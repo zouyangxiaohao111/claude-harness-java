@@ -13,6 +13,27 @@
 | `src/` | Java backend (`nexusai`), Spring Boot 3.5 + SQLite + MyBatis-Flex |
 | `frontend/` | Web frontend (React) + optional Tauri desktop shell + browser extension |
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/home.png" alt="Main workspace" width="85%">
+</p>
+
+The main workspace — session list, streaming chat, tool-call visualization, permission bubbles and async-task panels.
+
+**Everything below is configuration stored in SQLite and editable from the UI — no hardcoded keys.**
+
+| | |
+|---|---|
+| <img src="docs/screenshots/model-config.png" width="100%"> | <img src="docs/screenshots/provider-config.png" width="100%"> |
+| **Model registry & pricing** | **Providers** (base URL / API keys) |
+| <img src="docs/screenshots/env-config.png" width="100%"> | <img src="docs/screenshots/skills-config.png" width="100%"> |
+| **Environment & feature toggles** | **Skills & slash commands** |
+| <img src="docs/screenshots/plugin-config.png" width="100%"> | <img src="docs/screenshots/mcp-config.png" width="100%"> |
+| **Plugin management** | **MCP servers** |
+| <img src="docs/screenshots/cron-config.png" width="100%"> | <img src="docs/screenshots/settings.png" width="100%"> |
+| **Cron schedules** | **Settings overview** |
+
 ## Features
 
 **Agent core**
