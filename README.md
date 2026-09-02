@@ -1,5 +1,7 @@
 # claude-harness-java
 
+**English** | [**中文**](README.zh-CN.md)
+
 **A Java implementation of the Claude Code agent harness — Spring Boot backend + Web/Tauri frontend.**
 
 `claude-harness-java` re-implements the architecture and behavior of [Anthropic Claude Code](https://github.com/anthropics/claude-code) in Java (the "harness": agent loop, tools, permissions, hooks, skills, memory, team, cron), paired with a web / desktop frontend. It is **model-agnostic** — it speaks the Anthropic Messages API and the OpenAI-compatible protocol, so it works with Claude and other models (e.g. DeepSeek) via configurable providers.
