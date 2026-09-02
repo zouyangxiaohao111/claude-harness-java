@@ -8,13 +8,13 @@
 
 ## 为什么值得关注
 
-| | claude-harness-java | TS 脚本 harness（如 deepseek-harness） |
+| | claude-harness-java | TS harness（如 deepseek-harness） |
 |---|---|---|
-| 技术栈 | **纯 Java + Spring Boot** | TypeScript / Node |
-| 能力/插件管理 | **Spring IoC**（类型安全、依赖注入、AOP、生命周期）+ **class loader 动态加载 jar** + **GraalJS 跑 TS/JS** | 类「Spring 早期 XML 配 bean」的轻量自研容器（把插件当 bean 手动组装，更简略） |
-| 工程化 | Maven、DB 主控、测试完备 | 脚本胶水 |
+| 技术栈 | **纯 Java + Spring Boot** | TypeScript / Node（pnpm monorepo） |
+| 能力/插件管理 | **Spring IoC**（类型安全、依赖注入、AOP、生命周期）+ **class loader 动态加载 jar** + **GraalJS 跑 TS/JS** | **Cordis** 轻量 DI 容器（TS 生态）——「一切皆插件」，`ctx.plugin` 声明式注册 |
+| 工程化 | Maven、DB 主控、测试完备 | pnpm workspace |
 
-**一句话**：deepseek-harness 走的是「自己写个简版 bean 容器管插件」的老路——像 Spring 早期 XML 时代，能跑但规范与安全要自己补。**而我们直接拥抱 Java 生态给的东西**：Spring IoC 管能力、class loader 做插件热加载、GraalJS 让社区用 TS/JS 写轻量工具。**Java 开发者不用羡慕 Node 生态的脚本 harness。**
+**一句话**：[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 用 [Cordis](https://github.com/cordiverse/cordis) 轻量依赖注入容器做「一切皆插件」——**思想与 Spring IoC 同源**，但它是 TS 生态，靠命令式注册 + 配置 schema 组装，缺 JVM 的类型安全与成熟治理。**而我们直接拥抱 Java 生态给的东西**：Spring IoC 管能力（类型安全 + AOP + 生命周期）、class loader 做插件 jar 热加载与隔离、GraalJS 让社区用 TS/JS 写轻量工具——**Java 核心保类型安全，脚本语言开插件生态。**
 
 ## 界面
 

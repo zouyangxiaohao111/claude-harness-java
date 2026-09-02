@@ -27,18 +27,18 @@
 
 ## 🚀 为什么值得加入
 
-| 对比维度 | **claude-harness-java（我们）** | TS 脚本类 harness（如 deepseek-harness） |
+| 对比维度 | **claude-harness-java（我们）** | TS harness（如 deepseek-harness） |
 |---|---|---|
-| 技术栈 | 纯 Java + Spring Boot | TypeScript/Node |
-| 插件/能力管理 | **Spring IoC 体系**：类型安全、依赖注入、生命周期管理、事务/安全完备 | 类「Spring 早期 XML 配 bean」的轻量自研加载器（把插件当 bean 手动组装，更简略） |
-| 扩展形态 | class loader **动态加载 jar** + **GraalJS 跑 TS/JS 脚本** | 以 JS/TS 脚本为主 |
-| 工程化 | Maven 统一管理、DB 主控、测试完备 | 脚本胶水层 |
+| 技术栈 | 纯 Java + Spring Boot | TypeScript/Node（pnpm monorepo） |
+| 插件/能力管理 | **Spring IoC 体系**：类型安全、依赖注入、AOP、生命周期、治理完备 | **Cordis** 轻量 DI 容器（TS 生态），「一切皆插件」，`ctx.plugin(...)` 声明式注册 |
+| 扩展形态 | class loader **动态加载 jar** + **GraalJS 跑 TS/JS 脚本** | Cordis 插件（模型/工具/UI/agent 循环皆可替换） |
+| 工程化 | Maven 统一管理、DB 主控、测试完备 | pnpm workspace |
 
-**一句话讲透我们的差异化**：deepseek-harness 走的是「自己写个简版 bean 容器管插件」的老路——像 Spring 早期的 XML 时代，能跑，但安全、规范、工程化都要自己补。而 **Java 生态已经给了我们更成熟的选择**：
+**一句话讲透我们的差异化**：[deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)（TS）用 [Cordis](https://github.com/cordiverse/cordis) 这个轻量依赖注入容器实现「一切皆插件」——**思想与 Spring IoC 同源**（DI 管理组件），但它是 TS 生态、靠命令式 `ctx.plugin` + 配置 schema 组装，没有 JVM 的类型安全与成熟治理。**我们直接拥抱 JVM 生态给的东西**：
 
-- **Spring IoC** 管理插件/能力 —— 依赖注入、AOP、生命周期、配置外部化，天生规范；
+- **Spring IoC** 管理插件/能力 —— 依赖注入、AOP、生命周期、配置外部化，类型安全且规范完备；
 - **class loader 动态加载** —— 插件 jar 可热插拔，宿主与插件类隔离，安全可控；
-- **GraalJS 嵌入** —— 用 Java 工程写核心，允许社区用 **TS/JS 写轻量工具/技能**，语言门槛让给脚本爱好者的同时，核心依旧类型安全。
+- **GraalJS 嵌入** —— Java 工程写核心，社区用 **TS/JS 写轻量工具/技能**；核心类型安全，脚本语言开生态。
 
 > 所以我们不只是「又一个 AI 工具」，而是一个**想清楚插件化第二曲线**的项目——如果你对「Java 宿主 + 多语言插件」的架构有兴趣，这里有大块空白等你画。
 

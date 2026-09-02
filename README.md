@@ -118,7 +118,7 @@ The project aims for behavioral alignment with Claude Code where the architectur
 - **Deeper Team collaboration** — member mailboxes, task claiming, permission inheritance & bubbling
 - **Plugin system** — Spring-managed capabilities + **class loader hot-loading** of plugin jars + **GraalJS** so the community can write lightweight TS/JS tools/skills
 
-Why this plugin approach is interesting: TS-style harnesses (e.g. deepseek-harness) roll their own miniature "XML-era bean container" to wire plugins. We lean on the real thing — **Spring IoC + dynamic class loading + GraalJS** — for type safety, lifecycle and governance. If that sounds like a fun architecture problem, there's a large open canvas here.
+Why this plugin approach is interesting: TS harnesses such as [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) are built on [Cordis](https://github.com/cordiverse/cordis) — a lightweight TS dependency-injection container where everything is a plugin. Same spirit as Spring IoC, but TS-ecosystem. We build on the JVM equivalent — **Spring IoC + dynamic class loading + GraalJS** — for type safety, lifecycle and governance. If that sounds like a fun architecture problem, there's a large open canvas here.
 
 **We're looking for Java contributors** — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
