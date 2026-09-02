@@ -1,0 +1,17 @@
+-- ===================================================================
+-- V59: mcp_servers 新增 scope 列（MCP DB 唯一源改造）
+-- 用户拍板（2026-08-30）：MCP 写只写 DB，读只读 DB。.mcp.json 仅保留
+-- 「手动 import 入口」（POST /api/v1/mcp/import），启动不自动导入。
+-- DB 加 scope 列持久化每个 server 的来源 scope。
+--
+-- 列 CC original（Open-ClaudeCode 真源，不信注释看行为）：
+--   * scope —— CC original: McpServerConfig 的 scope 元数据（addScopeToServers，
+--     config.ts 合并序 user<project<local，local 最高；enterprise 独占短路）。
+--     既有行缺省 'project'（历史 REST add 默认 project scope —— 对齐 CC
+--     ensureConfigScope utils.ts:292-302 缺省 project；G5 主路径是 project scope）。
+--     可空（非 NOT NULL）：MyBatis-Flex 全字段 INSERT 对直插 null scope 的夹具/外部
+--     工具不崩（ApprovalFlowTest.insertPending 直插 record 即此场景）；生产
+--     create/update/import 总会 setScope，可空仅容错直插路径。
+-- SQLite 一次 ALTER 仅支持单列（V10 同款范式）。
+-- ===================================================================
+ALTER TABLE mcp_servers ADD COLUMN scope TEXT DEFAULT 'project';

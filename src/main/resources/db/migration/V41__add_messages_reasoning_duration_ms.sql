@@ -1,0 +1,16 @@
+-- ===================================================================
+-- V41: Add messages.reasoning_duration_ms（后端测 reasoning 耗时）
+-- ===================================================================
+-- 背景：用户拍板（2026-08-24）后端测量模型推理耗时（thinking 阶段），
+--   STOMP MessageCompleteEvent + messages 表 + transcript 文件三轨下发/记录。
+-- CC 真源（自验）：CC 无 reasoning 计时字段——sessionStorage.ts:1706/2209-2252 的
+--   turn_duration 是 system+subtype='turn_duration'+messageCount（checkResumeConsistency
+--   用），非推理耗时；本列是净新增字段，非 CC 对齐。
+-- 语义：reasoning_duration_ms INTEGER（Java Long，ms，可空）＝推理流首 SSE reasoning
+--   chunk 到达时刻 至 推理阶段结束（首 content chunk 或 onAssistantMessage）的时间跨度；
+--   无 reasoning → NULL（不记录）。
+-- Java 端：MessageRecord.reasoningDurationMs（MyBatis-Flex camelCase→snake_case 自动映射），
+--   写侧 ChatService.replayAndPersist:447/:518 + MessageService appendMessage:277/
+--   replaceSessionMessages:363，读侧 MessageService.toDto:473 回填 ChatMessageDto。
+-- SQLite 单 ALTER（messages 表无重建约束），列可空，无默认值，存量旧行 NULL 容错。
+ALTER TABLE messages ADD COLUMN reasoning_duration_ms INTEGER;

@@ -1,0 +1,25 @@
+-- ===================================================================
+-- V50: sessions 表新增会话累计 usage/cost 列（跨 turn 权威载体）
+--
+-- 背景：token usage/cost 上报链路（CC 对齐）需会话累计花费与按模型
+--   用量快照。CC 真源为进程级 STATE 单例 + project config 持久化
+--   （state.ts:704-710 total_cost_usd / lastModelUsage；cost-tracker.ts
+--   restoreCostStateForSession 仅同 sessionId restore）——Java 多会话并发
+--   → 按 sessionId 隔离 + 存 sessions 表列（multi-session-vs-cc-single-session
+--   铁律，effort_level V31 / bare_mode V33 同款会话列范式）。
+--
+-- 列：
+--   total_cost_yuan DECIMAL(10,6) 可空 = 会话累计花费（元）· CC original:
+--     total_cost_usd（result 事件 / state.ts:704-710），值用人民币元（用户拍板，
+--     字段名对齐 CC、不换算 USD）。
+--   model_usage_json TEXT 可空 = 按模型 8 字段 camelCase JSON 快照
+--     （{"deepseek-v4-flash":{inputTokens,outputTokens,cacheReadInputTokens,
+--     cacheCreationInputTokens,webSearchRequests,costUSD,contextWindow,
+--     maxOutputTokens}}）· CC original: project config lastModelUsage
+--     （state.ts:704-710 / CostTracker.ModelUsage cost-tracker.ts:29-38）。
+-- 存量行 NULL 容错（restore 时 null → 零累计）。
+-- Java 端 camelCase 字段 totalCostYuan / modelUsageJson，MyBatis-Flex 自动
+-- snake↔camel（同 permission_mode V44 列范式）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN total_cost_yuan DECIMAL(10,6) NULL;
+ALTER TABLE sessions ADD COLUMN model_usage_json TEXT NULL;

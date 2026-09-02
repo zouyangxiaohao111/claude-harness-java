@@ -1,0 +1,17 @@
+-- ===================================================================
+-- V33: sessions 表加 bare_mode（bare 精简模式会话级开关）
+--
+-- 背景：用户拍板（2026-08-23）bareMode 随会话走（非全局 settings）——
+--   CC isBareMode()（envUtils.ts:60-65）是进程级 env 判定（CLAUDE_CODE_SIMPLE /
+--   --bare argv），Web 多会话需会话级承载（对齐 effort_level / ultracode_enabled
+--   同款 V31/V32 范式）。
+--
+-- bare_mode INTEGER（0/1，可空）：true = 该会话启用 bare（精简）模式
+--   （LLM 可见工具池裁剪为 simpleTools=[Bash,Read,Edit]，对齐 CC getTools
+--   SIMPLE 分支 tools.ts:287-296）。Java 端 camelCase 字段 bareMode，
+--   MyBatis-Flex 自动 snake_case↔camelCase 转换（同 effort_level 既有列约定）。
+--
+-- 判定优先级（会话级）：当前会话 bare_mode（DB）→ 有值则用之；null / 无会话 /
+--   读取失败 → 回落 env CLAUDE_CODE_SIMPLE / nexusai.memory.bare-mode → 默认 false。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN bare_mode INTEGER;

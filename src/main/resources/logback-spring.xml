@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- 引用 Spring Boot 的 logback 基础配置（含默认 LOG_DATEFORMAT_PATTERN 等变量） -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml" />
+
+    <!-- 外部可配项（application.yml logging.* 注入；未配置回落默认） -->
+    <springProperty scope="context" name="log-file-path" source="logging.file.path" defaultValue="logs"/>
+    <springProperty scope="context" name="log-rolling-max-file-size" source="logging.logback.rollingpolicy.max-file-size" defaultValue="100MB"/>
+    <springProperty scope="context" name="log-rolling-total-size-cap" source="logging.logback.rollingpolicy.total-size-cap" defaultValue="1GB"/>
+    <springProperty scope="context" name="log-rolling-max-history" source="logging.logback.rollingpolicy.max-history" defaultValue="30"/>
+    <springProperty scope="context" name="log-rolling-clean-history-on-start" source="logging.logback.rollingpolicy.clean-history-on-start" defaultValue="false"/>
+
+    <!-- 控制台格式：%highlight 颜色（INFO 绿/WARN 黄/ERROR 红，logback 自带，不依赖 SkyWalking）
+         + MDC sessionId/reqId（当前项目链路追踪，对齐现有 logback-spring.xml 的 s=/r= 约定） -->
+    <property name="PATTERN_CONSOLE"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [s=%X{sessionId:-SYSTEM}] [r=%X{reqId:-}] %boldYellow(%thread) %boldGreen(%logger{30}) - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%wEx}"/>
+
+    <!-- 文件格式：无 ANSI 颜色（文件不含转义字符），MDC 保留 -->
+    <property name="PATTERN_FILE"
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [s=%X{sessionId:-SYSTEM}] [r=%X{reqId:-}] [%thread] %logger{40} - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%ex}"/>
+
+    <!-- 控制台 Appender（人类 + AI 友好，带颜色） -->
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${PATTERN_CONSOLE}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <!-- 文件 Appender：INFO 全量（含 debug/warn/error） -->
+    <appender name="FILE_INFO" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${log-file-path}/info.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>${PATTERN_FILE}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${log-file-path}/info/info-%d{yyyy-MM-dd}.%i.log.zip</fileNamePattern>
+            <cleanHistoryOnStart>${log-rolling-clean-history-on-start}</cleanHistoryOnStart>
+            <maxFileSize>${log-rolling-max-file-size}</maxFileSize>
+            <totalSizeCap>${log-rolling-total-size-cap}</totalSizeCap>
+            <maxHistory>${log-rolling-max-history}</maxHistory>
+        </rollingPolicy>
+    </appender>
+
+    <!-- 文件 Appender：WARN+ERROR（只收 warn/error，LevelFilter 精确匹配） -->
+    <appender name="FILE_WARN" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${log-file-path}/warn.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>${PATTERN_FILE}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${log-file-path}/warn/warn-%d{yyyy-MM-dd}.%i.log.zip</fileNamePattern>
+            <cleanHistoryOnStart>${log-rolling-clean-history-on-start}</cleanHistoryOnStart>
+            <maxFileSize>${log-rolling-max-file-size}</maxFileSize>
+            <totalSizeCap>${log-rolling-total-size-cap}</totalSizeCap>
+            <maxHistory>${log-rolling-max-history}</maxHistory>
+        </rollingPolicy>
+        <filter class="ch.qos.logback.classic.filter.LevelFilter">
+            <level>WARN</level>
+            <onMatch>ACCEPT</onMatch>
+            <onMismatch>DENY</onMismatch>
+        </filter>
+    </appender>
+
+    <!-- 文件 Appender：ERROR（只收 error） -->
+    <appender name="FILE_ERROR" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${log-file-path}/error.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>${PATTERN_FILE}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${log-file-path}/error/error-%d{yyyy-MM-dd}.%i.log.zip</fileNamePattern>
+            <cleanHistoryOnStart>${log-rolling-clean-history-on-start}</cleanHistoryOnStart>
+            <maxFileSize>${log-rolling-max-file-size}</maxFileSize>
+            <totalSizeCap>${log-rolling-total-size-cap}</totalSizeCap>
+            <maxHistory>${log-rolling-max-history}</maxHistory>
+        </rollingPolicy>
+        <filter class="ch.qos.logback.classic.filter.LevelFilter">
+            <level>ERROR</level>
+            <onMatch>ACCEPT</onMatch>
+            <onMismatch>DENY</onMismatch>
+        </filter>
+    </appender>
+
+    <!-- 异步写入（提升性能 · 不丢日志 discardingThreshold=0） -->
+    <appender name="ASYNC_INFO" class="ch.qos.logback.classic.AsyncAppender">
+        <discardingThreshold>0</discardingThreshold>
+        <queueSize>256</queueSize>
+        <appender-ref ref="FILE_INFO"/>
+    </appender>
+    <appender name="ASYNC_WARN" class="ch.qos.logback.classic.AsyncAppender">
+        <discardingThreshold>0</discardingThreshold>
+        <queueSize>256</queueSize>
+        <appender-ref ref="FILE_WARN"/>
+    </appender>
+    <appender name="ASYNC_ERROR" class="ch.qos.logback.classic.AsyncAppender">
+        <discardingThreshold>0</discardingThreshold>
+        <queueSize>256</queueSize>
+        <appender-ref ref="FILE_ERROR"/>
+    </appender>
+
+    <!-- 级别配置：com.nexusai 默认 INFO；agent/LLM 流式细节 DEBUG 时开 -->
+    <logger name="com.nexusai" level="INFO"/>
+    <logger name="com.nexusai.application.agent.LlmAgentLoop" level="INFO"/>
+    <logger name="com.nexusai.infra.llm.OpenAiSdkProvider" level="INFO"/>
+    <logger name="com.nexusai.application.chat.ChatService" level="INFO"/>
+    <logger name="org.springframework" level="WARN"/>
+    <logger name="org.quartz" level="WARN"/>
+    <logger name="org.flywaydb" level="WARN"/>
+    <logger name="com.zaxxer.hikari" level="WARN"/>
+    <logger name="org.apache.catalina" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+        <appender-ref ref="ASYNC_INFO"/>
+        <appender-ref ref="ASYNC_WARN"/>
+        <appender-ref ref="ASYNC_ERROR"/>
+    </root>
+
+</configuration>

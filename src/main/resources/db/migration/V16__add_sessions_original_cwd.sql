@@ -1,0 +1,11 @@
+-- ===================================================================
+-- V16: sessions 表新增 original_cwd 列（gap1-originalcwd · 前端传入用户真实目录）
+-- 对齐 CC worktree.ts:712 `const originalCwd = getCwd()`（createWorktreeForSession 入口
+--   捕获进入前 cwd），Web 架构适配：前端用户目录 ≠ 服务端 user.dir，由前端经
+--   POST /api/v1/sessions body 传入 originalCwd，落库后 EnterWorktreeTool 捕获、
+--   ExitWorktreeTool 退出时回显，缺失回退 user.dir。
+-- 仅 ALTER ADD COLUMN（非重建、非改 NOT NULL），走 Flyway 默认事务即可（区别于 V14
+--   需脱离事务的 sessions 重建，V14 是 DROP TABLE 级联问题，本 V16 无此风险）。
+-- 可空：未传 originalCwd 的旧会话 / 新会话均合法（Exit 侧回退 user.dir）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN original_cwd TEXT;

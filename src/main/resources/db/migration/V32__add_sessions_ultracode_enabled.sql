@@ -1,0 +1,13 @@
+-- ===================================================================
+-- V32: sessions 表加 ultracode_enabled（ultracode 模式会话级开关）
+--
+-- 背景：用户拍板 ultracode 应作为后端真实概念（可持久化/恢复/展示），
+--   而非前端本地标识。ultracode = xhigh effort + workflows 编排启用。
+--   workflows 编排 Java 未实现（WorkflowTool stub，对齐探查 P0-P3 后置），
+--   本期先持久化 ultracode 开关状态，effort 层落 xhigh（对齐前端 mapToBackend）。
+--
+-- ultracode_enabled INTEGER（0/1，可空）：true = 该会话启用 ultracode 模式
+--   （effort 落 xhigh + 未来 workflows 编排启用）。Java 端 camelCase 字段 ultracodeEnabled，
+--   MyBatis-Flex 自动 snake_case↔camelCase 转换（同 effort_level 既有列约定）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN ultracode_enabled INTEGER;

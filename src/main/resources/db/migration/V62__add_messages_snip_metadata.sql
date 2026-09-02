@@ -1,0 +1,18 @@
+-- ===================================================================
+-- V62: messages 表新增 snip_metadata 列（snip_boundary 消息携带 removedUuids 的 JSON 文本）
+--
+-- [2026-09-02] Snip 裁剪标记持久化：SnipTool 注入的 snip_boundary 消息
+--   （role=system + subtype='snip_boundary' + snipMetadata.removedUuids）落库本列，
+--   GET /messages 出站后前端据此在「被裁剪消息右上角」标注「已裁剪」角标
+--   （用户确认：Snip 本来就带这个标记字段，持久化即可，不出现 boundary 分界线事件）。
+--
+-- 不加 DEFAULT，null = 非 snip_boundary 消息（零行为变化）。
+--   对齐 V13 compact_metadata / microcompact_metadata 先例（MyBatis-Flex 自动
+--   snake_case↔camelCase 转换：camelCase 字段 snipMetadata → 列 snip_metadata）。
+--
+-- 列语义：
+--   snip_metadata（TEXT）：snipMetadata Map<String,Object> 的 JSON 文本
+--     （结构 { removedUuids?: string[] }，snipCompact.ts:99-106 / snipProjection.ts:31）。
+--     null = 非 snip_boundary 消息。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN snip_metadata TEXT;

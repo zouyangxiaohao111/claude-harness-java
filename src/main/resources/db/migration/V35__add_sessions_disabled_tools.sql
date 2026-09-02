@@ -1,0 +1,14 @@
+-- ===================================================================
+-- V34: sessions 表加 disabled_tools（会话级禁用工具集合）
+--
+-- 背景：前端工具列表（待前端对接 §29）「点 × 临时禁用 → 该工具从模型 schema 移除，会话内生效」。
+--   CC 无「会话内临时禁用」内置机制（Web UX 产品功能，G24 用户拍板），Java 端以
+--   「会话级禁用集合 + llmToolsArray 追加过滤」复刻 CC blanket deny 的 schema 阶段剔除
+--   观察效果（tools.ts:262-269「A tool is filtered out ... before the model sees them」）。
+--
+-- disabled_tools TEXT（JSON 数组，如 ["Bash","WebSearch"]；null = 未禁用）：
+--   存储被禁用工具名集合。Java 端 camelCase 字段 disabledTools，MyBatis-Flex 自动
+--   snake_case↔camelCase 转换（同 effort_level / bare_mode 既有列约定）。
+--   空集合 → 存 null（读回空集合），与 V33 bare_mode 可空语义一致。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN disabled_tools TEXT;

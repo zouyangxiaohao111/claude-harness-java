@@ -1,0 +1,21 @@
+-- ===================================================================
+-- V55: settings 表新增 snip_nudge_threshold 列（snip nudge 阈值入 DB settings，
+--   可配置 + 上下文窗口自适应）
+-- [fix-transcript-nudge] SnipCompactor.SNIP_NUDGE_THRESHOLD=30 此前硬编码
+--   （CC original: snipCompact.ts:11）；本迁移把 nudge 阈值入 DB settings
+--   单行多列，前端「环境配置」可配，实时读源（CompactSettingsResolver.
+--   snipNudgeThreshold）消费。INTEGER 可空：
+--   - null = 回落窗口自适应算法（SnipCompactor.resolveSnipNudgeThreshold 按
+--     effectiveWindow 档位：≥800k → 150；>600k → 100；≥400k → 60；其他 → 30
+--     （CC 默认，snipCompact.ts:11））。
+--   - >0 = DB 值直接覆盖窗口自适应（用户显式配置优先）。
+--   对齐 V52/V54 先例（MyBatis-Flex 自动 snake_case↔camelCase 转换；camelCase
+--   字段 snipNudgeThreshold → 列 snip_nudge_threshold；不加 DEFAULT，null =
+--   未配置回落算法，与 V52/V54 一致）。
+--
+-- 读链：SettingsService.get()/update() 读写 DB 列（merge 策略，null 不覆盖）；
+--   CompactSettingsResolver.snipNudgeThreshold() 每次 selectOneById(1) 实时读
+--   （>0 返回，否则 null = 回落窗口自适应）。消费点见
+--   AgentLoopContext.maybeInjectContextEfficiencyNudge（门 4 shouldNudgeForSnips）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN snip_nudge_threshold INTEGER;

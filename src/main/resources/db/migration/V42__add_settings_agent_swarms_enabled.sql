@@ -1,0 +1,15 @@
+-- ===================================================================
+-- V42: settings 表新增 agent_swarms_enabled 列
+-- [agent-swarms-setting] 前端「环境配置」Agent Swarms 开关（设置页开关 →
+--   TaskSystemConfig.isAgentSwarmsEnabled() 判定链 OR settings）：
+--   agent_swarms_enabled（INTEGER 可空，0/1）= 前端配置的 Agent Swarms 开关。
+--   null = 未配置不覆盖（TaskSystemConfig 静态覆盖标志为 null，维持 CC 原
+--   opt-in/killswitch 判定链）；true = 额外 opt-in 源；false = 不额外放行。
+--   Java 端 camelCase 字段 agentSwarmsEnabled，MyBatis-Flex 自动 snake_case↔
+--   camelCase 转换（同 V34 auto_memory_enabled 先例，对齐前端提示词明确 INTEGER）。
+--
+-- 读链：SettingsService.get()/update() 写库后同步
+--   TaskSystemConfig.setAgentSwarmsSettingsOverride(dto.agentSwarmsEnabled())，
+--   进程级静态覆盖立即生效；killswitch（nexusai.swarms.killswitch）仍末位优先。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN agent_swarms_enabled INTEGER;

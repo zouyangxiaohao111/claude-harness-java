@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.3</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.nexusai</groupId>
+    <artifactId>claude-harness-java</artifactId>
+    <version>0.5.0</version>
+    <name>claude-harness-java</name>
+    <description>claude-harness-java - Java implementation of the Claude Code agent harness (Spring Boot + SQLite)</description>
+
+    <properties>
+        <!-- Java 25 required for GraalVM Native Image (native-maven-plugin 0.10.2
+             + native-image toolchain); virtual threads enabled by Spring Boot 3.4
+             default in JDK 25. Phase 6 native build (2026-06-14). -->
+        <java.version>25</java.version>
+        <maven.compiler.source>25</maven.compiler.source>
+        <maven.compiler.target>25</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <mybatis-flex.version>1.10.0</mybatis-flex.version>
+        <sqlite-jdbc.version>3.46.0.0</sqlite-jdbc.version>
+        <flyway-sqlite.version>10.20.1</flyway-sqlite.version>
+        <springdoc.version>2.7.0</springdoc.version>
+        <native-maven-plugin.version>0.10.2</native-maven-plugin.version>
+        <openai-java.version>0.25.0</openai-java.version>
+        <!-- [DEC-RV-07] Anthropic 官方 Java SDK · 对齐 CC @anthropic-ai/sdk
+             (Open-ClaudeCode/src/services/api/client.ts:1). 与 openai-java 同 Stainless 生成族. -->
+        <anthropic-java.version>2.53.0</anthropic-java.version>
+        <!-- [R32-b12 D-1] OTel SDK 版本 · 路径 C (OTel API + Logging Exporter, 0 collector).
+             严格对齐 CC Open-ClaudeCode/src/utils/telemetry/instrumentation.ts:86-214 bootstrapTelemetry.
+             不引入 OTLP/HTTP collector 依赖; 仅本地 stdout/logback 输出 (与 production COLLECTOR_URL 切换留 R33+).
+             1.42.1 为 OTel Java 稳定版 (Spring Boot 3.5.3 BOM 不管理 opentelemetry-* 显式版本). -->
+        <opentelemetry.version>1.42.1</opentelemetry.version>
+        <caffeine.version>3.1.8</caffeine.version>
+        <!-- [impl-I-6] Spring AI BOM · 入站 MCP server（Spring AI 接管 /mcp，替代自研 JSON-RPC 骨架）。
+             Q-23 拍板（open-decisions.md L58）：用 spring-ai-starter-mcp-server-webmvc 暴露 ToolRegistry 工具。 -->
+        <spring-ai.version>1.1.2</spring-ai.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- [impl-I-6] Spring AI BOM 1.1.2（本地 m2 已备，Boot 3.5 兼容）。声明
+                 spring-ai-starter-mcp-server-webmvc 等管理项，见 BOM pom :875-890。 -->
+            <dependency>
+                <groupId>org.springframework.ai</groupId>
+                <artifactId>spring-ai-bom</artifactId>
+                <version>${spring-ai.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+<!--    LRU缓存    -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+        <!-- Spring Boot 核心 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+<!--    webflux    -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-websocket</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <!-- ORM: MyBatis-Flex（取代 JPA，方便后续替换） -->
+        <dependency>
+            <groupId>com.mybatis-flex</groupId>
+            <artifactId>mybatis-flex-spring-boot3-starter</artifactId>
+            <version>${mybatis-flex.version}</version>
+        </dependency>
+
+        <!-- SQLite 驱动 -->
+        <dependency>
+            <groupId>org.xerial</groupId>
+            <artifactId>sqlite-jdbc</artifactId>
+            <version>${sqlite-jdbc.version}</version>
+        </dependency>
+
+        <!-- Flyway：随 Spring Boot 3.4 BOM（10.20.1，自带 SQLite 支持） -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+
+        <!-- Quartz（调度框架）— C4 Schedule 后端 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-quartz</artifactId>
+        </dependency>
+
+        <!-- c3p0：Quartz 2.3.2 默认连接池（自带 ComboPooledDataSource）；
+             不引入会导致 ConnectionProvider class 找不到 c3p0 类而失败 -->
+        <dependency>
+            <groupId>com.mchange</groupId>
+            <artifactId>c3p0</artifactId>
+            <version>0.9.5.5</version>
+        </dependency>
+
+        <!-- Swagger UI / OpenAPI 3 -->
+        <dependency>
+            <groupId>org.springdoc</groupId>
+            <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+            <version>${springdoc.version}</version>
+        </dependency>
+
+        <!-- OpenAI SDK (官方 Java SDK, 支持流式 + 非流式 + tool calls)
+             替代 OpenAiProvider.java 中 ~200 行手写 SSE 解析逻辑.
+             s19 P1-1/2/3 + s20 wiring 升级 (LlmaGentLoop 接入官方 SDK 入口) -->
+        <dependency>
+            <groupId>com.openai</groupId>
+            <artifactId>openai-java</artifactId>
+            <version>${openai-java.version}</version>
+        </dependency>
+
+        <!-- [DEC-RV-07] Anthropic 官方 Java SDK · 替代 AnthropicProvider 手写 HTTP.
+             单坐标自动带 anthropic-java-client-okhttp + anthropic-java-core + okhttp + kotlin (Stainless 同族). -->
+        <dependency>
+            <groupId>com.anthropic</groupId>
+            <artifactId>anthropic-java</artifactId>
+            <version>${anthropic-java.version}</version>
+        </dependency>
+
+        <!-- [R32-b12 D-1] OpenTelemetry SDK · 路径 C (OTel API + Logging Exporter, 0 collector).
+             对齐 CC Open-ClaudeCode/src/utils/telemetry/instrumentation.ts:86-214 bootstrapTelemetry.
+             - opentelemetry-api: logEvent/logOTelEvent 接口契约 (Attributes, EventLogger).
+             - opentelemetry-sdk: SDK 运行时 (LoggerProvider + Resource + LogLimits).
+             - opentelemetry-exporter-logging: LoggingExporter (无 collector, stdout/logback 输出).
+             严格对齐 CC "eventLogger.emit({body, attributes})" 模式. 后期可替换为 otlp exporter. -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-logging</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.35</version>
+        </dependency>
+
+        <!-- [P-CC-01] Apache PDFBox · PDF 解析（对齐 CC utils/pdf.ts readPDF/extractPDFPages，
+             用户 2026-08-05 拍板「剩余拍板项严格和CC对齐，许可添加POM」）。
+             3.0.5 与仓库 JDK25 兼容；传递依赖 fontbox + pdfbox-io + commons-logging（本地 m2 已备）。
+             替代 CC 的 poppler-utils 外部二进制（pdfinfo/pdftoppm），进程内等价渲染。 -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>3.0.5</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>com.alibaba.fastjson2</groupId>
+            <artifactId>fastjson2</artifactId>
+            <version>2.0.58</version>
+        </dependency>
+
+        <!-- RES-C10: tiktoken 本地估算（OpenAI 无 count_tokens 端点，CC tokenEstimation.ts:203-208 roughTokenCountEstimation 增强版） -->
+        <dependency>
+            <groupId>com.knuddels</groupId>
+            <artifactId>jtokkit</artifactId>
+            <version>1.1.0</version>
+        </dependency>
+
+        <!-- [P3-33] io.methvin:directory-watcher 0.18.0 · 递归目录监听（chokidar 的 Java 等价）。
+             SkillChangeDetector 用其 DirectoryWatcher + onIdle debounce（空闲窗口=awaitWriteFinish 写稳定等价）
+             替代自实现 JDK WatchService + mtime/size 轮询（skillChangeDetector.ts:27/:32 awaitWriteFinish）。
+             Java 8+ 兼容（本工程 JDK 25）；传递依赖 net.java.dev.jna（仅 macOS 原生 watcher 运行时用到，
+             Windows/Linux 走 JDK WatchService，不加载 JNA native）。 -->
+        <dependency>
+            <groupId>io.methvin</groupId>
+            <artifactId>directory-watcher</artifactId>
+            <version>0.18.0</version>
+        </dependency>
+
+        <!-- [impl-I-6] Spring AI MCP server（WebMVC transport）· Q-23 拍板：
+             自研 JSON-RPC 骨架 McpServerEndpoint 由 Spring AI 自带端点接管 /mcp
+             （application.yml protocol=streamable → 单端点 /mcp；若用 SSE 默认协议则 /sse + /mcp/message）。
+             ToolRegistry 工具经 ToolCallback 适配暴露（对齐 CC entrypoints/mcp.ts startMCPServer）。
+             本工程为 spring-boot-starter-web 栈，故用 -webmvc 而非 -webflux。 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-starter-mcp-server-webmvc</artifactId>
+        </dependency>
+
+        <!-- 单元测试 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- [S10 基建修复] TestRunner（S02 交付，src/test/.../TestRunner.java）需要
+             junit-platform-launcher；版本由 spring-boot-dependencies junit-bom 管理。
+             不声明 → test-compile 失败（S02 用隔离构建规避，S10 起进入常规 test classpath）。 -->
+        <dependency>
+            <groupId>org.junit.platform</groupId>
+            <artifactId>junit-platform-launcher</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>nexusai-backend</finalName>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.graalvm.buildtools</groupId>
+                <artifactId>native-maven-plugin</artifactId>
+                <version>${native-maven-plugin.version}</version>
+                <configuration>
+                    <buildArgs>
+                        <arg>--no-fallback</arg>
+                        <arg>--enable-url-protocols=http,https,ws,wss</arg>
+                        <arg>--initialize-at-build-time=org.sqlite.util.ProcessRunner</arg>
+                    </buildArgs>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,0 +1,21 @@
+-- ===================================================================
+-- V56: settings 表新增 auto_dream_enabled 列（autoDream 统一走 DB 主控，默认开，弃文件）
+--
+-- 用户决策（2026-08-30）：autoDreamEnabled 从 settings.json 文件 + env NEXUSAI_AUTO_DREAM
+--   主控升级为 DB settings 列主控（对齐 autoMemory 的 auto_memory_enabled V34 先例），
+--   弃用文件承载（BundledSkillEnabledGates / AutoDreamConsolidator 不再读 settings.json 的
+--   autoDreamEnabled），默认开（null = 回落 true）。
+--
+-- 列：auto_dream_enabled（INTEGER 可空，0/1）= 前端可配的 auto-dream 总开关。
+--   Java 端 camelCase 字段 autoDreamEnabled，MyBatis-Flex 自动 snake_case↔camelCase 转换
+--   （同 V34 auto_memory_enabled 列约定；V52/V54 同款：不加 DEFAULT，null = 未配置回落默认）。
+--   「默认 true」为 Java 读链回落语义（AutoDreamConsolidator.isAutoDreamEnabledBySettingsOrEnv
+--   无 DB 值 → env 可选覆盖 → true），非 DB DEFAULT 子句。
+--
+-- 读链：SettingsService.get()/update() 读写 DB 列（merge 策略，null 不覆盖）；
+--   BundledSkillEnabledGates.readAutoDreamEnabledSetting DB 优先 → 无则 null；
+--   AutoDreamConsolidator.isAutoDreamEnabledBySettingsOrEnv DB 优先 → env 可选覆盖 → 默认 true。
+-- 写链：SettingsService.update 落 DB 列 + BundledSkillEnabledGates.writeAutoMemoryToggles 落
+--   DB 列（autoDream 不再写 settings.json 文件）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN auto_dream_enabled INTEGER;

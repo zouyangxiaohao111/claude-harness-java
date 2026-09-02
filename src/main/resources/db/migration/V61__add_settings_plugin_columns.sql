@@ -1,0 +1,27 @@
+-- ===================================================================
+-- V61: settings 表新增插件双读配置 2 列（插件配置入 DB settings，
+--   前端「插件设置 / 插件管理页」可配）
+-- [2026-09-01 用户拍板] 插件双读开关 pluginClaudeFallback 从 yml
+--   nexusai.feature.plugin-claude-fallback 迁移为 DB 列；DB settings 加
+--   enabledPlugins 列供前端插件管理页写入。
+--
+-- 全部不加 DEFAULT，null = 未配置回落原判定链，零行为变化。
+--   对齐 V60 先例（MyBatis-Flex 自动 snake_case↔camelCase 转换：
+--   camelCase 字段 enabledPlugins → 列 enabled_plugins；
+--   pluginClaudeFallback → 列 plugin_claude_fallback）。
+--
+-- 列语义：
+--   enabled_plugins（TEXT）：插件启停映射 Map<String,Boolean> 的 JSON 文本
+--     （前端插件管理页写入）。null = 未配置 → InstalledPluginsManager 读链
+--     回落 ConfigStorage（settings.json）→ 最后 CC settings（~/.claude/
+--     settings.json）双读（nexusai 优先 + 同 name nexusai 赢）。
+--   plugin_claude_fallback（INTEGER 0/1）：插件双读开关。true = enabledPlugins/
+--     installed 合并 nexusai + CC（~/.claude settings/plugins 兜底）；false = 只读
+--     nexusai 不回落实 CC。null = 未配置回落默认 true（原 yml :true 语义）。
+--
+-- 读链：SettingsService.get()/update() 读写 DB 列（merge 策略，null 不覆盖）；
+--   InstalledPluginsManager / InstalledPluginsFileStore 经 SettingsMapper
+--   selectOneById(1) 实时读（null = 回落默认 true / 回落文件双读链）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN enabled_plugins TEXT;
+ALTER TABLE settings ADD COLUMN plugin_claude_fallback INTEGER;

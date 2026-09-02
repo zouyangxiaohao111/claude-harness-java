@@ -1,0 +1,24 @@
+-- ===================================================================
+-- V53: Add messages.cache_read_input_tokens / cache_creation_input_tokens
+-- [token-compact-fix B1] cache 用量落库（方案A）
+-- ===================================================================
+-- 背景：用户拍板（2026-08-28）cache_read/cache_creation 落库，拒绝近似——
+--   messages 表此前只存 input_tokens/output_tokens（V-TOK），cache 未存 →
+--   GET/messages 重算 contextTokensUsed 少算 cache（与实时 complete 事件
+--   ChatService:572-578 不一致）。方案A 落库：写侧（MessageService
+--   appendMessage/replaceSessionMessages + ChatService.replayAndPersist final
+--   块）从 AgentUsage.cacheReadInputTokens()/cacheCreationInputTokens() 投影
+--   落库；读侧 MessageService.toDto 回填 ChatMessageDto.inputCacheReadTokens/
+--   inputCacheCreationTokens（与 usage 双通道）。
+-- CC 真源（自验）：CC BetaUsage cache_read_input_tokens / cache_creation_input_tokens
+--   （agentToolUtils.ts:241-242 usage 7 子字段；tokens.ts:46-53 getTokenCountFromUsage
+--   四通道求和 = input + cache_creation + cache_read + output）——本列是 message.usage
+--   的 DB 承载，非净新增语义。
+-- 语义：cache_read_input_tokens INTEGER / cache_creation_input_tokens INTEGER
+--   （MyBatis-Flex camelCase→snake_case 自动映射 → MessageRecord.cacheReadInputTokens /
+--   cacheCreationInputTokens），可空，无默认值。存量旧行 NULL（= 无 cache 数据，
+--   读侧回退 0，与实时 usage null 省略语义等价）。
+-- SQLite 单 ALTER（messages 表无重建约束），列可空，无默认值，对齐 V41
+--   reasoning_duration_ms 范式（V41__add_messages_reasoning_duration_ms.sql:16）。
+ALTER TABLE messages ADD COLUMN cache_read_input_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN cache_creation_input_tokens INTEGER;

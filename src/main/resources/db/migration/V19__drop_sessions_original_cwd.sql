@@ -1,0 +1,11 @@
+-- ===================================================================
+-- V19: sessions 表删除 original_cwd 列（WF-5 · 纯对齐 CC）
+-- 对齐 CC：worktree 会话 resume 恢复走 transcript worktree-state
+--   （sessionStorage.ts:2889 saveWorktreeState + sessionRestore.ts:332-366 readWorktreeState），
+--   不从 DB sessions.original_cwd 读回。originalCwd 持久化已迁 transcript，
+--   故 DB 列不再需要。
+-- V16__add_sessions_original_cwd.sql 保留（Flyway 已应用，删则校验和失配，只加本迁移）。
+-- 原编号 V17 与 V17__add_boundary_metadata_columns 冲突（2026-08-15 修复）→ 重编号 V19。
+-- SQLite ALTER TABLE DROP COLUMN 支持（SQLite >= 3.35.0），无需脱离事务重建表。
+-- ===================================================================
+ALTER TABLE sessions DROP COLUMN original_cwd;

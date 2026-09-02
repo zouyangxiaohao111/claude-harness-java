@@ -1,0 +1,467 @@
+# =====================================================================
+# NexusAI Backend configuration (YAML)
+# Format note: All comments in English to avoid YAML encoding pitfalls
+# (Chinese UTF-8 comments caused silent parser failures in early phases;
+# see progress.md "Pitfall #3"). If you need Chinese annotations, put
+# them in /docs/, not in this file.
+# =====================================================================
+
+spring:
+  application:
+    # [G3 决策 D1 + 第二轮拍板] appName 固定 nexusai → NexusaiPaths.getAppConfigHomeDir() = {user.home}/.nexusai
+    name: nexusai
+
+  # [impl-I-6] Spring AI 入站 MCP server · 对齐 CC entrypoints/mcp.ts:49
+  # (new Server({name:'claude/tengu', version: MACRO.VERSION}, ...))。
+  # SERVER_NAME 审计锚点: 下方 server.name: claude/tengu 承接 CC mcp.ts:49 的
+  # SERVER_NAME 常量；原 Java 常量类 McpServerEntrypoint 已删除（RES-07c，
+  # 0 调用方死代码），改由 Spring AI 配置承接。
+  # /mcp 由 Spring AI WebMvc 自动配置接管：CONFIG_PREFIX=spring.ai.mcp.server
+  # (McpServerProperties)。protocol=streamable → 单端点 /mcp（McpServerStreamableHttpProperties
+  # mcpEndpoint 默认值已实证）；若用 SSE 默认协议则端点为 /sse + /mcp/message（与计划草案的
+  # "/mcp/sse" 不符，按实际行为选 streamable，计划 M4 "按 1.1.2 实际默认值核对"）。
+  # ToolRegistry 工具经 InboundMcpToolProvider 暴露（tools/list + tools/call）。
+  ai:
+    mcp:
+      server:
+        name: claude/tengu
+        version: 0.2.38
+        enabled: true
+        type: sync
+        protocol: streamable
+
+  # ---------------------------------------------------------------
+  # HikariCP + SQLite + WAL tuning
+  # PRAGMA passed via JDBC URL params (xerial-sqlite supported).
+  # The URL must be quoted: '&' is the YAML anchor indicator and would
+  # otherwise be swallowed by the parser.
+  # ---------------------------------------------------------------
+  datasource:
+    # [G3 决策] DB 位置：NEXUSAI_HOME 已废弃用于应用配置（自有根 NexusaiPaths = {user.home}/.nexusai），
+    #   但 DB 位置保留 ${NEXUSAI_HOME:./}（未设 env 默认 ./ → cwd/nexusai.db），避免破坏既有 dev DB 路径；
+    #   如需迁到 {user.home} 可改 ${user.home}/.nexusai/nexusai.db。cron/MCP 已入 DB（datasource 承载），
+    #   无独立文件路径。
+    url: "jdbc:sqlite:${NEXUSAI_HOME:./}nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"
+    driver-class-name: org.sqlite.JDBC
+    hikari:
+      pool-name: NexusAiHikariPool
+      connection-timeout: 1000
+      maximum-pool-size: 50        # Conservative: SQLite write-lock sensitive
+      minimum-idle: 10
+      max-lifetime: 1800000         # 30 min
+      idle-timeout: 120000          # 2 min
+      keepalive-timeout: 30000      # 30 s
+      initialization-fail-timeout: 1
+      leak-detection-threshold: 60000
+      register-mbeans: true
+
+  # ---------------------------------------------------------------
+  # Flyway (schema migrations)
+  # ---------------------------------------------------------------
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  # ---------------------------------------------------------------
+  # MyBatis-Flex
+  # ---------------------------------------------------------------
+  mybatis-flex:
+    configuration:
+      map-underscore-to-camel-case: true
+      log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+  # ---------------------------------------------------------------
+  # Quartz scheduler (clustered, JDBC store, SQLite-friendly)
+  # Property keys use Quartz's internal camelCase naming.
+  #   - SQLiteDelegate (in schedule package) overrides getBlob() -> getBytes()
+  #   - isClustered=true + instanceId=AUTO: cross-JVM single-scheduler arbitration,
+  #     equivalent expression of CC scheduler lock intent (cronScheduler.ts:350 if(isOwner) gate;
+  #     OPD-Cron-04-01 decision). SQLite lacks SELECT ... FOR UPDATE so lockHandler is the
+  #     SQLite write-lock adapter (SQLiteClusterSemaphore) instead of the in-process semaphore
+  #     (in-process only, not cluster-safe).
+  #   - c3p0 is on the classpath as Quartz's default ConnectionProvider
+  # ---------------------------------------------------------------
+  quartz:
+    job-store-type: jdbc
+    jdbc:
+      initialize-schema: always
+    properties:
+      org:
+        quartz:
+          jobStore:
+            class: org.quartz.impl.jdbcjobstore.JobStoreTX
+            driverDelegateClass: com.nexusai.infra.schedule.SQLiteDelegate
+            dataSource: NexusAiQuartzDS
+            isClustered: true
+            # 锁接管探测对齐 CC cronScheduler.ts:44 LOCK_PROBE_INTERVAL_MS=5000（:434 setInterval）：
+            # 非 owner 会话每 5s 探测锁、owner 崩溃即接管。Quartz clusterCheckinInterval 默认 7500ms，
+            # 不收紧则接管延迟被抬到 7.5s（探查 SL-D2:115 D9），偏离 CC 5s 行为（决策 #16 / open-decisions.md:147）。
+            clusterCheckinInterval: 5000
+            lockHandler:
+              class: com.nexusai.infra.schedule.SQLiteClusterSemaphore
+          dataSource:
+            NexusAiQuartzDS:
+              driver: org.sqlite.JDBC
+              URL: "jdbc:sqlite:${NEXUSAI_HOME:./}nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"
+          scheduler:
+            instanceId: AUTO
+          threadPool:
+            threadCount: 4
+
+  # ---------------------------------------------------------------
+  # MVC path matching: use AntPathMatcher to support {path:.+}
+  # multi-segment matches (SessionFile path may contain '/' and '.').
+  # ---------------------------------------------------------------
+  mvc:
+    pathmatch:
+      matching-strategy: ant_path_matcher
+
+  # ---------------------------------------------------------------
+  # [U1] Multipart upload limits · PDF 混合传输（C）>5MB 大 PDF 走
+  # POST /api/v1/attachments/upload 落盘。Spring Boot 默认 max-file-size=1MB /
+  # max-request-size=10MB，无法承载 >5MB 上传；抬到 100MB 对齐
+  # PdfSupport.PDF_MAX_EXTRACT_SIZE（CC constants/apiLimits.ts:72）。
+  # ---------------------------------------------------------------
+  servlet:
+    multipart:
+      max-file-size: 100MB
+      max-request-size: 100MB
+
+  # ---------------------------------------------------------------
+  # Virtual Threads: requires JDK 21+; env is Java 17 so disabled.
+  # Upgrade to JDK 25 + spring.threads.virtual.enabled=true in Phase 6.
+  # Currently: NOT SET (Spring Boot 3.4 default is off).
+  # ---------------------------------------------------------------
+
+# =====================================================================
+# Custom nexusai properties
+# =====================================================================
+nexusai:
+  # ---------------------------------------------------------------
+  # [toolsearch mode] openai_compatible（deepseek）工具策略 · 三态互斥（ToolSearchService 消费）
+  # 背景：openai_compatible 模型（deepseek）无 Anthropic tool_reference/defer_loading 语义；
+  #   Java 扩展经 ToolSearch 返回完整 schema 文本（<functions>）让模型拿到参数即可调用。
+  #   search（默认，用户拍板 2026-09-01）→ 懒加载：defer 工具不进 API tools，模型经 ToolSearch
+  #     搜索拿完整 schema 当场调用（不激活）。
+  #   activate → 懒加载 + 激活：ToolSearch 确认的工具写入激活集，下轮进 API tools 直接可调
+  #     （搜索 + 激活提示；等效旧 activate-on-search=true；代价 = 激活时 tools 参数变化 → 前缀
+  #     缓存低频 break）。
+  #   full → 全发：所有工具（含 defer）全量进 schema，模型直接调用，排除 ToolSearch（无搜索环节，
+  #     等效旧「完整 schema 模式」；工具量大时 token 成本高）。
+  #   【废弃】activate-on-search 布尔已由 mode 取代（mode=activate / mode=search 对应旧 true/false）。 search|activate|full
+  # ---------------------------------------------------------------
+  toolsearch:
+    mode: search
+  # [pdf-vision-align] PDF 分大小框架阈值 · 对齐 CC constants/apiLimits.ts:66/72（3MB/100MB）。
+  # extract-size-threshold：PDF ≤该值走 document block，>该值≤max 走逐页 image block / 文本模型页图注册（3145728=3MB）。
+  # max-extract-size：PDF 提取路径最大文件尺寸，超过报 too_large（104857600=100MB）。
+  # 消费点：PdfSupport.getExtractSizeThreshold()/getMaxExtractSize()（PdfSupportConfig @Value 注入 → setThresholds）。
+  pdf:
+    extract-size-threshold: 3145728
+    max-extract-size: 104857600
+  # ---------------------------------------------------------------
+  # [附件双模式 + 统一附件表 contentId · 2026-09-02 用户拍板] 附件 local-read 开关。
+  # local-read=true：前后端同机（Tauri 本地桌面），大文件（>5MB PDF/媒体/大图）前端传本地绝对路径
+  #   path（AttachmentRequest.path），后端直读磁盘（省 upload）；消费/预览统一经 attachments 表
+  #   contentId → path。
+  # local-read=false：远程/Web，走 multipart upload（store 落盘）注册附件表。
+  # 消费点：ChatService.resolveAttachments path 分支 + AttachmentController /attachments/config
+  #   （AttachmentLocalReadConfig / @Value ${nexusai.attachments.local-read:false} 注入）。
+  # 远程部署覆盖：env NEXUSAI_ATTACHMENTS_LOCAL_READ=false
+  # ---------------------------------------------------------------
+  attachments:
+    local-read: true
+  # ---------------------------------------------------------------
+  # [access-log 可配置] API 访问日志（ApiAccessLogInterceptor 消费 · nexusai.access-log）
+  # 背景：前端轮询端点（/api/v1/schedules 定时任务 + /api/v1/tasks 异步任务 +
+  #   /api/v1/workflows/runs workflow 运行列表 + /api/v1/sessions/{id} 会话详情）每 2s
+  #   打后端，默认全量打印「开始请求 / 完成请求」两条日志刷屏；本配置可排除。
+  #   enabled:       总开关，默认 true（保持现状打印全部请求日志）；false = 全部静默。
+  #   exclude-uris:  排除 URI 前缀列表（前缀匹配 startsWith），命中前缀即不打印日志；
+  #                  可自行增删，常用于排除轮询 / 探活类高频端点。
+  #                  注意：/api/v1/sessions/ 带尾斜杠，精确排除 GET /sessions/{id} 详情
+  #                  轮询 + DELETE，不误伤 GET /sessions（列表）+ POST /sessions（创建）。
+  # 绑定类：com.nexusai.infra.filter.ApiAccessLogProperties（@ConfigurationProperties）。
+  # ---------------------------------------------------------------
+  access-log:
+    enabled: true
+    exclude-uris:
+      - /api/v1/schedules
+      - /api/v1/tasks
+      - /api/v1/workflows/runs
+      - /api/v1/sessions/
+  # 最大迭代次数 -1代表不限制
+  max-turns: -1
+  # [2026-08-24 虚拟线程改造] chatExecutor 已改 JDK 25 虚拟线程（无池上限，每 run 独立虚拟线程），
+  #   不再需要并发池配置。权限弹窗等无限等待不再占池线程（原 core=4 被多会话权限弹窗 run 占满
+  #   → 新会话排队卡住）。
+  # 各个厂商有不同的推理字段，支持手动配置
+  openai-reasoning-field:
+    - reasoning_content
+    - reasoning
+    - thinking
+    - reasoning_split
+  # [G3 决策] nexusai.home / NEXUSAI_HOME 已废弃（决策 D1 + 第二轮拍板）：
+  #   应用配置自有根统一 NexusaiPaths.getAppConfigHomeDir() = {user.home}/.nexusai
+  #   （spring.application.name=nexusai，见 NexusaiAppNameInitializer）。skills 根 =
+  #   {user.home}/.nexusai/skills；如需覆盖旧部署路径，用 nexusai.config.global-file /
+  #   settings-file 显式指定，不再读 nexusai.home。
+  # home: ${NEXUSAI_HOME:.}
+
+  # ---------------------------------------------------------------
+  # [M3.4] Transcript classifier 启用开关 · 对齐 CC Open-ClaudeCode/src/services/tools/toolExecution.ts:1075-1101
+  # `feature('TRANSCRIPT_CLASSIFIER') && permissionDecision.decisionReason?.type === 'classifier' && permissionDecision.decisionReason.classifier === 'auto-mode'`
+  # 启用后, classifier auto-mode Deny 路径触发 PermissionDenied hook 询问 retry 决策 → 注入 isMeta user message 允许 LLM 重试
+  # (CC createUserMessage({content, isMeta:true})).
+  # M3.4 决策: 默认值从 false (C-2 保守策略) 改为 true (与 CC 运行时 feature 行为对齐).
+  # ---------------------------------------------------------------
+  classifier:
+    transcript:
+      enabled: true
+
+  # ---------------------------------------------------------------
+  # [WF3-04 explainer] 权限解释器门控 · 对齐 CC permissionExplainerEnabled !== false
+  # (permissionExplainer.ts:139-141, 默认开)。false = opt-out 关闭权限弹窗风险解释。
+  # model 可显式指定解释器模型名；留空则回退 settings fast/main 主循环模型。
+  # ---------------------------------------------------------------
+  permission:
+    explainer:
+      enabled: true
+
+  # [R32-b7a-2 Phase 5] 用户类型 · 决定 ConfigTool 等敏感工具是否暴露给 LLM.
+  # default = 普通用户 (NexusAI 当前定位); ant = CC internal ant 环境.
+  # 对齐 CC env USER_TYPE=ant (config.ts:9).
+  user:
+    type: ${NEXUSAI_USER_TYPE:default}
+
+  # [R32-b7a-2 Phase 5] ConfigTool 工具开关 (ant + true 才注册 bean).
+  # 安全默认 false — 即使 ant 部署也需显式开启.
+  tools:
+    config:
+      enabled: ${NEXUSAI_CONFIG_TOOL_ENABLED:false}
+
+  # ---------------------------------------------------------------
+  # [IMP-H2 + websearch-ccalign V37 + websearch-resid R-B] WebSearch 后端引擎配置全部移 DB settings
+  #   （V37 列 websearch_engine/api_key/proxy/websearch_use_small_model + V38 列 websearch_base_url，
+  #   前端可配置）——本文件不再提供 engine/api-key/base-url（@Value 已全删，
+  #   base-url 走 DB settings.websearchBaseUrl，空 → AnySearchEngine.DEFAULT_BASE_URL 兜底）。
+  #   anysearch-ai API（POST {baseUrl}/v1/search，body {query, max_results, allowed_domains?,
+  #   blocked_domains?}，匿名可用低速率；api_key 空 → 内置默认兜底）。
+  # ---------------------------------------------------------------
+
+  # [R32-b7a-2 Phase 5] ConfigStorage 路径配置 (Phase 3 FileConfigStorage 读取).
+  # [G3 决策] 前缀由 ${NEXUSAI_HOME:.} 改为 ${user.home}（NEXUSAI_HOME 已废弃）。
+  # 默认 global-file = ~/.nexusai.json (对齐 CC ~/.claude.json); settings 无显式配置 → 走 NexusaiPaths 动态根
+  # (= NexusaiPaths.getAppConfigHomeDir()/settings.json，appName 默认 nexusai)。
+  config:
+    global-file: ${user.home}/.nexusai.json
+
+  # AES/GCM 256-bit key (base64). Dev default only.
+  # Generate new: openssl rand -base64 32
+  # v2: load from macOS Keychain via Tauri.
+  encryption:
+    key: "HxBcdiB5ncUwttp/2Z/kImpmtdG8gz79qbekIeGmAGc="
+
+  # ---------------------------------------------------------------
+  # [P2-4] Bundled skill 注册 feature flag · 对齐 CC src/skills/bundled/index.ts:35-78
+  # 编译期 feature('...') 门控. CC 生产 bundle (package/cli.js G15) 将 AGENT_TRIGGERS /
+  # AGENT_TRIGGERS_REMOTE / BUILDING_CLAUDE_APPS 三个 flag 编译为 true → loop/schedule/claude-api
+  # 无条件注册; KAIROS/KAIROS_DREAM/REVIEW_ARTIFACT/RUN_SKILL_GENERATOR 编译 false 且源文件在
+  # CC checkout 不存在 (幽灵引用, 生产永不注册, Java 不实现).
+  # Java 用 Spring 运行时等价 (接口用 Spring), 默认三 flag true + mcpSkills false 匹配 CC 生产注册集 (14 skill 不变).
+  # ---------------------------------------------------------------
+  skill:
+    features:
+      agent-triggers: true
+      agent-triggers-remote: true
+      building-claude-apps: true
+      # [P2-9/P1-9] MCP 技能门控 · CC original: feature('MCP_SKILLS') commands.ts:550/:558.
+      # 默认 false 对齐 CC 生产 bundle DCE（mcpSkills.ts 折叠 false，P1-9 拍板 Java 默认关）；
+      # 需启用 MCP skill 生产时显式置 true（kill-switch 语义：默认关、显式开）.
+      mcp-skills: true
+    # [P3-6] skill improvement 检测器注册门控 · CC original:
+    #   feature('SKILL_IMPROVEMENT') && getFeatureValue_CACHED_MAY_BE_STALE('tengu_copper_panda', false)
+    #   (skillImprovement.ts:176-179) 双门控皆真才注册 — Java 折叠为单配置项, 默认 false 不注册检测器
+    #   (对齐 CC 生产 bundle DCE); true 时启用远程 kill-switch 语义. applySkillImprovement 独立导出不受影响.
+    improvement-enabled: false
+    # [P2-2] user/project 技能源加载开关 · CC original: isSettingSourceEnabled('userSettings'/'projectSettings')
+    #   (settings/constants.ts:174-177，由 CLI --settings 状态驱动；Java Web 后端无 CLI，concern #2 补开关)。
+    #   CC 缺省全源启用（allowedSettingSources 缺省含 user/project，state.ts:313-319），Java 默认 true 对齐；
+    #   false 时关停对应源加载（user → userSettings 源，project → projectSettings/additional/bare 依赖 project）。
+    sources:
+      user-settings: true
+      project-settings: true
+
+  # ---------------------------------------------------------------
+  # [CRON-A5] Cron 工具门控 · 对齐 CC Open-ClaudeCode/src/tools/ScheduleCronTool/prompt.ts
+  # isKairosCronEnabled (:36-45) + isDurableCronEnabled (:56-62)：
+  #   - agent-trigger-cron 对应 CC 编译期 feature('AGENT_TRIGGERS')（生产 bundle G15 编译 true）→
+  #     三 Cron 工具 @ConditionalOnProperty(name="nexusai.feature.agent-trigger-cron",
+  #     matchIfMissing=true) 默认注册 + 运行时 isEnabled() 委托 CronEnabledGates。
+  #   - cron-durable 对应 CC GrowthBook 'tengu_kairos_cron_durable' 默认 true（Java 无 GrowthBook，
+  #     用配置建模；不 consult CLAUDE_CODE_DISABLE_CRON）。默认 true，显式置 false 强制 durable:false。
+  #   两者默认 true = 默认开（对齐 CC /loop GA + GB 默认 true）；CC 本地 kill-switch
+  #   CLAUDE_CODE_DISABLE_CRON env truthy 时运行时 isEnabled 关闭（CronEnabledGates 委托
+  #   BundledSkillEnabledGates.isKairosCronEnabled 判定）。
+  # ---------------------------------------------------------------
+  # [CM5-D-11 / D-02] TEAMMEM 门控 · 对齐 CC 编译期 feature('TEAMMEM')（memory/types.ts:9
+  #   MEMORY_TYPE_VALUES 含 TeamMem 仅 TEAMMEM 开启时；watcher.ts:253 startTeamMemoryWatcher 首闸）。
+  #   CC 发行默认 [INFERENCE]（生产 bundle 编译宏不可读），OPD-CM3-10 拍板 Java 默认关；
+  #   Java 用 Spring 运行时等价 FeatureFlags.teamMem()（FeatureFlags.java:237
+  #   ${nexusai.feature.team-mem:false}），OAuth 上线前按需激活（D-02）。默认 false。
+  feature:
+    # [2026-09-01] WORKFLOW_SCRIPTS feature 开启 → WorkflowTool.isEnabled()=true（暴露给模型，
+    #   多代理编排 / ultracode 依赖）；默认 false 时 Workflow 工具不暴露（ToolSearch 搜不到）。
+    workflow-scripts: true
+    # [2026-09-01 → V61 迁移 DB] 插件双读开关已迁移为 DB settings.plugin_claude_fallback
+    #   （前端「插件设置」页可配；null = 回落默认 true）。本 yml 键已废弃——仅保留占位，
+    #   实际消费点 InstalledPluginsManager / InstalledPluginsFileStore 改读 DB 列。
+    plugin-claude-fallback: true
+    agent-trigger-cron: true
+    cron-durable: true
+    # [CM5-D-11 / D-02] TEAMMEM 编译期 feature 门控 · CC memory/types.ts:9 + watcher.ts:253 ·
+    # 默认 false（OPD-CM3-10 拍板；生产默认惰性，OAuth 上线前按需激活）。true = FeatureFlags.teamMem()
+    # 使 isTeamMemFeatureEnabled()（TeamMemPaths.java:417-419）通过第一闸，watcher/同步链路可启动。
+    team-mem: true
+    # [OD-01 S1] HISTORY_SNIP feature flag · 对齐 CC query.ts:115/401（feature('HISTORY_SNIP')）
+    # 默认开 = 开 SnipTool 注册 + 主循环 snip 门（microcompact 之前运行，二者非互斥）。
+    history-snip: true
+    # [OD-01 S1] tengu_session_memory GB flag · 对齐 CC sessionMemoryCompact.ts:412-415
+    # 默认开 = 开会话记忆提取（fork LLM 提取有成本）+ 与 sm-compact 作 AND 决定 SM 压缩。
+    sm-session-memory: true
+    # [OD-01 S1] tengu_sm_compact GB flag · 对齐 CC sessionMemoryCompact.ts:416-419
+    # 默认开 = SM 压缩优先（与 sm-session-memory 作 AND）。
+    sm-compact: true
+
+  # ---------------------------------------------------------------
+  # [ODF-A3] bare 模式统一判定 · Java 独有增强（CC envUtils.ts:60-65 无对应配置）
+  # CC 真源 isBareMode() = isEnvTruthy(CLAUDE_CODE_SIMPLE) || argv includes '--bare'；
+  # Java Web 后端无 --bare argv，仅建模 env 通道。
+  # 优先级：nexusai.memory.bare-mode 显式设置 → env CLAUDE_CODE_SIMPLE truthy 集 {1,true,yes,on}
+  #       → 默认 false。true = 跳过 auto-memory / auto-dream / skills 自动发现 / prompt-suggestion。
+  # 注释（未设置）= 走 env（默认对齐 CC）。判定入口 MemoryBareModeConfig.isBareMode()。
+  memory:
+    # bare-mode: true
+    # [IMP-CM-19] remote mode 统一判定 · Java 独有增强（CC bootstrap/state.ts:1631-1637 无对应配置）
+    # CC 真源 getIsRemoteMode() = STATE.isRemoteMode（默认 false :390），仅经 main.tsx:3328/3447
+    #   setIsRemoteMode(true) CLI 置位；Java Web 后端无 --remote/--teleport argv，用配置通道建模。
+    # 优先级：nexusai.memory.remote-mode 显式设置 → 默认 false。true = SM 提取 init
+    #   （sessionMemory.ts:358）/ extract 提取（extractMemories.ts:549-552）跳过。
+    # 注释（未设置）= 默认 false（对齐 CC state.ts:390）。判定入口 MemoryRemoteModeConfig.isRemoteMode()。
+    # remote-mode: true
+
+  # ---------------------------------------------------------------
+  # [RES-R7] Prompt caching 1h TTL · 用户拍板（探查/system_prompt/implementation/09-open-decisions.md §六 R7）：
+  #   默认 1h 生效（enable=true, ttl='1h'）、不做 CC 用户资格门控（should1hCacheTTL 简化，claude.ts:393-434）、
+  #   仅 Anthropic 有效（OpenAI 由提供商决定缓存策略，不适用 Anthropic cache_control ttl）。
+  #   enable=false → cache_control 恒不输出 ttl 字段（与改造前字节一致，可回退）。
+  #   ttl 可配任意 Anthropic 支持的 TTL 值（如 '1h'/'5m'）。
+  # ---------------------------------------------------------------
+  prompt-caching:
+    enabled: true
+    ttl: "1h"
+
+  # ---------------------------------------------------------------
+  # MCP (Model Context Protocol) configuration
+  # R32-b7a-3 方案 A: 5 个 stub Tool 通过 nexusai.mcp.features.* 暴露,
+  # 默认全部 disabled. 开启后将由 McpToolPool 启动期 tools/list
+  # 拉取同名 MCP tool 自动覆盖 stub.
+  # 配置项设计: 探查/findings/r32-b7a-3-explore.md §6
+  # ---------------------------------------------------------------
+  mcp:
+    # 全局 MCP 开关 (默认关闭 — 需明确启用后 McpToolPool 才装配 server)
+    enabled: false
+
+    # [impl-I-3 T1] channel 全局 runtime 开关 · CC original: isChannelsEnabled() (channelAllowlist.ts:51-53,
+    # GrowthBook 'tengu_harbor')。默认 false → --channels 是 no-op、无 channel 通知 handler 注册。
+    channels-enabled: false
+    # [impl-I-3 T6] channel permission relay 开关 · CC original: isChannelPermissionRelayEnabled()
+    # (channelPermissions.ts:36-38, GrowthBook 'tengu_harbor_permissions')。独立于 channels-enabled。
+    channels-permission-relay-enabled: false
+
+    # MCP tool pool 并发/超时配置
+    pool:
+      max-concurrent-calls: 4
+      call-timeout-ms: 30000
+      serialize-same-server: true
+
+    # MCP server 列表 (按需添加; 注释示例: filesystem / web-browser / github)
+    # transport 可选: stdio / sse / http / ws / sdk / claudeai-proxy
+    servers: []
+
+    # Feature flags — 5 个 stub Tool 的开关 (默认全部 false)
+    features:
+      web-browser-tool: false        # 对应 WebBrowserTool stub
+      list-peers-tool: false         # 对应 ListPeersTool stub
+      send-user-file-tool: false     # 对应 SendUserFileTool stub
+      push-notification-tool: false  # 对应 PushNotificationTool stub
+      subscribe-pr-tool: false       # 对应 SubscribePRTool stub
+
+    # OAuth / Authorization Server discovery
+    auth:
+      oauth-enabled: false
+      as-discovery-timeout-ms: 5000
+
+    # MCP resources 端点 (McpToolPool resources/list + resources/subscribe)
+    resources:
+      list-enabled: true
+      subscribe-enabled: false
+
+    # MCP prompts 端点 (McpToolPool prompts/list)
+    prompts:
+      list-enabled: false
+
+    # [impl-I-4 T3] 启动异步预取 enabled MCP servers · CC original: main.tsx bootstrap 启动即预取
+    # (prefetchAllMcpResources client.ts:2408-2473)。默认 true（对齐 CC 启动即预取）；
+    # false → 维持 REST 手动 start。
+    prefetch-on-startup: false
+
+    # [RES-07d] official MCP registry 启动 prefetch · CC original: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+    # 门控 + main.tsx:418 prefetchOfficialMcpUrls（officialRegistry.ts:33-60）。默认 true（对齐 CC 启动即
+    # fire-and-forget 抓取）；false → 跳过（无网络请求），isOfficialMcpUrl fail-closed 返回 false。
+    prefetch-official-registry: false
+
+    # [impl-I-4 T5] MCP 大结果输出 token 上限 · CC original: getMaxMcpOutputTokens()
+    # (mcpValidation.ts:26-47, env MAX_MCP_OUTPUT_TOKENS > growthbook > 默认 25000)。
+    # Java 无 growthbook → yml 承接；env 覆盖由 ${MAX_MCP_OUTPUT_TOKENS:25000} placeholder 处理。
+    output:
+      max-tokens: ${MAX_MCP_OUTPUT_TOKENS:64000}
+
+  # ------------------------------------------------------------------
+  # 安全配置（BearerTokenAuthFilter 注入源 · nexusai.security.require-oauth-auth）
+  # 默认 true = deny-all（对齐 CC auth.ts:1960 validateForceLoginOrg fail-closed：无法校验 org → 拒绝）；
+  # false = 条件放行（fail-open 过渡态逃逸阀，仅 token 生产链未接通过渡期；接通后必须保持 true）。
+  # @Value 默认 :true 兜底（yml 键缺失仍 deny）；可经 env NEXUSAI_SECURITY_REQUIRE_OAUTH_AUTH=false 覆盖。
+  # ------------------------------------------------------------------
+  security:
+    require-oauth-auth: false
+
+# =====================================================================
+# Actuator
+# =====================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+# =====================================================================
+# Springdoc / OpenAPI 3
+# =====================================================================
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
+# =====================================================================
+# Server
+# =====================================================================
+server:
+  port: 3458
+
+# 日志（logback-spring.xml：控制台 %highlight 颜色 + 文件滚动 + 异步；无 SkyWalking）
+logging:
+  file:
+    path: logs

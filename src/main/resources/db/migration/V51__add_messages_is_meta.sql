@@ -1,0 +1,28 @@
+-- ===================================================================
+-- V51: messages 表新增 is_meta 列（元消息标志）
+--
+-- 背景：ChatMessageDto.isMeta（R32-c-1 字段，CC original: isMeta，messages.ts:3753
+--   createUserMessage({..., isMeta:true}) / useScheduledTasks.ts:76 cron 入队 isMeta 语义）
+--   此前未持久化——DB 转录重放（listBySession / 恢复漏斗）读回恒 false（MessageService.toDto
+--   R32-c-1 缺省），cron user prompt 落库后前端可见为普通 user 气泡（与 CC「isMeta=true →
+--   UI 隐藏但模型可见」存在差异，登记 §41.2 已知偏差）。
+--
+-- WHY（持久化闭环）：cron 触发的 user prompt（TestJob.enqueueLead / CronIdleExecutor
+--   surfaceMissedOneShots 以 workload=WORKLOAD_CRON 入队，QueueItem.isMeta=true）消费落库时须
+--   还原 isMeta=true → 前端按 isMeta 隐藏 cron user 气泡（仅显示 scheduled_task_fire + assistant
+--   回复）；mid-turn 注入的 task-notification user 消息同样 isMeta=true → 前端隐藏、模型可见。
+--   语义 = CC original isMeta（messages.ts:3753 createUserMessage({..., isMeta:true}) /
+--   useScheduledTasks.ts:76 cron 入队 isMeta 语义 —— UI 隐藏但模型可见）：
+--     - cron user prompt：isMeta=true（系统生成，非用户输入）
+--     - 普通 user 输入（createUserMessage / 排队 prompt）：isMeta=false
+--     - 系统消息（scheduled_task_fire 等）：isMeta=false（CC createScheduledTaskFireMessage
+--       messages.ts:4385-4392 isMeta=false，仍可见）
+--     - task-notification mid-turn 注入消息：isMeta=true（前端隐藏、模型可见）
+--
+-- 列（MyBatis-Flex snake↔camel 自动映射，同 V47 user_message_id 列范式）：
+--   is_meta ↔ isMeta（Boolean；SQLite 无 BOOLEAN → INTEGER 0/1）。
+-- 存量旧行该列为 NULL（用 NULLABLE 而非 NOT NULL DEFAULT 0 —— MyBatis-Flex 默认 insert 是否
+--   含 null 列未配置（application.yml:64-67 无 ignoreNulls），7 处 insert 点大多不设 isMeta，
+--   NULLABLE 列保安全；toDto 读侧 Boolean.TRUE.equals(...) 容错 null→false）。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN is_meta INTEGER NULL;

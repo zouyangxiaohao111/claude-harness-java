@@ -1,0 +1,19 @@
+-- ===================================================================
+-- V43: sessions 表加 todos（会话级 todo 持久化 · R3）
+--
+-- 背景：todo 会话级跨 send/重启存活（用户拍板 R3 永久，2026-08-24）。
+--   CC appState.todos[todoKey]（TodoWriteTool.ts:65-94）为 React useState 内存态；
+--   Java Web 多会话无进程级 appState 单例 → 会话级状态必须存 sessions 表列
+--   （multi-session-vs-cc-single-session 铁律，effort_level V31 / bare_mode V33 /
+--   disabled_tools V35 / team_context V40 同款范式）。V1 内存版（AgentState.todos）
+--   只存活最近一次 send，R3 在其上加持久。
+--
+-- todos TEXT（JSON 对象，可空；null = 该会话从未 TodoWrite）：结构对齐 CC
+--   appState.todos {todoKey: TodoItem[]}，TodoItem = {content, status:
+--   pending|in_progress|completed, activeForm}（status 小写，CC types.ts:4-6 值域）。
+--   Java 端 camelCase 字段 todos，MyBatis-Flex 自动 snake_case↔camelCase 转换
+--   （同 effort_level / team_context 既有列约定）。读写：TodoWriteTool.
+--   todosMapToJson/todosJsonToMap（Jackson 规范形）+ SessionService.parseTodos
+--   （fastjson2 解析态）+ LlmAgentLoop doRun 回读注入，三通道共用同一规范形。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN todos TEXT;

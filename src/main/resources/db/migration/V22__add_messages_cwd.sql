@@ -1,0 +1,17 @@
+-- ===================================================================
+-- V22: Add messages.cwd column (G13 · 对齐 CC transcript 消息 cwd 戳)
+-- ===================================================================
+-- CC 真源（自验，不信注释）：
+--   * sessionStorage.ts:1059 {@code cwd: getCwd()} —— CC 每条 transcript 消息
+--     在落 jsonl 时戳入当前工作目录（消息产生时 cwd）；
+--   * sessionStorage.ts:2522 / 4680 {@code projectPath: firstMessage.cwd}
+--     —— /resume 与 session 列表用首条消息的 cwd 作为 projectPath 恢复目录上下文；
+--   * sessionStorage.ts:4751 {@code extractJsonStringField(head, 'cwd')}
+--     —— lite 读回时从消息头提取 cwd 字段（旧 jsonl 无该字段 → undefined 容错）。
+-- Java 等价：messages 表（Java 的 transcript 持久化载体，CC 为 jsonl）新增 cwd 列，
+--   写侧（MessageService.createUserMessage/appendMessage/replaceSessionMessages +
+--   ChatService.newAssistantMessage/newToolMessage）在落库时经
+--   CwdResolution.getCwd(sessionId) 戳入；读侧 MessageService.toDto 回填到
+--   ChatMessageDto.cwd。存量旧行该列为 NULL（对齐 CC 旧 jsonl 无 cwd 容错）。
+-- SQLite 单 ALTER 即可（messages 表无重建约束），列可空，无默认值。
+ALTER TABLE messages ADD COLUMN cwd TEXT;

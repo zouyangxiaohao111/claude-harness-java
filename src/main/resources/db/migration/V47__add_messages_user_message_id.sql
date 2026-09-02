@@ -1,0 +1,28 @@
+-- ===================================================================
+-- V47: messages 表新增 user_message_id 列（发起该轮的用户消息 id）
+--
+-- 背景：ChatMessageDto.userMessageId（净新增字段，对齐 CC parentUuid 链
+--   sessionStorage.ts:1001-1068 insertMessageChain 的 transcriptMessage.parentUuid）
+--   此前未持久化——前端消息流/排队按 userMessageId 锚定（一个 userMessageId 一个
+--   flow，工具轮挂主气泡下），GET /messages 读回恒 null（toDto 缺省），前端无法
+--   归组历史转录。
+--
+-- WHY（持久化闭环）：DB 转录重放（listBySession / 恢复漏斗）必须还原 userMessageId，
+--   否则前端消息流/排队锚定在历史消息上失真。语义 = 每条消息所属的「发起该轮的
+--   user 消息 uuid」：
+--     - user 消息：user_message_id = 自己的 id（CC 链中 user 消息 uuid 作链根，
+--       sessionStorage.ts:1066-1068 isChainParticipant 后 parentUuid = message.uuid）
+--     - assistant 消息：user_message_id = 发起该轮的用户消息 id（CC
+--       transcriptMessage.parentUuid = 前一条链参与消息 uuid，turn 内首个链根即
+--       user 消息 uuid）
+--     - tool/tool_result：跟随所属 assistant 的 user_message_id（CC
+--       effectiveParentUuid = sourceToolAssistantUUID，sessionStorage.ts:1028-1037；
+--       Java 侧 turn 内所有 assistant/tool 同源 = replayAndPersist 的 userMessageId）
+--     - 排队用户消息：user_message_id = 排队命令 uuid（自身 id）
+--   system 消息（cron 触发 scheduled_task_fire 等）不在用户轮内 → NULL。
+--
+-- 列（MyBatis-Flex snake↔camel 自动映射，同 V46 image_paste_ids 列范式）：
+--   user_message_id ↔ userMessageId（String；VARCHAR(64) 容纳 msg-xxx / msg-queued-xxx id）。
+-- 存量旧行该列为 NULL（前端 null = 无归属，容错）。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN user_message_id VARCHAR(64) NULL;

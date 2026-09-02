@@ -1,0 +1,21 @@
+-- ===================================================================
+-- V46: messages 表新增 image_paste_ids 列（图片粘贴序号 JSON 数组字符串）
+--
+-- 背景：ChatMessageDto.imagePasteIds（R32-b9 · 对齐 CC
+--   messages.ts:460-523 createUserMessage 签名的 imagePasteIds?: number[]，
+--   Java 端按 brief 使用 List<String>）此前仅存内存消息流（LlmAgentLoop A4
+--   媒体注入 buildUserMessageWithImages 构造 imagePasteIds），DB 未持久化
+--   —— GET /messages 读回恒空列表（toDto 旧占位 R32-b9 "DB schema 未持久化"）。
+--
+-- WHY（持久化闭环）：前端重拉缩略图需消息携带图片粘贴序号（CC getNextImagePasteId
+--   全局累计跨 Role）；转录重放（listBySession/恢复漏斗）必须还原 imagePasteIds，
+--   否则 TokenEstimator/Tokens 图片 token 估算、前端图链展示在历史消息上失真。
+--
+-- 存储形态：JSON 数组字符串（["1","2",...]），对齐 structured_output V6 / compact
+--   metadata V13 同款 JSON 文本通道（MessageService.serializeStringList/parseStringList
+--   round-trip 闭环）。null/空 = 无图片。
+--
+-- 列（MyBatis-Flex snake↔camel 自动映射，同 V44 permission_mode 列范式）：
+--   image_paste_ids ↔ imagePasteIds（String；VARCHAR(512) 容量 50 附件上限 × 序号长度有余）。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN image_paste_ids VARCHAR(512) NULL;

@@ -1,0 +1,36 @@
+# ===== Build outputs =====
+target/
+dist/
+dist-electron/
+node_modules/
+*.class
+*.jar
+
+# ===== IDE =====
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# ===== Runtime data / local config =====
+*.log
+nexusai.db
+nexusai.db-journal
+nexusai.db-wal
+nexusai.db-shm
+nexusai.db.bak-*
+.env
+settings.json
+
+# ===== Tauri / Rust =====
+src-tauri/target/
+src-tauri/nexusai-debug.log
+
+# ===== MCP local config (user-specific) =====
+.mcp.json
+.nexusai.json
+
+# ===== Index / tooling =====
+.gitnexus/
+.nexusai/
+.worktrees/

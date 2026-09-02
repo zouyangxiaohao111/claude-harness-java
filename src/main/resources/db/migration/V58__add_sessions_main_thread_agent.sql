@@ -1,0 +1,29 @@
+-- ===================================================================
+-- V58: sessions 表新增会话指定主线程 agent 列（SP-03）
+-- [prompt-align SP-03] 不加 DEFAULT，null = 该会话未指定主线程 agent
+--   （回落默认系统提示组装链），零行为变化。
+--
+-- 背景（multi-session-vs-cc-single-session 铁律，effort_level V31 /
+--   bare_mode V33 / todos V43 / loop_mode_override V57 同款会话列范式）：
+--   main_thread_agent 对齐 CC appState.agent（CLI 单会话进程内存态，用户经
+--   /init --agent 设置）+ resumeAgent.ts:121-124 mainThreadAgentDefinition =
+--   appState.agent ? activeAgents.find(a => a.agentType === appState.agent)：
+--   非空 → getSystemPrompt 生成 agentSystemPrompt 替换 custom/default
+--   （systemPrompt.ts:77-83）。Java Web 多会话无进程级 appState 单例，
+--   若入全局 settings(id=1) 会跨会话泄漏 → 存 sessions 表会话列，随 sessionId
+--   归属，前端会话级可配。
+--
+-- 列 CC original（Open-ClaudeCode 真源，不信注释看行为；行号以 worktree HEAD
+--   6fe89de61 锚定，均 grep -n 复验）：
+--   main_thread_agent ↔ appState.agent / mainThreadAgentDefinition：
+--     CC systemPrompt.ts:77-83（mainThreadAgentDefinition 非空 →
+--     agentSystemPrompt = def.getSystemPrompt(...)，:115-122 agentSystemPrompt
+--     优先替换 custom/default）；resumeAgent.ts:121-124（appState.agent →
+--     activeAgents.find）。TEXT 可空：null = 未指定，分支休眠（Java 现行为）。
+--     值 = agentType 串（Java AgentDefinitionRegistry.findAgent 等价 lookup）。
+--
+-- 写侧：SessionService.update PATCH 合并（req.mainThreadAgent() != null →
+--   setMainThreadAgent，null 不改动）；读侧消费：LlmAgentLoop.buildEffectivePromptOptions
+--   （SP-03）→ mainThreadAgentDefinition supplier + agent 分支 gate 激活。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN main_thread_agent TEXT;

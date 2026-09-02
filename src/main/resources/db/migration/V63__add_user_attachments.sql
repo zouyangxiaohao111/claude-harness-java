@@ -1,0 +1,19 @@
+-- ===================================================================
+-- V63: messages 表新增 user_attachments 列（user 消息附件快照 JSON 数组）
+--（V62 编号已被 snip_metadata 迁移占用，本迁移顺延 V63）
+--
+-- 背景：ChatMessageDto.userAttachments（净新增字段，非 CC 对齐）记录 user 消息
+--   发送时携带的全部附件（type+filename 快照，含图片），供前端 F5 重拉显示附件
+--   chip。此前附件仅存在于内存请求（SendMessageRequest.attachments），DB 未持久化
+--   —— GET /messages 读回无附件信息。
+--
+-- WHY（持久化闭环）：前端 F5 / 历史消息重拉需还原附件 chip（对齐 CC 消息模型
+--   attachment 展示）。存储形态 = JSON 数组文本（[{"type":"file","filename":"a.pdf"},
+--   {"type":"image","filename":"a.png"}]），对齐 image_paste_ids V46 / structured_output
+--   V6 同款 JSON 文本通道（MessageService.serializeUserAttachments/parseUserAttachments
+--   round-trip 闭环）。null/空 = 无附件。
+--
+-- 列（MyBatis-Flex snake↔camel 自动映射，同 V46 image_paste_ids 列范式）：
+--   user_attachments ↔ userAttachments（String；TEXT 容纳任意数量附件快照）。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN user_attachments TEXT;

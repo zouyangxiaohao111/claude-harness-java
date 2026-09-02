@@ -1,0 +1,36 @@
+-- ===================================================================
+-- V57: sessions 表新增提示词对齐会话级门控 3 列（会话/运行级状态入 DB
+--   sessions 会话列，前端会话级可配 + 后续批次 SP-01/SP-10/GLB-03 消费）
+-- [prompt-align G0-01] 全部不加 DEFAULT，null = 未配置回落原判定链
+--   （env / FeatureFlags / 交互式默认），零行为变化。
+--
+-- 背景（multi-session-vs-cc-single-session 铁律，effort_level V31 /
+--   bare_mode V33 / todos V43 同款会话列范式）：loop_mode_override /
+--   non_interactive_session / auto_mode_enabled 属 CC appState 会话/运行级
+--   状态（CC CLI 单会话进程内存态）；Java Web 多会话无进程级 appState 单例，
+--   若入全局 settings(id=1) 会跨会话泄漏（A 会话设 loop 模式 → 全部会话被
+--   覆盖）。故存 sessions 表会话列，随 sessionId 归属（G0-02 仅加 SessionRecord
+--   实体字段；写侧会话创建/恢复链与读侧消费 SP-01/SP-10/GLB-03 属后续批次）。
+--
+-- 各列 CC original（Open-ClaudeCode 真源，不信注释看行为；行号以
+--   worktree HEAD 6fe89de61 锚定，均 grep -n 复验）：
+--   loop_mode_override ↔ loopModeOverride：
+--     CC utils/systemPrompt.ts:56-58 overrideSystemPrompt 早退——override
+--     非空 → 直接 asSystemPrompt([overrideSystemPrompt]) 替换全部系统提示
+--     （--loop CLI 运行模式承载）。TEXT 可空：null = 不触发 override。
+--   non_interactive_session ↔ nonInteractiveSession：
+--     CC bootstrap/state.ts:1057-1059 getIsNonInteractiveSession() =
+--     !STATE.isInteractive；constants/prompts.ts:368-370（非交互会话不注入
+--     '!' 前缀 shell 命令建议子弹）。INTEGER 可空：null = false 交互式。
+--   auto_mode_enabled ↔ autoModeEnabled：
+--     CC utils/messages.ts:3860-3870 case 'auto_mode' → getAutoModeInstructions
+--     （getAutoModeFullInstructions 连续自主执行提示，:3419-3432）+ permissions
+--     GetNextPermissionMode 联动（auto 档连续自主执行）。INTEGER 可空：
+--     null = feature 门默认关。
+--
+-- 读链：SessionService 会话 CRUD 读写本 3 列（对齐 effort_level/bare_mode
+--   会话列通道）；消费点见后续批次 SP-01/SP-10/GLB-03。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN loop_mode_override TEXT;
+ALTER TABLE sessions ADD COLUMN non_interactive_session INTEGER;
+ALTER TABLE sessions ADD COLUMN auto_mode_enabled INTEGER;

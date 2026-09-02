@@ -1,0 +1,24 @@
+-- ===================================================================
+-- V44: settings.permission_mode 全局默认 + sessions.permission_mode 会话覆盖
+--
+-- 背景：前端 types.ts 已定义 6 值 PermissionMode 联合（:297）并建模
+--   SettingsDto.permissionMode（:347）/ SessionDto.permissionMode（:435）/
+--   SessionUpdateRequest.permissionMode（:519）——后端落库 + 解析链是缺口。
+--   CC original: settings.permissions.defaultMode（permissionSetup.ts:743-771）；
+--   Web 多会话需会话级覆盖（multi-session-vs-cc-single-session 铁律，
+--   effort_level V31 / bare_mode V33 同款会话列范式）。
+--
+-- 1) settings.permission_mode TEXT 可空 = 全局默认权限模式。
+--    null = 未配置 → 回落 settings.json defaultMode（InitialPermissionModeSource
+--    磁盘三源 user<project<local）→ default。对齐 V34 auto_memory_directory 列范式。
+-- 2) sessions.permission_mode TEXT 可空 = 会话级覆盖。null = 未覆盖。
+--    PATCH /api/v1/sessions/{id} 写本列；ChatService 解析 effectiveMode 读本列。
+--
+-- 值域：6 值 CC 字符串（default/plan/acceptEdits/bypassPermissions/dontAsk/auto）。
+--   ⚠ 必须存 CC 串（acceptEdits），非枚举 name（ACCEPT_EDITS 不被 fromString 识别
+--   → 静默折叠 default，设置"不生效"）。isSettable 写侧校验 + 本注释双防。
+-- Java 端 camelCase 字段 permissionMode，MyBatis-Flex 自动 snake↔camel
+-- （同 agentSwarmsEnabled V42）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN permission_mode TEXT;
+ALTER TABLE sessions ADD COLUMN permission_mode TEXT;

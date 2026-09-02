@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "NexusAI in Chrome",
+  "version": "0.1.0",
+  "description": "NexusAI 浏览器自动化扩展：连接后端 /ws/browser，执行 read_page/find/form_input/computer 等 18 个浏览器工具",
+  "permissions": ["tabs", "scripting", "activeTab", "storage", "windows", "alarms"],
+  "host_permissions": ["<all_urls>", "http://localhost:3458/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false,
+      "match_about_blank": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "NexusAI in Chrome"
+  }
+}

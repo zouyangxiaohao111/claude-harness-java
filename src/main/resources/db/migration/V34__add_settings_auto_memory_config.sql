@@ -1,0 +1,21 @@
+-- ===================================================================
+-- V34: settings 表新增 auto_memory_directory / auto_memory_enabled 列
+--
+-- 背景：OPD-CM5-C-05（context-memory_v5 拍板）——autoMemoryDirectory 存 DB setting，
+--   前端"模型配置页-环境配置"可配置，对齐 CC 给默认值（getAutoMemPath 默认 auto 记忆路径）；
+--   autoMemoryEnabled 也存 DB + 前端，仅自动记忆打开才能配置路径（联动，前端控制）。
+--   企业级通道（policySettings）本期不实现；flag 登记 N/A；
+--   CLAUDE_COWORK_MEMORY_PATH_OVERRIDE 注释保留不启用。
+--
+-- 列：auto_memory_directory（TEXT 可空）= 前端配置的 auto 记忆目录绝对路径；
+--     auto_memory_enabled（INTEGER 可空，0/1）= 前端配置的自动记忆总开关。
+--   Java 端 camelCase 字段（autoMemoryDirectory / autoMemoryEnabled），
+--   MyBatis-Flex 自动 snake_case↔camelCase 转换（同 effort_level 既有列约定）。
+--
+-- 读链：AutoMemPaths.readAutoMemoryDirectorySetting / BundledSkillEnabledGates
+--   .readAutoMemoryEnabledSetting 均 DB 列优先 → 无则 settings 文件（既有文件承载保留
+--   为回落）；未配置（null）→ 对齐 CC 默认值（autoMemoryEnabled 默认 true / 路径默认
+--   per-project AutoMemPaths 计算）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN auto_memory_directory TEXT;
+ALTER TABLE settings ADD COLUMN auto_memory_enabled INTEGER;

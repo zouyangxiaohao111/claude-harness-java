@@ -1,0 +1,15 @@
+-- ===================================================================
+-- V39: sessions 表加 team_context（会话级 swarm teamContext）
+--
+-- 背景：CC 侧 teamContext 存 appState（TeamCreateTool.ts:201-216 setAppState(teamContext)，
+--   session-global 稳定态），Java Web 多会话无进程级 appState 单例 → 会话级状态必须存
+--   sessions 表列（multi-session-vs-cc-single-session 铁律，effort_level V31 / bare_mode V33 /
+--   disabled_tools V35 同款范式）。TeamCreateTool 写、TeamDeleteTool 清、SendMessageTool 读，
+--   跨工具/跨回合/重开会话存活（对应 SwarmReconnection「resumed session restore」场景）。
+--
+-- team_context TEXT（JSON 对象，可空；null = 未设）：结构对齐 CC appState.teamContext
+--   {teamName, teamFilePath, leadAgentId, teammates:{[leadAgentId]:{name,agentType,cwd,...}}}。
+--   Java 端 camelCase 字段 teamContext，MyBatis-Flex 自动 snake_case↔camelCase 转换
+--   （同 effort_level / bare_mode / disabled_tools 既有列约定）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN team_context TEXT;

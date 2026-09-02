@@ -1,0 +1,13 @@
+-- ===================================================================
+-- V30: models 表删除 context_window 列（历史纯展示字段）
+--
+-- 背景：models.context_window（默认 512000，V1__init_schema.sql:34）是历史纯展示字段，
+-- 运行时上下文窗口解析链不用它——0.4.0 打通后统一读 models.max_context_tokens
+-- （V24 加列，W2-1 模型级窗口）。全链路已删 contextWindow（Model/ModelRecord/ModelDto/
+-- ModelCreateRequest/ModelUpdateRequest/ModelService/ProviderService），本迁移删 DB 列。
+--
+-- SQLite ALTER TABLE DROP COLUMN 支持（SQLite >= 3.35.0，sqlite-jdbc 3.46.0.0），
+-- 无需脱离事务重建表（V19__drop_sessions_original_cwd.sql / V26__provider_env_settings.sql
+-- 仓库既有先例；FK 安全，不触发级联删除）。
+-- ===================================================================
+ALTER TABLE models DROP COLUMN context_window;

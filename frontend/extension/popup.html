@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>NexusAI in Chrome</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 320px;
+      font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background: #1e1f24;
+      color: #e6e6ea;
+      padding: 16px;
+    }
+    .head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .dot.on { background: #34d399; box-shadow: 0 0 6px #34d399; }
+    .dot.off { background: #f87171; box-shadow: 0 0 6px #f87171; }
+    .title { font-size: 13px; font-weight: 600; color: #fff; }
+    .status { font-size: 12px; color: #9ca3af; margin-bottom: 14px; min-height: 16px; }
+    .ws { font-size: 11px; color: #6b7280; font-family: ui-monospace, Consolas, monospace; margin-bottom: 4px; word-break: break-all; }
+    .count { font-size: 11px; color: #6b7280; margin-bottom: 12px; }
+    button {
+      width: 100%;
+      background: #6d7cff;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 0;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    button:hover { background: #5a6cf5; }
+    .tip { font-size: 11px; color: #6b7280; line-height: 1.6; margin-top: 12px; }
+    .tip b { color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <div class="head">
+    <div class="dot off" id="statusDot"></div>
+    <div class="title">NexusAI in Chrome</div>
+  </div>
+  <div class="status" id="statusText">未连接</div>
+
+  <div class="ws" id="wsUrl">ws://localhost:3458/ws/browser</div>
+  <div class="count" id="sessionCount"></div>
+
+  <button id="connectBtn">连接</button>
+
+  <div class="tip">
+    <b>使用说明：</b><br />
+    1. 点击「连接」一次，扩展即全局连接后端（无需填写 sessionId）<br />
+    2. 一个连接可服务<b>所有会话</b>：后端按 sessionId 路由，每个会话自动分配自己的浏览器标签页<br />
+    3. 保持本扩展开启，即可在任意会话中使用浏览器工具
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

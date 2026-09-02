@@ -1,0 +1,21 @@
+-- ===================================================================
+-- V45: settings 表新增 classifier_model 列（Yolo 权限分类器模型，前端可配置）
+--
+-- 背景：用户 2026-08-24 拍板「Yolo 分类器模型来源改 DB settings（前端可配置）」——
+--   YoloClassifierImpl 当前 @Value nexusai.classifier.model 缺省字面量
+--   claude-sonnet-4-20250514 偏离 CC；改为 DB settings.classifier_model 承载
+--   （前端「模型配置页-环境配置」可配置），未配置 → 对齐 CC 兜底主循环模型。
+--
+-- CC original: tengu_auto_mode_config.model（GrowthBook JSON config，
+--   yoloClassifier.ts:1354-1356）/ getClassifierModel()（yoloClassifier.ts:1345-1361）
+--   ant env → GB config.model → poor mode getDefaultSonnetModel → getMainLoopModel。
+-- Java 端等价链：nexusai.classifier.model yml 覆写 → DB settings.classifier_model →
+--   resolveFastModelName 主循环兜底（Java getMainLoopModel 近似）。
+--
+-- 列（MyBatis-Flex snake↔camel，同 V44 permission_mode 列范式）：
+--   classifier_model ↔ classifierModel（String；null/空白 = 未配置 → 主循环兜底）。
+--   命名：classifierModel 大写 M 映射 classifier_model（正确 snake，无大小写边界；
+--   同 websearchUseSmallModel 小写 s 教训 :60-62 反向先例——classifierModel → classifier_model
+--   精确匹配本列，若写成 ClassifierModel 会映射 classifier_model 仍同列，故无歧义）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN classifier_model TEXT;

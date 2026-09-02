@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test logging config · 让 AgentLoop / MockLlmProvider 的 debug 日志也可见。
+
+  默认 Spring Boot 是 INFO，这里把 com.nexusai.* 升到 DEBUG，可以完整看到：
+  - LlmAgentLoop.run start / done
+  - LlmAgentLoop turn=N 的 model / provider / msgs
+  - LlmAgentLoop finishReason / chunks / chars
+  - MockLlmProvider 的 stream 行为
+-->
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{0} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="WARN">
+        <appender-ref ref="STDOUT"/>
+    </root>
+
+    <!-- 业务包升到 DEBUG · 看到 loop / provider / event 全链路 -->
+    <logger name="com.nexusai" level="DEBUG"/>
+
+    <!-- 关闭 Spring 框架噪声（不要 logback-spring 之类的） -->
+    <logger name="org.springframework" level="WARN"/>
+</configuration>

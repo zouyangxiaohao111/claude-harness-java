@@ -1,0 +1,22 @@
+-- ===================================================================
+-- V23: Add schedule bound_project column — schedules.bound_project
+-- 对齐 CC durable cron 项目级语义（grep 自验 Open-ClaudeCode/src/utils/cronTasks.ts）：
+--   * bound_project —— CC original: 无字段（CronTask 类型无 cwd/dir/project，
+--     cronTasks.ts:30-70）。CC 的"任务属于哪个项目"由文件位置决定：durable 任务写进
+--     <projectRoot>/.claude/scheduled_tasks.json（cronTasks.ts:74-83 getCronFilePath =
+--     join(dir ?? getProjectRoot(), '.claude', 'scheduled_tasks.json')；writeCronTasks
+--     cronTasks.ts:165-182 写当前项目根），一个项目一个文件 = 隐式项目锚。
+--     Java 是全局单表（ScheduleService.listAll = selectAll 全表），无法从存储位置推断
+--     项目锚，必须每任务一列显式存（与 SESSION 任务被迫落 session_id 同一推理）。
+--   * 取值：PERSISTENT 任务创建时填"创建会话的绑定项目"（SessionProjectRoot.getForSession，
+--     对齐 CC STATE.projectRoot 启动/绑定目录，state.ts:511-513/523-525；
+--     中途 cd 不重锚，ExitWorktreeTool.ts:135-136）。无会话 REST 直建（sessionId=null）
+--     → NULL（fire 兜底 user.dir，已知差异：CC 所有 durable 任务都在会话里创建）。
+--   * SESSION 任务恒 NULL（对齐 CC session 任务仅存进程内存，cronTasks.ts:211-213
+--     addSessionCronTask 不写盘 —— Java SESSION 仍落库，但项目锚由 sessionId 恢复路径
+--     承载，不写 bound_project 列，两路径清晰分离）。
+-- SQLite 一次 ALTER 仅支持单列。
+-- 新列默认 NULL：存量行 bound_project=NULL → PERSISTENT fire 回落 user.dir（现状不变）。
+-- ===================================================================
+
+ALTER TABLE schedules ADD COLUMN bound_project VARCHAR(1024);
