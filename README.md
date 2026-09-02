@@ -86,6 +86,19 @@ Model providers (name, type, base URL, API key, price) are stored in the databas
 
 The project aims for behavioral alignment with Claude Code where the architecture permits (the reference is an independent re-reading of its *behavior*, not its code). When something diverges — e.g. openai-compatible models without `tool_reference`, or a Java Spring bean model replacing a TypeScript module — the divergence is deliberate and documented in the code.
 
+## Roadmap & Join us 🚀
+
+**Done**: agent loop · tool system · permissions/hooks · skills/slash commands · memory & compaction · multimodal routing · MCP · cron · team & sub-agent basics · streaming frontend
+
+**Next up**:
+- **Workflow orchestration** — deterministic multi-agent / multi-stage pipelines (Plan → Execute → Reflect → global review), resumable
+- **Deeper Team collaboration** — member mailboxes, task claiming, permission inheritance & bubbling
+- **Plugin system** — Spring-managed capabilities + **class loader hot-loading** of plugin jars + **GraalJS** so the community can write lightweight TS/JS tools/skills
+
+Why this plugin approach is interesting: TS-style harnesses (e.g. deepseek-harness) roll their own miniature "XML-era bean container" to wire plugins. We lean on the real thing — **Spring IoC + dynamic class loading + GraalJS** — for type safety, lifecycle and governance. If that sounds like a fun architecture problem, there's a large open canvas here.
+
+**We're looking for Java contributors** — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 [MIT](LICENSE)
