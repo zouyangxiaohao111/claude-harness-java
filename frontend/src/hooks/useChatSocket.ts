@@ -541,8 +541,11 @@ export function useChatSocket(
     // 多会话分发：事件归属会话优先取 evt.sessionId（切走会话的事件仍落到原会话 streams）
     const sid = evt.sessionId ?? sessionId ?? ''
     if (isPushedUser(evt)) {
-      // cron/Ask 后台落库的 user 消息（isMeta=true 占位）→ 进 messages 保持 flow 顺序（group 渲染跳过不显示）
-      if (evt.id) st.appendMetaUser(sid, evt.id, evt.content ?? null)
+      // P0 排队消息气泡：message.user 按事件携带的 isMeta 分流（不再一刀切硬编码占位）——
+      //   isMeta=false（普通用户消息，含 busy-queued 排队插队注入）→ 渲染正式 user 气泡（进消息列表，id 判重）；
+      //   isMeta=true/缺省（cron/Ask 后台落库）→ 隐藏占位保 flow 顺序（group 渲染跳过不显示）。
+      //   正常发送乐观插入 id=resp.userMessageId=后端 uuid → 与推送同 id 被 appendMetaUser 幂等拦截，无双泡。
+      if (evt.id) st.appendMetaUser(sid, evt.id, evt.content ?? null, evt.isMeta !== false)
     } else if (isChunk(evt)) {
       // 契约 #1：chunk.assistantMessageId = turnAssistantId（每轮真实稳定 id）→ 按轮惰性建块累积。
       //   'msg-stream' 兜底兼容旧后端（未改前所有 chunk 共享该 id → 归入同一条流式块）。

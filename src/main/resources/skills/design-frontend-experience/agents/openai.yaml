@@ -1,0 +1,14 @@
+interface:
+  display_name: "\u524D\u7AEF\u4EFB\u52A1\u4E0E\u9875\u9762\u8BBE\u8BA1"
+  short_description: "\u4ECE\u89D2\u8272\u4EFB\u52A1\u72B6\u6001\u6743\u9650\u548C\
+    API\u751F\u6210\u4F01\u4E1A\u524D\u7AEF\u9875\u9762\u4E0E\u4EA4\u4E92\u5408\u540C"
+  default_prompt: "\u4F7F\u7528 $design-frontend-experience \u8BBE\u8BA1\u4EFB\u52A1\
+    \u6D41\u3001\u9875\u9762\u3001\u64CD\u4F5C\u3001\u8868\u5355\u548C\u5F02\u5E38\
+    \u72B6\u6001\u3002"
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

@@ -127,8 +127,11 @@ public class ChatController {
     /**
      * [queue-first B4] 弹出可编辑排队命令（对齐 CC 排队条 Esc/↑ 拉回编辑）· 返回 {content} 填输入框。
      *
-     * <p>从会话队列移除最旧一条 mode=prompt 命令并返回其 content（前端 popEditableQueuedCommand
-     * 调用，当前端点曾 404）；无排队命令 → 空 Map（前端视为 null，无编辑内容）。
+     * <p>经 {@link NotificationQueue#popForEdit} 从会话队列移除<b>全部</b> mode=prompt 命令
+     * （谓词与旧 removeByFilter 完全一致，保持旧序）并审计 op='popAll'（带 content，对齐 CC
+     * popAllEditable messageQueueManager.ts:471-476），仅取最旧一条的 content 回填输入框
+     * （复刻旧行为：移除全部 prompt 命令只回填最旧一条）；无排队命令 → 空 Map（前端视为
+     * null，无编辑内容）。
      */
     @PostMapping("/queue/pop")
     @ResponseStatus(HttpStatus.OK)
@@ -137,13 +140,13 @@ public class ChatController {
             log.warn("ChatController: NotificationQueue 未注入, /queue/pop 返回空");
             return Map.of();
         }
-        List<NotificationQueue.QueueItem> popped = notificationQueue.removeByFilter(
+        List<NotificationQueue.QueueItem> popped = notificationQueue.popForEdit(
             cmd -> cmd.sessionId() != null && cmd.sessionId().equals(sessionId)
                 && NotificationQueue.MODE_PROMPT.equals(cmd.mode()));
         if (popped.isEmpty()) {
             return Map.of();
         }
-        // 只返回最旧一条的 content（拉回编辑）；已从队列移除
+        // 只返回最旧一条的 content（拉回编辑）；已从队列移除（popForEdit 审计 'popAll'）
         if (queueEventPublisher != null) {
             queueEventPublisher.emitChanged(sessionId);
         }

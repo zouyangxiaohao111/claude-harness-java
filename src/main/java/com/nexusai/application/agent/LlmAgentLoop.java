@@ -10322,6 +10322,11 @@ public class LlmAgentLoop implements AgentLoop {
             //   是唯一视觉通道 → 从 deferred 剔除强制 schema 直发（不赌模型会 ToolSearch 激活，
             //   历史 Read 图空读死循环 / fork 视觉子代理递归诱因）。主/子代理共享本 queryLoop 装配路径。
             exemptVisionAnalyzeDeferForTextModel(deferredToolNames, modelMapper, providerMapper, modelName);
+            // [websearch-openai-alwaysload 2026-09-04 用户拍板] WebSearch/WebFetch 懒加载豁免：
+            //   非 anthropic（openai_compatible/openai_sdk/未来 response）时从 deferred 移除 → 恒在
+            //   初始 schema（不赌模型会 ToolSearch 激活）—— 用户实测 deepseek 误判"没 WebSearch"
+            //   白派 agent。anthropic 保留懒加载（tool_reference 能正常激活，对齐 CC 省 token）。
+            exemptWebSearchDeferForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
             Set<String> discovered = ToolSearchService.extractDiscoveredToolNames(messages);
             if (useToolSearch) {
                 // 短路（claude.ts:1140-1147）：无 deferred 且无 pending MCP → 关闭。
@@ -11393,6 +11398,50 @@ public class LlmAgentLoop implements AgentLoop {
         boolean imageCapable = modelSupportsImage(modelMapper, providerMapper, modelName);
         if (!(antDirectFormat && imageCapable)) {
             deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.VISION_ANALYZE_TOOL_NAME);
+        }
+    }
+
+    /**
+     * WebSearch/WebFetch 懒加载豁免 · [2026-09-04 用户拍板] 非 anthropic（openai 系）始终加载。
+     *
+     * <p><b>WHY</b>：用户实测 deepseek（openai_compatible）会话里模型误判「没有 WebSearch/
+     * WebFetch 工具」→ 白派 agent。根因 = 两工具 {@code shouldDefer() → true}（对齐 CC
+     * WebSearchTool.ts:156 / WebFetchTool.ts:71）→ 非 discovered/激活时不进初始 schema；模型
+     * 又无 tool_reference（deepseek）需先 ToolSearch 激活 → 误判不存在。anthropic 有 tool_reference
+     * 能正常激活，保留懒加载省 token（对齐 CC）。
+     *
+     * <p><b>判定</b>：{@code !isAnthropic} = openai_compatible/openai_sdk/<b>未来 response</b>
+     * （Response API 直给格式，provider.type 届时按需扩展，isAnthropic 判 false 天然覆盖）。
+     * <b>mapper null → return（不豁免，deferred 保留原样）</b>：llmToolsArray 4 参旧签名
+     * （modelMapper/providerMapper null）无法判定 provider，保持既有懒加载行为（对齐 vision 豁免
+     * 前身：仅装配层 7 参带 mapper 的主循环/子代理路径判定）。不贸然移除 defer —— 避免无依据
+     * 改变默认行为（旧测试契约：4 参路径 WebSearch 仍 deferred）。
+     *
+     * @param deferred       deferred 工具名集合（就地移除 WebSearch/WebFetch）
+     * @param modelMapper    模型 mapper（null → 不豁免，保持 deferred）
+     * @param providerMapper 提供商 mapper（null → 不豁免，保持 deferred）
+     * @param modelName      当前生效模型名（可 null）
+     */
+    static void exemptWebSearchDeferForOpenAi(Set<String> deferred,
+            ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
+        if (deferred == null || modelMapper == null || providerMapper == null) {
+            return; // 无法判定 provider → 保持既有懒加载（4 参旧签名契约）
+        }
+        boolean hasWeb = deferred.contains(
+                com.nexusai.application.agent.tool.ToolNameConstants.WEB_SEARCH_TOOL_NAME)
+            || deferred.contains(com.nexusai.application.agent.tool.ToolNameConstants.WEB_FETCH_TOOL_NAME);
+        if (!hasWeb) {
+            return;
+        }
+        if (ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)) {
+            return; // anthropic 保留懒加载（tool_reference 激活，对齐 CC）
+        }
+        // 非 anthropic（openai 系含未来 response）→ 恒在初始 schema
+        deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.WEB_SEARCH_TOOL_NAME);
+        deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.WEB_FETCH_TOOL_NAME);
+        if (log.isDebugEnabled()) {
+            log.debug("llmToolsArray: WebSearch/WebFetch 从 deferred 豁免（非 anthropic 始终加载，"
+                + "防 openai 模型误判无工具白派 agent）");
         }
     }
 

@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tasks;
 
 import com.nexusai.model.session.dto.AttachmentRequest;
+import com.nexusai.repository.session.entity.QueueOperationRecord;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -12,7 +13,9 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
 
 /**
@@ -229,6 +232,27 @@ public class NotificationQueue {
     private final List<QueueItem> queue = new ArrayList<>();
 
     // ============================================================================
+    // [queue-audit] 队列审计 sink（对齐 CC queue-operation · OD-D11）· 仅诊断旁路
+    // ============================================================================
+
+    /** 审计 sink · 每次 enqueue/dequeue/remove/popAll 提交一条 QueueOperationRecord；
+     *  null = 未注册（启动窗口事件不审计，诊断可接受）。 */
+    private volatile Consumer<QueueOperationRecord> auditSink;
+
+    /** 审计分发线程 · 单线程 daemon（仿上方 NOTIFY_EXECUTOR :239 同款）——
+     *  mutator 锁内<b>只 submit</b> QueueOperationRecord，本分发线程异步调 sink，
+     *  绝不执行 sink 代码到热路径 / 绝不阻塞入队线程（红线 3：audit 不阻塞、不抛）。
+     *
+     *  <p>诊断性质（MINOR 4）：本 executor 任务队列与 {@code QueueAuditService} 自有
+     *  executor 构成两级无界单线程队列——DB 挂起时内存累积（仅诊断数据，不阻塞队列
+     *  功能热路径）；后续如需可改有界 + 丢弃最旧。 */
+    private static final ExecutorService AUDIT_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "queue-audit-dispatch");
+        t.setDaemon(true);
+        return t;
+    });
+
+    // ============================================================================
     // P3 事件驱动（对齐 CC useQueueProcessor.ts:35-67 useSyncExternalStore 订阅队列快照）
     // ============================================================================
 
@@ -264,6 +288,8 @@ public class NotificationQueue {
         }
         // [DEL-13] 入队不发 hook · 对齐 CC messageQueueManager.ts 入队路径零 hook（E-TS07-08）：
         // Notification hook 仅由系统通知路径触发（LlmAgentLoop A11 / ElicitationHandler / AgentLoopContext）。
+        // [queue-audit] 入队审计（带 content · CC logOperation 'enqueue' :131-134）
+        submitAudit(auditRecord("enqueue", normalized));
         // [P3] 队列变更通知（事件驱动消费，对齐 CC useSyncExternalStore 订阅队列快照）
         fireOnChange();
     }
@@ -281,6 +307,8 @@ public class NotificationQueue {
                 item.mode(), normalized.priority(), item.agentId(), originDesc(normalized.origin()),
                 normalized.scheduleId());
         }
+        // [queue-audit] 入队审计（带 content · CC logOperation 'enqueue' :145-148）
+        submitAudit(auditRecord("enqueue", normalized));
         // [P3] 队列变更通知（事件驱动消费）
         fireOnChange();
     }
@@ -306,6 +334,77 @@ public class NotificationQueue {
     private static String originDesc(@Nullable MessageOrigin origin) {
         if (origin == null) return "null";
         return origin.kind() + (origin.server() != null ? ":" + origin.server() : "");
+    }
+
+    // ============================================================================
+    // [queue-audit] 注册 + 审计构造/提交
+    // ============================================================================
+
+    /**
+     * 注册审计 sink · 由 {@code QueueAuditService} @PostConstruct 装配（本类不依赖 Spring）。
+     *
+     * <p>sink 为 {@code volatile} 单槽：后注册替换先注册（生产端唯一 = QueueAuditService；
+     * 测试可注入捕获器断言）。注册前（startup 窗口）mutator 照常跑、不审计。
+     *
+     * @param sink 审计消费端（null → no-op，不替换既有 sink）
+     */
+    public void registerAuditSink(Consumer<QueueOperationRecord> sink) {
+        if (sink != null) {
+            this.auditSink = sink;
+        }
+    }
+
+    /**
+     * 构造审计记录 · CC logOperation (messageQueueManager.ts:28-38) 语义：
+     * <ul>
+     *   <li>enqueue / popAll → 带 content（CC :131-134/:471-476 传 command.value 字符串）</li>
+     *   <li>dequeue / remove → 不带 content（CC :191/:289-291/:310-312 无 content）</li>
+     * </ul>
+     * Java 增强身份字段（sessionId/uuid/mode/priority/workload）供入出队配对诊断；
+     * priority 存小写（QueueItem.Priority name() 转小写 → 'now'|'next'|'later'）。
+     */
+    private static QueueOperationRecord auditRecord(String operation, QueueItem item) {
+        QueueOperationRecord rec = new QueueOperationRecord();
+        rec.setOperation(operation);
+        rec.setSessionId(item.sessionId());
+        rec.setUuid(item.uuid());
+        rec.setMode(item.mode());
+        rec.setPriority(item.priority() != null ? item.priority().name().toLowerCase() : null);
+        rec.setWorkload(item.workload());
+        if (("enqueue".equals(operation) || "popAll".equals(operation)) && item.value() != null) {
+            rec.setContent(item.value());
+        }
+        return rec;
+    }
+
+    /**
+     * 异步提交审计 · mutator 锁内调用：只把 record submit 到 {@link #AUDIT_EXECUTOR}，
+     * 分发线程再调 sink（不执行任何 sink 代码到入队线程）。
+     *
+     * <p>fail-soft（红线 3）：sink null / 提交被拒 → debug 不抛；分发线程 sink 异常 → warn
+     * 不抛。空返回场景由调用方守卫（不构造 record 即不进本方法）。
+     */
+    private void submitAudit(QueueOperationRecord rec) {
+        Consumer<QueueOperationRecord> sink = auditSink;
+        if (sink == null || rec == null) {
+            return;
+        }
+        try {
+            AUDIT_EXECUTOR.submit(() -> {
+                try {
+                    sink.accept(rec);
+                } catch (Exception e) {
+                    if (log.isWarnEnabled()) {
+                        log.warn("NotificationQueue 审计 sink 分发异常（已捕获，不阻塞队列）: op={} session={} err={}",
+                            rec.getOperation(), rec.getSessionId(), e.getMessage());
+                    }
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            if (log.isDebugEnabled()) {
+                log.debug("NotificationQueue 审计提交被拒（executor 关闭，跳过审计）: {}", e.getMessage());
+            }
+        }
     }
 
     // ============================================================================
@@ -336,6 +435,8 @@ public class NotificationQueue {
         }
         QueueItem dequeued = queue.remove(bestIdx);
         if (log.isDebugEnabled()) log.debug("NotificationQueue.dequeue: mode={}", dequeued.mode());
+        // [queue-audit] 出队审计（无 content · CC logOperation 'dequeue' :191）——空/全不匹配早退不触发
+        submitAudit(auditRecord("dequeue", dequeued));
         // [P3] 队列变更通知（事件驱动消费）
         fireOnChange();
         return Optional.of(dequeued);
@@ -373,6 +474,10 @@ public class NotificationQueue {
         List<QueueItem> commands = new ArrayList<>(queue);
         queue.clear();
         if (log.isDebugEnabled()) log.debug("NotificationQueue.dequeueAll: {} items", commands.size());
+        // [queue-audit] 批量出队审计（每条无 content · CC dequeueAll :208-210 for _cmd logOperation('dequeue')）
+        for (QueueItem c : commands) {
+            submitAudit(auditRecord("dequeue", c));
+        }
         // [P3] 队列变更通知（事件驱动消费）
         fireOnChange();
         return commands;
@@ -399,6 +504,10 @@ public class NotificationQueue {
         queue.clear();
         queue.addAll(remaining);
         if (log.isDebugEnabled()) log.debug("NotificationQueue.dequeueAllMatching: {} matched", matched.size());
+        // [queue-audit] 批量出队审计（每条无 content · CC dequeueAllMatching :262-264）
+        for (QueueItem c : matched) {
+            submitAudit(auditRecord("dequeue", c));
+        }
         // [P3] 队列变更通知（事件驱动消费）
         fireOnChange();
         return matched;
@@ -435,14 +544,19 @@ public class NotificationQueue {
      */
     public synchronized void remove(List<QueueItem> commandsToRemove) {
         if (commandsToRemove == null || commandsToRemove.isEmpty()) return;
-        int before = queue.size();
+        List<QueueItem> removedItems = new ArrayList<>();
         for (int i = queue.size() - 1; i >= 0; i--) {
             if (containsIdentity(commandsToRemove, queue.get(i))) {
-                queue.remove(i);
+                removedItems.add(queue.remove(i));
             }
         }
-        if (log.isDebugEnabled() && queue.size() != before) {
-            log.debug("NotificationQueue.remove: removed {} items", before - queue.size());
+        if (log.isDebugEnabled() && !removedItems.isEmpty()) {
+            log.debug("NotificationQueue.remove: removed {} items", removedItems.size());
+        }
+        // [queue-audit] 移除审计（每条无 content · CC remove :289-291 logOperation('remove')）
+        // 只对「实际按引用移除」的项打点（并发消费竞态下已不在队列的传入项不打 —— 空守卫不触发）
+        for (QueueItem removed : removedItems) {
+            submitAudit(auditRecord("remove", removed));
         }
         // [P3] 队列变更通知（事件驱动消费；drainForQuery 经本方法消费 → 覆盖 mid-turn drain 变化点）
         fireOnChange();
@@ -458,6 +572,12 @@ public class NotificationQueue {
 
     /**
      * 按谓词移除并返回被移除项 — 对齐 CC removeByFilter (messageQueueManager.ts:298-316)。
+     *
+     * <p><b>[queue-audit 孤儿声明 · MINOR 2]</b>：ChatController /queue/pop 已改调
+     * {@link #popForEdit}（审计 'popAll'）后，本方法<b>生产侧无调用方</b>。保留不改删
+     * —— CC messageQueueManager.ts:298-316 有对应物（removeByFilter 仍被 CC 保留），
+     * 且本方法承载「通用谓词移除 + 审计 'remove'」语义，供未来生产路径复用；如需清理
+     * 登记待清理项，勿删。
      */
     public synchronized List<QueueItem> removeByFilter(Predicate<QueueItem> predicate) {
         List<QueueItem> removed = new ArrayList<>();
@@ -470,6 +590,46 @@ public class NotificationQueue {
         }
         if (log.isDebugEnabled() && !removed.isEmpty()) {
             log.debug("NotificationQueue.removeByFilter: removed {} items", removed.size());
+        }
+        // [queue-audit] 移除审计（每条无 content · CC removeByFilter :310-312）；空移除不触发
+        for (QueueItem cmd : removed) {
+            submitAudit(auditRecord("remove", cmd));
+        }
+        // [P3] 队列变更通知（事件驱动消费）
+        fireOnChange();
+        return removed;
+    }
+
+    /**
+     * 弹出可编辑排队命令（Esc/↑ 拉回编辑）— 对齐 CC popAllEditable (messageQueueManager.ts:428-484)。
+     *
+     * <p><b>ChatController /queue/pop 专用入口（reflector MAJOR 定死）</b>：与
+     * {@link #removeByFilter} 相同的「谓词匹配 + 保持原序移除 + 返回被移除项」，但审计
+     * op=<b>'popAll'（带 content）</b> —— 区分「拉回编辑」（Esc/↑，CC popAllEditable :471-476
+     * 每条带 content logOperation('popAll')）与「模型消费通用移除」（removeByFilter → 'remove' 无 content）。
+     *
+     * <p>谓词契约（MINOR 1）：返回该谓词命中的<b>全部</b>项（保持旧序，与现 removeByFilter
+     * 谓词语义完全一致）；调用方取首条回填（复刻 ChatController 旧行为：移除全部 prompt
+     * 命令仅回填最旧一条）。无匹配 → 返回空 List、不触发审计（CC :432-443 空守卫同款）。
+     *
+     * @param predicate 匹配谓词（ChatController 传 sessionId + mode=prompt 过滤）
+     * @return 匹配并移除的项（原顺序）；无匹配 → 空 List
+     */
+    public synchronized List<QueueItem> popForEdit(Predicate<QueueItem> predicate) {
+        List<QueueItem> removed = new ArrayList<>();
+        for (int i = queue.size() - 1; i >= 0; i--) {
+            QueueItem cmd = queue.get(i);
+            if (predicate.test(cmd)) {
+                removed.add(0, cmd);   // 保持原顺序 (CC :304 removed.unshift 同款)
+                queue.remove(i);
+            }
+        }
+        if (log.isDebugEnabled() && !removed.isEmpty()) {
+            log.debug("NotificationQueue.popForEdit: popped {} items", removed.size());
+        }
+        // [queue-audit] popAll 审计（带 content · CC popAllEditable :471-476）；空弹出不触发
+        for (QueueItem cmd : removed) {
+            submitAudit(auditRecord("popAll", cmd));
         }
         // [P3] 队列变更通知（事件驱动消费）
         fireOnChange();

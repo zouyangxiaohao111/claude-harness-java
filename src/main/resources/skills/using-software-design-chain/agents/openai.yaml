@@ -1,0 +1,4 @@
+interface:
+  display_name: "软件设计技能链"
+  short_description: "逐项完成设计链；存量工程由总入口创建只读子代理探查"
+  default_prompt: "使用 $using-software-design-chain 按逐项发现、登记、确认的铁律完成软件设计链；发现存量工程时，由总入口创建专用只读子代理并明确要求其使用项目能力探查技能。"

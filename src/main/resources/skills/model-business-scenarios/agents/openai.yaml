@@ -1,0 +1,14 @@
+interface:
+  display_name: "\u573A\u666F\u89C4\u5219\u5EFA\u6A21"
+  short_description: "\u628A\u9700\u6C42\u8F6C\u6362\u4E3A\u4E1A\u52A1\u573A\u666F\
+    \u89C4\u5219\u72B6\u6001\u6743\u9650\u5F02\u5E38\u6D41\u7A0B\u4E0E\u5B8C\u6574\
+    \u5BA1\u8BA1\u6A21\u578B"
+  default_prompt: "\u4F7F\u7528 $model-business-scenarios \u5B8C\u5584\u4E1A\u52A1\
+    \u884C\u4E3A\u6A21\u578B\u5E76\u9A8C\u8BC1\u573A\u666F\u8D28\u91CF\u95E8\u3002"
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

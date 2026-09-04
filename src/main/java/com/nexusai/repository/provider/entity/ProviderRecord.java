@@ -25,7 +25,6 @@ public class ProviderRecord {
     private Boolean enabled;
     private String createdAt;
     private String updatedAt;
-    private Integer maxContextTokens;
 
     public Provider toDomain() {
         Provider p = new Provider();
@@ -81,6 +80,4 @@ public class ProviderRecord {
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public String getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(String updatedAt) { this.updatedAt = updatedAt; }
-    public Integer getMaxContextTokens() { return maxContextTokens; }
-    public void setMaxContextTokens(Integer maxContextTokens) { this.maxContextTokens = maxContextTokens; }
 }

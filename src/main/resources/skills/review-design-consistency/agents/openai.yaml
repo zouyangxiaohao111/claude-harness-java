@@ -1,0 +1,14 @@
+interface:
+  display_name: "\u8DE8\u4EA7\u7269\u4E00\u81F4\u6027\u5BA1\u67E5"
+  short_description: "\u5BA1\u67E5\u9700\u6C42\u9886\u57DF\u6570\u636EAPI\u524D\u7AEF\
+    \u6D4B\u8BD5\u4E4B\u95F4\u7684\u65AD\u94FE\u51B2\u7A81\u548C\u6F02\u79FB"
+  default_prompt: "\u4F7F\u7528 $review-design-consistency \u6267\u884C\u8DE8\u4EA7\
+    \u7269\u4E00\u81F4\u6027\u5BA1\u67E5\u5E76\u8F93\u51FA\u5F71\u54CD\u5206\u6790\
+    \u3002"
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

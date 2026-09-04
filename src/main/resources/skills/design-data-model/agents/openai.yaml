@@ -1,0 +1,13 @@
+interface:
+  display_name: "\u6570\u636E\u6A21\u578B\u4E0E\u8868\u8BBE\u8BA1"
+  short_description: "\u751F\u6210\u6982\u5FF5\u903B\u8F91\u7269\u7406\u6A21\u578B\
+    \u5E76\u6309\u516C\u53F8MySQL\u89C4\u8303\u8F93\u51FA\u6570\u636E\u5E93\u8868"
+  default_prompt: "\u4F7F\u7528 $design-data-model \u8BBE\u8BA1\u6570\u636E\u5E93\u8868\
+    \u3001\u6570\u636E\u5B57\u5178\u3001\u7EA6\u675F\u3001\u7D22\u5F15\u548CDDL\u3002"
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

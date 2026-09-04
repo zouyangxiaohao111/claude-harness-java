@@ -1,0 +1,15 @@
+interface:
+  display_name: "\u9700\u6C42\u7CBE\u70BC"
+  short_description: "\u628A\u5EFA\u8BBE\u65B9\u6848\u548C\u539F\u59CB\u6750\u6599\
+    \u8F6C\u6210\u53EF\u8FFD\u8E2A\u53EF\u9A8C\u6536\u7684\u8F6F\u4EF6\u9700\u6C42\
+    \u57FA\u7EBF"
+  default_prompt: "\u4F7F\u7528 $refine-software-requirements \u5BA1\u9605\u8FD9\u4E9B\
+    \u5EFA\u8BBE\u6750\u6599\u5E76\u4EA7\u51FA\u6B63\u5F0F\u9700\u6C42\u57FA\u7EBF\
+    \u3002"
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true

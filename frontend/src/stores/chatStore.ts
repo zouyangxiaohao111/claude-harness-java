@@ -132,8 +132,9 @@ export interface ChatState {
   addApiError: (sessionId: string, err: ApiFlowError) => void
   /** 清空会话 API 错误（新 user 消息发送时调用 · 错误卡属上一轮） */
   clearApiErrors: (sessionId: string) => void
-  /** 后端推送的 user 消息（cron/Ask 后台落库 prompt · isMeta=true 占位不显示，保持 flow 顺序） */
-  appendMetaUser: (sessionId: string, id: string, content?: string | null) => void
+  /** 后端推送的 user 消息（message.user）：isMeta=true/缺省 = cron/Ask 后台落库占位不显示（保 flow 顺序）；
+   *  isMeta=false = 正式 user 气泡（含 busy-queued 排队插队注入）。按 id 幂等去重。 */
+  appendMetaUser: (sessionId: string, id: string, content?: string | null, isMeta?: boolean) => void
 }
 
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
@@ -367,7 +368,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const { [sessionId]: _drop, ...rest } = st.apiErrors
     return { apiErrors: rest }
   }),
-  appendMetaUser: (sessionId, id, content) => set((st) => {
+  appendMetaUser: (sessionId, id, content, isMeta = true) => set((st) => {
     const msgs = st.messages[sessionId] ?? []
     // 幂等：同 id 已存在（重拉/重复推送）不重复插入
     if (msgs.some((m) => m.id === id)) return st
@@ -377,7 +378,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       reasoning: null, toolCalls: null, finishReason: null, inputTokens: null,
       outputTokens: null, reasoningDurationMs: null, time: null, createdAt: now,
       toolCallId: null, assistantMessageId: null, userMessageId: id, subtype: null,
-      isMeta: true, isApiErrorMessage: false, apiError: null, error: null,
+      isMeta, isApiErrorMessage: false, apiError: null, error: null,
       errorDetails: null, matchedRule: null,
     }
     return { messages: { ...st.messages, [sessionId]: [...msgs, metaMsg] } }

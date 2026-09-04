@@ -1,0 +1,4 @@
+interface:
+  display_name: "现有项目能力探查"
+  short_description: "子代理并行探查架构、模块、基础组件、API与数据库能力"
+  default_prompt: "使用 $inspect-existing-project-capabilities 调度只读子代理探查现有项目，并汇总架构剖面与复用决策。"

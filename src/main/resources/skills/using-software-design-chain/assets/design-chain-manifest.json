@@ -1,0 +1,57 @@
+{
+  "schema_version": 6,
+  "project_code": "PROJECT",
+  "slice_id": "SLICE-001",
+  "baseline_version": "0.1-draft",
+  "code_version": null,
+  "codebase_status": "NOT_PROVIDED",
+  "current_stage": "requirements",
+  "current_gate": "G0",
+  "gate_status": "NOT_CHECKED",
+  "active_work_item": null,
+  "iron_law": {
+    "name": "discover-register-confirm",
+    "status": "ENFORCED",
+    "continuous_execution": true
+  },
+  "project_probe": {
+    "subagent_available": null,
+    "execution_mode": null,
+    "skill_name": "inspect-existing-project-capabilities",
+    "agent_task_ref": null,
+    "status": "NOT_STARTED",
+    "fallback_reason": null,
+    "code_version": null,
+    "artifact_refs": []
+  },
+  "continuation_required": true,
+  "next_work_item_id": null,
+  "next_stage": "requirements",
+  "stop_reason": null,
+  "human_review": {
+    "status": "NOT_REVIEWED",
+    "last_reviewed_at": null,
+    "feedback_refs": []
+  },
+  "human_input_requests": [],
+  "gate_components": {
+    "data": "NOT_CHECKED",
+    "backend": "NOT_CHECKED"
+  },
+  "stage_status": {
+    "requirements": "NEEDS_CONTEXT",
+    "business_scenarios": "NOT_STARTED",
+    "project_foundation": "NOT_STARTED",
+    "domain_boundaries": "NOT_STARTED",
+    "data_model": "NOT_STARTED",
+    "backend_architecture": "NOT_STARTED",
+    "frontend_experience": "NOT_STARTED",
+    "tests_acceptance": "NOT_STARTED",
+    "consistency_review": "NOT_STARTED"
+  },
+  "artifacts": [],
+  "open_blockers": [],
+  "approvals": [],
+  "gate_records": [],
+  "route_history": []
+}
