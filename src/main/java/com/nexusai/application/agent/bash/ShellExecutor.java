@@ -561,6 +561,15 @@ public final class ShellExecutor {
         if (cwd != null && !cwd.isBlank()) {
             pb.directory(new File(cwd));
         }
+        // [stdin 接空 2026-09-04 方案A] 子进程 stdin 定向「读空设备」——Windows NUL / POSIX /dev/null。
+        //   根治「命令意外落到读 stdin」的永久挂起：Java 服务进程 stdin 是不关闭的句柄（非 EOF），
+        //   一旦命令（如被拆管道后裸 grep / cat 无参）读 stdin 会永远等不到结束 → BashTool 卡到超时。
+        //   接空后此类命令立即读到 EOF 退出（对齐 CC 给命令加 `< /dev/null` 防挂的语义）。
+        //   注：不能用 Redirect.DISCARD（type=WRITE，仅合法用于 stdout/stderr 丢弃；redirectInput
+        //   要求 READ）——必须 Redirect.from(空设备文件) 以读方式打开。
+        //   stdout/stderr 不受影响（调用方自行 redirect / reader 线程读）。
+        File devNull = IS_WINDOWS ? new File("NUL") : new File("/dev/null");
+        pb.redirectInput(ProcessBuilder.Redirect.from(devNull));
         return pb;
     }
 
@@ -1030,7 +1039,10 @@ public final class ShellExecutor {
             return addStdinRedirect ? quoted + " < /dev/null" : quoted;
         }
         if (addStdinRedirect) {
-            return ShellQuoteParser.quote(List.of(command, "<", "/dev/null"));
+            // `< /dev/null` 是注入的重定向操作符（防命令读父 stdin 挂起），不是普通参数——不送 quote()
+            //（方案B quoteOne 会对裸 `<` 加引号保护，破坏其操作符语义）；命令串单独 quote 后字面追加，
+            // 与 heredoc/多行分支（quoted + " < /dev/null"）同风格。
+            return ShellQuoteParser.quote(List.of(command)) + " < /dev/null";
         }
         return ShellQuoteParser.quote(List.of(command));
     }

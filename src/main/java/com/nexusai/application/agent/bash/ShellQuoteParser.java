@@ -73,22 +73,43 @@ public final class ShellQuoteParser {
 
     /**
      * shell-quote quote 等价 · 对齐 npm shell-quote（shellQuote.ts:267 委托）+ CC quote 语义。
-     * 数组项以空格 join；含 {@code "} 或空白且不含 {@code '} → 单引号；含 {@code "} 或 {@code '}
-     * 或空白 → 双引号；否则原样。
+     * 数组项以空格 join；含 {@code "} / 空白 / shell 元字符（{@code |&;()<>} 等，见
+     * {@link #containsShellMeta}）且不含 {@code '} → 单引号；含 {@code "} 或 {@code '} 或空白
+     * 或 shell 元字符 → 双引号；否则原样。
      */
     public static String quote(List<String> args) {
         return args.stream().map(ShellQuoteParser::quoteOne).collect(Collectors.joining(" "));
     }
 
     private static String quoteOne(String arg) {
-        if ((arg.contains("\"") || containsWhitespace(arg)) && !arg.contains("'")) {
+        // [元字符保护 2026-09-04 方案B] 除引号/空白外，词内含 eval 后会被 bash 当语法操作符的
+        //   字符（| & ; ( ) < > 换行）也必须引号保护。WHY：rearrangePipeCommand 经 shell-quote
+        //   parse 把双引号模式串（grep -oE "a|b|c"）剥离引号成单个词，重建时若无此保护竖线裸返回
+        //   → eval 'grep -oE a|b|c' 被拆成管道 → 裸 grep 读 stdin 永久挂起（Java 服务 stdin 非 EOF）。
+        //   只保护语法控制符，不含 glob（* ? [ ]）——glob 需保持原样交给 shell 展开（CC buildCommandParts
+        //   glob 特判不引号 语义一致，ShellQuoteParserTest/ShellExecutorTest 回归覆盖）。
+        boolean needProtect = arg.contains("\"") || arg.contains("'") || containsWhitespace(arg)
+            || containsShellMeta(arg);
+        if (needProtect && !arg.contains("'")) {
             return "'" + arg.replace("\\", "\\\\").replace("'", "\\'") + "'";
         }
-        if (arg.contains("\"") || arg.contains("'") || containsWhitespace(arg)) {
+        if (needProtect) {
             return "\"" + arg.replace("\\", "\\\\").replace("\"", "\\\"")
                 .replace("$", "\\$").replace("`", "\\`").replace("!", "\\!") + "\"";
         }
         return arg;
+    }
+
+    /** 词内含 bash 语法操作符字符（eval 后改变解析结构）→ 必须引号保护。 */
+    private static boolean containsShellMeta(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '|' || c == '&' || c == ';' || c == '(' || c == ')'
+                    || c == '<' || c == '>' || c == '\n' || c == '\r') {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean containsWhitespace(String s) {
