@@ -40,7 +40,8 @@ class ToolRegistrationConfigSubagentExecutorBeanTest {
         //   第 15 参 yoloClassifier（subagent_v3=IMP-SUB-25 R2 接线归零，handoff 分类）——签名并集 15 参
         // [循环依赖修复] 第 16 参 agentMemoryDirectory（null-safe 参数注入；null → 回落 productionDefault()）
         // [prompt-align UP-01] 第 17 参 promptAlignSettingsResolver（null → setter 回落 coordinatorMode.isCoordinatorMode()）
-        SubagentExecutor executor = config.subagentExecutor(null, null, null, null, null, null, null, null, null, null, null, false, null, null, null, null, null);
+        // [A5-2] 第 18/19 参 modelMapper+providerMapper（null-safe；null → SubagentExecutor 回落 anthropic 语义）
+        SubagentExecutor executor = config.subagentExecutor(null, null, null, null, null, null, null, null, null, null, null, false, null, null, null, null, null, null, null);
 
         // WHEN: 反射读私有 final 字段 fallbackSystemPrompt
         Field f = SubagentExecutor.class.getDeclaredField("fallbackSystemPrompt");
@@ -76,7 +77,8 @@ class ToolRegistrationConfigSubagentExecutorBeanTest {
                 // [冲突裁决·并集] 签名并集 15 参：analyticsTracker+agentNameRegistry（IMP-G4）+ yoloClassifier（IMP-SUB-25）
                 // [循环依赖修复] 第 16 参 agentMemoryDirectory（null-safe 参数注入；null → 回落 productionDefault()）
                 // [prompt-align UP-01] 第 17 参 promptAlignSettingsResolver（null → setter 回落 coordinatorMode.isCoordinatorMode()）
-                null, null, null, null, null, null, null, summaryService, coordinatorMode, null, null, true, null, null, null, null, null);
+                // [A5-2] 第 18/19 参 modelMapper+providerMapper（null-safe；null → 回落 anthropic 语义）
+                null, null, null, null, null, null, null, summaryService, coordinatorMode, null, null, true, null, null, null, null, null, null, null);
 
             Field sf = SubagentExecutor.class.getDeclaredField("summaryService");
             sf.setAccessible(true);
@@ -114,7 +116,8 @@ class ToolRegistrationConfigSubagentExecutorBeanTest {
             // [冲突裁决·并集] 签名并集 15 参：analyticsTracker+agentNameRegistry（IMP-G4）+ yoloClassifier（IMP-SUB-25）
             // [循环依赖修复] 第 16 参 agentMemoryDirectory（null-safe 参数注入；null → 回落 productionDefault()）
             // [prompt-align UP-01] 第 17 参 promptAlignSettingsResolver（null → setter 回落 coordinatorMode.isCoordinatorMode()）
-            null, null, null, null, null, null, null, null, null, null, sdkEventQueue, false, null, null, null, null, null);
+            // [A5-2] 第 18/19 参 modelMapper+providerMapper（null-safe；null → 回落 anthropic 语义）
+            null, null, null, null, null, null, null, null, null, null, sdkEventQueue, false, null, null, null, null, null, null, null);
 
         Field sdkq = SubagentExecutor.class.getDeclaredField("sdkEventQueue");
         sdkq.setAccessible(true);

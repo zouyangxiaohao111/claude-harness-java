@@ -129,6 +129,27 @@ class SubagentToolSchemaTest {
     }
 
     @Test
+    @DisplayName("inputSchema: model 放开为任意 string（非 enum）· 支持多模态档位模型名，不再限 sonnet/opus/haiku")
+    void inputSchema_modelIsFreeString_forMultimodalTierModelName() {
+        // WHY (规则九): >20 页 PDF 文本主模型需引导调 Agent(model=<settings.multimodalModelName>)
+        //   派多模态子代理——若 model 仍是 sonnet/opus/haiku 枚举，主模型无法传多模态档位模型名
+        //   （如 'gpt-4o'/'claude-sonnet-4-6'），Agent 派子代理引导失效。放开 enum 为任意 string，
+        //   运行时解析（effectiveProviderConfig / AgentModelResolver.parseUserSpecifiedModel）已支持任意模型名。
+        // GIVEN
+        SubagentTool tool = new SubagentTool();
+
+        // WHEN
+        JsonNode model = tool.inputSchema().path("properties").path("model");
+
+        // THEN: type=string 且无 enum 限制；description 提示多模态档位模型名能力
+        assertThat(model.path("type").asText()).isEqualTo("string");
+        assertThat(model.has("enum")).as("model 须放开为任意 string，不再限制 sonnet/opus/haiku 枚举").isFalse();
+        assertThat(model.path("description").asText())
+            .contains("多模态档位模型名")
+            .contains("sonnet/opus/haiku");
+    }
+
+    @Test
     @DisplayName("outputSchema: anyOf 含 sync(completed) + async(async_launched) 两分支 (CC :141-155)")
     void outputSchema_isUnionOfSyncAndAsync() {
         // GIVEN

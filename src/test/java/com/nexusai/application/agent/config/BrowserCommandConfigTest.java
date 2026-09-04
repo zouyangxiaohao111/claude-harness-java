@@ -52,6 +52,8 @@ class BrowserCommandConfigTest {
     @BeforeEach
     void clearRegistry() {
         BundledSkills.clear();
+        // [browser-mcp-yml-gate] reset 总开关为默认 false（yml nexusai.feature.browser-mcp 默认关）
+        org.springframework.test.util.ReflectionTestUtils.setField(skillConfig, "browserMcpEnabled", false);
     }
 
     @AfterEach
@@ -193,8 +195,10 @@ class BrowserCommandConfigTest {
     // ════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("skill 门控：BrowserWsChannel 有连接 → nexusai-in-chrome 注册（对齐 CC setup.ts:72-84 + index.ts:70-72）")
+    @DisplayName("skill 门控：yml 开关开 + BrowserWsChannel 有连接 → nexusai-in-chrome 注册（对齐 CC setup.ts:72-84 + index.ts:70-72）")
     void skillGateRegistersWhenConnected() {
+        // [browser-mcp-yml-gate] 模拟 nexusai.feature.browser-mcp: true（开发中默认关，需显式开）
+        org.springframework.test.util.ReflectionTestUtils.setField(skillConfig, "browserMcpEnabled", true);
         BrowserWsChannel mockChannel = mock(BrowserWsChannel.class);
         when(mockChannel.hasSessionConnection()).thenReturn(true);
 
@@ -210,8 +214,10 @@ class BrowserCommandConfigTest {
     }
 
     @Test
-    @DisplayName("skill 门控：BrowserWsChannel 无连接 → nexusai-in-chrome 不注册（对齐 CC 默认关）")
+    @DisplayName("skill 门控：yml 开关开 + BrowserWsChannel 无连接 → nexusai-in-chrome 不注册（连接探测）")
     void skillGateSkipsWhenNotConnected() {
+        // [browser-mcp-yml-gate] browser-mcp: true 但无扩展连接 → 连接探测仍拒绝
+        org.springframework.test.util.ReflectionTestUtils.setField(skillConfig, "browserMcpEnabled", true);
         BrowserWsChannel mockChannel = mock(BrowserWsChannel.class);
         when(mockChannel.hasSessionConnection()).thenReturn(false);
 
@@ -223,6 +229,24 @@ class BrowserCommandConfigTest {
             .map(Command::getName).toList();
         assertThat(names).doesNotContain("nexusai-in-chrome");
         // 注册链未被掏空
+        assertThat(names).contains("loop");
+    }
+
+    @Test
+    @DisplayName("skill 门控：yml 开关关（默认 browser-mcp:false）+ 有连接 → nexusai-in-chrome 不注册（开发中默认关）")
+    void skillGateDisabledByYmlFlag_skipsEvenWhenConnected() {
+        // [browser-mcp-yml-gate] browser-mcp: false（默认）→ 即使扩展连接也不注册 skill
+        //   （工具不注册 + skill 不激活，防「skill 提示用工具但工具不存在」空转）
+        BrowserWsChannel mockChannel = mock(BrowserWsChannel.class);
+        when(mockChannel.hasSessionConnection()).thenReturn(true);
+
+        BundledSkillsBootstrapper bootstrapper =
+            skillConfig.bundledSkillsBootstrapper(BundledSkillFeatureFlags.DEFAULTS, null, mockChannel);
+        bootstrapper.run(null);
+
+        List<String> names = BundledSkills.getAll().stream()
+            .map(Command::getName).toList();
+        assertThat(names).doesNotContain("nexusai-in-chrome");
         assertThat(names).contains("loop");
     }
 

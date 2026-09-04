@@ -54,8 +54,9 @@ class ToolRegistrationConfigSubagentSupplierTest {
         // [冲突裁决·并集] 第 13/14 参 analyticsTracker+agentNameRegistry（IMP-G4）+ 第 15 参 yoloClassifier（IMP-SUB-25）
         // [循环依赖修复] 第 16 参 agentMemoryDirectory（null-safe 参数注入；null → 回落 productionDefault()）
         // [prompt-align UP-01] 第 17 参 promptAlignSettingsResolver（null → setter 回落 coordinatorMode.isCoordinatorMode()）
+        // [A5-2] 第 18/19 参 modelMapper+providerMapper（null-safe；null → 回落 anthropic 语义）
         ToolRegistrationConfig config = new ToolRegistrationConfig();
-        SubagentExecutor executor = config.subagentExecutor(null, null, null, null, null, supplier, null, null, null, null, null, false, null, null, null, null, null);
+        SubagentExecutor executor = config.subagentExecutor(null, null, null, null, null, supplier, null, null, null, null, null, false, null, null, null, null, null, null, null);
 
         // THEN: executor 的 pluginOnlySettingsSupplier 字段必须指向注入的 supplier（非默认 Map::of）
         Field f = SubagentExecutor.class.getDeclaredField("pluginOnlySettingsSupplier");

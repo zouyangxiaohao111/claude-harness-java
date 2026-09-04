@@ -9,6 +9,7 @@ import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.config.MemoryRemoteModeConfig;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.SystemMessage;
 import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
 import com.nexusai.application.agent.skill.ClaudePaths;
@@ -26,6 +27,7 @@ import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
 import com.nexusai.repository.settings.entity.SettingsRecord;
 import com.nexusai.repository.settings.mapper.SettingsMapper;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -66,8 +68,9 @@ import static org.mockito.Mockito.when;
  *       abort 中止 → 回滚锁（Java 无 kill 路径，abort 为唯一回滚点 · DreamTask.ts:136-155）；
  *       遥测 tengu_auto_dream_fired/completed/failed 双发射（recordEvent + logOTelEvent ·
  *       HookRegistry:278-279 惯例，autoDream.ts:195/252/267）。</li>
- *   <li>P2-1 会话门数据源 = 扁平 transcript：{ws}/{uuid}.jsonl（listCandidates:169-198 扁平扫描，
- *       getTranscriptPath 布局；生产 sessionId=UUID）—— 嵌套 session 目录布局会导致生产永不触发。</li>
+ *   <li>P2-1 会话门数据源 = 扁平 transcript：{configHome}/projects/{sanitize(ws)}/{sess-xxx 或 uuid}.jsonl
+ *       （listCandidates:169-198 扁平扫描；SessionStorage.getProjectDir(ws) 布局，2026-09-04 修正
+ *       原直扫 workspaceDir 的 bug）—— 测试须把 jsonl 写到该 config-home 派生目录而非 ws 项目根。</li>
  *   <li>D5-A/M-11：consolidateIfNeeded/scanSessionTranscripts 收 (workspaceDir, sessionId) 显式
  *       参数（替代共享 volatile 读写）—— 两会话目录隔离断言（无跨会话交错窗口）。</li>
  * </ol>
@@ -107,6 +110,18 @@ class AutoDreamConsolidatorTest {
         // spy：recordEvent 计数委托真实对象 + logOTelEvent 双发射可 verify（P2-1）
         telemetry = spy(new Telemetry());
         consolidator.setTelemetry(telemetry);
+        // [transcript-reloc 2026-09-04] 生产 transcript 不在 workspaceDir(项目根)平铺，而在
+        //   {configHome}/projects/{sanitizePath(ws)}（SessionStorage.getProjectDir(ws) =
+        //   NexusaiPaths.getAppConfigHomePath().resolve("projects").resolve(sanitize)）——
+        //   scanSessionTranscripts 内部经 SessionStorage.getProjectDir 派生同一目录。config-home
+        //   override 隔离到 @TempDir（防写/读真实 ~/.nexusai；getConfigHomeDirOverride 优先于 appName）。
+        NexusaiPaths.setConfigHomeDirOverride(Files.createDirectories(tempDir.resolve("cfg-home")).toString());
+    }
+
+    @AfterEach
+    void tearDown() {
+        // 复位 config home override（防泄漏到下一用例 —— @TempDir 每用例唯一，不串扰）
+        NexusaiPaths.setConfigHomeDirOverride(null);
     }
 
     @Test
@@ -719,7 +734,7 @@ class AutoDreamConsolidatorTest {
     }
 
     @Test
-    @DisplayName("当前 session 从会话门排除（autoDream.ts:164，扁平 {ws}/{uuid}.jsonl）")
+    @DisplayName("当前 session 从会话门排除（autoDream.ts:164，扁平 {configHome}/projects/{slug}/{sess-*.jsonl}）")
     void currentSession_excludedFromSessionGate() throws IOException {
         // 6 个扁平 transcript 但 1 个是当前 session → 排除后 5 个 → 通过（autoDream.ts:164）
         List<String> ids = writeSessions(ws, 6);
@@ -773,20 +788,25 @@ class AutoDreamConsolidatorTest {
     }
 
     @Test
-    @DisplayName("会话门扁平扫 *.jsonl + UUID 校验（listCandidates:169-198，agent-*.jsonl 非 UUID 排除）")
-    void sessionGate_flatScanSkipsNonUuidAndStale() throws IOException {
-        // 扁平 {ws}/{uuid}.jsonl 布局（getTranscriptPath）：仅 UUID 命名计入，agent-*.jsonl /
-        // 非 .jsonl / mtime 陈旧不计
-        Files.createDirectories(ws);
+    @DisplayName("会话门扁平扫：生产 sess-* 计入 + agent-* 排除 + UUID 老格式兼容 + 陈旧不计（对齐 CC 意图）")
+    void sessionGate_flatScanSkipsAgentAndStale() throws IOException {
+        // [B1 修复] 会话门过滤对齐 CC validateUuid 意图（排除 agent-*.jsonl 子代理 sidechain）：
+        //   生产主会话 = sess-*.jsonl 计入；agent-* 前缀排除；非 .jsonl / mtime 陈旧不计；
+        //   UUID 老格式仍兼容计入（listCandidates:169-198 语义 · sessionStoragePortable.ts:26-30）。
+        // [transcript-reloc] 文件写到 SessionStorage.getProjectDir(ws)（生产 transcript 目录）——
+        //   扫描端 scanSessionTranscripts 派生同一 config-home 目录，非 ws 项目根。
+        Path dir = SessionStorage.getProjectDir(ws);
+        Files.createDirectories(dir);
         long staleMtime = System.currentTimeMillis() - 2L * 60 * 60 * 1000;
+        // 5 个生产格式主会话（sess-<8hex>.jsonl）→ 会话门通过
         for (int i = 0; i < 5; i++) {
-            Path p = ws.resolve(UUID.randomUUID() + ".jsonl");
+            Path p = dir.resolve("sess-" + UUID.randomUUID().toString().substring(0, 8) + ".jsonl");
             Files.writeString(p, "{}\n");
         }
-        // agent-*.jsonl（非 UUID 前缀 → validateUuid 排除）+ 非 .jsonl 尾缀 + 陈旧 .jsonl
-        Files.writeString(ws.resolve("agent-123.jsonl"), "{}\n");
-        Files.writeString(ws.resolve("random.txt"), "{}\n");
-        Path stale = ws.resolve(UUID.randomUUID() + ".jsonl");
+        // agent-*.jsonl（子代理 sidechain → 排除）+ 非 .jsonl 尾缀 + 陈旧 .jsonl
+        Files.writeString(dir.resolve("agent-123.jsonl"), "{}\n");
+        Files.writeString(dir.resolve("random.txt"), "{}\n");
+        Path stale = dir.resolve("sess-" + UUID.randomUUID().toString().substring(0, 8) + ".jsonl");
         Files.writeString(stale, "{}\n");
         Files.setLastModifiedTime(stale, FileTime.fromMillis(staleMtime));
         consolidator.setAutoDreamEnabled(() -> true);
@@ -794,6 +814,24 @@ class AutoDreamConsolidatorTest {
         consolidator.consolidateIfNeeded(ws, null, null);
 
         // 恰好 5 个有效（agent-*/random.txt/陈旧不计）→ 通过
+        assertThat(query.called()).isTrue();
+    }
+
+    @Test
+    @DisplayName("会话门兼容：UUID 老格式 transcript 仍计入（CC 布局，validateUuid 兼容保留）")
+    void sessionGate_flatScanUuidLegacyStillCounts() throws IOException {
+        // WHY: B1 放宽后 UUID 老格式（CC 原生布局）仍须计入 —— 兼容迁移期混合文件系统。
+        // [transcript-reloc] 文件写到 SessionStorage.getProjectDir(ws)（生产 transcript 目录）
+        Path dir = SessionStorage.getProjectDir(ws);
+        Files.createDirectories(dir);
+        for (int i = 0; i < 5; i++) {
+            Path p = dir.resolve(UUID.randomUUID() + ".jsonl");
+            Files.writeString(p, "{}\n");
+        }
+        consolidator.setAutoDreamEnabled(() -> true);
+
+        consolidator.consolidateIfNeeded(ws, null, null);
+
         assertThat(query.called()).isTrue();
     }
 
@@ -1036,8 +1074,9 @@ class AutoDreamConsolidatorTest {
         for (String id : ids) {
             assertThat(prompt).contains("\n- " + id);
         }
-        // 尾部字节对齐：以最后一个 "- <uuid>" 结尾、无尾 \n（join 无尾换行 + text block 收尾无 \n）
-        assertThat(prompt).matches("(?s).*- [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
+        // 尾部字节对齐：以最后一个 "- sess-<8hex>" 结尾、无尾 \n（join 无尾换行 + text block 收尾无 \n）。
+        // [B1 修复] 生产 sessionId = sess-<8hex>（writeSessions 造生产真实格式）。
+        assertThat(prompt).matches("(?s).*- sess-[0-9a-f]{8}$");
         assertThat(prompt).doesNotEndWith("\n");
     }
 
@@ -1155,6 +1194,31 @@ class AutoDreamConsolidatorTest {
         assertThat(result.writtenPaths()).contains(fp);
     }
 
+    @Test
+    @DisplayName("[A1 重做] 5 参显式 memoryDir：无 projectRoot ThreadLocal 时锁/prompt 落传入目录（不回落 config-home）")
+    void consolidateIfNeeded_explicitMemoryDir_usedWithoutThreadLocal() throws IOException {
+        // WHY: 用户核心诉求 —— ThreadLocal 获取失败（异步 fork 线程无会话 projectRoot）不得导致
+        // memoryDir 回落 config-home 写错目录。参数直传后：consolidateIfNeeded 5 参接收会话线程
+        // 解析的 memoryDir，锁（ConsolidationLock）与 prompt memoryRoot 均用传入值，与当前线程
+        // AutoMemPaths ThreadLocal 完全无关。
+        writeSessions(ws, 5);
+        consolidator.setAutoDreamEnabled(() -> true);
+        // 关键：本测试线程不设 AutoMemPaths projectRoot ThreadLocal（setUp 未 setCurrentProjectRoot），
+        // 即使回落也只会到 config-home —— 断言锁/prompt 用显式传入的 mem，证明不依赖 ThreadLocal。
+        Path explicitMem = tempDir.resolve("explicit-mem-dir");
+
+        ForkedAgentParams p = captureForkParams(() -> consolidator.consolidateIfNeeded(ws, null, null, null, explicitMem));
+
+        assertThat(p).isNotNull();
+        // 锁落在显式 memoryDir（非 config-home / 非 ws）—— fork 后锁文件 mtime 即 lastConsolidatedAt
+        assertThat(explicitMem.resolve(ConsolidationLock.LOCK_FILE)).exists();
+        // prompt memoryRoot = 显式 memoryDir（buildConsolidationPrompt memoryRoot 参数）
+        ChatMessageDto promptMsg = p.promptMessages().get(p.promptMessages().size() - 1);
+        assertThat(promptMsg.content()).contains(explicitMem.toString());
+        // 且不含 config-home 自身路径（防回落误写）
+        assertThat(promptMsg.content()).doesNotContain(
+            com.nexusai.application.agent.skill.NexusaiPaths.getAppConfigHomeDir());
+    }
 
     /**
      * DC-9（IMP-MV2-30）：测试包内 fork 参数观察点 —— mockStatic 捕获
@@ -1198,15 +1262,31 @@ class AutoDreamConsolidatorTest {
     }
 
     /**
-     * 在 workspaceDir 下造 n 个扁平 transcript {ws}/{uuid}.jsonl（mtime=now ·
-     * SessionStorage.getTranscriptPath 布局，listCandidates:169-198 扁平扫描）。返回 sessionId 列表。
+     * 在 SessionStorage.getProjectDir(ws)（= {configHome}/projects/{sanitize(ws)}）下造 n 个扁平
+     * transcript sess-&lt;8hex&gt;.jsonl（mtime=now · SessionStorage.getTranscriptPath 布局，
+     * listCandidates:169-198 扁平扫描）。返回 sessionId 列表。
+     *
+     * <p><b>[transcript-reloc 2026-09-04]</b>：目标目录从 ws(项目根) 改为 config-home 派生目录
+     * （生产 transcript 实际位置；scanSessionTranscripts 内部经 SessionStorage.getProjectDir 派生
+     * 同一目录）。需先经 {@link NexusaiPaths#setConfigHomeDirOverride} 隔离（setUp 已做），否则
+     * 会写真实 ~/.nexusai。
+     *
+     * <p><b>[B1 修复 2026-09-04]</b>：文件名改<b>生产真实格式</b> sess-&lt;8hex&gt;.jsonl
+     * （[session-id-short] 键型 UUID→String short 形态，LlmAgentLoop:209）—— 旧实现造 UUID
+     * 文件名，会话门过滤测试全绿（UUID 能通过）但生产 sess-*.jsonl 全被 isUuid 排除 → 测试
+     * 与生产脱节、autoDream 永不触发（生产实测 6 次 STOP_HOOK 触发 0 次合并）。改造后全部
+     * 用例走生产格式，真正覆盖会话门通过路径。
      */
     static List<String> writeSessions(Path ws, int n) throws IOException {
-        Files.createDirectories(ws);
+        // [transcript-reloc 2026-09-04] transcript 写生产真实目录 {configHome}/projects/{sanitize(ws)}
+        //   （SessionStorage.getProjectDir(ws) · scanSessionTranscripts 内部同样派生该目录）——
+        //   非 ws 项目根平铺（原心智模型错误：scan 扫 config-home 派生目录，ws 下平铺恒 0）。
+        Path dir = SessionStorage.getProjectDir(ws);
+        Files.createDirectories(dir);
         List<String> ids = new ArrayList<>();
         for (int i = 0; i < n; i++) {
-            String id = UUID.randomUUID().toString();
-            Files.writeString(ws.resolve(id + ".jsonl"), "{}\n");
+            String id = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+            Files.writeString(dir.resolve(id + ".jsonl"), "{}\n");
             ids.add(id);
         }
         return ids;

@@ -85,6 +85,24 @@ class ShellQuoteParserTest {
     }
 
     @Test
+    @DisplayName("双引号 grep 模式含竖线：重建后竖线单引号保护（不拆管道，方案B）")
+    void rearrange_doubleQuotedPipePattern_quotesMeta() {
+        // WHY（规则九）：用户事故命令 grep -oE "JS_A|JS_B|..." file | sort | uniq -c —— parse 剥双引号
+        //   得单 token `a|b`（竖线是模式字面量，非管道），重建必须恢复引号保护；否则 eval 后 `a|b`
+        //   被当管道 → 裸 `grep -oE a` 读 stdin → Java 服务 stdin 非 EOF 永久挂起（BashTool 卡到超时）。
+        //   断言核心：期望值含 `'"'"'a|b'"'"'`（a|b 单引号化后经 singleQuoteForEval 转义），而非裸 `a|b`。
+        assertThat(ShellQuoteParser.rearrangePipeCommand("grep -oE \"a|b\" file | wc -l"))
+            .isEqualTo("'grep -oE '\"'\"'a|b'\"'\"' file < /dev/null | wc -l'");
+    }
+
+    @Test
+    @DisplayName("单引号词内双引号 view-id 模式：重建保留（对照不回归）")
+    void rearrange_singleQuotedViewIdPattern_stillProtected() {
+        assertThat(ShellQuoteParser.rearrangePipeCommand("grep -oE 'id=\"view-x\"' f | sort -u"))
+            .isEqualTo("'grep -oE '\"'\"'id=\"view-x\"'\"'\"' f < /dev/null | sort -u'");
+    }
+
+    @Test
     @DisplayName("parseShell：操作符/词/引号 token 化")
     void parseShell_tokenizes() {
         List<Object> tokens = ShellQuoteParser.parseShell("cat 'a b' | grep x");

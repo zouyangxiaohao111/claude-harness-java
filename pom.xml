@@ -12,10 +12,10 @@
     </parent>
 
     <groupId>com.nexusai</groupId>
-    <artifactId>claude-harness-java</artifactId>
-    <version>0.5.0</version>
-    <name>claude-harness-java</name>
-    <description>claude-harness-java - Java implementation of the Claude Code agent harness (Spring Boot + SQLite)</description>
+    <artifactId>nexusai-backend</artifactId>
+    <version>0.1.0</version>
+    <name>nexusai-backend</name>
+    <description>NexusAI Backend - Spring Boot 3.4 + SQLite + MyBatis-Flex</description>
 
     <properties>
         <!-- Java 25 required for GraalVM Native Image (native-maven-plugin 0.10.2

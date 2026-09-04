@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.LlmAgentLoop;
-import com.nexusai.application.agent.attachment.ImageAttachmentStore;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.PathGuard;
@@ -210,24 +209,27 @@ class PdfDeliveryAlignmentTest {
     // ═════════════ 3.5 [pdf-vision-align] 文本模型 PDF · 不发 document/image block（deepseek 400 根因防线）═════════════
 
     @Test
-    @DisplayName("[pdf-vision-align] 文本模型 + store → dispatchPdfFull 返回文本成功（页图注册 contentId），不发 document/image block newMessages")
-    void textModelDispatch_emitsNoDocumentOrImageNewMessages(@TempDir Path workspace) throws Exception {
+    @DisplayName("[pdf-vision-align 纠正] 文本模型 + 全读 PDF → error tool result + 无 document/image block newMessages（对齐 CC throw fail-loud）")
+    void textModelDispatch_returnsFailLoudErrorNoNewMessages(@TempDir Path workspace) throws Exception {
         writeRealPdf(workspace, "doc.pdf", 2);
         ReadFileTool tool = new ReadFileTool(new PathGuard(workspace));
-        ImageAttachmentStore imageStore = new ImageAttachmentStore();
-        tool.setImageAttachmentStore(imageStore);
         ToolUseContext ctx = textModelCtx(workspace);
 
         ToolResult<?> result = (ToolResult<?>) tool.execute(callWith("doc.pdf"), ctx);
 
-        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
+        assertThat(result.data())
+            .as("文本模型下 Read pdf → 引导文本 data（fail loud：模型据提示调 Agent 派多模态子代理/换模型，不回 400；非 document/parts 块）")
+            .isInstanceOf(String.class);
         assertThat(result.newMessages())
             .as("文本模型下绝不把 document/image block 发给主模型（deepseek 400 根因防线）")
             .isNullOrEmpty();
         assertThat((String) result.data())
-            .contains("vision_analyze")
-            .contains("contentId=")
+            .contains("当前模型不支持 image/PDF 视觉")
+            .contains("完整 PDF")
             .contains("doc.pdf");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("对抗核验 #3：error 文案以 'Error: ' 识别前缀开头 → is_error=true（fail loud + hook/analytics 正确）")
+            .isTrue();
     }
 
     /** [pdf-vision-align] 文本模型上下文：appState mainLoopModel=claude-3-haiku（mappers 未注入 → 1 参回落 false → 文本模型分支）。 */

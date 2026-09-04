@@ -169,12 +169,13 @@ class CronIdleExecutorTest {
     }
 
     @Test
-    @DisplayName("门关（isKairosCronEnabled=false）→ poll 不消费队列（对齐 CC isKilled 每 tick gate）")
+    @DisplayName("OD-D7 门关 + 仅 cron workload → poll 不消费 cron（逐条 skip，队列原样保留）")
     void pollSkipsWhenCronGateClosed() {
-        // WHY: OPD-Cron-07-h 拍板「关闭后已注册任务立即停止」——CC cronScheduler.ts:231
-        // check() 每 tick 顶部 `if (isKilled?.()) return`（useScheduledTasks.ts:119
-        // isKilled: () => !isKairosCronEnabled()）。Java 等价：CronEnabledGates 关闭 →
-        // CronIdleExecutor.poll() 开头 return false，队列原样保留（不消费不启动）。
+        // WHY（OD-D7 收窄后机制）: 原「门关 → poll() 开头整队列 return false」自创过宽 —— CC 队列消费
+        // （queueProcessor.ts:52-87 / useQueueProcessor.ts:48-67）零 cron 引用，isKilled 只 gate 调度
+        // tick（cronScheduler.ts:231）。收窄后 = mainThreadConsumable 谓词逐条跳过 WORKLOAD_CRON 项：
+        // 队列只有 cron → peek 无可消费 → poll 返回 false，cron 项留队列（存量项等门开 / producer gate
+        // 已停 fire）。生产方停止语义仍由 TestJob.fire producer gate（OPD-Cron-07-h）保证。
         queue.enqueue(new QueueItem("提示词A", "prompt", Priority.LATER, null, true, NotificationQueue.WORKLOAD_CRON));
         CronEnabledGates gates = new CronEnabledGates(false, true);   // agentTriggerCron=false → isKairosCronEnabled=false
         ReflectionTestUtils.setField(executor, "cronGates", gates);
@@ -183,8 +184,63 @@ class CronIdleExecutorTest {
         boolean processed = executor.poll(commands -> startCount.incrementAndGet());
 
         assertThat(processed).isFalse();
-        assertThat(startCount.get()).isZero();          // 门关不消费不启动
-        assertThat(queue.size()).isEqualTo(1);          // 队列原样保留（已注册任务立即停，不消费）
+        assertThat(startCount.get()).isZero();          // 门关 cron 项不消费不启动
+        assertThat(queue.size()).isEqualTo(1);          // cron 项原样保留（谓词 skip，非整队列冻结）
+    }
+
+    @Test
+    @DisplayName("OD-D7 门关 + 仅 busy-queued/task-notification → 照常空闲消费（cron 开关与队列消费解耦）")
+    void pollConsumesNonCronWhenCronGateClosed() {
+        // WHY: OD-D7 核心意图 —— 关 cron 只停 cron 调度（producer gate），队列消费照常服务非 cron
+        //   命令（CC queueProcessor.ts 零 cron 引用）。门关后 busy-queued（用户排队 prompt）与
+        //   task-notification（后台任务完成通知）仍须空闲消费；若门关冻结整段 poll，用户排队消息会
+        //   滞留到门重开才被处理（2026-09-04 拍板修复）。
+        CronEnabledGates gates = new CronEnabledGates(false, true);   // agentTriggerCron=false → isKairosCronEnabled=false
+        ReflectionTestUtils.setField(executor, "cronGates", gates);
+        queue.enqueue(new QueueItem("排队用户消息", "prompt", Priority.LATER, null,
+            false, "busy-queued"));                                   // busy-queued: workload != cron
+        queue.enqueue(new QueueItem("后台完成通知", "task-notification", Priority.LATER, null,
+            true, null));
+        AtomicInteger startCount = new AtomicInteger();
+        List<QueueItem> consumed = new ArrayList<>();
+
+        // 两种 mode 分属不同 batch（peek 取最高优先 / FIFO 先插入者）→ 两次 poll 各消费一类
+        boolean first = executor.poll(commands -> {
+            startCount.incrementAndGet();
+            consumed.addAll(commands);
+        });
+        boolean second = executor.poll(commands -> {
+            startCount.incrementAndGet();
+            consumed.addAll(commands);
+        });
+
+        assertThat(first).isTrue();
+        assertThat(second).isTrue();
+        assertThat(startCount.get()).isEqualTo(2);
+        assertThat(consumed).extracting(QueueItem::value)
+            .containsExactlyInAnyOrder("排队用户消息", "后台完成通知");
+        assertThat(queue.size()).isZero();
+    }
+
+    @Test
+    @DisplayName("OD-D7 门关 + 混排 cron 队头 LATER → 非 cron 不被队头 cron 阻塞（peek 全队列扫无饿死）")
+    void pollCronHeadDoesNotBlockNonCronWhenGateClosed() {
+        // WHY: 原 poll 顶部整队列 gate 删除后，peek 仍须证明不被队头 cron 饿死 —— NotificationQueue.peek
+        //   全队列线性扫「匹配谓词的最高优先级」，队头 cron（workload=cron）被谓词 skip → 后方非 cron
+        //   照常命中。若谓词未正确 skip cron，peek 会返回队头 cron 而 poll 把它当可消费项启动（错）。
+        CronEnabledGates gates = new CronEnabledGates(false, true);   // agentTriggerCron=false → isKairosCronEnabled=false
+        ReflectionTestUtils.setField(executor, "cronGates", gates);
+        // 先入队 cron（队头，LATER），后入队 task-notification（LATER 同级 FIFO 靠后）
+        queue.enqueue(new QueueItem("队头cron", "prompt", Priority.LATER, null, true, NotificationQueue.WORKLOAD_CRON));
+        queue.enqueue(new QueueItem("通知不被阻塞", "task-notification", Priority.LATER, null, true, null));
+        List<QueueItem> consumed = new ArrayList<>();
+
+        boolean processed = executor.poll(consumed::addAll);
+
+        assertThat(processed).isTrue();
+        assertThat(consumed).extracting(QueueItem::value).containsExactly("通知不被阻塞");
+        assertThat(queue.size()).isEqualTo(1);          // cron 队头原样保留
+        assertThat(queue.peek(q -> true).orElseThrow().value()).isEqualTo("队头cron");
     }
 
     // ============ CRON-F5: 启动表面 missed（ApplicationReadyEvent → surfaceMissedAtStartup） ============
@@ -1491,13 +1547,14 @@ class CronIdleExecutorTest {
     }
 
     @Test
-    @DisplayName("目标2: run 结束返回 AgentState → 调用 chatService.replayAndPersist 落库（真实会话，streamTopic=会话级单 topic）")
+    @DisplayName("目标2: run 结束返回 AgentState → 实时落库 SPI 武装 + complete 收口 + clearAppendListener（真实会话）")
     void runOneAgentLoop_persistsResultAfterRun() throws Exception {
         // WHY（规则九）: cron 结果必须落 transcript（assistant/tool/final，user 已落库）——CC onFireTask
-        //   结果落 transcript + 用户可见回复。run() 返回终态 AgentState → 复用 ChatService.replayAndPersist
-        //   （与主链路同款回放持久化：落库 assistant/tool/final，user 已落库跳过，注入历史 prePersisted 跳过防重）。
-        //   streamTopic=会话级单 topic；wsTemplate 未注入（非 Spring 单测）→ sendAndLog 跳过推送仅落库。
-        //   RED: 不调用 / sessionUuid 错（GLOBAL 兜底）/ runState 丢弃 → 断言变红。
+        //   结果实时写 transcript。实时化后（2026-09-03）不再调 ChatService.replayAndPersist 批量：run 前经
+        //   ChatService.armRealTimePersist 武装 appendListener（doRun 历史注入后逐条实时落库），run 后
+        //   clearAppendListener + publishCompleteEvent 收口。mock loop 不消费 enabler → 捕获 consumer 手动
+        //   accept 验证真实接线。streamTopic=会话级单 topic；wsTemplate 未注入 → sendAndLog 跳过推送仅落库。
+        //   RED: 未武装 / 未收口 / sessionUuid 错（GLOBAL 兜底）/ runState 丢弃 → 断言变红。
         String sessionId = "sess-result-persist";
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
@@ -1514,8 +1571,18 @@ class CronIdleExecutorTest {
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        verify(mockChat).replayAndPersist(eq(sessionId), isNull(), eq(state),
-            eq("/topic/sessions/" + sessionId + "/stream"), isNull());
+        // ① run 前武装实时落库 SPI：setPostHistoryPersistEnabler 被调 → 捕获 consumer 手动 accept →
+        //    chatService.armRealTimePersist 真实接线（initialUserMessageId = cmd.uuid() = null）。
+        ArgumentCaptor<java.util.function.Consumer> enablerCaptor =
+            ArgumentCaptor.forClass(java.util.function.Consumer.class);
+        verify(loop).setPostHistoryPersistEnabler(enablerCaptor.capture());
+        enablerCaptor.getValue().accept(state);
+        verify(mockChat).armRealTimePersist(eq(state), eq(sessionId),
+            eq("/topic/sessions/" + sessionId + "/stream"), isNull(), isNull());
+        // ② run 结束收口：clearAppendListener + publishCompleteEvent（userMessageId=cmd.uuid()=null）
+        verify(state).clearAppendListener();
+        verify(mockChat).publishCompleteEvent(eq(sessionId), isNull(), eq(state),
+            eq("/topic/sessions/" + sessionId + "/stream"), isNull(), anyLong(), isNull());
     }
 
     @Test
@@ -1558,11 +1625,12 @@ class CronIdleExecutorTest {
     }
 
     @Test
-    @DisplayName("[cron-complete] cron run 结束 → 调 chatService.publishCompleteEvent 收口（userMessageId=cron user 消息 id）")
+    @DisplayName("[cron-complete] cron run 结束 → 实时落库 SPI 武装 + publishCompleteEvent 收口（userMessageId=cron user 消息 id）")
     void runOneAgentLoop_pushesCompleteAfterPersist() throws Exception {
         // WHY（规则九 · 前端消息顺序倒挂修复）: cron 轮 assistant 流式块无 complete 收口 → 残留 streams →
-        //   被后续用户 turn complete 混收口倒挂。run 结束后复用 ChatService.publishCompleteEvent
-        //   （正常 turn 同款装配）收口，前端 finalize cron 块。userMessageId=cron user 消息 id（=cmd.uuid()）。
+        //   被后续用户 turn complete 混收口倒挂。实时化后（2026-09-03）run 结果已由 appendListener 实时落库，
+        //   run 结束复用 ChatService.publishCompleteEvent（正常 turn 同款装配）收口，前端 finalize cron 块。
+        //   userMessageId=cron user 消息 id（=cmd.uuid()="msg-cron-uuid"，同时作为实时落库归属根传参）。
         String sessionId = "sess-cron-complete";
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
@@ -1579,8 +1647,15 @@ class CronIdleExecutorTest {
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        verify(mockChat).replayAndPersist(eq(sessionId), eq("msg-cron-uuid"), eq(state),
-            eq("/topic/sessions/" + sessionId + "/stream"), isNull());
+        // run 前武装实时落库 SPI：捕获 consumer 手动 accept → armRealTimePersist 以 cmd.uuid() 作归属根
+        ArgumentCaptor<java.util.function.Consumer> enablerCaptor =
+            ArgumentCaptor.forClass(java.util.function.Consumer.class);
+        verify(loop).setPostHistoryPersistEnabler(enablerCaptor.capture());
+        enablerCaptor.getValue().accept(state);
+        verify(mockChat).armRealTimePersist(eq(state), eq(sessionId),
+            eq("/topic/sessions/" + sessionId + "/stream"), isNull(), eq("msg-cron-uuid"));
+        // run 结束收口：clearAppendListener + publishCompleteEvent
+        verify(state).clearAppendListener();
         verify(mockChat).publishCompleteEvent(eq(sessionId), eq("msg-cron-uuid"), eq(state),
             eq("/topic/sessions/" + sessionId + "/stream"), isNull(), anyLong(), isNull());
     }

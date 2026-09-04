@@ -42,6 +42,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -50,28 +51,29 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * [mid-turn-align] ChatService 层：mid-turn 注入排队 user 消息的落库时机 + error 逃生门。
+ * [mid-turn-align · 实时落库 2026-09-03] ChatService 层：mid-turn 注入排队 user 消息的实时落库 +
+ * run 后收口兜底 + error 分支（对齐 CC 无 requeue）。
  *
  * <p><b>WHY（规则九 · 测试验证意图）</b>：busy-queued 由 LlmAgentLoop 工具边界 mid-turn 注入当前轮
- * 上下文（同轮回答），排队 user 消息<b>不立即落库</b>（goal 2），轮结束由 ChatService 补落库
- * （createQueuedUserMessage，指定 id = 队列 uuid，DB 顺序 = user → assistant... → queued-user）。
- * 本测试锁定三个行为意图：
+ * 上下文（同轮回答）。实时化后 queued-user 在 append 时点由 appendListener（persistAppendedMessage）
+ * 原位落库（4 参单调 ts，DB 顺序 = user → assistant... → queued-user）；processUserMessage 在 run
+ * 返回后收口（clearAppendListener + persistInjectedQueuedMessages existsById 判重幂等兜底）。本文件
+ * 用 mock loop（不消费 appendListener enabler）锁定 run 后收口兜底路径三个行为意图：
  * <ol>
- *   <li><b>成功路径</b>：{@code replayAndPersist} 按 {@code state.messages()} 位置<b>原位落库</b>
- *       mid-turn 注入的 queued-user（走 4 参单调重载，含空 content 一条；顺序 = messages() 位置，
- *       与 assistant 的相对序见 ChatServiceReplayPersistReasoningDurationTest.inPlaceQueuedUserCreatedAt
- *       ——assistantA &lt; queued-user &lt; assistantB）。</li>
- *   <li><b>cancel 分支</b>：与成功路径共用同一 {@code persistInjectedQueuedMessages} 补落库
- *       （cancel 仅 return 前多调一次同 helper，行为由本文件 helper 用例覆盖）。</li>
- *   <li><b>error 分支</b>：{@code loop.run()} 抛异常时 state 恒 null（赋值未完成）→ 走 loop 逃生门
- *       {@code loop.injectedQueuedMessages()} 逐个以<b>原 uuid</b> re-enqueue 回 NotificationQueue
- *       （workload=busy-queued, priority=NEXT）+ emitChanged —— 消息不永久丢失，交 CronIdleExecutor 兜底。</li>
+ *   <li><b>成功路径</b>：收口 {@code persistInjectedQueuedMessages} 按 injected 列表<b>原位落库</b>
+ *       mid-turn 注入的 queued-user（4 参单调重载，含空 content 一条；顺序 = injectedQueuedMessages()
+ *       注册序 = messages() 位置）。</li>
+ *   <li><b>cancel 分支</b>：run 返回后收口先于 cancel 检查执行（同一 {@code persistInjectedQueuedMessages}
+ *       幂等补落），cancel 分支不再重复调用。</li>
+ *   <li><b>error 分支</b>：{@code loop.run()} 抛异常 → state 恒 null。已注入命令<b>不再 requeue</b>
+ *       （对齐 CC messageQueueManager.ts 无 requeue API，用户拍板 2026-09-03）：队列保持空，已 append
+ *       的由实时落库留痕，未注入仍在队列由 CronIdleExecutor 自然消费；终态 error + idle 事件仍推。</li>
  * </ol>
  *
  * <p>纯单测：{@code new ChatService()} + {@link ReflectionTestUtils} 注入 mock；{@code processUserMessage}
  * 直调（无 Spring proxy → @Async 不生效，同步执行）；loopProvider 返回 mock LlmAgentLoop（run 桩返回/抛异常）。
  */
-@DisplayName("[mid-turn-align] 排队 user 消息轮结束补落库 + error 逃生门")
+@DisplayName("[mid-turn-align] 排队 user 消息实时落库收口兜底 + error 不 requeue")
 class ChatServiceTest {
 
     private ChatService service;
@@ -125,10 +127,11 @@ class ChatServiceTest {
     }
 
     @Test
-    @DisplayName("成功路径：mid-turn 注入 queued-user 原位 4 参落库（含空 content），顺序 = messages() 位置")
+    @DisplayName("成功路径：mid-turn 注入 queued-user 收口兜底 4 参落库（含空 content），顺序 = injected 注册序")
     void processUserMessage_successPath_persistsInjectedQueuedMessagesInPlace() {
-        // GIVEN: mock loop.run() 返回 state——queued-user 同时 append 进 messages()（真实 LlmAgentLoop
-        //   工具边界注入模型）并登记 injectedQueuedMessages（含空 content 一条）
+        // GIVEN: mock loop.run() 返回 state——queued-user 登记 injectedQueuedMessages（含空 content 一条）。
+        //   mock loop 不消费 appendListener enabler（真实 doRun 才会回调武装）→ 实时原位落库未执行 → 走
+        //   processUserMessage run 后收口 persistInjectedQueuedMessages（existsById mock false → 全部补落）。
         AgentState state = new AgentState("sys", sid, null);
         state.appendMessage(LlmAgentLoop.toMessage(Role.assistant, "同轮回复", null));
         state.appendMessage(LlmAgentLoop.toMessage(Role.user, "忙时追问", null, "msg-queued-1"));
@@ -143,23 +146,24 @@ class ChatServiceTest {
         service.processUserMessage(sid, "msg-user", new SendMessageRequest(
             "主问题", null, null, null, null, null, null, null, null), wsTemplate);
 
-        // THEN: 原位落库走 4 参重载（单调时间戳 createdAt=baseTs.plusNanos(seq)），顺序 = messages()
-        //   位置（msg-queued-1 先于 msg-queued-2）；与 assistant 落库的相对序由
-        //   ChatServiceReplayPersistReasoningDurationTest.inPlaceQueuedUserCreatedAt 锚定
-        //   （assistantA < queued-user < assistantB）。
+        // THEN: 收口兜底走 6 参重载（单调时间戳 createdAt=baseTs.plusNanos(seq)），顺序 = injected 注册序
+        //   （msg-queued-1 先于 msg-queued-2）。真实生产实时路径由 appendListener 在 append 时点以同款 6 参
+        //   单调 ts 原位落库（顺序 = messages() 位置，见 persistAppendedMessage user 分支）。
+        //   [P0-1 OD-1/OD-3] 6 参末位 queuedOrigin：本测试经 2 参 addInjectedQueuedMessage 登记（queuedOrigin=null，
+        //   与现状等价不标记）；生产 drain busy-queued 经 3 参登记 queuedOrigin='busy-queued'。
         InOrder inOrder = inOrder(messageService);
         inOrder.verify(messageService).createQueuedUserMessage(
-            eq(sid), eq("msg-queued-1"), eq("忙时追问"), any(OffsetDateTime.class));
+            eq(sid), eq("msg-queued-1"), eq("忙时追问"), any(OffsetDateTime.class), eq(false), isNull());
         inOrder.verify(messageService).createQueuedUserMessage(
-            eq(sid), eq("msg-queued-2"), eq(""), any(OffsetDateTime.class));
+            eq(sid), eq("msg-queued-2"), eq(""), any(OffsetDateTime.class), eq(false), isNull());
         // 队列已空（mid-turn 注入已 drain 消费，轮结束不再残留）
         assertThat(notificationQueue.size()).isZero();
     }
 
     @Test
-    @DisplayName("error 分支：loop.run() 抛异常 → state 恒 null，经 loop 逃生门 re-enqueue 回队列（原 uuid + busy-queued + NEXT）+ emitChanged")
-    void processUserMessage_errorBranch_reenqueuesInjectedQueuedMessages() {
-        // GIVEN: mock loop.run() 抛异常，loop.injectedQueuedMessages() 有值（error 逃生门镜像）
+    @DisplayName("error 分支：loop.run() 抛异常 → 不再 requeue 已注入排队消息（对齐 CC 无 requeue，队列保持空）")
+    void processUserMessage_errorBranch_noReenqueue() {
+        // GIVEN: mock loop.run() 抛异常，loop.injectedQueuedMessages() 有值（旧 error 逃生门镜像——已删）
         LlmAgentLoop mockLoop = mock(LlmAgentLoop.class);
         when(mockLoop.injectedQueuedMessages()).thenReturn(List.of(
             new AgentState.InjectedQueuedMessage("msg-queued-err", "错误前追问")));
@@ -170,15 +174,18 @@ class ChatServiceTest {
         service.processUserMessage(sid, "msg-user", new SendMessageRequest(
             "主问题", null, null, null, null, null, null, null, null), wsTemplate);
 
-        // THEN: 已 mid-turn 注入的排队消息以原 uuid 重新入队（不丢失，交 CronIdleExecutor 兜底）
-        assertThat(notificationQueue.size()).as("error 分支必须 re-enqueue 排队消息回队列").isEqualTo(1);
-        NotificationQueue.QueueItem item = notificationQueue.peek(q -> true).orElseThrow();
-        assertThat(item.uuid()).isEqualTo("msg-queued-err");
-        assertThat(item.workload()).isEqualTo("busy-queued");
-        assertThat(item.priority()).isEqualTo(NotificationQueue.Priority.NEXT);
-        assertThat(item.mode()).isEqualTo(NotificationQueue.MODE_PROMPT);
-        assertThat(item.sessionId()).isEqualTo(sid);
-        verify(queueEventPublisher).emitChanged(sid);
+        // THEN: 不再 re-enqueue（对齐 CC messageQueueManager.ts 无 requeue API：消费即移除，query 崩溃已消费
+        //   命令不自动回队）——已注入命令若已 append 由实时落库留痕（DB + 前端气泡）；未注入仍在队列由
+        //   CronIdleExecutor 自然消费。队列保持空 = error 分支不重放。
+        assertThat(notificationQueue.size()).as("error 分支不得 requeue 已注入排队消息（对齐 CC 无 requeue）").isZero();
+        verify(queueEventPublisher, never()).emitChanged(sid);
+        // 终态事件仍推（error + idle）——前端收口不漏
+        String topic = "/topic/sessions/" + sid + "/stream";
+        ArgumentCaptor<Object> eventCaptor = ArgumentCaptor.forClass(Object.class);
+        verify(wsTemplate, atLeast(1)).convertAndSend(eq(topic), eventCaptor.capture());
+        boolean hasError = eventCaptor.getAllValues().stream()
+            .anyMatch(e -> e instanceof com.nexusai.eventbus.ws.MessageErrorEvent);
+        assertThat(hasError).as("error 分支仍推 message.error（前端留痕）").isTrue();
     }
 
     @Test
@@ -242,11 +249,16 @@ class ChatServiceTest {
         //   上下文三字段每轮带（照抄 CC result 事件结构，plan §一 目标 JSON）。
         AgentState state = new AgentState("sys", sid, null);
         state.setCurrentModel("deepseek-v4-flash");
+        AgentUsage asstUsage = new AgentUsage(1000L, 500L, 100L, 200L,
+            new AgentUsage.ServerToolUse(1L, 0L), "standard",
+            new AgentUsage.CacheCreation(0L, 0L));
         ChatMessageDto asst = LlmAgentLoop.toMessage(Role.assistant, "同轮回复", null, "a-final")
-            .withUsage(new AgentUsage(1000L, 500L, 100L, 200L,
-                new AgentUsage.ServerToolUse(1L, 0L), "standard",
-                new AgentUsage.CacheCreation(0L, 0L)));
+            .withUsage(asstUsage);
         state.appendMessage(asst);
+        // [usage-push] complete.usage 口径 = 本轮累计（state.runUsage）——mock LlmAgentLoop 不会走
+        //   真实 publishMessageUsage 3 处接线，需手动 accumulateRunUsage 模拟生产累计（否则 runUsage
+        //   = 全零哨兵 → 本测试 input/output 断言红）。
+        state.accumulateRunUsage(asstUsage);
         // 模拟 LlmAgentLoop E2/E3 生产路径写 state 会话累计
         state.addSessionCostYuan(0.0123);
         LlmAgentLoop mockLoop = mock(LlmAgentLoop.class);
@@ -287,6 +299,50 @@ class ChatServiceTest {
             .as("percentLeft = 余量百分比（常驻每轮带，对齐 CC StatusLine）").isNotNull();
         assertThat(complete.getNumTurns())
             .as("num_turns = state.turnCount()").isEqualTo(state.turnCount());
+    }
+
+    @Test
+    @DisplayName("[usage-push] message.complete.usage = 本轮累计（两条 assistant 1000/500 + 2000/800 → 3000/1300），对齐 CC result.usage")
+    void processUserMessage_completeEvent_usageIsTurnCumulative() {
+        // GIVEN: mock loop.run() 返回带 2 条 assistant（各带 usage）且已 accumulateRunUsage 的 state
+        // WHY（规则九 · 意图）：CC result.usage = query 级累计 totalUsage（QueryEngine.ts:790-816/:861），
+        //   Java 改读 state.runUsage()（LlmAgentLoop 3 处 withUsage append 后 accumulateRunUsage）——
+        //   若误用末条单条（修复前 lastAssistantMessage(state).usage()），第二条 2000/800 会覆盖累计
+        //   断言 3000/1300 红。
+        AgentState state = new AgentState("sys", sid, null);
+        state.setCurrentModel("deepseek-v4-flash");
+        // 第一条 assistant：input 1000 / output 500（cache 字段 null）
+        state.appendMessage(LlmAgentLoop.toMessage(Role.assistant, "首条回复", null, "a-1")
+            .withUsage(new AgentUsage(1000L, 500L, null, null, null, null, null)));
+        state.accumulateRunUsage(new AgentUsage(1000L, 500L, null, null, null, null, null));
+        // 第二条 assistant：input 2000 / output 800（cacheRead 300）
+        state.appendMessage(LlmAgentLoop.toMessage(Role.assistant, "次条回复", null, "a-2")
+            .withUsage(new AgentUsage(2000L, 800L, null, 300L, null, null, null)));
+        state.accumulateRunUsage(new AgentUsage(2000L, 800L, null, 300L, null, null, null));
+        LlmAgentLoop mockLoop = mock(LlmAgentLoop.class);
+        when(mockLoop.run(any(RunRequest.class))).thenReturn(state);
+        when(loopProvider.getObject()).thenReturn(mockLoop);
+
+        // WHEN: 主流程（busy 判定 false → 正常跑完整轮，发送 message.complete）
+        service.processUserMessage(sid, "msg-user", new SendMessageRequest(
+            "主问题", null, null, null, null, null, null, null, null), wsTemplate);
+
+        // THEN: complete.usage = 本轮累计（非末条单条 2000/800）
+        String topic = "/topic/sessions/" + sid + "/stream";
+        ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
+        verify(wsTemplate, atLeast(1)).convertAndSend(eq(topic), captor.capture());
+        MessageCompleteEvent complete = captor.getAllValues().stream()
+            .filter(MessageCompleteEvent.class::isInstance)
+            .map(MessageCompleteEvent.class::cast)
+            .findFirst().orElseThrow();
+        assertThat(complete.getUsage())
+            .as("usage 必须携带本轮累计（非 null）").isNotNull();
+        assertThat(complete.getUsage().inputTokens())
+            .as("usage.input_tokens = 1000+2000 本轮累计（对齐 CC result.usage totalUsage）").isEqualTo(3000L);
+        assertThat(complete.getUsage().outputTokens())
+            .as("usage.output_tokens = 500+800 本轮累计").isEqualTo(1300L);
+        assertThat(complete.getUsage().cacheReadInputTokens())
+            .as("usage.cache_read_input_tokens = 0+300 本轮累计").isEqualTo(300L);
     }
 
     @Test

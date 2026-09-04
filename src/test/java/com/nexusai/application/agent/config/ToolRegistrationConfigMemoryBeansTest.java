@@ -60,6 +60,11 @@ class ToolRegistrationConfigMemoryBeansTest {
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED,
             /*hookRegistry*/ null, /*readFileTool*/ null, /*settingsResolver*/ null);
         assertThat(sm).isNotNull();
+        // [sm-reloc] 生产 2-arg 装配：per-session resolver（SessionStorage::sessionProjectDir）必须注入，
+        //   非 legacy 固定 baseDir —— resolvePath 按会话动态求值 projects/{slug}（与 transcript 同源分层）
+        assertThat(readField(sm, "sessionBaseDirResolver"))
+            .as("sm-reloc：sessionMemoryService bean 的 sessionBaseDirResolver 非 null（per-session 落点）")
+            .isNotNull();
 
         MemoryStorage storage = config.memoryStorage(
             com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance());
@@ -212,7 +217,8 @@ class ToolRegistrationConfigMemoryBeansTest {
         StreamCompactSummary streamCompactSummary = Mockito.mock(StreamCompactSummary.class);
         SessionMemoryService sm = sessionMemoryServiceBean();
 
-        AutoCompactor auto = config.autoCompactor(tokenCounter, streamCompactSummary, null, sm, /*settingsResolver*/ null);
+        AutoCompactor auto = config.autoCompactor(tokenCounter, streamCompactSummary, null, sm,
+            /*settingsResolver*/ null, /*modelMapper*/ null, /*providerMapper*/ null);
 
         Field f = AutoCompactor.class.getDeclaredField("sessionMemoryService");
         f.setAccessible(true);

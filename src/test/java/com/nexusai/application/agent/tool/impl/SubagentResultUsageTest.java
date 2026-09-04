@@ -160,6 +160,23 @@ class SubagentResultUsageTest {
     }
 
     @Test
+    @DisplayName("[A5-2] extractTotalTokens(anthropic=false) = input + output（deepseek 子代理预算口径）")
+    void extractTotalTokens_shouldDispatchNonAnthropic() {
+        // WHY (A5-2): 子 Agent 预算 totalTokens 按来源模型判 anthropic——deepseek input_tokens 已含
+        //   cache hit（input == H+M），4 项和把命中重复计入 → 父 Agent 预算决策 over-count。
+        //   1 参（默认 anthropic）保持 4 项和；2 参非 anthropic → input+output。
+        AgentUsage full = new AgentUsage(100L, 25L, 40L, 15L, null, null, null);
+        List<ChatMessageDto> messages = List.of(assistantWithUsage("结论", full));
+
+        assertThat(SubagentExecutor.extractTotalTokens(messages, false))
+            .as("100+25=125（忽略 cache_read=40/cache_creation=15）").isEqualTo(125L);
+        assertThat(SubagentExecutor.extractTotalTokens(messages, true))
+            .as("anthropic 保持 4 项和 = 180").isEqualTo(180L);
+        assertThat(SubagentExecutor.extractTotalTokens(messages))
+            .as("1 参默认 anthropic 语义 = 180（向后兼容）").isEqualTo(180L);
+    }
+
+    @Test
     @DisplayName("[DEC-04] SubagentResult.usage 必填非空 (null → requireNonNull 失败, 对齐 CC usage 非空 schema)")
     void subagentResult_shouldRejectNullUsage() {
         // WHY: CC agentToolResultSchema usage 必填非 nullable (EV-DPA-001), finalizeAgentTool 无 null 兜底.

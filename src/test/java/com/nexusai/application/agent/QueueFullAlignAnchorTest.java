@@ -80,21 +80,29 @@ class QueueFullAlignAnchorTest {
         AgentState state = loop.run(RunRequest.session("主问题", sid, null,
             com.nexusai.infra.llm.ProviderConfig.empty(), "test-model", null, null));
 
-        String ccPrefix = "The user sent a new message while you were working:\n";
-        String ccSuffix = "\n\nIMPORTANT: After completing your current task, you MUST address the user's message above. Do not ignore it.";
+        // [P0-1 机制切换] state 存原文 RAW + queuedOrigin（壳只在发送边界 wrapQueuedMessagesForApi 生成）；
+        //   契约：busy-queued 原文 + queuedOrigin=busy-queued；turn-0 主 prompt（workload=null）原文不套壳。
         List<String> userContents = state.messages().stream()
             .filter(m -> m.role() == Role.user)
             .map(ChatMessageDto::content)
             .toList();
-        // [prompt-wrap-fix] 契约分化：busy-queued（mid-turn 排队）保留 wrapCommandText 壳（prefix + 原文
-        //   + suffix）；turn-0 主 prompt（workload=null）走 handlePromptSubmit 原文不套壳。
         assertThat(userContents).hasSize(2);
         assertThat(userContents.get(0))
-            .as("busy-queued 先入队先出（FIFO），保留 wrapCommandText 壳（prefix + 原文 + suffix）")
-            .isEqualTo(ccPrefix + "忙时追问" + ccSuffix);
+            .as("busy-queued 先入队先出（FIFO），state 存原文 RAW（包壳在发送边界）")
+            .isEqualTo("忙时追问");
         assertThat(userContents.get(1))
             .as("turn-0 主 prompt（workload=null）后注入，走原文不套壳（对齐 CC handlePromptSubmit）")
             .isEqualTo("主问题");
+        // busy-queued state 消息带 queuedOrigin=busy-queued + isMeta=false
+        assertThat(state.messages().stream()
+            .filter(m -> m.role() == Role.user && "忙时追问".equals(m.content()))
+            .findFirst())
+            .as("busy-queued state 消息必须带 queuedOrigin=busy-queued（发送层据此包壳）+ isMeta=false")
+            .isPresent()
+            .satisfies(opt -> {
+                assertThat(opt.get().queuedOrigin()).isEqualTo("busy-queued");
+                assertThat(opt.get().isMeta()).isFalse();
+            });
         // turn-0 注入的 busy-queued 进 state.injectedQueuedMessages（原位落库通道，对齐文档反思 #6）
         assertThat(state.injectedQueuedMessages())
             .as("turn-0 注入的 busy-queued 必须进 injectedQueuedMessages（{uuid, 原始文本}，供轮末补落库）")

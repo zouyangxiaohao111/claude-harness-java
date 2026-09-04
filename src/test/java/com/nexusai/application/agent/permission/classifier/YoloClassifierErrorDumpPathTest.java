@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.permission.PermissionMode;
-import com.nexusai.application.agent.skill.BundledSkillFileExtractor;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
@@ -117,7 +117,7 @@ class YoloClassifierErrorDumpPathTest {
             .as("CC :947 reason 'Classifier request aborted'")
             .isEqualTo("Classifier request aborted");
         assertThat(result.errorDumpPath()).isNull();
-        Path dumpFile = Path.of(BundledSkillFileExtractor.getClaudeTempDir(),
+        Path dumpFile = Path.of(NexusaiPaths.getAppTempDir(),
             "auto-mode-classifier-errors", sessionId + ".txt");
         assertThat(Files.exists(dumpFile))
             .as("CC :941-953 abort 分支不 dump → 无 dump 文件副作用")
@@ -140,7 +140,7 @@ class YoloClassifierErrorDumpPathTest {
         assertThat(result.errorDumpPath())
             .as("CC :1261-1269 abort 分支不带 errorDumpPath")
             .isNull();
-        Path dumpFile = Path.of(BundledSkillFileExtractor.getClaudeTempDir(),
+        Path dumpFile = Path.of(NexusaiPaths.getAppTempDir(),
             "auto-mode-classifier-errors", sessionId + ".txt");
         assertThat(Files.exists(dumpFile))
             .as("CC :1261-1269 abort 分支不 dump → 无 dump 文件副作用")

@@ -88,6 +88,12 @@ class PdfAttachmentProcessorTest {
         assertThat(result.resolution()).isEqualTo(PdfAttachmentProcessor.Resolution.NEEDS_SUBAGENT);
         assertThat(result.pageCount()).isEqualTo(25);
         assertThat(result.blocks()).isEmpty();
+        // [pdf-subagent] needsSubagent 结果须保留 resolvePdfBlocks 已解析的磁盘路径（供 LlmAgentLoop 派子代理读原 PDF）
+        assertThat(result.pdfPath())
+            .as("NEEDS_SUBAGENT 结果必须携带 pdfPath（供主模型自主引导 Read pages / 派子代理引用）")
+            .isNotNull()
+            .isNotBlank()
+            .endsWith(".pdf");
     }
 
     @Test
@@ -166,8 +172,9 @@ class PdfAttachmentProcessorTest {
     }
 
     @Test
-    @DisplayName("生产链路: >20 页 PDF 附件 → NEEDS_SUBAGENT → 主 user 消息注入文本说明，无 media block")
-    void productionPath_moreThan20Pages_injectsTextNote(@TempDir Path dir) throws Exception {
+    @DisplayName("生产链路: >20 页 PDF 附件 → NEEDS_SUBAGENT → 主 user 消息注入自主引导文本"
+        + "（多模态主模型 Read pages 分段，系统不自动 fork），无 media block")
+    void productionPath_moreThan20Pages_injectsReadPagesGuidance(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "big.pdf", 25);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -177,18 +184,77 @@ class PdfAttachmentProcessorTest {
             new AttachmentRequest("pdf", null, "big.pdf", PdfSupport.PDF_MEDIA_TYPE, base64, null)));
         assertThat(registered).isEqualTo(1);
 
+        // modelName=null + 无 DB mappers → PdfSupport.isPDFSupported(null)=true → 多模态主模型分支：
+        //   U2 自主引导注入 "自行 Read 工具 + pages 分段读取" 文本（系统不自动 fork 子代理）。
         ChatMessageDto msg = LlmAgentLoop.buildUserMessageWithImages(
             null, processor, null, null, "请总结这个 PDF", null, sessionKey, null, false);
 
         assertThat(msg.role()).isEqualTo(Role.user);
-        // 无 media block 注入（NEEDS_SUBAGENT，R2 subagent 解析）→ 文本说明 + 原始 prompt
+        // 无 media block 注入（NEEDS_SUBAGENT）→ 文本引导 + 原始 prompt
         assertThat(msg.contentBlocks()).isEmpty();
         assertThat(msg.content())
             .contains("big.pdf")
             .contains("25")
-            .contains(String.valueOf(PdfSupport.PDF_MAX_PAGES_PER_READ))
-            .contains("子代理")
-            .contains("请总结这个 PDF");
+            .contains("请用 Read 工具 + pages 参数分段读取")
+            .contains("超过单次读取上限 20 页")
+            .contains("请总结这个 PDF")
+            .doesNotContain("已派子代理");   // 系统不自动 fork
+    }
+
+    @Test
+    @DisplayName("生产链路: >20 页 PDF + 文本主模型（claude-3-haiku）→ 引导调 Agent 派多模态子代理"
+        + "（model 提示多模态档位名；系统不自动 fork）")
+    void productionPath_moreThan20Pages_textModel_injectsAgentGuidance(@TempDir Path dir) throws Exception {
+        Path file = writeRealPdf(dir, "big.pdf", 25);
+        String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
+        PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
+        String sessionKey = UUID.randomUUID().toString();
+
+        int registered = processor.registerPdfAttachments("sess-1", sessionKey, List.of(
+            new AttachmentRequest("pdf", null, "big.pdf", PdfSupport.PDF_MEDIA_TYPE, base64, null)));
+        assertThat(registered).isEqualTo(1);
+
+        // 9 参重载：modelName=claude-3-haiku（null mappers → 1 参回落含 haiku → pdfSupported=false 文本分支），
+        //   multimodalModelName=null → 引导回落默认模型语义（注明 settings.multimodalModelName 未配置）。
+        ChatMessageDto msg = LlmAgentLoop.buildUserMessageWithImages(
+            null, processor, null, null, "请总结这个 PDF", "claude-3-haiku", sessionKey, null, false);
+
+        assertThat(msg.role()).isEqualTo(Role.user);
+        assertThat(msg.contentBlocks()).isEmpty();
+        assertThat(msg.content())
+            .contains("big.pdf")
+            .contains("25")
+            .contains("当前模型不支持直接查看 PDF")
+            .contains("Agent 工具")
+            .contains("多模态子代理")
+            .contains("Read 工具 + pages 参数分段读取")
+            .contains("vision_analyze 一次只支持单页 contentId")
+            .doesNotContain("已派子代理");
+    }
+
+    @Test
+    @DisplayName("生产链路: >20 页 PDF + 文本主模型 + 已配置多模态档位名 → 引导注入 model=多模态名")
+    void productionPath_moreThan20Pages_textModel_multimodalNameInjected(@TempDir Path dir) throws Exception {
+        Path file = writeRealPdf(dir, "big.pdf", 25);
+        String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
+        PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
+        String sessionKey = UUID.randomUUID().toString();
+
+        int registered = processor.registerPdfAttachments("sess-1", sessionKey, List.of(
+            new AttachmentRequest("pdf", null, "big.pdf", PdfSupport.PDF_MEDIA_TYPE, base64, null)));
+        assertThat(registered).isEqualTo(1);
+
+        // 10 参重载：multimodalModelName="claude-sonnet-4-6"（动态 resolveMultimodalModelName 注入）
+        ChatMessageDto msg = LlmAgentLoop.buildUserMessageWithImages(
+            null, processor, null, null, "请总结这个 PDF", "claude-3-haiku", sessionKey, null, false,
+            "claude-sonnet-4-6");
+
+        assertThat(msg.role()).isEqualTo(Role.user);
+        assertThat(msg.contentBlocks()).isEmpty();
+        assertThat(msg.content())
+            .contains("model=claude-sonnet-4-6")
+            .contains("当前模型不支持直接查看 PDF")
+            .contains("vision_analyze 一次只支持单页 contentId");
     }
 
     @Test
@@ -201,13 +267,14 @@ class PdfAttachmentProcessorTest {
         assertThat(processor.registerPdfAttachments("sess-1", "key", null)).isZero();
     }
 
-    // ═════════════ [pdf-vision-align] 文本模型路径 · 页图注册 visionContentIds ═════════════
-    // WHY（CLAUDE.md 规则 9）：deepseek=chat 文本模型发不出 PDF document block（API 400 根因），
-    //   必须改为逐页 JPEG 注册到 ImageAttachmentStore（contentId 列表），否则文本模型下 PDF 附件静默丢失。
+    // ═════════════ [vision-cc-align 2026-09-03] 文本模型路径 · 懒渲染引导（不再逐页注册页图）═════════════
+    // WHY（CLAUDE.md 规则 9）：deepseek=chat 文本模型发不出 PDF document block（API 400 根因），必须引导
+    //   vision_analyze(contentType=pdf, path, pages)。v2 起**不再预注册逐页页图**（省一次全 PDF 渲染）：
+    //   resolvePdfBlocks 只透出 pdfPath + pageCount，渲染延迟到 vision_analyze 调用时按 pages 懒做。
 
     @Test
-    @DisplayName("文本模型路径: textModel 小 PDF（2 页）→ 页图注册 visionContentIds==2、不发 document block")
-    void textModelPdf_registersPagesAsImages(@TempDir Path dir) throws Exception {
+    @DisplayName("文本模型路径: textModel 小 PDF（2 页）→ 懒渲染引导（pdfPath 透出、无页图注册、不发 document block）")
+    void textModelPdf_lazyRendersGuidesToVisionAnalyze(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "doc.pdf", 2);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -226,18 +293,15 @@ class PdfAttachmentProcessorTest {
             .as("文本模型不发 document block（deepseek 400 根因防线）")
             .isEmpty();
         assertThat(pdf.visionContentIds())
-            .as("2 页 → 2 个页图注册 contentId")
-            .hasSize(2);
-        for (long id : pdf.visionContentIds()) {
-            ImageAttachmentStore.Base64Content content = imageStore.getBase64OrDisk("sess-1", id);
-            assertThat(content)
-                .as("页图须可经 ImageAttachmentStore 读回（vision_analyze 消费路径）")
-                .isNotNull();
-            byte[] img = java.util.Base64.getDecoder().decode(content.base64());
-            assertThat((img[0] & 0xFF) == 0xFF && (img[1] & 0xFF) == 0xD8)
-                .as("页图必须是可解码 JPEG（FFD8 magic）")
-                .isTrue();
-        }
+            .as("v2 不再逐页预注册页图（懒渲染）→ visionContentIds 空")
+            .isEmpty();
+        assertThat(pdf.pdfPath())
+            .as("pdfPath 透出（PDF 附件落盘绝对路径），供 LlmAgentLoop 拼 vision_analyze(contentType=pdf, path=…) 引导")
+            .isNotNull()
+            .isNotBlank();
+        assertThat(Files.exists(Path.of(pdf.pdfPath())))
+            .as("pdfPath 指向真实存在的 PDF（vision_analyze resolvePath 直读）")
+            .isTrue();
     }
 
     @Test
@@ -257,6 +321,12 @@ class PdfAttachmentProcessorTest {
         assertThat(pending).hasSize(1);
         assertThat(pending.get(0).needsSubagent()).isTrue();
         assertThat(pending.get(0).visionContentIds()).isEmpty();
+        // [pdf-subagent] needsSubagent PendingPdf 须携 pdfPath（resolvePdfBlocks 产物，LlmAgentLoop 派子代理读原 PDF）
+        assertThat(pending.get(0).pdfPath())
+            .as(">20 页 needsSubagent PendingPdf 必须保留磁盘 pdfPath（自主引导注入用）")
+            .isNotNull()
+            .isNotBlank()
+            .endsWith(".pdf");
     }
 
     @Test

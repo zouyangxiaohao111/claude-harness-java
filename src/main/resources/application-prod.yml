@@ -1,0 +1,4 @@
+spring:
+  datasource:
+    # prod 数据落用户目录（与 config home {user.home}/.nexusai 一致）；仅覆盖 url，其余继承主配置
+    url: "jdbc:sqlite:${user.home}/.nexusai/nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"

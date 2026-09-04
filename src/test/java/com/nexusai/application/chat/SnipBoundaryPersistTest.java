@@ -24,7 +24,6 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.lang.reflect.Method;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -43,12 +42,13 @@ import static org.mockito.Mockito.verify;
  * F5 由 GET /messages 兜底）。
  *
  * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图）</b>: SnipTool 注入的 boundary（removedUuids）
- * 必须在 turn 结束（replayAndPersist）落库 DB，供 GET /messages 出站（前端 F5 后读 removedUuids
- * 标注「已裁剪」）；同时 STOMP 推送 MessageBoundaryEvent，前端实时标注。被 snipe 消息本身不删
- * （对齐 CC transcript append-only）。缺失任一 → 前端无法标注。
+ * 必须在 append 时点（persistAppendedMessage snip 分支）落库 DB，供 GET /messages 出站（前端 F5 后读
+ * removedUuids 标注「已裁剪」）；同时 STOMP 推送 MessageBoundaryEvent，前端实时标注。被 snipe 消息
+ * 本身不删（对齐 CC transcript append-only）。缺失任一 → 前端无法标注。
  *
  * <p>纯单测：{@code new ChatService()} + ReflectionTestUtils 注入 mock MessageMapper /
- * SimpMessagingTemplate；replayAndPersist 反射调用（对齐 ChatServiceReplayPersistReasoningTest）。
+ * SimpMessagingTemplate；生产链路触发（{@code armRealTimePersist} + {@code state.appendMessage}，
+ * 替代已删 replayAndPersist 反射调用）。
  */
 @DisplayName("[snip-persist-field] snip_boundary 落库 + STOMP 推送")
 class SnipBoundaryPersistTest {
@@ -111,17 +111,17 @@ class SnipBoundaryPersistTest {
         return (ToolResult<String>) r;
     }
 
-    private void invokeReplay(AgentState state) throws Exception {
-        Method m = ChatService.class.getDeclaredMethod(
-            "replayAndPersist",
-            String.class, String.class, AgentState.class, String.class, SimpMessagingTemplate.class);
-        m.setAccessible(true);
-        m.invoke(service, SESSION, "msg-user", state, STREAM_TOPIC, wsTemplate);
+    /** 生产链路触发：武装实时落库 listener 后逐条 append（对齐 doRun「先 arm 后 append」）。 */
+    private void armAndAppend(AgentState state, String userMessageId, ChatMessageDto... messages) {
+        service.armRealTimePersist(state, SESSION, STREAM_TOPIC, wsTemplate, userMessageId);
+        for (ChatMessageDto m : messages) {
+            state.appendMessage(m);
+        }
     }
 
     @Test
-    @DisplayName("SnipTool 注入 boundary → replayAndPersist 落库（role=system + snipMetadata）+ STOMP 推送")
-    void persistsBoundaryAndPushesStomp() throws Exception {
+    @DisplayName("SnipTool 注入 boundary → 实时落库（role=system + snipMetadata）+ STOMP 推送")
+    void persistsBoundaryAndPushesStomp() {
         // GIVEN: 会话历史含被 snipe 区间（user0+assistant0+tool0）+ SnipTool 注入 boundary
         ChatMessageDto user0 = msg("u0", Role.user, "open baidu");
         ChatMessageDto asst0 = msg("a0", Role.assistant, "searching");
@@ -135,17 +135,12 @@ class SnipBoundaryPersistTest {
         assertThat(boundary.snipMetadata()).isNotNull();
 
         AgentState state = new AgentState("sys");
-        state.appendMessage(user0);
-        state.appendMessage(asst0);
-        state.appendMessage(tool0);
-        state.appendMessage(user1);
-        state.appendMessage(boundary);   // SnipTool 注入的 boundary 在本轮 state.messages()
 
-        // WHEN: turn 结束回放持久化
-        invokeReplay(state);
+        // WHEN: 生产链路实时落库（逐条 append——boundary 在 append 时点走 snip 分支落库 + 推 MessageBoundaryEvent）
+        armAndAppend(state, "msg-user", user0, asst0, tool0, user1, boundary);
 
         // THEN: messageMapper.insert 收到 snip_boundary 记录（role=system + subtype + snipMetadata）
-        //   （insert 还含 tool 记录 + final assistant，用 atLeastOnce + 按 subtype 过滤定位 boundary）
+        //   （insert 还含 tool 记录 + assistant，用 atLeastOnce + 按 subtype 过滤定位 boundary）
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper, org.mockito.Mockito.atLeastOnce()).insert(captor.capture());
         MessageRecord inserted = captor.getAllValues().stream()
@@ -169,12 +164,11 @@ class SnipBoundaryPersistTest {
 
     @Test
     @DisplayName("无 snip_boundary 消息 → 零落库、零推送（普通 turn 不受影响）")
-    void noBoundary_noPersistNoPush() throws Exception {
+    void noBoundary_noPersistNoPush() {
         ChatMessageDto user0 = msg("u0", Role.user, "hi");
         AgentState state = new AgentState("sys");
-        state.appendMessage(user0);
 
-        invokeReplay(state);
+        armAndAppend(state, "msg-user", user0);
 
         // 普通 user 消息不走 insert（user 已由 createUserMessage 落库）；boundary 分支不触发
         verify(messageMapper, never()).insert(any());

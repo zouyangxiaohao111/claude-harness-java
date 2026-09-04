@@ -70,18 +70,57 @@ class ModelCostCalculatorTest {
     }
 
     @Test
-    @DisplayName("通用默认档高峰计费公式（3/9 元档，对齐 CC tokensToUSDCost）")
-    void calculateCostYuan_matchesCcFormula() {
-        // WHY: 公式 = (input/1e6)*inputPk + (output/1e6)*outputPk + (cacheRead/1e6)*cacheReadPk
-        //   + (cacheCreation/1e6)*cacheWritePk（webSearch 不计）。
+    @DisplayName("无 mapper → 非 anthropic 语义（deepseek input 已含 cache hit，先扣命中按 miss 全价）")
+    void calculateCostYuan_noMapper_deepseekSemantics() {
+        // WHY (A5-1): calc = new ModelCostCalculator() 无 mapper → isAnthropic false → deepseek 语义。
+        //   deepseek input_tokens 已含 cache hit（input == H+M）→ anthropic 4 项和双计；A5-1 改为
+        //   max(0, input-cacheRead)/1e6*inputPrice + output/1e6*outputPrice + cacheRead/1e6*cacheReadPrice
+        //   （忽略 cacheWrite/cacheCreation）。
         // 通用默认档高峰：input 3.0 / output 9.0 / cacheRead 0.10 / cacheWrite(=input) 3.0
-        // 期望 = 1M/1e6*3 + 500K/1e6*9 + 1M/1e6*0.1 + 500K/1e6*3 = 3 + 4.5 + 0.1 + 1.5 = 9.1
+        // 期望 = max(0,1M-1M)/1e6*3 + 500K/1e6*9 + 1M/1e6*0.1 = 0 + 4.5 + 0.1 = 4.6
         double scalar = calc.calculateCostYuan("any-model", 1_000_000L, 500_000L, 1_000_000L, 500_000L, true);
-        assertThat(scalar).as("标量重载计费公式").isCloseTo(9.1, within(1e-6));
+        assertThat(scalar).as("deepseek 语义标量重载（input 已含 cache，扣命中按 miss 全价）").isCloseTo(4.6, within(1e-6));
 
         AgentUsage usage = new AgentUsage(1_000_000L, 500_000L, 500_000L, 1_000_000L, null, null, null);
         double fromUsage = calc.calculateCostYuan("any-model", usage, true);
-        assertThat(fromUsage).as("AgentUsage 重载与标量同源（cacheCreate→cacheWrite 价）").isCloseTo(9.1, within(1e-6));
+        assertThat(fromUsage).as("AgentUsage 重载与标量同源（cacheRead=1M 折价 0.1，cacheCreate 忽略）").isCloseTo(4.6, within(1e-6));
+    }
+
+    @Test
+    @DisplayName("anthropic provider（DB 判定 provider.type=anthropic）→ 保留 CC 4 项公式（A5-1）")
+    void calculateCostYuan_anthropic_keepsCcFourTermFormula() {
+        // WHY (A5-1): anthropic 语义的 input+cacheRead+cacheCreate 求和/计价对 deepseek 双计——A5-1 按
+        //   isAnthropic 分派：anthropic 走现 4 项公式（对齐 CC modelCost.ts tokensToUSDCost）不动。
+        // 构造 DB：模型 "claude-sonnet" 归属 provider type="anthropic"（providerMapper 判定）。
+        ModelRecord dbRecord = new ModelRecord();
+        dbRecord.setId("m-claude");
+        dbRecord.setName("claude-sonnet");
+        dbRecord.setEnabled(true);
+        dbRecord.setProviderId("p-anthropic");
+        dbRecord.setInputPricePeak(3.0);
+        dbRecord.setInputPriceOffpeak(1.5);
+        dbRecord.setOutputPricePeak(9.0);
+        dbRecord.setOutputPriceOffpeak(4.5);
+        dbRecord.setCacheReadPricePeak(0.10);
+        dbRecord.setCacheReadPriceOffpeak(0.05);
+        dbRecord.setCacheWritePricePeak(3.0);
+        dbRecord.setCacheWritePriceOffpeak(1.5);
+
+        com.nexusai.repository.provider.entity.ProviderRecord provider = new com.nexusai.repository.provider.entity.ProviderRecord();
+        provider.setId("p-anthropic");
+        provider.setType("anthropic");
+
+        ModelCostCalculator anthropicCalc = new ModelCostCalculator();
+        ModelMapper mm = mock(ModelMapper.class);
+        when(mm.selectListByQuery(any())).thenReturn(List.of(dbRecord));
+        ProviderMapper pm = mock(ProviderMapper.class);
+        when(pm.selectOneById("p-anthropic")).thenReturn(provider);
+        ReflectionTestUtils.setField(anthropicCalc, "modelMapper", mm);
+        ReflectionTestUtils.setField(anthropicCalc, "providerMapper", pm);
+
+        // 期望 = 1M/1e6*3 + 500K/1e6*9 + 1M/1e6*0.1 + 500K/1e6*3 = 3 + 4.5 + 0.1 + 1.5 = 9.1（CC 4 项公式保留）
+        double scalar = anthropicCalc.calculateCostYuan("claude-sonnet", 1_000_000L, 500_000L, 1_000_000L, 500_000L, true);
+        assertThat(scalar).as("anthropic 4 项公式（对齐 CC tokensToUSDCost）").isCloseTo(9.1, within(1e-6));
     }
 
     @Test

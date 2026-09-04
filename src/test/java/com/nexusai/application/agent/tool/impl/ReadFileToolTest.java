@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.api.AnalyticsTracker;
-import com.nexusai.application.agent.attachment.ImageAttachmentStore;
+import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.tool.FileReadingLimits;
@@ -21,9 +21,16 @@ import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.ToolUseContext.ReadState;
 import com.nexusai.infra.util.GitIgnoreHelper;
 import com.nexusai.model.command.Command;
+import com.nexusai.model.session.dto.ChatMessageDto;
+import com.nexusai.model.session.dto.Role;
+import com.nexusai.repository.provider.entity.ModelRecord;
+import com.nexusai.repository.provider.entity.ProviderRecord;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -36,6 +43,8 @@ import java.util.function.Supplier;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
 
 /**
  * Session L · {@link ReadFileTool} CC 对齐验证。
@@ -829,67 +838,309 @@ class ReadFileToolTest {
     }
 
     @Test
-    @DisplayName("[pdf-vision-align] 文本模型 + 无 store → 回落 CC error（mainLoopModel 含 claude-3-haiku，未 setImageAttachmentStore）")
-    void executePdfHaikuModelReturnsUnsupportedError(@TempDir Path workspace) throws Exception {
+    @DisplayName("[pdf-vision-align 纠正] 文本模型 + 全读 PDF → fail-loud error（不发 document/image block，对齐 CC isPDFSupported throw）")
+    void textModelPdfFull_returnsFailLoudError(@TempDir Path workspace) throws Exception {
         writeRealPdf(workspace, "doc.pdf", 2);
         ReadFileTool tool = toolFor(workspace);
-        // appState 注入 mainLoopModel（Java appStateRef 语义 · LlmAgentLoop:1392 读取键）
-        // 20 参 of()（ToolUseContext:784-805，无 additionalWorkingDirectories 参）全显式泛型
-        ToolUseContext ctx = ToolUseContext.of(
-            UUID.nameUUIDFromBytes(("rft-agent-" + workspace).getBytes()),
-            "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
-            PermissionMode.DEFAULT,
-            java.util.List.<com.nexusai.application.agent.tool.Tool>of(),
-            "", AbortController.NOOP,
-            java.util.List.<Object>of(),
-            null, PermissionMode.DEFAULT,
-            java.util.Map.<String, com.nexusai.application.agent.tool.McpClientRuntime>of(),
-            false, "", null,
-            null,
-            java.util.Map.<String, com.nexusai.application.agent.tool.ToolDecisionInfo>of(),
-            null,
-            state -> state == null
-                ? java.util.Map.<String, Object>of("mainLoopModel", "claude-3-haiku")
-                : state,
-            updater -> {
-            }, m -> {
-            }, s -> {
-            });
-        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"), ctx);
-
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data()).contains("not supported with this model");
-    }
-
-    @Test
-    @DisplayName("[pdf-vision-align] 文本模型 + imageStore 注入 → PDF 页图注册 + vision_analyze 说明（不发 document/image block）")
-    void textModelPdf_registersPagesForVisionAnalyze(@TempDir Path workspace) throws Exception {
-        writeRealPdf(workspace, "doc.pdf", 2);
-        ReadFileTool tool = toolFor(workspace);
-        ImageAttachmentStore imageStore = new ImageAttachmentStore();
-        tool.setImageAttachmentStore(imageStore);
         ToolUseContext ctx = haikuModelCtx(workspace);
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"), ctx);
 
-        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
+        assertThat(result.data())
+            .as("文本模型全读 PDF → 引导文本 data（非 parts/JsonNode —— 不发 document/image block）")
+            .isInstanceOf(String.class);
         String data = (String) result.data();
         assertThat(data)
-            .as("文本模型 PDF → 页图注册 + vision_analyze 引导（含 contentId，不回 400）")
-            .contains("contentId=")
-            .contains("vision_analyze")
-            .contains("doc.pdf");
+            .as("错误含模型不支持 image/PDF + 范围 + path；引导 vision_analyze(contentType=pdf, path=绝对路径) 直达（非派多模态子代理）")
+            .contains("当前模型不支持 image/PDF 视觉")
+            .contains("完整 PDF")
+            .contains("doc.pdf")
+            .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+            .contains("pages=[要分析的页号数组]")
+            .doesNotContain("多模态子代理")
+            .doesNotContain("multimodalModelName");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("对抗核验 #3：error 文案以 'Error: ' 识别前缀开头 → is_error=true（fail loud + hook/analytics 正确）")
+            .isTrue();
         assertThat(result.newMessages())
             .as("文本模型不发 document/image block newMessages（deepseek 400 根因防线）")
             .isNullOrEmpty();
-        // 页图可经 imageStore 读回（vision_analyze 消费路径；id 从 1 分配）
-        ImageAttachmentStore.Base64Content content = imageStore.getBase64OrDisk(ctx.sessionId(), 1L);
-        assertThat(content)
-            .as("第 1 页图须已注册到图片缓存")
-            .isNotNull();
     }
 
-    /** [pdf-vision-align] 文本模型上下文：appState mainLoopModel=claude-3-haiku（mappers 未注入 → 1 参回落 false → 文本模型分支）。 */
+    @Test
+    @DisplayName("[vision-cc-align 2026-09-03] 文本模型 + .png 图 → fail-loud 引导 vision_analyze(path)（不发 image block —— 原 bug：模型 Read 空图死循环）")
+    void textModelImage_returnsFailLoudErrorGuidesToVisionAnalyze(@TempDir Path workspace) throws Exception {
+        // 文件只需存在：dispatchImage 文本模型门控前置（gate 在 Files.readAllBytes 前），不读真实图片内容
+        Files.write(workspace.resolve("shot.png"),
+            new byte[]{(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 0, 0, 0, 0});
+        ReadFileTool tool = toolFor(workspace);
+        ToolUseContext ctx = haikuModelCtx(workspace);
+
+        ToolResult result = (ToolResult) tool.execute(callWith("shot.png"), ctx);
+
+        assertThat(result.data())
+            .as("文本模型图片 → 引导文本 data（非 parts/JsonNode —— 不发 image block，deepseek 空读根因）")
+            .isInstanceOf(String.class);
+        String data = (String) result.data();
+        assertThat(data)
+            .as("错误含模型不支持 + path；引导 vision_analyze(type=analyze, path=…)（非派子代理/非 contentId）")
+            .contains("当前模型不支持 Read 直接显示图像")
+            .contains("shot.png")
+            .contains("vision_analyze(type=analyze, path=")
+            .doesNotContain("多模态子代理")
+            .doesNotContain("contentId");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("error 文案以 'Error: ' 识别前缀开头 → is_error=true（fail loud）")
+            .isTrue();
+        assertThat(result.newMessages())
+            .as("文本模型图片分支不发 image block newMessages（deepseek 400/空读根因防线）")
+            .isNullOrEmpty();
+    }
+
+    @Test
+    @DisplayName("[pdf-vision-align 纠正] 文本模型 + pages=1-2 → fail-loud error（不发 image block —— 原 bug：渲染页图发 deepseek → 400）")
+    void textModelPdfPages_returnsFailLoudError(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 3);
+        ReadFileTool tool = toolFor(workspace);
+        ToolUseContext ctx = haikuModelCtx(workspace);
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf", "pages", "1-2"), ctx);
+
+        assertThat(result.data())
+            .as("文本模型 pages → 引导文本 data（非 parts/JsonNode —— 不发 image block newMessages）")
+            .isInstanceOf(String.class);
+        String data = (String) result.data();
+        assertThat(data)
+            .contains("当前模型不支持 image/PDF 视觉")
+            .contains("PDF 页图（pages=1-2）")
+            .contains("doc.pdf")
+            .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+            .doesNotContain("多模态子代理")
+            .doesNotContain("multimodalModelName");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("对抗核验 #3：error 文案以 'Error: ' 识别前缀开头 → is_error=true")
+            .isTrue();
+        assertThat(result.newMessages())
+            .as("文本模型 pages 分支不发 image block newMessages（deepseek 400 根因防线）")
+            .isNullOrEmpty();
+    }
+
+    @Test
+    @DisplayName("[vision-cc-align 2026-09-03] 文本模型 + pages → fail-loud 引导 vision_analyze(contentType=pdf, path, pages) 直达（删派多模态子代理递归源）")
+    void textModelPdfPages_errorGuidesToVisionAnalyze(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 3);
+        ReadFileTool tool = toolFor(workspace);
+        ToolUseContext ctx = haikuModelCtx(workspace);
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf", "pages", "1-2"), ctx);
+
+        assertThat(result.data())
+            .as("data 为引导文本（非 parts/JsonNode —— 不发 image block）")
+            .isInstanceOf(String.class);
+        String data = (String) result.data();
+        assertThat(data)
+            // [vision-cc-align 2026-09-03] 递归根因修复：不再引导派多模态子代理（fork 继承文本模型 →
+            //   Read 再触发门控 → 无限递归）。改为引导 vision_analyze 直达（工具内部懒渲染 pages → 调多模态
+            //   档位模型 → 返回文本），path 传绝对路径（vision_analyze resolvePath 直读，无 cwd 歧义）。
+            .as("错误含模型不支持 + 范围 + path；引导 vision_analyze(contentType=pdf, path=绝对路径, pages=…)；不含 Agent 子代理/动态档位名")
+            .contains("当前模型不支持 image/PDF 视觉")
+            .contains("PDF 页图（pages=1-2）")
+            .contains("doc.pdf")
+            .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+            .contains("pages=[要分析的页号数组]")
+            .contains("分段分析该 PDF")
+            .doesNotContain("多模态子代理")
+            .doesNotContain("Agent 工具")
+            .doesNotContain("multimodalModelName");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("对抗核验 #3：error 文案以 'Error: ' 识别前缀开头 → is_error=true")
+            .isTrue();
+        assertThat(result.newMessages())
+            .as("文本模型 pages 分支仍不发 image block newMessages（deepseek 400 根因防线）")
+            .isNullOrEmpty();
+    }
+
+    // ═════════════ [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删 · 绝对路径直接可读（对齐 CC expandPath）═════════════
+
+    @Test
+    @DisplayName("CC 对齐：cwd 外绝对路径 PDF 直接可读（PathGuard 逃逸拦截已删，原附件表豁免机制整体删除）")
+    void absolutePathOutsideWorkspaceDirectlyReadable(@TempDir Path workspace, @TempDir Path outsideDir) throws Exception {
+        // 模拟附件/系统文件（Desktop/pdf-cache）位于会话 cwd 之外——CC 语义：绝对路径显式指定即可读
+        // （FileReadTool.ts:443 仅 expandPath，无逃逸检查；日志实证 2026-09-03 blocked path escape 误伤附件）
+        writeRealPdf(outsideDir, "attach.pdf", 2);
+        Path pdf = outsideDir.resolve("attach.pdf");
+        ReadFileTool tool = toolWithModelType(workspace, "vision", "vision-exp");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "vision-exp");
+
+        ToolResult result = (ToolResult) tool.execute(callWith(pdf.toAbsolutePath().toString()), ctx);
+
+        assertThat(String.valueOf(result.data()))
+            .as("绝对路径（cwd 外）应直接可读——不再有 'escapes workspace' 逃逸拦截（对齐 CC）")
+            .doesNotContain("escapes workspace");
+    }
+
+    // ═════════════ [pdf-vision-align 对抗核验 #2] 生产 3 参路径 · ModelMapper/ProviderMapper 注入（真实 DB type 判定）═════════════
+
+    /** 构造 type 指定的 ModelRecord（mock selectListByQuery 返回；name 与 ctx appState mainLoopModel 对应）。 */
+    private static ModelRecord modelRecordOfType(String type, String name) {
+        ModelRecord m = new ModelRecord();
+        m.setId("m1");
+        m.setProviderId("p1");
+        m.setName(name);
+        m.setType(type);
+        m.setEnabled(true);
+        return m;
+    }
+
+    /** [pdf-vision-align 对抗核验 #2] 注入 mapper 的 ReadFileTool：mock selectListByQuery 返回 type 记录。
+     *  modelName 无 '/' → ModelNameResolver 走兼容路径 selectListByQuery（mock 已 stub）。
+     *  [vision-cc-align 2026-09-03] providerMapper 补 stub selectOneById→anthropic：Read 直给判据升级为
+     *  ant 直给格式 && supportsImage（canModelViewReadResultDirectly 经 ContextUsageCalculator.isAnthropic
+     *  查 provider.type==anthropic）——vision 测试（type=multimodal, claude-sonnet-4-6）须真 ant 才直给。 */
+    private static ReadFileTool toolWithModelType(Path workspace, String type, String modelName) {
+        ReadFileTool tool = toolFor(workspace);
+        ModelMapper modelMapper = Mockito.mock(ModelMapper.class);
+        when(modelMapper.selectListByQuery(any())).thenReturn(List.of(modelRecordOfType(type, modelName)));
+        tool.setModelMapper(modelMapper);
+        ProviderMapper providerMapper = Mockito.mock(ProviderMapper.class);
+        ProviderRecord provider = new ProviderRecord();
+        provider.setId("p1");
+        provider.setType("anthropic");
+        when(providerMapper.selectOneById(any())).thenReturn(provider);
+        tool.setProviderMapper(providerMapper);
+        return tool;
+    }
+
+    @Test
+    @DisplayName("[对抗核验 #2] 3 参生产路径：type=chat（deepseek DB 实值）→ 全读 PDF fail-loud error + isToolErrorData=true + 无 newMessages")
+    void textModelPdfFull_threeParamChatType_failLoudError(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 2);
+        ReadFileTool tool = toolWithModelType(workspace, "chat", "deepseek-chat");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "deepseek-chat");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"), ctx);
+
+        assertThat(result.data()).isInstanceOf(String.class);
+        assertThat((String) result.data())
+            .as("3 参 type=chat（deepseek）→ 引导文本 error（含 model=deepseek-chat，非 1 参 haiku 名字契约路径）")
+            .contains("Error: 当前模型不支持 image/PDF 视觉")
+            .contains("model=deepseek-chat")
+            .contains("完整 PDF");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("对抗核验 #3：error 文案必须以 isToolErrorData 识别前缀开头 → is_error=true（fail loud + hook/analytics 正确）")
+            .isTrue();
+        assertThat(result.newMessages())
+            .as("文本模型不发 document/image block newMessages（deepseek 400 根因防线）")
+            .isNullOrEmpty();
+    }
+
+    @Test
+    @DisplayName("[对抗核验 #2] 3 参生产路径：type=chat → pages 读 PDF fail-loud error + isToolErrorData=true + 无 image block newMessages")
+    void textModelPdfPages_threeParamChatType_failLoudError(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 3);
+        ReadFileTool tool = toolWithModelType(workspace, "chat", "deepseek-chat");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "deepseek-chat");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf", "pages", "1-2"), ctx);
+
+        assertThat(result.data()).isInstanceOf(String.class);
+        assertThat((String) result.data())
+            .as("3 参 type=chat pages → 引导文本 error（含 pages 范围，不渲染页图）")
+            .contains("Error: 当前模型不支持 image/PDF 视觉")
+            .contains("PDF 页图（pages=1-2）")
+            .contains("model=deepseek-chat");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
+        assertThat(result.newMessages()).isNullOrEmpty();
+    }
+
+    @Test
+    @DisplayName("[vision-cc-align 2026-09-03] 判据升级：type=vision 但 openai provider（deepseek-vision-exp）→ pages 引导 vision_analyze（多模态≠Read 直给，格式也须 ant）")
+    void visionExpOpenAiProvider_pages_guidesToVisionAnalyzeNotDirect(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 3);
+        ReadFileTool tool = toolFor(workspace);
+        ModelMapper modelMapper = Mockito.mock(ModelMapper.class);
+        when(modelMapper.selectListByQuery(any())).thenReturn(
+            List.of(modelRecordOfType("vision", "deepseek-vision-exp")));
+        tool.setModelMapper(modelMapper);
+        ProviderMapper providerMapper = Mockito.mock(ProviderMapper.class);
+        ProviderRecord provider = new ProviderRecord();
+        provider.setId("p1");
+        provider.setType("openai");
+        when(providerMapper.selectOneById(any())).thenReturn(provider);
+        tool.setProviderMapper(providerMapper);
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "deepseek-vision-exp");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf", "pages", "1-2"), ctx);
+
+        assertThat(result.data())
+            .as("deepseek-vision-exp：多模态（type=vision）但 openai-completions 非 ant 直给格式 → 引导（不直给页图）")
+            .isInstanceOf(String.class);
+        String data = (String) result.data();
+        assertThat(data)
+            .contains("Error: 当前模型不支持 image/PDF 视觉")
+            .contains("model=deepseek-vision-exp")
+            .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+            .doesNotContain("image blocks");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("error 文案以 'Error: ' 前缀开头 → is_error=true（fail loud）")
+            .isTrue();
+        assertThat(result.newMessages())
+            .as("非 ant 直给格式不发 image block newMessages（格式不支持 Read 带图）")
+            .isNullOrEmpty();
+    }
+
+    @Test
+    @DisplayName("[对抗核验 #2] 3 参生产路径：type=multimodal → 全读 PDF document block newMessages 正常（不误拒）")
+    void visionModelPdfFull_threeParamMultimodal_deliversDocumentBlock(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 2);
+        ReadFileTool tool = toolWithModelType(workspace, "multimodal", "claude-sonnet-4-6");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "claude-sonnet-4-6");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"), ctx);
+
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("type=multimodal → 不走 error 分支（3 参 supportsImage=true）")
+            .isFalse();
+        assertThat(result.data()).isInstanceOf(JsonNode.class);
+        assertThat(((JsonNode) result.data()).path("read_file_output_type").asText()).isEqualTo("pdf");
+        List<ChatMessageDto> newMessages = result.newMessages();
+        assertThat(newMessages)
+            .as("type=multimodal → document block newMessages 正常送达（CC FileReadTool.ts:999-1016）")
+            .hasSize(1);
+        ChatMessageDto meta = newMessages.get(0);
+        assertThat(meta.isMeta()).isTrue();
+        assertThat(meta.role()).isEqualTo(Role.user);
+        JsonNode docBlock = (JsonNode) meta.contentBlocks().get(0);
+        assertThat(docBlock.get("type").asText()).isEqualTo("document");
+        assertThat(docBlock.get("source").get("media_type").asText()).isEqualTo("application/pdf");
+    }
+
+    @Test
+    @DisplayName("[对抗核验 #2] 3 参生产路径：type=multimodal → pages 读 PDF image blocks newMessages 正常")
+    void visionModelPdfPages_threeParamMultimodal_deliversImageBlocks(@TempDir Path workspace) throws Exception {
+        writeRealPdf(workspace, "doc.pdf", 3);
+        ReadFileTool tool = toolWithModelType(workspace, "multimodal", "claude-sonnet-4-6");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "claude-sonnet-4-6");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf", "pages", "1-2"), ctx);
+
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("type=multimodal pages → 不走 error 分支")
+            .isFalse();
+        assertThat(result.data()).isInstanceOf(JsonNode.class);
+        assertThat(((JsonNode) result.data()).path("read_file_output_type").asText()).isEqualTo("parts");
+        List<ChatMessageDto> newMessages = result.newMessages();
+        assertThat(newMessages).hasSize(1);
+        List<?> blocks = newMessages.get(0).contentBlocks();
+        assertThat(blocks)
+            .as("2 页提取 → 2 个 image blocks")
+            .hasSize(2);
+        JsonNode block0 = (JsonNode) blocks.get(0);
+        assertThat(block0.get("type").asText()).isEqualTo("image");
+        assertThat(block0.get("source").get("media_type").asText()).isEqualTo("image/jpeg");
+    }
+
+    /** [pdf-vision-align 纠正] 文本模型上下文：appState mainLoopModel=claude-3-haiku（mappers 未注入 → 1 参回落 false → 文本模型分支）。 */
     private static ToolUseContext haikuModelCtx(Path workspace) {
         UUID agentId = UUID.nameUUIDFromBytes(("rft-haiku-agent-" + workspace).getBytes());
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
@@ -1088,13 +1339,17 @@ class ReadFileToolTest {
     // ═════════════ 既有契约不被破坏 ═════════════
 
     @Test
-    @DisplayName("既有契约: 路径越狱仍由 execute 内 PathGuard 拦截 —— 不删防御纵深")
-    void executeStillRejectsPathEscape(@TempDir Path workspace) {
+    @DisplayName("[CC 对齐 2026-09-03] 相对路径逃逸(../../)不再拦截——resolve 纯展开，文件不存在返回 error")
+    void executePathEscape_noLongerIntercepted(@TempDir Path workspace) {
         ReadFileTool tool = toolFor(workspace);
 
         ToolResult result = (ToolResult) tool.execute(callWith("../../etc/passwd"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
+        assertThat(result.data())
+            .as("PathGuard 逃逸拦截已删（对齐 CC）：../../ 展开后读文件，不存在返回 String error（非 escape 拦截）")
+            .isInstanceOf(String.class);
+        assertThat(String.valueOf(result.data()))
+            .doesNotContain("escapes workspace");
     }
 
     @Test
@@ -1196,8 +1451,8 @@ class ReadFileToolTest {
     // ═════════════ [P-AL-06] CYBER_RISK_MITIGATION_REMINDER (CC FileReadTool.ts:729-738) ═════════════
 
     /**
-     * [P-AL-06] 构造带 appState mainLoopModel 的 ctx —— 对齐
-     * executePdfHaikuModelReturnsUnsupportedError 的 20 参注入方式（Java appStateRef 语义）。
+     * [P-AL-06] 构造带 appState mainLoopModel 的 ctx —— 20 参注入方式（Java appStateRef 语义，
+     * 同 haikuModelCtx 的 mainLoopModel 键来源）。
      */
     private static ToolUseContext ctxWithSessionAndModel(Path workspace, String mainLoopModel) {
         return ToolUseContext.of(

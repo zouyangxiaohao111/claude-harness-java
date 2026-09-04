@@ -378,4 +378,75 @@ class CommandControllerBuiltInCommandsTest {
         mockMvc.perform(post("/api/command/builtins/effort/execute"))
             .andExpect(status().isInternalServerError());
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // [compact-execute 2026-09-04] /compact 真执行（复用已注册 slash handler）
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("compact 带会话 → dispatchResult(/compact) 复用真执行 handler 返回 displayText（非元数据薄触发）")
+    void executeCompactBuiltin_withSession_runsCompaction_returnsDisplayText() throws Exception {
+        // WHY: 用户输入 /compact → 前端 POST builtins/compact/execute（带 ?sessionId=）。修复前该
+        //   端点只回命令元数据（DEC-9 薄触发）→ 压缩从不执行、前端无 CC 式反应。修复后必须真实执行：
+        //   dispatchResult 复用已注册 compact handler（handleCompactCommand → CompactCommand.call），
+        //   返回 displayText（"Compacted …"）。若只回元数据 DTO → 压缩功能仍失效。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        when(dispatcher.dispatchResult("/compact"))
+            .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
+                .text("Compacted 5 messages"));
+        RequestContext.setSession("sess-compact1");
+
+        mockMvc.perform(post("/api/command/builtins/compact/execute")
+                .param("sessionId", "sess-compact1"))
+            .andExpect(status().isOk())
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.content()
+                .string(org.hamcrest.Matchers.containsString("Compacted 5 messages")));
+        verify(dispatcher).dispatchResult("/compact");
+    }
+
+    @Test
+    @DisplayName("compact 无会话标识 → 200 中文说明（需 ?sessionId=，对齐 CC /compact 在当前会话压缩）")
+    void executeCompactBuiltin_noSession_returnsGuidance() throws Exception {
+        // WHY: CC 无「无会话 /compact」——命令必须知道压缩哪个会话。前端漏带 ?sessionId=（日志实证
+        //   曾无会话调用）→ 返回可理解的中文引导而非静默 / 误导错。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        RequestContext.clear();
+
+        // content().string() 默认 ISO-8859-1 会乱码中文 → 用 UTF-8 显式解码后断言
+        String body = mockMvc.perform(post("/api/command/builtins/compact/execute"))
+            .andExpect(status().isOk()).andReturn().getResponse()
+            .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(body).contains("缺少会话标识");
+    }
+
+    @Test
+    @DisplayName("compact handler 未注册 → 中文 fail 提示（fail loud，非静默）")
+    void executeCompactBuiltin_handlerUnregistered_failLoud() throws Exception {
+        // WHY: dispatchResult null = compact handler 未注册（ToolRegistrationConfig 注册副作用未跑？）
+        //   → 明确告知而非假装压缩成功。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        when(dispatcher.dispatchResult("/compact")).thenReturn(null);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        RequestContext.setSession("sess-compact2");
+
+        String body = mockMvc.perform(post("/api/command/builtins/compact/execute")
+                .param("sessionId", "sess-compact2"))
+            .andExpect(status().isOk()).andReturn().getResponse()
+            .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(body).contains("命令未注册");
+    }
+
+    @Test
+    @DisplayName("UserInputDispatcher 未注入（非容器）→ compact fail loud 500（对齐 effort/resume 模式）")
+    void executeCompactBuiltin_notWired_500() throws Exception {
+        // setUp 未注入 userInputDispatcher → null → 抛 IllegalStateException（GlobalExceptionHandler → 500）
+        mockMvc.perform(post("/api/command/builtins/compact/execute")
+                .param("sessionId", "sess-compact3"))
+            .andExpect(status().isInternalServerError());
+    }
 }

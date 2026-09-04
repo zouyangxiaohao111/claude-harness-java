@@ -106,6 +106,10 @@ class StatsServiceTest {
         assertThat(beta.inputTokens()).isEqualTo(200L);
         assertThat(beta.outputTokens()).isEqualTo(30L);
         assertThat(beta.costUSD()).isCloseTo(0.02, within(0.0001));
+        // [A5-2] 无 mapper 注入（测试直构）→ isAnthropic 回落 false → anthropic=false（deepseek/openai
+        //   语义，前端按 input+output 分派 total；前端据此不再对 cache 字段重复求和）
+        assertThat(alpha.anthropic()).as("无 mapper → 标志 false（非 anthropic 语义）").isFalse();
+        assertThat(beta.anthropic()).isFalse();
     }
 
     @Test

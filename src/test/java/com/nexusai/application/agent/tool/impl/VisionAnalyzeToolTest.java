@@ -18,9 +18,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
 import org.mockito.ArgumentCaptor;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -164,10 +168,13 @@ class VisionAnalyzeToolTest {
     }
 
     @Test
-    @DisplayName("懒加载：shouldDefer=true（工具 schema 不占初始 prompt，经 ToolSearch 检索加载）")
-    void lazyLoad_shouldDeferTrue() {
-        // CC Tool.ts:442 shouldDefer=true → defer_loading，需 ToolSearch 后才可调用。
-        // WHY：主流视觉模型用不上本工具（图片直接注入 image block），始终进 schema 是 token 浪费。
+    @DisplayName("工具意图懒：shouldDefer=true（是否实际懒由装配层按主模型豁免，见 LlmAgentLoop.exemptVisionAnalyzeDeferForTextModel）")
+    void deferIntentTrue() {
+        // 2026-09-03 定稿：vision_analyze 工具层表达"想懒"（defer_loading 语义）；是否真懒由装配层按
+        // 主模型判定 —— 仅 ant/response 直给格式 + 多模态保留懒；deepseek（openai-completions，含
+        // vision-exp）/ 文本模型 → 从 deferred 剔除强制直发（vision_analyze 是唯一视觉通道）。
+        // WHY（规则 9）：若工具意图回退 shouldDefer=false（常驻），ant 多模态主模型也直发 → 多占
+        // schema token；若装配层豁免缺失，deepseek 文本又要走 ToolSearch 激活 → 回归历史死循环。
         assertThat(tool.shouldDefer(null)).isTrue();
     }
 
@@ -264,5 +271,143 @@ class VisionAnalyzeToolTest {
         var v = tool.validateInput(json("{\"type\":\"analyze\",\"prompt\":\"x\"}"), null);
         assertThat(v.ok()).isFalse();
         assertThat(v.errorCode()).isEqualTo("3");
+    }
+
+    // ── [v2] path / contentType / pages 校验分支 ──
+
+    @Test
+    @DisplayName("validateInput v2：analyze 给 path（无 contentId）→ pass（文件系统源）")
+    void validateInput_pathAlone_passes() {
+        var v = tool.validateInput(json("{\"type\":\"analyze\",\"prompt\":\"x\",\"path\":\"a/b.png\"}"), null);
+        assertThat(v.ok()).isTrue();
+    }
+
+    @Test
+    @DisplayName("validateInput v2：contentId 与 path 同给 → fail errorCode=5（互斥）")
+    void validateInput_bothSources_fails() {
+        var v = tool.validateInput(json(
+            "{\"type\":\"analyze\",\"prompt\":\"x\",\"contentId\":\"1\",\"path\":\"a.png\"}"), null);
+        assertThat(v.ok()).isFalse();
+        assertThat(v.errorCode()).isEqualTo("5");
+    }
+
+    @Test
+    @DisplayName("validateInput v2：pages 但 contentType≠pdf → fail errorCode=9")
+    void validateInput_pagesWithoutPdf_fails() {
+        var v = tool.validateInput(json(
+            "{\"type\":\"analyze\",\"prompt\":\"x\",\"contentId\":\"1\",\"contentType\":\"image\",\"pages\":[1]}"), null);
+        assertThat(v.ok()).isFalse();
+        assertThat(v.errorCode()).isEqualTo("9");
+    }
+
+    @Test
+    @DisplayName("validateInput v2：pages 超 20 页 → fail errorCode=10（对齐 CC PDF_MAX_PAGES_PER_READ）")
+    void validateInput_pagesOverLimit_fails() {
+        StringBuilder pages = new StringBuilder();
+        for (int i = 1; i <= 21; i++) {
+            pages.append(i).append(',');
+        }
+        var v = tool.validateInput(json("{\"type\":\"analyze\",\"prompt\":\"x\",\"path\":\"a.pdf\","
+            + "\"contentType\":\"pdf\",\"pages\":[" + pages.substring(0, pages.length() - 1) + "]}"), null);
+        assertThat(v.ok()).isFalse();
+        assertThat(v.errorCode()).isEqualTo("10");
+    }
+
+    @Test
+    @DisplayName("validateInput v2：contentType 非法值 → fail errorCode=6")
+    void validateInput_badContentType_fails() {
+        var v = tool.validateInput(json(
+            "{\"type\":\"analyze\",\"prompt\":\"x\",\"contentId\":\"1\",\"contentType\":\"video\"}"), null);
+        assertThat(v.ok()).isFalse();
+        assertThat(v.errorCode()).isEqualTo("6");
+    }
+
+    // ── [v2] path 源（文件系统读盘 / PDF 懒渲染）──
+
+    @Test
+    @DisplayName("[v2 path 图] analyze(path=图片) 读盘 → 单 image block 送视觉模型（无需 contentId/注册）")
+    void analyze_pathImage_readsFileAndProxies() throws Exception {
+        Path img = configHome.resolve("shot.png");
+        Files.write(img, Base64.getDecoder().decode(PNG_BASE64));
+        stubSuccessChain("截图里有一个登录按钮。");
+
+        // Windows 反斜杠破坏 JSON 转义 → 正斜杠（Path 可接受）
+        String jsonPath = img.toString().replace('\\', '/');
+        AgentToolResult<?> result = tool.execute(
+            call("t", "{\"type\":\"analyze\",\"prompt\":\"这个截图里有什么？\",\"path\":\"" + jsonPath + "\"}"),
+            ToolUseContext.of(null, "sess-1"));
+
+        assertThat(result).isInstanceOf(ToolResult.class);
+        assertThat(((ToolResult<String>) result).data()).contains("type=analyze").contains("截图里有一个登录按钮");
+
+        ArgumentCaptor<LlmProvider.ChatRequestOptions> captor =
+            ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
+        verify(provider).chatWithOptions(
+            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), captor.capture());
+        List<ChatMessageDto> history = captor.getValue().history();
+        assertThat(history).hasSize(1);
+        assertThat(history.get(0).contentBlocks()).hasSize(2);
+        assertThat(history.get(0).contentBlocks().get(1).toString())
+            .contains("\"image\"").contains("\"base64\"").contains(PNG_BASE64);
+    }
+
+    @Test
+    @DisplayName("[v2 pdf] analyze(path=PDF, contentType=pdf, pages=[1,3]) 懒渲染选中页 → 双 image block 送视觉模型，临时目录清理")
+    void analyze_pathPdf_pages_rendersSelectedPagesToVisionModel() throws Exception {
+        Path pdf = configHome.resolve("sample.pdf");
+        try (PDDocument doc = new PDDocument()) {
+            for (int i = 0; i < 3; i++) {
+                doc.addPage(new PDPage());
+            }
+            doc.save(pdf.toFile());
+        }
+        stubSuccessChain("PDF 第 1、3 页是合同条款。");
+
+        // Windows 反斜杠破坏 JSON 转义 → 正斜杠（Path 可接受）
+        String jsonPath = pdf.toString().replace('\\', '/');
+        AgentToolResult<?> result = tool.execute(
+            call("t", "{\"type\":\"analyze\",\"prompt\":\"这 PDF 讲了什么？\",\"path\":\"" + jsonPath
+                + "\",\"contentType\":\"pdf\",\"pages\":[1,3]}"),
+            ToolUseContext.of(null, "sess-1"));
+
+        assertThat(result).isInstanceOf(ToolResult.class);
+        String data = ((ToolResult<String>) result).data();
+        assertThat(data).contains("type=analyze").contains("PDF 占位符=[pdf:").contains("pages=[1, 3]")
+            .contains("PDF 第 1、3 页是合同条款");
+
+        // 核心契约：懒渲染只送选中页 → user 消息 contentBlocks=[text, image(页1), image(页3)]，共 3 块
+        ArgumentCaptor<LlmProvider.ChatRequestOptions> captor =
+            ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
+        verify(provider).chatWithOptions(
+            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), captor.capture());
+        List<ChatMessageDto> history = captor.getValue().history();
+        assertThat(history).hasSize(1);
+        List<?> blocks = history.get(0).contentBlocks();
+        assertThat(blocks).hasSize(3);
+        assertThat(blocks.get(1).toString()).contains("\"image\"").contains("\"image/jpeg\"");
+        assertThat(blocks.get(2).toString()).contains("\"image\"").contains("\"image/jpeg\"");
+
+        // 渲染临时目录已清理（finally deleteRecursive）
+        try (java.util.stream.Stream<Path> walk = Files.list(Path.of(System.getProperty("java.io.tmpdir")))) {
+            assertThat(walk.filter(p -> p.getFileName().toString().startsWith("vision-analyze-pdf-"))).isEmpty();
+        }
+    }
+
+    @Test
+    @DisplayName("[400 回归 2026-09-03] inputSchema pages.items 必须是 schema 对象（OpenAI Invalid schema anyOf 防回归）")
+    void inputSchema_pagesItems_isObjectSchema() {
+        // 生产 400：原 putArray("items").add("integer") 生成 items=["integer"]（字符串数组）→ 非法 JSON Schema
+        // → OpenAI "Invalid schema for function 'vision_analyze' not valid under anyOf"。items 必须为
+        // 对象 {"type":"integer"}。deepseek 全 schema 直发，schema 非法即 API 400（整轮失败）。
+        JsonNode pages = tool.inputSchema().path("properties").path("pages");
+        assertThat(pages.get("type").asText()).isEqualTo("array");
+        JsonNode items = pages.get("items");
+        assertThat(items)
+            .as("items 必须存在")
+            .isNotNull();
+        assertThat(items.isObject())
+            .as("items 必须是 schema 对象 {" + "\"type\":\"integer\"" + "}（putObject），非字符串数组（putArray+add('integer')）")
+            .isTrue();
+        assertThat(items.get("type").asText()).isEqualTo("integer");
     }
 }

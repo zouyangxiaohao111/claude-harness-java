@@ -44,6 +44,7 @@ spring:
     #   但 DB 位置保留 ${NEXUSAI_HOME:./}（未设 env 默认 ./ → cwd/nexusai.db），避免破坏既有 dev DB 路径；
     #   如需迁到 {user.home} 可改 ${user.home}/.nexusai/nexusai.db。cron/MCP 已入 DB（datasource 承载），
     #   无独立文件路径。
+    # 默认无 profile = dev（cwd 库）；prod 由 application-prod.yml 覆盖 url 到 ~/.nexusai。
     url: "jdbc:sqlite:${NEXUSAI_HOME:./}nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"
     driver-class-name: org.sqlite.JDBC
     hikari:

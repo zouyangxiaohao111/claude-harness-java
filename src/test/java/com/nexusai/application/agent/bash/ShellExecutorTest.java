@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.bash;
 
 import com.nexusai.application.agent.memory.MemoryFileDetection;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
@@ -317,7 +318,7 @@ class ShellExecutorTest {
         assertThat(claudeCodeTmpdir).as("CLAUDE_CODE_TMPDIR 必须注入").isNotNull().isNotEmpty();
         assertThat(tmpdir).as("CLAUDE_CODE_TMPDIR 与 TMPDIR 同源（均沙箱 tmpdir，CC bashProvider.ts:241-243）")
             .isEqualTo(claudeCodeTmpdir);
-        // 沙箱 tmpdir = base/claude-{username}（Shell.ts:203-207 + claudeTempDirName.ts 等价）
-        assertThat(tmpdir).endsWith("claude-" + System.getProperty("user.name", "unknown"));
+        // 沙箱 tmpdir = base/{appName}[-{uid}]（Shell.ts:203-207 + getClaudeTempDirName 等价 → NexusaiPaths 单出口）
+        assertThat(tmpdir).endsWith(NexusaiPaths.getAppTempDirName());
     }
 }

@@ -254,10 +254,13 @@ class LlmAgentLoopUserMessageImageRoutingTest {
             assertThat(msg.role()).isEqualTo(Role.user);
             assertThat(msg.contentBlocks()).isEmpty();
             assertThat(msg.content())
-                .contains("contentId=")
-                .contains("vision_analyze")
-                .contains("页")
-                .contains("请总结这个 PDF");
+                .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+                .contains("pages=[要分析的页号数组]")
+                .contains("当前模型不支持直接查看 PDF")
+                .contains("共 2 页")
+                .contains("请总结这个 PDF")
+                .doesNotContain("contentId=")
+                .doesNotContain("图片缓存");
         } finally {
             java.nio.file.Files.deleteIfExists(file);
         }

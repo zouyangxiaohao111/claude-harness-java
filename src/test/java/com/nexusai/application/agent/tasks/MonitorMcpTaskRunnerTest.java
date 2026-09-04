@@ -2,6 +2,7 @@ package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tasks.BackgroundTaskRunner;
 import com.nexusai.common.RequestContext;
 import com.nexusai.domain.mcp.McpServerService;
@@ -332,15 +333,14 @@ class MonitorMcpTaskRunnerTest {
             String taskId = runner.registerTask("monitor-unify", "tu-y");
             String outputFile = runner.outputFileFor(taskId);
             // 五层唯一根：per-user + per-project + per-session（CC diskOutput.ts:50-55 + filesystem.ts:376-378）
-            String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
             String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
-            Path expected = Paths.get(tmpDir, BackgroundTaskRunner.claudeTempDirName(), sanitizedCwd,
+            Path expected = Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
                 sessionId, "tasks", taskId + ".output");
             assertThat(outputFile).as("monitor_mcp 输出必须落五层唯一根（per-user + per-project + sessionId 层）")
                 .isEqualTo(expected.toString());
             assertThat(Paths.get(outputFile).getParent().toString())
-                .as("根目录 = claude-{uid}/{sanitizedCwd}/{sessionId}/tasks（CC getTaskOutputDir 语义）")
-                .isEqualTo(Paths.get(tmpDir, BackgroundTaskRunner.claudeTempDirName(), sanitizedCwd,
+                .as("根目录 = {appName}[-{uid}]/{sanitizedCwd}/{sessionId}/tasks（CC getTaskOutputDir 语义）")
+                .isEqualTo(Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
                     sessionId, "tasks").toString());
             // 旧 flat 独立根不得再产出（CC 无对应偏离已删）
             assertThat(outputFile).doesNotContain("nexusai-tasks");

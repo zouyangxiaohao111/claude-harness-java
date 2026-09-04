@@ -231,7 +231,7 @@ class AgentContextThreadLocalTest {
 
         Map<String, Object> attrs = AgentContext.buildForkAgentQueryEventAttrs(
             "compact", "compact", 1500L, 3,
-            100L, 200L, 900L, 50L, queryTracking);
+            100L, 200L, 900L, 50L, queryTracking, true);
 
         assertThat(attrs).as("forkLabel 透传 (CC :658-659)").containsEntry("forkLabel", "compact");
         assertThat(attrs).as("querySource 透传 canonical (CC :660-661)").containsEntry("querySource", "compact");
@@ -243,10 +243,26 @@ class AgentContextThreadLocalTest {
         assertThat(attrs).as("cacheCreationInputTokens (CC :670)").containsEntry("cacheCreationInputTokens", 50L);
         Double cacheHitRate = (Double) attrs.get("cacheHitRate");
         assertThat(cacheHitRate)
-            .as("cacheHitRate 派生值 = cache_read / 总输入 (CC :651-654)")
+            .as("anthropic=true → cacheHitRate = cache_read/(input+cache_read+cache_create) (CC :651-654)")
             .isCloseTo(0.857142857, within(1e-6));
         assertThat(attrs).as("queryChainId 附带 (CC :683-685)").containsEntry("queryChainId", "chain-1");
         assertThat(attrs).as("queryDepth 附带 (CC :686-687)").containsEntry("queryDepth", 2);
+    }
+
+    @Test
+    @DisplayName("buildForkAgentQueryEventAttrs 非 anthropic（openai_sdk/deepseek）→ cacheHitRate = cache_read/input（input 已含 cache hit）")
+    void buildForkAgentQueryEventAttrs_deepseek_cacheHitRateReadOverInput() {
+        // WHY: deepseek（openai 协议）input_tokens 已含 cache hit（input==H+M）；旧恒三字段分母
+        //   read/(input+read+create)=900/(1000+900+100)=0.45 恒为真实一半。修复后按 provider 分派：
+        //   anthropic=false → read/input = 0.9。RED teeth：改回三字段分母 → 0.45 → 断言失败。
+        Map<String, Object> attrs = AgentContext.buildForkAgentQueryEventAttrs(
+            "extract_memories", "extract_memories", 900L, 4,
+            1000L, 200L, 900L, 100L, null, false);
+
+        Double cacheHitRate = (Double) attrs.get("cacheHitRate");
+        assertThat(cacheHitRate)
+            .as("anthropic=false → cache_read/input = 0.9（防 0.45 回归）")
+            .isCloseTo(0.9, within(1e-9));
     }
 
     @Test
@@ -256,7 +272,7 @@ class AgentContextThreadLocalTest {
         //   不写 queryChainId/queryDepth；Java 端 null 等价 undefined，字段缺失而非 null 值。
         Map<String, Object> attrs = AgentContext.buildForkAgentQueryEventAttrs(
             "session_memory", "session_memory", 800L, 1,
-            0L, 0L, 0L, 0L, null);
+            0L, 0L, 0L, 0L, null, true);
 
         assertThat(attrs).as("null queryTracking 不附带 queryChainId").doesNotContainKey("queryChainId");
         assertThat(attrs).as("null queryTracking 不附带 queryDepth").doesNotContainKey("queryDepth");
@@ -272,7 +288,7 @@ class AgentContextThreadLocalTest {
 
         AgentContext.emitForkAgentQueryEvent(
             telemetry, "auto_dream", "auto_dream", 1200L, 5,
-            10L, 20L, 0L, 0L, null);
+            10L, 20L, 0L, 0L, null, false);
 
         assertThat(telemetry.getCounter("tengu_fork_agent_query"))
             .as("emitForkAgentQueryEvent 必须 recordEvent 计数 (CC forkedAgent.ts:656)")
@@ -288,12 +304,12 @@ class AgentContextThreadLocalTest {
         Telemetry telemetry = new Telemetry();
         AgentContext.emitForkAgentQueryEvent(
             telemetry, "compact", "compact", 900L, 2,
-            5L, 5L, 0L, 0L, null);
+            5L, 5L, 0L, 0L, null, false);
         assertThat(telemetry.getCounter("tengu_fork_agent_query")).isEqualTo(1);
 
         AgentContext.emitForkAgentQueryEvent(
             null, "compact", "compact", 900L, 2,
-            5L, 5L, 0L, 0L, null);
+            5L, 5L, 0L, 0L, null, false);
         assertThat(telemetry.getCounter("tengu_fork_agent_query"))
             .as("telemetry=null 时发射为 no-op（不额外计数、不抛异常）")
             .isEqualTo(1);

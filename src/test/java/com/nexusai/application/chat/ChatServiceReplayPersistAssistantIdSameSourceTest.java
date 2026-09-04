@@ -18,7 +18,6 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.lang.reflect.Method;
 import java.time.OffsetDateTime;
 import java.util.List;
 
@@ -29,23 +28,26 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
- * [同源改造] replayAndPersist 落库 id 统一 turnAssistantId · 净新增。
+ * [同源改造] 实时落库 id 统一 turnAssistantId · 净新增。
  *
  * <p><b>WHY (CLAUDE.md 规则 9 · 测试验证意图)</b>: assistant 落库 id 与流式
  * {@code chunk.assistantMessageId}（=turnAssistantId）必须同源（前端「块 id 匹配 DB」目标域），
  * 而非随机 {@code finalAssistantId = "msg-"+UUID8}。变异点：
  * <ul>
- *   <li>final 块仍用随机 finalAssistantId → 纯文本 assistant 落库 id="msg-*" ≠ 源消息 id → 红</li>
- *   <li>final 块缺 toolCalls 空闸 → 工具轮末条被循环落库后 final 块再以随机 id 插一条重复行 → 红</li>
+ *   <li>纯文本 assistant 落库仍用随机 id → 落库 id="msg-*" ≠ 源消息 id → 红</li>
+ *   <li>工具轮末条被重复落库 → 以随机 id 插一条重复行 → 红</li>
  *   <li>tool_result STOMP 事件父 id 仍用随机 finalAssistantId → 前端块 id 不匹配 → 红</li>
  * </ul>
  *
  * <p>纯单测：{@code new ChatService()} + {@link ReflectionTestUtils} 注入 mock mapper +
- * mock wsTemplate；{@code replayAndPersist} 私有方法反射调用（同
- * {@code ChatServiceReplayPersistReasoningTest} 模式）。
+ * mock wsTemplate；生产链路触发（{@code armRealTimePersist} 武装 appendListener 后
+ * {@code state.appendMessage} 逐条实时落库，替代已删 replayAndPersist 反射调用）。
  */
-@DisplayName("[同源改造] replayAndPersist 落库 id 统一 turnAssistantId")
+@DisplayName("[同源改造] 实时落库 id 统一 turnAssistantId")
 class ChatServiceReplayPersistAssistantIdSameSourceTest {
+
+    private static final String SESSION = "sess-1";
+    private static final String STREAM_TOPIC = "/topic/sessions/" + SESSION + "/stream";
 
     private ChatService service;
     private MessageMapper messageMapper;
@@ -62,18 +64,25 @@ class ChatServiceReplayPersistAssistantIdSameSourceTest {
         ReflectionTestUtils.setField(service, "toolCallMapper", toolCallMapper);
     }
 
+    /** 生产链路触发：武装实时落库 listener 后逐条 append（对齐 doRun「先 arm 后 append」）。 */
+    private void armAndAppend(AgentState state, String userMessageId, ChatMessageDto... messages) {
+        service.armRealTimePersist(state, SESSION, STREAM_TOPIC, wsTemplate, userMessageId);
+        for (ChatMessageDto m : messages) {
+            state.appendMessage(m);
+        }
+    }
+
     @Test
-    @DisplayName("纯文本 assistant final 落库 id == 源消息 id（=turnAssistantId，非随机 finalAssistantId）")
-    void finalBlockPersistIdIsSourceMessageId() throws Exception {
-        // GIVEN: 纯文本 assistant（无 tool_calls → 仅 final 块落库），id="turn-1"
+    @DisplayName("纯文本 assistant 落库 id == 源消息 id（=turnAssistantId，非随机）")
+    void finalBlockPersistIdIsSourceMessageId() {
+        // GIVEN: 纯文本 assistant（无 tool_calls → 仅纯文本落库），id="turn-1"
         AgentState state = new AgentState("sys");
-        state.appendMessage(new ChatMessageDto(
-            "turn-1", "sess-1", Role.assistant, null, "纯文本回复", "思考", List.of(),
+
+        // WHEN: 生产链路实时落库（append 即触发 persistAppendedMessage）
+        armAndAppend(state, "msg-user", new ChatMessageDto(
+            "turn-1", SESSION, Role.assistant, null, "纯文本回复", "思考", List.of(),
             FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(), null, null,
             null, List.of(), List.of(), null, false, false));
-
-        // WHEN: 回放持久化（生产路径 replayAndPersist）
-        invokeReplay(state, null);
 
         // THEN: 落库恰一次，id == "turn-1"（源 assistant 消息真实 id = turnAssistantId）
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
@@ -84,32 +93,31 @@ class ChatServiceReplayPersistAssistantIdSameSourceTest {
     }
 
     @Test
-    @DisplayName("工具轮末条不重复落库：循环落一次（id=turnAssistantId），final 块跳过（toolCalls 空闸）")
-    void toolTurnLastAssistantNotDuplicated() throws Exception {
+    @DisplayName("工具轮末条不重复落库：assistant 落一次（id=turnAssistantId），无随机 id 重复行")
+    void toolTurnLastAssistantNotDuplicated() {
         // GIVEN: 工具轮 assistant（带 toolCalls，id="turn-t"）+ tool_result
         AgentState state = new AgentState("sys");
-        state.appendMessage(new ChatMessageDto(
-            "turn-t", "sess-1", Role.assistant, null, "", "工具轮思考",
-            List.of(new ToolCallDto("tc1", "Bash", "{}", null, false)),
-            FinishReason.tool_calls, null, null, "刚刚", OffsetDateTime.now(), null, null,
-            null, List.of(), List.of(), null, false, false));
-        state.appendMessage(new ChatMessageDto(
-            "tr1", "sess-1", Role.tool, "tool", "ok", null, null,
-            null, null, null, "刚刚", OffsetDateTime.now(), "tc1", "turn-t",
-            null, List.of(), List.of(), null, false, false));
 
-        // WHEN: 回放持久化
-        invokeReplay(state, wsTemplate);
+        // WHEN: 生产链路实时落库（assistant + tool_result 逐条 append 即落）
+        armAndAppend(state, "msg-user",
+            new ChatMessageDto(
+                "turn-t", SESSION, Role.assistant, null, "", "工具轮思考",
+                List.of(new ToolCallDto("tc1", "Bash", "{}", null, false)),
+                FinishReason.tool_calls, null, null, "刚刚", OffsetDateTime.now(), null, null,
+                null, List.of(), List.of(), null, false, false),
+            new ChatMessageDto(
+                "tr1", SESSION, Role.tool, "tool", "ok", null, null,
+                null, null, null, "刚刚", OffsetDateTime.now(), "tc1", "turn-t",
+                null, List.of(), List.of(), null, false, false));
 
-        // THEN: 工具轮 assistant 恰落库一次（循环 :449），final 块 toolCalls 空闸跳过
-        //   （不得产生第二条随机 id 重复行）→ 共 2 次 insert（assistant + tool_result）
+        // THEN: 工具轮 assistant 恰落库一次（纯文本分支无重复落），共 2 次 insert（assistant + tool_result）
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper, times(2)).insert(captor.capture());
         List<MessageRecord> assistantRecs = captor.getAllValues().stream()
             .filter(r -> "assistant".equals(r.getRole()))
             .toList();
         assertThat(assistantRecs)
-            .as("工具轮末条 assistant 必须恰落库一次（final 块跳过，无重复行）")
+            .as("工具轮末条 assistant 必须恰落库一次（无随机 id 重复行）")
             .hasSize(1);
         assertThat(assistantRecs.get(0).getId())
             .as("工具轮 assistant 落库 id == turnAssistantId")
@@ -117,22 +125,22 @@ class ChatServiceReplayPersistAssistantIdSameSourceTest {
     }
 
     @Test
-    @DisplayName("tool_result STOMP 事件父 id == turnAssistantId（m.assistantMessageId，非随机 finalAssistantId）")
-    void toolResultEventAssistantMessageIdIsTurnId() throws Exception {
+    @DisplayName("tool_result STOMP 事件父 id == turnAssistantId（m.assistantMessageId，非随机）")
+    void toolResultEventAssistantMessageIdIsTurnId() {
         // GIVEN: 工具轮 assistant（id="turn-t"）+ tool_result（assistantMessageId="turn-t"）
         AgentState state = new AgentState("sys");
-        state.appendMessage(new ChatMessageDto(
-            "turn-t", "sess-1", Role.assistant, null, "", "思考",
-            List.of(new ToolCallDto("tc1", "Bash", "{}", null, false)),
-            FinishReason.tool_calls, null, null, "刚刚", OffsetDateTime.now(), null, null,
-            null, List.of(), List.of(), null, false, false));
-        state.appendMessage(new ChatMessageDto(
-            "tr1", "sess-1", Role.tool, "tool", "ok", null, null,
-            null, null, null, "刚刚", OffsetDateTime.now(), "tc1", "turn-t",
-            null, List.of(), List.of(), null, false, false));
 
-        // WHEN: 回放持久化（STOMP 事件发出）
-        invokeReplay(state, wsTemplate);
+        // WHEN: 生产链路实时落库（STOMP 事件随 append 发出）
+        armAndAppend(state, "msg-user",
+            new ChatMessageDto(
+                "turn-t", SESSION, Role.assistant, null, "", "思考",
+                List.of(new ToolCallDto("tc1", "Bash", "{}", null, false)),
+                FinishReason.tool_calls, null, null, "刚刚", OffsetDateTime.now(), null, null,
+                null, List.of(), List.of(), null, false, false),
+            new ChatMessageDto(
+                "tr1", SESSION, Role.tool, "tool", "ok", null, null,
+                null, null, null, "刚刚", OffsetDateTime.now(), "tc1", "turn-t",
+                null, List.of(), List.of(), null, false, false));
 
         // THEN: MessageToolResultEvent.assistantMessageId == "turn-t"（真实 turn id，非幻影随机串）
         ArgumentCaptor<StreamEvent> captor = ArgumentCaptor.forClass(StreamEvent.class);
@@ -144,7 +152,7 @@ class ChatServiceReplayPersistAssistantIdSameSourceTest {
         assertThat(toolResultEvt.getAssistantMessageId())
             .as("tool_result STOMP 事件父 id 必须指向真实 turn id（turnAssistantId）")
             .isEqualTo("turn-t");
-        // 对照：tool_call 事件父 id 同为 turnAssistantId（既有 :462 行为不回归）
+        // 对照：tool_call 事件父 id 同为 turnAssistantId（既有行为不回归）
         MessageToolCallEvent toolCallEvt = captor.getAllValues().stream()
             .filter(MessageToolCallEvent.class::isInstance)
             .map(MessageToolCallEvent.class::cast)
@@ -152,14 +160,5 @@ class ChatServiceReplayPersistAssistantIdSameSourceTest {
         assertThat(toolCallEvt.getAssistantMessageId())
             .as("tool_call STOMP 事件父 id 必须指向真实 turn id（turnAssistantId）")
             .isEqualTo("turn-t");
-    }
-
-    /** 反射调用 private {@code replayAndPersist(sessionId, userMessageId, state, streamTopic, wsTemplate)}。 */
-    private void invokeReplay(AgentState state, SimpMessagingTemplate ws) throws Exception {
-        Method m = ChatService.class.getDeclaredMethod(
-            "replayAndPersist",
-            String.class, String.class, AgentState.class, String.class, SimpMessagingTemplate.class);
-        m.setAccessible(true);
-        m.invoke(service, "sess-1", "msg-user", state, "/topic/stream", ws);
     }
 }

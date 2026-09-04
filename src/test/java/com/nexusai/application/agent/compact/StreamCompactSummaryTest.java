@@ -239,8 +239,11 @@ class StreamCompactSummaryTest {
         StreamCompactSummary.setTelemetry(telemetry);
         try {
             ChatMessageDto assistant = assistantMessage("fork summary");
+            // [A 命中率口径] 3 参带 providerType='anthropic'：cacheHitRate 保持 CC/Anthropic
+            //   三字段分母语义（read/(input+read+create)）；2 参重载 providerType=null →
+            //   isAnthropic()=false 走 read/input，本用例会 RED（防公式被误改）。
             ForkedAgentResult result = new ForkedAgentResult(
-                List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 200, 300));
+                List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 200, 300), "anthropic");
             RunForkedAgent.ForkedQuery query = params -> result;
             ToolUseContext tuc = new ToolUseContext(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
@@ -274,6 +277,47 @@ class StreamCompactSummaryTest {
                 }));
             Mockito.verify(telemetry).logOTelEvent(
                 Mockito.eq("tengu_compact_cache_sharing_success"), Mockito.anyMap());
+        } finally {
+            StreamCompactSummary.setTelemetry(null);
+        }
+    }
+
+    @Test
+    @DisplayName("A: fork 缓存共享成功 + 非 anthropic（openai_sdk/deepseek）→ cacheHitRate = cache_read/input（input 已含 cache hit）")
+    void forkCacheSharing_success_deepseek_cacheHitRateReadOverInput() {
+        // WHY: deepseek（openai 协议）input_tokens 已含 cache hit（input==H+M）；旧恒三字段分母
+        //   read/(input+read+create) 会给出 900/(1000+900+100)=0.45 —— 恒为真实一半。修复后按
+        //   provider 分派：providerType='openai_sdk' → isAnthropic()=false → read/input = 0.9。
+        //   RED teeth：若公式回到恒三字段分母或 provider 分派丢失 → 0.45 → 断言失败。
+        Telemetry telemetry = Mockito.mock(Telemetry.class);
+        StreamCompactSummary.setTelemetry(telemetry);
+        try {
+            ChatMessageDto assistant = assistantMessage("fork summary");
+            ForkedAgentResult result = new ForkedAgentResult(
+                List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 900, 100), "openai_sdk");
+            RunForkedAgent.ForkedQuery query = params -> result;
+            ToolUseContext tuc = new ToolUseContext(
+                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
+            CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
+                List.of(userMessage("forkctx1", "fork ctx")));
+            StreamCompactSummary scs = new StreamCompactSummary(
+                () -> (LlmProvider) null, () -> "model", ProviderConfig::empty,
+                () -> params, null, null, null, false, true, false, null, null, null);
+            scs.setForkedQuery(query);
+
+            CompactConversation.SummaryResult summary = scs.streamCompactSummary(
+                List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
+                null, ProviderConfig.empty());
+
+            assertThat(summary).as("fork 成功摘要返回").isNotNull();
+            Mockito.verify(telemetry).recordEvent(
+                Mockito.eq("tengu_compact_cache_sharing_success"),
+                Mockito.argThat(attrs -> {
+                    Object hit = attrs.get("cacheHitRate");
+                    return hit instanceof Double d
+                        && Math.abs(d - 0.9) < 1e-9;
+                }));
         } finally {
             StreamCompactSummary.setTelemetry(null);
         }

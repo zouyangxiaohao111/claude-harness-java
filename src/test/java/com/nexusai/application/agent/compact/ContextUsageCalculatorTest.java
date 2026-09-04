@@ -8,6 +8,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.within;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -51,6 +52,56 @@ class ContextUsageCalculatorTest {
         assertThat(ContextUsageCalculator.computeContextTokensUsed(2000L, 500L, 300L, false))
             .as("openai_compatible → 仅 input（不双计 cache）")
             .isEqualTo(2000L);
+    }
+
+    // ─────────────────────────── computeCacheHitRate 纯函数 ───────────────────────────
+
+    @Test
+    @DisplayName("Anthropic：cache 命中率 = read/(input+read+create) 三字段分母（CC forkedAgent.ts:647-654）")
+    void cacheHitRate_anthropic_threeFieldDenominator() {
+        // WHY: Claude usage 三字段独立 → 分母 = input + cache_read + cache_create（CC :651-654）。
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 900L, 100L, true))
+            .as("read/(input+read+create) = 900/2000")
+            .isCloseTo(0.45, within(1e-9));
+    }
+
+    @Test
+    @DisplayName("Anthropic：cache 字段 null → 0 容错（无 cache / 旧行无 cache 列）")
+    void cacheHitRate_anthropic_nullCacheFields() {
+        // WHY: cacheRead null → read=0 → 0（无命中）；cacheRead 非 null 但 cacheCreate null → 0 补齐。
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, null, null, true))
+            .as("cacheRead null → read=0 → 0")
+            .isEqualTo(0d);
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 900L, null, true))
+            .as("cacheCreate null → 分母 = input + read + 0 = 900/1900")
+            .isCloseTo(900.0 / 1900.0, within(1e-9));
+    }
+
+    @Test
+    @DisplayName("非 anthropic（openai/deepseek）：命中率 = read/input——prompt_tokens 已含 cache hit（核心意图）")
+    void cacheHitRate_nonAnthropic_readOverInput() {
+        // WHY: DeepSeek input==H+M；旧恒三字段分母（read/(input+read+create) = 900/2000 = 0.45）
+        //   恒为真实一半 → 命中率口径修复：read/input = 900/1000 = 0.9。
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 900L, 100L, false))
+            .as("read/input = 0.9（防 0.45 回归）")
+            .isCloseTo(0.9, within(1e-9));
+    }
+
+    @Test
+    @DisplayName("read=0 或分母≤0 → 0（无命中 / 非法场景）")
+    void cacheHitRate_zeroWhenNoReadOrBadDenominator() {
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 0L, 100L, true))
+            .as("read=0 → 0")
+            .isEqualTo(0d);
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 0L, 100L, false))
+            .as("read=0（非 anthropic）→ 0")
+            .isEqualTo(0d);
+        assertThat(ContextUsageCalculator.computeCacheHitRate(0L, 900L, 100L, false))
+            .as("非 anthropic 分母=input=0 → 0（input=0 但 cacheRead>0 非法）")
+            .isEqualTo(0d);
+        assertThat(ContextUsageCalculator.computeCacheHitRate(0L, 900L, 100L, true))
+            .as("anthropic 分母 = 0+900+100 > 0 → 900/1000 = 0.9（input=0 但 read/create 存在仍可算）")
+            .isCloseTo(0.9, within(1e-9));
     }
 
     // ─────────────────────────── isAnthropic 判定链 ───────────────────────────
@@ -124,5 +175,61 @@ class ContextUsageCalculatorTest {
         assertThat(ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, "unknown-model"))
             .as("未命中模型 → 非 Anthropic（openai_compatible 语义）")
             .isFalse();
+    }
+
+    // ─────────────────────────── snapshot 单点（window + used + percentLeft） ───────────────────────────
+
+    @Test
+    @DisplayName("snapshot：窗口=模型 max_context + 非 anthropic used=input + percentLeft 算对（防双计）")
+    void snapshot_resolvesWindowAndAppliesProtocolDispatch() {
+        // GIVEN: 可解析模型（openai_compatible provider + max_context_tokens=2000）
+        stubResolvableModel();
+        ProviderRecord p = new ProviderRecord();
+        p.setId("p1");
+        p.setType("openai_compatible");
+        when(providerMapper.selectOneById(any())).thenReturn(p);
+        // stubResolvableModel 未设 maxContextTokens → 补设 2000（模型级窗口权威值）
+        ModelRecord m = new ModelRecord();
+        m.setId("m1");
+        m.setProviderId("p1");
+        m.setName("deepseek-v4-flash");
+        m.setEnabled(true);
+        m.setMaxContextTokens(2000);
+        when(modelMapper.selectOneByQuery(any())).thenReturn(m);
+
+        ContextUsageCalculator.Snapshot snap = ContextUsageCalculator.snapshot(
+            modelMapper, providerMapper, "deepseek/deepseek-v4-flash",
+            new com.nexusai.application.agent.tool.AgentUsage(1500L, 500L, 300L, 1000L, null, null, null));
+
+        assertThat(snap.contextWindow())
+            .as("窗口 = 模型 max_context_tokens=2000（未配才回落 1M）").isEqualTo(2000L);
+        assertThat(snap.contextTokensUsed())
+            .as("非 anthropic → 仅 input=1500（cacheRead 1000 已含 input，加会双计）").isEqualTo(1500L);
+        assertThat(snap.percentLeft())
+            .as("round((1-1500/2000)*100)=25").isEqualTo(25);
+    }
+
+    @Test
+    @DisplayName("snapshot：usage null → used=0 + percentLeft null（NON_NULL 省略），窗口仍解析")
+    void snapshot_nullUsage_zeroUsedNullPercent() {
+        stubResolvableModel();
+        ProviderRecord p = new ProviderRecord();
+        p.setId("p1");
+        p.setType("openai_compatible");
+        when(providerMapper.selectOneById(any())).thenReturn(p);
+        ModelRecord m = new ModelRecord();
+        m.setId("m1");
+        m.setProviderId("p1");
+        m.setName("deepseek-v4-flash");
+        m.setEnabled(true);
+        m.setMaxContextTokens(4000);
+        when(modelMapper.selectOneByQuery(any())).thenReturn(m);
+
+        ContextUsageCalculator.Snapshot snap = ContextUsageCalculator.snapshot(
+            modelMapper, providerMapper, "deepseek/deepseek-v4-flash", null);
+
+        assertThat(snap.contextWindow()).isEqualTo(4000L);
+        assertThat(snap.contextTokensUsed()).as("usage null → used 0").isZero();
+        assertThat(snap.percentLeft()).as("usage null → percentLeft null（省略）").isNull();
     }
 }

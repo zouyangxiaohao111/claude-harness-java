@@ -241,6 +241,54 @@ class MemoryPromptBuilderTest {
     }
 
     @Test
+    @DisplayName("[A1 读取侧回归] 真实 AutoMemPaths：会话线程 projectRoot → loadMemoryPrompt 解析到该项目的 per-project 记忆目录（不回落 config-home）")
+    void autoOnly_realAutoMemPaths_resolvesSessionProjectMemoryDir(@TempDir Path configHome) throws Exception {
+        // WHY（规则九 · 用户补测要求）：既有测试全用 overrideSupplier 注入固定目录，未覆盖
+        // "会话线程 projectRoot ThreadLocal → AutoMemPaths.getAutoMemPath() 真实解析"这条读取链路。
+        // 若 setCurrentProjectRoot 未生效（如误删注入点），loadMemoryPrompt 会回落 config-home 自身
+        // （C--configHome slug）而非绑定项目目录 → 模型拿到错误目录的记忆。本测试钉死解析正确性。
+        // config home 隔离到 @TempDir（NexusaiPaths override），绝不写真实 ~/.nexusai。
+        NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+        try {
+            // 绑定项目（中文路径 → sanitize slug，贴近用户真实「桌面报告」场景）
+            Path boundProject = configHome.resolve("报告项目");
+            java.nio.file.Path projectMemoryDir = configHome.resolve("projects")
+                .resolve(AutoMemPaths.sanitizePath(boundProject.toString()))
+                .resolve("memory");
+            Files.createDirectories(projectMemoryDir);
+
+            // 模拟会话线程：注入会话 projectRoot（LlmAgentLoop.run() resolveSessionProjectRoot 等价）
+            AutoMemPaths.setCurrentProjectRoot(boundProject.toString());
+
+            // 真实 AutoMemPaths（defaultInstance supplier = currentSessionProjectRoot ThreadLocal）
+            MemoryPromptBuilder b = new MemoryPromptBuilder(
+                AutoMemPaths.defaultInstance(),
+                () -> true,   // autoEnabled
+                () -> false,  // kairosActive
+                () -> false,  // teamEnabled
+                () -> false,  // coralFernFlag
+                () -> false,  // mothCopseFlag
+                () -> false,  // herringClockFlag
+                () -> null,   // coworkEnv
+                p -> "");     // entrypointReader
+
+            String prompt = b.loadMemoryPrompt();
+
+            // auto-only prompt 首行目录 = 该绑定项目的 per-project 记忆目录（buildMemoryLines :901）
+            assertThat(prompt).contains("file-based memory system at `" + projectMemoryDir + java.io.File.separator + "`");
+            // 绝不回落 config-home 自身（缺陷 A 表现：把 config-home 自身当项目 → projects/sanitize(configHome)/memory）。
+            // 注意：boundProject slug 以 configHome slug 为前缀，故断言"configHome slug 后紧跟 /memory"而非前缀匹配。
+            assertThat(prompt).doesNotContain(
+                "memory system at `" + configHome.resolve("projects")
+                    .resolve(AutoMemPaths.sanitizePath(configHome.toString()))
+                    .resolve("memory").toString());
+        } finally {
+            AutoMemPaths.setCurrentProjectRoot(null);
+            NexusaiPaths.setConfigHomeDirOverride(null);
+        }
+    }
+
+    @Test
     @DisplayName("[IMP-C-6 · C-6] productionDefault() 单例装配接生产静态 coralFern —— flag 开 agent-memory prompt 含 Searching past context")
     void productionDefault_reads_static_coralFern(@TempDir Path dir) {
         // WHY（规则九）：C-6 单例缺口 —— AgentMemoryDirectory 共享单例（DefaultHolder.INSTANCE）

@@ -99,6 +99,32 @@ class AgentModelResolverTest {
     }
 
     @Test
+    @DisplayName("[pdf-fork-model 2026-09-03] tool 显式 model 优先于 settings.subagentModelId（用户拍板 tool->db->env）")
+    void toolSpecifiedModel_takesPriorityOverSettingsDb() {
+        // WHY: 主代理引导 vision 子代理调 Agent 显式传 model，DB settings.subagentModelName（默认文本）
+        //   不得压过显式指定（原 DB 最高优先级 bug：日志实证 2026-09-03 queryLoop 入口
+        //   model=deepseek/deepseek-v4-flash，vision 失效 → 子代理用文本模型 Read pdf 被拒）。
+        assertThat(AgentModelResolver.resolveWithEnv(
+            "opus", "claude-sonnet-4-5", "claude-opus-4-6", null, "claude-haiku-4", "claude-sonnet-4-6"))
+            .isEqualTo("claude-opus-4-6");
+        // 真实场景：tool 自定义 vision 模型名（非档位别名）优先于 DB 文本默认
+        assertThat(AgentModelResolver.resolveWithEnv(
+            null, "deepseek/deepseek-v4-flash", "deepseek-v4-flash-vision-exp", null, null,
+            "deepseek/deepseek-v4-flash"))
+            .isEqualTo("deepseek-v4-flash-vision-exp");
+    }
+
+    @Test
+    @DisplayName("[pdf-fork-model 2026-09-03] tool 显式 model 匹配父档位 → 仍继承父模型（防降级语义保留）")
+    void toolSpecifiedModel_matchesParentTier_inheritsParent_evenWithDb() {
+        // WHY: tool 最优先但 aliasMatchesParentTier 防降级语义不变——tool=sonnet + 父 sonnet →
+        //   继承父精确串，即使 DB 配了其他档位
+        assertThat(AgentModelResolver.resolveWithEnv(
+            "haiku", "claude-sonnet-4-5", "sonnet", null, null, "claude-opus-4-6"))
+            .isEqualTo("claude-sonnet-4-5");
+    }
+
+    @Test
     @DisplayName("inherit 非 opusplan/haiku 父模型 + plan 模式 → 原样返回父模型（CC model.ts:166 默认分支）")
     void inherit_nonAliasParent_planMode_returnsParent() {
         String parent = "claude-opus-4-6";

@@ -115,6 +115,19 @@ class TokenUsageFamilyCcContractTest {
         assertThat(Tokens.getTokenCountFromUsage(null)).isZero();
     }
 
+    @Test
+    @DisplayName("getTokenCountFromUsage(anthropic=false) = input + output（deepseek input 已含 cache hit，A5-2）")
+    void getTokenCountFromUsage_nonAnthropic_inputPlusOutput() {
+        // WHY (A5-2): deepseek（openai 协议）input_tokens 已含 cache hit（input == H+M），
+        //   4 项和把 cacheRead/cacheCreate 重复计入 → 展示/预算/决策阈值口径必须 input+output。
+        Tokens.Usage usage = new Tokens.Usage(100, 20, 5, 3);
+        assertThat(Tokens.getTokenCountFromUsage(usage, false))
+            .as("100+20=120（忽略 cacheRead=5/cacheCreate=3）").isEqualTo(120);
+        // anthropic=true 保持 4 项和（CC 原生）与 1 参一致
+        assertThat(Tokens.getTokenCountFromUsage(usage, true)).isEqualTo(128);
+        assertThat(Tokens.getTokenCountFromUsage(null, false)).isZero();
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // tokenCountFromLastAPIResponse（tokens.ts:55-66）
     // ════════════════════════════════════════════════════════════════════════

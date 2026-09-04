@@ -3,6 +3,7 @@ package com.nexusai.application.agent.tasks;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.common.RequestContext;
@@ -32,7 +33,9 @@ import static org.mockito.Mockito.mock;
  *       （{@code src/utils/permissions/filesystem.ts:376-378}）</li>
  *   <li>{@code getClaudeTempDir() = join(tmpdir, getClaudeTempDirName()) + sep}
  *       （filesystem.ts:331-347）；{@code getClaudeTempDirName()}：Windows→{@code claude}，
- *       Unix→{@code claude-{uid}}（filesystem.ts:307-315）</li>
+ *       Unix→{@code claude-{uid}}（filesystem.ts:307-315）—— Java 单出口
+ *       {@link NexusaiPaths#getAppTempDirName()}，per-user 层品牌名动态 = {appName}（自有，无前导点），
+ *       行为仍镜像 CC 结构（win 无 uid / Unix {appName}-{uid数字}）。</li>
  *   <li>{@code sanitizePath}：非字母数字→'-'（sessionStoragePortable.ts:311-319）</li>
  *   <li>Task 创建：{@code Task.ts:121 outputFile: getTaskOutputPath(id)}（LocalAgentTask.tsx:488/553
  *       createTaskStateBase 消费）</li>
@@ -40,9 +43,10 @@ import static org.mockito.Mockito.mock;
  *
  * <p><b>WHY（规则九 · 测试验证意图而非行为）</b>——五层为何重要：
  * <ul>
- *   <li><b>per-user 层</b>（{@code claude-{uid}}）：Unix 多用户共享同一 {@code /tmp}，不加 uid 层会造成
+ *   <li><b>per-user 层</b>（{@code {appName}-{uid}}）：Unix 多用户共享同一 {@code /tmp}，不加 uid 层会造成
  *       权限冲突与跨用户串读（filesystem.ts:311-313）；Windows tmpdir 已 per-user 故 CC 不加 uid
- *       （filesystem.ts:305/308-310）——{@link BackgroundTaskRunner#claudeTempDirName()} 平台分支。</li>
+ *       （filesystem.ts:305/308-310）——Java 走 {@link NexusaiPaths#getAppTempDirName()} 平台分支
+ *       （per-user 层品牌名已动态 appName，行为仍镜像 CC 结构）。</li>
  *   <li><b>per-project 层</b>（sanitizePath(originalCwd)）：不同项目 originalCwd → 不同输出目录
  *       （filesystem.ts:376-378），同一用户多个项目互不串扰。</li>
  *   <li><b>per-session 层</b>：sessionId 纳入路径防并发会话 clobber（diskOutput.ts:38-41）。</li>
@@ -52,7 +56,7 @@ import static org.mockito.Mockito.mock;
  *       已删除（无兼容层/双轨）。</li>
  * </ul>
  *
- * <p>本类锁定：{@code taskOutputPath} 产出 CC 五层格式（含 claude-{uid} + originalCwd sanitize +
+ * <p>本类锁定：{@code taskOutputPath} 产出 CC 五层格式（含 per-user {appName}[-{uid}] + originalCwd sanitize +
  * sessionId + tasks + .output）、registerAsyncAgent / registerAgentForeground 的 outputFile 走
  * {@code taskOutputPath}、appendToOutputFile 写前建父目录、per-project 隔离、sanitizePath 分隔符替换。
  */
@@ -74,14 +78,13 @@ class BackgroundTaskRunnerTest {
 
     /** 期望 CC 五层路径（与生产 taskOutputDir 同源镜像，锁定五层形态）。 */
     private static String expectedFiveLayerPath(String sessionId, String taskId) {
-        String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
         String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
-        return Paths.get(tmpDir, BackgroundTaskRunner.claudeTempDirName(), sanitizedCwd,
+        return Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
             sessionId, "tasks", taskId + ".output").toString();
     }
 
     @Test
-    @DisplayName("taskOutputPath 产出 CC 五层 {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/{taskId}.output")
+    @DisplayName("taskOutputPath 产出 CC 五层 {tmpRoot}/{appName}[-{uid}]/{sanitizedCwd}/{sessionId}/tasks/{taskId}.output")
     void taskOutputPath_producesCcFiveLayerFormat() {
         // WHY: CC getTaskOutputPath = join(getTaskOutputDir(), `${taskId}.output`)，
         //   getTaskOutputDir = join(getProjectTempDir(), getSessionId(), 'tasks')（diskOutput.ts:50-55/72-74），
@@ -101,7 +104,7 @@ class BackgroundTaskRunnerTest {
     }
 
     @Test
-    @DisplayName("taskOutputDir 产出 CC 五层唯一根（claude-{uid} + sanitizedCwd + sessionId + tasks，旧 nexusai-sessions 已删）")
+    @DisplayName("taskOutputDir 产出 CC 五层唯一根（{appName}[-{uid}] + sanitizedCwd + sessionId + tasks，旧 nexusai-sessions 已删）")
     void taskOutputDir_producesCcFiveLayerRoot() {
         // WHY（方案B 意图，规则九）：CC 唯一 diskOutput 机制 getTaskOutputDir = join(getProjectTempDir(),
         //   getSessionId(), 'tasks')（diskOutput.ts:50-55）；getProjectTempDir = join(getClaudeTempDir(),
@@ -116,12 +119,12 @@ class BackgroundTaskRunnerTest {
             String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
             String dir = BackgroundTaskRunner.taskOutputDir();
             Path p = Path.of(dir);
-            // 五层逐段：.../tasks(⑤) ← sessionId(④) ← sanitizedCwd(③) ← claude-{uid}(②) ← tmpRoot(①)
+            // 五层逐段：.../tasks(⑤) ← sessionId(④) ← sanitizedCwd(③) ← {appName}[-{uid}](②) ← tmpRoot(①)
             assertThat(p.getName(p.getNameCount() - 1).toString()).isEqualTo("tasks");
             assertThat(p.getName(p.getNameCount() - 2).toString()).isEqualTo(sessionId);
             assertThat(p.getName(p.getNameCount() - 4).toString())
-                .as("per-user 层 = claudeTempDirName()（Windows=claude / Unix=claude-{uid}，CC filesystem.ts:307-315）")
-                .isEqualTo(BackgroundTaskRunner.claudeTempDirName());
+                .as("per-user 层 = NexusaiPaths.getAppTempDirName()（Windows={appName} / Unix={appName}-{uid}，CC filesystem.ts:307-315 结构）")
+                .isEqualTo(NexusaiPaths.getAppTempDirName());
             assertThat(dir).startsWith(Paths.get(tmpDir).toString());
             // 旧 A-7 简化根不得再产出（无兼容层/双轨，单轨五层）
             assertThat(dir).doesNotContain("nexusai-sessions");
@@ -161,23 +164,23 @@ class BackgroundTaskRunnerTest {
     }
 
     @Test
-    @DisplayName("per-user 层：claudeTempDirName()（Windows=claude / Unix=claude-{uid}，CC filesystem.ts:307-315）")
-    void taskOutputDir_perUserLayerClaudeUid() {
+    @DisplayName("per-user 层：NexusaiPaths.getAppTempDirName()（Windows={appName} / Unix={appName}-{uid}，CC filesystem.ts:307-315 结构）")
+    void taskOutputDir_perUserLayerAppTempDirName() {
         // WHY（规则九）：CC getClaudeTempDirName（filesystem.ts:307-315）——Unix 多用户共享 /tmp 需
-        //   claude-{uid} 防权限冲突与跨用户串读（:311-313）；Windows tmpdir 已 per-user（C:\Users\{user}
-        //   \AppData\Local\Temp），CC 用 'claude' 即可（:305/308-310）。Java 等价 = claudeTempDirName()
-        //   平台分支（任务铁律：uid 来源 System.getProperty("user.name") 或 cc uid 等价）。测试独立按
-        //   os.name 计算期望层，断言 taskOutputDir 的 ② per-user 段一致（不直接复用生产方法，防同义反复）。
+        //   {appName}-{uid} 防权限冲突与跨用户串读（:311-313）；Windows tmpdir 已 per-user（C:\Users\{user}
+        //   \AppData\Local\Temp），CC 用 'claude' 即可（:305/308-310）。Java 等价 = NexusaiPaths
+        //   getAppTempDirName() 平台分支（per-user 层品牌名动态 appName；uid 数字经 UnixSystem，不硬编码）。
+        //   测试独立按 os.name 计算期望层（win 无 uid 段），断言 taskOutputDir 的 ② per-user 段一致。
         String sessionId = "sess-uid-b";
         RequestContext.setSession(sessionId);
         try {
             String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
             String expectedLayer = os.contains("windows")
-                ? "claude"
-                : "claude-" + System.getProperty("user.name", "0");
+                ? NexusaiPaths.getAppName()
+                : NexusaiPaths.getAppTempDirName(); // = {appName}-{uid}（uid 经现取，不硬编码）
             String dir = BackgroundTaskRunner.taskOutputDir();
             String perUserSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 4).toString();
-            assertThat(perUserSegment).as("② per-user 段必须与 CC 平台分支一致").isEqualTo(expectedLayer);
+            assertThat(perUserSegment).as("② per-user 段必须与 NexusaiPaths 平台分支一致").isEqualTo(expectedLayer);
         } finally {
             RequestContext.clear();
         }

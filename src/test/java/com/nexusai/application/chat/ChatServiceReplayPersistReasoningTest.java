@@ -28,16 +28,20 @@ import static org.mockito.Mockito.verify;
  * 历史回放 reasoning 持久化验证（前后端联调修复）。
  *
  * <p><b>WHY (CLAUDE.md 规则 9 · 测试验证意图)</b>: 流式路径已把 thinking 经
- * {@code MessageChunkEvent.ofReasoning} 推前端（LlmAgentLoop:4560），但 {@code replayAndPersist}
+ * {@code MessageChunkEvent.ofReasoning} 推前端（LlmAgentLoop:4560），但实时落库（persistAppendedMessage）
  * 落库时曾只存 content、丢 reasoning → GET /messages 历史回放 reasoning 恒 null（前端
  * ChatMessageDto.reasoning + MessageList + cleanReasoning 就绪也无数据）。本测试锁定
  * "落库的 assistant 消息必须携带 reasoning"，防回归。
  *
  * <p>纯单测：{@code new ChatService()} + {@link ReflectionTestUtils} 注入 mock MessageMapper；
- * {@code replayAndPersist} 为私有方法，反射调用（与 ChatServiceResumeWorktreeTest 同模式）。
+ * 生产链路触发（{@code armRealTimePersist} + {@code state.appendMessage}，替代已删 replayAndPersist
+ * 反射调用）。prePersisted 场景按 doRun「先 setPrePersistedMessageIds 后 append」时序武装。
  */
-@DisplayName("[联调修复] replayAndPersist 落库 assistant 消息携带 reasoning")
+@DisplayName("[联调修复] 实时落库 assistant 消息携带 reasoning")
 class ChatServiceReplayPersistReasoningTest {
+
+    private static final String SESSION = "sess-1";
+    private static final String STREAM_TOPIC = "/topic/sessions/" + SESSION + "/stream";
 
     private ChatService service;
     private MessageMapper messageMapper;
@@ -51,41 +55,44 @@ class ChatServiceReplayPersistReasoningTest {
 
     private ChatMessageDto assistant(String content, String reasoning) {
         return new ChatMessageDto(
-            "msg-asst", "sess-1", Role.assistant, null, content, reasoning,
+            "msg-asst", SESSION, Role.assistant, null, content, reasoning,
             List.of(), FinishReason.stop, null, null,
             null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
     }
 
+    /** 生产链路触发：武装实时落库 listener 后逐条 append（对齐 doRun「先 arm 后 append」）。 */
+    private void armAndAppend(AgentState state, ChatMessageDto... messages) {
+        service.armRealTimePersist(state, SESSION, STREAM_TOPIC, null, "msg-user");
+        for (ChatMessageDto m : messages) {
+            state.appendMessage(m);
+        }
+    }
+
     @Test
-    @DisplayName("纯文本 final assistant 落库 reasoning 非空 → 历史回放有思考")
-    void persistFinalAssistantWithReasoning() throws Exception {
-        // GIVEN: state 含一条带 thinking 的纯文本 assistant（无 tool_calls → 走 final 落库）
+    @DisplayName("纯文本 assistant 落库 reasoning 非空 → 历史回放有思考")
+    void persistFinalAssistantWithReasoning() {
+        // GIVEN: 纯文本 assistant 带 thinking
         AgentState state = new AgentState("sys");
-        state.appendMessage(assistant("你好，有什么可以帮你？", "这是思考过程…"));
 
-        // WHEN: 回放持久化（生产路径 replayAndPersist）
-        invokeReplay(state);
+        // WHEN: 生产链路实时落库（append 即触发 persistAppendedMessage）
+        armAndAppend(state, assistant("你好，有什么可以帮你？", "这是思考过程…"));
 
-        // THEN: messageMapper.insert 的 final assistant 记录 reasoning == 思考过程
+        // THEN: messageMapper.insert 的 assistant 记录 reasoning == 思考过程
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper).insert(captor.capture());
         assertThat(captor.getValue().getReasoning())
-            .as("final assistant 落库必须携带 reasoning（历史回放前端可展示思考）")
+            .as("assistant 落库必须携带 reasoning（历史回放前端可展示思考）")
             .isEqualTo("这是思考过程…");
     }
 
     @Test
     @DisplayName("无 thinking 的 assistant 落库 reasoning 为 null（不误写）")
-    void persistAssistantWithoutReasoningIsNull() throws Exception {
-        // GIVEN: state 含一条无 thinking 的纯文本 assistant
+    void persistAssistantWithoutReasoningIsNull() {
         AgentState state = new AgentState("sys");
-        state.appendMessage(assistant("普通回复", null));
 
-        // WHEN: 回放持久化
-        invokeReplay(state);
+        armAndAppend(state, assistant("普通回复", null));
 
-        // THEN: 落库记录 reasoning 为 null（与修复前行为一致，不误补）
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper).insert(captor.capture());
         assertThat(captor.getValue().getReasoning())
@@ -95,83 +102,78 @@ class ChatServiceReplayPersistReasoningTest {
 
     @Test
     @DisplayName("prePersistedMessageIds 命中的历史 assistant 不重插（防 PK 冲突双写）")
-    void skipPrePersistedHistoryAssistant() throws Exception {
+    void skipPrePersistedHistoryAssistant() {
         // WHY（fix-loop-resume-history 双通道铁律）: doRun 主路径恢复把 DB 历史灌入 state.messages()
-        //   并登记 prePersistedMessageIds。若 replayAndPersist 仍遍历重插 history 消息 —— 其携带
+        //   并登记 prePersistedMessageIds。若实时落库仍遍历重插 history 消息 —— 其携带
         //   原始 DB id 作 PK，重插必 duplicate-key 崩；合成 sentinel/Continue（临时 UUID id，已收集进
         //   集合）CC 也不写 transcript。变异点：跳过逻辑不生效 → insert 两次（h1 + final）→ 红。
-        // GIVEN: 注入历史 assistant（已存 DB id=h1，带 tool_calls → 不跳过时会在循环内重插）+
-        //        当前轮新 assistant（纯文本，走 final 落库）+ prePersistedMessageIds={h1}
+        // GIVEN: 注入历史 assistant（已存 DB id=h1，带 tool_calls → 不跳过时会在 append 时重插）+
+        //        当前轮新 assistant（纯文本）+ prePersistedMessageIds={h1}
         ChatMessageDto history = new ChatMessageDto(
-            "h1", "sess-1", Role.assistant, null, "历史工具调用", null,
+            "h1", SESSION, Role.assistant, null, "历史工具调用", null,
             List.of(new ToolCallDto("tc1", "Bash", "{}", null, false)),
             FinishReason.tool_calls, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
         ChatMessageDto fresh = assistant("本轮新回复", null);
         AgentState state = new AgentState("sys");
-        state.appendMessage(history);
-        state.appendMessage(fresh);
         state.setPrePersistedMessageIds(java.util.Set.of("h1"));
 
-        // WHEN: 回放持久化
-        invokeReplay(state);
+        // WHEN: 生产链路实时落库（h1 先被 prePersisted 跳过，fresh 落库）
+        armAndAppend(state, history, fresh);
 
-        // THEN: 历史 h1 被跳过，insert 仅 final 一次
+        // THEN: 历史 h1 被跳过，insert 仅 fresh 一次
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper, times(1)).insert(captor.capture());
         assertThat(captor.getValue().getId())
-            .as("历史消息已存 DB，replayAndPersist 不得重插（防 PK 冲突）；仅本轮 final 落库")
+            .as("历史消息已存 DB，实时落库不得重插（防 PK 冲突）；仅本轮新 assistant 落库")
             .isNotEqualTo("h1");
     }
 
     @Test
     @DisplayName("注入历史（末条 assistant ∈ prePersisted）+ 本轮未产出新 assistant → 零落库（幽灵行防御）")
-    void skipFinalPersistWhenLastAssistantIsInjectedHistory() throws Exception {
+    void skipFinalPersistWhenLastAssistantIsInjectedHistory() {
         // WHY（fix-loop-resume-history 新回归）: doRun 注入块把 DB 历史灌入 state.messages() 后，
         //   lastAssistant() 从末向前扫描会命中注入的历史 assistant。若本轮 run 未 append 新
         //   assistant 即退出（取消/中断 / NO_ASSISTANT_TEXT 空流 / stream timeout / stop-hook 阻断），
-        //   历史内容会被以全新随机 id 落库 = 幽灵重复行。变异点：final 块未跳过注入历史 → insert 一次
+        //   历史内容会被以全新随机 id 落库 = 幽灵重复行。变异点：prePersisted 跳过未生效 → insert 一次
         //   （内容=历史回复）→ 红。
         // GIVEN: 仅注入历史 assistant（id=h1 ∈ prePersisted），本轮无新产出
         ChatMessageDto history = new ChatMessageDto(
-            "h1", "sess-1", Role.assistant, null, "历史回复", null,
+            "h1", SESSION, Role.assistant, null, "历史回复", null,
             List.of(), FinishReason.stop, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
         AgentState state = new AgentState("sys");
-        state.appendMessage(history);
         state.setPrePersistedMessageIds(java.util.Set.of("h1"));
 
-        // WHEN: 回放持久化
-        invokeReplay(state);
+        // WHEN: 生产链路实时落库（h1 命中 prePersisted → append 时点即跳过）
+        armAndAppend(state, history);
 
-        // THEN: final 块跳过注入历史 → messageMapper.insert 零调用（不得以新 id 重写历史内容）
+        // THEN: 历史 h1 被跳过 → messageMapper.insert 零调用（不得以新 id 重写历史内容）
         verify(messageMapper, times(0)).insert(any());
     }
 
     @Test
     @DisplayName("末条 assistant 是 deserializer 合成 sentinel → 零落库（sentinel 绝不可落库）")
-    void skipFinalPersistWhenLastAssistantIsSentinel() throws Exception {
+    void skipFinalPersistWhenLastAssistantIsSentinel() {
         // WHY: 中断恢复（末条为 user）时 SessionResumeDeserializer splice 注入
         //   assistant sentinel「No response requested.」（conversationRecovery.ts:234-248），其 id
-        //   已被注入块登记 prePersistedMessageIds。若 final 块用 lastAssistant() 命中 sentinel 并以
-        //   新 id 落库 → 幽灵「No response requested.」行污染 transcript + 前端。变异点：final 块
-        //   未按「末条 assistant id ∈ prePersisted」判定 → insert 一次（内容=sentinel）→ 红。
+        //   已被注入块登记 prePersistedMessageIds。若实时落库按 lastAssistant() 命中 sentinel 并以
+        //   新 id 落库 → 幽灵「No response requested.」行污染 transcript + 前端。变异点：prePersisted
+        //   跳过未生效 → insert 一次（内容=sentinel）→ 红。
         // GIVEN: 注入历史 assistant（h1）+ sentinel（s1），两者均 ∈ prePersisted
         ChatMessageDto history = new ChatMessageDto(
-            "h1", "sess-1", Role.assistant, null, "历史回复", null,
+            "h1", SESSION, Role.assistant, null, "历史回复", null,
             List.of(), FinishReason.stop, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
         ChatMessageDto sentinel = new ChatMessageDto(
-            "s1", "sess-1", Role.assistant, null, "No response requested.", null,
+            "s1", SESSION, Role.assistant, null, "No response requested.", null,
             List.of(), FinishReason.stop, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
         AgentState state = new AgentState("sys");
-        state.appendMessage(history);
-        state.appendMessage(sentinel);
         state.setPrePersistedMessageIds(java.util.Set.of("h1", "s1"));
 
-        // WHEN: 回放持久化
-        invokeReplay(state);
+        // WHEN: 生产链路实时落库（h1 + sentinel 均命中 prePersisted → 跳过）
+        armAndAppend(state, history, sentinel);
 
         // THEN: sentinel 为末条 assistant 且 ∈ prePersisted → 零落库
         verify(messageMapper, times(0)).insert(any());
@@ -179,32 +181,30 @@ class ChatServiceReplayPersistReasoningTest {
 
     @Test
     @DisplayName("注入历史 + 本轮新 assistant → 仅新 assistant 落库（历史不得以新 id 重写）")
-    void persistNewAssistantWhileSkippingInjectedHistory() throws Exception {
-        // WHY: 注入历史后本轮正常产出新 assistant → 仅新 assistant 走 final 落库；历史内容绝不得
-        //   以新随机 id 重写。变异点：final 块把「末条 assistant ∈ prePersisted」误判为跳过 → 新
-        //   assistant 也不落库 → 红；或误伤把历史当新产出重写 → 双写 → 红。
+    void persistNewAssistantWhileSkippingInjectedHistory() {
+        // WHY: 注入历史后本轮正常产出新 assistant → 仅新 assistant 走落库；历史内容绝不得
+        //   以新随机 id 重写。变异点：prePersisted 跳过误伤把历史当新产出重写 → 双写 → 红；或
+        //   把新 assistant 也误跳过 → 不落库 → 红。
         // GIVEN: 注入历史 assistant（h1 ∈ prePersisted）+ 本轮新 assistant（msg-new ∉ prePersisted）
         ChatMessageDto history = new ChatMessageDto(
-            "h1", "sess-1", Role.assistant, null, "历史回复", null,
+            "h1", SESSION, Role.assistant, null, "历史回复", null,
             List.of(), FinishReason.stop, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
         ChatMessageDto fresh = new ChatMessageDto(
-            "msg-new", "sess-1", Role.assistant, null, "本轮新回复", "本轮思考", null,
+            "msg-new", SESSION, Role.assistant, null, "本轮新回复", "本轮思考", null,
             FinishReason.stop, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
         AgentState state = new AgentState("sys");
-        state.appendMessage(history);
-        state.appendMessage(fresh);
         state.setPrePersistedMessageIds(java.util.Set.of("h1"));
 
-        // WHEN: 回放持久化
-        invokeReplay(state);
+        // WHEN: 生产链路实时落库（h1 跳过，msg-new 落库）
+        armAndAppend(state, history, fresh);
 
-        // THEN: 仅 final 落库一次，内容=本轮新回复（历史未被重写、新 assistant 未被误跳）
+        // THEN: 仅 msg-new 落库一次，内容=本轮新回复（历史未被重写、新 assistant 未被误跳）
         ArgumentCaptor<MessageRecord> captor = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper, times(1)).insert(captor.capture());
         assertThat(captor.getValue().getContent())
-            .as("注入历史后本轮新 assistant 必须落库（final 块只跳过注入历史）")
+            .as("注入历史后本轮新 assistant 必须落库（仅跳过注入历史）")
             .isEqualTo("本轮新回复");
     }
 
@@ -241,7 +241,7 @@ class ChatServiceReplayPersistReasoningTest {
     void lastAssistantReasoning_returnsLastAssistantReasoning() throws Exception {
         // WHY: 修复前 MessageCompleteEvent 构造 reasoning 恒传 null → 前端收口消息思考丢失。
         //   lastAssistantReasoning 是 message.complete 事件 reasoning 的数据源（对齐
-        //   replayAndPersist :432 finalReasoning = m.reasoning() 捕获语义）。变异点：取错消息
+        //   persistAppendedMessage finalReasoning = m.reasoning() 捕获语义）。变异点：取错消息
         //   （取第一条 assistant / 取 content）→ 红。
         // GIVEN: 两条 assistant，末条带 thinking
         AgentState state = new AgentState("sys");
@@ -270,26 +270,17 @@ class ChatServiceReplayPersistReasoningTest {
     void lastAssistantReasoning_noAssistant_returnsNull() throws Exception {
         AgentState state = new AgentState("sys");
         state.appendMessage(new ChatMessageDto(
-            "u1", "sess-1", Role.user, null, "你好", null,
+            "u1", SESSION, Role.user, null, "你好", null,
             null, null, null, null, null, OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false));
 
         assertThat(lastReasoning(state)).isNull();
     }
 
-    /** 反射调用 private {@code lastAssistantReasoning(AgentState)}。 */
+    /** 反射调用 private {@code lastAssistantReasoning(AgentState)}（仍存在，收口 helper）。 */
     private String lastReasoning(AgentState state) throws Exception {
         Method m = ChatService.class.getDeclaredMethod("lastAssistantReasoning", AgentState.class);
         m.setAccessible(true);
         return (String) m.invoke(service, state);
-    }
-
-    /** 反射调用 private {@code replayAndPersist(sessionId, userMessageId, state, streamTopic, wsTemplate)}。 */
-    private void invokeReplay(AgentState state) throws Exception {
-        Method m = ChatService.class.getDeclaredMethod(
-            "replayAndPersist",
-            String.class, String.class, AgentState.class, String.class, SimpMessagingTemplate.class);
-        m.setAccessible(true);
-        m.invoke(service, "sess-1", "msg-user", state, "/topic/stream", null);
     }
 }

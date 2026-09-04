@@ -225,6 +225,46 @@ class StreamingToolExecutorErrorTelemetryTest {
     }
 
     /**
+     * [_raw 兜底拦截 2026-09-04] openai 兼容模型超大 tool 参数（Bash heredoc / Write 大 content）
+     * 手写 JSON 转义偶发非法 → accumulator/provider 兜底包 {@code {_raw: 原文}}。执行层必须识别并
+     * 给「模型可行动的引导」（拆小重试），而非喂 zod 校验报误导性「缺 path / 多 _raw」（模型误以为
+     * 自己该传 _raw，20+ 轮死循环事故）。对齐 CC：非法 input 走 zod safeParse 失败给模型错误，
+     * 引导信息须指向真实原因（超长 JSON 转义失败）。
+     */
+    @Test
+    @DisplayName("_raw 兜底 input → 引导「拆小重试」，不执行工具、不发误导 zod telemetry")
+    void rawFallbackInput_intercepted_guidanceNotMisleadingZod() {
+        ConfigTool bashTool = new ConfigTool("Bash", false); // schema required=path：若不拦截会 zod 报 path missing
+        ToolRegistry registry = registryWith(bashTool);
+        ToolUseContext ctx = ctxWith(List.of(bashTool));
+
+        AtomicReference<Map<String, Object>> errorAttrs = new AtomicReference<>();
+        StreamingToolExecutor exec = new StreamingToolExecutor(registry, ctx);
+        exec.setTelemetry(capturingSpy(errorAttrs));
+        exec.setInputValidator(new ToolInputValidator()); // 真实 zod——证明拦截先于它，未走误导 schema 失败
+
+        // {_raw: 原文} = readTree 失败兜底形态（事故复刻：超大 heredoc 命令 JSON 转义失败）
+        ObjectNode rawInput = JSON.createObjectNode();
+        rawInput.put("_raw", "{\"command\": \"cd \\\"D:/项目/运维/智能化运维一体平台\\\" && cat > demo.html "
+            + "<<'DEMO_EOF_A'\\n<!DOCTYPE html>\\n<html lang=\\\"zh-CN\\\">…(转义出错导致非闭合)");
+        exec.add(new ToolUseBlock("call_bash_raw_1", "Bash", rawInput));
+        var results = exec.getRemainingResults();
+
+        assertThat(results).as("拦截返回 1 个错误结果").hasSize(1);
+        assertThat(results.get(0)).isInstanceOf(ToolResult.class);
+        String payload = ToolResult.renderToolResultPayloadText((ToolResult<?>) results.get(0));
+        assertThat(payload)
+            .as("引导必须指向真实原因（非合法 JSON + 拆小重试）——模型据此拆分而非误以为要传 _raw")
+            .contains("不是合法 JSON").contains("拆成多次较小");
+        assertThat(payload)
+            .as("不得出现误导性 zod 错误（缺 command/path、多 _raw）——那让模型以为格式错而 20+ 轮死循环")
+            .doesNotContain("required parameter");
+        assertThat(errorAttrs.get())
+            .as("_raw 拦截先于 zod：不发 tengu_tool_use_error（未走 schema 失败 telemetry 路径）")
+            .isNull();
+    }
+
+    /**
      * validateInput 语义校验失败: 载荷对齐 CC toolExecution.ts:691-698 —
      * {@code {messageID, toolName, error: isValidCall.message, errorCode: isValidCall.errorCode,
      * isMcp}}，无 toolUseID、无 errorDetails。

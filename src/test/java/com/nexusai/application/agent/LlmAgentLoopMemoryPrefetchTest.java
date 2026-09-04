@@ -160,7 +160,7 @@ class LlmAgentLoopMemoryPrefetchTest {
         List<List<ChatMessageDto>> histories = new ArrayList<>();
         RunRequest request = querySource == QuerySource.SUBAGENT
             ? new RunRequest("configure the system now", ProviderConfig.empty(), "test-model",
-                QuerySource.SUBAGENT, null, null, null, null, null, null, null, null, null, null, false, null, null)
+                QuerySource.SUBAGENT, null, null, null, null, null, null, null, null, null, null, false, null, null, null)
             : RunRequest.session("configure the system now", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID(),
                 ProviderConfig.empty(), "test-model", null, null);
         final boolean[] firstRound = {true};

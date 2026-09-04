@@ -80,16 +80,19 @@ class AgentToolUtilsAgentSetsTest {
     // ── 集合内容复验（D-26 ASYNC 16 项含 ToolSearch；OPD-03 COORDINATOR 4 项）──
 
     @Test
-    @DisplayName("ASYNC_AGENT_ALLOWED_TOOLS 共 16 项含 ToolSearch（复验确认，OPD-03 伪差异不重做）")
+    @DisplayName("ASYNC_AGENT_ALLOWED_TOOLS 共 17 项含 ToolSearch + vision_analyze（PDF 分页子代理读页图）")
     void asyncAllowedHas16IncludingToolSearch() {
-        // WHY: CC constants/tools.ts:55-71 字面量 16 项（SHELL_TOOL_NAMES=Bash+PowerShell 占 2 项，
-        // TOOL_SEARCH_TOOL_NAME 在第 14 位）。含 ToolSearch 是 hook agent 反递归/补全工具的必要白名单。
+        // WHY: CC constants/tools.ts:55-71 字面量 16 项 + [PDF 分页子代理修复] vision_analyze 补进
+        //   第 17 项（Java 文本模型 deepseek 看 PDF 页图/附件图靠 vision_analyze 代理视觉模型——
+        //   fork 异步子代理 >20 页 PDF NEEDS_SUBAGENT 分页依赖；isReadOnly+isConcurrencySafe 异步安全）。
+        //   含 ToolSearch 是 hook agent 反递归/补全工具的必要白名单。
         Assertions.assertThat(AgentToolUtils.ASYNC_AGENT_ALLOWED_TOOLS)
-            .as("ASYNC 白名单必须为 16 项")
-            .hasSize(16)
+            .as("ASYNC 白名单必须为 17 项（含 vision_analyze 供 PDF 分页子代理读页图）")
+            .hasSize(17)
             .contains(ToolNameConstants.TOOL_SEARCH_TOOL_NAME)
             .contains(ToolNameConstants.ENTER_WORKTREE_TOOL_NAME)
-            .contains(ToolNameConstants.EXIT_WORKTREE_TOOL_NAME);
+            .contains(ToolNameConstants.EXIT_WORKTREE_TOOL_NAME)
+            .contains(ToolNameConstants.VISION_ANALYZE_TOOL_NAME);
     }
 
     @Test

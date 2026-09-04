@@ -904,6 +904,34 @@ class ExtractMemoriesAgentTest {
         assertThat(telemetry.events).as("agentId 非空 → 不发提取 telemetry（gate 链首个检查即 return）").isEmpty();
     }
 
+    @Test
+    @DisplayName("[A1 重做] 6 参显式 memoryDir：无 projectRoot ThreadLocal 时 fork 用显式目录成功发起（不回落 config-home NPE/错目录）")
+    void executeExtractMemories_explicitMemoryDir_usedWithoutThreadLocal() throws Exception {
+        // WHY: 用户核心诉求 —— ThreadLocal 获取失败（异步 fork 线程无会话 projectRoot）不得导致
+        // memoryDir 回落 config-home。参数直传后：executeExtractMemories 6 参接收会话线程解析的
+        // memoryDir，runExtraction（fork 线程）用传入值扫 manifest + 构造 canUseTool，与当前线程
+        // AutoMemPaths ThreadLocal 完全无关。本测试线程<b>不设</b> AutoMemPaths projectRoot
+        // ThreadLocal（若回落到 config-home 且该目录含不可预期文件/无文件都会 manifest 扫描或
+        // canUseTool 路径异常 —— 直接 NPE/断言失败），显式目录下 fork 正常发起即证明参数生效。
+        MemoryStorage storage = new MemoryStorage(tempDir); // tempDir 冻结仅作 storage 载体，实际用显式 dir
+        ExtractMemoriesAgent agent = new ExtractMemoriesAgent(storage);
+        RecordingQuery query = new RecordingQuery();
+        agent.setForkedQuery(query);
+        agent.setExtractionGate(() -> true);
+        agent.setAutoMemoryEnabled(() -> true);
+        Path explicitMem = tempDir.resolve("explicit-mem-extract");
+
+        agent.executeExtractMemories(List.of(userMsg("m1", "a")), null, null, null, null,
+            explicitMem.toString() + java.io.File.separator);
+        agent.drainPendingExtraction(5000);
+
+        // fork 参数构造成功 = runExtraction 用显式 memoryDir 完成 manifest 扫描 + canUseTool 构造
+        // （无 ThreadLocal 回落 config-home 导致的目录错乱）。canUseTool 非 null = 受限写面已建。
+        ForkedAgentParams p = agent.lastForkParams();
+        assertThat(p).as("fork 参数应已构造（显式 memoryDir 下 manifest 扫描 + canUseTool 成功）").isNotNull();
+        assertThat(p.canUseTool()).as("canUseTool 受限写面基于显式 memoryDir 构造成功").isNotNull();
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // helpers
     // ════════════════════════════════════════════════════════════════════
