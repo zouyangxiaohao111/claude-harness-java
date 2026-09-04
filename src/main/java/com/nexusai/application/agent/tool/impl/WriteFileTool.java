@@ -202,7 +202,8 @@ public class WriteFileTool implements Tool {
         if (input != null) {
             String relPath = input.path("file_path").asText("");
             if (!relPath.isBlank()) {
-                try {
+                // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开），原 try-catch 逃逸跳过删除
+                {
                     Path file = guard.resolve(relPath);
                     String absolute = file.toAbsolutePath().normalize().toString();
                     // IMP-M-P2-2: agent-memory 写 carve-out（对齐 CC filesystem.ts:1554-1562
@@ -233,11 +234,6 @@ public class WriteFileTool implements Tool {
                             new com.nexusai.application.agent.permission.PermissionDecisionReason.Other(
                                 "auto memory files are allowed for writing"),
                             null, false, null, java.util.List.of());
-                    }
-                } catch (SecurityException se) {
-                    // 路径逃逸由 execute/validateInput 拒绝，此处不参与
-                    if (log.isDebugEnabled()) {
-                        log.debug("WriteFileTool: carve-out 路径逃逸跳过: {}", relPath);
                     }
                 }
             }
@@ -552,11 +548,8 @@ public class WriteFileTool implements Tool {
         }
 
         Path file;
-        try {
-            file = guard.resolve(relPath);
-        } catch (SecurityException se) {
-            return Tool.ValidationResult.pass();
-        }
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），越狱 defer 逻辑删除
+        file = guard.resolve(relPath);
         // UNC 路径提前 pass (CC :182-184).
         String fullFilePathStr = file.toString();
         if (fullFilePathStr.startsWith("\\\\") || fullFilePathStr.startsWith("//")) {
@@ -701,12 +694,8 @@ public class WriteFileTool implements Tool {
         }
 
         Path file;
-        try {
-            file = guard.resolve(relPath);
-        } catch (SecurityException se) {
-            log.warn("WriteFileTool: blocked path escape: {}", relPath);
-            return ToolResult.error(call.id(), se.getMessage());
-        }
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），逃逸拒绝删除
+        file = guard.resolve(relPath);
 
         // P1-2: 动态技能发现 + 条件技能激活 · 对齐 CC FileWriteTool.ts:232-245
         //   （在 call() 开头、写文件前触发；fire-and-forget 不阻塞工具调用链）

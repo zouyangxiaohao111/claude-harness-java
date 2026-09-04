@@ -2,7 +2,7 @@ package com.nexusai.application.agent.permission.classifier;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.nexusai.application.agent.skill.BundledSkillFileExtractor;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolRegistry;
@@ -766,7 +766,7 @@ public class YoloClassifierImpl implements YoloClassifier {
      */
     private String dumpClassifierErrorPrompts(String systemPrompt, String userMessage, Throwable e, ToolUseContext ctx) {
         try {
-            String tempRoot = BundledSkillFileExtractor.getClaudeTempDir();
+            String tempRoot = NexusaiPaths.getAppTempDir();
             Path dumpDir = Path.of(tempRoot, "auto-mode-classifier-errors");
             Files.createDirectories(dumpDir);
             // [session-id-short] ctx.sessionId() 已 String，恒等直传

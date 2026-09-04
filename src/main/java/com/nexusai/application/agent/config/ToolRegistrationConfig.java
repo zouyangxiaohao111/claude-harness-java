@@ -657,12 +657,20 @@ public class ToolRegistrationConfig {
             // [prompt-align UP-01] 提示词对齐门控实时读源 · 同文件 :2389 @Bean（batch0），
             //   子代理 drain pending 消息 coordinator 包裹门（对齐 CC attachments.ts:1085-1102）。
             //   Spring 必注入非 null（@Bean）；直构测试传 null → setter 回落 coordinatorMode.isCoordinatorMode()。
-            com.nexusai.application.agent.prompt.PromptAlignSettingsResolver promptAlignSettingsResolver) {
+            com.nexusai.application.agent.prompt.PromptAlignSettingsResolver promptAlignSettingsResolver,
+            // [A5-2] 子 Agent 预算求和分派 mapper（isAnthropic 原料 · deepseek input 已含 cache hit）·
+            //   @Autowired(required=false)：测试直构传 null → SubagentExecutor 回落 anthropic 语义
+            //   （既有 4 项和，无行为变化）。
+            @Autowired(required = false) com.nexusai.repository.provider.mapper.ModelMapper modelMapper,
+            @Autowired(required = false) com.nexusai.repository.provider.mapper.ProviderMapper providerMapper) {
         // 懒代理直接作为 subagentToolRegistry — 执行期 all() 返回已填充工具集
         SubagentExecutor executor = new SubagentExecutor(
                 toolRegistry, hookRegistry, null,
                 llmProviderFactory, null,
                 "gpt-4", AgentToolSection.get());
+        // [A5-2] 协议分派 mapper 注入（null 安全，SubagentExecutor 内回落 anthropic 语义）
+        executor.setModelMapper(modelMapper);
+        executor.setProviderMapper(providerMapper);
         if (log.isDebugEnabled()) {
             log.debug("subagentExecutor fallbackSystemPrompt ← AgentToolSection.get() (非 fork 变体, "
                     + "CC prompts.ts:319; 仅 agent 自身 prompt 空白时兜底, fork path 由 forkParentSystemPrompt 覆盖)");
@@ -830,6 +838,9 @@ public class ToolRegistrationConfig {
     @Bean
     public TokenCounter tokenCounter(TokenEstimator tokenEstimator) {
         log.info("L4-A: 注册 TokenCounter bean → 委托 TokenEstimator.tokenCountWithEstimation（AutoCompactor 阈值走真实估算）");
+        // [A5-2 登记] 保持 1 参（anthropic 4 项和）——TokenCounter 接口无 model 通道（wiring 时无
+        //   effectiveModel），deepseek（input 已含 cache hit）下 auto-compact 阈值 over-count 已知，
+        //   待 model 通道接入（TokenCounter.count 加 model 形参）后按 isAnthropic 分派。
         return messages -> tokenEstimator.tokenCountWithEstimation(messages);
     }
 
@@ -853,7 +864,12 @@ public class ToolRegistrationConfig {
             StreamCompactSummary streamCompactSummary,
             @Autowired(required = false) com.nexusai.application.agent.compact.CompactThresholdSystem compactThresholdSystem,
             @Autowired(required = false) com.nexusai.application.agent.memory.SessionMemoryService sessionMemoryService,
-            com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
+            com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
+            // [A5-2] 求和 provider 分派 mapper（isAnthropic 原料 · deepseek input 已含 cache hit）·
+            //   @Autowired(required=false)：测试直构传 null → CompactConversation.resolveAnthropic
+            //   回落 anthropic 语义（既有 4 项和，无行为变化）。
+            @Autowired(required = false) com.nexusai.repository.provider.mapper.ModelMapper modelMapper,
+            @Autowired(required = false) com.nexusai.repository.provider.mapper.ProviderMapper providerMapper) {
         AutoCompactor autoCompactor = new AutoCompactor(tokenCounter, streamCompactSummary);
         if (compactThresholdSystem != null) {
             autoCompactor.setThresholdSystem(compactThresholdSystem);
@@ -865,6 +881,9 @@ public class ToolRegistrationConfig {
         //   settings.max_ptl_retries 实时读，null 回落常量；auto/reactive/manual 全路径共用
         //   同一全局槽位 → settings 单例注入一次覆盖所有调用方）
         com.nexusai.application.agent.compact.CompactConversation.setSettingsResolver(settingsResolver);
+        // [A5-2] compactConversation 协议分派 mapper 静态槽位接线（auto/reactive/manual/partial
+        //   全路径共用同一全局槽位；null → resolveAnthropic 回落 anthropic 语义）
+        com.nexusai.application.agent.compact.CompactConversation.setMappers(modelMapper, providerMapper);
         // IMP-M-P0-3: SM 优先路径生产注入（autoCompact.ts:287-310 trySessionMemoryCompaction）
         if (sessionMemoryService != null) {
             autoCompactor.setSessionMemoryService(sessionMemoryService);
@@ -1417,8 +1436,15 @@ public class ToolRegistrationConfig {
      * （sessionMemory.ts:318-325/:420-433，无 null 守卫）—— 下方代码体与 ExtractMemoriesAgent/
      * AutoDreamConsolidator（IMP-M-P0-3 模式）同源注入，闭环 X3/X4。
      *
-     * <p>baseDir 用 projectDir（session-memory 落 {@code {projectDir}/{sessionId}/session-memory/summary.md}，
-     * 对齐 CC filesystem.ts:261-271 getSessionMemoryPath）。
+     * <p><b>[sm-reloc 2026-09-02]</b> SM 摘要落点 = per-session
+     * {@code {configHome}/projects/{slug}/{sessionId}/session-memory/summary.md}（对齐 CC
+     * filesystem.ts:261-271 getSessionMemoryPath，与 transcript 同根分层）—— 生产 2-arg 构造
+     * {@code (fallbackBaseDir, SessionStorage::sessionProjectDir)}：resolver 按 sessionId 查
+     * SessionCwdHolder/SessionProjectRoot 全局 map 派生 slug（绑定项目也不写进用户项目真实目录），
+     * fallbackBaseDir = {@link NexusaiPaths#getAppConfigHomeDir()} 仅作 legacy 回落（resolver 非空
+     * → 构造器不 eager mkdir，per-session 目录惰性建）。绝不用
+     * {@code AutoMemPaths.currentSessionProjectRoot()}（ThreadLocal，PostSamplingHook/压缩线程上
+     * unset → 不可靠 + 构造期冻结污染）。
      */
     @Bean
     public com.nexusai.application.agent.memory.SessionMemoryService sessionMemoryService(
@@ -1440,11 +1466,16 @@ public class ToolRegistrationConfig {
             @org.springframework.lang.Nullable com.nexusai.application.agent.tool.impl.ReadFileTool readFileTool,
             // [V52 B1-6] 压缩配置 DB 实时读源（settings.sm_session_memory_enabled / sm_compact_enabled）
             com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
-        // ODF-A1: SM 会话根 = 会话 projectRoot（per-session · 绝不读 JVM 进程工作目录）
-        java.nio.file.Path baseDir = java.nio.file.Paths.get(
-            com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
+        // [sm-reloc] SM 摘要落点对齐 CC：per-session {configHome}/projects/{slug}/{sessionId}/session-memory/summary.md
+        //   fallbackBaseDir = config home（resolver 非空 → 构造器不 eager mkdir，仅 legacy 回落用）；
+        //   resolver = SessionStorage::sessionProjectDir（按 sessionId 查 SessionCwdHolder/SessionProjectRoot
+        //   全局 map —— hook/压缩线程可靠，绝不读 ThreadLocal AutoMemPaths.currentSessionProjectRoot）。
+        java.nio.file.Path fallbackBaseDir = java.nio.file.Paths.get(
+            com.nexusai.application.agent.skill.NexusaiPaths.getAppConfigHomeDir());
         com.nexusai.application.agent.memory.SessionMemoryService svc =
-            new com.nexusai.application.agent.memory.SessionMemoryService(baseDir);
+            new com.nexusai.application.agent.memory.SessionMemoryService(
+                fallbackBaseDir,
+                com.nexusai.application.agent.tool.SessionStorage::sessionProjectDir);
         // P1-3: 提取管线生产 fork seam 注入（runForkedAgent querySource='session_memory'）
         // [SM-06] 门控双源统一（DRIFT-8）· CC 提取与压缩读同一 tengu_session_memory flag
         //   （sessionMemory.ts:80-82 与 sessionMemoryCompact.ts:412-420 两处独立读取，恒同源）——
@@ -1522,8 +1553,9 @@ public class ToolRegistrationConfig {
             }
         });
         log.info("IMP-M-P0-3/P1-3/C-1/FIX-SM: 注册 SessionMemoryService → AutoCompactor /compact 注入 "
-            + "(baseDir={}, forkSeam={}, smExtractionGate={}, telemetry={}, autoCompactGate=注入)",
-            baseDir, productionForkedQuery != null,
+            + "(fallbackBaseDir={}, resolver=sessionProjectDir, forkSeam={}, smExtractionGate={}, "
+            + "telemetry={}, autoCompactGate=注入)",
+            fallbackBaseDir, productionForkedQuery != null,
             isEnvTruthy(System.getenv("NEXUSAI_SESSION_MEMORY")), telemetry != null);
         return svc;
     }

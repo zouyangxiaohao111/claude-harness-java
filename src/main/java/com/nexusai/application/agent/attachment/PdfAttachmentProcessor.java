@@ -38,7 +38,7 @@ import java.util.UUID;
  * <p><b>分页决策 + 三态解析</b>（对齐 CC FileReadTool.ts:894-1017 + pdf.ts:179-300）：
  * <ol>
  *   <li>分页：{@link PdfSupport#getPDFPageCount} → 页数 &gt; {@link PdfSupport#PDF_MAX_PAGES_PER_READ}(20)
- *       → {@link Resolution#NEEDS_SUBAGENT}（R2 subagent 解析标记）；页数 null（无法确定）→ 继续三态
+ *       → {@link Resolution#NEEDS_SUBAGENT}（&gt;20 页自主引导标记，注入 pdf_reference 式文本）；页数 null（无法确定）→ 继续三态
  *       （CC :949-955 {@code pageCount !== null && pageCount > threshold} 等价）</li>
  *   <li>≤3MB（{@link PdfSupport#PDF_EXTRACT_SIZE_THRESHOLD}）→ document block（CC :1001-1015）</li>
  *   <li>&gt;3MB ≤100MB → {@link PdfSupport#extractPDFPages} 逐页 JPEG → image blocks
@@ -48,7 +48,9 @@ import java.util.UUID;
  *
  * <p><b>注入模式</b>：{@link #registerPdfAttachments} 解析附件 → 存 {@code pendingPdfs}（按会话），
  * 主 user 消息构造（LlmAgentLoop {@code buildUserMessageWithImages} → {@link #drainPendingPdfs}）消费：
- * NEEDS_SUBAGENT → 注入文本说明（R2 后续处理），不注入媒体块。
+ * NEEDS_SUBAGENT → PendingPdf 携 pdfPath，LlmAgentLoop 注入按主模型能力分流的 pdf_reference 式引导
+ * 文本（U2 自主引导：多模态主模型自行 Read + pages 分段 / 文本主模型调 Agent 派多模态子代理，系统
+ * <b>不自动 fork</b>），不注入媒体块。
  *
  * <p><b>并发</b>：pending 表 {code synchronized(lock)} 复合操作（同 {@link ImageAttachmentStore} 模式）。
  * <b>失败语义</b>：resolve 失败不抛出 → {@code ERROR}（fail loud，调用方 warn 跳过该附件，不中断整个请求）。
@@ -61,7 +63,7 @@ public final class PdfAttachmentProcessor {
     /** 无会话兜底桶名 · 同 {@link ImageAttachmentStore} / {@link PdfAttachmentStore}。 */
     private static final String UNKNOWN_SESSION = "unknown";
 
-    /** 解析结果分派：INJECT=直接注入 blocks；NEEDS_SUBAGENT=&gt;20 页需 subagent（R2）；ERROR=解析失败跳过。 */
+    /** 解析结果分派：INJECT=直接注入 blocks；NEEDS_SUBAGENT=&gt;20 页自主引导（主模型 Read pages / Agent 派多模态子代理）；ERROR=解析失败跳过。 */
     public enum Resolution { INJECT, NEEDS_SUBAGENT, ERROR }
 
     /**
@@ -73,29 +75,38 @@ public final class PdfAttachmentProcessor {
      * @param error            ERROR 时的错误（CC PDFError 等价）
      * @param visionContentIds [pdf-vision-align] 文本模型 PDF 页图注册的 ImageAttachmentStore contentId
      *                         列表（多模态路径 = 空列表；文本模型路径非空，供 LlmAgentLoop 拼 vision_analyze 说明）
+     * @param pdfPath          [pdf-自主引导] resolvePdfBlocks 已解析出的 PDF 磁盘绝对路径（NEEDS_SUBAGENT /
+     *                         INJECT 时非空；供 LlmAgentLoop 注入引导文本引用，模型据此 Read / Agent 派子代理）
      */
     public record PdfBlocksResult(
             Resolution resolution,
             List<ContentBlockParam> blocks,
             Integer pageCount,
             PdfSupport.PdfError error,
-            List<Long> visionContentIds) {
+            List<Long> visionContentIds,
+            String pdfPath) {
 
         public static PdfBlocksResult inject(List<ContentBlockParam> blocks, Integer pageCount) {
-            return new PdfBlocksResult(Resolution.INJECT, blocks, pageCount, null, List.of());
+            return inject(blocks, pageCount, null);
         }
 
-        public static PdfBlocksResult needsSubagent(Integer pageCount) {
-            return new PdfBlocksResult(Resolution.NEEDS_SUBAGENT, List.of(), pageCount, null, List.of());
+        /** [pdf-自主引导] INJECT 结果可携 pdfPath（供后续 Read pages 兜底 / 调试）。 */
+        public static PdfBlocksResult inject(List<ContentBlockParam> blocks, Integer pageCount, String pdfPath) {
+            return new PdfBlocksResult(Resolution.INJECT, blocks, pageCount, null, List.of(), pdfPath);
+        }
+
+        /** [pdf-自主引导] &gt;20 页 NEEDS_SUBAGENT · pdfPath 保留 resolvePdfBlocks 已解析的磁盘路径（供 LlmAgentLoop 注入引导文本引用）。 */
+        public static PdfBlocksResult needsSubagent(String pdfPath, Integer pageCount) {
+            return new PdfBlocksResult(Resolution.NEEDS_SUBAGENT, List.of(), pageCount, null, List.of(), pdfPath);
         }
 
         public static PdfBlocksResult failure(PdfSupport.PdfError error, Integer pageCount) {
-            return new PdfBlocksResult(Resolution.ERROR, List.of(), pageCount, error, List.of());
+            return new PdfBlocksResult(Resolution.ERROR, List.of(), pageCount, error, List.of(), null);
         }
 
         /** [pdf-vision-align] 文本模型 PDF 页图注册成功（resolution=INJECT，无 document/image block，仅 contentId 列表）。 */
         public static PdfBlocksResult injectVision(List<Long> contentIds, Integer pageCount) {
-            return new PdfBlocksResult(Resolution.INJECT, List.of(), pageCount, null, contentIds);
+            return new PdfBlocksResult(Resolution.INJECT, List.of(), pageCount, null, contentIds, null);
         }
     }
 
@@ -104,12 +115,14 @@ public final class PdfAttachmentProcessor {
      *
      * @param filename         客户端原始文件名（可 null）
      * @param blocks           待注入 content blocks（needsSubagent=false 时非空）
-     * @param needsSubagent    true = &gt;20 页，需 subagent 解析（R2），本次不注入媒体块
+     * @param needsSubagent    true = &gt;20 页，自主引导标记（主模型 Read pages / Agent 派多模态子代理），本次不注入媒体块
      * @param pageCount        页数（可 null）
      * @param visionContentIds [pdf-vision-align] 文本模型 PDF 页图注册 contentId 列表（多模态路径 = 空列表）
+     * @param pdfPath          [pdf-自主引导] PDF 磁盘绝对路径（resolvePdfBlocks 解析产物；needsSubagent=true
+     *                         时非空，供 LlmAgentLoop 注入引导文本引用，模型据此 Read / Agent 派子代理）
      */
     public record PendingPdf(String filename, List<ContentBlockParam> blocks, boolean needsSubagent,
-                             Integer pageCount, List<Long> visionContentIds) {}
+                             Integer pageCount, List<Long> visionContentIds, String pdfPath) {}
 
     /** 会话 → 待注入 PDF 列表（drain 消费并清除，只注入一次，对齐 CC prompt submit 一次性构建）。 */
     private final Map<String, List<PendingPdf>> pendingPdfs = new HashMap<>();
@@ -229,10 +242,12 @@ public final class PdfAttachmentProcessor {
         Integer pageCount = PdfSupport.getPDFPageCount(filePath);
         if (pageCount != null && pageCount > PdfSupport.PDF_MAX_PAGES_PER_READ) {
             if (log.isDebugEnabled()) {
-                log.debug("[U2 分页决策] PDF 页数 {} 超出单次直接读取上限 {} → NEEDS_SUBAGENT（R2 subagent 分页解析）path={}",
+                log.debug("[U2 分页决策] PDF 页数 {} 超出单次直接读取上限 {} → NEEDS_SUBAGENT（自主引导，主模型 Read pages / Agent 派多模态子代理）path={}",
                     pageCount, PdfSupport.PDF_MAX_PAGES_PER_READ, filePath);
             }
-            return PdfBlocksResult.needsSubagent(pageCount);
+            // [pdf-自主引导] pdfPath 保留进结果对象 → PendingPdf → LlmAgentLoop 注入引导文本引用
+            //   （模型自行 Read 原 PDF + pages 分段 / Agent 派多模态子代理，系统不自动 fork）
+            return PdfBlocksResult.needsSubagent(filePath.toString(), pageCount);
         }
         if (log.isDebugEnabled()) {
             log.debug("[U2 分页决策] PDF 页数 {} ≤ {} → 直接注入（document/image block / 文本模型页图注册）path={}",
@@ -254,22 +269,17 @@ public final class PdfAttachmentProcessor {
                         PdfSupport.getMaxExtractSize()) + ")."), pageCount);
         }
 
-        // ── [pdf-vision-align] 文本模型分支 · 恒转页图注册（≤100MB 任意大小；document block 文本模型发不出去）──
+        // ── [vision-cc-align 2026-09-03] 文本模型分支 · 不再逐页预注册页图（懒渲染省成本）：引导
+        //    vision_analyze(contentType=pdf, path=pdfPath, pages=[...])，调用时内部才渲染指定页。
+        //    document block 文本模型发不出去（deepseek 400 根因防线），故不发任何媒体块，仅透出
+        //    pdfPath + pageCount 供 LlmAgentLoop 拼引导（PDF 附件经附件表注册零拷贝落盘，filePath 即
+        //    磁盘绝对路径，vision_analyze resolvePath 直读）。
         if (textModel && imageStore != null) {
-            PdfSupport.PdfExtractResult extract = PdfSupport.extractPDFPages(
-                filePath, cacheBaseDir(sessionId).resolve("pages-" + UUID.randomUUID()), null, null);
-            if (!extract.success()) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[U2 三态][pdf-vision-align] extractPDFPages 失败（文本模型页图注册）path={} reason={} message={}",
-                        filePath, extract.error().reason(), extract.error().message());
-                }
-                return PdfBlocksResult.failure(extract.error(), pageCount);
-            }
             if (log.isInfoEnabled()) {
-                log.info("[U2 三态][pdf-vision-align] PDF 文本模型 → 恒转页图注册 path={} pages={} size={}B",
+                log.info("[U2 三态][vision-cc-align] PDF 文本模型 → 不预注册页图，引导 vision_analyze(contentType=pdf) path={} pages={} size={}B",
                     filePath, pageCount, size);
             }
-            return registerPageImagesToStore(extract.data(), sessionId, imageStore, pageCount);
+            return PdfBlocksResult.inject(List.of(), pageCount, filePath.toString());
         }
 
         // ── 三态解析 · ≤3MB → document block；>3MB → extractPDFPages 逐页 image block ──
@@ -379,7 +389,8 @@ public final class PdfAttachmentProcessor {
      *
      * <p>对齐 {@code registerRunPromptImages}（F1）模式：doRun 入口调用（先于首个 user 消息构造），
      * 主 user 消息构造 {@code buildUserMessageWithImages} → {@link #drainPendingPdfs} 消费。
-     * NEEDS_SUBAGENT（&gt;20 页）同样登记（PendingPdf.needsSubagent=true），注入侧转文本说明（R2 后续）。
+     * NEEDS_SUBAGENT（&gt;20 页）同样登记（PendingPdf.needsSubagent=true + pdfPath），注入侧由
+     * LlmAgentLoop 注入按主模型能力分流的 pdf_reference 式引导文本（U2 自主引导，系统不自动 fork）。
      *
      * @param sessionId  会话 id（路径通道 PdfAttachmentStore 解析用）
      * @param sessionKey 待注入 PDF 会话键（pending 表分桶 · 同 {@code imageSessionKey}）
@@ -425,10 +436,13 @@ public final class PdfAttachmentProcessor {
                 textModel, imageStore);
             if (result.resolution() == Resolution.INJECT) {
                 pending.add(new PendingPdf(att.filename(), result.blocks(), false, result.pageCount(),
-                    result.visionContentIds()));
+                    result.visionContentIds(), result.pdfPath()));
                 registered++;
             } else if (result.resolution() == Resolution.NEEDS_SUBAGENT) {
-                pending.add(new PendingPdf(att.filename(), List.of(), true, result.pageCount(), List.of()));
+                // [pdf-自主引导] PendingPdf 保留 pdfPath：LlmAgentLoop buildUserMessageWithImages 消费时
+                //   注入按主模型能力分流的引导文本（模型自行 Read pages / Agent 派多模态子代理，系统不自动 fork）
+                pending.add(new PendingPdf(att.filename(), List.of(), true, result.pageCount(), List.of(),
+                    result.pdfPath()));
                 registered++;
             } else {
                 log.warn("[U2] PDF 附件解析失败跳过: contentId={} filename={} reason={} message={}",
@@ -580,58 +594,6 @@ public final class PdfAttachmentProcessor {
             return List.of();
         }
         return blocks;
-    }
-
-    /**
-     * [pdf-vision-align] 把 extractPDFPages 产出页图逐页注册到 {@link ImageAttachmentStore} → contentId 列表。
-     *
-     * <p><b>逐页读-注册-释放</b>（不批量驻留全部页 base64）：Files.list try-with-resources 关闭目录流，
-     * 过滤 .jpg 排序 → 逐页 Files.readAllBytes → {@code imageStore.store(sessionId, base64, "image/jpeg")}
-     * 收集 {@link ImageAttachmentStore.StoredImage#id()}。contentIds 空（无 jpg 产出 / 全部注册失败）
-     * → CORRUPTED error（fail loud，不发空 contentId 给模型）；否则 INJECT 携带 visionContentIds
-     * （供 LlmAgentLoop 文本模型分支拼 vision_analyze 说明）。
-     *
-     * @param data      extractPDFPages 成功载荷（outputDir / filePath / count）
-     * @param sessionId 会话 id（ImageAttachmentStore 按会话分桶）
-     * @param imageStore 图片附件缓存（须非 null）
-     * @param pageCount 页数（透传，可 null）
-     * @return INJECT（visionContentIds）/ ERROR（CORRUPTED）
-     */
-    private PdfBlocksResult registerPageImagesToStore(PdfSupport.PdfExtractData data, String sessionId,
-                                                      ImageAttachmentStore imageStore, Integer pageCount) {
-        List<Long> contentIds = new ArrayList<>();
-        Path outputDir = Path.of(data.outputDir());
-        if (Files.isDirectory(outputDir)) {
-            try (var stream = Files.list(outputDir)) {
-                List<Path> jpegs = stream
-                    .filter(p -> p.getFileName().toString().endsWith(".jpg"))
-                    .sorted()
-                    .toList();
-                for (Path img : jpegs) {
-                    byte[] bytes = Files.readAllBytes(img);
-                    ImageAttachmentStore.StoredImage stored =
-                        imageStore.store(sessionId, Base64.getEncoder().encodeToString(bytes), "image/jpeg");
-                    if (stored != null) {
-                        contentIds.add(stored.id());
-                    }
-                }
-            } catch (Exception e) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[U2][pdf-vision-align] PDF 页图注册失败 outputDir={} cause={}", outputDir, e.toString());
-                }
-                return PdfBlocksResult.failure(new PdfSupport.PdfError(PdfSupport.ErrorReason.CORRUPTED,
-                    "PDF 页图注册失败: " + (e.getMessage() == null ? e.toString() : e.getMessage())), pageCount);
-            }
-        }
-        if (contentIds.isEmpty()) {
-            return PdfBlocksResult.failure(new PdfSupport.PdfError(PdfSupport.ErrorReason.CORRUPTED,
-                "PDF 页图注册为空（渲染失败）"), pageCount);
-        }
-        if (log.isInfoEnabled()) {
-            log.info("[U2][pdf-vision-align] PDF 文本模型页图注册完成 path={} 页图={} contentIds={}",
-                data.filePath(), contentIds.size(), contentIds);
-        }
-        return PdfBlocksResult.injectVision(contentIds, pageCount);
     }
 
     // ════════════════════════════════════════════════════════════════════

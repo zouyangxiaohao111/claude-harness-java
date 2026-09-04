@@ -406,9 +406,26 @@ public final class AutoMemPaths {
      * }</pre>
      * 用 findCanonicalGitRoot 使同一仓库的所有 worktree 共享一个 auto-memory 目录
      * （anthropics/claude-code#24382）。
+     *
+     * <p>[A1 重做 2026-09-04] 委托 {@link #getAutoMemBase(String)}（显式 projectRoot 解析），
+     * 本方法读注入 supplier（ThreadLocal currentSessionProjectRoot）。异步 fork 线程不读本方法
+     * （无 ThreadLocal），改由调用方在会话线程按显式 projectRoot 调重载后传参。
      */
     public String getAutoMemBase() {
-        String projectRoot = projectRootSupplier.get();
+        return getAutoMemBase(projectRootSupplier.get());
+    }
+
+    /**
+     * 按显式 projectRoot 解析 canonical git 根 · CC original: {@code getAutoMemBase}（paths.ts:203-205）。
+     *
+     * <p>[A1 重做] 新增显式重载 —— 不依赖 supplier/ThreadLocal，调用方持有确切 projectRoot 时
+     * 直接传（LlmAgentLoop 会话线程用 boundProject 解析 → 传 extract/dream fork 消费）。
+     *
+     * @param explicitProjectRoot 会话绑定 projectRoot（boundProject/originalCwd；null → NFC 空回落）
+     * @return canonical git root（可得时），否则 NFC(explicitProjectRoot)
+     */
+    public String getAutoMemBase(String explicitProjectRoot) {
+        String projectRoot = explicitProjectRoot;
         String canonical = findCanonicalGitRoot(projectRoot);
         if (canonical != null) {
             if (log.isDebugEnabled()) {
@@ -424,20 +441,40 @@ public final class AutoMemPaths {
     /**
      * auto-memory 目录路径 · CC original: {@code getAutoMemPath}（paths.ts:223-235）。
      *
-     * <p>解析顺序：
+     * <p>[A1 重做 2026-09-04] 委托 {@link #getAutoMemPath(String)}（显式 projectRoot 解析），
+     * 本方法读注入 supplier（ThreadLocal currentSessionProjectRoot）。<b>异步 fork 线程不读本
+     * 方法</b>（无 ThreadLocal 回落 config-home）—— 改由调用方在会话线程按显式 projectRoot 调
+     * 重载后传参（对齐 CC extractMemories.ts:339 runExtraction 先 getAutoMemPath 再 fork）。
+     *
+     * @return 带唯一尾分隔符的 auto-memory 目录
+     */
+    public String getAutoMemPath() {
+        return getAutoMemPath(projectRootSupplier.get());
+    }
+
+    /**
+     * 按显式 projectRoot 解析 auto-memory 目录 · CC original: {@code getAutoMemPath}（paths.ts:223-235）。
+     *
+     * <p>[A1 重做] 新增显式重载 —— 不依赖 supplier/ThreadLocal，调用方持有确切 projectRoot 时
+     * 直接传（LlmAgentLoop 会话线程用 boundProject 解析 → 传 extract/dream fork 消费）。这也对齐
+     * CC 真实形态：CC 每次 runExtraction/runAutoDream 在会话上下文开头 getAutoMemPath() 算一次，
+     * 目录是"算好传进 fork"而非 fork 内现算。
+     *
+     * <p>解析顺序（paths.ts:223-235）：
      * <ol>
      *   <li>CLAUDE_COWORK_MEMORY_PATH_OVERRIDE（全路径 override，Cowork 用）</li>
      *   <li>settings.json autoMemoryDirectory（可信源 policy/local/user，排除 projectSettings）</li>
-     *   <li>{@code <memoryBase>/projects/<sanitizePath(getAutoMemBase())>/memory/}（per-project 默认）</li>
+     *   <li>{@code <memoryBase>/projects/<sanitizePath(getAutoMemBase(explicitRoot))>/memory/}（per-project 默认）</li>
      * </ol>
      *
      * <p>memoize（CC :216-234 注释）：render-path 调用方（collapseReadSearchGroups → isAutoManagedMemoryFile）
      * 每条 tool-use 消息触发多次；keyed on projectRoot 使测试 mock 变更时重算，env/settings 会话稳定。
      *
+     * @param explicitProjectRoot 会话绑定 projectRoot（boundProject/originalCwd；null → 按空解析）
      * @return 带唯一尾分隔符的 auto-memory 目录
      */
-    public String getAutoMemPath() {
-        String projectRoot = projectRootSupplier.get();
+    public String getAutoMemPath(String explicitProjectRoot) {
+        String projectRoot = explicitProjectRoot;
         // OPD-R2-12：按 projectRoot 独立槽（CC lodash memoize paths.ts:223-235）——
         // 旧单槽 volatile 双字段 value→key 写序存在跨会话错配竞态（EV-036，medium）。
         // projectRoot 为 null（异常注入）→ 不缓存直接计算。
@@ -460,7 +497,7 @@ public final class AutoMemPaths {
         String projectsDir = Paths.get(getMemoryBaseDir(), "projects").toString();
         // OPD-R2-06：CC paths.ts:232 (...+sep).normalize('NFC')
         String path = ClaudePaths.normalizeNfc(
-            Paths.get(projectsDir, sanitizePath(getAutoMemBase()), AUTO_MEM_DIRNAME).toString() + SEP);
+            Paths.get(projectsDir, sanitizePath(getAutoMemBase(projectRoot)), AUTO_MEM_DIRNAME).toString() + SEP);
         if (log.isDebugEnabled()) {
             log.debug("[AutoMemPaths] getAutoMemPath 计算 per-project 路径: {}", path);
         }

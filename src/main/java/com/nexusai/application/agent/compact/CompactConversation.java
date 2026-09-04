@@ -8,6 +8,8 @@ import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -124,6 +126,53 @@ public final class CompactConversation {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // [A5-2] 协议分派 mapper 静态槽位（求和 provider 分派 · deepseek 双计修复）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 模型/provider mapper 静态槽位 · [A5-2 求和 provider 分派] 协议判定（isAnthropic）原料。
+     *
+     * <p>同 {@link #settingsResolver} 先例：compactConversation 为静态单函数无法实例注入，
+     * 以 volatile 静态槽位承接，由 {@link com.nexusai.application.agent.config.ToolRegistrationConfig}
+     * autoCompactor bean 启动期注入一次（auto/reactive/manual/partial 全路径共用同一全局槽位）。
+     * 未注入 → {@link #resolveAnthropic} 回落 anthropic 语义（既有 4 项和，向后兼容测试）。
+     */
+    private static volatile ModelMapper modelMapper;
+    private static volatile ProviderMapper providerMapper;
+
+    /**
+     * 注入协议分派 mapper（幂等）· null 注入 = 复位（回落 anthropic 语义）。
+     *
+     * @param mm  模型 mapper（null → 回落）
+     * @param pm  提供商 mapper（null → 回落）
+     */
+    public static void setMappers(ModelMapper mm, ProviderMapper pm) {
+        modelMapper = mm;
+        providerMapper = pm;
+        if (log.isDebugEnabled()) {
+            log.debug("[CompactConversation] setMappers: 注入 modelMapper={} providerMapper={}（A5-2 求和分派）",
+                mm != null, pm != null);
+        }
+    }
+
+    /**
+     * 压缩路径协议判定 · [A5-2] 由模型名解析 isAnthropic（经静态 mapper 槽位）。
+     *
+     * <p>回落语义：mapper 或模型不可得 → <b>true（anthropic 语义，既有 4 项和）</b>——
+     * 与 1 参方法默认一致，避免未接线（测试/手动直构）改变既有行为；生产（mappers 注入 +
+     * ctx.model 已设）→ 真实分派（deepseek 走 input+output）。
+     *
+     * @param model 生效模型名（ctx.getModel()；null/blank → 回落 anthropic）
+     * @return true=Anthropic 4 项和；false=OpenAI/DeepSeek 仅 input+output
+     */
+    static boolean resolveAnthropic(String model) {
+        if (modelMapper == null || providerMapper == null || model == null || model.isBlank()) {
+            return true; // mapper/模型不可得 → 保持 anthropic 语义（既有 4 项和，向后兼容）
+        }
+        return ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, model);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // 嵌套类型
     // ════════════════════════════════════════════════════════════════════
 
@@ -162,9 +211,23 @@ public final class CompactConversation {
      * input/cache_read/cache_creation/output 四元组。
      */
     public record TokenUsage(int inputTokens, int outputTokens, int cacheReadInputTokens, int cacheCreationInputTokens) {
-        /** 对齐 CC getTokenCountFromUsage（tokens.ts:29-37）：input + cache_creation + cache_read + output */
+        /** 对齐 CC getTokenCountFromUsage（tokens.ts:29-37）：input + cache_creation + cache_read + output（anthropic 语义，A5-2 默认） */
         public int total() {
-            return inputTokens + outputTokens + cacheReadInputTokens + cacheCreationInputTokens;
+            return total(true);
+        }
+
+        /**
+         * 协议分派 total · [A5-2] anthropic → 4 项和；非 anthropic（deepseek input 已含 cache hit）→
+         * input+output（展示/预算口径，输入侧不重复计命中）。
+         *
+         * @param anthropic 协议判定：true=4 项和；false=仅 input+output
+         * @return 压缩 API token 总数（≥ 0）
+         */
+        public int total(boolean anthropic) {
+            if (anthropic) {
+                return inputTokens + outputTokens + cacheReadInputTokens + cacheCreationInputTokens;
+            }
+            return inputTokens + outputTokens;
         }
     }
 
@@ -229,7 +292,9 @@ public final class CompactConversation {
             }
 
             // ── 2. preCompactTokenCount（compact.ts:401 tokenCountWithEstimation）──
-            final int preCompactTokenCount = tokenCountWithEstimation(messages);
+            // [A5-2] 求和 provider 分派：deepseek input 已含 cache hit → 按 ctx.model 判 anthropic
+            //   （mapper/模型不可得 → resolveAnthropic 回落 anthropic 语义，既有 4 项和）
+            final int preCompactTokenCount = tokenCountWithEstimation(messages, resolveAnthropic(ctx.getModel()));
 
             // ── 3. hooks_start: pre_compact + SDK 状态（compact.ts:406-412）──
             ctx.getOnCompactProgress().accept(new HooksStart(HookType.PRE_COMPACT));
@@ -413,7 +478,8 @@ public final class CompactConversation {
                 preCompactTokenCount, summaryText.length(), messages.size() - messagesToSummarize.size());
 
             // ── 14. 度量三口径（compact.ts:626-645）──
-            int compactionCallTotalTokens = tokenCountFromLastAPIResponse(summaryResult);
+            // [A5-2] 求和 provider 分派：摘要 API usage 按 ctx.model 判 anthropic（deepseek 仅 input+output）
+            int compactionCallTotalTokens = tokenCountFromLastAPIResponse(summaryResult, resolveAnthropic(ctx.getModel()));
             int truePostCompactTokenCount = roughTokenCountEstimationForMessages(
                 concatLists(
                     List.of(boundaryMarker.toChatMessageDto()),
@@ -772,6 +838,9 @@ public final class CompactConversation {
      * 与 {@link TokenEstimator#tokenCountWithEstimation} 同源（usage-walk + sibling 回溯，
      * tokens.ts:232-252），消除双实现漂移（探查 R2/S-4）。
      *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义；deepseek 调用点请用
+     * {@link #tokenCountWithEstimation(List, boolean)} 传 isAnthropic。
+     *
      * @param messages 消息列表
      * @return 上下文窗口 token 估算（≥ 0）
      */
@@ -780,14 +849,39 @@ public final class CompactConversation {
     }
 
     /**
+     * 当前上下文窗口 token 估算 · 协议分派重载（A5-2 · deepseek 双计修复）。
+     *
+     * @param messages  消息列表
+     * @param anthropic 协议判定：true=4 项和；false=仅 input+output
+     * @return 上下文窗口 token 估算（≥ 0）
+     */
+    public static int tokenCountWithEstimation(List<ChatMessageDto> messages, boolean anthropic) {
+        return Tokens.tokenCountWithEstimation(messages, anthropic);
+    }
+
+    /**
      * 压缩 API 调用总用量 · 对齐 CC {@code tokenCountFromLastAPIResponse}
      * （utils/tokens.ts:55，compact.ts:629-631）：usage 全量（input+cache+output）。
+     *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义；deepseek 调用点请用
+     * {@link #tokenCountFromLastAPIResponse(SummaryResult, boolean)} 传 isAnthropic。
      */
     public static int tokenCountFromLastAPIResponse(SummaryResult summaryResult) {
+        return tokenCountFromLastAPIResponse(summaryResult, true);
+    }
+
+    /**
+     * 压缩 API 调用总用量 · 协议分派重载（A5-2 · deepseek 双计修复）。
+     *
+     * @param summaryResult 摘要生产结果（usage 可为 null）
+     * @param anthropic     协议判定：true=4 项和；false=仅 input+output
+     * @return 压缩 API token 数（无 usage → 0）
+     */
+    public static int tokenCountFromLastAPIResponse(SummaryResult summaryResult, boolean anthropic) {
         if (summaryResult == null || summaryResult.usage() == null) {
             return 0;
         }
-        return summaryResult.usage().total();
+        return summaryResult.usage().total(anthropic);
     }
 
     /** 对齐 CC roughTokenCountEstimation（tokenEstimation.ts:203）：Math.round(len/4)。 */

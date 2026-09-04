@@ -212,6 +212,19 @@ public class SubagentTool implements Tool {
     private com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
 
     /**
+     * [A5-2] 子 Agent 预算求和分派 mapper（isAnthropic 原料 · deepseek input 已含 cache hit，
+     * 4 项和双计 over-count）· {@code @Autowired(required=false)} 字段注入（对齐
+     * featureFlags/skillPreloader 先例，4 个 SubagentExecutor 构造站点统一消费同一实例）。
+     * 未注入（测试/手动直构）→ 透传 null → SubagentExecutor 回落 anthropic 语义（既有 4 项和）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.repository.provider.mapper.ModelMapper modelMapper;
+
+    /** [A5-2] 提供商 mapper · 同 {@link #modelMapper} 注入范式（isAnthropic provider.type 判定）。 */
+    @Autowired(required = false)
+    private com.nexusai.repository.provider.mapper.ProviderMapper providerMapper;
+
+    /**
      * [IMP-PA-FORK-03] 会话 AgentState 注册表 · fork fallback 重建「父完整有效 system prompt」时
      * 读取父 custom/append/model（对齐 CC AgentTool.tsx:499-511
      * {@code toolUseContext.options.{customSystemPrompt,appendSystemPrompt}} + runAgent.ts:131
@@ -669,6 +682,38 @@ public class SubagentTool implements Tool {
      */
     private AgentDefinitionRegistry currentRegistry() {
         return registryFor(sessionCwdFor(null));
+    }
+
+    /**
+     * [B1] 按会话解析 registry · 供 web 结构化端点（GET /api/agents/list）+ 会话写侧校验两用。
+     *
+     * <p><b>跳过 deny 过滤</b>（对齐 CC：用户侧 agent 选择器不过滤）：本方法返回该会话
+     * agent-defs 全量 active winners（{@link AgentDefinitionRegistry#listAgents}），不做权限
+     * deny 过滤 —— 区别于 Agent tool 的 filterDeniedAgents（{@code PermissionBubbleService}）。
+     *
+     * <p>sessionId 非空 → 该会话<b>冻结发现 cwd</b> 的 per-session registry
+     * （{@link #sessionDiscoveryCwdFor}，首访问冻结锚 L3 boundProject = CC 启动目录）；
+     * sessionId 空/null → 当前会话兜底（{@link #currentRegistry()}：MDC 会话 → workspaceDir）。
+     *
+     * @param sessionId 会话 ID（可 null/空白 → 兜底当前会话）
+     * @return 该会话的 Agent 定义注册中心（恒非 null）
+     */
+    public AgentDefinitionRegistry registryForSession(String sessionId) {
+        if (sessionId != null && !sessionId.isBlank()) {
+            AgentDefinitionRegistry reg = registryFor(sessionDiscoveryCwdFor(sessionId));
+            if (log.isDebugEnabled()) {
+                log.debug("[SubagentTool] registryForSession: sessionId={} 命中 per-session registry "
+                        + "agents={}（发现 cwd 冻结，B1 用户侧选择器不过滤 deny）",
+                    sessionId, reg.size());
+            }
+            return reg;
+        }
+        AgentDefinitionRegistry reg = currentRegistry();
+        if (log.isDebugEnabled()) {
+            log.debug("[SubagentTool] registryForSession: sessionId 为空 → 兜底当前会话 registry agents={}（B1）",
+                reg.size());
+        }
+        return reg;
     }
 
     /**
@@ -1699,8 +1744,13 @@ public class SubagentTool implements Tool {
 
         // 可选字段
         addProperty(properties, "subagent_type", "string", "The type of specialized agent to use");
-        addEnumProperty(properties, "model", new String[]{"sonnet", "opus", "haiku"},
-            "Optional model override for this agent");
+        // [pdf-自主引导] model 放开为任意 string：支持多模态档位模型名（settings.multimodalModelName
+        //   解析出的 vision 模型名，如 'gpt-4o'/'claude-sonnet-4-6'）或 sonnet/opus/haiku 档次。
+        //   运行时解析（effectiveProviderConfig / AgentModelResolver.parseUserSpecifiedModel）已支持
+        //   任意模型名，此处仅放开 schema 枚举（原 enum 限制会让主模型无法传多模态档位模型名给子代理）。
+        addProperty(properties, "model", "string",
+            "Optional model override：支持多模态档位模型名（settings.multimodalModelName 解析的 vision 模型）"
+                + "或 sonnet/opus/haiku 档次；不传则按 agent 定义 / 父模型继承解析");
         // CC AgentTool.tsx:122-124 run_in_background 条件 omit:
         //   isBackgroundTasksDisabled || isForkSubagentEnabled() 时省略 (LLM 看不到无效字段)
         addProperty(properties, "run_in_background", "boolean",
@@ -2867,6 +2917,9 @@ public class SubagentTool implements Tool {
         executor.setSkillPreloader(skillPreloader);
         // [ALI-3] telemetry + transcript classifier + deferred modifier 注入 (与主路径对称)
         if (telemetry != null) executor.setTelemetry(telemetry);
+        // [A5-2] 子 Agent 预算求和分派 mapper 注入（null 安全 → SubagentExecutor 回落 anthropic 语义）
+        executor.setModelMapper(modelMapper);
+        executor.setProviderMapper(providerMapper);
         executor.setTranscriptClassifierEnabled(transcriptClassifierEnabled);
         // [IMP-SUB-25 返工 R2 接线归零] handoff 安全分类器注入（4 构造点对称，消灭 L1 惰性；
         //   对齐 R31-03 applySummaryWiring 模式 —— 此前全仓无 setYoloClassifier 调用 → 门 4 恒跳过）
@@ -3179,6 +3232,9 @@ public class SubagentTool implements Tool {
                         // [ALI-3] telemetry + classifier + deferred modifier 注入 (async worker)
                         //   [S3-4 决策 B] setSubagentExecutionContext 已删除 — forkParams 承载父上下文
                         if (telemetry != null) exec.setTelemetry(telemetry);
+                        // [A5-2] 子 Agent 预算求和分派 mapper 注入（null 安全 → 回落 anthropic 语义）
+                        exec.setModelMapper(modelMapper);
+                        exec.setProviderMapper(providerMapper);
                         exec.setTranscriptClassifierEnabled(transcriptClassifierEnabled);
                         // [IMP-SUB-25 返工 R2 接线归零] handoff 安全分类器注入（4 构造点对称）
                         exec.setYoloClassifier(yoloClassifier);
@@ -3316,6 +3372,9 @@ public class SubagentTool implements Tool {
         // [ALI-3] telemetry + classifier + deferred modifier 注入 (降级 sync 路径)
         //   [S3-4 决策 B] setSubagentExecutionContext 已删除 — forkParams 承载父上下文
         if (telemetry != null) executor.setTelemetry(telemetry);
+        // [A5-2] 子 Agent 预算求和分派 mapper 注入（null 安全 → 回落 anthropic 语义）
+        executor.setModelMapper(modelMapper);
+        executor.setProviderMapper(providerMapper);
         executor.setTranscriptClassifierEnabled(transcriptClassifierEnabled);
         // [IMP-SUB-25 返工 R2 接线归零] handoff 安全分类器注入（4 构造点对称，消灭 L1 惰性；
         //   对齐 R31-03 applySummaryWiring 模式 —— 此前全仓无 setYoloClassifier 调用 → 门 4 恒跳过）
@@ -3709,6 +3768,9 @@ public class SubagentTool implements Tool {
                 //   复用原 worktree, 不应触发新建隔离 worktree (CC resumeAgent.ts:82-97/192).
                 exec.setSkillPreloader(skillPreloader);
                 if (telemetry != null) exec.setTelemetry(telemetry);
+                // [A5-2] 子 Agent 预算求和分派 mapper 注入（null 安全 → 回落 anthropic 语义）
+                exec.setModelMapper(modelMapper);
+                exec.setProviderMapper(providerMapper);
                 exec.setTranscriptClassifierEnabled(transcriptClassifierEnabled);
                 // [IMP-SUB-25 返工 R2 接线归零] handoff 安全分类器注入（4 构造点对称）
                 exec.setYoloClassifier(yoloClassifier);

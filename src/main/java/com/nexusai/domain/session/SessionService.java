@@ -5,9 +5,11 @@ import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.hook.SkillImprovementSuggestionStore;
+import com.nexusai.application.agent.subagent.AgentDefinitionRegistry;
 import com.nexusai.application.agent.team.SpawnInProcess;
 import com.nexusai.application.agent.team.TeamHelpers;
 import com.nexusai.application.agent.tool.SessionStorage;
+import com.nexusai.application.agent.tool.impl.SubagentTool;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.model.provider.dto.ModelTag;
@@ -22,6 +24,7 @@ import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
@@ -67,6 +70,21 @@ public class SessionService {
     //   （对齐 CC spawnInProcess.ts:184-188 registerCleanup abort；Java 无进程退出，会话删除即触发点）。
     //   best-effort，required=false。
     @Autowired(required = false) private SpawnInProcess spawnInProcess;
+    // [cache-hit-fix B] 注入 SessionGitStatusRegistry — session 删除时释放该会话 git status 快照
+    //   （对齐 CC 进程随会话结束退出无泄漏；Java 常驻 JVM，会话删除时由外层 evict 防注册表无界增长）。
+    //   best-effort，required=false（null → 跳过，不阻塞删除主流程）。
+    @Autowired(required = false) private com.nexusai.application.agent.prompt.SessionGitStatusRegistry sessionGitStatusRegistry;
+    // [B3] 注入 SubagentTool — mainThreadAgent 写侧校验数据源（registryForSession → findAgent）。
+    //   best-effort，required=false：plain JUnit 无容器 → null → 走原逻辑不校验（fail-open）；
+    //   生产注入 → 未命中 agentType fail-loud 400（对齐 permissionMode isSettable 范式）。
+    //   domain.session → application.agent.tool.impl 单向依赖（与 teamHelpers/spawnInProcess 同向）。
+    //   [REWORK 2026-09-04 循环依赖修复] @Lazy 破环：SubagentTool.setAvailableTools(List<Tool>) 注入
+    //   全量 Tool bean 含 SendMessageTool，而 SendMessageTool @Autowired SessionService → 若此处直接注入
+    //   SubagentTool 即形成 SessionService→SubagentTool→SendMessageTool→SessionService 环，Spring Boot 3.5
+    //   默认禁循环依赖 → APPLICATION FAILED TO START。@Lazy 注入懒代理，首次使用才解析真 bean，环已破。
+    @Autowired(required = false)
+    @Lazy
+    private SubagentTool subagentTool;
 
     public List<SessionDto> list() {
         List<SessionRecord> all = sessionMapper.selectAll();
@@ -100,6 +118,11 @@ public class SessionService {
         s.setModelTag((req.model() != null ? req.model() : ModelTag.DS).name());
         s.setModelName(hasModelName ? req.modelName() : null);
         s.setTitle(hasTitle ? req.title() : req.modelName());
+        // [title-cc-align V66] 显式命名标志 · 对齐 CC initialName → hasExplicitTitle=true
+        //   （initReplBridge.ts:299-311）：创建传真实标题（非占位）→ titleExplicit=1（count3 不覆盖，
+        //   视为显式命名）；占位/默认（"新会话"/=modelName/null）→ 0（count1/count3 可自动生成）。
+        //   判定复用 ChatService.isDefaultTitle（MAJOR-4：package-private → public static 供跨包调用）。
+        s.setTitleExplicit(ChatService.isDefaultTitle(req.title(), req.modelName()) ? 0 : 1);
         s.setTime("现在");
         s.setSessionGroup(SessionGroup.current.name());
         s.setTabId(null);
@@ -121,7 +144,12 @@ public class SessionService {
         SessionRecord s = sessionMapper.selectOneById(id);
         if (s == null) throw new NotFoundException("Session " + id + " not found");
 
-        if (req.title() != null) s.setTitle(req.title());
+        if (req.title() != null) {
+            // [title-cc-align V66] 显式 /rename → titleExplicit=1（永不自动覆盖）· 对齐 CC
+            //   getCurrentSessionTitle（initReplBridge.ts:349-351 hasExplicitTitle → return true）
+            s.setTitle(req.title());
+            s.setTitleExplicit(1);
+        }
         if (req.model() != null) s.setModelTag(req.model().name());
         if (req.modelName() != null) s.setModelName(req.modelName());
         if (req.mainProjectId() != null) s.setMainProjectId(req.mainProjectId());
@@ -141,8 +169,33 @@ public class SessionService {
         // [SP-03] 会话指定主线程 agent（V58 列 main_thread_agent）：PATCH 语义，仅显式传入时更新
         //   （null 不改动）。存 CC agentType 串原样（AgentDefinitionRegistry.findAgent 等价 lookup）；
         //   空串清除 = 回落默认组装链（对齐 permissionMode trim 范式）。
+        // [B3] 写侧校验：trim 后非空 → 必须命中 registry.findAgent（按会话解析 registry，
+        //   registryForSession），否则 fail-loud 400（对齐 permissionMode isSettable 范式）；
+        //   SubagentTool 未接线（plain JUnit）→ log.warn 后走原逻辑不校验（fail-open）。
         if (req.mainThreadAgent() != null) {
-            s.setMainThreadAgent(req.mainThreadAgent().trim());
+            String agentType = req.mainThreadAgent().trim();
+            if (agentType.isEmpty()) {
+                // 空串清除 = 回落默认组装链（对齐 permissionMode trim 范式）
+                s.setMainThreadAgent("");
+                if (log.isDebugEnabled()) {
+                    log.debug("[SessionService] update: session={} mainThreadAgent 清空（回落默认 agent 组装链）", id);
+                }
+            } else if (subagentTool != null) {
+                AgentDefinitionRegistry registry = subagentTool.registryForSession(id);
+                if (registry.findAgent(agentType) == null) {
+                    String available = String.join(", ",
+                        registry.listAgents().stream().map(a -> a.agentType()).toList());
+                    throw new ValidationException(
+                        "agent 类型不存在: " + agentType + "，可用: " + available);
+                }
+                s.setMainThreadAgent(agentType);
+                log.info("[SessionService] update: session={} 设置 mainThreadAgent={}（registry 命中，按会话解析）",
+                    id, agentType);
+            } else {
+                log.warn("[SessionService] update: SubagentTool 未接线，mainThreadAgent={} 跳过校验走原逻辑（fail-open）",
+                    agentType);
+                s.setMainThreadAgent(agentType);
+            }
         }
         s.setUpdatedAt(OffsetDateTime.now().toString());
 
@@ -185,6 +238,11 @@ public class SessionService {
         //   （决策登记 6 A2-4：CC 进程随会话结束退出无泄漏；Java 常驻 JVM，会话删除时由外层移除
         //   该会话 cached-MC 桶，防 SESSION_STATES 内存累积。null/未知会话 no-op，不阻塞删除主流程。）
         MicroCompactor.removeSessionState(id);
+        // [cache-hit-fix B] 会话删除 → 释放该会话 git status 快照（防 SessionGitStatusRegistry 无界增长）。
+        //   best-effort：null（未接线）→ 跳过；未知会话 evict no-op，不阻塞删除主流程。
+        if (sessionGitStatusRegistry != null) {
+            sessionGitStatusRegistry.evict(id);
+        }
         // DEL-SH-01: 会话删除时清理该 session 的 skill improvement suggestion store 条目
         //   (对齐 CC AppState.skillImprovement.suggestion 随会话消亡; removeBySession 静默忽略 null/未知)
         // [session-id-short] id 已 short 直键 store（不再 parseSessionUuid）
@@ -197,9 +255,14 @@ public class SessionService {
         //   （{slug}/{sessionId}.jsonl + {slug}/{sessionId}/ 递归）。文件不存在/删失败 → log.warn
         //   不抛（fail-loud 但不断 DB 删行）。对齐 CC cleanupTaskOutput/cleanupOldSessionFiles。
         try {
-            com.nexusai.common.SessionProjectRoot.clearSession(id);
+            // [删除清理 2026-09-03 顺序修复] 必须先取 originalCwd 再 clearSession：clearSession 会清掉
+            //   SessionProjectRoot 冻结（boundProject 层），随后 getOriginalCwdLayer 拿不到冻结 → 回落
+            //   user.dir（后端启动目录）→ deleteSessionFiles 打错 slug（实测 sess-4b06118b boundProject=
+            //   桌面报告目录，却删到 D--code-ai-project-nexusai-backend slug），真正 transcript/session-memory
+            //   残留未清。先取值 → 再 clear → 再删（顺序关键）。
             java.nio.file.Path projectRoot = java.nio.file.Path.of(
                 com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayer(id));
+            com.nexusai.common.SessionProjectRoot.clearSession(id);
             SessionStorage.deleteSessionFiles(projectRoot, id);
         } catch (Exception e) {
             log.warn("[SessionService] delete 文件侧清理失败（best-effort）: session={} err={}", id, e.getMessage());

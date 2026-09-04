@@ -3,6 +3,7 @@ package com.nexusai.application.agent.skill;
 import com.nexusai.application.agent.browser.BrowserWsChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -29,6 +30,16 @@ import org.springframework.context.annotation.Configuration;
 public class BundledSkillFeatureFlagsConfig {
 
     private static final Logger log = LoggerFactory.getLogger(BundledSkillFeatureFlagsConfig.class);
+
+    /**
+     * [browser-mcp-yml-gate] nexusai-in-chrome 总开关 · yml {@code nexusai.feature.browser-mcp}
+     * （默认 false）。开发中默认关：false → nexusai-in-chrome skill 不注册（与
+     * {@link BrowserMcpToolConfig} 工具不注册同步，防「skill 提示用 mcp__nexusai-in-chrome__*
+     * 工具但工具不存在」空转）。测试手动 new（未注入）→ false 默认关（BundledSkillsFeatureGatingTest
+     * 只查 loop/schedule/claude-api，不受影响）。
+     */
+    @Value("${nexusai.feature.browser-mcp:false}")
+    private boolean browserMcpEnabled;
 
     public BundledSkillFeatureFlagsConfig(BundledSkillFeatureFlags flags) {
         if (log.isDebugEnabled()) {
@@ -81,8 +92,9 @@ public class BundledSkillFeatureFlagsConfig {
             BrowserWsChannel browserWsChannel) {
         return new BundledSkillsBootstrapper(
             // nexusai-in-chrome 门控 · CC original: shouldAutoEnableClaudeInChrome()
-            // (src/utils/claudeInChrome/setup.ts:72-84) —— Java 等价：当前会话有扩展 WS 连接
-            () -> browserWsChannel != null && browserWsChannel.hasSessionConnection(),
+            // (src/utils/claudeInChrome/setup.ts:72-84) —— Java 等价：browserMcpEnabled（yml 总开关，
+            // 开发中默认关）&& 当前会话有扩展 WS 连接
+            () -> browserMcpEnabled && browserWsChannel != null && browserWsChannel.hasSessionConnection(),
             () -> "ant".equalsIgnoreCase(System.getenv("USER_TYPE")),
             flags,
             () -> true,

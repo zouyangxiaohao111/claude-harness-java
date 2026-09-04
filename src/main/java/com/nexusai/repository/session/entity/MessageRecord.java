@@ -163,6 +163,16 @@ public class MessageRecord {
      * user_message_id 列范式）。null/旧行 = false（toDto 读侧 Boolean.TRUE.equals 容错）。
      */
     private Boolean isMeta;
+    /**
+     * 排队来源标记 · CC original: queued_command origin 语义（messages.ts:3753-3796）。
+     *
+     * <p>[P0-1 OD-1/OD-3 方案 A] V67 落库为 queued_origin 列（MyBatis-Flex camelCase →
+     * snake_case 自动映射，同 V51 is_meta 列范式）。mid-turn 注入的 busy-queued 排队用户消息
+     * 落库原文 content + 本列 'busy-queued'，resume 重放读侧 toDto 回填 ChatMessageDto.queuedOrigin
+     * → 发送层按标记重新包壳。仅 busy-queued 持久化标记；空闲 cron/busy / 普通消息 / slash
+     * meta/result/reject 恒 null（红线：空闲路径零标记，CC processTextPrompt 原文发）。
+     */
+    private String queuedOrigin;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -216,4 +226,6 @@ public class MessageRecord {
     public void setUserMessageId(String userMessageId) { this.userMessageId = userMessageId; }
     public Boolean getIsMeta() { return isMeta; }
     public void setIsMeta(Boolean isMeta) { this.isMeta = isMeta; }
+    public String getQueuedOrigin() { return queuedOrigin; }
+    public void setQueuedOrigin(String queuedOrigin) { this.queuedOrigin = queuedOrigin; }
 }

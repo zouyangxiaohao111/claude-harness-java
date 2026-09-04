@@ -2,7 +2,6 @@ package com.nexusai.application.agent.permission;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
-import com.nexusai.application.agent.skill.BundledSkillFileExtractor;
 import com.nexusai.application.agent.skill.ClaudePaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.ToolUseContext;
@@ -89,7 +88,7 @@ public record PathValidationEnv(
             ClaudePaths.getClaudeConfigHomeDir(),
             NexusaiPaths.getAppConfigHomeDir(),
             false,
-            BundledSkillFileExtractor.getClaudeTempDir(),
+            NexusaiPaths.getAppTempDir(),
             false,
             null,
             null
@@ -116,7 +115,7 @@ public record PathValidationEnv(
             ClaudePaths.getClaudeConfigHomeDir(),
             NexusaiPaths.getAppConfigHomeDir(),
             false,
-            BundledSkillFileExtractor.getClaudeTempDir(),
+            NexusaiPaths.getAppTempDir(),
             false,
             null,
             null

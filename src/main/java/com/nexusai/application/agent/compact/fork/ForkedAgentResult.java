@@ -12,10 +12,14 @@ import java.util.List;
  *                  {@code messages: Message[]} (forkedAgent.ts:117)
  * @param totalUsage loop 内所有 API 调用累计 usage · CC original:
  *                  {@code totalUsage: NonNullableUsage} (forkedAgent.ts:119)
+ * @param providerType provider type（LlmProvider.type()：'anthropic' | 'openai_compatible' |
+ *                     'openai_sdk' ...）· A 命中率口径协议分派载荷；未知/便捷构造 → null
+ *                     （{@link #isAnthropic()}=false → 非 anthropic read/input 语义）
  */
 public record ForkedAgentResult(
         List<ChatMessageDto> messages,
-        ForkUsage totalUsage) {
+        ForkUsage totalUsage,
+        String providerType) {
 
     public ForkedAgentResult {
         if (messages == null) {
@@ -24,6 +28,22 @@ public record ForkedAgentResult(
         if (totalUsage == null) {
             totalUsage = ForkUsage.empty();
         }
+    }
+
+    /**
+     * 便捷构造 · providerType 未知 → null（{@link #isAnthropic()}=false）。
+     * 兼容既有 2 参调用点（测试 fake ForkedQuery 构造 / 语义不变）。
+     */
+    public ForkedAgentResult(List<ChatMessageDto> messages, ForkUsage totalUsage) {
+        this(messages, totalUsage, null);
+    }
+
+    /**
+     * 是否 Anthropic provider · {@code "anthropic".equals(providerType)}
+     * （null / 'openai_compatible' / 'openai_sdk' → false，非 anthropic read/input 语义）。
+     */
+    public boolean isAnthropic() {
+        return "anthropic".equals(providerType);
     }
 
     /**

@@ -70,6 +70,12 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(p);
     }
 
+    @ExceptionHandler(BadGatewayException.class)
+    public ResponseEntity<Problem> handleBadGateway(BadGatewayException ex, HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
+            .body(withInstance(Problem.of(502, "Bad Gateway", ex.getMessage()), req));
+    }
+
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<Problem> handleUnreadable(HttpMessageNotReadableException ex,
                                                     HttpServletRequest req) {

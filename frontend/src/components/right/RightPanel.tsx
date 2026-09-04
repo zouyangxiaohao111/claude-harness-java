@@ -12,6 +12,8 @@ import { useSubagentStore, type SubagentIdentity } from '@/stores/subagentStore'
 import { TeamPanel } from '@/components/right/TeamPanel'
 import { TodoPanel } from '@/components/right/TodoPanel'
 import { AsyncTasksPanel } from '@/components/right/AsyncTasksPanel'
+import { RightPreview } from '@/components/right/RightPreview'
+import { usePreviewStore } from '@/stores/previewStore'
 
 type RightTab = 'files' | 'tasks' | 'projects'
 
@@ -489,6 +491,8 @@ export function RightPanel({
   const [fileTree, setFileTree] = useState<FileNode[] | null>(null)
   const [fileTreeLoading, setFileTreeLoading] = useState(false)
   const [fileTreeError, setFileTreeError] = useState(false)
+  // 右侧覆盖预览（附件/HTML 运行点开 → 覆盖整个右栏；关闭恢复原 tab）
+  const preview = usePreviewStore((s) => s.preview)
   // 展开的目录 path 集合
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
   useEffect(() => {
@@ -791,6 +795,12 @@ export function RightPanel({
           </>
         )}
       </div>
+      {/* 附件/HTML 预览：覆盖整个右栏（关闭恢复原 tab · 中间对话不受影响） */}
+      {preview && (
+        <div className="right-preview-overlay">
+          <RightPreview preview={preview} />
+        </div>
+      )}
     </div>
   )
 }

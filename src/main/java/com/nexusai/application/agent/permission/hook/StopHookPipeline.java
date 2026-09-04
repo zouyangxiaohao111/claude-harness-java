@@ -240,10 +240,11 @@ public final class StopHookPipeline {
                                                              boolean bareMode,
                                                              Path workspaceDir,
                                                              String sessionId) {
-        // 9 参便捷重载 · 无 fork 原料（非主循环调用方：测试/直构）→ null 原料透传，
-        // extract/dream 侧保持既有兜底（supplier / createMinimalCacheSafeParams，不 fail-loud）。
+        // 9 参便捷重载 · 无 fork 原料 + 无 memoryDir（非主循环调用方：测试/直构）→ null 透传，
+        // extract/dream 侧保持既有兜底（supplier / createMinimalCacheSafeParams，不 fail-loud；
+        //   agents 被 mock 的测试不触发 fork）。生产 LlmAgentLoop 必须走 11 参带会话线程解析 memoryDir。
         return executeExtractMemoriesAndAutoDream(agentId, extractAgent, dreamer, messages,
-            isNonInteractiveSession, appendSystemMessage, bareMode, workspaceDir, sessionId, null);
+            isNonInteractiveSession, appendSystemMessage, bareMode, workspaceDir, sessionId, null, null);
     }
 
     /**
@@ -272,7 +273,8 @@ public final class StopHookPipeline {
                                                              boolean bareMode,
                                                              Path workspaceDir,
                                                              String sessionId,
-                                                             com.nexusai.application.agent.compact.fork.ForkRawMaterial forkRawMaterial) {
+                                                             com.nexusai.application.agent.compact.fork.ForkRawMaterial forkRawMaterial,
+                                                             Path memoryDir) {
         // CC stopHooks.ts:136 if (!isBareMode()) —— bare/SIMPLE 脚本 -p 调用跳过后台 bookkeeping
         if (bareMode) {
             if (log.isDebugEnabled()) {
@@ -303,7 +305,12 @@ public final class StopHookPipeline {
             //   —— 本方法 :282 已 gate agentId==null（调用点第一层），impl 入口再二次防御
             //   （拦截未来非 StopHookPipeline 调用方误传子代理片段）。
             // [sm-cursor-sessionize] sessionId 透传 impl —— 游标/stash 按会话键控（多会话互不串扰）
-            extractAgent.executeExtractMemories(snapshot, appendSystemMessage, forkRawMaterial, agentId, sessionId);
+            // [A1 重做] memoryDir 显式传参（会话线程 LlmAgentLoop 解析 boundProject 后传入，
+            //   fork 内不现算不读 ThreadLocal —— 对齐 CC extractMemories.ts:339 先算后传）。
+            //   memoryDir null（测试/非主循环调用方）→ agent 内部 storage.memoryDir() 兜底。
+            String extractMemDir = normalizeMemDir(memoryDir);
+            extractAgent.executeExtractMemories(snapshot, appendSystemMessage, forkRawMaterial, agentId, sessionId,
+                extractMemDir);
             log.info("STOP_HOOK extractMemories 已异步触发 (agentId=null, extractAgent 非空, "
                     + "EXTRACT_MEMORIES 模块开关={}, isExtractModeActive, appendSystemMessage={}, bareMode={}, forkRawMaterial={}) · CC stopHooks.ts:136-153",
                 isExtractMemoriesModuleEnabled(),
@@ -312,6 +319,11 @@ public final class StopHookPipeline {
             triggered = true;
         }
         if (dreamer != null) {
+            // [A1 重做] memoryDir 显式传参 —— runAsync（ForkJoinPool）不继承会话线程 ThreadLocal，
+            //   memoryDir 由会话线程（LlmAgentLoop stop-hook）算好闭包捕获传入 consolidateIfNeeded
+            //   5 参，fork 内不现算不读 ThreadLocal（对齐 CC runAutoDream 先 getAutoMemPath 后 fork）。
+            //   memoryDir null（测试/非主循环调用方）→ AutoDreamConsolidator 内部 memoryDir() 兜底。
+            final Path dreamMemDir = memoryDir;
             CompletableFuture.runAsync(() -> {
                 try {
                     // [FIX-AD] 透传 appendSystemMessage（CC autoDream.ts:126/238-248
@@ -319,7 +331,11 @@ public final class StopHookPipeline {
                     //   时追加 verb='Improved' 的 memory_saved 完成消息直达 UI
                     // [IMP-MV2-09 T9] fork 原料透传（autoDream.ts:226 createCacheSafeParams(context)
                     //   全量载荷 · forkedAgent.ts:131-141；null = 无捕获兜底）
-                    dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial);
+                    if (dreamMemDir != null) {
+                        dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, dreamMemDir);
+                    } else {
+                        dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial);
+                    }
                 } catch (Exception e) {
                     log.warn("LlmAgentLoop autoDream failed: {}", e.getMessage());
                 }
@@ -511,5 +527,17 @@ public final class StopHookPipeline {
             return v;
         }
         return System.getenv(key);
+    }
+
+    /**
+     * memoryDir 归一为尾分隔符字符串 · [A1 重做] null → null（测试/非主循环调用方，agent 内部
+     * storage.memoryDir() 兜底）；否则保证唯一尾分隔符（ExtractMemoriesAgent.memoryDir 契约）。
+     */
+    private static String normalizeMemDir(Path memoryDir) {
+        if (memoryDir == null) {
+            return null;
+        }
+        String s = memoryDir.toString();
+        return (s.endsWith("/") || s.endsWith("\\")) ? s : s + java.io.File.separator;
     }
 }

@@ -1072,9 +1072,10 @@ public record ToolUseContext(
      * toString() 拿到统一形式的字符串. Windows 大小写不敏感目前由 {@code PathGuard}
      * 解析后 OS-level 处理, 与 CC 行为等价 (Windows NTFS 本身大小写不敏感).
      *
-     * <p><b>容错</b>: {@link PathGuard#resolve(String)} 抛 {@code SecurityException}
-     * (越狱) 时透传给 caller — caller 应在 validateInput 阶段已捕获, 此处再抛符合
-     * "fail loud" 原则.
+     * <p><b>容错</b>: {@link PathGuard#resolve(String)} 自 2026-09-03 起为纯展开语义
+     * (对齐 CC expandPath)，不再抛 {@code SecurityException}（逃逸拦截已删，s02 教学版遗留）——
+     * 绝对/相对路径只展开不拦截，越界路径（workspace 外）返回规范化外部绝对路径并参与 dedup key，
+     * 安全边界由 {@code ReadPermissionChecker.isInWorkingDir}（权限层）承担。
      *
      * @param guard PathGuard 实例 (注入 workspace 根)
      * @param rawPath 原始路径字符串 (LLM 入参)

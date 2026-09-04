@@ -107,8 +107,8 @@ public class BundledSkillFileExtractor {
      *
      * <p>对齐 CC {@code getBundledSkillsRoot}（filesystem.ts:365-370）：memoize + per-process
      * random nonce（16 bytes → 32 hex）+ {@code join(getClaudeTempDir(), 'bundled-skills',
-     * MACRO.VERSION, nonce)}。底层 temp 根经 {@link #getClaudeTempDir()}（filesystem.ts:331-347
-     * 等价，OPD-WF5-02-07 补齐 env 覆写 / Unix /tmp / realpath / uid 后缀）。
+     * MACRO.VERSION, nonce)}。底层 temp 根经 {@link NexusaiPaths#getAppTempDir()} 单出口
+     * （filesystem.ts:331-347 等价，per-user 层品牌名 = appName 自有）。
      *
      * <p>memoize 保证解压写与权限检查在进程生命周期内路径一致；版本隔离让旧二进制残留
      * 不落入 allowlist。double-checked volatile 字段保证进程内确定性。
@@ -120,7 +120,7 @@ public class BundledSkillFileExtractor {
             synchronized (BundledSkillFileExtractor.class) {
                 if (rootCache == null) {
                     String nonce = HexFormat.of().formatHex(randomBytes(16));
-                    rootCache = Paths.get(getClaudeTempDir())
+                    rootCache = Paths.get(NexusaiPaths.getAppTempDir())
                         .resolve("bundled-skills")
                         .resolve(VERSION)
                         .resolve(nonce);
@@ -132,81 +132,6 @@ public class BundledSkillFileExtractor {
             }
         }
         return rootCache;
-    }
-
-    // ────────────────────────────────────────────────────────────────────────
-    // getClaudeTempDir · OPD-WF5-02-07 对齐 CC filesystem.ts:307-315 / :331-347
-    // ────────────────────────────────────────────────────────────────────────
-
-    /** 当前平台是否 Windows（CC getPlatform()==='windows' 等价）。 */
-    private static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase().contains("win");
-    }
-
-    /**
-     * Claude temp 目录名 · CC {@code getClaudeTempDirName}（filesystem.ts:307-315）：
-     * win='claude'；非 win='claude-{uid}'（uid 防多用户共享 /tmp 权限冲突）。
-     */
-    public static String getClaudeTempDirName() {
-        if (isWindows()) {
-            return "claude";
-        }
-        return "claude-" + getUid();
-    }
-
-    /**
-     * Claude temp 目录（symlink 已解析）· CC {@code getClaudeTempDir}（filesystem.ts:331-347）：
-     * {@code CLAUDE_CODE_TMPDIR || (win ? tmpdir() : '/tmp')} → realpath → {@code join(base, dirName) + sep}。
-     *
-     * <p>realpath 解析 symlink（macOS /tmp → /private/tmp），使路径与权限检查的 resolved 路径一致
-     * （filesystem.ts:324-327 注释）。memoize：输入（env + 平台 + 系统 tmpdir realpath）进程内恒定。
-     *
-     * @return temp 根目录 + 平台目录名 + 尾分隔符（进程内恒定）
-     */
-    public static String getClaudeTempDir() {
-        if (tempRootCache == null) {
-            synchronized (BundledSkillFileExtractor.class) {
-                if (tempRootCache == null) {
-                    String base = System.getenv("CLAUDE_CODE_TMPDIR");
-                    if (base == null || base.isBlank()) {
-                        base = isWindows()
-                            ? System.getProperty("java.io.tmpdir")
-                            : "/tmp";
-                    }
-                    // realpath（CC :339-344 realpathSync；失败回退原路径）
-                    String resolved = base;
-                    try {
-                        resolved = Paths.get(base).toRealPath().normalize().toString();
-                    } catch (IOException e) {
-                        if (log.isDebugEnabled()) {
-                            log.debug("[BundledSkillFileExtractor] getClaudeTempDir realpath 失败回退原路径（CC filesystem.ts:339-344）: {} → {}",
-                                base, e.getMessage());
-                        }
-                    }
-                    tempRootCache = Paths.get(resolved, getClaudeTempDirName())
-                        .normalize().toString() + File.separator;
-                    if (log.isDebugEnabled()) {
-                        log.debug("[BundledSkillFileExtractor] getClaudeTempDir（CC filesystem.ts:331-347）→ {}", tempRootCache);
-                    }
-                }
-            }
-        }
-        return tempRootCache;
-    }
-
-    /**
-     * 当前进程 uid（CC process.getuid?.() ?? 0，filesystem.ts:313）。Java 无可移植 getuid：
-     * 非 Windows 用 JDK UnixSystem（失败兜底 0）；Windows 恒 0（tmpdir 已 per-user）。
-     */
-    private static long getUid() {
-        if (isWindows()) {
-            return 0L;
-        }
-        try {
-            return new com.sun.security.auth.module.UnixSystem().getUid();
-        } catch (Throwable t) {
-            return 0L;
-        }
     }
 
     /**
@@ -412,7 +337,4 @@ public class BundledSkillFileExtractor {
 
     /** per-process 单例缓存 · CC memoize（filesystem.ts:365）。 */
     private static volatile Path rootCache;
-
-    /** getClaudeTempDir per-process 单例缓存 · CC memoize（filesystem.ts:331）。 */
-    private static volatile String tempRootCache;
 }

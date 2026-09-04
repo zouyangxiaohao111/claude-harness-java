@@ -14,16 +14,22 @@ import org.slf4j.LoggerFactory;
  * {@code aliasMatchesParentTier}（裸家族别名继承父档位）/ tool-specified model 优先。
  * 注释假声称"对齐 CC"（Pattern #9）——本类按 CC 真源重构。
  *
- * <p><b>解析顺序（CC agent.ts:43-94 + [W2-2] settings.subagentModelId DB 优先）</b>:
+ * <p><b>解析顺序（2026-09-03 用户拍板：tool model -> db -> env -> 继承）</b>:
  * <ol>
- *   <li>settings.subagentModelId（DB，W2-2 接入，DB 优先于 env；env 路 W4 清理）→ {@link #parseUserSpecifiedModel}</li>
+ *   <li>tool-specified model（显式指定最优先）→ {@link #aliasMatchesParentTier} 命中返回 parentModel，否则 parse</li>
+ *   <li>settings.subagentModelId（DB 默认，用户"我的 db 就是 env"）→ {@link #parseUserSpecifiedModel}</li>
  *   <li>{@code CLAUDE_CODE_SUBAGENT_MODEL} env → {@link #parseUserSpecifiedModel}</li>
- *   <li>tool-specified model → {@link #aliasMatchesParentTier} 命中返回 parentModel，否则 parse</li>
  *   <li>{@code agentModel ?? 'inherit'}</li>
  *   <li>{@code 'inherit'} → {@link #getRuntimeMainLoopModel}（运行时解析）</li>
  *   <li>aliasMatchesParentTier 命中 → parentModel（防降级）</li>
  *   <li>兜底 {@link #parseUserSpecifiedModel}</li>
  * </ol>
+ *
+ * <p><b>优先级 WHY（2026-09-03）</b>: 主代理引导 vision 子代理调 Agent 显式传
+ * {@code model=deepseek-v4-flash-vision-exp}，原 settings.subagentModelId（DB 文本模型）最高优先级
+ * 直接压过 tool model → 子代理用文本模型 Read pdf 被拒（日志实证 queryLoop 入口
+ * {@code model=deepseek/deepseek-v4-flash}）。显式指定覆盖默认（工程常识）；db/env 仍作默认/全局兜底
+ * （普通子代理不传 model 时生效）。
  *
  * <p><b>Bedrock 区域前缀继承降级说明</b>: CC 的 {@code getBedrockRegionPrefix/applyParentRegionPrefix}
  * 保证 subagent 继承父模型的跨区域 inference profile（数据驻留安全——IAM 权限按区域 profile 隔离）。
@@ -68,13 +74,12 @@ public final class AgentModelResolver {
     /**
      * 解析 subagent effective model · 对齐 CC agent.ts:37-95 + settings.subagentModelId DB 承载。
      *
-     * <p>[W2-2] 新增 settings.subagentModelId（DB settings 列，V25）来源：<b>DB 优先</b>于
-     * env {@code CLAUDE_CODE_SUBAGENT_MODEL}（env 路后续 W4 清理，届时 settings 为唯一来源）。
-     * 解析链：
+     * <p>[W2-2] settings.subagentModelId（DB settings 列，V25）为默认子代理模型（用户"我的 db 就是 env"）。
+     * 解析链（2026-09-03 用户拍板：tool model -> db -> env -> 继承，显式指定覆盖默认）：
      * <ol>
-     *   <li>settings.subagentModelId（DB，本次 W2-2 优先）→ {@link #parseUserSpecifiedModel}</li>
+     *   <li>tool-specified model（显式指定最优先）→ {@link #aliasMatchesParentTier} 命中返回 parentModel，否则 parse</li>
+     *   <li>settings.subagentModelId（DB 默认）→ {@link #parseUserSpecifiedModel}</li>
      *   <li>{@code CLAUDE_CODE_SUBAGENT_MODEL} env → {@link #parseUserSpecifiedModel}</li>
-     *   <li>tool-specified model → {@link #aliasMatchesParentTier} 命中返回 parentModel，否则 parse</li>
      *   <li>{@code agentModel ?? 'inherit'}</li>
      *   <li>{@code 'inherit'} → {@link #getRuntimeMainLoopModel}（运行时解析）</li>
      *   <li>aliasMatchesParentTier 命中 → parentModel（防降级）</li>
@@ -128,7 +133,19 @@ public final class AgentModelResolver {
             String permissionMode,
             String envModel,
             String subagentModelId) {
-        // 1. settings.subagentModelId DB 优先 · W2-2（env 路 W4 清理后为唯一来源）
+        // [优先级 2026-09-03 用户拍板] tool model -> db(settings.subagentModelName) -> env -> 继承。
+        //   WHY：主代理引导 vision 子代理调 Agent 显式传 model=deepseek-v4-flash-vision-exp，DB
+        //   settings.subagentModelName（文本）原最高优先级直接压过 tool model → 子代理用文本模型
+        //   Read pdf 被拒（日志实证 2026-09-03 queryLoop 入口 model=deepseek/deepseek-v4-flash）。
+        //   显式指定覆盖默认（工程常识）；db/env 仍作默认/全局兜底（普通子代理不传 model 时生效）。
+        // 1. tool-specified model 最优先 · CC agent.ts:70-76（显式覆盖默认）
+        if (toolSpecifiedModel != null && !toolSpecifiedModel.isBlank()) {
+            if (aliasMatchesParentTier(toolSpecifiedModel, parentModel)) {
+                return parentModel;
+            }
+            return parseUserSpecifiedModel(toolSpecifiedModel);
+        }
+        // 2. settings.subagentModelId DB 默认（用户"我的 db 就是 env"——DB 承载默认子代理模型）· W2-2
         if (subagentModelId != null && !subagentModelId.isBlank()) {
             if (log.isDebugEnabled()) {
                 log.debug("[AgentModelResolver] settings.subagentModelId 命中: {} → 走 parseUserSpecifiedModel",
@@ -136,18 +153,9 @@ public final class AgentModelResolver {
             }
             return parseUserSpecifiedModel(subagentModelId);
         }
-        // 2. env override · CC agent.ts:43-45
+        // 3. env override · CC agent.ts:43-45
         if (envModel != null && !envModel.isBlank()) {
             return parseUserSpecifiedModel(envModel);
-        }
-
-        // [Bedrock 区域前缀继承降级 no-op · 见类 Javadoc]
-        // 2. tool-specified model 优先 · CC agent.ts:70-76
-        if (toolSpecifiedModel != null && !toolSpecifiedModel.isBlank()) {
-            if (aliasMatchesParentTier(toolSpecifiedModel, parentModel)) {
-                return parentModel;
-            }
-            return parseUserSpecifiedModel(toolSpecifiedModel);
         }
 
         // 3. agentModel ?? 'inherit' · CC agent.ts:78

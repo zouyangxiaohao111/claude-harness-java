@@ -2,6 +2,7 @@ package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.common.RequestContext;
 import jakarta.annotation.Nullable;
@@ -205,11 +206,14 @@ public class BackgroundTaskRunner {
                 // CC LocalShellTask.tsx:105-171 — enqueueShellNotification
                 // T1: size-watchdog 杀进程消息并入 summary（BashResult.stderr 前缀命中 → detail 追加），
                 //   对齐 CC prependStderr 的模型可见语义（ShellCommand.ts:318-322）。非 size-kill → null 不改变文本。
+                // [OD-D8] 普通 bash 完成通知 priority null→NEXT · CC LocalShellTask.tsx:166-171
+                //   priority: feature('MONITOR_TOOL')?'next':'later'，用户拍板开态（产品 Monitor 已 NEXT，
+                //   统一）→ bash 完成忙时在工具边界 mid-turn 注入（对齐 OD-D3 isMeta 形态）。
                 String xml = TaskNotificationBuilder.buildEnqueueShellNotification(completed, result.exitCode(),
                     sizeWatchdogKillNote(result));
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        null, null, null, false, null, false, null, completed.sessionId()));
+                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null, completed.sessionId()));
 
                 // OPD-TS-22/TP-18: 终态 task_notification SDK 事件（Java 无 print.ts XML→SDK 解析，
                 // 必须直接发射供前端消费；XML 通知仍走队列供模型，非双发——CC 双发风险是两条 SDK 路径）
@@ -233,9 +237,10 @@ public class BackgroundTaskRunner {
                 frameworkService.updateTaskState(sessionTask.id(), failed);
 
                 String xml = TaskNotificationBuilder.buildEnqueueShellNotification(failed, -1);
+                // [OD-D8] spawn 失败同 NEXT（对齐成功路径：CC LocalShellTask.tsx:166-171 完成/失败同 priority）
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        null, null, null, false, null, false, null, failed.sessionId()));
+                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null, failed.sessionId()));
 
                 emitTerminatedSdk(failed);
 
@@ -298,6 +303,10 @@ public class BackgroundTaskRunner {
         frameworkService.updateTaskState(sessionTask.id(), completed);
 
         String xml = TaskNotificationBuilder.buildEnqueueShellNotification(completed, 0);
+        // [OD-D8 收窄定案] spawnStub 覆盖非 LOCAL_BASH 占位类型（doc: 其余 6 种 TaskType），非 bash
+        //   完成 → 保持默认 LATER（对齐 CC 非 bash 默认 later）；仅真 bash 五路径（spawn 完成/失败、
+        //   markKilled、completeForegroundBackgroundedTask 完成/失败）改 NEXT。当前 spawnStub 无调用方
+        //   （s14+ 各 TaskType 实际执行器落地前为死代码），收窄不扩大行为面。
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
                 null, null, null, false, null, false, null, completed.sessionId()));
@@ -431,9 +440,10 @@ public class BackgroundTaskRunner {
         frameworkService.updateTaskState(taskId, killed);
 
         String xml = TaskNotificationBuilder.buildEnqueueShellNotification(killed, -1);
+        // [OD-D8] kill 终态同 NEXT（CC LocalShellTask.tsx:166-171 completed/failed/killed 同 priority）
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
-                null, null, null, false, null, false, null, killed.sessionId()));
+                NotificationQueue.Priority.NEXT, null, null, false, null, false, null, killed.sessionId()));
 
         emitTerminatedSdk(killed);
     }
@@ -512,35 +522,6 @@ public class BackgroundTaskRunner {
     }
 
     /**
-     * CC {@code getClaudeTempDirName} 等价（filesystem.ts:307-315）—— task 输出目录的 <b>per-user 层</b>目录名。
-     *
-     * <p>CC 真源（自验，不信注释）：
-     * <pre>
-     * getClaudeTempDirName():                                  // filesystem.ts:307-315
-     *   if (getPlatform() === 'windows') return 'claude'       // :308-310 Windows tmpdir 已 per-user
-     *   const uid = process.getuid?.() ?? 0                    // :313
-     *   return `claude-${uid}`                                 // :314 Unix /tmp 共享需 uid 隔离
-     * </pre>
-     * Java 等价：Windows（{@code os.name} 含 "windows"）→ {@code claude}（{@code java.io.tmpdir}
-     * 已是 {@code C:\Users\{user}\AppData\Local\Temp}，天然 per-user）；非 Windows →
-     * {@code claude-{user.name}}（{@code System.getProperty("user.name")} 为 CC {@code getuid()}
-     * 的 Java 等价——任务铁律："uid 来源：System.getProperty("user.name") 或 cc uid 等价"）。
-     *
-     * <p>WHY（规则九）：Unix 多用户共享同一 {@code /tmp}，不加 uid 层会造成权限冲突与跨用户串读
-     * （filesystem.ts:311-313 注释）；Windows tmpdir 已 per-user 故 CC 不加 uid（:305 注释）。
-     *
-     * @return per-user 层目录名（Windows {@code claude} / Unix {@code claude-{uid}}）
-     */
-    static String claudeTempDirName() {
-        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-        if (os.contains("windows")) {
-            return "claude";
-        }
-        String uid = System.getProperty("user.name", "0");
-        return "claude-" + uid;
-    }
-
-    /**
      * 任务输出目录 · 对齐 CC getTaskOutputDir（diskOutput.ts:50-55
      * {@code join(getProjectTempDir(), getSessionId(), 'tasks')}）。
      *
@@ -550,15 +531,16 @@ public class BackgroundTaskRunner {
      * getProjectTempDir() = join(getClaudeTempDir(), sanitizePath(getOriginalCwd())) + sep     // filesystem.ts:376-378
      * getClaudeTempDir()  = join(tmpdir, getClaudeTempDirName()) + sep                          // filesystem.ts:331-347
      * </pre>
-     * Java 五层映射：
+     * Java 五层映射（per-user 层品牌名 = {appName} 自有，经 {@link NexusaiPaths#getAppTempDir()} 单出口）：
      * <pre>
-     * {tmpRoot}/claude-{uid}/{sanitizePath(originalCwd)}/{sessionId}/tasks
-     *   ①tmp根      ②per-user      ③per-project                ④per-session   ⑤tasks
+     * {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks
+     *   ①tmp根        ②per-user                ③per-project         ④per-session   ⑤tasks
      * </pre>
      * <ol>
-     *   <li><b>① tmpRoot</b> = {@code java.io.tmpdir}（现有）</li>
-     *   <li><b>② per-user</b> = {@link #claudeTempDirName()}（CC getClaudeTempDirName
-     *       filesystem.ts:307-315：Windows→{@code claude}，Unix→{@code claude-{uid}}）</li>
+     *   <li><b>① tmpRoot</b> = {@link NexusaiPaths#getAppTempDir()} 内 base（env CLAUDE_CODE_TMPDIR
+     *       → Windows java.io.tmpdir / Unix /tmp，realpath 后缓存）</li>
+     *   <li><b>② per-user</b> = {@link NexusaiPaths#getAppTempDirName()}（CC getClaudeTempDirName
+     *       filesystem.ts:307-315 结构：Windows→{appName}，Unix→{appName}-{uid数字}）</li>
      *   <li><b>③ per-project</b> = {@link CwdResolution#getOriginalCwdLayer(String)} 的 CC
      *       sanitizePath（sessionStoragePortable.ts:311-319，非字母数字→'-'；filesystem.ts:376
      *       {@code sanitizePath(getOriginalCwd())}）—— 不同项目 originalCwd → 不同输出目录</li>
@@ -575,17 +557,16 @@ public class BackgroundTaskRunner {
      * @return 任务输出目录绝对路径（不含 taskId 文件名）
      */
     public static String taskOutputDir() {
-        String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
         String sessionId = resolveSessionId();
         String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
-        return Paths.get(tmpDir, claudeTempDirName(), sanitizedCwd, sessionId, "tasks").toString();
+        return Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd, sessionId, "tasks").toString();
     }
 
     /**
      * 任务输出文件路径 · 对齐 CC getTaskOutputPath（diskOutput.ts:72-74
      * {@code join(getTaskOutputDir(), \`${taskId}.output\`)}）。
      *
-     * <p>产出 {@code {tmpRoot}/claude-{uid}/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output}
+     * <p>产出 {@code {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output}
      * （方案B 五层，见 {@link #taskOutputDir()}）。
      *
      * @param taskId 任务 id（local_agent = agentId.toString()，CC 合一）
@@ -639,7 +620,7 @@ public class BackgroundTaskRunner {
         }
         // CC 语义: taskId === agentId (LocalAgentTask.tsx:197-262)
         String taskId = agentId.toString();
-        // 方案B: outputFile 对齐 CC 五层 {tmpRoot}/claude-{uid}/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output
+        // 方案B: outputFile 对齐 CC 五层 {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output
         //   （CC LocalAgentTask.tsx:488 createTaskStateBase → Task.ts:121 getTaskOutputPath）
         String outputFile = taskOutputPath(taskId);
         // Phase 4 (cron-notify): 透传创建会话 sessionId（SubagentTool 从父循环 TUC 提取，
@@ -1099,9 +1080,10 @@ public class BackgroundTaskRunner {
             // 对齐 CC :470 enqueueShellNotification（size-watchdog kill 消息并入 detail）
             String xml = TaskNotificationBuilder.buildEnqueueShellNotification(completed, exitCode,
                 result != null ? BackgroundTaskRunner.sizeWatchdogKillNote(result) : null);
+            // [OD-D8] 前台→后台 bash 完成同 NEXT（CC LocalShellTask.tsx:166-171 completed/failed/killed 同 priority）
             notificationQueue.enqueuePendingNotification(
                 new NotificationQueue.QueueItem(xml, "task-notification",
-                    null, null, null, false, null, false, null, completed.sessionId()));
+                    NotificationQueue.Priority.NEXT, null, null, false, null, false, null, completed.sessionId()));
             emitTerminatedSdk(completed);
 
             log.info("BackgroundTaskRunner.completeForegroundBackgroundedTask: task {} 完成 exitCode={} (G1-2)",
@@ -1123,9 +1105,10 @@ public class BackgroundTaskRunner {
                 tasks.put(taskId, failed);
                 frameworkService.updateTaskState(taskId, failed);
                 String xml = TaskNotificationBuilder.buildEnqueueShellNotification(failed, -1);
+                // [OD-D8] 前台→后台 bash 失败同 NEXT（对齐成功路径）
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        null, null, null, false, null, false, null, failed.sessionId()));
+                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null, failed.sessionId()));
                 emitTerminatedSdk(failed);
                 log.error("BackgroundTaskRunner.completeForegroundBackgroundedTask: task {} 失败: {}",
                     taskId, e.getMessage());
@@ -2023,7 +2006,7 @@ public class BackgroundTaskRunner {
      * 文件不存在时创建; 已存在时 append 保留 worker 累积输出.
      *
      * <p><b>方案B 对齐</b>：outputFile 为 CC 五层
-     * {@code {tmpRoot}/claude-{uid}/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output}，
+     * {@code {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output}，
      * 父目录（.../{sessionId}/tasks）不再天然存在 —— 写前 {@code createDirectories} 建父目录
      * （对齐 CC ensureOutputDir，diskOutput.ts:65-67 mkdir recursive）。旧平铺 /tmp 路径父目录恒在，
      * 无需此步。

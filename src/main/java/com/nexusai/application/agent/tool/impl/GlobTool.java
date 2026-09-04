@@ -218,19 +218,16 @@ public class GlobTool implements Tool {
         if (pattern.isBlank()) return ToolResult.error(call.id(), "pattern is empty");
 
         Path root;
-        try {
-            if (pathArg.isBlank()) {
-                root = guard.workdir();
-            } else {
-                root = guard.resolve(pathArg);
-                if (!Files.isDirectory(root)) {
-                    return ToolResult.error(call.id(),
-                        "path is not a directory: " + pathArg);
-                }
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），catch 逃逸拒绝删除；
+        //   越界搜索（pathArg 在 workspace 外）由权限层 isInWorkingDir 兜底
+        if (pathArg.isBlank()) {
+            root = guard.workdir();
+        } else {
+            root = guard.resolve(pathArg);
+            if (!Files.isDirectory(root)) {
+                return ToolResult.error(call.id(),
+                    "path is not a directory: " + pathArg);
             }
-        } catch (SecurityException se) {
-            log.warn("GlobTool: blocked path escape: {}", pathArg);
-            return ToolResult.error(call.id(), se.getMessage());
         }
 
         PathMatcher matcher = root.getFileSystem().getPathMatcher("glob:" + pattern);

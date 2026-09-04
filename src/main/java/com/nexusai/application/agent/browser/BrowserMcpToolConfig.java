@@ -5,6 +5,7 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -30,12 +31,28 @@ public class BrowserMcpToolConfig {
     private static final Logger log = LoggerFactory.getLogger(BrowserMcpToolConfig.class);
 
     /**
+     * [browser-mcp-yml-gate] nexusai-in-chrome 浏览器工具总开关 · yml {@code nexusai.feature.browser-mcp}
+     * （默认 false）。开发中默认关：mcp__nexusai-in-chrome__* 18 工具不注册（模型不可见），
+     * 避免开发期误调；后期转常态后改默认 true。
+     */
+    @Value("${nexusai.feature.browser-mcp:false}")
+    private boolean browserMcpEnabled;
+
+    /**
      * @param browserChannel 转发通道；已由 {@link BrowserWsChannel} 注入（真实 WS 转发）。
      *                       {@code required=false} 容错：部分测试上下文无该 bean → null → execute
      *                       fail loud（向后兼容）。
      */
     @Bean
     public List<Tool> browserMcpTools(@Autowired(required = false) BrowserChannel browserChannel) {
+        if (!browserMcpEnabled) {
+            // [browser-mcp-yml-gate] flag false → 空 List（工具不注册，模型 tools 不含
+            //   mcp__nexusai-in-chrome__*；ToolRegistry @Resource 注入空 List → registerAll no-op）
+            if (log.isInfoEnabled()) {
+                log.info("nexusai.feature.browser-mcp=false → mcp__nexusai-in-chrome__* 浏览器工具不注册（开发中默认关，需 yml true + 装扩展）");
+            }
+            return List.of();
+        }
         List<Tool> tools = BrowserToolRegistry.createTools(browserChannel);
         log.info("注册 {} 个 nexusai-in-chrome 浏览器工具 → ToolRegistry（BrowserChannel 注入={}）",
             tools.size(), browserChannel != null);

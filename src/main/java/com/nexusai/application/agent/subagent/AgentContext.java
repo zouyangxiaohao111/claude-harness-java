@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.subagent;
 
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.telemetry.Telemetry;
 
@@ -421,8 +422,10 @@ public sealed interface AgentContext {
      *   <li>serviceTier — :671（Java fork 域无数据源 → null；ForkedAgentResult.ForkUsage 不承载）</li>
      *   <li>cacheCreationEphemeral1hTokens/cacheCreationEphemeral5mTokens — :672-675
      *       （Java fork 域无数据源 → 0，对齐 CC EMPTY_USAGE cache_creation 零初始化）</li>
-     *   <li>cacheHitRate — :678（派生：cache_read / (input+cache_create+cache_read)，
-     *       分母 ≤ 0 → 0，:647-654）</li>
+     *   <li>cacheHitRate — :678（派生 · <b>A 命中率口径协议分派</b>：anthropic →
+     *       {@code cache_read/(input+cache_read+cache_create)}，:647-654；非 anthropic
+     *       （openai_sdk/deepseek，prompt_tokens 已含 cache hit）→ {@code cache_read/input}；
+     *       read ≤ 0 或分母 ≤ 0 → 0）</li>
      *   <li>queryChainId/queryDepth — :681-687（queryTracking 存在才附带，CC 条件展开）</li>
      * </ul>
      *
@@ -440,17 +443,20 @@ public sealed interface AgentContext {
      * @param queryTracking   查询链路跟踪（chainId/depth）· CC original:
      *                        {@code toolUseContext.queryTracking} (forkedAgent.ts:619)；
      *                        null → 不附带 queryChainId/queryDepth（CC :681 条件展开）
+     * @param anthropic       协议判定（CacheHitRate 分派）：true=Anthropic 三字段分母；
+     *                        false=openai/deepseek read/input（input 已含 cache hit）·
+     *                        CC 无对应（Java fork 路径需 provider 判定，见 RunForkedAgent）
      * @return 事件属性 Map（telemetry.recordEvent / logOTelEvent 入参）
      */
     static Map<String, Object> buildForkAgentQueryEventAttrs(
             String forkLabel, String querySource, long durationMs, int messageCount,
             long inputTokens, long outputTokens, long cacheReadInputTokens,
-            long cacheCreationInputTokens, Map<String, Object> queryTracking) {
-        // CC :647-654 cacheHitRate 派生：分母 = input + cache_create + cache_read；分母 ≤ 0 → 0
-        long totalInputTokens = inputTokens + cacheCreationInputTokens + cacheReadInputTokens;
-        double cacheHitRate = totalInputTokens > 0
-            ? (double) cacheReadInputTokens / totalInputTokens
-            : 0.0;
+            long cacheCreationInputTokens, Map<String, Object> queryTracking, boolean anthropic) {
+        // [A 命中率口径] 协议分派单点（ContextUsageCalculator.computeCacheHitRate）：
+        //   anthropic → read/(input+read+create)（CC :647-654）；非 anthropic → read/input
+        //   （deepseek prompt_tokens 已含 cache hit，旧分母恒为真实一半）
+        double cacheHitRate = ContextUsageCalculator.computeCacheHitRate(
+            inputTokens, cacheReadInputTokens, cacheCreationInputTokens, anthropic);
         Map<String, Object> attrs = new LinkedHashMap<>();
         attrs.put("forkLabel", forkLabel);
         attrs.put("querySource", querySource);
@@ -500,11 +506,13 @@ public sealed interface AgentContext {
      *                             {@code totalUsage.cache_creation_input_tokens} (:670)
      * @param queryTracking 查询链路跟踪（chainId/depth）· CC original:
      *                      {@code toolUseContext.queryTracking} (forkedAgent.ts:619)
+     * @param anthropic     协议判定（透传 build · CacheHitRate 分派）：true=Anthropic；
+     *                      false=openai/deepseek（input 已含 cache hit）
      */
     static void emitForkAgentQueryEvent(
             Telemetry telemetry, String forkLabel, String querySource, long durationMs,
             int messageCount, long inputTokens, long outputTokens, long cacheReadInputTokens,
-            long cacheCreationInputTokens, Map<String, Object> queryTracking) {
+            long cacheCreationInputTokens, Map<String, Object> queryTracking, boolean anthropic) {
         if (telemetry == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[AgentContext] tengu_fork_agent_query 遥测跳过（telemetry 未注入）: forkLabel={} querySource={}",
@@ -514,7 +522,7 @@ public sealed interface AgentContext {
         }
         Map<String, Object> attrs = buildForkAgentQueryEventAttrs(
             forkLabel, querySource, durationMs, messageCount, inputTokens, outputTokens,
-            cacheReadInputTokens, cacheCreationInputTokens, queryTracking);
+            cacheReadInputTokens, cacheCreationInputTokens, queryTracking, anthropic);
         telemetry.recordEvent("tengu_fork_agent_query", attrs);
         telemetry.logOTelEvent("tengu_fork_agent_query", attrs);
         if (log.isDebugEnabled()) {

@@ -390,6 +390,57 @@ public class MessageService {
      */
     public MessageCreatedResponse createQueuedUserMessage(String sessionId, String userMessageId, String content,
                                                           OffsetDateTime createdAt, boolean isMeta) {
+        return createQueuedUserMessage(sessionId, userMessageId, content, createdAt, isMeta, null);
+    }
+
+    /**
+     * 6 参重载：{@link #createQueuedUserMessage(String, String, String, OffsetDateTime, boolean)} +
+     * 显式 queuedOrigin（排队来源标记）。
+     *
+     * <p><b>[P0-1 OD-1/OD-3] queuedOrigin 落库</b>：mid-turn 注入的 busy-queued 排队用户消息
+     * （真实用户工作途中消息）落库 queued_origin='busy-queued'（V67 列），resume 重放 toDto 读回
+     * → 发送层按标记重新包壳。仅 busy-queued 传 'busy-queued'；空闲 cron/busy / slash meta/result/reject
+     * / 其余生产调用方恒 null（红线：空闲路径零标记，原文发）。imagePasteIds/userAttachments 缺省 null
+     * （纯文本排队命令无附件）。
+     *
+     * @param sessionId     目标会话（short）
+     * @param userMessageId 预生成 id（队列 QueueItem.uuid；null/空 → generateId 兜底）
+     * @param content       排队命令原文（QueueItem.value；null → 空串）
+     * @param createdAt     落库 created_at（供 replayAndPersist 单调序传入；null → OffsetDateTime.now()）
+     * @param isMeta        CC original: isMeta（messages.ts:3753 / useScheduledTasks.ts:76）—
+     *                      true = 系统生成消息（UI 隐藏、模型可见，V51 is_meta 列落库）
+     * @param queuedOrigin  排队来源标记（'busy-queued'；null = 非排队消息不标记）
+     * @return MessageCreatedResponse（queued=false——已消费落库，正常轮）
+     */
+    public MessageCreatedResponse createQueuedUserMessage(String sessionId, String userMessageId, String content,
+                                                          OffsetDateTime createdAt, boolean isMeta, String queuedOrigin) {
+        return createQueuedUserMessage(sessionId, userMessageId, content, createdAt, isMeta, queuedOrigin,
+            null, null);
+    }
+
+    /**
+     * 8 参重载：{@link #createQueuedUserMessage(String, String, String, OffsetDateTime, boolean, String)}
+     * + 显式 imagePasteIds + userAttachments（附件落库，OD-D13 busy 图片）。
+     *
+     * <p><b>[OD-D5/OD-D13] 附件落库</b>：mid-turn 注入的 busy 带图排队用户消息落库
+     * {@code image_paste_ids}（V46 JSON 数组；F5 前端按 id 拉图）+ {@code user_attachments}
+     * （V63，本期 busy 图 userAttachments 恒 null —— base64 直传无附件表 contentId，imagePasteIds
+     * 链路承载）。content 仍存<b>原文 RAW</b>（inj.content = QueueItem.value，壳不落库，红线 §五.4）。
+     *
+     * @param sessionId      目标会话（short）
+     * @param userMessageId  预生成 id（队列 QueueItem.uuid；null/空 → generateId 兜底）
+     * @param content        排队命令原文（QueueItem.value；null → 空串）
+     * @param createdAt      落库 created_at（供 replayAndPersist 单调序传入；null → OffsetDateTime.now()）
+     * @param isMeta         CC original: isMeta（messages.ts:3753 / useScheduledTasks.ts:76）
+     * @param queuedOrigin   排队来源标记（'busy-queued'；null = 非排队消息不标记）
+     * @param imagePasteIds  图片粘贴 id 列表（V46 JSON 数组；null/空 → 列 NULL，纯文本排队消息）
+     * @param userAttachments 附件快照（V63；本期 busy 图 null，预留 path/upload 附件回补通道）
+     * @return MessageCreatedResponse（queued=false——已消费落库，正常轮）
+     */
+    public MessageCreatedResponse createQueuedUserMessage(String sessionId, String userMessageId, String content,
+                                                          OffsetDateTime createdAt, boolean isMeta, String queuedOrigin,
+                                                          List<String> imagePasteIds,
+                                                          List<ChatMessageDto.UserAttachmentInfo> userAttachments) {
         SessionRecord session = sessionMapper.selectOneById(sessionId);
         if (session == null) throw new NotFoundException("Session " + sessionId + " not found");
         if (userMessageId == null || userMessageId.isBlank()) {
@@ -410,11 +461,21 @@ public class MessageService {
         m.setOutputTokens(null);
         m.setCreatedAt((createdAt != null ? createdAt : OffsetDateTime.now()).toString());
         m.setCwd(CwdResolution.getCwd(sessionId));
-        // 排队命令仅 content 入队（attachments 未入队，登记为限制）；imagePasteIds 恒 null
-        m.setImagePasteIds(null);
+        // [OD-D13] 排队命令附件落库：纯文本（imagePasteIds=null）→ V46 列 NULL（现状零变化）；
+        //   busy 带图 → 落 imagePasteIds JSON 数组（F5 前端按 id 拉图）。userAttachments 本期 null
+        //   （base64 直传无附件表 contentId，V63 预留 path/upload 通道回补）。
+        m.setImagePasteIds(imagePasteIds != null && !imagePasteIds.isEmpty()
+            ? serializeStringList(imagePasteIds) : null);
+        if (userAttachments != null && !userAttachments.isEmpty()) {
+            m.setUserAttachments(serializeUserAttachments(userAttachments));
+        }
         // [C1] isMeta 落库 · CC original: isMeta（messages.ts:3753 createUserMessage({..., isMeta:true}) /
         //   useScheduledTasks.ts:76 cron 入队 isMeta 语义）· V51 is_meta 列；cron=true / busy-queued=false
         m.setIsMeta(isMeta);
+        // [P0-1 OD-1/OD-3] queuedOrigin 落库 · CC original: queued_command origin 语义 · V67
+        //   queued_origin 列；仅 busy-queued 传 'busy-queued'（resume 重放 toDto 读回 → 发送层重包壳）；
+        //   空闲 cron/busy / slash meta/result/reject 恒 null（红线：空闲路径零标记，原文发）
+        m.setQueuedOrigin(queuedOrigin);
         messageMapper.insert(m);
         session.setMessageCount((session.getMessageCount() == null ? 0 : session.getMessageCount()) + 1);
         session.setUpdatedAt(OffsetDateTime.now().toString());
@@ -531,6 +592,16 @@ public class MessageService {
     public void delete(String id) {
         MessageRecord m = messageMapper.selectOneById(id);
         if (m == null) throw new NotFoundException("Message " + id + " not found");
+        // [级联对称 2026-09-03] 删 assistant 若带工具调用 → 连带删其 tool_result 消息行（role=tool 且
+        //   tool_call_id ∈ 该 assistant 的 tool_calls.id）。tool_result 不挂 assistant 的 FK（独立 messages
+        //   行，tool_call_id 列仅引用 tool_calls.id），原实现漏删 → 中断/裁剪后残留孤儿 tool_result →
+        //   resume 注入 OpenAI 400 'Messages with role tool must follow tool_calls'。tool_calls 表本体
+        //   由下方 FK CASCADE/显式删清除（ON DELETE CASCADE 级联 tool_calls，不级联 messages tool_result）。
+        if (m.getRole() != null && Role.assistant.name().equals(m.getRole())) {
+            messageMapper.deleteByQuery(QueryWrapper.create().where(
+                "role = ? AND tool_call_id IN (SELECT id FROM tool_calls WHERE message_id = ?)",
+                Role.tool.name(), id));
+        }
         // tool_calls 的 FK ON DELETE CASCADE 会连带清，这里显式删一次更稳
         toolCallMapper.deleteByQuery(QueryWrapper.create().eq("message_id", id));
         messageMapper.deleteById(id);
@@ -895,6 +966,7 @@ public class MessageService {
             .withCwd(m.getCwd()) // [G13] 回填 cwd 戳（V22 列；旧行 NULL = 未戳容错，对齐 CC 旧 jsonl 无 cwd）
             .withReasoningDurationMs(m.getReasoningDurationMs()) // [reasoningDurationMs] 读侧回填（V41 列；GET /messages 出站唯一点）
             .withUserMessageId(m.getUserMessageId()) // [userMessageId] 读侧回填（V47 列；GET /messages 出站唯一点；旧行 NULL = 无归属容错）
+            .withQueuedOrigin(m.getQueuedOrigin()) // [P0-1 OD-1/OD-3] 读侧回填（V67 queued_origin 列；resume 发送层按标记重新包壳；旧行 NULL = 非排队不包壳，与现状一致可接受）
             .withUserAttachments(resolveAttachmentUrls(parseUserAttachments(m.getUserAttachments()), m.getSessionId())); // [userAttachments] 读侧回填（V62 列；GET /messages 出站唯一点；contentId 非空 → url 动态拼 /api/v1/attachments/content/{sessionId}/{contentId}；null 列 → 空列表，恒非 null）
         // [usage 读侧回填] DB 持久化 inputTokens/outputTokens + cache 4 字段 → 重拉投影回填 usage，
         //   使 F5 后消息 token 展示与实时 complete 事件一致（↑input ↓output + cache）。
@@ -1154,7 +1226,7 @@ public class MessageService {
             }
             String cid = info.contentId();
             String url = (cid != null && !cid.isBlank())
-                ? "/api/v1/attachments/content/" + sessionId + "/" + cid
+                ? "/attachments/content/" + sessionId + "/" + cid
                 : null;
             if (url == null && info.url() == null) {
                 resolved.add(info); // 无 contentId → 无 url 可拼，保留原 record

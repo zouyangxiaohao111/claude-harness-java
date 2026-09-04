@@ -175,6 +175,16 @@ public class CommandController {
     private com.nexusai.application.agent.tool.impl.ToolSearchTool toolSearchTool;
 
     /**
+     * [cache-hit-fix B] 会话级 GitStatusProvider 注册表 · /clear 会话结束 → 释放该会话 git status
+     * 快照（仿 MicroCompactor.removeSessionState 同点接线，防 SessionGitStatusRegistry 无界增长；
+     * 下轮同 sessionId 懒建新实例重新快照，等价 CC reset 后新 turn）。
+     * {@code @Autowired(required=false)}：plain JUnit（无 Spring 容器）缺省 null → /clear 分支
+     * 跳过 evict（保测试兼容，见 CommandControllerBuiltInCommandsTest）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.prompt.SessionGitStatusRegistry sessionGitStatusRegistry;
+
+    /**
      * 列出所有命令 · DEC-8 前端环境声明过滤。
      *
      * <p>接收 {@code X-Client-Env} 请求头（react|mobile）透传到 {@link SkillRegistry#filterByClientEnv}
@@ -367,6 +377,11 @@ public class CommandController {
             //   resetMicrocompactState（PostCompactCleanup 序列内 :41）只复位桶内容不移桶；此处整桶移除，
             //   下轮 currentSessionState() computeIfAbsent 懒建新桶，语义等价 CC reset 后新 turn。）
             MicroCompactor.removeSessionState(com.nexusai.common.RequestContext.sessionId());
+            // [cache-hit-fix B] /clear 会话结束 → 释放该会话 git status 快照（防 SessionGitStatusRegistry
+            //   无界增长；下轮同 sessionId 懒建新实例重新快照）。null（plain JUnit 无容器）→ 跳过。
+            if (sessionGitStatusRegistry != null) {
+                sessionGitStatusRegistry.evict(com.nexusai.common.RequestContext.sessionId());
+            }
             // [IMP2-02 r1（CC caches.ts:80-84）] session_start reason 补偿：/clear 由
             // clearSessionCaches 触发，非压缩事件 —— runPostCompactCleanup 内部置的
             // 'compact' 必须覆盖回 'session_start'，否则下轮 getMemoryFiles 缓存 miss 时

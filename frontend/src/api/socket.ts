@@ -1,6 +1,6 @@
 import { Client, type IMessage, type StompSubscription } from '@stomp/stompjs'
 import SockJS from 'sockjs-client'
-import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations } from './types'
+import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, MessageUsageEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations } from './types'
 
 export function parseStreamEvent(raw: unknown): StreamEvent {
   const obj = (raw ?? {}) as Record<string, unknown>
@@ -10,6 +10,8 @@ export function parseStreamEvent(raw: unknown): StreamEvent {
 export const isChunk = (e: StreamEvent): e is MessageChunkEvent => e.type === 'message.chunk'
 export const isPushedUser = (e: StreamEvent): e is PushedUserMessageEvent => e.type === 'message.user'
 export const isComplete = (e: StreamEvent): e is MessageCompleteEvent => e.type === 'message.complete'
+/** 消息级 usage 快照守卫（消息级完成、非 turn 终态 —— isComplete 对 message.usage 恒 false → 不退订） */
+export const isMessageUsage = (e: StreamEvent): e is MessageUsageEvent => e.type === 'message.usage'
 export const isToolCall = (e: StreamEvent): e is MessageToolCallEvent => e.type === 'message.tool_call'
 export const isBoundary = (e: StreamEvent): e is MessageBoundaryEvent => e.type === 'message.boundary'
 export const isToolResult = (e: StreamEvent): e is MessageToolResultEvent => e.type === 'message.tool_result'

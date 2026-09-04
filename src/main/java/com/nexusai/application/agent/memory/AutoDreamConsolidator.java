@@ -15,6 +15,7 @@ import com.nexusai.application.agent.tasks.DreamTaskRegistry;
 import com.nexusai.application.agent.tasks.DreamTaskState;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.SystemMessage;
 import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -131,8 +132,6 @@ public class AutoDreamConsolidator {
             "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 
     private final MemoryStorage storage;
-    private final Path memoryDir;
-    private final ConsolidationLock consolidationLock;
 
     /**
      * remote mode 门控 · CC original: {@code getIsRemoteMode()}（autoDream.ts:97，
@@ -246,8 +245,29 @@ public class AutoDreamConsolidator {
 
     public AutoDreamConsolidator(MemoryStorage storage) {
         this.storage = storage;
-        this.memoryDir = storage.memoryDir();
-        this.consolidationLock = new ConsolidationLock(memoryDir);
+    }
+
+    /**
+     * 记忆目录 · CC original: {@code getAutoMemPath()}（paths.ts:223-235）。
+     *
+     * <p><b>[A1 修复 2026-09-04]</b>：由构造期冻结字段改<b>惰性现算</b>—— 每次调用
+     * {@code storage.memoryDir()}（生产 = AutoMemPaths 按当前线程 projectRoot 解析 per-project）。
+     * 旧实现构造冻结：bean 构造时无会话上下文 → 回落 config-home 自身 slug（C--Users-WIN--nexusai），
+     * 所有会话记忆/锁写错目录。调用方（StopHookPipeline runAsync 入口）须先经
+     * {@link AutoMemPaths#setCurrentProjectRoot} 注入会话 projectRoot，否则异步 fork 线程
+     * （ForkJoinPool）无 ThreadLocal 仍回落 config-home。
+     */
+    private Path memoryDir() {
+        return storage.memoryDir();
+    }
+
+    /**
+     * 合并锁 · 绑定 memoryDir（锁文件位于记忆目录内，consolidationLock.ts:21-23 lockPath）。
+     * [A1 修复] 由构造期冻结字段改惰性现算 —— 随 {@link #memoryDir()} 每次现算（同一 memoryDir
+     * 派生同一锁路径，无状态泄漏；CC 每轮读锁/写锁同样按当前 memory 目录操作）。
+     */
+    private ConsolidationLock consolidationLock() {
+        return new ConsolidationLock(memoryDir());
     }
 
     /** 注入 isAutoMemoryEnabled 门控（null → false，CC paths.ts:30-56 gate 关闭）。 */
@@ -291,7 +311,7 @@ public class AutoDreamConsolidator {
      * priorMtime=0 → unlink，否则写空 body + utimes 回退（consolidationLock.ts:91-108）。
      */
     void rollbackConsolidationLockSeam(long priorMtime) {
-        consolidationLock.rollbackConsolidationLock(priorMtime);
+        consolidationLock().rollbackConsolidationLock(priorMtime);
     }
 
     /** 注入遥测（tengu_auto_dream_* 事件 · autoDream.ts:195/252/267）。 */
@@ -406,8 +426,57 @@ public class AutoDreamConsolidator {
     public void consolidateIfNeeded(Path workspaceDir, String sessionId,
                                     Consumer<SystemMessage> appendSystemMessage,
                                     ForkRawMaterial forkRawMaterial) {
+        // 4 参便捷重载 · 无显式 memoryDir（非主循环调用方：测试/直构 storage Path 冻结安全；
+        //   生产 StopHookPipeline 必须走 5 参带会话线程解析的 memoryDir —— 本重载现算
+        //   storage.memoryDir()，fork 线程下调会回落 config-home，故生产禁用）。
+        consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, memoryDir());
+    }
+
+    /**
+     * 检查门控，满足条件时执行 fork 合并 · CC original: {@code runAutoDream}
+     * （autoDream.ts:125-272）。
+     *
+     * <p>[A1 重做 2026-09-04] <b>memoryDir 显式传参</b> —— consolidateIfNeeded 由 StopHookPipeline
+     * 在 runAsync（ForkJoinPool）内调用，无会话线程 ThreadLocal。生产调用方（LlmAgentLoop stop-hook，
+     * 会话线程）按 boundProject 经 {@link AutoMemPaths#getAutoMemPath(String)} 解析 memoryDir
+     * 后显式传入本方法 —— 内部所有锁/合并操作用该 memoryDir（consolidationLock.ts 锁文件位于
+     * memory 目录内），fork 线程绝不回读 AutoMemPaths/ThreadLocal。
+     *
+     * <p>门控顺序（autoDream.ts:5-9 注释，最便宜先）：
+     * <ol>
+     *   <li>isGateOpen（remoteMode + autoMemoryEnabled + autoDreamEnabled，autoDream.ts:95-100；KAIROS N/A）</li>
+     *   <li>时间门控（readLastConsolidatedAt 单 stat，autoDream.ts:131-141）</li>
+     *   <li>扫描节流（内存变量 lastSessionScanAt，autoDream.ts:143-151）</li>
+     *   <li>会话门控（transcript 扫描 + 排除当前 session，autoDream.ts:153-171）</li>
+     *   <li>锁门控（tryAcquireConsolidationLock，autoDream.ts:173-190）</li>
+     * </ol>
+     *
+     * <p><b>FIX-AD 动态阈值</b>：每轮经 {@code configSupplier.get()} 读取
+     * {@link AutoDreamConfig}（对齐 CC autoDream.ts:126 {@code const cfg = getConfig()}，
+     * GB tengu_onyx_plover 每轮读取 + 字段校验），时间/会话门用 cfg 值。
+     *
+     * <p><b>D5-A/M-11 参数化</b>：workspaceDir/sessionId/memoryDir 显式传参替代共享 volatile /
+     * ThreadLocal 读写（@Bean 共享 + 异步 consolidateIfNeeded 的跨会话交错窗口），调用点
+     * （LlmAgentLoop stop-hook 注入处）按会话捕获后经 StopHookPipeline 透传。
+     *
+     * @param workspaceDir 会话 transcript 扫描根目录（CC getProjectDir(cwd) ·
+     *                     consolidationLock.ts:121）
+     * @param sessionId    当前 session ID（排除自身 · CC autoDream.ts:164；null = 不排除）
+     * @param appendSystemMessage UI 系统消息回调（CC toolUseContext.appendSystemMessage；
+     *                            null = fork 成功不追加 Improved 完成消息）
+     * @param forkRawMaterial     fork 原料（主线程 systemPrompt/userContext/systemContext/
+     *                            快照 · forkedAgent.ts:131-141；null = 无捕获兜底）
+     * @param memoryDir    会话解析的 auto-memory 目录（LlmAgentLoop 会话线程 getAutoMemPath(boundProject)
+     *                     算好传入 · fork 全链用，绝不回读 ThreadLocal）
+     * @see <a href="https://github.com/anthropics/claude-code/blob/main/src/services/autoDream/autoDream.ts#L319-L324">CC executeAutoDream</a>
+     */
+    public void consolidateIfNeeded(Path workspaceDir, String sessionId,
+                                    Consumer<SystemMessage> appendSystemMessage,
+                                    ForkRawMaterial forkRawMaterial,
+                                    Path memoryDir) {
         // 动态阈值（autoDream.ts:126 每轮 getConfig · FIX-AD 替代硬编码 24/5）
         AutoDreamConfig cfg = effectiveConfig();
+        ConsolidationLock lock = new ConsolidationLock(memoryDir);
         // isGateOpen · remote mode（autoDream.ts:97 getIsRemoteMode；位于 autoMemory 之前 =
         //   CC 门序 autoDream.ts:95-100 最便宜先，KAIROS=N/A · OPD-M-26）
         if (remoteMode.getAsBoolean()) {
@@ -431,7 +500,7 @@ public class AutoDreamConsolidator {
             return;
         }
         // 时间门控（consolidationLock.ts:29-36 单 stat · 动态 minHours）
-        Long lastAt = checkTimeGate(cfg.minHours());
+        Long lastAt = checkTimeGate(cfg.minHours(), lock);
         if (lastAt == null) {
             return;
         }
@@ -450,11 +519,11 @@ public class AutoDreamConsolidator {
             return;
         }
         // 锁门控（consolidationLock.ts:46-84 tryAcquireConsolidationLock）
-        Long priorMtime = acquireLock();
+        Long priorMtime = acquireLock(lock);
         if (priorMtime == null) {
             return;
         }
-        doConsolidate(workspaceDir, priorMtime, sessionIds, hoursSince, appendSystemMessage, forkRawMaterial);
+        doConsolidate(workspaceDir, priorMtime, sessionIds, hoursSince, appendSystemMessage, forkRawMaterial, memoryDir, lock);
     }
 
     /**
@@ -478,10 +547,11 @@ public class AutoDreamConsolidator {
      * 读失败 → 0（CC fail-open，readLastConsolidatedAt 内部 catch 返回 0，OPD-M-32 回归）。
      *
      * @param minHours 动态阈值（CC autoDream.ts:141 {@code hoursSince < cfg.minHours}）
+     * @param lock     本会话 memoryDir 派生的锁（[A1 重做] 显式传入，不现算 storage.memoryDir()）
      * @return 通过 → 上次合并时间 ms（0 = 从未合并）；阻断 → null
      */
-    Long checkTimeGate(double minHours) {
-        long lastAt = consolidationLock.readLastConsolidatedAt();
+    Long checkTimeGate(double minHours, ConsolidationLock lock) {
+        long lastAt = lock.readLastConsolidatedAt();
         double hoursSince = (System.currentTimeMillis() - lastAt) / 3_600_000.0;
         if (hoursSince < minHours) {
             if (log.isDebugEnabled()) {
@@ -531,10 +601,16 @@ public class AutoDreamConsolidator {
      */
     List<String> scanSessionTranscripts(Path workspaceDir, String sessionId, long sinceMs) {
         List<String> result = new ArrayList<>();
-        Path base = workspaceDir;
+        // [BUG-FIX 2026-09-04 autoDream 永不触发] transcript 不在 workspaceDir(项目根)平铺——
+        //   生产 transcript = {configHome}/projects/{sanitize(workspaceDir)}/{sessionId}.jsonl(S2 扁平布局,
+        //   SessionStorage.getProjectDir(workspaceDir) = getProjectsDir()/sanitizePath(projectRoot))，
+        //   对齐 CC listSessionsTouchedSince → getProjectDir(getOriginalCwd())（consolidationLock.ts:121-122）。
+        //   原实现 base=workspaceDir(项目根,无 .jsonl) → 会话门恒 0 < minSessions=5 → autoDream 永不
+        //   fire → auto-memory 永远空。workspaceDir(null/不存在)仍阻断(防御)。
+        Path base = workspaceDir == null ? null : SessionStorage.getProjectDir(workspaceDir);
         if (base == null || !Files.isDirectory(base)) {
             if (log.isDebugEnabled()) {
-                log.debug("[AutoDream] workspaceDir 不存在或不可读，会话门阻断: {}", base);
+                log.debug("[AutoDream] transcript 基目录不存在或不可读，会话门阻断: {}", base);
             }
             return result;
         }
@@ -545,8 +621,18 @@ public class AutoDreamConsolidator {
                     return; // listCandidates:183 name.endsWith('.jsonl')
                 }
                 String candidateId = fileName.substring(0, fileName.length() - ".jsonl".length());
-                if (!isUuid(candidateId)) {
-                    return; // validateUuid（sessionStoragePortable.ts:26-30，排除 agent-*.jsonl）
+                // [B1 修复 2026-09-04] 会话门过滤对齐 CC 意图（排除 agent-*.jsonl 子代理 sidechain）
+                //   —— 生产主会话 transcript 文件名 = sess-<hex>.jsonl（[session-id-short] 键型
+                //   UUID→String short 形态），旧实现照抄 CC validateUuid（sessionStoragePortable.ts:26-30）
+                //   只认 UUID → 生产 sess-*.jsonl 全被排除 → 会话门恒 0 → autoDream 永不触发。
+                //   CC validateUuid 的本意（listSessionsImpl.ts:184 注释）是排除 agent-*.jsonl
+                //   （子代理文件，CC 主会话恰好 UUID 命名故用 UUID 校验）。Java 主会话 = sess-*，
+                //   故按意图对齐：排除 agent-* 前缀 + 计入 sess-* 前缀（UUID 老格式仍兼容保留）。
+                if (candidateId.startsWith("agent-")) {
+                    return; // 子代理 sidechain（SessionStorage:85 agent-${agentId}.jsonl）排除
+                }
+                if (!isUuid(candidateId) && !candidateId.startsWith("sess-")) {
+                    return; // 非会话文件排除（CC validateUuid 等价意图）
                 }
                 if (sessionId != null && sessionId.equals(candidateId)) {
                     return; // 排除当前 session（autoDream.ts:164 · D5-A 参数化显式传入）
@@ -584,10 +670,11 @@ public class AutoDreamConsolidator {
      * <p>stale 窗口(1h)内且持有者 PID 存活 → null（阻塞）；否则写 PID + re-read 校验，
      * 返回 priorMtime（0 = 获取前无锁文件）。
      *
+     * @param lock 本会话 memoryDir 派生的锁（[A1 重做] 显式传入，不现算 storage.memoryDir()）
      * @return 获取成功 → priorMtime（供 rollback）；被持有/竞态失败 → null
      */
-    Long acquireLock() {
-        Long priorMtime = consolidationLock.tryAcquireConsolidationLock();
+    Long acquireLock(ConsolidationLock lock) {
+        Long priorMtime = lock.tryAcquireConsolidationLock();
         if (priorMtime == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[AutoDream] lock_gate 阻断: 锁被持有（stale 窗口内 PID 存活）");
@@ -628,7 +715,7 @@ public class AutoDreamConsolidator {
      */
     private void doConsolidate(Path workspaceDir, long priorMtime, List<String> sessionIds,
                                double hoursSince, Consumer<SystemMessage> appendSystemMessage,
-                               ForkRawMaterial forkRawMaterial) {
+                               ForkRawMaterial forkRawMaterial, Path memoryDir, ConsolidationLock lock) {
         emitTelemetry("tengu_auto_dream_fired", Map.of(
             "hours_since", Math.round(hoursSince),
             "sessions_since", sessionIds.size()));
@@ -653,7 +740,7 @@ public class AutoDreamConsolidator {
 
             // 3. fork 直接写文件（autoDream.ts:224-233 · overrides.abortController + onMessage）
             ForkedAgentParams params = buildForkParams(prompt, dreamTaskId, abortController,
-                touchedPaths, forkRawMaterial);
+                touchedPaths, forkRawMaterial, memoryDir);
 
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null
@@ -704,7 +791,7 @@ public class AutoDreamConsolidator {
                 if (log.isDebugEnabled()) {
                     log.debug("[AutoDream] 合并被中止（非 kill 路径），回滚锁（防 mtime=now 阻断下轮）");
                 }
-                consolidationLock.rollbackConsolidationLock(priorMtime);
+                lock.rollbackConsolidationLock(priorMtime);
                 return;
             }
             // 5. 遥测 failed + rollback 回退 mtime（autoDream.ts:266-271）
@@ -713,7 +800,7 @@ public class AutoDreamConsolidator {
             if (dreamTaskId != null) {
                 dreamTaskRegistry.failDreamTask(dreamTaskId);
             }
-            consolidationLock.rollbackConsolidationLock(priorMtime);
+            lock.rollbackConsolidationLock(priorMtime);
             return;
         }
     }
@@ -770,10 +857,10 @@ public class AutoDreamConsolidator {
         }
         // ② 手动乐观盖章（dream.ts:32 await recordConsolidation() · 与自动 dream 区别：
         //    不 tryAcquire/不 rollback，best-effort 静默，失败不炸断 /dream 命令）
-        consolidationLock.recordConsolidation();
+        consolidationLock().recordConsolidation();
 
         // ③ 组装手动 prompt（dream.ts:27-38）
-        String memoryRoot = memoryDir.toString();
+        String memoryRoot = memoryDir().toString();
         String transcriptDir = workspaceDir != null ? workspaceDir.toString() : memoryRoot;
         String basePrompt = ConsolidationPrompt.buildConsolidationPrompt(memoryRoot, transcriptDir, "");
         String prompt = DREAM_PROMPT_PREFIX + basePrompt;
@@ -791,7 +878,7 @@ public class AutoDreamConsolidator {
         List<String> touchedPaths = new ArrayList<>();
         try {
             ForkedAgentParams params = buildForkParams(prompt, null, abortController,
-                touchedPaths, forkRawMaterial);
+                touchedPaths, forkRawMaterial, memoryDir());
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null
                 ? result.totalUsage() : ForkedAgentResult.ForkUsage.empty();
@@ -833,12 +920,15 @@ public class AutoDreamConsolidator {
      * @param abortController abortController 透传（CC overrides.abortController）
      * @param touchedPaths    watcher 收集的 touched paths holder（自动/手动共享）
      * @param forkRawMaterial fork 原料（主线程 systemPrompt 等 · forkedAgent.ts:131-141；null = 兜底）
+     * @param memoryDir       本会话 auto-memory 目录（[A1 重做] 显式传入 —— doConsolidate 从
+     *                        consolidateIfNeeded 5 参透传；doDream 内部现算 storage.memoryDir()）
      * @return ForkedAgentParams（promptMessages + cacheSafeParams + canUseTool + 接线）
      */
     private ForkedAgentParams buildForkParams(String prompt, String dreamTaskId,
                                               AbortController abortController,
                                               List<String> touchedPaths,
-                                              ForkRawMaterial forkRawMaterial) {
+                                              ForkRawMaterial forkRawMaterial,
+                                              Path memoryDir) {
         String memoryRoot = memoryDir.toString();
         List<ChatMessageDto> promptMessages = List.of(userMessage(prompt));
 

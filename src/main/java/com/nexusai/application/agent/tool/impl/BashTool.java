@@ -1302,7 +1302,16 @@ public class BashTool implements Tool {
             // CC 语义：#handleTimeout（ShellCommand.ts:135-141）→ shouldAutoBackground 且已注册
             //   onTimeout 回调 → 转后台（进程不杀，返回 backgroundTaskId）；否则 #doKill(SIGTERM)
             //   → exit code 143 + stderr 前缀 "Command timed out after <formatDuration>"（:323-328）。
-            int await = awaitForegroundProcess(process, timeoutMs, backgroundedFlag);
+            // [manual-bg 修复] 外部后台化感知: 用户手动转后台(Ctrl+B/前端按钮经 TaskController→
+            //   backgroundExistingForegroundTask)翻转任务 isBackgrounded,但 BashTool 局部 backgroundedFlag
+            //   仅自动路径(15s/超时)置 —— 若不查任务后台化状态,execute 会一直等进程自然结束,agent 循环
+            //   卡住(对齐 CC BashTool.tsx:1090-1102 前台 progress loop 查 shellCommand.status==='backgrounded')。
+            //   foregroundTaskId 非 effectively final(1090 初始化 + 1263 赋值) → 复制到 final 供 lambda 捕获。
+            final String fgTaskIdForAwait = foregroundTaskId;
+            int await = awaitForegroundProcess(process, timeoutMs, backgroundedFlag,
+                () -> fgTaskIdForAwait != null && backgroundTaskRunner != null
+                    && backgroundTaskRunner.getTask(fgTaskIdForAwait)
+                        .map(t -> t.isBackgrounded()).orElse(false));
 
             if (backgroundedFlag[0]) {
                 // G5-2: 15s 定时器已就地转后台（backgroundExistingForegroundTask 成功）→ 返回后台化结果
@@ -1649,11 +1658,24 @@ public class BashTool implements Tool {
      * @param backgroundedFlag 单元素布尔数组（15s 定时器转后台后置 true → 立即返回）
      * @return {@link #AWAIT_COMPLETED} / {@link #AWAIT_TIMEOUT} / {@link #AWAIT_INTERRUPTED}
      */
-    private static int awaitForegroundProcess(Process process, long timeoutMs, boolean[] backgroundedFlag) {
+    /**
+     * 等待前台进程结束(≤250ms 轮询)。
+     *
+     * <p>[manual-bg 修复 2026-09-04] 除本地 backgroundedFlag(仅 BashTool 自动路径 —— 15s 定时器/超时
+     * 置位)外,还检查 externallyBackgrounded(外部<b>手动</b>转后台:Ctrl+B/前端「转后台」按钮经
+     * TaskController → {@code BackgroundTaskRunner.backgroundExistingForegroundTask} 翻转任务
+     * isBackgrounded,<b>不置</b> BashTool 局部 backgroundedFlag)。对齐 CC BashTool.tsx:1090-1102
+     * {@code shellCommand.status === 'backgrounded'} 每 tick 检测 —— CC 手动 Ctrl+B 由前台 progress loop
+     * 检测到后返回 backgroundTaskId 让 agent 循环继续。任一成立 → 置 flag + 返回 AWAIT_TIMEOUT(调用方
+     * :1307 走 backgroundedFlag 分支返回后台化结果,进程不杀)。
+     */
+    private static int awaitForegroundProcess(Process process, long timeoutMs, boolean[] backgroundedFlag,
+                                              java.util.function.BooleanSupplier externallyBackgrounded) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (true) {
-            if (backgroundedFlag[0]) {
-                return AWAIT_TIMEOUT; // 已转后台（视为"未自然完成"），调用方按后台化结果处理
+            if (backgroundedFlag[0] || externallyBackgrounded.getAsBoolean()) {
+                backgroundedFlag[0] = true;
+                return AWAIT_TIMEOUT; // 已转后台(本地自动 15s/超时 或 外部手动 Ctrl+B),调用方按后台化结果处理
             }
             if (!process.isAlive()) {
                 return AWAIT_COMPLETED;

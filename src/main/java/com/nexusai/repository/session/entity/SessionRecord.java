@@ -133,6 +133,15 @@ public class SessionRecord {
      * 值 = agentType 串（AgentDefinitionRegistry.findAgent 等价 lookup，SP-03）。
      */
     private String mainThreadAgent;
+    /**
+     * 显式命名标志（V66 列 title_explicit，三态）· CC original: hasExplicitTitle / custom-title
+     *   storage（initReplBridge.ts:299-336 / REPL.tsx:2684-2698）：
+     *   0 = 未显式命名（count1/count3 可自动生成，对齐 CC hasExplicitTitle=false）
+     *   1 = 显式 /rename（PATCH，永不自动覆盖，对齐 CC getCurrentSessionTitle 语义）
+     *   2 = 自动生成且 count3 已刷新（不再自动刷新，对齐 CC onUserMessage count>=3 后回调停 done）
+     *   null = 存量旧行（V66 DEFAULT 0 语义，读侧按 0 处理）。
+     */
+    private Integer titleExplicit;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -186,4 +195,7 @@ public class SessionRecord {
     // [prompt-align SP-03 V58] 会话指定主线程 agent getter/setter（V58 会话列，MyBatis-Flex snake↔camel 映射）
     public String getMainThreadAgent() { return mainThreadAgent; }
     public void setMainThreadAgent(String mainThreadAgent) { this.mainThreadAgent = mainThreadAgent; }
+    // [title-cc-align V66] 显式命名标志 getter/setter（V66 会话列 title_explicit，MyBatis-Flex snake↔camel 映射）
+    public Integer getTitleExplicit() { return titleExplicit; }
+    public void setTitleExplicit(Integer titleExplicit) { this.titleExplicit = titleExplicit; }
 }

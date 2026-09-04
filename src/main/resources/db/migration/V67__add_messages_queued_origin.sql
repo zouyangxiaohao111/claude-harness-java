@@ -1,0 +1,24 @@
+-- ===================================================================
+-- V67: messages 表新增 queued_origin 列（mid-turn 排队用户消息来源标记）
+--
+-- [2026-09-04 P0-1 OD-1/OD-3 方案 A「存原文 + 标记列 + 发送时包壳」]：
+--   用户工作途中（busy）发来的排队消息（busy-queued），mid-turn drain 注入本轮上下文时
+--   state 存原文 + queuedOrigin='busy-queued' 标记，DB 同步落「原文」到 content 列
+--   （红线：不改 DB content），另在本列记录来源标记 queued_origin —— resume 重放时
+--   MessageService.toDto 读回该列 → ChatMessageDto.queuedOrigin → 发送层按标记重新包壳
+--   （修 live 有壳 / resume 丢壳 错位，对齐 CC transcript 存 RAW + normalizeMessagesForAPI
+--   临时包壳语义 messages.ts:2269-2291）。
+--
+-- 列语义：
+--   queued_origin（VARCHAR，可空）：
+--     'busy-queued' = mid-turn 真实用户排队消息（唯一落库标记；发送层中文提醒壳）；
+--     null = 普通用户消息 / 空闲 cron / busy 空闲消费 / slash meta/result/reject
+--            （红线：空闲路径零标记，CC processTextPrompt 原文发）。
+--   仅 busy-queued 标记持久化；task-notification/coordinator/channel/cron mid-turn 注入
+--   不落库（现状 scope，resume 后消失，明示验收不误判）。
+--
+-- 不加 DEFAULT，null = 非 busy-queued 消息（零行为变化）。
+--   对齐 V62 snip_metadata / V22 cwd 先例（MyBatis-Flex 自动 snake_case↔camelCase：
+--   camelCase 字段 queuedOrigin → 列 queued_origin）。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN queued_origin VARCHAR NULL;

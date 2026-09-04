@@ -130,9 +130,11 @@ public class VisionAnalyzeTool implements Tool {
 
     @Override
     public String description() {
-        return "代理视觉模型分析：把图片与指令发给独立视觉模型（settings.multimodalModelName）"
-                + "分析，返回纯文本结果。type=analyze 读附件缓存图片（contentId）→ 视觉模型分析；"
-                + "type=suggest 纯 prompt 建议（不读图）。返回文本中图片以 [image:contentId] 占位符表示。";
+        return "代理视觉模型分析：把图片/PDF 页与指令发给独立视觉模型（settings.multimodalModelName）"
+                + "分析，返回纯文本结果。type=analyze 读源（source 二选一：contentId=附件表 contentId，"
+                + "path=文件系统路径）+ contentType=image|pdf（pdf 支持 pages 显式页号数组 [1,2,3]）→ 视觉"
+                + "模型分析；type=suggest 纯 prompt 建议（不读图）。返回文本以 [image/…] 占位符代替二进制，"
+                + "绝不注入图片给主模型。";
     }
 
     /** 只读 · 读缓存 + 外部模型调用，无副作用。 */
@@ -148,18 +150,20 @@ public class VisionAnalyzeTool implements Tool {
     }
 
     /**
-     * <b>懒加载（shouldDefer=true，2026-09-01 拍板）</b>：本工具只在主模型<b>不支持视觉</b>时
-     * 需要；视觉模型（Claude 系）图片直接注入 image block 用不上 → 懒加载省 token。
-     *
-     * <p><b>懒加载的生效由 useToolSearch 决定</b>（对齐 CC Tool.ts shouldDefer + toolSearch 门控）：
+     * <b>想懒（shouldDefer=true，2026-09-03 定稿）</b>：vision_analyze 默认懒加载（defer_loading 语义，
+     * 省 schema token）。是否<b>实际懒</b>由<b>装配层按主模型能力豁免</b>决定（LlmAgentLoop
+     * {@code exemptVisionAnalyzeDeferForTextModel}，见该处 javadoc）：
      * <ul>
-     *   <li>useToolSearch=true（Claude 系/支持 tool_reference）→ 真懒加载：prompt 只给工具名，
-     *       模型经 ToolSearch 确认后调用（defer_loading 语义，省 schema token）。</li>
-     *   <li>useToolSearch=false（deepseek 等 openai_compatible 无 tool_reference）→ 懒加载不生效：
-     *       全部工具（含本 defer 工具）直接发送完整 schema，模型视作普通工具直接调用（无搜索环节、
-     *       无死锁）。由 {@code ToolSearchService.DEFAULT_UNSUPPORTED_MODEL_PATTERNS +"deepseek"}
-     *       统一门控保障，非单列本工具。</li>
+     *   <li>主模型 = ant/response 直给格式 + 多模态（supportsImage）→ 能走 Read 直给通道，vision_analyze
+     *       仅 PDF &gt;预算/分段补充 → <b>保留懒</b>（需时经 ToolSearch/discovered 激活）；</li>
+     *   <li>其余（deepseek openai-completions，<b>含 vision-exp 多模态</b> / 任何文本模型）→ vision_analyze
+     *       是<b>唯一视觉通道</b> → 装配层从 deferred 剔除 → <b>schema 直发</b>（不赌模型会 ToolSearch，
+     *       历史 Read 图死循环 / fork 视觉子代理递归诱因之一）。</li>
      * </ul>
+     *
+     * <p><b>Task#15（子代理拿不到）根治</b>：子代理共享主循环 queryLoop 装配（LlmAgentLoop:5360 注释），
+     * 装配层豁免一处即覆盖主/子代理 —— fresh 子代理若主模型非 ant+多模态，vision_analyze 不再因 defer
+     * 排除，schema 直发可见。
      */
     @Override
     public boolean shouldDefer(JsonNode input) {
@@ -167,9 +171,9 @@ public class VisionAnalyzeTool implements Tool {
     }
 
     /**
-     * 输入 schema · 方案定稿 {@code { type(必选), prompt(必选), contentId(可选) }}。
-     * {@code contentId} 为 {@link ImageAttachmentStore} 分配的整数图片 id（LLM 侧以字符串传递），
-     * 仅 {@code type=analyze} 必填。
+     * 输入 schema v2 · {@code { type(必选), prompt(必选), contentType(可选), contentId|path(analyze 二选一), pages(可选) }}。
+     * {@code contentId} = 附件表 contentId（LLM 侧字符串传递）；{@code path} = 文件系统路径（Read 引导场景，
+     * 相对会话 cwd 解析）；{@code contentType=image|pdf} 分流源格式；{@code pages} 仅 pdf（显式页号数组）。
      */
     @Override
     public JsonNode inputSchema() {
@@ -180,15 +184,36 @@ public class VisionAnalyzeTool implements Tool {
         ObjectNode type = props.putObject("type");
         type.put("type", "string");
         type.put("enum", JsonNodeFactory.instance.arrayNode().add("analyze").add("suggest"));
-        type.put("description", "analyze=读缓存图并分析；suggest=纯 prompt 建议（不读图）");
+        type.put("description", "analyze=读源并分析；suggest=纯 prompt 建议（不读图）");
 
         ObjectNode prompt = props.putObject("prompt");
         prompt.put("type", "string");
         prompt.put("description", "发给视觉模型的指令/问题文本（必填）");
 
+        ObjectNode contentType = props.putObject("contentType");
+        contentType.put("type", "string");
+        contentType.put("enum", JsonNodeFactory.instance.arrayNode().add("image").add("pdf"));
+        contentType.put("description", "源格式（可选）：image=单图；pdf=PDF（支持 pages 页号数组）。"
+                + "缺省按 path 扩展名 / contentId 附件 mediaType 推断；suggest 忽略");
+
         ObjectNode contentId = props.putObject("contentId");
         contentId.put("type", "string");
-        contentId.put("description", "图片附件缓存 id（ImageAttachmentStore 分配的整数 id，字符串形式；type=analyze 必填）");
+        contentId.put("description", "附件表 contentId（整数 id 字符串形式；附件/粘贴媒体源）。"
+                + "type=analyze 时与 path 二选一，互斥");
+
+        ObjectNode path = props.putObject("path");
+        path.put("type", "string");
+        path.put("description", "文件系统路径（Read 引导场景；图片或 PDF）。相对路径按会话 cwd 解析。"
+                + "type=analyze 时与 contentId 二选一，互斥");
+
+        ObjectNode pages = props.putObject("pages");
+        pages.put("type", "array");
+        pages.put("description", "仅 contentType=pdf：显式页号数组（1-based，如 [1,2,3]），一次 ≤20 页。"
+                + "缺省：≤10 页全渲染，>10 页报错提示带 pages");
+        // [400 修复 2026-09-03] items 必须是 schema 对象 {"type":"integer"} —— 原 putArray("items").add("integer")
+        //   生成 items=["integer"]（字符串数组）非法 JSON Schema → OpenAI 400 "Invalid schema ... anyOf"。
+        //   putObject("items") 生成 items={"type":"integer"}，合法单元素数组 schema。
+        pages.putObject("items").put("type", "integer");
 
         schema.putArray("required").add("type").add("prompt");
         schema.put("additionalProperties", false);
@@ -215,13 +240,49 @@ public class VisionAnalyzeTool implements Tool {
         }
         if ("analyze".equals(type)) {
             String contentId = readString(input, "contentId");
-            if (contentId == null || contentId.isBlank()) {
-                return ValidationResult.fail("3", "Error: type=analyze requires contentId");
+            String path = readString(input, "path");
+            boolean hasContentId = contentId != null && !contentId.isBlank();
+            boolean hasPath = path != null && !path.isBlank();
+            // [v2 source 二选一] contentId=附件 / path=文件系统：缺源 → errorCode 3（旧文案子串兼容）；互斥 → 5
+            if (!hasContentId && !hasPath) {
+                return ValidationResult.fail("3", "Error: type=analyze requires contentId or path");
             }
-            try {
-                Long.parseLong(contentId.trim());
-            } catch (NumberFormatException e) {
-                return ValidationResult.fail("4", "Error: contentId must be a numeric id, got: " + contentId);
+            if (hasContentId && hasPath) {
+                return ValidationResult.fail("5", "Error: contentId and path are mutually exclusive, pick one");
+            }
+            if (hasContentId) {
+                try {
+                    Long.parseLong(contentId.trim());
+                } catch (NumberFormatException e) {
+                    return ValidationResult.fail("4", "Error: contentId must be a numeric id, got: " + contentId);
+                }
+            }
+            String contentType = readString(input, "contentType");
+            if (contentType != null && !contentType.isBlank()
+                    && !"image".equals(contentType) && !"pdf".equals(contentType)) {
+                return ValidationResult.fail("6", "Error: contentType must be image|pdf, got: " + contentType);
+            }
+            JsonNode pagesNode = input == null ? null : input.get("pages");
+            if (pagesNode != null && !pagesNode.isNull() && !pagesNode.isMissingNode()) {
+                if (!pagesNode.isArray()) {
+                    return ValidationResult.fail("7", "Error: pages must be an array of page numbers");
+                }
+                if (pagesNode.isEmpty()) {
+                    return ValidationResult.fail("8", "Error: pages must not be empty");
+                }
+                if (!"pdf".equals(contentType)) {
+                    return ValidationResult.fail("9", "Error: pages only applies to contentType=pdf");
+                }
+                if (pagesNode.size() > PdfSupport.PDF_MAX_PAGES_PER_READ) {
+                    return ValidationResult.fail("10", "Error: pages exceeds " + PdfSupport.PDF_MAX_PAGES_PER_READ
+                        + " pages per request");
+                }
+                for (JsonNode p : pagesNode) {
+                    if (!p.isInt() || p.asInt() < 1) {
+                        return ValidationResult.fail("8",
+                            "Error: pages must contain positive integer page numbers (1-based)");
+                    }
+                }
             }
         }
         return ValidationResult.pass();
@@ -257,58 +318,112 @@ public class VisionAnalyzeTool implements Tool {
                     type, truncate(prompt), contentIdStr == null ? "" : contentIdStr, sessionId);
         }
 
-        // ── 2. analyze 分支：contentId 必填 + 读图 + 5MB 门控 ──
+        // ── 2. analyze 源解析（v2：contentId/path 二选一 + contentType 分流 image|pdf）──
+        //    只解析源信息、不读二进制 —— PDF 页渲染推迟到 5 步（provider 校验通过后，免白渲染）
         String base64 = null;
         String mediaType = null;
         long contentId = -1;
+        boolean isPdf = false;
+        String pdfFilePath = null;
+        List<Integer> pages = null;
         if ("analyze".equals(type)) {
-            if (contentIdStr == null || contentIdStr.isBlank()) {
-                return ToolResult.error(call.id(), "type=analyze requires contentId");
+            String path = readString(input, "path");
+            String contentType = readString(input, "contentType");
+            boolean hasPath = path != null && !path.isBlank();
+            boolean hasContentId = contentIdStr != null && !contentIdStr.isBlank();
+            // [v2 source 二选一] contentId=附件 / path=文件系统（互斥）；缺源 → 同 validateInput errorCode 3 语义
+            if (!hasContentId && !hasPath) {
+                return ToolResult.error(call.id(), "type=analyze requires contentId or path");
             }
-            try {
-                contentId = Long.parseLong(contentIdStr.trim());
-            } catch (NumberFormatException e) {
-                log.warn("VisionAnalyzeTool contentId 非法: '{}' 原因={}", contentIdStr, e.getMessage());
-                return ToolResult.error(call.id(), "invalid contentId: " + contentIdStr);
+            if (hasContentId && hasPath) {
+                return ToolResult.error(call.id(), "contentId and path are mutually exclusive, pick one");
             }
-            // [附件双模式] 附件表（attachments 统一 contentId 中心：path/upload 大图 contentId=附件表 id）优先
-            //   → 附件表 path 读盘 base64；附件表无记录（历史 image-cache ≤5MB contentId / 200 FIFO 逐出 /
-            //   重启后内存索引丢失）→ 回退 imageAttachmentStore.getBase64OrDisk（内存命中 → 磁盘兜底）。
-            //   [id 空间防撞] 附件表命中须 mediaType=image/*（对齐发送侧 resolveContentIdInTable "image/"
-            //   前缀校验）：contentId 可能为 image-cache 空间 id（多模态路由 / PDF 文本模型页图注册），与
-            //   附件表非图片行（pdf/媒体/path 其它类型）同数字撞号时，若不加校验会错读非图片文件当图 → 张冠李戴。
-            String sourcePath = null;
-            Base64Content content = null;
-            if (attachmentService != null) {
-                AttachmentRecord rec = attachmentService.getContent(contentId);
-                String recMt = rec == null ? null : rec.getMediaType();
-                if (rec != null && rec.getPath() != null && !rec.getPath().isBlank()
-                        && recMt != null && recMt.toLowerCase().startsWith("image/")) {
-                    sourcePath = rec.getPath();
-                    content = readAttachmentTableContent(contentId, sourcePath);
+            if (hasContentId) {
+                try {
+                    contentId = Long.parseLong(contentIdStr.trim());
+                } catch (NumberFormatException e) {
+                    log.warn("VisionAnalyzeTool contentId 非法: '{}' 原因={}", contentIdStr, e.getMessage());
+                    return ToolResult.error(call.id(), "invalid contentId: " + contentIdStr);
                 }
             }
-            if (content == null) {
-                content = imageAttachmentStore == null
-                        ? null : imageAttachmentStore.getBase64OrDisk(sessionId, contentId);
+            // contentType 缺省推断：path 按扩展名（.pdf）；contentId 按附件 mediaType（application/pdf）
+            if (contentType != null && !contentType.isBlank()) {
+                isPdf = "pdf".equals(contentType);
+            } else if (hasPath) {
+                isPdf = looksLikePdf(path);
+            } else {
+                isPdf = attachmentIsPdf(contentId);
             }
-            if (content == null) {
-                log.warn("VisionAnalyzeTool 附件缓存未命中: contentId={} session={}", contentId, sessionId);
-                return ToolResult.error(call.id(), "attachment cache miss for contentId=" + contentId);
-            }
-            if (isBase64Oversize(content.base64())) {
-                String hint = sourcePath == null || sourcePath.isBlank() ? "" : "，本地路径=" + sourcePath;
-                log.warn("VisionAnalyzeTool 图片超 5MB 无法发给视觉模型: contentId={} base64Len={} mediaType={} session={}{}（建议改用本地路径引用）",
-                        contentId, content.base64().length(), content.mediaType(), sessionId, hint);
-                return ToolResult.error(call.id(),
-                        "图片超 5MB 无法发送视觉模型，请改用本地路径引用: contentId=" + contentId + hint);
-            }
-            base64 = content.base64();
-            mediaType = content.mediaType();
-            if (log.isDebugEnabled()) {
-                log.debug("VisionAnalyzeTool 读取附件内容成功: contentId={} mediaType={} base64Len={} session={} 来源={}",
-                        contentId, mediaType, base64.length(), sessionId,
-                        sourcePath == null ? "image-cache" : "附件表 path=" + sourcePath);
+            pages = readPages(input);
+            if (isPdf) {
+                // [v2 pdf 源] path 直读 / contentId → 附件表 getPath（零拷贝引用磁盘 PDF）。仅解析路径，
+                //    渲染在 5 步（resolvePdfSourceFile 含 exists 校验；null → fail-loud 提示走 path 重传）
+                pdfFilePath = resolvePdfSourceFile(path, contentId, hasContentId, ctx);
+                if (pdfFilePath == null) {
+                    return ToolResult.error(call.id(), hasContentId
+                        ? "无法解析 PDF 附件路径: contentId=" + contentId
+                            + "（附件表无 application/pdf 记录；历史存量 contentId 不支持，请改传 path 重试）"
+                        : "path 文件不存在或不可读: " + path);
+                }
+                if (log.isInfoEnabled()) {
+                    log.info("VisionAnalyzeTool PDF 源解析成功: source={} path={} pages={} session={}",
+                        hasContentId ? "contentId=" + contentId : "path", pdfFilePath, pages, sessionId);
+                }
+            } else {
+                // image 单图：contentId（附件表 image/* → image-cache 回退）或 path 读盘
+                String sourcePath = null;
+                Base64Content content = null;
+                if (hasContentId) {
+                    // [附件双模式] 附件表（attachments 统一 contentId 中心：path/upload 大图）优先 →
+                    //   附件表 path 读盘 base64；附件表无记录（历史 image-cache contentId / 200 FIFO 逐出 /
+                    //   重启后内存索引丢失）→ 回退 imageAttachmentStore.getBase64OrDisk（内存命中 → 磁盘兜底）。
+                    //   [id 空间防撞] 附件表命中须 mediaType=image/*：防 image-cache 空间 id 与附件表
+                    //   非图片行同数字撞号张冠李戴（对齐发送侧 resolveContentIdInTable "image/" 前缀校验）。
+                    if (attachmentService != null) {
+                        AttachmentRecord rec = attachmentService.getContent(contentId);
+                        String recMt = rec == null ? null : rec.getMediaType();
+                        if (rec != null && rec.getPath() != null && !rec.getPath().isBlank()
+                                && recMt != null && recMt.toLowerCase().startsWith("image/")) {
+                            sourcePath = rec.getPath();
+                            content = readAttachmentTableContent(contentId, sourcePath);
+                        }
+                    }
+                    if (content == null) {
+                        content = imageAttachmentStore == null
+                                ? null : imageAttachmentStore.getBase64OrDisk(sessionId, contentId);
+                    }
+                } else {
+                    // [v2 path 图] 文件系统读盘（相对会话 cwd 解析）
+                    Path file = resolvePath(path, ctx);
+                    if (file == null) {
+                        return ToolResult.error(call.id(), "path 文件不存在: " + path);
+                    }
+                    try {
+                        byte[] bytes = Files.readAllBytes(file);
+                        content = new Base64Content(resolveImageMediaType(path), Base64.getEncoder().encodeToString(bytes));
+                    } catch (Exception e) {
+                        log.warn("VisionAnalyzeTool path 图片读取失败: path={} 原因={}", path, e.getMessage());
+                        return ToolResult.error(call.id(), "读取 path 图片失败: " + path + " (" + e.getMessage() + ")");
+                    }
+                }
+                if (content == null) {
+                    log.warn("VisionAnalyzeTool 附件缓存未命中: contentId={} session={}", contentId, sessionId);
+                    return ToolResult.error(call.id(), "attachment cache miss for contentId=" + contentId);
+                }
+                if (isBase64Oversize(content.base64())) {
+                    String hint = sourcePath == null || sourcePath.isBlank() ? "" : "，本地路径=" + sourcePath;
+                    log.warn("VisionAnalyzeTool 图片超 5MB 无法发给视觉模型: contentId={} base64Len={} mediaType={} session={}{}",
+                            contentId, content.base64().length(), content.mediaType(), sessionId, hint);
+                    return ToolResult.error(call.id(),
+                            "图片超 5MB 无法发送视觉模型，请改用本地路径引用: contentId=" + contentId + hint);
+                }
+                base64 = content.base64();
+                mediaType = content.mediaType();
+                if (log.isDebugEnabled()) {
+                    log.debug("VisionAnalyzeTool 读取图片内容成功: contentId={} mediaType={} base64Len={} session={} 来源={}",
+                            contentId, mediaType, base64.length(), sessionId,
+                            sourcePath == null ? "image-cache/path" : "附件表 path=" + sourcePath);
+                }
             }
         }
 
@@ -344,8 +459,11 @@ public class VisionAnalyzeTool implements Tool {
         String resultText;
         try {
             // 8-arg ChatRequestOptions: history/tools/outputFormat/thinkingConfig/temperature/querySource/abort/maxTokens
-            if ("analyze".equals(type)) {
-                // 单条 user 消息：contentBlocks=[text, image]（text 块在前，对齐 CC prompt 数组 attachments.ts:1065-1071）
+            if ("analyze".equals(type) && isPdf) {
+                // [v2 pdf] 懒渲染 pages → 页图 image blocks → 视觉模型（单条 user 消息 text+N image）
+                resultText = chatWithPdfPages(provider, resolved, modelName, prompt, pdfFilePath, pages, contentId);
+            } else if ("analyze".equals(type)) {
+                // image 单图：contentBlocks=[text, image]（text 块在前，对齐 CC prompt 数组 attachments.ts:1065-1071）
                 List<JsonNode> blocks = new ArrayList<>(2);
                 blocks.add(textBlock(prompt));
                 blocks.add(com.nexusai.application.agent.LlmAgentLoop.imageContentBlock(mediaType, base64));
@@ -362,28 +480,244 @@ public class VisionAnalyzeTool implements Tool {
                 resultText = provider.chatWithOptions(resolved.config(), modelName, null, prompt, options);
             }
         } catch (Exception e) {
-            log.error("VisionAnalyzeTool 视觉模型调用失败: model={} type={} contentId={} 原因={}",
-                    modelName, type, contentId, e.getMessage());
+            log.error("VisionAnalyzeTool 视觉模型调用失败: model={} type={} contentId={} isPdf={} 原因={}",
+                    modelName, type, contentId, isPdf, e.getMessage());
             return ToolResult.error(call.id(), "vision model call failed: " + e.getMessage());
         }
 
         // ── 6. 组装纯文本 ToolResult（占位符代替 base64，绝不给主模型 base64）──
-        String data = buildResultText(type, contentId, resultText);
+        String data = buildResultText(type, contentId, resultText, isPdf ? pdfFilePath : null, pages);
         if (log.isDebugEnabled()) {
-            log.debug("VisionAnalyzeTool 执行成功: type={} contentId={} model={} resultLen={}（返回纯文本，图片以占位符表示）",
-                    type, contentId, modelName, resultText == null ? 0 : resultText.length());
+            log.debug("VisionAnalyzeTool 执行成功: type={} contentId={} isPdf={} model={} resultLen={}（返回纯文本，图片以占位符表示）",
+                    type, contentId, isPdf, modelName, resultText == null ? 0 : resultText.length());
         }
         return ToolResult.success(call.id(), data);
     }
 
     /**
-     * 纯文本结果组装 · 图片以 {@code [image:{contentId}]} 占位符表示，绝不携带 base64。
+     * [v2 pdf] PDF 懒渲染 pages → 页图 image blocks → 视觉模型（多图单条 user 消息）→ 纯文本返回。
+     *
+     * <p><b>懒渲染</b>：不预注册页图（替代 registerPageImagesToStore），调用时经 PdfSupport 100 DPI
+     * 渲染 <code>pages</code> 指定页到临时目录，只挑所需页转 base64（每页 ≤5MB gate）。渲染临时目录
+     * finally 递归清理。页号越界 / 超 20 页跨度 / 渲染失败 → 抛 {@link IllegalStateException}（execute 外层
+     * catch → fail-loud ToolResult.error）。
+     *
+     * @param provider     视觉模型 provider
+     * @param resolved     已解析 ProviderConfig（resolved.config() 供 chatWithOptions）
+     * @param modelName    多模态档位模型名（日志）
+     * @param prompt       主模型问题（text 块置前）
+     * @param pdfFilePath  PDF 本地绝对路径（resolvePdfSourceFile 已 exists 校验）
+     * @param pages        显式页号（1-based；null/空 → ≤10 页全渲染，>10 报错要求 pages）
+     * @param contentId    源 contentId（日志；path 源为 -1）
+     * @return 视觉模型纯文本响应
      */
-    private static String buildResultText(String type, long contentId, String resultText) {
+    private String chatWithPdfPages(LlmProvider provider, ModelConfigResolver.ResolvedModel resolved,
+                                    String modelName, String prompt, String pdfFilePath,
+                                    List<Integer> pages, long contentId) throws Exception {
+        Path file = Path.of(pdfFilePath);
+        Integer pageCount = PdfSupport.getPDFPageCount(file);
+        if (pageCount == null || pageCount <= 0) {
+            throw new IllegalStateException("无法读取 PDF 页数: " + pdfFilePath);
+        }
+        List<Integer> selected = (pages != null && !pages.isEmpty()) ? pages : defaultPdfPages(pageCount);
+        for (Integer p : selected) {
+            if (p == null || p < 1 || p > pageCount) {
+                throw new IllegalStateException("PDF 页号越界: page=" + p + "（共 " + pageCount + " 页）");
+            }
+        }
+        int min = selected.get(0);
+        int max = selected.get(selected.size() - 1);
+        if ((long) max - min + 1 > PdfSupport.PDF_MAX_PAGES_PER_READ) {
+            throw new IllegalStateException("PDF 一次最多渲染 " + PdfSupport.PDF_MAX_PAGES_PER_READ
+                + " 页，当前跨度 " + (max - min + 1) + " 页，请缩小 pages 范围");
+        }
+        Path tmpDir = Files.createTempDirectory("vision-analyze-pdf-");
+        try {
+            PdfSupport.PdfExtractResult extract = PdfSupport.extractPDFPages(file, tmpDir, min, max);
+            if (!extract.success()) {
+                throw new IllegalStateException("PDF 页渲染失败: " + extract.error().message());
+            }
+            List<JsonNode> imgBlocks = new ArrayList<>();
+            for (Integer p : selected) {
+                Path jpg = tmpDir.resolve(String.format("page-%02d.jpg", p));
+                if (!Files.exists(jpg)) {
+                    throw new IllegalStateException("PDF 页图缺失: page-" + p + ".jpg");
+                }
+                byte[] bytes = Files.readAllBytes(jpg);
+                String b64 = Base64.getEncoder().encodeToString(bytes);
+                if (isBase64Oversize(b64)) {
+                    throw new IllegalStateException("PDF 第 " + p + " 页图超 5MB 无法发送视觉模型"
+                        + "（页面过大，建议减小 pages 范围）");
+                }
+                imgBlocks.add(com.nexusai.application.agent.LlmAgentLoop.imageContentBlock(
+                    PDF_PAGE_IMAGE_MEDIA_TYPE, b64));
+            }
+            if (imgBlocks.isEmpty()) {
+                throw new IllegalStateException("PDF 页图产出为空（渲染失败）");
+            }
+            List<JsonNode> blocks = new ArrayList<>(imgBlocks.size() + 1);
+            blocks.add(textBlock(prompt));
+            blocks.addAll(imgBlocks);
+            ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
+                Role.user, prompt, null, null, blocks, List.of(), true);
+            LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
+                List.of(user), null, null, null, null, "vision_analyze", null, null);
+            if (log.isDebugEnabled()) {
+                log.debug("VisionAnalyzeTool PDF 页图已组装: path={} pages={} 页图={}（送视觉模型）",
+                    pdfFilePath, selected, imgBlocks.size());
+            }
+            return provider.chatWithOptions(resolved.config(), modelName, null, null, options);
+        } finally {
+            deleteRecursive(tmpDir);
+        }
+    }
+
+    /**
+     * pages 缺省策略 · 对齐 CC FileReadTool PDF_AT_MENTION_INLINE_THRESHOLD=10：
+     * ≤10 页全渲染；>10 页报错要求显式 pages（fail-loud，防整份大 PDF 全渲染浪费）。
+     */
+    private static List<Integer> defaultPdfPages(int pageCount) throws Exception {
+        if (pageCount > PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD) {
+            throw new IllegalStateException("PDF 共 " + pageCount + " 页（>"
+                + PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD + "），请传 pages=[页号数组] 分段分析，一次 ≤"
+                + PdfSupport.PDF_MAX_PAGES_PER_READ + " 页");
+        }
+        List<Integer> all = new ArrayList<>(pageCount);
+        for (int i = 1; i <= pageCount; i++) {
+            all.add(i);
+        }
+        return all;
+    }
+
+    /**
+     * [v2] PDF 源 → 本地绝对路径（exists 校验）。contentId 走附件表 {@link AttachmentService#getPath}
+     * （application/pdf 附件，零拷贝引用磁盘）；path 走 {@link #resolvePath}（相对 cwd）。
+     * 解析失败 → null（调用方 fail-loud；历史存量 store contentId 无附件表记录 → 提示改传 path）。
+     */
+    private String resolvePdfSourceFile(String path, long contentId, boolean hasContentId, ToolUseContext ctx) {
+        if (!hasContentId) {
+            Path f = resolvePath(path, ctx);
+            return f == null ? null : f.toString();
+        }
+        if (attachmentService == null) {
+            return null;
+        }
+        try {
+            String p = attachmentService.getPath(contentId);
+            if (p == null || p.isBlank()) {
+                return null;
+            }
+            Path f = Path.of(p);
+            return Files.exists(f) ? f.toString() : null;
+        } catch (Exception e) {
+            log.warn("VisionAnalyzeTool PDF contentId 路径解析失败: contentId={} 原因={}", contentId, e.getMessage());
+            return null;
+        }
+    }
+
+    /** [v2] 文件系统路径解析：绝对直读；相对按会话 cwd（ctx.effectiveCwd）解析；不存在 → null。 */
+    private static Path resolvePath(String path, ToolUseContext ctx) {
+        if (path == null || path.isBlank()) {
+            return null;
+        }
+        Path p = Path.of(path.trim());
+        if (!p.isAbsolute()) {
+            p = (ctx != null && ctx.effectiveCwd() != null ? ctx.effectiveCwd() : Path.of("").toAbsolutePath())
+                .resolve(p);
+        }
+        p = p.normalize();
+        return Files.exists(p) ? p : null;
+    }
+
+    /** 扩展名推断 PDF（contentType 缺省 + path 源时）。 */
+    private static boolean looksLikePdf(String path) {
+        if (path == null) {
+            return false;
+        }
+        return path.toLowerCase().endsWith(".pdf");
+    }
+
+    /** contentId 附件 mediaType 判 PDF（contentType 缺省 + contentId 源时）。 */
+    private boolean attachmentIsPdf(long contentId) {
+        if (attachmentService == null) {
+            return false;
+        }
+        try {
+            AttachmentRecord rec = attachmentService.getContent(contentId);
+            return rec != null && rec.getMediaType() != null
+                && PdfSupport.PDF_MEDIA_TYPE.equalsIgnoreCase(rec.getMediaType());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** [v2] path 图 mediaType：扩展名映射兜底 image/png（无附件表，独立于 resolveMediaType）。 */
+    private static String resolveImageMediaType(String path) {
+        if (path != null) {
+            int dot = path.lastIndexOf('.');
+            if (dot >= 0 && dot < path.length() - 1) {
+                String mapped = EXTENSION_TO_MEDIA_TYPE.get(path.substring(dot + 1).toLowerCase());
+                if (mapped != null) {
+                    return mapped;
+                }
+            }
+        }
+        return "image/png";
+    }
+
+    /** [v2] pages 数组读取：input.pages int[] → List&lt;Integer&gt;（保序）；缺省 → null。 */
+    private static List<Integer> readPages(JsonNode input) {
+        if (input == null || !input.has("pages") || input.get("pages").isNull()
+                || !input.get("pages").isArray()) {
+            return null;
+        }
+        JsonNode arr = input.get("pages");
+        List<Integer> list = new ArrayList<>();
+        for (JsonNode n : arr) {
+            if (n.isInt()) {
+                list.add(n.asInt());
+            }
+        }
+        return list.isEmpty() ? null : list;
+    }
+
+    /** 递归删除临时目录（渲染页图清理）。 */
+    private static void deleteRecursive(Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> walk = Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (java.io.IOException ignored) {
+                    // 尽力清理，失败不阻断主流程
+                }
+            });
+        } catch (java.io.IOException e) {
+            log.warn("VisionAnalyzeTool 清理 PDF 临时目录失败: dir={} 原因={}", dir, e.getMessage());
+        }
+    }
+
+    /** PDF 页图 media_type（PdfSupport 100 DPI JPEG 渲染产出）。 */
+    private static final String PDF_PAGE_IMAGE_MEDIA_TYPE = "image/jpeg";
+
+    /**
+     * 纯文本结果组装 · image 以 {@code [image:{contentId}]}、pdf 以 {@code [pdf:path pages=[…]]}
+     * 占位符表示，绝不携带 base64。
+     */
+    private static String buildResultText(String type, long contentId, String resultText,
+                                          String pdfFilePath, List<Integer> pages) {
         StringBuilder sb = new StringBuilder();
         sb.append("[vision_analyze 结果] type=").append(type);
         if ("analyze".equals(type)) {
-            sb.append(", contentId=").append(contentId).append(", 图片占位符=[image:").append(contentId).append(']');
+            if (pdfFilePath != null) {
+                sb.append(", PDF 占位符=[pdf:").append(pdfFilePath)
+                  .append(" pages=").append(pages == null ? "全" : pages.toString()).append(']');
+            } else {
+                sb.append(", contentId=").append(contentId)
+                  .append(", 图片占位符=[image:").append(contentId).append(']');
+            }
         }
         sb.append('\n').append(resultText == null ? "" : resultText);
         return sb.toString();

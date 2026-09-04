@@ -13,6 +13,14 @@ export interface StreamBlock {
   content: string
   /** 工具卡片（回放推 tool_call 挂入 · 契约 #6；arguments 已在前端 JSON.stringify 转字符串） */
   toolCalls: ToolCallDto[]
+  /** message.usage 事件逐条挂载：该条 assistant 的 usage（含 decode_ms · 块内优先，complete 累计兜底） */
+  usage?: MessageUsageDto | null
+  /** message.usage 事件逐条挂载：上下文已用 tokens（块内优先） */
+  contextTokensUsed?: number | null
+  /** message.usage 事件逐条挂载：模型上下文窗口（tokens · 块内优先） */
+  contextWindow?: number | null
+  /** message.usage 事件逐条挂载：上下文剩余百分比（块内优先） */
+  percentLeft?: number | null
 }
 
 /** 会话流式 API 错误（message.error 事件 → 对话流助手位置错误卡渲染 · 对齐 CC assistant API error 语义） */
@@ -91,6 +99,14 @@ export interface ChatState {
   addToolCall: (sessionId: string, assistantMessageId: string, tool: ToolCallDto) => void
   /** 契约 #6：tool_result 按 toolCallId 匹配卡片填 result/isError（跨块遍历） */
   fillToolResult: (sessionId: string, toolCallId: string, result: string | null, isError: boolean | null) => void
+  /** message.usage（消息级完成、非 turn 终态）：按 assistantMessageId 定位块挂 usage/上下文快照
+   *  （lastIndexOf 取最新轮）；找不到 no-op（纯工具轮无块 → 由下一条 assistant / complete 兜底） */
+  applyMessageUsage: (sessionId: string, assistantMessageId: string | null | undefined, meta?: {
+    usage?: MessageUsageDto | null
+    contextTokensUsed?: number | null
+    contextWindow?: number | null
+    percentLeft?: number | null
+  }) => void
   /** complete 收口：流式块转 assistant 消息（id=turnAssistantId · 与后端同源后即 DB 权威 id），清空流式块 */
   /** 块级流式收口 → 块转消息；meta 可选（complete 事件透传 reasoningDurationMs + token usage/cost/上下文快照，无则 null） */
   finalizeBlocks: (sessionId: string, meta?: {
@@ -249,6 +265,25 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     })
     return changed ? { streams: { ...st.streams, [sessionId]: next } } : st
   }),
+  applyMessageUsage: (sessionId, assistantMessageId, meta = {}) => set((st) => {
+    // message.usage（消息级完成）：按块 id 定位挂 usage/上下文快照。lastIndexOf 取最新轮；
+    //   null id / 匹配不到（纯工具轮该条 assistant 无文本块，或 complete 已清流）→ no-op 不崩溃，
+    //   由下一条 assistant message.usage / turn 末 complete meta 兜底。
+    if (!assistantMessageId) return st
+    const blocks = st.streams[sessionId]
+    if (!blocks || blocks.length === 0) return st
+    const idx = blocks.map((b) => b.assistantMessageId).lastIndexOf(assistantMessageId)
+    if (idx < 0) return st
+    const next = [...blocks]
+    next[idx] = {
+      ...next[idx],
+      usage: meta.usage ?? next[idx].usage,
+      contextTokensUsed: meta.contextTokensUsed ?? next[idx].contextTokensUsed,
+      contextWindow: meta.contextWindow ?? next[idx].contextWindow,
+      percentLeft: meta.percentLeft ?? next[idx].percentLeft,
+    }
+    return { streams: { ...st.streams, [sessionId]: next } }
+  }),
   finalizeBlocks: (sessionId, meta = {}) => set((st) => {
     const blocks = st.streams[sessionId]
     if (!blocks || blocks.length === 0) return st
@@ -266,10 +301,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       time: null, createdAt: now, toolCallId: null, assistantMessageId: b.assistantMessageId,
       userMessageId: b.userMessageId ?? null, subtype: null, isMeta: false, isApiErrorMessage: false,
       apiError: null, error: null, errorDetails: null, matchedRule: null,
-      usage: meta.usage ?? null, totalCostUsd: meta.totalCostUsd ?? null,
-      modelUsage: meta.modelUsage ?? null, contextTokensUsed: meta.contextTokensUsed ?? null,
-      percentLeft: meta.percentLeft ?? null,
-      decodeMs: meta.decodeMs ?? null, contextWindow: meta.contextWindow ?? null,
+      // 逐块优先：块内 usage/上下文快照（message.usage 实时挂载）→ 回落 complete meta
+      //   （turn 累计 usage 只兜底纯工具轮/旧后端无 message.usage 的块）
+      usage: b.usage ?? meta.usage ?? null, totalCostUsd: meta.totalCostUsd ?? null,
+      modelUsage: meta.modelUsage ?? null,
+      contextTokensUsed: b.contextTokensUsed ?? meta.contextTokensUsed ?? null,
+      percentLeft: b.percentLeft ?? meta.percentLeft ?? null,
+      decodeMs: b.usage?.decode_ms ?? meta.decodeMs ?? null,
+      contextWindow: b.contextWindow ?? meta.contextWindow ?? null,
     }))
     // 按 flow 插回（根治「排队消息实时顺序错乱」）：不尾部 append —— 对每个块按其归属的
     //   userMessageId，插入 messages 中最后一条同 flow 消息之后。否则 streaming 里早于排队消息

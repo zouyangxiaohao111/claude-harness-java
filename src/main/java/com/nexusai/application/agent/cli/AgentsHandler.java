@@ -5,6 +5,7 @@ import com.nexusai.application.agent.tool.impl.SubagentTool;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
@@ -163,6 +164,54 @@ public final class AgentsHandler {
         }
         return out;
     }
+
+    /**
+     * [B2] 结构化 agent 列表端点 · web 用户侧 agent 选择器数据源。
+     *
+     * <p>视图 = active winners（{@code subagentTool.registryForSession(sessionId).listAgents()}，
+     * registry 已 6 组覆盖合并只保留 winner）。不同于 {@link #agents()}（纯文本 CLI 等价），本端点
+     * 返回 JSON 结构化 DTO 供前端选择器渲染（agentType/whenToUse/source/model/memory/tools/color）。
+     *
+     * <p><b>跳过 deny 过滤</b>（对齐 CC：用户侧 agent 选择器不过滤，区别于 Agent tool 的
+     * filterDeniedAgents）——直接返回 registry 全量 active winners。
+     *
+     * @param sessionId 会话 ID（可选 · null → 当前会话/MDC 兜底）
+     * @return agent 列表（AgentListItemDto 记录，camelCase 字段 Spring 序列化 OK）
+     */
+    @GetMapping("/list")
+    public List<AgentListItemDto> list(@RequestParam(required = false) String sessionId) {
+        if (subagentTool == null) {
+            log.warn("[AgentsHandler] SubagentTool 未注入，/list 端点返回空列表（plain JUnit 无 Spring 容器）");
+            return List.of();
+        }
+        List<AgentListItemDto> dtos = subagentTool.registryForSession(sessionId).listAgents().stream()
+            .map(a -> new AgentListItemDto(
+                a.agentType(),
+                a.whenToUse(),
+                a.source(),
+                a.model().orElse(null),
+                a.memory().orElse(null),
+                a.tools().orElse(null),
+                a.color().orElse(null)))
+            .toList();
+        log.info("[AgentsHandler] /list 端点命中 {} 个 agent（sessionId={}，跳过 deny 过滤对齐 CC 用户侧选择器）",
+            dtos.size(), sessionId);
+        return dtos;
+    }
+
+    /**
+     * [B2] 结构化 agent 列表 DTO · camelCase 字段（Spring 序列化 OK）。
+     * model/memory/tools/color 取 AgentDefinition Optional 值，empty → null（缺省字段不占位）。
+     */
+    public record AgentListItemDto(
+        String agentType,
+        String whenToUse,
+        String source,
+        String model,
+        String memory,
+        List<String> tools,
+        String color
+    ) {}
 
     /** CC ResolvedAgent 最小子集 — 5 字段 (含 overriddenBy). */
     public record ResolvedAgent(

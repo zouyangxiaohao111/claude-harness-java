@@ -1,5 +1,6 @@
 package com.nexusai.model.session.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.nexusai.application.agent.tool.AgentUsage;
 
 import java.time.OffsetDateTime;
@@ -209,7 +210,24 @@ public record ChatMessageDto(
     Long contextWindow,                 // 模型上下文窗口（models.max_context_tokens，回落 1M）
     // ── userAttachments · 附件快照（type+filename+mediaType+contentId）· 净新增字段（非 CC 对齐，
     //    前端 F5 重拉附件 chip）；url 为出站投影不落库（toDto 按 contentId 动态拼）──
-    List<UserAttachmentInfo> userAttachments
+    List<UserAttachmentInfo> userAttachments,
+    // ── queuedOrigin · 排队消息来源标记 · 对齐 CC queued_command 语义（messages.ts:3753-3796）──
+    // WHY（P0-1 OD-1/OD-3 方案 A「存原文+标记列+发送时包壳」）：mid-turn 注入的排队用户消息
+    //   来源标记，state → DB（V67 queued_origin 列）→ resume 全程贯穿；LlmAgentLoop 发送层
+    //   wrapQueuedMessagesForApi 在 ModelRequest 构造前按标记对 user 消息生成带壳副本（只改
+    //   API-bound 副本，不污染 state.messages()）。
+    //   取值（scope 收窄，§4.1）：
+    //     'busy-queued'        = 真实用户工作途中排队消息（唯一落库标记；发送层中文提醒壳【Java 独有】）；
+    //     'task-notification'  = mid-turn 后台命令完成通知（不落库，发送层 TASK_NOTIFICATION_PREFIX 壳）；
+    //     'coordinator'/'channel'/'cron' = 对应来源 mid-turn 注入（不落库；cron 走 human 壳）。
+    //   null = 普通用户消息 / 空闲 cron / slash meta/result/reject（不包壳、不落标记）。
+    //   @JsonIgnore：内部标记<b>不出站</b>（红线 §六.3：GET /messages 出站 content=DB 原文，
+    //   queuedOrigin 泄漏前端会误判）；resume 重包经 DB toDto 读回，不依赖 JSON round-trip
+    //   （对齐 CC transcript 存 RAW + normalizeMessagesForAPI 临时包壳，resume 重包）。
+    //   字段置于 canonical 末尾（userAttachments 之后），既有 45 参 canonical 调用方经
+    //   45 参兼容构造器默认 null。
+    @JsonIgnore
+    String queuedOrigin
 ) {
     /**
      * 附件快照项 · 对齐前端 userAttachments: [{ type, filename, mediaType, contentId, url }]
@@ -230,6 +248,76 @@ public record ChatMessageDto(
      * null 容错。既有唯一调用点（MessageService.userAttachmentsFromAttachments）已同步补参。
      */
     public record UserAttachmentInfo(String type, String filename, String mediaType, String contentId, String url) {}
+
+    /**
+     * P0-1 兼容构造器：保留既有 45 参 canonical 调用方形状（…userAttachments），
+     * 默认 queuedOrigin=null。
+     *
+     * <p>WHY: queuedOrigin 在 record 末尾新增字段后（canonical 45→46 参），既有 45 参 canonical
+     * 调用方（各 withXxx 拷贝方法重建前路径 / 各兼容构造器内部 this(...) 委派）不再命中新
+     * canonical —— 本构造器保留旧 45 参形状并补 queuedOrigin=null（非排队消息容错），避免调用方
+     * 重排参数。与 decodeMs 41 参构造器同先例。
+     *
+     * @param userAttachments 附件快照列表（{@link UserAttachmentInfo}）；null = 无附件
+     */
+    public ChatMessageDto(
+            String id,
+            String sessionId,
+            Role role,
+            String author,
+            String content,
+            String reasoning,
+            List<ToolCallDto> toolCalls,
+            FinishReason finishReason,
+            Integer inputTokens,
+            Integer outputTokens,
+            String time,
+            OffsetDateTime createdAt,
+            String toolCallId,
+            String assistantMessageId,
+            String acceptFeedback,
+            List<?> contentBlocks,
+            List<String> imagePasteIds,
+            Map<String, Object> structuredOutput,
+            boolean isMeta,
+            boolean isError,
+            String sourceToolUseID,
+            String subtype,
+            boolean isApiErrorMessage,
+            String apiError,
+            String error,
+            String errorDetails,
+            Integer inputCacheReadTokens,
+            Integer inputCacheCreationTokens,
+            Map<String, Object> compactMetadata,
+            Map<String, Object> microcompactMetadata,
+            String logicalParentUuid,
+            boolean isCompactSummary,
+            boolean isVisibleInTranscriptOnly,
+            AgentUsage usage,
+            String level,
+            String matchedRule,
+            Map<String, Object> snipMetadata,
+            String cwd,
+            Long reasoningDurationMs,
+            String userMessageId,
+            Long decodeMs,
+            Long contextTokensUsed,
+            Integer percentLeft,
+            Long contextWindow,
+            List<UserAttachmentInfo> userAttachments) {
+        this(id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
+            contextTokensUsed, percentLeft, contextWindow, userAttachments,
+            null); // queuedOrigin null = 非排队消息（默认）
+    }
 
     /**
      * IMP-05 兼容构造器：保留既有 20 参调用方（R32-b14 之后 canonical 形状）。
@@ -619,7 +707,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
-            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments); // G13: 补 cwd（withSourceToolUseID 早期未重建 cwd，补全保字段）+ userMessageId 透传 + B7 decodeMs 透传
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 补 cwd（withSourceToolUseID 早期未重建 cwd，补全保字段）+ userMessageId 透传 + B7 decodeMs 透传
     }
 
     /**
@@ -644,7 +732,60 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
-            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
+     * [OD-D5] 拷贝方法：仅替换 {@code contentBlocks}，其余字段全透传 · 镜像 CC spread
+     * {@code {...m, content}} 语义（本方法针对 contentBlocks 数组字段）。
+     *
+     * <p><b>WHY（发送层 contentBlocks[0] 包壳）</b>：mid-turn 注入的 busy 带图消息产物经
+     * {@code buildUserMessageWithImages} 生成 contentBlocks=[text(原文), ...image]（content 亦为原文
+     * 但 AnthropicSdkProvider:2195-2203 / OpenAiSdkProvider role=user contentBlocks 分支在
+     * contentBlocks 非空时<b>弃 content</b>，只序列化 contentBlocks）。发送层
+     * {@code LlmAgentLoop.wrapQueuedMessagesForApi} 需对 contentBlocks[0].text 包壳（busy 中文壳）→
+     * 经本方法生成 contentBlocks 全量副本（首块 text 覆盖为带壳文本，其余块原样共享——JsonNode 不可变，
+     * 无共享污染），供 withQueuedOrigin 同款 record 拷贝模式重建。null/空 = 覆盖为空列表（罕见防御）。
+     *
+     * @param newContentBlocks 新的内容块列表（{@code List<? extends Object>}，透传 List&lt;JsonNode&gt;）
+     * @return 与原 record 全字段相同、仅 contentBlocks 覆盖的新实例
+     */
+    public ChatMessageDto withContentBlocks(List<?> newContentBlocks) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, newContentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
+     * [实时落库 2026-09-03] 拷贝方法：仅替换 {@code subtype}，其余字段全透传 · 镜像 CC spread
+     * {@code {...m, subtype}}（messages.ts:4539/4569 subtype 判别字段）· 与 {@link #withContent}
+     * / {@link #withSnipMetadata} 同款 record 拷贝模式（仅第 22 参 subtype 覆盖为 newSubtype）。
+     *
+     * <p>供 LlmAgentLoop max_tokens 截断恢复分支对截断 assistant 打 {@code subtype="max_tokens"}
+     * 标记（ChatService 实时落库据此落 finishReason=max_tokens，对齐 CC AssistantMessage
+     * apiError='max_output_tokens' 语义）。
+     *
+     * @param newSubtype 新的 subtype 文本（可为 null）
+     * @return 与原 record 全字段相同、仅 subtype 覆盖的新实例
+     */
+    public ChatMessageDto withSubtype(String newSubtype) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, newSubtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
     /**
@@ -669,7 +810,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, newSnipMetadata,
             cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow,
-            userAttachments);
+            userAttachments, queuedOrigin);
     }
 
     /**
@@ -703,7 +844,7 @@ public record ChatMessageDto(
             isApiErrorMessage, apiError, error, errorDetails,
             null, null,
             null, null, null, false, false,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments); // G13: 保留 cwd 戳 + B7 decodeMs 透传
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
     /**
@@ -727,7 +868,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments); // G13: 保留 cwd 戳 + B7 decodeMs 透传
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
     /**
@@ -751,7 +892,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments); // G13: 保留 cwd 戳 + B7 decodeMs 透传
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
     /**
@@ -774,7 +915,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
     /**
@@ -798,7 +939,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
     /**
@@ -823,7 +964,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
     /**
@@ -848,7 +989,34 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
+     * P0-1 拷贝方法：覆盖排队来源标记 · 镜像 CC spread {@code {...m, ...}} 语义
+     * （CC original: queued_command origin 语义，messages.ts:3753-3796；Java 以 queuedOrigin 表达）。
+     *
+     * <p>供 LlmAgentLoop drainAndInjectQueued 对 mid-turn 注入的 busy-queued 排队用户消息打标
+     * （原文 content + queuedOrigin='busy-queued'），以及读侧 {@code MessageService.toDto}
+     * 从 DB 列 queued_origin 回填（V67）。发送层 wrapQueuedMessagesForApi 按本标记生成带壳副本。
+     * null = 非排队消息（不包壳、不落标记）。
+     *
+     * @param queuedOrigin 排队来源标记（'busy-queued' / 'task-notification' / 'coordinator' /
+     *                     'channel' / 'cron'）；null = 非排队
+     * @return 与原 record 全字段相同、仅 queuedOrigin 覆盖的新实例
+     */
+    public ChatMessageDto withQueuedOrigin(String queuedOrigin) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
+            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
     /**
@@ -1305,7 +1473,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
-            contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
     /**
@@ -1328,7 +1496,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
-            contextTokensUsed, percentLeft, contextWindow, userAttachments);
+            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
     }
 
 }

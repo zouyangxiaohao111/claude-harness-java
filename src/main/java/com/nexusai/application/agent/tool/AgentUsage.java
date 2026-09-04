@@ -134,13 +134,33 @@ public record AgentUsage(
      * <p>WHY: finalizeAgentTool totalTokens 用本公式 (agentToolUtils.ts:319), SubagentExecutor.extractTotalTokens
      * 必须同源, 否则 totalTokens 与 usage 各算各的 (对齐规则 5 禁止同语义双实现漂移).
      *
+     * <p><b>A5-2 求和分派</b>: 1 参 = anthropic 语义（4 项和，CC 原生），保持既有大量调用/测试兼容；
+     * 子代理预算等按 provider 分派的调用点（deepseek input 已含 cache hit → 双计）请用
+     * {@link #totalTokens(boolean)} 传 isAnthropic（本 record 无模型上下文，anthropic 由调用点判定注入）。
+     *
      * @return 4 字段之和 (nullable 缓存字段按 CC ?? 0)
      */
     public long totalTokens() {
-        return inputTokens
-            + (cacheCreationInputTokens != null ? cacheCreationInputTokens : 0L)
-            + (cacheReadInputTokens != null ? cacheReadInputTokens : 0L)
-            + outputTokens;
+        return totalTokens(true);
+    }
+
+    /**
+     * 汇总 token · 协议分派重载（A5-2 · deepseek 双计修复）。
+     *
+     * <p>anthropic → 4 项和（CC getTokenCountFromUsage）；非 anthropic（deepseek/openai，
+     * input 已含 cache hit）→ 仅 input+output（展示/预算口径，输入侧不重复计命中）。
+     *
+     * @param anthropic 协议判定：true=4 项和；false=仅 input+output
+     * @return 总 token 数（≥ 0）
+     */
+    public long totalTokens(boolean anthropic) {
+        if (anthropic) {
+            return inputTokens
+                + (cacheCreationInputTokens != null ? cacheCreationInputTokens : 0L)
+                + (cacheReadInputTokens != null ? cacheReadInputTokens : 0L)
+                + outputTokens;
+        }
+        return inputTokens + outputTokens;
     }
 
     /**

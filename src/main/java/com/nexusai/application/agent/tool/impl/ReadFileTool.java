@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.api.AnalyticsTracker;
-import com.nexusai.application.agent.attachment.ImageAttachmentStore;
+import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.application.agent.permission.ReadPermissionChecker;
@@ -248,6 +248,7 @@ public class ReadFileTool implements Tool {
     private final FileReadListenerRegistry listenerRegistry;
     private final ReadPermissionChecker permissionChecker;
 
+
     /**
      * [L+ R3] dedup killswitch · 对齐 CC {@code getFeatureValue_CACHED_MAY_BE_STALE('tengu_read_dedup_killswitch', false)}.
      * 3P default = killswitch off = dedup enabled. Java 端走 Spring @Value 注入, 默认 true.
@@ -346,16 +347,17 @@ public class ReadFileTool implements Tool {
         this.memoryFileDetection = memoryFileDetection;
     }
 
-    // ── [pdf-vision-align] 模型能力 / 图片缓存注入 · 字段注入（不碰既有 3 参构造 :365-390，避免破坏测试便捷构造）──
-    /** 模型 mapper · dispatchPdfFull 文本模型页图注册判定用（null → PdfSupport.isPDFSupported 回落 1 参 CC 契约）。 */
+    // ── [pdf-vision-align] 模型能力注入 · 字段注入（不碰既有 3 参构造，避免破坏测试便捷构造）──
+    /** 模型 mapper · PDF/图片能力判定用（null → PdfSupport.isPDFSupported 回落 1 参 CC 契约）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ModelMapper modelMapper;
     /** 提供商 mapper · 模型名解析（null → ModelNameResolver 按 name 兼容路径）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ProviderMapper providerMapper;
-    /** 图片附件缓存 · 文本模型 PDF 页图注册目标（null → dispatchPdfFull 回落 CC error 文案）。 */
+    /** 多模态档位模型名解析 · 文本模型 PDF error 引导动态取 settings.multimodal_model_name
+     *  （{@link ModelConfigResolver#resolveMultimodalModelName}；null → 省略 (model=…) 段并提示先配置）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
-    private ImageAttachmentStore imageAttachmentStore;
+    private ModelConfigResolver modelConfigResolver;
 
     /** 测试 / 非 Spring 场景注入 ModelMapper（同 PdfAttachmentProcessor.setPdfAttachmentStore 模式）。 */
     public void setModelMapper(ModelMapper modelMapper) {
@@ -367,9 +369,9 @@ public class ReadFileTool implements Tool {
         this.providerMapper = providerMapper;
     }
 
-    /** 测试 / 非 Spring 场景注入 ImageAttachmentStore（文本模型 PDF 页图注册）。 */
-    public void setImageAttachmentStore(ImageAttachmentStore imageAttachmentStore) {
-        this.imageAttachmentStore = imageAttachmentStore;
+    /** 测试 / 非 Spring 场景注入 ModelConfigResolver（多模态档位模型名动态解析）。 */
+    public void setModelConfigResolver(ModelConfigResolver modelConfigResolver) {
+        this.modelConfigResolver = modelConfigResolver;
     }
 
     /**
@@ -875,13 +877,10 @@ public class ReadFileTool implements Tool {
                 "limit must be >= 1; got " + limit);
         }
 
-        Path file;
-        try {
-            file = guard.resolve(relPath);
-        } catch (SecurityException se) {
-            log.warn("ReadFileTool: blocked path escape: {}", relPath);
-            return ToolResult.error(call.id(), se.getMessage());
-        }
+        // [CC 对齐 2026-09-03 用户拍板] PathGuard 逃逸拦截已删除（resolve 纯展开，绝对/相对路径都不拦）——
+        //   附件（Desktop/pdf-cache/子代理 output）等任意绝对路径直接可读，原附件表 path 豁免机制
+        //   （pdf-attachment-allowlist）整体失效删除。生产安全边界由 ReadPermissionChecker.isInWorkingDir 承担。
+        Path file = guard.resolve(relPath);
 
         // ── dedup: 同 path + offset/limit + mtime 未变 → file_unchanged（CC :536-573）──
         // [L+ R1 收尾] 无 ctx → 完全跳过 dedup (既不读也不写); 有 ctx → 走 ctx.readFileState().
@@ -1408,9 +1407,34 @@ public class ReadFileTool implements Tool {
 
     /**
      * pages 分支 · 对齐 CC FileReadTool.ts:895-946。
+     *
+     * <p>[pdf-vision-align 2026-09-02 纠正] 文本模型门控：CC 页图 image blocks 送达依赖模型支持图片
+     * （CC 全系 Claude 均支持），Java 接 deepseek 等纯文本模型时发 image block → 400
+     * {@code This model does not support image}。本方法在页图 image blocks 入 newMessages 前判定
+     * 当前模型能力（{@link #resolveMainLoopModel} → {@link PdfSupport#isPDFSupported} 3 参 →
+     * {@code ModelCapabilityResolver.supportsImage}）：模型支持图片 → 现行为（image blocks newMessages）；
+     * 文本模型 → {@link #textModelPdfUnsupported} fail-loud error（对齐 CC
+     * {@code isPDFSupported()===false → throw}，不页图注册、不发 image block —— 模型据错误调 Agent
+     * 派多模态子代理或换支持多模态的模型）。[对抗核验 #4] 门控在 extract<b>之前</b>：文本模型
+     * 不渲染页图（原实现 extract 后才门控 → 文本模型全渲染再删，纯浪费）。
      */
     private ToolResult dispatchPdfPages(ToolUseBlock call, Path file, String relPath,
                                         String pages, ToolUseContext ctx) {
+        // [pdf-vision-align 对抗核验 #4] 门控提前到 extract 之前：文本模型直接 fail-loud error，
+        //   不渲染页图（原实现 extract 后才门控 → 文本模型全渲染再删，纯浪费）。判定源与 dispatchPdfFull
+        //   同构：resolveMainLoopModel（appState mainLoopModel 优先 → ctx.effectiveModelName）→
+        //   PdfSupport.isPDFSupported 3 参（modelMapper 注入 → ModelCapabilityResolver.supportsImage，
+        //   deepseek=chat → false）。模型支持图片 → 走 CC :895-946 正常页图 image blocks 送达；文本模型
+        //   → 不发 image block 给不支持图片的模型（deepseek 400 根因防线），错误引导派多模态子代理。
+        String mainLoopModel = resolveMainLoopModel(ctx);
+        if (!canModelViewReadResultDirectly(mainLoopModel)) {
+            if (log.isInfoEnabled()) {
+                log.info("ReadFileTool: PDF pages 文本模型门控提前触发 path={} pages={} model={}"
+                        + "（fail-loud error，不渲染页图 / 不发 image block 给不支持图片的模型）",
+                    relPath, pages, mainLoopModel);
+            }
+            return textModelPdfUnsupported(call, file, relPath, mainLoopModel, "PDF 页图（pages=" + pages + "）");
+        }
         // CC :896-899 parsePDFPageRange(pages) — 非法字符串 → null → 全量提取（parsedRange ?? undefined）
         PdfPageRange.Range parsedRange = PdfPageRange.parse(pages).orElse(null);
         PdfSupport.PdfExtractResult extractResult = PdfSupport.extractPDFPages(
@@ -1471,18 +1495,29 @@ public class ReadFileTool implements Tool {
                     + "Maximum " + PdfSupport.PDF_MAX_PAGES_PER_READ + " pages per request.");
         }
 
-        // CC :957-960 shouldExtractPages = !isPDFSupported() || stats.size > PDF_EXTRACT_SIZE_THRESHOLD
+        // [pdf-vision-align 对抗核验 #4] 门控提前到 extract 之前：文本模型直接 fail-loud error，
+        //   不渲染页图 / 不 readPDF（原实现 extract（telemetry）后才门控 → 文本模型全渲染再删，纯浪费）。
+        //   判定源同 dispatchPdfPages：resolveMainLoopModel（appState mainLoopModel 优先 →
+        //   ctx.effectiveModelName）→ PdfSupport.isPDFSupported 3 参（modelMapper 注入 →
+        //   ModelCapabilityResolver.supportsImage，deepseek=chat → false；null → 回落 1 参 CC 契约）。
         String mainLoopModel = resolveMainLoopModel(ctx);
-        // [pdf-vision-align] 3 参重载：按当前请求模型能力判定（mappers 注入 → supportsImage；null → 回落 1 参 CC 契约）
-        boolean pdfSupported = PdfSupport.isPDFSupported(modelMapper, providerMapper, mainLoopModel);
+        if (!canModelViewReadResultDirectly(mainLoopModel)) {
+            if (log.isInfoEnabled()) {
+                log.info("ReadFileTool: PDF 全读文本模型门控提前触发 path={} model={}"
+                        + "（fail-loud error，不渲染页图 / 不发 document block 给不支持图片的模型）",
+                    relPath, mainLoopModel);
+            }
+            return textModelPdfUnsupported(call, file, relPath, mainLoopModel, "完整 PDF");
+        }
         long fileSize;
         try {
             fileSize = Files.size(file);
         } catch (Exception e) {
             return ToolResult.error(call.id(), "Read error: " + e.getMessage());
         }
-        boolean shouldExtractPages = !pdfSupported || fileSize > PdfSupport.getExtractSizeThreshold();
-        // [pdf-vision-align] 提为局部变量捕获：文本模型分支复用（避免二次渲染 CPU/内存浪费）；telemetry 日志不变
+        // CC :962-977 提取仅当 size > 阈值（模型已支持图片 → !pdfSupported 分支已提前返回，无全渲染浪费）
+        boolean shouldExtractPages = fileSize > PdfSupport.getExtractSizeThreshold();
+        // 提取结果仅用于 telemetry（CC :962-977 返回值不被消费，只发事件）；局部变量捕获防二次渲染
         PdfSupport.PdfExtractResult extractResult = null;
         if (shouldExtractPages) {
             // CC :962-977 提取结果仅用于 telemetry（真实 CC 行为——返回值不被消费，只发事件）
@@ -1502,21 +1537,6 @@ public class ReadFileTool implements Tool {
                         fileSize, extractResult.error().reason(), relPath);
                 }
             }
-        }
-
-        // CC :979-985 !isPDFSupported → throw（提示语保留 CC 结构与 model 指引；
-        //   poppler-utils 安装句删除——Java 无 poppler 依赖, pdfbox 进程内渲染）
-        if (!pdfSupported) {
-            // [pdf-vision-align] 文本模型 PDF 分支：imageStore 注入（Spring 生产）→ 页图注册 + vision_analyze
-            //   说明（不回 400，不发 document/image block 给文本模型 → deepseek 400 根因防线）；store 未注入
-            //   （非 Spring 单测）→ 回落原 CC error 文案（既有 executePdfHaikuModelReturnsUnsupportedError 不回归）。
-            if (imageAttachmentStore != null) {
-                return registerTextModelPdfPages(call, file, relPath, ctx, extractResult);
-            }
-            return ToolResult.error(call.id(),
-                "Reading full PDFs is not supported with this model. Use a newer model (Sonnet 3.5 v2 or later), "
-                    + "or use the pages parameter to read specific page ranges (e.g., pages: \"1-5\", maximum "
-                    + PdfSupport.PDF_MAX_PAGES_PER_READ + " pages per request).");
         }
 
         // CC :987-990 readPDF → !success → throw
@@ -1551,102 +1571,91 @@ public class ReadFileTool implements Tool {
     }
 
     /**
-     * [pdf-vision-align] 文本模型 PDF → 页图注册（deepseek 400 根因防线）。
+     * [vision-cc-align 2026-09-03] 文本模型 PDF fail-loud error · 对齐 CC FileReadTool.ts:979-985
+     * {@code isPDFSupported()===false → throw new Error}（不页图注册、不发 document/image block、不静默）。
      *
-     * <p>复用 {@code dispatchPdfFull} 的 {@code shouldExtractPages} 已提取 extractResult
-     * （避免二次渲染 CPU/内存浪费）；失败/未捕获 → 重试 {@link PdfSupport#extractPDFPages} 一次，
-     * 再失败 → {@link ToolResult#error}。逐页 JPEG {@code Files.readAllBytes} →
-     * {@code imageAttachmentStore.store(sessionId, base64, "image/jpeg")} 收集 contentId
-     * （逐页读-注册-释放，不批量驻留全部页 base64）。contentIds 空 → error（fail loud）。
-     * 成功返回<b>纯文本</b>成功（含 contentId + vision_analyze 引导），不发 document/image block 给文本模型。
+     * <p><b>[2026-09-03 递归根因修复]</b> 原引导「派多模态子代理」已删：fork 继承文本模型 → Read PDF 再触发
+     * 本门控 → 再派子代理 → 无限递归（曾致超长 run / 提醒刷屏）。改为引导 <b>vision_analyze 直达</b>
+     * （contentType=pdf + path + pages）——工具内部懒渲染指定页调多模态档位模型，返回纯文本，主模型闭环无需子代理。
      *
-     * @param call          工具调用
-     * @param file          PDF 磁盘路径
-     * @param relPath       PDF 相对路径（日志/说明用）
-     * @param ctx           工具上下文（sessionId 取图片缓存分桶；可 null）
-     * @param extractResult shouldExtractPages 已提取结果（可 null = 未提取/防御）
-     * @return 文本成功（页图注册 contentId）/ error
+     * @param call      工具调用
+     * @param file      Read 解析出的 PDF Path（绝对；null → 回退 relPath）
+     * @param relPath   相对显示路径（错误文案含 path，模型可指代该文件）
+     * @param modelName 当前不支持 image/PDF 的模型名（resolveMainLoopModel 结果；可 null → "未知"）
+     * @param scope     读取范围文案（"完整 PDF" / "PDF 页图（pages=…）"，区分全读/页读）
+     * @return fail-loud {@link ToolResult#error}
      */
-    private ToolResult registerTextModelPdfPages(ToolUseBlock call, Path file, String relPath,
-                                                 ToolUseContext ctx, PdfSupport.PdfExtractResult extractResult) {
-        PdfSupport.PdfExtractData data;
-        if (extractResult != null && extractResult.success()) {
-            data = extractResult.data();
-        } else {
-            // 文本模型分支复用失败 / 未捕获（防御）→ 重试提取一次
-            PdfSupport.PdfExtractResult retry = PdfSupport.extractPDFPages(
-                file, pdfOutputDir(ctx), null, null);
-            if (!retry.success()) {
-                if (log.isInfoEnabled()) {
-                    log.info("ReadFileTool: 文本模型 PDF 页图提取失败 path={} reason={} message={}",
-                        relPath, retry.error().reason(), retry.error().message());
-                }
-                return ToolResult.error(call.id(), retry.error().message());
-            }
-            data = retry.data();
-        }
-        String sessionId = ctx != null ? ctx.sessionId() : null;
-        java.util.List<Long> contentIds = new java.util.ArrayList<>();
-        Path outputDir = Path.of(data.outputDir());
-        if (Files.isDirectory(outputDir)) {
-            try (var stream = Files.list(outputDir)) {
-                java.util.List<Path> jpegs = stream
-                    .filter(p -> p.getFileName().toString().endsWith(".jpg"))
-                    .sorted()
-                    .toList();
-                for (Path img : jpegs) {
-                    byte[] bytes = Files.readAllBytes(img);
-                    ImageAttachmentStore.StoredImage stored = imageAttachmentStore.store(
-                        sessionId, Base64.getEncoder().encodeToString(bytes), "image/jpeg");
-                    if (stored != null) {
-                        contentIds.add(stored.id());
-                    }
-                }
-            } catch (Exception e) {
-                if (log.isDebugEnabled()) {
-                    log.debug("ReadFileTool: 文本模型 PDF 页图注册失败 outputDir={} cause={}", outputDir, e.toString());
-                }
-                return ToolResult.error(call.id(), "PDF 页图注册失败: "
-                    + (e.getMessage() == null ? e.toString() : e.getMessage()));
-            }
-        }
-        if (contentIds.isEmpty()) {
-            return ToolResult.error(call.id(), "PDF 页图注册为空（渲染失败）");
-        }
-        // [pdf-vision-align] 页图已注册到 ImageAttachmentStore（base64 进内存/磁盘缓存），
-        //   源 JPEG 目录不再需要 → 删除防磁盘累积（Reflect medium；多模态路径保留目录对齐 CC）
-        deleteRecursively(outputDir);
-        if (log.isInfoEnabled()) {
-            log.info("ReadFileTool: 文本模型 PDF → 页图注册 path={} pages={} contentId={}（源页图目录已清理）",
-                relPath, contentIds.size(), contentIds);
-        }
-        return ToolResult.success(call.id(),
-            "PDF 当前模型无法直接读取（文本模型）。已把 " + contentIds.size()
-                + " 页渲染为图片注册到图片缓存，contentId=" + contentIds
-                + "（文件路径=" + relPath + "）。请用 vision_analyze 工具逐页分析：type=analyze, contentId=<页码对应 id>, prompt=<对该页的提问>。");
+    private ToolResult textModelPdfUnsupported(ToolUseBlock call, Path file, String relPath,
+                                               String modelName, String scope) {
+        String absPath = file == null ? relPath : file.toString();
+        StringBuilder msg = new StringBuilder("Error: 当前模型不支持 image/PDF 视觉（model=")
+            .append(modelName == null ? "未知" : modelName)
+            .append("），无法直接读取 ").append(scope).append("（path=").append(relPath).append("）。");
+        // [vision-cc-align 2026-09-03] 递归根因修复：删「派多模态子代理」引导（fork 继承文本模型 → Read 再
+        //   触发本门控 → 无限递归）。改为引导 vision_analyze 直达（工具内部自己调多模态档位模型，懒渲染 pages，
+        //   返回纯文本）——主模型闭环，无需子代理。
+        msg.append("请调用 vision_analyze(type=analyze, contentType=pdf, path=").append(absPath)
+            .append(", pages=[要分析的页号数组], prompt=对该 PDF 的提问) 分段分析该 PDF。")
+            .append("vision_analyze 会把指定页渲染成图并调用多模态档位模型分析，返回纯文本结果。");
+        return ToolResult.error(call.id(), msg.toString());
     }
 
-    /** 递归删除目录（页图源目录清理，防磁盘累积）。文件删除失败 → 忽略（debug 日志，不影响主流程）。 */
-    private static void deleteRecursively(Path dir) {
-        if (dir == null || !Files.exists(dir)) {
-            return;
+    /**
+     * [vision-cc-align 2026-09-03] 文本模型图片 fail-loud error · 对齐 dispatchPdf 门控语义：
+     * 模型不支持 Read 直给图像（openai-completions 丢弃 tool_result 图 / ant 文本模型）。
+     * 引导 vision_analyze(path)（工具内部读图调多模态档位模型），不派子代理、不读文件。
+     *
+     * @param call      工具调用
+     * @param file      Read 解析出的文件 Path（绝对；null → 回退 relPath）
+     * @param relPath   相对显示路径（错误文案含 path）
+     * @param modelName 当前不支持 image 的模型名（可 null → "未知"）
+     * @param ext       图片扩展名（如 .png，文案标注类型）
+     * @return fail-loud {@link ToolResult#error}
+     */
+    private ToolResult textModelImageUnsupported(ToolUseBlock call, Path file, String relPath,
+                                                 String modelName, String ext) {
+        String absPath = file == null ? relPath : file.toString();
+        StringBuilder msg = new StringBuilder("Error: 当前模型不支持 Read 直接显示图像（model=")
+            .append(modelName == null ? "未知" : modelName)
+            .append(ext == null ? "" : ", type=" + ext)
+            .append("，path=").append(relPath).append("）。");
+        msg.append("如需查看图像内容，请调用 vision_analyze(type=analyze, path=").append(absPath)
+            .append(", prompt=你想了解什么)。vision_analyze 会读取该图并调用多模态档位模型分析，返回纯文本结果。");
+        return ToolResult.error(call.id(), msg.toString());
+    }
+
+    /**
+     * [vision-cc-align 2026-09-03] 判 Read 结果能否由主模型<b>直接看</b>（image block / PDF document /
+     * 页图 image 直给）= <b>ant/response 直给格式 && 模型多模态（supportsImage）</b>（且，不是或）。
+     *
+     * <p>WHY：多模态能力（supportsImage）是必要条件但非充分 —— deepseek-vision-exp 亦标多模态
+     * （models.type=vision），但 openai-completions 格式下 Read 的 image/document block（tool_result /
+     * newMessages user 注入）无法送达模型（R-T-1），Read 直给通道仅对 ant（anthropic）/ openai-response
+     * （预留，Java 暂未对接）直给格式开放。非该组合（openai-completions 的 deepseek 含 vision-exp /
+     * 任何文本模型）→ false → dispatchImage/dispatchPdf fail-loud 引导 vision_analyze（type=analyze,
+     * path / contentType=pdf + pages）。判据与 LlmAgentLoop.exemptVisionAnalyzeDeferForTextModel 同源
+     * （Read 直给能力 ⇔ vision_analyze 可懒）。
+     *
+     * <p><b>直给格式判据按 provider.type</b>（com.nexusai.application.agent.compact.ContextUsageCalculator
+     * 的 isAnthropic：model→providerId→providerMapper.selectOneById→provider.type=="anthropic"），
+     * <b>非模型名前缀</b>——claude-sonnet 等模型名仅为
+     * supportsImage 解析输入，anthropic/response 归属一律看 provider.type；response 直给格式将来接入时
+     * 同样经 provider/模型配置的 response 能力字段判定，勿硬编码模型名。
+     *
+     * <p>mapper null（非 Spring 单测 / toolFor 未注入）→ 回落 1 参 {@link PdfSupport#isPDFSupported(String)}
+     * 名字契约（仅 claude-3-haiku 子串判文本），保持既有多模态送达单测绿（无 mapper 构造默认模型直给）。
+     *
+     * @param modelName 当前主模型名（resolveMainLoopModel 结果；可 null）
+     * @return true = Read 图/PDF 结果可直接送达该模型
+     */
+    private boolean canModelViewReadResultDirectly(String modelName) {
+        if (modelMapper == null || providerMapper == null) {
+            return PdfSupport.isPDFSupported(modelName);
         }
-        try (var paths = Files.walk(dir)) {
-            paths.sorted(java.util.Comparator.reverseOrder())
-                .forEach(p -> {
-                    try {
-                        Files.deleteIfExists(p);
-                    } catch (Exception e) {
-                        if (log.isDebugEnabled()) {
-                            log.debug("ReadFileTool: 页图目录清理跳过 {} cause={}", p, e.toString());
-                        }
-                    }
-                });
-        } catch (Exception e) {
-            if (log.isDebugEnabled()) {
-                log.debug("ReadFileTool: 页图目录清理失败 dir={} cause={}", dir, e.toString());
-            }
-        }
+        boolean antDirectFormat = com.nexusai.application.agent.compact.ContextUsageCalculator.isAnthropic(
+            modelMapper, providerMapper, modelName);
+        boolean imageCapable = PdfSupport.isPDFSupported(modelMapper, providerMapper, modelName);
+        return antDirectFormat && imageCapable;
     }
 
     /**
@@ -1810,6 +1819,20 @@ public class ReadFileTool implements Tool {
      */
     private ToolResult dispatchImage(ToolUseBlock call, Path file, String relPath,
                                      String ext, ToolUseContext ctx, int maxTokens) throws Exception {
+        // [vision-cc-align 2026-09-03] 文本模型门控前置（对齐 dispatchPdfPages 提前门控）：openai-completions
+        //   deepseek / ant 文本模型下 Read 图 image block 会被 provider 丢弃（R-T-1）→ 模型反复 Read 空图死循环。
+        //   直给判定 = canModelViewReadResultDirectly（ant/response 直给格式 && supportsImage 多模态）——
+        //   deepseek-vision-exp 虽标多模态但 completions 格式不走 Read 直给 → 同样引导。直给 →
+        //   现行为 image block；否则 fail-loud 引导 vision_analyze(path)（不读文件、不发 image block）。
+        String mainLoopModel = resolveMainLoopModel(ctx);
+        if (!canModelViewReadResultDirectly(mainLoopModel)) {
+            if (log.isInfoEnabled()) {
+                log.info("ReadFileTool: 图片文本模型门控前置触发 path={} model={}"
+                        + "（fail-loud 引导 vision_analyze(path)，不读文件 / 不发 image block 给不支持图片的模型）",
+                    relPath, mainLoopModel);
+            }
+            return textModelImageUnsupported(call, file, relPath, mainLoopModel, ext);
+        }
         byte[] bytes = Files.readAllBytes(file);
         long originalSize = bytes.length;
         try {

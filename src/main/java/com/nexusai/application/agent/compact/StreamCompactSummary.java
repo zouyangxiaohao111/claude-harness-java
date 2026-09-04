@@ -595,8 +595,10 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 //   PTL 错误文本（PROMPT_TOO_LONG_ERROR_MESSAGE 前缀）跳过 success 事件
                 //   （CC 返回给调用方 PTL 重试循环，不视为成功摘要）。
                 if (!text.startsWith(ApiErrors.PROMPT_TOO_LONG_ERROR_MESSAGE)) {
+                    // [A 命中率口径] 传 ForkedAgentResult（携带 providerType → isAnthropic() 分派
+                    //   cacheHitRate 分母），不再传 usage（丢失 provider 判定）。
                     emitCompactEvent("tengu_compact_cache_sharing_success",
-                        cacheSharingSuccessAttrs(preCompactTokenCount, result.totalUsage()));
+                        cacheSharingSuccessAttrs(preCompactTokenCount, result));
                 }
                 if (log.isInfoEnabled()) {
                     log.info("[StreamCompactSummary] fork 缓存共享成功: forkMsgs={} summaryChars={} usage={} · CC compact.ts:1201-1230",
@@ -629,22 +631,26 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      * compact.ts:1214-1227 logEvent 字段逐项：preCompactTokenCount / outputTokens /
      * cacheReadInputTokens / cacheCreationInputTokens / cacheHitRate。
      *
-     * <p>cacheHitRate（CC compact.ts:1220-1226）：{@code cache_read > 0 →
-     * cache_read / (cache_read + cache_creation + input)，否则 0}。
+     * <p>cacheHitRate（<b>A 命中率口径协议分派</b> · ContextUsageCalculator.computeCacheHitRate）：
+     * anthropic → {@code cache_read/(cache_read + cache_creation + input)}（CC compact.ts:1220-1226）；
+     * 非 anthropic（openai_sdk/deepseek，prompt_tokens 已含 cache hit）→ {@code cache_read/input}
+     * （旧恒三字段分母对 deepseek 双计 → 命中率恒为真实一半）。read ≤ 0 / 分母 ≤ 0 → 0。
      *
      * @param preCompactTokenCount 压缩前 token 估算
-     * @param usage fork 累计 usage（可 null → token 字段 0 + cacheHitRate 0，防异常吞成功路径）
+     * @param result fork 结果（ForkedAgentResult 携带 providerType → isAnthropic() 分派；
+     *               null → token 字段 0 + cacheHitRate 0，防异常吞成功路径）
      * @return CC 事件属性 map（LinkedHashMap 保序）
      */
     private static java.util.Map<String, Object> cacheSharingSuccessAttrs(
-            int preCompactTokenCount, ForkedAgentResult.ForkUsage usage) {
+            int preCompactTokenCount, ForkedAgentResult result) {
+        ForkedAgentResult.ForkUsage usage = result == null ? null : result.totalUsage();
         long output = usage == null ? 0 : usage.outputTokens();
         long cacheRead = usage == null ? 0 : usage.cacheReadInputTokens();
         long cacheCreation = usage == null ? 0 : usage.cacheCreationInputTokens();
         long input = usage == null ? 0 : usage.inputTokens();
-        double cacheHitRate = cacheRead > 0
-            ? (double) cacheRead / (double) (cacheRead + cacheCreation + input)
-            : 0d;
+        boolean anthropic = result != null && result.isAnthropic();
+        double cacheHitRate = ContextUsageCalculator.computeCacheHitRate(
+            input, cacheRead, cacheCreation, anthropic);
         java.util.Map<String, Object> attrs = new LinkedHashMap<>();
         attrs.put("preCompactTokenCount", preCompactTokenCount);
         attrs.put("outputTokens", output);

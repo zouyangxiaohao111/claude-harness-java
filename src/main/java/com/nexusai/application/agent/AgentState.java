@@ -5,6 +5,7 @@ import com.nexusai.application.agent.attachment.AttachmentMessageDto;
 import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.application.agent.hook.CollapseHookSummaries;
 import com.nexusai.application.agent.recovery.RecoveryState;
+import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.TodoWriteTool.TodoItem;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -191,8 +192,19 @@ public class AgentState {
     @JsonIgnore
     private final List<InjectedQueuedMessage> injectedQueuedMessages = new ArrayList<>();
 
-    /** [mid-turn-align] 单条 mid-turn 注入的排队 user 消息（uuid = 队列命令 id，content = 原始文本，可空串）。 */
-    public record InjectedQueuedMessage(String uuid, String content) {}
+    /**
+     * [mid-turn-align] 单条 mid-turn 注入的排队 user 消息（uuid = 队列命令 id，content = 原始文本，可空串）。
+     *
+     * <p>[P0-1 OD-1/OD-3] 3 参扩展 + queuedOrigin（排队来源标记）：本 registry 仅登记
+     * busy-queued 项（busy-queued 才需落库），queuedOrigin 供 ChatService 落库联动
+     * createQueuedUserMessage(..., queuedOrigin)。2 参便捷构造器默认 queuedOrigin=null
+     * （测试 / 旧调用方兼容；语义 = 非标记落库，与现状等价）。
+     */
+    public record InjectedQueuedMessage(String uuid, String content, String queuedOrigin) {
+        public InjectedQueuedMessage(String uuid, String content) {
+            this(uuid, content, null);
+        }
+    }
     /**
      * [IMP-HR-08 R1/R2] 本 run 的结构化输出 jsonSchema · doRun 注册 enforcement 时写入
      * （CC main.tsx:1885-1891 --json-schema 等价）。
@@ -488,6 +500,21 @@ public class AgentState {
      */
     public void addInjectedQueuedMessage(String uuid, String content) {
         this.injectedQueuedMessages.add(new InjectedQueuedMessage(uuid, content));
+    }
+
+    /**
+     * [P0-1 OD-1/OD-3] 3 参重载：+ queuedOrigin（排队来源标记）。
+     *
+     * <p>drain busy-queued 时经本重载登记 queuedOrigin='busy-queued'，ChatService 轮末补落库
+     * 据此 createQueuedUserMessage(..., queuedOrigin)。registry 仅登记 busy-queued（coordinator/
+     * channel/task-notification/cron mid-turn 不落库、不登记）。
+     *
+     * @param uuid         队列命令 id（CC attachment.source_uuid · 落库用指定 id）
+     * @param content      原始排队文本（可为空串/ null）
+     * @param queuedOrigin 排队来源标记（'busy-queued'；null = 不标记）
+     */
+    public void addInjectedQueuedMessage(String uuid, String content, String queuedOrigin) {
+        this.injectedQueuedMessages.add(new InjectedQueuedMessage(uuid, content, queuedOrigin));
     }
 
     /**
@@ -796,6 +823,72 @@ public class AgentState {
     }
 
     /**
+     * [usage-push] 本轮（run）级累计 input tokens · CC original: query 级累计 totalUsage 的
+     * {@code input_tokens} 分量（QueryEngine.ts:790-816 totalUsage += message.usage）。
+     *
+     * <p><b>run 级 vs 会话级</b>：{@link #sessionInputTokens()} 是跨 turn 会话累计（CostTracker
+     * 经 sessions 表 restore/save 持久化，CC cost-tracker 进程级近似）；本字段为<b>单 run（本轮
+     * query）累计</b>——AgentState 每 run 新建（LlmAgentLoop:1627），初始恒 0 自动清零，只累计
+     * 3 处 withUsage append（LlmAgentLoop 纯文本/截断 + AgentLoopContext 工具轮），对齐 CC
+     * message_stop 逐条累计 → turn 末 result.usage（QueryEngine totalUsage）。message.complete 的
+     * usage 从本字段派生（ChatService.publishCompleteEvent 改读 runUsage()）。
+     *
+     * <p><b>local-only 约束（CLAUDE.md BudgetTracker 架构红线）</b>：{@code @JsonIgnore} —— 与
+     * {@link #sessionOutputTokens} 同属本地会话状态，绝不序列化到 outbound DTO / STOMP /
+     * WebSocket / EventPublisher payload，绝不写入 LLM 请求 payload。
+     */
+    @JsonIgnore
+    private long runInputTokens = 0;
+
+    /** [usage-push] 本轮（run）级累计 output tokens（CC totalUsage.output_tokens 分量）。 */
+    @JsonIgnore
+    private long runOutputTokens = 0;
+
+    /** [usage-push] 本轮（run）级累计 cache read tokens（CC totalUsage.cache_read 分量）。 */
+    @JsonIgnore
+    private long runCacheRead = 0;
+
+    /** [usage-push] 本轮（run）级累计 cache creation tokens（CC totalUsage.cache_creation 分量）。 */
+    @JsonIgnore
+    private long runCacheCreation = 0;
+
+    /**
+     * [usage-push] 累加一条消息 usage 入 run 级累计 · 对齐 CC message_stop 逐条累计（query 级
+     * totalUsage += message.usage，QueryEngine.ts:790-816）。
+     *
+     * <p><b>调用点</b>：LlmAgentLoop.publishMessageUsage（3 处 withUsage append 后立即，
+     * 纯文本/截断/工具轮）——与推送 message.usage 事件同点累加，保证 turn 末 complete.usage =
+     * 各 message.usage 之和。null → no-op（无 usage 上报的消息不污染累计）。
+     *
+     * @param usage 本条 assistant 消息的 provider usage（null → no-op）
+     */
+    public void accumulateRunUsage(AgentUsage usage) {
+        if (usage == null) {
+            return;
+        }
+        this.runInputTokens += usage.inputTokens();
+        this.runOutputTokens += usage.outputTokens();
+        this.runCacheRead += usage.cacheReadInputTokens() != null ? usage.cacheReadInputTokens() : 0L;
+        this.runCacheCreation += usage.cacheCreationInputTokens() != null ? usage.cacheCreationInputTokens() : 0L;
+    }
+
+    /**
+     * [usage-push] 本轮累计 usage · 对齐 CC query 级 totalUsage（QueryEngine.ts:790-816/:861）
+     * → result.usage（message.complete usage 装配读此）。
+     *
+     * <p>7 参 AgentUsage（serverToolUse/serviceTier/cacheCreation 嵌套字段 null —— 累计只算 4 个
+     * token 字段，嵌套字段逐条不累计；与 MessageUsageDto.from 7 参投影形状一致，CC result.usage
+     * 顶层仅 token 字段累计）。恒非 null：无任何消息带 usage → 全零哨兵（complete 事件仍发 usage
+     * 对象，形状稳定）。
+     *
+     * @return 本轮 input/output/cacheRead/cacheCreation 4 字段累计 usage
+     */
+    public AgentUsage runUsage() {
+        return new AgentUsage(this.runInputTokens, this.runOutputTokens,
+            this.runCacheCreation, this.runCacheRead, null, null, null);
+    }
+
+    /**
      * [V-TOK-02 实施] 本会话累计花费（人民币元）· CC original: {@code total_cost_usd}
      * (state.ts:704-710 / result 事件)，值用元（用户拍板：字段名对齐 CC、不换算 USD）。
      *
@@ -884,16 +977,19 @@ public class AgentState {
     }
 
     /**
-     * [V-TOK-02 实施] 本会话 token 总量 · 对齐 CC {@code getTokenCountFromUsage}
-     * (tokens.ts:46-53) / context.ts current_usage 口径：input + output + cacheRead + cacheCreation
-     * （补充需求「会话 token 总量」；模型桶各字段求和）。
+     * [V-TOK-02 实施] 本会话 token 总量 · <b>已按 deepseek（openai）语义改 input+output</b>（A5-2）：
+     * deepseek {@code input_tokens} 已含 cache hit（input == H+M），若再加 cacheRead/cacheCreation
+     * 会双计。模型桶各字段求和改为 {@code input + output}（展示/汇总口径）。
+     *
+     * <p><b>A5-2 登记</b>: 本方法<b>无消费者（dead）</b>（全仓 grep 仅定义/JavaDoc）——直接改为
+     * openai 语义 + 本注释；若日后重新接线且需支持 anthropic 场景，须按 provider 分派
+     * （anthropic 会话 = input+output+cacheRead+cacheCreation），并携带模型/协议上下文。
      */
     public long sessionTotalTokens() {
         long total = 0;
         synchronized (this.sessionModelUsage) {
             for (CostTracker.ModelUsage u : this.sessionModelUsage.values()) {
-                total += u.inputTokens() + u.outputTokens()
-                    + u.cacheReadInputTokens() + u.cacheCreationInputTokens();
+                total += u.inputTokens() + u.outputTokens();
             }
         }
         return total;
@@ -1304,6 +1400,61 @@ public class AgentState {
     public String takeClassifierMatchedRule(String toolUseId) {
         if (toolUseId == null) return null;
         return classifierMatchedRules.remove(toolUseId);
+    }
+
+    // ── [fix-toolcalls-400 C] 工具 newMessages 按 toolUseId 延迟落地（CC toolExecution.ts:1478 addToolResult 先 / :1566 newMessages 后）──
+    /**
+     * 工具返回的 {@code newMessages}（如 Read pdf pages 的 isMeta image user 消息）按 toolUseId
+     * 暂存，延迟到 {@code AgentLoopContext.handleToolCallsTurn} step 3 该工具 {@code tool_result}
+     * append 之后 flush —— 对齐 CC toolExecution.ts:1478 addToolResult（产出含 tool_result 的 user
+     * 消息）→ :1566-1570 push result.newMessages（页图消息）。
+     *
+     * <p><b>WHY（根因）</b>: 旧实现 {@code ToolResultApplier.apply} 在工具执行 dispatch 期就
+     * {@code state.messages().addAll(tr.newMessages())}，早于 step 3 才 append 的 {@code tool_result}
+     * → state.messages 顺序变成 [assistant(tool_calls), user(isMeta 页图), tool(tool_result)]。
+     * provider 原序透传 → assistant tool_calls 后夹 image user 消息 → Anthropic 400
+     * "assistant message with tool_calls must be followed by tool messages"。本 map 让 newMessages
+     * 先暂存，待各自 tool_result 落地后再 flush。
+     *
+     * <p><b>local-only 约束（CLAUDE.md BudgetTracker 架构红线）</b>: {@code @JsonIgnore} —— 绝不
+     * 序列化到 outbound DTO / STOMP / WebSocket / EventPublisher payload。与
+     * {@link #structuredOutputs} / {@link #classifierMatchedRules} 同属 turn 级一次性暂存（take 后
+     * 移除，handleToolCallsTurn 末尾 drain 兜底清空 → 不跨 turn 泄漏）。
+     */
+    @JsonIgnore
+    private final java.util.Map<String, List<ChatMessageDto>> pendingNewMessagesByToolUseId =
+        new ConcurrentHashMap<>();
+
+    /** 工具执行期暂存 newMessages（ToolResultApplier 调用）· null/blank/empty 跳过。 */
+    public void stashNewMessages(String toolUseId, List<ChatMessageDto> newMessages) {
+        if (toolUseId == null || toolUseId.isBlank()
+                || newMessages == null || newMessages.isEmpty()) {
+            return;
+        }
+        // merge：同一 toolUseId 多处 handler（如 hook 普通消息并入 newMessages）累积，保序。
+        pendingNewMessagesByToolUseId.merge(toolUseId, new ArrayList<>(newMessages),
+            (old, add) -> {
+                List<ChatMessageDto> merged = new ArrayList<>(old);
+                merged.addAll(add);
+                return merged;
+            });
+    }
+
+    /** 取出并移除某 toolUseId 的暂存 newMessages（handleToolCallsTurn step 3 flush 后一次性消费）· 无则空 List。 */
+    public List<ChatMessageDto> takeNewMessages(String toolUseId) {
+        if (toolUseId == null) return List.of();
+        List<ChatMessageDto> msgs = pendingNewMessagesByToolUseId.remove(toolUseId);
+        return msgs == null ? List.of() : msgs;
+    }
+
+    /** 是否仍有未消费的暂存 newMessages（handleToolCallsTurn 末尾兜底 drain 判定用）。 */
+    public boolean hasPendingNewMessages() {
+        return !pendingNewMessagesByToolUseId.isEmpty();
+    }
+
+    /** 当前暂存只读视图，供测试/审计使用。 */
+    public java.util.Map<String, List<ChatMessageDto>> pendingNewMessagesByToolUseId() {
+        return java.util.Collections.unmodifiableMap(pendingNewMessagesByToolUseId);
     }
 
     // ── Stream-A5 内容替换持久化 (对齐 CC recordContentReplacement, query.ts:394) ──

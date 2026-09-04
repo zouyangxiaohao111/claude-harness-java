@@ -7,6 +7,9 @@
 # =====================================================================
 
 spring:
+  threads:
+    virtual:
+      enabled: true
   application:
     # [G3 决策 D1 + 第二轮拍板] appName 固定 nexusai → NexusaiPaths.getAppConfigHomeDir() = {user.home}/.nexusai
     name: nexusai
@@ -62,7 +65,6 @@ spring:
     enabled: true
     locations: classpath:db/migration
     baseline-on-migrate: true
-
   # ---------------------------------------------------------------
   # MyBatis-Flex
   # ---------------------------------------------------------------
@@ -314,6 +316,11 @@ nexusai:
     # [2026-09-01] WORKFLOW_SCRIPTS feature 开启 → WorkflowTool.isEnabled()=true（暴露给模型，
     #   多代理编排 / ultracode 依赖）；默认 false 时 Workflow 工具不暴露（ToolSearch 搜不到）。
     workflow-scripts: true
+    # [2026-09-02] nexusai-in-chrome 浏览器工具总开关 · 开发中默认关（不暴露 mcp__nexusai-in-chrome__*
+    #   18 工具给模型，避免开发期误调）；需启用 → true + 装 Chrome 扩展。BrowserMcpToolConfig 读此
+    #   flag（false → 工具不注册）+ BundledSkillFeatureFlagsConfig nexusai-in-chrome skill 门控叠加
+    #   （false → skill 不注册，防「skill 提示用工具但工具不存在」空转）。后期转常态后改默认 true。
+    browser-mcp: false
     # [2026-09-01 → V61 迁移 DB] 插件双读开关已迁移为 DB settings.plugin_claude_fallback
     #   （前端「插件设置」页可配；null = 回落默认 true）。本 yml 键已废弃——仅保留占位，
     #   实际消费点 InstalledPluginsManager / InstalledPluginsFileStore 改读 DB 列。

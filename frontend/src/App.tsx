@@ -10,8 +10,9 @@ import {
   newSessionContext,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag } from '@/types'
-import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode } from '@/api/types'
+import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
+import { marketApi } from '@/api/market'
 import { projectApi, type ProjectDto } from '@/api/projects'
 import { selectProjectFolder } from '@/utils/projectFolder'
 import { isAbsolutePath, normalizePath } from '@/utils/path'
@@ -61,6 +62,7 @@ import { EffortModal } from '@/components/modals/EffortModal'
 import { ContextAnalyzeModal } from '@/components/modals/ContextAnalyzeModal'
 import { UsageCostModal } from '@/components/modals/UsageCostModal'
 import { MemoryEditorModal } from '@/components/modals/MemoryEditorModal'
+import { SkillMarketModal } from '@/components/modals/SkillMarketModal'
 import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
 import { getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
@@ -135,6 +137,9 @@ function App() {
       .catch(() => { /* 后端未就绪则回落 mock allProjects，不阻断 */ })
     return () => { cancelled = true }
   }, [])
+
+  // ---- 技能市场弹窗（Composer 顶部 agent 胶囊点击触发 · App 持有开关 + 渲染 SkillMarketModal）----
+  const [showMarket, setShowMarket] = useState(false)
 
   // ---- local UI state (kept tiny) ----
   // 中心区视图：'chat' 对话 / 'trace' 轨迹（dsh 式记录列表）
@@ -233,7 +238,16 @@ function App() {
   }, [])
   // 挂载拉附件模式配置（attachmentLocalRead：true=本地桌面 path 直读；后端未起/无端点 → false 兜底走 upload）
   useEffect(() => {
-    void attachmentApi.config().then((c) => setAttachmentLocalRead(!!c.localRead)).catch(() => { /* 后端不可达 → false，附件走 upload（现状） */ })
+    const load = () => {
+      attachmentApi.config()
+        .then((c) => { setAttachmentLocalRead(!!c.localRead); console.debug('[attachment-mode] localRead =', c.localRead) })
+        .catch((e) => {
+          // 后端未起时首次拉取失败 → 3s 后重试（避免 mount 早于后端导致永久回落 upload）
+          console.debug('[attachment-mode] config 拉取失败，3s 重试', e)
+          setTimeout(load, 3000)
+        })
+    }
+    load()
   }, [])
   // 上次 Esc 时间戳（turn 运行中两下停流 + 空闲双击弹窗，分离避免状态串扰：
   //  stopStreaming 异步移除 activeStreams → turnRunning 翻 false，同一 ref 会让第二下 Esc 误走空闲分支）
@@ -309,7 +323,11 @@ function App() {
   const activeSession = storeSessions.find((s) => s.id === activeSessionId) ?? storeSessions[0] ?? EMPTY_SESSION_DTO
   // 当前会话权限模式：会话覆盖 ?? 全局默认 ?? 'default'
   const activePermissionMode: PermissionMode = activeSession?.permissionMode ?? appSettings?.permissionMode ?? 'default'
+  // 当前会话主线程 agent（V58 main_thread_agent · null/空串 = 默认模式，Composer 顶部胶囊显示）
+  const currentAgent = activeSession?.mainThreadAgent ?? null
   const sessionContext = sessionContexts[activeSessionId] ?? newSessionContext
+
+  // 本地专家/市场数据由 SkillMarketModal 打开时自行拉取（agentApi.listAgents + marketApi.*），App 不再常驻清单。
 
   // ---- 消息渲染源：chatStore.messages + 当前流式 ----
   const storeMessages = useChatStore((s) => s.messages[activeSessionId] ?? EMPTY_MESSAGES)
@@ -331,9 +349,10 @@ function App() {
       .catch(() => { /* 后端 batch 端点未就绪时静默（重拉后无图，同现状） */ })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSessionId, storeMessages])
-  // turn 运行中判定：activeStreams 含本会话 = turn 已登记（含 thinking 阶段）。
-  //   不能只看 stream —— 流式块仅在块推送后才有值，思考阶段为空 → Esc 一次会被当成「空闲」而不停流
-  const turnRunning = !!activeStreams[activeSessionId]
+  // turn 运行中判定：activeStreams 含本会话 = turn 已登记（含 thinking 阶段，此时 streams 空）。
+  //   OR streams 有流式块 = 打字机在推（后端主动推流/cron 续跑未登记 activeStreams 时仍要可停）。
+  //   两信号互补：思考阶段靠 activeStreams；打字机阶段靠 streams（防「打字机在动但发送键已出」脱节）
+  const turnRunning = !!activeStreams[activeSessionId] || (stream && stream.length > 0)
   // 运行中会话集合（有 stream = 运行中），供左侧栏状态图标。
   // 用 useMemo 稳定引用避免 selector 每次返回新 Set 触发无限重渲染。
   const streamsMap = useChatStore((s) => s.streams)
@@ -377,16 +396,27 @@ function App() {
   const conversationId = useChatStore((s) => s.conversationIds[activeSessionId])
   // F8 门控：消息非空 && 输入框为空（composerText 无有效内容）&& 非 loading
   const canOpenDialogOps = storeMessages.length > 0 && !turnRunning && !composerText.trim()
+  // 停止后静默重拉当前会话（显示已停止 → 立即反映停止后真实状态 · 等同「轨迹点击」刷新：
+  //   无 toast、不闪、保留窗口与 WS 连接）
+  const refreshAfterStop = useCallback(async () => {
+    if (!activeSessionId) return
+    try {
+      const msgs = await chatApi.listMessages(activeSessionId)
+      setMessages(activeSessionId, msgs)
+    } catch { /* 停止后刷新失败静默（后续事件/手动 F5 兜底） */ }
+  }, [activeSessionId, setMessages])
   // ---- 停止当前流式（Esc 一次 · turn 运行中）----
   const stopStreaming = useCallback(async () => {
     if (!activeSessionId) return
     try {
       await chatApi.cancel(activeSessionId)
       clearStream(activeSessionId)
+      showToast('已停止生成', 'success')
+      await refreshAfterStop()
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [activeSessionId, clearStream, showToast])
+  }, [activeSessionId, clearStream, showToast, refreshAfterStop])
 
   // ---- 停止当前会话所有任务（Esc 3s 内连按两次 · 对齐 CC killAllAgents 连按确认）----
   const handleStopAll = useCallback(async () => {
@@ -403,10 +433,22 @@ function App() {
       // 3) 清当前流式
       clearStream(activeSessionId)
       showToast('已停止所有任务', 'success')
+      // 显示「已停止」后后台刷新会话数据（停止后立即反映真实状态，等同轨迹 tab 刷新）
+      await refreshAfterStop()
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [activeSessionId, clearStream, showToast])
+  }, [activeSessionId, clearStream, showToast, refreshAfterStop])
+
+  // ---- 强行停止所有（Composer 「停止所有」按钮：一键 = 取消当前流式 + 停全部后台任务。
+  //      等价双击 Esc 强停，但不依赖 3s 连按时序；turn 不在飞时退化为纯 stop-all）----
+  const handleHardStop = useCallback(async () => {
+    if (!activeSessionId) return
+    if (turnRunning) {
+      try { await chatApi.cancel(activeSessionId) } catch { /* 无在飞 turn → 后端无取消目标，静默 */ }
+    }
+    await handleStopAll()
+  }, [activeSessionId, turnRunning, handleStopAll])
 
   // ---- Ctrl+B：当前会话前台任务全部转后台（对齐 CC task:background · 主线程可继续对话）----
   useEffect(() => {
@@ -514,7 +556,7 @@ function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'F5') return
       // 设置页打开时 F5 刷新当前菜单 tab；其他弹窗打开时不刷新
-      if (showDialogOps || showCommandPalette || ui.showSearchPalette || showModelPicker || showAgentsPanel || showChromePanel || showContextAnalyze || showMemoryEditor || showIncludeApproval || ui.showAddPanel || !!ui.diffFile) return
+      if (showDialogOps || showCommandPalette || ui.showSearchPalette || showModelPicker || showAgentsPanel || showChromePanel || showContextAnalyze || showMemoryEditor || showIncludeApproval || showMarket || ui.showAddPanel || !!ui.diffFile) return
       e.preventDefault()
       if (ui.showSettings) {
         // F5 刷新当前设置菜单页（对应 hook refresh；无 hook 的 tab 回落刷新会话历史）
@@ -533,7 +575,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [ui, settings.settingsTab, providersApi, skillsApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval])
+  }, [ui, settings.settingsTab, providersApi, skillsApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
 
   // ---- 历史回放：会话切换（真实后端 id）时先清空，再拉取该会话历史消息 ----
   const isRealActive = storeSessions.some((s) => s.id === activeSessionId)
@@ -554,7 +596,21 @@ function App() {
   //   topic 校验：事件来源 topic 必须等于当前登记 topic 才删。防竞态——turn A 运行中 send B，
   //   activeStreams[sid] 已登记为 topicB，此时 A 的终止事件（topicA）若盲删会把 topicB 一并移除
   //   → B 订阅被取消 → 新 turn 输出丢失。topic 不匹配说明该终止信号属于已被轮换掉的旧 turn，忽略。
+  // ---- 「完成未读」绿点（需求：运行结束且非当前会话 → 静止绿点；切到即清除）----
+  const activeSessionIdRef = useRef(activeSessionId)
+  activeSessionIdRef.current = activeSessionId
+  const [doneUnreadIds, setDoneUnreadIds] = useState<Set<string>>(new Set())
+  // 切到某会话 → 视为已读（清除其完成未读绿点）
+  useEffect(() => {
+    if (!activeSessionId) return
+    setDoneUnreadIds((p) => (p.has(activeSessionId) ? (() => { const n = new Set(p); n.delete(activeSessionId); return n })() : p))
+  }, [activeSessionId])
+
   const handleSessionDone = useCallback((sid: string, topic?: string) => {
+    // [未读] complete/cancel 运行结束且非当前会话 → 标「完成未读」（running/pending 优先级更高会覆盖显示）
+    if (sid !== activeSessionIdRef.current) {
+      setDoneUnreadIds((p) => (p.has(sid) ? p : new Set(p).add(sid)))
+    }
     setActiveStreams((prev) => {
       if (!prev[sid]) return prev
       if (topic && prev[sid] !== topic) return prev
@@ -594,8 +650,21 @@ function App() {
     }
   }, [])
 
+  // [断连恢复] WS 被服务端强杀（send time limit 超时）断连后,重连第一个 message.complete → 按事件 sid 权威
+  //   重拉 GET /messages 补偿缺口（DB 已逐条落库 realtime-persist）。reloadMessages 锁 activeSessionId
+  //   （F5/当前会话专用）,后台会话断连需按 sid 拉 → 独立实现。finalizeBlocks 按 id 幂等去重保证不重复。
+  const handleReconnectReload = useCallback(async (sid: string) => {
+    try {
+      const msgs = await chatApi.listMessages(sid)
+      setMessages(sid, msgs)
+    } catch {
+      // 重拉失败静默（不 toast 打扰——可能后台会话;下次 complete / 手动 F5 / 切会话重拉兜底）
+      console.debug('[reconnect-reload]', 'sid=', sid, '失败（静默,待下次兜底）')
+    }
+  }, [setMessages])
+
   // 多会话并行订阅（订阅所有 activeStreams；complete/cancel 明确回调移除）
-  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged)
+  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload)
 
   // ---- away-summary：blur 5min 触发，REST 摘要回插为系统消息 ----
   useAwaySummary(activeSessionId, (text) => {
@@ -965,6 +1034,41 @@ function App() {
     }
   }, [activeSessionId, setSessions, showToast, storeSessions])
 
+  // 会话级主线程 agent（V58 main_thread_agent · Composer 顶部胶囊）：PATCH 后端 + 本地同步
+  //   agentType=null/空串 均表示清除 → 后端传空串（PATCH 语义：null=不改动，空串=清除）
+  const handleAgentChange = useCallback(async (agentType: string | null) => {
+    if (!activeSessionId) return
+    try {
+      await sessionApi.update(activeSessionId, { mainThreadAgent: agentType ?? '' })
+      setSessions(storeSessions.map((s) => (s.id === activeSessionId ? { ...s, mainThreadAgent: agentType } : s)))
+      showToast(agentType ? `已切换到专家 ${agentType}` : '已恢复默认模式', 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [activeSessionId, setSessions, storeSessions, showToast])
+
+  // ---- 技能市场：使用专家（SkillMarketModal 回调）----
+  // 本地专家 → 复用 handleAgentChange（现有 PATCH mainThreadAgent 链路）+ 关弹窗；
+  // 远端专家 → marketApi.useExpert（后端构造成本地 agent + 设会话 mainThreadAgent）→ store 同步 + 关弹窗 + toast。
+  const handleMarketUseLocal = useCallback((agentType: string) => {
+    setShowMarket(false)
+    void handleAgentChange(agentType)
+  }, [handleAgentChange])
+
+  const handleMarketUseRemote = useCallback(async (expert: MarketExpert) => {
+    if (!activeSessionId) return
+    try {
+      const r = await marketApi.useExpert(activeSessionId, expert.marketId)
+      // 用 useChatStore.getState() 取最新会话列表（避免闭包 stale）
+      const st = useChatStore.getState()
+      setSessions(st.sessions.map((s) => (s.id === activeSessionId ? { ...s, mainThreadAgent: r.mainThreadAgent } : s)))
+      setShowMarket(false)
+      showToast(`已使用 ${r.displayName || expert.displayName || expert.agentName || r.mainThreadAgent} 驱动会话`, 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [activeSessionId, setSessions, showToast])
+
   // 会话重命名（会话栏 ⋯ → 重命名）：PATCH 后端 title + 本地同步
   const renameSession = useCallback(async (id: string, title: string) => {
     try {
@@ -1107,9 +1211,18 @@ function App() {
           const m = /^data:[^;]+;base64,(.+)$/.exec(raw)
           return { base64: m ? m[1] : raw, mediaType: a.mediaType || 'image/png' }
         }) ?? []
-      // 用户附件快照（非图片：PDF/文件等）→ user 气泡显示文件名 chip；DB 重拉后端不出站该字段
+      // 用户附件快照（非图片：PDF/Word/视频/音频/文件）→ user 气泡内联胶囊 + 点击预览。
+      //   内容源：base64（≤5MB 即时）→ path（local-read 大文件本地读盘）→ url（upload contentId 后端 /content 预览——
+      //   upload 已注册附件表，contentId 立即拼 url，发送即能点预览，不必等 F5 后端出站）
       const userAttachments = attachments?.filter((a) => a.type !== 'image' && a.filename)
-        .map((a) => ({ type: a.type, filename: a.filename! })) ?? []
+        .map((a) => {
+          const cid = a.contentId ?? null
+          return {
+            type: a.type, filename: a.filename!, mediaType: a.mediaType ?? null, contentId: cid,
+            url: cid ? `/attachments/content/${activeSessionId}/${cid}` : null,
+            base64: a.base64 ?? null, path: a.path ?? null,
+          }
+        }) ?? []
       st.setMessages(activeSessionId, [
         ...(st.messages[activeSessionId] ?? []),
         { id: resp.userMessageId, sessionId: activeSessionId, role: 'user', author: '你', content: text, reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null, toolCallId: null, assistantMessageId: null, userMessageId: resp.userMessageId, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null, imageData: imageData.length ? imageData : null, userAttachments: userAttachments.length ? userAttachments : null },
@@ -1169,6 +1282,7 @@ function App() {
   useEscapeKey(showUsageCost, () => setShowUsageCost(false))
   useEscapeKey(showMemoryEditor, () => setShowMemoryEditor(false))
   useEscapeKey(showIncludeApproval, () => setShowIncludeApproval(false))
+  useEscapeKey(showMarket, () => setShowMarket(false))
 
   // ---- global keys（⌘K 打开命令面板；原 ⌘K→搜索 的快捷键移交给 MenuBar 搜索按钮）----
   useEffect(() => {
@@ -1236,6 +1350,9 @@ function App() {
           })()
         }}
         onCreateSession={() => createSession()}
+        onOpenAgentMarket={() => setShowMarket(true)}
+        onOpenKnowledgeBase={() => showToast('知识库建设中，敬请期待', 'info')}
+        doneUnreadIds={doneUnreadIds}
         onAddWorkspace={() => void handleAddWorkspace()}
         onOpenSettings={() => uiDispatch({ type: 'TOGGLE_SETTINGS' })}
         onDeleteSession={handleDeleteSession}
@@ -1249,7 +1366,14 @@ function App() {
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M1.5 3C1.5 2.5 1.8 2.2 2.3 2.2H4L4.8 3.4H9.7C10.2 3.4 10.5 3.7 10.5 4.2V9C10.5 9.5 10.2 9.8 9.7 9.8H2.3C1.8 9.8 1.5 9.5 1.5 9V3Z"/></svg>
             对话
           </button>
-          <button className={`center-tab ${centerView === 'trace' ? 'active' : ''}`} onClick={() => setCenterView('trace')}>
+          <button
+            className={`center-tab ${centerView === 'trace' ? 'active' : ''}`}
+            onClick={() => {
+              setCenterView('trace')
+              // 切到轨迹视图自动后台重拉当前会话最新消息（轨迹 = 消息派生的记录，无需手动 F5 才看到新记录）
+              if (activeSessionId) void reloadMessages()
+            }}
+          >
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M6 1L6 9M6 9L3 6M6 9L9 6M3 11H9"/></svg>
             轨迹
             <span className="count-badge">{storeMessages.filter((m) => !m.isMeta).length}</span>
@@ -1316,11 +1440,14 @@ function App() {
             onOpenModelPicker={() => setShowModelPicker(true)}
             onOpenEffort={() => setShowEffort(true)}
             sessionId={activeSessionId ?? ''}
+            currentAgent={currentAgent}
+            onOpenMarket={() => setShowMarket(true)}
             empty={storeMessages.length === 0 && !stream}
             onOpenUsageCost={() => setShowUsageCost(true)}
             onOpenChromePanel={() => setShowChromePanel(true)}
             showToBottom={!chatAtBottom}
             onScrollToBottom={() => setToBottomSignal((x) => x + 1)}
+            onHardStop={handleHardStop}
             localRead={attachmentLocalRead}
           />
         )}
@@ -1423,6 +1550,18 @@ function App() {
       )}
       {showAgentsPanel && <AgentsPanel onClose={() => setShowAgentsPanel(false)} />}
       {showChromePanel && <ChromePanel sessionId={activeSessionId} onClose={() => setShowChromePanel(false)} />}
+      {/* 技能市场（V58 主线程 agent 胶囊 → SkillMarketModal · 骨架版） */}
+      {showMarket && (
+        <SkillMarketModal
+          sessionId={activeSessionId ?? ''}
+          currentAgent={currentAgent}
+          busy={turnRunning}
+          onClose={() => setShowMarket(false)}
+          onUseLocalAgent={handleMarketUseLocal}
+          onUseRemoteExpert={(e) => void handleMarketUseRemote(e)}
+          showToast={showToast}
+        />
+      )}
       <SkillSurvey />
       {ui.showSettings && (
         <SettingsModal

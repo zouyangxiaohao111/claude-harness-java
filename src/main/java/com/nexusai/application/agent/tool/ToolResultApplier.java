@@ -18,7 +18,13 @@ import java.util.function.Function;
  * ExtendedToolResult 分流, 对每个 {@link ToolResult} 直接应用其载荷.
  * <p>应用协议 (对齐 CC SkillTool.ts:775-860 + toolExecution.ts:1272-1279):
  * <ol>
- *   <li>追加 {@link ToolResult#newMessages()} 到 messages (跨 turn 持久, SkillTool 用)</li>
+ *   <li>[fix-toolcalls-400 C] {@link ToolResult#newMessages()} 不再立即 addAll 到 messages —— 改按
+ *       toolUseId 暂存到 {@link AgentState#stashNewMessages}，由
+ *       {@code AgentLoopContext.handleToolCallsTurn} step 3 在该工具 {@code tool_result} append
+ *       之后 flush (对齐 CC toolExecution.ts:1478 addToolResult 先 / :1566-1570 newMessages 后)。
+ *       WHY: 立即 addAll 会让 Read pdf pages 等 isMeta image user 消息夹在 assistant(tool_calls)
+ *       与 tool_result 之间 → Anthropic 400 "assistant message with tool_calls must be followed
+ *       by tool messages"。stateObj 非 AgentState / toolUseId 不可得时回退旧行为直接 addAll 保底。</li>
  *   <li>结构化输出 {@link ToolResult#presentationMeta(ToolResult)} → {@link AgentState#recordStructuredOutput}
  *       (b14 本地暂存, 稍后由 LlmAgentLoop toolResultMessage 挂到 tool_result)</li>
  *   <li>[IT-6] 同上条件 → {@link AttachmentMessageDto#structuredOutput} attachment 追加到
@@ -49,8 +55,10 @@ public final class ToolResultApplier {
      * 应用 ToolResult 的 newMessages + structuredOutput 载荷.
      *
      * @param result   工具执行结果 (AgentToolResult&lt;?&gt;; 退役 ExtendedToolResult 后恒为 ToolResult)
-     * @param messages 当前 state.messages (会追加 newMessages)
-     * @param stateObj 当前 state (AgentState; 透传 recordStructuredOutput +
+     * @param messages 当前 state.messages ([fix-toolcalls-400 C] newMessages 不再直接 addAll ——
+     *                 改经 stateObj(AgentState) 按 toolUseId 暂存, 由 handleToolCallsTurn step 3
+     *                 该工具 tool_result 之后 flush; 仅 stateObj 非 AgentState 兜底时直写本列表)
+     * @param stateObj 当前 state (AgentState; 透传 stashNewMessages + recordStructuredOutput +
      *                 appendAttachment structured_output attachment, IT-6)
      * @param toolUseId 工具调用 ID（[IMP-C2] mapper 参数透传, 由调用方从调用块推导）
      * @return 处理后的 ToolResult (调用方继续追加 tool_result 消息)
@@ -62,9 +70,19 @@ public final class ToolResultApplier {
             // 防御: sealed permits 只剩 ToolResult, 理论不可达
             return null;
         }
-        // 1. 追加 newMessages (CC SkillTool.ts:735-860 call() 返回 newMessages)
+        // 1. newMessages → 延迟落地 (fix-toolcalls-400 C · CC toolExecution.ts:1478 addToolResult 先 /
+        //    :1566 newMessages 后). 工具执行期只暂存, 由 handleToolCallsTurn step 3 在每条 tool_result
+        //    append 之后 flush, 保证 state.messages 顺序 = assistant(tool_calls) → tool(tool_result)
+        //    → user(newMessages)。否则 pdf 页图等 isMeta user 消息夹在 assistant(tool_calls) 与
+        //    tool_result 之间 → provider 原序透传 → Anthropic 400。
         if (tr.newMessages() != null && !tr.newMessages().isEmpty()) {
-            messages.addAll(tr.newMessages());
+            if (stateObj instanceof AgentState state
+                    && toolUseId != null && !toolUseId.isBlank()) {
+                state.stashNewMessages(toolUseId, tr.newMessages());
+            } else if (messages != null) {
+                // 防御: 无 AgentState / toolUseId 可作键时回退旧行为 (立即追加), 不丢消息
+                messages.addAll(tr.newMessages());
+            }
         }
         // 2. structuredOutput → AgentState.recordStructuredOutput (b14 本地暂存, Java 偏离通道)
         //    + structured_output attachment (IT-6 · 对齐 CC toolExecution.ts:1272-1279

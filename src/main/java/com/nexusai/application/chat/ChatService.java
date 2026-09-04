@@ -15,6 +15,7 @@ import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.TaskBudget;
 import com.nexusai.application.agent.attachment.ImageAttachmentStore;
 import com.nexusai.application.agent.attachment.MediaAttachmentStore;
+import com.nexusai.application.agent.attachment.MediaLimitConstants;
 import com.nexusai.application.agent.attachment.MediaLimitGuard;
 import com.nexusai.application.agent.attachment.PdfAttachmentStore;
 import com.nexusai.application.agent.tool.impl.AskUserQuestionTool;
@@ -67,7 +68,9 @@ import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.OffsetDateTime;
@@ -77,6 +80,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.Base64;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -282,10 +286,70 @@ public class ChatService {
         //   能进 drainForQuery 快照（sleepRan=false 绝大多数工具边界 threshold=NEXT），在下一工具边界
         //   被当前轮 mid-turn 注入同轮回答；仅当前轮不再调工具时才留到 turn 结束由 CronIdleExecutor
         //   起新轮兜底消费（mainThreadConsumable 不看 priority，兜底不受影响）。
+        // [OD-D5] busy-queued 携图：从 req.attachments() 提取 image 类（≤5MB base64 直传项）→
+        //   QueueItem.attachments 携带。不预写 pendingPromptImages（防共享桶错配 + 端后 doRun
+        //   双注册；reflector MAJOR-2/5）——drain 消费点逐项 registerRunPromptImages 消费即清。
+        //   contentId/path 大图/PDF/media 本期 busy mid-turn 不支撑（端后兜底 doRun 空闲链）。
+        //   空图 → 现状纯文本零变化。
+        java.util.List<AttachmentRequest> busyImages = busyQueuedImageAttachments(req);
         notificationQueue.enqueue(new NotificationQueue.QueueItem(
             content, NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,
-            null, userMessageId, false, "busy-queued", false, null, sessionId));
+            null, userMessageId, false, "busy-queued", false, null, sessionId,
+            null /* boundProject */, null /* scheduleId */, busyImages));
+        if (log.isInfoEnabled()) {
+            log.info("QUEUE busy 携附件: session={} uuid={} images={}（OD-D5 busy 图片通道：≤5MB base64 直传项随队列入队，"
+                    + "drain 消费点逐项注册；大图/PDF/media 端后兜底）",
+                sessionId, userMessageId, busyImages == null ? 0 : busyImages.size());
+        }
         queueEventPublisher.emitChanged(sessionId);
+    }
+
+    /**
+     * [OD-D5] 提取 busy-queued 可携带图片附件（≤5MB base64 image 直传项）。
+     *
+     * <p>对齐 CC busy enqueue 携 {@code pastedContents}（handlePromptSubmit.ts:340）——CC 只把
+     * 「图片粘贴内容」随命令携带，非图片附件（PDF/media/path 大图）不在 busy 内联注入范围。
+     * Java 侧过滤条件：
+     * <ul>
+     *   <li>{@code type=image} 或 {@code mediaType=image/*}（同 {@code LlmAgentLoop.isImageAttachment}）</li>
+     *   <li>{@code base64} 非空白（直传内容；contentId/path 通道需空闲 resolveAttachments 补全，
+     *       busy mid-turn 不支撑）</li>
+     *   <li>{@code base64.length() ≤ 5MB}（Anthropic image block base64 硬限制，apiLimits.ts:19；
+     *       超限大图本期走端后兜底 doRun 空闲链，不随 busy 队列内联注入）</li>
+     * </ul>
+     * 空附件 / 无命中 → 空列表（纯文本行为零变化）。
+     *
+     * @param req 原请求体（可 null）
+     * @return 可携带图片附件列表（恒非 null；无 → emptyList）
+     */
+    private java.util.List<AttachmentRequest> busyQueuedImageAttachments(SendMessageRequest req) {
+        if (req == null || req.attachments() == null || req.attachments().isEmpty()) {
+            return java.util.List.of();
+        }
+        java.util.List<AttachmentRequest> images = new java.util.ArrayList<>();
+        for (AttachmentRequest att : req.attachments()) {
+            if (att == null) {
+                continue;
+            }
+            boolean imageType = (att.type() != null && "image".equalsIgnoreCase(att.type()))
+                || (att.mediaType() != null && att.mediaType().startsWith("image/"));
+            if (!imageType) {
+                continue;
+            }
+            String b64 = att.base64();
+            if (b64 == null || b64.isBlank()) {
+                continue;   // contentId/path 通道 busy mid-turn 不支撑（红线 §五.7）
+            }
+            if (b64.length() > MediaLimitConstants.API_IMAGE_MAX_BASE64_SIZE) {
+                if (log.isDebugEnabled()) {
+                    log.debug("QUEUE busy 跳过超限图（>5MB base64 不内联注入，端后 doRun 兜底）: filename={} base64Len={}",
+                        att.filename(), b64.length());
+                }
+                continue;
+            }
+            images.add(att);
+        }
+        return images;
     }
 
     // ─────────────────────────── P5 · 变量 + 扩展对齐 ───────────────────────────
@@ -477,15 +541,16 @@ public class ChatService {
     }
 
     /**
-     * [mid-turn-align · B 落库正解] 失败路径兜底落库 mid-turn 注入的排队 user 消息。
+     * [mid-turn-align · 实时落库 2026-09-03] 幂等兜底落库 mid-turn 注入的排队 user 消息。
      *
-     * <p>成功路径已由 {@link #replayAndPersist} 按 state.messages() 位置原位落库（单点收敛，对齐 CC
-     * messages.ts:3782 消费时 createUserMessage）——本方法仅服务两条失败路径：
+     * <p><b>实时化后定位变化</b>：queued-user 正常由实时落库 appendListener（persistAppendedMessage
+     * user 分支）在 append 时点原位落库（4 参单调 ts）；本方法仅服务 appendListener 未执行/漏落的两条
+     * 兜底路径（对齐原 replayAndPersist 时代失败路径语义，消息不永久丢失）：
      * <ul>
-     *   <li><b>replayAndPersist 抛异常</b>（processUserMessage catch 分支）：原位落库可能部分执行，
-     *       此处 best-effort 全量重试（幂等：已落库的重复调用仅 duplicate-key warn）</li>
-     *   <li><b>cancel 分支</b>（run 已成功返回但 task.cancel 置位，不经过 replayAndPersist）：本轮已
-     *       mid-turn 注入的 queued-user 不得丢失（否则 DB 无记录、前端气泡悬空）</li>
+     *   <li><b>run 正常返回收口</b>（processUserMessage / 无 listener 场景）：已实时落库的
+     *       existsById 判重跳过；漏落/未武装的此处补落</li>
+     *   <li><b>cancel 分支</b>（run 已成功返回但 task.cancel 置位）：本轮已 mid-turn 注入的
+     *       queued-user 不得丢失（否则 DB 无记录、前端气泡悬空）</li>
      * </ul>
      *
      * <p>逐个 try/catch + warn：单条落库失败不打断 message.complete 收口（非致命）。
@@ -501,19 +566,25 @@ public class ChatService {
         if (injected == null || injected.isEmpty()) {
             return;
         }
+        // [reflect-warning] 单调时间戳兜底：同批连续 insert 不在同一毫秒并列（对齐原 replayAndPersist
+        //   baseTs.plusNanos(seq) 保序范式；实时 append 已用同款单调 ts）。
+        OffsetDateTime baseTs = OffsetDateTime.now();
+        long tsSeq = 0;
         for (AgentState.InjectedQueuedMessage inj : injected) {
             try {
-                // [mid-turn 加固 2026-08-25] 跳过已原位落库的（replayAndPersist :688 单调 baseTs.plusNanos
-                //   落库保序）——否则 3 参 now() 重复落库会 insert 冲突（无害）或 error 分支覆盖 created_at
-                //   顺序。仅 :688 未执行（error 兜底）时本处落库。
+                // [mid-turn 加固 2026-08-25] 跳过已原位落库的（实时 appendListener 已落 4 参单调 ts）——
+                //   否则重复落库会 insert 冲突（无害）或覆盖 created_at 顺序。仅实时漏落时本处补落。
                 if (messageService.existsById(inj.uuid())) {
                     if (log.isDebugEnabled()) {
                         log.debug("ChatService: 排队 user 消息已原位落库，补落库跳过 id={}", inj.uuid());
                     }
                     continue;
                 }
-                // 空 content 也落库（busy 入队 content 可为空串；空 user 消息仍应在 DB 有记录）
-                messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content());
+                // 空 content 也落库（busy 入队 content 可为空串；空 user 消息仍应在 DB 有记录）。
+                // 4 参重载注入单调时间戳：DB created_at 严格递增，顺序可期（对齐原 replayAndPersist :688）。
+                // [P0-1 OD-1/OD-3] 6 参重载透传 queuedOrigin（registry 仅 busy-queued → 'busy-queued' 落 V67 列）
+                messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
+                    baseTs.plusNanos(tsSeq++), false, inj.queuedOrigin());
                 if (log.isInfoEnabled()) {
                     log.info("ChatService: mid-turn 注入排队 user 消息补落库 session={} id={} chars={}",
                         sessionId, inj.uuid(), inj.content() == null ? 0 : inj.content().length());
@@ -526,43 +597,13 @@ public class ChatService {
     }
 
     /**
-     * [mid-turn-align] error 分支逃生门：把已 mid-turn 注入的排队 user 消息重新 enqueue 回队列。
+     * [实时落库 2026-09-03] 已注入命令绝不 requeue（对齐 CC messageQueueManager.ts：无 requeue API，
+     * 消费即移除；query 崩溃已消费命令不自动回队——transcript/DB 实时留痕不重试）。
      *
-     * <p>run() 抛异常时 state 恒 null（赋值未完成）→ 无法经 state.injectedQueuedMessages() 补落库，
-     * 改用 loop 实例的镜像列表（{@code loop.injectedQueuedMessages()}）。逐条以<b>原 uuid</b> +
-     * mode=prompt + priority=NEXT + workload="busy-queued" 重新入队（前端 queue.drained 按 uuid
-     * 去重；消息不永久丢失），emitChanged 刷新排队框。会话已 idle（:279 isSessionRunning 已过）→
-     * CronIdleExecutor 兜底重新消费落库 + 起新轮。
-     *
-     * @param loop      本轮 LlmAgentLoop 实例（null = 未走到 run()，无可逃生消息）
-     * @param sessionId 目标会话（short）
+     * <p>原 reenqueueInjectedQueuedMessages（error 分支逃生门）已按用户拍板删除：error 分支 run() 抛异常
+     * 时，已注入命令若已 append 已由实时落库落 DB（+ 前端气泡留痕）；未注入仍在队列由 CronIdleExecutor
+     * 自然消费。遗留引用已清（规则十二：显式失败不静默跳过）。
      */
-    private void reenqueueInjectedQueuedMessages(LlmAgentLoop loop, String sessionId) {
-        if (loop == null) {
-            return;
-        }
-        List<AgentState.InjectedQueuedMessage> injected = loop.injectedQueuedMessages();
-        if (injected == null || injected.isEmpty()) {
-            return;
-        }
-        for (AgentState.InjectedQueuedMessage inj : injected) {
-            try {
-                notificationQueue.enqueue(new NotificationQueue.QueueItem(
-                    inj.content(), NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,
-                    null, inj.uuid(), false, "busy-queued", false, null, sessionId));
-                queueEventPublisher.emitChanged(sessionId);
-                if (log.isInfoEnabled()) {
-                    log.info("ChatService: error 分支 re-enqueue 排队 user 消息回队列（交 CronIdleExecutor 兜底）"
-                            + " session={} id={}",
-                        sessionId, inj.uuid());
-                }
-            } catch (Exception e) {
-                log.warn("ChatService: error 分支 re-enqueue 排队 user 消息失败: session={} id={}: {}",
-                    sessionId, inj.uuid(), e.getMessage());
-            }
-        }
-    }
-
     @Async("chatExecutor")
     public void processUserMessage(String sessionId,
                                    String userMessageId,
@@ -819,6 +860,15 @@ public class ChatService {
                             + "（per-call 恒胜会话 override；null 回落全局 settings/permissions.defaultMode）",
                         perCallPermissionMode, session.getPermissionMode(), effectivePermissionMode);
                 }
+                // [实时落库 2026-09-03] run 前武装实时落库 SPI：装配了落库能力（messageService != null）才
+                //   武装（非 Spring 单测不武装 → loop mock 不消费 enabler，零行为变化）。doRun 历史注入完成、
+                //   prePersistedMessageIds 已登记后回调 → armRealTimePersist setAppendListener，其后每条
+                //   新 append（=消息完整产出）即实时落 DB（对齐 CC recordTranscript）。传该轮 userMessageId
+                //   作 DB user_message_id 归属根（对齐原 replayAndPersist lastUserMessageId 初值语义）。
+                if (messageService != null) {
+                    loop.setPostHistoryPersistEnabler(state2 ->
+                        armRealTimePersist(state2, sessionId, streamTopic, wsTemplate, userMessageId));
+                }
                 state = loop.run(RunRequest.session(
                     userPrompt, sessionId, null, config, modelName, null,
                     req != null ? req.appendSystemPrompt() : null,   // [RES-SP31] 接线：HTTP 请求体追加指令
@@ -830,11 +880,10 @@ public class ChatService {
                     attachments));                                   // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
             } catch (Exception e) {
                 log.error("AGENT failed: model={}", modelName, e);
-                // [mid-turn-align] error 分支逃生门：run() 抛异常 → state 恒 null（赋值未完成），
-                //   已 mid-turn 注入的排队 user 消息从 loop 实例重新 enqueue 回队列（保留原 uuid，
-                //   前端 queue.drained 去重；消息不永久丢失），会话已 idle → CronIdleExecutor 兜底
-                //   重新消费落库 + 起新轮。
-                reenqueueInjectedQueuedMessages(loop, sessionId);
+                // [实时落库 2026-09-03] error 分支删除 reenqueueInjectedQueuedMessages（对齐 CC
+                //   messageQueueManager.ts：无 requeue API，消费即移除；query 崩溃已消费命令不自动回队）。
+                //   已注入命令若已 append 已实时落库留痕（DB + 前端气泡）；未注入仍在队列由 CronIdleExecutor
+                //   自然消费——规则十二显式失败：不再静默重放。
                 String errorCode = (e instanceof InterruptedException) ? "cancelled" : "llm_error";
                 String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                 // [reflect-blocker] 终态事件同源（error 分支）：run() 抛异常 → state 恒 null（赋值未完成），
@@ -883,12 +932,19 @@ public class ChatService {
                     (lastAsst != null && lastAsst.id() != null) ? "lastAssistantMessage" : "task-placeholder");
             }
 
+            // [实时落库 2026-09-03] run() 返回后收口：解除 appendListener（防泄漏/下轮误触发）+ queued-user
+            //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
+            //   批量已删——消息已实时落库，此处不再遍历 state.messages()。
+            if (state != null) {
+                state.clearAppendListener();
+                persistInjectedQueuedMessages(state, sessionId);
+            }
+
             // 5) cancel 检查
             if (task.cancel.get()) {
                 log.info("AGENT cancelled by user");
-                // [mid-turn-align] cancel 分支同样补落库（run 已成功返回，state 非 null）：本轮已
-                //   mid-turn 注入的排队 user 消息不得丢失（否则 DB 无记录、前端气泡悬空）。
-                persistInjectedQueuedMessages(state, sessionId);
+                // [mid-turn-align] cancel 分支 queued-user 已由上方收口 persistInjectedQueuedMessages
+                //   幂等补落（run 返回后即执行，先于本 cancel 检查），此处不再重复调用。
                 sendAndLog(wsTemplate, streamTopic,
                     MessageCancelledEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realAssistantId),
                     "cancelled");
@@ -903,22 +959,9 @@ public class ChatService {
                 state.turnCount(), state.exitReason(),
                 state.messages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
 
-            // 6) 翻译 + 持久化（[mid-turn-align · B 落库正解] 成功路径的 queued-user 原位落库已收进
-            //   replayAndPersist 单点，不再有第二落库通道——对齐 CC messages.ts:3782 消费时落库）
-            try {
-                replayAndPersist(sessionId, userMessageId, state, streamTopic, wsTemplate);
-            } catch (Exception e) {
-                log.error("Replay/persist failed", e);
-                // [mid-turn-align · B 落库正解] replayAndPersist 抛异常（DB insert/duplicate-key）时
-                //   注入的 queued-user 不得永久丢失——原位落库可能已部分执行（幂等：duplicate-key 仅
-                //   warn），此处 best-effort 兜底全量重试（原 :486 位于 try/catch 外的安全网收进 catch
-                //   内承接失败路径）。
-                persistInjectedQueuedMessages(state, sessionId);
-                sendAndLog(wsTemplate, streamTopic,
-                    MessageErrorEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realAssistantId,
-                        "replay_error", e.getMessage()),
-                    "error replay");
-            }
+            // 6) 消息已实时落库（appendListener → persistAppendedMessage，run 全程逐条落），无 run 末批量。
+            //   原 replayAndPersist 已删：本处仅收口（clearAppendListener + persistInjectedQueuedMessages
+            //   幂等兜底）已在上方执行。queued-user 原位顺序 = append 即落（对齐 CC messages.ts:3782 消费时落库）。
 
             // 7) message.complete · [V-TOK 实施] 照抄 CC result 事件结构（真实 usage/cost/上下文，
             //    替代 mock 42）——usage = 末条 assistant 的 provider usage；total_cost_usd/modelUsage =
@@ -970,29 +1013,25 @@ public class ChatService {
         // [bugfix] 前端收口消息思考丢失：reasoning 由 null 改为末条 assistant 的真实 reasoning
         //   （对齐 replayAndPersist finalReasoning 捕获语义，:432 finalReasoning = m.reasoning()）
         String finalReasoning = lastAssistantReasoning(state);
-        ChatMessageDto completeAsst = lastAssistantMessage(state);
-        AgentUsage completeUsage = completeAsst != null ? completeAsst.usage() : null;
-        // 块 3 投影：真实 input/output tokens（usage 缺失 → null，NON_NULL 省略）
-        Integer completeInputTokens = completeUsage != null ? (int) completeUsage.inputTokens() : null;
-        Integer completeOutputTokens = completeUsage != null ? (int) completeUsage.outputTokens() : null;
-        // 上下文快照（对齐 CC context.ts:118-144）：窗口 = 模型 max_context_tokens（回落 1M）；
-        // current_usage = input + cache_read + cache_creation（不含 output）；percentLeft = 余量百分比
-        // [B2-R2] 公式分协议：Anthropic 用 CC 公式 input+cacheRead+cacheCreate；OpenAI/DeepSeek 仅 input
+        // [usage-push] complete.usage 口径从末条单条改为本轮累计 totalUsage（对齐 CC result.usage =
+        //   query 级累计 totalUsage，QueryEngine.ts:790-816/:861）——run 级累计由 LlmAgentLoop 3 处
+        //   withUsage append 后 publishMessageUsage → state.accumulateRunUsage 累加。无任何 assistant
+        //   消息带 usage 时 runUsage() = 全零哨兵（AgentState 每 run 新建自动清零），仍发 usage 对象
+        //   （与 MessageUsageDto.from 恒非 null + @JsonInclude(NON_NULL) 形状一致）。
+        AgentUsage completeUsage = state.runUsage();
+        // 块 3 投影：真实 input/output tokens（本轮累计；runUsage() 恒非 null → 恒发）
+        Integer completeInputTokens = (int) completeUsage.inputTokens();
+        Integer completeOutputTokens = (int) completeUsage.outputTokens();
+        // 上下文快照（对齐 CC context.ts:118-144）：单点化收口到 ContextUsageCalculator.snapshot
+        //   —— window = 模型 max_context_tokens（回落 1M）+ used 协议分派 + percentLeft clamp 0。
+        //   [usage-push] 与 message.usage 事件（LlmAgentLoop.publishMessageUsage）共用同一快照单点，
+        //   防 ChatService/MessageService 式公式漂移重演（见 ContextUsageCalculator 类 javadoc）。
         String completeModel = state.currentModel();
-        ModelRecord completeModelRecord = completeModel != null ? findEnabledModelByName(completeModel) : null;
-        boolean completeIsAnthropic = ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, completeModel);
-        long completeContextWindow = completeModelRecord != null && completeModelRecord.getMaxContextTokens() != null
-            ? completeModelRecord.getMaxContextTokens() : 1_048_576L;
-        long completeContextUsed = completeUsage != null
-            ? ContextUsageCalculator.computeContextTokensUsed(
-                completeUsage.inputTokens(),
-                completeUsage.cacheReadInputTokens(),
-                completeUsage.cacheCreationInputTokens(),
-                completeIsAnthropic)
-            : 0L;
-        Integer completePercentLeft = completeUsage != null
-            ? Math.max(0, (int) Math.round((1 - (double) completeContextUsed / completeContextWindow) * 100))
-            : null;
+        ContextUsageCalculator.Snapshot completeSnapshot =
+            ContextUsageCalculator.snapshot(modelMapper, providerMapper, completeModel, completeUsage);
+        long completeContextWindow = completeSnapshot.contextWindow();
+        long completeContextUsed = completeSnapshot.contextTokensUsed();
+        Integer completePercentLeft = completeSnapshot.percentLeft();
         long completeDurationMs = System.currentTimeMillis() - turnStartMs;
         // [B7-R9] decode_ms 装配：从末条 assistant 消息读 LlmAgentLoop firstTokenMs 打点结果
         Long completeDecodeMs = lastAssistantDecodeMs(state);
@@ -1061,9 +1100,8 @@ public class ChatService {
     /**
      * 统一 STOMP 推送 + 日志。summary 是给人 + AI 看的简短描述。
      *
-     * <p><b>[cron-fire-visible] wsTemplate null 守卫</b>（2026-08-25）：{@link #replayAndPersist}
-     * public 化后 cron 路径（CronIdleExecutor）复用 —— 非 Spring 单测或 headless 未注入
-     * wsTemplate 时跳过推送（仅落库），不 NPE。生产主链路 wsTemplate 恒非 null，行为不变。
+     * <p><b>wsTemplate null 守卫</b>（2026-08-25）：非 Spring 单测或 headless 未注入 wsTemplate 时跳过
+     * 推送（实时落库仅写 DB），不 NPE。生产主链路 wsTemplate 恒非 null，行为不变。
      */
     private void sendAndLog(SimpMessagingTemplate ws, String topic,
                             StreamEvent evt, String summary) {
@@ -1082,7 +1120,7 @@ public class ChatService {
      * 流式入口（演示用）· 对齐 CC query.ts:219 {@code async function* query(params)}.
      *
      * <p>与 {@link #processUserMessage} 主流程平行：{@code processUserMessage} 用
-     * {@link LlmAgentLoop#run(RunRequest)} 拿终态 AgentState 给 {@code replayAndPersist};
+     * {@link LlmAgentLoop#run(RunRequest)} 拿终态 AgentState（实时落库由 appendListener 完成）；
      * 本方法用 {@link LlmAgentLoop#runStream(RunRequest)} 拿事件流
      * ({@link AgentEvent.TurnStarted} / {@link AgentEvent.TurnCompleted} /
      * {@link AgentEvent.Terminal}), 模拟 CC AsyncGenerator 消费.
@@ -1109,86 +1147,123 @@ public class ChatService {
         }
     }
 
-    // ─────────────────────────── 回放 + 持久化 ───────────────────────────
+    // ─────────────────────────── 实时落库（append 即落 · 对齐 CC recordTranscript）───────────────────────────
 
     /**
-     * 回放 + 持久化本轮 agent 结果 · 对齐 CC 消费时落 transcript（messages.ts:3782）。
+     * [实时落库 2026-09-03] 单轮实时落库上下文（per-run）。
      *
-     * <p><b>[cron-fire-visible] public 化</b>（2026-08-25）：原 private 仅供
-     * {@code processUserMessage} 主链路调用；cron 触发结果落库（CronIdleExecutor.runOneAgentLoop）
-     * 复用同一方法——遍历 {@code state.messages()} 落库 assistant/tool/final（user 已落库跳过、
-     * 注入历史经 prePersistedMessageIds 跳过防重），保证 cron 与主会话同款回放语义
-     * （CC onFireTask：cron 结果落 transcript，前端可见）。tool_call/tool_result 经 STOMP
-     * 推送（realtimeToolCallsPushed 去重防双发），wsTemplate 为 null（非 Spring 单测）时
-     * {@link #sendAndLog} 跳过推送仅落库。
+     * <p>持会话级串行锁 + 单调时间戳 + 消息链归属（lastUserMessageId）。listener 每 append 一条消息即同步
+     * 落库，故时间戳须 {@code baseTs.plusNanos(seq)} 单调保序（工具并行 append → synchronized 串行落库），
+     * 对齐原 replayAndPersist 循环内保序范式（同 MessageService.replaceSessionMessages base.plusNanos(i)）。
+     * lastUserMessageId 初始 = 本轮发起 user 消息 id（调用方经 5 参 armRealTimePersist 传入，对齐原
+     * replayAndPersist lastUserMessageId = turn userMessageId）；遇 mid-turn 注入排队 user 时推进。
      */
-    public void replayAndPersist(String sessionId,
-                                 String userMessageId,
-                                 AgentState state,
-                                 String streamTopic,
-                                 SimpMessagingTemplate wsTemplate) {
-        String finalAssistantId = "msg-" + UUID.randomUUID().toString().substring(0, 8);
-        // [联调修复] 追踪最后一条 assistant 的 reasoning（final 落库用，否则历史回放无思考）
-        String finalReasoning = null;
-        // [reasoningDurationMs] 追踪最后一条 assistant 的推理耗时（final 落库 + STOMP 收口用，同 finalReasoning 语义）
-        Long finalReasoningDurationMs = null;
+    private static final class PersistCtx {
+        final String sessionId;
+        final Object lock = new Object();
+        final java.time.OffsetDateTime baseTs;
+        final java.util.concurrent.atomic.AtomicLong tsSeq;
+        final java.util.concurrent.atomic.AtomicReference<String> lastUserMessageId;
 
-        // [fix-loop-resume-history] 注入历史消息 id 集 · LlmAgentLoop.doRun 主路径恢复（对齐 CC
-        //   loadConversationForResume）把 DB 历史灌入 state.messages() 后登记。遍历跳过这些消息：
-        //   history assistant/tool 消息带原始 DB id 作 PK，重插必 duplicate-key 崩；合成 sentinel/
-        //   Continue（deserializer 注入，临时 UUID id）CC 也不写 transcript（下轮由 deserializer 从
-        //   interrupted 尾部重新派生），语义一致。null（全新会话 / 非主线程 / 测试构造路径）= 无注入
-        //   → 跳过不生效（等价现状）。本轮新生成的 assistant/tool 消息 id 不在集合 → 正常落库。
-        java.util.Set<String> prePersisted = state.prePersistedMessageIds();
+        PersistCtx(String sessionId, String initialUserMessageId) {
+            this.sessionId = sessionId;
+            this.baseTs = java.time.OffsetDateTime.now();
+            this.tsSeq = new java.util.concurrent.atomic.AtomicLong(0);
+            this.lastUserMessageId = new java.util.concurrent.atomic.AtomicReference<>(initialUserMessageId);
+        }
+    }
 
-        // [mid-turn-align · B 落库正解] mid-turn 注入的排队 user 消息（queued-user）已在
-        //   state.messages() 正确位置（LlmAgentLoop 工具边界 appendMessage：回复A后、回复B前），
-        //   按位置原位落库 → DB 顺序 = user → assistantA → tool → queued-user → assistantB(final)，
-        //   修复原末尾补落库（:486）导致的 queued-user 排在回答它的 assistant 之后。原始 user /
-        //   resume 历史 user 已落库（controller createUserMessage / DB 历史行），仍跳过。
-        //   落库 content 用 injected 原始 value（含空串）而非 m.content()（wrapCommandText 包裹文本）。
-        //   id 前缀判定安全：注入 id=队列 uuid（msg-queued-xxx）与 controller 生成 id（msg-xxx）前缀
-        //   不同，不会误判原始 user。
-        Map<String, String> injectedById = (state.injectedQueuedMessages() == null)
-            ? Collections.emptyMap()
-            : state.injectedQueuedMessages().stream()
-                .filter(java.util.Objects::nonNull)
-                .collect(Collectors.toMap(
-                    AgentState.InjectedQueuedMessage::uuid,
-                    AgentState.InjectedQueuedMessage::content,
-                    (a, b) -> a));
-        Set<String> inPlacePersisted = new HashSet<>();
+    /**
+     * [实时落库 2026-09-03] 武装 AgentState 逐条 append 监听器（对齐 CC recordTranscript 每条产出即写）。
+     *
+     * <p>生产调用方（ChatService.processUserMessage / CronIdleExecutor）在 {@code loop.run()} 前经
+     * {@code LlmAgentLoop.setPostHistoryPersistEnabler(...)} 注入本方法；doRun 历史注入完成、
+     * prePersistedMessageIds 已登记后回调 → 此处 setAppendListener，其后每条新 append（=消息完整产出，
+     * DTO 全字段齐：usage/finishReason 已在 append 点定）即实时落 DB。
+     *
+     * <p><b>listener 体内异常处理</b>：单条落库失败仅 log.warn 不抛出（不打断主循环 / 不丢前端流）；
+     * queued-user 若因注册时序漏落，由 processUserMessage 收口 persistInjectedQueuedMessages
+     * （existsById 判重）幂等补漏。
+     *
+     * @param state                本轮 AgentState（doRun 内历史注入后、后续消息 append 前）
+     * @param sessionId            目标会话（short）
+     * @param streamTopic          会话级 STOMP topic
+     * @param wsTemplate           STOMP 模板（null → sendAndLog 跳过推送仅落库，非 Spring 单测）
+     * @param initialUserMessageId 本轮发起 user 消息 id（= turn userMessageId，DB user_message_id 归属根，
+     *                             对齐原 replayAndPersist 初值）。null → 回落 state.lastUserMessageId()/sessionId
+     */
+    public void armRealTimePersist(AgentState state, String sessionId, String streamTopic,
+                                   SimpMessagingTemplate wsTemplate, String initialUserMessageId) {
+        if (state == null) {
+            return;
+        }
+        String init = initialUserMessageId != null
+            ? initialUserMessageId
+            : (state.lastUserMessageId() != null ? state.lastUserMessageId() : sessionId);
+        PersistCtx ctx = new PersistCtx(sessionId, init);
+        state.setAppendListener(m -> {
+            try {
+                persistAppendedMessage(ctx, state, m, streamTopic, wsTemplate);
+            } catch (Exception e) {
+                log.warn("实时落库失败: session={} id={} role={}: {}", sessionId,
+                    m != null ? m.id() : "?", m != null ? m.role() : "?", e.getMessage());
+            }
+        });
+        if (log.isInfoEnabled()) {
+            log.info("[实时落库] appendListener 已武装: session={}（对齐 CC recordTranscript 逐条实时写）", sessionId);
+        }
+    }
 
-        // [reflect-warning · DB 顺序保序] 同一 replayAndPersist 循环内 assistantA/queued-user/assistantB
-        //   连续 insert 落在同一毫秒（OffsetDateTime.now() 毫秒精度）时 created_at 并列 → ORDER BY
-        //   created_at 单键（loadRecentHistory :1341 / GET /messages 同款）并列序不确定，queued-user 可能
-        //   间歇排在 assistantB 之后，击败 B 目标「回复A后回复B前」DB 顺序承诺。用 baseTs.plusNanos(seq)
-        //   单调时间戳对齐 replaceSessionMessages 同款保序范式（MessageService:445 base.plusNanos(i)）。
-        OffsetDateTime baseTs = OffsetDateTime.now();
-        long tsSeq = 0;
-        // [usermessageid 双通道 2026-08-25] 落库 user_message_id 逐条归属：默认 turn 发起者
-        //   userMessageId；遇到 mid-turn 注入的排队 user 推进为排队 uuid。修正「事件通道已切排队
-        //   flow、DB 落库未切」的不一致——「是的，已结束」落库归排队 flow，bash 工具轮仍归用户1
-        //   （对齐事件通道 effectiveStreamUserMessageId 逐条动态 + CC parentUuid 链根）。
-        String lastUserMessageId = userMessageId;
+    /**
+     * [实时落库 2026-09-03] 4 参便捷版：init 由 {@code state.lastUserMessageId()}（历史末条 user）推导，
+     * 无则回落 sessionId。供无显式 userMessageId 的场景兜底；生产调用方走 5 参重载（传该轮 userMessageId）。
+     */
+    public void armRealTimePersist(AgentState state, String sessionId, String streamTopic,
+                                   SimpMessagingTemplate wsTemplate) {
+        armRealTimePersist(state, sessionId, streamTopic, wsTemplate, null);
+    }
 
-        for (ChatMessageDto m : state.messages()) {
-            // [snip-persist-field] 落库 snip_boundary 消息（role=system + subtype=snip_boundary +
-            //   snipMetadata.removedUuids）——GET /messages 出站后前端读 removedUuids 标注「已裁剪」。
-            //   被 snipe 消息本身已落库（历史），不删除（对齐 CC transcript append-only 语义）。
-            //   boundary 是本轮 SnipTool 新注入（id 不在 prePersisted 历史集），正常 insert；
-            //   best-effort：落库失败不阻断（前端标注缺失可接受，模型面剔除已由 projectSnippedView 完成）。
+    /**
+     * [实时落库 2026-09-03] appendListener 单条实时落库（核心）· 由原 replayAndPersist 循环逐条提取。
+     *
+     * <p>每 append 一条消息即同步落 DB（对齐 CC recordTranscript append-only 实时写，替代原 run 末
+     * replayAndPersist 批量遍历 {@code state.messages()}）。分支语义与 replayAndPersist 现状逐字一致：
+     * <ul>
+     *   <li><b>snip_boundary</b>：判重 selectOneById → insert system 行（subtype/snipMetadata）+ removedUuids
+     *       非空推 MessageBoundaryEvent（压缩机制零改动，仅触发时机提前到 append 即落）</li>
+     *   <li><b>user</b>：imagePasteIds 回写 lastUserMessageId 行；mid-turn 注入 queued-user 原位落库
+     *       （4 参单调 ts + 推进 lastUserMessageId）；普通 user 不重复 insert（controller 已落）</li>
+     *   <li><b>assistant</b>：toolCalls 非空 → insert finishReason=tool_calls + 逐条 ToolCallRecord
+     *       （不落 usage 列，对齐原循环）；纯文本 → insert finishReason = subtype==max_tokens ? max_tokens
+     *       : state.finishReason()（usage/cache 投影），每条 append 即落（取代仅末条）</li>
+     *   <li><b>tool</b>：insert tool 行 + toolCallMapper.update result/isError + STOMP 去重回放</li>
+     * </ul>
+     * synchronized(ctx.lock)：StreamingToolExecutor 真流式工具并行 append → 串行落库 + 单调 ts。
+     */
+    private void persistAppendedMessage(PersistCtx ctx, AgentState state, ChatMessageDto m,
+            String streamTopic, SimpMessagingTemplate wsTemplate) {
+        synchronized (ctx.lock) {
+            String sessionId = ctx.sessionId;
+            java.time.OffsetDateTime ts = ctx.baseTs.plusNanos(ctx.tsSeq.incrementAndGet());
+
+            // [fix-loop-resume-history] 注入历史消息跳过（防重复落库 · 双通道铁律：DB 权威读取不破坏）。
+            //   prePersistedMessageIds 在 doRun 历史注入时先登记后 append（LlmAgentLoop:2294），listener
+            //   据此在 append 时点即识别历史 id 跳过（合成 sentinel/Continue 同登记，绝不可落库）。
+            java.util.Set<String> prePersisted = state.prePersistedMessageIds();
+            if (prePersisted != null && m.id() != null && prePersisted.contains(m.id())) {
+                return;
+            }
+
+            // ── snip_boundary：role=system + subtype=snip_boundary · 逐字搬原 replayAndPersist snip 分支 ──
             if (m.role() == Role.system
                     && com.nexusai.application.agent.compact.SnipCompactor.SUBTYPE_SNIP_BOUNDARY.equals(m.subtype())) {
-                // [snip-boundary 防主键冲突] 历史 boundary（resume/DB 恢复进 state）已落库 → 跳过重复 insert
-                //   （对齐 assistant/tool prePersisted 语义；prePersisted 常不含 system 角色，DB 查重最可靠）
                 String boundaryId = m.id() != null ? m.id() : "msg-" + UUID.randomUUID().toString().substring(0, 8);
                 try {
                     if (messageMapper.selectOneById(boundaryId) != null) {
                         if (log.isDebugEnabled()) {
                             log.debug("ChatService: snip_boundary 已落库，跳过重复 insert（防主键冲突）: id={}", boundaryId);
                         }
-                        continue;
+                        return;
                     }
                     MessageRecord rec = new MessageRecord();
                     rec.setId(boundaryId);
@@ -1200,126 +1275,123 @@ public class ChatService {
                     if (m.snipMetadata() != null) {
                         rec.setSnipMetadata(JSON.writeValueAsString(m.snipMetadata()));
                     }
-                    rec.setCreatedAt(baseTs.plusNanos(tsSeq++).toString());
+                    rec.setCreatedAt(ts.toString());
                     messageMapper.insert(rec);
-                    // [snip-persist-field] STOMP 实时推送 boundary（前端标注「已裁剪」· removedUuids）
                     java.util.List<String> removedUuids = m.snipMetadata() != null
-                        && m.snipMetadata().get("removedUuids") instanceof java.util.List<?> ru
-                        ? ru.stream().filter(String.class::isInstance).map(String.class::cast).toList()
-                        : java.util.List.of();
+                            && m.snipMetadata().get("removedUuids") instanceof java.util.List<?> ru
+                            ? ru.stream().filter(String.class::isInstance).map(String.class::cast).toList()
+                            : java.util.List.of();
                     if (!removedUuids.isEmpty()) {
                         sendAndLog(wsTemplate, streamTopic,
                             new com.nexusai.eventbus.ws.MessageBoundaryEvent(
-                                sessionId, lastUserMessageId, removedUuids, m.content()),
+                                sessionId, ctx.lastUserMessageId.get(), removedUuids, m.content()),
                             "message.boundary removedUuids=" + removedUuids.size());
                     }
                     if (log.isInfoEnabled()) {
-                        log.info("ChatService: snip_boundary 落库+推送: session={} boundary={} removedUuids={} 条",
+                        log.info("ChatService: snip_boundary 实时落库+推送: session={} boundary={} removedUuids={} 条",
                             sessionId, rec.getId(), removedUuids.size());
                     }
                 } catch (Exception e) {
-                    log.warn("ChatService: snip_boundary 落库失败（best-effort）: session={} id={}: {}",
+                    log.warn("ChatService: snip_boundary 实时落库失败（best-effort）: session={} id={}: {}",
                         sessionId, m.id(), e.getMessage());
                 }
-                continue;
-            }
-            if (m.role() == Role.user) {
-                // [usermessageid 双通道] 仅注入排队 user 推进归属（历史/本轮 user id 与入参 turn
-                //   归属等价，不推进——防历史 user 误覆盖；cron 场景无 injected 恒入参零变化）
-                if (m.id() != null && injectedById.containsKey(m.id())) {
-                    lastUserMessageId = m.id();
-                }
-                // [AM-CC-20260825] 小图 base64 直传：A4 生成的 user 消息带 imagePasteIds（F1 自增 id），
-                //   回写 createUserMessage 已落库的 user 消息记录（image_paste_ids）——否则 GET /messages
-                //   出站 imagePasteIds 空，前端不拉图。user 消息本体由 createUserMessage 落库，不重复 insert。
-                // [F5 回传修复] 原：updateUserImagePasteIds(m.id(), ...)——A4 生成的 user 消息 id 是随机
-                //   UUID（buildUserMessageWithImages id=null），DB 无此行，回写落空（SQLite 无行不报错）；
-                //   改为 lastUserMessageId——controller 预落库的 user 消息 id 才是回写目标（mid-turn 排队
-                //   已由上方 injectedById 推进，history/本轮 user id 与入参 turn 归属等价）。
-                if (messageService != null && m.imagePasteIds() != null && !m.imagePasteIds().isEmpty()
-                        && m.id() != null) {
-                    try {
-                        messageService.updateUserImagePasteIds(lastUserMessageId, m.imagePasteIds());
-                    } catch (Exception e) {
-                        log.warn("[ChatService] 回写 user 消息 image_paste_ids 失败: id={} err={}", m.id(), e.getMessage());
-                    }
-                }
-                // [mid-turn-align] 仅 mid-turn 注入的 queued-user 原位落库（指定 id = 队列 uuid）；
-                //   messageService 为 @Autowired(required=false) 必须判 null。
-                if (messageService != null && m.id() != null && injectedById.containsKey(m.id())) {
-                    try {
-                        // [reflect-warning] 4 参重载注入单调时间戳：queued-user created_at 严格位于
-                        //   assistantA（前一 insert）与 assistantB（后一 insert）之间，DB 顺序可期。
-                        messageService.createQueuedUserMessage(
-                            sessionId, m.id(), injectedById.get(m.id()), baseTs.plusNanos(tsSeq++));
-                        inPlacePersisted.add(m.id());
-                        if (log.isInfoEnabled()) {
-                            log.info("ChatService: mid-turn 注入排队 user 消息原位落库 session={} id={}",
-                                sessionId, m.id());
-                        }
-                    } catch (Exception e) {
-                        log.warn("ChatService: mid-turn 注入排队 user 消息原位落库失败（diff 补漏兜底）: "
-                                + "session={} id={}: {}",
-                            sessionId, m.id(), e.getMessage());
-                    }
-                }
-                continue;
+                return;
             }
 
-            // [fix-loop-resume-history] 跳过注入历史消息（防重复落库 · 双通道铁律：DB 权威读取不破坏）
-            if (prePersisted != null && m.id() != null && prePersisted.contains(m.id())) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[ChatService] replayAndPersist 跳过注入历史消息（防重复落库）: id={} role={}",
-                        m.id(), m.role());
+            if (m.role() == Role.user) {
+                // [AM-CC-20260825] A4 图片 user 消息：imagePasteIds 回写 lastUserMessageId 对应 user 行
+                //   （createUserMessage 已落库，本体不重复 insert）。
+                // [OD-D13 AM 回写守卫（reflector MAJOR-3）] 仅 m.id()==ctx.lastUserMessageId.get() 或
+                //   injectedQueuedById(m.id())==null 才 updateUserImagePasteIds —— 防 busy 带图消息 append 时
+                //   lastUserMessageId 仍指向原 turn user 行 → busy 图 imagePasteIds 脏写上一 user 行
+                //   （图归属错乱）。busy 带图行 imagePasteIds 由下方 createQueuedUserMessage 8 参 overload
+                //   直接落自身行（非 AM 回写）。
+                if (messageService != null && m.imagePasteIds() != null && !m.imagePasteIds().isEmpty()
+                        && m.id() != null) {
+                    boolean isLastUserRow = m.id().equals(ctx.lastUserMessageId.get());
+                    boolean notInjected = injectedQueuedById(state, m.id()) == null;
+                    if (isLastUserRow || notInjected) {
+                        try {
+                            messageService.updateUserImagePasteIds(ctx.lastUserMessageId.get(), m.imagePasteIds());
+                        } catch (Exception e) {
+                            log.warn("[ChatService] 实时落库回写 user 消息 image_paste_ids 失败: id={} err={}",
+                                m.id(), e.getMessage());
+                        }
+                    }
                 }
-                continue;
+                // [mid-turn-align] 仅 mid-turn 注入的 queued-user 原位落库（4 参单调 ts）+ 推进归属。
+                if (messageService != null && m.id() != null) {
+                    AgentState.InjectedQueuedMessage inj = injectedQueuedById(state, m.id());
+                    if (inj != null) {
+                        try {
+                            // [P0-1 OD-1/OD-3] 6 参重载透传 queuedOrigin（registry 仅 busy-queued →
+                            //   'busy-queued' 落 V67 queued_origin 列；resume toDto 读回 → 发送层重包壳）
+                            // [OD-D13] 8 参 overload 接 imagePasteIds + userAttachments：busy 带图消息
+                            //   m.imagePasteIds()（buildUserMessageWithImages 恒收集）→ 落 V46 自身行
+                            //   （busy 图行由 overload 写入，非 AM 回写 —— 守卫上方已拦截脏写上一行）。
+                            //   content 仍 inj.content()（QueueItem.value 原文，壳不落库）；userAttachments
+                            //   本期 busy 图 null（base64 直传无附件表 contentId）。
+                            messageService.createQueuedUserMessage(sessionId, m.id(), inj.content(), ts,
+                                false, inj.queuedOrigin(), m.imagePasteIds(), m.userAttachments());
+                            ctx.lastUserMessageId.set(m.id());
+                            if (log.isInfoEnabled()) {
+                                log.info("ChatService: mid-turn 注入排队 user 消息实时原位落库 session={} id={}"
+                                        + " images={}",
+                                    sessionId, m.id(),
+                                    m.imagePasteIds() == null ? 0 : m.imagePasteIds().size());
+                            }
+                        } catch (Exception e) {
+                            log.warn("ChatService: mid-turn 注入排队 user 消息实时原位落库失败: session={} id={}: {}",
+                                sessionId, m.id(), e.getMessage());
+                        }
+                    }
+                }
+                return;
             }
 
             if (m.role() == Role.assistant) {
-                String assistantId = m.id();
-                // 与 lastAssistant() 同语义：取最后一条 assistant 的 reasoning 供 final 落库
-                finalReasoning = m.reasoning();
-                // [reasoningDurationMs] 与 lastAssistant() 同语义：取最后一条 assistant 的耗时供 final 落库
-                finalReasoningDurationMs = m.reasoningDurationMs();
-                log.info("ASSISTANT msg: id={} contentLen={} reasoningLen={} toolCalls={}",
-                    abbreviate(assistantId, 16),
-                    m.content() == null ? 0 : m.content().length(),
-                    m.reasoning() == null ? 0 : m.reasoning().length(),
-                    m.toolCalls() == null ? 0 : m.toolCalls().size());
-
+                String id = m.id();
+                if (log.isInfoEnabled()) {
+                    log.info("ASSISTANT msg: id={} contentLen={} reasoningLen={} toolCalls={} subtype={}",
+                        abbreviate(id, 16),
+                        m.content() == null ? 0 : m.content().length(),
+                        m.reasoning() == null ? 0 : m.reasoning().length(),
+                        m.toolCalls() == null ? 0 : m.toolCalls().size(),
+                        m.subtype());
+                }
                 if (m.toolCalls() != null && !m.toolCalls().isEmpty()) {
-                    // 持久化 assistant (with tool_calls)
-                    MessageRecord rec = newAssistantMessage(sessionId, assistantId, lastUserMessageId);
+                    // 工具轮 assistant：insert finishReason=tool_calls（不落 usage 列，对齐原循环）+ 逐条 ToolCallRecord。
+                    MessageRecord rec = newAssistantMessage(sessionId, id, ctx.lastUserMessageId.get());
                     rec.setContent(m.content() == null ? "" : m.content());
                     rec.setReasoning(m.reasoning());
-                    // [reasoningDurationMs] 工具轮 assistant 落库推理耗时（V41 列；净新增字段）
                     rec.setReasoningDurationMs(m.reasoningDurationMs());
                     rec.setFinishReason("tool_calls");
-                    // [reflect-warning] 单调时间戳覆盖（同循环保序；默认 OffsetDateTime.now() 毫秒并列风险）
-                    rec.setCreatedAt(baseTs.plusNanos(tsSeq++).toString());
+                    rec.setCreatedAt(ts.toString());
                     messageMapper.insert(rec);
-                    // [reasoningDurationMs] transcript 双轨：工具轮 assistant 推理耗时写 JSONL（best-effort）
-                    appendReasoningDurationToTranscript(sessionId, assistantId, m.reasoningDurationMs());
-
+                    appendReasoningDurationToTranscript(sessionId, id, m.reasoningDurationMs());
                     for (ToolCallDto tc : m.toolCalls()) {
                         Map<String, Object> argsMap = parseArgs(tc.arguments());
-                        // [工具调用实时推] 回放去重（双守卫 · DB 落库无条件）: 本 turn 已实时推送过
-                        //   同 toolCallId 的 tool_call → 回放跳过已推 STOMP (防前端重复卡片);
-                        //   ToolCallRecord insert 无条件保留. 空集合语义 = 无实时推 → 回放全推
-                        //   (向后兼容, T10). per-toolCallId 双集合分开 (Q4 关键边界).
+                        // [工具调用实时推] 去重：本 turn 已实时推送过同 toolCallId 的 tool_call → 跳过；
+                        //   ToolCallRecord insert 无条件（对齐原 replayAndPersist 双守卫语义）。
+                        //   ⚠️ 实时化时序：assistant append（本 listener）先于 executor.add（runTools），
+                        //   若本处推送必须同步登记 realtimeToolCallsPushed——否则 executor 稍后 add 时
+                        //   set.add 返回 true 再推一次 → 前端重复工具卡片（原批量 replay 在 run 末无此
+                        //   时序，Executor 已完成不会双推；实时化后顺序反转必须登记防双）。
                         if (state.realtimeToolCallsPushed() == null
                                 || !state.realtimeToolCallsPushed().contains(tc.id())) {
+                            if (state.realtimeToolCallsPushed() != null) {
+                                state.realtimeToolCallsPushed().add(tc.id());
+                            }
                             sendAndLog(wsTemplate, streamTopic,
-                                new MessageToolCallEvent(sessionId, lastUserMessageId, assistantId,
+                                new MessageToolCallEvent(sessionId, ctx.lastUserMessageId.get(), id,
                                     tc.id(), tc.name(), argsMap),
                                 "tool_call name=" + tc.name()
                                     + " id=" + abbreviate(tc.id(), 24)
                                     + " args=" + abbreviate(tc.arguments(), 120));
                         }
-
                         ToolCallRecord tcRec = new ToolCallRecord();
                         tcRec.setId(tc.id());
-                        tcRec.setMessageId(assistantId);
+                        tcRec.setMessageId(id);
                         tcRec.setToolName(tc.name());
                         tcRec.setArguments(tc.arguments());
                         tcRec.setResult(null);
@@ -1327,158 +1399,97 @@ public class ChatService {
                         tcRec.setCreatedAt(OffsetDateTime.now().toString());
                         toolCallMapper.insert(tcRec);
                     }
+                } else {
+                    // 纯文本 assistant（含截断 subtype=max_tokens / error 文案行）：每条 append 即落
+                    //   （取代原 replayAndPersist final 仅落末条 · 对齐 CC transcript append-only）。
+                    //   usage/cache 投影对照原 final 块（tool_calls 分支不落 usage，纯文本等价 final）。
+                    String fr = "max_tokens".equals(m.subtype())
+                        ? "max_tokens" : (state.finishReason() == null ? "stop" : state.finishReason());
+                    MessageRecord rec = newAssistantMessage(sessionId, id, ctx.lastUserMessageId.get());
+                    rec.setContent(m.content() == null ? "" : m.content());
+                    rec.setReasoning(m.reasoning());
+                    rec.setReasoningDurationMs(m.reasoningDurationMs());
+                    rec.setFinishReason(fr);
+                    AgentUsage usage = m.usage();
+                    rec.setInputTokens(usage != null ? (int) usage.inputTokens() : null);
+                    rec.setOutputTokens(usage != null ? (int) usage.outputTokens() : null);
+                    rec.setCacheReadInputTokens(usage != null && usage.cacheReadInputTokens() != null
+                        ? Math.toIntExact(usage.cacheReadInputTokens()) : null);
+                    rec.setCacheCreationInputTokens(usage != null && usage.cacheCreationInputTokens() != null
+                        ? Math.toIntExact(usage.cacheCreationInputTokens()) : null);
+                    rec.setCreatedAt(ts.toString());
+                    messageMapper.insert(rec);
+                    appendReasoningDurationToTranscript(sessionId, id, m.reasoningDurationMs());
+                    if (log.isInfoEnabled()) {
+                        log.info("ChatService: 纯文本 assistant 实时落库: session={} id={} finishReason={} len={}",
+                            sessionId, id, fr, m.content() == null ? 0 : m.content().length());
+                    }
                 }
+                return;
+            }
 
-                // Phase 6·s02.6: content + reasoning 已经在 LlmAgentLoop 13-arg
-                //   provider.stream 解析时**真流式**推过 STOMP (per SSE chunk).
-                //   这里不再回放 (回放会重复推给前端).
-                log.info("replayed (true stream): id={} content={} reasoning={}",
-                    abbreviate(assistantId, 16),
-                    m.content() == null ? 0 : m.content().length(),
-                    m.reasoning() == null ? 0 : m.reasoning().length());
-
-            } else if (m.role() == Role.tool) {
+            if (m.role() == Role.tool) {
                 String content = m.content() == null ? "" : m.content();
                 boolean isError = content.startsWith("Error")
                     || content.toLowerCase().contains("dangerous")
                     || content.toLowerCase().contains("not found")
                     || content.toLowerCase().contains("no such tool");
-                // [工具调用实时推] 回放去重（双守卫 · DB 落库无条件）: 本 turn 已实时推送过
-                //   同 toolCallId 的 tool_result → 回放跳过已推 STOMP (防前端重复卡片);
-                //   messageMapper.insert / toolCallMapper.update 无条件保留.
-                if (state.realtimeToolResultsPushed() == null
-                        || !state.realtimeToolResultsPushed().contains(m.toolCallId())) {
+                // [工具调用实时推] 去重 + STOMP 推送。父 id = m.assistantMessageId()（= turnAssistantId）；
+                //   null 时跳过推送（实时上下文无原 replayAndPersist finalAssistantId 随机占位——DB insert
+                //   无条件保留，前端刷新经 GET /messages 重建卡片；fail loud 已 debug 记日志）。
+                //   ⚠️ 登记 realtimeToolResultsPushed（同 tool_call 分支防双推理据）：tool_result 消息
+                //   append 通常晚于 executor pushToolResultRealtime（已登记 → 此处跳过），headless/未推
+                //   场景本处推送须登记，防同 turn 内后续重复。
+                if (m.assistantMessageId() != null
+                        && (state.realtimeToolResultsPushed() == null
+                            || !state.realtimeToolResultsPushed().contains(m.toolCallId()))) {
+                    if (state.realtimeToolResultsPushed() != null) {
+                        state.realtimeToolResultsPushed().add(m.toolCallId());
+                    }
                     sendAndLog(wsTemplate, streamTopic,
-                        // [同源改造] tool_result 事件父 id 指向真实 turn id（m.assistantMessageId=turnAssistantId，
-                        //   非幻影随机 finalAssistantId）；null 回退 finalAssistantId（legacy/边界保护）
-                        new MessageToolResultEvent(sessionId, lastUserMessageId,
-                            m.assistantMessageId() != null ? m.assistantMessageId() : finalAssistantId,
+                        new MessageToolResultEvent(sessionId, ctx.lastUserMessageId.get(),
+                            m.assistantMessageId(),
                             m.toolCallId(), truncate(content, 5000), isError),
                         "tool_result id=" + abbreviate(m.toolCallId(), 24)
                             + " len=" + content.length() + " isError=" + isError);
                 }
-
-                MessageRecord rec = newToolMessage(sessionId, m.toolCallId(), content, lastUserMessageId);
-                // [reflect-warning] 单调时间戳覆盖（同循环保序；默认 OffsetDateTime.now() 毫秒并列风险）
-                rec.setCreatedAt(baseTs.plusNanos(tsSeq++).toString());
+                MessageRecord rec = newToolMessage(sessionId, m.toolCallId(), content, ctx.lastUserMessageId.get());
+                rec.setCreatedAt(ts.toString());
                 messageMapper.insert(rec);
-
                 ToolCallRecord tcUpdate = toolCallMapper.selectOneById(m.toolCallId());
                 if (tcUpdate != null) {
                     tcUpdate.setResult(truncate(content, 5000));
                     tcUpdate.setIsError(isError);
                     toolCallMapper.update(tcUpdate);
                 }
+                return;
             }
-        }
-
-        // [mid-turn-align · B 落库正解] diff 补漏：对 injected 中未原位落库的条目（压缩折叠
-        //   removeMessages 从 state.messages() 移除 / 原位单条落库抛异常跳过）best-effort 补调
-        //   createQueuedUserMessage——「已注入命令必须持久化」契约不因压缩/单条失败改变
-        //   （逐条 try/catch + warn，幂等：原位已落库的重复调用仅 duplicate-key warn）。
-        if (state.injectedQueuedMessages() != null) {
-            for (AgentState.InjectedQueuedMessage inj : state.injectedQueuedMessages()) {
-                if (inj == null || inj.uuid() == null || inPlacePersisted.contains(inj.uuid())) {
-                    continue;
-                }
-                try {
-                    if (messageService != null) {
-                        messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content());
-                        inPlacePersisted.add(inj.uuid());
-                        if (log.isInfoEnabled()) {
-                            log.info("ChatService: mid-turn 注入排队 user 消息 diff 补漏落库 session={} id={}",
-                                sessionId, inj.uuid());
-                        }
-                    }
-                } catch (Exception e) {
-                    log.warn("ChatService: mid-turn 注入排队 user 消息 diff 补漏落库失败: session={} id={}: {}",
-                        sessionId, inj.uuid(), e.getMessage());
-                }
-            }
-        }
-
-        // 持久化 final assistant
-        // [fix-loop-resume-history] 跳过注入历史（新回归防御）：doRun 注入块已把 DB 历史灌入
-        //   state.messages()（LlmAgentLoop:1889-1914），lastAssistant() 从末向前扫描会命中注入的
-        //   历史 assistant 或 deserializer 合成 sentinel「No response requested.」。当本轮 run 未
-        //   append 任何新 assistant 即退出——取消/中断（LlmAgentLoop:4735-4768 仅 append synthetic
-        //   tool_result + user interruption）、NO_ASSISTANT_TEXT 空流退出（:5814-5819）、stream
-        //   timeout（:4717-4726）、stop-hook 阻断——lastAssistant() 返回历史 assistant 内容（或
-        //   sentinel），被以全新随机 id 落库并推前端 = 幽灵重复行。判定末条 assistant 的 id 是否
-        //   ∈ prePersistedMessageIds（注入历史 + sentinel 均已登记）→ 是则本轮未产出新 assistant，
-        //   跳过落库（sentinel 绝不可落库；历史 assistant 内容不得以新 id 重写）。
-        String finalContent = state.lastAssistant();
-        if (finalContent != null && !isLastAssistantFromInjectedHistory(state, prePersisted)) {
-            // [同源改造] final 落库 id 取末条 assistant 的真实 id（=turnAssistantId），与流式
-            //   chunk.assistantMessageId 同源（前端块 id 匹配 DB）。回退随机 UUID 保护 legacy/边界
-            //   （id() 恒非 null，安全兜底）。toolCalls 空闸：工具轮末条（abort/hook_stopped/
-            //   max_turns 在工具批后 break）已被 per-message 循环以 id=turnAssistantId 落库
-            //   （:449/:470 同引用），若此处不跳过，会以随机 id 再插一条内容相同（或空串）的重复行
-            //   —— 本闸修复该同域重复问题。⚠️ 该闸依赖「per-message 循环只落 tool_calls 非空
-            //   assistant」这一现状；若未来扩展循环落全部 assistant，需改为按 id 去重而非按
-            //   toolCalls 判空。
-            ChatMessageDto lastAsst = lastAssistantMessage(state);
-            if (lastAsst != null && (lastAsst.toolCalls() == null || lastAsst.toolCalls().isEmpty())) {
-                String persistId = lastAsst.id() != null ? lastAsst.id() : UUID.randomUUID().toString();
-                MessageRecord finalRec = newAssistantMessage(sessionId, persistId, lastUserMessageId);
-                finalRec.setContent(finalContent);
-                finalRec.setReasoning(finalReasoning);
-                // [reasoningDurationMs] final assistant 落库推理耗时（V41 列；净新增字段）
-                finalRec.setReasoningDurationMs(finalReasoningDurationMs);
-                finalRec.setFinishReason(state.finishReason() == null ? "stop" : state.finishReason());
-                // [V-TOK 实施] 真实 input/output tokens 落库（替代 mock 42）· 末条 assistant 的
-                //   provider usage 投影（usage 缺失 → null，MessageRecord 列可空；历史重拉不再 42）。
-                AgentUsage finalUsage = lastAsst != null ? lastAsst.usage() : null;
-                finalRec.setInputTokens(finalUsage != null ? (int) finalUsage.inputTokens() : null);
-                finalRec.setOutputTokens(finalUsage != null ? (int) finalUsage.outputTokens() : null);
-                // [token-compact-fix B1 方案A] cache 用量落库 · V53 列；末条 assistant 的 usage
-                //   cache 投影（usage 缺失/null → 落 NULL，旧行重算回退 0；与 input/output 同容错）。
-                //   replayAndPersist final 块是本轮 assistant 唯一真实落库点，漏掉则重拉重算少算 cache。
-                finalRec.setCacheReadInputTokens(finalUsage != null && finalUsage.cacheReadInputTokens() != null
-                    ? Math.toIntExact(finalUsage.cacheReadInputTokens()) : null);
-                finalRec.setCacheCreationInputTokens(finalUsage != null && finalUsage.cacheCreationInputTokens() != null
-                    ? Math.toIntExact(finalUsage.cacheCreationInputTokens()) : null);
-                // [reflect-warning] 单调时间戳覆盖（同循环保序；默认 OffsetDateTime.now() 毫秒并列风险）
-                finalRec.setCreatedAt(baseTs.plusNanos(tsSeq++).toString());
-                messageMapper.insert(finalRec);
-                // [reasoningDurationMs] transcript 双轨：final assistant 推理耗时写 JSONL（best-effort）
-                appendReasoningDurationToTranscript(sessionId, persistId, finalReasoningDurationMs);
-                log.info("PERSIST assistant final: id={} len={} reasoningLen={} finishReason={}",
-                    persistId, finalContent.length(),
-                    finalReasoning == null ? 0 : finalReasoning.length(), finalRec.getFinishReason());
+            if (log.isDebugEnabled()) {
+                log.debug("[实时落库] 未处理消息角色: role={} id={}", m.role(), m.id());
             }
         }
     }
 
     /**
-     * [fix-loop-resume-history] 判定 state.messages() 末条 assistant 是否为注入历史。
+     * 按 id 在 {@code state.injectedQueuedMessages()} 中查找注入的排队 user 消息（原始 value 载体）。
      *
-     * <p><b>WHY（双通道铁律：DB 权威读取不破坏）</b>：replayAndPersist final 块用
-     * {@code state.lastAssistant()}（AgentState.java:1266-1274 末向前扫描首个 assistant）落库，
-     * 注入块（LlmAgentLoop.doRun:1889-1914）已把 DB 历史灌入 state.messages() 并登记其 id 到
-     * prePersistedMessageIds。本轮未 append 新 assistant 即退出（取消/中断 / NO_ASSISTANT_TEXT
-     * 空流 / stream timeout / stop-hook 阻断）→ lastAssistant() 命中注入历史或 deserializer 合成
-     * sentinel → 若仍以全新随机 id 落库即幽灵重复行。本方法按 lastAssistant() 同向（末向前）找
-     * 末条 assistant，其 id ∈ prePersistedMessageIds（注入历史与 sentinel 均已登记）→ 是则跳过
-     * final 落库。prePersisted == null（全新会话 / 非主线程 / 测试构造路径）= 无注入 → 恒 false
-     * （等价现状，本轮新产出 assistant 正常落库）。
-     *
-     * @param state        回放持久化的 AgentState
-     * @param prePersisted 注入历史消息 id 集（state.prePersistedMessageIds()；null = 无注入）
-     * @return true = 末条 assistant 来自注入历史（本轮未产出新 assistant，不得落库）
+     * <p>实时落库（persistAppendedMessage user 分支）在 append 时点按 m.id() 反查 injected 原始 content
+     * —— 落库用原始 value（非 wrapCommandText 包裹文本），与 m.content() 不同。
      */
-    private boolean isLastAssistantFromInjectedHistory(AgentState state, java.util.Set<String> prePersisted) {
-        if (prePersisted == null) {
-            return false;
+    private static AgentState.InjectedQueuedMessage injectedQueuedById(AgentState state, String id) {
+        if (state == null || id == null) {
+            return null;
         }
-        List<ChatMessageDto> messages = state.messages();
-        for (int i = messages.size() - 1; i >= 0; i--) {
-            ChatMessageDto m = messages.get(i);
-            if (m != null && m.role() == Role.assistant) {
-                return m.id() != null && prePersisted.contains(m.id());
+        List<AgentState.InjectedQueuedMessage> injected = state.injectedQueuedMessages();
+        if (injected == null) {
+            return null;
+        }
+        for (AgentState.InjectedQueuedMessage inj : injected) {
+            if (inj != null && id.equals(inj.uuid())) {
+                return inj;
             }
         }
-        return false;
+        return null;
     }
 
     /**
@@ -1879,94 +1890,260 @@ public class ChatService {
 
     // ─────────────────────────── 标题生成 ───────────────────────────
 
-    private void maybeGenerateTitle(SessionRecord session, String userMessageId,
-                                    String assistantFinalContent, SimpMessagingTemplate wsTemplate) {
+    /**
+     * [title-cc-align] 标题生成（对齐 CC initReplBridge.ts:349-378 onUserMessage 的 count1+count3
+     *   触发语义 + REPL.tsx:2661-2699 haikuTitleAttemptedRef 一次性）。
+     *
+     * <p>触发条件（userCount = title-worthy 用户消息计数，role=user 且 is_meta 非 1 且 content 非空；
+     *   count1 输入 = 首条 title-worthy 用户消息原文，count3 输入 = 完整会话文本尾部 1000 字符）：
+     * <ul>
+     *   <li><b>count1</b>：userCount>=1 && titleExplicit==0 && isDefaultTitle（title 仍默认 = count1
+     *       未成功 / 未显式命名）——对齐 CC {@code count===1 && !hasTitle}（initReplBridge.ts:355-358）</li>
+     *   <li><b>count3</b>：userCount>=3 && titleExplicit==0（未显式命名（非 1）且未刷新（非 2）才刷新）
+     *       ——对齐 CC {@code userMessageCount === 3} → extractConversationText 全会话尾部
+     *       （sessionTitle.ts:33-54 MAX_CONVERSATION_TEXT=1000，tail-slice 最近上下文优先）</li>
+     * </ul>
+     * 两者<b>并列判断</b>（非 else）：userCount==1 只走 count1；==2 走 count1；>=3 若 title 仍默认
+     * 先补 count1 再 count3（聚合兜底，防批量跳变越过 3 不触发，反射器 MAJOR-3 定死）。显式 /rename
+     * （titleExplicit==1，SessionService.update 置位）永不自动覆盖。
+     *
+     * <p>覆盖规则：count1 成功置 titleExplicit=0（仍可被 count3 进化，对齐 CC count1 生成 → count3
+     *   覆盖自动 title）；count3 成功置 titleExplicit=2（已自动刷新，不再重复刷新，对齐 CC count>=3
+     *   后回调停 done）。生成失败落"新会话"占位（titleExplicit 不变）→ 后续收口按条件重试。
+     *
+     * <p>public 化：CronIdleExecutor 收口补 title 生成（busy-queued / cron / task-notification 轮末
+     *   同样触发，对齐 CC 所有路径汇聚 onQuery 都会检查 title）。
+     *
+     * @param session               会话记录（调用方已从 DB 载入）
+     * @param userMessageId         该轮 user 消息 id（SessionTitleEvent 归属；cron 场景 cmd.uuid() 可 null）
+     * @param assistantFinalContent 该轮 assistant 最终内容（保留参数，暂未用于输入）
+     * @param wsTemplate            STOMP 出站模板（status topic 推送）
+     */
+    public void maybeGenerateTitle(SessionRecord session, String userMessageId,
+                                   String assistantFinalContent, SimpMessagingTemplate wsTemplate) {
         try {
             String currentTitle = session.getTitle();
             // [联调修复] 对齐 CC initReplBridge.ts:299-336「非显式命名可被自动生成覆盖」：前端创建会话
             //   传占位标题（'新会话' 等）不等同于用户显式 /rename → 一律视为默认，允许摘要生成替换。
-            //   CC 侧显式命名（/rename）有内存标记；Java 端无此机制，用占位集合近似（A 方案）+ 前端
-            //   创建不再传占位 title（B 方案）双保险。
+            //   CC 侧显式命名（/rename）有内存标记；Java 端以 title_explicit 列（V66）三态承载。
             boolean looksLikeDefault = isDefaultTitle(currentTitle, session.getModelName());
-            Integer mc = session.getMessageCount();
-            if (!looksLikeDefault || mc == null || mc > 2) return;
+            Integer titleExplicit = session.getTitleExplicit();
+            // [FIX-1 对抗核验 MAJOR] 自动生成资格 = 未显式命名（非 1）且未自动刷新（非 2）——
+            //   旧 explicitBlocked 只拦 1 不拦 2：count3 成功置 2 后下一收口又满足条件 → 每轮重复刷新。
+            //   对齐 plan §3.4.2 + CC initReplBridge.ts:377「return userMessageCount >= 3 后停 done」。
+            boolean autoEligible = titleExplicit == null || titleExplicit == 0;
+            // [title-cc-align] title-worthy 用户消息计数替代 messageCount（后者混入 system 计数，长任务
+            //   首轮工具/system 消息多 → 快速超 2 永不生成；对齐 CC onUserMessage userMessageCount
+            //   initReplBridge.ts:349-352）
+            int userCount = countTitleWorthyUserMessages(session.getId());
+            boolean doCount1 = userCount >= 1 && autoEligible && looksLikeDefault;
+            boolean doCount3 = userCount >= 3 && autoEligible;
+            if (!doCount1 && !doCount3) return;
 
             String fastModelName = modelConfigResolver.resolveFastModelName("claude-haiku-4-5-20251001");
-            if (fastModelName == null) return;
-            // [G-9] 弱档(小快)模型统一委托 ModelConfigResolver.resolveFastModelName（②weak→③haiku45，不回退主模型）
-            if (log.isDebugEnabled()) {
-                log.debug("[ChatService] 标题生成弱档(小快)模型 fastModelName={} · 委托 ModelConfigResolver.resolveFastModelName CC getSmallFastModel (model.ts:36-38)",
-                    fastModelName);
+            if (fastModelName == null) {
+                // [G-9] 弱档(小快)模型统一委托 ModelConfigResolver.resolveFastModelName（②weak→③haiku45，
+                //   不回退主模型）；未配置 → 跳过生成，log.debug 披露（不静默，对齐 CC getSmallFastModel
+                //   model.ts:36-38 缺失语义）
+                if (log.isDebugEnabled()) {
+                    log.debug("[ChatService] 标题生成跳过：fastModelName 未配置（弱档小快模型缺失，"
+                            + "对齐 CC getSmallFastModel model.ts:36-38）session={} userCount={}",
+                        session.getId(), userCount);
+                }
+                return;
             }
-
-            String userContent = extractLastUserContent(session.getId());
-            String prompt = "用 5-10 个字总结: " + (userContent != null ? userContent : "(无内容)");
-
-            ProviderConfig config;
-            String providerType;
-            try {
-                config = buildConfigForModel(fastModelName);
-                providerType = providerTypeForModel(fastModelName);
-            } catch (Exception e) {
-                config = ProviderConfig.empty();
-                providerType = "openai_compatible";
+            // count1（title 仍默认）→ 首条 title-worthy 用户消息输入；成功置 titleExplicit=0（仍可被 count3 进化）
+            if (doCount1) {
+                String userContent = extractFirstUserContent(session.getId());
+                String input = userContent != null ? userContent : "(无内容)";
+                boolean ok = applyGeneratedTitle(session, generateTitleText(input, fastModelName),
+                    0, userMessageId, wsTemplate);
+                if (log.isInfoEnabled()) {
+                    log.info("[ChatService] 标题 count1 生成{} session={} userCount={} title={}",
+                        ok ? "成功" : "失败（保持原标题与 titleExplicit 不变，可重试）",
+                        session.getId(), userCount, session.getTitle());
+                }
             }
-            LlmProvider titleProvider = llmProviderFactory.getProvider(config, providerType);
-            String newTitle;
-            try {
-                // [align-cc 2026-08-25] 对齐 CC sessionTitle.ts SESSION_TITLE_PROMPT（3-7 words + sentence case
-                //   + 好/坏例子 + JSON {title} 结构化输出）——旧 prompt「用 5-10 个字总结」无约束，LLM 自由发挥
-                //   输出对话文本（实测 title="一切是否已然终结？"/"请提供项目描述..."）。
-                String titlePrompt = "Generate a concise, sentence-case title (3-7 words) that captures the main topic "
-                    + "or goal of this coding session. The title should be clear enough that the user recognizes the "
-                    + "session in a list. Use sentence case: capitalize only the first word and proper nouns.\n\n"
-                    + "Return JSON with a single \"title\" field.\n\n"
-                    + "Good examples:\n{\"title\": \"Fix login button on mobile\"}\n{\"title\": \"Add OAuth authentication\"}\n"
-                    + "{\"title\": \"Debug failing CI tests\"}\n{\"title\": \"Refactor API client error handling\"}\n\n"
-                    + "Bad (too vague): {\"title\": \"Code changes\"}\n"
-                    + "Bad (too long): {\"title\": \"Investigate and fix the issue where the login button does not respond on mobile devices\"}\n"
-                    + "Bad (wrong case): {\"title\": \"Fix Login Button On Mobile\"}";
-                var titleSchema = JSON.createObjectNode();
-                titleSchema.put("type", "object");
-                titleSchema.putObject("properties").putObject("title").put("type", "string");
-                titleSchema.putArray("required").add("title");
-                LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                    List.of(), null, LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(titleSchema),
-                    null, null, "auto_title", null, null, null, null, null, null, null, null, null);
-                String titleJson = titleProvider.chatWithOptions(config, fastModelName, titlePrompt, prompt, options);
-                newTitle = (titleJson != null && !titleJson.isBlank())
-                    ? JSON.readTree(titleJson).path("title").asText(null) : null;
-            } catch (Exception ex) {
-                log.warn("Title failed: {}", ex.getMessage());
-                newTitle = "新会话";
+            // count3 → 完整会话文本尾部 1000 字符输入；成功置 titleExplicit=2（已自动刷新，不再重复刷新）
+            if (doCount3) {
+                String convText = extractConversationTextTail(session.getId());
+                String input = (convText != null && !convText.isBlank()) ? convText : "(无内容)";
+                boolean ok = applyGeneratedTitle(session, generateTitleText(input, fastModelName),
+                    2, userMessageId, wsTemplate);
+                if (log.isInfoEnabled()) {
+                    log.info("[ChatService] 标题 count3 刷新{} session={} userCount={} title={}",
+                        ok ? "成功" : "失败（保持原标题与 titleExplicit 不变，可重试）",
+                        session.getId(), userCount, session.getTitle());
+                }
             }
-            if (newTitle != null) {
-                newTitle = newTitle.trim().replaceAll("^[\"']|[\"']$", "");
-                if (newTitle.length() > 30) newTitle = newTitle.substring(0, 30) + "...";
-                if (newTitle.isBlank()) newTitle = "新会话";
-            } else newTitle = "新会话";
-
-            session.setTitle(newTitle);
-            session.setUpdatedAt(OffsetDateTime.now().toString());
-            sessionMapper.update(session);
-
-            // [AM-CC-20260825] title 推会话级 status topic（前端常驻订阅），而非 stream topic——
-            //   stream topic 在 message.complete 后前端可能退订 → title 事件丢失（新建会话列表标题不更新，
-            //   2026-08-25 联调实测）。status topic 前端持续订阅，实时收到标题。
-            sendAndLog(wsTemplate, "/topic/sessions/" + session.getId() + "/status",
-                com.nexusai.eventbus.ws.SessionTitleEvent.of(session.getId(), userMessageId, newTitle),
-                "title=" + newTitle);
         } catch (Exception e) {
             log.error("maybeGenerateTitle failed", e);
         }
     }
 
     /**
+     * [title-cc-align] 生成标题文本 · 对齐 CC sessionTitle.ts:79-129 generateSessionTitle
+     *   （SESSION_TITLE_PROMPT 3-7 words sentence case + JSON {title} 结构化输出；异常 → "新会话" 占位，
+     *   never rejects 语义）。提取自原 maybeGenerateTitle 生成段，count1/count3 共用。
+     *
+     * @return 非 null 非 blank 的标题（生成失败回落"新会话"占位）
+     */
+    private String generateTitleText(String input, String fastModelName) {
+        ProviderConfig config;
+        String providerType;
+        try {
+            config = buildConfigForModel(fastModelName);
+            providerType = providerTypeForModel(fastModelName);
+        } catch (Exception e) {
+            config = ProviderConfig.empty();
+            providerType = "openai_compatible";
+        }
+        LlmProvider titleProvider = llmProviderFactory.getProvider(config, providerType);
+        String prompt = "用 5-10 个字总结: " + input;
+        String newTitle;
+        try {
+            // [align-cc 2026-08-25] 对齐 CC sessionTitle.ts SESSION_TITLE_PROMPT（3-7 words + sentence case
+            //   + 好/坏例子 + JSON {title} 结构化输出）——旧 prompt「用 5-10 个字总结」无约束，LLM 自由发挥
+            //   输出对话文本（实测 title="一切是否已然终结？"/"请提供项目描述..."）。
+            String titlePrompt = "Generate a concise, sentence-case title (3-7 words) that captures the main topic "
+                + "or goal of this coding session. The title should be clear enough that the user recognizes the "
+                + "session in a list. Use sentence case: capitalize only the first word and proper nouns.\n\n"
+                + "Return JSON with a single \"title\" field.\n\n"
+                + "Good examples:\n{\"title\": \"Fix login button on mobile\"}\n{\"title\": \"Add OAuth authentication\"}\n"
+                + "{\"title\": \"Debug failing CI tests\"}\n{\"title\": \"Refactor API client error handling\"}\n\n"
+                + "Bad (too vague): {\"title\": \"Code changes\"}\n"
+                + "Bad (too long): {\"title\": \"Investigate and fix the issue where the login button does not respond on mobile devices\"}\n"
+                + "Bad (wrong case): {\"title\": \"Fix Login Button On Mobile\"}";
+            // [language 2026-09-04] 标题语言跟随 settings.language(auto → LanguageResolver 按时区解析成
+            //   语言显示名)。已配置 → 追加"用 {语言} 输出标题"(解决中文会话出英文标题)。null(未配置)→ 原样。
+            String titleLanguage = resolveTitleLanguage();
+            if (titleLanguage != null) {
+                titlePrompt = titlePrompt + "\nOutput the title in " + titleLanguage + ".";
+            }
+            var titleSchema = JSON.createObjectNode();
+            titleSchema.put("type", "object");
+            titleSchema.putObject("properties").putObject("title").put("type", "string");
+            titleSchema.putArray("required").add("title");
+            LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
+                List.of(), null, LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(titleSchema),
+                null, null, "auto_title", null, null, null, null, null, null, null, null, null);
+            String titleJson = titleProvider.chatWithOptions(config, fastModelName, titlePrompt, prompt, options);
+            newTitle = (titleJson != null && !titleJson.isBlank())
+                ? JSON.readTree(titleJson).path("title").asText(null) : null;
+        } catch (Exception ex) {
+            log.warn("Title failed: {}", ex.getMessage());
+            newTitle = "新会话";
+        }
+        if (newTitle != null) {
+            newTitle = newTitle.trim().replaceAll("^[\"']|[\"']$", "");
+            if (newTitle.length() > 30) newTitle = newTitle.substring(0, 30) + "...";
+            if (newTitle.isBlank()) newTitle = "新会话";
+        } else newTitle = "新会话";
+        return newTitle;
+    }
+
+    /**
+     * [language 2026-09-04] 读 settings.language(auto → LanguageResolver 按时区解析)得标题语言显示名。
+     *   读失败 / 未配置 → null(标题 prompt 不加语言要求,沿用英文 prompt)。
+     */
+    private String resolveTitleLanguage() {
+        try {
+            com.nexusai.repository.settings.entity.SettingsRecord s =
+                settingsMapper.selectOneById(SETTINGS_SINGLETON_ID);
+            if (s == null) {
+                return null;
+            }
+            return com.nexusai.application.agent.prompt.LanguageResolver.resolve(s.getLanguage());
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ChatService] resolveTitleLanguage 读 settings.language 失败(标题仍按原 prompt 生成): {}",
+                    e.getMessage());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * [title-cc-align] 应用生成的标题并推 status topic · titleExplicit 按生成轮次置位
+     * （count1→0 可进化 / count3→2 已刷新停止）。
+     *
+     * <p>[FIX-2 对抗核验 MINOR] 成功判定：generateTitleText 失败回落"新会话"占位
+     * （isDefaultTitle 判 true）→ 不落库不置位，保持原 title 与 titleExplicit 不变 ——
+     *   否则 count3 失败置 titleExplicit=2 会锁死重试（plan §3.4.6「失败 titleExplicit 不变」），
+     *   且可能用占位标题覆写已有自动标题。
+     *
+     * @return true=生成成功已落库；false=生成失败（回落占位，保持原状态可重试）
+     */
+    private boolean applyGeneratedTitle(SessionRecord session, String newTitle, int titleExplicit,
+                                        String userMessageId, SimpMessagingTemplate wsTemplate) {
+        // 成功判定：newTitle 非空且非默认占位（count1/count3 生成失败统一回落"新会话"→ false）
+        boolean generated = newTitle != null && !isDefaultTitle(newTitle, session.getModelName());
+        if (!generated) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ChatService] 标题生成失败（回落默认占位），保持原 title 与 titleExplicit 不变 session={}",
+                    session.getId());
+            }
+            return false;
+        }
+        session.setTitle(newTitle);
+        session.setTitleExplicit(titleExplicit);
+        session.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(session);
+        // [AM-CC-20260825] title 推会话级 status topic（前端常驻订阅），而非 stream topic——
+        //   stream topic 在 message.complete 后前端可能退订 → title 事件丢失（新建会话列表标题不更新，
+        //   2026-08-25 联调实测）。status topic 前端持续订阅，实时收到标题。
+        sendAndLog(wsTemplate, "/topic/sessions/" + session.getId() + "/status",
+            com.nexusai.eventbus.ws.SessionTitleEvent.of(session.getId(), userMessageId, newTitle),
+            "title=" + newTitle);
+        return true;
+    }
+
+    /**
+     * [title-cc-align] title-worthy 用户消息计数 · 对齐 CC onUserMessage userMessageCount
+     *   （initReplBridge.ts:349-352）：role=user 且 (is_meta IS NULL OR is_meta != 1) 且 content 非空。
+     *   is_meta NULL 显式包含（V51 存量旧行）；替代 messageCount（混入 system 计数导致长任务永不生成）。
+     *   原始 SQL where（与 MessageService:718 同款模式，MyBatis-Flex where(String, Object...) 生产已证）。
+     */
+    private int countTitleWorthyUserMessages(String sessionId) {
+        long count = messageMapper.selectCountByQuery(
+            QueryWrapper.create().where(
+                "session_id = ? AND role = ? AND (is_meta IS NULL OR is_meta != 1) "
+                    + "AND content IS NOT NULL AND content != ''",
+                sessionId, Role.user.name()));
+        return (int) count;
+    }
+
+    /**
+     * [title-cc-align] 完整会话文本尾部 1000 字符 · 对齐 CC sessionTitle.ts:33-54 extractConversationText
+     *   （MAX_CONVERSATION_TEXT=1000；遍历 user/assistant 跳过 isMeta / 空 content，tail-slice
+     *   最近上下文优先；无 origin 列 → isMeta + 空 content 近似 human origin 判定）。
+     */
+    private String extractConversationTextTail(String sessionId) {
+        List<MessageRecord> rows = messageMapper.selectListByQuery(
+            QueryWrapper.create().where(
+                "session_id = ? AND role IN ('user', 'assistant')", sessionId)
+                .orderBy("created_at", true));
+        if (rows == null || rows.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder();
+        for (MessageRecord m : rows) {
+            if (Boolean.TRUE.equals(m.getIsMeta())) continue;
+            String c = m.getContent();
+            if (c == null || c.isBlank()) continue;
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(c);
+        }
+        String text = sb.toString();
+        return text.length() > 1000 ? text.substring(text.length() - 1000) : text;
+    }
+
+    /**
      * 标题是否为「默认/未显式命名」（允许自动生成覆盖）。对齐 CC initReplBridge.ts:299-336：
      * 仅用户显式 /rename 命名的标题才阻止自动生成。判定 = null/blank ∨ 等于 modelName ∨ 占位标题
      * （A 方案：后端兜底识别前端占位；B 方案：前端创建不再传占位 title，双保险）。
+     * [title-cc-align MAJOR-4] package-private → <b>public static</b>：SessionService
+     * （com.nexusai.domain.session，跨包）create 时经本方法判定 titleExplicit 初值。
      */
-    static boolean isDefaultTitle(String title, String modelName) {
+    public static boolean isDefaultTitle(String title, String modelName) {
         return title == null || title.isBlank()
             || title.equals(modelName)
             || isDefaultPlaceholderTitle(title);
@@ -1986,10 +2163,26 @@ public class ChatService {
         };
     }
 
-    private String extractLastUserContent(String sessionId) {
+    /**
+     * 首条 title-worthy 用户消息原文（count1 输入）· 对齐 CC initReplBridge.ts onUserMessage
+     *   count===1 时 deriveTitle(text) 取触发那一条消息原文（:365-368）。
+     *
+     * <p>[FIX-3 对抗核验 MINOR] orderBy 由 created_at DESC（最近）改 ASC（最早）：count1 语义是
+     *   「首条」title-worthy 用户消息——CC 逐条必经 count==1，取的是触发 count 的那条（即最早）。
+     *   收口聚合（userCount 跳变：immediate local-jsx / 被拒 userInvocable / busy-queued 一次落多行）
+     *   时旧逻辑取「最近」一条，与新会话首条主题偏差大。
+     *
+     * <p>[title-cc-align 反射器 MAJOR-2 定死] 保留 (is_meta IS NULL OR is_meta != 1) + content 非空 过滤：
+     *   否则收口时首条 role=user 可能是 cron/task 元消息（isMeta=true 非空 content，
+     *   CronIdleExecutor.java:466-473），count1 输入取错。改后恒为首条 title-worthy 用户消息。
+     */
+    private String extractFirstUserContent(String sessionId) {
         List<MessageRecord> rows = messageMapper.selectListByQuery(
-            QueryWrapper.create().eq("session_id", sessionId).eq("role", Role.user.name())
-                .orderBy("created_at", false).limit(1));
+            QueryWrapper.create().where(
+                "session_id = ? AND role = ? AND (is_meta IS NULL OR is_meta != 1) "
+                    + "AND content IS NOT NULL AND content != ''",
+                sessionId, Role.user.name())
+                .orderBy("created_at", true).limit(1));
         return (rows != null && !rows.isEmpty()) ? rows.get(0).getContent() : null;
     }
 
@@ -2156,6 +2349,24 @@ public class ChatService {
             //    对齐 CC pastedContents.content（纯 base64，config.ts:57）。统一在此剥离，下游 F1/A4/A3
             //    全部拿到纯 base64。
             if (att.base64() != null && !att.base64().isBlank()) {
+                // [skill-attach-register] base64 直传 PDF（≤5MB，前端契约 base64 无 contentId）→ 落盘 +
+                //   注册附件表（统一 contentId → user_attachments 落 contentId → F5 出站 url 可拼预览）。
+                //   注册成功 → 转 contentId 路径通道（PdfAttachmentProcessor resolvePathChannel 附件表读盘，
+                //   不再 writeBase64Channel 临时落盘）；store/register 失败 → warn 降级保留 base64 直传
+                //   （附件不丢，模型仍可读，仅 F5 url 缺失）。
+                if (isPdfAttachment(att) && (att.contentId() == null || att.contentId().isBlank())) {
+                    AttachmentRequest pdfRegistered = registerBase64Pdf(sessionId, att);
+                    if (pdfRegistered != null) {
+                        resolved.add(pdfRegistered);
+                        if (log.isDebugEnabled()) {
+                            log.debug("[A1 attachments] base64 直传 PDF 注册附件表 → contentId 路径通道: "
+                                    + "contentId={} filename={}（≤5MB base64 → 附件表统一 contentId，F5 url 可预览）",
+                                pdfRegistered.contentId(), pdfRegistered.filename());
+                        }
+                        continue;
+                    }
+                    // 注册失败 → 降级走下方原 base64 直传（保留 contentId=null 语义）
+                }
                 resolved.add(new AttachmentRequest(
                     att.type(), att.contentId(), att.filename(), att.mediaType(),
                     stripDataUrlPrefix(att.base64()), att.path()));
@@ -2368,6 +2579,63 @@ public class ChatService {
         }
         String mediaType = att.mediaType();
         return mediaType != null && PdfSupport.PDF_MEDIA_TYPE.equalsIgnoreCase(mediaType);
+    }
+
+    /**
+     * [skill-attach-register] base64 直传 PDF（≤5MB，前端契约 ≤5MB 附件一律 base64 无 contentId）落盘 +
+     * 注册附件表（统一 contentId 注册中心）· 复刻 AttachmentController.upload pdf 分支范式
+     * （pdfAttachmentStore.store → attachmentService.register → contentId=附件表自增 id）。
+     *
+     * <p><b>WHY（CLAUDE.md 规则 9）</b>：base64 直传 PDF 此前 resolveAttachments 仅透传 base64（无附件表
+     * 注册）→ user_attachments.contentId=null → 出站 {@code resolveAttachmentUrls} 拼不出
+     * {@code /attachments/content/{sessionId}/{contentId}} → F5 重拉前端无法按内容端点预览（乐观 base64
+     * 仅前端内存，重拉丢失）。注册后 resolveAttachments 输出走 contentId 路径通道 → PdfAttachmentProcessor
+     * resolvePathChannel 经附件表读盘分页（不再 writeBase64Channel 临时落盘 attach-uuid.pdf），语义与
+     * &gt;5MB upload/path 附件统一。≤5MB 图保持 base64 直传（image-cache/imagePasteIds 独立通道，不改）。
+     *
+     * @param sessionId 会话 id（附件表 session_id + store 落盘目录归属）
+     * @param att       原附件（type=pdf + base64 非空 + contentId 空）
+     * @return 已注册附件（type=pdf + contentId + base64=null + path=store 落盘路径）；store/register 失败 →
+     *         null（调用方降级保留 base64 直传）
+     */
+    private AttachmentRequest registerBase64Pdf(String sessionId, AttachmentRequest att) {
+        if (pdfAttachmentStore == null || attachmentService == null) {
+            log.warn("[attachments] base64 PDF 注册附件表依赖未注入（pdfAttachmentStore/attachmentService）→ 降级 base64 直传: filename={}",
+                att.filename());
+            return null;
+        }
+        try {
+            byte[] bytes = Base64.getDecoder().decode(stripDataUrlPrefix(att.base64()));
+            if (bytes.length == 0) {
+                log.warn("[attachments] base64 PDF 解码为空 → 降级 base64 直传: filename={}", att.filename());
+                return null;
+            }
+            String filename = (att.filename() != null && !att.filename().isBlank())
+                ? att.filename() : "attachment.pdf";
+            try (InputStream in = new ByteArrayInputStream(bytes)) {
+                PdfAttachmentStore.StoredPdf stored = pdfAttachmentStore.store(sessionId, in, bytes.length, filename);
+                if (stored == null) {
+                    log.warn("[attachments] base64 PDF 落盘失败（store null）→ 降级 base64 直传: filename={} size={}B",
+                        filename, bytes.length);
+                    return null;
+                }
+                String mediaType = (att.mediaType() != null && !att.mediaType().isBlank())
+                    ? att.mediaType() : PdfSupport.PDF_MEDIA_TYPE;
+                long contentId = attachmentService.register(sessionId, stored.path(), mediaType,
+                    stored.filename(), stored.size(), "upload");
+                if (log.isInfoEnabled()) {
+                    log.info("[attachments] base64 直传 PDF 注册附件表成功: contentId={} filename={} size={}B "
+                            + "path={}（≤5MB base64 → 附件表统一 contentId，F5 预览 url 可恢复）",
+                        contentId, stored.filename(), stored.size(), stored.path());
+                }
+                return new AttachmentRequest("pdf", String.valueOf(contentId), stored.filename(),
+                    mediaType, null, stored.path());
+            }
+        } catch (Exception e) {
+            log.warn("[attachments] base64 PDF 注册附件表异常 → 降级 base64 直传: filename={} 原因={}",
+                att.filename(), e.toString());
+            return null;
+        }
     }
 
     /** [attachments-v2 Step2] 是否为媒体附件（type=video/audio/file）。 */

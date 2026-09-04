@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Client, type StompSubscription } from '@stomp/stompjs'
 import { useChatStore } from '../stores/chatStore'
-import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete, isToolCall, isToolResult, isBoundary, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
+import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
@@ -9,6 +9,36 @@ import type { StreamEvent, TaskEvent, SessionStatusEvent, SessionTitleEvent, Tea
 import { useTeamStore } from '../stores/teamStore'
 import { useTodoStore } from '../stores/todoStore'
 import { teamsApi } from '../api/teams'
+
+/** [打字机节流 2026-09-04] 流式 append 合并窗口(ms)：reasoning/content chunk 攒够窗口再批量 append 一次。
+ *  根因: 后端流式逐块推送, 前端原来「每 chunk 一次 appendChunk/appendReasoning → 一次 zustand setState +
+ *  整页重渲染」——长 thinking 一轮几百上千 chunk → 主线程被 React 渲染占满 → 来不及读 socket → 积压 →
+ *  「后端推完了前端还在慢慢显示/卡住」。合并到每 STREAM_APPEND_MS(40ms)一次 set, 渲染频率从「每 chunk」
+ *  降到 ~25 次/s, 主线程得闲及时消费 WS 帧。UI 滞后 ≤40ms 无感。 */
+const STREAM_APPEND_MS = 40
+/** sid -> blockId -> 累积增量（delta=正文 / reasoning=思考）。模块级:跨 hook 重渲染不丢、多会话并行独立累积。 */
+const pendingStreamAppends = new Map<string, Map<string, { delta: string; reasoning: string }>>()
+let streamFlushTimer: ReturnType<typeof setTimeout> | null = null
+
+/** 把缓冲里所有会话/块的累积增量一次 append 进 chatStore（合并 setState）。 */
+function flushStreamAppends() {
+  if (streamFlushTimer) { clearTimeout(streamFlushTimer); streamFlushTimer = null }
+  if (pendingStreamAppends.size === 0) return
+  const st = useChatStore.getState()
+  for (const [sid, blocks] of pendingStreamAppends) {
+    for (const [blockId, acc] of blocks) {
+      if (acc.delta) st.appendChunk(sid, blockId, acc.delta)
+      if (acc.reasoning) st.appendReasoning(sid, blockId, acc.reasoning)
+    }
+  }
+  pendingStreamAppends.clear()
+}
+
+/** 调度一次 flush（已有挂起 timer 则复用——timer 触发时统一把窗口内全部增量合并 append）。 */
+function scheduleStreamFlush() {
+  if (streamFlushTimer) return
+  streamFlushTimer = setTimeout(() => { streamFlushTimer = null; flushStreamAppends() }, STREAM_APPEND_MS)
+}
 
 /** STOMP skill_improvement.suggestion 事件（对齐 SkillImprovementSuggestionEvent · 轻量信号） */
 interface SkillImprovementSuggestionWire {
@@ -126,6 +156,9 @@ export function useChatSocket(
   onQueueDrained?: (sessionId: string, drained: { uuid?: string; content: string }[]) => void,
   /** 排队命令快照变化（queue.changed）→ 回调 App：刷新排队框（useCommandQueue.setQueued） */
   onQueueChanged?: (sessionId: string, commands: { content: string; mode: string; isEditable: boolean; isMeta?: boolean }[]) => void,
+  /** [断连恢复] WS 被服务端强杀（send time limit 超时 → close）后,重连收到的第一个 message.complete
+   *   触发回调 → App 按 sid 权威重拉 GET /messages 补偿缺口。根治「complete 推给零订阅者丢失 → 打字机永久卡死」。 */
+  onReconnectReload?: (sid: string) => void,
 ) {
   const clientRef = useRef<Client | null>(null)
   const setConnection = useChatStore((s) => s.setConnection)
@@ -143,6 +176,13 @@ export function useChatSocket(
   // onQueueChanged 经 ref 转发
   const onQueueChangedRef = useRef(onQueueChanged)
   onQueueChangedRef.current = onQueueChanged
+  // [断连恢复] onReconnectReload 经 ref 转发
+  const onReconnectReloadRef = useRef(onReconnectReload)
+  onReconnectReloadRef.current = onReconnectReload
+  /** [断连恢复] WS 被服务端强杀（Send time exceeded → close 1011）后置 true;重连后第一个 message.complete
+   *   触发权威重拉并复位（补偿断连窗口内被零订阅者丢弃的 chunk/complete —— 打字机永久卡死的直接原因）。
+   *   不放 onConnect 复位:断连丢事件的 turn 其 complete 在重连之后才到,onConnect 过早复位会漏掉这次补偿。 */
+  const wasDisconnectedRef = useRef(false)
   /** 流式订阅登记：sid -> sub（会话级单 topic /topic/sessions/{sid}/stream 常驻 · 不随消息退订） */
   const streamSubsRef = useRef<Map<string, StompSubscription>>(new Map())
   const permSubsRef = useRef<Map<string, { message: StompSubscription; bridge: StompSubscription; channel: StompSubscription }>>(new Map())
@@ -280,7 +320,14 @@ export function useChatSocket(
     }
     const client = createSocketClient()
     client.onDisconnect = () => { setConnection('disconnected'); clearSubscriptions() }
-    client.onWebSocketClose = () => { setConnection('disconnected'); clearSubscriptions() }
+    client.onWebSocketClose = () => {
+      // [打字机节流] 断连前 flush 缓冲（把已收到但仍在窗口内的增量渲染, 减少断连视觉缺口）
+      flushStreamAppends()
+      // [断连恢复] 置断连标志（不在此复位,等重连后第一个 complete 触发重拉才复位 —— 见 isComplete 分支）。
+      wasDisconnectedRef.current = true
+      setConnection('disconnected')
+      clearSubscriptions()
+    }
     client.onConnect = () => {
       setConnection('connected')
       // 当前会话 scoped 订阅（用 ref 读最新 sessionId）
@@ -309,6 +356,8 @@ export function useChatSocket(
     clientRef.current = client
     setConnection('connecting')
     return () => {
+      // [打字机节流] 卸载前 flush 缓冲（把窗口内已收增量渲染; 残余 timer 由 flush 内 clearTimeout 清理）
+      flushStreamAppends()
       // client 单例 unmount 时清理（会话级 scoped 订阅 + 按 sid 常驻订阅）
       for (const sub of sessionScopedSubsRef.current) sub.unsubscribe()
       sessionScopedSubsRef.current = []
@@ -502,12 +551,23 @@ export function useChatSocket(
       // [打字机性能] 移除每 chunk 磁盘日志（debugLog=writeTextFile 串行写盘 · 后端高频推 chunk 时
       //   阻塞 STOMP 处理 → 打字机滞后「后端完成前端还没打完」）；console.debug 保留（devtools 未开零成本）
       console.debug('[chunk] uid', { blockId, uid: evt.userMessageId, sid })
+      // ensureStreamBlock 保持即时（幂等:块已存在时 return 不触发重渲染,只首 chunk 建块一次）——
+      //   块归属必须立即可见,后续 tool_call/usage 按块定位不丢
       st.ensureStreamBlock(sid, blockId, evt.userMessageId)
-      if (evt.delta) st.appendChunk(sid, blockId, evt.delta)
-      if (evt.reasoning) {
-        // 过滤流式累积残留的 null 串（cleanReasoning 同源，展示层不再出现 nullnull…）
-        const cleaned = evt.reasoning.replace(/(?:null)+/g, '')
-        if (cleaned.trim()) st.appendReasoning(sid, blockId, cleaned)
+      // [打字机节流] delta/reasoning 攒入模块级缓冲, STREAM_APPEND_MS 后批量 append（治 reasoning/正文
+      //   「每 chunk 一次整页重渲染」→ 主线程得闲及时读 socket）。UI 滞后 ≤40ms, 打字机滚动粒度不变。
+      if (evt.delta || evt.reasoning) {
+        let blocks = pendingStreamAppends.get(sid)
+        if (!blocks) { blocks = new Map(); pendingStreamAppends.set(sid, blocks) }
+        let acc = blocks.get(blockId)
+        if (!acc) { acc = { delta: '', reasoning: '' }; blocks.set(blockId, acc) }
+        if (evt.delta) acc.delta += evt.delta
+        if (evt.reasoning) {
+          // 过滤流式累积残留的 null 串（cleanReasoning 同源，展示层不再出现 nullnull…）
+          const cleaned = evt.reasoning.replace(/(?:null)+/g, '')
+          if (cleaned.trim()) acc.reasoning += cleaned
+        }
+        scheduleStreamFlush()
       }
     } else if (isToolCall(evt)) {
       // TEMP 诊断：tool_call 目标 id vs 现有流式块 ids（确认是否同源匹配）
@@ -531,7 +591,24 @@ export function useChatSocket(
       if (evt.removedUuids?.length) {
         st.markSnipped(sid, evt.removedUuids)
       }
+    } else if (isMessageUsage(evt)) {
+      // message.usage（消息级完成、非 turn 终态）：每条 assistant 流式结束推自身 usage + 上下文快照
+      //   → 按 assistantMessageId 实时挂到流式块 → Composer 缓存%/上下文条即时更新（不等 turn complete）。
+      //   高危：本分支绝不调 onSessionDone / 不退订 —— 退订只在 message.complete（isComplete 对 message.usage 恒 false，
+      //   天然走不到 onSessionDoneRef；后端不复用 complete 名的原因即在此）。纯工具轮无块 → applyMessageUsage no-op，
+      //   由下一条 assistant 的 message.usage 或 turn 末 complete meta 兜底。
+      if (evt.assistantMessageId) {
+        st.applyMessageUsage(sid, evt.assistantMessageId, {
+          usage: evt.usage ?? null,
+          contextTokensUsed: evt.contextTokensUsed ?? null,
+          contextWindow: evt.contextWindow ?? null,
+          percentLeft: evt.percentLeft ?? null,
+        })
+      }
     } else if (isComplete(evt)) {
+      // [打字机节流] 收口前先 flush 缓冲里的尾增量——finalizeBlocks 把流式块转消息, 若缓冲未 flush
+      //   会缺最后一段（40ms 窗口内的 delta/reasoning 尚未 append 进 streams）→ 消息尾字丢失
+      flushStreamAppends()
       // 契约 #2/#5：complete 收口 → 流式块直接转消息（id=turnAssistantId，后端落库同源后即 DB 权威 id，免重拉）。
       //   透传 complete 的思考耗时（无重拉时块消息才不缺 reasoningDurationMs）
       st.finalizeBlocks(sid, {
@@ -566,6 +643,15 @@ export function useChatSocket(
           })
         }
       }
+      // [断连恢复] 若本 turn 期间 WS 被服务端强杀过 → 断连窗口内 chunk/complete 推给零订阅者已丢
+      //   （STOMP simple broker topic 非持久,无重放）→ 触发 App 按 sid 权威重拉 GET /messages 补偿缺口:
+      //   DB 已逐条落库（realtime-persist）,重拉把「中途断」的残缺块替换为权威完整消息;
+      //   finalizeBlocks 按 id 幂等去重（chatStore.ts:320）保证不重复。只在此(complete=turn 已结束)分支触发,
+      //   不在 turn 中途（避免把进行中流式块替换成 DB 半成品）。触发一次后复位标志。
+      if (wasDisconnectedRef.current) {
+        wasDisconnectedRef.current = false
+        onReconnectReloadRef.current?.(sid)
+      }
       // 生命周期明确信号：通知 App 移除 activeStreams → 取消该会话订阅（无推断竞争）。
       //   带 topic：App 侧校验当前登记的 topic 匹配才删（防旧 turn 终止事件误删刚登记的新 turn）
       onSessionDoneRef.current?.(sid, topic)
@@ -580,6 +666,8 @@ export function useChatSocket(
         message: evt.message ?? '模型调用失败',
       })
     } else if (isCancelled(evt)) {
+      // [打字机节流] 取消清流前 flush 缓冲（把窗口内已收的 delta/reasoning 渲染, 避免取消即丢尾段）
+      flushStreamAppends()
       // 已取消 → 清流 + 居中 toast（对齐「已刷新对话」等通知 · 不再走左侧通知栏）
       st.clearStream(sid)
       onSessionDoneRef.current?.(sid, topic)

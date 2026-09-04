@@ -3,26 +3,26 @@ package com.nexusai.application.agent.tool;
 import com.nexusai.application.agent.agent.CwdResolution;
 
 import java.io.IOException;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.function.Supplier;
 
 /**
- * 路径安全校验 · 对齐 CC utils/path.ts:138 sanitizePath 助手。
+ * 路径展开工具 · 对齐 CC {@code utils/path.ts expandPath}（2026-09-03 用户拍板删 PathGuard 逃逸拦截）。
  *
- * <p>确保所有文件操作都限定在 workspace 内，禁止 {@code ../../etc/passwd} 这种逃逸。
+ * <p><b>WHY</b>：CC 真源 FileReadTool.ts:443 validateInput 仅 {@code expandPath(file_path)}（展开路径），
+ * <b>不做</b>"逃出 workspace" 检查——CC 信任模型可读任意绝对路径，安全靠权限弹窗（canUseTool / deny rule）。
+ * 本类原 s02 教学版自建"最严格版本"（toRealPath 软链接解析 + startsWith 逃逸前缀检查），偏离 CC，
+ * 误伤附件（Desktop/pdf-cache）、子代理 output、系统文件读取（日志实证 2026-09-03 blocked path escape）。
+ * 用户拍板删除逃逸拦截，最大限度对齐 CC：{@link #resolve(String)} 现为纯展开（镜像
+ * {@code expandPath}），绝对/相对路径只展开不拦截；~ / null 字节 / Windows POSIX 转换全处理。
  *
- * <h2>CC 对齐</h2>
- * <p>CC 的 FileRead / FileWrite / Edit 工具在 {@code validateInput()}（{@code toolExecution.ts:682}）
- * 阶段做路径校验。CC 用更复杂的规则（多 worktree / 软链接解析），本类做最严格版本（解析
- * 软链接 + 路径前缀检查）—— 这与 s02 教学版一致。
+ * <p><b>安全边界移交</b>：删除 PathGuard 逃逸后，生产（checkPermissions 注入）路径的 workspace
+ * 边界由 {@code ReadPermissionChecker.isInWorkingDir}（CC 对齐 filesystem.ts:1136-1151，锚
+ * originalCwd + additionalWorkingDirectories，fail-closed）承担；本类不再做 execute 阶段第二道防线。
  *
- * <p>s02 [P2] 修补：通过 {@link Path#toRealPath()} 解析软链接，消除
- * {@code ln -s /etc/passwd workspace/link} 绕过 PathGuard 的安全漏洞。
- *
- * <p>注意：本类<b>不</b>做"白名单路径"判断（如只允许 /src 目录），只做"不能逃出 workspace"
- * 的判断。更细的权限由 s03 permission 章节加（canUseTool 检查）。
+ * <p><b>已知简化</b>：不再解析软链接（对齐 CC expandPath 仅 normalize）；相对路径逃逸（{@code ../}）
+ * 不再拦截（CC 语义，安全靠权限层）。
  *
  * <h2>工作目录来源 · 对齐 CC expandPath(baseDir=getCwd()) 每调用取（INV-1）</h2>
  * <p>CC 文件工具相对路径基准 = {@code expandPath(path, baseDir)} 的 {@code baseDir} 默认
@@ -117,25 +117,18 @@ public class PathGuard {
      * @throws SecurityException 如果路径解析后逃出 workdir
      */
     public Path resolve(String relative) {
+        // [CC 对齐 2026-09-03 用户拍板 · 删 PathGuard 逃逸拦截] 纯展开语义（镜像 CC expandPath）：
+        //   绝对/相对路径只展开不拦截（绝对路径任意可读；相对路径 resolve(baseDir).normalize() 不限制
+        //   是否在 workspace 内），~ / null 字节 / Windows POSIX 转换全处理；不解析软链接、不做
+        //   "逃出 workspace" 检查（s02 教学版遗留，CC 真源 FileReadTool.ts:443 仅 expandPath）。
+        //   生产安全边界由 ReadPermissionChecker.isInWorkingDir（checkPermissions 注入时，CC 对齐
+        //   filesystem.ts:1136-1151）承担，本类不再做 execute 阶段第二道防线。
         // 每调用取当前 workdir（对齐 CC expandPath baseDir=getCwd() per-call · INV-1）
         Path workdir = currentWorkdir();
         if (relative == null || relative.isBlank()) {
             return workdir;
         }
-        Path resolved = workdir.resolve(relative).normalize();
-        // 已通过 toRealPath 解决软链接绕过（对齐 CC safePath）
-        try {
-            resolved = resolved.toRealPath();
-        } catch (NoSuchFileException e) {
-            // 新建文件（尚不存在），不解析软链接，用 normalize() 结果
-        } catch (IOException e) {
-            // 其他 I/O 错误也降级（权限问题等），不阻断正常操作
-        }
-        if (!resolved.startsWith(workdir)) {
-            throw new SecurityException(
-                "Path escapes workspace: '" + relative + "' → " + resolved);
-        }
-        return resolved;
+        return Paths.get(expandPath(relative, workdir.toString()));
     }
 
     /**

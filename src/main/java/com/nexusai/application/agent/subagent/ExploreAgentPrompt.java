@@ -61,7 +61,7 @@ public final class ExploreAgentPrompt {
         String searchReadOnly = "ls, git status, git log, git diff, find" + searchSuffix + ", cat, head, tail";
 
         return """
-            You are a file search specialist for NexusAI, an open-source desktop assistant implementing the Claude Code agent harness. You excel at thoroughly navigating and exploring codebases.
+            You are a file search specialist for NexusAI, a desktop assistant developed by 建科院数字公司. You excel at thoroughly navigating and exploring codebases.
 
             === CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
             This is a READ-ONLY exploration task. You are STRICTLY PROHIBITED from:

@@ -170,24 +170,14 @@ public class NotebookEditTool implements Tool {
         String editMode = input.path("edit_mode").asText("replace");
 
         // resolve 绝对路径（CC :180-182：isAbsolute ? notebook_path : resolve(cwd, notebook_path)）
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛；不再 toRealPath → 8.3 短名
+        //   误报场景也不存在），原 catch 回退（①越狱 ②8.3 短名）死代码删除。
         Path path;
         String key;
-        try {
-            path = guard != null ? guard.resolve(notebookPath) : Paths.get(notebookPath);
-            key = guard != null
-                ? ToolUseContext.keyForReadFileState(guard, notebookPath)
-                : null;
-        } catch (SecurityException se) {
-            // guard.resolve 抛 SecurityException 的两种情况：
-            //   ① 真实路径越狱（../../etc/passwd）——越狱由 checkPermissions（写权限链）拦截；
-            //   ② Windows 8.3 短名敏感：TEMP 下文件删除后 toRealPath 用 8.3 短名（ADMINI~1），
-            //      startsWith(workdir=长名) 不命中误报越狱（缺文件场景）。此时回退纯绝对路径
-            //      解析（schema 要求 notebook_path 必填且绝对），继续校验读文件分支（ENOENT → errorCode 1）。
-            //   不得 return pass() —— 那会短路整个校验放行缺文件。
-            if (log.isDebugEnabled()) {
-                log.debug("NotebookEditTool: validateInput guard.resolve 失败回退 Paths.get path={} cause={}",
-                    notebookPath, se.toString());
-            }
+        if (guard != null) {
+            path = guard.resolve(notebookPath);
+            key = ToolUseContext.keyForReadFileState(guard, notebookPath);
+        } else {
             path = Paths.get(notebookPath);
             key = null;
         }

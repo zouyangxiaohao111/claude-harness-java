@@ -16,6 +16,7 @@ import com.nexusai.application.agent.compact.PlanProvider;
 import com.nexusai.application.agent.compact.PlanProviderImpl;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.SnipCompactor;
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.TokenEstimator;
 import com.nexusai.application.agent.AgentEvent;
 import com.nexusai.application.agent.diff.TraceEvent;
@@ -425,6 +426,10 @@ public record AgentLoopContext(
          *  <p>cwd-align-ext：默认取会话 originalCwd（CC subagent transcript 锚 getProjectDir(getOriginalCwd())
          *  sessionStorage.ts:202-205）；无 sessionId 回落 user.dir（方案 1，零行为变化）。 */
         private Path workspaceDir = Path.of(resolveDefaultWorkspaceDir());
+        /** [cache-hit-fix B] 会话级 GitStatusProvider · CC context.ts:97 会话开始一次快照、会话内不更新。
+         *  doRun 建 mainCtx 后经 SessionGitStatusRegistry 注入（跨 run 共享同一实例，system 尾字节稳定 →
+         *  保护 deepseek 单前缀缓存）；null = 未注入（非 Spring / 无 sessionId）→ loop() 回落每 run new。 */
+        private com.nexusai.application.agent.prompt.GitStatusProvider gitStatusProvider;
         /** [S05] 会话级 appState 读通道 · 对齐 CC Tool.ts:182 getAppState（LlmAgentLoop.getAppStateSnapshot 接线）。 */
         private java.util.function.Function<java.util.Map<String, Object>, java.util.Map<String, Object>> appStateReader;
 
@@ -457,6 +462,8 @@ public record AgentLoopContext(
         public void setContentReplacementState(ContentReplacementState v) { this.contentReplacementState = v; }
         public Path workspaceDir() { return workspaceDir; }
         public void setWorkspaceDir(Path v) { this.workspaceDir = v; }
+        public com.nexusai.application.agent.prompt.GitStatusProvider gitStatusProvider() { return gitStatusProvider; }
+        public void setGitStatusProvider(com.nexusai.application.agent.prompt.GitStatusProvider v) { this.gitStatusProvider = v; }
         public java.util.function.Function<java.util.Map<String, Object>, java.util.Map<String, Object>> appStateReader() {
             return appStateReader;
         }
@@ -1749,6 +1756,17 @@ public record AgentLoopContext(
             .withReasoningDurationMs(reasoningDurationMs)
             // [B7-R9] 输出解码耗时 decodeMs 挂载（工具轮 assistant 消息；外层 run() 算好传入，null = 无计时）
             .withDecodeMs(decodeMs));
+        // [usage-push] 工具轮 assistant 消息逐条 usage 实时推 + run 级累计（append withUsage 后立即；
+        //   对齐 CC claude.ts:2244-2248 message.usage 写回 UI）。static 本方法在
+        //   com.nexusai.application.agent.loop 包 → publishMessageUsage 需 public（LlmAgentLoop
+        //   assistantMessageWithToolCalls 先例）。模型 = state.currentModel()；userMessageId 派生 =
+        //   state.lastUserMessageId() ?? ctx.streamUserMessageId()（同 turnUserMessageId 推导，消息链优先）。
+        com.nexusai.application.agent.LlmAgentLoop.publishMessageUsage(
+            ctx, state,
+            state.currentModel(),
+            state.lastUserMessageId() != null ? state.lastUserMessageId() : ctx.streamUserMessageId(),
+            turnAssistantId,
+            msg, decodeMs);
 
         // 2. runTools 顶层入口（streaming 已 add / fallback 新建统一收集）
         com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome outcome;
@@ -1901,10 +1919,25 @@ public record AgentLoopContext(
                 }
             }
             state.appendMessage(toolResultMsg);
+            // [fix-toolcalls-400 C] 该工具 newMessages 紧跟其 tool_result flush ·
+            //   对齐 CC toolExecution.ts:1478 addToolResult 先 / :1566-1570 newMessages 后。
+            //   工具执行期 (StreamingToolExecutor dispatch → ToolResultApplier.apply) 只把 newMessages
+            //   暂存进 AgentState (stashNewMessages, 不立即 addAll); 此处 tool_result 落地后才 flush,
+            //   保证 state.messages 顺序 = assistant(tool_calls) → tool(tool_result) → user(newMessages),
+            //   否则 Read pdf pages 等 isMeta image user 消息夹在 assistant tool_calls 与 tool_result
+            //   之间 → provider 原序透传 → Anthropic 400 "assistant message with tool_calls must be
+            //   followed by tool messages"。无 newMessages 的工具 (多数) 缓存空, 本步无操作。
+            flushNewMessagesAfterToolResult(state, toolUseId, toolName);
             traceEmit(ctx, new com.nexusai.application.agent.diff.TraceEvent(
                 com.nexusai.application.agent.diff.TraceEvent.Kind.TOOL_RESULT,
                 toolName, System.currentTimeMillis(),
                 java.util.Map.of("id", toolUseId, "isError", isError)));
+        }
+        // [fix-toolcalls-400 C] 兜底 drain: aborted/synthetic/配对缺口 等边缘路径下, 工具执行期已暂存
+        //   但未在本轮任一 tool_result 后 flush 的 newMessages, 在全部 tool_result 之后统一落盘,
+        //   保证仍不夹在 assistant(tool_calls) 与 tool_result 之间 (且不跨 turn 泄漏)。
+        if (state.hasPendingNewMessages()) {
+            drainLeftoverNewMessages(state);
         }
 
         if (hasStructuredOutputCall) {
@@ -1975,6 +2008,60 @@ public record AgentLoopContext(
             state.markNeedsFollowUp();
         }
         return "continue";
+    }
+
+    /**
+     * [fix-toolcalls-400 C] 单个工具 {@code tool_result} 落地后 flush 其暂存 newMessages ·
+     * 对齐 CC toolExecution.ts:1478 addToolResult 先 / :1566-1570 newMessages 后。
+     *
+     * <p>newMessages（Read pdf pages isMeta image user 消息 / SkillTool 指令 / hook 普通消息 /
+     * permission retry isMeta 消息等）由工具执行期 {@code ToolResultApplier.apply} 按 toolUseId
+     * 暂存进 AgentState（不立即 addAll），此处取出并追加到 state.messages 尾 —— 顺序保证
+     * assistant(tool_calls) → tool(tool_result) → user(newMessages)。无 newMessages 的工具
+     * （多数）取到空 List，本方法 no-op。
+     *
+     * <p><b>落盘通道</b>: 直接 {@code state.messages().addAll}（与旧 {@code ToolResultApplier.apply}
+     * 时期一致 —— newMessages 不经 {@code appendMessage} 监听器；tool_result 消息本身才走
+     * appendMessage）。行为差异仅<b>顺序</b>后移，跨 turn 持久/next-turn 投影（SnipTool boundary）
+     * 语义不变。
+     */
+    private static void flushNewMessagesAfterToolResult(AgentState state, String toolUseId, String toolName) {
+        if (state == null || toolUseId == null) return;
+        List<com.nexusai.model.session.dto.ChatMessageDto> pending = state.takeNewMessages(toolUseId);
+        if (pending != null && !pending.isEmpty()) {
+            state.messages().addAll(pending);
+            if (log.isDebugEnabled()) {
+                log.debug("TOOL newMessages flush after tool_result: toolName={} id={} count={} · CC toolExecution.ts:1478 addToolResult 先 / :1566 newMessages 后",
+                    toolName, abbreviate(toolUseId, 24), pending.size());
+            }
+        }
+    }
+
+    /**
+     * [fix-toolcalls-400 C] 兜底 drain：step 3 主循环结束后仍有未配对的暂存 newMessages（aborted /
+     * synthetic / 配对缺口等边缘路径）→ 在全部 tool_result 之后统一落盘。
+     *
+     * <p>WHY: 即使个别工具没有对应 tool_result 配对，其 newMessages 也不能跨 turn 泄漏在暂存 map
+     * 里；统一追加到末尾仍满足「newMessages 不夹在 assistant(tool_calls) 与 tool_result 之间」
+     * 的 provider 顺序约束（此时 tool_result 已全部落地）。map 迭代序无依赖 —— 仅取剩余集合追加。
+     */
+    private static void drainLeftoverNewMessages(AgentState state) {
+        if (state == null) return;
+        List<com.nexusai.model.session.dto.ChatMessageDto> leftovers = new java.util.ArrayList<>();
+        // 先快照 key（避免迭代同时 take 从并发 map 移除的边迭代边删风险；CHM 弱一致迭代虽不抛
+        // CME，但快照更稳）。map 迭代序无依赖 —— 仅取剩余集合追加。
+        java.util.List<String> pendingIds = new java.util.ArrayList<>(
+            state.pendingNewMessagesByToolUseId().keySet());
+        for (String toolUseId : pendingIds) {
+            List<com.nexusai.model.session.dto.ChatMessageDto> msgs = state.takeNewMessages(toolUseId);
+            if (msgs != null) leftovers.addAll(msgs);
+        }
+        if (!leftovers.isEmpty()) {
+            state.messages().addAll(leftovers);
+            if (log.isDebugEnabled()) {
+                log.debug("TOOL newMessages leftover drain (无 tool_result 配对): count={}", leftovers.size());
+            }
+        }
     }
 
     /**
@@ -2644,7 +2731,13 @@ public record AgentLoopContext(
         if (te == null) {
             return messagesForLlm;
         }
-        int used = te.tokenCountFromLastAPIResponse(messagesForLlm);
+        // [A5-2] 求和 provider 分派：token_usage 注入 used 按 model 判 anthropic（deepseek input 已含
+        //   cache hit，4 项和双计 → 注入给模型的 used 虚高）。mapper 不可得（测试）→ 回落 anthropic 语义。
+        AgentLoopContext.TokenBudgetBeans beans = ctx.tokenBudgetBeans();
+        boolean anthropic = (beans != null && beans.modelMapper() != null && beans.providerMapper() != null)
+            ? ContextUsageCalculator.isAnthropic(beans.modelMapper(), beans.providerMapper(), model)
+            : true;
+        int used = te.tokenCountFromLastAPIResponse(messagesForLlm, anthropic);
         Integer total = computeBudgetFromGates(ctx, ctx.queryConfig(), model);
         if (total == null || total <= 0) {
             return messagesForLlm;

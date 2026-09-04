@@ -367,7 +367,14 @@ public class CommandService {
         // skill 包语义相悖的跨模块残留（trim/无 glob/多行）。body 不 trim（CC :145 对齐）。
         Map<String, Object> frontmatter = frontmatterParser.parse(raw);
         String body = frontmatterParser.extractBody(raw);
-        String name = frontmatter.getOrDefault("name", dir.getFileName().toString()).toString();
+        // [skill-db-name-dir] name 恒=目录名 —— 对齐 CC loadSkillsDir.ts（skill name = entry.name =
+        //   目录名，CC :238-239 displayName 才是 String(frontmatter.name)）+ SkillsLoader.java:49-51
+        //   （frontmatter.name 只作 displayName，userFacingName() 优先展示，不反置为 name）。
+        //   旧实现 frontmatter.name 优先 → 手动复制技能目录（目录名 ≠ frontmatter.name，如中文名
+        //   frontmatter）时 DB 链与文件加载链（SkillsLoader name=目录名）分裂 → 同技能双实体
+        //   （面板两条 / registry 真技能因 DB 无同名记录 id=null，DB enabled 覆盖补不到 id）。
+        //   改目录名后 rescan：新目录名无 DB 记录 → 插新行；旧名行残留由调用方处理（无则幽灵补缺）
+        String name = dir.getFileName().toString();
 
         CommandRecord existing = commandMapper.selectOneByQuery(
             QueryWrapper.create().eq("name", name));
@@ -440,8 +447,9 @@ public class CommandService {
     // ============== helpers: YAML frontmatter 解析（统一复用 ParseSkillFrontmatter） ==============
     // P0-6 跨模块统一：本类手写行解析（parseFrontmatter/parseBody/parseScalarValue）已删除，
     // 全部改经 {@link #frontmatterParser}（{@link ParseSkillFrontmatter} 真 YAML 解析器，
-    // 对齐 CC frontmatterParser.ts:130-175）。唯一残留差异：本 DB 链按 name upsert，
-    // frontmatter.name 优先（Java 存活链语义，CC name 恒=目录名）。
+    // 对齐 CC frontmatterParser.ts:130-175）。本 DB 链按 name upsert：name=目录名（[skill-db-name-dir]
+    // 对齐 CC loadSkillsDir.ts + SkillsLoader，不再 frontmatter.name 优先），SKILL.md frontmatter 的
+    // name 经 applyFrontmatter 存 displayName（可读中文展示名，userFacingName() 优先取用）。
 
     // ============== helpers: request → Command 映射 ==============
 

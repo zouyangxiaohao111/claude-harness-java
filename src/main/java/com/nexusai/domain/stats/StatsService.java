@@ -2,6 +2,9 @@ package com.nexusai.domain.stats;
 
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import org.slf4j.Logger;
@@ -29,7 +32,9 @@ import java.util.Map;
  *       {@code {date, tokenCount, costYuan}}，按日期升序。无 model_usage_json → token=0 但 costYuan 计入；
  *       无有效 created_at → 跳过 byDay（totals 仍计入）。</li>
  *   <li><b>byModel</b>：按 model_usage_json 模型 key 聚合，每项 {@code {model, inputTokens, outputTokens,
- *       cacheReadInputTokens, cacheCreationInputTokens, costUSD}}（costUSD = 各桶 costUSD 累加），
+ *       cacheReadInputTokens, cacheCreationInputTokens, costUSD, anthropic}}（costUSD = 各桶 costUSD
+ *       累加；<b>anthropic</b> = 该模型是否 Anthropic provider，前端据此对 total 求和分派——
+ *       deepseek（非 anthropic）input 已含 cache hit，只能 input+output，不能按 anthropic 4 项和），
  *       按 token（input+output）降序。</li>
  * </ol>
  *
@@ -47,15 +52,28 @@ public class StatsService {
     /** byDay 项：{date, tokenCount, costYuan}。 */
     public record DayStat(String date, long tokenCount, double costYuan) {}
 
-    /** byModel 项：{model, inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens, costUSD}。 */
+    /** byModel 项：{model, inputTokens, outputTokens, cacheReadInputTokens, cacheCreationInputTokens, costUSD, anthropic}。 */
     public record ModelStat(String model, long inputTokens, long outputTokens,
-                            long cacheReadInputTokens, long cacheCreationInputTokens, double costUSD) {}
+                            long cacheReadInputTokens, long cacheCreationInputTokens, double costUSD,
+                            boolean anthropic) {}
 
     /** 聚合结果：{totals, byDay, byModel}。 */
     public record StatsResult(Totals totals, List<DayStat> byDay, List<ModelStat> byModel) {}
 
     @Autowired
     private SessionMapper sessionMapper;
+
+    /**
+     * [A5-2] 模型/provider mapper · byModel 行 anthropic 标志判定（isAnthropic 原料 · 前端据此
+     * 对 total 求和分派：deepseek input 已含 cache hit，不能按 anthropic 4 项和）。仿
+     * {@link #sessionMapper} @Autowired 注入；未注入（测试/直构）→ isAnthropic null 回落 false →
+     * 行标志 anthropic=false（deepseek/openai 语义，前端按 input+output 分派，安全默认）。
+     */
+    @Autowired(required = false)
+    private ModelMapper modelMapper;
+
+    @Autowired(required = false)
+    private ProviderMapper providerMapper;
 
     /**
      * 聚合所有会话统计 · 数据流：sessions 全表 → 逐会话解析 model_usage_json + total_cost_yuan +
@@ -118,8 +136,12 @@ public class StatsService {
             a.getValue().inputTokens + a.getValue().outputTokens));
         for (Map.Entry<String, ModelAgg> en : modelEntries) {
             ModelAgg v = en.getValue();
+            // [A5-2] 每行带 anthropic 标志（前端据此分派 total 求和：anthropic=4 项和，
+            //   非 anthropic（deepseek input 已含 cache hit）= input+output）。mapper 不可得 →
+            //   isAnthropic false → 标志 false（deepseek/openai 语义，安全默认）。
+            boolean anthropic = ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, en.getKey());
             byModel.add(new ModelStat(en.getKey(), v.inputTokens, v.outputTokens,
-                v.cacheReadInputTokens, v.cacheCreationInputTokens, v.costUSD));
+                v.cacheReadInputTokens, v.cacheCreationInputTokens, v.costUSD, anthropic));
         }
 
         if (log.isDebugEnabled()) {

@@ -291,7 +291,9 @@ public final class PartialCompactConversation {
             }
 
             // ── 3. preCompactTokenCount（compact.ts:810）──
-            final int preCompactTokenCount = CompactConversation.tokenCountWithEstimation(allMessages);
+            // [A5-2] 求和 provider 分派：deepseek input 已含 cache hit → 按 ctx.model 判 anthropic
+            final int preCompactTokenCount = CompactConversation.tokenCountWithEstimation(
+                allMessages, CompactConversation.resolveAnthropic(ctx.getModel()));
 
             // ── 4. hooks_start: pre_compact + SDK 状态（compact.ts:812-817）──
             ctx.getOnCompactProgress().accept(new HooksStart(HookType.PRE_COMPACT));
@@ -461,7 +463,9 @@ public final class PartialCompactConversation {
             List<ChatMessageDto> hookMessages = CompactHooks.processSessionStartHooks(ctx);
 
             // ── 15. postCompactTokenCount + compactionUsage（compact.ts:985-988）──
-            int postCompactTokenCount = CompactConversation.tokenCountFromLastAPIResponse(summaryResult);
+            // [A5-2] 求和 provider 分派：摘要 API usage 按 ctx.model 判 anthropic（deepseek 仅 input+output）
+            int postCompactTokenCount = CompactConversation.tokenCountFromLastAPIResponse(
+                summaryResult, CompactConversation.resolveAnthropic(ctx.getModel()));
             CompactConversation.TokenUsage compactionUsage = summaryResult != null ? summaryResult.usage() : null;
 
             // ── 16. lastPreCompactUuid（compact.ts:1009-1013）──

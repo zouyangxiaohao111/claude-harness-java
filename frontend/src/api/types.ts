@@ -331,6 +331,8 @@ export interface AppSettings {
   fontSize: 'small' | 'medium' | 'large' | null  // 后端 FontSize 枚举
   accent: string | null
   animationsEnabled: boolean | null
+  /** 界面/AI 回复语言（后端 settings.language 列 · 存语言显示名如「中文」或特殊值 auto=按本机时区自动解析） */
+  language?: string | null
   // 0.4.0 契约：settings 存模型全名 providerName/modelName（V28 RENAME *_model_id → *_model_name）
   mainModelName: string | null
   fastModelName: string | null
@@ -500,6 +502,8 @@ export interface SessionDto {
   bareMode: boolean | null
   /** 会话级权限模式覆盖（null = 未覆盖，回落全局 settings.permissionMode） */
   permissionMode?: PermissionMode | null
+  /** V58 main_thread_agent · 会话级主线程 agent（专家）· 整轮对话由指定 agent 驱动；null/空串 = 默认模式 */
+  mainThreadAgent?: string | null
   messageCount: number | null
   createdAt?: string
   updatedAt?: string
@@ -527,6 +531,10 @@ export interface StatsByModel {
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
   costUSD: number
+  /** 该模型是否 Anthropic provider（后端 ContextUsageCalculator.isAnthropic 判定）·
+   *  true=total 按 4 项和（input 不含 cache hit）；false（deepseek input 已含 cache hit）= 仅 input+output，
+   *  4 项和会双计 cache */
+  anthropic: boolean
 }
 /** 全量总览（后端 StatsController totals · 全会话聚合） */
 export interface StatsTotals {
@@ -616,7 +624,88 @@ export interface CreateTeamRequest {
   sessionId?: string
 }
 export interface SessionCreateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string }
-export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode }
+/** 会话更新（PATCH /sessions/{id} · null=不改动，mainThreadAgent 空串=清除） */
+export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null }
+/** GET /agents/list?sessionId={sid} 单条（后端 AgentListDto · agentType 专家列表） */
+export interface AgentListItem {
+  agentType: string
+  whenToUse: string
+  source: string
+  model?: string | null
+  memory?: string | null
+  tools?: string[] | null
+  color?: string | null
+}
+
+// ---- 技能市场（GET/POST /api/market/* · 后端 MarketController 代理腾讯 workbuddy 市场 · remote=true 表示远端市场项）----
+/** GET /api/market/expert?page&page_size 单条（后端 MarketExpertDto · 远端专家）
+ *  字段对齐：marketId=市场源侧唯一 id；useCount 原始数字 / useCountDisplay 展示用文案（如「12.6万次使用」）。 */
+export interface MarketExpert {
+  /** 市场源侧唯一 id（POST use 路径段用） */
+  marketId: string
+  /** 专家 agentType（use 后端构造成本地 agent 后写入会话 mainThreadAgent 的值） */
+  agentName?: string | null
+  /** 展示名（卡片标题） */
+  displayName?: string | null
+  /** 头像/图标 URL（有则图，无则色块兜底） */
+  icon?: string | null
+  /** 专业领域/岗位（如「资深后端工程师」） */
+  profession?: string | null
+  /** 一句话介绍（卡片描述 2 行截断） */
+  description?: string | null
+  /** 标签（卡片底部 chips） */
+  tags?: string[] | null
+  /** 技能分类（聚合分类胶囊用） */
+  categories?: string[] | null
+  /** 使用次数原始值（展示用 useCountDisplay，排序可用它） */
+  useCount?: number | null
+  /** 展示用使用量文案（如「12.6万次使用」） */
+  useCountDisplay?: string | null
+  /** 是否已内置预装（远端列表也标「已安装」） */
+  preinstalled?: boolean | null
+  /** 是否精选/推荐置顶 */
+  featured?: boolean | null
+  /** 远端来源标识 */
+  remote?: boolean
+}
+/** GET /api/market/skill 单条（后端 MarketSkillDto · 远端技能） */
+export interface MarketSkill {
+  marketId: string
+  /** 技能命令名（如 todo-write） */
+  name?: string | null
+  displayName?: string | null
+  icon?: string | null
+  description?: string | null
+  /** 技能分类（聚合「全部」胶囊过滤用） */
+  categories?: string[] | null
+  /** 使用示例（description 下方的示例短语，骨架未用可后续展示） */
+  examples?: string[] | null
+  /** 是否已内置预装 */
+  preinstalled?: boolean | null
+  remote?: boolean
+}
+/** GET /api/market/connector 单条（后端 MarketConnectorDto · 远端连接器） */
+export interface MarketConnector {
+  marketId: string
+  /** 连接器名（如「Notion」「GitHub」） */
+  name?: string | null
+  /** 权限范围说明（description 合成用） */
+  scope?: string | null
+  /** 状态（如 available/installed） */
+  status?: string | null
+  /** 鉴权类型（如 OAuth2 / API Key） */
+  authType?: string | null
+  /** 是否已连接（「已安装」判定） */
+  isConnected?: boolean | null
+  remote?: boolean
+}
+/** POST /api/market/expert/{marketId}/use 响应（后端已构造本地 agent + 设会话 mainThreadAgent） */
+export interface MarketUseExpertResult {
+  /** 会话新主线程 agent（本地 expert agentType） */
+  mainThreadAgent: string
+  /** 展示名（toast「已使用 X 驱动会话」） */
+  displayName?: string | null
+}
 
 // ---- Todo 清单（TodoWrite 工具 · GET /sessions/{id}/todos + STOMP /topic/sessions/{sessionId}/todos）----
 /** Todo 状态（对齐后端 TodoItem.status） */
@@ -770,8 +859,9 @@ export interface ChatMessageDto {
   microcompactMetadata?: CompactBoundaryMetadata | null
   /** 边界消息元数据（role=system + subtype=snip_boundary 携带 · snip 裁剪分界线识别展示用） */
   snipMetadata?: SnipBoundaryMetadata | null
-  /** 前端乐观追加的用户附件快照（发送时 PDF/file 等 · user 气泡显示文件名 chip；DB 重拉后端不出站该字段） */
-  userAttachments?: { type: string; filename: string; mediaType?: string | null; contentId?: string | null; url?: string | null }[] | null
+  /** 用户附件（PDF/Word/视频/音频/文件 · user 气泡内联胶囊展示 · 点击预览）。
+   *  乐观追加带 base64（≤5MB 即时预览）/ path（local-read 大文件本地读）；F5 重拉后端出站 url（内容端点）+ contentId */
+  userAttachments?: { type: string; filename: string; mediaType?: string | null; contentId?: string | null; url?: string | null; base64?: string | null; path?: string | null }[] | null
 }
 /** 附件契约（attachment-multimodal）：结构化附件。图片 base64 直传；大 PDF 先 upload 拿 contentId；
  *  local-read 模式（前后端同机）大文件传本地 path 由后端读盘，与 base64/contentId 三选一 */
@@ -800,7 +890,7 @@ export interface PartialCompactResponse { messages: ChatMessageDto[]; conversati
 
 // ---- STOMP 事件全集（基类 type/sessionId/userMessageId/ts） ----
 export type StreamEventType =
-  | 'message.chunk' | 'message.complete' | 'message.error' | 'message.cancelled' | 'message.user'
+  | 'message.chunk' | 'message.complete' | 'message.usage' | 'message.error' | 'message.cancelled' | 'message.user'
   | 'message.tool_call' | 'message.tool_result'   // 占位不发，仅类型占位
   | 'message.boundary'                             // [snip-persist] Snip 裁剪边界（removedUuids → 消息「已裁剪」角标）
   | 'session.status' | 'session.title'
@@ -892,6 +982,19 @@ export interface MessageCompleteEvent extends StreamEventBase {
   duration_ms?: number | null
   /** 本轮轮数 */
   num_turns?: number | null
+  /** 模型上下文窗口（tokens · 回落 1M） */
+  contextWindow?: number | null
+  /** 上下文已用（input + cache_read + cache_creation · 不含 output） */
+  contextTokensUsed?: number | null
+  /** 上下文剩余百分比（0-100 · 无 usage 时省略 · 负数 clamp 0） */
+  percentLeft?: number | null
+}
+/** 消息级 usage 快照事件（后端每条 assistant 流式结束推 · 消息级完成、非 turn 终态）。
+ *  携带该条 usage + 上下文快照 → 前端实时更新缓存%/上下文条；不得当 turn 终态退订（退订只在 message.complete）。 */
+export interface MessageUsageEvent extends StreamEventBase {
+  type: 'message.usage'
+  assistantMessageId?: string | null
+  usage?: MessageUsageDto | null
   /** 模型上下文窗口（tokens · 回落 1M） */
   contextWindow?: number | null
   /** 上下文已用（input + cache_read + cache_creation · 不含 output） */
@@ -1000,7 +1103,7 @@ export interface ApiRetryEvent extends StreamEventBase {
   uuid?: string | null
 }
 export type StreamEvent =
-  | MessageChunkEvent | MessageCompleteEvent | MessageErrorEvent | MessageCancelledEvent
+  | MessageChunkEvent | MessageCompleteEvent | MessageUsageEvent | MessageErrorEvent | MessageCancelledEvent
   | MessageToolCallEvent | MessageToolResultEvent
   | SessionStatusEvent | SessionTitleEvent | PermissionRequestEvent | ApiRetryEvent | TokenWarningEvent
   | QueueChangedEvent | QueueDrainedEvent

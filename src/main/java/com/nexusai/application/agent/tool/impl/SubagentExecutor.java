@@ -55,6 +55,7 @@ import com.nexusai.model.command.Command;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.StreamingToolExecutor;
 import com.nexusai.application.agent.tool.AgentToolResult;
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.tool.AgentToolUtils;
 import com.nexusai.application.agent.tool.ContentReplacementState;
 import com.nexusai.application.agent.tool.AgentUsage;
@@ -69,6 +70,8 @@ import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProvider.ChatRequestOptions.ThinkingConfig;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
@@ -335,6 +338,33 @@ public class SubagentExecutor {
      * 默认 true (对齐 LlmAgentLoop @Value 默认), 关闭时 PermissionDenied retry hook 早返.
      */
     private volatile boolean transcriptClassifierEnabled = true;
+
+    /**
+     * [A5-2] 模型/provider mapper · 求和 provider 分派（isAnthropic）原料 · 子 Agent 预算
+     * totalTokens 按 effectiveModel 判 anthropic（deepseek input 已含 cache hit → 4 项和双计
+     * over-count）。由装配方（SubagentTool / ToolRegistrationConfig）经 {@link #setModelMapper}/
+     * {@link #setProviderMapper} 注入；null = 未接线 → 回落 anthropic 语义（既有 4 项和，无行为变化）。
+     */
+    private volatile ModelMapper modelMapper;
+    private volatile ProviderMapper providerMapper;
+
+    /**
+     * 注入模型 mapper（A5-2 · null 注入 = 复位回落 anthropic 语义）。
+     *
+     * @param modelMapper 模型 mapper（可 null）
+     */
+    public void setModelMapper(ModelMapper modelMapper) {
+        this.modelMapper = modelMapper;
+    }
+
+    /**
+     * 注入提供商 mapper（A5-2 · null 注入 = 复位回落 anthropic 语义）。
+     *
+     * @param providerMapper 提供商 mapper（可 null）
+     */
+    public void setProviderMapper(ProviderMapper providerMapper) {
+        this.providerMapper = providerMapper;
+    }
 
     /**
      * [IMP-SUB-25 D-3] handoff 安全分类器 · 对齐 CC agentToolUtils.ts:389-481
@@ -4234,7 +4264,12 @@ public class SubagentExecutor {
                 String fallbackText = extractConclusionFromMessages(state.messages());
                 // [S4] 异常路径 usage 兜底: 从已累积的 state.messages() 提取 (可能含已产出的 assistant 消息)
                 AgentUsage fallbackUsage = extractUsageFromMessages(state.messages());
-                long fallbackTokens = extractTotalTokens(state.messages());
+                // [A5-2] 子 Agent 预算求和分派：按 effectiveModel 判 anthropic（deepseek input 已含
+                //   cache hit，4 项和双计 over-count）。mapper 不可得 → 回落 anthropic 语义。
+                boolean fallbackAnthropic = (modelMapper != null && providerMapper != null)
+                    ? ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, effectiveModel)
+                    : true;
+                long fallbackTokens = extractTotalTokens(state.messages(), fallbackAnthropic);
                 // [R-A2] A-2 异常 catch 路径 totalToolUseCount 真实计数 · 对齐 CC agentToolUtils.ts:262-274
                 //   countToolUses —— queryLoop 异常时 state.messages() 可能已累积部分 assistant 消息
                 //   （已产出的 tool_use 块），原两分支硬编码 0 会让父 Agent 在异常场景系统性低估子
@@ -4286,7 +4321,12 @@ public class SubagentExecutor {
             int totalTurns = result.totalTurns();
             // [S4 P1 差异项 2] usage/totalTokens 从末尾 assistant 消息提取 (对齐 CC agentToolUtils.ts:319/355)
             AgentUsage usage = extractUsageFromMessages(summarySource);
-            long totalTokens = extractTotalTokens(summarySource);
+            // [A5-2] 子 Agent 预算求和分派：按 effectiveModel 判 anthropic（deepseek input 已含
+            //   cache hit，4 项和双计 over-count）。mapper 不可得 → 回落 anthropic 语义。
+            boolean anthropic = (modelMapper != null && providerMapper != null)
+                ? ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, effectiveModel)
+                : true;
+            long totalTokens = extractTotalTokens(summarySource, anthropic);
     
             log.info("[SubagentExecutor] [H7-arch Phase 2] queryLoop 完成: agentId={} turns={} toolUseCount={} msgs={} aborted={} totalTokens={}",
                     agentId, totalTurns, totalToolUseCount,
@@ -4653,12 +4693,27 @@ public class SubagentExecutor {
      * {@code input + (cache_creation ?? 0) + (cache_read ?? 0) + output} · finalizeAgentTool
      * (agentToolUtils.ts:319) 同公式.
      *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义（4 项和，CC 原生）——保持既有测试/seam 兼容；
+     * 子 Agent 预算分派请用 {@link #extractTotalTokens(List, boolean)} 传 isAnthropic
+     * （由调用点按 effectiveModel 判，deepseek input 已含 cache hit → 4 项和双计 over-count）。
+     *
      * @param messages 子 Agent 完整消息历史
      * @return 末尾 assistant 消息的 4 token 字段之和 (无 assistant → 0)
      */
     static long extractTotalTokens(List<ChatMessageDto> messages) {
+        return extractTotalTokens(messages, true);
+    }
+
+    /**
+     * 计算总 token 数 · 协议分派重载（A5-2 · deepseek 双计修复）。
+     *
+     * @param messages  子 Agent 完整消息历史
+     * @param anthropic 协议判定：true=4 项和；false=仅 input+output（子 Agent 预算口径）
+     * @return 末尾 assistant 消息的 token 之和 (无 assistant → 0)
+     */
+    static long extractTotalTokens(List<ChatMessageDto> messages, boolean anthropic) {
         AgentUsage usage = extractUsageFromMessages(messages);
-        return usage.totalTokens();
+        return usage.totalTokens(anthropic);
     }
 
     /**

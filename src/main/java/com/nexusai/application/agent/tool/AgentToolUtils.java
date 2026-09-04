@@ -47,8 +47,13 @@ public final class AgentToolUtils {
         Set.copyOf(ToolNameConstants.ALL_AGENT_DISALLOWED_TOOLS);
 
     /**
-     * CC constants/tools.ts:55-71 · async agent 白名单 (16 项).
+     * CC constants/tools.ts:55-71 · async agent 白名单 (17 项).
      * <p>注: CC SHELL_TOOL_NAMES 含 Bash+PowerShell, Java 端对应 ToolNameConstants.
+     * <p>[PDF 分页子代理修复] vision_analyze 补进 async 白名单：CC 异步 worker 承担"读图/PDF"
+     *   靠 Read（在列）；Java 文本模型（deepseek）看 PDF 页图/附件图靠 vision_analyze 代理视觉
+     *   模型——不加则 fork 异步子代理（>20 页 PDF NEEDS_SUBAGENT 分页）注册表剔除 vision_analyze →
+     *   dispatch/schema 均无 → No such tool。isReadOnly + isConcurrencySafe（VisionAnalyzeTool）
+     *   → 异步 worker 使用安全。
      */
     public static final Set<String> ASYNC_AGENT_ALLOWED_TOOLS = Set.of(
         ToolNameConstants.FILE_READ_TOOL_NAME,          // Read
@@ -66,7 +71,8 @@ public final class AgentToolUtils {
         ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME,   // SyntheticOutput
         ToolNameConstants.TOOL_SEARCH_TOOL_NAME,        // ToolSearch
         ToolNameConstants.ENTER_WORKTREE_TOOL_NAME,     // EnterWorktree
-        ToolNameConstants.EXIT_WORKTREE_TOOL_NAME       // ExitWorktree
+        ToolNameConstants.EXIT_WORKTREE_TOOL_NAME,      // ExitWorktree
+        ToolNameConstants.VISION_ANALYZE_TOOL_NAME      // vision_analyze（代理视觉模型读图/PDF 页）
     );
 
     /**

@@ -38,16 +38,22 @@ export function AsyncTasksPanel({ activeSessionId, showToast }: {
         // [subagent-restore 2026-08-25] REST 兜底补录：STOMP /topic/tasks 不重放历史事件，子代理
         //   task_started 若在 STOMP 断连/未订阅窗口被 drain 即丢失 → subagentStore 空 → 「子代理运行
         //   状况」区不显示。此处从 REST 同源（BackgroundTaskRunner 持久 task store）对 type=local_agent
-        //   且 store 未登记的任务补录 register —— 4s 轮询恢复子代理卡片，STOMP 丢失不再留白。
+        //   任务补录 —— 2s 轮询恢复子代理卡片，STOMP 丢失不再留白。
         for (const t of list ?? []) {
           if (t.type !== 'local_agent') continue
           const st = useSubagentStore.getState()
           const existing = st.bySession[activeSessionId]?.[t.id]
-          if (existing) continue
-          // taskId 作 key（register 第 2 参；toolUseId null 与 STOMP 事件同构）。description 兜底 task_type。
-          st.register(null, t.id, t.description || t.type, t.type, activeSessionId)
-          // 按 REST 状态初始化三态（completed→done · failed/killed→stopped）：STOMP 不重放终态，
-          //   补录后若不补终态活动，子代理恒显示「运行中」（常驻三态下虚高）
+          // 已终态（STOMP 事件已登记 done/failed/stopped）→ 无需再补，跳过
+          if (existing && existing.status !== 'running') continue
+          // 未登记（STOMP 断连/未订阅窗口丢失 task_started）→ 先 register 恢复卡片；
+          //   已登记但仍是 running（终态事件在断连窗口丢失）→ 复用既有身份，不重复 register
+          if (!existing) {
+            // taskId 作 key（register 第 2 参；toolUseId null 与 STOMP 事件同构）。description 兜底 task_type。
+            st.register(null, t.id, t.description || t.type, t.type, activeSessionId)
+          }
+          // REST 终态权威补录：身份刚 register 或仍为陈旧 running，只要 REST 显示终态就补终态活动
+          //   （completed→done · failed/killed→stopped）——否则 localStorage 持久化的 running 会
+          //   跨会话/跨天永久虚高（终态事件丢失后 addActivity(done) 永不执行）。
           if (t.status === 'completed') {
             st.addActivity(t.id, { type: 'done', text: t.status, ts: Date.now() }, activeSessionId)
           } else if (t.status === 'failed' || t.status === 'killed') {

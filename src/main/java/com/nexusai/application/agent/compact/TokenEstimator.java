@@ -118,6 +118,10 @@ public class TokenEstimator {
      * estimateMessageTokens 双用途（D-18），blocking 改走 usage-walk + IMP-06 统一窗口
      * （computeBlockingLimit）。
      *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义（4 项和）；deepseek 等 openai_compatible 调用点请用
+     * {@link #tokenCountWithEstimation(List, boolean)} 传 isAnthropic（本 bean 无模型上下文，
+     * anthropic 由调用点按 effectiveModel 判定注入）。
+     *
      * @param messages 组装后请求消息列表（CC messagesForQuery）
      * @return 上下文窗口 token 估算（≥ 0）
      */
@@ -126,14 +130,39 @@ public class TokenEstimator {
     }
 
     /**
+     * 当前上下文窗口 token 估算 · 协议分派重载（A5-2 · deepseek 双计修复）。
+     *
+     * @param messages  组装后请求消息列表
+     * @param anthropic 协议判定：true=4 项和；false=仅 input+output
+     * @return 上下文窗口 token 估算（≥ 0）
+     */
+    public int tokenCountWithEstimation(List<ChatMessageDto> messages, boolean anthropic) {
+        return Tokens.tokenCountWithEstimation(messages, anthropic);
+    }
+
+    /**
      * 最后一次 API 响应总 token（compaction API 用量 = postCompactTokenCount）· 对齐 CC
      * {@code tokenCountFromLastAPIResponse}（utils/tokens.ts:55-66）。
+     *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义；deepseek 调用点请用
+     * {@link #tokenCountFromLastAPIResponse(List, boolean)} 传 isAnthropic。
      *
      * @param messages 消息列表
      * @return 最近 API 响应 token 数（含 cache；无 usage → 0）
      */
     public int tokenCountFromLastAPIResponse(List<ChatMessageDto> messages) {
         return Tokens.tokenCountFromLastAPIResponse(messages);
+    }
+
+    /**
+     * 最后一次 API 响应总 token · 协议分派重载（A5-2 · deepseek 双计修复）。
+     *
+     * @param messages  消息列表
+     * @param anthropic 协议判定：true=4 项和；false=仅 input+output
+     * @return 最近 API 响应 token 数（无 usage → 0）
+     */
+    public int tokenCountFromLastAPIResponse(List<ChatMessageDto> messages, boolean anthropic) {
+        return Tokens.tokenCountFromLastAPIResponse(messages, anthropic);
     }
 
     /**

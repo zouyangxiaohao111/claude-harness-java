@@ -2,11 +2,18 @@ import { useEffect, useState } from 'react'
 import { useChatStore } from '@/stores/chatStore'
 import { sessionApi } from '@/api/sessions'
 import { statsApi } from '@/api/stats'
-import type { ChatMessageDto, StatsResponse } from '@/api/types'
+import type { ChatMessageDto, StatsByModel, StatsResponse } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 
 /** 千位以上紧凑显示（按模型明细/上下文条用 · 对齐 ContextAnalyzeModal fmt） */
 const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+
+/** byModel 行 token 总计 · 按 provider 分派（后端 byModel 每行 anthropic 标志）：
+ *  anthropic（claude）4 项和（input 不含 cache hit）；deepseek（openai 协议）input 已含 cache hit，
+ *  只能 input+output，4 项和会双计 cache。 */
+const modelRowTotal = (r: StatsByModel) => r.anthropic
+  ? r.inputTokens + r.outputTokens + r.cacheReadInputTokens + r.cacheCreationInputTokens
+  : r.inputTokens + r.outputTokens
 
 /** 稳定空数组（避免 selector `?? []` 每次返回新引用触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
@@ -54,7 +61,7 @@ function StatsSection() {
 
   const { totals, byDay, byModel } = data
   const maxDayTokens = byDay.reduce((m, d) => Math.max(m, d.tokenCount), 0)
-  const maxModelTokens = byModel.reduce((m, r) => Math.max(m, r.inputTokens + r.outputTokens + r.cacheReadInputTokens + r.cacheCreationInputTokens), 0)
+  const maxModelTokens = byModel.reduce((m, r) => Math.max(m, modelRowTotal(r)), 0)
 
   return (
     <div className="uc-stats">
@@ -97,7 +104,7 @@ function StatsSection() {
         <div className="uc-section-title">按模型</div>
         {byModel.length === 0 && <div className="uc-muted">暂无数据</div>}
         {byModel.map((r) => {
-          const total = r.inputTokens + r.outputTokens + r.cacheReadInputTokens + r.cacheCreationInputTokens
+          const total = modelRowTotal(r)
           return (
             <div key={r.model} className="uc-stats-model">
               <div className="uc-stats-bar-row">

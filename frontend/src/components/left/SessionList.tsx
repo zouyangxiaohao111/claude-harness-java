@@ -32,6 +32,10 @@ interface SessionListProps {
   projectNameFor?: (projectId: string | null) => string
   onCreateInProject?: (projectId: string | null) => void
   onCreateSession?: () => void
+  /** 点击左栏「技能市场」入口 → 打开技能市场弹窗（App 持有 showMarket state） */
+  onOpenAgentMarket?: () => void
+  /** 点击左栏「知识库」入口 → 打开知识库/记忆（App 处理，暂占位） */
+  onOpenKnowledgeBase?: () => void
   /** 添加工作区（新项目工作组 · App 用本地文件夹选择注册，可添加多个） */
   onAddWorkspace?: () => void
   onOpenSettings?: () => void
@@ -39,8 +43,10 @@ interface SessionListProps {
   onDeleteSession?: (id: string) => void
   /** 运行中会话 id 集合（有 stream = 运行中 · 蓝点 ongoing） */
   runningSessionIds?: Set<string>
-  /** 等待权限/提问的会话 id 集合（permissionQueue 中 · 黄点 warning，优先于运行点） */
+  /** 等待权限/提问的会话 id 集合（permissionQueue 中 · 橙红闪烁，优先于运行点） */
   pendingSessionIds?: Set<string>
+  /** 运行完成且未读的会话 id 集合（静止绿点 · 切到该会话即清除） */
+  doneUnreadIds?: Set<string>
   /** 重命名会话（App 调 sessionApi.update + 本地同步） */
   onRenameSession?: (id: string, title: string) => void
 }
@@ -61,7 +67,7 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
-export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds }: SessionListProps) {
+export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase }: SessionListProps) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   // 会话操作菜单：menuId（打开的菜单）+ renameId/renameDraft（重命名输入）
   const [menuId, setMenuId] = useState<string | null>(null)
@@ -90,6 +96,17 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
       <button className="new-session-btn" onClick={() => onCreateSession?.()} title="新建会话">
         + 新会话
       </button>
+      {/* 左栏入口：技能市场 / 知识库（透明胶囊 · hover 浮现 · 点开各自面板） */}
+      <div className="left-entry" onClick={() => onOpenAgentMarket?.()} title="打开技能市场">
+        <svg className="ent-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}><circle cx="12" cy="10" r="3.4" /><path d="M4.5 20c.9-3 4-4.4 7.5-4.4s6.6 1.4 7.5 4.4" /></svg>
+        <span className="ent-t">技能市场</span>
+        <span className="ent-arr">›</span>
+      </div>
+      <div className="left-entry" onClick={() => onOpenKnowledgeBase?.()} title="打开知识库">
+        <svg className="ent-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}><ellipse cx="12" cy="5.5" rx="7" ry="3" /><path d="M5 5.5v13c0 1.7 3.1 3 7 3s7-1.3 7-3v-13" /><path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3" /></svg>
+        <span className="ent-t">知识库</span>
+        <span className="ent-arr">›</span>
+      </div>
       {/* 工作区标签 + 添加工作区按钮（hover tooltip · 设计稿 v7） */}
       <div className="workspace-label">
         <span className="label">工作区</span>
@@ -133,12 +150,15 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
                 onClick={() => switchSession(s.id)}
               >
                 {/* 对齐 Harness sessionStatuses：等待权限（黄）优先于运行中（蓝） */}
-                {(runningSessionIds?.has(s.id) || pendingSessionIds?.has(s.id)) && (
-                  <span
-                    className={`status-dot ${pendingSessionIds?.has(s.id) ? 'pending' : 'running'}`}
-                    title={pendingSessionIds?.has(s.id) ? '等待权限/回答' : '运行中'}
-                  />
-                )}
+                {(() => {
+                  const pend = pendingSessionIds?.has(s.id)
+                  const run = runningSessionIds?.has(s.id)
+                  const dn = doneUnreadIds?.has(s.id)
+                  if (!pend && !run && !dn) return null
+                  const cls = pend ? 'pending' : run ? 'running' : 'done'
+                  const tip = pend ? '等待权限/回答（点开会话处理）' : run ? '运行中' : '已完成 · 未读'
+                  return <span className={`status-dot ${cls}`} title={tip} />
+                })()}
                 {renameId === s.id ? (
                   <input
                     className="session-rename-input"

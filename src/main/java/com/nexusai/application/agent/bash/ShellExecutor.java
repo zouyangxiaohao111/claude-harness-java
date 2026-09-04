@@ -2,6 +2,7 @@ package com.nexusai.application.agent.bash;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.MemoryFileDetection;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tasks.ProcessTreeKiller;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -182,8 +183,9 @@ public final class ShellExecutor {
         String claudeCodeTmpdir = System.getenv("CLAUDE_CODE_TMPDIR");
         String base = (claudeCodeTmpdir != null && !claudeCodeTmpdir.isBlank())
             ? claudeCodeTmpdir : "/tmp";
-        // getClaudeTempDirName 等价：claude-{uid}（CC claudeTempDirName.ts / shell.ts getClaudeTempDirName）
-        String tmpName = "claude-" + (System.getProperty("user.name", "unknown"));
+        // getClaudeTempDirName 等价 → NexusaiPaths.getAppTempDirName()（CC claudeTempDirName.ts /
+        //   shell.ts getClaudeTempDirName；per-user 层品牌名 = appName 自有，单出口收敛）
+        String tmpName = NexusaiPaths.getAppTempDirName();
         String sandboxTmpDir = base.endsWith("/") ? base + tmpName : base + "/" + tmpName;
         // G5-10 返工：宿主侧 mkdir 0o700（CC Shell.ts:267-272）——先建目录再注入 env，防写 TMPDIR ENOENT
         createSandboxTmpDir(sandboxTmpDir);
@@ -351,17 +353,15 @@ public final class ShellExecutor {
      * @param command bash 命令（BashTool 传 wrapForCwdTracking 包装后的 wrappedCommand；后台任务
      *                传原始 command——后台不跟踪 cwd）
      * @param cwd     工作目录（会话 cwd；null/blank → 不设置 directory）
-     * @return 配置完成的 ProcessBuilder（[bashPath, "-c", command]，env 已注入，directory 已设）
+     * @return 配置完成的 ProcessBuilder（默认 argv=[bashPath, "-c", command]；Windows 且命令含 {@code "}
+     *         时写临时 .sh 走 {@code bash <脚本文件>}（Windows 引号安全 方案A），env 已注入，directory 已设）
      * @throws IllegalStateException 无可用 Posix shell（CC 同款显式错误，fail-loud）
      */
     public static ProcessBuilder bash(String command, String cwd) {
-        String bashPath = resolveShell();
-        ProcessBuilder pb = new ProcessBuilder(bashPath, "-c", command);
-        applyExecEnv(pb, bashPath);
-        if (cwd != null && !cwd.isBlank()) {
-            pb.directory(new File(cwd));
-        }
-        return pb;
+        // [Windows 引号安全 2026-09-03 方案A] 统一委托 bashProcessBuilder（单一判定：Windows 含 " 走脚本文件）。
+        // skipLogin=true：2 参为既有兼容入口（bashMerged/executeTimed 未接快照），历史语义「无 -l 保持旧行为」
+        // （javadoc + ShellExecutorTest.bash_* 断言 argv=[bash,-c,cmd]）——不因统一而给该路径加 -l。
+        return bashProcessBuilder(command, cwd, true);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -494,21 +494,9 @@ public final class ShellExecutor {
      * @return 配置完成的 ProcessBuilder（env 已注入，directory 已设）
      */
     public static ProcessBuilder bash(String command, String cwd, Path snapshotPath) {
-        String bashPath = resolveShell();
-        List<String> args = new ArrayList<>();
-        args.add(bashPath);
-        args.add("-c");
-        boolean skipLoginShell = snapshotPath != null;
-        if (!skipLoginShell) {
-            args.add("-l");
-        }
-        args.add(command);
-        ProcessBuilder pb = new ProcessBuilder(args);
-        applyExecEnv(pb, bashPath);
-        if (cwd != null && !cwd.isBlank()) {
-            pb.directory(new File(cwd));
-        }
-        return pb;
+        // [Windows 引号安全 2026-09-03 方案A] 统一委托 bashProcessBuilder；快照存在 → 跳过 -l（语义不变，
+        //   对齐 CC getSpawnArgs bashProvider.ts:200-206）。
+        return bashProcessBuilder(command, cwd, snapshotPath != null);
     }
 
     /**
@@ -525,6 +513,62 @@ public final class ShellExecutor {
         ProcessBuilder pb = bash(command, cwd);
         pb.redirectErrorStream(true);
         return pb;
+    }
+
+    /**
+     * [Windows 引号安全 2026-09-03 方案A] 统一构造 bash ProcessBuilder · 三个 bash() 入口的单一内部核心。
+     *
+     * <p>Java {@code ProcessBuilder} 在 Windows 构造命令行时恒按 CRT 规则转义 argv（含 {@code "} → {@code \"}），
+     * 与 MSYS/Git Bash 的 argv 还原不兼容 → 含 {@code "} 的命令串被截断（python -c "..." 丢参挂起 120s 事故，
+     * 探针实证 bash 还原只剩第一个词）。修复：Windows 且命令含 {@code "} 时写临时 {@code .sh} 脚本文件，
+     * 改 {@code bash <脚本文件>} 执行（argv 只剩路径零引号转义，命令内容直达 bash = CC/Node spawn verbatim 效果）。
+     * 非 Windows（POSIX execve argv 数组，无命令行转义问题）不触发。脚本文件不主动删（系统 TEMP，OS 清理；
+     * ProcessBuilder 不 start 无法知生命周期，小文件累积可接受，后续可优化）。写脚本失败降级 {@code -c}（原行为，
+     * fail-loud 由下游执行报错）。
+     *
+     * @param command    bash 命令（BashTool 传 wrapForExec/wrapForCwdTracking 包装后的 wrappedCommand）
+     * @param cwd        工作目录（null/blank → 不设置 directory）
+     * @param skipLogin  true = 跳过 {@code -l}：3 参快照存在（snapshotPath != null）或 2 参既有兼容入口
+     *                   （历史语义无 -l）；false = 加 {@code -l}（3 参无快照回退 login shell，
+     *                   对齐 CC getSpawnArgs bashProvider.ts:200-206）
+     * @return 配置完成的 ProcessBuilder（env 已注入，directory 已设）
+     */
+    private static ProcessBuilder bashProcessBuilder(String command, String cwd, boolean skipLogin) {
+        String bashPath = resolveShell();
+        List<String> args = new ArrayList<>();
+        args.add(bashPath);
+        if (!skipLogin) {
+            args.add("-l");
+        }
+        Path scriptFile = null;
+        if (IS_WINDOWS && command != null && command.contains("\"")) {
+            try {
+                scriptFile = writeBashScript(command);
+                args.add(scriptFile.toString());
+            } catch (Exception e) {
+                scriptFile = null;   // 写脚本失败降级 -c（原行为，fail-loud 由下游执行报错）
+                if (log.isDebugEnabled()) {
+                    log.debug("ShellExecutor.bash: 写临时 bash 脚本失败，降级 -c: {}", e.toString());
+                }
+            }
+        }
+        if (scriptFile == null) {
+            args.add("-c");
+            args.add(command);
+        }
+        ProcessBuilder pb = new ProcessBuilder(args);
+        applyExecEnv(pb, bashPath);
+        if (cwd != null && !cwd.isBlank()) {
+            pb.directory(new File(cwd));
+        }
+        return pb;
+    }
+
+    /** [Windows 引号安全 方案A] 写 bash 脚本临时文件（LF 行尾——CRLF 会破坏 bash 脚本解析）。 */
+    private static Path writeBashScript(String command) throws IOException {
+        Path f = Files.createTempFile("nexusai-bash-", ".sh");
+        Files.writeString(f, command.replace("\r\n", "\n"), StandardCharsets.UTF_8);
+        return f;
     }
 
     /**

@@ -1,8 +1,9 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import type { FontSize, ModelInfo, SettingsTab, ThemeMode } from '@/types'
 import { settingsApi } from '@/api/settings'
 import { ApiError } from '@/api/rest'
 import type { UpdateSettingsRequest } from '@/api/types'
+import { LanguagePickerModal, languageDisplayName } from './LanguagePickerModal'
 import { ProvidersPanel } from './ProvidersPanel'
 import { SkillsPanel } from './SkillsPanel'
 import { MCPPanel } from './MCPPanel'
@@ -130,7 +131,11 @@ export function SettingsModal({
     })
   }
 
+  // 语言选择弹窗开关（通用 tab「语言」行 · 选中即 onSaveSettings 写回 settings.language）
+  const [langOpen, setLangOpen] = useState(false)
+
   return (
+    <>
     <div className="settings-backdrop" onClick={close}>
       <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
         <div className="settings-header">
@@ -179,6 +184,18 @@ export function SettingsModal({
                       </button>
                     ))}
                   </div>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">语言</div>
+                    <div className="settings-row-desc">界面与 AI 回复语言 · 自动 = 按系统时区选择</div>
+                  </div>
+                  <button className="lang-pill" onClick={() => setLangOpen(true)} title="点击选择语言">
+                    <span className="lang-pill-value">{languageDisplayName(appSettings?.language)}</span>
+                    <svg className="lang-pill-chevron" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2" style={{ width: 12, height: 12 }}>
+                      <path d="M2 4L6 8L10 4" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  </button>
                 </div>
                 <div className="settings-row">
                   <div>
@@ -290,6 +307,17 @@ export function SettingsModal({
         </div>
       </div>
     </div>
+    {langOpen && (
+      <LanguagePickerModal
+        value={appSettings?.language ?? null}
+        onPick={(v) => {
+          setLangOpen(false)
+          void onSaveSettings({ language: v })
+        }}
+        onClose={() => setLangOpen(false)}
+      />
+    )}
+    </>
   )
 }
 

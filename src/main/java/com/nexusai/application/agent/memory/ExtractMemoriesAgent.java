@@ -3,6 +3,7 @@ package com.nexusai.application.agent.memory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.QuerySource;
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.ForkRawMaterial;
 import com.nexusai.application.agent.compact.fork.ForkedAgentParams;
@@ -153,8 +154,6 @@ public class ExtractMemoriesAgent {
                                   ForkRawMaterial forkRawMaterial) {}
 
     private final MemoryStorage storage;
-    /** auto-memory 目录（尾分隔符）· CC original: getAutoMemPath() (extractMemories.ts:339) */
-    private final String memoryDir;
 
     // ── 注入 seam ──
     /** fork 查询 seam · 测试注入 RecordingQuery；生产接 LlmAgentLoop queryLoop（R9/IMP-18） */
@@ -243,8 +242,20 @@ public class ExtractMemoriesAgent {
 
     public ExtractMemoriesAgent(MemoryStorage storage) {
         this.storage = storage;
+    }
+
+    /**
+     * auto-memory 目录（尾分隔符）· CC original: {@code getAutoMemPath()} (extractMemories.ts:339)。
+     *
+     * <p><b>[A1 重做 2026-09-04]</b>：本方法仅作<b>兜底/测试</b>入口（5 参便捷 executeExtractMemories
+     * 委托、6 参 memoryDir=null 兜底）—— storage 冻结 Path（测试）时安全；生产 StopHookPipeline
+     * 走 6 参带会话线程解析的 memoryDir，fork 内用参数不调本方法（避免异步 ForkJoinPool 无
+     * ThreadLocal 回落 config-home 自身 slug 写错目录 —— 原 A1 惰性现算依赖当前线程 projectRoot，
+     * 用户否决该隐式线程依赖，改参数直传）。</p>
+     */
+    private String memoryDir() {
         String dir = storage.memoryDir().toString();
-        this.memoryDir = (dir.endsWith("/") || dir.endsWith("\\")) ? dir : dir + java.io.File.separator;
+        return (dir.endsWith("/") || dir.endsWith("\\")) ? dir : dir + java.io.File.separator;
     }
 
     public void setForkedQuery(RunForkedAgent.ForkedQuery query) {
@@ -488,10 +499,47 @@ public class ExtractMemoriesAgent {
                                        ForkRawMaterial forkRawMaterial,
                                        String agentId,
                                        String sessionId) {
+        executeExtractMemories(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId, memoryDir());
+    }
+
+    /**
+     * 异步提取入口（fire-and-forget）· 对齐 CC {@code executeExtractMemories}
+     * （extractMemories.ts:598-603）+ {@code extractor}（:569-577）。
+     *
+     * <p>[A1 重做 2026-09-04] <b>memoryDir 显式传参</b>—— 本方法在<b>会话线程</b>
+     * （LlmAgentLoop stop-hook 同步调用，projectRoot ThreadLocal 可靠）被调用，故在进入
+     * runAsync（ForkJoinPool，不继承会话 ThreadLocal）<b>之前</b>把 memoryDir 解析为不可变
+     * 字符串，闭包贯穿 fork 全链 —— fork 线程绝不回读 AutoMemPaths/ThreadLocal，杜绝
+     * 「ThreadLocal 获取失败 → 回落 config-home → 记忆写错目录」。
+     *
+     * <p>对齐 CC 真实形态：CC extractMemories.ts:339 runExtraction 在 fork 前
+     * {@code const memoryDir = getAutoMemPath()} 算一次，目录是「算好传进 fork」而非 fork 内
+     * 现算；CC 单会话全局 projectRoot 故随处可靠，Java 多会话把「解析点」收敛到会话线程入口。
+     *
+     * @param messages            主线程消息快照（CC REPLHookContext.messages）
+     * @param appendSystemMessage UI 系统消息回调（CC toolUseContext.appendSystemMessage；
+     *                            null = 不追加 memory_saved 系统消息）
+     * @param forkRawMaterial     fork 原料（主线程 systemPrompt/userContext/systemContext/
+     *                            快照 · forkedAgent.ts:131-141；null = 无捕获兜底）
+     * @param agentId             子代理 id（null = 主线程；非空 → impl 入口跳过，CC :531-533）
+     * @param sessionId           会话 ID（[sm-cursor-sessionize] 游标/stash/观察点按会话键控；
+     *                            null → "unknown" 兜底键）
+     * @param memoryDir           会话解析的 auto-memory 目录（尾分隔符，fork 全链用）
+     */
+    public void executeExtractMemories(List<ChatMessageDto> messages,
+                                       Consumer<SystemMessage> appendSystemMessage,
+                                       ForkRawMaterial forkRawMaterial,
+                                       String agentId,
+                                       String sessionId,
+                                       String memoryDir) {
+        // [A1 重做] memoryDir null（测试/非主循环调用方走 5 参委托）→ storage.memoryDir() 兜底
+        //   （测试 storage Path 冻结安全）；生产 StopHookPipeline 传会话线程解析的 memoryDir。
+        String memDir = memoryDir != null ? memoryDir : memoryDir();
         // extractor（CC :569-577）：把 promise 登记进 inFlightExtractions，await 后移除。
         // 覆盖完整 trailing-run 链（runExtraction 递归 finally），故 drain 等待它即覆盖尾随轮。
-        CompletableFuture<Void> p = CompletableFuture.runAsync(
-            () -> executeExtractMemoriesImpl(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId));
+        CompletableFuture<Void> p = CompletableFuture.runAsync(() -> {
+            executeExtractMemoriesImpl(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId, memDir);
+        });
         inFlightExtractions.add(p);
         p.whenComplete((v, e) -> inFlightExtractions.remove(p));
         if (log.isDebugEnabled()) {
@@ -581,7 +629,8 @@ public class ExtractMemoriesAgent {
                                             Consumer<SystemMessage> appendSystemMessage,
                                             ForkRawMaterial forkRawMaterial,
                                             String agentId,
-                                            String sessionId) {
+                                            String sessionId,
+                                            String memoryDir) {
         // 双层防御第二层 · CC extractMemories.ts:531-533 executeExtractMemoriesImpl 入口首个检查
         //   `if (context.toolUseContext.agentId) return` —— 主线程 agentId==null 才执行提取；
         //   未来非 StopHookPipeline 调用方若误传子代理片段，在此拦截不写主会话记忆（[IMP-E-2]）。
@@ -637,7 +686,7 @@ public class ExtractMemoriesAgent {
             log.info("[ExtractMemories] 提取进行中，stash 上下文待尾随轮（coalesced）· CC extractMemories.ts:557-564");
             return;
         }
-        runExtraction(messages, appendSystemMessage, forkRawMaterial, false, sessionId);
+        runExtraction(messages, appendSystemMessage, forkRawMaterial, false, sessionId, memoryDir);
     }
 
     // ── 核心 · 对齐 CC runExtraction（extractMemories.ts:329-523）──
@@ -664,13 +713,17 @@ public class ExtractMemoriesAgent {
      * @param isTrailingRun       是否尾随轮（CC isTrailingRun，:377-385 跳过节流）
      * @param sessionId           会话 ID（[sm-cursor-sessionize] 游标/节流/stash/观察点按会话键控；
      *                            null → "unknown" 兜底键）
+     * @param memoryDir           会话解析的 auto-memory 目录（尾分隔符，fork 全链用 —— 入口
+     *                            executeExtractMemories 在会话线程算好传入，本方法在 fork 线程
+     *                            绝不回读 storage.memoryDir()/AutoMemPaths，防 ThreadLocal 回落）
      * @return 提取结果（写入的记忆文件数 + 路径列表）
      */
     private ExtractResult runExtraction(List<ChatMessageDto> messages,
                                         Consumer<SystemMessage> appendSystemMessage,
                                         ForkRawMaterial forkRawMaterial,
                                         boolean isTrailingRun,
-                                        String sessionId) {
+                                        String sessionId,
+                                        String memoryDir) {
         String key = cursorKey(sessionId);
         if (messages == null || messages.isEmpty()) {
             if (log.isDebugEnabled()) {
@@ -724,7 +777,11 @@ public class ExtractMemoriesAgent {
         long startTime = System.currentTimeMillis();
         try {
             // 4. 预注入 manifest（CC extractMemories.ts:398-400）
-            List<MemoryEntry> existing = storage.list();
+            // [A1 重做] 按传入 memoryDir 参数扫（fork 线程不读 storage.memoryDir()/AutoMemPaths ——
+            //   旧 storage.list() 内部现算 memoryDir，fork 线程无 ThreadLocal 回落 config-home，
+            //   manifest 读到错误目录。MemoryStorage 惰性 memoryDir 属会话线程解析面，本处用参数）。
+            List<MemoryEntry> existing = new MemoryScanner().scan(
+                java.nio.file.Paths.get(memoryDir), null);
             // [rev2 D-06/OPD-R2-MEM-06] 单一入口：CC extractMemories.ts:398-400 复用同一
             // formatMemoryManifest（memoryScan.ts:84-94）—— 改调 FindRelevantMemories.formatManifest，
             // 旧私有重复实现已删（尾换行字节差消除，EX-03③）
@@ -838,17 +895,17 @@ public class ExtractMemoriesAgent {
                 ? result.totalUsage() : ForkedAgentResult.ForkUsage.empty();
             long turnCount = result.messages() == null ? 0L
                 : result.messages().stream().filter(m -> m != null && m.role() == Role.assistant).count();
-            // [IMP-MV2-10] cache 命中率 hitPct 日志（CC extractMemories.ts:440-453）·
-            //   totalInput = input + cache_create + cache_read；hitPct = cache_read/totalInput*100
-            //   （1 位小数 · JS toFixed(1) 等价，Locale.ROOT 防小数分隔符漂移；totalInput=0 →
-            //   "0.0"）。CC logForDebugging 调试级 → Java debug 级。usage 保真由
+            // [IMP-MV2-10 + A 命中率口径] cache 命中率 hitPct 日志（CC extractMemories.ts:440-453）·
+            //   协议分派（ContextUsageCalculator.computeCacheHitRate）：anthropic →
+            //   read/(input+read+create)；非 anthropic（deepseek prompt_tokens 已含 cache hit）→
+            //   read/input（旧恒三字段分母对 deepseek 双计 → 命中率恒为真实一半）。*100 后
+            //   1 位小数（JS toFixed(1) 等价，Locale.ROOT 防小数分隔符漂移；read ≤ 0 / 分母 ≤ 0 →
+            //   0 → "0.0"）。CC logForDebugging 调试级 → Java debug 级。usage 保真由
             //   ProductionForkedQuery 全量累计提供（forkedAgent.ts:557-566 · IMP-MV2-10）。
-            long totalInput = usage.inputTokens() + usage.cacheCreationInputTokens()
-                + usage.cacheReadInputTokens();
-            String hitPct = totalInput > 0
-                ? String.format(Locale.ROOT, "%.1f",
-                    usage.cacheReadInputTokens() * 100.0 / totalInput)
-                : "0.0";
+            double hitRatePct = ContextUsageCalculator.computeCacheHitRate(
+                usage.inputTokens(), usage.cacheReadInputTokens(),
+                usage.cacheCreationInputTokens(), result.isAnthropic()) * 100.0;
+            String hitPct = String.format(Locale.ROOT, "%.1f", hitRatePct);
             log.debug("[ExtractMemories] finished — {} files written, cache: read={} create={} "
                     + "input={} ({}% hit)",
                 writtenPaths.size(), usage.cacheReadInputTokens(), usage.cacheCreationInputTokens(),
@@ -898,7 +955,7 @@ public class ExtractMemoriesAgent {
             if (trailing != null) {
                 log.info("[ExtractMemories] 运行尾随提取（stashed 上下文）· CC extractMemories.ts:510-521");
                 runExtraction(trailing.messages(), trailing.appendSystemMessage(),
-                    trailing.forkRawMaterial(), true, sessionId);
+                    trailing.forkRawMaterial(), true, sessionId, memoryDir);
             }
         }
     }

@@ -1,0 +1,20 @@
+-- ===================================================================
+-- V66: sessions 表新增 title_explicit 列（显式命名标志）
+--
+-- 背景（title-cc-align · 决策 2026-09-04）：CC 显式命名（/rename / initialName /
+--   /remote-control <name>）写 sessionStorage custom-title（initReplBridge.ts:299-336），
+--   与自动生成 title（updateBridgeSessionTitle bridge API，不写 storage）可区分——
+--   hasExplicitTitle=true 后 count1/count3 永不再自动覆盖。Java 端 SessionService.update
+--   （PATCH /rename）与自动生成（ChatService.maybeGenerateTitle）同写 sessions.title，
+--   无区分列 → count3 会误覆盖显式 /rename。本列补三态语义（对齐 CC custom-title storage）：
+--
+-- 三态（INTEGER）：
+--   0 = 未显式命名（count1/count3 可自动生成，对齐 CC hasExplicitTitle=false）
+--   1 = 显式 /rename（PATCH，永不自动覆盖，对齐 CC getCurrentSessionTitle 语义）
+--   2 = 自动生成且 count3 已刷新（不再自动刷新，对齐 CC onUserMessage count>=3 后回调停 done）
+--
+-- 列（MyBatis-Flex snake↔camel 自动映射，同 V57/V58 会话列范式）：
+--   title_explicit ↔ titleExplicit（Integer；SQLite 无 BOOLEAN → INTEGER 0/1/2）。
+-- 存量旧行该列 DEFAULT 0（默认可自动生成；非 1 即非显式，count3 覆盖自动 title 合法）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN title_explicit INTEGER NULL DEFAULT 0;

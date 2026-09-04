@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.cost;
 
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.infra.llm.ModelNameResolver;
 import com.nexusai.repository.provider.entity.ModelRecord;
@@ -77,6 +78,21 @@ public class ModelCostCalculator {
 
     /**
      * T3 兜底重载 · 文本回合 usage 缺失时用估算 token 同口径计价（input/cache 0，output 估算值）。
+     *
+     * <p><b>A5-1 计费 provider 分派（deepseek 缓存双计修复）</b>: deepseek（openai 协议）
+     * {@code input_tokens} <b>已含 cache hit</b>（input == H+M，DB 实锤）——Anthropic 语义的
+     * {@code input + cacheRead + cacheCreate} 三字段求和计价对 deepseek <b>双计</b>（input 全价重复 +
+     * 命中折价重复）。故按 {@link com.nexusai.application.agent.compact.ContextUsageCalculator#isAnthropic}
+     * 分派：
+     * <ul>
+     *   <li><b>anthropic</b> → 现 4 项公式（CC modelCost.ts tokensToUSDCost）保留；</li>
+     *   <li><b>非 anthropic（deepseek/openai）</b> → {@code max(0, input - cacheRead)/1e6*inputPrice
+     *       + output/1e6*outputPrice + cacheRead/1e6*cacheReadPrice}（先扣命中再按 miss 全价计 input，
+     *       命中按折价；<b>忽略 cacheCreate/cacheWritePrice</b>——deepseek 无 cache_write 档）。</li>
+     * </ul>
+     * <b>价语义（用户确认）</b>: input_price=miss 全价、cache_read_price=hit 折价、cache_write 对
+     * deepseek 忽略。DB 全 NULL 时内置默认档 3.0/0.10 即此语义；日后配价按此填。
+     * mapper 不可得（非 Spring new / 模型不可判定）→ isAnthropic false → deepseek 语义（input 含 cache）。
      */
     public double calculateCostYuan(String model, long inputTokens, long outputTokens,
                                     long cacheRead, long cacheCreation, boolean isPeak) {
@@ -85,10 +101,18 @@ public class ModelCostCalculator {
         double outputPrice = isPeak ? tier.outputPricePeak() : tier.outputPriceOffpeak();
         double cacheReadPrice = isPeak ? tier.cacheReadPricePeak() : tier.cacheReadPriceOffpeak();
         double cacheWritePrice = isPeak ? tier.cacheWritePricePeak() : tier.cacheWritePriceOffpeak();
-        return (inputTokens / 1e6) * inputPrice
+        boolean anthropic = ContextUsageCalculator.isAnthropic(this.modelMapper, this.providerMapper, model);
+        if (anthropic) {
+            return (inputTokens / 1e6) * inputPrice
+                + (outputTokens / 1e6) * outputPrice
+                + (cacheRead / 1e6) * cacheReadPrice
+                + (cacheCreation / 1e6) * cacheWritePrice;
+        }
+        // 非 anthropic（deepseek/openai）：input 已含 cache hit → 先扣命中按 miss 全价，命中折价，忽略 cache_write
+        long missTokens = Math.max(0L, inputTokens - cacheRead);
+        return (missTokens / 1e6) * inputPrice
             + (outputTokens / 1e6) * outputPrice
-            + (cacheRead / 1e6) * cacheReadPrice
-            + (cacheCreation / 1e6) * cacheWritePrice;
+            + (cacheRead / 1e6) * cacheReadPrice;
     }
 
     /**

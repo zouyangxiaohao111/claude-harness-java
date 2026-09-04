@@ -71,9 +71,10 @@ public class GitStatusProvider {
     private final Path cwd;
     private final GitRunner runner;
 
-    /** 会话级 memoize 结果 · CC original: lodash memoize (context.ts:36) */
-    private String cachedGitStatus = null;
-    private boolean gitStatusComputed = false;
+    /** 会话级 memoize 结果 · CC original: lodash memoize (context.ts:36) · volatile：跨 run 共享实例
+     *  并发单飞（cache-hit-fix B 批，镜像 SystemPromptContextProvider:76-77）可见性。 */
+    private volatile String cachedGitStatus = null;
+    private volatile boolean gitStatusComputed = false;
 
     /**
      * @param cwd    工作目录（null → 走 {@link CwdResolution#getCwd()} 统一入口；测试可注入临时目录）
@@ -119,35 +120,46 @@ public class GitStatusProvider {
         if (gitStatusComputed) {
             return cachedGitStatus;
         }
-        long start = System.currentTimeMillis();
-        if (log.isDebugEnabled()) {
-            log.debug("[GitStatusProvider] getGitStatus 开始: cwd={}", cwd);
-        }
+        // [cache-hit-fix B] 并发单飞 · volatile 双检非原子（A 计算期间 B 亦进入计算体 → 重复跑 git 命令）
+        // 改 synchronized (this) 单飞——首检命中直接返回，未命中持锁二次检后计算，并发调用方阻塞于
+        // 监视器共享同一次计算（对齐 CC lodash memoize promise 共享 / SystemPromptContextProvider:151-188）。
+        // 无重入风险：计算体仅调 isGit / computeGitStatus（git 子进程）不回入本锁（秒级持锁期间并发方
+        // 串行等待，正是 CC promise 共享语义）。本实例现可跨 run 共享（SessionGitStatusRegistry 会话级
+        // 快照），多 run 首次并发进入时同样只算一次。
+        synchronized (this) {
+            if (gitStatusComputed) {
+                return cachedGitStatus;
+            }
+            long start = System.currentTimeMillis();
+            if (log.isDebugEnabled()) {
+                log.debug("[GitStatusProvider] getGitStatus 开始: cwd={}", cwd);
+            }
 
-        // ── settings 门控（SP-10 △1，gitSettings.ts:13-18）──
-        if (!GitInstructionConfig.shouldIncludeGitInstructions()) {
-            log.info("[GitStatusProvider] settings 门控关闭（nexusai.git.include-instructions=false 或 env 关闭），跳过 git status（对齐 CC shouldIncludeGitInstructions，cwd={}）", cwd);
-            cachedGitStatus = null;
+            // ── settings 门控（SP-10 △1，gitSettings.ts:13-18）──
+            if (!GitInstructionConfig.shouldIncludeGitInstructions()) {
+                log.info("[GitStatusProvider] settings 门控关闭（nexusai.git.include-instructions=false 或 env 关闭），跳过 git status（对齐 CC shouldIncludeGitInstructions，cwd={}）", cwd);
+                cachedGitStatus = null;
+                gitStatusComputed = true;
+                return null;
+            }
+
+            String result;
+            // ── getIsGit 前置（CC context.ts:46）──
+            if (!isGit()) {
+                log.info("[GitStatusProvider] 非 git 仓库，跳过 git status（对齐 CC context.ts:52-57，cwd={}）", cwd);
+                result = null;
+            } else {
+                result = computeGitStatus(start);
+            }
+
+            cachedGitStatus = result;
             gitStatusComputed = true;
-            return null;
+            if (log.isDebugEnabled()) {
+                log.debug("[GitStatusProvider] getGitStatus 完成: 耗时 {} ms, hasGitStatus={}",
+                    System.currentTimeMillis() - start, result != null);
+            }
+            return result;
         }
-
-        String result;
-        // ── getIsGit 前置（CC context.ts:46）──
-        if (!isGit()) {
-            log.info("[GitStatusProvider] 非 git 仓库，跳过 git status（对齐 CC context.ts:52-57，cwd={}）", cwd);
-            result = null;
-        } else {
-            result = computeGitStatus(start);
-        }
-
-        cachedGitStatus = result;
-        gitStatusComputed = true;
-        if (log.isDebugEnabled()) {
-            log.debug("[GitStatusProvider] getGitStatus 完成: 耗时 {} ms, hasGitStatus={}",
-                System.currentTimeMillis() - start, result != null);
-        }
-        return result;
     }
 
     /**

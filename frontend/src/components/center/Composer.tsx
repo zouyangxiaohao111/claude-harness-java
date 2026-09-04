@@ -6,16 +6,19 @@ import type { QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
 import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
 import { uploadAttachment } from '@/api/chat'
+import { AgentSelector } from './AgentSelector'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { readFile, stat } from '@tauri-apps/plugin-fs'
 import { COMMAND_ITEMS } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
 import { compactNumber } from '@/utils/format'
-import { useChatStore } from '@/stores/chatStore'
+import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
+/** 稳定空数组（streams[sessionId] 不存在时回落，防 selector 每次返回新引用触发重渲染）。 */
+const EMPTY_BLOCKS: StreamBlock[] = []
 
 /** Tauri：拖拽被 WebView 拦截，用 onDragDropEvent 拿真实路径 → fs 读文件 → base64/upload */
 const IS_TAURI = isTauri()
@@ -88,8 +91,14 @@ interface ComposerProps {
   showToBottom?: boolean
   /** 回到底部点击 → 滚动对话到底（App 触发 MessageList scrollSignal） */
   onScrollToBottom?: () => void
+  /** 强行停止所有（输入框上方按钮：一键取消当前流式 + 停全部后台任务 · 替代难触发的双击 Esc）· streaming 时显示 */
+  onHardStop?: () => void
   /** local-read 附件模式（前后端同机）：>5MB 拖拽附件传本地 path 由后端读盘，不 upload */
   localRead?: boolean
+  /** 当前会话主线程 agent（null/空串 = 默认模式，胶囊显示「技能市场」入口） */
+  currentAgent?: string | null
+  /** 点击顶部 agent 胶囊 → 打开技能市场弹窗（App 持有 showMarket state） */
+  onOpenMarket?: () => void
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -122,18 +131,22 @@ function renderHighlighted(text: string): ReactNode[] {
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, localRead }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onOpenMarket }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
   const sessionUsage = useChatStore((s) => s.sessions.find((x) => x.id === sessionId))
-  // F1/F5 · 当前上下文「已用 / 窗口（剩余%）」：末条 assistant 消息 complete 透传快照优先，
-  //   无则回落 token_warning 事件（tokenUsage/contextWindow/percentLeft）
+  // F1/F5 · 当前上下文「已用 / 窗口（剩余%）」：优先末条带快照（实时=流式块 message.usage 挂载、
+  //   complete 落库消息），无则回落 token_warning 事件（tokenUsage/contextWindow/percentLeft）。
+  //   扫描源 = [...msgs, ...liveBlocks]：live 块排尾部 → 从尾向前命中最新流式块的 usage/上下文，
+  //   多轮 turn 内每条 assistant message.usage 到达即实时刷新；turn 完成清流后纯 msgs 兜底。
   const msgs = useChatStore((s) => (sessionId ? (s.messages[sessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES))
+  const liveBlocks = useChatStore((s) => (sessionId ? (s.streams[sessionId] ?? EMPTY_BLOCKS) : EMPTY_BLOCKS))
   const tokenWarning = useChatStore((s) => s.tokenWarning)
   const ctxInfo = useMemo(() => {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]
+    const scanned = [...msgs, ...liveBlocks]
+    for (let i = scanned.length - 1; i >= 0; i--) {
+      const m = scanned[i]
       if (m.contextTokensUsed != null && m.contextWindow != null) {
         return { used: m.contextTokensUsed, window: m.contextWindow, pct: m.percentLeft ?? null }
       }
@@ -142,33 +155,46 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       return { used: tokenWarning.tokenUsage, window: tokenWarning.contextWindow, pct: tokenWarning.percentLeft ?? null }
     }
     return null
-  }, [msgs, tokenWarning])
-  // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：本轮 usage 的 cache_read / (input + cache_read + cache_creation)
+  }, [msgs, liveBlocks, tokenWarning])
+  // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
+  //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
+  //   deepseek（openai 协议）：input_tokens 已含 cache hit（input==H+M），直接 cache_read / input
+  //   （真实命中率；按 anthropic 公式会算成真实的一半 ~40% 假象）。provider 由 currentModel
+  //   `provider/model` 前缀判定（后端 ContextUsageCalculator.isAnthropic 同口径：provider.type==anthropic）。
   //   取最近一条带 usage 的 assistant 消息（complete 事件 usage 透传 · tokenWarning.tokenUsage 仅 number 无缓存细分）
   const cacheRateInfo = useMemo(() => {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const u = msgs[i]?.usage
+    const isClaudeProvider = (currentModel ?? '').split('/')[0].trim().toLowerCase() === 'anthropic'
+    const scanned = [...msgs, ...liveBlocks]
+    for (let i = scanned.length - 1; i >= 0; i--) {
+      const u = scanned[i]?.usage
       if (!u) continue
       const cr = u.cache_read_input_tokens ?? 0
       const ci = u.input_tokens ?? 0
       const cc = u.cache_creation_input_tokens ?? 0
-      const total = ci + cc + cr
-      if (total > 0) return { rate: Math.round((cr / total) * 100), read: cr }
+      if (isClaudeProvider) {
+        const total = ci + cc + cr
+        if (total > 0) return { rate: Math.round((cr / total) * 100), read: cr }
+      } else if (ci > 0) {
+        return { rate: Math.round((cr / ci) * 100), read: cr }
+      }
     }
     return null
-  }, [msgs])
-  // F4 · 末条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示，
-  //   原 MessageList 消息作者行计算迁到此处，footer hint-usage 汇总）
+  }, [msgs, liveBlocks, currentModel])
+  // F4 · 最近一条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示）。
+  //   扫描源 = [...msgs, ...liveBlocks]：live 块在 message.usage（assistant 流式结束）即挂 usage/decode_ms，
+  //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。
+  //   live 块无 role（隐含 assistant）；decode_ms 语义 = 首 token→完成整段计时，故速率是「每段输出收尾即跳」。
   const lastSpeedTs = useMemo(() => {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]
-      if (m.role !== 'assistant') continue
+    const scanned = [...msgs, ...liveBlocks] as Array<ChatMessageDto & StreamBlock>
+    for (let i = scanned.length - 1; i >= 0; i--) {
+      const m = scanned[i]
+      if (m.role && m.role !== 'assistant') continue
       const ot = m.usage?.output_tokens ?? m.outputTokens ?? 0
-      const dm = m.decodeMs ?? m.usage?.decode_ms ?? 0
+      const dm = m.usage?.decode_ms ?? m.decodeMs ?? 0
       if (ot > 0 && dm > 0) return Math.round((ot * 1000) / dm)
     }
     return null
-  }, [msgs])
+  }, [msgs, liveBlocks])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const highlightRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -361,6 +387,23 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     }
   }
 
+  /** 添加文件按钮：Tauri 桌面 → plugin-dialog.open() 拿绝对路径（localRead path 通道，大文件不 upload）；
+   *  浏览器（无绝对路径）→ 原生 file input → File 对象走 upload。 */
+  const handleAddFiles = async () => {
+    if (IS_TAURI) {
+      try {
+        const { open } = await import('@tauri-apps/plugin-dialog')
+        const sel = await open({ multiple: true })
+        const paths = Array.isArray(sel) ? sel : sel ? [sel] : []
+        if (paths.length) void addPaths(paths)
+        return
+      } catch {
+        /* dialog 不可用 → 回退原生 file input */
+      }
+    }
+    fileInputRef.current?.click()
+  }
+
   // Tauri 拖拽事件：WebView 拦截浏览器 drop，改由 onDragDropEvent 拿文件真实路径
   useEffect(() => {
     if (!IS_TAURI) return
@@ -544,20 +587,41 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               </div>
             )}
           </div>
-          {/* 回到底部（输入框上方 · 与 full 模式模块对称 · 离底时显示） */}
-          {showToBottom && (
-            <button
-              className="composer-top-btn"
-              onClick={onScrollToBottom}
-              title="回到最底部"
-              aria-label="回到最底部"
-            >
-              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-                <path d="M2 5l4 4 4-4" />
-              </svg>
-              <span>回到底部</span>
-            </button>
-          )}
+          {/* V58 主线程 agent（专家）胶囊 · 显示当前驱动 agent · 放「模式」下拉右侧 · 点开技能市场 */}
+          <AgentSelector
+            currentAgent={currentAgent}
+            onOpen={() => { if (onOpenMarket) onOpenMarket() }}
+          />
+          {/* 输入框上方右缘操作组（右对齐输入框右缘）：回到底部（离底时）+ 停止所有（运行中） */}
+          <div className="composer-top-actions">
+            {showToBottom && (
+              <button
+                className="composer-top-btn"
+                onClick={onScrollToBottom}
+                title="回到最底部"
+                aria-label="回到最底部"
+              >
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
+                  <path d="M2 5l4 4 4-4" />
+                </svg>
+                <span>回到底部</span>
+              </button>
+            )}
+            {/* 强行停止所有：一键终止当前会话全部运行任务（后台子代理/续跑一并停止），替代难触发的双击 Esc */}
+            {onHardStop && streaming && (
+              <button
+                className="composer-top-btn hard-stop"
+                onClick={onHardStop}
+                title="强制终止当前会话所有运行中的任务（含后台子代理/续跑）"
+                aria-label="停止所有"
+              >
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 10, height: 10 }}>
+                  <path d="M3 3l6 6M9 3l-6 6" />
+                </svg>
+                <span>停止所有</span>
+              </button>
+            )}
+          </div>
         </div>
         <div className="input-box">
           <div style={{ position: 'relative' }}>
@@ -690,7 +754,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   e.target.value = ''
                 }}
               />
-              <div className="tool-chip" onClick={() => fileInputRef.current?.click()}>
+              <div className="tool-chip" onClick={() => void handleAddFiles()}>
                 <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
                   <path d="M6 2V10M2 6H10" />
                 </svg>
@@ -794,8 +858,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               {streaming ? (
                 <button className="send-btn danger" onClick={onStop} title="停止生成">
                   <span>停止</span>
-                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <rect x="3" y="3" width="6" height="6" rx="1" />
+                  {/* 实心方块：svg 17px × 方块占满 12 单位中 10 → 视觉高≈14px（与「停止」文字字号同高） */}
+                  <svg viewBox="0 0 12 12" fill="currentColor" aria-hidden="true" style={{ width: 17, height: 17 }}>
+                    <rect x="1" y="1" width="10" height="10" rx="1.5" />
                   </svg>
                 </button>
               ) : (

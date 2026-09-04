@@ -147,3 +147,74 @@ describe('chatStore conversationId', () => {
     expect(s.getState().conversationIds['sess-2']).toBe('conv-2')
   })
 })
+
+describe('chatStore message.usage 逐块挂载 + finalize 逐块优先', () => {
+  it('applyMessageUsage 按 assistantMessageId 挂 usage/上下文快照到流式块（WHY：每条 assistant 流式结束推 message.usage → 实时缓存%/上下文条，不等 turn complete）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().applyMessageUsage('sess-1', 'turn-a', {
+      usage: { input_tokens: 100, output_tokens: 50 },
+      contextTokensUsed: 800, contextWindow: 200000, percentLeft: 99,
+    })
+    const b = s.getState().streams['sess-1']?.[0]
+    expect(b?.usage?.input_tokens).toBe(100)
+    expect(b?.usage?.output_tokens).toBe(50)
+    expect(b?.contextTokensUsed).toBe(800)
+    expect(b?.contextWindow).toBe(200000)
+    expect(b?.percentLeft).toBe(99)
+  })
+  it('applyMessageUsage 无匹配块 / 无 assistantMessageId 时 no-op 不崩溃（WHY：纯工具轮该条无文本块，由下一条 assistant / complete meta 兜底）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    const before = s.getState().streams['sess-1']
+    s.getState().applyMessageUsage('sess-1', 'missing-id', { usage: { input_tokens: 1, output_tokens: 1 } })
+    s.getState().applyMessageUsage('sess-1', null, { usage: { input_tokens: 1, output_tokens: 1 } })
+    // 引用未变 → 状态未改动；块 usage 仍未挂载
+    expect(s.getState().streams['sess-1']).toBe(before)
+    expect(s.getState().streams['sess-1']?.[0]?.usage).toBeUndefined()
+  })
+  it('finalizeBlocks 逐块优先：多轮各块挂自身 usage，不共用末条 meta（WHY：turn 内每条 assistant 显示自己的 usage/上下文，complete 累计只兜底）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().appendChunk('sess-1', 'turn-a', 'A')
+    s.getState().applyMessageUsage('sess-1', 'turn-a', {
+      usage: { input_tokens: 1000, output_tokens: 100, decode_ms: 500 },
+      contextTokensUsed: 1200, contextWindow: 200000, percentLeft: 99,
+    })
+    s.getState().ensureStreamBlock('sess-1', 'turn-b')
+    s.getState().appendChunk('sess-1', 'turn-b', 'B')
+    s.getState().applyMessageUsage('sess-1', 'turn-b', {
+      usage: { input_tokens: 2000, output_tokens: 200, decode_ms: 900 },
+      contextTokensUsed: 2200, contextWindow: 200000, percentLeft: 98,
+    })
+    // complete meta 携带 turn 累计 —— 仅兜底（块自身带 usage/快照时以块为准）
+    s.getState().finalizeBlocks('sess-1', {
+      usage: { input_tokens: 3000, output_tokens: 300 }, contextTokensUsed: 3000,
+      contextWindow: 200000, percentLeft: 97, decodeMs: 1400,
+    })
+    const msgs = s.getState().messages['sess-1'] ?? []
+    const ma = msgs.find((m) => m.content === 'A')
+    const mb = msgs.find((m) => m.content === 'B')
+    expect(ma?.usage?.input_tokens).toBe(1000)
+    expect(ma?.contextTokensUsed).toBe(1200)
+    expect(ma?.percentLeft).toBe(99)
+    expect(ma?.decodeMs).toBe(500)   // decodeMs 取块内 usage.decode_ms，非 complete meta
+    expect(mb?.usage?.input_tokens).toBe(2000)
+    expect(mb?.contextTokensUsed).toBe(2200)
+    expect(mb?.percentLeft).toBe(98)
+    expect(mb?.decodeMs).toBe(900)
+  })
+  it('finalizeBlocks 回落：块未挂 usage 时用 complete meta 兜底（WHY：旧后端无 message.usage / 纯工具轮 → complete 累计照常透传）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().appendChunk('sess-1', 'turn-a', 'A')
+    s.getState().finalizeBlocks('sess-1', {
+      usage: { input_tokens: 3000, output_tokens: 300 }, contextTokensUsed: 3000,
+      contextWindow: 200000, percentLeft: 97,
+    })
+    const m = s.getState().messages['sess-1']?.[0]
+    expect(m?.usage?.input_tokens).toBe(3000)
+    expect(m?.contextTokensUsed).toBe(3000)
+    expect(m?.contextWindow).toBe(200000)
+  })
+})

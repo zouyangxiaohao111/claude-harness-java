@@ -104,6 +104,12 @@ export const useSubagentStore = create<SubagentState>()((set, get) => {
         const session = st.bySession[sid] ?? {}
         const identity = session[taskId] ?? Object.values(session).find((i) => i.taskId === taskId)
         if (!identity) return st
+        // 终态幂等：已 done/failed/stopped 再收到终态活动（STOMP 终态事件 + REST 兜底补录
+        //   双路径可能各推一次）→ 忽略，防止活动时间线重复追加、状态抖动。
+        if ((identity.status === 'done' || identity.status === 'failed' || identity.status === 'stopped')
+            && (activity.type === 'done' || activity.type === 'failed' || activity.type === 'stopped')) {
+          return st
+        }
         const updated: SubagentIdentity = {
           ...identity,
           activities: [...identity.activities, activity],

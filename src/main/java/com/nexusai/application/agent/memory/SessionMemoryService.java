@@ -64,6 +64,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -131,6 +132,17 @@ public class SessionMemoryService {
     }
 
     private final Path baseDir;
+
+    /**
+     * per-session 会话根解析器 · sessionId → {@code {configHome}/projects/{slug}}（对齐 CC
+     * sessionStorage.ts:202-205 getProjectDir(getOriginalCwd()) 分层，summary 与 transcript 同源）。
+     *
+     * <p><b>[sm-reloc]</b> 生产注入 {@code SessionStorage::sessionProjectDir}（按 sessionId 查
+     * SessionCwdHolder/SessionProjectRoot 全局 map —— hook/压缩线程上也不依赖 ThreadLocal）；
+     * null = legacy 固定 {@link #baseDir}（1-arg 构造 / 测试回落）。resolver 非 null 时目录由
+     * {@code setupSessionMemoryFile} 惰性创建（构造器不 eager mkdir，防启动期污染 + bean hermetic）。</p>
+     */
+    private final Function<String, Path> sessionBaseDirResolver;
 
     /** env 读取器 · 可注入便于测试（默认 System::getenv）。SM 压缩门控读取用。 */
     private Function<String, String> envProvider = System::getenv;
@@ -303,12 +315,35 @@ public class SessionMemoryService {
         public static final SmCompactConfig DEFAULT = new SmCompactConfig(10_000, 5, 40_000);
     }
 
+    /**
+     * 1-arg 构造（legacy）· 委托 2-arg，resolver=null → 固定 {@code baseDir} 平铺语义
+     * （测试 / 回落，目录构造期 createDirectories 行为不变）。
+     */
     public SessionMemoryService(Path baseDir) {
-        this.baseDir = baseDir;
-        try {
-            Files.createDirectories(baseDir);
-        } catch (IOException e) {
-            log.warn("[SessionMemory] 无法创建 session memory 目录: {}", baseDir, e);
+        this(baseDir, null);
+    }
+
+    /**
+     * 2-arg 主构造 · {@code resolver} 非 null = per-session 派生（生产注入
+     * {@code SessionStorage::sessionProjectDir}）。
+     *
+     * <p><b>[sm-reloc] 目录创建语义</b>：{@code resolver == null}（legacy）→ 构造期
+     * {@code createDirectories(baseDir)}（原 1-arg 行为保留）；{@code resolver != null} →
+     * <b>不</b> eager mkdir —— per-session 目录由 {@code setupSessionMemoryFile} 惰性建
+     * （{@code createDirectoriesOwnerOnly}），防启动期污染 + bean hermetic。</p>
+     *
+     * @param baseDir  legacy 固定基目录（resolver null 时生效；非 null）
+     * @param resolver sessionId → {configHome}/projects/{slug}；可 null = legacy
+     */
+    public SessionMemoryService(Path baseDir, Function<String, Path> resolver) {
+        this.baseDir = Objects.requireNonNull(baseDir, "baseDir");
+        this.sessionBaseDirResolver = resolver;
+        if (resolver == null) {
+            try {
+                Files.createDirectories(baseDir);
+            } catch (IOException e) {
+                log.warn("[SessionMemory] 无法创建 session memory 目录: {}", baseDir, e);
+            }
         }
     }
 
@@ -1426,6 +1461,39 @@ public class SessionMemoryService {
         return shouldUse;
     }
 
+    /**
+     * 解析本会话已存在的 transcript 文件 · <b>[R1 读修复 2026-09-02]</b>。
+     *
+     * <p><b>WHY（活 bug）</b>：原读点 {@code SessionStorage.resolveExistingTranscript(baseDir, sessionId)}
+     * 在 per-session 新布局下会把 SM 的 slug 基目录 {@code {configHome}/projects/{slug}} 误当
+     * projectRoot 喂入 —— 其内部再 {@code getProjectDir(workspaceDir)} 一次 → 双重包裹
+     * {@code {configHome}/projects/{sanitize(configHome/projects/{slug})}/{sessionId}.jsonl}，
+     * 读不到真实 transcript。现按 SM 路径介质统一：summary 与 transcript <b>共享同一 slug 锚</b>。</p>
+     *
+     * <ul>
+     *   <li>resolver 非空（per-session）→ {@code {projects/{slug}}/{sessionId}.jsonl} 直接判存
+     *       （Files.isRegularFile），不存在 → null</li>
+     *   <li>resolver null（legacy 固定 baseDir）→ 原 1-arg 语义
+     *       {@code SessionStorage.resolveExistingTranscript(baseDir, sessionId)}（旧测试不变）</li>
+     * </ul>
+     *
+     * @param sessionId 会话 ID
+     * @return 已存在的 nexusai transcript 文件路径；不存在 / sessionId null → null
+     */
+    private Path resolveExistingTranscriptForSession(String sessionId) {
+        if (sessionId == null) {
+            return null;
+        }
+        if (sessionBaseDirResolver != null) {
+            Path slugDir = sessionBaseDirResolver.apply(sessionId);
+            if (slugDir != null) {
+                Path f = slugDir.resolve(sessionId + ".jsonl");
+                return Files.isRegularFile(f) ? f : null;
+            }
+        }
+        return SessionStorage.resolveExistingTranscript(baseDir, sessionId);
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // trySessionMemoryCompaction · 对齐 CC sessionMemoryCompact.ts:514-630
     // ════════════════════════════════════════════════════════════════════
@@ -1527,6 +1595,9 @@ public class SessionMemoryService {
             // preCompactTokenCount · CC sessionMemoryCompact.ts:445 tokenCountFromLastAPIResponse
             // （末条 usage input+cache+output，无则 0）——OPD-R2-SM-01 DRIFT-6 修复：
             // 旧实现用简化 tokenCountWithEstimation（input+output+rough 尾段）→ boundary preTokens 漂移。
+            // [A5-2 登记] 保持 1 参（anthropic 4 项和）——SM 路径无 model/mapper 上下文（本类无
+            //   ModelMapper/ProviderMapper），deepseek 下 over-count 已知（AutoCompactorCcContractTest
+            //   :610-626 锁定 4 项和语义），待 model 通道接入后分派。
             int preCompactTokenCount = Tokens.tokenCountFromLastAPIResponse(messages);
             String lastUuid = messages.isEmpty() ? null : messages.get(messages.size() - 1).id();
             CompactBoundaryMessage boundaryMarker = CompactBoundaryMessage.createCompactBoundaryMessage(
@@ -1557,8 +1628,11 @@ public class SessionMemoryService {
             // transcript 路径（sessionMemoryCompact.ts:464-469 第 3 参 + :589 getTranscriptPath）——
             // [S2] 扁平 {configHome}/projects/{slug}/{sessionId}.jsonl（SessionStorage.getTranscriptPath
             //   config-home 派生，对齐 CC sessionStorage.ts:202-205 getProjectDir(getOriginalCwd())）
-            // [D3] 读兼容：经 SessionStorage.resolveExistingTranscript 读 nexusai 现有 transcript（仅 nexusai，无 claude 回落）
-            Path transcriptPath = SessionStorage.resolveExistingTranscript(baseDir, sessionId);
+            // [D3] 读兼容：经 resolveExistingTranscriptForSession 读 nexusai 现有 transcript（仅 nexusai，无 claude 回落）
+            // [R1 活 bug 修复] 原 SessionStorage.resolveExistingTranscript(baseDir, sessionId) 把 per-session
+            //   slug 目录（{configHome}/projects/{slug}）误当 projectRoot 再 getProjectDir 二次包裹；
+            //   现 resolver 非空时 summary 与 transcript 共享同一 slug 锚直接判存（勿再喂 resolveExistingTranscript）
+            Path transcriptPath = resolveExistingTranscriptForSession(sessionId);
             String summaryContent = CompactSummary.buildUserMessage(
                 truncation.content(),
                 transcriptPath == null ? null : transcriptPath.toString(),
@@ -2082,13 +2156,28 @@ public class SessionMemoryService {
      * session memory 文件路径 · 对齐 CC {@code getSessionMemoryPath()}
      * （filesystem.ts:261-271）{@code {projectDir}/{sessionId}/session-memory/summary.md}。
      *
-     * <p>Web 后端无 getProjectDir(getCwd())（CC :261-264），以注入 baseDir 替代（OPD-M-25
-     * concern 登记）。</p>
+     * <p><b>[sm-reloc 2026-09-02]</b> 落点改 per-session：
+     * <ul>
+     *   <li>{@code sessionBaseDirResolver} 非 null（生产 = {@code SessionStorage::sessionProjectDir}
+     *       = {@code {configHome}/projects/{sanitize(稳定锚 boundProject/originalCwd)}}，与 transcript
+     *       同根分层；绑定项目也不写进用户项目真实目录）→
+     *       {@code {projects/{slug}}/{sessionId}/session-memory/summary.md}</li>
+     *   <li>resolver null = legacy 固定 baseDir（1-arg 构造 / 测试回落），Web 后端无
+     *       getProjectDir(getCwd())（CC :261-264）以注入 baseDir 替代（OPD-M-25 登记）——
+     *       {@code {baseDir}/{sessionId}/session-memory/summary.md}；sessionId null →
+     *       {@code {baseDir}/session-memory/summary.md}（无会话分支）</li>
+     * </ul>
      *
      * @param sessionId 会话 ID
      * @return 文件绝对路径
      */
     Path resolvePath(String sessionId) {
+        if (sessionId != null && sessionBaseDirResolver != null) {
+            Path slugDir = sessionBaseDirResolver.apply(sessionId);
+            if (slugDir != null) {
+                return slugDir.resolve(sessionId).resolve("session-memory").resolve("summary.md");
+            }
+        }
         if (sessionId == null) {
             return baseDir.resolve("session-memory").resolve("summary.md");
         }

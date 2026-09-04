@@ -148,7 +148,8 @@ public class EditFileTool implements Tool {
         if (input != null) {
             String relPath = input.path("file_path").asText("");
             if (!relPath.isBlank()) {
-                try {
+                // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开），原 try-catch 逃逸跳过删除。
+                {
                     Path file = guard.resolve(relPath);
                     String absolute = file.toAbsolutePath().normalize().toString();
                     // IMP-M-P2-2b: agent-memory 写 carve-out（对齐 CC filesystem.ts:1554-1562
@@ -179,10 +180,6 @@ public class EditFileTool implements Tool {
                             new com.nexusai.application.agent.permission.PermissionDecisionReason.Other(
                                 "auto memory files are allowed for writing"),
                             null, false, null, java.util.List.of());
-                    }
-                } catch (SecurityException se) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("EditFileTool: carve-out 路径逃逸跳过: {}", relPath);
                     }
                 }
             }
@@ -488,14 +485,8 @@ public class EditFileTool implements Tool {
             return Tool.ValidationResult.pass();  // execute() 内部会拒空 path
         }
 
-        Path file;
-        try {
-            file = guard.resolve(relPath);
-        } catch (SecurityException se) {
-            // 路径越狱: 让 execute() 内部 SecurityException 兜底处理,
-            // 这里 pass 让其他 validate 阶段先做 deny 规则等检查.
-            return Tool.ValidationResult.pass();
-        }
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），越狱 defer 逻辑删除
+        Path file = guard.resolve(relPath);
         // UNC 路径提前 pass (CC :179-181 防 NTLM 凭据泄露).
         String fullFilePathStr = file.toString();
         if (fullFilePathStr.startsWith("\\\\") || fullFilePathStr.startsWith("//")) {
@@ -821,12 +812,8 @@ public class EditFileTool implements Tool {
         // 语义比较（读文件内容做应用后比较）：ENOENT → 空内容（CC utils.ts:763-772
         //   读文件失败无 TOCTOU 预检）。encoding-aware 读（utf16le 不乱码）。
         String fileContent = "";
-        Path file;
-        try {
-            file = guard.resolve(pathA);
-        } catch (SecurityException se) {
-            return false;
-        }
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），catch 判 false 删除
+        Path file = guard.resolve(pathA);
         if (Files.exists(file)) {
             try {
                 fileContent = FileEncodingReader.readFileMetadata(file).content();
@@ -931,13 +918,8 @@ public class EditFileTool implements Tool {
 
         if (relPath.isBlank()) return ToolResult.error(call.id(), "path is empty");
 
-        Path file;
-        try {
-            file = guard.resolve(relPath);
-        } catch (SecurityException se) {
-            log.warn("EditFileTool: blocked path escape: {}", relPath);
-            return ToolResult.error(call.id(), se.getMessage());
-        }
+        // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），逃逸拒绝删除
+        Path file = guard.resolve(relPath);
 
         // P1-2: 动态技能发现 + 条件技能激活 · 对齐 CC FileEditTool.ts:404-423
         //   （在 call() 开头、编辑前触发；fire-and-forget 不阻塞工具调用链）

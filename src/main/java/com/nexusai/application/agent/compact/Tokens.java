@@ -97,35 +97,75 @@ public final class Tokens {
      * 上下文总 token · CC original: getTokenCountFromUsage (utils/tokens.ts:46-53)。
      * input + cache_creation + cache_read + output（全量窗口，含 cache）。
      *
+     * <p><b>A5-2 求和分派</b>: 1 参 = anthropic 语义（4 项和，CC 原生）——保持既有大量调用/测试
+     * 兼容；需要按 provider 分派的调用点（deepseek 等 openai_compatible 的 input 已含 cache hit）
+     * 请用 {@link #getTokenCountFromUsage(Usage, boolean)} 传 isAnthropic。
+     *
      * @param usage API usage
      * @return 总 token 数（≥ 0）
      */
     public static int getTokenCountFromUsage(Usage usage) {
+        return getTokenCountFromUsage(usage, true);
+    }
+
+    /**
+     * 上下文总 token · 协议分派重载（A5-2 求和 provider 分派 · deepseek 双计修复）。
+     *
+     * <p><b>WHY 分派</b>: Anthropic（Claude API usage 三字段独立）→ 4 项和
+     * {@code input + cache_creation + cache_read + output}（CC tokens.ts:46-53 原生）；
+     * OpenAI/DeepSeek（openai_compatible）{@code input_tokens} <b>已含 cache hit</b>
+     * （input == H+M，DB 实锤）→ 再加 cacheRead/cacheCreation 会双计 → 仅
+     * {@code input + output}（展示/预算/决策阈值口径，输入侧不再重复计命中）。
+     *
+     * @param usage     API usage
+     * @param anthropic 协议判定：true=Anthropic 4 项和；false=OpenAI/DeepSeek 仅 input+output
+     * @return 总 token 数（≥ 0）
+     */
+    public static int getTokenCountFromUsage(Usage usage, boolean anthropic) {
         if (usage == null) {
             return 0;
         }
-        return usage.inputTokens() + usage.cacheCreationInputTokens()
-            + usage.cacheReadInputTokens() + usage.outputTokens();
+        if (anthropic) {
+            return usage.inputTokens() + usage.cacheCreationInputTokens()
+                + usage.cacheReadInputTokens() + usage.outputTokens();
+        }
+        // 非 anthropic：input_tokens 已含 cache hit，只计 input+output（A5-2）
+        return usage.inputTokens() + usage.outputTokens();
     }
 
     /**
      * 最后一次 API 响应总 token · CC original: tokenCountFromLastAPIResponse (utils/tokens.ts:55-66)。
      * 从末尾回扫最近携带 usage 的消息，返回 getTokenCountFromUsage（含 cache）；无 → 0。
      *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义（4 项和）；deepseek 等 openai_compatible 调用点请用
+     * {@link #tokenCountFromLastAPIResponse(List, boolean)} 传 isAnthropic。
+     *
      * @param messages 消息列表
      * @return 最近 API 响应 token 数（无 usage → 0）
      */
     public static int tokenCountFromLastAPIResponse(List<ChatMessageDto> messages) {
+        return tokenCountFromLastAPIResponse(messages, true);
+    }
+
+    /**
+     * 最后一次 API 响应总 token · 协议分派重载（A5-2 · deepseek 双计修复）。
+     * 与 {@link #getTokenCountFromUsage(Usage, boolean)} 同分派口径（anthropic 4 项 / 非 anthropic input+output）。
+     *
+     * @param messages  消息列表
+     * @param anthropic 协议判定：true=Anthropic 4 项和；false=OpenAI/DeepSeek 仅 input+output
+     * @return 最近 API 响应 token 数（无 usage → 0）
+     */
+    public static int tokenCountFromLastAPIResponse(List<ChatMessageDto> messages, boolean anthropic) {
         if (messages == null) {
             return 0;
         }
         for (int i = messages.size() - 1; i >= 0; i--) {
             Usage usage = getTokenUsage(messages.get(i));
             if (usage != null) {
-                int total = getTokenCountFromUsage(usage);
+                int total = getTokenCountFromUsage(usage, anthropic);
                 if (log.isDebugEnabled()) {
-                    log.debug("[IMP-17 Tokens] tokenCountFromLastAPIResponse: lastUsageIdx={} result={} · CC tokens.ts:55",
-                        i, total);
+                    log.debug("[IMP-17 Tokens] tokenCountFromLastAPIResponse: lastUsageIdx={} result={} anthropic={} · CC tokens.ts:55",
+                        i, total, anthropic);
                 }
                 return total;
             }
@@ -230,6 +270,9 @@ public final class Tokens {
      * <p><b>IMP2-19 X-3</b>: 消费方核验结论 —— Java 生产 0 消费方（探查 §6 X-3）→ 按 CC 语义
      * 实现并登记 N/A 接线（TokenHelpersCcContractTest 锁定公式与 findLast 语义）。
      *
+     * <p><b>A5-2 登记</b>: 保持 1 参（anthropic 默认 4 项和）——本方法无模型上下文，
+     * 且 Java 生产 0 消费方（N/A）；deepseek 下 over-count 已知但无影响（无消费方）。
+     *
      * @param messages 消息列表
      * @return 最后 assistant 的 usage 全量 &gt; 200_000
      */
@@ -332,10 +375,26 @@ public final class Tokens {
      * 插入 tool_result）的首个 sibling，保证交错 tool_result 全部进入估算切片（否则欠估）；
      * 返回 {@code getTokenCountFromUsage(usage)} + 切片后消息的 rough 估算。无 usage → 全量 rough。
      *
+     * <p><b>A5-2</b>: 1 参 = anthropic 语义（4 项和）；deepseek 等 openai_compatible 调用点请用
+     * {@link #tokenCountWithEstimation(List, boolean)} 传 isAnthropic。
+     *
      * @param messages 消息列表
      * @return 上下文窗口 token 估算（≥ 0）
      */
     public static int tokenCountWithEstimation(List<ChatMessageDto> messages) {
+        return tokenCountWithEstimation(messages, true);
+    }
+
+    /**
+     * 当前上下文窗口 token 估算 · 协议分派重载（A5-2 · deepseek 双计修复）。
+     * usage 切片走 {@link #getTokenCountFromUsage(Usage, boolean)} 分派
+     * （anthropic 4 项 / 非 anthropic input+output），rough 尾段不受协议影响。
+     *
+     * @param messages  消息列表
+     * @param anthropic 协议判定：true=Anthropic 4 项和；false=OpenAI/DeepSeek 仅 input+output
+     * @return 上下文窗口 token 估算（≥ 0）
+     */
+    public static int tokenCountWithEstimation(List<ChatMessageDto> messages, boolean anthropic) {
         if (messages == null || messages.isEmpty()) {
             return 0;
         }
@@ -363,11 +422,11 @@ public final class Tokens {
                     }
                 }
                 // usage 来自回溯前捕获的 message（tokens.ts:253）；切片从锚定 i 之后开始
-                int result = getTokenCountFromUsage(usage)
+                int result = getTokenCountFromUsage(usage, anthropic)
                     + roughTokenCountEstimationForMessages(messages.subList(i + 1, messages.size()));
                 if (log.isDebugEnabled()) {
-                    log.debug("[IMP-17 Tokens] tokenCountWithEstimation: anchorIdx={} usage={} result={} · CC tokens.ts:226 usage-walk",
-                        i, getTokenCountFromUsage(usage), result);
+                    log.debug("[IMP-17 Tokens] tokenCountWithEstimation: anchorIdx={} usage={} result={} anthropic={} · CC tokens.ts:226 usage-walk",
+                        i, getTokenCountFromUsage(usage, anthropic), result, anthropic);
                 }
                 return result;
             }

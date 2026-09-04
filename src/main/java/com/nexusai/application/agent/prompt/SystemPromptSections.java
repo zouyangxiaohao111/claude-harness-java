@@ -2,6 +2,7 @@ package com.nexusai.application.agent.prompt;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.LoadMemoryPrompt;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.subagent.SubagentEnvInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -504,8 +505,9 @@ public final class SystemPromptSections {
      * （permissions/filesystem.ts:384-388 = {@code join(getProjectTempDir(), getSessionId(), 'scratchpad')}；
      * getProjectTempDir :376-382 = {@code join(getClaudeTempDir(), sanitizePath(getOriginalCwd())) + sep}）。
      *
-     * <p>Java 等价：claudeTempDir = {@code java.io.tmpdir}/claude（CC Windows 分支
-     * getClaudeTempDirName filesystem.ts:307-309 返回 'claude'）；sanitizePath 走
+     * <p>Java 等价：appTempDir = {@link NexusaiPaths#getAppTempDir()}（运行时临时根，per-user 层
+     * 品牌名 = {appName} 自有，行为对齐 CC getClaudeTempDir / getClaudeTempDirName
+     * filesystem.ts:331-347/:307-315）；sanitizePath 走
      * {@link com.nexusai.application.agent.memory.AutoMemPaths#sanitizePath}；originalCwd 走
      * {@link CwdResolution#getOriginalCwdLayer(String)}（会话 original cwd，CC getOriginalCwd()）。
      *
@@ -518,13 +520,13 @@ public final class SystemPromptSections {
             return null;
         }
         try {
-            Path claudeTempDir = Path.of(System.getProperty("java.io.tmpdir", "/tmp"), "claude");
+            Path appTempDir = NexusaiPaths.getAppTempPath();
             String originalCwd = CwdResolution.getOriginalCwdLayer(sessionId);
             if (originalCwd == null || originalCwd.isBlank()) {
                 originalCwd = System.getProperty("user.dir", ".");
             }
             String sanitized = com.nexusai.application.agent.memory.AutoMemPaths.sanitizePath(originalCwd);
-            return claudeTempDir.resolve(sanitized).resolve(sessionId).resolve("scratchpad").toString();
+            return appTempDir.resolve(sanitized).resolve(sessionId).resolve("scratchpad").toString();
         } catch (Exception e) {
             log.warn("[SystemPromptSections] getScratchpadDir 计算失败，返回 null（scratchpad 段不注入）: {}", e.toString());
             return null;

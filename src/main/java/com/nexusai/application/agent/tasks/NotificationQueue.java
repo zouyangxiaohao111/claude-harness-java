@@ -1,6 +1,6 @@
 package com.nexusai.application.agent.tasks;
 
-import com.nexusai.common.SessionKeys;
+import com.nexusai.model.session.dto.AttachmentRequest;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -128,8 +128,31 @@ public class NotificationQueue {
         @Nullable MessageOrigin origin,
         @Nullable String sessionId,
         @Nullable String boundProject,
-        @Nullable String scheduleId
+        @Nullable String scheduleId,
+        /**
+         * [OD-D5/OD-D13 busy 图片] 附件列表 · CC original: {@code pastedContents}
+         * （handlePromptSubmit.ts:340 忙时 enqueue 携带 raw pastedContents；
+         * attachments.ts:1060-1083 每条 queued_command 各自 pastedContents → buildImageContentBlocks）。
+         *
+         * <p>仅 busy-queued 携图（enqueueBusyPrompt 提取 ≤5MB base64 image 直传项）；
+         * task-notification/coordinator/channel/cron 不携。drain 消费点逐项注册
+         * （registerRunPromptImages per-item），消费即清（CC per-command 独立附件，
+         * attachments.ts:1060-1083 —— 绝不共享桶）。null = 无附件（纯文本）。
+         */
+        @Nullable List<AttachmentRequest> attachments
     ) {
+        /**
+         * 12-arg 兼容构造（attachments=null）— [OD-D5] 既有 canonical 调用方零改动
+         * （normalizePriority 等 12 参直传路径仍可用，attachments 留空 = 无附件）。
+         */
+        public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
+                         @Nullable String uuid, boolean isMeta, @Nullable String workload,
+                         boolean skipSlashCommands, @Nullable MessageOrigin origin,
+                         @Nullable String sessionId, @Nullable String boundProject,
+                         @Nullable String scheduleId) {
+            this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
+                sessionId, boundProject, scheduleId, null);
+        }
         /**
          * 11-arg 兼容构造（origin + sessionId + boundProject，scheduleId=null）— cron-transcript
          * 保留旧 canonical 签名（scheduleId 后置 null），使既有 11 参调用（TestJob fire 路径 / 测试）
@@ -153,7 +176,7 @@ public class NotificationQueue {
                          boolean skipSlashCommands, @Nullable MessageOrigin origin,
                          @Nullable String sessionId) {
             this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
-                sessionId, null, null);
+                sessionId, null, null, null);
         }
 
         /**
@@ -272,9 +295,11 @@ public class NotificationQueue {
         // 恢复项目上下文失效 → 回落 user.dir）
         // [PROBE-DUR 修订 2026-08-22] scheduleId 透传（DURABLE cron fire 携带调度 id）——仅供日志
         // 归组/诊断（NotificationQueue 唯一消费点 = 日志），per-task 虚拟会话键机制已删（master a6dce0b0）
+        // [OD-D5] attachments 透传（busy-queued 携图）：priority==null 路径逐字段重建必须保留附件，
+        //   否则忙时排队带图消息经 normalizePriority（priority 缺省补 NEXT）丢图（reflector MAJOR-2）。
         return new QueueItem(item.value(), item.mode(), fallback, item.agentId(),
             item.uuid(), item.isMeta(), item.workload(), item.skipSlashCommands(), item.origin(),
-            item.sessionId(), item.boundProject(), item.scheduleId());
+            item.sessionId(), item.boundProject(), item.scheduleId(), item.attachments());
     }
 
     /** debug 日志用 origin 描述（channel → "channel:server"，null → "null"）。 */

@@ -910,6 +910,11 @@ public class CommandHookExecutor {
         if (exitCode == 2) {
             NotificationQueue queue = notificationQueue;
             if (queue != null) {
+                // [P0-5 F-6b/OD-D16 · 2026-09-04] 本处【不改】：exit=2 预包 <system-reminder> = CC 真源
+                //   hooks.ts:236-243（wrapInSystemReminder 先包一层），mid-turn queued_command 消费端
+                //   （CC messages.ts:3788 wrapMessagesInSystemReminder）再包 = 真双层。Java 现状（预包 +
+                //   发送层再包）对齐 CC；防三层由发送层 wrapQueuedMessagesForApi 幂等跳过承担
+                //   （content 已 <system-reminder> 开头 → 原样跳过；MINOR-1 取舍 = 单层有意偏离）。
                 // CC :234 wrapInSystemReminder + :232-238 enqueuePendingNotification(task-notification)
                 // JS (stderr || stdout) 真值语义 → Java 非空串优先 stderr
                 String blockingText = (stderr != null && !stderr.isEmpty()) ? stderr : stdout;

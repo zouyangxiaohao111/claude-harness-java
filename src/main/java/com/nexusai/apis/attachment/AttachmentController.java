@@ -189,7 +189,7 @@ public class AttachmentController {
         // 分流落盘：pdf → PdfAttachmentStore；image → ImageAttachmentStore；video/audio/file → MediaAttachmentStore
         try (InputStream in = file.getInputStream()) {
             if (isPdfFile(filename, mediaType)) {
-                StoredPdf stored = pdfAttachmentStore.store(sessionId, in, size, filename);
+                StoredPdf stored = pdfAttachmentStore.store(resolvedSession, in, size, filename);
                 if (stored == null) {
                     throw new IllegalStateException("PDF 落盘失败，请重试");
                 }
@@ -205,7 +205,7 @@ public class AttachmentController {
             if (isImageFile(filename, mediaType)) {
                 // 图片仍走 ImageAttachmentStore（image-cache）落盘；upload 大图 → 注册附件表（附件表 id 作 contentId）
                 ImageAttachmentStore.StoredImage storedImage =
-                        imageAttachmentStore.store(sessionId, in, size, filename, mediaType);
+                        imageAttachmentStore.store(resolvedSession, in, size, filename, mediaType);
                 if (storedImage == null) {
                     throw new IllegalStateException("图片落盘失败，请重试");
                 }
@@ -218,7 +218,7 @@ public class AttachmentController {
                 return new PdfUploadResponse(String.valueOf(contentId), filename,
                         storedImage.mediaType(), size);
             }
-            StoredMedia storedMedia = mediaAttachmentStore.store(sessionId, in, size, filename, mediaType);
+            StoredMedia storedMedia = mediaAttachmentStore.store(resolvedSession, in, size, filename, mediaType);
             if (storedMedia == null) {
                 throw new IllegalStateException("媒体落盘失败，请重试");
             }

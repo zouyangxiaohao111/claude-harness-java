@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import type { ChatMessageDto } from '@/api/types'
@@ -9,6 +9,24 @@ import { useSubagentStore } from '@/stores/subagentStore'
 import { useChatStore } from '@/stores/chatStore'
 import type { StreamBlock, ApiFlowError } from '@/stores/chatStore'
 import { tasksApi } from '@/api/tasks'
+import { usePreviewStore } from '@/stores/previewStore'
+
+/** 附件胶囊类型图标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
+function attachIcon(a: NonNullable<ChatMessageDto['userAttachments']>[number]) {
+  const lower = a.filename.toLowerCase()
+  if (a.type === 'pdf' || lower.endsWith('.pdf')) return <span className="uaf-badge pdf">PDF</span>
+  if (lower.endsWith('.docx') || lower.endsWith('.doc')) return <span className="uaf-badge word">W</span>
+  if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) return <span className="uaf-badge excel">X</span>
+  if (a.type === 'video') return (
+    <span className="uaf-badge icon video"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></span>
+  )
+  if (a.type === 'audio') return (
+    <span className="uaf-badge icon audio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg></span>
+  )
+  return (
+    <span className="uaf-badge icon file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg></span>
+  )
+}
 
 /** 消息时间：优先后端人读相对时间（GET /messages time：刚刚/N分钟前/N小时前/N天前/≥30天 yyyy-MM-dd）；
  *  无则回落 createdAt HH:MM（live 消息兜底）；都缺省 → '' */
@@ -106,29 +124,36 @@ function MdContent({ html, className, onRunHtml }: { html: string; className?: s
   return <div ref={ref} className={className} dangerouslySetInnerHTML={{ __html: html }} />
 }
 
-/** HTML 代码块运行预览 · sandbox iframe（allow-scripts 但【不含】allow-same-origin → 不透明 origin，
- *  脚本可跑但无法访问宿主应用 DOM/存储，安全隔离；srcdoc 即用户要预览的原始代码，不经 DOMPurify） */
-function HtmlPreviewModal({ code, onClose }: { code: string; onClose: () => void }) {
-  const [key, setKey] = useState(0)
-  return (
-    <div className="fm-backdrop" onClick={onClose}>
-      <div className="html-preview-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="html-preview-head">
-          <span className="html-preview-title">HTML 预览</span>
-          <span className="spacer" />
-          <button className="fm-btn" onClick={() => setKey((k) => k + 1)}>重新加载</button>
-          <button className="fm-btn primary" onClick={onClose}>关闭</button>
-        </div>
-        <iframe
-          key={key}
-          className="html-preview-frame"
-          sandbox="allow-scripts allow-modals allow-forms allow-popups"
-          srcDoc={code}
-          title="HTML 预览"
-        />
-      </div>
-    </div>
-  )
+/** [打字机节流 2026-09-04] 流式正文排版节流:content 增长时最多每 RENDER_MD_THROTTLE_MS(200ms) 排版一次。
+ *  替代原「每 chunk 对增长中的全文 renderMd」——O(n²) 随消息变长越排越卡 → 固定 ~5 次/s, 每次排
+ *  「到点时刻的最新全文」跳过中间态。消息 complete 后本组件随流式块卸载, 正式消息走 Message 组件
+ *  renderMd 精排一次(571 行), 无格式跳变遗漏。reasoning 思考不经 markdown(887 纯文本), 不受本组件影响。 */
+const RENDER_MD_THROTTLE_MS = 200
+function StreamingMd({ content, onRunHtml }: { content: string; onRunHtml?: (code: string) => void }) {
+  const [html, setHtml] = useState(() => (content ? renderMd(content) : ''))
+  // html 已排到的 content 版本 + 上次排版时刻 —— 流式期间只重排「新到达且距上次 ≥200ms」的内容
+  const htmlContentRef = useRef(content)
+  const lastRenderAtRef = useRef(0)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (content === htmlContentRef.current) return // 已排到最新版本,跳过
+    const renderNow = () => {
+      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
+      htmlContentRef.current = content
+      lastRenderAtRef.current = Date.now()
+      setHtml(renderMd(content))
+    }
+    const elapsed = Date.now() - lastRenderAtRef.current
+    if (lastRenderAtRef.current === 0 || elapsed >= RENDER_MD_THROTTLE_MS) {
+      renderNow() // 首帧或距上次排版 ≥200ms → 立即排（leading throttle）
+    } else {
+      if (timerRef.current) clearTimeout(timerRef.current)
+      timerRef.current = setTimeout(renderNow, RENDER_MD_THROTTLE_MS - elapsed) // 补到 200ms 边界排最新
+    }
+    return () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null } }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [content])
+  return html ? <MdContent className="content md" html={html} onRunHtml={onRunHtml} /> : null
 }
 
 /** 流式 API 错误卡（message.error → 对话流助手回复位置渲染 · 对齐 CC assistant API error / isApiErrorMessage 展示） */
@@ -508,15 +533,17 @@ function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: 
           {userImages.map((img, i) => (
             <img key={i} src={`data:${img.mediaType};base64,${img.base64}`} alt="图片附件" className="user-attach-img" style={{ cursor: 'zoom-in' }} onClick={() => setZoomImg(`data:${img.mediaType};base64,${img.base64}`)} />
           ))}
-          {/* 非图片附件（PDF/文件/视频/音频）文件名 chip · 乐观 + F5 均渲染；
-              图片附件过滤（走上方缩略图 imageData/imagePasteIds 通道，避免双份） */}
-          {msg.userAttachments?.filter((a) => a.type !== 'image').map((a, i) => (
-            <div key={i} className="user-attach-file" title={a.filename}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="uaf-icon"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg>
-              <span className="uaf-name">{a.filename}</span>
-            </div>
-          ))}
-          <MdContent className="user-bubble md" html={renderMd(msg.content)} onRunHtml={onRunHtml} />
+          {/* 文件附件（PDF/Word/视频/音频）内联在 user 气泡里（文字下方 · 点击预览）——
+              图片附件走上方缩略图 imageData/imagePasteIds 通道 */}
+          <div className="user-bubble">
+            <MdContent className="user-text md" html={renderMd(msg.content)} onRunHtml={onRunHtml} />
+            {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
+              <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => usePreviewStore.getState().open({ kind: 'attachment', title: a.filename, item: a })}>
+                {attachIcon(a)}
+                <span className="uaf-name">{a.filename}</span>
+              </button>
+            ))}
+          </div>
         </div>
       ) : isFallback ? (
         <div className="fallback-banner">
@@ -607,13 +634,22 @@ function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: 
   )
 }
 
+// [打字机性能] 历史消息 memo 化：streaming 每 chunk 推进 → MessageList 整体 re-render，
+//   但历史 msg 引用不变（store 只在 complete 追加）→ memo 短路跳过其函数体/markdown DOM diff，
+//   只重渲「正在流式的最后一块」。props 引用稳定前提：onDelete=App useCallback、onRunHtml=openHtmlPreview useCallback。
+const MemoMessage = memo(Message)
+
 export function MessageList({ messages, streaming, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
-  const rowKey = (id: string) => (conversationId ? `${conversationId}:${id}` : id)
+  //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
+  const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
   const streamWrapRef = useRef<HTMLDivElement>(null)
   const lastMsgId = messages[messages.length - 1]?.id
-  // HTML 代码块运行预览（「运行」按钮 → sandbox iframe 弹窗）
-  const [htmlPreview, setHtmlPreview] = useState<string | null>(null)
+  // HTML 代码块「运行」→ 右栏覆盖预览（sandbox iframe 运行结果 · 中间对话不受影响）
+  //   useCallback 稳定引用：Message 组件已 React.memo —— onRunHtml 引用必须稳定，否则每 chunk 全量击穿
+  const openHtmlPreview = useCallback((code: string) => {
+    usePreviewStore.getState().open({ kind: 'html', title: 'HTML 预览', code })
+  }, [])
   // [bug-101] 流式思考块收起：按块 assistantMessageId 记收起态（此前恒展开 + 无 onClick 无法收起）
   const [collapsedStreamReasoning, setCollapsedStreamReasoning] = useState<Record<string, boolean>>({})
   // message.error → 对话流错误卡：展平跨会话错误按 flow 键锚定（当前视图单会话；无 flow 兜底 global）
@@ -644,11 +680,16 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
     if (el) el.scrollTop = el.scrollHeight
   }
   // 记录滚动位置：用户上滚查历史 → nearBottom=false；拉到底部 → true（含外部滚动，如浏览器）
+  //  [窗口化] 触顶（scrollTop ≤ 24）且仍有更早历史 → 增量扩展可见窗口（顶部插入内容的高度补偿在渲染后 effect）
   const onScroll = () => {
     const el = scrollElRef.current
     if (!el) return
     nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICKY_BOTTOM_THRESHOLD
     onNearBottomChangeRef.current?.(nearBottomRef.current)
+    if (el.scrollTop <= 24 && flatRowsLenRef.current > visCountRef.current) {
+      loadPrevScrollHRef.current = el.scrollHeight
+      setVisCount((v) => Math.min(v + WINDOW_STEP, flatRowsLenRef.current))
+    }
   }
   // 绑定滚动容器：空态（messages 空 且 无流式）时组件 return null → streamWrapRef 无 DOM，
   //   故容器引用与监听在「消息数或流式出现」后重绑（首条消息/首个流式块出现时 streamWrapRef 才有效）
@@ -708,13 +749,58 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
     for (const [i, b] of (streaming ?? []).entries()) {
       const key = b.userMessageId ?? b.assistantMessageId ?? 'stream'
       push(key, { kind: 'blk', b, i })
-      // 详细诊断：streaming 块归属（userMessageId 是否缺失/与 messages user 匹配）
-      // [打字机性能] 移除每 chunk 磁盘日志（writeTextFile 串行写盘阻塞流式渲染）；console.debug 保留
-      console.debug('[group-blk]', { i, key, uid: b.userMessageId, blkId: b.assistantMessageId?.slice(0, 12), contentLen: b.content.length, toolN: b.toolCalls.length })
     }
-    console.debug('[group]', arr.map((g) => ({ key: g.key, n: g.items.length, order: g.items.map((it) => it.kind === 'msg' ? `${it.m.role}:${it.m.content?.slice(0, 8)}` : `stream:${(it.b.assistantMessageId ?? '').slice(0, 8)}`) })))
     return arr
   }, [messages, streaming])
+  // ---- [窗口化渲染] 长会话防卡：默认只渲染尾部 WINDOW_MAX 行（消息 + 流式块 + 组尾错误卡），
+  //      上拉到顶自动增量加载更早 WINDOW_STEP 行。渲染行数上限恒定 → 打开长会话/流式推进不随历史量卡死。----
+  const WINDOW_MAX = 150 // 初始可见渲染行数
+  const WINDOW_STEP = 100 // 触顶单次增量加载行数
+  // 线性渲染行（保时间序：组内顺序即全局消息序；组尾 err 卡片跟随其组）供窗口截取
+  const flatRows = useMemo(() => {
+    const rows: (
+      | { key: string; kind: 'msg'; m: ChatMessageDto }
+      | { key: string; kind: 'blk'; b: StreamBlock; i: number }
+      | { key: string; kind: 'err'; err: ApiFlowError }
+    )[] = []
+    for (const g of groups) {
+      for (const it of g.items) {
+        rows.push(it.kind === 'msg'
+          ? { key: rowKey(it.m.id), kind: 'msg', m: it.m }
+          : { key: it.b.assistantMessageId ?? `blk:${it.i}`, kind: 'blk', b: it.b, i: it.i })
+      }
+      const gErr = apiErrorMap.get(g.key)
+      if (gErr) rows.push({ key: `err:${g.key}`, kind: 'err', err: gErr })
+    }
+    return rows
+  }, [groups, apiErrorMap, rowKey])
+  const [visCount, setVisCount] = useState(WINDOW_MAX)
+  // 会话内容首条 id 变化（切换会话/清空历史）→ 窗口重置为尾部 WINDOW_MAX；同会话 F5 重拉首 id 不变 → 保留展开窗口
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setVisCount(WINDOW_MAX)
+    // 切会话默认滚到【最底部 = 最新回复】，不沿用上一会话滚动位置/贴底态（否则上拉过旧会话后
+    //   切到 assistant 结尾的新会话会停在顶部）；等容器绑 + 内容渲染后再滚（setTimeout 0）
+    nearBottomRef.current = true
+    onNearBottomChangeRef.current?.(true)
+    const t = window.setTimeout(() => stickBottom(), 0)
+    return () => window.clearTimeout(t)
+  }, [messages[0]?.id])
+  const hasMoreOlder = flatRows.length > visCount
+  const visible = hasMoreOlder ? flatRows.slice(flatRows.length - visCount) : flatRows
+  // onScroll 在滚动容器重绑时闭包捕获旧值 → 经 ref 读最新（窗口扩展后触顶监听不停摆）
+  const flatRowsLenRef = useRef(flatRows.length)
+  flatRowsLenRef.current = flatRows.length
+  const visCountRef = useRef(visCount)
+  visCountRef.current = visCount
+  const loadPrevScrollHRef = useRef(0)
+  // 窗口扩展（顶部插入更早历史）后补偿 scrollTop（内容增高差）→ 阅读位置不跳动（loadPrev 置位的那次渲染后执行）
+  useEffect(() => {
+    if (!loadPrevScrollHRef.current) return
+    const el = scrollElRef.current
+    if (el) el.scrollTop += el.scrollHeight - loadPrevScrollHRef.current
+    loadPrevScrollHRef.current = 0
+  })
   // 空态（置于所有 hooks 之后 · React 19 hooks 规则：hooks 前不得条件 return）
   if (messages.length === 0 && !streaming) {
     return null
@@ -744,22 +830,48 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
           display: block;
           margin-bottom: 6px;
         }
-        /* 用户消息非图片附件（PDF/文件）文件名 chip（乐观追加 userAttachments 快照） */
+        /* 用户消息文件附件（PDF/Word/视频/音频）卡片：白底 + 阴影 + hover 阴影加深 · 点击预览 */
         .user-attach-file {
           display: inline-flex;
           align-items: center;
-          gap: 6px;
-          max-width: 280px;
-          padding: 5px 10px;
-          margin-bottom: 6px;
-          background: rgba(0,0,0,.045);
+          gap: 8px;
+          max-width: 320px;
+          padding: 7px 12px;
+          background: #fff;
           border: 1px solid rgba(0,0,0,.08);
-          border-radius: 7px;
+          border-radius: 10px;
           font-size: 12.5px;
           color: var(--ink);
+          cursor: pointer;
+          font-family: inherit;
+          line-height: 1.5;
+          text-align: left;
+          box-shadow: 0 1px 3px rgba(20,20,19,.08), 0 1px 2px rgba(20,20,19,.04);
+          transition: box-shadow .15s ease;
         }
-        .user-attach-file .uaf-icon { width: 14px; height: 14px; flex-shrink: 0; color: var(--accent); }
+        .user-attach-file:hover { box-shadow: 0 6px 16px rgba(20,20,19,.14), 0 2px 6px rgba(20,20,19,.08); }
         .user-attach-file .uaf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* 类型徽标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
+        .uaf-badge {
+          flex-shrink: 0;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          min-width: 22px;
+          height: 17px;
+          padding: 0 4px;
+          border-radius: 4px;
+          font-size: 10px;
+          font-weight: 700;
+          color: #fff;
+        }
+        .uaf-badge.pdf { background: #FA5151; }
+        .uaf-badge.word { background: #2B579A; }
+        .uaf-badge.excel { background: #217346; }
+        .uaf-badge.icon { background: transparent; color: #666; min-width: 16px; padding: 0; }
+        .uaf-badge.icon svg { width: 15px; height: 15px; display: block; }
+        .uaf-badge.icon.video { color: #E4572E; }
+        .uaf-badge.icon.audio { color: #6B5BCE; }
         /* CRON 定时任务触发系统通知（scheduled_task_fire · 对齐 CC SystemTextMessage「❋ 任务执行中」） */
         .msg.system-notice { justify-content: flex-start; padding: 4px 0; }
         .system-notice {
@@ -788,40 +900,40 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
           assistant.toolCalls[].result（DB 重拉后），独立渲染会重复噪音 → 一并过滤 */}
       {/* 按 userMessageId 分组渲染（消息链锚定 · 对齐 GET /messages 后端出站链）：
           每组 = 一个 flow（user 消息 + 其 assistant/工具流），工具轮挂主气泡下；排队场景顺序正确 */}
-      {groups.map((g) => (
-        <Fragment key={g.key}>
-          {g.items.map((it) => it.kind === 'msg' ? (
-            <Message key={rowKey(it.m.id)} msg={it.m} onDelete={onDelete} onRunHtml={setHtmlPreview} />
-          ) : (
-            <div className={`msg assistant${it.i === (streaming?.length ?? 0) - 1 ? ' streaming' : ''}`} key={it.b.assistantMessageId ?? it.i}>
-              <div className="avatar">N</div>
-              <div className="body">
-                <div className="author">nexus</div>
-                {cleanReasoning(it.b.reasoning) && (() => {
-                  // [bug-101] 流式思考块收起：按块 assistantMessageId 记收起态（此前恒展开 + div 无 onClick）
-                  const blkId = it.b.assistantMessageId ?? String(it.i)
-                  const collapsed = !!collapsedStreamReasoning[blkId]
-                  return (
-                    <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
-                      <button className="thinking-toggle" onClick={() => setCollapsedStreamReasoning((prev) => ({ ...prev, [blkId]: !collapsed }))}>
-                        <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
-                        <span>正在思考…</span>
-                      </button>
-                      {!collapsed && <div className="thinking-body">{cleanReasoning(it.b.reasoning)}</div>}
-                    </div>
-                  )
-                })()}
-                {it.b.content && <MdContent className="content md" html={renderMd(it.b.content)} onRunHtml={setHtmlPreview} />}
-                {it.b.toolCalls.length > 0 && it.b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} />)}
-              </div>
+      {visible.map((row) => {
+        if (row.kind === 'msg') {
+          return <MemoMessage key={row.key} msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} />
+        }
+        if (row.kind === 'err') {
+          return <ApiErrorCard key={row.key} err={row.err} />
+        }
+        const b = row.b
+        const blkIdx = row.i
+        return (
+          <div className={`msg assistant${blkIdx === (streaming?.length ?? 0) - 1 ? ' streaming' : ''}`} key={row.key}>
+            <div className="avatar">N</div>
+            <div className="body">
+              <div className="author">nexus</div>
+              {cleanReasoning(b.reasoning) && (() => {
+                // [bug-101] 流式思考块收起：按块 assistantMessageId 记收起态（此前恒展开 + div 无 onClick）
+                const blkId = b.assistantMessageId ?? String(blkIdx)
+                const collapsed = !!collapsedStreamReasoning[blkId]
+                return (
+                  <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
+                    <button className="thinking-toggle" onClick={() => setCollapsedStreamReasoning((prev) => ({ ...prev, [blkId]: !collapsed }))}>
+                      <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+                      <span>正在思考…</span>
+                    </button>
+                    {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
+                  </div>
+                )
+              })()}
+              {b.content && <StreamingMd content={b.content} onRunHtml={openHtmlPreview} />}
+              {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} />)}
             </div>
-          ))}
-          {(() => {
-            const err = apiErrorMap.get(g.key)
-            return err ? <ApiErrorCard key={`err-${g.key}`} err={err} /> : null
-          })()}
-        </Fragment>
-      ))}
+          </div>
+        )
+      })}
       {/* 无 flow 锚定的错误（userMessageId/assistantMessageId 均缺失）→ 兜底渲染在末尾 */}
       {(() => { const err = apiErrorMap.get('global'); return err ? <ApiErrorCard key="err-global" err={err} /> : null })()}
       {/* 回到最底部（离底时显示 · 对齐 deepseek-harness ChatView toBottom） */}
@@ -840,7 +952,6 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
         </div>
       )}
     </div>
-      {htmlPreview && <HtmlPreviewModal code={htmlPreview} onClose={() => setHtmlPreview(null)} />}
     </>
   )
 }

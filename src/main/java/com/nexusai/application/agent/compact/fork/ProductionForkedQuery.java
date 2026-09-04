@@ -329,7 +329,10 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                     + "（CC forkedAgent.ts:557-566 从 message_delta 累计）——provider 未提取 "
                     + "usage 或真实响应无 usage；input/cache 随 usage 缺失同为 0（如实不伪造）");
         }
-        return new ForkedAgentResult(outputMessages, totalUsage);
+        // [A 命中率口径] 第 3 组件 providerType = provider.type()：下游 cacheHitRate 按协议分派
+        //   （anthropic → read/(input+read+create)；openai_sdk/deepseek → read/input，input 已含 cache hit）。
+        //   provider 已在 :182-184 判空（null 抛 IllegalStateException）→ 此处恒非 null。
+        return new ForkedAgentResult(outputMessages, totalUsage, provider.type());
     }
 
     // ════════════════════════════════════════════════════════════════════

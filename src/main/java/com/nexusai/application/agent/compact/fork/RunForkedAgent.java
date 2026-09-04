@@ -238,6 +238,9 @@ public final class RunForkedAgent {
         //   （logForkAgentQueryEvent 在 runForkedAgent 完成时发射，全字段 + cacheHitRate 派生）。
         //   queryTracking 取父 toolUseContext（CC :619 toolUseContext.queryTracking）·
         //   querySource 取 canonical 小写值（QuerySource.canonical，如 'compact'/'session_memory'）。
+        // [A 命中率口径] 末参 anthropic = provider 协议判定（ForkedAgentResult 第 3 组件 providerType）：
+        //   ProductionForkedQuery 传 provider.type() → "anthropic".equals 判 Anthropic；测试/便捷
+        //   构造 providerType=null → false（非 anthropic read/input 语义，deepseek 不双计）。
         AgentContext.emitForkAgentQueryEvent(
             telemetry,
             params.forkLabel(),
@@ -248,7 +251,8 @@ public final class RunForkedAgent {
             usage.outputTokens(),
             usage.cacheReadInputTokens(),
             usage.cacheCreationInputTokens(),
-            cs.toolUseContext() != null ? cs.toolUseContext().queryTracking() : null);
+            cs.toolUseContext() != null ? cs.toolUseContext().queryTracking() : null,
+            "anthropic".equals(result.providerType()));
         return result;
     }
 
