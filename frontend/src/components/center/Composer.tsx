@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import { QueuedCommandsBar } from './QueuedCommandsBar'
 import { SessionToolsPanel } from './SessionToolsPanel'
+import { CatArtBody } from '../startup/CatArt'
 import type { QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
 import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
@@ -525,10 +526,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       {/* 空态 hero：logo 动画 + 标题 + quick-actions（对齐主界面原型） */}
       {empty && (
         <div className="welcome">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="welcome-logo">
-            <path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8z" />
-            <path d="M12 6a6 6 0 1 0 6 6 6 6 0 0 0-6-6zm0 10a4 4 0 1 1 4-4 4 4 0 0 1-4 4z" />
-          </svg>
+          <CatArtBody className="welcome-logo" />
           <div className="hero-title">你好，今天有什么可以帮忙的</div>
           <div className="quick-actions">
             <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>⚡ 生成实体提取脚本</div>

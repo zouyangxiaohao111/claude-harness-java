@@ -241,6 +241,36 @@ class StreamingToolExecutorRealtimePushTest {
         assertThat(res.getAssistantMessageId()).isEqualTo("turn-1");
     }
 
+    @Test
+    @DisplayName("T5b 工具正常完成但零输出 → tool_result 实时推占位（修复 A：防前端假『执行中』）")
+    void emptySuccessExit_pushesNoOutputPlaceholder() throws Exception {
+        // WHY：cmd start 开浏览器等空输出成功命令，旧实现实时推 result="" → 前端 ToolCard 拿
+        //   result.trim()!=='' 判完成 → 空结果被当"未完成" → 永久「执行中」假卡（真实已 0.76s 完成）。
+        //   修复：空 String data 推占位 "(<tool> completed with no output)"，与 role=tool 落库兜底
+        //   （applyToolResultBudget）一致，实时/刷新两路结果一致。
+        SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        ToolRegistry registry = new ToolRegistry();
+        registry.register(quickTool("quick", ""));   // 空输出成功（cmd start 开浏览器同形态）
+        AgentState state = new AgentState("sys");
+        StreamingToolExecutor exec = newExecutor(registry, pool);
+        exec.setAgentState(state);
+        exec.setToolStreamPublisher(ws, TOPIC, "sess-1", "msg-u1");
+
+        exec.add(call("tc1b", "quick"), ToolParent.of("turn-1"), null);
+        exec.getRemainingResults();
+        pool.shutdown();
+
+        ArgumentCaptor<StreamEvent> captor = ArgumentCaptor.forClass(StreamEvent.class);
+        verify(ws, atLeastOnce()).convertAndSend(eq(TOPIC), captor.capture());
+        MessageToolResultEvent res = toolResult(captor, "tc1b");
+        assertThat(res).isNotNull();
+        assertThat(res.getIsError()).isFalse();
+        assertThat(res.getResult())
+            .as("空输出成功须推占位 '(quick completed with no output)'（对齐 applyToolResultBudget 落库兜底）")
+            .isEqualTo("(quick completed with no output)");
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // T6: catch(Throwable) 出口
     // ════════════════════════════════════════════════════════════════════

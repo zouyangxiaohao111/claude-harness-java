@@ -14,9 +14,16 @@
     "core:window:allow-is-maximized",
     "core:window:allow-start-dragging",
     "core:window:allow-set-focus",
+    "core:window:allow-set-size",
+    "core:window:allow-set-min-size",
+    "core:window:allow-center",
+    "core:window:allow-outer-size",
     "dialog:allow-open",
     "fs:allow-read-file",
     "fs:allow-write-text-file",
+    "fs:allow-stat",
+    "fs:allow-exists",
+    "fs:allow-read-dir",
     {
       "identifier": "fs:scope",
       "allow": [{ "path": "**" }]

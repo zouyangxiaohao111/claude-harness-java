@@ -3,7 +3,14 @@
 
 use std::path::PathBuf;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
+
+/// 后端进程生命周期管理（T12）：探活 / 启动 / 等待就绪 / 整树回收本地后端 java 进程。
+mod backend;
+
+/// 本会话由 Tauri 壳自启的后端 java 进程 pid。
+/// None = 启动时 3458 已有外部后端在跑（复用）或尚未自启 —— 此时关窗不回收外部进程。
+struct BackendState(std::sync::Mutex<Option<u32>>);
 
 /// 查找本机 Chrome / Chromium 可执行文件。
 /// Windows：Program Files / Program Files (x86) / %LOCALAPPDATA%；
@@ -170,7 +177,15 @@ fn install_chrome_extension(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // 单实例：第二实例启动即退出并把已运行实例的主窗口置前聚焦，
+        // 防止两个壳实例各自拉起后端、争抢 3458 端口（窗口 label 默认 "main"）
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
+        .manage(BackendState(std::sync::Mutex::new(None)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
@@ -179,18 +194,110 @@ fn main() {
             install_chrome_extension
         ])
         .setup(|app| {
-            // 启动时按显示器尺寸 85% 设置窗口（用户拍板：百分比 85%）
+            // ===== 启动期小窗（承载 loader）+ 就绪放大交给前端 =====
+            // 背景：后端冷启动实测可能 >8s（首次 Flyway 全量迁移 / c3p0 / Quartz bean 初始化）。
+            // 若窗口初始就是 85% 大窗，首帧将长时间空白/白屏。故启动期用 460x400 小窗承载 loader，
+            // 前端收到 backend-ready 事件后自驱放大到显示器 85%（放大权在前端，L2 前端实现）。
+            // 注：460x400 小于 tauri.conf.json 的 minWidth/minHeight(960x600)，先临时下调最小尺寸，
+            //     否则 set_size 会被系统 clamp 回 960x600，小窗不生效；前端放大后如需恢复
+            //     960x600 下限，由前端 setMinSize 再设回（后端就绪前保持小窗由壳保证）。
             if let Some(window) = app.get_webview_window("main") {
-                if let Some(monitor) = window.current_monitor().ok().flatten() {
-                    let s = monitor.size();
-                    let w = (s.width as f64 * 0.85) as u32;
-                    let h = (s.height as f64 * 0.85) as u32;
-                    let _ = window.set_size(tauri::PhysicalSize::new(w, h));
-                    let _ = window.center();
-                }
+                let _ = window.set_min_size(Some(tauri::PhysicalSize::new(460, 400)));
+                let _ = window.set_size(tauri::PhysicalSize::new(460, 400));
+                let _ = window.center();
             }
+
+            // ===== 后端进程生命周期（T12）=====
+            // 1) 数据目录 .nexusai 与 .nexusai/logs 就绪（后端日志落盘前提）。
+            //    失败先把关键信息写启动器日志 tauri-launcher.log（release 无控制台时唯一排障通道），再返回 Err
+            if let Err(e) = backend::ensure_data_dirs() {
+                let msg = format!("初始化本地数据目录失败：{}（请检查用户主目录权限）", e);
+                backend::log_launcher(&msg);
+                return Err(msg.into());
+            }
+
+            // 供后台线程 emit 事件；clone 出独立 AppHandle，避免线程内借用 app
+            let handle = app.handle().clone();
+
+            // 2) 3458 无后端才自启；已有（外部进程 / 上一会话残留）则直接复用，不重复拉起
+            if !backend::backend_ready() {
+                // 3) spawn 随包裁剪 JRE：javaw -jar backend/nexusai-backend.jar --spring.profiles.active=prod
+                let pid = backend::spawn_backend(&handle).map_err(|e| {
+                    let msg = format!(
+                        "本地后端启动失败：{}（请查看 {}/logs/backend.log）",
+                        e,
+                        backend::data_dir().display()
+                    );
+                    backend::log_launcher(&msg);
+                    msg
+                })?;
+                // 记录 pid 到 state，供关窗 / 退出时整树回收
+                *app.state::<BackendState>().0.lock().unwrap() = Some(pid);
+                eprintln!("[backend] 已启动本地后端，pid={}，后台等待健康就绪…", pid);
+
+                // 4) 关键：setup 不阻塞主线程 —— 起后台线程轮询 /actuator/health 最多 60s，
+                //    窗口首帧立即渲染 loader（Spring Boot prod 冷启动实测 >8s：首次 Flyway 全量迁移 /
+                //    c3p0 / Quartz bean 初始化）。就绪 / 超时都经事件通知前端（事件名定死，L2 前端 listen）：
+                //    - backend-ready：后端已就绪，前端据此放大窗口到 85%
+                //    - backend-error：启动超时，前端据此提示；超时先 kill_process_tree(pid) 防孤儿
+                std::thread::spawn(move || {
+                    if backend::wait_backend_ready(backend::WAIT_BACKEND_READY_TIMEOUT) {
+                        eprintln!("[backend] 本地后端已就绪：http://localhost:3458/actuator/health");
+                        let _ = handle.emit("backend-ready", ());
+                    } else {
+                        backend::kill_process_tree(pid);
+                        let msg = format!(
+                            "本地后端启动超时（{} 秒内未就绪，已回收进程树 pid={}），请查看 {}/logs/backend.log（中文）。",
+                            backend::WAIT_BACKEND_READY_TIMEOUT.as_secs(),
+                            pid,
+                            backend::data_dir().display()
+                        );
+                        backend::log_launcher(&msg);
+                        let _ = handle.emit("backend-error", msg);
+                    }
+                });
+            } else {
+                eprintln!("[backend] 检测到 3458 已有后端在运行，跳过自启");
+                // dev 等外部后端已就绪：立即通知前端。
+                // 注：此刻 webview 可能尚未挂载监听，事件可能 miss —— 前端启动时应自带一次探活兜底
+                let _ = handle.emit("backend-ready", ());
+            }
+
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .on_window_event(|window, event| {
+            // 用户关窗：整树杀掉本会话自启的后端 java（防孤儿）；take() 后 state 置 None
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let pid = window
+                    .app_handle()
+                    .state::<BackendState>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some(p) = pid {
+                    eprintln!("[backend] 窗口关闭，回收后端进程树 pid={}", p);
+                    backend::kill_process_tree(p);
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        // 兜底：非“关窗”路径的退出（RunEvent::ExitRequested）再回收一次；
+        // take() 幂等——若已在关窗时 kill 过则此处为 None，直接跳过
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            let pid = app_handle
+                .state::<BackendState>()
+                .0
+                .lock()
+                .unwrap()
+                .take();
+            if let Some(p) = pid {
+                eprintln!("[backend] 应用退出，回收后端进程树 pid={}", p);
+                backend::kill_process_tree(p);
+            }
+        }
+    });
 }

@@ -36,6 +36,15 @@ const TIER_FIELD: Partial<Record<ModelRole, ModelSettingsKey>> = {
   '权限分类器': 'classifierModel',
 }
 
+/** L4b 首启引导：仅给向导讲解/绑定涉及的 5 张档位卡挂 data-tour 标记（主/最强/快速/弱/子代理） */
+const ROLE_TOUR: Partial<Record<ModelRole, string>> = {
+  '主模型': 'role-main',
+  '最强模型': 'role-strong',
+  '快速模型': 'role-fast',
+  '弱模型': 'role-weak',
+  '子代理': 'role-sub',
+}
+
 interface Props {
   providers: Provider[]
   settings: AppSettings | null
@@ -79,6 +88,7 @@ export function ModelSettingsPanel({ providers, settings, onSaveSettings, fastMo
             <div
               key={k}
               className={`role-card ${isActive ? 'active' : ''} ${isConfigured ? 'configured-card' : ''}`}
+              data-tour={ROLE_TOUR[k] ?? undefined}
               onClick={() => setRole(k)}
             >
               <div className="role-name">

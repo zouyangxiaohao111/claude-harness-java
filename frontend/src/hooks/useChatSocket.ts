@@ -513,7 +513,10 @@ export function useChatSocket(
     // 后端 d973edad 新增顶层 type='task.notification'（结构化终态直推 · 含空闲路径）：
     //   更新任务状态活动历史 + toast（对齐 CC 任务完成通知）；按会话过滤（契约 §二）
     if (evt.type === 'task.notification') {
-      const taskId = evt.taskId ?? null
+      // wire 键 = task_id（后端 TaskNotificationEvent @JsonProperty("task_id")，非 camelCase taskId）——
+      //   旧实现读 evt.taskId 恒 undefined → taskId=null → addActivity 永不执行 → 子代理后台任务终态
+      //   丢失、卡片「运行中」虚高（2026-09-05 修复，配合 types.ts TaskNotificationWireEvent.task_id）。
+      const taskId = evt.task_id ?? evt.userMessageId ?? null
       if (taskId) {
         useSubagentStore.getState().addActivity(taskId, {
           type: evt.status === 'failed' ? 'failed' : evt.status === 'stopped' ? 'stopped' : 'done',

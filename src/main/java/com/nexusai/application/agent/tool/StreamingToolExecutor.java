@@ -3649,7 +3649,26 @@ public class StreamingToolExecutor {
         if (assistantId == null) {
             assistantId = "";
         }
-        String result = truncateResult(t.result == null ? null : t.result.data());
+        // 空输出成功工具（cmd start 开浏览器等零 stdout 命令）实时推 result="" → 前端 ToolCard 拿
+        //   result.trim()!=='' 判完成 → 永久「执行中」假卡（真实 0.76s 已完成）。对齐
+        //   AgentLoopContext.applyToolResultBudget(:2181) 的落库兜底：String data trim 空 → 占位
+        //   "(<tool> completed with no output)"，保证实时事件与 role=tool 落库/给 LLM 结果一致
+        //   （BashTool 空输出假卡事故 2026-09-05 · 修复 A）。rawData 为 null / 非 String（结构化 data<T>）
+        //   不兜底（对齐 applyToolResultBudget 仅 String 分支），原样 truncateResult。
+        Object rawData = t.result == null ? null : t.result.data();
+        String result;
+        if (rawData instanceof String sd && sd.trim().isEmpty()) {
+            // 空输出占位（BashTool 空输出假卡事故 2026-09-05 · 修复 A）：让实时事件与 role=tool
+            //   落库/给 LLM 结果（applyToolResultBudget 兜底）一致，前端不再把空结果当"未完成"。
+            result = "(" + t.call.name() + " completed with no output)";
+            if (log.isDebugEnabled()) {
+                log.debug("TOOL realtime tool_result 空输出兜底: tool={} id={} → 占位 '{}'（修复 A, 对齐 applyToolResultBudget）",
+                    t.call.name(), abbreviate(t.call.id(), 24), result);
+            }
+        } else {
+            // null / 非 String data（结构化 data<T>）不兜底（对齐 applyToolResultBudget 仅 String 分支）
+            result = truncateResult(rawData);
+        }
         try {
             ts.wsTemplate().convertAndSend(ts.streamTopic(),
                 new MessageToolResultEvent(ts.sessionId(), ts.userMessageId(),

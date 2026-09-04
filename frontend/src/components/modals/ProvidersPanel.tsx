@@ -41,6 +41,13 @@ const EMPTY_MODEL: Model = {
   maxContextTokens: null,
 }
 
+/** L4b-2：新建 provider 的「首个模型」name 预填提示（anthropic → claude-sonnet-4-5；其余留空，由引导文案示例引导） */
+const firstModelNameHint = (p: Provider): string => {
+  if (p.models.length > 0) return ''
+  const isAnthropic = p.type === 'anthropic' || (p.baseUrl ?? '').toLowerCase().includes('api.anthropic.com')
+  return isAnthropic ? 'claude-sonnet-4-5' : ''
+}
+
 
 const EditIcon = () => (
   <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
@@ -63,7 +70,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null)
   const [addingProvider, setAddingProvider] = useState(false)
   const [editingModel, setEditingModel] = useState<{ providerId: string; model: Model } | null>(null)
-  const [addingModelFor, setAddingModelFor] = useState<string | null>(null)
+  const [addingModelFor, setAddingModelFor] = useState<{ providerId: string; prefillName: string } | null>(null)
   const [pending, setPending] = useState(false)
 
   // ---- Provider CRUD 包装（带错误处理 + toast） ----
@@ -123,8 +130,10 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       enabled: p.enabled ?? true,
     }
     void wrap(async () => {
-      await createProvider(req)
+      const created = await createProvider(req)
       setAddingProvider(false)
+      // L4b-2 首启引导信号：带 created 详情（内含 models），引导据此判断是否需补插「添加模型」步
+      window.dispatchEvent(new CustomEvent('nexusai:provider-saved', { detail: created }))
     }, `已添加: ${p.name}`)
   }
 
@@ -165,6 +174,8 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
     void wrap(async () => {
       await createModel(providerId, req)
       setAddingModelFor(null)
+      // L4b-2 首启引导信号：模型真实创建成功后派发，引导据此从「添加模型」步进入主模型绑定
+      window.dispatchEvent(new CustomEvent('nexusai:model-added'))
     }, `已添加模型: ${m.name}`)
   }
 
@@ -187,6 +198,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
         </div>
         <button
           className="settings-add-btn"
+          data-tour="add-provider"
           onClick={() => setAddingProvider(true)}
           disabled={pending}
         >
@@ -238,7 +250,11 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
             ))
           )}
 
-          <button className="add-model-btn" onClick={() => setAddingModelFor(p.id)}>+ 添加模型</button>
+          <button
+            className="add-model-btn"
+            data-tour="add-model"
+            onClick={() => setAddingModelFor({ providerId: p.id, prefillName: firstModelNameHint(p) })}
+          >+ 添加模型</button>
         </div>
       ))}
 
@@ -319,9 +335,9 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
 
       {addingModelFor && (
         <ModelFormModal
-          initial={EMPTY_MODEL}
-          providerName={list.find((x) => x.id === addingModelFor)?.name}
-          onSave={(m) => onAddModel(addingModelFor, m)}
+          initial={{ ...EMPTY_MODEL, name: addingModelFor.prefillName }}
+          providerName={list.find((x) => x.id === addingModelFor.providerId)?.name}
+          onSave={(m) => onAddModel(addingModelFor.providerId, m)}
           onCancel={() => setAddingModelFor(null)}
         />
       )}

@@ -1,5 +1,5 @@
 import './styles/globals.css'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   allProjects,
@@ -33,6 +33,7 @@ import { useSkills } from '@/hooks/useSkills'
 import { useMcp } from '@/hooks/useMcp'
 import { useDatabases } from '@/hooks/useDatabases'
 import { useSchedules } from '@/hooks/useSchedules'
+import { useFirstRunGuide } from '@/hooks/useFirstRunGuide'
 import { useSession, useProject, useUI, useSettings } from '@/reducers'
 
 import { TitleBar } from '@/components/layout/TitleBar'
@@ -54,10 +55,9 @@ import { ChromePanel } from '@/components/center/ChromePanel'
 import { SkillSurvey } from '@/components/center/SkillSurvey'
 import { RightPanel } from '@/components/right/RightPanel'
 import { ProjectContextMenu } from '@/components/right/ProjectContextMenu'
-import { DiffModal } from '@/components/modals/DiffModal'
-import { FileViewModal } from '@/components/modals/FileViewModal'
 import { SearchPalette } from '@/components/modals/SearchPalette'
 import { SettingsModal } from '@/components/modals/SettingsModal'
+import { TourOverlay } from '@/components/startup/tour/TourOverlay'
 import { ModelPickerModal } from '@/components/modals/ModelPickerModal'
 import { EffortModal } from '@/components/modals/EffortModal'
 import { ContextAnalyzeModal } from '@/components/modals/ContextAnalyzeModal'
@@ -67,6 +67,16 @@ import { SkillMarketModal } from '@/components/modals/SkillMarketModal'
 import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
 import { getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
+
+// L5 首屏提速：DiffModal/FileViewModal 都是按需打开的弹窗，静态 import 会把整包 monaco-editor
+// （经 @/utils/monaco）拖进同步入口 chunk（index-*.js 曾 ~4.6MB min）。改 React.lazy 后 monaco
+// 拆到独立异步 chunk，真正首次打开弹窗才请求/解析；两弹窗均具名导出，需映射到 default 供 lazy 使用。
+const DiffModal = lazy(() =>
+  import('@/components/modals/DiffModal').then((m) => ({ default: m.DiffModal })),
+)
+const FileViewModal = lazy(() =>
+  import('@/components/modals/FileViewModal').then((m) => ({ default: m.FileViewModal })),
+)
 
 /** Per-session project state: main, subs, expanded toggles, transient flash. */
 interface SessionProjectState {
@@ -1095,6 +1105,25 @@ function App() {
     [settingsDispatch, uiDispatch],
   )
 
+  // L4b 首启引导：打开/切换设置 tab —— 设置已开只切 tab；未开才打开（区别于上方 toggle 语义）
+  const openSettingsTo = useCallback(
+    (tab: SettingsTab) => {
+      settingsDispatch({ type: 'SET_SETTINGS_TAB', tab })
+      if (!ui.showSettings) uiDispatch({ type: 'TOGGLE_SETTINGS' })
+    },
+    [settingsDispatch, uiDispatch, ui.showSettings],
+  )
+  // L4b 首启引导编排（提供商→模型 顺序向导 · 全新安装自动弹，老用户绝不弹）
+  const firstRunGuide = useFirstRunGuide({
+    providers: providersApi.list,
+    providersLoading: providersApi.loading,
+    providersError: providersApi.error,
+    appSettings,
+    settingsOpen: ui.showSettings,
+    openSettingsAt: openSettingsTo,
+    closeSettings: () => uiDispatch({ type: 'CLOSE_SETTINGS' }),
+  })
+
   // ---- file rollback/confirm (mock: just toast + remove from active session context) ----
   const rollbackFile = useCallback(
     (name: string) => {
@@ -1483,13 +1512,20 @@ function App() {
       {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport） */}
       <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />
 
-      <DiffModal diff={currentDiff} close={() => uiDispatch({ type: 'SET_DIFF', file: null })} />
+      {/* L5 懒加载弹窗：diff/文件查看 首次打开才拉 monaco chunk；加载毫秒级 → fallback=null 不闪空 */}
+      {currentDiff && (
+        <Suspense fallback={null}>
+          <DiffModal diff={currentDiff} close={() => uiDispatch({ type: 'SET_DIFF', file: null })} />
+        </Suspense>
+      )}
       {openFile && (
-        <FileViewModal
-          projectId={openFile.projectId}
-          path={openFile.path}
-          close={() => setOpenFile(null)}
-        />
+        <Suspense fallback={null}>
+          <FileViewModal
+            projectId={openFile.projectId}
+            path={openFile.path}
+            close={() => setOpenFile(null)}
+          />
+        </Suspense>
       )}
       {showEffort && (
         <EffortModal
@@ -1599,6 +1635,15 @@ function App() {
           showToast={showToast}
         />
       )}
+      {/* L4b 首启引导 Spotlight（全局层 · TourOverlay 未激活时返回 null） */}
+      <TourOverlay
+        active={firstRunGuide.active}
+        stepIndex={firstRunGuide.stepIndex}
+        steps={firstRunGuide.steps}
+        onNext={firstRunGuide.onNext}
+        onSkip={firstRunGuide.onSkip}
+        done={firstRunGuide.done}
+      />
       <ProjectContextMenu
         contextMenu={ui.contextMenu}
         mainProject={sessionProject.main}

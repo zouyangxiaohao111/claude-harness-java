@@ -1205,14 +1205,20 @@ export interface TaskNotificationEvent extends TaskEventBase {
 
 /**
  * 后端 d973edad 新增顶层 type='task.notification' 结构化事件（/topic/tasks · 后台任务每次终态
- * completed/failed/killed 都直推，含空闲路径）。字段 sessionId/taskId（camelCase），与既有
+ * completed/failed/killed 都直推，含空闲路径）。wire 字段 = task_id（后端 TaskNotificationEvent
+ * @JsonProperty("task_id")），且任务 id 同时落 StreamEvent 基类 userMessageId 槽位；sessionId 由
+ * StreamEvent 承载。⚠️ 勿声明 taskId（camelCase）——wire 从不含该键，旧实现读 evt.taskId → 终态
+ * addActivity 永不执行 → 子代理后台任务「运行中」虚高（2026-09-05 修复）。与既有
  * system+subtype=task_notification 并存 —— 前者是结构化载荷（前端按会话过滤 + 更新任务状态），
- * 后者是旧 type='system' 通知。
+ * 后者是旧 type='system' 通知（其 task_id 已正确）。
  */
 export interface TaskNotificationWireEvent {
   type: 'task.notification'
   sessionId?: string | null
-  taskId?: string | null
+  /** 任务 id（@JsonProperty("task_id")） */
+  task_id?: string | null
+  /** StreamEvent 基类槽位（后端把 taskId 同时放入 userMessageId 槽，作兜底） */
+  userMessageId?: string | null
   status?: string | null
   summary?: string | null
 }

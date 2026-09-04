@@ -324,11 +324,15 @@ function ToolCard({ tool, matchedRule }: { tool: NonNullable<ChatMessageDto['too
       }
     } catch { return null }
   })() : null
-  // 工具状态：有 result = 已完成；无 result 且非 error = 执行中（OUT 未出前不应标「已完成」）
-  const hasOutput = tool.result != null && tool.result.trim() !== ''
+  // 工具状态：收到 tool_result（result 由 null → 有值，含空串 = 无输出成功命令）即已完成；
+  //   result 仍为 null 且非 error = 执行中（OUT 未回前不应标「已完成」）。
+  //   WHY：空输出成功 Bash（cmd start 开浏览器等零 stdout）后端实时推 result=""，旧实现拿
+  //   result.trim()!=='' 判完成 → 空结果被当未完成 → 永久「执行中」假卡
+  //   （BashTool 空输出假卡事故 2026-09-05 · 修复 B）。OUT 区显隐用内联 result.trim()!==''（下方 body）。
+  const hasResult = tool.result != null
   // [Ctrl+B 转后台] 运行中的前台工具卡（Bash/Agent · 后端按类型自动分发）：toolUseId 关联 taskId →
   //   isBackgrounded!==true（前台）且 running → 显示「转后台」；已后台化任务不显示（异步面板可见）
-  const runningFront = !hasOutput && !tool.isError
+  const runningFront = !hasResult && !tool.isError
   const [bgTaskId, setBgTaskId] = useState<string | null>(null)
   useEffect(() => {
     if (!runningFront) { setBgTaskId(null); return }
@@ -362,8 +366,8 @@ function ToolCard({ tool, matchedRule }: { tool: NonNullable<ChatMessageDto['too
             已自动批准（{rule}）
           </span>
         )}
-        <span className={`status ${tool.isError ? 'error' : hasOutput ? 'done' : 'running'}`}>
-          {tool.isError ? '失败' : hasOutput ? '已完成' : '执行中'}
+        <span className={`status ${tool.isError ? 'error' : hasResult ? 'done' : 'running'}`}>
+          {tool.isError ? '失败' : hasResult ? '已完成' : '执行中'}
         </span>
         {bgTaskId && (
           <span role="button" className="tc-bg" onClick={(e) => { e.stopPropagation(); e.preventDefault(); void doBackground() }} title="转到后台继续运行（Ctrl+B）">
