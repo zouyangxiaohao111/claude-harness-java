@@ -43,6 +43,7 @@ import { PermissionBubble } from '@/components/center/PermissionBubble'
 import { DialogOpsModal } from '@/components/center/DialogOpsModal'
 import { RetryBanner } from '@/components/center/RetryBanner'
 import { TokenWarningBanner } from '@/components/center/TokenWarningBanner'
+import { CompactProgressBar } from '@/components/center/CompactProgressBar'
 import { NotificationBanner } from '@/components/center/NotificationBanner'
 import { Composer } from '@/components/center/Composer'
 import { TraceView } from '@/components/center/TraceView'
@@ -353,6 +354,8 @@ function App() {
   //   OR streams 有流式块 = 打字机在推（后端主动推流/cron 续跑未登记 activeStreams 时仍要可停）。
   //   两信号互补：思考阶段靠 activeStreams；打字机阶段靠 streams（防「打字机在动但发送键已出」脱节）
   const turnRunning = !!activeStreams[activeSessionId] || (stream && stream.length > 0)
+  // 压缩进行中（compact-progress 事件 · 不经 LlmAgentLoop → turnRunning 假，需并入发送键⇄停止）
+  const compactActive = useChatStore((s) => s.compact.visible && s.compact.status === 'running')
   // 运行中会话集合（有 stream = 运行中），供左侧栏状态图标。
   // 用 useMemo 稳定引用避免 selector 每次返回新 Set 触发无限重渲染。
   const streamsMap = useChatStore((s) => s.streams)
@@ -408,6 +411,10 @@ function App() {
   // ---- 停止当前流式（Esc 一次 · turn 运行中）----
   const stopStreaming = useCallback(async () => {
     if (!activeSessionId) return
+    // 压缩进行中停止：立即收起进度横幅（后端 cancel abort 摘要；随后的 compact_end 不再显示完成态）
+    if (useChatStore.getState().compact.visible) {
+      useChatStore.getState().setCompact({ visible: false, status: 'canceled' })
+    }
     try {
       await chatApi.cancel(activeSessionId)
       clearStream(activeSessionId)
@@ -1409,6 +1416,8 @@ function App() {
           </div>
         )}
         <TokenWarningBanner />
+        {/* 压缩进度横幅（/compact 命令触发 · 输入框上方 · compact-progress 事件驱动；发送键压缩中变停止） */}
+        <CompactProgressBar />
         <NotificationBanner />
         {/* 轨迹视图只查看，不展示对话输入框 */}
         {/* 发送键 ⇄ 停止键切换用 turnRunning（activeStreams 登记 = turn 运行中，含 thinking/重试期；
@@ -1421,7 +1430,7 @@ function App() {
             showToast={showToast}
             permissionMode={activePermissionMode}
             onPermissionModeChange={handlePermissionModeChange}
-            streaming={turnRunning}
+            streaming={turnRunning || compactActive}
             onStop={stopStreaming}
             queuedCommands={commandQueue.queuedCommands}
             popEditable={() => {

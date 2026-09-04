@@ -1032,7 +1032,11 @@ public class ToolRegistrationConfig {
         StreamCompactSummary summary = new StreamCompactSummary(
             suppliers.providerSupplier(), suppliers.modelSupplier(), suppliers.configSupplier(),
             cacheSafeParamsSupplier,
-            null,                 // abortControllerSupplier（NOOP 兜底）
+            // [可中断 2026-09-04 · CC Esc] abort 源接当前压缩 AbortController：manual /compact
+            //   （handleCompactCommand registerAbort）与 auto（LlmAgentLoop）压缩期间注册 → 摘要
+            //   provider 硬断流（CC Esc 打断 compact.ts:126）。无当前压缩 → null → StreamCompactSummary
+            //   回落 NOOP（摘要不可中断 = 原行为，不回归）。
+            () -> com.nexusai.application.agent.compact.CompactProgressState.currentAbort(),
             null,                 // sessionActivitySignalSupplier
             null,                 // keepaliveExecutor（不启动 keepalive）
             false,                // sessionActivityTrackingActive
@@ -2163,8 +2167,25 @@ public class ToolRegistrationConfig {
                     warning -> wsTemplate.convertAndSend(
                         "/topic/sessions/" + pushSessionId + "/token-warning", warning));
                 CompactWarningState.registerPushContext(tokenWarningPushCtx);
+                // [compact-progress-push 2026-09-04] 压缩进度 STOMP 推送注册（对齐 CC REPL
+                //   onCompactProgress spinner：hooks_start / compact_start「Compacting conversation」/
+                //   compact_end）。compactConversation 全链 emit → CompactConversationContext
+                //   getOnCompactProgress 委托本注册 → convertAndSend 前端 topic。finally clear。
+                com.nexusai.application.agent.compact.CompactProgressState.register(event ->
+                    wsTemplate.convertAndSend(
+                        com.nexusai.application.agent.compact.CompactProgressState.topic(pushSessionId),
+                        com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event)));
             }
         }
+        // [可中断 2026-09-04 · CC Esc] 当前压缩 AbortController：registerAbort（ThreadLocal，摘要
+        //   中断源——streamCompactSummary abortControllerSupplier 已接 currentAbort）+ registerSessionAbort
+        //   （会话级，前端停止/Esc → cancelSession → CompactProgressState.abortForSession abort 摘要）。
+        //   finally clearAbort + removeSessionAbort（成对防泄漏）。对齐 CC 压缩中 Esc → abortController
+        //   → provider 断流 → 'Compaction canceled.'（compact.ts:126-127）。
+        com.nexusai.application.agent.tool.AbortController compactAbort =
+            new com.nexusai.application.agent.tool.AbortController();
+        com.nexusai.application.agent.compact.CompactProgressState.registerAbort(compactAbort);
+        com.nexusai.application.agent.compact.CompactProgressState.registerSessionAbort(sessionId, compactAbort);
         try {
             CompactCommand.CompactCommandResult result = CompactCommand.call(args, ctx);
             log.info("[R1] /compact 压缩成功: session={} displayText={}",
@@ -2186,6 +2207,11 @@ public class ToolRegistrationConfig {
             if (tokenWarningPushCtx != null) {
                 CompactWarningState.clearPushContext();
             }
+            // [compact-progress-push] 压缩进度推送清除（register 成对；幂等，未注册也安全）
+            com.nexusai.application.agent.compact.CompactProgressState.clear();
+            // [可中断] 压缩 AbortController 清理（register 成对；幂等）
+            com.nexusai.application.agent.compact.CompactProgressState.clearAbort();
+            com.nexusai.application.agent.compact.CompactProgressState.removeSessionAbort(sessionId);
             // [RES-C2] R5-4：manual provider 生命周期终结（close 幂等）
             manualProvider.close();
         }

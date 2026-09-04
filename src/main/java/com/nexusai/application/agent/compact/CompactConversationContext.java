@@ -179,7 +179,13 @@ public class CompactConversationContext {
     public String getQuerySource() { return querySource; }
     public Path getWorkspaceDir() { return workspaceDir; }
     public SessionStorage.SessionMetadata getSessionMetadata() { return sessionMetadata; }
-    public Consumer<CompactProgressEvent> getOnCompactProgress() { return onCompactProgress; }
+    public Consumer<CompactProgressEvent> getOnCompactProgress() {
+        // [compact-progress-push 2026-09-04] 显式 set（buildAutoContext 从 tuc、测试注入）优先；
+        //   未显式设置时委托 CompactProgressState 线程注册（manual/auto 压缩期间注册 STOMP 推送，
+        //   对齐 CC REPL onCompactProgress spinner）。无注册 → 回落字段默认 no-op（行为不回归）。
+        Consumer<CompactProgressEvent> registered = CompactProgressState.current();
+        return registered != null ? registered : onCompactProgress;
+    }
     public Consumer<SDKStatus> getSdkStatusSetter() { return sdkStatusSetter; }
     public Consumer<SpinnerMode> getStreamModeSetter() { return streamModeSetter; }
     public Consumer<Integer> getResponseLengthSetter() { return responseLengthSetter; }

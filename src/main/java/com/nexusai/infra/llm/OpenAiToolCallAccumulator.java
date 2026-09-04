@@ -16,6 +16,9 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 public class OpenAiToolCallAccumulator {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+    /** fail-loud 日志（_raw 兜底 2026-09-04：非法 arguments 记录含工具名/长度/异常）· slf4j（CLAUDE.md 规则）。 */
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(OpenAiToolCallAccumulator.class);
 
     public int index;
     public String id;      // 第一块设定
@@ -30,7 +33,11 @@ public class OpenAiToolCallAccumulator {
                 ? JSON.createObjectNode()
                 : JSON.readTree(args);
         } catch (Exception e) {
-            // arguments 不是合法 JSON（罕见）→ 用空对象 + 原始字符串
+            // arguments 不是合法 JSON（openai 兼容超长参数漏转义，2026-09-04 事故）→ 记录 fail-loud，
+            //   包 {_raw: 原文}（执行层 StreamingToolExecutor 拦截并引导模型拆小，见其 _raw 拦截块）。
+            log.warn("OpenAiToolCallAccumulator: tool_call arguments 非法 JSON（readTree 失败）"
+                    + "name={} len={} err={} → _raw 兜底", name,
+                args == null ? 0 : args.length(), e.toString());
             ObjectNode wrapper = JSON.createObjectNode();
             wrapper.put("_raw", args == null ? "" : args);
             input = wrapper;

@@ -1316,6 +1316,37 @@ public class StreamingToolExecutor {
                             abbreviate(t.call.id(), 24), t.call.name());
                     }
                 }
+                // ── [_raw 拦截 2026-09-04] arguments JSON 解析失败兜底检测 ──
+                //   openai 兼容模型（deepseek 等）生成超大 tool 参数（Bash heredoc / Write 大 content，
+                //   整页 HTML 上千引号）时，手写 JSON 转义偶发非法 → accumulator/provider 兜底包
+                //   {_raw: 原文}。此时走 zod 校验只报误导性「缺 command 多 _raw」（模型误以为自己该传
+                //   _raw，陷入 20+ 轮重试死循环）。此处拦截产「模型可行动」引导：参数非合法 JSON →
+                //   提示拆小重试。对齐 CC：非法 input 走 zod safeParse 失败给模型错误（CC 无 _raw
+                //   概念——Anthropic tool input 为结构化对象，模型不负责 JSON 转义）。
+                if (strippedInput != null && strippedInput.isObject() && strippedInput.size() == 1
+                        && strippedInput.has("_raw") && strippedInput.get("_raw").isTextual()) {
+                    String toolName = (t.tool != null && t.tool.name() != null)
+                        ? t.tool.name() : String.valueOf(t.call.name());
+                    String raw = strippedInput.get("_raw").asText();
+                    int rawLen = raw == null ? 0 : raw.length();
+                    String guidance = "Tool " + toolName + " 调用参数不是合法 JSON，无法执行。"
+                        + "常见原因：命令/写入内容过长（参数 JSON 需模型手写转义，易出错）。"
+                        + "请把超大内容拆成多次较小的 Bash/Write 调用重试（每次控制较小长度），"
+                        + "确保参数为合法 JSON。原始参数长度=" + rawLen + "。";
+                    if (log.isInfoEnabled()) {
+                        log.info("TOOL _raw 兜底拦截: callId={} tool={} rawLen={} → 引导拆小重试（非合法 JSON）",
+                            abbreviate(t.call.id(), 24), toolName, rawLen);
+                    }
+                    t.result = ToolResult.error(t.call.id(),
+                        ToolErrorFormatter.inputValidationErrorBlock(guidance), "validation");
+                    t.isError = true;
+                    erroredCount.incrementAndGet();
+                    t.status = Status.COMPLETED;
+                    clearInProgress(t.call.id());
+                    pushToolResultRealtime(t);
+                    processQueue();
+                    return;
+                }
                 // ── [A1 撤外层] (d) schema 校验 · 对齐 CC toolExecution.ts:615-680
                 //   用 Tool.inputSchema (Zod schema 等价) 校验; 失败 → 注入 tengu_tool_use_error
                 //   + tengu_deferred_tool_schema_not_sent (仅 MCP deferred) + SchemaNotSentHint 拼接到 error.

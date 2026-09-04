@@ -73,6 +73,8 @@ export interface ChatState {
   retry: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null
   /** 压缩警告抑制态（token_warning 事件 · 非 null 且 !suppressed 时显示横幅） */
   tokenWarning: TokenWarningEvent | null
+  /** 压缩进度 UI 态（compact-progress 事件归一 · 驱动输入框上方 CompactProgressBar + Composer 发送键变停止） */
+  compact: { visible: boolean; status: 'running' | 'done' | 'canceled'; hookType?: string; pct: number }
   /** 会话 API 错误（message.error → 对话流错误卡 · key=sessionId） */
   apiErrors: Record<string, ApiFlowError[]>
   // actions
@@ -128,6 +130,8 @@ export interface ChatState {
   expirePermission: (sessionId: string, requestId: string) => void
   setRetry: (r: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null) => void
   setTokenWarning: (w: TokenWarningEvent | null) => void
+  /** 压缩进度 UI 态更新（compact-progress 事件归一写入；visible=false 隐藏横幅/恢复发送键） */
+  setCompact: (c: { visible: boolean; status?: 'running' | 'done' | 'canceled'; hookType?: string; pct?: number }) => void
   /** message.error → 记录会话 API 错误（对话流错误卡） */
   addApiError: (sessionId: string, err: ApiFlowError) => void
   /** 清空会话 API 错误（新 user 消息发送时调用 · 错误卡属上一轮） */
@@ -149,6 +153,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   agentStatus: 'idle',
   retry: null,
   tokenWarning: null,
+  compact: { visible: false, status: 'running', pct: 0 },
   apiErrors: {},
   setSessions: (sessions) => set({ sessions }),
   updateSessionUsage: (sessionId, usage) => set((st) => ({
@@ -360,6 +365,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   }),
   setRetry: (retry) => set({ retry }),
   setTokenWarning: (tokenWarning) => set({ tokenWarning }),
+  setCompact: (c) => set((st) => ({
+    compact: {
+      visible: c.visible,
+      status: c.status ?? st.compact.status,
+      hookType: c.hookType ?? st.compact.hookType,
+      pct: c.pct ?? st.compact.pct,
+    },
+  })),
   addApiError: (sessionId, err) => set((st) => ({
     apiErrors: { ...st.apiErrors, [sessionId]: [...(st.apiErrors[sessionId] ?? []), err] },
   })),

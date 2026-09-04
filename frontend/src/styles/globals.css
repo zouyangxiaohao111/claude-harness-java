@@ -9052,3 +9052,38 @@ html {
 
 /* 远端专家已内置预装徽标（绿） */
 .sm-badge.inst { color: var(--success-dark, #2D6E3D); background: var(--success-soft, rgba(93, 184, 114, 0.12)); }
+
+/* ================================================================ */
+/*  压缩进度横幅（CompactProgressBar · /compact 命令压缩中 · 输入框上方）*/
+/*  贴合 TokenWarningBanner 暖橙族：状态行(图标+文案+%) + 4px 胶囊轨    */
+/* ================================================================ */
+.cp-banner{
+  display:flex;flex-direction:column;gap:8px;
+  background:#FFF7EC;border:1px solid #FFD9B0;border-radius:12px;
+  padding:10px 14px;margin-bottom:10px;
+  box-shadow:0 10px 30px rgba(180,150,120,.08), 0 2px 8px rgba(0,0,0,.04);
+  animation:cp-in .22s cubic-bezier(.16,1,.3,1)
+}
+.cp-banner.cp-done{transition:opacity .35s}
+@keyframes cp-in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.cp-banner{animation:none}.cp-fill{transition:none}}
+.cp-status{display:flex;align-items:center;gap:8px}
+.cp-icon{color:#FF7A3D;flex-shrink:0;display:flex}
+.cp-icon.done{color:#2D6E3D}
+.cp-icon.cancel{color:#C64545}
+.cp-text{font-size:13px;color:#B35B2D;font-weight:500;flex:1;min-width:0;line-height:1.4}
+.cp-text.done{color:#2D6E3D}
+.cp-text.cancel{color:#C64545}
+.cp-pct{font-size:11px;color:#B35B2D;opacity:.8;font-variant-numeric:tabular-nums;flex-shrink:0}
+.cp-track{position:relative;height:4px;border-radius:9999px;background:rgba(204,120,92,.18);overflow:hidden}
+.cp-fill{position:absolute;top:0;bottom:0;left:0;width:0;border-radius:9999px;background:linear-gradient(90deg,#CC785C,#FF9A5C);transition:width .28s cubic-bezier(.16,1,.3,1)}
+.cp-fill.done{background:#5DB872}
+.cp-fill.cancel{background:#C64545}
+/* 暗色主题覆盖（与 .tw-banner 同族 · 暖橙降饱和深底） */
+[data-theme='dark'] .cp-banner{background:#2b2119;border-color:rgba(255,180,120,.28);box-shadow:0 10px 30px rgba(0,0,0,.4)}
+[data-theme='dark'] .cp-text{color:#f0b48f}
+[data-theme='dark'] .cp-text.done{color:#a0e5b1}
+[data-theme='dark'] .cp-icon{color:#ff9a6a}
+[data-theme='dark'] .cp-pct{color:#f0b48f}
+[data-theme='dark'] .cp-track{background:rgba(224,138,108,.24)}
+[data-theme='dark'] .cp-fill{background:linear-gradient(90deg,#e08a6c,#ff9a6a)}

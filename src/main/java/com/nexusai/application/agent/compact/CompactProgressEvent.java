@@ -83,4 +83,16 @@ public sealed interface CompactProgressEvent {
      */
     record CompactEnd() implements CompactProgressEvent {
     }
+
+    /**
+     * 摘要流式进度（Java 扩展 2026-09-04 · CC 无此事件——CC CompactProgressEvent 仅
+     * {@code hooks_start/compact_start/compact_end} 3 点事件；Java 为前端「真进度条」补充，
+     * 非 CC 对齐项）。摘要 LLM 流式期间按已收字符累计推送（对齐 CC {@code setResponseLength
+     * (length => length + delta)} 累加语义，compact.ts:1345-1347，CC 用它驱动 spinner 无 percent）。
+     *
+     * @param chars 已流式收到的摘要字符数（单调增；前端可驱动进度条在摘要段实时蠕动，
+     *              到 {@code compact_end} 归 100%）
+     */
+    record SummaryProgress(int chars) implements CompactProgressEvent {
+    }
 }

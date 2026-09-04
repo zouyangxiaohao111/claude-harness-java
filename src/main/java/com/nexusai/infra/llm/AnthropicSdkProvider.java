@@ -2173,6 +2173,11 @@ public class AnthropicSdkProvider implements LlmProvider {
                             ? JSON.createObjectNode()
                             : JSON.readTree(tc.arguments());
                     } catch (Exception e) {
+                        // [_raw fail-loud 2026-09-04] arguments 非法 JSON → 记录（含工具名/长度/异常），
+                        //   执行层拦截 {_raw} 引导模型拆小（见 StreamingToolExecutor _raw 拦截）。
+                        log.warn("AnthropicSdkProvider: tool_call arguments 非法 JSON（readTree 失败）"
+                                + "name={} len={} err={} → _raw 兜底", tc.name(),
+                            tc.arguments() == null ? 0 : tc.arguments().length(), e.toString());
                         var wrapper = JSON.createObjectNode();
                         wrapper.put("_raw", tc.arguments() == null ? "" : tc.arguments());
                         inputJson = wrapper;
@@ -2828,6 +2833,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                     ? JSON.createObjectNode()
                     : JSON.readTree(args);
             } catch (Exception e) {
+                // [_raw fail-loud 2026-09-04] arguments 非法 JSON → 记录（fail loud，见外层同款）
+                log.warn("AnthropicSdkProvider.ToolCallAccumulator: tool_call arguments 非法 JSON"
+                        + "（readTree 失败）name={} len={} err={} → _raw 兜底", name,
+                    args == null ? 0 : args.length(), e.toString());
                 var wrapper = JSON.createObjectNode();
                 wrapper.put("_raw", args == null ? "" : args);
                 input = wrapper;

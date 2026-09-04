@@ -195,13 +195,43 @@ export function useChatSocket(
   const statusSubsRef = useRef<Map<string, StompSubscription>>(new Map())
   /** 会话级常驻订阅登记：sid -> { token, queue }（token-warning / queue 按 sid 常驻 ——
    *   切走后原会话排队消费（queue.drained）/ 压缩警告仍需收；不随 sessionId 重订，同 stream/perm 模式）。 */
-  const sessionLevelSubsRef = useRef<Map<string, { token: StompSubscription; queue: StompSubscription }>>(new Map())
+  const sessionLevelSubsRef = useRef<Map<string, { token: StompSubscription; queue: StompSubscription; compact: StompSubscription }>>(new Map())
   /** 当前会话 scoped 订阅句柄（team/todo/skill —— 随 sessionId 切换重订；
    *   stream/perm/status/token-warning/queue 按 sid 常驻不在此列）。sessionId 变化时先退订再订阅，client 单例不重建。 */
   const sessionScopedSubsRef = useRef<StompSubscription[]>([])
   /** 最新 sessionId（client 单例 onConnect 需读最新值订阅 scoped topics） */
   const sessionIdRef = useRef(sessionId)
   sessionIdRef.current = sessionId
+
+  // ── 压缩进度事件归一（compact-progress STOMP → chatStore.compact UI 态）──
+  const compactFirstCharsRef = useRef<number | null>(null)
+  const compactPctRef = useRef(0)
+  const compactDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  function handleCompactEvent(raw: { type?: string; hookType?: string; chars?: number }) {
+    const st = useChatStore.getState()
+    if (compactDoneTimer.current) { clearTimeout(compactDoneTimer.current); compactDoneTimer.current = null }
+    if (raw.type === 'compact_start') {
+      // 摘要请求前 → 进度条起步 8%（后端可中断 + 进度推送已就绪）
+      compactFirstCharsRef.current = null; compactPctRef.current = 8
+      st.setCompact({ visible: true, status: 'running', hookType: undefined, pct: 8 })
+    } else if (raw.type === 'hooks_start') {
+      st.setCompact({ visible: true, status: 'running', hookType: raw.hookType })
+    } else if (raw.type === 'compact_progress') {
+      // 摘要流式已收字符（Java 扩展）→ 差分推进度（无总量：封顶 90%，compact_end 才 100）
+      const chars = typeof raw.chars === 'number' ? raw.chars : 0
+      if (compactFirstCharsRef.current == null) compactFirstCharsRef.current = chars
+      const delta = chars - compactFirstCharsRef.current
+      compactPctRef.current = Math.min(90, 8 + Math.max(0, Math.floor((delta / 8000) * 82)))
+      st.setCompact({ visible: true, status: 'running', hookType: undefined, pct: compactPctRef.current })
+    } else if (raw.type === 'compact_end') {
+      // finally（无论成败）→ 100% + 短暂完成态后隐藏（横幅渐隐、发送键复原）
+      st.setCompact({ visible: true, status: 'done', hookType: undefined, pct: 100 })
+      compactDoneTimer.current = setTimeout(() => {
+        st.setCompact({ visible: false, status: 'running', hookType: undefined, pct: 0 })
+        compactFirstCharsRef.current = null; compactPctRef.current = 0
+      }, 900)
+    }
+  }
 
   // 订阅当前会话 scoped topics（team/todo/skill · 当前会话 UI 状态）· 返回句柄数组供退订
   function subscribeCurrentSessionScoped(client: Client, sid: string): StompSubscription[] {
@@ -261,6 +291,12 @@ export function useChatSocket(
         })
       }
     })
+    // 压缩进度（compact-progress · 按 sid 常驻）：manual/auto /compact 进行中 → 驱动输入框上方进度横幅 + 发送键变停止
+    const compact = client.subscribe(`/topic/sessions/${sid}/compact-progress`, (msg) => {
+      let raw: Record<string, unknown>
+      try { raw = JSON.parse(msg.body) } catch { return }
+      handleCompactEvent(raw as { type?: string; hookType?: string; chars?: number })
+    })
     const queue = client.subscribe(`/topic/sessions/${sid}/queue`, (msg) => {
       let raw: Record<string, unknown>
       try { raw = JSON.parse(msg.body) } catch { return }
@@ -282,7 +318,7 @@ export function useChatSocket(
         })))
       }
     })
-    sessionLevelSubsRef.current.set(sid, { token, queue })
+    sessionLevelSubsRef.current.set(sid, { token, queue, compact })
   }
 
   /**

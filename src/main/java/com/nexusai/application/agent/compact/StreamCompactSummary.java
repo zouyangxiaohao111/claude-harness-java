@@ -887,6 +887,13 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 }
                 int total = streamedChars.addAndGet(chunk.length());
                 responseLengthSetter.accept(total);
+                // [真进度 2026-09-04] 摘要流已收字符 → 当前压缩进度推送（前端进度条蠕动源）。
+                //   经 CompactProgressState.current()（manual/auto 压缩期间注册的 STOMP 推送）；
+                //   无注册 → no-op 不回归。
+                java.util.function.Consumer<CompactProgressEvent> progressSink = CompactProgressState.current();
+                if (progressSink != null) {
+                    progressSink.accept(new CompactProgressEvent.SummaryProgress(total));
+                }
             }
         };
 

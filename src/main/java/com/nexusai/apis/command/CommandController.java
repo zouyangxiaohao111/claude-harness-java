@@ -185,6 +185,15 @@ public class CommandController {
     private com.nexusai.application.agent.prompt.SessionGitStatusRegistry sessionGitStatusRegistry;
 
     /**
+     * [compact-execute] slash 分发器 · /compact 真执行复用：dispatchResult 调已注册的 compact
+     * handler（ToolRegistrationConfig.registerCompactSlashCommand → handleCompactCommand →
+     * CompactCommand.call）。{@code @Autowired(required=false)}：plain JUnit（无容器）缺省 null →
+     * /compact 分支 fail-loud（保测试兼容，同 effort/resume 注入惯例）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.UserInputDispatcher userInputDispatcher;
+
+    /**
      * 列出所有命令 · DEC-8 前端环境声明过滤。
      *
      * <p>接收 {@code X-Client-Env} 请求头（react|mobile）透传到 {@link SkillRegistry#filterByClientEnv}
@@ -484,6 +493,66 @@ public class CommandController {
                 args);
         }
         return effortCommand.handle(args);
+    }
+
+    /**
+     * [compact-execute] /compact 真实压缩执行 · 对齐 CC compact.ts:40 call（local 命令进程内执行）。
+     *
+     * <p>DEC-9 薄触发（{@link #executeBuiltin} 对非 resume/clear 只返回命令元数据）对 local 型命令
+     * 不适用——CC 语义 /compact 必在「当前会话」执行。web 端用户输入 /compact 由前端统一走
+     * {@code builtins/{name}/execute}（日志实证 POST /api/command/builtins/compact/execute 无会话、
+     * 后端只回元数据 → 压缩从未执行、前端无 CC 式反应）。本字面端点（Spring literal &gt; {name}
+     * 路径变量，同 effort 模式）真实执行：解析会话（query ?sessionId= → MDC 兜底，
+     * MemoryController:124-127 同款）→ 写 MDC → {@code UserInputDispatcher.dispatchResult} 复用已注册
+     * compact handler（registerCompactSlashCommand → handleCompactCommand：DISABLE_COMPACT 门控 →
+     * 会话 AgentState → SM 优先 / microcompact+compactConversation 传统压缩 → displayText + STOMP
+     * token-warning 推送）→ 返回 displayText（{@code "Compacted …"}）。压缩替换会话
+     * AgentState.messages → 下次拉取历史即压缩后态。
+     *
+     * <p>无会话标识 → 返回中文说明（fail-loud，不静默）：CC 无「无会话 /compact」——命令必须知道
+     * 压缩哪个会话。
+     *
+     * @param sessionIdParam query {@code ?sessionId=}（可选；MDC 兜底）——前端需带当前会话
+     * @return displayText（压缩成功）/ 中文失败说明
+     */
+    @PostMapping(path = "/builtins/compact/execute", produces = "text/plain;charset=UTF-8")
+    public String executeCompactBuiltin(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
+        if (userInputDispatcher == null) {
+            log.error("[CommandController] executeCompactBuiltin: UserInputDispatcher 未注入"
+                + "（非容器上下文），无法执行 /compact");
+            throw new IllegalStateException("UserInputDispatcher not wired into CommandController");
+        }
+        // 会话解析：query ?sessionId= → MDC 兜底（对齐 MemoryController:139-144 会话注入模式）
+        String sessionId = (sessionIdParam != null && !sessionIdParam.isBlank())
+            ? sessionIdParam : RequestContext.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[CommandController] executeCompactBuiltin: 无会话标识（query ?sessionId= 缺失且 MDC 无）"
+                + "→ 拒绝压缩（CC /compact 必绑定当前会话；前端需带 ?sessionId=）");
+            return "/compact 无法执行：缺少会话标识。请在请求携带 ?sessionId=<当前会话>"
+                + "（对齐 CC：/compact 在当前会话内压缩，需知道压缩哪个会话）。";
+        }
+        RequestContext.setSession(sessionId);
+        try {
+            // 复用已注册 compact handler：/compact（无自定义指令 → SM 优先 / 传统压缩）
+            com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult r =
+                userInputDispatcher.dispatchResult("/compact");
+            if (r == null) {
+                log.error("[CommandController] executeCompactBuiltin: /compact handler 未注册"
+                    + "（dispatchResult null；ToolRegistrationConfig.registerCompactSlashCommand 未执行？）");
+                return "/compact 无法执行：/compact 命令未注册。";
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[CommandController] executeCompactBuiltin: /compact 执行完成 session={} kind={} resultLen={}",
+                    sessionId, r.kind(), r.value() == null ? 0 : r.value().length());
+            }
+            if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
+                return "/compact 压缩完成（无文本结果）。";
+            }
+            return r.value();
+        } finally {
+            RequestContext.clear();
+        }
     }
 
     /**

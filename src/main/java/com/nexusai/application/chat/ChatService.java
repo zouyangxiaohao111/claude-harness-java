@@ -1618,6 +1618,14 @@ public class ChatService {
                 log.debug("[S4-FIX] cancelSession: 无在飞 AgentState（registry miss）session={}", sessionId);
             }
         }
+        // [可中断 2026-09-04 · CC Esc] abort 会话在飞压缩（manual HTTP /compact）：前端停止键/Esc →
+        //   cancelSession 一并打断压缩（摘要 provider 硬断流 → 'Compaction canceled.'，对齐 CC
+        //   compact.ts:126）。无在飞压缩 → false no-op（不阻塞 task.cancel 主路径）。
+        boolean compactAborted =
+            com.nexusai.application.agent.compact.CompactProgressState.abortForSession(sessionId);
+        if (compactAborted && log.isInfoEnabled()) {
+            log.info("[cancelSession] 已 abort 在飞压缩 session={}（user-cancel → 摘要断流）", sessionId);
+        }
         ChatTask task = inProgress.get(sessionId);
         if (task != null) {
             task.cancel.set(true);

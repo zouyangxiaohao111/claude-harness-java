@@ -2119,6 +2119,13 @@ public class LlmAgentLoop implements AgentLoop {
                 warning -> this.wsTemplate.convertAndSend(
                     "/topic/sessions/" + pushSessionId + "/token-warning", warning));
             com.nexusai.application.agent.compact.CompactWarningState.registerPushContext(tokenWarningPushCtx);
+            // [compact-progress-push 2026-09-04] auto 压缩进度 STOMP 推送（对齐 CC REPL spinner）。
+            //   auto compactConversation 的 ccCtx（buildAutoContext）经 CompactConversationContext
+            //   getOnCompactProgress 委托本线程注册 → 推前端 topic。finally clear（register 成对）。
+            com.nexusai.application.agent.compact.CompactProgressState.register(event ->
+                this.wsTemplate.convertAndSend(
+                    com.nexusai.application.agent.compact.CompactProgressState.topic(pushSessionId),
+                    com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event)));
         }
         try {
             return doRun(params);
@@ -2126,6 +2133,8 @@ public class LlmAgentLoop implements AgentLoop {
             if (tokenWarningPushCtx != null) {
                 com.nexusai.application.agent.compact.CompactWarningState.clearPushContext();
             }
+            // [compact-progress-push] auto 压缩进度推送清除（register 成对；幂等）
+            com.nexusai.application.agent.compact.CompactProgressState.clear();
             markIdle(params.sessionId());
             // [queue-full-align P1] 注销 now 中断监听器（防跨 run 泄漏；队列 onChange 常驻 NOTIFY_EXECUTOR）
             if (nowAbortListener != null && runQueueRef != null) {

@@ -1092,6 +1092,17 @@ export interface TokenWarningEvent extends StreamEventBase {
   percentLeft?: number
 }
 
+/** 压缩进度事件（STOMP /topic/sessions/{sid}/compact-progress · 后端 CompactProgressState.toFrontendJson）。
+ *  hooks_start{hookType} 各压缩 hook 前；compact_start 摘要请求前（进度条起步）；
+ *  compact_progress{chars} 摘要流式已收字符（Java 扩展，前端驱动进度条蠕动）；compact_end 摘要结束（含 finally）。 */
+export interface CompactProgressEventType {
+  type: 'hooks_start' | 'compact_start' | 'compact_end' | 'compact_progress'
+  /** hooks_start 的 hook 阶段：pre_compact / post_compact / session_start */
+  hookType?: 'pre_compact' | 'post_compact' | 'session_start'
+  /** compact_progress：已流式收到的摘要字符数（单调增） */
+  chars?: number
+}
+
 export interface ApiRetryEvent extends StreamEventBase {
   type: 'api_retry'
   subtype?: string
