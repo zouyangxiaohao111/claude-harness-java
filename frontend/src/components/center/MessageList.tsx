@@ -1,6 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { marked } from 'marked'
-import DOMPurify from 'dompurify'
+import { MarkdownText } from '@/markdown/MarkdownText'
 import type { ChatMessageDto } from '@/api/types'
 import { subagentColor } from '@/api/types'
 import { compactNumber } from '@/utils/format'
@@ -52,109 +51,7 @@ function cleanReasoning(s?: string | null): string {
   return s.replace(/(?:null)+/g, '').trim()
 }
 
-/** marked 18 实测对【无空格】ATX 标题（`##核心`）不解析（输出 <p> 字面文本），
- *  必须 `## 核心` 才渲染 <h2> → 预处理给标题补空格（排除代码块 shebang `#!`）。 */
-function fixHeadings(src: string): string {
-  return src.replace(/^(#{1,6})([^\s#!][^\n]*)$/gm, (_m, hashes: string, text: string) => {
-    return `${hashes} ${text}`
-  })
-}
-
-/** 修复「标题与表格表头粘连」行（模型偶发 `##标题|表头|` 后跟 `|---|` 分隔行）→ 拆为标题 + 表头，
- *  使 marked 能识别为表格（实测：粘连格式 marked 会整段当纯文本 <p> 渲染）。 */
-function fixAdheredTables(src: string): string {
-  return src.replace(/^(#{1,6}[^|\n]*)\|([^\n]*\|.*)\n(\s*\|[-:|\s]+\|.*\n)/gm, (_m, heading: string, header: string, sepRow: string) => {
-    return `${heading}\n|${header}\n${sepRow}`
-  })
-}
-
-/** 未闭合代码块（AI/系统偶发 ` ```text ```` 无闭合 → marked 一路吃到文本末尾成整块代码）→
- *  降级为普通文本（剔除 ``` 标记）。仅奇数个 ```（存在未闭合）时触发；合法闭合代码块（偶数）不处理。 */
-function fixUnclosedCodeBlocks(src: string): string {
-  const count = (src.match(/```/g) ?? []).length
-  return count % 2 === 1 ? src.replace(/```[a-zA-Z0-9_-]*\s*/g, '') : src
-}
-
-/** Markdown 渲染 + DOMPurify 消毒（对齐 MemoryEditorModal 预览惯例：marked.parse + sanitize）。
- *  gfm 表格/任务列表 + breaks 单换行成 <br>（对话换行友好）；空 content → '' */
-function renderMd(content?: string | null): string {
-  if (!content) return ''
-  // 预处理：补标题空格 → 拆粘连表格 → 未闭合代码块降级（依次执行，避免相互干扰）
-  return DOMPurify.sanitize(marked.parse(fixUnclosedCodeBlocks(fixAdheredTables(fixHeadings(content))), { gfm: true, breaks: true }) as string)
-}
-
-/** Markdown 内容渲染 + 代码块右上角复制按钮（DOM 注入：pre 内 absolute 按钮，hover 显示）。
- *  复制后按钮短暂显示「已复制」；navigator.clipboard 不可用时静默失败。 */
-function MdContent({ html, className, onRunHtml }: { html: string; className?: string; onRunHtml?: (code: string) => void }) {
-  const ref = useRef<HTMLDivElement>(null)
-  // 运行回调走 ref：effect 依赖 [html]，ref 避免闭包捕获过期回调
-  const onRunHtmlRef = useRef(onRunHtml)
-  onRunHtmlRef.current = onRunHtml
-  useEffect(() => {
-    const el = ref.current
-    if (!el) return
-    for (const pre of el.querySelectorAll<HTMLPreElement>('pre')) {
-      if (!pre.querySelector('.code-copy')) {
-        const btn = document.createElement('button')
-        btn.type = 'button'
-        btn.className = 'code-copy'
-        btn.textContent = '复制'
-        btn.addEventListener('click', () => {
-          void navigator.clipboard?.writeText(pre.textContent ?? '').then(() => {
-            btn.textContent = '已复制'
-            window.setTimeout(() => { btn.textContent = '复制' }, 1200)
-          }).catch(() => {})
-        })
-        pre.appendChild(btn)
-      }
-      // html 代码块 → 右上角「运行」按钮（弹窗 sandbox iframe 预览）
-      if (!pre.querySelector('.code-run')) {
-        const codeEl = pre.querySelector('code.language-html')
-        if (codeEl) {
-          const rb = document.createElement('button')
-          rb.type = 'button'
-          rb.className = 'code-run'
-          rb.textContent = '运行'
-          rb.addEventListener('click', () => { onRunHtmlRef.current?.(codeEl.textContent ?? '') })
-          pre.appendChild(rb)
-        }
-      }
-    }
-  }, [html])
-  return <div ref={ref} className={className} dangerouslySetInnerHTML={{ __html: html }} />
-}
-
-/** [打字机节流 2026-09-04] 流式正文排版节流:content 增长时最多每 RENDER_MD_THROTTLE_MS(200ms) 排版一次。
- *  替代原「每 chunk 对增长中的全文 renderMd」——O(n²) 随消息变长越排越卡 → 固定 ~5 次/s, 每次排
- *  「到点时刻的最新全文」跳过中间态。消息 complete 后本组件随流式块卸载, 正式消息走 Message 组件
- *  renderMd 精排一次(571 行), 无格式跳变遗漏。reasoning 思考不经 markdown(887 纯文本), 不受本组件影响。 */
-const RENDER_MD_THROTTLE_MS = 200
-function StreamingMd({ content, onRunHtml }: { content: string; onRunHtml?: (code: string) => void }) {
-  const [html, setHtml] = useState(() => (content ? renderMd(content) : ''))
-  // html 已排到的 content 版本 + 上次排版时刻 —— 流式期间只重排「新到达且距上次 ≥200ms」的内容
-  const htmlContentRef = useRef(content)
-  const lastRenderAtRef = useRef(0)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => {
-    if (content === htmlContentRef.current) return // 已排到最新版本,跳过
-    const renderNow = () => {
-      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null }
-      htmlContentRef.current = content
-      lastRenderAtRef.current = Date.now()
-      setHtml(renderMd(content))
-    }
-    const elapsed = Date.now() - lastRenderAtRef.current
-    if (lastRenderAtRef.current === 0 || elapsed >= RENDER_MD_THROTTLE_MS) {
-      renderNow() // 首帧或距上次排版 ≥200ms → 立即排（leading throttle）
-    } else {
-      if (timerRef.current) clearTimeout(timerRef.current)
-      timerRef.current = setTimeout(renderNow, RENDER_MD_THROTTLE_MS - elapsed) // 补到 200ms 边界排最新
-    }
-    return () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null } }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [content])
-  return html ? <MdContent className="content md" html={html} onRunHtml={onRunHtml} /> : null
-}
+/** 对话正文 markdown 走增量 mdast 渲染器（@/markdown/MarkdownText，双态 streaming/settled）。 */
 
 /** 流式 API 错误卡（message.error → 对话流助手回复位置渲染 · 对齐 CC assistant API error / isApiErrorMessage 展示） */
 function ApiErrorCard({ err }: { err: ApiFlowError }) {
@@ -424,6 +321,26 @@ function ToolCard({ tool, matchedRule }: { tool: NonNullable<ChatMessageDto['too
   )
 }
 
+/** 单条超长正文防护：正文 > HEAVY_CONTENT_CHARS 时只渲染截断纯文本预览 + 「查看完整内容」，
+ *  展开后才走整段 mdast（MarkdownText）。否则打开含 350KB 级单条消息的会话会被一条 DOM 卡死
+ *  ——窗口化只限「条数」不限「单条体积」。初始加载不被病理大消息阻塞，展开由用户主动触发。 */
+const HEAVY_CONTENT_CHARS = 20_000
+const HEAVY_PREVIEW_CHARS = 5_000
+function ContentGuard({ text, className, onRunHtml }: { text: string; className: string; onRunHtml?: (code: string) => void }) {
+  const heavy = text.length > HEAVY_CONTENT_CHARS
+  const [expanded, setExpanded] = useState(false)
+  if (!heavy || expanded) return <MarkdownText text={text} className={className} onRunHtml={onRunHtml} />
+  const shown = text.slice(0, HEAVY_PREVIEW_CHARS)
+  return (
+    <div className={className}>
+      <pre className="heavy-preview">{shown}{text.length > HEAVY_PREVIEW_CHARS ? '…' : ''}</pre>
+      <button type="button" className="heavy-expand" onClick={() => setExpanded(true)} title="展开后需渲染完整内容，可能短暂卡顿">
+        查看完整内容（本条 {Math.round(text.length / 1024)}KB · 展开较耗资源）
+      </button>
+    </div>
+  )
+}
+
 function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: (id: string) => void; onRunHtml?: (code: string) => void }) {
   const isUser = msg.role === 'user'
   // F25 · model_fallback_warning：role=system + subtype='informational' 的消息按「模型降级」提示渲染
@@ -540,7 +457,7 @@ function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: 
           {/* 文件附件（PDF/Word/视频/音频）内联在 user 气泡里（文字下方 · 点击预览）——
               图片附件走上方缩略图 imageData/imagePasteIds 通道 */}
           <div className="user-bubble">
-            <MdContent className="user-text md" html={renderMd(msg.content)} onRunHtml={onRunHtml} />
+            <ContentGuard text={msg.content ?? ''} className="user-text md" onRunHtml={onRunHtml} />
             {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
               <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => usePreviewStore.getState().open({ kind: 'attachment', title: a.filename, item: a })}>
                 {attachIcon(a)}
@@ -604,7 +521,7 @@ function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: 
                 {msg.errorDetails && <p className="error-details">{msg.errorDetails}</p>}
               </div>
             ) : (
-              <MdContent className="content md" html={renderMd(msg.content)} onRunHtml={onRunHtml} />
+              <ContentGuard text={msg.content ?? ''} className="content md" onRunHtml={onRunHtml} />
             )}
             {/* CHK-8 · token 用量 / 花费：优先 complete 事件透传的真实 usage（本轮输入↑输出↓ + 会话花费¥），
                 无则回落 output_token_usage attachment（turn/session/budget），再回落 msg.outputTokens；均无数据不渲染 */}
@@ -932,7 +849,7 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
                   </div>
                 )
               })()}
-              {b.content && <StreamingMd content={b.content} onRunHtml={openHtmlPreview} />}
+              {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={openHtmlPreview} />}
               {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} />)}
             </div>
           </div>

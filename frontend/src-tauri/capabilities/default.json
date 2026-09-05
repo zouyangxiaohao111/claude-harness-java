@@ -18,6 +18,8 @@
     "core:window:allow-set-min-size",
     "core:window:allow-center",
     "core:window:allow-outer-size",
+    "core:window:allow-create",
+    "core:webview:allow-create-webview-window",
     "dialog:allow-open",
     "fs:allow-read-file",
     "fs:allow-write-text-file",

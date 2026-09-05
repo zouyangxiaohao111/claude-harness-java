@@ -712,6 +712,8 @@ function App() {
     (sessionId: string) => {
       const s = sessions.find((x) => x.id === sessionId)
       if (!s) return
+      // 已激活会话重复点击 → no-op（防快速连点把「切换清空+重拉+整列表重渲染」排队压主线程 → 卡死）
+      if (sessionId === activeSessionId) return
       sessionDispatch({ type: 'SWITCH', sessionId })
       // 排队命令按会话隔离：切会话 → 清空排队框（否则显示上个会话的排队命令）
       commandQueue.clear()
@@ -722,7 +724,7 @@ function App() {
         showToast(`已切换到: ${s.title}`, 'success')
       }
     },
-    [sessions, sessionR.openSessions, sessionDispatch, showToast, commandQueue],
+    [sessions, sessionR.openSessions, sessionDispatch, showToast, commandQueue, activeSessionId],
   )
 
   // ---- delete session（后端删 + 本地清 store + 切到下一个会话）----

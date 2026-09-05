@@ -1340,55 +1340,166 @@ html {
   margin: 14px 0;
 }
 
-/* 代码块复制按钮（md 渲染 · pre 右上角 hover 显示） */
-.msg .content.md pre,
-.msg.user .user-bubble.md pre {
-  position: relative;
+/* ===== mdast 增量渲染器（MarkdownText / CodeBlock）样式 · 移植 deepseek-harness ===== */
+/* 代码块容器：banner + 正文 pre（覆盖 .msg .content pre 的通用边框/背景/圆角） */
+.msg .content.md .md-code-block,
+.msg.user .user-bubble .md-code-block {
+  margin: 8px 0;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  background: var(--surface-1);
+  overflow: hidden;
 }
-.code-copy {
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  padding: 3px 8px;
+.md-code-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline);
+}
+.md-code-lang {
   font-size: 11px;
-  line-height: 1.4;
+  line-height: 1.6;
+  color: var(--ink-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.md-code-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.md-code-copy,
+.md-code-run {
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.5;
   border: 1px solid var(--hairline);
   border-radius: var(--r-xs);
   background: var(--surface-2);
   color: var(--ink-muted);
   cursor: pointer;
-  /* 常显（半透明 · 不挡内容）· hover 全显 */
-  opacity: 0.55;
+  opacity: 0.75;
   transition: opacity 120ms var(--ease);
+  font-family: inherit;
 }
-.code-copy:hover {
-  opacity: 1;
-  color: var(--ink);
-  border-color: var(--ink-faint);
-  background: var(--surface-3);
+.md-code-copy:hover,
+.md-code-run:hover { opacity: 1; }
+.md-code-copy:hover { color: var(--ink); background: var(--surface-3); border-color: var(--ink-faint); }
+.md-code-run { color: var(--accent); }
+.md-code-run:hover { color: var(--accent); border-color: var(--accent); background: var(--surface-3); }
+
+/* 代码块正文 pre：复位边框/圆角/背景/间距，横向滚动；代码区沿用容器 surface-1 底色
+   （shiki background 设 --shiki-background=transparent） */
+.msg .content.md .md-code-block pre,
+.msg.user .user-bubble .md-code-block pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 10px 12px;
+  overflow-x: auto;
 }
-/* HTML 代码块运行按钮（md 渲染 · 复制按钮左侧 · hover 显示 · 强调色区分） */
-.code-run {
-  position: absolute;
-  top: 6px;
-  right: 44px;
-  padding: 3px 8px;
-  font-size: 11px;
-  line-height: 1.4;
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-xs);
-  background: var(--surface-2);
-  color: var(--accent);
-  cursor: pointer;
-  /* 常显（半透明 · 不挡内容）· hover 全显 */
-  opacity: 0.55;
-  transition: opacity 120ms var(--ease);
+.msg .content.md .md-code-block pre code,
+.msg.user .user-bubble .md-code-block pre code {
+  background: none;
+  padding: 0;
+  border: none;
+  color: var(--ink-muted);
+  font-size: 12px;
+  line-height: 1.55;
 }
-.code-run:hover {
-  opacity: 1;
-  color: var(--accent);
-  border-color: var(--accent);
-  background: var(--surface-3);
+
+/* 表格：横向滚动容器（覆盖旧 .content.md table 的 display:block 双滚动） */
+.msg .content.md .md-table-scroll,
+.msg.user .user-bubble .md-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin: 10px 0;
+}
+.msg .content.md .md-table-scroll table,
+.msg.user .user-bubble .md-table-scroll table {
+  display: table;
+  width: max-content;
+  margin: 0;
+  border-collapse: collapse;
+}
+
+/* 图片与占位 alt；KaTeX 横向溢出 */
+.msg .content.md img,
+.msg.user .user-bubble img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--r-md);
+}
+.msg .content.md .md-image-alt,
+.msg.user .user-bubble .md-image-alt {
+  color: var(--ink-muted);
+  font-style: italic;
+}
+.msg .content.md .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
+/* shiki 语法高亮 token：浅色（默认）+ 深色（.app[data-theme=dark]）。
+   变量名来自 shiki createCssVariablesTheme 的语义 token（--shiki-foreground / --shiki-token-*）。 */
+.app {
+  --shiki-background: transparent;
+  --shiki-foreground: #24292f;
+  --shiki-token-comment: #6a737d;
+  --shiki-token-keyword: #cf222e;
+  --shiki-token-string: #0a3069;
+  --shiki-token-number: #0550ae;
+  --shiki-token-constant: #0550ae;
+  --shiki-token-function: #8250df;
+  --shiki-token-property: #0550ae;
+  --shiki-token-parameter: #24292f;
+  --shiki-token-variable: #24292f;
+  --shiki-token-type: #953800;
+  --shiki-token-operator: #0550ae;
+  --shiki-token-punctuation: #57606a;
+  --shiki-token-builtin: #6f42c1;
+  --shiki-token-entity: #8250df;
+  --shiki-token-regexp: #0a3069;
+  --shiki-token-annotation: #6f42c1;
+  --shiki-token-language: #6f42c1;
+  --shiki-token-escape: #bf3989;
+  --shiki-token-symbol: #0550ae;
+  --shiki-token-special: #116329;
+  --shiki-token-imports: #6f42c1;
+}
+.app[data-theme="dark"] {
+  --shiki-background: transparent;
+  --shiki-foreground: #d4d4d4;
+  --shiki-token-comment: #6b737c;
+  --shiki-token-keyword: #c586c0;
+  --shiki-token-string: #ce9178;
+  --shiki-token-number: #b5cea8;
+  --shiki-token-constant: #4fc1ff;
+  --shiki-token-function: #dcdcaa;
+  --shiki-token-property: #4fc1ff;
+  --shiki-token-parameter: #9cdcfe;
+  --shiki-token-variable: #9cdcfe;
+  --shiki-token-type: #4ec9b0;
+  --shiki-token-operator: #d4d4d4;
+  --shiki-token-punctuation: #808080;
+  --shiki-token-builtin: #4ec9b0;
+  --shiki-token-entity: #dcdcaa;
+  --shiki-token-regexp: #d16969;
+  --shiki-token-annotation: #b5cea8;
+  --shiki-token-language: #c586c0;
+  --shiki-token-escape: #d7ba7d;
+  --shiki-token-symbol: #d4d4d4;
+  --shiki-token-special: #ce9178;
+  --shiki-token-imports: #c586c0;
 }
 
 /* HTML 预览弹窗（运行按钮 → sandbox iframe 预览） */
@@ -1451,6 +1562,83 @@ html {
 .rp-title { flex: 1; font-size: 12.5px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rp-close { border: none; background: transparent; color: var(--ink-faint); width: 24px; height: 24px; border-radius: 6px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .rp-close:hover { background: var(--surface-3); color: var(--error); }
+/* HTML 预览「独立窗口/标签页打开」动作（右栏预览标题栏） */
+.rp-act {
+  border: 1px solid var(--hairline);
+  background: var(--surface-1);
+  color: var(--accent);
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-family: inherit;
+  white-space: nowrap;
+}
+.rp-act:hover { background: var(--accent-soft); border-color: var(--accent); }
+
+/* ===== HTML 独立查看器（location.hash #/standalone-html · main.tsx 顶层分流渲染）===== */
+.shtml {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+}
+.shtml-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline);
+  flex-shrink: 0;
+}
+.shtml-title { font-size: 12.5px; color: var(--ink); font-weight: 600; }
+.shtml-hint { font-size: 11.5px; color: var(--ink-muted); }
+.shtml-bar .spacer { flex: 1; }
+.shtml-reload {
+  border: 1px solid var(--hairline);
+  background: var(--surface-1);
+  color: var(--ink-muted);
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  font-size: 15px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.shtml-reload:hover { background: var(--surface-3); color: var(--ink); }
+.shtml-frame { flex: 1; width: 100%; min-height: 0; border: 0; background: #fff; }
+
+/* ===== 超长单条消息：截断预览 + 展开（防 350KB 级单条把整会话渲染钉死）===== */
+.heavy-preview {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.heavy-expand {
+  margin: 6px 0 2px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--accent);
+  border-radius: var(--r-xs);
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.heavy-expand:hover { background: var(--accent-soft); border-color: var(--accent); }
 .rp-body { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: stretch; justify-content: stretch; overflow: hidden; background: #ececee; }
 /* iframe / 视频 / 音频严格占满容器：随右栏拖宽动态自适应（resizer 改 --right-w → overlay → 这里跟随） */
 .rp-frame, .rp-media { flex: 1; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: #fff; }

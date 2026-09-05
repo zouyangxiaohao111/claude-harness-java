@@ -3,6 +3,7 @@ import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker'
 import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { BASE_URL } from '@/api/rest'
 import { usePreviewStore, type PreviewTab } from '@/stores/previewStore'
+import { openStandaloneHtml } from '@/utils/htmlStandalone'
 
 // pdf.js worker 单例（vite `?worker` 端口方式 · `?url` 的 ESM worker 在 dev 不可靠会白屏）
 let pdfWorkerPort: Worker | null = null
@@ -216,6 +217,15 @@ export function RightPreview({ preview }: { preview: PreviewTab }) {
       <div className="rp-head">
         <span className="rp-title" title={preview.title}>{preview.title}</span>
         <span className="spacer" />
+        {preview.kind === 'html' && (
+          <button
+            className="rp-act"
+            title="在独立窗口/标签页打开 · 对话里再次点击该代码块的「运行」会自动刷新，不打断对话"
+            onClick={() => void openStandaloneHtml(preview.code ?? '')}
+          >
+            ⧉ 独立打开
+          </button>
+        )}
         <button className="rp-close" onClick={close} title="关闭预览（恢复右侧原 tab）">✕</button>
       </div>
       <div className="rp-body">
