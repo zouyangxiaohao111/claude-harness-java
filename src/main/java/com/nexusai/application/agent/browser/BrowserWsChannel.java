@@ -11,6 +11,8 @@ import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -221,10 +223,12 @@ public class BrowserWsChannel implements BrowserChannel {
         if (result.isMissingNode() || result.isNull()) {
             return "";
         }
-        if (result.isTextual()) {
-            return result.asText();
+        String serialized = result.isTextual() ? result.asText() : JSON.writeValueAsString(result);
+        if (log.isInfoEnabled()) {
+            log.info("BrowserWsChannel: 扩展已返回 tool_result 完成 callId={} tool={} sessionId={} bytes={}",
+                callId, tool, sessionId, serialized.length());
         }
-        return JSON.writeValueAsString(result);
+        return serialized;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -247,6 +251,8 @@ public class BrowserWsChannel implements BrowserChannel {
         }
         WebSocketSession old = connection.getAndSet(session);
         if (old != null && old != session && old.isOpen()) {
+            // 连接被替换：旧连接上在途的 tool_call 不会再收到回复 → 立即 fail，避免 send 干等 30s
+            failAllPending("扩展连接被新连接替换（旧 wsSessionId=" + old.getId() + "），在途调用失效");
             try {
                 old.close(new CloseStatus(CLOSE_CODE_REPLACED, "replaced by newer connection"));
                 if (log.isInfoEnabled()) {
@@ -277,6 +283,27 @@ public class BrowserWsChannel implements BrowserChannel {
             if (log.isInfoEnabled()) {
                 log.info("BrowserWsChannel: 全局扩展连接已注销 wsSessionId={}", session.getId());
             }
+            // 连接断开：在途 tool_call 不可能再收到回复 → 立即 fail，避免 send 干等 30s
+            failAllPending("扩展连接断开（wsSessionId=" + session.getId() + "），在途调用失效");
+        }
+    }
+
+    /**
+     * 连接失效时立即 fail 所有在途 tool_call（{@link #send} 的 future 以 ExecutionException 抛出，
+     * 调用方 {@link BrowserMcpTool} fail loud → 模型秒收错误可重试，而不是空等 30s）。
+     */
+    private void failAllPending(String reason) {
+        List<String> ids = new ArrayList<>(pending.keySet());
+        int failed = 0;
+        for (String id : ids) {
+            CompletableFuture<JsonNode> future = pending.remove(id);
+            if (future != null) {
+                future.completeExceptionally(new IOException(reason));
+                failed++;
+            }
+        }
+        if (failed > 0 && log.isWarnEnabled()) {
+            log.warn("BrowserWsChannel: 连接失效，立即 fail 在途 tool_call {} 笔（{}）", failed, reason);
         }
     }
 
@@ -305,6 +332,10 @@ public class BrowserWsChannel implements BrowserChannel {
             return;
         }
         future.complete(response);
+        if (log.isInfoEnabled()) {
+            log.info("BrowserWsChannel.resolve: 收到扩展回包并完成挂起调用 callId={} type={} bytes={}",
+                callId, response.path("type").asText("?"), response.toString().length());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════

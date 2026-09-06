@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "NexusAI in Chrome",
-  "version": "0.1.0",
+  "version": "0.1.7",
   "description": "NexusAI 浏览器自动化扩展：连接后端 /ws/browser，执行 read_page/find/form_input/computer 等 18 个浏览器工具",
-  "permissions": ["tabs", "scripting", "activeTab", "storage", "windows", "alarms"],
+  "permissions": ["tabs", "scripting", "activeTab", "storage", "windows", "alarms", "idle", "debugger"],
   "host_permissions": ["<all_urls>", "http://localhost:3458/*"],
   "background": {
     "service_worker": "background.js"

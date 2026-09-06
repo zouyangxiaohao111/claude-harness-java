@@ -72,24 +72,96 @@ function elementInfo(el) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  单源可交互索引（read_page / find / computer 共用同一份编号）          */
+/*  ref = 快照数组下标；一次扫描内顺序稳定。对齐 CCB/page-agent 的         */
+/*  “interactive index” 思想，但保持 vanilla + 本项目中文注释风格。       */
+/* ------------------------------------------------------------------ */
+
+/** 可交互候选选择器：CCB/page-agent + 本项目原有关注选择器并集（嵌套去重见下方逻辑） */
+const INTERACTIVE_SELECTOR = [
+  'a', 'button', 'input', 'select', 'textarea', 'summary',
+  '[contenteditable="true"]',
+  '[role="button"]', '[role="link"]', '[role="tab"]', '[role="menuitem"]',
+  '[role="menuitemradio"]', '[role="menuitemcheckbox"]', '[role="radio"]',
+  '[role="checkbox"]', '[role="switch"]', '[role="slider"]', '[role="spinbutton"]',
+  '[role="combobox"]', '[role="searchbox"]', '[role="textbox"]', '[role="listbox"]', '[role="option"]',
+  '[onclick]', '[data-testid]', '[data-test]', 'label',
+].join(', ')
+
+/** 视为“独立交互”的 ARIA role（对齐 CCB DISTINCT_INTERACTIVE_ROLES 的可操作子集） */
+const INTERACTIVE_ROLES = new Set([
+  'button', 'link', 'tab', 'menuitem', 'menuitemradio', 'menuitemcheckbox',
+  'radio', 'checkbox', 'switch', 'slider', 'spinbutton', 'combobox',
+  'searchbox', 'textbox', 'listbox', 'option', 'gridcell', 'treeitem',
+])
+
+const INDEX_MAX = 500 // 与旧 read_page 上限一致，避免一次性扫描整页巨型 DOM
+let interactiveElements = []         // Element[]：ref == 数组下标（最近一次 refresh 的快照）
+const interactiveRefOfEl = new WeakMap() // element → ref（反向校验；元素被 GC 自动清理）
+
+/** 元素可否入索引：有真实尺寸、未显隐/禁用（display:none 等坐标点击永远落不上的排除） */
+function isIndexableInteractive(el) {
+  if (!el || el.nodeType !== 1) return false
+  if (el.disabled || el.inert) return false
+  if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return false
+  const style = window.getComputedStyle(el)
+  if (style.visibility === 'hidden' || style.display === 'none') return false
+  const r = el.getBoundingClientRect()
+  return !!(r.width && r.height) // display:none 的 rect 为 0；不用 offsetWidth（SVG 元素无该属性）
+}
+
+/** 父级已编号时，子元素是否仍构成“独立交互”（需单独编号，如 <label> 里的 <input>） */
+function isDistinctNested(el) {
+  const tag = el.tagName.toLowerCase()
+  if (['a', 'button', 'input', 'select', 'textarea', 'summary'].includes(tag)) return true
+  if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') return true
+  if (el.hasAttribute('data-testid') || el.hasAttribute('data-test')) return true
+  const role = el.getAttribute('role')
+  if (role && INTERACTIVE_ROLES.has(role)) return true
+  if (el.hasAttribute('onclick')) return true
+  return false
+}
+
+/** 是否有已编号祖先（querySelectorAll 按文档序 → 祖先先于后代被收集） */
+function hasIndexedAncestor(el, included) {
+  let p = el.parentElement
+  while (p && p.nodeType === 1) {
+    if (included.has(p)) return true
+    p = p.parentElement
+  }
+  return false
+}
+
+/**
+ * 扫描一次单源可交互索引：按稳定文档序收集「可交互元素」数组，
+ * 同步刷新模块级 interactiveElements（ref=下标），返回带 ref + elementInfo 的快照。
+ * read_page / find / computer 三处都引用同一份索引，杜绝“两套编号源”错位。
+ */
+function refreshInteractiveIndex() {
+  const els = []
+  const info = []
+  const included = new Set()
+  for (const el of document.querySelectorAll(INTERACTIVE_SELECTOR)) {
+    if (els.length >= INDEX_MAX) break
+    if (!isIndexableInteractive(el)) continue
+    if (hasIndexedAncestor(el, included) && !isDistinctNested(el)) continue // 父级已编号的子按钮不重复编号
+    included.add(el)
+    const ref = els.length
+    interactiveRefOfEl.set(el, ref)
+    els.push(el)
+    info.push({ ref, ...elementInfo(el) })
+  }
+  interactiveElements = els
+  return info
+}
+
+/* ------------------------------------------------------------------ */
 /*  18 个工具实现（DOM 操作类）                                         */
 /* ------------------------------------------------------------------ */
 
-/** read_page：页面结构 + 可交互元素清单（简化 accessibility tree） */
+/** read_page：基于单源可交互索引输出可交互元素清单（每个带 ref=快照下标） */
 async function readPage() {
-  const nodes = []
-  const selectors = [
-    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-    'button', 'a', 'input', 'select', 'textarea',
-    '[role]', 'nav', 'main', 'article', 'section', 'img', 'label',
-  ]
-  for (const sel of selectors) {
-    for (const el of document.querySelectorAll(sel)) {
-      if (nodes.length >= 500) break
-      nodes.push(elementInfo(el))
-    }
-    if (nodes.length >= 500) break
-  }
+  const nodes = refreshInteractiveIndex() // 与 find / computer 共用同一份索引
   return { ok: true, result: { url: location.href, title: document.title, nodeCount: nodes.length, nodes } }
 }
 
@@ -99,26 +171,34 @@ async function getPageText() {
   return { ok: true, result: { url: location.href, text: text.slice(0, 20000) } }
 }
 
-/** find：按文本/描述/aria/data-testid 查找元素，返回选择器 + 索引供后续 computer 定位 */
+/** find：在单源可交互索引快照内按文本/描述/selector 匹配，返回带 ref 的结果供 computer 定位 */
 async function find(args = {}) {
-  const { text, description } = args
+  const { text, description, selector } = args
   const q = String(text || description || '').trim().toLowerCase()
-  if (!q) return { ok: false, error: 'find 需要 text 或 description 参数' }
-  const all = document.querySelectorAll(
-    'button, a, input, textarea, select, [contenteditable="true"], [role="button"], [role="link"], [role="tab"], [role="menuitem"], label, h1,h2,h3,h4,h5,h6, [data-testid], [data-test]',
-  )
+  const selArg = selector ? String(selector).trim() : ''
+  if (!q && !selArg) return { ok: false, error: 'find 需要 text/description 或 selector 参数' }
+  const snapshot = refreshInteractiveIndex() // 与 read_page / computer 同一份编号
   const matches = []
-  for (const el of all) {
+  let selInvalid = false
+  for (const item of snapshot) {
     if (matches.length >= 50) break
-    const t = (el.textContent || '').trim()
-    const placeholder = el.getAttribute('placeholder') || ''
-    const aria = el.getAttribute('aria-label') || ''
-    const testid = el.getAttribute('data-testid') || el.getAttribute('data-test') || ''
-    const hay = `${t} ${placeholder} ${aria} ${testid}`.toLowerCase()
-    if (hay.includes(q)) {
-      matches.push({ index: matches.length, ...elementInfo(el) })
+    const el = interactiveElements[item.ref] // 与 info 同源（单源索引）
+    if (!el) continue
+    let hit = false
+    if (selArg) {
+      try { if (el.matches(selArg)) hit = true } catch (e) { selInvalid = true; break }
     }
+    if (!hit && q) {
+      const t = (el.textContent || '').trim()
+      const placeholder = el.getAttribute('placeholder') || ''
+      const aria = el.getAttribute('aria-label') || ''
+      const testid = el.getAttribute('data-testid') || el.getAttribute('data-test') || ''
+      const hay = `${t} ${placeholder} ${aria} ${testid}`.toLowerCase()
+      if (hay.includes(q)) hit = true
+    }
+    if (hit) matches.push({ ...item, index: item.ref }) // ref 对齐 computer；index 为向后兼容别名
   }
+  if (selInvalid) return { ok: false, error: `find selector 非法：${selArg}` }
   return { ok: true, result: { found: matches.length, matches } }
 }
 
@@ -171,23 +251,37 @@ function parseModifiers(modifiers) {
   return m
 }
 
-/** 定位操作目标：ref（find 返回的索引，对齐 CCB ref 语义）> selector > coordinate 的 elementFromPoint */
-function locateTarget(args) {
+/** 解析 CCB 风格 ref（数字 / "ref_3" / "3"）→ 快照数组下标；解析不了返回 -1 */
+function parseRef(ref) {
+  if (typeof ref === 'number') return Number.isFinite(ref) ? Math.trunc(ref) : -1
+  const s = String(ref).trim().replace(/^ref_?/i, '')
+  return /^\d+$/.test(s) ? Number(s) : -1
+}
+
+/**
+ * 定位操作目标：ref（单源索引下标，对齐 CCB ref 语义）> selector > coordinate 的 elementFromPoint。
+ * ref 取自最近一次 read_page/find 的快照数组；元素已不在文档（isConnected=false）→ 明确报错。
+ */
+function locateElement(args) {
   const { ref, selector, coordinate, x, y } = args
   if (ref != null) {
-    // CCB ref：read_page/find 的 element ref ID（我们返回 index，兼容 "ref_1"/数字/字符串）
-    const idx = typeof ref === 'number' ? ref : /^\d+$/.test(String(ref)) ? Number(String(ref).replace(/^ref_?/, '')) : -1
-    if (idx >= 0) {
-      const interactive = document.querySelectorAll('button, a, input, textarea, select, [contenteditable="true"], [role], label, h1,h2,h3,h4,h5,h6')
-      const el = interactive[idx] || null
-      if (el) return el
-    }
-    return document.querySelector(`[data-nexusai-ref="${CSS.escape(String(ref))}"]`) || null
+    const idx = parseRef(ref)
+    const el = idx >= 0 && idx < interactiveElements.length ? interactiveElements[idx] : null
+    if (el && el.isConnected) return { ok: true, el }
+    return { ok: false, error: `ref 失效，请重新 read_page/find（ref=${String(ref)}）` }
   }
-  if (selector) return document.querySelector(selector)
+  if (selector) {
+    const el = document.querySelector(selector)
+    if (el) return { ok: true, el }
+    return { ok: false, error: `未找到匹配 selector 的元素：${selector}` }
+  }
   const pos = coordinate || (x != null && y != null ? [Number(x), Number(y)] : null)
-  if (pos && pos.length >= 2) return document.elementFromPoint(Number(pos[0]), Number(pos[1]))
-  return null
+  if (pos && pos.length >= 2) {
+    const el = document.elementFromPoint(Number(pos[0]), Number(pos[1]))
+    if (el) return { ok: true, el }
+    return { ok: false, error: `坐标点无元素（${Number(pos[0])}, ${Number(pos[1])}）` }
+  }
+  return { ok: false, error: '缺少定位参数（ref/selector/coordinate 至少其一）' }
 }
 
 function mouseInit(pos, mods) {
@@ -198,6 +292,57 @@ function fireMouse(el, type, pos, mods) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/** 找出元素自身或最近的可聚焦祖先（真实点击的 focus 目标，浏览器行为：聚焦最近可聚焦祖先） */
+function nearestFocusable(el) {
+  let n = el
+  while (n && n.nodeType === 1) {
+    const tag = n.tagName.toLowerCase()
+    if (n.isContentEditable || tag === 'a' || tag === 'button' || tag === 'input' ||
+        tag === 'select' || tag === 'textarea' || (typeof n.tabIndex === 'number' && n.tabIndex >= 0)) {
+      return n
+    }
+    n = n.parentElement
+  }
+  return null
+}
+
+/**
+ * 真实点击序列（治 P3a「坐标点击落空 / 点了没反应」）：
+ *   scrollIntoView(center) → elementFromPoint 命中最深层真实元素（在意图元素内）
+ *   → focus 最近可聚焦祖先 → pointer/mouse down+up → 原生 el.click() 兜底默认激活
+ *   （<a> 导航 / <button>、<input type=submit> 提交 / checkbox、radio 切换等浏览器原生
+ *   默认行为只有原生 click() 才会触发，纯合成 MouseEvent 不产生默认动作）。
+ * @param point 可选 [x,y]：给定时作为命中/事件坐标（coordinate 点击保持精确）；缺省取元素中心。
+ * @param opts  { button?:number, contextmenu?:boolean }：right_click 用 button=2 + contextmenu。
+ */
+function dispatchRealClick(el, point, mods, opts = {}) {
+  const { button = 0 } = opts
+  try { el.scrollIntoView({ block: 'center', inline: 'nearest' }) } catch (e) { /* 忽略滚动异常 */ }
+  const rect = el.getBoundingClientRect()
+  const x = point && point.length >= 2 ? Number(point[0]) : rect.left + rect.width / 2
+  const y = point && point.length >= 2 ? Number(point[1]) : rect.top + rect.height / 2
+  const doc = el.ownerDocument || document
+  let hit = null
+  try { hit = doc.elementFromPoint(x, y) } catch (e) { /* 忽略 */ }
+  const target = hit && hit.nodeType === 1 && el.contains(hit) ? hit : el
+  const focusable = nearestFocusable(el)
+  if (focusable) { try { focusable.focus({ preventScroll: true }) } catch (e) { /* 某些元素 focus 抛错，忽略 */ } }
+  const mBase = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button, ...mods }
+  const pBase = { ...mBase, pointerType: 'mouse', isPrimary: true }
+  const hasPointer = typeof PointerEvent !== 'undefined'
+  if (hasPointer) target.dispatchEvent(new PointerEvent('pointerdown', pBase))
+  target.dispatchEvent(new MouseEvent('mousedown', mBase))
+  if (hasPointer) target.dispatchEvent(new PointerEvent('pointerup', pBase))
+  target.dispatchEvent(new MouseEvent('mouseup', mBase))
+  if (opts.contextmenu) {
+    target.dispatchEvent(new MouseEvent('contextmenu', { ...mBase, button: 2 }))
+  }
+  if (button === 0 && !opts.contextmenu && typeof target.click === 'function') {
+    try { target.click() } catch (e) { /* 点击异常不影响已派发的事件序列 */ }
+  }
+  return { x, y, target }
+}
+
 /** computer：13 actions 对齐 CCB（screenshot/zoom capture 在 background） */
 async function computer(args = {}) {
   const { action, text, coordinate, start_coordinate, duration, scroll_direction, scroll_amount, repeat, modifiers } = args
@@ -206,37 +351,40 @@ async function computer(args = {}) {
 
   switch (action) {
     case 'left_click': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer left_click 找不到目标（coordinate/ref/selector）' }
-      fireMouse(el, 'mousedown', pos, mods)
-      fireMouse(el, 'mouseup', pos, mods)
-      fireMouse(el, 'click', pos, mods)
-      return { ok: true, result: { clicked: buildSelector(el), x: pos ? pos[0] : undefined, y: pos ? pos[1] : undefined } }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer left_click ${r.error}` }
+      const hit = dispatchRealClick(r.el, pos, mods)
+      return { ok: true, result: { clicked: buildSelector(r.el), x: hit.x, y: hit.y } }
     }
     case 'right_click': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer right_click 找不到目标' }
-      fireMouse(el, 'contextmenu', pos, mods)
-      return { ok: true, result: { rightClicked: buildSelector(el) } }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer right_click ${r.error}` }
+      // 右键：真实序列（滚动/命中/focus）+ contextmenu；不补 el.click()（避免误触发左键默认激活）
+      dispatchRealClick(r.el, pos, mods, { button: 2, contextmenu: true })
+      return { ok: true, result: { rightClicked: buildSelector(r.el) } }
     }
     case 'double_click': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer double_click 找不到目标' }
-      for (let i = 0; i < 2; i++) { fireMouse(el, 'mousedown', pos, mods); fireMouse(el, 'mouseup', pos, mods); fireMouse(el, 'click', pos, mods) }
-      fireMouse(el, 'dblclick', pos, mods)
-      return { ok: true, result: { doubleClicked: buildSelector(el) } }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer double_click ${r.error}` }
+      const first = dispatchRealClick(r.el, pos, mods)
+      dispatchRealClick(r.el, pos, mods)
+      fireMouse(r.el, 'dblclick', [first.x, first.y], mods)
+      return { ok: true, result: { doubleClicked: buildSelector(r.el) } }
     }
     case 'triple_click': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer triple_click 找不到目标' }
-      for (let i = 0; i < 3; i++) { fireMouse(el, 'mousedown', pos, mods); fireMouse(el, 'mouseup', pos, mods); fireMouse(el, 'click', pos, mods) }
-      fireMouse(el, 'dblclick', pos, mods)
-      fireMouse(el, 'dblclick', pos, mods)
-      return { ok: true, result: { tripleClicked: buildSelector(el) } }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer triple_click ${r.error}` }
+      let last = null
+      for (let i = 0; i < 3; i++) last = dispatchRealClick(r.el, pos, mods)
+      const p = last ? [last.x, last.y] : pos
+      fireMouse(r.el, 'dblclick', p, mods)
+      fireMouse(r.el, 'dblclick', p, mods)
+      return { ok: true, result: { tripleClicked: buildSelector(r.el) } }
     }
     case 'type': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer type 找不到目标' }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer type ${r.error}` }
+      const el = r.el
       el.focus()
       const strValue = String(text ?? '')
       if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
@@ -284,14 +432,15 @@ async function computer(args = {}) {
       return { ok: true, result: { scrolled: dir, amount } }
     }
     case 'scroll_to': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer scroll_to 找不到目标 ref' }
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-      return { ok: true, result: { scrolledTo: buildSelector(el) } }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer scroll_to ${r.error}` }
+      r.el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      return { ok: true, result: { scrolledTo: buildSelector(r.el) } }
     }
     case 'hover': {
-      const el = locateTarget(args)
-      if (!el) return { ok: false, error: 'computer hover 找不到目标' }
+      const r = locateElement(args)
+      if (!r.ok) return { ok: false, error: `computer hover ${r.error}` }
+      const el = r.el
       fireMouse(el, 'mouseover', pos, mods)
       fireMouse(el, 'mouseenter', pos, mods)
       fireMouse(el, 'mousemove', pos, mods)

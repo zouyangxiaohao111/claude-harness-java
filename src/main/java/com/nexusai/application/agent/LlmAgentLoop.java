@@ -11186,7 +11186,9 @@ public class LlmAgentLoop implements AgentLoop {
      *       引导主模型<b>自己</b>用 Read 工具 + pages 参数分段读取（每段 ≤20 页，一次多页 document block）。</li>
      *   <li><b>主模型文本</b>（deepseek 等不支持 PDF）→ 引导主模型调 Agent 工具派<b>多模态子代理</b>
      *       （model = {@code multimodalModelName} 动态多模态档位模型名）处理该 PDF。子代理可用 Read + pages
-     *       分段（推荐，一次多页 document block）；或逐页 vision_analyze（一次一 contentId，不支持页码范围）。</li>
+     *       分段（推荐，一次多页 document block）；或调 vision_analyze 一次分析一批页
+     *       （contentType=pdf + path + pages 页号数组，一次 ≤{@code PdfSupport.PDF_MAX_PAGES_PER_READ} 页，
+     *       多页合并一次往返，非逐页单 contentId）。</li>
      * </ul>
      *
      * @param pdf               待引导 PDF（needsSubagent=true）
@@ -11243,10 +11245,16 @@ public class LlmAgentLoop implements AgentLoop {
         if (pdfPath != null && !pdfPath.isBlank()) {
             sb.append("（路径：").append(pdfPath).append("）");
         }
+        // [vision-guidance-fix 2026-09-06] 引导对齐 VisionAnalyzeTool v2：contentType=pdf + path + pages 页号
+        //   数组一次 ≤PDF_MAX_PAGES_PER_READ 页（多页合并一次往返）——旧文案"一次只支持单页 contentId、不支持
+        //   页码范围"过时，会诱导视觉子代理逐页 N 次往返（视觉工具多轮），须引导一次 pages=[...] 批量分析。
         sb.append("。子代理可用 Read 工具 + pages 参数分段读取原 PDF（每段 ≤")
             .append(PdfSupport.PDF_MAX_PAGES_PER_READ)
-            .append(" 页，一次多页 document block，多模态模型直接看）；或若 PDF 页图已渲染 / 页 contentId 可用则逐页调用 vision_analyze")
-            .append("（注意：vision_analyze 一次只支持单页 contentId，不支持页码范围如 '1-5'）。推荐 Read pages 分段（高效）。");
+            .append(" 页，一次多页 document block，多模态模型直接看）；或调用 vision_analyze(type=analyze, contentType=pdf, path=")
+            .append(pdfPath != null && !pdfPath.isBlank() ? pdfPath : "<PDF 附件路径>")
+            .append(", pages=[页号数组 ≤")
+            .append(PdfSupport.PDF_MAX_PAGES_PER_READ)
+            .append(" 页], prompt=<对该批页的分析要求>) 一次分析一批页（多页合并一次往返，无需逐页）。推荐 Read pages 分段（高效）。");
         return sb.toString();
     }
 

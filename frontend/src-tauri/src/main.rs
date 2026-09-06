@@ -87,6 +87,38 @@ fn chrome_extension_dir(app: tauri::AppHandle) -> Result<String, String> {
     resolve_chrome_extension_dir(&app)
 }
 
+/// 返回扩展 ZIP 包绝对路径（内含 manifest.json 等 5 文件，供备份/手动安装/分享）。
+/// 1) 优先打包资源目录 resources/extension-pack/nexusai-extension.zip（随安装包分发，安装后与 extension 同级）；
+/// 2) 开发模式资源目录无该 zip 时，回退 src-tauri/extension-pack/nexusai-extension.zip（make-extension-zip.mjs 产物）。
+fn resolve_chrome_extension_zip_path(app: &tauri::AppHandle) -> Result<String, String> {
+    // 打包后：resource_dir()/extension-pack/nexusai-extension.zip
+    let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+    let bundled = resource_dir
+        .join("extension-pack")
+        .join("nexusai-extension.zip");
+    if bundled.is_file() {
+        return Ok(bundled.to_string_lossy().to_string());
+    }
+    // dev 回退：env!("CARGO_MANIFEST_DIR") = 编译期 src-tauri/，extension-pack/nexusai-extension.zip 即脚本产物
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("extension-pack")
+        .join("nexusai-extension.zip");
+    if dev.is_file() {
+        return Ok(dev.to_string_lossy().to_string());
+    }
+    Err(format!(
+        "未找到扩展 zip 包（resources/extension-pack/nexusai-extension.zip 与 src-tauri/extension-pack/nexusai-extension.zip 均不存在；候选路径：{} / {}）",
+        bundled.to_string_lossy(),
+        dev.to_string_lossy()
+    ))
+}
+
+/// 获取 Chrome 扩展 ZIP 包路径（供前端展示 zip 备份/手动安装位置）。
+#[tauri::command]
+fn chrome_extension_zip_path(app: tauri::AppHandle) -> Result<String, String> {
+    resolve_chrome_extension_zip_path(&app)
+}
+
 /// 检测本机是否安装 Chrome / Chromium。
 #[tauri::command]
 fn is_chrome_installed() -> Result<bool, String> {
@@ -190,6 +222,7 @@ fn main() {
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![
             chrome_extension_dir,
+            chrome_extension_zip_path,
             is_chrome_installed,
             install_chrome_extension
         ])

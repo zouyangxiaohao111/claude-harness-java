@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { chromeExtensionDir, installChromeExtension, isChromeInstalled } from '@/utils/chromeExtension'
+import { chromeExtensionDir, chromeExtensionZipPath, installChromeExtension, isChromeInstalled } from '@/utils/chromeExtension'
 import { api } from '@/api/rest'
 
 /**
@@ -14,6 +14,7 @@ export function ChromePanel({ sessionId, onClose }: { sessionId: string; onClose
   const [copied, setCopied] = useState(false)
   // FNT-BROWSER-02：浏览器扩展安装/状态（按钮触发检查，不做启动自动弹窗）
   const [extDir, setExtDir] = useState<string | null>(null)
+  const [zipPath, setZipPath] = useState<string | null>(null)
   const [chromeInstalled, setChromeInstalled] = useState<boolean | null>(null)
   const [checking, setChecking] = useState(false)
   const [installing, setInstalling] = useState(false)
@@ -38,8 +39,13 @@ export function ChromePanel({ sessionId, onClose }: { sessionId: string; onClose
   const checkStatus = useCallback(async () => {
     setChecking(true)
     try {
-      const [dir, ok] = await Promise.all([chromeExtensionDir(), isChromeInstalled()])
+      const [dir, zip, ok] = await Promise.all([
+        chromeExtensionDir(),
+        chromeExtensionZipPath(),
+        isChromeInstalled(),
+      ])
       setExtDir(dir)
+      setZipPath(zip)
       setChromeInstalled(ok)
     } finally {
       setChecking(false)
@@ -85,8 +91,20 @@ export function ChromePanel({ sessionId, onClose }: { sessionId: string; onClose
     }
   }
 
+  // 安装目录前缀：打包后扩展目录 = <安装目录>/extension，去掉末尾 /extension 即安装目录
+  // （dev 时 extDir 指向项目内扩展目录，前缀不具「安装目录」语义，文案按资源根提示即可）
+  const installRoot = extDir?.replace(/[\\/]extension$/i, '') ?? null
   const steps: { title: string; desc: string }[] = [
-    { title: '安装 Chrome 扩展（持久化）', desc: '点「一键安装」：Chrome 未运行会自动冷启动加载；Chrome 运行中会打开 chrome://extensions 引导「开发者模式 → 加载已解压的扩展程序 → 选择扩展目录」——此方式 Chrome 重启后仍保留（命令行 --load-extension 重启会失效）。' },
+    {
+      title: '安装 Chrome 扩展（持久化）',
+      desc:
+        '点「一键安装」：Chrome 未运行会自动冷启动加载；Chrome 运行中会打开 chrome://extensions 引导「开发者模式 → 加载已解压的扩展程序 → 选择扩展目录」——此方式 Chrome 重启后仍保留（命令行 --load-extension 重启会失效）。' +
+        (installRoot && zipPath
+          ? ` 桌面端安装后扩展随包分发：目录 ${installRoot}\\extension，zip 备份位于 ${zipPath}；手动加载时选中上方「扩展目录」路径即可。`
+          : installRoot
+            ? ` 桌面端安装后扩展随包分发：目录 ${installRoot}\\extension（zip 备份未生成，需重新构建/安装）。`
+            : ' 打包版扩展目录与 zip 备份随安装包分发到安装目录（extension / extension-pack\\nexusai-extension.zip）；此处未拿到真实路径，可点上方「检查浏览器状态」刷新。'),
+    },
     { title: '打开扩展面板点「连接」', desc: '点击浏览器右上角扩展图标（拼图），在 NexusAI in Chrome popup 中点击「连接」一次（无需填写 sessionId）。' },
     { title: '全局连接已建立', desc: '扩展连上 ws://localhost:3458/ws/browser（hello 不带 sessionId），一个连接服务所有会话；面板「扩展 WS 连接」显示已连接。' },
     { title: '在任意会话中使用', desc: '后端按 sessionId 路由浏览器工具调用，每个会话自动分配自己的浏览器标签页（对齐 CCB「每个对话自己的新 tab」）。' },
@@ -134,11 +152,18 @@ export function ChromePanel({ sessionId, onClose }: { sessionId: string; onClose
                 此前已一键安装过；若扩展未生效可重新安装。
               </div>
             )}
-            {extDir !== null && (
-              <div style={{ fontSize: 11, color: 'var(--ink-muted)', lineHeight: 1.5, overflowWrap: 'anywhere' }}>
-                扩展资源路径：{extDir
-                  ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5 }}>{extDir}</span>
-                  : '（未找到，桌面端打包后随安装包分发到 resources/extension）'}
+            {(extDir !== null || zipPath !== null) && (
+              <div style={{ fontSize: 11, color: 'var(--ink-muted)', lineHeight: 1.6, overflowWrap: 'anywhere', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div>
+                  扩展目录：{extDir
+                    ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5 }}>{extDir}</span>
+                    : '未找到（请重新安装 NexusAI 或联系管理员）'}
+                </div>
+                <div>
+                  扩展 ZIP 包：{zipPath
+                    ? <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5 }}>{zipPath}</span>
+                    : '未找到（打包版未附带 zip 备份，请重新安装 NexusAI）'}
+                </div>
               </div>
             )}
             <div style={{ fontSize: 11, color: 'var(--ink-muted)', lineHeight: 1.6 }}>

@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Misc
+*.html
+!index.html
+# 浏览器扩展 popup（Chrome action default_popup 引用；否则 clone/发布缺文件 Chrome 报错）
+!extension/popup.html
+.claude/worktrees/

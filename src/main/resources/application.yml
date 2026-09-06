@@ -321,7 +321,7 @@ nexusai:
     #   18 工具给模型，避免开发期误调）；需启用 → true + 装 Chrome 扩展。BrowserMcpToolConfig 读此
     #   flag（false → 工具不注册）+ BundledSkillFeatureFlagsConfig nexusai-in-chrome skill 门控叠加
     #   （false → skill 不注册，防「skill 提示用工具但工具不存在」空转）。后期转常态后改默认 true。
-    browser-mcp: false
+    browser-mcp: true
     # [2026-09-01 → V61 迁移 DB] 插件双读开关已迁移为 DB settings.plugin_claude_fallback
     #   （前端「插件设置」页可配；null = 回落默认 true）。本 yml 键已废弃——仅保留占位，
     #   实际消费点 InstalledPluginsManager / InstalledPluginsFileStore 改读 DB 列。

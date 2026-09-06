@@ -34,3 +34,15 @@ src-tauri/nexusai-debug.log
 .gitnexus/
 .nexusai/
 .worktrees/
+
+# ===== Tauri 打包产物（同步自 nexusai master .gitignore，front/→frontend/ 路径重映射）=====
+# 后端产物（prepare-backend 生成，不入库）；保留 .gitkeep 占位使目录常驻
+#   （tauri build.rs 校验 bundle.resources 的 backend 路径存在，缺失导致 tauri dev/build 失败）
+frontend/src-tauri/backend/*
+!frontend/src-tauri/backend/.gitkeep
+# 扩展 zip 产物（make-extension-zip.mjs 生成，不入库）；保留 .gitkeep 占位使目录常驻
+#   （tauri bundle.resources 校验 extension-pack 路径存在，缺失导致 tauri dev/build 失败）
+frontend/src-tauri/extension-pack/*
+!frontend/src-tauri/extension-pack/.gitkeep
+# 本地打包产物目录（不入库，供 pack.bat/sh 输出与人工取用）
+release/

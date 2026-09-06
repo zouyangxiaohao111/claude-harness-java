@@ -1,10 +1,11 @@
 /**
  * Chrome 扩展安装桥接层（FNT-BROWSER-02）
  *
- * 封装 Tauri 三个 command：
- *   - chrome_extension_dir      → 扩展目录绝对路径
- *   - is_chrome_installed       → Chrome/Chromium 是否已安装
- *   - install_chrome_extension  → 用本机 Chrome 登录配置启动并加载扩展
+ * 封装 Tauri 四个 command：
+ *   - chrome_extension_dir       → 扩展目录绝对路径
+ *   - chrome_extension_zip_path  → 扩展 ZIP 包绝对路径（extension-pack/nexusai-extension.zip）
+ *   - is_chrome_installed        → Chrome/Chromium 是否已安装
+ *   - install_chrome_extension   → 用本机 Chrome 登录配置启动并加载扩展
  *
  * 动态 import + 非 Tauri 环境优雅降级（与 tauri-bridge.ts 同一模式）：
  * 浏览器 dev 模式不阻塞调用方，返回 null / false / 抛错由调用方展示。
@@ -20,6 +21,15 @@ async function invokeTauri<T>(cmd: string): Promise<T> {
 export async function chromeExtensionDir(): Promise<string | null> {
   try {
     return await invokeTauri<string>('chrome_extension_dir')
+  } catch {
+    return null
+  }
+}
+
+/** 扩展 ZIP 包绝对路径（打包后随安装包分发到 extension-pack/nexusai-extension.zip；dev 由 make-extension-zip.mjs 产物）。非 Tauri / 未找到返回 null。 */
+export async function chromeExtensionZipPath(): Promise<string | null> {
+  try {
+    return await invokeTauri<string>('chrome_extension_zip_path')
   } catch {
     return null
   }

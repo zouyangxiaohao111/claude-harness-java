@@ -5,10 +5,12 @@ import com.nexusai.application.agent.browser.BrowserWsChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.socket.config.annotation.EnableWebSocket;
 import org.springframework.web.socket.config.annotation.WebSocketConfigurer;
 import org.springframework.web.socket.config.annotation.WebSocketHandlerRegistry;
+import org.springframework.web.socket.server.standard.ServletServerContainerFactoryBean;
 
 /**
  * 浏览器扩展 WebSocket 端点配置 · 原生 WS（非 STOMP）。
@@ -46,6 +48,20 @@ public class BrowserWebSocketConfig implements WebSocketConfigurer {
 
     @Autowired
     private BrowserWsChannel browserWsChannel;
+
+    /**
+     * 放大 WS 帧缓冲 —— 治 1009「Message Too Big」：
+     * 截图结果是大段 base64 JSON（~40KB~MB 级），后端默认文本帧缓冲 ~8KB，
+     * 一发截图就超限 → 连接被 1009 掐断（此前「截图必断连/超时」根因）。
+     * 16MB 文本 + 二进制缓冲覆盖最大全页 PNG；会话不设服务端空闲超时。
+     */
+    @Bean
+    public ServletServerContainerFactoryBean createWebSocketContainer() {
+        ServletServerContainerFactoryBean container = new ServletServerContainerFactoryBean();
+        container.setMaxTextMessageBufferSize(16 * 1024 * 1024);
+        container.setMaxBinaryMessageBufferSize(16 * 1024 * 1024);
+        return container;
+    }
 
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {

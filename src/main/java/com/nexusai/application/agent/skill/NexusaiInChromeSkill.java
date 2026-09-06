@@ -46,7 +46,11 @@ public final class NexusaiInChromeSkill {
         "Now that this skill is invoked, you have access to Chrome browser automation tools. "
         + "You can now use the mcp__nexusai-in-chrome__* tools to interact with web pages.\n\n"
         + "IMPORTANT: Start by calling mcp__nexusai-in-chrome__tabs_context_mcp to get information "
-        + "about the user's current browser tabs.";
+        + "about the user's current browser tabs.\n\n"
+        + "CAPTCHA RULE: If the page shows a CAPTCHA, slider-drag verification, or a login/consent "
+        + "prompt, do NOT attempt to auto-solve it (no javascript_tool hacks, no blind coordinate "
+        + "clicks). Stop, and call AskUserQuestion to ask the user to complete the verification in "
+        + "the browser manually. After they confirm, re-check with read_page / get_page_text and continue.";
     public static final String TOOL_PREFIX = "mcp__nexusai-in-chrome__";
 
     private final Supplier<String> basePromptSupplier;

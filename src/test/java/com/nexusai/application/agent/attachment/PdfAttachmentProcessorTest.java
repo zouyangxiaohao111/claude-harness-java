@@ -228,8 +228,9 @@ class PdfAttachmentProcessorTest {
             .contains("Agent 工具")
             .contains("多模态子代理")
             .contains("Read 工具 + pages 参数分段读取")
-            .contains("vision_analyze 一次只支持单页 contentId")
-            .doesNotContain("已派子代理");
+            .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+            .doesNotContain("已派子代理")
+            .doesNotContain("一次只支持单页 contentId");
     }
 
     @Test
@@ -254,7 +255,8 @@ class PdfAttachmentProcessorTest {
         assertThat(msg.content())
             .contains("model=claude-sonnet-4-6")
             .contains("当前模型不支持直接查看 PDF")
-            .contains("vision_analyze 一次只支持单页 contentId");
+            .contains("vision_analyze(type=analyze, contentType=pdf, path=")
+            .doesNotContain("一次只支持单页 contentId");
     }
 
     @Test

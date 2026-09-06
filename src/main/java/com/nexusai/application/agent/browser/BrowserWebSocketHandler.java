@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.browser;
 
+import java.util.concurrent.atomic.AtomicLong;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -39,6 +40,9 @@ public class BrowserWebSocketHandler extends TextWebSocketHandler {
 
     private static final Logger log = LoggerFactory.getLogger(BrowserWebSocketHandler.class);
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** 异常断连(1001/1006)累计计数 —— 埋点量化 MV3 SW 回收/网络抖动断连频率。 */
+    private static final AtomicLong abnormalCloseCount = new AtomicLong();
 
     private final BrowserWsChannel channel;
 
@@ -108,6 +112,18 @@ public class BrowserWebSocketHandler extends TextWebSocketHandler {
                 }
                 channel.resolve(callId, msg);
             }
+            case "ping" -> {
+                // 扩展心跳 → 回 pong：让扩展 SW 周期性「收到一条 WS 消息」，重置 MV3 SW 空闲计时
+                // （Chrome 以「SW 是否在处理事件」判空闲；单向往外发不算，收到才算 → 防回收断连）
+                try {
+                    session.sendMessage(new TextMessage("{\"type\":\"pong\"}"));
+                } catch (java.io.IOException e) {
+                    if (log.isWarnEnabled()) {
+                        log.warn("BrowserWebSocketHandler: 回 pong 失败 wsSessionId={} err={}",
+                            session.getId(), e.getMessage());
+                    }
+                }
+            }
             default -> {
                 if (log.isWarnEnabled()) {
                     log.warn("BrowserWebSocketHandler: 未知消息类型（忽略）type={} wsSessionId={}",
@@ -118,14 +134,29 @@ public class BrowserWebSocketHandler extends TextWebSocketHandler {
     }
 
     /**
-     * 连接关闭 → 清理全局引用（身份感知，不会误删新连接）。
+     * 连接关闭 → 清理全局引用（身份感知，不会误删新连接），并按 close-code 分类埋点：
+     * 1000 正常关闭；1001/1006 计为异常断连（warn + 累计）；其它归「其他(code)」。
      */
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         channel.unregisterByWsSession(session);
+        int code = status == null ? -1 : status.getCode();
+        String kind;
+        if (code == 1000) {
+            kind = "正常关闭(1000)";
+        } else if (code == 1001 || code == 1006) {
+            kind = "异常断连(1001/1006)——疑似 MV3 SW 回收/网络抖动";
+            long n = abnormalCloseCount.incrementAndGet();
+            if (log.isWarnEnabled()) {
+                log.warn("BrowserWebSocketHandler: 扩展 WS 异常关闭 wsSessionId={} status={} 累计异常次数={}（会话 tab 是否重建见扩展侧日志）",
+                    session.getId(), status, n);
+            }
+        } else {
+            kind = "其他(" + code + ")";
+        }
         if (log.isInfoEnabled()) {
-            log.info("BrowserWebSocketHandler: 扩展 WS 已关闭 wsSessionId={} status={}",
-                session.getId(), status);
+            log.info("BrowserWebSocketHandler: 扩展 WS 已关闭 wsSessionId={} 分类={} status={}",
+                session.getId(), kind, status);
         }
     }
 

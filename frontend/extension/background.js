@@ -6,7 +6,7 @@
 //   3. 维护 per-session tab 组（Map<sessionId, {tabId,...}>）：tabs_context_mcp / tabs_create_mcp
 //      首次某会话调用创建新 tab，后续复用（对齐 CCB「每个对话创建自己的新 tab」）
 //   4. 结果回传带 sessionId（tool_result / tool_error 与 tool_call 的 id 一一对应）
-//   5. 断线自动重连（2s 退避）；单次调用 30s 超时兜底（fail loud）
+//   5. 断线自动重连（指数退避 2s→4s→5s 封顶）；单次调用 30s 超时兜底（fail loud）
 
 const WS_URL = 'ws://localhost:3458/ws/browser'
 const TIMEOUT_MS = 30_000 // 后端约定 30s 内必须响应
@@ -29,6 +29,7 @@ function blobToDataUrl(blob) {
 
 let ws = null
 let reconnectTimer = null
+let reconnectAttempt = 0 // 指数退避计数（onopen 重置 0）
 let heartbeatTimer = null
 let connected = false
 /** id -> { tool, timer, sessionId } · 未完成的 tool_call，用于超时清理 */
@@ -44,23 +45,24 @@ const sessionTabs = new Map()
 /* ------------------------------------------------------------------ */
 const SESSION_TABS_KEY = 'nexusai_session_tabs'
 
-function persistSessionTabs() {
+async function persistSessionTabs() {
   const obj = {}
   for (const [sid, entry] of sessionTabs) obj[sid] = entry
-  chrome.storage.local.set({ [SESSION_TABS_KEY]: obj }).catch(() => {})
+  await chrome.storage.local.set({ [SESSION_TABS_KEY]: obj }).catch(() => {})
 }
 
 async function restoreSessionTabs() {
   try {
     const saved = await chrome.storage.local.get(SESSION_TABS_KEY)
     const data = saved && saved[SESSION_TABS_KEY]
-    if (data && typeof data === 'object') {
-      for (const [sid, entry] of Object.entries(data)) {
-        // 只恢复仍存在的 tab（tabId 可能已被用户关闭 → ensureSessionTab 的 getTab 兜底重建）
-        if (entry && entry.tabId) sessionTabs.set(sid, entry)
-      }
+    if (!data || typeof data !== 'object') return
+    for (const [sid, entry] of Object.entries(data)) {
+      if (!entry || !entry.tabId) continue
+      const tab = await getTab(entry.tabId).catch(() => null) // getTab 已定义（SW 内 getTab 兜底返回 null）
+      if (tab) sessionTabs.set(sid, { ...entry, windowId: tab.windowId, url: tab.url, title: tab.title })
+      // tab 不存在（用户关闭/浏览器重启）→ 不恢复，ensureSessionTab 之后按需重建一次
     }
-  } catch { /* storage 不可用 → 空 Map（下次重建，可接受） */ }
+  } catch { /* storage 不可用 → 空 Map */ }
 }
 
 /* ------------------------------------------------------------------ */
@@ -87,6 +89,7 @@ function connect() {
   }
   ws.onopen = () => {
     connected = true
+    reconnectAttempt = 0 // 连上即重置退避计数
     sendHello()
     broadcastStatus()
     startHeartbeat()
@@ -117,21 +120,27 @@ function sendHello() {
 
 function scheduleReconnect() {
   clearTimeout(reconnectTimer)
-  reconnectTimer = setTimeout(connect, RECONNECT_MS)
+  const delay = Math.min(5000, RECONNECT_MS * Math.pow(2, reconnectAttempt)) // 2s→4s→5s 封顶
+  reconnectAttempt++
+  reconnectTimer = setTimeout(() => { connect() }, delay)
 }
 
 /* ------------------------------------------------------------------ */
-/*  WS 心跳：每 25s 发 ping，保持连接活跃（防后端空闲断开），配合 alarms  */
-/*  保活 + 2s 快速重连让「连接过期」几乎无感。MV3 SW 无法真正永不过期     */
-/*  （SW 空闲回收是 Chrome 限制），但心跳+保活+重连把断开窗口压到最小。  */
+/*  WS 心跳：每 20s 发 ping 并补一次 storage 写，保持连接活跃（防后端空闲  */
+/*  断开 + Chrome<116 也重置 SW 空闲计时），配合 alarms 保活 + 指数退避重连 */
+/*  让「连接过期」几乎无感。MV3 SW 无法真正永不过期（SW 空闲回收是 Chrome  */
+/*  限制），但心跳+保活+重连把断开窗口压到最小。                          */
 /* ------------------------------------------------------------------ */
 function startHeartbeat() {
   clearInterval(heartbeatTimer)
   heartbeatTimer = setInterval(() => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'ping' }))
+      // 真实扩展活动：重置 SW 空闲计时（不依赖 Chrome≥116 "WS 消息重置计时"）
+      chrome.storage.local.set({ _hb: Date.now() }).catch(() => {})
     }
-  }, 25_000)
+  }, 6_000) // 心跳压到 6s：实测这台 Chrome 的 SW ~13s 就被回收，20s 心跳追不上被杀速度；
+  // 6s 发 ping + 后端回 pong（SW 每 ~6s 收到消息）→ 永不空闲满 13s，防回收断连
 }
 function stopHeartbeat() {
   clearInterval(heartbeatTimer)
@@ -172,6 +181,7 @@ function dispatchToolCall(msg) {
     }
   }, TIMEOUT_MS)
   pending.set(id, { tool, timer, sessionId })
+  console.log('[tool_call] dispatch', { tool, id, sessionId, tabId: (args && args.tabId) || null })
 
   runTool(id, tool, args || {}, sessionId)
     .then((out) => resolve(id, sessionId, out))
@@ -189,7 +199,7 @@ async function runTool(id, tool, args, sessionId) {
 /** 需要 chrome.tabs/windows API 的工具在 SW 内执行，不依赖页面 DOM */
 function isBackgroundTool(tool, args) {
   if (['resize_window', 'tabs_context_mcp', 'tabs_create_mcp', 'switch_browser', 'javascript_tool', 'navigate'].includes(tool)) return true
-  if (tool === 'computer' && args.action === 'screenshot') return true
+  if (tool === 'computer' && (args.action === 'screenshot' || args.action === 'zoom')) return true
   return false
 }
 
@@ -214,6 +224,7 @@ function sendResult(id, sessionId, result) {
 }
 
 function sendError(id, sessionId, error) {
+  console.warn('[tool_error] ws send', { id, sessionId, error: String(error).slice(0, 300) })
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: 'tool_error', id, sessionId, error }))
   }
@@ -297,8 +308,10 @@ async function ensureSessionTab(sessionId, url) {
   // ensureInjectableTab 可能导航（chrome:// 等 → about:blank）→ finalEntry 写回 sessionTabs + 持久化
   //   （防止 SW 回收后会话 tab 信息丢失 → 复用原 tab，不再每次重建新标签）
   const ensured = await ensureInjectableTab(tab, entry)
+  // 会话 tab 防自动丢弃（新建与复用的 tab 都关：SW 回收/tab 闲置不被 Chrome 整 tab 丢弃）
+  try { await chrome.tabs.update(ensured.tab.id, { autoDiscardable: false }) } catch { /* 可忽略 */ }
   sessionTabs.set(sessionId, ensured.entry)
-  persistSessionTabs()
+  await persistSessionTabs() // 原 fire-and-forget，改为写完成再返回（SW 回收前落盘更稳）
   return ensured
 }
 
@@ -307,6 +320,13 @@ async function ensureSessionTab(sessionId, url) {
  * 故 args.tabId（模型可能携带的陈旧值）一律以会话 tab 为准 —— 即「定位到该会话的 tab，而非活动 tab」。
  */
 async function resolveSessionTab(sessionId, args) {
+  // 模型显式给 tabId（对齐 CCB/BrowserSkill 工具带 tabId 语义）：若指向存活的 http(s) 页则直接用，
+  // 绝不新建 chrome://newtab——否则每次调用都冒一个新标签并截到空页。
+  const tid = args && args.tabId
+  if (tid != null && /^\d+$/.test(String(tid))) {
+    const t = await chrome.tabs.get(Number(tid)).catch(() => null)
+    if (t && IS_HTTP(t)) return t
+  }
   const { tab } = await ensureSessionTab(sessionId)
   return tab
 }
@@ -328,6 +348,203 @@ async function runInSessionTab(id, tool, args, sessionId) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  截图辅助：免聚焦截图（去 OS raise / 去盲目 sleep / minimized 显式拒绝） */
+/* ------------------------------------------------------------------ */
+
+/** 是否 http(s) 页（可被内容脚本注入/被 CDP 捕获；chrome://、about:、扩展页除外）。 */
+const IS_HTTP = (t) => t && t.url && /^https?:/i.test(t.url)
+
+/** 查窗口最小化态（用于截图前快速拒绝，不做静默重试）。 */
+async function windowIsMinimized(windowId) {
+  try {
+    const w = await chrome.windows.get(windowId)
+    return w.state === 'minimized'
+  } catch { return false } // 窗口没了由 captureVisibleTab 抛错兜底
+}
+
+/** 目标窗口当前活动 tab（决定是否要 tabs.update 激活——已 active 则跳过，省 ~840ms）。 */
+async function activeTabInWindow(windowId) {
+  const tabs = await chrome.tabs.query({ windowId, active: true })
+  return tabs[0] || null
+}
+
+/** base64 dataUrl 的真实字节数（MV3 SW 有 atob）。 */
+function dataUrlBytes(dataUrl) {
+  if (!dataUrl) return 0
+  try {
+    const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1)
+    const bin = atob(b64)
+    return bin.length
+  } catch { return dataUrl.length }
+}
+
+/** 有界等待：ms 内不落定即抛错（截图路径绝不无限挂起，避免后端 30s send 掐掉却无诊断）。 */
+function raceTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`[${label}] 超时 ${ms}ms`)), ms)),
+  ])
+}
+
+/**
+ * CDP per-tab 截图（renderer 级，不依赖窗口在前台 / 活动标签）。每次 attach→enable→
+ * 焦点模拟→capture→detach。每步有界（8s），最坏 ~24s < 后端 30s，不依赖 SW 定时器存活。
+ * Emulation.setFocusEmulationEnabled 让被遮挡/非前台页按“已聚焦”产帧（不抢 OS 焦点），
+ * 治 occlusion 停帧导致 fromSurface 等不到新帧。
+ */
+async function cdpScreenshotTab(tabId, capFormat, quality) {
+  let attached = false
+  try {
+    await raceTimeout(chrome.debugger.attach({ tabId }, '1.3'), 8000, 'cdp.attach')
+    attached = true
+    await raceTimeout(chrome.debugger.sendCommand({ tabId }, 'Page.enable'), 8000, 'cdp.enable')
+    // 焦点模拟：页面视为已聚焦 → 动画/Canvas 持续产帧（配合 fromSurface 才能拿到新帧）
+    await raceTimeout(
+      chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: true }),
+      8000, 'cdp.focusEmu').catch(() => {})
+    const res = await raceTimeout(
+      chrome.debugger.sendCommand({ tabId }, 'Page.captureScreenshot', {
+        format: capFormat,
+        quality: capFormat === 'jpeg' ? quality : undefined,
+        fromSurface: true,
+        captureBeyondViewport: false,
+      }),
+      8000, 'cdp.capture')
+    if (!res || !res.data) return { ok: false, step: 'capture', msg: 'CDP 未返回图像数据' }
+    if (!isPureBase64(res.data)) {
+      console.warn('[screenshot][cdp] 返回 base64 不纯 len=' + String(res.data).length)
+      return { ok: false, step: 'capture', msg: 'CDP 返回的 base64 不纯（尾部疑似混入异常文本）' }
+    }
+    return { ok: true, dataUrl: 'data:image/' + (capFormat === 'png' ? 'png' : 'jpeg') + ';base64,' + res.data }
+  } catch (e) {
+    const m = (e && e.message) || String(e)
+    if (/another debugger/i.test(m)) return { ok: false, devtools: true, msg: m }
+    console.warn('[screenshot][cdp] 失败', { tabId, capFormat, msg: m })
+    return { ok: false, msg: m }
+  } finally {
+    if (attached) {
+      try { await chrome.debugger.sendCommand({ tabId }, 'Emulation.setFocusEmulationEnabled', { enabled: false }) } catch { /* 忽略 */ }
+      try { await chrome.debugger.detach({ tabId }) } catch { /* 忽略 */ }
+    }
+  }
+}
+
+/**
+ * 免前台截图：优先 CDP per-tab（不依赖窗口前台/活动标签）；CDP 失败回退 captureVisibleTab。
+ * 两路都带超时、绝不挂起。minimized → ERR_MINIMIZED（先拒，不做 18-57s 慢帧）。
+ */
+/** 严格 base64 纯度（CDP/Chrome 返回仅含 A-Za-z0-9+/=）；尾部混入其它字符即判定异常。 */
+function isPureBase64(b64) {
+  return typeof b64 === 'string' && /^[A-Za-z0-9+/]*={0,2}$/.test(b64)
+}
+
+async function screenshotTab(windowId, tabId, { format = 'jpeg', quality = 85 } = {}) {
+  const t0 = performance.now()
+  if (await windowIsMinimized(windowId)) {
+    return { ok: false, code: 'ERR_MINIMIZED',
+      msg: 'Chrome 窗口已最小化：无可见合成面，无法截图。请先恢复窗口，或改用 DOM 文本观察（get_page_text/read_page）。' }
+  }
+  // 目标 = 该窗口当前活动 http(s) 标签（用户正在看的页面——截图成熟做法），
+  // 而非受管会话 tab：会话 tab 可能是残留 chrome://newtab，强行激活它反而截到空页。
+  let act = await activeTabInWindow(windowId)
+  if (!act || !IS_HTTP(act)) {
+    // 活动标签非 http(s)（chrome://newtab/about:blank）→ 回退受管 tabId（若为 http(s)）并激活
+    const stored = await chrome.tabs.get(tabId).catch(() => null)
+    if (stored && IS_HTTP(stored)) {
+      try { await chrome.tabs.update(tabId, { active: true }) } catch (e) {
+        return { ok: false, code: 'ERR_ACTIVATE', msg: '激活目标 tab 失败：' + (e && e.message || e) }
+      }
+      act = stored
+    }
+  }
+  if (!act || !IS_HTTP(act)) {
+    const fallback = await chrome.tabs.get(tabId).catch(() => null)
+    const shown = (act && act.url) || (fallback && fallback.url) || ''
+    return { ok: false, code: 'ERR_TARGET_TAB',
+      msg: `当前活动标签不可截图（URL=${shown || '(空)'}，多为 chrome:// 新标签/空白页）。请先 navigate 或把目标页面切为活动标签再截图。` }
+  }
+  tabId = act.id // 此后 captureVisibleTab/CDP 都针对该活动 http(s) 页
+  const capFormat = format === 'png' ? 'png' : 'jpeg'
+
+  // 主路① captureVisibleTab：直接抓 OS 合成面，动画/Canvas 页也秒出（对齐 mcp-chrome/BrowserSkill 默认）。
+  // 前台门控：captureVisibleTab 读窗口合成面，窗口被遮挡(非前台)会 occlusion 停帧 → 只在前台时用它；
+  // 非前台直接走 CDP（免前台 + 焦点模拟），避免 captureVisibleTab 永悬 + MV3 SW 回收带死看门狗。
+  const winState = await chrome.windows.get(windowId).catch(() => null)
+  const windowFocused = !!(winState && winState.focused)
+  let cvtErr = null
+  if (windowFocused) {
+    console.log('[shot] cvt:try', { windowId, tabId, capFormat, focused: true })
+    try {
+      const dataUrl = await raceTimeout(
+        chrome.tabs.captureVisibleTab(windowId, { format: capFormat, quality: capFormat === 'jpeg' ? quality : undefined }),
+        8000, 'captureVisibleTab')
+      const bytes = dataUrlBytes(dataUrl)
+      const b64part = typeof dataUrl === 'string' ? dataUrl.slice(dataUrl.indexOf(',') + 1) : ''
+      if (dataUrl && bytes >= 512 && isPureBase64(b64part)) {
+        console.log('[shot] cvt:ok bytes=' + bytes + ' ms=' + Math.round(performance.now() - t0))
+        return { ok: true, dataUrl, format: capFormat, bytes, ms: Math.round(performance.now() - t0), source: 'captureVisibleTab' }
+      }
+      cvtErr = (!dataUrl || bytes < 512) ? '返回空/坏帧' : '返回 base64 不纯'
+      console.warn('[shot] cvt:err ' + cvtErr)
+    } catch (e1) {
+      cvtErr = (e1 && e1.message) || String(e1)
+      console.warn('[shot] cvt:err ' + cvtErr)
+    }
+  } else {
+    cvtErr = '窗口非前台(focused=false)，跳过 captureVisibleTab 直走 CDP'
+    console.log('[shot] cvt:skip 窗口非前台')
+  }
+
+  // 主路② CDP per-tab（免前台；动画页可能等帧超时，故作回退而非主路）
+  console.log('[shot] cdp:try')
+  const cdp = await cdpScreenshotTab(tabId, capFormat, quality)
+  if (cdp.ok) {
+    const dataUrl = cdp.dataUrl
+    const bytes = dataUrlBytes(dataUrl)
+    if (bytes < 512) return { ok: false, code: 'ERR_BLANK', msg: 'CDP 截图内容为空/坏帧（bytes=' + bytes + '）。' }
+    console.log('[shot] cdp:ok bytes=' + bytes + ' ms=' + Math.round(performance.now() - t0))
+    return { ok: true, dataUrl, format: capFormat, bytes, ms: Math.round(performance.now() - t0), source: 'cdp' }
+  }
+  const devtoolsNote = cdp.devtools ? '（目标页开着 DevTools，占用了调试器）' : ''
+  console.warn('[screenshot] 两路均失败', { cvtErr, cdp: cdp.msg, cdpStep: cdp.step })
+  return { ok: false, code: 'ERR_CAPTURE',
+    msg: `截图失败${devtoolsNote}。captureVisibleTab: ${cvtErr || '(无)'}；CDP: ${cdp.msg || cdp.step || '(无)'}` }
+}
+
+/**
+ * 就绪门（navigate 专用）：轮询等待页面加载完成（document.readyState === 'complete'）。
+ * 上限 ~15s / 200ms；页面不可注入（chrome:// 等）探测不到 readyState → 尽早按 timeout
+ * 返回，不抛错、不无限等——导航本身已成功发起，加载态由模型用后续 DOM 工具自我校正。
+ */
+async function waitForTabComplete(tabId) {
+  const DEADLINE_MS = 15_000
+  const STEP_MS = 200
+  const UNINJECTABLE_MAX = 5
+  const deadline = Date.now() + DEADLINE_MS
+  let uninjectable = 0
+  while (Date.now() < deadline) {
+    const tab = await getTab(tabId)
+    if (!tab) return 'timeout' // tab 已不存在（被关闭/替换）→ 不再等
+    if (tab.status === 'complete') {
+      let rs = null
+      try {
+        const r = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => document.readyState,
+        })
+        rs = (r && r[0] && r[0].result) || null
+      } catch (e) {
+        rs = null // 导航中/不可注入 → 按“未就绪”继续轮询
+      }
+      if (rs === 'complete') return 'complete'
+      if (rs === null && ++uninjectable >= UNINJECTABLE_MAX) return 'timeout' // chrome:// 等不可注入页
+    }
+    await sleep(STEP_MS)
+  }
+  return 'timeout'
+}
+
+/* ------------------------------------------------------------------ */
 /*  SW 内直接执行的工具                                                  */
 /* ------------------------------------------------------------------ */
 async function runInBackground(tool, args, sessionId) {
@@ -340,20 +557,36 @@ async function runInBackground(tool, args, sessionId) {
       //   把 tab 导航到目标 http URL，绕开不可注入页（导航后 DOM 工具在 http 页正常）。
       //   对齐 CCB @ant/claude-for-chrome-mcp browserTools.ts:212-230 navigate schema：
       //   url 无协议默认补 https://；"forward"/"back" 走浏览器历史导航。
+      //   [就绪门（P3c）] tabs.update/goForward/goBack 只发起导航、不等加载完成，随后 DOM
+      //   工具可能打在「旧文档残留 / loading 中」页 → 用 waitForTabComplete 轮询等页面
+      //   complete（上限 ~15s / 200ms）；等不到带 state:'timeout' 返回（不抛、不无限等）。
       const { url } = args
       if (!url) throw new Error('navigate 需要 url 参数')
       const { tab } = await ensureSessionTab(sessionId)
+      let navMode = 'url'
+      let navUrl = url
       if (url === 'forward') {
         await chrome.tabs.goForward(tab.id)
-        return { ok: true, result: { navigating: 'forward', tabId: tab.id } }
-      }
-      if (url === 'back') {
+        navMode = 'forward'
+      } else if (url === 'back') {
         await chrome.tabs.goBack(tab.id)
-        return { ok: true, result: { navigating: 'back', tabId: tab.id } }
+        navMode = 'back'
+      } else {
+        navUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`
+        await chrome.tabs.update(tab.id, { url: navUrl })
       }
-      const target = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`
-      await chrome.tabs.update(tab.id, { url: target })
-      return { ok: true, result: { navigating: target, tabId: tab.id } }
+      await sleep(200) // 给导航一帧提交窗口，避免轮询到旧文档的 readyState
+      const state = await waitForTabComplete(tab.id)
+      const cur = await getTab(tab.id)
+      return {
+        ok: true,
+        result: {
+          navigating: navMode === 'url' ? navUrl : navMode,
+          url: (cur && cur.url) || navUrl,
+          tabId: tab.id,
+          state,
+        },
+      }
     }
     case 'resize_window': {
       const { width, height } = args
@@ -397,7 +630,8 @@ async function runInBackground(tool, args, sessionId) {
       const fn = args.fn
       const payload = code != null ? String(code) : fn != null ? `return (${fn})()` : null
       if (payload == null) throw new Error('javascript_tool 需要 code/text 或 function')
-      const { tab } = await ensureSessionTab(sessionId)
+      // 尊重显式 tabId（对齐 computer）：否则会打到受管会话 tab（可能停在 chrome:///扩展页）→ Cannot access chrome-extension://
+      const tab = await resolveSessionTab(sessionId, args)
       const res = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         world: 'MAIN',
@@ -418,32 +652,19 @@ async function runInBackground(tool, args, sessionId) {
       throw new Error(out.error)
     }
     case 'computer': {
-      // computer：screenshot / zoom（capture）在 background 处理；其余 DOM action（click/type/key/
-      //   wait/scroll/scroll_to/hover/drag）由 content script 执行（对齐 CCB 13 actions 分流）
+      // 截图：走免聚焦 screenshotTab（去 raise / 去盲目 sleep / minimized 显式 reason-code）。
+      // DOM 类 computer action 由 content script 处理（isBackgroundTool 已分流，此处仅截图/zoom）。
       const { action, format, region } = args
-      const { tab } = await ensureSessionTab(sessionId)
-      await chrome.windows.update(tab.windowId, { focused: true })
-      await chrome.tabs.update(tab.id, { active: true })
-      // 短暂等待聚焦生效（captureVisibleTab 在窗口未聚焦时可能失败/黑屏——Windows 程序无法
-      //   强制聚焦，用户在 NexusAI 应用里操作时 Chrome 窗口未聚焦）
-      await sleep(200)
-      // [截图] captureVisibleTab（不弹 debugger 提示）+ jpeg（base64 小，防 WS 回传超时）+ 8s
-      //   超时保护（Promise.race 卡住快速 tool_error，不让后端 30s 干等）。zoom 用 png（无损裁剪源）。
-      const capFormat = action === 'zoom' ? 'png' : (format || 'jpeg')
-      const timeout = new Promise((_, rej) =>
-        setTimeout(() => rej(new Error(`screenshot 捕获超时（${SCREENSHOT_TIMEOUT_MS / 1000}s）`)), SCREENSHOT_TIMEOUT_MS))
-      let full
-      try {
-        full = await Promise.race([
-          chrome.tabs.captureVisibleTab(tab.windowId, { format: capFormat, quality: capFormat === 'jpeg' ? 85 : undefined }),
-          timeout,
-        ])
-        console.log('[screenshot] captureVisibleTab OK', { format: capFormat, bytes: full ? full.length : 0 })
-      } catch (e) {
-        // [截图诊断] 截图失败/超时日志（区别：capture 失败 vs 传输慢——capture 日志缺失 = capture 卡住）
-        console.error('[screenshot] captureVisibleTab FAIL/超时', { format: capFormat, err: e && e.message })
-        throw e
+      if (action !== 'screenshot' && action !== 'zoom') {
+        return { ok: false, error: `computer ${action} 应由 content script 执行（非截图 action 不应到此）` }
       }
+      // 目标 tab：优先模型显式 tabId 指向的存活 http(s) 页（resolveSessionTab 已统一），不再绕受管会话 tab
+      const tab = await resolveSessionTab(sessionId, args)
+      const shot = await screenshotTab(tab.windowId, tab.id, {
+        format: action === 'zoom' ? 'png' : (format || 'jpeg'),
+      })
+      if (!shot.ok) throw new Error(shot.code + ': ' + shot.msg)
+      const full = shot.dataUrl
       if (action === 'zoom') {
         // zoom：capture 全屏 + OffscreenCanvas 裁剪 region（[x0,y0,x1,y1]）→ jpeg（对齐 CCB zoom 语义）
         if (!region || region.length < 4) throw new Error('zoom 需要 region（[x0,y0,x1,y1]）')
@@ -459,7 +680,7 @@ async function runInBackground(tool, args, sessionId) {
         const dataUrl = await blobToDataUrl(outBlob)
         return { ok: true, result: { dataUrl, format: 'jpeg', region: { x0: Number(x0), y0: Number(y0), x1: Number(x1), y1: Number(y1) } } }
       }
-      return { ok: true, result: { dataUrl: full, format: capFormat } }
+      return { ok: true, result: { dataUrl: full, format: shot.format } }
     }
     default:
       throw new Error(`后台工具未实现：${tool}`)
@@ -493,6 +714,15 @@ chrome.storage.local.remove('sessionId').catch(() => {})
 void restoreSessionTabs()
 connect()
 
+// 唤醒路径：idle 从非 active 回到 active / 浏览器启动 / 扩展安装升级 → 恢复原会话 tab + 重连 WS
+async function reconnectIfNeeded() {
+  await restoreSessionTabs()
+  connect()
+}
+chrome.idle.onStateChanged.addListener((newState) => { if (newState === 'active') reconnectIfNeeded() })
+chrome.runtime.onStartup.addListener(() => { reconnectIfNeeded() })
+chrome.runtime.onInstalled.addListener(() => { reconnectIfNeeded() })
+
 /* ------------------------------------------------------------------ */
 /*  MV3 保活：service worker 空闲 ~30s 被 Chrome 回收 → WebSocket 断开    */
 /*  （后端日志 code=1001 GOING_AWAY）。chrome.alarms 周期唤醒 SW，唤醒后  */
@@ -502,8 +732,5 @@ const KEEPALIVE_ALARM = 'nexusai-ws-keepalive'
 chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 })
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== KEEPALIVE_ALARM) return
-  // SW 被唤醒：WS 非 OPEN 则重连（connect 内部 OPEN/CONNECTING 去重）
-  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
-    connect()
-  }
+  connect() // 无条件：OPEN/CONNECTING 时内部去重；否则强拉新连接，不等 readyState 变 CLOSED
 })

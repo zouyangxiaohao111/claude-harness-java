@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:3000",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build && node scripts/prepare-backend.mjs"
+    "beforeBuildCommand": "npm run build && node scripts/prepare-backend.mjs && node scripts/make-extension-zip.mjs"
   },
   "app": {
     "macOSPrivateApi": true,
@@ -33,7 +33,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": ["../extension", "backend"],
+    "resources": ["../extension", "backend", "extension-pack"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
