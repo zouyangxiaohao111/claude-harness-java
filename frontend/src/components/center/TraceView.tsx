@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import type { ChatMessageDto, ToolCallDto } from '@/api/types'
 
 /** 轨迹视图 · dsh 式记录列表：从会话消息历史派生 user/assistant/tool 记录（按 turn 分组）。
@@ -33,17 +34,20 @@ interface TraceRecord {
   toolName: string
   txt: string
   time: string
+  /** 完整原文（列表显示截断 · 点击行看全文用） */
+  full?: string
 }
 
 /** 单条消息 → 轨迹记录数组（user 1 条 / assistant 1 条 + 每条 toolCall 1 条，保持顺序） */
 function toRecords(msg: ChatMessageDto): TraceRecord[] {
   const time = msg.time ?? msg.createdAt ?? ''
+  const content = msg.content ?? ''
   if (msg.role === 'user') {
-    return [{ kind: 'user', toolClass: '', toolName: '', txt: msg.content ?? '', time }]
+    return [{ kind: 'user', toolClass: '', toolName: '', txt: content, time, full: content }]
   }
   if (msg.role === 'system') {
     // fallback / 系统消息：归为 assistant 类别，避免空行
-    return [{ kind: 'assistant', toolClass: '', toolName: '', txt: msg.content ?? '', time }]
+    return [{ kind: 'assistant', toolClass: '', toolName: '', txt: content, time, full: content }]
   }
   const records: TraceRecord[] = []
   for (const tc of msg.toolCalls ?? []) {
@@ -53,15 +57,17 @@ function toRecords(msg: ChatMessageDto): TraceRecord[] {
       toolName: cleanToolName(tc.name),
       txt: summarizeArgs(tc),
       time,
+      full: tc.arguments ?? '',
     })
   }
-  if (msg.content) {
+  if (content) {
     records.push({
       kind: 'assistant',
       toolClass: '',
       toolName: '',
-      txt: msg.content.length > 60 ? `${msg.content.slice(0, 60)}…` : msg.content,
+      txt: content.length > 60 ? `${content.slice(0, 60)}…` : content,
       time,
+      full: content,
     })
   }
   return records
@@ -79,6 +85,11 @@ interface TraceViewProps {
 }
 
 export function TraceView({ messages }: TraceViewProps) {
+  // [轨迹详情] 点击记录行 → 浮层看完整内容
+  const [detail, setDetail] = useState<TraceRecord | null>(null)
+  const detailLabel = detail
+    ? (detail.kind === 'user' ? '用户消息' : detail.kind === 'tool' ? `工具调用 · ${detail.toolName || 'tool'}` : '助手回复')
+    : ''
   const visible = messages.filter((m) => !m.isMeta)
   if (visible.length === 0) {
     return (
@@ -113,7 +124,12 @@ export function TraceView({ messages }: TraceViewProps) {
         <div key={t.num} className="trace-turn">
           <div className="trace-turn-header"><span className="turn-num">#{t.num}</span> {t.title}</div>
           {t.records.map((r, i) => (
-            <div key={i} className={`trace-record ${r.kind === 'user' ? 'user-rec' : r.kind === 'assistant' ? 'assistant-rec' : r.toolClass}`}>
+            <div
+              key={i}
+              className={`trace-record ${r.kind === 'user' ? 'user-rec' : r.kind === 'assistant' ? 'assistant-rec' : r.toolClass}${r.full != null ? ' clickable' : ''}`}
+              onClick={() => { if (r.full != null) setDetail(r) }}
+              title={r.full != null ? '点击查看完整内容' : undefined}
+            >
               <span className={`kind ${r.kind}`}>{r.kind}</span>
               <span className="content">
                 {r.kind === 'tool' ? (
@@ -129,6 +145,19 @@ export function TraceView({ messages }: TraceViewProps) {
           ))}
         </div>
       ))}
+      {detail && (
+        <div className="trace-detail-mask" onClick={() => setDetail(null)}>
+          <div className="trace-detail" onClick={(e) => e.stopPropagation()}>
+            <div className="trace-detail-head">
+              <span className="trace-detail-title">{detailLabel}</span>
+              <button type="button" className="trace-detail-close" onClick={() => setDetail(null)} aria-label="关闭">
+                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" width="12" height="12"><path d="M3 3L9 9M9 3L3 9" /></svg>
+              </button>
+            </div>
+            <pre className="trace-detail-body">{detail.full ?? detail.txt}</pre>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

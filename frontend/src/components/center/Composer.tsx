@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ClipboardEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import { QueuedCommandsBar } from './QueuedCommandsBar'
 import { SessionToolsPanel } from './SessionToolsPanel'
@@ -13,6 +13,7 @@ import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { readFile, stat } from '@tauri-apps/plugin-fs'
 import { COMMAND_ITEMS } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
+import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
@@ -60,6 +61,8 @@ interface ComposerProps {
   popEditable: () => void
   /** 当前绑定项目名（null=未绑定，显示"未选中"） */
   boundProjectName: string | null
+  /** 当前绑定项目 id（@ 引用文件候选源 = 该项目 git 文件树 · null=未绑定不弹候选） */
+  boundProjectId?: string | null
   /** 点击项目选择器 → 弹项目列表（App 处理） */
   onSelectProject: () => void
   /** 当前模型名（发送键旁胶囊展示） */
@@ -118,21 +121,49 @@ const HIGHLIGHT_SPAN_STYLE: CSSProperties = {
   borderRadius: 'var(--r-xs)',
 }
 
-// 把输入文本拆成「普通片段 + token target 高亮片段」
-function renderHighlighted(text: string): ReactNode[] {
-  const nodes: ReactNode[] = []
+// @引用 token 匹配（@"引号路径" 或 @路径：遇空白/中文标点/右括号/引号结束；不含 #L 行区间）
+const AT_TOKEN_RE = /@"[^"]+"|@[^\s，。、；：（()）“”"'#]+/g
+
+// 单段内再叠加 token-budget(+500k) 高亮
+function renderBudget(text: string): ReactNode[] {
+  const out: ReactNode[] = []
   let last = 0
   for (const m of text.matchAll(TOKEN_BUDGET_RE)) {
     const idx = m.index ?? 0
-    if (idx > last) nodes.push(text.slice(last, idx))
-    nodes.push(<span key={idx} style={HIGHLIGHT_SPAN_STYLE}>{m[0]}</span>)
+    if (idx > last) out.push(text.slice(last, idx))
+    out.push(<span key={`b-${idx}`} style={HIGHLIGHT_SPAN_STYLE}>{m[0]}</span>)
     last = idx + m[0].length
   }
-  if (last < text.length) nodes.push(text.slice(last))
+  if (last < text.length) out.push(text.slice(last))
+  return out
+}
+
+// 把输入文本拆成「普通片段(+budget 高亮) + @引用 chip」
+// @引用 chip 渲染在「高亮层」（textArea 之上、透明副本）里 → 鼠标 hover/点击命中 chip 本体；
+// 视觉样式由 .input-at-chip（globals.css）提供（阴影框 · hover 加深阴影 · 点击移除）。
+function renderHighlighted(text: string, onChipRemove?: (token: string) => void): ReactNode[] {
+  const nodes: ReactNode[] = []
+  let last = 0
+  for (const m of text.matchAll(AT_TOKEN_RE)) {
+    const idx = m.index ?? 0
+    if (idx > last) nodes.push(...renderBudget(text.slice(last, idx)))
+    nodes.push(
+      <span
+        key={`at-${idx}`}
+        className="input-at-chip"
+        title="点击移除引用"
+        onClick={() => onChipRemove?.(m[0])}
+      >
+        {m[0]}
+      </span>,
+    )
+    last = idx + m[0].length
+  }
+  if (last < text.length) nodes.push(...renderBudget(text.slice(last)))
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onOpenMarket }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onOpenMarket }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -259,6 +290,86 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     if (cmdMatches && !hadCmdRef.current) setCmdIndex(0)
     hadCmdRef.current = !!cmdMatches
   }, [cmdMatches])
+
+  // [Phase3 @引用文件] 输入 '@' → 绑定项目文件候选（对齐 CC @file）。端锚定（末行行尾 @token）：
+  //   探测末行「最后一个空白/标点之后的尾词」是否以 @ 开头；选中后把该尾词替换成 @path 。
+  const atTailIndex = (() => {
+    const t = composerText
+    if (!t.includes('@')) return null
+    const lastNl = t.lastIndexOf('\n')
+    const line = lastNl >= 0 ? t.slice(lastNl + 1) : t
+    const seg = Math.max(
+      line.lastIndexOf(' '), line.lastIndexOf('，'), line.lastIndexOf('。'),
+      line.lastIndexOf('：'), line.lastIndexOf('（'), line.lastIndexOf('('),
+    )
+    const tail = line.slice(seg + 1)
+    if (!tail.startsWith('@')) return null
+    const segStartAbs = lastNl >= 0 ? lastNl + 1 + seg : seg
+    return { segStartAbs, prefix: tail.slice(1) }
+  })()
+  const atActive = !!atTailIndex && !!boundProjectId && !streaming
+  const [atIndex, setAtIndex] = useState(0)
+  const atMenuRef = useRef<HTMLDivElement>(null)
+  const hadAtRef = useRef(false)
+  const [projFiles, setProjFiles] = useState<string[] | null>(null)
+  // 懒加载一次绑定项目 git 文件（扁平文件路径；失败静默，@ 仍可手输）
+  useEffect(() => {
+    if (!atActive || projFiles !== null || !boundProjectId) return
+    let alive = true
+    projectApi.files(boundProjectId)
+      .then((nodes) => {
+        if (!alive) return
+        const out: string[] = []
+        const walk = (list: { type: string; path: string; children?: unknown[] | null }[]) => {
+          for (const n of list) {
+            if (n.type === 'file') out.push(n.path)
+            else if (n.children && Array.isArray(n.children)) walk(n.children as { type: string; path: string; children?: unknown[] | null }[])
+          }
+        }
+        walk(nodes as { type: string; path: string; children?: unknown[] | null }[])
+        setProjFiles(out)
+      })
+      .catch(() => { /* 后端未就绪：@ 提示静默（仍可手输） */ })
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [atActive, boundProjectId])
+  const atMatches = useMemo(() => {
+    if (!atActive || projFiles === null || !atTailIndex) return null
+    const q = atTailIndex.prefix.toLowerCase()
+    const list = projFiles.filter((p) => !q || p.toLowerCase().includes(q)).slice(0, 40)
+    return list.length ? list : null
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [atActive, projFiles, atTailIndex])
+  // 候选出现/变化 → 重置选中；随 ↑↓ 联动滚动
+  useEffect(() => {
+    if (atMatches && !hadAtRef.current) setAtIndex(0)
+    hadAtRef.current = !!atMatches
+  }, [atMatches])
+  useEffect(() => {
+    if (!atMatches || !atMenuRef.current) return
+    const el = atMenuRef.current.children[atIndex % atMatches.length] as HTMLElement | undefined
+    el?.scrollIntoView({ block: 'nearest' })
+  }, [atIndex, atMatches])
+  /** 选中候选 → 把行尾 @token 替换为 @path（保留前导空白/标点分隔符） */
+  const applyAtPick = (path: string) => {
+    if (!atTailIndex) return
+    const head = atTailIndex.segStartAbs >= 0 ? composerText.slice(0, atTailIndex.segStartAbs + 1) : ''
+    setComposerText(`${head}@${path} `)
+    setAtIndex(0)
+    textareaRef.current?.focus()
+  }
+
+  /** [Phase3] 点输入框 @chip → 从文本移除该引用 token（并折叠多余空格） */
+  const removeAtChip = useCallback((token: string) => {
+    const idx = composerText.indexOf(token)
+    if (idx < 0) return
+    let next = composerText.slice(0, idx) + composerText.slice(idx + token.length)
+    // 折叠移除后可能残留的双空格（token 前后各一）
+    if (next.includes('  ')) next = next.replace(/ {2,}/g, ' ').replace(/^ /, '')
+    setComposerText(next)
+    setAtIndex(0)
+    requestAnimationFrame(() => textareaRef.current?.focus())
+  }, [composerText, setComposerText])
   // 发送键旁胶囊 → 上拉抽屉（模型/推理等级两行）；点击外部收起
   const [pillOpen, setPillOpen] = useState(false)
   const pillRef = useRef<HTMLDivElement>(null)
@@ -636,11 +747,11 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 pointerEvents: 'none',
                 whiteSpace: 'pre-wrap',
                 color: 'transparent',
-                zIndex: 0,
+                zIndex: 2, // 置于 textarea(z1) 之上：@chip 可命中 hover/click（container 本身 pointer-events:none 放行到 textarea）
                 ...HIGHLIGHT_TEXT_STYLE,
               }}
             >
-              {renderHighlighted(composerText)}
+              {renderHighlighted(composerText, removeAtChip)}
             </div>
             <textarea
               ref={textareaRef}
@@ -650,6 +761,24 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               onScroll={syncHighlight}
               onPaste={onPaste}
               onKeyDown={(e) => {
+                // [Phase3 @引用] 候选打开时优先：↑↓ 选择 · Tab/Enter 引用 · Esc 关闭（不发送）
+                if (atMatches) {
+                  if (e.key === 'ArrowDown') { e.preventDefault(); setAtIndex((i) => (i + 1) % atMatches.length); return }
+                  if (e.key === 'ArrowUp') { e.preventDefault(); setAtIndex((i) => (i - 1 + atMatches.length) % atMatches.length); return }
+                  if (e.key === 'Tab' || e.key === 'Enter') {
+                    e.preventDefault()
+                    applyAtPick(atMatches[atIndex % atMatches.length])
+                    return
+                  }
+                  if (e.key === 'Escape') {
+                    e.preventDefault()
+                    if (atTailIndex) {
+                      setComposerText(atTailIndex.segStartAbs >= 0 ? composerText.slice(0, atTailIndex.segStartAbs + 1) : '')
+                    }
+                    e.stopPropagation()
+                    return
+                  }
+                }
                 // 命令即时提示打开时：↑↓ 选择 · Tab/Enter 补全命令
                 if (cmdMatches) {
                   if (e.key === 'ArrowDown') { e.preventDefault(); setCmdIndex((i) => (i + 1) % cmdMatches.length); return }
@@ -715,6 +844,23 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                       <span style={{ fontSize: 9.5, fontFamily: 'var(--font-mono)', color: 'var(--ink-faint)', marginLeft: 6 }}>{c.pluginName}</span>
                     )}
                     <span className="slash-desc">{c.description}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            {atMatches && (
+              <div className="at-menu" ref={atMenuRef}>
+                <div className="at-menu-cap">@ 引用文件 · {boundProjectName ?? '绑定项目'}</div>
+                {atMatches.map((p, i) => (
+                  <div
+                    key={p}
+                    className={`at-item ${i === atIndex % atMatches.length ? 'active' : ''}`}
+                    onMouseEnter={() => setAtIndex(i)}
+                    onClick={() => applyAtPick(p)}
+                    title={p}
+                  >
+                    <span className="at-at">@</span>
+                    <span className="at-path">{p}</span>
                   </div>
                 ))}
               </div>

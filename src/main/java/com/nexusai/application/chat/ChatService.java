@@ -810,6 +810,10 @@ public class ChatService {
                 if (userPrompt == null || userPrompt.isBlank()) {
                     userPrompt = lastUserContent(loadRecentHistory(sessionId, HISTORY_LIMIT));
                 }
+                // [Phase3 @引用文件] 从 content 里的 @token（@path / @"path with space" · 用户 @ 提及字面）解析
+                //   绑定项目内相对路径 → 读全文拼进本轮 user 文本（对齐 CC @file 上下文注入；
+                //   越界/缺失/超限 skip + warn fail loud，不阻断发送；@token 原文已含在 content 里，气泡展示/落库不变）
+                userPrompt = appendReferencedFiles(userPrompt, sessionId);
                 log.info("AGENT start: prompt={}chars tools={}",
                     userPrompt == null ? 0 : userPrompt.length(),
                     toolRegistry == null ? 0 : toolRegistry.all().size());
@@ -2694,6 +2698,131 @@ public class ChatService {
                 att.type(), att.filename(), att.mediaType(), contentId, null));
         }
         return list;
+    }
+
+    /**
+     * [Phase3 @引用文件] 从 content 的 @token（{@code @path} / {@code @"path with space"} · 用户 @ 提及字面）
+     * 解析绑定项目内相对路径并读全文拼进本轮 user 文本。
+     *
+     * <p>对齐 CC {@code @file} 语义：引用文件内容作为<b>本轮</b>模型上下文（文本块附加，非附件/非 systemPrompt）。
+     * 约束（fail loud）：路径必须落在绑定项目根内（{@code sessionProjectRootResolver} 解析根 · 穿越守卫）；
+     * 文件不存在 / 读失败 / 超上限 → skip + warn；单文件上限 1MB / 100k 字符。
+     * 仅影响本轮在内存 user 文本，不改 DB 内容列（@token 原文已落库 → 气泡/历史原样）。</p>
+     *
+     * @param userPrompt 本轮 user 文本（含用户输入的 @token 字面）
+     * @param sessionId  会话短 id
+     * @return 注入后的 user 文本（无引用则原样返回）
+     */
+    private String appendReferencedFiles(String userPrompt, String sessionId) {
+        if (userPrompt == null || userPrompt.indexOf('@') < 0) {
+            return userPrompt;
+        }
+        // 解析 @token：@"引号路径" 或 @非空白路径（遇空白/中文标点/右括号结束）；去重保留序
+        List<String> refs = new ArrayList<>();
+        java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+        int i = 0;
+        while (true) {
+            int at = userPrompt.indexOf('@', i);
+            if (at < 0) {
+                break;
+            }
+            boolean startOk = at == 0
+                || Character.isWhitespace(userPrompt.charAt(at - 1))
+                || "，。、；：（(【“\"'".indexOf(userPrompt.charAt(at - 1)) >= 0;
+            if (startOk) {
+                String token = null;
+                int end;
+                int from = at + 1;
+                if (from < userPrompt.length() && userPrompt.charAt(from) == '"') {
+                    int close = userPrompt.indexOf('"', from + 1);
+                    if (close > from) {
+                        token = userPrompt.substring(from + 1, close);
+                        end = close;
+                    } else {
+                        end = userPrompt.length();
+                    }
+                } else {
+                    int j = from;
+                    while (j < userPrompt.length()) {
+                        char c = userPrompt.charAt(j);
+                        if (Character.isWhitespace(c) || "，。、；：（()）“”\"".indexOf(c) >= 0) {
+                            break;
+                        }
+                        j++;
+                    }
+                    token = userPrompt.substring(from, j);
+                    end = j;
+                }
+                if (token != null) {
+                    String clean = token.trim();
+                    // 去掉可选行区间 #L10-20（仅定位用，读全文不需要）
+                    int hashL = clean.indexOf("#L");
+                    if (hashL >= 0) {
+                        clean = clean.substring(0, hashL);
+                    }
+                    if (!clean.isEmpty() && !clean.equals(".") && !clean.equals("..")) {
+                        seen.add(clean);
+                        refs.add(clean);
+                    }
+                }
+                i = end;
+            } else {
+                i = at + 1;
+            }
+        }
+        if (refs.isEmpty()) {
+            return userPrompt;
+        }
+        final long maxBytes = 1_000_000L;
+        final int maxChars = 100_000;
+        String projectRoot = (sessionProjectRootResolver != null)
+            ? sessionProjectRootResolver.apply(sessionId)
+            : null;
+        if (projectRoot == null || projectRoot.isBlank()) {
+            log.warn("[@file] 会话未绑定项目/无项目根, 引用文件不注入: session={} refs={}", sessionId, refs.size());
+            return userPrompt;
+        }
+        java.nio.file.Path root;
+        try {
+            root = java.nio.file.Path.of(projectRoot).toAbsolutePath().normalize();
+        } catch (Exception e) {
+            log.warn("[@file] 项目根解析失败, 引用文件不注入: session={} err={}", sessionId, e.toString());
+            return userPrompt;
+        }
+        StringBuilder sb = new StringBuilder(userPrompt);
+        int injected = 0;
+        for (String clean : refs) {
+            try {
+                java.nio.file.Path p = root.resolve(clean).normalize();
+                if (!p.startsWith(root)) {
+                    log.warn("[@file] 引用路径越出项目根, 跳过注入: session={} ref={}", sessionId, clean);
+                    continue;
+                }
+                if (!java.nio.file.Files.isRegularFile(p)) {
+                    log.warn("[@file] 引用文件不存在, 跳过注入: session={} ref={}", sessionId, clean);
+                    continue;
+                }
+                long size = java.nio.file.Files.size(p);
+                if (size > maxBytes) {
+                    log.warn("[@file] 引用文件超上限({}B), 跳过注入: session={} ref={} size={}",
+                        maxBytes, sessionId, clean, size);
+                    continue;
+                }
+                String content = java.nio.file.Files.readString(p, java.nio.charset.StandardCharsets.UTF_8);
+                if (content.length() > maxChars) {
+                    content = content.substring(0, maxChars) + "\n…[内容过长已截断]";
+                }
+                sb.append("\n\n【引用文件 @").append(clean).append("】\n").append(content);
+                injected++;
+            } catch (Exception e) {
+                log.warn("[@file] 引用文件读取失败, 跳过注入: session={} ref={} err={}", sessionId, clean, e.toString());
+            }
+        }
+        if (injected > 0 && log.isInfoEnabled()) {
+            log.info("[@file] 本轮注入引用文件 {} 个: session={} 增量字符={}",
+                injected, sessionId, sb.length() - userPrompt.length());
+        }
+        return sb.toString();
     }
 
     // ════════════════════════════════════════════════════════════════════════

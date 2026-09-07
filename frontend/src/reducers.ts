@@ -22,15 +22,18 @@ export type SessionAction =
   | { type: 'ADD_TAB'; tabId: string }
 
 export interface SessionState {
+  /** 当前激活会话 id；'' = 无会话（后端列表为空/未加载）→ 展示空工作区零态 */
   activeSession: string
   centerTabId: string
   openSessions: string[]
 }
 
+// 不再播种 demo 会话（sess-msgbus 等）——有真实会话时 App 列表加载后 SWITCH 到第一个，
+// 无真实会话时保持 ''（干净零态，绝不渲染演示假数据）。
 const initialSessionState: SessionState = {
-  activeSession: 'sess-msgbus',
-  centerTabId: 'sess-msgbus',
-  openSessions: ['sess-msgbus', 'sess-npe', 'sess-pg', 'sess-p1', 'sess-perf'],
+  activeSession: '',
+  centerTabId: '',
+  openSessions: [],
 }
 
 function sessionReducer(state: SessionState, action: SessionAction): SessionState {

@@ -49,6 +49,10 @@ interface SessionListProps {
   doneUnreadIds?: Set<string>
   /** 重命名会话（App 调 sessionApi.update + 本地同步） */
   onRenameSession?: (id: string, title: string) => void
+  /** 折叠/展开左栏（App 持有状态 · 按钮在左栏头部三条横线） */
+  onToggleCollapse?: () => void
+  /** 已折叠：只渲染窄 rail（展开按钮 + 新建）· 对齐 deepseek-harness 收起留 rail、永不消失 */
+  collapsed?: boolean
 }
 
 /** 相对时间标签：今天 / 昨天 / 前天 / N天前（≤7）/ 月-日（更早） */
@@ -67,12 +71,24 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
-export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase }: SessionListProps) {
+export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed }: SessionListProps) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   // 会话操作菜单：menuId（打开的菜单）+ renameId/renameDraft（重命名输入）
   const [menuId, setMenuId] = useState<string | null>(null)
   const [renameId, setRenameId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
+
+  // [对齐 deepseek-harness] 收起 = 窄 rail（不消失）：始终能再展开
+  if (collapsed) {
+    return (
+      <div className="left left-rail-collapsed">
+        <button className="rail-collapse-btn rail-expand" title="展开会话栏" aria-label="展开会话栏" onClick={onToggleCollapse}>
+          <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><path d="M5 2.5L10 7L5 11.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+        </button>
+        <button className="new-session-btn rail-new" title="新建会话" onClick={() => onCreateSession?.()}><PlusIcon size={13} /></button>
+      </div>
+    )
+  }
 
   // 按 mainProjectId 分组
   const groups = new Map<string, SessionDto[]>()
@@ -92,6 +108,12 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
 
   return (
     <div className="left">
+      {/* 左栏面板内折叠开关（顶格 · 无文字标签 · 对齐 deepseek-harness logoRow 样式） */}
+      <div className="left-rail-head">
+        <button className="rail-collapse-btn" title="收起会话栏" aria-label="收起会话栏" onClick={onToggleCollapse}>
+          <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><line x1="2" y1="3.6" x2="12" y2="3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="7" x2="12" y2="7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="10.4" x2="12" y2="10.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+        </button>
+      </div>
       {/* 新会话按钮（工作区上方，居中 · 设计稿 v7） */}
       <button className="new-session-btn" onClick={() => onCreateSession?.()} title="新建会话">
         + 新会话

@@ -6,6 +6,7 @@ import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
 import type { StreamEvent, TaskEvent, SessionStatusEvent, SessionTitleEvent, TeamStatusEvent, TeammateMessageEvent, TodoItem } from '../api/types'
+import type { SessionFile } from '../types'
 import { useTeamStore } from '../stores/teamStore'
 import { useTodoStore } from '../stores/todoStore'
 import { teamsApi } from '../api/teams'
@@ -38,6 +39,17 @@ function flushStreamAppends() {
 function scheduleStreamFlush() {
   if (streamFlushTimer) return
   streamFlushTimer = setTimeout(() => { streamFlushTimer = null; flushStreamAppends() }, STREAM_APPEND_MS)
+}
+
+/** [Phase2 · session-file-panel-collapse-atfile] files.changed 载荷 → SessionFile[]（整表替换 · path basename → name）。 */
+function toChangedSessionFiles(raw: { files?: Array<{ path?: string | null; status?: string | null; additions?: number | null; deletions?: number | null }> } | null): SessionFile[] {
+  const arr = raw?.files ?? []
+  return arr.map((f) => {
+    const path = f.path ?? ''
+    const i = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+    const name = i >= 0 ? path.slice(i + 1) : path
+    return { name, path, adds: f.additions ?? 0, dels: f.deletions ?? 0, isNew: f.status === 'added' }
+  })
 }
 
 /** STOMP skill_improvement.suggestion 事件（对齐 SkillImprovementSuggestionEvent · 轻量信号） */
@@ -195,7 +207,7 @@ export function useChatSocket(
   const statusSubsRef = useRef<Map<string, StompSubscription>>(new Map())
   /** 会话级常驻订阅登记：sid -> { token, queue }（token-warning / queue 按 sid 常驻 ——
    *   切走后原会话排队消费（queue.drained）/ 压缩警告仍需收；不随 sessionId 重订，同 stream/perm 模式）。 */
-  const sessionLevelSubsRef = useRef<Map<string, { token: StompSubscription; queue: StompSubscription; compact: StompSubscription }>>(new Map())
+  const sessionLevelSubsRef = useRef<Map<string, { token: StompSubscription; queue: StompSubscription; compact: StompSubscription; files: StompSubscription }>>(new Map())
   /** 当前会话 scoped 订阅句柄（team/todo/skill —— 随 sessionId 切换重订；
    *   stream/perm/status/token-warning/queue 按 sid 常驻不在此列）。sessionId 变化时先退订再订阅，client 单例不重建。 */
   const sessionScopedSubsRef = useRef<StompSubscription[]>([])
@@ -318,7 +330,16 @@ export function useChatSocket(
         })))
       }
     })
-    sessionLevelSubsRef.current.set(sid, { token, queue, compact })
+    // [Phase2 · session-file-panel-collapse-atfile] 会话改动文件（files.changed · 全量快照整表替换 → chatStore.changedFiles）
+    const files = client.subscribe(`/topic/sessions/${sid}/files`, (msg) => {
+      let parsed: unknown
+      try { parsed = JSON.parse(msg.body) } catch { return }
+      const raw = parsed as { files?: Array<{ path?: string | null; status?: string | null; additions?: number | null; deletions?: number | null }> } | null
+      if (raw && Array.isArray(raw.files)) {
+        useChatStore.getState().setChangedFiles(sid, toChangedSessionFiles(raw))
+      }
+    })
+    sessionLevelSubsRef.current.set(sid, { token, queue, compact, files })
   }
 
   /**
@@ -397,7 +418,7 @@ export function useChatSocket(
       // client 单例 unmount 时清理（会话级 scoped 订阅 + 按 sid 常驻订阅）
       for (const sub of sessionScopedSubsRef.current) sub.unsubscribe()
       sessionScopedSubsRef.current = []
-      for (const { token, queue } of sessionLevelSubsRef.current.values()) { token.unsubscribe(); queue.unsubscribe() }
+      for (const sub of sessionLevelSubsRef.current.values()) { sub.token.unsubscribe(); sub.queue.unsubscribe(); sub.compact.unsubscribe(); sub.files.unsubscribe() }
       sessionLevelSubsRef.current.clear()
       streamSubsRef.current.clear()
       permSubsRef.current.clear()
@@ -422,6 +443,8 @@ export function useChatSocket(
     // 切换 scoped 订阅：先退订旧会话的 team/todo/token/queue/skill，再订阅新会话
     unsubscribeCurrentSessionScoped()
     sessionScopedSubsRef.current = subscribeCurrentSessionScoped(client, sessionId)
+    // 会话级常驻订阅（queue/token/compact/files）· 幂等（已订则跳过）
+    subscribeSessionLevel(client, sessionId)
     // C1 · 新会话常驻订阅权限 topics
     if (!permSubsRef.current.has(sessionId)) {
       permSubsRef.current.set(sessionId, subscribePermTopics(client, sessionId))

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { SessionContext, SettingsTab } from '@/types'
+import type { SettingsTab, Project, SessionFile } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
 import { workflowApi } from '@/api/workflows'
 import { tasksApi } from '@/api/tasks'
@@ -14,11 +14,14 @@ import { TodoPanel } from '@/components/right/TodoPanel'
 import { AsyncTasksPanel } from '@/components/right/AsyncTasksPanel'
 import { RightPreview } from '@/components/right/RightPreview'
 import { usePreviewStore } from '@/stores/previewStore'
+import { useChatStore } from '@/stores/chatStore'
 
 type RightTab = 'files' | 'tasks' | 'projects'
 
 /** 稳定空身份 map（selector 兜底用 · 避免 `?? {}` 每次新对象触发 zustand 无限重渲染） */
 const EMPTY_IDENTITY_MAP: Record<string, SubagentIdentity> = {}
+/** 稳定空文件列表（文件 tab 零态 selector 兜底 · 避免新数组引用触发无限重渲染） */
+const EMPTY_FILES: SessionFile[] = []
 
 /** 子代理活动时间 HH:MM */
 function formatActTime(ts: number): string {
@@ -260,20 +263,24 @@ function TranscriptModal({ sessionId, taskId, name, onClose }: {
 
 
 interface RightPanelProps {
-  sessionContext: SessionContext
-  /** 当前激活会话 id（TeamPanel 拉会话 teamContext 用） */
+  /** 当前激活会话 id（文件 tab 从 chatStore.changedFiles 取 · TeamPanel 拉 teamContext 用） */
   activeSessionId: string | null
+  /** 会话绑定项目（「项目」tab · App 从 sessionProject 取 · 未绑定=空项目 → 未绑定零态） */
+  mainProject: Project
   rightTab: RightTab
   setRightTab: (t: RightTab) => void
-  setDiffFile: (name: string | null) => void
+  /** 改动文件行点击 → 打开真实 diff（App 拉 REST /files/diff 喂 DiffModal） */
+  onOpenFileRow: (path: string) => void
   /** 项目文件树点击文件 → 打开真实内容查看（App 处理） */
   onOpenFile: (projectId: string, path: string) => void
+  /** [Phase3] 文件树右键「引用到对话」→ 插入 @path 到输入框（App 处理 · 与 @ 补全同效） */
+  onQuoteFile: (path: string) => void
   showToast: (msg: string, type?: 'success' | 'info') => void
   /** 打开设置指定 tab（定时任务「+」→ schedules tab） */
   openSettingsAt: (tab: SettingsTab) => void
   flashingProject: string | null
-  rollbackFile: (name: string) => void
-  confirmFile: (name: string) => void
+  /** 回滚本会话改动（App 二次确认 + 调 revert REST + 刷新列表） */
+  onRollbackFile: (path: string) => void
 }
 
 const PlusIcon = ({ size = 12 }: { size?: number }) => (
@@ -306,12 +313,14 @@ function FileTreeNode({
   expandedDirs,
   onToggle,
   onOpen,
+  onQuote,
 }: {
   node: FileNode
   depth: number
   expandedDirs: Set<string>
   onToggle: (path: string) => void
   onOpen: (path: string) => void
+  onQuote: (path: string) => void
 }) {
   const isDir = node.type === 'dir'
   const expanded = isDir ? expandedDirs.has(node.path) : false
@@ -322,7 +331,12 @@ function FileTreeNode({
         className={`file-tree-node ${isDir ? 'dir' : 'file'}`}
         style={{ paddingLeft }}
         onClick={() => (isDir ? onToggle(node.path) : onOpen(node.path))}
-        title={node.path}
+        onContextMenu={(e) => {
+          if (isDir) return
+          e.preventDefault()
+          onQuote(node.path)
+        }}
+        title={isDir ? node.path : `${node.path} · 左键查看 · 右键引用到对话`}
       >
         {isDir ? (
           <span className={`chev ${expanded ? 'open' : ''}`}>
@@ -356,6 +370,7 @@ function FileTreeNode({
               expandedDirs={expandedDirs}
               onToggle={onToggle}
               onOpen={onOpen}
+              onQuote={onQuote}
             />
           ))}
         </div>
@@ -370,11 +385,13 @@ function ProjectFileTree({
   expandedDirs,
   onToggle,
   onOpen,
+  onQuote,
 }: {
   nodes: FileNode[]
   expandedDirs: Set<string>
   onToggle: (path: string) => void
   onOpen: (path: string) => void
+  onQuote: (path: string) => void
 }) {
   if (nodes.length === 0) {
     return <div className="right-empty">该项目暂无文件（非 git 仓库？）</div>
@@ -382,7 +399,7 @@ function ProjectFileTree({
   return (
     <div className="file-tree">
       {nodes.map((n) => (
-        <FileTreeNode key={n.path} node={n} depth={0} expandedDirs={expandedDirs} onToggle={onToggle} onOpen={onOpen} />
+        <FileTreeNode key={n.path} node={n} depth={0} expandedDirs={expandedDirs} onToggle={onToggle} onOpen={onOpen} onQuote={onQuote} />
       ))}
     </div>
   )
@@ -406,19 +423,20 @@ const NewFileSvg = () => (
 )
 
 export function RightPanel({
-  sessionContext,
   activeSessionId,
+  mainProject,
   rightTab,
   setRightTab,
-  setDiffFile,
+  onOpenFileRow,
   onOpenFile,
+  onQuoteFile,
   showToast,
   openSettingsAt,
   flashingProject,
-  rollbackFile,
-  confirmFile,
+  onRollbackFile,
 }: RightPanelProps) {
-  const { files, mainProject } = sessionContext
+  // 「文件」tab 数据 = 本会话 agent 改动文件（chatStore.changedFiles · files.changed 事件/GET /files 写入 · 无=[]零态）
+  const files = useChatStore((s) => s.changedFiles[activeSessionId ?? ''] ?? EMPTY_FILES)
   // 任务 tab 数据：定时任务（真实后端）+ 子代理身份（/topic/tasks 事件登记）
   const schedules = useSchedules()
   const subagentIdentities = useSubagentStore((s) => s.bySession[activeSessionId ?? ''] ?? EMPTY_IDENTITY_MAP)
@@ -537,8 +555,8 @@ export function RightPanel({
               <div className="right-empty">该会话暂无文件变更</div>
             ) : (
               files.map((f) => (
-                <div key={f.name} className="file-row">
-                  <span className="file-main" onClick={() => setDiffFile(f.name)}>
+                <div key={f.path} className="file-row">
+                  <span className="file-main" title="查看真实 diff" onClick={() => onOpenFileRow(f.path)}>
                     <span className="icon">{f.isNew ? <NewFileSvg /> : <FileSvg />}</span>
                     <span className="name">{f.name}</span>
                     <span className="stats-line">
@@ -549,28 +567,19 @@ export function RightPanel({
                   <span className="file-actions">
                     <button
                       className="file-action-btn rollback"
-                      title="回滚此次变更"
-                      onClick={(e) => { e.stopPropagation(); rollbackFile(f.name) }}
+                      title="回滚到本会话改动前"
+                      onClick={(e) => { e.stopPropagation(); onRollbackFile(f.path) }}
                     >
                       <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ width: 14, height: 14 }}>
                         <path d="M3.5 8C3.5 5 5.5 3 8 3C9.5 3 10.8 3.7 11.6 4.8" strokeLinecap="round" strokeLinejoin="round" />
                         <path d="M12 2.5V5H9.5" strokeLinecap="round" strokeLinejoin="round" />
                       </svg>
                     </button>
-                    <button
-                      className="file-action-btn confirm"
-                      title="确认此次变更"
-                      onClick={(e) => { e.stopPropagation(); confirmFile(f.name) }}
-                    >
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" style={{ width: 14, height: 14 }}>
-                        <path d="M3 8L6.5 11.5L13 4.5" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
                   </span>
                 </div>
               ))
             )}
-            {files.length > 0 && <div className="right-hint">↑ 点击任一文件查看 diff · Esc 关闭</div>}
+            {files.length > 0 && <div className="right-hint">↑ 点击文件查看本会话真实 diff · Esc 关闭</div>}
           </>
         )}
 
@@ -785,9 +794,10 @@ export function RightPanel({
                     expandedDirs={expandedDirs}
                     onToggle={toggleDir}
                     onOpen={(path) => main.id ? onOpenFile(main.id, path) : undefined}
+                    onQuote={(path) => onQuoteFile(path)}
                   />
                 )}
-                <div className="right-hint">↑ 点击文件查看 · 目录可展开</div>
+                <div className="right-hint">↑ 点击查看 · 目录展开 · 文件右键「引用到对话」</div>
               </>
             ) : (
               <div className="right-empty">未绑定项目 · 在输入框上方选择项目开始对话</div>

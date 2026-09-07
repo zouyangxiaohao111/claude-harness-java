@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry } from '../api/types'
+import type { SessionFile } from '../types'
 
 /** 流式块：一个 assistant 轮次（key = 后端 chunk.assistantMessageId = turnAssistantId）。
  *  三内容字段皆可空——「纯思考轮」（仅 reasoning）、「思考+工具轮·无正文」（reasoning+toolCalls）、「正文轮」（仅 content）。
@@ -61,6 +62,8 @@ export interface PermissionRequestItem {
 export interface ChatState {
   sessions: SessionDto[]
   messages: Record<string, ChatMessageDto[]>          // sessionId -> 历史消息
+  /** 本会话 agent 改动的文件（files.changed STOMP 事件 + GET /files 对账 → 右栏「文件」tab 真数据源 · 无改动 = []) */
+  changedFiles: Record<string, SessionFile[]>
   /** 图片缓存：sessionId → id → {mediaType, base64}（重拉后按 imagePasteIds 批量拉图显示缩略图） */
   imageCache: Record<string, Record<string, { mediaType: string; base64: string }>>
   streams: Record<string, StreamBlock[]>              // sessionId -> 当前流式块列表（按 assistantMessageId 分轮）
@@ -79,6 +82,8 @@ export interface ChatState {
   apiErrors: Record<string, ApiFlowError[]>
   // actions
   setSessions: (s: SessionDto[]) => void
+  /** files.changed 事件 / GET /files 对账 → 整表替换该会话改动文件（无改动传 []） */
+  setChangedFiles: (sessionId: string, files: SessionFile[]) => void
   /** 会话 token/金额汇总实时更新（complete 事件 → 覆盖会话累计 · 底部 footer 展示） */
   updateSessionUsage: (sessionId: string, usage: { totalCostYuan?: number | null; totalTokens?: number | null }) => void
   setMessages: (sessionId: string, msgs: ChatMessageDto[]) => void
@@ -144,6 +149,7 @@ export interface ChatState {
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
   sessions: [],
   messages: {},
+  changedFiles: {},
   imageCache: {},
   streams: {},
   snippedIds: {},          // [snip-persist] 会话级被裁剪消息 id（Snip 后「已裁剪」角标）
@@ -156,6 +162,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   compact: { visible: false, status: 'running', pct: 0 },
   apiErrors: {},
   setSessions: (sessions) => set({ sessions }),
+  setChangedFiles: (sessionId, files) => set((st) => ({
+    changedFiles: { ...st.changedFiles, [sessionId]: files },
+  })),
   updateSessionUsage: (sessionId, usage) => set((st) => ({
     sessions: st.sessions.map((s) => {
       if (s.id !== sessionId) return s
@@ -202,11 +211,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const streams = { ...st.streams }
     const conversationIds = { ...st.conversationIds }
     const apiErrors = { ...st.apiErrors }
+    const changedFiles = { ...st.changedFiles }
     delete messages[sessionId]
     delete streams[sessionId]
     delete conversationIds[sessionId]
     delete apiErrors[sessionId]
-    return { messages, streams, conversationIds, apiErrors }
+    delete changedFiles[sessionId]
+    return { messages, streams, conversationIds, apiErrors, changedFiles }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),

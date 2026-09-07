@@ -1,17 +1,16 @@
 import './styles/globals.css'
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   allProjects,
   models,
   searchItems,
   getDiffFor,
-  sessionContexts,
-  newSessionContext,
 } from '@/data'
-import type { Project, Session, SettingsTab, ModelTag } from '@/types'
+import type { Project, Session, SettingsTab, ModelTag, DiffFile } from '@/types'
 import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
+import { sessionFilesApi } from '@/api/sessionFiles'
 import { marketApi } from '@/api/market'
 import { projectApi, type ProjectDto } from '@/api/projects'
 import { selectProjectFolder } from '@/utils/projectFolder'
@@ -34,6 +33,7 @@ import { useMcp } from '@/hooks/useMcp'
 import { useDatabases } from '@/hooks/useDatabases'
 import { useSchedules } from '@/hooks/useSchedules'
 import { useFirstRunGuide } from '@/hooks/useFirstRunGuide'
+import { useTierInheritGuide } from '@/hooks/useTierInheritGuide'
 import { useSession, useProject, useUI, useSettings } from '@/reducers'
 
 import { TitleBar } from '@/components/layout/TitleBar'
@@ -59,6 +59,7 @@ import { SearchPalette } from '@/components/modals/SearchPalette'
 import { SettingsModal } from '@/components/modals/SettingsModal'
 import { TourOverlay } from '@/components/startup/tour/TourOverlay'
 import { ModelPickerModal } from '@/components/modals/ModelPickerModal'
+import { TierInheritModal } from '@/components/modals/TierInheritModal'
 import { EffortModal } from '@/components/modals/EffortModal'
 import { ContextAnalyzeModal } from '@/components/modals/ContextAnalyzeModal'
 import { UsageCostModal } from '@/components/modals/UsageCostModal'
@@ -68,15 +69,10 @@ import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
 import { getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
 
-// L5 首屏提速：DiffModal/FileViewModal 都是按需打开的弹窗，静态 import 会把整包 monaco-editor
-// （经 @/utils/monaco）拖进同步入口 chunk（index-*.js 曾 ~4.6MB min）。改 React.lazy 后 monaco
-// 拆到独立异步 chunk，真正首次打开弹窗才请求/解析；两弹窗均具名导出，需映射到 default 供 lazy 使用。
-const DiffModal = lazy(() =>
-  import('@/components/modals/DiffModal').then((m) => ({ default: m.DiffModal })),
-)
-const FileViewModal = lazy(() =>
-  import('@/components/modals/FileViewModal').then((m) => ({ default: m.FileViewModal })),
-)
+// DiffModal/FileViewModal 改静态 import：monaco 直接打进主包，启动解析一次；
+// 桌面 Tauri 本地加载快，换取「点开 diff 零拉取零等待」（放弃此前 L5 懒加载拆分）。
+import { DiffModal } from '@/components/modals/DiffModal'
+import { FileViewModal } from '@/components/modals/FileViewModal'
 
 /** Per-session project state: main, subs, expanded toggles, transient flash. */
 interface SessionProjectState {
@@ -91,6 +87,9 @@ const EMPTY_SESSION_DTO: SessionDto = {
   id: '', model: null, modelName: null, title: '', time: null, group: null,
   tabId: null, mainProjectId: null, effortLevel: null, ultracodeEnabled: null, bareMode: null, messageCount: null,
 }
+
+/** 空项目（无绑定项目时右栏「项目」tab 兜底 → 显示「未绑定项目」而非演示名）。 */
+const EMPTY_PROJECT: Project = { id: '', name: '', branch: '', dirty: 0, agents: 0, path: '' }
 
 /** 后端 SessionDto → UI 旧 Session 形状（null 兜底，任务 9 起组件原生消费 DTO 后移除）。 */
 /** 稳定空数组（避免 selector `?? []` 每次返回新引用触发 useSyncExternalStore 无限重渲染）。 */
@@ -126,18 +125,8 @@ function App() {
   const storeSessions = useChatStore((s) => s.sessions)
   const setSessions = useChatStore((s) => s.setSessions)
 
-  // ---- per-session project state (so right panel syncs) ----
-  const initialPerSession: Record<string, SessionProjectState> = {}
-  Object.keys(sessionContexts).forEach((id) => {
-    const c = sessionContexts[id]
-    initialPerSession[id] = {
-      main: c.mainProject,
-      subs: c.subProjects,
-      expanded: {},
-      flashing: null,
-    }
-  })
-  const [perSessionProjects, setPerSessionProjects] = useState<Record<string, SessionProjectState>>(initialPerSession)
+  // ---- per-session project state (so right panel syncs)；不再从 demo sessionContexts 播种 ----
+  const [perSessionProjects, setPerSessionProjects] = useState<Record<string, SessionProjectState>>({})
   // #1 绑定策略：真实项目缓存（projectApi.list），供 projectNameFor / createSession 反查 main 项目名，
   //   替代无 id 的 mock allProjects。挂载时拉取，失败优雅降级（回落 mock）。
   const [realProjects, setRealProjects] = useState<Project[]>([])
@@ -166,6 +155,8 @@ function App() {
   const [fastModel, setFastModel] = useState<string | null>(null)
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [showEffort, setShowEffort] = useState(false)
+  // [Phase2] 真实 diff（改动文件行点击拉 REST · 取代 mock getDiffFor 演示；close/Esc 时清空）
+  const [liveDiff, setLiveDiff] = useState<DiffFile | null>(null)
   // /context analyze：前端直连 REST 分类展示（OPD-CM5-F-13）
   const [showContextAnalyze, setShowContextAnalyze] = useState(false)
   // F1 · 用量与花费弹窗（Composer 底部 hint-usage 点击打开）
@@ -212,19 +203,19 @@ function App() {
   // ---- refs ----
   const modelDropdownRef = useRef<HTMLDivElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
-  // 右栏拖拽调宽：resizer 在 .app 层（无 backdrop-filter，fixed 相对 viewport 正常）
+  // 右栏拖拽调宽：网格列统一走 CSS var（--left-w/--right-w），resizer 只改 --right-w；
+  //   折叠 = 给 .app 加 left-collapsed/right-collapsed 类把对应列置 0 + 隐藏 rail（不丢已存宽度）
   const resizerRef = useRef<HTMLDivElement>(null)
   const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault()
     const appEl = document.querySelector('.app') as HTMLElement | null
     if (!appEl) return
     const startX = e.clientX
-    const startW = parseFloat(appEl.style.gridTemplateColumns?.split(' ')[2]) || 300
+    const startW = parseFloat(appEl.style.getPropertyValue('--right-w')) || 300
     let currentW = startW
     const move = (ev: MouseEvent) => {
       // resizer 在右栏左边缘：往左拖（clientX 减小）→ 右栏变宽
       currentW = Math.max(220, Math.min(640, startW - (ev.clientX - startX)))
-      appEl.style.gridTemplateColumns = `260px 1fr ${currentW}px`
       appEl.style.setProperty('--right-w', `${currentW}px`)
     }
     const up = () => {
@@ -235,17 +226,23 @@ function App() {
     document.addEventListener('mousemove', move)
     document.addEventListener('mouseup', up)
   }
-  // 挂载时恢复用户调整过的右栏宽度
+  // 挂载时恢复用户调整过的右栏宽度（只写 var）
   useEffect(() => {
     const saved = localStorage.getItem('nexusai-right-w')
     if (saved) {
       const w = Math.max(220, Math.min(640, parseInt(saved, 10) || 300))
       const appEl = document.querySelector('.app') as HTMLElement | null
-      if (appEl) {
-        appEl.style.gridTemplateColumns = `260px 1fr ${w}px`
-        appEl.style.setProperty('--right-w', `${w}px`)
-      }
+      if (appEl) appEl.style.setProperty('--right-w', `${w}px`)
     }
+  }, [])
+  // 左右栏折叠（会话内临时；启动一律展开 —— 不读/不写 localStorage，避免误存的"已收起"让下次启动只剩中栏）
+  // 折叠后网格列归 0、rail 隐藏，经边缘细竖条/头部三横线重开。
+  const [leftCollapsed, setLeftCollapsed] = useState(false)
+  const [rightCollapsed, setRightCollapsed] = useState(false)
+  // 清理历史误存（旧版持久化残留 key）：防止有遗留 true 时再次读到
+  useEffect(() => {
+    localStorage.removeItem('nexusai-left-collapsed')
+    localStorage.removeItem('nexusai-right-collapsed')
   }, [])
   // 挂载拉附件模式配置（attachmentLocalRead：true=本地桌面 path 直读；后端未起/无端点 → false 兜底走 upload）
   useEffect(() => {
@@ -296,19 +293,22 @@ function App() {
   }, [appSettings?.fastModelName])
 
   // ---- 挂载时从后端拉取会话列表 ----
+  // 无 demo 播种：列表空 → activeSession 保持 ''（右栏文件=0、不再渲染演示假文件，首页保持原 welcome hero）；
+  // 列表非空 → 自动切到第一个真实会话（真实 id）。
   useEffect(() => {
     let cancelled = false
     sessionApi.list()
       .then((list) => {
         if (cancelled) return
         setSessions(list)
-        // activeSession 默认是前端 mock（sess-msgbus），后端真实 session 体系无此 id → 自动切到第一个
-        // 真实会话，避免发消息/拉消息走 mock id 触发「session not found」404
         if (list.length > 0 && !list.some((s) => s.id === sessionR.activeSession)) {
           sessionDispatch({ type: 'SWITCH', sessionId: list[0].id })
         }
       })
-      .catch((e) => showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info'))
+      .catch((e) => {
+        if (cancelled) return
+        showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      })
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setSessions, showToast])
@@ -336,7 +336,6 @@ function App() {
   const activePermissionMode: PermissionMode = activeSession?.permissionMode ?? appSettings?.permissionMode ?? 'default'
   // 当前会话主线程 agent（V58 main_thread_agent · null/空串 = 默认模式，Composer 顶部胶囊显示）
   const currentAgent = activeSession?.mainThreadAgent ?? null
-  const sessionContext = sessionContexts[activeSessionId] ?? newSessionContext
 
   // 本地专家/市场数据由 SkillMarketModal 打开时自行拉取（agentApi.listAgents + marketApi.*），App 不再常驻清单。
 
@@ -606,6 +605,18 @@ function App() {
     return () => { cancelled = true }
   }, [activeSessionId, isRealActive, setMessages, showToast])
 
+  // [Phase2] 切到真实会话 → GET /files 对账（补订阅前/断连期间的改动文件 · 与 files.changed 事件同源整表替换）
+  const realChangedSession = storeSessions.some((s) => s.id === activeSessionId) ? activeSessionId : null
+  useEffect(() => {
+    if (!realChangedSession) return
+    let alive = true
+    sessionFilesApi.list(realChangedSession)
+      .then((files) => { if (alive) useChatStore.getState().setChangedFiles(realChangedSession, files) })
+      .catch(() => { /* 后端未就绪静默（files.changed 事件仍可实时到） */ })
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [realChangedSession])
+
   // 排队消费：queue.drained 到达（工具边界）→ App 立即 append 用户2 气泡；渲染按 userMessageId 分组
   //   自动排到当前 assistant 工具轮之后（对齐 deepseek-harness/CC 工具边界插入，不延后到 complete）。
   // 会话生命周期明确信号（对齐 Harness 事件驱动确定性）：complete/cancel 到达 → 移除 activeStreams。
@@ -698,10 +709,11 @@ function App() {
   const boundProject = activeSession?.mainProjectId
     ? (realProjects.find((p) => p.id === activeSession.mainProjectId) ?? null)
     : null
+  // 会话绑定项目反查真实项目；缺省回退 perSessionProjects（会话创建时记录）→ 空项目（「未绑定项目」零态）
   const sessionProject = boundProject
     ? { main: boundProject, subs: [], expanded: {}, flashing: null }
     : (perSessionProjects[activeSessionId] ?? {
-        main: allProjects[0],
+        main: EMPTY_PROJECT,
         subs: [],
         expanded: {},
         flashing: null,
@@ -813,8 +825,8 @@ function App() {
     setSessions([created, ...storeSessions])
     sessionDispatch({ type: 'SWITCH', sessionId: created.id })
     sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
-    // M2：右面板 main 用真实项目反查（created.mainProjectId → realProjects），替代 mock allProjects[0]
-    const realMain = (created.mainProjectId && realProjects.find((p) => p.id === created.mainProjectId)) || allProjects[0]
+    // M2：右面板 main 用真实项目反查（created.mainProjectId → realProjects），无真实 id → 空项目（不显示演示项目名）
+    const realMain = (created.mainProjectId && realProjects.find((p) => p.id === created.mainProjectId)) || EMPTY_PROJECT
     setPerSessionProjects((prev) => ({
       ...prev,
       [created.id]: {
@@ -917,7 +929,7 @@ function App() {
     (id: string, updater: (p: SessionProjectState) => SessionProjectState) => {
       setPerSessionProjects((prev) => ({
         ...prev,
-        [id]: updater(prev[id] ?? { main: allProjects[0], subs: [], expanded: {}, flashing: null }),
+        [id]: updater(prev[id] ?? { main: EMPTY_PROJECT, subs: [], expanded: {}, flashing: null }),
       }))
     },
     [],
@@ -1125,25 +1137,69 @@ function App() {
     openSettingsAt: openSettingsTo,
     closeSettings: () => uiDispatch({ type: 'CLOSE_SETTINGS' }),
   })
+  // Task-B 档位一键套用主模型引导：主模型配好 & 六档全空时弹一次；
+  // 首启向导运行中（含完成卡）不抢弹，等向导结束后再判。
+  const tierInherit = useTierInheritGuide({
+    appSettings,
+    guideActive: firstRunGuide.active,
+    showToast,
+    onSettingsUpdated: (updated) => setAppSettings(updated),
+  })
 
-  // ---- file rollback/confirm (mock: just toast + remove from active session context) ----
-  const rollbackFile = useCallback(
-    (name: string) => {
-      const ctx = sessionContexts[activeSessionId]
-      if (ctx) {
-        // In a real app this would call a backend; here we just toast.
+  // ---- 改动文件：真实 diff / 回滚（Phase 2 · 后端 SessionFilesController / files.changed 同源） ----
+  const reloadChangedFiles = useCallback(async (sessionId: string) => {
+    try {
+      const files = await sessionFilesApi.list(sessionId)
+      useChatStore.getState().setChangedFiles(sessionId, files)
+    } catch { /* 后端未就绪静默（files.changed 事件仍可实时到） */ }
+  }, [])
+  const openChangedFileDiff = useCallback(async (path: string) => {
+    if (!activeSessionId) return
+    try {
+      const d = await sessionFilesApi.diff(activeSessionId, path)
+      setLiveDiff(d)
+      uiDispatch({ type: 'SET_DIFF', file: path })
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : '无法获取 diff（文件可能已回滚）', 'info')
+    }
+  }, [activeSessionId, showToast])
+  const rollbackChangedFile = useCallback(async (path: string) => {
+    if (!activeSessionId) return
+    const name = path.split('/').pop() ?? path
+    if (!window.confirm(`回滚 ${name} 到本会话改动前？该文件的后续修改将被覆盖。`)) return
+    try {
+      const r = await sessionFilesApi.revert(activeSessionId, path)
+      if (r?.success) {
+        uiDispatch({ type: 'SET_DIFF', file: null })
+        setLiveDiff(null)
+        await reloadChangedFiles(activeSessionId)
+        showToast(`已回滚 ${name}`, 'success')
+      } else {
+        showToast('回滚失败（文件可能已被外部修改）', 'info')
       }
-      showToast(`已回滚: ${name}`, 'info')
-    },
-    [activeSessionId, showToast],
-  )
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : '回滚失败', 'info')
+    }
+  }, [activeSessionId, reloadChangedFiles, showToast])
 
-  const confirmFile = useCallback(
-    (name: string) => {
-      showToast(`已确认: ${name}`, 'success')
-    },
-    [showToast],
-  )
+  // [Phase3 @引用预览] 点消息里 @引用卡片 → 打开绑定项目文件预览（FileViewModal）
+  const openRefFile = useCallback((path: string) => {
+    const pid = activeSession?.mainProjectId
+    if (!pid) {
+      showToast('未绑定项目，无法预览引用文件', 'info')
+      return
+    }
+    setOpenFile({ projectId: pid, path })
+  }, [activeSession?.mainProjectId, showToast])
+
+  // [Phase3 @引用] 项目树右键「引用到对话」/ 未来其它入口 → 把 @path 插进输入框（与输入框 @ 补全同效）
+  const insertReference = useCallback((path: string) => {
+    setComposerText((prev) => {
+      const sep = prev && !prev.endsWith(' ') && !prev.endsWith('\n') ? ' ' : ''
+      return `${prev}${sep}@${path} `
+    })
+    showToast(`已引用 @${path}`, 'info')
+  }, [showToast])
 
   // 后端技能命令名集合（GET /api/command · 含 skills）：技能斜杠命令作为消息发送触发，不弹空面板
   const [remoteCmdNames, setRemoteCmdNames] = useState<Set<string>>(new Set())
@@ -1312,7 +1368,7 @@ function App() {
   useEscapeKey(ui.showAddPanel, () => { uiDispatch({ type: 'CLOSE_ADD_PANEL' }); projectDispatch({ type: 'SET_ADD_SEARCH', value: '' }) })
   useEscapeKey(ui.showSearchPalette, () => { uiDispatch({ type: 'CLOSE_SEARCH' }); uiDispatch({ type: 'SET_SEARCH_QUERY', value: '' }) })
   useEscapeKey(ui.showSettings, () => uiDispatch({ type: 'CLOSE_SETTINGS' }))
-  useEscapeKey(!!ui.diffFile, () => uiDispatch({ type: 'SET_DIFF', file: null }))
+  useEscapeKey(!!ui.diffFile, () => { uiDispatch({ type: 'SET_DIFF', file: null }); setLiveDiff(null) })
   useEscapeKey(showModelPicker, () => setShowModelPicker(false))
   useEscapeKey(showAgentsPanel, () => setShowAgentsPanel(false))
   useEscapeKey(showChromePanel, () => setShowChromePanel(false))
@@ -1337,12 +1393,27 @@ function App() {
   }, [ui.showSearchPalette, uiDispatch])
 
   return (
-    <div className="app">
+    <div className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}`}>
       <div className="topbar">
         <TitleBar />
         <MenuBar
           openSettings={() => uiDispatch({ type: 'TOGGLE_SETTINGS' })}
         />
+        {/* 右栏折叠开关（顶部导航栏右侧 · 左栏开关在左栏面板内） */}
+        <div className="topbar-panel-toggles">
+          <button
+            className="rail-collapse-btn"
+            title={rightCollapsed ? '展开上下文面板' : '收起上下文面板'}
+            aria-label={rightCollapsed ? '展开上下文面板' : '收起上下文面板'}
+            onClick={() => setRightCollapsed((v) => !v)}
+          >
+            {rightCollapsed ? (
+              <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><path d="M9 2.5L4 7L9 11.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+            ) : (
+              <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><line x1="2" y1="3.6" x2="12" y2="3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="7" x2="12" y2="7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="10.4" x2="12" y2="10.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+            )}
+          </button>
+        </div>
       </div>
       <SessionList
         sessions={storeSessions}
@@ -1378,8 +1449,8 @@ function App() {
               setSessions([created, ...storeSessions])
               sessionDispatch({ type: 'SWITCH', sessionId: created.id })
               sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
-              // M2：项目内新建后写 perSessionProjects 真实 main（反查 realProjects）
-              const realMain = (pid && realProjects.find((p) => p.id === pid)) || allProjects[0]
+              // M2：项目内新建后写 perSessionProjects 真实 main（反查 realProjects）；无真实 id → 空项目
+              const realMain = (pid && realProjects.find((p) => p.id === pid)) || EMPTY_PROJECT
               setPerSessionProjects((prev) => ({ ...prev, [created.id]: { main: realMain, subs: [], expanded: {}, flashing: null } }))
               showToast('已创建新会话', 'success')
             } catch (e) {
@@ -1397,8 +1468,11 @@ function App() {
         onRenameSession={renameSession}
         runningSessionIds={runningSessionIds}
         pendingSessionIds={pendingSessionIds}
+        onToggleCollapse={() => setLeftCollapsed((v) => !v)}
+        collapsed={leftCollapsed}
       />
       <div className="center">
+        {/* 无会话：不插空态页 —— 保留原首页（Composer welcome hero + 左栏「新建会话」），右栏各 tab 显示 0/空态 */}
         <div className="center-tabs">
           <button className={`center-tab ${centerView === 'chat' ? 'active' : ''}`} onClick={() => setCenterView('chat')}>
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M1.5 3C1.5 2.5 1.8 2.2 2.3 2.2H4L4.8 3.4H9.7C10.2 3.4 10.5 3.7 10.5 4.2V9C10.5 9.5 10.2 9.8 9.7 9.8H2.3C1.8 9.8 1.5 9.5 1.5 9V3Z"/></svg>
@@ -1421,7 +1495,7 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={storeMessages} />
           ) : (
-            <MessageList messages={storeMessages} streaming={stream && stream.length > 0 ? stream : null} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !(stream && stream.length > 0)} onNearBottomChange={setChatAtBottom} />
+            <MessageList messages={storeMessages} streaming={stream && stream.length > 0 ? stream : null} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !(stream && stream.length > 0)} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} />
           )}
         </div>
         {currentPermission && (
@@ -1471,6 +1545,7 @@ function App() {
               })
             }}
             boundProjectName={activeSession.mainProjectId ? (realProjects.find((p) => p.id === activeSession.mainProjectId)?.name ?? null) : null}
+            boundProjectId={activeSession.mainProjectId}
             onSelectProject={() => void handleSelectProjectFolder()}
             currentModel={activeSession.modelName ?? ''}
             effortLevel={activeSession.effortLevel ?? 'high'}
@@ -1493,41 +1568,34 @@ function App() {
         )}
       </div>
       <RightPanel
-        sessionContext={{
-          files: sessionContext.files,
-          tracks: sessionContext.tracks,
-          mainProject: sessionProject.main,
-          subProjects: sessionProject.subs,
-          messages: sessionContext.messages,
-        }}
         activeSessionId={activeSessionId}
+        mainProject={sessionProject.main}
         rightTab={ui.rightTab}
         setRightTab={(t) => uiDispatch({ type: 'SET_RIGHT_TAB', tab: t })}
-        setDiffFile={(f) => uiDispatch({ type: 'SET_DIFF', file: f })}
+        onOpenFileRow={openChangedFileDiff}
         onOpenFile={(projectId, path) => setOpenFile({ projectId, path })}
+        onQuoteFile={insertReference}
         showToast={showToast}
         openSettingsAt={openSettingsAt}
         flashingProject={sessionProject.flashing}
-        rollbackFile={rollbackFile}
-        confirmFile={confirmFile}
+        onRollbackFile={rollbackChangedFile}
       />
-      {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport） */}
-      <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />
+      {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport；折叠时由窄 rail 展开，不显示 resizer） */}
+      {!rightCollapsed && <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />}
 
-      {/* L5 懒加载弹窗：diff/文件查看 首次打开才拉 monaco chunk；加载毫秒级 → fallback=null 不闪空 */}
-      {currentDiff && (
-        <Suspense fallback={null}>
-          <DiffModal diff={currentDiff} close={() => uiDispatch({ type: 'SET_DIFF', file: null })} />
-        </Suspense>
+      {/* Diff / 文件查看（monaco 已静态入主包，点开即用） */}
+      {(liveDiff ?? currentDiff) && (
+        <DiffModal
+          diff={liveDiff ?? currentDiff}
+          close={() => { uiDispatch({ type: 'SET_DIFF', file: null }); setLiveDiff(null) }}
+        />
       )}
       {openFile && (
-        <Suspense fallback={null}>
-          <FileViewModal
-            projectId={openFile.projectId}
-            path={openFile.path}
-            close={() => setOpenFile(null)}
-          />
-        </Suspense>
+        <FileViewModal
+          projectId={openFile.projectId}
+          path={openFile.path}
+          close={() => setOpenFile(null)}
+        />
       )}
       {showEffort && (
         <EffortModal
@@ -1635,6 +1703,15 @@ function App() {
           onOpenMemoryEditor={() => setShowMemoryEditor(true)}
           close={() => uiDispatch({ type: 'CLOSE_SETTINGS' })}
           showToast={showToast}
+        />
+      )}
+      {/* Task-B 档位一键套用主模型引导（向导结束后/设置加载完条件满足弹一次 · 独立 Modal 层） */}
+      {tierInherit.active && tierInherit.mainModelName && (
+        <TierInheritModal
+          mainModelName={tierInherit.mainModelName}
+          showExtrasNote={tierInherit.extrasAllUnset}
+          onApply={tierInherit.apply}
+          onDismiss={tierInherit.dismiss}
         />
       )}
       {/* L4b 首启引导 Spotlight（全局层 · TourOverlay 未激活时返回 null） */}

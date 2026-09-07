@@ -1032,6 +1032,8 @@ public class EditFileTool implements Tool {
             notifyLspChange(file, newContent);
             // vscodeSdkMcp.ts:39-59；userType=ant + client 存在才发送，否则内部跳过）
             notifyVscodeFileUpdated(relPath, content, newContent);
+            // [Phase2] 会话改动文件记录（写盘点 · 首写快照/净计数 + files.changed 推送）
+            recordSessionFile(ctx, relPath, file, exists, content, newContent);
             if (log.isDebugEnabled()) {
                 log.debug("EditFileTool: 匹配链完成 old={} actual={} new={} replaceAll={} hunk={}",
                     normalized.oldString(), actualOldString, actualNewString, replaceAll, result.patch().size());
@@ -1112,6 +1114,14 @@ public class EditFileTool implements Tool {
         this.fileHistoryService = fileHistoryService;
     }
 
+    // [Phase2 · session-file-panel-collapse-atfile] 会话改动文件记录器（agent 写盘 → 右栏「文件」tab + files.changed）。
+    // @Autowired(required=false)：无 bean 时跳过（POJO 测试不破）。与 fileHistoryService 同源注入模式。
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.session.SessionFilesRecorder sessionFilesRecorder;
+    public void setSessionFilesRecorder(com.nexusai.application.session.SessionFilesRecorder r) {
+        this.sessionFilesRecorder = r;
+    }
+
     // [OPD-TOOL-06-4] LspManager（写盘后 didChange/didSave 通知 · 对齐 CC FileEditTool.ts:494-514）。
     // @Autowired(required=false)：无 bean 时跳过（POJO 测试不破）。
     @org.springframework.beans.factory.annotation.Autowired(required = false)
@@ -1164,6 +1174,20 @@ public class EditFileTool implements Tool {
         } catch (Exception e) {
             // 备份失败不阻塞编辑（CC createBackup 失败 logError + return 等价）
             log.warn("EditFileTool: fileHistory trackEdit 失败: {} cause={}", file, e.toString());
+        }
+    }
+
+    /** [Phase2] 写盘后记录「本会话改动文件」→ 右栏文件 tab + files.changed 推送（fail-soft 不阻塞写盘）。 */
+    private void recordSessionFile(ToolUseContext ctx, String relPath, Path file, boolean existedBefore, String beforeText, String afterText) {
+        if (sessionFilesRecorder == null) {
+            return;
+        }
+        try {
+            String sessionId = ctx == null ? null : ctx.sessionId();
+            sessionFilesRecorder.record(sessionId, relPath, file.toAbsolutePath().normalize().toString(),
+                existedBefore ? beforeText : null, afterText);
+        } catch (Exception e) {
+            log.warn("EditFileTool: sessionFiles record 失败: {} cause={}", relPath, e.toString());
         }
     }
 

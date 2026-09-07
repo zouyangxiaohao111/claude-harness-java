@@ -21,6 +21,13 @@ function rebuildSides(hunks: DiffHunk[]): { original: string; modified: string }
   return { original: o.join('\n'), modified: m.join('\n') }
 }
 
+// 模块级单例：跨多次打开复用一个 Monaco Diff 编辑器（创建编辑器 + 起 worker 昂贵，
+// 换文件只换 model）。host 节点随每次弹窗移入容器；组件卸载不销毁编辑器。
+let liveEditor: monaco.editor.IStandaloneDiffEditor | null = null
+let liveHost: HTMLDivElement | null = null
+let liveOrig: monaco.editor.ITextModel | null = null
+let liveMod: monaco.editor.ITextModel | null = null
+
 /** 文件 diff 查看（Monaco Diff Editor · 并排/统一切换 · 行内高亮 + 行号 + 折叠导航） */
 export function DiffModal({ diff, close }: DiffModalProps) {
   const boxRef = useRef<HTMLDivElement>(null)
@@ -28,19 +35,41 @@ export function DiffModal({ diff, close }: DiffModalProps) {
   const [sideBySide, setSideBySide] = useState(true)
 
   useEffect(() => {
-    if (!boxRef.current || !diff) return
+    const box = boxRef.current
+    if (!box || !diff) return
     const { original, modified } = rebuildSides(diff.hunks)
-    const ed = monaco.editor.createDiffEditor(boxRef.current, {
-      readOnly: true,
-      renderSideBySide: true,
-      ...MONACO_COMMON_OPTS,
-    })
-    ed.setModel({
-      original: monaco.editor.createModel(original, monacoLangOf(diff.path)),
-      modified: monaco.editor.createModel(modified, monacoLangOf(diff.path)),
-    })
-    diffRef.current = ed
-    return () => { ed.dispose(); diffRef.current = null }
+    // 首次创建编辑器 + host；后续打开复用（host 移入本次容器即可）
+    if (!liveEditor) {
+      liveHost = document.createElement('div')
+      liveHost.style.cssText = 'width:100%;height:100%;min-height:inherit'
+      liveEditor = monaco.editor.createDiffEditor(liveHost, {
+        readOnly: true,
+        renderSideBySide: true,
+        ...MONACO_COMMON_OPTS,
+      })
+    }
+    if (liveHost && liveHost.parentNode !== box) box.appendChild(liveHost)
+    const lang = monacoLangOf(diff.path)
+    const om = monaco.editor.createModel(original, lang)
+    const mm = monaco.editor.createModel(modified, lang)
+    liveEditor.setModel({ original: om, modified: mm })
+    liveOrig?.dispose()
+    liveMod?.dispose()
+    liveOrig = om
+    liveMod = mm
+    diffRef.current = liveEditor
+    // 复用实例换容器/换 model 后需显式 layout（WebView2 下 ResizeObserver 偶发不触发）
+    const layout = () => { try { liveEditor?.layout() } catch { /* 忽略 */ } }
+    const raf = requestAnimationFrame(layout)
+    const t1 = setTimeout(layout, 60)
+    const t2 = setTimeout(layout, 300)
+    // 卸载不销毁编辑器（下次打开复用）；仅清定时器
+    return () => {
+      cancelAnimationFrame(raf)
+      clearTimeout(t1)
+      clearTimeout(t2)
+      diffRef.current = null
+    }
   }, [diff])
 
   useEffect(() => {

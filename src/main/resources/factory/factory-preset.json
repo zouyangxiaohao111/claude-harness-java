@@ -1,0 +1,51 @@
+{
+  "providers": [
+    {
+      "name": "deepseek",
+      "type": "openai_compatible",
+      "baseUrl": "https://api.deepseek.com",
+      "enabled": true
+    }
+  ],
+  "models": [
+    {
+      "provider": "deepseek",
+      "name": "deepseek-v4-flash",
+      "tag": "DS",
+      "type": "chat",
+      "enabled": true
+    },
+    {
+      "provider": "deepseek",
+      "name": "deepseek-v4-flash-vision-exp",
+      "tag": "DS",
+      "type": "multimodal",
+      "enabled": true
+    },
+    {
+      "provider": "deepseek",
+      "name": "deepseek-v4-pro",
+      "tag": "DS",
+      "type": "chat",
+      "enabled": true
+    }
+  ],
+  "settings": {
+    "theme": "light",
+    "font_size": "medium",
+    "accent": "#CC785C",
+    "animations_enabled": true,
+    "auto_compact_window": 1000000,
+    "max_output_tokens": 8000,
+    "websearch_use_small_model": true,
+    "agent_swarms_enabled": true,
+    "permission_mode": "default",
+    "auto_compact_enabled": true,
+    "reactive_compact_enabled": true,
+    "history_snip_enabled": true,
+    "sm_session_memory_enabled": true,
+    "sm_compact_enabled": true,
+    "time_based_mc_enabled": false,
+    "language": "中文"
+  }
+}

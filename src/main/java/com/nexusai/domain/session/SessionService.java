@@ -74,6 +74,8 @@ public class SessionService {
     //   （对齐 CC 进程随会话结束退出无泄漏；Java 常驻 JVM，会话删除时由外层 evict 防注册表无界增长）。
     //   best-effort，required=false（null → 跳过，不阻塞删除主流程）。
     @Autowired(required = false) private com.nexusai.application.agent.prompt.SessionGitStatusRegistry sessionGitStatusRegistry;
+    // [Phase2 · session-file-panel-collapse-atfile] 会话删除 → 释放该会话改动文件记录（内存 + 快照落盘）
+    @Autowired(required = false) private com.nexusai.application.session.SessionFilesRecorder sessionFilesRecorder;
     // [B3] 注入 SubagentTool — mainThreadAgent 写侧校验数据源（registryForSession → findAgent）。
     //   best-effort，required=false：plain JUnit 无容器 → null → 走原逻辑不校验（fail-open）；
     //   生产注入 → 未命中 agentType fail-loud 400（对齐 permissionMode isSettable 范式）。
@@ -242,6 +244,11 @@ public class SessionService {
         //   best-effort：null（未接线）→ 跳过；未知会话 evict no-op，不阻塞删除主流程。
         if (sessionGitStatusRegistry != null) {
             sessionGitStatusRegistry.evict(id);
+        }
+        // [Phase2] 会话删除 → 释放该会话改动文件记录（内存注册表 + session-files 快照目录）
+        //   best-effort：null（未接线）→ 跳过；evict no-op 不阻塞删除主流程。
+        if (sessionFilesRecorder != null) {
+            sessionFilesRecorder.evict(id);
         }
         // DEL-SH-01: 会话删除时清理该 session 的 skill improvement suggestion store 条目
         //   (对齐 CC AppState.skillImprovement.suggestion 随会话消亡; removeBySession 静默忽略 null/未知)

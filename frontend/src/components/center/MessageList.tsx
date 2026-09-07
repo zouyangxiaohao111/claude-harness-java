@@ -1,8 +1,34 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { MarkdownText } from '@/markdown/MarkdownText'
 import type { ChatMessageDto } from '@/api/types'
 import { subagentColor } from '@/api/types'
 import { compactNumber } from '@/utils/format'
+import { extractAtRefs } from '@/utils/atRefs'
+
+// @引用 token（@"引号路径" 或 @路径 · 遇空白/中文标点/右括号/引号结束）
+const AT_MENTION_RE = /@"[^"]+"|@[^\s，。、；：（()）“”"'#]+/g
+
+/** [Phase3] 用户正文 → @token 渲染为「内联可点 chip」（阴影），其余文本原样；换行由 .user-ref-text(pre-wrap) 保真。 */
+function renderUserRefText(text: string, onOpen?: (path: string) => void): ReactNode[] {
+  const out: ReactNode[] = []
+  let last = 0
+  let k = 0
+  for (const m of text.matchAll(AT_MENTION_RE)) {
+    const idx = m.index ?? 0
+    if (idx > last) out.push(text.slice(last, idx))
+    const raw = m[0]
+    // 点击预览用「相对路径」：去前导 @ 与 @"引号"，并去掉可选 #L 行区间
+    const clean = (raw.startsWith('@"') ? raw.slice(2, -1) : raw.slice(1)).split('#L')[0]
+    out.push(
+      <button key={`r${k++}`} type="button" className="inline-ref-chip" title="点击预览引用文件" onClick={() => onOpen?.(clean)}>
+        {m[0]}
+      </button>,
+    )
+    last = idx + raw.length
+  }
+  if (last < text.length) out.push(text.slice(last))
+  return out
+}
 import { parseAnsiLines, type AnsiLine } from '@/utils/ansi'
 import { useSubagentStore } from '@/stores/subagentStore'
 import { useChatStore } from '@/stores/chatStore'
@@ -177,6 +203,8 @@ interface MessageListProps {
   scrollSignal?: number
   /** turn 运行中且无流式块（thinking/重试等待期）→ 消息流末尾显示「nexus 思考中…」占位，消除发送后空白间隙 */
   thinking?: boolean
+  /** [Phase3] 点击 @引用文件卡片 → 打开文件预览（App 用绑定项目 + path 打开 FileViewModal） */
+  onOpenRefFile?: (path: string) => void
   /** 滚动贴底状态回调（「回到底部」按钮由 Composer 工具栏渲染 · 离底时 App 传 showToBottom=true） */
   onNearBottomChange?: (atBottom: boolean) => void
 }
@@ -341,7 +369,7 @@ function ContentGuard({ text, className, onRunHtml }: { text: string; className:
   )
 }
 
-function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: (id: string) => void; onRunHtml?: (code: string) => void }) {
+function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessageDto; onDelete: (id: string) => void; onRunHtml?: (code: string) => void; onOpenRefFile?: (path: string) => void }) {
   const isUser = msg.role === 'user'
   // F25 · model_fallback_warning：role=system + subtype='informational' 的消息按「模型降级」提示渲染
   const isFallback = msg.role === 'system' && msg.subtype === 'informational'
@@ -457,7 +485,15 @@ function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: 
           {/* 文件附件（PDF/Word/视频/音频）内联在 user 气泡里（文字下方 · 点击预览）——
               图片附件走上方缩略图 imageData/imagePasteIds 通道 */}
           <div className="user-bubble">
-            <ContentGuard text={msg.content ?? ''} className="user-text md" onRunHtml={onRunHtml} />
+            {/* [Phase3 @引用] 正文里的 @token 直接渲染为内联可点 chip（单份 · 不再额外加引用卡片行）。
+                无 @引用时仍走原有 ContentGuard markdown 渲染。 */}
+            {extractAtRefs(msg.content).length > 0 ? (
+              <div className="user-text user-ref-text">
+                {renderUserRefText(msg.content ?? '', onOpenRefFile)}
+              </div>
+            ) : (
+              <ContentGuard text={msg.content ?? ''} className="user-text md" onRunHtml={onRunHtml} />
+            )}
             {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
               <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => usePreviewStore.getState().open({ kind: 'attachment', title: a.filename, item: a })}>
                 {attachIcon(a)}
@@ -560,7 +596,7 @@ function Message({ msg, onDelete, onRunHtml }: { msg: ChatMessageDto; onDelete: 
 //   只重渲「正在流式的最后一块」。props 引用稳定前提：onDelete=App useCallback、onRunHtml=openHtmlPreview useCallback。
 const MemoMessage = memo(Message)
 
-export function MessageList({ messages, streaming, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange }: MessageListProps) {
+export function MessageList({ messages, streaming, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
@@ -823,7 +859,7 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
           每组 = 一个 flow（user 消息 + 其 assistant/工具流），工具轮挂主气泡下；排队场景顺序正确 */}
       {visible.map((row) => {
         if (row.kind === 'msg') {
-          return <MemoMessage key={row.key} msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} />
+          return <MemoMessage key={row.key} msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile} />
         }
         if (row.kind === 'err') {
           return <ApiErrorCard key={row.key} err={row.err} />
