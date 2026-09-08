@@ -2403,6 +2403,14 @@ public record AgentLoopContext(
             if ("hook_stopped_continuation".equals(a.type())) {
                 continue;
             }
+            // [skill-listing-stable] skill_listing 已改为请求头部恒定注入（prependSkillListing，队首 meta
+            //   user 消息，紧跟 system / userContext），不再经本方法队尾重放 —— 避免「同内容每轮队尾重复 +
+            //   位置随 transcript 增长漂移」破坏前缀缓存。历史/遗留 skill_listing attachment 一律跳过渲染
+            //   （对齐 CC「一次生成放头部、后续轮不重放」）；其它 hook attachment（todo_reminder/memory/
+            //   invoked_skills 等）仍走队尾原样。
+            if ("skill_listing".equals(a.type())) {
+                continue;
+            }
             String text = renderHookAttachmentForLlm(a);
             if (text != null) {
                 renderedTexts.add(text);
@@ -3992,6 +4000,34 @@ public record AgentLoopContext(
             + "You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>\n");
         java.util.List<ChatMessageDto> result = new java.util.ArrayList<>(messages);
         result.add(0, metaUserMessage(content.toString()));
+        return result;
+    }
+
+    /**
+     * [skill-listing-stable] skill_listing 恒定请求头部块 · 对齐 CC utils/messages.ts:3728-3738
+     * （{@code wrapMessagesInSystemReminder([createUserMessage({content: `The following skills are
+     * available for use with the Skill tool:\n\n${attachment.content}`, isMeta:true})])}）。
+     *
+     * <p>替代旧「skill_listing attachment 常驻 {@code state.attachments()} → maybeInjectHookAttachments
+     * 每轮队尾重放」链路：每轮以全量当前技能清单重建本块并置于消息队首（紧跟 system / userContext 之下，
+     * CC「一次生成放头部、字节稳定、后续轮不队尾重放」语义）。技能集合不变 → 字节稳定 → 前缀缓存不断；
+     * 变化 → 随当前清单自动更新；compact 后仍恒在头部（无队尾重发，对齐 CC postCompactCleanup 不重发）；
+     * resume 无需抑制。
+     *
+     * @param messages    当前 LLM 调用消息（在 prependUserContext 之前调用：本块置于 userContext 之下的队首）
+     * @param listingText 预算内技能清单文本（{@code SkillCatalog.formatListing(...)} 产物，CC
+     *                    original: attachment.content = formatCommandsWithinBudget(newSkills, ...)）
+     * @return 前置 skill_listing 头部队首后的消息列表（listingText 空/ null → 原列表）
+     */
+    public static java.util.List<ChatMessageDto> prependSkillListing(
+            java.util.List<ChatMessageDto> messages, String listingText) {
+        if (listingText == null || listingText.isBlank()) {
+            return messages;
+        }
+        String body = "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n"
+            + listingText + "\n</system-reminder>";
+        java.util.List<ChatMessageDto> result = new java.util.ArrayList<>(messages);
+        result.add(0, metaUserMessage(body));
         return result;
     }
 

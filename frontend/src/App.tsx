@@ -74,6 +74,7 @@ import { Toast } from '@/components/common/Toast'
 // 桌面 Tauri 本地加载快，换取「点开 diff 零拉取零等待」（放弃此前 L5 懒加载拆分）。
 import { DiffModal } from '@/components/modals/DiffModal'
 import { FileViewModal } from '@/components/modals/FileViewModal'
+import { openStandalone, previewKindOfPath, basenameOf } from '@/utils/standalonePreview'
 
 /** Per-session project state: main, subs, expanded toggles, transient flash. */
 interface SessionProjectState {
@@ -1207,15 +1208,26 @@ function App() {
     }
   }, [activeSessionId, reloadChangedFiles, showToast])
 
-  // [Phase3 @引用预览] 点消息里 @引用卡片 → 打开绑定项目文件预览（FileViewModal）
+  // [preview-standalone] 项目文件统一打开：docx/xlsx/pdf/image/video/audio → 独立预览窗；
+  //   html 与文本代码 → FileViewModal（源码查看/编辑/保存；html 可在 modal 内「运行」独立窗）。
+  const openProjectFile = useCallback((projectId: string, path: string) => {
+    const kind = previewKindOfPath(path)
+    if (kind) {
+      openStandalone({ type: kind, title: basenameOf(path), project: { id: projectId, path } })
+      return
+    }
+    setOpenFile({ projectId, path })
+  }, [])
+
+  // [Phase3 @引用预览] 点消息里 @引用卡片 → 打开绑定项目文件（docx/图等独立预览，文本进 FileViewModal）
   const openRefFile = useCallback((path: string) => {
     const pid = activeSession?.mainProjectId
     if (!pid) {
       showToast('未绑定项目，无法预览引用文件', 'info')
       return
     }
-    setOpenFile({ projectId: pid, path })
-  }, [activeSession?.mainProjectId, showToast])
+    openProjectFile(pid, path)
+  }, [activeSession?.mainProjectId, openProjectFile, showToast])
 
   // [Phase3 @引用] 项目树右键「引用到对话」/ 未来其它入口 → 把 @path 插进输入框（与输入框 @ 补全同效）
   const insertReference = useCallback((path: string) => {
@@ -1598,7 +1610,7 @@ function App() {
         rightTab={ui.rightTab}
         setRightTab={(t) => uiDispatch({ type: 'SET_RIGHT_TAB', tab: t })}
         onOpenFileRow={openChangedFileDiff}
-        onOpenFile={(projectId, path) => setOpenFile({ projectId, path })}
+        onOpenFile={openProjectFile}
         onQuoteFile={insertReference}
         showToast={showToast}
         openSettingsAt={openSettingsAt}

@@ -34,7 +34,7 @@ import { useSubagentStore } from '@/stores/subagentStore'
 import { useChatStore } from '@/stores/chatStore'
 import type { StreamBlock, ApiFlowError } from '@/stores/chatStore'
 import { tasksApi } from '@/api/tasks'
-import { usePreviewStore } from '@/stores/previewStore'
+import { openStandalone, previewKindOfAttachment } from '@/utils/standalonePreview'
 
 /** 附件胶囊类型图标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
 function attachIcon(a: NonNullable<ChatMessageDto['userAttachments']>[number]) {
@@ -495,7 +495,7 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
               <ContentGuard text={msg.content ?? ''} className="user-text md" onRunHtml={onRunHtml} />
             )}
             {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
-              <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => usePreviewStore.getState().open({ kind: 'attachment', title: a.filename, item: a })}>
+              <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a })}>
                 {attachIcon(a)}
                 <span className="uaf-name">{a.filename}</span>
               </button>
@@ -602,10 +602,10 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
   const streamWrapRef = useRef<HTMLDivElement>(null)
   const lastMsgId = messages[messages.length - 1]?.id
-  // HTML 代码块「运行」→ 右栏覆盖预览（sandbox iframe 运行结果 · 中间对话不受影响）
+  // HTML 代码块「运行」→ 独立窗口预览（sandbox iframe 运行结果 · 不占右栏、不打断对话）
   //   useCallback 稳定引用：Message 组件已 React.memo —— onRunHtml 引用必须稳定，否则每 chunk 全量击穿
   const openHtmlPreview = useCallback((code: string) => {
-    usePreviewStore.getState().open({ kind: 'html', title: 'HTML 预览', code })
+    openStandalone({ type: 'html', title: 'HTML 运行预览', code })
   }, [])
   // [bug-101] 流式思考块收起：按块 assistantMessageId 记收起态（此前恒展开 + 无 onClick 无法收起）
   const [collapsedStreamReasoning, setCollapsedStreamReasoning] = useState<Record<string, boolean>>({})

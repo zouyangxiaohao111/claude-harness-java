@@ -4658,6 +4658,12 @@ public class LlmAgentLoop implements AgentLoop {
             // 违反 effectively-final 约束（Java lambda 捕获限制）。
             final Map<String, Object> turnQueryTracking = queryTracking;
 
+            // [skill-listing-stable] 本迭代 skill_listing 请求头部文本 · A8（技能清单装配）每轮重建，
+            //   prependSkillListing 于消息组装末段置队首（userContext 之下）。do-while 每次迭代重置 → 头部
+            //   内容随当前技能集合自动更新；技能不变则字节稳定（对齐 CC「变化才重置」前缀缓存语义）。
+            //   不再经 state.attachments() 常驻 + maybeInjectHookAttachments 队尾重放（见 A8 与
+            //   maybeInjectHookAttachments skill_listing 跳过）。
+            String skillListingHeaderText = null;
 
             // 退出 2：ABORTED
             if (state.cancelled()) {
@@ -4837,9 +4843,13 @@ public class LlmAgentLoop implements AgentLoop {
                 drainAndInjectQueued(ctx, params, state, consumedCommandUuids,
                     injectedQueuedMessages, imageStore, pdfProcessor, didLastTurnUseSleep(state));
             }
-            // ── A8: 技能预取 attachment · 对齐 CC query.ts:1570-1643 / attachments.ts:2661-2751 ──
-            // [P1-10] 对齐 CC getSkillListingAttachments：每轮按 skill name 增量 dedup（恒开启，CC
-            // sentSkillNames 语义）→ newSkills 非空时注入 type='skill_listing' attachment。
+            // ── A8: skill_listing 恒定头部装配 · 对齐 CC query.ts:1570-1643 / attachments.ts:2661-2751 ──
+            // [skill-listing-stable] 不再「append type='skill_listing' attachment + maybeInjectHookAttachments
+            // 每轮队尾重放」（队尾位置随 transcript 增长漂移 → 破坏前缀缓存）；改为每轮把「全量当前清单」
+            // 渲染进 skillListingHeaderText，由 prependSkillListing 置请求队首（userContext 之下、紧跟 system）。
+            // 技能不变 → 字节稳定；变化 → 头部随当前清单自动更新（CC「变化才重置」语义）；compact 后仍恒在
+            // 头部（无队尾重发）；resume 无需抑制。
+            // [P1-10] computeSkillListingDelta 按 skill name 增量 dedup 保留，仅用于首注遥测 + Haiku 变化门控。
             // [X22] 删除 turn%5 节流：CC 无固定轮次节流，靠按名 dedup 控频（attachments.ts:2603-2750）。
             // [X21] 类型由 skill_catalog 改名 skill_listing（attachments.ts:2745）。
             // [R25-6] 异步 Haiku 增强摘要 · 对齐 CC query.ts:1570 fire-and-forget Haiku 模式（参照 R24-5）
@@ -4899,30 +4909,30 @@ public class LlmAgentLoop implements AgentLoop {
                                 }
                             }
                         }
+                        // [skill-listing-stable] skill_listing 恒定请求头部注入（对齐 CC messages.ts:3728-3738
+                        //   「一次生成放头部、字节稳定、后续轮不队尾重放」）：头部内容 = 全量当前清单
+                        //   （formatListing(commands) 非 delta 子集）。技能集合不变 → 字节稳定 → 前缀缓存不断；
+                        //   变化 → 头部随当前清单自动更新（对齐 CC「变化才重置」语义）；compact 后仍恒在头部
+                        //   （无队尾重发，对齐 CC postCompactCleanup 不重发）；resume 无需抑制。
+                        //   delta 保留仅用于 ①首注遥测（上）②Haiku 摘要变化门控（下）。
+                        String listingText = ctx.skillCatalog().formatListing(commands,
+                            resolveContextWindowTokens(params.modelName(), autoCompactor));
+                        if (listingText != null && !listingText.isBlank()) {
+                            skillListingHeaderText = listingText;
+                            if (log.isDebugEnabled()) {
+                                log.debug("[LlmAgentLoop] turn={} skill_listing header set ({} skills, agent={})",
+                                    state.turnCount(), commands.size(),
+                                    state.agentId() != null ? state.agentId() : "<main>");
+                            }
+                        }
+                        // [R25-6] 异步 Haiku 增强摘要 (fire-and-forget) · 仅新技能出现（首注/变化）触发，
+                        //   避免每轮重复消耗 · 不阻塞主链
                         if (!delta.newSkills().isEmpty()) {
-                            // [P2-19] 活跃委托路径动态预算 · 对齐 CC attachments.ts:2737-2741
-                            //   contextWindowTokens = getContextWindowForModel(mainLoopModel, betas)
-                            //   → formatCommandsWithinBudget(newSkills, contextWindowTokens)。
-                            // [G-10] 窗口经 CompactThresholdSystem（autoCompactor 承载）；模型未知/未接线
-                            //   → resolveWindowFallback 默认 200k → getCharBudget(200k)=8000（同旧 null 回落）。
-                            String listingText = ctx.skillCatalog().formatListing(delta.newSkills(),
-                                resolveContextWindowTokens(params.modelName(), autoCompactor));
-                            state.appendAttachment(AttachmentMessageDto.skillListing(
-                                listingText, delta.newSkills().size(), delta.isInitial()));
-                            log.info("[LlmAgentLoop] turn={} skill_listing attached ({} skills, isInitial={}, agent={})",
-                                state.turnCount(), delta.newSkills().size(), delta.isInitial(),
-                                state.agentId() != null ? state.agentId() : "<main>");
-                            // [R25-6] 异步 Haiku 增强摘要 (fire-and-forget) · 不阻塞主链
-                            // [P1-10/X20] 源由全量 catalogText 改为本次注入的 newSkills 清单
                             AgentLoopContext.triggerSkillCatalogHaikuSummaryAsync(ctx, state, listingText);
-                        } else {
-                            log.debug("[LlmAgentLoop] turn={} skill_listing dedup skipped ({} skills, agent={})",
-                                state.turnCount(), commands.size(),
-                                state.agentId() != null ? state.agentId() : "<main>");
                         }
                     }
                 } catch (Exception e) {
-                    log.warn("[LlmAgentLoop] skill_listing attachment failed: {}", e.getMessage());
+                    log.warn("[LlmAgentLoop] skill_listing header 构建失败: {}", e.getMessage());
                 }
             }
 
@@ -5482,6 +5492,12 @@ public class LlmAgentLoop implements AgentLoop {
             // 3. appendSystemContext（api.ts:437-447）· systemContext（gitStatus?/cacheBreaker?）并入 systemPrompt
             java.util.List<String> fullSystemPrompt =
                 sysPromptCtxProvider.appendSystemContext(systemPrompt, sysParts.systemContext());
+            // [skill-listing-stable] 4.4 skill_listing 恒定头部块 · 替代旧「append attachment + 每轮队尾重放」：
+            //   头部内容（全量当前技能清单）由 A8 每轮重建，本处置队首（userContext 之下的恒定位置，紧跟 system）。
+            //   技能不变 → 字节稳定（前缀缓存不断）；变化 → 随当前清单自动更新；compact 后仍恒在头部（无队尾重发）。
+            if (skillListingHeaderText != null) {
+                messagesForLlm = AgentLoopContext.prependSkillListing(messagesForLlm, skillListingHeaderText);
+            }
             // 4. prependUserContext（api.ts:449-474）· userContext（claudeMd?/currentDate）前置 meta user 消息
             //    （CLAUDE.md 顶部上下文由此通道注入；空 context → 原列表）
             //    [SP-02 b] coordinator userContext 并入：gate 真时向 userContext map 合并

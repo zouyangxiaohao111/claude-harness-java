@@ -112,21 +112,39 @@ class SystemPromptGuidanceTest {
         assertThat(after.newSkills()).isEmpty();
     }
 
-    // ── ③ skill_listing 渲染：renderHookAttachmentForLlm → user message ──
+    // ── ③ skill_listing 恒定头部注入：prependSkillListing → 队首 meta user（替代队尾重放）──
 
     @Test
-    @DisplayName("skill_listing 渲染：经 maybeInjectHookAttachments 注入 'The following skills are available...' 前缀")
-    void skillListing_rendersAsUserMessage() {
+    @DisplayName("skill_listing 头部注入：prependSkillListing 渲染 'The following skills are available...' 前缀 + isMeta + 队首")
+    void skillListing_prependsAsHeader() {
+        List<ChatMessageDto> result = AgentLoopContext.prependSkillListing(
+            new ArrayList<>(), "- commit: 提交代码");
+
+        assertThat(result).as("skill_listing 头部块必须渲染为一条 meta user message").hasSize(1);
+        assertThat(result.get(0).content())
+            .as("对齐 CC messages.ts:3734 wrapInSystemReminder 前缀")
+            .startsWith("<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n")
+            .contains("- commit: 提交代码")
+            .endsWith("\n</system-reminder>");
+        assertThat(result.get(0).isMeta()).as("CC createUserMessage({content, isMeta:true})").isTrue();
+
+        // 空/ null listingText → 原列表（对齐 CC :3729-3731 content 空 → return []）
+        assertThat(AgentLoopContext.prependSkillListing(new ArrayList<>(), ""))
+            .as("空 listingText 不注入头部块").isEmpty();
+        assertThat(AgentLoopContext.prependSkillListing(new ArrayList<>(), null))
+            .as("null listingText 不注入头部块").isEmpty();
+    }
+
+    @Test
+    @DisplayName("skill_listing 不再经 maybeInjectHookAttachments 队尾重放（头部恒定注入取代，防双份 + 防位置漂移）")
+    void skillListing_notTailReplayedByHookAttachments() {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         state.appendAttachment(AttachmentMessageDto.skillListing("- commit: 提交代码", 1, true));
 
         List<ChatMessageDto> messages = AgentLoopContext.maybeInjectHookAttachments(
             null, state, new ArrayList<>());
 
-        assertThat(messages).as("skill_listing 必须渲染为一条 meta user message").hasSize(1);
-        assertThat(messages.get(0).content())
-            .as("对齐 CC messages.ts:3734 wrapInSystemReminder 前缀")
-            .contains("The following skills are available for use with the Skill tool:")
-            .contains("- commit: 提交代码");
+        assertThat(messages).as("skill_listing attachment 被 maybeInjectHookAttachments 跳过（不再队尾重放）")
+            .isEmpty();
     }
 }
