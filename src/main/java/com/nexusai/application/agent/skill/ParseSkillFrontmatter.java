@@ -145,9 +145,14 @@ public class ParseSkillFrontmatter {
         // CC frontmatterParser.ts:145 content = markdown.slice(match[0].length) —— 不 trim
         String content = markdown.substring(m.end());
 
+        // [2026-09-08 CRLF 兼容] 行尾统一为 LF 再喂 SnakeYAML：Windows skill/agent 文件常为 CRLF，
+        // 引号化(quoteProblemativeValues)会把行尾 \r 包进双引号字符串 → YAML 拒绝 → 二次重试仍失败刷 WARN
+        // （image-blaster SKILL.md argument-hint 裸 [ 实测）。CRLF→LF 与 CC 语义一致，不影响 content。
+        String yamlText = frontmatterText.replace("\r\n", "\n").replace("\r", "\n");
+
         Map<String, Object> frontmatter = new LinkedHashMap<>();
         try {
-            Object parsed = parseYaml(frontmatterText);
+            Object parsed = parseYaml(yamlText);
             // CC :150-153 parsed 必须是对象且非数组才接受，否则保持空 Map
             if (parsed instanceof Map<?, ?>) {
                 frontmatter = toMap(parsed);
@@ -155,7 +160,7 @@ public class ParseSkillFrontmatter {
         } catch (Exception e) {
             // CC :155-160 首次失败 → quoteProblemativeValues 引号化特殊字符后重试
             try {
-                Object retried = parseYaml(quoteProblemativeValues(frontmatterText));
+                Object retried = parseYaml(quoteProblemativeValues(yamlText));
                 if (retried instanceof Map<?, ?>) {
                     frontmatter = toMap(retried);
                 }

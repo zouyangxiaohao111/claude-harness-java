@@ -5,5 +5,6 @@ public enum ModelTag {
     DS,    // DeepSeek
     CL,    // Claude
     GP,    // GPT
-    QW     // Qwen
+    QW,    // Qwen
+    KIMI   // Kimi / Moonshot（moonshot-* / kimi-*）
 }

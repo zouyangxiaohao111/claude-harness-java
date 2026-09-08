@@ -122,6 +122,21 @@ class ParseSkillFrontmatterTest {
             .containsExactly("src/**/*.ts", "src/**/*.tsx");
     }
 
+    @Test
+    @DisplayName("CRLF 行尾 + 裸 [ 值（image-blaster SKILL.md 形态）：引号化不把 \\r 包进串 → 正常解析")
+    void parse_crlfBareBracket_quoteRetrySucceeds() {
+        // 复现 image-blast-*.md argument-hint 裸 [ 值 + Windows CRLF：\r 若被引号化包进双引号串
+        // SnakeYAML 拒绝 → 二次重试仍 WARN。归一 CRLF→LF 后应正常解析。
+        String md = "---\r\n"
+            + "name: image-blast-3d\r\n"
+            + "argument-hint: [world-name] [object-id/name]\r\n"
+            + "---\r\nbody";
+        Map<String, Object> fm = parser.parse(md);
+
+        assertThat(fm.get("name")).isEqualTo("image-blast-3d");
+        assertThat(fm.get("argument-hint")).isEqualTo("[world-name] [object-id/name]");
+    }
+
     // ═════════════════════════════════════════════════════════════════════
     // coerceDescriptionToString
     // ═════════════════════════════════════════════════════════════════════

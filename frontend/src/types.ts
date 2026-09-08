@@ -35,7 +35,7 @@ export interface DiffFile {
   hunks: DiffHunk[]
 }
 
-export type ModelTag = 'DS' | 'CL' | 'GP' | 'QW'
+export type ModelTag = 'DS' | 'CL' | 'GP' | 'QW' | 'KIMI'
 
 /**
  * 与 Java 端 `config.provider.model.ModelConfig.ModelType` 枚举一一对应

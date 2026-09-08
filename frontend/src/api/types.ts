@@ -41,7 +41,7 @@ export interface UpdateProviderRequest {
 }
 
 // ---- Model ----
-export type ModelTag = 'DS' | 'CL' | 'GP' | 'QW'
+export type ModelTag = 'DS' | 'CL' | 'GP' | 'QW' | 'KIMI'
 export type ModelType =
   | 'chat' | 'text' | 'vision' | 'multimodal'
   | 'image_generation' | 'embedding' | 'audio' | 'rerank' | 'moderation'

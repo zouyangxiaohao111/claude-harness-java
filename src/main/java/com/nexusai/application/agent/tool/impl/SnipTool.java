@@ -183,8 +183,12 @@ public class SnipTool implements Tool {
 
         ObjectNode messageIds = props.putObject("message_ids");
         messageIds.put("type", "array");
-        ArrayNode items = messageIds.putArray("items");
-        items.addObject().put("type", "string");
+        // [2026-09-08 对齐 CC] items 必须是「单对象」{type:"string"}（标准 JSON Schema）——
+        //   CC 真源 SnipTool.ts:9-10 用 z.array(z.string())，序列化即 items 对象形式；
+        //   旧写法 items:[{type:"string"}]（tuple 形式，仅 z.tuple 才有）被 moonshot/kimi 校验拒绝
+        //   (400: properties.message_ids.items must be an object)；OpenAI/DeepSeek 兼容端点两种形式皆可，
+        //   改对象形式不影响它们，且更贴近 CC。
+        messageIds.putObject("items").put("type", "string");
         messageIds.put("description",
             "IDs of the messages to snip from history. Use the [id:xxx] short IDs shown at the end of each "
                 + "user message (NOT message content — content text never matches). Snipped messages are "

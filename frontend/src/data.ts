@@ -411,7 +411,7 @@ export const trackItems: { dot: 'running' | 'ok' | 'warn'; name: string; time: s
 
 /* ---------- pure helpers (replace inline condition chains) ---------- */
 
-/** Map a model tag like "DS" to the CSS class suffix (e.g. "ds"). */
+/** Map a model tag like "DS" to the CSS class suffix (e.g. "ds"). 未知 tag → 中性兜底（不再误标 DS 色）。 */
 export const tagToClass = (tag: string): string => {
   switch (tag) {
     case 'DS':
@@ -422,18 +422,29 @@ export const tagToClass = (tag: string): string => {
       return 'gp'
     case 'QW':
       return 'qw'
+    case 'KIMI':
+      return 'kimi'
     default:
-      return 'ds'
+      return 'other'
   }
 }
 
-/** Derive the short tag (DS/CL/GP/QW) from a full model name. */
-export const modelNameToTag = (name: string): ModelTag => {
-  if (name.startsWith('DeepSeek')) return 'DS'
-  if (name.startsWith('Claude')) return 'CL'
-  if (name.startsWith('GPT')) return 'GP'
-  return 'QW'
+/**
+ * 从模型全名推断品牌标签（大小写不敏感；provider 名命中已知品牌即映射）。
+ * 半动态：新增已知 provider 后此表即识，未知品牌返回 null（调用方保留配置 tag，不误标）。
+ */
+export const brandTagFromName = (name: string): ModelTag | null => {
+  const n = (name ?? '').toLowerCase()
+  if (n.startsWith('deepseek')) return 'DS'
+  if (n.startsWith('claude') || n.includes('anthropic')) return 'CL'
+  if (n.startsWith('gpt') || n.includes('openai')) return 'GP'
+  if (n.startsWith('kimi') || n.startsWith('moonshot')) return 'KIMI'
+  if (n.startsWith('qwen') || n.includes('tongyi')) return 'QW'
+  return null
 }
+
+/** 从模型全名取品牌标签；未识别 → QW（历史默认，仅作展示兜底）。 */
+export const modelNameToTag = (name: string): ModelTag => brandTagFromName(name) ?? 'QW'
 
 /* ------------------------------------------------------------------ */
 /*  Per-session context (chat history + right panel data per session) */

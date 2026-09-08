@@ -6,6 +6,7 @@ import {
   models,
   searchItems,
   getDiffFor,
+  brandTagFromName,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag, DiffFile } from '@/types'
 import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert } from '@/api/types'
@@ -765,6 +766,10 @@ function App() {
           if (next) {
             sessionDispatch({ type: 'SWITCH', sessionId: next.id })
             if (!sessionR.openSessions.includes(next.id)) sessionDispatch({ type: 'ADD_TAB', tabId: next.id })
+          } else {
+            // 删除的是最后一个会话 → 激活重置为空。否则 activeSessionId 残留已删 id，
+            // 之后欢迎页「绑定项目」会误判为「有会话」→ bind 到已删除的 session → Session not found
+            sessionDispatch({ type: 'SWITCH', sessionId: '' })
           }
         }
         showToast('会话已删除', 'info')
@@ -784,7 +789,12 @@ function App() {
       for (const p of providersApi.list) {
         if (!p.enabled) continue
         const hit = p.models.find((m) => m.enabled && `${p.name}/${m.name}` === main)
-        if (hit) return { tag: hit.tag, name: main }
+        if (hit) {
+          // [半动态 KIMI] 存储 tag 是 DS 兜底时，若品牌能从模型全名推断（如 kimi/moonshot）→ 用推断值，
+          // 避免「选了 kimi 却发 model=DS」；已存明确标签（CL/GP/QW/KIMI）则尊重
+          const brand = brandTagFromName(main)
+          return { tag: hit.tag === 'DS' && brand !== null ? brand : hit.tag, name: main }
+        }
       }
     }
     // 2) 回落第一个 enabled provider 的第一个 enabled model
@@ -879,17 +889,13 @@ function App() {
     showToast(`已添加工作区 ${p.name}`, 'success')
   }, [defaultNewSessionModel, showToast, sessionDispatch, setSessions, storeSessions])
 
-  // 本地文件夹选项目（Tauri 原生文件夹框 · 用户需求）：有会话 → 注册(幂等) + 绑定当前会话；
-  //   无会话（欢迎页空态）→ 等同「添加工作区」，自动建该目录首个会话显示到左栏
+  // 本地文件夹选项目（Tauri 原生文件夹框 · 用户需求）：有有效会话 → 注册(幂等) + 绑定当前会话；
+  //   无会话 / 激活会话已被删除（欢迎页空态）→ 等同「添加工作区」，自动建该目录首个会话显示到左栏
   const handleSelectProjectFolder = useCallback(async () => {
-    // 会话已创建并对话后不能切换绑定目录
-    if (activeSessionId) {
-      const hasMessages = (useChatStore.getState().messages[activeSessionId] ?? []).length > 0
-      if (hasMessages) {
-        showToast('当前会话已有对话，不能切换绑定目录', 'info')
-        return
-      }
-    }
+    // 「有会话」必须是列表里真实存在的会话：删除最后一个会话后 activeSessionId 可能残留已删 id
+    // （见 handleDeleteSession else 分支）——若仍以非空 id 判「有会话」，会 bind 到已删除的 session
+    // → 后端 Session not found
+    const activeStillExists = !!activeSessionId && storeSessions.some((s) => s.id === activeSessionId)
     const sel = await selectProjectFolder()
     if (!sel) return // 用户取消
     // 后端已校验路径（转绝对 + 目录必须存在）：浏览器 dev 模式仅返回目录名（相对），
@@ -898,12 +904,17 @@ function App() {
       showToast('浏览器模式无法获取项目绝对路径，请使用桌面端选择文件夹', 'info')
       return
     }
-    if (!activeSessionId) {
-      // 无会话（欢迎页）：建工作区会话 → 左侧立即出现绑定项目
+    if (!activeStillExists) {
+      // 无有效会话（真无会话 / 激活指向已删会话）：建工作区会话 → 左侧立即出现绑定项目
       await openWorkspaceFromFolder(sel.path)
       return
     }
-    // 有会话（空新会话）：注册项目（幂等）→ 绑定当前会话
+    // 有效会话（空新会话）：已有对话不可切换；否则注册项目（幂等）→ 绑定当前会话
+    const hasMessages = (useChatStore.getState().messages[activeSessionId] ?? []).length > 0
+    if (hasMessages) {
+      showToast('当前会话已有对话，不能切换绑定目录', 'info')
+      return
+    }
     let proj: ProjectDto
     const folderName = sel.path.split(/[\\/]/).pop() || sel.path
     try {
@@ -924,7 +935,7 @@ function App() {
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [activeSessionId, showToast, setSessions, openWorkspaceFromFolder])
+  }, [activeSessionId, storeSessions, showToast, setSessions, openWorkspaceFromFolder])
 
   // 添加工作区（新项目工作组）：选文件夹 → 走公共建工作区路径（可添加多个）
   const handleAddWorkspace = useCallback(async () => {

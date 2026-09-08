@@ -66,6 +66,8 @@
   --model-claude: #C77B5C;
   --model-gpt: #10A37F;
   --model-qwen: #7B61FF;
+  --model-kimi: #E8618C;
+  --model-other: #64748B;
 
   /* Border Radius 圆角 */
   --window-radius: 10px;
@@ -1095,6 +1097,8 @@ html {
 .model-tag.cl { background: var(--model-claude); }
 .model-tag.gp { background: var(--model-gpt); }
 .model-tag.qw { background: var(--model-qwen); }
+.model-tag.kimi { background: var(--model-kimi); }
+.model-tag.other { background: var(--model-other); }
 
 .session-item .title {
   flex: 1;
