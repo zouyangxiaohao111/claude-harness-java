@@ -49,24 +49,31 @@ public class SnipCompactor {
     /** 估算每 token 字符数（保守，混合代码/文本）· CC original: CHARS_PER_TOKEN (snipCompact.ts:6) = 4 */
     private static final int CHARS_PER_TOKEN = 4;
 
-    /** 消息数 nudge 阈值（CC 默认/最低档）· CC original: SNIP_NUDGE_THRESHOLD (snipCompact.ts:11) = 30 */
+    /** 消息数 nudge 阈值 · CC original: SNIP_NUDGE_THRESHOLD (snipCompact.ts:11) = 30（固定值）。
+     *  仅供 {@code shouldNudgeForSnips(messages)} 单参变体（CC 原语义）+ 窗口未知（0/负）兜底；
+     *  窗口自适应路径用下方 450/300/180/90 档位（snip-nudge-scaleup 2026-09-08）。 */
     private static final int SNIP_NUDGE_THRESHOLD = 30;
 
     // [V55 fix-transcript-nudge] 上下文窗口自适应档位（Java 扩展，CC 仅固定 30）。
     //   effectiveWindow = CompactThresholdSystem#getEffectiveContextWindowSize(model)
-    //   （含 reserved 减法 + settings 收窄）。档位：≥800k → 150；>600k → 100；≥400k → 60；其他 → 30。
-    /** 窗口档位 A 下限（effectiveWindow ≥ 800k → 阈值 150） */
+    //   （含 reserved 减法 + settings 收窄）。
+    //   [snip-nudge-scaleup 2026-09-08 用户拍板] 档位整体 ×3（1M 窗口 150→450，避免过早 nudge；
+    //   其它窗口自适应同比例）：≥800k → 450；>600k → 300；≥400k → 180；>0 且 <400k（如 200k）→ 90；
+    //   窗口未知（0/负：阈值系统未接线/单测/无 bean）→ 仍回落 CC 默认 30（零行为变化）。
+    /** 窗口档位 A 下限（effectiveWindow ≥ 800k → 阈值 450） */
     private static final int SNIP_NUDGE_WINDOW_800K = 800_000;
-    /** 窗口档位 B 下限（effectiveWindow &gt; 600k → 阈值 100） */
+    /** 窗口档位 B 下限（effectiveWindow &gt; 600k → 阈值 300） */
     private static final int SNIP_NUDGE_WINDOW_600K = 600_000;
-    /** 窗口档位 C 下限（effectiveWindow ≥ 400k → 阈值 60） */
+    /** 窗口档位 C 下限（effectiveWindow ≥ 400k → 阈值 180） */
     private static final int SNIP_NUDGE_WINDOW_400K = 400_000;
     /** 窗口档位 A 阈值（≥800k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_150 = 150;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_450 = 450;
     /** 窗口档位 B 阈值（>600k 且 <800k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_100 = 100;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_300 = 300;
     /** 窗口档位 C 阈值（≥400k 且 ≤600k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_60 = 60;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_180 = 180;
+    /** 窗口档位 D 阈值（>0 且 <400k 已知小窗口，如 200k） */
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_90 = 90;
 
     /**
      * nudge 提示文本 · CC original: SNIP_NUDGE_TEXT (snipCompact.ts:17-18)。
@@ -288,8 +295,9 @@ public class SnipCompactor {
      * <p><b>优先级</b>:
      * <ol>
      *   <li>DB settings.snip_nudge_threshold &gt; 0 → 直接覆盖（用户显式配置优先，前端「环境配置」可配）</li>
-     *   <li>null / ≤ 0 → 按 effectiveWindow 窗口自适应档位回落：
-     *       ≥800k → 150；&gt;600k → 100；≥400k → 60；其他 → 30（CC 默认，snipCompact.ts:11）</li>
+     *   <li>null / ≤ 0 → 按 effectiveWindow 窗口自适应档位回落（snip-nudge-scaleup 2026-09-08 用户拍板，
+     *       1M 窗口不再过早通知，档位整体 ×3）：
+     *       ≥800k → 450；&gt;600k → 300；≥400k → 180；&gt;0 且 &lt;400k（如 200k）→ 90</li>
      * </ol>
      * effectiveWindow 为 0 / 负数（阈值系统未接线、单测、无 bean）→ 回落 30（CC 默认，零行为变化）。
      *
@@ -306,16 +314,21 @@ public class SnipCompactor {
         }
         int threshold;
         if (effectiveWindow >= SNIP_NUDGE_WINDOW_800K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_150;
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_450;
         } else if (effectiveWindow > SNIP_NUDGE_WINDOW_600K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_100;
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_300;
         } else if (effectiveWindow >= SNIP_NUDGE_WINDOW_400K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_60;
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_180;
+        } else if (effectiveWindow > 0) {
+            // 已知小窗口（<400k，如 200k）→ 90（snip-nudge-scaleup 自适应档）
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_90;
         } else {
+            // 窗口未知（0/负：阈值系统未接线/单测/无 bean）→ CC 默认 30（零行为变化）
             threshold = SNIP_NUDGE_THRESHOLD;
         }
         if (log.isDebugEnabled()) {
-            log.debug("[SnipCompactor] nudge 阈值窗口自适应: effectiveWindow={} → 阈值{}（DB=null 回落，CC 默认 {}）",
+            log.debug("[SnipCompactor] nudge 阈值窗口自适应: effectiveWindow={} → 阈值{}（DB=null 回落，"
+                + "档位 snip-nudge-scaleup；窗口未知兜底 CC 默认 {}）",
                 effectiveWindow, threshold, SNIP_NUDGE_THRESHOLD);
         }
         return threshold;

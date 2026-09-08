@@ -177,7 +177,8 @@ public class SettingsRecord {
     // [V55 fix-transcript-nudge] snip_nudge_threshold ↔ snipNudgeThreshold：snip nudge
     //   消息数阈值（CC original: SNIP_NUDGE_THRESHOLD = 30, snipCompact.ts:11）。
     //   null = 回落窗口自适应算法（SnipCompactor.resolveSnipNudgeThreshold 按
-    //   effectiveWindow 档位：≥800k → 150；>600k → 100；≥400k → 60；其他 → 30）；
+    //   effectiveWindow 档位，snip-nudge-scaleup 2026-09-08 ×3：≥800k → 450；>600k → 300；
+    //   ≥400k → 180；>0 且 <400k → 90；窗口未知 0/负 → 30 CC 默认）；
     //   >0 = DB 值直接覆盖。命名：snipNudgeThreshold 大写 T 映射 snip_nudge_threshold
     //   （MyBatis-Flex camelCase→snake 精确映射，同 V45 classifierModel 大写 M 反向先例）。
     private Integer snipNudgeThreshold;

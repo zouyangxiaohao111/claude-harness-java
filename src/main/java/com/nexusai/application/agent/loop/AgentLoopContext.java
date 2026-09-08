@@ -377,6 +377,19 @@ public record AgentLoopContext(
      */
     public static final class LoopSessionState {
 
+        /** [bg-wait-hint Layer-1] doRun(实例) 暂存的"后台任务运行中勿轮询"提示；static loop 首轮消费一次后清空。 */
+        private volatile String pendingBgWaitHint;
+
+        public void setPendingBgWaitHint(String hint) {
+            this.pendingBgWaitHint = hint;
+        }
+
+        public String takePendingBgWaitHint() {
+            String h = this.pendingBgWaitHint;
+            this.pendingBgWaitHint = null;
+            return h;
+        }
+
         /**
          * workspaceDir 默认解析 · 对齐 CC getOriginalCwd()（sessionStorage.ts:202-205 subagent
          * transcript 锚 getProjectDir(getOriginalCwd())）。

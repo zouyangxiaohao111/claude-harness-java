@@ -10,7 +10,10 @@ import com.nexusai.model.project.dto.ProjectDto;
 import com.nexusai.model.session.dto.SessionDto;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -48,6 +51,16 @@ public class ProjectController {
     @GetMapping("/api/v1/projects/{id}/file")
     public FileContentDto file(@PathVariable String id, @RequestParam String path) {
         return projectService.readFile(id, path);
+    }
+
+    /** 项目文件原始字节（docx 等二进制预览 · 防路径穿越同 readFile）。 */
+    @GetMapping("/api/v1/projects/{id}/raw")
+    public ResponseEntity<byte[]> raw(@PathVariable String id, @RequestParam String path) {
+        byte[] bytes = projectService.readFileBytes(id, path);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "inline")
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .body(bytes);
     }
 
     /** 项目文件写入（Monaco 编辑保存 · body 复用 FileContentDto.content · 防路径穿越同 readFile）。 */

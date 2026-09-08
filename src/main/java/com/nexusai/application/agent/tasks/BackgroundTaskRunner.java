@@ -459,6 +459,26 @@ public class BackgroundTaskRunner {
     }
 
     /**
+     * [bg-wait-hint] 该会话是否有仍在运行(RUNNING)的后台任务（本地 runner 管辖：spawn / 前台转后台）。
+     * 供主循环 Layer-1「后台任务运行中→提示勿轮询、等完成通知」注入判定。
+     *
+     * @param sessionId 会话 short id
+     * @return true = 存在本会话 RUNNING 后台任务
+     */
+    public boolean hasRunningTaskForSession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return false;
+        }
+        for (BackgroundTask t : tasks.values()) {
+            if (t != null && t.status() == BackgroundTaskStatus.RUNNING
+                    && sessionId.equals(t.sessionId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 全部类型任务全量（本地 tasks ∪ TaskFrameworkService.store，按 id 去重）。
      *
      * <p>用户拍板「全部类型」（#138 前端异步任务清单）——monitor_mcp / in_process_teammate /

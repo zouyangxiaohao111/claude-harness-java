@@ -94,6 +94,10 @@ public class MemoryStorage {
      * @return 记忆条目列表（mtime 降序，最多 MEMORY_MAX_FILES）
      */
     public List<MemoryEntry> list() {
+        // A′: 无有效项目 → 无记忆目录 → 空列表（对齐 CC readdir 失败 catch → []，memoryScan.ts:74-75）
+        if (memoryDir() == null) {
+            return List.of();
+        }
         // 提取路径无外部取消（CC extractMemories.ts:399 新建 createAbortController().signal 恒未取消）
         List<MemoryEntry> entries = scanner.scan(memoryDir(), null);
         if (log.isDebugEnabled()) {
@@ -111,6 +115,11 @@ public class MemoryStorage {
      * {@code AutoMemPaths#getAutoMemPath(String)} 显式重载解析后参数直传（无 ThreadLocal 依赖）。
      */
     public Path memoryDir() {
-        return autoMemPaths != null ? Paths.get(autoMemPaths.getAutoMemPath()) : memoryDir;
+        if (autoMemPaths == null) {
+            return memoryDir;
+        }
+        String autoMem = autoMemPaths.getAutoMemPath();
+        // A′: 无有效项目（config-home 回落）→ per-project auto 记忆目录不存在 → null（调用方跳过）
+        return autoMem == null ? null : Paths.get(autoMem);
     }
 }

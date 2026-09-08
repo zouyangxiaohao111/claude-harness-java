@@ -2198,11 +2198,22 @@ public class ChatService {
      */
     private static boolean isDefaultPlaceholderTitle(String title) {
         if (title == null) return false;
-        return switch (title.trim()) {
+        String t = title.trim();
+        boolean hit = switch (t) {
             case "新会话", "新对话", "新聊天", "新工作区",
                  "Untitled", "New Chat", "New Conversation", "New conversation" -> true;
             default -> false;
         };
+        if (hit) {
+            return true;
+        }
+        // [session-title-fix 2026-09-08 B] provider/model 形态默认占位：创建时 title=req.modelName()
+        //   （SessionService:122），若随后会话切换模型，旧模型字符串标题对新模型不再「默认」→ 自动标题
+        //   判定 looksLikeDefault=false 永不生成（sess-17514758 现象：切 k3 后标题停在 fz/deepseek-v4-flash）。
+        //   真实自动标题是词/句不含 '/'；用户显式命名由 titleExplicit=1 单独拦截（autoEligible=false），
+        //   此处放宽对 provider/model 形态视为默认占位，不误伤显式命名。
+        int slash = t.indexOf('/');
+        return slash > 0 && slash == t.lastIndexOf('/') && slash < t.length() - 1;
     }
 
     /**

@@ -1650,7 +1650,16 @@ html {
 .rp-frame, .rp-media { flex: 1; width: 100%; height: 100%; min-width: 0; min-height: 0; border: 0; background: #fff; }
 .rp-media { object-fit: contain; }
 .rp-audio { width: 100%; flex: none; align-self: center; padding: 24px; }
-.rp-docx { width: 100%; height: 100%; overflow: auto; background: #fff; padding: 16px; }
+.rp-docx { position: relative; width: 100%; height: 100%; overflow: hidden; background: #fff; }
+.rp-docx-body { position: absolute; inset: 0; overflow: auto; padding: 16px; }
+.rp-docx-overlay {
+  position: absolute; inset: 0; z-index: 2; background: var(--surface-1);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink-subtle); font-size: 13px; padding: 20px;
+}
+/* Excel 预览（Univer sheets-core · 容器需确定宽高否则白屏） */
+.excel-preview { position: relative; width: 100%; height: 100%; overflow: hidden; }
+.excel-preview-body { position: absolute; inset: 0; }
 .rp-hint, .rp-err { color: var(--ink-subtle); font-size: 13px; padding: 20px; }
 .rp-err { color: var(--error); }
 /* PDF 动态预览（pdf.js 全部页纵向滚动 · 每页 fit-width · 容器宽变重渲染） */
@@ -7161,6 +7170,9 @@ html {
 /* Monaco 编辑查看（FileViewModal）：容器无内边距 + 编辑器占满 */
 .file-view-body.monaco-body { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
 .file-view-body .monaco-box { flex: 1; min-height: 320px; }
+/* FileViewModal docx 预览（docx-preview 渲染容器） */
+.fvm-docx { position: relative; flex: 1; min-height: 0; background: #fff; }
+.fvm-docx-body { position: absolute; inset: 0; overflow: auto; padding: 16px; }
 .file-view-actions { display: flex; align-items: center; gap: 6px; }
 .file-view-edit-badge {
   font-size: 10px; color: var(--accent); background: var(--accent-soft);

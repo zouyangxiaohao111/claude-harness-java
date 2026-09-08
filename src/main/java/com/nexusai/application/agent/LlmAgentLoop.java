@@ -331,6 +331,14 @@ public class LlmAgentLoop implements AgentLoop {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private PermissionConfigProvider permissionConfigProvider;
 
+    /** [bg-wait-hint Layer-1] 后台任务 runner（查询本会话是否有运行中后台任务 → 提示模型勿轮询、等完成通知）。nullable */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.tasks.BackgroundTaskRunner backgroundTaskRunner;
+
+    public void setBackgroundTaskRunner(com.nexusai.application.agent.tasks.BackgroundTaskRunner runner) {
+        this.backgroundTaskRunner = runner;
+    }
+
     /**
      * 当前 run() 调用的 AgentState (volatile 保证多线程可见性).
      * <p>s06 P2-2 修补: 父 Loop 暴露 state 给 SubagentTool 提取 parentToolUseContext.
@@ -1295,6 +1303,13 @@ public class LlmAgentLoop implements AgentLoop {
     private com.nexusai.repository.session.mapper.SessionMapper sessionMapper;
 
     /**
+     * B′: ProjectMapper 注入 · resolveSessionProjectRoot 失败兜底用 streamSessionId 直查
+     * sessions.main_project_id → projects.path（单一来源 DB，不绕 resolver bean）。可空
+     * （POJO 单测 / 无 Spring）→ DB 兜底 no-op（保持无项目）。
+     */
+    private com.nexusai.repository.project.mapper.ProjectMapper projectMapper;
+
+    /**
      * 静态桥 SessionMapper · [SP-01/SP-10] static loop 上下文读取会话列
      * （loop_mode_override / non_interactive_session）。setSessionMapper 同步桥接
      * （SessionToolDisableConfig 先例，gap29）。null 注入保持 null（读侧回落）。
@@ -1310,6 +1325,42 @@ public class LlmAgentLoop implements AgentLoop {
         // [gap29] 同一 SessionMapper 桥接到会话级禁用工具集合静态读取（llmToolsArray static 上下文，
         //   对齐 MemoryBareModeConfig.bridgeSessionMapper 静态桥接惯例）。null 注入保持空集（不剔除）。
         SessionToolDisableConfig.setSessionMapper(sessionMapper);
+    }
+
+    /** [B′] setter 注入 ProjectMapper（@Autowired(required=false)，同 R3 SessionMapper 方案 C 模式）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setProjectMapper(com.nexusai.repository.project.mapper.ProjectMapper projectMapper) {
+        this.projectMapper = projectMapper;
+    }
+
+    /**
+     * [backend-sendmsg-inbox 2026-09-08] 会话级 name→agentId 注册表（C7）· 对齐 CC
+     * appState.agentNameRegistry。SendMessage 按名投递的待办队列由运行中 fork/后台子代理每轮
+     * queryLoop drain 消费（对齐 CC LocalAgentTask 每轮 drain pendingMessages）。
+     * 由装配方注入（{@code @Autowired(required=false)}）→ setter 同步静态桥（static loop 上下文
+     * 无法引用实例字段）；未注入 → null → {@link #drainPendingAgentMessages} no-op
+     * （不破坏单测 / POJO 场景）。
+     */
+    private volatile com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry;
+
+    /**
+     * 静态桥 AgentNameRegistry · [backend-sendmsg-inbox] static loop 上下文（queryLoop 每轮
+     * messagesForLlm 定稿段）读取注册表 drain SendMessage 待办。setAgentNameRegistry 同步桥接
+     * （SessionMapper 静态桥先例）。null 注入保持 null（读侧 no-op）。
+     */
+    private static volatile com.nexusai.application.agent.subagent.AgentNameRegistry staticAgentNameRegistry;
+
+    /** [backend-sendmsg-inbox] setter 注入 AgentNameRegistry（@Autowired(required=false)，同步静态桥）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setAgentNameRegistry(com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry) {
+        this.agentNameRegistry = agentNameRegistry;
+        // [backend-sendmsg-inbox] 静态桥接：static loop（queryLoop/loop）每轮 drain 消费 SendMessage 待办
+        LlmAgentLoop.staticAgentNameRegistry = agentNameRegistry;
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] [sendmsg-inbox] agentNameRegistry 注入={} (CC agentNameRegistry · "
+                    + "static loop 每轮 drain SendMessage 待办)",
+                agentNameRegistry != null);
+        }
     }
 
     // ── Diff Engine: TraceRecorder 注入 · 对齐 skill differential-testing.md ──
@@ -3198,6 +3249,16 @@ public class LlmAgentLoop implements AgentLoop {
                 maxTurns, params.taskBudget(), params.fallbackModel(),
                 params.skipCacheWrite(), params.maxOutputTokensOverride(),
                 mainDeps, params.config());
+        // [bg-wait-hint Layer-1] 本会话有运行中后台任务 → 暂存"勿轮询、等完成通知"提示，static loop 首轮消费一次
+        //   （对齐 CC AgentTool 异步告知「agent results will arrive in a subsequent message」）。
+        if (agentId == null && backgroundTaskRunner != null && mainCtx != null
+                && mainCtx.sessionState() != null
+                && backgroundTaskRunner.hasRunningTaskForSession(sessionId)) {
+            mainCtx.sessionState().setPendingBgWaitHint(
+                "<system-reminder>\n本会话有后台任务正在后台运行（可能含你派出的子代理 / 后台命令）。"
+                + "完成时会自动通知你并继续。请勿轮询或重复执行相同的状态检查；若用户询问进度，"
+                + "最多检查一次后停下，告知用户「仍在进行，完成时会自动汇报」即可。\n</system-reminder>");
+        }
         com.nexusai.application.agent.loop.LoopResult loopResult =
             queryLoop(queryParams, state, consumedCommandUuids, this.autoCompactor, this.microCompactor,
                     this.settingsResolver, this.countTokensClient, this.imageAttachmentStore, this.pdfAttachmentProcessor,
@@ -3803,6 +3864,80 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [backend-sendmsg-inbox 2026-09-08] 子代理每轮消费 SendMessage 待办并前置本轮消息顶部 ·
+     * 对齐 CC queryLoop 每轮 drain（LocalAgentTask.drainPendingMessages :181 →
+     * getAgentPendingMessageAttachments attachments.ts:1085-1101 → wrapCommandText case
+     * 'coordinator' messages.ts:5502-5505 + wrapMessagesInSystemReminder messages.ts:3784）。
+     *
+     * <p><b>WHY</b>：现状唯一消费点是 SubagentExecutor.runSubagentQueryLoop 启动段（drain 一次），
+     * 运行中投递的消息（fork/后台子代理存活期间 SendMessage 按名投递）排到本轮结束才可见。
+     * 本方法在每轮模型请求前（messagesForLlm 定稿段）调用，把排队待办 drain 为 user 消息前置
+     * （"Message queued for delivery ... at its next tool round" 语义，与启动段互补：
+     * drain 取走即清 → 同条只前置一次，无双发）。
+     *
+     * <p><b>守卫</b>：主线程（REPL/主会话，state.agentId()==null）绝不 drain —— 否则会吃掉
+     * 用户 prompt 队列语义（AgentNameRegistry 队列按 agentId 投递，主线程 agentId 无注册条目）；
+     * staticAgentNameRegistry 未桥接（无 bean/POJO）→ no-op。coordinator 包裹门控与
+     * SubagentExecutor 启动段（:3954-3957）取值一致（优先 DB resolver，回落 CoordinatorMode）。
+     * 动态注入不持久化（对齐 CC drained 只进本次 API 消息 + teammate mailbox 同款防膨胀）。
+     *
+     * @param ctx            loop 上下文（promptAlignSettingsResolver / coordinatorMode 源）
+     * @param state          AgentState（agentId 源；主线程 null 时跳过）
+     * @param messagesForLlm 本轮将发给模型的消息列表（前置副本返回；null → 原样返回）
+     * @return 前置 SendMessage 待办后的消息列表（无待办 / 守卫不满足 → 原引用）
+     */
+    private static java.util.List<ChatMessageDto> drainPendingAgentMessages(
+            AgentLoopContext ctx, AgentState state,
+            java.util.List<ChatMessageDto> messagesForLlm) {
+        // 主线程（REPL/主会话，agentId==null）绝不 drain（防吃掉用户 prompt 队列语义）
+        if (state == null || state.agentId() == null || messagesForLlm == null) {
+            return messagesForLlm;
+        }
+        com.nexusai.application.agent.subagent.AgentNameRegistry registry = staticAgentNameRegistry;
+        if (registry == null) {
+            return messagesForLlm; // 未注入 bean → no-op（不破坏单测/POJO）
+        }
+        java.util.List<String> pending = registry.drain(state.agentId().toString());
+        if (pending.isEmpty()) {
+            return messagesForLlm;
+        }
+        // [sendmsg-inbox] coordinator 包裹门控 · 与 SubagentExecutor.runSubagentQueryLoop 启动段
+        //   （:3954-3957）取值一致：DB resolver 非 null → 用 DB 值；null → CoordinatorMode 回落。
+        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver r = promptAlignResolverFromCtx(ctx);
+        boolean coordGate = (r != null && r.coordinatorModeEnabled() != null)
+            ? r.coordinatorModeEnabled()
+            : coordinatorMode.isCoordinatorMode();
+        java.util.List<ChatMessageDto> out = new java.util.ArrayList<>(messagesForLlm);
+        int coordinatorWrapped = 0;
+        // FIFO 队列保持投递序：逆序遍历 + add(0) → 前置到本轮 messagesForLlm 顶部
+        for (int i = pending.size() - 1; i >= 0; i--) {
+            String pm = pending.get(i);
+            ChatMessageDto meta;
+            if (coordGate) {
+                // CC wrapCommandText case 'coordinator'（messages.ts:5502-5505）逐字 +
+                //   :3784 system-reminder 包裹；isMeta=true → 前端隐藏、模型可见
+                //   （对齐 CC queued_command origin:{kind:'coordinator'} isMeta:true）。
+                String wrapped = "<system-reminder>\n"
+                    + "The coordinator sent a message while you were working:\n" + pm
+                    + "\n\nAddress this before completing your current task.\n</system-reminder>";
+                meta = toMessage(Role.user, wrapped, null, null, true);
+                coordinatorWrapped++;
+            } else {
+                // 与 SubagentExecutor 启动段 coordGate=false 分支同形态：裸 user 消息
+                meta = toMessage(Role.user, pm, null, null, false);
+            }
+            out.add(0, meta);
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[LlmAgentLoop] [sendmsg-inbox] 每轮消费 SendMessage 待办 {} 条 → 前置本轮 "
+                    + "消息顶部 (agentId={} coordGate={} coordinatorWrapped={} · CC drainPendingMessages "
+                    + "+ queued_command)",
+                pending.size(), state.agentId(), coordGate, coordinatorWrapped);
+        }
+        return out;
+    }
+
+    /**
      * 当前 turn 会话 ID · CC original: getSessionId()（Java perTurnTuc.sessionId() 必填非空；
      * perTurnTuc null → ctx.streamSessionId() 兜底）。
      *
@@ -3986,6 +4121,57 @@ public class LlmAgentLoop implements AgentLoop {
         return merged;
     }
 
+    /**
+     * [auto-memory DB 主路径 · 决策 2026-09-08] memory 段组装前确认 projectRoot 已解析到会话绑定项目。
+     *
+     * <p><b>取舍/语义</b>：
+     * <ul>
+     *   <li>auto-memory 未启用（{@code BundledSkillEnabledGates.isAutoMemoryEnabled()} false）→ 无注入义务，
+     *       直接返回（MemoryPromptBuilder disabled 分支自行输出 null，不视为错误）。</li>
+     *   <li>本线程已注入有效 projectRoot（{@code AutoMemPaths.captureCurrentProjectRoot()} 非空，
+     *       LlmAgentLoop.run() 入口 resolveSessionProjectRoot 成功产物）→ 已解析，直接返回。</li>
+     *   <li>缺注入但当前有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
+     *       冻结值回填本线程 —— 冻结值 = run() 入口 DB 兜底（{@code tryResolveBoundProjectFromDb}：
+     *       {@code sessions.main_project_id → projects.path} → 校验 → setCurrentProjectRoot +
+     *       SessionProjectRoot.setForSession）成功后的产物，即 DB 主路径解析结果（"等价"于再查一次
+     *       DB；不重复查，符合 F1 会话内不重查语义）。</li>
+     *   <li>仍解析不到（DB 确实无绑定）→ 抛 {@link AutoMemoryNoBoundProjectException}，由调用方
+     *       <b>当场 catch</b>：fail loud 记 error，本轮不注入 auto 记忆段，不让整个 turn 崩溃。</li>
+     * </ul>
+     *
+     * <p>DB 查询为何不在此重复：本方法位于 static 组装路径（buildSystemPromptAssemblyInput），无
+     * sessionMapper/projectMapper 实例依赖；真正的 DB 直查兜底在实例方法
+     * {@link LlmAgentLoop#resolveSessionProjectRoot()} 的
+     * {@code tryResolveBoundProjectFromDb}（run() 入口已执行并冻结）。此处读取冻结值即等价消费 DB
+     * 结果，同时修复「有绑定但本线程 ThreadLocal 未回放 → 回落 config-home → 该轮记忆漏注入」。
+     *
+     * @param ctx loop 上下文（{@code streamSessionId} 源）
+     * @throws AutoMemoryNoBoundProjectException 会话存在但 DB 无绑定项目（且 auto-memory 启用）
+     */
+    private static void ensureAutoMemoryProjectRootResolvedForPrompt(com.nexusai.application.agent.loop.AgentLoopContext ctx) {
+        if (!com.nexusai.application.agent.skill.BundledSkillEnabledGates.isAutoMemoryEnabled()) {
+            return;
+        }
+        String sessionId = ctx.streamSessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        String current = com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
+        if (current != null && !current.isBlank()) {
+            return;
+        }
+        String frozen = com.nexusai.common.SessionProjectRoot.getForSession(sessionId);
+        if (frozen != null && !frozen.isBlank()) {
+            com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(frozen);
+            if (log.isDebugEnabled()) {
+                log.debug("[LlmAgentLoop] auto-memory 组装线程缺 projectRoot，从会话冻结值回填（DB 主路径）: "
+                    + "session={} projectRoot={}", sessionId, frozen);
+            }
+            return;
+        }
+        throw new com.nexusai.application.agent.memory.AutoMemoryNoBoundProjectException(sessionId);
+    }
+
     private static com.nexusai.application.agent.prompt.SystemPromptAssemblyInput buildSystemPromptAssemblyInput(
             AgentLoopContext ctx,
             com.nexusai.application.agent.loop.QueryParams params,
@@ -4017,8 +4203,15 @@ public class LlmAgentLoop implements AgentLoop {
         // telemetry 经 ctx.toolExecutionBeans()（LlmAgentLoop 既有静态 loop 通道，line 2402-2403 同模式）。
         com.nexusai.application.agent.telemetry.Telemetry tel =
             ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
-        com.nexusai.application.agent.memory.LoadMemoryPrompt memoryLoader =
-            new com.nexusai.application.agent.memory.LoadMemoryPrompt(
+        com.nexusai.application.agent.memory.LoadMemoryPrompt memoryLoader;
+        try {
+            // [auto-memory DB 主路径 · 决策 2026-09-08] memory 段组装前确认 projectRoot 已解析到
+            //   会话绑定项目（DB 派生）——不走则当前线程可能是无 ThreadLocal 回放的非 run() 线程
+            //   （compact/queryLoop 等组装上下文），会回落 config-home → getAutoMemPath 返回 null →
+            //   有绑定也不注入（缺陷）。本步用 SessionProjectRoot 冻结值（run() 入口 DB 兜底
+            //   tryResolveBoundProjectFromDb 成功后的产物）回填本线程，保证「有绑定必注入 D 目录」。
+            ensureAutoMemoryProjectRootResolvedForPrompt(ctx);
+            memoryLoader = new com.nexusai.application.agent.memory.LoadMemoryPrompt(
                 com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault(
                     tel,
                     com.nexusai.application.agent.memory.MemoryPromptBuilder::isKairosDeploymentFlagEnabled,
@@ -4031,6 +4224,16 @@ public class LlmAgentLoop implements AgentLoop {
                     //   FeatureFlags.coralFern()（CC getFeatureValue_CACHED_MAY_BE_STALE('tengu_coral_fern', false)，
                     //   memdir.ts:376 动态读 GB flag）
                     () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()));
+        } catch (com.nexusai.application.agent.memory.AutoMemoryNoBoundProjectException e) {
+            // fail loud + 降级取舍（决策 2026-09-08）：DB 确实无绑定 → 会话态错误，但不得击穿整个
+            //   user turn —— 记 log.error（中文、sessionId/线程/原因）后本轮 memory 段不注入任何内容
+            //   （memoryLoader=null → SystemPromptSections.memoryCompute 判空跳过），绝不把 ~/.nexusai
+            //   当项目塞给模型；下一轮若绑定补上即自动恢复注入。
+            log.error("[LlmAgentLoop] 会话 {} auto-memory 无绑定项目（DB 查不到 main_project_id/path），"
+                + "本轮不注入 auto 记忆段（不回落配置主目录当项目）; thread={} - {}",
+                e.sessionId(), Thread.currentThread().getName(), e.getMessage());
+            memoryLoader = null;
+        }
         // [RES-C8] additionalWorkingDirs · 对齐 CC resumeAgent.ts:126-128
         // Array.from(appState.toolPermissionContext.additionalWorkingDirectories.keys())
         // perTurnTuc.additionalWorkingDirectories() = Map<String, AdditionalWorkingDirectory>
@@ -5536,6 +5739,11 @@ public class LlmAgentLoop implements AgentLoop {
                     }
                 }
             }
+            // [backend-sendmsg-inbox 2026-09-08] 子代理每轮消费 SendMessage 待办（对齐 CC queryLoop
+            //   每轮 drain pendingMessages）：messagesForLlm 定稿后、发送层包壳前调用 —— 只每次
+            //   model 请求前一次（不在 streamed 片段内重复 drain）；主线程（agentId==null）守卫在方法内
+            //   no-op；drain 取走即清 → 同条只前置一次（与 SubagentExecutor 启动段首轮 seed 互补无双发）。
+            messagesForLlm = drainPendingAgentMessages(ctx, state, messagesForLlm);
             // [P0-1 OD-1/OD-3] 发送层包壳 transform（唯一发送边界 · 对齐 CC normalizeMessagesForAPI
             //   messages.ts:2269-2291）：对 messagesForLlm 中 user 且 queuedOrigin 命中消息生成带壳副本
             //   （busy-queued 中文提醒 / task-notification 前缀 / coordinator / channel|server / cron human 壳），
@@ -5548,6 +5756,24 @@ public class LlmAgentLoop implements AgentLoop {
             //   让模型能引用消息 ID 调用 SnipTool。只改发送副本（ChatMessageDto.withContent），
             //   不污染 state.messages()；门关 → 原引用（零行为变化）。
             messagesForLlm = AgentLoopContext.maybeAppendSnipIdTags(ctx, settingsResolver, messagesForLlm);
+            // [bg-wait-hint Layer-1] 消费 doRun 暂存的后台等待提示（每 run 仅一次：takePending 清空）
+            if (ctx.sessionState() != null) {
+                String bgHint = ctx.sessionState().takePendingBgWaitHint();
+                if (bgHint != null) {
+                    java.util.List<ChatMessageDto> withBgHint = new java.util.ArrayList<>(messagesForLlm);
+                    withBgHint.add(new ChatMessageDto(
+                        UUID.randomUUID().toString(), null, Role.user, "system",
+                        bgHint, null, List.of(),
+                        com.nexusai.model.session.dto.FinishReason.stop,
+                        null, null, "刚刚", java.time.OffsetDateTime.now(), null, null, null,
+                        List.of(), List.of(), null, true, false,
+                        null, null));
+                    messagesForLlm = withBgHint;
+                    if (log.isInfoEnabled()) {
+                        log.info("[bg-wait-hint] 已注入后台任务等待提示（勿轮询）");
+                    }
+                }
+            }
             com.nexusai.application.agent.loop.ModelRequest request = new com.nexusai.application.agent.loop.ModelRequest(
                 params.config(),
                 effectiveModel,
@@ -7180,9 +7406,17 @@ public class LlmAgentLoop implements AgentLoop {
                         ? ctx.sessionState().workspaceDir()
                         : java.nio.file.Path.of(
                             com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
-                    java.nio.file.Path inLoopMemoryDir = java.nio.file.Path.of(
-                        com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()
-                            .getAutoMemPath(inLoopMemBase.toString()));
+                    // A′: getAutoMemPath 无有效项目（config-home 回落）→ null → 传 null 给
+                    //   StopHookPipeline（其内部对 memoryDir null 走 agent storage.memoryDir() 兜底 /
+                    //   normalizeMemDir null 归一）—— extract/dream fork 不再拿到 config-home 假目录。
+                    String inLoopMemStr = com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()
+                        .getAutoMemPath(inLoopMemBase.toString());
+                    if (inLoopMemStr == null) {
+                        log.warn("[LlmAgentLoop] extract/dream memoryDir 无有效项目（auto-memory per-project "
+                            + "目录不存在，memBase={}），跳过 per-project 记忆提取/合并（A′）", inLoopMemBase);
+                    }
+                    java.nio.file.Path inLoopMemoryDir = inLoopMemStr == null
+                        ? null : java.nio.file.Path.of(inLoopMemStr);
                     StopHookPipeline.executeExtractMemoriesAndAutoDream(
                         stopMainAgentId,                // 子代理 id（null = 主线程）· CC !toolUseContext.agentId
                         ctx.extractMemoriesAgent(),
@@ -9652,6 +9886,53 @@ public class LlmAgentLoop implements AgentLoop {
      * 回退原文 NFC（对齐 state.ts:271 EPERM 回退）。命中冻结路径同样归一（冻结值可能来自
      * bind() 的未归一 DB 值，幂等归一保证两次 run 产出一致）。
      */
+    /**
+     * [B′] resolveSessionProjectRoot 失败出口的 DB 兜底 —— 直接用 streamSessionId 查
+     * {@code sessions.main_project_id → projects.path}（单一来源 DB，不依赖
+     * {@code sessionProjectRootResolver} bean 是否注入）。与成功分支一致：normalize
+     * （realpath+NFC）+ {@code isValidDirectory} 校验 + setCurrentProjectRoot + workspaceDir
+     * + SessionProjectRoot 冻结。取到有效绝对目录 → true（调用方继续/返回）；
+     * 仍取不到 → false（调用方保持"无项目"，memory 域由 A′ skip —— 不再把 config-home
+     * 当"默认项目"塞进 ThreadLocal/workspaceDir）。
+     */
+    private boolean tryResolveBoundProjectFromDb(String sessionIdStr) {
+        if (sessionIdStr == null || sessionIdStr.isBlank()) {
+            return false;
+        }
+        String path = null;
+        try {
+            com.nexusai.repository.session.entity.SessionRecord session =
+                sessionMapper != null ? sessionMapper.selectOneById(sessionIdStr) : null;
+            if (session != null && session.getMainProjectId() != null
+                    && !session.getMainProjectId().isBlank()) {
+                com.nexusai.repository.project.entity.ProjectRecord project =
+                    projectMapper != null ? projectMapper.selectOneById(session.getMainProjectId()) : null;
+                if (project != null && project.getPath() != null && !project.getPath().isBlank()) {
+                    path = project.getPath();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[LlmAgentLoop] 会话 projectRoot DB 兜底查询失败，保持无项目: {} - {}",
+                sessionIdStr, e.getMessage());
+            return false;
+        }
+        if (path == null || path.isBlank()) {
+            return false;
+        }
+        String normalized = normalizeSessionProjectRoot(path);
+        if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
+            log.warn("[LlmAgentLoop] 会话 {} DB 兜底解析 projectRoot 目录无效（非绝对/不存在），保持无项目: {}",
+                sessionIdStr, normalized);
+            return false;
+        }
+        this.workspaceDir = java.nio.file.Path.of(normalized);
+        com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(normalized);
+        com.nexusai.common.SessionProjectRoot.setForSession(sessionIdStr, normalized);
+        log.info("[LlmAgentLoop] 会话 projectRoot DB 兜底注入（resolve 失败出口）: session={} projectRoot={}",
+            sessionIdStr, normalized);
+        return true;
+    }
+
     private void resolveSessionProjectRoot() {
         // [批次乙 cron-mem] DURABLE cron 回合项目身份整体注入（对齐 CC fire 回合
         // projectRoot=创建项目 cronTasks.ts:74-83 + paths.ts:223-235）——必须放在函数体首行、
@@ -9688,8 +9969,14 @@ public class LlmAgentLoop implements AgentLoop {
             //   user.dir——避免 system prompt 冻结无效路径与 Bash 工具 getCwd 回落打架（LLM 感知
             //   「抓包流程」但工具实际在 nexusai-backend）。根因在前端绑定 path 需绝对路径。
             if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
-                log.warn("[LlmAgentLoop] 会话 {} 冻结 projectRoot 目录无效（非绝对/不存在），回落默认 "
-                    + "workspaceDir（与 getCwd 一致，勿误报绑定项目）: {}", sessionIdStr, normalized);
+                log.warn("[LlmAgentLoop] 会话 {} 冻结 projectRoot 目录无效（非绝对/不存在），DB 兜底取回真实绑定项目: {}",
+                    sessionIdStr, normalized);
+                // [B′] 冻结值无效 → 直查 DB 兜底；仍无 → 保持无项目（memory 域 A′ skip）
+                if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                    return;
+                }
+                log.warn("[LlmAgentLoop] 会话 {} DB 兜底未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
+                    sessionIdStr);
                 return;
             }
             this.workspaceDir = java.nio.file.Path.of(normalized);
@@ -9703,6 +9990,12 @@ public class LlmAgentLoop implements AgentLoop {
                 log.debug("[LlmAgentLoop] sessionProjectRootResolver 未注入，workspaceDir 保持默认: {}",
                     workspaceDir);
             }
+            // [B′] resolver bean 未注入 → DB 兜底直查绑定项目
+            if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                return;
+            }
+            log.warn("[LlmAgentLoop] 会话 {} 无 sessionProjectRootResolver 且 DB 兜底无绑定项目，"
+                + "保持无项目（memory 域 A′ skip）", sessionIdStr);
             return;
         }
         try {
@@ -9710,6 +10003,11 @@ public class LlmAgentLoop implements AgentLoop {
             if (projectRoot == null || projectRoot.isBlank()) {
                 log.info("[LlmAgentLoop] 会话 {} 未绑定项目/项目无路径，workspaceDir 保持默认: {}",
                     sessionIdStr, workspaceDir);
+                // [B′] resolver 未命中 → DB 兜底（可能 resolver 漏看 / 会话刚 bind 未走冻结）
+                if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                    return;
+                }
+                // 仍无 → 真无绑定：保持无项目（memory 域 A′ skip；不额外 warn，普通未绑定会话属常态）
                 return;
             }
             // [IMP-A · F7] 注入点归一：realpath（失败回退原文）+ NFC · 产出字节恒 NFC+realpath
@@ -9717,8 +10015,14 @@ public class LlmAgentLoop implements AgentLoop {
             // [cwd-consistency 2026-08-25] 同冻结命中校验：resolver 解析结果目录无效 → 不冻结不注入
             //   （与 getCwd L3 回落一致，防 system prompt 与工具 cwd 不一致）。
             if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
-                log.warn("[LlmAgentLoop] 会话 {} 解析 projectRoot 目录无效（非绝对/不存在），不注入 "
-                    + "workspaceDir（与 getCwd 一致回落默认）: {}", sessionIdStr, normalized);
+                log.warn("[LlmAgentLoop] 会话 {} 解析 projectRoot 目录无效（非绝对/不存在），DB 兜底取回真实绑定项目: {}",
+                    sessionIdStr, normalized);
+                // [B′] resolver 结果无效 → DB 兜底；仍无 → 保持无项目（memory 域 A′ skip）
+                if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                    return;
+                }
+                log.warn("[LlmAgentLoop] 会话 {} DB 兜底未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
+                    sessionIdStr);
                 return;
             }
             this.workspaceDir = java.nio.file.Path.of(normalized);
@@ -9728,7 +10032,12 @@ public class LlmAgentLoop implements AgentLoop {
             log.info("[LlmAgentLoop] 会话 projectRoot 注入（CC 启动冻结）: session={} projectRoot={}",
                 sessionIdStr, normalized);
         } catch (Exception e) {
-            log.warn("[LlmAgentLoop] 解析会话 projectRoot 失败，保持默认: {} - {}", sessionIdStr, e.getMessage());
+            log.warn("[LlmAgentLoop] 解析会话 projectRoot 失败，DB 兜底取回真实绑定项目: {} - {}", sessionIdStr, e.getMessage());
+            // [B′] resolver 异常 → DB 兜底；仍无 → 保持无项目（memory 域 A′ skip）
+            if (!tryResolveBoundProjectFromDb(sessionIdStr)) {
+                log.warn("[LlmAgentLoop] 会话 {} resolver 异常且 DB 兜底未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
+                    sessionIdStr);
+            }
         }
     }
 
@@ -10371,6 +10680,16 @@ public class LlmAgentLoop implements AgentLoop {
             //   （deepseek 等 openai_compatible）也要懒加载（deferred 过滤 + ToolSearch 保留），
             //   filterToolsForSchema 需要 deferred/discovered 集合（不再传 null 走全发旧行为）。
             Set<String> deferredToolNames = ToolSearchService.computeDeferredToolNames(available);
+            // [openai-defer-exempt 2026-09-08 用户拍板] 通用懒加载豁免：非 anthropic（openai 系
+            //   deepseek/fz/moonshot 等）清空整个 deferred → 所有 shouldDefer 工具全 schema 直发。
+            //   WHY：defer 工具的前提 = 模型能经 ToolSearch/tool_reference 激活被剔工具（CC anthropic
+            //   语义）；openai 兼容模型无 tool_reference、不自知工具存在故不会主动搜索 → 被剔 = 对
+            //   模型不存在。逐工具白名单豁免（vision/WebSearch/SendMessage）已漏网 worktree 工具
+            //   （用户实测叫它建 worktree，它用 bash git worktree add 兜底 —— EnterWorktree/ExitWorktree
+            //   shouldDefer=true 被 filterToolsForSchema 剔出初始 schema）→ 通用化：openai 下全部直发
+            //   一劳永逸（anthropic 保留懒加载，对齐 CC 省 token；下两个专用豁免在 anthropic 分支仍有
+            //   特判语义，保留不动）。
+            exemptAllDeferredForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
             // [vision-defer-model 2026-09-03] vision_analyze 懒加载豁免（装配层按主模型能力判定）：
             //   仅 ant/response 直给格式 + 多模态（supportsImage）才保留懒 —— 该模型能走 Read 直给通道，
             //   vision_analyze 仅 PDF 超预算/分段补充，可 defer 省 token；
@@ -10383,6 +10702,11 @@ public class LlmAgentLoop implements AgentLoop {
             //   初始 schema（不赌模型会 ToolSearch 激活）—— 用户实测 deepseek 误判"没 WebSearch"
             //   白派 agent。anthropic 保留懒加载（tool_reference 能正常激活，对齐 CC 省 token）。
             exemptWebSearchDeferForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
+            // [sendmessage-openai-alwaysload 2026-09-08] SendMessage 懒加载豁免：非 anthropic
+            //   （openai_compatible/deepseek/moonshot 等）时从 deferred 移除 → 恒在初始 schema
+            //   （openai 兼容模型无 tool_reference，deferred 工具会被 filterToolsForSchema 剔出初始
+            //   schema，模型不自知 → 无法向运行中子代理发消息；对齐 vision/WebSearch 同因豁免）。
+            exemptSendMessageDeferForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
             Set<String> discovered = ToolSearchService.extractDiscoveredToolNames(messages);
             if (useToolSearch) {
                 // 短路（claude.ts:1140-1147）：无 deferred 且无 pending MCP → 关闭。
@@ -11507,6 +11831,90 @@ public class LlmAgentLoop implements AgentLoop {
             log.debug("llmToolsArray: WebSearch/WebFetch 从 deferred 豁免（非 anthropic 始终加载，"
                 + "防 openai 模型误判无工具白派 agent）");
         }
+    }
+
+    /**
+     * SendMessage 懒加载豁免 · [2026-09-08 用户拍板] 非 anthropic（openai 兼容/deepseek/moonshot）
+     * 请求中 SendMessage 恒进初始 schema。
+     *
+     * <p><b>WHY</b>：SendMessage 对齐 CC SendMessageTool.ts:533 {@code shouldDefer:true} → 非
+     * discovered/激活时不进初始 schema；openai 兼容模型无 tool_reference（deepseek/moonshot），
+     * deferred 工具会被 {@code filterToolsForSchema} 剔出初始 schema 且模型无法经 ToolSearch 激活 →
+     * 模型不自知存在 SendMessage → 无法向运行中 fork/后台子代理发消息。anthropic 有 tool_reference
+     * 能正常激活，保留懒加载省 token（对齐 CC defer）。与 vision/WebSearch 豁免同因（用户实测
+     * deepseek 会话误判"没有工具"）。
+     *
+     * <p><b>判定</b>：mapper null → 无法判 provider → 按 vision 语义保守剔除直发（不赌模型会
+     * ToolSearch 激活）；{@code isAnthropic} = true → 保留懒（tool_reference 激活，对齐 CC）；
+     * 其余（openai_compatible/openai_sdk/未来 response）→ 从 deferred 移除恒在初始 schema。
+     *
+     * @param deferred       deferred 工具名集合（就地移除 SendMessage；null 容忍）
+     * @param modelMapper    模型 mapper（null → 保守剔除直发，vision 语义）
+     * @param providerMapper 提供商 mapper（null → 保守剔除直发，vision 语义）
+     * @param modelName      当前生效模型名（可 null）
+     */
+    static void exemptSendMessageDeferForOpenAi(Set<String> deferred,
+            ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
+        if (deferred == null || !deferred.contains(
+                com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME)) {
+            return;
+        }
+        if (modelMapper == null || providerMapper == null) {
+            // vision 语义：mapper 未注入无法判 provider → 保守直发（不赌模型会 ToolSearch 激活）
+            deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME);
+            return;
+        }
+        if (ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)) {
+            return; // anthropic 保留懒加载（tool_reference 激活，对齐 CC defer）
+        }
+        // 非 anthropic（openai 兼容/deepseek/moonshot/未来 response）→ 恒在初始 schema
+        deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME);
+        if (log.isDebugEnabled()) {
+            log.debug("llmToolsArray: SendMessage 从 deferred 豁免（非 anthropic 始终加载，"
+                + "与 vision/WebSearch 同因：openai 兼容模型无 tool_reference，deferred 工具会从初始 "
+                + "schema 被剔，模型不自知无法发消息）");
+        }
+    }
+
+    /**
+     * 通用懒加载豁免 · [2026-09-08 用户拍板] 非 anthropic（openai 系）清空整个 deferred 集合。
+     *
+     * <p><b>WHY</b>：defer 工具的前提 = 模型能经 ToolSearch/tool_reference 激活被剔工具（CC
+     * anthropic 语义，tool_search beta 通道）。openai 兼容模型（deepseek/fz/moonshot）无
+     * tool_reference → {@code filterToolsForSchema} 把 deferred 剔出初始 schema 后模型不自知存在、
+     * 也不会主动 ToolSearch 搜索 → 对模型<b>工具不存在</b>。逐工具白名单豁免（vision/WebSearch/
+     * SendMessage）逐批漏网 —— EnterWorktree/ExitWorktree {@code shouldDefer=true}（对齐 CC）即中招：
+     * 用户实测叫它建 worktree，它用 {@code bash git worktree add} 兜底（看不到 EnterWorktree）。故
+     * 通用化：openai 下<b>所有</b> deferred 工具全部 schema 直发（不赌模型会搜索），一劳永逸。
+     *
+     * <p>anthropic（有 tool_reference 能激活）保留懒加载省 token，对齐 CC。
+     *
+     * <p><b>判定</b>：mapper null（4 参旧签名无法判 provider）→ 不豁免（保持懒，旧契约不变，同
+     * WebSearch 语义；llmToolsArray 主装配路径恒带 mapper）。
+     *
+     * @param deferred       deferred 工具名集合（原地 clear；null / 空容忍）
+     * @param modelMapper    模型 mapper（null → 不豁免，保持 deferred）
+     * @param providerMapper 提供商 mapper（null → 不豁免，保持 deferred）
+     * @param modelName      当前生效模型名（可 null）
+     */
+    static void exemptAllDeferredForOpenAi(Set<String> deferred,
+            ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
+        if (deferred == null || deferred.isEmpty()) {
+            return; // 空集 / null → no-op（装配容忍）
+        }
+        if (modelMapper == null || providerMapper == null) {
+            return; // 无法判 provider → 保持既有懒加载（4 参旧签名契约，同 WebSearch 语义）
+        }
+        if (ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)) {
+            return; // anthropic 保留懒加载（tool_reference 激活，对齐 CC defer）
+        }
+        // 非 anthropic（openai_compatible/openai_sdk/未来 response）→ 全部 schema 直发
+        if (log.isDebugEnabled()) {
+            log.debug("llmToolsArray: 非 anthropic 通用懒加载豁免，deferred {} 个工具全部 schema 直发"
+                + "（openai 兼容模型无 tool_reference，被剔工具对模型不存在——含 EnterWorktree/"
+                + "ExitWorktree）", deferred.size());
+        }
+        deferred.clear();
     }
 
     /**

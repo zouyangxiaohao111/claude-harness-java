@@ -43,6 +43,9 @@ public class ProjectService {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectService.class);
 
+    /** 原始字节读取上限（100MB · 防 readAllBytes OOM） */
+    private static final long RAW_FILE_MAX_BYTES = 100L * 1024 * 1024;
+
     @Autowired private ProjectMapper projectMapper;
 
     /**
@@ -167,6 +170,40 @@ public class ProjectService {
         } catch (IOException e) {
             log.warn("writeFile: 写入失败 project={} path={} err={}", id, relativePath, e.getMessage());
             throw new NotFoundException("文件写入失败");
+        }
+    }
+
+    /** 读取项目内文件原始字节（docx 等二进制预览 · 防路径穿越同 readFile · 上限 100MB 防 OOM）。 */
+    public byte[] readFileBytes(String id, String relativePath) {
+        ProjectRecord p = projectMapper.selectOneById(id);
+        if (p == null) throw new NotFoundException("Project " + id + " not found");
+        String projectPath = p.getPath();
+        if (projectPath == null || projectPath.isBlank()) {
+            throw new NotFoundException("Project " + id + " 无 path");
+        }
+        if (relativePath == null || relativePath.isBlank()) {
+            throw new NotFoundException("文件路径为空");
+        }
+        Path root = Paths.get(projectPath).toAbsolutePath().normalize();
+        Path resolved = resolveProjectFile(root, relativePath);
+        if (!Files.isRegularFile(resolved)) {
+            log.warn("readFileBytes: 非文件 project={} path={}", id, relativePath);
+            throw new NotFoundException("文件不存在或不可读");
+        }
+        try {
+            long size = Files.size(resolved);
+            if (size > RAW_FILE_MAX_BYTES) {
+                log.warn("readFileBytes: 文件过大拒绝 project={} path={} size={}", id, relativePath, size);
+                throw new ValidationException("文件超过 " + (RAW_FILE_MAX_BYTES / 1024 / 1024) + "MB 上限，无法预览");
+            }
+            byte[] bytes = Files.readAllBytes(resolved);
+            if (log.isDebugEnabled()) {
+                log.debug("readFileBytes: project={} path={} size={}", id, relativePath, bytes.length);
+            }
+            return bytes;
+        } catch (IOException e) {
+            log.warn("readFileBytes: 读取失败 project={} path={} err={}", id, relativePath, e.getMessage());
+            throw new NotFoundException("文件读取失败");
         }
     }
 

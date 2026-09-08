@@ -507,14 +507,22 @@ public class ClaudemdEngine {
 
         // 7. Team memory entrypoint · feature('TEAMMEM') 门控
         if (bool(teamMemoryEnabled) && memoryFileDetection.isTeamMemoryEnabled()) {
-            MemoryFileInfo entry = safelyReadEntrypoint(
-                Paths.get(memoryFileDetection.getTeamMemPath(), "MEMORY.md").toString(),
-                ClaudemdMemoryType.TEAM_MEM);
-            if (entry != null) {
-                String normalized = normalizeForComparison(entry.path());
-                if (!processedPaths.contains(normalized)) {
-                    processedPaths.add(normalized);
-                    result.add(entry);
+            // A′: 无有效项目 → team 目录不存在（getTeamMemPath()==null）→ 跳过（不拼 null 进 Paths.get）
+            String teamMemDir = memoryFileDetection.getTeamMemPath();
+            if (teamMemDir == null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[ClaudemdEngine] 无有效项目，team memory 目录不存在，跳过 TeamMem entrypoint");
+                }
+            } else {
+                MemoryFileInfo entry = safelyReadEntrypoint(
+                    Paths.get(teamMemDir, "MEMORY.md").toString(),
+                    ClaudemdMemoryType.TEAM_MEM);
+                if (entry != null) {
+                    String normalized = normalizeForComparison(entry.path());
+                    if (!processedPaths.contains(normalized)) {
+                        processedPaths.add(normalized);
+                        result.add(entry);
+                    }
                 }
             }
         }
@@ -1593,8 +1601,12 @@ public class ClaudemdEngine {
             case LOCAL -> Paths.get(originalCwdSupplier.get(), "CLAUDE.local.md").toString();
             case PROJECT -> Paths.get(originalCwdSupplier.get(), "CLAUDE.md").toString();
             case MANAGED -> Paths.get(ClaudePaths.getManagedFilePath(), "CLAUDE.md").toString();
-            case AUTO_MEM -> autoMemPaths.getAutoMemEntrypoint();
-            case TEAM_MEM -> Paths.get(memoryFileDetection.getTeamMemPath(), "MEMORY.md").toString();
+            case AUTO_MEM -> autoMemPaths.getAutoMemEntrypoint();   // A′: 无有效项目 → null
+            case TEAM_MEM -> {
+                // A′: 无有效项目 → team 目录不存在 → null（不拼 null 进 Paths.get）
+                String teamMemDir = memoryFileDetection.getTeamMemPath();
+                yield teamMemDir == null ? null : Paths.get(teamMemDir, "MEMORY.md").toString();
+            }
         };
     }
 

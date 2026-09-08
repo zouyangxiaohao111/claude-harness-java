@@ -57,7 +57,7 @@ interface ProblemJson {
   message?: string
 }
 
-async function parseProblem(res: Response): Promise<ApiError> {
+export async function parseProblem(res: Response): Promise<ApiError> {
   let body: ProblemJson = {}
   try {
     body = (await res.json()) as ProblemJson

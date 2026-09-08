@@ -199,7 +199,7 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
   // ---- V54 · 压缩数值配置组（11 项 · 空 = null 回落后端默认 · 走 buildCompressionDto 写整 DTO null 不覆盖）----
   type CompactNumberKey = 'cachedMicrocompactTriggerThreshold' | 'cachedMicrocompactKeepRecent' | 'smMinTokens' | 'smMinTextBlockMessages' | 'smMaxTokens' | 'smMinimumMessageTokensToInit' | 'smMinimumTokensBetweenUpdate' | 'smToolCallsBetweenUpdates' | 'maxConsecutiveAutocompactFailures' | 'maxPtlRetries' | 'maxCompactStreamingRetries' | 'snipNudgeThreshold'
   const COMPACT_NUMBERS: { key: CompactNumberKey; name: string; desc: string; defaultValue: number | null; domain: CompactDomainKey }[] = [
-    { key: 'snipNudgeThreshold', name: 'Snip 提示消息数阈值', desc: '消息数达到该值提示模型考虑 Snip 压缩；留空按上下文窗口自适应（1M→150 / 512k→100 / 400k→60 / 200k→30）', defaultValue: null, domain: 'snip' },
+    { key: 'snipNudgeThreshold', name: 'Snip 提示消息数阈值', desc: '消息数达到该值提示模型考虑 Snip 压缩；留空按上下文窗口自适应（1M→450 / 512k→300 / 400k→180 / 200k→90）', defaultValue: null, domain: 'snip' },
     { key: 'cachedMicrocompactTriggerThreshold', name: '缓存微压缩触发阈值', desc: '活跃工具结果超过该阈值触发缓存微压缩', defaultValue: 10, domain: 'microMc' },
     { key: 'cachedMicrocompactKeepRecent', name: '缓存微压缩保留数', desc: '触发时保留最近 N 个工具结果', defaultValue: 5, domain: 'microMc' },
     { key: 'smMinTokens', name: 'SM 保留尾段最小 token 数', desc: '会话记忆压缩保留尾段的最小 token 数', defaultValue: 10000, domain: 'sm' },

@@ -305,7 +305,18 @@ public class MemoryPrefetcher {
             }
         }
         // CC :2213 dirs = memoryDirs.length > 0 ? memoryDirs : [getAutoMemPath()]
-        return dirs.isEmpty() ? List.of(Path.of(autoMemPaths.getAutoMemPath())) : dirs;
+        if (!dirs.isEmpty()) {
+            return dirs;
+        }
+        String autoMem = autoMemPaths.getAutoMemPath();
+        // A′: 无有效项目（config-home 回落）→ auto-memory per-project 目录不存在 → 空检索目录（跳过预取）
+        if (autoMem == null) {
+            if (log.isDebugEnabled()) {
+                log.debug("[MemoryPrefetcher] resolveMemoryDirs 无有效项目（auto-memory 目录不存在），返回空检索目录");
+            }
+            return List.of();
+        }
+        return List.of(Path.of(autoMem));
     }
 
     /**

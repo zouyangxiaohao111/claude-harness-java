@@ -184,6 +184,10 @@ public final class TeamMemPaths {
      */
     public String getTeamMemPath() {
         String autoMem = autoMemPaths.getAutoMemPath();
+        // A′: 无有效项目 → auto-memory 目录不存在 → team 子目录亦不存在（返回 null，调用方跳过）
+        if (autoMem == null) {
+            return null;
+        }
         return ClaudePaths.normalizeNfc(autoMem + "team" + java.io.File.separator);
     }
 
@@ -192,7 +196,9 @@ public final class TeamMemPaths {
      * = join(getAutoMemPath(), 'team', 'MEMORY.md')。
      */
     public String getTeamMemEntrypoint() {
-        return Paths.get(autoMemPaths.getAutoMemPath(), "team", "MEMORY.md").toString();
+        String teamMem = getTeamMemPath();
+        // A′: 无有效项目 → team 目录不存在 → entrypoint 不存在（返回 null）
+        return teamMem == null ? null : Paths.get(teamMem, "MEMORY.md").toString();
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -280,10 +286,15 @@ public final class TeamMemPaths {
      * <p>前缀攻击防护：要求前缀后跟分隔符，/foo/team-evil 不匹配 /foo/team。
      */
     public boolean isRealPathWithinTeamDir(String realCandidate) throws IOException {
+        String teamMemPath = getTeamMemPath();
+        // A′: 无有效项目 → 无 team 目录 → 无法验证包含（fail-closed 返回 false）
+        if (teamMemPath == null) {
+            return false;
+        }
         Path realTeamDir;
         try {
             // getTeamMemPath() 带尾分隔符；realpath 在某些平台拒绝尾分隔符 → 先 strip
-            realTeamDir = Paths.get(stripTrailingSeparators(getTeamMemPath())).toRealPath();
+            realTeamDir = Paths.get(stripTrailingSeparators(teamMemPath)).toRealPath();
         } catch (NoSuchFileException e) {
             // team 目录不存在 —— symlink 逃逸不可能，跳过检查
             return true;
@@ -340,6 +351,10 @@ public final class TeamMemPaths {
         // 同为原生分隔符 → 直比较即可（不再 toComparable 小写折叠）。
         String resolvedPath = Paths.get(filePath).toAbsolutePath().normalize().toString();
         String teamDir = getTeamMemPath();
+        // A′: 无有效项目 → 无 team 目录 → 任何路径都不在 team 内
+        if (teamDir == null) {
+            return false;
+        }
         return resolvedPath.startsWith(teamDir);
     }
 
@@ -357,6 +372,10 @@ public final class TeamMemPaths {
         // 第一遍：normalize .. 段 + 字符串级包含检查（先于碰文件系统的快速拒绝）
         String resolvedPath = Paths.get(filePath).toAbsolutePath().normalize().toString();
         String teamDir = getTeamMemPath();
+        // A′: 无有效项目 → 无 team 目录 → 无可写目标（fail-closed）
+        if (teamDir == null) {
+            throw new PathTraversalError("No team memory directory configured (no auto memory / no project)");
+        }
         // 前缀攻击防护：teamDir 以 sep 结尾，team-evil/ 不匹配 team/
         if (!resolvedPath.startsWith(teamDir)) {
             throw new PathTraversalError("Path escapes team memory directory: \"" + filePath + "\"");
@@ -380,6 +399,10 @@ public final class TeamMemPaths {
     public String validateTeamMemKey(String relativeKey) throws IOException {
         sanitizePathKey(relativeKey);
         String teamDir = getTeamMemPath();
+        // A′: 无有效项目 → 无 team 目录 → 无可写目标（fail-closed）
+        if (teamDir == null) {
+            throw new PathTraversalError("No team memory directory configured (no auto memory / no project)");
+        }
         String fullPath = Paths.get(teamDir).resolve(relativeKey).toString();
         // 第一遍：normalize .. 段 + 字符串级包含检查
         String resolvedPath = Paths.get(fullPath).toAbsolutePath().normalize().toString();

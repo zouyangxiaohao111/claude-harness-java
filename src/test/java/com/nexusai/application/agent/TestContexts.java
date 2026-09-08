@@ -19,6 +19,7 @@ import org.mockito.Mockito;
 import java.util.List;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.when;
 
@@ -176,7 +177,13 @@ public final class TestContexts {
         TokenEstimator te = Mockito.mock(TokenEstimator.class);
         // IMP-17 后 blocking 预检测量走 tokenCountWithEstimation（CC query.ts:637 usage-walk），
         // mock 固定返回 tokenUsage 驱动「估算超窗 → 拦截」意图。
+        // [blocking-stub-2arg 2026-09-08] LlmAgentLoop:5528 blocking 预检调「两参」重载
+        //   tokenCountWithEstimation(messagesForQuery, anthropic)（TokenEstimator:139，anthropic 分派
+        //   4 项和 vs 3 项——deepseek cache 去重），单参 stub 不匹配 → mock 返回 0 → tokenUsage=0
+        //   恒不及 blockingLimit → 预检静默失效（b6BlockingWindow / BlockingLimitTest pre-existing 红
+        //   根因）。两参 stub 一并补（单参 stub 保留：estimateMessageTokens 消费方仍走单参重载）。
         when(te.tokenCountWithEstimation(anyList())).thenReturn(tokenUsage);
+        when(te.tokenCountWithEstimation(anyList(), anyBoolean())).thenReturn(tokenUsage);
         ModelMapper modelMapper = Mockito.mock(ModelMapper.class);
         ModelRecord model = new ModelRecord();
         model.setProviderId("p1");

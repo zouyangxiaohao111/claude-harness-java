@@ -347,10 +347,13 @@ public final class MemoryFileDetection {
         // auto-memory 路径 override 检查（CC :177-187）
         if (autoMemoryEnabled.getAsBoolean()) {
             String autoMemPath = autoMemPaths.getAutoMemPath();
-            String autoMemDirCmp = toComparable(stripTrailing(autoMemPath));
-            String autoMemPathCmp = toComparable(autoMemPath);
-            if (normalizedCmp.equals(autoMemDirCmp) || normalizedCmp.startsWith(autoMemPathCmp)) {
-                return true;
+            // A′: 无有效项目 → 无 auto-memory 目录 → 不命中（跳过该子判定）
+            if (autoMemPath != null) {
+                String autoMemDirCmp = toComparable(stripTrailing(autoMemPath));
+                String autoMemPathCmp = toComparable(autoMemPath);
+                if (normalizedCmp.equals(autoMemDirCmp) || normalizedCmp.startsWith(autoMemPathCmp)) {
+                    return true;
+                }
             }
         }
         // configDir / memoryBaseDir 下的 session/projects/memory 目录（CC :189-206）
@@ -429,8 +432,14 @@ public final class MemoryFileDetection {
         // 决策 D1/D3：claude 配置根纳入快速检查（D3 transcript 读回落，命令提及 ~/.claude 亦命中）
         String claudeConfigDir = ClaudePaths.getClaudeConfigHomeDir();
         String memoryBase = autoMemPaths.getMemoryBaseDir();
-        String autoMemDir = autoMemoryEnabled.getAsBoolean()
-            ? stripTrailing(autoMemPaths.getAutoMemPath()) : "";
+        // A′: 无有效项目 → 无 auto-memory 目录 → 空串（不参与命令快速命中判定）
+        String autoMemDir = "";
+        if (autoMemoryEnabled.getAsBoolean()) {
+            String autoMem = autoMemPaths.getAutoMemPath();
+            if (autoMem != null) {
+                autoMemDir = stripTrailing(autoMem);
+            }
+        }
 
         // 快速检查：命令是否提及 config / memoryBase / auto-mem 目录（CC :222-241）
         String commandCmp = toComparable(command);

@@ -79,6 +79,46 @@ class AutoMemPathsTest {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // A′: config-home 永不作为 per-project auto-memory 项目根
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("A′: projectRoot == memoryBase（config-home 回落形态）→ getAutoMemPath/getAutoMemBase 返回 null，禁止派生假项目目录")
+    void getAutoMemPath_memoryBaseAsProjectRoot_returnsNull(@TempDir Path memoryBase) {
+        // WHY: 无绑定回合把配置主目录当「项目」→ 派生 projects/sanitize(configHome)/memory 假目录
+        //      （生产实测 feedback 写进 ~/.nexusai/projects/C--Users-WIN--nexusai/memory）。A′ 在
+        //      per-project 路径层拦截：projectRoot==memoryBase → 无有效项目 → null（调用方跳过）。
+        AutoMemPaths paths = paths(memoryBase.toString(), memoryBase.toString(), null, null);
+
+        assertThat(paths.getAutoMemPath())
+            .as("projectRoot==memoryBase → per-project auto 记忆路径不存在（null）")
+            .isNull();
+        assertThat(paths.getAutoMemBase())
+            .as("projectRoot==memoryBase → per-project auto 记忆基路径不存在（null）")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("A′: projectRoot == config-home（ThreadLocal 回落）→ defaultInstance.getAutoMemPath() 返回 null")
+    void getAutoMemPath_configHomeAsProjectRoot_returnsNull(@TempDir Path configHome) {
+        // WHY: 生产 defaultInstance 的 supplier = currentSessionProjectRoot()，无 ThreadLocal 注入时
+        //      回落 config-home。若 getAutoMemPath 仍拼 projects/sanitize(configHome)/memory 即缺陷 A
+        //      复现；A′ 使 config-home 作项目根时返回 null（memory 域 skip）。
+        NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+        BundledSkillEnabledGates.bridgeSettingsMapper(null);   // 清 DB 桥接泄漏（settings 链回落 null）
+        AutoMemPaths.setCurrentProjectRoot(configHome.toString());
+        try {
+            AutoMemPaths paths = AutoMemPaths.defaultInstance();
+            assertThat(paths.getAutoMemPath())
+                .as("config-home 自身不能作为 per-project 项目根 → null")
+                .isNull();
+        } finally {
+            AutoMemPaths.setCurrentProjectRoot(null);
+            NexusaiPaths.setConfigHomeDirOverride(null);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // 2. override / settings 链
     // ════════════════════════════════════════════════════════════════
 

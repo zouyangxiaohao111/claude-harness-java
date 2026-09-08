@@ -4,6 +4,8 @@ import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import { BASE_URL } from '@/api/rest'
 import { usePreviewStore, type PreviewTab } from '@/stores/previewStore'
 import { openStandaloneHtml } from '@/utils/htmlStandalone'
+import { isDocxName, isXlsxName } from '@/utils/fileType'
+import { ExcelPreview } from './ExcelPreview'
 
 // pdf.js worker 单例（vite `?worker` 端口方式 · `?url` 的 ESM worker 在 dev 不可靠会白屏）
 let pdfWorkerPort: Worker | null = null
@@ -149,13 +151,16 @@ function PdfPreview({ url }: { url: string }) {
 export function RightPreview({ preview }: { preview: PreviewTab }) {
   const close = usePreviewStore((s) => s.close)
   const item = preview.kind === 'attachment' ? preview.item : undefined
-  const isDocx = !!item && /\.docx$/i.test(item.filename)
+  const isDocx = !!item && isDocxName(item.filename)
   const isPdf = !!item && (item.type === 'pdf' || /\.pdf$/i.test(item.filename))
+  const isXlsx = !!item && isXlsxName(item.filename)
 
   const [playUrl, setPlayUrl] = useState<string | null>(null)
-  const [docxLoading, setDocxLoading] = useState(false)
+  const [docxLoading, setDocxLoading] = useState(true)
   const [docxErr, setDocxErr] = useState<string | null>(null)
   const docxBoxRef = useRef<HTMLDivElement>(null)
+  const [xlsxBytes, setXlsxBytes] = useState<Uint8Array | null>(null)
+  const [xlsxErr, setXlsxErr] = useState<string | null>(null)
 
   const readLocal = async (p: string): Promise<Uint8Array> => {
     const { readFile } = await import('@tauri-apps/plugin-fs')
@@ -163,9 +168,9 @@ export function RightPreview({ preview }: { preview: PreviewTab }) {
   }
   const backendUrl = (u: string) => (u.startsWith('http') ? u : `${BASE_URL}${u}`)
 
-  // 附件非 docx → playUrl（path 本地 blob / base64 dataURL / url 后端）
+  // 附件非 docx/xlsx → playUrl（path 本地 blob / base64 dataURL / url 后端）
   useEffect(() => {
-    if (!item || isDocx) return
+    if (!item || isDocx || isXlsx) return
     let cancelled = false
     let localUrl: string | null = null
     if (item.path) {
@@ -178,7 +183,7 @@ export function RightPreview({ preview }: { preview: PreviewTab }) {
       setPlayUrl(backendUrl(item.url))
     } else setPlayUrl(null)
     return () => { cancelled = true; if (localUrl) URL.revokeObjectURL(localUrl) }
-  }, [item, isDocx])
+  }, [item, isDocx, isXlsx])
 
   // docx → docx-preview 渲染
   useEffect(() => {
@@ -212,6 +217,34 @@ export function RightPreview({ preview }: { preview: PreviewTab }) {
     return () => { cancelled = true }
   }, [item, isDocx])
 
+  // xlsx → 解析字节（path 本地读 / base64 / url 后端）交给 ExcelPreview
+  useEffect(() => {
+    if (!item || !isXlsx) return
+    let cancelled = false
+    setXlsxBytes(null)
+    setXlsxErr(null)
+    const run = async () => {
+      try {
+        let bytes: Uint8Array
+        if (item.path) bytes = await readLocal(item.path)
+        else if (item.base64) {
+          const bin = atob(item.base64)
+          bytes = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+        } else if (item.url) {
+          const res = await fetch(backendUrl(item.url))
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          bytes = new Uint8Array(await res.arrayBuffer())
+        } else throw new Error('附件内容不可用')
+        if (!cancelled) setXlsxBytes(bytes)
+      } catch (e) {
+        if (!cancelled) setXlsxErr(e instanceof Error ? e.message : String(e))
+      }
+    }
+    void run()
+    return () => { cancelled = true }
+  }, [item, isXlsx])
+
   return (
     <div className="rp-wrap">
       <div className="rp-head">
@@ -243,11 +276,13 @@ export function RightPreview({ preview }: { preview: PreviewTab }) {
         ) : isPdf && playUrl ? (
           <PdfPreview url={playUrl} />
         ) : isDocx ? (
-          docxLoading
-            ? <div className="rp-hint">Word 渲染中…</div>
-            : docxErr
-              ? <div className="rp-err">Word 渲染失败：{docxErr}</div>
-              : <div ref={docxBoxRef} className="rp-docx" />
+          <div className="rp-docx">
+            {docxLoading && <div className="rp-docx-overlay">Word 渲染中…</div>}
+            {docxErr && <div className="rp-docx-overlay rp-err">Word 渲染失败：{docxErr}</div>}
+            <div ref={docxBoxRef} className="rp-docx-body" />
+          </div>
+        ) : isXlsx ? (
+          <ExcelPreview bytes={xlsxBytes} error={xlsxErr} />
         ) : (
           <div className="rp-err">
             附件内容不可用（local-read 请确认本地文件存在；F5 重拉需后端内容端点）

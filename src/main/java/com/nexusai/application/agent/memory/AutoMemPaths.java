@@ -152,6 +152,9 @@ public final class AutoMemPaths {
 
     private static final String SEP = java.io.File.separator;
     private static final char BACKSLASH = '\\';
+    /** A′: Windows 路径比较大小写不敏感（config-home 回落值恒为同源生成，跨盘符不涉及）。 */
+    private static final boolean IS_WINDOWS =
+        System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
 
     private final Supplier<String> projectRootSupplier;
     private final Supplier<String> memoryBaseDirSupplier;
@@ -396,6 +399,63 @@ public final class AutoMemPaths {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // A′: per-project auto-memory 项目根有效性判定（config-home 永不作为项目身份）
+    // ════════════════════════════════════════════════════════════════
+
+    /**
+     * A′ 判定：projectRoot 是否可作为 per-project auto-memory 的「有效项目」。
+     *
+     * <p><b>缺陷根因</b>：无绑定/回落场景会把配置主目录（{@code ~/.nexusai}）当「项目」派生
+     * slug（{@code projects/C--Users-WIN--nexusai/memory}）—— feedback 等 auto 记忆被写进
+     * config-home 自身（生产实测 MemoryStorage A1 修复同源）。处理放在 memory per-project
+     * 路径层（<b>不改</b> {@link #currentSessionProjectRoot()} 对外契约，它有 12 处调用方）：
+     * <ul>
+     *   <li>projectRoot null/blank → 无效；</li>
+     *   <li>normalize 后与 {@link #getMemoryBaseDir()}（memoryBase）相等 → 无效；</li>
+     *   <li>normalize 后与 {@link NexusaiPaths#getAppConfigHomeDir()}（config home）相等 → 无效。</li>
+     * </ul>
+     *
+     * <p><b>[决策 2026-09-08] DB 主路径解析在上游完成</b>：auto-memory 目录的主路径 = 会话绑定项目
+     * （LlmAgentLoop.run() 入口 resolveSessionProjectRoot → tryResolveBoundProjectFromDb：
+     * {@code sessions.main_project_id → projects.path}，成功注入 ThreadLocal）。本方法是路径层
+     * 纯防御（null/blank/config-home/memoryBase 永不拼接）——走到 null 只表示「上游无有效项目」，
+     * 不是本方法负责去查 DB。调用方（MemoryPromptBuilder/LlmAgentLoop 守卫）据此 fail loud。
+     *
+     * @param projectRoot 候选项目根（可能来自回落链的 config-home）
+     * @return false = 无有效项目（getAutoMemPath/getAutoMemBase 应返回 null，禁止拼 config-home）
+     */
+    private boolean isEligibleProjectRoot(String projectRoot) {
+        if (projectRoot == null || projectRoot.isBlank()) {
+            return false;
+        }
+        return !isSameDirectory(projectRoot, getMemoryBaseDir())
+            && !isSameDirectory(projectRoot, NexusaiPaths.getAppConfigHomeDir());
+    }
+
+    /** 路径是否指向同一目录（absolute+normalize 后比对；Windows 大小写折叠）。 */
+    private static boolean isSameDirectory(String a, String b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        try {
+            String na = comparablePath(a);
+            String nb = comparablePath(b);
+            if (na.equals(nb)) {
+                return true;
+            }
+            return IS_WINDOWS && na.equalsIgnoreCase(nb);
+        } catch (Exception e) {
+            // 非法路径（InvalidPathException 等）→ 按字符串直比兜底
+            return a.equals(b) || (IS_WINDOWS && a.equalsIgnoreCase(b));
+        }
+    }
+
+    /** 去尾分隔符 + absolute + normalize，产出可稳定比对的路径形态。 */
+    private static String comparablePath(String p) {
+        return java.nio.file.Paths.get(stripTrailingSeparators(p)).toAbsolutePath().normalize().toString();
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // getAutoMemBase / getAutoMemPath · paths.ts:203-235
     // ════════════════════════════════════════════════════════════════
 
@@ -422,10 +482,19 @@ public final class AutoMemPaths {
      * 直接传（LlmAgentLoop 会话线程用 boundProject 解析 → 传 extract/dream fork 消费）。
      *
      * @param explicitProjectRoot 会话绑定 projectRoot（boundProject/originalCwd；null → NFC 空回落）
-     * @return canonical git root（可得时），否则 NFC(explicitProjectRoot)
+     * @return canonical git root（可得时），否则 NFC(explicitProjectRoot)；
+     *         无有效项目（null/blank/config-home/memoryBase）→ null（A′）
      */
     public String getAutoMemBase(String explicitProjectRoot) {
         String projectRoot = explicitProjectRoot;
+        // A′: 无有效项目（null/blank/config-home/memoryBase）→ per-project auto 记忆基路径不存在
+        if (!isEligibleProjectRoot(projectRoot)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[AutoMemPaths] getAutoMemBase 无有效项目（null/blank/config-home），返回 null: rawRoot={}",
+                    explicitProjectRoot);
+            }
+            return null;
+        }
         String canonical = findCanonicalGitRoot(projectRoot);
         if (canonical != null) {
             if (log.isDebugEnabled()) {
@@ -446,7 +515,8 @@ public final class AutoMemPaths {
      * 方法</b>（无 ThreadLocal 回落 config-home）—— 改由调用方在会话线程按显式 projectRoot 调
      * 重载后传参（对齐 CC extractMemories.ts:339 runExtraction 先 getAutoMemPath 再 fork）。
      *
-     * @return 带唯一尾分隔符的 auto-memory 目录
+     * @return 带唯一尾分隔符的 auto-memory 目录；无有效项目（config-home 回落，无 override/settings）
+     *         → null（A′，per-project auto 记忆不存在）
      */
     public String getAutoMemPath() {
         return getAutoMemPath(projectRootSupplier.get());
@@ -471,7 +541,8 @@ public final class AutoMemPaths {
      * 每条 tool-use 消息触发多次；keyed on projectRoot 使测试 mock 变更时重算，env/settings 会话稳定。
      *
      * @param explicitProjectRoot 会话绑定 projectRoot（boundProject/originalCwd；null → 按空解析）
-     * @return 带唯一尾分隔符的 auto-memory 目录
+     * @return 带唯一尾分隔符的 auto-memory 目录；无有效项目（null/blank/config-home/memoryBase，
+     *         且无 override/settings）→ null（A′，per-project auto 记忆不存在）
      */
     public String getAutoMemPath(String explicitProjectRoot) {
         String projectRoot = explicitProjectRoot;
@@ -493,6 +564,17 @@ public final class AutoMemPaths {
                 log.debug("[AutoMemPaths] getAutoMemPath 使用 override/settings 路径: {}", override);
             }
             return cachePut(projectRoot, override);
+        }
+        // A′: 走到 per-project 默认派生前，projectRoot 必须是有效项目（null/blank/config-home/memoryBase
+        //   → 无项目）。config-home 回落恒发生在无绑定/异步线程回合，派生会产出
+        //   <memoryBase>/projects/C--Users-WIN--nexusai/memory 假目录 → 在此拦截返回 null
+        //   （调用方跳过 auto 记忆分支；不写缓存 —— CHM 禁 null 值，null 不缓存）。
+        if (!isEligibleProjectRoot(projectRoot)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[AutoMemPaths] getAutoMemPath 无有效项目（null/blank/config-home），返回 null（per-project auto 记忆不存在）: rawRoot={}",
+                    explicitProjectRoot);
+            }
+            return null;
         }
         String projectsDir = Paths.get(getMemoryBaseDir(), "projects").toString();
         // OPD-R2-06：CC paths.ts:232 (...+sep).normalize('NFC')
@@ -518,7 +600,9 @@ public final class AutoMemPaths {
      * 与 getAutoMemPath 同解析顺序。
      */
     public String getAutoMemEntrypoint() {
-        return Paths.get(getAutoMemPath(), AUTO_MEM_ENTRYPOINT_NAME).toString();
+        String autoMem = getAutoMemPath();
+        // A′: 无有效项目 → auto-memory 目录不存在 → entrypoint 不存在（返回 null，调用方跳过）
+        return autoMem == null ? null : Paths.get(autoMem, AUTO_MEM_ENTRYPOINT_NAME).toString();
     }
 
     /**
@@ -526,10 +610,15 @@ public final class AutoMemPaths {
      * 形状：{@code <autoMemPath>/logs/YYYY/MM/YYYY-MM-DD.md}（KAIROS assistant 模式 append 用）。
      */
     public String getAutoMemDailyLogPath(LocalDate date) {
+        String autoMem = getAutoMemPath();
+        // A′: 无有效项目 → 无 auto-memory 目录 → daily-log 路径不存在（返回 null，调用方跳过）
+        if (autoMem == null) {
+            return null;
+        }
         String yyyy = String.format("%04d", date.getYear());
         String mm = String.format("%02d", date.getMonthValue());
         String dd = String.format("%02d", date.getDayOfMonth());
-        return Paths.get(getAutoMemPath(), "logs", yyyy, mm, yyyy + "-" + mm + "-" + dd + ".md").toString();
+        return Paths.get(autoMem, "logs", yyyy, mm, yyyy + "-" + mm + "-" + dd + ".md").toString();
     }
 
     /**
@@ -561,7 +650,12 @@ public final class AutoMemPaths {
         if (normalizedPath == null) {
             return false;
         }
-        return normalizedPath.startsWith(getAutoMemPath());
+        String autoMem = getAutoMemPath();
+        // A′: 无有效项目 → 无 auto-memory 目录 → 任何路径都不在其内（返回 false）
+        if (autoMem == null) {
+            return false;
+        }
+        return normalizedPath.startsWith(autoMem);
     }
 
     // ════════════════════════════════════════════════════════════════

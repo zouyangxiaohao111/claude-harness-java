@@ -1,4 +1,4 @@
-import { api } from './rest'
+import { api, BASE_URL, parseProblem } from './rest'
 import type { SessionDto } from './types'
 import type { Project } from '@/types'
 
@@ -57,6 +57,12 @@ export const projectApi = {
   /** 项目文件内容（点击文件查看真实内容） */
   file: (id: string, path: string) =>
     api<FileContent>(`/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`),
+  /** 项目文件原始字节（docx/xlsx 等二进制预览 · 非2xx 归一为 ApiError · 返回 Response 由调用方取 arrayBuffer） */
+  raw: async (id: string, path: string) => {
+    const res = await fetch(`${BASE_URL}/projects/${encodeURIComponent(id)}/raw?path=${encodeURIComponent(path)}`)
+    if (!res.ok) throw await parseProblem(res)
+    return res
+  },
   /** 项目文件写入（Monaco 编辑保存 · PUT body 复用 FileContent.content） */
   write: (id: string, path: string, content: string) =>
     api<FileContent>(`/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`, { method: 'PUT', body: { content } }),
