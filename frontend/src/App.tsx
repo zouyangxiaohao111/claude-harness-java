@@ -839,7 +839,48 @@ function App() {
     showToast('已创建新会话', 'success')
   }, [sessionDispatch, showToast, setSessions, storeSessions, activeSession, activeSessionId, perSessionProjects, realProjects, defaultNewSessionModel])
 
-  // 本地文件夹选项目（Tauri 原生文件夹框 · 用户需求）→ 注册项目 + 绑定当前会话
+  /**
+   * 添加工作区（新项目工作组）：给已校验的绝对目录 → 注册/取项目 → 创建该项目首个会话并置顶左栏。
+   *
+   * <p>「欢迎页（无会话）绑定项目」与左栏「添加工作区 +」共用此路径——保证任一入口绑定目录后
+   * 左侧会话列表立即出现该项目（此前无会话分支只注册项目不建会话 → 左栏无变化，用户误以为没绑上）。
+   * <p>注册用后端 POST /projects 幂等（同 path 返回已有、不同 path 同名各自成行）——
+   * 不再按 name 前端猜复用，避免同名不同目录误配。
+   */
+  const openWorkspaceFromFolder = useCallback(async (absPath: string) => {
+    const folderName = absPath.split(/[\\/]/).pop() || absPath
+    // 注册/取项目（name=文件夹名，path=绝对路径；后端幂等）
+    let proj: ProjectDto
+    try {
+      proj = await projectApi.create({ name: folderName, path: normalizePath(absPath) })
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      return
+    }
+    const p: Project = { id: proj.id, name: proj.name, branch: proj.branch ?? '', dirty: proj.dirty ?? 0, agents: proj.agents ?? 0, path: proj.path ?? '' }
+    // 刷新真实项目缓存（置顶去重）
+    setRealProjects((prev) => (prev.some((x) => x.id === p.id) ? prev : [p, ...prev]))
+    // 创建该项目第一个会话（新工作组起点；不拦截——新工作组无空会话）
+    const pickFrom = defaultNewSessionModel
+    let created: SessionDto
+    try {
+      created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: p.id })
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      return
+    }
+    setSessions([created, ...storeSessions])
+    sessionDispatch({ type: 'SWITCH', sessionId: created.id })
+    sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
+    setPerSessionProjects((prev) => ({
+      ...prev,
+      [created.id]: { main: p, subs: [], expanded: {}, flashing: null },
+    }))
+    showToast(`已添加工作区 ${p.name}`, 'success')
+  }, [defaultNewSessionModel, showToast, sessionDispatch, setSessions, storeSessions])
+
+  // 本地文件夹选项目（Tauri 原生文件夹框 · 用户需求）：有会话 → 注册(幂等) + 绑定当前会话；
+  //   无会话（欢迎页空态）→ 等同「添加工作区」，自动建该目录首个会话显示到左栏
   const handleSelectProjectFolder = useCallback(async () => {
     // 会话已创建并对话后不能切换绑定目录
     if (activeSessionId) {
@@ -857,7 +898,12 @@ function App() {
       showToast('浏览器模式无法获取项目绝对路径，请使用桌面端选择文件夹', 'info')
       return
     }
-    // 注册项目（POST /projects，name=文件夹名，path=绝对路径）
+    if (!activeSessionId) {
+      // 无会话（欢迎页）：建工作区会话 → 左侧立即出现绑定项目
+      await openWorkspaceFromFolder(sel.path)
+      return
+    }
+    // 有会话（空新会话）：注册项目（幂等）→ 绑定当前会话
     let proj: ProjectDto
     const folderName = sel.path.split(/[\\/]/).pop() || sel.path
     try {
@@ -871,58 +917,26 @@ function App() {
       const p = { id: proj.id, name: proj.name, branch: proj.branch ?? '', dirty: proj.dirty ?? 0, agents: proj.agents ?? 0, path: proj.path ?? '' }
       return [p, ...prev.filter((x) => x.id !== proj.id)]
     })
-    // 绑定当前会话
-    if (activeSessionId) {
-      try {
-        const updated = await projectApi.bind(activeSessionId, { projectId: proj.id })
-        setSessions(useChatStore.getState().sessions.map((s) => (s.id === activeSessionId ? updated : s)))
-        showToast(`已绑定项目 ${proj.name}`, 'success')
-      } catch (e) {
-        showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
-      }
+    try {
+      const updated = await projectApi.bind(activeSessionId, { projectId: proj.id })
+      setSessions(useChatStore.getState().sessions.map((s) => (s.id === activeSessionId ? updated : s)))
+      showToast(`已绑定项目 ${proj.name}`, 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [activeSessionId, showToast, setSessions])
+  }, [activeSessionId, showToast, setSessions, openWorkspaceFromFolder])
 
-  // 添加工作区（新项目工作组）：本地选文件夹 → 注册项目 → 创建该项目首个会话（可添加多个）
+  // 添加工作区（新项目工作组）：选文件夹 → 走公共建工作区路径（可添加多个）
   const handleAddWorkspace = useCallback(async () => {
     const sel = await selectProjectFolder()
     if (!sel) return // 用户取消
-    // 同 handleSelectProjectFolder：非绝对路径拒绝（浏览器 dev 模式仅目录名）
+    // 非绝对路径拒绝（浏览器 dev 模式仅目录名，会污染会话 cwd）
     if (!isAbsolutePath(sel.path)) {
       showToast('浏览器模式无法获取项目绝对路径，请使用桌面端选择文件夹', 'info')
       return
     }
-    const folderName = sel.path.split(/[\\/]/).pop() || sel.path
-    // 查同名项目已存在则复用（避免 409）；否则注册
-    let proj = realProjects.find((p) => p.name === folderName)
-    if (!proj) {
-      try {
-        const created = await projectApi.create({ name: folderName, path: normalizePath(sel.path) })
-        proj = { id: created.id, name: created.name, branch: created.branch ?? '', dirty: created.dirty ?? 0, agents: created.agents ?? 0, path: created.path ?? '' }
-        setRealProjects((prev) => [proj!, ...prev])
-      } catch (e) {
-        showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
-        return
-      }
-    }
-    // 创建该项目第一个会话（新工作组起点；不拦截——新工作组无空会话）
-    const pickFrom = defaultNewSessionModel
-    let created: SessionDto
-    try {
-      created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: proj.id })
-    } catch (e) {
-      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
-      return
-    }
-    setSessions([created, ...storeSessions])
-    sessionDispatch({ type: 'SWITCH', sessionId: created.id })
-    sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
-    setPerSessionProjects((prev) => ({
-      ...prev,
-      [created.id]: { main: proj!, subs: [], expanded: {}, flashing: null },
-    }))
-    showToast(`已添加工作区 ${proj.name}`, 'success')
-  }, [realProjects, defaultNewSessionModel, showToast, sessionDispatch, setSessions, storeSessions])
+    await openWorkspaceFromFolder(sel.path)
+  }, [openWorkspaceFromFolder])
 
   // ---- per-session project handlers ----
   const updateSessionProject = useCallback(

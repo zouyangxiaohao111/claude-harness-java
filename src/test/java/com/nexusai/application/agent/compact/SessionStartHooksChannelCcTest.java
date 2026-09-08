@@ -119,6 +119,39 @@ class SessionStartHooksChannelCcTest {
     }
 
     @Test
+    @DisplayName("[session-start-cc-align P0-3] 多 result 均带 additionalContext → 恰 1 条 hook_additional_context（聚合单份）")
+    void multipleResultsWithAdditionalContext_aggregateSingleHook() {
+        // WHY: compact 通道必须单份——§14 的 DB 持久化 hook（P0-1）在 compact 时随旧 transcript 整体
+        //      被替换（replaceSessionMessages delete-all + reinsert）；compact 自插的这一条若按 result 逐条
+        //      追加会与"压缩后仅剩一份"冲突，需证明 processSessionStartHooks 把 N 个 result 的
+        //      additionalContext 聚合进 <b>1</b> 条 hook_additional_context（CC sessionStart.ts:163-172
+        //      也是把收集的 additionalContexts join 进单条附件消息）。压缩替换 transcript 后下 run resume
+        //      恢复出含本条的既有历史 → §14 resumedFromDb 门控（B 级对齐 CC startup 边界）跳过、不重注入
+        //      → 单份固定（防 P0-1 持久化 hook 与 compact 重插份并存；旧 anyMatch(subtype) 守卫已删，见
+        //      LlmAgentLoop :2691 注释）。
+        List<GenericHook.HookResult> results = List.of(
+            result("hook message 1", "附加上下文1", List.of("/path/a")),
+            result("hook message 2", "附加上下文2", null));
+        CompactConversationContext ctx = new CompactConversationContext()
+            .setSessionId("s1")
+            .setAgentId("main")
+            .setModel("claude-sonnet-4-5")
+            .setHookRegistry(registryReturning(results));
+
+        List<ChatMessageDto> hookMessages = CompactHooks.processSessionStartHooks(ctx);
+
+        List<ChatMessageDto> hooks = hookMessages.stream()
+            .filter(m -> "hook_additional_context".equals(m.subtype()))
+            .toList();
+        assertThat(hooks)
+            .as("N 个 result 的 additionalContext 必须聚合进恰 1 条 hook_additional_context（防两份并存）")
+            .hasSize(1);
+        assertThat(hooks.get(0).content())
+            .as("两条 result 的 additionalContext 以 \\n join（对齐 LlmAgentLoop §14 :2687-2688）")
+            .isEqualTo("附加上下文1\n附加上下文2");
+    }
+
+    @Test
     @DisplayName("△-5: 失败结果不进消息链、不聚合附加通道（CC executeSessionStartHooks 成功语义）")
     void failedResultsSkipped() {
         GenericHook.HookResult failed = new GenericHook.HookResult(

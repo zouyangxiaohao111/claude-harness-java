@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -275,11 +276,31 @@ public class ProjectService {
         return toDto(p);
     }
 
+    /**
+     * 注册项目（POST /api/v1/projects）。
+     *
+     * <p>[V69 · 对齐 CC 项目=目录] 幂等：以「目录绝对路径」判重（非 name）——
+     * 同路径已注册 → 直接复用返回（不重复 INSERT）。根治欢迎页/面板重复绑定同一目录撞
+     * projects.name UNIQUE → SQLite 500；不同目录同名（如 D:/a/proj 与 D:/b/proj）则各自成行并存
+     * （name 唯一约束已随 V69 迁至 path）。
+     *
+     * <p>[2026-08-24 cwd 污染修复 · 用户拍板源头根治] 项目路径恒绝对（对齐 CC getOriginalCwd 启动目录）：
+     *   前端可能传相对路径（如「抓包流程」）→ 转绝对 + 校验目录存在，否则绑定后 CwdResolution
+     *   返回无效 cwd 致 Bash/Glob/Read 全失败。CwdResolution/setForSession 校验保留为防御层。
+     *   [V69] DB 存储统一正斜杠绝对路径（Windows Path.toString 默认反斜杠 → 归一），
+     *   保证 path UNIQUE 字面一致生效 + 前端展示/日志友好。
+     */
     public ProjectDto register(ProjectCreateRequest req) {
-        // [2026-08-24 cwd 污染修复 · 用户拍板源头根治] 项目路径恒绝对（对齐 CC getOriginalCwd 启动目录）：
-        //   前端可能传相对路径（如「抓包流程」）→ 转绝对 + 校验目录存在，否则绑定后 CwdResolution
-        //   返回无效 cwd 致 Bash/Glob/Read 全失败。CwdResolution/setForSession 校验保留为防御层。
         String absPath = normalizeProjectPath(req.path());
+        // [V69] 幂等：同路径已注册 → 复用，不重复 insert
+        ProjectRecord existing = findExistingByPath(absPath);
+        if (existing != null) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ProjectService.register] 同路径项目已注册，复用（幂等）: id={} name={} path={}",
+                    existing.getId(), existing.getName(), existing.getPath());
+            }
+            return toDto(existing);
+        }
         ProjectRecord p = new ProjectRecord();
         p.setId(generateId("proj"));
         p.setName(req.name());
@@ -290,6 +311,9 @@ public class ProjectService {
         p.setLastIndexedAt(null);
         p.setBound(Boolean.FALSE);
         projectMapper.insert(p);
+        if (log.isDebugEnabled()) {
+            log.debug("[ProjectService.register] 注册新项目: id={} name={} path={}", p.getId(), req.name(), absPath);
+        }
         return toDto(p);
     }
 
@@ -303,11 +327,38 @@ public class ProjectService {
             if (!Files.isDirectory(abs)) {
                 throw new ValidationException("project directory does not exist: " + abs);
             }
-            return abs.toString();
+            // [V69] DB 存储统一正斜杠（Windows Path.toString 默认反斜杠 → 归一）→ path UNIQUE 字面一致
+            return abs.toString().replace('\\', '/');
         } catch (InvalidPathException e) {
             throw new ValidationException("invalid project path: " + path);
         }
     }
+
+    /**
+     * 按目录绝对路径查已注册项目（归一化比较：分隔符统一、去尾斜杠、Windows 忽略大小写）。
+     * 本地项目记录量小（< 百级），全量 selectAll + Java 归一化最鲁棒——避免 SQL 表达式
+     * 与历史 path 分隔符差异（\ 与 /）带来的漏判/重复 insert。
+     */
+    private ProjectRecord findExistingByPath(String absPath) {
+        String key = normalizePathKey(absPath);
+        for (ProjectRecord p : projectMapper.selectAll()) {
+            if (normalizePathKey(p.getPath()).equals(key)) {
+                return p;
+            }
+        }
+        return null;
+    }
+
+    /** 目录路径「同一性」键：trim + 分隔符统一 / + 去尾斜杠；Windows 大小写不敏感（盘符/目录）。 */
+    static String normalizePathKey(String path) {
+        if (path == null) return "";
+        String s = path.trim().replace('\\', '/');
+        while (s.endsWith("/") && s.length() > 1) s = s.substring(0, s.length() - 1);
+        return IS_WINDOWS ? s.toLowerCase(Locale.ROOT) : s;
+    }
+
+    static final boolean IS_WINDOWS =
+        System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win");
 
     public void remove(String id) {
         ProjectRecord p = projectMapper.selectOneById(id);

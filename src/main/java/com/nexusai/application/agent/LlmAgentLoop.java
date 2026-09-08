@@ -2270,11 +2270,19 @@ public class LlmAgentLoop implements AgentLoop {
         //   从 interrupted 尾部重新派生）。
         //   best-effort：messageService 未接线 / 读取失败 → 跳过不阻断 loop（对齐 :2435-2438
         //   skill 恢复块同款容错）。
+        // [C 级 2026-09-07 后端重启副作用补回] §14 SessionStart 判据 = JVM 冷/热（进程级 sessionStartSeen），
+        //   非本处历史空不空。JVM 重启天然清空进程级标记（SessionStartSeenRegistry.reset 仅供测试模拟重启）
+        //   → 老会话重启后的首条消息重新触发 SessionStart hook 副作用（watchPaths 等动态监听重建，对齐 CC
+        //   resume 边界「无条件重跑并 push」，见 CC conversationRecovery.ts:565-568）；同进程内已跑过的会话
+        //   （热）§14 整段跳过（对齐 CC 同进程内轮不重跑）。B 级 resumedFromDb 局部变量（按「DB 历史空不空」
+        //   判续聊）已删除——它会把「重启后首条消息」误判为续聊而整体跳过，丢失 watchPaths 副作用补回。
+        //   cold 判据求值在 §14 门控（见下方）；本恢复块只负责把 DB 历史灌入 state.messages()，供 §14 cold
+        //   时的 V1「存在即跳过」注入去重消费（恢复历史已含 hook_additional_context 副本 → 跑副作用不重注入）。
+        //   真子代理不调 LlmAgentLoop.run（SubagentExecutor.java:2015）不涉及。
         // [fix-loop-resume-history] 会话原始转录一次性读取（消除重复 DB I/O · 低效非错误）：
-        //   注入块经 listForResumeExcluding(raw, ...) 内存派生 + 续跑 skill 恢复块（:2422-2439）原本
-        //   各自 listBySession 全量读取同一会话消息 → 每 run 两次相同 DB 查询。本块先取一次缓存，
-        //   注入块与 skill 恢复块共享；读取失败 → null → 各处按其既有 best-effort 跳过（不阻断 loop，
-        //   语义与改造前一致）。
+        //   注入块经 listForResumeExcluding(raw, ...) 内存派生 + 续跑 skill 恢复块原本各自 listBySession
+        //   全量读取同一会话消息 → 每 run 两次相同 DB 查询。本块先取一次缓存，注入块与 skill 恢复块共享；
+        //   读取失败 → null → 各处按其既有 best-effort 跳过（不阻断 loop，语义与改造前一致）。
         List<ChatMessageDto> resumeRawTranscript = null;
         if ((agentId == null || backgroundSessionTask) && messageService != null
                 && streamSessionId != null && !streamSessionId.isBlank()) {
@@ -2296,6 +2304,11 @@ public class LlmAgentLoop implements AgentLoop {
                     filterIncompleteAssistantToolCalls(
                         messageService.listForResumeExcluding(resumeRawTranscript, streamUserMessageId)));
                 if (resumeHistory != null && !resumeHistory.isEmpty()) {
+                    // [C 级 2026-09-07] 恢复注入块只把 DB 既有历史灌入 state.messages()（注册 prePersisted +
+                    //   appendMessage 循环，供消息产出钩子跳过历史 id）。§14 SessionStart 是否执行由进程级
+                    //   cold 判据（SessionStartSeenRegistry）在下方门控求值，不再按「本分支是否恢复出历史」判断
+                    //   ——resumed 与否只影响 V1 注入去重（恢复历史已含 hook 副本则不重注入），不阻断 cold 重启后
+                    //   的 hook 副作用重跑（对齐 CC conversationRecovery.ts:565-568 resume 无条件重跑 hook）。
                     java.util.Set<String> ids = new java.util.HashSet<>();
                     for (ChatMessageDto m : resumeHistory) {
                         if (m != null && m.id() != null) {
@@ -2616,9 +2629,33 @@ public class LlmAgentLoop implements AgentLoop {
         //   (sessionStart.ts:150-161): initialUserMessage → pendingInitialUserMessage（首轮
         //   user message 替换, cli/print.ts:697）; watchPaths → allWatchPaths → updateWatchPaths.
         //   旧实现只注入 message attachment, 两个字段静默丢弃（探查报告 △-03）。
+        // [C 级 2026-09-07 后端重启副作用补回] §14 SessionStart 门控：cold（进程级 sessionStartSeen，
+        //   putIfAbsent 成功）才整块执行——executeEvent / injectHookResultMessage / initialUserMessage /
+        //   watchPaths / additionalContext 注入全部含于块内；hot（同进程已跑过）整段跳过。对齐 CC
+        //   sessionStart.ts 触发=startup/resume/clear/compact 四个进程边界、同进程内轮不重跑。
+        //   - JVM 冷启动后某会话首条消息：无论历史空不空都 cold → 重跑 hook 副作用（老会话重启后的
+        //     watchPaths 等动态监听补回 = 本批目标）；source 由 resolveSessionStartSource 推导（历史非空
+        //     → 'resume'，对齐 CC conversationRecovery.ts:565 resume 边界「无条件重跑」）。
+        //   - 同进程第二 run：hot → 整段跳过 → 不重跑不重注；模型仍见注入：A 级（P0-1）已把首轮
+        //     hook_additional_context 落库，resume 恢复历史含其单一固定副本。
+        //   key = streamSessionId（主线程与后台任务同 key：setStreamContext / setTaskStreamContext 透传同一
+        //     会话 id）；/clear（CommandController）remove 该 key → 下 run 恢复 cold（CC clear 边界）。
+        //   CC 语义差异披露（CC-with-flag 翻倍规避）：CC 默认不落盘 hook_additional_context
+        //   （sessionStorage.ts isLoggableMessage 过滤，仅 CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT 开时
+        //   放行），resume 无条件重跑并 push（conversationRecovery.ts:565-568，与保存开关无关）——开关开时
+        //   每次 resume 会堆副本。nexusai = 等效「开关开」架构（A 级已落库）→ 用 cold + §14 内 V1「存在即
+        //   跳过」双闸：触发时机对齐 CC resume 边界、同时规避 CC-with-flag 的副本翻倍。注入须字节稳定
+        //   （动态 hook 只在 clear/compact 冷边界刷新，见 CommandController remove + CompactHooks 独立重插）。
+        String sessionStartKey = (streamSessionId != null && !streamSessionId.isBlank())
+            ? streamSessionId : sessionId;
+        boolean coldSessionStart = SessionStartSeenRegistry.markSeen(sessionStartKey);
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] SessionStart 判据: session={} cold={}（进程级 sessionStartSeen，对齐 CC 会话开始四进程边界）",
+                sessionStartKey, coldSessionStart);
+        }
         String sessionStartInitialUserMessage = null;
         java.util.List<String> sessionStartWatchPaths = null;
-        if (hookRegistry != null) {
+        if (hookRegistry != null && coldSessionStart) {
             try {
                 // [IMP-LL-02 · OPD-WF4-LC-03] SessionStart source 动态推导 · 对齐 CC
                 //   executeSessionStartHooks source union 'startup'|'resume'|'clear'|'compact'
@@ -2663,15 +2700,18 @@ public class LlmAgentLoop implements AgentLoop {
                     //   + isMeta=false 一次性 appendMessage 进对话历史（非 attachment 常驻重渲染，避免
                     //   maybeInjectHookAttachments 每轮重复渲染成 isMeta 消息）。
                     java.util.List<String> startAdditionalContexts = startResult.additionalContexts();
-                    // [fix 2026-09-01] SessionStart additionalContext 会话一次（对齐 CC 会话开始一次，
-                    //   非每轮）：run() 每次用户消息执行 SessionStart → resume 会话每轮重复注入 + 插在
-                    //   用户消息前（干扰模型识别用户消息，10:49 误判"只有 system reminders"诱因之一）。
-                    //   检查 state.messages 已注入过 hook_additional_context（transcript 恢复/上次注入）
-                    //   → 后续轮跳过（消息流：系统提示 → sessionStart 一次 → 后续轮对话追加）。
-                    boolean alreadyInjectedSessionContext = state.messages().stream()
-                        .anyMatch(m -> "hook_additional_context".equals(m.subtype()));
-                    if (startAdditionalContexts != null && !startAdditionalContexts.isEmpty()
-                            && !alreadyInjectedSessionContext) {
+                    // [C 级 2026-09-07 · V1 定案] 注入去重「存在即跳过」（独立于冷/热判据）：cold 跑 hook 后，
+                    //   仅当恢复历史无 hook_additional_context 副本才注入 1 份并落库（P0-1）；恢复历史已含
+                    //   副本（A 级后落库的会话 / 后端重启后补跑）→ 只跑副作用（watchPaths 等）不重注入。
+                    //   判据 = 此刻 state.messages()（§14 前仅恢复历史被 append —— 用户消息 append 在队列
+                    //   drain、skill 恢复均在 §14 后）anyMatch hook_additional_context。恢复 09-01 版
+                    //   anyMatch 守卫（A 级前注入不落库 → 每轮 miss 失效；B 级误删 —— B 假设「进块前提历史
+                    //   空」不再成立：cold 判据下重启后老会话同样进本块且恢复历史非空）。字节稳定来源：注入
+                    //   只在 cold 边界执行一次，副本随恢复历史跨 run 固定重放；动态 hook 变更只在 clear/compact
+                    //   冷边界刷新（CommandController remove / CompactHooks 独立重插，见下）。
+                    boolean restoredHistoryHasHookCopy = state.messages().stream().anyMatch(m -> m != null
+                        && Role.user == m.role() && "hook_additional_context".equals(m.subtype()));
+                    if (startAdditionalContexts != null && !startAdditionalContexts.isEmpty()) {
                         java.util.List<String> nonBlankContexts = new java.util.ArrayList<>();
                         for (String ac : startAdditionalContexts) {
                             if (ac != null && !ac.isBlank()) {
@@ -2679,23 +2719,30 @@ public class LlmAgentLoop implements AgentLoop {
                             }
                         }
                         if (!nonBlankContexts.isEmpty()) {
-                            // [align-CC 2026-09-01] content 包 <system-reminder> + isMeta=true（对齐 CC
-                            //   messages.ts:4117-4127 hook_additional_context：wrapInSystemReminder +
-                            //   createUserMessage({isMeta:true})）——模型识别为「系统注入的技能说明」而非
-                            //   普通用户消息（此前 isMeta=false，模型把技能说明当用户贴的内容，看不到
-                            //   using-zjkycode 等 SessionStart hook 注入的定义）
-                            String wrappedContext = "<system-reminder>\nSessionStart hook additional context: "
-                                + String.join("\n", nonBlankContexts) + "\n</system-reminder>";
-                            state.appendMessage(new ChatMessageDto(
-                                UUID.randomUUID().toString(), sessionId, Role.user, "hook",
-                                wrappedContext, null, List.of(),
-                                com.nexusai.model.session.dto.FinishReason.stop,
-                                null, null, "刚刚", java.time.OffsetDateTime.now(), null, null, null,
-                                List.of(), List.of(), null, true, false,
-                                null, "hook_additional_context"));
-                            if (log.isInfoEnabled()) {
-                                log.info("HOOK SessionStart 提供 additionalContext: {} 段（hook_additional_context 追加进对话历史）",
-                                    nonBlankContexts.size());
+                            if (restoredHistoryHasHookCopy) {
+                                if (log.isInfoEnabled()) {
+                                    log.info("HOOK SessionStart 恢复历史已含 hook_additional_context 副本 → 跑副作用但不重注入（V1 存在即跳过，防 CC-with-flag 副本翻倍；session={}）",
+                                        sessionStartKey);
+                                }
+                            } else {
+                                // [align-CC 2026-09-01] content 包 <system-reminder> + isMeta=true（对齐 CC
+                                //   messages.ts:4117-4127 hook_additional_context：wrapInSystemReminder +
+                                //   createUserMessage({isMeta:true})）——模型识别为「系统注入的技能说明」而非
+                                //   普通用户消息（此前 isMeta=false，模型把技能说明当用户贴的内容，看不到
+                                //   using-zjkycode 等 SessionStart hook 注入的定义）
+                                String wrappedContext = "<system-reminder>\nSessionStart hook additional context: "
+                                    + String.join("\n", nonBlankContexts) + "\n</system-reminder>";
+                                state.appendMessage(new ChatMessageDto(
+                                    UUID.randomUUID().toString(), sessionId, Role.user, "hook",
+                                    wrappedContext, null, List.of(),
+                                    com.nexusai.model.session.dto.FinishReason.stop,
+                                    null, null, "刚刚", java.time.OffsetDateTime.now(), null, null, null,
+                                    List.of(), List.of(), null, true, false,
+                                    null, "hook_additional_context"));
+                                if (log.isInfoEnabled()) {
+                                    log.info("HOOK SessionStart 提供 additionalContext: {} 段（hook_additional_context 追加进对话历史）",
+                                        nonBlankContexts.size());
+                                }
                             }
                         }
                     }

@@ -6,6 +6,7 @@ import com.nexusai.application.agent.command.EffortCommand;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.PostCompactCleanup;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
+import com.nexusai.application.agent.SessionStartSeenRegistry;
 import com.nexusai.application.agent.skill.BuiltInCommands;
 import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.application.agent.subagent.AgentContext;
@@ -417,6 +418,13 @@ public class CommandController {
             if (toolSearchTool != null) {
                 toolSearchTool.clearToolSearchDescriptionCache();
             }
+            // [C 级 2026-09-07 · 对齐 CC conversation.ts:245 clear 边界] /clear 清空会话时点移除本会话的
+            //   进程级 sessionStartSeen key → 下 run（同会话续聊）恢复 cold → §14 SessionStart hook 链重跑
+            //   （watchPaths 等动态副作用刷新）。注入去重仍由 LlmAgentLoop §14 V1「存在即跳过」独立兜底：
+            //   /clear 不删 DB 消息行（web 转录保留，见 B-4 复核）→ 恢复历史仍含 A 级落库的单份 hook 副本
+            //   → cold 跑副作用但不重注入 → 恒 0 或 1 份、绝无 2 份；「clear 后应见一次新注入」仅在转录真被
+            //   清空（无副本）时发生，属产品行为登记项。
+            SessionStartSeenRegistry.remove(com.nexusai.common.RequestContext.sessionId());
             // [IMP-E4-06 · E4-XP-W67-01] /clear 前端触发 → 先 SESSION_END(reason='clear') hook
             //   · 对齐 CC conversation.ts:69 executeSessionEndHooks('clear')（清空会话时点，SessionEnd
             //     先于 SessionStart 发射；CC :245 processSessionStartHooks('clear') 在后）。

@@ -1350,6 +1350,36 @@ public class ChatService {
                         }
                     }
                 }
+                // [session-start-cc-align P0-1] SessionStart hook_additional_context 注入消息落库（核心修复）。
+                //   WHY：§14（LlmAgentLoop:2689-2695）每次用户消息都执行 SessionStart hook，注入一条
+                //   Role.user + author=hook + subtype=hook_additional_context + isMeta=true 消息（随机 UUID）。
+                //   旧逻辑 user 分支到此无条件 return 跳过 → 注入消息不落库 → 09-01 的 anyMatch(subtype) 守卫
+                //   （LlmAgentLoop:2671-2672）跨 run 失效（恢复历史里无它）→ 每轮在尾部重塞一份。
+                //   对齐 CC：注入消息成为 transcript 一条 isMeta=true user 消息并落库（sessionStart.ts:163-172 /
+                //   messages.ts:4117-4127 createAttachmentMessage {type:'hook_additional_context', isMeta:true}），
+                //   后续 run 经 listForResumeExcluding 恢复（不过滤 is_meta/subtype）→ 守卫命中 → 单份固定靠前。
+                //   ⚠️ nexusai 每轮 run ≠ CC resume：CC 跨进程 resume 会 push 新副本；nexusai 依赖 DB 单份 + 守卫跳过
+                //   （「存在即跳过」），故必须落库保留注入消息自身 id/content/isMeta/subtype。
+                //   ⚠️ 不向 wsTemplate 广播（user 分支现状不推送；hook isMeta=true 前端已隐藏，靠 GET /messages 出现即可）。
+                //   落库选型：MessageService.appendMessage(ChatMessageDto, OffsetDateTime) 2 参重载 —— 单行
+                //   DTO→Record 完整映射（id 沿用 dto.id、author/subtype/content/isMeta/cwd 全保留、不 bump messageCount），
+                //   createdAt 接本方法 :1251 单调 ts。兄弟分支（图片回写 / mid-turn 排队）零改动。
+                if (m.isMeta() && "hook".equals(m.author())
+                        && "hook_additional_context".equals(m.subtype())) {
+                    if (messageService != null) {
+                        try {
+                            messageService.appendMessage(m, ts);
+                            if (log.isInfoEnabled()) {
+                                log.info("ChatService: SessionStart hook_additional_context 注入消息落库: session={} id={} len={}",
+                                    sessionId, abbreviate(m.id(), 16),
+                                    m.content() == null ? 0 : m.content().length());
+                            }
+                        } catch (Exception e) {
+                            log.warn("ChatService: hook_additional_context 落库失败（best-effort 不阻断）: session={} id={}: {}",
+                                sessionId, m.id(), e.getMessage());
+                        }
+                    }
+                }
                 return;
             }
 

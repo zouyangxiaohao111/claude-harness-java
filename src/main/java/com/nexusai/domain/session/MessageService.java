@@ -671,6 +671,25 @@ public class MessageService {
      * @return 落库后的消息（id 已生成）
      */
     public ChatMessageDto appendMessage(ChatMessageDto dto) {
+        return appendMessage(dto, OffsetDateTime.now());
+    }
+
+    /**
+     * [session-start-cc-align P0-1] appendMessage 2 参重载：显式指定 {@code created_at}。
+     *
+     * <p><b>WHY</b>: 1 参 {@link #appendMessage(ChatMessageDto)} 硬编码
+     * {@code created_at = OffsetDateTime.now()}——ChatService 实时落库（persistAppendedMessage）
+     * 走 {@code baseTs.plusNanos(seq)} 单调时间戳保序，hook_additional_context 注入消息（SessionStart
+     * additionalContext，对齐 CC sessionStart.ts:163-172 / messages.ts:4117-4127）必须落在调用方给定
+     * 的单调 ts 上，否则与同轮 assistant/工具行排序错乱。1 参委托本重载传 {@link OffsetDateTime#now()}，
+     * 既有调用方（spawnInProcessTeammate / PermissionRulesController.retryDenials 等）零行为变化。
+     *
+     * @param dto       出站消息（DTO→Record 完整映射：id/author/subtype/content/isMeta/imagePasteIds/cwd
+     *                  全保留，不 bump sessions.messageCount——元消息不入用户计数）
+     * @param createdAt 显式 created_at（单调 ts；null → 回落 {@link OffsetDateTime#now()} 兜底）
+     * @return 落库后的消息（id 已生成；createdAt 字段保留 dto 原值，对齐 1 参既有语义）
+     */
+    public ChatMessageDto appendMessage(ChatMessageDto dto, OffsetDateTime createdAt) {
         if (dto == null) {
             throw new IllegalArgumentException("appendMessage: dto 不能为 null");
         }
@@ -697,7 +716,8 @@ public class MessageService {
         //   含 cache（与实时 complete 事件一致，不再少算）。
         rec.setCacheReadInputTokens(cacheReadInputTokensOf(dto));
         rec.setCacheCreationInputTokens(cacheCreationInputTokensOf(dto));
-        rec.setCreatedAt(OffsetDateTime.now().toString());
+        // [session-start-cc-align P0-1] created_at 用显式 createdAt（单调 ts），1 参委托传 now() 零行为变化
+        rec.setCreatedAt(createdAt != null ? createdAt.toString() : OffsetDateTime.now().toString());
         rec.setToolCallId(dto.toolCallId());
         rec.setSubtype(dto.subtype());
         rec.setStructuredOutput(serializeStructuredOutput(dto.structuredOutput()));
