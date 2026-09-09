@@ -5811,6 +5811,17 @@ html {
   box-shadow: 0 8px 24px rgba(20, 20, 19, 0.12), 0 2px 8px rgba(20, 20, 19, 0.06);
   padding: 14px 16px;
   z-index: 40;
+  /* [ask-overflow 2026-09-09] AskUser 四问等长内容超高会撑爆可视区、底部按钮被裁不可达 →
+     limheight 内滚（滚动条视觉隐藏，滚轮/触控仍可滚）。 */
+  max-height: min(62vh, 560px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+.permission-bubble::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 .pb-title {
   font-size: 14px;
@@ -9817,3 +9828,27 @@ html {
   background: rgba(204,120,92,.24);
   box-shadow: 0 0 0 1px var(--accent, #cc785c), 0 3px 9px rgba(20,20,19,.18);
 }
+
+/* ===== 自动更新中心（UpdateCenter）===== */
+.ud-fab{position:fixed;right:18px;bottom:18px;width:40px;height:40px;border-radius:50%;border:1px solid var(--line,#e6e8f0);background:#fff;color:var(--brand,#4A6CF7);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 22px -6px rgba(20,24,50,.25);cursor:pointer;z-index:1200}
+.ud-fab:hover{transform:translateY(-1px);box-shadow:0 10px 26px -6px rgba(20,24,50,.32)}
+.ud-dlg{width:520px;max-width:calc(100vw - 32px);background:#fff;border:1px solid var(--line,#e6e8f0);border-radius:16px;box-shadow:0 24px 60px -18px rgba(20,24,50,.24);overflow:hidden;margin-top:6vh}
+.ud-head{display:flex;align-items:flex-start;gap:11px;padding:18px 20px 6px;position:relative}
+.ud-ic{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;flex:none}
+.ud-ic.brand{background:#eef1ff;color:#4A6CF7}.ud-ic.ok{background:#e6f6f1;color:#10A37F}.ud-ic.warn{background:#fdf1e0;color:#d97706}
+.ud-title{flex:1}.ud-title b{font-size:15px;display:inline}
+.ud-ver{font-family:ui-monospace,Consolas,monospace;font-size:11px;background:#f7f8fb;border:1px solid #e6e8f0;color:#4a4f63;padding:1px 7px;border-radius:6px;margin-left:8px}
+.ud-x{border:none;background:transparent;color:#8b90a6;font-size:14px;cursor:pointer;line-height:1}
+.ud-body{padding:10px 20px 8px}
+.ud-muted{color:#8b90a6;font-size:12.5px;line-height:1.7;margin:2px 0 8px}
+.ud-notes{background:#f7f8fb;border:1px solid #e6e8f0;border-radius:10px;padding:8px 11px;max-height:160px;overflow:auto}
+.ud-notes.full{max-height:60vh}
+.ud-notes pre{font:inherit;white-space:pre-wrap;word-break:break-word;color:#4a4f63;font-size:12px;line-height:1.8}
+.ud-bar{height:8px;background:#f0f1f6;border:1px solid #e6e8f0;border-radius:99px;overflow:hidden;margin:10px 0 6px}
+.ud-bar i{display:block;height:100%;background:linear-gradient(90deg,#6f8bff,#4A6CF7);border-radius:99px;transition:width .2s}
+.ud-meta{display:flex;justify-content:space-between;font-size:12px;color:#8b90a6}
+.ud-foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px 18px}
+.ud-btn{border:1px solid #e6e8f0;background:#fff;color:#4a4f63;padding:7px 15px;font-size:12.5px;border-radius:9px;cursor:pointer}
+.ud-btn.primary{background:#4A6CF7;border-color:#4A6CF7;color:#fff;font-weight:600}
+.ud-btn.primary:hover{background:#3b55d8}
+.ud-btn.ghost{color:#8b90a6;border-color:transparent}

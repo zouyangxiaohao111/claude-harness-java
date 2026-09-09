@@ -69,6 +69,7 @@ import { SkillMarketModal } from '@/components/modals/SkillMarketModal'
 import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
 import { getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
+import { UpdateCenter } from '@/components/updater/UpdateCenter'
 
 // DiffModal/FileViewModal 改静态 import：monaco 直接打进主包，启动解析一次；
 // 桌面 Tauri 本地加载快，换取「点开 diff 零拉取零等待」（放弃此前 L5 懒加载拆分）。
@@ -1777,6 +1778,7 @@ function App() {
         />
       )}
       <Toast toast={ui.toast} />
+      <UpdateCenter />
     </div>
   )
 }

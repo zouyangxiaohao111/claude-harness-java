@@ -383,7 +383,7 @@ export interface AppSettings {
   contextCollapseEnabled?: boolean | null
   /** 历史裁剪开关（对齐 CC historySnipEnabled · 长对话 Snip 历史窗口） */
   historySnipEnabled?: boolean | null
-  /** snip 提示消息数阈值，null=窗口自适应 90/180/300/450（200k→90 / 400k→180 / 512k→300 / 1M→450） */
+  /** snip 提示消息数阈值，null=窗口自适应（effectiveWindow ≥800k→900 / >600k→600 / ≥400k→360 / <400k→180，snip-nudge-scaleup 2026-09-09 再 ×2） */
   snipNudgeThreshold?: number | null
   /** 会话记忆开关（对齐 CC smSessionMemoryEnabled · Session Memory 服务） */
   smSessionMemoryEnabled?: boolean | null

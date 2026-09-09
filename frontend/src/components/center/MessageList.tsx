@@ -383,6 +383,9 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
   const isMicrocompactBoundary = msg.role === 'system' && msg.subtype === 'microcompact_boundary'
   const isSnipBoundary = msg.role === 'system' && msg.subtype === 'snip_boundary'
   const isBoundary = isCompactBoundary || isMicrocompactBoundary || isSnipBoundary
+  // [toolsum-display] tool_use_summary 展示行（作者 attachment + subtype=tool_use_summary · 后端落库 /
+  //   /topic/tasks 实时 · 不进模型上下文）→ 渲染独立置灰窄行，非用户气泡/不进输入历史
+  const isToolUseSummary = msg.author === 'attachment' && msg.subtype === 'tool_use_summary'
   // 边界标签文案（中文）：compact 有 compactMetadata.preTokens/postTokens 时追加 token 数（122k→42k）；
   //   snip 有 removedUuids 时说明移除条数
   const boundaryLabel = (() => {
@@ -452,6 +455,15 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
         <div className="boundary-note">
           <span className="boundary-label" title={boundaryTitle}>{boundaryLabel}</span>
         </div>
+      </div>
+    )
+  }
+  // tool_use_summary 摘要行：居中弱化窄行（⚒ 图标 + 单行文本 · title 全文）——无删除、不进输入历史
+  if (isToolUseSummary) {
+    return (
+      <div className="msg tool-use-summary">
+        <span className="tus-icon">⚒</span>
+        <span className="tus-text" title={msg.content ?? ''}>{msg.content}</span>
       </div>
     )
   }
@@ -697,7 +709,10 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
       arr[idx].items.push(item)
     }
     for (const m of messages) {
-      if (m.isMeta || m.role === 'tool') continue
+      if (m.role === 'tool') continue
+      // 放行 tool_use_summary 展示行（isMeta=true 但 author=attachment/subtype=tool_use_summary）——
+      //   默认 isMeta 跳过会把它吞掉（渲染分支见 Message 组件 isToolUseSummary）
+      if (m.isMeta && !(m.author === 'attachment' && m.subtype === 'tool_use_summary')) continue
       push(m.userMessageId ?? m.id, { kind: 'msg', m })
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
@@ -852,6 +867,30 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
           background: #FFF3EB;
         }
         .msg .msg-hover-actions .delete-btn:hover { background: #FF7A3D; color: #fff; }
+        /* tool_use_summary 摘要行：居中弱化窄行（工具批 · 不进模型上下文） */
+        .msg.tool-use-summary {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          max-width: 640px;
+          margin: 2px auto 4px;
+          padding: 2px 10px;
+          font-size: 11.5px;
+          line-height: 1.5;
+          color: var(--ink-muted, #888);
+          background: var(--surface-2, #f2f2f3);
+          border: 1px solid var(--hairline, #e5e5e5);
+          border-radius: 999px;
+          text-align: center;
+          user-select: none;
+        }
+        .msg.tool-use-summary .tus-icon { flex-shrink: 0; font-size: 11px; opacity: 0.85; }
+        .msg.tool-use-summary .tus-text {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
       `}</style>
       {/* F29 · 元消息（续写提示 / budget nudge）isMeta=true 不展示；role=tool 工具结果消息已含于
           assistant.toolCalls[].result（DB 重拉后），独立渲染会重复噪音 → 一并过滤 */}

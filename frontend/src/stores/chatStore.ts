@@ -144,6 +144,8 @@ export interface ChatState {
   /** 后端推送的 user 消息（message.user）：isMeta=true/缺省 = cron/Ask 后台落库占位不显示（保 flow 顺序）；
    *  isMeta=false = 正式 user 气泡（含 busy-queued 排队插队注入）。按 id 幂等去重。 */
   appendMetaUser: (sessionId: string, id: string, content?: string | null, isMeta?: boolean) => void
+  /** 实时插入 tool_use_summary 展示行（/topic/tasks 事件 · id 幂等 + userMessageId flow 锚定，防双通道重复） */
+  addToolUseSummary: (sessionId: string, row: { id: string; content: string; userMessageId?: string | null }) => void
 }
 
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
@@ -406,6 +408,29 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       errorDetails: null, matchedRule: null,
     }
     return { messages: { ...st.messages, [sessionId]: [...msgs, metaMsg] } }
+  }),
+  addToolUseSummary: (sessionId, { id, content, userMessageId }) => set((st) => {
+    const msgs = st.messages[sessionId] ?? []
+    // 幂等：同 id 已存在（/topic/tasks 与 GET 重拉双通道）不重复插
+    if (msgs.some((m) => m.id === id)) return st
+    const flowKey = userMessageId ?? id
+    const summaryRow: ChatMessageDto = {
+      id, sessionId, role: 'user', author: 'attachment', content,
+      reasoning: null, toolCalls: null, finishReason: null, inputTokens: null,
+      outputTokens: null, reasoningDurationMs: null, time: null, createdAt: new Date().toISOString(),
+      toolCallId: null, assistantMessageId: null, userMessageId: flowKey, subtype: 'tool_use_summary',
+      isMeta: true, isApiErrorMessage: false, apiError: null, error: null,
+      errorDetails: null, matchedRule: null,
+    }
+    // flow 锚定：插到 messages 中该 flow 最后一条之后；找不到同 flow 则队尾追加
+    let insertAt = msgs.length
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const key = msgs[i].userMessageId ?? msgs[i].id
+      if (key === flowKey) { insertAt = i + 1; break }
+    }
+    const next = [...msgs]
+    next.splice(insertAt, 0, summaryRow)
+    return { messages: { ...st.messages, [sessionId]: next } }
   }),
 }))
 

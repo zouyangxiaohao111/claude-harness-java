@@ -550,6 +550,24 @@ export function useChatSocket(
       if (showToast) showToast(`任务${evt.status === 'failed' ? '失败' : evt.status === 'stopped' ? '已停止' : '完成'}：${evt.summary ?? '…'}`, 'info')
       return
     }
+    // [toolsum-display] tool_use_summary 实时事件 → 会话消息流内插一行摘要（DB 落库后 F5/complete 重拉亦可见；
+    //   id 幂等防与重拉双通道重复）。flow 归属：优先当前活跃 stream 的 userMessageId，兜底末条消息。
+    if (evt.type === 'tool_use_summary') {
+      const sid = evt.session_id ?? sessionIdRef.current ?? undefined
+      const st = useChatStore.getState()
+      let flowId: string | undefined
+      const blocks = sid ? st.streams[sid] : undefined
+      const lastBlk = blocks && blocks.length ? blocks[blocks.length - 1] : undefined
+      if (lastBlk?.userMessageId) flowId = lastBlk.userMessageId
+      if (!flowId && sid) {
+        const msgs = st.messages[sid] ?? []
+        flowId = msgs.length ? (msgs[msgs.length - 1].userMessageId ?? undefined) : undefined
+      }
+      if (sid && evt.summary && evt.uuid) {
+        useChatStore.getState().addToolUseSummary(sid, { id: evt.uuid, content: evt.summary, userMessageId: flowId })
+      }
+      return
+    }
     if (evt.type !== 'system') return
     switch (evt.subtype) {
       case 'task_started': {
