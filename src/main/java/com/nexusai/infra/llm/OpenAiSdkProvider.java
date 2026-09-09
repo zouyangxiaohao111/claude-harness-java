@@ -1318,12 +1318,23 @@ public class OpenAiSdkProvider implements LlmProvider {
             log.debug("OpenAiSdkProvider 流式产出 message requestId={} · CC AssistantMessage.requestId 归因（DEC-RV-14a 兜底）",
                 state.requestId);
         }
+        String finishReason = state.finishReason == null ? "stop" : state.finishReason;
+        // [对齐 CC 2026-09-09 · length→apiError 洞修复] OpenAI/DeepSeek finish_reason='length'（单响应输出顶到
+        //   models.max_tokens=384K；thinking 也计入输出预算）→ apiError='max_output_tokens'，使 LlmAgentLoop
+        //   的 max_tokens recovery（8K→64K 升级 + Resume 续调，上限 3）真正触发。此前本文件两处 apiError 恒
+        //   null → deepseek 截断永不续调、尾部静默丢失（洞）。镜像 AnthropicSdkProvider:2861-2863（Anthropic
+        //   max_tokens/model_context_window_exceeded）与 CC openai/index.ts:199-209（stopReason==='max_tokens'）。
+        String apiError = "length".equals(finishReason) ? "max_output_tokens" : null;
+        if (apiError != null && log.isDebugEnabled()) {
+            log.debug("OpenAiSdkProvider finishReason 归一化: finish_reason={} → apiError=max_output_tokens（触发 max_tokens recovery）· CC openai/index.ts:199-209",
+                finishReason);
+        }
         return new AssistantMessage(
             state.content.toString(),
-            state.finishReason == null ? "stop" : state.finishReason,
+            finishReason,
             blocks,
             state.reasoning.toString(),
-            null,
+            apiError,
             usage,
             state.requestId
         );
