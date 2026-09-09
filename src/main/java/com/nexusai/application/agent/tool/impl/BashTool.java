@@ -1311,7 +1311,13 @@ public class BashTool implements Tool {
             int await = awaitForegroundProcess(process, timeoutMs, backgroundedFlag,
                 () -> fgTaskIdForAwait != null && backgroundTaskRunner != null
                     && backgroundTaskRunner.getTask(fgTaskIdForAwait)
-                        .map(t -> t.isBackgrounded()).orElse(false));
+                        .map(t -> t.isBackgrounded()).orElse(false),
+                // [Fix1] abort(停止/取消) 源 = ctx 的 run 级 AbortController（cancelSession→AgentState.
+                //   abortStream→abort → isCancelled()=true）→ await 循环据此中断并强杀进程。
+                //   对齐 CC ShellCommand.ts:186-193：reason=='interrupt'（提交新消息打断）不杀、
+                //   让 caller 可后台（Bash 默认 interruptBehavior='block'）；仅 user-cancel 等其它 reason 才 kill。
+                () -> ctx != null && ctx.abortController() != null && ctx.abortController().isCancelled()
+                    && !"interrupt".equals(ctx.abortController().reason()));
 
             if (backgroundedFlag[0]) {
                 // G5-2: 15s 定时器已就地转后台（backgroundExistingForegroundTask 成功）→ 返回后台化结果
@@ -1670,12 +1676,20 @@ public class BashTool implements Tool {
      * :1307 走 backgroundedFlag 分支返回后台化结果,进程不杀)。
      */
     private static int awaitForegroundProcess(Process process, long timeoutMs, boolean[] backgroundedFlag,
-                                              java.util.function.BooleanSupplier externallyBackgrounded) {
+                                              java.util.function.BooleanSupplier externallyBackgrounded,
+                                              java.util.function.BooleanSupplier aborted) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (true) {
+            // 顺序：先转后台(本地 15s/超时/外部手动) —— 手动转后台应赢过 abort(用户已显式要后台跑)；
+            // 再查 abort(停止/取消) —— 未转后台但 run 被取消(AgentState.abortStream→AbortController)
+            //   → 立即 AWAIT_INTERRUPTED，调用方 G5-9 杀进程，不等到 sleep/长命令自然结束
+            //   （[Fix1 2026-09-09] 停止对前台长命令无效 → run 假卡到命令结束才解除，本会话 4 分钟卡死根因）。
             if (backgroundedFlag[0] || externallyBackgrounded.getAsBoolean()) {
                 backgroundedFlag[0] = true;
                 return AWAIT_TIMEOUT; // 已转后台(本地自动 15s/超时 或 外部手动 Ctrl+B),调用方按后台化结果处理
+            }
+            if (aborted.getAsBoolean()) {
+                return AWAIT_INTERRUPTED; // run 被取消 → 强杀进程（G5-9：SIGKILL + emit KILLED + 注销）
             }
             if (!process.isAlive()) {
                 return AWAIT_COMPLETED;
