@@ -165,10 +165,11 @@ async function readPage() {
   return { ok: true, result: { url: location.href, title: document.title, nodeCount: nodes.length, nodes } }
 }
 
-/** get_page_text：整页可见文本 */
+/** get_page_text：整页可见文本（整页全交，不在扩展侧截断——超 CC 单结果内联上限
+ *  DEFAULT_MAX_RESULT_SIZE_CHARS=50_000 的部分由后端落盘+文件路径预览承接，聚合 200k 兜底） */
 async function getPageText() {
   const text = (document.body ? document.body.innerText : '') || ''
-  return { ok: true, result: { url: location.href, text: text.slice(0, 20000) } }
+  return { ok: true, result: { url: location.href, text } }
 }
 
 /** find：在单源可交互索引快照内按文本/描述/selector 匹配，返回带 ref 的结果供 computer 定位 */

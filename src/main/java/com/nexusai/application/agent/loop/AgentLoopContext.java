@@ -2727,10 +2727,16 @@ public record AgentLoopContext(
      * {@code "<system-reminder>\n" + SNIP_NUDGE_TEXT + "\n</system-reminder>"} 的 isMeta user 消息
      * （{@link #metaUserMessage}，对齐 CC wrapInSystemReminder messages.ts:3097-3099）。
      *
-     * <p><b>计数源</b>: CC getAttachments 收到 {@code [...messagesForQuery, ...assistantMessages,
-     * ...toolResults]}（query.ts:1585）；Java 侧取 {@code state.messages()}（持久会话，含本 turn 已累计
-     * 的 assistant/tool 消息，与 snip 步骤 query.ts:401-410 同源）。注入位置 = 消息流队尾（对齐 CC
-     * query.ts:1588 yield attachment 在既有消息之后）。动态生成不持久化（CC 纯函数每迭代重算，同
+     * <p><b>计数源（snip-nudge-count 修复，对齐 CCB query.ts:1894-1902）</b>: CC 真源 getAttachmentMessages
+     * 实参 = {@code messagesForQuery.concat(assistantMessages, toolResults)} —— <b>snip 投影后的模型可见
+     * 消息</b>（messagesForQuery 已由 query.ts:591-592 snipCompactIfNeeded 剔除 removedUuids；CCB store
+     * 同样 append-only，但判据数的是投影面）。Java 侧相应取 {@code messagesForLlm}（本方法注入目标，初值
+     * = 本迭代 messagesForQuery · LlmAgentLoop:5301，snip 投影在 :5014 / autocompact :5138 已就位），即
+     * 「本轮实际发给模型的消息链」。<b>不能数 {@code state.messages()} 全量</b>：Java snip 是请求级投影
+     * （B5 d-2，state 保留被 snip 消息不删），若数全量则模型越 snip、判据不降，达阈值后每轮重复注入 nudge
+     * （旧缺陷，固化见 LlmAgentLoopSnipMicroWiringTest）。state 参数仅保留用于守卫 + 诊断日志
+     * （全量 vs 可见条数对比，可确认 snip 生效）。注入位置 = 消息流队尾（对齐 CC query.ts:1588 yield
+     * attachment 在既有消息之后）。动态生成不持久化（CC 纯函数每迭代重算，同
      * {@link #maybeInjectOutputTokenUsage}）。
      *
      * <p><b>WHY nudge 是给模型看的 isMeta 消息</b>: CC SNIP_NUDGE_TEXT 提示「模型考虑 /force-snip 或 snip
@@ -2743,7 +2749,7 @@ public record AgentLoopContext(
      * @param thresholdSystem 有效上下文窗口计算源（CompactThresholdSystem#getEffectiveContextWindowSize；
      *                        可 null → effectiveWindow=0 → 回落 CC 默认阈值 30）
      * @param model         当前有效模型名（窗口计算入参；可 null）
-     * @param state         AgentState（state.messages() 计数源，对齐 CC messages 参数）
+     * @param state         AgentState（仅守卫 + 诊断日志用；判据不依赖它，见上「计数源」）
      * @param messagesForLlm 当前 LLM 请求消息列表（注入目标）
      * @return 注入后的消息列表；任一门未过 → 原引用
      */
@@ -2788,11 +2794,16 @@ public record AgentLoopContext(
             ? thresholdSystem.getEffectiveContextWindowSize(model)
             : 0;
         int snipNudgeThreshold = SnipCompactor.resolveSnipNudgeThreshold(dbNudgeThreshold, effectiveWindow);
-        if (!SnipCompactor.shouldNudgeForSnips(state.messages(), snipNudgeThreshold)) {
+        // [snip-nudge-count] 判据 = messagesForLlm（snip 投影后模型可见消息，对齐 CCB query.ts:1894
+        //   messagesForQuery.concat(assistantMessages, toolResults)）—— 非 state.messages() 全量：
+        //   Java snip 只做请求级投影（B5 d-2，state 保留被 snip 消息），数全量则模型 snip 后判据不降、
+        //   达阈值每轮重复 nudge（旧缺陷）。
+        if (!SnipCompactor.shouldNudgeForSnips(messagesForLlm, snipNudgeThreshold)) {
             if (log.isDebugEnabled()) {
-                log.debug("[LlmAgentLoop] context_efficiency nudge 跳过: state.messages()={} 条 < 阈值{}（db={} effectiveWindow={}）· CC attachments.ts:3978/snipCompact.ts:163-165",
-                    state.messages() != null ? state.messages().size() : 0,
-                    snipNudgeThreshold, dbNudgeThreshold, effectiveWindow);
+                log.debug("[LlmAgentLoop] context_efficiency nudge 跳过: 模型可见消息={} 条 < 阈值{}（db={} effectiveWindow={}, state 全量={} 诊断）· CC attachments.ts:3978/snipCompact.ts:163-165 + CCB query.ts:1894",
+                    messagesForLlm != null ? messagesForLlm.size() : 0,
+                    snipNudgeThreshold, dbNudgeThreshold, effectiveWindow,
+                    state != null && state.messages() != null ? state.messages().size() : 0);
             }
             return messagesForLlm;
         }
@@ -2802,8 +2813,9 @@ public record AgentLoopContext(
         withNudge.addAll(messagesForLlm);
         withNudge.add(metaUserMessage(text));
         if (log.isInfoEnabled()) {
-            log.info("[LlmAgentLoop] context_efficiency nudge 注入 LLM 队尾: state.messages()={} 条 ≥阈值{}（db={} effectiveWindow={}）, isMeta=true · CC attachments.ts:929-937/:3963-3983 + messages.ts:4148-4161",
-                state.messages().size(), snipNudgeThreshold, dbNudgeThreshold, effectiveWindow);
+            log.info("[LlmAgentLoop] context_efficiency nudge 注入 LLM 队尾: 模型可见消息={} 条 ≥阈值{}（db={} effectiveWindow={}, state 全量={} 诊断）, isMeta=true · CC attachments.ts:929-937/:3963-3983 + messages.ts:4148-4161 + CCB query.ts:1894",
+                messagesForLlm.size(), snipNudgeThreshold, dbNudgeThreshold, effectiveWindow,
+                state != null && state.messages() != null ? state.messages().size() : 0);
         }
         return withNudge;
     }
