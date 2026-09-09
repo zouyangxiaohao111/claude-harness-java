@@ -30,10 +30,12 @@ export function UpdateCenter() {
   const autoTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const busy = useRef(false)
 
-  const check = useCallback(async () => {
+  /** 检查更新。manual=true（用户点悬浮按钮）→ 全程给反馈（checking/latest/fail 都弹）；manual=false
+   *  （启动 3s 自动检查）→ 只在「发现新版本」时自动弹窗，无新版 / 检查失败均静默留在 idle，不打扰用户。 */
+  const check = useCallback(async (manual = false) => {
     if (busy.current) return
     busy.current = true
-    setStage('checking')
+    if (manual) setStage('checking')   // 自动检查：先留在 idle，避免「检查中」弹窗闪一下
     setErr('')
     try {
       const ver = current || (await invoke<string>('app_version'))
@@ -42,12 +44,13 @@ export function UpdateCenter() {
       if (found.available) {
         setInfo(found)
         setStage('found')
-      } else {
+      } else if (manual) {
+        // 手动检查才反馈「已是最新」；自动检查无新版 → 静默（不弹窗）
         setStage('latest')
       }
     } catch (e) {
       setErr(String(e))
-      setStage('fail')
+      if (manual) setStage('fail')   // 自动检查失败同样静默（启动期网络抖动不打扰）
     } finally {
       busy.current = false
     }
@@ -100,7 +103,7 @@ export function UpdateCenter() {
       <button
         className="ud-fab"
         title="检查更新"
-        onClick={() => { if (stage === 'idle') void check() }}
+        onClick={() => { if (stage === 'idle') void check(true) }}
       >
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1" />
