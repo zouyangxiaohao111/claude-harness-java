@@ -89,6 +89,20 @@ public class ChatController {
     /** [window-paging] /messages/page 响应体 · total = 会话消息总数（DB sessions.messageCount 非 meta 口径）。 */
     public record PageResp(List<ChatMessageDto> messages, boolean hasMore, int total) {}
 
+    /**
+     * [trace-count] 会话消息总数（轻量轮询）· GET /sessions/{sessionId}/messages/count。
+     * 读 sessions.messageCount（非 meta 口径），零 COUNT 查询 —— 轨迹徽标定时刷新用。
+     *
+     * @return {total: 会话非 meta 消息总数}
+     */
+    @GetMapping("/messages/count")
+    public CountResp count(@PathVariable String sessionId) {
+        return new CountResp(messageService.countBySession(sessionId));
+    }
+
+    /** [trace-count] /messages/count 响应体。 */
+    public record CountResp(int total) {}
+
     @PostMapping("/messages")
     @ResponseStatus(HttpStatus.ACCEPTED)
     public MessageCreatedResponse send(@PathVariable String sessionId,

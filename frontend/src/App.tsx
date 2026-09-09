@@ -346,6 +346,22 @@ function App() {
   const storeMessages = useChatStore((s) => s.messages[activeSessionId] ?? EMPTY_MESSAGES)
   // [trace-count] 轨迹 tab 徽标全量：GET /messages/page total（DB sessions.messageCount 非 meta 口径）· 未拉到时回落窗口条数
   const activeMsgTotal = useChatStore((s) => (activeSessionId ? (s.msgTotals[activeSessionId] ?? null) : null))
+  // [trace-count 轮询] 轨迹徽标实时：每 5s 拉后端该会话 count（DB sessions.messageCount · 非 meta 口径，轻量）。
+  //   覆盖 新消息落库 / 删除 / 裁剪 等一切变化，不依赖「窗口是否全量」。
+  useEffect(() => {
+    if (!activeSessionId) return
+    let alive = true
+    const sid = activeSessionId
+    const tick = async () => {
+      try {
+        const r = await chatApi.messageCount(sid)
+        if (alive) useChatStore.getState().setMsgTotal(sid, r.total)
+      } catch { /* 轮询失败静默：下次 tick 兜底；断网/后端未就绪不打扰 */ }
+    }
+    void tick()
+    const t = window.setInterval(tick, 5000)
+    return () => { alive = false; window.clearInterval(t) }
+  }, [activeSessionId])
   // [流式性能 2026-09-09] 不再顶层订阅整条 streams[sid] 引用（打字机逐帧 append 会让整 App 每帧重渲）。
   //   改订 streamOrder 长度（结构信号）：块增/删才变化, content 推进不触碰 —— 内容订阅已下沉 MessageList
   //   每行 StreamBlockRow（selectStreamBlock）。此处只用于 turnRunning / thinking / Composer.empty 的「有无流式块」。

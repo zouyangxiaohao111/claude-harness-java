@@ -11,6 +11,9 @@ export const chatApi = {
     api<{ messages: ChatMessageDto[]; hasMore: boolean; total: number }>(
       `/sessions/${encodeURIComponent(sessionId)}/messages/page?limit=${opts?.limit ?? 50}`
         + (opts?.beforeMessageId ? `&beforeMessageId=${encodeURIComponent(opts.beforeMessageId)}` : '')),
+  /** [trace-count] 会话消息总数（轻量 GET /messages/count · DB sessions.messageCount 非 meta 口径 · 轨迹徽标轮询用） */
+  messageCount: (sessionId: string) =>
+    api<{ total: number }>(`/sessions/${encodeURIComponent(sessionId)}/messages/count`),
   send: (sessionId: string, req: SendMessageRequest) =>
     api<MessageCreatedResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: 'POST', body: req }),
   removeMessage: (sessionId: string, messageId: string) =>

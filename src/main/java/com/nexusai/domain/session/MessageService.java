@@ -172,6 +172,22 @@ public class MessageService {
     public record PageResult(List<ChatMessageDto> messages, boolean hasMore, int total) {}
 
     /**
+     * 会话消息总数（sessions.messageCount · 非 meta 口径）· GET /sessions/{sessionId}/messages/count。
+     * 轻量、零 COUNT 查询，供前端定时轮询轨迹徽标实时刷新。
+     *
+     * @param sessionId 会话 ID（DB 键）
+     * @return 会话非 meta 消息总数
+     * @throws NotFoundException session 不存在
+     */
+    public int countBySession(String sessionId) {
+        SessionRecord session = sessionMapper.selectOneById(sessionId);
+        if (session == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        return session.getMessageCount() != null ? session.getMessageCount() : 0;
+    }
+
+    /**
      * [token-compact-fix ⑤方案B] 重拉上下文快照补算 · 用户拍板：不落库，每次重算。
      *
      * <p><b>WHY</b>: 实时 {@code message.complete} 事件推 contextWindow/contextTokensUsed/percentLeft
@@ -1029,7 +1045,7 @@ public class MessageService {
             m.getContent(),
             m.getReasoning(),
             toolDtos,
-            m.getFinishReason() != null ? FinishReason.valueOf(m.getFinishReason()) : null,
+            FinishReason.parse(m.getFinishReason()),
             m.getInputTokens(),
             m.getOutputTokens(),
             formatRelativeTimeAgo(parseDateTime(m.getCreatedAt()), OffsetDateTime.now()),
