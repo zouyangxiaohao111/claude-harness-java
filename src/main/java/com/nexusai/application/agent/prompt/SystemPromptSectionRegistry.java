@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.prompt;
 
+import com.nexusai.application.agent.memory.AutoMemPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -72,22 +73,37 @@ public class SystemPromptSectionRegistry {
      * @return 与注册序一致的解析结果数组（null 段也入列）
      */
     public List<String> resolveAll(SystemPromptSectionCache cache) {
+        // [memory-cc 2026-09-09 B1] 会话上下文快照进异步 compute：resolveAll 在请求线程被调（此时
+        //   AutoMemPaths ThreadLocal projectRoot 已注入）；并行 resolve 用 CompletableFuture.supplyAsync
+        //   （ForkJoinPool.commonPool，无 ThreadLocal/MDC）→ memory section 的 compute 读不到会话
+        //   projectRoot → auto-only 恒判「无项目」刷 ERROR（CC Node 单线程无此问题；Java 会话状态在
+        //   ThreadLocal）。参照 env_info_simple.cwd(sessionId) 显式传参先例（SystemPromptSections:56-76）：
+        //   请求线程快照 projectRoot → 每个 worker 内 set/restore（不跨任务泄漏）→ 依赖该 ThreadLocal 的
+        //   section（memory）在正确会话语义下计算。无会话调用（capture null）→ setCurrentProjectRoot(null)
+        //   等价 remove，行为与现状一致。
+        final String sessionProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
         CompletableFuture<String>[] futures = new CompletableFuture[sections.size()];
         for (int i = 0; i < sections.size(); i++) {
             final SystemPromptSection s = sections.get(i);
             futures[i] = CompletableFuture.supplyAsync(() -> {
-                if (!s.cacheBreak() && cache.has(s.name())) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("[SystemPromptSectionRegistry] 缓存命中，跳过 compute: name={}, cacheBreak={}", s.name(), s.cacheBreak());
+                final String prev = AutoMemPaths.captureCurrentProjectRoot();
+                AutoMemPaths.setCurrentProjectRoot(sessionProjectRoot);
+                try {
+                    if (!s.cacheBreak() && cache.has(s.name())) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("[SystemPromptSectionRegistry] 缓存命中，跳过 compute: name={}, cacheBreak={}", s.name(), s.cacheBreak());
+                        }
+                        return cache.get(s.name());
                     }
-                    return cache.get(s.name());
+                    if (log.isDebugEnabled()) {
+                        log.debug("[SystemPromptSectionRegistry] 缓存未命中，开始 compute: name={}, cacheBreak={}", s.name(), s.cacheBreak());
+                    }
+                    String value = s.compute().compute().join();
+                    cache.set(s.name(), value);
+                    return value;
+                } finally {
+                    AutoMemPaths.restoreCurrentProjectRoot(prev);
                 }
-                if (log.isDebugEnabled()) {
-                    log.debug("[SystemPromptSectionRegistry] 缓存未命中，开始 compute: name={}, cacheBreak={}", s.name(), s.cacheBreak());
-                }
-                String value = s.compute().compute().join();
-                cache.set(s.name(), value);
-                return value;
             });
         }
         CompletableFuture.allOf(futures).join();

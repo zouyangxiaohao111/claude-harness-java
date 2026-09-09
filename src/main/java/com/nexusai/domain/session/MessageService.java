@@ -102,6 +102,71 @@ public class MessageService {
         return result;
     }
 
+    /** [window-paging] 每页默认条数 · 对齐 deepseek-harness session.ts PAGE_MESSAGES=50。 */
+    public static final int DEFAULT_PAGE_SIZE = 50;
+
+    /**
+     * [window-paging] 分页读取会话消息 · GET /sessions/{sessionId}/messages/page。
+     *
+     * <p><b>语义</b>（对齐 deepseek 有界历史窗口）：前端普通查看只按页加载 —— 缺省（{@code beforeMessageId}
+     * 空）= <b>尾页</b>（最新 {@code limit} 条，created_at ASC 返回）；{@code beforeMessageId} 非空 = 该消息
+     * 之前更早的一页。`created_at` 为稳定序（replaceSessionMessages 用 base.plusNanos 保序写），作游标；
+     * 多查 1 条判定 hasMore。
+     *
+     * <p><b>与 {@link #listBySession} 的关系</b>：本方法是前端主通道（有界窗口，session 首载 / F5 / 向上翻页）；
+     * {@code listBySession} 全量保留给后端内部（LLM resume / partialCompact / trim 定位）+ 前端 Trace 全程
+     * （用户拍板：全量仅限 resume/trace/权威回填，前端查看一律 page）。上下文快照补算仅<b>尾页</b>有意义
+     * （{@link #applyContextSnapshotToLastAssistant} 补末条 assistant）。
+     *
+     * @param sessionId       会话 id（DB 键 "sess-xxx"）
+     * @param beforeMessageId 游标消息 id（null/blank = 尾页）；该消息本身排除
+     * @param limit           每页条数（&lt;=0 → 回落 {@link #DEFAULT_PAGE_SIZE}）
+     * @return {messages(created_at ASC), hasMore}；空会话 → 空列表 + hasMore=false
+     * @throws NotFoundException session 不存在 / beforeMessageId 不在该会话
+     */
+    public PageResult listPageBySession(String sessionId, String beforeMessageId, int limit) {
+        if (sessionMapper.selectOneById(sessionId) == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        final int pageSize = limit > 0 ? limit : DEFAULT_PAGE_SIZE;
+        QueryWrapper qw = QueryWrapper.create().eq("session_id", sessionId);
+        if (beforeMessageId != null && !beforeMessageId.isBlank()) {
+            MessageRecord pivot = messageMapper.selectOneByQuery(
+                QueryWrapper.create().eq("session_id", sessionId).eq("id", beforeMessageId));
+            if (pivot == null) {
+                throw new NotFoundException("Message " + beforeMessageId + " not found in session " + sessionId);
+            }
+            qw.lt("created_at", pivot.getCreatedAt());
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[MessageService] listPageBySession: session={} before={} limit={}（window-paging 有界窗口）",
+                sessionId, beforeMessageId, pageSize);
+        }
+        // DESC 取 pageSize+1 → 多 1 条 ⇒ hasMore；reverse 回 ASC 供前端顺序渲染
+        List<MessageRecord> desc = messageMapper.selectListByQuery(
+            qw.orderBy("created_at", false).limit(0, pageSize + 1));
+        boolean hasMore = desc.size() > pageSize;
+        List<MessageRecord> page = desc.size() > pageSize ? desc.subList(0, pageSize) : desc;
+        List<MessageRecord> asc = new ArrayList<>(page);
+        java.util.Collections.reverse(asc);
+        List<ChatMessageDto> result = new ArrayList<>(asc.size());
+        for (MessageRecord m : asc) {
+            result.add(toDto(m));
+        }
+        if (beforeMessageId == null || beforeMessageId.isBlank()) {
+            // 尾页才补上下文快照（前页更早消息的 usage 已随 DB 存储，无需重算）
+            applyContextSnapshotToLastAssistant(result, sessionId);
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[MessageService] listPageBySession: session={} 返回 {} 条（hasMore={}, before={}）",
+                sessionId, result.size(), hasMore, beforeMessageId);
+        }
+        return new PageResult(result, hasMore);
+    }
+
+    /** [window-paging] 分页响应 · {messages(created_at ASC), hasMore}。 */
+    public record PageResult(List<ChatMessageDto> messages, boolean hasMore) {}
+
     /**
      * [token-compact-fix ⑤方案B] 重拉上下文快照补算 · 用户拍板：不落库，每次重算。
      *

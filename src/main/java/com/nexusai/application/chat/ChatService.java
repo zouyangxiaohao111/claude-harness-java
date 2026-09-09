@@ -1310,27 +1310,9 @@ public class ChatService {
                 return;
             }
 
-            // [toolsum-display 2026-09-09] tool_use_summary 展示行落库（role=user/author=attachment/
-            // subtype=tool_use_summary/isMeta=true，由 LlmAgentLoop 经 appendMessage 触发）。
-            //   WHY：UI 可观测 + 历史可翻（GET /messages 读回 subtype 渲染），不向 wsTemplate 广播
-            //   （实时行走 LlmAgentLoop emitToolUseSummarySdkMessage → /topic/tasks，防双发）。
-            if (Role.user == m.role() && "attachment".equals(m.author())
-                    && com.nexusai.application.agent.attachment.AttachmentMessageDto.TYPE_TOOL_USE_SUMMARY.equals(m.subtype())) {
-                if (messageService != null) {
-                    try {
-                        messageService.appendMessage(m, ts);
-                        if (log.isInfoEnabled()) {
-                            log.info("ChatService: tool_use_summary 展示行实时落库: session={} id={} len={}",
-                                sessionId, abbreviate(m.id(), 16),
-                                m.content() == null ? 0 : m.content().length());
-                        }
-                    } catch (Exception e) {
-                        log.warn("ChatService: tool_use_summary 展示行落库失败（best-effort 不阻断）: session={} id={}: {}",
-                            sessionId, abbreviate(m.id(), 16), e.getMessage());
-                    }
-                }
-                return;
-            }
+            // [toolsum-cc 2026-09-09] 原 tool_use_summary 展示行落库分支已删（对齐 CC：summary 只 yield SDK，
+            //   不进 transcript/messages，见 LlmAgentLoop tool_use_summary 消费点注释）；历史遗留该 subtype
+            //   行不再被 append → 本分支不再可达。后续 role=user 分支照常。
 
             if (m.role() == Role.user) {
                 // [AM-CC-20260825] A4 图片 user 消息：imagePasteIds 回写 lastUserMessageId 对应 user 行

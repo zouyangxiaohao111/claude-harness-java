@@ -4777,15 +4777,13 @@ public class LlmAgentLoop implements AgentLoop {
                         pendingToolUseSummary.get(2, java.util.concurrent.TimeUnit.SECONDS);
                     if (summary != null) {
                         state.appendAttachment(summary);
-                        // [toolsum-display] 摘要另落一条「UI 展示行」（role=user/author=attachment/
-                        // subtype=tool_use_summary/isMeta=true）→ appendListener → ChatService 落库，
-                        // 前端 GET /messages 渲染一行且历史可翻；模型侧由 messagesForQuery 过滤剔除。
-                        // isMeta=true：避免归属污染 lastUserMessageId、避免被前端当真实用户行。
-                        try {
-                            state.appendMessage(toToolUseSummaryMessage(summary, state));
-                        } catch (Exception e) {
-                            log.warn("[LlmAgentLoop] tool_use_summary 展示行落库失败（best-effort 不阻断）: {}", e.getMessage());
-                        }
+                        // [toolsum-cc 2026-09-09] 对齐 CC：tool_use_summary 只 yield 到 SDK 流（前端实时），
+                        //   不进 transcript/messages 状态数组、不落库（CC query.ts:1055-1060 + messages.ts:5105-5116，
+                        //   Java 侧 emitToolUseSummarySdkMessage → /topic/tasks 承接实时）。
+                        //   原 toolsum-display「另落 UI 展示行」是 Java 独有扩展：① 展示行构造 sessionId 缺失 →
+                        //   INSERT messages.session_id NOT NULL 失败成 best-effort WARN；② 偏离 CC 语义。
+                        //   删除展示行落库 → 该行仅 /topic/tasks 实时可见（F5 后不再历史可翻 = CC 行为）；
+                        //   历史遗留展示行由 messagesForQuery isToolUseSummaryRow 过滤继续剔除不进模型。
                         log.info("[LlmAgentLoop] turn={} tool_use_summary 注入 (chars={}) · CC query.ts:1055-1060",
                             state.turnCount(),
                             summary.content() != null ? summary.content().length() : 0);
@@ -9099,28 +9097,6 @@ public class LlmAgentLoop implements AgentLoop {
     private static boolean isToolUseSummaryRow(ChatMessageDto m) {
         return m != null && Role.user == m.role() && "attachment".equals(m.author())
             && com.nexusai.application.agent.attachment.AttachmentMessageDto.TYPE_TOOL_USE_SUMMARY.equals(m.subtype());
-    }
-
-    /** [toolsum-display] AttachmentMessageDto(summary) → 展示用 ChatMessageDto 落库行（author=attachment，isMeta=true）。 */
-    private static ChatMessageDto toToolUseSummaryMessage(
-            com.nexusai.application.agent.attachment.AttachmentMessageDto a, AgentState state) {
-        String sessionId = state != null ? state.sessionId() : null;
-        String userMessageId = state != null ? state.lastUserMessageId() : null;
-        if (userMessageId == null) {
-            userMessageId = sessionId;
-        }
-        String type = com.nexusai.application.agent.attachment.AttachmentMessageDto.TYPE_TOOL_USE_SUMMARY;
-        // 21 参形状镜像 PostCompactAttachmentRestorer.buildAttachmentMessage（author='attachment' 落库行），
-        // isMeta=true（防归属污染/前端当真实用户行）；userMessageId 经 withUserMessageId 拷贝链（不动 ctor 位置）。
-        return new ChatMessageDto(
-            a.id() != null ? a.id() : java.util.UUID.randomUUID().toString(),
-            null, Role.user, "attachment",
-            a.content() != null ? a.content() : "", null, java.util.List.of(),
-            com.nexusai.model.session.dto.FinishReason.stop,
-            null, null, "刚刚", java.time.OffsetDateTime.now(),
-            null, null, null,
-            java.util.List.of(), java.util.List.of(), null, true, false, type)
-            .withUserMessageId(userMessageId);
     }
 
     // ── [W9-01 OPD-TS-29] tool_use_summary SDK 出站序列化 ──

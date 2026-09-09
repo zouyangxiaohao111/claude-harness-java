@@ -605,7 +605,24 @@ public class AutoCompactor {
         }
 
         // ── 阈值比较（autoCompact.ts:225-238）──
-        int tokenCount = tokenCounter.count(messages) - snipTokensFreed;
+        // [compact-realusage A 2026-09-09] 对齐 CC autoCompact.ts:225 tokenCount = tokenCountWithEstimation(messages)
+        //   − snipTokensFreed（tokens.ts:251 usage-walk：最近真实 API usage 打底 + 尾部粗估）——与 blocking
+        //   预检（LlmAgentLoop:5621-5628 tokenCountWithEstimation − snipTokensFreed）同源。旧实现
+        //   tokenCounter.count 为纯 4 字符/token 粗估，中文/代码/长工具输出高估 ~2×（实测 56.5 万估成 113 万
+        //   → 越 90% 误触 AUTO 压缩，见 2026-09-09 sess-fcdcdc68 日志）。deepseek/openai_compatible 走
+        //   resolveAnthropic=false（input 已含 cache hit，双计已修）。无 model（单测/未接线）→ 回落 estimate，
+        //   零行为变化。
+        int tokenCount;
+        if (model != null && !model.isBlank() && hasAssistantUsage(messages)) {
+            // 会话含真实 assistant usage（运行时 appendMessage(...withUsage...) 回填 input/output）
+            // → usage-walk（CC autoCompact.ts:225 tokenCountWithEstimation）：最近真实 API usage 打底 +
+            // 尾部粗估，不再纯估虚高误触（2026-09-09 sess-fcdcdc68：真实 56.5 万被估 113 万误触）。
+            tokenCount = Tokens.tokenCountWithEstimation(
+                messages, CompactConversation.resolveAnthropic(model)) - snipTokensFreed;
+        } else {
+            // model null / 无真实 usage（单测 mock tokenCounter / 纯文本小会话）→ 回落 estimate（零行为变化）
+            tokenCount = tokenCounter.count(messages) - snipTokensFreed;
+        }
 
         // [F2/G-23] 四态统一来源 · 对齐 CC autoCompact.ts:233-236：shouldAutoCompact 经
         // calculateTokenWarningState(...).isAboveAutoCompactThreshold 判定（替代原阈值直连；
@@ -626,6 +643,20 @@ public class AutoCompactor {
         }
 
         return warningState.isAboveAutoCompactThreshold();
+    }
+
+    /** [compact-realusage] 会话是否含真实 assistant usage（input/output 均已回填）→ 才走 usage-walk 判定。 */
+    private static boolean hasAssistantUsage(List<ChatMessageDto> messages) {
+        if (messages == null) {
+            return false;
+        }
+        for (ChatMessageDto m : messages) {
+            if (m != null && m.role() == com.nexusai.model.session.dto.Role.assistant
+                    && m.inputTokens() != null && m.outputTokens() != null) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

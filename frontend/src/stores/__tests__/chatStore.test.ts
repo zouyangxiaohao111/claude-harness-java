@@ -218,3 +218,54 @@ describe('chatStore message.usage 逐块挂载 + finalize 逐块优先', () => {
     expect(m?.contextWindow).toBe(200000)
   })
 })
+
+describe('chatStore streamTicks（[chat-switch-stream-align] 流式活动节拍 · 滚底按会话隔离）', () => {
+  it('appendChunk/appendReasoning 成功 → 本会话节拍 +1；块不存在 no-op 不递增；会话间隔离', () => {
+    const s = createChatStore()
+    expect(s.getState().streamTicks['sess-1'] ?? 0).toBe(0)
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    expect(s.getState().streamTicks['sess-1'] ?? 0).toBe(0) // 建块不推进节拍
+    s.getState().appendChunk('sess-1', 'turn-a', '一')
+    expect(s.getState().streamTicks['sess-1'] ?? 0).toBe(1)
+    s.getState().appendReasoning('sess-1', 'turn-a', '想')
+    expect(s.getState().streamTicks['sess-1'] ?? 0).toBe(2)
+    // 不匹配块 → no-op，节拍不推进（WHY：滚底订阅靠 tick 判断「本会话内容推进」，无效 append 不得触发滚动）
+    s.getState().appendChunk('sess-1', 'missing', 'x')
+    s.getState().appendReasoning('sess-1', 'missing', 'x')
+    expect(s.getState().streamTicks['sess-1'] ?? 0).toBe(2)
+    // 会话间隔离：sess-2 未推进（WHY：A 会话打字不得拖拽当前显示的 B 容器滚动）
+    expect(s.getState().streamTicks['sess-2'] ?? 0).toBe(0)
+  })
+  it('ensureStreamBlock 建块不推进；clearStream/finalize 不清节拍（节拍只表示内容推进，不随块生命周期归零）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().appendChunk('sess-1', 'turn-a', 'x')
+    s.getState().clearStream('sess-1')
+    expect(s.getState().streamTicks['sess-1'] ?? 0).toBe(1) // 保留：切回后内容继续推进 tick 变 → 正确触发一次滚底
+  })
+})
+
+describe('chatStore hasMore / prependMessages（[window-paging] 有界历史窗口）', () => {
+  it('setHasMore 落 store 且按会话隔离（WHY：顶部「加载更早」按钮显隐按会话独立）', () => {
+    const s = createChatStore()
+    s.getState().setHasMore('sess-1', true)
+    s.getState().setHasMore('sess-2', false)
+    expect(s.getState().hasMore['sess-1']).toBe(true)
+    expect(s.getState().hasMore['sess-2']).toBe(false)
+  })
+  it('prependMessages 头部插更早 + overlap 幂等去重 + 更新 hasMore（向上翻页保持 created_at 时序）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m3'), baseMsg('m4')])
+    s.getState().prependMessages('sess-1', [baseMsg('m1'), baseMsg('m2'), baseMsg('m3')], true)
+    expect(s.getState().messages['sess-1']?.map((m) => m.id)).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(s.getState().hasMore['sess-1']).toBe(true)
+  })
+  it('prependMessages 前页含 snip_boundary → 并入 snippedIds（照常「已裁剪」标注）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m5')])
+    const boundary: ChatMessageDto = { ...baseMsg('b1'), subtype: 'snip_boundary', snipMetadata: { removedUuids: ['u1', 'u2'] } }
+    s.getState().prependMessages('sess-1', [boundary, baseMsg('m4')], false)
+    expect(s.getState().snippedIds['sess-1']).toEqual(['u1', 'u2'])
+    expect(s.getState().hasMore['sess-1']).toBe(false)
+  })
+})

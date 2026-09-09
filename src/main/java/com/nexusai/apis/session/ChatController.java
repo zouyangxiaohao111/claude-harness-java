@@ -69,6 +69,26 @@ public class ChatController {
         return TeammateMessageFoldingChain.collapse(messageService.listBySession(sessionId));
     }
 
+    /**
+     * [window-paging] 有界历史窗口分页 · GET /sessions/{sessionId}/messages/page。
+     *
+     * <p><b>语义</b>（对齐 deepseek）：前端查看按页取 —— 缺省 = 尾页（最新 {@code limit} 条）；
+     * {@code beforeMessageId} = 该消息之前更早一页。多查 1 条回 hasMore。{@code limit} 缺省 50。
+     * {@code GET /messages}（全量）保留给 Trace 全程 / 后端内部（LLM resume、partialCompact/trim 回填）。
+     *
+     * @return {messages: ChatMessageDto[]（created_at ASC）, hasMore: boolean}
+     */
+    @GetMapping("/messages/page")
+    public PageResp page(@PathVariable String sessionId,
+                         @RequestParam(required = false, defaultValue = "50") int limit,
+                         @RequestParam(required = false) String beforeMessageId) {
+        MessageService.PageResult pr = messageService.listPageBySession(sessionId, beforeMessageId, limit);
+        return new PageResp(TeammateMessageFoldingChain.collapse(pr.messages()), pr.hasMore());
+    }
+
+    /** [window-paging] /messages/page 响应体。 */
+    public record PageResp(List<ChatMessageDto> messages, boolean hasMore) {}
+
     @PostMapping("/messages")
     @ResponseStatus(HttpStatus.ACCEPTED)
     public MessageCreatedResponse send(@PathVariable String sessionId,

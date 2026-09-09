@@ -207,6 +207,8 @@ interface MessageListProps {
   onOpenRefFile?: (path: string) => void
   /** 滚动贴底状态回调（「回到底部」按钮由 Composer 工具栏渲染 · 离底时 App 传 showToBottom=true） */
   onNearBottomChange?: (atBottom: boolean) => void
+  /** [window-paging] 顶部「加载更早」（hasMore 时显示）：App 取窗口首条 beforeMessageId 拉前页 prependMessages */
+  onLoadOlder?: (sessionId: string) => Promise<void> | void
 }
 
 /** 工具调用卡片 · FNT-TC-01：消息级 matchedRule（后端 ChatMessageDto 顶层出站）→ 显示「已自动批准（规则X）」徽标；无数据静默 */
@@ -641,19 +643,24 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
             {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
           </div>
         )}
-        {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
+        {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} streamKey={`${sessionId}:${blockId}`} />}
         {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live />)}
       </div>
     </div>
   )
 })
 
-export function MessageList({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile }: MessageListProps) {
+export function MessageList({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
   // [流式性能] 稳定行序订阅：引用只在块增/删/finalize/clear 变化；content 追加不触碰 → 父级不被打字机逐帧重渲
   const streamIds = useChatStore(selectStreamIds(sessionId))
+  // [chat-switch-stream-align] 当前渲染会话 ref（store.subscribe 回调需读最新，闭包不捕获过期值）
+  const sessionIdRef = useRef(sessionId)
+  sessionIdRef.current = sessionId
+  /** 本会话流式活动节拍缓存（-1 = 尚未见过首帧；见 streamTicks 说明）。 */
+  const lastStreamTickRef = useRef(-1)
   const streamWrapRef = useRef<HTMLDivElement>(null)
   const lastMsgId = messages[messages.length - 1]?.id
   // HTML 代码块「运行」→ 独立窗口预览（sandbox iframe 运行结果 · 不占右栏、不打断对话）
@@ -689,16 +696,12 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     if (el) el.scrollTop = el.scrollHeight
   }
   // 记录滚动位置：用户上滚查历史 → nearBottom=false；拉到底部 → true（含外部滚动，如浏览器）
-  //  [窗口化] 触顶（scrollTop ≤ 24）且仍有更早历史 → 增量扩展可见窗口（顶部插入内容的高度补偿在渲染后 effect）
+  // [window-paging] 移除「触顶自动翻页」（原渲染层窗口扩展）——更早历史改为顶部「加载更早」显式按钮
   const onScroll = () => {
     const el = scrollElRef.current
     if (!el) return
     nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICKY_BOTTOM_THRESHOLD
     onNearBottomChangeRef.current?.(nearBottomRef.current)
-    if (el.scrollTop <= 24 && flatRowsLenRef.current > visCountRef.current) {
-      loadPrevScrollHRef.current = el.scrollHeight
-      setVisCount((v) => Math.min(v + WINDOW_STEP, flatRowsLenRef.current))
-    }
   }
   // 绑定滚动容器：空态（messages 空 且 无流式）时组件 return null → streamWrapRef 无 DOM，
   //   故容器引用与监听在「消息数或流式出现」后重绑（首条消息/首个流式块出现时 streamWrapRef 才有效）
@@ -722,11 +725,26 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
   }, [lastMsgId])
   // [流式性能 2026-09-09] 流式滚底改为 store.subscribe（不触发 React 重渲）：打字机 content 逐帧 append 时
   //   父级不再被重渲（只订 streamOrder 稳定引用），但滚动需跟随流尖 —— 订阅 store 原语，贴底时直接写 scrollTop。
-  //   语义与旧 streamingTail effect 一致：仅 nearBottom 时跟随；上滚看历史不被拽回。
+  // [chat-switch-stream-align] 按会话隔离 + rAF 后写：
+  //   · 只当「当前渲染会话」的流式活动节拍（streamTicks[sid]）推进才滚 —— 修复「A 会话仍在打字、切到 B 查看
+  //     时，A 每帧 append 触发 subscribe → 把 B 的滚动容器拉到旧底」的抖动/错乱（对齐 deepseek 每 Session 独立
+  //     follow，互不劫持；切换前会话也照常收到其 chunk，但滚动只跟当前显示会话的流尖）。
+  //   · rAF 后写：subscribe 回调在 store 通知期同步执行，此时 scrollHeight 是旧值 → 包 rAF 待 React commit 后
+  //     读新高度再写，避免反复写回旧底。
+  //   语义保留：仅 nearBottom 时跟随；上滚看历史不被拽回。
   useEffect(() => {
-    return useChatStore.subscribe(() => {
-      if (nearBottomRef.current) stickBottom()
+    lastStreamTickRef.current = -1
+    let raf = 0
+    const unsub = useChatStore.subscribe(() => {
+      const sid = sessionIdRef.current
+      if (!sid || !nearBottomRef.current) return
+      const tick = useChatStore.getState().streamTicks[sid] ?? 0
+      if (tick === lastStreamTickRef.current) return
+      lastStreamTickRef.current = tick
+      if (raf) cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => { raf = 0; stickBottom() })
     })
+    return () => { unsub(); if (raf) cancelAnimationFrame(raf) }
   }, [])
   // 外部滚底信号（权限卡片出现等 App 层事件）→ 强制滚底
   useEffect(() => {
@@ -771,11 +789,10 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     }
     return arr
   }, [messages, streamIds, sessionId])
-  // ---- [窗口化渲染] 长会话防卡：默认只渲染尾部 WINDOW_MAX 行（消息 + 流式块 + 组尾错误卡），
-  //      上拉到顶自动增量加载更早 WINDOW_STEP 行。渲染行数上限恒定 → 打开长会话/流式推进不随历史量卡死。----
-  const WINDOW_MAX = 150 // 初始可见渲染行数
-  const WINDOW_STEP = 100 // 触顶单次增量加载行数
-  // 线性渲染行（保时间序：组内顺序即全局消息序；组尾 err 卡片跟随其组）供窗口截取
+  // ---- [window-paging] 有界历史窗口：渲染「已加载窗口」全量（尾页 50 + 顶部「加载更早」prepend 前页）。
+  //     数据天然有界 → 移除渲染层固定尾窗（原 150 尾窗造成「滚到顶看不到更早」）；行级 memo + settled LRU 兜底。
+  //     更早历史 = 顶部显式按钮（hasMore 时）→ onLoadOlder（App 拉前页 prependMessages + commit 后滚高补偿）。----
+  // 线性渲染行（保时间序：组内顺序即全局消息序；组尾 err 卡片跟随其组）→ 全量渲染已加载窗口
   const flatRows = useMemo(() => {
     const rows: (
       | { key: string; kind: 'msg'; m: ChatMessageDto }
@@ -793,33 +810,33 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     }
     return rows
   }, [groups, apiErrorMap, rowKey])
-  const [visCount, setVisCount] = useState(WINDOW_MAX)
-  // 会话内容首条 id 变化（切换会话/清空历史）→ 窗口重置为尾部 WINDOW_MAX；同会话 F5 重拉首 id 不变 → 保留展开窗口
+  // 会话内容首条 id 变化（切换会话/清空历史/F5 尾页重拉）→ 滚到底（=最新回复），不沿用上一会话滚动位置；
+  //   等容器绑 + 内容渲染后再滚（setTimeout 0）
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
-    setVisCount(WINDOW_MAX)
-    // 切会话默认滚到【最底部 = 最新回复】，不沿用上一会话滚动位置/贴底态（否则上拉过旧会话后
-    //   切到 assistant 结尾的新会话会停在顶部）；等容器绑 + 内容渲染后再滚（setTimeout 0）
     nearBottomRef.current = true
     onNearBottomChangeRef.current?.(true)
     const t = window.setTimeout(() => stickBottom(), 0)
     return () => window.clearTimeout(t)
   }, [messages[0]?.id])
-  const hasMoreOlder = flatRows.length > visCount
-  const visible = hasMoreOlder ? flatRows.slice(flatRows.length - visCount) : flatRows
-  // onScroll 在滚动容器重绑时闭包捕获旧值 → 经 ref 读最新（窗口扩展后触顶监听不停摆）
-  const flatRowsLenRef = useRef(flatRows.length)
-  flatRowsLenRef.current = flatRows.length
-  const visCountRef = useRef(visCount)
-  visCountRef.current = visCount
-  const loadPrevScrollHRef = useRef(0)
-  // 窗口扩展（顶部插入更早历史）后补偿 scrollTop（内容增高差）→ 阅读位置不跳动（loadPrev 置位的那次渲染后执行）
-  useEffect(() => {
-    if (!loadPrevScrollHRef.current) return
-    const el = scrollElRef.current
-    if (el) el.scrollTop += el.scrollHeight - loadPrevScrollHRef.current
-    loadPrevScrollHRef.current = 0
-  })
+  // [window-paging] hasMore（会话有更早历史）→ 顶部「加载更早」按钮；App onLoadOlder 拉前页 prependMessages。
+  const hasMore = useChatStore((s) => (sessionId ? s.hasMore[sessionId] : undefined))
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const loadOlderClick = async () => {
+    if (!sessionId || loadingOlder) return
+    setLoadingOlder(true)
+    try {
+      // 记录加载前高度 → App prependMessages（同步改 store）后在 commit 后补 scrollTop 防阅读跳
+      const prevH = scrollElRef.current?.scrollHeight ?? 0
+      await onLoadOlder?.(sessionId)
+      if (prevH) requestAnimationFrame(() => {
+        const el = scrollElRef.current
+        if (el) el.scrollTop += el.scrollHeight - prevH
+      })
+    } finally {
+      setLoadingOlder(false)
+    }
+  }
   // 空态（置于所有 hooks 之后 · React 19 hooks 规则：hooks 前不得条件 return）
   if (messages.length === 0 && streamIds.length === 0) {
     return null
@@ -941,11 +958,17 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
           white-space: nowrap;
         }
       `}</style>
+      {/* [window-paging] 顶部「加载更早」（hasMore 时；对齐 deepseek loadOlder 显式按钮，不做滚顶自动翻页） */}
+      {hasMore && (
+        <button className="ml-load-older" disabled={loadingOlder} onClick={loadOlderClick}>
+          {loadingOlder ? '加载中…' : '↑ 加载更早'}
+        </button>
+      )}
       {/* F29 · 元消息（续写提示 / budget nudge）isMeta=true 不展示；role=tool 工具结果消息已含于
           assistant.toolCalls[].result（DB 重拉后），独立渲染会重复噪音 → 一并过滤 */}
       {/* 按 userMessageId 分组渲染（消息链锚定 · 对齐 GET /messages 后端出站链）：
           每组 = 一个 flow（user 消息 + 其 assistant/工具流），工具轮挂主气泡下；排队场景顺序正确 */}
-      {visible.map((row) => {
+      {flatRows.map((row) => {
         if (row.kind === 'msg') {
           return <MemoMessage key={row.key} msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile} />
         }

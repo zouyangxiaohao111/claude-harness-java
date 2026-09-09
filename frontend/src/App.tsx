@@ -409,6 +409,43 @@ function App() {
 
   // ---- 合并「对话操作」：双击 Esc 触发弹窗（压缩 tab；消息非空且非 loading）----
   const setMessages = useChatStore((s) => s.setMessages)
+  // [window-paging] 有界历史窗口每页条数（对齐 deepseek 默认 50）
+  const HISTORY_PAGE_SIZE = 50
+  /** [window-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/page 尾页，不再全量拉。 */
+  const loadTailWindow = useCallback(async (sid: string) => {
+    const { messages, hasMore } = await chatApi.listMessagesPage(sid, { limit: HISTORY_PAGE_SIZE })
+    setMessages(sid, messages)
+    useChatStore.getState().setHasMore(sid, hasMore)
+  }, [setMessages])
+  /** [window-paging] 向上翻页「加载更早」：以窗口首条为 beforeMessageId 取更早一页 prepend（保持时序 + 幂等去重）。 */
+  const handleLoadOlder = useCallback(async (sid: string) => {
+    const st = useChatStore.getState()
+    const first = (st.messages[sid] ?? [])[0]
+    if (!first?.id) return
+    try {
+      const { messages, hasMore } = await chatApi.listMessagesPage(sid, {
+        limit: HISTORY_PAGE_SIZE,
+        beforeMessageId: first.id,
+      })
+      st.prependMessages(sid, messages, hasMore)
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [showToast])
+  // [window-paging] Trace 全程：会话全量消息（独立于聊天有界窗口 storeMessages · 用户拍板「Trace 就是全程」）。
+  const [traceMessages, setTraceMessages] = useState<Awaited<ReturnType<typeof chatApi.listMessages>>>([])
+  const loadTraceFull = useCallback(async (sid: string) => {
+    try {
+      const msgs = await chatApi.listMessages(sid) // 全量：Trace = 全程记录（不受窗口限制）
+      setTraceMessages(msgs)
+    } catch { /* trace 全量拉失败静默（重进 trace / 手动再点兜底） */ }
+  }, [])
+  // 保持在 Trace 视图时切会话 → 重新拉全程
+  useEffect(() => {
+    if (centerView !== 'trace' || !activeSessionId) return
+    void loadTraceFull(activeSessionId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [centerView, activeSessionId, loadTraceFull])
   const removeMessage = useChatStore((s) => s.removeMessage)
   const clearStream = useChatStore((s) => s.clearStream)
   const setConversationId = useChatStore((s) => s.setConversationId)
@@ -421,10 +458,9 @@ function App() {
   const refreshAfterStop = useCallback(async () => {
     if (!activeSessionId) return
     try {
-      const msgs = await chatApi.listMessages(activeSessionId)
-      setMessages(activeSessionId, msgs)
+      await loadTailWindow(activeSessionId)
     } catch { /* 停止后刷新失败静默（后续事件/手动 F5 兜底） */ }
-  }, [activeSessionId, setMessages])
+  }, [activeSessionId, loadTailWindow])
   // ---- 停止当前流式（Esc 一次 · turn 运行中）----
   const stopStreaming = useCallback(async () => {
     if (!activeSessionId) return
@@ -559,16 +595,16 @@ function App() {
     }
   }, [activeSessionId, setMessages, setConversationId, showToast])
 
-  // 重拉当前会话消息（DB 权威 · 无 toast）：complete 回调 + F5 共用；块级流契约 #2 用它对齐多轮链
+  // [window-paging] 重拉当前会话（无 toast · complete 回调 + F5 共用）：查看通道 = 尾页窗口（对齐 deepseek，
+  //   不再全量）。Trace 全程由 loadTraceFull 单独全量拉（见 center-tabs onClick / 渲染用 traceMessages）。
   const reloadMessages = useCallback(async () => {
     if (!activeSessionId) return
     try {
-      const msgs = await chatApi.listMessages(activeSessionId)
-      setMessages(activeSessionId, msgs)
+      await loadTailWindow(activeSessionId)
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [activeSessionId, setMessages, showToast])
+  }, [activeSessionId, loadTailWindow, showToast])
 
   // F5 刷新当前页面（对话/轨迹均基于会话消息）：无弹窗打开时重新拉取当前会话历史；客户端聚焦时 window keydown 天然满足，无额外按钮
   const refreshConversation = useCallback(async () => {
@@ -601,14 +637,25 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [ui, settings.settingsTab, providersApi, skillsApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
 
-  // ---- 历史回放：会话切换（真实后端 id）时先清空，再拉取该会话历史消息 ----
+  // ---- 历史回放：会话切换 —— 有常驻缓存直接复用；仅从未载入的会话才 GET 初始化 ----
+  // [chat-switch-stream-align] 对齐 deepseek「Session 数据常驻、切回不重拉」：messages/streams 已常驻
+  //   chatStore，实时链路（chunk append / message.user / complete finalize / queue.drained）持续增量维护。
+  //   旧实现每次切会话都 setMessages(activeSessionId, []) + GET 重拉 → 对仍正流式输出的会话切回瞬间历史
+  //   闪没、整列表重排抖动；store 明明有缓存还破坏重拉与常驻语义自相矛盾。故改为：缓存命中（历史非空，
+  //   含实时 finalize 增量）→ 直接渲染不重拉；仅 undefined/空缓存（首次切到未载入会话）才 GET 初始化。
   const isRealActive = storeSessions.some((s) => s.id === activeSessionId)
   useEffect(() => {
     if (!isRealActive) return
     let cancelled = false
-    setMessages(activeSessionId, [])
-    chatApi.listMessages(activeSessionId)
-      .then((msgs) => { if (!cancelled) setMessages(activeSessionId, msgs) })
+    const cached = useChatStore.getState().messages[activeSessionId]
+    if (Array.isArray(cached) && cached.length > 0) return
+    // [window-paging] 无缓存 → 尾页（有界窗口，不再全量；hasMore 供顶部「加载更早」）
+    chatApi.listMessagesPage(activeSessionId, { limit: HISTORY_PAGE_SIZE })
+      .then(({ messages, hasMore }) => {
+        if (cancelled) return
+        setMessages(activeSessionId, messages)
+        useChatStore.getState().setHasMore(activeSessionId, hasMore)
+      })
       .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
     return () => { cancelled = true }
   }, [activeSessionId, isRealActive, setMessages, showToast])
@@ -691,13 +738,13 @@ function App() {
   //   （F5/当前会话专用）,后台会话断连需按 sid 拉 → 独立实现。finalizeBlocks 按 id 幂等去重保证不重复。
   const handleReconnectReload = useCallback(async (sid: string) => {
     try {
-      const msgs = await chatApi.listMessages(sid)
-      setMessages(sid, msgs)
+      // [window-paging] 查看通道一律尾页（对齐 deepseek；被 snip/裁剪的更早消息由向上翻页补）
+      await loadTailWindow(sid)
     } catch {
       // 重拉失败静默（不 toast 打扰——可能后台会话;下次 complete / 手动 F5 / 切会话重拉兜底）
       console.debug('[reconnect-reload]', 'sid=', sid, '失败（静默,待下次兜底）')
     }
-  }, [setMessages])
+  }, [loadTailWindow])
 
   // 多会话并行订阅（订阅所有 activeStreams；complete/cancel 明确回调移除）
   const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload)
@@ -1525,8 +1572,8 @@ function App() {
             className={`center-tab ${centerView === 'trace' ? 'active' : ''}`}
             onClick={() => {
               setCenterView('trace')
-              // 切到轨迹视图自动后台重拉当前会话最新消息（轨迹 = 消息派生的记录，无需手动 F5 才看到新记录）
-              if (activeSessionId) void reloadMessages()
+              // [window-paging] Trace 全程：切到轨迹自动全量拉（独立于聊天有界窗口）
+              if (activeSessionId) void loadTraceFull(activeSessionId)
             }}
           >
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M6 1L6 9M6 9L3 6M6 9L9 6M3 11H9"/></svg>
@@ -1536,9 +1583,9 @@ function App() {
         </div>
         <div className="stream">
           {centerView === 'trace' ? (
-            <TraceView messages={storeMessages} />
+            <TraceView messages={traceMessages} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} />
           )}
         </div>
         {currentPermission && (

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { MarkdownText } from '../MarkdownText.tsx'
+import { MarkdownText, acquireStreamingRenderer } from '../MarkdownText.tsx'
 
 const noop = () => {}
 function render(text: string, streaming = false) {
@@ -108,7 +108,7 @@ describe('XSS 自持（替代 DOMPurify）', () => {
   })
 })
 
-describe('streaming 与 settled 一致性（无需 patch 的 GFM 文本应逐字节一致）', () => {
+describe('streaming 与 settled 一致性（[markdown-fix] 去 patches 后同源文本逐字节一致）', () => {
   it('heading/段落/表格/列表/强调/链接 两种形态渲染一致', () => {
     const text = '## 标题\n\n一段有 **加粗** 与 [链接](https://e.com) 的文本。\n\n| x | y |\n| --- | --- |\n| 1 | 2 |\n\n- 甲\n- 乙'
     expect(render(text, true)).toBe(render(text, false))
@@ -118,16 +118,74 @@ describe('streaming 与 settled 一致性（无需 patch 的 GFM 文本应逐字
     expect(html).toContain('<sup>1</sup>')
     expect(html).toContain('data-footnotes')
   })
+  it('`##核心`（无空格 ATX）两态一致按 CommonMark 段落渲染（原 settled-only patch 已移除 · 对齐 dsh）', () => {
+    const text = '##核心\n\n正文'
+    expect(render(text, true)).toBe(render(text, false))
+    const settled = render(text, false)
+    expect(settled).toContain('##核心')
+    expect(settled).not.toContain('<h2>')
+  })
 })
 
-describe('settled-only patch（有意终跳：流式与结束之间允许一次修正）', () => {
-  it('`##核心` 无空格标题：settled 出 <h2>，streaming 按字面段落', () => {
-    const text = '##核心\n\n正文'
-    const settled = render(text, false)
-    const streaming = render(text, true)
-    expect(settled).toContain('<h2>核心</h2>')
-    expect(streaming).toContain('<p>')
-    expect(streaming).toContain('##核心')
-    expect(streaming).not.toContain('<h2>')
+describe('[markdown-fix] 围栏代码零改写（原 patches 整文本正则的 RED 回归）', () => {
+  it('C 代码 #include/#define 终稿不被插空格（原 fixHeadings 会改成 # include/# define）', () => {
+    const text = '```c\n#include <stdio.h>\n#define N 5\nint main() { return 0; }\n```'
+    const html = render(text, false)
+    expect(html).toContain('#include')
+    expect(html).not.toContain('# include')
+    expect(html).toContain('#define N 5')
+    expect(html).not.toContain('# define')
+  })
+  it('bash shebang 行不被改动', () => {
+    const html = render('```bash\n#!/usr/bin/env bash\necho hi\n```', false)
+    expect(html).toContain('#!')
+  })
+})
+
+// 超过 STREAM_DEGRADE_CHARS(8000) 的单块长度：必然触发 D1 纯文本降级
+const LONG_SINGLE_BLOCK = 'x'.repeat(9000)
+
+describe('[chat-switch-stream-align] D1 · streaming 超长单块 → 纯文本降级（零 mdast parse，治「字不吐」）', () => {
+  it('超长单段 prose（不可冻结单块）→ <pre md-stream-degraded> 直出原文，不产 md 元素', () => {
+    const html = render(LONG_SINGLE_BLOCK, true)
+    expect(html).toContain('md-stream-degraded')
+    expect(html).toContain(LONG_SINGLE_BLOCK.slice(0, 40))
+    expect(html).not.toContain('<p>')
+  })
+  it('降级不丢字：settled 精排仍含全文（一次全量自愈）', () => {
+    const html = render(LONG_SINGLE_BLOCK, false)
+    expect(html).toContain(LONG_SINGLE_BLOCK.slice(0, 40))
+  })
+  it('正常多段短文本不触发降级（冻结有效，维持 markdown）', () => {
+    const text = '短段第一行。\n\n' + 'y'.repeat(300)
+    const html = render(text, true)
+    expect(html).not.toContain('md-stream-degraded')
+    expect(html).toContain('<p>')
+  })
+})
+
+describe('[chat-switch-stream-align] D2 · 流式渲染器按 streamKey 复用（切会话不重建增量状态）', () => {
+  it('同 key 同回调 → 返回同一实例（跨 remount 复用）', () => {
+    const a = acquireStreamingRenderer('sess-a:blk-1', noop)
+    const b = acquireStreamingRenderer('sess-a:blk-1', noop)
+    expect(b).toBe(a)
+  })
+  it('onRunHtml 引用变化 → 重建（冻结元素烘焙回调，引用须稳定）', () => {
+    const a = acquireStreamingRenderer('sess-a:blk-2', noop)
+    const cb = () => {}
+    const c = acquireStreamingRenderer('sess-a:blk-2', cb)
+    expect(c).not.toBe(a)
+    expect(acquireStreamingRenderer('sess-a:blk-2', cb)).toBe(c)
+  })
+})
+
+describe('[markdown-fix] settled LRU 缓存键含 onRunHtml（同 text 不同回调不串）', () => {
+  it('先渲染带运行按钮、再同 text 无回调 → 不被旧缓存污染', () => {
+    const text = '```html\n<b>x</b>\n```'
+    const withFn = renderToStaticMarkup(<MarkdownText text={text} onRunHtml={noop} />)
+    expect(withFn).toContain('运行')
+    // 同 text 第二次无 onRunHtml：若缓存键漏回调会命中「带按钮旧树」→ 必须重渲（RED: 原纯 text 键必绿失败）
+    const withoutFn = renderToStaticMarkup(<MarkdownText text={text} />)
+    expect(withoutFn).not.toContain('运行')
   })
 })

@@ -61,7 +61,9 @@ export interface PermissionRequestItem {
 
 export interface ChatState {
   sessions: SessionDto[]
-  messages: Record<string, ChatMessageDto[]>          // sessionId -> 历史消息
+  messages: Record<string, ChatMessageDto[]>          // sessionId -> 历史消息（有界窗口：尾页 + 向上 prepend，created_at 序）
+  /** [window-paging] 会话是否有更早历史（GET /messages/page hasMore · 列表顶部「加载更早」按钮显隐） */
+  hasMore: Record<string, boolean>
   /** 本会话 agent 改动的文件（files.changed STOMP 事件 + GET /files 对账 → 右栏「文件」tab 真数据源 · 无改动 = []) */
   changedFiles: Record<string, SessionFile[]>
   /** 图片缓存：sessionId → id → {mediaType, base64}（重拉后按 imagePasteIds 批量拉图显示缩略图） */
@@ -71,6 +73,10 @@ export interface ChatState {
    *  与 streams[sid] 不同，本数组引用只在「块增/删/finalize/clear」时变化——content 追加不触碰它。
    *  渲染层（MessageList 顺序壳）订阅它获得稳定行序；每行内容订阅走 streamBlock()（块对象引用级）。 */
   streamOrder: Record<string, string[]>              // sessionId -> 流式块 id 顺序（稳定引用 · 块增删才换）
+  /** [chat-switch-stream-align] 会话流式活动节拍：appendChunk/appendReasoning 每次成功更新 +1。
+   *  供滚底订阅按会话隔离——只在本会话内容推进时才滚，避免「A 会话仍在打字、切到 B 查看时每帧把 B 的
+   *  容器拉到底部」（对齐 deepseek：每个 Session 自带 notifier/follow，互不劫持）。 */
+  streamTicks: Record<string, number>
   /** [snip-persist] 会话级被裁剪消息 id 集合（Snip 后前端标注「已裁剪」· 实时 STOMP + F5 boundary 解析合并） */
   snippedIds: Record<string, string[]>
   conversationIds: Record<string, string>             // sessionId -> partial 压缩后新 conversationId（消息 row key 刷新）
@@ -150,15 +156,22 @@ export interface ChatState {
   appendMetaUser: (sessionId: string, id: string, content?: string | null, isMeta?: boolean) => void
   /** 实时插入 tool_use_summary 展示行（/topic/tasks 事件 · id 幂等 + userMessageId flow 锚定，防双通道重复） */
   addToolUseSummary: (sessionId: string, row: { id: string; content: string; userMessageId?: string | null }) => void
+  /** [window-paging] 记录会话是否有更早历史（GET /messages/page hasMore · 顶部「加载更早」按钮显隐） */
+  setHasMore: (sessionId: string, hasMore: boolean) => void
+  /** [window-paging] 向上翻页：更早一页 prepend 到该会话窗口头部（created_at 时序；幂等去重 overlap id；
+   *  snip_boundary 并入 snippedIds 照常标注）+ 更新 hasMore */
+  prependMessages: (sessionId: string, older: ChatMessageDto[], hasMore: boolean) => void
 }
 
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
   sessions: [],
   messages: {},
+  hasMore: {},              // [window-paging] 会话是否有更早历史（GET /messages/page）
   changedFiles: {},
   imageCache: {},
   streams: {},
   streamOrder: {},         // [流式性能] 会话流式块稳定顺序（块增删才换引用 · content 追加不触碰）
+  streamTicks: {},          // [chat-switch-stream-align] 会话流式活动节拍（appendChunk/Reasoning 递增 · 滚底按会话隔离）
   snippedIds: {},          // [snip-persist] 会话级被裁剪消息 id（Snip 后「已裁剪」角标）
   conversationIds: {},
   permissionQueue: [],
@@ -262,7 +275,10 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     if (idx < 0) return st
     const next = [...blocks]
     next[idx] = { ...next[idx], content: next[idx].content + delta }
-    return { streams: { ...st.streams, [sessionId]: next } }
+    return {
+      streams: { ...st.streams, [sessionId]: next },
+      streamTicks: { ...st.streamTicks, [sessionId]: (st.streamTicks[sessionId] ?? 0) + 1 },
+    }
   }),
   appendReasoning: (sessionId, assistantMessageId, reasoning) => set((st) => {
     const blocks = st.streams[sessionId]
@@ -271,7 +287,10 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     if (idx < 0) return st
     const next = [...blocks]
     next[idx] = { ...next[idx], reasoning: next[idx].reasoning + reasoning }
-    return { streams: { ...st.streams, [sessionId]: next } }
+    return {
+      streams: { ...st.streams, [sessionId]: next },
+      streamTicks: { ...st.streamTicks, [sessionId]: (st.streamTicks[sessionId] ?? 0) + 1 },
+    }
   }),
   addToolCall: (sessionId, assistantMessageId, tool) => set((st) => {
     const blocks = st.streams[sessionId]
@@ -447,6 +466,31 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const next = [...msgs]
     next.splice(insertAt, 0, summaryRow)
     return { messages: { ...st.messages, [sessionId]: next } }
+  }),
+  setHasMore: (sessionId, hasMore) => set((st) => ({
+    hasMore: { ...st.hasMore, [sessionId]: hasMore },
+  })),
+  prependMessages: (sessionId, older, hasMore) => set((st) => {
+    const existing = st.messages[sessionId] ?? []
+    const existingIds = new Set(existing.map((m) => m.id))
+    const fresh = (older ?? []).filter((m) => m && m.id && !existingIds.has(m.id))
+    // [snip-persist] 前页若含 snip_boundary → 并入 snippedIds（照常标注「已裁剪」）
+    const boundaryIds: string[] = []
+    for (const m of fresh) {
+      if (m.subtype === 'snip_boundary' && m.snipMetadata?.removedUuids?.length) {
+        boundaryIds.push(...m.snipMetadata.removedUuids)
+      }
+    }
+    const snippedIds = boundaryIds.length
+      ? { ...st.snippedIds, [sessionId]: Array.from(new Set([...(st.snippedIds[sessionId] ?? []), ...boundaryIds])) }
+      : st.snippedIds
+    // 头部 unshift：older 更早 → 拼在 existing 前保持 created_at 时序（overlap id 以 existing 为准）
+    const merged = fresh.length === 0 ? existing : [...fresh, ...existing]
+    return {
+      messages: { ...st.messages, [sessionId]: merged },
+      snippedIds,
+      hasMore: { ...st.hasMore, [sessionId]: hasMore },
+    }
   }),
 }))
 

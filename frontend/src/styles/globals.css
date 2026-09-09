@@ -9852,3 +9852,10 @@ html {
 .ud-btn.primary{background:#4A6CF7;border-color:#4A6CF7;color:#fff;font-weight:600}
 .ud-btn.primary:hover{background:#3b55d8}
 .ud-btn.ghost{color:#8b90a6;border-color:transparent}
+/* [chat-switch-stream-align D1] 流式「超长单块」纯文本降级：pre-wrap 保留换行、视觉与正文一致，
+   零 mdast parse（每帧直出 text）——治长 prose/长代码 fence 每帧全量 parse O(n²) 导致的「字不吐」。 */
+.md-stream-degraded{white-space:pre-wrap;word-break:break-word;margin:0;padding:0;font:inherit;color:inherit;line-height:inherit;font-family:inherit}
+/* [window-paging] 消息列表顶部「加载更早」（hasMore 有更早历史时 · 对齐 deepseek loadOlder 按钮） */
+.ml-load-older{display:block;margin:2px auto 12px;padding:5px 16px;font-size:12px;color:var(--ink-muted,#888);background:transparent;border:1px solid var(--hairline,#e5e5e5);border-radius:999px;cursor:pointer;transition:all .12s}
+.ml-load-older:hover{color:var(--ink);background:rgba(0,0,0,.04);border-color:#d0d0d5}
+.ml-load-older:disabled{opacity:.5;cursor:default}
