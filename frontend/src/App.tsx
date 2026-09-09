@@ -344,7 +344,11 @@ function App() {
 
   // ---- 消息渲染源：chatStore.messages + 当前流式 ----
   const storeMessages = useChatStore((s) => s.messages[activeSessionId] ?? EMPTY_MESSAGES)
-  const stream = useChatStore((s) => s.streams[activeSessionId])
+  // [流式性能 2026-09-09] 不再顶层订阅整条 streams[sid] 引用（打字机逐帧 append 会让整 App 每帧重渲）。
+  //   改订 streamOrder 长度（结构信号）：块增/删才变化, content 推进不触碰 —— 内容订阅已下沉 MessageList
+  //   每行 StreamBlockRow（selectStreamBlock）。此处只用于 turnRunning / thinking / Composer.empty 的「有无流式块」。
+  const streamBlockCount = useChatStore((s) => (activeSessionId ? (s.streamOrder[activeSessionId]?.length ?? 0) : 0))
+  const hasStream = streamBlockCount > 0
   // 重拉后按 imagePasteIds 批量拉图显示缩略图（后端 POST /attachments/image/batch · 本地缓存优先，
   //   乐观追加 imageData 已本地有 base64 无需再拉；miss 的 batch 拉取后写缓存供 MessageList 渲染）
   useEffect(() => {
@@ -364,14 +368,15 @@ function App() {
   }, [activeSessionId, storeMessages])
   // turn 运行中判定：activeStreams 含本会话 = turn 已登记（含 thinking 阶段，此时 streams 空）。
   //   OR streams 有流式块 = 打字机在推（后端主动推流/cron 续跑未登记 activeStreams 时仍要可停）。
-  //   两信号互补：思考阶段靠 activeStreams；打字机阶段靠 streams（防「打字机在动但发送键已出」脱节）
-  const turnRunning = !!activeStreams[activeSessionId] || (stream && stream.length > 0)
+  //   两信号互补：思考阶段靠 activeStreams；打字机阶段靠 streamOrder 有块（防「打字机在动但发送键已出」脱节）
+  const turnRunning = !!activeStreams[activeSessionId] || hasStream
   // 压缩进行中（compact-progress 事件 · 不经 LlmAgentLoop → turnRunning 假，需并入发送键⇄停止）
   const compactActive = useChatStore((s) => s.compact.visible && s.compact.status === 'running')
   // 运行中会话集合（有 stream = 运行中），供左侧栏状态图标。
+  // [流式性能] 从 streamOrder 读键集：content 推进不换引用 → 不会每 chunk 重渲；块增删（会话开始/结束流式）才更新。
   // 用 useMemo 稳定引用避免 selector 每次返回新 Set 触发无限重渲染。
-  const streamsMap = useChatStore((s) => s.streams)
-  const runningSessionIds = useMemo(() => new Set(Object.keys(streamsMap)), [streamsMap])
+  const streamOrderMap = useChatStore((s) => s.streamOrder)
+  const runningSessionIds = useMemo(() => new Set(Object.keys(streamOrderMap)), [streamOrderMap])
 
   // ---- 权限冒泡：持久队列头部 + 决策出队 ----
   const permissionQueue = useChatStore((s) => s.permissionQueue)
@@ -1533,7 +1538,7 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={storeMessages} />
           ) : (
-            <MessageList messages={storeMessages} streaming={stream && stream.length > 0 ? stream : null} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !(stream && stream.length > 0)} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} />
           )}
         </div>
         {currentPermission && (
@@ -1564,7 +1569,7 @@ function App() {
         <NotificationBanner />
         {/* 轨迹视图只查看，不展示对话输入框 */}
         {/* 发送键 ⇄ 停止键切换用 turnRunning（activeStreams 登记 = turn 运行中，含 thinking/重试期；
-            非 !!stream —— 重试/thinking 期无流式块 stream 为空，会误显示发送键） */}
+            非 仅 streamOrder 有块 —— 重试/thinking 期无流式块会误显示发送键） */}
         {centerView === 'chat' && (
           <Composer
             composerText={composerText}
@@ -1595,7 +1600,7 @@ function App() {
             sessionId={activeSessionId ?? ''}
             currentAgent={currentAgent}
             onOpenMarket={() => setShowMarket(true)}
-            empty={storeMessages.length === 0 && !stream}
+            empty={storeMessages.length === 0 && !hasStream}
             onOpenUsageCost={() => setShowUsageCost(true)}
             onOpenChromePanel={() => setShowChromePanel(true)}
             showToBottom={!chatAtBottom}

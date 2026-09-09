@@ -31,8 +31,8 @@ function renderUserRefText(text: string, onOpen?: (path: string) => void): React
 }
 import { parseAnsiLines, type AnsiLine } from '@/utils/ansi'
 import { useSubagentStore } from '@/stores/subagentStore'
-import { useChatStore } from '@/stores/chatStore'
-import type { StreamBlock, ApiFlowError } from '@/stores/chatStore'
+import { useChatStore, selectStreamIds, selectStreamBlock } from '@/stores/chatStore'
+import type { ApiFlowError } from '@/stores/chatStore'
 import { tasksApi } from '@/api/tasks'
 import { openStandalone, previewKindOfAttachment } from '@/utils/standalonePreview'
 
@@ -192,10 +192,10 @@ const FINISH_REASON_COLOR: Record<string, string> = {
 }
 
 interface MessageListProps {
+  /** 当前会话 id：父级订阅流式【稳定行序】（selectStreamIds → streamOrder）；流式块内容订阅下沉到每行
+   *  StreamBlockRow（selectStreamBlock → streams[sid] 块对象），不再由 App 顶层订阅整条 streams 引用 */
+  sessionId: string
   messages: ChatMessageDto[]
-  /** 契约 #1：流式按 assistantMessageId 分块（每轮独立 thinking/content，三字段皆可空）；
-   *   complete 后 App 重拉 DB 权威多轮链替换，此处仅流式进行中展示 */
-  streaming?: StreamBlock[] | null
   onDelete: (messageId: string) => void
   /** 会话当前 conversationId（partial 压缩/裁剪后旋转）：并入消息 row key，触发整列表 remount */
   conversationId?: string | null
@@ -210,7 +210,7 @@ interface MessageListProps {
 }
 
 /** 工具调用卡片 · FNT-TC-01：消息级 matchedRule（后端 ChatMessageDto 顶层出站）→ 显示「已自动批准（规则X）」徽标；无数据静默 */
-function ToolCard({ tool, matchedRule }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null }) {
+function ToolCard({ tool, matchedRule, live = false }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean }) {
   // 工具卡片默认折叠（用户手动点击展开 IN/OUT）· 对齐 Harness ToolRow；组件本地展开态
   const [expanded, setExpanded] = useState(false)
   const rule = matchedRule
@@ -255,9 +255,12 @@ function ToolCard({ tool, matchedRule }: { tool: NonNullable<ChatMessageDto['too
   //   result.trim()!=='' 判完成 → 空结果被当未完成 → 永久「执行中」假卡
   //   （BashTool 空输出假卡事故 2026-09-05 · 修复 B）。OUT 区显隐用内联 result.trim()!==''（下方 body）。
   const hasResult = tool.result != null
-  // [Ctrl+B 转后台] 运行中的前台工具卡（Bash/Agent · 后端按类型自动分发）：toolUseId 关联 taskId →
-  //   isBackgrounded!==true（前台）且 running → 显示「转后台」；已后台化任务不显示（异步面板可见）
-  const runningFront = !hasResult && !tool.isError
+  // [Fix3 2026-09-09 · 对齐 CC resolvedToolUseIDs] "执行中"只在 live(活跃流式块=turn 仍在飞)成立；
+  //   settled 历史里 result==null 且非 error = 孤儿(工具被取消/中断/结果缺失) → 显示"已中断"，不永久转圈。
+  //   runningFront(转后台按钮) 仅 live 卡有效 —— settled 孤儿不再触发 tasksApi.list 轮询/不再有陈旧"转后台"
+  //   （同时消除"任务已结束仍可点转后台→后端 400 静默"的陈旧卡）。
+  const interrupted = !hasResult && !tool.isError && !live
+  const runningFront = live && !hasResult && !tool.isError
   const [bgTaskId, setBgTaskId] = useState<string | null>(null)
   useEffect(() => {
     if (!runningFront) { setBgTaskId(null); return }
@@ -291,8 +294,8 @@ function ToolCard({ tool, matchedRule }: { tool: NonNullable<ChatMessageDto['too
             已自动批准（{rule}）
           </span>
         )}
-        <span className={`status ${tool.isError ? 'error' : hasResult ? 'done' : 'running'}`}>
-          {tool.isError ? '失败' : hasResult ? '已完成' : '执行中'}
+        <span className={`status ${tool.isError ? 'error' : hasResult ? 'done' : interrupted ? 'interrupted' : 'running'}`}>
+          {tool.isError ? '失败' : hasResult ? '已完成' : interrupted ? '已中断' : '执行中'}
         </span>
         {bgTaskId && (
           <span role="button" className="tc-bg" onClick={(e) => { e.stopPropagation(); e.preventDefault(); void doBackground() }} title="转到后台继续运行（Ctrl+B）">
@@ -608,10 +611,49 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
 //   只重渲「正在流式的最后一块」。props 引用稳定前提：onDelete=App useCallback、onRunHtml=openHtmlPreview useCallback。
 const MemoMessage = memo(Message)
 
-export function MessageList({ messages, streaming, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile }: MessageListProps) {
+// [流式性能 2026-09-09] 流式块行独立订阅（对齐 deepseek-harness ChatNodeSeat：只订自己 key 的节点）。
+//   父级 MessageList 只订 streamOrder（稳定 id 序）构建「顺序壳」；本行通过 selectStreamBlock(sid, blockId)
+//   订阅自己的块对象 —— append 只换该块对象引用 → 仅本行重渲，历史行/其余流式块行/父级全部被 bail。
+//   渲染行为与旧内联块一致：reasoning 默认展开可收起（本地态，随行卸载丢弃）、MarkdownText streaming、
+//   toolCalls 卡片。class 未动。
+const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, onRunHtml }: {
+  sessionId: string
+  blockId: string
+  isStreamingTail: boolean
+  onRunHtml: (code: string) => void
+}) {
+  // 只订自身块对象：append 后该块是新对象 → 重渲；其它块 append（数组换新但本块对象引用不变）→ bail
+  const b = useChatStore(selectStreamBlock(sessionId, blockId))
+  // [bug-101] 流式思考块收起：行内本地态（此前父级 Record 存收起态，整表重渲；行内自持语义不变）
+  const [collapsed, setCollapsed] = useState(false)
+  if (!b) return null
+  return (
+    <div className={`msg assistant${isStreamingTail ? ' streaming' : ''}`}>
+      <div className="avatar">N</div>
+      <div className="body">
+        <div className="author">nexus</div>
+        {cleanReasoning(b.reasoning) && (
+          <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
+            <button className="thinking-toggle" onClick={() => setCollapsed((v) => !v)}>
+              <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+              <span>正在思考…</span>
+            </button>
+            {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
+          </div>
+        )}
+        {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
+        {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live />)}
+      </div>
+    </div>
+  )
+})
+
+export function MessageList({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
+  // [流式性能] 稳定行序订阅：引用只在块增/删/finalize/clear 变化；content 追加不触碰 → 父级不被打字机逐帧重渲
+  const streamIds = useChatStore(selectStreamIds(sessionId))
   const streamWrapRef = useRef<HTMLDivElement>(null)
   const lastMsgId = messages[messages.length - 1]?.id
   // HTML 代码块「运行」→ 独立窗口预览（sandbox iframe 运行结果 · 不占右栏、不打断对话）
@@ -619,8 +661,6 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
   const openHtmlPreview = useCallback((code: string) => {
     openStandalone({ type: 'html', title: 'HTML 运行预览', code })
   }, [])
-  // [bug-101] 流式思考块收起：按块 assistantMessageId 记收起态（此前恒展开 + 无 onClick 无法收起）
-  const [collapsedStreamReasoning, setCollapsedStreamReasoning] = useState<Record<string, boolean>>({})
   // message.error → 对话流错误卡：展平跨会话错误按 flow 键锚定（当前视图单会话；无 flow 兜底 global）
   const allApiErrors = useChatStore((s) => s.apiErrors)
   const apiErrorMap = useMemo(() => {
@@ -668,7 +708,7 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
     el?.addEventListener('scroll', onScroll, { passive: true })
     return () => el?.removeEventListener('scroll', onScroll)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages.length, streaming?.length])
+  }, [messages.length, streamIds.length])
   // 新增消息：用户发送（user 角色）→ 无条件跳底部（用户要开始新回复）；助手落库（assistant）→ 仅贴近底部时跟随（看历史不拽）
   useEffect(() => {
     const last = messages[messages.length - 1]
@@ -680,14 +720,14 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lastMsgId])
-  // 流式增量 → 无条件滚底（AI 回复期间用户应默认在底部看最新内容；块级流监听最后一块对象
-  //   —— 正文推进 + 思考流式展开都算流尖；用户上滚看历史时也被拽回底部，对齐「AI 回复强制跟底」）
-  const streamingTail = streaming && streaming.length > 0 ? streaming[streaming.length - 1] : undefined
+  // [流式性能 2026-09-09] 流式滚底改为 store.subscribe（不触发 React 重渲）：打字机 content 逐帧 append 时
+  //   父级不再被重渲（只订 streamOrder 稳定引用），但滚动需跟随流尖 —— 订阅 store 原语，贴底时直接写 scrollTop。
+  //   语义与旧 streamingTail effect 一致：仅 nearBottom 时跟随；上滚看历史不被拽回。
   useEffect(() => {
-    // 流式推进：仅用户贴底时跟随滚底；上滚看历史不被拽回（「回到底部」按钮负责拉回）——
-    //   否则 AI/cron 回复流式时反复滚回底部，用户上滚看历史 + 回到底部按钮永远不出现
-    if (nearBottomRef.current) stickBottom()
-  }, [streamingTail])
+    return useChatStore.subscribe(() => {
+      if (nearBottomRef.current) stickBottom()
+    })
+  }, [])
   // 外部滚底信号（权限卡片出现等 App 层事件）→ 强制滚底
   useEffect(() => {
     if (scrollSignal !== undefined) {
@@ -701,7 +741,11 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
   //   ⚠ 必须置于所有 hooks 之后、条件 return 之前（React 19 hooks 规则：hooks 前不得条件 return，
   //   否则 messages 空↔非空时 hooks 数量变化 → "Rendered more hooks than during the previous render" 白屏）
   const groups = useMemo(() => {
-    const arr: { key: string; items: ({ kind: 'msg'; m: ChatMessageDto } | { kind: 'blk'; b: StreamBlock; i: number })[] }[] = []
+    // [流式性能] 只从快照读块归属(userMessageId)/数量做行序 —— 不把块对象存进父级(内容订阅下沉到行)。
+    //   streamOrder 变(块增删)才重算;content 逐帧 append 时 useChatStore.getState() 读到最新 userMessageId,
+    //   但本 memo 不会因 content 重跑(依赖只有 messages/streamIds/sessionId)。
+    const live = sessionId ? (useChatStore.getState().streams[sessionId] ?? []) : []
+    const arr: { key: string; items: ({ kind: 'msg'; m: ChatMessageDto } | { kind: 'blk'; sid: string; blockId: string })[] }[] = []
     const order = new Map<string, number>()
     const push = (key: string, item: (typeof arr)[number]['items'][number]) => {
       let idx = order.get(key)
@@ -718,12 +762,15 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
     //   的「位置」语义 —— 用户1 任务轮归用户1、排队 append 后的轮归排队）。冻结保证不被排队 append
     //   后到达的 chunk 覆盖。缺失（旧块/未带）回落 assistantMessageId 独立流。
-    for (const [i, b] of (streaming ?? []).entries()) {
+    //   行条目只带 (sid, blockId) —— 具体内容由每行 StreamBlockRow 自订 selectStreamBlock。
+    for (const blockId of streamIds) {
+      const b = live.find((x) => x.assistantMessageId === blockId)
+      if (!b) continue
       const key = b.userMessageId ?? b.assistantMessageId ?? 'stream'
-      push(key, { kind: 'blk', b, i })
+      push(key, { kind: 'blk', sid: sessionId, blockId })
     }
     return arr
-  }, [messages, streaming])
+  }, [messages, streamIds, sessionId])
   // ---- [窗口化渲染] 长会话防卡：默认只渲染尾部 WINDOW_MAX 行（消息 + 流式块 + 组尾错误卡），
   //      上拉到顶自动增量加载更早 WINDOW_STEP 行。渲染行数上限恒定 → 打开长会话/流式推进不随历史量卡死。----
   const WINDOW_MAX = 150 // 初始可见渲染行数
@@ -732,14 +779,14 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
   const flatRows = useMemo(() => {
     const rows: (
       | { key: string; kind: 'msg'; m: ChatMessageDto }
-      | { key: string; kind: 'blk'; b: StreamBlock; i: number }
+      | { key: string; kind: 'blk'; sid: string; blockId: string }
       | { key: string; kind: 'err'; err: ApiFlowError }
     )[] = []
     for (const g of groups) {
       for (const it of g.items) {
         rows.push(it.kind === 'msg'
           ? { key: rowKey(it.m.id), kind: 'msg', m: it.m }
-          : { key: it.b.assistantMessageId ?? `blk:${it.i}`, kind: 'blk', b: it.b, i: it.i })
+          : { key: it.blockId, kind: 'blk', sid: it.sid, blockId: it.blockId })
       }
       const gErr = apiErrorMap.get(g.key)
       if (gErr) rows.push({ key: `err:${g.key}`, kind: 'err', err: gErr })
@@ -774,9 +821,11 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
     loadPrevScrollHRef.current = 0
   })
   // 空态（置于所有 hooks 之后 · React 19 hooks 规则：hooks 前不得条件 return）
-  if (messages.length === 0 && !streaming) {
+  if (messages.length === 0 && streamIds.length === 0) {
     return null
   }
+  // 流式尾块 id（给行打「streaming」尾态 class · 只在块增删时变化）
+  const lastStreamId = streamIds.length > 0 ? streamIds[streamIds.length - 1] : undefined
   return (
     <>
     <div className="stream-inner" ref={streamWrapRef}>
@@ -903,31 +952,16 @@ export function MessageList({ messages, streaming, onDelete, conversationId, scr
         if (row.kind === 'err') {
           return <ApiErrorCard key={row.key} err={row.err} />
         }
-        const b = row.b
-        const blkIdx = row.i
+        // [流式性能] 流式块行 → 独立 memo 组件（只订自己块对象）。父级只给稳定 key(sid, blockId)，
+        //   content 推进只让目标行重渲；末块行带 'streaming' 尾态 class（同旧逻辑）。
         return (
-          <div className={`msg assistant${blkIdx === (streaming?.length ?? 0) - 1 ? ' streaming' : ''}`} key={row.key}>
-            <div className="avatar">N</div>
-            <div className="body">
-              <div className="author">nexus</div>
-              {cleanReasoning(b.reasoning) && (() => {
-                // [bug-101] 流式思考块收起：按块 assistantMessageId 记收起态（此前恒展开 + div 无 onClick）
-                const blkId = b.assistantMessageId ?? String(blkIdx)
-                const collapsed = !!collapsedStreamReasoning[blkId]
-                return (
-                  <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
-                    <button className="thinking-toggle" onClick={() => setCollapsedStreamReasoning((prev) => ({ ...prev, [blkId]: !collapsed }))}>
-                      <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
-                      <span>正在思考…</span>
-                    </button>
-                    {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
-                  </div>
-                )
-              })()}
-              {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={openHtmlPreview} />}
-              {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} />)}
-            </div>
-          </div>
+          <StreamBlockRow
+            key={row.key}
+            sessionId={row.sid}
+            blockId={row.blockId}
+            isStreamingTail={row.blockId === lastStreamId}
+            onRunHtml={openHtmlPreview}
+          />
         )
       })}
       {/* 无 flow 锚定的错误（userMessageId/assistantMessageId 均缺失）→ 兜底渲染在末尾 */}

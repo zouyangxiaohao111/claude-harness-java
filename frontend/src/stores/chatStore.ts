@@ -67,6 +67,10 @@ export interface ChatState {
   /** 图片缓存：sessionId → id → {mediaType, base64}（重拉后按 imagePasteIds 批量拉图显示缩略图） */
   imageCache: Record<string, Record<string, { mediaType: string; base64: string }>>
   streams: Record<string, StreamBlock[]>              // sessionId -> 当前流式块列表（按 assistantMessageId 分轮）
+  /** [流式性能 2026-09-09] 会话流式块「稳定顺序」镜像：sessionId -> blockId 顺序数组。
+   *  与 streams[sid] 不同，本数组引用只在「块增/删/finalize/clear」时变化——content 追加不触碰它。
+   *  渲染层（MessageList 顺序壳）订阅它获得稳定行序；每行内容订阅走 streamBlock()（块对象引用级）。 */
+  streamOrder: Record<string, string[]>              // sessionId -> 流式块 id 顺序（稳定引用 · 块增删才换）
   /** [snip-persist] 会话级被裁剪消息 id 集合（Snip 后前端标注「已裁剪」· 实时 STOMP + F5 boundary 解析合并） */
   snippedIds: Record<string, string[]>
   conversationIds: Record<string, string>             // sessionId -> partial 压缩后新 conversationId（消息 row key 刷新）
@@ -154,6 +158,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   changedFiles: {},
   imageCache: {},
   streams: {},
+  streamOrder: {},         // [流式性能] 会话流式块稳定顺序（块增删才换引用 · content 追加不触碰）
   snippedIds: {},          // [snip-persist] 会话级被裁剪消息 id（Snip 后「已裁剪」角标）
   conversationIds: {},
   permissionQueue: [],
@@ -211,35 +216,44 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   clearSession: (sessionId) => set((st) => {
     const messages = { ...st.messages }
     const streams = { ...st.streams }
+    const streamOrder = { ...st.streamOrder }
     const conversationIds = { ...st.conversationIds }
     const apiErrors = { ...st.apiErrors }
     const changedFiles = { ...st.changedFiles }
     delete messages[sessionId]
     delete streams[sessionId]
+    delete streamOrder[sessionId]
     delete conversationIds[sessionId]
     delete apiErrors[sessionId]
     delete changedFiles[sessionId]
-    return { messages, streams, conversationIds, apiErrors, changedFiles }
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
   ensureStreamBlock: (sessionId, assistantMessageId, userMessageId) => set((st) => {
-    const blocks = st.streams[sessionId] ?? []
-    const last = blocks[blocks.length - 1]
+    const blocks = st.streams[sessionId]
+    const last = blocks && blocks.length > 0 ? blocks[blocks.length - 1] : undefined
     console.debug('[esb]', { blockId: assistantMessageId?.slice(0, 12), uid: userMessageId, existing: last?.assistantMessageId?.slice(0, 12), existingUid: last?.userMessageId })
     if (last && last.assistantMessageId === assistantMessageId) {
       // 【冻结归属】块归属在【建立时确定】——首 chunk 到达时的 userMessageId（对应后端 DB 落库
       //   逐条推进的「位置」语义）。后续 chunk 不覆盖：排队消息 append 后 chunk 可能带新 id，
       //   若覆盖会让用户1 任务中途的工具块被错标排队 id（实时 ≠ DB 顺序的根因）。
       //   仅当建立时 userMessageId 缺失（首 chunk 未带）且后续首次带非空才回填（一次性），之后冻结。
+      //   [流式性能] 回填只替换块对象（streams 数组引用可换），不触碰 streamOrder —— 行序稳定。
       if (!last.userMessageId && userMessageId) {
-        const next = [...blocks]
+        const next = [...(blocks ?? [])]
         next[next.length - 1] = { ...last, userMessageId }
         return { streams: { ...st.streams, [sessionId]: next } }
       }
       return st
     }
-    return { streams: { ...st.streams, [sessionId]: [...blocks, { assistantMessageId, userMessageId: userMessageId ?? null, reasoning: '', content: '', toolCalls: [] }] } }
+    // [流式性能] 结构变更（新增块）：streams 追加 + streamOrder 追加同 id —— 渲染层订阅 streamOrder 感知新行。
+    const nb: StreamBlock = { assistantMessageId, userMessageId: userMessageId ?? null, reasoning: '', content: '', toolCalls: [] }
+    const ids = st.streamOrder[sessionId] ?? []
+    return {
+      streams: { ...st.streams, [sessionId]: [...(blocks ?? []), nb] },
+      streamOrder: { ...st.streamOrder, [sessionId]: [...ids, assistantMessageId] },
+    }
   }),
   appendChunk: (sessionId, assistantMessageId, delta) => set((st) => {
     const blocks = st.streams[sessionId]
@@ -350,11 +364,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       ordered.splice(insertAt, 0, bm)
     }
     const { [sessionId]: _drop, ...rest } = st.streams
-    return { streams: rest, messages: { ...st.messages, [sessionId]: ordered } }
+    const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
+    return { streams: rest, streamOrder: restOrder, messages: { ...st.messages, [sessionId]: ordered } }
   }),
   clearStream: (sessionId) => set((st) => {
     const { [sessionId]: _drop, ...rest } = st.streams
-    return { streams: rest }
+    const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
+    return { streams: rest, streamOrder: restOrder }
   }),
   setConversationId: (sessionId, conversationId) => set((st) => ({
     conversationIds: { ...st.conversationIds, [sessionId]: conversationId },
@@ -438,3 +454,24 @@ export const useChatStore = createChatStoreCreator()
 
 /** 测试用：返回独立 store 实例（避免测试间状态泄漏）。生产用 useChatStore 单例。 */
 export function createChatStore() { return createChatStoreCreator() }
+
+// ── [流式性能 2026-09-09] 渲染层稳定订阅访问器（对齐 deepseek-harness：order 与 content 解耦）──
+// 模块级稳定空数组：streamOrder[sid] 缺省时回落同引用，避免 selector `?? []` 每次新引用触发 uSES 无限重渲。
+const EMPTY_STREAM_IDS: string[] = []
+
+/**
+ * 订阅「某会话流式块 id 顺序」——引用只在块增/删/finalize/clear 时变化。
+ * content 追加（appendChunk/appendReasoning/toolCalls/usage）不触碰 → 订阅方（MessageList 顺序壳）不被内容推进重渲。
+ * 用法：`useChatStore(selectStreamIds(sessionId))`。
+ */
+export function selectStreamIds(sessionId: string | null): (s: ChatState) => string[] {
+  return (s) => (sessionId ? (s.streamOrder[sessionId] ?? EMPTY_STREAM_IDS) : EMPTY_STREAM_IDS)
+}
+
+/**
+ * 订阅「某流式块当前对象」——append 后该块是新对象 → 只有订阅自己的行重渲；其余行 selector 返回同引用被 bail。
+ * 用法：`useChatStore(selectStreamBlock(sessionId, blockId))`。
+ */
+export function selectStreamBlock(sessionId: string | null, blockId: string | null): (s: ChatState) => StreamBlock | undefined {
+  return (s) => (sessionId && blockId ? s.streams[sessionId]?.find((b) => b.assistantMessageId === blockId) : undefined)
+}

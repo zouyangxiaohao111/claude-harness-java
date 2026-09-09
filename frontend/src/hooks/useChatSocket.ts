@@ -11,19 +11,26 @@ import { useTeamStore } from '../stores/teamStore'
 import { useTodoStore } from '../stores/todoStore'
 import { teamsApi } from '../api/teams'
 
-/** [打字机节流 2026-09-04] 流式 append 合并窗口(ms)：reasoning/content chunk 攒够窗口再批量 append 一次。
- *  根因: 后端流式逐块推送, 前端原来「每 chunk 一次 appendChunk/appendReasoning → 一次 zustand setState +
- *  整页重渲染」——长 thinking 一轮几百上千 chunk → 主线程被 React 渲染占满 → 来不及读 socket → 积压 →
- *  「后端推完了前端还在慢慢显示/卡住」。合并到每 STREAM_APPEND_MS(40ms)一次 set, 渲染频率从「每 chunk」
- *  降到 ~25 次/s, 主线程得闲及时消费 WS 帧。UI 滞后 ≤40ms 无感。 */
-const STREAM_APPEND_MS = 40
+/** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
+ *  notifier.markFrameDirty：N 次 markDirty 折叠为一次动画帧 flush，通知推迟到下一帧）。
+ *  根因: 后端流式逐块推送, 前端原来「每 chunk 一次 appendChunk → 一次 zustand setState + 整页重渲染」——
+ *  长回复一轮几百上千 chunk → 主线程被 React 渲染占满 → 来不及读 socket → 积压 →
+ *  「后端推完了前端还在慢慢显示/卡住」。旧实现用固定 setTimeout(40ms) 攒批；现改为 rAF：同一帧内到达的
+ *  chunk 累积在缓冲, 每帧最多 flush 一次（渲染频率 ≈ 显示帧率, 不再绑定 40ms 定时器）。主线程得闲及时消费
+ *  WS 帧, UI 滞后 ≤1 帧无感。无 rAF 环境（jsdom/node 测试）回落 microtask。 */
 /** sid -> blockId -> 累积增量（delta=正文 / reasoning=思考）。模块级:跨 hook 重渲染不丢、多会话并行独立累积。 */
 const pendingStreamAppends = new Map<string, Map<string, { delta: string; reasoning: string }>>()
-let streamFlushTimer: ReturnType<typeof setTimeout> | null = null
+/** 已排定的 flush（rAF id；microtask 回落时用 0 占位）：非 null = 已有一帧待 flush, 后续 chunk 只累积不再排。 */
+let streamFlushRaf: number | null = null
+const canUseRaf = typeof requestAnimationFrame === 'function'
 
-/** 把缓冲里所有会话/块的累积增量一次 append 进 chatStore（合并 setState）。 */
+/** 把缓冲里所有会话/块的累积增量一次 append 进 chatStore（合并 setState）。显式调用点（complete/cancel/
+ *  error/unmount/断连）保持——先取消待定帧再合并, 避免残余帧触发二次空 flush。 */
 function flushStreamAppends() {
-  if (streamFlushTimer) { clearTimeout(streamFlushTimer); streamFlushTimer = null }
+  if (streamFlushRaf !== null) {
+    if (canUseRaf) cancelAnimationFrame(streamFlushRaf)
+    streamFlushRaf = null
+  }
   if (pendingStreamAppends.size === 0) return
   const st = useChatStore.getState()
   for (const [sid, blocks] of pendingStreamAppends) {
@@ -35,10 +42,17 @@ function flushStreamAppends() {
   pendingStreamAppends.clear()
 }
 
-/** 调度一次 flush（已有挂起 timer 则复用——timer 触发时统一把窗口内全部增量合并 append）。 */
+/** 调度一次 flush（已有待定帧则复用——帧触发时把窗口内全部增量合并 append）。 */
 function scheduleStreamFlush() {
-  if (streamFlushTimer) return
-  streamFlushTimer = setTimeout(() => { streamFlushTimer = null; flushStreamAppends() }, STREAM_APPEND_MS)
+  if (streamFlushRaf !== null) return
+  const publish = () => { streamFlushRaf = null; flushStreamAppends() }
+  if (canUseRaf) {
+    streamFlushRaf = requestAnimationFrame(publish)
+  } else {
+    // 无 rAF（jsdom/node 测试）：queueMicrotask 合成「同 tick 合并」边界
+    streamFlushRaf = 0
+    queueMicrotask(publish)
+  }
 }
 
 /** [Phase2 · session-file-panel-collapse-atfile] files.changed 载荷 → SessionFile[]（整表替换 · path basename → name）。 */
@@ -413,7 +427,7 @@ export function useChatSocket(
     clientRef.current = client
     setConnection('connecting')
     return () => {
-      // [打字机节流] 卸载前 flush 缓冲（把窗口内已收增量渲染; 残余 timer 由 flush 内 clearTimeout 清理）
+      // [打字机节流] 卸载前 flush 缓冲（把窗口内已收增量渲染; 残余帧句柄由 flush 内 cancel 清理）
       flushStreamAppends()
       // client 单例 unmount 时清理（会话级 scoped 订阅 + 按 sid 常驻订阅）
       for (const sub of sessionScopedSubsRef.current) sub.unsubscribe()
@@ -637,8 +651,8 @@ export function useChatSocket(
       // ensureStreamBlock 保持即时（幂等:块已存在时 return 不触发重渲染,只首 chunk 建块一次）——
       //   块归属必须立即可见,后续 tool_call/usage 按块定位不丢
       st.ensureStreamBlock(sid, blockId, evt.userMessageId)
-      // [打字机节流] delta/reasoning 攒入模块级缓冲, STREAM_APPEND_MS 后批量 append（治 reasoning/正文
-      //   「每 chunk 一次整页重渲染」→ 主线程得闲及时读 socket）。UI 滞后 ≤40ms, 打字机滚动粒度不变。
+      // [打字机节流] delta/reasoning 攒入模块级缓冲, 下一 rAF 帧批量 append（治 reasoning/正文
+      //   「每 chunk 一次整页重渲染」→ 主线程得闲及时读 socket）。UI 滞后 ≤1 帧, 打字机滚动粒度不变。
       if (evt.delta || evt.reasoning) {
         let blocks = pendingStreamAppends.get(sid)
         if (!blocks) { blocks = new Map(); pendingStreamAppends.set(sid, blocks) }
@@ -690,7 +704,7 @@ export function useChatSocket(
       }
     } else if (isComplete(evt)) {
       // [打字机节流] 收口前先 flush 缓冲里的尾增量——finalizeBlocks 把流式块转消息, 若缓冲未 flush
-      //   会缺最后一段（40ms 窗口内的 delta/reasoning 尚未 append 进 streams）→ 消息尾字丢失
+      //   会缺最后一段（同帧内已收但尚未 append 的 delta/reasoning）→ 消息尾字丢失
       flushStreamAppends()
       // 契约 #2/#5：complete 收口 → 流式块直接转消息（id=turnAssistantId，后端落库同源后即 DB 权威 id，免重拉）。
       //   透传 complete 的思考耗时（无重拉时块消息才不缺 reasoningDurationMs）

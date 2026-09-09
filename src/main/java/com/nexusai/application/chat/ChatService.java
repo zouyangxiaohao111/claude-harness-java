@@ -940,6 +940,14 @@ public class ChatService {
             //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
             //   批量已删——消息已实时落库，此处不再遍历 state.messages()。
             if (state != null) {
+                // [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks / getRemainingResults 收尾]
+                //   非 NORMAL 终态(用户停止 ABORTED / STREAM_ERROR / MAX_TURNS 等)时，为"有 tool_use 但
+                //   无对应 tool_result"的孤儿工具补 synthetic is_error（content 以 "Error" 开头 → 落库 isError=true）
+                //   ——此刻 appendListener 仍武装，append 即持久化补写 DB tool_call.result + STOMP 推 tool_result，
+                //   根治"被取消/中断的工具卡永久执行中"(历史 F5 复现)。正常 NORMAL 收尾工具必已由执行器补结果，跳过。
+                if (state.exitReason() != AgentState.ExitReason.NORMAL) {
+                    repairOrphanToolResults(state, sessionId);
+                }
                 state.clearAppendListener();
                 persistInjectedQueuedMessages(state, sessionId);
             }
@@ -1523,6 +1531,49 @@ public class ChatService {
             if (log.isDebugEnabled()) {
                 log.debug("[实时落库] 未处理消息角色: role={} id={}", m.role(), m.id());
             }
+        }
+    }
+
+    /**
+     * [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks] 非正常终态收尾：为 {@code state.messages()}
+     * 中「含 toolCalls 但缺对应 tool_result」的孤儿 tool_use 补 synthetic is_error tool 消息。此刻 run 已返回
+     * 但 appendListener 仍武装 → {@code state.appendMessage} 即触发 {@link #persistAppendedMessage}
+     * （Role.tool 分支 → toolCallMapper.update 补写 DB tool_call.result + STOMP 推 MessageToolResultEvent），
+     * 根治"被取消/中断/异常收尾的工具卡永久执行中"（历史 F5 复现：DB tool_call.result 恒 null）。
+     * 判定与 SessionResumeDeserializer.appendMissingToolResults 同源（全局 toolCallId 集合）。
+     *
+     * @param state     终态 AgentState
+     * @param sessionId 会话 id（数据流日志）
+     */
+    private void repairOrphanToolResults(AgentState state, String sessionId) {
+        var messages = state.messages();
+        java.util.Set<String> toolResultIds = new java.util.HashSet<>();
+        for (var m : messages) {
+            if (m != null && m.toolCallId() != null) {
+                toolResultIds.add(m.toolCallId());
+            }
+        }
+        int added = 0;
+        for (var m : messages) {
+            if (m == null || m.role() != Role.assistant || m.toolCalls() == null) {
+                continue;
+            }
+            for (var tc : m.toolCalls()) {
+                if (tc.id() != null && !toolResultIds.contains(tc.id())) {
+                    // content 以 "Error" 开头 → persistAppendedMessage Role.tool 分支判 isError=true（对齐既有判定）
+                    state.appendMessage(new ChatMessageDto(
+                        java.util.UUID.randomUUID().toString(), m.sessionId(), Role.tool, null,
+                        "Error: Tool interrupted — no result recorded (user stopped or turn aborted).",
+                        null, null, null, null, null, "刚刚", null,
+                        tc.id(), m.assistantMessageId(), null,
+                        java.util.List.of(), java.util.List.of(), null, false, true));
+                    added++;
+                }
+            }
+        }
+        if (added > 0) {
+            log.info("ChatService 终态孤儿 tool_use 补 synthetic is_error: session={} exit={} 补 {} 条（对齐 CC yieldMissingToolResultBlocks）",
+                sessionId, state.exitReason(), added);
         }
     }
 
