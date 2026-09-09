@@ -748,6 +748,15 @@ export function useChatSocket(
         code: evt.code ?? null,
         message: evt.message ?? '模型调用失败',
       })
+      // [永久卡修复 2026-09-09 · 对齐 CC] message.error 是后端 run 的「真终态」——ChatService 错误分支
+      //   只发 MessageErrorEvent + status=idle，不发 complete/cancelled（ChatService.java:911-919）。前端若
+      //   不自行收口，activeStreams[sid] 永不清理 → 发送键永为「停止」、RetryBanner 残留、消息停在运行态
+      //   （用户 F5 才复活）。对齐 CC：API 错误即该请求收尾 —— flush 尾增量 + 清 retry + 丢无 complete 的
+      //   流式残留块 + 通知 App 移除登记。
+      flushStreamAppends()
+      st.setRetry(null)          // complete 分支才置 null；error 分支此前漏 → 重试横幅残留
+      st.clearStream(sid)        // error 轮无 complete，流式块不会 finalize → 清掉避免「思考中/打字机」卡住
+      onSessionDoneRef.current?.(sid, topic)
     } else if (isCancelled(evt)) {
       // [打字机节流] 取消清流前 flush 缓冲（把窗口内已收的 delta/reasoning 渲染, 避免取消即丢尾段）
       flushStreamAppends()
