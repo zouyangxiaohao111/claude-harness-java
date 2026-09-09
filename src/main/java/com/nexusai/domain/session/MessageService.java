@@ -125,7 +125,8 @@ public class MessageService {
      * @throws NotFoundException session 不存在 / beforeMessageId 不在该会话
      */
     public PageResult listPageBySession(String sessionId, String beforeMessageId, int limit) {
-        if (sessionMapper.selectOneById(sessionId) == null) {
+        SessionRecord session = sessionMapper.selectOneById(sessionId);
+        if (session == null) {
             throw new NotFoundException("Session " + sessionId + " not found");
         }
         final int pageSize = limit > 0 ? limit : DEFAULT_PAGE_SIZE;
@@ -161,11 +162,14 @@ public class MessageService {
             log.info("[MessageService] listPageBySession: session={} 返回 {} 条（hasMore={}, before={}）",
                 sessionId, result.size(), hasMore, beforeMessageId);
         }
-        return new PageResult(result, hasMore);
+        // total = 会话消息总数（sessions.messageCount · 非 meta 口径）——前端轨迹徽标全量，避免拿「已加载页」当全量
+        int total = session.getMessageCount() != null ? session.getMessageCount() : 0;
+        return new PageResult(result, hasMore, total);
     }
 
-    /** [window-paging] 分页响应 · {messages(created_at ASC), hasMore}。 */
-    public record PageResult(List<ChatMessageDto> messages, boolean hasMore) {}
+    /** [window-paging] 分页响应 · {messages(created_at ASC), hasMore, total}。total = 会话消息总数
+     *  （sessions.messageCount · 非 meta 口径）——前端轨迹 tab 徽标全量用，避免拿「已加载页」条数当全量。 */
+    public record PageResult(List<ChatMessageDto> messages, boolean hasMore, int total) {}
 
     /**
      * [token-compact-fix ⑤方案B] 重拉上下文快照补算 · 用户拍板：不落库，每次重算。

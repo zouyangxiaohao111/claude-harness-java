@@ -5,9 +5,10 @@ export const chatApi = {
   listMessages: (sessionId: string) =>
     api<ChatMessageDto[]>(`/sessions/${encodeURIComponent(sessionId)}/messages`),
   /** [window-paging] 有界历史窗口分页：缺省 = 尾页（最新 limit 条）；beforeMessageId = 该消息之前更早一页。
-   *  返回 hasMore。前端查看主通道（打开/F5/切会话/断连补偿）用此，不再全量拉。 */
+   *  返回 hasMore + total（total = 会话非 meta 消息总数 · 轨迹徽标全量用，避免拿已加载页当全量）。
+   *  前端查看主通道（打开/F5/切会话/断连补偿）用此，不再全量拉。 */
   listMessagesPage: (sessionId: string, opts?: { limit?: number; beforeMessageId?: string }) =>
-    api<{ messages: ChatMessageDto[]; hasMore: boolean }>(
+    api<{ messages: ChatMessageDto[]; hasMore: boolean; total: number }>(
       `/sessions/${encodeURIComponent(sessionId)}/messages/page?limit=${opts?.limit ?? 50}`
         + (opts?.beforeMessageId ? `&beforeMessageId=${encodeURIComponent(opts.beforeMessageId)}` : '')),
   send: (sessionId: string, req: SendMessageRequest) =>

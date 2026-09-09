@@ -64,6 +64,8 @@ export interface ChatState {
   messages: Record<string, ChatMessageDto[]>          // sessionId -> 历史消息（有界窗口：尾页 + 向上 prepend，created_at 序）
   /** [window-paging] 会话是否有更早历史（GET /messages/page hasMore · 列表顶部「加载更早」按钮显隐） */
   hasMore: Record<string, boolean>
+  /** [trace-count] 会话消息总数（GET /messages/page total · DB sessions.messageCount 非 meta 口径）· 轨迹 tab 徽标全量 */
+  msgTotals: Record<string, number>
   /** 本会话 agent 改动的文件（files.changed STOMP 事件 + GET /files 对账 → 右栏「文件」tab 真数据源 · 无改动 = []) */
   changedFiles: Record<string, SessionFile[]>
   /** 图片缓存：sessionId → id → {mediaType, base64}（重拉后按 imagePasteIds 批量拉图显示缩略图） */
@@ -158,6 +160,8 @@ export interface ChatState {
   addToolUseSummary: (sessionId: string, row: { id: string; content: string; userMessageId?: string | null }) => void
   /** [window-paging] 记录会话是否有更早历史（GET /messages/page hasMore · 顶部「加载更早」按钮显隐） */
   setHasMore: (sessionId: string, hasMore: boolean) => void
+  /** [trace-count] 记录会话消息总数（GET /messages/page total · 轨迹 tab 徽标全量） */
+  setMsgTotal: (sessionId: string, total: number) => void
   /** [window-paging] 向上翻页：更早一页 prepend 到该会话窗口头部（created_at 时序；幂等去重 overlap id；
    *  snip_boundary 并入 snippedIds 照常标注）+ 更新 hasMore */
   prependMessages: (sessionId: string, older: ChatMessageDto[], hasMore: boolean) => void
@@ -167,6 +171,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   sessions: [],
   messages: {},
   hasMore: {},              // [window-paging] 会话是否有更早历史（GET /messages/page）
+  msgTotals: {},            // [trace-count] 会话消息总数（GET /messages/page total · 轨迹徽标全量）
   changedFiles: {},
   imageCache: {},
   streams: {},
@@ -469,6 +474,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   }),
   setHasMore: (sessionId, hasMore) => set((st) => ({
     hasMore: { ...st.hasMore, [sessionId]: hasMore },
+  })),
+  setMsgTotal: (sessionId, total) => set((st) => ({
+    msgTotals: { ...st.msgTotals, [sessionId]: total },
   })),
   prependMessages: (sessionId, older, hasMore) => set((st) => {
     const existing = st.messages[sessionId] ?? []

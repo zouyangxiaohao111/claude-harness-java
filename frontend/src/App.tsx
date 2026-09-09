@@ -344,6 +344,8 @@ function App() {
 
   // ---- 消息渲染源：chatStore.messages + 当前流式 ----
   const storeMessages = useChatStore((s) => s.messages[activeSessionId] ?? EMPTY_MESSAGES)
+  // [trace-count] 轨迹 tab 徽标全量：GET /messages/page total（DB sessions.messageCount 非 meta 口径）· 未拉到时回落窗口条数
+  const activeMsgTotal = useChatStore((s) => (activeSessionId ? (s.msgTotals[activeSessionId] ?? null) : null))
   // [流式性能 2026-09-09] 不再顶层订阅整条 streams[sid] 引用（打字机逐帧 append 会让整 App 每帧重渲）。
   //   改订 streamOrder 长度（结构信号）：块增/删才变化, content 推进不触碰 —— 内容订阅已下沉 MessageList
   //   每行 StreamBlockRow（selectStreamBlock）。此处只用于 turnRunning / thinking / Composer.empty 的「有无流式块」。
@@ -413,9 +415,10 @@ function App() {
   const HISTORY_PAGE_SIZE = 50
   /** [window-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/page 尾页，不再全量拉。 */
   const loadTailWindow = useCallback(async (sid: string) => {
-    const { messages, hasMore } = await chatApi.listMessagesPage(sid, { limit: HISTORY_PAGE_SIZE })
+    const { messages, hasMore, total } = await chatApi.listMessagesPage(sid, { limit: HISTORY_PAGE_SIZE })
     setMessages(sid, messages)
     useChatStore.getState().setHasMore(sid, hasMore)
+    useChatStore.getState().setMsgTotal(sid, total)   // [trace-count] 徽标全量 = DB 非 meta 消息总数
   }, [setMessages])
   /** [window-paging] 向上翻页「加载更早」：以窗口首条为 beforeMessageId 取更早一页 prepend（保持时序 + 幂等去重）。 */
   const handleLoadOlder = useCallback(async (sid: string) => {
@@ -651,10 +654,11 @@ function App() {
     if (Array.isArray(cached) && cached.length > 0) return
     // [window-paging] 无缓存 → 尾页（有界窗口，不再全量；hasMore 供顶部「加载更早」）
     chatApi.listMessagesPage(activeSessionId, { limit: HISTORY_PAGE_SIZE })
-      .then(({ messages, hasMore }) => {
+      .then(({ messages, hasMore, total }) => {
         if (cancelled) return
         setMessages(activeSessionId, messages)
         useChatStore.getState().setHasMore(activeSessionId, hasMore)
+        useChatStore.getState().setMsgTotal(activeSessionId, total)   // [trace-count] 徽标全量 = DB 非 meta 消息总数
       })
       .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
     return () => { cancelled = true }
@@ -1578,7 +1582,7 @@ function App() {
           >
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M6 1L6 9M6 9L3 6M6 9L9 6M3 11H9"/></svg>
             轨迹
-            <span className="count-badge">{storeMessages.filter((m) => !m.isMeta).length}</span>
+            <span className="count-badge">{activeMsgTotal ?? storeMessages.filter((m) => !m.isMeta).length}</span>
           </button>
         </div>
         <div className="stream">
