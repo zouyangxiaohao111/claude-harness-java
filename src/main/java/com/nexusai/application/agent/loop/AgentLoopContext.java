@@ -2001,22 +2001,6 @@ public record AgentLoopContext(
 
         log.info("TOOL batch done: {} calls · {} results", msg.toolCalls().size(), results.size());
 
-        // ── A6: 工具用量 Haiku 摘要（对齐 CC query.ts:1411 pendingToolUseSummary）──
-        if (isEmitToolUseSummariesEnabled(ctx)) {
-            try {
-                generateToolUseSummaryAsync(ctx, state, msg.toolCalls())
-                    .thenAccept(summary -> log.debug("[A6 tool_use_summary] async result: turn={} total={}",
-                        summary != null ? summary.turnCount() : -1,
-                        summary != null ? summary.totalCalls() : 0))
-                    .exceptionally(e -> {
-                        log.warn("[A6 tool_use_summary] failed: {}", e.getMessage());
-                        return null;
-                    });
-            } catch (Exception e) {
-                log.warn("[A6 tool_use_summary] trigger failed: {}", e.getMessage());
-            }
-        }
-
         if (!state.needsFollowUp()) {
             state.markNeedsFollowUp();
         }
@@ -2107,74 +2091,6 @@ public record AgentLoopContext(
                 toolName);
         }
         return null;
-    }
-
-    /** emitToolUseSummaries gate · static 化自 LlmAgentLoop#isEmitToolUseSummariesEnabled。 */
-    private static boolean isEmitToolUseSummariesEnabled(AgentLoopContext ctx) {
-        if (ctx.queryConfig() == null || ctx.queryConfig().gates() == null) return false;
-        return ctx.queryConfig().gates().emitToolUseSummaries();
-    }
-
-    /** 工具用量 Haiku 摘要 async · static 化自 LlmAgentLoop#generateToolUseSummaryAsync。 */
-    private static java.util.concurrent.CompletableFuture<com.nexusai.application.agent.LlmAgentLoop.ToolUseSummary>
-            generateToolUseSummaryAsync(AgentLoopContext ctx, AgentState state, List<ToolUseBlock> seenToolCalls) {
-        if (seenToolCalls == null || seenToolCalls.isEmpty()) {
-            return java.util.concurrent.CompletableFuture.completedFuture(null);
-        }
-        return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
-            java.util.Map<String, Integer> byTool = new java.util.LinkedHashMap<>();
-            for (ToolUseBlock call : seenToolCalls) {
-                byTool.merge(call.name(), 1, Integer::sum);
-            }
-            String semanticSummary = null;
-            try {
-                semanticSummary = generateToolUseSemanticSummaryWithHaiku(ctx, state, seenToolCalls, byTool);
-            } catch (Exception e) {
-                log.warn("[R24-5 Haiku summary] failed: {}", e.getMessage());
-            }
-            log.info("[R24-5 A6 tool_use_summary] turn={} tools={} total={} haikuSummary={}",
-                state.turnCount(), byTool.size(), seenToolCalls.size(),
-                semanticSummary != null ? "yes" : "no");
-            return new com.nexusai.application.agent.LlmAgentLoop.ToolUseSummary(state.turnCount(),
-                byTool, seenToolCalls.size(), System.currentTimeMillis(), semanticSummary);
-        });
-    }
-
-    /** Haiku 语义摘要 · static 化自 LlmAgentLoop#generateToolUseSemanticSummaryWithHaiku（ctx.llmProviderFactory）。 */
-    private static String generateToolUseSemanticSummaryWithHaiku(AgentLoopContext ctx, AgentState state,
-                                                                  List<ToolUseBlock> toolCalls,
-                                                                  java.util.Map<String, Integer> byTool) {
-        if (ctx.llmProviderFactory() == null) return null;
-        StringBuilder prompt = new StringBuilder();
-        prompt.append("请用 1-2 句话总结本轮工具调用, 重点说明高频工具的可能原因:\n");
-        prompt.append("工具调用次数统计: ");
-        byTool.forEach((name, count) -> prompt.append(name).append("=").append(count).append(" "));
-        prompt.append("\n调用顺序: ");
-        for (int i = 0; i < toolCalls.size() && i < 20; i++) {
-            prompt.append(toolCalls.get(i).name()).append(",");
-        }
-        prompt.append("\n\n只输出 1-2 句中文摘要, 不要前缀. ");
-        if (state != null) {
-            prompt.append("\n当前 turn=").append(state.turnCount());
-        }
-        // [RV14B-WIRE-04] 真实配置解析：fast 模型名 → DB 名 → (config, providerType)；
-        //   解析失败 → 返回 null（warn+skip 不落 mock，对齐 CC queryHaiku 失败即无结果）。
-        com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolved = resolveHaikuModelConfig(ctx);
-        if (resolved == null || resolved.config() == null || !resolved.config().isUsable()) {
-            log.warn("[R24-5 Haiku summary] 模型配置解析失败，跳过（warn+skip 不落 mock，RV14B-GATE-01）");
-            return null;
-        }
-        String modelName = resolveHaikuModelName(ctx);
-        try {
-            return ctx.llmProviderFactory().getProvider(resolved.config(), resolved.providerType()).chat(
-                resolved.config(),
-                modelName,
-                "你是代码助手统计专家. 用一句话总结高频工具的使用模式.",
-                prompt.toString()
-            );
-        } catch (Exception e) {
-            return null;
-        }
     }
 
     /** 单条工具结果按 CC persistence 语义处理 · static 化自 LlmAgentLoop#applyToolResultBudget。

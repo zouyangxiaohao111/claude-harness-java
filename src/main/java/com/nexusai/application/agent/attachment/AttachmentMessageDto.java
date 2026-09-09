@@ -859,6 +859,9 @@ public record AttachmentMessageDto(
     //           返回 null → 仅供 transcript/UI 可观测，不喂 LLM（对齐 CC 出站附件通道语义）。
     // ════════════════════════════════════════════════════════════════════════
 
+    /** type='tool_use_summary' attachment 类型常量（生成器 / LlmAgentLoop 过滤 / ChatService 落库共用）。 */
+    public static final String TYPE_TOOL_USE_SUMMARY = "tool_use_summary";
+
     /**
      * 入站 tool_use_summary attachment 工厂 · 对齐 CC {@code createToolUseSummaryMessage}
      * （utils/messages.ts:5105-5116）。

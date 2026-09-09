@@ -4749,7 +4749,23 @@ public class LlmAgentLoop implements AgentLoop {
             // 消息仅请求面剔除、不持久化删除）。防御性拷贝隔离后续 state 变异（relevant_memories
             // append / deferred_tools_delta append / reactive replace），
             // 默认（historySnip 关 + 无压缩触发）本局部内容 == state.messages()，行为不变。
-            List<ChatMessageDto> messagesForQuery = new ArrayList<>(state.messages());
+            // [toolsum-display 2026-09-09] tool_use_summary 是 UI 展示行（DB 落库 / 前端渲染），
+            // 绝不进模型上下文（防摘要批次变动断前缀缓存）。messagesForQuery 是 messagesForLlm /
+            // token 测量 / snip-micro-collapse-autocompact 的共同快照源，在此剔除摘要行覆盖全链路
+            // （实时多迭代 / stop-hook 重入 / DB 恢复注入后的新一轮都经此快照）。
+            // 注：本迭代 await 的 summary append 晚于此快照；过滤主要拦截「上一轮/恢复注入」的摘要行。
+            List<ChatMessageDto> messagesForQuery = new ArrayList<>();
+            for (ChatMessageDto m : state.messages()) {
+                if (isToolUseSummaryRow(m)) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[LlmAgentLoop] messagesForQuery 剔除 tool_use_summary 展示行（不进模型）: id={} contentLen={}",
+                            abbreviate(m.id(), 16),
+                            m.content() == null ? 0 : m.content().length());
+                    }
+                    continue;
+                }
+                messagesForQuery.add(m);
+            }
 
             // ── [H7-arch Phase 5 P4 C7] 消费上轮 tool-use summary · 对齐 CC query.ts:1055-1060 ──
             // Haiku (~1s) 在模型流式期间 (5-30s) 已 resolve，这里 await 不阻塞主链。
@@ -4761,6 +4777,15 @@ public class LlmAgentLoop implements AgentLoop {
                         pendingToolUseSummary.get(2, java.util.concurrent.TimeUnit.SECONDS);
                     if (summary != null) {
                         state.appendAttachment(summary);
+                        // [toolsum-display] 摘要另落一条「UI 展示行」（role=user/author=attachment/
+                        // subtype=tool_use_summary/isMeta=true）→ appendListener → ChatService 落库，
+                        // 前端 GET /messages 渲染一行且历史可翻；模型侧由 messagesForQuery 过滤剔除。
+                        // isMeta=true：避免归属污染 lastUserMessageId、避免被前端当真实用户行。
+                        try {
+                            state.appendMessage(toToolUseSummaryMessage(summary, state));
+                        } catch (Exception e) {
+                            log.warn("[LlmAgentLoop] tool_use_summary 展示行落库失败（best-effort 不阻断）: {}", e.getMessage());
+                        }
                         log.info("[LlmAgentLoop] turn={} tool_use_summary 注入 (chars={}) · CC query.ts:1055-1060",
                             state.turnCount(),
                             summary.content() != null ? summary.content().length() : 0);
@@ -7250,12 +7275,27 @@ public class LlmAgentLoop implements AgentLoop {
             }
 
             // ── 纯文本分支（Phase A 原行为） ──
-            if (text.isEmpty() && chunkCount[0] == 0) {
+            // [对齐 CC 2026-09-09] 空响应守卫修复（Java 独有 NO_ASSISTANT_TEXT 误杀）：
+            //   CC query.ts 无 NO_ASSISTANT_TEXT 终止（AgentState 自注"防御性，CC 未显式列出"）。deepseek
+            //   reasoning 模型长思考后常见「content 空 + reasoning 非空 + 无工具」——尤其工具批后 do-while
+            //   强制续轮回喂结果(genuine next_turn :7208-7249)的那一轮：模型想完无话可说即停，thinking 极长
+            //   （logs sess-fcdcdc68/msg-d9aaa8dc turn36 reasoning=221872 字符）。旧守卫只看 text/chunkCount，
+            //   把这种合法收尾判成空响应 break 掉整个 run，22 万字符思考在 appendMessage(:7265) 前整体丢弃，
+            //   最后正文永不产出（前端收到 message.complete finishReason=empty 复用上一轮旧正文）。修：
+            //   「本轮产出了非空 reasoning」走正常纯文本分支 appendMessage(thinking 落历史)+finishReason=stop
+            //   自然收尾；NO_ASSISTANT_TEXT 只保留给真·"无正文 无思考 无工具"（provider 空响应/异常）。
+            //   能落到本分支即已无工具轮（:7055 工具分支已 continue），故豁免只需判 reasoning。
+            boolean reasoningProduced = msg != null && msg.reasoning() != null && !msg.reasoning().isEmpty();
+            if (text.isEmpty() && chunkCount[0] == 0 && !reasoningProduced) {
                 state.setFinishReason("empty");
                 state.setExitReason(ExitReason.NO_ASSISTANT_TEXT);
                 state.setError("stream completed with no assistant text");
                 log.warn("LLM exit: {} (empty response)", state.exitReason());
                 break;
+            }
+            if (reasoningProduced && text.isEmpty()) {
+                log.info("LlmAgentLoop reasoning-only 收尾: turn={} reasoningLen={} content 空无工具 → 按正常纯文本分支结束(对齐 CC，不 NO_ASSISTANT_TEXT)",
+                    state.turnCount(), msg.reasoning().length());
             }
             state.setFinishReason("stop");
             // [DEC-04] assistant 消息携带 provider usage · CC finalizeAgentTool message.usage 透传
@@ -9055,25 +9095,32 @@ public class LlmAgentLoop implements AgentLoop {
         return chars / 4;
     }
 
-    // ── A6 辅助: 工具用量统计（对齐 CC query.ts:1411 pendingToolUseSummary）──
-    /**
-     * 统计当前 turn 的工具调用次数 + 按工具名分组 · 对齐 CC pendingToolUseSummary 结构.
-     *
-     * <p>R24-5 L1 真实: 增加 semanticSummary 字段承载 Haiku API 生成的语义摘要文本
-     * (CC fire-and-forget 后台总结, 主循环不等结果).
-     */
-    public record ToolUseSummary(
-        int turnCount,
-        java.util.Map<String, Integer> byTool,
-        int totalCalls,
-        long generatedAt,
-        String semanticSummary) {
+    /** [toolsum-display] tool_use_summary 展示行判别（role=user/author=attachment/subtype=TYPE_TOOL_USE_SUMMARY）。 */
+    private static boolean isToolUseSummaryRow(ChatMessageDto m) {
+        return m != null && Role.user == m.role() && "attachment".equals(m.author())
+            && com.nexusai.application.agent.attachment.AttachmentMessageDto.TYPE_TOOL_USE_SUMMARY.equals(m.subtype());
+    }
 
-        /** 向后兼容构造器 (无 Haiku 语义摘要, 仅本地计数 map) */
-        public ToolUseSummary(int turnCount, java.util.Map<String, Integer> byTool,
-                              int totalCalls, long generatedAt) {
-            this(turnCount, byTool, totalCalls, generatedAt, null);
+    /** [toolsum-display] AttachmentMessageDto(summary) → 展示用 ChatMessageDto 落库行（author=attachment，isMeta=true）。 */
+    private static ChatMessageDto toToolUseSummaryMessage(
+            com.nexusai.application.agent.attachment.AttachmentMessageDto a, AgentState state) {
+        String sessionId = state != null ? state.sessionId() : null;
+        String userMessageId = state != null ? state.lastUserMessageId() : null;
+        if (userMessageId == null) {
+            userMessageId = sessionId;
         }
+        String type = com.nexusai.application.agent.attachment.AttachmentMessageDto.TYPE_TOOL_USE_SUMMARY;
+        // 21 参形状镜像 PostCompactAttachmentRestorer.buildAttachmentMessage（author='attachment' 落库行），
+        // isMeta=true（防归属污染/前端当真实用户行）；userMessageId 经 withUserMessageId 拷贝链（不动 ctor 位置）。
+        return new ChatMessageDto(
+            a.id() != null ? a.id() : java.util.UUID.randomUUID().toString(),
+            null, Role.user, "attachment",
+            a.content() != null ? a.content() : "", null, java.util.List.of(),
+            com.nexusai.model.session.dto.FinishReason.stop,
+            null, null, "刚刚", java.time.OffsetDateTime.now(),
+            null, null, null,
+            java.util.List.of(), java.util.List.of(), null, true, false, type)
+            .withUserMessageId(userMessageId);
     }
 
     // ── [W9-01 OPD-TS-29] tool_use_summary SDK 出站序列化 ──

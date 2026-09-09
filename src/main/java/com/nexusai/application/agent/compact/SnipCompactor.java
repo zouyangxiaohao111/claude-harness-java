@@ -51,29 +51,30 @@ public class SnipCompactor {
 
     /** 消息数 nudge 阈值 · CC original: SNIP_NUDGE_THRESHOLD (snipCompact.ts:11) = 30（固定值）。
      *  仅供 {@code shouldNudgeForSnips(messages)} 单参变体（CC 原语义）+ 窗口未知（0/负）兜底；
-     *  窗口自适应路径用下方 450/300/180/90 档位（snip-nudge-scaleup 2026-09-08）。 */
+     *  窗口自适应路径用下方 900/600/360/180 档位（snip-nudge-scaleup 2026-09-08 ×3 + 2026-09-09 ×2）。 */
     private static final int SNIP_NUDGE_THRESHOLD = 30;
 
     // [V55 fix-transcript-nudge] 上下文窗口自适应档位（Java 扩展，CC 仅固定 30）。
     //   effectiveWindow = CompactThresholdSystem#getEffectiveContextWindowSize(model)
     //   （含 reserved 减法 + settings 收窄）。
-    //   [snip-nudge-scaleup 2026-09-08 用户拍板] 档位整体 ×3（1M 窗口 150→450，避免过早 nudge；
-    //   其它窗口自适应同比例）：≥800k → 450；>600k → 300；≥400k → 180；>0 且 <400k（如 200k）→ 90；
+    //   [snip-nudge-scaleup 2026-09-08 用户拍板] 档位整体 ×3（1M 窗口 150→450，避免过早 nudge；其它同比例）。
+    //   [snip-nudge-scaleup 2026-09-09 用户拍板 再 ×2（沿 ×3 阶梯同比例）]：实测 831 条对话仅用 ~61% 窗口，
+    //   450 条阈值仍过早 → 整档 ×2：≥800k → 900；>600k → 600；≥400k → 360；>0 且 <400k（如 200k）→ 180；
     //   窗口未知（0/负：阈值系统未接线/单测/无 bean）→ 仍回落 CC 默认 30（零行为变化）。
-    /** 窗口档位 A 下限（effectiveWindow ≥ 800k → 阈值 450） */
+    /** 窗口档位 A 下限（effectiveWindow ≥ 800k → 阈值 900） */
     private static final int SNIP_NUDGE_WINDOW_800K = 800_000;
-    /** 窗口档位 B 下限（effectiveWindow &gt; 600k → 阈值 300） */
+    /** 窗口档位 B 下限（effectiveWindow &gt; 600k → 阈值 600） */
     private static final int SNIP_NUDGE_WINDOW_600K = 600_000;
-    /** 窗口档位 C 下限（effectiveWindow ≥ 400k → 阈值 180） */
+    /** 窗口档位 C 下限（effectiveWindow ≥ 400k → 阈值 360） */
     private static final int SNIP_NUDGE_WINDOW_400K = 400_000;
     /** 窗口档位 A 阈值（≥800k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_450 = 450;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_900 = 900;
     /** 窗口档位 B 阈值（>600k 且 <800k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_300 = 300;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_600 = 600;
     /** 窗口档位 C 阈值（≥400k 且 ≤600k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_180 = 180;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_360 = 360;
     /** 窗口档位 D 阈值（>0 且 <400k 已知小窗口，如 200k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_90 = 90;
+    private static final int SNIP_NUDGE_THRESHOLD_TIER_180 = 180;
 
     /**
      * nudge 提示文本 · CC original: SNIP_NUDGE_TEXT (snipCompact.ts:17-18)。
@@ -295,9 +296,9 @@ public class SnipCompactor {
      * <p><b>优先级</b>:
      * <ol>
      *   <li>DB settings.snip_nudge_threshold &gt; 0 → 直接覆盖（用户显式配置优先，前端「环境配置」可配）</li>
-     *   <li>null / ≤ 0 → 按 effectiveWindow 窗口自适应档位回落（snip-nudge-scaleup 2026-09-08 用户拍板，
-     *       1M 窗口不再过早通知，档位整体 ×3）：
-     *       ≥800k → 450；&gt;600k → 300；≥400k → 180；&gt;0 且 &lt;400k（如 200k）→ 90</li>
+     *   <li>null / ≤ 0 → 按 effectiveWindow 窗口自适应档位回落（snip-nudge-scaleup 2026-09-08 用户拍板 ×3 +
+     *       2026-09-09 拍板 再 ×2，1M 窗口不再过早通知）：
+     *       ≥800k → 900；&gt;600k → 600；≥400k → 360；&gt;0 且 &lt;400k（如 200k）→ 180</li>
      * </ol>
      * effectiveWindow 为 0 / 负数（阈值系统未接线、单测、无 bean）→ 回落 30（CC 默认，零行为变化）。
      *
@@ -314,14 +315,14 @@ public class SnipCompactor {
         }
         int threshold;
         if (effectiveWindow >= SNIP_NUDGE_WINDOW_800K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_450;
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_900;
         } else if (effectiveWindow > SNIP_NUDGE_WINDOW_600K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_300;
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_600;
         } else if (effectiveWindow >= SNIP_NUDGE_WINDOW_400K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_180;
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_360;
         } else if (effectiveWindow > 0) {
-            // 已知小窗口（<400k，如 200k）→ 90（snip-nudge-scaleup 自适应档）
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_90;
+            // 已知小窗口（<400k，如 200k）→ 180（snip-nudge-scaleup 自适应档）
+            threshold = SNIP_NUDGE_THRESHOLD_TIER_180;
         } else {
             // 窗口未知（0/负：阈值系统未接线/单测/无 bean）→ CC 默认 30（零行为变化）
             threshold = SNIP_NUDGE_THRESHOLD;
