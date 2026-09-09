@@ -96,6 +96,26 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
     private final HookPermissionResolver permissionResolver;
 
     /**
+     * 会话模型直传解析（方案 A · 对齐 CC toolUseContext.options.mainLoopModel）：
+     * 入参 = {@code forkCtx.effectiveModelName()}（父会话当前运行模型，provider 全名，如
+     * {@code deepseek/deepseek-v4.1-flash-...}）；返回 {@link ForkModelRoute}（裸发送名 + provider
+     * config + LlmProvider）。非 null 且解析成功 → 覆盖全局 supplier（修跨 provider 重名误路由）；
+     * null / 解析失败 → 回落 supplier（旧 settings 路径，行为不变）。生产由 ToolRegistrationConfig 注入。
+     */
+    private final java.util.function.Function<String, ForkModelRoute> sessionModelRouteResolver;
+
+    /**
+     * 会话模型直传的路由结果。
+     *
+     * @param model         SDK 发送名（裸名，去 provider 前缀）
+     * @param config        provider 运行时配置（baseUrl + 解密 apiKey）
+     * @param provider      目标 LlmProvider
+     * @param providerType  provider.type()（openai_compatible / anthropic …）
+     */
+    public record ForkModelRoute(String model, ProviderConfig config,
+                                 LlmProvider provider, String providerType) {}
+
+    /**
      * 构造 · 由 ToolRegistrationConfig 生产注入。
      *
      * @param providerSupplier  provider 解析
@@ -107,11 +127,7 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                                  Supplier<String> modelSupplier,
                                  Supplier<ProviderConfig> configSupplier,
                                  ToolRegistry toolRegistry) {
-        this.providerSupplier = providerSupplier;
-        this.modelSupplier = modelSupplier;
-        this.configSupplier = configSupplier;
-        this.toolRegistry = toolRegistry;
-        this.permissionResolver = new HookPermissionResolver();
+        this(providerSupplier, modelSupplier, configSupplier, toolRegistry, null);
     }
 
     /**
@@ -128,11 +144,31 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                                  Supplier<ProviderConfig> configSupplier,
                                  ToolRegistry toolRegistry,
                                  HookPermissionResolver permissionResolver) {
+        this(providerSupplier, modelSupplier, configSupplier, toolRegistry, permissionResolver, null);
+    }
+
+    /**
+     * 构造（会话模型直传）· 生产注入 sessionModelRouteResolver（方案 A）。
+     *
+     * @param providerSupplier          provider 解析（回落源）
+     * @param modelSupplier             当前模型（回落源）
+     * @param configSupplier            provider 配置解析（回落源）
+     * @param toolRegistry              工具注册表（执行 fork 的 Read/Write/Edit/Bash 等）
+     * @param permissionResolver        权限解析器（null → 内部 new）
+     * @param sessionModelRouteResolver 会话模型直传解析（null → 回落 supplier）
+     */
+    public ProductionForkedQuery(Supplier<LlmProvider> providerSupplier,
+                                 Supplier<String> modelSupplier,
+                                 Supplier<ProviderConfig> configSupplier,
+                                 ToolRegistry toolRegistry,
+                                 HookPermissionResolver permissionResolver,
+                                 java.util.function.Function<String, ForkModelRoute> sessionModelRouteResolver) {
         this.providerSupplier = providerSupplier;
         this.modelSupplier = modelSupplier;
         this.configSupplier = configSupplier;
         this.toolRegistry = toolRegistry;
         this.permissionResolver = permissionResolver != null ? permissionResolver : new HookPermissionResolver();
+        this.sessionModelRouteResolver = sessionModelRouteResolver;
     }
 
     /**
@@ -179,9 +215,6 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
         String model = modelSupplier != null ? modelSupplier.get() : null;
         ProviderConfig config = configSupplier != null ? configSupplier.get() : null;
         LlmProvider provider = providerSupplier != null ? providerSupplier.get() : null;
-        if (provider == null) {
-            throw new IllegalStateException("[ProductionForkedQuery] provider 未注入（providerSupplier 返回 null），无法执行 fork loop");
-        }
 
         // [IMP-MV2-09 T9] userContext 前置 meta user 消息 · 对齐 CC query.ts:660
         //   {@code prependUserContext(messagesForQuery, userContext)} —— fork 重建主线程
@@ -199,9 +232,70 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
         AbortController abort = forkCtx != null && forkCtx.abortController() != null
             ? forkCtx.abortController() : AbortController.NOOP;
 
+        // ── [方案 A · 会话模型直传] 对齐 CC toolUseContext.options.mainLoopModel（sessionMemory.ts:418 /
+        //    sessionMemoryCompact.ts:587）：forkCtx（父会话隔离上下文）携带 effectiveModelName =
+        //    当前会话运行模型（provider 全名，如 deepseek/deepseek-v4.1-flash-…）→ 用同一模型现算
+        //    provider/config/裸发送名，取代全局 settings 默认（裸名撞跨 provider 重名 → 误路由 fz/ark 根因）。
+        if (sessionModelRouteResolver != null && forkCtx != null) {
+            String sessionModel = forkCtx.effectiveModelName();
+            if (sessionModel != null && !sessionModel.isBlank()) {
+                ForkModelRoute route = sessionModelRouteResolver.apply(sessionModel);
+                if (route != null && route.provider() != null && route.config() != null
+                        && route.config().isUsable() && route.model() != null && !route.model().isBlank()) {
+                    log.info("[ProductionForkedQuery] fork 会话模型直传: sessionModel={} → providerType={} "
+                            + "model={} baseUrl={}",
+                        sessionModel, route.providerType(), route.model(), route.config().baseUrl());
+                    model = route.model();
+                    config = route.config();
+                    provider = route.provider();
+                } else {
+                    log.warn("[ProductionForkedQuery] fork 会话模型路由失败(sessionModel={})，回落全局 supplier",
+                        sessionModel);
+                }
+            }
+        }
+        if (provider == null) {
+            throw new IllegalStateException("[ProductionForkedQuery] provider 未注入（providerSupplier 返回 null "
+                + "且无会话模型路由），无法执行 fork loop");
+        }
+
         // tools ArrayNode（cache-safe：fork 用主线程工具集，availableTools 由 cacheSafeParams
         //   toolUseContext 继承 —— CC tools 是 cache key 一部分，fork 不能换工具集）
         ArrayNode tools = buildToolsArray(forkCtx);
+
+        // ── [SM 工具诊断埋点] 实际下发给模型的工具集（是否含 Edit）+ canUseTool + 可见工具数 ──
+        //   排查「SM fork 只见模板不总结」：若 containsEdit=false → 模型根本没有 Edit 可调；
+        //   true → 工具已给、问题在模型没发起 Edit（看下方「无工具调用」文本收尾日志）。
+        List<String> toolNames = new java.util.ArrayList<>();
+        if (tools != null) {
+            for (com.fasterxml.jackson.databind.JsonNode n : tools) {
+                String nm = n.path("function").path("name").asText("");
+                if (nm.isEmpty()) {
+                    nm = n.path("name").asText("");
+                }
+                if (!nm.isEmpty()) {
+                    toolNames.add(nm);
+                }
+            }
+        }
+        int historySize = runningMessages != null ? runningMessages.size() : -1;
+        int systemSegments = params.systemPrompt() != null ? params.systemPrompt().size() : -1;
+        int systemChars = 0;
+        if (params.systemPrompt() != null) {
+            for (String s : params.systemPrompt()) {
+                if (s != null) {
+                    systemChars += s.length();
+                }
+            }
+        }
+        log.info("[ProductionForkedQuery] fork 工具下发: querySource={} model={} visibleTools={} "
+                + "containsEdit={} canUseTool={} availableTools={} names={} historySize={} "
+                + "systemPromptSegments={} systemPromptChars={}",
+            params.querySource(), model, tools != null ? tools.size() : 0,
+            toolNames.contains("Edit"),
+            params.canUseTool() != null ? "有(受限)" : "null(不受限)",
+            forkCtx != null && forkCtx.availableTools() != null ? forkCtx.availableTools().size() : 0,
+            toolNames, historySize, systemSegments, systemChars);
 
         // [RES-C6] 发送边界 boundary 剥离 → blocks 数组（对齐主线程 LlmAgentLoop:2897-2904 +
         //   ModelCaller blocks 重载）：fork 与主线程同一 gate（params.useGlobalCacheScope，由
@@ -292,6 +386,15 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                     log.debug("[ProductionForkedQuery] 第 {} 轮无工具调用，fork 完成（querySource={}）",
                         turns, params.querySource());
                 }
+                // ── [SM 工具诊断埋点] 无工具即文本收尾：打模型最终回复，区分「没给工具」还是「给了没调」 ──
+                String _content = msg.content() != null ? msg.content() : "";
+                String _reasoning = msg.reasoning() != null ? msg.reasoning() : "";
+                String _c = _content.length() > 300 ? _content.substring(0, 300) : _content;
+                String _r = _reasoning.length() > 300 ? _reasoning.substring(0, 300) : _reasoning;
+                log.info("[ProductionForkedQuery] fork 该轮无工具调用文本收尾: querySource={} contentChars={} "
+                        + "reasoningChars={} contentPreview=[{}] reasoningPreview=[{}]",
+                    params.querySource(), _content.length(), _reasoning.length(),
+                    _c.replace('\n', ' '), _r.replace('\n', ' '));
                 break;
             }
 

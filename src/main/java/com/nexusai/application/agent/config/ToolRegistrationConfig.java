@@ -1698,9 +1698,57 @@ public class ToolRegistrationConfig {
             @Autowired(required = false) com.nexusai.application.agent.settings.storage.FileConfigStorage configStorage) {
         ForkSuppliers suppliers = buildForkSuppliers(
             llmProviderFactory, modelMapper, providerMapper, providerService, configStorage);
-        log.info("IMP-M-P0-3: 注册 ProductionForkedQuery（生产 fork loop · extract/auto-dream seam 首接入 R9/IMP-18）");
+        log.info("IMP-M-P0-3: 注册 ProductionForkedQuery（生产 fork loop · extract/auto-dream seam 首接入 R9/IMP-18）"
+            + " · [方案 A] 会话模型直传 resolver 已注入");
         return new com.nexusai.application.agent.compact.fork.ProductionForkedQuery(
-            suppliers.providerSupplier(), suppliers.modelSupplier(), suppliers.configSupplier(), toolRegistry);
+            suppliers.providerSupplier(), suppliers.modelSupplier(), suppliers.configSupplier(), toolRegistry,
+            null,
+            sessionForkModelRoute(llmProviderFactory, modelMapper, providerMapper, providerService));
+    }
+
+    /**
+     * [方案 A · 会话模型直传] 按会话模型（provider 全名，如 {@code deepseek/deepseek-v4.1-flash-…}）
+     * 现算 fork 路由：model → provider → config(解密 key) + 裸发送名 + LlmProvider。
+     * 对齐 CC {@code toolUseContext.options.mainLoopModel}（sessionMemory.ts:418），解决全局 settings
+     * 默认裸名跨 provider 重名 → 误路由 fz/ark 的问题。任一环节失败 → null（ProductionForkedQuery 回落 supplier）。
+     */
+    private static java.util.function.Function<String,
+            com.nexusai.application.agent.compact.fork.ProductionForkedQuery.ForkModelRoute> sessionForkModelRoute(
+            com.nexusai.infra.llm.LlmProviderFactory llmProviderFactory,
+            com.nexusai.repository.provider.mapper.ModelMapper modelMapper,
+            com.nexusai.repository.provider.mapper.ProviderMapper providerMapper,
+            com.nexusai.domain.provider.ProviderService providerService) {
+        return (modelFull) -> {
+            try {
+                if (modelFull == null || modelFull.isBlank() || modelMapper == null || providerMapper == null
+                        || providerService == null || llmProviderFactory == null) {
+                    return null;
+                }
+                com.nexusai.repository.provider.entity.ModelRecord rec =
+                    com.nexusai.infra.llm.ModelNameResolver.resolve(modelMapper, providerMapper, modelFull);
+                if (rec == null || rec.getProviderId() == null || rec.getName() == null || rec.getName().isBlank()) {
+                    return null;
+                }
+                com.nexusai.repository.provider.entity.ProviderRecord prov =
+                    providerMapper.selectOneById(rec.getProviderId());
+                if (prov == null || !Boolean.TRUE.equals(prov.getEnabled())) {
+                    return null;
+                }
+                String rawKey = providerService.getDecryptedApiKey(prov.getId());
+                if (rawKey == null || rawKey.isBlank()) {
+                    return null;
+                }
+                String type = prov.getType() != null ? prov.getType() : "openai_compatible";
+                com.nexusai.infra.llm.ProviderConfig cfg =
+                    new com.nexusai.infra.llm.ProviderConfig(prov.getBaseUrl(), rawKey);
+                com.nexusai.infra.llm.LlmProvider p = llmProviderFactory.getProvider(cfg, type);
+                return new com.nexusai.application.agent.compact.fork.ProductionForkedQuery.ForkModelRoute(
+                    rec.getName(), cfg, p, type);
+            } catch (Exception e) {
+                log.warn("sessionForkModelRoute 解析失败 model={}: {}", modelFull, e.toString());
+                return null;
+            }
+        };
     }
 
     /**
