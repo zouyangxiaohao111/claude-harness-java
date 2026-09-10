@@ -4884,23 +4884,58 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
 
-            // ── [IMP-12/DRIFT-17] 循环入口 boundary 剥离 · CC query.ts:365 getMessagesAfterCompactBoundary ──
-            // 从最后一个 compact boundary（含）向后切片，去 pre-boundary 冗余历史；无 boundary → 全量快照不替换。
+            // ── [IMP-12/DRIFT-17] 循环入口 boundary 剥离 + snip 投影 · CC query.ts:523
+            //    `let messagesForQuery = getMessagesAfterCompactBoundary(messages)` ──
+            // 从最后一个 compact boundary（含）向后切片，去 pre-boundary 冗余历史。
+            //
+            // ⚠️ [snip-state-fix 2026-09-10 · 为什么这里"故意"用单参重载（includeSnipped=false）]
+            //   单参重载（BoundaryReader:203-205）恒传 false ⇒ HISTORY_SNIP 开启时，除切片外还会
+            //   应用 projectSnippedView（收集**全部** snip_boundary 的 removedUuids）把被裁剪消息
+            //   一并剔除；结果经 state.replaceMessages **写回内存清单**。这不是 bug、是**有意为之
+            //   且被全仓依赖**的语义，不要"修"成 includeSnipped=true：
+            //     · 本仓 state.messages() 在循环里扮演的是 CC `messagesForQuery` 的角色 —— CC 的
+            //       query() 全程只用 messagesForQuery（:746 发模型 / :660 fork 上下文 /
+            //       :836,:855 token 扣减 / :1520,:1575,:1613 stop hook），全量 `messages` 只被读
+            //       一次（:523 生成 messagesForQuery），其唯一去处是 REPL/界面滚动回看；
+            //     · 本仓「REPL 全量历史」那一份由 **DB** 承担（前端/轨迹读 DB；DB append-only
+            //       从不删行）—— 循环内的 state 无需再留第二份全量；
+            //     · 目前约 10 个"模型相邻"消费点**直接吃 state.messages()** 并依赖它已投影
+            //       （用「搜关键字」而非行号定位，避免行号漂移误导；全部在本文件内 grep 即得）：
+            //         `tryReactiveCompact(new ReactiveCompactor.TryReactiveCompactParams(` 的 messages 实参
+            //         `buildCompactCacheSafeParams` 内的 `new ArrayList<>(state.messages())`
+            //         `recoverFromOverflow(state.messages()`
+            //         `executeStopHooksCollecting` 两处 messages 实参
+            //         `executeExtractMemoriesAndAutoDream(... List.copyOf(state.messages())`
+            //         `ForkRawMaterial(List.copyOf(state.messages())`
+            //         `PostSamplingContext(` 的 messages 实参
+            //       改成 includeSnipped=true 会让它们**集体**从「已过滤」翻转为「未过滤」，
+            //       实测后果：reactive compact 把被裁剪内容摘要后**回灌模型**、
+            //       extract-memories/auto-dream 把被裁剪内容**写进 memory 文件**（永久污染）、
+            //       compact 的 cache-safe 上下文与真实压缩输入分歧。
+            //     ⇒ 真要在内存里保留全量（例如让 hook/UI 看到真实历史），必须**同时**把上面这些
+            //       消费点逐个改成显式取投影面，否则静默泄漏。CC 侧对应物见 query.ts:1407-1416
+            //       （reactive compact 亦传 messagesForQuery）。
+            //
+            // 边界情况：**无** compact boundary 时本块同样可能替换 state —— projectSnippedView
+            //   只做删除（removedSet 非空则 filter，绝不等量改写），故 size 判据有效、不会漏判；
+            //   即"无 boundary → 不替换"仅在 snip 也没裁剪过任何消息时成立。
             int preBoundaryCount = state.messages().size();
             List<ChatMessageDto> compactTarget = BoundaryReader.getMessagesAfterCompactBoundary(state.messages());
             if (compactTarget.size() != preBoundaryCount) {
                 state.replaceMessages(compactTarget);
-                log.info("[LlmAgentLoop] turn={} 循环入口 boundary 剥离: {} → {} messages · CC query.ts:365",
+                log.info("[LlmAgentLoop] turn={} 循环入口 boundary 剥离/裁剪投影: {} → {} messages（state=CC messagesForQuery 角色）· CC query.ts:523",
                     state.turnCount(), preBoundaryCount, compactTarget.size());
             }
 
-            // ── [B5 d-2] 请求级投影局部 messagesForQuery · CC query.ts:365
+            // ── [B5 d-2] 请求级投影局部 messagesForQuery · CC query.ts:523
             //    `let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]` ──
-            // 对齐 CC：请求面压缩链（snip/micro/collapse/autocompact）只替换本局部，state.messages()
-            // 保持完整（REPL/transcript 保留全量；CC query.ts:404 snip 请求级投影，removedUuids
-            // 消息仅请求面剔除、不持久化删除）。防御性拷贝隔离后续 state 变异（relevant_memories
-            // append / deferred_tools_delta append / reactive replace），
-            // 默认（historySnip 关 + 无压缩触发）本局部内容 == state.messages()，行为不变。
+            // 对齐 CC：请求面压缩链（snip/micro/collapse/autocompact）**只替换本局部**。
+            // ⚠️ 但 state.messages() **不是**「保持完整」：snip 的那一份在入口（上方 boundary 剥离块）
+            //   已随 projectSnippedView 写回 state —— 本仓 state 承担 CC `messagesForQuery` 的角色
+            //   （详见该块注释）。本局部只是在其之上再做**本轮**的请求级压缩。
+            //   「removedUuids 消息保留全量」说的是 **DB**（append-only 不删行），**不是内存 state**。
+            // 防御性拷贝隔离后续 state 变异（relevant_memories append / deferred_tools_delta append /
+            // reactive replace），默认（historySnip 关 + 无压缩触发）本局部内容 == state.messages()。
             // [toolsum-display 2026-09-09] tool_use_summary 是 UI 展示行（DB 落库 / 前端渲染），
             // 绝不进模型上下文（防摘要批次变动断前缀缓存）。messagesForQuery 是 messagesForLlm /
             // token 测量 / snip-micro-collapse-autocompact 的共同快照源，在此剔除摘要行覆盖全链路
@@ -5081,9 +5116,10 @@ public class LlmAgentLoop implements AgentLoop {
                 SnipCompactor.SnipResult snipResult =
                     new SnipCompactor().snipCompactIfNeeded(messagesForQuery);
                 snipTokensFreed = snipResult.tokensFreed();
-                // [B5 d-2] CC query.ts:404 `messagesForQuery = snipResult.messages` 请求级投影：
-                // 只替换局部 messagesForQuery，不再 state.replaceMessages 持久化删除 —— REPL/transcript
-                // 保留全量（removedUuids 消息仍留在 state，仅本请求面剔除；boundary 剥离前可见）。
+                // [B5 d-2] CC query.ts:591-595 `messagesForQuery = snipResult.messages` 请求级投影：
+                // 只替换局部 messagesForQuery，不做 DB 层的持久化删除（removedUuids 消息在 **DB** 仍在）。
+                // ⚠️ 内存层面：被 snip 消息**已在入口 boundary 剥离块**从 state.messages() 移除
+                //   （见该块注释）—— 故本处对 state 而言是幂等空操作，**不是**「state 仍留着它们」。
                 // 未执行（无 boundary）时 messages 与入参同引用 → 赋值无副作用。
                 messagesForQuery = snipResult.messages();
                 if (snipResult.boundaryMessage() != null) {
@@ -5099,7 +5135,7 @@ public class LlmAgentLoop implements AgentLoop {
                         log.debug("[LlmAgentLoop] turn={} snip boundaryMessage yield 到流事件: id={} · CC query.ts:406-408",
                             state.turnCount(), snipResult.boundaryMessage().id());
                     }
-                    log.info("[LlmAgentLoop] turn={} snip 完成: freed={} tokens（请求级投影，state.messages 保留全量）· CC query.ts:401-410",
+                    log.info("[LlmAgentLoop] turn={} snip 完成: freed={} tokens（请求级投影；被裁剪消息在 DB 保留、内存 state 已在入口剔除）· CC query.ts:591-595",
                         state.turnCount(), snipTokensFreed);
                 }
             }

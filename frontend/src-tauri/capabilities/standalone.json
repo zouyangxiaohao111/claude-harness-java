@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "standalone",
+  "description": "独立预览窗口（#/standalone-preview 整屏 HTML/PDF/Word/Excel/图片/音视频查看器）",
+  "windows": ["standalone-preview"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "fs:allow-read-file",
+    { "identifier": "fs:scope", "allow": ["**"] }
+  ]
+}

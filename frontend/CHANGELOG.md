@@ -2,14 +2,103 @@
 
 All notable changes to NexusAI will be documented in this file.
 
-## [Unreleased]
+## [0.1.6] - 2026-09-09
+
+### Fixed / Changed
+
+- **停止任务后卡片卡"运行中"**：`/tasks/{id}/kill` 对**已结束/已移除**的任务返回 404（`task not found`），而前端只在成功/失败时弹 toast、不更新本地态 → 子代理卡片永久"运行中"。现：**成功 → 乐观置 stopped**（终态事件丢失也不卡）；**404 → 视为已结束**（子代理卡片清身份 / 任务面板刷新清单）。
+- **轨迹徽标实时刷新**：每 5s 轮询后端 `GET /sessions/{id}/messages/count`（DB `sessions.messageCount` 非 meta 口径）更新轨迹 tab 消息总数，覆盖新消息/删除/裁剪；不再只是进会话时的快照。
+- **FinishReason 读回容错（后端）**：DB 某条 `finish_reason='max_tokens'` 曾致消息读取 500 → 轨迹页"暂无轨迹"；后端加 `max_tokens` 常量 + 容错解析，现正常。
+- **对话流式渲染对齐 deepseek**：rAF 帧合并替固定定时、行级订阅（打字只重渲所在行）；超长单块自动降级纯文本（不再逐帧全量解析卡死）；频繁切换会话不再「字不吐 / 抖动」。
+- **markdown 渲染对齐 CC**：移除 settled 前 dirty patches（围栏代码 `#include/#define` 不再被改写，「流式对、收口错」消除）；settled 缓存键补 onRunHtml。
+- **消息历史改为有界窗口**：打开/刷新只拉尾页 50 + 顶部「加载更早」逐页向上；Trace 全程独立（不受窗口限制）；不再一次全量拉 + 一次全量渲染。
+- **tool_use_summary 改实时展示**（不再写 transcript，对齐 CC）。
+- **自动压缩改真实用量判定**：不再因本地粗估虚高误触发压缩。
+- **auto-memory / snip 提醒修复**：default 会话记忆注入正常、snip 提醒按模型真实可见消息计数。
+- **轨迹 tab 消息数改全量**：0.1.6 有界窗口化后，「轨迹」徽标误把已加载页（page）条数（≈50）当全程数。现 `GET /messages/page` 新增 `total`（= 会话非 meta 消息总数，读 DB `sessions.messageCount` 零额外查询），chatStore 存会话总数，徽标 = total（未拉到回落窗口条数）；打开/切会话/F5/停止/重连即刷新到 DB 真值。
+- **轨迹补「已裁剪 / 已压缩」标记**：Snip 裁剪的消息此前在轨迹里与普通消息无异，Compact 压缩也看不出边界在哪。现轨迹左侧竖线区分 `.trace-record.snipped`（灰）+「已裁剪」标签，`compact_boundary` 渲染为「已压缩 #N（摘要看下一行）」分隔标记 + 折叠摘要详情（`is_compact_summary` 从 DB 读回，不再恒 false）。会话消息总数徽标按 `seq` 排序取。
+- **聊天区不再显示 transcript-only 摘要**：压缩摘要中"仅入 transcript、不进对话"的那种（对齐 CC `isVisibleInTranscriptOnly`）此前会作为普通用户气泡出现在聊天区。现 `MessageList` 按该标记过滤，只在轨迹中可读。
+- **「轨迹」里的压缩标记点开能看到真实摘要**：此前在「保留此前（from）」等压缩方向下，标记点开只显示英文占位文本（`Conversation compacted`）而非真正的压缩摘要；现按「压缩边界 ↔ 摘要」一一配对取值，各方向都能读到摘要。
+- **更早的压缩记录与其摘要正确一一对应**：连续压缩（多次压缩叠加）时，每条压缩记录对应自己的那份摘要，不会串到相邻的压缩记录上。
+- **压缩切点候选不再出现压缩摘要本身**：手动压缩/恢复的选点列表只列真实对话消息，压缩摘要与「仅入 transcript」的消息不再混入候选（选中它们会切出无意义的边界）。
+
+## [0.1.5] - 2026-09-09
+
+### Added
+
+- **自动更新**：桌面端启动自动检查（也可右下角「更新」手动），发现新版本即提示（对外 latest 化），支持查看更新说明 → 下载（进度/sha256 校验）→ 重启安装。更新源可配置，默认内网 MinIO，兼容 GitHub。
+- 发版侧新增 `scripts/release-update.mjs`（生成 latest.json + 上传 MinIO/GitHub）。
+
+### Fixed / Changed
+
+- **get_page_text 不再扩展侧截断（整页全交）**：此前 content script 将整页可见文本一刀切到 20k 字符，长文/长对话页后半被吞。现整页 `innerText` 全量回传，超 CC 单结果内联上限 `DEFAULT_MAX_RESULT_SIZE_CHARS=50_000` 的部分交由后端落盘+文件路径预览承接（聚合 200k 兜底），对齐 CC tool-result 尺寸语义。
+
+## [0.1.4] - 2026-09-08
+
+### Fixed / Changed
+
+- **前缀缓存修复（skill_listing 稳定化，对齐 CC）**：可用 skills 清单（~7.8k）此前经附件通道每轮追加到消息队尾，随对话增长位置漂移 → DeepSeek 前缀缓存每轮在清单处断裂（缓存利用率可低至 6%）。现改为**恒定置请求头部的 meta user 块**（紧跟 system、字节稳定、compact 后仍头部、变化随当前清单更新），缓存命中恢复高值。
+- 移除定位用的 `[CACHEFP]` 临时埋点（OpenAiSdkProvider）与 yml 开关。
+
+## [0.1.3] - 2026-09-08
+
+### Fixed / Changed
+
+- **后端 java 生命周期加固**：随包后端 pid 落盘 `~/.nexusai/backend.pid`；正常关窗/退出即时整树回收；被强杀后下次启动“身份校验”（命令行含 `nexusai-backend.jar`）才清理，不误杀其它 java。
+- **auto-memory 目录以 DB 绑定为主路径**：模型主动写记忆的目录来自会话绑定项目（DB path）；修复此前绑定 `D:\code\ai_project\nexusai` 却写入 `~/.nexusai/projects/C--Users-WIN--nexusai/memory` 的假目录；无绑定项目 → fail loud（error 日志）不回落、不拼假目录；autoDream/ExtractMemories 维持参数直传正确路径。
+- **SendMessage 对齐 CC**：OpenAI 兼容请求（deepseek/moonshot）初始 tools 含 SendMessage；fork/后台子代理每轮消费 inbox（主代理可实时通知运行中的子代理）。
+- **openai 懒加载通用豁免**：非 anthropic 清空 deferred，deferred 工具恒进初始 schema。
+- **会话标题自动生成**：provider/model 形态默认标题视为占位可被覆盖。
+- 子代理后台任务等待提示（Layer-1）；snip 档位说明同步；blocking 预检 stub 修复。
 
 ### Fixed
 
+- **无会话时「欢迎页绑定项目」此前只注册项目不建会话 → 左侧永远不出现（误以为没绑上）**：现改为与左栏「添加工作区 +」共用同一 `openWorkspaceFromFolder` 路径——选目录 → 注册/取项目 → **自动新建该项目首个会话并置顶左栏**并选中；有会话（空新会话）时维持绑定当前会话。左栏 `+ 添加工作区` 也复用此路径，前端不再按 name 猜复用（避免同名异目录误配）。
+- **后端配套（同批，见 backend changelog）**：`POST /api/v1/projects` 按「目录绝对路径」幂等（同目录重复注册返回已有，不再撞 projects.name UNIQUE → 500）；`projects` 唯一键由 name 迁到 path（Flyway V69），落库 path 统一正斜杠。
+- **绑定到已删除会话报 Session not found**：删除**最后一个**会话后 `activeSessionId` 残留已删 id（无 else 重置）→ 空态欢迎页「绑定项目」被误判为「有会话」→ bind 已删除 session 404。现删除最后一个会话时激活态重置为空；绑定入口改为校验会话真实存在于列表，不存在即走「建工作区」闭环。
+- **模型标签半动态（KIMI 等不再显示 DS）**：`ModelTag` 类型扩展 `'KIMI'`；新增 `brandTagFromName` 按模型全名推断品牌（kimi/moonshot→KIMI 等，未识别返回 null 保留配置 tag）；新建会话默认模型若存储 tag 是 DS 兜底但品牌可推断（如 kimi）→ 用推断值，不再发 `model=DS`。`tagToClass` 补 kimi、未知兜底 `other` 中性色（不再误标 DS 蓝）；`--model-kimi/--model-other` 主题色。
+
+### Added / Changed
+
+- **会话文件面板真打通（对齐 CC）**：无会话 = 干净零态（不再渲染演示假会话/文件，保留原首页 welcome hero）；左右栏折叠（收起保留窄 rail、顶部右栏开关，启动一律展开）；右栏「文件」tab 显示 agent **本会话真实改动的文件** + 点击看**真实 diff** + 可**回滚到改动前**（后端新增 `SessionFilesRecorder` 写盘捕获 + `files.changed` STOMP 推送 + REST `GET /files · GET /files/diff · POST /files/revert`；`session_files` 表孤儿 controller 清理路由冲突）。
+- **@ 引用文件（对齐 CC @file）**：输入框 `@` 补全绑定项目文件；项目文件树**右键「引用到对话」**与 @ 同效；发送后用户气泡内 `@pack.sh` 渲染为**内联阴影 chip**（可点开文件预览、悬停动效）；后端在 `ChatService` 把被引用文件读入**本轮模型上下文**（绑定项目根内路径约束，越界/缺失/超限 skip+warn fail loud，零 schema 改动）。
+- **轨迹视图看内容**：点击任意轨迹记录行弹出完整内容浮层（用户/助手全文、工具完整 arguments）。
+- **输入框引用 chip**：`@` token 以阴影框展示，hover 加深、点击从草稿移除。
+- **dev 启动修复**：`tauri dev` 不再因缺少随包后端而 panic（dev 交由 IDE 起 3458；release 仍 fail loud）。
+- 视觉对齐 deepseek-harness 侧栏折叠语义；monaco 静态入主包 + diff 编辑器单实例复用（首开零拉取）。
+
+## [Unreleased]
+
+### Added
+
+- **技能市场弹窗**（骨架，腾讯 workbuddy 数据）：Composer 顶部胶囊改为「技能市场」入口，点开全屏弹窗；三 Tab——专家（本地/远程混排带来源徽标）、技能（3 列卡 + 分类 + 精选/推荐）、连接器（3 列平铺）；搜索 / 已安装 N / 市场源下拉（默认腾讯）。远端专家「使用」→ 后端构造 `wb-` agent 注册进会话 → 设为会话主线程 agent 驱动整轮对话（与本地专家同链路）。配套后端 `GET/POST /api/market/*`（见后端 changelog）
+- **会话级主线程 agent（专家）选择器**（V58 `main_thread_agent`）：Composer 顶部新增 agent 胶囊，点开下拉可选「专家」（agentType + whenToUse 简介），选中即 PATCH 会话 `mainThreadAgent`，整轮对话由该 agent 的 systemPrompt 驱动（对齐 CC `--agent` / `mainThreadAgentDefinition`）；对话进行中锁定不可切，可选「默认（清除）」恢复；配套后端 `GET /api/agents/list` 结构化端点（active winners，跳过 deny 过滤对齐 CC 用户侧选择器）
+
+- **对话正文渲染迁移为增量 mdast（deepseek-harness 对齐）**：新增 `src/markdown/` —— micromark/mdast 结构化 AST + React 元素直渲，替换对话正文的 marked+DOMPurify+整段 innerHTML 重写。`IncrementalMarkdownParser` 流式只重解析「尾部不稳定块」（冻结前部块缓存 React 元素），根治「打字到代码块/长内容主线程卡顿数秒、要等 turn 结束才追平」。代码 fence 由真实语法树渐进成形（未闭合也产 code 节点、lang 从 fence 打开就有）→ ` ```html ` 代码块「运行」按钮流式中即出现；代码块 banner 化（语言徽标 + 复制/运行，复制/运行从 absolute-over-pre 改为 banner 内）。附带能力：shiki 语法高亮（JS 正则引擎 + 懒加载语言分包 + 浅/深 `--shiki-*` token，settled 才高亮）、KaTeX 数学（settled 才渲染；streaming 用无 math 语法防闪错）、CJK 强调（`**注意：**内容` 可闭合）、保留单换行→`<br>` 软换行。安全自持（替代 DOMPurify）：raw HTML 一律字面量文本、URL 协议白名单（http/https/mailto）、图片要求绝对 http(s)。历史消息精排、DB 重拉路径不变；`##核心`/粘连表/未闭合代码的文本修正移入 `patches.ts` 且只在 settled 全量渲染跑（流式预览与结束态允许一次「终跳」收口纠正，测试显式 pin）。（zcw）
+
+- **HTML 代码块「另起页面打开」独立窗口/标签页**：右栏 HTML 运行预览标题栏新增「⧉ 独立打开」——浏览器 dev/web 用同名标签页（window.open 复用）、Tauri 用 `WebviewWindow('html-standalone')`（已存在则聚焦）。独立查看器 = 整屏 sandbox iframe（`#/standalone-html` 路由，main.tsx 顶层分流，跳过 LaunchGate/STOMP，不打扰主会话）；对话里再次点击该代码块「运行」会经 localStorage 通道自动刷新独立页（窗口开着就跟着跑，用户可继续聊天）。新增 `front/src/utils/htmlStandalone.ts`、`front/src/components/standalone/StandaloneHtmlView.tsx`；Tauri 补 `core:window:allow-create`/`core:webview:allow-create-webview-window` 权限 + `standalone` capability（windows: html-standalone）。（zcw）
+
+### Fixed
+
+- **打开含超大单条消息的会话卡死**：窗口化只限「消息条数(150)」不限「单条 DOM 体积」——`sess-6e5e8ba8` 里有一条 ~350KB 的 user 消息，单条整段 mdast 解析建树即可把主线程钉死到渲染完。新增 `ContentGuard`：单条正文 >20KB 时初始只渲染前 5KB 纯文本预览 + 「查看完整内容」按钮，展开才整段 mdast（防初始加载被病理大消息阻塞）。（zcw）
+- **历史会话反复点击切换卡死**：① `switchSession` 点击「当前已激活会话」改 no-op（不再每次 dispatch+toast+触发切会话清空重拉/整列表重渲染排队压主线程）；② `MarkdownText` settled 渲染加 LRU 缓存（内容不变的消息跨会话重开不重新 mdast 解析 + KaTeX/shiki），快速在历史会话间切换不再整列表全量重排。（zcw）
+- **打字机流式代码块卡顿 + 代码块/运行按钮延迟显示（S1/S2）**：S1 根因=流式每 ~200ms 对整条增长全文 `renderMd` + `dangerouslySetInnerHTML` 整段重写、无 DOM 增量（代码块放大 DOM ~1.6×，未闭合 html 被当裸标签透传），叠加 40ms 滚底布局 → 单 tick 超帧预算后 setTimeout 节流被饿死、WS 帧积压到 turn 结束才追平。S2 根因=`fixUnclosedCodeBlocks` 全局奇数 ``` 剥光 fence → 流式中代码块整个不可见（按钮只注入存在 `code.language-html` 的 pre），直到 close fence（常在消息末尾）才成形。均随增量 mdast 渲染根治（见 Added）。
+- **对话工具卡空输出成功命令假「执行中」**：空输出成功 Bash（`cmd //c start` 开浏览器等零 stdout）后端实时推回空 result，ToolCard 旧判定 `result.trim()!==''` 判「已完成」→ 永久「执行中」转圈（实际已 0.7s 完成、刷新后反而正常，实时/重拉两路不一致）。完成判定改 `result != null`（收到 `tool_result` 含空串即完成）→ 空输出成功显示「已完成」（配套后端空输出占位 `(tool completed with no output)`，见后端 changelog 2026-09-05）
+- **后台任务终态收不到 / 子代理「运行中」虚高**：`/topic/tasks` `type=task.notification` wire 键实为 `task_id`（后端 `@JsonProperty("task_id")`），`TaskNotificationWireEvent` 误声明 camelCase `taskId` 且消费端读 `evt.taskId` → 恒 undefined → 终态 `addActivity` 永不执行；types.ts 字段改 `task_id`（+ `userMessageId` StreamEvent 槽兜底），useChatSocket 读 `evt.task_id ?? evt.userMessageId`
+- **子代理运行状况陈旧「运行中」**：AsyncTasksPanel REST 兜底补录不再因身份已登记（`if (existing) continue`）跳过终态——STOMP 已登记但实际已完成/失败（终态事件在断连窗口丢失）的子代理，2s 轮询按 REST 权威状态补 `done`/`stopped`；`subagentStore.addActivity` 加终态幂等，防事件 + 补录双路径重复追加
 - **子代理运行状况面板**：`task_started` 按 `task_type` 过滤（仅 `local_agent` / `in_process_teammate` / `remote_agent` 登记），`local_bash` 等后台命令不再误显示在子代理面板；配套后端 `emitForegroundTerminal` 补发终态事件（已完成的 bash 不再滞留"进行中"）
 - **定时任务消息重复**：`finalizeBlocks` 按 `assistantMessageId` 幂等（cron idle resume + 流式块 + 重拉双通道同一条消息不再重复插入）
 - **消息 token 用量**：fallback 分支「本轮 $368」为 JSX 字面 `$` + token 数 → 改「本轮输出 368 tokens」明确单位，消除金额误读
 - **流式思考块收起**：「正在思考…」块加点击收起（此前恒展开 + `div` 无 `onClick`）
+- **nexusai-in-chrome 扩展健壮性（B-1，Phase 0 实测定标）**：`front/extension/background.js` 截图去 OS 抢焦点——新增免聚焦 `screenshotTab`（删 `windows.update({focused})+sleep(200)`；目标 tab 已 active 跳过 `tabs.update`；实测单次截图 ~1.2s→~50-200ms 且不再把 Chrome 拉前台）；minimized 显式返回 `ERR_MINIMIZED` 不再 60s 干等；SW 连接加固——alarm 无条件 connect、心跳 25s→20s 且每 tick 补 `chrome.storage` 写（Chrome<116 也重置 SW 空闲计时）、指数退避重连、`idle/onStartup/onInstalled` 唤醒重连、会话 tab 持久化 awaited + 恢复时 `tabs.get` 校验 + `autoDiscardable:false`（治 1001 断连后重开标签）；修 computer `zoom` 从未路由到 background 的死路（`isBackgroundTool` 补 zoom）。配套后端断连 close-code 埋点见后端 changelog 2026-09-06。（zcw）
+- **nexusai-in-chrome 截图改 CDP per-tab（跟进）**：`captureVisibleTab` 要求「窗口前台 + 该标签为活动标签」，B-1 去 raise 后在 NexusAI 里截图即失焦 → 报 `Cannot access contents of url ""` / 超时。改为优先 CDP `Page.captureScreenshot(fromSurface)` 按 tabId 截（与窗口前台/活动标签无关，renderer 级），DevTools 占用调试器时回退 `captureVisibleTab` 并给可读提示；manifest 加 `debugger` 权限。治「在 NexusAI 里让 AI 截图报 host 错/卡死」。（zcw）
+- **nexusai-in-chrome 动作正确性（B-2）**：`content.js` 引入单源可交互索引——`read_page/find/computer` 共用同一份编号（`ref`=数组下标，元素存模块级数组+WeakMap 反向校验），杜绝「find/computer 各自 querySelectorAll 推导编号」导致的误点错位；`find` 支持 text/description/selector 并在同一快照匹配；`computer` 定位优先级 ref（校验 `isConnected`，失效明确报「请重新 read_page/find」）> selector > 坐标 elementFromPoint。点击改为真实序列：`scrollIntoView` + `elementFromPoint` 命中最深层真实元素 + 最近可聚焦祖先 `focus` + 派发 pointer/mouse 事件后**补原生 `el.click()` 默认激活**（链接导航/表单提交/checkbox 切换真正生效，治「点了没反应」）；右键不补 click 防误触发。`background.js` `navigate` 加就绪门（`waitForTabComplete` 轮询 tab complete / readyState 上限 15s，返回 `state:'complete'|'timeout'`，不再点了立刻打旧文档）。版本 0.1.6。（zcw）
+
+## [0.1.0] - 2026-09-04
+
+### Chore
+
+- **仓库单仓化 + Tauri 桌面打包 + 版本统一 0.1.0**：front/backend 并入 nexusai 单仓（本仓结构）；Tauri 桌面打包——jlink 裁剪 JRE 随包分发、Rust 后端进程生命周期托管、单实例锁、NSIS 安装包；三处版本统一对齐 tauri.conf 0.1.0（package.json 1.4.0→0.1.0、后端 pom 0.5.0→0.1.0）（zcw）
 
 ## [1.4.0] - 2026-08-24
 
@@ -39,6 +128,10 @@ All notable changes to NexusAI will be documented in this file.
 - 工具状态误标「已完成」（无 OUT 时显示执行中）
 - 未闭合代码块降级为普通文本（AI/系统偶发 ```text 无闭合不再吃到文本末尾）
 - 打字机光标移除（AI 回复流式不再闪烁 ▍ · 输入框不受影响）
+
+#### 追加（2026-09-03 · 未递增）
+
+- **响应式字号分级（窗口逻辑宽度三档）**：globals.css 末尾新增 `:root` 字号变量（`--fs-base/--fs-body/--fs-input/--fs-list`，默认=现值零回归）+ 两个 `@media(min-width: 1440/1920)` 三档覆盖（+1px/档）；核心阅读区选择器改变量引用——body 根字号、消息正文 `.msg .content`/`.msg.assistant .body`、用户气泡 `.msg.user .user-bubble`、输入框 `.composer textarea`、会话列表 `.session-item`。高分屏（Mac16≈1469 / 1920 屏≈1632 / 4K@150%≈2176 逻辑宽）字号自动 +1~2px；已验证 `vite build` 通过（globals.css · zcw）
 
 #### 追加（2026-09-01 · 未递增）
 

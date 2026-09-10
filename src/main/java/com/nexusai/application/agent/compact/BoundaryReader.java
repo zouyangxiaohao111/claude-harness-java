@@ -23,14 +23,14 @@ import java.util.Set;
  *   <tr><th>本方法</th><th>CC original</th><th>行号</th></tr>
  *   <tr><td>isCompactBoundaryMessage</td><td>isCompactBoundaryMessage(message)</td><td>messages.ts:4608-4612</td></tr>
  *   <tr><td>findLastCompactBoundaryIndex</td><td>findLastCompactBoundaryIndex(messages)</td><td>messages.ts:4618-4628</td></tr>
- *   <tr><td>getMessagesAfterCompactBoundary(messages, includeSnipped)</td><td>getMessagesAfterCompactBoundary(messages, options?)</td><td>messages.ts:4643-4656</td></tr>
+ *   <tr><td>getMessagesAfterCompactBoundary(messages, includeSnipped)</td><td>getMessagesAfterCompactBoundary(messages, options?)</td><td>messages.ts:5083-5096</td></tr>
  *   <tr><td>isSnipBoundaryMessage</td><td>isSnipBoundaryMessage(message)</td><td>snipProjection.ts:15-18</td></tr>
  *   <tr><td>projectSnippedView</td><td>projectSnippedView(messages)</td><td>snipProjection.ts:35-60</td></tr>
  * </table>
  *
  * <p><b>snip 投影（2026-08-18 真源对齐）</b>: CC getMessagesAfterCompactBoundary 在 HISTORY_SNIP
  * 开启且 {@code !options?.includeSnipped} 时会对切片应用 {@code projectSnippedView}
- * （messages.ts:4648-4653），剔除被 snip 删除的消息（removedUuids），使模型面数组不含陈旧历史。
+ * （messages.ts:5088-5093），剔除被 snip 删除的消息（removedUuids），使模型面数组不含陈旧历史。
  * 本组件按已入库真源 {@code Open-ClaudeCode/src/services/compact/snipProjection.ts} 完整实现
  * isSnipBoundaryMessage + projectSnippedView（此前 TODO[OD-01] 悬空，vendored snapshot 缺
  * snipProjection.js —— 2026-08-18 真源已取回，投影从「引用方语义」升级为「真源实现」）。
@@ -42,9 +42,20 @@ import java.util.Set;
  * <p><b>[D4 双门源合并] 门公式单一来源</b>: {@link #isHistorySnipEnabled(CompactSettingsResolver,
  * FeatureFlags)} 为唯一纯函数实现；{@code LlmAgentLoop} snip 步骤（门①）与本组件静态槽读侧（门②）
  * 均委托它 → DB {@code settings.history_snip_enabled} 为 NULL 时两门同回落到 FeatureFlags，
- * 不再分叉（分叉 = 入口剥离面不剔除被 snip 删除的消息 → 泄漏进 {@code :4738} 的
- * {@code state.replaceMessages} 前缀与 4 处静态调用面的模型输入；<b>不含</b>主循环请求面 ——
- * 请求面由门① 的 snip 步骤 {@code messagesForQuery} 独立剔除，见 LlmAgentLoop:5010-5018）。
+ * 不再分叉（分叉 = 入口剥离面不剔除被 snip 删除的消息 → 被裁剪消息留在内存 state，进而泄漏给
+ * **所有**直接吃 {@code state.messages()} 的模型相邻消费点 —— 含主循环请求面
+ * {@code messagesForQuery} 与 stop hook / extract-memories / reactive compact 等，见
+ * {@code LlmAgentLoop} 循环入口 boundary 剥离块的注释）。
+ *
+ * <p><b>[snip-state-fix 2026-09-10 语义澄清]</b> {@code includeSnipped} 的两种取值在本仓的用途：
+ * <ul>
+ *   <li>{@code false}（单参重载缺省，CC 的 model-facing 用法）：用于**模型面**——本仓
+ *       {@code LlmAgentLoop} 循环入口用它生成 {@code state.messages()} 的内容（state 在本仓循环里
+ *       扮演 CC {@code messagesForQuery} 的角色）。</li>
+ *   <li>{@code true}：CC 在 REPL/UI 面用（{@code REPL.tsx:3167-3169}，保留滚动回看）。本仓**当前
+ *       无可用的调用方**——因为「REPL 全量历史」在本仓由 **DB** 承担（前端/轨迹读 DB，DB
+ *       append-only 不删行），循环内 state 不需要第二份全量。</li>
+ * </ul>
  */
 public final class BoundaryReader {
 
@@ -189,9 +200,9 @@ public final class BoundaryReader {
 
     /**
      * 从最后一个 compact boundary（含）向后切片 · 对齐 CC {@code getMessagesAfterCompactBoundary}
-     * （messages.ts:4643-4656）：无边界返回全量；有边界返回从最后一个边界（含）到末尾的新列表。
+     * （messages.ts:5083-5096）：无边界返回全量；有边界返回从最后一个边界（含）到末尾的新列表。
      * 默认 {@code includeSnipped=false}（CC 缺省）：HISTORY_SNIP 开启时对切片应用
-     * {@link #projectSnippedView}（messages.ts:4648-4653）；flag 关时行为与旧单参版完全一致。
+     * {@link #projectSnippedView}（messages.ts:5088-5093）；flag 关时行为与旧单参版完全一致。
      *
      * <p><b>WHY 返回新列表</b>: CC {@code messages.slice(boundaryIndex)} 生成新数组；下游
      * （budget/snip/autocompact）可能改写切片，返回新列表避免 subList 视图把改动回灌原消息链
@@ -206,12 +217,16 @@ public final class BoundaryReader {
 
     /**
      * 从最后一个 compact boundary（含）向后切片 + 可选 snip 投影 · 对齐 CC
-     * {@code getMessagesAfterCompactBoundary(messages, options?)}（messages.ts:4643-4656）：
+     * {@code getMessagesAfterCompactBoundary(messages, options?)}（messages.ts:5083-5096）：
      * 切片语义与单参版相同；随后按 CC 门控 {@code !options?.includeSnipped && feature('HISTORY_SNIP')}
-     * （messages.ts:4648）对切片应用 {@link #projectSnippedView}，剔除被 snip 删除的陈旧消息。
+     * （messages.ts:5088）对切片应用 {@link #projectSnippedView}，剔除被 snip 删除的陈旧消息。
      *
-     * <p><b>includeSnipped 语义</b>: true = 保留被 snip 删除的消息（CC REPL.tsx 全屏 compact
-     * 处理器传 {@code { includeSnipped: true }} 保留滚动回看）；false = 默认，flag 开时应用投影。
+     * <p><b>includeSnipped 语义</b>: true = 保留被 snip 删除的消息（CC 在 REPL/UI 面这么用：
+     * {@code REPL.tsx:3167-3169} 全屏 compact 处理器，保留滚动回看）；false = 默认（CC 的
+     * model-facing 用法），flag 开时应用投影。
+     * ⚠️ 本仓**当前只有 false 的调用方**（{@code LlmAgentLoop} 循环入口，见 BoundaryReader 类注释
+     * 的 [snip-state-fix] 段）——「REPL 全量历史」由 DB 承担，循环内 state 不需第二份全量；
+     * 若将来要新增 true 的调用方，必须同时审计所有吃 {@code state.messages()} 的模型相邻消费点。
      * {@link #setFeatureFlags} 注入 historySnip 门（默认全关 → 投影恒跳过）。
      *
      * @param messages      消息列表

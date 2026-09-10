@@ -7,6 +7,8 @@ use tauri::{Emitter, Manager};
 
 /// 后端进程生命周期管理（T12）：探活 / 启动 / 等待就绪 / 整树回收本地后端 java 进程。
 mod backend;
+/// 自动更新（多源 latest.json 检查 / 下载 sha256 / NSIS 安装）。
+mod updater;
 
 /// 本会话由 Tauri 壳自启的后端 java 进程 pid。
 /// None = 启动时 3458 已有外部后端在跑（复用）或尚未自启 —— 此时关窗不回收外部进程。
@@ -224,7 +226,11 @@ fn main() {
             chrome_extension_dir,
             chrome_extension_zip_path,
             is_chrome_installed,
-            install_chrome_extension
+            install_chrome_extension,
+            updater::app_version,
+            updater::update_check,
+            updater::update_download,
+            updater::update_install
         ])
         .setup(|app| {
             // ===== 启动期小窗（承载 loader）+ 就绪放大交给前端 =====
@@ -252,43 +258,65 @@ fn main() {
             // 供后台线程 emit 事件；clone 出独立 AppHandle，避免线程内借用 app
             let handle = app.handle().clone();
 
+            // [T12-pid] 仅 release：启动前清理上次自启残留（身份校验 —— 只杀命令行含
+            //   nexusai-backend.jar 的后端，pid 复用/其它 java 一律不碰）；dev 由外部/IDE 后端
+            //   自行管理，不做跨进程清理。
+            if !cfg!(debug_assertions) {
+                backend::cleanup_stale_backend_pid();
+            }
+
             // 2) 3458 无后端才自启；已有（外部进程 / 上一会话残留）则直接复用，不重复拉起
             if !backend::backend_ready() {
-                // 3) spawn 随包裁剪 JRE：javaw -jar backend/nexusai-backend.jar --spring.profiles.active=prod
-                let pid = backend::spawn_backend(&handle).map_err(|e| {
-                    let msg = format!(
-                        "本地后端启动失败：{}（请查看 {}/logs/backend.log）",
-                        e,
-                        backend::data_dir().display()
-                    );
-                    backend::log_launcher(&msg);
-                    msg
-                })?;
-                // 记录 pid 到 state，供关窗 / 退出时整树回收
-                *app.state::<BackendState>().0.lock().unwrap() = Some(pid);
-                eprintln!("[backend] 已启动本地后端，pid={}，后台等待健康就绪…", pid);
+                match backend::spawn_backend(&handle) {
+                    Ok(pid) => {
+                        // 记录 pid 到 state（关窗/退出整树回收）；pid 落盘已在 spawn_backend 内完成
+                        *app.state::<BackendState>().0.lock().unwrap() = Some(pid);
+                        eprintln!("[backend] 已启动本地后端，pid={}，后台等待健康就绪…", pid);
 
-                // 4) 关键：setup 不阻塞主线程 —— 起后台线程轮询 /actuator/health 最多 60s，
-                //    窗口首帧立即渲染 loader（Spring Boot prod 冷启动实测 >8s：首次 Flyway 全量迁移 /
-                //    c3p0 / Quartz bean 初始化）。就绪 / 超时都经事件通知前端（事件名定死，L2 前端 listen）：
-                //    - backend-ready：后端已就绪，前端据此放大窗口到 85%
-                //    - backend-error：启动超时，前端据此提示；超时先 kill_process_tree(pid) 防孤儿
-                std::thread::spawn(move || {
-                    if backend::wait_backend_ready(backend::WAIT_BACKEND_READY_TIMEOUT) {
-                        eprintln!("[backend] 本地后端已就绪：http://localhost:3458/actuator/health");
-                        let _ = handle.emit("backend-ready", ());
-                    } else {
-                        backend::kill_process_tree(pid);
-                        let msg = format!(
-                            "本地后端启动超时（{} 秒内未就绪，已回收进程树 pid={}），请查看 {}/logs/backend.log（中文）。",
-                            backend::WAIT_BACKEND_READY_TIMEOUT.as_secs(),
-                            pid,
-                            backend::data_dir().display()
-                        );
-                        backend::log_launcher(&msg);
-                        let _ = handle.emit("backend-error", msg);
+                        // 3) 关键：setup 不阻塞主线程 —— 起后台线程轮询 /actuator/health 最多 60s，
+                        //    窗口首帧立即渲染 loader（Spring Boot prod 冷启动实测 >8s：首次 Flyway 全量迁移 /
+                        //    c3p0 / Quartz bean 初始化）。就绪 / 超时都经事件通知前端（事件名定死，L2 前端 listen）：
+                        //    - backend-ready：后端已就绪，前端据此放大窗口到 85%
+                        //    - backend-error：启动超时，前端据此提示；超时先 kill_process_tree(pid) 防孤儿
+                        std::thread::spawn(move || {
+                            if backend::wait_backend_ready(backend::WAIT_BACKEND_READY_TIMEOUT) {
+                                eprintln!("[backend] 本地后端已就绪：http://localhost:3458/actuator/health");
+                                let _ = handle.emit("backend-ready", ());
+                            } else {
+                                backend::kill_process_tree(pid);
+                                let msg = format!(
+                                    "本地后端启动超时（{} 秒内未就绪，已回收进程树 pid={}），请查看 {}/logs/backend.log（中文）。",
+                                    backend::WAIT_BACKEND_READY_TIMEOUT.as_secs(),
+                                    pid,
+                                    backend::data_dir().display()
+                                );
+                                backend::log_launcher(&msg);
+                                let _ = handle.emit("backend-error", msg);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        if cfg!(debug_assertions) {
+                            // dev 模式（tauri dev）：不一定随包分发 backend —— 不因缺少捆绑后端而 panic，
+                            // 跳过自启、交给前端探活（外部后端通常由 IDE 单独启动 3458）。日志中文便于排障。
+                            let msg = format!(
+                                "dev 模式未找到随包后端，跳过自启（请用 IDE 启动后端 3458）。原因：{}",
+                                e
+                            );
+                            backend::log_launcher(&msg);
+                            eprintln!("[backend-launcher] {}", msg);
+                        } else {
+                            // release：捆绑后端缺失属部署错误 → 显式失败（fail loud）
+                            let msg = format!(
+                                "本地后端启动失败：{}（请查看 {}/logs/backend.log）",
+                                e,
+                                backend::data_dir().display()
+                            );
+                            backend::log_launcher(&msg);
+                            return Err(msg.into());
+                        }
+                    }
+                }
             } else {
                 eprintln!("[backend] 检测到 3458 已有后端在运行，跳过自启");
                 // dev 等外部后端已就绪：立即通知前端。

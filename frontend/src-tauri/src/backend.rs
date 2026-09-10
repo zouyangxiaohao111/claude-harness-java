@@ -84,6 +84,82 @@ fn log_file() -> PathBuf {
     data_dir().join("logs").join("backend.log")
 }
 
+/// 本会话自启后端 pid 的持久化文件（`{data_dir}/backend.pid`）。
+/// 用途：正常关窗/退出时按内存 pid 整树回收；Tauri 被强杀/崩溃丢失该 pid 时，
+/// 下次启动经 [`cleanup_stale_backend_pid`] 做“身份校验后”的跨启动兜底清理。
+pub const BACKEND_PID_FILE: &str = "backend.pid";
+
+fn backend_pid_path() -> PathBuf {
+    data_dir().join(BACKEND_PID_FILE)
+}
+
+/// spawn 成功后把 pid 落盘（best-effort；数据目录已在启动时确保存在）。
+pub fn write_backend_pid(pid: u32) -> std::io::Result<()> {
+    std::fs::write(backend_pid_path(), pid.to_string())
+}
+
+/// 删除 pid 记录（幂等：文件不存在则忽略）。
+fn clear_backend_pid() {
+    let _ = std::fs::remove_file(backend_pid_path());
+}
+
+/// 该 pid 是否“本应用自启的后端”（命令行含 `nexusai-backend.jar`）？
+/// 只有身份命中才允许跨启动 kill —— 防 pid 复用 / 误杀其它 java（IDE、其它 GUI 应用）。
+/// Windows 经 PowerShell 读 CommandLine；查询失败 → false（保守不杀）。
+fn is_our_backend_process(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine");
+        match Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+        {
+            Ok(o) => {
+                let s = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                let ours = s.contains("nexusai-backend.jar");
+                if !ours {
+                    eprintln!("[backend] pid={} 命令行非本应用后端（或进程已退出）→ 不跨启动清理", pid);
+                }
+                ours
+            }
+            Err(e) => {
+                eprintln!("[backend] 查询 pid={} 命令行失败（{}）→ 保守不清理", pid, e);
+                false
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        false // 非 Windows 本轮不做跨启动清理
+    }
+}
+
+/// 启动前兜底清理上次残留：pid 文件记录了上次自启的后端，且进程确为
+/// `nexusai-backend.jar` → 整树清理（内部顺带删 pid 文件）；否则只删过时记录、
+/// 绝不动进程。文件缺失/内容非法 → no-op 或仅删记录。
+pub fn cleanup_stale_backend_pid() {
+    let path = backend_pid_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return, // 无记录 → 无事可做
+    };
+    let pid: u32 = match raw.trim().parse() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+    };
+    if is_our_backend_process(pid) {
+        eprintln!("[backend] 检测到上次自启后端残留 pid={}（命令行含 nexusai-backend.jar）→ 整树清理", pid);
+        kill_process_tree(pid);
+    } else {
+        eprintln!("[backend] pid 文件记录={} 非本应用后端或已退出 → 仅删记录，不杀进程", pid);
+        clear_backend_pid();
+    }
+}
+
 /// Rust 侧（Tauri 壳）自己的启动失败日志：追加写入 `{data_dir}/logs/tauri-launcher.log`。
 ///
 /// 与后端 java 进程的 backend.log 区分——这里记「壳拉起后端」这一侧的**关键失败**，
@@ -228,6 +304,10 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
     // 6) 关键：mem::forget 让子进程脱离 Child 句柄托管（父进程退出时不会被 drop 收割/牵连），
     //    之后统一用 kill_process_tree(pid) 显式整树回收
     std::mem::forget(child);
+    // 7) pid 落盘：Tauri 被强杀/崩溃时仍留下记录，下次启动可身份校验后兜底清理（防孤儿）
+    if let Err(e) = write_backend_pid(pid) {
+        eprintln!("[backend] 写入 pid 文件失败（不影响本次运行）：{}", e);
+    }
     Ok(pid)
 }
 
@@ -269,4 +349,6 @@ pub fn kill_process_tree(pid: u32) {
         let _ = pid;
         eprintln!("[backend] 非 Windows 平台整树杀后端进程未实现（pid={}），请手动终止 java 进程。", pid);
     }
+    // 本次 kill 的目标即本会话自启后端（pid 文件只写过自启 pid）→ 顺带清 pid 记录
+    clear_backend_pid();
 }
