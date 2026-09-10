@@ -162,8 +162,9 @@ public class MessageService {
             log.info("[MessageService] listPageBySession: session={} 返回 {} 条（hasMore={}, before={}）",
                 sessionId, result.size(), hasMore, beforeMessageId);
         }
-        // total = 会话消息总数（sessions.messageCount · 非 meta 口径）——前端轨迹徽标全量，避免拿「已加载页」当全量
-        int total = session.getMessageCount() != null ? session.getMessageCount() : 0;
+        // total = 会话消息总数（messages 表实际非 meta 行数，权威口径）——前端轨迹徽标全量。
+        //   不用 sessions.messageCount：该列只在部分写路径自增（实测 sess-1d389722 = 4，真实 64），会少算 assistant/tool。
+        int total = countNonMetaMessages(sessionId);
         return new PageResult(result, hasMore, total);
     }
 
@@ -184,7 +185,21 @@ public class MessageService {
         if (session == null) {
             throw new NotFoundException("Session " + sessionId + " not found");
         }
-        return session.getMessageCount() != null ? session.getMessageCount() : 0;
+        return countNonMetaMessages(sessionId);
+    }
+
+    /**
+     * 会话非 meta 消息行数（权威）· {@code messages} 表 COUNT。
+     *
+     * <p><b>WHY 不读 sessions.messageCount</b>：该列只在部分落库路径自增（实测 user 4 条但表内
+     * 64 条非 meta），会少算 assistant/tool → 轨迹徽标/分页 total 偏小。COUNT 走 session_id 索引，
+     * 轮询（5s）与分页开销可接受。{@code is_meta NULL} 显式包含（V51 存量旧行），与 TraceView
+     * {@code !isMeta} 过滤同口径。
+     */
+    private int countNonMetaMessages(String sessionId) {
+        long n = messageMapper.selectCountByQuery(
+            QueryWrapper.create().where("session_id = ? AND (is_meta IS NULL OR is_meta != 1)", sessionId));
+        return (int) n;
     }
 
     /**
