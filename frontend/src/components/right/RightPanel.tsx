@@ -455,8 +455,16 @@ export function RightPanel({
     try {
       const res = await tasksApi.killTask(id.taskId)
       if (!res?.success) { showToast('停止失败', 'info'); return }
+      // [stop-终态乐观] 立刻置 stopped：即使 killed 终态事件丢失，卡片也不再停"运行中"（事件到达时幂等覆盖）
+      useSubagentStore.getState().addActivity(id.taskId, { type: 'stopped', text: '已停止', ts: Date.now() })
       showToast(`已停止 @${id.name}`, 'success')
     } catch (e) {
+      // [stop-404 幂等] 任务已不存在（已结束/已移除）→ 本地清身份，避免卡片永久"运行中"
+      if (e instanceof ApiError && e.status === 404) {
+        useSubagentStore.getState().forget(id.taskId)
+        showToast('该任务已结束（已清理状态）', 'info')
+        return
+      }
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }

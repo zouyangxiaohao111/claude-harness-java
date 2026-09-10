@@ -92,9 +92,16 @@ export function AsyncTasksPanel({ activeSessionId, showToast }: {
   const handleKillTask = async (taskId: string) => {
     try {
       const res = await tasksApi.killTask(taskId)
-      if (!res?.success) { showToast('停止失败', 'info'); return }
+      if (!res?.success) { showToast('停止失败', 'info'); void load(); return }
       showToast('任务已停止', 'success')
+      void load()
     } catch (e) {
+      // [stop-404 幂等] 任务已不存在（已结束/已移除）→ 刷新清单清掉幽灵"运行中"
+      if (e instanceof ApiError && e.status === 404) {
+        showToast('该任务已结束（已刷新）', 'info')
+        void load()
+        return
+      }
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }

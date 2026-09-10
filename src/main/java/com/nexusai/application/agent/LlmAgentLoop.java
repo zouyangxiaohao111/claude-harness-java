@@ -6900,10 +6900,8 @@ public class LlmAgentLoop implements AgentLoop {
                 //   直传解析拿不到模型 → model=null → provider 回落 mock（假回复、永不 Edit）。用本轮
                 //   state.currentModel() 覆盖 effectiveModelName（= CC toolUseContext.options.mainLoopModel，
                 //   query.ts:1001-1008 REPLHookContext 同义），fork/后台按会话模型真实路由。
-                com.nexusai.application.agent.tool.ToolUseContext hookTuc = params.toolUseContext();
-                if (hookTuc != null && state.currentModel() != null && !state.currentModel().isBlank()) {
-                    hookTuc = hookTuc.withEffectiveModelName(state.currentModel());
-                }
+                com.nexusai.application.agent.tool.ToolUseContext hookTuc =
+                        hookToolUseContext(params.toolUseContext(), state.currentModel());
                 com.nexusai.application.agent.hook.PostSamplingContext psContext =
                         new com.nexusai.application.agent.hook.PostSamplingContext(
                             postSamplingMessages(psBase, msg, turnAssistantId),
@@ -12999,6 +12997,28 @@ public class LlmAgentLoop implements AgentLoop {
             out.add(toMessage(Role.assistant, content, msg.reasoning(), turnAssistantId));
         }
         return out;
+    }
+
+    /**
+     * [SM/fork 模型直传] PostSamplingHook 的 toolUseContext：把「本轮真正模型」写入
+     * {@code effectiveModelName}（= CC {@code toolUseContext.options.mainLoopModel}，
+     * query.ts:1001-1008 REPLHookContext 同义）。
+     *
+     * <p><b>WHY（回归事故）</b>：hook 原传 run 级 {@code params.toolUseContext()}，其
+     * {@code effectiveModelName} 恒空 → SM/后台 fork 的「会话模型直传」解析取不到模型 →
+     * {@code model=null} → provider 回落 {@code MockLlmProvider}（假回复、永不 Edit）。
+     * 本 helper 供 hook 调用并以单测锁定（防再退化）。
+     *
+     * @param base         父上下文（run 级 TUC；null → 原样返回）
+     * @param currentModel 本轮模型（state.currentModel()）；null/blank → 原样返回（不造字段）
+     * @return 带 effectiveModelName 的上下文（或原 base）
+     */
+    static com.nexusai.application.agent.tool.ToolUseContext hookToolUseContext(
+            com.nexusai.application.agent.tool.ToolUseContext base, String currentModel) {
+        if (base == null || currentModel == null || currentModel.isBlank()) {
+            return base;
+        }
+        return base.withEffectiveModelName(currentModel);
     }
 
     private static String jsonNodeToString(JsonNode node) {
