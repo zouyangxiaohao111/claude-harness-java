@@ -91,6 +91,81 @@ class LlmAgentLoopRunRequestContractTest {
     }
 
     /**
+     * [对齐 CC 2026-09-09] reasoning-only（content 空、无工具）不得被空响应守卫判死 —— 回归 LlmAgentLoop:7252。
+     *
+     * <p><b>WHY（规则 9 · 测试验证意图）</b>：CC query.ts 无 {@code NO_ASSISTANT_TEXT} 终止（Java 独有
+     * 防御，AgentState 自注）。deepseek reasoning 模型长思考后极常见「content 空 + reasoning 非空 +
+     * 无工具」（本会话 sess-fcdcdc68/msg-d9aaa8dc turn36 reasoning=221872 字符实锤）——尤其在工具批
+     * （如 TodoWrite）后 do-while 强制续轮回喂结果的那一轮。旧守卫只看 text/chunkCount，把这种合法收尾
+     * 当空响应 break 掉整个 run，22 万字符思考在 appendMessage 前整体丢弃、最后正文永不产出。修复后：
+     * reasoning 非空即走正常纯文本分支，thinking 落历史、finishReason=stop、NORMAL 收尾。
+     * <p>若修复回退（守卫重新无视 reasoning）→ 本测试 run 以 NO_ASSISTANT_TEXT 死 → RED。
+     */
+    @Test
+    @DisplayName("reasoning-only(content 空无工具) 不再 NO_ASSISTANT_TEXT：run NORMAL 且 reasoning 落历史")
+    void run_reasoningOnlyEmptyContent_isNormalAndKeepsReasoning() {
+        // ── 1. provider：不产任何 content chunk；仅交付带 reasoning 的 assistant（deepseek 思考后 content 空）──
+        LlmProvider provider = mock(LlmProvider.class);
+        doAnswer(inv -> {
+            Consumer<AssistantMessage> onMsg = inv.getArgument(10);
+            Runnable onComplete = inv.getArgument(16);
+            if (onMsg != null) {
+                onMsg.accept(new AssistantMessage("", "stop", List.of(), "模型深度思考内容(不含正文)"));
+            }
+            onComplete.run();
+            return null;
+        }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        LlmProviderFactory factory = mock(LlmProviderFactory.class);
+        when(factory.getProvider(any(), any())).thenReturn(provider);
+
+        LlmAgentLoop loop = new LlmAgentLoop(factory);
+        AgentState state = loop.run(RunRequest.forTest("hello", "test-model", null));
+
+        // ── 2. 断言 ──
+        assertThat(state.exitReason())
+            .as("reasoning-only 是合法收尾：不得以 NO_ASSISTANT_TEXT 判死 run（对齐 CC 无该终止）")
+            .isEqualTo(AgentState.ExitReason.NORMAL);
+        assertThat(state.messages())
+            .as("reasoning 必须随 assistant 消息落历史（修复后走正常 appendMessage，不再被 break 丢弃）")
+            .anyMatch(m -> m.role() == Role.assistant && "模型深度思考内容(不含正文)".equals(m.reasoning()));
+    }
+
+    /**
+     * [对齐 CC 2026-09-09] 空响应守卫的"另一半"必须保留：真·全空（无 content 无 reasoning 无工具）仍判死。
+     *
+     * <p><b>WHY（规则 9）</b>：NO_ASSISTANT_TEXT 只应保留给 provider 真·空响应（无正文、无思考、无工具），
+     * 它是 Java 对"流完成但无任何可消费输出"的防御。本次修正是给该守卫加 reasoning 豁免，<b>不是删除它</b>。
+     * 若后续把守卫整个拿掉 → 真·空响应会以空 assistant 消息 + NORMAL 收尾，掩盖 provider 异常 → RED 拦截。
+     */
+    @Test
+    @DisplayName("真·全空(无 content 无 reasoning 无工具) 仍 NO_ASSISTANT_TEXT（守卫保留验证）")
+    void run_trulyEmpty_noContentNoReasoning_stillNoAssistantText() {
+        // ── 1. provider：无 content chunk、msg 无 reasoning 无工具（真·空响应）──
+        LlmProvider provider = mock(LlmProvider.class);
+        doAnswer(inv -> {
+            Consumer<AssistantMessage> onMsg = inv.getArgument(10);
+            Runnable onComplete = inv.getArgument(16);
+            if (onMsg != null) {
+                onMsg.accept(new AssistantMessage("", "stop", List.of(), ""));
+            }
+            onComplete.run();
+            return null;
+        }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        LlmProviderFactory factory = mock(LlmProviderFactory.class);
+        when(factory.getProvider(any(), any())).thenReturn(provider);
+
+        LlmAgentLoop loop = new LlmAgentLoop(factory);
+        AgentState state = loop.run(RunRequest.forTest("hello", "test-model", null));
+
+        // ── 2. 断言 ──
+        assertThat(state.exitReason())
+            .as("真·全空响应仍应 NO_ASSISTANT_TEXT（豁免只给 reasoning，不放行 provider 空响应）")
+            .isEqualTo(AgentState.ExitReason.NO_ASSISTANT_TEXT);
+    }
+
+    /**
      * [RES-SP31 · OPD-SP-31] appendSystemPrompt 传递链：RunRequest → AgentState。
      *
      * <p><b>WHY</b>（CLAUDE.md 规则 9）: CC 中 {@code --append-system-prompt} 是用户追加指令的

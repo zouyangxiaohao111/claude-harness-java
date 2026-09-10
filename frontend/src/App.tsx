@@ -97,6 +97,8 @@ const EMPTY_PROJECT: Project = { id: '', name: '', branch: '', dirty: 0, agents:
 /** 后端 SessionDto → UI 旧 Session 形状（null 兜底，任务 9 起组件原生消费 DTO 后移除）。 */
 /** 稳定空数组（避免 selector `?? []` 每次返回新引用触发 useSyncExternalStore 无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
+/** [snip-persist] 空裁剪 id 列表常量（避免选择器每次新建 [] → 引用变化触发重渲染） */
+const EMPTY_SNIPPED_IDS: string[] = []
 
 function toSession(d: SessionDto): Session {
   return {
@@ -344,6 +346,8 @@ function App() {
 
   // ---- 消息渲染源：chatStore.messages + 当前流式 ----
   const storeMessages = useChatStore((s) => s.messages[activeSessionId] ?? EMPTY_MESSAGES)
+  // [snip-persist] 轨迹视图「已裁剪」标注源：当前会话被 Snip 裁剪的消息 id（STOMP message.boundary 实时 + F5 解析）
+  const activeSnippedIds = useChatStore((s) => (activeSessionId ? (s.snippedIds[activeSessionId] ?? EMPTY_SNIPPED_IDS) : EMPTY_SNIPPED_IDS))
   // [trace-count] 轨迹 tab 徽标全量：GET /messages/page total（DB sessions.messageCount 非 meta 口径）· 未拉到时回落窗口条数
   const activeMsgTotal = useChatStore((s) => (activeSessionId ? (s.msgTotals[activeSessionId] ?? null) : null))
   // [trace-count 轮询] 轨迹徽标实时：每 5s 拉后端该会话 count（DB sessions.messageCount · 非 meta 口径，轻量）。
@@ -1603,7 +1607,7 @@ function App() {
         </div>
         <div className="stream">
           {centerView === 'trace' ? (
-            <TraceView messages={traceMessages} />
+            <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
             <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} />
           )}

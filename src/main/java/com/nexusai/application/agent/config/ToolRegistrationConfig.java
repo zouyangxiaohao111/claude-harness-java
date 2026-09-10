@@ -184,6 +184,21 @@ public class ToolRegistrationConfig {
     private com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver;
 
     /**
+     * [fork 模型兜底 2026-09-10] DB settings 单例行 mapper —— {@code buildForkSuppliers} 的
+     * {@code rawModelSupplier} 在 {@code settings.json} 无 {@code model} 键时的兜底读源
+     * （{@code settings.main_model_name}）。
+     *
+     * <p><b>WHY</b>：生产实测 {@code ~/.nexusai/settings.json} 仅 {@code {"autoMemoryEnabled":true}}
+     * （无 model 键）→ fork 的 modelSupplier 恒 null + configSupplier 恒
+     * {@code ProviderConfig.empty()} → provider 回落 {@code MockLlmProvider}（假回复/永不 Edit，
+     * summary.md 冻结）。DB 才是本应用配置的权威源（settings.main_model_name 由前端写入），
+     * 文件缺失不应等同"无模型"。字段装配模式同 {@link #settingsResolver}；required=false
+     * 容错非 Spring 直构测试 / 无 mapper 场景（→ 保持旧行为：model=null 回落工厂默认）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
+
+    /**
      * [monitor-rework] MONITOR_MCP 流式监控执行器（@Component）· MonitorTool 生产接线注入。
      *
      * <p>WHY: MonitorTool 从 stub 升级为真实现，execute 需经 {@code registerTask + monitor}
@@ -962,6 +977,13 @@ public class ToolRegistrationConfig {
         // [V52 X1-3] BoundaryReader 读侧 snip 投影 DB 覆盖静态槽位接线（同 MicroCompactor 静态槽位
         //   同点；DB settings.history_snip_enabled 有值覆盖 FeatureFlags，null 回落）
         com.nexusai.application.agent.compact.BoundaryReader.setSettingsResolver(settingsResolver);
+        // [D4 双门源合并] BoundaryReader 读侧 feature 门静态槽接活（此前全仓无写入点 → 恒
+        //   ALL_DISABLED 死槽）：DB settings.history_snip_enabled 为 NULL 时，门②（getMessagesAfter
+        //   CompactBoundary snip 投影 :207）回落 FeatureFlags.historySnip 与门①（LlmAgentLoop snip
+        //   步骤）同源，不再分叉致被 snip 删除的消息从入口剥离面（:4738 state.replaceMessages 前缀
+        //   + 4 处静态调用面）泄漏。唯一写入点，Spring 启动
+        //   执行一次（早于任何请求）；null → setFeatureFlags 内部回落 ALL_DISABLED。
+        com.nexusai.application.agent.compact.BoundaryReader.setFeatureFlags(this.featureFlags);
         // [token-compact-fix ①] cached-MC 开关实时化：注入 DB 实时读源静态槽位（同 BoundaryReader
         //   接线点）。注入后 MicroCompactor.isCachedMicrocompactFeatureEnabled() 每次调用实时读
         //   settings.cached_microcompact_enabled（前端 PUT settings 后下一轮生效，不再需重启）；
@@ -1763,8 +1785,12 @@ public class ToolRegistrationConfig {
 
     /**
      * 构建 LLM 供应商组 · 对齐 streamCompactSummary 既有解析（model/config 同源）。
+     *
+     * <p><b>实例方法（非 static）</b>：{@code rawModelSupplier} 需读 DB 兜底源
+     * （{@link #settingsMapper} 字段 · settings.main_model_name），static 无法访问注入字段。
+     * 5 个调用点全部是同类 @Bean 实例方法，调用形态不变。
      */
-    private static ForkSuppliers buildForkSuppliers(
+    private ForkSuppliers buildForkSuppliers(
             com.nexusai.infra.llm.LlmProviderFactory llmProviderFactory,
             com.nexusai.repository.provider.mapper.ModelMapper modelMapper,
             com.nexusai.repository.provider.mapper.ProviderMapper providerMapper,
@@ -1786,7 +1812,26 @@ public class ToolRegistrationConfig {
                     }
                 }
             }
-            return resolved;
+            if (resolved != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[fork 模型解析] settings.json model={}（文件源命中）", resolved);
+                }
+                return resolved;
+            }
+            // [fork 模型兜底 2026-09-10] settings.json 无 model 键 → 回落 DB
+            //   settings.main_model_name（本应用配置权威源，前端 PUT settings 落库）——
+            //   否则 model=null + configSupplier=ProviderConfig.empty() → provider 回落
+            //   MockLlmProvider（假回复 / 永不 Edit）。DB 亦空 → null（保持旧行为，由调用方
+            //   provider 工厂回落 + ProductionForkedQuery 会话模型缺失 warn 显式暴露）。
+            String dbModel = readDbMainModelName(settingsMapper);
+            if (dbModel != null) {
+                log.info("[fork 模型解析] settings.json 无 model 键 → 兜底用 DB settings.main_model_name={}",
+                    dbModel);
+                return dbModel;
+            }
+            log.warn("[fork 模型解析] settings.json model 与 DB settings.main_model_name 均为空 → "
+                + "model=null（provider 将回落工厂默认/Mock；请在设置页配置主模型）");
+            return null;
         };
         // 发送名剥名（对齐 ModelConfigResolver.resolveSdkModelName 语义：全名 → DB models.name 裸名）。
         // 未命中（裸名/别名/无 mapper）→ 回落原始值透传（CC 未知名直接传 API，失败即失败）。
@@ -1890,6 +1935,35 @@ public class ToolRegistrationConfig {
         };
 
         return new ForkSuppliers(providerSupplier, modelSupplier, configSupplier, providerTypeSupplier);
+    }
+
+    /**
+     * [fork 模型兜底 2026-09-10] 读 DB 主模型名（{@code settings.main_model_name}）·
+     * 供 {@code rawModelSupplier} 在 settings.json 无 {@code model} 键时兜底。
+     *
+     * <p>语义对齐既有的 DB 主模型读取点（{@code CronIdleExecutor.resolveMainModelName}
+     * :1169-1179 / {@code ChatService.resolveSettingsModelName} :1927-1945 /
+     * {@code MessageService} :285-300）：settings 单例行（id=1）main_model_name 原样返回
+     * （裸名或 provider 全名，后续 {@code ModelNameResolver.resolve} 全名反查）。
+     * <b>失败一律 null</b>（无 mapper / 行缺失 / 空值 / 读取异常）→ 调用方保持旧行为
+     * （model=null → 工厂默认/Mock），异常不向上抛（fork 线程不得因读配置崩溃）。
+     *
+     * @param settingsMapper settings 单例行 mapper（null → null）
+     * @return main_model_name（非空白）或 null
+     */
+    static String readDbMainModelName(
+            com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper) {
+        if (settingsMapper == null) {
+            return null;
+        }
+        try {
+            com.nexusai.repository.settings.entity.SettingsRecord s = settingsMapper.selectOneById(1);
+            String v = s != null ? s.getMainModelName() : null;
+            return v != null && !v.isBlank() ? v : null;
+        } catch (Exception e) {
+            log.warn("[fork 模型兜底] DB settings.main_model_name 读取失败, 回落 null: {}", e.toString());
+            return null;
+        }
     }
 
     /**

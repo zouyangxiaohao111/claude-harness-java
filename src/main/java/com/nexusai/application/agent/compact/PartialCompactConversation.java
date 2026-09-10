@@ -784,13 +784,20 @@ public final class PartialCompactConversation {
 
     /**
      * 构建摘要 user 消息 · CC original: createUserMessage({content, isCompactSummary: true,
-     * ...(keep>0 ? {summarizeMetadata} : {isVisibleInTranscriptOnly: true})})（compact.ts:1031-1045）。
+     * ...(messagesToKeep.length > 0 ? {summarizeMetadata} : {isVisibleInTranscriptOnly: true})})（compact.ts:1063-1077）。
      *
-     * <p>Java 映射：subtype={@link CompactConversation#SUMMARY_SUBTYPE}（isCompactSummary 判别）；
-     * summarizeMetadata 以 {@code structuredOutput} 携带（user 消息不序列化到 API，
-     * AnthropicSdkProvider 仅 role=tool 序列化 structuredOutput）；messagesToKeep 为空时
-     * CC 走 isVisibleInTranscriptOnly（transcript-only 展示标记），Java ChatMessageDto
-     * 无该字段，以 subtype 判别 + structuredOutput 为 null 表达。
+     * <p>Java 映射：subtype={@link CompactConversation#SUMMARY_SUBTYPE}；summarizeMetadata 以
+     * {@code structuredOutput} 携带（user 消息不序列化到 API，AnthropicSdkProvider 仅 role=tool
+     * 序列化 structuredOutput）。
+     *
+     * <p><b>[SM/compact 收口] 两可观察性标记落列</b>（V70 列，CC original: isCompactSummary /
+     * isVisibleInTranscriptOnly，messages.ts:464-465/479-480）：partial 摘要恒
+     * {@code isCompactSummary=true}；{@code isVisibleInTranscriptOnly} <b>仅当 kept 段为空</b>
+     * 时为 true —— CC 三元分支 {@code messagesToKeep.length > 0 ? {summarizeMetadata}
+     * : {isVisibleInTranscriptOnly: true}}（compact.ts:1069-1077），Java 侧
+     * {@code summarizeMetadata == null} 即 messagesToKeep 为空（本类 :507-510 构造）。
+     *
+     * @param summarizeMetadata kept 段非空时的元数据；null = kept 段为空（→ transcript-only）
      */
     static ChatMessageDto buildSummaryMessage(String content, SummarizeMetadata summarizeMetadata) {
         Map<String, Object> structuredOutput = null;
@@ -802,11 +809,16 @@ public final class PartialCompactConversation {
             structuredOutput = new LinkedHashMap<>();
             structuredOutput.put("summarizeMetadata", meta);
         }
+        // [SM/compact 收口] 21 参构造器默认两标志 false → 显式覆写（CC compact.ts:1069-1077）：
+        //   isCompactSummary 恒 true；isVisibleInTranscriptOnly = kept 段为空（summarizeMetadata==null）。
+        boolean transcriptOnly = summarizeMetadata == null;
         return new ChatMessageDto(
             UUID.randomUUID().toString(), null, Role.user, "system",
             content, null, List.of(), FinishReason.stop,
             null, null, "刚刚", OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), structuredOutput, false, false,
-            CompactConversation.SUMMARY_SUBTYPE);
+            CompactConversation.SUMMARY_SUBTYPE)
+            .withIsCompactSummary(true)
+            .withIsVisibleInTranscriptOnly(transcriptOnly);
     }
 }

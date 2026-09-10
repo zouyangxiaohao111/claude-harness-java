@@ -16,7 +16,7 @@ import java.util.UUID;
 /**
  * 会话恢复消息反序列化 · 对齐 CC conversationRecovery.ts:167-255 {@code deserializeMessagesWithInterruptDetection}。
  *
- * <p><b>WHY（S1）</b>：Java 从 DB messages 原始行恢复（created_at ASC），无 CC 的中断检测 /
+ * <p><b>WHY（S1）</b>：Java 从 DB messages 原始行恢复（seq ASC 位置序），无 CC 的中断检测 /
  * tool_use 配对过滤 / "Continue" sentinel 注入 —— 中断 turn 恢复后"有问无答"。本类在恢复/续聊
  * 加载历史的通道（ChatController background / PartialCompactService / AwaySummaryController）
  * 对 DB 消息流应用 CC 同款反序列化语义。
@@ -93,7 +93,7 @@ public final class SessionResumeDeserializer {
     /**
      * 反序列化 + 中断检测 · 对齐 CC conversationRecovery.ts:167-255。
      *
-     * <p>输入为 DB 原始消息流（created_at ASC），输出为过滤 + 中断语义注入后的消息列表
+     * <p>输入为 DB 原始消息流（seq ASC 位置序），输出为过滤 + 中断语义注入后的消息列表
      * （不修改 DB；本方法为读侧漏斗，写入仍走 DB 权威通道）。
      *
      * @param raw DB 原始消息列表（可 null/空 → 恒返回空列表 + NONE）

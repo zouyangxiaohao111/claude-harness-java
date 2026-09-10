@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.compact.fork;
 
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
 
 import java.util.List;
@@ -34,7 +35,16 @@ public record ForkRawMaterial(
         List<String> systemPrompt,
         Map<String, String> userContext,
         Map<String, String> systemContext,
-        List<ChatMessageDto> forkContextMessages) {
+        List<ChatMessageDto> forkContextMessages,
+        // [SM-fork 模型直传 2026-09-10] 当轮会话运行模型（provider 全名，如
+        //   deepseek/deepseek-v4.1-flash-…）· = CC {@code toolUseContext.options.mainLoopModel}
+        //   （sessionMemory.ts:411-418 从 toolUseContext.options 取 mainLoopModel 组装 fork
+        //   systemPrompt；extractMemories.ts:372 createCacheSafeParams(context) 同源）。
+        //   WHY: 生产 supplier 的 toolUseContext 由 buildProductionCacheSafeParams 8 参构造 →
+        //   effectiveModelName 缺省 null → ProductionForkedQuery 会话模型直传解析取不到模型 →
+        //   model=null → provider 回落 MockLlmProvider（假回复 / 永不 Edit）。null = 未捕获
+        //   （非主循环入口/测试直构）→ 不造字段，回落既有全局 supplier 语义。
+        String effectiveModelName) {
 
     /** 紧凑构造器 · null 兜底（对齐 CacheSafeParams 同款防御；CC createCacheSafeParams 从不产 null）。 */
     public ForkRawMaterial {
@@ -77,5 +87,62 @@ public record ForkRawMaterial(
     public static Map<String, String> mergeContext(Map<String, String> supplied, Map<String, String> captured) {
         return supplied != null && !supplied.isEmpty() ? supplied
             : (captured != null ? captured : Map.of());
+    }
+
+    /**
+     * [SM-fork 模型直传 2026-09-10] 合并 fork 用 toolUseContext：保留 supplied 的真实工具集
+     * （{@code buildProductionCacheSafeParams} 唯一有效载荷 · {@code toolRegistry.all()}），
+     * 并把会话运行模型写入 {@code effectiveModelName}。
+     *
+     * <p><b>WHY（生产事故回归）</b>：CC 的 fork 上下文（{@code createCacheSafeParams(context)}，
+     * forkedAgent.ts:131-141 取 {@code context.toolUseContext}）<b>同时</b>携带
+     * {@code options.tools} 与 {@code options.mainLoopModel}。Java 侧这两个维度来自不同源：
+     * 工具集 = 生产 supplier 的合成上下文（8 参构造 → {@code effectiveModelName}=null），
+     * 会话模型 = psContext/{@link ForkRawMaterial} 的会话捕获。若只传 supplier 上下文，
+     * {@code ProductionForkedQuery} 的会话模型直传分支（:239-256）读不到模型 → 回落全局
+     * supplier（settings.json 无 model → model=null → {@code ProviderConfig.empty()}）→
+     * provider 回落 {@code MockLlmProvider}（假回复 / 永不 Edit，summary.md 冻结不前进）。
+     *
+     * <p><b>为什么用一个 wither 而不是换父上下文</b>：fork 的权限/abort/工具集语义由 supplier
+     * 上下文（既有生产契约）承载，只补齐缺省的 {@code effectiveModelName} 一个维度，
+     * 其余字段零变化（{@link ToolUseContext#withEffectiveModelName(String)} 透传全部字段）。
+     *
+     * @param suppliedCtx      supplier 注入的 fork 上下文（生产 = buildProductionCacheSafeParams）
+     * @param sessionModelName 会话运行模型（provider 全名）；null/blank → 原样返回（不造字段）
+     * @return 带 {@code effectiveModelName} 的 fork 上下文
+     */
+    public static ToolUseContext forkToolUseContext(ToolUseContext suppliedCtx, String sessionModelName) {
+        if (suppliedCtx == null) {
+            return null;
+        }
+        // withEffectiveModelName(null) → 原样返回（ToolUseContext:1409-1411，不造字段）
+        return suppliedCtx.withEffectiveModelName(sessionModelName);
+    }
+
+    /**
+     * {@link #forkToolUseContext(ToolUseContext, String)} 的会话上下文重载 ·
+     * 取 {@code sessionCtx.effectiveModelName()}（= CC {@code toolUseContext.options.mainLoopModel}，
+     * 由 LlmAgentLoop hook/loop 侧用 {@code state.currentModel()} 写入）。
+     *
+     * @param suppliedCtx supplier 注入的 fork 上下文（工具集载体）
+     * @param sessionCtx  会话 ToolUseContext（模型来源；null → 不造字段）
+     * @return 带会话模型的 fork 上下文
+     */
+    public static ToolUseContext forkToolUseContext(ToolUseContext suppliedCtx, ToolUseContext sessionCtx) {
+        return forkToolUseContext(suppliedCtx,
+            sessionCtx != null ? sessionCtx.effectiveModelName() : null);
+    }
+
+    /**
+     * {@link #forkToolUseContext(ToolUseContext, String)} 的 stop-hook 原料重载 ·
+     * 取 {@link #effectiveModelName()}（extract-memories / auto-dream 无 post-sampling 上下文，
+     * 会话模型经本 record 从 LlmAgentLoop 捕获点透传 · CC createCacheSafeParams(context) 同源）。
+     *
+     * @param suppliedCtx supplier 注入的 fork 上下文（工具集载体）
+     * @param raw         stop-hook 捕获的 fork 原料（null → 不造字段）
+     * @return 带会话模型的 fork 上下文
+     */
+    public static ToolUseContext forkToolUseContext(ToolUseContext suppliedCtx, ForkRawMaterial raw) {
+        return forkToolUseContext(suppliedCtx, raw != null ? raw.effectiveModelName() : null);
     }
 }

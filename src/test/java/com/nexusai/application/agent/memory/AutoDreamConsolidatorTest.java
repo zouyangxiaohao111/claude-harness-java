@@ -183,7 +183,8 @@ class AutoDreamConsolidatorTest {
             List.of("MAIN-SYSTEM-PROMPT-1", "MAIN-SYSTEM-PROMPT-2"),
             Map.of("claudeMd", "项目指令"),
             Map.of("gitStatus", "GIT-BLOCK"),
-            mainMsgs);
+            mainMsgs,
+            null);   // [SM-fork 模型直传] 本测试只验原料合并，模型维度见 SessionMemoryForkSessionModelTest
 
         consolidator.consolidateIfNeeded(ws, null, null, raw);
 

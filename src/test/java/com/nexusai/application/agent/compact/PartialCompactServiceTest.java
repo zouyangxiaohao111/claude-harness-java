@@ -52,7 +52,7 @@ import static org.mockito.Mockito.when;
  *   <li><b>direction-aware 重组顺序</b>（REPL.tsx:4950-4952）：from 时 keep 在 summary
  *       之前（前缀保留段先于摘要）；up_to 时 summary 在前（摘要先于后缀保留段）。若顺序错位
  *       → 前端 setMessages 后对话语义错乱（被摘要内容恢复顺序反了）。</li>
- *   <li><b>写回调用</b>（REPL.tsx:4964/4971）：replaceSessionMessages 收到重组列表 +
+ *   <li><b>写回调用</b>（REPL.tsx:4964/4971）：appendPostCompactMessages（append-only）收到重组列表 +
  *       updateConversationId 收到新 randomUUID；若未写回 → 下次 partial 无法重复剥离 boundary。</li>
  *   <li><b>错误翻译</b>：nothing_to_summarize → ValidationException(400)（CC compact.ts:802-808
  *       抛错）；messageId 不在剥离后列表 → NotFoundException(404)（REPL.tsx:4923-4930 warning）；
@@ -90,7 +90,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(sessionMessages);
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1)); // 模拟归一化：返回原列表
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))
@@ -110,7 +110,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))
@@ -128,12 +128,16 @@ class PartialCompactServiceTest {
         assertThat(messages.get(2).id()).isEqualTo("a0");
         assertThat(messages.get(3).subtype()).isEqualTo(CompactConversation.SUMMARY_SUBTYPE);
 
-        // 写回：replaceSessionMessages(sessionId, 重组列表) + updateConversationId(sessionId, new UUID)
+        // 写回：appendPostCompactMessages(sessionId, 重组列表) + updateConversationId(sessionId, new UUID)
         ArgumentCaptor<List<ChatMessageDto>> writtenCaptor = ArgumentCaptor.forClass(List.class);
-        verify(messageService).replaceSessionMessages(org.mockito.ArgumentMatchers.eq(SESSION),
+        verify(messageService).appendPostCompactMessages(org.mockito.ArgumentMatchers.eq(SESSION),
             writtenCaptor.capture());
-        assertThat(writtenCaptor.getValue()).extracting(ChatMessageDto::id)
-            .containsExactly("compact-boundary-compact_boundary", "u0", "a0", writtenCaptor.getValue().get(3).id());
+        // [SM/compact 对齐 CC] boundary id 每次取雪花（唯一）→ 首位断言 subtype + id 非空；其后 = keep + summary
+        assertThat(writtenCaptor.getValue()).hasSize(4);
+        assertThat(writtenCaptor.getValue().get(0).subtype()).isEqualTo("compact_boundary");
+        assertThat(writtenCaptor.getValue().get(0).id()).as("boundary id 非空（雪花取号）").isNotBlank();
+        assertThat(writtenCaptor.getValue().subList(1, 4)).extracting(ChatMessageDto::id)
+            .containsExactly("u0", "a0", writtenCaptor.getValue().get(3).id());
         ArgumentCaptor<String> convCaptor = ArgumentCaptor.forClass(String.class);
         verify(sessionService).updateConversationId(org.mockito.ArgumentMatchers.eq(SESSION),
             convCaptor.capture());
@@ -150,7 +154,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))
@@ -248,7 +252,7 @@ class PartialCompactServiceTest {
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         List<String> capturedPrompts = new ArrayList<>();
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
             capturedPrompts.add(inv.getArgument(0));
@@ -300,7 +304,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
             // 摘要生产期间读 ThreadLocal 槽位（StreamCompactSummary cacheSafeParamsSupplier=Holder.get() 读侧）
@@ -344,7 +348,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))
@@ -421,7 +425,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))
@@ -481,7 +485,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))

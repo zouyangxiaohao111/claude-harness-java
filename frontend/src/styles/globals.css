@@ -6029,6 +6029,48 @@ html {
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
 }
+/* [snip-persist] 已被 Snip 裁剪的轨迹行（id ∈ snippedIds · 不再发送给模型）：内容置灰划掉 + 「已裁剪」标记 */
+.trace-record.snipped .content {
+  opacity: 0.55;
+  text-decoration: line-through;
+  text-decoration-color: var(--hairline);
+}
+.trace-record .trace-snipped-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--ink-faint);
+  border: 1px solid var(--hairline);
+}
+/* [compact 边界] 轨迹视图「已压缩」标记条（居中 muted + 左右分隔线，对齐 MessageList .boundary-note 视觉） */
+.trace-compact-marker {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px 4px 12px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+}
+.trace-compact-marker::before,
+.trace-compact-marker::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--hairline);
+}
+.trace-compact-marker .trace-compact-txt {
+  white-space: nowrap;
+  padding: 3px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+.trace-compact-marker.clickable { cursor: pointer; }
+.trace-compact-marker.clickable:hover .trace-compact-txt { color: var(--ink-subtle); }
 
 /* ===== 中心区 对话/轨迹 双标签 ===== */
 .center-tabs {

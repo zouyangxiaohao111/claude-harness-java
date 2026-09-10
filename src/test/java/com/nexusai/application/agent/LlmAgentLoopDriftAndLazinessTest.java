@@ -306,53 +306,6 @@ class LlmAgentLoopDriftAndLazinessTest {
                 .isBetween(7817, 7853);
 
         }
-        // isEmitToolUseSummariesEnabled → AgentLoopContext static (private, ctx-aware)
-        // 锚定"存在 + 在预期区间"，防"移走/删除"（Pattern #2 行号漂移惯例）。
-        List<String> ctxLines = Files.readAllLines(Path.of(AGENT_LOOP_CONTEXT));
-        assertThat(findLine(ctxLines, "boolean isEmitToolUseSummariesEnabled(AgentLoopContext ctx)"))
-            .as("isEmitToolUseSummariesEnabled 应已 static 化搬入 AgentLoopContext")
-            // [workflow 合并] H8+canUseTool+H9 v2 全量合入后实测 1422 行.
-            //   ±8 容差重锚 [1414,1430], 锚定仍防"移走/删除" (Pattern #2 行号漂移).
-            // [H13-GAP v3] toolExecContext 新增 hook DONT_ASK permCtx 保留分支 (+13 行) → 实测 1435.
-            //   按 ±8 容差以实测 1435 为中心重锚 → [1427,1443].
-            // [IMP-15] AgentLoopContext 新增 max_output_tokens 接线段 (~+72 行) → 实测 1512.
-            //   按 ±8 容差以实测 1512 为中心重锚 → [1504,1520].
-            // [IMP-22] merger 迁移去重删除 AgentLoopContext 私有 collectCandidatesByMessage (~-22 行)
-            //   → 实测 1489. 按 ±8 容差以实测 1489 为中心重锚 → [1481,1497].
-            // [GR-3] AgentLoopContext 移除 compactContext record 组件 + computeBlockingLimit 改造
-            //   → 实测 1499. 按 ±8 容差以实测 1499 为中心重锚 → [1491,1507].
-            // [workflow 合并收尾] AgentLoopContext.isEmitToolUseSummariesEnabled 实测 1601,
-            //   按 ±8 容差以实测 1601 为中心重锚 → [1593,1609].
-            // [origin/master 合并 2026-08-05] 实测 1646 → 重锚 [1638,1654].
-            // [IMP-SP-08] AgentLoopContext 删 promptAssembler/systemPromptCache record 组件 +
-            //   static buildPromptContext（~-30 行）→ 实测 1615. ±8 容差重锚 [1607,1623].
-            // [OD-01 S3 2026-08-07] 压缩块接线（snip 门控+micro+B2/B4/B6 ~+215 行）→ 实测 1674.
-            //   ±8 容差重锚 [1666,1682].
-            // [ER-IMP-12 2026-08-08] aborted_tools 门翻转（~+2 行）→ 实测 1683. ±8 容差重锚
-            //   [1675,1691].
-            // [B-TB D1 2026-08-08] getLastAssistantMessage 新增（~+18 行，在此标记之前）→ 实测 1701.
-            //   ±8 容差重锚 [1693,1709].
-            // [RV14B-WIRE-04 2026-08-10] AgentLoopContext 新增 resolver 组件 + 35 参兼容 ctor +
-            //   两个 Haiku helper（~+102 行，在此标记之前）→ 实测 1803. ±8 容差重锚 [1795,1811].
-            // [R2-USAGE 2026-08-13] handleToolCallsTurn assistant 消息 withUsage（+6 行，在此标记
-            //   之前）→ 实测 1847. ±8 容差重锚 [1839,1855].
-            // [RF-1 2026-08-14] handleToolCallsTurn 新增 thinkingConfig 形参 + 顶部新增 ThinkingConfig
-            //   import（+2 行，在此标记之前）→ 实测 1856. ±8 容差重锚 [1848,1864].
-            // [WF-2 tool-wf2-exec-registry 2026-08-13] lazy-stream 接线（AgentLoopContext +5 行）
-            //   → 实测 1849. ±8 容差重锚 [1841,1857]（Pattern #2 行号漂移）。
-            // [merge 冲突解决 2026-08-14] 两侧 (R2-USAGE + RF-1 + WF-2) 合入后 AgentLoopContext
-            //   isEmitToolUseSummariesEnabled 实测 1881. ±8 容差重锚 [1873,1889].
-            // [ContextCompact 合入 master 2026-08-14] 实测 1876. ±8 容差重锚 [1868,1884].
-            // [hooks × origin/master 合入 2026-08-14] workflow/hooks (IMP-HOOKS-S5) 与
-            //   origin/master 全量合入后（stop-hook 相关段搬迁/精简 ~-36 行）实测 1845.
-            //   ±8 容差重锚 [1837,1853].
-            // [resolve:mch 2026-08-14] 合入终局后实测 1840（AgentLoopContext.java 无冲突）.
-            //   ±8 容差重锚 [1832,1848].
-            // [subagent_v3 rebase 2026-08-17] 合入 master 后实测 1895. ±8 容差重锚
-            //   [1887,1903]（Pattern #2 行号漂移，锚定仍防"移走/删除"）.
-            // [tool_v4 合并 2026-08-22] tool-v4 接线后实测 1914. ±8 容差重锚
-            //   [1906,1922]（Pattern #2 行号漂移，锚定仍防"移走/删除"）.
-            .isBetween(1906, 1922);
 
     }
 

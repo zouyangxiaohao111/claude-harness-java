@@ -72,8 +72,11 @@ class SessionStartHooksChannelCcTest {
             .as("hook_additional_context 消息追加到 hookMessages 尾部（sessionStart.ts:163-172）")
             .isEqualTo("hook_additional_context");
         assertThat(hookMessages.get(2).content())
-            .as("additionalContexts 聚合（H3 单值 String → 列表，join('\\n')）")
-            .isEqualTo("附加上下文1");
+            .as("additionalContexts 聚合 + 包 <system-reminder>（对齐 §14 与 CC messages.ts:4117-4127）")
+            .isEqualTo("<system-reminder>\nSessionStart hook additional context: 附加上下文1\n</system-reminder>");
+        assertThat(hookMessages.get(2).isMeta())
+            .as("hook_additional_context 恒 isMeta=true（系统注入·非用户输入，对齐 CC createUserMessage({isMeta:true})）")
+            .isTrue();
     }
 
     @Test
@@ -147,8 +150,9 @@ class SessionStartHooksChannelCcTest {
             .as("N 个 result 的 additionalContext 必须聚合进恰 1 条 hook_additional_context（防两份并存）")
             .hasSize(1);
         assertThat(hooks.get(0).content())
-            .as("两条 result 的 additionalContext 以 \\n join（对齐 LlmAgentLoop §14 :2687-2688）")
-            .isEqualTo("附加上下文1\n附加上下文2");
+            .as("两条 result 的 additionalContext 以 \\n join 且包 <system-reminder>（对齐 §14 与 CC messages.ts:4117-4127）")
+            .isEqualTo("<system-reminder>\nSessionStart hook additional context: 附加上下文1\n附加上下文2\n</system-reminder>");
+        assertThat(hooks.get(0).isMeta()).as("hook_additional_context 恒 isMeta=true").isTrue();
     }
 
     @Test

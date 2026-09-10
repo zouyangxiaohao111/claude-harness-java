@@ -566,8 +566,9 @@ public class ChatService {
         if (injected == null || injected.isEmpty()) {
             return;
         }
-        // [reflect-warning] 单调时间戳兜底：同批连续 insert 不在同一毫秒并列（对齐原 replayAndPersist
-        //   baseTs.plusNanos(seq) 保序范式；实时 append 已用同款单调 ts）。
+        // [SSOT created_at] 逐条经 MessageService.nextCreatedAt 单调分配器取号（与实时落库/compact 同源）
+        //   → 同批连续 insert 不并列且恒晚于该会话所有已有行；分配器不可用（messageService 已在上方判空
+        //   —— 本方法 messageService != null 才继续）→ 回落 baseTs 单调（原 replayAndPersist 范式）。
         OffsetDateTime baseTs = OffsetDateTime.now();
         long tsSeq = 0;
         for (AgentState.InjectedQueuedMessage inj : injected) {
@@ -581,10 +582,21 @@ public class ChatService {
                     continue;
                 }
                 // 空 content 也落库（busy 入队 content 可为空串；空 user 消息仍应在 DB 有记录）。
-                // 4 参重载注入单调时间戳：DB created_at 严格递增，顺序可期（对齐原 replayAndPersist :688）。
+                // [SSOT created_at] 时间戳经单调分配器取号（异常/取号为空 → 回落 baseTs 单调，原逻辑）。
                 // [P0-1 OD-1/OD-3] 6 参重载透传 queuedOrigin（registry 仅 busy-queued → 'busy-queued' 落 V67 列）
+                OffsetDateTime ts;
+                try {
+                    ts = messageService.nextCreatedAt(sessionId);
+                } catch (Exception e) {
+                    log.warn("ChatService: 排队 user 消息 created_at 分配器取号异常，回落 baseTs 单调: session={} err={}",
+                        sessionId, e.toString());
+                    ts = null;
+                }
+                if (ts == null) {
+                    ts = baseTs.plusNanos(tsSeq++);
+                }
                 messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
-                    baseTs.plusNanos(tsSeq++), false, inj.queuedOrigin());
+                    ts, false, inj.queuedOrigin());
                 if (log.isInfoEnabled()) {
                     log.info("ChatService: mid-turn 注入排队 user 消息补落库 session={} id={} chars={}",
                         sessionId, inj.uuid(), inj.content() == null ? 0 : inj.content().length());
@@ -949,6 +961,8 @@ public class ChatService {
                     repairOrphanToolResults(state, sessionId);
                 }
                 state.clearAppendListener();
+                // [SM/compact 对齐 CC] 同步解除压缩落库监听（防陈旧 PersistCtx/sessionId 泄漏到下轮）
+                state.clearCompactPersistListener();
                 persistInjectedQueuedMessages(state, sessionId);
             }
 
@@ -1165,15 +1179,25 @@ public class ChatService {
      * [实时落库 2026-09-03] 单轮实时落库上下文（per-run）。
      *
      * <p>持会话级串行锁 + 单调时间戳 + 消息链归属（lastUserMessageId）。listener 每 append 一条消息即同步
-     * 落库，故时间戳须 {@code baseTs.plusNanos(seq)} 单调保序（工具并行 append → synchronized 串行落库），
-     * 对齐原 replayAndPersist 循环内保序范式（同 MessageService.replaceSessionMessages base.plusNanos(i)）。
-     * lastUserMessageId 初始 = 本轮发起 user 消息 id（调用方经 5 参 armRealTimePersist 传入，对齐原
-     * replayAndPersist lastUserMessageId = turn userMessageId）；遇 mid-turn 注入排队 user 时推进。
+     * 落库（工具并行 append → synchronized 串行落库）。
+     *
+     * <p><b>[SSOT created_at 变更]</b>: {@code created_at} 已改由 {@link MessageService#nextCreatedAt}
+     * 的 per-session 单调分配器取号（{@link #persistAppendedMessage}），<b>不再是</b>
+     * {@code baseTs.plusNanos(seq)}。原因：{@code baseTs} = run 开始时 arm 捕获，而 compact 发生在 run
+     * <b>中段</b>（{@code MessageService.appendPostCompactMessages} 用「调用时」时间基）→ 同 run 内
+     * compact 之后 append 的消息时间戳早于 boundary → 下轮 {@code listBySession}（created_at ASC）顺序
+     * 倒挂 → boundary 切片整段丢消息 + 拆散 tool_use/tool_result 配对。分配器保证「任何新写入恒晚于该
+     * 会话所有已有行」，与 writer 无关。
+     *
+     * <p>{@code baseTs}/{@code tsSeq} <b>保留</b>：仅供分配器不可用（非 Spring 直构单测 messageService
+     * 为 null → nextCreatedAt 返回 null）时回落原逻辑（见 persistAppendedMessage），生产路径不再使用。
      */
     private static final class PersistCtx {
         final String sessionId;
         final Object lock = new Object();
+        /** [SSOT created_at 后仅回落用] run 起始时间基（非 Spring 单测分配器不可用时兜底）。 */
         final java.time.OffsetDateTime baseTs;
+        /** [SSOT created_at 后仅回落用] 同 run 内单调序号（兜底时间基的 +nanos 保序）。 */
         final java.util.concurrent.atomic.AtomicLong tsSeq;
         final java.util.concurrent.atomic.AtomicReference<String> lastUserMessageId;
 
@@ -1224,6 +1248,29 @@ public class ChatService {
         if (log.isInfoEnabled()) {
             log.info("[实时落库] appendListener 已武装: session={}（对齐 CC recordTranscript 逐条实时写）", sessionId);
         }
+        // [SM/compact 对齐 CC] 压缩落库监听：LlmAgentLoop.loop()（static，无 MessageService 引用）在
+        //   auto/reactive compact 成功后经 state.persistCompactedMessages 回调此处 →
+        //   MessageService.appendPostCompactMessages <b>append-only</b> 落库（只追加 boundary/summary 新行 +
+        //   把 kept 段 created_at 重挂到 boundary 之后，不删任何旧行 —— 对齐 CC transcript append-only：
+        //   sessionStorage.ts recordTranscript/insertMessageChain 只追加，加载侧按最后 boundary 剪枝）。
+        //   DB 与 compact 后内存一致 → 消除「每 run 从 DB 恢复全量 → 反复自动压缩」。
+        //   ⚠️ 不再走 replaceSessionMessages（删全表 + 换时间基）：同 run 内 compact 之后追加的消息
+        //   created_at 会早于重插 boundary → 下轮 listBySession 顺序倒挂 → boundary 切片丢消息（HIGH）。
+        //   messageService 未装配（非 Spring 单测）→ 不武装，loop 侧原样返回仅替换内存。
+        if (messageService != null) {
+            state.setCompactPersistListener(msgs -> {
+                List<ChatMessageDto> normalized = messageService.appendPostCompactMessages(sessionId, msgs);
+                if (log.isInfoEnabled()) {
+                    log.info("[compact-persist] compact 结果已 append-only 落库: session={} 条数={}（不删旧行 · 对齐 CC recordTranscript）",
+                        sessionId, normalized.size());
+                }
+                return normalized;
+            });
+            if (log.isInfoEnabled()) {
+                log.info("[实时落库] compactPersistListener 已武装: session={}（compact append-only 落库 · 对齐 CC transcript append-only）",
+                    sessionId);
+            }
+        }
     }
 
     /**
@@ -1233,6 +1280,26 @@ public class ChatService {
     public void armRealTimePersist(AgentState state, String sessionId, String streamTopic,
                                    SimpMessagingTemplate wsTemplate) {
         armRealTimePersist(state, sessionId, streamTopic, wsTemplate, null);
+    }
+
+    /**
+     * [SM/compact 对齐 CC] 只武装「落库」通道（append 实时落库 + compact append-only 落库），不推 STOMP。
+     *
+     * <p><b>WHY</b>：后台主会话入口（{@code MainSessionBackgroundService.runBackgroundQuery} 派生的
+     * LlmAgentLoop.run）此前完全未武装任何持久化监听 → 该通道下 append 不落库、compact 结果不落库
+     * （每 run 从 DB 恢复全量 → 反复自动压缩）。本方法给这条「无请求上下文」的入口一个不依赖
+     * streamTopic/wsTemplate 的最小武装点（传 null → {@code persistAppendedMessage} 内的 sendAndLog
+     * 跳过推送仅落库，与既有非 Spring 单测路径同款语义）。
+     *
+     * <p>主路径（ChatService.processUserMessage / CronIdleExecutor）仍走 5 参
+     * {@link #armRealTimePersist}（带 topic/ws 推送），本方法不改变其行为。
+     *
+     * @param state     本轮 AgentState
+     * @param sessionId 目标会话（DB 键）
+     */
+    public void armPersistenceListeners(AgentState state, String sessionId) {
+        // streamTopic/wsTemplate 传 null：仅落库不推送（后台派生查询的流走任务级 topic，由 loop 侧推送）
+        armRealTimePersist(state, sessionId, null, null, null);
     }
 
     /**
@@ -1256,7 +1323,27 @@ public class ChatService {
             String streamTopic, SimpMessagingTemplate wsTemplate) {
         synchronized (ctx.lock) {
             String sessionId = ctx.sessionId;
-            java.time.OffsetDateTime ts = ctx.baseTs.plusNanos(ctx.tsSeq.incrementAndGet());
+            // [SSOT created_at] created_at 统一经 MessageService.nextCreatedAt 单调分配器取号
+            //   （per-session：max(now, 该会话已知最大 ts + 1ns)）→ 恒晚于该会话所有已有行，与 writer 无关。
+            //   WHY：旧 baseTs.plusNanos(seq) 的时间基在 run 开始时冻结，而 compact 在 run 中段写入
+            //   boundary（MessageService.appendPostCompactMessages 用调用时 now()）→ compact 之后 append
+            //   的 assistant/tool/user 行时间戳早于 boundary → 下轮 boundary 切片整段丢失（HIGH）。
+            //   分配器不可用（messageService 未装配/取号返回 null，非 Spring 直构单测）→ 回落 baseTs 单调
+            //   （原逻辑，行为零变化）并 log.warn fail loud。
+            java.time.OffsetDateTime ts = null;
+            if (messageService != null) {
+                try {
+                    ts = messageService.nextCreatedAt(sessionId);
+                } catch (Exception e) {
+                    log.warn("ChatService: created_at 单调分配器取号异常，回落 baseTs 单调: session={} err={}",
+                        sessionId, e.toString());
+                }
+            }
+            if (ts == null) {
+                log.warn("ChatService: created_at 单调分配器不可用（MessageService 未装配/取号为空），"
+                    + "回落 baseTs.plusNanos 单调: session={}", sessionId);
+                ts = ctx.baseTs.plusNanos(ctx.tsSeq.incrementAndGet());
+            }
 
             // [fix-loop-resume-history] 注入历史消息跳过（防重复落库 · 双通道铁律：DB 权威读取不破坏）。
             //   prePersistedMessageIds 在 doRun 历史注入时先登记后 append（LlmAgentLoop:2294），listener
@@ -1288,6 +1375,7 @@ public class ChatService {
                         rec.setSnipMetadata(JSON.writeValueAsString(m.snipMetadata()));
                     }
                     rec.setCreatedAt(ts.toString());
+                    rec.setSeq(nextSeq(sessionId));   // [seq 排序键] 位置键取号
                     messageMapper.insert(rec);
                     java.util.List<String> removedUuids = m.snipMetadata() != null
                             && m.snipMetadata().get("removedUuids") instanceof java.util.List<?> ru
@@ -1413,6 +1501,7 @@ public class ChatService {
                     rec.setReasoningDurationMs(m.reasoningDurationMs());
                     rec.setFinishReason("tool_calls");
                     rec.setCreatedAt(ts.toString());
+                    rec.setSeq(nextSeq(sessionId));   // [seq 排序键] 位置键取号
                     messageMapper.insert(rec);
                     appendReasoningDurationToTranscript(sessionId, id, m.reasoningDurationMs());
                     for (ToolCallDto tc : m.toolCalls()) {
@@ -1464,6 +1553,7 @@ public class ChatService {
                     rec.setCacheCreationInputTokens(usage != null && usage.cacheCreationInputTokens() != null
                         ? Math.toIntExact(usage.cacheCreationInputTokens()) : null);
                     rec.setCreatedAt(ts.toString());
+                    rec.setSeq(nextSeq(sessionId));   // [seq 排序键] 位置键取号
                     messageMapper.insert(rec);
                     appendReasoningDurationToTranscript(sessionId, id, m.reasoningDurationMs());
                     if (log.isInfoEnabled()) {
@@ -1501,6 +1591,7 @@ public class ChatService {
                 }
                 MessageRecord rec = newToolMessage(sessionId, m.toolCallId(), content, ctx.lastUserMessageId.get());
                 rec.setCreatedAt(ts.toString());
+                rec.setSeq(nextSeq(sessionId));   // [seq 排序键] 位置键取号
                 messageMapper.insert(rec);
                 ToolCallRecord tcUpdate = toolCallMapper.selectOneById(m.toolCallId());
                 if (tcUpdate != null) {
@@ -2219,7 +2310,7 @@ public class ChatService {
         List<MessageRecord> rows = messageMapper.selectListByQuery(
             QueryWrapper.create().where(
                 "session_id = ? AND role IN ('user', 'assistant')", sessionId)
-                .orderBy("created_at", true));
+                .orderBy("seq", true));   // [seq 排序键] 位置序（会话正文尾部抽取；created_at 受 compact 重挂不扰动）
         if (rows == null || rows.isEmpty()) return null;
         StringBuilder sb = new StringBuilder();
         for (MessageRecord m : rows) {
@@ -2290,7 +2381,7 @@ public class ChatService {
                 "session_id = ? AND role = ? AND (is_meta IS NULL OR is_meta != 1) "
                     + "AND content IS NOT NULL AND content != ''",
                 sessionId, Role.user.name())
-                .orderBy("created_at", true).limit(1));
+                .orderBy("seq", true).limit(1));   // [seq 排序键] 位置序（首条 title-worthy 用户消息）
         return (rows != null && !rows.isEmpty()) ? rows.get(0).getContent() : null;
     }
 
@@ -2314,6 +2405,32 @@ public class ChatService {
 
     private static String generateId(String prefix) {
         return prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    /**
+     * [seq 排序键] 位置键取号 · 本类直写 {@code messageMapper.insert}（绕过 MessageService）的
+     * assistant/tool/snip 行落库时统一调用。
+     *
+     * <p>WHY：{@code messages.seq}（V70）是会话内排序位置键（读侧 listBySession/listPageBySession
+     * ORDER BY seq；compact 重挂 kept 段只改 seq）。本类实时落库是会话消息的主要 writer，若这些行
+     * 不取号 → seq 退化（NULL / -1）→ 在 ORDER BY seq 下排到最前（SQLite NULL 最小）→ 会话顺序错乱。
+     *
+     * <p><b>永不返回 null</b>：seq 取号已换雪花（{@code MessageService.nextSeq} 全局单调 long，自带
+     * 时钟回拨/异常兜底），此处不再需要 null 出口。唯一退化出口 = messageService 未注入
+     * （非 Spring 上下文 / plain JUnit 单测，{@code @Autowired(required=false)}）→ 返回 {@code -1L}
+     * 并 {@code log.error} make 可见。<b>{@code -1L} 会让该行在 ORDER BY seq 下排最前</b>——仅在
+     * messageService 缺失的<b>非生产</b>路径出现（生产中 Spring 恒注入，不触发）。
+     *
+     * @param sessionId 会话 ID（DB 键）
+     * @return 下一个 seq（雪花，全局单调 long）；仅 messageService 未注入（非 Spring/单测）→ {@code -1L}
+     */
+    private long nextSeq(String sessionId) {
+        if (messageService == null) {
+            log.error("ChatService: messageService 未注入（非 Spring/单测路径），本次落库 seq=-1（会排最前）: session={}",
+                sessionId);
+            return -1L;
+        }
+        return messageService.nextSeq(sessionId);
     }
 
     private static String abbreviate(String s, int max) {
@@ -2374,7 +2491,7 @@ public class ChatService {
     private List<ChatMessageDto> loadRecentHistory(String sessionId, int limit) {
         List<MessageRecord> desc = messageMapper.selectListByQuery(
             QueryWrapper.create().eq("session_id", sessionId)
-                .orderBy("created_at", false).limit(limit));
+                .orderBy("seq", false).limit(limit));   // [seq 排序键] 位置序（最近 N 条；created_at 受 compact 重挂不扰动）
         List<MessageRecord> asc = new ArrayList<>(desc);
         Collections.reverse(asc);
         List<ChatMessageDto> result = new ArrayList<>(asc.size());

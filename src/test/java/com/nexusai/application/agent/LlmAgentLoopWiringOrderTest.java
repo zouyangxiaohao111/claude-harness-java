@@ -524,9 +524,13 @@ class LlmAgentLoopWiringOrderTest {
         // 【GR-1 返工】主自动压缩已迁移到 compactConversation 单函数 → 只有 l4Result.messages()
         // （buildPostCompactMessages 组装，含 messagesToKeep 完整尾段）取代消息链；
         // 旧的手工组装 state.replaceMessages(compactTarget) 已被 GR-1 移除。
+        // [SM/compact 对齐 CC] 取代动作收敛到 persistCompactedMessages（内部 = 经 state 回调替换落库
+        //   + 归一化列表覆盖内存），请求面 messagesForQuery 取 state 的归一化拷贝（与 DB id 一致）——
+        //   锚点随实现同步（L4 尾段仍必须完整流经取代点，语义不变）。
         assertThat(source)
             .as("GR-1 自动压缩成功后用 l4Result.messages()（compactConversation 单函数 buildPostCompactMessages 完整尾段）取代消息链（L4 尾段不丢）")
-            .contains("state.replaceMessages(l4Result.messages());");
+            .contains("persistCompactedMessages(state, l4Result.messages());")
+            .contains("messagesForQuery = new ArrayList<>(state.messages());");
     }
 
     // ─────────────────────── helpers ───────────────────────

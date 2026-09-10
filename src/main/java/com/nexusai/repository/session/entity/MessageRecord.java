@@ -173,6 +173,52 @@ public class MessageRecord {
      * meta/result/reject 恒 null（红线：空闲路径零标记，CC processTextPrompt 原文发）。
      */
     private String queuedOrigin;
+    /**
+     * 会话内单调排序键 · <b>净新增字段（非 CC 对齐）—— 根治「created_at 既是时间又是位置」</b>。
+     *
+     * <p>WHY: {@code created_at} 此前双重语义 —— ① 展示时间（前端「X 分钟前」）② 会话内排序位置
+     * （listBySession / listPageBySession ORDER BY created_at）。compact append-only 落库需把 kept 段
+     * 「重挂」到 boundary 之后（位置变化），但 kept 的真实产生时间不该改写（展示语义）→ 同列二义必冲突。
+     * V70 落库为 {@code seq} 列：位置语义归 seq（读侧 ORDER BY seq），时间语义归 created_at。
+     *
+     * <p><b>顺序键 = 雪花 ID（hutool）· 全局单调</b>：新写入经
+     * {@link com.nexusai.domain.session.MessageService#nextSeq(String)}（hutool Snowflake，
+     * {@code cn.hutool.core.util.IdUtil#getSnowflakeNextId()}）取号，返回 {@code long} 全局单调。
+     * 不再 per-session seed：雪花 ID 免 seed 查询、免 seed 失败路径。V70 回填的存量行 =
+     * 按 (session_id, created_at, id) 稳定序的 1..N 行号；回填值只需保持
+     * <b>相对顺序</b>——新雪花号恒大于 1..N，混排后全局序仍正确。
+     * <b>多实例边界</b>：{@code MessageService.lastSeq} 只保护单进程；hutool 默认 workerId
+     * （PID/MAC 派生，mod 32）在同机多 JVM 有撞号概率 → 多实例同库写同一会话时 seq 可能
+     * 重复/回退，需显式配置 workerId 或加库侧唯一约束。
+     * null = V70 前的历史行（迁移已回填；理论不残留）。
+     */
+    private Long seq;
+    /**
+     * compact 摘要 user 消息标记 · CC original: isCompactSummary（messages.ts:465/480）。
+     *
+     * <p>V70 落库为 {@code is_compact_summary} 列（MyBatis-Flex camelCase→snake_case 自动映射，同 V51
+     * is_meta 列范式）。写侧 CompactConversation.buildCompactSummaryMessage（isCompactSummary=true）经
+     * MessageService.appendMessage/appendPostCompactMessages/replaceSessionMessages 落库；读侧 toDto 回填。
+     * null/旧行 = false（Boolean.TRUE.equals 容错）。
+     */
+    private Boolean isCompactSummary;
+    /**
+     * 仅 transcript 可见标记 · CC original: isVisibleInTranscriptOnly（messages.ts:464/479）。
+     *
+     * <p><b>语义 = 仅控制 UI/transcript 展示 + SDK {@code isSynthetic} 标记；严禁用于模型面过滤</b>。
+     * CC 真源实证：唯一 UI 用途是 {@code shouldShowUserMessage}（messages.ts:5115，
+     * {@code if (message.isVisibleInTranscriptOnly && !isTranscriptMode) return false}，调用点
+     * Messages.tsx:559）；另有 VirtualMessageList.tsx:156 / MessageSelector.tsx:800 的展示分支，
+     * 以及 SDK 事件标记（QueryEngine.ts:590、utils/messages/mappers.ts:155、queryHelpers.ts:165/232
+     * 的 {@code isSynthetic: msg.isMeta || msg.isVisibleInTranscriptOnly}）与
+     * bridgeMessaging.ts:195 的 running 状态抑制。<b>它从不参与模型请求的裁剪</b>——auto compact
+     * 摘要（compact.ts:643-650）同时带 {@code isCompactSummary=true} + {@code isVisibleInTranscriptOnly=true}，
+     * 却<b>必须发给模型</b>。若误按本标志过滤模型面，compact 摘要会被剔除 → 模型丢失全部历史摘要。
+     *
+     * <p>V70 落库为 {@code is_visible_in_transcript_only} 列（同 V51 is_meta 范式）。写侧摘要 user 消息
+     * （compact 无 kept 段时 CC 走该标志）经 MessageService 落库；读侧 toDto 回填。null/旧行 = false。
+     */
+    private Boolean isVisibleInTranscriptOnly;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -228,4 +274,10 @@ public class MessageRecord {
     public void setIsMeta(Boolean isMeta) { this.isMeta = isMeta; }
     public String getQueuedOrigin() { return queuedOrigin; }
     public void setQueuedOrigin(String queuedOrigin) { this.queuedOrigin = queuedOrigin; }
+    public Long getSeq() { return seq; }
+    public void setSeq(Long seq) { this.seq = seq; }
+    public Boolean getIsCompactSummary() { return isCompactSummary; }
+    public void setIsCompactSummary(Boolean isCompactSummary) { this.isCompactSummary = isCompactSummary; }
+    public Boolean getIsVisibleInTranscriptOnly() { return isVisibleInTranscriptOnly; }
+    public void setIsVisibleInTranscriptOnly(Boolean isVisibleInTranscriptOnly) { this.isVisibleInTranscriptOnly = isVisibleInTranscriptOnly; }
 }

@@ -118,6 +118,29 @@ class CompactBoundaryMessageCcTest {
     }
 
     @Test
+    @DisplayName("[雪花 id] 边界 id 取雪花数字串 + 每实例唯一 + id == record.uuid（单一来源，锚点可反查）")
+    void boundaryIdIsSnowflakeUniqueAndSingleSourced() {
+        // WHY（CLAUDE.md 规则九）：boundary id 有两条硬要求，任一破坏都会静默出错：
+        //   ① **每实例唯一** —— 旧实现用固定常量 id，第 2 次 compact 会退化成 UPDATE 同一行
+        //      （preTokens/messagesSummarized 永不刷新），partial `from` 方向还会出现「两条同 id boundary」；
+        //   ② **与 record.uuid 同源** —— uuid 同时是 preservedSegment.anchorUuid
+        //      （PartialCompactConversation:529/532），锚点必须能被 DB 行 id 反查；此前二者各自随机、互不相等。
+        //   id 本身不承载语义（判别依据恒为 subtype，messages.ts:4608），故只锁「唯一 + 同源 + 数字串形态」。
+        CompactBoundaryMessage b1 = CompactBoundaryMessage.createCompactBoundaryMessage(
+            "auto", 100, null, null, null);
+        CompactBoundaryMessage b2 = CompactBoundaryMessage.createCompactBoundaryMessage(
+            "auto", 100, null, null, null);
+
+        assertThat(b1.uuid()).as("雪花取号 → 纯数字串").matches("\\d+");
+        assertThat(b1.uuid()).as("两次创建的边界 id 必须互不相同（RED：改回固定常量 → 此处红）")
+            .isNotEqualTo(b2.uuid());
+        assertThat(b1.toChatMessageDto().id())
+            .as("DB 行 id 与 record.uuid 同源（RED：toChatMessageDto 另生成 id → 此处红）")
+            .isEqualTo(b1.uuid());
+        assertThat(b1.toChatMessageDto().subtype()).as("判别依据仍是 subtype").isEqualTo(SUBTYPE_COMPACT);
+    }
+
+    @Test
     @DisplayName("序列化: microcompact_boundary 的 toChatMessageDto 携带 microcompact subtype")
     void microcompactBoundarySerializesSubtype() {
         CompactBoundaryMessage boundary = CompactBoundaryMessage.createMicrocompactBoundaryMessage(

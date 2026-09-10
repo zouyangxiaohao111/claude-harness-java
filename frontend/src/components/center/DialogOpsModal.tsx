@@ -10,9 +10,21 @@ interface Props {
   onClose: () => void
 }
 
-/** 参与 pivot 选择的消息：仅用户消息（对齐回合边界语义，2026-08-24）+ 非元消息（isMeta 续写提示不展示） */
+/** 参与 pivot 选择的消息：仅用户消息（对齐回合边界语义，2026-08-24）+ 非元消息（isMeta 续写提示不展示）
+ *
+ *  <p>WHY 排除 compact 摘要与 transcript-only：这两类是压缩产物的展示载体、不是真实回合边界 ——
+ *  CC 对同一用途的「可选消息」列表显式排除二者（{@code MessageSelector.tsx:796-801}：
+ *  {@code if (message.isCompactSummary || message.isVisibleInTranscriptOnly) return false}，
+ *  判据来源 {@code services/compact/compact.ts:648 / 1068} 打标处）。选中它们做 from/up_to 切片
+ *  会切出无意义的边界（pivot 落在摘要消息上时，「摘要之前/之后的对话」语义不成立）。 */
 function pivotList(messages: ChatMessageDto[]): ChatMessageDto[] {
-  return messages.filter((m) => !m.isMeta && m.role === 'user')
+  return messages.filter(
+    (m) =>
+      !m.isMeta &&
+      m.role === 'user' &&
+      m.isCompactSummary !== true &&
+      m.isVisibleInTranscriptOnly !== true,
+  )
 }
 
 /** 列表项单行预览（折叠空白 + 截断） */

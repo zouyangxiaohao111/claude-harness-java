@@ -48,7 +48,7 @@ public class ExportController {
         log.info("[ExportController] export sessionId={} format={}", sessionId, format);
         SessionDto session = sessionService.getById(sessionId);
         List<MessageRecord> messages = messageMapper.selectListByQuery(
-                QueryWrapper.create().eq("session_id", sessionId).orderBy("created_at"));
+                QueryWrapper.create().eq("session_id", sessionId).orderBy("seq"));   // [seq 排序键] 位置序
         String body = renderMarkdown(session, messages);
         return ResponseEntity.ok()
                 .header("Content-Disposition", "attachment; filename=\"" + sessionId + "." + format + "\"")
@@ -60,7 +60,7 @@ public class ExportController {
         log.info("[ExportController] copy sessionId={}", sessionId);
         SessionDto session = sessionService.getById(sessionId);
         List<MessageRecord> messages = messageMapper.selectListByQuery(
-                QueryWrapper.create().eq("session_id", sessionId).orderBy("created_at"));
+                QueryWrapper.create().eq("session_id", sessionId).orderBy("seq"));   // [seq 排序键] 位置序
         String md = renderMarkdown(session, messages);
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("sessionId", sessionId);

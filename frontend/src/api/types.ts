@@ -790,14 +790,18 @@ export interface ToolCallDto {
   result: string | null
   isError: boolean | null
 }
-/** 压缩边界元数据（compact_boundary / microcompact_boundary 消息携带 · 后端透传） */
+/** 压缩边界元数据（compact_boundary / microcompact_boundary 消息携带 · 后端透传）
+ *
+ *  <p>[死字段清理] 原声明的 `postTokens` / `summary` 已删：后端
+ *  `CompactBoundaryMessage.toCompactMetadataMap` 从不 put 这两个 key（CC 的 compactMetadata
+ *  也没有它们），前端读点结构上永取不到值。压缩摘要正文改由轨迹视图经「边界↔摘要配对」
+ *  （`utils/compactPairing.ts`）读取。 */
 export interface CompactBoundaryMetadata {
-  /** 压缩前 tokens（「已压缩 · 对话历史已总结 · 122k→42k」展示用） */
+  /** 压缩前 tokens（CC original: compactMetadata.preTokens） */
   preTokens?: number | null
-  /** 压缩后 tokens */
-  postTokens?: number | null
-  /** 压缩摘要（可选 · 仅 tooltip 悬停展示） */
-  summary?: string | null
+  /** IMP2-14 · 被总结的消息条数（CC original: compactMetadata.messagesSummarized）
+   *  （后端 CompactBoundaryMessage.toCompactMetadataMap 有值才 put → 可能缺省） */
+  messagesSummarized?: number | null
   [key: string]: unknown
 }
 /** snip 裁剪边界元数据（snip_boundary 消息携带 · 后端透传） */
@@ -825,6 +829,15 @@ export interface ChatMessageDto {
   assistantMessageId: string | null
   subtype: string | null
   isMeta: boolean
+  /** IMP2-14 · compact 摘要 user 消息标记（CC original: isCompactSummary, messages.ts:465/480）：
+   *  true = 该 user 消息是 compact 摘要正文（后端 CompactConversation.buildCompactSummaryMessage 产出，
+   *  轨迹视图用它作为「已压缩」标记行的摘要详情来源）。可选：本地乐观构造的消息不带该字段。 */
+  isCompactSummary?: boolean
+  /** IMP2-14 · 「仅 transcript 可见」标记（CC original: isVisibleInTranscriptOnly, messages.ts:464/479）：
+   *  true = 该消息仅在 UI/transcript 展示（shouldShowUserMessage, messages.ts:5115）并带 SDK isSynthetic
+   *  事件标记；**严禁据此做模型面过滤** —— auto compact 摘要（compact.ts:643-650）带该标志但必须发给模型。
+   *  后端 V70 is_visible_in_transcript_only 列读回；可选：本地乐观构造的消息不带该字段。 */
+  isVisibleInTranscriptOnly?: boolean
   isApiErrorMessage: boolean
   apiError: string | null
   error: string | null

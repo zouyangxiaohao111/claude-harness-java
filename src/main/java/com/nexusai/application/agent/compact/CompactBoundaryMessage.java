@@ -11,7 +11,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
+
 
 /**
  * 压缩边界标记消息 · 对齐 CC createCompactBoundaryMessage() / createMicrocompactBoundaryMessage()
@@ -30,6 +30,8 @@ import java.util.UUID;
  *   <tr><td>isMeta</td><td>isMeta: false</td><td>messages.ts:4536</td></tr>
  *   <tr><td>timestamp</td><td>timestamp: ISO string</td><td>messages.ts:4535</td></tr>
  *   <tr><td>uuid</td><td>uuid: randomUUID()</td><td>messages.ts:4538</td></tr>
+ *   <tr><td colspan="3">⚠️ 差异：本仓 uuid 取 hutool 雪花（{@link #newBoundaryId()}）而非 randomUUID ——
+ *       二者唯一行为等价（该 id 不参与判别/解析，仅需每实例唯一），选雪花为与仓内 seq/id 策略统一。</td></tr>
  *   <tr><td>level</td><td>level: 'info'</td><td>messages.ts:4547</td></tr>
  *   <tr><td>compactMetadata</td><td>compactMetadata{trigger, preTokens, userContext, messagesSummarized}</td><td>messages.ts:4540-4546</td></tr>
  *   <tr><td>microcompactMetadata</td><td>microcompactMetadata{trigger, preTokens, tokensSaved, compactedToolIds, clearedAttachmentUUIDs}</td><td>messages.ts:4567-4574</td></tr>
@@ -49,7 +51,8 @@ public record CompactBoundaryMessage(
     boolean isMeta,
     /** CC original: timestamp (messages.ts:4535) · 创建时间（ISO，Java 侧 OffsetDateTime） */
     OffsetDateTime timestamp,
-    /** CC original: uuid (messages.ts:4538) · randomUUID() */
+    /** CC original: uuid (messages.ts:4538) · 本仓取 hutool 雪花（{@link #newBoundaryId()}，唯一性等价）；
+     *  同时充当 DB 行 id（{@link #toChatMessageDto()}）与 preservedSegment.anchorUuid —— 单一来源可反查 */
     String uuid,
     /** CC original: level (messages.ts:4547) · 'info' */
     String level,
@@ -76,6 +79,22 @@ public record CompactBoundaryMessage(
 
     /** 边界消息的角色固定为 system（CC type: 'system'，messages.ts:4534） */
     private static final Role BOUNDARY_ROLE = Role.system;
+
+    /**
+     * 边界 id 取号 · hutool 雪花（与 {@code MessageService.nextSeq} 同源）。
+     *
+     * <p><b>WHY 雪花而非 CC 的 {@code randomUUID()}（messages.ts:4538）</b>：本 id 不承载任何语义
+     * ——判别依据恒为 {@code subtype}（messages.ts:4608，见类头 JavaDoc 与 {@link #toChatMessageDto()}），
+     * 全仓无任何解析/前缀匹配点（grep 已验）。唯一硬要求 = <b>每个边界实例互不相同</b>
+     * （旧的固定常量会让第 2 次 compact 退化成 UPDATE 同一行）。雪花满足该要求，且与仓内 seq/id 策略统一。
+     *
+     * <p><b>单一边界一个 id</b>：本 id 同时充当 message 链锚点（{@code uuid} 字段 → preservedSegment.anchorUuid，
+     * {@code PartialCompactConversation:529/532}）与 DB 行 id（{@code toChatMessageDto().id()}），
+     * 二者同源 → 锚点可被 id 反查（此前二者各自随机、互不相等）。
+     */
+    private static String newBoundaryId() {
+        return String.valueOf(cn.hutool.core.util.IdUtil.getSnowflakeNextId());
+    }
 
     /**
      * compact_boundary 元数据 · 对齐 CC {@code compactMetadata{trigger, preTokens, userContext,
@@ -153,7 +172,7 @@ public record CompactBoundaryMessage(
             CONTENT_COMPACTED,
             false,
             OffsetDateTime.now(),
-            UUID.randomUUID().toString(),
+            newBoundaryId(),
             LEVEL_INFO,
             new CompactMetadata(trigger, preTokens, userContext, messagesSummarized),
             null,
@@ -185,7 +204,7 @@ public record CompactBoundaryMessage(
             CONTENT_MICROCOMPACTED,
             false,
             OffsetDateTime.now(),
-            UUID.randomUUID().toString(),
+            newBoundaryId(),
             LEVEL_INFO,
             null,
             new MicrocompactMetadata(trigger, preTokens, tokensSaved, toolIds, attUuids),
@@ -262,7 +281,14 @@ public record CompactBoundaryMessage(
      */
     public ChatMessageDto toChatMessageDto() {
         ChatMessageDto dto = new ChatMessageDto(
-            "compact-boundary-" + subtype,
+            // [SM/compact 对齐 CC] 每次边界产出**唯一** id（旧的固定常量 '{@code compact-boundary-<subtype>}'
+            //   必须去掉：固定 id 会让「每次 compact 新增 boundary 行」退化为 UPDATE 同一行（元数据陈旧），
+            //   并在 partial from 方向产生「两条同 id boundary」（messagesToKeep 旧 boundary + 新 boundary）。
+            //   唯一 id 后每次 compact 都是全新的 boundary 行（append-only），元数据恒新鲜。
+            // [雪花 id + 单一来源 2026-09-10 用户拍板] 直接复用本 record 的 {@code uuid}（工厂经
+            //   {@link #newBoundaryId()} 取雪花），不再另生成一个 —— DB 行 id == preservedSegment.anchorUuid
+            //   同源，锚点可被 id 反查（此前二者各自随机 → 互不相等）。
+            uuid,
             null,                         // sessionId（由调用方设置）
             BOUNDARY_ROLE,
             "system",                     // author

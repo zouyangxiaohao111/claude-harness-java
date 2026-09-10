@@ -458,7 +458,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             m.isMeta() && Role.user == m.role()
                 && ("<system-reminder>\n" + SnipCompactor.SNIP_NUDGE_TEXT + "\n</system-reminder>")
                     .equals(m.content())))
-            .as("B5 d-2: state.messages()=61 保留全量（snip 不再持久化删除，仍 ≥30）→ 必须注入 isMeta user nudge（CC messages.ts:4148-4161 wrapInSystemReminder）")
+            .as("[snip-nudge-count] 判据=模型可见消息: state 61 条 → snip 投影(剔除 u0..u9)后可见 51 条仍 ≥30 → 必须注入 isMeta user nudge（对齐 CCB query.ts:1894 messagesForQuery 投影后计数 + CC messages.ts:4148-4161 wrapInSystemReminder）")
             .isTrue();
     }
 
@@ -506,6 +506,38 @@ class LlmAgentLoopSnipMicroWiringTest {
         assertThat(sent.stream().anyMatch(m ->
             m.isMeta() && SnipCompactor.SNIP_NUDGE_TEXT.equals(m.content())))
             .as("消息 10 条 < 30 → shouldNudgeForSnips=false，不注入 nudge（snipCompact.ts:163-165）")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("nudge 判据对齐 CCB: snip 大幅剔除后模型可见 <阈值 → 不注入（state 全量仍 ≥阈值 · CCB query.ts:1894）")
+    void nudgeAfterLargeSnip_skipsWhenVisibleBelowThreshold() {
+        // WHY: [snip-nudge-count 修复] CCB 真源 query.ts:1894 nudge 判据 = messagesForQuery(已 snip 投影)
+        //   .concat(assistantMessages, toolResults) —— 数「模型可见」消息；Java 旧判据数 state.messages()
+        //   全量（B5 d-2 起 snip 只做请求级投影、state 保留被 snip 消息不删）→ 模型越 snip 判据不降、
+        //   达阈值后每轮重复注入 nudge（用户实测「一直提示」缺陷）。
+        //   本测试构造 state=31 条（30 "hi" user u0..u29 + boundary removedUuids=u0..u19）≥ 阈值 30 →
+        //   旧判据会注入；但 snip 投影后模型可见 = boundary+u20..u29 = 11 条 < 30 → 新判据（对齐 CCB）
+        //   必须不注入。RED teeth: 判据改回 state.messages() → 本测试 fail。
+        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
+        List<ChatMessageDto> msgs = new ArrayList<>(largeMessages(30));
+        msgs.add(snipBoundary("snip-boundary-nudge", removedUuids(0, 20)));
+        for (ChatMessageDto m : msgs) {
+            state.appendMessage(m);
+        }
+        List<List<ChatMessageDto>> histories = new ArrayList<>();
+        LlmProviderFactory factory = capturingProviderFactory(histories);
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null, snipOnFlags());
+        LoopResult result = drive(ctx, state);
+
+        assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
+        assertThat(histories).isNotEmpty();
+        List<ChatMessageDto> sent = histories.get(histories.size() - 1);
+        assertThat(sent.stream().anyMatch(m ->
+            m.isMeta() && Role.user == m.role()
+                && ("<system-reminder>\n" + SnipCompactor.SNIP_NUDGE_TEXT + "\n</system-reminder>")
+                    .equals(m.content())))
+            .as("snip 剔除 u0..u19 后模型可见 11 条 < 阈值 30（state 全量 31 仍 ≥30）→ 不注入 nudge（对齐 CCB query.ts:1894 投影后计数）")
             .isFalse();
     }
 

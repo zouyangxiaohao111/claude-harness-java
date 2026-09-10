@@ -74,7 +74,7 @@ class PartialCompactApiTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(sessionMessages);
-        when(messageService.replaceSessionMessages(anyString(), anyList()))
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
         when(summary.summarize(anyString(), anyList()))

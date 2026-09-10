@@ -32,11 +32,14 @@ import java.time.OffsetDateTime;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * [reasoningDurationMs] 实时落库 + STOMP 收口 + transcript 双轨测试 · 净新增（非 CC 对齐）。
@@ -236,6 +239,12 @@ class ChatServiceReplayPersistReasoningDurationTest {
         //   注意实时化时序：addInjectedQueuedMessage 必须先于 append（user 分支在 append 时点反查）。
         AgentState state = new AgentState("sys");
         state.addInjectedQueuedMessage("msg-queued-1", "忙时追问");
+        // [created_at 单调分配器] 生产链路 created_at 由 MessageService.nextCreatedAt 取号（本测试
+        //   messageService 为 mock → 缺省返回 null 会走 baseTs 回落分支，测不到新路径）→ 打桩为
+        //   严格递增序列，使断言锁死「分配器取号 → DB created_at 单调」这条真实生产语义。
+        java.util.concurrent.atomic.AtomicLong allocSeq = new java.util.concurrent.atomic.AtomicLong();
+        when(messageService.nextCreatedAt(anyString()))
+            .thenAnswer(inv -> OffsetDateTime.now().plusNanos(allocSeq.incrementAndGet()));
 
         // WHEN: 生产链路实时落库——逐条 append（queued-user 走 4 参单调重载原位落库）
         armAndAppend(state, "msg-user",
@@ -256,11 +265,13 @@ class ChatServiceReplayPersistReasoningDurationTest {
         verify(messageMapper, times(3)).insert(captor.capture());
         OffsetDateTime tsAssistantA = OffsetDateTime.parse(captor.getAllValues().get(0).getCreatedAt());
         OffsetDateTime tsAssistantB = OffsetDateTime.parse(captor.getAllValues().get(2).getCreatedAt());
-        // queued-user 走 6 参重载（实时原位落库单调时间戳 + queuedOrigin 透传；[P0-1] 本测试 2 参
-        //   addInjectedQueuedMessage 登记 → origin null，与现状等价不标记）
+        // queued-user 走 8 参重载（实时原位落库单调时间戳 + queuedOrigin 透传 + [OD-D13] imagePasteIds/
+        //   userAttachments 落自身行；本测试 2 参 addInjectedQueuedMessage 登记 → origin null 不标记）
+        //   ⚠️ 断言口径同步：该调用点在 HEAD 已是 8 参（旧断言仍按 6 参 verify → 基线红，非本批引入）。
         ArgumentCaptor<OffsetDateTime> tsCaptor = ArgumentCaptor.forClass(OffsetDateTime.class);
         verify(messageService).createQueuedUserMessage(
-            eq(SESSION), eq("msg-queued-1"), eq("忙时追问"), tsCaptor.capture(), eq(false), isNull());
+            eq(SESSION), eq("msg-queued-1"), eq("忙时追问"), tsCaptor.capture(), eq(false), isNull(),
+            anyList(), isNull());
         OffsetDateTime tsQueuedUser = tsCaptor.getValue();
 
         assertThat(tsQueuedUser)

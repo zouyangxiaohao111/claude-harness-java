@@ -130,7 +130,15 @@ class CompactConversationTest {
         List<ChatMessageDto> built = CompactionResult.buildPostCompactMessages(result);
         List<String> ids = built.stream().map(ChatMessageDto::id).toList();
         // boundary → summary → keep1 → keep2 → attachments → hookResults
-        assertThat(ids).containsExactly("compact-boundary-compact_boundary", "sum", "keep1", "keep2", "att", "hook");
+        // [SM/compact 对齐 CC] boundary id 每次取雪花（唯一）——去掉旧固定常量 id：每次 compact 都是
+        // 全新 boundary 行（元数据恒新鲜），不再 UPDATE 同一行。id 不承载语义，**判别依据恒为 subtype**
+        // （messages.ts:4608），故不再断言 id 前缀。
+        assertThat(ids).hasSize(6);
+        assertThat(built.get(0).subtype())
+            .as("boundary 在首位（判别依据 = subtype，非 id 前缀）")
+            .isEqualTo("compact_boundary");
+        assertThat(ids.get(0)).as("boundary id 非空（雪花取号）").isNotBlank();
+        assertThat(ids.subList(1, 6)).containsExactly("sum", "keep1", "keep2", "att", "hook");
         // L4 尾段不丢: messagesToKeep 完整保留（OD-04）
         assertThat(built).hasSize(6);
     }

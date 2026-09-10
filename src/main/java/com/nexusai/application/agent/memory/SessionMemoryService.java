@@ -21,6 +21,7 @@ import com.nexusai.application.agent.compact.Tokens;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
+import com.nexusai.application.agent.compact.fork.ForkRawMaterial;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
 import com.nexusai.application.agent.config.MemoryRemoteModeConfig;
@@ -767,7 +768,13 @@ public class SessionMemoryService {
                     mergeSystemPrompt(supplied.systemPrompt(), sessionSystemPrompt(psContext)),
                     mergeContext(supplied.userContext(), psContext.userContext()),
                     mergeContext(supplied.systemContext(), psContext.systemContext()),
-                    supplied.toolUseContext(),   // 生产 supplier 携带真实工具集（保留，buildProductionCacheSafeParams 唯一有效载荷）
+                    // [SM-fork 模型直传 2026-09-10] fork 上下文 = supplier 工具集 + 会话模型：
+                    //   仅传 supplied.toolUseContext() 会丢会话模型（8 参构造 effectiveModelName=null）
+                    //   → ProductionForkedQuery 直传分支取不到模型 → provider 回落 MockLlmProvider
+                    //   （假回复/永不 Edit，summary.md 冻结）。CC 真源：createCacheSafeParams(context)
+                    //   的 toolUseContext 同时带 options.tools 与 options.mainLoopModel
+                    //   （forkedAgent.ts:131-141 + sessionMemory.ts:411-418）。
+                    ForkRawMaterial.forkToolUseContext(supplied.toolUseContext(), psContext.toolUseContext()),
                     messages,
                     // [RES-C5 rework] gate 合并：生产 supplier 5 参便捷构造 gate=false（占位），
                     //   会话级 gate（GlobalCacheScope 单实现 · betas.ts:227-233）与 supplier 值
@@ -902,7 +909,8 @@ public class SessionMemoryService {
                     mergeSystemPrompt(supplied.systemPrompt(), manualSystemPrompt),
                     mergeContext(supplied.userContext(), Map.of()),
                     mergeContext(supplied.systemContext(), Map.of()),
-                    supplied.toolUseContext(), messages,
+                    // [SM-fork 模型直传 2026-09-10] 同 extract 路径：补齐会话模型（同源 toolUseContext）
+                    ForkRawMaterial.forkToolUseContext(supplied.toolUseContext(), toolUseContext), messages,
                     // [RES-C5 rework] gate 合并同 extractSessionMemory：生产 supplier 5 参便捷构造
                     //   gate=false 占位，与会话级 gate（GlobalCacheScope 单实现）OR 合并（REQ-C5-4）
                     supplied.useGlobalCacheScope() || useGlobalCacheScopeSupplier.get())

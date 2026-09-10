@@ -2017,16 +2017,20 @@ public record AgentLoopContext(
      * assistant(tool_calls) → tool(tool_result) → user(newMessages)。无 newMessages 的工具
      * （多数）取到空 List，本方法 no-op。
      *
-     * <p><b>落盘通道</b>: 直接 {@code state.messages().addAll}（与旧 {@code ToolResultApplier.apply}
-     * 时期一致 —— newMessages 不经 {@code appendMessage} 监听器；tool_result 消息本身才走
-     * appendMessage）。行为差异仅<b>顺序</b>后移，跨 turn 持久/next-turn 投影（SnipTool boundary）
-     * 语义不变。
+     * <p><b>落盘通道（[snip-boundary-persist] 定向分流）</b>: 逐条经
+     * {@link #appendFlushedNewMessage} —— {@code snip_boundary} 走 {@code state.appendMessage}
+     * （触 appendListener → {@code ChatService.persistAppendedMessage} 落 DB + STOMP，对齐 CC
+     * {@code /force-snip} 的 {@code setMessages} 追加 → {@code recordTranscript}）；其余 newMessages
+     * 维持 [fix-toolcalls-400 C] 旁路（{@code appendSilently} 不触监听器）。顺序仍为
+     * assistant(tool_calls) → tool(tool_result) → newMessages，逐条 add 与 addAll 等价。
      */
     private static void flushNewMessagesAfterToolResult(AgentState state, String toolUseId, String toolName) {
         if (state == null || toolUseId == null) return;
         List<com.nexusai.model.session.dto.ChatMessageDto> pending = state.takeNewMessages(toolUseId);
         if (pending != null && !pending.isEmpty()) {
-            state.messages().addAll(pending);
+            for (com.nexusai.model.session.dto.ChatMessageDto m : pending) {
+                appendFlushedNewMessage(state, m);
+            }
             if (log.isDebugEnabled()) {
                 log.debug("TOOL newMessages flush after tool_result: toolName={} id={} count={} · CC toolExecution.ts:1478 addToolResult 先 / :1566 newMessages 后",
                     toolName, abbreviate(toolUseId, 24), pending.size());
@@ -2041,6 +2045,10 @@ public record AgentLoopContext(
      * <p>WHY: 即使个别工具没有对应 tool_result 配对，其 newMessages 也不能跨 turn 泄漏在暂存 map
      * 里；统一追加到末尾仍满足「newMessages 不夹在 assistant(tool_calls) 与 tool_result 之间」
      * 的 provider 顺序约束（此时 tool_result 已全部落地）。map 迭代序无依赖 —— 仅取剩余集合追加。
+     *
+     * <p><b>落盘通道</b>: 与 {@link #flushNewMessagesAfterToolResult} <b>同批</b>逐条经
+     * {@link #appendFlushedNewMessage} 定向分流（snip_boundary → appendMessage 落库；其余 → 旁路）。
+     * 两处必须同改，否则 abort / 配对缺口路径仍漏 boundary。
      */
     private static void drainLeftoverNewMessages(AgentState state) {
         if (state == null) return;
@@ -2054,10 +2062,43 @@ public record AgentLoopContext(
             if (msgs != null) leftovers.addAll(msgs);
         }
         if (!leftovers.isEmpty()) {
-            state.messages().addAll(leftovers);
+            for (com.nexusai.model.session.dto.ChatMessageDto m : leftovers) {
+                appendFlushedNewMessage(state, m);
+            }
             if (log.isDebugEnabled()) {
                 log.debug("TOOL newMessages leftover drain (无 tool_result 配对): count={}", leftovers.size());
             }
+        }
+    }
+
+    /**
+     * [snip-boundary-persist] flush/drain 落盘通道分流 · 对齐 CC 边界消息的「消息存储追加」语义。
+     *
+     * <p><b>WHY</b>: 工具 {@code newMessages} 有 7 个生产者，其中多数（Read pdf 页图 / SkillTool
+     * 指令 / hook 普通消息 / permission retry isMeta user 消息等）按 [fix-toolcalls-400 C] 约定
+     * 只进 {@code state.messages()} 不上落盘通道；但 {@code snip_boundary} 是例外 —— CC
+     * {@code /force-snip} 命令直接 {@code setMessages(prev => [...prev, boundary])}
+     * （commands/force-snip.ts:42），boundary 属「消息存储追加」，必被 {@code recordTranscript}
+     * 写盘（sessionStorage.ts:2003-2010 自述：不落盘 → resume 立即 PTL）。nexusai 等价物 =
+     * {@code state.appendMessage}（触 {@code appendListener} = 生产
+     * {@code ChatService.persistAppendedMessage} 的 snip 分支 → DB 行 + MessageBoundaryEvent）。
+     *
+     * <p>故按 {@code role==system && subtype==snip_boundary} <b>定向</b>分流，而非整通道切
+     * {@code appendMessage}：后者会让其余 6 个生产者在子代理运行中开始写侧链 transcript + 推父流
+     * （{@code SubagentExecutor} 的 appendListener 对任意 role 无条件消费），超出本缺陷范围。
+     *
+     * @param state 当前 AgentState
+     * @param m     待追加消息（可能 null，防御性跳过）
+     */
+    private static void appendFlushedNewMessage(AgentState state,
+            com.nexusai.model.session.dto.ChatMessageDto m) {
+        if (m == null) return;
+        if (m.role() == Role.system && SnipCompactor.SUBTYPE_SNIP_BOUNDARY.equals(m.subtype())) {
+            // boundary：消息存储追加（触监听器 → persistAppendedMessage 落库 + STOMP）
+            state.appendMessage(m);
+        } else {
+            // 其余 newMessages：维持既有旁路（顺序追加，不触监听器）
+            state.appendSilently(m);
         }
     }
 

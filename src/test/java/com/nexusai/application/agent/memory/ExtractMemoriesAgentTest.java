@@ -773,7 +773,8 @@ class ExtractMemoriesAgentTest {
             List.of("MAIN-SYSTEM-PROMPT-1", "MAIN-SYSTEM-PROMPT-2"),
             Map.of("claudeMd", "项目指令"),
             Map.of("gitStatus", "GIT-BLOCK"),
-            messages);
+            messages,
+            null);   // [SM-fork 模型直传] 本测试只验原料合并（模型维度单测见 forkRawMaterial_carriesSessionModel）
 
         agent.setExtractionGate(() -> true);
         agent.setAutoMemoryEnabled(() -> true);
@@ -813,7 +814,7 @@ class ExtractMemoriesAgentTest {
         List<ChatMessageDto> messages = List.of(userMsg("m1", "a"), userMsg("m2", "b"));
         ForkRawMaterial raw = new ForkRawMaterial(
             List.of("MAIN-SYSTEM-PROMPT"), Map.of("claudeMd", "x"),
-            Map.of("gitStatus", "y"), messages);
+            Map.of("gitStatus", "y"), messages, null);
 
         agent.setExtractionGate(() -> true);
         agent.setAutoMemoryEnabled(() -> true);
@@ -825,6 +826,40 @@ class ExtractMemoriesAgentTest {
         assertThat(q.systemPrompt()).containsExactly("REAL-ASSEMBLED-PROMPT");
         assertThat(q.userContext()).containsEntry("userKey", "userVal");
         assertThat(q.systemContext()).containsEntry("sysKey", "sysVal");
+    }
+
+    @Test
+    @DisplayName("[SM-fork 模型直传 2026-09-10] extract fork 的 toolUseContext 携带 ForkRawMaterial 会话模型（修 MockLlmProvider 恒落）")
+    void forkRawMaterial_carriesSessionModel() {
+        // WHY (规则九): 生产事故 —— extract/dream fork 恒落 MockLlmProvider（假回复/永不 Write 记忆）。
+        //   根因：生产 supplier 的 toolUseContext 由 buildProductionCacheSafeParams 8 参构造 →
+        //   effectiveModelName 恒 null → ProductionForkedQuery「会话模型直传」(:239-256) 取不到模型
+        //   → 回落全局 supplier（settings.json 无 model → model=null → ProviderConfig.empty() → Mock）。
+        //   CC 真源：createCacheSafeParams(context) 的 toolUseContext 同时带 options.tools 与
+        //   options.mainLoopModel（forkedAgent.ts:131-141）——会话模型随 ForkRawMaterial 从
+        //   LlmAgentLoop 捕获点（state.currentModel()）透传，fork 前合并进 toolUseContext。
+        MemoryStorage storage = new MemoryStorage(tempDir);
+        ExtractMemoriesAgent agent = new ExtractMemoriesAgent(storage);
+        RecordingQuery query = new RecordingQuery();
+        agent.setForkedQuery(query);
+        agent.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+            List.of(), Map.of(), Map.of(), ctx(), List.of(), false));
+        List<ChatMessageDto> messages = List.of(userMsg("m1", "a"), userMsg("m2", "b"));
+        ForkRawMaterial raw = new ForkRawMaterial(
+            List.of("MAIN-SYSTEM-PROMPT"), Map.of(), Map.of(), messages,
+            "deepseek/deepseek-v4.1-flash-expires-on-0910");
+
+        agent.setExtractionGate(() -> true);
+        agent.setAutoMemoryEnabled(() -> true);
+        agent.executeExtractMemories(messages, null, raw);
+        agent.drainPendingExtraction(5000);
+
+        RunForkedAgent.ForkQueryParams q = query.lastParams();
+        assertThat(q).isNotNull();
+        assertThat(q.toolUseContext().effectiveModelName())
+            .as("fork toolUseContext 必须带会话模型（= CC toolUseContext.options.mainLoopModel）——"
+                + "否则 provider 回落 MockLlmProvider（永不 Write 记忆）")
+            .isEqualTo("deepseek/deepseek-v4.1-flash-expires-on-0910");
     }
 
     @Test

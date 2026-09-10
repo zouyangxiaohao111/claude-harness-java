@@ -99,7 +99,7 @@ public class ResumeService {
      * {@code projectPath: firstMessage.cwd} —— /resume 与 session 列表用首条消息的 cwd 作
      * projectPath（V22/G13 已落 messages 表 cwd 列）。Java 端 {@code ResumeService} 恢复
      * {@code SessionCwdHolder} 需要读主会话首条消息 cwd：经本 mapper
-     * （{@code eq("session_id", sessionId).orderBy("created_at", true).limit(1)}）取链首
+     * （{@code eq("session_id", sessionId).orderBy("seq", true).limit(1)}）取链首
      * （CC firstMessage = chain[0]）。
      *
      * <p>setter 注入（沿用本类既有风格）：plain JUnit 缺省 null → 目录恢复跳过（软降级，
@@ -510,7 +510,7 @@ public class ResumeService {
      * {@code MessageService.createUserMessage/appendMessage/replaceSessionMessages + ChatService
      * newAssistantMessage/newToolMessage} 经 {@code CwdResolution.getCwd(sessionId)} 戳入，见
      * {@code MessageRecord.cwd}）。本方法经 {@link #messageMapper} 读主会话首条消息
-     * （{@code eq("session_id", sessionId).orderBy("created_at", true).limit(1)}，CC firstMessage =
+     * （{@code eq("session_id", sessionId).orderBy("seq", true).limit(1)}，CC firstMessage =
      * chain[0]）取 cwd。mapper 未注入（plain JUnit）/ 查询异常 → 软降级跳过（CC 旧 jsonl 无 cwd
      * 字段容错，V22 列可空）。
      *
@@ -533,7 +533,7 @@ public class ResumeService {
             // 首条消息 = 链首（CC firstMessage = chain[0]，sessionStorage.ts:2522/4680）
             List<MessageRecord> rows = messageMapper.selectListByQuery(
                 QueryWrapper.create().eq("session_id", sessionKey)
-                    .orderBy("created_at", true).limit(1));
+                    .orderBy("seq", true).limit(1));   // [seq 排序键] 位置序（链首 = seq 最小）
             if (rows == null || rows.isEmpty()) {
                 if (log.isDebugEnabled()) {
                     log.debug("[ResumeService] resume 目录恢复跳过: 会话无消息（无链首）"

@@ -391,15 +391,13 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
   // [toolsum-display] tool_use_summary 展示行（作者 attachment + subtype=tool_use_summary · 后端落库 /
   //   /topic/tasks 实时 · 不进模型上下文）→ 渲染独立置灰窄行，非用户气泡/不进输入历史
   const isToolUseSummary = msg.author === 'attachment' && msg.subtype === 'tool_use_summary'
-  // 边界标签文案（中文）：compact 有 compactMetadata.preTokens/postTokens 时追加 token 数（122k→42k）；
-  //   snip 有 removedUuids 时说明移除条数
+  // 边界标签文案（中文）：snip 有 removedUuids 时说明移除条数
+  //   [死展示点清理] 原先 compact 分支还拼过「· 122k→42k」后缀 + 悬停显示 compactMetadata.summary，
+  //   但后端 `CompactBoundaryMessage.toCompactMetadataMap` **从不 put** postTokens/summary 这两个 key
+  //   （CC 的 compactMetadata 本身也没有它们）→ 该后缀与 tooltip 结构上永不出现。已删。
+  //   压缩摘要正文改由轨迹视图经「边界↔摘要配对」读取（`utils/compactPairing.ts`）。
   const boundaryLabel = (() => {
-    if (isCompactBoundary) {
-      const m = msg.compactMetadata
-      const pre = m?.preTokens != null && m.preTokens > 0 ? compactNumber(m.preTokens) : null
-      const post = m?.postTokens != null && m.postTokens > 0 ? compactNumber(m.postTokens) : null
-      return `已压缩 · 对话历史已总结${pre != null && post != null ? ` · ${pre}→${post}` : ''}`
-    }
+    if (isCompactBoundary) return '已压缩 · 对话历史已总结'
     if (isMicrocompactBoundary) return '已清理 · 旧工具输出已清除'
     if (isSnipBoundary) {
       const n = msg.snipMetadata?.removedUuids?.length ?? 0
@@ -407,8 +405,6 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
     }
     return ''
   })()
-  // 边界消息悬停提示：compact 携带 summary 时显示压缩摘要
-  const boundaryTitle = isCompactBoundary ? (msg.compactMetadata?.summary ?? undefined) : undefined
   const deletable = isUser || msg.role === 'assistant'
   // FNT-SUB-01/07：author 带真实身份（非 nexus）→ 判定为子代理消息，作者区显示子代理名 + 颜色点徽标
   const isSubagent = msg.role === 'assistant' && msg.author != null && msg.author !== '' && msg.author !== 'nexus'
@@ -458,7 +454,7 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
     return (
       <div className="msg boundary">
         <div className="boundary-note">
-          <span className="boundary-label" title={boundaryTitle}>{boundaryLabel}</span>
+          <span className="boundary-label">{boundaryLabel}</span>
         </div>
       </div>
     )
@@ -772,6 +768,14 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     }
     for (const m of messages) {
       if (m.role === 'tool') continue
+      // [transcript-only] 仅 transcript 可见的 user 消息不进普通对话流（CC original:
+      //   utils/messages.ts:5098-5115 shouldShowUserMessage —— 首行 `if (message.type !== 'user') return true`
+      //   使该判据只作用于 user 消息；调用点 components/Messages.tsx:559 主列表过滤）。
+      //   TraceView 不过滤（轨迹 tab 需要展示）。
+      //   位置：与下方 isMeta 分支是两条互不交叉的 continue（本分支无任何豁免），先后顺序不影响结果集；
+      //   保持在 isMeta 之前 = 维持既有「先按显式标志剔除」的读法，也不会遮蔽紧随其后的 tool_use_summary 放行分支。
+      //   compact 摘要（kept 段为空）由后端打此标记（PartialCompactConversation.buildSummaryMessage）。
+      if (m.role === 'user' && m.isVisibleInTranscriptOnly === true) continue
       // 放行 tool_use_summary 展示行（isMeta=true 但 author=attachment/subtype=tool_use_summary）——
       //   默认 isMeta 跳过会把它吞掉（渲染分支见 Message 组件 isToolUseSummary）
       if (m.isMeta && !(m.author === 'attachment' && m.subtype === 'tool_use_summary')) continue

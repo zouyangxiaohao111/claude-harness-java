@@ -1673,6 +1673,32 @@ public class AgentState {
     }
 
     /**
+     * [snip-boundary-persist] 静默追加消息 · <b>不</b>触 {@link #appendListener}。
+     *
+     * <p>与 {@link #appendMessage} 的唯一差异 = 是否通知监听器；两处均只做 {@code messages.add(m)}。
+     * 存在的意义是把「落盘通道语义」显式化：{@code appendMessage} 是「消息存储追加」通道
+     * （对齐 CC transcript 的 {@code recordTranscript} —— 生产上 {@link #appendListener} 有<b>两个</b>
+     * 实现体：主循环/定时任务的 {@code ChatService.persistAppendedMessage}（逐条写 DB + STOMP），
+     * 以及子代理的 {@code SubagentExecutor}（写侧链转录 + 推父流）），而工具 {@code newMessages}
+     * 中的多数生产者（Read pdf 页图 / SkillTool 指令 / hook 普通消息 / permission retry 等 isMeta
+     * user 消息）按既有约定<b>不进</b>消息存储（旁路语义，[fix-toolcalls-400 C]），必须显式走本方法。
+     *
+     * <p><b>与 appendMessage 的差异（务必分清）</b>：
+     * <ul>
+     *   <li>{@code appendMessage}：追加 + 触监听器 → 走实时落库/转录通道。snip_boundary 用此（对齐 CC
+     *       {@code /force-snip} 的 {@code setMessages(prev => [...prev, boundary])}，命令产物是消息存储追加）。</li>
+     *   <li>{@code appendSilently}：仅追加不触监听器 → 保持既有旁路。其余 newMessages 生产者用此。</li>
+     * </ul>
+     *
+     * <p>调用点见 {@code AgentLoopContext.appendFlushedNewMessage}（按 subtype 定向分流）。
+     *
+     * @param m 待追加消息（非 null）
+     */
+    public void appendSilently(ChatMessageDto m) {
+        this.messages.add(m);
+    }
+
+    /**
      * [S4-1] 逐消息 append 监听器 · CC original: {@code for await (const message of query(...))}
      * (runAgent.ts:748-806) 的逐消息 yield 语义 —— 父 Agent 必须实时观测子 Agent 产出。
      *
@@ -1705,6 +1731,76 @@ public class AgentState {
     public void clearAppendListener() {
         this.appendListener = null;
     }
+
+    /**
+     * 逐条 append 实时落库是否已武装（{@link #appendListener} 非 null）。
+     *
+     * <p><b>WHY</b>：调用方需据「append 是否即落库」决定能否安全执行「先删旧再插新」的覆盖式写
+     * （LlmAgentLoop §14 SessionStart hook_additional_context）：已武装 → appendMessage 即落库，
+     * 删旧后必有新份；未武装（fork 子 agent / 非 Spring 单测）→ 必须自己补落库或干脆不删 DB 旧行，
+     * 否则「删了旧、新份没落库」= DB 丢份。
+     *
+     * @return true = {@link #setAppendListener} 已武装（append 即落库）
+     */
+    public boolean isAppendPersistenceArmed() {
+        return this.appendListener != null;
+    }
+
+    /**
+     * [SM/compact 对齐 CC] 压缩落库监听器 · 入参 = post-compact 消息集，返回 = 落库归一化后的消息集。
+     *
+     * <p><b>WHY</b>：CC compact 把内存 messages 换成 {@code boundary + summary + messagesToKeep}
+     * （compact.ts:330-338 buildPostCompactMessages → REPL setMessages），nexusai 的 compact 在
+     * {@code LlmAgentLoop.loop()}（static 方法，无 MessageService 引用）内完成，只能经 state 回调把
+     * 「压缩结果落库」这一持久化动作交回持有 DB 通道的装配层（ChatService.armRealTimePersist /
+     * armPersistenceListeners 武装，与 {@link #appendListener} 同一武装点）。旧行为只改内存不落库 →
+     * 每 run 从 DB 恢复全量 → 反复自动压缩。
+     *
+     * <p><b>落库语义 = append-only</b>（对齐 CC transcript append-only：sessionStorage.ts
+     * {@code recordTranscript}/{@code insertMessageChain} 只追加）：{@code MessageService.appendPostCompactMessages}
+     * 只追加新行 + 把 kept 段 created_at 重挂到 boundary 之后，<b>不删任何旧行</b>。故签名返回归一化列表
+     * （id 保持 + sessionId 落定），内存须用同一份以与 DB id 对齐。
+     *
+     * <p><b>未武装语义</b>（fork 子 agent / 测试 / 非 Spring）：{@link #persistCompactedMessages} 原样返回
+     * 入参，调用方照常替换内存 → 零行为变化（子 agent 不落主库）。
+     *
+     * <p><b>local-only 约束</b>: {@code @JsonIgnore} —— 与 {@link #appendListener} / {@link #budgetTracker}
+     * 同属 local-only 状态，绝不序列化到 outbound DTO / STOMP / WebSocket / EventPublisher payload。
+     */
+    @JsonIgnore
+    private volatile java.util.function.UnaryOperator<List<ChatMessageDto>> compactPersistListener = null;
+
+    /**
+     * 武装压缩落库监听 · 见 {@link #compactPersistListener} 字段 JavaDoc。
+     *
+     * @param listener 入参 post-compact 消息集 → 返回落库归一化后的消息集；null 解除
+     */
+    public void setCompactPersistListener(java.util.function.UnaryOperator<List<ChatMessageDto>> listener) {
+        this.compactPersistListener = listener;
+    }
+
+    /** 解除压缩落库监听（run 收口必调，防泄漏跨 run 复用陈旧 PersistCtx）。 */
+    public void clearCompactPersistListener() {
+        this.compactPersistListener = null;
+    }
+
+    /**
+     * 压缩结果落库 · 对齐 CC transcript append-only（compact 后 DB 追加 boundary/summary + 重挂 kept 段）。
+     *
+     * <p>已武装 → 经监听器 append-only 落库并返回归一化列表（调用方据此替换内存，保证 memory 与 DB id
+     * 一致）；未武装 / 入参 null → 原样返回（fork 子 agent、非 Spring 单测零行为变化）。异常不吞：由调用方
+     * （LlmAgentLoop.persistCompactedMessages）fail-loud（log.error）兜底替换内存。
+     *
+     * @param postCompactMessages compact 后消息集（boundary + summary + kept + attachments + hooks）
+     * @return 落库归一化后的消息集；未武装 → 原入参
+     */
+    public List<ChatMessageDto> persistCompactedMessages(List<ChatMessageDto> postCompactMessages) {
+        java.util.function.UnaryOperator<List<ChatMessageDto>> listener = this.compactPersistListener;
+        if (listener == null || postCompactMessages == null) {
+            return postCompactMessages;
+        }
+        return listener.apply(postCompactMessages);
+    }
     /** s01 [P2] 修补新增 · 对齐 CC createAttachmentMessage。
      *  [Session H5] 改 public · StreamingToolExecutor (tool 子包) 跨包注入 hook attachment,
      *  与既有 public mutator setHasInterruptibleToolInProgress 规范一致. */
@@ -1736,6 +1832,16 @@ public class AgentState {
             log.debug("[P1-6-READ-1] removeAttachmentsByType: type={} removed={}/{}",
                 type, before - attachments.size(), before);
         }
+    }
+
+    /** 从 messages 移除指定 subtype 的消息（如 hook_additional_context 覆盖式注入前清内存旧份）· 返回移除条数。 */
+    public int removeMessagesBySubtype(String subtype) {
+        if (subtype == null || subtype.isBlank()) {
+            return 0;
+        }
+        int before = messages.size();
+        messages.removeIf(m -> m != null && subtype.equals(m.subtype()));
+        return before - messages.size();
     }
 
     /**

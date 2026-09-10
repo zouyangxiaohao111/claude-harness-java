@@ -128,7 +128,7 @@ public record ChatMessageDto(
     Map<String, Object> microcompactMetadata,   // CC original: microcompactMetadata (messages.ts:4567-4574) · microcompact_boundary 元数据；非 boundary 消息 null
     String logicalParentUuid,                   // CC original: logicalParentUuid (messages.ts:4551-4553) · 压缩前最后消息 uuid（仅 compact_boundary，有值才存在）
     boolean isCompactSummary,                   // CC original: isCompactSummary (messages.ts:465/480) · 摘要 user 消息标记
-    boolean isVisibleInTranscriptOnly,          // CC original: isVisibleInTranscriptOnly (messages.ts:464/479) · 仅 transcript 可见（不进模型上下文）
+    boolean isVisibleInTranscriptOnly,          // CC original: isVisibleInTranscriptOnly (messages.ts:464/479) · 仅 UI/transcript 展示 + SDK isSynthetic 标记；严禁用于模型面过滤（compact 摘要带该标志但必须发给模型，messages.ts:5115 / compact.ts:643-650）
     // [DEC-04 R2-USAGE] usage 数据源闭环 · CC original: message.usage (agentToolUtils.ts:238-256,
     //   finalizeAgentTool :355 直接透传 lastAssistantMessage.message.usage)
     // WHY: Java 旧 ChatMessageDto 仅 inputTokens/outputTokens 2 字段恒 null (provider 未解析),
@@ -828,6 +828,15 @@ public record ChatMessageDto(
      * {@code msg.withUsage(usage).withUsageCache(cacheRead, cacheCreation)}（LlmAgentLoop
      * toMessage 即按此顺序，:6249-6254）。
      *
+     * <p><b>V70 两标志必须透传（不得硬编码 false）</b>：本方法重建 record 时
+     * {@code compactMetadata}/{@code microcompactMetadata}/{@code logicalParentUuid}/
+     * {@code isCompactSummary}/{@code isVisibleInTranscriptOnly} 一律取 {@code this.xxx()}。
+     * WHY: 这些字段是 compact 摘要消息的「可观察性标记」，一旦被 withUsage 重置为
+     * null/false，DB 落库与 transcript 投影都会丢失摘要身份（isCompactSummary=false →
+     * TraceView compactSummaryAfter 断裂；isVisibleInTranscriptOnly=false → 前端把摘要
+     * 误当普通消息渲染）。当前 compact 摘要 token 恒 null（usage 空 → withUsage 提前 return
+     * {@code this}），所以暂未爆；但该前提无人钉住，硬编码 false 是把「暂不触发」当「不会触发」。
+     *
      * @param usage CC original: message.usage（agentToolUtils.ts:238-256）；null = 保持原值
      * @return 与原 record 全字段相同、仅 usage + inputTokens/outputTokens 投影覆盖的新实例
      */
@@ -843,7 +852,8 @@ public record ChatMessageDto(
             sourceToolUseID, subtype,
             isApiErrorMessage, apiError, error, errorDetails,
             null, null,
-            null, null, null, false, false,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
@@ -908,6 +918,76 @@ public record ChatMessageDto(
     public ChatMessageDto withCwd(String cwd) {
         return new ChatMessageDto(
             id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
+     * 拷贝方法：覆盖 compact 摘要标记 · 镜像 CC spread {@code {...m, isCompactSummary}} 语义
+     * （CC original: isCompactSummary, messages.ts:465/480）。
+     *
+     * <p><b>WHY</b>：写侧落库 round-trip 保真 —— {@code MessageService.appendMessage} /
+     * {@code replaceSessionMessages} 的写后回传 DTO 经兼容构造器会重置
+     * isCompactSummary/isVisibleInTranscriptOnly（默认 false），需显式回填以保真
+     * （TraceView 的 compactSummaryAfter 依赖 {@code isCompactSummary===true}）。
+     *
+     * @param newIsCompactSummary CC original: isCompactSummary（messages.ts:465/480）
+     * @return 与原 record 全字段相同、仅 isCompactSummary 覆盖的新实例
+     */
+    public ChatMessageDto withIsCompactSummary(boolean newIsCompactSummary) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            newIsCompactSummary, isVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
+     * 拷贝方法：覆盖「仅 transcript 可见」标记 · 镜像 CC spread {@code {...m, isVisibleInTranscriptOnly}}
+     * 语义（CC original: isVisibleInTranscriptOnly, messages.ts:464/479）。
+     *
+     * @param newIsVisibleInTranscriptOnly CC original: isVisibleInTranscriptOnly（messages.ts:464/479）
+     * @return 与原 record 全字段相同、仅 isVisibleInTranscriptOnly 覆盖的新实例
+     */
+    public ChatMessageDto withIsVisibleInTranscriptOnly(boolean newIsVisibleInTranscriptOnly) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, newIsVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
+     * 拷贝方法：覆盖会话归属 sessionId · 镜像 CC spread {@code {...m, sessionId}} 语义。
+     *
+     * <p><b>WHY</b>：compact 产出的新消息（{@code CompactBoundaryMessage.toChatMessageDto()} sessionId=null；
+     * {@code CompactConversation.buildCompactSummaryMessage} sessionId=null）在内存流里 sessionId 为空，
+     * 但落 DB（messages.session_id NOT NULL）必须有值。append-only 落库路径
+     * （{@code MessageService.appendPostCompactMessages}）复用 {@code appendMessage(dto, createdAt)} 的完整
+     * DTO→Record 映射，而后者按 {@code dto.sessionId()} 写列 → 调用前必须先把 sessionId 落定。
+     *
+     * @param newSessionId 目标会话 ID（DB 键，如 "sess-xxx"）
+     * @return 与原 record 全字段相同、仅 sessionId 覆盖的新实例
+     */
+    public ChatMessageDto withSessionId(String newSessionId) {
+        return new ChatMessageDto(
+            id, newSessionId, role, author, content, reasoning, toolCalls, finishReason,
             inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
             acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
             sourceToolUseID, subtype,

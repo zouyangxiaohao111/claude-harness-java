@@ -277,7 +277,7 @@ class AlignComp1ResumeRestorePartialInjectTest {
             StreamCompactSummary summary = mock(StreamCompactSummary.class);
             // partialCompact 走 listForResume（续聊加载历史通道，S1 中断语义漏斗）——mock 该调用
             when(messageService.listForResume(anyString())).thenReturn(fourMessages(sessSessionId));
-            when(messageService.replaceSessionMessages(anyString(), anyList()))
+            when(messageService.appendPostCompactMessages(anyString(), anyList()))
                 .thenAnswer(inv -> inv.getArgument(1));
             // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）
             when(summary.summarize(anyString(), anyList()))

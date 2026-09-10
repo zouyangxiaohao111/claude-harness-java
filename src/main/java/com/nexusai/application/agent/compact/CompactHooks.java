@@ -180,12 +180,19 @@ public final class CompactHooks {
         // △-5 · CC original: createAttachmentMessage({type:'hook_additional_context',
         //   content: additionalContexts, hookName:'SessionStart', toolUseID:'SessionStart',
         //   hookEvent:'SessionStart'})（sessionStart.ts:163-172）——追加到 hookMessages 尾部
+        // [SM/compact 对齐 CC] 行形状与 LlmAgentLoop §14（SessionStart cold 注入）完全一致：content 包
+        //   <system-reminder>\nSessionStart hook additional context: ...\n</system-reminder> + isMeta=true
+        //   （对齐 CC messages.ts:4117-4127 wrapInSystemReminder + createUserMessage({isMeta:true})）。
+        //   旧形状（裸拼接 + isMeta=false）会让模型把技能说明当用户贴的内容；且两处形状不一致 →
+        //   同一 subtype 两类消息，前端/恢复侧判别分裂。
         if (!additionalContexts.isEmpty()) {
             hookMessages.add(new ChatMessageDto(
                 UUID.randomUUID().toString(), ctx.getSessionId(), Role.user, "hook",
-                String.join("\n", additionalContexts), null, List.of(), FinishReason.stop,
+                "<system-reminder>\nSessionStart hook additional context: "
+                    + String.join("\n", additionalContexts) + "\n</system-reminder>",
+                null, List.of(), FinishReason.stop,
                 null, null, "刚刚", OffsetDateTime.now(), null, null, null,
-                List.of(), List.of(), null, false, false,
+                List.of(), List.of(), null, true, false,
                 null, "hook_additional_context"));
             if (log.isDebugEnabled()) {
                 log.debug("[CompactHooks] SessionStart hooks (compact) additionalContext: {} 段（hook_additional_context 追加到 hookMessages 尾部）",

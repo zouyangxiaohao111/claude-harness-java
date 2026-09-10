@@ -931,6 +931,8 @@ public class CronIdleExecutor {
                 // [实时落库] run 返回后收口：解除 appendListener（防泄漏 / 下轮误触发）——恒在 runState 非 null
                 //   时执行（未武装时 listener 恒 null，clear 无害），对齐主会话 processUserMessage 收口语义。
                 runState.clearAppendListener();
+                // [SM/compact 对齐 CC] 同步解除压缩落库监听（armRealTimePersist 同点武装，防泄漏下轮）
+                runState.clearCompactPersistListener();
             }
             if (runState != null && chatService != null
                     && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)) {

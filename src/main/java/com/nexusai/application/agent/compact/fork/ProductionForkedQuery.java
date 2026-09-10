@@ -105,6 +105,14 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
     private final java.util.function.Function<String, ForkModelRoute> sessionModelRouteResolver;
 
     /**
+     * [fork 模型直传] 「会话模型缺失」告警去重（每 querySource 一次）—— 缺失时 fork 只能回落
+     * 全局 supplier（settings 无 model → Mock 假回复）；首次 warn 显式暴露，后续 debug，
+     * 避免高频 fork（每轮 compact / 每轮提取）刷屏。
+     */
+    private final java.util.Set<String> sessionModelMissingWarned =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
      * 会话模型直传的路由结果。
      *
      * @param model         SDK 发送名（裸名，去 provider 前缀）
@@ -251,6 +259,23 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                 } else {
                     log.warn("[ProductionForkedQuery] fork 会话模型路由失败(sessionModel={})，回落全局 supplier",
                         sessionModel);
+                }
+            } else {
+                // [fail-loud 规则十二 2026-09-10] 会话模型缺失（forkCtx.effectiveModelName 空）→
+                //   直传分支静默跳过，只能回落全局 supplier。此前无任何日志 → SM/extract/dream
+                //   fork 落 MockLlmProvider（假回复/永不 Edit）时排障需逐行读代码。此处每
+                //   querySource warn 一次（去重字段），显式指出调用方需补 effectiveModelName。
+                String qs = String.valueOf(params.querySource());
+                if (sessionModelMissingWarned.add(qs)) {
+                    log.warn("[ProductionForkedQuery] fork 上下文 effectiveModelName 为空（querySource={}）→ "
+                            + "会话模型直传跳过，回落全局 supplier(model={})。若随后 provider=MockLlmProvider，"
+                            + "根因即此处：调用方须把会话模型写入 CacheSafeParams.toolUseContext"
+                            + ".effectiveModelName（= CC toolUseContext.options.mainLoopModel）",
+                        qs, model);
+                } else if (log.isDebugEnabled()) {
+                    log.debug("[ProductionForkedQuery] fork 会话模型仍为空（querySource={}），继续回落全局 supplier: "
+                        + "model={} provider={}", qs, model,
+                        provider != null ? provider.getClass().getSimpleName() : "null");
                 }
             }
         }

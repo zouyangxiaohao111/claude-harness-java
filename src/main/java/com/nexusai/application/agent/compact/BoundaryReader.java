@@ -34,8 +34,17 @@ import java.util.Set;
  * 本组件按已入库真源 {@code Open-ClaudeCode/src/services/compact/snipProjection.ts} 完整实现
  * isSnipBoundaryMessage + projectSnippedView（此前 TODO[OD-01] 悬空，vendored snapshot 缺
  * snipProjection.js —— 2026-08-18 真源已取回，投影从「引用方语义」升级为「真源实现」）。
- * HISTORY_SNIP 门经 {@link #setFeatureFlags} 静态槽位注入（MicroCompactor/StreamCompactSummary
- * 先例），默认 ALL_DISABLED → flag 关时投影恒 no-op，既有单参调用方零行为变化。
+ * HISTORY_SNIP 门经 {@link #setFeatureFlags} 静态槽位注入 —— <b>唯一生产写入点 =
+ * {@code ToolRegistrationConfig.microCompactor} @Bean</b>（ToolRegistrationConfig.java:964，
+ * 与 {@link #setSettingsResolver} 同点，Spring 启动执行一次、早于任何请求；MicroCompactor/
+ * StreamCompactSummary 先例），默认 ALL_DISABLED → flag 关时投影恒 no-op，既有单参调用方零行为变化。
+ *
+ * <p><b>[D4 双门源合并] 门公式单一来源</b>: {@link #isHistorySnipEnabled(CompactSettingsResolver,
+ * FeatureFlags)} 为唯一纯函数实现；{@code LlmAgentLoop} snip 步骤（门①）与本组件静态槽读侧（门②）
+ * 均委托它 → DB {@code settings.history_snip_enabled} 为 NULL 时两门同回落到 FeatureFlags，
+ * 不再分叉（分叉 = 入口剥离面不剔除被 snip 删除的消息 → 泄漏进 {@code :4738} 的
+ * {@code state.replaceMessages} 前缀与 4 处静态调用面的模型输入；<b>不含</b>主循环请求面 ——
+ * 请求面由门① 的 snip 步骤 {@code messagesForQuery} 独立剔除，见 LlmAgentLoop:5010-5018）。
  */
 public final class BoundaryReader {
 
@@ -54,6 +63,10 @@ public final class BoundaryReader {
      * setter，IMP2-01 先例）：getMessagesAfterCompactBoundary 为静态纯函数，生产 bean 无
      * FeatureFlags 注入面，以静态槽位承载门控；默认 {@code ALL_DISABLED}（historySnip=false）
      * → snip 投影恒 no-op（CC flag-off 等价）。
+     *
+     * <p><b>[D4 双门源合并] 唯一生产写入点</b>: {@code ToolRegistrationConfig.microCompactor}
+     * @Bean（ToolRegistrationConfig.java:964）调用 {@link #setFeatureFlags}——此前本槽生产零调用方
+     * （恒 ALL_DISABLED = 死槽），DB 列 NULL 时门② 与门① 分叉。
      */
     private static volatile com.nexusai.application.agent.loop.FeatureFlags featureFlags =
         com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED;
@@ -68,7 +81,11 @@ public final class BoundaryReader {
     private static volatile com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver;
 
     /**
-     * [2026-08-18] 测试注入 feature 门（对齐 {@link MicroCompactor#setFeatureFlags} 先例）。
+     * [2026-08-18] 注入 feature 门（对齐 {@link MicroCompactor#setFeatureFlags} 先例）。
+     *
+     * <p><b>[D4 双门源合并] 唯一生产写入点</b>: {@code ToolRegistrationConfig.microCompactor}
+     * @Bean（ToolRegistrationConfig.java:964，与 {@link #setSettingsResolver} 相邻），Spring 启动
+     * 执行一次。此前该槽生产零调用方（恒 {@code ALL_DISABLED}）——DB 列 NULL 时门② 与门① 分叉。
      *
      * @param flags feature 门（null → 回退 ALL_DISABLED，对齐 flag-off）
      */
@@ -96,19 +113,38 @@ public final class BoundaryReader {
     }
 
     /**
-     * HISTORY_SNIP 门 DB-aware 解析 · [V52 X1-3] 供读侧 snip 投影门控。
+     * HISTORY_SNIP 门公式 · <b>[D4 双门源合并] 全仓唯一纯函数实现</b>（CC {@code feature('HISTORY_SNIP')}，
+     * query.ts:115/401 + messages.ts:4648 读侧门控）。
      *
-     * <p>DB {@code settings.history_snip_enabled} 有值覆盖 {@link #featureFlags}.historySnip()
-     * （null 回落 FeatureFlags，零行为变化）。
+     * <p>门①（{@code LlmAgentLoop} snip 步骤）与门②（本组件静态槽读侧 / 5 处静态调用面）均委托本方法：
+     * DB {@code settings.history_snip_enabled} 有值（非 null）即覆盖并返回；null → 回落
+     * {@code flags.historySnip()}（零行为变化）。resolver <b>每次调用实时读 DB</b>，绝不缓存进静态槽
+     * （前端 PUT /api/v1/settings 后下一轮即生效）。
+     *
+     * @param resolver 压缩配置实时读源（可 null = 未接线 → 直接回落 flags）
+     * @param flags    feature 门（可 null → 视作全关，对齐 flag-off）
+     * @return true = HISTORY_SNIP 开启（含 DB 覆盖）
+     */
+    public static boolean isHistorySnipEnabled(CompactSettingsResolver resolver,
+                                               com.nexusai.application.agent.loop.FeatureFlags flags) {
+        Boolean dbSnip = resolver != null ? resolver.historySnipEnabled() : null;
+        if (dbSnip != null) {
+            return dbSnip;
+        }
+        return flags != null && flags.historySnip();
+    }
+
+    /**
+     * HISTORY_SNIP 门 DB-aware 解析 · [V52 X1-3] 供读侧 snip 投影门控（:207）。
+     *
+     * <p>[D4 双门源合并] 无参重载委托 {@link #isHistorySnipEnabled(CompactSettingsResolver,
+     * com.nexusai.application.agent.loop.FeatureFlags)}（输入 = 静态槽 settingsResolver +
+     * 静态槽 featureFlags，后者由 {@code ToolRegistrationConfig.microCompactor} @Bean 写入）。
      *
      * @return true = HISTORY_SNIP 开启（含 DB 覆盖）
      */
     private static boolean isHistorySnipEnabled() {
-        Boolean dbSnip = settingsResolver != null ? settingsResolver.historySnipEnabled() : null;
-        if (dbSnip != null) {
-            return dbSnip;
-        }
-        return featureFlags.historySnip();
+        return isHistorySnipEnabled(settingsResolver, featureFlags);
     }
 
     private BoundaryReader() {

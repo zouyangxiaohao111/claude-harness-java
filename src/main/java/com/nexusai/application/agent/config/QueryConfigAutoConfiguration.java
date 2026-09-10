@@ -17,7 +17,8 @@ import java.util.function.Supplier;
  * <p>对齐 CC query/config.ts:
  * <ul>
  *   <li>streamingToolExecution — Statsig tengu_streaming_tool_execution2</li>
- *   <li>emitToolUseSummaries — env NEXUSAI_EMIT_TOOL_USE_SUMMARIES</li>
+ *   <li>emitToolUseSummaries — env NEXUSAI_EMIT_TOOL_USE_SUMMARIES · <b>默认 false</b>（2026-09-10
+ *       用户拍板反转 W9-01；对齐 CC query/config.ts:36-38 未设 env 即关）</li>
  *   <li>isAnt — env USER_TYPE=ant</li>
  *   <li>fastModeEnabled — <b>恒 false</b>（F3 用户拍板恒关：非 Anthropic 无 fast-mode 服务端；原 CC
  *       CLAUDE_CODE_DISABLE_FAST_MODE fastMode.ts:39 / Java NEXUSAI_DISABLE_FAST_MODE env 路已删除）</li>
@@ -35,9 +36,14 @@ public class QueryConfigAutoConfiguration {
         return QueryConfig.buildQueryConfig(
             "default-session",
             () -> isTruthy(env.getProperty("STREAMING_TOOL_EXECUTION", "true")),
-            // [W9-01 OPD-TS-29] 默认改 true（未设 env 即开启）· CC 默认 env-off，用户拍板 Java 端默认开启
-            //   以便实际接通出站链路（NEXUSAI_EMIT_TOOL_USE_SUMMARIES=true 显式开启 / 显式 "false" 关闭）
-            () -> isTruthy(env.getProperty("NEXUSAI_EMIT_TOOL_USE_SUMMARIES", "true")),
+            // [W9-01 OPD-TS-29 反转 · 2026-09-10 用户拍板] 默认回归 false，严格对齐 CC。
+            //   沿革：W9-01 当时明知「CC 默认 env-off」仍有意把 Java 端默认改成 true，理由=「先实际接通
+            //     出站链路并验证跑通」；该验证目标已达成，故按对齐 CC 铁律回归 false。
+            //   CC 真源：claude-code-best/src/query/config.ts:36-38
+            //     emitToolUseSummaries: isEnvTruthy(process.env.CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES)
+            //     未设该 env 时 isEnvTruthy(undefined) → envUtils.ts:33 `if (!envVar) return false` → **关**。
+            //   需要开启时显式置 env / yml：NEXUSAI_EMIT_TOOL_USE_SUMMARIES=true（"1"/"yes" 亦可）。
+            () -> isTruthy(env.getProperty("NEXUSAI_EMIT_TOOL_USE_SUMMARIES", "false")),
             () -> "ant".equalsIgnoreCase(env.getProperty("USER_TYPE", "")),
             // [F3 用户拍板恒关] 非 Anthropic 无 fast-mode 服务端 → fastModeEnabled 恒 false；
             //   原 NEXUSAI_DISABLE_FAST_MODE env 路删除（CC CLAUDE_CODE_DISABLE_FAST_MODE fastMode.ts:39 无服务端支撑）

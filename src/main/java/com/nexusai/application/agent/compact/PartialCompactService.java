@@ -49,8 +49,8 @@ import java.util.stream.Collectors;
  *       compact.ts:772-1106，算法已完整实现仅缺接线）</li>
  *   <li>按 direction 重组（REPL.tsx:4950-4952：from=[keep,summary]，up_to=[summary,keep]）+
  *       boundary/attachments/hookResults 拼接</li>
- *   <li>写回消息列表（更新会话消息）+ 新 conversationId（对齐 REPL.tsx:4971
- *       {@code setConversationId(randomUUID())}）</li>
+ *   <li>写回消息列表（append-only 追加压缩结果，不删旧行 —— 对齐 CC transcript append-only）
+ *       + 新 conversationId（对齐 REPL.tsx:4971 {@code setConversationId(randomUUID())}）</li>
  *   <li>{@code runPostCompactCleanup}（REPL.tsx:4972，PostCompactCleanup.java:160-163，
  *       非 main-thread）</li>
  * </ol>
@@ -183,7 +183,8 @@ public class PartialCompactService {
             //   assistant 剥离 + 中断 turn "Continue" sentinel 注入）。CC partial compact 消费的
             //   是 deserialize 后的内存消息（loadConversationForResume 已应用中断语义），Java 侧
             //   DB 即 CC 内存列表等价物，压缩输入同样过中断语义漏斗。DB 权威写入不变
-            //   （replaceSessionMessages 写回为压缩后权威列表）。
+            //   （appendPostCompactMessages append-only 写回，见步骤 7；被摘要掉的旧行保留在
+            //   boundary 之前 → 读侧剪枝，与 auto/reactive compact 同一语义）。
             List<ChatMessageDto> messages = messageService.listForResume(sessionId);
 
             // [ALIGN-COMP-1 P1] resume 恢复 invokedSkills / suppress 副作用已迁至通用续跑入口
@@ -242,9 +243,22 @@ public class PartialCompactService {
             log.info("[PartialCompact] 重组: direction={} 压缩后消息 {} 条（boundary→ordered→attachments→hooks）",
                 request.direction(), postCompact.size());
 
-            // ── 7. 写回：替换会话消息 + 新 conversationId（REPL.tsx:4964/4971）──
+            // ── 7. 写回：<b>append-only</b> 追加压缩结果 + 新 conversationId（REPL.tsx:4964/4971）──
+            // [SM/compact 对齐 CC] 由 replaceSessionMessages（删全表 + 换时间基重插）改为
+            //   appendPostCompactMessages（只追加 boundary/summary 新行 + 把 kept 段 created_at 重挂到
+            //   boundary 之后，<b>绝不删除旧行</b>）—— 与 auto/reactive compact 同一条落库语义
+            //   （ChatService.armRealTimePersist 的 compactPersistListener 亦调本方法）。
+            //   WHY（结构同构 + 边界剪枝契约）: partial 的结果集与全量 compact 完全同构
+            //   （CompactionResult.buildPartialPostCompactMessages = boundary → ordered(summary/keep)
+            //   → attachments → hookResults），且本方法步骤 2 已用
+            //   BoundaryReader.getMessagesAfterCompactBoundary 读侧剪枝 —— append-only 正是该读侧契约的
+            //   写入侧对偶（CC transcript 恒 append-only，sessionStorage.ts recordTranscript；compact 只追加
+            //   boundary+summary，加载侧按最后 boundary 剪枝）。旧 replace 路径换时间基后，与实时落库/
+            //   MessageService.nextCreatedAt 单调分配器不同源 → 重插行可能早于会话已有行 → 下轮
+            //   boundary 切片把 kept 段整段丢掉（与 auto compact 修复前同款 HIGH bug）。
+            //   被摘要掉的旧行保留在 DB（boundary 之前 → 模型面剪枝；轨迹可回溯），与 auto compact 一致。
             String newConversationId = UUID.randomUUID().toString();
-            List<ChatMessageDto> normalized = messageService.replaceSessionMessages(sessionId, postCompact);
+            List<ChatMessageDto> normalized = messageService.appendPostCompactMessages(sessionId, postCompact);
             sessionService.updateConversationId(sessionId, newConversationId);
 
             // ── 8. runPostCompactCleanup（REPL.tsx:4972，非 main-thread，querySource=compact）──

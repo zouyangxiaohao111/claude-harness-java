@@ -819,7 +819,12 @@ public class ExtractMemoriesAgent {
                         forkRawMaterial != null ? forkRawMaterial.userContext() : null),
                     ForkRawMaterial.mergeContext(supplied.systemContext(),
                         forkRawMaterial != null ? forkRawMaterial.systemContext() : null),
-                    supplied.toolUseContext(), messages,
+                    // [SM-fork 模型直传 2026-09-10] fork 上下文 = supplier 工具集 + 会话模型
+                    //   （ForkRawMaterial 捕获点透传 · CC createCacheSafeParams(context)
+                    //   forkedAgent.ts:131-141 的 toolUseContext 同时带 options.tools + mainLoopModel）。
+                    //   仅传 supplied.toolUseContext() → effectiveModelName 恒 null → ProductionForkedQuery
+                    //   直传分支取不到模型 → provider 回落 MockLlmProvider（假回复/永不 Write 记忆）。
+                    ForkRawMaterial.forkToolUseContext(supplied.toolUseContext(), forkRawMaterial), messages,
                     // [RES-C5 rework] gate 合并：生产 supplier 5 参便捷构造 gate=false 占位，
                     //   与会话级 gate（GlobalCacheScope 单实现 · betas.ts:227-233）OR 合并（REQ-C5-4）
                     supplied.useGlobalCacheScope() || useGlobalCacheScopeSupplier.get())

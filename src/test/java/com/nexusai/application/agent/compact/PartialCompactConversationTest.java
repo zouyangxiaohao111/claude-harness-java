@@ -147,7 +147,14 @@ class PartialCompactConversationTest {
 
         // from: messagesToKeep = [0,pivot) 过滤 progress → 保留 boundary + u0 + u2
         List<String> keptIds = result.messagesToKeep().stream().map(ChatMessageDto::id).toList();
-        assertThat(keptIds).containsExactly("u0", "compact-boundary-compact_boundary", "u2");
+        // [SM/compact 对齐 CC] boundary id 每次取雪花（唯一）；判别依据恒为 subtype，不断言 id 前缀
+        assertThat(keptIds).hasSize(3);
+        assertThat(keptIds.get(0)).isEqualTo("u0");
+        assertThat(keptIds.get(1)).as("boundary id 非空（雪花取号）").isNotBlank();
+        assertThat(result.messagesToKeep().get(1).subtype())
+            .as("kept 段内的 boundary 以 subtype 判别")
+            .isEqualTo("compact_boundary");
+        assertThat(keptIds.get(2)).isEqualTo("u2");
         // 被摘要段 = [pivot,size) → 1 条（u3）
         assertThat(result.boundaryMarker().compactMetadata().messagesSummarized()).isEqualTo(1);
     }
@@ -521,6 +528,39 @@ class PartialCompactConversationTest {
         assertThat(meta.get("direction")).isEqualTo("up_to");
         // isCompactSummary 判别：subtype=compact_summary
         assertThat(summary.subtype()).isEqualTo(CompactConversation.SUMMARY_SUBTYPE);
+        // [SM/compact 收口] kept 非空 → CC 三元分支走 summarizeMetadata 一支（compact.ts:1069-1073），
+        //   摘要随普通对话流展示 → isVisibleInTranscriptOnly 不得为 true。
+        assertThat(summary.isCompactSummary())
+            .as("partial 摘要恒 isCompactSummary=true（CC compact.ts:1069）").isTrue();
+        assertThat(summary.isVisibleInTranscriptOnly())
+            .as("kept 非空 → 摘要不进 transcript-only（CC compact.ts:1069-1073 仅空 kept 挂该标记）").isFalse();
+    }
+
+    @Test
+    @DisplayName("[SM/compact 收口] keep 为空 → 摘要 isCompactSummary=true + isVisibleInTranscriptOnly=true（CC compact.ts:1073-1077）")
+    void summaryTranscriptOnlyWhenKeepEmpty() {
+        // WHY（CLAUDE.md 规则九 · 测试验证意图）：kept 段为空时 CC 不给摘要挂 summarizeMetadata，
+        //   改挂 isVisibleInTranscriptOnly: true（compact.ts:1073-1077）→ 摘要只进 transcript /
+        //   模型上下文，不在普通对话流展示（前端 MessageList 按该标记过滤）。Java 侧
+        //   summarizeMetadata == null 即 kept 为空（本类 :507-510 构造）——两标记若不落列，
+        //   V70 列恒 false → 前端会把本该隐藏的裸摘要当普通消息渲染。
+        //   RED：buildSummaryMessage 用 21 参构造器（两标志默认 false）→ 本用例两条断言红。
+        List<ChatMessageDto> all = List.of(
+            msg("u0", Role.user, "only 0"),
+            msg("a0", Role.assistant, "asst 0"));
+        CompactConversationContext c = ctx((messages, prompt, preTokens) -> okSummary(), new ArrayList<>());
+        // FROM + pivot=0 → keep=[0,0)=空；summarize=[0,size)=全部（非空 → 不触发空 summarize 抛错）
+        CompactionResult result = PartialCompactConversation.partialCompactConversation(
+            all, 0, c, null, CompactPrompt.Direction.FROM);
+
+        assertThat(result.messagesToKeep()).isEmpty();
+        ChatMessageDto summary = result.summaryMessages().get(0);
+        assertThat(summary.isCompactSummary())
+            .as("partial 摘要恒 isCompactSummary=true（CC compact.ts:1069）").isTrue();
+        assertThat(summary.isVisibleInTranscriptOnly())
+            .as("kept 为空 → transcript-only（CC compact.ts:1073-1077）").isTrue();
+        assertThat(summary.structuredOutput())
+            .as("kept 为空 → CC 三元分支不挂 summarizeMetadata（改挂 transcript-only）").isNull();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -705,8 +745,11 @@ class PartialCompactConversationTest {
             List.of("a1"), List.of("h1"));
         List<ChatMessageDto> postCompact =
             CompactionResult.buildPartialPostCompactMessages(result, CompactPrompt.Direction.FROM);
-        assertThat(postCompact.stream().map(ChatMessageDto::id).toList())
-            .containsExactly("compact-boundary-compact_boundary", "k1", "k2", "s1", "s2", "a1", "h1");
+        // [SM/compact 对齐 CC] boundary id 每次取雪花（唯一）→ 断言「首位 + id 非空」+ 其后固定 id
+        assertThat(postCompact.stream().map(ChatMessageDto::id).toList()).hasSize(7);
+        assertThat(postCompact.get(0).id()).as("boundary id 非空（雪花取号）").isNotBlank();
+        assertThat(postCompact.stream().map(ChatMessageDto::id).toList().subList(1, 7))
+            .containsExactly("k1", "k2", "s1", "s2", "a1", "h1");
         // boundary 结构化消息（subtype=compact_boundary）在首位（REPL.tsx:4952 postCompact[0]）
         assertThat(postCompact.get(0).subtype()).isEqualTo("compact_boundary");
     }
@@ -719,8 +762,11 @@ class PartialCompactConversationTest {
             List.of("a1"), List.of("h1"));
         List<ChatMessageDto> postCompact =
             CompactionResult.buildPartialPostCompactMessages(result, CompactPrompt.Direction.UP_TO);
-        assertThat(postCompact.stream().map(ChatMessageDto::id).toList())
-            .containsExactly("compact-boundary-compact_boundary", "s1", "s2", "k1", "k2", "a1", "h1");
+        assertThat(postCompact.stream().map(ChatMessageDto::id).toList()).hasSize(7);
+        assertThat(postCompact.get(0).id()).as("boundary id 非空（雪花取号）").isNotBlank();
+        assertThat(postCompact.get(0).subtype()).isEqualTo("compact_boundary");
+        assertThat(postCompact.stream().map(ChatMessageDto::id).toList().subList(1, 7))
+            .containsExactly("s1", "s2", "k1", "k2", "a1", "h1");
     }
 
     @Test
@@ -732,8 +778,11 @@ class PartialCompactConversationTest {
             List.of("s1"), List.of("k1"), List.of(), List.of());
         List<ChatMessageDto> postCompact =
             CompactionResult.buildPartialPostCompactMessages(result, null);
-        assertThat(postCompact.stream().map(ChatMessageDto::id).toList())
-            .containsExactly("compact-boundary-compact_boundary", "k1", "s1");
+        assertThat(postCompact.stream().map(ChatMessageDto::id).toList()).hasSize(3);
+        assertThat(postCompact.get(0).id()).as("boundary id 非空（雪花取号）").isNotBlank();
+        assertThat(postCompact.get(0).subtype()).isEqualTo("compact_boundary");
+        assertThat(postCompact.stream().map(ChatMessageDto::id).toList().subList(1, 3))
+            .containsExactly("k1", "s1");
     }
 
     // ════════════════════════════════════════════════════════════════════

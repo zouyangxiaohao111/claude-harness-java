@@ -1061,6 +1061,49 @@ public class LlmAgentLoop implements AgentLoop {
         this.postHistoryPersistEnabler = enabler;
     }
 
+    /**
+     * [SM/compact 对齐 CC] compact 成功后把 post-compact 消息集<b>追加落库 + 替换内存</b>。
+     *
+     * <p><b>落库语义 = append-only</b>（对齐 CC transcript append-only：sessionStorage.ts
+     * {@code recordTranscript}/{@code insertMessageChain} 只追加新消息，旧行保留；compact 只追加
+     * boundary + summary，加载/请求侧按最后一个 boundary 剪枝）。经
+     * {@link AgentState#persistCompactedMessages}（已武装 → MessageService.appendPostCompactMessages
+     * 追加新行 + 把 kept 段 created_at 重挂到 boundary 之后，<b>不删旧行</b>）落库，再用返回的归一化列表
+     * 覆盖内存 state，保证 memory 与 DB id 一致。
+     *
+     * <p><b>失败 fail-loud（log.error）</b>：落库失败 → 内存仍替换为 post-compact 视图（本 run 请求面
+     * 用压缩后视图，不阻断主循环），但 DB 仍是压缩前全量 → 下轮 run 从 DB 恢复全量后<b>会再次触发自动压缩</b>
+     * （重复压缩 = 显式失败，不是静默降级），必须从日志可见。
+     *
+     * <p><b>WHY 经 state 回调而不直接调 MessageService</b>：本方法所在 {@code loop(...)} 是 static 方法
+     * （H7-arch 静态化，无 LlmAgentLoop 实例 / 无 messageService 字段引用），持久化通道只能由装配层
+     * （ChatService.armRealTimePersist / armPersistenceListeners / CronIdleExecutor 同一武装点）经
+     * AgentState 监听器交回；未武装（fork 子 agent / 非 Spring 单测）时 persistCompactedMessages 原样返回
+     * → 仅替换内存，零行为变化。
+     *
+     * @param state              当前 AgentState（sessionId 取 DB 归属）
+     * @param postCompactMessages compact 后消息集（boundary + summary + kept + attachments + hooks）
+     */
+    private static void persistCompactedMessages(AgentState state, List<ChatMessageDto> postCompactMessages) {
+        if (state == null || postCompactMessages == null) {
+            return;
+        }
+        String sid = state.sessionId();
+        try {
+            List<ChatMessageDto> normalized = state.persistCompactedMessages(postCompactMessages);
+            state.replaceMessages(normalized != null ? normalized : postCompactMessages);
+            if (log.isInfoEnabled()) {
+                log.info("[compact-persist] compact 结果已 append-only 落库（不删旧行）: session={} 条数={}",
+                    sid, state.messages().size());
+            }
+        } catch (Exception e) {
+            // fail-loud（规则十二）：未落库 → 下轮 run 从 DB 恢复压缩前全量 → 会重复压缩（显式失败，非静默）
+            log.error("[compact-persist] compact 结果落库失败（内存已替换为压缩后视图；DB 未落 → 下轮会重复压缩）:"
+                + " session={} err={}", sid, e.toString(), e);
+            state.replaceMessages(postCompactMessages);
+        }
+    }
+
     // ── [H7-arch Phase 5 P4] 三项 feature-gated 能力 setter（手动注入）──
 
     /** P4 C4-C6：设置 feature flags（默认全关）。 */
@@ -2748,20 +2791,23 @@ public class LlmAgentLoop implements AgentLoop {
                     //   watchPaths()，additionalContexts()（List<String>，CC sessionStart.ts:145-149 收集）
                     //   静默丢弃（探查 Gap）。Java 对齐样例 CompactHooks.executeSessionStartHooks
                     //   （CompactHooks.java:183-194）：Role.user + author=hook + subtype=hook_additional_context
-                    //   + isMeta=false 一次性 appendMessage 进对话历史（非 attachment 常驻重渲染，避免
+                    //   + isMeta=true（content 包 <system-reminder>，对齐 CC messages.ts:4117-4127）一次性
+                    //   appendMessage 进对话历史（非 attachment 常驻重渲染，避免
                     //   maybeInjectHookAttachments 每轮重复渲染成 isMeta 消息）。
                     java.util.List<String> startAdditionalContexts = startResult.additionalContexts();
-                    // [C 级 2026-09-07 · V1 定案] 注入去重「存在即跳过」（独立于冷/热判据）：cold 跑 hook 后，
-                    //   仅当恢复历史无 hook_additional_context 副本才注入 1 份并落库（P0-1）；恢复历史已含
-                    //   副本（A 级后落库的会话 / 后端重启后补跑）→ 只跑副作用（watchPaths 等）不重注入。
-                    //   判据 = 此刻 state.messages()（§14 前仅恢复历史被 append —— 用户消息 append 在队列
-                    //   drain、skill 恢复均在 §14 后）anyMatch hook_additional_context。恢复 09-01 版
-                    //   anyMatch 守卫（A 级前注入不落库 → 每轮 miss 失效；B 级误删 —— B 假设「进块前提历史
-                    //   空」不再成立：cold 判据下重启后老会话同样进本块且恢复历史非空）。字节稳定来源：注入
-                    //   只在 cold 边界执行一次，副本随恢复历史跨 run 固定重放；动态 hook 变更只在 clear/compact
-                    //   冷边界刷新（CommandController remove / CompactHooks 独立重插，见下）。
-                    boolean restoredHistoryHasHookCopy = state.messages().stream().anyMatch(m -> m != null
-                        && Role.user == m.role() && "hook_additional_context".equals(m.subtype()));
+                    // [C 级 2026-09-07] 覆盖式注入「先插后删」：cold 跑 hook 后注入 1 份新份、再删其它旧份
+                    //   —— 恒 1 条。CC 原语义 = hook_additional_context 不落 transcript（sessionStorage.ts
+                    //   isLoggableMessage 过滤，仅 CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT 开时放行），
+                    //   nexusai 为「等效开关开」架构（A 级已落库）→ 用覆盖式写抵消 CC-with-flag 的 resume
+                    //   副本翻倍：cold 边界删旧插新，旧实现「存在即跳过」不重注入会让 hook 配置变更后副本
+                    //   永不刷新（且残留多份累积）。动态 hook 变更同样只在 clear/compact 冷边界刷新
+                    //   （CommandController remove / CompactHooks 独立重插，见下）。
+                    //   [SM/compact 对齐 CC · 先插后删不变量] 严格「先插新份，成功后删其它旧份」：
+                    //   任何时刻 DB 中该 subtype 至少 1 条（插入失败则不执行删除 → 旧份仍在，绝不丢份）：
+                    //     ① append 实时落库已武装（state.isAppendPersistenceArmed）→ state.appendMessage 即落库；
+                    //     ② 未武装但 messageService 可用 → 由 ④ 直接补一次 messageService.appendMessage（1 参，
+                    //        走 nextCreatedAt/nextSeq 单调取号，不传 now()）；
+                    //     ③ messageService == null（fork 子 agent / 非 Spring 单测）→ 不删 DB 旧行，仅内存覆盖。
                     if (startAdditionalContexts != null && !startAdditionalContexts.isEmpty()) {
                         java.util.List<String> nonBlankContexts = new java.util.ArrayList<>();
                         for (String ac : startAdditionalContexts) {
@@ -2770,30 +2816,75 @@ public class LlmAgentLoop implements AgentLoop {
                             }
                         }
                         if (!nonBlankContexts.isEmpty()) {
-                            if (restoredHistoryHasHookCopy) {
-                                if (log.isInfoEnabled()) {
-                                    log.info("HOOK SessionStart 恢复历史已含 hook_additional_context 副本 → 跑副作用但不重注入（V1 存在即跳过，防 CC-with-flag 副本翻倍；session={}）",
-                                        sessionStartKey);
+                            // ① 内存旧份删除（必须先于 ③ append 新份 —— 否则会把刚注入的新份一并移除）
+                            int removedMem = state.removeMessagesBySubtype("hook_additional_context");
+                            if (log.isDebugEnabled()) {
+                                log.debug("HOOK SessionStart hook_additional_context 覆盖式注入: 移除内存旧份 {} 条（session={}）",
+                                    removedMem, sessionStartKey);
+                            }
+                            // ③ 注入新份 · [align-CC 2026-09-01] content 包 <system-reminder> + isMeta=true
+                            //   （对齐 CC messages.ts:4117-4127 hook_additional_context：wrapInSystemReminder +
+                            //   createUserMessage({isMeta:true})）——模型识别为「系统注入的技能说明」而非
+                            //   普通用户消息（此前 isMeta=false，模型把技能说明当用户贴的内容，看不到
+                            //   using-zjkycode 等 SessionStart hook 注入的定义）
+                            String wrappedContext = "<system-reminder>\nSessionStart hook additional context: "
+                                + String.join("\n", nonBlankContexts) + "\n</system-reminder>";
+                            ChatMessageDto hookDto = new ChatMessageDto(
+                                UUID.randomUUID().toString(), sessionId, Role.user, "hook",
+                                wrappedContext, null, List.of(),
+                                com.nexusai.model.session.dto.FinishReason.stop,
+                                null, null, "刚刚", java.time.OffsetDateTime.now(), null, null, null,
+                                List.of(), List.of(), null, true, false,
+                                null, "hook_additional_context");
+                            // ③ 先插新份（已武装 → 监听器同步落库该新份）
+                            state.appendMessage(hookDto);
+                            // [先插后删不变量 · 落库成功判据 = DB 真查得到] 不可只信 isAppendPersistenceArmed()
+                            //   —— 它只表示「监听器已挂」，不代表「新份真的写进 DB」：
+                            //   ChatService.persistAppendedMessage 对 hook_additional_context 的 insert 是
+                            //   best-effort（try/catch → 仅 log.warn 不上抛，见 ChatService :1471-1478），
+                            //   insert 失败时 appendMessage 仍正常返回 → 旧代码误判 newPersisted=true →
+                            //   ⑤ 删掉 DB 旧份 ⇒ **新份没入库 + 旧份被删 = DB 0 条**，模型永久丢失技能注入
+                            //   （直到下一次 cold 边界才补回），与该分支自称的「任何时刻 DB 至少 1 条」矛盾。
+                            //   故用 existsById 复核新份是否真的落库（未武装路径由 ④ 的显式 try/catch 判定；
+                            //   子代理通道监听器不写 DB → 恒 false → 保守不删旧份，同样不丢份）。
+                            boolean newPersisted =
+                                messageService != null && messageService.existsById(hookDto.id());
+                            // ④ 未武装 append 实时落库 → 直接补落库（1 参重载走 nextCreatedAt/nextSeq 单调取号，
+                            //    不传 now()）；成功才允许 ⑤ 删旧，失败保留 DB 旧份（绝不留「删了旧、新份没落库」窗口）
+                            if (messageService != null && !state.isAppendPersistenceArmed()) {
+                                try {
+                                    messageService.appendMessage(hookDto);
+                                    newPersisted = true;
+                                    if (log.isDebugEnabled()) {
+                                        log.debug("HOOK SessionStart hook_additional_context 直接补落库（appendListener 未武装）: session={} id={}",
+                                            sessionStartKey, hookDto.id());
+                                    }
+                                } catch (Exception e) {
+                                    log.error("HOOK SessionStart hook_additional_context 补落库失败（保留 DB 旧份不删，避免丢份）: session={} id={} err={}",
+                                        sessionStartKey, hookDto.id(), e.toString(), e);
                                 }
-                            } else {
-                                // [align-CC 2026-09-01] content 包 <system-reminder> + isMeta=true（对齐 CC
-                                //   messages.ts:4117-4127 hook_additional_context：wrapInSystemReminder +
-                                //   createUserMessage({isMeta:true})）——模型识别为「系统注入的技能说明」而非
-                                //   普通用户消息（此前 isMeta=false，模型把技能说明当用户贴的内容，看不到
-                                //   using-zjkycode 等 SessionStart hook 注入的定义）
-                                String wrappedContext = "<system-reminder>\nSessionStart hook additional context: "
-                                    + String.join("\n", nonBlankContexts) + "\n</system-reminder>";
-                                state.appendMessage(new ChatMessageDto(
-                                    UUID.randomUUID().toString(), sessionId, Role.user, "hook",
-                                    wrappedContext, null, List.of(),
-                                    com.nexusai.model.session.dto.FinishReason.stop,
-                                    null, null, "刚刚", java.time.OffsetDateTime.now(), null, null, null,
-                                    List.of(), List.of(), null, true, false,
-                                    null, "hook_additional_context"));
-                                if (log.isInfoEnabled()) {
-                                    log.info("HOOK SessionStart 提供 additionalContext: {} 段（hook_additional_context 追加进对话历史）",
-                                        nonBlankContexts.size());
+                            } else if (messageService == null && log.isDebugEnabled()) {
+                                log.debug("HOOK SessionStart hook_additional_context 无落库通道（messageService=null）→ 跳过删旧，仅内存覆盖: session={}",
+                                    sessionStartKey);
+                            }
+                            // ⑤ 删除其它旧份（先插后删：新份已落库 = newPersisted，删旧排除新份 id）·
+                            //    fail-loud：删除失败仅 log.warn（不回滚已插入的新份；DB 可能多 1 份，绝不丢份）
+                            if (messageService != null && newPersisted) {
+                                try {
+                                    int removedRows = messageService.deleteBySessionAndSubtype(
+                                        sessionId, "hook_additional_context", hookDto.id());
+                                    if (log.isInfoEnabled()) {
+                                        log.info("HOOK SessionStart hook_additional_context 覆盖式注入: 删除 DB 旧份 {} 条（先插后删，DB 恒 1 条，session={}）",
+                                            removedRows, sessionStartKey);
+                                    }
+                                } catch (Exception e) {
+                                    log.warn("HOOK SessionStart hook_additional_context 旧份删除失败（新份已落库，DB 可能多 1 份但绝不丢份）: session={} err={}",
+                                        sessionStartKey, e.toString());
                                 }
+                            }
+                            if (log.isInfoEnabled()) {
+                                log.info("HOOK SessionStart 提供 additionalContext: {} 段（hook_additional_context 先插后删覆盖式写入对话历史，DB 恒 1 条）",
+                                    nonBlankContexts.size());
                             }
                         }
                     }
@@ -4998,14 +5089,17 @@ public class LlmAgentLoop implements AgentLoop {
             int snipTokensFreed = 0;
             // [V52 B1-6] snip 门控叠加 DB settings.history_snip_enabled：DB 有值则用之，
             //   null 回落 ctx.featureFlags().historySnip()（零行为变化）。
-            boolean historySnipEnabled = ctx.featureFlags().historySnip();
-            Boolean dbSnip = settingsResolver != null ? settingsResolver.historySnipEnabled() : null;
-            if (dbSnip != null) {
-                historySnipEnabled = dbSnip;
-                if (log.isDebugEnabled()) {
-                    log.debug("[LlmAgentLoop] DB settings.history_snip_enabled={} 覆盖 FeatureFlags.historySnip={}",
-                        dbSnip, ctx.featureFlags().historySnip());
-                }
+            // [D4 双门源合并] 公式收敛到 BoundaryReader.isHistorySnipEnabled 单一来源（门①）——
+            //   与门②（BoundaryReader 静态槽读侧 :207 / 5 处静态调用面）同源，DB 列 NULL 时不再分叉。
+            //   输入仍为实例/参数 settingsResolver（DB 实时读，不缓存）+ ctx.featureFlags()。
+            boolean historySnipEnabled = BoundaryReader.isHistorySnipEnabled(settingsResolver, ctx.featureFlags());
+            if (log.isDebugEnabled()) {
+                // 注意：不再二次调 settingsResolver.historySnipEnabled()（避免 debug 下重复 DB 查询）——
+                // enabled 与 flags 值对比即可分辨「DB 覆盖」与「回落 FeatureFlags」两条路径。
+                log.debug("[LlmAgentLoop] snip 门①解析（BoundaryReader 单一来源）: enabled={}, "
+                        + "ctx.featureFlags().historySnip()={}, DB 覆盖源={}（enabled≠flags 即 DB 覆盖）",
+                    historySnipEnabled, ctx.featureFlags().historySnip(),
+                    settingsResolver != null ? "settingsResolver 注入·实时读" : "未接线→回落 flag");
             }
             if (historySnipEnabled) {
                 SnipCompactor.SnipResult snipResult =
@@ -5132,8 +5226,14 @@ public class LlmAgentLoop implements AgentLoop {
                         //   buildPostCompactMessages 语义 —— 压缩是正常持久化动作，与 snip 请求级
                         //   投影不同）。同时替换请求级局部 messagesForQuery（CC query.ts:528
                         //   `messagesForQuery = postCompactMessages`，本 turn 后续请求沿用压缩视图）。
-                        state.replaceMessages(l4Result.messages());
-                        messagesForQuery = l4Result.messages();
+                        // [SM/compact 对齐 CC] 落库 = append-only（CC transcript append-only：只追加
+                        //   boundary/summary 新行 + 把 kept 段 created_at 重挂到 boundary 之后，绝不删旧行；
+                        //   加载/请求侧按最后 boundary 剪枝）。否则只改内存 → 每 run 从 DB 恢复全量 →
+                        //   反复自动压缩。persistCompactedMessages 内部以归一化列表覆盖 state，
+                        //   故 messagesForQuery 取 state.messages() 的<b>拷贝</b>
+                        //   （与 DB id 一致；拷贝保持「本局部与 state 隔离」不变量，见 :4800 防御性拷贝注释）。
+                        persistCompactedMessages(state, l4Result.messages());
+                        messagesForQuery = new ArrayList<>(state.messages());
                         // [H7-arch Phase 5 P4 C1] 本 turn 已压缩 → blocking-limit 跳过（CC: !compactionResult）
                         justCompacted = true;
                         // [MISS-3/IMP2-07] 压缩成功复位 → AutoCompactTrackingState.recordSuccess 内
@@ -6726,7 +6826,9 @@ public class LlmAgentLoop implements AgentLoop {
                             // finalContextTokensFromLastResponse 读到压缩后列表 → 0（measured 失真）。
                             java.util.List<ChatMessageDto> preCompactMessages = new java.util.ArrayList<>(state.messages());
                             java.util.List<ChatMessageDto> postCompactMessages = compacted.buildPostCompactMessages();
-                            state.replaceMessages(postCompactMessages);
+                            // [SM/compact 对齐 CC] 落库 = append-only（CC transcript append-only；同 proactive 路径）·
+                            //   preCompactMessages 快照已在上方替换前拷好（task_budget 结转仍需压缩前数组）。
+                            persistCompactedMessages(state, postCompactMessages);
 
                             if (params.taskBudget() != null) {
                                 Integer prevRemaining = taskBudgetRemaining;
@@ -7456,7 +7558,14 @@ public class LlmAgentLoop implements AgentLoop {
                                 ? Map.copyOf(sysParts.userContext()) : Map.of(),
                             sysParts != null && sysParts.systemContext() != null
                                 ? Map.copyOf(sysParts.systemContext()) : Map.of(),
-                            List.copyOf(state.messages()));
+                            List.copyOf(state.messages()),
+                            // [SM-fork 模型直传 2026-09-10] 当轮会话运行模型（= CC
+                            //   toolUseContext.options.mainLoopModel）随 fork 原料透传 ——
+                            //   extract/dream fork 的 toolUseContext 由此补齐 effectiveModelName，
+                            //   否则 ProductionForkedQuery 直传分支取不到模型 → provider 回落
+                            //   MockLlmProvider（假回复/永不 Write 记忆）。源 = state.currentModel()
+                            //   （与 post-sampling hook toolUseContext 的 hookToolUseContext 同源）。
+                            state.currentModel());
                     // [A1 重做] memoryDir 会话线程解析：boundProject（= sessionState().workspaceDir()，
                     //   原始路径非 slug）经 AutoMemPaths.getAutoMemPath(boundProject) 显式解析 →
                     //   传 StopHookPipeline → extract/dream fork 消费。解析发生在会话线程（本行），

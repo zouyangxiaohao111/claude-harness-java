@@ -1,7 +1,9 @@
 package com.nexusai.application.agent.tasks;
 
+import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.RunRequest;
+import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.AgentTranscript;
 import com.nexusai.application.agent.tool.SessionStorage;
@@ -81,6 +83,16 @@ public class MainSessionBackgroundService {
     @Autowired
     @Qualifier("chatExecutor")
     private Executor backgroundExecutor;
+    /**
+     * [SM/compact 对齐 CC] 落库通道装配服务（只用到 {@code armPersistenceListeners}：append 实时落库 +
+     * compact append-only 落库，不推 STOMP —— 本入口的流走任务级 topic）。
+     *
+     * <p><b>WHY</b>：后台派生查询此前完全没武装持久化监听 → 该通道 append 不落库、compact 结果不落库
+     * （每 run 从 DB 恢复全量 → 反复自动压缩）。{@code required=false}：非 Spring 单测/裁剪环境注入不到 →
+     * 跳过武装（保持旧行为，不阻断 run）。
+     */
+    @Autowired(required = false)
+    private ChatService chatService;
     /** [IMP2-10 · MISS-2 · OD-13] taskBudget 配置源（tokens；0 = 未配置 → 回落 RunRequest.DEFAULT_TASK_BUDGET_TOTAL） */
     @Value("${nexusai.agent.task-budget.total:0}")
     private int taskBudgetTotalConfigured = 0;
@@ -360,8 +372,31 @@ public class MainSessionBackgroundService {
                 if (log.isDebugEnabled()) {
                     log.debug("[IMP2-10 taskBudget] 主会话后台化入口注入: source=配置/默认值 total={}", taskBudget.total());
                 }
-                loop.run(RunRequest.session(userPrompt, sessionUuid, agentUuid, cfg, modelName,
+                // [SM/compact 对齐 CC · 消除未武装通道] 本入口此前无任何持久化监听武装 → append 不落库、
+                //   compact 结果不落库。run 前经 postHistoryPersistEnabler 回调（doRun 历史注入完成、
+                //   prePersistedMessageIds 登记后触发）武装「仅落库」通道：append 逐条实时落 DB（对齐 CC
+                //   recordTranscript）+ compact 结果 append-only 落库（对齐 CC transcript append-only）。
+                //   流式推送仍走任务级 topic（loop.setTaskStreamContext），本武装不推 STOMP。
+                // [seq 排序键 核对] 本入口落库的目标就是「主会话」messages（sessionId = 真实会话 id，
+                //   后台派生查询复用同一会话，非独立库）——经 ChatService.persistAppendedMessage 走既有
+                //   append 实时落库通道，created_at（时间）与 seq（V70 位置键）均经 MessageService 的
+                //   per-session 单点取号，与前台 writer 同域单调 → 无需本入口单独处理（行为不变）。
+                if (chatService != null) {
+                    loop.setPostHistoryPersistEnabler(state2 ->
+                        chatService.armPersistenceListeners(state2, sessionId));
+                    if (log.isInfoEnabled()) {
+                        log.info("主会话后台化派生查询: 落库监听已武装 session={}（append 实时落库 + compact append-only）",
+                            sessionId);
+                    }
+                }
+                AgentState runState = loop.run(RunRequest.session(userPrompt, sessionUuid, agentUuid, cfg, modelName,
                     null, null, null, taskBudget));
+
+                // run 收口：解除监听（防 PersistCtx/sessionId 泄漏到下轮 / 下个 task 复用本 loop 实例）
+                if (runState != null) {
+                    runState.clearAppendListener();
+                    runState.clearCompactPersistListener();
+                }
 
                 // CC :387-401 abort 中断 → notified 短路 + emitTaskTerminatedSdk('stopped')
                 if (abortFlag != null && abortFlag.get()) {

@@ -54,13 +54,16 @@ import java.util.UUID;
  *       {@code state.messages()} 快照，AgentLoopContext.toolExecContext），把
  *       {@code message_ids} 中<b>实际存在</b>的消息 id 收进 {@code removedUuids}，构造
  *       snip_boundary system 消息（content = 摘要），经 {@link ToolResult#successWithNewMessages}
- *       {@code newMessages} 通道注入会话历史（ToolResultApplier.apply → state.messages().addAll，
- *       ToolResultApplier.java:69-71）。</li>
+ *       {@code newMessages} 通道注入会话历史（ToolResultApplier.apply → state.stashNewMessages 暂存，
+ *       由 AgentLoopContext.flushNewMessagesAfterToolResult 在 tool_result 之后逐条追加；
+ *       [snip-boundary-persist] boundary 经 appendMessage 触 appendListener → 落库 + STOMP）。</li>
  *   <li><b>LlmAgentLoop snip 步骤</b>（LlmAgentLoop.java:3761-3787，对齐 CC query.ts:401-410）：
  *       下轮 do-while 迭代开头，{@code new SnipCompactor().snipCompactIfNeeded(state.messages())}
- *       反向扫到 boundary，按 {@code removedUuids} 剔除对应消息 → {@code state.replaceMessages(...)}
- *       把 removedUuids 消息从 {@code AgentState} 历史中物理移除，boundary（含摘要）保留，
- *       释放 token。模型面消息链 = 剔除后的消息 + 摘要边界（CC snipCompact.ts:118-139 等价）。</li>
+ *       反向扫到 boundary，按 {@code removedUuids} 生成<b>请求级投影</b>
+ *       {@code messagesForQuery}（对齐 CC query.ts:592 {@code messagesForQuery = snipResult.messages}），
+ *       只替换发往 provider 的本轮消息链、<b>不</b>改 {@code AgentState.messages()} 本身
+ *       （boundary + 被裁剪消息均保留在 state，供落库/转录）。模型面消息链 = 投影后的消息 + 摘要边界
+ *       （CC snipCompact.ts:118-139 + snipProjection 等价）。</li>
  * </ol>
  *
  * <p><b>数据流</b>：message_ids+reason（LLM）→ execute 匹配会话历史 → removedUuids+summary
@@ -465,8 +468,10 @@ public class SnipTool implements Tool {
      * （type='system' && subtype='snip_boundary'）+ snipCompact.ts:99-106
      * （snipMetadata.removedUuids）。
      *
-     * <p>content = 摘要（boundary 保留在投影后消息链中，模型看到摘要替换）；isMeta=true
-     * （对齐 CC isSnipMarkerMessage 内部消息语义，snipCompact.ts:25-28，非用户面向历史条目标记）。
+     * <p>content = 摘要（boundary 保留在投影后消息链中，模型看到摘要替换）；<b>isMeta=false</b>
+     * —— 与本方法实现一致（{@code ChatMessageDto} 第 19 位实参传 {@code false}），且必须保持 false：前端
+     * {@code MessageList.tsx:777} / {@code TraceView.tsx:93} 会过滤 isMeta=true 的行，带 true 会让
+     * 裁剪条静默消失（§5.1 约束 1）。
      *
      * @param ctx          ToolUseContext（sessionId 归因）
      * @param removedUuids 被裁剪消息 id 列表（写入 snipMetadata.removedUuids）
