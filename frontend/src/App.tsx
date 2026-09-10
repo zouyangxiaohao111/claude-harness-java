@@ -457,16 +457,37 @@ function App() {
   }, [showToast])
   // [window-paging] Trace 全程：会话全量消息（独立于聊天有界窗口 storeMessages · 用户拍板「Trace 就是全程」）。
   const [traceMessages, setTraceMessages] = useState<Awaited<ReturnType<typeof chatApi.listMessages>>>([])
+  // [Trace 释放·内建过期守卫] 上一版把「取消守卫」做成可选入参交调用方 opt-in（isCancelled?）——那只是
+  //   一份调用契约：轨迹 tab 的 onClick 当时未传守卫，请求 resolve 后照样 setTraceMessages(全量)，把
+  //   「离场置空」的副本重新灌回并驻留（列表越大请求越慢越易命中），并使「轨迹内 A→B 快速切会话响应乱序」
+  //   复活。改为内建守卫：响应 resolve 时按【当前是否仍在该会话的 Trace 视图】自行判定丢弃，任何调用点
+  //   （含未来新增）都无法绕过。用 ref 读实时值（loadTraceFull 是 useCallback([])，闭包拿不到最新 state）；
+  //   沿用本文件既有 activeSessionIdRef 的「渲染期同步 ref」写法。
+  const traceViewStateRef = useRef<{ view: 'chat' | 'trace'; sid: string | null }>({ view: centerView, sid: activeSessionId })
+  traceViewStateRef.current = { view: centerView, sid: activeSessionId }
   const loadTraceFull = useCallback(async (sid: string) => {
     try {
       const msgs = await chatApi.listMessages(sid) // 全量：Trace = 全程记录（不受窗口限制）
+      const cur = traceViewStateRef.current
+      // 已离场（切走 tab）或已切会话 → 丢弃响应，绝不写回 state。
+      if (cur.view !== 'trace' || cur.sid !== sid) return
       setTraceMessages(msgs)
     } catch { /* trace 全量拉失败静默（重进 trace / 手动再点兜底） */ }
   }, [])
   // 保持在 Trace 视图时切会话 → 重新拉全程
   useEffect(() => {
-    if (centerView !== 'trace' || !activeSessionId) return
+    if (centerView !== 'trace' || !activeSessionId) {
+      // [内存·Trace 离场即释放] traceMessages 是会话【全量】副本（listMessages 无 limit，且 TraceView
+      //   每条带 full=完整正文/toolCall.arguments），是全仓第二份全量数据。原实现只在进入/切会话时拉取、
+      //   从不置空 → 离开轨迹后整份原样驻留，切会话/删会话也不释放。这里补 else：非 Trace 视图（含
+      //   activeSessionId 变化触发的切会话、删当前会话后 activeSessionId 变空）→ 清空副本。
+      //   语义不变：Trace 仍是全程（进入轨迹时按 activeSessionId 重新全量拉取）。
+      //   函数式更新只在非空时换引用，避免每次 activeSessionId 变化都制造新 [] 触发无谓重渲。
+      setTraceMessages((prev) => (prev.length === 0 ? prev : []))
+      return
+    }
     void loadTraceFull(activeSessionId)
+    // 过期守卫已内建在 loadTraceFull（读 traceViewStateRef 实时判定），此处无需再持有 cancelled 闭包。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [centerView, activeSessionId, loadTraceFull])
   const removeMessage = useChatStore((s) => s.removeMessage)
@@ -619,7 +640,7 @@ function App() {
   }, [activeSessionId, setMessages, setConversationId, showToast])
 
   // [window-paging] 重拉当前会话（无 toast · complete 回调 + F5 共用）：查看通道 = 尾页窗口（对齐 deepseek，
-  //   不再全量）。Trace 全程由 loadTraceFull 单独全量拉（见 center-tabs onClick / 渲染用 traceMessages）。
+  //   不再全量）。Trace 全程由 loadTraceFull 单独全量拉（见上方依赖 centerView 的 effect / 渲染用 traceMessages）。
   const reloadMessages = useCallback(async () => {
     if (!activeSessionId) return
     try {
@@ -752,7 +773,9 @@ function App() {
         }
       })
     if (msgs.length > 0) {
-      st.setMessages(sid, [...prev, ...msgs])
+      // [有界窗口] 追加路径 → appendMessages（内部 capTail）：勿用 setMessages([...prev, ...msgs])，
+      //   那条路不裁剪，是内存无界的漏洞口。
+      st.appendMessages(sid, msgs)
       void debugLog(`[drained-append] sid=${sid} uids=${msgs.map((m) => m.userMessageId ?? m.id).join(',')} contents=${msgs.map((m) => m.content?.slice(0, 10) ?? '').join(',')}`)
     }
   }, [])
@@ -776,7 +799,9 @@ function App() {
   // ---- away-summary：blur 5min 触发，REST 摘要回插为系统消息 ----
   useAwaySummary(activeSessionId, (text) => {
     const st = useChatStore.getState()
-    st.setMessages(activeSessionId, [...(st.messages[activeSessionId] ?? []), {
+    // [有界窗口] away-summary 是 blur 触发的追加路径，不保证随后有 finalize 兜底 → 原
+    //   setMessages([...prev, new]) 在本会话内只增不减。改用 appendMessages 由 store 统一裁剪。
+    st.appendMessages(activeSessionId, [{
       id: `away-${Date.now()}`, sessionId: activeSessionId, role: 'system', author: 'system', content: text,
       reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null,
       toolCallId: null, assistantMessageId: null, subtype: 'away_summary', isMeta: false, isApiErrorMessage: false,
@@ -1432,8 +1457,9 @@ function App() {
             base64: a.base64 ?? null, path: a.path ?? null,
           }
         }) ?? []
-      st.setMessages(activeSessionId, [
-        ...(st.messages[activeSessionId] ?? []),
+      // [有界窗口] 发送成功的乐观 user 气泡是追加路径 → appendMessages（内部 capTail）统一裁剪；
+      //   勿用 setMessages([...prev, new])（不裁剪，是内存无界的漏洞口）。
+      st.appendMessages(activeSessionId, [
         { id: resp.userMessageId, sessionId: activeSessionId, role: 'user', author: '你', content: text, reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null, toolCallId: null, assistantMessageId: null, userMessageId: resp.userMessageId, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null, imageData: imageData.length ? imageData : null, userAttachments: userAttachments.length ? userAttachments : null },
       ])
       // 注意：发送时【不】clearStream —— 正常流程上一轮 complete 已清 streams（finalizeBlocks 返回 rest）；
@@ -1596,9 +1622,14 @@ function App() {
           <button
             className={`center-tab ${centerView === 'trace' ? 'active' : ''}`}
             onClick={() => {
-              setCenterView('trace')
-              // [window-paging] Trace 全程：切到轨迹自动全量拉（独立于聊天有界窗口）
-              if (activeSessionId) void loadTraceFull(activeSessionId)
+              // [Trace 释放·去旁路] 进入轨迹不再在此处发请求：全量加载由依赖 centerView 的 effect 单点负责，
+              //   否则进入时 onClick + effect 会重复发两条全量请求（本就冗余）。已在轨迹视图时再点 = 手动
+              //   重试（保留原「手动再点兜底」语义）；loadTraceFull 已内建过期守卫，此调用同样不可能绕过。
+              if (centerView === 'trace') {
+                if (activeSessionId) void loadTraceFull(activeSessionId)
+              } else {
+                setCenterView('trace')
+              }
             }}
           >
             <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M6 1L6 9M6 9L3 6M6 9L9 6M3 11H9"/></svg>

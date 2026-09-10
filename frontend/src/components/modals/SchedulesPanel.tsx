@@ -46,31 +46,89 @@ const stepOf = (v: string): number | null => {
 }
 
 /**
- * F29：把 cron 串转人类可读文案。
- * 支持常见 5/6 段 Quartz 模式：每 N 分钟、每天 HH:mm、每月 N 日 HH:mm；
- * 其余（周几组合等）回退显示原文 + 「(未识别调度)」。
+ * Quartz 周几编号 → 中文：1=周日、2=周一 … 7=周六。
+ * cron-6field-contract：与后端契约文本一致，切勿按 ISO 改成 1=周一（会让「周一」显示成「周日」）。
  */
-export function cronToHuman(cron: string): string {
+const DOW_LABEL: Record<number, string> = {
+  1: '周日',
+  2: '周一',
+  3: '周二',
+  4: '周三',
+  5: '周四',
+  6: '周五',
+  7: '周六',
+}
+
+/**
+ * cron-6field-contract：解析 dow 字段 → 「每周X」/「每周X至周Y」；非单一/区间返回 null。
+ * 仅接受单个 1-7 与 A-B（A≤B）两种形态，逗号列表/步进等一律不识别（宁回退不瞎猜）。
+ */
+const dowPartOf = (dow: string): string | null => {
+  const single = /^([1-7])$/.exec(dow)
+  if (single) return `每${DOW_LABEL[Number(single[1])]}`
+  const range = /^([1-7])-([1-7])$/.exec(dow)
+  if (range) {
+    const a = Number(range[1])
+    const b = Number(range[2])
+    if (a <= b) return `每${DOW_LABEL[a]}至${DOW_LABEL[b]}`
+  }
+  return null
+}
+
+/**
+ * F29：把「单个」cron 变体（6 段 Quartz，秒 分 时 日 月 周）转人类可读文案。
+ * 支持：每 N 分钟、每天 HH:mm、每月 N 日 HH:mm、每周X（含区间）HH:mm；识别不了返回 null。
+ * cron-6field-contract：原实现内联在 cronToHuman，此处抽出以便 `||` 变体逐个复用。
+ */
+function singleCronToHuman(cron: string): string | null {
   const parts = cron.trim().split(/\s+/)
   // 兼容 6 段 Quartz（秒 分 时 日 月 周）：剥掉秒字段退化为 5 段
   const f = parts.length === 6 ? parts.slice(1) : parts
-  if (f.length !== 5) return `${cron}（未识别调度）`
+  if (f.length !== 5) return null
   const [min, hour, dom, month, dow] = f
-  // 周几字段非通配（'*'/'?'）→ 周几限定属于不支持的模式，回退原文（避免把「每周一」误标成「每天」）
-  if (dow !== '*' && dow !== '?') return `${cron}（未识别调度）`
-  // 每 N 分钟（如 '0/5' / '*/5'）
-  const step = stepOf(min)
-  if (step != null) return `每 ${step} 分钟`
+  const dowWild = dow === '*' || dow === '?'
+  const dowLabel = dowWild ? null : dowPartOf(dow)
+  // 周几字段非通配且不是单一/区间 → 不支持，回退原文（避免把「每周一」误标成「每天」）
+  if (!dowWild && dowLabel == null) return null
+  // 每 N 分钟（如 '0/5' / '*/5'）；仅在周几未限定时成立，否则会丢掉周几约束
+  if (dowWild) {
+    const step = stepOf(min)
+    if (step != null) return `每 ${step} 分钟`
+  }
   const num = /^\d{1,2}$/
-  // 每天 HH:mm（分 时 固定，日/月 通配）
-  if (num.test(min) && num.test(hour) && dom === '*' && month === '*') {
+  if (!num.test(min) || !num.test(hour)) return null
+  // 周几限定：日字段通配（'*'/'?'）+ 月通配 → 每周X HH:mm
+  if (dowLabel != null) {
+    // 日字段固定（非 '*'/'?'）+ 周字段固定的双约束 → 不支持（后端变体串里 dom 侧通常写作 '?'）
+    if ((dom === '*' || dom === '?') && month === '*') {
+      return `${dowLabel} ${pad2(hour)}:${pad2(min)}`
+    }
+    return null
+  }
+  // 每天 HH:mm（分 时 固定，日/月通配）
+  if (dom === '*' && month === '*') {
     return `每天 ${pad2(hour)}:${pad2(min)}`
   }
   // 每月 N 日 HH:mm（日固定，月通配）
-  if (num.test(min) && num.test(hour) && num.test(dom) && month === '*') {
+  if (num.test(dom) && month === '*') {
     return `每月 ${Number(dom)} 日 ${pad2(hour)}:${pad2(min)}`
   }
-  return `${cron}（未识别调度）`
+  return null
+}
+
+/**
+ * F29：把 cron 串转人类可读文案。
+ * 支持常见 5/6 段 Quartz 模式：每 N 分钟、每天 HH:mm、每月 N 日 HH:mm、每周X（含区间）HH:mm；
+ * cron-6field-contract：日+周双约束时后端存 `||` 连接的变体串（任一变体匹配即触发），
+ * 逐个识别后用「 或 」拼接；任一变体识别不了则整体回退原文 + 「（未识别调度）」。
+ */
+export function cronToHuman(cron: string): string {
+  if (cron.includes('||')) {
+    const variants = cron.split('||').map((v) => singleCronToHuman(v))
+    if (variants.every((v) => v != null)) return variants.join(' 或 ')
+    return `${cron}（未识别调度）`
+  }
+  return singleCronToHuman(cron) ?? `${cron}（未识别调度）`
 }
 
 /** 归属短标签（截断显示）· 会话 > agent > 项目；全无 → 全局 */

@@ -382,6 +382,119 @@ public final class CronExpressionConverter {
     }
 
     /**
+     * errorCode1 统一报错文案（单一真源 · cron-6field-contract）· {@code CronCreateTool.validateInput}
+     * 与 {@code CronCreateTool.execute} 共用，消除两处内联拼串漂移。
+     *
+     * <p>分流（确定性判定，不做启发式猜测）:
+     * <ol>
+     *   <li>{@link #domDowExclusivityHint} 命中 → {@code Invalid cron expression '<cron>'. <hint>}
+     *       （给出可照写的建议完整串）</li>
+     *   <li>字段数 != 6 → {@code Invalid cron expression '<cron>'. Expected 6 fields:
+     *       S M H DoM Mon DoW (day-of-month and day-of-week must have exactly one '?').}</li>
+     *   <li>6 段但另有非法值 → {@code Invalid cron expression '<cron>'. Field values out of range
+     *       (sec 0-59, min 0-59, hour 0-23, day-of-month 1-31, month 1-12).}</li>
+     * </ol>
+     *
+     * <p><b>WHY（cron-6field-contract）</b>: 旧文案恒为 "Expected 6 fields: S M H DoM Mon DoW."，
+     * 当字段数本来就是 6、真正原因是 dom/dow 缺 '?'（Quartz 2.5.0 硬规则：dom 与 dow 必须且只能
+     * 有一个是 '?'，两个 '*' 拒、两个 '?' 也拒）时，模型据报错只会反复数字段，无法修正。
+     *
+     * @param cron 用户原始 cron 串（可为 null/空，展示层归一为 ""）
+     * @return errorCode1 报错文案
+     */
+    public static String invalidCronMessage(String cron) {
+        String display = cron == null ? "" : cron;
+        String hint = domDowExclusivityHint(cron);
+        if (hint != null) {
+            if (log.isDebugEnabled()) {
+                log.debug("invalidCronMessage 命中 dom/dow 互斥诊断，cron=[{}] 提示=[{}]", display, hint);
+            }
+            return "Invalid cron expression '" + display + "'. " + hint;
+        }
+        String trimmed = display.trim();
+        String[] parts = trimmed.isEmpty() ? new String[0] : trimmed.split("\\s+");
+        if (parts.length != 6) {
+            if (log.isDebugEnabled()) {
+                log.debug("invalidCronMessage 字段数不足，cron=[{}] 实得 {} 段（期望 6 段）",
+                    display, parts.length);
+            }
+            return "Invalid cron expression '" + display + "'. Expected 6 fields: S M H DoM Mon DoW "
+                + "(day-of-month and day-of-week must have exactly one '?').";
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("invalidCronMessage 6 段但字段值非法（非 dom/dow 互斥原因），cron=[{}]", display);
+        }
+        return "Invalid cron expression '" + display + "'. Field values out of range "
+            + "(sec 0-59, min 0-59, hour 0-23, day-of-month 1-31, month 1-12).";
+    }
+
+    /**
+     * dom/dow 互斥诊断（确定性字符串判定 · cron-6field-contract）。
+     *
+     * <p>仅当 6 段输入且 {@code (dom是'?') == (dow是'?')}（即两者都 '?'，或两者都非 '?' —— 含双
+     * '*'、双具体值）时进入改写：按「保留信息更多的一侧」产出候选串，再用 Quartz
+     * {@code CronExpression.isValidExpression} 复验；复验通过才返回可操作提示，否则返回 null
+     * （说明还有别的原因，不给误导提示）。
+     *
+     * <p>改写规则:
+     * <ul>
+     *   <li>dow 既非 {@code *} 也非 {@code ?} → dom 改 {@code ?}（保留 dow 约束）</li>
+     *   <li>否则 dom 既非 {@code *} 也非 {@code ?} → dow 改 {@code ?}（保留 dom 约束）</li>
+     *   <li>否则（双通配 {@code * *} 或双 {@code ?}）→ dom={@code ?}、dow={@code *}</li>
+     * </ul>
+     *
+     * <p><b>6 段直通世界</b>: Quartz 2.5.0 实测硬规则——dom 与 dow 必须且只能有一个是 '?'；
+     * 周编号 1=周日 … 7=周六（{@code ? * 2-6} = 周一至周五）。6 段输入直通不重编号，与 5 段经
+     * {@link #toQuartz6Field} 重编号（{@link #toQuartzDow}）是两个世界，本方法只读不转换。
+     *
+     * @param cron 用户原始 cron 串
+     * @return 可操作提示（含建议后的完整串）；非本原因 / 复验不过 → null
+     */
+    public static String domDowExclusivityHint(String cron) {
+        if (cron == null) return null;
+        String trimmed = cron.trim();
+        String[] parts = trimmed.isEmpty() ? new String[0] : trimmed.split("\\s+");
+        if (parts.length != 6) return null;
+        String dom = parts[3];
+        String dow = parts[5];
+        boolean domPlaceholder = "?".equals(dom);
+        boolean dowPlaceholder = "?".equals(dow);
+        if (domPlaceholder != dowPlaceholder) return null; // 已满足互斥，非本原因
+        String newDom;
+        String newDow;
+        String keptSide;
+        if (!"*".equals(dow) && !"?".equals(dow)) {
+            newDom = "?";
+            newDow = dow;
+            keptSide = "day-of-week";
+        } else if (!"*".equals(dom) && !"?".equals(dom)) {
+            newDom = dom;
+            newDow = "?";
+            keptSide = "day-of-month";
+        } else {
+            newDom = "?";
+            newDow = "*";
+            keptSide = "neither(wildcard)";
+        }
+        String candidate = parts[0] + " " + parts[1] + " " + parts[2] + " " + newDom + " "
+            + parts[4] + " " + newDow;
+        if (!CronExpression.isValidExpression(candidate)) {
+            if (log.isDebugEnabled()) {
+                log.debug("domDowExclusivityHint 建议串复验不通过，放弃提示，cron=[{}] 候选=[{}]",
+                    trimmed, candidate);
+            }
+            return null;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("domDowExclusivityHint 命中（保留 {} 侧约束），cron=[{}] → 建议=[{}]",
+                keptSide, trimmed, candidate);
+        }
+        return "day-of-month and day-of-week must have exactly one '?' — got day-of-month='" + dom
+            + "' and day-of-week='" + dow + "'. Use \"0 */5 * ? * *\" style (here: \""
+            + candidate + "\").";
+    }
+
+    /**
      * CC 366 天上限毫秒等价（IMPL-03/NEW-1）· CC cron.ts:138 {@code maxIter = 366 * 24 * 60}
      * 分钟 ≈ 366 天，超限 {@code computeNextCronRun} 即 return null（cron.ts:180）→
      * errorCode2「一年内无匹配」。Quartz {@code getNextValidTimeAfter} <b>无此上限</b>

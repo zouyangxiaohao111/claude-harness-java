@@ -1171,6 +1171,24 @@ html {
   padding: 0 32px;
 }
 
+/* [渲染有界] 助手消息行离屏时跳过其子树的布局/绘制（content-visibility: auto）。
+ * 背景：559223a 删掉渲染层 WINDOW_MAX=150 尾窗后（注释声称「数据天然有界」），行数实际只由
+ *   store 窗口决定；长窗口下大量离屏行仍全量参与 style/layout/paint，是 renderer 内存/卡顿税。
+ *   DOM 节点仍在（可被 Ctrl+F / 快捷键定位触发强制渲染），只是离屏不入布局。
+ * contain-intrinsic-size: auto 160px —— 离屏行按估高占位；auto = 记住上次实测高度，滚回已渲染过的
+ *   行不跳变（代价：未渲染行的滚动条长度是估算值）。Chromium/WebView2 支持。
+ * 只作用于助手行（.msg.assistant）：content-visibility 隐含 paint containment，会裁剪子元素溢出。
+ *   助手 .body 透明无阴影 → 无可见影响；用户气泡 .msg.user .user-bubble 带 box-shadow（右缘贴行边），
+ *   施加同一规则会裁掉其右缘阴影 —— 故排除用户行（其 DOM 很轻，收益也小）。
+ * 副作用边界：行成为绝对/固定定位后代的包含块。当前助手行内无 absolute/fixed 元素（hover 删除按钮
+ *   在 .msg.user 且 .msg 已是 position:relative）—— 将来若在助手行内加浮层需排除该行。
+ * 未做虚拟化（react-virtual）：行高不定 + 异步 shiki/KaTeX + 增量流式三因素使测量复杂、风险高；
+ *   有界 store 窗口 + 本规则已覆盖「内存无界」与「离屏渲染税」两个主问题。 */
+.stream-inner > .msg.assistant {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 160px;
+}
+
 /* Message */
 .msg {
   margin-bottom: 16px;

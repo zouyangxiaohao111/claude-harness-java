@@ -143,6 +143,16 @@ public class CronCreateTool implements Tool {
      * 全链统一 6 字段（CC 原文为 5 字段 "Uses standard 5-field cron"，prompt.ts:89，被决策#5
      * 覆写为 Java 端 6 字段措辞 + '?' 占位说明）。Java CronExpressionConverter 兼容 5 段
      * （toQuartz6Field 转换）→ 用户输入 5 段 cron 亦可用，但工具说明按 6 字段契约指导。
+     *
+     * <p><b>cron-6field-contract 修正（2026-09-10）</b>: 6 字段契约保留，但示例全部由
+     * 「非法形」改为 Quartz 2.5.0 实测 <b>合法形</b>——旧示例（每 5 分钟 {@code 0 *&#47;5 * * * *}、
+     * 每小时 {@code 0 0 * * * *}、工作日 9 点 {@code 0 0 9 * * 1-5}、
+     * {@code 0 57 8 * * *}、{@code 0 7 * * * *}）
+     * 全部是 dom/dow 双非 '?' 形，被 Quartz 硬规则拒收（dom 与 dow 必须且只能有一个是 '?'，
+     * 两个 '*' 拒、两个 '?' 也拒），模型照抄即 errorCode1。同时把"条件式"互斥表述（"一方用
+     * 具体值/部分通配时另一方须 ?"）改为<b>硬规则表述</b>，并补 6 段直通世界的 dow 编号
+     * （1=周日 … 7=周六，{@code ? * 2-6} = 周一至周五；注意 5 段输入经 toQuartz6Field/toQuartzDow
+     * 会重编号，与 6 段直通是两个世界）。
      */
     @Override
     public String prompt() {
@@ -188,8 +198,10 @@ public class CronCreateTool implements Tool {
         return "Schedule a prompt to be enqueued at a future time. Use for both recurring schedules and one-shot reminders.\n"
             + "\n"
             + "Uses standard 6-field cron in the user's local timezone: second minute hour day-of-month month day-of-week. "
-            + "Use '?' for the unused day-of-month or day-of-week field (they are mutually exclusive). "
-            + "\"0 0 9 * * *\" means 9am local — no timezone conversion needed.\n"
+            + "The day-of-month and day-of-week fields are mutually exclusive — exactly one of them MUST be \"?\" "
+            + "(never \"*\", even when you mean \"every day\"). "
+            + "\"0 0 9 ? * *\" means 9am local — no timezone conversion needed. "
+            + "Day-of-week numbering is 1=Sunday ... 7=Saturday, so \"? * 2-6\" means Monday-Friday.\n"
             + "\n"
             + "## One-shot tasks (recurring: false)\n"
             + "\n"
@@ -201,15 +213,15 @@ public class CronCreateTool implements Tool {
             + "## Recurring jobs (recurring: true, the default)\n"
             + "\n"
             + "For \"every N minutes\" / \"every hour\" / \"weekdays at 9am\" requests:\n"
-            + "  \"0 */5 * * * *\" (every 5 min), \"0 0 * * * *\" (hourly), \"0 0 9 * * 1-5\" (weekdays at 9am local)\n"
+            + "  \"0 */5 * ? * *\" (every 5 min), \"0 0 * ? * *\" (hourly), \"0 0 9 ? * 2-6\" (weekdays at 9am local)\n"
             + "\n"
             + "## Avoid the :00 and :30 minute marks when the task allows it\n"
             + "\n"
             + "Every user who asks for \"9am\" gets `0 9`, and every user who asks for \"hourly\" gets `0 *` — "
             + "which means requests from across the planet land on the API at the same instant. When the user's "
             + "request is approximate, pick a minute that is NOT 0 or 30:\n"
-            + "  \"every morning around 9\" → \"0 57 8 * * *\" or \"0 3 9 * * *\" (not \"0 0 9 * * *\")\n"
-            + "  \"hourly\" → \"0 7 * * * *\" (not \"0 0 * * * *\")\n"
+            + "  \"every morning around 9\" → \"0 57 8 ? * *\" or \"0 3 9 ? * *\" (not \"0 0 9 ? * *\")\n"
+            + "  \"hourly\" → \"0 7 * ? * *\" (not \"0 0 * ? * *\")\n"
             + "  \"in an hour or so, remind me to...\" → pick whatever minute you land on, don't round\n"
             + "\n"
             + "Only use minute 0 or 30 when the user names that exact time and clearly means it (\"at 9:00 sharp\", "
@@ -301,8 +313,9 @@ public class CronCreateTool implements Tool {
      * <ol>
      *   <li><b>1</b> 非法 cron：errorCode1 闸门失败（CC :83-89 parseCronExpression；B5 全 6 字段
      *       委托 Quartz——5 段经 toQuartz6Field 兼容、6 段透传，终值以
-     *       {@code CronExpression.isValidExpression} 校验，见下方法体；IMPL-03 追加 '?' 占位
-     *       说明——dom/dow 互斥：一个字段用具体值/部分通配时，另一个须用 '?' 占位，✗-G）</li>
+     *       {@code CronExpression.isValidExpression} 校验，见下方法体；cron-6field-contract
+     *       起报错由 {@link CronExpressionConverter#invalidCronMessage} 单一真源产出——dom/dow
+     *       互斥诊断命中给可照写建议串，否则按「字段数 != 6」/「6 段值越界」分流）</li>
      *   <li><b>2</b> 一年内无匹配日期（CC :90-96；IMPL-03/NEW-1 自建 366 天上限——
      *       {@link CronExpressionConverter#hasMatchWithinYear}，CC cron.ts:138
      *       {@code maxIter = 366 * 24 * 60} 分钟等价）</li>
@@ -311,9 +324,13 @@ public class CronCreateTool implements Tool {
      * </ol>
      *
      * <p>errorCode2-4 消息文本逐字对齐 CC（含 errorCode 字符串）；errorCode1 消息按决策#5 为
-     * 6 字段契约文本（'Expected 6 fields: S M H DoM Mon DoW.'，CC CronCreateTool.ts:86 为
-     * 5 字段，被决策#5 覆写为 Java 端判断措辞），IMPL-03 追加 '?' 占位说明句（追加式，
-     * 决策#5「只补占位提示不逐字改文本」）。错误码 4 的 teammate predicate 用
+     * 6 字段契约文本，但 cron-6field-contract 起改为<b>按真正原因分流</b>（单一真源
+     * {@link CronExpressionConverter#invalidCronMessage}）：dom/dow 互斥诊断命中 → 给建议串；
+     * 字段数 != 6 → 'Expected 6 fields: S M H DoM Mon DoW (day-of-month and day-of-week must
+     * have exactly one '?').'（CC CronCreateTool.ts:86 为 5 字段，被决策#5 覆写为 Java 端措辞）；
+     * 6 段值越界 → 'Field values out of range (...)'。旧文案恒为 'Expected 6 fields ... Use '?'
+     * for the unused ... field.'，在字段数本来就正确时误导模型数字段（cron-6field-contract 修复）。
+     * 错误码 4 的 teammate predicate 用
      * {@link TeammateContext#getTeammateContext()}（对齐 CC 真源 :107 + CronDeleteTool:195 既有
      * 约定；Java 当前无 teammate agentId 字段，WF-B/D 补 → 登记 WF-A-OD-11）。
      *
@@ -330,8 +347,10 @@ public class CronCreateTool implements Tool {
         //   toQuartzCronVariants 将 5 段经 toQuartz6Field 兼容（OPD-Cron-T1-01「写工具兼容 5 段并
         //   也支持 6 段」）/ 6 段透传校验 / dom-dow 双约束拆 2 变体（OR），任一变体须 Quartz
         //   CronExpression.isValidExpression 合法（B5 较 B1 更严：秒/分 61-99 越界亦拒）。
-        //   消息契约文本 6 字段（'Expected 6 fields: S M H DoM Mon DoW.'，CC :86 为 5 字段被覆写）
-        //   + IMPL-03 追加 '?' 占位说明（dom/dow 互斥：具体 dom 时 dow 用 '?'，反之亦然，✗-G）。
+        //   消息由 CronExpressionConverter.invalidCronMessage 单一真源产出（cron-6field-contract）：
+        //   6 字段契约文本保留（CC :86 为 5 字段被决策#5 覆写），但按真正原因分流——dom/dow 互斥
+        //   诊断命中给建议串；字段数 != 6 / 6 段值越界分别给对应文案（旧文案恒 'Expected 6 fields'
+        //   在字段数正确时误导模型）。
         List<String> gateVariants = CronExpressionConverter.toQuartzCronVariants(cron);
         boolean cronValid = gateVariants != null && !gateVariants.isEmpty()
             && gateVariants.stream().allMatch(CronExpression::isValidExpression);
@@ -340,9 +359,7 @@ public class CronCreateTool implements Tool {
                 log.debug("CronCreateTool.validateInput: errorCode1 非法 cron，cron=[{}] 变体=[{}] "
                         + "（5 段/6 段任一合法即通过，委托 Quartz 6 字段校验）", cron, gateVariants);
             }
-            return ValidationResult.fail("1",
-                "Invalid cron expression '" + cronDisp + "'. Expected 6 fields: S M H DoM Mon DoW. "
-                + "Use '?' for the unused day-of-month or day-of-week field.");
+            return ValidationResult.fail("1", CronExpressionConverter.invalidCronMessage(cronDisp));
         }
         // errorCode 2 · CC :90-96 nextCronRunMs === null（一年内无匹配）
         //   IMPL-03（NEW-1 已定方向）: CC cron.ts:138 maxIter=366*24*60 分钟超限即 null → errorCode2；
@@ -385,12 +402,14 @@ public class CronCreateTool implements Tool {
             .put("type", "string")
             // 决策#5: LLM 契约文本 6 字段（含前导秒 + DoW '?' 占位），与 DB/Quartz 6 字段存储一致。
             // CC CronCreateTool.ts:31-32 为 5 字段描述（'M H DoM Mon DoW'），被决策#5 覆写。
+            // cron-6field-contract: 示例全部改为 Quartz 2.5.0 实测合法形（dom/dow 恰一个 '?'）；
+            // ❌ 反例刻意保留（两个 '*' 会被拒）以正面教会模型硬规则。
             .put("description",
-                "标准 6 字段 cron 表达式（按本地时间）：\"S M H DoM Mon DoW\" "
-                + "（前导为秒字段；day-of-month 与 day-of-week 互斥：一个字段用具体值/部分"
-                + "通配时，另一个须用 \"?\" 占位），"
-                + "例如 \"0 */5 * * * *\" = 每 5 分钟，"
-                + "\"0 30 14 28 2 ?\" = 本地时间 2 月 28 日 14:30 执行一次。"));
+                "标准 6 字段 cron（本地时间）：\"秒 分 时 日 月 周\"。"
+                + "硬规则：\"日\" 与 \"周\" 两个字段必须且只能有一个写成 \"?\"，另一个即使想每天都匹配也不能写 \"*\"。"
+                + "✅ \"0 */5 * ? * *\"（每 5 分钟）、\"0 30 14 28 2 ?\"（2 月 28 日 14:30）；"
+                + "❌ \"0 */5 * * * *\"（日/周都是 *，会被拒）。"
+                + "周编号：1=周日 … 7=周六（\"周一至周五\" 写 \"? * 2-6\"）。"));
         props.set("prompt", JSON.createObjectNode()
             .put("type", "string")
             .put("description", "每次触发时入队的 prompt。"));
@@ -464,10 +483,7 @@ public class CronCreateTool implements Tool {
         //    (dom-only + dow-only, 并集 = CC cron.ts:151-158 OR 语义), 其余 → 单变体.
         List<String> cronVariants = CronExpressionConverter.toQuartzCronVariants(cron);
         if (cronVariants == null || cronVariants.isEmpty()) {
-            return ToolResult.error(call.id(),
-                "CronCreateTool: invalid cron expression '" + cron + "'. "
-                + "Expected 6 fields: S M H DoM Mon DoW. "
-                + "Use '?' for the unused day-of-month or day-of-week field.");
+            return ToolResult.error(call.id(), CronExpressionConverter.invalidCronMessage(cron));
         }
 
         // 2. 字段映射 (CC → Java)

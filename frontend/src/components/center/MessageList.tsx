@@ -814,15 +814,25 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     }
     return rows
   }, [groups, apiErrorMap, rowKey])
-  // 会话内容首条 id 变化（切换会话/清空历史/F5 尾页重拉）→ 滚到底（=最新回复），不沿用上一会话滚动位置；
-  //   等容器绑 + 内容渲染后再滚（setTimeout 0）
+  // 【根因·「加载更早」跳底】原依赖是 [messages[0]?.id]，注释称「会话内容首条 id 变化 → 滚到底」。
+  //   但 prependMessages 把更早页 unshift 到数组【头部】→ messages[0].id 必然变化 → 本 effect 把
+  //   「向上扩展历史」误判成「切换会话」，重置 nearBottom 并 setTimeout(0) 调 stickBottom()
+  //   （scrollTop = scrollHeight）。它与 loadOlderClick 的高度补偿 rAF 构成竞态：
+  //     · timer 先跑 → 写到底部；随后 rAF 再 `scrollTop += Δ`（已到底被钳）→ 仍在底部；
+  //     · rAF 先跑 → 补偿正确；随后 timer 覆盖成 scrollHeight → 仍跳到底部。
+  //   两种时序都落到底部 = 用户报的「点加载更早直接跳到底」。这就是「哪一行赢了竞争」：
+  //   赢家是 setTimeout 的 stickBottom()（旧 effect:823），因为它写的是绝对底部、而补偿只做相对位移。
+  //   修法（非补丁）：reset 的判据从「首条消息 id」（会被 prepend 噪声触发）换成【会话身份】
+  //   （sessionId + conversationId）——只有真正切换会话 / partial 压缩·裁剪旋转 conversationId 才重置。
+  //   prepend 不改变身份，故不再触发，loadOlderClick 的 rAF 成为唯一写者，锚定生效。
+  //   语义保持：切会话/压缩裁剪仍回到最新（滚到底），不沿用上一会话滚动位置。
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     nearBottomRef.current = true
     onNearBottomChangeRef.current?.(true)
     const t = window.setTimeout(() => stickBottom(), 0)
     return () => window.clearTimeout(t)
-  }, [messages[0]?.id])
+  }, [sessionId, conversationId])
   // [window-paging] hasMore（会话有更早历史）→ 顶部「加载更早」按钮；App onLoadOlder 拉前页 prependMessages。
   const hasMore = useChatStore((s) => (sessionId ? s.hasMore[sessionId] : undefined))
   const [loadingOlder, setLoadingOlder] = useState(false)

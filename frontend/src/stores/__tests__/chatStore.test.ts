@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createChatStore } from '../chatStore'
+import { createChatStore, MESSAGE_WINDOW_KEEP, MESSAGE_WINDOW_MAX, IMAGE_CACHE_MAX_PER_SESSION } from '../chatStore'
 import type { ChatMessageDto } from '../../api/types'
 
 /** 测试用最小 ChatMessageDto（避免每个用例重复造全字段）。 */
@@ -267,5 +267,152 @@ describe('chatStore hasMore / prependMessages（[window-paging] 有界历史窗�
     s.getState().prependMessages('sess-1', [boundary, baseMsg('m4')], false)
     expect(s.getState().snippedIds['sess-1']).toEqual(['u1', 'u2'])
     expect(s.getState().hasMore['sess-1']).toBe(false)
+  })
+})
+
+// [内存] messages 硬顶：原实现四条追加路径全不裁剪 + 切会话缓存非空不重拉 → 无界涨（WebView2 实测 1.2GB）。
+// 这些用例守住「追加有界」与「prepend 不被 append 立刻吃掉」两条不变量 —— 若有人给某条追加路径
+// 去掉 capTail，长度断言会立即失败（测试验证的是「为何重要」：内存必须有界）。
+describe('chatStore 有界窗口（[内存] messages 硬顶）', () => {
+  const many = (n: number, sid = 'sess-1', prefix = 'm') =>
+    Array.from({ length: n }, (_, i) => baseMsg(`${prefix}${i}`, sid))
+
+  it('finalizeBlocks 追加超过 MESSAGE_WINDOW_KEEP → 从头部裁剪，长度稳定在 N（WHY：messages 只增不减是 renderer 1.2GB 根因）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_KEEP)) // m0..m299（=KEEP）
+    s.getState().ensureStreamBlock('sess-1', 'turn-x')
+    s.getState().appendChunk('sess-1', 'turn-x', '正文')
+    s.getState().finalizeBlocks('sess-1')
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP)      // 301 → 裁回 300
+    expect(msgs.some((m) => m.id === 'm0')).toBe(false) // 最老的被裁掉
+    expect(msgs[msgs.length - 1].id).toBe('turn-x')     // 最新（块落库）仍在
+  })
+
+  it('appendMetaUser / expirePermission 追加同样受硬顶（WHY：追加路径必须统一收敛到一个裁剪函数，漏一条即再泄漏）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_KEEP))
+    s.getState().appendMetaUser('sess-1', 'meta-1')
+    let msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP)
+    expect(msgs[msgs.length - 1].id).toBe('meta-1')
+    expect(msgs.some((m) => m.id === 'm0')).toBe(false)
+
+    s.getState().enqueuePermission({ kind: 'message', sessionId: 'sess-1', requestId: 'r1', toolName: 'edit' })
+    s.getState().expirePermission('sess-1', 'r1')
+    msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP) // 超时留痕也不得撑破窗口
+  })
+
+  it('prepend 更早页后 append 不立刻吃掉它（WHY：prepend 是用户显式行为，不能被后台追加无声抹掉）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_KEEP))          // m0..m299
+    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true) // +50 → 350（< MAX）
+    expect(s.getState().messages['sess-1']).toHaveLength(MESSAGE_WINDOW_KEEP + 50)
+    expect(s.getState().extendedWindow['sess-1']).toBe(true)
+
+    s.getState().ensureStreamBlock('sess-1', 'turn-y')
+    s.getState().appendChunk('sess-1', 'turn-y', 'x')
+    s.getState().finalizeBlocks('sess-1') // append 一次：上限放宽到 MAX → 不得回落到 KEEP
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP + 51)
+    expect(msgs.some((m) => m.id === 'old0')).toBe(true) // 刚加载的更早页仍在
+  })
+
+  it('prepend 达到绝对硬顶 MESSAGE_WINDOW_MAX → 头部裁剪（最老的先走），总量有界（WHY：prepend 也不能无限）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_MAX))            // m0..m499（=MAX）
+    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true) // 550 → 裁回 500
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_MAX)
+    // 明确行为：新到的更早页被同一次头部裁剪舍弃（尾部实时内容必须保住）
+    expect(msgs.some((m) => m.id === 'old0')).toBe(false)
+  })
+
+  it('clearSession 释放该会话全部会话级状态（含 imageCache/hasMore/msgTotals/snippedIds）（WHY：删会话后这些键永不读取，纯占内存）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m1')])
+    s.getState().setHasMore('sess-1', true)
+    s.getState().setMsgTotal('sess-1', 9)
+    s.getState().markSnipped('sess-1', ['u1'])
+    s.getState().setImageCache('sess-1', { img1: { mediaType: 'image/png', base64: 'AAA' } })
+    s.getState().setConversationId('sess-1', 'conv-1')
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().appendChunk('sess-1', 'turn-a', 'x') // 置 streamTicks
+    s.getState().clearSession('sess-1')
+    const st = s.getState()
+    expect(st.messages['sess-1']).toBeUndefined()
+    expect(st.streams['sess-1']).toBeUndefined()
+    expect(st.imageCache['sess-1']).toBeUndefined()
+    expect(st.hasMore['sess-1']).toBeUndefined()
+    expect(st.msgTotals['sess-1']).toBeUndefined()
+    expect(st.snippedIds['sess-1']).toBeUndefined()
+    expect(st.conversationIds['sess-1']).toBeUndefined()
+    expect(st.streamTicks['sess-1']).toBeUndefined()
+    expect(st.extendedWindow['sess-1']).toBeUndefined()
+  })
+})
+
+describe('chatStore imageCache 淘汰上限（[内存] base64 永不释放 → 有界）', () => {
+  it('setImageCache 超 IMAGE_CACHE_MAX_PER_SESSION 按插入序淘汰最旧、保留最新（WHY：粘贴/缩略图 base64 每条数 MB）', () => {
+    const s = createChatStore()
+    const img = (i: number) => ({ [`img${i}`]: { mediaType: 'image/png', base64: 'A'.repeat(8) } })
+    const bulk = Object.assign({}, ...Array.from({ length: IMAGE_CACHE_MAX_PER_SESSION + 1 }, (_, i) => img(i)))
+    s.getState().setImageCache('sess-1', bulk)
+    const cache = s.getState().imageCache['sess-1'] ?? {}
+    expect(Object.keys(cache)).toHaveLength(IMAGE_CACHE_MAX_PER_SESSION)
+    expect(cache['img0']).toBeUndefined()                                  // 最旧被淘汰
+    expect(cache[`img${IMAGE_CACHE_MAX_PER_SESSION}`]).toBeDefined()       // 最新保留
+  })
+
+  it('setImageCache 会话间隔离（WHY：A 会话图片淘汰不得影响 B 会话）', () => {
+    const s = createChatStore()
+    s.getState().setImageCache('sess-1', { a: { mediaType: 'image/png', base64: 'A' } })
+    s.getState().setImageCache('sess-2', { b: { mediaType: 'image/png', base64: 'B' } })
+    expect(s.getState().imageCache['sess-1']?.['a']).toBeDefined()
+    expect(s.getState().imageCache['sess-2']?.['b']).toBeDefined()
+  })
+})
+
+// [内存] appendMessages 是 App 三条本地追加路径（queue.drained 排队气泡 / away-summary 回插 / 发送成功
+// 乐观 user 气泡）的唯一入口。这些路径原先各自 setMessages([...prev, new]) 绕过裁剪 —— 其中 away-summary
+// 由 blur 触发、不保证随后有 finalize 兜底 → 该会话生命周期内只增不减（核验复现 300+400=700）。
+// 本组守住「本地追加也有界」这条不变量：若有人改回 setMessages 拼接，长度断言会立即失败。
+describe('chatStore appendMessages（[内存] 本地追加也必须有界）', () => {
+  it('连续 append 超过 MESSAGE_WINDOW_KEEP → 长度稳定在 N，不随追加次数增长（WHY：核验曾复现 300+400=700）', () => {
+    const s = createChatStore()
+    for (let i = 0; i < MESSAGE_WINDOW_KEEP + 400; i++) {
+      s.getState().appendMessages('sess-1', [baseMsg(`a${i}`)])
+    }
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP)   // 700 → 稳定 300
+    expect(msgs.some((m) => m.id === 'a0')).toBe(false)  // 最老的先走
+    expect(msgs[msgs.length - 1].id).toBe(`a${MESSAGE_WINDOW_KEEP + 399}`) // 最新仍在
+  })
+
+  it('单次批量追加超上限同样裁到 N（WHY：queue.drained 一次可回插多条）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', Array.from({ length: MESSAGE_WINDOW_KEEP }, (_, i) => baseMsg(`m${i}`)))
+    s.getState().appendMessages('sess-1', Array.from({ length: 150 }, (_, i) => baseMsg(`batch${i}`)))
+    expect(s.getState().messages['sess-1']).toHaveLength(MESSAGE_WINDOW_KEEP)
+  })
+
+  it('空追加早退、保持数组引用稳定（WHY：避免无谓重渲）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m1')])
+    const before = s.getState().messages
+    s.getState().appendMessages('sess-1', [])
+    expect(s.getState().messages).toBe(before)
+  })
+
+  it('prepend 扩容后 appendMessages 同样放宽到 MAX，不立刻吃掉更早页（WHY：显式行为不被后台追加抹掉）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', Array.from({ length: MESSAGE_WINDOW_KEEP }, (_, i) => baseMsg(`m${i}`)))
+    s.getState().prependMessages('sess-1', Array.from({ length: 50 }, (_, i) => baseMsg(`old${i}`)), true)
+    s.getState().appendMessages('sess-1', [baseMsg('new1')])
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP + 51)   // 未回落 KEEP
+    expect(msgs.some((m) => m.id === 'old0')).toBe(true)  // 更早页仍在
+    expect(msgs[msgs.length - 1].id).toBe('new1')
   })
 })

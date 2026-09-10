@@ -24,9 +24,18 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.DayOfWeek;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -43,8 +52,9 @@ import static org.mockito.Mockito.when;
  * <ul>
  *   <li>validateInput 四错误码（CC :82-116 顺序 1→2→3→4）：1 非法 cron / 2 一年无匹配 /
  *       3 超 MAX_JOBS / 4 durable+teammate 冲突；errorCode2-4 消息逐字对齐 CC，
- *       errorCode1 消息按决策#5 为 6 字段契约文本（'Expected 6 fields: S M H DoM Mon DoW.'
- *       + IMPL-03 追加 '?' 占位说明，dom/dow 互斥）；errorCode2 自建 366 天上限
+ *       errorCode1 消息按决策#5 为 6 字段契约文本（CronExpressionConverter.invalidCronMessage
+ *       单一真源：dom/dow 互斥诊断命中 → 给可照写建议串；字段数不足 → 'Expected 6 fields...'；
+ *       6 段值越界 → 'Field values out of range...'）；errorCode2 自建 366 天上限
  *       （IMPL-03/NEW-1：CronExpressionConverter.hasMatchWithinYear，CC cron.ts:138 maxIter 等价）；</li>
  *   <li>effectiveDurable kill-switch（CC :120）：durable=true 但 {@code cron-durable} 门 false →
  *       effectiveDurable=false → SESSION-only（tool_result where 子句 "Session-only..." 可观测）；</li>
@@ -62,6 +72,9 @@ import static org.mockito.Mockito.when;
 class CronCreateToolCcContractTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** 抽取文案里 "..." 引号内文本（跨字母/中文/空格均可，供 cron 示例合法性防回归用）。 */
+    private static final Pattern QUOTED = Pattern.compile("\"([^\"\\n]+)\"");
 
     /** 构造 mock 创建的 schedule 任务（execute 断言用，renderResult 只读 id）。 */
     private static ScheduleDto created(String id, ScheduleScope scope) {
@@ -174,10 +187,28 @@ class CronCreateToolCcContractTest {
 
         assertThat(r.ok()).isFalse();
         assertThat(r.message())
-            .as("决策#5: errorCode1 消息 6 字段契约文本（S M H DoM Mon DoW，CC 为 5 字段被决策覆写）"
-                + " + IMPL-03 追加 '?' 占位说明（dom/dow 互斥，LLM 可改写）")
-            .isEqualTo("Invalid cron expression 'bad cron'. Expected 6 fields: S M H DoM Mon DoW. "
-                + "Use '?' for the unused day-of-month or day-of-week field.");
+            .as("cron-6field-contract: 'bad cron' 仅 2 段 → 走字段数分支（6 字段契约文本保留，"
+                + "并把 dom/dow '?' 互斥硬规则写进报错，避免模型不知道真正原因）")
+            .isEqualTo("Invalid cron expression 'bad cron'. Expected 6 fields: S M H DoM Mon DoW "
+                + "(day-of-month and day-of-week must have exactly one '?').");
+    }
+
+    @Test
+    @DisplayName("cron-6field-contract: 6 段内字段越界（字段数正确）→ errorCode 1 + 越界文案（不误报字段数）")
+    void validateInput_errorCode1_fieldValuesOutOfRange() {
+        CronCreateTool tool = new CronCreateTool(mock(ScheduleService.class), CronEnabledGates.DEFAULTS);
+
+        // '0 0 99 * * ?'：6 段、dom='*'/dow='?' 已互斥 → 非互斥原因；真正原因是 hour 99 越界。
+        // 报错必须指向值域而非字段数（旧文案恒 "Expected 6 fields" 会误导模型去数字段）。
+        Tool.ValidationResult r = tool.validateInput(
+            call("c1", input("0 0 99 * * ?", "p", null, null)).input(), null);
+
+        assertThat(r.ok()).isFalse();
+        assertThat(r.errorCode()).isEqualTo("1");
+        assertThat(r.message())
+            .as("6 段 + 值越界 → 值域文案（sec 0-59 … month 1-12），不得再提 Expected 6 fields")
+            .isEqualTo("Invalid cron expression '0 0 99 * * ?'. Field values out of range "
+                + "(sec 0-59, min 0-59, hour 0-23, day-of-month 1-31, month 1-12).");
     }
 
     @Test
@@ -206,21 +237,25 @@ class CronCreateToolCcContractTest {
     }
 
     @Test
-    @DisplayName("IMPL-03: 6 段 dom+dow 双具体（无 ?）→ errorCode 1 + 消息含 ? 占位说明（✗-G）")
+    @DisplayName("cron-6field-contract: 6 段 dom/dow 双非 '?' → errorCode 1 + 互斥诊断 + 可照写建议串")
     void validateInput_errorCode1_6fieldDualSpecific_placeholderHint() {
         CronCreateTool tool = new CronCreateTool(mock(ScheduleService.class), CronEnabledGates.DEFAULTS);
 
-        // '0 0 9 * * 1-5'：dom='*' + dow='1-5' 双具体 → Quartz 互斥规则拒绝（isValidExpression=false）
-        // → errorCode1；IMPL-03 追加 '?' 占位说明（dom/dow 互斥：一方具体另一方须 '?'，LLM 可改写）。
+        // '0 0 9 * * 1-5'：dom='*' + dow='1-5' 双非 '?' → Quartz 2.5.0 硬规则拒绝
+        // （dom/dow 必须且只能有一个是 '?'，两个 '*' 拒、两个 '?' 也拒）→ errorCode1。
+        // 报错须命中互斥诊断分支：dow 具体 → 建议 dom 改 '?'（保留 dow 约束），并给出完整建议串。
         Tool.ValidationResult r = tool.validateInput(
             call("c1", input("0 0 9 * * 1-5", "p", null, null)).input(), null);
 
         assertThat(r.ok()).isFalse();
         assertThat(r.errorCode()).isEqualTo("1");
         assertThat(r.message())
-            .as("IMPL-03/✗-G: errorCode1 消息须含 '?' 占位说明（dom/dow 互斥），且保留决策#5 6 字段文本主体")
-            .contains("Expected 6 fields: S M H DoM Mon DoW")
-            .contains("Use '?' for the unused day-of-month or day-of-week field");
+            .as("errorCode1 须命中 dom/dow 互斥诊断（而非 'Expected 6 fields' 误导字段数）")
+            .contains("must have exactly one '?'")
+            .contains("day-of-month='*'")
+            .contains("day-of-week='1-5'")
+            .as("须给出建议后的完整串，模型可直接照写")
+            .contains("0 0 9 ? * 1-5");
     }
 
     @Test
@@ -339,6 +374,100 @@ class CronCreateToolCcContractTest {
             .as("B5-1 §5 improvement：5 段 dow 区间 '1-5' 经 toQuartzDow 重编号 '2,3,4,5,6' → "
                 + "toQuartz6Field '0 0 9 ? * 2,3,4,5,6' Quartz 合法 → errorCode1 由拒变过（对齐全 6 字段方向，勿修回）")
             .isTrue();
+    }
+
+    // ═════════════ cron-6field-contract · 契约示例合法性防回归 + 6 段 dow 编号钉死 ═════════════
+    // WHY（规则九 · 测试验证意图）: 工具 prompt()/inputSchema 里的 cron 示例是"给模型看的唯一契约"，
+    // 一旦写成 Quartz 拒收的非法形（dom/dow 双非 '?'），模型照抄即被 errorCode1 拒 → 工具不可用。
+    // 旧文案里 6 个示例有 3 个非法（'0 */5 * * * *' / '0 0 9 * * 1-5' / '0 7 * * * *'，实测 Quartz
+    // 2.5.0 拒绝）。本组用例把"文案每个示例必须过 validateInput"钉死，任何未来改动写回非法示例立即变红。
+
+    /** 抽取文案里 "..." 引号内的 6 段 cron 示例（跳过 <today_dom> 占位符与 ❌ 反例）。 */
+    private static List<String> extractCronExamples(String text) {
+        List<String> out = new ArrayList<>();
+        Matcher m = QUOTED.matcher(text);
+        while (m.find()) {
+            String quoted = m.group(1).trim();
+            String[] parts = quoted.split("\\s+");
+            if (parts.length != 6) continue;
+            boolean cronish = true;
+            for (String t : parts) {
+                if (!t.matches("[0-9*/?,\\-]+")) { cronish = false; break; }
+            }
+            if (!cronish) continue; // 跳过 '秒 分 时 日 月 周' / '<today_dom>' 等非 cron 引文
+            int from = Math.max(0, m.start() - 6);
+            if (text.substring(from, m.start()).contains("❌")) continue; // 跳过刻意反例（schema 里的 ❌ 示例）
+            out.add(quoted);
+        }
+        return out;
+    }
+
+    @Test
+    @DisplayName("cron-6field-contract: prompt()+inputSchema 每个 cron 示例都必须过 validateInput（防再写非法示例）")
+    void promptAndSchemaExamples_allValid() {
+        ScheduleService svc = mock(ScheduleService.class);
+        when(svc.listAll()).thenReturn(List.of());
+        CronCreateTool tool = new CronCreateTool(svc, CronEnabledGates.DEFAULTS);
+
+        String prompt = tool.prompt();
+        String schemaDesc = tool.inputSchema().path("properties").path("cron")
+            .path("description").asText();
+        List<String> examples = new ArrayList<>(extractCronExamples(prompt));
+        int fromPrompt = examples.size();
+        examples.addAll(extractCronExamples(schemaDesc));
+
+        assertThat(fromPrompt).as("prompt() 必须至少抽出 6 个 cron 示例（契约段 + recurring + 抖动建议）")
+            .isGreaterThanOrEqualTo(6);
+        assertThat(examples)
+            .as("规格要求的合法示例必须全部在文案中（缺一即文案被削）")
+            .contains("0 0 9 ? * *", "0 */5 * ? * *", "0 0 * ? * *", "0 0 9 ? * 2-6",
+                "0 57 8 ? * *", "0 3 9 ? * *", "0 7 * ? * *", "0 30 14 28 2 ?");
+        for (String ex : examples) {
+            Tool.ValidationResult r = tool.validateInput(call("c1", input(ex, "p", null, null)).input(), null);
+            assertThat(r.ok())
+                .as("文案示例 '%s' 必须 Quartz 合法（validateInput 放行）；模型照抄不得被 errorCode1 拒", ex)
+                .isTrue();
+        }
+        assertThat(prompt)
+            .as("prompt() 不得再含非法示例（dom/dow 双非 '?'，Quartz 2.5.0 实测拒绝）")
+            .doesNotContain("0 */5 * * * *", "0 0 9 * * 1-5", "0 7 * * * *");
+    }
+
+    @Test
+    @DisplayName("cron-6field-contract: 6 段直通下 dow 编号 1=周日…7=周六（'? * 2-6' = 周一至周五）")
+    void sixFieldDowNumbering_pinsSundayFirst() {
+        // WHY（规则九）: 6 段输入直通 Quartz 不重编号（5 段才经 toQuartzDow +1 重编号）是两个世界。
+        // 文案写 "? * 2-6 = 周一至周五" 的前提是 6 段世界里 1=周日 —— 本用例用固定锚点 + 固定时区
+        // 逐次触发把星期集合钉死，防"文案说 2-6=周一~周五但引擎实际算成周二~周六"的静默错位。
+        ZoneId sh = ZoneId.of("Asia/Shanghai");
+        long anchor = ZonedDateTime.of(LocalDateTime.of(2026, 9, 6, 0, 0), sh) // 2026-09-06 为周日
+            .toInstant().toEpochMilli();
+
+        Set<DayOfWeek> monToFri = new LinkedHashSet<>();
+        long cursor = anchor;
+        for (int i = 0; i < 10; i++) {
+            Long next = CronExpressionConverter.nextCronRunMs("0 0 9 ? * 2-6", cursor, sh);
+            assertThat(next).as("'0 0 9 ? * 2-6' 第 %d 次触发不得为 null", i + 1).isNotNull();
+            monToFri.add(Instant.ofEpochMilli(next).atZone(sh).getDayOfWeek());
+            cursor = next;
+        }
+        assertThat(monToFri)
+            .as("6 段直通：dow 2-6 = 周一~周五（若被 5 段转换器重编号则会落到周二~周六）")
+            .containsExactlyInAnyOrder(DayOfWeek.MONDAY, DayOfWeek.TUESDAY,
+                DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY, DayOfWeek.FRIDAY);
+
+        Set<DayOfWeek> sunToThu = new LinkedHashSet<>();
+        cursor = anchor;
+        for (int i = 0; i < 10; i++) {
+            Long next = CronExpressionConverter.nextCronRunMs("0 0 9 ? * 1-5", cursor, sh);
+            assertThat(next).as("'0 0 9 ? * 1-5' 第 %d 次触发不得为 null", i + 1).isNotNull();
+            sunToThu.add(Instant.ofEpochMilli(next).atZone(sh).getDayOfWeek());
+            cursor = next;
+        }
+        assertThat(sunToThu)
+            .as("对照 '? * 1-5' = 周日~周四（证明 1=周日、7=周六，与 '? * 2-6' 差一天）")
+            .containsExactlyInAnyOrder(DayOfWeek.SUNDAY, DayOfWeek.MONDAY, DayOfWeek.TUESDAY,
+                DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY);
     }
 
     // ═════════════ effectiveDurable kill-switch + tool_result 文本（CC :117-153）═════════════
