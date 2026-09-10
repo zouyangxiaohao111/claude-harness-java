@@ -399,7 +399,7 @@ class ManualCacheClearCcIntegrationTest {
         // 会话存在（clearInvokedSkills 路径可达；注册表内无 state → 各清理 debug skip 不抛）
         com.nexusai.common.RequestContext.setSession("00000000-0000-0000-0000-00000000000c");
 
-        Object dto = controller.executeBuiltin("clear", null);
+        Object dto = controller.executeBuiltin("clear", null, null);
 
         assertThat(dto).isNotNull();
         assertThat(COLLAPSE_RESETS.get())
@@ -441,7 +441,7 @@ class ManualCacheClearCcIntegrationTest {
         state.addInvokedSkill("bg-skill", "/s/bg.md", "c", bgAgent);
         state.addInvokedSkill("main-skill", "/s/main.md", "c", null);
 
-        controller.executeBuiltin("clear", null);
+        controller.executeBuiltin("clear", null, null);
 
         assertThat(state.getInvokedSkillsForAgent(bgAgent)).hasSize(1);
         assertThat(state.getInvokedSkillsForAgent(null)).isEmpty();

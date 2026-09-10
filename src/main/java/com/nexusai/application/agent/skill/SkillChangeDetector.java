@@ -561,6 +561,11 @@ public class SkillChangeDetector implements ApplicationRunner {
             skillRegistry.refresh();
         }
         resetSentSkillNames();
+        // [skill-listing-cc-align 2026-09-10] 进程级 skill_listing sent 注册表同步清空（skill 文件变更后
+        //   下一轮重发）· 对齐 CC skillChangeDetector.ts:276 {@code resetSentSkillNames()} 的既有语义
+        //   （sentSkillNames.clear()）。保留 initialized 标记 → 下轮走「已初始化 + 无 sent」的增量分支 =
+        //   全量重发（skill_listing 重注），与 CC「clear 后 isInitial 重发」等效。
+        SkillListingSentRegistry.resetSentAllSessions();
         emit();
     }
 
@@ -651,7 +656,7 @@ public class SkillChangeDetector implements ApplicationRunner {
      * <ol>
      *   <li>清空所有已注册 sentSkillNames Map —— skill 文件变更后下一轮 skill_listing 重发全部技能；</li>
      *   <li>复位所有已注册 suppressNextSkillListing 为 false —— 取消 pending 的 resume 抑制，使文件
-     *       变更触发的重发不被 suppressNext 吞掉（否则 Java 端 suppressNext 消费（computeSkillListingDelta
+     *       变更触发的重发不被 suppressNext 吞掉（否则 Java 端 suppressNext 消费（旧 computeSkillListingDelta
      *       compareAndSet）会在 clear 后的下一轮仍抑制一次 listing，偏离 CC）。</li>
      * </ol>
      *

@@ -402,9 +402,26 @@ public record AgentLoopContext(
             return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
         }
 
-        /** [P1-10] 已发送 skill name 集合（按 agentKey，空串=主线程）· 对齐 CC attachments.ts:2607 sentSkillNames。 */
+        /**
+         * [P1-10·skill-listing-cc-align 降级为遗留] per-run 已发送 skill name 集合。
+         *
+         * <p><b>2026-09-10 起</b>：真正的 skill_listing 去重状态已迁至进程级
+         * {@link com.nexusai.application.agent.skill.SkillListingSentRegistry}（键 sessionId+agentKey，跨 run 存活）。
+         * 本字段不再被注入逻辑消费，保留原因：① {@code AgentLoopContextFactory.build()} 仍把它注册进
+         * {@link com.nexusai.application.agent.skill.SkillChangeDetector} 静态表，使 skill 文件变更时
+         * {@code resetSentSkillNames()} 的「清全部已注册 sentSkillNames」契约在测试中可验证；
+         * ② 既有测试（SkillChangeDetectorTest / AgentLoopContextFactoryTest）直接读写本字段。
+         */
         private ConcurrentHashMap<String, Set<String>> sentSkillNames = new ConcurrentHashMap<>();
-        /** [P1-10] resume 时抑制下一次 skill_listing 注入 · 一次性，消费后自动 reset · 对齐 CC attachments.ts:2633。 */
+        /**
+         * [P1-10·skill-listing-cc-align 降级为遗留] 旧 resume suppress latch（per-run）。
+         *
+         * <p><b>2026-09-10 起</b>：resume 抑制由 {@code SkillListingSentRegistry} 的 initialized 标记决定
+         * （resume 且未 initialized → 抑制），本 latch 不再被注入逻辑消费。保留原因：① 同上被工厂注册进
+         * {@code SkillChangeDetector} 静态表；② {@code PostCompactAttachmentRestorer.restoreSkillStateFromMessages}
+         * 仍在检测到转录 skill_listing 附件时置真（对齐 CC conversationRecovery 的 suppress 钩子），
+         * LlmAgentLoopResumeRestoreEntryTest 断言该置真行为。
+         */
         private AtomicBoolean suppressNextSkillListing = new AtomicBoolean(false);
         /** [R27-8] todo reminder 文本 memoization 缓存。 */
         private ConcurrentHashMap<String, String> todoReminderCache = new ConcurrentHashMap<>();
@@ -709,70 +726,11 @@ public record AgentLoopContext(
         }
     }
 
-    /**
-     * [P1-10] 按 skill name 增量计算本次应注入的 skill_listing 增量 · 对齐 CC attachments.ts:2699-2730
-     * ({@code getSkillListingAttachments})。替代旧 isSkillCatalogAlreadySent/markSkillCatalogSent 双方法
-     * （C-8 双实现漂移：旧版存 catalogText.hashCode() + enableSkillDedup 开关；CC 语义是恒开 + 按 name）。
-     *
-     * <p>CC 语义（Read 自验 E4）:
-     * <pre>
-     * const agentKey = toolUseContext.agentId ?? ''                    // :2699
-     * let sent = sentSkillNames.get(agentKey); if (!sent) {...set...}  // :2700-2704
-     * if (suppressNext) { 全量标 sent; return [] }                      // :2709-2715
-     * const newSkills = allCommands.filter(cmd => !sent.has(cmd.name)) // :2718
-     * if (newSkills.length === 0) return []                            // :2720-2722
-     * const isInitial = sent.size === 0                                // :2725
-     * for (cmd of newSkills) sent.add(cmd.name)                        // :2727-2730
-     * </pre>
-     *
-     * <p>恒开启：CC sentSkillNames 恒生效，无 enableSkillDedup 开关（X22/dedup 语义偏移根源已删）。
-     * agentKey null → ""（主线程，CC {@code agentId ?? ''}），每 agent 各自独立 sent 集合。
-     *
-     * @param ctx      AgentLoopContext（经 sessionState() 读写 sentSkillNames / suppressNextSkillListing）
-     * @param agentKey agent 标识（主线程传 null 或 ""；subagent 传其 agentId 字符串）
-     * @param commands 全量候选技能命令（CC allCommands，按 name 去重）
-     * @return SkillListingDelta（newSkills 增量子集 + isInitial 是否首注）；无增量 → 空 delta
-     */
-    public static SkillListingDelta computeSkillListingDelta(AgentLoopContext ctx, String agentKey,
-                                                             java.util.List<com.nexusai.model.command.Command> commands) {
-        String key = agentKey != null ? agentKey : "";  // CC: agentId ?? ''
-        // get-or-create sent 集合（CC :2700-2704 sentSkillNames.get(agentKey) ?? new Set）
-        java.util.Set<String> sent = ctx.sessionState().sentSkillNames()
-            .computeIfAbsent(key, k -> java.util.concurrent.ConcurrentHashMap.newKeySet());
-        // resume 抑制路径：全量标已发送再返回空（CC :2709-2715 --resume 已含 listing 时不重复注入）
-        if (ctx.sessionState().suppressNextSkillListing().compareAndSet(true, false)) {
-            for (com.nexusai.model.command.Command cmd : commands) {
-                sent.add(cmd.getName());
-            }
-            return new SkillListingDelta(java.util.List.of(), false);
-        }
-        // newSkills = filter !sent.contains(name)（CC :2718）
-        java.util.List<com.nexusai.model.command.Command> newSkills = commands.stream()
-            .filter(cmd -> !sent.contains(cmd.getName()))
-            .toList();
-        if (newSkills.isEmpty()) {
-            return new SkillListingDelta(java.util.List.of(), false);
-        }
-        // isInitial 必须在标 sent 前取（CC :2725 sent.size === 0）
-        boolean isInitial = sent.isEmpty();
-        for (com.nexusai.model.command.Command cmd : newSkills) {
-            sent.add(cmd.getName());
-        }
-        if (log.isDebugEnabled()) {
-            log.debug("[P1-10 computeSkillListingDelta] agentKey={} newSkills={} isInitial={} sent={} · CC attachments.ts:2699-2730",
-                key, newSkills.size(), isInitial, sent.size());
-        }
-        return new SkillListingDelta(newSkills, isInitial);
-    }
-
-    /**
-     * [P1-10] computeSkillListingDelta 结果载体 · 对齐 CC attachments.ts:2717-2730
-     * {@code newSkills = allCommands.filter(...)} + {@code isInitial = sent.size === 0}。
-     *
-     * @param newSkills 本次应注入的增量子集（CC original: newSkills）
-     * @param isInitial 是否首次全量注入（CC original: isInitial）
-     */
-    public record SkillListingDelta(java.util.List<com.nexusai.model.command.Command> newSkills, boolean isInitial) {}
+    // [skill-listing-cc-align 2026-09-10] 旧 computeSkillListingDelta / SkillListingDelta 已删除：
+    //   sent 集合存在 ctx.sessionState()（LoopSessionState 每 run 重建）→ 每 run isInitial=true、
+    //   newSkills=全量，delta 机器被架空；且其返回值只喂遥测/Haiku，不决定注入什么。决策迁至进程级
+    //   SkillListingSentRegistry.decide(...)（键 sessionId+agentKey，跨 run 存活），注入消息构造见
+    //   skillListingMessage(...)。
 
     /** skill catalog 异步 Haiku 摘要 · static 化自 LlmAgentLoop#triggerSkillCatalogHaikuSummaryAsync。 */
     public static void triggerSkillCatalogHaikuSummaryAsync(AgentLoopContext ctx, AgentState state, String catalogText) {
@@ -2360,10 +2318,11 @@ public record AgentLoopContext(
             if ("hook_stopped_continuation".equals(a.type())) {
                 continue;
             }
-            // [skill-listing-stable] skill_listing 已改为请求头部恒定注入（prependSkillListing，队首 meta
-            //   user 消息，紧跟 system / userContext），不再经本方法队尾重放 —— 避免「同内容每轮队尾重复 +
-            //   位置随 transcript 增长漂移」破坏前缀缓存。历史/遗留 skill_listing attachment 一律跳过渲染
-            //   （对齐 CC「一次生成放头部、后续轮不重放」）；其它 hook attachment（todo_reminder/memory/
+            // [skill-listing-cc-align 2026-09-10] skill_listing 现由 LlmAgentLoop.doRun 每 run 经
+            //   SkillListingSentRegistry.decide 决策、以真实消息（state.appendMessage → 实时落库）尾随
+            //   当前用户消息注入 —— 不再经 state.attachments() + 本方法队尾重放（避免同内容每轮重复 +
+            //   位置随 transcript 增长漂移）。此处恒跳过 skill_listing attachment 渲染：既防与真实注入
+            //   消息双份，也令历史/遗留 attachment 不复活。其它 hook attachment（todo_reminder/memory/
             //   invoked_skills 等）仍走队尾原样。
             if ("skill_listing".equals(a.type())) {
                 continue;
@@ -3129,11 +3088,19 @@ public record AgentLoopContext(
                 }
                 return hookName + " hook success: " + content;
             case "skill_listing":
-                // [P1-10] 对齐 CC utils/messages.ts:3728-3738 normalizeAttachmentForAPI case 'skill_listing':
-                //   wrapMessagesInSystemReminder([createUserMessage({content: `The following skills are
-                //   available for use with the Skill tool:\n\n${attachment.content}`, isMeta:true})])
-                //   wrapInSystemReminder = `<system-reminder>\n${content}\n</system-reminder>`（:3097-3100）
-                //   content 空 → return []（:3729-3731）
+                // [skill-listing-cc-align 2026-09-10 纠偏] 对齐 CC utils/messages.ts:4160-4170
+                //   normalizeAttachmentForAPI case 'skill_listing'（**非**旧注释误引的 :3728-3738 —— 该区间是
+                //   plan-mode pair-planning 指令文本，与 skill_listing 无关；skill_listing 分支经 grep 确认为
+                //   :4160 唯一命中）:
+                //     if (!attachment.content) return []                              // :4161-4163
+                //     return wrapMessagesInSystemReminder([createUserMessage({        // :4164-4170
+                //       content: `The following skills are available for use with the Skill tool:\n\n${attachment.content}`,
+                //       isMeta: true })])
+                //   wrapInSystemReminder = `<system-reminder>\n${content}\n</system-reminder>`。
+                //   注：本 case 现为「形状保留」路径 —— skill_listing 注入自本批起改由 LlmAgentLoop 每 run
+                //   构造真实 user 消息（AgentLoopContext.skillListingMessage）尾随当前用户消息，且本方法
+                //   调用点已 `continue` 跳过 skill_listing（防双份）；保留本 case 仅为与 CC
+                //   normalizeAttachmentForAPI 的 case 面对齐（CC 有对应物，属死代码决策规则的「保留」侧）。
                 return (content == null || content.isBlank()) ? null
                     : "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n"
                         + content + "\n</system-reminder>";
@@ -3973,31 +3940,46 @@ public record AgentLoopContext(
     }
 
     /**
-     * [skill-listing-stable] skill_listing 恒定请求头部块 · 对齐 CC utils/messages.ts:3728-3738
-     * （{@code wrapMessagesInSystemReminder([createUserMessage({content: `The following skills are
-     * available for use with the Skill tool:\n\n${attachment.content}`, isMeta:true})])}）。
+     * [skill-listing-cc-align 2026-09-10] skill_listing 注入消息构造 · 对齐 CC 渲染契约。
      *
-     * <p>替代旧「skill_listing attachment 常驻 {@code state.attachments()} → maybeInjectHookAttachments
-     * 每轮队尾重放」链路：每轮以全量当前技能清单重建本块并置于消息队首（紧跟 system / userContext 之下，
-     * CC「一次生成放头部、字节稳定、后续轮不队尾重放」语义）。技能集合不变 → 字节稳定 → 前缀缓存不断；
-     * 变化 → 随当前清单自动更新；compact 后仍恒在头部（无队尾重发，对齐 CC postCompactCleanup 不重发）；
-     * resume 无需抑制。
+     * <p><b>CC 真源（复核后）</b>：
+     * <ul>
+     *   <li>skill_listing 是 <b>attachment</b>，由 {@code processTextPrompt} 以
+     *       {@code messages: [userMessage, ...attachmentMessages]} 返回（processTextPrompt.ts:97）
+     *       —— 即位于<b>首条用户消息之后</b>，<b>非头部</b>。</li>
+     *   <li>渲染分支 {@code case 'skill_listing'} 仅做 wrapMessagesInSystemReminder +
+     *       {@code createUserMessage({content: `The following skills are available for use with the
+     *       Skill tool:\n\n${attachment.content}`, isMeta:true})}（messages.ts:4160-4170），
+     *       <b>无任何 add(0)/unshift/置首操作</b>。</li>
+     * </ul>
      *
-     * @param messages    当前 LLM 调用消息（在 prependUserContext 之前调用：本块置于 userContext 之下的队首）
+     * <p><b>纠偏记录</b>：nexusai 旧实现与旧注释声称「对齐 CC messages.ts:3728-3738 一次生成放头部」——
+     * 经复核，CC {@code messages.ts:3728-3738} 是 plan-mode 的 pair-planning 指令文本，<b>与
+     * skill_listing 无关</b>，该论证不成立，旧「恒定头部注入」机制系误引产物。现回归：本消息由
+     * {@code LlmAgentLoop.doRun} 在<b>当前用户消息 append 之后</b> 经 {@code state.appendMessage}
+     * 尾随注入并落库，位置与顺序随重放还原。
+     *
+     * @param sessionId   目标会话 id（真实消息落库必需；CC 无此字段，Java 持久化载体要求非 null）
      * @param listingText 预算内技能清单文本（{@code SkillCatalog.formatListing(...)} 产物，CC
      *                    original: attachment.content = formatCommandsWithinBudget(newSkills, ...)）
-     * @return 前置 skill_listing 头部队首后的消息列表（listingText 空/ null → 原列表）
+     * @return isMeta=true 的 user 消息（author='attachment'，subtype='skill_listing'）；
+     *         listingText 空 / null → null（不注入）
      */
-    public static java.util.List<ChatMessageDto> prependSkillListing(
-            java.util.List<ChatMessageDto> messages, String listingText) {
+    public static ChatMessageDto skillListingMessage(String sessionId, String listingText) {
         if (listingText == null || listingText.isBlank()) {
-            return messages;
+            return null;
         }
         String body = "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n"
             + listingText + "\n</system-reminder>";
-        java.util.List<ChatMessageDto> result = new java.util.ArrayList<>(messages);
-        result.add(0, metaUserMessage(body));
-        return result;
+        // author='attachment' + subtype='skill_listing'：与 CC attachment 契约同名，
+        //   使 PostCompactAttachmentRestorer.restoreSkillStateFromMessages 的转录扫描可识别
+        //   （invoked_skills 同 author）。isMeta=true → 前端隐藏元消息（CC createUserMessage({isMeta:true})）。
+        return new ChatMessageDto(
+            UUID.randomUUID().toString(), sessionId, Role.user, "attachment",
+            body, null, java.util.List.of(), null, null, null,
+            "刚刚", java.time.OffsetDateTime.now(), null, null,
+            null, java.util.List.of(), java.util.List.of(), null, true)
+            .withSubtype("skill_listing");
     }
 
     /**

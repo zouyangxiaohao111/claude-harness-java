@@ -337,7 +337,28 @@ public class CommandController {
      */
     @PostMapping("/builtins/{name}/execute")
     public Object executeBuiltin(@PathVariable String name,
+                                 @RequestParam(value = "sessionId", required = false) String sessionIdParam,
                                  @RequestBody(required = false) ResumeExecuteRequest request) {
+        // [finding-2 修复 2026-09-10] 会话标识解析（query ?sessionId= → MDC 兜底，同 /compact 模式
+        //   CommandController:540-549）。WHY 必要：/clear 分支的会话级清理（SessionStartSeenRegistry.remove /
+        //   SkillListingSentRegistry.removeSession / MicroCompactor.removeSessionState /
+        //   sessionGitStatusRegistry.evict）全部读 RequestContext.sessionId()，而 REST 入口无任何 Filter/
+        //   Interceptor 写 MDC → 前端不带 ?sessionId= 时该值恒 null → 全部清理静默 no-op（「/clear 后重发
+        //   整份 skill_listing」生产不成立）。前端 runBuiltin 已透传 activeSessionId（App.tsx）。
+        //   无 sessionId → 保持旧行为（plain JUnit / 未迁移调用方）。
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            return executeBuiltinInternal(name, request);
+        }
+        RequestContext.setSession(sessionIdParam);
+        try {
+            return executeBuiltinInternal(name, request);
+        } finally {
+            RequestContext.clear(); // 防 Tomcat 线程复用残留（无 Filter 写 MDC，仅此处临时注入）
+        }
+    }
+
+    /** {@link #executeBuiltin} 主体 · MDC 会话已在包装层注入（本方法内 RequestContext.sessionId() 可见）。 */
+    private Object executeBuiltinInternal(String name, ResumeExecuteRequest request) {
         Command hit = BuiltInCommands.findByName(name);
         if (hit == null) {
             if (log.isDebugEnabled()) {
@@ -425,6 +446,24 @@ public class CommandController {
             //   → cold 跑副作用但不重注入 → 恒 0 或 1 份、绝无 2 份；「clear 后应见一次新注入」仅在转录真被
             //   清空（无副本）时发生，属产品行为登记项。
             SessionStartSeenRegistry.remove(com.nexusai.common.RequestContext.sessionId());
+            // [skill-listing-cc-align 2026-09-10] skill_listing sent 注册表 · /clear 重置该会话去重态。
+            //   ① CC {@code resetSentSkillNames()} 语义（clear/caches.ts:79）—— clear 后下一次 skill_listing
+            //   要重发<b>整份</b>：本表清 SENT + 保留 INITIALIZED（= CC suppressNext=false）→ 下一 run 走
+            //   增量分支因 sent 空而 isInitial=true 注入整份（对所有已存在 agentKey 槽生效）；另置 CLEARED
+            //   覆盖「该 key 从未初始化就遇 /clear」的场景。
+            //   ② 回收该会话槽位（防多会话常驻 JVM 内存累积）。
+            //   [finding-2 修复] sessionId 来自包装层 executeBuiltin 的 query ?sessionId=（前端 runBuiltin
+            //   透传 activeSessionId）→ 此处 RequestContext.sessionId() 已非 null，removeSession 不再 no-op。
+            //   [2026-09-10 rebase 轮 · 已对齐 CC（原登记为「有意偏离」，现收敛）] nexusai 的 /clear 不删 DB
+            //   消息行（web 转录保留，见上 SessionStartSeenRegistry 注释），而 skill_listing 自本批起是
+            //   <b>真实落库消息</b>：若只 CLEARED/清 sent 重发整份，重放转录时旧的一份仍在 → 同会话出现两份
+            //   等价清单（CC 的 /clear 清空消息故只有一份）。现改为「先插后删」收敛：本处 removeSession 置
+            //   CLEARED → 下次 decide 落分支 1 返回 supersedesPriorRows=true → LlmAgentLoop 置
+            //   AgentState.skillListingSupersedesPriorRows → ChatService.skill_listing 落库分支在插入新整份后
+            //   deleteBySessionAndSubtype(sessionId, "skill_listing", 新份id) 删除旧份 → DB 恒 1 条，
+            //   与 CC /clear「清空 → 重发唯一一份」净效果一致。对齐 §14 hook_additional_context 先插后删先例。
+            com.nexusai.application.agent.skill.SkillListingSentRegistry.removeSession(
+                com.nexusai.common.RequestContext.sessionId());
             // [IMP-E4-06 · E4-XP-W67-01] /clear 前端触发 → 先 SESSION_END(reason='clear') hook
             //   · 对齐 CC conversation.ts:69 executeSessionEndHooks('clear')（清空会话时点，SessionEnd
             //     先于 SessionStart 发射；CC :245 processSessionStartHooks('clear') 在后）。

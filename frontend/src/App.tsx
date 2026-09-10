@@ -1326,12 +1326,13 @@ function App() {
   // ---- 内置命令执行：统一走 executeBuiltin，成功/失败均显式反馈（fail loud）----
   const runBuiltin = useCallback(async (name: string) => {
     try {
-      await commandApi.executeBuiltin(name)
+      // 透传 activeSessionId：/clear 等会话级内置命令的后端清理链读 MDC 会话，不带则 no-op（finding-2）
+      await commandApi.executeBuiltin(name, undefined, activeSessionId ?? undefined)
       showToast(`已执行 /${name}`, 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [showToast])
+  }, [showToast, activeSessionId])
 
   // ---- composer ----
   const sendMessage = useCallback(async (attachments?: AttachmentRequest[]) => {

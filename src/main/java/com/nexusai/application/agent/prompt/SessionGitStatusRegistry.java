@@ -18,9 +18,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * 由 {@code LlmAgentLoop.doRun} 建 mainCtx 后注入 sessionState，loop() 跨 run 复用同一实例，
  * system 尾字节稳定 → 前缀缓存保持命中。
  *
- * <p><b>防无界增长</b>：{@link #evict(String)} 供会话终止路径接线（SessionService.delete /
- * CommandController /clear，仿 {@code SessionAgentStateRegistry.remove} 先例）——/clear 或
- * 会话删除后释放该会话快照，下轮重新快照（等价 CC reset 后新 turn 语义）。
+ * <p><b>防无界增长</b>：{@link #evict(String)} 已接在会话终止路径（
+ * {@code SessionService#delete} 会话删除 / {@code CommandController} /clear）——/clear 或会话
+ * 删除后释放该会话快照，下轮重新快照（等价 CC reset 后新 turn 语义）。
+ *
+ * <p>与 {@code SessionAgentStateRegistry.remove(String)} 的区别：本表存的是<b>可重建</b>的
+ * git status 快照，/clear 与删除都清（clear 后重新快照）；而后者持有不可重建的会话 STATE，
+ * /clear 不清、仅会话删除时移除（CC clearConversation 只清 caches，进程与 STATE 继续）。
  *
  * <p><b>并发</b>：ConcurrentHashMap —— 多会话并行 turn（每会话独立 key）无锁并发安全。
  *

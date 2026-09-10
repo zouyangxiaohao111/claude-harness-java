@@ -80,7 +80,9 @@ import java.util.UUID;
  * <h2>不 reset sentSkillNames</h2>
  * <p>CC 显式<b>不</b>调 {@code resetSentSkillNames()}（:65-69）：压缩后重注入完整 skill_listing
  * 是纯 cache_creation；模型仍有 SkillTool schema，invoked_skills 保留已用技能。Java 端
- * sentSkillNames 状态存于 {@code AgentLoopContext.LoopSessionState}，本序列不触碰。
+ * skill_listing 去重状态存于进程级 {@code SkillListingSentRegistry}（2026-09-10 起，键
+ * sessionId+agentKey），本序列<b>不触碰</b>它 → 压缩后 sent 集合跨压缩存活 → 天然不重注、新技能
+ * 仍走增量（对齐 CC compact.ts:548-553「刻意不 reset」）。
  */
 @Component
 public class PostCompactCleanup {

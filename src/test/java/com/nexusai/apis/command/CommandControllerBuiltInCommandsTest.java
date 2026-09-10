@@ -91,6 +91,8 @@ class CommandControllerBuiltInCommandsTest {
     void tearDown() {
         // [RES-④] resume 测试设置了 MDC sessionId，清理避免线程复用泄漏
         RequestContext.clear();
+        // [finding-2] skill_listing sent 注册表是进程级静态 → 测试间复位防串扰
+        com.nexusai.application.agent.skill.SkillListingSentRegistry.reset();
     }
 
     @Test
@@ -114,6 +116,31 @@ class CommandControllerBuiltInCommandsTest {
             .andExpect(jsonPath("$[10].name").value("effort"))
             .andExpect(jsonPath("$[10].type").value("local-jsx"))
             .andExpect(jsonPath("$[10].argumentHint").value("[low|medium|high|max|auto]"));
+    }
+
+    @Test
+    @DisplayName("POST /builtins/clear/execute?sessionId=X → 生产链路清 SkillListingSentRegistry（finding-2：此前 MDC 无会话 → no-op）")
+    void executeBuiltin_clear_withSessionId_clearsSkillListingRegistry() throws Exception {
+        String sid = "sess-clear-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        com.nexusai.application.agent.skill.SkillListingSentRegistry.reset();
+        // 首 run：整份 + 置 initialized（模拟该会话在本 JVM 已发过清单）
+        com.nexusai.application.agent.skill.SkillListingSentRegistry.decide(sid, "", List.of("commit"), false);
+        assertThat(com.nexusai.application.agent.skill.SkillListingSentRegistry.isInitialized(sid, "")).isTrue();
+
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", sid))
+            .andExpect(status().isOk());
+
+        // [2026-09-10 收尾轮] /clear 的 faithful 翻译 = CC resetSentSkillNames 的
+        //   sentSkillNames.clear() + suppressNext=false：清 SENT、**保留** INITIALIZED
+        //   （= suppressNext=false）。已初始化槽因此仍在集合内，但 sent 已清 → 下一 decide 重发整份。
+        //   故此处断言「initialized 仍 true」+「下一 decide 整份」，而非旧版「initialized 被清」。
+        assertThat(com.nexusai.application.agent.skill.SkillListingSentRegistry.isInitialized(sid, ""))
+            .as("/clear 保留 initialized（= CC suppressNext=false），清的是 sent —— 见 SkillListingSentRegistry.removeSession")
+            .isTrue();
+        assertThat(com.nexusai.application.agent.skill.SkillListingSentRegistry
+                .decide(sid, "", List.of("commit"), true).names())
+            .as("CC resetSentSkillNames 语义（clear/caches.ts:79）：/clear 后下次 decide 必须重发整份（证明 ?sessionId= 打通了 removeSession）")
+            .containsExactly("commit");
     }
 
     @Test

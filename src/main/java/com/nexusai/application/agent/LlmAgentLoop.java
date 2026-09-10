@@ -85,6 +85,7 @@ import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.skill.SkillChangeDetector;
 import com.nexusai.application.agent.skill.SkillDiscoveryPrefetch;
 import com.nexusai.application.agent.skill.SkillListingFilter;
+import com.nexusai.application.agent.skill.SkillListingSentRegistry;
 import com.nexusai.application.agent.skillsearch.SkillSearchPrefetch;
 import com.nexusai.application.agent.recovery.*;
 import com.nexusai.application.agent.recovery.context.ContextConstants;
@@ -3085,9 +3086,10 @@ public class LlmAgentLoop implements AgentLoop {
         //   restoreSkillStateFromMessages）。Java 端在 loop 运行前对主会话（agentId==null）
         //   扫描持久化转录（streamSessionId 原始 "sess-xxx" 键）中的 invoked_skills /
         //   skill_listing 附件：invoked_skills → state.addInvokedSkill（跨压缩存活）；
-        //   skill_listing → sessionState.suppressNextSkillListing 置真（一次性 latch，
-        //   computeSkillListingDelta compareAndSet(true,false) 消耗，避免 resume 重复注入
-        //   ~600 token skills-available 清单）。best-effort：messageService 未接线 /
+        //   skill_listing → sessionState.suppressNextSkillListing 置真（一次性 latch）。2026-09-10 起
+        //   该 latch 不再被注入逻辑消费——resume 抑制改由进程级 SkillListingSentRegistry 的 initialized
+        //   标记承担（resume 且未初始化 → 抑制），避免 resume 重复注入 ~600 token skills-available 清单。
+        //   best-effort：messageService 未接线 /
         //   非主会话 / 读取失败 → 跳过不阻断 loop。
         // [P2-23 · WF8-01 △-2] resume 标志：CC restoreSkillStateFromMessages 仅 resume 路径调用
         //   （conversationRecovery.ts:556-558 loadConversationForResume），Java 端因 AgentState
@@ -3099,23 +3101,37 @@ public class LlmAgentLoop implements AgentLoop {
         //   （streamUserMessageId）后判「会话有历史」：全新会话首 run（转录仅含当前用户消息）
         //   → resume=false 跳过恢复；后续 run（含先前历史消息）→ resume=true 恢复）。
         //   streamUserMessageId 为 null（非流式测试路径）→ 回落「转录非空」保序行为。
-        //   残留披露（见 PostCompactAttachmentRestorer.restoreSkillStateFromMessages javadoc）：
-        //   resume=true 且转录残留 skill_listing 附件时 suppress 仍每 run 重武装（WF8-01
-        //   R1/T-3 每 run 抑制风险）；转录残留 invoked_skills 附件时 invokedAt 仍每 run 刷新
-        //   （△-1/DEL-WF8-1 排序时序偏差）——两者均为 Java per-run 架构补偿固有残留，登记未解决。
+        // [skill-listing-cc-align 2026-09-10] 残留论述已更新：resume=true 且转录残留 skill_listing 附件时
+        //   suppress 仍每 run 重武装 —— 新语义下该 latch 已不再被注入逻辑消费（resume 抑制改由进程级
+        //   SkillListingSentRegistry 的 initialized 标记决定），故「每 run 重武装」不再是缺陷，仅为兼容/
+        //   测试守卫保留（见 PostCompactAttachmentRestorer.restoreSkillStateFromMessages javadoc）。
+        //   转录残留 invoked_skills 附件时 invokedAt 仍每 run 刷新（△-1/DEL-WF8-1 排序时序偏差）保留登记。
+        //
+        //   [skill-listing-cc-align] resume 判据提升为 run 级变量 skillListingResume：主线程 (agentId==null)
+        //   与后台化主会话任务 (backgroundSessionTask) 同走；skill_listing 注入（下方用户消息 append 后）
+        //   与续跑恢复共用，避免二次推导分歧。真子代理不调 doRun。
+        //   [2026-09-10 收尾轮 · 非 CC 登记] 边界：resumeRawTranscript 读取失败（listBySession 抛异常 / 未接线）
+        //   时保持 null → 本判据保持 false → 老会话被当作全新会话（整份注入，而非 CC 的 suppress）。CC 的
+        //   suppressNext 由 loadConversationForResume 无条件触发、无此回落。属 best-effort 失败路径（生产
+        //   messageService 恒 wired，仅 DB 抖动命中）；此处选择「保守重复注入一次整份」而非「静默少注入」，
+        //   代价是一次多余清单 token。登记为已知偏离。
+        boolean skillListingResume = false;
+        if ((agentId == null || backgroundSessionTask) && resumeRawTranscript != null) {
+            List<ChatMessageDto> resumeTranscript = resumeRawTranscript;
+            skillListingResume = streamUserMessageId == null
+                ? !resumeTranscript.isEmpty()
+                : resumeTranscript.stream().anyMatch(m -> m != null && !streamUserMessageId.equals(m.id()));
+        }
         if (agentId == null && messageService != null && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
                 // [fix-loop-resume-history] 复用注入块一次性读取的原始转录缓存（resumeRawTranscript），
                 //   消除与注入块对同一会话的重复 listBySession 全量查询。null（读取失败）→
                 //   restoreSkillStateFromMessages 空转（其内部 null 防护），resume=false 跳过恢复。
                 List<ChatMessageDto> transcript = resumeRawTranscript;
-                boolean resume = transcript != null && (streamUserMessageId == null
-                    ? !transcript.isEmpty()
-                    : transcript.stream().anyMatch(m -> m != null && !streamUserMessageId.equals(m.id())));
                 PostCompactAttachmentRestorer.restoreSkillStateFromMessages(
-                    state, transcript, mainCtx.sessionState().suppressNextSkillListing(), resume);
+                    state, transcript, mainCtx.sessionState().suppressNextSkillListing(), skillListingResume);
                 log.info("[LlmAgentLoop] 续跑入口恢复 skill 状态完成: sessionId={} 转录 {} 条 resume={}（CC loadConversationForResume:556-558）",
-                    streamSessionId, transcript == null ? 0 : transcript.size(), resume);
+                    streamSessionId, transcript == null ? 0 : transcript.size(), skillListingResume);
             } catch (Exception e) {
                 log.warn("[LlmAgentLoop] 续跑入口恢复 skill 状态失败（best-effort 不阻断 loop）: sessionId={} err={}",
                     streamSessionId, e.getMessage());
@@ -3267,6 +3283,16 @@ public class LlmAgentLoop implements AgentLoop {
                 imageSessionKey(sessionId), null, false,
                 resolveMultimodalModelName() /* [U2 自主引导] 多模态档位模型名注入引导（settings.multimodalModelName）*/));
         }
+        // ── [skill-listing-cc-align 2026-09-10] skill_listing 注入点已下移至 loop() turn-0 drain 之后 ──
+        //   CC：skill_listing 是 attachment，由 processTextPrompt 以 messages:[userMessage, ...attachments]
+        //   返回（processTextPrompt.ts:97）→ 位于<b>首条用户消息之后</b>（非头部）；sent 集合是进程级
+        //   module-scope Map（attachments.ts:2676），键 agentId ?? ''。
+        //   [2026-09-10 修复轮] 原实现把注入放在本处（循环之前），仅对「else 直拼分支」成立：生产主路径
+        //   （web 主线程）当前用户消息经 notificationQueue 入队（上 :3151），真正 append 在 do-while 首轮
+        //   turn-0 drain（loop 内 :4721 → :8320）→ 原实现使清单排到用户消息<b>之前</b>（全新会话即 index 0 =
+        //   头部），与 CC [userMessage, ...attachments] 相反。现注入下移至 loop() turn-0 drain 之后，
+        //   确保当前用户消息先入 state.messages()、清单尾随其后。resume 判据仍复用本处 skillListingResume
+        //   （会话有历史续跑，非 JVM 冷热），经 queryLoop 透传进 loop。
         // [queue-full-align P1 + P3] now 优先级中断消费方 + run 队列引用捕获（对齐 CC print.ts:1858-1863）
         // Priority.NOW 枚举存在（NotificationQueue）但 0 生产者 + 0 消费方 → 本步补消费方：
         // 订阅队列 onChange → 检测本会话 NOW 命令 → runAbortController.abort("interrupt") + state.cancel()
@@ -3353,7 +3379,7 @@ public class LlmAgentLoop implements AgentLoop {
         com.nexusai.application.agent.loop.LoopResult loopResult =
             queryLoop(queryParams, state, consumedCommandUuids, this.autoCompactor, this.microCompactor,
                     this.settingsResolver, this.countTokensClient, this.imageAttachmentStore, this.pdfAttachmentProcessor,
-                    this.injectedQueuedMessages);
+                    this.injectedQueuedMessages, skillListingResume);
         AgentState out = loopResult.finalState();
 
         // R28-1: 循环退出后统一 notifyCompleted · 对齐 CC query.ts:235-238
@@ -3633,7 +3659,7 @@ public class LlmAgentLoop implements AgentLoop {
             java.util.List<String> consumedCommandUuids,
             AutoCompactor autoCompactor,
             MicroCompactor microCompactor) {
-        return queryLoop(params, state, consumedCommandUuids, autoCompactor, microCompactor, null, null, null, null, null);
+        return queryLoop(params, state, consumedCommandUuids, autoCompactor, microCompactor, null, null, null, null, null, false);
     }
 
     /**
@@ -3664,7 +3690,7 @@ public class LlmAgentLoop implements AgentLoop {
             ImageAttachmentStore imageStore,
             PdfAttachmentProcessor pdfProcessor) {
         return queryLoop(params, state, consumedCommandUuids, autoCompactor, microCompactor,
-            null, countTokensClient, imageStore, pdfProcessor, null);
+            null, countTokensClient, imageStore, pdfProcessor, null, false);
     }
 
     /**
@@ -3674,6 +3700,11 @@ public class LlmAgentLoop implements AgentLoop {
      *                               drain busy-queued 时 add；run() 传 this.injectedQueuedMessages 作
      *                               error 逃生门）。null = 非主循环调用方（subagent/测试旧签名）→
      *                               loop() 跳过镜像写（成功路径仍经 state.injectedQueuedMessages() 补落库）。
+     * @param skillListingResume [skill-listing-cc-align] 会话续跑判据（= 排除当前 in-flight 用户消息后转录
+     *                          非空）· doRun 计算后透传，供 loop() turn-0 drain 之后的 skill_listing 注入
+     *                          决策（FULL / suppress / DELTA）。中间重载（3/4/5/8 参）传 false（子代理/
+     *                          hook agent 恒 !resume → 其自身首份全量；对齐 CC 子代理 turn-0 listing
+     *                          attachments.ts:2672-2676，非「不注入」）。
      * @return LoopResult（含 finalState，run 从 finalState 取返回）
      */
     public static com.nexusai.application.agent.loop.LoopResult queryLoop(
@@ -3686,7 +3717,8 @@ public class LlmAgentLoop implements AgentLoop {
             CountTokensClient countTokensClient,
             ImageAttachmentStore imageStore,
             PdfAttachmentProcessor pdfProcessor,
-            java.util.List<AgentState.InjectedQueuedMessage> injectedQueuedMessages) {
+            java.util.List<AgentState.InjectedQueuedMessage> injectedQueuedMessages,
+            boolean skillListingResume) {
         // [R-A3] A-3 补填 LoopResult.totalDurationMs（开始-结束时间）· 对齐 CC
         //   finalizeAgentTool `totalDurationMs: Date.now() - startTime`
         //   （agentToolUtils.ts:352，startTime 在 agent 工具调用入口捕获）。
@@ -3730,7 +3762,7 @@ public class LlmAgentLoop implements AgentLoop {
         // [U2 · R1] pdfProcessor 透传（null = 无 PDF 注入）· 统一队列 drain prompt 路径 PDF blocks 注入。
         // [mid-turn-align] injectedQueuedMessages 透传（null = 非主循环 → loop() 跳过镜像写，成功路径
         //   仍经 state.injectedQueuedMessages() 补落库）。
-        AgentState finalState = loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, 0, false, /*stopHookBlockingReentries=*/0, /*suppressTurnZeroDrain=*/false);
+        AgentState finalState = loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, 0, false, /*stopHookBlockingReentries=*/0, /*suppressTurnZeroDrain=*/false, skillListingResume);
         boolean aborted = finalState != null
             && AgentState.ExitReason.ABORTED.equals(finalState.exitReason());
         // [R-A3] 开始-结束时间差 · 对齐 CC agentToolUtils.ts:352 Date.now() - startTime。
@@ -4483,6 +4515,9 @@ public class LlmAgentLoop implements AgentLoop {
     //   本参置 true（仅递归重入点传）→ 新帧首轮跳过 turn-zero/firstIteration 强制 drain（重入轮首轮
     //   不 drain 排队，等下一真工具轮或 turn 末 CronIdleExecutor 空闲兜底）。首调（queryLoop :3525）传
     //   false = 正常 turn-0 drain 保留。只在 firstIteration=true 的本帧首轮生效，后续轮不受影响。
+    // [skill-listing-cc-align 修复轮] skillListingResume：doRun 计算的续跑判据透传；turn-0 drain
+    //   （当前用户消息 append）之后据此调用 injectSkillListingForRun（主/子/hook 三路均注入，
+    //   子代理/hook 恒 false → 自身首份全量；对齐 CC attachments.ts:2672-2676）。
     private static AgentState loop(AgentLoopContext ctx,
                             com.nexusai.application.agent.loop.QueryParams params,
                             AgentState state,
@@ -4497,7 +4532,10 @@ public class LlmAgentLoop implements AgentLoop {
                             int cumulativeOutputTokens,
                             boolean stopHookActive,
                             int stopHookBlockingReentries,
-                            boolean suppressTurnZeroDrain) {
+                            boolean suppressTurnZeroDrain,
+                            // [skill-listing-cc-align 修复轮] resume 判据透传（doRun 计算，非主循环仅经
+                            //   中间重载传 false）→ turn-0 drain 之后 skill_listing 注入决策用。
+                            boolean skillListingResume) {
         // ── s11: 初始化单次调用的 RecoveryState · 对齐 CC query.ts:203-217 ──
         // [ER-IMP-09] stop-hook 重入守卫保留 · 对齐 CC query.ts:1297 stop_hook_blocking
         //   重建 State 时 hasAttemptedReactiveCompact 保留（不置 false）。CC query.ts:1293-1296
@@ -4749,12 +4787,9 @@ public class LlmAgentLoop implements AgentLoop {
             // 违反 effectively-final 约束（Java lambda 捕获限制）。
             final Map<String, Object> turnQueryTracking = queryTracking;
 
-            // [skill-listing-stable] 本迭代 skill_listing 请求头部文本 · A8（技能清单装配）每轮重建，
-            //   prependSkillListing 于消息组装末段置队首（userContext 之下）。do-while 每次迭代重置 → 头部
-            //   内容随当前技能集合自动更新；技能不变则字节稳定（对齐 CC「变化才重置」前缀缓存语义）。
-            //   不再经 state.attachments() 常驻 + maybeInjectHookAttachments 队尾重放（见 A8 与
-            //   maybeInjectHookAttachments skill_listing 跳过）。
-            String skillListingHeaderText = null;
+            // [skill-listing-cc-align 2026-09-10] 旧 per-iteration skillListingHeaderText 已删：
+            //   skill_listing 改为 doRun 内每 run 一次决策 + 真实消息尾随注入（injectSkillListingForRun），
+            //   不再每轮重建 / 不再 prepend 到请求队首。
 
             // 退出 2：ABORTED
             if (state.cancelled()) {
@@ -4788,6 +4823,32 @@ public class LlmAgentLoop implements AgentLoop {
             if (firstIteration && !suppressTurnZeroDrain) {
                 drainAndInjectQueued(ctx, params, state, consumedCommandUuids,
                     injectedQueuedMessages, imageStore, pdfProcessor, didLastTurnUseSleep(state));
+                // ── [skill-listing-cc-align 2026-09-10 修复轮] skill_listing 注入（每 run 一次 ·
+                //    紧随当前用户消息之后）──
+                //   WHY 必须在 turn-0 drain 之后：生产主路径（web 主线程）当前用户消息经 notificationQueue
+                //   入队，真正 append 发生在上面的 drainAndInjectQueued（→ :8320 state.appendMessage）。
+                //   若在 drain 之前注入，清单会排到当前用户消息之前（全新会话即 index 0 = 头部），违反 CC
+                //   processTextPrompt.ts:97 [userMessage, ...attachmentMessages]（attachment 尾随首条用户消息）。
+                //   非队列直拼 / batchMode 的当前用户消息已在循环前 append，此处注入同样落在其之后。
+                //   [finding-1 修复 2026-09-10] 去 isMainLoop 门：CC 的 skill_listing 是 attachment，由共享
+                //   query() 循环内的 getAttachments 无条件挂载，subagent/hook agent 亦走 query()（forkedAgent
+                //   .ts:564 / execAgentHook.ts:167），且 sentSkillNames 注释明写「Keyed by agentId (empty
+                //   string = main thread) so subagents get their own turn-0 listing」（attachments.ts:2672-2676）
+                //   → 子代理确有自己 turn-0 的清单。nexusai 子代理/hook 经 3 参 queryLoop 委托（SubagentExecutor
+                //   :4261 / ExecAgentHook:415），skillListingResume 恒 false → 落 !resume 分支 = 该 agent 自己的
+                //   首份全量；注册表键含 agentKey（state.agentId()，主线程 ""）→ 各 agent 独立、不串扰。
+                //   [2026-09-10 收尾轮 · 非 CC 登记] 注入只在每 run 的 turn-0 做一次，CC 则在每个 tool-use
+                //   turn 的 attachment pass（query.ts:1894 getAttachmentMessages，含 maybe('skill_listing',…)
+                //   attachments.ts:927）都会再跑一遍。因按 name 去重（本注册表 sent），正常路径两者等价；
+                //   差异仅在「run 中途新增技能」的公告时机（CC 当轮即公告，nexusai 要等下一 run）。属有意
+                //   简化：移出 firstIteration 会让每轮都尝试构造/落库清单消息，而增量去重后绝大多数轮为
+                //   「无新增 → 不注入」，收益小、改动面与落库噪声大。
+                try {
+                    injectSkillListingForRun(ctx, params.toolUseContext(), state,
+                        params.modelName(), skillListingResume, autoCompactor);
+                } catch (Exception e) {
+                    log.warn("[LlmAgentLoop] skill_listing 注入失败（best-effort 不阻断 run）: {}", e.getMessage());
+                }
             }
             firstIteration = false;
 
@@ -4957,98 +5018,13 @@ public class LlmAgentLoop implements AgentLoop {
                 drainAndInjectQueued(ctx, params, state, consumedCommandUuids,
                     injectedQueuedMessages, imageStore, pdfProcessor, didLastTurnUseSleep(state));
             }
-            // ── A8: skill_listing 恒定头部装配 · 对齐 CC query.ts:1570-1643 / attachments.ts:2661-2751 ──
-            // [skill-listing-stable] 不再「append type='skill_listing' attachment + maybeInjectHookAttachments
-            // 每轮队尾重放」（队尾位置随 transcript 增长漂移 → 破坏前缀缓存）；改为每轮把「全量当前清单」
-            // 渲染进 skillListingHeaderText，由 prependSkillListing 置请求队首（userContext 之下、紧跟 system）。
-            // 技能不变 → 字节稳定；变化 → 头部随当前清单自动更新（CC「变化才重置」语义）；compact 后仍恒在
-            // 头部（无队尾重发）；resume 无需抑制。
-            // [P1-10] computeSkillListingDelta 按 skill name 增量 dedup 保留，仅用于首注遥测 + Haiku 变化门控。
-            // [X22] 删除 turn%5 节流：CC 无固定轮次节流，靠按名 dedup 控频（attachments.ts:2603-2750）。
-            // [X21] 类型由 skill_catalog 改名 skill_listing（attachments.ts:2745）。
-            // [R25-6] 异步 Haiku 增强摘要 · 对齐 CC query.ts:1570 fire-and-forget Haiku 模式（参照 R24-5）
-            // 完成后写回 attachment (type=skill_catalog_summary). 主循环不等待.
-            // [ALIGN-COMP-1 M-29] skill_listing 无 Skill 工具守卫 · 对齐 CC attachments.ts:2669-2672
-            //   `if (!toolUseContext.options.tools.some(toolMatchesName(SKILL_TOOL_NAME))) return []`：
-            //   无 Skill 工具的 agent 不注入 listing（避免纯 token 浪费）。
-            if (ctx.skillCatalog() != null
-                    && hasSkillToolInAvailableTools(params.toolUseContext())) {
-                try {
-                    // [P2-9] 数据源改为 listing 合并视图（本地 + MCP thread-in）：对齐 CC attachments.ts:2677-2682
-                    //   getMcpSkillCommands(commands) + uniqBy([...local, ...mcp], 'name') —— MCP 技能首次注入 listing。
-                    java.util.List<Command> commands = ctx.skillCatalog().getModelInvocableCommandsForListing();
-                    // [P3-5] EXPERIMENTAL_SKILL_SEARCH 门控过滤 · 对齐 CC attachments.ts:2692-2697
-                    //   if (feature('EXPERIMENTAL_SKILL_SEARCH') && skillSearchModules?.featureCheck
-                    //   .isSkillSearchEnabled()) { allCommands = filterToBundledAndMcp(allCommands) }。
-                    //   Java 近似双条件：skillPrefetch flag（FeatureFlags，默认 ALL_DISABLED → 短路）
-                    //   && skillDiscoveryPrefetch 组件启用（concern #2 isSkillSearchEnabled 映射）。
-                    //   默认 flag 关 → 不过滤，行为零变化（对齐 CC flag-off DCE 折叠）。
-                    if (ctx.featureFlags().skillPrefetch()
-                            && ctx.skillDiscoveryPrefetch() != null
-                            && ctx.skillDiscoveryPrefetch().isEnabled()) {
-                        commands = SkillListingFilter.filterToBundledAndMcp(commands);
-                        if (log.isDebugEnabled()) {
-                            log.debug("[LlmAgentLoop] turn={} EXPERIMENTAL_SKILL_SEARCH 启用 → filterToBundledAndMcp 后 listing 技能数={}",
-                                state.turnCount(), commands != null ? commands.size() : 0);
-                        }
-                    }
-                    if (commands != null && !commands.isEmpty()) {
-                        // [P1-10] 按名增量 dedup 唯一入口 · 主线程 agentKey=""（CC agentId ?? ''），
-                        // subagent 各自 agentId，不再因 agentId=null 绕过 dedup.
-                        AgentLoopContext.SkillListingDelta delta = AgentLoopContext.computeSkillListingDelta(
-                            ctx, state.agentId() != null ? state.agentId().toString() : null, commands);
-                        // [P2-11] tengu_skill_loaded 遥测 · 对齐 CC skillLoadedEvent.ts:13-39 logSkillsLoaded
-                        //   （main.tsx:281 logSessionTelemetry 会话启动一次；grep 自验 CC 全 src 仅此 1 个
-                        //   调用点，subagent 经 fork 入口不调用）。
-                        //   [ALIGN-VERIFY-1 R42/T9 修正] 门控 = A8 首帧 isInitial && 主 agent
-                        //   （state.agentId()==null，主线程 agentKey=""）：computeSkillListingDelta 按
-                        //   agentKey 判首帧，subagent 各自独立 sent 集合 → 其首帧 isInitial=true 会多发；
-                        //   CC 仅主会话启动发射一次 → 按 agentId==null 过滤对齐 once/session 口径。
-                        //   后台化主会话（agentId=agentUuid，MainSessionBackgroundService 唯一非 null
-                        //   agentId 的 run 调用方）为同一会话续跑，不重复发射（CC 同会话不重发）。
-                        //   skills 源 = getModelInvocableCommands()（P1-9 getSkillToolCommands 等价，
-                        //   纯本地，CC :22）；budget = getCharBudget（P2-19，CC :23 getCharBudget(contextWindowTokens)）。
-                        if (delta.isInitial() && state.agentId() == null) {
-                            try {
-                                java.util.List<Command> loadedSkills = ctx.skillCatalog().getModelInvocableCommands();
-                                int skillBudget = ctx.skillCatalog().getCharBudget(
-                                    resolveContextWindowTokens(params.modelName(), autoCompactor));
-                                com.nexusai.application.agent.telemetry.Telemetry tel =
-                                    ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
-                                com.nexusai.application.agent.telemetry.skill.SkillLoadedEvent.logSkillsLoaded(
-                                    tel, loadedSkills, skillBudget);
-                            } catch (Exception te) {
-                                if (log.isDebugEnabled()) {
-                                    log.debug("[LlmAgentLoop] tengu_skill_loaded 遥测失败（不阻塞主链）: {}", te.getMessage());
-                                }
-                            }
-                        }
-                        // [skill-listing-stable] skill_listing 恒定请求头部注入（对齐 CC messages.ts:3728-3738
-                        //   「一次生成放头部、字节稳定、后续轮不队尾重放」）：头部内容 = 全量当前清单
-                        //   （formatListing(commands) 非 delta 子集）。技能集合不变 → 字节稳定 → 前缀缓存不断；
-                        //   变化 → 头部随当前清单自动更新（对齐 CC「变化才重置」语义）；compact 后仍恒在头部
-                        //   （无队尾重发，对齐 CC postCompactCleanup 不重发）；resume 无需抑制。
-                        //   delta 保留仅用于 ①首注遥测（上）②Haiku 摘要变化门控（下）。
-                        String listingText = ctx.skillCatalog().formatListing(commands,
-                            resolveContextWindowTokens(params.modelName(), autoCompactor));
-                        if (listingText != null && !listingText.isBlank()) {
-                            skillListingHeaderText = listingText;
-                            if (log.isDebugEnabled()) {
-                                log.debug("[LlmAgentLoop] turn={} skill_listing header set ({} skills, agent={})",
-                                    state.turnCount(), commands.size(),
-                                    state.agentId() != null ? state.agentId() : "<main>");
-                            }
-                        }
-                        // [R25-6] 异步 Haiku 增强摘要 (fire-and-forget) · 仅新技能出现（首注/变化）触发，
-                        //   避免每轮重复消耗 · 不阻塞主链
-                        if (!delta.newSkills().isEmpty()) {
-                            AgentLoopContext.triggerSkillCatalogHaikuSummaryAsync(ctx, state, listingText);
-                        }
-                    }
-                } catch (Exception e) {
-                    log.warn("[LlmAgentLoop] skill_listing header 构建失败: {}", e.getMessage());
-                }
-            }
+            // [skill-listing-cc-align 2026-09-10] A8「skill_listing 恒定头部装配」块已删除：旧实现每轮
+            //   全量重建清单 → prependSkillListing 置请求队首（add(0)），并误引 CC messages.ts:3728-3738
+            //   （实为 plan-mode pair-planning 文本，与 skill_listing 无关）。现改为每 run 一次决策 +
+            //   真实消息尾随注入（见 injectSkillListingForRun）：注入点在循环首轮 turn-0 drain 之后
+            //   （:4745 附近），确保紧随当前用户消息；skill_listing 是 attachment，位于首条用户消息之
+            //   后、非头部；sent 集合进程级（SkillListingSentRegistry）。遥测（tengu_skill_loaded）与
+            //   Haiku 摘要触发随之一并迁入 injectSkillListingForRun。
 
             // ── [C-30] skillPrefetch start · 对齐 CC query.ts:331-335 ──
             //   const pendingSkillPrefetch = skillPrefetch?.startSkillDiscoveryPrefetch(null, messages, toolUseContext)
@@ -5615,12 +5591,9 @@ public class LlmAgentLoop implements AgentLoop {
             // 3. appendSystemContext（api.ts:437-447）· systemContext（gitStatus?/cacheBreaker?）并入 systemPrompt
             java.util.List<String> fullSystemPrompt =
                 sysPromptCtxProvider.appendSystemContext(systemPrompt, sysParts.systemContext());
-            // [skill-listing-stable] 4.4 skill_listing 恒定头部块 · 替代旧「append attachment + 每轮队尾重放」：
-            //   头部内容（全量当前技能清单）由 A8 每轮重建，本处置队首（userContext 之下的恒定位置，紧跟 system）。
-            //   技能不变 → 字节稳定（前缀缓存不断）；变化 → 随当前清单自动更新；compact 后仍恒在头部（无队尾重发）。
-            if (skillListingHeaderText != null) {
-                messagesForLlm = AgentLoopContext.prependSkillListing(messagesForLlm, skillListingHeaderText);
-            }
+            // [skill-listing-cc-align 2026-09-10] 旧 4.4 skill_listing 头部块已删：skill_listing 现为
+            //   state.messages() 中的真实消息（紧随当前用户消息之后，见 injectSkillListingForRun），
+            //   经 messagesForQuery 自然进入请求，无需 prepend 到队首。
             // 4. prependUserContext（api.ts:449-474）· userContext（claudeMd?/currentDate）前置 meta user 消息
             //    （CLAUDE.md 顶部上下文由此通道注入；空 context → 原列表）
             //    [SP-02 b] coordinator userContext 并入：gate 真时向 userContext map 合并
@@ -7688,7 +7661,7 @@ public class LlmAgentLoop implements AgentLoop {
                                 // [H7-arch Phase 5-2 B1] 重入点：loop(ctx, params, state, uuids,
                                 //   autoCompactor, microCompactor, cumulativeOutputTokens,
                                 //   stopHookActive=true)（[V-TOK/DEC-RV-04] 累计透传）
-                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true);
+                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
                             }
                             if (loopStopCollect.preventedContinuation()) {
                                 log.info("HOOK Stop preventContinuation (in-loop): graceful exit, stopReason={}",
@@ -8015,7 +7988,7 @@ public class LlmAgentLoop implements AgentLoop {
                                 // [H7-arch Phase 5-2 B1] 重入点：loop(ctx, params, state, uuids,
                                 //   autoCompactor, microCompactor, cumulativeOutputTokens,
                                 //   stopHookActive=true)（[V-TOK/DEC-RV-04] 累计透传）
-                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true);
+                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
                             }
                         }
                     }
@@ -8178,7 +8151,7 @@ public class LlmAgentLoop implements AgentLoop {
                     } else {
                         state.markNeedsFollowUp();
                         return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor,
-                            settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true);
+                            settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
                     }
                 }
             } catch (Exception e) {
@@ -8832,6 +8805,155 @@ public class LlmAgentLoop implements AgentLoop {
      *            buildBaseToolUseContext）
      * @return true=可用工具中含 Skill 工具
      */
+    /**
+     * [skill-listing-cc-align 2026-09-10] skill_listing 注入（每 run 一次）· 对齐 CC
+     * {@code getSkillListingAttachments}（attachments.ts:2661-2752）+ {@code processTextPrompt}
+     * 的 {@code messages: [userMessage, ...attachmentMessages]}（processTextPrompt.ts:97）。
+     *
+     * <p><b>位置与落库</b>：在 {@code loop()} 首轮 <b>turn-0 drain 之后</b> 调用 →
+     * 此刻当前用户消息（队列 drain / 直拼 / batch）已进入 {@code state.messages()}，{@link
+     * AgentState#appendMessage} 使注入消息尾随当前用户消息（= CC 首条用户消息之后），并经
+     * ChatService 实时落库 appendListener 成为真实消息 → 重放可还原同一位置。
+     * <b>位置键 = {@code messages.seq}（V70）非 created_at</b>：落库走 2 参
+     * {@code MessageService.appendMessage(dto, ts)}（内部 seq=null → nextSeq 雪花自动取号）；用户消息
+     * 行先落库（seq=S_user）→ 清单行后 inject（write-order）→ nextSeq &gt; S_user → {@code listBySession}
+     * ORDER BY seq 重放即「紧随用户消息之后」。created_at（ts）仅展示时间，<b>不承载位置</b>。
+     * （2026-09-10 修复轮：原在 doRun 循环前调用，会先于队列 drain 的当前用户消息 append →
+     * 清单落到用户消息<b>之前</b>，违反 CC 尾随语义。）
+     *
+     * <p><b>决策</b>：{@link SkillListingSentRegistry#decide}（进程级，键 sessionId+agentKey，
+     * 跨 run 存活）四分支：
+     * <ul>
+     *   <li>/clear 标记 → 整份重发（CC resetSentSkillNames）；</li>
+     *   <li>{@code !resume}（全新会话首 run）→ 整份注入；</li>
+     *   <li>{@code resume && 未初始化}（JVM 重启 / 会话首现本进程）→ 全量标 sent，不注入
+     *       （CC suppress 分支 attachments.ts:2791-2797）；</li>
+     *   <li>{@code resume && 已初始化} → 只注入新技能增量（CC attachments.ts:2799-2809）。</li>
+     * </ul>
+     * 候选为空时 {@code decide} 仍被调用（不再提前 return）：空候选也须消费 suppress 并置 initialized，
+     * 否则「首 run 零技能」的会话被后续 resume run 永久抑制（对齐 CC attachments.ts:2791-2797 无条件消费
+     * suppressNext → 下一次非空 pass isInitial=true 注入整份）。
+     *
+     * <p><b>compact</b>：不触碰注册表（对齐 compact.ts:548-553「刻意不 reset」）→ 压缩后不重注、
+     * 新技能仍走增量。
+     *
+     * <p><b>主线程 / 子代理 / hook agent 三路</b>（对齐 CC attachments.ts:2672-2676「Keyed by agentId
+     * (empty string = main thread) so subagents get their own turn-0 listing」）：agentKey 取
+     * {@code state.agentId()}（主线程 null → ""），子代理/hook 各有独立 agentId → 各自独立 turn-0
+     * 全量（其 queryLoop 重载传 resume=false → 走 {@code !resume} 首份分支）。
+     *
+     * @param ctx          主会话 AgentLoopContext（skillCatalog / featureFlags 读取面）
+     * @param baseTuc      base ToolUseContext（availableTools 快照，Skill 工具守卫用；loop() 内取
+     *                     {@code params.toolUseContext()}）
+     * @param state        本 run AgentState（注入写入面 + agentId/sessionId 键源）
+     * @param modelName    本 run 解析后模型名（预算计算 resolveContextWindowTokens 用）
+     * @param resume       会话续跑判据（排除当前 in-flight 用户消息后转录非空；勿用 JVM 冷热）
+     * @param autoCompactor 预算计算 resolveContextWindowTokens 用（loop() 实例字段透传；static 化后
+     *                     不能直读实例字段）
+     */
+    private static void injectSkillListingForRun(AgentLoopContext ctx, ToolUseContext baseTuc, AgentState state,
+                                          String modelName, boolean resume, AutoCompactor autoCompactor) {
+        if (ctx == null || ctx.skillCatalog() == null || state == null) {
+            return;
+        }
+        // [ALIGN-COMP-1 M-29] 无 Skill 工具守卫 · 对齐 CC attachments.ts:2750-2755
+        //   `if (!toolUseContext.options.tools.some(toolMatchesName(SKILL_TOOL_NAME))) return []`。
+        //   [2026-09-10 对抗核验修复轮] CC 该守卫在 get-or-create/suppress 段（:2780）之前 → 不消耗
+        //   suppressNext、不建 sent 槽。本表等价状态 = key ∈ INITIALIZED 表示「suppressNext === false」；
+        //   只有「全新会话首 run（!resume，CC 态即 suppress=false）」需要把该状态落位，否则同一 JVM 内
+        //   后续 run（resume=true 且 !initialized）会被误判为「冷 resume」→ 永久抑制（清单永不注入）。
+        //   冷 resume（resume=true）保持未初始化 = suppress 待消费，交由首个 decide 走 suppress 分支。
+        if (!hasSkillToolInAvailableTools(baseTuc)) {
+            if (!resume) {
+                SkillListingSentRegistry.markInitialized(state.sessionId(), agentKey(state));
+            }
+            return;
+        }
+        // [P2-9] listing 合并视图（本地 + MCP thread-in）· 对齐 CC attachments.ts:2677-2682
+        //   getMcpSkillCommands(commands) + uniqBy([...local, ...mcp], 'name')。
+        java.util.List<Command> commands = ctx.skillCatalog().getModelInvocableCommandsForListing();
+        // [P3-5] EXPERIMENTAL_SKILL_SEARCH 门控过滤 · 对齐 CC attachments.ts:2692-2697（默认 flag 关 → 零变化）。
+        if (ctx.featureFlags().skillPrefetch()
+                && ctx.skillDiscoveryPrefetch() != null
+                && ctx.skillDiscoveryPrefetch().isEnabled()) {
+            commands = SkillListingFilter.filterToBundledAndMcp(commands);
+            if (log.isDebugEnabled()) {
+                log.debug("[LlmAgentLoop] skill_listing EXPERIMENTAL_SKILL_SEARCH 启用 → filterToBundledAndMcp 后技能数={}",
+                    commands != null ? commands.size() : 0);
+            }
+        }
+        // [2026-09-10 对抗核验修复轮] 不再因候选为空提前 return —— 空候选也必须进 decide 走完状态机
+        //   （消费 suppress 并置 initialized），否则「首 run 零技能」的会话被后续 resume run 永久抑制。
+        //   对齐 CC attachments.ts:2791-2797：suppressNext 无条件消费（allCommands 空只是 forEach 空转），
+        //   sent 保持空 → 下一次非空 pass 因 sent.size()===0 → isInitial=true → 注入整份（:2799-2809）。
+        if (commands == null) {
+            commands = java.util.List.of();
+        }
+        String agentKey = agentKey(state);
+        java.util.List<String> allNames = commands.stream().map(Command::getName).toList();
+        SkillListingSentRegistry.Decision decision = SkillListingSentRegistry.decide(
+            state.sessionId(), agentKey, allNames, resume);
+        if (decision.names().isEmpty()) {
+            // 不注入 → 清取代标记（防上一次 run 残留的 true 命中本次未注入的路径，规则十二 fail loud）。
+            state.setSkillListingSupersedesPriorRows(false);
+            if (log.isDebugEnabled()) {
+                log.debug("[LlmAgentLoop] skill_listing 不注入: session={} agentKey='{}' resume={}（CC attachments.ts:2791-2809）",
+                    state.sessionId(), agentKey, resume);
+            }
+            return;
+        }
+        // 只对命中子集取预算内文本（CC formatCommandsWithinBudget(newSkills, contextWindowTokens)）。
+        java.util.List<Command> toInject = commands.stream()
+            .filter(c -> decision.names().contains(c.getName()))
+            .toList();
+        String listingText = ctx.skillCatalog().formatListing(toInject,
+            resolveContextWindowTokens(modelName, autoCompactor));
+        if (listingText == null || listingText.isBlank()) {
+            return;
+        }
+        // [P2-11] tengu_skill_loaded 遥测 · 对齐 CC skillLoadedEvent.ts:13-39 logSkillsLoaded（main.tsx:281
+        //   会话启动一次）。门控 = 首份 isInitial && 主线程（agentId==null，主线程 agentKey=""）；后台化
+        //   主会话（MainSessionBackgroundService）为同一会话续跑不重复发射（CC 同会话不重发）。
+        if (decision.isInitial() && state.agentId() == null) {
+            try {
+                java.util.List<Command> loadedSkills = ctx.skillCatalog().getModelInvocableCommands();
+                int skillBudget = ctx.skillCatalog().getCharBudget(
+                    resolveContextWindowTokens(modelName, autoCompactor));
+                com.nexusai.application.agent.telemetry.Telemetry tel =
+                    ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
+                com.nexusai.application.agent.telemetry.skill.SkillLoadedEvent.logSkillsLoaded(
+                    tel, loadedSkills, skillBudget);
+            } catch (Exception te) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[LlmAgentLoop] tengu_skill_loaded 遥测失败（不阻塞主链）: {}", te.getMessage());
+                }
+            }
+        }
+        ChatMessageDto listingMsg = AgentLoopContext.skillListingMessage(state.sessionId(), listingText);
+        if (listingMsg == null) {
+            state.setSkillListingSupersedesPriorRows(false);
+            return;
+        }
+        // [2026-09-10 /clear 收敛] 置「取代旧行」标记（仅 /clear 重发的整份 = decision.supersedesPriorRows）
+        //   → 必须在 appendMessage 之前置位：appendMessage 同步触发 ChatService 落库 listener，
+        //   落库侧读本标记决定是否「先插后删」把该会话 skill_listing 收敛为唯一一份。
+        state.setSkillListingSupersedesPriorRows(decision.supersedesPriorRows());
+        state.appendMessage(listingMsg); // 尾随当前用户消息 + 实时落库（ChatService user 分支 subtype=skill_listing）
+        log.info("[LlmAgentLoop] skill_listing 注入: session={} agentKey='{}' skills={} isInitial={} supersedesPrior={} resume={} · CC attachments.ts:2781-2832",
+            state.sessionId(), agentKey, decision.names().size(), decision.isInitial(),
+            decision.supersedesPriorRows(), resume);
+        // [R25-6] 异步 Haiku 增强摘要（fire-and-forget）· 仅有新技能（首注/增量）触发，不阻塞主链。
+        AgentLoopContext.triggerSkillCatalogHaikuSummaryAsync(ctx, state, listingText);
+    }
+
+    /**
+     * agentKey：主线程 ""（对齐 CC {@code agentId ?? ''}，attachments.ts:2780），子代理 / hook agent /
+     * 后台化主会话任务 = 其 agentUuid。注册表按 {@code (sessionId, agentKey)} 隔离 → 各 agent 独立清单。
+     */
+    private static String agentKey(AgentState state) {
+        return state.agentId() != null ? state.agentId().toString() : "";
+    }
+
     private static boolean hasSkillToolInAvailableTools(ToolUseContext tuc) {
         if (tuc == null || tuc.availableTools() == null) {
             return false;
@@ -13254,9 +13376,10 @@ public class LlmAgentLoop implements AgentLoop {
 
     // ─────────────────────────────────────────────────────────────────────
     // [P1-10] 实例 dedup 区域已整段删除（C-8/D-5 双实现漂移 · 零调用方死代码）。
-    // dedup 收敛为 AgentLoopContext.computeSkillListingDelta 唯一入口（按 skill name 增量、
-    // 恒开启、suppressNext CAS 抑制），状态存 LoopSessionState.sentSkillNames
-    // (ConcurrentHashMap<String, Set<String>>, 空串=主线程)。
+    // [skill-listing-cc-align 2026-09-10] dedup 收敛为 SkillListingSentRegistry.decide 唯一入口
+    // （按 skill name 增量、恒开启、resume 未初始化抑制、/clear 强制整份），状态存进程级注册表
+    // （键 sessionId+agentKey，空串=主线程，跨 run 存活）；注入点在 loop() 首轮 turn-0 drain 之后
+    // （injectSkillListingForRun，紧随当前用户消息），resume 判据自 doRun 透传。
     // ─────────────────────────────────────────────────────────────────────
 
     // ════════════════════════════════════════════════════════════════════════

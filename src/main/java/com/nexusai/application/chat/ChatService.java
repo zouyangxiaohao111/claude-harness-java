@@ -1480,6 +1480,56 @@ public class ChatService {
                         }
                     }
                 }
+                // [skill-listing-cc-align 2026-09-10] skill_listing 注入消息落库（真实消息通道）。
+                //   WHY：CC 的 skill_listing 是 attachment，随 userMessage 一并进入 transcript（位于首条
+                //   用户消息之后，processTextPrompt.ts:97；渲染 messages.ts:4160-4170），resume/重放可见。
+                //   Java 端 doRun 每 run 决策后 state.appendMessage(meta user, subtype='skill_listing')
+                //   → 此处把该真实消息落库（对齐 hook_additional_context 先例：保留 isMeta/subtype/author、
+                //   不 bump messageCount）。
+                //   [seq 位置键 · 2026-09-10 rebase 适配] 位置不再靠 created_at/单调 ts：2 参
+                //   appendMessage(dto, ts) 内部委托 3 参重载并传 seq=null → MessageService.nextSeq 雪花自动
+                //   取号（V70）。清单行由 loop 在当前用户消息 append 之后注入（write-order）→ 其 seq 自然
+                //   大于该用户行 → listBySession ORDER BY seq ASC 重放还原同一「紧随用户消息之后」位置；
+                //   created_at（ts）仅作展示时间，不承载位置语义。绝不可改为直写 messageMapper.insert ——
+                //   那样须自行 setSeq(nextSeq)，漏了即 seq=NULL，而 SQLite 中 NULL 排最前 → 清单飞到上下文最前。
+                if (m.isMeta() && "skill_listing".equals(m.subtype())) {
+                    if (messageService != null) {
+                        try {
+                            messageService.appendMessage(m, ts);
+                            if (log.isInfoEnabled()) {
+                                log.info("ChatService: skill_listing 注入消息落库: session={} id={} len={}",
+                                    sessionId, abbreviate(m.id(), 16),
+                                    m.content() == null ? 0 : m.content().length());
+                            }
+                            // [2026-09-10 /clear 收敛 · 先插后删] /clear 后 CC 清空 messages → 旧清单消失、
+                            //   仅剩重发的整份；nexusai 的 /clear 不删 DB 消息行 → 旧整份被 resume 重放与新
+                            //   整份共存 = 两份。故在 CLEARED 触发的整份重发落库时（state 标记由
+                            //   LlmAgentLoop.injectSkillListingForRun 置位）收敛：新份已落库（上方 appendMessage
+                            //   返回即成功）→ 删除该会话其它 skill_listing 行（excludeId=新份 id），DB 恒 1 条。
+                            //   对齐 §14 hook_additional_context 先插后删先例（LlmAgentLoop:2840-2885）。
+                            //   仅 /clear 触发：增量清单 / skill 变更重发须保留旧行（CC 累积，删旧即丢未变技能）。
+                            //   删除失败仅 log.warn（新份已落，DB 可能多 1 份，绝不丢份）。
+                            if (state.isSkillListingSupersedesPriorRows()) {
+                                try {
+                                    int removed = messageService.deleteBySessionAndSubtype(
+                                        sessionId, "skill_listing", m.id());
+                                    if (log.isInfoEnabled()) {
+                                        log.info("ChatService: skill_listing /clear 覆盖式落库: 删除旧份 {} 条"
+                                                + "（先插后删，DB 恒 1 条，session={}）",
+                                            removed, sessionId);
+                                    }
+                                } catch (Exception de) {
+                                    log.warn("ChatService: skill_listing 旧份删除失败（新份已落库，"
+                                            + "DB 可能多 1 份但绝不丢份）: session={} err={}",
+                                        sessionId, de.toString());
+                                }
+                            }
+                        } catch (Exception e) {
+                            log.warn("ChatService: skill_listing 落库失败（best-effort 不阻断）: session={} id={}: {}",
+                                sessionId, m.id(), e.getMessage());
+                        }
+                    }
+                }
                 return;
             }
 

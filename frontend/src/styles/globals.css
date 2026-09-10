@@ -2651,13 +2651,16 @@ html {
 .hint-usage .hu-ctx {
   color: var(--ink-muted);
 }
-/* 当前上下文剩余感知：pct 是【剩余百分比】（越低越接近满）· ≤20% 琥珀黄醒目（快满预警）· ≤5% 红（接近上限）· 与金额橙红（hu-cost）区分 */
+/* 当前上下文剩余感知：pct 是【剩余百分比】· >80% 绿（充裕）· 40–80% 橙（关注）· <40% 红（接近上限） */
+.hint-usage .hu-ctx.ok {
+  color: var(--green, #16a34a);
+}
 .hint-usage .hu-ctx.warn {
-  color: var(--warning);
+  color: var(--warning, #d97706);
   font-weight: 600;
 }
 .hint-usage .hu-ctx.hot {
-  color: var(--error);
+  color: var(--error, #dc2626);
   font-weight: 600;
 }
 

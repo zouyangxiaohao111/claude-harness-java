@@ -159,6 +159,24 @@ public class AgentState {
     @JsonIgnore
     private java.util.Set<String> prePersistedMessageIds = null;
     /**
+     * [skill-listing-cc-align 2026-09-10] 本次注入的 skill_listing 是否<b>取代该会话此前所有清单行</b>
+     * （supersede）· loop 侧在注入 /clear 触发的整份清单前置真 → 落库侧
+     * （ChatService.persistAppendedMessage 的 skill_listing 分支）据此执行「先插后删」
+     * （{@code deleteBySessionAndSubtype(sessionId, "skill_listing", newId)}）把 DB 收敛为该会话唯一一份。
+     *
+     * <p><b>WHY 只对 /clear 置真（而非所有整份注入）</b>：CC 的 /clear 清空 sessions 消息数组 → 旧清单
+     * 附件随之消失，下一 pass 的整份重发即该会话唯一一份；nexusai 的 /clear <b>不删</b> DB 消息行
+     * （web 转录保留，见 CommandController /clear 注释）→ 旧整份被 resume 重放与新整份共存 = 两份。
+     * 故在 /clear 的重发时点收敛。而「中途新增技能」的<b>增量</b>清单（只含新技能名）以及
+     * 「skill 文件变更」触发的整份重发都必须<b>保留</b>旧行 —— CC 同场景下旧附件留在 messages 数组里
+     * 累积（增量清单依赖旧整份提供未变技能的信息；删旧即丢技能）。故本标记仅在 CLEARED 分支置真。
+     *
+     * <p><b>local-only 约束（CLAUDE.md BudgetTracker 架构红线）</b>：{@code @JsonIgnore} —— 纯进程内
+     * 落库侧信号，绝不序列化到 outbound DTO / STOMP / WebSocket / EventPublisher payload。
+     */
+    @JsonIgnore
+    private volatile boolean skillListingSupersedesPriorRows = false;
+    /**
      * [工具调用实时推] 本 turn 已实时推送的 tool_call id 集合 · executor
      * (StreamingToolExecutor.pushToolCallRealtime) 实时推时登记, ChatService.replayAndPersist
      * 据此跳过已推 STOMP (防前端重复卡片). {@link ConcurrentHashMap#newKeySet()} 保证 fixed-8 池
@@ -456,6 +474,24 @@ public class AgentState {
     @JsonIgnore
     public java.util.Set<String> prePersistedMessageIds() {
         return this.prePersistedMessageIds;
+    }
+
+    /**
+     * [skill-listing-cc-align] loop 注入整份 skill_listing 时置位（仅 /clear 重发）· 见字段 javadoc。
+     *
+     * @param v true = 本次 skill_listing 落库须「先插后删」收敛为唯一一份
+     */
+    public void setSkillListingSupersedesPriorRows(boolean v) {
+        this.skillListingSupersedesPriorRows = v;
+    }
+
+    /**
+     * [skill-listing-cc-align] 读取「本次 skill_listing 注入是否取代旧行」· ChatService 落库侧消费。
+     * <p><b>local-only 约束</b>: {@code @JsonIgnore} 双重保险 —— 与字段注解共同保证不序列化到外部通道。
+     */
+    @JsonIgnore
+    public boolean isSkillListingSupersedesPriorRows() {
+        return this.skillListingSupersedesPriorRows;
     }
 
     /**

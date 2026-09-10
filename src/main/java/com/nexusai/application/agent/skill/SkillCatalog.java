@@ -121,7 +121,7 @@ public class SkillCatalog {
      * [P1-10] 暴露 model-invocable 命令全量列表 · 对齐 CC {@code getSkillToolCommands(cwd)} +
      * {@code getMcpSkillCommands} 合并后的 allCommands（attachments.ts:2680-2683）。
      *
-     * <p><b>WHY</b>: computeSkillListingDelta 需要以 {@code List<Command>} 作 dedup 源（按 name），
+     * <p><b>WHY</b>: SkillListingSentRegistry.decide 需要以 {@code List<Command>} 作 dedup 源（按 name），
      * 不再经 buildCatalog() 文本中转（旧 isSkillCatalogAlreadySent 存 catalogText.hashCode() 语义已废弃）。
      *
      * @return registry 过滤后的 model-invocable 命令列表（buildCatalog 同源）
@@ -135,7 +135,7 @@ public class SkillCatalog {
      * {@code getSkillListingAttachments} attachments.ts:2677-2682
      * {@code uniqBy([...localCommands, ...mcpSkills], 'name')}。
      *
-     * <p><b>WHY</b>: computeSkillListingDelta 的 skill_listing 注入源（LlmAgentLoop:2213）——
+     * <p><b>WHY</b>: SkillListingSentRegistry.decide 的 skill_listing 注入源（LlmAgentLoop.injectSkillListingForRun）——
      * CC 本地命令经 getSkillToolCommands（commands.ts:563-581），MCP 技能经 getMcpSkillCommands
      * （commands.ts:547-559）thread-in 合并（MCP live outside getCommands）。旧实现只注入
      * {@link #getModelInvocableCommands()}（纯本地，MCP 缺失，偏离 CC attachments.ts:2680-2683）。
@@ -267,7 +267,7 @@ public class SkillCatalog {
      * [P1-10] 对 newSkills 子集取预算内清单文本 · 对齐 CC {@code formatCommandsWithinBudget(newSkills, contextWindowTokens)}
      * (tools/SkillTool/prompt.ts:70-134) + attachments.ts:2741。
      *
-     * <p><b>WHY</b>: skill_listing attachment 只对 {@code computeSkillListingDelta} 算出的增量子集
+     * <p><b>WHY</b>: skill_listing attachment 只对 {@code SkillListingSentRegistry.decide} 算出的增量子集
      * (newSkills) 渲染，不再对全量 catalog 渲染（P1-10 dedup 语义）。复用 buildTruncatedCatalog 的
      * bundled 保完整 / 其余截断逻辑（CC formatCommandsWithinBudget 同源）。
      *

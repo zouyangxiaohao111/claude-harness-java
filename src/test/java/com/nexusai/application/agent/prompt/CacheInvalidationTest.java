@@ -99,7 +99,7 @@ class CacheInvalidationTest {
         try {
             // [RES-④] executeBuiltin 新增可选 @RequestBody 参数（resume 分支消费），非 resume 传 null；
             //   返回类型 Object（resume → ResumeAgentResult，其余 → BuiltInCommandDto），此处强转
-            BuiltInCommandDto dto = (BuiltInCommandDto) controller.executeBuiltin("clear", null);
+            BuiltInCommandDto dto = (BuiltInCommandDto) controller.executeBuiltin("clear", null, null);
             assertThat(dto.name()).as("DEC-9 返回 DTO 不变").isEqualTo("clear");
             assertThat(fx.resolveAfterClear())
                 .as("/clear 后缓存已清 → resolveAll 重新 compute（CC clearSystemPromptSections）")
@@ -118,7 +118,7 @@ class CacheInvalidationTest {
         CommandController controller = new CommandController();
         ReflectionTestUtils.setField(controller, "sessionAgentStateRegistry", fx.registry);
         // MDC 未设置 → sessionId null → debug skip
-        controller.executeBuiltin("clear", null);
+        controller.executeBuiltin("clear", null, null);
         assertThat(fx.computeCount.get()).as("无会话上下文 → 失效跳过 → 缓存未清").isEqualTo(1);
     }
 

@@ -991,8 +991,10 @@ public final class PostCompactAttachmentRestorer {
      *   <li>invoked_skills attachment → {@code addInvokedSkill(name, path, content, null)}
      *       （CC :387-393）；</li>
      *   <li>skill_listing attachment → {@code suppressNextSkillListing()}（CC :399-401，
-     *       一次性抑制，转录已含 skills-available 提醒时不重复注入）。消费侧在
-     *       {@code AgentLoopContext.computeSkillListingDelta} 接线。</li>
+     *       一次性抑制，转录已含 skills-available 提醒时不重复注入）。<b>2026-09-10 起</b>：该 latch
+     *       不再被注入逻辑消费 —— resume 抑制改由进程级
+     *       {@code SkillListingSentRegistry} 的 initialized 标记决定（resume 且未初始化 → 抑制）。
+     *       本置真仅为兼容/测试守卫保留（见下方「suppress 副作用」）。</li>
      * </ol>
      *
      * <p><b>WHY（CC javadoc 原义）</b>: resume（compact 后会话接续 / 新会话继续）时
@@ -1014,13 +1016,15 @@ public final class PostCompactAttachmentRestorer {
      * payload（{@code {"type":"invoked_skills","skills":[{name,path,content}]}}，:236）。
      * 与 {@link #skillAttachment} 同一载荷契约，无第二格式（无兼容层）。
      *
-     * <p><b>suppress 副作用（CC :399-401 第二半段）</b>: 检测到 skill_listing attachment
-     * → 对齐 CC 恢复点直接调 {@code suppressNextSkillListing()} 置真（一次性 latch，
-     * attachments.ts:2633-2636）。Java 端 suppressNextSkillListing 是 per-run
-     * {@code AgentLoopContext.LoopSessionState} 的 AtomicBoolean（非 CC 进程级全局 boolean），
-     * 由恢复点（LlmAgentLoop.run 入口，镜像 CC loadConversationForResume:556-558）经本参
-     * 传入，置真后由 {@code AgentLoopContext.computeSkillListingDelta} 一次性
-     * {@code compareAndSet(true,false)} 消耗（不重复注入 ~600 token 清单）。
+     * <p><b>suppress 副作用（CC :399-401 第二半段 · 2026-09-10 更新）</b>: 检测到 skill_listing
+     * attachment → 对齐 CC 恢复点调 {@code suppressNextSkillListing()} 置真（一次性 latch，
+     * attachments.ts:2633-2636）。Java 端该 AtomicBoolean 是 per-run
+     * {@code AgentLoopContext.LoopSessionState} 字段；<b>新语义下它不再被注入逻辑消费</b> ——
+     * resume 抑制已改由进程级 {@code SkillListingSentRegistry} 的 initialized 标记承担
+     * （resume 且该 (sessionId, agentKey) 未初始化 → 全量标 sent、不注入；= CC suppress 分支）。
+     * 故「每个 resume run 重武装本 latch」<b>不再是缺陷</b>：注册表在会话首次处理时即置 initialized，
+     * 后续 run 走增量分支，不会因本 latch 反复抑制。本置真保留为使
+     * LlmAgentLoopResumeRestoreEntryTest 的「resume 检测到 skill_listing → latch 置真」契约继续成立。
      *
      * <p><b>resume 标志（P2-23 · WF8-01 △-2）</b>: CC {@code restoreSkillStateFromMessages}
      * 仅 resume 路径调用（conversationRecovery.ts:556-558 loadConversationForResume），
@@ -1037,15 +1041,14 @@ public final class PostCompactAttachmentRestorer {
      * 调用方（LlmAgentLoop.run 入口）负责按此语义计算并传参；本方法对 resume=false
      * 直接 return（guard 可达，非死分支）。
      *
-     * <p><b>残留登记（[P2-23 返工] 如实披露，不作「消除」声明）</b>:
+     * <p><b>残留登记（2026-09-10 更新）</b>:
      * <ul>
-     *   <li><b>每 run 抑制风险（WF8-01 R1/T-3）</b>：会话续跑（resume=true）且转录残留
-     *       skill_listing 附件时，本方法每 run 重武装 suppressNextSkillListing →
-     *       {@code AgentLoopContext.computeSkillListingDelta:670} 每 run 走抑制分支
-     *       （compareAndSet(true,false) → 全量标 sent → 空 delta），新技能可能不注入。
-     *       Java sentSkillNames / suppressNextSkillListing 均为 per-run
-     *       （LoopSessionState 每 run 新建），CC 为进程级常驻（attachments.ts:2607/:2636）——
-     *       架构补偿固有残留，登记未解决。</li>
+     *   <li><b>「每 run 重武装 suppress」已不再是缺陷（WF8-01 R1/T-3 关闭）</b>：旧论述基于
+     *       per-run sentSkillNames —— 每 run 重武装 latch 会每 run 走抑制分支、吞掉增量。
+     *       新设计下 resume 抑制由进程级 {@code SkillListingSentRegistry}（键 sessionId+agentKey，
+     *       跨 run 存活）的 initialized 标记承担，本 latch 无人消费 → 每 run 重武装无副作用；
+     *       会话首现本进程时注册表未初始化 → 走抑制分支（<b>正确</b>：转录已含清单不重复注入），
+     *       之后 initialized → 走增量分支。对齐 CC attachments.ts:2676 进程级 sentSkillNames。</li>
      *   <li><b>invokedAt 每 run 刷新（△-1 / DEL-WF8-1）</b>：转录残留 invoked_skills 附件
      *       且 resume=true 时，每 run addInvokedSkill 刷新时间戳
      *       （{@code max(prev+1, now)}，AgentState.java:860），invoked_skills 附件排序
@@ -1075,8 +1078,8 @@ public final class PostCompactAttachmentRestorer {
             }
             // CC conversationRecovery.ts:399-401 第二半段：转录已含 skills-available 提醒
             // （skill_listing attachment）→ suppressNextSkillListing() 一次性抑制，避免 resume
-            // 重复注入 ~600 token 清单。消费侧（compareAndSet 一次性消费）在
-            // AgentLoopContext.computeSkillListingDelta（LoopSessionState.suppressNextSkillListing）。
+            // 重复注入 ~600 token 清单。2026-09-10 起该 latch 不再被注入逻辑消费（resume 抑制改由
+            // SkillListingSentRegistry 的 initialized 标记承担），此处置真仅为兼容/测试守卫保留。
             if ("skill_listing".equals(m.subtype())) {
                 skillListingFound = true;
                 continue;

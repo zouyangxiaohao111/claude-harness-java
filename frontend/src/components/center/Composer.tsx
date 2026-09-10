@@ -1037,7 +1037,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               {lastSpeedTs != null && <span className="hu-speed">· {lastSpeedTs} t/s</span>}
               {sessionUsage?.totalTokens != null && sessionUsage.totalTokens > 0 && <span className="hu-tokens">⚡ 累计 {compactNumber(sessionUsage.totalTokens)} tokens</span>}
               {ctxInfo && (
-                <span className={`hu-ctx${ctxInfo.pct != null ? (ctxInfo.pct <= 5 ? ' hot' : ctxInfo.pct <= 20 ? ' warn' : '') : ''}`}>
+                <span className={`hu-ctx${ctxInfo.pct != null ? (ctxInfo.pct > 80 ? ' ok' : ctxInfo.pct >= 40 ? ' warn' : ' hot') : ''}`}>
                   · 当前上下文 {compactNumber(ctxInfo.used)} / {compactNumber(ctxInfo.window)}
                   {ctxInfo.pct != null ? `（${ctxInfo.pct}%）` : ''}
                 </span>

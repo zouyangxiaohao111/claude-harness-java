@@ -276,7 +276,7 @@ class LlmAgentLoopSessionStartSourceCcTest {
         ReflectionTestUtils.setField(controller, "hookRegistry", capturingRegistry(captured));
         com.nexusai.common.RequestContext.setSession("00000000-0000-0000-0000-00000000000c");
 
-        Object dto = controller.executeBuiltin("clear", null);
+        Object dto = controller.executeBuiltin("clear", null, null);
 
         assertThat(dto).isNotNull();
         assertThat(captured.stream().filter(e -> e.type() == HookEventType.SESSION_START)).hasSize(1);
@@ -306,7 +306,7 @@ class LlmAgentLoopSessionStartSourceCcTest {
         ReflectionTestUtils.setField(controller, "hookRegistry", capturingRegistry(captured));
         com.nexusai.common.RequestContext.setSession("00000000-0000-0000-0000-00000000000d");
 
-        Object dto = controller.executeBuiltin("clear", null);
+        Object dto = controller.executeBuiltin("clear", null, null);
 
         assertThat(dto).isNotNull();
         // SESSION_END 必须发射且 reason='clear'（CC conversation.ts:69 executeSessionEndHooks('clear')）

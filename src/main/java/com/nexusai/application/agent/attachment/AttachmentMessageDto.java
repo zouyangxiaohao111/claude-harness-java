@@ -948,11 +948,17 @@ public record AttachmentMessageDto(
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // [P1-10] skill_listing attachment 工厂 · 对齐 CC utils/attachments.ts:2743-2750
+    // skill_listing attachment 工厂 · 对齐 CC utils/attachments.ts:2743-2832
     //   getSkillListingAttachments 返回 [{type:'skill_listing', content: formatCommandsWithinBudget(newSkills),
-    //   skillCount: newSkills.length, isInitial}]。由 LlmAgentLoop 每轮经 computeSkillListingDelta
-    //   （按 skill name 增量 dedup）算出 newSkills 后调用，渲染层 renderHookAttachmentForLlm
-    //   case 'skill_listing' 渲染为 user message（CC messages.ts:3728-3738）。
+    //   skillCount: newSkills.length, isInitial}]（CC :2807 isInitial = sent.size===0，:2829 skillCount）。
+    //   由 LlmAgentLoop.injectSkillListingForRun 每 run 经 SkillListingSentRegistry.decide（按 skill name
+    //   增量 dedup）算出 newSkills 后调用。
+    //   [skill-listing-cc-align 2026-09-10 纠偏] 渲染锚点原写「CC messages.ts:3728-3738」系<b>误引</b> ——
+    //   该区间是 plan-mode pair-planning 指令文本；skill_listing 的 normalizeAttachmentForAPI 分支在
+    //   messages.ts:4160-4170（wrapMessagesInSystemReminder + createUserMessage(isMeta:true)）。
+    //   且本 Java 工厂现<b>不再</b>经 renderHookAttachmentForLlm 渲染（该路径已恒 `continue` 跳过
+    //   skill_listing）：注入改由 LlmAgentLoop 每 run 构造真实 user 消息（AgentLoopContext.skillListingMessage）
+    //   尾随当前用户消息。本工厂保留为 CC union 成员形状 + 测试用。
     // ════════════════════════════════════════════════════════════════════════
 
     /**

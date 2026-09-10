@@ -74,6 +74,12 @@ public class SessionService {
     //   （对齐 CC 进程随会话结束退出无泄漏；Java 常驻 JVM，会话删除时由外层 evict 防注册表无界增长）。
     //   best-effort，required=false（null → 跳过，不阻塞删除主流程）。
     @Autowired(required = false) private com.nexusai.application.agent.prompt.SessionGitStatusRegistry sessionGitStatusRegistry;
+    // [skill-listing-cc-align 2026-09-10] 注入 SessionAgentStateRegistry — 会话删除时移除该会话主 AgentState 映射。
+    //   CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无对应动作；Java 常驻 JVM 必须显式移除，
+    //   否则每个「跑过又不再跑」的会话都会留一个陈旧 AgentState（握着该会话完整消息历史）——是本节各注册表里
+    //   泄漏量最大的一个。best-effort，required=false（null → 跳过，不阻塞删除主流程）。
+    //   domain.session → application.agent 单向依赖（与 sessionGitStatusRegistry 同向，无环）。
+    @Autowired(required = false) private com.nexusai.application.agent.SessionAgentStateRegistry sessionAgentStateRegistry;
     // [Phase2 · session-file-panel-collapse-atfile] 会话删除 → 释放该会话改动文件记录（内存 + 快照落盘）
     @Autowired(required = false) private com.nexusai.application.session.SessionFilesRecorder sessionFilesRecorder;
     // [B3] 注入 SubagentTool — mainThreadAgent 写侧校验数据源（registryForSession → findAgent）。
@@ -244,6 +250,31 @@ public class SessionService {
         //   best-effort：null（未接线）→ 跳过；未知会话 evict no-op，不阻塞删除主流程。
         if (sessionGitStatusRegistry != null) {
             sessionGitStatusRegistry.evict(id);
+        }
+        // [skill-listing-cc-align 2026-09-10] 会话删除 → 释放该会话「已发技能集合」注册表条目（防无界增长）。
+        //   best-effort：本类是 final + 私有构造的<b>静态工具表</b>（非 Spring bean，无实例可注入），故直呼静态
+        //   方法，不套 null 守卫；未知会话 key 前缀不命中 → removeIf no-op，不阻塞删除主流程。
+        //   [2026-09-10 收尾轮修复] 用 removeSessionEntries（纯清理）而非 removeSession：removeSession 会置
+        //   CLEARED 标记（供 /clear 重发整份语义），但被删会话不会再跑 decide → 该 String 永不被消费、随
+        //   「删除会话次数」无界增长（与本表防无界增长目标相反）。removeSessionEntries 只回收槽位、不置标记。
+        try {
+            com.nexusai.application.agent.skill.SkillListingSentRegistry.removeSessionEntries(id);
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: SkillListingSentRegistry.removeSessionEntries 失败 session={}: {}",
+                id, e.toString());
+        }
+        // [skill-listing-cc-align 2026-09-10] 会话删除 → 移除该会话主 AgentState 映射（sessions + agents 双桶）。
+        //   对齐说明：CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无对应动作；
+        //   Java 常驻 JVM 必须显式移除，否则每个「跑过又不再跑」的会话都会留一个陈旧 AgentState
+        //   （握着该会话完整消息历史）——是本节各注册表里泄漏量最大的一个。
+        //   [2026-09-10 收尾轮修复] 用 removeBySessionId 而非 remove(id)：本注册表是双 map，后台化主会话
+        //   注册在 agents 桶（键 agentUuid），上一版只清 sessions 桶 → 被后台化过的会话其完整历史仍泄漏。
+        //   注意：**不在 /clear 接**——CC 的 /clear 不销毁 STATE（clearConversation 只清 caches，
+        //   进程与 STATE 继续）；且 /clear 路径自身在 clearInvokedSkillsPreservingBackgrounded
+        //   里仍要 sessionAgentStateRegistry.get(sessionId) 再写，提前移除会让后续 get 拿到 null。
+        //   best-effort：null（未接线）→ 跳过；未知会话 no-op，不阻塞删除主流程。
+        if (sessionAgentStateRegistry != null) {
+            sessionAgentStateRegistry.removeBySessionId(id);
         }
         // [Phase2] 会话删除 → 释放该会话改动文件记录（内存注册表 + session-files 快照目录）
         //   best-effort：null（未接线）→ 跳过；evict no-op 不阻塞删除主流程。
