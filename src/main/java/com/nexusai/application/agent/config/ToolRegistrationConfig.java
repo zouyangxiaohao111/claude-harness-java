@@ -2102,7 +2102,8 @@ public class ToolRegistrationConfig {
             @Autowired(required = false) com.nexusai.domain.provider.ProviderService providerService,
             @Autowired(required = false) com.nexusai.application.agent.settings.storage.FileConfigStorage configStorage,
             @Autowired(required = false) com.nexusai.application.agent.telemetry.Telemetry telemetry,
-            @Autowired(required = false) com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
+            @Autowired(required = false) com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
+            @Autowired(required = false) com.nexusai.domain.session.MessageService messageService) {
         // [RES-R4-1] manual /compact firstParty gate 接线：复用 buildForkSuppliers 单一来源解析
         // configSupplier（与 streamCompactSummary 同源，无第二份解析逻辑），gate 判定经共享
         // GlobalCacheScope 求值（REQ-R4-1 验收 2/4）。
@@ -2110,7 +2111,7 @@ public class ToolRegistrationConfig {
             llmProviderFactory, modelMapper, providerMapper, providerService, configStorage);
         registerCompactSlashCommand(userInputDispatcher, sessionAgentStateRegistry,
             reactiveCompactor, streamCompactSummary, sessionMemoryService, claudemdEngine, skillCatalog,
-            suppliers.configSupplier(), telemetry, settingsResolver);
+            suppliers.configSupplier(), telemetry, settingsResolver, messageService);
         return new CompactCommandRegistration();
     }
 
@@ -2131,6 +2132,8 @@ public class ToolRegistrationConfig {
      * @param reactiveCompactor reactive-only 压缩
      * @param streamCompactSummary L4 摘要生产
      * @param sessionMemoryService SM 优先压缩（IMP-M-P0-3 注入，null → 空指令 SM 分支跳过）
+     * @param messageService       /compact 结果落库通道（compact-persist-fix；null → 回落
+     *                             AgentState 已武装的 compactPersistListener，两者皆无 fail-loud）
      */
     private void registerCompactSlashCommand(UserInputDispatcher dispatcher,
                                              SessionAgentStateRegistry sessionRegistry,
@@ -2141,7 +2144,8 @@ public class ToolRegistrationConfig {
                                              com.nexusai.application.agent.skill.SkillCatalog skillCatalog,
                                              java.util.function.Supplier<com.nexusai.infra.llm.ProviderConfig> configSupplier,
                                              com.nexusai.application.agent.telemetry.Telemetry telemetry,
-                                             com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
+                                             com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
+                                             com.nexusai.domain.session.MessageService messageService) {
         if (dispatcher == null) {
             log.warn("[R1] UserInputDispatcher 未注入，/compact 生产注册跳过");
             return;
@@ -2153,7 +2157,7 @@ public class ToolRegistrationConfig {
             UserInputDispatcher.LocalCommandResult.text(
                 handleCompactCommand(args, sessionRegistry, reactiveCompactor, streamCompactSummary,
                     sessionMemoryService, claudemdEngine, skillCatalog, configSupplier, telemetry,
-                    settingsResolver)));
+                    settingsResolver, messageService)));
         log.info("[R1] /compact 已注册为生产 slash command · "
                 + "对齐 CC commands.ts:267 COMMANDS + commands.ts:653 BRIDGE_SAFE_COMMANDS "
                 + "（handler=CompactCommand.call，sessionRegistry={}，reactiveCompactor={}，streamCompactSummary={}，SM={}，"
@@ -2189,6 +2193,8 @@ public class ToolRegistrationConfig {
      *                         完整 getClaudeMds 链，对齐 LlmAgentLoop:2187；null → 单文件子集）
      * @param skillCatalog     skill 目录（manual defaultAssemble 的 session_guidance 子弹；
      *                         对齐 LlmAgentLoop.buildSystemPromptAssemblyInput:2079）
+     * @param messageService   /compact 结果落库通道（null → 回落 AgentState 已武装的
+     *                         compactPersistListener；两者皆无 → fail-loud 仅内存替换）
      */
     private String handleCompactCommand(String args,
                                         SessionAgentStateRegistry sessionRegistry,
@@ -2199,7 +2205,8 @@ public class ToolRegistrationConfig {
                                         com.nexusai.application.agent.skill.SkillCatalog skillCatalog,
                                         java.util.function.Supplier<com.nexusai.infra.llm.ProviderConfig> configSupplier,
                                         com.nexusai.application.agent.telemetry.Telemetry telemetry,
-                                        com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
+                                        com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
+                                        com.nexusai.domain.session.MessageService messageService) {
         // ── 1. DISABLE_COMPACT 门控（compact/index.ts:9 isEnabled）──
         // [V52 X1-2] DB settings.disable_compact 覆盖：env 仍优先（CC 一票否决），DB 有值补一票
         // （settingsResolver null 回落仅 env 判定，零行为变化）。
@@ -2312,11 +2319,23 @@ public class ToolRegistrationConfig {
             CompactCommand.CompactCommandResult result = CompactCommand.call(args, ctx);
             log.info("[R1] /compact 压缩成功: session={} displayText={}",
                 sessionId, result.displayText());
-            // [Fix-P1 HIGH] displayText 作为 result 回传 → 拦截器 local 分支组装
-            //   <local-command-stdout> 落库 + 推 message.user（CC local text 分支等价）。
-            return (result.displayText() != null && !result.displayText().isBlank())
+            // ── 4. 结果写回会话（落库 + 内存替换）· 对齐 CC processSlashCommand.tsx:895-916 ──
+            // [compact-persist-fix] 修复「/compact 报成功但 compact_boundary=0 / is_compact_summary=0」：
+            //   本 handler 原先只取 displayText 当回复，压缩产物（boundary + summary）被整个丢弃
+            //   → 不落库、不写回 state（白干）。CC 侧写回在 processSlashCommand
+            //   （result.type==='compact' → buildPostCompactMessages → REPL 替换 messages），
+            //   本仓对应物即此处。SM 优先 / compactConversation 两分支结果同构，共用同一写回。
+            CompactCommand.ApplyOutcome applyOutcome = CompactCommand.applyResultToState(
+                state, sessionId, result.compactionResult(), messageService);
+            String displayText = (result.displayText() != null && !result.displayText().isBlank())
                 ? result.displayText()
                 : "/compact 压缩完成（无 displayText）。";
+            // fail-loud（规则十二）：未落库时在用户可见文本里明示，绝不静默当成功
+            return switch (applyOutcome) {
+                case PERSISTED -> displayText;
+                case NO_PERSIST_CHANNEL -> displayText + CompactCommand.WARN_NO_PERSIST_CHANNEL;
+                case PERSIST_FAILED -> displayText + CompactCommand.WARN_PERSIST_FAILED;
+            };
         } catch (IllegalArgumentException e) {
             log.warn("[R1] /compact 压缩失败（业务错误）: session={} error={}", sessionId, e.getMessage());
             return "/compact 压缩失败（业务错误）: " + e.getMessage();

@@ -84,7 +84,7 @@ class ToolRegistrationConfigCompactCloseTest {
                                             SessionAgentStateRegistry registry) {
         Object result = ReflectionTestUtils.invokeMethod(
             config, "handleCompactCommand",
-            "", registry, null, null, null, null, null, null, null, null);
+            "", registry, null, null, null, null, null, null, null, null, null);
         assertThat(result).as("handleCompactCommand 失败路径返回业务错误文案（非 null）")
             .isInstanceOf(String.class).isNotNull();
     }

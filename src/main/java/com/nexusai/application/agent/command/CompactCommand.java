@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.command;
 
+import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.compact.BoundaryReader;
 import com.nexusai.application.agent.compact.CompactConstants;
@@ -16,6 +17,7 @@ import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.compact.fork.CacheSharingParamsBuilder;
+import com.nexusai.domain.session.MessageService;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.prompt.SystemPrompt;
 import com.nexusai.application.agent.prompt.SystemPromptContextProvider;
@@ -316,6 +318,111 @@ public final class CompactCommand {
                 log.error("[CompactCommand] 压缩失败: {}", error.toString());
                 throw new IllegalArgumentException(ERROR_PREFIX + error.getMessage());
             }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 结果写回会话状态 · 调用方侧语义 · 对齐 CC processSlashCommand.tsx:895-916
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 写回结果 · 见 {@link #applyResultToState}。
+     *
+     * <ul>
+     *   <li>{@link #PERSISTED} —— boundary+summary 已 append-only 落库 + 内存已替换为压缩后视图</li>
+     *   <li>{@link #NO_PERSIST_CHANNEL} —— 无落库通道：仅内存替换（fail-loud，压缩结果不入历史）</li>
+     *   <li>{@link #PERSIST_FAILED} —— 落库抛异常：仅内存替换（fail-loud；DB 仍为压缩前全量）</li>
+     * </ul>
+     */
+    public enum ApplyOutcome { PERSISTED, NO_PERSIST_CHANNEL, PERSIST_FAILED }
+
+    /** fail-loud 文案 · 无落库通道（压缩只在内存生效，重载会话即丢失）。 */
+    public static final String WARN_NO_PERSIST_CHANNEL =
+        "\n⚠ 压缩结果未写入历史（无落库通道）：本次压缩只在当前内存视图生效，重新加载会话后会恢复压缩前全量（并可能重复压缩）。";
+
+    /** fail-loud 文案 · 落库抛异常（内存已是压缩后视图，DB 仍是压缩前全量）。 */
+    public static final String WARN_PERSIST_FAILED =
+        "\n⚠ 压缩结果写库失败：本次会话已按压缩后视图继续，但历史未更新（重新加载会话后会恢复压缩前全量并可能重复压缩）。";
+
+    /**
+     * 把 /compact 的压缩结果写回会话（落库 + 内存替换）· 对齐 CC
+     * {@code processSlashCommand.tsx:895-916} 的 {@code result.type === 'compact'} 分支
+     * （{@code buildPostCompactMessages(compactionResult)} → REPL 用其替换 messages 数组）。
+     *
+     * <p><b>WHY 存在（本方法修的 bug）</b>: 本仓 {@link #call} 只返回
+     * {@link CompactCommandResult}（对齐 CC {@code call} 契约），写回由调用方负责——CC 里是
+     * processSlashCommand（REPL）；本仓对应物是
+     * {@code ToolRegistrationConfig.handleCompactCommand}。该 handler 原先<b>只取
+     * {@code displayText} 当回复</b>，压缩产物（boundary + summary）被整个丢弃 → /compact 报
+     * 成功但 {@code compact_boundary=0}、{@code is_compact_summary=0}（白干）。本方法是该写回
+     * 动作的单点实现，SM 优先分支与 compactConversation 分支<b>共用</b>（两者都是
+     * {@link CompactionResult}，{@code buildPostCompactMessages} 对两者同构：boundary → summary
+     * → keep → attachments → hooks）。
+     *
+     * <p><b>落库通道选择（与 auto/reactive 同一条语义）</b>:
+     * <ol>
+     *   <li>优先 {@code messageService.appendPostCompactMessages}（直接通道）——manual /compact
+     *       由 REST/分发线程执行（非 LlmAgentLoop 线程），run 空闲时 AgentState 的
+     *       {@code compactPersistListener} 已被
+     *       {@code ChatService.processUserMessage} 收口清除 → {@code state.persistCompactedMessages}
+     *       会原样返回（未武装）而<b>静默不落库</b>。直接通道与 {@code PartialCompactService:261}
+     *       （同为「loop 外压缩」）走的是同一条 append-only 落库路径。</li>
+     *   <li>回落 {@code state.persistCompactedMessages}（已武装 → 经
+     *       {@code ChatService.compactPersistListener} → 同一 {@code appendPostCompactMessages}），
+     *       与 auto（{@code LlmAgentLoop:5247}）/reactive（{@code :6840}）路径逐字同源。</li>
+     *   <li>两者皆无 → <b>不静默</b>：{@link ApplyOutcome#NO_PERSIST_CHANNEL}（fail-loud，调用方
+     *       在 displayText 里明示「未写入历史」）。</li>
+     * </ol>
+     *
+     * <p><b>内存替换</b>: 落库返回的归一化列表（id 保持 + sessionId 落定）覆盖内存，保证 memory 与
+     * DB id 一致（对齐 auto 路径 {@code LlmAgentLoop.persistCompactedMessages:1094-1095}）。
+     * 落库失败/无通道时仍替换内存（本会话按压缩后视图继续），但 DB 未更新 → 显式失败而非静默
+     * （与 {@code LlmAgentLoop:1100-1105} fail-loud 兜底同语义）。
+     *
+     * <p><b>并发注记</b>: 与 {@code PartialCompactService} 同一约束——会话在跑 LLM turn 时并发
+     * /compact 会与内存 {@code AgentState.replaceMessages} 分叉，需前端确保非 loading 时调用
+     * （对齐 CC REPL 命令排队，仅非 isLoading 可发）。
+     *
+     * @param state            目标会话 AgentState（live，非 null）
+     * @param sessionId        DB 会话键（short；null → 直接通道不可用）
+     * @param compactionResult /compact 产出的压缩结果（SM 优先 / compactConversation / reactive 同构）
+     * @param messageService   落库通道（生产 @Bean；null → 回落 state 已武装通道 / fail-loud）
+     * @return 写回结果（见 {@link ApplyOutcome}）
+     */
+    public static ApplyOutcome applyResultToState(AgentState state,
+                                                  String sessionId,
+                                                  CompactionResult compactionResult,
+                                                  MessageService messageService) {
+        if (state == null) {
+            throw new IllegalArgumentException("applyResultToState: state is null");
+        }
+        List<ChatMessageDto> postCompact = CompactionResult.buildPostCompactMessages(compactionResult);
+        boolean hasDirectChannel = messageService != null && sessionId != null;
+        if (!hasDirectChannel && !state.isAppendPersistenceArmed()) {
+            // fail-loud（规则十二）：压缩成功但无处落库 —— 绝不静默当成功
+            log.error("[CompactCommand] /compact 压缩成功但无落库通道（messageService={} 且 AgentState 未武装"
+                    + " compactPersistListener）→ 仅替换内存，压缩结果未写入历史: session={} 条数={}",
+                messageService == null ? "null" : "sessionId=null", state.sessionId(), postCompact.size());
+            state.replaceMessages(postCompact);
+            return ApplyOutcome.NO_PERSIST_CHANNEL;
+        }
+        try {
+            List<ChatMessageDto> normalized = hasDirectChannel
+                ? messageService.appendPostCompactMessages(sessionId, postCompact)
+                : state.persistCompactedMessages(postCompact);
+            state.replaceMessages(normalized != null ? normalized : postCompact);
+            log.info("[CompactCommand] /compact 压缩结果已 append-only 落库并写回会话状态: session={} 条数={}"
+                    + "（boundary+summary 入历史 · 不删旧行 · 通道={}）",
+                sessionId != null ? sessionId : state.sessionId(), state.messages().size(),
+                hasDirectChannel ? "messageService" : "state.compactPersistListener");
+            return ApplyOutcome.PERSISTED;
+        } catch (Exception e) {
+            // fail-loud（规则十二）：DB 未落 → 下轮从 DB 恢复压缩前全量 → 会重复压缩（显式失败）
+            log.error("[CompactCommand] /compact 压缩结果落库失败（内存已替换为压缩后视图；DB 未落 →"
+                    + " 下轮会重复压缩）: session={} err={}",
+                sessionId != null ? sessionId : state.sessionId(), e.toString(), e);
+            state.replaceMessages(postCompact);
+            return ApplyOutcome.PERSIST_FAILED;
         }
     }
 

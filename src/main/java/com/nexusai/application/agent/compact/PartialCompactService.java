@@ -26,7 +26,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -133,6 +133,15 @@ public class PartialCompactService {
     }
 
     /**
+     * [SQLITE_BUSY_SNAPSHOT 修复] 注入落库段事务管理器（测试 seam · 生产走 {@code @Autowired} 字段注入）。
+     *
+     * @param transactionManager 事务管理器；null → 落库直调（委托 MessageService 自身 @Transactional）
+     */
+    public void setTransactionManager(org.springframework.transaction.PlatformTransactionManager transactionManager) {
+        this.transactionManager = transactionManager;
+    }
+
+    /**
      * [S3-L4-B] PROMPT_CACHE_BREAK_DETECTION feature 门控 · 对齐 auto 路径
      * ToolRegistrationConfig:733 {@code gatedBy(featureFlags)} 模式（CC claude.ts:1469
      * {@code feature('PROMPT_CACHE_BREAK_DETECTION')}）。required=false：非 Spring 直构测试 /
@@ -142,6 +151,19 @@ public class PartialCompactService {
      */
     @Autowired(required = false)
     private com.nexusai.application.agent.loop.FeatureFlags featureFlags;
+
+    /**
+     * [SQLITE_BUSY_SNAPSHOT 修复] 落库段短事务的事务管理器 · {@code @Autowired(required=false)}
+     * 字段注入（镜像本类 taskFrameworkService / planProvider / featureFlags / settingsResolver
+     * 既有模式，<b>不动构造器签名</b> —— 3 参 / 6 参直构测试逐位不变）。
+     *
+     * <p>生产 bean <b>实测为</b> {@code com.mybatisflex.spring.FlexTransactionManager}（MyBatis-Flex
+     * starter 提供，3461 实例启动日志 {@code 落库段: 独立短事务（TM=FlexTransactionManager）} 实证）；
+     * 直构测试 / 无 bean → null → {@link #persistCompactedMessages} 走「直调委托
+     * MessageService/SessionService 各自事务」分支（单测 mock 语义不变）。
+     */
+    @Autowired(required = false)
+    private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
     @Autowired
     public PartialCompactService(MessageService messageService,
@@ -168,11 +190,25 @@ public class PartialCompactService {
     /**
      * partial 压缩编排 · 对齐 CC REPL.tsx:4918-4972 onSummarize。
      *
+     * <p><b>[SQLITE_BUSY_SNAPSHOT 修复] 本方法刻意不加 {@code @Transactional}</b>。
+     * 原实现把整个编排（读 listForResume → 几十秒 LLM 摘要 → 写回）包在一个事务里：SQLite WAL 下，
+     * 事务的第一条 SELECT 就固定了读快照，此后任何其它连接提交写都会让该快照失效 → 事务内<b>后续
+     * 任何写</b>必然抛 {@code SQLITE_BUSY_SNAPSHOT}（SQLite 不允许把过期读快照升级为写事务，
+     * {@code busy_timeout} 也救不了），于是 partial-compact 在并发写（quartz 触发 / 实时落库 /
+     * 其它会话）下<b>稳定 500</b>。事务边界因此收窄为「只有落库那一段」
+     * （{@link #persistCompactedMessages} 内 TransactionTemplate 短事务）：LLM 长调用在事务外，
+     * 落库事务从开启到提交只跨毫秒级，不再携带过期快照。
+     *
+     * <p><b>一致性影响</b>：读阶段（步骤 1-6）改为各自自动提交的短读 —— 与 CC 同构
+     * （CC 的 partial compact 也没有跨 LLM 调用的 DB 事务，transcript 是 append-only 逐条落盘）。
+     * 落库的两处写（{@link MessageService#appendPostCompactMessages} + updateConversationId）
+     * 仍在<b>同一个</b>短事务内 → 二者原子性与修复前一致（任一失败整块回滚，不留半写）。
+     * {@code PostCompactCleanup} 移到事务提交之后执行（纯内存态复位，本就不需要事务语义）。
+     *
      * @param sessionId 会话 ID（路径变量）
      * @param request   请求（messageId / direction / feedback）
      * @return 重组后消息列表 + 新 conversationId（前端 setMessages + setConversationId）
      */
-    @Transactional
     public PartialCompactResponse partialCompact(String sessionId, PartialCompactRequest request) {
         RequestContext.setSession(sessionId);
         CompactConversationContext ctx = null;
@@ -257,11 +293,16 @@ public class PartialCompactService {
             //   MessageService.nextCreatedAt 单调分配器不同源 → 重插行可能早于会话已有行 → 下轮
             //   boundary 切片把 kept 段整段丢掉（与 auto compact 修复前同款 HIGH bug）。
             //   被摘要掉的旧行保留在 DB（boundary 之前 → 模型面剪枝；轨迹可回溯），与 auto compact 一致。
+            // [SQLITE_BUSY_SNAPSHOT 修复] 落库走「事务外 LLM + 短事务 + BUSY_SNAPSHOT 重试」
+            //   （见 persistCompactedMessages 的 JavaDoc；本方法已刻意不加 @Transactional）。
             String newConversationId = UUID.randomUUID().toString();
-            List<ChatMessageDto> normalized = messageService.appendPostCompactMessages(sessionId, postCompact);
-            sessionService.updateConversationId(sessionId, newConversationId);
+            List<ChatMessageDto> normalized =
+                persistCompactedMessages(sessionId, postCompact, newConversationId);
 
             // ── 8. runPostCompactCleanup（REPL.tsx:4972，非 main-thread，querySource=compact）──
+            // [SQLITE_BUSY_SNAPSHOT 修复] 移到落库短事务提交之后 —— 5 项清理全是内存态复位
+            // （resetMicrocompactState / clearSystemPromptSections / clearClassifierApprovals …），
+            // 不需要事务语义；放在事务外反而保证「清理只在落库成功后发生」。
             PostCompactCleanup.runPostCompactCleanup("compact");
 
             return new PartialCompactResponse(normalized, newConversationId);
@@ -291,6 +332,99 @@ public class PartialCompactService {
             }
         }
         return -1;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [SQLITE_BUSY_SNAPSHOT 修复] 落库段短事务 + 重试
+    // ════════════════════════════════════════════════════════════════════
+
+    /** 落库短事务最大尝试次数（首次 + 4 次重试）；有限次数，耗尽则 fail loud。 */
+    static final int MAX_WRITE_ATTEMPTS = 5;
+
+    /**
+     * partial 压缩落库段 · 独立<b>短事务</b> + BUSY_SNAPSHOT 重试（[SQLITE_BUSY_SNAPSHOT 修复]）。
+     *
+     * <p><b>WHY（根因）</b>：SQLite WAL 下事务的第一条 SELECT 固定读快照；该快照被其它连接提交顶掉后，
+     * 事务内<b>任何写</b>都抛 {@code SQLITE_BUSY_SNAPSHOT}（SQLite 不允许把过期读快照升级为写事务，
+     * {@code busy_timeout} 对本错误不生效）。旧实现把 {@code partialCompact} 整体 {@code @Transactional}
+     * 且事务内夹着几十秒的 LLM 摘要 → 并发写（quartz 触发 / 实时落库 / 其它会话）必然让快照过期 →
+     * 写回必失败（稳定 500）。本方法把落库收进「开启到提交只跨毫秒级」的短事务，快照不再有机会过期。
+     *
+     * <p><b>重试（为什么必要且为什么必须换事务）</b>：短事务内仍有毫秒级「先读后写」窗口
+     * （{@code appendPostCompactMessages} 先读 knownIds 再写），窗口内恰有并发提交仍可能 BUSY_SNAPSHOT
+     * —— 此时同事务内重试无用（快照已死），必须开新事务拿新快照；{@code TransactionTemplate.execute}
+     * 每次调用都开新事务，故重试天然正确。重试幂等：上一次尝试整体回滚、DB 无残留，boundary/summary
+     * 的 id 来自上游 DTO（稳定），重插不产生重复行（seq/created_at 分配器只产生跳号，不产生回退）。
+     *
+     * <p><b>原子性</b>：两处写（appendPostCompactMessages + updateConversationId）在<b>同一事务</b>内 ——
+     * 与修复前一致（任一失败整块回滚，不留「boundary 落了而 conversationId 没更新」的半写）。
+     *
+     * @param sessionId         会话 ID
+     * @param postCompact       重组后待落库消息（append-only 语义，见 MessageService）
+     * @param newConversationId 新 conversationId（REPL.tsx:4971）
+     * @return 归一化后的消息列表（供响应体）
+     */
+    List<ChatMessageDto> persistCompactedMessages(String sessionId,
+                                                  List<ChatMessageDto> postCompact,
+                                                  String newConversationId) {
+        if (transactionManager == null) {
+            // 直构测试 / 无 TM bean → 直调：MessageService.appendPostCompactMessages 自带
+            // @Transactional 兜底（单测 mock 场景无 DB，语义逐位不变）。
+            // 规则十二 fail loud：短事务护栏未启用属「降级」，必须显式记日志，不得静默。
+            log.warn("[PartialCompact] 无 PlatformTransactionManager → 落库直调（短事务 + BUSY_SNAPSHOT 重试"
+                + "护栏未启用；生产不应出现，出现即注入缺失）");
+            List<ChatMessageDto> normalized = messageService.appendPostCompactMessages(sessionId, postCompact);
+            sessionService.updateConversationId(sessionId, newConversationId);
+            return normalized;
+        }
+        TransactionTemplate template = new TransactionTemplate(transactionManager);
+        log.info("[PartialCompact] 落库段: 独立短事务（TM={}）+ BUSY_SNAPSHOT 重试上限 {} 次",
+            transactionManager.getClass().getSimpleName(), MAX_WRITE_ATTEMPTS);
+        RuntimeException lastBusy = null;
+        for (int attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt++) {
+            try {
+                List<ChatMessageDto> normalized = template.execute(status -> {
+                    List<ChatMessageDto> written =
+                        messageService.appendPostCompactMessages(sessionId, postCompact);
+                    sessionService.updateConversationId(sessionId, newConversationId);
+                    return written;
+                });
+                if (attempt > 1) {
+                    log.warn("[PartialCompact] 落库在第 {} 次尝试成功（前 {} 次 BUSY_SNAPSHOT，已换新事务重试）",
+                        attempt, attempt - 1);
+                }
+                return normalized;
+            } catch (RuntimeException e) {
+                if (!isSqliteBusy(e)) {
+                    throw e;
+                }
+                lastBusy = e;
+                log.warn("[PartialCompact] 落库第 {}/{} 次尝试命中 SQLITE_BUSY_SNAPSHOT（换新事务重试）: {}",
+                    attempt, MAX_WRITE_ATTEMPTS, e.getMessage());
+            }
+        }
+        log.error("[PartialCompact] 落库 {} 次尝试均因 SQLITE_BUSY_SNAPSHOT 失败，放弃（fail loud）",
+            MAX_WRITE_ATTEMPTS);
+        throw lastBusy;
+    }
+
+    /**
+     * SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT 判别（可重试错误）· 沿 cause 链匹配消息
+     * 「SQLITE_BUSY」（同时覆盖 {@code SQLITE_BUSY}(5) 与 {@code SQLITE_BUSY_SNAPSHOT}(517) 两种文案）。
+     * <b>不</b>按 {@code org.sqlite.SQLiteException} 类型匹配：生产异常可能被 MyBatis / Spring 事务层
+     * 包装，消息仍留在 cause 链上，但最外层类型不一定是它。
+     */
+    static boolean isSqliteBusy(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            String msg = cur.getMessage();
+            if (msg != null && msg.contains("SQLITE_BUSY")) {
+                return true;
+            }
+            Throwable next = cur.getCause();
+            cur = (next == cur) ? null : next;
+        }
+        return false;
     }
 
     /** nothing_to_summarize 判别（CC compact.ts:802-808 抛错文本）。 */
