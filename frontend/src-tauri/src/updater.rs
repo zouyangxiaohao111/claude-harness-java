@@ -2,7 +2,7 @@
 //!
 //! 清单 latest.json（每源根）：{ version, notes, published, platforms: {
 //!   "windows-x86_64": { url, sha256 } } }。
-//! 多源顺序尝试（默认内网 MinIO → GitHub release），sha256 校验替代 minisign（免私钥管理）。
+//! 多源顺序尝试（NEXUSAI_UPDATER_SOURCES / 内置默认 → GitHub release），sha256 校验替代 minisign（免私钥管理）。
 //! 命令：update_check( currentVersion, sources? ) / update_download( info ) / update_install( path )
 //! 事件：update://found / update://progress / update://installing / update://error
 
@@ -12,9 +12,12 @@ use std::io::Read;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-/// 默认源（内网 MinIO 桶 nexusai/updater · GitHub release latest.json）
+/// 默认源（自建更新源占位符 + 公开 GitHub release latest.json 兜底）。
+///
+/// 自建源地址不入库：部署时用环境变量 `NEXUSAI_UPDATER_SOURCES`（逗号分隔的 latest.json 地址）
+/// 覆盖，或由前端 `update_check` 命令的 `sources` 参数显式传入。
 pub const DEFAULT_SOURCES: [&str; 2] = [
-    "http://192.168.20.125:9000/nexusai/updater/latest.json",
+    "https://your-update-host.example/nexusai/updater/latest.json",
     "https://github.com/zouyangxiaohao111/claude-harness-java/releases/latest/download/latest.json",
 ];
 
@@ -70,7 +73,7 @@ pub fn update_check(
     sources: Option<Vec<String>>,
     app: AppHandle,
 ) -> Result<UpdateInfo, String> {
-    let list = sources.unwrap_or_else(|| DEFAULT_SOURCES.iter().map(|s| s.to_string()).collect());
+    let list = resolve_sources(sources);
     let mut last_err: Option<String> = None;
     for src in list {
         let info = fetch_one(&src, &current_version);
@@ -86,6 +89,29 @@ pub fn update_check(
         }
     }
     Err(last_err.unwrap_or_else(|| "无更新源".into()))
+}
+
+/// 更新源优先级：命令显式传入 > 环境变量 `NEXUSAI_UPDATER_SOURCES`（逗号分隔）> 内置默认。
+fn resolve_sources(sources: Option<Vec<String>>) -> Vec<String> {
+    if let Some(list) = sources.filter(|l| !l.is_empty()) {
+        return list;
+    }
+    if let Ok(raw) = std::env::var("NEXUSAI_UPDATER_SOURCES") {
+        let list = parse_sources(&raw);
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    DEFAULT_SOURCES.iter().map(|s| s.to_string()).collect()
+}
+
+/// 逗号分隔 → 去空白/去空项（`"a, b ,,"` → `["a","b"]`）。
+fn parse_sources(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn fetch_one(src: &str, current: &str) -> Result<UpdateInfo, String> {
@@ -210,5 +236,11 @@ mod tests {
     fn parse_digits() {
         assert_eq!(parse("0.1.5"), vec![0, 1, 5]);
         assert_eq!(parse("v1.2.3-beta.2"), vec![1, 2, 3, 2]);
+    }
+
+    #[test]
+    fn parse_sources_splits_and_trims() {
+        assert_eq!(parse_sources("a, b ,,c"), vec!["a", "b", "c"]);
+        assert!(parse_sources("  ").is_empty());
     }
 }

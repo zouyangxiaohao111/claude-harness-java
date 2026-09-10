@@ -9,7 +9,7 @@
  * 用法（在 front/ 下执行，或传 front 根）：
  *   node scripts/release-update.mjs [--exe <path>] [--out <dir>]
  * 上传（可选，通过 env）：
- *   MINIO_API=http://192.168.20.125:9000  MINIO_BUCKET=nexusai  MINIO_PREFIX=updater
+ *   MINIO_API=https://your-update-host.example  MINIO_BUCKET=nexusai  MINIO_PREFIX=updater
  *     （配合已登录的 mc：脚本执行 `mc cp --quiet` 到 ${MINIO_API}/${BUCKET}/${PREFIX}/）
  *   GH_UPLOAD=1 （配合 gh 已登录：上传到当前 repo 的 v${version} release）
  * 不传任何上传 env → 仅本地生成到 --out（默认 ../release）。
@@ -46,10 +46,10 @@ if (!existsSync(exe)) {
 }
 const sha256 = createHash('sha256').update(readFileSync(exe)).digest('hex')
 
-// 4) 清单：默认内网 MinIO 下载 URL；GH 源在同一相对路径
+// 4) 清单：下载 URL 取自 MINIO_API（未设置则写占位符，发版时用真实地址覆盖）；GH 源在同一相对路径
 const bucket = process.env.MINIO_BUCKET || 'nexusai'
 const prefix = (process.env.MINIO_PREFIX || 'updater').replace(/^\/|\/$/g, '')
-const minioApi = process.env.MINIO_API || 'http://192.168.20.125:9000'
+const minioApi = process.env.MINIO_API || 'https://your-update-host.example'
 const fileName = `NexusAI_${version}_x64-setup.exe`
 const manifest = {
   version,
