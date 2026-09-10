@@ -6895,6 +6895,15 @@ public class LlmAgentLoop implements AgentLoop {
             if (msg != null) {
                 java.util.List<com.nexusai.model.session.dto.ChatMessageDto> psBase =
                         params.messages() != null ? params.messages() : state.messages();
+                // [SM/fork 模型直传] hook 的 toolUseContext 必须是「本轮真正模型」的上下文：
+                //   params.toolUseContext() 是 run 级 TUC，effectiveModelName 恒空 → SM fork 会话模型
+                //   直传解析拿不到模型 → model=null → provider 回落 mock（假回复、永不 Edit）。用本轮
+                //   state.currentModel() 覆盖 effectiveModelName（= CC toolUseContext.options.mainLoopModel，
+                //   query.ts:1001-1008 REPLHookContext 同义），fork/后台按会话模型真实路由。
+                com.nexusai.application.agent.tool.ToolUseContext hookTuc = params.toolUseContext();
+                if (hookTuc != null && state.currentModel() != null && !state.currentModel().isBlank()) {
+                    hookTuc = hookTuc.withEffectiveModelName(state.currentModel());
+                }
                 com.nexusai.application.agent.hook.PostSamplingContext psContext =
                         new com.nexusai.application.agent.hook.PostSamplingContext(
                             postSamplingMessages(psBase, msg, turnAssistantId),
@@ -6906,7 +6915,7 @@ public class LlmAgentLoop implements AgentLoop {
                             fullSystemPrompt,
                             params.userContext(),
                             params.systemContext(),
-                            params.toolUseContext(),
+                            hookTuc,
                             params.querySource());
                 com.nexusai.application.agent.hook.PostSamplingHookRegistry.executeAll(
                     psContext,

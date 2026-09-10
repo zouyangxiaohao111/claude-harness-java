@@ -288,14 +288,20 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                 }
             }
         }
-        log.info("[ProductionForkedQuery] fork 工具下发: querySource={} model={} visibleTools={} "
+        log.info("[ProductionForkedQuery] fork 工具下发: querySource={} model={} provider={} visibleTools={} "
                 + "containsEdit={} canUseTool={} availableTools={} names={} historySize={} "
                 + "systemPromptSegments={} systemPromptChars={}",
-            params.querySource(), model, tools != null ? tools.size() : 0,
+            params.querySource(), model, provider != null ? provider.getClass().getSimpleName() : "null",
+            tools != null ? tools.size() : 0,
             toolNames.contains("Edit"),
             params.canUseTool() != null ? "有(受限)" : "null(不受限)",
             forkCtx != null && forkCtx.availableTools() != null ? forkCtx.availableTools().size() : 0,
             toolNames, historySize, systemSegments, systemChars);
+        if (provider instanceof com.nexusai.infra.llm.MockLlmProvider) {
+            log.warn("[ProductionForkedQuery] fork 落到 MockLlmProvider（无真实 LLM，永不产内容/Edit）: "
+                    + "querySource={} model={} — 查 model/provider 解析（model 空 / config unusable）",
+                params.querySource(), model);
+        }
 
         // [RES-C6] 发送边界 boundary 剥离 → blocks 数组（对齐主线程 LlmAgentLoop:2897-2904 +
         //   ModelCaller blocks 重载）：fork 与主线程同一 gate（params.useGlobalCacheScope，由
