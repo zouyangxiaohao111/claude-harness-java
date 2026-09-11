@@ -700,10 +700,13 @@ class AutoCompactorCcContractTest {
             .as("G-2: getAutoCompactThreshold 必须吃 ccContext 有效模型 big-model（非原始 modelName 默认窗）")
             .isGreaterThan(150_000);
 
-        // ── 有效模型 = small-model（50k cap < 100k 能力门）→ 回落默认 200k 窗 → 阈值高 → 100k 未达阈 → 不压缩 ──
-        // 对齐 CC context.ts:74-83：cap.max_input_tokens < 100_000 不进入 100k 门 → 回落
-        //   MODEL_CONTEXT_WINDOW_DEFAULT(200k)。注：setModelContextWindowResolver 显式返回 50000
-        //   亦被 CompactThresholdSystem 100k 能力门钳制为默认 200k（CC 语义，小窗模型不产生低阈值）。
+        // ── 有效模型 = small-model（显式配置 50k 窗）→ 按配置值 → 阈值低 → 100k 超阈 → 压缩 ──
+        // 【2026-09-11 契约变更】原「<100k 能力门」（CC context.ts:75 cap.max_input_tokens >= 100_000）
+        // 已从 CompactThresholdSystem 删除：CC 该门作用于 getModelCapability 的**静态能力表**（模型内置
+        // 硬上限）；NexusAI 无能力表，resolver 返回的是**用户显式配置**（DB models.max_context_tokens），
+        // 对应 CC 的用户覆盖分支（context.ts:52-60，无任何能力门）。套用能力门会造成「用户配 50k/90k 被
+        // 静默抬成 200k」——与本次修复的「未配置被静默算成 20 万」属同一类「静默吞掉配置」缺陷。
+        // 现语义：resolver 返回值 > 0 一律原样采用（与 ContextUsageCalculator 窗口口径同源）。
         // ctx 镜像 buildDefaultCompactConversationContext 必需字段，避免 compactConversation NPE
         //（model/querySource/readFileState/notifyCompaction；sessionId/agentId null 与默认路径等价）。
         CompactConversationContext smallCtx = new CompactConversationContext()
@@ -714,11 +717,11 @@ class AutoCompactorCcContractTest {
         AutoCompactor.AutoCompactResult rSmall = auto.autoCompactIfNeeded(
             msgs, 0, "user", smallCtx);
         assertThat(rSmall.wasCompacted())
-            .as("G-2: small-model 50k cap < 100k 能力门 → 回落默认 200k 窗（CC context.ts:74-83）→ 100k 未达阈不应压缩")
-            .isFalse();
+            .as("G-2: small-model 显式 50k 窗按配置值生效（不再被 100k 能力门抬成 200k）→ 阈值低 → 100k 必须压缩")
+            .isTrue();
         assertThat(auto.getAutoCompactThreshold())
-            .as("G-2: small-model 回落默认 200k → 阈值高（≥167k，非小窗低阈值——CC 语义 cap<100k 回落默认）")
-            .isGreaterThan(150_000);
+            .as("G-2: small-model 阈值随 50k 配置窗派生（≈50000−20000−13000），远低于 200k 窗的高阈值")
+            .isLessThan(50_000);
     }
 
     @Test

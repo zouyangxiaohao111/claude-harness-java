@@ -77,6 +77,16 @@ public class AgentLoopContextFactory {
 
     private static final Logger log = LoggerFactory.getLogger(AgentLoopContextFactory.class);
 
+    /**
+     * [fail-loud] 「模型未配置/查不到窗口 → 用默认值」的告警去重集合（每 model 只 warn 一次）。
+     * 该解析器被阈值/blocking/展示多路复用，每 turn 调用多次，不去重会刷屏。
+     */
+    private final java.util.Set<String> unconfiguredWindowWarned =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** null 模型名在 {@link #unconfiguredWindowWarned} 中的占位键（ConcurrentHashMap 不允许 null 键）。 */
+    private static final String NULL_MODEL_KEY = "<null>";
+
     // ── 原 32 组件基础设施 bean（全部 required=false）──
     @Autowired(required = false) private ToolRegistry toolRegistry;
     @Autowired(required = false) private HookRegistry hookRegistry;
@@ -280,23 +290,62 @@ public class AgentLoopContextFactory {
     }
 
     /**
-     * 按模型解析上下文窗口（DB model 元数据优先）· 回落 CC 默认 200_000。
+     * 按模型解析上下文窗口（DB model 元数据优先，DB {@code models.max_context_tokens}）。
+     *
+     * <p><b>「未配置 / 查不到」的回落 = {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}
+     * （1_048_576 = 1M）</b>，与前端契约「留空=1M」一致（2026-09-11 起；此前回落 CC 的 200_000，
+     * 即 2026-09-11 事故路径 —— {@code models.deepseek-flash.max_context_tokens=NULL} → 窗口 20 万
+     * → 阈值 179_000 → 会话在 92.6 万 tokens 就被压缩）。
+     *
+     * <p><b>[fail-loud]</b>：走到「未配置窗口 → 用默认值」这条路会打一条 WARN（含 model 名 +
+     * 所用默认值 + 具体原因），每 model 只打一次（防每 turn 刷屏）。四种触发情形：
+     * <ol>
+     *   <li>{@code model} 为空 / mapper 未注入（无 DB 上下文）</li>
+     *   <li>{@code ModelNameResolver.resolve} 返回 null（模型不存在 / 未命中）</li>
+     *   <li>{@code max_context_tokens} 为 NULL（<b>本次事故情形</b>）或 ≤ 0</li>
+     *   <li>解析抛异常</li>
+     * </ol>
+     *
+     * @param model 模型名（全名/裸名；可 null）
+     * @return DB 配置窗口（&gt; 0）或未配置默认值（恒 &gt; 0）
      */
     private int resolveModelContextWindow(String model) {
         if (model == null || model.isBlank() || modelMapper == null || providerMapper == null) {
-            return CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
+            warnUnconfiguredWindow(model, "model 为空或 DB mapper 不可用（modelMapper="
+                + (modelMapper != null) + ", providerMapper=" + (providerMapper != null) + "）");
+            return CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
         try {
             // W1-2: 统一走全名解析器（providerName/modelName 联合查, 无 / 回退按 name 查第一条）
             ModelRecord modelRecord = ModelNameResolver.resolve(modelMapper, providerMapper, model);
             // W2-1: 模型级窗口优先（models.max_context_tokens）——provider 级不再读取（探查确认死源）
-            if (modelRecord != null && modelRecord.getMaxContextTokens() != null) {
+            if (modelRecord != null && modelRecord.getMaxContextTokens() != null
+                    && modelRecord.getMaxContextTokens() > 0) {
                 return modelRecord.getMaxContextTokens();
             }
+            warnUnconfiguredWindow(model, modelRecord == null
+                ? "ModelNameResolver 未命中该模型"
+                : "max_context_tokens = " + modelRecord.getMaxContextTokens() + "（NULL/≤0）");
         } catch (Exception e) {
-            log.warn("[IMP-06] model 上下文窗口解析失败, 回落默认: model={} err={}", model, e.toString());
+            warnUnconfiguredWindow(model, "窗口解析异常: " + e);
         }
-        return CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
+        return CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
+    }
+
+    /**
+     * [fail-loud] 「模型未配置/查不到上下文窗口 → 使用默认值」告警（每 model 仅一次，
+     * 防阈值/blocking 预检每 turn 多次调用刷屏）。
+     *
+     * @param model  模型名（可 null）
+     * @param reason 具体原因（写入日志，便于定位是 NULL / 未命中 / mapper 缺失）
+     */
+    private void warnUnconfiguredWindow(String model, String reason) {
+        String key = model != null ? model : NULL_MODEL_KEY;
+        if (unconfiguredWindowWarned.add(key)) {
+            log.warn("[IMP-06] 模型 {} 未配置/查不到上下文窗口（{}）→ 使用「未配置窗口」默认值 {}"
+                    + "（前端契约 留空=1M，models.max_context_tokens）；如需其它窗口请显式配置",
+                model, reason, CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT);
+        }
     }
 
     /**

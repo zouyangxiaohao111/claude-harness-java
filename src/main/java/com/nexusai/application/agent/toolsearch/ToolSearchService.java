@@ -781,9 +781,12 @@ public final class ToolSearchService {
      * <ol>
      *   <li>{@code [1m]} 后缀 → {@code CONTEXT_1M_WINDOW}（utils/context.ts:69-72 显式 opt-in 优先，
      *       前置 {@code CLAUDE_CODE_DISABLE_1M_CONTEXT} 门 → has1mContext，G-13）</li>
-     *   <li>DB 模型级窗口（models.max_context_tokens，G-15 全名优先消歧）→ 100k 能力门（G-11，
-     *       &lt;100k 回落默认 200k）→ 1M 禁用钳制（G-14，&gt;200k 且禁用 → 200k）</li>
-     *   <li>回落 {@code MODEL_CONTEXT_WINDOW_DEFAULT}（utils/context.ts:96-98）</li>
+     *   <li>DB 模型级窗口（models.max_context_tokens，G-15 全名优先消歧）—— <b>&gt; 0 即原样采用</b>
+     *       （2026-09-11 删除原 G-11「&lt;100k 能力门」：DB 列是用户配置，对应 CC 的用户覆盖分支
+     *       context.ts:52-60，非 CC 的静态能力表；保留会导致用户配 90k 被静默抬成 200k）</li>
+     *   <li><b>未配置 / 查不到 → {@code CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}</b>（1_048_576 = 1M，
+     *       与前端「留空=1M」契约一致；2026-09-11 前为 200_000）</li>
+     *   <li>1M 禁用钳制（G-14，&gt;200k 且禁用 → 200_000）</li>
      * </ol>
      *
      * <p><b>独立 DB→[1m] 链已删除（原 W4-2 resolveDbContextWindow / G-15 私有解析）</b>: 共享 bean 的

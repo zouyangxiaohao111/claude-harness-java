@@ -80,7 +80,7 @@ public class ModelService {
         m.setEnabled(req.enabled() == null ? Boolean.TRUE : req.enabled());
         m.setCreatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
         if (log.isDebugEnabled()) {
-            log.debug("[ModelService] create 入库模型级窗口: model={} maxContextTokens={} (来源: 请求 {} → 默认 200_000)",
+            log.debug("[ModelService] create 入库模型级窗口: model={} maxContextTokens={} (来源: 请求 {} → 默认 1_048_576 = 1M)",
                 m.getName(), m.getMaxContextTokens(), req.maxContextTokens() != null ? "显式" : "缺省");
         }
         modelMapper.insert(ModelRecord.fromDomain(m));

@@ -169,29 +169,47 @@ public final class ContextUsageCalculator {
     }
 
     /**
-     * 解析模型上下文窗口 · 对齐 ChatService.publishCompleteEvent 实时路径（models.max_context_tokens，
-     * 回落 1M）+ MessageService.resolveContextWindowForModel 同源链（ModelNameResolver.resolve →
-     * ModelRecord.max_context_tokens；未命中/未配置/异常 → 回落 1_048_576）。
+     * 解析模型上下文窗口 · 对齐 ChatService.publishCompleteEvent 实时路径（models.max_context_tokens）+
+     * MessageService.resolveContextWindowForModel 同源链（ModelNameResolver.resolve →
+     * ModelRecord.max_context_tokens）。
      *
-     * @param modelMapper    模型 mapper（null → 回落 1M）
-     * @param providerMapper 提供商 mapper（null → 回落 1M）
-     * @param modelName      模型名（null/blank → 回落 1M）
+     * <p><b>「未配置窗口」默认值 = {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}
+     * （1_048_576 = 1M）· 单源</b>：未命中 / 未配置 / mapper 缺失 / 异常 一律回落该常量
+     * （不再是字面量 1_048_576，也不是 CC 的 200_000）。
+     * 该常量同时是 {@link CompactThresholdSystem}（阈值口径）与
+     * {@code AgentLoopContextFactory.resolveModelContextWindow}（DB 解析回落）的回落值
+     * —— 三处同源，故同一 model 在「展示口径」与「阈值口径」得到同一窗口。
+     *
+     * <p><b>[fail-loud]</b>：走到默认值这条路会打 WARN（含 model 名 + 原因 + 所用默认值）。
+     *
+     * @param modelMapper    模型 mapper（null → 回落未配置默认值）
+     * @param providerMapper 提供商 mapper（null → 回落未配置默认值）
+     * @param modelName      模型名（null/blank → 回落未配置默认值）
      * @return 模型上下文窗口 token 数（> 0，恒正）
      */
     private static long resolveContextWindowForModel(ModelMapper modelMapper, ProviderMapper providerMapper,
                                                      String modelName) {
         if (modelName == null || modelName.isBlank() || modelMapper == null || providerMapper == null) {
-            return 1_048_576L;
+            log.warn("[ContextUsageCalculator] 模型 {} 未配置/查不到上下文窗口（model 为空或 DB mapper 不可用）"
+                    + "→ 使用「未配置窗口」默认值 {}（前端契约 留空=1M）",
+                modelName, CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT);
+            return CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
         try {
             ModelRecord model = ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
             if (model != null && model.getMaxContextTokens() != null && model.getMaxContextTokens() > 0) {
                 return model.getMaxContextTokens();
             }
+            log.warn("[ContextUsageCalculator] 模型 {} 未配置/查不到上下文窗口（{}）→ 使用「未配置窗口」默认值 {}"
+                    + "（前端契约 留空=1M，models.max_context_tokens）",
+                modelName,
+                model == null ? "ModelNameResolver 未命中" : "max_context_tokens = " + model.getMaxContextTokens(),
+                CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT);
         } catch (Exception e) {
-            log.warn("[ContextUsageCalculator] 模型窗口解析失败, 回落 1M: model={} err={}", modelName, e.toString());
+            log.warn("[ContextUsageCalculator] 模型窗口解析失败，模型 {} 按「未配置窗口」处理 → 默认 {}: err={}",
+                modelName, CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT, e.toString());
         }
-        return 1_048_576L;
+        return CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
     }
 
     /**

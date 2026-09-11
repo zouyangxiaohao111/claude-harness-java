@@ -872,15 +872,20 @@ public class MessageService {
      * 的 DB model 元数据窗口来源（models.max_context_tokens，AgentLoopContextFactory:293-294）。
      *
      * <p>经 {@link ModelNameResolver#resolve}（全名感知，models.name 精确匹配 enabled model）反查
-     * ModelRecord 取 {@code max_context_tokens}；未命中/未配置/异常 → 回落 1_048_576（与实时 complete
-     * 事件同值 ChatService:571，非 CompactConstants.CONTEXT_1M_WINDOW=1_000_000）。
+     * ModelRecord 取 {@code max_context_tokens}；未命中/未配置/异常 →
+     * {@link com.nexusai.application.agent.compact.CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}
+     * （1_048_576 = 1M，非 {@code CONTEXT_1M_WINDOW=1_000_000}）—— 与实时 complete 事件
+     * （ChatService）及 {@code ContextUsageCalculator} 同源单常量。
      *
-     * @param model 模型名（全名/裸名；null → 直接回落 1M）
+     * @param model 模型名（全名/裸名；null → 直接回落未配置默认值）
      * @return 模型上下文窗口 token 数（> 0）
      */
     private long resolveContextWindowForModel(String model) {
         if (model == null || modelMapper == null || providerMapper == null) {
-            return 1_048_576L;
+            log.warn("[MessageService] 重拉上下文窗口: 模型 {} 未配置/查不到（model 为空或 DB mapper 不可用）"
+                + "→ 使用「未配置窗口」默认值 {}", model,
+                com.nexusai.application.agent.compact.CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT);
+            return com.nexusai.application.agent.compact.CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
         try {
             ModelRecord modelRecord = ModelNameResolver.resolve(modelMapper, providerMapper, model);
@@ -888,14 +893,17 @@ public class MessageService {
                     && modelRecord.getMaxContextTokens() > 0) {
                 return modelRecord.getMaxContextTokens();
             }
-            if (log.isDebugEnabled()) {
-                log.debug("[MessageService] 重拉上下文窗口: 模型 {} 无 max_context_tokens 或未命中，回落 1M",
-                    model);
-            }
+            log.warn("[MessageService] 重拉上下文窗口: 模型 {} 未配置/查不到上下文窗口（{}）"
+                    + "→ 使用「未配置窗口」默认值 {}", model,
+                modelRecord == null ? "ModelNameResolver 未命中"
+                    : "max_context_tokens = " + modelRecord.getMaxContextTokens(),
+                com.nexusai.application.agent.compact.CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT);
         } catch (Exception e) {
-            log.warn("[MessageService] 重拉上下文窗口解析失败, 回落 1M: model={} err={}", model, e.toString());
+            log.warn("[MessageService] 重拉上下文窗口解析失败，模型 {} 按「未配置窗口」处理 → 默认 {}: err={}",
+                model, com.nexusai.application.agent.compact.CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT,
+                e.toString());
         }
-        return 1_048_576L;
+        return com.nexusai.application.agent.compact.CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
     }
 
     /**

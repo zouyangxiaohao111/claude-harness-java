@@ -1643,6 +1643,69 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [compact-cost] 压缩那次 LLM 调用的 usage → 会话成本/用量合计 · 对齐 CC
+     * {@code claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage, options.model)}
+     * → {@code cost-tracker.ts:250-276 addToTotalModelUsage} → {@code state.ts:551-558
+     * STATE.totalCostUSD += cost}。
+     *
+     * <p><b>WHY 独立入口（而非复用 accumulateSessionUsage 直接调用）</b>：压缩调用是 side call
+     * （CC {@code queryModel} 的 message_delta 分支），其 usage 只作为
+     * {@code CompactionResult.compactionUsage} 在内存返回、不进 transcript（故 boundary/summary 行
+     * token 列为 NULL —— 与 CC 一致，不改）。但 CC 的<b>成本</b>侧同样在 message_delta 分支计入
+     * 会话合计，Java 端此前只有两处遥测消费（{@code emitTenguCompactTelemetry} /
+     * {@code emitAutoCompactSucceededTelemetry}）→ 真机漏算（sess-c72a825a auto compact
+     * preTokens≈46 万未进 sessions.total_cost_yuan / model_usage_json）。本方法补上成本接线。
+     *
+     * <p><b>复用既有会话计费通道（不新造统计体系）</b>：{@code addSessionOutputTokens}（output
+     * 镜像字段，主循环同款两处 :7257/:7528）+ {@link #accumulateSessionUsage}（input/cost/按模型桶）
+     * —— 与主循环同一条链路 → ChatService message.complete 读 {@code state.sessionCostYuan()} /
+     * {@code sessionModelUsage()} → CostTracker.saveCurrentSessionCosts 落
+     * sessions.total_cost_yuan + model_usage_json（跨 turn restore/save 自动生效）。
+     *
+     * <p><b>✗ 绝不进 runUsage</b>：CC {@code result.usage}（QueryEngine.totalUsage）只在主循环
+     * message_stop 累加，压缩 side call 不计入 —— 本方法只动会话级四元组，绝不调
+     * {@code state.accumulateRunUsage}（否则 complete.usage 会多算压缩量，反而不对齐 CC）。
+     *
+     * <p><b>模型口径</b>：{@code compactModel} 必须是真正执行本次压缩调用的模型（= 建压缩上下文
+     * 时喂给 {@code CompactConversationContext} 的 model，最终经
+     * {@code StreamCompactSummary.modelSupplier} 落到 {@code summaryResult.usage} 的那次调用）。
+     * 价格按模型/provider 分派（ModelCostCalculator 的 anthropic/deepseek cache 语义不同）——
+     * 用会话主模型顶替会算错金额。
+     *
+     * @param state        会话累计载体（null → no-op）
+     * @param compactModel 本次压缩调用实际使用的模型（null → no-op，不猜）
+     * @param usage        压缩调用 usage（null / 四字段全零 → no-op，不污染桶）
+     * @param calculator   模型计费纯函数（null → 仅累计 input/output tokens，cost/桶跳过）
+     */
+    private static void accumulateCompactionSessionCost(
+            AgentState state, String compactModel,
+            CompactConversation.TokenUsage usage,
+            com.nexusai.application.agent.cost.ModelCostCalculator calculator) {
+        if (state == null || usage == null || compactModel == null) {
+            return;
+        }
+        long cacheRead = usage.cacheReadInputTokens();
+        long cacheCreation = usage.cacheCreationInputTokens();
+        if (usage.inputTokens() <= 0 && usage.outputTokens() <= 0
+                && cacheRead <= 0 && cacheCreation <= 0) {
+            return;
+        }
+        // 主循环同款两步：output 镜像字段（:7257/:7528 addSessionOutputTokens）+
+        // input/cost/按模型桶（accumulateSessionUsage 内含 addSessionInputTokens /
+        // addSessionCostYuan / mergeSessionModelUsage）。
+        AgentUsage compactUsage = new AgentUsage(
+            usage.inputTokens(), usage.outputTokens(), cacheCreation, cacheRead,
+            null, null, null);
+        state.addSessionOutputTokens(compactUsage.outputTokens());
+        accumulateSessionUsage(state, compactModel, compactUsage, calculator);
+        if (log.isDebugEnabled()) {
+            log.debug("[compact-cost] 压缩调用 usage 已并入会话合计: model={} in={} out={} cacheRead={} cacheCreate={} sessionCostYuan={} · CC claude.ts:2361",
+                compactModel, compactUsage.inputTokens(), compactUsage.outputTokens(),
+                cacheRead, cacheCreation, state.sessionCostYuan());
+        }
+    }
+
+    /**
      * [usage-push] 逐消息 usage 推送 + run 级累计 · 每条 assistant 消息流式结束即推
      * {@code message.usage}（实时）并对齐 CC message_stop 累计（run 级 → complete.usage 读累计）。
      *
@@ -5288,6 +5351,16 @@ public class LlmAgentLoop implements AgentLoop {
                         // [MISS-5] emit tengu_auto_compact_succeeded · CC query.ts:478
                         // [IMP-CM-17] 结构化遥测（双发射 recordEvent + logOTelEvent · 原 log.info 文本升级）
                         emitAutoCompactSucceededTelemetry(loopTelemetry, preCompactMessages, l4Result, queryTracking);
+                        // [compact-cost] 压缩那次 LLM 调用的 usage → 会话成本/用量合计（对齐 CC
+                        //   claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage,
+                        //   options.model) → cost-tracker.ts:250-276 → state.ts:551-558）。
+                        //   模型 = compactEffectiveModel（本 turn 喂给 ccCtx 的模型 = CC mainLoopModel，
+                        //   即真正执行本次摘要调用的模型；StreamCompactSummary.modelSupplier 同源）。
+                        //   ✗ 不进 runUsage（压缩是 side call，CC result.usage 不含它）。
+                        CompactionResult autoCr = l4Result.compactionResult();
+                        accumulateCompactionSessionCost(state, compactEffectiveModel,
+                            autoCr != null ? autoCr.compactionUsage() : null,
+                            ctx.modelCostCalculator());
                         log.info("tengu_auto_compact_succeeded: originalMessageCount={} compactedMessageCount={} freed={} tokens source={} · CC query.ts:478",
                             preCompactMessages.size(), l4Result.messages().size(),
                             l4Result.tokensFreed(), l4Result.source());
@@ -6837,8 +6910,12 @@ public class LlmAgentLoop implements AgentLoop {
                         // （reactiveCompact.ts:75-88）：需 per-session CompactConversationContext
                         // （buildAutoContext 同 auto 路径 :3554）+ summaryProducer 适配
                         // （ReactiveCompactor.compactCallback → SummaryProducer，compact.ts:451）。
+                        // [compact-cost] 本 turn 有效模型提升为局部量：既喂 ccCtx（= 本次压缩调用
+                        //   实际使用的模型，CC mainLoopModel），又作成本折算的模型口径（同一值，
+                        //   避免二次解析漂移）。
+                        String reactiveCompactModel = resolveTurnEffectiveModel(params, recoveryState);
                         CompactConversationContext reactiveCcCtx = CompactConversation.buildAutoContext(
-                            params.toolUseContext(), resolveTurnEffectiveModel(params, recoveryState),
+                            params.toolUseContext(), reactiveCompactModel,
                             params.querySource().canonical(), ctx.hookRegistry());
                         if (reactiveCcCtx.getSummaryProducer() == null) {
                             reactiveCcCtx.setSummaryProducer(ctx.reactiveCompactor().summaryProducer());
@@ -6884,6 +6961,14 @@ public class LlmAgentLoop implements AgentLoop {
                                     prevRemaining, params.taskBudget().total(), measured, now);
                             }
 
+                            // [compact-cost] reactive 压缩那次 LLM 调用的 usage → 会话成本/用量合计
+                            //   （与 auto 路径同一条通道，对齐 CC claude.ts:2361
+                            //   addToTotalSessionCost → cost-tracker.ts:250-276）。snip-first 纯裁剪
+                            //   路径无 LLM 调用 → compactionUsage=null → 安全 no-op。
+                            //   ✗ 不进 runUsage（压缩是 side call）。
+                            accumulateCompactionSessionCost(state, reactiveCompactModel,
+                                compacted.compactionResult().compactionUsage(),
+                                ctx.modelCostCalculator());
                             // [R25-3] 标记 reactive compact 已尝试 · 让 gate 防止下次 prompt-too-long 时再次 compact
                             recoveryState.markReactiveCompact();
                             // [P4-4 item3 · CC query.ts:1442] reactive compact 成功后<b>复位</b> autoCompactTracking。

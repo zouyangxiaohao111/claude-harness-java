@@ -55,7 +55,15 @@ import java.util.function.ToIntFunction;
  * <p><b>model 上下文窗口解析器</b>: {@link #setModelContextWindowResolver(ToIntFunction)} 允许
  * 外部注入 DB model 元数据解析（models.max_context_tokens 模型级窗口，对齐旧 {@code computeBudgetFromGates} 语义；
  * W2-1 运行时窗口源由 providers.max_context_tokens 迁移至模型级）；
- * 未注入时回落 CC 默认 200_000（context.ts:9 MODEL_CONTEXT_WINDOW_DEFAULT）。
+ * <b>有</b>配置源但解析不到（resolver 返回 ≤ 0 / 抛异常）时回落<b>本产品</b>「未配置窗口」默认值
+ * {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}（1_048_576 = 1M，
+ * 与前端「留空=1M」契约一致，2026-09-11 起；<b>不再是</b> CC 的 200_000）；
+ * 未注入解析器（本部署无窗口源）时仍回落 CC 末位默认 200_000。
+ *
+ * <p><b>⚠ 200_000（{@link CompactConstants#MODEL_CONTEXT_WINDOW_DEFAULT}）在本类中只剩两个用途</b>：
+ * ① {@code CLAUDE_CODE_DISABLE_1M_CONTEXT} 生效时的<b>收窄目标</b>（CC context.ts:76-82）；
+ * ② 「本部署无窗口配置源」的末位兜底（CC context.ts:96-98，测试/非 Spring 场景）。
+ * 它<b>不再</b>承担「用户没配窗口」的回落职责。
  */
 public class CompactThresholdSystem {
 
@@ -91,11 +99,28 @@ public class CompactThresholdSystem {
     private static final int AUTOCOMPACT_BUFFER_TIER_30K = 30_000;
 
     /**
-     * model 上下文窗口解析器（CC getContextWindowForModel 的 Java 载体）·
-     * 默认返回 CC MODEL_CONTEXT_WINDOW_DEFAULT；可由 DB model 元数据解析器覆盖。
+     * model 上下文窗口解析器（CC getContextWindowForModel 的 Java 载体）· 可由 DB model
+     * 元数据解析器覆盖（生产由 {@code AgentLoopContextFactory.wireThresholdSystemResolver} 注入）。
+     *
+     * <p><b>未注入时回落 {@link CompactConstants#MODEL_CONTEXT_WINDOW_DEFAULT}（200_000）</b>
+     * —— 语义 = 「本部署根本没有窗口配置源」（无 Spring / 单测），等价 CC
+     * {@code context.ts:96-98} 的末位兜底；与「<b>有</b>配置源但该模型无值」（resolver 返回 ≤ 0
+     * 或抛异常）区分开：后者才是「用户没配窗口」，回落
+     * {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}（1_048_576，前端契约 留空=1M），
+     * 见 {@link #getContextWindowForModel(String)}。
      */
     private ToIntFunction<String> modelContextWindowResolver =
         model -> CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
+
+    /**
+     * 「未配置窗口 → 用默认值」的 fail-loud 去重集合（每个 model 只 warn 一次，防每 turn 刷屏）。
+     * 键 = 触发回落的 model 名（null 用 {@link #NULL_MODEL_KEY} 占位）。
+     */
+    private final java.util.Set<String> unconfiguredWindowWarned =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** null 模型名在 {@link #unconfiguredWindowWarned} 中的占位键（ConcurrentHashMap 不允许 null 键）。 */
+    private static final String NULL_MODEL_KEY = "<null>";
 
     /** max_tokens 解析器注入（测试隔离 model 解析，对齐 setModelContextWindowResolver）· null = 走真实解析链。 */
     private ToIntFunction<String> maxOutputTokensResolver;
@@ -113,12 +138,15 @@ public class CompactThresholdSystem {
     }
 
     /**
-     * 注入 model 上下文窗口解析器（DB provider.maxContextTokens，对齐旧 computeBudgetFromGates）。
+     * 注入 model 上下文窗口解析器（DB models.max_context_tokens，对齐旧 computeBudgetFromGates）。
      *
-     * @param resolver model → 上下文窗口 token 数；返回 ≤ 0 时视为不可用（回落默认）
+     * @param resolver model → 上下文窗口 token 数；返回 ≤ 0 时视为「未配置/查不到」
+     *                 （回落 {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}，
+     *                  fail-loud warn 由 {@link #getContextWindowForModel(String)} 输出）
      */
     public void setModelContextWindowResolver(ToIntFunction<String> resolver) {
-        this.modelContextWindowResolver = resolver != null ? resolver : model -> CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
+        this.modelContextWindowResolver =
+            resolver != null ? resolver : model -> CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
     }
 
     /**
@@ -214,6 +242,42 @@ public class CompactThresholdSystem {
         return model != null && model.toLowerCase().contains("[1m]");
     }
 
+    /**
+     * 模型上下文窗口（原始窗口，未减 summary 预留）· 对齐 CC {@code utils/context.ts:51-98
+     * getContextWindowForModel} 的解析链，<b>但「DB 配置窗口」按 CC 的「用户显式覆盖」分支处理</b>。
+     *
+     * <p><b>解析链（自上而下，命中即返回）</b>：
+     * <ol>
+     *   <li>{@code [1m]} 后缀（未被禁用）→ {@link CompactConstants#CONTEXT_1M_WINDOW}（1_000_000）</li>
+     *   <li>DB 模型窗口 {@code models.max_context_tokens}（resolver）——<b>&gt; 0 即原样采用</b>
+     *       （不论大小：用户配 90k 就是 90k）</li>
+     *   <li>resolver <b>返回 ≤ 0 / 抛异常</b>（有配置源但该模型未配置、行缺失、NULL）→
+     *       {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}（1_048_576）+ fail-loud warn</li>
+     *   <li>1M 被禁用（{@code CLAUDE_CODE_DISABLE_1M_CONTEXT}）且窗口 &gt; 200_000 →
+     *       收窄到 {@link CompactConstants#MODEL_CONTEXT_WINDOW_DEFAULT}（200_000，HIPAA）</li>
+     * </ol>
+     *
+     * <p><b>「未注入 resolver」与「resolver 返回 ≤ 0」的区别（勿混）</b>：前者 = 本部署没有窗口
+     * 配置源（无 Spring / 单测）→ 保持 CC 末位默认 200_000；后者 = 有配置源（DB）但该模型没有值
+     * → 本产品「未配置窗口」默认 1M（前端契约）。生产恒为后者（resolver 由
+     * {@code AgentLoopContextFactory} 注入，见 {@code wireThresholdSystemResolver}）。
+     *
+     * <p><b>⚠ 本批的两处语义变更（2026-09-11，契约统一）</b>：
+     * <ol>
+     *   <li><b>「有配置源但该模型无值」的回落值 200_000 → 1_048_576</b>：本产品的窗口由用户配置，
+     *       前端契约「留空 = 1M」；未配置时必须按 1M 计。事故实证见
+     *       {@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}。
+     *       （「本部署无配置源」的末位兜底仍是 200_000，见下。）</li>
+     *   <li><b>删除「&lt; 100k 能力门」（原 G-11，CC context.ts:75 {@code cap.max_input_tokens
+     *       >= 100_000}）</b>：CC 该门作用于 {@code getModelCapability(model)} 返回的<b>静态能力表</b>
+     *       （模型内置硬上限）；NexusAI 无此表，resolver 返回的是<b>用户显式配置</b>
+     *       （DB {@code models.max_context_tokens}），对应 CC 的
+     *       {@code CLAUDE_CODE_MAX_CONTEXT_TOKENS} 显式覆盖分支（context.ts:52-60）——
+     *       该分支<b>没有</b>任何能力门，直接原样采用。原先套用能力门导致「用户配 90k 被静默
+     *       抬成 200k」，与本批要修的「静默吞掉配置」同类。删除后 resolver &gt; 0 一律原样采用
+     *       （与 {@link ContextUsageCalculator} 的窗口口径同源）。</li>
+     * </ol>
+     */
     public int getContextWindowForModel(String model) {
         if (has1mContext(model)) {
             return CompactConstants.CONTEXT_1M_WINDOW;
@@ -222,27 +286,30 @@ public class CompactThresholdSystem {
         try {
             resolved = modelContextWindowResolver.applyAsInt(model);
         } catch (Exception e) {
-            log.warn("[CompactThresholdSystem] modelContextWindowResolver 异常, 回落默认: {}", e.toString());
-            resolved = CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
+            log.warn("[CompactThresholdSystem] 模型窗口解析器异常，模型 {} 按「未配置窗口」处理: err={}",
+                model, e.toString());
+            resolved = CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
         if (resolved <= 0) {
-            return CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
-        }
-        // [G-11 100k 能力门] CC context.ts:75 — capability 分支仅当 cap.max_input_tokens >= 100_000
-        // 生效；resolver 返回 <100_000（DB 手配 90k 等小窗口）→ 能力分支落穿 → 回落默认 200k。
-        if (resolved < CompactConstants.CONTEXT_WINDOW_CAPABILITY_GATE) {
-            if (log.isDebugEnabled()) {
-                log.debug("[CompactThresholdSystem] resolver 窗口 {} < 100k 能力下限, 回落默认 {}（CC context.ts:75 cap>=100k 才应用）",
-                    resolved, CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT);
+            // [fail-loud] 走到「未配置/查不到窗口 → 用默认值」这条路必须一眼可见
+            // （此前只有一条隐晦的 db=null debug），每 model 只告警一次防刷屏。
+            if (unconfiguredWindowWarned.add(model != null ? model : NULL_MODEL_KEY)) {
+                log.warn("[CompactThresholdSystem] 模型 {} 未配置/查不到上下文窗口"
+                        + "（models.max_context_tokens 为空或模型未命中, resolver={}）→ "
+                        + "使用「未配置窗口」默认值 {}（前端契约 留空=1M）；"
+                        + "如需其它窗口请在模型配置中显式填写",
+                    model, resolved, CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT);
             }
-            return CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
+            resolved = CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
-        // CC context.ts:76-82 — capability 超 200k 且 1M 被禁用 → 钳制回落 200k
-        // （HIPAA 禁用场景 1M 能力端点仍可用于本地决策，但窗口不按 1M 计算）
+        // CC context.ts:76-82 — 窗口超 200k 且 1M 被禁用 → 收窄到 200k
+        // （HIPAA 禁用场景 1M 能力端点仍可用于本地决策，但窗口不按 1M 计算）。
+        // 注：本收窄在「未配置默认 1M」之后统一生效——若无条件早返回，未配置模型会在 1M 禁用
+        // 部署下拿到 1M 窗口，HIPAA 上限被绕过（2026-09-11 修正）。
         if (is1mContextDisabled() && resolved > CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT) {
             if (log.isDebugEnabled()) {
                 log.debug("[CompactThresholdSystem] CLAUDE_CODE_DISABLE_1M_CONTEXT 生效，"
-                    + "窗口 {} 钳制回落 {}（CC context.ts:75-81）",
+                    + "窗口 {} 收窄到 {}（CC context.ts:75-81）",
                     resolved, CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT);
             }
             return CompactConstants.MODEL_CONTEXT_WINDOW_DEFAULT;
@@ -257,6 +324,12 @@ public class CompactThresholdSystem {
      * <p><b>WHY</b>: {@link com.nexusai.application.agent.toolsearch.ToolSearchService} /
      * {@link com.nexusai.application.agent.LlmAgentLoop} 等非 Spring 场景在未注入本类 bean 时，
      * 复用本类同源逻辑（{@code [1m]} 前置 + 禁用门 + 默认），避免各自私有实现造成双轨（G-10）。
+     *
+     * <p><b>本静态兜底 = 「本部署无窗口配置源」场景（非 Spring / 单测），无 DB 查询能力</b>，
+     * 故保持 CC 末位默认 200_000（{@link CompactConstants#MODEL_CONTEXT_WINDOW_DEFAULT}）；
+     * 有 DB 配置源时的「未配置窗口」默认是 1_048_576
+     * （{@link CompactConstants#CONTEXT_WINDOW_UNCONFIGURED_DEFAULT}，前端契约 留空=1M）——
+     * 生产走 {@link #getContextWindowForModel(String)} 而非本方法。
      *
      * @param model               模型名（可 null）
      * @param is1mContextDisabled 1M 上下文是否禁用（CLAUDE_CODE_DISABLE_1M_CONTEXT 真值）
