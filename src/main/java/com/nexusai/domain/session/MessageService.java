@@ -241,27 +241,54 @@ public class MessageService {
     private final Set<String> seqFloorClampedWarned = ConcurrentHashMap.newKeySet();
 
     /**
-     * 读侧 NULL 兜底排序片段（前置键）：使 seq 为 NULL 的行稳定排到<b>各自结果集末尾</b>。
+     * 读侧排序片段（ASC 通道）：{@code seq} 升序 + NULL 排末尾。用于 {@link #listBySession}。
      *
-     * <p><b>语义选择（有意取舍）</b>：NULL = 位置未知，<b>既不冒充最新也不冒充最旧</b>：
-     * <ul>
-     *   <li><b>ASC</b>（{@link #listBySession}：模型上下文序 + BoundaryReader 切片）：裸 {@code seq} 下
-     *       NULL 恒排<b>最前</b>（先于第一条真实消息）= 冒充「会话最旧」→ 会被 boundary 切片当旧消息
-     *       <b>静默剪掉</b>，且挤在真实首条消息之前。本片段把它推到末尾 ⇒ 不遮挡真实首条、不被静默剪掉；</li>
-     *   <li><b>DESC</b>（{@link #listPageBySession} 尾页 = 最新 N 条，{@code LIMIT pageSize+1}）：这里若用
-     *       {@code seq IS NULL DESC} 会把 NULL 顶到 DESC 结果最前 = 冒充「<b>最新</b>」，一个位置未知的行
-     *       被算进尾页冒充刚写入的那条。故 DESC 侧同样用本片段（ASC 语义的前置键）→ NULL 落在 DESC
-     *       结果末尾 = <b>最旧</b>那头。</li>
-     * </ul>
-     * 两条通道对 NULL 的处置因此一致：<b>永不冒充最新</b>。残留（如实声明）：ASC 侧 NULL 行位于模型
-     * 上下文<b>末尾</b>，即「一条位置未知的行可能被当作最近一轮送给模型」—— 这是刻意取舍：排最前那一侧
-     * 会被 boundary 切片静默剪掉，<b>静默丢消息比「一条脏行可见 + 有 ERROR 日志」更糟</b>。根治靠 V71
-     * 触发器挡住新 NULL（写入口），读侧本片段 + {@link #warnNullSeqIfAny} 兜存量。
+     * <p><b>语义选择（有意取舍）</b>：NULL = 位置未知，<b>既不冒充最新也不冒充最旧</b> —— ASC 通道下
+     * NULL 落在<b>结果集末尾</b>：裸 {@code seq} 时 NULL 恒排<b>最前</b>（先于第一条真实消息）= 冒充
+     * 「会话最旧」→ 会被 boundary 切片当旧消息<b>静默剪掉</b>，且挤在真实首条消息之前。故必须把 NULL
+     * 推到末尾 ⇒ 不遮挡真实首条、不被静默剪掉。残留（如实声明）：ASC 侧 NULL 行位于模型上下文<b>末尾</b>，
+     * 即「一条位置未知的行可能被当作最近一轮送给模型」—— 刻意取舍：排最前那一侧会被 boundary 切片静默
+     * 剪掉，<b>静默丢消息比「一条脏行可见 + 有 ERROR 日志」更糟</b>。根治靠 V71 触发器挡住新 NULL（写入口），
+     * 读侧本片段 + {@link #warnNullSeqIfAny} 兜存量。
+     *
+     * <p><b>WHY 用 {@code NULLS LAST} 而不是旧的 {@code seq IS NULL} 前置键（本批的核心，别改回去）</b>：
+     * 旧写法 {@code ORDER BY seq IS NULL, seq ASC} 里 {@code seq IS NULL} 是<b>表达式、不是索引列</b>
+     * → SQLite 无法用它出序，实测查询计划退化为
+     * {@code SEARCH messages USING INDEX idx_messages_session_seq (session_id=?)} <b>+</b>
+     * {@code USE TEMP B-TREE FOR ORDER BY}（全量临时排序，把 {@code idx_messages_session_seq} 的
+     * 免排序收益全部废掉）。分页那条更亏：本可 {@code ORDER BY seq DESC LIMIT 51} 只取 51 行就停，
+     * 加前置键后要先全量排序再取 51 行。
+     * 而 {@code seq ASC NULLS LAST} 的排序键<b>仍是索引列 seq</b>（{@code NULLS LAST} 是 SQLite 3.30+
+     * 的排序修饰符，不是表达式）→ 实测查询计划只有 index SEARCH、<b>没有</b> {@code USE TEMP B-TREE}。
+     * 语义与旧写法<b>逐行等价</b>（NULL 同样落在各自结果集末尾）。
+     *
+     * <p><b>为什么不能直接删掉 NULL 兜底（比如裸 {@code seq}）</b>：V71 的回填只在「已升级并重启到新
+     * 构建」的机器上跑过；<b>其他用户的库在升级到本构建之前仍带 NULL</b>，读侧不能假设全世界的库都干净。
+     *
+     * <p><b>语法位置固定</b>：SQLite 文法为 {@code expr [COLLATE 名] [ASC|DESC] [NULLS FIRST|LAST]}，
+     * 即方向必须在 {@code NULLS LAST} <b>之前</b>（{@code seq NULLS LAST ASC} 是语法错误，实测
+     * {@code near "ASC": syntax error}）。故本片段自带方向、调用方<b>不得</b>再叠加 {@code orderBy}。
      *
      * <p><b>public 常量</b>：真实 SQLite 引擎断言（测试）直接引用本常量组装 SQL，保证「测试断言的口径」
-     * 与「生产发出的片段」同源、不会两处漂移（生产经 {@code orderByUnSafely} 原样发出，列名不加引号）。
+     * 与「生产发出的片段」同源、不会两处漂移（生产经 {@code orderByUnSafely} 原样发出：实测
+     * {@code QueryWrapper.create().eq("session_id",..).orderByUnSafely("seq ASC NULLS LAST").toSQL()}
+     * → {@code ... ORDER BY seq ASC NULLS LAST}，flex 不包装/不转义/不追加方向）。
      */
-    public static final String SEQ_NULLS_LAST_ORDER = "seq IS NULL";
+    public static final String SEQ_ASC_NULLS_LAST_ORDER = "seq ASC NULLS LAST";
+
+    /**
+     * 读侧排序片段（DESC 通道）：{@code seq} 降序 + NULL 排末尾。用于 {@link #listPageBySession} 尾页。
+     *
+     * <p><b>WHY 不是 {@code seq DESC NULLS LAST} 之外的写法</b>：DESC 通道下"排末尾"= <b>最旧</b>那头
+     * —— 绝不能让 NULL 冒充「<b>最新</b>」被算进尾页（{@code LIMIT pageSize+1}）而挤掉真实刚写入的那条。
+     * 裸 {@code seq DESC} 恰好把 NULL 排最后（SQLite 视 NULL 为最小）→ 语义上「裸 DESC」与「DESC NULLS
+     * LAST」一致，本片段只是把该语义<b>显式钉住</b>（防将来有人把两条通道的排序片段写反）；且与 ASC 通道
+     * 对称、共用同一套 NULLS LAST 机制（索引可用，见 {@link #SEQ_ASC_NULLS_LAST_ORDER} 的 WHY）。
+     *
+     * <p><b>与 {@link #listBySession} 的关系</b>：两条通道对 NULL 的处置一致 = <b>永不冒充最新</b>，
+     * 且都<b>永不废掉</b> {@code idx_messages_session_seq}（无 TEMP B-TREE）。
+     */
+    public static final String SEQ_DESC_NULLS_LAST_ORDER = "seq DESC NULLS LAST";
 
     /**
      * 取一个「雪花候选号」（{@code IdUtil.getSnowflakeNextId()}）· {@link #nextSeq} /
@@ -401,9 +428,10 @@ public class MessageService {
         }
         if (nullSeqRows > 0) {
             log.error("[MessageService] {}: 会话 {} 的结果集里有 {} 行 seq 为 NULL（位置键未落 = 数据异常）"
-                    + "，样本 id={}。这些行在 ORDER BY 里不冒充真实位置（{} 前置键 → 各自结果集末尾），"
-                    + "但位置未知本身不可接受：新写入已被 V71 触发器拦截，存量行请跑 V71 回填/人工补齐 seq。",
-                channel, sessionId, nullSeqRows, sampleId, SEQ_NULLS_LAST_ORDER);
+                    + "，样本 id={}。这些行在 ORDER BY 里不冒充真实位置（排序键 `seq <方向> NULLS LAST` "
+                    + "→ 各自结果集末尾），但位置未知本身不可接受：新写入已被 V71 触发器拦截，"
+                    + "存量行请跑 V71 回填/人工补齐 seq。",
+                channel, sessionId, nullSeqRows, sampleId);
         }
     }
 
@@ -525,12 +553,12 @@ public class MessageService {
         if (sessionMapper.selectOneById(sessionId) == null) {
             throw new NotFoundException("Session " + sessionId + " not found");
         }
-        // [seq 排序键 + NULL 兜底] 位置序 = seq；NULL 行经 SEQ_NULLS_LAST_ORDER 前置键稳定推到本结果集
+        // [seq 排序键 + NULL 兜底] 位置序 = seq；NULL 行经 SEQ_ASC_NULLS_LAST_ORDER 稳定推到本结果集
         //   末尾（裸 seq ASC 下 NULL 恒排最前 → 位置未知的行冒充会话首条消息、挤进模型上下文顶部）。见该常量 javadoc。
+        //   注意：方向已含在片段里（SQLite 文法要求 NULLS LAST 在方向之后），故不得再叠加 orderBy("seq", true)。
         List<MessageRecord> all = messageMapper.selectListByQuery(
             QueryWrapper.create().eq("session_id", sessionId)
-                .orderByUnSafely(SEQ_NULLS_LAST_ORDER)
-                .orderBy("seq", true));
+                .orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER));
         warnNullSeqIfAny(sessionId, "listBySession", all);
         List<ChatMessageDto> result = new ArrayList<>(all.size());
         for (MessageRecord m : all) {
@@ -556,7 +584,7 @@ public class MessageService {
      * 作游标；多查 1 条判定 hasMore。
      *
      * <p><b>[seq NULL 兜底]</b>：seq 为 NULL 的行（位置键未落 = 数据异常）由
-     * {@link #SEQ_NULLS_LAST_ORDER} 前置键排到 DESC 结果<b>末尾</b>（= 最旧那头，绝不冒充「最新」被算进
+     * {@link #SEQ_DESC_NULLS_LAST_ORDER} 排到 DESC 结果<b>末尾</b>（= 最旧那头，绝不冒充「最新」被算进
      * 尾页），并对该结果集 {@link #warnNullSeqIfAny ERROR 一条}。新 NULL 由 V71 触发器堵在写入口。
      *
      * <p><b>与 {@link #listBySession} 的关系</b>：本方法是前端主通道（有界窗口，session 首载 / F5 / 向上翻页）；
@@ -619,12 +647,14 @@ public class MessageService {
         //   SQLite 语义下 NEGATIVE LIMIT = 不限量（一次拉全表），与调用方意图相反且无日志。饱和到
         //   Integer.MAX_VALUE（= 调用方语义「全要」）而非改小成某个上限（不静默改调用方语义）。
         int probe = pageSize == Integer.MAX_VALUE ? Integer.MAX_VALUE : pageSize + 1;
-        // [seq NULL 兜底] DESC 侧仍用 SEQ_NULLS_LAST_ORDER 前置键（**不是** seq IS NULL DESC）：
+        // [seq NULL 兜底] DESC 侧用 SEQ_DESC_NULLS_LAST_ORDER（**不是** NULLS FIRST）：
         //   后者会把 NULL 顶到 DESC 结果最前 = 冒充「最新」并混进尾页（位置未知的行冒充刚写入的那条）。
         //   本片段的语义 = NULL 落在 DESC 结果末尾（最旧那头）；且带游标的分页含 seq < pivot 条件，
         //   NULL 行本就不会被游标页取到 → 分页通道对 NULL 行不可见（可见性由 warnNullSeqIfAny 的 ERROR 承担）。
+        //   WHY 不用旧的 `seq IS NULL, seq DESC` 前置键：那是表达式 → 实测多一次 USE TEMP B-TREE FOR ORDER BY，
+        //   把「DESC LIMIT 51 走索引取够即停」退化成「全量排序再取 51 行」。见 SEQ_ASC_NULLS_LAST_ORDER 的 javadoc。
         List<MessageRecord> desc = messageMapper.selectListByQuery(
-            qw.orderByUnSafely(SEQ_NULLS_LAST_ORDER).orderBy("seq", false).limit(0, probe));
+            qw.orderByUnSafely(SEQ_DESC_NULLS_LAST_ORDER).limit(0, probe));
         warnNullSeqIfAny(sessionId, "listPageBySession", desc);
         boolean hasMore = desc.size() > pageSize;
         List<MessageRecord> page = desc.size() > pageSize ? desc.subList(0, pageSize) : desc;

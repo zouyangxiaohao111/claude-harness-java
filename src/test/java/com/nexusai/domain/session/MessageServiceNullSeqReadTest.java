@@ -39,13 +39,19 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>本测试锁死</b>：
  * <ol>
- *   <li>两条读路径的排序都带 {@link MessageService#SEQ_NULLS_LAST_ORDER} 前置键，且 DESC 侧<b>不得</b>用
- *       {@code seq IS NULL DESC}（那会把 NULL 顶成「最新」）；</li>
+ *   <li><b>front-of-flex（最大风险点）</b>：MyBatis-Flex 的 {@code orderByUnSafely} 把
+ *       {@code seq <方向> NULLS LAST} <b>原样</b>发出 —— 不包装成列名、不转义、不追加 {@code ASC}。
+ *       实测生成 SQL 形如 {@code ... ORDER BY seq ASC NULLS LAST}。任何包装都会让 SQLite 报语法错
+ *       或让排序失效，故这条断言是「排序片段能被生产栈正确发出」的唯一守卫；</li>
+ *   <li>ASC 通道用 {@link MessageService#SEQ_ASC_NULLS_LAST_ORDER}、DESC 通道用
+ *       {@link MessageService#SEQ_DESC_NULLS_LAST_ORDER}，且 DESC 侧<b>不得</b>用 {@code NULLS FIRST}
+ *       （那会把 NULL 顶成「最新」）；</li>
  *   <li>结果集里出现 NULL seq → <b>ERROR 一条</b>（含会话 / 通道 / 条数 / 样本 id）。</li>
  * </ol>
  *
- * <p><b>RED 条件</b>：把排序改回裸 {@code orderBy("seq", ...)} → ① 红；DESC 改成
- * {@code orderByUnSafely("seq IS NULL DESC")} → ① 红；删掉 {@code warnNullSeqIfAny} 调用 → ② 红。
+ * <p><b>RED 条件（变异验证，两条都实测过）</b>：把常量改回 {@code "seq IS NULL, seq ASC"}（表达式前置键）
+ * → ①② 红（片段不匹配）；把 {@code NULLS LAST} 去掉（改裸 {@code "seq ASC"}）→ ①② 红。
+ * 删掉 {@code warnNullSeqIfAny} 调用 → ③ 红。
  */
 @DisplayName("[seq NULL 兜底·读侧] 排序不冒充真实位置 + ERROR 有声")
 class MessageServiceNullSeqReadTest {
@@ -105,7 +111,7 @@ class MessageServiceNullSeqReadTest {
     }
 
     @Test
-    @DisplayName("listBySession（ASC）：排序含 `seq IS NULL` 前置键（NULL 推末尾）；有 NULL 行 → ERROR 一条")
+    @DisplayName("listBySession（ASC）：flex 原样发出 `seq ASC NULLS LAST`（NULL 推末尾）；有 NULL 行 → ERROR 一条")
     void listBySession_ordersNullsLastAndLogsError() {
         when(messageMapper.selectListByQuery(any()))
             .thenReturn(List.of(row("m1", 10L), row("m-dirty", null), row("m2", 11L)));
@@ -113,10 +119,18 @@ class MessageServiceNullSeqReadTest {
         service.listBySession(SESSION);
 
         String sql = captureListQuery().toSQL();
+        // 【最大风险点】flex 必须原样发出：不得包装成列名/转义/追加方向。任一处改写都会让 SQLite 语法错或排序失效。
         assertThat(sql)
-            .as("ASC 侧必须带 NULL 前置键 —— 裸 seq ASC 下 NULL 排最前（冒充会话最旧/被 boundary 静默剪掉）")
-            .contains(MessageService.SEQ_NULLS_LAST_ORDER);
-        assertThat(sql).as("位置序仍是 seq").contains("seq ASC");
+            .as("flex orderByUnSafely 必须原样发出 `seq ASC NULLS LAST`（不包装/不转义/不追加方向）")
+            .contains("ORDER BY seq ASC NULLS LAST");
+        // 防「旁路叠加」：若调用方又叠了 orderBy("seq", true)，会变成 `... NULLS LAST, seq ASC`（语义冗余且说明有人没读文法）
+        assertThat(sql)
+            .as("方向已含在片段内，不得再叠加第二个排序键 —— 出现 `NULLS LAST,` 即表示有人把 orderBy(\"seq\", ..) 加回来了")
+            .doesNotContain("NULLS LAST,");
+        // 防回归：旧表达式前置键必须彻底消失（它是废索引的元凶）
+        assertThat(sql)
+            .as("旧写法 `seq IS NULL` 是表达式 → SQLite 必做全量临时排序，本批已淘汰，不得复活")
+            .doesNotContain("seq IS NULL");
 
         List<ILoggingEvent> errors = errorLogs();
         assertThat(errors).as("NULL seq = 数据异常，必须 ERROR 有声（静默变有声是这条的核心价值）").hasSize(1);
@@ -125,7 +139,7 @@ class MessageServiceNullSeqReadTest {
     }
 
     @Test
-    @DisplayName("listPageBySession（DESC 尾页）：同样用 `seq IS NULL`（而非 IS NULL DESC）→ NULL 不冒充「最新」")
+    @DisplayName("listPageBySession（DESC 尾页）：原样发出 `seq DESC NULLS LAST`（而非 NULLS FIRST）→ NULL 不冒充「最新」")
     void listPageBySession_descKeepsNullsAwayFromNewest() {
         when(messageMapper.selectListByQuery(any()))
             .thenReturn(List.of(row("m2", 11L), row("m1", 10L), row("m-dirty", null)));
@@ -134,11 +148,11 @@ class MessageServiceNullSeqReadTest {
 
         String sql = captureListQuery().toSQL();
         assertThat(sql)
-            .as("DESC 侧同样带 `seq IS NULL` 前置键 → NULL 落在 DESC 结果末尾（= 最旧那头）")
-            .contains(MessageService.SEQ_NULLS_LAST_ORDER);
+            .as("DESC 侧必须原样发出 `seq DESC NULLS LAST` → NULL 落在 DESC 结果末尾（= 最旧那头）")
+            .contains("ORDER BY seq DESC NULLS LAST");
         assertThat(sql)
-            .as("绝不能用 `seq IS NULL DESC`：那会把 NULL 顶到 DESC 结果最前 = 位置未知的行冒充「最新」挤进尾页")
-            .doesNotContain(MessageService.SEQ_NULLS_LAST_ORDER + " DESC");
+            .as("绝不能用 NULLS FIRST：那会把 NULL 顶到 DESC 结果最前 = 位置未知的行冒充「最新」挤进尾页")
+            .doesNotContain("NULLS FIRST");
         assertThat(sql).as("分页仍按 seq 降序取尾页").contains("seq DESC");
         assertThat(errorLogs()).as("分页通道同样必须对 NULL 行 ERROR 有声").hasSize(1);
     }

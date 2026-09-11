@@ -40,7 +40,7 @@ import static org.mockito.Mockito.when;
  *   <li>把 {@link ChatService} skill_listing 落库分支的 {@code messageService.appendMessage(m, ts)}
  *       改为直写 {@code messageMapper.insert} 而忘了 {@code rec.setSeq(nextSeq(sessionId))} →
  *       {@link #listingRow_carriesSeq()} 的 {@code getSeq()} 为 null → 红（位置键未知：读侧虽有
- *       {@code SEQ_NULLS_LAST_ORDER} 兜到末尾、但已还原不出「紧随用户消息之后」的位置）；
+ *       {@code SEQ_ASC_NULLS_LAST_ORDER} 兜到末尾、但已还原不出「紧随用户消息之后」的位置）；
  *       注：V71 起这种写入在真库上还会被 BEFORE INSERT 触发器直接 ABORT（位置键不许为 NULL）；</li>
  *   <li>把该落库分支删掉 / appendMessage 不再被调用 → 无 insert → 两用例皆红；</li>
  *   <li>seq 取号退化为常量/复用同值 → {@link #listingRow_seqAfterPreExistingUserRow()} 的
@@ -100,7 +100,7 @@ class ChatServiceSkillListingSeqStampTest {
     void listingRow_carriesSeq() {
         // WHY: 落库分支必须走 messageService.appendMessage（内部 nextSeq 取号，且新写入已被 V71 触发器
         //   强制非 NULL）。若改成直写 messageMapper.insert 而不自行 setSeq → seq=NULL → 位置未知：
-        //   本批读侧已把 NULL 兜到结果集末尾（MessageService.SEQ_NULLS_LAST_ORDER，不再排最前），
+        //   本批读侧已把 NULL 兜到结果集末尾（MessageService.SEQ_ASC_NULLS_LAST_ORDER，不再排最前），
         //   但位置仍是「未知」→ 重放（listBySession 按 seq）还原不出「紧随用户消息之后」，
         //   与 CC 语义相反（本批核心语义被破坏），且会被读侧 ERROR 报警。
         AgentState state = new AgentState("sys");

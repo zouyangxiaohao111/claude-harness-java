@@ -242,8 +242,8 @@ class V71MessagesSeqNullGuardMigrationTest {
     private static List<String> idsAsc(Connection conn, String sessionId) throws Exception {
         List<String> out = new ArrayList<>();
         try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT id FROM messages WHERE session_id = ? ORDER BY " + MessageService.SEQ_NULLS_LAST_ORDER
-                    + " ASC, seq ASC")) {
+                "SELECT id FROM messages WHERE session_id = ? ORDER BY "
+                    + MessageService.SEQ_ASC_NULLS_LAST_ORDER)) {
             ps.setString(1, sessionId);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
