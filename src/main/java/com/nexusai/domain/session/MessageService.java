@@ -183,7 +183,7 @@ public class MessageService {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // [seq 单调排序键] 雪花取号 · 位置语义（区别于 created_at 时间语义）
+    // [seq 单调排序键] 雪花取号 + per-session DB 基数 seed · 位置语义（区别于 created_at 时间语义）
     // ════════════════════════════════════════════════════════════════════
 
     /**
@@ -195,31 +195,215 @@ public class MessageService {
      * 时间不该被改写（展示语义）→ 同列二义必冲突。{@code seq}（V70 列）承载位置语义：读侧 ORDER BY seq，
      * created_at 回归纯时间。kept 段重挂 = 只更新 seq、created_at 保持原值。
      *
-     * <p><b>why 雪花而非 per-session 自增</b>：旧实现 per-session {@code seed = MAX(seq)} + 内存自增，
-     * 需 seed 查询、per-JVM 各自取号、seed 失败需回落安全基数等边角。雪花 ID 免 seed 查询、免 seed
-     * 失败路径。V70 存量行回填为 1..N，新雪花号恒大于它们 → 混排全局序仍正确。
+     * <p><b>why 雪花而非纯 per-session 自增</b>：纯 per-session 自增（{@code seed = MAX(seq)} + 内存自增）
+     * 需每会话一个分配槽；雪花号十进制位宽大 + 全局单调，跨会话混排也不乱序。V70 存量行回填为 1..N，
+     * 新雪花号恒大于它们 → 混排序仍正确。
+     *
+     * <p><b>⚠️ 纠正 V70 头注释的过时措辞（V70 文件按 checksum 约束<b>一字未改</b>，见 V71 头注释）</b>：
+     * V70:19 原话称雪花取号「免 seed 查询 / 免 per-JVM 重复 / <b>天然多实例安全</b>」——三句都不成立：
+     * <ul>
+     *   <li><b>「免 seed 查询」不成立</b>：本批已补 per-session DB 基数 seed（{@link #seqFloorOf}）。
+     *       「免 seed」的前提是「新号恒大于 DB 中所有已有号」，而该前提<b>只在时钟单调向前时</b>成立；</li>
+     *   <li><b>「天然多实例安全」不成立</b>：见下方「多实例边界」（workerId 由 PID/MAC 派生，mod 32 撞号）。
+     *       V70 头注释与本节结论自相矛盾，<b>以本节为准</b>；</li>
+     *   <li><b>跨重启单调不成立</b>：hutool 雪花号 = 时间基派生。墙钟回拨（NTP 回跳 / VM 快照恢复 /
+     *       手工改时间）+ 进程重启后取到的号会<b>小于</b>回拨前写入的号 → 新行排在旧行之前
+     *       （{@code ORDER BY seq ASC}）→ boundary 切片把最新一轮整段剪掉（见 {@link #seqFloorOf}）。</li>
+     * </ul>
+     * 本批不动 V70（checksum 会让已有库起不来），纠正落在新代码 javadoc 与 V71 头注释。
      *
      * <p><b>多实例边界（不要按「天然多实例安全」理解）</b>：{@code lastSeq} 只保护<b>单进程</b>。
      * hutool 默认 {@code IdUtil} 单例的 workerId 由 {@code RuntimeUtil.getPid()} 的 hashCode
      * 取模派生、datacenterId 由 MAC 派生 —— <b>同机两个 JVM 有撞 workerId 的概率（mod 32）</b>。
      * 单实例部署下本方法返回值全局唯一且单调；多实例同库写同一会话时 seq 可能重复/回退，
      * 需显式配置 workerId（{@code IdUtil.getSnowflake(workerId, datacenterId)}）或加库侧唯一约束。
+     * <b>[本批补充]</b> {@link #seqFloorOf} 的 per-session DB 基数 seed 只兜「重启 + 时钟不再向前」
+     * 这一类，<b>不改变</b>本边界：多实例写同一会话仍可能撞号（本批未修，如实声明）。
      */
     private final AtomicLong lastSeq = new AtomicLong(0L);
+
+    /**
+     * 会话 ID → 该会话 seq 的 <b>DB 基数</b>（首次取号时读入的 {@code max(seq)}；0 = 无行 / 未知）。
+     *
+     * <p><b>WHY 与 {@link #tsAlloc} 对称</b>：{@code created_at} 早有 DB 基数 seed（{@link #seedMaxNanos}），
+     * 而 {@code seq} 没有 —— 这是缺陷一的根：{@code lastSeq} 进程内从 0 起，<b>从不与 DB 的 max(seq)
+     * 比较</b>，于是「重启 + 墙钟回拨」后新号低于 DB 中的旧号 → {@code ORDER BY seq ASC} 把最新写入的
+     * 消息排到会话最前 → 被 {@code BoundaryReader.getMessagesAfterCompactBoundary} 当 boundary 之前的
+     * 旧消息整段剪掉 → 模型看不到刚发生的这一轮，且零日志。本槽位就是补上的那个基数。
+     *
+     * <p><b>key = sessionId（null/空白 → "" 独立槽位，防 NPE；空 key 不查 DB 直接 0）</b>。
+     * <b>每会话只查一次 DB</b>：{@link ConcurrentHashMap#computeIfAbsent} 保证该 sessionId 的 seed
+     * 恰好执行一次（与 {@link #tsAlloc} 同款；value 命中后永不再回查 —— 进程内 lastSeq 此后恒高于它）。
+     */
+    private final ConcurrentHashMap<String, Long> seqFloor = new ConcurrentHashMap<>();
+
+    /** 已就「seq 候选低于 DB 基数」报过 ERROR 的会话（每会话只 ERROR 一次，防持续异常刷屏）。 */
+    private final Set<String> seqFloorClampedWarned = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 读侧 NULL 兜底排序片段（前置键）：使 seq 为 NULL 的行稳定排到<b>各自结果集末尾</b>。
+     *
+     * <p><b>语义选择（有意取舍）</b>：NULL = 位置未知，<b>既不冒充最新也不冒充最旧</b>：
+     * <ul>
+     *   <li><b>ASC</b>（{@link #listBySession}：模型上下文序 + BoundaryReader 切片）：裸 {@code seq} 下
+     *       NULL 恒排<b>最前</b>（先于第一条真实消息）= 冒充「会话最旧」→ 会被 boundary 切片当旧消息
+     *       <b>静默剪掉</b>，且挤在真实首条消息之前。本片段把它推到末尾 ⇒ 不遮挡真实首条、不被静默剪掉；</li>
+     *   <li><b>DESC</b>（{@link #listPageBySession} 尾页 = 最新 N 条，{@code LIMIT pageSize+1}）：这里若用
+     *       {@code seq IS NULL DESC} 会把 NULL 顶到 DESC 结果最前 = 冒充「<b>最新</b>」，一个位置未知的行
+     *       被算进尾页冒充刚写入的那条。故 DESC 侧同样用本片段（ASC 语义的前置键）→ NULL 落在 DESC
+     *       结果末尾 = <b>最旧</b>那头。</li>
+     * </ul>
+     * 两条通道对 NULL 的处置因此一致：<b>永不冒充最新</b>。残留（如实声明）：ASC 侧 NULL 行位于模型
+     * 上下文<b>末尾</b>，即「一条位置未知的行可能被当作最近一轮送给模型」—— 这是刻意取舍：排最前那一侧
+     * 会被 boundary 切片静默剪掉，<b>静默丢消息比「一条脏行可见 + 有 ERROR 日志」更糟</b>。根治靠 V71
+     * 触发器挡住新 NULL（写入口），读侧本片段 + {@link #warnNullSeqIfAny} 兜存量。
+     *
+     * <p><b>public 常量</b>：真实 SQLite 引擎断言（测试）直接引用本常量组装 SQL，保证「测试断言的口径」
+     * 与「生产发出的片段」同源、不会两处漂移（生产经 {@code orderByUnSafely} 原样发出，列名不加引号）。
+     */
+    public static final String SEQ_NULLS_LAST_ORDER = "seq IS NULL";
 
     /**
      * 取一个「雪花候选号」（{@code IdUtil.getSnowflakeNextId()}）· {@link #nextSeq} /
      * {@link #nextSeqBlock} 共用的候选基准来源。
      *
-     * <p>异常/时钟回拨 → 回落 {@code nowMillis*1000}（仅候选值降级，单调性仍由调用方的
-     * {@code max(candidate, prev+1)} 保证）。
+     * <p><b>异常/时钟回拨兜底 = 纯进程内单调（{@code lastSeq + 1}），绝不再引入墙钟量纲</b>：
+     * 旧实现回落 {@code System.currentTimeMillis() * 1000L}（≈1.79e15），而真实雪花号 ≈2.098e18，
+     * <b>差约 1170 倍（3 个数量级）</b>。进程重启 + 墙钟回拨（NTP 回跳 / VM 快照恢复 / 手工改时间）后，
+     * 这个兜底值远小于回拨前写入的雪花号 → 新行 seq &lt; 旧行 → 最新写入的消息被排到会话最前 →
+     * boundary 切片整段剪掉 → 模型看不到刚发生的这一轮，且零日志。
+     *
+     * <p><b>为什么兜底取 {@code lastSeq + 1} 而不是抛出让上层显式处理</b>（二选一，选前者）：
+     * 抛异常会把「雪花取号的一次瞬时异常」放大成「全部落库路径失败」（user 消息 / compact / 工具结果
+     * 全写不进去 = 用户可见的丢消息），代价远大于「位置键退化为纯进程内序数」。而进程内序数本身是安全的
+     * —— 它不含任何墙钟量纲，跨重启量纲倒挂因此不可能再发生；量纲缩水后的「值偏小」由
+     * {@link #seqFloorOf} 的 DB 基数 clamp 抬到该会话已有行之上（见 {@link #clampSeqToDbFloor}）。
+     * 故「兜底不炸落库」与「位置不出错」两件事由两个职责分担，而不是靠抛异常二选一。
      */
     private long snowflakeCandidate() {
         try {
             return cn.hutool.core.util.IdUtil.getSnowflakeNextId();
         } catch (Exception e) {
-            log.warn("[MessageService] 雪花取号异常，回落毫秒*1000 单调兜底: {}", e.toString());
-            return System.currentTimeMillis() * 1000L;
+            long fallback = lastSeq.get() + 1;   // 纯进程内单调：无墙钟量纲（见 javadoc）
+            log.warn("[MessageService] 雪花取号异常，回落纯进程内单调兜底 lastSeq+1={}"
+                    + "（不再用墙钟量纲 nowMillis*1000 —— 旧值 ≈1.79e15 与雪花号 ≈2.098e18 差 3 个数量级，"
+                    + "跨重启必错序）; seq 基数由该会话 DB 基数 clamp 兜底: {}",
+                fallback, e.toString());
+            return fallback;
+        }
+    }
+
+    /**
+     * 该会话 seq 的 <b>DB 基数</b>（{@link #seedMaxSeq} 的进程内缓存）· 每会话只查一次 DB。
+     *
+     * @param sessionId 会话 ID（null/空白 → "" 独立槽位，seed 恒 0 不查 DB）
+     * @return 该会话 {@code max(seq)}；无行 / 查询失败 / mapper 缺失 → 0（= 无基数，clamp 不介入）
+     */
+    private long seqFloorOf(String sessionId) {
+        String key = (sessionId == null || sessionId.isBlank()) ? "" : sessionId;
+        return seqFloor.computeIfAbsent(key, this::seedMaxSeq);
+    }
+
+    /**
+     * seed：DB 该会话 {@code max(seq)} → long（无行 / 查询失败 / mapper 缺失 / sessionId 空 → 0）。
+     *
+     * <p>与 {@link #seedMaxNanos} 同款（读一行 + 取该列），差别只在列与排序：{@code ORDER BY seq DESC
+     * LIMIT 1} —— SQLite 下 DESC 的 NULL 排最后，故此行是「该会话最大的<b>非 NULL</b> seq」
+     * （全 NULL 会话 → 拿到 NULL 行 → 回落 0，等价无基数）。
+     *
+     * <p><b>查询失败 = 降级 0 但必须出声</b>：缓存 0 表示「本会话不再重试 seed」，此时跨重启基数缺位
+     * （回拨后仍可能错序），故 warn 明确写出该风险，而不是静默 0。
+     */
+    private long seedMaxSeq(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return 0L;
+        }
+        if (messageMapper == null) {
+            // 无 mapper = 无 Spring 上下文 / 纯单测直构（对齐 tsAlloc seed 的容错面），非数据异常
+            log.debug("[MessageService] seq seed 跳过（messageMapper 未注入）: session={}", sessionId);
+            return 0L;
+        }
+        try {
+            List<MessageRecord> rows = messageMapper.selectListByQuery(
+                QueryWrapper.create().eq("session_id", sessionId).orderBy("seq", false).limit(0, 1));
+            if (rows != null && !rows.isEmpty() && rows.get(0) != null && rows.get(0).getSeq() != null) {
+                long seeded = rows.get(0).getSeq();
+                if (log.isDebugEnabled()) {
+                    log.debug("[MessageService] seq seed: session={} DB max(seq)={}（该会话取号基数）",
+                        sessionId, seeded);
+                }
+                return seeded;
+            }
+        } catch (Exception e) {
+            log.warn("[MessageService] seq seed 失败（该会话降级为无 DB 基数：重启+墙钟回拨时新号可能低于"
+                    + " DB 已有号 → ORDER BY seq ASC 会把最新消息排到最前，请检查本地 DB 可读性）: "
+                    + "session={} err={}", sessionId, e.toString());
+        }
+        return 0L;
+    }
+
+    /**
+     * 候选号相对「该会话 DB 基数」的<b>防御性校准</b>（缺陷一第 3 条：把静默错序变成有声）。
+     *
+     * <p>触发条件 {@code candidate <= floor}：候选号比该会话 DB 已有行还小 —— 必然错序
+     * （新行会排到旧行之前，被 boundary 切片剪掉）。真实可达路径＝雪花取号异常回落进程内序数
+     * （见 {@link #snowflakeCandidate}）撞上「该会话有 V70 回填 1..N 或历史雪花号」；
+     * 也覆盖「未来某天取号量纲又被改小」这类回归。
+     *
+     * <p><b>处置</b>：抬到 {@code floor + 1}（一个仍会被 {@link #nextSeq} 的 {@code max(candidate, prev+1)}
+     * 继续往上压的下界），并 <b>ERROR 一次</b> —— 每会话只报一次（{@link #seqFloorClampedWarned}），
+     * 后续同类事件降为 DEBUG（不再累计计数，只记当次的值）：本仓有「持续异常刷屏」前科（cron 刷屏根因），故不逐次 ERROR，
+     * 但首次必定有声（诊断信息含 session / 候选值 / DB 基数）。
+     *
+     * @param sessionId 会话 ID
+     * @param candidate 雪花候选号（可能已是兜底值）
+     * @return {@code candidate}；若低于 DB 基数 → {@code DB max(seq) + 1}
+     */
+    private long clampSeqToDbFloor(String sessionId, long candidate) {
+        long floor = seqFloorOf(sessionId);
+        if (floor > 0 && candidate <= floor) {
+            String key = (sessionId == null || sessionId.isBlank()) ? "" : sessionId;
+            if (seqFloorClampedWarned.add(key)) {
+                log.error("[MessageService] seq 候选号低于该会话 DB 基数（静默错序已抬升为有声）: "
+                        + "session={} 候选={} DB max(seq)={} → 抬到 {}。成因＝雪花取号异常回落进程内序数 / "
+                        + "墙钟回拨 / 跨进程写入；不抬升则新行会排在旧行之前（ORDER BY seq ASC），"
+                        + "boundary 切片会把最新一轮整段剪掉且无日志。",
+                    sessionId, candidate, floor, floor + 1);
+            } else if (log.isDebugEnabled()) {
+                log.debug("[MessageService] seq 候选号再次低于 DB 基数（同会话已 ERROR 过，降 DEBUG 防刷屏）: "
+                        + "session={} 候选={} DB max(seq)={}", sessionId, candidate, floor);
+            }
+            return floor + 1;
+        }
+        return candidate;
+    }
+
+    /**
+     * 读侧 NULL seq 兜底告警（<b>静默变有声 = 本条的核心价值</b>）：结果集里出现 seq 为 NULL 的行即
+     * ERROR 一条，带会话 / 通道 / 条数 / 样本 id。
+     *
+     * <p>每结果集最多一条 ERROR（按会话聚合而非逐行，避免坏数据把日志刷爆）。NULL 的<b>根因入口</b>由
+     * V71 的 BEFORE INSERT/UPDATE 触发器堵住；本方法是「存量坏数据 / 触发器上线前的库」的读侧兜底。
+     */
+    private void warnNullSeqIfAny(String sessionId, String channel, List<MessageRecord> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return;
+        }
+        int nullSeqRows = 0;
+        String sampleId = null;
+        for (MessageRecord r : rows) {
+            if (r != null && r.getSeq() == null) {
+                nullSeqRows++;
+                if (sampleId == null) {
+                    sampleId = r.getId();
+                }
+            }
+        }
+        if (nullSeqRows > 0) {
+            log.error("[MessageService] {}: 会话 {} 的结果集里有 {} 行 seq 为 NULL（位置键未落 = 数据异常）"
+                    + "，样本 id={}。这些行在 ORDER BY 里不冒充真实位置（{} 前置键 → 各自结果集末尾），"
+                    + "但位置未知本身不可接受：新写入已被 V71 触发器拦截，存量行请跑 V71 回填/人工补齐 seq。",
+                channel, sessionId, nullSeqRows, sampleId, SEQ_NULLS_LAST_ORDER);
         }
     }
 
@@ -227,20 +411,28 @@ public class MessageService {
      * 取下一个 {@code seq}（全局单调递增）· <b>单号写路径统一入口</b>。
      *
      * <p><b>语义</b>：hutool 雪花 ID（{@code IdUtil.getSnowflakeNextId()}）· 全局单调 long。异常/时钟
-     * 回拨兜底取 {@code nowMillis*1000}，并经 {@code lastSeq} 保证返回值<b>恒增</b>
-     * （{@code max(id, prev+1)}，含回拨与重复）。调用顺序 = seq 顺序（调用方按入参数组序逐个取号即保序）。
+     * 回拨兜底取<b>纯进程内序数</b>（{@code lastSeq + 1}，<b>不再用墙钟量纲</b>，见
+     * {@link #snowflakeCandidate}），并经 {@code lastSeq} 保证返回值<b>恒增</b>
+     * （{@code max(candidate, prev+1)}，含回拨与重复）。调用顺序 = seq 顺序（调用方按入参数组序逐个取号即保序）。
+     *
+     * <p><b>[跨进程基线 seed]</b>：取号前先取「该会话 DB 基数」{@code floor = max(seq)}
+     * （{@link #seqFloorOf}，每会话只查一次），并把候选号校准到 {@code >= floor + 1}
+     * （{@link #clampSeqToDbFloor}，低于基数时 ERROR 一次）—— 故返回值<b>恒大于该会话 DB 中已有的
+     * max(seq)</b>（进程重启 + 墙钟回拨后也不会把新消息排到旧消息之前）。
      *
      * <p><b>实现</b>：直接复用 {@link #nextSeqBlock(String, int)} 的 {@code count=1} 分支
      * （同一次 {@code updateAndGet} 取 {@code [base]}）—— 两条路径共用同一个 CAS 序列化点，
-     * 语义与旧实现逐位等价（{@code base = max(candidate, prev+1)} 即原来的恒增值），
+     * 语义与旧实现逐位等价（{@code base = max(clamp(候选), prev+1)} 即原来的恒增值再叠基数下界），
      * 故不存在「两套取号逻辑漂移」的风险。
      *
-     * <p><b>恒增范围仅限本进程</b>：{@code lastSeq} 是进程内 {@code AtomicLong}，跨 JVM 不共享；
-     * 多实例同库写同一会话时，因 hutool 默认 workerId（PID/MAC 派生，mod 32）可能撞号，返回值
-     * 不保证跨进程唯一/单调（详见 {@link #lastSeq} 的「多实例边界」）。
+     * <p><b>恒增范围仅限本进程</b>（叠加「该会话 DB 基数」这条跨进程下界）：{@code lastSeq} 是进程内
+     * {@code AtomicLong}，跨 JVM 不共享；多实例同库写同一会话时，因 hutool 默认 workerId（PID/MAC 派生，
+     * mod 32）可能撞号，返回值不保证跨进程唯一/单调（详见 {@link #lastSeq} 的「多实例边界」）。
      *
-     * @param sessionId 会话 ID（<b>保留参数以便调用点稳定</b>；雪花全局单调，不再按会话 seed，值不参与取号）
-     * @return 下一个 seq（<b>严格大于本进程</b>此前所有已分配值；不保证跨 JVM 单调）
+     * @param sessionId 会话 ID（<b>参与取号</b>：用于查/缓存该会话 DB 基数 seed，见 {@link #seqFloorOf}；
+     *                  null/空白 → 无基数槽位，退化为纯进程内取号）
+     * @return 下一个 seq（<b>严格大于本进程</b>此前所有已分配值，且恒大于该会话 DB 已知 max(seq)；
+     *         不保证跨 JVM 单调）
      */
     public long nextSeq(String sessionId) {
         return nextSeqBlock(sessionId, 1)[0];
@@ -273,8 +465,11 @@ public class MessageService {
      * CAS 串行化排除了第三种可能，故<b>并发号绝不落在块内部</b>。反之「逐个取号」= {@code count} 次独立
      * CAS → 块内出现 {@code count-1} 个可被插入的窗口（这就是本方法存在的唯一理由）。
      *
-     * <p><b>基准</b>：{@code base = max(雪花候选, prev + 1)} —— 雪花候选给全局（跨会话）单调基准，
-     * {@code prev + 1} 保证即便雪花回拨或候选号被并发线程抢先，也不与已分配值重叠。
+     * <p><b>基准</b>：{@code base = max(clamp(雪花候选), prev + 1)} —— 雪花候选给全局（跨会话）单调基准，
+     * {@code prev + 1} 保证即便雪花回拨或候选号被并发线程抢先，也不与已分配值重叠；
+     * <b>{@code clamp(...)} = 相对该会话 DB 基数（{@code max(seq)}）的校准</b>
+     * （{@link #clampSeqToDbFloor}）→ 整块恒落在该会话 DB 已有行<b>之后</b>（跨重启/回拨不错序）。
+     * 校准在 CAS <b>之前</b>做一次（不在 lambda 内），故不受 {@code updateAndGet} 重试影响。
      *
      * <p><b>溢出兜底</b>：{@code base + count - 1} 若越过 {@code Long.MAX_VALUE} → {@code Math.addExact}
      * 抛 {@code ArithmeticException}（catch 后转 {@link IllegalStateException}）<b>显式失败</b>：
@@ -289,7 +484,7 @@ public class MessageService {
      * <p><b>非 CC 对齐项，属本仓自研</b>：CC 的 transcript 是内存数组，位置 = 数组下标，
      * 不存在「DB 位置键取号」，故 CC 无对应物；本方法只服务本仓的 DB 落库顺序。
      *
-     * @param sessionId 会话 ID（仅用于日志/语义分组，不参与取号；同 {@link #nextSeq}）
+     * @param sessionId 会话 ID（<b>参与取号</b>：用于查/缓存该会话 DB 基数 seed；同 {@link #nextSeq}）
      * @param count     块内元素个数（{@code <= 0} → 返回空数组，<b>不</b>消耗任何号）
      * @return 长度为 {@code count} 的连续严格递增 seq：{@code [0]} = 块首、{@code [count-1]} = 块末
      * @throws IllegalStateException seq 空间耗尽（{@code Long.MAX_VALUE} 饱和；实际不可达）
@@ -298,7 +493,10 @@ public class MessageService {
         if (count <= 0) {
             return new long[0];
         }
-        final long candidate = snowflakeCandidate();
+        // [跨进程基数] 候选号先相对该会话 DB 基数（max(seq)）校准 —— 低于基数即 ERROR 一次并抬到
+        //   max(seq)+1（clampSeqToDbFloor）。放在 CAS 之外 → 每次调用恰好校准/告警一次，
+        //   不受 updateAndGet 的 CAS 重试次数影响（lambda 内做会重复告警）。
+        final long candidate = clampSeqToDbFloor(sessionId, snowflakeCandidate());
         final long offset = count - 1L;
         long end;
         try {
@@ -327,8 +525,13 @@ public class MessageService {
         if (sessionMapper.selectOneById(sessionId) == null) {
             throw new NotFoundException("Session " + sessionId + " not found");
         }
+        // [seq 排序键 + NULL 兜底] 位置序 = seq；NULL 行经 SEQ_NULLS_LAST_ORDER 前置键稳定推到本结果集
+        //   末尾（裸 seq ASC 下 NULL 恒排最前 → 位置未知的行冒充会话首条消息、挤进模型上下文顶部）。见该常量 javadoc。
         List<MessageRecord> all = messageMapper.selectListByQuery(
-            QueryWrapper.create().eq("session_id", sessionId).orderBy("seq", true));
+            QueryWrapper.create().eq("session_id", sessionId)
+                .orderByUnSafely(SEQ_NULLS_LAST_ORDER)
+                .orderBy("seq", true));
+        warnNullSeqIfAny(sessionId, "listBySession", all);
         List<ChatMessageDto> result = new ArrayList<>(all.size());
         for (MessageRecord m : all) {
             result.add(toDto(m));
@@ -348,8 +551,13 @@ public class MessageService {
      *
      * <p><b>语义</b>（对齐 deepseek 有界历史窗口）：前端普通查看只按页加载 —— 缺省（{@code beforeMessageId}
      * 空）= <b>尾页</b>（最新 {@code limit} 条，seq ASC 返回）；{@code beforeMessageId} 非空 = 该消息
-     * 之前更早的一页。`seq` 为稳定位置序（全部写路径经 {@link #nextSeq} 雪花取号（全局单调 long），
-     * 恒严格递增；compact 重挂 kept 段也只改 seq），作游标；多查 1 条判定 hasMore。
+     * 之前更早的一页。`seq` 为稳定位置序（全部写路径经 {@link #nextSeq} 雪花取号（进程内单调 long，
+     * 且恒大于该会话 DB 已知 max(seq)：跨重启/时钟回拨也不倒挂）；compact 重挂 kept 段也只改 seq），
+     * 作游标；多查 1 条判定 hasMore。
+     *
+     * <p><b>[seq NULL 兜底]</b>：seq 为 NULL 的行（位置键未落 = 数据异常）由
+     * {@link #SEQ_NULLS_LAST_ORDER} 前置键排到 DESC 结果<b>末尾</b>（= 最旧那头，绝不冒充「最新」被算进
+     * 尾页），并对该结果集 {@link #warnNullSeqIfAny ERROR 一条}。新 NULL 由 V71 触发器堵在写入口。
      *
      * <p><b>与 {@link #listBySession} 的关系</b>：本方法是前端主通道（有界窗口，session 首载 / F5 / 向上翻页）；
      * {@code listBySession} 全量保留给后端内部（LLM resume / partialCompact / trim 定位）+ 前端 Trace 全程
@@ -411,8 +619,13 @@ public class MessageService {
         //   SQLite 语义下 NEGATIVE LIMIT = 不限量（一次拉全表），与调用方意图相反且无日志。饱和到
         //   Integer.MAX_VALUE（= 调用方语义「全要」）而非改小成某个上限（不静默改调用方语义）。
         int probe = pageSize == Integer.MAX_VALUE ? Integer.MAX_VALUE : pageSize + 1;
+        // [seq NULL 兜底] DESC 侧仍用 SEQ_NULLS_LAST_ORDER 前置键（**不是** seq IS NULL DESC）：
+        //   后者会把 NULL 顶到 DESC 结果最前 = 冒充「最新」并混进尾页（位置未知的行冒充刚写入的那条）。
+        //   本片段的语义 = NULL 落在 DESC 结果末尾（最旧那头）；且带游标的分页含 seq < pivot 条件，
+        //   NULL 行本就不会被游标页取到 → 分页通道对 NULL 行不可见（可见性由 warnNullSeqIfAny 的 ERROR 承担）。
         List<MessageRecord> desc = messageMapper.selectListByQuery(
-            qw.orderBy("seq", false).limit(0, probe));
+            qw.orderByUnSafely(SEQ_NULLS_LAST_ORDER).orderBy("seq", false).limit(0, probe));
+        warnNullSeqIfAny(sessionId, "listPageBySession", desc);
         boolean hasMore = desc.size() > pageSize;
         List<MessageRecord> page = desc.size() > pageSize ? desc.subList(0, pageSize) : desc;
         List<MessageRecord> asc = new ArrayList<>(page);

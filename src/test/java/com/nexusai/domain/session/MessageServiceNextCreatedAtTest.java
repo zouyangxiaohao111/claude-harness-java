@@ -13,7 +13,6 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -133,17 +132,22 @@ class MessageServiceNextCreatedAtTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // [seq 排序键] 雪花取号 · 全局单调 long（免 seed 查询）
+    // [seq 排序键] 雪花取号 · 全局单调 long + per-session DB 基数 seed
+    //   （跨进程基数/低于基数抬升/LERROR 有声/兜底去墙钟量纲 → 见 MessageServiceSeqSeedTest）
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("⑤ [seq] 雪花取号：连续调用严格递增且互不相等，且零 DB 交互（免 seed）")
-    void seqSnowflakeStrictlyIncreasingUniqueNoDbSeed() {
+    @DisplayName("⑤ [seq] 雪花取号：严格递增 + 互不相等；**每会话一次** DB 基数 seed（不是零 DB 交互）")
+    void seqStrictlyIncreasingUniqueWithOneTimePerSessionDbSeed() {
         // WHY（CLAUDE.md 规则九 · 不变量）：{@code seq} 是会话内位置键，{@code listPageBySession} 用它做
-        //   游标（{@code qw.lt("seq", pivot.getSeq())}）。旧 per-session 实现需 seed=DB max(seq) 查询，
-        //   且 seed 失败要回落安全基数（否则与存量行 1..N 重复 → 游标并列丢行）。雪花实现全局唯一且
-        //   单调 → 免 seed 查询、免 per-JVM 重复（多实例安全）、免回落边角。此处锁死这三条意图。
-        //   RED：取号改回 seed 查询 → never() 红；返回值改常量/不推进 → 递增或唯一性红。
+        //   游标（{@code qw.lt("seq", pivot.getSeq())}），故连续取号必须严格递增且不并列。
+        //
+        // [本批修正 · 原测试的意图是错的] 原用例名/断言是「零 DB 交互（免 seed）/ never()」—— 那是把
+        //   V70 头注释的过时措辞（「免 seed 查询」）当成了不变量来钉。事实正相反：免 seed 的前提
+        //   「新号恒大于 DB 所有已有号」只在时钟单调向前时成立，重启 + 墙钟回拨下不成立（缺陷一）。
+        //   现在**每会话** seed 一次 DB max(seq)（见 MessageServiceSeqSeedTest 的跨进程基数用例），
+        //   本用例相应改为钉「每会话仅一次」。
+        //   RED：seed 每次取号都查库 → times(1) 红；返回值改常量/不推进 → 递增或唯一性红。
         long s1 = service.nextSeq(SESSION);
         long s2 = service.nextSeq(SESSION);
         long s3 = service.nextSeq(SESSION);
@@ -154,18 +158,19 @@ class MessageServiceNextCreatedAtTest {
         assertThat(java.util.Set.of(s1, s2, s3)).as("互不相等（全局唯一）").hasSize(3);
         assertThat(s1).as("雪花号恒大于 V70 回填的 1..N（混排后新行恒排在旧行之后）")
             .isGreaterThan(1_000_000L);
-        verify(messageMapper, never()).selectListByQuery(any());
+        // 每会话只 seed 一次（mock 默认返回空列表 → 基数 0，不影响雪花基准）
+        verify(messageMapper, times(1)).selectListByQuery(any());
     }
 
     @Test
-    @DisplayName("⑥ [seq] 雪花取号全局单调：跨 sessionId 仍共享同一递增序列（不再 per-session seed）")
-    void seqSnowflakeGlobalAcrossSessions() {
-        // WHY：旧实现 key=sessionId 各自 seed → 两个会话可分配出相同 seq（per-JVM 内不冲突但语义上
-        //   非全局唯一）；雪花号全局唯一 → 跨会话仍递增且互不相等。RED：改回 seqAlloc per-session 槽位
-        //   （各自从 0/seed 起）→ sB 不 > sA 或两者相等 → 红。
+    @DisplayName("⑥ [seq] 取号全局单调：跨 sessionId 仍共享同一递增序列（per-session 只是基数，不是分配槽）")
+    void seqGlobalMonotonicAcrossSessions() {
+        // WHY：seq 的**分配槽**是全进程单个 lastSeq（跨会话共用一个递增序列），per-session 的只是
+        //   「DB 基数 seed」（{@code seqFloorOf}，抬下界不改分配槽）→ 跨会话取号仍严格递增且互不相等。
+        //   RED：把分配槽改成 per-session（各自从基数起）→ sB 不 > sA 或两者相等 → 红。
         long sA = service.nextSeq("sess-a");
         long sB = service.nextSeq("sess-b");
 
-        assertThat(sB).as("跨会话仍严格递增（雪花全局单调，非 per-session 自增）").isGreaterThan(sA);
+        assertThat(sB).as("跨会话仍严格递增（分配槽全局唯一，per-session 仅提供基数下界）").isGreaterThan(sA);
     }
 }
