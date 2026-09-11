@@ -1,7 +1,6 @@
 package com.nexusai.application.agent;
 
 import com.nexusai.application.agent.compact.AutoCompactor;
-import com.nexusai.application.agent.compact.AutoCompactTrackingState;
 import com.nexusai.application.agent.compact.CompactConversation;
 import com.nexusai.application.agent.compact.CompactBoundaryMessage;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
@@ -172,9 +171,10 @@ class LlmAgentLoopSnipMicroWiringTest {
         LlmProviderFactory factory = completingProviderFactory();
 
         AutoCompactor auto = Mockito.mock(AutoCompactor.class);
-        when(auto.autoCompactIfNeeded(anyList(), anyInt(), anyString(), any()))
+        // [P4-4] 生产路径调用 5 参重载（第 5 参 = per-query() AutoCompactTrackingState，CC
+        //   autoCompact.ts:275 `tracking` 形参），非实例字段 getTracking() ——桩/校验随之更新。
+        when(auto.autoCompactIfNeeded(anyList(), anyInt(), anyString(), any(), any()))
             .thenReturn(new AutoCompactor.AutoCompactResult(false, List.of(), null, 0, null, null));
-        when(auto.getTracking()).thenReturn(new AutoCompactTrackingState());
 
         FeatureFlags flags = historySnipOn ? snipOnFlags() : FeatureFlags.ALL_DISABLED;
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null, flags);
@@ -183,7 +183,7 @@ class LlmAgentLoopSnipMicroWiringTest {
         LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
 
         ArgumentCaptor<Integer> cap = ArgumentCaptor.forClass(Integer.class);
-        verify(auto).autoCompactIfNeeded(anyList(), cap.capture(), anyString(), any());
+        verify(auto).autoCompactIfNeeded(anyList(), cap.capture(), anyString(), any(), any());
         return cap.getValue();
     }
 

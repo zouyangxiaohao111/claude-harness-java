@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { useChatStore, selectTokenWarning } from '@/stores/chatStore'
+import { useChatStore } from '@/stores/chatStore'
+import { resolveCtxInfo } from '@/utils/contextUsage'
 import { sessionApi } from '@/api/sessions'
 import { statsApi } from '@/api/stats'
 import type { ChatMessageDto, StatsByModel, StatsResponse } from '@/api/types'
@@ -132,7 +133,8 @@ function StatsSection() {
 /**
  * F1 · 用量与花费弹窗（Composer 底部 hint-usage 点击打开 · 只读展示）
  * 顶部「当前会话」：金额（totalCostYuan）+ tokens（totalTokens）+ 按模型明细（末条 assistant 消息
- *   modelUsage 快照 · 会话累计）+ 当前上下文条（末条消息 contextTokensUsed/percentLeft，回落 token_warning 事件）。
+ *   modelUsage 快照 · 会话累计）+ 当前上下文条（末条 assistant 的快照口径 contextTokensUsed/contextWindow/
+ *   percentLeft · 由 resolveCtxInfo 单点解析，与 Composer 上下文条同源；无快照即不显示该条）。
  * 下方「所有会话」列表：map chatStore.sessions，每行 title+time+tokens+金额，点击 switchSession。
  * 打开时 sessionApi.list() 刷新（totalCostYuan/totalTokens 从后端 sessions 表重读）。
  */
@@ -149,8 +151,6 @@ export function UsageCostModal({
   const [tab, setTab] = useState<'usage' | 'stats'>('usage')
   const sessions = useChatStore((s) => s.sessions)
   const setSessions = useChatStore((s) => s.setSessions)
-  // [按会话键控] 上下文条回落值只取弹窗当前展示会话的那一份（原全局单字段会串到别的会话）
-  const tokenWarning = useChatStore(selectTokenWarning(activeSessionId))
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? sessions[0] ?? null
   // 末条 assistant 消息（complete 事件透传 usage/modelUsage/上下文快照；纯思考轮 content 空但 usage 有效）
   const lastMsg = useChatStore((s) => {
@@ -171,10 +171,14 @@ export function UsageCostModal({
   }, [setSessions])
 
   const modelUsageEntries = lastMsg?.modelUsage ? Object.entries(lastMsg.modelUsage) : []
-  // 当前上下文条：末条消息快照优先，回落 token_warning 事件
-  const ctxUsed = lastMsg?.contextTokensUsed ?? tokenWarning?.tokenUsage ?? null
-  const ctxWindow = lastMsg?.contextWindow ?? tokenWarning?.contextWindow ?? null
-  const ctxPct = lastMsg?.percentLeft ?? tokenWarning?.percentLeft ?? null
+  // 当前上下文条：**只认快照口径**（末条 assistant 的完整快照 · resolveCtxInfo 单点，与 Composer 同源）。
+  //   [P3-d 口径统一 2026-09-11] 删除「回落 token_warning」：其 tokenUsage 是本地估算、percentLeft 是
+  //   阈值相对口径（分母 autoCompactThreshold ≠ 窗口），与服务端真实 usage 不同源 → 混显示会让弹窗与
+  //   Composer 上下文条各说一套；无快照即不显示该条（对齐 CC getCurrentUsage undefined）。
+  const ctxInfo = resolveCtxInfo([lastMsg])
+  const ctxUsed = ctxInfo?.used ?? null
+  const ctxWindow = ctxInfo?.window ?? null
+  const ctxPct = ctxInfo?.pct ?? null
   const ctxFill = ctxUsed != null && ctxWindow != null && ctxWindow > 0
     ? Math.max(0, Math.min(100, (ctxUsed / ctxWindow) * 100))
     : null

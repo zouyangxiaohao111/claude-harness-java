@@ -231,7 +231,7 @@ class ToolRegistrationConfigMemoryBeansTest {
         SessionMemoryService sm = sessionMemoryServiceBean();
 
         CompactCommand.CompactCommandContext ctx = config.buildCompactCommandContext(
-            List.of(chatMessage("m1")), "s-1", "a-1", null, null, sm,
+            List.of(chatMessage("m1")), "s-1", "a-1", null, null, null, sm,
             null, null, null, null, null, false,
             new com.nexusai.application.agent.telemetry.Telemetry());  // [IMP-CM-17] telemetry 接线（tengu_compact）
 

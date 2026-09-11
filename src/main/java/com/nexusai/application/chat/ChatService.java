@@ -1048,13 +1048,20 @@ public class ChatService {
         // 块 3 投影：真实 input/output tokens（本轮累计；runUsage() 恒非 null → 恒发）
         Integer completeInputTokens = (int) completeUsage.inputTokens();
         Integer completeOutputTokens = (int) completeUsage.outputTokens();
+        // [P3-c] 上下文快照 usage 源 = 末条带 usage 的 assistant 消息（= 最后一轮 API 调用的 prompt
+        //   大小 = 当前上下文）· 对齐 CC getCurrentUsage（tokens.ts:150-177 倒序取最后一条带 usage
+        //   的消息）。⚠️ 不再传 runUsage()：它是本 run <b>每条</b> assistant usage 的累加（N 次 API
+        //   调用 prompt 之和），多轮工具 turn 会 ≈N 倍虚高；而重拉补算
+        //   （MessageService.applyContextSnapshotToLastAssistant）本就是单条口径 → 前端 F5 前后跳变。
+        //   runUsage() 保留给 complete.usage（CC result.usage = query 级累计，QueryEngine.ts:790-816）。
+        AgentUsage contextUsage = lastAssistantUsage(state);
         // 上下文快照（对齐 CC context.ts:118-144）：单点化收口到 ContextUsageCalculator.snapshot
         //   —— window = 模型 max_context_tokens（回落 1M）+ used 协议分派 + percentLeft clamp 0。
         //   [usage-push] 与 message.usage 事件（LlmAgentLoop.publishMessageUsage）共用同一快照单点，
         //   防 ChatService/MessageService 式公式漂移重演（见 ContextUsageCalculator 类 javadoc）。
         String completeModel = state.currentModel();
         ContextUsageCalculator.Snapshot completeSnapshot =
-            ContextUsageCalculator.snapshot(modelMapper, providerMapper, completeModel, completeUsage);
+            ContextUsageCalculator.snapshot(modelMapper, providerMapper, completeModel, contextUsage);
         long completeContextWindow = completeSnapshot.contextWindow();
         long completeContextUsed = completeSnapshot.contextTokensUsed();
         Integer completePercentLeft = completeSnapshot.percentLeft();
@@ -1752,6 +1759,40 @@ public class ChatService {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {
                 return m.reasoningDurationMs();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * [P3-c] 末条带 usage 的 assistant 消息 usage（message.complete 上下文快照 usage 源）。
+     *
+     * <p><b>WHY（口径对齐 CC）</b>：上下文「当前用量」= 最后一次 API 调用的 prompt 大小
+     * （全量历史 + 工具结果），即<b>最后一条带 usage 的 assistant 消息</b>的 usage —— CC
+     * {@code getCurrentUsage()}（tokens.ts:150-177）正是倒序取该条。本方法为该口径的
+     * Java 单点：末向前扫描首个 {@code role==assistant && usage != null} 的消息。
+     *
+     * <p><b>不得用 {@link AgentState#runUsage()}</b>：run 级累计 = 本 run 每条 assistant usage
+     * 的<b>累加</b>（N 次 API 调用 prompt 之和），多轮工具 turn 下 ≈N 倍虚高，且与重拉补算
+     * （MessageService 单条口径）不一致 → 前端 F5 前后跳变。run 累计只服务 complete.usage
+     * （CC result.usage = query 级累计）。
+     *
+     * <p><b>无匹配 → null</b>（未跑过任何带 usage 的 LLM 调用，如 abort 空跑）：交
+     * {@link ContextUsageCalculator#snapshot} 表达为「无 usage 数据」（used=0 + percentLeft 省略），
+     * 与「上下文真的空」不混同。
+     *
+     * @param state 当前 run 的 AgentState
+     * @return 末条带 usage 的 assistant 消息 usage；无 → null
+     */
+    private AgentUsage lastAssistantUsage(AgentState state) {
+        if (state == null || state.messages() == null) {
+            return null;
+        }
+        List<ChatMessageDto> messages = state.messages();
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessageDto m = messages.get(i);
+            if (m != null && m.role() == Role.assistant && m.usage() != null) {
+                return m.usage();
             }
         }
         return null;

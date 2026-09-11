@@ -21,6 +21,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       env，env 路已删）；PCT / BLOCKING override env 保留</li>
  *   <li>四态计算：warning / error / auto / blocking + percentLeft</li>
  *   <li>blocking 与 auto 阈值同源（同一 effectiveWindow 来源）</li>
+ *   <li>[P3-d] 口径区分：{@code thresholdRelativePercentLeft}（阈值相对，本类）≠ 窗口相对余量
+ *       （唯一权威 = {@code ContextUsageCalculator.Snapshot}）；旧名 {@code percentLeft()} 为新名别名</li>
  * </ol>
  *
  * <p><b>RED teeth</b>: 基线（fixed 200_000）下本类引用的 {@link CompactThresholdSystem} 不存在
@@ -256,6 +258,54 @@ class CompactThresholdSystemTest {
             .as("settings 收窄后 blocking = 80000 − 3000，与 threshold 同一 effectiveWindow")
             .isEqualTo(narrowed.getEffectiveContextWindowSize(MODEL) - 3_000)
             .isEqualTo(77_000);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 4.5 [P3-d] 口径区分：token_warning 的百分比是「阈值相对」，不是「窗口相对余量」
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>WHY（规则九 · 两套口径不得混用）</b>：同一个 UI 区域（Composer 上下文条）此前可能显示两个
+     * 互相矛盾的数字 —— {@code ContextUsageCalculator.Snapshot.percentLeft}（窗口相对，分母 = 模型原始
+     * 窗口 = 权威展示口径）vs {@code token_warning.percentLeft}（阈值相对，分母 = autoCompactThreshold）。
+     * 本用例把两个数字钉死为<b>刻意不同</b>，并声明后者只是「阈值判定口径」：若有人把阈值口径当余量
+     * 渲染（或把两者合并成一套公式），本用例即红。
+     *
+     * <p><b>RED 条件</b>：把 {@code calculateTokenWarningState} 的分母改成 {@code getContextWindowForModel}
+     * （或改成 {@code ContextUsageCalculator} 的窗口相对百分比）→ 40 vs 50 的差异消失 → 红。
+     */
+    @Test
+    @DisplayName("[P3-d] 阈值相对百分比 ≠ 窗口相对余量（同一 usage/window 下刻意不同 → 禁止混当余量渲染）")
+    void thresholdRelativePercent_isNotWindowRelativePercent() {
+        CompactThresholdSystem ts = new CompactThresholdSystem(null);
+        // MODEL → contextWindow=200000（未命中模型族），effectiveWindow=180000，autoThreshold=167000
+        int usage = 100_000;
+
+        CompactThresholdSystem.TokenWarningState state = ts.calculateTokenWarningState(usage, MODEL, true);
+        int thresholdRelative = state.thresholdRelativePercentLeft();
+        int windowRelative = (int) Math.round((1 - (double) usage / ts.getContextWindowForModel(MODEL)) * 100);
+
+        assertThat(thresholdRelative)
+            .as("阈值相对：round((167000−100000)/167000×100) = 40（分母 = autoCompactThreshold）")
+            .isEqualTo(40);
+        assertThat(windowRelative)
+            .as("窗口相对（唯一权威 = ContextUsageCalculator.Snapshot）：round((1−100000/200000)×100) = 50")
+            .isEqualTo(50);
+        assertThat(thresholdRelative)
+            .as("同一 usage 下两套口径必然不同 → 前端禁止把 token_warning.percentLeft 当剩余% 渲染")
+            .isNotEqualTo(windowRelative);
+    }
+
+    @Test
+    @DisplayName("[P3-d] 旧名访问器 percentLeft() = 新名 thresholdRelativePercentLeft()（纯改名，值语义不变）")
+    void legacyAccessorIsSameQuantityAsRenamedComponent() {
+        CompactThresholdSystem ts = new CompactThresholdSystem(null);
+        CompactThresholdSystem.TokenWarningState state = ts.calculateTokenWarningState(1_000, MODEL, true);
+
+        assertThat(state.percentLeft())
+            .as("预算外消费方（LlmAgentLoop / AutoCompactor）仍读旧名 → 取值必须与显式新名一致")
+            .isEqualTo(state.thresholdRelativePercentLeft())
+            .isEqualTo(99);
     }
 
     // ════════════════════════════════════════════════════════════════════

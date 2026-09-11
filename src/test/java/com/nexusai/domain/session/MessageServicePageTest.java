@@ -217,4 +217,147 @@ class MessageServicePageTest {
         }
         return out;
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [P3-b] 压缩后归零：快照扫描下界 = 最后一个 compact boundary（与请求面同源）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>WHY（规则九 · 「压缩后上下文数字必须降下来」）</b>：/compact 落库是 append-only（旧 assistant
+     * 行仍在表里），压缩后尚未来新一轮时「全表末条带 usage 的 assistant」正是<b>压缩前</b>那条 →
+     * 重拉按其 input/cache 重算 → 前端 F5 后仍显示压缩前大值（数字不降）。本组用例钉死：快照只在
+     * 最后一个 compact boundary 之后找；其后无带 usage 的 assistant → <b>不出快照</b>（= CC full
+     * compact 后 {@code getCurrentUsage()} 找不到 → 指示器归零，compact.ts:767-777）。
+     *
+     * <p><b>RED 条件</b>：把扫描下界改回 0（全表末条）→ 压缩前 assistant 被挂上 used=500000 → 红。
+     */
+    @Test
+    @DisplayName("[P3-b] 压缩后无新一轮：boundary 之后无带 usage assistant → 不出快照（归零，非压缩前大值）")
+    void postCompactNoNewTurn_doesNotAttachPreCompactSnapshot() {
+        stubModelResolution();
+        // ASC（= 前端/模型面顺序）：user → assistant(压缩前, input=500000) → boundary → 摘要(无 usage)
+        when(messageMapper.selectListByQuery(any())).thenReturn(newestFirst(
+            summary("s1", "2026-01-04T00:00:00Z"),
+            boundary("b1", "2026-01-03T00:00:00Z"),
+            asst("m2", "2026-01-02T00:00:00Z", 500_000),
+            rec("m1", "2026-01-01T00:00:00Z")));
+
+        PageResult pr = service.listPageBySession("sess-1", null, 50);
+
+        assertThat(dto(pr, "m2").contextTokensUsed())
+            .as("压缩前 assistant 不得被补上快照（旧行为：全表末条 → 这里会挂 500000 → 前端数字不降）")
+            .isNull();
+        assertThat(pr.messages())
+            .as("压缩后视图无任何消息携带上下文快照（归零语义）")
+            .allSatisfy(m -> assertThat(m.contextTokensUsed()).isNull());
+    }
+
+    @Test
+    @DisplayName("[P3-b] 压缩后已有新一轮：快照取 boundary 之后的 assistant（与请求面同源），非压缩前那条")
+    void postCompactWithNewTurn_snapshotFromPostBoundaryAssistant() {
+        stubModelResolution();
+        // ASC：user → assistant(压缩前 big) → boundary → 摘要 → assistant(压缩后 input=1200)
+        when(messageMapper.selectListByQuery(any())).thenReturn(newestFirst(
+            asst("m5", "2026-01-05T00:00:00Z", 1_200),
+            summary("s1", "2026-01-04T00:00:00Z"),
+            boundary("b1", "2026-01-03T00:00:00Z"),
+            asst("m2", "2026-01-02T00:00:00Z", 500_000),
+            rec("m1", "2026-01-01T00:00:00Z")));
+
+        PageResult pr = service.listPageBySession("sess-1", null, 50);
+
+        assertThat(dto(pr, "m5").contextTokensUsed())
+            .as("非 anthropic → 仅 input=1200（压缩后真实上下文）")
+            .isEqualTo(1200L);
+        assertThat(dto(pr, "m2").contextTokensUsed())
+            .as("压缩前 assistant 不挂快照（不得拿它冒充当前上下文）")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("[P3-b 回归] 无 compact boundary（普通会话）：仍补末条带 usage 的 assistant（行为不变）")
+    void noBoundary_keepsLegacyBehaviour() {
+        stubModelResolution();
+        when(messageMapper.selectListByQuery(any())).thenReturn(newestFirst(
+            asst("m2", "2026-01-02T00:00:00Z", 3_000),
+            rec("m1", "2026-01-01T00:00:00Z")));
+
+        PageResult pr = service.listPageBySession("sess-1", null, 50);
+
+        assertThat(dto(pr, "m2").contextTokensUsed())
+            .as("无边界 → 末条带 usage 的 assistant 补快照（P3-b 不得破坏常规路径）")
+            .isEqualTo(3_000L);
+    }
+
+    /** mock 返回序 = 最新在前（listPageBySession 内部 reverse 回 ASC）。 */
+    private static List<MessageRecord> newestFirst(MessageRecord... newestFirstRows) {
+        return new ArrayList<>(List.of(newestFirstRows));
+    }
+
+    private static MessageRecord asst(String id, String createdAt, int inputTokens) {
+        MessageRecord m = rec(id, createdAt);
+        m.setRole("assistant");
+        m.setContent("回复-" + id);
+        m.setInputTokens(inputTokens);
+        m.setOutputTokens(10);
+        return m;
+    }
+
+    /** 压缩摘要（assistant 角色、无 usage —— 对齐 full compact 产出的摘要消息）。 */
+    private static MessageRecord summary(String id, String createdAt) {
+        MessageRecord m = rec(id, createdAt);
+        m.setRole("assistant");
+        m.setContent("摘要-" + id);
+        m.setIsCompactSummary(true);
+        return m;
+    }
+
+    /** compact boundary（role=system + subtype=compact_boundary，BoundaryReader 判别口径）。 */
+    private static MessageRecord boundary(String id, String createdAt) {
+        MessageRecord m = rec(id, createdAt);
+        m.setRole("system");
+        m.setSubtype("compact_boundary");
+        m.setContent("boundary");
+        return m;
+    }
+
+    private static ChatMessageDto dto(PageResult pr, String id) {
+        return pr.messages().stream().filter(m -> id.equals(m.id())).findFirst().orElseThrow();
+    }
+
+    /**
+     * 模型解析桩：会话模型 = {@code deepseek/deepseek-v4-flash}（settings.mainModelName），
+     * max_context_tokens=200000，provider.type=openai_compatible（→ used 仅 input，与生产主模型一致）。
+     */
+    private void stubModelResolution() {
+        com.nexusai.repository.settings.entity.SettingsRecord settings =
+            new com.nexusai.repository.settings.entity.SettingsRecord();
+        settings.setMainModelName("deepseek/deepseek-v4-flash");
+        com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper =
+            mock(com.nexusai.repository.settings.mapper.SettingsMapper.class);
+        when(settingsMapper.selectOneById(any())).thenReturn(settings);
+        ReflectionTestUtils.setField(service, "settingsMapper", settingsMapper);
+
+        com.nexusai.repository.provider.mapper.ModelMapper modelMapper =
+            mock(com.nexusai.repository.provider.mapper.ModelMapper.class);
+        com.nexusai.repository.provider.mapper.ProviderMapper providerMapper =
+            mock(com.nexusai.repository.provider.mapper.ProviderMapper.class);
+        com.nexusai.repository.provider.entity.ProviderRecord provider =
+            new com.nexusai.repository.provider.entity.ProviderRecord();
+        provider.setId("p1");
+        provider.setName("deepseek");
+        provider.setType("openai_compatible");
+        when(providerMapper.selectOneByQuery(any())).thenReturn(provider);
+        when(providerMapper.selectOneById(any())).thenReturn(provider);
+        com.nexusai.repository.provider.entity.ModelRecord model =
+            new com.nexusai.repository.provider.entity.ModelRecord();
+        model.setId("m1");
+        model.setProviderId("p1");
+        model.setName("deepseek-v4-flash");
+        model.setEnabled(true);
+        model.setMaxContextTokens(200_000);
+        when(modelMapper.selectOneByQuery(any())).thenReturn(model);
+        ReflectionTestUtils.setField(service, "modelMapper", modelMapper);
+        ReflectionTestUtils.setField(service, "providerMapper", providerMapper);
+    }
 }

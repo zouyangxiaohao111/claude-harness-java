@@ -108,8 +108,29 @@ public class AutoCompactor {
      */
     private CompactSettingsResolver settingsResolver;
 
-    /** 跟踪状态 */
-    private final AutoCompactTrackingState tracking;
+    /**
+     * 便捷路径跟踪状态 · <b>生产路径不消费</b>（测试 / 手动接线的 {@code tryAutoCompact} 重载专用）。
+     *
+     * <p><b>[P4-4 tracking 生命周期对齐 CC] WHY（历史事故根因）</b>：本字段原为<b>唯一</b>跟踪状态源，
+     * 而 AutoCompactor 是 Spring 单例 bean（跨会话共享 JVM 单实例）——多会话并发时 A 会话的
+     * {@code compacted/turnCounter/turnId/consecutiveFailures} 会被 B 会话的压缩/失败覆盖：
+     * <ul>
+     *   <li>B 会话可继承 A 会话的<b>已熔断</b>计数 → B 的自动压缩被无故短路（上下文不再被压，
+     *       最终撞 blocking-limit / 413）；</li>
+     *   <li>A 的 runtime reset（run 入口）会把 B 正在累计的熔断计数清零 → 熔断器形同虚设；</li>
+     *   <li>{@code compacted=true} 跨会话泄漏 → {@code isRecompactionInChain} / 回合计数失真。</li>
+     * </ul>
+     * CC 的 {@code autoCompactTracking} 是 {@code query()} 调用的<b>局部 State 字段</b>
+     * （query.ts:264 声明 / :425 初始化为 undefined），随 query() 调用创建、随调用结束丢弃——
+     * 既不跨会话也不跨 query。
+     *
+     * <p><b>本仓对齐</b>：生产路径由调用方（{@code LlmAgentLoop.queryLoop} = CC query() 等价入口）
+     * 每 query() 创建一个 {@link AutoCompactTrackingState}，经
+     * {@link #autoCompactIfNeeded(List, int, String, CompactConversationContext, AutoCompactTrackingState)}
+     * 第 5 参显式传入（对齐 CC {@code deps.autocompact(..., tracking, ...)} 第 5 参）。本字段仅供
+     * 无 per-session 上下文的便捷重载（测试 / 手动接线）持有，<b>不是</b>生产状态源。
+     */
+    private final AutoCompactTrackingState defaultTracking;
 
     // ════════════════════════════════════════════════════════════════════
     // IMP-07 新增 CC 对齐字段
@@ -298,7 +319,7 @@ public class AutoCompactor {
     public AutoCompactor(TokenCounter tokenCounter, CompactCallback compactCallback) {
         this.tokenCounter = tokenCounter;
         this.compactCallback = compactCallback;
-        this.tracking = new AutoCompactTrackingState();
+        this.defaultTracking = new AutoCompactTrackingState();
     }
 
     /**
@@ -432,10 +453,15 @@ public class AutoCompactor {
     }
 
     /**
-     * 获取跟踪状态
+     * 获取<b>便捷路径</b>跟踪状态（测试 / 手动接线）· 生产路径不消费。
+     *
+     * <p>[P4-4] 生产路径的跟踪状态由 {@code LlmAgentLoop.queryLoop} 每 query() 新建并经
+     * {@link #autoCompactIfNeeded(List, int, String, CompactConversationContext, AutoCompactTrackingState)}
+     * 第 5 参显式传入（对齐 CC query() 局部 State.autoCompactTracking，query.ts:264/:425）——
+     * 本方法暴露的字段跨会话共享，<b>绝不可</b>作为多会话生产状态载体（见 {@link #defaultTracking}）。
      */
     public AutoCompactTrackingState getTracking() {
-        return tracking;
+        return defaultTracking;
     }
 
     /**
@@ -701,6 +727,13 @@ public class AutoCompactor {
      *   <li>失败计数：非 USER_ABORT 记 error 日志、计数无条件 +1（autoCompact.ts:334-349，INV-5）</li>
      * </ol>
      *
+     * <p><b>[P4-4 tracking 生命周期对齐 CC] 本重载为便捷路径</b>（测试 / 手动接线，无 per-session
+     * 上下文）：跟踪状态回落实例字段 {@link #defaultTracking}（跨会话共享，<b>生产禁用</b>）。
+     * 生产路径（{@code LlmAgentLoop}）必须走
+     * {@link #autoCompactIfNeeded(List, int, String, CompactConversationContext, AutoCompactTrackingState)}
+     * 显式传入本 query() 的跟踪状态 —— 对齐 CC 把 {@code tracking} 作为
+     * {@code deps.autocompact} 第 5 参（query.ts:852-865）而非模块/单例状态。
+     *
      * @param messages        消息列表（post-snip/collapse 视图 · CC query.ts:454 传参）
      * @param snipTokensFreed L2 Snip 已释放的 token 数（CC query.ts:466 传参；默认 0）
      * @param querySource     查询来源（CC querySource；session_memory/compact/marble_origami → 守卫）
@@ -712,6 +745,37 @@ public class AutoCompactor {
     public AutoCompactResult autoCompactIfNeeded(
             List<ChatMessageDto> messages, int snipTokensFreed, String querySource,
             CompactConversationContext ccContext) {
+        return autoCompactIfNeeded(messages, snipTokensFreed, querySource, ccContext, this.defaultTracking);
+    }
+
+    /**
+     * 尝试执行自动压缩（<b>生产路径</b> · 显式跟踪状态）· 对齐 CC
+     * {@code autoCompactIfNeeded(messages, toolUseContext, cacheSafeParams, querySource, tracking, snipTokensFreed)}
+     * （autoCompact.ts:275-278）——跟踪状态由调用方持有并作为参数传入，<b>不是</b> AutoCompactor 实例状态。
+     *
+     * <p><b>[P4-4 tracking 生命周期对齐 CC] WHY</b>：CC 的 {@code autoCompactTracking} 属于
+     * {@code query()} 调用的循环局部 State（query.ts:264 声明 / :425 初始化 undefined / :555
+     * {@code let tracking = autoCompactTracking}），随 query() 调用创建、随调用结束丢弃——多会话
+     * 共享进程时天然互不污染。Java 端 AutoCompactor 为单例 bean，若沿用实例字段则跨会话/跨 run 串台
+     * （B 会话继承 A 的熔断计数或 compacted 标志 → 该压的不压、不该压的反复压，即历史「同一会话反复
+     * autoCompact」事故的判据错乱面）。本重载把状态生命周期交还调用方：
+     * {@code LlmAgentLoop.queryLoop} 每 query() 新建一个 {@link AutoCompactTrackingState}，经
+     * {@code loop(...)} 参数透传（含 stop-hook 递归重入帧，对齐 CC transition 携带
+     * {@code autoCompactTracking: tracking} 的 7 处 continue 站点）。
+     *
+     * @param messages        消息列表（post-snip/collapse 视图 · CC query.ts:454 传参）
+     * @param snipTokensFreed L2 Snip 已释放的 token 数（CC query.ts:466 传参；默认 0）
+     * @param querySource     查询来源（CC querySource；session_memory/compact/marble_origami → 守卫）
+     * @param ccContext       compactConversation 上下文（per-session 接线，由 LlmAgentLoop 经
+     *                        {@link CompactConversation#buildAutoContext} 构建；null → 默认上下文，
+     *                        摘要生产回落 {@link #prepareAutoContext} 从 compactCallback 适配）
+     * @param tracking        本 query() 调用的跟踪状态（CC original: tracking，autoCompact.ts:275）·
+     *                        非 null（调用方每 query() 新建）；读写本参数，绝不触碰实例字段
+     * @return 压缩结果
+     */
+    public AutoCompactResult autoCompactIfNeeded(
+            List<ChatMessageDto> messages, int snipTokensFreed, String querySource,
+            CompactConversationContext ccContext, AutoCompactTrackingState tracking) {
         if (messages == null || messages.isEmpty()) {
             return new AutoCompactResult(false, messages, null, 0, null, null);
         }
@@ -917,7 +981,7 @@ public class AutoCompactor {
         //   写回 tracking——保证便捷路径（测试/手动接线）熔断计数持续累计，与生产 LlmAgentLoop
         //   写回行为一致。成功复位已由 recordSuccess 内部完成（query.ts:521-526 公共复位等价）。
         if (result.consecutiveFailures() != null) {
-            tracking.setConsecutiveFailures(result.consecutiveFailures());
+            defaultTracking.setConsecutiveFailures(result.consecutiveFailures());
         }
         return result;
     }
@@ -1057,10 +1121,16 @@ public class AutoCompactor {
     }
 
     /**
-     * 重置压缩状态（新会话）
+     * 重置<b>便捷路径</b>跟踪状态（测试 / 手动接线）· 生产路径已无共享状态可重置。
+     *
+     * <p>[P4-4] 生产路径的跟踪状态是 per-query() 局部对象（{@code LlmAgentLoop.queryLoop} 每
+     * query() 新建并经 {@link #autoCompactIfNeeded(List, int, String, CompactConversationContext,
+     * AutoCompactTrackingState)} 第 5 参传入），随调用结束自然丢弃 —— 对齐 CC query.ts:425
+     * {@code autoCompactTracking: undefined} 的每 query() 初值，无需（也不应）由单例 bean 显式
+     * reset 来"隔离会话"（旧 {@code doRun} 入口 reset 正是跨会话串台隐患的补丁）。
      */
     public void reset() {
-        tracking.reset();
+        defaultTracking.reset();
     }
 
     /**

@@ -135,16 +135,17 @@ public final class CompactConversation {
      * <p>同 {@link #settingsResolver} 先例：compactConversation 为静态单函数无法实例注入，
      * 以 volatile 静态槽位承接，由 {@link com.nexusai.application.agent.config.ToolRegistrationConfig}
      * autoCompactor bean 启动期注入一次（auto/reactive/manual/partial 全路径共用同一全局槽位）。
-     * 未注入 → {@link #resolveAnthropic} 回落 anthropic 语义（既有 4 项和，向后兼容测试）。
+     * 未注入 → {@link #resolveAnthropic} 回落<b>非 Anthropic</b> 语义（唯一权威
+     * {@link ContextUsageCalculator#isAnthropic}，deepseek input 已含 cache 不重复求和）。
      */
     private static volatile ModelMapper modelMapper;
     private static volatile ProviderMapper providerMapper;
 
     /**
-     * 注入协议分派 mapper（幂等）· null 注入 = 复位（回落 anthropic 语义）。
+     * 注入协议分派 mapper（幂等）· null 注入 = 复位（回落非 Anthropic 语义）。
      *
-     * @param mm  模型 mapper（null → 回落）
-     * @param pm  提供商 mapper（null → 回落）
+     * @param mm  模型 mapper（null → 回落非 Anthropic）
+     * @param pm  提供商 mapper（null → 回落非 Anthropic）
      */
     public static void setMappers(ModelMapper mm, ProviderMapper pm) {
         modelMapper = mm;
@@ -158,17 +159,18 @@ public final class CompactConversation {
     /**
      * 压缩路径协议判定 · [A5-2] 由模型名解析 isAnthropic（经静态 mapper 槽位）。
      *
-     * <p>回落语义：mapper 或模型不可得 → <b>true（anthropic 语义，既有 4 项和）</b>——
-     * 与 1 参方法默认一致，避免未接线（测试/手动直构）改变既有行为；生产（mappers 注入 +
-     * ctx.model 已设）→ 真实分派（deepseek 走 input+output）。
+     * <p><b>[P3-a 回落方向统一]</b> 唯一权威 = {@link ContextUsageCalculator#isAnthropic}
+     * （与 ModelCostCalculator / LlmAgentLoop 求和分派同源单点），本方法<b>只做委托</b>，
+     * 不再自判一套回落：mapper 未注入 / 模型 null/blank / 模型不可判定 → <b>false（非 Anthropic，
+     * input+output）</b>，与 {@code ContextUsageCalculator.isAnthropic} 完全一致。
+     * 旧实现此处回落 <b>true</b>（anthropic 4 项和）与唯一权威方向相反 → 手工 /compact 未
+     * setModel 时 ctx.getModel()=null → 恒 4 项和 → deepseek 会话 preTokens 翻倍（DB 实证
+     * preTokens=188374 ≈ 2× 真实 94625）。
      *
-     * @param model 生效模型名（ctx.getModel()；null/blank → 回落 anthropic）
+     * @param model 生效模型名（ctx.getModel()；null/blank → 回落非 Anthropic）
      * @return true=Anthropic 4 项和；false=OpenAI/DeepSeek 仅 input+output
      */
     static boolean resolveAnthropic(String model) {
-        if (modelMapper == null || providerMapper == null || model == null || model.isBlank()) {
-            return true; // mapper/模型不可得 → 保持 anthropic 语义（既有 4 项和，向后兼容）
-        }
         return ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, model);
     }
 
@@ -292,8 +294,9 @@ public final class CompactConversation {
             }
 
             // ── 2. preCompactTokenCount（compact.ts:401 tokenCountWithEstimation）──
-            // [A5-2] 求和 provider 分派：deepseek input 已含 cache hit → 按 ctx.model 判 anthropic
-            //   （mapper/模型不可得 → resolveAnthropic 回落 anthropic 语义，既有 4 项和）
+            // [A5-2][P3-a] 求和 provider 分派：deepseek input 已含 cache hit → 按 ctx.model 判 anthropic
+            //   （mapper/模型不可得 → resolveAnthropic 委托 ContextUsageCalculator.isAnthropic 回落
+            //    非 Anthropic，与唯一权威同向；故 ctx.model 必须由装配侧 setModel，见 manual 路径）
             final int preCompactTokenCount = tokenCountWithEstimation(messages, resolveAnthropic(ctx.getModel()));
 
             // ── 3. hooks_start: pre_compact + SDK 状态（compact.ts:406-412）──

@@ -896,8 +896,9 @@ public class ToolRegistrationConfig {
         //   settings.max_ptl_retries 实时读，null 回落常量；auto/reactive/manual 全路径共用
         //   同一全局槽位 → settings 单例注入一次覆盖所有调用方）
         com.nexusai.application.agent.compact.CompactConversation.setSettingsResolver(settingsResolver);
-        // [A5-2] compactConversation 协议分派 mapper 静态槽位接线（auto/reactive/manual/partial
-        //   全路径共用同一全局槽位；null → resolveAnthropic 回落 anthropic 语义）
+        // [A5-2][P3-a] compactConversation 协议分派 mapper 静态槽位接线（auto/reactive/manual/partial
+        //   全路径共用同一全局槽位；null → resolveAnthropic 委托 ContextUsageCalculator.isAnthropic
+        //   回落「非 Anthropic」，两处回落方向已统一）
         com.nexusai.application.agent.compact.CompactConversation.setMappers(modelMapper, providerMapper);
         // IMP-M-P0-3: SM 优先路径生产注入（autoCompact.ts:287-310 trySessionMemoryCompaction）
         if (sessionMemoryService != null) {
@@ -2275,7 +2276,8 @@ public class ToolRegistrationConfig {
         SystemPromptContextProvider manualProvider =
             buildManualSystemPromptCtxProvider(state, claudemdEngine);
         CompactCommand.CompactCommandContext ctx = buildCompactCommandContext(
-            state.messages(), sessionId, agentId, reactiveCompactor, streamCompactSummary,
+            state.messages(), sessionId, agentId, resolveManualCompactModel(state),
+            reactiveCompactor, streamCompactSummary,
             sessionMemoryService,
             state.currentToolUseContext(),
             manualProvider,
@@ -2422,7 +2424,8 @@ public class ToolRegistrationConfig {
      *   <li><b>会互相覆盖</b>：同一 short sessionId 键位被 live 主循环占用时，注册即覆盖在飞 run 的
      *       AgentState（该 state 承载 {@code invokedSkills} / {@code budgetTracker} / 权限上下文，
      *       是 SkillTool 写侧、{@code WebSocketPermissionPrompter}、{@code PartialCompactService}
-     *       的解析目标）→ 会把一个「非运行态、无 ToolUseContext、无模型信息」的空壳暴露给这些读侧。</li>
+     *       的解析目标）→ 会把一个「非运行态、无 ToolUseContext、无 invokedSkills」的空壳暴露给这些读侧
+     *       （[P3-a-2] 本类构造的临时 state 只补了会话模型，仍无 TUC/invokedSkills/live 生命周期）。</li>
      *   <li><b>无生命周期所有者</b>：唯一回收点是 {@code removeBySessionId}（会话删除，
      *       {@code SessionService.delete} 接线）。注册即产生「每次空闲 /compact 泄漏一个 state」
      *       的无界累积（含全量消息历史，是 registry javadoc 自称泄漏量最大的对象）。</li>
@@ -2469,6 +2472,15 @@ public class ToolRegistrationConfig {
         List<com.nexusai.model.session.dto.ChatMessageDto> history =
             messageService.listForResumeExcluding(raw, excludeId);
         AgentState rebuilt = new AgentState(null, rawSessionId, (java.util.UUID) null);
+        // [P3-a-2] 重建 state 补「会话有效模型」——见 {@link #resolveSessionModelName} 的 WHY。
+        //   不补 → currentModel()=null → resolveManualCompactModel 返 null → resolveAnthropic 回落
+        //   非 Anthropic → **anthropic 会话少计**（该 4 项和却只算 input+output；deepseek 会话
+        //   input 已含 cache，本就该走非 Anthropic，故本行只修 anthropic 侧、不改 deepseek 结果）。
+        //   消费方安全：本 state 是一次性临时对象（未注册进 registry → 无外部寻址者，见 javadoc
+        //   「不注册」三条理由）；{@link AgentState#setCurrentModel} 是纯 volatile 字段写
+        //   （AgentState.java:1237，无监听/无落库/无序列化——该字段 @JsonIgnore），故不影响
+        //   本路径其它消费方（ctx.messages / applyResultToState / systemPrompt / appendSystemPrompt）。
+        rebuilt.setCurrentModel(resolveSessionModelName(rawSessionId));
         if (history != null) {
             // 与 LlmAgentLoop:2419 同源：逐条 appendMessage 注入（临时 state 未武装 appendListener
             // → 不触发任何落库/STOMP，纯内存注灌）。
@@ -2482,6 +2494,109 @@ public class ToolRegistrationConfig {
                 + "（raw={} 排除在途={}；对齐 CC REPL 恒持 messages，compact.ts:44）",
             rawSessionId, rebuilt.messages().size(), raw.size(), excludeId != null);
         return rebuilt;
+    }
+
+    /**
+     * [P3-a-2] 会话有效模型名（DB 链）· 空闲重建 / partial 两条压缩 ctx 装配路径的同源解析。
+     *
+     * <h2>WHY（为什么重建出来的 state 必须带模型）</h2>
+     * 压缩的 token 口径按 {@code ctx.getModel()} 分派协议（{@code CompactConversation.resolveAnthropic}
+     * → 唯一权威 {@link com.nexusai.application.agent.compact.ContextUsageCalculator#isAnthropic}）：
+     * Anthropic = {@code input + cacheRead + cacheCreate + output}（4 项和，Claude usage 三字段独立）；
+     * OpenAI/DeepSeek = 仅 {@code input + output}（prompt_tokens <b>已含</b> cache hit，再加即双计）。
+     * 空闲/未注册会话的 AgentState 是 {@link #rebuildIdleStateFromDb} 重建出来的，而
+     * {@code LlmAgentLoop.doRun:2461} 的 {@code setCurrentModel(modelName)} 只对 live 会话写 →
+     * 重建 state 的 {@code currentModel()=null} → 模型不可判定 → 分派回落非 Anthropic →
+     * <b>anthropic 会话少计</b>（deepseek 会话恰好正确，故缺陷只在 anthropic 侧显形）。
+     *
+     * <h2>链与 auto 路径同源（不新造第四份口径）</h2>
+     * auto 路径的模型最终来自 {@code ChatService.resolveModelNameForSession}
+     * （{@code ChatService.java:2045-2060} 四层链：{@code req.modelName} → {@code sessions.model_name}
+     * → {@code settings.main_model_name} → {@code DEFAULT_MODEL}）。/compact 与 partial 均在
+     * <b>无请求体模型参数</b>的路径上（命令/历史消息选择器，非 send），故本方法 = 该链的
+     * <b>会话层 + settings 层</b>，与既有同层拷贝 {@code MessageService.resolveSessionModel}
+     * （{@code MessageService.resolveSessionModel:815-831}，重拉快照补算）逐层同序。
+     *
+     * <h2>形态（必须与 auto 路径一致，否则 isAnthropic 分派仍错）</h2>
+     * 返回库中原始名（会话 override / settings 主模型：可为 {@code providerName/modelName} 全名，
+     * 如 {@code anthropic/claude-sonnet-4-6}，也可为裸名）；{@code ContextUsageCalculator.isAnthropic}
+     * 经 {@code ModelNameResolver.resolve}（全名感知：真全名精确定位 provider，裸名按 name 反查）
+     * 判定 provider.type，故全名/裸名均可正确分派 —— 与 auto 路径 {@code state.currentModel()}
+     * （{@code params.modelName()} 同源原始名）同形态。
+     *
+     * @param sessionId 会话 DB 键（short 形态 sess-xxx）
+     * @return 模型名（{@code sessions.model_name} → {@code settings.main_model_name}）；
+     *         不可得（会话行缺失 / 两处皆空 / mapper 未注入 / 读取异常）→ null
+     *         （调用方不臆断协议，交 {@code resolveAnthropic} 统一回落非 Anthropic）
+     */
+    String resolveSessionModelName(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            com.nexusai.repository.session.entity.SessionRecord session =
+                sessionMapper == null ? null : sessionMapper.selectOneById(sessionId);
+            if (session != null && session.getModelName() != null && !session.getModelName().isBlank()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[P3-a-2] 会话模型解析: session={} model={}（源=sessions.model_name 会话 override）",
+                        sessionId, session.getModelName());
+                }
+                return session.getModelName();
+            }
+        } catch (Exception e) {
+            // best-effort：会话行读取失败 → 继续回落 settings（不阻断压缩，分派由唯一权威兜底）
+            log.warn("[P3-a-2] 会话模型解析失败（回落 settings.main_model_name）: session={} err={}",
+                sessionId, e.toString());
+        }
+        String settingsModel = readDbMainModelName(settingsMapper);
+        if (log.isDebugEnabled()) {
+            log.debug("[P3-a-2] 会话无 override → settings.main_model_name={}（session={}）",
+                settingsModel, sessionId);
+        }
+        return settingsModel;
+    }
+
+    /**
+     * [P3-a] manual /compact 的有效模型解析 · 与 auto 路径<b>同源</b>。
+     *
+     * <p><b>WHY（为什么必须是这个源）</b>: auto 路径的模型来自
+     * {@code LlmAgentLoop.resolveTurnEffectiveModel(params, recoveryState)}
+     * = {@code params.deps().resolveModel()} 非空取之，否则回落
+     * {@code recoveryState.getCurrentModel()}（LlmAgentLoop.java:5669/5688 每轮
+     * {@code state.setCurrentModel(effectiveModel)} 覆盖写，含 fallbackModel 改写）。
+     * Java 侧 {@code RecoveryState} 即会话 {@link AgentState}，故本方法取
+     * {@link AgentState#currentModel()}——正是 auto 路径 {@code AutoCompactor.model}
+     * 的来源（{@code ccContext.getModel()} ← buildAutoContext(model)）。两路径同口径，
+     * 压缩阈值/协议分派不再各判一套。
+     *
+     * <p>回落链（仅当 state.currentModel() 为 null/blank 时）：per-turn
+     * {@link ToolUseContext#effectiveModelName()}（AgentLoopContext:1387 由
+     * {@code state.currentModel()} 写入，可能滞后一轮）→ 仍不可得 → null，交
+     * {@code CompactConversation.resolveAnthropic} 按唯一权威回落非 Anthropic。
+     * <b>[P3-a-2]</b> 空闲/DB 重建 state（{@link #rebuildIdleStateFromDb}）原先是 null 主源
+     * （临时 state 无 currentModel/TUC → 判不出来 → anthropic 少计）；现重建时由
+     * {@link #resolveSessionModelName} 写入会话模型（{@code sessions.model_name} →
+     * {@code settings.main_model_name}），故本方法对空闲与 live 两条路径同口径取到模型。
+     * 仍不可得（会话/设置两处皆空、mapper 未注入）→ null，走统一回落方向（非臆断协议）。
+     *
+     * @param state 会话状态（可为 null → null）
+     * @return 本会话有效模型全名；不可得 → null（调用方 compactConversation 侧统一回落非 Anthropic）
+     */
+    static String resolveManualCompactModel(AgentState state) {
+        if (state == null) {
+            return null;
+        }
+        String model = state.currentModel();
+        if (model == null || model.isBlank()) {
+            ToolUseContext tuc = state.currentToolUseContext();
+            model = tuc != null ? tuc.effectiveModelName() : null;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[P3-a] manual /compact 模型解析: session={} model={}（源=AgentState.currentModel，"
+                    + "与 auto 路径 resolveTurnEffectiveModel 同口径）",
+                state.sessionId(), model != null ? model : "(null → 回落非 Anthropic)");
+        }
+        return model;
     }
 
     /**
@@ -2499,6 +2614,10 @@ public class ToolRegistrationConfig {
      * @param messages            会话消息（boundary 剥离在 CompactCommand 内做）
      * @param sessionId           会话 ID
      * @param agentId             agent ID
+     * @param model               本会话有效模型全名 · [P3-a] 透传给 compactConversation 上下文
+     *                            （ctx.getModel() → resolveAnthropic 协议分派）；调用方经
+     *                            {@link #resolveManualCompactModel(AgentState)} 求值（与 auto
+     *                            路径 AutoCompactor.model 同源口径）
      * @param reactiveCompactor   reactive-only 压缩（可为 null）
      * @param streamCompactSummary L4 摘要生产（可为 null → buildCompactConversationContext null-safe）
      * @param sessionMemoryService SM 优先压缩（可为 null → 空指令 SM 分支跳过）
@@ -2517,6 +2636,7 @@ public class ToolRegistrationConfig {
             List<com.nexusai.model.session.dto.ChatMessageDto> messages,
             String sessionId,
             String agentId,
+            String model,
             ReactiveCompactor reactiveCompactor,
             StreamCompactSummary streamCompactSummary,
             com.nexusai.application.agent.memory.SessionMemoryService sessionMemoryService,
@@ -2538,7 +2658,8 @@ public class ToolRegistrationConfig {
         return new CompactCommand.CompactCommandContext(
             messages, sessionId, agentId, "compact", false, abortController,
             sessionMemoryService, new MicroCompactor(), reactiveCompactor,
-            () -> buildCompactConversationContext(sessionId, agentId, streamCompactSummary, toolUseContext, telemetry),
+            () -> buildCompactConversationContext(sessionId, agentId, model, streamCompactSummary,
+                toolUseContext, telemetry),
             notifyCompactionRunnable(agentId), clearUserContextCacheRunnable(),
             toolUseContext, sysPromptCtxProvider, defaultSysPromptAssemble, customSystemPrompt,
             appendSystemPrompt, useGlobalCacheScope,
@@ -2670,10 +2791,15 @@ public class ToolRegistrationConfig {
      * 构造 compactConversation 上下文 · 对齐 AutoCompactor.prepareAutoContext:712-724 的
      * summaryProducer 接线模式（StreamCompactSummary 包装为 SummaryProducer）。
      *
-     * <p>model 不设（compactConversation 不读 getModel，CompactConversation.java grep 自验；
-     * 3×delta 的 modelSupportsToolReference gate 以 ctx.model=null → 假定支持回落，见
-     * PostCompactAttachmentRestorer.modelSupportsToolReference）；
-     * notifyCompaction 用 no-op（CC PROMPT_CACHE_BREAK_DETECTION feature 默认关闭，
+     * <p><b>[P3-a] model 必须设</b>：A5-2 之后 {@code compactConversation} <b>会</b>读
+     * {@code ctx.getModel()}（CompactConversation.java 度量两处：preCompactTokenCount
+     * :299 与 compactionCallTotalTokens :485 → {@code resolveAnthropic(ctx.getModel())}）。
+     * 旧注释「compactConversation 不读 getModel」已过时，正是它导致本路径从不 setModel →
+     * {@code ctx.getModel()=null} → 协议判定回落 → deepseek 会话 token 翻倍（DB 实证
+     * preTokens=188374 ≈ 2× 真实 94625）。现由调用方传入本会话有效模型（与 auto 路径同源，
+     * 见 {@link #resolveManualCompactModel}）。
+     *
+     * <p>notifyCompaction 用 no-op（CC PROMPT_CACHE_BREAK_DETECTION feature 默认关闭，
      * AutoCompactor.prepareAutoContext 同设 no-op）。
      *
      * <p><b>[IMP2-03]</b> 附件生产接线（✗-1..✗-4）：manual /compact 路径经
@@ -2684,17 +2810,24 @@ public class ToolRegistrationConfig {
      *
      * @param sessionId 会话 ID
      * @param agentId   agent ID
+     * @param model     本会话有效模型全名 · [P3-a] compactConversation 度量两处读 ctx.getModel()
+     *                  → resolveAnthropic 协议分派（null → 回落非 Anthropic）；源与 auto 路径同源，
+     *                  见 {@link #resolveManualCompactModel(AgentState)}
      * @param streamCompactSummary L4 摘要生产（@Bean required 注入，生产恒非 null）
      * @return CompactConversationContext（summaryProducer 已接线）
      */
     private CompactConversationContext buildCompactConversationContext(String sessionId,
                                                                        String agentId,
+                                                                       String model,
                                                                        StreamCompactSummary streamCompactSummary,
                                                                        ToolUseContext toolUseContext,
                                                                        com.nexusai.application.agent.telemetry.Telemetry telemetry) {
         CompactConversationContext cc = new CompactConversationContext();
         cc.setSessionId(sessionId);
         cc.setAgentId(agentId);
+        // [P3-a] 本会话有效模型（与 auto 路径 AutoCompactor.model / buildAutoContext 同口径）——
+        //   不设 → ctx.getModel()=null → 协议判定不可分派 → deepseek 求和翻倍（见 javadoc）。
+        cc.setModel(model);
         cc.setQuerySource("compact");
         // [IMP-CM-17] tengu_compact 结构化遥测接线（compact.ts:650-695）：manual /compact 成功路径
         //   经 compactConversation 发射全字段事件。telemetry 未注入 → 事件静默跳过（零行为变化）。

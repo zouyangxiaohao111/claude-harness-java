@@ -27,6 +27,23 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link #isAnthropic}——模型名 → provider.type 判定（与 ChatService.providerTypeForModel
  *       同源链：ModelNameResolver.resolve → provider.type == "anthropic"；异常 warn + false 回落）。</li>
  * </ul>
+ *
+ * <h2>[P3-d] 上下文口径唯一权威（勿再造第二套）</h2>
+ * 前端上下文条/余量百分比（Composer「已用 / 窗口（剩余%）」）的<b>唯一权威</b> = 本类
+ * {@link #snapshot} 三元组：<b>服务端真实 usage</b>（协议分派）+ <b>模型原始窗口</b>
+ * （{@code models.max_context_tokens}，回落 1M，<b>不减</b> summary 预留）+ <b>窗口相对百分比</b>
+ * （{@code round((1 − used/window) × 100)}）。三条产出消费点同源：{@code message.usage}
+ * （{@code LlmAgentLoop.publishMessageUsage}，单条 usage）、{@code message.complete}
+ * （{@code ChatService.publishCompleteEvent}，末条带 usage 的 assistant）、重拉补算
+ * （{@code MessageService.applyContextSnapshotToLastAssistant}）。
+ *
+ * <p><b>与 {@code token_warning.percentLeft} 的区别（禁止混用）</b>：{@code CompactThresholdSystem
+ * .calculateTokenWarningState} 的百分比是<b>阈值相对</b>口径（分母 = autoCompactThreshold = 有效窗口
+ * − autocompact buffer，见 {@code autoCompact.ts:108-111}），服务<b>自动压缩阈值判定</b>
+ * （warning/error/auto/blocking 四态）；它<b>不是</b>「剩余上下文百分比」，不得直接当余量渲染给用户
+ * （见该 record 的 {@code thresholdRelativePercentLeft} 命名）。同理
+ * {@code getEffectiveContextWindowSize}（减 summary 预留 + settings 收窄）只是阈值口径窗口，
+ * 对外显示的窗口恒为 {@link #snapshot} 的原始窗口。
  */
 public final class ContextUsageCalculator {
 
@@ -108,7 +125,16 @@ public final class ContextUsageCalculator {
     public record Snapshot(long contextWindow, long contextTokensUsed, Integer percentLeft) {}
 
     /**
-     * 计算上下文快照 · 对齐 CC context.ts:118-144（window/current_usage/percentLeft）。
+     * [P3-c] 计算上下文快照 · 对齐 CC context.ts:118-144（window/current_usage/percentLeft）。
+     *
+     * <p><b>⚠️ usage 入参口径 = 单条 assistant 消息的 usage（current_usage），不是 run 累计</b>：
+     * CC {@code getCurrentUsage()}（tokens.ts:150-177）倒序取<b>最后一条带 usage 的消息</b>，
+     * 其 usage 即「当前上下文大小」（最后一轮 API 调用的 prompt = 全量历史 + 工具结果）。
+     * 若误传 {@code AgentState.runUsage()}（本 run 内每条 assistant usage 的<b>累加</b>，见
+     * AgentState:901-925），多轮工具 turn（N 次 LLM 调用）会得到 ≈N 倍虚高值，且与重拉路径
+     * （{@code MessageService.applyContextSnapshotToLastAssistant}，同为单条口径）不一致
+     * → 前端 F5 前后跳变。
+     * run 累计只用于 {@code message.complete.usage}（CC result.usage，QueryEngine.ts:790-816）。
      *
      * <p>窗口 = 模型 {@code max_context_tokens}（ModelNameResolver.resolve → ModelRecord），
      * 未命中/未配置/异常 → 回落 1_048_576（与实时 complete 事件同值，非 CompactConstants

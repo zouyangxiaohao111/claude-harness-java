@@ -1364,11 +1364,21 @@ function App() {
     try {
       // 透传 activeSessionId：/clear 等会话级内置命令的后端清理链读 MDC 会话，不带则 no-op（finding-2）
       await commandApi.executeBuiltin(name, undefined, activeSessionId ?? undefined)
+      // [P3-b 前端配合 · 压缩归零] /compact 成功落库后重拉本会话消息：压缩替换了消息链，前端本地仍是
+      //   压缩前的消息（含旧 assistant 的上下文快照）→ 「已用/窗口」停在压缩前的大值。重拉走
+      //   GET /messages/page（DB 权威），后端 MessageService.applyContextSnapshotToLastAssistant 只在
+      //   **最后一个 compact boundary 之后**找带 usage 的 assistant → 压缩后 boundary 之后暂无 assistant
+      //   → 不出快照 → Composer 上下文条归为「无快照不显示」（对齐 CC getCurrentUsage undefined 归零）。
+      //   WHY 不选「认 assistantMessageId==null 的 message.usage 会话级覆盖」：后端该推送通道
+      //   CompactCommand.registerPostCompactSnapshotPushContext 生产侧**未接线**（全仓无注册调用方，
+      //   pushPostCompactSnapshotReset 恒 no-op）→ 依赖它则数字根本不降；重拉不依赖新事件，且正是后端
+      //   同义归零（boundary 切片）的既有路径。
+      if (name === 'compact') await reloadMessages()
       showToast(`已执行 /${name}`, 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [showToast, activeSessionId])
+  }, [showToast, activeSessionId, reloadMessages])
 
   // ---- composer ----
   const sendMessage = useCallback(async (attachments?: AttachmentRequest[]) => {

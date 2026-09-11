@@ -1,6 +1,7 @@
 package com.nexusai.domain.session;
 
 import com.mybatisflex.core.query.QueryWrapper;
+import com.nexusai.application.agent.compact.BoundaryReader;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo;
@@ -749,6 +750,12 @@ public class MessageService {
      * （GET /messages）不落库 → 重拉丢失。本方法在重拉结果上对<b>末条 assistant 消息</b>（usage 非空，
      * 对齐 toDto :691 input/output 任一非 null 判据）补算三字段，使前端重拉后上下文余量展示与实时一致。
      *
+     * <p><b>[P3-b] 扫描下界 = 最后一个 compact boundary 之后</b>（与请求面同源）：压缩后 DB 仍保留
+     * 压缩前的旧 assistant（append-only），若按全表取「末条带 usage 的 assistant」，压缩后（下一轮
+     * 尚未发生）取到的正是压缩前那条 → 重拉显示压缩前大值（数字不降）。切片后无 assistant 时
+     * <b>不出快照</b> = 压缩后归零（对齐 CC full compact 后 {@code getCurrentUsage} 找不到带 usage
+     * 的 assistant，compact.ts:767-777）。
+     *
      * <p><b>重算公式（[B1 方案A] V53 cache 落库后完整 usage · 协议分派对齐实时）</b>:
      * {@code contextTokensUsed} 由 {@link ContextUsageCalculator#computeContextTokensUsed} 按协议分派：
      * Anthropic → input + cacheRead + cacheCreate（Claude API 三字段独立）；OpenAI/DeepSeek → 仅 input
@@ -764,9 +771,17 @@ public class MessageService {
         if (messages == null || messages.isEmpty()) {
             return;
         }
-        // 末条 assistant 消息（usage 非空：input/output 任一非 null，对齐 toDto :691 判据）
+        // [P3-b · 压缩后归零] 只在<b>最后一个 compact boundary 之后</b>找 assistant —— 与请求面同源
+        //   （模型面 = LlmAgentLoop 循环入口经 BoundaryReader.getMessagesAfterCompactBoundary 的切片）。
+        //   WHY 必须（要修的缺陷）：/compact 后 DB 是 append-only（旧 assistant 行仍在），压缩后尚无
+        //   新一轮时「全表末条带 usage 的 assistant」恰是<b>压缩前</b>那条 → 重拉按其 input/cache 重算
+        //   → 前端重拉后仍显示压缩前的大值（数字不降）。CC 对照：full compact 产出的 messages 数组
+        //   不含旧 assistant（compact.ts:767-777）→ getCurrentUsage 找不到 → 指示器归零。
+        //   本切片后无 assistant → <b>不出快照</b>（与 CC 归零等价；前端无快照即回落为不显示该值）。
+        int boundaryIdx = BoundaryReader.findLastCompactBoundaryIndex(messages);
+        int scanFrom = boundaryIdx >= 0 ? boundaryIdx + 1 : 0;
         int lastAsstIdx = -1;
-        for (int i = messages.size() - 1; i >= 0; i--) {
+        for (int i = messages.size() - 1; i >= scanFrom; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant
                     && (m.inputTokens() != null || m.outputTokens() != null)) {
@@ -776,8 +791,9 @@ public class MessageService {
         }
         if (lastAsstIdx < 0) {
             if (log.isDebugEnabled()) {
-                log.debug("[MessageService] 重拉上下文快照跳过: 会话 {} 无 usage 非空的 assistant 消息",
-                    sessionId);
+                log.debug("[MessageService] 重拉上下文快照跳过: 会话 {} 最后 compact boundary(下标={}) 之后"
+                        + "无 usage 非空的 assistant 消息（压缩后归零语义 · 对齐 CC getCurrentUsage undefined）",
+                    sessionId, boundaryIdx);
             }
             return;
         }

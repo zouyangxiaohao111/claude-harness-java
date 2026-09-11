@@ -18,6 +18,13 @@ import java.util.function.ToIntFunction;
  * 与 CC model-aware + reserved 减法 + env 覆盖 偏移。本类是阈值体系的<b>统一窗口来源</b>：
  * auto-compact 阈值与 blocking 预检都从这里取窗（同源，OD-12/OD-16 裁决）。
  *
+ * <p><b>[P3-d] 口径边界（本类是阈值口径，不是展示口径）</b>: 本类所有窗口
+ * （{@link #getEffectiveContextWindowSize} = 原始窗口 − summary 预留 − settings 收窄）与全部百分比
+ * （{@link #calculateTokenWarningState} 的 {@code thresholdRelativePercentLeft}）都只服务
+ * <b>自动压缩阈值判定</b>。前端「上下文已用 / 窗口（剩余%）」的<b>唯一权威</b>是
+ * {@code ContextUsageCalculator.Snapshot}（服务端真实 usage + 模型原始 {@code max_context_tokens}
+ * + 窗口相对百分比）；两套数值不同，禁止互相替代渲染。
+ *
  * <h2>CC 对齐</h2>
  * <ul>
  *   <li>{@link #getMaxOutputTokensForModel(String)} — [W2-3] <b>DB 优先</b>（models.max_tokens
@@ -434,6 +441,13 @@ public class CompactThresholdSystem {
     /**
      * token 警告四态计算 · 对齐 CC {@code autoCompact.ts:93-145 calculateTokenWarningState}。
      *
+     * <p><b>[P3-d] 本方法产出的百分比是「阈值相对」口径，不是「上下文剩余百分比」</b>：
+     * 分母 = {@code threshold}（auto 启用时 = {@link #getAutoCompactThreshold}，否则 = 有效窗口），
+     * 即 CC {@code autoCompact.ts:108-111} 的<b>阈值判定</b>口径 —— 服务 warning/error/auto/blocking
+     * 四态。对外显示的唯一权威是 {@code ContextUsageCalculator.Snapshot}（服务端真实 usage +
+     * 模型原始窗口 + 窗口相对百分比）。两者数值会不同（阈值相对分母更小 → 同 usage 下百分比更低），
+     * 前端不得把 {@code token_warning.percentLeft} 当余量渲染（见 {@link TokenWarningState}）。
+     *
      * @param tokenUsage        当前 token 用量
      * @param model             模型名
      * @param autoCompactEnabled 是否启用自动压缩（CC {@code isAutoCompactEnabled()} 的 Java 载体；
@@ -480,11 +494,38 @@ public class CompactThresholdSystem {
      * 四态计算结果 · 对齐 CC {@code autoCompact.ts:95-102} 返回对象
      * {@code {percentLeft, isAboveWarningThreshold, isAboveErrorThreshold,
      * isAboveAutoCompactThreshold, isAtBlockingLimit}}。
+     *
+     * <p><b>[P3-d] 命名澄清（两套口径不得混用）</b>：
+     * <ul>
+     *   <li>{@code thresholdRelativePercentLeft} = <b>阈值相对</b>百分比
+     *       {@code max(0, round((threshold − usage) / threshold × 100))}（CC autoCompact.ts:108-111），
+     *       分母是自动压缩阈值（或有效窗口），<b>只服务内部四态阈值判定</b>。</li>
+     *   <li>用户可见的「已用 / 窗口（剩余%）」唯一权威 = {@code ContextUsageCalculator.Snapshot}
+     *       （服务端真实 usage + 模型原始 {@code max_context_tokens} + 窗口相对百分比）。</li>
+     * </ul>
+     * 二者数值不同（分母不同），前端禁止把前者当「剩余百分比」渲染（P3-d 前端配合项）。
+     *
+     * @param thresholdRelativePercentLeft   阈值相对百分比（内部阈值口径；见上）
+     * @param isAboveWarningThreshold        是否超过 warning 阈值（threshold − 20k）
+     * @param isAboveErrorThreshold          是否超过 error 阈值（threshold − 10k）
+     * @param isAboveAutoCompactThreshold    是否达到自动压缩阈值
+     * @param isAtBlockingLimit              是否达到 blocking 上限
      */
     public record TokenWarningState(
-        int percentLeft,
+        int thresholdRelativePercentLeft,
         boolean isAboveWarningThreshold,
         boolean isAboveErrorThreshold,
         boolean isAboveAutoCompactThreshold,
-        boolean isAtBlockingLimit) {}
+        boolean isAtBlockingLimit) {
+
+        /**
+         * 旧名访问器（本批预算外消费方：{@code LlmAgentLoop} token_warning 推送 +
+         * {@code AutoCompactor} 阈值日志，二处均在本批改动范围外）—— 语义与
+         * {@link #thresholdRelativePercentLeft()} 完全相同，<b>非</b>窗口相对余量。
+         * 两处调用方迁到新名后可删本方法。
+         */
+        public int percentLeft() {
+            return thresholdRelativePercentLeft;
+        }
+    }
 }

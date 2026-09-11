@@ -858,13 +858,13 @@ export interface ChatMessageDto {
   totalCostUsd?: number | null
   /** complete 事件透传：按模型 usage 快照（会话累计） */
   modelUsage?: Record<string, ModelUsageEntry> | null
-  /** complete 事件透传：上下文已用 tokens */
+  /** complete 事件透传：上下文已用 tokens（**快照口径** · 协议分派） */
   contextTokensUsed?: number | null
-  /** complete 事件透传：上下文剩余百分比 */
+  /** complete 事件透传：**窗口相对**剩余百分比（快照口径 · 与 token_warning 的阈值相对口径不同源） */
   percentLeft?: number | null
   /** complete 事件透传：解码耗时（ms · usage.decode_ms 来源 · F4 t/s 速度显示） */
   decodeMs?: number | null
-  /** complete 事件透传：模型上下文窗口（tokens · contextWindow 来源） */
+  /** complete 事件透传：模型上下文窗口（tokens · contextWindow 来源 · 模型原始 max_context_tokens） */
   contextWindow?: number | null
   /** 边界消息元数据（role=system + subtype=compact_boundary 携带 · 压缩分界线识别展示用） */
   compactMetadata?: CompactBoundaryMetadata | null
@@ -1003,16 +1003,22 @@ export interface MessageCompleteEvent extends StreamEventBase {
   percentLeft?: number | null
 }
 /** 消息级 usage 快照事件（后端每条 assistant 流式结束推 · 消息级完成、非 turn 终态）。
- *  携带该条 usage + 上下文快照 → 前端实时更新缓存%/上下文条；不得当 turn 终态退订（退订只在 message.complete）。 */
+ *  携带该条 usage + 上下文快照 → 前端实时更新缓存%/上下文条；不得当 turn 终态退订（退订只在 message.complete）。
+ *
+ *  <p>{@code assistantMessageId == null} = **会话级快照覆盖**（后端 P3-b：手动 /compact 成功落库后推
+ *  会话级归零快照 used=0/percentLeft=100）。⚠️ 该推送通道
+ *  （{@code CompactCommand.registerPostCompactSnapshotPushContext}）当前**生产未接线**（无注册调用方）
+ *  → 实际不会下发；前端压缩归零走「/compact 成功后重拉消息」（{@code App.runBuiltin}）而非本事件。 */
 export interface MessageUsageEvent extends StreamEventBase {
   type: 'message.usage'
+  /** 该条 assistant 消息 id；null = 会话级快照覆盖（见上） */
   assistantMessageId?: string | null
   usage?: MessageUsageDto | null
-  /** 模型上下文窗口（tokens · 回落 1M） */
+  /** 模型上下文窗口（tokens · 模型原始 max_context_tokens，未命中回落 1_048_576） */
   contextWindow?: number | null
-  /** 上下文已用（input + cache_read + cache_creation · 不含 output） */
+  /** 上下文已用（协议分派：Anthropic input+cacheRead+cacheCreate / OpenAI·DeepSeek 仅 input） */
   contextTokensUsed?: number | null
-  /** 上下文剩余百分比（0-100 · 无 usage 时省略 · 负数 clamp 0） */
+  /** **窗口相对**剩余百分比（0-100 · 无 usage 时省略 · 负数 clamp 0） */
   percentLeft?: number | null
 }
 export interface MessageErrorEvent extends StreamEventBase {
@@ -1092,16 +1098,24 @@ export interface PermissionRequestEvent extends StreamEventBase {
   /** AskUser 问题（便捷访问；实际 wire 位置在 toolInput.questions，解析 toolInput 获得） */
   questions?: AskUserQuestion[]
 }
-/** 压缩警告抑制态（对齐 CC compactWarningStore/TokenWarning · STOMP token_warning） */
+/** 压缩警告抑制态（对齐 CC compactWarningStore/TokenWarning · STOMP token_warning）
+ *
+ *  <p>[P3-d 口径统一 2026-09-11] <b>本事件的 tokenUsage/contextWindow/percentLeft 是「阈值相对」口径，
+ *  不是上下文快照口径</b>：后端 wire 字段名仍是 {@code percentLeft}（JSON 键 = AgentEvent.TokenWarning
+ *  的 record 分量名，未随改名变化；改名的是 {@code CompactThresholdSystem.TokenWarningState} 的
+ *  <b>访问器</b> {@code thresholdRelativePercentLeft}）——但语义 = {@code max(0, round((threshold − usage)
+ *  / threshold × 100))}，分母 threshold = autoCompactThreshold（≠ 上下文窗口）；tokenUsage 还是**本地
+ *  估算**（非服务端真实 usage）。**禁止当「上下文剩余 %」渲染**，要数字请走快照口径
+ *  （{@code resolveCtxInfo}）。 */
 export interface TokenWarningEvent extends StreamEventBase {
   type: 'token_warning'
   /** 压缩警告抑制态：压缩成功=true（隐藏）、新压缩开始=false（恢复显示） */
   suppressed?: boolean
-  /** 当前 token 用量 */
+  /** 当前 token 用量（**本地估算** · 阈值判定用，非服务端真实 usage） */
   tokenUsage?: number
-  /** 上下文窗口大小 */
+  /** 有效上下文窗口（= 窗口 − reserved；阈值口径分母，非模型原始 max_context_tokens） */
   contextWindow?: number
-  /** 剩余百分比（可选：CC 前端算 displayPercentLeft） */
+  /** 阈值相对百分比（分母 = autoCompactThreshold · 内部四态判定用；**不是**剩余百分比，禁止展示） */
   percentLeft?: number
 }
 

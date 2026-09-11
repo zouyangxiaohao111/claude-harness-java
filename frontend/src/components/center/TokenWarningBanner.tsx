@@ -1,9 +1,14 @@
 import { useChatStore, selectTokenWarning } from '@/stores/chatStore'
+import { tokenWarningBannerText } from '@/utils/contextUsage'
 
 /**
  * 压缩警告抑制态横幅 · 对齐 CC TokenWarning（上下文快满 / 自动压缩被抑制时提示）。
  * 消费后端 token_warning 事件：suppressed=true（压缩成功）→ 隐藏；false → 恢复显示。
- * percentLeft 可选，缺省用 tokenUsage/contextWindow 计算剩余百分比。
+ *
+ * <p>[P3-d 口径统一 2026-09-11] **只给文字不给百分比**：{@code token_warning.percentLeft} 后端已改名
+ * {@code thresholdRelativePercentLeft}（阈值相对口径，分母 autoCompactThreshold ≠ 上下文窗口），
+ * {@code tokenUsage} 是本地估算 —— 都不是「上下文剩余 %」。要显示数字请走快照口径（Composer 上下文条 /
+ * 用量弹窗的 {@code resolveCtxInfo}）；本横幅只负责「接近自动压缩窗口」的**文字**提示。
  *
  * <p>[多会话隔离 2026-09-11] 只显示<b>传入会话（当前活动会话）</b>的那一份告警：后端
  * token_warning 推的是会话级 topic（/topic/sessions/{sid}/token-warning），原实现读全局单字段
@@ -12,16 +17,8 @@ import { useChatStore, selectTokenWarning } from '@/stores/chatStore'
 export function TokenWarningBanner({ sessionId }: { sessionId: string | null }) {
   // 键不存在 → null（该会话无警告）；不看别的会话的键 → 切走即消失、切回即恢复
   const warning = useChatStore(selectTokenWarning(sessionId))
-  if (!warning || warning.suppressed) return null
-
-  const pct = warning.percentLeft != null
-    ? warning.percentLeft
-    : warning.tokenUsage != null && warning.contextWindow
-      ? Math.round((1 - warning.tokenUsage / warning.contextWindow) * 100)
-      : null
-  const text = pct != null
-    ? `上下文剩余 ${pct}% · 接近自动压缩`
-    : '上下文接近自动压缩窗口'
+  const text = tokenWarningBannerText(warning)
+  if (!text) return null
 
   return (
     // 复用 retry-wrap：与输入框同宽（max-width 760 居中 + padding 32）左对齐

@@ -288,4 +288,120 @@ class ChatServiceReplayPersistReasoningDurationTest {
         m.setAccessible(true);
         return (Long) m.invoke(service, state);
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [P3-c] complete 上下文快照口径 = 末条 assistant 的 usage（非 run 累计）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * <b>WHY（规则九 · 上下文数字必须与重拉一致）</b>：{@code contextTokensUsed} 表达「当前上下文
+     * 大小」= 最后一轮 API 调用的 prompt（CC {@code getCurrentUsage}，tokens.ts:150-177 倒序取最后
+     * 一条带 usage 的消息）。旧实现传 {@code state.runUsage()}（本 run <b>每条</b> assistant usage 的
+     * 累加）→ 多轮工具 turn（N 次 LLM 调用）≈N 倍虚高；而重拉补算（MessageService 单条口径）给的是
+     * 真实值 → 前端「F5 前后跳变」。
+     *
+     * <p><b>RED 条件</b>：把 {@code ContextUsageCalculator.snapshot(...)} 的 usage 实参改回
+     * {@code state.runUsage()} → 本用例断言 1000 得到 3000 → 红。
+     *
+     * <p>同时钉死「{@code runUsage()} 不得删」：{@code complete.usage}（CC result.usage = query 级
+     * 累计）仍必须是 3 次调用之和 3000。
+     */
+    @Test
+    @DisplayName("[P3-c] complete 上下文快照 = 末条 assistant usage（多轮 turn 不虚高）；complete.usage 仍为 run 累计")
+    void completeContextSnapshot_usesLastAssistantUsage_notRunTotal() {
+        AgentState state = new AgentState("sys");
+        // 3 轮 LLM 调用（工具轮 x2 + 纯文本收尾），每轮 input=1000 → run 累计 3000
+        com.nexusai.application.agent.tool.AgentUsage perCall =
+            new com.nexusai.application.agent.tool.AgentUsage(1_000L, 10L, null, null, null, null, null);
+        for (int i = 1; i <= 3; i++) {
+            state.appendMessage(new ChatMessageDto(
+                "a" + i, SESSION, Role.assistant, null, "轮" + i, null,
+                List.of(), FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(), null, null, null,
+                List.of(), List.of(), null, false, false).withUsage(perCall));
+            // 生产：LlmAgentLoop.publishMessageUsage 每轮 append(withUsage) 后立即累加
+            state.accumulateRunUsage(perCall);
+        }
+        // 模型不可判定（state.currentModel() == null + 本测试未注入 mapper）→ 窗口回落 1M + 非 anthropic
+        // → contextTokensUsed = 单条 input（协议分派），使断言口径干净。
+
+        service.publishCompleteEvent(SESSION, "msg-user", state, STREAM_TOPIC, wsTemplate, 0L, "a3");
+
+        ArgumentCaptor<com.nexusai.eventbus.ws.StreamEvent> captor =
+            ArgumentCaptor.forClass(com.nexusai.eventbus.ws.StreamEvent.class);
+        verify(wsTemplate).convertAndSend(eq(STREAM_TOPIC), captor.capture());
+        com.nexusai.eventbus.ws.MessageCompleteEvent evt =
+            (com.nexusai.eventbus.ws.MessageCompleteEvent) captor.getValue();
+
+        assertThat(evt.getContextTokensUsed())
+            .as("上下文快照 = 末条 assistant 的 input=1000（当前上下文），不是 run 累计 3000")
+            .isEqualTo(1_000L);
+        assertThat(evt.getUsage().inputTokens())
+            .as("complete.usage 仍是本轮 run 累计 3000（CC result.usage · runUsage() 不得删）")
+            .isEqualTo(3_000L);
+    }
+
+    /**
+     * 无任何带 usage 的 assistant（如 abort 空跑）→ 快照表达为「无 usage 数据」：
+     * used=0 + percentLeft 省略（NON_NULL），而不是拿 run 累计的全零哨兵冒充「已用 0 / 100% 剩余」。
+     *
+     * <p><b>RED 条件</b>：快照 usage 源改回 {@code runUsage()}（恒非 null）→ percentLeft=100 → 红。
+     */
+    @Test
+    @DisplayName("[P3-c] 无带 usage 的 assistant → 快照 used=0 + percentLeft 省略（与「真的空」区分）")
+    void completeContextSnapshot_noAssistantUsage_isUnknownNotZeroed() {
+        AgentState state = new AgentState("sys");
+        state.appendMessage(new ChatMessageDto(
+            "a1", SESSION, Role.assistant, null, "无 usage 回复", null,
+            List.of(), FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(), null, null, null,
+            List.of(), List.of(), null, false, false));
+
+        service.publishCompleteEvent(SESSION, "msg-user", state, STREAM_TOPIC, wsTemplate, 0L, "a1");
+
+        ArgumentCaptor<com.nexusai.eventbus.ws.StreamEvent> captor =
+            ArgumentCaptor.forClass(com.nexusai.eventbus.ws.StreamEvent.class);
+        verify(wsTemplate).convertAndSend(eq(STREAM_TOPIC), captor.capture());
+        com.nexusai.eventbus.ws.MessageCompleteEvent evt =
+            (com.nexusai.eventbus.ws.MessageCompleteEvent) captor.getValue();
+
+        assertThat(evt.getContextTokensUsed()).as("无 usage 数据 → used 0").isZero();
+        assertThat(evt.getPercentLeft())
+            .as("无 usage 数据 → percentLeft 省略（null），不得报「剩余 100%」")
+            .isNull();
+    }
+
+    /**
+     * <b>WHY（口径统一 · 与重拉路径同值）</b>：同一份单条 usage，实时 complete 事件与重拉补算
+     * （MessageService.applyContextSnapshotToLastAssistant）必须给出<b>同一个</b> contextTokensUsed
+     * —— 这正是 P3-c/P3-d 要根治的「两套口径并存」。
+     *
+     * <p><b>RED 条件</b>：任一实现改用 run 累计 / 改用其他公式 → 两者不等 → 红。
+     */
+    @Test
+    @DisplayName("[P3-d] 实时 complete 快照与重拉快照同值（同一单条 usage → 无漂移）")
+    void completeSnapshot_equalsReloadSnapshot_forSameSingleUsage() {
+        AgentState state = new AgentState("sys");
+        com.nexusai.application.agent.tool.AgentUsage single =
+            new com.nexusai.application.agent.tool.AgentUsage(4_321L, 10L, 500L, 700L, null, null, null);
+        state.appendMessage(new ChatMessageDto(
+            "a1", SESSION, Role.assistant, null, "回复", null,
+            List.of(), FinishReason.stop, 4_321, 10, "刚刚", OffsetDateTime.now(), null, null, null,
+            List.of(), List.of(), null, false, false).withUsage(single));
+
+        service.publishCompleteEvent(SESSION, "msg-user", state, STREAM_TOPIC, wsTemplate, 0L, "a1");
+
+        ArgumentCaptor<com.nexusai.eventbus.ws.StreamEvent> captor =
+            ArgumentCaptor.forClass(com.nexusai.eventbus.ws.StreamEvent.class);
+        verify(wsTemplate).convertAndSend(eq(STREAM_TOPIC), captor.capture());
+        com.nexusai.eventbus.ws.MessageCompleteEvent evt =
+            (com.nexusai.eventbus.ws.MessageCompleteEvent) captor.getValue();
+
+        // 重拉口径（MessageService：非 anthropic → 仅 input；同 window/1M 回落）
+        long reloadUsed = com.nexusai.application.agent.compact.ContextUsageCalculator.computeContextTokensUsed(
+            4_321L, 700L, 500L, false);
+        assertThat(evt.getContextTokensUsed())
+            .as("实时与重拉必须同值（同一条 usage + 同一协议分派单点）")
+            .isEqualTo(reloadUsed)
+            .isEqualTo(4_321L);
+        assertThat(evt.getContextWindow()).isEqualTo(1_048_576L);
+    }
 }

@@ -303,14 +303,14 @@ class ManualCacheClearCcIntegrationTest {
         ReflectionTestUtils.setField(config, "featureFlags", cacheBreakFeatureOn());
         Method build = ToolRegistrationConfig.class.getDeclaredMethod(
             "buildCompactCommandContext",
-            List.class, String.class, String.class,
+            List.class, String.class, String.class, String.class,
             ReactiveCompactor.class, com.nexusai.application.agent.compact.StreamCompactSummary.class,
             SessionMemoryService.class, com.nexusai.application.agent.tool.ToolUseContext.class,
             com.nexusai.application.agent.prompt.SystemPromptContextProvider.class,
             Supplier.class, String.class, String.class, boolean.class, Telemetry.class);
         build.setAccessible(true);
         CompactCommand.CompactCommandContext ctx = (CompactCommand.CompactCommandContext) build.invoke(
-            config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT,
+            config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT, null,
             null, null, null, null, null, null, null, null, false, null);
 
         // ── 2a. clearUserContextCache 真实接线：注册观察钩子 → 执行 → 钩子触发 ──
@@ -353,14 +353,14 @@ class ManualCacheClearCcIntegrationTest {
         // 不注入 → featureFlags 默认 ALL_DISABLED（feature 关）
         Method build = ToolRegistrationConfig.class.getDeclaredMethod(
             "buildCompactCommandContext",
-            List.class, String.class, String.class,
+            List.class, String.class, String.class, String.class,
             ReactiveCompactor.class, com.nexusai.application.agent.compact.StreamCompactSummary.class,
             SessionMemoryService.class, com.nexusai.application.agent.tool.ToolUseContext.class,
             com.nexusai.application.agent.prompt.SystemPromptContextProvider.class,
             Supplier.class, String.class, String.class, boolean.class, Telemetry.class);
         build.setAccessible(true);
         CompactCommand.CompactCommandContext ctx = (CompactCommand.CompactCommandContext) build.invoke(
-            config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT,
+            config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT, null,
             null, null, null, null, null, null, null, null, false, null);
 
         List<PromptCacheBreakDetection.CacheBreakResult> events = new ArrayList<>();

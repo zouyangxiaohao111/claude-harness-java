@@ -242,10 +242,10 @@ class ReactiveFailureTranslationCcTest {
             new com.nexusai.application.agent.telemetry.Telemetry();
 
         // 与 ManualCacheClearCcIntegrationTest 相同的反射模式调用生产接线（package-private）
-        // 生产签名 13 参（末尾追加 Telemetry，ToolRegistrationConfig.java:1816），此处同步 13 参。
+        // 生产签名 14 参（agentId 后追加 model · [P3-a]，末尾 Telemetry），此处同步 14 参。
         Method build = com.nexusai.application.agent.config.ToolRegistrationConfig.class.getDeclaredMethod(
             "buildCompactCommandContext",
-            List.class, String.class, String.class,
+            List.class, String.class, String.class, String.class,
             ReactiveCompactor.class, com.nexusai.application.agent.compact.StreamCompactSummary.class,
             com.nexusai.application.agent.memory.SessionMemoryService.class, ToolUseContext.class,
             SystemPromptContextProvider.class, Supplier.class, String.class, String.class, boolean.class,
@@ -253,7 +253,7 @@ class ReactiveFailureTranslationCcTest {
         build.setAccessible(true);
         CompactCommandContext ctx = (CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
-            SESSION, AGENT, null, null, null, tuc, null, null, null, null, false, telemetry);
+            SESSION, AGENT, null, null, null, null, tuc, null, null, null, null, false, telemetry);
 
         // 生产接线断言：命令级取消信号 == 会话 live 信号（不再是断开 new AbortController()）
         assertThat(ctx.abortController())

@@ -180,6 +180,19 @@ public class PartialCompactService {
     @Autowired(required = false)
     private SimpMessagingTemplate wsTemplate;
 
+    /**
+     * [P3-a-2] settings 单例行 mapper · {@code settings.main_model_name} 读取通道
+     * （会话无 model_name override 时的模型回落源，见 {@link #resolveSessionModelName(String)}）。
+     *
+     * <p>与 manual /compact 路径同源：{@code ToolRegistrationConfig.readDbMainModelName}（静态）
+     * 读的正是本表 {@code id=1} 行同一列；{@code MessageService.resolveSessionModel} 同链。
+     * {@code @Autowired(required=false)} 字段注入（镜像本类 taskFrameworkService / planProvider /
+     * settingsResolver / wsTemplate 既有模式，<b>不动构造器签名</b> —— 3 参 / 6 参直构测试逐位不变）；
+     * null（直构测试 / 无 bean）→ 模型回落链止于会话记录（返 null → 统一回落非 Anthropic）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
+
     /** 测试注入 STOMP 模板（生产走 {@code @Autowired} 字段注入 · 对齐 setPlanProvider 先例）。 */
     public void setWsTemplate(SimpMessagingTemplate wsTemplate) {
         this.wsTemplate = wsTemplate;
@@ -579,6 +592,11 @@ public class PartialCompactService {
         // 必抛异常的历史错位根因消除）。
         cc.setSessionId(sessionId);
         cc.setAgentId("main");
+        // [P3-a-2] 本会话有效模型 —— 见 {@link #resolveCompactModel(String)} 的 WHY：partial 的
+        //   preCompactTokenCount / compactionCallTotalTokens 两处按 ctx.getModel() 分派协议
+        //   （PartialCompactConversation:295/468 → CompactConversation.resolveAnthropic），
+        //   不设 → 不可判定 → 回落非 Anthropic → anthropic 会话少计（deepseek 恰好正确）。
+        cc.setModel(resolveCompactModel(sessionId));
         cc.setQuerySource("compact");
         cc.setReadFileState(new LinkedHashMap<>());
         // [S3-L4-B] PROMPT_CACHE_BREAK_DETECTION 门控接线（对齐 ToolRegistrationConfig:733-734
@@ -634,6 +652,121 @@ public class PartialCompactService {
         // → restore() 产出 file→async→plan→plan_mode→skill→3×delta（CC compact.ts:925-975 全序）。
         PostCompactAttachmentRestorer.populateInvokedSkillsAttachment(sessionAgentStateRegistry, cc);
         return cc;
+    }
+
+    /**
+     * [P3-a-2] partial 压缩上下文的会话有效模型名 · 与 manual {@code /compact} 同源解析。
+     *
+     * <h2>WHY</h2>
+     * {@link PartialCompactConversation} 的 {@code preCompactTokenCount}
+     * （{@code PartialCompactConversation:295}）与 {@code compactionCallTotalTokens}（{@code :468}）
+     * 都按 {@code ctx.getModel()} 分派协议（{@code CompactConversation.resolveAnthropic} → 唯一权威
+     * {@code ContextUsageCalculator.isAnthropic}）：Anthropic = 4 项和；OpenAI/DeepSeek = 仅
+     * {@code input + output}（prompt_tokens 已含 cache hit）。{@code buildContext} 原先不
+     * {@code setModel} → {@code ctx.getModel()=null} → 不可判定 → 回落非 Anthropic →
+     * <b>anthropic 会话少计</b>（deepseek 会话恰好正确）。
+     *
+     * <h2>解析顺序（两步，与 {@code ToolRegistrationConfig.resolveManualCompactModel} 镜像）</h2>
+     * <ol>
+     *   <li><b>已注册 live state</b>：{@code state.currentModel()}（{@code LlmAgentLoop.doRun:2461}
+     *       入口 + 每轮 {@code resolveTurnEffectiveModel} 覆盖写 = auto 路径 {@code AutoCompactor.model}
+     *       同源）→ 缺失时回落 {@code state.currentToolUseContext().effectiveModelName()}
+     *       （可能滞后一轮的 per-turn 值）。</li>
+     *   <li><b>未注册 / 空缺</b>（空闲会话、REST 线程历史会话）：
+     *       {@link #resolveSessionModelName(String)} 走 DB 链
+     *       （{@code sessions.model_name} → {@code settings.main_model_name}），
+     *       与 {@code ToolRegistrationConfig.rebuildIdleStateFromDb} 的补模型同一链。</li>
+     * </ol>
+     *
+     * <p><b>形态</b>：与 auto 路径同形态（库中原始名，全名/裸名皆可，
+     * {@code ContextUsageCalculator.isAnthropic} 经 {@code ModelNameResolver.resolve} 全名感知分派）。
+     * 全部不可得 → null → 交 {@code resolveAnthropic} 统一回落非 Anthropic（不在此臆断协议）。
+     *
+     * @param sessionId 会话 DB 键（short 形态 sess-xxx）
+     * @return 本会话有效模型名；不可得 → null
+     */
+    String resolveCompactModel(String sessionId) {
+        AgentState live = sessionAgentStateRegistry == null ? null
+            : sessionAgentStateRegistry.get(sessionId);
+        if (live != null) {
+            String model = live.currentModel();
+            if (model == null || model.isBlank()) {
+                ToolUseContext tuc = live.currentToolUseContext();
+                model = tuc != null ? tuc.effectiveModelName() : null;
+            }
+            if (model != null && !model.isBlank()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[P3-a-2] partial 模型解析: session={} model={}（源=live AgentState，"
+                            + "与 auto 路径 resolveTurnEffectiveModel 同口径）",
+                        sessionId, model);
+                }
+                return model;
+            }
+        }
+        // 未注册 / live state 模型空缺 → DB 链（会话 override → settings 主模型）
+        return resolveSessionModelName(sessionId);
+    }
+
+    /**
+     * [P3-a-2] 会话有效模型名（DB 链）· {@code sessions.model_name} → {@code settings.main_model_name}。
+     *
+     * <p>与 manual /compact 路径的空闲重建同链同序（镜像
+     * {@code ToolRegistrationConfig.resolveSessionModelName}）：auto 路径模型最终来自
+     * {@code ChatService.resolveModelNameForSession}（四层链，会话层 + settings 层即此处；
+     * 请求体模型参数层在 partial 这类「历史消息选择器」入口不存在）。既有同层拷贝：
+     * {@code MessageService.resolveSessionModel}（重拉上下文快照补算）。
+     *
+     * @param sessionId 会话 DB 键（short 形态 sess-xxx）
+     * @return 模型名；不可得（会话行缺失 / 两处皆空 / mapper 未注入 / 读取异常）→ null
+     */
+    String resolveSessionModelName(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            com.nexusai.model.session.dto.SessionDto session = sessionService == null
+                ? null : sessionService.getById(sessionId);
+            if (session != null && session.modelName() != null && !session.modelName().isBlank()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[P3-a-2] partial 模型解析: session={} model={}（源=sessions.model_name 会话 override）",
+                        sessionId, session.modelName());
+                }
+                return session.modelName();
+            }
+        } catch (Exception e) {
+            // 会话行缺失（NotFoundException）/ 读取异常 → 继续回落 settings（不阻断压缩）
+            log.warn("[P3-a-2] partial 会话模型解析失败（回落 settings.main_model_name）: session={} err={}",
+                sessionId, e.toString());
+        }
+        String settingsModel = readDbMainModelName();
+        if (log.isDebugEnabled()) {
+            log.debug("[P3-a-2] partial 会话无 override → settings.main_model_name={}（session={}）",
+                settingsModel, sessionId);
+        }
+        return settingsModel;
+    }
+
+    /**
+     * [P3-a-2] 读 DB 主模型名（{@code settings.main_model_name}，单例行 id=1）。
+     *
+     * <p>与 {@code ToolRegistrationConfig.readDbMainModelName(settingsMapper)} 同一行同一列
+     * （manual 路径版本为静态方法，因跨类复用不便而在此按同一语义收敛；两处读点同源同表）。
+     * 失败一律 null（mapper 未注入 / 行缺失 / 空值 / 异常）→ 调用方走「不可判定」统一回落。
+     *
+     * @return main_model_name（非空白）或 null
+     */
+    private String readDbMainModelName() {
+        if (settingsMapper == null) {
+            return null;
+        }
+        try {
+            com.nexusai.repository.settings.entity.SettingsRecord s = settingsMapper.selectOneById(1);
+            String v = s != null ? s.getMainModelName() : null;
+            return v != null && !v.isBlank() ? v : null;
+        } catch (Exception e) {
+            log.warn("[P3-a-2] partial DB settings.main_model_name 读取失败, 回落 null: {}", e.toString());
+            return null;
+        }
     }
 
     /**

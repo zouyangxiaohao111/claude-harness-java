@@ -218,7 +218,10 @@ class LlmAgentLoopWiringOrderTest {
             "src/main/java/com/nexusai/application/agent/compact/AutoCompactTrackingState.java"));
         assertThat(source)
             .as("必须存在 turnCounter++ 接线（IMP2-07 归并 · CC query.ts:1524）")
-            .contains("getTracking().startNewTurn();");
+            // [P4-4 更新] 计数源由 AutoCompactor 单例实例字段（getTracking()）改为 per-query() 跟踪
+            //   状态 autoCompactTracking（CC query.ts:264 State.autoCompactTracking + :1817
+            //   `if (tracking?.compacted) tracking.turnCounter++`）——断言随接线更新，语义不变。
+            .contains("autoCompactTracking.startNewTurn();");
         assertThat(source)
             .as("必须存在 tengu_post_autocompact_turn 遥测事件（CC query.ts:1525）")
             .contains("tengu_post_autocompact_turn");

@@ -15,7 +15,8 @@ import { COMMAND_ITEMS } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
-import { useChatStore, selectTokenWarning, type StreamBlock } from '@/stores/chatStore'
+import { resolveCtxInfo } from '@/utils/contextUsage'
+import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
@@ -168,28 +169,18 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
   const sessionUsage = useChatStore((s) => s.sessions.find((x) => x.id === sessionId))
-  // F1/F5 · 当前上下文「已用 / 窗口（剩余%）」：优先末条带快照（实时=流式块 message.usage 挂载、
-  //   complete 落库消息），无则回落 token_warning 事件（tokenUsage/contextWindow/percentLeft）。
-  //   扫描源 = [...msgs, ...liveBlocks]：live 块排尾部 → 从尾向前命中最新流式块的 usage/上下文，
-  //   多轮 turn 内每条 assistant message.usage 到达即实时刷新；turn 完成清流后纯 msgs 兜底。
+  // F1/F5 · 当前上下文「已用 / 窗口（剩余%）」：**只认快照口径**（服务端真实 usage + 模型原始窗口 +
+  //   窗口相对百分比 · resolveCtxInfo）。扫描源 = [...msgs, ...liveBlocks]：live 块排尾部 → 从尾向前
+  //   命中最新流式块的 usage/上下文，多轮 turn 内每条 assistant message.usage 到达即实时刷新；turn
+  //   完成清流后纯 msgs 兜底。
+  //   [P3-d 口径统一 2026-09-11] 删除「无快照 → 回落 token_warning」分支：该事件的 tokenUsage 是本地
+  //   估算、percentLeft 是**阈值相对**口径（分母 autoCompactThreshold ≠ 窗口），与快照口径异源，混在同
+  //   一位置会忽大忽小；且 /compact 后 boundary 之后暂无带 usage 的 assistant（后端
+  //   MessageService.applyContextSnapshotToLastAssistant 同义切片）→ 无快照即不显示（对齐 CC
+  //   getCurrentUsage 找不到 → 指示器归零），否则会拿压缩前的值顶上来（数字不降）。
   const msgs = useChatStore((s) => (sessionId ? (s.messages[sessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES))
   const liveBlocks = useChatStore((s) => (sessionId ? (s.streams[sessionId] ?? EMPTY_BLOCKS) : EMPTY_BLOCKS))
-  // [按会话键控] 只取本 Composer 所属会话的那一份告警（回落上下文条用）——原读全局单字段，
-  //   会把别的会话的告警算进本会话的上下文显示
-  const tokenWarning = useChatStore(selectTokenWarning(sessionId))
-  const ctxInfo = useMemo(() => {
-    const scanned = [...msgs, ...liveBlocks]
-    for (let i = scanned.length - 1; i >= 0; i--) {
-      const m = scanned[i]
-      if (m.contextTokensUsed != null && m.contextWindow != null) {
-        return { used: m.contextTokensUsed, window: m.contextWindow, pct: m.percentLeft ?? null }
-      }
-    }
-    if (tokenWarning && tokenWarning.tokenUsage != null && tokenWarning.contextWindow != null) {
-      return { used: tokenWarning.tokenUsage, window: tokenWarning.contextWindow, pct: tokenWarning.percentLeft ?? null }
-    }
-    return null
-  }, [msgs, liveBlocks, tokenWarning])
+  const ctxInfo = useMemo(() => resolveCtxInfo([...msgs, ...liveBlocks]), [msgs, liveBlocks])
   // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
   //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
   //   deepseek（openai 协议）：input_tokens 已含 cache hit（input==H+M），直接 cache_read / input

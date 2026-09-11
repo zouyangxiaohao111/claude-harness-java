@@ -64,6 +64,7 @@ import com.nexusai.application.agent.tool.ToolResultApplier;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.ToolDecisionInfo;
 import com.nexusai.application.agent.compact.AutoCompactor;
+import com.nexusai.application.agent.compact.AutoCompactTrackingState;
 import com.nexusai.application.agent.compact.BoundaryReader;
 import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
@@ -2306,19 +2307,12 @@ public class LlmAgentLoop implements AgentLoop {
         //   （SessionStorage/FileChangedWatcher/auto-dream）解析
         resolveSessionProjectRoot();
 
-        // [IMP2-07 · S-7 熔断范围登记：per-run] AutoCompactor tracking 每次 run() 重置——
-        //   CC tracking 为单次 query() 调用（= 一次用户回合 = Java 一次 run()）的循环局部状态
-        //   （query.ts:268-272 每 query 调用 state.autoCompactTracking 初始化为 undefined），
-        //   回合内跨工具轮经 continue 透传累计（query.ts:539-542/1718），回合边界复位。
-        //   Java singleton bean 跨会话共享，显式 reset 防跨 run 残留 → 与 CC 语义等价
-        //   （熔断范围 = 单次 run 内跨工具轮累计；run 边界归零）。
-        //   AutoCompactTrackingState.compacted/turnCounter/consecutiveFailures 全部归零。
-        if (autoCompactor != null) {
-            autoCompactor.reset();
-            if (log.isDebugEnabled()) {
-                log.debug("[LlmAgentLoop] AutoCompactor tracking 已重置（S-7 per-run：对齐 CC query.ts:272 每 query 调用重新初始化）");
-            }
-        }
+        // [P4-4 tracking 生命周期对齐 CC] 旧的 run() 入口 `autoCompactor.reset()`（S-7 补丁）已删：
+        //   它作用在 AutoCompactor 单例 bean 的实例字段上，只能把"单会话串行"时序对齐 CC 的
+        //   per-query() 复位；并发会话 B 进入 run() 反而会清掉 A 正在累计的熔断计数（判据串台）。
+        //   现跟踪状态改为 per-query() 对象：LlmAgentLoop.queryLoop 入口 new（CC query.ts:425
+        //   `autoCompactTracking: undefined`）→ loop(...) 递归参数透传 → autoCompactIfNeeded 第 5 参。
+        //   故本处无需（也无从）重置共享状态。
 
         // PR 4: 构造 state 时传入 sessionId/agentId，供 PermissionContextBuilder 使用
         // [RES-SP31] 透传 appendSystemPrompt（RunRequest → AgentState，OPD-SP-31 接线）
@@ -3755,6 +3749,23 @@ public class LlmAgentLoop implements AgentLoop {
                     params.modelName(), state.sessionId(), state.turnCount());
             }
         }
+        // ── [P4-4 tracking 生命周期对齐 CC] 每 query() 调用一个 autoCompactTracking 对象 ──
+        // CC original: query.ts:264（State 字段声明）+ :425（`autoCompactTracking: undefined` 每
+        //   query() 调用重新初始化）+ :555（`let tracking = autoCompactTracking`）——跟踪状态是
+        //   query() 的循环局部 State，随 query() 创建/丢弃，多会话共享进程时天然互不污染。
+        // Java 对齐：本方法 = CC query() 等价入口（见 :3708 "[R28-1] 唯一入口"），故在此 new 一个
+        //   AutoCompactTrackingState，经 loop(...) 参数透传（Stop-hook 递归重入帧传同一对象，
+        //   对齐 CC 6 处 State 重建站点 `autoCompactTracking: tracking`：query.ts:1389（collapse_drain_retry）/
+        //   1497（max_output_tokens_escalate）/1525（max_output_tokens_recovery）/1580/1621（hook 类）/2046
+        //   （next_turn；tengu_auto_compact_succeeded 复位站点见 :719-724，reactive 置 undefined 见 :1442））。
+        // 旧实现（S-7 补丁）：AutoCompactor 单例 bean 持有实例字段 tracking + doRun 入口 reset()
+        //   —— 单例字段跨会话共享，并发会话 A/B 互相覆盖 compressed/failures 判据（历史「同一会话
+        //   反复 autoCompact」判据错乱面）；reset() 只能对齐"单会话串行"时序，无法隔离并发会话。
+        AutoCompactTrackingState autoCompactTracking = new AutoCompactTrackingState();
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] queryLoop 入口新建 autoCompactTracking（per-query 对象 · CC query.ts:425）: sessionId={}",
+                state.sessionId());
+        }
         // 委托 loop 主体（stopHookActive 首调 false，重入点 loop(..., true)）。
         // [V-TOK / DEC-RV-04] cumulativeOutputTokens 首调传 0（CC turn 起始累计从 0 起）。
         // [SH-02 E4] stopHookBlockingReentries 首调传 0（CC query.ts:1302 transition 无计数概念）。
@@ -3762,7 +3773,7 @@ public class LlmAgentLoop implements AgentLoop {
         // [U2 · R1] pdfProcessor 透传（null = 无 PDF 注入）· 统一队列 drain prompt 路径 PDF blocks 注入。
         // [mid-turn-align] injectedQueuedMessages 透传（null = 非主循环 → loop() 跳过镜像写，成功路径
         //   仍经 state.injectedQueuedMessages() 补落库）。
-        AgentState finalState = loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, 0, false, /*stopHookBlockingReentries=*/0, /*suppressTurnZeroDrain=*/false, skillListingResume);
+        AgentState finalState = loop(ctx, params, state, consumedCommandUuids, autoCompactor, autoCompactTracking, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, 0, false, /*stopHookBlockingReentries=*/0, /*suppressTurnZeroDrain=*/false, skillListingResume);
         boolean aborted = finalState != null
             && AgentState.ExitReason.ABORTED.equals(finalState.exitReason());
         // [R-A3] 开始-结束时间差 · 对齐 CC agentToolUtils.ts:352 Date.now() - startTime。
@@ -4523,6 +4534,12 @@ public class LlmAgentLoop implements AgentLoop {
                             AgentState state,
                             java.util.List<String> consumedCommandUuids,
                             AutoCompactor autoCompactor,
+                            // [P4-4 tracking 生命周期对齐 CC] per-query() 跟踪状态（CC State.autoCompactTracking，
+                            //   query.ts:264）：由 queryLoop 入口新建（每 query() 一个对象），本帧与其递归
+                            //   重入帧共用同一实例（对齐 CC transition 站点 `autoCompactTracking: tracking`）；
+                            //   故本参数是<b>递归透传</b>参数，不是 loop 局部 new（旧 S-7 实现为单例字段+run 入口
+                            //   reset，跨会话共享 → 判据串台）。
+                            AutoCompactTrackingState autoCompactTracking,
                             MicroCompactor microCompactor,
                             com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
                             CountTokensClient countTokensClient,
@@ -4564,9 +4581,14 @@ public class LlmAgentLoop implements AgentLoop {
         // 保持与原 carrier 实例字段语义一致（否则 if 检查恒 false，token budget 变死代码）。
         com.nexusai.application.agent.query.TokenBudgetChecker.BudgetTracker budgetTracker = state.budgetTracker();
         String previousEffectiveModel = null;
-        // [H7-arch Phase 5 P4 C1] "本 turn 刚压缩过" 标志 · 对齐 CC compactionResult (query.ts:632)
-        // loop 级局部变量：压缩管线（L1-L4）成功后置 true，blocking-limit 跳过条件消费（CC: !compactionResult）。
-        boolean justCompacted = false;
+        // [P4-5 对齐 CC] "本迭代刚压缩过" 标志从 loop() 方法级下移到 do-while <b>迭代体内</b>
+        //   （声明见下方 do { 内）——对齐 CC `const { compactionResult, consecutiveFailures } =
+        //   await deps.autocompact(...)`（query.ts:652）在 while(true) <b>迭代体内</b>声明：
+        //   每迭代重新求值，压缩只影响本迭代的两处 `!compactionResult` 判定
+        //   （blocking 上限预检 query.ts:827；预测性 autocompact query.ts:852）。
+        //   旧 Java 方法级布尔为"粘滞"语义——一次压缩后本 run 余下所有迭代的上限预检被永久
+        //   跳过（该拦的不拦 → 上下文越过 blocking 上限直撞 provider 413 →
+        //   触发 reactive compact → 反复压缩，历史事故的放大面）。
         // [IMP-16] task_budget 结转局部量 · CC query.ts:291 taskBudgetRemaining（初始 null=undefined）
         Integer taskBudgetRemaining = null;
         // [MF3-3] 本次调用的 max_tokens 覆盖 · 对齐 CC State.maxOutputTokensOverride (query.ts:210)
@@ -4765,6 +4787,16 @@ public class LlmAgentLoop implements AgentLoop {
         //   continue、:5549 tombstone 不清标志 —— 只在 continue 处置 false 会残留）。
         boolean[] lastIterationRanTools = { false };
         do {
+            // ── [P4-5 对齐 CC · per-iteration] "本迭代刚压缩过" 标志 ──
+            // CC original: query.ts:652 `const { compactionResult, consecutiveFailures } =
+            //   await deps.autocompact(...)` —— compactionResult 在 while(true) <b>迭代体内</b>
+            //   声明，本迭代压缩才为真，下一迭代重新求值（默认假）。
+            // 消费点两处（均本迭代语义）：
+            //   · blocking 上限预检跳过（query.ts:827 `!compactionResult && ...`）
+            //   · 预测性 autocompact（query.ts:852 `if (!compactionResult && isAutoCompactEnabled())`）
+            // 旧实现在 loop() 方法级声明且从不复位 → 一次压缩后整个 run 都跳过 blocking 预检
+            //   （粘滞），与 CC 每迭代语义相反。此处随迭代体重置即为 CC 等价物。
+            boolean justCompacted = false;
             // [H7-arch Phase 5-2 A2] 每轮递增 queryTracking · 对齐 CC query.ts:346-363
             // null → 新链 {chainId: deps.uuid(), depth: 0}; 非 null → 同链 depth+1（chainId 稳定）。
             // instanceof 守卫防止外部注入畸形 queryTracking（chainId 非 String / depth 非 Integer）
@@ -5228,7 +5260,10 @@ public class LlmAgentLoop implements AgentLoop {
                     // autoCompact.ts:225 tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed）
                     // —— 阈值判定反映 snip 已释放的量，非硬编码 0（INV-9）。
                     AutoCompactor.AutoCompactResult l4Result = autoCompactor.autoCompactIfNeeded(
-                        messagesForQuery, snipTokensFreed, params.querySource().canonical(), ccCtx);
+                        messagesForQuery, snipTokensFreed, params.querySource().canonical(), ccCtx,
+                        // [P4-4] 第 5 参 = 本 query() 跟踪状态（CC autoCompact.ts:275 `tracking` 形参同位置）
+                        //   ——不再是 AutoCompactor 单例实例字段，故多会话并发互不污染。
+                        autoCompactTracking);
                     if (l4Result.wasCompacted()) {
                         // 防御性快照：state.replaceMessages 对旧列表 in-place clear+addAll（AgentState.java:520-522），
                         // 必须在替换前拷贝，否则 measured（CC messagesForQuery 压缩前数组）被新列表污染 → 0。
@@ -5276,7 +5311,8 @@ public class LlmAgentLoop implements AgentLoop {
                         //   通道可跨 AutoCompactor 实例传递。成功复位（query.ts:521-526 公共复位）
                         //   已由 autoCompactIfNeeded 内 recordSuccess 完成，此处仅失败分支写回。
                         if (l4Result.consecutiveFailures() != null) {
-                            autoCompactor.getTracking().setConsecutiveFailures(
+                            // [P4-4] 写回本 query() 跟踪状态（非单例实例字段）
+                            autoCompactTracking.setConsecutiveFailures(
                                 l4Result.consecutiveFailures());
                         }
                         if (log.isDebugEnabled()) {
@@ -6850,6 +6886,17 @@ public class LlmAgentLoop implements AgentLoop {
 
                             // [R25-3] 标记 reactive compact 已尝试 · 让 gate 防止下次 prompt-too-long 时再次 compact
                             recoveryState.markReactiveCompact();
+                            // [P4-4 item3 · CC query.ts:1442] reactive compact 成功后<b>复位</b> autoCompactTracking。
+                            //   CC original: `const next: State = { messages: postCompactMessages, ...,
+                            //   autoCompactTracking: undefined, hasAttemptedReactiveCompact: true, ...,
+                            //   transition: { reason: 'reactive_compact_retry' } }`（query.ts:1435-1447）
+                            //   —— 置 undefined 后，下一迭代 proactive autocompact 拿到的是全新状态
+                            //   （isRecompactionInChain=false / 熔断计数归零 / compacted=false），
+                            //   不会把"上一段生命周期的压缩判据"带进新一轮上下文。
+                            //   旧 Java 未复位 → reactive 成功后 compacted/turnCounter/consecutiveFailures
+                            //   仍携带旧值（可能与 proactive 路径交叠出现判据错乱 → 反复压缩）。
+                            //   Java 等价物 = 新建对象（对齐"undefined 后由下一次压缩重建 State 字段"）。
+                            autoCompactTracking = new AutoCompactTrackingState();
                             log.info("[LlmAgentLoop] 应急压缩完成: 消息数 {} → {}, 重试 LLM 调用 · CC query.ts:1148",
                                 before, postCompactMessages.size());
                             state.clearError();
@@ -7339,11 +7386,12 @@ public class LlmAgentLoop implements AgentLoop {
                 // [IMP2-07] 压缩后回合计数归并进 tracking.startNewTurn()——
                 //   tracking.turnCounter 为唯一计数源（recompactionInfo.turnsSincePreviousCompact
                 //   同源，autoCompact.ts:281；DRIFT-4/S-6），压缩成功由 recordSuccess 归零。
-                if (autoCompactor != null && autoCompactor.getTracking().isCompacted()) {
-                    autoCompactor.getTracking().startNewTurn();
+                if (autoCompactor != null && autoCompactTracking.isCompacted()) {
+                    // [P4-4] 计数源 = 本 query() 跟踪状态（CC query.ts:1817 `tracking.turnCounter++`）
+                    autoCompactTracking.startNewTurn();
                     log.info("tengu_post_autocompact_turn: turnId={} turnCounter={} · CC query.ts:1525",
-                        autoCompactor.getTracking().getTurnId(),
-                        autoCompactor.getTracking().getTurnCounter());
+                        autoCompactTracking.getTurnId(),
+                        autoCompactTracking.getTurnCounter());
                 }
 
                 // ── [P-8] genuine next_turn 边界 · CC query.ts:1679/1704-1712 ──
@@ -7697,7 +7745,7 @@ public class LlmAgentLoop implements AgentLoop {
                                 // [H7-arch Phase 5-2 B1] 重入点：loop(ctx, params, state, uuids,
                                 //   autoCompactor, microCompactor, cumulativeOutputTokens,
                                 //   stopHookActive=true)（[V-TOK/DEC-RV-04] 累计透传）
-                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
+                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, autoCompactTracking, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
                             }
                             if (loopStopCollect.preventedContinuation()) {
                                 log.info("HOOK Stop preventContinuation (in-loop): graceful exit, stopReason={}",
@@ -8024,7 +8072,7 @@ public class LlmAgentLoop implements AgentLoop {
                                 // [H7-arch Phase 5-2 B1] 重入点：loop(ctx, params, state, uuids,
                                 //   autoCompactor, microCompactor, cumulativeOutputTokens,
                                 //   stopHookActive=true)（[V-TOK/DEC-RV-04] 累计透传）
-                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
+                                return loop(ctx, params, state, consumedCommandUuids, autoCompactor, autoCompactTracking, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
                             }
                         }
                     }
@@ -8186,7 +8234,7 @@ public class LlmAgentLoop implements AgentLoop {
                             state.turnCount(), stopHookBlockingReentries, maxStopHookBlockingReentries());
                     } else {
                         state.markNeedsFollowUp();
-                        return loop(ctx, params, state, consumedCommandUuids, autoCompactor, microCompactor,
+                        return loop(ctx, params, state, consumedCommandUuids, autoCompactor, autoCompactTracking, microCompactor,
                             settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, cumulativeOutputTokens, /*stopHookActive=*/true, stopHookBlockingReentries + 1, /*suppressTurnZeroDrain=*/true, skillListingResume);
                     }
                 }
