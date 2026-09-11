@@ -10,6 +10,7 @@ import com.nexusai.application.agent.prompt.SystemPromptAssemblyInput;
 import com.nexusai.application.agent.prompt.SystemPromptContextProvider;
 import com.nexusai.application.agent.prompt.UserContextProvider;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
+import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.common.RequestContext;
@@ -25,6 +26,7 @@ import com.nexusai.model.session.dto.PartialCompactResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -165,6 +167,24 @@ public class PartialCompactService {
     @Autowired(required = false)
     private org.springframework.transaction.PlatformTransactionManager transactionManager;
 
+    /**
+     * [partial-compact-progress 2026-09-11] STOMP 模板 · partial 压缩进度推送 sender。
+     *
+     * <p>与 manual /compact（{@code ToolRegistrationConfig:440 wsTemplate}）/ auto
+     * （{@code LlmAgentLoop.setStreamContext} 注入同一 bean）<b>同一注入模式</b>：
+     * {@code @Autowired(required=false)} 字段注入（镜像本类 taskFrameworkService / planProvider /
+     * featureFlags / transactionManager 既有模式，<b>不动构造器签名</b> —— 3 参 / 6 参直构测试
+     * 逐位不变）。非 STOMP 路径 / 直构测试 → null → 不注册进度推送（压缩照常完成，只是前端无横幅，
+     * 与 manual/auto 无 wsTemplate 时同款降级）。
+     */
+    @Autowired(required = false)
+    private SimpMessagingTemplate wsTemplate;
+
+    /** 测试注入 STOMP 模板（生产走 {@code @Autowired} 字段注入 · 对齐 setPlanProvider 先例）。 */
+    public void setWsTemplate(SimpMessagingTemplate wsTemplate) {
+        this.wsTemplate = wsTemplate;
+    }
+
     @Autowired
     public PartialCompactService(MessageService messageService,
                                  SessionService sessionService,
@@ -212,6 +232,42 @@ public class PartialCompactService {
     public PartialCompactResponse partialCompact(String sessionId, PartialCompactRequest request) {
         RequestContext.setSession(sessionId);
         CompactConversationContext ctx = null;
+        // [partial-compact-progress 2026-09-11] 统一压缩进度通道注册（+ 压缩可中断）。
+        //
+        // <p><b>WHY（要修的缺陷）</b>：partial 原先在 {@code buildContext} 里把 {@code cc} 的进度
+        // sink 覆写成「只写日志」（{@code cc.setOnCompactProgress(event -> log.info(...))}）——
+        // {@link PartialCompactConversation} 确实全链 emit 5 事件（PRE_COMPACT / CompactStart /
+        // SESSION_START / POST_COMPACT / CompactEnd，:299/:311/:462/:521/:560），但事件只进日志、
+        // 不进 STOMP → 前端订阅的 {@code /topic/sessions/{sid}/compact-progress} 恒无消息 →
+        // 用户在消息选择器触发 partial 压缩后几十秒内看不到任何进度（不知道在压缩、也不知道进度）。
+        //
+        // <p><b>照抄的两条既有路径（本处不改语义，只接同一通道）</b>：
+        // <ul>
+        //   <li>manual {@code /compact}：{@code ToolRegistrationConfig:2307-2336} 注册
+        //       （进度={@code CompactProgressState.register} → wsTemplate.convertAndSend /
+        //       abort={@code registerAbort}+{@code registerSessionAbort}）+ {@code :2370-2382}
+        //       finally 三清理</li>
+        //   <li>auto compact：{@code LlmAgentLoop:2207-2224} 注册 + {@code :2227-2232}
+        //       finally {@code clear()}</li>
+        // </ul>
+        //
+        // <p><b>线程安全（partial 跑 REST 线程的关键核实）</b>：
+        // <ul>
+        //   <li>{@code CompactConversationContext.getOnCompactProgress()} 在<b>事件 accept 时</b>
+        //       读 {@code CompactProgressState.current()}（ThreadLocal），{@code StreamCompactSummary}
+        //       的 abort supplier（{@code () -> CompactProgressState.currentAbort()}）与
+        //       {@code SummaryProgress} 推送同样在<b>调用线程</b>读 ThreadLocal。partial 全程
+        //       （含 {@code StreamCompactSummary.summarize} / {@code PartialCompactConversation}）
+        //       在 REST 线程同步执行、无线程切换 → 注册/读取同线程，ThreadLocal 命中。</li>
+        //   <li>abort 是<b>会话级</b>（{@code CompactProgressState.sessionAborts} 为
+        //       ConcurrentHashMap，非 ThreadLocal）→ 前端「停止」→ {@code ChatService.cancelSession}
+        //       （{@code :1855 abortForSession(sessionId)}）在<b>另一线程</b>也能命中本 REST 线程
+        //       注册的 AbortController，与 manual 路径同一条跨线程链路。</li>
+        // </ul>
+        // 注册点刻意放在 {@code try} <b>之前</b>：保证下方 finally 的三个清理在成功/业务失败/
+        // 异常三路必达（register/clear 成对，不为 REST 线程留 ThreadLocal/静态槽残留）。
+        AbortController compactAbort = new AbortController();
+        registerProgressChannel(sessionId, compactAbort);
         try {
             // ── 1. 加载消息（MessageService.listBySession 校验 session 存在，不存在 → 404）──
             // [S1] partial 压缩 = 续聊加载历史通道 → listForResume（对齐 CC
@@ -245,7 +301,7 @@ public class PartialCompactService {
                 sessionId, compactMessages.size(), request.messageId(), pivot, request.direction());
 
             // ── 4. 构建压缩上下文（mirror ToolRegistrationConfig.buildCompactConversationContext:1389-1413）──
-            ctx = buildContext(sessionId);
+            ctx = buildContext(sessionId, compactAbort);
 
             // ── 4.5 [ALIGN-COMP-1 CS-2] partial 路径 registry holder 装配（镜像 CompactConversation
             //   holder · AutoCompactor:598-603 同款接线时机）── 使 step 13
@@ -307,6 +363,16 @@ public class PartialCompactService {
 
             return new PartialCompactResponse(normalized, newConversationId);
         } finally {
+            // [partial-compact-progress 2026-09-11] 统一进度通道清理（与上方 registerProgressChannel
+            //   成对；三路必达：成功 / 业务失败(400/404) / 异常）。三处 clear 均幂等，未注册也安全。
+            //   顺序对齐 manual ToolRegistrationConfig:2375-2379（clear → clearAbort → removeSessionAbort）。
+            CompactProgressState.clear();
+            CompactProgressState.clearAbort();
+            CompactProgressState.removeSessionAbort(sessionId);
+            if (log.isDebugEnabled()) {
+                log.debug("[PartialCompact] 压缩进度通道已清理: sessionId={}（ThreadLocal 进度/abort 出栈，"
+                    + "会话级 abort 槽位移除）", sessionId);
+            }
             // [RES-C3] partial 会话级 sysPromptCtxProvider 生命周期终结（register/unregister 成对，
             // RES-C2 契约：成功/业务失败/异常三路均注销，close 幂等）
             if (ctx != null && ctx.getSysPromptCtxProvider() != null) {
@@ -314,6 +380,55 @@ public class PartialCompactService {
             }
             RequestContext.clear();
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [partial-compact-progress 2026-09-11] 统一压缩进度/可中断通道
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 注册 partial 压缩的统一进度通道（对齐 manual {@code ToolRegistrationConfig:2307-2336} /
+     * auto {@code LlmAgentLoop:2207-2224}，<b>不另起第二套</b>）。
+     *
+     * <p>三件事，与两条既有路径逐条同构：
+     * <ol>
+     *   <li><b>进度推送</b>：wsTemplate 可得 → {@code CompactProgressState.register(consumer)}，
+     *       consumer 内 {@code convertAndSend(CompactProgressState.topic(sid), toFrontendJson(event))}
+     *       → 前端 {@code /topic/sessions/{sid}/compact-progress} 横幅（CompactProgressBar）。
+     *       wsTemplate 缺失（非 STOMP 路径/直构测试）→ 不注册，fail loud 记 warn（规则十二），
+     *       压缩照常完成。</li>
+     *   <li><b>线程级 abort</b>：{@code registerAbort(compactAbort)}（ThreadLocal）→
+     *       {@code StreamCompactSummary} 的 abort supplier（{@code ToolRegistrationConfig:1061}）
+     *       取到 → 前端取消 → 摘要 provider 硬断流 → 'Compaction canceled.'（对齐 CC
+     *       compact.ts:126）。</li>
+     *   <li><b>会话级 abort</b>：{@code registerSessionAbort(sid, compactAbort)}（ConcurrentHashMap，
+     *       跨线程）→ 前端停止/Esc → {@code ChatService.cancelSession:1855 abortForSession(sid)}
+     *       可达本 REST 线程在飞 partial 压缩。</li>
+     * </ol>
+     *
+     * <p><b>成对性</b>：调用方 {@link #partialCompact} 在 finally 内调用 {@code clear()} /
+     * {@code clearAbort()} / {@code removeSessionAbort(sessionId)}（三路必达，幂等）。
+     *
+     * @param sessionId   会话 ID（short 直键 · 与 topic 拼装/会话级 abort 同源）
+     * @param compactAbort 本次 partial 压缩的 AbortController（同时设进 ctx.abortController，
+     *                     使 CompactHooks 的 hook batch abort 与摘要断流同源）
+     */
+    private void registerProgressChannel(String sessionId, AbortController compactAbort) {
+        // 会话级 + 线程级 abort 恒注册（与 wsTemplate 无关；manual 路径同样无条件注册）
+        CompactProgressState.registerAbort(compactAbort);
+        CompactProgressState.registerSessionAbort(sessionId, compactAbort);
+        if (wsTemplate == null || sessionId == null) {
+            // fail loud（规则十二）：非 STOMP 路径跳过的是「推送」，不是「压缩」——不能静默。
+            log.warn("[PartialCompact] wsTemplate/sessionId 缺失 → partial 压缩进度不推前端"
+                + "（非 STOMP 路径或直构测试；abort 通道仍已注册）: sessionId={} wsTemplate={}",
+                sessionId, wsTemplate != null);
+            return;
+        }
+        String topic = CompactProgressState.topic(sessionId);
+        CompactProgressState.register(event -> wsTemplate.convertAndSend(
+            topic, CompactProgressState.toFrontendJson(event)));
+        log.info("[PartialCompact] 压缩进度通道已注册: topic={}（前端进度横幅源；abort=线程级+会话级，"
+            + "前端停止可达 REST 线程在飞压缩）", topic);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -437,8 +552,16 @@ public class PartialCompactService {
      * 构建压缩上下文 · mirror ToolRegistrationConfig.buildCompactConversationContext:1389-1413
      * （生产接线模式）。agentId 用 "main"（REST 无 agent 参数；notifyCompaction 经
      * {@link com.nexusai.application.agent.lsp.PromptCacheBreakDetection#gatedBy} 门控接线，
-     * feature 关 → no-op；hookRegistry null → agentId 当前流程不可达消费）；onCompactProgress
-     * 接 logger；summaryProducer 接 StreamCompactSummary（null → fail loud）。
+     * feature 关 → no-op；hookRegistry null → agentId 当前流程不可达消费）；summaryProducer
+     * 接 StreamCompactSummary（null → fail loud）。
+     *
+     * <p><b>[partial-compact-progress 2026-09-11] onCompactProgress 不再在此覆写</b>：原实现
+     * {@code cc.setOnCompactProgress(event -> log.info(...))} 是「只写日志」的自建第二套 sink
+     * （事件到不了前端）。现由 {@link #partialCompact} 经 {@link #registerProgressChannel}
+     * 注册 {@code CompactProgressState}（与 manual/auto 同一条统一通道）→
+     * {@link CompactConversationContext#getOnCompactProgress()} 在 accept 时优先返回该注册，
+     * 无注册（无 STOMP）→ 回落字段默认 no-op。<b>本处刻意不设兜底 sink</b>，避免与统一通道
+     * 形成第二条链（对齐 auto buildAutoContext 之外的 LlmAgentLoop/手动路径均不自设 sink 的现状）。
      *
      * <p>[RES-C3] OPD-SP-33 生产 partial 注入会话 AgentState 组装链原料（CC getCacheSharingParams
      * compact.ts:250-287 + REPL.tsx:4938-4942 调用方提供 cacheSafeParams）：会话 AgentState
@@ -449,7 +572,7 @@ public class PartialCompactService {
      * ToolRegistrationConfig:1302-1310 同款通道）。会话未注册 AgentState → best-effort 缺原料
      * → build 返回 null → save(null) → 走流式 fallback（缓存共享为优化项，不阻断压缩，不抛错）。
      */
-    private CompactConversationContext buildContext(String sessionId) {
+    private CompactConversationContext buildContext(String sessionId, AbortController compactAbort) {
         CompactConversationContext cc = new CompactConversationContext();
         // [session-id-short] REST 路径变量 sessionId 已 short 直键，直接入 ctx（不再 parseSessionUuid
         // 归一化——registry 注册键同为 short，populateInvokedSkillsAttachment 可命中；原 UUID.fromString
@@ -463,7 +586,15 @@ public class PartialCompactService {
         // cache-read 基线（querySource="compact"，agentId="main"）
         cc.setNotifyCompaction(() -> com.nexusai.application.agent.lsp.PromptCacheBreakDetection
             .gatedBy(featureFlags).notifyCompaction("compact", "main"));
-        cc.setOnCompactProgress(event -> log.info("[PartialCompact] 压缩进度事件: {}", event));
+        // [partial-compact-progress 2026-09-11] 原 `cc.setOnCompactProgress(event -> log.info(...))`
+        //   （只写日志、前端恒无横幅）已删除：进度 sink 统一由 partialCompact 的
+        //   registerProgressChannel 注册进 CompactProgressState，getOnCompactProgress() 优先取该注册。
+        //   非 STOMP 路径 → 回落字段默认 no-op（与 auto/manual 同款降级，不再自建第二套 sink）。
+        // [可中断 2026-09-04 · CC Esc] partial 压缩的 AbortController 与统一通道同一实例：
+        //   CompactHooks 的 hook batch abort（CompactHooks:73/234 读 ctx.getAbortController()）
+        //   与 StreamCompactSummary 摘要断流（经 CompactProgressState.currentAbort()）同源 ——
+        //   前端停止 → 摘要/hook 一并断（对齐 manual ctx.abortController 语义）。
+        cc.setAbortController(compactAbort);
         if (streamCompactSummary != null) {
             cc.setSummaryProducer((messagesToSummarize, compactPrompt, preCompactTokenCount) -> {
                 try {

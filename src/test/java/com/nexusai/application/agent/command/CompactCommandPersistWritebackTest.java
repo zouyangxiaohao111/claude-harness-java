@@ -356,7 +356,14 @@ class CompactCommandPersistWritebackTest {
     }
 
     /**
-     * 降级：拿不到 live AgentState（注册表无该会话）→ fail-loud 且<b>不谎报压缩成功</b>。
+     * 降级：拿不到 live AgentState 且<b>无重建通道</b>（messageService=null，旧实现里这是唯一形态）
+     * → fail-loud 且<b>不谎报压缩成功</b>。
+     *
+     * <p>[compact-idle-rebuild] 语义收窄：registry miss 不再是拒绝压缩的理由 ——
+     * {@code handleCompactCommand} 会先经 {@code rebuildIdleStateFromDb} 用 {@code messageService}
+     * 从 DB 历史重建临时 state（对齐 CC REPL 恒持 messages）并真压缩落库
+     * （覆盖见 {@code ToolRegistrationConfigCompactIdleRebuildTest}，本类
+     * {@link #invokeHandleCompact} 传的 messageService=null 是「连历史都读不到」这一残留降级路径）。
      *
      * <p><b>RED 条件</b>: 若把 state==null 分支改成返回 displayText/成功文案，本用例红。
      */

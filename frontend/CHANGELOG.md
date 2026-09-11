@@ -6,6 +6,7 @@ All notable changes to NexusAI will be documented in this file.
 
 ### Fixed / Changed
 
+- **定时任务「日+周双约束」不再显示"未识别调度"**：后端为「每月 1 日 **或** 每周一」这类 dom+dow 双约束任务存的是 `||` 连接的变体串（如 `0 0 9 1 * ?||0 0 9 ? * 2`），而 `SchedulesPanel.cronToHuman` 按空白切分会把 `?||0` 当成一个 token → 字段数变 12 → 落入「未识别调度」。现先按 `||` 拆分、逐个识别后用「 或 」拼接；并补周几识别（`? * 2-6` → `每周一至周五`，**Quartz 编号 1=周日**，防按 ISO 误标成「1=周一」）；任一侧识别不了仍整体回退原文。设置面板与右侧面板共用该函数，一并生效。
 - **停止任务后卡片卡"运行中"**：`/tasks/{id}/kill` 对**已结束/已移除**的任务返回 404（`task not found`），而前端只在成功/失败时弹 toast、不更新本地态 → 子代理卡片永久"运行中"。现：**成功 → 乐观置 stopped**（终态事件丢失也不卡）；**404 → 视为已结束**（子代理卡片清身份 / 任务面板刷新清单）。
 - **轨迹徽标实时刷新**：每 5s 轮询后端 `GET /sessions/{id}/messages/count`（DB `sessions.messageCount` 非 meta 口径）更新轨迹 tab 消息总数，覆盖新消息/删除/裁剪；不再只是进会话时的快照。
 - **FinishReason 读回容错（后端）**：DB 某条 `finish_reason='max_tokens'` 曾致消息读取 500 → 轨迹页"暂无轨迹"；后端加 `max_tokens` 常量 + 容错解析，现正常。

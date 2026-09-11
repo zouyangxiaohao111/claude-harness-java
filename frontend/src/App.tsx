@@ -23,7 +23,7 @@ import { settingsApi } from '@/api/settings'
 import { attachmentApi } from '@/api/attachment'
 import { ApiError } from '@/api/rest'
 import { debugLog } from '@/utils/debugLog'
-import { useChatStore } from '@/stores/chatStore'
+import { useChatStore, selectCompact } from '@/stores/chatStore'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { useAwaySummary } from '@/hooks/useAwaySummary'
 import { sendPermissionResponse } from '@/api/socket'
@@ -393,7 +393,11 @@ function App() {
   //   两信号互补：思考阶段靠 activeStreams；打字机阶段靠 streamOrder 有块（防「打字机在动但发送键已出」脱节）
   const turnRunning = !!activeStreams[activeSessionId] || hasStream
   // 压缩进行中（compact-progress 事件 · 不经 LlmAgentLoop → turnRunning 假，需并入发送键⇄停止）
-  const compactActive = useChatStore((s) => s.compact.visible && s.compact.status === 'running')
+  // [多会话隔离 2026-09-11] 只看【当前活动会话】的进度：原实现读全局单对象 → A 压缩中切到 B，
+  //   B 的发送键变停止（且点击取消的是 B）。此处与 CompactProgressBar 用同一键 → 键出现即横幅出现、
+  //   即发送键变停止，取消目标天然一致（见 stopStreaming 的取消会话取值）。
+  const activeCompact = useChatStore(selectCompact(activeSessionId))
+  const compactActive = activeCompact.visible && activeCompact.status === 'running'
   // 运行中会话集合（有 stream = 运行中），供左侧栏状态图标。
   // [流式性能] 从 streamOrder 读键集：content 推进不换引用 → 不会每 chunk 重渲；块增删（会话开始/结束流式）才更新。
   // 用 useMemo 稳定引用避免 selector 每次返回新 Set 触发无限重渲染。
@@ -508,9 +512,16 @@ function App() {
   // ---- 停止当前流式（Esc 一次 · turn 运行中）----
   const stopStreaming = useCallback(async () => {
     if (!activeSessionId) return
-    // 压缩进行中停止：立即收起进度横幅（后端 cancel abort 摘要；随后的 compact_end 不再显示完成态）
-    if (useChatStore.getState().compact.visible) {
-      useChatStore.getState().setCompact({ visible: false, status: 'canceled' })
+    // [多会话隔离 2026-09-11] 停止键与进度横幅共用【同一个会话键】：
+    //   compactActive = compact[activeSessionId]（见上），横幅 CompactProgressBar 亦只渲染该键
+    //   → 点停止时正在压缩的会话 ≡ 当前活动会话，取消目标不存在歧义（原实现：全局横幅 + 取消
+    //   activeSessionId，A 压缩中切到 B 时「显示 A 的横幅、取消 B」）。
+    //   取消通道无需新增后端：POST /sessions/{sid}/cancel → ChatService.cancelSession →
+    //   CompactProgressState.abortForSession(sid) 会 abort 该会话在飞压缩（摘要 provider 硬断流）。
+    // 压缩进行中停止：立即收起该会话进度横幅（后端 cancel abort 摘要；随后的 compact_end 不再显示完成态）
+    const cur = useChatStore.getState().compact[activeSessionId]
+    if (cur?.visible) {
+      useChatStore.getState().setCompact(activeSessionId, { ...cur, visible: false, status: 'canceled' })
     }
     try {
       await chatApi.cancel(activeSessionId)
@@ -1666,9 +1677,10 @@ function App() {
             <RetryBanner attempt={retry.attempt} maxRetries={retry.maxRetries} retryDelayMs={retry.retryDelayMs} onClose={() => setRetry(null)} />
           </div>
         )}
-        <TokenWarningBanner />
+        {/* 上下文告警 / 压缩进度横幅：均按【当前活动会话】取那一份（多会话并行不串台） */}
+        <TokenWarningBanner sessionId={activeSessionId} />
         {/* 压缩进度横幅（/compact 命令触发 · 输入框上方 · compact-progress 事件驱动；发送键压缩中变停止） */}
-        <CompactProgressBar />
+        <CompactProgressBar sessionId={activeSessionId} />
         <NotificationBanner />
         {/* 轨迹视图只查看，不展示对话输入框 */}
         {/* 发送键 ⇄ 停止键切换用 turnRunning（activeStreams 登记 = turn 运行中，含 thinking/重试期；

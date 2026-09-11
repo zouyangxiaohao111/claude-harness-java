@@ -1,4 +1,4 @@
-import { useChatStore } from '@/stores/chatStore'
+import { useChatStore, selectCompact } from '@/stores/chatStore'
 
 /** hooks_start 阶段文案（可选副提示 · 对齐 CC REPL spinner：Running PreCompact hooks… 等） */
 const HOOK_LABEL: Record<string, string> = {
@@ -10,16 +10,21 @@ const HOOK_LABEL: Record<string, string> = {
 /**
  * 上下文压缩进度横幅（输入框上方 · STOMP compact-progress 事件驱动 · 贴合 TokenWarningBanner 暖橙族）。
  *
- * <p>状态（chatStore.compact，useChatSocket 归一）：<ul>
+ * <p>状态（chatStore.compact[sessionId]，useChatSocket 归一）：<ul>
  *   <li>compact_start → running，pct 起步 8%；</li>
  *   <li>compact_progress{chars} → 摘要流式推进（封顶 90%）；hooks_start 切阶段文案；</li>
  *   <li>compact_end → done（100% 绿，短暂后由 useChatSocket 定时隐藏）；</li>
  *   <li>canceled → 手动停止（Composer 发送键压缩中变停止 / Esc，见 Composer）。</li>
  * </ul>
  * 停止能力共用输入框<b>发送键</b>（压缩中发送键变停止方块）——本横幅不含独立停止钮。
+ *
+ * <p>[多会话隔离 2026-09-11] <b>只渲染传入会话（当前活动会话）的那一份进度</b>：后端 compact-progress
+ * 是会话级 topic，本仓多会话并行 —— 若读全局单对象，A 压缩中切到 B 时 B 会显示 A 的进度（并让 B 的
+ * 发送键变停止、取消到 B）。sessionId=null（无活动会话）→ 不渲染。
  */
-export function CompactProgressBar() {
-  const compact = useChatStore((s) => s.compact)
+export function CompactProgressBar({ sessionId }: { sessionId: string | null }) {
+  // 键不存在 → EMPTY_COMPACT（稳定引用）→ visible=false 不渲染
+  const compact = useChatStore(selectCompact(sessionId))
   if (!compact.visible) return null
 
   const isDone = compact.status === 'done'

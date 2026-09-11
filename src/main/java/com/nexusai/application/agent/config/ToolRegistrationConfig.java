@@ -2194,7 +2194,10 @@ public class ToolRegistrationConfig {
      * @param skillCatalog     skill 目录（manual defaultAssemble 的 session_guidance 子弹；
      *                         对齐 LlmAgentLoop.buildSystemPromptAssemblyInput:2079）
      * @param messageService   /compact 结果落库通道（null → 回落 AgentState 已武装的
-     *                         compactPersistListener；两者皆无 → fail-loud 仅内存替换）
+     *                         compactPersistListener；两者皆无 → fail-loud 仅内存替换）·
+     *                         [compact-idle-rebuild] 同时是空闲会话 state 重建的消息源
+     *                         （registry miss → {@link #rebuildIdleStateFromDb}；null → 无法重建，
+     *                         维持「会话未注册 AgentState」fail-loud）
      */
     private String handleCompactCommand(String args,
                                         SessionAgentStateRegistry sessionRegistry,
@@ -2228,10 +2231,26 @@ public class ToolRegistrationConfig {
         }
         // [session-id-short] rawSessionId 已 short 直键 registry（不再 parseSessionUuid）
         AgentState state = sessionRegistry == null ? null : sessionRegistry.get(rawSessionId);
+        // ── 2.5 [compact-idle-rebuild] 空闲/未注册会话 state 重建 ──
+        // CC 的 REPL 恒持有 messages（compact/index.ts → compact.ts:44 `let { messages } = context`），
+        // 故 CC 的 /compact 任何时刻（含空闲会话）都能压。本仓 AgentState 只在主循环在跑时注册
+        // （LlmAgentLoop.run 入口 :2454），空闲会话 registry miss → 旧实现直接 bail（"什么都不做"）。
+        // 此处按 loop 同款「从 DB 重建」手法（listBySession → listForResumeExcluding 中断语义漏斗 →
+        // appendMessage 注灌，逐字复用 LlmAgentLoop:2385/2402-2420 与 PartialCompactService:224
+        // 的既有重建路径）造一个**一次性临时 state** 供本次压缩使用。
+        // 不注册进 registry 的理由（默认不注册，见 rebuildIdleStateFromDb javadoc）：临时 state 无
+        // 生命周期所有者，注册后既会与在飞主循环的 live state 互相覆盖，又无回收点（会话删除才清）。
+        boolean stateRebuiltFromDb = false;
         if (state == null) {
-            log.warn("[R1] /compact 会话未注册 AgentState: sessionId={}（LlmAgentLoop 主会话入口才注册，"
-                    + "LlmAgentLoop.java:1543）", rawSessionId);
-            return "/compact 会话未注册 AgentState（无进行中循环）。";
+            state = rebuildIdleStateFromDb(rawSessionId, messageService);
+            stateRebuiltFromDb = state != null;
+        }
+        if (state == null) {
+            log.warn("[R1] /compact 会话未注册 AgentState 且无法从 DB 重建: sessionId={}"
+                    + "（LlmAgentLoop 主会话入口才注册，LlmAgentLoop.java:2454；重建需注入 MessageService 且会话存在）",
+                rawSessionId);
+            return "/compact 会话未注册 AgentState（无进行中循环），且无法从历史重建"
+                + "（messageService 未注入或会话不存在）。";
         }
         String sessionId = state.sessionId() != null ? state.sessionId() : rawSessionId;
         String agentId = state.agentId() != null ? state.agentId().toString() : null;
@@ -2330,6 +2349,11 @@ public class ToolRegistrationConfig {
             String displayText = (result.displayText() != null && !result.displayText().isBlank())
                 ? result.displayText()
                 : "/compact 压缩完成（无 displayText）。";
+            // [compact-idle-rebuild] 用户可见说明：本次不是对 live 主循环 state 压缩，而是从 DB 历史
+            //   重建后压缩（用户应知道「该会话当时没有在跑的循环」这一事实，不谎报为常规压缩）。
+            if (stateRebuiltFromDb) {
+                displayText = displayText + INFO_REBUILT_FROM_DB;
+            }
             // fail-loud（规则十二）：未落库时在用户可见文本里明示，绝不静默当成功
             return switch (applyOutcome) {
                 case PERSISTED -> displayText;
@@ -2356,6 +2380,108 @@ public class ToolRegistrationConfig {
             // [RES-C2] R5-4：manual provider 生命周期终结（close 幂等）
             manualProvider.close();
         }
+    }
+
+    /** [compact-idle-rebuild] 空闲会话从历史重建后压缩的用户可见补充说明（成功路径追加）。 */
+    static final String INFO_REBUILT_FROM_DB =
+        "\nℹ 该会话当前没有进行中的循环，已从历史消息重建上下文后完成压缩。";
+
+    /**
+     * [compact-idle-rebuild] 空闲/未注册会话的 AgentState <b>一次性临时重建</b>。
+     *
+     * <h2>WHY（要修的缺陷）</h2>
+     * {@code /compact} 在空闲会话上恒报「会话未注册 AgentState（无进行中循环）」并直接 bail —— 不压缩、
+     * 不落库。根因：本仓 {@code AgentState} 只由 {@code LlmAgentLoop.run} 主会话入口注册
+     * （{@code LlmAgentLoop:2454}），空闲会话 registry miss；而 CC 的 REPL <b>恒持有 messages</b>
+     * （{@code compact.ts:44} {@code let { messages } = context}）→ CC 的 {@code /compact} 任何时刻都能压。
+     * 本方法补齐「空闲会话从 DB 取回消息」这一步，使 manual {@code /compact} 与 CC 语义对齐。
+     *
+     * <h2>复用的既有重建手法（不新造）</h2>
+     * 与 {@code LlmAgentLoop.doRun} 的 DB 历史注入块（{@code LlmAgentLoop:2385} 读
+     * {@code listBySession} → {@code :2402} 经 {@code listForResumeExcluding(raw, streamUserMessageId)}
+     * 派生 → {@code :2419} 逐条 {@code state.appendMessage}）<b>逐字同源</b>；同为「loop 外续聊加载历史
+     * 通道」的 {@code PartialCompactService:224} 也消费同一 {@code listForResume} 漏斗（其 javadoc
+     * 明列恢复通道消费点：ChatController background / PartialCompactService / AwaySummaryController）。
+     * 漏斗内建中断语义（未配对 tool_use 剥离 / 孤立 thinking 剥离 / 纯空白 assistant 剥离 /
+     * {@code detectTurnInterruption} + "Continue" sentinel），因此重建产物 = CC「resume 后 REPL 内存
+     * messages」的等价物，正是 CC {@code /compact} 的输入形态。
+     *
+     * <h2>在途命令行的排除（CC 对齐）</h2>
+     * {@code ChatController.send → MessageService.createUserMessage}（{@code ChatController:149}）在命令
+     * dispatch <b>之前</b>已把 {@code /compact} 这行 user 消息落库，并经
+     * {@code ChatService.processUserMessage:624} 把它作为 {@code RequestContext.requestId()} 带下来。
+     * CC 侧 {@code /compact} 的 userMessage 是在<b>压缩完成之后</b>才拼进 {@code messagesToKeep}
+     * （{@code processSlashCommand.tsx:859} 创建、{@code :883-895} 追加）→ 压缩输入不含自身。故此处
+     * 同样排除它（连同其触发的 INTERRUPTED_PROMPT "Continue" sentinel 一起消失）。
+     * <b>守卫</b>：仅当 {@code requestId} 恰为<b>本转录末条消息 id</b> 时才排除 —— 防跨请求残留 reqId
+     * 误删真实历史；{@code CommandController.executeCompactBuiltin} 直调路径（{@code ?sessionId=}）
+     * 不落该行、requestId 亦非它 → 不退化为排除，语义与 CC 一致。
+     *
+     * <h2>是否注册进 {@link SessionAgentStateRegistry}：<b>不注册</b></h2>
+     * <ul>
+     *   <li><b>会互相覆盖</b>：同一 short sessionId 键位被 live 主循环占用时，注册即覆盖在飞 run 的
+     *       AgentState（该 state 承载 {@code invokedSkills} / {@code budgetTracker} / 权限上下文，
+     *       是 SkillTool 写侧、{@code WebSocketPermissionPrompter}、{@code PartialCompactService}
+     *       的解析目标）→ 会把一个「非运行态、无 ToolUseContext、无模型信息」的空壳暴露给这些读侧。</li>
+     *   <li><b>无生命周期所有者</b>：唯一回收点是 {@code removeBySessionId}（会话删除，
+     *       {@code SessionService.delete} 接线）。注册即产生「每次空闲 /compact 泄漏一个 state」
+     *       的无界累积（含全量消息历史，是 registry javadoc 自称泄漏量最大的对象）。</li>
+     *   <li><b>不需要</b>：本 state 只服务本次压缩的三处消费（{@code ctx.messages()} 输入、
+     *       {@code applyResultToState} 的落库/内存写回、{@code currentToolUseContext/systemPrompt/
+     *       appendSystemPrompt} 三个 null-safe 原料），全部在同一次调用内闭合；压缩结束即无需再被寻址。
+     *       {@code CompactCommand.setSessionAgentStateRegistry(sessionRegistry)} 仍传<b>真实</b> registry
+     *       → invoked_skills 重注入按 sessionId 解析 miss（null-safe 跳过），不会取到本临时 state。</li>
+     * </ul>
+     *
+     * @param rawSessionId 会话 DB 键（short 形态 sess-xxx）
+     * @param messageService DB 消息读取通道（生产 @Bean；null → 无法重建，返回 null）
+     * @return 临时 AgentState（messages = 漏斗后的历史；空会话 = 0 条消息的合法 state）；
+     *         读取失败 / 通道缺失 → null（调用方 fail-loud 报「无法从历史重建」）
+     */
+    AgentState rebuildIdleStateFromDb(String rawSessionId,
+                                      com.nexusai.domain.session.MessageService messageService) {
+        if (messageService == null || rawSessionId == null || rawSessionId.isBlank()) {
+            return null;
+        }
+        List<com.nexusai.model.session.dto.ChatMessageDto> raw;
+        try {
+            // 与 LlmAgentLoop:2385 同源：一次性读原始转录（seq ASC），后续在内存派生（不重复查库）。
+            raw = messageService.listBySession(rawSessionId);
+        } catch (Exception e) {
+            // best-effort：会话不存在（NotFoundException）或 DB 抖动 → 无法重建，交调用方 fail-loud
+            log.warn("[R1] /compact 空闲会话历史读取失败（无法重建 state）: session={} err={}",
+                rawSessionId, e.toString());
+            return null;
+        }
+        if (raw == null) {
+            raw = List.of();
+        }
+        // 在途 /compact 行排除（守卫：仅当 requestId 就是本转录末条消息 id —— 见 javadoc）
+        String excludeId = null;
+        if (!raw.isEmpty()) {
+            com.nexusai.model.session.dto.ChatMessageDto tail = raw.get(raw.size() - 1);
+            String inFlightUserMessageId = RequestContext.requestId();
+            if (tail != null && inFlightUserMessageId != null
+                    && inFlightUserMessageId.equals(tail.id())) {
+                excludeId = inFlightUserMessageId;
+            }
+        }
+        List<com.nexusai.model.session.dto.ChatMessageDto> history =
+            messageService.listForResumeExcluding(raw, excludeId);
+        AgentState rebuilt = new AgentState(null, rawSessionId, (java.util.UUID) null);
+        if (history != null) {
+            // 与 LlmAgentLoop:2419 同源：逐条 appendMessage 注入（临时 state 未武装 appendListener
+            // → 不触发任何落库/STOMP，纯内存注灌）。
+            for (com.nexusai.model.session.dto.ChatMessageDto m : history) {
+                if (m != null) {
+                    rebuilt.appendMessage(m);
+                }
+            }
+        }
+        log.info("[R1] /compact 空闲会话 AgentState 已从 DB 历史重建: session={} 历史 {} 条"
+                + "（raw={} 排除在途={}；对齐 CC REPL 恒持 messages，compact.ts:44）",
+            rawSessionId, rebuilt.messages().size(), raw.size(), excludeId != null);
+        return rebuilt;
     }
 
     /**

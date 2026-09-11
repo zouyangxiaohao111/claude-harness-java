@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry } from '../api/types'
 import type { SessionFile } from '../types'
+import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
 
 // ── [有界窗口] messages[sessionId] 硬顶（治内存：WebView2 renderer 实测涨到 1.2GB）──
 // 根因：原实现 messages 只增不减 —— finalizeBlocks / appendMetaUser / addToolUseSummary /
@@ -117,10 +118,14 @@ export interface ChatState {
   connection: 'idle' | 'connecting' | 'connected' | 'disconnected'
   agentStatus: AgentStatus
   retry: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null
-  /** 压缩警告抑制态（token_warning 事件 · 非 null 且 !suppressed 时显示横幅） */
-  tokenWarning: TokenWarningEvent | null
-  /** 压缩进度 UI 态（compact-progress 事件归一 · 驱动输入框上方 CompactProgressBar + Composer 发送键变停止） */
-  compact: { visible: boolean; status: 'running' | 'done' | 'canceled'; hookType?: string; pct: number }
+  /** [按会话键控] 压缩警告（sessionId -> token_warning 事件 · 键不存在 = 该会话无警告）。
+   *  后端推的是会话级 topic（/topic/sessions/{sid}/token-warning）→ 原全局单字段会让 A 会话的
+   *  上下文告警出现在 B（切会话无清理）。读取侧一律取【当前会话】那一份（selectTokenWarning）。 */
+  tokenWarning: Record<string, TokenWarningEvent>
+  /** [按会话键控] 压缩进度 UI 态（sessionId -> 进度 · 驱动该会话的 CompactProgressBar + Composer 发送键变停止）。
+   *  同 tokenWarning：后端 compact-progress 是会话级 topic，本仓多会话并行 → 必须按键隔离，
+   *  否则「A 压缩中切到 B」会显示 A 的进度、并把 B 的发送键变成停止（取消错会话）。 */
+  compact: Record<string, CompactUiState>
   /** 会话 API 错误（message.error → 对话流错误卡 · key=sessionId） */
   apiErrors: Record<string, ApiFlowError[]>
   // actions
@@ -183,9 +188,13 @@ export interface ChatState {
   dequeuePermission: (requestId: string) => void
   expirePermission: (sessionId: string, requestId: string) => void
   setRetry: (r: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null) => void
-  setTokenWarning: (w: TokenWarningEvent | null) => void
-  /** 压缩进度 UI 态更新（compact-progress 事件归一写入；visible=false 隐藏横幅/恢复发送键） */
-  setCompact: (c: { visible: boolean; status?: 'running' | 'done' | 'canceled'; hookType?: string; pct?: number }) => void
+  /** 更新某会话的压缩警告（null = 清除该会话警告）；只影响该 sessionId 的键。 */
+  setTokenWarning: (sessionId: string, w: TokenWarningEvent | null) => void
+  /** 更新某会话的压缩进度 UI 态（compact-progress 事件经 reduceCompactTable 归一出完整状态后写入该会话的键；
+   *  传 visible=false 隐藏横幅/恢复发送键）。 */
+  setCompact: (sessionId: string, c: CompactUiState) => void
+  /** 删除某会话的压缩进度键（完成态渐隐到期 / 删会话 · 不留残留键）。读取侧自动回落 EMPTY_COMPACT。 */
+  clearCompact: (sessionId: string) => void
   /** message.error → 记录会话 API 错误（对话流错误卡） */
   addApiError: (sessionId: string, err: ApiFlowError) => void
   /** 清空会话 API 错误（新 user 消息发送时调用 · 错误卡属上一轮） */
@@ -227,8 +236,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   connection: 'idle',
   agentStatus: 'idle',
   retry: null,
-  tokenWarning: null,
-  compact: { visible: false, status: 'running', pct: 0 },
+  tokenWarning: {},   // [按会话键控] sessionId -> token_warning（键不存在 = 无警告）
+  compact: {},        // [按会话键控] sessionId -> 压缩进度（键不存在 = 该会话无在飞压缩）
   apiErrors: {},
   setSessions: (sessions) => set({ sessions }),
   setChangedFiles: (sessionId, files) => set((st) => ({
@@ -313,6 +322,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const snippedIds = { ...st.snippedIds }
     const streamTicks = { ...st.streamTicks }
     const extendedWindow = { ...st.extendedWindow }
+    // [按会话键控] 压缩进度 / 压缩警告也是会话级键：删会话一并释放（否则该键永不再被读，纯残留）
+    const compact = { ...st.compact }
+    const tokenWarning = { ...st.tokenWarning }
     delete messages[sessionId]
     delete streams[sessionId]
     delete streamOrder[sessionId]
@@ -325,7 +337,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     delete snippedIds[sessionId]
     delete streamTicks[sessionId]
     delete extendedWindow[sessionId]
-    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, extendedWindow }
+    delete compact[sessionId]
+    delete tokenWarning[sessionId]
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, extendedWindow, compact, tokenWarning }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
@@ -500,15 +514,23 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
   }),
   setRetry: (retry) => set({ retry }),
-  setTokenWarning: (tokenWarning) => set({ tokenWarning }),
-  setCompact: (c) => set((st) => ({
-    compact: {
-      visible: c.visible,
-      status: c.status ?? st.compact.status,
-      hookType: c.hookType ?? st.compact.hookType,
-      pct: c.pct ?? st.compact.pct,
-    },
+  // [按会话键控] 只写该 sessionId 的键，绝不触碰其它会话的那一份（多会话并行各自独立）
+  setTokenWarning: (sessionId, w) => set((st) => {
+    const tokenWarning = { ...st.tokenWarning }
+    if (w == null) delete tokenWarning[sessionId]
+    else tokenWarning[sessionId] = w
+    return { tokenWarning }
+  }),
+  // [按会话键控] 整表写入该会话的进度态（由 reduceCompactEvent 产出完整状态 → 不做字段级 ?? 合并，
+  //   避免「compact_start 想清掉上一阶段 hookType 却被 ?? 保留」的歧义）
+  setCompact: (sessionId, c) => set((st) => ({
+    compact: { ...st.compact, [sessionId]: c },
   })),
+  clearCompact: (sessionId) => set((st) => {
+    if (!st.compact[sessionId]) return st
+    const { [sessionId]: _drop, ...rest } = st.compact
+    return { compact: rest }
+  }),
   addApiError: (sessionId, err) => set((st) => ({
     apiErrors: { ...st.apiErrors, [sessionId]: [...(st.apiErrors[sessionId] ?? []), err] },
   })),
@@ -620,4 +642,25 @@ export function selectStreamIds(sessionId: string | null): (s: ChatState) => str
  */
 export function selectStreamBlock(sessionId: string | null, blockId: string | null): (s: ChatState) => StreamBlock | undefined {
   return (s) => (sessionId && blockId ? s.streams[sessionId]?.find((b) => b.assistantMessageId === blockId) : undefined)
+}
+
+// ── [多会话隔离 2026-09-11] 会话级 UI 态（压缩进度 / 压缩警告）按 sid 读取 ──
+// 渲染侧唯一入口：只读【当前活动会话】的那一份，键不存在回落稳定空态（EMPTY_COMPACT / null）。
+// WHY 强制走访问器：直接读 s.compact / s.tokenWarning 会拿到整张表，任何「忘了按会话过滤」的写法
+//   都会复现原全局单例 bug（A 的进度/告警出现在 B）。
+
+/**
+ * 订阅「某会话的压缩进度 UI 态」。键不存在 → EMPTY_COMPACT（模块级同引用，避免无谓重渲）。
+ * 用法：`useChatStore(selectCompact(activeSessionId))`；`compact.visible` 才渲染横幅。
+ */
+export function selectCompact(sessionId: string | null | undefined): (s: ChatState) => CompactUiState {
+  return (s) => (sessionId ? (s.compact[sessionId] ?? EMPTY_COMPACT) : EMPTY_COMPACT)
+}
+
+/**
+ * 订阅「某会话的压缩警告」。键不存在 → null（该会话无警告）。
+ * 用法：`useChatStore(selectTokenWarning(activeSessionId))`。
+ */
+export function selectTokenWarning(sessionId: string | null | undefined): (s: ChatState) => TokenWarningEvent | null {
+  return (s) => (sessionId ? (s.tokenWarning[sessionId] ?? null) : null)
 }

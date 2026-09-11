@@ -10,6 +10,7 @@ import type { SessionFile } from '../types'
 import { useTeamStore } from '../stores/teamStore'
 import { useTodoStore } from '../stores/todoStore'
 import { teamsApi } from '../api/teams'
+import { EMPTY_COMPACT_TABLE, dropCompactSession, isCompactCanceled, reduceCompactTable, type CompactProgressWire, type CompactTable } from '../utils/compactProgress'
 
 /** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
  *  notifier.markFrameDirty：N 次 markDirty 折叠为一次动画帧 flush，通知推迟到下一帧）。
@@ -229,33 +230,38 @@ export function useChatSocket(
   const sessionIdRef = useRef(sessionId)
   sessionIdRef.current = sessionId
 
-  // ── 压缩进度事件归一（compact-progress STOMP → chatStore.compact UI 态）──
-  const compactFirstCharsRef = useRef<number | null>(null)
-  const compactPctRef = useRef(0)
-  const compactDoneTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  function handleCompactEvent(raw: { type?: string; hookType?: string; chars?: number }) {
+  // ── 压缩进度事件归一（compact-progress STOMP → chatStore.compact[sid] UI 态）──
+  // [多会话隔离 2026-09-11] 累加器（firstChars/pct）与「完成态渐隐」定时器**按会话各一份**：
+  //   原实现是应用级单值/单定时器（App 只调一次本 hook）→ 两会话并发压缩时 B 的首帧 chars 覆盖
+  //   A 的差分基准（A 的百分比跳变）、且任一事件的「先 clear 定时器」会把另一会话的渐隐定时器掐掉。
+  //   键 = sessionId：表（ui+accs）由纯函数 reduceCompactTable 按 sid 变换，store 只镜像 ui 部分。
+  const compactTableRef = useRef<CompactTable>(EMPTY_COMPACT_TABLE)
+  const compactDoneTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  function handleCompactEvent(sid: string, raw: CompactProgressWire) {
+    if (!sid) return
     const st = useChatStore.getState()
-    if (compactDoneTimer.current) { clearTimeout(compactDoneTimer.current); compactDoneTimer.current = null }
-    if (raw.type === 'compact_start') {
-      // 摘要请求前 → 进度条起步 8%（后端可中断 + 进度推送已就绪）
-      compactFirstCharsRef.current = null; compactPctRef.current = 8
-      st.setCompact({ visible: true, status: 'running', hookType: undefined, pct: 8 })
-    } else if (raw.type === 'hooks_start') {
-      st.setCompact({ visible: true, status: 'running', hookType: raw.hookType })
-    } else if (raw.type === 'compact_progress') {
-      // 摘要流式已收字符（Java 扩展）→ 差分推进度（无总量：封顶 90%，compact_end 才 100）
-      const chars = typeof raw.chars === 'number' ? raw.chars : 0
-      if (compactFirstCharsRef.current == null) compactFirstCharsRef.current = chars
-      const delta = chars - compactFirstCharsRef.current
-      compactPctRef.current = Math.min(90, 8 + Math.max(0, Math.floor((delta / 8000) * 82)))
-      st.setCompact({ visible: true, status: 'running', hookType: undefined, pct: compactPctRef.current })
-    } else if (raw.type === 'compact_end') {
-      // finally（无论成败）→ 100% + 短暂完成态后隐藏（横幅渐隐、发送键复原）
-      st.setCompact({ visible: true, status: 'done', hookType: undefined, pct: 100 })
-      compactDoneTimer.current = setTimeout(() => {
-        st.setCompact({ visible: false, status: 'running', hookType: undefined, pct: 0 })
-        compactFirstCharsRef.current = null; compactPctRef.current = 0
-      }, 900)
+    // 只清【本会话】的待定渐隐定时器（别的会话的压缩不受影响）
+    const pending = compactDoneTimersRef.current.get(sid)
+    if (pending != null) { clearTimeout(pending); compactDoneTimersRef.current.delete(sid) }
+    // [停止键收口] 用户已显式取消该会话的压缩（App.stopStreaming → 该会话进度态置 status='canceled'）：
+    //   后端 finally 仍会推 compact_end —— 不能再让横幅弹回「压缩完成」（取消后 0.9s 的完成态自相矛盾）。
+    if (raw.type === 'compact_end' && isCompactCanceled(st.compact[sid])) {
+      compactTableRef.current = dropCompactSession(compactTableRef.current, sid)
+      st.clearCompact(sid)   // 删键收尾（取消时已置 visible=false）→ 读取侧回落 EMPTY_COMPACT
+      return
+    }
+    const { table, changed, hideAfterMs } = reduceCompactTable(compactTableRef.current, sid, raw)
+    compactTableRef.current = table
+    // 未知子类型（changed=false）→ 不写 store（避免空事件把进度态刷成缺省）
+    if (!changed) return
+    st.setCompact(sid, table.ui[sid])
+    if (hideAfterMs != null) {
+      compactDoneTimersRef.current.set(sid, setTimeout(() => {
+        compactDoneTimersRef.current.delete(sid)
+        // 删除该会话的键（ui + 累加器）→ 读取侧回落 EMPTY_COMPACT（横幅消失、发送键复原），不留残留
+        compactTableRef.current = dropCompactSession(compactTableRef.current, sid)
+        useChatStore.getState().clearCompact(sid)
+      }, hideAfterMs))
     }
   }
 
@@ -306,10 +312,12 @@ export function useChatSocket(
       let raw: Record<string, unknown>
       try { raw = JSON.parse(msg.body) } catch { return }
       const st = useChatStore.getState()
+      // [按会话键控] 告警写入本订阅所属会话（topic 即 /topic/sessions/{sid}/...）——
+      //   原实现写全局单字段 → A 会话告警出现在 B，且切会话无清理。
       if (raw.suppressed) {
-        st.setTokenWarning(null)
+        st.setTokenWarning(sid, null)
       } else {
-        st.setTokenWarning({
+        st.setTokenWarning(sid, {
           type: 'token_warning', sessionId: sid, suppressed: false,
           tokenUsage: raw.tokenUsage as number | undefined,
           contextWindow: raw.contextWindow as number | undefined,
@@ -321,7 +329,9 @@ export function useChatSocket(
     const compact = client.subscribe(`/topic/sessions/${sid}/compact-progress`, (msg) => {
       let raw: Record<string, unknown>
       try { raw = JSON.parse(msg.body) } catch { return }
-      handleCompactEvent(raw as { type?: string; hookType?: string; chars?: number })
+      // [透传 sid] 订阅闭包里的 sid 即事件归属会话 —— 原实现把 raw 交给无 sid 的 handler，
+      //   任何会话的事件都写进同一个全局对象（切会话后 B 显示 A 的进度）。
+      handleCompactEvent(sid, raw as CompactProgressWire)
     })
     const queue = client.subscribe(`/topic/sessions/${sid}/queue`, (msg) => {
       let raw: Record<string, unknown>
@@ -442,6 +452,10 @@ export function useChatSocket(
       teamLeadSubsRef.current = null
       for (const sub of statusSubsRef.current.values()) sub.unsubscribe()
       statusSubsRef.current.clear()
+      // [多会话隔离] 压缩进度表（ui+累加器）/ 渐隐定时器随 hook 卸载整体释放（每会话一份 → 逐个清）
+      for (const t of compactDoneTimersRef.current.values()) clearTimeout(t)
+      compactDoneTimersRef.current.clear()
+      compactTableRef.current = EMPTY_COMPACT_TABLE
       void client.deactivate()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -784,8 +798,13 @@ export function useChatSocket(
       const status = raw === 'thinking' || raw === 'streaming' ? raw : 'idle'
       st.setAgentStatus(status)
     } else if (isTokenWarning(evt)) {
-      // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 隐藏；false（新压缩）→ 恢复显示
-      st.setTokenWarning(evt.suppressed ? null : evt)
+      // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 隐藏；false（新压缩）→ 恢复显示。
+      // [按会话键控] 归属会话优先取事件自带 sessionId，兜底当前会话 ref（不用闭包 sessionId ——
+      //   mount 期建立的订阅闭包拿的是首渲染值）；都取不到 → 丢弃（不写空键污染 map）。
+      //   常态通道是会话级 topic（subscribeSessionLevel 的 /token-warning），本分支是 stream/status
+      //   topic 兜底，二者写同一会话的键 → 幂等。
+      const twSid = evt.sessionId ?? sessionIdRef.current
+      if (twSid) st.setTokenWarning(twSid, evt.suppressed ? null : evt)
     } else if (evt.type === 'session.title') {
       // 会话标题生成完成（后端 maybeGenerateTitle 推送）→ 同步会话列表 title
       const title = (evt as SessionTitleEvent).title

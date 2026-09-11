@@ -27,6 +27,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -101,6 +102,10 @@ class PartialCompactServiceTest {
     @AfterEach
     void tearDown() {
         RequestContext.clear();
+        // [partial-progress] 统一通道静态槽位复位（用例失败/中断时防跨用例串台）· 幂等
+        CompactProgressState.clear();
+        CompactProgressState.clearAbort();
+        CompactProgressState.removeSessionAbort(SESSION);
     }
 
     @Test
@@ -510,6 +515,154 @@ class PartialCompactServiceTest {
             .filter(m -> "invoked_skills".equals(m.subtype()))
             .findFirst().orElseThrow();
         assertThat(skillMsg.content()).contains("调研工具").contains("invoked_skills");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [partial-compact-progress 2026-09-11] 统一压缩进度/可中断通道
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * partial 压缩进度经统一通道推 STOMP · {@code /topic/sessions/{sid}/compact-progress}。
+     *
+     * <p><b>WHY（修复的缺陷）</b>：partial 原先在 {@code buildContext} 内
+     * {@code cc.setOnCompactProgress(event -> log.info(...))} —— 进度事件只进日志、不进 STOMP。
+     * {@link PartialCompactConversation} 确实全链 emit（PRE_COMPACT/CompactStart/SESSION_START/
+     * POST_COMPACT/CompactEnd），但 sink 被覆写成日志 → 前端订阅的 topic 恒无消息 → 用户在消息
+     * 选择器触发 partial 压缩后几十秒内看不到任何进度（不知道在压缩、也不知道进度）。本用例锁定
+     * <b>意图</b>（事件真的到达前端 topic · 与 manual/auto 同一条统一通道），而非仅仅「回调被调用」。
+     *
+     * <p><b>RED 条件（mutation 自证）</b>：把 {@code partialCompact} 内
+     * {@code registerProgressChannel(sessionId, compactAbort)} 删回「只 log」
+     * （并在 {@code buildContext} 恢复 {@code cc.setOnCompactProgress(log)}）→
+     * {@code wsTemplate.convertAndSend} 零调用 → 本用例第一/三条断言红。
+     */
+    @Test
+    @DisplayName("[partial-progress] 进度事件推 /topic/sessions/{sid}/compact-progress（前端横幅源 · 同 manual/auto 统一通道）")
+    void partialProgress_pushedToSessionTopic() {
+        MessageService messageService = mock(MessageService.class);
+        SessionService sessionService = mock(SessionService.class);
+        StreamCompactSummary summary = mock(StreamCompactSummary.class);
+        when(messageService.listForResume(anyString())).thenReturn(fourMessages());
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
+            .thenAnswer(inv -> inv.getArgument(1));
+        when(summary.summarize(anyString(), anyList()))
+            .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
+        PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
+
+        SimpMessagingTemplate wsTemplate = mock(SimpMessagingTemplate.class);
+        List<String> topics = new ArrayList<>();
+        List<Object> payloads = new ArrayList<>();
+        List<Boolean> sinkRegisteredAtPush = new ArrayList<>();
+        // 每次推送记录主题 + 载荷 + 「该线程 ThreadLocal 注册是否在飞」——证明推送出自本 REST 线程
+        // 注册的统一通道（而非其它路径），且注册在压缩期间真实生效（不是事后补发）。
+        org.mockito.Mockito.doAnswer(inv -> {
+            topics.add(inv.getArgument(0));
+            payloads.add(inv.getArgument(1));
+            sinkRegisteredAtPush.add(CompactProgressState.current() != null);
+            return null;
+        }).when(wsTemplate).convertAndSend(anyString(), org.mockito.ArgumentMatchers.any(Object.class));
+        svc.setWsTemplate(wsTemplate);
+
+        svc.partialCompact(SESSION,
+            new PartialCompactRequest("u1", PartialCompactRequest.Direction.FROM, null));
+
+        assertThat(topics).as("进度事件全部推到会话级 compact-progress topic（与 CompactProgressState.topic 同源）")
+            .isNotEmpty()
+            .allMatch("/topic/sessions/s1/compact-progress"::equals);
+        assertThat(sinkRegisteredAtPush).as("推送发生在 ThreadLocal 注册在飞期间（非事后补发）")
+            .containsOnly(true);
+        List<String> types = payloads.stream()
+            .map(p -> ((com.fasterxml.jackson.databind.node.ObjectNode) p).path("type").asText())
+            .toList();
+        assertThat(types).as("单流程 5 事件全到前端（CC CompactProgressEvent union）")
+            .containsExactly("hooks_start", "compact_start", "hooks_start", "hooks_start", "compact_end");
+        List<String> hookTypes = payloads.stream()
+            .map(p -> ((com.fasterxml.jackson.databind.node.ObjectNode) p).path("hookType").asText())
+            .filter(s -> !s.isEmpty())
+            .toList();
+        assertThat(hookTypes).as("hooks_start 三类齐全（pre/post/session_start）")
+            .contains("pre_compact", "session_start", "post_compact");
+    }
+
+    /**
+     * 注册/清理<b>成对</b>：partial 调用结束（成功/业务失败/异常三路）不留 ThreadLocal / 会话级残留。
+     *
+     * <p><b>WHY</b>：partial 跑 REST 线程（每条请求都可能换线程，但容器线程复用），ThreadLocal
+     * 进度/abort 槽若不清理 → 串台到同线程的下一个请求；会话级 abort 槽不清理 → 前端「停止」
+     * 会去 abort 一个已结束的压缩（假阳性日志 + 真实 abort 丢失）。
+     *
+     * <p><b>RED 条件</b>：删去 {@code partialCompact} finally 内的三处 clear → 本用例红。
+     */
+    @Test
+    @DisplayName("[partial-progress] 注册/清理成对：调用后无 ThreadLocal/会话级残留")
+    void partialProgress_channelCleanedUpAfterCall() {
+        MessageService messageService = mock(MessageService.class);
+        SessionService sessionService = mock(SessionService.class);
+        StreamCompactSummary summary = mock(StreamCompactSummary.class);
+        when(messageService.listForResume(anyString())).thenReturn(fourMessages());
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
+            .thenAnswer(inv -> inv.getArgument(1));
+        when(summary.summarize(anyString(), anyList()))
+            .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
+        PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
+        svc.setWsTemplate(mock(SimpMessagingTemplate.class));
+
+        assertThat(CompactProgressState.current()).as("前置：无残留").isNull();
+        svc.partialCompact(SESSION,
+            new PartialCompactRequest("u1", PartialCompactRequest.Direction.FROM, null));
+
+        assertThat(CompactProgressState.current()).as("清后 ThreadLocal 进度槽出栈").isNull();
+        assertThat(CompactProgressState.currentAbort()).as("清后 ThreadLocal abort 槽出栈（摘要断流源不复用）").isNull();
+        assertThat(CompactProgressState.abortForSession(SESSION)).as("清后会话级无在飞压缩可 abort").isFalse();
+    }
+
+    /**
+     * 前端「停止」<b>跨线程可达</b> REST 线程在飞 partial 压缩（会话级 abort 槽非 ThreadLocal）。
+     *
+     * <p><b>WHY（本次最关键的线程安全判断）</b>：partial 跑 REST 线程，而 cancelSession 由前端
+     * HTTP 请求线程执行（{@code ChatService:1855 abortForSession(sessionId)}）。若 abort 只登记在
+     * ThreadLocal，前端将永远打不断 REST 线程的 partial 压缩（用户按停止无效）。本用例用一个
+     * <b>真实的新线程</b>调用 {@code abortForSession}，证明会话级 ConcurrentHashMap 通道可达；
+     * 并证明 REST 线程内 {@code CompactProgressState.currentAbort()}（StreamCompactSummary 摘要
+     * 断流 supplier 的读取点）是<b>同一实例</b>且已被置位 → 摘要 provider 会硬断流。
+     *
+     * <p><b>RED 条件</b>：删去 {@code registerProgressChannel} 内
+     * {@code registerSessionAbort(sessionId, compactAbort)} → 另一线程 abortForSession 返回 false → 红。
+     */
+    @Test
+    @DisplayName("[partial-progress] 前端停止跨线程可达：另一线程 abortForSession 命中 REST 线程在飞压缩")
+    void partialAbort_reachableFromCancelThread() throws Exception {
+        MessageService messageService = mock(MessageService.class);
+        SessionService sessionService = mock(SessionService.class);
+        StreamCompactSummary summary = mock(StreamCompactSummary.class);
+        when(messageService.listForResume(anyString())).thenReturn(fourMessages());
+        when(messageService.appendPostCompactMessages(anyString(), anyList()))
+            .thenAnswer(inv -> inv.getArgument(1));
+        java.util.concurrent.atomic.AtomicReference<Boolean> crossThreadAbortHit =
+            new java.util.concurrent.atomic.AtomicReference<>(false);
+        java.util.concurrent.atomic.AtomicReference<Boolean> restThreadSawCancelled =
+            new java.util.concurrent.atomic.AtomicReference<>(false);
+        // 摘要生产在 REST 线程执行 → 借此处模拟「压缩进行中，前端从另一线程发 cancel」
+        when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
+            Thread canceller = new Thread(() ->
+                crossThreadAbortHit.set(CompactProgressState.abortForSession(SESSION)),
+                "test-cancel-thread");
+            canceller.start();
+            canceller.join(5000);
+            AbortController inFlight = CompactProgressState.currentAbort();
+            restThreadSawCancelled.set(inFlight != null && inFlight.isCancelled());
+            return new CompactConversation.SummaryResult("summary ok", null);
+        });
+        PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
+
+        svc.partialCompact(SESSION,
+            new PartialCompactRequest("u1", PartialCompactRequest.Direction.FROM, null));
+
+        assertThat(crossThreadAbortHit.get())
+            .as("另一线程（模拟前端 cancelSession）abort 命中在飞 partial 压缩").isTrue();
+        assertThat(restThreadSawCancelled.get())
+            .as("REST 线程摘要断流源（currentAbort）为同一实例且已取消").isTrue();
+        assertThat(CompactProgressState.abortForSession(SESSION)).as("收尾后无残留可 abort").isFalse();
     }
 
     /** 反射读 SystemPromptInjection 静态表当前大小（ToolRegistrationConfigCompactCloseTest 同款观察点）。 */

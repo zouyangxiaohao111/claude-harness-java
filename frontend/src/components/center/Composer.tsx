@@ -15,7 +15,7 @@ import { COMMAND_ITEMS } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
-import { useChatStore, type StreamBlock } from '@/stores/chatStore'
+import { useChatStore, selectTokenWarning, type StreamBlock } from '@/stores/chatStore'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
@@ -174,7 +174,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   //   多轮 turn 内每条 assistant message.usage 到达即实时刷新；turn 完成清流后纯 msgs 兜底。
   const msgs = useChatStore((s) => (sessionId ? (s.messages[sessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES))
   const liveBlocks = useChatStore((s) => (sessionId ? (s.streams[sessionId] ?? EMPTY_BLOCKS) : EMPTY_BLOCKS))
-  const tokenWarning = useChatStore((s) => s.tokenWarning)
+  // [按会话键控] 只取本 Composer 所属会话的那一份告警（回落上下文条用）——原读全局单字段，
+  //   会把别的会话的告警算进本会话的上下文显示
+  const tokenWarning = useChatStore(selectTokenWarning(sessionId))
   const ctxInfo = useMemo(() => {
     const scanned = [...msgs, ...liveBlocks]
     for (let i = scanned.length - 1; i >= 0; i--) {

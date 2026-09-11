@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useChatStore } from '@/stores/chatStore'
+import { useChatStore, selectTokenWarning } from '@/stores/chatStore'
 import { sessionApi } from '@/api/sessions'
 import { statsApi } from '@/api/stats'
 import type { ChatMessageDto, StatsByModel, StatsResponse } from '@/api/types'
@@ -149,7 +149,8 @@ export function UsageCostModal({
   const [tab, setTab] = useState<'usage' | 'stats'>('usage')
   const sessions = useChatStore((s) => s.sessions)
   const setSessions = useChatStore((s) => s.setSessions)
-  const tokenWarning = useChatStore((s) => s.tokenWarning)
+  // [按会话键控] 上下文条回落值只取弹窗当前展示会话的那一份（原全局单字段会串到别的会话）
+  const tokenWarning = useChatStore(selectTokenWarning(activeSessionId))
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? sessions[0] ?? null
   // 末条 assistant 消息（complete 事件透传 usage/modelUsage/上下文快照；纯思考轮 content 空但 usage 有效）
   const lastMsg = useChatStore((s) => {
