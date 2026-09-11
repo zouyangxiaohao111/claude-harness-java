@@ -352,6 +352,12 @@ public class MessageService {
             return 0L;
         }
         try {
+            // [有意**不**写 NULLS LAST] 此处裸 seq DESC 恰好是正确语义，加 NULLS LAST 反而是噪音：
+            //   本方法要的是 max(seq)，而 SQLite 视 NULL 为最小 → DESC 下 NULL 自动排最后 →
+            //   LIMIT 1 拿到的就是「该会话最大的**非 NULL** seq」（全 NULL 会话 → 拿到 NULL 行 → 回落 0，
+            //   等价无基数，见本方法上半段的状态机）。换言之「DESC + NULL 最小」已经把 NULL 排除在
+            //   max 之外，显式 NULLS LAST 不改变任何一行结果，只会让读代码的人以为这里有 NULL 兜底需求。
+            //   后来者请**不要**为「统一口径」把本行改成 SEQ_DESC_NULLS_LAST_ORDER。
             List<MessageRecord> rows = messageMapper.selectListByQuery(
                 QueryWrapper.create().eq("session_id", sessionId).orderBy("seq", false).limit(0, 1));
             if (rows != null && !rows.isEmpty() && rows.get(0) != null && rows.get(0).getSeq() != null) {

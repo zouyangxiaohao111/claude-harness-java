@@ -33,6 +33,7 @@ import com.nexusai.common.SessionKeys;
 import com.nexusai.domain.provider.ProviderService;
 import com.nexusai.domain.schedule.ScheduleService;
 import com.nexusai.domain.session.AttachmentService;
+import com.nexusai.domain.session.MessageService;
 import com.nexusai.eventbus.ws.*;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.infra.llm.LlmProvider;
@@ -2398,10 +2399,15 @@ public class ChatService {
      *   最近上下文优先；无 origin 列 → isMeta + 空 content 近似 human origin 判定）。
      */
     private String extractConversationTextTail(String sessionId) {
+        // [seq NULL 兜底] 位置序 = seq（created_at 受 compact 重挂不扰动）；ASC 侧**必须** NULLS LAST：
+        //   裸 seq ASC 下 SQLite 视 NULL 最小 → 存量 seq 为 NULL 的行（V71 触发器之前写入 / 未升级的库）
+        //   会冒充「会话最旧」挤进正文拼接的最前，把尾部 1000 字符窗口的配比带偏（脏行的位置未知，
+        //   不该占真实位置）。语义口径：ASC 侧 NULL 排**末尾**（位置未知，一律不冒充任何真实位置）。
+        //   片段自带方向，不得再叠加 .orderBy("seq", ...)；排序键仍是索引列 seq（WHY 见 SEQ_ASC_NULLS_LAST_ORDER）。
         List<MessageRecord> rows = messageMapper.selectListByQuery(
             QueryWrapper.create().where(
                 "session_id = ? AND role IN ('user', 'assistant')", sessionId)
-                .orderBy("seq", true));   // [seq 排序键] 位置序（会话正文尾部抽取；created_at 受 compact 重挂不扰动）
+                .orderByUnSafely(MessageService.SEQ_ASC_NULLS_LAST_ORDER));
         if (rows == null || rows.isEmpty()) return null;
         StringBuilder sb = new StringBuilder();
         for (MessageRecord m : rows) {
@@ -2467,12 +2473,17 @@ public class ChatService {
      *   CronIdleExecutor.java:466-473），count1 输入取错。改后恒为首条 title-worthy 用户消息。
      */
     private String extractFirstUserContent(String sessionId) {
+        // [seq NULL 兜底] 位置序 = seq；ASC 侧**必须** NULLS LAST，不能裸 seq ASC：
+        //   裸 seq ASC 下 SQLite 视 NULL 最小 → 存量 seq 为 NULL 的用户消息（V71 触发器之前写入 /
+        //   未升级的库）会被当成「首条」，而它可能根本不是第一句（位置未知）→ **标题用错消息**。
+        //   语义口径：ASC 侧 NULL 排**末尾**（位置未知，绝不冒充首条）。
+        //   片段自带方向，不得再叠加 .orderBy("seq", ...)；排序键仍是索引列 seq（WHY 见 SEQ_ASC_NULLS_LAST_ORDER）。
         List<MessageRecord> rows = messageMapper.selectListByQuery(
             QueryWrapper.create().where(
                 "session_id = ? AND role = ? AND (is_meta IS NULL OR is_meta != 1) "
                     + "AND content IS NOT NULL AND content != ''",
                 sessionId, Role.user.name())
-                .orderBy("seq", true).limit(1));   // [seq 排序键] 位置序（首条 title-worthy 用户消息）
+                .orderByUnSafely(MessageService.SEQ_ASC_NULLS_LAST_ORDER).limit(1));
         return (rows != null && !rows.isEmpty()) ? rows.get(0).getContent() : null;
     }
 
@@ -2580,9 +2591,18 @@ public class ChatService {
     }
 
     private List<ChatMessageDto> loadRecentHistory(String sessionId, int limit) {
+        // [seq NULL 兜底] 位置序 = seq（created_at 受 compact 重挂不扰动）；DESC 侧用
+        //   MessageService.SEQ_DESC_NULLS_LAST_ORDER（**不是** NULLS FIRST）。
+        //   口径：NULL 排 DESC 结果**末尾**（= 最旧那头），绝不冒充「最近」——否则脏行会顶掉真实最新那条，
+        //   本方法（末轮用户消息抽取）就会拿到一条位置未知的旧消息。
+        //   ⚠️ **本条是「语义显式化」，不是行为修复**：SQLite 视 NULL 为最小 → 裸 seq DESC 下 NULL 本来就
+        //   排在最后，二者对 SQLite 逐行等价（实测见 SeqNullsLastReadPathsRealSqliteTest）。写出来是为了
+        //   把方向钉死，防后来者「顺手统一」成 NULLS FIRST，同时与 ASC 通道共用同一套 NULLS LAST 机制。
+        //   片段自带方向（SQLite 文法要求方向在 NULLS LAST 之前），故不得再叠加 .orderBy("seq", ...)；
+        //   排序键仍是索引列 seq → 查询计划与裸 seq 完全相同（WHY 见 SEQ_DESC_NULLS_LAST_ORDER 的 javadoc）。
         List<MessageRecord> desc = messageMapper.selectListByQuery(
             QueryWrapper.create().eq("session_id", sessionId)
-                .orderBy("seq", false).limit(limit));   // [seq 排序键] 位置序（最近 N 条；created_at 受 compact 重挂不扰动）
+                .orderByUnSafely(MessageService.SEQ_DESC_NULLS_LAST_ORDER).limit(limit));
         List<MessageRecord> asc = new ArrayList<>(desc);
         Collections.reverse(asc);
         List<ChatMessageDto> result = new ArrayList<>(asc.size());

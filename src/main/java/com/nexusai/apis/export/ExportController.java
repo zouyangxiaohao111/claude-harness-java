@@ -1,6 +1,7 @@
 package com.nexusai.apis.export;
 
 import com.mybatisflex.core.query.QueryWrapper;
+import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.repository.session.entity.MessageRecord;
@@ -47,8 +48,15 @@ public class ExportController {
                                           @RequestParam(defaultValue = "md") String format) {
         log.info("[ExportController] export sessionId={} format={}", sessionId, format);
         SessionDto session = sessionService.getById(sessionId);
+        // [seq NULL 兜底] 位置序 = seq；ASC 侧**必须** NULLS LAST，不能裸 seq ASC：
+        //   裸 seq ASC 下 SQLite 视 NULL 为最小 → 存量 seq 为 NULL 的行（V71 触发器之前写入 / 未升级的库）
+        //   会冒充「会话首条」被排到导出正文最前 → 导出的 Markdown 以一条位置未知的脏行开头。
+        //   语义口径：ASC 侧 NULL 排**末尾**（位置未知，一律不冒充「会话首条」）。
+        //   片段自带方向（SQLite 文法要求方向在 NULLS LAST 之前），故不得再叠加 .orderBy("seq", ...)；
+        //   排序键仍是索引列 seq → 查询计划与裸 seq 完全相同（WHY 见 MessageService.SEQ_ASC_NULLS_LAST_ORDER）。
         List<MessageRecord> messages = messageMapper.selectListByQuery(
-                QueryWrapper.create().eq("session_id", sessionId).orderBy("seq"));   // [seq 排序键] 位置序
+                QueryWrapper.create().eq("session_id", sessionId)
+                    .orderByUnSafely(MessageService.SEQ_ASC_NULLS_LAST_ORDER));
         String body = renderMarkdown(session, messages);
         return ResponseEntity.ok()
                 .header("Content-Disposition", "attachment; filename=\"" + sessionId + "." + format + "\"")
@@ -59,8 +67,15 @@ public class ExportController {
     public Map<String, Object> copy(@PathVariable String sessionId) {
         log.info("[ExportController] copy sessionId={}", sessionId);
         SessionDto session = sessionService.getById(sessionId);
+        // [seq NULL 兜底] 位置序 = seq；ASC 侧**必须** NULLS LAST，不能裸 seq ASC：
+        //   裸 seq ASC 下 SQLite 视 NULL 为最小 → 存量 seq 为 NULL 的行（V71 触发器之前写入 / 未升级的库）
+        //   会冒充「会话首条」被排到导出正文最前 → 导出的 Markdown 以一条位置未知的脏行开头。
+        //   语义口径：ASC 侧 NULL 排**末尾**（位置未知，一律不冒充「会话首条」）。
+        //   片段自带方向（SQLite 文法要求方向在 NULLS LAST 之前），故不得再叠加 .orderBy("seq", ...)；
+        //   排序键仍是索引列 seq → 查询计划与裸 seq 完全相同（WHY 见 MessageService.SEQ_ASC_NULLS_LAST_ORDER）。
         List<MessageRecord> messages = messageMapper.selectListByQuery(
-                QueryWrapper.create().eq("session_id", sessionId).orderBy("seq"));   // [seq 排序键] 位置序
+                QueryWrapper.create().eq("session_id", sessionId)
+                    .orderByUnSafely(MessageService.SEQ_ASC_NULLS_LAST_ORDER));
         String md = renderMarkdown(session, messages);
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("sessionId", sessionId);

@@ -12,6 +12,7 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
 import com.nexusai.domain.mcp.McpServerService;
+import com.nexusai.domain.session.MessageService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.repository.session.entity.MessageRecord;
 import com.nexusai.repository.session.mapper.MessageMapper;
@@ -99,8 +100,8 @@ public class ResumeService {
      * {@code projectPath: firstMessage.cwd} —— /resume 与 session 列表用首条消息的 cwd 作
      * projectPath（V22/G13 已落 messages 表 cwd 列）。Java 端 {@code ResumeService} 恢复
      * {@code SessionCwdHolder} 需要读主会话首条消息 cwd：经本 mapper
-     * （{@code eq("session_id", sessionId).orderBy("seq", true).limit(1)}）取链首
-     * （CC firstMessage = chain[0]）。
+     * （{@code eq("session_id", sessionId).orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER).limit(1)}）取链首
+     * （CC firstMessage = chain[0]；{@code NULLS LAST} 保证链首不会是 seq 为 NULL 的存量脏行）。
      *
      * <p>setter 注入（沿用本类既有风格）：plain JUnit 缺省 null → 目录恢复跳过（软降级，
      * 不阻断 resume 主流程；CC 旧 jsonl 无 cwd 字段同容错）。生产经 Spring 注入。
@@ -510,8 +511,8 @@ public class ResumeService {
      * {@code MessageService.createUserMessage/appendMessage/replaceSessionMessages + ChatService
      * newAssistantMessage/newToolMessage} 经 {@code CwdResolution.getCwd(sessionId)} 戳入，见
      * {@code MessageRecord.cwd}）。本方法经 {@link #messageMapper} 读主会话首条消息
-     * （{@code eq("session_id", sessionId).orderBy("seq", true).limit(1)}，CC firstMessage =
-     * chain[0]）取 cwd。mapper 未注入（plain JUnit）/ 查询异常 → 软降级跳过（CC 旧 jsonl 无 cwd
+     * （{@code eq("session_id", sessionId).orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER).limit(1)}，
+     * CC firstMessage = chain[0]）取 cwd。mapper 未注入（plain JUnit）/ 查询异常 → 软降级跳过（CC 旧 jsonl 无 cwd
      * 字段容错，V22 列可空）。
      *
      * <p><b>键形态</b>：resume 以派生 UUID 为键（{@code sessionId.toString()}），与
@@ -530,10 +531,16 @@ public class ResumeService {
         }
         String sessionKey = sessionId;
         try {
-            // 首条消息 = 链首（CC firstMessage = chain[0]，sessionStorage.ts:2522/4680）
+            // 首条消息 = 链首（CC firstMessage = chain[0]，sessionStorage.ts:2522/4680）。
+            // [seq NULL 兜底] ASC 侧**必须** NULLS LAST，不能裸 seq ASC：裸 seq ASC 下 SQLite 视 NULL 最小
+            //   → seq 为 NULL 的行（V71 触发器之前写入 / 未升级的库）会被当成「链首」，其 cwd 通常也是 NULL
+            //   → 本方法取不到 firstCwd（退化为不恢复目录），更坏的情况是脏行带了一个错的 cwd →
+            //   **子代理在错误的工作目录下干活**。语义口径：ASC 侧 NULL 排**末尾**（位置未知，绝不冒充链首）。
+            //   片段自带方向（SQLite 文法要求方向在 NULLS LAST 之前），故不得再叠加 .orderBy("seq", ...)；
+            //   排序键仍是索引列 seq → 查询计划与裸 seq 完全相同（WHY 见 MessageService.SEQ_ASC_NULLS_LAST_ORDER）。
             List<MessageRecord> rows = messageMapper.selectListByQuery(
                 QueryWrapper.create().eq("session_id", sessionKey)
-                    .orderBy("seq", true).limit(1));   // [seq 排序键] 位置序（链首 = seq 最小）
+                    .orderByUnSafely(MessageService.SEQ_ASC_NULLS_LAST_ORDER).limit(1));
             if (rows == null || rows.isEmpty()) {
                 if (log.isDebugEnabled()) {
                     log.debug("[ResumeService] resume 目录恢复跳过: 会话无消息（无链首）"
