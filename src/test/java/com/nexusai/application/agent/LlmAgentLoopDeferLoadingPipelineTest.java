@@ -43,18 +43,31 @@ class LlmAgentLoopDeferLoadingPipelineTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SUPPORTED_MODEL = "claude-sonnet-4-5";
+    /** 非 anthropic 模型（openai_compatible 代理）；其名不在 tool_reference 不支持名单 → isToolSearchEnabled 单独判会为 true。 */
+    private static final String OPENAI_COMPAT_MODEL = "deepseek-v4-flash";
 
     @AfterEach
     void resetEnv() {
         ToolSearchService.envOverride = null;
     }
 
-    /** 10 参构造器 per-turn TUC（对齐 LlmAgentLoopToolsArrayDenyTest + 生产 perTurnTuc 形态）. */
+    /**
+     * 10 参构造器 per-turn TUC（对齐 LlmAgentLoopToolsArrayDenyTest + 生产 perTurnTuc 形态）·
+     * [R8] 盖章 providerType=anthropic —— 生产 perTurnTuc 由 {@code AgentLoopContext.toolExecContext}
+     * 经 {@code ModelConfigResolver.resolveProviderType} 每轮盖章 {@code effectiveProviderType}
+     * （门控 AND 的 provider 源）。缺此门控 AND 恒 false → 所有现存 anthropic 用例退化为全发。
+     */
     private ToolUseContext tuc(List<Tool> availableTools) {
+        return tuc(availableTools, "anthropic");
+    }
+
+    /** [R8] 显式 provider 盖章变体（非 anthropic / 未知场景）。 */
+    private ToolUseContext tuc(List<Tool> availableTools, String providerType) {
         return new ToolUseContext(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT, Map.of(),
                 availableTools, null, AbortController.NOOP, List.of(),
-                (ToolPermissionContext) null, PermissionMode.DEFAULT);
+                (ToolPermissionContext) null, PermissionMode.DEFAULT)
+            .withEffectiveProviderType(providerType);
     }
 
     /** 含 tool_result→tool_reference 块的 user 消息（对齐 CC ToolSearchTool.ts:465-468 发射形状）. */
@@ -136,6 +149,75 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         assertThat(schemaNames(assembly.tools()))
                 .as("discovered 空 → WebSearch 剔除，Bash/ToolSearch 保留")
                 .containsExactlyInAnyOrder("Bash", "ToolSearch");
+    }
+
+    @Test
+    @DisplayName("[R8] 非 anthropic（openai_compatible）→ 排除 ToolSearch + 全部工具内联、无 defer_loading（CC claude.ts:1170-1172）")
+    void pipeline_nonAnthropic_sendsAllInlineNoDeferLoading() {
+        // WHY（R8 2026-09-11 回归 CC）：门控 AND = isToolSearchEnabled(...) && toolReferenceUsable(providerType, model)。
+        //   非 anthropic provider（openai_compatible）→ toolReferenceUsable=false → useToolSearch=false →
+        //   filterToolsForSchema false 分支「排除 ToolSearch + 全量内联」，绝不发 defer_loading（willDefer=false）。
+        //   此处刻意让 discovered 含 WebSearch：证明确实未走「deferred 过滤」（否则 WebSearch 会被 defer）。
+        //   变异 (i)：把门控 AND 去掉 → 非 anthropic 仍走 true 分支（deepseek 过模型名单、isToolSearchEnabled=true，
+        //   deferred 非空不短路）→ ToolSearch 保留 + defer_loading 发射 → 本用例红（退回 09-01 死锁方向）。
+        ToolSearchService.envOverride = Map.of();
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+
+        LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
+                tuc(available, "openai_compatible"), QuerySource.USER,
+                List.of(userMsgWithToolReference("WebSearch")), OPENAI_COMPAT_MODEL);
+
+        assertThat(assembly.useToolSearch()).isFalse();
+        assertThat(schemaNames(assembly.tools()))
+                .as("非 anthropic → 排除 ToolSearch，其余（含 deferred WebSearch）全量内联")
+                .containsExactlyInAnyOrder("Bash", "WebSearch");
+        assertThat(findSchema(assembly.tools(), "WebSearch").has("defer_loading"))
+                .as("非 anthropic 绝不发 defer_loading（CC claude.ts:1208-1209 willDefer=false）")
+                .isFalse();
+        assertThat(findSchema(assembly.tools(), "Bash").has("defer_loading")).isFalse();
+    }
+
+    @Test
+    @DisplayName("[R8] anthropic + haiku → 排除 ToolSearch + 全量内联（模型不支持 tool_reference）")
+    void pipeline_anthropicHaiku_sendsAllInline() {
+        // WHY（R8）：anthropic 下 haiku 不解析 tool_reference（toolSearch.ts:200-204）→ toolReferenceUsable=false
+        //   → useToolSearch=false → CC 全发。旧实现靠「清空 deferred」豁免到达同一形态；R8 由门控 AND 直接判。
+        ToolSearchService.envOverride = Map.of();
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+
+        LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
+                tuc(available, "anthropic"), QuerySource.USER,
+                List.of(userMsgWithToolReference("WebSearch")), "claude-haiku-4-5");
+
+        assertThat(assembly.useToolSearch()).isFalse();
+        assertThat(schemaNames(assembly.tools()))
+                .as("haiku → 排除 ToolSearch，其余全量内联")
+                .containsExactlyInAnyOrder("Bash", "WebSearch");
+        assertThat(findSchema(assembly.tools(), "WebSearch").has("defer_loading")).isFalse();
+    }
+
+    @Test
+    @DisplayName("[R8] anthropic + 非 haiku（sonnet）→ 保留懒加载 deferred（discovered 才进 schema）")
+    void pipeline_anthropicNonHaiku_keepsDeferredLazyLoad() {
+        // WHY（R8）：anthropic × 支持模型 → toolReferenceUsable=true → useToolSearch=true（deferred 非空不短路）
+        //   → true 分支：ToolSearch 保留、未 discovered 的 deferred（WebSearch）剔除。此即被删
+        //   LlmAgentLoopOpenAiDeferExemptTest 中「anthropic 保留 deferred」语义的管线级替代。
+        ToolSearchService.envOverride = Map.of();
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+
+        LlmAgentLoop.ToolsAssembly noDiscovery = LlmAgentLoop.llmToolsArray(
+                tuc(available, "anthropic"), QuerySource.USER, List.of(), SUPPORTED_MODEL);
+        assertThat(noDiscovery.useToolSearch()).isTrue();
+        assertThat(schemaNames(noDiscovery.tools()))
+                .as("anthropic + sonnet → WebSearch（deferred 未发现）剔除，Bash/ToolSearch 保留")
+                .containsExactlyInAnyOrder("Bash", "ToolSearch");
+
+        LlmAgentLoop.ToolsAssembly discovered = LlmAgentLoop.llmToolsArray(
+                tuc(available, "anthropic"), QuerySource.USER,
+                List.of(userMsgWithToolReference("WebSearch")), SUPPORTED_MODEL);
+        assertThat(schemaNames(discovered.tools()))
+                .as("discovered 后 WebSearch 进 schema（懒加载发现闭环）")
+                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebSearch");
     }
 
     @Test

@@ -484,7 +484,8 @@ public class SubagentExecutor {
             // [openai-lazy] effectiveModelName 透传 — 子代理共享父 turn 模型名
             source.effectiveModelName(),
             // [openai-lazy 乙-1] effectiveProviderType 透传 — 子代理共享父 turn 目标 provider
-            //   （ToolSearch 分流渲染用；漏补则子代理 ToolSearch 回落 null → 多出文本块，与父不一致）
+            //   （主循环门控 toolReferenceUsable 用；漏补则子代理侧回落 null → 判不支持 → 子代理
+            //   tool search 被关闭、全量 schema 内联，与父不一致）
             source.effectiveProviderType()
         );
     }

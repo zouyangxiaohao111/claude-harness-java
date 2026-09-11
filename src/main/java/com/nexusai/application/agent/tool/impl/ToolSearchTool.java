@@ -260,11 +260,10 @@ public class ToolSearchTool implements Tool {
             logSearchOutcome(found, "select", deferredTools.size(), maxResults, query);
             // [activate-on-search] ToolSearch 确认 → 激活匹配工具（开关开时进 API tools，下轮可调用）
             java.util.List<String> activated = ToolSearchService.activateTools(found);
-            // [openai-lazy 乙-1] 按目标 provider 能力分流输出：anthropic（有 tool_reference）→ 纯 matches
-            //   （tool_reference 块由 API 客户端展开，CC 原样）；其它/未知 provider（无 tool_reference）→
-            //   附带完整 schema + 激活提示（模型从 tool_result 文本拿到参数即可调用，避免死锁）
+            // [R8] 渲染零分支（CC ToolSearchTool.ts:462-469）：命中恒产纯 tool_reference 块 + （activate
+            //   模式激活时的）激活提示，无 provider/model 分流。
             return ToolResult.success(call.id(), buildSearchOutput(
-                    found, query, deferredTools.size(), deferredTools, allTools, activated, ctx));
+                    found, query, deferredTools.size(), activated));
         }
 
         // ── 关键词检索（CC ToolSearchTool.ts:409-414）──
@@ -282,55 +281,21 @@ public class ToolSearchTool implements Tool {
         }
         // [activate-on-search] ToolSearch 确认 → 激活匹配工具（开关开时进 API tools，下轮可调用）
         java.util.List<String> activated = ToolSearchService.activateTools(matches);
-        // [openai-lazy 乙-1] 按目标 provider 能力分流输出（同上 select 分支）· 非 anthropic → 完整 schema + 激活提示
+        // [R8] 渲染零分支（同上 select 分支）
         return ToolResult.success(call.id(), buildSearchOutput(
-                matches, query, deferredTools.size(), deferredTools, allTools, activated, ctx));
+                matches, query, deferredTools.size(), activated));
     }
 
     /**
-     * [openai-lazy 乙-1] 按 <b>目标 provider 能力</b>分流 ToolSearch 输出 · 用户拍板（2026-09-01）
-     * 「Anthropic 格式不要变」，2026-09-11 拍板乙-1：判据 = 目标 provider 类型（非模型名）。
-     *
-     * <p>{@link #providerSupportsToolReference}（provider type == "anthropic"，有 tool_reference
-     * 语义）→ 输出 <b>纯 matches</b>（命中渲染纯 {@code tool_reference} 块，API 客户端展开为完整工具，
-     * CC 原样；不附 schema/激活提示文本 —— 模型天然知道 defer 工具已可用）。
-     *
-     * <p>其它 / null / 未知（openai_compatible / openai_sdk / 解析不出）→ 附带匹配工具<b>完整 schema</b>
-     * （{@link ToolSchemaDto}）+ 激活提示（激活模式开启时）—— 模型从 tool_result 的
-     * {@code <functions>} 文本直接拿到参数即可调用（无搜索死锁）。渲染见
-     * {@link #mapToToolResultBlockParam}（schemas 非空 → 追加 text 块）。
+     * [R8 · 回归 CC ToolSearchTool.ts:462-469 渲染零分支] ToolSearch 命中输出构造：
+     * 仅 matches（渲染为纯 {@code tool_reference} 块，API 客户端展开为完整工具）+ activate 模式
+     * 激活时的提示文本。原 [openai-lazy 乙-1] 的 anthropic/非 anthropic provider 分流分支已随 R8
+     * 删除（provider 判据现于主循环门控单点，渲染恒无分支）。
      */
     private static ToolSearchOutput buildSearchOutput(
             java.util.List<String> matches, String query, int totalDeferredTools,
-            List<Tool> deferredTools, List<Tool> allTools,
-            java.util.List<String> activated, ToolUseContext ctx) {
-        if (providerSupportsToolReference(ctx)) {
-            return new ToolSearchOutput(matches, query, totalDeferredTools, null);
-        }
-        return new ToolSearchOutput(matches, query, totalDeferredTools, null,
-                toSchemas(matches, deferredTools, allTools), activatedNotice(activated));
-    }
-
-    /**
-     * [乙-1 + 2026-09-11 单点化] 目标 provider × 模型是否可用 tool_reference ·
-     * 委托单点 {@link ToolSearchService#toolReferenceUsable(String, String)}
-     * （provider 语义 取与 模型能力 {@code modelSupportsToolReference}）。
-     *
-     * <p><b>WHY 按 provider × 模型判</b>：tool_reference 是 Anthropic wire 专属语义
-     * （CC {@code ToolSearchTool.ts:462-469} 渲染无 provider/model 分支，恒发 tool_reference 块）；
-     * openai_compatible / openai_sdk provider 序列化时整块丢弃 tool_reference（见
-     * {@code OpenAiSdkProvider}）→ 只发 tool_reference 会零载荷死锁。模型侧：anthropic 下 haiku
-     * 不支持 tool_reference（toolSearch.ts:200-204/239-252）→ 也须附完整 schema。
-     *
-     * <p>ctx / providerType / model null 或未知（resolver 未注入 / 模型未命中 / provider 未
-     * enabled 等）→ false（保守判「不支持」→ 附 schema）。<b>默认保守方向</b>：多一段
-     * {@code <functions>} 文本对 Anthropic 无损（CC 也多容忍额外 text 块），但缺 schema 会让无
-     * tool_reference 语义的模型反复检索、无法调用（死锁）——不对称风险下取安全侧。
-     */
-    private static boolean providerSupportsToolReference(ToolUseContext ctx) {
-        String providerType = ctx != null ? ctx.effectiveProviderType() : null;
-        String model = ctx != null ? ctx.effectiveModelName() : null;
-        return ToolSearchService.toolReferenceUsable(providerType, model);
+            java.util.List<String> activated) {
+        return new ToolSearchOutput(matches, query, totalDeferredTools, null, activatedNotice(activated));
     }
 
     /**
@@ -342,24 +307,6 @@ public class ToolSearchTool implements Tool {
             return null;
         }
         return "Tools activated into the tool set, callable directly now: " + String.join(", ", activated);
-    }
-
-    /** [schema-return] 工具名列表 → 完整 schema DTO（从 deferred/allTools 找 Tool，取 name/description/inputSchema）。 */
-    private static List<ToolSchemaDto> toSchemas(List<String> names, List<Tool> deferredTools, List<Tool> allTools) {
-        if (names == null || names.isEmpty()) {
-            return List.of();
-        }
-        List<ToolSchemaDto> out = new ArrayList<>(names.size());
-        for (String name : names) {
-            Tool tool = findToolByName(deferredTools, name);
-            if (tool == null) {
-                tool = findToolByName(allTools, name);
-            }
-            if (tool != null) {
-                out.add(new ToolSchemaDto(tool.name(), tool.description(), tool.inputSchema()));
-            }
-        }
-        return List.copyOf(out);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -401,55 +348,22 @@ public class ToolSearchTool implements Tool {
             }
             return new ToolResultBlockParam(toolUseId, "tool_result", text, false);
         }
-        // 命中 → tool_reference blocks（CC ToolSearchTool.ts:462-469）· Anthropic 客户端展开语义
+        // 命中 → tool_reference blocks（CC ToolSearchTool.ts:462-469）· Anthropic 客户端展开语义。
+        //   [R8] 渲染零分支：不再按 provider 追加 <functions> JSONSchema 文本（原 [openai-lazy 乙-1] 扩展
+        //   随 R8 删除 —— 非 anthropic 已由主循环门控排除 ToolSearch，无「拿到 schema 才能调用」场景）。
         List<ContentBlockParam> blocks = out.matches().stream()
                 .map(ToolReferenceBlockParam::new)
                 .collect(Collectors.toList());
-        // [openai-lazy 乙-1] 非 anthropic provider（无 tool_reference 语义，OpenAiSdkProvider 序列化
-        //   role=tool 时整块丢弃 tool_reference）→ 追加 text 块承载完整 JSONSchema：
-        //   对齐 CC PROMPT_TAIL（prompt.ts:44-51）描述的 "<functions>...complete JSONSchema...</functions>"
-        //   契约格式。模型从文本读到参数即可直接 tool_use 调用（无搜索死锁）。schemas 非空 = producer
-        //   判「不支持 tool_reference」（buildSearchOutput）。
-        String schemaText = toFunctionsBlockText(out.schemas());
-        if (schemaText != null) {
-            blocks.add(new ContentBlockParam.TextBlockParam(schemaText));
-        }
         // 激活提示（activate-on-search 开启且本次确认激活）· 用户拍板「激活必有提示」
         String notice = out.activatedNotice();
         if (notice != null && !notice.isBlank()) {
             blocks.add(new ContentBlockParam.TextBlockParam(notice));
         }
         if (log.isDebugEnabled()) {
-            log.debug("[ToolSearchTool] 命中 {} 条 → tool_reference blocks {} 个 + text 块 {} 个（schemas={}, activatedNotice={}，CC ToolSearchTool.ts:462-469 + openai-lazy 乙-1 provider 能力分流）",
-                    out.matches().size(), out.matches().size(),
-                    blocks.size() - out.matches().size(),
-                    out.schemas() == null ? 0 : out.schemas().size(),
-                    notice != null);
+            log.debug("[ToolSearchTool] 命中 {} 条 → tool_reference blocks {} 个 + 激活提示 {}（CC ToolSearchTool.ts:462-469 渲染零分支）",
+                    out.matches().size(), out.matches().size(), notice != null);
         }
         return new ToolResultBlockParam(toolUseId, "tool_result", blocks, false);
-    }
-
-    /**
-     * [openai-lazy] 匹配工具完整 JSONSchema → {@code <functions>} 文本块（对齐 CC PROMPT_TAIL
-     * 契约 "each matched tool appears as one <function>{...}</function> line"）。schemas 空 → null
-     * （Anthropic 场景无 text 块，保持纯 tool_reference）。JSON 序列化经 JsonNodeFactory 保证
-     * description 引号/换行正确转义。
-     */
-    private static String toFunctionsBlockText(List<ToolSchemaDto> schemas) {
-        if (schemas == null || schemas.isEmpty()) {
-            return null;
-        }
-        StringBuilder sb = new StringBuilder("<functions>\n");
-        for (ToolSchemaDto s : schemas) {
-            ObjectNode fn = JsonNodeFactory.instance.objectNode();
-            fn.put("description", s.description() == null ? "" : s.description());
-            fn.put("name", s.name());
-            fn.set("parameters", s.parameters() == null
-                    ? JsonNodeFactory.instance.objectNode() : s.parameters());
-            sb.append("<function>").append(fn.toString()).append("</function>\n");
-        }
-        sb.append("</functions>");
-        return sb.toString();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -459,33 +373,20 @@ public class ToolSearchTool implements Tool {
     /**
      * 检索输出结构 · 对齐 CC Output（ToolSearchTool.ts:47），经 {@link #mapToToolResultBlockParam} 序列化。包可见供测试断言。
      *
-     * <p><b>schemas 字段（2026-09-01 扩展，偏离 CC matches-only）</b>：CC 仅返回 matches（工具名），
-     * Claude 理解「matches=确认可直接调用」（defer_loading 工具在 Anthropic API 注册表）；openai_compatible
-     * 模型（deepseek）无 tool_reference/defer_loading 语义，拿不到参数会误解「无 schema 未找到」而反复检索
-     * 卡死（联调实测）。扩展返回每个匹配工具的完整 schema（{name, description, parameters}）→ 模型从
-     * tool_result 直接拿到参数即可调用（配合 activate-on-search 开关激活进 API tools 真正可调）。
+     * <p>[R8] 原 [openai-lazy 乙-1] 的 {@code schemas} 字段（完整 JSONSchema，非 anthropic 死锁防护）已随
+     * provider 渲染分支删除；{@code activatedNotice} 为 activate 模式独立特性（激活提示文本），保留。
      */
     record ToolSearchOutput(
             List<String> matches,
             String query,
             int totalDeferredTools,
             List<String> pendingMcpServers,
-            List<ToolSchemaDto> schemas,
             String activatedNotice) {
-        /** 兼容旧 4 参调用（测试/无 schema 场景 → 空 schemas + 无激活提示）。 */
+        /** 4 参便利构造（测试/无激活提示场景 → 无激活提示；[R8] 原 schemas 字段已删）。 */
         ToolSearchOutput(List<String> matches, String query, int totalDeferredTools, List<String> pendingMcpServers) {
-            this(matches, query, totalDeferredTools, pendingMcpServers, List.of(), null);
-        }
-
-        /** 5 参（schemas 有值，无激活提示）。 */
-        ToolSearchOutput(List<String> matches, String query, int totalDeferredTools, List<String> pendingMcpServers,
-                         List<ToolSchemaDto> schemas) {
-            this(matches, query, totalDeferredTools, pendingMcpServers, schemas, null);
+            this(matches, query, totalDeferredTools, pendingMcpServers, null);
         }
     }
-
-    /** 匹配工具完整 schema（name/description/parameters JSONSchema）· 供模型直接获取参数定义。 */
-    record ToolSchemaDto(String name, String description, JsonNode parameters) {}
 
     /** parseToolName 返回值 · CC ToolSearchTool.ts:132-136。 */
     private record ParsedToolName(List<String> parts, String full, boolean isMcp) {}

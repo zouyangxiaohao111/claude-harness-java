@@ -1377,6 +1377,24 @@ public record AgentLoopContext(
                     e.getMessage());
             }
         }
+        // [openai-lazy 乙-1] 解析当前 turn 目标 provider 类型 · 单一来源 ModelConfigResolver.resolveProviderType。
+        //   R8（2026-09-11）后的真实消费方（渲染侧已无 provider 分支 —— ToolSearchTool 对齐 CC
+        //   ToolSearchTool.ts:462-469「零分支恒发 tool_reference」）：
+        //     (1) LlmAgentLoop.llmToolsArray 门控 AND：
+        //         isToolSearchEnabled(...) && ToolSearchService.toolReferenceUsable(本字段, modelName)
+        //         —— 非 anthropic / 判不出 → useToolSearch=false → 排除 ToolSearch + 其余工具完整 schema 内联直发；
+        //     (2) PostCompactAttachmentRestorer 两处 gate（deferred_tools_delta / chrome instructions）。
+        //   解析值语义：resolver null / modelName null-blank / DB 未命中 / provider 未 enabled / apiKey 空 → null。
+        //   注意 ModelConfigResolver.resolve 内 provider.type==null 会回落 "openai_compatible"（既有契约，本轮不动）——
+        //   该回落会掩盖「anthropic provider 但 type 未填」的情形，使其静默退化为无 tool search。
+        String resolvedProviderType = com.nexusai.infra.llm.ModelConfigResolver.resolveProviderType(
+            ctx.modelConfigResolver(), state.currentModel());
+        if (resolvedProviderType == null) {
+            log.warn("[openai-lazy 乙-1] provider 类型解析不出 → toolReferenceUsable 判不支持 → tool search 对本轮关闭"
+                    + "（保守退化，工具不会丢，但失去懒加载）: sessionId={} currentModel={}",
+                state.sessionId(),
+                state.currentModel() != null ? state.currentModel() : "(null)");
+        }
         com.nexusai.application.agent.tool.ToolUseContext perTurnTuc = baseTuc
             .withQueryTracking(queryTracking)
             .withMessages(state.messages() != null ? state.messages() : List.of())
@@ -1384,12 +1402,8 @@ public record AgentLoopContext(
             // [openai-lazy] 注入当前 turn 有效模型名（模型能力解析消费：ReadFileTool / fork 直传等）。
             //   state.currentModel() = LlmAgentLoop doRun 入口 + 每轮 effectiveModel 覆盖写。
             .withEffectiveModelName(state.currentModel())
-            // [openai-lazy 乙-1] 注入当前 turn 目标 provider 类型（ToolSearchTool 渲染分流按 provider
-            //   能力判，而非模型名）：经单一来源 ModelConfigResolver.resolveProviderType 解析。
-            //   resolver null / model null-blank / DB 未命中 / provider 未 enabled / apiKey 空 → null
-            //   → producer 侧判「不支持 tool_reference」→ 保守追加 <functions> 文本块（防搜索死锁）。
-            .withEffectiveProviderType(com.nexusai.infra.llm.ModelConfigResolver.resolveProviderType(
-                ctx.modelConfigResolver(), state.currentModel()));
+            // [openai-lazy 乙-1] 注入当前 turn 目标 provider 类型（消费方见上方解析处注释）。
+            .withEffectiveProviderType(resolvedProviderType);
         state.setCurrentToolUseContext(perTurnTuc);
         if (log.isDebugEnabled()) {
             log.debug("AgentLoopContext toolExecContext stamp: sessionId={} queryTracking={} effectiveModel={} effectiveProviderType={}",

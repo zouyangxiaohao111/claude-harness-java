@@ -130,10 +130,9 @@ class LlmAgentLoopToolResultBlockE2ETest {
     /**
      * 真实执行 ToolSearchTool（含 ToolUseContext，复用 ToolSearchToolRetrievalTest 模式）。
      *
-     * <p>[openai-lazy 乙-1] 补 provider 能力前提：{@code withEffectiveProviderType("anthropic")}
-     * —— 命中路径按目标 provider 能力分流（anthropic → 纯 tool_reference 块，CC 原样）。
-     * 若缺此前提（providerType=null → 保守判不支持）→ 追加 {@code <functions>} 文本块 →
-     * 本测试正向断言（content 数组 size）变红。模型名仅与 :156 wire 模型对齐（非判据）。
+     * <p>[R8] 渲染已回归 CC ToolSearchTool.ts:462-469 零分支：命中恒产纯 tool_reference 块
+     * （provider/model 不再影响渲染形状）。{@code withEffectiveProviderType("anthropic")} 保留以
+     * 维持与生产 perTurnTuc 同形；模型名仅与 :156 wire 模型对齐（非渲染判据）。
      */
     private AgentToolResult<?> execute(ToolSearchTool tool, String query, List<Tool> tools) {
         JsonNode input = JSON.createObjectNode().put("query", query).put("max_results", 5);

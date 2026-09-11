@@ -5,10 +5,6 @@ import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.ToolSearchTool;
 import com.nexusai.application.agent.tool.impl.WebSearchTool;
 import com.nexusai.infra.llm.CountTokensClient;
-import com.nexusai.repository.provider.entity.ModelRecord;
-import com.nexusai.repository.provider.entity.ProviderRecord;
-import com.nexusai.repository.provider.mapper.ModelMapper;
-import com.nexusai.repository.provider.mapper.ProviderMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -18,9 +14,6 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * [H4] ToolSearch definitive 门控测试 · 对齐 CC toolSearch.ts:385-473 {@code isToolSearchEnabled}
@@ -64,11 +57,11 @@ class ToolSearchServiceDefinitiveGateTest {
         assertThat(ToolSearchService.modelSupportsToolReference("claude-opus-4-1")).isTrue();
         // 2026-09-11 期望变更（WHY）：DEFAULT_UNSUPPORTED_MODEL_PATTERNS 归位回 CC 原样只留 'haiku'
         //   （toolSearch.ts:200-204），deepseek 从负向名单移除 → modelSupportsToolReference 判 true。
-        //   「openai 系不启用 tool search」不再由模型名单承担，改由 LlmAgentLoop.exemptAllDeferredForOpenAi
-        //   单点负责（非 anthropic → 全部 defer 工具 schema 直发）；provider 语义与模型能力取与见
-        //   toolReferenceUsable。变异：若把 'deepseek' 加回名单 → 本行变红。
+        //   「openai 系不启用 tool search」不再由模型名单承担，改由主循环门控单点负责
+        //   （isToolSearchEnabled && toolReferenceUsable(providerType, model)；非 anthropic → useToolSearch=false
+        //   → 全部工具 schema 直发）。变异：若把 'deepseek' 加回名单 → 本行变红。
         assertThat(ToolSearchService.modelSupportsToolReference("deepseek-v4-flash"))
-            .as("deepseek 不在模型不支持名单（不在 anthropic 用 tool search 由豁免负责）")
+            .as("deepseek 不在模型不支持名单（非 anthropic 不启用 tool search 由门控 AND 负责）")
             .isTrue();
     }
 
@@ -95,47 +88,6 @@ class ToolSearchServiceDefinitiveGateTest {
         assertThat(ToolSearchService.toolReferenceUsable("anthropic", null)).isFalse();
         assertThat(ToolSearchService.toolReferenceUsable(null, null)).isFalse();
         assertThat(ToolSearchService.toolReferenceUsable("openai_sdk", "claude-opus-4")).isFalse();
-    }
-
-    @Test
-    @DisplayName("toolReferenceUsable mapper 版重载：复用唯一解析链反推 providerType，判据仍落单点（anthropic×haiku → false）")
-    void toolReferenceUsable_mapperOverload_delegatesToSinglePoint() {
-        // WHY（2026-09-11 单点化）：LlmAgentLoop.exemptAllDeferredForOpenAi 只持 mapper + 模型名，
-        //   经本重载入单点——不得自带第三把尺子。providerType 由既有唯一 mapper 版 provider 判定
-        //   （ContextUsageCalculator.isAnthropic → ModelNameResolver.resolve → provider.type）反推。
-        //   变异：本重载改回「只判 isAnthropic」（去掉模型那一半）→ haiku 断言变红。
-        ModelMapper modelMapper = mock(ModelMapper.class);
-        ProviderMapper providerMapper = mock(ProviderMapper.class);
-        ProviderRecord provider = new ProviderRecord();
-        provider.setId("p1");
-        when(providerMapper.selectOneByQuery(any())).thenReturn(provider);
-        when(providerMapper.selectOneById(any())).thenReturn(provider);
-        ModelRecord m = new ModelRecord();
-        m.setId("m1");
-        m.setProviderId("p1");
-        m.setName("claude-opus-4");
-        m.setEnabled(true);
-        when(modelMapper.selectOneByQuery(any())).thenReturn(m);
-
-        provider.setType("anthropic");
-        assertThat(ToolSearchService.toolReferenceUsable(
-                modelMapper, providerMapper, "anthropic/claude-opus-4"))
-            .as("anthropic × 非 haiku → 两半成立 → true").isTrue();
-        assertThat(ToolSearchService.toolReferenceUsable(
-                modelMapper, providerMapper, "anthropic/claude-haiku-4-5-20251001"))
-            .as("模型那一半在 mapper 重载下同样 load-bearing：anthropic + haiku → false "
-                + "（旧 exemptAllDeferredForOpenAi 只判 isAnthropic 会判 true → 漏清）").isFalse();
-
-        provider.setType("openai_compatible");
-        assertThat(ToolSearchService.toolReferenceUsable(
-                modelMapper, providerMapper, "openai/gpt-5"))
-            .as("provider 那一半：非 anthropic → false").isFalse();
-
-        // 判不出即不支持（mapper 缺失 / 模型名 null）
-        assertThat(ToolSearchService.toolReferenceUsable(null, null, "anthropic/claude-opus-4"))
-            .as("mapper null → 判不出 → false（调用方 exemptAllDeferredForOpenAi 据此保持旧契约）").isFalse();
-        assertThat(ToolSearchService.toolReferenceUsable(modelMapper, providerMapper, null))
-            .as("模型名 null → false（判不出即不支持）").isFalse();
     }
 
     @Test
@@ -239,36 +191,44 @@ class ToolSearchServiceDefinitiveGateTest {
     }
 
     @Test
-    @DisplayName("filterToolsForSchema：useToolSearch=false（openai-lazy）→ ToolSearch 保留 + deferred 过滤（懒加载始终成立）")
-    void filterToolsForSchema_disabled_openaiLazy() {
-        // WHY: [openai-lazy] Java 扩展偏离 CC claude.ts:1170-1172（排除 ToolSearch + 全发）——
-        //   openai_compatible（deepseek）无 tool_reference，ToolSearch 是唯一拿到 defer 工具完整 schema
-        //   的通道（命中返回 <functions> 文本），排除则死锁；deferred 照常过滤（懒加载不默认占 prompt），
-        //   discovered/activated 例外（activate-on-search 控制）。
-        // ① 无 deferred（短路）→ 排除 ToolSearch（无对象可搜，对齐 CC claude.ts:1140-1147 短路 + :1170-1172）
+    @DisplayName("filterToolsForSchema：useToolSearch=false 恒「排除 ToolSearch + 全量」（CC claude.ts:1170-1172，R8 回归）")
+    void filterToolsForSchema_disabled_ccForm() {
+        // WHY（R8 2026-09-11 回归 CC）：useToolSearch=false（非 anthropic / anthropic×haiku / 显式关闭）
+        //   时模型无 tool_reference —— 被剔工具对模型不存在即死锁，故必须「排除 ToolSearch + 其余（含
+        //   deferred/MCP）全部完整 schema 内联直发」。原 [openai-lazy]「ToolSearch 保留 + deferred 过滤」
+        //   子路径已删（其唯一动因 = 主循环靠「清空 deferred」豁免兜底；R8 改由门控 AND 直接判 false）。
+        //   变异 (ii)：把 ② 改回「保留 ToolSearch」→ 本用例变红。
+        // ① 无 deferred：排除 ToolSearch + 全量（CC :1170-1172）
         List<Tool> noDeferred = ToolSearchService.filterToolsForSchema(TOOLS_WITH_SEARCH, false, null, null);
         assertThat(names(noDeferred))
-                .as("useToolSearch=false 且无 deferred（短路）→ 排除 ToolSearch")
+                .as("useToolSearch=false → 排除 ToolSearch，其余全量（含 WebSearch）")
                 .containsExactlyInAnyOrder("Bash", "WebSearch");
-        // ② deferred 存在但未发现/未激活 → WebSearch 过滤，ToolSearch 保留（懒加载）
+        // ② deferred 未发现 → 不参与过滤，仍全量（CC 恒等式）
         List<Tool> withDeferred = ToolSearchService.filterToolsForSchema(
                 TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of());
         assertThat(names(withDeferred))
-                .as("deferred 未激活 → 剔除 WebSearch，Bash/ToolSearch 恒留（懒加载）")
-                .containsExactlyInAnyOrder("Bash", "ToolSearch");
-        // ③ deferred 已 discovered/activated → 保留
-        List<Tool> activated = ToolSearchService.filterToolsForSchema(
+                .as("deferred 未发现也照发（false 分支 deferred 不参与过滤）")
+                .containsExactlyInAnyOrder("Bash", "WebSearch");
+        // ③ deferred 已 discovered → 结果与 ② 逐项相同（deferred/discovered 均为恒等式输入）
+        List<Tool> discovered = ToolSearchService.filterToolsForSchema(
                 TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of("WebSearch"));
-        assertThat(names(activated))
-                .as("deferred 已发现/激活 → 三工具全留")
-                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebSearch");
+        assertThat(names(discovered))
+                .as("discovered 不改变结果 —— false 分支对 deferred/discovered 恒等（CC 回归核心）")
+                .containsExactlyInAnyOrder("Bash", "WebSearch");
+        // ④ 中性证明：filterToolsForSchema(false, deferred=∅)（旧非 anthropic 生产形态：豁免清空 deferred）
+        //    === filterToolsForSchema(false, deferred 非空)（R8 新形态：门控直接 false，deferred 保留）
+        //    → 非 anthropic 最终工具集与改动前逐项一致。
+        assertThat(names(ToolSearchService.filterToolsForSchema(
+                TOOLS_WITH_SEARCH, false, Set.of(), Set.of())))
+            .as("中性证明：deferred 空（改动前形态）与非空（R8 形态）结果逐项相同")
+            .containsExactlyInAnyOrderElementsOf(names(withDeferred));
     }
 
     @Test
-    @DisplayName("[mode=full] filterToolsForSchema：全发（含 deferred，排除 ToolSearch，无搜索环节）")
+    @DisplayName("[mode=full] filterToolsForSchema：全发（含 deferred，排除 ToolSearch）—— 语义并入恒等分支")
     void filterToolsForSchema_modeFull_sendsAll() {
-        // WHY: mode=full（全发）→ 对齐旧「完整 schema 模式」：所有工具含 defer 直接进 schema，
-        //   模型直接调用；ToolSearch 排除（无搜索环节，对齐 CC claude.ts:1170-1172）。
+        // WHY（R8）：full 模式语义（排除 ToolSearch + 全量）现即 false 分支的恒等行为，不再特判；
+        //   mode=full 下结果须与默认 search 的 false 分支一致（CC claude.ts:1170-1172）。
         ToolSearchService.modeOverride = "full";
         try {
             List<Tool> filtered = ToolSearchService.filterToolsForSchema(
@@ -282,18 +242,17 @@ class ToolSearchServiceDefinitiveGateTest {
     }
 
     @Test
-    @DisplayName("[mode=activate] filterToolsForSchema：懒加载同 search（deferred 过滤 + ToolSearch 保留）")
-    void filterToolsForSchema_modeActivate_lazyLikeSearch() {
-        // WHY: mode=activate 的过滤行为与 search 相同（ToolSearch 保留 + deferred 过滤）；
-        //   区别只在 activateTools 是否写入激活集（activate → 是，下轮进 API tools）。
-        //   ACTIVATED_TOOLS 私有不可直注 → 验证过滤形状（懒加载成立）+ 门控不破坏。
+    @DisplayName("[mode=activate] filterToolsForSchema：同 CC 恒等（排除 ToolSearch + 全量）")
+    void filterToolsForSchema_modeActivate_ccForm() {
+        // WHY（R8）：mode 不再影响 false 分支过滤（原 search/activate 的「保留 ToolSearch + 过滤 deferred」
+        //   已删）。activate 的差异只在 ToolSearch 命中时是否写入激活集（activateTools），与过滤形状无关。
         ToolSearchService.modeOverride = "activate";
         try {
             List<Tool> filtered = ToolSearchService.filterToolsForSchema(
                     TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of());
             assertThat(names(filtered))
-                    .as("mode=activate → deferred WebSearch 未激活 → 剔除，Bash/ToolSearch 保留")
-                    .containsExactlyInAnyOrder("Bash", "ToolSearch");
+                    .as("mode=activate → 排除 ToolSearch，其余全量（与 mode=full / search 同形）")
+                    .containsExactlyInAnyOrder("Bash", "WebSearch");
         } finally {
             ToolSearchService.modeOverride = null;
         }

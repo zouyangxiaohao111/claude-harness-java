@@ -264,25 +264,20 @@ class ToolSearchToolRetrievalTest {
     }
 
     @Test
-    @DisplayName("openai_compatible（无 tool_reference）命中 → tool_reference + <functions> schema text 块（openai-lazy 乙-1 扩展）")
-    void mapToBlock_matches_openai_appendsFunctionsText() {
+    @DisplayName("[R8] provider=未知/null 命中 → 纯 tool_reference（渲染零分支，CC ToolSearchTool.ts:462-469）")
+    void mapToBlock_unknownProvider_pureToolReference() {
+        // WHY（R8 2026-09-11 回归 CC）：渲染恒无 provider/model 分支 —— 命中恒产纯 tool_reference 块。
+        //   原「未知 provider → 追加 <functions> JSONSchema 文本」的 [openai-lazy 乙-1] 扩展已随 R8 删除
+        //   （非 anthropic 已在主循环门控被排除出工具集，ToolSearch 永不可达其渲染路径）。
+        //   变异：把渲染改回「按 provider 分流追加 <functions>」→ size 变 2 → 红。
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // 无 providerType（未知）→ 保守判不支持 tool_reference：命中附带完整 JSONSchema 文本
         AgentToolResult<?> result = executeResult("select:Read", tools);
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
         List<?> content = (List<?>) block.content();
-        assertThat(content).hasSize(2);
+        assertThat(content).hasSize(1);
         assertThat(((ContentBlockParam) content.get(0)).type()).isEqualTo("tool_reference");
-        ContentBlockParam text = (ContentBlockParam) content.get(1);
-        assertThat(text.type()).isEqualTo("text");
-        String t = ((ContentBlockParam.TextBlockParam) text).text();
-        assertThat(t)
-                .as("<functions> 完整 JSONSchema（对齐 CC PROMPT_TAIL 契约）")
-                .contains("<functions>")
-                .contains("\"name\":\"Read\"")
-                .contains("\"parameters\":{}")
-                .contains("</functions>");
+        assertThat(((ToolReferenceBlockParam) content.get(0)).toolName()).isEqualTo("Read");
     }
 
     @Test
@@ -301,46 +296,35 @@ class ToolSearchToolRetrievalTest {
     }
 
     @Test
-    @DisplayName("[单点化] provider=anthropic + haiku 模型名 → tool_reference + <functions> 文本（模型那一半，size=2）")
-    void mapToBlock_anthropicHaikuModel_appendsFunctionsText() {
+    @DisplayName("[R8] provider=anthropic + haiku 模型名 → 纯 tool_reference（渲染零分支；haiku 已被门控排除工具搜索）")
+    void mapToBlock_anthropicHaikuModel_pureToolReference() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // 2026-09-11 行为变更：旧实现只判 provider（anthropic → size=1 纯 tool_reference），
-        //   单点化后模型能力参与 → anthropic + haiku（不支持 tool_reference，toolSearch.ts:200-204）
-        //   → 保守附完整 schema。变异 (i)：单点去掉模型那一半（只判 provider）→ size=1 变红。
+        // WHY（R8 2026-09-11 回归 CC）：渲染不再含模型能力分支（原单点化期按 anthropic×haiku 补
+        //   <functions> 文本）。实际生产里 anthropic×haiku 的 useToolSearch=false → ToolSearch 不入 schema，
+        //   本渲染路径不可达；测试直接调 execute 故须断言「零分支 = 纯 tool_reference」。
         AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-haiku-4-5", "anthropic");
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
         List<?> content = (List<?>) block.content();
-        assertThat(content).hasSize(2);
+        assertThat(content).hasSize(1);
         assertThat(((ContentBlockParam) content.get(0)).type()).isEqualTo("tool_reference");
-        ContentBlockParam text = (ContentBlockParam) content.get(1);
-        assertThat(text.type()).isEqualTo("text");
-        assertThat(((ContentBlockParam.TextBlockParam) text).text())
-                .as("anthropic + haiku 也必须补 <functions> 文本（haiku 不解析 tool_reference）")
-                .contains("<functions>")
-                .contains("\"name\":\"Read\"");
+        assertThat(((ToolReferenceBlockParam) content.get(0)).toolName()).isEqualTo("Read");
     }
 
     @Test
-    @DisplayName("[乙-1] 反向保命：provider=openai_compatible + claude 模型名 → 必带 <functions> 文本（size=2，防零载荷死锁）")
-    void mapToBlock_providerOpenAi_beatsClaudeModelName() {
+    @DisplayName("[R8] provider=openai_compatible + claude 模型名 → 纯 tool_reference（渲染零分支，无 provider 分流）")
+    void mapToBlock_providerOpenAi_pureToolReference() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // 危险方向：模型名是 claude-*（模型那一半判「支持」），但目标 provider=openai_compatible
-        // （序列化丢弃 tool_reference 块）→ 必须追加 <functions> 文本，否则模型零载荷 → 搜索死锁。
-        // 变异 (ii)：单点去掉 provider 那一半（只判模型名）→ size=1 变红（claude 名误判支持）。
+        // WHY（R8）：原「openai_compatible → 必带 <functions> 文本防零载荷死锁」的扩展已删——该场景下
+        //   主循环门控 useToolSearch=false 已把 ToolSearch 排除出工具集（模型根本不会发 ToolSearch 调用），
+        //   渲染侧无需再做 provider 分流。变异：恢复 provider 分流 → size=2 → 红。
         AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5", "openai_compatible");
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
         List<?> content = (List<?>) block.content();
-        assertThat(content).hasSize(2);
+        assertThat(content).hasSize(1);
         assertThat(((ContentBlockParam) content.get(0)).type()).isEqualTo("tool_reference");
-        ContentBlockParam text = (ContentBlockParam) content.get(1);
-        assertThat(text.type()).isEqualTo("text");
-        assertThat(((ContentBlockParam.TextBlockParam) text).text())
-                .as("openai_compatible provider 必须拿到 <functions> 文本（防死锁）")
-                .contains("<functions>")
-                .contains("\"name\":\"Read\"")
-                .contains("</functions>");
+        assertThat(((ToolReferenceBlockParam) content.get(0)).toolName()).isEqualTo("Read");
     }
 
     @Test

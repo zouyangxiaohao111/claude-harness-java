@@ -73,10 +73,9 @@ class SchemaNotSentHintGate4ProductionChainTest {
         ToolUseContext searchCtx = ToolUseContext.of(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 List.of(searchTool, webSearch))
-                // [openai-lazy 乙-1 + 2026-09-11 单点化] tool_reference 判据 = provider 语义
-                //   取与 模型能力（toolReferenceUsable）。生产路径 turn 恒带 provider+model
-                //   （AgentLoopContext:1386-1391）；本测试须两者都显式给 anthropic + claude-*，
-                //   否则任一为 null → 保守判不支持 → 追加 <functions> 文本块 → contentBlocks hasSize(2) 变红。
+                // [R8 / 单点化] 生产路径 turn 恒带 provider+model（AgentLoopContext.toolExecContext 盖章）；
+                //   本测试显式给 anthropic + claude-*（与原 [openai-lazy 乙-1] 期一致，保留上下文完整性）。
+                //   [R8] 渲染已回归 CC 零分支（恒纯 tool_reference），provider/model 不再影响渲染形状。
                 .withEffectiveProviderType("anthropic")
                 .withEffectiveModelName("claude-sonnet-4-5");
         AgentToolResult<?> result = searchTool.execute(call, searchCtx);

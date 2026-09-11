@@ -3,7 +3,6 @@ package com.nexusai.application.agent.toolsearch;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.compact.CompactConstants;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
-import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.infra.llm.CountTokensClient;
@@ -251,10 +250,11 @@ public final class ToolSearchService {
     /** CC toolSearch.ts:200-204 DEFAULT_UNSUPPORTED_MODEL_PATTERNS（负向模式：小写 contains 命中即不支持）·
      *  2026-09-11 清理：回 CC 原样只留 {@code "haiku"}（此前 Java 扩展的 +deepseek 已删除）。
      *
-     *  <p><b>分工</b>：「openai 系不启用 tool search」不在这里判——由 {@code LlmAgentLoop.exemptAllDeferredForOpenAi}
-     *  单点负责（非 anthropic provider → 全部 defer 工具直接发完整 schema，无 ToolSearch 环节）。本名单
-     *  只表达<b>模型自身</b>是否支持 tool_reference（CC 语义：新模型默认支持，命中即不支持）。provider
-     *  语义与模型能力<b>取与</b>见单点 {@link #toolReferenceUsable}。 */
+     *  <p><b>分工</b>：「openai 系不启用 tool search」不在这里判——由主循环门控
+     *  「{@code isToolSearchEnabled(...) && toolReferenceUsable(providerType, model)}」负责
+     *  （非 anthropic provider → useToolSearch=false → 全部工具直接发完整 schema，无 ToolSearch 环节）。
+     *  本名单只表达<b>模型自身</b>是否支持 tool_reference（CC 语义：新模型默认支持，命中即不支持）。
+     *  provider 语义与模型能力<b>取与</b>见单点 {@link #toolReferenceUsable}。 */
     private static final Set<String> DEFAULT_UNSUPPORTED_MODEL_PATTERNS = Set.of("haiku");
 
     /** CC toolSearch.ts:49 DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE = 10（10% 上下文窗口）. */
@@ -526,15 +526,13 @@ public final class ToolSearchService {
      *       {@code DEFAULT_UNSUPPORTED_MODEL_PATTERNS = ['haiku']}（toolSearch.ts:200-204）。</li>
      * </ol>
      *
-     * <p><b>判不出即不支持</b>：providerType 或 model 任一为 null / 未知 → false。保守方向取「附完整
-     * schema」：多一段 {@code <functions>} 文本对 Anthropic 无损，但缺 schema 会让无 tool_reference
-     * 语义的模型反复检索、无法调用（死锁）。
+     * <p><b>判不出即不支持</b>：providerType 或 model 任一为 null / 未知 → false。消费方取保守方向
+     * （不启用工具搜索 → 全部工具完整 schema 内联直发）：缺 schema 会让无 tool_reference 语义的
+     * 模型反复检索、无法调用（死锁）。
      *
-     * <p>取代此前分散 4 处、2 种键的判据（{@link #modelSupportsToolReference} /
-     * {@code PostCompactAttachmentRestorer.modelSupportsToolReference} 独立拷贝 /
-     * {@code ToolSearchTool.providerSupportsToolReference} / {@code LlmAgentLoop.exemptAllDeferredForOpenAi}
-     * 的 provider 判）。单点收敛同时消除同一模型两处判据相反的潜伏 bug（旧拷贝对 deepseek 判 true、
-     * 此处判 false）。
+     * <p>取代此前分散的判据（{@link #modelSupportsToolReference} /
+     * {@code PostCompactAttachmentRestorer.modelSupportsToolReference} 独立拷贝）。单点收敛同时
+     * 消除同一模型两处判据相反的潜伏 bug（旧拷贝对 deepseek 判 true、此处判 false）。
      *
      * @param providerType 目标 provider 类型（{@code ToolUseContext.effectiveProviderType()}；null/未知 → false）
      * @param model        模型名（null → false）
@@ -544,33 +542,6 @@ public final class ToolSearchService {
         return "anthropic".equalsIgnoreCase(providerType) && modelSupportsToolReference(model);
     }
 
-    /**
-     * tool_reference 判据单点 · <b>mapper 版重载</b>（调用点只持 mapper + 模型名、无 providerType
-     * 字符串时用）。2026-09-11 用户拍板：「{@code exemptAllDeferredForOpenAi} 也换成这个规则，
-     * 内部调用同一个规则而不是分三份」——本重载即那条统一入口，消除 {@code LlmAgentLoop
-     * .exemptAllDeferredForOpenAi} 自带的第三把尺子（旧实现直接 {@code ContextUsageCalculator
-     * .isAnthropic(modelMapper, providerMapper, modelName)}）。
-     *
-     * <p><b>解析链复用（严禁第三条）</b>：providerType 由既有<b>唯一</b> mapper 版 provider 判定
-     * {@link ContextUsageCalculator#isAnthropic(com.nexusai.repository.provider.mapper.ModelMapper,
-     * com.nexusai.repository.provider.mapper.ProviderMapper, String)} 反推 —— 该链 =
-     * {@code ContextUsageCalculator.java:229-255}：{@code ModelNameResolver.resolve}（:234）→
-     * {@code ProviderMapper.selectOneById}（:242）→ {@code ProviderRecord.getType()}（:243）。
-     * 命中 {@code "anthropic"} → 委托 2 参单点；非 anthropic / 判不出（mapper null、模型未命中、
-     * provider 缺失）→ 传 {@code null}，2 参单点按「判不出即不支持」判 false。本重载<b>不复制</b>
-     * 解析链，故不存在第三份 provider 解析。
-     *
-     * @param modelMapper    模型 mapper（null → 判不出 → false）
-     * @param providerMapper 提供商 mapper（null → 判不出 → false）
-     * @param model          模型名（null/blank → false）
-     * @return true = 该 provider × 模型组合可用 tool_reference
-     */
-    public static boolean toolReferenceUsable(
-            ModelMapper modelMapper, ProviderMapper providerMapper, String model) {
-        String providerType = ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, model)
-            ? "anthropic" : null;
-        return toolReferenceUsable(providerType, model);
-    }
 
     /**
      * definitive 门控（纯 char fallback）· 对齐 CC {@code isToolSearchEnabled}（toolSearch.ts:385-473）·
@@ -702,26 +673,15 @@ public final class ToolSearchService {
      *   <li>deferred 工具仅当在 discovered set 中才留（:1167-1168，tool_reference 已发现）</li>
      * </ul>
      *
-     * <p>{@code useToolSearch=false}（openai_compatible / deepseek，<b>[openai-lazy] Java 扩展
-     * 2026-09-01，偏离 CC claude.ts:1170-1172「排除 ToolSearch + 全发」</b>）· 三态互斥由
-     * {@link #mode}（search | activate | full）决定：
-     * <ul>
-     *   <li><b>full</b>（mode=full）→ 排除 ToolSearch + 全量发送（含 deferred，模型直接调用无搜索环节，
-     *       对齐 CC :1170-1172 + 旧「完整 schema 模式」）</li>
-     *   <li><b>search / activate</b>（mode=search 默认 / mode=activate）→ 非 deferred 恒留 +
-     *       <b>ToolSearch 恒留</b>（CC :1170-1172 在此分支排除 ToolSearch —— 因 Anthropic 认为模型不支持
-     *       tool_reference 则搜索无意义；Java 扩展保留：openai 模型无 tool_reference，ToolSearch 是唯一
-     *       通道拿到 defer 工具完整 schema（命中返回 {@code <functions>} 文本），若排除 → deferred 工具
-     *       永不暴露 → 死锁）+ deferred 仅当 discovered（openai 恒空）或激活（mode=activate 的激活集）
-     *       中才留 —— <b>懒加载始终成立</b>：vision_analyze 等 defer 工具默认不进 API tools，不占 prompt</li>
-     *   <li><b>短路</b>（deferred 空，claude.ts:1140-1147）→ ToolSearch 无对象可搜 → 排除（省 schema token）</li>
-     * </ul>
+     * <p>{@code useToolSearch=false}（非 anthropic / anthropic×haiku / 显式关闭，<b>2026-09-11 R8
+     * 回归 CC claude.ts:1170-1172</b>）→ <b>恒</b>「排除 ToolSearchTool + 其余（含 deferred/MCP）全量
+     * 完整 schema 内联发送」。deferred/discovered 集合在此分支<b>不参与过滤</b>（恒等式），defer_loading
+     * 也不发射（willDefer = useToolSearch && …，claude.ts:1208-1209）。
      *
      * @param tools              可用工具列表
-     * @param useToolSearch      本 turn 工具搜索开关（true=Anthropic tool_reference 语义；
-     *                           false=openai_compatible，按 {@link #mode} 三态）
-     * @param deferredToolNames  预计算 deferred 名（可 null）
-     * @param discoveredToolNames 消息历史发现的 tool_reference 名集合（可 null；openai 恒空）
+     * @param useToolSearch      本 turn 工具搜索开关（true=Anthropic tool_reference 语义；false=CC 全发）
+     * @param deferredToolNames  预计算 deferred 名（可 null；false 分支不参与过滤）
+     * @param discoveredToolNames 消息历史发现的 tool_reference 名集合（可 null；false 分支不参与过滤）
      * @return 过滤后的工具列表
      */
     public static List<Tool> filterToolsForSchema(
@@ -747,28 +707,13 @@ public final class ToolSearchService {
                 })
                 .toList();
         }
-        // [openai-lazy] useToolSearch=false 不再「排除 ToolSearch + 全发」· 三态互斥（mode 枚举）：
-        //   FULL（mode=full）或短路（无 deferred，claude.ts:1140-1147）→ 排除 ToolSearch + 全量
-        //   （含 deferred；全发模式模型直接调用无搜索环节；短路 ToolSearch 无对象可搜）；
-        //   其余（SEARCH/ACTIVATE）→ 有 deferred → 保留 ToolSearch（模型搜索拿 schema 的唯一通道）
-        //   + deferred 照常过滤（懒加载；discovered 恒空，activated 由 mode=activate 的激活集控制）。
-        if (deferred.isEmpty() || isFullSchemaMode()) {
-            return tools.stream()
-                .filter(t -> t != null && !matchesToolSearchName(t))
-                .toList();
-        }
+        // [R8 · 回归 CC claude.ts:1170-1172] useToolSearch=false → 恒「排除 ToolSearchTool + 全量」
+        //   （含 deferred/MCP；模型无 tool_reference → 工具必须完整内联，否则被剔工具对模型不存在即死锁）。
+        //   删除了 [openai-lazy]「ToolSearch 保留 + deferred 过滤」子路径与 isFullSchemaMode() 特判 ——
+        //   full 模式语义（排除 ToolSearch + 全发）即本恒等分支，无需分派；deferred/discovered/激活集
+        //   在此均不参与（恒等式）。
         return tools.stream()
-            .filter(t -> t != null)
-            .filter(t -> {
-                if (!deferred.contains(t.name())) {
-                    return true;                  // 非 deferred 恒留
-                }
-                if (matchesToolSearchName(t)) {
-                    return true;                  // ToolSearch 恒留（openai 搜索拿 schema 通道）
-                }
-                // deferred 仅 discovered（openai 恒空）或 ToolSearch 激活（mode=activate，Java 扩展）含才留
-                return discovered.contains(t.name()) || isActivated(t.name());
-            })
+            .filter(t -> t != null && !matchesToolSearchName(t))
             .toList();
     }
 

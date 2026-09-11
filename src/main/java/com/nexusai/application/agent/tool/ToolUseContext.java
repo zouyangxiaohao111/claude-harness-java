@@ -164,10 +164,15 @@ public record ToolUseContext(
         @JsonIgnore String effectiveModelName,
         // ═══════════════════ 49 [openai-lazy] effectiveProviderType ═══════════════════
         // 当前 turn 目标 provider 类型 · Java 扩展（无 CC 对应字段）。
-        // 取值："anthropic" / "openai_compatible" / "openai_sdk" / … / null（null=未知）。
-        // 消费方 ToolSearchTool.buildSearchOutput：按 provider 能力（乙-1）分流渲染——
-        //   "anthropic"（有 tool_reference 语义）→ ToolSearch 命中保持纯 tool_reference 块（CC 原样）；
-        //   其它/null/未知 → 追加完整 JSONSchema <functions> 文本（保守防搜索死锁）。
+        // 取值："anthropic" / "openai_compatible" / "openai_sdk" / … / null（null=判不出）。
+        // R8（2026-09-11）后消费方（渲染侧 ToolSearchTool 已无 provider 分支 —— 对齐 CC
+        //   ToolSearchTool.ts:462-469「零分支恒发 tool_reference」）：
+        //   (1) LlmAgentLoop.llmToolsArray 门控 AND：
+        //       isToolSearchEnabled(...) && ToolSearchService.toolReferenceUsable(本字段, modelName)
+        //       —— 非 anthropic / 判不出 → tool search 对本轮关闭 → 排除 ToolSearch + 其余工具完整 schema 内联直发；
+        //   (2) PostCompactAttachmentRestorer 两处 gate（deferred_tools_delta / chrome instructions）。
+        // null/未知的后果 = 判「不支持 tool_reference」→ 关闭 tool search（保守退化：工具不会丢，
+        //   但失去懒加载）；原「追加完整 JSONSchema <functions> 文本块防搜索死锁」渲染分支已随 R8 删除。
         // 单一来源 = AgentLoopContext.toolExecContext 经 ModelConfigResolver.resolveProviderType
         //   （静态单一来源 MAINCHAIN-01）解析后盖章；producer 只读 ctx 比较，无 DB 依赖。
         // @JsonIgnore: 会话运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
@@ -597,7 +602,7 @@ public record ToolUseContext(
              mcpServerConnections,
              null,     // [OPD-D1-01] fileReadingLimits 缺省 → compact ctor 兜底 null (CC optional)
              null,     // [openai-lazy] effectiveModelName 缺省 → null
-             null);    // [openai-lazy] effectiveProviderType 缺省 → null（未知 provider → 保守加文本块）
+             null);    // [openai-lazy] effectiveProviderType 缺省 → null（判不出 → tool search 关闭，全量 schema 内联）
     }
 
     /** Stage 3.1 4 参兼容构造器. */
@@ -1446,16 +1451,24 @@ public record ToolUseContext(
 
     /**
      * [openai-lazy 乙-1] 覆写 effectiveProviderType（当前 turn 目标 provider 类型）·
-     * ToolSearchTool 渲染分流按 <b>provider 能力</b>判（非模型名）：
-     * {@code "anthropic".equalsIgnoreCase(effectiveProviderType)} → 纯 tool_reference 块；
-     * 其它 / null / 未知 → 追加完整 JSONSchema {@code <functions>} 文本（保守防死锁）。
+     * R8 后消费方 = 主循环门控单点（渲染侧已无 provider 分支）：
+     * <ul>
+     *   <li>{@code LlmAgentLoop.llmToolsArray} 门控 AND：
+     *       {@code isToolSearchEnabled(...) && ToolSearchService.toolReferenceUsable(本字段, modelName)}
+     *       —— 非 {@code "anthropic"} / 判不出 → tool search 对本轮关闭 → 排除 ToolSearch +
+     *       其余工具完整 schema 内联直发；</li>
+     *   <li>{@code PostCompactAttachmentRestorer} 两处 gate（同单点 {@code toolReferenceUsable}）。</li>
+     * </ul>
+     * 渲染侧 {@code ToolSearchTool} 已无 provider 分支（对齐 CC {@code ToolSearchTool.ts:462-469}
+     * 零分支恒发 {@code tool_reference}）—— 原「其它 / null / 未知 → 追加完整 JSONSchema
+     * {@code <functions>} 文本」分支已随 R8 删除。
      *
      * <p>单一来源 = AgentLoopContext.toolExecContext 经
      * {@link com.nexusai.infra.llm.ModelConfigResolver#resolveProviderType} 解析后盖章；
      * producer 只读 ctx 做一次字符串比较，无 DB 依赖（{@code new ToolSearchTool()} 无参构造保持）。
      *
-     * <p>null 参数 → 保留现有（no-op，与 withEffectiveModelName 语义一致；缺省 null = 未知 →
-     * 保守加文本块）。
+     * <p>null 参数 → 保留现有（no-op，与 withEffectiveModelName 语义一致；缺省 null = 判不出 →
+     * 关闭 tool search、全量工具 schema 内联，保守但工具不会丢）。
      */
     public ToolUseContext withEffectiveProviderType(String providerType) {
         if (providerType == null) {
@@ -1719,7 +1732,7 @@ public record ToolUseContext(
             this.mcpServerConnections(),   // [MCP-I-9 Q-30] 连接继承 · 继承父 (with 不覆写)
             this.fileReadingLimits(),  // [OPD-D1-01] 继承父 · 对齐 CC forkedAgent.ts:456 fileReadingLimits: parentContext.fileReadingLimits
             this.effectiveModelName(),   // [openai-lazy] 继承父 · 子代理共享父 turn 模型名
-            this.effectiveProviderType() // [openai-lazy] 继承父 · 子代理共享父 turn 目标 provider（ToolSearch 分流渲染用）
+            this.effectiveProviderType() // [openai-lazy] 继承父 · 子代理共享父 turn 目标 provider（主循环门控 toolReferenceUsable 用）
     );
     }
 

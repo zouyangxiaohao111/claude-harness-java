@@ -11128,21 +11128,18 @@ public class LlmAgentLoop implements AgentLoop {
         // [H4] defer_loading 管线（CC claude.ts:1120-1243）· messages/modelName 任一缺失 → 旧行为
         //   （无工具搜索/无发射；compact 直调方与旧测试契约不变）。
         if (available != null && modelName != null) {
-            boolean useToolSearch = ToolSearchService.isToolSearchEnabled(available, modelName, tokenClient);
-            // [openai-lazy] deferred/discovered 预计算移到 useToolSearch 判断前 —— useToolSearch=false
-            //   （deepseek 等 openai_compatible）也要懒加载（deferred 过滤 + ToolSearch 保留），
-            //   filterToolsForSchema 需要 deferred/discovered 集合（不再传 null 走全发旧行为）。
+            // [R8 · 2026-09-11 用户拍板] 门控 AND 并入单点，回归 CC claude.ts:1120-1172：
+            //   isToolSearchEnabled 承担 CC toolSearch.ts:385-473（modelSupportsToolReference +
+            //   ToolSearch 可用性 + mode + tst-auto 阈值）；再 AND 单点
+            //   {@link ToolSearchService#toolReferenceUsable}（provider==anthropic AND modelSupportsToolReference）。
+            //   provider 源 = <b>每轮盖章</b>的 tuc.effectiveProviderType()（与渲染/附件两处同源，
+            //   AgentLoopContext.toolExecContext 盖章；上层已判 tuc 非空）。
+            //   useToolSearch=false（非 anthropic / anthropic×haiku / 显式关闭）→ CC :1170-1172
+            //   「排除 ToolSearch + 全量 schema 内联直发」，绝不发 defer_loading（willDefer = useToolSearch && …，
+            //   claude.ts:1208-1209）—— 非 anthropic 靠门控为 false 拿全量，不再靠「清空 deferred」豁免。
+            boolean useToolSearch = ToolSearchService.isToolSearchEnabled(available, modelName, tokenClient)
+                    && ToolSearchService.toolReferenceUsable(tuc.effectiveProviderType(), modelName);
             Set<String> deferredToolNames = ToolSearchService.computeDeferredToolNames(available);
-            // [openai-defer-exempt 2026-09-08 用户拍板] 通用懒加载豁免：非 anthropic（openai 系
-            //   deepseek/fz/moonshot 等）清空整个 deferred → 所有 shouldDefer 工具全 schema 直发。
-            //   WHY：defer 工具的前提 = 模型能经 ToolSearch/tool_reference 激活被剔工具（CC anthropic
-            //   语义）；openai 兼容模型无 tool_reference、不自知工具存在故不会主动搜索 → 被剔 = 对
-            //   模型不存在。逐工具白名单豁免（vision/WebSearch/SendMessage）已漏网 worktree 工具
-            //   （用户实测叫它建 worktree，它用 bash git worktree add 兜底 —— EnterWorktree/ExitWorktree
-            //   shouldDefer=true 被 filterToolsForSchema 剔出初始 schema）→ 通用化：openai 下全部直发
-            //   一劳永逸（anthropic 保留懒加载，对齐 CC 省 token；下两个专用豁免在 anthropic 分支仍有
-            //   特判语义，保留不动）。
-            exemptAllDeferredForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
             // [vision-defer-model 2026-09-03] vision_analyze 懒加载豁免（装配层按主模型能力判定）：
             //   仅 ant/response 直给格式 + 多模态（supportsImage）才保留懒 —— 该模型能走 Read 直给通道，
             //   vision_analyze 仅 PDF 超预算/分段补充，可 defer 省 token；
@@ -11182,15 +11179,15 @@ public class LlmAgentLoop implements AgentLoop {
                         withSkipSpecial(filtered, querySource).toOpenAiToolsArray(deferredToolNames),
                         true, deferredToolNames);
             }
-            // [openai-lazy] useToolSearch=false（openai_compatible 无 tool_reference，Java 扩展）：
-            //   ToolSearch 保留（模型经搜索拿完整 schema）+ deferred 过滤（懒加载；activated 例外）。
-            //   非 CC claude.ts:1170-1172「排除 ToolSearch + 全发」（openai 懒加载扩展，见 ToolSearchService
-            //   filterToolsForSchema javadoc）。toOpenAiToolsArray() 无 defer_loading 发射（openai API
-            //   无该字段语义，避免 deepseek 收到未知字段）。
+            // [R8 · 回归 CC claude.ts:1170-1172] useToolSearch=false（非 anthropic / anthropic×haiku /
+            //   显式关闭）：只剔除 ToolSearchTool，其余（含 deferred/MCP）<b>全部完整 schema 内联直发</b>。
+            //   deferred 集合此处不参与过滤（filterToolsForSchema false 分支恒等），toOpenAiToolsArray()
+            //   无 defer_loading 发射（openai API 无该字段语义，避免 deepseek 收到未知字段）。
             List<Tool> filtered = ToolSearchService.filterToolsForSchema(
                     available, false, deferredToolNames, discovered);
             if (log.isDebugEnabled()) {
-                log.debug("llmToolsArray: useToolSearch=false（openai-lazy），filteredTools {}→{}（deferred {} 过滤，ToolSearch 保留，模型经搜索拿 schema）",
+                log.debug("llmToolsArray: useToolSearch=false，filteredTools {}→{}（排除 ToolSearch + 全量内联，"
+                    + "对齐 CC claude.ts:1170-1172；deferred {} 不参与过滤）",
                         available.size(), filtered.size(), deferredToolNames.size());
             }
             return new ToolsAssembly(withSkipSpecial(filtered, querySource).toOpenAiToolsArray(), false, deferredToolNames);
@@ -12327,67 +12324,6 @@ public class LlmAgentLoop implements AgentLoop {
                 + "与 vision/WebSearch 同因：openai 兼容模型无 tool_reference，deferred 工具会从初始 "
                 + "schema 被剔，模型不自知无法发消息）");
         }
-    }
-
-    /**
-     * 通用懒加载豁免 · [2026-09-08 用户拍板，2026-09-11 单点化] tool_reference <b>不可用</b>
-     * （非 anthropic provider，或 anthropic 下不支持 tool_reference 的模型如 haiku）→ 清空整个
-     * deferred 集合。
-     *
-     * <p><b>WHY</b>：defer 工具的前提 = 模型能经 ToolSearch/tool_reference 激活被剔工具（CC
-     * anthropic 语义，tool_search beta 通道）。openai 兼容模型（deepseek/fz/moonshot）无
-     * tool_reference → {@code filterToolsForSchema} 把 deferred 剔出初始 schema 后模型不自知存在、
-     * 也不会主动 ToolSearch 搜索 → 对模型<b>工具不存在</b>。逐工具白名单豁免（vision/WebSearch/
-     * SendMessage）逐批漏网 —— EnterWorktree/ExitWorktree {@code shouldDefer=true}（对齐 CC）即中招：
-     * 用户实测叫它建 worktree，它用 {@code bash git worktree add} 兜底（看不到 EnterWorktree）。故
-     * 通用化：openai 下<b>所有</b> deferred 工具全部 schema 直发（不赌模型会搜索），一劳永逸。
-     *
-     * <p>anthropic（有 tool_reference 能激活）保留懒加载省 token，对齐 CC。
-     *
-     * <p><b>判定（2026-09-11 单点化）</b>：委托<b>唯一单点</b>
-     * {@link ToolSearchService#toolReferenceUsable(ModelMapper, ProviderMapper, String)}
-     * （用户拍板「换成这个规则，内部调用同一个规则而不是分三份」）——该单点 = provider 语义
-     * <b>取与</b> 模型能力（{@code toolReferenceUsable} = {@code "anthropic".equals(providerType)}
-     * {@code &&} {@code modelSupportsToolReference(model)}）。
-     * <b>可用 → return（保留懒加载）；不可用 → {@code deferred.clear()}（全部 schema 直发）</b>。
-     * 故判据不止「是否 anthropic」，还含<b>模型那一半</b>：
-     * <ul>
-     *   <li>anthropic × 支持模型（非 haiku）→ 可用 → 保留懒加载（对齐 CC 省 token）；</li>
-     *   <li>anthropic × <b>haiku</b> → 不可用（haiku 不解析 tool_reference，toolSearch.ts:200-204）
-     *       → 清空（本方法借此与渲染/附件两处判据一致；旧实现只判 provider → haiku 下漏清，
-     *       反让 ToolSearch 留在 deferred、且给 haiku 发 tool_reference）；</li>
-     *   <li>非 anthropic（openai_compatible/openai_sdk/未来 response）→ 不可用 → 清空。</li>
-     * </ul>
-     *
-     * <p><b>4 参旧签名契约不变</b>：原有的 {@code deferred == null/empty} 与
-     * {@code modelMapper == null || providerMapper == null} 两处提前 return 保留 —— mapper 缺失
-     * 无法判 provider → <b>不豁免</b>（保持懒，同 WebSearch 语义；llmToolsArray 主装配路径恒带
-     * mapper）。此路径的语义本轮未改。
-     *
-     * @param deferred       deferred 工具名集合（原地 clear；null / 空容忍）
-     * @param modelMapper    模型 mapper（null → 不豁免，保持 deferred）
-     * @param providerMapper 提供商 mapper（null → 不豁免，保持 deferred）
-     * @param modelName      当前生效模型名（可 null）
-     */
-    static void exemptAllDeferredForOpenAi(Set<String> deferred,
-            ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
-        if (deferred == null || deferred.isEmpty()) {
-            return; // 空集 / null → no-op（装配容忍）
-        }
-        if (modelMapper == null || providerMapper == null) {
-            return; // 无法判 provider → 保持既有懒加载（4 参旧签名契约，同 WebSearch 语义）
-        }
-        if (ToolSearchService.toolReferenceUsable(modelMapper, providerMapper, modelName)) {
-            return; // tool_reference 可用（anthropic × 支持模型）→ 保留懒加载（对齐 CC defer）
-        }
-        // provider 无 tool_reference 语义（openai_compatible/openai_sdk/未来 response）或模型不支持
-        // （anthropic × haiku）→ 全部 schema 直发
-        if (log.isDebugEnabled()) {
-            log.debug("llmToolsArray: tool_reference 不可用（provider 非 anthropic 或模型不支持）通用懒加载"
-                + "豁免，deferred {} 个工具全部 schema 直发（被剔工具对模型不存在——含 EnterWorktree/"
-                + "ExitWorktree；单点 toolReferenceUsable 判据）", deferred.size());
-        }
-        deferred.clear();
     }
 
     /**
