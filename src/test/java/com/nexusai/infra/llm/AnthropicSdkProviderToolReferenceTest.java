@@ -38,9 +38,9 @@ class AnthropicSdkProviderToolReferenceTest {
         blocks.add(JSON.readTree("{\"type\":\"tool_reference\",\"tool_name\":\"Foo\"}"));
 
         ChatMessageDto msg = toolMsg("", blocks);
-        JsonNode body = buildParamsWire(List.of(msg));
+        JsonNode body = toolWire(msg);
 
-        JsonNode content = body.get("messages").get(0).get("content");
+        JsonNode content = body.get("content");
         assertThat(content.isArray()).isTrue();
         assertThat(content.size()).isEqualTo(1);
         assertThat(content.get(0).get("type").asText()).isEqualTo("tool_result");
@@ -60,9 +60,9 @@ class AnthropicSdkProviderToolReferenceTest {
         blocks.add(JSON.readTree("{\"type\":\"tool_reference\",\"tool_name\":\"Bar\"}"));
 
         ChatMessageDto msg = toolMsg("search matched", blocks);
-        JsonNode body = buildParamsWire(List.of(msg));
+        JsonNode body = toolWire(msg);
 
-        JsonNode toolContent = body.get("messages").get(0).get("content").get(0).get("content");
+        JsonNode toolContent = body.get("content").get(0).get("content");
         assertThat(toolContent.isArray()).isTrue();
         assertThat(toolContent.size()).isEqualTo(2);
         assertThat(toolContent.get(0).get("type").asText()).isEqualTo("text");
@@ -80,8 +80,8 @@ class AnthropicSdkProviderToolReferenceTest {
         ChatMessageDto msg = toolMsg("", blocks);
 
         assertThatCode(() -> {
-            JsonNode body = buildParamsWire(List.of(msg));
-            JsonNode toolContent = body.get("messages").get(0).get("content").get(0).get("content");
+            JsonNode body = toolWire(msg);
+            JsonNode toolContent = body.get("content").get(0).get("content");
             // tool_name 缺失 → 块被跳过（log.warn），tool_result.content 为空数组，不产生畸形块
             assertThat(toolContent.isArray()).isTrue();
             assertThat(toolContent.size()).isEqualTo(0);
@@ -96,6 +96,23 @@ class AnthropicSdkProviderToolReferenceTest {
             null, null, null, null, null, null,
             OffsetDateTime.now(), "call-id-abc", null,
             null, contentBlocks == null ? List.of() : contentBlocks, List.of());
+    }
+
+    /**
+     * [P1] 取「该 tool 消息」在其真实协议位置上的 wire 节点：前置 owning assistant（tool_calls
+     * 含同 id）已配对。发送边界新增 {@link ToolResultPairingRepair}（CC {@code ensureToolResultPairing}，
+     * messages.ts:5594-5951）后，无前置 tool_use 的孤立 tool 结果会按 CC 语义在发往 API 前被剥离
+     * —— 孤立 fixture 已无法到达 wire，故 fixture 补上 owning assistant（协议上 tool 消息本就必须
+     * 应答前置 assistant.tool_calls）。
+     */
+    private static JsonNode toolWire(ChatMessageDto toolMsg) throws Exception {
+        ChatMessageDto owner = new ChatMessageDto(
+            "asst-owner", "sess-1", Role.assistant, "assistant", "",
+            null, List.of(new com.nexusai.model.session.dto.ToolCallDto(
+                toolMsg.toolCallId(), "test_tool", "{}", null, false)),
+            null, null, null, null, OffsetDateTime.now(), null, null,
+            null, null, null);
+        return buildParamsWire(List.of(owner, toolMsg)).get("messages").get(1);
     }
 
     /** [DEC-RV-07 REWORK-2] 生产 SDK wire：buildMessageParams → _body() 序列化 JsonNode。 */

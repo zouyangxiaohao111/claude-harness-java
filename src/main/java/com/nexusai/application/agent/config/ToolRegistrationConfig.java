@@ -199,6 +199,21 @@ public class ToolRegistrationConfig {
     private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
 
     /**
+     * [compact-cost] 模型计费纯函数（@Component）· manual {@code /compact} 压缩调用 usage 折算
+     * 会话成本时使用（{@code LlmAgentLoop.accumulateCompactionSessionCost} 的 calculator 形参）。
+     *
+     * <p>WHY: 压缩那次 LLM 调用的 usage 必须并入会话成本/用量合计（CC {@code claude.ts:2361
+     * costUSD += addToTotalSessionCost(costUSDForPart, usage, options.model)}）——auto / reactive
+     * 两路已接（{@code LlmAgentLoop:5361/6969} 经 {@code ctx.modelCostCalculator()}），manual
+     * {@code /compact} 此前漏接 → 真机漏算。{@code @Autowired(required=false)} 字段注入（镜像
+     * {@link #settingsMapper} / {@link #planProvider} 既有模式，<b>不动构造器签名</b>——直构测试
+     * 逐位不变）；null（直构测试 / 无 bean）→ 仅累计 input/output tokens，cost/按模型桶跳过
+     * （{@code accumulateCompactionSessionCost} 内既有 null 语义，零 NPE）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.ModelCostCalculator modelCostCalculator;
+
+    /**
      * [monitor-rework] MONITOR_MCP 流式监控执行器（@Component）· MonitorTool 生产接线注入。
      *
      * <p>WHY: MonitorTool 从 stub 升级为真实现，execute 需经 {@code registerTask + monitor}
@@ -2338,6 +2353,20 @@ public class ToolRegistrationConfig {
         com.nexusai.application.agent.compact.CompactProgressState.registerSessionAbort(sessionId, compactAbort);
         try {
             CompactCommand.CompactCommandResult result = CompactCommand.call(args, ctx);
+            // [compact-cost] manual /compact 那次 LLM 调用的 usage → 会话成本/用量合计
+            //   （对齐 CC claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage,
+            //   options.model) → cost-tracker.ts:250-276 → state.ts:551-558）。auto / reactive
+            //   两路已接（LlmAgentLoop:5361/6969），manual 此前漏接 → 真机漏算。
+            //   模型 = resolveManualCompactModel(state)：与上方 buildCompactCommandContext 喂给
+            //   CompactConversationContext 的模型<b>同一求值</b>（真正执行本次摘要调用的模型，
+            //   价格按模型/provider 分派）——用会话主模型顶替会算错金额。
+            //   ✗ 不进 runUsage（压缩是 side call，CC result.usage 不含它）。
+            //   位置 = call 成功后、写回前（仅成功路径；call 抛异常 → catch 分支，不计）。
+            //   compactionUsage 为 null（SM 优先路径无 LLM 调用）→ accumulateCompactionSessionCost
+            //   内 null 守卫生效 → 安全 no-op。
+            com.nexusai.application.agent.LlmAgentLoop.accumulateCompactionSessionCost(
+                state, resolveManualCompactModel(state),
+                result.compactionResult().compactionUsage(), modelCostCalculator);
             log.info("[R1] /compact 压缩成功: session={} displayText={}",
                 sessionId, result.displayText());
             // ── 4. 结果写回会话（落库 + 内存替换）· 对齐 CC processSlashCommand.tsx:895-916 ──

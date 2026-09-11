@@ -95,15 +95,19 @@ class E4ToolResultFormCcContractTest {
     @Test
     @DisplayName("序列化侧：Role.tool + toolCallId → SDK user 角色 + tool_result 块（tool_use_id）——线上形态与 CC 全同")
     void serializationSide_roleToolBecomesUserWrappedToolResultOnWire() {
+        // [P1] owning assistant 必须在场：发送边界的 ToolResultPairingRepair（CC ensureToolResultPairing，
+        //   messages.ts:5594-5951）会把无前置 tool_use 的孤立 tool 结果按 CC 语义剥离；协议上 tool 消息
+        //   本就必须应答前置 assistant.tool_calls，故 fixture 补齐（历史形态 = user → assistant(tool_use) → tool）。
         List<ChatMessageDto> history = List.of(
             msg(Role.user, "u0", "turn1"),
+            assistantWithToolUse("a0", "toolu_e4_1"),
             toolResultDto("tr1", "toolu_e4_1"));
 
         MessageCreateParams params = AnthropicSdkProviderShim.buildMessageParams(history);
         List<MessageParam> msgs = params.messages();
-        assertThat(msgs).hasSize(2);
+        assertThat(msgs).hasSize(3);
 
-        MessageParam last = msgs.get(1);
+        MessageParam last = msgs.get(2);
         // anthropic-java：content 为 Union（String | List<ContentBlockParam>）——tool 消息必然块形态
         assertThat(last.role()).as("线上角色 = user（SDK 要求 tool_result 挂在 user 消息）")
             .isEqualTo(MessageParam.Role.USER);

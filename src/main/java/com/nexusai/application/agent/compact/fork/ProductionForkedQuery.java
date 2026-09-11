@@ -433,15 +433,29 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
             for (ToolUseBlock call : msg.toolCalls()) {
                 ToolResult<?> result = executeGatedTool(call, params, forkCtx);
                 // [G2] 复用 LlmAgentLoop.toolResultMessage（DEL-G2-02：删除私有影子实现）
-                ChatMessageDto toolMsg = LlmAgentLoop.toolResultMessage(result);
+                // [fork-toolcallid] toolUseId / isError 显式透传 —— 对齐 CC toolExecution.ts:1367
+                //   {@code tool.mapToolResultToToolResultBlockParam(result.data, toolUseID)}：
+                //   toolUseID 是<b>显式参数</b>，绝不从 ToolResult 里取（IMP-C2 已删 ToolResult.toolUseId/
+                //   isError 字段，组 2-1 拍板）。
+                //   旧实现走 1 参重载 {@code toolResultMessage(result)} → toolUseId 恒 null →
+                //   provider role=tool 分支丢弃该条消息（OpenAiSdkProvider「跳过缺少 toolCallId 的
+                //   tool 消息」）→ 下一轮 assistant(tool_calls) 无对应 tool 响应 → OpenAI/DeepSeek 400。
+                //   真机日志实证：36 次「跳过缺少 toolCallId 的 tool 消息」全在 fork 线程，
+                //   EXTRACT_MEMORIES 第 2 轮 8 次。
+                //   isError 推导与紧邻 debug 日志同源（{@link LlmAgentLoop#isToolErrorData}，主循环
+                //   AgentLoopContext:1836 同款显式透传语义）；tool 传 null = 与旧 1 参重载完全一致的
+                //   payload 渲染路径（per-tool mapper 不参与 → 本次改动不动载荷字节）。
+                boolean toolIsError = LlmAgentLoop.isToolErrorData(result.data());
+                ChatMessageDto toolMsg = LlmAgentLoop.toolResultMessage(result,
+                    call.id(), toolIsError, null, null, null,
+                    List.of(), List.of(), java.util.Map.of());
                 outputMessages.add(toolMsg);
                 runningMessages.add(toolMsg);
                 // G-79 流式回调：tool_result 消息同样产出即回调（CC query() 产出 user 消息亦回调）
                 params.onMessage().accept(toolMsg);
                 if (log.isDebugEnabled()) {
                     log.debug("[ProductionForkedQuery] 工具执行完成: name={} id={} isError={}",
-                        call.name(), call.id(),
-                        com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(result.data()));
+                        call.name(), call.id(), toolIsError);
                 }
             }
         }

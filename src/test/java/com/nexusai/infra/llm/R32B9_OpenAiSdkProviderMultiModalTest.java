@@ -40,9 +40,8 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
     @DisplayName("role=tool 无 contentBlocks → 单 string content (向后兼容)")
     void roleToolNoContentBlocks() throws Exception {
         ChatMessageDto msg = toolMsg("Hello", null);
-        JsonNode body = sdkWire(List.of(msg));
+        JsonNode toolMsg = toolWire(msg);
 
-        JsonNode toolMsg = body.get(0);
         assertThat(toolMsg.get("role").asText()).isEqualTo("tool");
         assertThat(toolMsg.get("tool_call_id").asText()).isEqualTo("call-id-abc");
         assertThat(toolMsg.get("content").asText()).isEqualTo("Hello");
@@ -56,9 +55,8 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
             null, null, null, null, null, null,
             OffsetDateTime.now(), "call-id-abc", null,
             "请重新执行", List.of(), List.of());
-        JsonNode body = sdkWire(List.of(msg));
+        JsonNode toolMsg = toolWire(msg);
 
-        JsonNode toolMsg = body.get(0);
         JsonNode content = toolMsg.get("content");
         assertThat(content.isArray()).isTrue();
         assertThat(content.size()).isEqualTo(2);
@@ -76,11 +74,11 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
             null, null, null, null, null, null,
             OffsetDateTime.now(), "call-id-abc", null,
             null, List.of(), List.of(), java.util.Map.of("answer", "yes"));
-        JsonNode body = sdkWire(List.of(msg));
+        JsonNode body = toolWire(msg);
 
         // IT-6: CC normalizeAttachmentForAPI structured_output→[]（messages.ts:4258-4261）
         // → tool content 回落标量 text，不再出现 JSON text part。
-        JsonNode content = body.get(0).get("content");
+        JsonNode content = body.get("content");
         assertThat(content.isTextual()).isTrue();
         assertThat(content.asText()).isEqualTo("plain result");
     }
@@ -94,9 +92,9 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
         blocks.add(JSON.readTree("{\"type\":\"text\",\"text\":\"附加说明\"}"));
 
         ChatMessageDto msg = toolMsg("Image result", blocks);
-        JsonNode body = sdkWire(List.of(msg));
+        JsonNode body = toolWire(msg);
 
-        JsonNode content = body.get(0).get("content");
+        JsonNode content = body.get("content");
         assertThat(content.isArray()).isTrue();
         // text(content) + text(附加说明)；image_url 不得出现（R-T-1 受控残留）
         assertThat(content.size()).isEqualTo(2);
@@ -116,9 +114,9 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
         blocks.add(JSON.readTree("{\"type\":\"text\",\"text\":\"附加说明\"}"));
 
         ChatMessageDto msg = toolMsg("Search result", blocks);
-        JsonNode body = sdkWire(List.of(msg));
+        JsonNode body = toolWire(msg);
 
-        JsonNode content = body.get(0).get("content");
+        JsonNode content = body.get("content");
         assertThat(content.isArray()).isTrue();
         // text(content) + text(附加说明)；tool_reference 不得序列化（OpenAI 无原生块 → 回退 content 文本）
         assertThat(content.size()).isEqualTo(2);
@@ -131,8 +129,8 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
         }
         assertThat(content.get(1).get("text").asText()).isEqualTo("附加说明");
         // 整条 tool 消息不得出现 tool_reference / tool_name 字段（N/A：序列化行为不变）
-        assertThat(body.get(0).toString()).doesNotContain("tool_reference");
-        assertThat(body.get(0).toString()).doesNotContain("tool_name");
+        assertThat(body.toString()).doesNotContain("tool_reference");
+        assertThat(body.toString()).doesNotContain("tool_name");
     }
 
     @Test
@@ -200,6 +198,22 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
             null, null, null, null, null, null,
             OffsetDateTime.now(), "call-id-abc", null,
             null, contentBlocks == null ? List.of() : contentBlocks, List.of());
+    }
+
+    /**
+     * [P1] 取「该 tool 消息」在其真实协议位置上的 wire 节点：前置 owning assistant（tool_calls
+     * 含同 id）已配对。发送边界新增 {@link ToolResultPairingRepair}（CC {@code ensureToolResultPairing}，
+     * messages.ts:5594-5951）后，无前置 tool_use 的孤立 tool 结果会按 CC 语义在发往 API 前被剥离
+     * —— 孤立 fixture 已无法到达 wire，故 fixture 补上 owning assistant（协议上 tool 消息本就必须
+     * 应答前置 assistant.tool_calls）。
+     */
+    private static JsonNode toolWire(ChatMessageDto toolMsg) throws Exception {
+        ChatMessageDto owner = new ChatMessageDto(
+            "asst-owner", "sess-1", Role.assistant, "assistant", "",
+            null, List.of(new ToolCallDto(toolMsg.toolCallId(), "test_tool", "{}", null, false)),
+            null, null, null, null, OffsetDateTime.now(), null, null,
+            null, null, null);
+        return sdkWire(List.of(owner, toolMsg)).get(1);
     }
 
     /** [OpenAI-SDK 迁移] 生产 SDK wire：buildSdkMessages → ObjectMappers 序列化 JsonNode。 */

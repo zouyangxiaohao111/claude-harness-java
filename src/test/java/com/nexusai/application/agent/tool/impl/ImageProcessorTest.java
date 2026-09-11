@@ -84,8 +84,11 @@ class ImageProcessorTest {
         ChatMessageDto msg = LlmAgentLoop.toolResultMessage(
             result, "call-img-1", false, tool, null, null, List.of(), List.of(), Map.of());
 
-        JsonNode body = buildParamsWire(List.of(msg));
-        JsonNode content = body.get("messages").get(0).get("content");
+        // [P1] owning assistant 必须在场：发送边界的 ToolResultPairingRepair（CC ensureToolResultPairing，
+        //   messages.ts:5594-5951）会把无前置 tool_use 的孤立 tool 结果按 CC 语义剥离；协议上 tool 消息
+        //   本就必须应答前置 assistant.tool_calls。
+        JsonNode body = buildParamsWire(List.of(owningAssistant("call-img-1"), msg));
+        JsonNode content = body.get("messages").get(1).get("content");
         assertThat(content.size()).as("image 独立块送达：单条消息应只含 1 个 tool_result 块（image 嵌套其内）").isEqualTo(1);
         JsonNode toolResult = content.get(0);
         assertThat(toolResult.get("type").asText()).isEqualTo("tool_result");
@@ -107,5 +110,15 @@ class ImageProcessorTest {
             "claude-opus-4", null, history, null, null, null, null, null, null);
         return JSON.readTree(com.anthropic.core.ObjectMappers.jsonMapper()
             .writeValueAsString(params._body()));
+    }
+
+    /** [P1] owning assistant（tool_calls 含同 id）：tool 消息的协议前置（否则被发送边界配对修复当孤儿剥离）。 */
+    private static ChatMessageDto owningAssistant(String toolUseId) {
+        return new ChatMessageDto(
+            "asst-owner", null, com.nexusai.model.session.dto.Role.assistant, "assistant", "",
+            null, List.of(new com.nexusai.model.session.dto.ToolCallDto(
+                toolUseId, "Read", "{}", null, false)),
+            null, null, null, null, java.time.OffsetDateTime.now(), null, null,
+            null, null, null, null);
     }
 }

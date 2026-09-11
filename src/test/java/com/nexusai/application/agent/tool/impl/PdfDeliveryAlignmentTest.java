@@ -267,13 +267,27 @@ class PdfDeliveryAlignmentTest {
             null, List.of(documentBlockNode("QUJDRA==")), List.of(),
             null, false, false);
 
-        JsonNode userMsg = invokeAnthropicBuildRequestBody(List.of(toolMsg)).get("messages").get(0);
+        // [P1] owning assistant 必须在场：发送边界的 ToolResultPairingRepair（CC ensureToolResultPairing，
+        //   messages.ts:5594-5951）会把无前置 tool_use 的孤立 tool 结果按 CC 语义剥离；协议上 tool 消息
+        //   本就必须应答前置 assistant.tool_calls。
+        JsonNode userMsg = invokeAnthropicBuildRequestBody(
+            List.of(owningAssistant("call-pdf-1"), toolMsg)).get("messages").get(1);
         JsonNode content = userMsg.get("content");
         assertThat(content.get(0).get("type").asText()).isEqualTo("tool_result");
         assertThat(content.get(1).get("type").asText())
             .as("role=tool contentBlocks 中的 document 块必须渲染（CC addToolResult contentBlocks push）")
             .isEqualTo("document");
         assertThat(content.get(1).get("source").get("data").asText()).isEqualTo("QUJDRA==");
+    }
+
+    /** [P1] owning assistant（tool_calls 含同 id）：tool 消息的协议前置（否则被发送边界配对修复当孤儿剥离）。 */
+    private static ChatMessageDto owningAssistant(String toolUseId) {
+        return new ChatMessageDto(
+            "asst-owner", null, Role.assistant, "assistant", "",
+            null, List.of(new com.nexusai.model.session.dto.ToolCallDto(
+                toolUseId, "Read", "{}", null, false)),
+            null, null, null, null, java.time.OffsetDateTime.now(), null, null,
+            null, null, null, null);
     }
 
     /** [DEC-RV-07 REWORK-2] 生产 SDK wire：buildMessageParams → _body() 序列化 JsonNode。 */

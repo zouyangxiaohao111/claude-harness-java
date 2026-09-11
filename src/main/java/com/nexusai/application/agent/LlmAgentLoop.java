@@ -1672,12 +1672,18 @@ public class LlmAgentLoop implements AgentLoop {
      * 价格按模型/provider 分派（ModelCostCalculator 的 anthropic/deepseek cache 语义不同）——
      * 用会话主模型顶替会算错金额。
      *
-     * @param state        会话累计载体（null → no-op）
+     * <p><b>可见性 public（跨包调用）</b>：同 {@link #publishMessageUsage} 先例 —— manual {@code /compact}
+     * （{@code com.nexusai.application.agent.config.ToolRegistrationConfig}）与 partial 压缩
+     * （{@code com.nexusai.application.agent.compact.PartialCompactService}）均在 agent 子包内，
+     * 需直接调用本入口把各自那次压缩调用的 usage 并入同一会话合计（<b>不新造第二套统计</b>）。
+     * 签名/语义未变，仅放宽可见性（private static → public static）。
+     *
+     * @param state        会话累计载体（null → no-op；partial 路径未注册会话即此情形）
      * @param compactModel 本次压缩调用实际使用的模型（null → no-op，不猜）
      * @param usage        压缩调用 usage（null / 四字段全零 → no-op，不污染桶）
      * @param calculator   模型计费纯函数（null → 仅累计 input/output tokens，cost/桶跳过）
      */
-    private static void accumulateCompactionSessionCost(
+    public static void accumulateCompactionSessionCost(
             AgentState state, String compactModel,
             CompactConversation.TokenUsage usage,
             com.nexusai.application.agent.cost.ModelCostCalculator calculator) {

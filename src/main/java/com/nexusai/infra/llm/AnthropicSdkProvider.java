@@ -2093,6 +2093,11 @@ public class AnthropicSdkProvider implements LlmProvider {
     private static List<MessageParam> buildSdkMessages(List<ChatMessageDto> history) {
         List<MessageParam> msgs = new ArrayList<>();
         if (history == null) return msgs;
+        // [P1 发送边界配对修复] CC original: ensureToolResultPairing（claude.ts:1324，主线程与 fork 共用
+        //   同一处；forkedAgent.ts:538-541 明确「不在 fork 侧过滤悬挂 tool_use，下游统一修」）。
+        //   Anthropic 通道唯一 DTO→wire 转换点（buildMessageParams → stream/chat/chatWithRaw/chatWithOptions
+        //   及 fork 的 ProductionForkedQuery.streamOnce 全经此）。
+        history = ToolResultPairingRepair.ensureToolResultPairing(history);
         for (ChatMessageDto m : history) {
             if (m == null || m.role() == null) continue;
             if (m.role() == Role.system) {
@@ -2144,6 +2149,13 @@ public class AnthropicSdkProvider implements LlmProvider {
                     trb.contentOfBlocks(toolContent);
                 } else {
                     trb.content(m.content() == null ? "" : m.content());
+                }
+                // [P1] is_error 透传 · CC original tool_result.is_error（messages.ts:4754；合成占位
+                //   syntheticBlocks 恒 is_error:true，messages.ts:5796-5801）。缺此接线时
+                //   ToolResultPairingRepair 的合成错误占位在 Anthropic wire 上与正常结果无法区分。
+                //   仅 true 时写入（false 不显式下发，既有非错误结果的出站字节零变化）。
+                if (m.isError()) {
+                    trb.isError(true);
                 }
                 blocks.add(ContentBlockParam.ofToolResult(trb.build()));
                 // [R32-b9-fix Fix E] acceptFeedback 独立 text block

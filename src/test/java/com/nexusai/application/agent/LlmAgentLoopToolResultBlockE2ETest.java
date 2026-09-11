@@ -71,8 +71,7 @@ class LlmAgentLoopToolResultBlockE2ETest {
         assertThat(producerBlock.get("tool_name").asText()).isEqualTo("Read");
 
         // ── provider wire 断言：tool_result.content 为块数组，含 tool_reference ──
-        JsonNode body = buildWire(msg);
-        JsonNode toolResultBlock = body.get("messages").get(0).get("content").get(0);
+        JsonNode toolResultBlock = toolResultBlockWire(msg);
         assertThat(toolResultBlock.get("type").asText()).isEqualTo("tool_result");
         assertThat(toolResultBlock.get("tool_use_id").asText()).isEqualTo("toolu_1");
 
@@ -95,8 +94,7 @@ class LlmAgentLoopToolResultBlockE2ETest {
         ChatMessageDto msg = LlmAgentLoop.toolResultMessage(
                 (ToolResult<?>) result, "toolu_1", false, tool, null, null, List.of(), List.of(), Map.of());
 
-        JsonNode body = buildWire(msg);
-        JsonNode toolContent = body.get("messages").get(0).get("content").get(0).get("content");
+        JsonNode toolContent = toolResultBlockWire(msg).get("content");
 
         assertThat(toolContent.isArray()).isTrue();
         assertThat(toolContent.size()).isEqualTo(2);
@@ -120,8 +118,7 @@ class LlmAgentLoopToolResultBlockE2ETest {
         assertThat(msg.contentBlocks()).as("空结果路径不注入块").isEmpty();
         assertThat(msg.content()).as("空结果走文本回退").startsWith("No matching deferred tools found");
 
-        JsonNode body = buildWire(msg);
-        JsonNode toolResultBlock = body.get("messages").get(0).get("content").get(0);
+        JsonNode toolResultBlock = toolResultBlockWire(msg);
         assertThat(toolResultBlock.get("type").asText()).isEqualTo("tool_result");
         assertThat(toolResultBlock.get("content").isTextual()).isTrue();
         assertThat(toolResultBlock.get("content").asText())
@@ -140,13 +137,27 @@ class LlmAgentLoopToolResultBlockE2ETest {
         return tool.execute(call, ctx);
     }
 
-    /** 生产 SDK wire：buildMessageParams → _body() 序列化 JsonNode（复用 R32B9 测试模式）。 */
-    private JsonNode buildWire(ChatMessageDto msg) throws Exception {
+    /**
+     * 生产 SDK wire：buildMessageParams → _body() 序列化 → 取「该 tool 消息」的 tool_result 块 JsonNode
+     * （复用 R32B9 测试模式）。
+     *
+     * <p>[P1] owning assistant（tool_calls 含同 id）与 tool 消息同历史配对：发送边界的
+     * {@code ToolResultPairingRepair}（CC {@code ensureToolResultPairing}，messages.ts:5594-5951）会将
+     * 无前置 tool_use 的孤立 tool 结果按 CC 语义剥离；协议上 tool 消息本就必须应答前置
+     * assistant.tool_calls，故 fixture 补齐（wire 形态 = assistant(tool_use) → user(tool_result)）。
+     */
+    private JsonNode toolResultBlockWire(ChatMessageDto msg) throws Exception {
+        ChatMessageDto owner = new ChatMessageDto(
+                "asst-owner", null, com.nexusai.model.session.dto.Role.assistant, "assistant", "",
+                null, List.of(new com.nexusai.model.session.dto.ToolCallDto(
+                        msg.toolCallId(), "ToolSearch", "{}", null, false)),
+                null, null, null, null, null, null, null, null, List.of(), List.of(), null, false, false);
         com.anthropic.models.messages.MessageCreateParams params = AnthropicSdkProvider.buildMessageParams(
                 "claude-opus-4", (java.util.List<com.nexusai.application.agent.prompt.SystemPromptBlock>) null,
-                List.of(msg), null, null, null, null, null, null);
-        return JSON.readTree(com.anthropic.core.ObjectMappers.jsonMapper()
+                List.of(owner, msg), null, null, null, null, null, null);
+        JsonNode body = JSON.readTree(com.anthropic.core.ObjectMappers.jsonMapper()
                 .writeValueAsString(params._body()));
+        return body.get("messages").get(1).get("content").get(0);
     }
 
     /** 最小 deferred 匿名工具：shouldDefer=true 使 ToolSearchTool 将其纳入 deferred 全集。 */

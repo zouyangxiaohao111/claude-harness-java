@@ -658,7 +658,16 @@ public class OpenAiSdkProvider implements LlmProvider {
             b.addSystemMessage(systemPrompt);
         }
         if (history != null) {
-            for (ChatMessageDto m : history) {
+            // [P1 发送边界配对修复] CC original: ensureToolResultPairing（claude.ts:1324 —— 主线程与 fork
+            //   共用同一处；forkedAgent.ts:538-541 明确「不在 fork 侧 filter 悬挂 tool_use，下游统一修」）。
+            //   Java 侧唯一 DTO→wire 转换点即此处（stream/chat/chatWithRaw/chatWithOptions 共用），
+            //   fork 经 ProductionForkedQuery.streamOnce → provider.stream 同样落到这里。
+            List<ChatMessageDto> outbound = ToolResultPairingRepair.ensureToolResultPairing(history);
+            if (outbound != history && log.isDebugEnabled()) {
+                log.debug("OpenAiSdkProvider 发送边界配对修复: {} → {} 条（悬挂 tool_use/孤儿 tool_result）",
+                    history.size(), outbound.size());
+            }
+            for (ChatMessageDto m : outbound) {
                 ChatCompletionMessageParam param = toSdkMessage(m);
                 if (param != null) {
                     b.addMessage(param);
@@ -757,7 +766,9 @@ public class OpenAiSdkProvider implements LlmProvider {
     public static List<ChatCompletionMessageParam> buildSdkMessages(List<ChatMessageDto> history) {
         List<ChatCompletionMessageParam> msgs = new ArrayList<>();
         if (history == null) return msgs;
-        for (ChatMessageDto m : history) {
+        // [P1 发送边界配对修复] 与 buildRequestParams(:660) 同源同语义 —— 测试驱动路径与生产路径
+        //   共用 ToolResultPairingRepair.ensureToolResultPairing（CC claude.ts:1324 唯一调用点同款）。
+        for (ChatMessageDto m : ToolResultPairingRepair.ensureToolResultPairing(history)) {
             ChatCompletionMessageParam param = toSdkMessage(m);
             if (param != null) msgs.add(param);
         }
