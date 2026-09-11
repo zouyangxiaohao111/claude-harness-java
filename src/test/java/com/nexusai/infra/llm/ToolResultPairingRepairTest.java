@@ -318,11 +318,11 @@ class ToolResultPairingRepairTest {
         assertThat(rebuilt.isMeta()).isEqualTo(withExtras.isMeta());
     }
 
-    // ─────────── ⊕ Java 扩展：无 id 结果认领（CC 无对应 · 仅 1:1 无歧义） ───────────
+    // ─────────── 无 id 结果：CC 无此输入形态 → 丢弃（不认领） ───────────
 
     @Test
-    @DisplayName("⊕ 1 个悬挂 + 1 条无 id 结果 → 认领真实输出（不合成错误占位，保住工具结果）")
-    void singleNullIdResult_isAdoptedInsteadOfSynthesized() {
+    @DisplayName("无 id 结果 → 丢弃（不认领）；其对应悬挂 id 收合成错误占位")
+    void nullIdResult_isDroppedAndMissingIdSynthesized() {
         List<ChatMessageDto> in = List.of(
             user("hi"),
             assistant("", call("toolu_A")),
@@ -330,15 +330,23 @@ class ToolResultPairingRepairTest {
 
         List<ChatMessageDto> out = ToolResultPairingRepair.ensureToolResultPairing(in);
 
+        // WHY（对齐 CC）：CC 的 tool_result 恒带 tool_use_id（ToolResultBlockParam.messages 里
+        // tool_result 必填 tool_use_id），不存在「无 id 结果」这种输入 → 也就没有任何认领逻辑。
+        // 对不上任何 tool_use 的结果统一走 orphanedIds 剥离：
+        //   CC original: messages.ts:5817-5834 `if (orphanedSet.has(trId)) return false`。
+        // 其对应的悬挂 tool_use 由合成块补齐：
+        //   CC original: messages.ts:5796-5801 syntheticBlocks = {tool_use_id, content: 占位, is_error: true}。
         assertThat(out).hasSize(3);
         assertThat(out.get(2).toolCallId()).isEqualTo("toolu_A");
-        assertThat(out.get(2).content()).isEqualTo("REAL OUTPUT");
-        assertThat(out.get(2).isError()).isFalse();
+        assertThat(out.get(2).content()).isEqualTo(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER);
+        assertThat(out.get(2).isError()).isTrue();
+        // 真实输出被丢弃（数据保真度下降，见 R5 blockers）：既不认领，也不以任何形式保留
+        assertThat(out).noneSatisfy(m -> assertThat(m.content()).isEqualTo("REAL OUTPUT"));
     }
 
     @Test
-    @DisplayName("⊕ 无歧义前提不满足（2 悬挂 + 1 无 id）→ 不认领，回退 CC 语义（丢弃 + 合成占位）")
-    void ambiguousNullIdResults_areNotAdopted() {
+    @DisplayName("2 悬挂 + 1 无 id 结果 → 无 id 结果丢弃，两个 id 各收合成占位（仍不认领）")
+    void nullIdResult_alwaysDropped_missingIdsSynthesized() {
         List<ChatMessageDto> in = List.of(
             user("hi"),
             assistant("", call("toolu_A"), call("toolu_B")),
@@ -346,6 +354,8 @@ class ToolResultPairingRepairTest {
 
         List<ChatMessageDto> out = ToolResultPairingRepair.ensureToolResultPairing(in);
 
+        // WHY（对齐 CC）：无 id 结果与任何 tool_use 都对不上 → 一律剥离（不因「1:1 无歧义」而认领，
+        // CC 无此扩展）。CC original: messages.ts:5817-5834（剥孤儿）+ :5796-5801（合成占位）。
         assertThat(out).hasSize(4);
         assertThat(out.get(2).toolCallId()).isEqualTo("toolu_A");
         assertThat(out.get(3).toolCallId()).isEqualTo("toolu_B");

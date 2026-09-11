@@ -92,6 +92,9 @@ public final class ToolResultPairingRepair {
      *       {@code isError=true}，{@code isMeta=true}），置于该 assistant 结果区段之前；</li>
      *   <li><b>tool 结果无前置 tool_use</b> → 丢弃该 tool 消息（CC 剥块等价）；若它是首条对 API 可见
      *       消息，则替换为 user 占位文本以保住「载荷以 user 开头」（CC :5642-5657）；</li>
+     *   <li><b>tool 结果无 id / id 对不上</b> → <b>丢弃</b>（不认领）：CC 的 tool_result 恒带
+     *       {@code tool_use_id}（{@code ToolResultBlockParam}），不对应的结果统一走 orphanedIds 剥离
+     *       （CC :5817-5834）；其对应的悬挂 tool_use 则收到合成占位（前述第 1 条）；</li>
      *   <li><b>一次多个悬挂</b> → 逐个补齐（<b>顺序 = assistant tool_calls 顺序</b>）；</li>
      *   <li><b>连续多条 assistant</b> → 前一条的结果区段为空即补齐，不合并、不删消息；tool_use id 重复
      *       （跨消息/消息内）→ 保留首次出现，后续剥离（CC :5698-5707，API "tool_use ids must be unique"）；</li>
@@ -246,33 +249,16 @@ public final class ToolResultPairingRepair {
 
             repaired = true;
 
-            // ⊕ 无 id 结果认领（Java 扩展 · CC 无对应 —— CC 的 tool_result 恒带 tool_use_id）：
-            //   仅当「缺失 id 恰 1 个」且「无 id 结果恰 1 条」时认领（1:1 无歧义），避免把真实工具输出
-            //   降级成合成错误占位（fork 自执行工具 toolCallId 恒 null 的兜底；根因已在写入侧修复，
-            //   本认领仅覆盖历史/边角残留）。多对多时不做位置猜配，回退 CC 语义（丢弃 + 合成占位）。
-            List<String> toSynthesize = new ArrayList<>(missingIds);
-            ChatMessageDto adoptedMsg = null;
-            String adoptedId = null;
-            if (nullIdCount == 1 && missingIds.size() == 1) {
-                for (ChatMessageDto t : region) {
-                    if (t.role() == Role.tool && (t.toolCallId() == null || t.toolCallId().isBlank())) {
-                        adoptedMsg = t;
-                        adoptedId = toSynthesize.remove(0);
-                        break;
-                    }
-                }
-            }
-
             log.warn("[ToolResultPairingRepair] 配对修复: 悬挂 tool_use={} 孤儿 tool_result={} 重复结果={} "
-                    + "无 id 结果={} 认领={} · session={} assistantMsgId={}",
-                missingIds, orphanedIds, duplicateResults, nullIdCount, adoptedId,
+                    + "无 id 结果={} · session={} assistantMsgId={}",
+                missingIds, orphanedIds, duplicateResults, nullIdCount,
                 assistantMsg.sessionId(), assistantMsg.id());
 
             // 3) 合成结果前置（CC :5836 `[...syntheticBlocks, ...content]`）
-            for (String id : toSynthesize) {
+            for (String id : missingIds) {
                 result.add(syntheticToolResult(assistantMsg, id));
             }
-            // 4) 区段按原序输出：system 透传 / 真实结果保留（丢弃孤儿 + 重复 + 未认领的无 id 结果，
+            // 4) 区段按原序输出：system 透传 / 真实结果保留（丢弃孤儿 + 重复 + 无 id 结果，
             //    后者 provider 序列化侧本就丢弃：OpenAiSdkProvider toolCallId==null → yield null）
             Set<String> emitted = new HashSet<>();
             for (ChatMessageDto t : region) {
@@ -280,12 +266,14 @@ public final class ToolResultPairingRepair {
                     result.add(t);
                     continue;
                 }
-                if (t == adoptedMsg) {
-                    result.add(copyWithToolCallId(t, adoptedId));
-                    continue;
-                }
                 String id = t.toolCallId();
                 if (id == null || id.isBlank()) {
+                    // 丢弃而非认领（对齐 CC）：CC 的 tool_result 恒带 tool_use_id（ToolResultBlockParam），
+                    // 无「无 id 结果」输入形态；不对应的结果一律走 orphanedIds 剥离。
+                    // CC original: messages.ts:5817-5834 `if (orphanedSet.has(trId)) return false`。
+                    // 保留 warn 以便发现残留坏数据（写入侧根因已修，正常新数据走不到此处）。
+                    log.warn("[ToolResultPairingRepair] 丢弃无 id tool 结果（CC 无认领语义 · 无法配对）"
+                        + " content={}", truncate(t.content()));
                     continue;
                 }
                 if (!toolUseIdSet.contains(id)) {
@@ -353,21 +341,6 @@ public final class ToolResultPairingRepair {
         return new ChatMessageDto(
             m.id(), m.sessionId(), m.role(), m.author(), content, m.reasoning(), toolCalls, m.finishReason(),
             m.inputTokens(), m.outputTokens(), m.time(), m.createdAt(), m.toolCallId(), m.assistantMessageId(),
-            m.acceptFeedback(), m.contentBlocks(), m.imagePasteIds(), m.structuredOutput(), m.isMeta(), m.isError(),
-            m.sourceToolUseID(), m.subtype(),
-            m.isApiErrorMessage(), m.apiError(), m.error(), m.errorDetails(),
-            m.inputCacheReadTokens(), m.inputCacheCreationTokens(),
-            m.compactMetadata(), m.microcompactMetadata(), m.logicalParentUuid(),
-            m.isCompactSummary(), m.isVisibleInTranscriptOnly(), m.usage(), m.level(), m.matchedRule(), m.snipMetadata(),
-            m.cwd(), m.reasoningDurationMs(), m.userMessageId(), m.decodeMs(), m.contextTokensUsed(), m.percentLeft(),
-            m.contextWindow(), m.userAttachments(), m.queuedOrigin());
-    }
-
-    /** tool 结果全字段透传 + toolCallId 覆盖（⊕ 认领路径）。 */
-    private static ChatMessageDto copyWithToolCallId(ChatMessageDto m, String toolCallId) {
-        return new ChatMessageDto(
-            m.id(), m.sessionId(), m.role(), m.author(), m.content(), m.reasoning(), m.toolCalls(), m.finishReason(),
-            m.inputTokens(), m.outputTokens(), m.time(), m.createdAt(), toolCallId, m.assistantMessageId(),
             m.acceptFeedback(), m.contentBlocks(), m.imagePasteIds(), m.structuredOutput(), m.isMeta(), m.isError(),
             m.sourceToolUseID(), m.subtype(),
             m.isApiErrorMessage(), m.apiError(), m.error(), m.errorDetails(),

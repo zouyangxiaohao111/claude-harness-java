@@ -2104,7 +2104,9 @@ public class AnthropicSdkProvider implements LlmProvider {
                 continue; // system 已在 top-level 处理
             }
             if (m.role() == Role.tool) {
-                if (m.toolCallId() == null) {
+                // [R4 收尾] 空串 == 缺失：toolCallId 为 "" 时 tool_result.tool_use_id 为空 →
+                //   与 null 同等丢弃（防御性；上游 ToolResultPairingRepair 已按 null/isBlank 剥离）。
+                if (m.toolCallId() == null || m.toolCallId().isBlank()) {
                     log.warn("skipping tool message without toolCallId");
                     continue;
                 }

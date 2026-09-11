@@ -167,6 +167,22 @@ class ToolResultPairingSendBoundaryTest {
     }
 
     @Test
+    @DisplayName("OpenAI wire：无 id 结果 → 被丢弃（不认领），悬挂 tool_call 收合成占位 · 对齐 CC")
+    void openAiWire_nullIdResult_droppedNotAdopted() throws Exception {
+        List<ChatMessageDto> history = List.of(
+            user("hi"), assistant("", call("call_1")), toolResult(null, "REAL OUTPUT"));
+
+        JsonNode messages = openAiWire(history);
+
+        // WHY（对齐 CC）：CC 无「无 id 结果」输入形态（tool_result 必带 tool_use_id），不对应的结果
+        // 一律剥离（messages.ts:5817-5834），悬挂 tool_use 由合成块补齐（:5796-5801）。
+        assertThat(openAiToolResultIds(messages)).containsExactly("call_1");
+        assertThat(messages.toString())
+            .contains(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER)
+            .doesNotContain("REAL OUTPUT");
+    }
+
+    @Test
     @DisplayName("OpenAI wire：已完整配对 → 请求体零变化（无合成占位、消息数不变）")
     void openAiWire_fullyPaired_unchanged() throws Exception {
         List<ChatMessageDto> history = List.of(
@@ -211,6 +227,20 @@ class ToolResultPairingSendBoundaryTest {
     }
 
     @Test
+    @DisplayName("Anthropic wire：无 id 结果 → 被丢弃（不认领），tool_use 收合成 is_error 占位 · 对齐 CC")
+    void anthropicWire_nullIdResult_droppedNotAdopted() throws Exception {
+        List<ChatMessageDto> history = List.of(
+            user("hi"), assistant("", call("toolu_1")), toolResult(null, "REAL OUTPUT"));
+
+        JsonNode messages = anthropicWire(history);
+
+        assertThat(anthropicToolResultIds(messages)).containsExactly("toolu_1");
+        assertThat(messages.toString())
+            .contains(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER)
+            .doesNotContain("REAL OUTPUT");
+    }
+
+    @Test
     @DisplayName("Anthropic wire：已完整配对 → 真实 tool_result 不被打上 is_error（仅错误结果携带）")
     void anthropicWire_fullyPaired_realResultHasNoIsError() throws Exception {
         List<ChatMessageDto> history = List.of(
@@ -224,6 +254,73 @@ class ToolResultPairingSendBoundaryTest {
             for (JsonNode b : m.path("content")) {
                 if ("tool_result".equals(b.path("type").asText())) {
                     assertThat(b.has("is_error")).isFalse();
+                }
+            }
+        }
+    }
+
+    // ─────────── [R4 收尾] 空串 toolCallId 守卫（空串 == 缺失）───────────
+
+    /**
+     * 直接驱动 provider 单条序列化（旁路 {@code ToolResultPairingRepair}）：
+     * 这是 provider 守卫的最后一道闸 —— 上游 repair 已按 null/blank 剥离，直连 toSdkMessage
+     * 时 null 与空串必须同等丢弃，否则 wire 会带空 {@code tool_call_id} → OpenAI 兼容端点 400
+     * （"An assistant message with 'tool_calls' must be followed by tool messages responding to
+     * each 'tool_call_id'"）。
+     * <p>变异自证：把守卫回退为仅 {@code == null} → 空串/空白断言红。
+     */
+    @Test
+    @DisplayName("OpenAI toSdkMessage：空串/空白 toolCallId → 与 null 同等丢弃（不外发空 tool_call_id）")
+    void openAi_toSdkMessage_blankToolCallId_dropped() {
+        assertThat(OpenAiSdkProvider.toSdkMessage(toolResult(null, "x")))
+            .as("null 已由既有守卫丢弃").isNull();
+        assertThat(OpenAiSdkProvider.toSdkMessage(toolResult("", "x")))
+            .as("空串必须与 null 同等丢弃").isNull();
+        assertThat(OpenAiSdkProvider.toSdkMessage(toolResult("   ", "x")))
+            .as("纯空白必须与 null 同等丢弃").isNull();
+        assertThat(OpenAiSdkProvider.toSdkMessage(toolResult("call_1", "x")))
+            .as("有效 id 正常保留").isNotNull();
+    }
+
+    @Test
+    @DisplayName("OpenAI wire：空串 id 结果 → 被丢弃（wire 无空 tool_call_id）· 悬挂 tool_call 收合成占位")
+    void openAiWire_blankIdResult_dropped() throws Exception {
+        List<ChatMessageDto> history = List.of(
+            user("hi"), assistant("", call("call_1")), toolResult("", "BLANK OUTPUT"));
+
+        JsonNode messages = openAiWire(history);
+
+        assertThat(openAiToolResultIds(messages))
+            .as("空串 id 结果不认领 → 仅剩合成占位应答 call_1").containsExactly("call_1");
+        assertThat(messages.toString())
+            .contains(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER)
+            .doesNotContain("BLANK OUTPUT");
+        for (JsonNode m : messages) {
+            if ("tool".equals(m.path("role").asText())) {
+                assertThat(m.path("tool_call_id").asText())
+                    .as("wire 上不得出现空 tool_call_id").isNotBlank();
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Anthropic wire：空串 id 结果 → 被丢弃（wire 无空 tool_use_id）")
+    void anthropicWire_blankIdResult_dropped() throws Exception {
+        List<ChatMessageDto> history = List.of(
+            user("hi"), assistant("", call("toolu_1")), toolResult("", "BLANK OUTPUT"));
+
+        JsonNode messages = anthropicWire(history);
+
+        assertThat(anthropicToolResultIds(messages))
+            .as("空串 id 结果不认领 → 仅剩合成占位应答 toolu_1").containsExactly("toolu_1");
+        assertThat(messages.toString())
+            .contains(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER)
+            .doesNotContain("BLANK OUTPUT");
+        for (JsonNode m : messages) {
+            for (JsonNode b : m.path("content")) {
+                if ("tool_result".equals(b.path("type").asText())) {
+                    assertThat(b.path("tool_use_id").asText())
+                        .as("wire 上不得出现空 tool_use_id").isNotBlank();
                 }
             }
         }

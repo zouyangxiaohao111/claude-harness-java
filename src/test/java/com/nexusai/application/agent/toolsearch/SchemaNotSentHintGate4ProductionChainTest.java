@@ -72,7 +72,10 @@ class SchemaNotSentHintGate4ProductionChainTest {
         ToolUseBlock call = new ToolUseBlock("toolu_search_1", "ToolSearch", input);
         ToolUseContext searchCtx = ToolUseContext.of(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
-                List.of(searchTool, webSearch));
+                List.of(searchTool, webSearch))
+                // [openai-lazy 乙-1] provider 能力前提：anthropic → 命中纯 tool_reference 块（
+                //   providerType=null → 保守判不支持 → 追加 <functions> 文本块 → contentBlocks hasSize(2) 变红）
+                .withEffectiveProviderType("anthropic");
         AgentToolResult<?> result = searchTool.execute(call, searchCtx);
 
         // ── 2) tool.mapToToolResultBlockParam 返回 content=List<ToolReferenceBlockParam>（OPD-TS-09-01 上游侧）──

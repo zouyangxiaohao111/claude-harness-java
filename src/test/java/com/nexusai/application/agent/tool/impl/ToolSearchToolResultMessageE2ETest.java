@@ -51,8 +51,8 @@ class ToolSearchToolResultMessageE2ETest {
     @DisplayName("Anthropic 命中 tool_reference → toolResultMessage 结构化透传（content 置空串 + contentBlocks 注入纯 tool_reference 块，不压平 record）")
     void toolSearch_selectHit_toolResultMessage_preservesToolReferenceBlocks() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // [openai-lazy] Anthropic（Claude，支持 tool_reference）→ 命中纯 tool_reference（CC 原样，无 schema text）
-        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5");
+        // [openai-lazy 乙-1] 目标 provider=anthropic → 命中纯 tool_reference（CC 原样，无 schema text）
+        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5", "anthropic");
 
         // mapper 已产出 tool_reference 块数组（上游正确侧）
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
@@ -104,11 +104,11 @@ class ToolSearchToolResultMessageE2ETest {
     // ───────────────────────── helpers（对齐 ToolSearchToolRetrievalTest） ─────────────────────────
 
     private AgentToolResult<?> executeResult(String query, List<Tool> tools) {
-        return executeResultWithModel(query, tools, null);
+        return executeResultWithModel(query, tools, null, null);
     }
 
-    /** [openai-lazy] 带模型名执行（model 非 null 且支持 tool_reference → Anthropic 分流纯 tool_reference）。 */
-    private AgentToolResult<?> executeResultWithModel(String query, List<Tool> tools, String model) {
+    /** [openai-lazy 乙-1] 带模型名 + providerType 执行（providerType="anthropic" → 纯 tool_reference 分流）。 */
+    private AgentToolResult<?> executeResultWithModel(String query, List<Tool> tools, String model, String providerType) {
         JsonNode input = MAPPER.createObjectNode()
                 .put("query", query)
                 .put("max_results", 5);
@@ -116,7 +116,8 @@ class ToolSearchToolResultMessageE2ETest {
         ToolUseContext ctx = ToolUseContext.of(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 tools, "", AbortController.NOOP, List.of(), null, null, Map.of(), false, "")
-                .withEffectiveModelName(model);
+                .withEffectiveModelName(model)
+                .withEffectiveProviderType(providerType);
         return tool.execute(call, ctx);
     }
 

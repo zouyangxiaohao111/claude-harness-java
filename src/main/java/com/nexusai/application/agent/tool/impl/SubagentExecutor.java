@@ -481,8 +481,11 @@ public class SubagentExecutor {
             //   对齐 CC forkedAgent.ts:456 fileReadingLimits: parentContext.fileReadingLimits.
             //   原 46 参兼容构造器缺该字段 → compact ctor 兜底 null, 丢失父 override (R2 遗留).
             source.fileReadingLimits(),
-            // [openai-lazy] effectiveModelName 透传 — 子代理共享父 turn 模型名（ToolSearch 分流渲染用）
-            source.effectiveModelName()
+            // [openai-lazy] effectiveModelName 透传 — 子代理共享父 turn 模型名
+            source.effectiveModelName(),
+            // [openai-lazy 乙-1] effectiveProviderType 透传 — 子代理共享父 turn 目标 provider
+            //   （ToolSearch 分流渲染用；漏补则子代理 ToolSearch 回落 null → 多出文本块，与父不一致）
+            source.effectiveProviderType()
         );
     }
 

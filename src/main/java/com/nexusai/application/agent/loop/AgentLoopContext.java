@@ -1381,16 +1381,22 @@ public record AgentLoopContext(
             .withQueryTracking(queryTracking)
             .withMessages(state.messages() != null ? state.messages() : List.of())
             .withPermissionContext(permCtx, permMode)
-            // [openai-lazy] 注入当前 turn 有效模型名（ToolSearchTool 渲染分流：
-            //   Anthropic 纯 tool_reference / openai_compatible 追加完整 JSONSchema 文本）。
+            // [openai-lazy] 注入当前 turn 有效模型名（模型能力解析消费：ReadFileTool / fork 直传等）。
             //   state.currentModel() = LlmAgentLoop doRun 入口 + 每轮 effectiveModel 覆盖写。
-            .withEffectiveModelName(state.currentModel());
+            .withEffectiveModelName(state.currentModel())
+            // [openai-lazy 乙-1] 注入当前 turn 目标 provider 类型（ToolSearchTool 渲染分流按 provider
+            //   能力判，而非模型名）：经单一来源 ModelConfigResolver.resolveProviderType 解析。
+            //   resolver null / model null-blank / DB 未命中 / provider 未 enabled / apiKey 空 → null
+            //   → producer 侧判「不支持 tool_reference」→ 保守追加 <functions> 文本块（防搜索死锁）。
+            .withEffectiveProviderType(com.nexusai.infra.llm.ModelConfigResolver.resolveProviderType(
+                ctx.modelConfigResolver(), state.currentModel()));
         state.setCurrentToolUseContext(perTurnTuc);
         if (log.isDebugEnabled()) {
-            log.debug("AgentLoopContext toolExecContext stamp: sessionId={} queryTracking={} effectiveModel={}",
+            log.debug("AgentLoopContext toolExecContext stamp: sessionId={} queryTracking={} effectiveModel={} effectiveProviderType={}",
                 state.sessionId(),
                 perTurnTuc.queryTracking() != null ? perTurnTuc.queryTracking() : "(null)",
-                perTurnTuc.effectiveModelName() != null ? perTurnTuc.effectiveModelName() : "(null)");
+                perTurnTuc.effectiveModelName() != null ? perTurnTuc.effectiveModelName() : "(null)",
+                perTurnTuc.effectiveProviderType() != null ? perTurnTuc.effectiveProviderType() : "(null)");
         }
         return perTurnTuc;
     }

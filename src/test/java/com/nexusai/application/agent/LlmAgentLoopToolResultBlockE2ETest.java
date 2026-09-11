@@ -127,13 +127,22 @@ class LlmAgentLoopToolResultBlockE2ETest {
 
     // ───────────────────────── helpers ─────────────────────────
 
-    /** 真实执行 ToolSearchTool（含 ToolUseContext，复用 ToolSearchToolRetrievalTest 模式）。 */
+    /**
+     * 真实执行 ToolSearchTool（含 ToolUseContext，复用 ToolSearchToolRetrievalTest 模式）。
+     *
+     * <p>[openai-lazy 乙-1] 补 provider 能力前提：{@code withEffectiveProviderType("anthropic")}
+     * —— 命中路径按目标 provider 能力分流（anthropic → 纯 tool_reference 块，CC 原样）。
+     * 若缺此前提（providerType=null → 保守判不支持）→ 追加 {@code <functions>} 文本块 →
+     * 本测试正向断言（content 数组 size）变红。模型名仅与 :156 wire 模型对齐（非判据）。
+     */
     private AgentToolResult<?> execute(ToolSearchTool tool, String query, List<Tool> tools) {
         JsonNode input = JSON.createObjectNode().put("query", query).put("max_results", 5);
         ToolUseBlock call = new ToolUseBlock("toolu_1", "ToolSearch", input);
         ToolUseContext ctx = ToolUseContext.of(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
-                tools, "", AbortController.NOOP, List.of(), null, null, Map.of(), false, "");
+                tools, "", AbortController.NOOP, List.of(), null, null, Map.of(), false, "")
+                .withEffectiveModelName("claude-opus-4")
+                .withEffectiveProviderType("anthropic");
         return tool.execute(call, ctx);
     }
 

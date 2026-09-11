@@ -156,13 +156,23 @@ public record ToolUseContext(
         @JsonIgnore FileReadingLimits.Override fileReadingLimits,
         // ═══════════════════ 48 [openai-lazy] effectiveModelName ═══════════════════
         // 当前 turn 有效模型名 · Java 扩展（无 CC 对应字段，对齐 CC toolUseContext.options.model? 语义）。
-        // 消费方 ToolSearchTool.execute：按 modelSupportsToolReference 分流渲染——
-        //   Anthropic/Claude（支持 tool_reference）→ ToolSearch 命中保持纯 tool_reference 块（CC 原样）；
-        //   openai_compatible（deepseek）→ 追加完整 JSONSchema 文本（模型直接拿参数调用）。
+        // 消费方（非 ToolSearch 分流）：ReadFileTool 模型能力解析 / fork 会话模型直传 / hook agent
+        // 模型上下文（grep effectiveModelName 见各消费点）。
         // 由 AgentLoopContext.toolExecContext 从 AgentState.currentModel() 注入。
         // @JsonIgnore: 会话运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 readFileState / mcpServerConnections / fileReadingLimits local-only 约束）。
-        @JsonIgnore String effectiveModelName
+        @JsonIgnore String effectiveModelName,
+        // ═══════════════════ 49 [openai-lazy] effectiveProviderType ═══════════════════
+        // 当前 turn 目标 provider 类型 · Java 扩展（无 CC 对应字段）。
+        // 取值："anthropic" / "openai_compatible" / "openai_sdk" / … / null（null=未知）。
+        // 消费方 ToolSearchTool.buildSearchOutput：按 provider 能力（乙-1）分流渲染——
+        //   "anthropic"（有 tool_reference 语义）→ ToolSearch 命中保持纯 tool_reference 块（CC 原样）；
+        //   其它/null/未知 → 追加完整 JSONSchema <functions> 文本（保守防搜索死锁）。
+        // 单一来源 = AgentLoopContext.toolExecContext 经 ModelConfigResolver.resolveProviderType
+        //   （静态单一来源 MAINCHAIN-01）解析后盖章；producer 只读 ctx 比较，无 DB 依赖。
+        // @JsonIgnore: 会话运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 effectiveModelName / readFileState / mcpServerConnections / fileReadingLimits local-only 约束）。
+        @JsonIgnore String effectiveProviderType
         // [Session J 方案 A] 撤回 E session 加的 querySource + assistantMessage 顶层字段:
         //   - CC 真源 (主 agent grep 实证 Pattern #9):
         //     · querySource: toolUseContext.options.querySource (Tool.ts:176), Java 端对齐
@@ -586,7 +596,8 @@ public record ToolUseContext(
              readFileState,
              mcpServerConnections,
              null,     // [OPD-D1-01] fileReadingLimits 缺省 → compact ctor 兜底 null (CC optional)
-             null);    // [openai-lazy] effectiveModelName 缺省 → null（未知模型，ToolSearchTool 分流判支持）
+             null,     // [openai-lazy] effectiveModelName 缺省 → null
+             null);    // [openai-lazy] effectiveProviderType 缺省 → null（未知 provider → 保守加文本块）
     }
 
     /** Stage 3.1 4 参兼容构造器. */
@@ -1328,7 +1339,8 @@ public record ToolUseContext(
             readFileState(),
             List.copyOf(conns),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留 · CC Tool.ts:251 optional)
-            effectiveModelName());  // [openai-lazy] 透传 (null 保留)
+            effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
     }
 
     /** 覆写 messages 快照。null 参数 → 保留现有。 */
@@ -1363,7 +1375,8 @@ public record ToolUseContext(
             readFileState(),
             mcpServerConnections(),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
-            effectiveModelName());  // [openai-lazy] 透传 (null 保留)
+            effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
     }
 
     /**
@@ -1396,14 +1409,14 @@ public record ToolUseContext(
             readFileState(),
             mcpServerConnections(),
             limits,
-            effectiveModelName());  // [openai-lazy] 透传 (null 保留)
+            effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
     }
 
     /**
-     * [openai-lazy] 覆写 effectiveModelName（当前 turn 有效模型名）· ToolSearchTool 渲染分流：
-     * {@code modelSupportsToolReference} 判 Anthropic（纯 tool_reference）vs openai_compatible
-     * （追加完整 JSONSchema 文本）。null 参数 → 保留现有。注入点 AgentLoopContext.toolExecContext
-     * （从 {@code AgentState.currentModel()} 取值）。
+     * [openai-lazy] 覆写 effectiveModelName（当前 turn 有效模型名）· 消费方为模型能力解析
+     * （ReadFileTool / fork 会话模型直传 / hook agent 模型上下文）。null 参数 → 保留现有。
+     * 注入点 AgentLoopContext.toolExecContext（从 {@code AgentState.currentModel()} 取值）。
      */
     public ToolUseContext withEffectiveModelName(String modelName) {
         if (modelName == null) {
@@ -1427,7 +1440,47 @@ public record ToolUseContext(
             readFileState(),
             mcpServerConnections(),
             fileReadingLimits(),
-            modelName);
+            modelName,
+            effectiveProviderType());
+    }
+
+    /**
+     * [openai-lazy 乙-1] 覆写 effectiveProviderType（当前 turn 目标 provider 类型）·
+     * ToolSearchTool 渲染分流按 <b>provider 能力</b>判（非模型名）：
+     * {@code "anthropic".equalsIgnoreCase(effectiveProviderType)} → 纯 tool_reference 块；
+     * 其它 / null / 未知 → 追加完整 JSONSchema {@code <functions>} 文本（保守防死锁）。
+     *
+     * <p>单一来源 = AgentLoopContext.toolExecContext 经
+     * {@link com.nexusai.infra.llm.ModelConfigResolver#resolveProviderType} 解析后盖章；
+     * producer 只读 ctx 做一次字符串比较，无 DB 依赖（{@code new ToolSearchTool()} 无参构造保持）。
+     *
+     * <p>null 参数 → 保留现有（no-op，与 withEffectiveModelName 语义一致；缺省 null = 未知 →
+     * 保守加文本块）。
+     */
+    public ToolUseContext withEffectiveProviderType(String providerType) {
+        if (providerType == null) {
+            return this;
+        }
+        return new ToolUseContext(
+            agentId(), sessionId(), mode(), additionalWorkingDirectories(),
+            availableTools(), taskListId(), abortController(),
+            messages(), permissionContext(), permissionMode(),
+            mcpClients(),
+            isNonInteractiveSession(), renderedSystemPrompt(), effectiveCwd(),
+            inProgressToolUseIDs(), toolDecisions(), onCompactProgress(),
+            getAppState(), setAppState(), setStreamMode(), setSDKStatus(),
+            addNotification(), appendSystemMessage(), sendOSNotification(),
+            setResponseLength(), setHasInterruptibleToolInProgress(), updateFileHistoryState(),
+            updateAttributionState(), setConversationId(), setToolJSX(), openMessageSelector(),
+            userModified(), nestedMemoryAttachmentTriggers(), loadedNestedMemoryPaths(),
+            dynamicSkillDirTriggers(), discoveredSkillNames(), agentType(), requireCanUseTool(),
+            preserveToolUseResults(), localDenialTracking(), contentReplacementState(),
+            queryTracking(), toolUseId(), criticalSystemReminder_EXPERIMENTAL(),
+            readFileState(),
+            mcpServerConnections(),
+            fileReadingLimits(),
+            effectiveModelName(),
+            providerType);
     }
 
     /** 覆写 permissionContext + permissionMode（每轮经 ctx.permissionContextBuilder() 重建）。 */
@@ -1468,7 +1521,8 @@ public record ToolUseContext(
             readFileState(),
             mcpServerConnections(),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
-            effectiveModelName());  // [openai-lazy] 透传 (null 保留)
+            effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
     }
 
     public ToolUseContext with(SubagentContextOverrides overrides) {
@@ -1664,7 +1718,8 @@ public record ToolUseContext(
             newReadFileState,
             this.mcpServerConnections(),   // [MCP-I-9 Q-30] 连接继承 · 继承父 (with 不覆写)
             this.fileReadingLimits(),  // [OPD-D1-01] 继承父 · 对齐 CC forkedAgent.ts:456 fileReadingLimits: parentContext.fileReadingLimits
-            this.effectiveModelName()   // [openai-lazy] 继承父 · 子代理共享父 turn 模型名（ToolSearch 分流渲染用）
+            this.effectiveModelName(),   // [openai-lazy] 继承父 · 子代理共享父 turn 模型名
+            this.effectiveProviderType() // [openai-lazy] 继承父 · 子代理共享父 turn 目标 provider（ToolSearch 分流渲染用）
     );
     }
 

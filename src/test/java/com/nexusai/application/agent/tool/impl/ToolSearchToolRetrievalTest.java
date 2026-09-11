@@ -242,8 +242,8 @@ class ToolSearchToolRetrievalTest {
     @DisplayName("Anthropic（Claude，支持 tool_reference）命中 → 纯 tool_reference blocks（CC ToolSearchTool.ts:462-469，格式不变）")
     void mapToBlock_matches_produceToolReferenceBlocks() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // [openai-lazy] 带 claude model → Anthropic 分流：命中纯 tool_reference（用户拍板「Anthropic 格式不要变」）
-        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5");
+        // [openai-lazy 乙-1] 目标 provider=anthropic → 命中纯 tool_reference（用户拍板「Anthropic 格式不要变」）
+        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5", "anthropic");
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
         assertThat(block.type()).isEqualTo("tool_result");
@@ -264,10 +264,10 @@ class ToolSearchToolRetrievalTest {
     }
 
     @Test
-    @DisplayName("openai_compatible（无 tool_reference）命中 → tool_reference + <functions> schema text 块（openai-lazy 扩展）")
+    @DisplayName("openai_compatible（无 tool_reference）命中 → tool_reference + <functions> schema text 块（openai-lazy 乙-1 扩展）")
     void mapToBlock_matches_openai_appendsFunctionsText() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // 无 model（或 deepseek）→ 保守判 openai：命中附带完整 JSONSchema 文本，模型直接拿参数调用
+        // 无 providerType（未知）→ 保守判不支持 tool_reference：命中附带完整 JSONSchema 文本
         AgentToolResult<?> result = executeResult("select:Read", tools);
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
@@ -282,6 +282,43 @@ class ToolSearchToolRetrievalTest {
                 .contains("<functions>")
                 .contains("\"name\":\"Read\"")
                 .contains("\"parameters\":{}")
+                .contains("</functions>");
+    }
+
+    @Test
+    @DisplayName("[乙-1] 判据 = 目标 provider，非模型名：provider=anthropic + deepseek 模型名 → 仍纯 tool_reference（size=1）")
+    void mapToBlock_providerAnthropic_beatsOpenAiModelName() {
+        List<Tool> tools = List.of(deferredTool("Read", "read a file"));
+        // 反直觉交叉：模型名含 deepseek（旧 modelSupportsToolReference 负向模式会判「不支持」），
+        // 但目标 provider=anthropic（有 tool_reference 语义）→ 只发 tool_reference 块。
+        // 变异：若把 buildSearchOutput 判据回退为按模型名（modelSupportsToolReference）→ size=2 变红。
+        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "deepseek-v4-flash", "anthropic");
+
+        ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
+        List<?> content = (List<?>) block.content();
+        assertThat(content).hasSize(1);
+        assertThat(((ContentBlockParam) content.get(0)).type()).isEqualTo("tool_reference");
+    }
+
+    @Test
+    @DisplayName("[乙-1] 反向保命：provider=openai_compatible + claude 模型名 → 必带 <functions> 文本（size=2，防零载荷死锁）")
+    void mapToBlock_providerOpenAi_beatsClaudeModelName() {
+        List<Tool> tools = List.of(deferredTool("Read", "read a file"));
+        // 危险方向：模型名是 claude-*（旧 modelSupportsToolReference 会判「支持」→ 只发 tool_reference），
+        // 但目标 provider=openai_compatible（序列化丢弃 tool_reference 块）→ 必须追加 <functions>
+        // 文本，否则模型零载荷 → 搜索死锁。变异：判据回退按模型名 → size=1 变红。
+        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5", "openai_compatible");
+
+        ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
+        List<?> content = (List<?>) block.content();
+        assertThat(content).hasSize(2);
+        assertThat(((ContentBlockParam) content.get(0)).type()).isEqualTo("tool_reference");
+        ContentBlockParam text = (ContentBlockParam) content.get(1);
+        assertThat(text.type()).isEqualTo("text");
+        assertThat(((ContentBlockParam.TextBlockParam) text).text())
+                .as("openai_compatible provider 必须拿到 <functions> 文本（防死锁）")
+                .contains("<functions>")
+                .contains("\"name\":\"Read\"")
                 .contains("</functions>");
     }
 
@@ -328,15 +365,15 @@ class ToolSearchToolRetrievalTest {
     }
 
     private AgentToolResult<?> executeResult(String query, int maxResults, List<Tool> tools) {
-        return executeResultWithModel(query, maxResults, tools, null);
+        return executeResultWithModel(query, maxResults, tools, null, null);
     }
 
-    /** [openai-lazy] 带模型名执行（model 非 null 且支持 tool_reference → Anthropic 分流纯 tool_reference）。 */
-    private AgentToolResult<?> executeResultWithModel(String query, List<Tool> tools, String model) {
-        return executeResultWithModel(query, 5, tools, model);
+    /** [openai-lazy 乙-1] 带模型名 + providerType 执行（providerType="anthropic" → 纯 tool_reference 分流）。 */
+    private AgentToolResult<?> executeResultWithModel(String query, List<Tool> tools, String model, String providerType) {
+        return executeResultWithModel(query, 5, tools, model, providerType);
     }
 
-    private AgentToolResult<?> executeResultWithModel(String query, int maxResults, List<Tool> tools, String model) {
+    private AgentToolResult<?> executeResultWithModel(String query, int maxResults, List<Tool> tools, String model, String providerType) {
         JsonNode input = MAPPER.createObjectNode()
                 .put("query", query)
                 .put("max_results", maxResults);
@@ -344,7 +381,8 @@ class ToolSearchToolRetrievalTest {
         ToolUseContext ctx = ToolUseContext.of(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 tools, "", AbortController.NOOP, List.of(), null, null, Map.of(), false, "")
-                .withEffectiveModelName(model);
+                .withEffectiveModelName(model)
+                .withEffectiveProviderType(providerType);
         return tool.execute(call, ctx);
     }
 

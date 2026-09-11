@@ -847,7 +847,11 @@ public class OpenAiSdkProvider implements LlmProvider {
                 yield ChatCompletionMessageParam.ofAssistant(b.build());
             }
             case tool -> {
-                if (m.toolCallId() == null) {
+                // [R4 收尾] 空串 == 缺失：toolCallId 为 "" 时 wire 上会带空 tool_call_id，
+                //   被 OpenAI 兼容端点拒（"must be followed by tool messages responding to each
+                //   'tool_call_id'"）→ 与 null 同等丢弃（防御性；上游 ToolResultPairingRepair
+                //   已按 null/isBlank 剥离，此处为直连 toSdkMessage 的最后一道闸）。
+                if (m.toolCallId() == null || m.toolCallId().isBlank()) {
                     log.warn("跳过缺少 toolCallId 的 tool 消息: 内容={}",
                         truncate(m.content(), 50));
                     yield null;
