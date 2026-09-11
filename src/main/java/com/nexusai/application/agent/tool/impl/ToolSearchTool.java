@@ -312,22 +312,25 @@ public class ToolSearchTool implements Tool {
     }
 
     /**
-     * [openai-lazy 乙-1] 目标 provider 是否有 tool_reference 语义 · 判据 =
-     * {@code "anthropic".equalsIgnoreCase(ctx.effectiveProviderType())}（provider 类型，非模型名）。
+     * [乙-1 + 2026-09-11 单点化] 目标 provider × 模型是否可用 tool_reference ·
+     * 委托单点 {@link ToolSearchService#toolReferenceUsable(String, String)}
+     * （provider 语义 取与 模型能力 {@code modelSupportsToolReference}）。
      *
-     * <p><b>WHY 按 provider 判（乙-1）</b>：tool_reference 是 Anthropic wire 专属语义
-     * （CC {@code ToolSearchTool.ts:462-468} 无 model/provider 分支，恒发 tool_reference 块）；
+     * <p><b>WHY 按 provider × 模型判</b>：tool_reference 是 Anthropic wire 专属语义
+     * （CC {@code ToolSearchTool.ts:462-469} 渲染无 provider/model 分支，恒发 tool_reference 块）；
      * openai_compatible / openai_sdk provider 序列化时整块丢弃 tool_reference（见
-     * {@code OpenAiSdkProvider}）→ 只发 tool_reference 会零载荷死锁。故按目标 provider 能力判。
+     * {@code OpenAiSdkProvider}）→ 只发 tool_reference 会零载荷死锁。模型侧：anthropic 下 haiku
+     * 不支持 tool_reference（toolSearch.ts:200-204/239-252）→ 也须附完整 schema。
      *
-     * <p>ctx / providerType null 或未知（resolver 未注入 / 模型未命中 / provider 未 enabled 等）
-     * → false（保守判「不支持」→ 附 schema）。<b>默认保守方向</b>：多一段 <functions> 文本对
-     * Anthropic 无损（CC 也多容忍额外 text 块），但缺 schema 会让无 tool_reference 语义的模型
-     * 反复检索、无法调用（死锁）——不对称风险下取安全侧。
+     * <p>ctx / providerType / model null 或未知（resolver 未注入 / 模型未命中 / provider 未
+     * enabled 等）→ false（保守判「不支持」→ 附 schema）。<b>默认保守方向</b>：多一段
+     * {@code <functions>} 文本对 Anthropic 无损（CC 也多容忍额外 text 块），但缺 schema 会让无
+     * tool_reference 语义的模型反复检索、无法调用（死锁）——不对称风险下取安全侧。
      */
     private static boolean providerSupportsToolReference(ToolUseContext ctx) {
         String providerType = ctx != null ? ctx.effectiveProviderType() : null;
-        return "anthropic".equalsIgnoreCase(providerType);
+        String model = ctx != null ? ctx.effectiveModelName() : null;
+        return ToolSearchService.toolReferenceUsable(providerType, model);
     }
 
     /**

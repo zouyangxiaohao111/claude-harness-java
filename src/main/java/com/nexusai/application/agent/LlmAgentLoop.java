@@ -5989,7 +5989,8 @@ public class LlmAgentLoop implements AgentLoop {
             //   isDeferredToolsDeltaEnabled 默认关）。
             if (toolsAssembly.useToolSearch() && deferredToolsDeltaGate(ctx)) {
                 ChatMessageDto dtd = PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
-                        perTurnTuc.availableTools(), effectiveModel, messagesForLlm);
+                        perTurnTuc.availableTools(), effectiveModel, perTurnTuc.effectiveProviderType(),
+                        messagesForLlm);
                 if (dtd != null) {
                     messagesForLlm = new ArrayList<>(messagesForLlm);
                     String rendered = PostCompactAttachmentRestorer.renderDeferredToolsDelta(dtd.content());
@@ -12329,7 +12330,9 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * 通用懒加载豁免 · [2026-09-08 用户拍板] 非 anthropic（openai 系）清空整个 deferred 集合。
+     * 通用懒加载豁免 · [2026-09-08 用户拍板，2026-09-11 单点化] tool_reference <b>不可用</b>
+     * （非 anthropic provider，或 anthropic 下不支持 tool_reference 的模型如 haiku）→ 清空整个
+     * deferred 集合。
      *
      * <p><b>WHY</b>：defer 工具的前提 = 模型能经 ToolSearch/tool_reference 激活被剔工具（CC
      * anthropic 语义，tool_search beta 通道）。openai 兼容模型（deepseek/fz/moonshot）无
@@ -12341,8 +12344,25 @@ public class LlmAgentLoop implements AgentLoop {
      *
      * <p>anthropic（有 tool_reference 能激活）保留懒加载省 token，对齐 CC。
      *
-     * <p><b>判定</b>：mapper null（4 参旧签名无法判 provider）→ 不豁免（保持懒，旧契约不变，同
-     * WebSearch 语义；llmToolsArray 主装配路径恒带 mapper）。
+     * <p><b>判定（2026-09-11 单点化）</b>：委托<b>唯一单点</b>
+     * {@link ToolSearchService#toolReferenceUsable(ModelMapper, ProviderMapper, String)}
+     * （用户拍板「换成这个规则，内部调用同一个规则而不是分三份」）——该单点 = provider 语义
+     * <b>取与</b> 模型能力（{@code toolReferenceUsable} = {@code "anthropic".equals(providerType)}
+     * {@code &&} {@code modelSupportsToolReference(model)}）。
+     * <b>可用 → return（保留懒加载）；不可用 → {@code deferred.clear()}（全部 schema 直发）</b>。
+     * 故判据不止「是否 anthropic」，还含<b>模型那一半</b>：
+     * <ul>
+     *   <li>anthropic × 支持模型（非 haiku）→ 可用 → 保留懒加载（对齐 CC 省 token）；</li>
+     *   <li>anthropic × <b>haiku</b> → 不可用（haiku 不解析 tool_reference，toolSearch.ts:200-204）
+     *       → 清空（本方法借此与渲染/附件两处判据一致；旧实现只判 provider → haiku 下漏清，
+     *       反让 ToolSearch 留在 deferred、且给 haiku 发 tool_reference）；</li>
+     *   <li>非 anthropic（openai_compatible/openai_sdk/未来 response）→ 不可用 → 清空。</li>
+     * </ul>
+     *
+     * <p><b>4 参旧签名契约不变</b>：原有的 {@code deferred == null/empty} 与
+     * {@code modelMapper == null || providerMapper == null} 两处提前 return 保留 —— mapper 缺失
+     * 无法判 provider → <b>不豁免</b>（保持懒，同 WebSearch 语义；llmToolsArray 主装配路径恒带
+     * mapper）。此路径的语义本轮未改。
      *
      * @param deferred       deferred 工具名集合（原地 clear；null / 空容忍）
      * @param modelMapper    模型 mapper（null → 不豁免，保持 deferred）
@@ -12357,14 +12377,15 @@ public class LlmAgentLoop implements AgentLoop {
         if (modelMapper == null || providerMapper == null) {
             return; // 无法判 provider → 保持既有懒加载（4 参旧签名契约，同 WebSearch 语义）
         }
-        if (ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)) {
-            return; // anthropic 保留懒加载（tool_reference 激活，对齐 CC defer）
+        if (ToolSearchService.toolReferenceUsable(modelMapper, providerMapper, modelName)) {
+            return; // tool_reference 可用（anthropic × 支持模型）→ 保留懒加载（对齐 CC defer）
         }
-        // 非 anthropic（openai_compatible/openai_sdk/未来 response）→ 全部 schema 直发
+        // provider 无 tool_reference 语义（openai_compatible/openai_sdk/未来 response）或模型不支持
+        // （anthropic × haiku）→ 全部 schema 直发
         if (log.isDebugEnabled()) {
-            log.debug("llmToolsArray: 非 anthropic 通用懒加载豁免，deferred {} 个工具全部 schema 直发"
-                + "（openai 兼容模型无 tool_reference，被剔工具对模型不存在——含 EnterWorktree/"
-                + "ExitWorktree）", deferred.size());
+            log.debug("llmToolsArray: tool_reference 不可用（provider 非 anthropic 或模型不支持）通用懒加载"
+                + "豁免，deferred {} 个工具全部 schema 直发（被剔工具对模型不存在——含 EnterWorktree/"
+                + "ExitWorktree；单点 toolReferenceUsable 判据）", deferred.size());
         }
         deferred.clear();
     }

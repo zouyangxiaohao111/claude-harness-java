@@ -3,6 +3,7 @@ package com.nexusai.application.agent.toolsearch;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.compact.CompactConstants;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
+import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.infra.llm.CountTokensClient;
@@ -247,14 +248,14 @@ public final class ToolSearchService {
     /** CC isToolSearchEnabledOptimistic 模块级一次性日志标志（toolSearch.ts:269）。 */
     private static volatile boolean loggedOptimistic = false;
 
-    /** CC toolSearch.ts:204 DEFAULT_UNSUPPORTED_MODEL_PATTERNS（负向模式：小写 contains 命中即不支持）·
-     *  Java 扩展：+deepseek —— openai_compatible provider 无 tool_reference 块语义（CC 的
-     *  defer_loading 是 Anthropic API 专属），若误判「支持 tool_reference」→ useToolSearch=true →
-     *  defer 工具被 filterToolsForSchema 从 API tools 过滤（模型调不到）+ ToolSearch 输出仅 matches
-     *  不激活工具（discovered 需模型实际调用才有）→ 死锁（联调实测 deepseek 反复 ToolSearch
-     *  vision_analyze 称「无 schema 无法调用」）。判不支持 → useToolSearch=false → 全部工具直接
-     *  发送完整 schema，模型视作普通工具直接调用（无搜索环节）。 */
-    private static final Set<String> DEFAULT_UNSUPPORTED_MODEL_PATTERNS = Set.of("haiku", "deepseek");
+    /** CC toolSearch.ts:200-204 DEFAULT_UNSUPPORTED_MODEL_PATTERNS（负向模式：小写 contains 命中即不支持）·
+     *  2026-09-11 清理：回 CC 原样只留 {@code "haiku"}（此前 Java 扩展的 +deepseek 已删除）。
+     *
+     *  <p><b>分工</b>：「openai 系不启用 tool search」不在这里判——由 {@code LlmAgentLoop.exemptAllDeferredForOpenAi}
+     *  单点负责（非 anthropic provider → 全部 defer 工具直接发完整 schema，无 ToolSearch 环节）。本名单
+     *  只表达<b>模型自身</b>是否支持 tool_reference（CC 语义：新模型默认支持，命中即不支持）。provider
+     *  语义与模型能力<b>取与</b>见单点 {@link #toolReferenceUsable}。 */
+    private static final Set<String> DEFAULT_UNSUPPORTED_MODEL_PATTERNS = Set.of("haiku");
 
     /** CC toolSearch.ts:49 DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE = 10（10% 上下文窗口）. */
     private static final int DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE = 10;
@@ -510,6 +511,65 @@ public final class ToolSearchService {
             }
         }
         return true;
+    }
+
+    /**
+     * tool_reference 判据<b>单点</b> · 用户定义语义（2026-09-11 拍板）：
+     * 「ant 支持 tool_reference（除了 haiku），其他都是不支持的」= provider 语义 <b>取与</b> 模型能力。
+     *
+     * <p>两个必要条件（AND）：
+     * <ol>
+     *   <li><b>provider 必须有 tool_reference 语义</b>——tool_reference 是 Anthropic wire 专属块：
+     *       CC {@code ToolSearchTool.ts:462-469} 渲染无 provider/model 分支，恒发 tool_reference 块；
+     *       openai_compatible/openai_sdk 序列化时整块丢弃 → 只发它会零载荷死锁。</li>
+     *   <li><b>模型本身支持</b>——CC {@code modelSupportsToolReference}（toolSearch.ts:239-252）负向名单
+     *       {@code DEFAULT_UNSUPPORTED_MODEL_PATTERNS = ['haiku']}（toolSearch.ts:200-204）。</li>
+     * </ol>
+     *
+     * <p><b>判不出即不支持</b>：providerType 或 model 任一为 null / 未知 → false。保守方向取「附完整
+     * schema」：多一段 {@code <functions>} 文本对 Anthropic 无损，但缺 schema 会让无 tool_reference
+     * 语义的模型反复检索、无法调用（死锁）。
+     *
+     * <p>取代此前分散 4 处、2 种键的判据（{@link #modelSupportsToolReference} /
+     * {@code PostCompactAttachmentRestorer.modelSupportsToolReference} 独立拷贝 /
+     * {@code ToolSearchTool.providerSupportsToolReference} / {@code LlmAgentLoop.exemptAllDeferredForOpenAi}
+     * 的 provider 判）。单点收敛同时消除同一模型两处判据相反的潜伏 bug（旧拷贝对 deepseek 判 true、
+     * 此处判 false）。
+     *
+     * @param providerType 目标 provider 类型（{@code ToolUseContext.effectiveProviderType()}；null/未知 → false）
+     * @param model        模型名（null → false）
+     * @return true = 该 provider × 模型组合可用 tool_reference
+     */
+    public static boolean toolReferenceUsable(String providerType, String model) {
+        return "anthropic".equalsIgnoreCase(providerType) && modelSupportsToolReference(model);
+    }
+
+    /**
+     * tool_reference 判据单点 · <b>mapper 版重载</b>（调用点只持 mapper + 模型名、无 providerType
+     * 字符串时用）。2026-09-11 用户拍板：「{@code exemptAllDeferredForOpenAi} 也换成这个规则，
+     * 内部调用同一个规则而不是分三份」——本重载即那条统一入口，消除 {@code LlmAgentLoop
+     * .exemptAllDeferredForOpenAi} 自带的第三把尺子（旧实现直接 {@code ContextUsageCalculator
+     * .isAnthropic(modelMapper, providerMapper, modelName)}）。
+     *
+     * <p><b>解析链复用（严禁第三条）</b>：providerType 由既有<b>唯一</b> mapper 版 provider 判定
+     * {@link ContextUsageCalculator#isAnthropic(com.nexusai.repository.provider.mapper.ModelMapper,
+     * com.nexusai.repository.provider.mapper.ProviderMapper, String)} 反推 —— 该链 =
+     * {@code ContextUsageCalculator.java:229-255}：{@code ModelNameResolver.resolve}（:234）→
+     * {@code ProviderMapper.selectOneById}（:242）→ {@code ProviderRecord.getType()}（:243）。
+     * 命中 {@code "anthropic"} → 委托 2 参单点；非 anthropic / 判不出（mapper null、模型未命中、
+     * provider 缺失）→ 传 {@code null}，2 参单点按「判不出即不支持」判 false。本重载<b>不复制</b>
+     * 解析链，故不存在第三份 provider 解析。
+     *
+     * @param modelMapper    模型 mapper（null → 判不出 → false）
+     * @param providerMapper 提供商 mapper（null → 判不出 → false）
+     * @param model          模型名（null/blank → false）
+     * @return true = 该 provider × 模型组合可用 tool_reference
+     */
+    public static boolean toolReferenceUsable(
+            ModelMapper modelMapper, ProviderMapper providerMapper, String model) {
+        String providerType = ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, model)
+            ? "anthropic" : null;
+        return toolReferenceUsable(providerType, model);
     }
 
     /**

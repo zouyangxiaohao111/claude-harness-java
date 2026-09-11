@@ -5,6 +5,10 @@ import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.ToolSearchTool;
 import com.nexusai.application.agent.tool.impl.WebSearchTool;
 import com.nexusai.infra.llm.CountTokensClient;
+import com.nexusai.repository.provider.entity.ModelRecord;
+import com.nexusai.repository.provider.entity.ProviderRecord;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -14,6 +18,9 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * [H4] ToolSearch definitive 门控测试 · 对齐 CC toolSearch.ts:385-473 {@code isToolSearchEnabled}
@@ -55,6 +62,80 @@ class ToolSearchServiceDefinitiveGateTest {
         assertThat(ToolSearchService.modelSupportsToolReference("claude-3-5-haiku")).isFalse();
         assertThat(ToolSearchService.modelSupportsToolReference("claude-sonnet-4-5")).isTrue();
         assertThat(ToolSearchService.modelSupportsToolReference("claude-opus-4-1")).isTrue();
+        // 2026-09-11 期望变更（WHY）：DEFAULT_UNSUPPORTED_MODEL_PATTERNS 归位回 CC 原样只留 'haiku'
+        //   （toolSearch.ts:200-204），deepseek 从负向名单移除 → modelSupportsToolReference 判 true。
+        //   「openai 系不启用 tool search」不再由模型名单承担，改由 LlmAgentLoop.exemptAllDeferredForOpenAi
+        //   单点负责（非 anthropic → 全部 defer 工具 schema 直发）；provider 语义与模型能力取与见
+        //   toolReferenceUsable。变异：若把 'deepseek' 加回名单 → 本行变红。
+        assertThat(ToolSearchService.modelSupportsToolReference("deepseek-v4-flash"))
+            .as("deepseek 不在模型不支持名单（不在 anthropic 用 tool search 由豁免负责）")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("toolReferenceUsable 单点：provider 语义 取与 模型能力；判不出即不支持")
+    void toolReferenceUsable_singlePoint() {
+        // WHY: 2026-09-11 用户定义语义「ant 支持 tool_reference（除 haiku），其他都不支持」——
+        //   tool_reference 是 anthropic wire 专属（openai 序列化整块丢弃 → 零载荷死锁），
+        //   且 anthropic 下 haiku 不支持 → 两半 AND 缺一即 false。
+        // 两半都成立 → true
+        assertThat(ToolSearchService.toolReferenceUsable("anthropic", "claude-opus-4")).isTrue();
+        assertThat(ToolSearchService.toolReferenceUsable("Anthropic", "claude-sonnet-4-5"))
+            .as("provider 大小写不敏感（equalsIgnoreCase）").isTrue();
+        // 模型那一半 load-bearing：anthropic + haiku → false
+        //   变异 (i)：把单点改成只判 provider（去掉 && modelSupportsToolReference）→ 本行变红。
+        assertThat(ToolSearchService.toolReferenceUsable("anthropic", "claude-haiku-4-5")).isFalse();
+        // provider 那一半 load-bearing：openai_compatible + claude 名 → false（代理暴露 claude 名陷阱）
+        //   变异 (ii)：把单点改成只判 modelSupportsToolReference（去掉 provider 取与）→ 本行变红。
+        assertThat(ToolSearchService.toolReferenceUsable("openai_compatible", "claude-sonnet-4-5"))
+            .as("openai 代理暴露 claude 名也必须判不支持（无 tool_reference wire 语义）").isFalse();
+        assertThat(ToolSearchService.toolReferenceUsable("openai_compatible", "deepseek-v4-flash")).isFalse();
+        // 判不出即不支持：任一 null / 未知 → false
+        assertThat(ToolSearchService.toolReferenceUsable(null, "claude-opus-4")).isFalse();
+        assertThat(ToolSearchService.toolReferenceUsable("anthropic", null)).isFalse();
+        assertThat(ToolSearchService.toolReferenceUsable(null, null)).isFalse();
+        assertThat(ToolSearchService.toolReferenceUsable("openai_sdk", "claude-opus-4")).isFalse();
+    }
+
+    @Test
+    @DisplayName("toolReferenceUsable mapper 版重载：复用唯一解析链反推 providerType，判据仍落单点（anthropic×haiku → false）")
+    void toolReferenceUsable_mapperOverload_delegatesToSinglePoint() {
+        // WHY（2026-09-11 单点化）：LlmAgentLoop.exemptAllDeferredForOpenAi 只持 mapper + 模型名，
+        //   经本重载入单点——不得自带第三把尺子。providerType 由既有唯一 mapper 版 provider 判定
+        //   （ContextUsageCalculator.isAnthropic → ModelNameResolver.resolve → provider.type）反推。
+        //   变异：本重载改回「只判 isAnthropic」（去掉模型那一半）→ haiku 断言变红。
+        ModelMapper modelMapper = mock(ModelMapper.class);
+        ProviderMapper providerMapper = mock(ProviderMapper.class);
+        ProviderRecord provider = new ProviderRecord();
+        provider.setId("p1");
+        when(providerMapper.selectOneByQuery(any())).thenReturn(provider);
+        when(providerMapper.selectOneById(any())).thenReturn(provider);
+        ModelRecord m = new ModelRecord();
+        m.setId("m1");
+        m.setProviderId("p1");
+        m.setName("claude-opus-4");
+        m.setEnabled(true);
+        when(modelMapper.selectOneByQuery(any())).thenReturn(m);
+
+        provider.setType("anthropic");
+        assertThat(ToolSearchService.toolReferenceUsable(
+                modelMapper, providerMapper, "anthropic/claude-opus-4"))
+            .as("anthropic × 非 haiku → 两半成立 → true").isTrue();
+        assertThat(ToolSearchService.toolReferenceUsable(
+                modelMapper, providerMapper, "anthropic/claude-haiku-4-5-20251001"))
+            .as("模型那一半在 mapper 重载下同样 load-bearing：anthropic + haiku → false "
+                + "（旧 exemptAllDeferredForOpenAi 只判 isAnthropic 会判 true → 漏清）").isFalse();
+
+        provider.setType("openai_compatible");
+        assertThat(ToolSearchService.toolReferenceUsable(
+                modelMapper, providerMapper, "openai/gpt-5"))
+            .as("provider 那一半：非 anthropic → false").isFalse();
+
+        // 判不出即不支持（mapper 缺失 / 模型名 null）
+        assertThat(ToolSearchService.toolReferenceUsable(null, null, "anthropic/claude-opus-4"))
+            .as("mapper null → 判不出 → false（调用方 exemptAllDeferredForOpenAi 据此保持旧契约）").isFalse();
+        assertThat(ToolSearchService.toolReferenceUsable(modelMapper, providerMapper, null))
+            .as("模型名 null → false（判不出即不支持）").isFalse();
     }
 
     @Test

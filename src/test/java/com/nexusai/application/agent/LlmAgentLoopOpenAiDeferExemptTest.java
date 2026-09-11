@@ -123,6 +123,50 @@ class LlmAgentLoopOpenAiDeferExemptTest {
     }
 
     @Test
+    @DisplayName("2026-09-11 单点化：anthropic + haiku → 判据含模型那一半 → 清空（修掉旧实现只判 provider 的漏清）")
+    void anthropicHaiku_clearsAllDeferred() {
+        stubResolvableModel();
+        ProviderRecord p = new ProviderRecord();
+        p.setId("p1");
+        p.setType("anthropic");
+        when(providerMapper.selectOneById(any())).thenReturn(p);
+
+        Set<String> deferred = deferredWithWorktree();
+        LlmAgentLoop.exemptAllDeferredForOpenAi(
+            deferred, modelMapper, providerMapper, "anthropic/claude-haiku-4-5-20251001");
+
+        assertThat(deferred)
+            .as("WHY（规则 9）：haiku 不解析 tool_reference（toolSearch.ts:200-204）→ tool_reference 不可用 "
+                + "→ 全体 schema 直发。旧实现只判 provider（isAnthropic=true → return）→ 漏清：ToolSearch "
+                + "留在 deferred 且仍给 haiku 发 tool_reference（跨尺度不一致）。"
+                + "变异：判据回退 ContextUsageCalculator.isAnthropic(...) → 本用例变红。")
+            .isEmpty();
+    }
+
+    @Test
+    @DisplayName("anthropic + claude-opus-4 → tool_reference 可用 → deferred 全部保留（模型那一半成立）")
+    void anthropicOpus_keepsAllDeferred() {
+        stubResolvableModel();
+        ProviderRecord p = new ProviderRecord();
+        p.setId("p1");
+        p.setType("anthropic");
+        when(providerMapper.selectOneById(any())).thenReturn(p);
+
+        Set<String> deferred = deferredWithWorktree();
+        LlmAgentLoop.exemptAllDeferredForOpenAi(
+            deferred, modelMapper, providerMapper, "anthropic/claude-opus-4");
+
+        assertThat(deferred)
+            .as("anthropic × 非 haiku 模型 → 两半均成立 → 保留懒加载省 token（对齐 CC，不因单点化而过度清空）")
+            .containsExactlyInAnyOrder(
+                "ToolSearch",
+                ToolNameConstants.ENTER_WORKTREE_TOOL_NAME,
+                ToolNameConstants.EXIT_WORKTREE_TOOL_NAME,
+                ToolNameConstants.VISION_ANALYZE_TOOL_NAME,
+                ToolNameConstants.WEB_SEARCH_TOOL_NAME);
+    }
+
+    @Test
     @DisplayName("mapper null（4 参旧签名无法判 provider）→ 不豁免，deferred 保留（旧契约不变）")
     void mapperNull_keepsDeferred() {
         Set<String> deferred = deferredWithWorktree();

@@ -160,7 +160,11 @@ class AttachmentProductionWiringIntegrationTest {
             null, PermissionMode.DEFAULT,
             Map.of("docs-server", new McpClientRuntime("docs-server", "mcp__docs-server__search",
                 "文档服务器使用说明：先查目录再读文件")),
-            false, "");
+            false, "")
+            // 2026-09-11 单点化：deferred_tools_delta gate 现按 provider 语义 取与 模型能力判
+            //   （toolReferenceUsable）——生产路径 provider 恒由 turn 解析注入；本测试须显式给
+            //   anthropic，否则 null provider → 保守判不支持 → dtd 不产出。
+            .withEffectiveProviderType("anthropic");
 
         CompactConversationContext ctx = ctx(tuc);
         PostCompactAttachmentRestorer.populatePostCompactAttachments(ctx, null, null);
@@ -194,6 +198,39 @@ class AttachmentProductionWiringIntegrationTest {
             .filter(a -> PostCompactAttachmentRestorer.DELTA_TYPE_MCP_INSTRUCTIONS.equals(a.subtype()))
             .findFirst().orElseThrow();
         assertThat(mid.content()).contains("## docs-server").contains("文档服务器使用说明");
+    }
+
+    @Test
+    @DisplayName("3×delta gate 开 + openai_compatible: 不产出声称 available via ToolSearch 的 deferred_tools_delta")
+    void deltaGateOn_openAiProvider_noDeferredToolsDelta() {
+        // WHY（2026-09-11 单点化）：deferred_tools_delta 内容声称「这些工具 available via ToolSearch」，
+        //   而 openai_compatible provider 无 tool_reference 语义（ToolSearch 命中不激活工具）→ 若仍产出
+        //   该 delta 就是误导 + 死锁。单点 toolReferenceUsable(openai_compatible, claude-*) = false →
+        //   dtd gate 拦截。变异：单点去掉 provider 那一半 → 本用例变红（dtd 误产出）。
+        PostCompactAttachmentRestorer.envOverride = Map.of(
+            "USER_TYPE", "ant",
+            "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true",
+            "CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+
+        List<Tool> tools = new ArrayList<>();
+        tools.add(tool("mcp__docs-server__search", true));
+        tools.add(tool("ToolSearch", false));
+
+        ToolUseContext tuc = ToolUseContext.of(
+            null, "", PermissionMode.DEFAULT,
+            tools, "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of(),
+            null, PermissionMode.DEFAULT)
+            .withEffectiveProviderType("openai_compatible");
+
+        CompactConversationContext ctx = ctx(tuc);
+        PostCompactAttachmentRestorer.populatePostCompactAttachments(ctx, null, null);
+
+        CompactionResult result = CompactConversation.compactConversation(
+            messages("m1", "m2", "m3"), ctx, false, null, false, null);
+
+        assertThat(result.attachments().stream().map(ChatMessageDto::subtype))
+            .as("openai_compatible provider 无 tool_reference → 不产出 deferred_tools_delta")
+            .doesNotContain(PostCompactAttachmentRestorer.DELTA_TYPE_DEFERRED_TOOLS);
     }
 
     @Test

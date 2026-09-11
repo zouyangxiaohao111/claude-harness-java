@@ -286,12 +286,12 @@ class ToolSearchToolRetrievalTest {
     }
 
     @Test
-    @DisplayName("[乙-1] 判据 = 目标 provider，非模型名：provider=anthropic + deepseek 模型名 → 仍纯 tool_reference（size=1）")
-    void mapToBlock_providerAnthropic_beatsOpenAiModelName() {
+    @DisplayName("[乙-1 + 单点化] provider=anthropic + deepseek 模型名 → 纯 tool_reference（size=1，deepseek 已不在不支持名单）")
+    void mapToBlock_providerAnthropic_deepseekModel_pureToolReference() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // 反直觉交叉：模型名含 deepseek（旧 modelSupportsToolReference 负向模式会判「不支持」），
-        // 但目标 provider=anthropic（有 tool_reference 语义）→ 只发 tool_reference 块。
-        // 变异：若把 buildSearchOutput 判据回退为按模型名（modelSupportsToolReference）→ size=2 变红。
+        // 2026-09-11 单点化后判据 = provider 语义 取与 模型能力：目标 provider=anthropic（有
+        //   tool_reference 语义）+ deepseek（已从 DEFAULT_UNSUPPORTED_MODEL_PATTERNS 移除 → 模型判支持）
+        //   → 两半均成立 → 只发 tool_reference 块。
         AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "deepseek-v4-flash", "anthropic");
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
@@ -301,12 +301,33 @@ class ToolSearchToolRetrievalTest {
     }
 
     @Test
+    @DisplayName("[单点化] provider=anthropic + haiku 模型名 → tool_reference + <functions> 文本（模型那一半，size=2）")
+    void mapToBlock_anthropicHaikuModel_appendsFunctionsText() {
+        List<Tool> tools = List.of(deferredTool("Read", "read a file"));
+        // 2026-09-11 行为变更：旧实现只判 provider（anthropic → size=1 纯 tool_reference），
+        //   单点化后模型能力参与 → anthropic + haiku（不支持 tool_reference，toolSearch.ts:200-204）
+        //   → 保守附完整 schema。变异 (i)：单点去掉模型那一半（只判 provider）→ size=1 变红。
+        AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-haiku-4-5", "anthropic");
+
+        ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);
+        List<?> content = (List<?>) block.content();
+        assertThat(content).hasSize(2);
+        assertThat(((ContentBlockParam) content.get(0)).type()).isEqualTo("tool_reference");
+        ContentBlockParam text = (ContentBlockParam) content.get(1);
+        assertThat(text.type()).isEqualTo("text");
+        assertThat(((ContentBlockParam.TextBlockParam) text).text())
+                .as("anthropic + haiku 也必须补 <functions> 文本（haiku 不解析 tool_reference）")
+                .contains("<functions>")
+                .contains("\"name\":\"Read\"");
+    }
+
+    @Test
     @DisplayName("[乙-1] 反向保命：provider=openai_compatible + claude 模型名 → 必带 <functions> 文本（size=2，防零载荷死锁）")
     void mapToBlock_providerOpenAi_beatsClaudeModelName() {
         List<Tool> tools = List.of(deferredTool("Read", "read a file"));
-        // 危险方向：模型名是 claude-*（旧 modelSupportsToolReference 会判「支持」→ 只发 tool_reference），
-        // 但目标 provider=openai_compatible（序列化丢弃 tool_reference 块）→ 必须追加 <functions>
-        // 文本，否则模型零载荷 → 搜索死锁。变异：判据回退按模型名 → size=1 变红。
+        // 危险方向：模型名是 claude-*（模型那一半判「支持」），但目标 provider=openai_compatible
+        // （序列化丢弃 tool_reference 块）→ 必须追加 <functions> 文本，否则模型零载荷 → 搜索死锁。
+        // 变异 (ii)：单点去掉 provider 那一半（只判模型名）→ size=1 变红（claude 名误判支持）。
         AgentToolResult<?> result = executeResultWithModel("select:Read", tools, "claude-sonnet-4-5", "openai_compatible");
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "toolsearch-1", false);

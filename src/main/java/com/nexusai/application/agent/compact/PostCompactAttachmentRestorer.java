@@ -1367,8 +1367,9 @@ public final class PostCompactAttachmentRestorer {
             return;
         }
         String model = ctx.getModel();
-        // 1. deferred_tools_delta（compact.ts:567-574）
-        ChatMessageDto dtd = deferredToolsDeltaAttachment(tuc.availableTools(), model, preservedMessages);
+        // 1. deferred_tools_delta（compact.ts:567-574）· providerType 从 tuc 透传（单点 toolReferenceUsable 消费）
+        ChatMessageDto dtd = deferredToolsDeltaAttachment(
+                tuc.availableTools(), model, tuc.effectiveProviderType(), preservedMessages);
         if (dtd != null) {
             out.add(dtd);
         }
@@ -1395,25 +1396,26 @@ public final class PostCompactAttachmentRestorer {
      *
      * <p>Gate 链（任一不过 → null）：isDeferredToolsDeltaEnabled（feature tengu_glacier_2xr /
      * USER_TYPE=ant，默认关）→ isToolSearchEnabledOptimistic（SchemaNotSentHint）→
-     * modelSupportsToolReference（默认支持，'haiku' 不支持，toolSearch.ts:204/239-254）→
+     * toolReferenceUsable（单点：provider 语义 取与 模型能力，判不出即不支持）→
      * isToolSearchToolAvailable（ToolSearch 在工具池）。内容：当前 deferred 工具集
      * （isDeferredTool：MCP 工具恒 defer，alwaysLoad 排除，ToolSearch 自身不 defer，
      * ToolSearchService.isDeferredTool）对已 announce 集合的 diff。
      *
-     * @param tools    工具池（CC options.tools）
-     * @param model    主循环模型名（CC options.mainLoopModel；null → 假定支持）
-     * @param messages 历史消息（diff 扫描源；全量压缩传 [] → 宣布全量）
+     * @param tools        工具池（CC options.tools）
+     * @param model        主循环模型名（CC options.mainLoopModel；null → 单点保守判不支持）
+     * @param providerType 目标 provider 类型（CC 由 wire 语义隐含；Java 显式透传，null → 不支持）
+     * @param messages     历史消息（diff 扫描源；全量压缩传 [] → 宣布全量）
      * @return deferred_tools_delta 附件；gate 关/无变化 → null
      */
     public static ChatMessageDto deferredToolsDeltaAttachment(
-            List<Tool> tools, String model, List<ChatMessageDto> messages) {
+            List<Tool> tools, String model, String providerType, List<ChatMessageDto> messages) {
         if (!isDeferredToolsDeltaEnabled()) {
             return null;
         }
         if (!ToolSearchService.isToolSearchEnabledOptimistic()) {
             return null;
         }
-        if (!modelSupportsToolReference(model)) {
+        if (!ToolSearchService.toolReferenceUsable(providerType, model)) {
             return null;
         }
         if (!ToolSearchService.isToolSearchToolAvailable(tools)) {
@@ -1581,8 +1583,9 @@ public final class PostCompactAttachmentRestorer {
             }
         }
         // clientSide chrome（attachments.ts:1570-1580）：三 gate + nexusai-in-chrome 已连接
+        // 第二 gate 走单点 toolReferenceUsable（providerType 从 tuc 取）
         if (ToolSearchService.isToolSearchEnabledOptimistic()
-                && modelSupportsToolReference(model)
+                && ToolSearchService.toolReferenceUsable(tuc.effectiveProviderType(), model)
                 && ToolSearchService.isToolSearchToolAvailable(tuc.availableTools())
                 && connectedNames.contains(NEXUSAI_IN_CHROME_MCP_SERVER_NAME)) {
             String existing = blocks.get(NEXUSAI_IN_CHROME_MCP_SERVER_NAME);
@@ -1668,18 +1671,6 @@ public final class PostCompactAttachmentRestorer {
             return false;
         }
         return "ant".equals(e.get("USER_TYPE"));
-    }
-
-    /**
-     * CC modelSupportsToolReference（toolSearch.ts:239-254）：默认支持，仅命中 unsupported
-     * 模式（DEFAULT_UNSUPPORTED_MODEL_PATTERNS = ['haiku']，toolSearch.ts:204）不支持。
-     * null → 假定支持（CC 生产恒传已定义 model；Java manual 路径 best-effort 可 null）。
-     */
-    public static boolean modelSupportsToolReference(String model) {
-        if (model == null) {
-            return true;
-        }
-        return !model.toLowerCase().contains("haiku");
     }
 
     // ── delta 小工具 ──
