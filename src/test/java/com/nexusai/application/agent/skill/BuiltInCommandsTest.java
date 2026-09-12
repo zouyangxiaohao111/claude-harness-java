@@ -75,11 +75,24 @@ class BuiltInCommandsTest {
     }
 
     @Test
-    @DisplayName("output-style isHidden=true（output-style/index.ts:7）；其余 9 命令默认可见")
-    void outputStyle_isHidden() {
+    @DisplayName("isHidden 集合：output-style（CC output-style/index.ts:7）+ clear（停用 /clear）；其余 9 命令可见")
+    void hiddenCommands_outputStyleAndClear() {
         List<Command> all = BuiltInCommands.getAll();
-        assertThat(byName(all, "output-style").getIsHidden()).isTrue();
-        assertThat(all.stream().filter(c -> !"output-style".equals(c.getName())))
+        // ① output-style：CC 原生 isHidden —— 命令仍可 execute，只是列表不渲染
+        assertThat(byName(all, "output-style").getIsHidden())
+            .as("CC output-style/index.ts:7 isHidden:true")
+            .isTrue();
+        // ② clear：我们停用它（用户裁定「我们不需要 /clear —— 新建会话用界面「+」」）。
+        //    WHY isHidden 而非删除：CC 的 isHidden 语义正是「列里不显示、但仍可经
+        //    findCommand/execute 触发」＝ clear 现在的处境；且依本仓铁律「死代码不一定要删：
+        //    CC 有对应即保留」（CC 确有 /clear）⇒ 命令留在注册表、仅不再对外广告。
+        //    显式调用仍会得到 fail-loud 409 + 中文原因（见 CommandController 的守卫用例）。
+        assertThat(byName(all, "clear").getIsHidden())
+            .as("停用 /clear：不再对外广告（此前仅前端过滤，API 仍回一条必然 409 的命令）")
+            .isTrue();
+        // ③ 其余 9 条仍可见 —— 回归守卫：别把停用范围扩大到别的命令
+        assertThat(all.stream()
+                .filter(c -> !"output-style".equals(c.getName()) && !"clear".equals(c.getName())))
             .allSatisfy(c -> assertThat(c.getIsHidden()).isFalse());
     }
 

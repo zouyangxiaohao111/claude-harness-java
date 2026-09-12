@@ -1633,8 +1633,29 @@ public class ReadFileTool implements Tool {
      * newMessages user 注入）无法送达模型（R-T-1），Read 直给通道仅对 ant（anthropic）/ openai-response
      * （预留，Java 暂未对接）直给格式开放。非该组合（openai-completions 的 deepseek 含 vision-exp /
      * 任何文本模型）→ false → dispatchImage/dispatchPdf fail-loud 引导 vision_analyze（type=analyze,
-     * path / contentType=pdf + pages）。判据与 LlmAgentLoop.exemptVisionAnalyzeDeferForTextModel 同源
-     * （Read 直给能力 ⇔ vision_analyze 可懒）。
+     * path / contentType=pdf + pages）。
+     *
+     * <p><b>[R12 2026-09-12 · 规则七显式暴露：本判据已与 vision_analyze 懒加载豁免不同源]</b>
+     * 早前「判据与 LlmAgentLoop.exemptVisionAnalyzeDeferForTextModel 同源（Read 直给能力 ⇔
+     * vision_analyze 可懒）」的说法已失效 —— 两者判据维度与 provider 判源都不同：
+     * <ul>
+     *   <li><b>本判据（单维）</b> = provider 直给格式（anthropic；openai-response 预留）∧
+     *       supportsImage 多模态，<b>与模型名无关</b>（wire 是否送达图/文档块由 provider 格式决定）。</li>
+     *   <li><b>豁免判据（双维）</b> = {@code LlmAgentLoop.exemptVisionAnalyzeDeferForTextModel} 内
+     *       {@code ToolSearchService.toolReferenceUsable(providerType, modelName)}（provider==anthropic
+     *       <b>且</b>模型名不命中 haiku 负向名单，即「能用 tool_reference」）∧ supportsImage 多模态。</li>
+     * </ul>
+     * 差异点（都不是错，各自语义独立）：
+     * <ol>
+     *   <li><b>模型维度</b>：anthropic × haiku 且 DB {@code models.type} 为多模态时，本判据 true
+     *       （Read 可直给），豁免判据 false（haiku 无 tool_reference ⇒ 懒加载不可达 ⇒ 剔除直发）；
+     *       Read 直给只看 wire 格式，vision_analyze 懒加载额外要求模型能解析 tool_reference。</li>
+     *   <li><b>provider 判源</b>：本判据经 DB mapper 现查（下段 {@code ContextUsageCalculator.isAnthropic}）；
+     *       豁免判据经调用方传入的本轮生效值 {@code tuc.effectiveProviderType()}（每轮盖章）。</li>
+     *   <li><b>mapper 未注入的降级</b>：本判据回落 1 参名字契约（下段）；豁免判据遇 mapper null 即剔除直发。</li>
+     * </ol>
+     * <p><b>待清理项</b>：若后续要求两者真同源，应让本判据同样走 {@code toolReferenceUsable} 单点，
+     * 而不是各持一份 provider/模型判据。
      *
      * <p><b>直给格式判据按 provider.type</b>（com.nexusai.application.agent.compact.ContextUsageCalculator
      * 的 isAnthropic：model→providerId→providerMapper.selectOneById→provider.type=="anthropic"），

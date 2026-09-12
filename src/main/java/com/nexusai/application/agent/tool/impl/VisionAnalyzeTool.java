@@ -52,9 +52,11 @@ import java.util.Map;
  * 时经 {@link #execute} 触发 —— 对齐 CC 工具执行模型（toolExecution.ts {@code tool.call(...)}
  * 才执行）。
  *
- * <p><b>懒加载（shouldDefer=true）</b>：本工具 schema 不占初始 prompt（defer_loading），
- * 只在主模型不支持视觉、需要时经 ToolSearch 检索加载 —— 对齐 CC Tool.ts:442 + AbstractTaskTool
- * 一族模式。WHY：主流视觉模型用不上本工具，始终进 schema 是 token 浪费。
+ * <p><b>懒加载（shouldDefer=true）</b>：本工具 schema 不占初始 prompt（defer_loading），是否真懒由
+ * 装配层豁免决定（R12 口径详见 {@link #shouldDefer}：provider==anthropic 且模型非 haiku 且多模态才
+ * 保留懒、需时经 ToolSearch 激活，其余情况由装配层剔除 → schema 直发）—— 对齐 CC Tool.ts:442 +
+ * AbstractTaskTool 一族模式。WHY：能走 Read 直给通道的多模态主模型用不上本工具（仅 PDF 超预算/分段时
+ * 补充），始终进 schema 是 token 浪费。
  *
  * <p><b>返回纯文本</b>：<b>不 override</b> {@link Tool#mapToToolResultBlockParam} → 走默认
  * {@code renderToolResultPayloadText} 文本渲染，绝无 base64 image block 注入主模型。
@@ -151,19 +153,32 @@ public class VisionAnalyzeTool implements Tool {
 
     /**
      * <b>想懒（shouldDefer=true，2026-09-03 定稿）</b>：vision_analyze 默认懒加载（defer_loading 语义，
-     * 省 schema token）。是否<b>实际懒</b>由<b>装配层按主模型能力豁免</b>决定（LlmAgentLoop
-     * {@code exemptVisionAnalyzeDeferForTextModel}，见该处 javadoc）：
+     * 省 schema token）。是否<b>实际懒</b>由装配层豁免决定（LlmAgentLoop
+     * {@code exemptVisionAnalyzeDeferForTextModel}，见该处 javadoc）。
+     *
+     * <p><b>[R12 2026-09-12 判据单点化 · 准确口径]</b>：豁免 = {@code ToolSearchService.toolReferenceUsable(
+     * providerType, modelName)}（providerType 由调用方传 {@code tuc.effectiveProviderType()}）<b>且</b>
+     * supportsImage 多模态 —— 即
+     * 「<b>provider == anthropic 且模型名不命中 haiku 负向名单</b>（{@code DEFAULT_UNSUPPORTED_MODEL_PATTERNS
+     * = ['haiku']}，haiku 无 tool_reference）」∧ 多模态。四格：
      * <ul>
-     *   <li>主模型 = ant/response 直给格式 + 多模态（supportsImage）→ 能走 Read 直给通道，vision_analyze
-     *       仅 PDF &gt;预算/分段补充 → <b>保留懒</b>（需时经 ToolSearch/discovered 激活）；</li>
-     *   <li>其余（deepseek openai-completions，<b>含 vision-exp 多模态</b> / 任何文本模型）→ vision_analyze
-     *       是<b>唯一视觉通道</b> → 装配层从 deferred 剔除 → <b>schema 直发</b>（不赌模型会 ToolSearch，
-     *       历史 Read 图死循环 / fork 视觉子代理递归诱因之一）。</li>
+     *   <li><b>anthropic + 多模态 + 非 haiku</b> → 能用 tool_reference，且能走 Read 直给通道，
+     *       vision_analyze 仅 PDF &gt;预算/分段补充 → <b>保留懒</b>（需时经 ToolSearch/discovered 激活）；</li>
+     *   <li><b>anthropic + haiku（即便 DB 标多模态）</b> → 无 tool_reference ⇒ 懒加载不可达（模型永远
+     *       搜不出本工具）→ 装配层从 deferred 剔除 → <b>schema 直发</b>；</li>
+     *   <li><b>anthropic + 非多模态文本模型</b> → 无 Read 直给通道，本工具是唯一视觉通道 →
+     *       <b>schema 直发</b>；</li>
+     *   <li><b>非 anthropic</b>（deepseek openai-completions，<b>含 vision-exp 多模态</b> / openai_sdk）
+     *       → 无 tool_reference ⇒ <b>schema 直发</b>（不赌模型会 ToolSearch，历史 Read 图死循环 /
+     *       fork 视觉子代理递归诱因之一）。</li>
      * </ul>
+     * （旧口径「装配层按主模型能力豁免」指的是 provider-only 判据
+     * {@code ContextUsageCalculator.isAnthropic}，R12 已收敛为上述 {@code toolReferenceUsable} 单点。）
      *
      * <p><b>Task#15（子代理拿不到）根治</b>：子代理共享主循环 queryLoop 装配（LlmAgentLoop:5360 注释），
-     * 装配层豁免一处即覆盖主/子代理 —— fresh 子代理若主模型非 ant+多模态，vision_analyze 不再因 defer
-     * 排除，schema 直发可见。
+     * 装配层豁免一处即覆盖主/子代理 —— fresh 子代理若不满足「toolReferenceUsable ∧ 多模态」（即非
+     * anthropic、或 anthropic×haiku、或非多模态文本模型），vision_analyze 不再因 defer 排除，
+     * schema 直发可见。
      */
     @Override
     public boolean shouldDefer(JsonNode input) {

@@ -103,11 +103,21 @@ public final class BuiltInCommands {
      * aliases:['reset','new'], supportsNonInteractive:false, load:()=>import('./clear.js')}}。
      * <p>type='local'（TUI 本地无副作用命令）；supportsNonInteractive 无 Java 对应字段（web 无
      * 非交互 TUI 语义），不映射。
+     *
+     * <p><b>[2026-09-12 · isHidden=true]</b> 用户裁定「我们不需要 /clear」（新建会话用界面「+」）
+     * ⇒ 停用该命令：前端去全部入口 + `CommandController.executeBuiltinInternal` fail-loud 409。
+     * 此处补 `isHidden=true`，使 **API 出站也不再广告它** —— 此前仅前端过滤，`GET /api/command/builtins`
+     * 仍回一条「必然 409」的命令，移动端等其它消费方会看到。
+     * <p>语义正好对齐 CC 的 `isHidden`：<b>列里不显示，但仍可经 findCommand / execute 触发</b>
+     * （本仓既有对照：`/output-style` 的 CC 原文 `output-style/index.ts:7` `isHidden:true` 同义；
+     * `CommandController:301` 亦注「含 isHidden 命令，React 自行过滤隐藏项」）。
+     * ⇒ **命令仍留在注册表**（依本仓铁律「死代码不一定要删：CC 有对应即保留」—— CC 确有 /clear），
+     * 仅不再对外广告；显式调用仍会得到 409 + 中文原因（fail-loud，非静默）。
      */
     private static Command clear() {
         return builtin("clear", "local",
             "Clear conversation history and free up context",
-            List.of("reset", "new"), null, false, null);
+            List.of("reset", "new"), null, /* isHidden */ true, null);
     }
 
     /**
