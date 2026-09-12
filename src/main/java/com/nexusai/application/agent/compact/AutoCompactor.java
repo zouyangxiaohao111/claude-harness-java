@@ -94,13 +94,15 @@ public class AutoCompactor {
      */
     private CompactThresholdSystem thresholdSystem = new CompactThresholdSystem(null);
 
-    /** 当前模型名（窗口 model-aware 计算用；null = 回落默认窗口）。
-     * [IMP2-24 T-6] setter 已删：model 仅经 {@code autoCompactIfNeeded} 的
-     * {@code ccContext.getModel()} 上下文注入（对齐 CC shouldAutoCompact(messages, model) 参数语义）。
-     * [IMP-CM-06 G-2] ccContext.getModel() 由 LlmAgentLoop 传 effectiveModel（= CC mainLoopModel，
-     * autoCompact.ts:267，可被 fallbackModel 改写 query.ts:922）——阈值体系吃 effectiveModel，
-     * 非原始 modelName（fallback 场景模型源错位 Q-1）。 */
-    private String model;
+    // [P2-7 · 2026-09-11] 原 private String model 实例字段已删除（跨会话串台）。
+    //   WHY: 该字段由 autoCompactIfNeeded 每次调用覆写，但 ccContext.getModel()==null 时【不覆写】
+    //   → 保留上一会话的 model。AutoCompactor 是 Spring 单例 bean，多会话并发共享 → A 会话用 B 的
+    //   窗口算阈值（200k vs 1M 差 5 倍）：该压的不压（撞 413）或过早压。
+    //   CC 真源 autoCompact.ts:267 `const model = toolUseContext.options.mainLoopModel` —— 调用内
+    //   局部变量，从不落实例状态（同模式前科：autoCompactTracking 曾串台，见 defaultTracking javadoc）。
+    //   现 model 为 autoCompactIfNeeded 的调用内局部变量，逐参传给 shouldAutoCompact /
+    //   getAutoCompactThreshold / calculateTokenWarningState / trySessionMemoryCompaction /
+    //   buildDefaultCompactConversationContext（对齐 CC 各函数 (…, model) 显式参数）。
 
     /**
      * 压缩配置 DB 实时读源 · [V52 token-compact-fix B1-6] @Autowired(required=false)：
@@ -263,7 +265,7 @@ public class AutoCompactor {
     /**
      * [RV-E-01 GAP-03 兜底] 会话工具使用上下文 · CC original: {@code context}
      * （compact.ts:285）。auto 路径 ccContext==null 回落
-     * {@link #buildDefaultCompactConversationContext()} 时，经 {@link #prepareAutoContext}
+     * {@link #buildDefaultCompactConversationContext(String)} 时，经 {@link #prepareAutoContext}
      * 把本字段接线进 ctx.toolUseContext，使 isInPlanMode() 读真实 plan mode →
      * populatePlanModeAttachment 生产可达（与 buildAutoContext 主路径对称）。
      */
@@ -465,14 +467,20 @@ public class AutoCompactor {
     }
 
     /**
-     * 当前自动压缩阈值 · 对齐 CC {@code autoCompact.ts:72 getAutoCompactThreshold(model)}
+     * 自动压缩阈值 · 对齐 CC {@code autoCompact.ts:101-120 getAutoCompactThreshold(model)}
      * （effectiveWindow − 13_000 + env 覆盖；[IMP2-24 T-4/T-9] setter 通道已删，
      * 窗口统一经 {@link CompactThresholdSystem}（getContextWindowForModel），env 由 CompactEnvProperties 承载）。
      *
      * <p>[IMP-CM-06 G-2] model 源 = ccContext.getModel()（effectiveModel）· CC mainLoopModel
      * （autoCompact.ts:267 getAutoCompactThreshold(model)），与 blocking-limit 预检同源（query.ts:637-639）。
+     *
+     * <p><b>[P2-7 · 2026-09-11] model 改为显式入参</b>：原无参版本读 AutoCompactor.model 实例字段
+     * （跨会话串台，见字段处注释）。对齐 CC 的 {@code getAutoCompactThreshold(model)} 单参签名。
+     *
+     * @param model 有效模型名（null/空 → 回落默认窗口 · CC context.ts:9 MODEL_CONTEXT_WINDOW_DEFAULT）
+     * @return 自动压缩阈值（token）
      */
-    public int getAutoCompactThreshold() {
+    public int getAutoCompactThreshold(String model) {
         return thresholdSystem.getAutoCompactThreshold(model);
     }
 
@@ -570,12 +578,19 @@ public class AutoCompactor {
      * <p><b>不含熔断器检查</b>——CC 熔断器在 autoCompactIfNeeded（autoCompact.ts:260-265），
      * 不在此处（旧 Java 实现放这里，属偏移）。
      *
+     * <p><b>[P2-7 · 2026-09-11] model 改为显式入参</b>（CC 签名 {@code shouldAutoCompact(messages, model,
+     * querySource?, snipTokensFreed = 0)}，autoCompact.ts:189-197）。原实现读 AutoCompactor.model
+     * 实例字段 → 单例 bean 多会话串台（见字段处注释）；CC 的 model 是 query() 调用的调用内局部变量
+     * （autoCompact.ts:267）。
+     *
      * @param messages         消息列表
+     * @param model            有效模型名（窗口 model-aware 计算用；null → 回落默认窗口）
      * @param querySource      查询来源（CC querySource；session_memory/compact/marble_origami → 守卫）
      * @param snipTokensFreed  L2 Snip 已释放的 token 数（默认 0）
      * @return true 表示需要自动压缩
      */
-    public boolean shouldAutoCompact(List<ChatMessageDto> messages, String querySource, int snipTokensFreed) {
+    public boolean shouldAutoCompact(List<ChatMessageDto> messages, String model, String querySource,
+                                     int snipTokensFreed) {
         // ── 递归守卫（INV-6，autoCompact.ts:169-183）──
         // IMP2-01（S-3）：判定入口 canonical 归一——生产传 name() 大写枚举名
         // （SESSION_MEMORY/COMPACT/MARBLE_ORIGAMI）先归一 CC 小写值域再比较；
@@ -686,17 +701,6 @@ public class AutoCompactor {
     }
 
     /**
-     * 判断是否应执行自动压缩（默认 querySource 重载）· 向后兼容。
-     *
-     * @param messages         消息列表
-     * @param snipTokensFreed  L2 Snip 已释放的 token 数
-     * @return true 表示需要自动压缩
-     */
-    public boolean shouldAutoCompact(List<ChatMessageDto> messages, int snipTokensFreed) {
-        return shouldAutoCompact(messages, this.querySource, snipTokensFreed);
-    }
-
-    /**
      * 尝试执行自动压缩 · 对齐 CC autoCompact.ts:241-351 autoCompactIfNeeded()
      *
      * <p><b>[GR-1 返工 · 消除双轨]</b> L4 压缩不再手工组装 [boundary,summary]，而是直接调用
@@ -708,7 +712,7 @@ public class AutoCompactor {
      * <p><b>snipTokensFreed 真实透传（IMP-21 / INV-9）</b>：CC query.ts:466 把 snip 释放的
      * token 数传给 {@code deps.autocompact}，autoCompact.ts:272 再传给 shouldAutoCompact，
      * 阈值比较 {@code tokenCount − snipTokensFreed}（autoCompact.ts:225）。本方法接收
-     * snipTokensFreed 并转发给 {@link #shouldAutoCompact(List, String, int)}。
+     * snipTokensFreed 并转发给 {@link #shouldAutoCompact(List, String, String, int)}。
      *
      * <h2>执行步骤（IMP-07 对齐 + GR-1 返工）</h2>
      * <ol>
@@ -780,9 +784,13 @@ public class AutoCompactor {
             return new AutoCompactResult(false, messages, null, 0, null, null);
         }
         this.querySource = querySource != null ? querySource : "user";
-        if (ccContext != null && ccContext.getModel() != null) {
-            this.model = ccContext.getModel();
-        }
+        // [P2-7 · 2026-09-11] model = 调用内局部变量（对齐 CC autoCompact.ts:267
+        //   `const model = toolUseContext.options.mainLoopModel`）——绝不写入实例状态。
+        //   旧实现写 this.model 且 ccContext.getModel()==null 时不覆写 → 保留上一会话的 model
+        //   （单例 bean 多会话并发串台：A 会话吃 B 会话的窗口算阈值）。
+        //   [IMP-CM-06 G-2] 源 = ccContext.getModel()（effectiveModel = CC mainLoopModel，可被
+        //   fallbackModel 改写 query.ts:922）；ccContext 为 null（便捷重载）→ null = 默认窗口。
+        String model = ccContext != null ? ccContext.getModel() : null;
         // [FIX-SM] SM 压缩生产 sessionId/agentId 必须从 ccContext 取（LlmAgentLoop:2500-2501
         //   buildAutoContext 已把 params.toolUseContext() 的 sessionId/agentId 注入上下文）——
         //   此前 AutoCompactor 实例字段恒 null（生产无 setter 调用），SM 读 null 文件回落 legacy，
@@ -816,7 +824,7 @@ public class AutoCompactor {
 
         // ── 3. shouldAutoCompact（递归守卫 + DISABLE env + 阈值 − snipTokensFreed，autoCompact.ts:268-277）──
         // INV-9: tokenCount = count(messages) − snipTokensFreed（autoCompact.ts:225）
-        if (!shouldAutoCompact(messages, querySource, snipTokensFreed)) {
+        if (!shouldAutoCompact(messages, model, querySource, snipTokensFreed)) {
             if (log.isDebugEnabled()) {
                 log.debug("[AutoCompactor] 未达阈值（含 snipTokensFreed={} 减法），跳过自动压缩",
                     snipTokensFreed);
@@ -831,7 +839,7 @@ public class AutoCompactor {
 
         // ── 4. SM 优先 trySessionMemoryCompaction（autoCompact.ts:287-310，REQ-12）──
         // [FIX-SM] effSessionId/effAgentId 来自 ccContext（生产非 null，见上方推导）
-        CompactionResult smResult = trySessionMemoryCompaction(messages, effSessionId, effAgentId);
+        CompactionResult smResult = trySessionMemoryCompaction(messages, effSessionId, effAgentId, model);
         if (smResult != null) {
             // SM 成功链：setLastSummarizedMessageId(undefined) + runPostCompactCleanup +
             // [gate] notifyCompaction + markPostCompaction（INV-8 · autoCompact.ts:287-310）。
@@ -871,7 +879,8 @@ public class AutoCompactor {
 
         try {
             // ── 5. [GR-1] CC 单函数 compactConversation（autoCompact.ts:313-321，消除双轨）──
-            CompactConversationContext ctx = ccContext != null ? ccContext : buildDefaultCompactConversationContext();
+            CompactConversationContext ctx = ccContext != null ? ccContext
+                : buildDefaultCompactConversationContext(model);
             prepareAutoContext(ctx);
             // [IMP2-03] auto 路径附件生产接线（✗-1..✗-4，INV-15）：async-agent/plan/plan_mode
             // 经 populatePostCompactAttachments 填充 ctx（数据源 taskFrameworkService/planProvider
@@ -882,7 +891,7 @@ public class AutoCompactor {
                 tracking.isCompacted(),           // autoCompact.ts:280 isRecompactionInChain
                 tracking.getTurnCounter(),        // autoCompact.ts:281 turnsSincePreviousCompact
                 tracking.getTurnId(),             // autoCompact.ts:282 previousCompactTurnId
-                getAutoCompactThreshold(),        // autoCompact.ts:283 autoCompactThreshold
+                getAutoCompactThreshold(model),   // autoCompact.ts:283 autoCompactThreshold
                 querySource);                     // autoCompact.ts:284 querySource
 
             // [MF2-3] auto 路径 registry 供给：把会话 AgentState 注册表写入 compactConversation
@@ -996,10 +1005,11 @@ public class AutoCompactor {
      * @param messages  待压缩消息
      * @param sessionId 会话 ID（FIX-SM：生产来自 ccContext，避免 SM 读 null 文件回落 legacy）
      * @param agentId   agent ID（SM 成功链 notifyCompaction 审计）
+     * @param model     本调用的有效模型名（[P2-7] 调用内局部变量透传，用于 SM 阈值 · 不读实例字段）
      * @return SM 压缩结果；不可用 → null
      */
     private CompactionResult trySessionMemoryCompaction(
-            List<ChatMessageDto> messages, String sessionId, String agentId) {
+            List<ChatMessageDto> messages, String sessionId, String agentId, String model) {
         if (sessionMemoryService == null) {
             return null;
         }
@@ -1009,7 +1019,7 @@ public class AutoCompactor {
         // 仅保留 null-guard：sessionMemoryService 未注入 → null。前置读取 getSessionMemoryContent
         // 非五类 fs-inaccessible 错误按 CC 语义上抛（sessionMemoryUtils.ts:124-125 显式失败，不吞错）。
         return sessionMemoryService.trySessionMemoryCompaction(
-            messages, sessionId, agentId, getAutoCompactThreshold());
+            messages, sessionId, agentId, getAutoCompactThreshold(model));
     }
 
     /**
@@ -1024,11 +1034,11 @@ public class AutoCompactor {
      * {@link #wireAutoNotifyCompaction} 按 PROMPT_CACHE_BREAK_DETECTION 门控真实接线
      * （CC compact.ts:698-699；门控关闭 → no-op 等价）。
      */
-    CompactConversationContext buildDefaultCompactConversationContext() {
+    CompactConversationContext buildDefaultCompactConversationContext(String model) {
         CompactConversationContext ctx = new CompactConversationContext()
             .setSessionId(this.sessionId)
             .setAgentId(this.agentId)
-            .setModel(this.model)
+            .setModel(model)
             .setQuerySource(this.querySource)
             .setReadFileState(new LinkedHashMap<>());
         wireAutoNotifyCompaction(ctx);

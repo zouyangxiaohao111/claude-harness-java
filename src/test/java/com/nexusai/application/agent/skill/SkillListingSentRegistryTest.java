@@ -30,6 +30,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       <b>不得</b>被误判为冷 resume 而永久 suppress（2026-09-10 对抗核验 high 回归）；</li>
  *   <li>边界. removeSession（/clear）保留 initialized（= CC suppressNext=false，消 CLEARED 单消费者竞态）；
  *       removeSessionEntries（会话删除纯清理）清双键不置 CLEARED；null sessionId 不抛 NPE（2026-09-10 收尾轮）。</li>
+ *   <li>i. removeAgentKey（P2-12）· 单键回收只命中目标 agentKey、复现时落抑制分支、不触碰会话级 CLEARED、
+ *       幂等且 null 安全 —— 子代理 / hook agent 结束点的槽位回收语义。</li>
  * </ul>
  */
 class SkillListingSentRegistryTest {
@@ -357,5 +359,70 @@ class SkillListingSentRegistryTest {
         assertThat(cold.names()).as("冷 resume 无工具 run 不补记 → 首个 decide 仍走 suppress（转录已含清单）")
             .isEmpty();
         assertThat(SkillListingSentRegistry.isInitialized(sessionB, "")).isTrue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // i. P2-12 · 单键回收（removeAgentKey）—— 子代理 / hook agent 结束点
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("i1. removeAgentKey → 只回收指定 agentKey 槽（双键同清），不误伤主线程槽与其他 agentKey")
+    void removeAgentKey_onlyTargetedSlot() {
+        List<String> names = List.of("commit");
+        String hookAgent = "hook-agent-" + UUID.randomUUID();
+        SkillListingSentRegistry.decide(sessionA, "", names, false);           // 主线程
+        SkillListingSentRegistry.decide(sessionA, "sub-1", names, false);      // 子代理
+        SkillListingSentRegistry.decide(sessionA, hookAgent, names, false);    // hook agent
+        assertThat(SkillListingSentRegistry.sessionSlotCount(sessionA))
+            .as("前置：3 个 agentKey 各占一槽").isEqualTo(3);
+
+        SkillListingSentRegistry.removeAgentKey(sessionA, hookAgent);
+
+        // WHY 该断言重要：hook agent 每次调用都是新 UUID（ExecAgentHook.generateHookAgentId），
+        //   若不按结束点回收，槽位随「hook 调用次数」在常驻 JVM 无界增长（审计 P2-12）。
+        assertThat(SkillListingSentRegistry.isInitialized(sessionA, hookAgent))
+            .as("目标 agentKey 的 INITIALIZED 必须一并回收（否则后续 decide 会因 sent 空整份重发）").isFalse();
+        assertThat(SkillListingSentRegistry.sessionSlotCount(sessionA))
+            .as("槽位数必须减一（SENT 条目确实被移除）").isEqualTo(2);
+        assertThat(SkillListingSentRegistry.isInitialized(sessionA, "")).as("主线程槽不受影响").isTrue();
+        assertThat(SkillListingSentRegistry.isInitialized(sessionA, "sub-1")).as("其他 agentKey 槽不受影响").isTrue();
+    }
+
+    @Test
+    @DisplayName("i2. removeAgentKey → 复现同一 agentKey 时落抑制分支（不整份重发），且不触碰会话级 CLEARED")
+    void removeAgentKey_reusedKeySuppressed_clearedUntouched() {
+        List<String> names = List.of("commit");
+        String sub = "sub-reused";
+        SkillListingSentRegistry.decide(sessionA, sub, names, false); // 子代理首注 → sent=全量 + initialized
+        assertThat(SkillListingSentRegistry.decide(sessionA, sub, names, true).names())
+            .as("稳定态：无增量 → 不注入").isEmpty();
+
+        SkillListingSentRegistry.removeAgentKey(sessionA, sub);
+
+        // 复现同 agentKey（resume 复用 agentId 路径）→ 分支 3 抑制：转录已含清单，不重复注入。
+        //   若只清 SENT 而保留 INITIALIZED，则会走「sent 空 → isInitial=true → 整份重发」（~4K token 冗余）。
+        assertThat(SkillListingSentRegistry.decide(sessionA, sub, names, true).names())
+            .as("回收后复现同一 agentKey 必须抑制（与回收前稳定态的可观测结果一致：不注入）").isEmpty();
+
+        // CLEARED 是会话级意图：单 agent 结束不得消费/清除它（/clear 后所有槽仍须整份重发）。
+        SkillListingSentRegistry.removeSession(sessionA); // /clear
+        SkillListingSentRegistry.removeAgentKey(sessionA, "another-agent");
+        assertThat(SkillListingSentRegistry.decide(sessionA, "", names, true).names())
+            .as("removeAgentKey 不得清掉会话级 CLEARED（/clear 整份重发语义必须保持）")
+            .containsExactly("commit");
+    }
+
+    @Test
+    @DisplayName("i3. removeAgentKey 幂等 + null 入参不抛（与 decide/keyOf 同口径）")
+    void removeAgentKey_idempotentAndNullSafe() {
+        SkillListingSentRegistry.decide(sessionA, "", List.of("commit"), false);
+
+        SkillListingSentRegistry.removeAgentKey(sessionA, "never-existed"); // 未知键 no-op
+        SkillListingSentRegistry.removeAgentKey(null, null);                 // 不得抛 NPE
+        assertThat(SkillListingSentRegistry.sessionSlotCount(sessionA)).isEqualTo(1);
+
+        SkillListingSentRegistry.removeAgentKey(sessionA, "");
+        SkillListingSentRegistry.removeAgentKey(sessionA, "");               // 二次调用幂等
+        assertThat(SkillListingSentRegistry.sessionSlotCount(sessionA)).isZero();
     }
 }

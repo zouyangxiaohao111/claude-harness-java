@@ -42,6 +42,8 @@ interface TraceRecord {
   snipped?: boolean
   /** [compact 边界] subtype=compact_boundary → 渲染为居中「已压缩」标记行（非普通记录行） */
   compact?: boolean
+  /** [边界标记] 详情浮层标题（缺省按 kind 回落；snip 标记用「裁剪摘要」区分「压缩摘要」） */
+  detailTitle?: string
 }
 
 /** [compact 边界] compact 替换点标记文案前缀（轨迹视图专属；聊天区 MessageList 另有一套文案） */
@@ -92,6 +94,30 @@ function microcompactMarker(msg: ChatMessageDto): TraceRecord {
     txt: MICROCOMPACT_MARKER_TXT,
     time: msg.time ?? msg.createdAt ?? '',
     compact: true,
+  }
+}
+
+/** [snip 边界] subtype=snip_boundary → 「已裁剪」居中标记条（与聊天区 MessageList boundaryLabel 同文案）。
+ *
+ *  <p><b>WHY 必须有本分支</b>：缺少它时 snip_boundary 行落入 {@link toRecords} 的 role=system 兜底 →
+ *  被当成「普通 assistant 记录」渲染，直接把 boundary.content（模型写的裁剪摘要）显示成一条助手回复
+ *  → <b>轨迹里看不出发生过 snip</b>（P2-19 取证）。
+ *
+ *  <p>摘要正文（boundary.content = SnipTool 传入的 reason）<b>可点开</b>：它是「这次裁剪做了什么」的说明，
+ *  保留可读性（对齐 CC SnipBoundaryMessage.tsx:12-22 把 content 渲染进分隔条本身）。
+ *  注：聊天区的居中条只显示条数（不展开摘要），此处以详情浮层承载，两边文案保持同源。 */
+function snipBoundaryMarker(msg: ChatMessageDto): TraceRecord {
+  const n = msg.snipMetadata?.removedUuids?.length ?? 0
+  const detail = msg.content ?? ''
+  return {
+    kind: 'assistant',
+    toolClass: '',
+    toolName: '',
+    txt: `已裁剪 · 历史消息已由 Snip 移除${n > 0 ? `（${n} 条）` : ''}`,
+    time: msg.time ?? msg.createdAt ?? '',
+    full: detail || undefined,
+    compact: true,
+    detailTitle: '裁剪摘要',
   }
 }
 
@@ -149,7 +175,7 @@ export function TraceView({ messages, snippedIds = [] }: TraceViewProps) {
   // [轨迹详情] 点击记录行 → 浮层看完整内容
   const [detail, setDetail] = useState<TraceRecord | null>(null)
   const detailLabel = detail
-    ? (detail.compact ? '压缩摘要' : detail.kind === 'user' ? '用户消息' : detail.kind === 'tool' ? `工具调用 · ${detail.toolName || 'tool'}` : '助手回复')
+    ? (detail.detailTitle ?? (detail.compact ? '压缩摘要' : detail.kind === 'user' ? '用户消息' : detail.kind === 'tool' ? `工具调用 · ${detail.toolName || 'tool'}` : '助手回复'))
     : ''
   const visible = messages.filter((m) => !m.isMeta)
   if (visible.length === 0) {
@@ -190,6 +216,15 @@ export function TraceView({ messages, snippedIds = [] }: TraceViewProps) {
       cur.records.push(microcompactMarker(msg))
       continue
     }
+    // [snip 边界] snip 裁剪分界 → 居中标记条（与聊天区同文案），不落普通记录行（P2-19）
+    if (msg.subtype === 'snip_boundary') {
+      if (cur === null) {
+        cur = { num: turns.length + 1, title: '会话', records: [] }
+        turns.push(cur)
+      }
+      cur.records.push(snipBoundaryMarker(msg))
+      continue
+    }
     const recs = toRecords(msg, msg.id != null && snippedSet.has(msg.id))
     if (recs.length === 0) continue
     if (msg.role === 'user') {
@@ -216,7 +251,7 @@ export function TraceView({ messages, snippedIds = [] }: TraceViewProps) {
               key={i}
               className={`trace-compact-marker${r.full != null ? ' clickable' : ''}`}
               onClick={() => { if (r.full != null) setDetail(r) }}
-              title={r.full != null ? '点击查看压缩摘要' : undefined}
+              title={r.full != null ? `点击查看${r.detailTitle ?? '压缩摘要'}` : undefined}
             >
               <span className="trace-compact-txt">{r.txt}</span>
             </div>

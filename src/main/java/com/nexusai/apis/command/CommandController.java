@@ -20,6 +20,7 @@ import com.nexusai.model.command.Command;
 import com.nexusai.model.command.dto.BuiltInCommandDto;
 import com.nexusai.model.command.dto.CommandDto;
 import com.nexusai.model.command.dto.CreateCommandRequest;
+import com.nexusai.model.command.dto.CompactExecuteRequest;
 import com.nexusai.model.command.dto.EffortExecuteRequest;
 import com.nexusai.model.command.dto.ResumeExecuteRequest;
 import com.nexusai.model.command.dto.UpdateCommandRequest;
@@ -383,6 +384,21 @@ public class CommandController {
         if ("resume".equals(hit.getName())) {
             return executeResume(request);
         }
+        // [P2-18 · 2026-09-11] /compact 显式路由（不再依赖 Spring「literal 路由优先于 {name} 路径变量」）。
+        //   WHY：compact 的真实执行点只在字面端点 {@code /builtins/compact/execute}；本通用分支对
+        //   compact 只回命令元数据（DEC-9 薄触发）。旧实现下「/compact 真的压缩了」这一事实完全由
+        //   Spring 路由优先级保证（无编译期/测试期护栏）——字面端点一旦被移除/改写路径，请求会静默
+        //   落回本分支返回元数据（= 前端报「已执行 /compact」但压缩从未发生，历史故障复发）。
+        //   现把 compact 显式委托到字面端点同一执行体：任一入口都真实压缩，不存在静默假成功通道。
+        //   注：本分支不带自定义指令（args 走字面端点的 CompactExecuteRequest 请求体），
+        //   与 CC {@code /compact} 空 args 等价（compact.ts:54 {@code args.trim()} → ''）。
+        if ("compact".equals(hit.getName())) {
+            if (log.isDebugEnabled()) {
+                log.debug("[CommandController] executeBuiltin({}) 显式路由 → executeCompactBuiltin"
+                    + "（不依赖 literal 路由优先级；P2-18）", name);
+            }
+            return executeCompactBuiltin(null, null);
+        }
         // [IMP-SP-07] /clear 失效接线：clear 命令触发会话级 system prompt section 缓存失效
         if ("clear".equals(hit.getName())) {
             invalidateSystemPromptSections("executeBuiltin(/clear)");
@@ -441,10 +457,15 @@ public class CommandController {
             }
             // [C 级 2026-09-07 · 对齐 CC conversation.ts:245 clear 边界] /clear 清空会话时点移除本会话的
             //   进程级 sessionStartSeen key → 下 run（同会话续聊）恢复 cold → §14 SessionStart hook 链重跑
-            //   （watchPaths 等动态副作用刷新）。注入去重仍由 LlmAgentLoop §14 V1「存在即跳过」独立兜底：
-            //   /clear 不删 DB 消息行（web 转录保留，见 B-4 复核）→ 恢复历史仍含 A 级落库的单份 hook 副本
-            //   → cold 跑副作用但不重注入 → 恒 0 或 1 份、绝无 2 份；「clear 后应见一次新注入」仅在转录真被
-            //   清空（无副本）时发生，属产品行为登记项。
+            //   （watchPaths 等动态副作用刷新）。
+            //   [P2-20 ③ 2026-09-12 修正] 原文此处写「注入去重仍由 LlmAgentLoop §14 V1『存在即跳过』独立
+            //   兜底 → /clear 不删 DB 行 → cold 跑副作用但<b>不重注入</b> → 恒 0 或 1 份、绝无 2 份」。
+            //   实测该表述<b>双错</b>（注释已过时，非实现缺陷）：
+            //   ① 「存在即跳过」机制<b>已不存在</b> —— §14 hook_additional_context 已改为「先插后删」覆盖式
+            //      写（LlmAgentLoop 覆盖式注入块：cold 注入 1 份新份 → 确认落库成功后再删其它旧份）；
+            //   ② cold <b>会</b>重注入（用新份替换旧份，hook 配置变更才能刷新），不是「不重注入」。
+            //   净结果仍为「该 subtype 在 DB 恒 1 条」（先插后删不变量：插入失败则不执行删除 → 旧份仍在，
+            //   绝不丢份）—— 结论不变，达成机制从「跳过」换成「覆盖式写」。
             SessionStartSeenRegistry.remove(com.nexusai.common.RequestContext.sessionId());
             // [skill-listing-cc-align 2026-09-10] skill_listing sent 注册表 · /clear 重置该会话去重态。
             //   ① CC {@code resetSentSkillNames()} 语义（clear/caches.ts:79）—— clear 后下一次 skill_listing
@@ -559,12 +580,31 @@ public class CommandController {
      * <p>无会话标识 → 返回中文说明（fail-loud，不静默）：CC 无「无会话 /compact」——命令必须知道
      * 压缩哪个会话。
      *
+     * <p><b>[P2-8 · 2026-09-11] 自定义指令入站</b>：请求体 {@code {args: "用中文总结"}} →
+     * 拼成 {@code "/compact 用中文总结"} 交给同一 dispatcher（{@code UserInputDispatcher.dispatchResult}
+     * 按首个空白拆分 name/args，UserInputDispatcher.java:133-136）→
+     * {@code ToolRegistrationConfig.registerCompactSlashCommand} 的 handler 消费 args →
+     * {@code CompactCommand.call} 的 {@code customInstructions}（compact.ts:54）→ 有指令时跳过 SM 优先
+     * 直压（compact.ts:44-48 {@code if (!customInstructions)}）。旧实现恒 {@code dispatchResult("/compact")}
+     * → args 恒空 → Web 端拿不到自定义指令，且 manual /compact 永远落 SM 优先分支。
+     *
+     * <p><b>[P2-18 · 2026-09-11] 显式路由护栏</b>：/compact 的真实执行点恒定在本字面端点
+     * （{@code /builtins/compact/execute}）。旧实现仅靠 Spring「literal 路由优先于 {name} 路径变量」
+     * 取胜（无编译期/测试期护栏）——{@link #executeBuiltin} 的通用分支对 compact 只回元数据（DEC-9
+     * 薄触发），一旦本字面端点被移除/改写路径，请求会静默落回通用分支返回元数据（历史「报成功但压缩
+     * 从未执行」故障复发）。现于通用分支显式分流 compact（{@link #executeBuiltinInternal} 显式委托到
+     * 本端点同一执行体，不再依赖路由优先级），并有
+     * {@code CommandControllerBuiltInCommandsTest} 断言「字面端点真实执行（非元数据）」与
+     * 「通用分支 compact 亦真实委托」。
+     *
      * @param sessionIdParam query {@code ?sessionId=}（可选；MDC 兜底）——前端需带当前会话
+     * @param request        请求体 {@code {args}}（可选；null/空 args = 无自定义指令 · CC args 空串等价）
      * @return displayText（压缩成功）/ 中文失败说明
      */
     @PostMapping(path = "/builtins/compact/execute", produces = "text/plain;charset=UTF-8")
     public String executeCompactBuiltin(
-            @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam,
+            @RequestBody(required = false) CompactExecuteRequest request) {
         if (userInputDispatcher == null) {
             log.error("[CommandController] executeCompactBuiltin: UserInputDispatcher 未注入"
                 + "（非容器上下文），无法执行 /compact");
@@ -581,17 +621,25 @@ public class CommandController {
         }
         RequestContext.setSession(sessionId);
         try {
-            // 复用已注册 compact handler：/compact（无自定义指令 → SM 优先 / 传统压缩）
+            String args = request != null ? request.args() : null;
+            // 复用已注册 compact handler：/compact [args]（无自定义指令 → SM 优先 / 传统压缩；
+            //   有指令 → 跳过 SM 优先直压，对齐 CC compact.ts:44-48）
+            String input = (args == null || args.isBlank()) ? "/compact" : "/compact " + args;
+            if (log.isDebugEnabled()) {
+                log.debug("[CommandController] executeCompactBuiltin: dispatch input='{}'（args 透传自定义指令）",
+                    input);
+            }
             com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult r =
-                userInputDispatcher.dispatchResult("/compact");
+                userInputDispatcher.dispatchResult(input);
             if (r == null) {
                 log.error("[CommandController] executeCompactBuiltin: /compact handler 未注册"
                     + "（dispatchResult null；ToolRegistrationConfig.registerCompactSlashCommand 未执行？）");
                 return "/compact 无法执行：/compact 命令未注册。";
             }
             if (log.isInfoEnabled()) {
-                log.info("[CommandController] executeCompactBuiltin: /compact 执行完成 session={} kind={} resultLen={}",
-                    sessionId, r.kind(), r.value() == null ? 0 : r.value().length());
+                log.info("[CommandController] executeCompactBuiltin: /compact 执行完成 session={} kind={} resultLen={} customInstructions={}",
+                    sessionId, r.kind(), r.value() == null ? 0 : r.value().length(),
+                    args != null && !args.isBlank());
             }
             if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
                 return "/compact 压缩完成（无文本结果）。";

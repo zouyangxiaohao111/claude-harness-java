@@ -130,7 +130,7 @@ class EnvOverridesCcContractTest {
     @DisplayName("M-2: DISABLE_COMPACT=on → shouldAutoCompact 早退 false（autoCompact.ts:185-187 链）")
     void disableCompactOnEarlyReturnsShouldAutoCompact() {
         assertThat(autoCompactorWithEnv(Map.of("DISABLE_COMPACT", "on"))
-                .shouldAutoCompact(List.of(), "user", 0))
+                .shouldAutoCompact(List.of(), null, "user", 0))
             .isFalse();
     }
 

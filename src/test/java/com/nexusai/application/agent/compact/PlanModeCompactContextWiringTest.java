@@ -63,7 +63,8 @@ class PlanModeCompactContextWiringTest {
             (p, m) -> new CompactConversation.SummaryResult("<summary>x</summary>", null));
         auto.setToolUseContext(planModeTuc(PermissionMode.PLAN));
 
-        CompactConversationContext ctx = auto.buildDefaultCompactConversationContext();
+        // [P2-7] 回落上下文构建现接收 model 显式入参（原读 AutoCompactor.model 实例字段）
+        CompactConversationContext ctx = auto.buildDefaultCompactConversationContext(null);
 
         assertThat(ctx.getToolUseContext())
             .as("auto 回落路径（ccContext==null）必须把 toolUseContext 接线进 ctx")

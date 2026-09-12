@@ -28,24 +28,20 @@ import java.util.Set;
  *   <tr><td>projectSnippedView</td><td>projectSnippedView(messages)</td><td>snipProjection.ts:35-60</td></tr>
  * </table>
  *
- * <p><b>snip 投影（2026-08-18 真源对齐）</b>: CC getMessagesAfterCompactBoundary 在 HISTORY_SNIP
- * 开启且 {@code !options?.includeSnipped} 时会对切片应用 {@code projectSnippedView}
- * （messages.ts:5088-5093），剔除被 snip 删除的消息（removedUuids），使模型面数组不含陈旧历史。
+ * <p><b>snip 投影（2026-08-18 真源对齐）</b>: CC getMessagesAfterCompactBoundary 在
+ * {@code !options?.includeSnipped} 时会对切片应用 {@code projectSnippedView}（messages.ts:5088-5093），
+ * 剔除被 snip 删除的消息（removedUuids），使模型面数组不含陈旧历史。
  * 本组件按已入库真源 {@code Open-ClaudeCode/src/services/compact/snipProjection.ts} 完整实现
  * isSnipBoundaryMessage + projectSnippedView（此前 TODO[OD-01] 悬空，vendored snapshot 缺
  * snipProjection.js —— 2026-08-18 真源已取回，投影从「引用方语义」升级为「真源实现」）。
- * HISTORY_SNIP 门经 {@link #setFeatureFlags} 静态槽位注入 —— <b>唯一生产写入点 =
- * {@code ToolRegistrationConfig.microCompactor} @Bean</b>（ToolRegistrationConfig.java:964，
- * 与 {@link #setSettingsResolver} 同点，Spring 启动执行一次、早于任何请求；MicroCompactor/
- * StreamCompactSummary 先例），默认 ALL_DISABLED → flag 关时投影恒 no-op，既有单参调用方零行为变化。
+ * <b>[N2 2026-09-11]</b> 投影**不再受 HISTORY_SNIP 运行时开关门控**（回放门，见下方 [N2] 段）；
+ * 无 boundary / 无 removedUuids 时投影原样返回，故既有单参调用方在「无 snip 历史」时零行为变化。
  *
  * <p><b>[D4 双门源合并] 门公式单一来源</b>: {@link #isHistorySnipEnabled(CompactSettingsResolver,
- * FeatureFlags)} 为唯一纯函数实现；{@code LlmAgentLoop} snip 步骤（门①）与本组件静态槽读侧（门②）
- * 均委托它 → DB {@code settings.history_snip_enabled} 为 NULL 时两门同回落到 FeatureFlags，
- * 不再分叉（分叉 = 入口剥离面不剔除被 snip 删除的消息 → 被裁剪消息留在内存 state，进而泄漏给
- * **所有**直接吃 {@code state.messages()} 的模型相邻消费点 —— 含主循环请求面
- * {@code messagesForQuery} 与 stop hook / extract-memories / reactive compact 等，见
- * {@code LlmAgentLoop} 循环入口 boundary 剥离块的注释）。
+ * FeatureFlags)} 为唯一纯函数实现；{@code LlmAgentLoop} snip 步骤（门①）委托它。
+ * <b>[N2 2026-09-11]</b> 该静态槽读侧（原「门②」，即本组件 {@link #setFeatureFlags} /
+ * {@link #setSettingsResolver} 支撑的 {@code isHistorySnipEnabled()} 无参重载）**已无消费方**
+ * （投影去门控后成为死接线）——保留待用户裁定是否清理，详见下方 [N2] 段。
  *
  * <p><b>[snip-state-fix 2026-09-10 语义澄清]</b> {@code includeSnipped} 的两种取值在本仓的用途：
  * <ul>
@@ -56,6 +52,42 @@ import java.util.Set;
  *       无可用的调用方**——因为「REPL 全量历史」在本仓由 **DB** 承担（前端/轨迹读 DB，DB
  *       append-only 不删行），循环内 state 不需要第二份全量。</li>
  * </ul>
+ *
+ * <p><b>[N2 2026-09-11 · 回放门 vs 执行门拆分 · 用户拍板 (B)「历史 snip 不复活」]</b>
+ * 关掉开关只应禁止「产生新 snip」，不应让**已执行过**的 snip 失效。故：
+ * <ol>
+ *   <li><b>回放门（本组件 {@code getMessagesAfterCompactBoundary}）</b>：去门控 —— 只要
+ *       {@code !includeSnipped} 就应用 {@link #projectSnippedView}，与 compact boundary 剥离
+ *       （恒定、本就无门）对称。</li>
+ *   <li><b>执行门（{@code LlmAgentLoop} snip 步骤）</b>：仍读开关
+ *       （{@code if (historySnipEnabled)}，公式 = {@link #isHistorySnipEnabled(CompactSettingsResolver,
+ *       FeatureFlags)}）—— 管「本轮是否执行**新** snip」，语义不变。</li>
+ * </ol>
+ * <b>⛔ 5 处静态调用面逐一审计结论（实施时 grep 复核，行号为当日实测）：全部为「回放」语义</b>
+ * <table>
+ *   <tr><th>调用点</th><th>用途</th><th>回放/执行</th></tr>
+ *   <tr><td>{@code LlmAgentLoop.java:5085}</td><td>循环入口 boundary 剥离 + snip 投影写回
+ *       {@code state.messages()}（state 扮演 CC {@code messagesForQuery} 角色）→ 模型面</td>
+ *       <td><b>回放</b></td></tr>
+ *   <tr><td>{@code CompactCommand.java:217}</td><td>手动 {@code /compact}：剥离结果即压缩输入
+ *       （喂给摘要模型）→ 模型面</td><td><b>回放</b></td></tr>
+ *   <tr><td>{@code PartialCompactService.java:318}</td><td>partial compact：剥离后按
+ *       {@code messageId} 定 pivot；**pivot == -1 即「已 snipped/pre-compact」的判据**
+ *       （:322-330 抛 404 提示）——去门控才能保住该判据正确</td><td><b>回放</b></td></tr>
+ *   <tr><td>{@code StreamCompactSummary.java:744}</td><td>流式 fallback 的 apiMessages
+ *       （{@code [getMessagesAfterCompactBoundary(messages), summaryRequest]}）→ 模型面</td>
+ *       <td><b>回放</b></td></tr>
+ *   <tr><td>{@code SkillifySkillRegistrar.java:301}</td><td>{@code extractUserMessages(
+ *       getMessagesAfterCompactBoundary(context.messages))} → 喂 skillify 提示词 → 模型面</td>
+ *       <td><b>回放</b></td></tr>
+ * </table>
+ * 无一处需要「执行」语义 —— 执行门只存在于 {@code LlmAgentLoop} 的 snip 步骤（不经过本方法）。
+ *
+ * <p><b>[N2 遗留 · 待用户裁定清理]</b> 去门控后，本组件的静态槽 {@link #setFeatureFlags} /
+ * {@link #setSettingsResolver}（生产接线 {@code ToolRegistrationConfig.java:995/:1002}）及其唯一的
+ * 消费方 {@code isHistorySnipEnabled()} 无参重载**已无任何消费方**（死接线）。本次**未删除**
+ * （用户拍板项，非本项范围）；如需清理须同步移除 {@code ToolRegistrationConfig} 两行接线与
+ * {@code BoundaryReaderHistorySnipSingleSourceTest} 的对应断言。
  */
 public final class BoundaryReader {
 
@@ -68,67 +100,74 @@ public final class BoundaryReader {
     private static final String SNIP_METADATA_REMOVED_UUIDS = "removedUuids";
 
     /**
-     * [2026-08-18] HISTORY_SNIP 门（CC {@code feature('HISTORY_SNIP')}，query.ts:115/401）· 默认全关。
+     * [2026-08-18] HISTORY_SNIP 门静态槽 · 默认全关。
      *
      * <p>与 {@link MicroCompactor} / {@link StreamCompactSummary} 同模式（static volatile + 测试
      * setter，IMP2-01 先例）：getMessagesAfterCompactBoundary 为静态纯函数，生产 bean 无
-     * FeatureFlags 注入面，以静态槽位承载门控；默认 {@code ALL_DISABLED}（historySnip=false）
-     * → snip 投影恒 no-op（CC flag-off 等价）。
+     * FeatureFlags 注入面，以静态槽位承载门控。
      *
-     * <p><b>[D4 双门源合并] 唯一生产写入点</b>: {@code ToolRegistrationConfig.microCompactor}
-     * @Bean（ToolRegistrationConfig.java:964）调用 {@link #setFeatureFlags}——此前本槽生产零调用方
-     * （恒 ALL_DISABLED = 死槽），DB 列 NULL 时门② 与门① 分叉。
+     * <p><b>⚠️ [N2 2026-09-11] 本槽已无消费方（死接线，待用户裁定是否清理）</b>：snip 投影去门控
+     * 后，唯一读者 {@code isHistorySnipEnabled()} 无参重载已无调用点。生产写入点仍为
+     * {@code ToolRegistrationConfig.microCompactor} @Bean（ToolRegistrationConfig.java:1002），
+     * 写入后不会被读取 —— 保留仅为避免在未获授权时擅自删除。详见类注释 [N2 遗留] 段。
      */
     private static volatile com.nexusai.application.agent.loop.FeatureFlags featureFlags =
         com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED;
 
     /**
-     * [V52 X1-3] 压缩配置 DB 实时读源静态槽位（null = 未接线 → 回落 {@link #featureFlags}）。
+     * [V52 X1-3] 压缩配置 DB 实时读源静态槽位。
      *
      * <p>同 {@link #setFeatureFlags} 静态槽位模式（BoundaryReader 为纯静态工具类，无实例注入面）；
-     * 生产在 {@code ToolRegistrationConfig.microCompactor} @Bean 接线（与 MicroCompactor 静态槽位
-     * 同点）。
+     * 生产在 {@code ToolRegistrationConfig.microCompactor} @Bean 接线。
+     *
+     * <p><b>⚠️ [N2 2026-09-11] 本槽已无消费方（死接线，待用户裁定是否清理）</b>：同上，唯一读者
+     * {@code isHistorySnipEnabled()} 无参重载已无调用点。生产写入点
+     * {@code ToolRegistrationConfig.java:995}。
      */
     private static volatile com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver;
 
     /**
      * [2026-08-18] 注入 feature 门（对齐 {@link MicroCompactor#setFeatureFlags} 先例）。
      *
-     * <p><b>[D4 双门源合并] 唯一生产写入点</b>: {@code ToolRegistrationConfig.microCompactor}
-     * @Bean（ToolRegistrationConfig.java:964，与 {@link #setSettingsResolver} 相邻），Spring 启动
-     * 执行一次。此前该槽生产零调用方（恒 {@code ALL_DISABLED}）——DB 列 NULL 时门② 与门① 分叉。
+     * <p><b>⚠️ [N2 2026-09-11] 死接线</b>：生产写入点 {@code ToolRegistrationConfig.microCompactor}
+     * @Bean（ToolRegistrationConfig.java:1002），但 snip 投影去门控后已无读者。保留待用户裁定。
      *
-     * @param flags feature 门（null → 回退 ALL_DISABLED，对齐 flag-off）
+     * @param flags feature 门（null → 回退 ALL_DISABLED）
      */
     public static void setFeatureFlags(com.nexusai.application.agent.loop.FeatureFlags flags) {
         featureFlags = flags != null
             ? flags
             : com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED;
         if (log.isDebugEnabled()) {
-            log.debug("BoundaryReader setFeatureFlags: historySnip={}（getMessagesAfterCompactBoundary snip 投影门控，CC HISTORY_SNIP）",
-                featureFlags.historySnip());
+            log.debug("BoundaryReader setFeatureFlags: historySnip={}（[N2] 该槽已无消费方，"
+                    + "snip 投影回放门不受其门控）", featureFlags.historySnip());
         }
     }
 
     /**
-     * [V52 X1-3] 压缩配置 DB 实时读源静态注入（可 null，null = 未接线回落 FeatureFlags）。
+     * [V52 X1-3] 压缩配置 DB 实时读源静态注入（可 null）。
+     *
+     * <p><b>⚠️ [N2 2026-09-11] 死接线</b>：生产写入点 ToolRegistrationConfig.java:995，已无读者。
      *
      * @param resolver 压缩配置实时读源（可 null）
      */
     public static void setSettingsResolver(com.nexusai.application.agent.compact.CompactSettingsResolver resolver) {
         settingsResolver = resolver;
         if (log.isDebugEnabled()) {
-            log.debug("BoundaryReader setSettingsResolver: 注入={}（snip 投影 DB 覆盖，null 回落 FeatureFlags）",
+            log.debug("BoundaryReader setSettingsResolver: 注入={}（[N2] 该槽已无消费方）",
                 resolver != null);
         }
     }
 
     /**
-     * HISTORY_SNIP 门公式 · <b>[D4 双门源合并] 全仓唯一纯函数实现</b>（CC {@code feature('HISTORY_SNIP')}，
-     * query.ts:115/401 + messages.ts:4648 读侧门控）。
+     * HISTORY_SNIP 门公式 · <b>[D4 双门源合并] 全仓唯一纯函数实现</b>
+     * （CC {@code feature('HISTORY_SNIP')}，query.ts:141/401 + messages.ts:5088 读侧判定）。
      *
-     * <p>门①（{@code LlmAgentLoop} snip 步骤）与门②（本组件静态槽读侧 / 5 处静态调用面）均委托本方法：
-     * DB {@code settings.history_snip_enabled} 有值（非 null）即覆盖并返回；null → 回落
+     * <p><b>[N2 2026-09-11] 当前唯一消费方 = 执行门</b>：{@code LlmAgentLoop} snip 步骤
+     * （{@code if (historySnipEnabled)}，管「本轮是否产生**新** snip」）。原先的「门②」（本组件
+     * 静态槽读侧的 snip 投影门控）已随回放门去门控而消失。
+     *
+     * <p>DB {@code settings.history_snip_enabled} 有值（非 null）即覆盖并返回；null → 回落
      * {@code flags.historySnip()}（零行为变化）。resolver <b>每次调用实时读 DB</b>，绝不缓存进静态槽
      * （前端 PUT /api/v1/settings 后下一轮即生效）。
      *
@@ -146,14 +185,19 @@ public final class BoundaryReader {
     }
 
     /**
-     * HISTORY_SNIP 门 DB-aware 解析 · [V52 X1-3] 供读侧 snip 投影门控（:207）。
+     * HISTORY_SNIP 门 DB-aware 解析（静态槽输入）· [V52 X1-3]。
+     *
+     * <p><b>⚠️ [N2 2026-09-11] 已无消费方（死代码，待用户裁定是否清理）</b>：原供读侧 snip 投影
+     * 门控；投影改「回放门」（不受开关门控）后，本重载连同其两个静态输入
+     * （{@link #settingsResolver} / {@link #featureFlags}）一并成为死接线。**本次未删除**——
+     * 属用户拍板项，不在本项范围。详见类注释 [N2 遗留] 段。
      *
      * <p>[D4 双门源合并] 无参重载委托 {@link #isHistorySnipEnabled(CompactSettingsResolver,
-     * com.nexusai.application.agent.loop.FeatureFlags)}（输入 = 静态槽 settingsResolver +
-     * 静态槽 featureFlags，后者由 {@code ToolRegistrationConfig.microCompactor} @Bean 写入）。
+     * com.nexusai.application.agent.loop.FeatureFlags)}。
      *
      * @return true = HISTORY_SNIP 开启（含 DB 覆盖）
      */
+    @SuppressWarnings("unused")
     private static boolean isHistorySnipEnabled() {
         return isHistorySnipEnabled(settingsResolver, featureFlags);
     }
@@ -201,8 +245,10 @@ public final class BoundaryReader {
     /**
      * 从最后一个 compact boundary（含）向后切片 · 对齐 CC {@code getMessagesAfterCompactBoundary}
      * （messages.ts:5083-5096）：无边界返回全量；有边界返回从最后一个边界（含）到末尾的新列表。
-     * 默认 {@code includeSnipped=false}（CC 缺省）：HISTORY_SNIP 开启时对切片应用
-     * {@link #projectSnippedView}（messages.ts:5088-5093）；flag 关时行为与旧单参版完全一致。
+     * 默认 {@code includeSnipped=false}（CC 缺省）：对切片应用 {@link #projectSnippedView}
+     * （messages.ts:5088-5093）。<b>[N2 2026-09-11]</b> 投影**不受** HISTORY_SNIP 运行时开关门控
+     * （回放门·历史 snip 不复活）；无 boundary / 无 removedUuids 时投影原样返回，故无 snip 历史时
+     * 行为与改前一致。
      *
      * <p><b>WHY 返回新列表</b>: CC {@code messages.slice(boundaryIndex)} 生成新数组；下游
      * （budget/snip/autocompact）可能改写切片，返回新列表避免 subList 视图把改动回灌原消息链
@@ -218,16 +264,28 @@ public final class BoundaryReader {
     /**
      * 从最后一个 compact boundary（含）向后切片 + 可选 snip 投影 · 对齐 CC
      * {@code getMessagesAfterCompactBoundary(messages, options?)}（messages.ts:5083-5096）：
-     * 切片语义与单参版相同；随后按 CC 门控 {@code !options?.includeSnipped && feature('HISTORY_SNIP')}
-     * （messages.ts:5088）对切片应用 {@link #projectSnippedView}，剔除被 snip 删除的陈旧消息。
+     * 切片语义与单参版相同；随后在 {@code !includeSnipped} 时对切片应用
+     * {@link #projectSnippedView}，剔除被 snip 删除的陈旧消息。
      *
-     * <p><b>includeSnipped 语义</b>: true = 保留被 snip 删除的消息（CC 在 REPL/UI 面这么用：
-     * {@code REPL.tsx:3167-3169} 全屏 compact 处理器，保留滚动回看）；false = 默认（CC 的
-     * model-facing 用法），flag 开时应用投影。
-     * ⚠️ 本仓**当前只有 false 的调用方**（{@code LlmAgentLoop} 循环入口，见 BoundaryReader 类注释
-     * 的 [snip-state-fix] 段）——「REPL 全量历史」由 DB 承担，循环内 state 不需第二份全量；
+     * <p><b>[N2 2026-09-11] 回放门 ≠ 执行门（有意偏离 CC 字面、保持 CC 语义）</b>:
+     * CC 的字面门是 {@code !options?.includeSnipped && feature('HISTORY_SNIP')}（messages.ts:5088）。
+     * 但 CC 的 {@code feature()} 是**构建期常量**（模块级三元，见 {@code tools.ts:141} /
+     * {@code query.ts:141}）→ CC 侧「回放已执行的 snip」与「本轮执行新 snip」不可能分叉。本仓把该
+     * 开关实现成**运行时 DB 开关**（{@code settings.history_snip_enabled}），因此必须拆成两个门：
+     * <ul>
+     *   <li><b>回放门（本方法）</b>：**不受开关门控** —— 只要历史里有 snip_boundary，就剔除其
+     *       {@code removedUuids}。理由：关掉开关只应禁止「产生新 snip」，已执行过的 snip 是既成事实；
+     *       且必须与 compact boundary 对称（后者的剥离在本方法上方恒定执行、同样无门）。</li>
+     *   <li><b>执行门</b>：{@code LlmAgentLoop} snip 步骤（{@code if (historySnipEnabled)}）仍读开关，
+     *       管「本轮是否产生**新** snip」——语义不变。</li>
+     * </ul>
+     *
+     * <p><b>includeSnipped 语义（不变）</b>: true = 保留被 snip 删除的消息（CC 在 REPL/UI 面这么用：
+     * {@code REPL.tsx:3167-3169} 全屏 compact 处理器，保留滚动回看）；false = 默认（CC 的 model-facing
+     * 用法），应用投影。
+     * ⚠️ 本仓**当前只有 false 的调用方**（5 处静态调用面，见类注释的 [N2] 段——经逐一审计全部为
+     * 「回放」语义）——「REPL 全量历史」由 DB 承担，循环内 state 不需第二份全量；
      * 若将来要新增 true 的调用方，必须同时审计所有吃 {@code state.messages()} 的模型相邻消费点。
-     * {@link #setFeatureFlags} 注入 historySnip 门（默认全关 → 投影恒跳过）。
      *
      * @param messages      消息列表
      * @param includeSnipped 是否保留被 snip 删除的消息（CC options.includeSnipped，messages.ts:4648）
@@ -255,15 +313,36 @@ public final class BoundaryReader {
                     boundaryIndex, sliced.size());
             }
         }
-        if (!includeSnipped && isHistorySnipEnabled()) {
+        // ── [N2 2026-09-11 · 回放门 vs 执行门拆分] snip 投影**不再受** isHistorySnipEnabled 门控 ──
+        // 决策 (B)「历史 snip 不复活」：关掉开关只应禁止「产生**新** snip」，绝不能让**已执行过**的
+        // snip 失效 —— 历史 snip_boundary 是既成事实，与 compact boundary 同类（后者的剥离在本方法
+        // 上方恒定执行、同样无门），二者必须对称。
+        //
+        // ⚠️ 这是**有意偏离 CC 字面、但保持 CC 语义**的改造（CC 对照见类注释）：
+        //   · CC 门 = {@code !options?.includeSnipped && feature('HISTORY_SNIP')}（messages.ts:5088，
+        //     已读实际 TS 源码复核），而 {@code feature()} 是**构建期常量** —— 它在 CC 里出现于
+        //     模块级三元（tools.ts:141 {@code const SnipTool = feature('HISTORY_SNIP') ? ... : null}、
+        //     query.ts:141 {@code const snipModule = feature('HISTORY_SNIP') ? ... : null}）→ 一旦构建
+        //     完成即不可能翻转 ⇒ 「回放」与「执行」在 CC **天然同源、不可能分叉**。
+        //   · 本仓把它实现成了**运行时 DB 开关**（settings.history_snip_enabled）→ 才必须把两个语义
+        //     拆成两个门：本处 = **回放门**（无门控，只要历史有 boundary 就回放既成事实）；门① =
+        //     {@code LlmAgentLoop} 的 snip 步骤（仍读开关，管「本轮是否执行**新** snip」）。
+        //   · 偏离的只是字面（少一次 isHistorySnipEnabled 判据），保持的是语义：「有 boundary」在 CC
+        //     中等价于「flag 曾开启」（flag 关时 CC 侧 SnipTool 根本注册不出、绝不会产生 boundary）。
+        //     故「!includeSnipped && flag」≡「!includeSnipped && 存在 boundary」。
+        //   · 不误伤保证：无 boundary 或 removedUuids 为空时 {@link #projectSnippedView} 原样返回
+        //     （:325-331），故「门关 + 历史无 snip」行为与改前逐字节一致。
+        if (!includeSnipped) {
             if (log.isDebugEnabled()) {
-                log.debug("读侧切片: HISTORY_SNIP 开启且 includeSnipped=false，对切片应用 snip 投影（messages.ts:4648-4653）");
+                log.debug("读侧切片: includeSnipped=false → 应用 snip 投影"
+                        + "（回放门·不受 HISTORY_SNIP 运行时开关门控，N2 决策 B：历史 snip 不复活；"
+                        + "CC messages.ts:5088 构建期常量的等价语义）");
             }
             return projectSnippedView(sliced);
         }
         if (log.isDebugEnabled()) {
-            log.debug("读侧切片: 跳过 snip 投影（includeSnipped={} historySnip={}，messages.ts:4648 门控）",
-                includeSnipped, isHistorySnipEnabled());
+            log.debug("读侧切片: 跳过 snip 投影（includeSnipped=true，UI/REPL 全量面，"
+                    + "CC REPL.tsx:3167-3169 用法；CC messages.ts:5088 options.includeSnipped 分支）");
         }
         return sliced;
     }

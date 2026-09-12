@@ -68,8 +68,17 @@ import static org.mockito.Mockito.when;
  *       microcompactMessages 并替换消息（snip 后、collapse 前）。</li>
  * </ol>
  *
- * <p><b>RED teeth</b>: revert LlmAgentLoop 中 snip 门控（恒执行）/ B2 透传（改回 0）/ B6（改回
- * rawWindow−3000）/ B4（不减 snipTokensFreed）/ B1（不调用 micro）→ 对应测试必须 fail。
+ * <p><b>⚠️ [N2 2026-09-11] 本类 3 处断言已按「回放门去门控」更新，且 B2/B4 的 snipTokensFreed 牙齿
+ * 结构性失效</b>：N2 决策 (B) 让 snip 投影不再受开关门控（回放既成事实），于是 state/messagesForQuery
+ * 在进入 snip 步骤前**已被投影** → {@code snipCompactIfNeeded} 找不到被删消息 → {@code tokensFreed}
+ * 恒 0。这与 CC 同构（CC 也拿已投影的 {@code messagesForQuery} 去算，snipCompact.ts:128-139 只在
+ * 仍存在的消息上累加）⇒「snip 释放量回馈 autocompact/blocking」在两侧都结构性失效，已登记待裁定。
+ * 受影响：{@link #snipGateOff_skipsSnip} / {@link #snipGateOn_runsSnip} /
+ * {@link #snipBoundaryYield_publishedToEventChannel}（state 断言反转）+ {@link #b2PassThrough_gateOn_forwardsTokensFreed}
+ * / {@link #b4MeasurementSubtractsSnipTokensFreed}（值结构性 0，改为事实登记）。
+ * <p><b>RED teeth（更新后）</b>: revert LlmAgentLoop 中 snip 门控（恒执行）→ {@link #snipBoundaryYield_gateOff_noEvent}
+ * 必须 fail；{@link #b2SourceForwardsVariable} 是 snipTokensFreed 透传的非硬编码唯一守卫；
+ * B6/B1 牙齿不变。
  */
 @DisplayName("[S3] snip 门控 + micro 接线 + snipTokensFreed 透传 + blocking 窗口（CC query.ts:401-466/637-638）")
 class LlmAgentLoopSnipMicroWiringTest {
@@ -89,7 +98,7 @@ class LlmAgentLoopSnipMicroWiringTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("snip 门控: HISTORY_SNIP=false → 主循环跳过 snip（有 boundary 也不执行，u0 保留）")
+    @DisplayName("snip 门控: HISTORY_SNIP=false → 主循环跳过「产生新 snip」，但历史 snip 仍回放剔除（N2）")
     void snipGateOff_skipsSnip() throws IOException {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         for (ChatMessageDto m : snipTriggerMessages()) {
@@ -103,15 +112,28 @@ class LlmAgentLoopSnipMicroWiringTest {
 
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
         assertThat(state.exitReason())
-            .as("historySnip=false → 不 snip，正常 LLM 调用")
+            .as("historySnip=false → 不产生新 snip，正常 LLM 调用")
             .isNotEqualTo(AgentState.ExitReason.BLOCKING_LIMIT);
+        // ⚠️ [N2 2026-09-11 决策 B「历史 snip 不复活」] 旧断言为 `contains("u0")`（门关 → 投影整段跳过
+        //   → 被裁消息回到模型上下文）。该断言编码的是**旧的 (A) 语义**，与用户拍板相反：
+        //   关掉开关只应禁止「产生新 snip」，不应让已执行过的 snip 失效 —— 历史 snip_boundary 与
+        //   compact boundary 同为「同类历史裁剪标记」，后者的剥离本就恒定无门，二者必须对称。
+        //   ⇒ 门关时 state（本仓扮演 CC messagesForQuery 角色）仍应剔除 removedUuids。
         assertThat(ids(state))
-            .as("HISTORY_SNIP=false → snip 被 feature 门跳过（CC query.ts:401 关时不执行），removedUuids 消息保留")
-            .contains("u0");
+            .as("[N2] 回放门不受开关门控 → 历史 snip 的 u0..u9 仍被剔除（决策 B：不复活）")
+            .doesNotContain("u0", "u9");
+        assertThat(ids(state))
+            .as("[N2] 执行门仍生效：未产生**新** boundary（历史 boundary 原样保留，不被重复执行/改写）")
+            .contains("snip-boundary-1");
+        long boundaryCount = state.messages().stream()
+            .filter(m -> m.subtype() != null && "snip_boundary".equals(m.subtype())).count();
+        assertThat(boundaryCount)
+            .as("[N2] 门关 → snip 步骤被 feature 门跳过（CC query.ts:401），boundary 数量不增")
+            .isEqualTo(1);
     }
 
     @Test
-    @DisplayName("snip 门控: HISTORY_SNIP=true → 主循环执行 snip（请求面 removedUuids 剔除，state 保留全量 · B5 d-2）")
+    @DisplayName("snip 门控: HISTORY_SNIP=true → 主循环执行 snip（请求面 removedUuids 剔除 · B5 d-2）")
     void snipGateOn_runsSnip() {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         for (ChatMessageDto m : snipTriggerMessages()) {
@@ -129,9 +151,18 @@ class LlmAgentLoopSnipMicroWiringTest {
         assertThat(ids(histories.get(histories.size() - 1)))
             .as("HISTORY_SNIP=true + snip_boundary → 请求面（messagesForQuery）removedUuids 中 u0..u9 必须被剔除（CC 真源 snipCompact.ts:128-139）")
             .doesNotContain("u0", "u9");
+        // ⚠️ [N2 2026-09-11 修正] 旧断言为 `contains("u0","u9")`（as「B5 d-2: state 保留全量」）。
+        //   该断言**只在测试 JVM 里成立**：旧门② 的静态槽默认 ALL_DISABLED（BoundaryReaderHistorySnip
+        //   SingleSourceTest 还会 @AfterEach 复位它），只有该槽被生产 @Bean 写入时入口回放投影才会执行。
+        //   而生产 application.yml:337 `history-snip: true` → 槽被写活 → 生产里 state **本来就是**被
+        //   投影过的（LlmAgentLoop 入口块的既有注释亦明写「被 snip 消息已在入口 boundary 剥离块从
+        //   state.messages() 移除……不是 state 仍留着它们」）。即旧断言 = 测试/生产分叉。
+        //   [N2] 回放门去门控后两边统一：state 恒为投影面（本仓 state 扮演 CC messagesForQuery 角色）。
+        //   B5 d-2「不做 DB 层持久化删除」的意图不变 —— removedUuids 消息仍完整留在 **DB**
+        //   （append-only，前端/轨迹直读 DB），该契约由落库侧测试覆盖，不应由内存 state 断言。
         assertThat(ids(state))
-            .as("B5 d-2: removedUuids 中 u0..u9 必须保留在 state.messages()（snip 请求级投影，不再持久化删除）")
-            .contains("u0", "u9");
+            .as("[N2] 回放门恒定执行 → state（messagesForQuery 角色）不含被 snip 的 u0..u9")
+            .doesNotContain("u0", "u9");
         assertThat(ids(state))
             .as("snip 后 boundary 保留在 state（输入含 boundary，真源 kept 含 boundary，snipCompact.ts:128-139）")
             .contains("snip-boundary-1");
@@ -154,12 +185,24 @@ class LlmAgentLoopSnipMicroWiringTest {
     }
 
     @Test
-    @DisplayName("B2: HISTORY_SNIP=true + snip 触发 → autoCompactIfNeeded 第二参=真实 tokensFreed（非硬编码 0）")
+    @DisplayName("B2: HISTORY_SNIP=true → 第二参取自 snipResult.tokensFreed()（[N2] 入口回放已剔除 → 结构性 0）")
     void b2PassThrough_gateOn_forwardsTokensFreed() {
         int captured = captureSnipTokensFreed(true);
+        // ⚠️ [N2 2026-09-11 · 事实登记，非本项修改点] 本断言原为 `isEqualTo(SNIP_TOKENS_FREED=10)`，
+        //   其成立前提是「入口 boundary 剥离块**没有**执行 snip 投影」——而这只在测试 JVM 成立
+        //   （旧门② 静态槽默认 ALL_DISABLED）；生产 yml history-snip=true 早已把槽写活。
+        //   [N2] 回放门去门控后，state/messagesForQuery 在进入 snip 步骤前**已被投影**
+        //   （LlmAgentLoop 入口块 → :5085），故 snipCompactIfNeeded 找不到任何 removedUuids 消息
+        //   → tokensFreed 结构性为 0。这与 CC 同构：CC 也是拿 `messagesForQuery`
+        //   （query.ts:523，投影已应用）去调 snipCompactIfNeeded（query.ts:589），而 freed 只在
+        //   「仍在数组里的被删消息」上累加（snipCompact.ts:128-139）→ 同样恒 0。
+        //   ⇒ 动态「非硬编码 0」的牙齿已结构性失效，真正的守卫是静态断言
+        //   {@link #b2SourceForwardsVariable}（断言传的是变量而非字面量 0）。本用例保留为
+        //   「透传链不抛异常 + 值来自 snipResult」的回归位。
         assertThat(captured)
-            .as("门开 + snip 触发时 autoCompactIfNeeded 第二参必须透传 snipResult.tokensFreed()（CC query.ts:466）")
-            .isEqualTo(SNIP_TOKENS_FREED);
+            .as("[N2] 门开时第二参仍取自 snipResult.tokensFreed()；因入口回放已剔除 removedUuids，"
+                + "该值结构性为 0（与 CC snipCompact.ts:128-139 在已投影数组上求和同构）")
+            .isEqualTo(0);
     }
 
     /** 经 4 参 queryLoop 注入 mock autoCompactor，捕获 autoCompactIfNeeded 第二参。 */
@@ -261,11 +304,21 @@ class LlmAgentLoopSnipMicroWiringTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("B4: blocking 测量减 snipTokensFreed（usage−snipFreed 判定，CC query.ts:638）")
+    @DisplayName("B4（[N2] 结构性失效登记）: snipTokensFreed 恒 0 → 测量不再扣减 → 同 usage 转为拦截")
     void b4MeasurementSubtractsSnipTokensFreed() {
-        // 兜底窗口：contextWindow=30000 → blockingLimit=30000−3000=27000
-        // usage=27200，snip 触发释放 500 → 测量 = 27200−500 = 26700 < 27000 → 不拦截
-        // （若 B4 回归不减 snipFreed：27200 >= 27000 → 拦截，本测试 fail）
+        // 兜底窗口：contextWindow=30000 → blockingLimit=30000−3000=27000；usage=27200。
+        //
+        // ⚠️ [N2 2026-09-11 · 结构性失效登记（不是本项要修的缺陷）]
+        //   本用例原意：snip 释放 500 → 测量 27200−500=26700 < 27000 → 不拦截（RED teeth：若测量不减
+        //   snipTokensFreed 则 27200>=27000 拦截 → fail）。
+        //   该前提是「入口 boundary 剥离块**未**执行 snip 投影」——只在测试 JVM 成立（旧门② 静态槽
+        //   默认 ALL_DISABLED）；生产 application.yml:337 history-snip=true 早已把槽写活。
+        //   [N2] 回放门去门控后 state/messagesForQuery 在进 snip 步骤前已被投影（LlmAgentLoop:5085）
+        //   → snipCompactIfNeeded 找不到被删消息 → tokensFreed 结构性 0 → 测量不减 → 27200 >= 27000
+        //   → 本用例现在判定为「拦截」。与 CC 同构（CC 同样拿已投影的 messagesForQuery 去算，
+        //   snipCompact.ts:128-139 只在仍存在的消息上累加 freed）。
+        //   ⇒ 「snip 释放量回馈 autocompact/blocking」这条链在本仓（及 CC）结构性失效，
+        //     已在 N2 实施报告中登记为待裁定项；本用例改为断言当前事实以防静默回归。
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         for (ChatMessageDto m : b4SnipTriggerMessages()) {
             state.appendMessage(m);
@@ -277,10 +330,13 @@ class LlmAgentLoopSnipMicroWiringTest {
 
         LoopResult result = drive(ctx, state);
 
-        assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
         assertThat(state.exitReason())
-            .as("B4: 测量必须减 snipTokensFreed → (27200−500)=26700 < 27000 不拦截；不减则 27200>=27000 拦截")
-            .isNotEqualTo(AgentState.ExitReason.BLOCKING_LIMIT);
+            .as("[N2] snipTokensFreed 结构性 0 → 测量 = 27200 >= blockingLimit 27000 → 拦截"
+                + "（改前因入口未投影、snipFreed=500 → 26700 不拦截）")
+            .isEqualTo(AgentState.ExitReason.BLOCKING_LIMIT);
+        assertThat(result.aborted())
+            .as("blocking 拦截由预检触发，非用户中断")
+            .isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -363,11 +419,14 @@ class LlmAgentLoopSnipMicroWiringTest {
         assertThat(ids(state))
             .as("真源语义: snip 后 boundary 保留在 state（输入含 boundary，snipCompact.ts:128-139）")
             .contains(yielded.id());
-        // [B5 d-2] 请求级投影：removedUuids 中 u0..u9 只在请求面剔除，state.messages() 保留全量
-        //（REPL/transcript 保留；CC query.ts:404 `messagesForQuery = snipResult.messages`）
+        // ⚠️ [N2 2026-09-11] 旧断言为 `contains("u0","u9")`（as「B5 d-2: state 保留全量」）——
+        //   同 [snipGateOn_runsSnip] 的注释：它只在测试 JVM 里成立（旧门② 静态槽默认 ALL_DISABLED），
+        //   而生产 application.yml:337 `history-snip: true` 早已把槽写活 → 生产入口**本就**在投影。
+        //   [N2] 回放门去门控后两侧统一：state = 投影面（本仓 state 扮演 CC messagesForQuery 角色）。
+        //   B5 d-2 的本意（不持久化删除）说的是 **DB**，其契约由落库侧测试覆盖。
         assertThat(ids(state))
-            .as("B5 d-2: removedUuids 中 u0..u9 必须保留在 state.messages()（snip 不再持久化删除）")
-            .contains("u0", "u9");
+            .as("[N2] state（messagesForQuery 角色）不含被 snipped 的 u0..u9 —— 回放门恒定执行")
+            .doesNotContain("u0", "u9");
         assertThat(histories)
             .as("LLM 至少被调用一次（history 被捕获）")
             .isNotEmpty();

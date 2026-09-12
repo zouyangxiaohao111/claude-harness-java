@@ -259,6 +259,38 @@ public final class SkillListingSentRegistry {
     }
 
     /**
+     * [P2-12 · 2026-09-11] 单键回收：子代理 / hook agent <b>结束点</b>移除该 (会话, agentKey) 槽位。
+     *
+     * <p><b>WHY（泄漏面）</b>：本表键含 agentKey，而 hook agent 每次调用都生成<b>新 UUID</b>
+     * （{@code ExecAgentHook.generateHookAgentId()} → {@code hook-agent-<uuid>}），子代理每次执行亦为新
+     * agentId → 每个 (会话, agent 调用) 都在 {@link #SENT} 留一份 Set&lt;技能名&gt; 且<b>永不回收</b>
+     * （此前只有按 sessionId 前缀的 {@link #removeSession} / {@link #removeSessionEntries}）。
+     * CC 的同名结构 {@code sentSkillNames}（attachments.ts:2676，键 {@code agentId ?? ''}）同样从不删单键，
+     * 但 CC 一进程一会话、agent 随进程消亡 → 无泄漏面；nexusai 常驻 JVM 必须显式回收。
+     *
+     * <p><b>为什么连 INITIALIZED 一并移除（而非只清 SENT）</b>：只清 SENT 会让同一 key 的下一次 decide
+     * 落分支 4 且 {@code sent.isEmpty()} → {@code isInitial=true} → <b>整份重发</b>（~4K token）；
+     * 而该 key 对应的 agent 已经结束，若其因 resume 复用同 agentId 续跑（{@code SubagentExecutor}
+     * 的 {@code forkParams.agentIdOverride()} 路径），重发既冗余又偏离「续跑不重注」语义。
+     * 两者同删后，复用同 agentId 的续跑落分支 3（resume 且未初始化 → 抑制 + 全量标 sent），
+     * 与「槽位未被回收时分支 4 无增量 → 不注入」的<b>可观测结果一致</b>（皆不注入）。
+     *
+     * <p><b>不触碰 CLEARED</b>：CLEARED 是<b>会话级</b>的 /clear 意图（供该会话所有 agentKey 槽整份重发），
+     * 单个 agent 结束不得消费或清除它。
+     *
+     * <p><b>幂等</b>：键不存在 → no-op；{@code sessionId}/{@code agentKey} 为 null → 与 {@link #keyOf}
+     * 同口径折算（不抛 NPE）。
+     *
+     * @param sessionId 会话 short id（null → 折算空串，与 {@link #decide} 一致）
+     * @param agentKey  agent 标识（主线程 {@code ""}；子代理 / hook agent = 其 agentUuid 字符串）
+     */
+    public static void removeAgentKey(String sessionId, String agentKey) {
+        String key = keyOf(sessionId, agentKey);
+        SENT.remove(key);
+        INITIALIZED.remove(key);
+    }
+
+    /**
      * skill 文件变更时清空全部已发送集合（保留 initialized 标记）· 对齐 CC {@code resetSentSkillNames()}
      * 由 skillChangeDetector.ts:276 调用 → 下一轮 listing 重发（本表走分支 4：sent 空 → newSkills=全量）。
      *
@@ -291,6 +323,27 @@ public final class SkillListingSentRegistry {
     /** 该 key 是否已初始化（存在 entry 且走过初始化分支）· 仅供测试/诊断。 */
     public static boolean isInitialized(String sessionId, String agentKey) {
         return INITIALIZED.contains(keyOf(sessionId, agentKey));
+    }
+
+    /**
+     * 该会话当前持有的槽位数（键前缀匹配 {@code sessionId + KEY_SEP}）· <b>仅供测试/诊断</b>。
+     *
+     * <p>WHY 需要它：{@link #removeAgentKey} 的调用点在 agent 结束路径（ExecAgentHook / SubagentExecutor），
+     * 其 agentKey 是随机 UUID、调用后无法从外部反解 —— 只有「按会话数槽位」才能断言「结束点确实回收了」。
+     * 与 {@link #isInitialized} 同性质（只读诊断，不暴露可变内部结构）。
+     *
+     * @param sessionId 会话 short id（null → 折算空串，与 {@link #decide} 一致）
+     * @return 该会话名下 SENT 槽位数
+     */
+    public static int sessionSlotCount(String sessionId) {
+        String prefix = (sessionId != null ? sessionId : "") + KEY_SEP;
+        int n = 0;
+        for (String k : SENT.keySet()) {
+            if (k.startsWith(prefix)) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /**

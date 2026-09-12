@@ -1152,6 +1152,12 @@ public class MessageService {
         //   queued_origin 列；仅 busy-queued 传 'busy-queued'（resume 重放 toDto 读回 → 发送层重包壳）；
         //   空闲 cron/busy / slash meta/result/reject 恒 null（红线：空闲路径零标记，原文发）
         m.setQueuedOrigin(queuedOrigin);
+        // [D8=C 2026-09-12] V70 两标记列真实接线：排队用户消息是普通消息 → 两标志显式 false（不是 NULL）·
+        //   CC original: isCompactSummary/isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。
+        //   语义等价（读侧 Boolean.TRUE.equals 本就把 NULL 当 false），只为消除
+        //   「V70 后新行的 NULL」与「V70 前老行的 NULL」不可区分（迁移/校正失去判据）。
+        m.setIsCompactSummary(false);
+        m.setIsVisibleInTranscriptOnly(false);
         // [seq 排序键] 位置键取号（雪花全局单调；读侧 listBySession/listPageBySession ORDER BY seq）
         m.setSeq(nextSeq(sessionId));
         messageMapper.insert(m);
@@ -1199,6 +1205,12 @@ public class MessageService {
         // [C1] 普通用户输入非系统生成 · CC original: isMeta=false（messages.ts:3753 createUserMessage
         //   默认非元消息）· V51 is_meta 列显式落 false
         m.setIsMeta(false);
+        // [D8=C 2026-09-12] V70 两标记列真实接线：普通用户输入是普通消息 → 两标志显式 false（不是 NULL）·
+        //   CC original: isCompactSummary/isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。
+        //   语义等价（读侧 Boolean.TRUE.equals 本就把 NULL 当 false）；只为消除新行 NULL 与 V70 前老行
+        //   NULL 不可区分。
+        m.setIsCompactSummary(false);
+        m.setIsVisibleInTranscriptOnly(false);
         // [seq 排序键] 位置键取号（雪花全局单调）
         m.setSeq(nextSeq(sessionId));
         messageMapper.insert(m);
@@ -1260,6 +1272,12 @@ public class MessageService {
         m.setIsMeta(false);
         // [G13] 消息 cwd 戳 · 对齐 CC sessionStorage.ts:1059（与 createUserMessage 同款）
         m.setCwd(CwdResolution.getCwd(sessionId));
+        // [D8=C 2026-09-12] V70 两标记列真实接线：系统 subtype 消息是普通消息 → 两标志显式 false（不是 NULL）·
+        //   CC original: isCompactSummary/isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。
+        //   语义等价（读侧 Boolean.TRUE.equals 本就把 NULL 当 false）；只为消除新行 NULL 与 V70 前老行
+        //   NULL 不可区分。
+        m.setIsCompactSummary(false);
+        m.setIsVisibleInTranscriptOnly(false);
         // [seq 排序键] 位置键取号（雪花全局单调）
         m.setSeq(nextSeq(sessionId));
         messageMapper.insert(m);

@@ -1383,6 +1383,26 @@ public class ChatService {
                         rec.setSnipMetadata(JSON.writeValueAsString(m.snipMetadata()));
                     }
                     rec.setCreatedAt(ts.toString());
+                    // [D8=C 2026-09-12] V70 两标记列真实接线：snip_boundary 是系统边界行，非压缩摘要
+                    //   → 两标志显式 false（不是 NULL）· CC original: isCompactSummary/
+                    //   isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。语义等价（读侧
+                    //   Boolean.TRUE.equals 本就把 NULL 当 false）；本路径绕过 MessageService 直写
+                    //   messageMapper.insert，须在此独立接线。
+                    rec.setIsCompactSummary(false);
+                    rec.setIsVisibleInTranscriptOnly(false);
+                    // [is_meta 接线 2026-09-12] V51 is_meta 列真实接线：snip_boundary 行显式落 false
+                    //   （不是 NULL）—— 本路径直写 messageMapper.insert 绕过 MessageService，须独立接线。
+                    //   ⚠️ 与 CC 原始值的**有意偏离**（同 SnipTool.buildSnipBoundaryMessage javadoc 的
+                    //   §5.1 约束 1）：CC `force-snip.ts:34` 该边界消息写 `isMeta: true`，而 CC 的 isMeta
+                    //   过滤**只作用于 user 行**（components/Messages.tsx:176 `if (msg.type === 'user') ...
+                    //   return !msg.isMeta`；:156 对 `type === 'system'` 另有放行分支）→ 边界在 CC 的
+                    //   转录渲染路径（Messages.tsx → Message.tsx:191 分支）照常可见。nexusai 前端两处
+                    //   过滤**无 role 豁免**（MessageList.tsx:871 `if (m.isMeta && !isLiveDisplayRow) continue`、
+                    //   TraceView.tsx:180 `messages.filter(m => !m.isMeta)`）→ 落 true 会让「已裁剪」标记条
+                    //   **从对话区与轨迹同时消失**（P2-19/D9 刚接线的 snipBoundaryMarker 分支将成死代码）。
+                    //   故以 false 补偿该前端差异，取得与 CC **同一可见结果**。同一消息的 DTO 侧亦为 false
+                    //   （SnipTool.buildSnipBoundaryMessage 第 19 位实参），落 false 保证 DTO↔DB 一致。
+                    rec.setIsMeta(false);
                     rec.setSeq(nextSeq(sessionId));   // [seq 排序键] 位置键取号
                     messageMapper.insert(rec);
                     java.util.List<String> removedUuids = m.snipMetadata() != null
@@ -2564,6 +2584,19 @@ public class ChatService {
         //   消息落库时戳入当前工作目录，供 /resume 恢复目录上下文（:2522 projectPath=firstMessage.cwd）。
         //   本路径直写 messageMapper.insert 绕过 MessageService，须在此独立戳入。
         m.setCwd(CwdResolution.getCwd(sessionId));
+        // [D8=C 2026-09-12] V70 两标记列真实接线：assistant 消息（tool_calls / 纯文本两条路径共用本工厂）
+        //   是普通消息 → 两标志显式 false（不是 NULL）· CC original: isCompactSummary/
+        //   isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。语义等价（读侧 Boolean.TRUE.equals
+        //   本就把 NULL 当 false）；只为消除新行 NULL 与 V70 前老行 NULL 不可区分。
+        //   本路径直写 messageMapper.insert 绕过 MessageService，须在此独立接线（同 cwd 戳先例）。
+        m.setIsCompactSummary(false);
+        m.setIsVisibleInTranscriptOnly(false);
+        // [is_meta 接线 2026-09-12] V51 is_meta 列真实接线：assistant 是真实对话消息 → 显式 false
+        //   （不是 NULL）。CC assistant 消息**无 isMeta 概念**（isMeta 只存在于 createUserMessage，
+        //   messages.ts:463-483）⇒ 语义等价 false。本路径直写 messageMapper.insert 绕过
+        //   MessageService，须在此独立接线。读侧影响：is_meta=false → 计入
+        //   countNonMetaMessages（轨迹条数徽标）且不被任何过滤剔除。
+        m.setIsMeta(false);
         return m;
     }
 
@@ -2587,6 +2620,17 @@ public class ChatService {
         m.setUserMessageId(userMessageId);
         // [G13] 消息 cwd 戳 · 对齐 CC sessionStorage.ts:1059（同 newAssistantMessage）。
         m.setCwd(CwdResolution.getCwd(sessionId));
+        // [D8=C 2026-09-12] V70 两标记列真实接线：tool_result 消息是普通消息 → 两标志显式 false（不是 NULL）·
+        //   CC original: isCompactSummary/isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。
+        //   语义等价（读侧 Boolean.TRUE.equals 本就把 NULL 当 false）；本路径绕过 MessageService 直写
+        //   messageMapper.insert，须在此独立接线（同 cwd 戳先例）。
+        m.setIsCompactSummary(false);
+        m.setIsVisibleInTranscriptOnly(false);
+        // [is_meta 接线 2026-09-12] V51 is_meta 列真实接线：tool_result 是真实对话消息 → 显式 false
+        //   （不是 NULL）。CC tool_result 承载于 user 消息（isMeta 缺省 false，messages.ts:463-483
+        //   createUserMessage 未传 isMeta ⇒ undefined ⇒ 非元消息）⇒ 语义等价 false。
+        //   本路径直写 messageMapper.insert 绕过 MessageService，须在此独立接线。
+        m.setIsMeta(false);
         return m;
     }
 

@@ -84,10 +84,10 @@ class R32B15Stage3_1_AutoCompactorC13Test {
             (p, m) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
-        assertThat(auto.shouldAutoCompact(big, "session_memory", 0)).isFalse();
-        assertThat(auto.shouldAutoCompact(big, "compact", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "session_memory", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "compact", 0)).isFalse();
         // 非守卫源 user 超阈 → true (阈值真实生效)
-        assertThat(auto.shouldAutoCompact(big, "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(big, null, "user", 0)).isTrue();
     }
 
     @Test

@@ -215,6 +215,57 @@ class CompactCommandCcContractTest {
             .hasMessage("No messages to compact");
     }
 
+    /**
+     * [N2 2026-09-11] 消费点 2/5 · {@code CompactCommand.java:217} 的回放门断言。
+     *
+     * <p><b>WHY（规则 9 · 验证意图）</b>：{@code /compact} 的压缩输入面 = 模型面，必须回放历史 snip
+     * （用户拍板 (B)：关掉开关只禁「产生新 snip」，不使已执行过的 snip 失效）。本用例在**门关**
+     * （默认 FeatureFlags.ALL_DISABLED + 静态槽恒 ALL_DISABLED）下断言：压缩输入面（summaryProducer
+     * 收到的 messages）仍剔除 removedUuids 里的消息。RED teeth：给
+     * {@code BoundaryReader.getMessagesAfterCompactBoundary} 的投影改回带开关门控 → 本用例必须 fail。
+     */
+    @Test
+    @DisplayName("[N2] /compact 门关仍回放历史 snip：压缩输入面不含被裁消息（CC compact.ts:46）")
+    void compactGateOff_stillReplaysHistoricalSnip() {
+        List<ChatMessageDto> messages = new ArrayList<>();
+        messages.add(msg("u0", Role.user, "被 snip 掉的旧提问"));
+        messages.add(msg("u1", Role.user, "保留的提问"));
+        messages.add(snipBoundary("snip-boundary-1", List.of("u0")));
+
+        AtomicReference<List<ChatMessageDto>> summaryInput = new AtomicReference<>();
+        CompactCommandContext c = ctx(messages, null, null,
+            (m, p, t) -> {
+                summaryInput.set(m);
+                return new CompactConversation.SummaryResult("summary ok", null);
+            },
+            new ArrayList<>(), new AbortController(), () -> { });
+
+        CompactCommand.call("", c);
+
+        assertThat(summaryInput.get())
+            .as("[N2] 压缩输入面（= 模型面）必须回放历史 snip：u0 被剔除、boundary 保留"
+                + "（门关不影响回放；CC compact.ts:46 是同一 API 的 model-facing 用法）")
+            .isNotNull()
+            .extracting(ChatMessageDto::id)
+            .doesNotContain("u0")
+            .contains("u1", "snip-boundary-1");
+    }
+
+    /** [N2] snip 边界消息（subtype + snipMetadata.removedUuids，CC snipCompact.ts:99-106）。 */
+    private static ChatMessageDto snipBoundary(String id, List<String> removedUuids) {
+        Map<String, Object> meta = new java.util.LinkedHashMap<>();
+        meta.put("removedUuids", removedUuids);
+        return new ChatMessageDto(
+            id, SESSION, Role.system, "system", "snip boundary", null, List.of(),
+            FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(),
+            null, null, null, List.of(), List.of(),
+            null, false, false, null, "snip_boundary",
+            false, null, null, null,
+            null, null,
+            null, null, null, false, false,
+            null, null, null, meta);
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // 验收 3 · displayText 单测（compact.ts:230-248 buildDisplayText）
     // ════════════════════════════════════════════════════════════════════

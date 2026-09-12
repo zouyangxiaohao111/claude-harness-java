@@ -351,6 +351,26 @@ public class PluginLoader {
         }
     }
 
+    /**
+     * [P2-24 · 2026-09-11] 缓存级联工具注入 · 可选注入（required=false）。
+     *
+     * <p><b>{@code @Lazy} 断装配环</b>：{@link PluginCacheUtils} 反向注入本类（其 {@code setPluginLoader}）
+     * 以清 feed 单槽 → 直注入构成 PluginLoader ↔ PluginCacheUtils 循环引用（Spring Boot 2.6+ 默认
+     * 禁循环引用）。{@code @Lazy} 延迟到首次使用解析（同 PluginCacheUtils 对 SubagentTool 的既有先例）。
+     *
+     * <p>未注入（直构/单测）→ null → {@link #refreshActivePlugins()} 回退到原有的
+     * {@code clearPluginCache + pruneRemovedPluginHooks}（行为不丢，只是少了命令/agent/prompt/
+     * skill_listing 的级联清空）。
+     */
+    @Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    public void setPluginCacheUtils(PluginCacheUtils pluginCacheUtils) {
+        this.pluginCacheUtils = pluginCacheUtils;
+        if (log.isDebugEnabled()) {
+            log.debug("[P2-24] PluginCacheUtils 注入: {}", pluginCacheUtils != null);
+        }
+    }
+
     /** [MPL7] hook 注册中心（可为 null → 插件 hook 注册跳过, 不破坏插件加载）。 */
     private volatile HookRegistry hookRegistry;
 
@@ -362,6 +382,13 @@ public class PluginLoader {
 
     /** [IMP-GAP03] hook matcher 引擎（可为 null → 插件 hook matcher 不过滤, 保持现状）。 */
     private volatile HookMatcherEngine hookMatcherEngine;
+
+    /**
+     * [P2-24 · 2026-09-11] 缓存级联工具（可为 null → refreshActivePlugins 回退到 feed 单槽清空路径）。
+     *
+     * <p>{@link #refreshActivePlugins()} 经此调 CC 同款 {@code clearAllCaches()}（refresh.ts:76）。
+     */
+    private volatile PluginCacheUtils pluginCacheUtils;
 
     /**
      * [ODF-C3R] 生产 feed · 装配期枚举已装 enabled plugins 调 4 参 load 注册 agentsPath。
@@ -910,10 +937,31 @@ public class PluginLoader {
      *
      * <p>clearAllCaches → loadAllPlugins 全量新鲜枚举（预热 cacheOnly）→ loadPluginHooks 全量 swap。
      * loadPluginHooks 失败仅登记 hook_load_failed，不丢失插件/命令/agent 数据（refresh.ts:152-161）。
+     *
+     * <p><b>[P2-24 · 2026-09-11 修复] 首步必须是 {@code clearAllCaches()} 级联，而非只清 feed 单槽。</b>
+     * CC {@code refreshActivePlugins} 第一句即 {@code clearAllCaches()}（refresh.ts:74-79，README 注释
+     * 「Clears ALL plugin caches (unlike the old needsRefresh path which only cleared loadAllPlugins and
+     * returned stale data from downstream memoized loaders)」）——该级联含 {@code clearCommandsCache}
+     * （cacheUtils.ts:46），而 skill 候选列表正是经命令 memoize 层枚举的。修复前本方法只做
+     * {@code clearPluginCache + pruneRemovedPluginHooks}：feed 缓存清了，但<b>命令/技能 memoize 没清</b>
+     * → {@code /reload-plugins} 时技能列表压根没重新枚举（审计 P2-24）。
+     *
+     * <p>未注入 {@link PluginCacheUtils}（直构/单测）→ 回退原有的 feed 单槽清空路径，保证既有测试
+     * 与无 Spring 场景行为不退化。
      */
     public void refreshActivePlugins() {
-        clearPluginCache("refreshActivePlugins");
-        pruneRemovedPluginHooks();
+        // CC refresh.ts:74 clearAllCaches() —— 必须打头，且必须是级联（见方法 javadoc P2-24 段）。
+        PluginCacheUtils cacheUtils = this.pluginCacheUtils;
+        if (cacheUtils != null) {
+            cacheUtils.clearAllCaches();
+        } else {
+            // 未注入 → 退化路径（等价修复前的行 1-2；丢失命令/agent/prompt/skill_listing 级联）。
+            if (log.isDebugEnabled()) {
+                log.debug("[P2-24] refreshActivePlugins: PluginCacheUtils 未注入 → 仅清 feed 单槽（退化路径）");
+            }
+            clearPluginCache("refreshActivePlugins");
+            pruneRemovedPluginHooks();
+        }
         PluginLoadResult result = loadAllPlugins();
         try {
             loadPluginHooks();

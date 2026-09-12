@@ -100,9 +100,9 @@ class IMP21SnipCollapseCcContractTest {
         List<ChatMessageDto> big = largeMessages(50);
 
         // 无 snip: tokenCount=200_000 ≥ 阈值 → 需压缩
-        assertThat(auto.shouldAutoCompact(big, "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(big, null, "user",0)).isTrue();
         // snip 释放足量 token: tokenCount − snipTokensFreed < 阈值 → 不需压缩（INV-9）
-        assertThat(auto.shouldAutoCompact(big, "user", 200_000)).isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "user",200_000)).isFalse();
     }
 
     @Test

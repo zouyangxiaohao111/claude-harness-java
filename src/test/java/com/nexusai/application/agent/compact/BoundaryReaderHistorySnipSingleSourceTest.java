@@ -45,18 +45,29 @@ import static org.mockito.Mockito.when;
  *       经 {@code settingsResolver}（参数，非 null 时）DB 覆盖，消费点 = SnipCompactor / nudge / [id:] tag。</li>
  *   <li><b>门②（静态槽）</b> {@link BoundaryReader}：同公式但输入是静态槽 {@code settingsResolver}
  *       + 静态槽 {@code featureFlags}（默认 {@code ALL_DISABLED}，此前<b>全仓无人写</b> = 死槽），
- *       消费点 = {@code getMessagesAfterCompactBoundary} 的 {@code projectSnippedView}（:207，
- *       循环入口剥离 {@code LlmAgentLoop:4738} + CompactCommand/PartialCompactService/
- *       StreamCompactSummary/SkillifySkillRegistrar 共 5 处静态调用面）。</li>
+ *       消费点 = {@code getMessagesAfterCompactBoundary} 的 {@code projectSnippedView}，
+ *       循环入口剥离 {@code LlmAgentLoop} + CompactCommand/PartialCompactService/
+ *       StreamCompactSummary/SkillifySkillRegistrar 共 5 处静态调用面。</li>
  * </ol>
  * DB {@code settings.history_snip_enabled} 有值时两门短路到同一值（暂时一致）；一旦该列为 NULL：
  * 门① 回落 FeatureFlags（application.yml:337 = true），门② 回落死槽 = false → <b>分叉</b>——被 snip
- * 删除的消息经 {@code :4738} 入口剥离不剔除 → 泄漏进模型请求面 / 手工压缩输入面。
+ * 删除的消息经入口剥离不剔除 → 泄漏进模型请求面 / 手工压缩输入面。
  *
- * <p><b>RED teeth</b>: revert ① {@code ToolRegistrationConfig.microCompactor} 的
- * {@code BoundaryReader.setFeatureFlags} 接线，或 ② {@code LlmAgentLoop} 门① 改回内联公式
+ * <p><b>[N2 2026-09-11 更新]</b> 用户拍板 (B)「历史 snip 不复活」后，门② <b>已整体消失</b>：
+ * snip 投影改为**回放门**（{@code !includeSnipped} 即投影，不看任何开关），故：
+ * <ul>
+ *   <li>静态槽 {@code setFeatureFlags} / {@code setSettingsResolver} 及其唯一读者
+ *       {@code isHistorySnipEnabled()} 无参重载 → <b>死接线</b>（保留待用户裁定清理）；
+ *       本类中依赖静态槽的断言因此退化为「恒成立」，不再有区分力（见各方法 as() 说明）。</li>
+ *   <li>「门关 → 投影 no-op」的旧断言已按 (B) <b>反向改写</b>
+ *       （{@link #microCompactorBean_flagOff_stillProjectsHistoricalSnip}）——
+ *       这正是 N2 要的语义变化。</li>
+ * </ul>
+ *
+ * <p><b>RED teeth</b>: revert ① {@code LlmAgentLoop} 门① 改回内联公式
  * （不走 {@link BoundaryReader#isHistorySnipEnabled(CompactSettingsResolver, FeatureFlags)}）→
- * 对应测试必须 fail。
+ * {@link #llmAgentLoop_delegatesToBoundaryReader} 必须 fail；② 把 snip 投影改回带开关门控 →
+ * {@link #microCompactorBean_flagOff_stillProjectsHistoricalSnip} 必须 fail。
  *
  * <p><b>测试隔离</b>（surefire 默认 forkCount=1 + reuseForks=true，静态槽跨测试类共享）：
  * 本类 {@code @AfterEach} 把三个静态槽复位（见 {@link #restoreStaticSlots()}），否则会让
@@ -82,8 +93,11 @@ class BoundaryReaderHistorySnipSingleSourceTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("接线: microCompactor @Bean 后静态 featureFlags 槽鲜活 → DB=null 时门②回落 flag（投影生效）")
+    @DisplayName("接线: microCompactor @Bean 后静态 featureFlags 槽鲜活（[N2] 投影已去门控，本用例不再有区分力）")
     void microCompactorBean_wiresStaticFeatureFlagsSlot() throws Exception {
+        // ⚠️ [N2 2026-09-11] 投影改为回放门后，本用例的断言恒成立（不再依赖静态槽接线）——
+        //   保留仅为回归「@Bean 仍可被调用、不抛异常」，其原「接线才生效」的区分力已由 N2 移除。
+        //   静态槽是否清理由用户拍板，届时本用例应一并处理。
         // WHY: DB settings.history_snip_enabled 为 NULL（resolver 返回 null）+ FeatureFlags.historySnip=true
         //   → 门②必须回落 FeatureFlags（投影像门①一致生效）。修复前静态 featureFlags 槽无写入点
         //   （恒 ALL_DISABLED）→ 投影恒 no-op → 被 snip 删除的消息从 getMessagesAfterCompactBoundary
@@ -107,8 +121,9 @@ class BoundaryReaderHistorySnipSingleSourceTest {
     }
 
     @Test
-    @DisplayName("接线对照: FeatureFlags.historySnip=false → 门②仍 no-op（flag 关等价，零行为变化）")
-    void microCompactorBean_flagOff_noProjection() throws Exception {
+    @DisplayName("[N2 语义反转] HISTORY_SNIP 关（flag=false + DB=null）→ 回放门仍剔除被 snipped 消息")
+    void microCompactorBean_flagOff_stillProjectsHistoricalSnip() throws Exception {
+        // 门关场景：DB 列 null + FeatureFlags 全关
         CompactSettingsResolver resolver = Mockito.mock(CompactSettingsResolver.class);
         when(resolver.historySnipEnabled()).thenReturn(null);
 
@@ -118,8 +133,31 @@ class BoundaryReaderHistorySnipSingleSourceTest {
         config.microCompactor(false, 60, 5, null, resolver);
 
         assertThat(ids(BoundaryReader.getMessagesAfterCompactBoundary(snipMessages())))
-            .as("flag 关 → 投影 no-op，被 snipped 消息保留（CC flag-off 等价）")
-            .contains("u0", "snip-boundary-1");
+            .as("[N2 2026-09-11 决策 B「历史 snip 不复活」] 开关只禁「产生新 snip」，不使已执行过的 snip 失效"
+                + "——历史 snip_boundary 是既成事实，与 compact boundary 剥离（恒定无门）对称")
+            .doesNotContain("u0")
+            .contains("u1", "snip-boundary-1");
+    }
+
+    @Test
+    @DisplayName("[N2 语义反转] 无 snip 历史时门关行为与改前逐字节一致（不误伤）")
+    void gateOff_noSnipHistory_behavesAsBefore() {
+        List<ChatMessageDto> noSnip = new ArrayList<>();
+        noSnip.add(singleMessage("u0", "hi"));
+        noSnip.add(singleMessage("u1", "hi"));
+
+        assertThat(ids(BoundaryReader.getMessagesAfterCompactBoundary(noSnip)))
+            .as("[N2] 无 snip_boundary → projectSnippedView 收集到空 removedSet 原样返回（projectSnippedView:325-331）"
+                + "→ 「门关 + 无历史 snip」零行为变化")
+            .containsExactly("u0", "u1");
+    }
+
+    @Test
+    @DisplayName("[N2] includeSnipped=true（UI/REPL 全量面）→ 仍拿全量，不受回放门影响")
+    void includeSnippedTrue_stillFull() {
+        assertThat(ids(BoundaryReader.getMessagesAfterCompactBoundary(snipMessages(), true)))
+            .as("[N2] includeSnipped 语义不变（CC REPL.tsx:3167-3169 UI 面）→ true 时不做任何投影")
+            .contains("u0", "u1", "snip-boundary-1");
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -1077,11 +1077,16 @@ public class LlmAgentLoop implements AgentLoop {
      * 用压缩后视图，不阻断主循环），但 DB 仍是压缩前全量 → 下轮 run 从 DB 恢复全量后<b>会再次触发自动压缩</b>
      * （重复压缩 = 显式失败，不是静默降级），必须从日志可见。
      *
+     * <p><b>[P2-17 · 2026-09-11] 未武装 = 无落库通道 → 同样 fail-loud</b>（见方法内显式检测）：
+     * {@link AgentState#persistCompactedMessages} 在 {@code compactPersistListener == null} 时原样返回入参
+     * （根本没落库）——旧实现仍无条件 log.info「已 append-only 落库」= 报假成功（日志无法区分真落库与没落库）。
+     * 现对齐 {@code CompactCommand.applyResultToState} 的 {@code ApplyOutcome.NO_PERSIST_CHANNEL} 口径，
+     * 先判 {@code state.isAppendPersistenceArmed()} 再决定走落库（log.info）还是 fail-loud（log.error）。
+     *
      * <p><b>WHY 经 state 回调而不直接调 MessageService</b>：本方法所在 {@code loop(...)} 是 static 方法
      * （H7-arch 静态化，无 LlmAgentLoop 实例 / 无 messageService 字段引用），持久化通道只能由装配层
      * （ChatService.armRealTimePersist / armPersistenceListeners / CronIdleExecutor 同一武装点）经
-     * AgentState 监听器交回；未武装（fork 子 agent / 非 Spring 单测）时 persistCompactedMessages 原样返回
-     * → 仅替换内存，零行为变化。
+     * AgentState 监听器交回；未武装（fork 子 agent / 非 Spring 单测）→ 仅替换内存 + fail-loud 日志。
      *
      * @param state              当前 AgentState（sessionId 取 DB 归属）
      * @param postCompactMessages compact 后消息集（boundary + summary + kept + attachments + hooks）
@@ -1091,6 +1096,24 @@ public class LlmAgentLoop implements AgentLoop {
             return;
         }
         String sid = state.sessionId();
+        // [P2-17 · 2026-09-11] 未武装 = 无落库通道 → fail-loud，绝不打「已 append-only 落库」假成功。
+        //   WHY：AgentState.persistCompactedMessages 在 compactPersistListener == null 时【原样返回入参】
+        //   （根本没落库，见 AgentState.java:1833-1839），旧实现无条件 log.info「已落库」→ 日志无法区分
+        //   「真落库」与「没落库」，与 CompactCommand.applyResultToState 对同情形已做 fail-loud
+        //   （ApplyOutcome.NO_PERSIST_CHANNEL，CompactCommand.java:396-401）口径不一。
+        //   可落点：装配层未调 setCompactPersistListener（如 VerifyChatController:107 无
+        //   setPostHistoryPersistEnabler）→ 生产三入口（ChatService/CronIdleExecutor/…）均已武装。
+        //   判据用 isCompactPersistArmed()（compact 专用通道）而非 isAppendPersistenceArmed()：
+        //   子代理（SubagentExecutor:4005）只武装 appendListener → 后者会误判为「已落库」。
+        //   仍替换内存（本 run 请求面用压缩后视图，不阻断主循环）；DB 未更新 → 下轮从 DB 恢复全量 →
+        //   会重复压缩（显式失败，不是静默降级）。
+        if (!state.isCompactPersistArmed()) {
+            log.error("[compact-persist] 无落库通道（AgentState.compactPersistListener 未武装）→"
+                    + " 压缩结果只在内存生效，未写入历史（重载会话将恢复压缩前全量并可能重复压缩）:"
+                    + " session={} 条数={}", sid, postCompactMessages.size());
+            state.replaceMessages(postCompactMessages);
+            return;
+        }
         try {
             List<ChatMessageDto> normalized = state.persistCompactedMessages(postCompactMessages);
             state.replaceMessages(normalized != null ? normalized : postCompactMessages);
@@ -2832,7 +2855,7 @@ public class LlmAgentLoop implements AgentLoop {
                 GenericHook.HookResult startResult = hookRegistry.executeEvent(startEvent);
                 // [H3 v4 Gap①] 注入 executeEvent message attachment → LLM 可见通道
                 //   （对齐 CC executeHooks hooks.ts:2796 yield {message} → H8 v2 maybeInjectHookAttachments 渲染）.
-                injectHookResultMessage(state, startResult);
+                injectHookResultMessage(state, startResult, startEvent.type().ccName());
                 if (startResult != null) {
                     if (startResult.initialUserMessage() != null && !startResult.initialUserMessage().isBlank()) {
                         sessionStartInitialUserMessage = startResult.initialUserMessage();
@@ -2983,7 +3006,9 @@ public class LlmAgentLoop implements AgentLoop {
                     "init"  // trigger (CC union 'init'|'maintenance')
                 );
                 // [H3 v4 Gap①] 注入 executeEvent message attachment → LLM 可见通道
-                injectHookResultMessage(state, setupResult);
+                //   [hook_success 渲染门] CC 事件名 "Setup" → 被 messages.ts:4540-4545 白名单挡掉
+                //   （CC processSetupHooks sessionStart.ts:203-205 同样 push message 但渲染为 []）。
+                injectHookResultMessage(state, setupResult, HookEventType.SETUP.ccName());
             } catch (Exception e) {
                 log.warn("HOOK Setup failed: {}", e.getMessage());
             }
@@ -3030,7 +3055,7 @@ public class LlmAgentLoop implements AgentLoop {
                     promptRequester);
                 // [H3 v4 Gap①] 注入 executeEvent message attachment → LLM 可见通道
                 //   （对齐 CC handlePromptSubmit: executeHooks yield message → normalizeAttachmentForAPI 渲染）.
-                injectHookResultMessage(state, promptResult);
+                injectHookResultMessage(state, promptResult, promptEvent.type().ccName());
                 if (promptResult != null && promptResult.preventContinuation()) {
                     // hook 拦截用户输入 → 直接返回
                     log.info("HOOK UserPromptSubmit prevented continuation: {}", promptResult.stopReason());
@@ -3683,6 +3708,33 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [P2-23 · 2026-09-11] 4 参 queryLoop 重载 · 显式透传会话续跑判据 {@code skillListingResume}
+     * （供子代理 resume 路径 · 无 AutoCompactor/MicroCompactor 的调用方）。
+     *
+     * <p><b>WHY 需要它</b>：中间重载（3/4/5/8 参）硬传 {@code false}，使<b>同一 agentKey 二次续跑</b>
+     * （async 子代理 resume 复用原 agentId，{@code SubagentExecutor} 的
+     * {@code ForkPathParams.agentIdOverride()} 路径）落 skill_listing 决策的「全新会话首 run」分支
+     * （{@code SkillListingSentRegistry.decide} 分支 2）——该分支会 {@code sent.clear()} 后整份重发，
+     * 而 CC 同进程内因该 agentId 的 {@code sent} 非空 → {@code newSkills} 空 → <b>不注入</b>
+     * （attachments.ts:2799-2809）。续跑重发既浪费 ~4K token 又打断前缀缓存。
+     *
+     * @param params               loop 参数载体（deps 从 params.deps() 读）
+     * @param state                AgentState（run 入口已构造）
+     * @param consumedCommandUuids 命令生命周期追踪
+     * @param skillListingResume   本次 run 是否为该 agentKey 的续跑（子代理 resume=true；其余调用方
+     *                             传 false —— 见各调用点说明）
+     * @return LoopResult（含 finalState）
+     */
+    public static com.nexusai.application.agent.loop.LoopResult queryLoop(
+            com.nexusai.application.agent.loop.QueryParams params,
+            AgentState state,
+            java.util.List<String> consumedCommandUuids,
+            boolean skillListingResume) {
+        return queryLoop(params, state, consumedCommandUuids, null, null,
+            null, null, null, null, null, skillListingResume);
+    }
+
+    /**
      * [GR-3] 4 参 queryLoop 重载 · 透传 AutoCompactor 供 s08 自动压缩块使用（生产 run() 传
      * 实例字段 this.autoCompactor；单测直接注入）。null → s08 自动压缩跳过（空值保护）。
      * microCompactor 走 null（测试注入 B6 用；B1 micro 接线测试走 5 参重载）。
@@ -3722,6 +3774,8 @@ public class LlmAgentLoop implements AgentLoop {
             java.util.List<String> consumedCommandUuids,
             AutoCompactor autoCompactor,
             MicroCompactor microCompactor) {
+        // [P2-23] skillListingResume=false：本重载无续跑语义的调用方（测试/旧签名）——子代理 resume
+        //   路径改走 4 参 boolean 重载，不再经此硬传 false。
         return queryLoop(params, state, consumedCommandUuids, autoCompactor, microCompactor, null, null, null, null, null, false);
     }
 
@@ -3763,11 +3817,20 @@ public class LlmAgentLoop implements AgentLoop {
      *                               drain busy-queued 时 add；run() 传 this.injectedQueuedMessages 作
      *                               error 逃生门）。null = 非主循环调用方（subagent/测试旧签名）→
      *                               loop() 跳过镜像写（成功路径仍经 state.injectedQueuedMessages() 补落库）。
-     * @param skillListingResume [skill-listing-cc-align] 会话续跑判据（= 排除当前 in-flight 用户消息后转录
-     *                          非空）· doRun 计算后透传，供 loop() turn-0 drain 之后的 skill_listing 注入
-     *                          决策（FULL / suppress / DELTA）。中间重载（3/4/5/8 参）传 false（子代理/
-     *                          hook agent 恒 !resume → 其自身首份全量；对齐 CC 子代理 turn-0 listing
-     *                          attachments.ts:2672-2676，非「不注入」）。
+     * @param skillListingResume [skill-listing-cc-align] 会话续跑判据（主线程 = 排除当前 in-flight 用户
+     *                          消息后转录非空；子代理 = 该 agentKey 是否续跑，见
+     *                          {@link #queryLoop(com.nexusai.application.agent.loop.QueryParams, AgentState, java.util.List, boolean)}）·
+     *                          doRun 计算后透传，供 loop() turn-0 drain 之后的 skill_listing 注入
+     *                          决策（FULL / suppress / DELTA）。
+     *                          <p><b>[P2-23 · 2026-09-11] 中间重载不再一律硬传 false</b>：
+     *                          <ul>
+     *                            <li>主线程：doRun 真实判据（:3445 透传）</li>
+     *                            <li>子代理：{@code SubagentExecutor} resume 路径（复用原 agentId）传 true
+     *                                —— CC {@code sent} 非空 → 不重发整份（attachments.ts:2799-2809）</li>
+     *                            <li>hook agent：恒 false —— CC 每次 hook 调用生成<b>新</b> agentId
+     *                                （{@code hook-agent-${randomUUID()}}，execAgentHook.ts:144-150）→
+     *                                {@code sent} 为空 → 其自身首份全量（attachments.ts:2672-2676）</li>
+     *                          </ul>
      * @return LoopResult（含 finalState，run 从 finalState 取返回）
      */
     public static com.nexusai.application.agent.loop.LoopResult queryLoop(
@@ -4990,10 +5053,16 @@ public class LlmAgentLoop implements AgentLoop {
             // 从最后一个 compact boundary（含）向后切片，去 pre-boundary 冗余历史。
             //
             // ⚠️ [snip-state-fix 2026-09-10 · 为什么这里"故意"用单参重载（includeSnipped=false）]
-            //   单参重载（BoundaryReader:203-205）恒传 false ⇒ HISTORY_SNIP 开启时，除切片外还会
-            //   应用 projectSnippedView（收集**全部** snip_boundary 的 removedUuids）把被裁剪消息
-            //   一并剔除；结果经 state.replaceMessages **写回内存清单**。这不是 bug、是**有意为之
-            //   且被全仓依赖**的语义，不要"修"成 includeSnipped=true：
+            //   单参重载（BoundaryReader:203-205）恒传 false ⇒ 除切片外还会应用 projectSnippedView
+            //   （收集**全部** snip_boundary 的 removedUuids）把被裁剪消息一并剔除；结果经
+            //   state.replaceMessages **写回内存清单**。这不是 bug、是**有意为之且被全仓依赖**的语义，
+            //   不要"修"成 includeSnipped=true：
+            //   ⚠️ [N2 2026-09-11 · 回放门] 该投影**不受** historySnip 运行时开关门控（决策 B：
+            //      历史 snip 不复活）。即：此处是**回放门**——只要历史里有 snip_boundary 就剔除其
+            //      removedUuids（与 compact boundary 剥离对称，后者本就恒定无门）；开关只管**执行门**
+            //      （下方 snip 步骤 `if (historySnipEnabled)` 是否产生**新** snip）。无 snip 历史时
+            //      projectSnippedView 原样返回 → 行为与改前一致。CC 的 feature('HISTORY_SNIP') 是
+            //      构建期常量（messages.ts:5088），两语义在 CC 天然同源，本仓因改运行时开关才拆分。
             //     · 本仓 state.messages() 在循环里扮演的是 CC `messagesForQuery` 的角色 —— CC 的
             //       query() 全程只用 messagesForQuery（:746 发模型 / :660 fork 上下文 /
             //       :836,:855 token 扣减 / :1520,:1575,:1613 stop hook），全量 `messages` 只被读
@@ -5201,8 +5270,11 @@ public class LlmAgentLoop implements AgentLoop {
             int snipTokensFreed = 0;
             // [V52 B1-6] snip 门控叠加 DB settings.history_snip_enabled：DB 有值则用之，
             //   null 回落 ctx.featureFlags().historySnip()（零行为变化）。
-            // [D4 双门源合并] 公式收敛到 BoundaryReader.isHistorySnipEnabled 单一来源（门①）——
-            //   与门②（BoundaryReader 静态槽读侧 :207 / 5 处静态调用面）同源，DB 列 NULL 时不再分叉。
+            // [D4 双门源合并] 公式收敛到 BoundaryReader.isHistorySnipEnabled 单一来源。
+            //   [N2 2026-09-11] 本处 = **执行门**（唯一剩下的门）：只管「本轮是否执行**新** snip」
+            //   （产生新 snip_boundary）。**回放门**已去门控 —— 历史 snip 的投影在
+            //   BoundaryReader.getMessagesAfterCompactBoundary 中恒定执行（决策 B：历史 snip 不复活），
+            //   故原先的「门②」不再存在，DB 列 NULL 时的双门分叉问题随之消失。
             //   输入仍为实例/参数 settingsResolver（DB 实时读，不缓存）+ ctx.featureFlags()。
             boolean historySnipEnabled = BoundaryReader.isHistorySnipEnabled(settingsResolver, ctx.featureFlags());
             if (log.isDebugEnabled()) {
@@ -7298,7 +7370,8 @@ public class LlmAgentLoop implements AgentLoop {
                                 "max_output_tokens",
                                 maxTokensApiErrorMsg.errorDetails(),
                                 maxTokensErrorContent);
-                            injectHookResultMessage(state, ctx.hookRegistry().executeEvent(failureEvent));
+                            injectHookResultMessage(state, ctx.hookRegistry().executeEvent(failureEvent),
+                                failureEvent.type().ccName());
                             if (log.isDebugEnabled()) {
                                 log.debug("LlmAgentLoop max_tokens 恢复耗尽: isApiErrorMessage=true 触发 StopFailure hook (query.ts:1262)");
                             }
@@ -7793,13 +7866,19 @@ public class LlmAgentLoop implements AgentLoop {
                                     String blockingText = HookEvent.getStopHookMessage(r.blockingError());
                                     blockingTexts.add(blockingText);
                                     log.info("HOOK Stop blockingError (in-loop): {}", blockingText);
-                                    state.appendMessage(toMessage(Role.user, blockingText, null));
+                                    // [P2-14 2026-09-12] isMeta=true · CC original: createUserMessage({
+                                    //   content: getStopHookMessage(...), isMeta: true })（stopHooks.ts:267-271，
+                                    //   注释原文 "Hide from UI (shown in summary message instead)"）。
+                                    //   WHY: 回注内容是「hook 反馈」不是用户输入 —— 不置 isMeta 会经 appendListener
+                                    //   实时落库 + 前端渲染成用户自己的气泡（污染 lastUserMessageId 归属）。
+                                    //   模型面不受影响（isMeta 与 isVisibleInTranscriptOnly 一样绝不用于模型侧过滤）。
+                                    state.appendMessage(toMessage(Role.user, blockingText, null, null, true));
                                 }
                             }
                             // [IMP-HOOKS-S5 D-11 ①] hookCount>0 → stop_hook_summary + hookErrors 通知
                             //   （镜像 §14 :4703-4716 · CC stopHooks.ts:298-317）
                             if (loopStopCollect.hookCount() > 0) {
-                                state.recordStopHookSummary(new CollapseHookSummaries.SimpleHookMsg(
+                                CollapseHookSummaries.HookMessage stopSummary = new CollapseHookSummaries.SimpleHookMsg(
                                     // [IMP-HOOKS-S7 H6] hookLabel=null · CC stopHooks.ts:297-308
                                     //   createStopHookSummaryMessage 8 参（无 hookLabel 实参）→
                                     //   undefined → isLabeledHookSummary 守卫不过 → Stop 摘要永不折叠
@@ -7811,7 +7890,11 @@ public class LlmAgentLoop implements AgentLoop {
                                     loopStopCollect.preventedContinuation(),
                                     loopStopCollect.hasOutput(),
                                     null, // [IMP-HOOKS-S5 D-15] totalDurationMs 通道已删（CC 无 per-batch 耗时）
-                                    loopStopCollect.stopReason()));
+                                    loopStopCollect.stopReason());
+                                state.recordStopHookSummary(stopSummary);
+                                // [P2-15] 出站通道：摘要推 /topic/tasks（前端可见）· 对齐 CC
+                                //   stopHooks.ts:309-318 yield createStopHookSummaryMessage 进消息流
+                                emitStopHookSummarySdkMessage(ctx, state, stopSummary);
                                 if (!loopStopCollect.hookErrors().isEmpty()) {
                                     notifyStopHookError(stopParentTuc, loopStopCollect.hookErrors());
                                 }
@@ -8107,7 +8190,7 @@ public class LlmAgentLoop implements AgentLoop {
                         //   createStopHookSummaryMessage → UI transcript）。Java 走 AgentState 本地
                         //   暂存通道（@JsonIgnore，绝不进 state.messages()，R32C1 防 LLM 上下文污染）。
                         if (stopCollect.hookCount() > 0) {
-                            state.recordStopHookSummary(new CollapseHookSummaries.SimpleHookMsg(
+                            CollapseHookSummaries.HookMessage stopSummary = new CollapseHookSummaries.SimpleHookMsg(
                                 // [IMP-HOOKS-S7 H6] hookLabel=null · CC stopHooks.ts:297-308 8 参
                                 //   无 hookLabel → undefined → 永不折叠（同 in-loop）
                                 null,
@@ -8117,7 +8200,11 @@ public class LlmAgentLoop implements AgentLoop {
                                 stopCollect.preventedContinuation(),
                                 stopCollect.hasOutput(),
                                 null, // [IMP-HOOKS-S5 D-15] StopHookCollectResult 耗时通道已删除（CC stopHooks.ts 无 per-batch 通道）；SimpleHookMsg 该参保留（Pre/PostToolUse 摘要通道），Stop 永不折叠 → 恒 null
-                                stopCollect.stopReason()));
+                                stopCollect.stopReason());
+                            state.recordStopHookSummary(stopSummary);
+                            // [P2-15] 出站通道：摘要推 /topic/tasks（前端可见）· 对齐 CC
+                            //   stopHooks.ts:309-318 yield createStopHookSummaryMessage 进消息流
+                            emitStopHookSummarySdkMessage(ctx, state, stopSummary);
                             // [R6] hookErrors>0 → 通知（对齐 CC stopHooks.ts:310-317 addNotification）
                             if (!stopCollect.hookErrors().isEmpty()) {
                                 notifyStopHookError(stopParentTuc, stopCollect.hookErrors());
@@ -8148,7 +8235,10 @@ public class LlmAgentLoop implements AgentLoop {
                                     //   'Stop hook feedback:\n' 前缀（hooks.ts:1894-1896）。
                                     String blockingText = HookEvent.getStopHookMessage(r.blockingError());
                                     log.info("HOOK Stop blockingError: {}", blockingText);
-                                    state.appendMessage(toMessage(Role.user, blockingText, null));
+                                    // [P2-14 2026-09-12] isMeta=true · 同 in-loop 点 · CC original:
+                                    //   stopHooks.ts:267-271 createUserMessage({..., isMeta: true})
+                                    //   （"Hide from UI (shown in summary message instead)"）。
+                                    state.appendMessage(toMessage(Role.user, blockingText, null, null, true));
                                 }
                             }
                             if (stopHookBlockingReentries >= maxStopHookBlockingReentries()) {
@@ -8257,7 +8347,15 @@ public class LlmAgentLoop implements AgentLoop {
                         if (r.blockingError() != null) {
                             String msg = HookEvent.getTaskCompletedHookMessage(r.blockingError());
                             teammateBlockingErrors.add(msg);
-                            state.appendMessage(toMessage(Role.user, msg, null));
+                            // [is_meta 接线 2026-09-12] isMeta=true · CC original: createUserMessage({
+                            //   content: getTaskCompletedHookMessage(result.blockingError), isMeta: true })
+                            //   （stopHooks.ts:386-389，`isMeta: true` 落在 :388）。
+                            //   WHY: 回注内容是「hook 反馈」不是用户输入 —— 不置 isMeta 会（①）被
+                            //   AgentState.lastUserMessageId()（:428 `!m.isMeta()` 过滤）选中 → 事件/
+                            //   落库归属指向本 hook 消息的随机 UUID（用户可见的归属错乱）；
+                            //   （②）计入 countNonMetaMessages 轨迹条数徽标 → 条数虚高。
+                            //   模型面不受影响（isMeta 绝不用于模型侧过滤，同 P2-14 in-loop/§14 先例）。
+                            state.appendMessage(toMessage(Role.user, msg, null, null, true));
                         }
                         // CC stopHooks.ts:383-395: preventContinuation → 'TaskCompleted hook prevented continuation'
                         if (r.preventContinuation() && r.blockingError() == null) {
@@ -8291,7 +8389,11 @@ public class LlmAgentLoop implements AgentLoop {
                         if (r.blockingError() != null) {
                             String msg = HookEvent.getTeammateIdleHookMessage(r.blockingError());
                             teammateBlockingErrors.add(msg);
-                            state.appendMessage(toMessage(Role.user, msg, null));
+                            // [is_meta 接线 2026-09-12] isMeta=true · CC original: createUserMessage({
+                            //   content: getTeammateIdleHookMessage(result.blockingError), isMeta: true })
+                            //   （stopHooks.ts:428-431，`isMeta: true` 落在 :430）· 理由同上方
+                            //   TaskCompleted 兄弟点（lastUserMessageId 归属 + countNonMetaMessages 条数）。
+                            state.appendMessage(toMessage(Role.user, msg, null, null, true));
                         }
                         // CC stopHooks.ts:425-437: preventContinuation → 'TeammateIdle hook prevented continuation'
                         if (r.preventContinuation() && r.blockingError() == null) {
@@ -9555,6 +9657,88 @@ public class LlmAgentLoop implements AgentLoop {
         }
     }
 
+    // ── [P2-15 2026-09-12] stop_hook_summary SDK 出站序列化 ──
+    /**
+     * 把 Stop hook 摘要推 /topic/tasks（沿用 {@link #emitToolUseSummarySdkMessage} 同一出站范式）。
+     *
+     * <p><b>对齐 CC</b>：{@code createStopHookSummaryMessage}（utils/messages.ts:4838-4866）产出
+     * {@code type:'system' + subtype:'stop_hook_summary'} 消息，{@code stopHooks.ts:309-318} 把它
+     * yield 进消息流 → transcript 渲染（CC 用户 ctrl+o 能看到 Stop hook 摘要）。
+     * Java 侧该摘要原本只落 {@link AgentState#stopHookSummaries()}（{@code @JsonIgnore} 本地暂存通道）
+     * → <b>永不进 STOMP/DB/UI</b>（P2-15 取证）。本方法补出站通道。
+     *
+     * <p><b>wire 契约</b>（snake_case = CC 字段名 + 本仓 STOMP 惯例）：
+     * {@code {type:'system', subtype:'stop_hook_summary', hook_count, hook_infos, hook_errors,
+     * prevented_continuation, stop_reason, has_output, hook_label, total_duration_ms, uuid, session_id}}。
+     *
+     * <p>⚠️ 这是<b>元数据型</b>内容（hook 计数 / 错误列表 / 阻止原因），不是对话正文 ——
+     * 前端必须按独立摘要行渲染（对齐 CC {@code SystemTextMessage.StopHookSummaryMessage}），
+     * <b>不得</b>当普通 user/assistant 文本气泡渲染。
+     *
+     * <p>出站点与 SdkEventQueue drain 同通道（/topic/tasks）；非流式会话 {@code wsTemplate=null}
+     * → 静默跳过（对齐 CC 仅 streaming 消费 SDK 消息）。
+     *
+     * @param ctx     Agent 循环上下文（wsTemplate null 时跳过出站）
+     * @param state   当前 AgentState（sessionId → session_id）
+     * @param summary 已折叠/记录的 Stop hook 摘要（{@link CollapseHookSummaries.HookMessage}）
+     */
+    private static void emitStopHookSummarySdkMessage(AgentLoopContext ctx,
+            AgentState state,
+            CollapseHookSummaries.HookMessage summary) {
+        if (ctx == null || ctx.wsTemplate() == null || summary == null) {
+            return;
+        }
+        try {
+            ObjectNode node = JSON.createObjectNode();
+            node.put("type", "system");
+            node.put("subtype", "stop_hook_summary");
+            node.put("hook_count", summary.hookCount());
+            com.fasterxml.jackson.databind.node.ArrayNode infos = node.putArray("hook_infos");
+            if (summary.hookInfos() != null) {
+                for (String info : summary.hookInfos()) {
+                    infos.add(info);
+                }
+            }
+            com.fasterxml.jackson.databind.node.ArrayNode errors = node.putArray("hook_errors");
+            if (summary.hookErrors() != null) {
+                for (String err : summary.hookErrors()) {
+                    errors.add(err);
+                }
+            }
+            node.put("prevented_continuation", summary.preventedContinuation());
+            node.put("has_output", summary.hasOutput());
+            // CC 字段 hookLabel 为 string|undefined（createStopHookSummaryMessage :4847 可选参）；
+            //   Stop/SubagentStop 生产形态 hookLabel=null（LlmAgentLoop :7883/:8189）→ wire 显式 null，
+            //   与 CC {@code hookLabel: hookLabel ?? ''}（:4863）区分：前端按 null 判「非 label 摘要」
+            //   （CC StopHookSummaryMessage :168 用 !message.hookLabel 分派）。
+            if (summary.hookLabel() != null) {
+                node.put("hook_label", summary.hookLabel());
+            } else {
+                node.putNull("hook_label");
+            }
+            if (summary.stopReason() != null) {
+                node.put("stop_reason", summary.stopReason());
+            } else {
+                node.putNull("stop_reason");
+            }
+            if (summary.totalDurationMs() != null) {
+                node.put("total_duration_ms", summary.totalDurationMs());
+            } else {
+                node.putNull("total_duration_ms");
+            }
+            node.put("uuid", java.util.UUID.randomUUID().toString());
+            node.put("session_id", state.sessionId());
+            ctx.wsTemplate().convertAndSend("/topic/tasks", node);
+            log.info("[LlmAgentLoop] turn={} stop_hook_summary SDK 出站 → /topic/tasks (hookCount={}, 错误数={}, 阻止继续={}) · CC messages.ts:4838-4866 + stopHooks.ts:309-318",
+                state.turnCount(),
+                summary.hookCount(),
+                summary.hookErrors() != null ? summary.hookErrors().size() : 0,
+                summary.preventedContinuation());
+        } catch (Exception e) {
+            log.warn("[LlmAgentLoop] stop_hook_summary SDK 出站失败: {}", e.getMessage());
+        }
+    }
+
     // ── [R25-6] A8 异步 Haiku 技能摘要 (fire-and-forget, 对齐 CC query.ts:1570-1643) ──
     /**
      * 异步调用 Haiku 生成"高频技能使用模式"语义摘要 · 参照 R24-5 generateToolUseSummaryAsync 模式.
@@ -9985,10 +10169,17 @@ public class LlmAgentLoop implements AgentLoop {
      * 双发污染（同 StreamingToolExecutor injectPostToolUseHookAttachments 的 #31301 双显示规避）.
      * 故本方法不用于 STOP 消费者（该路径已有独立单通道注入）.
      *
-     * @param state  当前 AgentState（null → no-op; message 追加到 state.attachments()）
-     * @param result executeEvent 返回结果（null 或 message()==null → no-op）
+     * @param state         当前 AgentState（null → no-op; message 追加到 state.attachments()）
+     * @param result        executeEvent 返回结果（null 或 message()==null → no-op）
+     * @param hookEventName 触发本结果的 CC 事件名（{@link com.nexusai.application.agent.permission.hook.HookEventType#ccName()}
+     *                      ，如 "SessionStart"/"Setup"/"UserPromptSubmit"/"StopFailure"）。
+     *                      CC original: {@code attachment.hookEvent}（messages.ts:4541/:4546）——
+     *                      既作 hook_success 渲染门判据（①），也作 hookName 缺省值
+     *                      （CC {@code hookName = matchQuery ? `${hookEvent}:${matchQuery}` : hookEvent}，
+     *                      hooks.ts:2123；本 Java 通道的 String 消息不携带 hookName）。可 null。
      */
-    private static void injectHookResultMessage(AgentState state, GenericHook.HookResult result) {
+    private static void injectHookResultMessage(AgentState state, GenericHook.HookResult result,
+                                                String hookEventName) {
         if (state == null || result == null || result.message() == null) {
             return;
         }
@@ -9999,7 +10190,10 @@ public class LlmAgentLoop implements AgentLoop {
                 //   （sessionStart.ts:141-142 hookMessages → initialMessages；toolHooks.ts:478-480
                 //   → resultingMessages）。一次性 appendMessage 进 state.messages()，不常驻
                 //   attachment（避免 maybeInjectHookAttachments 每轮重渲染成 isMeta 消息）。
-                appendPlainHookMessage(state, att.content());
+                //   hookName 优先取 attachment 自带值（CC attachment.hookName 同源），
+                //   缺省回落到事件名（CC hooks.ts:2123 无 matchQuery 时 hookName == hookEvent）。
+                appendPlainHookMessage(state, hookEventName,
+                    resolveHookName(att.hookName(), hookEventName), att.content());
             } else {
                 // 真实 attachment 消息（hook_success/hook_blocking_error 等，OD-14 透传通道）
                 //   → CC 本就是 attachment，保持 appendAttachment 常驻渲染。
@@ -10007,7 +10201,8 @@ public class LlmAgentLoop implements AgentLoop {
             }
         } else {
             // 普通文本 message → 一次性 user 消息（对齐 CC sessionStart.ts:141-142）
-            appendPlainHookMessage(state, result.message().toString());
+            appendPlainHookMessage(state, hookEventName,
+                resolveHookName(null, hookEventName), result.message().toString());
         }
         if (log.isDebugEnabled()) {
             log.debug("HOOK executeEvent message 注入 LLM 可见通道 (CC executeHooks yield message → 普通 user 消息一次性)");
@@ -10015,18 +10210,106 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [hook message 普通消息通道] 普通文本 hook message → 一次性 user 消息。
+     * [hook message 普通消息通道 · 2026-09-12 对齐 CC hook_success 渲染] 普通文本 hook message →
+     * 一次性 user 消息（<b>isMeta=true</b> + {@code <system-reminder>} 包裹 + {@code {hookName} hook success: } 前缀）。
      *
-     * <p>对齐 CC sessionStart.ts:141-142 {@code hookMessages.push(hookResult.message)} →
-     * initialMessages；toolHooks.ts:478-480 {@code result.message} → resultingMessages。
-     * isMeta=false 进对话历史，一次性（非 attachment 常驻重渲染）。空文本不注入
-     * （CC messages.ts:4106 hook_success content==='' return [] 同类抑制）。
+     * <p><b>CC 真源（已实读 claude-code-best）</b>：{@code sessionStart.ts:141-142}
+     * {@code hookMessages.push(hookResult.message)} → initialMessages；{@code toolHooks.ts:478-480}
+     * {@code result.message} → resultingMessages。该 message 最终由
+     * {@code normalizeMessagesForAPI} 的 {@code case 'attachment'}（messages.ts:2591-2609）交给
+     * {@code normalizeAttachmentForAPI} 渲染，{@code hook_success} 分支（messages.ts:4539-4556）为：
+     * <pre>
+     * case 'hook_success':
+     *   if (attachment.hookEvent !== 'SessionStart' &amp;&amp; attachment.hookEvent !== 'UserPromptSubmit') return []   // ①
+     *   if (attachment.content === '') return []                                                                    // ②
+     *   return [createUserMessage({
+     *     content: wrapInSystemReminder(`${attachment.hookName} hook success: ${attachment.content}`),           // ③
+     *     isMeta: true,                                                                                           // ④
+     *   })]
+     * </pre>
+     * {@code wrapInSystemReminder}（messages.ts:3488-3490）=
+     * {@code `<system-reminder>\n${content}\n</system-reminder>`}（<b>前后各一换行</b>）。
+     *
+     * <p><b>四项逐条落地</b>：① 的事件门在本方法首行（{@link #isHookSuccessRenderableEvent}，
+     * 只作用于本"普通文本 hook message"通道 —— {@code appendAttachment} 附件通道不受影响）——
+     * 本 Java 通道覆盖的事件（SessionStart/Setup/UserPromptSubmit/StopFailure）<b>宽于</b> CC
+     * 白名单，故按 CC 收窄，Setup/StopFailure 的普通 hook 文本不再注入（CC 同：其
+     * {@code hook_success} 附件同样被 ① 挡掉）；② 保留空文本不注入；③ 前缀 + ④ isMeta 在本方法。
+     *
+     * <p><b>why isMeta=true（用户可见行为变化，非回归）</b>：CC 该消息是元消息 ——
+     * {@code Messages.tsx:176} 对 {@code type==='user'} 的 meta 消息不渲染为对话气泡（用户不可见、
+     * 模型可见）。改 true 后本仓前端同样不再把它显示为用户气泡（对齐 CC）。同时修正两处读侧后果
+     * （与 {@code TaskCompleted}/{@code TeammateIdle} 回注同批 2026-09-12 is_meta 接线同理）：
+     * （①）{@link AgentState#lastUserMessageId()}（{@code !m.isMeta()} 过滤）不再选中本 hook 文本
+     * → 消息归属/落库 {@code user_message_id} 不再指向 hook 随机 UUID；（②）不再计入
+     * {@code MessageService.countNonMetaMessages} → 轨迹条数不虚高。模型面不受影响
+     * （isMeta 绝不用于模型侧过滤，同 P2-14 先例）。
+     *
+     * @param hookEventName CC 事件名（{@code HookEventType.ccName()}）；① 的渲染门判据
+     * @param hookName 已解析的 hook 名（CC original: {@code attachment.hookName}；见
+     *                 {@link #resolveHookName}，恒非 null/空 —— 缺省为事件名，不伪造、不留空）
+     * @param content  hook 返回的用户可见消息原文（CC original: {@code attachment.content}）
      */
-    private static void appendPlainHookMessage(AgentState state, String content) {
+    private static void appendPlainHookMessage(AgentState state, String hookEventName,
+                                               String hookName, String content) {
+        // ① 事件门：hookEvent ∉ {SessionStart, UserPromptSubmit} → 不渲染（CC messages.ts:4540-4545）
+        if (!isHookSuccessRenderableEvent(hookEventName)) {
+            if (log.isDebugEnabled()) {
+                log.debug("HOOK hook message 抑制: hookEvent={} 不在 CC hook_success 白名单 {{SessionStart, UserPromptSubmit}}",
+                    hookEventName);
+            }
+            return;
+        }
+        // ② content === '' → []（CC messages.ts:4546-4548；保留既有空文本抑制语义）
         if (content == null || content.isBlank()) {
             return;
         }
-        state.appendMessage(toMessage(Role.user, content, null));
+        // ③ wrapInSystemReminder + `{hookName} hook success: ` 前缀（CC messages.ts:4550-4555）
+        // ④ isMeta=true（CC messages.ts:4554）
+        String rendered = "<system-reminder>\n"
+            + hookName + " hook success: " + content
+            + "\n</system-reminder>";
+        state.appendMessage(toMessage(Role.user, rendered, null, null, true));
+    }
+
+    /**
+     * [hook_success 渲染门 ①] CC {@code messages.ts:4540-4545}：仅 SessionStart / UserPromptSubmit
+     * 渲染 {@code hook_success}，其余事件 {@code return []}。
+     *
+     * <p><b>影响面（行为收窄，显式披露）</b>：本通道调用点覆盖 SessionStart / Setup /
+     * UserPromptSubmit / StopFailure 四类事件 —— 比 CC 白名单宽。按 CC 加门后 <b>Setup 与
+     * StopFailure</b> 的普通 hook 文本不再注入 LLM。已复核 CC 侧同语义：
+     * {@code processSetupHooks}（sessionStart.ts:203-205）虽 push {@code hookResult.message}，
+     * 但该 message 是 {@code hook_success} 附件、{@code hookEvent='Setup'} 被 ① 挡掉 → CC 同样不渲染；
+     * StopFailure 同理（不在白名单）。
+     *
+     * @param hookEventName CC 事件名（可 null → 按"不在白名单"处理，与 CC {@code undefined !== 'SessionStart'} 同）
+     */
+    private static boolean isHookSuccessRenderableEvent(String hookEventName) {
+        return "SessionStart".equals(hookEventName) || "UserPromptSubmit".equals(hookEventName);
+    }
+
+    /**
+     * [hookName 解析] CC {@code hooks.ts:2123}
+     * {@code const hookName = matchQuery ? `${hookEvent}:${matchQuery}` : hookEvent} ——
+     * 优先用 attachment 自带 hookName（配置驱动 hook 为 {@code config-command:<cmd>} 等，
+     * 由 HookRegistry 计算，与 CC 同源），缺省回落到事件名（无 matchQuery 时的 CC 取值）。
+     *
+     * <p>绝不返回 null/blank —— 否则 {@link #appendPlainHookMessage} 会产出
+     * {@code "null hook success: "} 这类伪造前缀（用户拍板：不要伪造/留空）。
+     *
+     * @param attachmentHookName {@code AttachmentMessageDto.hookName()}（可 null）
+     * @param hookEventName      触发事件 CC 名（可 null）
+     * @return 恒非空 hookName
+     */
+    private static String resolveHookName(String attachmentHookName, String hookEventName) {
+        if (attachmentHookName != null && !attachmentHookName.isBlank()) {
+            return attachmentHookName;
+        }
+        if (hookEventName != null && !hookEventName.isBlank()) {
+            return hookEventName;
+        }
+        return "Hook";
     }
 
     /**
@@ -10160,7 +10443,8 @@ public class LlmAgentLoop implements AgentLoop {
                     streamError != null && streamError.getMessage() != null
                         ? streamError.getMessage() : "recovery failed",
                     lastAssistantText);
-                injectHookResultMessage(state, ctx.hookRegistry().executeEvent(failureEvent));
+                injectHookResultMessage(state, ctx.hookRegistry().executeEvent(failureEvent),
+                    failureEvent.type().ccName());
             } catch (Exception e) {
                 log.warn("HOOK StopFailure failed: {}", e.getMessage());
             }

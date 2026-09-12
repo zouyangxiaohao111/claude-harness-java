@@ -33,12 +33,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>hook_user_message → <b>不走 attachment 渲染</b>（RE-THINK: CC result.message → 普通
  *       user 消息, 生产两端已改普通消息通道结算: PreToolUse → newMessages; 非 PreToolUse →
  *       state.messages() 一次性; 渲染 case 已删除 AgentLoopContext:2175）</li>
- *   <li>hook_blocking_error → "{hookName} hook blocking error from command: "{command}": {content}"
- *       （prompt-align bd982d7e0 补 command 段，对齐 CC messages.ts:4090-4097）</li>
+ *   <li>hook_blocking_error → {@code "<system-reminder>\n{hookName} hook blocking error from command:
+ *       "{command}": {content}\n</system-reminder>"}（prompt-align bd982d7e0 补 command 段；
+ *       batch1-A 补 system-reminder 包裹，对齐 CC messages.ts:4530-4538）</li>
  *   <li>hook_stopped_continuation → <b>不注入</b>（V-SH-2 · CC query.ts:1519-1520 hook_stopped 立即
  *       退出，同次 query 无后续 LLM 调用，终止信号永不送达模型；Java 跨 loop 常驻故渲染返回 null）</li>
- *   <li>hook_additional_context（content 非空）→ "{hookName} hook additional context: {content}"</li>
- *   <li>hook_success（仅 SessionStart/UserPromptSubmit + content 非空）→ "{hookName} hook success: {content}"</li>
+ *   <li>hook_additional_context（content 非空）→ {@code "<system-reminder>\n{hookName} hook additional
+ *       context: {content}\n</system-reminder>"}（batch1-A 补包裹，对齐 CC messages.ts:4557-4569）</li>
+ *   <li>hook_success（仅 SessionStart/UserPromptSubmit + content 非空）→ {@code "<system-reminder>\n
+ *       {hookName} hook success: {content}\n</system-reminder>"}（batch1-A 补包裹，对齐 CC
+ *       messages.ts:4539-4556）</li>
  *   <li>hook_cancelled / hook_error_during_execution / hook_non_blocking_error /
  *       hook_system_message / hook_permission_decision → <b>不注入</b>（CC :4255-4260 返回 []）</li>
  * </ul>
@@ -83,10 +87,13 @@ class HookAttachmentLlmInjectionTest {
     }
 
     @Test
-    @DisplayName("hook_blocking_error → 注入 '{hookName} hook blocking error: {content}'（CC messages.ts:4090-4097）")
+    @DisplayName("hook_blocking_error → 注入 wrapInSystemReminder('{hookName} hook blocking error from command: \"{command}\": {content}')（CC messages.ts:4530-4538）")
     void hookBlockingError_injectedWithCcFormat() {
         // WHY: CC 把 blocking error 作为 feedback 注入 LLM（model 需要知道 hook 为何阻断）;
         //      Java 端 content 承载 error 文本（AttachmentMessageDto 无 command 字段）.
+        //      [batch1-A] CC :4533-4535 是 wrapInSystemReminder(`${hookName} hook blocking error from
+        //      command: "${command}": ${blockingError}`) —— 断言串必须含 <system-reminder> 前后包裹
+        //      （wrapInSystemReminder 定义 :3488-3490），否则模型面拿到的是裸文本而非 CC 形态。
         AgentState state = new AgentState("system-prompt");
         state.appendAttachment(AttachmentMessageDto.hookBlockingError(
             "PostToolUse:Bash", "toolu_2", "PostToolUse", "syntax error in script"));
@@ -97,7 +104,9 @@ class HookAttachmentLlmInjectionTest {
         assertThat(injected)
             .anySatisfy(m ->
                 assertThat(m.content())
-                    .isEqualTo("PostToolUse:Bash hook blocking error from command: \"\": syntax error in script"));
+                    .isEqualTo("<system-reminder>\n"
+                        + "PostToolUse:Bash hook blocking error from command: \"\": syntax error in script"
+                        + "\n</system-reminder>"));
     }
 
     @Test
@@ -126,9 +135,12 @@ class HookAttachmentLlmInjectionTest {
     }
 
     @Test
-    @DisplayName("hook_additional_context → 注入 '{hookName} hook additional context: {joined}'（CC :4117-4128）")
+    @DisplayName("hook_additional_context → 注入 wrapInSystemReminder('{hookName} hook additional context: {joined}')（CC messages.ts:4557-4569）")
     void hookAdditionalContext_injectedWithCcFormat() {
         // WHY: hook 返回的附加上下文必须进入 LLM 上下文（CC content.join('\\n') 逐条注入）.
+        //      [batch1-A] CC :4563-4565 = wrapInSystemReminder(`${hookName} hook additional context:
+        //      ${content.join('\n')}`)；join 已由工厂承担（AttachmentMessageDto:623-632），本断言锁定
+        //      wrap 前缀 + join 结果 + 前后包裹三段（CC :3488-3490）。
         AgentState state = new AgentState("system-prompt");
         state.appendAttachment(AttachmentMessageDto.hookAdditionalContext(
             "PreToolUse:Read", "toolu_4", "PreToolUse", List.of("ctx line 1", "ctx line 2")));
@@ -139,7 +151,9 @@ class HookAttachmentLlmInjectionTest {
         assertThat(injected)
             .anySatisfy(m ->
                 assertThat(m.content())
-                    .isEqualTo("PreToolUse:Read hook additional context: ctx line 1\nctx line 2"));
+                    .isEqualTo("<system-reminder>\n"
+                        + "PreToolUse:Read hook additional context: ctx line 1\nctx line 2"
+                        + "\n</system-reminder>"));
     }
 
     @Test
@@ -171,17 +185,50 @@ class HookAttachmentLlmInjectionTest {
     }
 
     @Test
-    @DisplayName("hook_success（SessionStart + content 非空）→ 注入（CC :4105-4114）")
-    void hookSuccess_sessionEvent_injected() {
+    @DisplayName("hook_success（SessionStart + content 为空串）→ 不注入（CC messages.ts:4546-4548 content === '' return []）")
+    void hookSuccess_sessionEventInjected() {
+        // WHY: 3 参 hookSuccess 工厂 content 恒 ''（AttachmentMessageDto:743-745）→ CC :4546-4548
+        //      `if (attachment.content === '') return []` ⇒ 空成功提示不进 LLM（无信息量）。
+        //      [batch1-A 更正 DisplayName]：旧名误写「content 非空 → 注入」而断言 isEmpty（名实不符），
+        //      现名实一致；非空 content 的注入形态由 hookSuccess_sessionEventWithContent_wrapped 锁定。
         AgentState state = new AgentState("system-prompt");
-        state.appendAttachment(AttachmentMessageDto.hookSuccess("SessionStart", "toolu_7", "SessionStart")
-            // hookSuccess 工厂 content 为空串 → 用内容字段承载（对齐 CC attachment.content）
-        );
+        state.appendAttachment(AttachmentMessageDto.hookSuccess("SessionStart", "toolu_7", "SessionStart"));
 
         List<ChatMessageDto> injected =
             AgentLoopContext.maybeInjectHookAttachments(null, state, baseMessages(state));
 
         assertThat(injected).isEmpty();
+    }
+
+    @Test
+    @DisplayName("[batch1-A] hook_success（SessionStart + content 非空）→ 注入 wrapInSystemReminder('{hookName} hook success: {content}') 且 isMeta=true（CC messages.ts:4539-4556）")
+    void hookSuccess_sessionEventWithContent_wrapped() {
+        // WHY: CC :4549-4555 三件事必须同时成立 —— ① content 包在 <system-reminder> 内
+        //      （:3488-3490 wrapInSystemReminder），② 前缀逐字 `${hookName} hook success: `，
+        //      ③ isMeta:true（元消息：不落用户可见面）。
+        //      [跨读侧后果] isMeta=true 是同批 dba36e1 已定的归属口径：本注入消息只进 messagesForLlm
+        //      副本（LlmAgentLoop:5711），不入 state.messages() ⇒ AgentState.lastUserMessageId()
+        //      （:425 `!m.isMeta()` 过滤）与 MessageService.countNonMetaMessages 双双不选中/不计数。
+        AgentState state = new AgentState("system-prompt");
+        state.appendAttachment(AttachmentMessageDto.hookSuccess(
+            "SessionStart", "toolu_8", "SessionStart", "hook output text",
+            "stdout text", "stderr text", 0, "echo hi", 12L));
+
+        List<ChatMessageDto> injected =
+            AgentLoopContext.maybeInjectHookAttachments(null, state, baseMessages(state));
+
+        assertThat(injected).hasSize(1);
+        ChatMessageDto rendered = injected.get(0);
+        assertThat(rendered.content())
+            .as("CC :4551-4553 wrapInSystemReminder + 前缀逐字")
+            .isEqualTo("<system-reminder>\nSessionStart hook success: hook output text\n</system-reminder>");
+        assertThat(rendered.isMeta())
+            .as("CC :4554 isMeta:true → 元消息（lastUserMessageId/countNonMetaMessages 均不选中）")
+            .isTrue();
+        assertThat(rendered.content())
+            .as("包裹不得吞内容：模型面仍能拿到 hook 输出正文（CC :4552 attachment.content）")
+            .contains("hook output text");
+        assertThat(rendered.role()).isEqualTo(Role.user);
     }
 
     @Test
@@ -222,8 +269,8 @@ class HookAttachmentLlmInjectionTest {
 
         assertThat(injected)
             .extracting(ChatMessageDto::content)
-            .contains("PostToolUse:Bash hook blocking error from command: \"\": boom",
-                "PreToolUse:Read hook additional context: ctx line 1")
+            .contains("<system-reminder>\nPostToolUse:Bash hook blocking error from command: \"\": boom\n</system-reminder>",
+                "<system-reminder>\nPreToolUse:Read hook additional context: ctx line 1\n</system-reminder>")
             .contains("original user msg");
         // 注入 2 条 hook 消息 + 1 条原始消息
         assertThat(injected).hasSize(3);
@@ -263,12 +310,58 @@ class HookAttachmentLlmInjectionTest {
         assertThat(injected.get(1).content()).isEqualTo("assistant tool_use block");
         assertThat(injected.get(2).content()).isEqualTo("user tool_result block");
         // hook 附件渲染消息必须送达<b>队尾</b>（tool_result 之后）→ push tail（CC toolExecution.ts:1585-1587）
-        assertThat(injected.get(3).content()).isEqualTo("PostToolUse:Bash hook blocking error from command: \"\": boom-tail");
-        assertThat(injected.get(4).content()).isEqualTo("PreToolUse:Read hook additional context: tail ctx");
+        assertThat(injected.get(3).content())
+            .isEqualTo("<system-reminder>\nPostToolUse:Bash hook blocking error from command: \"\": boom-tail\n</system-reminder>");
+        assertThat(injected.get(4).content())
+            .isEqualTo("<system-reminder>\nPreToolUse:Read hook additional context: tail ctx\n</system-reminder>");
         // 显式断言: hook 附件不得前置（回归保护 prepend 队首旧行为）
         assertThat(injected.get(0).content())
             .as("hook 附件不得 prepend 到队首（对齐 CC push tail）")
             .doesNotContain("hook blocking error")
             .doesNotContain("hook additional context");
+    }
+
+    @Test
+    @DisplayName("[batch1-A] 渲染结果全部 isMeta=true 且不入 state.messages()（跨读侧：lastUserMessageId / 落库条数均不选中）")
+    void renderedHookMessages_areMetaAndNeverEnterStateMessages() {
+        // WHY (规则九 · 为什么重要): 渲染产物是 LLM 请求面专供副本（LlmAgentLoop:5711
+        //   `messagesForLlm = maybeInjectHookAttachments(...)`，随后仅用于 ModelRequest 组装
+        //   :6127），**不得**回流 state.messages()。若回流，两件事会坏：
+        //   ① AgentState.lastUserMessageId()（:425 遍历 messages 取最后 `!isMeta()` 的 user）
+        //      会把 hook 文本当「最后一条真实用户消息」→ 事件/落库 userMessageId 归属错乱；
+        //   ② MessageService.countNonMetaMessages（DB 侧非元消息条数，驱动轨迹条数徽标）虚高。
+        //   本测试同时锁定「模型面拿得到内容」与「用户/落库面拿不到」两侧。
+        AgentState state = new AgentState("system-prompt");
+        state.appendMessage(new ChatMessageDto("u0", null, Role.user, "system",
+            "real user prompt", null, List.of(), null, null, null,
+            null, null, null, null, null, List.of(), List.of()));
+        state.appendAttachment(AttachmentMessageDto.hookBlockingError(
+            "PostToolUse:Bash", "toolu_11", "PostToolUse", "marker-blocking"));
+        state.appendAttachment(AttachmentMessageDto.hookAdditionalContext(
+            "PreToolUse:Read", "toolu_12", "PreToolUse", List.of("marker-ctx")));
+
+        List<ChatMessageDto> injected =
+            AgentLoopContext.maybeInjectHookAttachments(null, state, baseMessages(state));
+
+        // ① 模型面：三条消息齐备（原文 + 2 条渲染），渲染内容为包裹形态
+        assertThat(injected).hasSize(3);
+        assertThat(injected.subList(1, 3))
+            .allSatisfy(m -> assertThat(m.content())
+                .startsWith("<system-reminder>\n")
+                .endsWith("\n</system-reminder>"));
+        assertThat(injected.subList(1, 3)).extracting(ChatMessageDto::content)
+            .anySatisfy(c -> assertThat(c).contains("marker-blocking"))
+            .anySatisfy(c -> assertThat(c).contains("marker-ctx"));
+
+        // ② 全部注入消息 isMeta=true（CC createUserMessage({isMeta:true})）
+        assertThat(injected.subList(1, 3))
+            .as("hook 渲染消息必须 isMeta=true（CC :4536/:4554/:4566）")
+            .allSatisfy(m -> assertThat(m.isMeta()).isTrue());
+
+        // ③ 读侧不受污染：state.messages() 未被追加，lastUserMessageId() 仍锚真实用户消息
+        assertThat(state.messages()).as("渲染产物不得回流 state.messages()").hasSize(1);
+        assertThat(state.lastUserMessageId())
+            .as("isMeta 渲染消息不得被 lastUserMessageId() 选中（AgentState:425 !isMeta 过滤）")
+            .isEqualTo("u0");
     }
 }

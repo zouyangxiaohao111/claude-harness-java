@@ -3073,14 +3073,21 @@ public record AgentLoopContext(
             //   若仍残留 hook_user_message attachment (防御), 走 default → 不渲染, 避免
             //   常驻 attachment 每轮重渲染成 isMeta 消息.
             case "hook_blocking_error":
-                // [prompt-align CTX-03] CC :4090-4097 `{hookName} hook blocking error from command:
-                //   "{command}": {error}`（wrapInSystemReminder + isMeta）。Java AttachmentMessageDto 已承载
-                //   command（AttachmentMessageDto.java:76-78，[H3 v3 修复]；生产方 HookRegistry:2867/2960/
+                // [batch1-A · wrap 补齐] CC messages.ts:4530-4538（真源，非注释）:
+                //   createUserMessage({ content: wrapInSystemReminder(
+                //     `${attachment.hookName} hook blocking error from command: "` +
+                //     `${attachment.blockingError.command}": ${attachment.blockingError.blockingError}`),
+                //     isMeta: true })
+                //   wrapInSystemReminder = `<system-reminder>\n${content}\n</system-reminder>`（:3488-3490，
+                //   前后各一换行、无缩进）。Java AttachmentMessageDto 已承载 command
+                //   （AttachmentMessageDto.java:76-78，[H3 v3 修复]；生产方 HookRegistry:2867/2960/
                 //   3189/3281 与 HookOutputParser:464 均传 blockingError.command()）→ 补 `from command:` 段。
-                //   保留 content 空→null 守卫（CC 渲染外 isMeta 包裹不变，走 maybeInjectHookAttachments 队尾注入）。
+                //   保留 content 空→null 守卫（CC 无此门，恒渲染；Java 防御，走 maybeInjectHookAttachments
+                //   队尾注入）。包裹写法沿用同 switch 既有先例（hook_stopped_continuation :3104 /
+                //   skill_listing :3144）。
                 return (content == null || content.isBlank()) ? null
-                    : hookName + " hook blocking error from command: \""
-                        + (a.command() != null ? a.command() : "") + "\": " + content;
+                    : "<system-reminder>\n" + hookName + " hook blocking error from command: \""
+                        + (a.command() != null ? a.command() : "") + "\": " + content + "\n</system-reminder>";
             case "hook_stopped_continuation":
                 // [V-SH-2 · 修订 CTX-10] 渲染形状对齐 CC normalizeAttachmentForAPI
                 //   （messages.ts:4130-4136）：`{hookName} hook stopped continuation: {message}`
@@ -3096,17 +3103,29 @@ public record AgentLoopContext(
                 return (content == null || content.isBlank()) ? null
                     : "<system-reminder>\n" + hookName + " hook stopped continuation: " + content + "\n</system-reminder>";
             case "hook_additional_context":
-                // CC :4117-4128 content 为空 → []
+                // [batch1-A · wrap 补齐] CC messages.ts:4557-4569（真源，非注释）:
+                //   if (attachment.content.length === 0) return []                    // :4558-4560
+                //   createUserMessage({ content: wrapInSystemReminder(
+                //     `${attachment.hookName} hook additional context: ${attachment.content.join('\n')}`),
+                //     isMeta: true })                                                // :4561-4567
+                //   join('\n') 已由 AttachmentMessageDto.hookAdditionalContext 工厂承担
+                //   （AttachmentMessageDto.java:623-632 → String.join("\n", contexts)）→ 此处 content 即已 join 串。
                 return (content == null || content.isBlank()) ? null
-                    : hookName + " hook additional context: " + content;
+                    : "<system-reminder>\n" + hookName + " hook additional context: " + content
+                        + "\n</system-reminder>";
             case "hook_success":
-                // CC :4099-4115 仅 SessionStart/UserPromptSubmit 且 content 非空
+                // [batch1-A · wrap 补齐] CC messages.ts:4539-4556（真源，非注释）:
+                //   if (hookEvent !== 'SessionStart' && hookEvent !== 'UserPromptSubmit') return []  // :4540-4545
+                //   if (attachment.content === '') return []                                        // :4546-4548
+                //   createUserMessage({ content: wrapInSystemReminder(
+                //     `${attachment.hookName} hook success: ${attachment.content}`), isMeta: true })  // :4549-4555
+                //   注：Java 空内容门用 isBlank()（比 CC 的 === '' 更宽，防御串 " "）—— 既有约定，本批未动。
                 String ev = a.hookEvent();
                 boolean sessionEvent = "SessionStart".equals(ev) || "UserPromptSubmit".equals(ev);
                 if (!sessionEvent || content == null || content.isBlank()) {
                     return null;
                 }
-                return hookName + " hook success: " + content;
+                return "<system-reminder>\n" + hookName + " hook success: " + content + "\n</system-reminder>";
             case "skill_listing":
                 // [skill-listing-cc-align 2026-09-10 纠偏] 对齐 CC utils/messages.ts:4160-4170
                 //   normalizeAttachmentForAPI case 'skill_listing'（**非**旧注释误引的 :3728-3738 —— 该区间是

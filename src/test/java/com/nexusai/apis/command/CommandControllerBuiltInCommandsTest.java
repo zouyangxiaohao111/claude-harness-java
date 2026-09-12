@@ -476,4 +476,107 @@ class CommandControllerBuiltInCommandsTest {
                 .param("sessionId", "sess-compact3"))
             .andExpect(status().isInternalServerError());
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // [P2-8 · 2026-09-11] /compact 自定义指令入站
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("P2-8: compact 请求体 {args} → dispatchResult('/compact <args>')（自定义指令透传）")
+    void executeCompactBuiltin_withArgs_forwardsCustomInstructions() throws Exception {
+        // WHY（规则九 · 验证意图）: CC 支持 /compact 用中文总结 —— args 作为 customInstructions
+        //   一路到 compactConversation（compact.ts:54/:106-112），且【有指令时跳过 SM 优先】
+        //   （compact.ts:44-48 `if (!customInstructions)`，session memory 压缩不支持自定义指令）。
+        //   旧实现恒 dispatchResult("/compact") → args 恒空 → Web 端自定义指令不可达，且 manual
+        //   /compact 永远落 SM 优先分支（走不到 CC 的带指令直压路径）。本断言锁住「指令真的透传」：
+        //   若前端/后端任一侧丢掉 args → dispatchResult 收到的仍是裸 "/compact" → 本测试 fail。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        when(dispatcher.dispatchResult("/compact 用中文总结"))
+            .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
+                .text("Compacted 5 messages"));
+        RequestContext.setSession("sess-compact-args");
+
+        mockMvc.perform(post("/api/command/builtins/compact/execute")
+                .param("sessionId", "sess-compact-args")
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .content("{\"args\":\"用中文总结\"}"))
+            .andExpect(status().isOk())
+            .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.content()
+                .string(org.hamcrest.Matchers.containsString("Compacted 5 messages")));
+        verify(dispatcher).dispatchResult("/compact 用中文总结");
+    }
+
+    @Test
+    @DisplayName("P2-8: compact 空/缺省 args → 仍走裸 '/compact'（SM 优先分支语义不变）")
+    void executeCompactBuiltin_blankArgs_dispatchesBareCompact() throws Exception {
+        // WHY: args 为空 = CC args.trim() === ''（compact.ts:54）→ 走 SM 优先（compact.ts:58-82）。
+        //   空体/空白 args 不得拼出 "/compact " 尾随空格（UserInputDispatcher 用 trim 兜底，但
+        //   契约上是裸 "/compact"）。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        when(dispatcher.dispatchResult("/compact"))
+            .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
+                .text("Compacted 1 messages"));
+        RequestContext.setSession("sess-compact-blank");
+
+        mockMvc.perform(post("/api/command/builtins/compact/execute")
+                .param("sessionId", "sess-compact-blank"))
+            .andExpect(status().isOk());
+        verify(dispatcher).dispatchResult("/compact");
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // [P2-18 · 2026-09-11] manual /compact 显式路由（不再依赖 Spring 路由优先级）
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("P2-18: 字面端点 compact/execute 真实执行（响应为 displayText，非命令元数据 DTO）")
+    void p218_literalEndpointReallyCompacts_notMetadata() throws Exception {
+        // WHY（规则九）: /compact 是否真执行，旧实现完全依赖 Spring「literal 优先于 {name} 路径变量」
+        //   这一隐式优先级，无编译期/测试期护栏 —— 字面端点一旦被移除/改路径，请求会落回通用分支
+        //   （DEC-9 薄触发只回元数据 BuiltInCommandDto）→ 前端报「已执行 /compact」但压缩从未发生。
+        //   本断言以响应形状锁住「字面端点存在且真实执行」：displayText 是纯文本，
+        //   若是元数据薄触发则会返回 JSON（含 name/type/description）→ 断言 fail。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        when(dispatcher.dispatchResult(any()))
+            .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
+                .text("Compacted 7 messages"));
+        RequestContext.setSession("sess-compact-p218");
+
+        String body = mockMvc.perform(post("/api/command/builtins/compact/execute")
+                .param("sessionId", "sess-compact-p218"))
+            .andExpect(status().isOk()).andReturn().getResponse()
+            .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+        assertThat(body).as("字面端点必须真实执行（displayText），不得退化为元数据 DTO")
+            .contains("Compacted 7 messages");
+        assertThat(body).as("元数据薄触发的标志字段不得出现在压缩响应里").doesNotContain("\"description\"");
+    }
+
+    @Test
+    @DisplayName("P2-18: 通用分支 executeBuiltinInternal(compact) 显式委托真执行（不再只回元数据）")
+    void p218_genericRouteForCompactDelegatesToRealExecution() throws Exception {
+        // WHY（规则九）: 通用路由 POST /builtins/{name}/execute 对 compact 旧行为 = 只回命令元数据
+        //   （DEC-9 薄触发）→ 「/compact 真执行」这件事完全押在 Spring 路由优先级上。现通用分支显式
+        //   分流 compact 到同一执行体：即使字面端点消失/改路径，compact 仍真实压缩，不存在静默假成功
+        //   通道。本测试直接驱动该分支（生产 URL 会被字面端点抢先命中，无法经 HTTP 触达 → 反射调用）。
+        com.nexusai.application.agent.UserInputDispatcher dispatcher =
+            mock(com.nexusai.application.agent.UserInputDispatcher.class);
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+        when(dispatcher.dispatchResult("/compact"))
+            .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
+                .text("Compacted generic"));
+        RequestContext.setSession("sess-compact-p218b");
+
+        Object result = ReflectionTestUtils.invokeMethod(
+            controller, "executeBuiltinInternal", "compact", null);
+
+        verify(dispatcher).dispatchResult("/compact");
+        assertThat(result).as("通用分支对 compact 必须真实执行（displayText），而非返回 BuiltInCommandDto 元数据")
+            .isEqualTo("Compacted generic");
+    }
 }

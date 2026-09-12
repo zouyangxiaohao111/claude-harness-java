@@ -810,6 +810,20 @@ export interface SnipBoundaryMetadata {
   removedUuids?: string[] | null
   [key: string]: unknown
 }
+/** [P2-15] Stop hook 摘要行载荷（前端实时行专用 · 后端 /topic/tasks 出站，不落 DB、不进模型上下文）。
+ *  字段对齐 CC {@code SystemStopHookSummaryMessage}（utils/messages.ts:4838-4866）。 */
+export interface StopHookSummaryPayload {
+  /** 本轮 Stop 事件上执行的 hook 总数（CC hookCount） */
+  hookCount: number
+  /** hook 标签（CC hookLabel）；Stop/SubagentStop 生产形态为 null/空 → 非 label 摘要 */
+  hookLabel?: string | null
+  /** hook 错误列表（CC hookErrors · 非空才展示） */
+  hookErrors: string[]
+  /** 是否阻止继续（CC preventedContinuation · 真时展示 stopReason） */
+  preventedContinuation: boolean
+  /** 阻止继续的原因（CC stopReason · 仅 preventedContinuation=true 时有值） */
+  stopReason?: string | null
+}
 export interface ChatMessageDto {
   id: string
   sessionId: string
@@ -872,6 +886,9 @@ export interface ChatMessageDto {
   microcompactMetadata?: CompactBoundaryMetadata | null
   /** 边界消息元数据（role=system + subtype=snip_boundary 携带 · snip 裁剪分界线识别展示用） */
   snipMetadata?: SnipBoundaryMetadata | null
+  /** [P2-15] Stop hook 摘要行载荷（subtype='stop_hook_summary' 的**实时行**携带 ·
+   *  /topic/tasks 出站、不落库不进模型 → 仅本次会话存活，F5 后不再有此行） */
+  stopHookSummary?: StopHookSummaryPayload | null
   /** 用户附件（PDF/Word/视频/音频/文件 · user 气泡内联胶囊展示 · 点击预览）。
    *  乐观追加带 base64（≤5MB 即时预览）/ path（local-read 大文件本地读）；F5 重拉后端出站 url（内容端点）+ contentId */
   userAttachments?: { type: string; filename: string; mediaType?: string | null; contentId?: string | null; url?: string | null; base64?: string | null; path?: string | null }[] | null
@@ -1174,9 +1191,11 @@ export interface QueueDrainedEvent extends StreamEventBase {
 /** /topic/tasks 订阅主题（后台任务 SDK 事件通道） */
 export const TASKS_TOPIC = '/topic/tasks'
 
-/** 后台任务事件 subtype（4 类 drain 事件运行时 type 恒为 'system'，subtype 区分） */
+/** 后台任务事件 subtype（drain 事件运行时 type 恒为 'system'，subtype 区分；
+ *  stop_hook_summary = [P2-15] Stop hook 摘要（元数据型 · 非任务）同通道出站） */
 export type TaskEventSubtype =
   | 'task_started' | 'task_progress' | 'task_notification' | 'session_state_changed'
+  | 'stop_hook_summary'
 
 /** 任务 usage 内部对象（对齐后端 SdkEventQueue.TaskUsage） */
 export interface TaskEventUsage {
@@ -1264,6 +1283,30 @@ export interface ToolUseSummaryEvent extends TaskEventBase {
   preceding_tool_use_ids?: string[] | null
 }
 
+/**
+ * [P2-15] Stop hook 摘要（单对象，type='system' + subtype='stop_hook_summary'）·
+ * 对齐 CC {@code createStopHookSummaryMessage}（utils/messages.ts:4838-4866）经 stopHooks.ts:309-318
+ * yield 进消息流。Java 出站点 {@code LlmAgentLoop.emitStopHookSummarySdkMessage} → /topic/tasks。
+ *
+ * <p><b>元数据型内容</b>（hook 计数 / 错误列表 / 阻止继续原因），<b>不是</b>对话正文 ——
+ * 渲染必须走独立摘要行（对齐 CC SystemTextMessage.StopHookSummaryMessage），不得当普通气泡。
+ *
+ * <p>{@code hook_label}：CC 为 {@code string|undefined}；Stop/SubagentStop 生产形态为 null
+ * （CC compact 摘要以外唯一生产者为 Pre/PostToolUse，本仓 Stop 摘要恒 null）。
+ */
+export interface StopHookSummaryEvent extends TaskEventBase {
+  type: 'system'
+  subtype: 'stop_hook_summary'
+  hook_count?: number | null
+  hook_infos?: string[] | null
+  hook_errors?: string[] | null
+  prevented_continuation?: boolean | null
+  stop_reason?: string | null
+  has_output?: boolean | null
+  hook_label?: string | null
+  total_duration_ms?: number | null
+}
+
 /** /topic/tasks 载荷（drain 出站为 JSON 数组）单条事件联合 */
 export type TaskEvent =
   | TaskStartedEvent
@@ -1271,6 +1314,7 @@ export type TaskEvent =
   | TaskNotificationEvent
   | SessionStateChangedEvent
   | ToolUseSummaryEvent
+  | StopHookSummaryEvent
   | TaskNotificationWireEvent
 
 /** 子代理 transcript 单条消息（对齐后端 AgentMessage record · GET /sessions/{sid}/subagents/{agentId}/transcript） */

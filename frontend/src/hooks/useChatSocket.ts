@@ -597,6 +597,35 @@ export function useChatSocket(
       return
     }
     if (evt.type !== 'system') return
+    // [P2-15] Stop hook 摘要（元数据型）→ 会话消息流内插独立摘要行 · 与 tool_use_summary 同款
+    //   （后端 LlmAgentLoop.emitStopHookSummarySdkMessage 出站；不落库 → F5 后不再有该行）。
+    //   flow 归属同 tool_use_summary：优先当前活跃 stream 的 userMessageId，兜底末条消息。
+    if (evt.subtype === 'stop_hook_summary') {
+      const sid = evt.session_id ?? sessionIdRef.current ?? undefined
+      const st = useChatStore.getState()
+      let flowId: string | undefined
+      const blocks = sid ? st.streams[sid] : undefined
+      const lastBlk = blocks && blocks.length ? blocks[blocks.length - 1] : undefined
+      if (lastBlk?.userMessageId) flowId = lastBlk.userMessageId
+      if (!flowId && sid) {
+        const msgs = st.messages[sid] ?? []
+        flowId = msgs.length ? (msgs[msgs.length - 1].userMessageId ?? undefined) : undefined
+      }
+      if (sid && evt.uuid) {
+        useChatStore.getState().addStopHookSummary(sid, {
+          id: evt.uuid,
+          payload: {
+            hookCount: evt.hook_count ?? 0,
+            hookLabel: evt.hook_label ?? null,
+            hookErrors: evt.hook_errors ?? [],
+            preventedContinuation: evt.prevented_continuation === true,
+            stopReason: evt.stop_reason ?? null,
+          },
+          userMessageId: flowId,
+        })
+      }
+      return
+    }
     switch (evt.subtype) {
       case 'task_started': {
         const taskId = evt.task_id ?? evt.uuid ?? null

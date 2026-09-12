@@ -412,6 +412,12 @@ public class ExecAgentHook {
                     state.messages(), systemPrompt, baseTuc,
                     QuerySource.HOOK_AGENT, modelName, MAX_AGENT_TURNS, null, null, null, null,
                     deps, effectiveConfig);
+            // [P2-23 · 2026-09-11] skillListingResume 恒 false（经 3 参重载 = 默认 false）——
+            //   此处【不是】缺陷：CC 每次 hook 调用生成**新** agentId
+            //   （execAgentHook.ts:144-150 `hook-agent-${randomUUID()}`）→ skills sent 槽恒空
+            //   → 该 hook agent 得到自己的首份整份清单（attachments.ts:2672-2676「subagents get their
+            //   own turn-0 listing」）。仅子代理 resume 路径（复用原 agentId）需透传真实 resume，
+            //   见 SubagentExecutor.runSubagentQueryLoop。
             LoopResult result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids);
 
             // 10. 提取 StructuredOutput {ok,reason} · CC :212-225 attachment.structured_output
@@ -454,6 +460,19 @@ public class ExecAgentHook {
                 } catch (Exception e) {
                     log.warn("ExecAgentHook: hook={} 注销 enforcement hook 失败: {}", hookName, e.getMessage());
                 }
+            }
+            // [P2-12 · 2026-09-11] hook agent 结束点回收 skill_listing 槽位（防进程内无界增长）。
+            //   hook agent 每次调用生成新 UUID（generateHookAgentId）→ 每个 (会话, hook 调用) 在
+            //   SkillListingSentRegistry 留一份 Set<技能名> 且永不回收。对齐说明：CC sentSkillNames
+            //   同样从不删单键（attachments.ts:2676），但 CC 一进程一会话、agent 随进程消亡 → 无泄漏面；
+            //   nexusai 常驻 JVM 必须显式回收。放 finally 覆盖正常/异常所有出口（规则十二 fail loud：
+            //   回收失败仅 warn，不影响 hook outcome）。
+            try {
+                com.nexusai.application.agent.skill.SkillListingSentRegistry
+                    .removeAgentKey(sessionId, hookAgentUuid.toString());
+            } catch (Exception e) {
+                log.warn("ExecAgentHook: hook={} 回收 skill_listing 槽失败 agentId={}: {}",
+                    hookName, hookAgentId, e.getMessage());
             }
         }
     }

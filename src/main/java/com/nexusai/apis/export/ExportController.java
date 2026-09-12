@@ -136,6 +136,29 @@ public class ExportController {
         for (MessageRecord m : messages) {
             String role = m.getRole() != null ? m.getRole() : "unknown";
             String content = m.getContent() != null ? m.getContent() : "";
+            // [P2-21 2026-09-12] 两标记列接线 · 对齐 CC 导出的两类渲染语义
+            //   （commands/export/export.tsx → utils/exportRenderer.tsx 以
+            //   {@code screen="prompt"} 渲染 <Messages> → messages.ts:500 isTranscriptMode=false）。
+            //   ② isCompactSummary=true 的 user 消息：Message.tsx:141 走 CompactSummary 专用渲染
+            //      （不复用普通用户气泡）→ 本处给独立小节标题，不再当 '## User' 导出。
+            //   ① isVisibleInTranscriptOnly=true 的 <b>user</b> 消息：
+            //      shouldShowUserMessage(msg, false) 命中 messages.ts:5115 `!isTranscriptMode → return false`
+            //      → 该消息不渲染 → 本处跳过（CC 该过滤仅作用于 type==='user'）。
+            //   ⚠️ [P2-21 裁决 b 2026-09-12 · <b>有意偏离 CC 的判定顺序</b>]
+            //      CC 是「先 ① 后 ②」：full-compact 摘要**同时带两标志**（compact.ts:643-650）时先命中 ①
+            //      → 导出里**整条不出现**，压缩摘要正文丢失。.md 是**归档件**（无实时 UI 兜底），
+            //      丢摘要等于丢压缩上下文 ⇒ 用户裁定改为「先 ② 后 ①」：带 isCompactSummary 的行
+            //      一律走摘要小节（保住正文），仅"只带 transcript-only、不带摘要"的行才跳过。
+            //      差异仅出现在「两标志并存」这一种行（即 full/SM compact 摘要），partial（kept 非空，
+            //      compact.ts:1068-1077 只带 isCompactSummary）两种顺序下行为本来一致。
+            if ("user".equals(role) && Boolean.TRUE.equals(m.getIsCompactSummary())) {
+                sb.append("## Compact Summary\n\n");
+                sb.append(content).append("\n\n");
+                continue;
+            }
+            if ("user".equals(role) && Boolean.TRUE.equals(m.getIsVisibleInTranscriptOnly())) {
+                continue;
+            }
             switch (role) {
                 case "user" -> {
                     sb.append("## User\n\n");

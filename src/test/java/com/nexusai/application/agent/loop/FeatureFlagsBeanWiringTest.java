@@ -196,14 +196,14 @@ class FeatureFlagsBeanWiringTest {
         auto.setReactiveOnlyMode(false);
         auto.setContextCollapseModeEnabled(on.contextCollapse());
         // CONTEXT_COLLAPSE feature+运行时门双 true → 抑制主动 autocompact（CC autoCompact.ts:215-223）
-        assertThat(auto.shouldAutoCompact(List.of(), "user", 0))
+        assertThat(auto.shouldAutoCompact(List.of(), null, "user", 0))
             .as("feature 开 + 运行时门开必须抑制 autocompact（collapse 拥有 headroom，风险 14）")
             .isFalse();
 
         // 对照：默认全关（生产默认 ALL_DISABLED）→ 不抑制 → 超阈照常
         AutoCompactor off = new AutoCompactor(msgs -> 200_000,
             (p, m) -> new CompactConversation.SummaryResult("summary", null));
-        assertThat(off.shouldAutoCompact(List.of(), "user", 0))
+        assertThat(off.shouldAutoCompact(List.of(), null, "user", 0))
             .as("默认全关时不得抑制（对齐 CC flag 默认关闭）")
             .isTrue();
     }

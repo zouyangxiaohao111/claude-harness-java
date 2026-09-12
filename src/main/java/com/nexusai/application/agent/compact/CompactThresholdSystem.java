@@ -580,7 +580,7 @@ public class CompactThresholdSystem {
      *
      * @param thresholdRelativePercentLeft   阈值相对百分比（内部阈值口径；见上）
      * @param isAboveWarningThreshold        是否超过 warning 阈值（threshold − 20k）
-     * @param isAboveErrorThreshold          是否超过 error 阈值（threshold − 10k）
+     * @param isAboveErrorThreshold          是否超过 error 阈值（threshold − 20k）
      * @param isAboveAutoCompactThreshold    是否达到自动压缩阈值
      * @param isAtBlockingLimit              是否达到 blocking 上限
      */

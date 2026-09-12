@@ -320,7 +320,73 @@ class CompactBoundaryMessageCcTest {
         assertThat(dto.compactMetadata()).doesNotContainKey("preservedSegment");
     }
 
+    // ════════════════════════════════════════════════════════════════════
+    // [D4 档 0.5 2026-09-12] annotateBoundaryWithPreservedSegment · 非空校验 + 只写语义
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[D4] 保留段注解：head/anchor/tail 三 uuid 正确落进 preservedSegment（只写字段）")
+    void annotatePreservedSegment_happyPath() {
+        CompactBoundaryMessage boundary = CompactBoundaryMessage.createCompactBoundaryMessage(
+            "auto", 100, null, null, null);
+
+        CompactBoundaryMessage annotated = CompactBoundaryMessage.annotateBoundaryWithPreservedSegment(
+            boundary, "anchor-uuid", List.of(keepMsg("keep-1"), keepMsg("keep-2"), keepMsg("keep-3")));
+
+        CompactMetadata.PreservedSegment seg = annotated.compactMetadata().preservedSegment();
+        assertThat(seg).as("非空保留段必须产出 preservedSegment").isNotNull();
+        assertThat(seg.headUuid()).as("headUuid = keep[0].id（CC compact.ts:1077-1081）").isEqualTo("keep-1");
+        assertThat(seg.anchorUuid()).isEqualTo("anchor-uuid");
+        assertThat(seg.tailUuid()).as("tailUuid = keep.at(-1).id").isEqualTo("keep-3");
+        // 原 4 字段元数据不被注解过程丢失
+        assertThat(annotated.compactMetadata().trigger()).isEqualTo("auto");
+        assertThat(annotated.compactMetadata().preTokens()).isEqualTo(100);
+    }
+
+    @Test
+    @DisplayName("[D4] 非空校验 fail-loud 但**不改变行为**：uuid 缺失仍照原样构造（不抛异常）")
+    void annotatePreservedSegment_blankUuid_stillConstructsWithoutThrowing() {
+        // WHY（CLAUDE.md 规则九）：preservedSegment 在 nexusai 是**只写字段**——读侧零消费，
+        //   故 uuid 缺失不会当场炸，只会在「将来有人接读侧」时静默产出坏接线图。D4 档 0.5 的取舍是
+        //   **只加可观测性（log.warn），不加 fail-fast**：抛异常会让 compact 主流程因一个无人读的
+        //   元数据字段无故失败。本测试锁死这个取舍 —— 若有人把 warn 改成 throw，此处红。
+        CompactBoundaryMessage boundary = CompactBoundaryMessage.createCompactBoundaryMessage(
+            "auto", 100, null, null, null);
+
+        // headUuid=null（keep[0].id() 缺失）+ anchorUuid=null（调用方未传）
+        CompactBoundaryMessage annotated = CompactBoundaryMessage.annotateBoundaryWithPreservedSegment(
+            boundary, null, List.of(keepMsg(null), keepMsg("keep-2")));
+
+        assertThat(annotated).as("非空校验失败不改变返回结构（仍返回注解后的新 boundary）").isNotNull();
+        CompactMetadata.PreservedSegment seg = annotated.compactMetadata().preservedSegment();
+        assertThat(seg).isNotNull();
+        assertThat(seg.headUuid()).as("坏值照原样落（不抛、不清零、不替换）").isNull();
+        assertThat(seg.anchorUuid()).isNull();
+        assertThat(seg.tailUuid()).isEqualTo("keep-2");
+    }
+
+    @Test
+    @DisplayName("[D4] 空保留段 → 返回原 boundary 不变（CC compact.ts:349-367 前置守卫）")
+    void annotatePreservedSegment_emptyKeepReturnsOriginal() {
+        CompactBoundaryMessage boundary = CompactBoundaryMessage.createCompactBoundaryMessage(
+            "auto", 100, null, null, null);
+
+        assertThat(CompactBoundaryMessage.annotateBoundaryWithPreservedSegment(boundary, "a", List.of()))
+            .as("空保留段 → 原 boundary（无 preservedSegment）").isSameAs(boundary);
+        assertThat(CompactBoundaryMessage.annotateBoundaryWithPreservedSegment(boundary, "a", null))
+            .isSameAs(boundary);
+        assertThat(CompactBoundaryMessage.annotateBoundaryWithPreservedSegment(boundary, "a", null)
+            .compactMetadata().preservedSegment()).isNull();
+    }
+
     // ── 测试辅助 ────────────────────────────────────────────────────────
+
+    /** 保留段消息（可传 null id 模拟缺 uuid 的坏值路径）。 */
+    private static ChatMessageDto keepMsg(String id) {
+        return new ChatMessageDto(id, null, Role.user, "user", "keep", null, List.of(),
+            FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(),
+            null, null, null, List.of(), List.of(), null, false, false, null);
+    }
 
     private static ChatMessageDto userMsg(String id, String content) {
         return new ChatMessageDto(id, null, Role.user, "user", content, null, List.of(),

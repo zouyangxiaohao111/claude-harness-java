@@ -354,6 +354,77 @@ function ToolCard({ tool, matchedRule, live = false }: { tool: NonNullable<ChatM
   )
 }
 
+/** [P2-13] compact 摘要专用渲染 · 对齐 CC {@code components/CompactSummary.tsx:74-104}（auto-compact 默认分支）
+ *  + {@code components/Message.tsx:140-142}（{@code case 'user': if (message.isCompactSummary) return <CompactSummary/>}）。
+ *
+ *  <p><b>WHY 不能当普通 user 气泡</b>：compact 摘要（role=user / author=system / isCompactSummary=true）
+ *  是<b>系统产物</b>不是用户输入 —— 走 user 气泡会以用户口吻展示整段摘要正文，且被误读为「用户说过」。
+ *
+ *  <p><b>CC 语义映射</b>：CC 在 prompt 模式（= 本仓对话区）只显示 {@code ⏺ Conversation summarized to
+ *  free up context} 标题行、正文靠 ctrl+o 进 transcript 模式才展开；本仓无 transcript 全局开关
+ *  （轨迹 tab 承担 transcript 角色），故把「展开」下放为标题行内的折叠开关：默认收起 = CC prompt 语义，
+ *  展开 = CC transcript 语义（正文可读）。
+ *  注：CC 另一分支（{@code summarizeMetadata} 的「Summarized conversation」）本仓不可达 ——
+ *  summarizeMetadata 由后端放在 {@code structuredOutput} 内（PartialCompactConversation.buildSummaryMessage），
+ *  前端 DTO 不出站该字段；故只实现默认分支（保持数据可得性诚实，不臆造计数/方向）。 */
+function CompactSummaryCard({ msg }: { msg: ChatMessageDto }) {
+  const [expanded, setExpanded] = useState(false)
+  const text = msg.content ?? ''
+  return (
+    <div className="msg compact-summary">
+      <div className="cs-head">
+        <span className="cs-dot" aria-hidden>⏺</span>
+        <span className="cs-title">Conversation summarized to free up context</span>
+        {text.trim() !== '' && (
+          <button type="button" className="cs-toggle" onClick={() => setExpanded((v) => !v)} aria-expanded={expanded}>
+            {expanded ? '收起摘要' : '查看摘要'}
+          </button>
+        )}
+      </div>
+      {expanded && text.trim() !== '' && (
+        <div className="cs-body">
+          <MarkdownText text={text} className="cs-text md" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** [P2-15] Stop hook 摘要行 · 对齐 CC {@code SystemTextMessage.tsx:151-254 StopHookSummaryMessage}
+ *  （默认分支：{@code ⏺ Ran N stop hooks} + 逐条错误 + 阻止继续原因）。
+ *
+ *  <p><b>元数据型内容</b>（hook 计数 / 错误列表 / 阻止原因），不是对话正文 —— 独立摘要行渲染，
+ *  绝不当普通 user/assistant 气泡。
+ *
+ *  <p>可见性门与 CC 一致（{@code SystemTextMessage.tsx:173-179}：{@code if (hookErrors.length === 0
+ *  && !preventedContinuation && !message.hookLabel) ... return null}）：无错误、未阻止继续、
+ *  且非 label 摘要 → 不渲染（Stop/SubagentStop 生产形态 hookLabel 恒 null →
+ *  即「只有出错或被阻止时才可见」）。 */
+function StopHookSummaryRow({ payload }: { payload: NonNullable<ChatMessageDto['stopHookSummary']> }) {
+  const errors = payload.hookErrors ?? []
+  const hasLabel = payload.hookLabel != null && payload.hookLabel !== ''
+  if (errors.length === 0 && !payload.preventedContinuation && !hasLabel) return null
+  const label = hasLabel ? payload.hookLabel : 'stop'
+  return (
+    <div className="msg stop-hook-summary">
+      <div className="shs-head">
+        <span className="shs-dot" aria-hidden>⏺</span>
+        <span className="shs-title">
+          Ran <b>{payload.hookCount}</b> {label} {payload.hookCount === 1 ? 'hook' : 'hooks'}
+        </span>
+      </div>
+      {payload.preventedContinuation && payload.stopReason && (
+        <div className="shs-line"><span className="shs-branch" aria-hidden>⎿</span>{payload.stopReason}</div>
+      )}
+      {errors.map((err, i) => (
+        <div key={i} className="shs-line shs-error">
+          <span className="shs-branch" aria-hidden>⎿</span>{label} hook error: {err}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 /** 单条超长正文防护：正文 > HEAVY_CONTENT_CHARS 时只渲染截断纯文本预览 + 「查看完整内容」，
  *  展开后才走整段 mdast（MarkdownText）。否则打开含 350KB 级单条消息的会话会被一条 DOM 卡死
  *  ——窗口化只限「条数」不限「单条体积」。初始加载不被病理大消息阻塞，展开由用户主动触发。 */
@@ -378,6 +449,13 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
   const isUser = msg.role === 'user'
   // F25 · model_fallback_warning：role=system + subtype='informational' 的消息按「模型降级」提示渲染
   const isFallback = msg.role === 'system' && msg.subtype === 'informational'
+  // [P2-15] Stop hook 摘要行（/topic/tasks 实时插入 · 元数据型展示行）：独立摘要行渲染，
+  //   不进 user/assistant 气泡分支（CC SystemTextMessage.tsx:121-127 专用分派）
+  const isStopHookSummary = msg.subtype === 'stop_hook_summary'
+  // [P2-13] compact 摘要 user 消息（isCompactSummary=true）→ CC CompactSummary 专用渲染，
+  //   不是普通用户气泡（CC Message.tsx:140-142）。kept 段为空时后端另打
+  //   isVisibleInTranscriptOnly=true（对话区不展示，由 groups 过滤在上游 continue 掉）。
+  const isCompactSummary = msg.role === 'user' && msg.isCompactSummary === true
   // CRON · scheduled_task_fire：定时任务触发系统通知（对齐 CC SystemTextMessage.tsx:137 「❋ 任务执行中」）
   const isScheduledFire = msg.role === 'system' && msg.subtype === 'scheduled_task_fire'
   // 裁剪/压缩边界消息（role=system + subtype 分界线标记）：compact_boundary 自动/手动压缩分界、
@@ -467,6 +545,14 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
         <span className="tus-text" title={msg.content ?? ''}>{msg.content}</span>
       </div>
     )
+  }
+  // [P2-15] Stop hook 摘要行（元数据型）→ 独立摘要行（可见性门在组件内，同 CC）
+  if (isStopHookSummary && msg.stopHookSummary) {
+    return <StopHookSummaryRow payload={msg.stopHookSummary} />
+  }
+  // [P2-13] compact 摘要 → CC CompactSummary 专用渲染（不是普通用户气泡）
+  if (isCompactSummary) {
+    return <CompactSummaryCard msg={msg} />
   }
   return (
     <div
@@ -776,9 +862,13 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
       //   保持在 isMeta 之前 = 维持既有「先按显式标志剔除」的读法，也不会遮蔽紧随其后的 tool_use_summary 放行分支。
       //   compact 摘要（kept 段为空）由后端打此标记（PartialCompactConversation.buildSummaryMessage）。
       if (m.role === 'user' && m.isVisibleInTranscriptOnly === true) continue
-      // 放行 tool_use_summary 展示行（isMeta=true 但 author=attachment/subtype=tool_use_summary）——
-      //   默认 isMeta 跳过会把它吞掉（渲染分支见 Message 组件 isToolUseSummary）
-      if (m.isMeta && !(m.author === 'attachment' && m.subtype === 'tool_use_summary')) continue
+      // 放行「实时展示行」（isMeta=true 但属 UI 摘要行）：tool_use_summary 与
+      //   [P2-15] stop_hook_summary —— 默认 isMeta 跳过会把它们吞掉（渲染分支见 Message 组件）。
+      //   两者都只由 /topic/tasks 实时插入（不落库），isMeta=true 是为了不进「消息计数徽标 /
+      //   pivot 候选 / 轨迹」这些「真实对话消息」口径。
+      const isLiveDisplayRow = (m.author === 'attachment' && m.subtype === 'tool_use_summary')
+        || m.subtype === 'stop_hook_summary'
+      if (m.isMeta && !isLiveDisplayRow) continue
       push(m.userMessageId ?? m.id, { kind: 'msg', m })
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
@@ -971,6 +1061,59 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
           text-overflow: ellipsis;
           white-space: nowrap;
         }
+        /* [P2-13] compact 摘要卡片：CC CompactSummary 专用渲染（⏺ 标题行 + 折叠正文），
+           不是用户气泡 —— 摘要正文默认收起（= CC prompt 模式），展开 = CC transcript 模式 */
+        .msg.compact-summary {
+          flex-direction: column;
+          align-items: flex-start;
+          max-width: 720px;
+          margin: 6px auto 8px;
+          padding: 10px 14px;
+          font-size: 12.5px;
+          color: var(--ink-muted, #888);
+          background: var(--surface-2, #f2f2f3);
+          border: 1px solid var(--hairline, #e5e5e5);
+          border-radius: 10px;
+        }
+        .msg.compact-summary .cs-head { display: flex; align-items: center; gap: 8px; width: 100%; }
+        .msg.compact-summary .cs-dot { flex-shrink: 0; font-size: 12px; line-height: 1; opacity: 0.9; }
+        .msg.compact-summary .cs-title { font-weight: 600; color: var(--ink, #333); }
+        .msg.compact-summary .cs-toggle {
+          margin-left: auto;
+          padding: 1px 8px;
+          font-size: 11px;
+          font-family: inherit;
+          color: var(--ink-subtle, #666);
+          background: transparent;
+          border: 1px solid var(--hairline, #e5e5e5);
+          border-radius: 999px;
+          cursor: pointer;
+        }
+        .msg.compact-summary .cs-toggle:hover { color: var(--ink, #333); background: var(--surface-3, #eaeaea); }
+        .msg.compact-summary .cs-body {
+          width: 100%;
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px dashed var(--hairline, #e5e5e5);
+          color: var(--ink, #333);
+        }
+        /* [P2-15] Stop hook 摘要行：元数据型内容（⏺ Ran N stop hooks + 错误行），
+           左对齐弱化摘要，与 user/assistant 气泡区分（CC SystemTextMessage 同款语义） */
+        .msg.stop-hook-summary {
+          flex-direction: column;
+          align-items: flex-start;
+          margin: 4px 0 6px;
+          padding-left: 2px;
+          font-size: 12.5px;
+          color: var(--ink-muted, #888);
+          line-height: 1.6;
+        }
+        .msg.stop-hook-summary .shs-head { display: flex; align-items: baseline; gap: 6px; }
+        .msg.stop-hook-summary .shs-dot { flex-shrink: 0; font-size: 11px; opacity: 0.85; }
+        .msg.stop-hook-summary .shs-title b { color: var(--ink, #333); }
+        .msg.stop-hook-summary .shs-line { padding-left: 14px; }
+        .msg.stop-hook-summary .shs-branch { margin-right: 6px; opacity: 0.6; }
+        .msg.stop-hook-summary .shs-error { color: var(--warning, #c9820e); }
       `}</style>
       {/* [window-paging] 顶部「加载更早」（hasMore 时；对齐 deepseek loadOlder 显式按钮，不做滚顶自动翻页） */}
       {hasMore && (

@@ -23,7 +23,7 @@ import { settingsApi } from '@/api/settings'
 import { attachmentApi } from '@/api/attachment'
 import { ApiError } from '@/api/rest'
 import { debugLog } from '@/utils/debugLog'
-import { useChatStore, selectCompact } from '@/stores/chatStore'
+import { useChatStore, selectCompact, collectRemovedUuids } from '@/stores/chatStore'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { useAwaySummary } from '@/hooks/useAwaySummary'
 import { sendPermissionResponse } from '@/api/socket'
@@ -472,6 +472,16 @@ function App() {
   const loadTraceFull = useCallback(async (sid: string) => {
     try {
       const msgs = await chatApi.listMessages(sid) // 全量：Trace = 全程记录（不受窗口限制）
+      // [P2-19 F5 角标缺口] 全量列表是【唯一】必然含全部 snip_boundary 的通道：
+      //   · 轨迹「已裁剪」pill 的缺口是确定的 —— traceMessages 拿到全量（boundary + 被裁消息都在），
+      //     但 snippedIds 只由 STOMP 实时 / setMessages 解析填充，F5（冷启动）后为空 → pill 不渲染
+      //     （P2-19 取证②）。本行用同一份全量补齐 snippedIds。
+      //   · 聊天区角标：被裁消息落在当前窗口时才需要角标，而尾页窗口（loadTailWindow 只拉 50 条）
+      //     可能不含 boundary → setMessages 的解析为空（补上后不再依赖「boundary 是否落在加载页」）。
+      //   位置在过期守卫【之前】：snippedIds 是会话级既成事实，与「此刻是否仍停在轨迹 tab」无关；
+      //   过期守卫只约束 traceMessages 这个 UI 副本（快速切走不得回灌）。
+      const removed = collectRemovedUuids(msgs)
+      if (removed.length > 0) useChatStore.getState().markSnipped(sid, removed)
       const cur = traceViewStateRef.current
       // 已离场（切走 tab）或已切会话 → 丢弃响应，绝不写回 state。
       if (cur.view !== 'trace' || cur.sid !== sid) return
@@ -1360,10 +1370,18 @@ function App() {
   }, [])
 
   // ---- 内置命令执行：统一走 executeBuiltin，成功/失败均显式反馈（fail loud）----
-  const runBuiltin = useCallback(async (name: string) => {
+  // [P2-8] args：`/compact 用中文总结` 这类带参内置命令的尾部文本（命令名之后的全部内容）。
+  //   后端 /compact 字面端点以 {args} 请求体接收并透传为 customInstructions（CC compact.ts:54），
+  //   有指令时跳过 SM 优先直压（compact.ts:44-48）。不带 args → 裸 "/compact" 语义不变。
+  const runBuiltin = useCallback(async (name: string, args?: string) => {
     try {
       // 透传 activeSessionId：/clear 等会话级内置命令的后端清理链读 MDC 会话，不带则 no-op（finding-2）
-      await commandApi.executeBuiltin(name, undefined, activeSessionId ?? undefined)
+      // 透传 args：/compact 自定义指令（后端 CompactExecuteRequest{args}）；其余命令忽略该字段
+      await commandApi.executeBuiltin(
+        name,
+        args ? { args } : undefined,
+        activeSessionId ?? undefined,
+      )
       // [P3-b 前端配合 · 压缩归零] /compact 成功落库后重拉本会话消息：压缩替换了消息链，前端本地仍是
       //   压缩前的消息（含旧 assistant 的上下文快照）→ 「已用/窗口」停在压缩前的大值。重拉走
       //   GET /messages/page（DB 权威），后端 MessageService.applyContextSnapshotToLastAssistant 只在
@@ -1427,7 +1445,11 @@ function App() {
         return
       }
       if (isKnownCommand(name)) {
-        void runBuiltin(name)
+        // [P2-8] 透传命令名之后的尾部文本为 args（`/compact 用中文总结` → args='用中文总结'）。
+        //   旧实现只取 name 并清空输入框 → /compact 的自定义指令在入站即被丢弃（后端 args 恒空
+        //   → 永远落 SM 优先分支，走不到 CC 的带指令直压路径 compact.ts:44-48）。其余内置命令
+        //   不解 args（后端忽略多余字段）。
+        void runBuiltin(name, text.slice(1 + name.length).trim())
         setComposerText('')
         return
       }

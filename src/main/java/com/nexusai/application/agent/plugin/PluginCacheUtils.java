@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.plugin;
 
+import com.nexusai.application.agent.skill.SkillListingSentRegistry;
 import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.application.agent.subagent.loadAgentsDir;
 import com.nexusai.application.agent.tool.impl.SkillToolPrompt;
@@ -29,8 +30,13 @@ import org.springframework.stereotype.Component;
  *       loadAgentsDir.ts:395 等价，agent 定义 memoize 失效）</li>
  *   <li>clearPromptCache → {@link SkillToolPrompt#clearPromptCache()}（cacheUtils.ts:48，
  *       prompt.ts:217-219 等价）</li>
- *   <li>clearAllOutputStylesCache → {@code OutputStyleDirLoader.clearOutputStyleCaches()} /
- *       resetSentSkillNames → 无生产实例/agent-session 作用域，登记 open-decisions（MPL7 downgrade）</li>
+ *   <li>clearAllOutputStylesCache → {@code OutputStyleDirLoader.clearOutputStyleCaches()}（未接线项，保留）</li>
+ *   <li>resetSentSkillNames → {@link SkillListingSentRegistry#resetSentAllSessions()}
+ *       （attachments.ts:2681-2685 {@code sentSkillNames.clear() + suppressNext=false}）。
+ *       <b>[P2-22 · 2026-09-11 纠偏]</b>本条此前写「无生产实例/agent-session 作用域，登记 open-decisions
+ *       （MPL7 downgrade）」—— 该理由<b>已失效</b>：{@code SkillListingSentRegistry}（进程级会话键控表）
+ *       就是 CC {@code sentSkillNames} 的生产对应物，其 {@code resetSentAllSessions()} 即 CC reset 的
+ *       faithful 翻译（清各槽 sent、保留 INITIALIZED = {@code suppressNext===false}，见该表 javadoc）。</li>
  * </ul>
  *
  * <p>WHY（规则三）：CC 用函数调用做级联清空（cacheUtils.ts:44-50）；Java 用本类聚合，
@@ -101,8 +107,10 @@ public class PluginCacheUtils {
      * [MPL7] clearAllCaches · 对齐 CC cacheUtils.ts:44-50 级联清空。
      *
      * <p>clearAllPluginCaches + clearCommandsCache（SkillRegistry.refresh）+
-     * clearAgentDefinitionsCache（loadAgentsDir.clearCache）+ clearPromptCache（SkillToolPrompt.clearPromptCache）。
-     * 全量级联后：插件卸载/禁用 → feed 重枚举 + hooks prune + 命令/agent/prompt 缓存失效，下次查询全新鲜。
+     * clearAgentDefinitionsCache（loadAgentsDir.clearCache）+ clearPromptCache（SkillToolPrompt.clearPromptCache）
+     * + resetSentSkillNames（SkillListingSentRegistry.resetSentAllSessions，<b>末位</b>，对齐 CC cacheUtils.ts:49）。
+     * 全量级联后：插件卸载/禁用 → feed 重枚举 + hooks prune + 命令/agent/prompt 缓存失效 + skill_listing
+     * 去重态清零（下次 decide 因各槽 sent 空 → isInitial=true → 整份重发），下次查询全新鲜。
      *
      * <p>未注入 SkillRegistry → clearCommandsCache 项 no-op（直构/测试兼容），其余级联仍执行。
      */
@@ -127,8 +135,16 @@ public class PluginCacheUtils {
         }
         // CC cacheUtils.ts:48 clearPromptCache → SkillToolPrompt.clearPromptCache（prompt.ts:217-219）
         SkillToolPrompt.clearPromptCache();
+        // [P2-22 · 2026-09-11] CC cacheUtils.ts:49 resetSentSkillNames() → 清 skill_listing 去重态。
+        //   末位次序对齐 CC（cacheUtils.ts:44-50 的最后一个语句）。WHY：插件启用/禁用/升级后技能候选集
+        //   发生变化，CC 借此让下一次 attachment pass 因 sent 空而 isInitial=true → 整份重发；
+        //   我们此前缺这一步 → 只走增量分支（新增技能名能发，但整份重发语义缺失）。
+        //   生产实例 = 静态表 SkillListingSentRegistry（无 bean 可注入，直呼静态方法）；
+        //   清各槽 sent + CLEARED，保留 INITIALIZED（= CC suppressNext===false）→ 各会话走「已初始化 +
+        //   sent 空」增量分支 = 全量重发（SkillListingSentRegistry.resetSentAllSessions javadoc）。
+        SkillListingSentRegistry.resetSentAllSessions();
         if (log.isDebugEnabled()) {
-            log.debug("[MPL7] clearAllCaches: 级联清空完成 (对齐 CC cacheUtils.ts:44-50)");
+            log.debug("[MPL7] clearAllCaches: 级联清空完成 (对齐 CC cacheUtils.ts:44-50，含末位 resetSentSkillNames)");
         }
     }
 }

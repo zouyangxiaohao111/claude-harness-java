@@ -5,6 +5,8 @@ import com.nexusai.application.agent.api.PromptSuggestion;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.hook.CollapseHookSummaries;
+import com.nexusai.application.agent.loop.AgentLoopContext;
+import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.memory.AutoDreamConsolidator;
 import com.nexusai.application.agent.memory.ExtractMemoriesAgent;
 import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
@@ -30,8 +32,11 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 
+import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -470,6 +475,94 @@ class StopHooksPipelineTest {
             null, 1, List.of("echo b"), List.of(), true, true, 300L));
         assertThat(state.stopHookSummaries()).hasSize(2);
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [P2-15] AgentState.stopHookSummaries 本地暂存通道 → /topic/tasks 出站（前端可见）
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[P2-15] stop_hook_summary 出站 → /topic/tasks snake_case wire（CC messages.ts:4838-4866 契约）")
+    void stopHookSummaryEmit_serializesSnakeCaseWire() throws Exception {
+        // WHY（规则九 · 验证意图）: 缺陷 P2-15 = 该摘要只落 AgentState 本地暂存（@JsonIgnore）
+        //   → 永不进 STOMP/DB/UI，用户看不到 Stop hook 摘要；而 CC 把它 yield 进消息流
+        //   （stopHooks.ts:309-318 → transcript 可读）。本测试钉住两件事：
+        //   ① 出站确实发生（convertAndSend /topic/tasks）；② wire 字段是 CC 契约的 snake_case
+        //   （hook_count/hook_errors/prevented_continuation/stop_reason/hook_label）——若有人把它
+        //   改成 camelCase 或丢掉错误列表，前端摘要行会静默退化成「Ran N stop hooks」且永不显示错误。
+        SimpMessagingTemplate wsTemplate = Mockito.mock(SimpMessagingTemplate.class);
+        AgentState state = new AgentState("sys", "sess-p215", null);
+        // Stop/SubagentStop 生产形态：hookLabel=null（LlmAgentLoop :7883/:8189 8 参构造）
+        CollapseHookSummaries.HookMessage summary = new CollapseHookSummaries.SimpleHookMsg(
+            null, 2, List.of("echo a", "echo b"), List.of("exit code 2"), true, true, null,
+            "Stop hook prevented continuation");
+
+        invokeStopHookSummaryEmit(wsTemplate, state, summary);
+
+        ArgumentCaptor<Object> payloadCaptor = ArgumentCaptor.forClass(Object.class);
+        Mockito.verify(wsTemplate).convertAndSend(eq("/topic/tasks"), payloadCaptor.capture());
+        com.fasterxml.jackson.databind.node.ObjectNode node =
+            (com.fasterxml.jackson.databind.node.ObjectNode) payloadCaptor.getValue();
+        assertThat(node.get("type").asText()).isEqualTo("system");
+        assertThat(node.get("subtype").asText()).isEqualTo("stop_hook_summary");
+        assertThat(node.get("hook_count").asInt()).isEqualTo(2);
+        assertThat(node.get("hook_errors").size())
+            .as("hook_errors 必须原样出站（前端「Ran N stop hooks」+ 错误行的可见性判据）")
+            .isEqualTo(1);
+        assertThat(node.get("hook_infos").size()).isEqualTo(2);
+        assertThat(node.get("prevented_continuation").asBoolean()).isTrue();
+        assertThat(node.get("stop_reason").asText()).isEqualTo("Stop hook prevented continuation");
+        assertThat(node.get("hook_label").isNull())
+            .as("Stop 生产形态 hookLabel=null → wire 显式 null（前端据此判「非 label 摘要」）")
+            .isTrue();
+        assertThat(node.get("session_id").asText()).isEqualTo("sess-p215");
+        assertThat(node.get("uuid").asText()).isNotBlank();
+    }
+
+    @Test
+    @DisplayName("[P2-15] wsTemplate=null（非流式会话）→ 静默跳过，不抛异常")
+    void stopHookSummaryEmit_noWsTemplate_skips() throws Exception {
+        // WHY: 对齐 CC「仅 streaming/headless 消费 SDK 消息」——非流式会话没有出站通道，
+        //   若不拦，Stop hook 结束后会因 NPE 打断 turn 收尾（fail loud 变成 fail broken）。
+        SimpMessagingTemplate wsTemplate = Mockito.mock(SimpMessagingTemplate.class);
+        AgentState state = new AgentState("sys", "sess-p215-null", null);
+        CollapseHookSummaries.HookMessage summary = new CollapseHookSummaries.SimpleHookMsg(
+            null, 1, List.of("echo a"), List.of(), false, true, null);
+
+        AgentLoopContext ctx = com.nexusai.application.agent.TestContexts.agentLoopContext(
+            null, null, null, null, null,
+            (AgentLoopContext.ToolExecutionBeans) null,
+            (com.nexusai.application.agent.permission.hook.HookRegistry) null);
+        assertThat(ctx.wsTemplate()).as("前置：TestContexts 重载默认 wsTemplate=null").isNull();
+
+        invokeStopHookSummaryEmit(ctx, state, summary); // 不得抛异常
+
+        Mockito.verify(wsTemplate, Mockito.never())
+            .convertAndSend(Mockito.anyString(), Mockito.any(Object.class));
+    }
+
+    /** [P2-15] 反射调用私有出站方法（32 参 compat ctor 注入 wsTemplate · record 组件 final 不可改写）。 */
+    private static void invokeStopHookSummaryEmit(SimpMessagingTemplate wsTemplate,
+                                                  AgentState state,
+                                                  CollapseHookSummaries.HookMessage summary) throws Exception {
+        AgentLoopContext ctx = new AgentLoopContext(
+            null, null, null, null, null, null, null, null, null,
+            null, null, null, null, null, null, wsTemplate, "/topic/tasks",
+            null, null, FeatureFlags.ALL_DISABLED, null, null, null, null,
+            null, null, null, null, null, null, null, null);
+        invokeStopHookSummaryEmit(ctx, state, summary);
+    }
+
+    /** [P2-15] 反射调用私有出站方法（给定 ctx）。 */
+    private static void invokeStopHookSummaryEmit(AgentLoopContext ctx,
+                                                  AgentState state,
+                                                  CollapseHookSummaries.HookMessage summary) throws Exception {
+        Method m = LlmAgentLoop.class.getDeclaredMethod(
+            "emitStopHookSummarySdkMessage", AgentLoopContext.class, AgentState.class,
+            CollapseHookSummaries.HookMessage.class);
+        m.setAccessible(true);
+        m.invoke(null, ctx, state, summary);
+    }
+
 
     @Test
     @DisplayName("TaskUpdateTool TaskCompleted hook 从 ctx 拿真实 permissionMode/abortController（非死 null）")

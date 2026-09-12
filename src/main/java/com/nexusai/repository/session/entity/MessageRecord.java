@@ -217,6 +217,13 @@ public class MessageRecord {
      *
      * <p>V70 落库为 {@code is_visible_in_transcript_only} 列（同 V51 is_meta 范式）。写侧摘要 user 消息
      * （compact 无 kept 段时 CC 走该标志）经 MessageService 落库；读侧 toDto 回填。null/旧行 = false。
+     *
+     * <p><b>[P2-20 ① 2026-09-12 权威澄清]</b> 迁移文件 {@code V70__messages_seq_and_transcript_flags.sql:26}
+     * 的列注释写作「仅 transcript 可见（<b>不进模型上下文</b>）」—— <b>该括号注释是错的</b>（与 CC 实际
+     * TS 行为不符）。CC 真源：本标志唯一用途是 UI/transcript 展示过滤
+     * （{@code shouldShowUserMessage}，messages.ts:5115）+ SDK {@code isSynthetic} 标记，
+     * <b>从不参与模型请求裁剪</b>。V70 因 Flyway checksum 约束一个字都不能改（见 V71:4-9 记录），
+     * 故以本 JavaDoc 为准 —— 后来者请勿据 V70 那句反推模型面行为。
      */
     private Boolean isVisibleInTranscriptOnly;
 

@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.compact;
 
+import com.nexusai.application.agent.attachment.AttachmentMessageDto;
 import com.nexusai.application.agent.permission.hook.CommandHook;
 import com.nexusai.application.agent.permission.hook.GenericHook;
 import com.nexusai.application.agent.permission.hook.HookEvent;
@@ -264,12 +265,52 @@ public final class CompactHooks {
 
     // ── 提取小工具 ──
 
-    /** hook 输出文本（HookResult.message，trim；null → 空串）。 */
+    /**
+     * hook 输出文本 · 对齐 CC {@code HookOutsideReplResult.output}
+     * （utils/hooks.ts:3476-3480 {@code result.status === 0 ? result.stdout : result.stderr}）。
+     *
+     * <p><b>[P1-6 修复] WHY 取 attachment 的 stdout/stderr 而非 {@code message().toString()}</b>：
+     * CC 的 {@code output} 是 <b>hook 进程的文本输出</b> —— command hook 成功取 stdout、失败取 stderr
+     * （utils/hooks.ts:3476-3480），HTTP hook 取 body（:3390-3400）。CompactHooks 三个消费点
+     * （PreCompact newCustomInstructions / SessionStart hook 消息 / PostCompact userDisplayMessage）
+     * 在 CC 都派生自该文本。Java 的等价文本落在 {@link AttachmentMessageDto} 的
+     * {@code stdout}/{@code stderr}（CommandHookExecutor 逐字段对齐 CC 3800 行）；
+     * 旧实现取 {@code message().toString()} → 结构化 DTO 的 toString 被当成 hook 输出
+     * （DB 实证：{@code content=AttachmentMessageDto[id=8f85a058-…, messageType=attachment, type=hook_success,
+     * stdout={"hookSpecificOutput":{…}} 整串进模型上下文，每次 compact 3 条）。
+     *
+     * <p><b>回落 {@code content}</b>：无 stdout/stderr 的 attachment 两类 ——
+     * ① JSON 输出的 hook_success（CC suppressOutput 分支 content 承载，stdout 仅原始 JSON）；
+     * ② hook_blocking_error（Java 该工厂不填 stdout/stderr，仅 content=blockingError 文本）。
+     *
+     * @param result hook 结果（null → 空串）
+     * @return hook 输出文本（trim 后；无输出 → 空串）
+     */
     private static String outputOf(GenericHook.HookResult result) {
-        if (result == null || result.message() == null) {
+        if (result == null) {
             return "";
         }
-        return result.message().toString().trim();
+        Object message = result.message();
+        if (message instanceof AttachmentMessageDto att) {
+            String text = result.outcome() == GenericHook.HookOutcome.SUCCESS
+                ? att.stdout() : att.stderr();
+            if (text == null || text.isEmpty()) {
+                text = att.content();
+            }
+            return text == null ? "" : text.trim();
+        }
+        if (message instanceof String s) {
+            return s.trim();
+        }
+        if (message != null) {
+            // 非 attachment 非 String：无 CC 对应物（CC result.message 恒为消息对象，utils/hooks.ts:338-357）
+            //   → fail-loud，绝不把结构化对象 toString 后当 hook 输出（本项修复的根因）。
+            if (log.isWarnEnabled()) {
+                log.warn("[CompactHooks] hook 结果 message 类型无 CC 对应物（{}）→ 输出按空处理"
+                    + "（不再 toString 结构化对象）", message.getClass().getName());
+            }
+        }
+        return "";
     }
 
     /** hook 命令串（CommandHook.command；非 CommandHook / null → '?'）。 */

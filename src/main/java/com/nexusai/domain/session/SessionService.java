@@ -263,6 +263,25 @@ public class SessionService {
             log.warn("[SessionService] delete: SkillListingSentRegistry.removeSessionEntries 失败 session={}: {}",
                 id, e.toString());
         }
+        // [P2-11 · 2026-09-11] 会话删除 → 释放该会话 SessionStart「冷启动」判据键（防进程内无界增长）。
+        //   本表全仓唯一移除点此前只有 /clear（CommandController:448）→ 会话被删除时键永驻，
+        //   长跑 JVM 下随「删过的会话数」累积（本表是 ConcurrentHashMap<String,Boolean> 进程级静态表）。
+        //   对齐说明：CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无对应动作
+        //   （sessionStart.ts 无 delete 清理）；Java 常驻 JVM 必须显式回收，与上面 4 个注册表同一口径。
+        //   用 remove 而非新增「纯清理」变体：本表无 CLEARED 类「待消费标记」，remove 自身即纯删除，
+        //   不会留下永不被消费的残留（与 SessionStartSeenRegistry 语义一致，见其 javadoc）。
+        //   best-effort：本类是 final + 私有构造的静态工具表（非 Spring bean，无实例可注入），故直呼
+        //   静态方法不套 null 守卫；null/未知 key → remove no-op，不阻塞删除主流程。
+        try {
+            com.nexusai.application.agent.SessionStartSeenRegistry.remove(id);
+            if (log.isDebugEnabled()) {
+                log.debug("[SessionService] delete: SessionStartSeenRegistry.remove session={}（防进程内键泄漏，P2-11）",
+                    id);
+            }
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: SessionStartSeenRegistry.remove 失败 session={}: {}",
+                id, e.toString());
+        }
         // [skill-listing-cc-align 2026-09-10] 会话删除 → 移除该会话主 AgentState 映射（sessions + agents 双桶）。
         //   对齐说明：CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无对应动作；
         //   Java 常驻 JVM 必须显式移除，否则每个「跑过又不再跑」的会话都会留一个陈旧 AgentState

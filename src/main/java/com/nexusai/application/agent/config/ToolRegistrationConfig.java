@@ -1718,7 +1718,7 @@ public class ToolRegistrationConfig {
      *
      * <p><b>为什么专用 loop 而非 LlmAgentLoop.queryLoop（INV-6 破坏风险）</b>: 主循环权限消费点
      * 在内层 StreamingToolExecutor（继承主线程 permissionGate），QueryParams.canUseTool 无消费点
-     * （H9-GAP-4，QueryParams.java:45 已删）——直接复用会让 fork 继承主线程权限，破坏 INV-6 的
+     * （H9-GAP-4，QueryParams.java:58-62 已删）——直接复用会让 fork 继承主线程权限，破坏 INV-6 的
      * 受限 canUseTool（Read/Grep/Glob + 只读 Bash + auto-memory 目录内 Edit/Write）。本 bean
      * 经 {@code HookPermissionResolver.resolve(canUseTool)} 直接消费受限 canUseTool。
      *

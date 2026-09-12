@@ -1821,11 +1821,32 @@ public class AgentState {
     }
 
     /**
+     * 压缩落库通道是否已武装（{@link #compactPersistListener} 非 null）。
+     *
+     * <p><b>WHY 需要它（P2-17 · 2026-09-11）</b>：{@link #persistCompactedMessages} 未武装时
+     * <b>原样返回入参</b>（根本没落库）—— 调用方若不加判别就宣称「已落库」即假成功。与
+     * {@link #isAppendPersistenceArmed()} 同性质，但二者是<b>不同通道</b>：子代理
+     * （{@code SubagentExecutor}）只武装 {@code appendListener}（子代理消息不落主库），
+     * <b>不</b>武装 {@code compactPersistListener} → 不可用 {@code isAppendPersistenceArmed()} 代替本判据
+     * （会把子代理的「未落库」误判为已落库）。
+     *
+     * @return true = {@link #setCompactPersistListener} 已武装（compact 结果 append-only 落库）
+     */
+    public boolean isCompactPersistArmed() {
+        return this.compactPersistListener != null;
+    }
+
+    /**
      * 压缩结果落库 · 对齐 CC transcript append-only（compact 后 DB 追加 boundary/summary + 重挂 kept 段）。
      *
      * <p>已武装 → 经监听器 append-only 落库并返回归一化列表（调用方据此替换内存，保证 memory 与 DB id
      * 一致）；未武装 / 入参 null → 原样返回（fork 子 agent、非 Spring 单测零行为变化）。异常不吞：由调用方
      * （LlmAgentLoop.persistCompactedMessages）fail-loud（log.error）兜底替换内存。
+     *
+     * <p><b>[P2-17 · 2026-09-11] 未武装路径的调用方义务</b>：本方法「原样返回」不代表落库成功——
+     * 调用方必须先以 {@link #isAppendPersistenceArmed()}（或 {@link #persistCompactedMessages} 的
+     * 落库结果）判别，未武装时按显式失败处理，不得宣称「已落库」（旧 LlmAgentLoop 该处无条件
+     * log.info 即此类假成功，已修）。
      *
      * @param postCompactMessages compact 后消息集（boundary + summary + kept + attachments + hooks）
      * @return 落库归一化后的消息集；未武装 → 原入参

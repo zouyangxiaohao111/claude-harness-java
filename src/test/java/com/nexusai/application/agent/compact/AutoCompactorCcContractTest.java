@@ -52,7 +52,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
-        assertThat(auto.shouldAutoCompact(big, "session_memory", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "session_memory", 0)).isFalse();
     }
 
     @Test
@@ -61,7 +61,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
-        assertThat(auto.shouldAutoCompact(big, "compact", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "compact", 0)).isFalse();
     }
 
     @Test
@@ -71,10 +71,10 @@ class AutoCompactorCcContractTest {
         List<ChatMessageDto> big = largeMessages(50);
 
         // 未启用 CONTEXT_COLLAPSE 时 marble_origami 不守卫（autoCompact.ts:179 feature 门控）
-        assertThat(auto.shouldAutoCompact(big, "marble_origami", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(big, null, "marble_origami", 0)).isTrue();
         // 启用后守卫
         auto.setContextCollapseEnabled(true);
-        assertThat(auto.shouldAutoCompact(big, "marble_origami", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "marble_origami", 0)).isFalse();
     }
 
     @Test
@@ -83,7 +83,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
-        assertThat(auto.shouldAutoCompact(big, "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(big, null, "user", 0)).isTrue();
     }
 
     @Test
@@ -93,15 +93,15 @@ class AutoCompactorCcContractTest {
         List<ChatMessageDto> big = largeMessages(50);
 
         // 生产 LlmAgentLoop 传 querySource().name() 大写枚举名 → canonical 归一后守卫命中
-        assertThat(auto.shouldAutoCompact(big, "SESSION_MEMORY", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "SESSION_MEMORY", 0))
             .as("生产大写 SESSION_MEMORY 必须命中递归守卫（fork 死锁防护）").isFalse();
-        assertThat(auto.shouldAutoCompact(big, "COMPACT", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "COMPACT", 0))
             .as("生产大写 COMPACT 必须命中递归守卫").isFalse();
         auto.setContextCollapseEnabled(true);
-        assertThat(auto.shouldAutoCompact(big, "MARBLE_ORIGAMI", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "MARBLE_ORIGAMI", 0))
             .as("生产大写 MARBLE_ORIGAMI + CONTEXT_COLLAPSE 必须命中 ctx-agent 守卫（autoCompact.ts:179-183）").isFalse();
         // 对照：USER 大写（主线程）超阈不受守卫 → true
-        assertThat(auto.shouldAutoCompact(big, "USER", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "USER", 0))
             .as("生产大写 USER（主线程）不受守卫，阈值真实生效").isTrue();
     }
 
@@ -115,22 +115,22 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
-        assertThat(auto.shouldAutoCompact(big, "agent:subagent", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "agent:subagent", 0))
             .as("SUBAGENT canonical（agent:subagent）超阈不受守卫").isTrue();
-        assertThat(auto.shouldAutoCompact(big, "agent:builtin:fork", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "agent:builtin:fork", 0))
             .as("FORK canonical（agent:builtin:fork）超阈不受守卫").isTrue();
-        assertThat(auto.shouldAutoCompact(big, "SUBAGENT", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "SUBAGENT", 0))
             .as("生产大写 SUBAGENT 归一后仍非守卫源，超阈照常").isTrue();
-        assertThat(auto.shouldAutoCompact(big, "FORK", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "FORK", 0))
             .as("生产大写 FORK 归一后仍非守卫源，超阈照常").isTrue();
         // [IMP2-05 精确化后] 运行时 querySource 从聚合占位升级为 agentType 级精确值
         //   （agent:builtin:<type>/agent:custom/agent:default，promptCategory.ts:16-28）。
         //   递归守卫值域不变（仅 session_memory/compact/marble_origami），精确值必须保持非守卫。
-        assertThat(auto.shouldAutoCompact(big, "agent:builtin:Explore", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "agent:builtin:Explore", 0))
             .as("[IMP2-05] 内置 Explore 精确值超阈不受守卫").isTrue();
-        assertThat(auto.shouldAutoCompact(big, "agent:custom", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "agent:custom", 0))
             .as("[IMP2-05] 自定义 agent 精确值超阈不受守卫").isTrue();
-        assertThat(auto.shouldAutoCompact(big, "agent:default", 0))
+        assertThat(auto.shouldAutoCompact(big, null, "agent:default", 0))
             .as("[IMP2-05] 默认 agent 精确值超阈不受守卫").isTrue();
     }
 
@@ -203,7 +203,7 @@ class AutoCompactorCcContractTest {
         auto.setEnvProvider(key -> "DISABLE_COMPACT".equals(key) ? "true" : null);
 
         assertThat(auto.isAutoCompactEnabled()).isFalse();
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isFalse();
         assertThat(auto.tryAutoCompact(largeMessages(50)).wasCompacted()).isFalse();
     }
 
@@ -458,7 +458,7 @@ class AutoCompactorCcContractTest {
         auto.setReactiveOnlyMode(true);
 
         // 超阈但 reactive-only 模式开启 → 抑制主动 autocompact（reactive compact 承接 413）
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isFalse();
     }
 
     @Test
@@ -467,7 +467,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         auto.setReactiveCompactEnabled(true);
         // tengu_cobalt_raccoon 缺省 false → growthbook 未配置时自动压缩仍活跃
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
     }
 
     @Test
@@ -476,7 +476,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         auto.setReactiveOnlyMode(true);
         // REACTIVE_COMPACT feature 关闭 → 抑制不生效
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
     }
 
     @Test
@@ -487,7 +487,7 @@ class AutoCompactorCcContractTest {
         auto.setContextCollapseModeEnabled(true);
 
         // 超阈但 context-collapse 模式开启 → 抑制主动 autocompact（collapse 拥有 headroom）
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isFalse();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isFalse();
     }
 
     @Test
@@ -496,7 +496,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         auto.setContextCollapseEnabled(true);
         // isContextCollapseEnabled()=false → collapse 未运行时自动压缩仍活跃
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
     }
 
     @Test
@@ -505,7 +505,7 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
         auto.setContextCollapseModeEnabled(true);
         // CONTEXT_COLLAPSE feature 关闭 → 抑制不生效
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0)).isTrue();
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
     }
 
     @Test
@@ -573,7 +573,8 @@ class AutoCompactorCcContractTest {
         assertThat(auto.getTracking().getTurnId())
             .as("压缩成功必须轮换 turnId（DRIFT-4/S-6）").isNotEqualTo(preCompactTurnId);
         // autoCompactThreshold ← getAutoCompactThreshold(model)（autoCompact.ts:283）
-        assertThat(auto.getAutoCompactThreshold()).isPositive();
+        // [P2-7] model 现为显式入参（调用内局部变量）；本路径 ccContext=null → model=null → 默认窗
+        assertThat(auto.getAutoCompactThreshold(null)).isPositive();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -695,8 +696,9 @@ class AutoCompactorCcContractTest {
         assertThat(rBig.wasCompacted())
             .as("G-2: ccContext 有效模型 big-model（200k 窗）→ 阈值高 → 100k 未达阈不应压缩")
             .isFalse();
-        // model 已从 ccContext 注入 → getAutoCompactThreshold 反映 big-model 窗（200k-20k-13k ≥ 167k）
-        assertThat(auto.getAutoCompactThreshold())
+        // [P2-7] model 现为调用内局部变量（不落实例字段）→ 阈值按调用方显式传入的模型求值。
+        //   「ccContext 有效模型确实被本调用消费」由上方 wasCompacted 断言承载（big-model 高阈值 → 不压）。
+        assertThat(auto.getAutoCompactThreshold("big-model"))
             .as("G-2: getAutoCompactThreshold 必须吃 ccContext 有效模型 big-model（非原始 modelName 默认窗）")
             .isGreaterThan(150_000);
 
@@ -719,7 +721,7 @@ class AutoCompactorCcContractTest {
         assertThat(rSmall.wasCompacted())
             .as("G-2: small-model 显式 50k 窗按配置值生效（不再被 100k 能力门抬成 200k）→ 阈值低 → 100k 必须压缩")
             .isTrue();
-        assertThat(auto.getAutoCompactThreshold())
+        assertThat(auto.getAutoCompactThreshold("small-model"))
             .as("G-2: small-model 阈值随 50k 配置窗派生（≈50000−20000−13000），远低于 200k 窗的高阈值")
             .isLessThan(50_000);
     }
@@ -735,11 +737,50 @@ class AutoCompactorCcContractTest {
 
         AutoCompactor.AutoCompactResult r = auto.autoCompactIfNeeded(
             largeMessages(20), 0, "user", new CompactConversationContext());
-        // ccContext.model=null → AutoCompactor.model 保持 null → 默认窗 200k → 10k 未达阈 → 不压缩
+        // ccContext.model=null → 本调用 model=null → 默认窗 200k → 10k 未达阈 → 不压缩
         assertThat(r.wasCompacted()).isFalse();
-        assertThat(auto.getAutoCompactThreshold())
+        assertThat(auto.getAutoCompactThreshold(null))
             .as("G-2: ccContext.model=null 必须回落默认窗（200k → 阈值≥167k，不 NPE）")
             .isGreaterThan(150_000);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // P2-7 · model 跨会话串台（单例 bean 实例字段 → 调用内局部变量）
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("P2-7: 上一调用的 model 不得泄漏到 model=null 的下一调用（跨会话串台）")
+    void p27_staleModelDoesNotLeakIntoNextCall() {
+        // WHY（规则九 · 验证意图）：AutoCompactor 是 Spring 单例 bean，多会话并发共享同一实例。
+        //   model 决定阈值所用的窗口（200k 默认 vs 用户显式配置的 50k 差 ≈10 倍），若它是实例字段，
+        //   ccContext.getModel()==null 的调用会继承上一会话的 model：
+        //     · 上一会话 = small-model（50k 窗，阈值 ≈17k）→ 下一会话 model=null（默认 200k 窗，
+        //       阈值 ≈167k）会误用 17k → 10 万 token 的会话被过早压缩（本测试断言的方向）；
+        //     · 反向（大→小）则「该压的不压」→ 撞 413。
+        //   CC autoCompact.ts:267 `const model = toolUseContext.options.mainLoopModel` 是调用内
+        //   局部变量，从不跨调用保留 → 本测试即该语义的回归锁。
+        CompactThresholdSystem ts = new CompactThresholdSystem(null);
+        ts.setModelContextWindowResolver(model -> "small-model".equals(model) ? 50_000 : 200_000);
+        AutoCompactor auto = new AutoCompactor(msgs -> 100_000,
+            (p, m) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
+        auto.setThresholdSystem(ts);
+        List<ChatMessageDto> msgs = largeMessages(50);
+
+        // ① 有效模型 = small-model（50k 窗 → 阈值 ≈17k）→ 100k 超阈 → 压缩
+        CompactConversationContext smallCtx = new CompactConversationContext()
+            .setModel("small-model").setQuerySource("user")
+            .setReadFileState(new java.util.LinkedHashMap<>())
+            .setNotifyCompaction(() -> { });
+        assertThat(auto.autoCompactIfNeeded(msgs, 0, "user", smallCtx).wasCompacted())
+            .as("P2-7 前置：small-model 阈值低 → 100k 必须压缩")
+            .isTrue();
+
+        // ② 紧随其后、ccContext 不带模型（= 另一会话/未接线场景）→ 必须按默认 200k 窗判定
+        //    （阈值 ≈167k）→ 100k 未达阈 → 不压缩。
+        //    实例字段实现下此处会继承 ① 的 small-model → 阈值 ≈17k → 误压（本断言即抓该回归）。
+        assertThat(auto.autoCompactIfNeeded(msgs, 0, "user", new CompactConversationContext()).wasCompacted())
+            .as("P2-7: model=null 的调用必须按默认窗判定，不得继承上一调用的 small-model（否则过早压缩）")
+            .isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -1976,8 +1976,12 @@ public class SubagentExecutor {
             //   （getSubagentLogName → subagent_name / getAgentContext → parent_agent_id）可归因到该子 agent。
             //   异步边界：executeStreaming 同步运行（sync 在工具线程 / async 在 asyncWorker 线程），
             //   runWithAgentContext 的 ThreadLocal set/remove 与 query loop 同线程（S-15 跨线程不串台）。
-            String invocationKind = (forkParams != null && forkParams.resumedMessages() != null)
-                ? "resume" : "spawn";
+            // [P2-23 · 2026-09-11] resume 判据提升为局部变量（原只用于 analytics invocationKind）：
+            //   同一判据同时驱动子代理 skill_listing 的续跑语义（透传 queryLoop skillListingResume）。
+            //   resume = 复用原 agentId 续写 transcript（resumeAgent.ts:166-171 promptMessages =
+            //   [...resumedMessages, ...]）——该 agentKey 在本进程已发过一次清单。
+            final boolean subagentResume = forkParams != null && forkParams.resumedMessages() != null;
+            String invocationKind = subagentResume ? "resume" : "spawn";
             // lambda 捕获需 effectively final：subagentCtx（Step 18 rebuild）/ agentDefinition（Step 1
             //   effort merge）均被重赋值，取 final 引用供 runWithAgentContext 包裹体使用。
             final ToolUseContext ctxForLoop = subagentCtx;
@@ -2000,7 +2004,9 @@ public class SubagentExecutor {
                     //   经 ForkPathParams 直带, null → loop 默认 create（非 resume / 父 live state 不可得）
                     forkParams != null ? forkParams.contentReplacementState() : null,
                     // [D-6] progressTracker 逐 assistant message 累积接入（CC updateProgressFromMessage）
-                    progressTracker);
+                    progressTracker,
+                    // [P2-23] 子代理 resume 判据 → skill_listing 续跑语义（见 runSubagentQueryLoop 尾参 javadoc）
+                    subagentResume);
                 return innerResult;
             });
         } finally {
@@ -3880,6 +3886,14 @@ public class SubagentExecutor {
      *   <li>工具隔离：base TUC {@code withAvailableTools(effectiveTools)}（对齐 CC runAgent 工具隔离）</li>
      *   <li>state 构造：{@code new AgentState(systemPrompt, sessionId, agentId)} + appendMessage</li>
      * </ul>
+     *
+     * @param skillListingResume [P2-23 · 2026-09-11] 本子代理 run 是否续跑（= 复用原 agentId 的 resume
+     *                          调用，由调用方经 {@code forkParams.resumedMessages() != null} 判定）·
+     *                          透传 {@link LlmAgentLoop#queryLoop} 的 skill_listing 续跑判据：
+     *                          {@code true} → 不整份重发清单（对齐 CC 同 agentId 的 {@code sent} 非空
+     *                          → {@code newSkills} 空 → 不注入，attachments.ts:2799-2809）；
+     *                          {@code false} → 该 agent 首份整份（CC 新 agentId {@code sent} 空 →
+     *                          isInitial，attachments.ts:2672-2676）。
      */
     private SubagentResult runSubagentQueryLoop(
             ToolUseContext subagentCtx,
@@ -3898,7 +3912,8 @@ public class SubagentExecutor {
             String lastRecordedUuid,
             Consumer<SubagentMessage> messageSink,
             ContentReplacementState contentReplacementState,
-            AgentProgressTracker progressTracker) {
+            AgentProgressTracker progressTracker,
+            boolean skillListingResume) {
 
         UUID agentId = subagentCtx.agentId();
         // [R3-WF-F IMP-SUB-12 返工] transcript/SubagentResult 键还原 a+16hex（S-12 桥），
@@ -4262,7 +4277,13 @@ public class SubagentExecutor {
                         forkQuerySource, exactQuerySource,
                         QuerySource.effectiveValue(queryParams.querySource(), queryParams.querySourceValue()),
                         agentDefinition.agentType());
-                result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids);
+                // [P2-23 · 2026-09-11] skillListingResume 透传（原经 3 参重载硬传 false）：
+                //   子代理 resume（复用原 agentId）→ true → SkillListingSentRegistry.decide 落
+                //   「resume 且未初始化 → 抑制」/「已初始化 → 只发增量」分支，不再清 sent 重发整份
+                //   （对齐 CC：同 agentId 的 sent 非空 → newSkills 空 → 不注入，attachments.ts:2799-2809）。
+                //   全新 spawn → false → 该 agent 首份整份清单（CC 新 agentId sent 空 → isInitial，
+                //   attachments.ts:2672-2676 turn-0 listing 保证不变）。
+                result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids, skillListingResume);
             } catch (Exception e) {
                 log.error("[SubagentExecutor] [H7-arch Phase 2] queryLoop 抛出: {}", e.toString());
                 String fallbackText = extractConclusionFromMessages(state.messages());
@@ -4372,6 +4393,17 @@ public class SubagentExecutor {
             state.clearAppendListener();
             // [P1-6-CLEANUP-1] 子 agent 完成/失败路径释放 invokedSkills (对齐 CC 4 调用方)
             cleanSubagentInvokedSkills(state, agentId);
+            // [P2-12 · 2026-09-11] 子 agent 结束点回收 skill_listing 槽位（防进程内无界增长）。
+            //   子代理每次执行 = 新 agentId（resume 复用 {@code forkParams.agentIdOverride} 场景除外）
+            //   → 每个 (会话, 子代理调用) 在 SkillListingSentRegistry 留一份 Set<技能名>。
+            //   key 口径与注入侧一致（LlmAgentLoop.agentKey(state) = state.agentId().toString()）；
+            //   主线程槽（agentKey=""）不受影响。放 finally 覆盖完成/失败/中断所有出口。
+            try {
+                com.nexusai.application.agent.skill.SkillListingSentRegistry
+                    .removeAgentKey(sessionId, agentId.toString());
+            } catch (Exception e) {
+                log.warn("[SubagentExecutor] 回收 skill_listing 槽失败 agentId={}: {}", agentId, e.getMessage());
+            }
         }
     }
 

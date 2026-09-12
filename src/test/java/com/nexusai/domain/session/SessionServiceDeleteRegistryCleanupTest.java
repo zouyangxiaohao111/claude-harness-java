@@ -2,6 +2,7 @@ package com.nexusai.domain.session;
 
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
+import com.nexusai.application.agent.SessionStartSeenRegistry;
 import com.nexusai.application.agent.skill.SkillListingSentRegistry;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.MessageMapper;
@@ -41,6 +42,7 @@ class SessionServiceDeleteRegistryCleanupTest {
     @AfterEach
     void tearDown() {
         SkillListingSentRegistry.reset();
+        SessionStartSeenRegistry.reset();
     }
 
     private static SessionService newService(String sessionId) {
@@ -76,6 +78,28 @@ class SessionServiceDeleteRegistryCleanupTest {
         // 未置 CLEARED：残留会让同一 key 的下一次 decide 走 /clear 分支整份重发（且永不被消费 → 无界增长）。
         assertThat(SkillListingSentRegistry.decide(id, "", List.of("commit"), true).names())
             .as("删除路径不得残留 CLEARED 类重发意图").isEmpty();
+    }
+
+    @Test
+    @DisplayName("delete → SessionStartSeenRegistry 键回收（P2-11，防常驻 JVM 内键泄漏）")
+    void delete_clearsSessionStartSeenKey() {
+        String id = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        SessionService service = newService(id);
+
+        // 该会话本进程已跑过 SessionStart（冷启动判据落位）
+        assertThat(SessionStartSeenRegistry.markSeen(id))
+            .as("前置：首次 markSeen 必须为冷（true）").isTrue();
+        assertThat(SessionStartSeenRegistry.markSeen(id))
+            .as("前置：同进程第二次 markSeen 必须为热（false）—— 键已驻留").isFalse();
+
+        service.delete(id);
+
+        // WHY 该断言重要：键若不回收，长跑 JVM 下随「删过的会话数」无界累积（本表是进程级静态
+        //   HashMap<String,Boolean>）；审计 P2-11 —— 本表此前全仓唯一移除点只有 /clear，
+        //   会话删除路径独漏。CC 无对应动作（一进程一会话，会话结束即进程退出）。
+        assertThat(SessionStartSeenRegistry.markSeen(id))
+            .as("删除会话必须回收 SessionStart 判据键；删掉 SessionService.delete 里的 "
+                + "SessionStartSeenRegistry.remove(id) 即 RED").isTrue();
     }
 
     @Test

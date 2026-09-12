@@ -46,7 +46,7 @@ import java.util.function.Supplier;
  *
  * <p><b>为什么 fork 不复用 LlmAgentLoop.queryLoop（INV-6 破坏风险）</b>: 主循环的权限消费点
  * 在 StreamingToolExecutor 内层（继承主线程 permissionGate），{@code QueryParams.canUseTool}
- * 无消费点（H9-GAP-4，QueryParams.java:45 已删）——直接复用会让 fork 继承主线程权限，
+ * 无消费点（H9-GAP-4，QueryParams.java:58-62 已删）——直接复用会让 fork 继承主线程权限，
  * 破坏 INV-6 的受限 canUseTool（Read/Grep/Glob + 只读 Bash + auto-memory 目录内 Edit/Write）。
  * 本类专用 loop 直接用 {@link HookPermissionResolver#resolve} 消费调用方传入的
  * {@code canUseTool}，保证 extract/auto-dream 的工具权限受限语义真实生效。

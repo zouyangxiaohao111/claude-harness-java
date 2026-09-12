@@ -109,7 +109,7 @@ class DisableCompactDbPrimaryTest {
 
         assertThat(auto.isAutoCompactEnabled())
             .as("DB true 直接禁用自动压缩（autoCompact.ts:148 一票否决）").isFalse();
-        assertThat(auto.shouldAutoCompact(largeMessages(50), "user", 0))
+        assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0))
             .as("shouldAutoCompact 早退 false（autoCompact.ts:185-187 链）").isFalse();
         assertThat(auto.tryAutoCompact(largeMessages(50)).wasCompacted())
             .as("autoCompactIfNeeded DISABLE_COMPACT 早退（autoCompact.ts:253-255）").isFalse();

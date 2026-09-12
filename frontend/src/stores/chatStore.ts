@@ -1,7 +1,29 @@
 import { create } from 'zustand'
-import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry } from '../api/types'
+import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload } from '../api/types'
 import type { SessionFile } from '../types'
 import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
+
+/**
+ * [snip-persist] 从消息列表解析 snip_boundary 的 {@code snipMetadata.removedUuids}（合并去重）。
+ *
+ * <p>WHY 抽成共享纯函数：该解析原先在 {@link ChatState.setMessages} 与
+ * {@link ChatState.prependMessages} 各写一份（复制粘贴），而第三条通道 ——
+ * {@code App.loadTraceFull} 拿到的<b>全量</b>消息（含全部 boundary）—— 却<b>没有</b>解析 →
+ * 轨迹视图「已裁剪」pill 与聊天区角标在 F5 后恒为空（P2-19 的 F5 缺口）。
+ * 三处收敛到本函数，新增消费点只需调用它。
+ *
+ * @param msgs 任意粒度的消息列表（尾页 / 前页 / 全量）
+ * @returns 被 snip 移除的消息 id（去重；无 boundary 或无 removedUuids → 空数组）
+ */
+export function collectRemovedUuids(msgs: ChatMessageDto[] | null | undefined): string[] {
+  const ids: string[] = []
+  for (const m of msgs ?? []) {
+    if (m.subtype === 'snip_boundary' && m.snipMetadata?.removedUuids?.length) {
+      ids.push(...m.snipMetadata.removedUuids)
+    }
+  }
+  return Array.from(new Set(ids))
+}
 
 // ── [有界窗口] messages[sessionId] 硬顶（治内存：WebView2 renderer 实测涨到 1.2GB）──
 // 根因：原实现 messages 只增不减 —— finalizeBlocks / appendMetaUser / addToolUseSummary /
@@ -204,6 +226,9 @@ export interface ChatState {
   appendMetaUser: (sessionId: string, id: string, content?: string | null, isMeta?: boolean) => void
   /** 实时插入 tool_use_summary 展示行（/topic/tasks 事件 · id 幂等 + userMessageId flow 锚定，防双通道重复） */
   addToolUseSummary: (sessionId: string, row: { id: string; content: string; userMessageId?: string | null }) => void
+  /** [P2-15] 实时插入 Stop hook 摘要行（/topic/tasks 事件 · 元数据型展示行，不落库不进模型）。
+   *  id 幂等；userMessageId flow 锚定同 addToolUseSummary。 */
+  addStopHookSummary: (sessionId: string, row: { id: string; payload: StopHookSummaryPayload; userMessageId?: string | null }) => void
   /** [window-paging] 记录会话是否有更早历史（GET /messages/page hasMore · 顶部「加载更早」按钮显隐） */
   setHasMore: (sessionId: string, hasMore: boolean) => void
   /** [trace-count] 记录会话消息总数（GET /messages/page total · 轨迹 tab 徽标全量） */
@@ -256,12 +281,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   setMessages: (sessionId, msgs) => set((st) => {
     // [snip-persist] F5 兜底：从 GET /messages 返回的 boundary 消息（ChatMessageDto.snipMetadata.removedUuids）
     //   解析被裁剪消息 id → 合并进 snippedIds（与 STOMP message.boundary 实时同集合，Message 组件统一按 id 标注「已裁剪」）
-    const boundaryIds: string[] = []
-    for (const m of msgs ?? []) {
-      if (m.subtype === 'snip_boundary' && m.snipMetadata?.removedUuids?.length) {
-        boundaryIds.push(...m.snipMetadata.removedUuids)
-      }
-    }
+    const boundaryIds = collectRemovedUuids(msgs)
     let snippedIds = st.snippedIds
     if (boundaryIds.length) {
       const merged = Array.from(new Set([...(st.snippedIds[sessionId] ?? []), ...boundaryIds]))
@@ -579,6 +599,33 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 条，头部裁剪）
     return { messages: { ...st.messages, [sessionId]: capTail(next, appendKeep(st, sessionId)) } }
   }),
+  // [P2-15] Stop hook 摘要实时行（/topic/tasks 事件）：元数据型内容（hook 计数/错误/阻止原因）→
+  //   行内挂 payload（不是正文），MessageList 走独立摘要行渲染分支（不得当普通气泡）。
+  //   isMeta=true（非对话消息：不进计数徽标 / 不进 pivot 候选）；放行靠 MessageList groups 的
+  //   展示行豁免（与 tool_use_summary 同款）。不落库 → F5 后该行消失（对齐后端 @JsonIgnore 本地通道）。
+  addStopHookSummary: (sessionId, { id, payload, userMessageId }) => set((st) => {
+    const msgs = st.messages[sessionId] ?? []
+    // 幂等：同 id 已存在不重复插（drain 批量出站/重放场景）
+    if (msgs.some((m) => m.id === id)) return st
+    const flowKey = userMessageId ?? id
+    const row: ChatMessageDto = {
+      id, sessionId, role: 'system', author: 'system', content: '',
+      reasoning: null, toolCalls: null, finishReason: null, inputTokens: null,
+      outputTokens: null, reasoningDurationMs: null, time: null, createdAt: new Date().toISOString(),
+      toolCallId: null, assistantMessageId: null, userMessageId: flowKey, subtype: 'stop_hook_summary',
+      isMeta: true, isApiErrorMessage: false, apiError: null, error: null,
+      errorDetails: null, matchedRule: null, stopHookSummary: payload,
+    }
+    // flow 锚定：插到 messages 中该 flow 最后一条之后；找不到同 flow 则队尾追加
+    let insertAt = msgs.length
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const key = msgs[i].userMessageId ?? msgs[i].id
+      if (key === flowKey) { insertAt = i + 1; break }
+    }
+    const next = [...msgs]
+    next.splice(insertAt, 0, row)
+    return { messages: { ...st.messages, [sessionId]: capTail(next, appendKeep(st, sessionId)) } }
+  }),
   setHasMore: (sessionId, hasMore) => set((st) => ({
     hasMore: { ...st.hasMore, [sessionId]: hasMore },
   })),
@@ -590,12 +637,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const existingIds = new Set(existing.map((m) => m.id))
     const fresh = (older ?? []).filter((m) => m && m.id && !existingIds.has(m.id))
     // [snip-persist] 前页若含 snip_boundary → 并入 snippedIds（照常标注「已裁剪」）
-    const boundaryIds: string[] = []
-    for (const m of fresh) {
-      if (m.subtype === 'snip_boundary' && m.snipMetadata?.removedUuids?.length) {
-        boundaryIds.push(...m.snipMetadata.removedUuids)
-      }
-    }
+    const boundaryIds = collectRemovedUuids(fresh)
     const snippedIds = boundaryIds.length
       ? { ...st.snippedIds, [sessionId]: Array.from(new Set([...(st.snippedIds[sessionId] ?? []), ...boundaryIds])) }
       : st.snippedIds

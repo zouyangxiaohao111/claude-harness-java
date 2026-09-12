@@ -5,6 +5,7 @@ import com.nexusai.application.agent.permission.hook.HookEvent;
 import com.nexusai.application.agent.permission.hook.HookEventType;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.model.session.dto.ChatMessageDto;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -34,6 +35,107 @@ class CompactHooksTest {
             false, null, List.of(), List.of(), message, null, null,
             null, null, GenericHook.HookOutcome.SUCCESS, null, null, null, null,
             null, null, null, null);
+    }
+
+    /**
+     * [P1-6] 真实 command hook 形态的 success 结果 —— message 是 hook_success attachment
+     * （CommandHookExecutor.toHookResultCore 产出：content=stdout.trim()，stdout 原文）。
+     */
+    private static GenericHook.HookResult commandSuccessResult(String stdoutText) {
+        return new GenericHook.HookResult(
+            false, null, List.of(), List.of(),
+            com.nexusai.application.agent.attachment.AttachmentMessageDto.hookSuccess(
+                "PreCompact:s1", null, "PreCompact", stdoutText, stdoutText, "", 0, "my-hook.sh", 12L),
+            null, null, null, null, GenericHook.HookOutcome.SUCCESS, null, null, null, null,
+            null, null, null, null);
+    }
+
+    /** [P1-6] 真实 command hook 形态的失败结果（非 0 退出 → hook_non_blocking_error，文本在 stderr）。 */
+    private static GenericHook.HookResult commandFailureResult(String stderrText) {
+        return new GenericHook.HookResult(
+            false, null, List.of(), List.of(),
+            com.nexusai.application.agent.attachment.AttachmentMessageDto.hookNonBlockingError(
+                "PreCompact:s1", null, "PreCompact", stderrText, "", 3, "my-hook.sh", 12L),
+            null, null, null, null, GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null,
+            null, null, null, null);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [P1-6 · 2026-09-11] hook 输出 = hook 文本，不是 attachment 的 toString()
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("P1-6: PreCompact 取 hook 的 stdout 文本（非 AttachmentMessageDto.toString 整串）")
+    void preCompact_usesHookOutputNotDtoToString() {
+        // WHY（规则九 · 验证意图）: CC 的 HookOutsideReplResult.output 是 hook 进程的文本输出
+        //   （utils/hooks.ts:3476-3480 status===0 ? stdout : stderr），PreCompact 的
+        //   newCustomInstructions / userDisplayMessage 全部派生自它（:4149-4184）。旧实现取
+        //   message().toString() → 结构化 DTO 被当 hook 输出（DB 实证：content=AttachmentMessageDto[id=…,
+        //   type=hook_success, stdout={"hookSpecificOutput":{… 整串进模型上下文）。
+        HookRegistry registry = new HookRegistry();
+        registry.register("test-pre-out", event -> commandSuccessResult("用中文总结这次压缩"),
+            HookEventType.PRE_COMPACT);
+        CompactConversationContext ctx = new CompactConversationContext()
+            .setSessionId("s1").setHookRegistry(registry);
+
+        CompactHooks.PreCompactHookResult result =
+            CompactHooks.executePreCompactHooks(ctx, "manual", null);
+
+        assertThat(result.newCustomInstructions())
+            .as("newCustomInstructions 必须是 hook 的输出文本（CC newCustomInstructions）")
+            .isEqualTo("用中文总结这次压缩");
+        assertThat(result.userDisplayMessage())
+            .as("展示消息取输出文本（CC `PreCompact [cmd] completed successfully: ${output}`；"
+                + "command 段对非 CommandHook 恒 '?' —— commandOf 既有语义）")
+            .endsWith("completed successfully: 用中文总结这次压缩");
+        assertThat(result.userDisplayMessage())
+            .as("不得把 attachment 的 toString 当 hook 输出（P1-6 根因）")
+            .doesNotContain("AttachmentMessageDto");
+    }
+
+    @Test
+    @DisplayName("P1-6: PreCompact 失败 hook 取 stderr 文本（CC output = stderr）")
+    void preCompact_failureUsesStderrText() {
+        HookRegistry registry = new HookRegistry();
+        registry.register("test-pre-fail", event -> commandFailureResult("脚本崩了"),
+            HookEventType.PRE_COMPACT);
+        CompactConversationContext ctx = new CompactConversationContext()
+            .setSessionId("s1").setHookRegistry(registry);
+
+        CompactHooks.PreCompactHookResult result =
+            CompactHooks.executePreCompactHooks(ctx, "manual", null);
+
+        assertThat(result.newCustomInstructions())
+            .as("失败 hook 的输出不进 newCustomInstructions（CC 只取 succeeded 的 output）")
+            .isNull();
+        assertThat(result.userDisplayMessage())
+            .as("失败展示消息取 stderr 文本（CC `PreCompact [cmd] failed: ${stderr}`）")
+            .endsWith("failed: 脚本崩了")
+            .doesNotContain("AttachmentMessageDto");
+    }
+
+    @Test
+    @DisplayName("P1-6: SessionStart hook 消息 content = hook 输出文本（不再落 attachment.toString）")
+    void sessionStart_hookMessageContentIsHookOutput() {
+        // WHY: 该路径产物进 postCompactMessages → 作为 user 消息进模型上下文 —— 旧实现把
+        //   AttachmentMessageDto 的 toString 整串喂给模型（DB 实证每次 compact 3 条）。
+        HookRegistry registry = new HookRegistry();
+        registry.register("test-session-start", event -> commandSuccessResult("技能已刷新"),
+            HookEventType.SESSION_START);
+        CompactConversationContext ctx = new CompactConversationContext()
+            .setSessionId("s1").setHookRegistry(registry);
+
+        List<ChatMessageDto> hookMessages = CompactHooks.processSessionStartHooks(ctx);
+
+        assertThat(hookMessages)
+            .as("成功 hook 的非空输出产一条 hook 消息")
+            .hasSize(1);
+        assertThat(hookMessages.get(0).content())
+            .as("消息 content 必须是 hook 输出文本（模型读到的内容）")
+            .isEqualTo("技能已刷新");
+        assertThat(hookMessages.get(0).content())
+            .as("不得把结构化 attachment 的 toString 当消息内容（P1-6 根因）")
+            .doesNotContain("AttachmentMessageDto");
     }
 
     @Test

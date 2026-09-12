@@ -96,6 +96,11 @@ public record CompactBoundaryMessage(
         return String.valueOf(cn.hutool.core.util.IdUtil.getSnowflakeNextId());
     }
 
+    /** null / 空串 / 纯空白判定 · persistedSegment 非空校验（D4 档 0.5）专用。 */
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
+    }
+
     /**
      * compact_boundary 元数据 · 对齐 CC {@code compactMetadata{trigger, preTokens, userContext,
      * messagesSummarized, preCompactDiscoveredTools, preservedSegment}}（utils/messages.ts:4540-4546）。
@@ -229,6 +234,17 @@ public record CompactBoundaryMessage(
      *   <li>from（前缀保留）→ boundary 自身（compact.ts:1081）</li>
      * </ul>
      *
+     * <p><b>⚠️ 本字段在 nexusai 为「只写」字段（D4 档 0.5 · 2026-09-12 裁定）</b>：
+     * CC 靠 {@code parentUuid} 指针链表达顺序，故需要这张「保留段接线图」在 resume 时
+     * {@code applyPreservedSegmentRelinks} 补指针（sessionStorage.ts:1876-1992，调用点 :3808）。
+     * nexusai <b>没有链结构</b>——顺序的唯一权威是 DB 列 {@code seq}
+     * （{@code MessageService.nextSeq} / {@code appendPostCompactMessages} 重挂），
+     * 且主路径 transcript 不写 uuid/parentUuid，把 CC 的 reader 搬来也<b>无链可走</b>。
+     * <p>本字段保留的意义 = CC wire-shape 对齐 + DB/SDK round-trip 完整（供审计/回放），
+     * <b>不是排序输入</b>。
+     * <p><b>⛔ 禁止读侧据此做任何重排/投影/切片</b>：那会制造第二个排序权威（与 {@code seq} 冲突），
+     * 是真正的高风险改动。顺序兜底一律归 {@code seq}。
+     *
      * @param boundary     待注解边界（compact_boundary）
      * @param anchorUuid   锚点消息 uuid（compact.ts:1077-1081）
      * @param messagesToKeep 压缩后保留消息（空 → 返回原 boundary）
@@ -245,10 +261,24 @@ public record CompactBoundaryMessage(
         if (oldMeta == null) {
             return boundary;
         }
+        // [D4 档 0.5 · 构造前非空校验] fail-loud 但不改行为：headUuid/tailUuid 取首末元素的 id()，
+        //   anchorUuid 由调用方传入 —— 任一为 null/空串时仍然照原样构造（不改变分支），只留 warn 痕迹。
+        //   WHY：本字段无读侧消费，坏值不会当场炸，只会在「将来有人接读侧」时静默产出错链；
+        //   故在此把「产出坏接线图」这件事变成可观测（CC applyPreservedSegmentRelinks 走不到即
+        //   logEvent('tengu_relink_walk_broken') 并放弃剪枝，同为「宁可多加载也不剪错」的失败观）。
+        String headUuid = messagesToKeep.get(0).id();
+        String tailUuid = messagesToKeep.get(messagesToKeep.size() - 1).id();
+        if (isBlank(headUuid) || isBlank(anchorUuid) || isBlank(tailUuid)) {
+            log.warn("[CompactBoundaryMessage] preservedSegment 非空校验失败（只写字段，读侧无消费 → 不改变行为）: "
+                + "headUuid={} anchorUuid={} tailUuid={} keep={} —— 顺序兜底归 seq，读侧禁止据此重排",
+                headUuid, anchorUuid, tailUuid, messagesToKeep.size());
+        }
+        // 注：坏值<b>照原样构造</b>（fail-loud 但不 fail-fast）——本字段无读侧消费，抛异常只会让
+        //   compact 主流程无故失败；可观测性由上面的 warn 承担。
         CompactMetadata.PreservedSegment segment = new CompactMetadata.PreservedSegment(
-            messagesToKeep.get(0).id(),
+            headUuid,
             anchorUuid,
-            messagesToKeep.get(messagesToKeep.size() - 1).id());
+            tailUuid);
         CompactMetadata newMeta = new CompactMetadata(
             oldMeta.trigger(), oldMeta.preTokens(), oldMeta.userContext(), oldMeta.messagesSummarized(),
             oldMeta.preCompactDiscoveredTools(), segment);

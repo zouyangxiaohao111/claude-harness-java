@@ -4,7 +4,9 @@ import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
+import com.nexusai.model.session.dto.SendMessageRequest;
 import com.nexusai.repository.session.entity.MessageRecord;
+import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.MessageMapper;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.repository.session.mapper.ToolCallMapper;
@@ -46,6 +48,14 @@ import static org.mockito.Mockito.when;
  * <p><b>顺带锁字段契约一致性</b>：{@link MessageRecord} 用包装类型 {@code Boolean}（DB 列可 NULL，容错旧行），
  * {@link ChatMessageDto} 用原始 {@code boolean}（内存态恒非 null）。两者命名同源
  * （isCompactSummary / isVisibleInTranscriptOnly），避免后续重命名只改一侧导致映射静默断链。
+ *
+ * <p><b>[M1 / D8=C 2026-09-12 扩面]</b> 本类原只覆盖 {@code appendMessage} 一条路径，而当时另有
+ * 7 条写路径完全不设这两列（新行照落 NULL）→ 上面那条「NULL 只属于 V70 前老行」的契约实际
+ * <b>不成立</b>（审计判定「测试声称的语义不成立」）。D8=C 接线后本类补齐 MessageService 侧
+ * 3 条路径（createUserMessage / createQueuedUserMessage / appendSystemSubtypeMessage）；
+ * ChatService 侧 4 条落库路径由
+ * {@code com.nexusai.application.chat.ChatServiceTranscriptFlagsPersistTest} 覆盖。
+ * 两处合计 7 条 → 契约在<b>全部写路径</b>上成立。
  */
 @DisplayName("[V70] MessageService.appendMessage 写侧落 isCompactSummary/isVisibleInTranscriptOnly（record 捕获）")
 class MessageServiceTranscriptFlagsRoundTripTest {
@@ -55,15 +65,19 @@ class MessageServiceTranscriptFlagsRoundTripTest {
 
     private MessageService service;
     private MessageMapper messageMapper;
+    private SessionMapper sessionMapper;
 
     @BeforeEach
     void setUp() {
         service = new MessageService();
         messageMapper = mock(MessageMapper.class);
+        sessionMapper = mock(SessionMapper.class);
         ReflectionTestUtils.setField(service, "messageMapper", messageMapper);
-        ReflectionTestUtils.setField(service, "sessionMapper", mock(SessionMapper.class));
+        ReflectionTestUtils.setField(service, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(service, "toolCallMapper", mock(ToolCallMapper.class));
         when(messageMapper.insert(any(MessageRecord.class))).thenReturn(1);
+        // createXxx / appendSystemSubtypeMessage 入口先查会话行（非 Spring 直构 → 手工给一行）
+        when(sessionMapper.selectOneById(any())).thenReturn(new SessionRecord());
     }
 
     /** compact 摘要消息（31 参 canonical 末 5 参 = 两标志 + 三个 boundary 元数据字段）。 */
@@ -110,6 +124,14 @@ class MessageServiceTranscriptFlagsRoundTripTest {
         // WHY: 生产 MessageService.toDto 读回按 Boolean.TRUE.equals 容错（NULL 与 FALSE 同判 false），
         //   但写侧应如实写 false 而非 null —— NULL 语义保留给「V70 前的历史行」，
         //   新写行的 NULL 会让「迁移是否回填完整」的排查失去区分度。
+        //
+        // [M1 2026-09-12 · 修正本契约的<b>适用范围</b>] 本条契约原先只在 appendMessage 成立，
+        //   而其时另有 7 条写路径（createQueuedUserMessage / createUserMessage /
+        //   appendSystemSubtypeMessage + ChatService 的 snip_boundary / assistant×2 / tool_result）
+        //   完全不设这两列，新行照落 NULL → 契约名存实亡（审计据此判定「测试声称的语义不成立」）。
+        //   D8=C 接线后这 7 条路径已补齐，契约在<b>全部写路径</b>上成立 —— 故断言从「appendMessage 一条」
+        //   扩到本类下方 3 条 MessageService 路径 + ChatServiceTranscriptFlagsPersistTest 的 4 条
+        //   ChatService 路径（删掉任一处 setIsXxx 两行 → 对应测试变红）。
         ChatMessageDto plain = new ChatMessageDto(
             "msg-plain", SESSION, Role.assistant, "assistant",
             "普通回复", null, List.of(), FinishReason.stop,
@@ -122,6 +144,54 @@ class MessageServiceTranscriptFlagsRoundTripTest {
         verify(messageMapper).insert(cap.capture());
         assertThat(cap.getValue().getIsCompactSummary()).as("普通消息落 false（非 null）").isFalse();
         assertThat(cap.getValue().getIsVisibleInTranscriptOnly()).as("普通消息落 false（非 null）").isFalse();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // [D8=C 2026-09-12] 其余 3 条 MessageService 写路径 · 同款契约（原先完全不设这两列 → 落 NULL）
+    //   RED 条件：删除对应方法里 setIsCompactSummary/setIsVisibleInTranscriptOnly 两行 → 捕获到 null → 红。
+    // ────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("[D8=C] createUserMessage 写路径：两标志显式 false（不是 NULL）")
+    void createUserMessage_writesFalseFlags() {
+        service.createUserMessage(SESSION, new SendMessageRequest(
+            "你好", null, null, List.of(), null, null, null, null, null));
+
+        MessageRecord rec = captureSingleInsert();
+        assertThat(rec.getRole()).as("前置：落的是 user 行").isEqualTo("user");
+        assertThat(rec.getIsCompactSummary())
+            .as("createUserMessage 必须显式写 false（NULL 会让「V70 后新行」与「V70 前老行」不可区分）")
+            .isFalse();
+        assertThat(rec.getIsVisibleInTranscriptOnly()).isFalse();
+    }
+
+    @Test
+    @DisplayName("[D8=C] createQueuedUserMessage 写路径：两标志显式 false（不是 NULL）")
+    void createQueuedUserMessage_writesFalseFlags() {
+        service.createQueuedUserMessage(SESSION, "msg-queued-1", "排队命令", null, false, "busy-queued");
+
+        MessageRecord rec = captureSingleInsert();
+        assertThat(rec.getRole()).as("前置：落的是 user 行").isEqualTo("user");
+        assertThat(rec.getIsCompactSummary()).isFalse();
+        assertThat(rec.getIsVisibleInTranscriptOnly()).isFalse();
+    }
+
+    @Test
+    @DisplayName("[D8=C] appendSystemSubtypeMessage 写路径：两标志显式 false（不是 NULL）")
+    void appendSystemSubtypeMessage_writesFalseFlags() {
+        service.appendSystemSubtypeMessage(SESSION, "scheduled_task_fire", "Running scheduled task");
+
+        MessageRecord rec = captureSingleInsert();
+        assertThat(rec.getRole()).as("前置：落的是 system 行").isEqualTo("system");
+        assertThat(rec.getIsCompactSummary()).isFalse();
+        assertThat(rec.getIsVisibleInTranscriptOnly()).isFalse();
+    }
+
+    /** 捕获本方法内唯一一次 messageMapper.insert 的实参记录。 */
+    private MessageRecord captureSingleInsert() {
+        ArgumentCaptor<MessageRecord> cap = ArgumentCaptor.forClass(MessageRecord.class);
+        verify(messageMapper).insert(cap.capture());
+        return cap.getValue();
     }
 
     @Test
