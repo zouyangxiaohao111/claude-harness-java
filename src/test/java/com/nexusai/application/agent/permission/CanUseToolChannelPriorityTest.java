@@ -326,7 +326,8 @@ class CanUseToolChannelPriorityTest {
         //   三条生产路径会静默改变权限行为。同时派生副本必须<b>保留</b>通道（否则 5c fork 在
         //   withThinkingConfig/withQuerySourceValue 链上丢权限 → INV-6 静默失效）。
         QueryParams params = QueryParams.forLoop(
-            List.of(), "sys", newCtx(List.of(), permCtx()), QuerySource.USER, "test-model",
+            // [prompt-assembly-A] systemPrompt 字段 String → List<String>（vestigial，恒传 List.of()）
+            List.of(), java.util.List.of(), newCtx(List.of(), permCtx()), QuerySource.USER, "test-model",
             null, null, null, null, null, null, ProviderConfig.empty());
         assertThat(params.canUseTool()).as("forLoop 默认 canUseTool=null（主线程/子代理/hook agent 三路不变）")
             .isNull();

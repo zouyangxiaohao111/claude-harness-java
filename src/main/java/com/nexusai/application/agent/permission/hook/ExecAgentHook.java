@@ -409,7 +409,11 @@ public class ExecAgentHook {
             List<String> consumedCommandUuids = new ArrayList<>();
             com.nexusai.application.agent.loop.QueryParams queryParams =
                 com.nexusai.application.agent.loop.QueryParams.forLoop(
-                    state.rawMessages(), systemPrompt, baseTuc,
+                    // [prompt-assembly-A] 2nd arg = QueryParams.systemPrompt（CC SystemPrompt 段数组语义）——
+                    //   本仓 vestigial（0 生产读点）：hook agent 真实提示来源 = AgentState.systemPrompt()
+                    //   （下一行 new AgentState(systemPrompt, ...)）+ loop 内 per-run 材料收集。
+                    //   恒传 List.of() ⇒ loop 走材料收集（现状行为）。
+                    state.rawMessages(), java.util.List.of(), baseTuc,
                     QuerySource.HOOK_AGENT, modelName, MAX_AGENT_TURNS, null, null, null, null,
                     deps, effectiveConfig);
             // [P2-23 · 2026-09-11] skillListingResume 恒 false（经 3 参重载 = 默认 false）——

@@ -259,7 +259,8 @@ class SubagentExecutorAdditionalAgentsTest {
 
         // 组合点输出注入 QueryParams.querySourceValue，发射侧 effectiveValue 优先取用（不吞 agentType）
         com.nexusai.application.agent.loop.QueryParams params = com.nexusai.application.agent.loop.QueryParams
-            .forLoop(null, "sys", null, QuerySource.SUBAGENT, "model", null, null, null, null, null, null, null)
+            // [prompt-assembly-A] systemPrompt 字段 String → List<String>（vestigial，恒传 List.of()）
+            .forLoop(null, java.util.List.of(), null, QuerySource.SUBAGENT, "model", null, null, null, null, null, null, null)
             .withQuerySourceValue(builtinExact);
         assertThat(QuerySource.effectiveValue(params.querySource(), params.querySourceValue()))
             .as("发射侧 effectiveValue 必须取用 agentType 级精确值（遥测可区分 Explore 子 agent）")
@@ -267,7 +268,7 @@ class SubagentExecutorAdditionalAgentsTest {
 
         // 发射侧对 agent:default 同样优先取用精确值（内置 type 空路径不吞成 'agent:subagent'）
         com.nexusai.application.agent.loop.QueryParams defaultParams = com.nexusai.application.agent.loop.QueryParams
-            .forLoop(null, "sys", null, QuerySource.SUBAGENT, "model", null, null, null, null, null, null, null)
+            .forLoop(null, java.util.List.of(), null, QuerySource.SUBAGENT, "model", null, null, null, null, null, null, null)
             .withQuerySourceValue(builtinNoTypeExact);
         assertThat(QuerySource.effectiveValue(defaultParams.querySource(), defaultParams.querySourceValue()))
             .as("发射侧 effectiveValue 必须取用 agent:default（builtin type 空路径）")

@@ -60,7 +60,12 @@ import java.util.function.Consumer;
  */
 public record QueryParams(
     List<ChatMessageDto> messages,                                   // CC 必填（B1 未消费，可为 null 占位）· CC original: messages (Open-ClaudeCode/src/query.ts:181)
-    String systemPrompt,                                             // CC 必填 · CC original: systemPrompt (Open-ClaudeCode/src/query.ts:182)
+    // [prompt-assembly-A per-run 材料收集] 类型 String → List<String>：对齐 CC {@code SystemPrompt}
+    //   （utils/systemPromptType.ts:8-10 {@code readonly string[] & {__brand}}）。语义 = **调用方已组装好的
+    //   系统提示**（CC 语义）；空列表/null = 调用方未组装 → loop 自己做 per-run 材料收集并回灌本字段
+    //   （见 {@code LlmAgentLoop.loop()} 的 do-while 前组装块）；非空 = 调用方已组装（fork 收敛通道）→
+    //   loop **跳过**材料收集，直接用传入值。CC original: systemPrompt (Open-ClaudeCode/src/query.ts:182)
+    List<String> systemPrompt,
     Map<String, String> userContext,                                 // CC 必填（⚠️ 必须 Map，非 String！）· CC original: userContext {[k]:string} (Open-ClaudeCode/src/query.ts:183)
     Map<String, String> systemContext,                               // CC 必填（⚠️ 必须 Map）· CC original: systemContext (Open-ClaudeCode/src/query.ts:184)
     // [5b · canUseTool 通道恢复] 受限 canUseTool 覆盖（CC 必填第 5 字段）。
@@ -128,7 +133,13 @@ public record QueryParams(
      * maxOutputTokensOverride / taskBudget / maxTurns）可为 null（CC 可选语义）。
      *
      * @param messages                loop 消息列表（run(): state.rawMessages()）
-     * @param systemPrompt            system prompt
+     * @param systemPrompt            <b>[vestigial · 本仓 3 条生产调用方恒传 {@code List.of()}，
+     *                                0 生产读点]</b> 调用方已组装好的系统提示（CC {@code SystemPrompt}
+     *                                段数组语义）。真实提示来源 = {@code AgentState.systemPrompt()}
+     *                                （custom）+ loop 内 per-run 材料收集（fetchSystemPromptParts →
+     *                                buildEffectiveSystemPrompt → 经 {@code withSystemPrompt} 回灌本
+     *                                字段）。保留本形的理由：对齐 CC {@code query({systemPrompt})}
+     *                                形状，并给 fork 收敛预留「调用方已组装 ⇒ loop 跳过材料收集」通道。
      * @param toolUseContext          初始 ToolUseContext（B1 占位；loop 内部仍用 toolExecContext 重建）
      * @param querySource             查询来源（compact ctor 已校验非空）
      * @param modelName               入口已解析 model 名
@@ -143,7 +154,7 @@ public record QueryParams(
      */
     public static QueryParams forLoop(
             List<ChatMessageDto> messages,
-            String systemPrompt,
+            List<String> systemPrompt,
             ToolUseContext toolUseContext,
             QuerySource querySource,
             String modelName,
@@ -259,6 +270,81 @@ public record QueryParams(
      * @return 仅 canUseTool 不同的副本
      */
     public QueryParams withCanUseTool(HookPermissionResolver.CanUseTool canUseTool) {
+        return new QueryParams(
+            messages, systemPrompt, userContext, systemContext,
+            canUseTool,
+            toolUseContext, querySource, querySourceValue, fallbackModel,
+            maxOutputTokensOverride, maxTurns, skipCacheWrite,
+            taskBudget, deps, config, modelName,
+            thinkingConfig,
+            onToolProgress);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [prompt-assembly-A] per-run 材料收集回灌三通道
+    //   CC 真源：query.ts:393-411 {@code const { systemPrompt, userContext, systemContext, ... } = params}
+    //   带注释「Immutable params — never reassigned during the query loop」；材料收集
+    //   （fetchSystemPromptParts / buildEffectiveSystemPrompt / coordinator userContext 合并）由
+    //   **调用方**每 turn 算一次（utils/queryContext.ts:44 → QueryEngine.ts:302），本仓等价物 =
+    //   LlmAgentLoop.loop() 的 do-while 前组装块 + 本组 wither 回灌。
+    //   Java 取舍：CC 侧 loop 内 systemPrompt 不可变、从不重赋；Java 侧要表达同一语义需把
+    //   「每 run 一次」的产物塞回 params —— 由**调用方**（loop 自己，在循环外）经 wither 生成本地
+    //   final 副本（见 loop() 内 {@code runParams}），不是循环内重赋。
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * [prompt-assembly-A] 派生副本 · 覆盖 systemPrompt（调用方已组装 / per-run 材料收集产物）。
+     *
+     * <p><b>语义</b>：字段 = 「已组装好的系统提示段数组」（CC {@code SystemPrompt} 语义）。
+     * loop 进入前由调用方（或 loop 自身的 per-run 组装块）写入；{@code do-while} 内的 s10
+     * 只做幂等的 {@code appendSystemContext}（CC query.ts:648 同点同语义）。
+     *
+     * @param systemPrompt 组装后的系统提示段数组（null → 空列表语义由消费侧判空处理）
+     * @return 仅 systemPrompt 不同的副本
+     */
+    public QueryParams withSystemPrompt(List<String> systemPrompt) {
+        return new QueryParams(
+            messages, systemPrompt, userContext, systemContext,
+            canUseTool,
+            toolUseContext, querySource, querySourceValue, fallbackModel,
+            maxOutputTokensOverride, maxTurns, skipCacheWrite,
+            taskBudget, deps, config, modelName,
+            thinkingConfig,
+            onToolProgress);
+    }
+
+    /**
+     * [prompt-assembly-A] 派生副本 · 覆盖 userContext（CC {@code getUserContext} 产物
+     * + coordinator 合并结果 · query.ts:183 / QueryEngine.ts:302-306）。
+     *
+     * <p>消费点：{@code prependUserContext}（每轮贴 meta user 消息 · CC query.ts:900）+
+     * PostSampling / stop-hook / fork 原料（REPLHookContext.userContext）。
+     *
+     * @param userContext user 通道上下文 map（{@code claudeMd}/{@code currentDate}/coordinator 键）
+     * @return 仅 userContext 不同的副本
+     */
+    public QueryParams withUserContext(Map<String, String> userContext) {
+        return new QueryParams(
+            messages, systemPrompt, userContext, systemContext,
+            canUseTool,
+            toolUseContext, querySource, querySourceValue, fallbackModel,
+            maxOutputTokensOverride, maxTurns, skipCacheWrite,
+            taskBudget, deps, config, modelName,
+            thinkingConfig,
+            onToolProgress);
+    }
+
+    /**
+     * [prompt-assembly-A] 派生副本 · 覆盖 systemContext（CC {@code getSystemContext} 产物 ·
+     * query.ts:184）。
+     *
+     * <p>消费点：{@code appendSystemContext}（并入系统提示尾段 · CC api.ts:437-447）+
+     * PostSampling / stop-hook / fork 原料（REPLHookContext.systemContext）。
+     *
+     * @param systemContext system 通道上下文 map（{@code gitStatus}/{@code cacheBreaker}）
+     * @return 仅 systemContext 不同的副本
+     */
+    public QueryParams withSystemContext(Map<String, String> systemContext) {
         return new QueryParams(
             messages, systemPrompt, userContext, systemContext,
             canUseTool,

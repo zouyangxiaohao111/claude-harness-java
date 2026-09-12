@@ -200,7 +200,7 @@ class ImageValidatorTest {
     /** QueryParams.forLoop 极简转发（避免 import 冲突）。 */
     private static class QueryParamsForTest {
         static com.nexusai.application.agent.loop.QueryParams forLoop(
-                List<ChatMessageDto> messages, String systemPrompt, ToolUseContext tuc,
+                List<ChatMessageDto> messages, List<String> systemPrompt, ToolUseContext tuc,
                 QuerySource qs, String model, Integer maxTurns, Object taskBudget,
                 String fallback, Boolean skipCache, Integer maxOutput,
                 com.nexusai.application.agent.loop.LoopDeps deps, ProviderConfig cfg) {

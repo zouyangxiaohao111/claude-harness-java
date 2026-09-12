@@ -172,7 +172,8 @@ class SubagentStreamingTest {
         //   即使 toProgressMessage 存在，子 agent 工具进度也永远到不了 sink。
         AtomicReference<SubagentMessage> received = new AtomicReference<>();
         QueryParams params = QueryParams.forLoop(
-                List.of(), "system-prompt", null, QuerySource.SUBAGENT, "model",
+                // [prompt-assembly-A] systemPrompt 字段 String → List<String>（vestigial，恒传 List.of()）
+                List.of(), java.util.List.of(), null, QuerySource.SUBAGENT, "model",
                 null, null, null, null, null, null, null)
             .withOnToolProgress(progress -> {
                 // 镜像 runSubagentQueryLoop 生产接线: 构造 ProgressMessage 发射 sink
@@ -189,7 +190,8 @@ class SubagentStreamingTest {
         // DEC-25 降级保留: messageSink==null 时生产接线不发射（async worker / 非流式 execute）
         AtomicReference<SubagentMessage> noSink = new AtomicReference<>();
         QueryParams defaultParams = QueryParams.forLoop(
-                List.of(), "system-prompt", null, QuerySource.SUBAGENT, "model",
+                // [prompt-assembly-A] systemPrompt 字段 String → List<String>（vestigial，恒传 List.of()）
+                List.of(), java.util.List.of(), null, QuerySource.SUBAGENT, "model",
                 null, null, null, null, null, null, null);
         assertThat(defaultParams.onToolProgress())
             .as("主循环 / 非流式 onToolProgress 默认 null (CC 主循环不 yield progress)")

@@ -4231,7 +4231,11 @@ public class SubagentExecutor {
                 }
                 com.nexusai.application.agent.loop.QueryParams queryParams =
                     com.nexusai.application.agent.loop.QueryParams.forLoop(
-                        state.rawMessages(), agentSystemPrompt, baseTuc,
+                        // [prompt-assembly-A] forLoop 第 2 实参 = QueryParams.systemPrompt（CC SystemPrompt
+                        //   段数组语义）——本仓 vestigial（0 生产读点）：子代理真实提示来源 =
+                        //   AgentState.systemPrompt()（下一行 new AgentState(agentSystemPrompt, ...)）+
+                        //   loop 内 per-run 材料收集。恒传 List.of() ⇒ loop 走材料收集（现状行为）。
+                        state.rawMessages(), java.util.List.of(), baseTuc,
                         forkQuerySource, effectiveModel, maxTurns, null, null, null, null,
                         deps, providerConfig)
                         // [IMP2-05 运行时接线] 注入 agentType 级精确 querySource（CC querySource 值域

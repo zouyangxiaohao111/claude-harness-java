@@ -186,7 +186,8 @@ class SkillListingSubagentResumeWiringTest {
             ToolUseContext tuc = ToolUseContext.of(AGENT_ID, SESSION_KEY, PermissionMode.DEFAULT,
                 List.of(skillTool));
             return QueryParams.forLoop(
-                state.rawMessages(), "sys", tuc,
+                // [prompt-assembly-A] systemPrompt 字段 String → List<String>（vestigial，恒传 List.of()）
+                state.rawMessages(), java.util.List.of(), tuc,
                 QuerySource.SUBAGENT, "test-model", 4,
                 null, null, null, null,
                 new SubagentLoopDeps(contextFactory.shared(null)), ProviderConfig.empty());

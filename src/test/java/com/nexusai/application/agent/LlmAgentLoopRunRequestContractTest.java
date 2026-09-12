@@ -301,7 +301,10 @@ class LlmAgentLoopRunRequestContractTest {
         com.nexusai.application.agent.loop.AgentLoopContext ctx =
             TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = QueryParams.forLoop(
-            state.rawMessages(), "sys",
+            // [prompt-assembly-A] 2nd arg 类型 String → List<String>（CC SystemPrompt 段数组语义）。
+            //   本仓该字段为 vestigial（0 生产读点）→ 测试侧一律 List.of()（= 三条生产调用方同值），
+            //   行为与旧传 "sys" 逐位相同（旧值从不被读；且空列表 ⇒ loop 走 per-run 材料收集 = 旧行为）。
+            state.rawMessages(), java.util.List.of(),
             com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             new LlmAgentLoop.MainLoopDeps(ctx, loop::getModelForCall), ProviderConfig.empty());
@@ -324,7 +327,7 @@ class LlmAgentLoopRunRequestContractTest {
             java.time.OffsetDateTime.now(), null, null, null, List.of(), List.of()));
         org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
             () -> new QueryParams(
-                messages, "sys", java.util.Map.of(), java.util.Map.of(),
+                messages, java.util.List.of(), java.util.Map.of(), java.util.Map.of(),
                 // [5b] canUseTool 为第 5 字段（CC query.ts:243 必填；Java 侧 null = 回落内层 gate）；
                 // 本测试锁定 compact ctor 的 querySource 非空校验，canUseTool 传 null 不影响校验。
                 null,
