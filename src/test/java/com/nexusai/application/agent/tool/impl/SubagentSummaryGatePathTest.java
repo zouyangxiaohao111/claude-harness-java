@@ -71,7 +71,7 @@ class SubagentSummaryGatePathTest {
                                      Consumer<String> onReasoningChunk,
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onComplete) {
+                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onComplete != null) onComplete.run();
         }

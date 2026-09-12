@@ -203,6 +203,103 @@ class AnthropicSdkProviderSystemBlocksTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // [C] 经 provider.stream 的 skipCacheWrite 端到端（wire 级 marker 落位）
+    //   WHY 独立于上面的 buildMessageParams 直调断言：上面 4 条用例直接调 9 参
+    //   buildMessageParams（skipCacheWrite 位置硬编码 null），**绕过 stream 链**——
+    //   若 LlmProvider.stream 抽象签名不带该参数（Java 无 default 形参），或
+    //   AnthropicSdkProvider.doStream 调 buildMessageParams 时又写回 null（B3 断点回归），
+    //   上面用例全绿而生产流式路径 marker 永不移位。本组用例从 provider.stream 入口发起
+    //   真实 HTTP 请求（本地 HttpServer 捕获请求体），钉死「参数 → wire」全链。
+    //   RED 变异：把 doStream 里第 9 实参改回 null → 本组 markerOnSecondToLast 必红。
+    // ════════════════════════════════════════════════════════════════════
+
+    /** 本地 HttpServer + 最小 SSE 响应（对齐 AnthropicSdkProviderEffortTest.buildSseResponse）。 */
+    private static byte[] minimalSseResponse() {
+        return ("event: message_start\n"
+            + "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude\",\"role\":\"assistant\"}}\n"
+            + "\n"
+            + "event: message_delta\n"
+            + "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n"
+            + "\n"
+            + "event: message_stop\n"
+            + "data: {\"type\":\"message_stop\"}\n"
+            + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * 经 provider.stream 发起一次真实调用并返回服务端收到的请求体 JSON。
+     *
+     * @param skipCacheWrite 传给 stream 的末参（null / true / false）
+     */
+    private static JsonNode streamAndCaptureBody(Boolean skipCacheWrite) throws Exception {
+        java.util.concurrent.atomic.AtomicReference<String> capturedBody =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.CountDownLatch got = new java.util.concurrent.CountDownLatch(1);
+        com.sun.net.httpserver.HttpServer server =
+            com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/messages", exchange -> {
+            capturedBody.set(new String(exchange.getRequestBody().readAllBytes(),
+                java.nio.charset.StandardCharsets.UTF_8));
+            byte[] sse = minimalSseResponse();
+            exchange.getResponseHeaders().set("Content-Type", "text/event-stream");
+            exchange.sendResponseHeaders(200, sse.length);
+            exchange.getResponseBody().write(sse);
+            exchange.close();
+            got.countDown();
+        });
+        server.start();
+        try {
+            ProviderConfig config = new ProviderConfig(
+                "http://127.0.0.1:" + server.getAddress().getPort(), "test-key");
+            java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+            new AnthropicSdkProvider().stream(
+                config, "claude-sonnet-4-6",
+                List.of(new SystemPromptBlock("sys", CacheScope.GLOBAL)),
+                List.of(userMessage("first"), userMessage("second"), userMessage("third")),
+                null, null, null, null, null,
+                c -> {}, m -> {}, t -> {}, r -> {}, () -> {},
+                null, e -> {}, done::countDown,
+                skipCacheWrite);
+            assertThat(done.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                .as("provider.stream 必须正常收尾（onComplete）").isTrue();
+            assertThat(got.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                .as("本地 server 必须收到请求").isTrue();
+            return JSON.readTree(capturedBody.get());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    @DisplayName("[C] 经 provider.stream · skipCacheWrite=true → wire marker 落倒数第二条（claude.ts:3243）")
+    void streamPath_skipCacheWriteTrue_markerOnSecondToLast() throws Exception {
+        JsonNode messages = streamAndCaptureBody(Boolean.TRUE).get("messages");
+        assertThat(messages).hasSize(3);
+        assertThat(messages.get(1).get("content").isArray())
+            .as("stream 路径 skipCacheWrite=true → marker 必须移位到倒数第二条"
+                + "（若 doStream 第 9 实参回退 null，marker 落末条 → 本断言红）").isTrue();
+        assertThat(messages.get(1).get("content").get(0).get("cache_control").get("type").asText())
+            .isEqualTo("ephemeral");
+        assertThat(messages.get(2).get("content").isTextual())
+            .as("末条 content 保持字符串（marker 移位非删除）").isTrue();
+        assertThat(messages.get(2).get("content").asText()).isEqualTo("third");
+    }
+
+    @Test
+    @DisplayName("[C] 经 provider.stream · skipCacheWrite=null/false（主循环）→ marker 落在最后一条（行为不变）")
+    void streamPath_skipCacheWriteUnset_markerOnLast() throws Exception {
+        for (Boolean value : new Boolean[] {null, Boolean.FALSE}) {
+            JsonNode messages = streamAndCaptureBody(value).get("messages");
+            assertThat(messages).hasSize(3);
+            assertThat(messages.get(2).get("content").isArray())
+                .as("skipCacheWrite=" + value + " → marker 保持末条（零行为变化）").isTrue();
+            assertThat(messages.get(2).get("content").get(0).get("cache_control").get("type").asText())
+                .isEqualTo("ephemeral");
+            assertThat(messages.get(1).get("content").isTextual()).isTrue();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // [IMP-SP2-07 ✗-13] PROMPT_CACHING_SCOPE_BETA_HEADER（claude.ts:1217-1222）
     // ════════════════════════════════════════════════════════════════════
 

@@ -327,7 +327,7 @@ class ForkConvergenceCcContractTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
                 oa.accept(new AssistantMessage(text, "stop", List.of()));
                 ocp.run();
             }
@@ -390,7 +390,7 @@ class ForkConvergenceCcContractTest {
                            Runnable onStreamingFallback,
                            AbortController abortController,
                            Consumer<Throwable> onError,
-                           Runnable onComplete) {
+                           Runnable onComplete, Boolean skipCacheWrite) {
             // 快照（runningMessages 在 provider 返回后仍会被追加 assistant/tool 消息）
             this.lastHistory = List.copyOf(history);
             this.lastSystemBlocks = systemPromptBlocks == null ? null : List.copyOf(systemPromptBlocks);

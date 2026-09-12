@@ -288,7 +288,11 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
 
     /**
      * mock provider 工厂：第 1 次回 tool_calls（触发第 2 个工具轮）、第 2 次回 stop。
-     * 两种 stream 重载（17 参 / 18 参带 thinkingConfig）都必须打桩——hook agent 走后者。
+     * 两种 stream 重载（blocks 重载 / blocks+thinkingConfig 重载）都必须打桩——hook agent 走后者。
+     *
+     * <p>[C] 参数个数：blocks 重载 = 18（C 批次在末位追加 {@code Boolean skipCacheWrite}），
+     * blocks+thinkingConfig 重载 = 19（同样末位追加）。下方答案的位置索引按 <b>19 = 带
+     * thinkingConfig</b> 分派（后者 onChunk/onAssistantMessage 比前者后移一位）。
      */
     @SuppressWarnings("unchecked")
     private static LlmProviderFactory newProviderFactory(List<List<SystemPromptBlock>> captured,
@@ -298,8 +302,8 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             Object[] args = inv.getArguments();
             List<SystemPromptBlock> blocks = (List<SystemPromptBlock>) args[2];
             captured.add(blocks == null ? null : List.copyOf(blocks));
-            int msgIdx = args.length == 18 ? 11 : 10;
-            int doneIdx = args.length == 18 ? 17 : 16;
+            int msgIdx = args.length == 19 ? 11 : 10;
+            int doneIdx = args.length == 19 ? 17 : 16;
             java.util.function.Consumer<AssistantMessage> onMsg = args[msgIdx] == null ? null
                 : (java.util.function.Consumer<AssistantMessage>) args[msgIdx];
             Runnable onComplete = (Runnable) args[doneIdx];
@@ -313,10 +317,12 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             onComplete.run();
             return null;
         };
-        Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        // blocks 重载（18 参 · anyList() 在 index 2 → 只可能绑定 blocks 变体）
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        // blocks+thinkingConfig 重载（19 参 · 全 any() + 19 个实参 → 只可能绑定该变体）
+        Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         return factory;

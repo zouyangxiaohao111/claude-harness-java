@@ -146,7 +146,7 @@ class ImageValidatorTest {
         LlmProvider provider = mock(LlmProvider.class);
         Mockito.doThrow(new IllegalStateException("must not call provider.stream directly"))
             .when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         var ctx = TestContexts.agentLoopContext(

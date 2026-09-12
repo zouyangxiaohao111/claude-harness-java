@@ -112,7 +112,7 @@ class PromptHookRealProviderTest {
             java.util.function.Consumer<String> orc, Runnable osf,
             com.nexusai.application.agent.tool.AbortController ac,
             java.util.function.Consumer<Throwable> oe,
-            Runnable onC) {
+            Runnable onC, Boolean skipCacheWrite) {
             throw new UnsupportedOperationException();
         }
 

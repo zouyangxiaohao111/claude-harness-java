@@ -131,7 +131,7 @@ class ProductionForkedQuerySkipGlobalCacheTest {
                                          Consumer<com.nexusai.application.agent.tool.ToolUseBlock> onToolCall,
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
                                          com.nexusai.application.agent.tool.AbortController abort,
-                                         Consumer<Throwable> onError, Runnable onComplete) {
+                                         Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
                 capturedBlocks[0] = blocks;
                 onChunk.accept("fork reply");
                 onAssistant.accept(new AssistantMessage("fork reply", "stop", List.of()));

@@ -118,7 +118,11 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Runnable onStreamingFallback,
                        AbortController abortController,
                        Consumer<Throwable> onError,
-                       Runnable onComplete) {
+                       Runnable onComplete,
+                       Boolean skipCacheWrite) {
+        // [C] skipCacheWrite 签名跟随（wire 无 marker 语义 · openai-compatible 端点无 prompt cache
+        //   条目写入移位的对应物 → 忽略，行为零改动）。CC 侧本参数只在 Anthropic 通道
+        //   claude.ts:3243 markerIndex 消费。
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
             abortController.onCancel(ac -> {
@@ -163,7 +167,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Runnable onStreamingFallback,
                        AbortController abortController,
                        Consumer<Throwable> onError,
-                       Runnable onComplete) {
+                       Runnable onComplete,
+                       Boolean skipCacheWrite) {
+        // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
             abortController.onCancel(ac -> {
@@ -202,7 +208,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Runnable onStreamingFallback,
                        AbortController abortController,
                        Consumer<Throwable> onError,
-                       Runnable onComplete) {
+                       Runnable onComplete,
+                       Boolean skipCacheWrite) {
+        // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         String joined = systemPromptBlocks == null ? null : systemPromptBlocks.stream()
             .filter(java.util.Objects::nonNull)
             .map(SystemPromptBlock::text)
@@ -210,7 +218,8 @@ public class OpenAiSdkProvider implements LlmProvider {
             .collect(java.util.stream.Collectors.joining("\n\n"));
         stream(config, modelName, joined, history, tools, maxOutputTokensOverride, taskBudget,
             effortValue, thinkingConfig, onChunk, onAssistantMessage, onToolCallComplete,
-            onReasoningChunk, onStreamingFallback, abortController, onError, onComplete);
+            onReasoningChunk, onStreamingFallback, abortController, onError, onComplete,
+            skipCacheWrite);
     }
 
     /** 流式核心 · SDK createStreaming + 迭代器消费（[H13-GAP-4 v3] chunk 边界检查 aborted）. */

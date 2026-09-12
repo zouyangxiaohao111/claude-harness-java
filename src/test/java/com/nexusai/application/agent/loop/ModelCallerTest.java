@@ -67,7 +67,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any());
+            any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -86,7 +86,7 @@ class ModelCallerTest {
 
         ModelRequest request = new ModelRequest(config, "m1", null, null, messages, tools,
             null, null, null, null,
-            onChunk, onMsg, onTool, onReasoning, onFallback, onError, onComplete, null);
+            onChunk, onMsg, onTool, onReasoning, onFallback, onError, onComplete, null, null);
 
         ModelResponse resp = ModelCaller.call(ctx, request);
 
@@ -123,7 +123,7 @@ class ModelCallerTest {
             captured[0] = inv.getArgument(6);
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -132,7 +132,7 @@ class ModelCallerTest {
         ProviderConfig config = new ProviderConfig("http://base", "k");
         ModelRequest request = new ModelRequest(config, "m1", null, null, List.of(), null,
             null, new com.nexusai.infra.llm.TaskBudgetParam(200_000, 165_000), null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
 
         ModelResponse resp = ModelCaller.call(ctx, request);
 
@@ -151,7 +151,7 @@ class ModelCallerTest {
             streamCalled[0] = true;
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -162,7 +162,7 @@ class ModelCallerTest {
         };
         ModelRequest request = new ModelRequest(ProviderConfig.empty(), "m1", null, null, List.of(),
             null, null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
 
         deps.callModel(request);
 
@@ -180,7 +180,7 @@ class ModelCallerTest {
         Mockito.doThrow(new IllegalStateException("must not call provider.stream directly"))
             .when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
                 any(), any(), any(), any(), any(), any(), any(), any(), any(),
-                any(), any(), any());
+                any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -238,7 +238,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any());
+            any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -254,7 +254,7 @@ class ModelCallerTest {
         ModelRequest request = new ModelRequest(new ProviderConfig("http://deepseek", "k"),
             "deepseek/deepseek-v4-flash", null, null, List.of(), null,
             null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
 
         ModelCaller.call(ctx, request);
 
@@ -273,7 +273,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any());
+            any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -285,7 +285,7 @@ class ModelCallerTest {
         ModelRequest request = new ModelRequest(new ProviderConfig("http://base", "k"),
             "deepseek/deepseek-v4-flash", null, null, List.of(), null,
             null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
 
         ModelCaller.call(ctx, request);
 
@@ -310,7 +310,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any());
+            any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -324,7 +324,7 @@ class ModelCallerTest {
                 com.nexusai.application.agent.prompt.CacheScope.NULL));
         ModelRequest request = new ModelRequest(config, "m1", blocks, "repl_main_thread",
             List.of(), null, null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
         ModelResponse resp = ModelCaller.call(ctx, request);
 
         assertThat(resp).isEqualTo(ModelResponse.SUBMITTED);

@@ -97,13 +97,13 @@ class MaxOutputTokensEscalationIntegrationTest {
             inv.getArgument(9), inv.getArgument(10), inv.getArgument(16),
             finishReasons, callCount))
             .when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         // [IMP-15 REWORK] 升级重试 override 非 null
         Mockito.doAnswer(inv -> answerProviderStream(
             inv.getArgument(9), inv.getArgument(10), inv.getArgument(16),
             finishReasons, callCount))
             .when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         return factory;

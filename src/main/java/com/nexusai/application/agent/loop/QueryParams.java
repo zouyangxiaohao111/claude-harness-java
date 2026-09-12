@@ -105,10 +105,25 @@ public record QueryParams(
     ProviderConfig config,                                           // Java 特有第 14 字段（loop 内 provider.stream 需要；P3 callModel 封装后移除）
     String modelName,                                                // Java 特有第 15 字段（run()/Subagent/Hook 入口已解析 model 名；P3 deps.resolveModel() 后移除）
     ThinkingConfig thinkingConfig,                                   // Java 特有第 16 字段（实际查询配置 thinkingConfig · CC original: toolUseContext.options.thinkingConfig (Open-ClaudeCode/src/query.ts:662)）
-    Consumer<Tool.ToolProgress> onToolProgress                       // Java 特有第 17 字段（子 agent 工具进度回调 · CC original: createProgressMessage (utils/messages.ts:603-618)，toolExecution.ts:550 tool.call progress → query 流 → runAgent.ts:792-805 yield；null = 主循环/非流式）
+    Consumer<Tool.ToolProgress> onToolProgress,                      // Java 特有第 17 字段（子 agent 工具进度回调 · CC original: createProgressMessage (utils/messages.ts:603-618)，toolExecution.ts:550 tool.call progress → query 流 → runAgent.ts:792-805 yield；null = 主循环/非流式）
+    // [D] Java 特有第 18 字段（消息级回调 · 每条「真实模型产出」消息 append 时回调一条）·
+    //   CC original: forkedAgent.ts:564-625 {@code for await (const message of query(...))} 消费侧
+    //   {@code outputMessages.push(message) + onMessage?.(message)}（:578）—— CC 的 query() 是
+    //   async generator，消息在**产出时**逐条 yield；Java 的 queryLoop 返回聚合 LoopResult
+    //   （finalState/totalTurns/...）结构上产不出中间消息，故用本回调在 3 个真实发射点等价位
+    //   转发（AgentLoopContext assistant(tool_calls) / AgentLoopContext tool_result /
+    //   LlmAgentLoop 纯文本 assistant）。
+    //   语义边界（显式取舍）：只发「真实模型产出」——错误/合成消息（max_output_tokens 截断提示、
+    //   API 错误消息、stop hook 注入、队列注入 user 消息）不发射（CC 的 onMessage 在 forkedAgent
+    //   消费侧对**所有** yield 生效，但那需 async generator；本仓以「模型产出」为最小充分集，
+    //   覆盖 CC 的 assistant + user(=tool_result) 两类）。null = 未注入 → 紧凑构造器归一为 no-op
+    //   （对齐 CC {@code onMessage?.()}，范式同 RunForkedAgent.ForkQueryParams:145-148）。
+    Consumer<ChatMessageDto> onMessage
 ) {
     /**
-     * 紧凑构造器：校验 querySource 必传（对齐 CC query.ts:189 运行时必填）；thinkingConfig null → disabled。
+     * 紧凑构造器：校验 querySource 必传（对齐 CC query.ts:189 运行时必填）；thinkingConfig null → disabled；
+     * [D] onMessage null → no-op（对齐 CC {@code onMessage?.(message)} 可选调用语义，
+     * 范式同 {@link com.nexusai.application.agent.compact.fork.RunForkedAgent.ForkQueryParams}）。
      *
      * @throws IllegalArgumentException if querySource null
      */
@@ -118,6 +133,10 @@ public record QueryParams(
         }
         if (thinkingConfig == null) {
             thinkingConfig = ThinkingConfig.disabled();
+        }
+        // [D] G-79 同款范式：null → no-op lambda（发射点无需各处判空）
+        if (onMessage == null) {
+            onMessage = msg -> { };
         }
     }
 
@@ -175,7 +194,8 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             null, // thinkingConfig null → 紧凑构造器默认 disabled（当前 Java 主循环请求路径未接线 thinking 发送）
-            null); // onToolProgress null → 主循环/非流式无工具进度回调（CC 主循环不 yield progress）
+            null, // onToolProgress null → 主循环/非流式无工具进度回调（CC 主循环不 yield progress）
+            null); // [D] onMessage null → 紧凑构造器归一为 no-op（未注入 = 零行为变化）
     }
 
     /**
@@ -211,7 +231,9 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig,
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传（拷贝构造必须带上，否则 wither 会静默丢掉回调）
+
     }
 
     /**
@@ -229,7 +251,8 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig != null ? thinkingConfig : ThinkingConfig.disabled(),
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传
     }
 
     /**
@@ -250,7 +273,35 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig,
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传（拷贝构造必须带上，否则 wither 会静默丢掉回调）
+    }
+
+    /**
+     * [D] 派生副本 · 覆盖 onMessage（消息级回调 · 每条真实模型产出消息 append 时回调一条）。
+     *
+     * <p><b>WHY（fork 收敛 E 的铺路）</b>：CC {@code query()} 是 async generator，
+     * {@code forkedAgent.ts:564-625} 在消费侧 {@code for outputMessages.push(message) +
+     * onMessage?.(message)}（:578）—— fork 的进度 UI（dream task）与 {@code touchedPaths} 收集
+     * 依赖「产出即回调」的流式语义。Java 的 queryLoop 返回聚合 LoopResult，无中间消息 →
+     * 本回调为等价通道（3 个真实发射点，见 {@link com.nexusai.application.agent.loop.AgentLoopContext}）。
+     *
+     * <p><b>范式</b>：与 {@link #withOnToolProgress} 同构（字段 + wither + 各拷贝构造逐处透传 +
+     * 单一注入点消费）；null → 紧凑构造器归一为 no-op（对齐 CC {@code onMessage?.()}）。
+     *
+     * @param onMessage 新的消息级回调（null → no-op）
+     * @return 仅 onMessage 不同的副本
+     */
+    public QueryParams withOnMessage(Consumer<ChatMessageDto> onMessage) {
+        return new QueryParams(
+            messages, systemPrompt, userContext, systemContext,
+            canUseTool,
+            toolUseContext, querySource, querySourceValue, fallbackModel,
+            maxOutputTokensOverride, maxTurns, skipCacheWrite,
+            taskBudget, deps, config, modelName,
+            thinkingConfig,
+            onToolProgress,
+            onMessage);
     }
 
     /**
@@ -277,7 +328,9 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig,
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传（拷贝构造必须带上，否则 wither 会静默丢掉回调）
+
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -310,7 +363,9 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig,
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传（拷贝构造必须带上，否则 wither 会静默丢掉回调）
+
     }
 
     /**
@@ -331,7 +386,9 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig,
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传（拷贝构造必须带上，否则 wither 会静默丢掉回调）
+
     }
 
     /**
@@ -352,6 +409,8 @@ public record QueryParams(
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
             thinkingConfig,
-            onToolProgress);
+            onToolProgress,
+            onMessage); // [D] 逐处透传（拷贝构造必须带上，否则 wither 会静默丢掉回调）
+
     }
 }

@@ -81,7 +81,7 @@ class CompactL4RealSummaryIntegrationTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
                 oa.accept(new AssistantMessage(text, "stop", List.of()));
                 ocp.run();
             }

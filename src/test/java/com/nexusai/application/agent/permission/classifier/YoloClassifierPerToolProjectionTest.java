@@ -409,7 +409,7 @@ class YoloClassifierPerToolProjectionTest {
                                      Consumer<ToolUseBlock> onToolCallComplete,
                                      Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                      AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onComplete) {
+                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
             throw new UnsupportedOperationException("YoloClassifier 路径不使用 stream");
         }
     }

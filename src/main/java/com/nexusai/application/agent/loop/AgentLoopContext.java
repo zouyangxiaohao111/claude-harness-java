@@ -1778,9 +1778,10 @@ public record AgentLoopContext(
             Long reasoningDurationMs,
             Long decodeMs) {
         // [5b] 16 参兼容入口 · canUseTool=null → 回落 beans.permissionGate（三路生产路径逐位不变）
+        // [D] onMessage=null → 紧凑构造器归一 no-op（本兼容入口不承载消息级回调，见 17 参入口）
         return handleToolCallsTurn(ctx, perTurnTuc, state, msg, assistantText, chunkCount,
             turnAssistantId, streamingExec, seenToolCalls, querySource, thinkingConfig,
-            allowedDecisions, toolDecisions, onToolProgress, reasoningDurationMs, decodeMs, null);
+            allowedDecisions, toolDecisions, onToolProgress, reasoningDurationMs, decodeMs, null, null);
     }
 
     /**
@@ -1792,6 +1793,11 @@ public record AgentLoopContext(
      * 优先级与零行为变化同 8/9 参 {@code buildStreamingExecutor}。
      *
      * @param canUseTool 受限 canUseTool 覆盖（null → 回落 beans.permissionGate，现状）
+     * @param onMessage  [D] 消息级回调（每条真实模型产出消息 append 时回调一条）· 本方法内是
+     *                   <b>2 个发射点</b>：assistant(tool_calls) 与 tool_result（对齐 CC
+     *                   forkedAgent.ts:578 消费侧 onMessage —— query() yield 的 assistant 与
+     *                   user(=tool_result) 两类）。null → 紧凑构造器归一 no-op（对齐 onMessage?.()）。
+     *                   沿 {@code onToolProgress} 既有参数链透传（同一范式，不新造机制）。
      * @since 5b
      */
     public static String handleToolCallsTurn(AgentLoopContext ctx,
@@ -1810,7 +1816,8 @@ public record AgentLoopContext(
             java.util.function.Consumer<Tool.ToolProgress> onToolProgress,
             Long reasoningDurationMs,
             Long decodeMs,
-            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseTool) {
+            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseTool,
+            java.util.function.Consumer<com.nexusai.model.session.dto.ChatMessageDto> onMessage) {
         if (perTurnTuc == null || perTurnTuc.availableTools().isEmpty()) {
             state.setError("assistant returned tool_calls but per-turn TUC has no availableTools");
             state.setExitReason(AgentState.ExitReason.STREAM_ERROR);
@@ -1848,18 +1855,26 @@ public record AgentLoopContext(
         //   （agentToolUtils.ts:238-256; mid-turn 退出时 extractUsageFromMessages 取本消息 usage）
         // [reasoningDurationMs] 工具轮 reasoning 直接取 msg.reasoning()（不传 reasoningBuf），
         //   计时值由外层 run() 算好经 handleToolCallsTurn 第 15 参传入（null = 无 reasoning）。
-        state.appendMessage(LlmAgentLoop.assistantMessageWithToolCalls(
-            assistantText, toolCallDtos, msg.reasoning(), turnAssistantId)
-            .withUsage(msg.usage())
-            // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
-            .withUsageCache(
-                msg.usage() != null && msg.usage().cacheReadInputTokens() != null
-                    ? Math.toIntExact(msg.usage().cacheReadInputTokens()) : null,
-                msg.usage() != null && msg.usage().cacheCreationInputTokens() != null
-                    ? Math.toIntExact(msg.usage().cacheCreationInputTokens()) : null)
-            .withReasoningDurationMs(reasoningDurationMs)
-            // [B7-R9] 输出解码耗时 decodeMs 挂载（工具轮 assistant 消息；外层 run() 算好传入，null = 无计时）
-            .withDecodeMs(decodeMs));
+        com.nexusai.model.session.dto.ChatMessageDto assistantToolCallsMsg =
+            LlmAgentLoop.assistantMessageWithToolCalls(
+                assistantText, toolCallDtos, msg.reasoning(), turnAssistantId)
+                .withUsage(msg.usage())
+                // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
+                .withUsageCache(
+                    msg.usage() != null && msg.usage().cacheReadInputTokens() != null
+                        ? Math.toIntExact(msg.usage().cacheReadInputTokens()) : null,
+                    msg.usage() != null && msg.usage().cacheCreationInputTokens() != null
+                        ? Math.toIntExact(msg.usage().cacheCreationInputTokens()) : null)
+                .withReasoningDurationMs(reasoningDurationMs)
+                // [B7-R9] 输出解码耗时 decodeMs 挂载（工具轮 assistant 消息；外层 run() 算好传入，null = 无计时）
+                .withDecodeMs(decodeMs);
+        state.appendMessage(assistantToolCallsMsg);
+        // [D] 发射点 ①：assistant(tool_calls) 真实模型产出 → onMessage（对齐 CC forkedAgent.ts:578
+        //   消费侧 onMessage?.(message)；CC query() yield 的 assistant 消息类型之一）。
+        //   null 判空 = CC `onMessage?.()`（本方法允许 onMessage=null：16 参兼容入口与测试直调）。
+        if (onMessage != null) {
+            onMessage.accept(assistantToolCallsMsg);
+        }
         // [usage-push] 工具轮 assistant 消息逐条 usage 实时推 + run 级累计（append withUsage 后立即；
         //   对齐 CC claude.ts:2244-2248 message.usage 写回 UI）。static 本方法在
         //   com.nexusai.application.agent.loop 包 → publishMessageUsage 需 public（LlmAgentLoop
@@ -2023,6 +2038,13 @@ public record AgentLoopContext(
                 }
             }
             state.appendMessage(toolResultMsg);
+            // [D] 发射点 ②：tool_result 真实产出（模型 tool_call 的执行结果，CC query() yield 的
+            //   user(=tool_result) 消息类型）→ onMessage（对齐 CC forkedAgent.ts:578）。
+            //   排在 flushNewMessagesAfterToolResult 之前：本发射点只发 tool_result 本身，
+            //   工具 newMessages（isMeta image 等）非模型产出 → 不发射（取舍边界见 QueryParams#onMessage）。
+            if (onMessage != null) {
+                onMessage.accept(toolResultMsg);
+            }
             // [fix-toolcalls-400 C] 该工具 newMessages 紧跟其 tool_result flush ·
             //   对齐 CC toolExecution.ts:1478 addToolResult 先 / :1566-1570 newMessages 后。
             //   工具执行期 (StreamingToolExecutor dispatch → ToolResultApplier.apply) 只把 newMessages

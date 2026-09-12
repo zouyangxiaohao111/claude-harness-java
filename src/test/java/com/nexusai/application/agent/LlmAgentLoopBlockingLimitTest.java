@@ -71,7 +71,7 @@ class LlmAgentLoopBlockingLimitTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         whenFactoryGetProvider(factory, provider);
 
@@ -106,7 +106,7 @@ class LlmAgentLoopBlockingLimitTest {
             .isEqualTo(AgentState.ExitReason.BLOCKING_LIMIT);
         // provider.stream 必须 0 次调用（loop 已调用 provider.type()，故不能用 verifyNoInteractions）
         verify(provider, never()).stream(
-            any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         assertThat(state.rawMessages().get(state.rawMessages().size() - 1).content())
             .as("blocking-limit 必须 append PROMPT_TOO_LONG assistant 错误消息（CC createAssistantAPIErrorMessage）")
             .contains("too long");
@@ -132,7 +132,7 @@ class LlmAgentLoopBlockingLimitTest {
             onComplete.run();
             return null;
         }).when(provider).stream(
-            any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         whenFactoryGetProvider(factory, provider);
 
@@ -164,7 +164,7 @@ class LlmAgentLoopBlockingLimitTest {
             .as("COMPACT 源跳过预检 → 走正常 LLM 调用（exitReason 应为 NORMAL 而非 BLOCKING_LIMIT）")
             .isNotEqualTo(AgentState.ExitReason.BLOCKING_LIMIT);
         verify(provider).stream(
-            any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     private static void whenFactoryGetProvider(LlmProviderFactory factory, LlmProvider provider) {

@@ -400,7 +400,9 @@ public class ExecAgentHook {
                         },
                         request.onToolCallComplete(), request.onReasoningChunk(),
                         request.onStreamingFallback(), request.onError(), request.onComplete(),
-                        request.abortController());
+                        request.abortController(),
+                        // [C] skipCacheWrite 逐字段拷贝透传（hook agent 请求与主循环同源 params）
+                        request.skipCacheWrite());
                     return ModelCaller.call(context(), countingRequest);
                 }
             };

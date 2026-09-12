@@ -108,7 +108,8 @@ public final class ModelCaller {
                 request.onStreamingFallback(),
                 request.abortController(),
                 request.onError(),
-                request.onComplete());
+                request.onComplete(),
+                request.skipCacheWrite());
             return ModelResponse.SUBMITTED;
         }
         // [IMP-SP-08] blocks 发送边界：splitSysPromptPrefix 产物直达 blocks 重载（system 为
@@ -137,7 +138,8 @@ public final class ModelCaller {
             request.onStreamingFallback(),
             request.abortController(),
             request.onError(),
-            request.onComplete());
+            request.onComplete(),
+            request.skipCacheWrite());
         return ModelResponse.SUBMITTED;
     }
 }

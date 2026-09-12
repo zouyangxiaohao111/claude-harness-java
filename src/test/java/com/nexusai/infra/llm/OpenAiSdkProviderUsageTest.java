@@ -234,7 +234,7 @@ class OpenAiSdkProviderUsageTest {
             List.of(new SystemPromptBlock("sys", CacheScope.NULL)),
             List.of(), null, null, null, null, null,
             chunks::add, captured::add, null, null, null, null, e -> {
-            }, done::countDown);
+            }, done::countDown, null);
         done.await(5, java.util.concurrent.TimeUnit.SECONDS);
 
         assertThat(captured).isNotEmpty();

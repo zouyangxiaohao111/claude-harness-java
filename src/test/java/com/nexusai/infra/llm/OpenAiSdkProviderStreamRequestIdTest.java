@@ -68,7 +68,7 @@ class OpenAiSdkProviderStreamRequestIdTest {
             AtomicReference<AssistantMessage> got = new AtomicReference<>();
             provider.stream(config, "deepseek-chat", List.of(new SystemPromptBlock("sys", CacheScope.NULL)),
                 List.of(userMsg("hi")), null, null, null, null, null,
-                c -> {}, got::set, null, null, null, null, e -> {}, done::countDown);
+                c -> {}, got::set, null, null, null, null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(got.get().requestId())
@@ -101,7 +101,7 @@ class OpenAiSdkProviderStreamRequestIdTest {
             AtomicReference<AssistantMessage> got = new AtomicReference<>();
             provider.stream(config, "deepseek-chat", List.of(new SystemPromptBlock("sys", CacheScope.NULL)),
                 List.of(userMsg("hi")), null, null, null, null, null,
-                c -> {}, got::set, null, null, null, null, e -> {}, done::countDown);
+                c -> {}, got::set, null, null, null, null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(got.get().requestId())

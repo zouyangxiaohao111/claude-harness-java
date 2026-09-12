@@ -254,7 +254,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                        Runnable onStreamingFallback,
                        com.nexusai.application.agent.tool.AbortController abortController,
                        Consumer<Throwable> onError,
-                       Runnable onComplete) {
+                       Runnable onComplete,
+                       Boolean skipCacheWrite) {
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
             abortController.onCancel(ac -> {
@@ -267,7 +268,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         doStream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete);
+            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -310,7 +311,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                           Runnable onStreamingFallback,
                           AtomicBoolean aborted,
                           Consumer<Throwable> onError,
-                          Runnable onComplete) {
+                          Runnable onComplete,
+                          Boolean skipCacheWrite) {
         if (config == null || !config.isUsable()) {
             onError.accept(new IllegalStateException(
                 "AnthropicSdkProvider.stream called without usable ProviderConfig"));
@@ -321,8 +323,10 @@ public class AnthropicSdkProvider implements LlmProvider {
 
         try {
             AnthropicClient client = buildClient(config);
+            // [C] skipCacheWrite 透传（原硬编码 null → 流式路径 marker 移位永不触发）·
+            //   CC claude.ts:3224/:3243 markerIndex = skipCacheWrite ? len-2 : len-1
             MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
-                maxOutputTokensOverride, taskBudget, effortValue, null, null, null,
+                maxOutputTokensOverride, taskBudget, effortValue, null, skipCacheWrite, null,
                 StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
 
             String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
@@ -436,7 +440,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 && shouldUseNonStreamingFallback(translated, aborted, streamingFallbackDisabled())) {
                 if (nonStreamingFallback(config, modelName, systemPromptBlocks, history, tools,
                     maxOutputTokensOverride, taskBudget, effortValue, translated, aborted,
-                    onStreamingFallback, onAssistantMessage, onComplete)) {
+                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite)) {
                     return;
                 }
                 log.warn("[AnthropicSdkProvider] 非流式回退失败，走原始流式错误 · CC claude.ts:2562");
@@ -530,7 +534,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                                          String effortValue, Throwable streamingError,
                                          AtomicBoolean aborted, Runnable onStreamingFallback,
                                          Consumer<AssistantMessage> onAssistantMessage,
-                                         Runnable onComplete) {
+                                         Runnable onComplete,
+                                         Boolean skipCacheWrite) {
         if (onStreamingFallback != null) {
             try {
                 onStreamingFallback.run();
@@ -555,7 +560,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             long attemptStartMs = System.currentTimeMillis(); // [A-13] 每次非流式尝试 = 一次真实 LLM 调用
             try {
                 AssistantMessage msg = nonStreamingSend(config, modelName, systemPromptBlocks,
-                    history, tools, maxOutputTokensOverride, taskBudget, effortValue, attemptStartMs);
+                    history, tools, maxOutputTokensOverride, taskBudget, effortValue, attemptStartMs,
+                    skipCacheWrite);
                 if (onAssistantMessage != null) {
                     onAssistantMessage.accept(msg);
                 }
@@ -631,10 +637,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                                               List<SystemPromptBlock> systemPromptBlocks,
                                               List<ChatMessageDto> history, ArrayNode tools,
                                               Integer maxOutputTokensOverride, TaskBudgetParam taskBudget,
-                                              String effortValue, long startMs) {
+                                              String effortValue, long startMs,
+                                              Boolean skipCacheWrite) {
         AnthropicClient client = buildClient(config);
+        // [C] 流式失败回退路径同样透传 skipCacheWrite（原硬编码 null）——回退链与流式链 marker 语义一致
         MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
-            maxOutputTokensOverride, taskBudget, effortValue, null, null, null,
+            maxOutputTokensOverride, taskBudget, effortValue, null, skipCacheWrite, null,
             StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
         // [DEC-RV-09] 非流式硬 cap 64000 · CC claude.ts:3364-3389 adjustParamsForNonStreaming
         //   （buildMessageParams 之后、create 之前无条件应用；claude.ts:857-860）

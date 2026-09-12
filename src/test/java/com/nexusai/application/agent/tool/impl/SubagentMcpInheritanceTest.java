@@ -293,7 +293,7 @@ class SubagentMcpInheritanceTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
 
         AgentState state = loop.run(RunRequest.session(
             "hello", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null /* 主线程 agentId=null */,
@@ -338,7 +338,7 @@ class SubagentMcpInheritanceTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
 
         AgentState state = loop.run(RunRequest.session(
             "hello", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null,

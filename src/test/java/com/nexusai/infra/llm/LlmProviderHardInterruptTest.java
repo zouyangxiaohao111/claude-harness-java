@@ -58,7 +58,7 @@ class LlmProviderHardInterruptTest {
             () -> {
                 completed.set(true);
                 done.countDown();
-            });
+            }, null);
 
         assertThat(done.await(5, TimeUnit.SECONDS)).as("abort 后必须在 5s 内终止").isTrue();
         assertThat(completed.get()).as("abort 硬中断: 不触发 onComplete").isFalse();
@@ -88,7 +88,7 @@ class LlmProviderHardInterruptTest {
             () -> {
                 completed.set(true);
                 done.countDown();
-            });
+            }, null);
 
         assertThat(done.await(5, TimeUnit.SECONDS)).as("正常 stream 必须在 5s 内完成").isTrue();
         assertThat(completed.get()).isTrue();
@@ -127,7 +127,7 @@ class LlmProviderHardInterruptTest {
             () -> {
                 completed.set(true);
                 done.countDown();
-            });
+            }, null);
 
         assertThat(firstChunk.await(5, TimeUnit.SECONDS)).as("mock 必须在 5s 内发出首 chunk").isTrue();
         assertThat(done.await(5, TimeUnit.SECONDS)).as("abort 后必须在 5s 内终止").isTrue();

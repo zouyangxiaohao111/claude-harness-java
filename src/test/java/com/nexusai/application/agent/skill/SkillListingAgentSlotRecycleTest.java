@@ -174,7 +174,7 @@ class SkillListingAgentSlotRecycleTest {
                            Runnable onStreamingFallback,
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete) {
+                           Runnable onComplete, Boolean skipCacheWrite) {
             int idx = callCount.getAndIncrement();
             onAssistantMessage.accept(responses.get(Math.min(idx, responses.size() - 1)));
             onComplete.run();

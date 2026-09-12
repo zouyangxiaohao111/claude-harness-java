@@ -297,7 +297,7 @@ class R32B7b2_PerCallReResolutionTest {
                            Runnable onStreamingFallback,
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete) {
+                           Runnable onComplete, Boolean skipCacheWrite) {
             // 真实 run() 流: 记录 model + 模拟一次纯文本响应 (无 tool_calls → NORMAL 退出)
             recordedModels.add(modelName);
             streamCallCount++;

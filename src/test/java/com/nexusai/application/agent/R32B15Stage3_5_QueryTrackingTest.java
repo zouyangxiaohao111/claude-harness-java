@@ -99,7 +99,7 @@ class R32B15Stage3_5_QueryTrackingTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);

@@ -60,6 +60,14 @@ import java.util.function.Consumer;
  * @param onStreamingFallback     provider 内部流式失败降级非流式时回调 · 对齐 CC query.ts:678-680
  *                                （loop 在下一条 message 到达时 tombstone 已积累的部分 assistant 消息）
  * @param onComplete              正常完成回调（与 onError 互斥）
+ * @param skipCacheWrite          [C] fork/side-query 不写 prompt cache（null = 未显式设置 → 等价
+ *                                false）· CC original: options.skipCacheWrite（claude.ts:711 options
+ *                                字段 → :1797 传参 → :3224/:3229 解构 → :3243 marker 移位）。本字段
+ *                                是 {@link com.nexusai.application.agent.loop.QueryParams#skipCacheWrite}
+ *                                到达 provider 的唯一中转站（ModelCaller 逐字段透传 → provider.stream
+ *                                末参 → AnthropicSdkProvider.buildMessageParams marker 落位）。
+ *                                <b>[C 位置取舍]</b> 组件位置 = 参数表末尾（record 组件序不影响语义，
+ *                                但保持与 {@code provider.stream} 末参一致，便于逐字段对照）。
  */
 public record ModelRequest(
     ProviderConfig config,                                  // provider 运行时配置（baseUrl + apiKey）
@@ -83,6 +91,7 @@ public record ModelRequest(
     Runnable onStreamingFallback,                           // streaming→non-streaming 降级通知（CC query.ts:678-680）
     Consumer<Throwable> onError,                            // 错误回调；只触发一次
     Runnable onComplete,                                    // 正常完成回调；只触发一次，与 onError 互斥
-    AbortController abortController                         // [H13-GAP-4 v3] 取消信号（可 null）
+    AbortController abortController,                        // [H13-GAP-4 v3] 取消信号（可 null）
+    Boolean skipCacheWrite                                  // [C] fork/side-query 不写 prompt cache（null = 未设置）· CC original: options.skipCacheWrite (claude.ts:711 → :3243)
 ) {
 }

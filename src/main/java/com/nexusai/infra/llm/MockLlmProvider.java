@@ -72,6 +72,18 @@ public class MockLlmProvider implements LlmProvider {
             : new AgentUsage(0L, MOCK_OUTPUT_TOKENS, 0L, 0L, null, null, null);
     }
 
+    /**
+     * [C] 最近一次 {@link #stream} 收到的 {@code skipCacheWrite}（可 null = 未显式设置）·
+     * 测试可观测性：mock 无 wire 层（buildMessageParams marker），透传是否到位只能在此断言
+     * （生产由 {@code AnthropicSdkProviderSystemBlocksTest} 覆盖 wire 级 marker 落位）。
+     */
+    private volatile Boolean lastSkipCacheWrite;
+
+    /** [C] 最近一次 stream 收到的 skipCacheWrite（null = 未显式设置）。 */
+    public Boolean lastSkipCacheWrite() {
+        return lastSkipCacheWrite;
+    }
+
     @Override
     public String type() {
         return "openai_compatible";
@@ -102,7 +114,11 @@ public class MockLlmProvider implements LlmProvider {
                        Runnable onStreamingFallback,
                        com.nexusai.application.agent.tool.AbortController abortController,
                        Consumer<Throwable> onError,
-                       Runnable onComplete) {
+                       Runnable onComplete,
+                       Boolean skipCacheWrite) {
+        // [C] 记录 skipCacheWrite 供测试观测（mock 无 wire 层；主/子/fork 任一路径透传是否到位
+        //   经 {@link #lastSkipCacheWrite()} 断言）。
+        this.lastSkipCacheWrite = skipCacheWrite;
         AtomicBoolean aborted = new AtomicBoolean(false);
         AtomicReference<Thread> workerRef = new AtomicReference<>();
         AtomicReference<String> abortReason = new AtomicReference<>();
@@ -144,7 +160,10 @@ public class MockLlmProvider implements LlmProvider {
                        Runnable onStreamingFallback,
                        com.nexusai.application.agent.tool.AbortController abortController,
                        Consumer<Throwable> onError,
-                       Runnable onComplete) {
+                       Runnable onComplete,
+                       Boolean skipCacheWrite) {
+        // [C] 记录 skipCacheWrite 供测试观测（同上）
+        this.lastSkipCacheWrite = skipCacheWrite;
         List<ChatMessageDto> reflected = history;
         if (thinkingConfig != null) {
             reflected = new ArrayList<>(history == null ? List.of() : history);
@@ -175,7 +194,7 @@ public class MockLlmProvider implements LlmProvider {
             systemPrompt == null ? null : List.of(new SystemPromptBlock(systemPrompt, CacheScope.NULL)),
             reflected, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, abortController, onError, onComplete);
+            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite);
     }
 
     /**

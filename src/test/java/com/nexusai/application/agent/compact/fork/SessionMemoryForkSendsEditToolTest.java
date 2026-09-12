@@ -124,7 +124,7 @@ class SessionMemoryForkSendsEditToolTest {
                                          Consumer<com.nexusai.application.agent.tool.ToolUseBlock> onToolCall,
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
                                          com.nexusai.application.agent.tool.AbortController abort,
-                                         Consumer<Throwable> onError, Runnable onComplete) {
+                                         Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
                 capturedTools[0] = t;
                 capturedHistory[0] = h;
                 onAssistant.accept(new AssistantMessage("会话内容较长，暂无必要新增内容。", "stop", List.of()));

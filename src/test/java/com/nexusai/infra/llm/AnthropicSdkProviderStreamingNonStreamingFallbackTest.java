@@ -86,7 +86,7 @@ class AnthropicSdkProviderStreamingNonStreamingFallbackTest {
                 () -> {
                     completed.set(true);
                     done.countDown();
-                });
+                }, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS))
                 .as("流式失败→非流式回退应在有限时间内完成")

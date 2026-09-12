@@ -69,7 +69,7 @@ class LlmAgentLoopRunRequestContractTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -115,7 +115,7 @@ class LlmAgentLoopRunRequestContractTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -152,7 +152,7 @@ class LlmAgentLoopRunRequestContractTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -189,7 +189,7 @@ class LlmAgentLoopRunRequestContractTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -286,7 +286,7 @@ class LlmAgentLoopRunRequestContractTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -335,7 +335,8 @@ class LlmAgentLoopRunRequestContractTest {
                 // [IMP2-05] querySourceValue 为第 8 字段（精确值通道，null = 回退 category.canonical()）；
                 // 本测试锁定 compact ctor 的 querySource 非空校验，querySourceValue 传 null 不影响校验。
                 null, null, null, null, null, null, null, null, ProviderConfig.empty(), "test-model",
-                null, null),
+                // [D] 第 17 字段 onToolProgress / 第 18 字段 onMessage（均 null → 不影响本校验）
+                null, null, null),
             "querySource 为 null 必须抛 IllegalArgumentException");
     }
 }

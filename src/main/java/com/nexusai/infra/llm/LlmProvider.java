@@ -62,6 +62,19 @@ public interface LlmProvider {
      *                                发送边界遥测/缓存 TTL 判定；Java getCacheControl ttl 由
      *                                PromptCachingTtlConfig 配置（默认 '1h'，RES-R7），与 querySource 无关
      * @param abortController         取消信号（可 null = 无中断能力）
+     * @param skipCacheWrite          [C] fork/side-query 不写 prompt cache 条目（可 null = 未显式设置
+     *                                → 行为等价 false）· CC original: {@code options.skipCacheWrite}
+     *                                (Open-ClaudeCode/src/services/api/claude.ts:711 字段 → :1797 传参 →
+     *                                :3224/:3229 解构 → :3243 {@code const markerIndex = skipCacheWrite
+     *                                ? messages.length - 2 : messages.length - 1})。Java 消费点 =
+     *                                {@link AnthropicSdkProvider#buildMessageParams} messages 通道
+     *                                exactly-one cache_control marker 落位（true → 倒数第二条）。
+     *                                <p><b>参数位置说明（显式取舍）</b>：追加在<b>参数表末尾</b>而非
+     *                                请求选项簇（effortValue/querySource 旁）。WHY: 本接口 3 个重载
+     *                                在测试树中被 Mockito 以<b>纯 positional 索引</b>消费
+     *                                （{@code inv.getArgument(9/10/16)} = onChunk/onAssistantMessage/
+     *                                onComplete，全仓 250 处），中部插入会使这些索引静默漂移；
+     *                                末尾追加与之逐位兼容。CC 侧本参数经 options 对象传递，位置无语义。
      */
     void stream(ProviderConfig config,
                 String modelName,
@@ -79,7 +92,8 @@ public interface LlmProvider {
                 Runnable onStreamingFallback,
                 AbortController abortController,
                 Consumer<Throwable> onError,
-                Runnable onComplete);
+                Runnable onComplete,
+                Boolean skipCacheWrite);
 
     /**
      * [CCJ-EXEC-08] 18-arg 流式 · <b>带 thinkingConfig 透传</b>（含 effortValue）。
@@ -96,6 +110,7 @@ public interface LlmProvider {
      *
      * @param effortValue    会话级 effort 值（可 null = 不注入；透传保持既有语义）
      * @param thinkingConfig 思考配置（可 null = 不发送；默认实现忽略）
+     * @param skipCacheWrite [C] fork/side-query 不写 prompt cache（可 null = 未设置）· 见抽象重载
      */
     default void stream(ProviderConfig config,
                         String modelName,
@@ -113,7 +128,8 @@ public interface LlmProvider {
                         Runnable onStreamingFallback,
                         AbortController abortController,
                         Consumer<Throwable> onError,
-                        Runnable onComplete) {
+                        Runnable onComplete,
+                        Boolean skipCacheWrite) {
         // [merge-fix] ⊕C-1 blocks 唯一发送契约：String 兼容链已删（16-arg String 委托目标不在
         //   合并接口），默认实现把 systemPrompt 折为单 block（CacheScope.NULL = 不缓存，join 恒等）
         //   路由到 blocks 抽象重载；thinkingConfig 忽略（与原有默认语义一致）。
@@ -121,7 +137,7 @@ public interface LlmProvider {
             systemPrompt == null ? null : List.of(new SystemPromptBlock(systemPrompt, CacheScope.NULL)),
             history, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, abortController, onError, onComplete);
+            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite);
     }
 
     /**
@@ -134,6 +150,7 @@ public interface LlmProvider {
      * {@code thinking:{type:'disabled'}}，对齐 chatWithOptions :490-495 先例）。
      *
      * @param thinkingConfig 思考配置（可 null = 不发送；默认实现忽略）
+     * @param skipCacheWrite [C] fork/side-query 不写 prompt cache（可 null = 未设置）· 见抽象重载
      */
     default void stream(ProviderConfig config,
                         String modelName,
@@ -152,11 +169,12 @@ public interface LlmProvider {
                         Runnable onStreamingFallback,
                         AbortController abortController,
                         Consumer<Throwable> onError,
-                        Runnable onComplete) {
+                        Runnable onComplete,
+                        Boolean skipCacheWrite) {
         stream(config, modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, abortController, onError, onComplete);
+            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite);
     }
 
     /**

@@ -154,7 +154,7 @@ class AnthropicSdkProviderEffortTest {
                 config, "claude-sonnet-4-6", List.of(new com.nexusai.application.agent.prompt.SystemPromptBlock("sys", com.nexusai.application.agent.prompt.CacheScope.ORG)), List.of(userMsg("hi")), null,
                 null, null, "high", null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown);
+                null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).as("onComplete 必须触发（正常流结束）").isTrue();
             assertThat(latch.await(10, TimeUnit.SECONDS)).as("server 必须收到请求").isTrue();
@@ -199,7 +199,7 @@ class AnthropicSdkProviderEffortTest {
                 config, "claude-sonnet-4-6", List.of(new com.nexusai.application.agent.prompt.SystemPromptBlock("sys", com.nexusai.application.agent.prompt.CacheScope.ORG)), List.of(userMsg("hi")), null,
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown);
+                null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();
@@ -241,7 +241,7 @@ class AnthropicSdkProviderEffortTest {
                 config, "claude-haiku-4-5", List.of(new com.nexusai.application.agent.prompt.SystemPromptBlock("sys", com.nexusai.application.agent.prompt.CacheScope.ORG)), List.of(userMsg("hi")), null,
                 null, null, "high", null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown);
+                null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();
@@ -281,7 +281,7 @@ class AnthropicSdkProviderEffortTest {
                 config, "claude-sonnet-4-6", List.of(new com.nexusai.application.agent.prompt.SystemPromptBlock("sys", com.nexusai.application.agent.prompt.CacheScope.ORG)), List.of(userMsg("hi")), null,
                 null, new TaskBudgetParam(200_000, 165_000), "high", null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown);
+                null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();

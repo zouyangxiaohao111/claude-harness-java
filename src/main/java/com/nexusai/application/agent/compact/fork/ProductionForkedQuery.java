@@ -374,7 +374,8 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
             try {
                 msg = streamOnce(provider, config, model, systemPromptBlocks,
                     runningMessages, tools, params.maxOutputTokensOverride(), abort,
-                    params.querySource() != null ? params.querySource().canonical() : null);
+                    params.querySource() != null ? params.querySource().canonical() : null,
+                    params.skipCacheWrite());
             } catch (Exception e) {
                 log.warn("[ProductionForkedQuery] 第 {} 轮 provider 调用异常（best-effort 终止 fork loop）: {}",
                     turns, e.getMessage());
@@ -566,6 +567,10 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
      *                           CC original: buildSystemPromptBlocks 输入（utils/api.ts:321-435）
      * @param maxOutputTokensOverride fork 路径传 null（不设，防 cache key 破坏 · INV-7）
      * @param querySource         来源标识（blocks 重载发送边界遥测 · 对齐 ModelCaller request.querySource）
+     * @param skipCacheWrite      [C] fork 不写 prompt cache 条目 · CC original: forkedAgent.ts:545-556
+     *                            {@code query({maxTurns, skipCacheWrite, canUseTool})} 透传 →
+     *                            claude.ts:3243 markerIndex 移位（compact fork = true，其余 fork = false）。
+     *                            本参数闭合「RunForkedAgent 写入 skipCacheWrite 后 0 读点」断点。
      * @return 完整 assistant message（流结束但无 assistant → null）
      */
     private AssistantMessage streamOnce(LlmProvider provider,
@@ -576,7 +581,8 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                                         ArrayNode tools,
                                         Integer maxOutputTokensOverride,
                                         AbortController abortController,
-                                        String querySource) {
+                                        String querySource,
+                                        Boolean skipCacheWrite) {
         CompletableFuture<AssistantMessage> future = new CompletableFuture<>();
         final AtomicInteger chunkCount = new AtomicInteger(0);
 
@@ -592,6 +598,8 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
             // [RES-C6] blocks 重载统一发送：AnthropicSdkProvider 覆写（system 数组）或默认 join 委托。
             //   taskBudget/effortValue 恒 null（fork 无 task_budget/effort 语义 · 对齐 ModelCaller
             //   blocks 分支非 Anthropic 场景）；maxOutputTokensOverride 透传（INV-7 恒 null）。
+            //   [C] skipCacheWrite 透传（末参）—— compact fork 恒 true → marker 落倒数第二条
+            //   （CC claude.ts:3243），fork 不污染主线程 cache key（compact.ts:1195）。
             provider.stream(
                 config, model, systemPromptBlocks, history, tools, maxOutputTokensOverride,
                 null, /* taskBudget */
@@ -604,7 +612,8 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                 () -> { /* onStreamingFallback */ },
                 abortController,
                 onError,
-                onComplete);
+                onComplete,
+                skipCacheWrite);
             // [IMP-GAP04 △-15] §7-10 默认裁决对齐 CC（CC 无 300s 硬超时，forkedAgent.ts query()
             //   靠 abortController + SDK 状态，流一直持续则等待）→ future.get() 无超时等待；
             //   取消路径保留：abortController → provider abort → CancellationException →

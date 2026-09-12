@@ -280,7 +280,7 @@ class HookRegistryDispatchTest {
                                          Runnable onStreamingFallback,
                                          AbortController abortController,
                                          java.util.function.Consumer<Throwable> onError,
-                                         Runnable onComplete) {
+                                         Runnable onComplete, Boolean skipCacheWrite) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig config, String modelName, String systemPrompt, String userMessage) {

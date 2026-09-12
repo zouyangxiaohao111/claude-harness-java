@@ -245,7 +245,7 @@ class SessionMemoryTuningConsumptionTest {
                 onComplete.run();
                 return null;
             }).when(mainProvider).stream(any(), anyString(), anyList(), anyList(), any(),
-                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
             when(factory.getProvider(any(), any())).thenReturn(mainProvider);
 
             LlmAgentLoop loop = new LlmAgentLoop(factory, null, registry);

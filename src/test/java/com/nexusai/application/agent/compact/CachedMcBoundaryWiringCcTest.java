@@ -468,7 +468,7 @@ class CachedMcBoundaryWiringCcTest {
             onComplete.run();
             return null;
         }).when(provider).stream(
-            any(), any(), (java.util.List<com.nexusai.application.agent.prompt.SystemPromptBlock>) any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), (java.util.List<com.nexusai.application.agent.prompt.SystemPromptBlock>) any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         return factory;

@@ -527,15 +527,49 @@ class RunForkedAgentTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // [C] skipCacheWrite 断点 B4：ForkQueryParams.skipCacheWrite → provider.stream
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[C] ProductionForkedQuery: skipCacheWrite=true 真实送达 provider.stream（compact fork 不写缓存）")
+    void productionForkedQuery_skipCacheWrite_reachesProvider() {
+        // WHY（CLAUDE.md 规则 9 · 测试验证意图）：配合 RunForkedAgent.java:210（params.skipCacheWrite()
+        //   → ForkQueryParams）与 compact.ts:1195（compact fork 恒 true），fork 的「不写 cache」
+        //   语义只有在**真正到达 provider** 时才成立 —— 此前 ForkQueryParams.skipCacheWrite 写入后
+        //   在 fork 链上 0 读点（ProductionForkedQuery.streamOnce 调 17 参 stream 时无处可传），
+        //   marker 移位（claude.ts:3243）在 fork 路径恒不触发 → fork 会覆盖主线程 cache 条目。
+        //   RED 变异：把 ProductionForkedQuery.streamOnce 的 provider.stream 末参改回不传/null
+        //   （或删掉 streamOnce 的 skipCacheWrite 形参透传）→ provider 收到 null → 本断言红。
+        EchoTool echo = new EchoTool();
+        ToolRegistry registry = ToolRegistry.from(List.of(echo));
+        ScriptedProvider provider = new ScriptedProvider(
+            new com.nexusai.infra.llm.AssistantMessage("done", "stop", List.of()));
+        ProductionForkedQuery loop = new ProductionForkedQuery(
+            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+
+        loop.run(forkParams(1, allowAll(), forkCtxWith(echo), true));
+
+        assertThat(provider.callCount()).isEqualTo(1);
+        assertThat(provider.lastSkipCacheWrite())
+            .as("fork 的 skipCacheWrite=true 必须到达 provider.stream（B4 断点闭合）").isTrue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // IMP-M-P0-3 · ProductionForkedQuery 测试工具
     // ════════════════════════════════════════════════════════════════════
 
     /** 构造 ForkQueryParams（extract 风格：maxTurns/skipCacheWrite=false；[RES-R4-2] 数组 + gate=3P 默认）。 */
     private static RunForkedAgent.ForkQueryParams forkParams(Integer maxTurns,
             HookPermissionResolver.CanUseTool canUseTool, ToolUseContext ctx) {
+        return forkParams(maxTurns, canUseTool, ctx, false);
+    }
+
+    /** [C] 构造 ForkQueryParams · 显式指定 skipCacheWrite（compact fork = true / 其余 = false）。 */
+    private static RunForkedAgent.ForkQueryParams forkParams(Integer maxTurns,
+            HookPermissionResolver.CanUseTool canUseTool, ToolUseContext ctx, boolean skipCacheWrite) {
         return new RunForkedAgent.ForkQueryParams(
             List.of(userMessage("sr", "fork prompt")), List.of("sys"), Map.of(), Map.of(),
-            canUseTool, ctx, QuerySource.EXTRACT_MEMORIES, null, maxTurns, false,
+            canUseTool, ctx, QuerySource.EXTRACT_MEMORIES, null, maxTurns, skipCacheWrite,
             /*useGlobalCacheScope*/ false, /*onMessage*/ null);
     }
 
@@ -581,6 +615,7 @@ class RunForkedAgentTest {
             new java.util.concurrent.atomic.AtomicInteger();
         private volatile String lastSystemPrompt;
         private volatile List<SystemPromptBlock> lastSystemPromptBlocks;
+        private volatile Boolean lastSkipCacheWrite;
 
         ScriptedProvider(com.nexusai.infra.llm.AssistantMessage... script) {
             this.script = List.of(script);
@@ -590,6 +625,8 @@ class RunForkedAgentTest {
         String lastSystemPrompt() { return lastSystemPrompt; }
         /** [RES-C6] blocks 重载收到的发送边界 blocks 数组（null = 未走 blocks 重载 → 旧 String join 路径）。 */
         List<SystemPromptBlock> lastSystemPromptBlocks() { return lastSystemPromptBlocks; }
+        /** [C] 最近一轮 stream 收到的 skipCacheWrite（null = 未显式设置）· fork 透传断点 B4 的观测点。 */
+        Boolean lastSkipCacheWrite() { return lastSkipCacheWrite; }
 
         @Override public String type() { return "test"; }
         @Override public String chat(com.nexusai.infra.llm.ProviderConfig c, String m, String s, String u) { return ""; }
@@ -608,8 +645,9 @@ class RunForkedAgentTest {
                            Runnable onStreamingFallback,
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete) {
+                           Runnable onComplete, Boolean skipCacheWrite) {
             this.lastSystemPromptBlocks = systemPromptBlocks;
+            this.lastSkipCacheWrite = skipCacheWrite;
             // 兼容既有 String 断言：blocks → join("\\n\\n") 与 splitSysPromptPrefix 语义一致
             this.lastSystemPrompt = systemPromptBlocks == null ? null : systemPromptBlocks.stream()
                 .map(SystemPromptBlock::text)

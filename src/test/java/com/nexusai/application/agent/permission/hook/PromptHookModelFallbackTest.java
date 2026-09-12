@@ -88,7 +88,7 @@ class PromptHookModelFallbackTest {
             java.util.function.Consumer<String> orc, Runnable osf,
             AbortController ac,
             java.util.function.Consumer<Throwable> oe,
-            Runnable onC) {
+            Runnable onC, Boolean skipCacheWrite) {
             throw new UnsupportedOperationException();
         }
 

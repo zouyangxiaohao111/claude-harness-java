@@ -208,7 +208,7 @@ class ForkToolCallIdPassthroughTest {
                            Runnable onStreamingFallback,
                            AbortController abortController,
                            Consumer<Throwable> onError,
-                           Runnable onComplete) {
+                           Runnable onComplete, Boolean skipCacheWrite) {
             int idx = Math.min(callCount.getAndIncrement(), script.size() - 1);
             onAssistantMessage.accept(script.get(idx));
             onComplete.run();

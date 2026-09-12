@@ -72,7 +72,7 @@ class LlmAgentLoopEffortCcTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -117,7 +117,7 @@ class LlmAgentLoopEffortCcTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -167,7 +167,7 @@ class LlmAgentLoopEffortCcTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -191,7 +191,7 @@ class LlmAgentLoopEffortCcTest {
         assertThat(streamCalled[0]).as("effort=null → blocks stream 被调用").isTrue();
         // [⊕C-1] 原 18-arg String stream 已删除：effort=null 语义 = blocks stream 的 effortValue 参数（arg 7）为 null
         verify(provider).stream(any(), anyString(), anyList(), anyList(), any(), any(), isNull(), isNull(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     /** 构造最小 AgentLoopContext（与 LlmAgentLoopTaskBudgetCcTest 同形 · 无压缩组件位）。 */

@@ -78,7 +78,7 @@ class R33H2_ExecPromptHookTest {
                                Runnable onStreamingFallback,
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
-                               Runnable onComplete) {
+                               Runnable onComplete, Boolean skipCacheWrite) {
                 throw new UnsupportedOperationException();
             }
 
@@ -118,7 +118,7 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (capturedUser != null) capturedUser.set(u);
                 return response;
@@ -195,7 +195,7 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 try { Thread.sleep(2000); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); throw new RuntimeException(e);
@@ -233,7 +233,7 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new RuntimeException("provider exploded");
             }

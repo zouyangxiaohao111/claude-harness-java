@@ -148,7 +148,7 @@ class OpenAiSdkProviderEffortTest {
                 config, "deepseek-chat", List.of(new com.nexusai.application.agent.prompt.SystemPromptBlock("sys", com.nexusai.application.agent.prompt.CacheScope.ORG)), List.of(userMsg("hi")), null,
                 null, null, "high", null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown);
+                null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).as("onComplete 必须触发（正常流结束）").isTrue();
             assertThat(latch.await(10, TimeUnit.SECONDS)).as("server 必须收到请求").isTrue();
@@ -192,7 +192,7 @@ class OpenAiSdkProviderEffortTest {
                 config, "deepseek-chat", List.of(new com.nexusai.application.agent.prompt.SystemPromptBlock("sys", com.nexusai.application.agent.prompt.CacheScope.ORG)), List.of(userMsg("hi")), null,
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown);
+                null, e -> {}, done::countDown, null);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(latch.await(10, TimeUnit.SECONDS)).isTrue();

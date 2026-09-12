@@ -193,7 +193,7 @@ class YoloClassifierErrorDumpPathTest {
                                          Consumer<ToolUseBlock> onToolCallComplete,
                                          Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                          AbortController abortController,
-                                         Consumer<Throwable> onError, Runnable onDone) {
+                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite) {
                 throw new UnsupportedOperationException("YoloClassifier 不使用 stream");
             }
         };
@@ -221,7 +221,7 @@ class YoloClassifierErrorDumpPathTest {
                                          Consumer<ToolUseBlock> onToolCallComplete,
                                          Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                          AbortController abortController,
-                                         Consumer<Throwable> onError, Runnable onDone) {
+                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite) {
                 throw new UnsupportedOperationException("YoloClassifier 不使用 stream");
             }
         };

@@ -6449,7 +6449,12 @@ public class LlmAgentLoop implements AgentLoop {
                 //   per-turn TUC 的 abortController（主循环=runAbortController, hook=hookAbort）。
                 //   经 ModelCaller 15-arg 透传, abort 时 provider 以 CancellationException
                 //   终止底层请求（对齐 CC createCombinedAbortSignal 硬中断）。
-                perTurnTuc != null ? perTurnTuc.abortController() : null
+                perTurnTuc != null ? perTurnTuc.abortController() : null,
+                // [C] skipCacheWrite 透传（params → ModelRequest → ModelCaller → provider.stream 末参）。
+                //   本仓生产恒 null（所有 RunRequest 工厂第 11 实参传 null = CC 未设置语义，主线程写 cache）；
+                //   fork 路径不经本构造点（走 ProductionForkedQuery，自带 skipCacheWrite=true）。
+                //   本字段是「QueryParams.skipCacheWrite 0 读点」断点的闭合点（原 0 读点 → 唯一读点）。
+                params.skipCacheWrite()
             );
             // [H7-arch Phase 5-2 P3-④] 提交 LLM call（loop 不再直接 provider.stream）。
             // [对抗核验 H13-GAP-4 v3] 后台线程执行 callModel → loop 线程空闲执行 abort 感知轮询
@@ -7671,7 +7676,10 @@ public class LlmAgentLoop implements AgentLoop {
                     // [B7-R9] 输出解码耗时 decodeMs（工具轮 assistant 消息挂载；同 reasoningDurationMs 传参位）
                     computeDecodeMs(firstTokenMs),
                     // [5b] 受限 canUseTool 通道（fallback 路径重建 executor 也要拿到；三路生产路径恒 null → 现状）
-                    params.canUseTool());
+                    params.canUseTool(),
+                    // [D] 消息级回调透传（handleToolCallsTurn 内 2 个发射点：assistant(tool_calls) /
+                    //   tool_result）· null 已由 QueryParams 紧凑构造器归一为 no-op（对齐 CC onMessage?.()）
+                    params.onMessage());
                 if (!"continue".equals(result)) {
                     break;
                 }
@@ -7823,18 +7831,28 @@ public class LlmAgentLoop implements AgentLoop {
             //   （agentToolUtils.ts:355）。msg 为 null（异常路径）→ 无 usage 附加。
             // [同源改造] 4-参补传 turnAssistantId：state.rawMessages() 内该消息 id == 流式
             //   chunk.assistantMessageId == 后续 ChatService 落库 id（配合 ChatService B1），三处同源。
-            state.appendMessage(toMessage(Role.assistant, text,
-                msg != null ? msg.reasoning() : null, turnAssistantId)
-                .withUsage(msg != null ? msg.usage() : null)
-                // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
-                .withUsageCache(
-                    msg != null && msg.usage() != null && msg.usage().cacheReadInputTokens() != null
-                        ? Math.toIntExact(msg.usage().cacheReadInputTokens()) : null,
-                    msg != null && msg.usage() != null && msg.usage().cacheCreationInputTokens() != null
-                        ? Math.toIntExact(msg.usage().cacheCreationInputTokens()) : null)
-                .withReasoningDurationMs(computeReasoningDurationMs(reasoningStartMs, reasoningEndMs))
-                // [B7-R9] 输出解码耗时 decodeMs 挂载（t/s 前端展示；同 reasoningDurationMs 写点）
-                .withDecodeMs(computeDecodeMs(firstTokenMs)));
+            com.nexusai.model.session.dto.ChatMessageDto plainTextAssistantMsg =
+                toMessage(Role.assistant, text,
+                    msg != null ? msg.reasoning() : null, turnAssistantId)
+                    .withUsage(msg != null ? msg.usage() : null)
+                    // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
+                    .withUsageCache(
+                        msg != null && msg.usage() != null && msg.usage().cacheReadInputTokens() != null
+                            ? Math.toIntExact(msg.usage().cacheReadInputTokens()) : null,
+                        msg != null && msg.usage() != null && msg.usage().cacheCreationInputTokens() != null
+                            ? Math.toIntExact(msg.usage().cacheCreationInputTokens()) : null)
+                    .withReasoningDurationMs(computeReasoningDurationMs(reasoningStartMs, reasoningEndMs))
+                    // [B7-R9] 输出解码耗时 decodeMs 挂载（t/s 前端展示；同 reasoningDurationMs 写点）
+                    .withDecodeMs(computeDecodeMs(firstTokenMs));
+            state.appendMessage(plainTextAssistantMsg);
+            // [D] 发射点 ③：纯文本 assistant 真实模型产出 → onMessage（对齐 CC forkedAgent.ts:578
+            //   消费侧 onMessage?.(message)；CC query() yield 的 assistant 消息类型之一）。
+            //   本分支是「无工具调用的收尾轮」——唯一在 LlmAgentLoop 内落库的模型产出消息
+            //   （工具轮的 assistant/tool_result 两条在 AgentLoopContext.handleToolCallsTurn 内发射）。
+            //   null 判空 = CC `onMessage?.()`（params.onMessage() 已归一，此处防御直调场景）。
+            if (params.onMessage() != null) {
+                params.onMessage().accept(plainTextAssistantMsg);
+            }
             // [usage-push] 纯文本 assistant 消息逐条 usage 实时推 + run 级累计（append withUsage 后立即；
             //   对齐 CC claude.ts:2244-2248 message.usage 写回 UI；作用域有 effectiveModel/
             //   turnUserMessageId/turnAssistantId/msg/decodeMs。msg null（异常路径）→ 方法内 no-op）

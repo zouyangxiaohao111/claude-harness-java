@@ -618,7 +618,7 @@ class YoloClassifierTelemetryTest {
                                      Consumer<ToolUseBlock> onToolCallComplete,
                                      Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                      com.nexusai.application.agent.tool.AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onDone) {
+                                     Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite) {
             throw new UnsupportedOperationException("YoloClassifier 路径不使用 stream");
         }
     }
