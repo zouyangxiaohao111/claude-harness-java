@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { SessionDto } from '@/api/types'
+import { compareSessions, compareGroups } from '@/utils/sessionOrder'
 
 /**
  * 左侧栏 · 按项目路径分组，每路径下挂该项目的会话列表。
@@ -98,7 +99,12 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     arr.push(s)
     groups.set(key, arr)
   }
-  const orderedKeys = [...groups.keys()].sort((a, b) => (a === '__unbound__' ? 1 : b === '__unbound__' ? -1 : 0))
+  // 分组标题序：口径与理由见 compareGroups（比对函数已提出到 sessionOrder.ts 以便覆盖测试 ——
+  // 原实现 inline 在此处且对两个非 unbound 组恒返回 0，是本次缺陷的同一处却零测试覆盖）。
+  const orderedKeys = [...groups.keys()].sort((a, b) => compareGroups(
+    { key: a, sessions: groups.get(a) ?? [] },
+    { key: b, sessions: groups.get(b) ?? [] },
+  ))
 
   const toggleGroup = (key: string) => setCollapsedGroups((prev) => {
     const next = new Set(prev)
@@ -151,7 +157,10 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         const groupTitle = name
         const collapsed = collapsedGroups.has(key)
         // 折叠 → 组内会话全部收起（0 个）；展开 → 全部显示
-        const visible = collapsed ? [] : groupSessions
+        // 组内序走 compareSessions（updatedAt 降序 + id 兜底），与后端 ORDER BY 同一口径；
+        // 用 slice 而非原地 sort —— groups 里的数组是本渲染新建的，但原地排序会让「组内序」
+        // 隐式依赖遍历顺序，显式复制更清楚。
+        const visible = collapsed ? [] : [...groupSessions].sort(compareSessions)
         return (
           <div key={key} className="left-section">
             <div className={`label ${collapsed ? 'collapsed' : ''}`} onClick={() => toggleGroup(key)}>

@@ -179,7 +179,11 @@ class SessionServiceTest {
         off.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         off.setMessageCount(0);
         off.setBareMode(0);
-        when(sessionMapper.selectAll()).thenReturn(java.util.List.of(on, off));
+        // list() 的查询已改为 selectListByQuery(带 ORDER BY updated_at DESC, id ASC)——排序由 DB 执行
+        //   （service 不做内存排序，见 SessionListOrderIntegrationTest 的真实库序断言）。本测试只验
+        //   逐行 DTO 映射，故 stub 任意一序即可。⚠️ 若仍 stub selectAll()，Mockito 对返回 List 的方法
+        //   默认返回空列表 → dtos 为空 → 断言全挂（本次回归即此因）。
+        when(sessionMapper.selectListByQuery(any())).thenReturn(java.util.List.of(on, off));
 
         java.util.List<SessionDto> dtos = service.list();
 
@@ -314,7 +318,8 @@ class SessionServiceTest {
         withoutTeam.setModelTag(ModelTag.DS.name());
         withoutTeam.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         withoutTeam.setMessageCount(0);
-        when(sessionMapper.selectAll()).thenReturn(java.util.List.of(withTeam, withoutTeam));
+        // 同 list_toDtoExposesBareMode：查询已改 selectListByQuery（排序由 DB 执行），本测试只验逐行映射
+        when(sessionMapper.selectListByQuery(any())).thenReturn(java.util.List.of(withTeam, withoutTeam));
 
         java.util.List<SessionDto> dtos = service.list();
 
@@ -592,7 +597,8 @@ class SessionServiceTest {
         withoutData.setModelTag(ModelTag.DS.name());
         withoutData.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         withoutData.setMessageCount(0);
-        when(sessionMapper.selectAll()).thenReturn(java.util.List.of(withData, withoutData));
+        // 同 list_toDtoExposesBareMode：查询已改 selectListByQuery（排序由 DB 执行），本测试只验逐行映射
+        when(sessionMapper.selectListByQuery(any())).thenReturn(java.util.List.of(withData, withoutData));
 
         java.util.List<SessionDto> dtos = service.list();
 

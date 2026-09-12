@@ -16,6 +16,7 @@ import { marketApi } from '@/api/market'
 import { projectApi, type ProjectDto } from '@/api/projects'
 import { selectProjectFolder } from '@/utils/projectFolder'
 import { isAbsolutePath, normalizePath } from '@/utils/path'
+import { compareSessions } from '@/utils/sessionOrder'
 import { chatApi } from '@/api/chat'
 import { commandApi } from '@/api/command'
 import { tasksApi } from '@/api/tasks'
@@ -956,7 +957,11 @@ function App() {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
       return
     }
-    setSessions([created, ...storeSessions])
+    // 新增后按 compareSessions 重排（不无条件前插）：新建会话的 updatedAt 由后端置为当前时刻
+    //   → 本来就是最新 → 排序后自然在最前；同时整列表从此保持与后端 GET /sessions 同一口径，
+    //   消除「新建跳到顶上、F5 后掉回原位」的错序（原写法 [created, ...storeSessions] 前插，
+    //   F5 走 sessionApi.list() 的 DB 序 = 另一套口径）。
+    setSessions([created, ...storeSessions].sort(compareSessions))
     sessionDispatch({ type: 'SWITCH', sessionId: created.id })
     sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
     // M2：右面板 main 用真实项目反查（created.mainProjectId → realProjects），无真实 id → 空项目（不显示演示项目名）
@@ -1003,7 +1008,8 @@ function App() {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
       return
     }
-    setSessions([created, ...storeSessions])
+    // 同 createSession：按统一口径重排（新建会话 updatedAt 最新 → 自然置顶），不无条件前插
+    setSessions([created, ...storeSessions].sort(compareSessions))
     sessionDispatch({ type: 'SWITCH', sessionId: created.id })
     sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
     setPerSessionProjects((prev) => ({
@@ -1646,7 +1652,8 @@ function App() {
             const pickFrom = defaultNewSessionModel
             try {
               const created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: pid ?? undefined })
-              setSessions([created, ...storeSessions])
+              // 同 createSession：按统一口径重排（新建会话 updatedAt 最新 → 自然置顶），不无条件前插
+              setSessions([created, ...storeSessions].sort(compareSessions))
               sessionDispatch({ type: 'SWITCH', sessionId: created.id })
               sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
               // M2：项目内新建后写 perSessionProjects 真实 main（反查 realProjects）；无真实 id → 空项目

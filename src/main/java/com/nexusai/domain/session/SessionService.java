@@ -94,8 +94,52 @@ public class SessionService {
     @Lazy
     private SubagentTool subagentTool;
 
+    /**
+     * 会话列表 · 全量查询 + <b>显式定序</b>：{@code updated_at DESC, id ASC}。
+     *
+     * <p><b>WHY 必须有 ORDER BY</b>：原实现走 {@code selectAll()} 裸查，SQL 无 ORDER BY ——
+     * SQLite 对无 ORDER BY 的查询<b>不保证行序</b>（走 {@code idx_sessions_updated} 时通常恰好是
+     * updated_at 序，一旦改走全表扫描/其它索引即变）。前端 F5 重拉后序与「新建会话前插」不一致，
+     * 即用户报的「左栏会话列表排序不固定」。
+     *
+     * <p><b>口径（与前端同一条，改这里必须同步改）</b>：前端唯一口径在
+     * {@code front/src/utils/sessionOrder.ts} 的 {@code compareSessions}。两处必须同向：
+     * updated_at 降序（最近活动在前），同值按 id 升序。
+     *
+     * <p><b>为什么 tie-breaker 必需</b>：{@code updated_at} 列声明为 {@code TEXT}（V1__init_schema.sql:55
+     * {@code TEXT NOT NULL DEFAULT (datetime('now'))}），SQLite 按<b>文本</b>比较；同值时 SQLite
+     * 不保证相对顺序 → 排序是「偏序」而非「全序」，行序仍可能漂。补 id 升序后成为确定的全序。
+     * id 是 {@code sess-xxxxxxxx} 的 ASCII，普通字符串比较（SQLite TEXT 比较，非
+     * locale-aware）与前端 {@code a < b ? -1 : a > b ? 1 : 0} 完全一致（前端刻意不用
+     * localeCompare —— 它受 locale 影响、跨环境可能不同）。
+     *
+     * <p><b>实测精度</b>：DDL 默认值是秒级 {@code datetime('now')}，但本仓全部会话写入口
+     * （{@link #create} / {@link #update} / ChatService:2402 / MessageService:1234,1289,1354 /
+     * ProjectSessionBindingService:66,94）一律写
+     * {@code OffsetDateTime.now().toString()} 的 ISO-8601（纳秒级 + {@code +08:00} 偏移，实测 13 行
+     * 全部形如 {@code 2026-09-12T21:18:39.645961+08:00}）→ 文本序 == 时间序，秒级同秒碰撞在该
+     * 写入口下不会发生；但 id 兜底仍必需（非「锦上添花」）：既让排序成为全序，也覆盖任何走
+     * DDL 默认值写入的行（秒级，批量创建会同秒）。
+     *
+     * <p><b>[已登记 · 当前不可达的错序陷阱]</b>本定序是「文本序 == 时间序」，前提是列内文本形态统一。
+     * 以下两种情形会使该前提破裂（**当前均不可达** —— 已核全仓写入点，但一旦引入即静默错序，
+     * 故登记在此）：
+     * <ol>
+     *   <li><b>混时区偏移</b>：文本序只在所有行同一 UTC 偏移下等于时间序。若有行写 {@code Z}/{@code +00:00}
+     *       而另一些写 {@code +08:00}，同一时刻的相对次序会按偏移字面量而非真实时刻排。实测真库
+     *       13/13 全部 {@code +08:00}（单机单 JVM 单时区）。根治方向：写侧统一存 UTC
+     *       （{@code Instant}）—— 属另一改动，本次未做。</li>
+     *   <li><b>DDL 默认值的空格格式</b>：若某行绕过应用写入、走 V1:55 的
+     *       {@code DEFAULT (datetime('now'))}，其形态是 {@code 2026-09-12 10:23:45}（空格分隔、无小数）。
+     *       空格 {@code 0x20} &lt; {@code 'T'} {@code 0x54} → 该行会整段排到所有 ISO 行之前；
+     *       且 JS {@code Date.parse} 对空格格式按**本地时区**解析 → 后端文本序与前端语义分歧。
+     *       防回归守卫：{@code SessionListOrderIntegrationTest} 的「出线串形态」用例断言出线
+     *       {@code updatedAt} 必为带 {@code T} 的 ISO 串。</li>
+     * </ol>
+     */
     public List<SessionDto> list() {
-        List<SessionRecord> all = sessionMapper.selectAll();
+        List<SessionRecord> all = sessionMapper.selectListByQuery(
+            QueryWrapper.create().orderBy("updated_at", false).orderBy("id", true));
         List<SessionDto> result = new ArrayList<>(all.size());
         for (SessionRecord s : all) {
             result.add(toDto(s));
