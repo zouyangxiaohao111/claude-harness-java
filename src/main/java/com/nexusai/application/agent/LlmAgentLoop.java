@@ -4212,29 +4212,6 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [prompt-assembly-A · per-run 材料收集] 材料收集段执行次数 · <b>测试观测点</b>
-     * （static bridge 先例 = {@link #staticSubagentTool}）。
-     *
-     * <p>WHY 需要观测点：材料收集（fetchSystemPromptParts → buildEffectiveSystemPrompt →
-     * coordinator userContext 合并）已从 do-while（per-tool-round）搬到 do-while 之前
-     * （per-run = per user turn，对齐 CC queryContext.ts:44 / QueryEngine.ts:302）。该「搬出」
-     * 无法从外部产物观察（同一 run 内材料收集是确定性的 ⇒ 多轮产物相同，产物断言对「搬回循环内」
-     * 的变异**不敏感**）→ 必须有一个纯计数观测点才能把「一个 run 只收集一次」钉成可测不变量。
-     * 生产零读点（仅本类 do-while 前组装块自增 + 下述 test 访问器）。
-     */
-    private static final AtomicInteger materialCollectionRuns = new AtomicInteger();
-
-    /** [测试观测点] 材料收集段累计执行次数（per-run 只应 +1）。 */
-    static int materialCollectionRunsForTest() {
-        return materialCollectionRuns.get();
-    }
-
-    /** [测试观测点] 复位材料收集段计数器（@BeforeEach 用，避免跨用例污染）。 */
-    static void resetMaterialCollectionRunsForTest() {
-        materialCollectionRuns.set(0);
-    }
-
-    /**
      * [prompt-assembly-A] 从 base TUC 派生 turn TUC（含 MCP 池刷新）· 原 do-while 内联逻辑抽取，
      * do-while 外（per-run 材料收集）与 do-while 内（per-tool-round 工具面）**共用同一实现**。
      *
@@ -4281,8 +4258,14 @@ public class LlmAgentLoop implements AgentLoop {
      * utils/systemPrompt.ts:41-123 → coordinator userContext 合并 QueryEngine.ts:302-306）。
      *
      * <p><b>禁止把它搬回 do-while 内</b>（CC query.ts:393-411「Immutable params — never reassigned
-     * during the query loop」+ :1991-1999 refreshTools 只刷 tools 不重算 systemPrompt）。计数观测点
-     * {@link #materialCollectionRunsForTest()} 钉死本约束。
+     * during the query loop」+ :1991-1999 refreshTools 只刷 tools 不重算 systemPrompt）。
+     *
+     * <p><b>已知架构残差（E-1b 修）</b>：按 CC 的形态，材料收集应由 {@code queryLoop} 的**调用方**
+     * 完成（CC 的 {@code fetchSystemPromptParts} 就是调用方调的），{@code queryLoop} 只消费
+     * {@code params.systemPrompt()/userContext()/systemContext()}。本仓当前把它放在 {@code loop()}
+     * 的 do-while 之前（一次/run），于是「每 run 只收集一次」**不是结构性成立的**，只是"只有这一个
+     * 调用点"的偶然事实。E-1b 会把调用点上移到 4 个调用方（主线程/子代理/hook/fork），届时该性质
+     * 结构性成立。⚠️ 因此**本方法不应再加「证明只跑一次」的观测点**——生产代码不承载测试专用埋点。
      *
      * <p><b>runTuc vs perTurnTuc</b>：本方法派生的 runTuc 只用于读材料收集输入
      * （sessionId / availableTools / additionalWorkingDirectories / mcpClients）；它带来的
@@ -4306,8 +4289,6 @@ public class LlmAgentLoop implements AgentLoop {
             String memoryMechanicsPrompt,
             com.nexusai.application.agent.prompt.SystemPromptContextProvider sysPromptCtxProvider,
             com.nexusai.application.agent.prompt.SystemPromptAssembler sysPromptAssembler) {
-        // [观测点] 见 materialCollectionRunsForTest()：per-run 只应 +1（多轮 run 下仍为 1）。
-        materialCollectionRuns.incrementAndGet();
         final ToolUseContext prevStampedTuc = state.currentToolUseContext();
         ToolUseContext runTuc;
         try {

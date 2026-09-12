@@ -56,16 +56,22 @@ import static org.mockito.Mockito.when;
  *   <li>CC {@code query.ts:1991-1999} {@code refreshTools()} 只刷 tools，<b>不重算</b> systemPrompt
  *       —— 接受提示里的工具清单 stale。</li>
  * </ul>
- * 本批若被回退（材料收集搬回循环内），下列哪条测试必须变红：
+ * 若材料收集的落点/形态被改坏，下列测试须变红：
  * <ol>
- *   <li>{@link #perRunMaterialCollection_executesExactlyOnce()} —— 计数观测点（工具轮数=2 时计数必须=1）；</li>
- *   <li>{@link #blocksAreStableAcrossRoundsWithinRun()} —— 跨轮稳定性（本仓材料收集确定性输入下
- *       回退后仍绿 ⇒ 该条是「目标行为」断言，真正的判别器是第 1 条）；</li>
- *   <li>{@link #postSamplingHookReceivesRealContextNotEmptyStub()} —— 空桩修复（回退后仍绿，
- *       但空桩若被改回 {@code Map.of()} 必红）；</li>
+ *   <li>{@link #blocksAreStableAcrossRoundsWithinRun()} —— 跨轮稳定性（材料收集确定性输入下
+ *       该条是「目标行为」断言）；</li>
+ *   <li>{@link #postSamplingHookReceivesRealContextNotEmptyStub()} —— 空桩修复（空桩若被改回
+ *       {@code Map.of()} 必红）；</li>
  *   <li>{@link #threePathsBlocksByteIdenticalToGolden()} —— 三路（主线程/子代理/hook agent）
- *       系统提示产物逐位相同（金样取自改动前的 master 运行输出）。</li>
+ *       系统提示产物逐位相同（金样取自改动前的 master 运行输出）；</li>
+ *   <li>{@link #callerSuppliedSystemPrompt_skipsMaterialCollection()} —— 调用方已组装
+ *       （{@code params.systemPrompt()} 非空）时 loop **不得覆盖**：发送 blocks 必须来自调用方传入值。</li>
  * </ol>
+ *
+ * <p><b>[小档 2026-09-12] 「每 run 只收集一次」不再设计数观测点</b>：该性质当前只是「只有一个调用点」
+ * 的偶然事实，**不是结构性成立的**；为它往生产代码里加 {@code AtomicInteger} + 两个测试访问器属
+ * 「生产承载测试专用埋点」，已删除。结构性保证由 E-1b（材料收集上移到 4 个调用方）提供。
+ * 相应地本类不再断言该性质 —— 它对可观测产物不敏感，无法用产物断言替代，硬造观测点得不偿失。
  *
  * <p>测试脚手架：mock provider 第 1 次回 tool_calls、第 2 次回 stop ⇒ 单 run 两个工具轮；
  * 捕获每次 provider 调用收到的 {@code systemPromptBlocks}（{@code stream} 第 3 实参）。
@@ -83,31 +89,13 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
         List.of(new SystemPromptBlock("HOOK-SYS-PROMPT", CacheScope.ORG));
 
     @BeforeEach
-    void resetObservationPoint() {
-        LlmAgentLoop.resetMaterialCollectionRunsForTest();
+    void resetHooks() {
         PostSamplingHookRegistry.clearAll();
     }
 
     @AfterEach
     void clearHooks() {
         PostSamplingHookRegistry.clearAll();
-    }
-
-    // ─────────────────── 验收 1：run 内材料收集只执行一次 ───────────────────
-
-    @Test
-    @DisplayName("[验收1] run 内材料收集只执行一次：2 个工具轮 → 计数仍为 1（回退到循环内 ⇒ 2，必红）")
-    void perRunMaterialCollection_executesExactlyOnce() {
-        Run run = drive("MAIN", "MAIN-SYS-PROMPT", QuerySource.USER, "sys-new", null);
-
-        assertThat(run.modelCalls.get())
-            .as("脚手架自检：必须真的跑了 2 个工具轮（否则计数断言无意义）")
-            .isEqualTo(2);
-        assertThat(LlmAgentLoop.materialCollectionRunsForTest())
-            .as("[验收1] 材料收集（fetchSystemPromptParts/buildEffectiveSystemPrompt/coordinator 合并）"
-                + "必须在 do-while 外每 run 只执行一次 · CC query.ts:393-411「Immutable params」"
-                + "+ QueryEngine.ts:302 调用方每 turn 一次；搬回 do-while 内 ⇒ 2 个工具轮 = 2 次，本断言必红")
-            .isEqualTo(1);
     }
 
     // ─────────────────── 验收 4：提示跨轮稳定 ───────────────────
@@ -191,7 +179,7 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
     // ─────────────────── 守卫：调用方已组装 ⇒ 跳过材料收集（fork 收敛通道） ───────────────
 
     @Test
-    @DisplayName("[守卫] params.systemPrompt 非空 ⇒ 跳过材料收集（计数 0）且 blocks = 调用方传入值")
+    @DisplayName("[守卫] params.systemPrompt 非空 ⇒ 跳过材料收集，发送 blocks = 调用方传入值（loop 不得覆盖）")
     void callerSuppliedSystemPrompt_skipsMaterialCollection() {
         List<List<SystemPromptBlock>> captured = new ArrayList<>();
         LlmProviderFactory factory = newProviderFactory(captured, new AtomicInteger());
@@ -214,10 +202,6 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
 
         LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
 
-        assertThat(LlmAgentLoop.materialCollectionRunsForTest())
-            .as("[守卫] 调用方已组装（params.systemPrompt 非空）⇒ 材料收集**一次都不跑**"
-                + "（CC query({systemPrompt}) 语义；fork 收敛预留通道）")
-            .isZero();
         assertThat(captured)
             .as("发送 blocks 必须来自调用方传入的 systemPrompt（+ 其 systemContext 并尾段），不得被 loop 覆盖")
             .allSatisfy(b -> assertThat(b).isEqualTo(List.of(
