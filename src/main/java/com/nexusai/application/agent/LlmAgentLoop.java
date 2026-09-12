@@ -1070,7 +1070,8 @@ public class LlmAgentLoop implements AgentLoop {
      * {@code recordTranscript}/{@code insertMessageChain} 只追加新消息，旧行保留；compact 只追加
      * boundary + summary，加载/请求侧按最后一个 boundary 剪枝）。经
      * {@link AgentState#persistCompactedMessages}（已武装 → MessageService.appendPostCompactMessages
-     * 追加新行 + 把 kept 段 created_at 重挂到 boundary 之后，<b>不删旧行</b>）落库，再用返回的归一化列表
+     * 追加新行；[D4 解法1-精简 2026-09-12] kept 段 dedup 跳过、写侧零改写，重挂由读侧
+     * {@code BoundaryReader.applyPreservedSegmentRelink} 承担，<b>不删旧行</b>）落库，再用返回的归一化列表
      * 覆盖内存 state，保证 memory 与 DB id 一致。
      *
      * <p><b>失败 fail-loud（log.error）</b>：落库失败 → 内存仍替换为 post-compact 视图（本 run 请求面
@@ -2461,14 +2462,14 @@ public class LlmAgentLoop implements AgentLoop {
         //   时的 V1「存在即跳过」注入去重消费（恢复历史已含 hook_additional_context 副本 → 跑副作用不重注入）。
         //   真子代理不调 LlmAgentLoop.run（SubagentExecutor.java:2015）不涉及。
         // [fix-loop-resume-history] 会话原始转录一次性读取（消除重复 DB I/O · 低效非错误）：
-        //   注入块经 listForResumeExcluding(raw, ...) 内存派生 + 续跑 skill 恢复块原本各自 listBySession
+        //   注入块经 listForResumeExcluding(raw, ...) 内存派生 + 续跑 skill 恢复块原本各自 listRawForTranscript
         //   全量读取同一会话消息 → 每 run 两次相同 DB 查询。本块先取一次缓存，注入块与 skill 恢复块共享；
         //   读取失败 → null → 各处按其既有 best-effort 跳过（不阻断 loop，语义与改造前一致）。
         List<ChatMessageDto> resumeRawTranscript = null;
         if ((agentId == null || backgroundSessionTask) && messageService != null
                 && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
-                resumeRawTranscript = messageService.listBySession(streamSessionId);
+                resumeRawTranscript = messageService.listRawForTranscript(streamSessionId);
             } catch (Exception e) {
                 log.warn("[LlmAgentLoop] 会话转录一次性读取失败（best-effort，注入与 skill 恢复跳过）: session={} err={}",
                     streamSessionId, e.getMessage());
@@ -3184,7 +3185,7 @@ public class LlmAgentLoop implements AgentLoop {
         //   每 run 新建 + invokedSkills @JsonIgnore 不持久化需每次 run 从转录重建（架构补偿）。
         //   引入 resume 标志 = 会话已有历史（转录含非当前用户消息）才恢复，使「会话有历史」
         //   成为真实判定而非死分支（[P2-23 返工]：ChatController.send() 第一步同步
-        //   createUserMessage 持久化当前用户消息 → listBySession 在 run() 入口恒非空，
+        //   createUserMessage 持久化当前用户消息 → listRawForTranscript 在 run() 入口恒非空，
         //   「转录非空」恒真 → if(!resume) 为死分支。改为排除当前 in-flight 用户消息
         //   （streamUserMessageId）后判「会话有历史」：全新会话首 run（转录仅含当前用户消息）
         //   → resume=false 跳过恢复；后续 run（含先前历史消息）→ resume=true 恢复）。
@@ -3198,7 +3199,7 @@ public class LlmAgentLoop implements AgentLoop {
         //   [skill-listing-cc-align] resume 判据提升为 run 级变量 skillListingResume：主线程 (agentId==null)
         //   与后台化主会话任务 (backgroundSessionTask) 同走；skill_listing 注入（下方用户消息 append 后）
         //   与续跑恢复共用，避免二次推导分歧。真子代理不调 doRun。
-        //   [2026-09-10 收尾轮 · 非 CC 登记] 边界：resumeRawTranscript 读取失败（listBySession 抛异常 / 未接线）
+        //   [2026-09-10 收尾轮 · 非 CC 登记] 边界：resumeRawTranscript 读取失败（listRawForTranscript 抛异常 / 未接线）
         //   时保持 null → 本判据保持 false → 老会话被当作全新会话（整份注入，而非 CC 的 suppress）。CC 的
         //   suppressNext 由 loadConversationForResume 无条件触发、无此回落。属 best-effort 失败路径（生产
         //   messageService 恒 wired，仅 DB 抖动命中）；此处选择「保守重复注入一次整份」而非「静默少注入」，
@@ -3213,7 +3214,7 @@ public class LlmAgentLoop implements AgentLoop {
         if (agentId == null && messageService != null && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
                 // [fix-loop-resume-history] 复用注入块一次性读取的原始转录缓存（resumeRawTranscript），
-                //   消除与注入块对同一会话的重复 listBySession 全量查询。null（读取失败）→
+                //   消除与注入块对同一会话的重复 listRawForTranscript 全量查询。null（读取失败）→
                 //   restoreSkillStateFromMessages 空转（其内部 null 防护），resume=false 跳过恢复。
                 List<ChatMessageDto> transcript = resumeRawTranscript;
                 PostCompactAttachmentRestorer.restoreSkillStateFromMessages(
@@ -5408,7 +5409,8 @@ public class LlmAgentLoop implements AgentLoop {
                         //   投影不同）。同时替换请求级局部 messagesForQuery（CC query.ts:528
                         //   `messagesForQuery = postCompactMessages`，本 turn 后续请求沿用压缩视图）。
                         // [SM/compact 对齐 CC] 落库 = append-only（CC transcript append-only：只追加
-                        //   boundary/summary 新行 + 把 kept 段 created_at 重挂到 boundary 之后，绝不删旧行；
+                        //   boundary/summary 新行；[D4 解法1-精简 2026-09-12] kept 段 dedup 跳过、写侧零改写，
+                        //   重挂由读侧 BoundaryReader.applyPreservedSegmentRelink 承担，绝不删旧行；
                         //   加载/请求侧按最后 boundary 剪枝）。否则只改内存 → 每 run 从 DB 恢复全量 →
                         //   反复自动压缩。persistCompactedMessages 内部以归一化列表覆盖 state，
                         //   故 messagesForQuery 取 state.rawMessages() 的<b>拷贝</b>
@@ -9129,7 +9131,7 @@ public class LlmAgentLoop implements AgentLoop {
      * ChatService 实时落库 appendListener 成为真实消息 → 重放可还原同一位置。
      * <b>位置键 = {@code messages.seq}（V70）非 created_at</b>：落库走 2 参
      * {@code MessageService.appendMessage(dto, ts)}（内部 seq=null → nextSeq 雪花自动取号）；用户消息
-     * 行先落库（seq=S_user）→ 清单行后 inject（write-order）→ nextSeq &gt; S_user → {@code listBySession}
+     * 行先落库（seq=S_user）→ 清单行后 inject（write-order）→ nextSeq &gt; S_user → {@code listRawForTranscript}
      * ORDER BY seq 重放即「紧随用户消息之后」。created_at（ts）仅展示时间，<b>不承载位置</b>。
      * （2026-09-10 修复轮：原在 doRun 循环前调用，会先于队列 drain 的当前用户消息 append →
      * 清单落到用户消息<b>之前</b>，违反 CC 尾随语义。）
@@ -10844,7 +10846,7 @@ public class LlmAgentLoop implements AgentLoop {
         if (agentId == null && messageService != null
                 && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
-                List<ChatMessageDto> transcript = messageService.listBySession(streamSessionId);
+                List<ChatMessageDto> transcript = messageService.listRawForTranscript(streamSessionId);
                 boolean resume = transcript != null && (streamUserMessageId == null
                     ? !transcript.isEmpty()
                     : transcript.stream().anyMatch(m -> m != null && !streamUserMessageId.equals(m.id())));

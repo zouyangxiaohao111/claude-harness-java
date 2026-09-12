@@ -32,7 +32,7 @@ import static org.mockito.Mockito.when;
  * + <b>候选低于基数时的抬升（有声）</b> + <b>兜底分支去墙钟量纲</b>。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：{@code messages.seq} 是会话内位置键，读侧一律
- * {@code ORDER BY seq}（{@code listBySession} / {@code listPageBySession}），且
+ * {@code ORDER BY seq}（{@code listRawForTranscript} / {@code listPageBySession}），且
  * {@code BoundaryReader.getMessagesAfterCompactBoundary} 按该序切片。修前的缺陷是：
  * <ul>
  *   <li>{@code lastSeq} 是<b>进程内</b> {@code AtomicLong}，重启归零，<b>从不与 DB 的 max(seq) 比较</b>

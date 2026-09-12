@@ -1034,7 +1034,7 @@ public final class PostCompactAttachmentRestorer {
      *
      * <p><b>[P2-23 返工] resume 计算语义</b>: resume = 转录中存在<b>非当前 in-flight 用户消息</b>
      * 的消息（排除 {@code streamUserMessageId}）。生产 {@code ChatController.send()} 第一步
-     * 同步 {@code createUserMessage} 持久化当前用户消息 → {@code listBySession} 在 run() 入口
+     * 同步 {@code createUserMessage} 持久化当前用户消息 → {@code listRawForTranscript} 在 run() 入口
      * 恒含当前用户消息 → 旧实现「转录非空」恒真，{@code if (!resume) return;} 为死分支。
      * 改为排除当前用户消息后判「会话有历史」：全新会话首 run（转录仅含当前用户消息）→
      * resume=false 直接返回（无技能状态可恢复）；后续 run（含先前历史消息）→ resume=true 恢复。

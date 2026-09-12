@@ -298,7 +298,7 @@ public class SlashCommandInterceptor {
     /** best-effort 读取会话消息（promptFn 会话通道）· 失败 → 空列表不阻断。 */
     private List<ChatMessageDto> safeListBySession(String sessionId) {
         try {
-            return messageService.listBySession(sessionId);
+            return messageService.listRawForTranscript(sessionId);
         } catch (Exception e) {
             log.warn("[slash] 读取会话消息失败（best-effort → 空列表）: session={} err={}", sessionId,
                 e.getMessage());

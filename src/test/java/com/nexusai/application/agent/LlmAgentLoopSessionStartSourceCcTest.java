@@ -153,7 +153,7 @@ class LlmAgentLoopSessionStartSourceCcTest {
 
     private static MessageService messageServiceReturning(List<ChatMessageDto> transcript) {
         MessageService ms = mock(MessageService.class);
-        when(ms.listBySession(SESSION_KEY)).thenReturn(transcript);
+        when(ms.listRawForTranscript(SESSION_KEY)).thenReturn(transcript);
         // [B 级 2026-09-07] resume 恢复块（doRun）经 listForResumeExcluding(raw, streamUserMessageId) 读派生
         //   历史 —— 不 stub 则 mock 返回 null → resumeHistory null → resumedFromDb 恒 false（误绿，测不到
         //   B 门控）。这里 stub 为「排除当前在途消息后的历史」，驱动 resumedFromDb 真实判定。

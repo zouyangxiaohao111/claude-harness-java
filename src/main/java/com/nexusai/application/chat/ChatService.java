@@ -1194,7 +1194,7 @@ public class ChatService {
      * 的 per-session 单调分配器取号（{@link #persistAppendedMessage}），<b>不再是</b>
      * {@code baseTs.plusNanos(seq)}。原因：{@code baseTs} = run 开始时 arm 捕获，而 compact 发生在 run
      * <b>中段</b>（{@code MessageService.appendPostCompactMessages} 用「调用时」时间基）→ 同 run 内
-     * compact 之后 append 的消息时间戳早于 boundary → 下轮 {@code listBySession}（created_at ASC）顺序
+     * compact 之后 append 的消息时间戳早于 boundary → 下轮 {@code listRawForTranscript}（created_at ASC）顺序
      * 倒挂 → boundary 切片整段丢消息 + 拆散 tool_use/tool_result 配对。分配器保证「任何新写入恒晚于该
      * 会话所有已有行」，与 writer 无关。
      *
@@ -1259,12 +1259,13 @@ public class ChatService {
         }
         // [SM/compact 对齐 CC] 压缩落库监听：LlmAgentLoop.loop()（static，无 MessageService 引用）在
         //   auto/reactive compact 成功后经 state.persistCompactedMessages 回调此处 →
-        //   MessageService.appendPostCompactMessages <b>append-only</b> 落库（只追加 boundary/summary 新行 +
-        //   把 kept 段 created_at 重挂到 boundary 之后，不删任何旧行 —— 对齐 CC transcript append-only：
+        //   MessageService.appendPostCompactMessages <b>append-only</b> 落库（只追加 boundary/summary 新行；
+        //   [D4 解法1-精简 · 2026-09-12] kept 段 dedup 跳过、写侧零改写，重挂改由读侧
+        //   BoundaryReader.applyPreservedSegmentRelink 承担；不删任何旧行 —— 对齐 CC transcript append-only：
         //   sessionStorage.ts recordTranscript/insertMessageChain 只追加，加载侧按最后 boundary 剪枝）。
         //   DB 与 compact 后内存一致 → 消除「每 run 从 DB 恢复全量 → 反复自动压缩」。
         //   ⚠️ 不再走 replaceSessionMessages（删全表 + 换时间基）：同 run 内 compact 之后追加的消息
-        //   created_at 会早于重插 boundary → 下轮 listBySession 顺序倒挂 → boundary 切片丢消息（HIGH）。
+        //   created_at 会早于重插 boundary → 下轮 listRawForTranscript 顺序倒挂 → boundary 切片丢消息（HIGH）。
         //   messageService 未装配（非 Spring 单测）→ 不武装，loop 侧原样返回仅替换内存。
         if (messageService != null) {
             state.setCompactPersistListener(msgs -> {
@@ -1528,7 +1529,7 @@ public class ChatService {
                 //   [seq 位置键 · 2026-09-10 rebase 适配] 位置不再靠 created_at/单调 ts：2 参
                 //   appendMessage(dto, ts) 内部委托 3 参重载并传 seq=null → MessageService.nextSeq 雪花自动
                 //   取号（V70）。清单行由 loop 在当前用户消息 append 之后注入（write-order）→ 其 seq 自然
-                //   大于该用户行 → listBySession ORDER BY seq ASC 重放还原同一「紧随用户消息之后」位置；
+                //   大于该用户行 → listRawForTranscript ORDER BY seq ASC 重放还原同一「紧随用户消息之后」位置；
                 //   created_at（ts）仅作展示时间，不承载位置语义。绝不可改为直写 messageMapper.insert ——
                 //   那样须自行 setSeq(nextSeq)，漏了即 seq=NULL，而 SQLite 中 NULL 排最前 → 清单飞到上下文最前。
                 if (m.isMeta() && "skill_listing".equals(m.subtype())) {
@@ -2544,8 +2545,9 @@ public class ChatService {
      * [seq 排序键] 位置键取号 · 本类直写 {@code messageMapper.insert}（绕过 MessageService）的
      * assistant/tool/snip 行落库时统一调用。
      *
-     * <p>WHY：{@code messages.seq}（V70）是会话内排序位置键（读侧 listBySession/listPageBySession
-     * ORDER BY seq；compact 重挂 kept 段只改 seq）。本类实时落库是会话消息的主要 writer，若这些行
+     * <p>WHY：{@code messages.seq}（V70）是会话内排序位置键（读侧 listRawForTranscript/listPageBySession
+     * ORDER BY seq；[D4 解法1-精简 · 2026-09-12] compact 落库对 kept 段已零改写 —— 其位置键保持原值，
+     * 模型面顺序由读侧重挂还原）。本类实时落库是会话消息的主要 writer，若这些行
      * 不取号 → seq 退化（NULL / -1）→ 在 ORDER BY seq 下排到最前（SQLite NULL 最小）→ 会话顺序错乱。
      *
      * <p><b>永不返回 null</b>：seq 取号已换雪花（{@code MessageService.nextSeq} 全局单调 long，自带

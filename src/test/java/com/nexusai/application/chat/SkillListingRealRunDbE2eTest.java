@@ -51,7 +51,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * [skill-listing 端到端 · 2026-09-10] <b>真实 run → 真实 MessageService → 真实 SQLite → listBySession(seq) 重放</b>。
+ * [skill-listing 端到端 · 2026-09-10] <b>真实 run → 真实 MessageService → 真实 SQLite → listRawForTranscript(seq) 重放</b>。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 验证意图）</b>：skill_listing 回归 CC 的一致性验证此前<b>只到</b>两层——
  * ① 内存态 {@code state.rawMessages()} 索引断言（{@code LlmAgentLoopSkillListingInjectTest}）；
@@ -65,7 +65,7 @@ import static org.mockito.Mockito.when;
  *   <li>DB 出现且仅出现一条 {@code author=attachment / subtype=skill_listing} 行；</li>
  *   <li>该行 {@code seq} 严格大于本会话用户消息行的 {@code seq}（= CC processTextPrompt.ts:97
  *       {@code [userMessage, ...attachmentMessages]} 的尾随位置）；</li>
- *   <li>{@link MessageService#listBySession}（{@code ORDER BY seq}）重放中清单行<b>位于用户消息之后</b>
+ *   <li>{@link MessageService#listRawForTranscript}（{@code ORDER BY seq}）重放中清单行<b>位于用户消息之后</b>
  *       （{@code [..., user, ...attachmentMessages]}，CC 不保证紧邻）—— 重放能还原 live 同一位置；</li>
  *   <li>同会话第二次 run 不新增 skill_listing 行（resume 抑制，不重注）；</li>
  *   <li>技能集合出现新技能 → 只追加增量行（内容只含新技能名，不重发整份）；</li>
@@ -95,7 +95,7 @@ import static org.mockito.Mockito.when;
  * {@code resume=false} → 偶发「整份重发 / 位置倒挂」假 RED；且前次运行的残留行也落在同一文件。
  * 独占文件 + 每用例唯一 sessionId + {@link #tearDown} 自清本会话行 → 无跨次/跨 JVM 污染，测试幂等。
  */
-@DisplayName("[skill-listing 端到端] 真实 run → 真实 MessageService → 真实 SQLite → listBySession(seq) 重放")
+@DisplayName("[skill-listing 端到端] 真实 run → 真实 MessageService → 真实 SQLite → listRawForTranscript(seq) 重放")
 class SkillListingRealRunDbE2eTest {
 
     private static MessageMapper messageMapper;
@@ -143,7 +143,7 @@ class SkillListingRealRunDbE2eTest {
         SkillListingSentRegistry.reset();
         session = "sess-e2e-" + UUID.randomUUID().toString().substring(0, 8);
 
-        // 真实 sessions 行（listBySession 会校验存在）
+        // 真实 sessions 行（listRawForTranscript 会校验存在）
         SessionRecord s = new SessionRecord();
         s.setId(session);
         s.setModelTag("DS");
@@ -180,7 +180,7 @@ class SkillListingRealRunDbE2eTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("真实 run → DB 落一行 skill_listing（author=attachment）；seq 在用户行之后；listBySession 重放还原位置")
+    @DisplayName("真实 run → DB 落一行 skill_listing（author=attachment）；seq 在用户行之后；listRawForTranscript 重放还原位置")
     void realRun_persistsListingAfterUser_rowShapeAndReplayOrder() {
         // 全量 = [commit, review]
         catalogCommands.set(List.of(cmd("commit"), cmd("review")));
@@ -217,8 +217,8 @@ class SkillListingRealRunDbE2eTest {
             .as("清单行 seq 必须严格大于用户行 seq —— CC [userMessage, ...attachmentMessages] 尾随位置（本批最易错处）")
             .isGreaterThan(userRow.getSeq());
 
-        // ③ listBySession（ORDER BY seq）重放顺序 = [..., user, skill_listing] → 还原 live 同一位置
-        List<ChatMessageDto> replay = messageService.listBySession(session);
+        // ③ listRawForTranscript（ORDER BY seq）重放顺序 = [..., user, skill_listing] → 还原 live 同一位置
+        List<ChatMessageDto> replay = messageService.listRawForTranscript(session);
         List<String> replayIds = replay.stream().map(ChatMessageDto::id).toList();
         assertThat(replayIds)
             .as("重放顺序 = DB seq 顺序（live 位置经 DB 可还原）")
@@ -302,7 +302,7 @@ class SkillListingRealRunDbE2eTest {
             .isGreaterThan(user3.getSeq());
 
         // 重放：清单行按 seq 序 = [整份(run1), 差量(run3)]，且差量行紧随其同轮用户行
-        List<ChatMessageDto> replay = messageService.listBySession(session);
+        List<ChatMessageDto> replay = messageService.listRawForTranscript(session);
         List<String> subOrder = replay.stream()
             .filter(m -> "skill_listing".equals(m.subtype()))
             .map(ChatMessageDto::id).toList();
@@ -417,7 +417,7 @@ class SkillListingRealRunDbE2eTest {
 
     // ─────────────────────────── DB / 断言 helpers ───────────────────────────
 
-    /** 该会话全部行按 seq ASC（listBySession 同序）—— 真实 DB 顺序。 */
+    /** 该会话全部行按 seq ASC（listRawForTranscript 同序）—— 真实 DB 顺序。 */
     private List<MessageRecord> dbRowsBySeq() {
         return messageMapper.selectListByQuery(
             QueryWrapper.create().eq("session_id", session).orderBy("seq", true));

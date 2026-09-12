@@ -109,7 +109,7 @@ class LlmAgentLoopSkillListingInjectTest {
             "fresh query", null, List.of(), FinishReason.stop, null, null, "刚刚",
             OffsetDateTime.now(), null, null, null, List.of(), List.of(), null, false, false, null);
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(currentUserMsg));
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(currentUserMsg));
 
         // SkillCatalog：全量 = [commit, review]，formatListing(子集) → 固定文本
         SkillCatalog catalog = mock(SkillCatalog.class);
@@ -202,7 +202,7 @@ class LlmAgentLoopSkillListingInjectTest {
         ChatMessageDto secondUser = userMsg("msg-2", SESSION_KEY, "second query");
 
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(firstUser));
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(firstUser));
 
         // SkillCatalog：run1 全量=[commit,review]；run2 全量=[commit,review,new-skill]。
         //   formatListing 文本由「传入的 Command 子集」派生 → 全量 vs 增量在消息内容上可区分。
@@ -242,7 +242,7 @@ class LlmAgentLoopSkillListingInjectTest {
         assertThat(listing1).as("首 run 注入整份").contains("commit").contains("review");
 
         // run 2：转录含历史（id a-1 ≠ msg-2）→ resume=true；全量新增 new-skill → 只应发增量
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(prevAssistant, secondUser));
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(prevAssistant, secondUser));
         when(messageService.listForResumeExcluding(anyList(), anyString())).thenReturn(List.of(prevAssistant));
         loop.setStreamContext(null, SESSION_KEY, "msg-2");
         AgentState s2 = loop.run(RunRequest.session("second query", sessionUuid, null,
@@ -339,7 +339,7 @@ class LlmAgentLoopSkillListingInjectTest {
         ChatMessageDto secondUser = userMsg("msg-2", SESSION_KEY, "second query");
 
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(firstUser));
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(firstUser));
 
         // run1：零技能（空候选）；run2：技能出现（late-skill）。
         SkillCatalog catalog = mock(SkillCatalog.class);
@@ -377,7 +377,7 @@ class LlmAgentLoopSkillListingInjectTest {
         assertThat(listingContent(s1.rawMessages())).as("零技能首 run → 不注入").isNull();
 
         // run 2：转录含历史（id a-1 ≠ msg-2）→ resume=true + 技能出现 → 必须注入整份
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(prevAssistant, secondUser));
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(prevAssistant, secondUser));
         when(messageService.listForResumeExcluding(anyList(), anyString())).thenReturn(List.of(prevAssistant));
         loop.setStreamContext(null, SESSION_KEY, "msg-2");
         AgentState s2 = loop.run(RunRequest.session("second query", sessionUuid, null,
@@ -411,7 +411,7 @@ class LlmAgentLoopSkillListingInjectTest {
         // ── fresh 侧 ──
         String freshSession = "sess-" + UUID.randomUUID().toString().substring(0, 8);
         MessageService fMsgSvc = mock(MessageService.class);
-        when(fMsgSvc.listBySession(SESSION_KEY)).thenReturn(List.of(userMsg("msg-1", SESSION_KEY, "first query")));
+        when(fMsgSvc.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(userMsg("msg-1", SESSION_KEY, "first query")));
         SkillCatalog freshCatalog = catalogFor(List.of(cmd("late-skill")));
 
         // run1：!resume + 无 Skill 工具 → 守卫补记 markInitialized（无注入）
@@ -422,7 +422,7 @@ class LlmAgentLoopSkillListingInjectTest {
             .as("fresh(!resume) 守卫必须补记 initialized（= CC suppressNext=false）").isTrue();
 
         // run2：有 Skill 工具 + 转录有历史(resume=true) + 技能出现 → 必须注入整份（不得再抑制）
-        when(fMsgSvc.listBySession(SESSION_KEY)).thenReturn(List.of(
+        when(fMsgSvc.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(
             assistantMsg("a-1", SESSION_KEY, "ans"), userMsg("msg-2", SESSION_KEY, "second query")));
         when(fMsgSvc.listForResumeExcluding(anyList(), anyString())).thenReturn(List.of(assistantMsg("a-1", SESSION_KEY, "ans")));
         AgentState f2 = runOnce(freshSession, "msg-2", "second query",
@@ -434,7 +434,7 @@ class LlmAgentLoopSkillListingInjectTest {
         // ── 冷 resume 侧 ──
         String coldSession = "sess-" + UUID.randomUUID().toString().substring(0, 8);
         MessageService cMsgSvc = mock(MessageService.class);
-        when(cMsgSvc.listBySession(SESSION_KEY)).thenReturn(List.of(
+        when(cMsgSvc.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(
             assistantMsg("a-1", SESSION_KEY, "prev"), userMsg("msg-2", SESSION_KEY, "second query")));
         when(cMsgSvc.listForResumeExcluding(anyList(), anyString())).thenReturn(List.of(assistantMsg("a-1", SESSION_KEY, "prev")));
         SkillCatalog coldCatalog = catalogFor(List.of(cmd("late-skill")));

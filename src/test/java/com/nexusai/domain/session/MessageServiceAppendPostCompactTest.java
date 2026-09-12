@@ -34,27 +34,34 @@ import static org.mockito.Mockito.when;
  * （sessionStorage.ts {@code recordTranscript}/{@code insertMessageChain} 只追加；compact 只追加 boundary +
  * summary，加载/请求侧按最后一个 boundary 剪枝）。旧实现 {@code replaceSessionMessages}「删全表 + 按新时间基
  * 重插」会让同一 run 内 compact <b>之后</b>追加的消息 created_at 早于重插的 boundary → 下轮
- * {@code listBySession}（created_at ASC）顺序倒挂 → boundary 切片整段丢消息（HIGH bug）。
+ * {@code listRawForTranscript}（created_at ASC）顺序倒挂 → boundary 切片整段丢消息（HIGH bug）。
  * 本测试锁死 append-only 三条不变量：
  * <ol>
  *   <li><b>绝不删除</b>任何旧行（DELETE 零调用）——删了就丢轨迹、且会带走 boundary 之前的历史；</li>
- *   <li><b>已存在 id</b>（messagesToKeep）→ 只 UPDATE <b>seq</b>（位置键重挂到 boundary 之后），
- *       <b>created_at 保持原值</b>（展示语义），不 INSERT 副本；</li>
+ *   <li><b>已存在 id</b>（messagesToKeep）→ <b>零改写</b>（不 UPDATE、不 INSERT）：对齐 CC
+ *       {@code recordTranscript} 按 uuid dedup 跳过（sessionStorage.ts:1457-1468，CC 注释自述 kept 行
+ *       parentUuid 保持 pre-compact 原值 "can't rewrite"）。kept 行留在 boundary 之前，靠<b>读侧</b>
+ *       {@code BoundaryReader.applyPreservedSegmentRelink} 按 preservedSegment 重挂回模型视图；</li>
  *   <li><b>新 id</b>（boundary / summary）→ INSERT 新行，seq 单调，返回顺序 = 入参顺序。</li>
  * </ol>
  *
+ * <p><b>[D4 解法1-精简 · 2026-09-12]</b>：改造前写侧对已存在 id 发 {@code UPDATE seq} 把 kept 搬到
+ * boundary 之后（"写侧重挂"）。该分支<b>已删除</b> —— 搬迁与「真 append-only」相悖、会抹掉位置的历史，
+ * 且与 CC 的写法相反（CC 磁盘上原地不动）。
+ *
  * <p><b>[SM/compact 对齐 CC · seq]</b>：V70 引入单调 seq 作位置键（雪花 ID，全局单调 long），根治
- * 「created_at 既是时间又是位置」——kept 重挂只改 seq（位置），created_at 回归纯时间（前端「X 分钟前」
- * 不被重挂污染）。
+ * 「created_at 既是时间又是位置」——kept 在 DB 里 seq/created_at 双双保持原值（写侧零改写），
+ * 位置还原完全交给读侧投影。
  *
  * <p><b>[SM/compact 对齐 CC · seq 块]</b>：整块 seq 由 {@code nextSeqBlock} <b>一次 CAS 原子占位</b>
  * （块内按数组序发号），保证并发实时落库（{@code ChatService.persistAppendedMessage}）的号不可能插进
- * compact 块内部 —— 详见 {@link MessageServiceSeqBlockTest} 与下方并发用例。
+ * compact 块内部 —— 详见 {@link MessageServiceSeqBlockTest} 与下方并发用例。kept 段不取号
+ * （零改写）→ 号段只覆盖真正写入的新行，块内无空洞。
  *
- * <p><b>RED 条件</b>：改回删 + 重插 → {@code never()).deleteByQuery} 红；keep 段改 INSERT 而非 UPDATE →
- * {@code insert} 次数/ids 断言红；不再重挂 seq → seq 位置序断言红（keep 排在 boundary 之前 → 切片丢消息）；
- * 重挂又写 created_at → created_at「保持原值」断言红；返回顺序被重排 → id 序列断言红；
- * 整块改回逐个 {@code nextSeq} → 并发用例的块内连续性断言红；两个 boundary id 复用同一个 → INSERT/UPDATE
+ * <p><b>RED 条件</b>：改回删 + 重插 → {@code never()).deleteByQuery} 红；kept 段又发写入（UPDATE 或
+ * INSERT）→ {@code never()).update} / insert 次数断言红；kept 段被塞进 seq 块 → 新行 seq 连续性断言红
+ * （boundary/summary 不再是相邻号）；返回顺序被重排 → id 序列断言红；
+ * 整块改回逐个 {@code nextSeq} → 并发用例的块内连续性断言红；两个 boundary id 复用同一个 → INSERT
  * 次数断言红。
  */
 @DisplayName("[SM/compact 对齐 CC] appendPostCompactMessages = append-only 落库（不删旧行）")
@@ -131,8 +138,8 @@ class MessageServiceAppendPostCompactTest {
     }
 
     @Test
-    @DisplayName("不删任何行 + kept UPDATE seq（created_at 不动）+ boundary/summary INSERT + 返回顺序 = 入参顺序")
-    void appendOnly_rehangKeptSeq_insertNew_neverDelete() {
+    @DisplayName("不删任何行 + kept 零改写（不 UPDATE/不 INSERT）+ boundary/summary INSERT + 返回顺序 = 入参顺序")
+    void appendOnly_dedupSkipKept_insertNew_neverDelete() {
         // GIVEN: CC buildPostCompactMessages 顺序 = boundary → summary → messagesToKeep
         List<ChatMessageDto> postCompact = List.of(boundary(), summary(), keep());
 
@@ -150,44 +157,35 @@ class MessageServiceAppendPostCompactTest {
         assertThat(inserted.getAllValues()).extracting(MessageRecord::getSessionId)
             .as("compact DTO sessionId=null → 落库前落定为方法入参 sessionId（messages.session_id NOT NULL）")
             .containsOnly(SESSION);
-        // kept 段（已存在 id）→ 只 UPDATE seq，不 INSERT 副本
-        ArgumentCaptor<MessageRecord> updated = ArgumentCaptor.forClass(MessageRecord.class);
-        verify(messageMapper, times(1)).update(updated.capture());
-        assertThat(updated.getValue().getId())
-            .as("kept 段走 UPDATE（重挂 seq），不新增副本")
-            .isEqualTo(KEEP_ID);
 
-        // THEN ② seq 位置序：boundary < summary < kept（雪花号严格递增，调用序 = 位置序；
-        //   kept 重挂 seq 到 boundary 之后 → 位置切片含 boundary 之后全部；这是「下轮 boundary 切片不丢 kept」的不变量）
-        //   注：seq 已换雪花 long（非 1..N 递增），故只断言严格递增的相对顺序，不锁具体值。
+        // THEN ② kept 段（已存在 id）→ 写侧零改写：既不 UPDATE 也不 INSERT（CC recordTranscript dedup 跳过）。
+        //   这是 D4 解法1-精简 的核心不变量 —— RED：把 UPDATE seq 分支加回来 / 改成 INSERT 副本 → 本断言红。
+        verify(messageMapper, never()).update(any());
+
+        // THEN ③ seq 块只覆盖真正写入的新行：boundary < summary 且相邻（kept 不占号 → 块内无空洞）
+        //   注：seq 已换雪花 long（非 1..N 递增），故只断言相对关系，不锁具体值。
         long boundarySeq = inserted.getAllValues().get(0).getSeq();
         long summarySeq = inserted.getAllValues().get(1).getSeq();
-        long keptSeq = updated.getValue().getSeq();
         assertThat(boundarySeq).as("boundary seq 为正（雪花号）").isPositive();
-        assertThat(summarySeq).as("summary seq > boundary seq（boundary 之后）").isGreaterThan(boundarySeq);
-        assertThat(keptSeq).as("kept 重挂 seq > summary seq（位置键推进到 boundary 之后）")
-            .isGreaterThan(summarySeq);
-
-        // THEN ③ created_at 保持原值 = 展示时间语义：重挂只写 seq，patch 不得携带 created_at
-        assertThat(updated.getValue().getCreatedAt())
-            .as("kept 重挂 seq 时不写 created_at（MyBatis-Flex update ignoreNulls → 该列不被 SET，保持原 DB 值）")
-            .isNull();
+        assertThat(summarySeq).as("summary seq = boundary + 1（同一块、按数组序发号）")
+            .isEqualTo(boundarySeq + 1);
         // 新行 created_at 仍由 nextCreatedAt 单调分配器取号（时间语义保留，供前端「X 分钟前」展示）
         assertThat(inserted.getAllValues()).extracting(MessageRecord::getCreatedAt).doesNotContainNull();
 
-        // THEN ③ 返回 = 归一化列表（id 保持 + sessionId 落定），顺序 = 入参顺序（供 state.replaceMessages）
+        // THEN ④ 返回 = 归一化列表（id 保持 + sessionId 落定），顺序 = 入参顺序（供 state.replaceMessages；
+        //   内存数组仍是 boundary → summary → kept，即模型该看到的顺序 —— DB 位置由读侧重挂还原）
         assertThat(out).hasSize(3);
         assertThat(out).extracting(ChatMessageDto::id).containsExactly(BOUNDARY_ID, SUMMARY_ID, KEEP_ID);
         assertThat(out).extracting(ChatMessageDto::sessionId).containsOnly(SESSION);
     }
 
     @Test
-    @DisplayName("[防御分支] 批内同 id 重复 → 命中「已存在」UPDATE 同一行、不 PK 冲突、不 DELETE（生产已不走此路径）")
-    void duplicateBoundaryId_mapsToSameRow_noDelete() {
+    @DisplayName("[防御分支] 批内同 id 重复 → 第二次命中「已存在」被 dedup 跳过、不 PK 冲突、不 DELETE（生产已不走此路径）")
+    void duplicateBoundaryId_dedupSkipped_noPkConflict() {
         // WHY（如实表述 · CLAUDE.md 规则十二 显式失败）：本用例建模的是<b>防御性</b>分支，不是生产场景。
         //   boundary id 现由 CompactBoundaryMessage.newBoundaryId() 每实例取雪花（唯一）→ 生产 partial-from
         //   不再产生「两条同 id boundary」。保留本用例是因为该分支仍必须存在：调用方误传同 id / 上游 id 复用
-        //   时，它把「重复 id」退化到 UPDATE（重挂位置）而不是 PK 冲突崩库。
+        //   时，它把「重复 id」退化到跳过而不是 PK 冲突崩库（改造前退化为 UPDATE 重挂位置）。
         // RED：去掉 knownIds 登记/判重（第二次同 id 仍走 INSERT）→ insert 次数 3（而非 2）→ 红。
         // GIVEN: 同一 boundary id 在批内出现两次
         List<ChatMessageDto> postCompact = List.of(boundary(), boundary(), summary());
@@ -195,11 +193,11 @@ class MessageServiceAppendPostCompactTest {
         // WHEN
         List<ChatMessageDto> out = service.appendPostCompactMessages(SESSION, postCompact);
 
-        // THEN: 第一次 boundary 为 INSERT（登记进 knownIds）→ 第二次同 id 命中「已存在」→ UPDATE（同一 DB 行，
-        //       后一次重挂位置覆盖前一次），无 DELETE、无 PK 冲突；summary 为新 id → INSERT（共 2 次）
+        // THEN: 第一次 boundary 为 INSERT（登记进 knownIds）→ 第二次同 id 命中「已存在」→ 零改写跳过，
+        //       无 DELETE、无 PK 冲突；summary 为新 id → INSERT（共 2 次）
         verify(messageMapper, never()).deleteByQuery(any());
         verify(messageMapper, times(2)).insert(any());
-        verify(messageMapper, times(1)).update(any());
+        verify(messageMapper, never()).update(any());
         assertThat(out).hasSize(3);
         assertThat(out).extracting(ChatMessageDto::id).containsExactly(BOUNDARY_ID, BOUNDARY_ID, SUMMARY_ID);
     }
@@ -238,21 +236,25 @@ class MessageServiceAppendPostCompactTest {
     }
 
     @Test
-    @DisplayName("[生产真实形态·同会话二次 compact] 旧 boundary 行已在 DB → 新 boundary INSERT + 旧 boundary/kept 重挂 UPDATE，仍不 DELETE")
-    void secondCompactOnSameSession_oldBoundaryRehung_insertsOnlyNewRows() {
+    @DisplayName("[生产真实形态·同会话二次 compact] 旧 boundary/kept 行已在 DB → 全部 dedup 跳过，只 INSERT 新 boundary+summary，仍不 DELETE")
+    void secondCompactOnSameSession_existingRowsDedupSkipped_insertsOnlyNewRows() {
         // WHY（规则九 · 本用例与上一条的区别，两条都保留、各锁一条真实分支）：
         //   - distinctBoundaryIds_bothInserted_noUpdate = 「<b>新会话首次</b> compact」形态：mock DB 里
         //     没有任何 boundary 行 → 两条 boundary 都按新行 INSERT（2 INSERT + summary，0 UPDATE）。
         //   - 本用例 = 「<b>同一会话第二次</b> compact（partial from）」的真实形态：上一次 compact 落库的
-        //     旧 boundary_A 行<b>仍在 DB</b>（knownIds 命中）→ 旧 boundary 走 2a「只重挂 seq 的 UPDATE」
-        //     （created_at 保持原值），只有新 boundary_B 与 summary 是 INSERT。批次顺序按生产 FROM 分支 =
+        //     旧 boundary_A 行<b>仍在 DB</b>（knownIds 命中）→ 与 kept 行一样走「零改写 dedup 跳过」，
+        //     只有新 boundary_B 与 summary 是 INSERT。批次顺序按生产 FROM 分支 =
         //     [新 boundary, ...kept(含旧 boundary), summary]（BoundaryReader 切片含边界本身
         //     subList(boundaryIndex,..)；CompactionResult FROM 分支 keep 在前、summary 在后）。
+        //   [D4 解法1-精简] 改造前旧 boundary_A 与 kept 各行发一次 UPDATE seq（写侧重挂）；
+        //     现在<b>写侧零改写</b> —— 它们留在原 seq 位置，模型视图由读侧按新 boundary 的
+        //     preservedSegment 重挂还原（kept 区间 [head..tail] 覆盖它们）。
         // RED 条件：
         //   ① 把旧 boundary 从 mock DB 行集合里去掉（或把 boundary_A 的 id 改成未落库的新 id）→
-        //      insert 2→3、update 2→1 → 红（破坏「已存在行必须重挂位置、不得再插一行副本」的不变量）；
-        //   ② 出现任何 DELETE（改回 replaceSessionMessages 删全表路径）→ never().deleteByQuery 红；
-        //   ③ 块内发号不按数组序（如把 seqBlock[seqIdx++] 换成常量/乱序）→ 连续性断言红。
+        //      insert 2→3 → 红（破坏「已存在行必须 dedup 跳过、不得再插一行副本」的不变量）；
+        //   ② 又对已存在行发写入（加回 UPDATE seq / 改成 INSERT 副本）→ never().update / insert 次数红；
+        //   ③ 出现任何 DELETE（改回 replaceSessionMessages 删全表路径）→ never().deleteByQuery 红；
+        //   ④ 块内发号不按数组序（如把 seqBlock[seqIdx++] 换成常量/乱序）→ 连续性断言红。
         MessageRecord keepRow = new MessageRecord();
         keepRow.setId(KEEP_ID);
         keepRow.setSessionId(SESSION);
@@ -270,40 +272,34 @@ class MessageServiceAppendPostCompactTest {
         verify(messageMapper, never()).deleteByQuery(any());
         ArgumentCaptor<MessageRecord> inserted = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper, times(2)).insert(inserted.capture());
-        ArgumentCaptor<MessageRecord> updated = ArgumentCaptor.forClass(MessageRecord.class);
-        verify(messageMapper, times(2)).update(updated.capture());
+        // 已存在的两条（旧 boundary_A + kept）一个字都不写 —— 写侧零改写（D4 解法1-精简核心不变量）
+        verify(messageMapper, never()).update(any());
 
         assertThat(inserted.getAllValues()).extracting(MessageRecord::getId)
-            .as("只有「新 boundary_B + summary」是新行（旧 boundary_A 与 kept 行已在 DB → 走重挂）")
+            .as("只有「新 boundary_B + summary」是新行（旧 boundary_A 与 kept 行已在 DB → 零改写跳过）")
             .containsExactly(BOUNDARY_ID_ALT, SUMMARY_ID);
-        assertThat(updated.getAllValues()).extracting(MessageRecord::getId)
-            .as("旧 boundary_A 与 kept 行各 UPDATE 一次（只重挂 seq，不新插副本）")
-            .containsExactly(BOUNDARY_ID, KEEP_ID);
-        // 整块位置号仍按入参数组序连续（INSERT/UPDATE 混合共用同一个 seq 块 → 下轮 DB(seq) 恢复序 == 内存视图序）
-        List<Long> seqByInputOrder = List.of(
-            inserted.getAllValues().get(0).getSeq(),   // 入参[0] 新 boundary_B
-            updated.getAllValues().get(0).getSeq(),    // 入参[1] 旧 boundary_A（重挂）
-            updated.getAllValues().get(1).getSeq(),    // 入参[2] kept
-            inserted.getAllValues().get(1).getSeq());  // 入参[3] summary
-        for (int i = 1; i < seqByInputOrder.size(); i++) {
-            assertThat(seqByInputOrder.get(i))
-                .as("入参第 %d 个元素的位置号 = 前一个 + 1（INSERT/UPDATE 混合也共用同一个 seq 块）", i)
-                .isEqualTo(seqByInputOrder.get(i - 1) + 1);
-        }
+        // 新行 seq 仍按数组序连续（KEEP 不取号 → 块内无空洞）
+        long newBoundarySeq = inserted.getAllValues().get(0).getSeq();
+        long newSummarySeq = inserted.getAllValues().get(1).getSeq();
+        assertThat(newSummarySeq)
+            .as("入参相邻的两个新行共用同一个 seq 块（结果 +1）；kept 不占号，故块内无空洞")
+            .isEqualTo(newBoundarySeq + 1);
         assertThat(out).extracting(ChatMessageDto::id)
-            .as("返回顺序 = 入参数组序（内存 state.replaceMessages 与 DB 序一致）")
+            .as("返回顺序 = 入参数组序（内存 state.replaceMessages 用之；DB 位置由读侧重挂还原）")
             .containsExactly(BOUNDARY_ID_ALT, BOUNDARY_ID, KEEP_ID, SUMMARY_ID);
     }
 
     @Test
-    @DisplayName("[seq 块] DB 侧 seq 序列 == 入参数组序且块内连续（boundary/summary 新行 + kept 重挂共用一个块）")
-    void appendPostCompact_seqSequenceMatchesInputOrderAndIsContiguous() {
-        // WHY（规则九）：compact 整块的顺序即「下轮 boundary 切片后的模型上下文顺序」。若块内 seq 不连续
-        //   （被并发实时落库插入），DB(seq) 恢复序会变成 [boundary][并发行][summary][kept...]，
-        //   而内存视图是 [boundary][summary][kept...][并发行] → 切片后 tool_result 可能先于 tool_use。
-        //   本用例锁死「一个块、按数组序、连续发号」。
+    @DisplayName("[seq 块] seq 块只覆盖真正写入的新行（boundary/summary 相邻号）；kept 零改写不占号")
+    void appendPostCompact_seqBlockCoversOnlyNewRows_noHole() {
+        // WHY（规则九）：compact 新行（boundary/summary/附件/hook）的 seq 顺序即「下轮 boundary 切片后的
+        //   模型上下文顺序」。若块内 seq 不连续（被并发实时落库插入），DB 序会变成 [boundary][并发行]
+        //   [summary][...] → 切片后可能出现 tool_result 先于 tool_use（provider 配对校验失败）。
+        //   本用例锁死「一个块、按数组序、连续发号」，并锁「kept 零改写后不消耗块内号段」（否则凭空
+        //   制造 seq 空洞，块内连续性判据失效）。
         // RED：appendPostCompactMessages 改回循环内逐个 nextSeq（且存在并发取号）→ 见下方并发用例红；
-        //      单纯改回逐个取号（无线程）时本用例仍绿 —— 本用例钉的是「组序 == 号序」，并发不可打断由
+        //      把 kept 也纳入取号 → summary 与 boundary 不再相邻 → 红；
+        //      单纯改回逐个取号（无线程）时本用例仍绿 —— 并发不可打断由
         //      concurrentAppendCannotInterruptCompactSeqBlock 与 MessageServiceSeqBlockTest 钉。
         List<ChatMessageDto> postCompact = List.of(boundary(), summary(), keep());
 
@@ -311,14 +307,13 @@ class MessageServiceAppendPostCompactTest {
 
         ArgumentCaptor<MessageRecord> inserted = ArgumentCaptor.forClass(MessageRecord.class);
         verify(messageMapper, times(2)).insert(inserted.capture());
-        ArgumentCaptor<MessageRecord> updated = ArgumentCaptor.forClass(MessageRecord.class);
-        verify(messageMapper, times(1)).update(updated.capture());
+        verify(messageMapper, never()).update(any());
 
         long boundarySeq = inserted.getAllValues().get(0).getSeq();
         long summarySeq = inserted.getAllValues().get(1).getSeq();
-        long keptSeq = updated.getValue().getSeq();
-        assertThat(summarySeq).as("summary = boundary + 1（块内按数组序发号）").isEqualTo(boundarySeq + 1);
-        assertThat(keptSeq).as("kept 重挂 = summary + 1（重挂行与新行共用同一个块）").isEqualTo(summarySeq + 1);
+        assertThat(summarySeq)
+            .as("summary = boundary + 1（块内按数组序发号；kept 不取号 → 相邻）")
+            .isEqualTo(boundarySeq + 1);
     }
 
     @Test
@@ -359,8 +354,8 @@ class MessageServiceAppendPostCompactTest {
     }
 
     @Test
-    @DisplayName("[V70] listBySession 读回 isCompactSummary/isVisibleInTranscriptOnly（TraceView compactSummaryAfter 依赖）")
-    void listBySession_readsBackTranscriptFlags() {
+    @DisplayName("[V70] listRawForTranscript 读回 isCompactSummary/isVisibleInTranscriptOnly（TraceView compactSummaryAfter 依赖）")
+    void listRawForTranscript_readsBackTranscriptFlags() {
         // WHY（CLAUDE.md 规则九）：compact 摘要正文挂载在 isCompactSummary=true 的 user 消息上
         //   （前端 TraceView.compactSummaryAfter 判据 = isCompactSummary===true）。V70 前该标志只在内存
         //   DTO 存在、DB 无列 → 重拉（GET /messages）读回恒 false → 轨迹视图摘要详情缺失。
@@ -376,7 +371,7 @@ class MessageServiceAppendPostCompactTest {
         summaryRec.setIsVisibleInTranscriptOnly(true);
         when(messageMapper.selectListByQuery(any())).thenReturn(List.of(summaryRec));
 
-        List<ChatMessageDto> out = service.listBySession(SESSION);
+        List<ChatMessageDto> out = service.listRawForTranscript(SESSION);
 
         assertThat(out).hasSize(1);
         assertThat(out.get(0).isCompactSummary())
@@ -389,7 +384,7 @@ class MessageServiceAppendPostCompactTest {
 
     @Test
     @DisplayName("[V70] 存量旧行 is_compact_summary NULL → 读回 false（Boolean.TRUE.equals 容错）")
-    void listBySession_nullFlags_readBackFalse() {
+    void listRawForTranscript_nullFlags_readBackFalse() {
         MessageRecord legacy = new MessageRecord();
         legacy.setId("msg-legacy");
         legacy.setSessionId(SESSION);
@@ -398,7 +393,7 @@ class MessageServiceAppendPostCompactTest {
         legacy.setCreatedAt(OffsetDateTime.now().toString());
         when(messageMapper.selectListByQuery(any())).thenReturn(List.of(legacy));
 
-        List<ChatMessageDto> out = service.listBySession(SESSION);
+        List<ChatMessageDto> out = service.listRawForTranscript(SESSION);
 
         assertThat(out.get(0).isCompactSummary()).isFalse();
         assertThat(out.get(0).isVisibleInTranscriptOnly()).isFalse();

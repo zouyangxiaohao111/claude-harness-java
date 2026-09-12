@@ -26,7 +26,14 @@ import java.util.Set;
  *   <tr><td>getMessagesAfterCompactBoundary(messages, includeSnipped)</td><td>getMessagesAfterCompactBoundary(messages, options?)</td><td>messages.ts:5083-5096</td></tr>
  *   <tr><td>isSnipBoundaryMessage</td><td>isSnipBoundaryMessage(message)</td><td>snipProjection.ts:15-18</td></tr>
  *   <tr><td>projectSnippedView</td><td>projectSnippedView(messages)</td><td>snipProjection.ts:35-60</td></tr>
+ *   <tr><td>applyPreservedSegmentRelink</td><td>applyPreservedSegmentRelinks(messages)</td><td>sessionStorage.ts:1876-1992</td></tr>
  * </table>
+ *
+ * <p><b>[D4 解法1-精简 · 2026-09-12 用户裁定] 保留段读侧重挂</b>：kept 段写侧<b>零改写</b>（对齐 CC
+ * {@code recordTranscript} 按 uuid dedup 跳过、磁盘上原地不动），故它物理排在 boundary <b>之前</b>；
+ * 本组件在切片后按 boundary 上的 {@code preservedSegment} 把它按原 seq 序接回 {@code anchorUuid} 之后
+ * （对齐 CC 在读侧打 {@code parentUuid} 补丁的形态）。<b>只读 seq、不改写</b> —— 排序权威仍只有 seq 一个。
+ * 详见 {@link #applyPreservedSegmentRelink(List, int, List)}。
  *
  * <p><b>snip 投影（2026-08-18 真源对齐）</b>: CC getMessagesAfterCompactBoundary 在
  * {@code !options?.includeSnipped} 时会对切片应用 {@code projectSnippedView}（messages.ts:5088-5093），
@@ -98,6 +105,18 @@ public final class BoundaryReader {
 
     /** CC original: snipMetadata.removedUuids（snipProjection.ts:31 / snipCompact.ts:99-103）· snip 删除消息 uuid 数组 */
     private static final String SNIP_METADATA_REMOVED_UUIDS = "removedUuids";
+
+    /** CC original: compactMetadata.preservedSegment（message.ts:85-93）· 保留段接线图（写方 = CompactBoundaryMessage.annotateBoundaryWithPreservedSegment；读方 = 本组件的重挂投影）。 */
+    private static final String COMPACT_METADATA_PRESERVED_SEGMENT = "preservedSegment";
+
+    /** CC original: preservedSegment.headUuid（compact.ts:384）· 保留段首条消息 uuid。 */
+    private static final String SEG_HEAD_UUID = "headUuid";
+
+    /** CC original: preservedSegment.anchorUuid（compact.ts:371-380 / :1117）· 保留段在新链中紧邻的前一条消息 uuid。 */
+    private static final String SEG_ANCHOR_UUID = "anchorUuid";
+
+    /** CC original: preservedSegment.tailUuid（compact.ts:385）· 保留段末条消息 uuid。 */
+    private static final String SEG_TAIL_UUID = "tailUuid";
 
     /**
      * [2026-08-18] HISTORY_SNIP 门静态槽 · 默认全关。
@@ -312,6 +331,11 @@ public final class BoundaryReader {
                 log.debug("读侧切片: 最后一个 compact boundary 下标={}，切片 {} 条消息（含 boundary）",
                     boundaryIndex, sliced.size());
             }
+            // ── [D4 解法1-精简 · 读侧重挂] 保留段（kept）在写侧原地不动 → 物理排在 boundary 之前 →
+            //    切片天然丢段。此处按 boundary 上贴的 preservedSegment 接线图，把它按原 seq 序接回
+            //    anchorUuid 之后（对齐 CC sessionStorage.ts:1876-1992 applyPreservedSegmentRelinks 的
+            //    head.parentUuid = anchorUuid 读侧内存修补语义）。⚠️ 只读不写，seq 仍是唯一排序输入。
+            sliced = applyPreservedSegmentRelink(messages, boundaryIndex, sliced);
         }
         // ── [N2 2026-09-11 · 回放门 vs 执行门拆分] snip 投影**不再受** isHistorySnipEnabled 门控 ──
         // 决策 (B)「历史 snip 不复活」：关掉开关只应禁止「产生**新** snip」，绝不能让**已执行过**的
@@ -345,6 +369,147 @@ public final class BoundaryReader {
                     + "CC REPL.tsx:3167-3169 用法；CC messages.ts:5088 options.includeSnipped 分支）");
         }
         return sliced;
+    }
+
+    /**
+     * 保留段读侧重挂 · 对齐 CC {@code applyPreservedSegmentRelinks}
+     * （sessionStorage.ts:1876-1992，唯一调用点 :3808 = {@code loadTranscriptFile} 内）的
+     * <b>等价实现</b>。
+     *
+     * <h2>WHY（CC 对照，只读实际 TS 行为）</h2>
+     * CC 的 kept 行<b>在磁盘上原地不动</b>：{@code recordTranscript} 按 uuid dedup 跳过
+     * （sessionStorage.ts:1457-1468），JSONL append-only <b>不能改</b> ⇒ 它们的 {@code parentUuid}
+     * 仍指着被压缩掉的老消息。CC 在<b>读侧</b>（加载 transcript 后）打补丁：
+     * <pre>
+     *   head.parentUuid = anchorUuid            // 保留段接到锚点之后（:1935-1940）
+     *   anchor 的其它 children → parentUuid = tailUuid   // 锚点原有的后续内容挪到保留段之后（:1942-1948）
+     * </pre>
+     * <b>不是落盘前、不是复制、不是移动</b>。本仓无 {@code parentUuid} 链结构，顺序权威是 {@code seq}
+     * —— 故等价实现 = 在<b>读侧切片后</b>把「boundary 之前、且在 {@code [headUuid..tailUuid]} 区间内」
+     * 的行<b>按原 seq 序</b>拼接到 {@code anchorUuid} 所指位置之后。
+     *
+     * <h2>⛔ 红线：不引入第二套排序权威</h2>
+     * 本方法<b>只读</b> {@code seq}（入参列表序 = seq 序）与 {@code anchorUuid} 的位置，
+     * <b>不改写任何 seq</b>，也不产生新的排序键。写侧（{@code MessageService.appendPostCompactMessages}）
+     * 因此可以做到零改写（真 append-only）。任何「据此重排 seq」的改动都是被禁止的。
+     *
+     * <h2>为什么 anchor 规则天然给出方向正确的顺序</h2>
+     * CC 的 {@code anchorUuid} = 「新链里紧邻 {@code keep[0]} 之前那条」（compact.ts:371-380）：
+     * <ul>
+     *   <li><b>up_to / SM（后缀保留）</b>：anchor = 最后一条 summary → 拼接后
+     *       {@code [boundary, summary, kept...]}（= {@code CompactionResult.buildPostCompactMessages} 顺序）；</li>
+     *   <li><b>from（前缀保留）</b>：anchor = boundary 本身（compact.ts:1112-1115）→ 拼接后
+     *       {@code [boundary, kept..., summary]}（= {@code CompactionResult.buildPartialPostCompactMessages}
+     *       的 from 分支顺序 —— REPL.tsx:4950-4951 direction-aware 重组）。</li>
+     * </ul>
+     * 即：本重挂产出的顺序与压缩当时的内存数组顺序<b>逐项一致</b>，故「本轮内存视图 == 下轮 DB 派生视图」。
+     *
+     * <h2>退化行为（数据异常时不硬拼）</h2>
+     * <ol>
+     *   <li><b>无 seg</b>（boundary 无 {@code compactMetadata.preservedSegment}）：原样返回切片
+     *       —— 与改造前逐字节一致（全量压缩不写 seg；旧数据若写侧已把 kept 搬到 boundary 之后，
+     *       其 seg 虽在但下条判据会命中）。</li>
+     *   <li><b>seg 存在但 head/tail 在列表里解析不到</b>（行被删 / id 损坏）：ERROR 留痕 + 原样返回切片。</li>
+     *   <li><b>{@code tailUuid} 落在 boundary 及其后</b>（= 改造前的旧数据形态：写侧已把 kept 之 seq
+     *       重挂到 boundary 之后）：WARN 留痕 + 原样返回 —— 此时 kept 已在切片内，
+     *       <b>不重复插入</b>，故新旧数据都幂等。</li>
+     *   <li><b>{@code anchorUuid} 不在切片内</b>：ERROR 留痕 + 原样返回切片。</li>
+     * </ol>
+     * 与 CC 的差异如实登记：CC 走链校验失败时 {@code return} 会<b>连剪枝一起跳过</b>
+     * （宁可多加载整段历史也不剪错，sessionStorage.ts:1921-1932）；本仓的 boundary 剥离是
+     * 切片语义（恒定执行、无独立剪枝步骤），无法"撤销切片"，故退化为<b>不重挂</b>并显式留痕。
+     *
+     * @param full          全量消息（seq 序；未切片）
+     * @param boundaryIndex 最后一个 compact boundary 的下标（切片起点）
+     * @param sliced        已从 boundaryIndex 切出的列表（本方法不修改它）
+     * @return 重挂后的新列表；无 seg / 数据异常 → 原样返回 {@code sliced}
+     */
+    static List<ChatMessageDto> applyPreservedSegmentRelink(
+            List<ChatMessageDto> full, int boundaryIndex, List<ChatMessageDto> sliced) {
+        if (full == null || sliced == null || boundaryIndex < 0 || boundaryIndex >= full.size()) {
+            return sliced;
+        }
+        ChatMessageDto boundary = full.get(boundaryIndex);
+        Map<String, Object> meta = boundary.compactMetadata();
+        Object segObj = meta == null ? null : meta.get(COMPACT_METADATA_PRESERVED_SEGMENT);
+        if (!(segObj instanceof Map<?, ?> seg)) {
+            if (log.isDebugEnabled()) {
+                log.debug("保留段重挂: 最后一条 compact boundary 无 preservedSegment（全量压缩 / 老数据）→"
+                        + "不重挂，切片 {} 条（行为与改前一致）", sliced.size());
+            }
+            return sliced;
+        }
+        String headUuid = asString(seg.get(SEG_HEAD_UUID));
+        String anchorUuid = asString(seg.get(SEG_ANCHOR_UUID));
+        String tailUuid = asString(seg.get(SEG_TAIL_UUID));
+        if (isBlank(headUuid) || isBlank(anchorUuid) || isBlank(tailUuid)) {
+            log.error("保留段重挂: preservedSegment 字段残缺，放弃重挂（不硬拼）: boundaryId={} "
+                    + "headUuid={} anchorUuid={} tailUuid={} —— 顺序兜底仍只有 seq",
+                boundary.id(), headUuid, anchorUuid, tailUuid);
+            return sliced;
+        }
+        int headIdx = indexOfId(full, headUuid);
+        int tailIdx = indexOfId(full, tailUuid);
+        if (headIdx < 0 || tailIdx < 0 || headIdx > tailIdx) {
+            // CC 对照：applyPreservedSegmentRelinks 的 tail→head 走链校验失败 → logEvent
+            //   ('tengu_relink_walk_broken') 并直接 return（:1921-1932）。本仓等价判据 =
+            //   「head/tail 都在列表里，且 head 不晚于 tail」（无链，故只能校验区间合法）。
+            log.error("保留段重挂: head/tail 无法在消息列表内解析成合法区间，放弃重挂（不硬拼）: "
+                    + "boundaryId={} headUuid={}(idx={}) tailUuid={}(idx={}) 列表={} 条"
+                    + "（CC sessionStorage.ts:1921-1932 走链失败同义：宁可少加载也不剪错）",
+                boundary.id(), headUuid, headIdx, tailUuid, tailIdx, full.size());
+            return sliced;
+        }
+        if (tailIdx >= boundaryIndex) {
+            // 改造前的旧数据形态：写侧曾把 kept 之 seq 重挂到 boundary 之后 → kept 物理已在切片内。
+            // 此处必须 no-op，否则重复插入同一批行（同一行出现两次）。
+            if (log.isDebugEnabled()) {
+                log.debug("保留段重挂: kept 区间 [{}(idx={})..{}(idx={})] 不在 boundary(idx={}) 之前"
+                        + "（旧数据形态：kept 已由写侧重挂进切片）→ 不重挂（幂等，避免重复插入）",
+                    headUuid, headIdx, tailUuid, tailIdx, boundaryIndex);
+            }
+            return sliced;
+        }
+        int anchorIdx = indexOfId(sliced, anchorUuid);
+        if (anchorIdx < 0) {
+            log.error("保留段重挂: anchorUuid 不在切片内，放弃重挂（不硬拼）: boundaryId={} anchorUuid={}"
+                    + "（from 方向应为 boundary 自身 / up_to·SM 方向应为最后一条 summary）",
+                boundary.id(), anchorUuid);
+            return sliced;
+        }
+        // 区间是 seq 序上的连续子序列（full 已按 seq 排）→ 直接 subList，不重新排序（红线：唯一权威仍是 seq）。
+        List<ChatMessageDto> kept = new ArrayList<>(full.subList(headIdx, tailIdx + 1));
+        List<ChatMessageDto> out = new ArrayList<>(sliced.size() + kept.size());
+        out.addAll(sliced.subList(0, anchorIdx + 1));
+        out.addAll(kept);
+        out.addAll(sliced.subList(anchorIdx + 1, sliced.size()));
+        if (log.isInfoEnabled()) {
+            log.info("保留段重挂: boundaryId={} 把 kept {} 条（[{}(idx={})..{}(idx={})]，原 seq 未改写）"
+                    + "拼接到 anchor={}(切片下标={}) 之后 → 视图 {} → {} 条（CC sessionStorage.ts:1876-1992 读侧语义）",
+                boundary.id(), kept.size(), headUuid, headIdx, tailUuid, tailIdx,
+                anchorUuid, anchorIdx, sliced.size(), out.size());
+        }
+        return out;
+    }
+
+    /** 在列表中按 id 定位下标（无匹配 → -1）。仅用于保留段读数，不参与排序。 */
+    private static int indexOfId(List<ChatMessageDto> messages, String id) {
+        for (int i = 0; i < messages.size(); i++) {
+            ChatMessageDto m = messages.get(i);
+            if (m != null && id.equals(m.id())) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /** JSON 值 → String（Jackson 反序列化自 DB compact_metadata 列；非字符串 / 缺失 → null）。 */
+    private static String asString(Object v) {
+        return v instanceof String s ? s : null;
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     /**

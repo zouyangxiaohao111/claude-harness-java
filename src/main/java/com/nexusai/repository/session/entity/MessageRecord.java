@@ -132,7 +132,7 @@ public class MessageRecord {
      * 闭环）。null/空 = 无图片。DB 列名 image_paste_ids（MyBatis-Flex camelCase→snake_case
      * 自动映射，同 V44 permission_mode 范式）。
      *
-     * <p><b>WHY</b>：前端重拉缩略图需消息携带图片粘贴序号；转录重放（listBySession / 恢复漏斗）
+     * <p><b>WHY</b>：前端重拉缩略图需消息携带图片粘贴序号；转录重放（listRawForTranscript / 恢复漏斗）
      * 必须还原该字段，否则 TokenEstimator/Tokens 图片 token 估算与前端图链展示在历史消息上失真。
      */
     private String imagePasteIds;
@@ -177,8 +177,10 @@ public class MessageRecord {
      * 会话内单调排序键 · <b>净新增字段（非 CC 对齐）—— 根治「created_at 既是时间又是位置」</b>。
      *
      * <p>WHY: {@code created_at} 此前双重语义 —— ① 展示时间（前端「X 分钟前」）② 会话内排序位置
-     * （listBySession / listPageBySession ORDER BY created_at）。compact append-only 落库需把 kept 段
-     * 「重挂」到 boundary 之后（位置变化），但 kept 的真实产生时间不该改写（展示语义）→ 同列二义必冲突。
+     * （listRawForTranscript / listPageBySession ORDER BY created_at）。compact append-only 落库需把 kept 段
+     * 接回 boundary 之后（位置变化），但 kept 的真实产生时间不该改写（展示语义）→ 同列二义必冲突。
+     * <b>[D4 解法1-精简 · 2026-09-12]</b> 该「接回」已改到<b>读侧</b>做（BoundaryReader 按 preservedSegment
+     * 重挂，写侧零改写）—— 但本字段的存在理由不变：位置语义必须独立于 created_at。
      * V70 落库为 {@code seq} 列：位置语义归 seq（读侧 ORDER BY seq），时间语义归 created_at。
      *
      * <p><b>顺序键 = 雪花 ID（hutool）· 全局单调</b>：新写入经

@@ -31,7 +31,7 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>WHY（CLAUDE.md 规则九）</b>: CC rewindConversationTo（REPL.tsx:3661-3699）在<b>前端内存</b>
  * {@code setMessages(prev.slice(0, messageIndex))} 裁剪 —— Java 无前端内存，裁剪必须落 DB
- * （模型上下文来自 DB transcript，LlmAgentLoop 经 listBySession 加载），本方法即 DB 等价物。
+ * （模型上下文来自 DB transcript，LlmAgentLoop 经 listRawForTranscript 加载），本方法即 DB 等价物。
  * 变异点：
  * <ul>
  *   <li>删 pivot 区间错误（保留 pivot 而非丢弃）→ 模型上下文含 pivot → 红</li>
@@ -56,7 +56,7 @@ class MessageServiceTrimAfterTest {
         ReflectionTestUtils.setField(service, "messageMapper", messageMapper);
         ReflectionTestUtils.setField(service, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(service, "toolCallMapper", toolCallMapper);
-        // session 存在（listBySession / replaceSessionMessages 双重校验共用）
+        // session 存在（listRawForTranscript / replaceSessionMessages 双重校验共用）
         when(sessionMapper.selectOneById(any())).thenReturn(new SessionRecord());
         // 每条消息 toDto 的 tool_calls 查询 → 空（简化）
         when(toolCallMapper.selectListByQuery(any())).thenReturn(List.of());
@@ -159,7 +159,7 @@ class MessageServiceTrimAfterTest {
     @Test
     @DisplayName("pivot 必须命中当前会话消息列表（跨会话同 id 不误删）")
     void trim_pivotOnlyMatchesCurrentSession() {
-        // WHY: pivot 定位用当前会话列表（listBySession :59-71）而非 getById —— 消息 id 可能跨会话
+        // WHY: pivot 定位用当前会话列表（listRawForTranscript :59-71）而非 getById —— 消息 id 可能跨会话
         //   重复，getById 会命中另一会话消息 → 错删。变异点：改用 getById → 本会话 pivot 不存在却
         //   定位成功（/ 或错误删除）→ 红。
         givenMessages(List.of(message("m1", "sess-1", "第一问")));
@@ -171,10 +171,10 @@ class MessageServiceTrimAfterTest {
     }
 
     @Test
-    @DisplayName("裁剪后顺序保持 created_at ASC（重插保序，与 listBySession 一致）")
+    @DisplayName("裁剪后顺序保持 created_at ASC（重插保序，与 listRawForTranscript 一致）")
     void trim_preservesOrder() {
         // WHY: 重插 created_at=base.plusNanos(i) 保序（replaceSessionMessages :238）——裁剪后列表
-        //   顺序必须与 listBySession 一致，否则前端 setMessages 顺序错乱。
+        //   顺序必须与 listRawForTranscript 一致，否则前端 setMessages 顺序错乱。
         givenMessages(List.of(
             message("m1", "sess-1", "第一问"),
             message("m2", "sess-1", "第二问"),

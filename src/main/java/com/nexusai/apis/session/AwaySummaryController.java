@@ -70,7 +70,7 @@ public class AwaySummaryController {
     /**
      * 生成 "while you were away" session recap 文本 · POST /api/agent/away-summary。
      *
-     * <p>流程: 解析 sessionId（ODF-B1R 请求优先 + MDC 兜底）→ {@link MessageService#listBySession}
+     * <p>流程: 解析 sessionId（ODF-B1R 请求优先 + MDC 兜底）→ {@link MessageService#listRawForTranscript}
      * 加载全部消息 → {@link AwaySummaryService#generate}{@code (messages, new AbortController())} →
      * {@code .get(60s)}。结果语义:
      * <ul>

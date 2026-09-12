@@ -27,7 +27,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * [seq NULL 兜底 · 读侧] {@code listBySession} / {@code listPageBySession} 对 seq 为 NULL 的行的
+ * [seq NULL 兜底 · 读侧] {@code listRawForTranscript} / {@code listPageBySession} 对 seq 为 NULL 的行的
  * <b>排序处置（不冒充真实位置）</b> + <b>ERROR 告警（静默变有声）</b>。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：{@code seq} 是 {@code INTEGER NULL}（V70），
@@ -111,12 +111,12 @@ class MessageServiceNullSeqReadTest {
     }
 
     @Test
-    @DisplayName("listBySession（ASC）：flex 原样发出 `seq ASC NULLS LAST`（NULL 推末尾）；有 NULL 行 → ERROR 一条")
-    void listBySession_ordersNullsLastAndLogsError() {
+    @DisplayName("listRawForTranscript（ASC）：flex 原样发出 `seq ASC NULLS LAST`（NULL 推末尾）；有 NULL 行 → ERROR 一条")
+    void listRawForTranscript_ordersNullsLastAndLogsError() {
         when(messageMapper.selectListByQuery(any()))
             .thenReturn(List.of(row("m1", 10L), row("m-dirty", null), row("m2", 11L)));
 
-        service.listBySession(SESSION);
+        service.listRawForTranscript(SESSION);
 
         String sql = captureListQuery().toSQL();
         // 【最大风险点】flex 必须原样发出：不得包装成列名/转义/追加方向。任一处改写都会让 SQLite 语法错或排序失效。
@@ -135,7 +135,7 @@ class MessageServiceNullSeqReadTest {
         List<ILoggingEvent> errors = errorLogs();
         assertThat(errors).as("NULL seq = 数据异常，必须 ERROR 有声（静默变有声是这条的核心价值）").hasSize(1);
         String msg = errors.get(0).getFormattedMessage();
-        assertThat(msg).contains("listBySession").contains(SESSION).contains("m-dirty");
+        assertThat(msg).contains("listRawForTranscript").contains(SESSION).contains("m-dirty");
     }
 
     @Test
@@ -163,7 +163,7 @@ class MessageServiceNullSeqReadTest {
         when(messageMapper.selectListByQuery(any()))
             .thenReturn(List.of(row("m1", 10L), row("m2", 11L)));
 
-        service.listBySession(SESSION);
+        service.listRawForTranscript(SESSION);
         service.listPageBySession(SESSION, null, 50);
 
         assertThat(errorLogs()).isEmpty();

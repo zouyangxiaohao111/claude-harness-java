@@ -85,7 +85,7 @@ class MessageSeqNullOrderSqlTest {
             assertNullsLastOrder(
                 ids(conn, "SELECT id FROM messages WHERE session_id='" + SESSION
                     + "' ORDER BY " + MessageService.SEQ_ASC_NULLS_LAST_ORDER),
-                "listBySession 的实测排序：非 NULL 升序在前、NULL 全在末尾（不遮挡真实首条、不被 boundary 静默剪掉）",
+                "listRawForTranscript 的实测排序：非 NULL 升序在前、NULL 全在末尾（不遮挡真实首条、不被 boundary 静默剪掉）",
                 List.of("a", "b"), 2);
 
             // ③ 生产 DESC 片段：NULL 落在 DESC 结果末尾（= 最旧那头），不进尾页冒充「最新」

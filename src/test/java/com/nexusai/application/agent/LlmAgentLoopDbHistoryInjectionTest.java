@@ -44,7 +44,7 @@ import static org.mockito.Mockito.when;
  * <ul>
  *   <li>主路径注入：run 后 state.rawMessages() 前缀=注入历史、历史之后含当前用户消息、
  *       prePersistedMessageIds 含历史 id（否则 replayAndPersist 无法跳过重插 → 幽灵行回归）</li>
- *   <li>best-effort 失败：messageService.listBySession 抛异常 → loop 不阻断、无注入
+ *   <li>best-effort 失败：messageService.listRawForTranscript 抛异常 → loop 不阻断、无注入
  *       （对齐 skill 恢复块同款容错语义，残留变量不影响后续 turn）</li>
  *   <li>agentId != null 且未设任务流上下文（子代理 fork 自有上下文）→ 不注入</li>
  *   <li>[Re-think R2 修复] agentId != null 且 setTaskStreamContext 置真（后台化主会话任务，
@@ -57,7 +57,7 @@ import static org.mockito.Mockito.when;
  * <p><b>测试基建</b>: 复用 LlmAgentLoopResumeRestoreEntryTest 同款真实 run 模式（裸
  * {@code new LlmAgentLoop(factory)} + mocked provider 首调 stop + {@link CapturingContextFactory}）。
  * 注入块消费 {@code messageService.listForResumeExcluding(List, String)} 重载（原始转录内存派生，
- * 消除与 skill 恢复块的重复 DB 读取）——mock 的 listBySession 返回原始转录，listForResumeExcluding
+ * 消除与 skill 恢复块的重复 DB 读取）——mock 的 listRawForTranscript 返回原始转录，listForResumeExcluding
  * 返回反序列化漏斗产物。
  */
 class LlmAgentLoopDbHistoryInjectionTest {
@@ -145,7 +145,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
                 List.of(), FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(),
                 null, null, null, List.of(), List.of(), null, false, false, null));
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(raw);
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(raw);
         // 反序列化漏斗产物（服务层已覆盖语义，这里直接 mock 产物聚焦注入块本身）
         when(messageService.listForResumeExcluding(anyList(), anyString())).thenReturn(
             List.of(historyAssistant(HIST_ASST_ID, "上一轮回复"),
@@ -176,11 +176,11 @@ class LlmAgentLoopDbHistoryInjectionTest {
     }
 
     @Test
-    @DisplayName("best-effort 失败: listBySession 抛异常 → loop 不阻断、无注入（prePersistedMessageIds=null）")
+    @DisplayName("best-effort 失败: listRawForTranscript 抛异常 → loop 不阻断、无注入（prePersistedMessageIds=null）")
     void dbReadFailure_loopContinues_noInjection() {
-        // GIVEN: 主流程预取 listBySession 抛异常（DB 抖动）→ resumeRawTranscript=null
+        // GIVEN: 主流程预取 listRawForTranscript 抛异常（DB 抖动）→ resumeRawTranscript=null
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY))
+        when(messageService.listRawForTranscript(SESSION_KEY))
             .thenThrow(new RuntimeException("db down"));
 
         LlmAgentLoop loop = buildLoop(messageService, stopProvider("fresh response"));
@@ -203,7 +203,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
         // GIVEN: messageService 可用且返回历史，但 agentId 非 null 且未调 setTaskStreamContext
         //        （子代理路径 —— fork 自有上下文，SubagentExecutor.java:2015 不调 LlmAgentLoop.run）
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(
             List.of(historyAssistant(HIST_ASST_ID, "上一轮回复")));
 
         LlmAgentLoop loop = buildLoop(messageService, stopProvider("subagent response"));
@@ -234,7 +234,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
             historyAssistant(HIST_ASST_ID, "上一轮回复"),
             historyTool(HIST_TOOL_ID, "tc-hist", "上一轮工具结果"));
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(raw);
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(raw);
         when(messageService.listForResumeExcluding(anyList(), nullable(String.class))).thenReturn(
             List.of(historyAssistant(HIST_ASST_ID, "上一轮回复"),
                 historyTool(HIST_TOOL_ID, "tc-hist", "上一轮工具结果")));

@@ -109,7 +109,7 @@ class V70MessagesSeqMigrationTest {
             // ── 5. 索引存在 + 二次执行幂等（IF NOT EXISTS）──
             assertThat(queryInt(conn,
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_session_seq'"))
-                .as("排序键索引已建（listBySession/listPageBySession 按 seq）").isEqualTo(1);
+                .as("排序键索引已建（listRawForTranscript/listPageBySession 按 seq）").isEqualTo(1);
             try (Statement st = conn.createStatement()) {
                 st.executeUpdate("CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq)");
             }

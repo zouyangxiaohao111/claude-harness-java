@@ -55,7 +55,7 @@ import static org.mockito.Mockito.when;
  * 这条口径钉死在 {@link MessageService} 两条主读路径<b>之外</b>的每一处 seq 排序点上。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：{@code SEQ_ASC_NULLS_LAST_ORDER} /
- * {@code SEQ_DESC_NULLS_LAST_ORDER} 已在 {@code listBySession} / {@code listPageBySession} 落地，
+ * {@code SEQ_DESC_NULLS_LAST_ORDER} 已在 {@code listRawForTranscript} / {@code listPageBySession} 落地，
  * 但同一批裸 {@code ORDER BY seq} 还散在 6 处（导出 / 复制 / resume 链首 / 标题两条输入 / 最近 N 条），
  * 其中<b>两处是功能性错误而不只是「顺序难看」</b>：
  * <ol>

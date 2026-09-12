@@ -2257,7 +2257,7 @@ public class ToolRegistrationConfig {
         // CC 的 REPL 恒持有 messages（compact/index.ts → compact.ts:44 `let { messages } = context`），
         // 故 CC 的 /compact 任何时刻（含空闲会话）都能压。本仓 AgentState 只在主循环在跑时注册
         // （LlmAgentLoop.run 入口 :2454），空闲会话 registry miss → 旧实现直接 bail（"什么都不做"）。
-        // 此处按 loop 同款「从 DB 重建」手法（listBySession → listForResumeExcluding 中断语义漏斗 →
+        // 此处按 loop 同款「从 DB 重建」手法（listRawForTranscript → listForResumeExcluding 中断语义漏斗 →
         // appendMessage 注灌，逐字复用 LlmAgentLoop:2385/2402-2420 与 PartialCompactService:224
         // 的既有重建路径）造一个**一次性临时 state** 供本次压缩使用。
         // 不注册进 registry 的理由（默认不注册，见 rebuildIdleStateFromDb javadoc）：临时 state 无
@@ -2435,7 +2435,7 @@ public class ToolRegistrationConfig {
      *
      * <h2>复用的既有重建手法（不新造）</h2>
      * 与 {@code LlmAgentLoop.doRun} 的 DB 历史注入块（{@code LlmAgentLoop:2385} 读
-     * {@code listBySession} → {@code :2402} 经 {@code listForResumeExcluding(raw, streamUserMessageId)}
+     * {@code listRawForTranscript} → {@code :2402} 经 {@code listForResumeExcluding(raw, streamUserMessageId)}
      * 派生 → {@code :2419} 逐条 {@code state.appendMessage}）<b>逐字同源</b>；同为「loop 外续聊加载历史
      * 通道」的 {@code PartialCompactService:224} 也消费同一 {@code listForResume} 漏斗（其 javadoc
      * 明列恢复通道消费点：ChatController background / PartialCompactService / AwaySummaryController）。
@@ -2484,7 +2484,7 @@ public class ToolRegistrationConfig {
         List<com.nexusai.model.session.dto.ChatMessageDto> raw;
         try {
             // 与 LlmAgentLoop:2385 同源：一次性读原始转录（seq ASC），后续在内存派生（不重复查库）。
-            raw = messageService.listBySession(rawSessionId);
+            raw = messageService.listRawForTranscript(rawSessionId);
         } catch (Exception e) {
             // best-effort：会话不存在（NotFoundException）或 DB 抖动 → 无法重建，交调用方 fail-loud
             log.warn("[R1] /compact 空闲会话历史读取失败（无法重建 state）: session={} err={}",

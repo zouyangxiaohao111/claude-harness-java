@@ -320,7 +320,7 @@ class CompactIdleRebuildModelWiringTest {
             usageMsg("h2", "first answer"),
             msg("h3", Role.user, "/compact")));
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION)).thenReturn(dbRows);
+        when(messageService.listRawForTranscript(SESSION)).thenReturn(dbRows);
         // 与生产同语义：按 requestId 真排除在途 /compact 行（不是原样返回）
         when(messageService.listForResumeExcluding(anyList(), nullable(String.class)))
             .thenAnswer(inv -> {

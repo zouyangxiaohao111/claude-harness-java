@@ -27,7 +27,7 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>WHY (CLAUDE.md 规则 9 · 测试验证意图)</b>: 实时 message.complete 事件推
  * contextTokensUsed/percentLeft/contextWindow（ChatService:559-581，对齐 CC context.ts
- * current_usage/percentLeft），历史消息重拉（GET /messages → MessageService.listBySession）
+ * current_usage/percentLeft），历史消息重拉（GET /messages → MessageService.listRawForTranscript）
  * 不落库 → 重拉丢失。方案B：不落库，每次重拉对末条 assistant 消息补算
  * （applyContextSnapshotToLastAssistant）。变异点：
  * <ul>
@@ -113,7 +113,7 @@ class MessageServiceContextSnapshotTest {
 
     @Test
     @DisplayName("正常路径：末条 assistant 得上下文快照（input 重算 + 模型表窗口 + percentLeft）")
-    void listBySession_attachesSnapshot_toLastAssistant() {
+    void listRawForTranscript_attachesSnapshot_toLastAssistant() {
         // GIVEN: 会话模型 override + 模型表窗口 128000 + 消息 [user, assistant(input=2000)]
         stubSessionModel("deepseek/deepseek-v4-flash");
         stubModelWindow(128000);
@@ -122,7 +122,7 @@ class MessageServiceContextSnapshotTest {
             rec("m-asst", "assistant", 2000, 500)));
 
         // WHEN: 重拉（GET /messages）
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: 末条 assistant 携带快照（DB 只存 input，cache 未存 → used=input；窗口=模型表；percentLeft 四舍五入）
         assertThat(read).hasSize(2);
@@ -140,7 +140,7 @@ class MessageServiceContextSnapshotTest {
 
     @Test
     @DisplayName("末条 assistant 无 usage（input/output 均 null）→ 不出快照")
-    void listBySession_lastAssistantNoUsage_noSnapshot() {
+    void listRawForTranscript_lastAssistantNoUsage_noSnapshot() {
         // GIVEN: 会话模型 + 模型窗口已可解析，但末条 assistant 无 usage
         stubSessionModel("deepseek/deepseek-v4-flash");
         stubModelWindow(128000);
@@ -149,7 +149,7 @@ class MessageServiceContextSnapshotTest {
             rec("m-asst", "assistant", null, null)));
 
         // WHEN
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: 三字段全 null（对齐实时 usage null 省略，前端 null=无数据）
         assertThat(read.get(1).contextTokensUsed()).isNull();
@@ -159,7 +159,7 @@ class MessageServiceContextSnapshotTest {
 
     @Test
     @DisplayName("会话模型不可判定（override + settings 均空）→ 不出快照")
-    void listBySession_modelUnresolvable_noSnapshot() {
+    void listRawForTranscript_modelUnresolvable_noSnapshot() {
         // GIVEN: 会话 modelName 空白 + settingsMapper 未注入（null）→ 模型不可判定
         stubSessionModel("   ");
         when(messageMapper.selectListByQuery(any())).thenReturn(List.of(
@@ -167,7 +167,7 @@ class MessageServiceContextSnapshotTest {
             rec("m-asst", "assistant", 2000, 500)));
 
         // WHEN
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: 不出快照（对齐实时 usage null 省略语义，前端 null=无数据）
         assertThat(read.get(1).contextTokensUsed()).isNull();
@@ -177,7 +177,7 @@ class MessageServiceContextSnapshotTest {
 
     @Test
     @DisplayName("[修复] openai_compatible 模型（DeepSeek）重算仅 input——加 cacheRead 双计 → 红")
-    void listBySession_openaiCompatibleCacheTokensNoDoubleCount() {
+    void listRawForTranscript_openaiCompatibleCacheTokensNoDoubleCount() {
         // WHY (规则 9 · 测试验证意图): 主模型 DeepSeek 走 openai_compatible 协议——实时 complete 事件
         //   仅按 input（prompt_tokens 已含 cache hit）。重算若仍三字段和（B1 旧实现）→ 与实时不一致，
         //   双计 cache → 红。变异点：重算对该协议加 cacheRead/cacheCreation → used=2800 → 红。
@@ -191,7 +191,7 @@ class MessageServiceContextSnapshotTest {
             rec("m-asst", "assistant", 2000, 500, 500, 300)));
 
         // WHEN: 重拉（GET /messages）
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: contextTokensUsed = input = 2000（cache 不双计，与实时 ChatService:572-578 同源）
         ChatMessageDto last = read.get(1);
@@ -211,7 +211,7 @@ class MessageServiceContextSnapshotTest {
 
     @Test
     @DisplayName("[修复] Anthropic 模型重算含 cache（input+cacheRead+cacheCreation 三字段和）")
-    void listBySession_anthropicCacheTokensIncludedInRecompute() {
+    void listRawForTranscript_anthropicCacheTokensIncludedInRecompute() {
         // WHY (规则 9 · 测试验证意图): Claude API usage 三字段独立（CC utils/context.ts:131-133），
         //   Anthropic 协议重算必须三字段和，否则 cache 少算 → 红。与实时 complete 事件同源分派。
         // GIVEN: provider.type="anthropic" + 末条 assistant input=2000 cacheRead=500 cacheCreation=300
@@ -223,7 +223,7 @@ class MessageServiceContextSnapshotTest {
             rec("m-asst", "assistant", 2000, 500, 500, 300)));
 
         // WHEN: 重拉（GET /messages）
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: contextTokensUsed = input + cacheRead + cacheCreation = 2800
         ChatMessageDto last = read.get(1);
@@ -237,7 +237,7 @@ class MessageServiceContextSnapshotTest {
 
     @Test
     @DisplayName("[B1 方案A] 旧行无 cache（V53 列 NULL）→ 重算回退 input（不 NPE，与存量兼容）")
-    void listBySession_oldRowNoCache_recomputeFallsBackToInput() {
+    void listRawForTranscript_oldRowNoCache_recomputeFallsBackToInput() {
         // WHY: V53 迁移前旧行 cache 列 NULL → toDto 回填 null → 重算 null 回退 0。
         //   变异点：重算直接对 null 做加法 → NPE → 红（存量历史消息重拉即崩）。
         stubSessionModel("deepseek/deepseek-v4-flash");
@@ -246,7 +246,7 @@ class MessageServiceContextSnapshotTest {
             rec("m-user", "user", null, null),
             rec("m-asst-old", "assistant", 2000, 500)));
 
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         assertThat(read.get(1).contextTokensUsed())
             .as("旧行无 cache → used = input + 0 + 0 = 2000（null 容错）")

@@ -109,7 +109,7 @@ class LlmAgentLoopResumeRestoreEntryTest {
             attachmentMsg("att-listing", "skill_listing", "skills-available reminder"));
 
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(transcript);
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(transcript);
 
         LlmProvider provider = stopProvider("resume response");
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
@@ -149,7 +149,7 @@ class LlmAgentLoopResumeRestoreEntryTest {
      * "msg-1"，无附件）→ resume=false → 不恢复 invokedSkills + 不置真 suppressNextSkillListing。
      *
      * <p><b>WHY（CLAUDE.md 规则 9）</b>: 生产 {@code ChatController.send()} 第一步同步
-     * {@code createUserMessage} 持久化当前用户消息 → {@code listBySession} 在 run() 入口恒含
+     * {@code createUserMessage} 持久化当前用户消息 → {@code listRawForTranscript} 在 run() 入口恒含
      * 当前用户消息 → 旧实现「转录非空」恒真（{@code if(!resume) return;} 死分支）。修正后
      * resume = 转录存在<b>非当前用户消息</b>；本测试钉死 resume=false 分支：全新会话首 run
      * 跳过恢复，不把任何技能状态误植进 fresh AgentState、不重武装 suppress。若 resume 计算被
@@ -163,7 +163,7 @@ class LlmAgentLoopResumeRestoreEntryTest {
             "fresh session query", null, List.of(), FinishReason.stop, null, null, "刚刚",
             OffsetDateTime.now(), null, null, null, List.of(), List.of(), null, false, false, null);
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(currentUserMsg));
+        when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(currentUserMsg));
 
         LlmProvider provider = stopProvider("fresh response");
         LlmProviderFactory factory = mock(LlmProviderFactory.class);

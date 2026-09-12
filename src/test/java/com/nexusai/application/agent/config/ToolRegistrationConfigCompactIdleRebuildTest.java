@@ -131,7 +131,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
             msg("h1", Role.user, "first question"),
             msg("h2", Role.assistant, "first answer"),
             msg("h3", Role.user, "/compact")));
-        when(messageService.listBySession(SESSION)).thenReturn(dbRows);
+        when(messageService.listRawForTranscript(SESSION)).thenReturn(dbRows);
         when(messageService.listForResumeExcluding(anyList(), nullable(String.class)))
             .thenAnswer(inv -> inv.getArgument(0));
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
@@ -188,7 +188,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
     void rebuiltStateIsNotRegisteredIntoLRegistry(@TempDir Path baseDir) throws Exception {
         SessionMemoryService sm = newSmService(baseDir);
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION)).thenReturn(new ArrayList<>(List.of(
+        when(messageService.listRawForTranscript(SESSION)).thenReturn(new ArrayList<>(List.of(
             msg("h1", Role.user, "q"), msg("h2", Role.assistant, "a"))));
         when(messageService.listForResumeExcluding(anyList(), nullable(String.class)))
             .thenAnswer(inv -> inv.getArgument(0));
@@ -241,7 +241,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
             .doesNotContain("会话未注册 AgentState");
         verify(messageService, never())
             .listForResumeExcluding(anyList(), nullable(String.class));
-        verify(messageService, never()).listBySession(SESSION);
+        verify(messageService, never()).listRawForTranscript(SESSION);
         ArgumentCaptor<List<ChatMessageDto>> persisted = ArgumentCaptor.forClass(List.class);
         verify(messageService).appendPostCompactMessages(eq(SESSION), persisted.capture());
         assertThat(persisted.getValue().get(0).subtype()).isEqualTo("compact_boundary");
@@ -263,7 +263,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
     void emptySessionReportsNoMessagesToCompact(@TempDir Path baseDir) throws Exception {
         SessionMemoryService sm = newSmService(baseDir);
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION)).thenReturn(new ArrayList<>());
+        when(messageService.listRawForTranscript(SESSION)).thenReturn(new ArrayList<>());
         when(messageService.listForResumeExcluding(anyList(), nullable(String.class)))
             .thenReturn(List.of());
 
@@ -298,7 +298,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
         SessionMemoryService sm = newSmService(baseDir);
         MessageService messageService = mock(MessageService.class);
         // 末条是真实会话内容（CommandController.executeCompactBuiltin 直调路径不落 /compact 行）
-        when(messageService.listBySession(SESSION)).thenReturn(new ArrayList<>(List.of(
+        when(messageService.listRawForTranscript(SESSION)).thenReturn(new ArrayList<>(List.of(
             msg("m1", Role.user, "q"), msg("m2", Role.assistant, "a"))));
         when(messageService.listForResumeExcluding(anyList(), nullable(String.class)))
             .thenAnswer(inv -> inv.getArgument(0));

@@ -30,7 +30,7 @@ import static org.mockito.Mockito.when;
  * {@code isCompactSummary / isVisibleInTranscriptOnly} 真正写入 {@link MessageRecord}（写侧 → 读回闭环）。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：既有 {@code MessageServiceAppendPostCompactTest}
- * 只覆盖了<b>读侧</b>（手工 {@code setIsCompactSummary(true)} 后 listBySession 读回）—— 把
+ * 只覆盖了<b>读侧</b>（手工 {@code setIsCompactSummary(true)} 后 listRawForTranscript 读回）—— 把
  * {@code appendMessage} 里那两行 {@code rec.setIsCompactSummary(...) / rec.setIsVisibleInTranscriptOnly(...)}
  * 整段删掉，既有测试<b>仍然全绿</b>，而生产后果是：
  * <ul>

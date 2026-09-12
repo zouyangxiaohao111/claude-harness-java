@@ -33,7 +33,7 @@ import com.fasterxml.jackson.databind.JsonNode;
  * </ul>
  *
  * <p>WHY 不从前端透传 {@code messages}：对话历史由后端
- * {@link com.nexusai.domain.session.MessageService#listBySession} 取（explainer 内部
+ * {@link com.nexusai.domain.session.MessageService#listRawForTranscript} 取（explainer 内部
  * {@code extractConversationContext} 自动取最近 3 条 assistant），防伪造上下文。
  *
  * @see PermissionExplanationEvent

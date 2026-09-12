@@ -1859,7 +1859,9 @@ public class AgentState {
      *
      * <p><b>落库语义 = append-only</b>（对齐 CC transcript append-only：sessionStorage.ts
      * {@code recordTranscript}/{@code insertMessageChain} 只追加）：{@code MessageService.appendPostCompactMessages}
-     * 只追加新行 + 把 kept 段 created_at 重挂到 boundary 之后，<b>不删任何旧行</b>。故签名返回归一化列表
+     * 只追加新行（[D4 解法1-精简 · 2026-09-12] 已存在行 dedup 跳过、<b>零改写</b>），<b>不删任何旧行</b>；
+     * kept 段回到模型视图由读侧按 preservedSegment 重挂（{@code BoundaryReader.applyPreservedSegmentRelink}）。
+     * 故签名返回归一化列表
      * （id 保持 + sessionId 落定），内存须用同一份以与 DB id 对齐。
      *
      * <p><b>未武装语义</b>（fork 子 agent / 测试 / 非 Spring）：{@link #persistCompactedMessages} 原样返回
@@ -1902,7 +1904,8 @@ public class AgentState {
     }
 
     /**
-     * 压缩结果落库 · 对齐 CC transcript append-only（compact 后 DB 追加 boundary/summary + 重挂 kept 段）。
+     * 压缩结果落库 · 对齐 CC transcript append-only（compact 后 DB 追加 boundary/summary；kept 段<b>零改写</b>
+     * 留在原位，模型面重挂由读侧 {@code BoundaryReader.applyPreservedSegmentRelink} 承担）。
      *
      * <p>已武装 → 经监听器 append-only 落库并返回归一化列表（调用方据此替换内存，保证 memory 与 DB id
      * 一致）；未武装 / 入参 null → 原样返回（fork 子 agent、非 Spring 单测零行为变化）。异常不吞：由调用方

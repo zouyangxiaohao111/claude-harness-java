@@ -299,7 +299,7 @@ public class PartialCompactService {
         AbortController compactAbort = new AbortController();
         registerProgressChannel(sessionId, compactAbort);
         try {
-            // ── 1. 加载消息（MessageService.listBySession 校验 session 存在，不存在 → 404）──
+            // ── 1. 加载消息（MessageService.listRawForTranscript 校验 session 存在，不存在 → 404）──
             // [S1] partial 压缩 = 续聊加载历史通道 → listForResume（对齐 CC
             //   deserializeMessagesWithInterruptDetection：未配对 tool_use/孤立 thinking/纯空白
             //   assistant 剥离 + 中断 turn "Continue" sentinel 注入）。CC partial compact 消费的
@@ -388,8 +388,9 @@ public class PartialCompactService {
 
             // ── 7. 写回：<b>append-only</b> 追加压缩结果 + 新 conversationId（REPL.tsx:4964/4971）──
             // [SM/compact 对齐 CC] 由 replaceSessionMessages（删全表 + 换时间基重插）改为
-            //   appendPostCompactMessages（只追加 boundary/summary 新行 + 把 kept 段 created_at 重挂到
-            //   boundary 之后，<b>绝不删除旧行</b>）—— 与 auto/reactive compact 同一条落库语义
+            //   appendPostCompactMessages（只追加 boundary/summary 新行；[D4 解法1-精简 2026-09-12]
+            //   kept 段 dedup 跳过、写侧零改写，重挂改由读侧 BoundaryReader.applyPreservedSegmentRelink
+            //   承担；<b>绝不删除旧行</b>）—— 与 auto/reactive compact 同一条落库语义
             //   （ChatService.armRealTimePersist 的 compactPersistListener 亦调本方法）。
             //   WHY（结构同构 + 边界剪枝契约）: partial 的结果集与全量 compact 完全同构
             //   （CompactionResult.buildPartialPostCompactMessages = boundary → ordered(summary/keep)

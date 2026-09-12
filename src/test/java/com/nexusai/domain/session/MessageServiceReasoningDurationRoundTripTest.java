@@ -34,7 +34,7 @@ import static org.mockito.Mockito.when;
  * <ul>
  *   <li>appendMessage 落库丢 duration → DB 写侧断头 → 红</li>
  *   <li>replaceSessionMessages 全量替换丢 duration → partial 压缩写回后历史耗时丢失 → 红</li>
- *   <li>toDto 不回填 → GET /messages（ChatController listBySession）出站无字段 → 红</li>
+ *   <li>toDto 不回填 → GET /messages（ChatController listRawForTranscript）出站无字段 → 红</li>
  *   <li>createUserMessage 误写 user 消息 duration → 无 reasoning 也留痕 → 红</li>
  * </ul>
  */
@@ -68,8 +68,8 @@ class MessageServiceReasoningDurationRoundTripTest {
     }
 
     @Test
-    @DisplayName("appendMessage 落库带 duration → listBySession 读回一致 + 返回 DTO 保留字段")
-    void appendMessage_writesDuration_listBySessionReadsBack() {
+    @DisplayName("appendMessage 落库带 duration → listRawForTranscript 读回一致 + 返回 DTO 保留字段")
+    void appendMessage_writesDuration_listRawForTranscriptReadsBack() {
         // GIVEN: 带推理耗时的 assistant DTO
         ChatMessageDto dto = assistant("msg-asst", "思考", 1200L);
 
@@ -87,7 +87,7 @@ class MessageServiceReasoningDurationRoundTripTest {
 
         // WHEN: 读回（toDto 回填）——stub selectListByQuery 返回已插入 rec
         when(messageMapper.selectListByQuery(any())).thenReturn(List.of(captor.getValue()));
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: GET /messages 出站 DTO 携带 duration
         assertThat(read).hasSize(1);

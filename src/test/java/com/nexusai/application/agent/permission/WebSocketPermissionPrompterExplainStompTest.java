@@ -110,7 +110,7 @@ class WebSocketPermissionPrompterExplainStompTest {
             RiskLevel.LOW, "Lists files", "I need to inspect", "None"));
         prompter.setPermissionExplainerForTesting(explainer);
         MessageService messageService = mock(MessageService.class);
-        when(messageService.listBySession(SESSION_ID))
+        when(messageService.listRawForTranscript(SESSION_ID))
             .thenReturn(List.of(assistant("recent assistant reasoning")));
         prompter.setMessageServiceForTesting(messageService);
 

@@ -43,7 +43,7 @@ import static org.mockito.Mockito.mock;
  *
  * <p><b>不可测部分（如实声明）</b>：「{@code -1} 在 SQLite {@code ORDER BY seq ASC} 下排最前」这一
  * 排序后果需要真实 DB 才能端到端断言 —— 本测试<b>不</b>伪造它（无假 DB 断言），只在 JavaDoc 中说明；
- * 排序语义由 {@code MessageService.listBySession}/{@code listPageBySession} 的 {@code ORDER BY seq}
+ * 排序语义由 {@code MessageService.listRawForTranscript}/{@code listPageBySession} 的 {@code ORDER BY seq}
  * 契约承载（见该两方法 JavaDoc）。
  */
 @DisplayName("[seq 排序键] ChatService.nextSeq -1 退化出口（行为锁）")

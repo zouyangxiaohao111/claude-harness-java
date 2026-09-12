@@ -73,8 +73,8 @@ class MessageServiceCacheTokensRoundTripTest {
     }
 
     @Test
-    @DisplayName("appendMessage 写侧把 AgentUsage.cacheRead/cacheCreation 落库（V53 列）→ listBySession 读回 DTO")
-    void appendMessage_writesCacheUsage_listBySessionReadsBack() {
+    @DisplayName("appendMessage 写侧把 AgentUsage.cacheRead/cacheCreation 落库（V53 列）→ listRawForTranscript 读回 DTO")
+    void appendMessage_writesCacheUsage_listRawForTranscriptReadsBack() {
         // GIVEN: 带 cache 的 assistant DTO（仅 usage 携带 cache，DTO 投影字段未设 →
         //   验证写侧真源读 AgentUsage）
         ChatMessageDto dto = assistantWithCacheUsage("msg-asst", 2000, 500, 500L, 300L);
@@ -94,7 +94,7 @@ class MessageServiceCacheTokensRoundTripTest {
 
         // WHEN: 读回（toDto 回填）——stub selectListByQuery 返回已插入 rec
         when(messageMapper.selectListByQuery(any())).thenReturn(List.of(captor.getValue()));
-        List<ChatMessageDto> read = service.listBySession("sess-1");
+        List<ChatMessageDto> read = service.listRawForTranscript("sess-1");
 
         // THEN: GET /messages 出站 DTO 携带 cache（toDto 读侧唯一点）
         assertThat(read).hasSize(1);

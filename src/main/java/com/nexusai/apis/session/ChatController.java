@@ -66,7 +66,7 @@ public class ChatController {
         // [W8-04 / OPD-TP-07] Java 消息折叠链（对齐 CC Messages.tsx:520）：出站 transcript 组装点
         // 应用 collapseTeammateShutdowns —— 连续 in-process teammate shutdown task_status attachment
         // 折叠为 teammate_shutdown_batch（否则前端收到多条「Teammate @x shut down gracefully」洪泛）。
-        return TeammateMessageFoldingChain.collapse(messageService.listBySession(sessionId));
+        return TeammateMessageFoldingChain.collapse(messageService.listRawForTranscript(sessionId));
     }
 
     /**
@@ -286,7 +286,7 @@ public class ChatController {
         // 会话历史 → transcript Map（CC query({messages}) 的 bgMessages 等价）
         // [S1] 后台化 = 续聊加载历史通道 → listForResume（对齐 CC deserializeMessagesWithInterruptDetection：
         //   未配对 tool_use/孤立 thinking/纯空白 assistant 剥离 + 中断 turn "Continue" sentinel 注入，
-        //   避免"有问无答"背景化后 LLM 上下文缺 assistant 响应）。DB 权威写入不变（listBySession 仍供 GET /messages）。
+        //   避免"有问无答"背景化后 LLM 上下文缺 assistant 响应）。DB 权威写入不变（listRawForTranscript 仍供 GET /messages）。
         List<Map<String, Object>> history = messageService.listForResume(sessionId).stream()
             .map(m -> Map.<String, Object>of("role", m.role() != null ? m.role().name() : "user",
                 "content", m.content() != null ? m.content() : ""))

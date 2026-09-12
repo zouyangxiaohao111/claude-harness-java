@@ -32,7 +32,7 @@ import static org.mockito.Mockito.when;
  * [seq 排序键] ChatService 实时落库 4 条直写 {@code messageMapper.insert} 分支的 seq / created_at 取号。
  *
  * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图）</b>：{@code messages.seq}（V70）是会话内<b>位置键</b>
- * —— 读侧 {@code MessageService.listBySession} / {@code listPageBySession} 一律 {@code ORDER BY seq ASC}，
+ * —— 读侧 {@code MessageService.listRawForTranscript} / {@code listPageBySession} 一律 {@code ORDER BY seq ASC}，
  * compact 重挂 kept 段也只改 seq。ChatService 实时落库是会话消息的<b>主要 writer</b>（4 处直写
  * {@code messageMapper.insert} 绕过 MessageService），每处都必须
  * {@code rec.setSeq(nextSeq(sessionId))} + {@code rec.setCreatedAt(ts.toString())}：

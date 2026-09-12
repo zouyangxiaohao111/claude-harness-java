@@ -613,7 +613,7 @@ public class CommandRegistrationConfig28 {
                     log.warn("[CommandRegistrationConfig28] /export 会话 {} 不存在", sessionId);
                     return;
                 }
-                List<ChatMessageDto> messages = messageService.listBySession(sessionId);
+                List<ChatMessageDto> messages = messageService.listRawForTranscript(sessionId);
                 String md = renderExportMarkdown(dto, messages);
                 String summary = messages.isEmpty() ? "(空会话)" : String.format(
                     "首条[%s]: %s | 末条[%s]: %s",

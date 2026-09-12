@@ -234,16 +234,15 @@ public record CompactBoundaryMessage(
      *   <li>from（前缀保留）→ boundary 自身（compact.ts:1081）</li>
      * </ul>
      *
-     * <p><b>⚠️ 本字段在 nexusai 为「只写」字段（D4 档 0.5 · 2026-09-12 裁定）</b>：
-     * CC 靠 {@code parentUuid} 指针链表达顺序，故需要这张「保留段接线图」在 resume 时
-     * {@code applyPreservedSegmentRelinks} 补指针（sessionStorage.ts:1876-1992，调用点 :3808）。
-     * nexusai <b>没有链结构</b>——顺序的唯一权威是 DB 列 {@code seq}
-     * （{@code MessageService.nextSeq} / {@code appendPostCompactMessages} 重挂），
-     * 且主路径 transcript 不写 uuid/parentUuid，把 CC 的 reader 搬来也<b>无链可走</b>。
-     * <p>本字段保留的意义 = CC wire-shape 对齐 + DB/SDK round-trip 完整（供审计/回放），
-     * <b>不是排序输入</b>。
-     * <p><b>⛔ 禁止读侧据此做任何重排/投影/切片</b>：那会制造第二个排序权威（与 {@code seq} 冲突），
-     * 是真正的高风险改动。顺序兜底一律归 {@code seq}。
+     * <p><b>⚠️ [D4 解法1-精简 · 2026-09-12 用户重新裁定，取代批次 1 的「档 0.5 只写不读」]</b>
+     * 本字段在 nexusai <b>有且只有一个读方</b>：{@code BoundaryReader.applyPreservedSegmentRelink}
+     * —— 读侧投影时按 {@code [headUuid..tailUuid]} 区间把 kept 行接回 {@code anchorUuid} 之后，
+     * 即 CC {@code applyPreservedSegmentRelinks}（sessionStorage.ts:1876-1992，调用点 :3808）的等价实现。
+     * <p>写侧因此<b>零改写</b>：kept 行在磁盘/DB 上原地不动（CC {@code recordTranscript} 按 uuid dedup
+     * 跳过，注释自述 "can't rewrite"）。
+     * <p><b>⛔ 红线：本字段只影响「切片后的拼接位置」，绝不作为第二套排序权威。</b>
+     * 投影全程只读 {@code seq}（列表序）与 {@code anchorUuid} 的位置，<b>不改写任何 seq</b>；
+     * 任何「据本字段重排 / 改写 seq 或另立排序键」的改动都被禁止 —— 排序输入恒为 {@code seq} 一个。
      *
      * @param boundary     待注解边界（compact_boundary）
      * @param anchorUuid   锚点消息 uuid（compact.ts:1077-1081）
@@ -261,20 +260,22 @@ public record CompactBoundaryMessage(
         if (oldMeta == null) {
             return boundary;
         }
-        // [D4 档 0.5 · 构造前非空校验] fail-loud 但不改行为：headUuid/tailUuid 取首末元素的 id()，
+        // [D4 · 构造前非空校验] fail-loud 但不改行为：headUuid/tailUuid 取首末元素的 id()，
         //   anchorUuid 由调用方传入 —— 任一为 null/空串时仍然照原样构造（不改变分支），只留 warn 痕迹。
-        //   WHY：本字段无读侧消费，坏值不会当场炸，只会在「将来有人接读侧」时静默产出错链；
-        //   故在此把「产出坏接线图」这件事变成可观测（CC applyPreservedSegmentRelinks 走不到即
-        //   logEvent('tengu_relink_walk_broken') 并放弃剪枝，同为「宁可多加载也不剪错」的失败观）。
+        //   WHY：本字段现由 BoundaryReader.applyPreservedSegmentRelink 读侧消费（见方法 JavaDoc）——
+        //   坏接线图会让读侧"放弃重挂"（kept 段落不进模型视图），故必须在这里留下产出侧痕迹，
+        //   与读侧的 ERROR 留痕形成两端可对上的证据链（CC 对应 logEvent('tengu_relink_walk_broken')，
+        //   同为「宁可少做也不做错」的失败观）。
         String headUuid = messagesToKeep.get(0).id();
         String tailUuid = messagesToKeep.get(messagesToKeep.size() - 1).id();
         if (isBlank(headUuid) || isBlank(anchorUuid) || isBlank(tailUuid)) {
-            log.warn("[CompactBoundaryMessage] preservedSegment 非空校验失败（只写字段，读侧无消费 → 不改变行为）: "
-                + "headUuid={} anchorUuid={} tailUuid={} keep={} —— 顺序兜底归 seq，读侧禁止据此重排",
+            log.warn("[CompactBoundaryMessage] preservedSegment 非空校验失败（读侧将据此接线图重挂 kept，坏值 → "
+                + "BoundaryReader 放弃重挂并留 ERROR）: "
+                + "headUuid={} anchorUuid={} tailUuid={} keep={} —— 排序权威仍只有 seq",
                 headUuid, anchorUuid, tailUuid, messagesToKeep.size());
         }
-        // 注：坏值<b>照原样构造</b>（fail-loud 但不 fail-fast）——本字段无读侧消费，抛异常只会让
-        //   compact 主流程无故失败；可观测性由上面的 warn 承担。
+        // 注：坏值<b>照原样构造</b>（fail-loud 但不 fail-fast）——抛异常只会让 compact 主流程无故失败；
+        //   可观测性由上面的 warn + 读侧的 ERROR 共同承担。
         CompactMetadata.PreservedSegment segment = new CompactMetadata.PreservedSegment(
             headUuid,
             anchorUuid,

@@ -38,7 +38,7 @@ import static org.mockito.Mockito.when;
  * </ul>
  *
  * <p>纯单测：{@code new MessageService()} + {@link ReflectionTestUtils} 注入 mock mapper
- * （与 MessageServiceTrimAfterTest 同模式）；不破坏 {@code listBySession} 原始读取（DB 权威不变）。
+ * （与 MessageServiceTrimAfterTest 同模式）；不破坏 {@code listRawForTranscript} 原始读取（DB 权威不变）。
  */
 @DisplayName("[fix-loop-resume-history] listForResumeExcluding 排除在途用户消息 + 中断语义")
 class MessageServiceResumeExcludingTest {
@@ -57,7 +57,7 @@ class MessageServiceResumeExcludingTest {
         ReflectionTestUtils.setField(service, "messageMapper", messageMapper);
         ReflectionTestUtils.setField(service, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(service, "toolCallMapper", toolCallMapper);
-        // session 存在（listBySession 校验共用）
+        // session 存在（listRawForTranscript 校验共用）
         when(sessionMapper.selectOneById(any())).thenReturn(new SessionRecord());
         // 每条消息 toDto 的 tool_calls 查询 → 空（简化；断链 tool 用例单独 stub）
         when(toolCallMapper.selectListByQuery(any())).thenReturn(List.of());
@@ -183,20 +183,20 @@ class MessageServiceResumeExcludingTest {
     }
 
     @Test
-    @DisplayName("不破坏 listBySession 原始读取（DB 权威通道不变）")
-    void listBySessionUnchanged() {
-        // WHY: 双通道铁律 —— listForResumeExcluding 是恢复消费点专用漏斗，listBySession 原始展示
-        //   不受影响。变异点：listForResumeExcluding 改写 DB / listBySession 行为 → 前端回放回归 → 红。
+    @DisplayName("不破坏 listRawForTranscript 原始读取（DB 权威通道不变）")
+    void listRawForTranscriptUnchanged() {
+        // WHY: 双通道铁律 —— listForResumeExcluding 是恢复消费点专用漏斗，listRawForTranscript 原始展示
+        //   不受影响。变异点：listForResumeExcluding 改写 DB / listRawForTranscript 行为 → 前端回放回归 → 红。
         givenMessages(List.of(
             msg("u1", "user", "第一问"),
             msg("a1", "assistant", "第一答"),
             msg("u2", "user", "当前消息")));
 
         service.listForResumeExcluding("sess-1", "u2");
-        List<ChatMessageDto> raw = service.listBySession("sess-1");
+        List<ChatMessageDto> raw = service.listRawForTranscript("sess-1");
 
         assertThat(raw).extracting(ChatMessageDto::id)
-            .as("listBySession 仍返回 DB 原始全部消息（含当前），created_at ASC")
+            .as("listRawForTranscript 仍返回 DB 原始全部消息（含当前），created_at ASC")
             .containsExactly("u1", "a1", "u2");
     }
 

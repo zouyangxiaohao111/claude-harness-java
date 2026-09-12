@@ -397,7 +397,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      *       {@link PermissionExplanationEvent#unavailable}（CC「Explanation unavailable」:161-166）。</li>
      * </ul>
      *
-     * <p>messages 来源 = {@link MessageService#listBySession}（explainer 内部
+     * <p>messages 来源 = {@link MessageService#listRawForTranscript}（explainer 内部
      * {@code extractConversationContext} 取最近 3 条 assistant）；messageService 未注入
      * → 空列表（CC messages? 可选语义）。推送失败仅日志不抛（对齐
      * {@link #onResponse} 容错 —— 不向前端回 error frame）。
@@ -485,7 +485,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             return List.of();
         }
         try {
-            return messageService.listBySession(sessionId);
+            return messageService.listRawForTranscript(sessionId);
         } catch (Exception e) {
             log.warn("PERMISSION explain: 会话消息拉取失败（降级空列表）sessionId={} err={}",
                 sessionId, e.toString());

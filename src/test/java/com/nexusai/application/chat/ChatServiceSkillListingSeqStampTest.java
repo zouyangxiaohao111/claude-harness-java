@@ -29,7 +29,7 @@ import static org.mockito.Mockito.when;
  * [seq 排序键 · skill-listing-cc-align] skill_listing 注入消息落库的 {@code seq} 位置键取号。
  *
  * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图）</b>：{@code messages.seq}（V70）是会话内<b>位置键</b>
- * —— 读侧 {@code MessageService.listBySession} / {@code listPageBySession} 一律 {@code ORDER BY seq ASC}，
+ * —— 读侧 {@code MessageService.listRawForTranscript} / {@code listPageBySession} 一律 {@code ORDER BY seq ASC}，
  * {@code created_at} 退回纯展示时间。CC 的 skill_listing 是 attachment，位于首条用户消息<b>之后</b>
  * （processTextPrompt.ts:97）；nexusai 靠 write-order 还原该位置 —— 用户行先落库（seq=S_user），
  * 清单行在 run 内 turn-0 drain 之后 append → 落库 {@code MessageService.appendMessage(dto, ts)}
@@ -101,7 +101,7 @@ class ChatServiceSkillListingSeqStampTest {
         // WHY: 落库分支必须走 messageService.appendMessage（内部 nextSeq 取号，且新写入已被 V71 触发器
         //   强制非 NULL）。若改成直写 messageMapper.insert 而不自行 setSeq → seq=NULL → 位置未知：
         //   本批读侧已把 NULL 兜到结果集末尾（MessageService.SEQ_ASC_NULLS_LAST_ORDER，不再排最前），
-        //   但位置仍是「未知」→ 重放（listBySession 按 seq）还原不出「紧随用户消息之后」，
+        //   但位置仍是「未知」→ 重放（listRawForTranscript 按 seq）还原不出「紧随用户消息之后」，
         //   与 CC 语义相反（本批核心语义被破坏），且会被读侧 ERROR 报警。
         AgentState state = new AgentState("sys");
         ChatMessageDto listing = AgentLoopContext.skillListingMessage(SESSION, "- commit: 提交代码");

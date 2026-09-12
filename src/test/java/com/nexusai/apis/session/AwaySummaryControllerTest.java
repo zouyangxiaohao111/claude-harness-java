@@ -155,7 +155,7 @@ class AwaySummaryControllerTest {
     }
 
     @Test
-    @DisplayName("成功：listBySession 3 条 → 200 + recap 文本 + chatWithOptions 契约（querySource/skipCacheWrite）")
+    @DisplayName("成功：listRawForTranscript 3 条 → 200 + recap 文本 + chatWithOptions 契约（querySource/skipCacheWrite）")
     void success_returnsRecapAndContract() throws Exception {
         // WHY: 前端 blur 5min 后 POST 拿 recap 文本回插 away_summary 系统消息（useAwaySummary.ts:80）。
         // 若 200 但 body 缺文本 → 前端无法回插；若契约未达 provider（querySource/skipCacheWrite）
@@ -178,7 +178,7 @@ class AwaySummaryControllerTest {
     }
 
     @Test
-    @DisplayName("空 transcript（listBySession 空）→ 204 空体不抛 500（CC awaySummary.ts:33-35）")
+    @DisplayName("空 transcript（listRawForTranscript 空）→ 204 空体不抛 500（CC awaySummary.ts:33-35）")
     void emptyTranscript_204() throws Exception {
         // WHY: CC messages.length===0 提前返回 null（awaySummary.ts:33-35）——无对话内容时 recap
         // 无意义；REST 用 204 表达 null，若抛 500 会污染前端 blur 回来自动请求的错误上报。
@@ -221,7 +221,7 @@ class AwaySummaryControllerTest {
     }
 
     @Test
-    @DisplayName("请求体 body 传 sessionId（无 MDC）→ 200 + listBySession 用请求 sessionId")
+    @DisplayName("请求体 body 传 sessionId（无 MDC）→ 200 + listRawForTranscript 用请求 sessionId")
     void requestBodySessionId_used() throws Exception {
         // WHY (ODF-B1R): CC useAwaySummary.ts 触发层在前端 REPL，会话上下文由前端持有；Web 前端
         // POST 必须能随请求携带 sessionId（后端 MDC 仅在请求处于会话链路内时可用）。若 body 传入被忽略
@@ -241,7 +241,7 @@ class AwaySummaryControllerTest {
     }
 
     @Test
-    @DisplayName("query 参数传 sessionId（无 MDC）→ 200 + listBySession 用请求 sessionId")
+    @DisplayName("query 参数传 sessionId（无 MDC）→ 200 + listRawForTranscript 用请求 sessionId")
     void queryParamSessionId_used() throws Exception {
         // WHY (ODF-B1R): 与 body 等价的前端传参通道（§8 契约 body/query 二选一）；纯 query 无
         // Content-Type/body 场景也必须命中请求 sessionId。
@@ -257,9 +257,9 @@ class AwaySummaryControllerTest {
     }
 
     @Test
-    @DisplayName("session 不存在（listBySession 抛 NotFoundException）→ 404")
+    @DisplayName("session 不存在（listRawForTranscript 抛 NotFoundException）→ 404")
     void sessionNotFound_404() throws Exception {
-        // WHY: MessageService.listBySession 校验 session 存在（MessageService.java:46-48），
+        // WHY: MessageService.listRawForTranscript 校验 session 存在（MessageService.java:46-48），
         // 不存在抛 NotFoundException → REST 404（REST 语义，区别于 CC 前端内存 messages 无此场景）。
         RequestContext.setSession("00000000-0000-0000-0000-00000000dead");
         when(messageService.listForResume(anyString()))
@@ -273,7 +273,7 @@ class AwaySummaryControllerTest {
     @Test
     @DisplayName("AS-05 body sessionId 单轨：memory 读同一请求会话（对齐 CC getSessionMemoryContent 无参读当前会话）")
     void requestBodySessionId_memoryReadSameSession() throws Exception {
-        // WHY: OPD-R2-AS-05 —— resolveSessionId（body→query→MDC）此前只驱动 listBySession，
+        // WHY: OPD-R2-AS-05 —— resolveSessionId（body→query→MDC）此前只驱动 listRawForTranscript，
         // 服务内 memory 读恒走 MDC supplier（无 MDC 时恒 null / MDC 有其它会话时读错会话，双轨）。
         // rev2 改 generate 显式 sessionId 参数：body sessionId 必须同时驱动 memory 读（单轨），
         // 对齐 CC 无参读当前会话经调用方注入。

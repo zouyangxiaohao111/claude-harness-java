@@ -22,7 +22,7 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：{@code messages.created_at} 承载会话消息的<b>时间语义</b>
  * （展示「X 分钟前」+ 分配器取号）；<b>位置语义</b>自 V70 起归 {@code seq}
- * （{@code listBySession}/{@code listPageBySession} ORDER BY seq；读侧
+ * （{@code listRawForTranscript}/{@code listPageBySession} ORDER BY seq；读侧
  * {@code BoundaryReader.getMessagesAfterCompactBoundary} 按该序切片剪枝）。若新写入的时间戳早于该会话
  * 已有行（旧实现：实时落库用 run 起始 baseTs、compact 追加用调用时 now()，两条时间基不同源），
  * 则时间序倒挂（V70 前因 created_at 兼任位置键 → boundary 切片把「边界之后本应保留的那轮」整段剪掉，

@@ -50,7 +50,8 @@ import com.nexusai.application.agent.session.SessionResumeDeserializer;
 
 /**
  * Message 业务逻辑：
- * - listBySession：按 sessionId 查全部
+ * - listRawForTranscript：按 sessionId 查<b>原始全量</b>（含 boundary 之前历史；落库/血缘/导出/resume 注入用）
+ * - listForModel：按 sessionId 查<b>模型视图</b>（全量 → BoundaryReader 投影；模型面唯一显式通道）
  * - getById：单查
  * - createUserMessage：持久化用户消息 + 自增 sessions.messageCount
  * - delete：单删
@@ -98,7 +99,7 @@ public class MessageService {
      *
      * <p><b>WHY（跨 writer 单调铁律）</b>：{@code messages.created_at} 是会话消息的<b>时间语义</b>键
      * （展示「X 分钟前」+ 本分配器取号）；<b>位置语义</b>自 V70 起归 {@code seq}
-     * （{@link #listBySession} / {@link #listPageBySession} ORDER BY seq；读侧
+     * （{@link #listRawForTranscript} / {@link #listPageBySession} ORDER BY seq；读侧
      * {@code BoundaryReader.getMessagesAfterCompactBoundary} 按该序切片）。
      * 本分配器仍须保证 created_at 严格递增——compact 重挂 kept 段时 created_at 保持原值（时间语义），
      * 但新写入行的时间戳不得倒挂。此前两条写路径各持时间基：
@@ -106,7 +107,7 @@ public class MessageService {
      * {@code baseTs.plusNanos(seq)}；compact 追加 {@link #appendPostCompactMessages} 用调用时
      * {@code OffsetDateTime.now()}。compact 发生在 run <b>中段</b> → 其 now() 恒晚于 baseTs →
      * 同 run 内 compact 之后继续 append 的 assistant/tool/后续 user 行时间戳<b>早于</b> boundary →
-     * 下轮 listBySession（V70 前按 created_at 排序）顺序倒挂 → boundary 切片把「边界之后本应保留的
+     * 下轮 listRawForTranscript（V70 前按 created_at 排序）顺序倒挂 → boundary 切片把「边界之后本应保留的
      * 那轮」整段剪掉（还拆散 tool_use/tool_result 配对）。本分配器以「per-session max(now, 该会话已知最大 ts + 1ns)」取号，
      * 保证<b>任何</b>新写入恒晚于该会话<b>所有</b>已有行（无论 writer 是谁、何时写）。
      *
@@ -191,7 +192,7 @@ public class MessageService {
      * {@code seq}（会话内位置键）取号自增兜底槽 · <b>仅防雪花时钟回拨/异常</b>。
      *
      * <p><b>WHY（根治「created_at 既是时间又是位置」）</b>：{@code created_at} 此前兼任展示时间
-     * （前端「X 分钟前」）与会话内排序位置（listBySession / listPageBySession ORDER BY created_at）。
+     * （前端「X 分钟前」）与会话内排序位置（listRawForTranscript / listPageBySession ORDER BY created_at）。
      * compact append-only 落库需把 kept 段「重挂」到 boundary 之后（位置变化），但 kept 的真实产生
      * 时间不该被改写（展示语义）→ 同列二义必冲突。{@code seq}（V70 列）承载位置语义：读侧 ORDER BY seq，
      * created_at 回归纯时间。kept 段重挂 = 只更新 seq、created_at 保持原值。
@@ -242,7 +243,7 @@ public class MessageService {
     private final Set<String> seqFloorClampedWarned = ConcurrentHashMap.newKeySet();
 
     /**
-     * 读侧排序片段（ASC 通道）：{@code seq} 升序 + NULL 排末尾。用于 {@link #listBySession}。
+     * 读侧排序片段（ASC 通道）：{@code seq} 升序 + NULL 排末尾。用于 {@link #listRawForTranscript}。
      *
      * <p><b>语义选择（有意取舍）</b>：NULL = 位置未知，<b>既不冒充最新也不冒充最旧</b> —— ASC 通道下
      * NULL 落在<b>结果集末尾</b>：裸 {@code seq} 时 NULL 恒排<b>最前</b>（先于第一条真实消息）= 冒充
@@ -286,7 +287,7 @@ public class MessageService {
      * LAST」一致，本片段只是把该语义<b>显式钉住</b>（防将来有人把两条通道的排序片段写反）；且与 ASC 通道
      * 对称、共用同一套 NULLS LAST 机制（索引可用，见 {@link #SEQ_ASC_NULLS_LAST_ORDER} 的 WHY）。
      *
-     * <p><b>与 {@link #listBySession} 的关系</b>：两条通道对 NULL 的处置一致 = <b>永不冒充最新</b>，
+     * <p><b>与 {@link #listRawForTranscript} 的关系</b>：两条通道对 NULL 的处置一致 = <b>永不冒充最新</b>，
      * 且都<b>永不废掉</b> {@code idx_messages_session_seq}（无 TEMP B-TREE）。
      */
     public static final String SEQ_DESC_NULLS_LAST_ORDER = "seq DESC NULLS LAST";
@@ -555,7 +556,39 @@ public class MessageService {
         return block;
     }
 
-    public List<ChatMessageDto> listBySession(String sessionId) {
+    /**
+     * <b>[D10 ④ 读侧收口 · 全量通道] 读会话<b>原始全量</b>消息（DB 权威行，未做任何投影）。</b>
+     *
+     * <p><b>选边（这是必须显式做的一次判断）</b>：本方法返回的是 CC {@code query()} 的
+     * {@code messages} 形参等价物 —— <b>含 boundary 之前的全部历史</b>、含被 snip 删除的消息。
+     * 需要「模型面」数组的调用方<b>不要</b>用本方法，用 {@link #listForModel(String)}；
+     * 需要「内存全量」的（落库 / 血缘 / 持久化 / resume 注入 / 计数诊断 / 前端全量查看 / 导出）
+     * 才用本方法。
+     *
+     * <p><b>谁在用（✅ = 有意取全量，行为不变；逐条判定见批次 4b 报告）</b>：
+     * <ul>
+     *   <li>{@code ChatController.list} = {@code GET /messages} 前端全量（对齐 CC {@code export.tsx:59}）；</li>
+     *   <li>{@code CommandRegistrationConfig28} {@code /export} + {@code ExportController}（导出/归档，全量直读）；</li>
+     *   <li>{@code LlmAgentLoop} resume 注入（灌 {@code state.rawMessages()} —— 模型面由
+     *       {@code AgentState.modelView()} 单点派生）+ SessionStart source 判定（只数条数）；</li>
+     *   <li>{@code ToolRegistrationConfig.rebuildIdleStateFromDb}（空闲 {@code /compact} 重建 state，
+     *       投影由下游 {@code CompactCommand} 自行做）；</li>
+     *   <li>{@code PartialCompactService}（经 {@code listForResume} → 自己调 BoundaryReader 投影）；</li>
+     *   <li>{@code WebSocketPermissionPrompter}（权限解释器载荷，对齐 CC
+     *       {@code BashPermissionRequest.tsx:131}——有意绕过）；</li>
+     *   <li>{@code trimSessionAfter}（按 id 定 pivot，DB 权威定位）；</li>
+     *   <li>{@code listForResume} / {@code listForResumeExcluding}（恢复漏斗的上游原材料）。</li>
+     * </ul>
+     *
+     * <p><b>命名史</b>：本方法原名 {@code listBySession} —— 该名字对「全量 vs 模型面」<b>零信息量</b>，
+     * 是 D10 审计里「绕过 BoundaryReader 直接喂模型在命名上根本看不出」的成因之一。故 D10 ④ 收口把它
+     * 显式改名为 {@code listRawForTranscript}，与之配对的模型面通道是 {@link #listForModel(String)}。
+     *
+     * @param sessionId 会话 ID（DB 键 "sess-xxx"）
+     * @return 原始全量消息（seq ASC 位置序；boundary 之前的旧历史 + 被 snip 删除的行都在）
+     * @throws NotFoundException session 不存在
+     */
+    public List<ChatMessageDto> listRawForTranscript(String sessionId) {
         // 校验 session 存在
         if (sessionMapper.selectOneById(sessionId) == null) {
             throw new NotFoundException("Session " + sessionId + " not found");
@@ -566,7 +599,7 @@ public class MessageService {
         List<MessageRecord> all = messageMapper.selectListByQuery(
             QueryWrapper.create().eq("session_id", sessionId)
                 .orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER));
-        warnNullSeqIfAny(sessionId, "listBySession", all);
+        warnNullSeqIfAny(sessionId, "listRawForTranscript", all);
         List<ChatMessageDto> result = new ArrayList<>(all.size());
         for (MessageRecord m : all) {
             result.add(toDto(m));
@@ -576,6 +609,41 @@ public class MessageService {
         //   DB 只存 input/output，cache 未存 → 重算值为近似）。不落库，每次重拉重算。
         applyContextSnapshotToLastAssistant(result, sessionId);
         return result;
+    }
+
+    /**
+     * <b>[D10 ④ 读侧收口 · 模型面通道] 读会话<b>模型视图</b>（DB 全量 → 经 BoundaryReader 投影）。</b>
+     *
+     * <p><b>语义</b> = CC {@code query.ts:523}
+     * {@code let messagesForQuery = getMessagesAfterCompactBoundary(messages)}：从最后一个
+     * compact boundary（含）向后切片、应用 snip 投影、并按 boundary 上的 {@code preservedSegment}
+     * 把 kept 段重挂回 anchor 之后（{@link com.nexusai.application.agent.compact.BoundaryReader}）。
+     * 即 <b>= {@code AgentState.modelView()} 的 DB 侧等价物</b>。
+     *
+     * <p><b>⚠️ 当前生产调用点 = 0（如实登记，不是遗漏）</b>：D10 双视图落地后，模型面视图的唯一生成点
+     * 是 {@code AgentState.modelView()} —— 从 DB 来的消息一律先经 {@code state.rawMessages()} 全量保活，
+     * 再在循环入口派生一次。因此「DB → 直接喂模型」这条绕过路径在生产里<b>已不存在</b>，本方法的价值是
+     * <b>命名兜底</b>：今后若要新增一处从 DB 取消息喂模型的调用点，只有 {@link #listForModel(String)}
+     * 这个名字是「模型面」，用 {@link #listRawForTranscript(String)} 会一眼看出选错边
+     * （这正是 D10 ④「让绕过 BoundaryReader 在命名上不可能看不出」的落点）。
+     *
+     * <p><b>不做</b>中断语义漏斗（那是 {@code listForResume} 的职责）—— 本方法只做「边界 + snip + kept 重挂」
+     * 这一层投影，职责单一。
+     *
+     * @param sessionId 会话 ID（DB 键 "sess-xxx"）
+     * @return 模型视图（不含 pre-boundary 历史、不含被 snip 删除的消息；kept 段已重挂到 anchor 之后）
+     * @throws NotFoundException session 不存在
+     */
+    public List<ChatMessageDto> listForModel(String sessionId) {
+        List<ChatMessageDto> raw = listRawForTranscript(sessionId);
+        List<ChatMessageDto> modelView = new ArrayList<>(
+            com.nexusai.application.agent.compact.BoundaryReader.getMessagesAfterCompactBoundary(raw));
+        if (log.isDebugEnabled()) {
+            log.debug("[MessageService] listForModel: session={} 全量 {} 条 → 模型视图 {} 条"
+                    + "（compact boundary 切片 + snip 投影 + preservedSegment 重挂，CC query.ts:523 等价）",
+                sessionId, raw.size(), modelView.size());
+        }
+        return modelView;
     }
 
     /** [window-paging] 每页默认条数 · 对齐 deepseek-harness session.ts PAGE_MESSAGES=50。 */
@@ -594,8 +662,9 @@ public class MessageService {
      * {@link #SEQ_DESC_NULLS_LAST_ORDER} 排到 DESC 结果<b>末尾</b>（= 最旧那头，绝不冒充「最新」被算进
      * 尾页），并对该结果集 {@link #warnNullSeqIfAny ERROR 一条}。新 NULL 由 V71 触发器堵在写入口。
      *
-     * <p><b>与 {@link #listBySession} 的关系</b>：本方法是前端主通道（有界窗口，session 首载 / F5 / 向上翻页）；
-     * {@code listBySession} 全量保留给后端内部（LLM resume / partialCompact / trim 定位）+ 前端 Trace 全程
+     * <p><b>与 {@link #listRawForTranscript} / {@link #listForModel} 的关系</b>（D10 ④ 三条读侧通道的选边）：
+     * 本方法 = 前端查看主通道（有界窗口，session 首载 / F5 / 向上翻页）—— <b>全量视图，与 DB 逐行一致</b>；
+     * {@link #listRawForTranscript} = 后端内部全量（LLM resume / partialCompact / trim 定位）+ 前端 Trace 全程
      * （用户拍板：全量仅限 resume/trace/权威回填，前端查看一律 page）。上下文快照补算仅<b>尾页</b>有意义
      * （{@link #applyContextSnapshotToLastAssistant} 补末条 assistant）。
      *
@@ -910,20 +979,20 @@ public class MessageService {
      * 会话恢复专用读取 · 对齐 CC conversationRecovery.ts:167-255
      * {@code deserializeMessagesWithInterruptDetection}（S1 会话恢复补中断语义）。
      *
-     * <p><b>WHY</b>：{@link #listBySession} 返回 DB 原始行（seq ASC 位置序），无中断检测 /
+     * <p><b>WHY</b>：{@link #listRawForTranscript} 返回 DB 原始行（seq ASC 位置序），无中断检测 /
      * tool_use 配对过滤 / "Continue" sentinel 注入 —— 中断 turn 恢复后"有问无答"。恢复/续聊
      * 加载历史的通道（ChatController background、PartialCompactService、AwaySummaryController）
      * 消费本方法，对 DB 消息流应用 CC 同款反序列化（未配对 tool_use 剥离 / 孤立 thinking 剥离 /
      * 纯空白 assistant 剥离 / detectTurnInterruption / "Continue" sentinel 注入）。
      *
-     * <p><b>不破坏 {@link #listBySession}</b>：前端 GET /messages 原始展示仍走 listBySession
+     * <p><b>不破坏 {@link #listRawForTranscript}</b>：前端 GET /messages 原始展示仍走 listRawForTranscript
      * （本方法为恢复消费点专用漏斗，DB 权威写入不变）。
      *
      * @param sessionId 会话 ID
      * @return 反序列化（中断语义注入）后的消息列表
      */
     public List<ChatMessageDto> listForResume(String sessionId) {
-        List<ChatMessageDto> raw = listBySession(sessionId);
+        List<ChatMessageDto> raw = listRawForTranscript(sessionId);
         return SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages();
     }
 
@@ -939,22 +1008,22 @@ public class MessageService {
      * <p>excludeMessageId == null/blank → 不排除（非流式测试路径回落，对齐
      * LlmAgentLoop :2428-2430 streamUserMessageId==null 回落「转录非空」）。
      *
-     * <p><b>不破坏 {@link #listBySession}</b>：DB 权威读取不变（前端 GET /messages 仍走
-     * listBySession 原始展示）；本方法为 loop 主路径恢复消费点专用漏斗。
+     * <p><b>不破坏 {@link #listRawForTranscript}</b>：DB 权威读取不变（前端 GET /messages 仍走
+     * listRawForTranscript 原始展示）；本方法为 loop 主路径恢复消费点专用漏斗。
      *
      * @param sessionId       会话 ID（DB 键 "sess-xxx"）
      * @param excludeMessageId 需排除的消息 id（当前 in-flight 用户消息；null=不排除）
      * @return 反序列化（中断语义注入）后的历史消息列表
      */
     public List<ChatMessageDto> listForResumeExcluding(String sessionId, String excludeMessageId) {
-        return listForResumeExcluding(listBySession(sessionId), excludeMessageId);
+        return listForResumeExcluding(listRawForTranscript(sessionId), excludeMessageId);
     }
 
     /**
      * 会话恢复专用读取（排除在途用户消息）· 已取原始转录的内存派生重载。
      *
      * <p><b>WHY（低效非错误修复）</b>：LlmAgentLoop.doRun 注入块与续跑 skill 恢复块每 run 各自
-     * {@link #listBySession} 全量读取同一会话消息 = 冗余 DB I/O。注入块改为复用主流程预取一次的
+     * {@link #listRawForTranscript} 全量读取同一会话消息 = 冗余 DB I/O。注入块改为复用主流程预取一次的
      * 原始转录（LlmAgentLoop.doRun:1917 前一次性读取缓存），经本重载在内存派生排除 + 中断语义
      * 漏斗产物，skill 恢复块直接消费缓存，消除重复查询。
      *
@@ -1158,7 +1227,7 @@ public class MessageService {
         //   「V70 后新行的 NULL」与「V70 前老行的 NULL」不可区分（迁移/校正失去判据）。
         m.setIsCompactSummary(false);
         m.setIsVisibleInTranscriptOnly(false);
-        // [seq 排序键] 位置键取号（雪花全局单调；读侧 listBySession/listPageBySession ORDER BY seq）
+        // [seq 排序键] 位置键取号（雪花全局单调；读侧 listRawForTranscript/listPageBySession ORDER BY seq）
         m.setSeq(nextSeq(sessionId));
         messageMapper.insert(m);
         session.setMessageCount((session.getMessageCount() == null ? 0 : session.getMessageCount()) + 1);
@@ -1316,7 +1385,7 @@ public class MessageService {
      *
      * <p><b>WHY（gap28 前端缺口 §28）</b>: 前端「裁剪到某点」需删除 pivot 之后全部消息且
      * 被删消息<b>不进模型上下文</b>——模型上下文来自 DB transcript（LlmAgentLoop.run 经
-     * listBySession 加载），故本方法 DB 删 + 重插保留段即等价 CC 前端 setMessages 裁剪。
+     * listRawForTranscript 加载），故本方法 DB 删 + 重插保留段即等价 CC 前端 setMessages 裁剪。
      * conversationId 旋转由调用方（ChatController 裁剪端点）负责，对齐 CC REPL.tsx:3673
      * {@code setConversationId(randomUUID())}。
      *
@@ -1335,8 +1404,8 @@ public class MessageService {
             throw new NotFoundException("Session " + sessionId + " not found");
         }
         // pivot 定位必须在「当前会话消息列表」内匹配（created_at ASC 序），而非 getById——
-        // 避免跨会话消息 id 误匹配（对齐 listBySession :59-71 同源读取）。
-        List<ChatMessageDto> all = listBySession(sessionId);
+        // 避免跨会话消息 id 误匹配（对齐 listRawForTranscript :59-71 同源读取）。
+        List<ChatMessageDto> all = listRawForTranscript(sessionId);
         int pivotIndex = -1;
         for (int i = 0; i < all.size(); i++) {
             if (all.get(i).id() != null && all.get(i).id().equals(pivotMessageId)) {
@@ -1474,7 +1543,7 @@ public class MessageService {
         //   V51 is_meta 列；出站透传 dto.isMeta()（:454），落库同源保证 round-trip 闭环
         rec.setIsMeta(dto.isMeta());
         // [seq 排序键] 位置键：显式 seq 优先（compact 块整块预算的号，见 nextSeqBlock）；否则单号取号
-        //   （雪花全局单调；读侧 listBySession/listPageBySession ORDER BY seq）
+        //   （雪花全局单调；读侧 listRawForTranscript/listPageBySession ORDER BY seq）
         rec.setSeq(seq != null ? seq : nextSeq(dto.sessionId()));
         // [V70] compact 摘要可观察性标志落库（CC original: isCompactSummary/isVisibleInTranscriptOnly，
         //   messages.ts:464-465/479-480）—— TraceView.compactSummaryAfter 读侧依赖 isCompactSummary===true。
@@ -1507,7 +1576,7 @@ public class MessageService {
      * 判 boundary）与前端 setMessages 刷新。CC 无 DB 概念，本方法为 Java 持久化载体：
      * <ol>
      *   <li>删该 session 全部消息（FK CASCADE 连带清 tool_calls，显式删更稳）</li>
-     *   <li>按数组序重插（保序：created_at / seq 双键单调递增，listBySession 按 seq ASC）</li>
+     *   <li>按数组序重插（保序：created_at / seq 双键单调递增，listRawForTranscript 按 seq ASC）</li>
      *   <li>归一化 sessionId=sessionId（boundary.toChatMessageDto() 的 sessionId=null，
      *       CompactBoundaryMessage.java:286-312）</li>
      *   <li>id 去重（批内重复 id → PK 冲突，重插时去重。boundary id 已改随机 UUID，partial from
@@ -1658,12 +1727,15 @@ public class MessageService {
      *
      * <p>旧路径 {@link #replaceSessionMessages}（删全表 + 按新时间基重插）偏离 CC 且引入 HIGH bug：
      * 同一 run 内 compact <b>之后</b>追加的消息其 created_at 早于重插的 boundary 行 →
-     * 下轮 {@link #listBySession}（created_at ASC）顺序倒挂 → boundary 切片把这些消息整段丢掉。
-     * 本方法的 append-only 语义：
+     * 下轮 {@link #listRawForTranscript}（created_at ASC）顺序倒挂 → boundary 切片把这些消息整段丢掉。
+     * 本方法的 append-only 语义（<b>[D4 解法1-精简 · 2026-09-12 用户裁定 · 写侧零改写]</b>）：
      * <ol>
-     *   <li><b>dto.id 已存在于 DB</b>（= messagesToKeep 段）→ 仅 <b>UPDATE 该行 seq</b> 到 boundary
-     *       之后（等价 CC 的链式重挂），<b>created_at 保持原值</b>（真实产生时间 = 展示语义，不被位置
-     *       重挂污染），其它字段一律不动；</li>
+     *   <li><b>dto.id 已存在于 DB</b>（= messagesToKeep 段）→ <b>一个字都不写</b>（不 UPDATE seq、
+     *       不动 created_at、不动内容）—— 对齐 CC {@code recordTranscript} 按 uuid <b>dedup 跳过</b>
+     *       （sessionStorage.ts:1457-1468：CC 注释自述 kept 行的 parentUuid 保持 pre-compact 原值、
+     *       "can't rewrite"）。kept 行留在 boundary <b>之前</b>的原始位置；它回到模型视图靠
+     *       <b>读侧</b>按 boundary 上的 {@code preservedSegment} 重挂
+     *       （{@code BoundaryReader.applyPreservedSegmentRelink}）；</li>
      *   <li><b>新 dto.id</b>（boundary / summary / attachments / hookResults）→ <b>INSERT 新行</b>，
      *       复用 {@link #appendMessage(ChatMessageDto, OffsetDateTime, Long)} 的完整 DTO→Record 映射
      *       （id 沿用 dto.id、sessionId 落定、created_at = {@link #nextCreatedAt}、seq = 本块预算值）；</li>
@@ -1676,16 +1748,22 @@ public class MessageService {
      * 两把锁不同源）拿到的号只可能在本块<b>之前</b>或<b>之后</b>，不可能插进 boundary 与 summary 之间。
      * 这是「DB(seq) 恢复序 == 内存视图序」的前提：否则并发行若为 tool_result 而对应 tool_use 在 kept 段，
      * 下轮 boundary 切片会让 tool_result 先于 tool_use 出现（provider 配对校验失败）。详见 nextSeqBlock。
+     * kept 段不取号（上条 2a）—— 号段只覆盖真正写入的新行，故块内无空洞。
+     *
+     * <p><b>⚠️ 连带行为变化（N4 已裁定可接受）</b>：写侧不再搬 kept 的 seq ⇒ kept 行留在 boundary
+     * <b>之前</b>，前端全量视图 / 导出（{@code ORDER BY seq} 直读 DB）看到的形态变成 CC 那样
+     * （kept 在原位、boundary 在其后）。模型面视图不受影响（由读侧重挂还原为
+     * boundary → summary → kept）。
      *
      * <p><b>与 replaceSessionMessages 的区别</b>：后者删全表 + 重插（把压缩前历史从 DB 物理抹除 +
-     * 换时间基）；本方法只追加 + 重挂 kept 段，DB 行数<b>只增不减</b>（压缩轨迹可回溯，且不破坏同 run
-     * 后续消息的时间序）。
+     * 换时间基）；本方法只追加，DB 行数<b>只增不减</b>、已有行<b>零改写</b>（压缩轨迹可回溯，
+     * 且不破坏同 run 后续消息的时间序）。
      *
-     * <p><b>id 重复（防御分支）</b>：批内重复出现的 id → 都命中「已存在」分支，映射到同一 DB 行（后一次
-     * UPDATE 覆盖前一次的重挂位置），不会 PK 冲突；批内新增 id 亦登记进 knownIds 供后续判重。
+     * <p><b>id 重复（防御分支）</b>：批内重复出现的 id → 后一次命中「已存在」分支被 <b>dedup 跳过</b>
+     * （不再 UPDATE），不会 PK 冲突；批内新增 id 亦登记进 knownIds 供后续判重。
      * <b>该分支为防御性</b>：boundary id 已改为每个实例取雪花（{@code CompactBoundaryMessage.newBoundaryId()}，
      * 每实例唯一），生产 partial-from 不再产生「两条同 id boundary」—— 保留它只为「调用方误传同 id /
-     * 上游 id 复用」时退化到 UPDATE 而不是 PK 冲突崩库。
+     * 上游 id 复用」时退化到跳过而不是 PK 冲突崩库。
      *
      * <p><b>原子性</b>：整体 @Transactional —— 任一写失败回滚全部，避免半写（调用方 fail-loud 记 error）。
      *
@@ -1714,43 +1792,39 @@ public class MessageService {
         }
         List<ChatMessageDto> sources = postCompactMessages == null ? List.of() : postCompactMessages;
         // 2. [seq 块·不可打断] 整块 seq <b>一次原子占位</b>（见 nextSeqBlock JavaDoc）——先算「实际取号条数」
-        //    （null 占位元素不取号，避免块内出现空洞），再一次性拿到连续号段，循环里按数组序发号。
+        //    （null 占位元素不取号；<b>已存在 id（kept 段）也不取号</b> —— 写侧零改写后 kept 保持原 seq，
+        //    见下方 2a），再一次性拿到连续号段，循环里按数组序发号。
         //    WHY 不能沿用「循环内逐个 nextSeq」：实时落库（ChatService.persistAppendedMessage，持
         //    ctx.lock）与本方法（@Transactional）两把锁不同源 → 并发 append 的号可能插进 boundary 与
         //    summary 之间 → 下轮 DB(seq) 恢复序与内存视图不一致 → 若并发行是 tool_result 而其 tool_use
         //    在 kept 段，切片后 tool_result 出现在 tool_use 之前（provider 配对校验失败）。
         int seqCount = 0;
         for (ChatMessageDto d : sources) {
-            if (d != null) {
+            if (d != null && !(d.id() != null && knownIds.contains(d.id()))) {
                 seqCount++;
             }
         }
         long[] seqBlock = nextSeqBlock(sessionId, seqCount);
         int seqIdx = 0;
         List<ChatMessageDto> normalized = new ArrayList<>(sources.size());
-        int rehung = 0;
+        int dedupSkipped = 0;
         int inserted = 0;
         for (ChatMessageDto dto : sources) {
             if (dto == null) {
                 continue;
             }
-            // 本元素的位置键 = 块内按数组序发下去的号（块首 → 块末单调，且整块不可被并发取号插入）
-            long seq = seqBlock[seqIdx++];
             // sessionId 落定（compact 产出的 boundary/summary DTO sessionId=null，落 DB 必须非空）
             ChatMessageDto src = withSession(dto, sessionId);
             String id = src.id();
             if (id != null && knownIds.contains(id)) {
-                // 2a. 已存在的行（messagesToKeep）→ 只把 <b>seq 重挂</b>到 boundary 之后（对齐 CC 链式重挂，
-                //     使「最后一个 boundary 之后」的位置切片 = post-compact 视图）；created_at 保持原值
-                //     （kept 的真实产生时间 = 展示语义，不被位置重挂污染），其余字段一律不动。
-                //     MyBatis-Flex update(entity) 默认 ignoreNulls=true → SET 仅含非 null 的 seq，WHERE id = ?（主键）。
-                MessageRecord patch = new MessageRecord();
-                patch.setId(id);
-                // [seq 块] 重挂值取自本块预算的号（块内按数组序递增，恒 > 该会话所有已有行 + 恒 > 块内
-                //   前序元素）→ 位置切片稳定；created_at 不写（保持原值）。
-                patch.setSeq(seq);
-                messageMapper.update(patch);
-                rehung++;
+                // 2a. 已存在的行（messagesToKeep）→ <b>零改写</b>：对齐 CC recordTranscript 按 uuid
+                //     <b>dedup 跳过</b>（sessionStorage.ts:1457-1468，CC 注释自述 kept 行保留原始 pre-compact
+                //     parentUuid 且 "can't rewrite"）。本仓等价：kept 行原地不动（seq/created_at/内容全不改），
+                //     不出现在写入流里；它回到模型视图靠<b>读侧</b>按 preservedSegment 重挂
+                //     （BoundaryReader.applyPreservedSegmentRelink），故不再消耗 seq 块号（否则凭空制造位置空洞）。
+                //     [D4 解法1-精简 · 2026-09-12 用户裁定] 原「只 UPDATE seq 把 kept 搬到 boundary 之后」
+                //     的写侧重挂分支已删除 —— 搬迁与「真 append-only」相悖，且把位置的历史抹掉。
+                dedupSkipped++;
                 normalized.add(src);
             } else {
                 // 2b. 新行（boundary / summary / attachments / hookResults）→ INSERT（复用 appendMessage 的
@@ -1761,6 +1835,7 @@ public class MessageService {
                 //   本块的两个 created_at 之间只影响展示时间感、<b>不影响</b>切片/恢复顺序；且 nextCreatedAt
                 //   是同一 per-session 分配器（单点），跨 writer 不会倒挂。为此再引入第二个块分配器属于
                 //   过度设计（两个分配器反而更易错位），故保持逐条取号。
+                long seq = seqBlock[seqIdx++];
                 OffsetDateTime ts = nextCreatedAt(sessionId);
                 ChatMessageDto insertedDto = appendMessage(src, ts, seq);
                 String newId = insertedDto != null ? insertedDto.id() : id;
@@ -1791,8 +1866,9 @@ public class MessageService {
         }
         if (log.isInfoEnabled()) {
             log.info("[MessageService] appendPostCompactMessages: session={} append-only 落库 {} 条"
-                    + "（重挂 kept {} 条 + 新插 {} 条；无删除，对齐 CC recordTranscript append-only）",
-                sessionId, normalized.size(), rehung, inserted);
+                    + "（dedup 跳过 kept {} 条 · 写侧零改写 + 新插 {} 条；无删除、无 UPDATE，"
+                    + "对齐 CC recordTranscript 按 uuid dedup 跳过）",
+                sessionId, normalized.size(), dedupSkipped, inserted);
         }
         return normalized;
     }

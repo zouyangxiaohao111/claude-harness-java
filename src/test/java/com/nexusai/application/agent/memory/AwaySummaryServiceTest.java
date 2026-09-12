@@ -496,7 +496,7 @@ class AwaySummaryServiceTest {
     @DisplayName("AS-05 显式 sessionId 单轨：memory 按参数 sessionId 读取（对齐 CC 无参读当前会话经调用方注入）")
     void explicitSessionId_singleTrack_memoryRead() throws Exception {
         // WHY: OPD-R2-AS-05 —— REST 载体 resolveSessionId（body→query→MDC）必须同时驱动
-        // listBySession 与 memory 读（消除 MDC supplier 双轨）；generate 显式 sessionId
+        // listRawForTranscript 与 memory 读（消除 MDC supplier 双轨）；generate 显式 sessionId
         // 参数 = 调用方注入「当前会话」的 Java 表达（CC getSessionMemoryContent() 无参）。
         String otherSession = "sess-other";
         Path memoryFile = tempDir.resolve(otherSession).resolve("session-memory").resolve("summary.md");

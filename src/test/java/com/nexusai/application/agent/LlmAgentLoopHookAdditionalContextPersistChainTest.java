@@ -111,9 +111,9 @@ class LlmAgentLoopHookAdditionalContextPersistChainTest {
         SessionStartSeenRegistry.reset();
     }
 
-    // ── 内存 MessageService（非 mock）：ChatService.appendMessage 落库 → listBySession 读回 → resume ──
+    // ── 内存 MessageService（非 mock）：ChatService.appendMessage 落库 → listRawForTranscript 读回 → resume ──
 
-    /** 真实 {@link MessageService} 子类，仅把 appendMessage 落库到内存 rows（listBySession 读回）。
+    /** 真实 {@link MessageService} 子类，仅把 appendMessage 落库到内存 rows（listRawForTranscript 读回）。
      *  非 final：用例 5 以匿名子类覆写 appendMessage / deleteBySessionAndSubtype 模拟失败路径。 */
     private static class InMemoryMessageService extends MessageService {
         final List<ChatMessageDto> rows = new ArrayList<>();
@@ -125,7 +125,7 @@ class LlmAgentLoopHookAdditionalContextPersistChainTest {
         }
 
         @Override
-        public List<ChatMessageDto> listBySession(String sessionId) {
+        public List<ChatMessageDto> listRawForTranscript(String sessionId) {
             // 插入序 = created_at ASC（本测试 seed + append 均按时间序追加）
             return new ArrayList<>(rows);
         }
