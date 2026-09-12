@@ -93,24 +93,25 @@ public final class ToolSearchService {
             new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
-     * [openai-lazy 三态互斥] openai_compatible（deepseek）模型工具策略 · 用户拍板 2026-09-01：
+     * [openai-lazy 两态互斥] openai_compatible（deepseek）模型工具策略 · 用户拍板 2026-09-01：
      * <ul>
      *   <li>{@link #SEARCH}（默认）——懒加载：defer 工具不进 API tools，模型经 ToolSearch 搜索拿
      *       完整 schema 当场调用（不激活）</li>
      *   <li>{@link #ACTIVATE}——懒加载 + 激活：ToolSearch 确认的工具写入 {@link #ACTIVATED_TOOLS}，
      *       下一轮进 API tools 直接可调（搜索 + 激活提示）</li>
-     *   <li>{@link #FULL}——全发：所有工具（含 defer）全量进 schema，模型直接调用，排除 ToolSearch
-     *       （无搜索环节，对齐上轮「完整 schema 模式」语义）</li>
      * </ul>
+     * <p>原第三态 {@code FULL}（全发：所有工具含 defer 直接进 schema、排除 ToolSearch）已于
+     * R11（2026-09-12）删除 —— 其语义即 {@code useToolSearch=false} 分支的恒等行为
+     * （{@link #filterToolsForSchema}），无独立消费者。</p>
      */
     public enum ToolSearchOpenAiMode {
-        SEARCH, ACTIVATE, FULL
+        SEARCH, ACTIVATE
     }
 
     /**
-     * yml {@code nexusai.toolsearch.mode} 三态互斥（search | activate | full，默认 search）·
-     * 替代废弃的 {@code activate-on-search} 布尔（mode=activate 即旧开关开；mode=search 即关；
-     * mode=full 新增全发）。非法值 → 回落 SEARCH。
+     * yml {@code nexusai.toolsearch.mode} 两态互斥（search | activate，默认 search）·
+     * 替代废弃的 {@code activate-on-search} 布尔（mode=activate 即旧开关开；mode=search 即关）。
+     * 非法值（含已删除的 full）→ 回落 SEARCH。
      */
     @org.springframework.beans.factory.annotation.Value("${nexusai.toolsearch.mode:search}")
     private volatile String mode;
@@ -124,8 +125,6 @@ public final class ToolSearchService {
             switch (m.toLowerCase(java.util.Locale.ROOT).trim()) {
                 case "activate":
                     return ToolSearchOpenAiMode.ACTIVATE;
-                case "full":
-                    return ToolSearchOpenAiMode.FULL;
                 default:
                     return ToolSearchOpenAiMode.SEARCH;
             }
@@ -136,27 +135,6 @@ public final class ToolSearchService {
     /** 解析当前 openai 工具模式 · override 优先（测试），否则 @Value mode。 */
     ToolSearchOpenAiMode modeEnum() {
         return parseMode(modeOverride != null ? modeOverride : this.mode);
-    }
-
-    /**
-     * [openai-lazy] 是否全发模式（mode=full · 所有工具含 defer 直接进 schema，排除 ToolSearch）。
-     * 测试 seam：modeOverride 非 null → 直接解析（不依赖 INSTANCE，非 Spring 测试可用）。
-     */
-    public static boolean isFullSchemaMode() {
-        if (modeOverride != null) {
-            return parseMode(modeOverride) == ToolSearchOpenAiMode.FULL;
-        }
-        ToolSearchService inst = INSTANCE;
-        return inst != null && inst.modeEnum() == ToolSearchOpenAiMode.FULL;
-    }
-
-    /** [openai-lazy] 是否激活模式（mode=activate · ToolSearch 确认后激活进 API tools）。 */
-    public static boolean isActivateMode() {
-        if (modeOverride != null) {
-            return parseMode(modeOverride) == ToolSearchOpenAiMode.ACTIVATE;
-        }
-        ToolSearchService inst = INSTANCE;
-        return inst != null && inst.modeEnum() == ToolSearchOpenAiMode.ACTIVATE;
     }
 
     /**
@@ -709,9 +687,10 @@ public final class ToolSearchService {
         }
         // [R8 · 回归 CC claude.ts:1170-1172] useToolSearch=false → 恒「排除 ToolSearchTool + 全量」
         //   （含 deferred/MCP；模型无 tool_reference → 工具必须完整内联，否则被剔工具对模型不存在即死锁）。
-        //   删除了 [openai-lazy]「ToolSearch 保留 + deferred 过滤」子路径与 isFullSchemaMode() 特判 ——
-        //   full 模式语义（排除 ToolSearch + 全发）即本恒等分支，无需分派；deferred/discovered/激活集
-        //   在此均不参与（恒等式）。
+        //   删除了 [openai-lazy]「ToolSearch 保留 + deferred 过滤」子路径与 isFullSchemaMode() 特判
+        //   （该 accessor 及 FULL 模式已于 R11 2026-09-12 一并删除）—— full 模式语义
+        //   （排除 ToolSearch + 全发）即本恒等分支，无需分派；deferred/discovered/激活集在此均不参与
+        //   （恒等式）。
         return tools.stream()
             .filter(t -> t != null && !matchesToolSearchName(t))
             .toList();

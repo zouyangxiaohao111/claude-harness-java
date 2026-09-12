@@ -142,7 +142,7 @@ spring:
 # =====================================================================
 nexusai:
   # ---------------------------------------------------------------
-  # [toolsearch mode] openai_compatible（deepseek）工具策略 · 三态互斥（ToolSearchService 消费）
+  # [toolsearch mode] openai_compatible（deepseek）工具策略 · 两态互斥（ToolSearchService 消费）
   # 背景：openai_compatible 模型（deepseek）无 Anthropic tool_reference/defer_loading 语义；
   #   Java 扩展经 ToolSearch 返回完整 schema 文本（<functions>）让模型拿到参数即可调用。
   #   search（默认，用户拍板 2026-09-01）→ 懒加载：defer 工具不进 API tools，模型经 ToolSearch
@@ -150,9 +150,9 @@ nexusai:
   #   activate → 懒加载 + 激活：ToolSearch 确认的工具写入激活集，下轮进 API tools 直接可调
   #     （搜索 + 激活提示；等效旧 activate-on-search=true；代价 = 激活时 tools 参数变化 → 前缀
   #     缓存低频 break）。
-  #   full → 全发：所有工具（含 defer）全量进 schema，模型直接调用，排除 ToolSearch（无搜索环节，
-  #     等效旧「完整 schema 模式」；工具量大时 token 成本高）。
-  #   【废弃】activate-on-search 布尔已由 mode 取代（mode=activate / mode=search 对应旧 true/false）。 search|activate|full
+  #   【R11 2026-09-12】原第三态 full（全发：所有工具含 defer 全量进 schema、排除 ToolSearch）已删除
+  #     —— 其语义即 useToolSearch=false 分支的恒等行为，无独立消费者；配 full 现按非法值回落 search。
+  #   【废弃】activate-on-search 布尔已由 mode 取代（mode=activate / mode=search 对应旧 true/false）。 search|activate
   # ---------------------------------------------------------------
   toolsearch:
     mode: search

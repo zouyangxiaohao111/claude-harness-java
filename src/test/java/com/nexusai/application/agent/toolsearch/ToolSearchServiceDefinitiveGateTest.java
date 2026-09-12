@@ -225,59 +225,89 @@ class ToolSearchServiceDefinitiveGateTest {
     }
 
     @Test
-    @DisplayName("[mode=full] filterToolsForSchema：全发（含 deferred，排除 ToolSearch）—— 语义并入恒等分支")
-    void filterToolsForSchema_modeFull_sendsAll() {
-        // WHY（R8）：full 模式语义（排除 ToolSearch + 全量）现即 false 分支的恒等行为，不再特判；
-        //   mode=full 下结果须与默认 search 的 false 分支一致（CC claude.ts:1170-1172）。
-        ToolSearchService.modeOverride = "full";
+    @DisplayName("[mode=activate] activateTools 门：activate 生效写激活集并回传；search 门关 → 空返回不写")
+    void activateTools_modeGate() {
+        // WHY（R11 2026-09-12）：原 isActivateMode() accessor 是死码（仅测试引用）已删；mode=activate
+        //   的唯一真实消费路径是 activateTools(...)（ToolSearchTool.java:262/283 调用）→ 门在
+        //   doActivateTools（modeEnum() != ACTIVATE 即短路）。本用例经该真实路径接管原 accessor 的
+        //   语义覆盖（activate 写激活集 / search 不写），不因删 accessor 丢掉这层。
+        //   变异：把 doActivateTools 的 ACTIVATE 门去掉（改成恒写）→ 下方 search 分支变红。
+        Object prevInstance = injectInstance(new ToolSearchService());
         try {
-            List<Tool> filtered = ToolSearchService.filterToolsForSchema(
-                    TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of());
-            assertThat(names(filtered))
-                    .as("mode=full → 全量（含 deferred WebSearch），排除 ToolSearch")
-                    .containsExactlyInAnyOrder("Bash", "WebSearch");
-        } finally {
-            ToolSearchService.modeOverride = null;
-        }
-    }
-
-    @Test
-    @DisplayName("[mode=activate] filterToolsForSchema：同 CC 恒等（排除 ToolSearch + 全量）")
-    void filterToolsForSchema_modeActivate_ccForm() {
-        // WHY（R8）：mode 不再影响 false 分支过滤（原 search/activate 的「保留 ToolSearch + 过滤 deferred」
-        //   已删）。activate 的差异只在 ToolSearch 命中时是否写入激活集（activateTools），与过滤形状无关。
-        ToolSearchService.modeOverride = "activate";
-        try {
-            List<Tool> filtered = ToolSearchService.filterToolsForSchema(
-                    TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of());
-            assertThat(names(filtered))
-                    .as("mode=activate → 排除 ToolSearch，其余全量（与 mode=full / search 同形）")
-                    .containsExactlyInAnyOrder("Bash", "WebSearch");
-        } finally {
-            ToolSearchService.modeOverride = null;
-        }
-    }
-
-    @Test
-    @DisplayName("[mode] 三态互斥解析：search（默认）/ activate / full / 非法值回落 search")
-    void modeEnum_threeStates() {
-        // WHY: 用户拍板 openai 三态互斥（search | activate | full）——一个键切换，
-        //   非法值/未配 → 回落默认 search（懒加载，最安全）。
-        try {
-            ToolSearchService.modeOverride = "full";
-            assertThat(ToolSearchService.isFullSchemaMode()).isTrue();
-            assertThat(ToolSearchService.isActivateMode()).isFalse();
             ToolSearchService.modeOverride = "activate";
-            assertThat(ToolSearchService.isActivateMode()).isTrue();
-            assertThat(ToolSearchService.isFullSchemaMode()).isFalse();
+            assertThat(ToolSearchService.activateTools(List.of("WebSearch")))
+                    .as("mode=activate → 命中 defer 名写入激活集并回传（ToolSearchTool 据此发激活提示）")
+                    .containsExactly("WebSearch");
+            assertThat(ToolSearchService.isActivated("WebSearch"))
+                    .as("激活集已写入 → filterToolsForSchema 将其视为 discovered 保留")
+                    .isTrue();
+
             ToolSearchService.modeOverride = "search";
-            assertThat(ToolSearchService.isActivateMode()).isFalse();
-            assertThat(ToolSearchService.isFullSchemaMode()).isFalse();
-            ToolSearchService.modeOverride = "bogus";
-            assertThat(ToolSearchService.isActivateMode()).isFalse();
-            assertThat(ToolSearchService.isFullSchemaMode()).isFalse();
+            assertThat(ToolSearchService.activateTools(List.of("Bash")))
+                    .as("mode=search → 门关，空返回、不写激活集")
+                    .isEmpty();
+            assertThat(ToolSearchService.isActivated("Bash")).isFalse();
         } finally {
             ToolSearchService.modeOverride = null;
+            clearActivatedTools();
+            restoreInstance(prevInstance);
+        }
+    }
+
+    @Test
+    @DisplayName("[mode] 两态互斥解析：search（默认）/ activate；非法值含已删 full → 回落 search")
+    void parseMode_twoStates() {
+        // WHY（R11 2026-09-12）：删除 full 死码后 mode 仅两态（search | activate）—— 一个键切换，
+        //   非法值/未配（含已删除的 "full"）→ 回落默认 search（懒加载，最安全）。
+        assertThat(ToolSearchService.parseMode("activate"))
+                .isEqualTo(ToolSearchService.ToolSearchOpenAiMode.ACTIVATE);
+        assertThat(ToolSearchService.parseMode("search"))
+                .isEqualTo(ToolSearchService.ToolSearchOpenAiMode.SEARCH);
+        assertThat(ToolSearchService.parseMode("bogus"))
+                .isEqualTo(ToolSearchService.ToolSearchOpenAiMode.SEARCH);
+        assertThat(ToolSearchService.parseMode(null))
+                .isEqualTo(ToolSearchService.ToolSearchOpenAiMode.SEARCH);
+        assertThat(ToolSearchService.parseMode("full"))
+                .as("full 枚举值已删（R11）→ 不再识别，回落默认 search")
+                .isEqualTo(ToolSearchService.ToolSearchOpenAiMode.SEARCH);
+    }
+
+    // ═══ 非 Spring 单测 helper：activateTools 经 doActivateTools 需 INSTANCE 非 null（无容器时为 null）
+    //     → 注入一个裸实例并复位；激活集是全局静态，用后必清（否则污染 filterToolsForSchema 用例）═══
+
+    /** 注入 ToolSearchService.INSTANCE · 返回旧值供 {@link #restoreInstance(Object)} 还原。 */
+    private static Object injectInstance(ToolSearchService inst) {
+        try {
+            java.lang.reflect.Field f = ToolSearchService.class.getDeclaredField("INSTANCE");
+            f.setAccessible(true);
+            Object prev = f.get(null);
+            f.set(null, inst);
+            return prev;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("ToolSearchService.INSTANCE 注入失败", e);
+        }
+    }
+
+    /** 还原 INSTANCE 为 {@link #injectInstance} 返回的旧值。 */
+    private static void restoreInstance(Object prev) {
+        try {
+            java.lang.reflect.Field f = ToolSearchService.class.getDeclaredField("INSTANCE");
+            f.setAccessible(true);
+            f.set(null, prev);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("ToolSearchService.INSTANCE 还原失败", e);
+        }
+    }
+
+    /** 清空全局激活集（ACTIVATED_TOOLS）· 测试间隔离。 */
+    @SuppressWarnings("unchecked")
+    private static void clearActivatedTools() {
+        try {
+            java.lang.reflect.Field f = ToolSearchService.class.getDeclaredField("ACTIVATED_TOOLS");
+            f.setAccessible(true);
+            ((java.util.Map<String, Boolean>) f.get(null)).clear();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("清空 ACTIVATED_TOOLS 失败", e);
         }
     }
 
