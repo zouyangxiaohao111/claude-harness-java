@@ -10,6 +10,7 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.ToolSearchTool;
+import com.nexusai.application.agent.tool.impl.WebFetchTool;
 import com.nexusai.application.agent.tool.impl.WebSearchTool;
 import com.nexusai.application.agent.toolsearch.ToolSearchService;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -256,6 +257,35 @@ class LlmAgentLoopDeferLoadingPipelineTest {
                 .as("2 参签名无 tool-search 过滤（defer_loading 管线不参与）")
                 .contains("Bash", "ToolSearch", "WebSearch");
         assertThat(findSchema(schema, "WebSearch").has("defer_loading")).isFalse();
+    }
+
+    @Test
+    @DisplayName("[R12] anthropic + sonnet → WebFetch 保留懒加载（tool_reference 可激活）；非 anthropic → 全量内联")
+    void pipeline_anthropicKeepsWebFetchDeferred() {
+        // WHY（R12 2026-09-12 承接自被删 LlmAgentLoopWebSearchDeferExemptTest 的「anthropic 保留 deferred」语义）：
+        //   anthropic × sonnet → toolReferenceUsable=true → useToolSearch=true → WebFetch（deferred 未发现）
+        //   不进初始 schema，discovered 后进 schema（懒加载发现闭环）。非 anthropic 侧「WebSearch/WebFetch
+        //   恒在初始 schema」语义由 pipeline_nonAnthropic_sendsAllInlineNoDeferLoading 管线级覆盖（R8 全发）。
+        //   R12 删 exemptWebSearchDeferForOpenAi/exemptSendMessageDeferForOpenAi 后，此处锁定 anthropic 侧不漂移。
+        ToolSearchService.envOverride = Map.of();
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebFetchTool());
+
+        LlmAgentLoop.ToolsAssembly noDiscovery = LlmAgentLoop.llmToolsArray(
+                tuc(available, "anthropic"), QuerySource.USER, List.of(), SUPPORTED_MODEL);
+        assertThat(noDiscovery.useToolSearch()).isTrue();
+        assertThat(schemaNames(noDiscovery.tools()))
+                .as("anthropic → WebFetch（deferred 未发现）不进初始 schema，Bash/ToolSearch 保留")
+                .containsExactlyInAnyOrder("Bash", "ToolSearch");
+
+        LlmAgentLoop.ToolsAssembly discovered = LlmAgentLoop.llmToolsArray(
+                tuc(available, "anthropic"), QuerySource.USER,
+                List.of(userMsgWithToolReference("WebFetch")), SUPPORTED_MODEL);
+        assertThat(schemaNames(discovered.tools()))
+                .as("discovered 后 WebFetch 进 schema")
+                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebFetch");
+        assertThat(findSchema(discovered.tools(), "WebFetch").path("defer_loading").asBoolean(false))
+                .as("discovered deferred 工具发射 defer_loading=true（CC api.ts:223-225）")
+                .isTrue();
     }
 
     private static JsonNode findSchema(ArrayNode schema, String name) {

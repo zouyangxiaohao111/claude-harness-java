@@ -11424,23 +11424,21 @@ public class LlmAgentLoop implements AgentLoop {
             boolean useToolSearch = ToolSearchService.isToolSearchEnabled(available, modelName, tokenClient)
                     && ToolSearchService.toolReferenceUsable(tuc.effectiveProviderType(), modelName);
             Set<String> deferredToolNames = ToolSearchService.computeDeferredToolNames(available);
-            // [vision-defer-model 2026-09-03] vision_analyze 懒加载豁免（装配层按主模型能力判定）：
-            //   仅 ant/response 直给格式 + 多模态（supportsImage）才保留懒 —— 该模型能走 Read 直给通道，
-            //   vision_analyze 仅 PDF 超预算/分段补充，可 defer 省 token；
-            //   其余（openai-completions 的 deepseek 含 vision-exp 多模态 / 任何文本模型）vision_analyze
-            //   是唯一视觉通道 → 从 deferred 剔除强制 schema 直发（不赌模型会 ToolSearch 激活，
-            //   历史 Read 图空读死循环 / fork 视觉子代理递归诱因）。主/子代理共享本 queryLoop 装配路径。
-            exemptVisionAnalyzeDeferForTextModel(deferredToolNames, modelMapper, providerMapper, modelName);
-            // [websearch-openai-alwaysload 2026-09-04 用户拍板] WebSearch/WebFetch 懒加载豁免：
-            //   非 anthropic（openai_compatible/openai_sdk/未来 response）时从 deferred 移除 → 恒在
-            //   初始 schema（不赌模型会 ToolSearch 激活）—— 用户实测 deepseek 误判"没 WebSearch"
-            //   白派 agent。anthropic 保留懒加载（tool_reference 能正常激活，对齐 CC 省 token）。
-            exemptWebSearchDeferForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
-            // [sendmessage-openai-alwaysload 2026-09-08] SendMessage 懒加载豁免：非 anthropic
-            //   （openai_compatible/deepseek/moonshot 等）时从 deferred 移除 → 恒在初始 schema
-            //   （openai 兼容模型无 tool_reference，deferred 工具会被 filterToolsForSchema 剔出初始
-            //   schema，模型不自知 → 无法向运行中子代理发消息；对齐 vision/WebSearch 同因豁免）。
-            exemptSendMessageDeferForOpenAi(deferredToolNames, modelMapper, providerMapper, modelName);
+            // [vision-defer-model 2026-09-03 / R12 2026-09-12 判据单点化] vision_analyze 懒加载豁免
+            //   （装配层按主模型能力判定）：仅「能用 tool_reference」AND 多模态（supportsImage）才保留懒 ——
+            //   该模型能走 Read 直给通道，vision_analyze 仅 PDF 超预算/分段补充，可 defer 省 token；
+            //   其余（非 anthropic / anthropic×haiku / 任何文本模型）vision_analyze 是唯一视觉通道 →
+            //   从 deferred 剔除强制 schema 直发（不赌模型会 ToolSearch 激活，历史 Read 图空读死循环 /
+            //   fork 视觉子代理递归诱因）。主/子代理共享本 queryLoop 装配路径。
+            //   判据单点 = ToolSearchService.toolReferenceUsable；provider 源 = tuc.effectiveProviderType()
+            //   （与上方门控同源，每轮盖章）——剔除此前第二个 provider 判源
+            //   ContextUsageCalculator.isAnthropic(modelMapper, …)。
+            exemptVisionAnalyzeDeferForTextModel(deferredToolNames, tuc.effectiveProviderType(),
+                    modelMapper, providerMapper, modelName);
+            // [R12 · 2026-09-12 清理] 原按 provider 剔除 deferred 让 WebSearch/WebFetch/SendMessage 直发
+            //   （exemptWebSearchDeferForOpenAi / exemptSendMessageDeferForOpenAi）；R8 后非 anthropic 由
+            //   useToolSearch=false 分支「排除 ToolSearch + 其余全发」语义覆盖，anthropic 分支原就早退 →
+            //   豁免冗余已删（零行为影响）。
             Set<String> discovered = ToolSearchService.extractDiscoveredToolNames(messages);
             if (useToolSearch) {
                 // 短路（claude.ts:1140-1147）：无 deferred 且无 pending MCP → 关闭。
@@ -12485,25 +12483,31 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [vision-defer-model 2026-09-03] vision_analyze 懒加载豁免（装配层 · llmToolsArray 调用）·
-     * 判据 = 「能走 Read 直给通道」= provider 直给格式 && 模型多模态（<b>且</b>，不是或）。
+     * [vision-defer-model 2026-09-03 / R12 2026-09-12 判据单点化] vision_analyze 懒加载豁免
+     * （装配层 · llmToolsArray 调用）· 判据 = 「能用 tool_reference」AND 模型多模态（<b>且</b>，不是或）。
      *
-     * <p>仅当主模型为 <b>ant（anthropic）/ response（openai-response，Java 暂未对接，预留）直给格式
-     * 且 supportsImage 多模态</b>（模型能直接 Read 图/PDF document，vision_analyze 仅 PDF 超预算/分段
-     * 补充）→ <b>保留懒</b>（defer_loading，省 schema token）。<b>非该组合一律从 deferred 剔除 →
-     * schema 直发</b>：openai-completions 的 deepseek（<b>含 vision-exp 多模态</b>——格式不支持 Read
-     * 带图，vision_analyze 是唯一视觉通道）/ 任何文本模型 / mapper 未注入（无法判 → 保守直发）。
+     * <p>仅当 <b>{@code ToolSearchService.toolReferenceUsable(providerType, modelName)}</b>
+     * （provider==anthropic 且模型支持 tool_reference，即非 haiku）<b>且 supportsImage 多模态</b>时
+     * <b>保留懒</b>（defer_loading，省 schema token）。<b>非该组合一律从 deferred 剔除 → schema 直发</b>：
+     * 非 anthropic（openai_compatible/openai_sdk，<b>含多模态</b>）/ anthropic×haiku（无 tool_reference
+     * ⇒ 懒加载不可达，模型永远搜不出该工具）/ 任何文本模型 / mapper 未注入（无法判 → 保守直发）。
+     *
+     * <p>判据单点：provider 源 = 调用方传 <b>{@code tuc.effectiveProviderType()}</b>（与门控
+     * {@code llmToolsArray} 内 {@code useToolSearch} 同源、每轮盖章），消除此前第二个 provider 判源
+     * {@code ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)}（按 DB mapper 现查）。
      *
      * <p>WHY（历史根因）：文本模型下 vision_analyze 若被 defer，主/子模型须先 ToolSearch 激活才拿得到
      * schema，模型常不自知 → Read 图空读死循环 / fork 视觉子代理递归（曾致超长 run / 提醒刷屏）。
-     * 主/子代理共享本 queryLoop 装配路径 → 一处豁免覆盖两者（Task#15）。
+     * 主/子代理共享本 queryLoop 装配路径 → 一处豁免覆盖两者（Task#15）。haiku 格反转同理：无
+     * tool_reference ⇒ 懒加载等于不可达 ⇒ 直发是 fail-safe（懒加载前提 = tool_reference 自带）。
      *
      * @param deferred       deferred 工具名集合（原地修改；null 容忍）
+     * @param providerType   本轮生效 provider 类型（{@code tuc.effectiveProviderType()}；null/未知 → toolReferenceUsable 判 false）
      * @param modelMapper    模型 mapper（null → 保守剔除直发）
      * @param providerMapper 提供商 mapper（null → 保守剔除直发）
      * @param modelName      本次调用主模型名
      */
-    static void exemptVisionAnalyzeDeferForTextModel(Set<String> deferred,
+    static void exemptVisionAnalyzeDeferForTextModel(Set<String> deferred, String providerType,
             ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
         if (deferred == null || !deferred.contains(
                 com.nexusai.application.agent.tool.ToolNameConstants.VISION_ANALYZE_TOOL_NAME)) {
@@ -12513,100 +12517,12 @@ public class LlmAgentLoop implements AgentLoop {
             deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.VISION_ANALYZE_TOOL_NAME);
             return;
         }
-        // 允许懒 = anthropic（ant）直给格式 && 多模态；openai-response 预留（Java 未对接，接入时按
-        // providerType 扩展）。deepseek=openai_compatible → 非 ant → 即使 supportsImage（vision-exp）
-        // 也强制直发（格式不支持 Read 带图，vision_analyze 唯一通道）。
-        boolean antDirectFormat = ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName);
+        // 允许懒 = 能用 tool_reference（anthropic 且非 haiku）&& 多模态。非 anthropic / anthropic×haiku：
+        // toolReferenceUsable=false → 懒加载不可达（模型搜不出工具）→ 强制直发（fail-safe）。
+        boolean toolRefUsable = ToolSearchService.toolReferenceUsable(providerType, modelName);
         boolean imageCapable = modelSupportsImage(modelMapper, providerMapper, modelName);
-        if (!(antDirectFormat && imageCapable)) {
+        if (!(toolRefUsable && imageCapable)) {
             deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.VISION_ANALYZE_TOOL_NAME);
-        }
-    }
-
-    /**
-     * WebSearch/WebFetch 懒加载豁免 · [2026-09-04 用户拍板] 非 anthropic（openai 系）始终加载。
-     *
-     * <p><b>WHY</b>：用户实测 deepseek（openai_compatible）会话里模型误判「没有 WebSearch/
-     * WebFetch 工具」→ 白派 agent。根因 = 两工具 {@code shouldDefer() → true}（对齐 CC
-     * WebSearchTool.ts:156 / WebFetchTool.ts:71）→ 非 discovered/激活时不进初始 schema；模型
-     * 又无 tool_reference（deepseek）需先 ToolSearch 激活 → 误判不存在。anthropic 有 tool_reference
-     * 能正常激活，保留懒加载省 token（对齐 CC）。
-     *
-     * <p><b>判定</b>：{@code !isAnthropic} = openai_compatible/openai_sdk/<b>未来 response</b>
-     * （Response API 直给格式，provider.type 届时按需扩展，isAnthropic 判 false 天然覆盖）。
-     * <b>mapper null → return（不豁免，deferred 保留原样）</b>：llmToolsArray 4 参旧签名
-     * （modelMapper/providerMapper null）无法判定 provider，保持既有懒加载行为（对齐 vision 豁免
-     * 前身：仅装配层 7 参带 mapper 的主循环/子代理路径判定）。不贸然移除 defer —— 避免无依据
-     * 改变默认行为（旧测试契约：4 参路径 WebSearch 仍 deferred）。
-     *
-     * @param deferred       deferred 工具名集合（就地移除 WebSearch/WebFetch）
-     * @param modelMapper    模型 mapper（null → 不豁免，保持 deferred）
-     * @param providerMapper 提供商 mapper（null → 不豁免，保持 deferred）
-     * @param modelName      当前生效模型名（可 null）
-     */
-    static void exemptWebSearchDeferForOpenAi(Set<String> deferred,
-            ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
-        if (deferred == null || modelMapper == null || providerMapper == null) {
-            return; // 无法判定 provider → 保持既有懒加载（4 参旧签名契约）
-        }
-        boolean hasWeb = deferred.contains(
-                com.nexusai.application.agent.tool.ToolNameConstants.WEB_SEARCH_TOOL_NAME)
-            || deferred.contains(com.nexusai.application.agent.tool.ToolNameConstants.WEB_FETCH_TOOL_NAME);
-        if (!hasWeb) {
-            return;
-        }
-        if (ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)) {
-            return; // anthropic 保留懒加载（tool_reference 激活，对齐 CC）
-        }
-        // 非 anthropic（openai 系含未来 response）→ 恒在初始 schema
-        deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.WEB_SEARCH_TOOL_NAME);
-        deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.WEB_FETCH_TOOL_NAME);
-        if (log.isDebugEnabled()) {
-            log.debug("llmToolsArray: WebSearch/WebFetch 从 deferred 豁免（非 anthropic 始终加载，"
-                + "防 openai 模型误判无工具白派 agent）");
-        }
-    }
-
-    /**
-     * SendMessage 懒加载豁免 · [2026-09-08 用户拍板] 非 anthropic（openai 兼容/deepseek/moonshot）
-     * 请求中 SendMessage 恒进初始 schema。
-     *
-     * <p><b>WHY</b>：SendMessage 对齐 CC SendMessageTool.ts:533 {@code shouldDefer:true} → 非
-     * discovered/激活时不进初始 schema；openai 兼容模型无 tool_reference（deepseek/moonshot），
-     * deferred 工具会被 {@code filterToolsForSchema} 剔出初始 schema 且模型无法经 ToolSearch 激活 →
-     * 模型不自知存在 SendMessage → 无法向运行中 fork/后台子代理发消息。anthropic 有 tool_reference
-     * 能正常激活，保留懒加载省 token（对齐 CC defer）。与 vision/WebSearch 豁免同因（用户实测
-     * deepseek 会话误判"没有工具"）。
-     *
-     * <p><b>判定</b>：mapper null → 无法判 provider → 按 vision 语义保守剔除直发（不赌模型会
-     * ToolSearch 激活）；{@code isAnthropic} = true → 保留懒（tool_reference 激活，对齐 CC）；
-     * 其余（openai_compatible/openai_sdk/未来 response）→ 从 deferred 移除恒在初始 schema。
-     *
-     * @param deferred       deferred 工具名集合（就地移除 SendMessage；null 容忍）
-     * @param modelMapper    模型 mapper（null → 保守剔除直发，vision 语义）
-     * @param providerMapper 提供商 mapper（null → 保守剔除直发，vision 语义）
-     * @param modelName      当前生效模型名（可 null）
-     */
-    static void exemptSendMessageDeferForOpenAi(Set<String> deferred,
-            ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
-        if (deferred == null || !deferred.contains(
-                com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME)) {
-            return;
-        }
-        if (modelMapper == null || providerMapper == null) {
-            // vision 语义：mapper 未注入无法判 provider → 保守直发（不赌模型会 ToolSearch 激活）
-            deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME);
-            return;
-        }
-        if (ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, modelName)) {
-            return; // anthropic 保留懒加载（tool_reference 激活，对齐 CC defer）
-        }
-        // 非 anthropic（openai 兼容/deepseek/moonshot/未来 response）→ 恒在初始 schema
-        deferred.remove(com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME);
-        if (log.isDebugEnabled()) {
-            log.debug("llmToolsArray: SendMessage 从 deferred 豁免（非 anthropic 始终加载，"
-                + "与 vision/WebSearch 同因：openai 兼容模型无 tool_reference，deferred 工具会从初始 "
-                + "schema 被剔，模型不自知无法发消息）");
         }
     }
 
