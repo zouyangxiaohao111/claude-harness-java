@@ -107,7 +107,8 @@ class CompactSessionCostWiringTest {
             message("m2", Role.user, "question-2", null, null)));
 
         AgentLoopContext ctx = agentLoopContext(plainReplyProvider(), null, recordingCalculator());
-        LlmAgentLoop.queryLoop(params(state, COMPACT_MODEL, ctx), state, new ArrayList<>(),
+        QueryParams callerParams0 = params(state, COMPACT_MODEL, ctx);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>(),
             autoCompactor());
 
         // ① 成本：压缩调用 4400 元入会话合计（单价 1 元/输入侧 token）
@@ -166,7 +167,8 @@ class CompactSessionCostWiringTest {
         rc.setEnabled(true);
         AgentLoopContext ctx = agentLoopContext(ptlOnceThenStopProvider(), rc, recordingCalculator());
 
-        LlmAgentLoop.queryLoop(reactiveParams(state, COMPACT_MODEL, ctx), state, new ArrayList<>());
+        QueryParams callerParams1 = reactiveParams(state, COMPACT_MODEL, ctx);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state), state, new ArrayList<>());
 
         // 前置：reactive compact 真实发生（消息被压缩）——否则本测试空转
         assertThat(state.rawMessages().size())
@@ -205,7 +207,8 @@ class CompactSessionCostWiringTest {
         AgentState a = newState();
         a.replaceMessages(List.of(message("m1", Role.user, "q", null, null)));
         AgentLoopContext ctxA = agentLoopContext(plainReplyProvider(), null, recordingCalculator());
-        LlmAgentLoop.queryLoop(params(a, COMPACT_MODEL, ctxA), a, new ArrayList<>(), autoCompactor());
+        QueryParams callerParams2 = params(a, COMPACT_MODEL, ctxA);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams2.deps().context(), callerParams2, a), a, new ArrayList<>(), autoCompactor());
         assertThat(a.sessionCostYuan())
             .as("模型 = compact-model-a（单价 1）→ 4400")
             .isEqualTo(EXPECTED_COMPACT_COST);
@@ -217,7 +220,8 @@ class CompactSessionCostWiringTest {
         AgentState b = newState();
         b.replaceMessages(List.of(message("m1", Role.user, "q", null, null)));
         AgentLoopContext ctxB = agentLoopContext(plainReplyProvider(), null, recordingCalculator(callsB));
-        LlmAgentLoop.queryLoop(params(b, TRAP_MODEL, ctxB), b, new ArrayList<>(), autoCompactor());
+        QueryParams callerParams3 = params(b, TRAP_MODEL, ctxB);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams3.deps().context(), callerParams3, b), b, new ArrayList<>(), autoCompactor());
         assertThat(b.sessionCostYuan())
             .as("模型换成高单价的 declared-model-expensive → 金额必须随之放大（证明模型真实参与计价，"
                 + "而非写死/取会话主模型）")
@@ -246,7 +250,8 @@ class CompactSessionCostWiringTest {
         AgentLoopContext ctx = agentLoopContext(plainReplyProvider(), null, recordingCalculator());
         AutoCompactor autoCompactor = autoCompactor();
 
-        LlmAgentLoop.queryLoop(params(state, COMPACT_MODEL, ctx), state, new ArrayList<>(), autoCompactor);
+        QueryParams callerParams4 = params(state, COMPACT_MODEL, ctx);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams4.deps().context(), callerParams4, state), state, new ArrayList<>(), autoCompactor);
         assertThat(state.sessionCostYuan())
             .as("第 1 次压缩后 = 4400")
             .isEqualTo(EXPECTED_COMPACT_COST);
@@ -255,7 +260,8 @@ class CompactSessionCostWiringTest {
         // 第二次压缩：重置为普通消息集（压缩后的 boundary/summary 携带 usage → 会走 usage-walk
         // 阈值判定，与本次断言的「压缩调用触发」无关），同一 AgentState 继续累计。
         state.replaceMessages(List.of(message("m9", Role.user, "second-round", null, null)));
-        LlmAgentLoop.queryLoop(params(state, COMPACT_MODEL, ctx), state, new ArrayList<>(), autoCompactor);
+        QueryParams callerParams5 = params(state, COMPACT_MODEL, ctx);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams5.deps().context(), callerParams5, state), state, new ArrayList<>(), autoCompactor);
 
         assertThat(state.sessionCostYuan())
             .as("第 2 次压缩必须再计一次（成本累加 8800，既不漏计也不覆盖）")

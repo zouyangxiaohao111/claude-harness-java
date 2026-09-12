@@ -107,10 +107,10 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
         ProviderConfig firstParty = new ProviderConfig("https://api.anthropic.com", "sk-test");
 
         // ── 4. queryLoop（gate=true 经 params.config() 注入）──
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null, tuc,
+        QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null, tuc,
                 QuerySource.USER, "test-model", null,
-                null, null, null, null, deps, firstParty),
+                null, null, null, null, deps, firstParty);
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         // ── 5. 断言 ──
@@ -156,10 +156,10 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
         };
         ProviderConfig firstParty = new ProviderConfig("https://api.anthropic.com", "sk-test");
 
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null, tuc,
+        QueryParams callerParams1 = QueryParams.forLoop(state.rawMessages(), null, tuc,
                 QuerySource.USER, "test-model", null,
-                null, null, null, null, deps, firstParty),
+                null, null, null, null, deps, firstParty);
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state),
             state, new ArrayList<>());
 
         assertThat(result.aborted()).isFalse();

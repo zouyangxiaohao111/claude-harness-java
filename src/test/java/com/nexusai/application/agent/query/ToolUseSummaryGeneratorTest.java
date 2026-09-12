@@ -362,15 +362,15 @@ class ToolUseSummaryGeneratorTest {
             @Override public boolean isMainLoop() { return true; }
         };
 
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(
                         com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new java.util.ArrayList<>());
         return state;
     }

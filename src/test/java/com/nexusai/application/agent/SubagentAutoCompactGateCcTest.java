@@ -66,7 +66,7 @@ class SubagentAutoCompactGateCcTest {
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.SUBAGENT, state);
-        LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), auto);
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
         assertThat(state.rawMessages())
             .as("子代理超阈必须触发自动压缩（CC shouldAutoCompact 无 agent:* 守卫；DRIFT-8/S-8）")
@@ -83,7 +83,7 @@ class SubagentAutoCompactGateCcTest {
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.FORK, state);
-        LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), auto);
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
         assertThat(state.rawMessages())
             .as("fork 子代理超阈必须触发自动压缩（CC runAgent.ts:748 同一 query()，agent:builtin:fork 非守卫源）")
@@ -101,7 +101,7 @@ class SubagentAutoCompactGateCcTest {
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), auto);
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
         assertThat(state.rawMessages())
             .as("主线程超阈必须触发自动压缩（既有行为保持）")

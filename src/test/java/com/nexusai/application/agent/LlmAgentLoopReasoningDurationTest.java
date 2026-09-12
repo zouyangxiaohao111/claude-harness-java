@@ -163,11 +163,11 @@ class LlmAgentLoopReasoningDurationTest {
         };
         ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash")));
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new java.util.ArrayList<>());
     }
 

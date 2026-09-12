@@ -100,11 +100,11 @@ class LlmAgentLoopWiringOrderTest {
         };
 
         // ── 3. 驱动 loop ──
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null,
+        QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         // ── 4. 断言 [D10 双视图 2026-09-12 改造]：pre1 从**模型视图**剥离，但**全量保活** ──

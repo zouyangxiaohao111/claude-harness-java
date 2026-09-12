@@ -154,7 +154,7 @@ class LlmAgentLoopOdD2DrainSuppressionTest {
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", 8, null, null, null, null,
             deps, ProviderConfig.empty());
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
 
         // ── 断言 ──
         // ① 确有 3 次模型调用（截断恢复 → 真工具轮 → 收尾文本）

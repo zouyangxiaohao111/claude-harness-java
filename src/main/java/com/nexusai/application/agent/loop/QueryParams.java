@@ -152,13 +152,13 @@ public record QueryParams(
      * maxOutputTokensOverride / taskBudget / maxTurns）可为 null（CC 可选语义）。
      *
      * @param messages                loop 消息列表（run(): state.rawMessages()）
-     * @param systemPrompt            <b>[vestigial · 本仓 3 条生产调用方恒传 {@code List.of()}，
-     *                                0 生产读点]</b> 调用方已组装好的系统提示（CC {@code SystemPrompt}
-     *                                段数组语义）。真实提示来源 = {@code AgentState.systemPrompt()}
-     *                                （custom）+ loop 内 per-run 材料收集（fetchSystemPromptParts →
-     *                                buildEffectiveSystemPrompt → 经 {@code withSystemPrompt} 回灌本
-     *                                字段）。保留本形的理由：对齐 CC {@code query({systemPrompt})}
-     *                                形状，并给 fork 收敛预留「调用方已组装 ⇒ loop 跳过材料收集」通道。
+     * @param systemPrompt            调用方已组装好的系统提示（CC {@code SystemPrompt} 段数组语义）。
+     *                                <b>[prompt-assembly-B]</b> 本实参仍是占位（三路生产调用方传
+     *                                {@code List.of()}）：真实值由调用方在 {@code forLoop} 之后调
+     *                                {@code LlmAgentLoop.collectRunMaterial(ctx, params, state)}
+     *                                回灌到返回的副本上（CC 位置 = QueryEngine.ts:302
+     *                                {@code fetchSystemPromptParts} → {@code buildEffectiveSystemPrompt}），
+     *                                query loop 只消费、不重折（CC query.ts:393-411）。
      * @param toolUseContext          初始 ToolUseContext（B1 占位；loop 内部仍用 toolExecContext 重建）
      * @param querySource             查询来源（compact ctor 已校验非空）
      * @param modelName               入口已解析 model 名

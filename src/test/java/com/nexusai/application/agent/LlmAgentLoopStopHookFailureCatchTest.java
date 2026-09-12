@@ -126,14 +126,16 @@ class LlmAgentLoopStopHookFailureCatchTest {
         };
 
         // ── 执行（旧实现：异常抛穿 queryLoop → 本行抛错 RED）──
-        assertThatCode(() -> LlmAgentLoop.queryLoop(
+        // [prompt-assembly-B] 测试即调用方：按生产契约先 collectRunMaterial 回灌三通道，再交 queryLoop。
+        com.nexusai.application.agent.loop.QueryParams rawParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 baseTuc.withAvailableTools(List.of(
                     com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
-            state, new ArrayList<>()))
+                deps, ProviderConfig.empty());
+        com.nexusai.application.agent.loop.QueryParams callerParams = LlmAgentLoop.collectRunMaterial(rawParams.deps().context(), rawParams, state);
+        assertThatCode(() -> LlmAgentLoop.queryLoop(callerParams, state, new ArrayList<>()))
             .as("[SH-03] in-loop Stop hook 异常不得抛穿 queryLoop（CC catch return {[],false} 优雅续行）")
             .doesNotThrowAnyException();
 
@@ -216,14 +218,16 @@ class LlmAgentLoopStopHookFailureCatchTest {
         };
 
         // ── 执行（旧实现：teammate 段无 try → 异常抛穿 queryLoop RED）──
-        assertThatCode(() -> LlmAgentLoop.queryLoop(
+        // [prompt-assembly-B] 测试即调用方：按生产契约先 collectRunMaterial 回灌三通道，再交 queryLoop。
+        com.nexusai.application.agent.loop.QueryParams rawParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 baseTuc.withAvailableTools(List.of(
                     com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
-            state, new ArrayList<>()))
+                deps, ProviderConfig.empty());
+        com.nexusai.application.agent.loop.QueryParams callerParams = LlmAgentLoop.collectRunMaterial(rawParams.deps().context(), rawParams, state);
+        assertThatCode(() -> LlmAgentLoop.queryLoop(callerParams, state, new ArrayList<>()))
             .as("[SH-03] teammate 段 hook 异常不得抛穿 queryLoop（CC stopHooks.ts:456-472 单 try catch 覆盖 teammate 段）")
             .doesNotThrowAnyException();
 

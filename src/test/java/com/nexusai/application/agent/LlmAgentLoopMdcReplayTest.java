@@ -90,11 +90,11 @@ class LlmAgentLoopMdcReplayTest {
 
             // ── 3. 驱动真实 queryLoop（同 WiringOrderTest 路径）──
             AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
-            LoopResult result = LlmAgentLoop.queryLoop(
-                QueryParams.forLoop(state.rawMessages(), null,
+            QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null,
                     ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                     QuerySource.USER, "test-model", null, null, null, null, null,
-                    deps, ProviderConfig.empty()),
+                    deps, ProviderConfig.empty());
+            LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
                 state, new ArrayList<>());
 
             // ── 4. 断言: 流线程（STREAM_EXECUTOR 虚拟线程）MDC 已回放，sessionId 非 null 且等于原始值 ──
@@ -141,11 +141,11 @@ class LlmAgentLoopMdcReplayTest {
 
             // ── 3. 驱动真实 queryLoop（同 MDC 回放测试路径）──
             AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
-            LoopResult result = LlmAgentLoop.queryLoop(
-                QueryParams.forLoop(state.rawMessages(), null,
+            QueryParams callerParams1 = QueryParams.forLoop(state.rawMessages(), null,
                     ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                     QuerySource.USER, "test-model", null, null, null, null, null,
-                    deps, ProviderConfig.empty()),
+                    deps, ProviderConfig.empty());
+            LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state),
                 state, new ArrayList<>());
 
             // ── 4. 断言: 流线程读到 loop 线程注入的会话 projectRoot（F3 回放生效）──

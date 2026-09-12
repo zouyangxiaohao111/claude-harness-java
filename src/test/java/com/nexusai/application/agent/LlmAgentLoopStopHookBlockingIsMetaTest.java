@@ -110,14 +110,16 @@ class LlmAgentLoopStopHookBlockingIsMetaTest {
         };
 
         // ── 执行（blocking → 重入；重入上限安全阀终止，全程不抛）──
-        assertThatCode(() -> LlmAgentLoop.queryLoop(
+        // [prompt-assembly-B] 测试即调用方：按生产契约先 collectRunMaterial 回灌三通道，再交 queryLoop。
+        com.nexusai.application.agent.loop.QueryParams rawParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 tucWithNotification(null).withAvailableTools(List.of(
                     TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
-            state, new ArrayList<>()))
+                deps, ProviderConfig.empty());
+        com.nexusai.application.agent.loop.QueryParams callerParams = LlmAgentLoop.collectRunMaterial(rawParams.deps().context(), rawParams, state);
+        assertThatCode(() -> LlmAgentLoop.queryLoop(callerParams, state, new ArrayList<>()))
             .as("[P2-14] Stop hook blocking 重入不应抛穿 queryLoop（安全阀终止）")
             .doesNotThrowAnyException();
 

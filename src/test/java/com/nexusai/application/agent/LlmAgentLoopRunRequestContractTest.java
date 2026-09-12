@@ -309,7 +309,7 @@ class LlmAgentLoopRunRequestContractTest {
             QuerySource.USER, "test-model", null, null, null, null, null,
             new LlmAgentLoop.MainLoopDeps(ctx, loop::getModelForCall), ProviderConfig.empty());
         // 编译断言：唯一入口签名必须接受 (loop.QueryParams, AgentState, List<String>)
-        LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
 
         assertThat(result).as("queryLoop 必须返回 LoopResult").isNotNull();
         assertThat(result.finalState()).as("LoopResult 必须带 finalState").isNotNull();

@@ -311,7 +311,7 @@ class BoundaryReaderHistorySnipSingleSourceTest {
             ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
     }
 
     private static List<String> ids(List<ChatMessageDto> messages) {

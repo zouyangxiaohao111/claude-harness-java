@@ -92,12 +92,12 @@ class LlmAgentLoopBlockingLimitTest {
         };
 
         // ── 4. 驱动 loop（[H7-arch Phase 5-2 B1] 收敛签名：queryLoop(loop.QueryParams, state, uuids)）──
-        LoopResult result = LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new java.util.ArrayList<>());
 
         // ── 5. 断言 ──
@@ -152,8 +152,7 @@ class LlmAgentLoopBlockingLimitTest {
             @Override public boolean isMainLoop() { return true; }
         };
 
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams1 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.COMPACT, "test-model", null, null, null, null, null,
@@ -162,7 +161,8 @@ class LlmAgentLoopBlockingLimitTest {
                 //   直接抛 IllegalStateException —— 与 ProductionForkedQuery 同判据）；本用例只验
                 //   blocking-limit 豁免，注入恒 ALLOW 的最小 canUseTool 即可（不进入工具路径）。
                 .withCanUseTool((tool, input, tuc, toolUseId, forceDecision) ->
-                    com.nexusai.application.agent.permission.ToolPermissionGate.DecisionResult.allow()),
+                    com.nexusai.application.agent.permission.ToolPermissionGate.DecisionResult.allow());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state),
             state, new java.util.ArrayList<>());
 
         assertThat(state.exitReason())

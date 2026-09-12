@@ -70,7 +70,7 @@ class LlmAgentLoopAssistantIdSameSourceTest {
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
     }
 
     /** 流式纯文本 provider（plain text → 'stop'，无 tool_use）。 */

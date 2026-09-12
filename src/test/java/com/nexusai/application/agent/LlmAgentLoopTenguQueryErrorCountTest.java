@@ -134,13 +134,13 @@ class LlmAgentLoopTenguQueryErrorCountTest {
             @Override public String resolveModel() { return "test-model"; }
         };
 
-        LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(
+        QueryParams callerParams0 = QueryParams.forLoop(
                 state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         // STREAM_ERROR 退出（不可恢复 400）· 前一回合已提交 tool_use assistant

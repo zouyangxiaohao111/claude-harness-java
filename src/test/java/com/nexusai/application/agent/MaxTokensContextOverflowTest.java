@@ -142,7 +142,7 @@ class MaxTokensContextOverflowTest {
         if (thinkingConfig != null) {
             params = params.withThinkingConfig(thinkingConfig);
         }
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
     }
 
     /** 溢出消息示例 · CC withRetry.ts:569 "input length and `max_tokens` exceed context limit: 188059 + 20000 > 200000"。 */

@@ -234,7 +234,7 @@ class LlmAgentLoopSnipMicroWiringTest {
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null, flags);
 
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), auto);
 
         ArgumentCaptor<Integer> cap = ArgumentCaptor.forClass(Integer.class);
         verify(auto).autoCompactIfNeeded(anyList(), cap.capture(), anyString(), any(), any());
@@ -285,7 +285,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             TestContexts.tokenBudgetBeans(200_000, 130_000));
 
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), auto);
 
         assertThat(state.exitReason())
             .as("B6: blockingLimit=effectiveWindow−3000=127000 ≤ usage=130000 → BLOCKING_LIMIT（旧公式 197000 不拦截）")
@@ -303,7 +303,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             TestContexts.tokenBudgetBeans(200_000, 130_000));
 
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
 
         assertThat(state.exitReason())
             .as("B6 对照: autoCompactor=null 兜底 blockingLimit=rawWindow−3000=197000 > usage=130000 → 不拦截")
@@ -370,7 +370,7 @@ class LlmAgentLoopSnipMicroWiringTest {
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), null, micro);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), null, micro);
 
         verify(micro).microcompactMessages(anyList(), anyString());
         assertThat(histories)
@@ -404,7 +404,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             snipOnFlags(), bridge);
 
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
 
         ArgumentCaptor<Object> cap = ArgumentCaptor.forClass(Object.class);
         verify(publisher, atLeastOnce()).publishEvent(cap.capture());
@@ -470,7 +470,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             FeatureFlags.ALL_DISABLED, bridge);
 
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
 
         verify(publisher, never())
             .publishEvent(Mockito.any(AgentBoundaryMessageEvent.class));
@@ -625,7 +625,7 @@ class LlmAgentLoopSnipMicroWiringTest {
 
     private static LoopResult drive(AgentLoopContext ctx, AgentState state) {
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
-        return LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        return LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
     }
 
     private static QueryParams forLoopParams(AgentLoopContext ctx, QuerySource source, AgentState state) {

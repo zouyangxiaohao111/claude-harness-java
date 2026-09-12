@@ -3451,14 +3451,17 @@ public class LlmAgentLoop implements AgentLoop {
         MainLoopDeps mainDeps = new MainLoopDeps(mainCtx, this::getModelForCall);
         com.nexusai.application.agent.loop.QueryParams queryParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                // [prompt-assembly-A] 2nd arg = QueryParams.systemPrompt（CC SystemPrompt 段数组语义）——
-                //   本仓 vestigial（0 生产读点）：主线程真实提示来源 = AgentState.systemPrompt()（custom，
-                //   由 doRun 从 RunRequest.systemPrompt() 写入）+ loop 内 per-run 材料收集。恒传 List.of()
-                //   ⇒ loop 走材料收集（现状行为）。
+                // [prompt-assembly-B] 2nd arg = QueryParams.systemPrompt：本行仍传 List.of() 占位，
+                //   真实值由**下一行**的 collectRunMaterial 回灌（调用方 = CC QueryEngine.ts:302 位置：
+                //   fetchSystemPromptParts + buildEffectiveSystemPrompt 每 turn 一次）。
+                //   主线程 custom 提示来源 = AgentState.systemPrompt()（由 doRun 从 RunRequest.systemPrompt() 写入）。
                 state.rawMessages(), java.util.List.of(), baseTuc, querySource, modelName,
                 maxTurns, params.taskBudget(), params.fallbackModel(),
                 params.skipCacheWrite(), params.maxOutputTokensOverride(),
                 mainDeps, params.config());
+        // [prompt-assembly-B] 材料收集归位调用方（CC 分层第 1 层）：queryLoop 只消费已折好的
+        //   systemPrompt/userContext/systemContext（query.ts:393-411「Immutable params」）。
+        queryParams = collectRunMaterial(mainCtx, queryParams, state);
         // [bg-wait-hint Layer-1] 本会话有运行中后台任务 → 暂存"勿轮询、等完成通知"提示，static loop 首轮消费一次
         //   （对齐 CC AgentTool 异步告知「agent results will arrive in a subsequent message」）。
         if (agentId == null && backgroundTaskRunner != null && mainCtx != null
@@ -4060,42 +4063,37 @@ public class LlmAgentLoop implements AgentLoop {
      * @return 组装输入（SessionGuidanceSection 依赖 enabledTools + skillToolCommands）
      */
     /**
-     * [RES-②] 构建压缩 fork 的 CacheSafeParams · CC getCacheSharingParams（compact.ts:250-287）。
+     * [RES-②] 构建压缩 fork 的 CacheSafeParams · CC {@code deps.autocompact(messagesForQuery,
+     * toolUseContext, {systemPrompt, userContext, systemContext, ...}, querySource)}（query.ts:653-660）。
      *
-     * <p>源数据与 CC 一一对应：sysPromptCtxProvider/sysPromptAssembler（loop 局部会话级组件）、
-     * {@code state.systemPrompt()}（CC {@code context.options.customSystemPrompt} compact.ts:269）、
-     * {@code params.toolUseContext()}（CC {@code context} compact.ts:285，fork 继承权限）、
-     * {@code state.rawMessages()} 压缩前快照（CC {@code messagesForCompact} compact.ts:104）。
-     * defaultAssemble 经 sysPromptAssembler.assemble + buildSystemPromptAssemblyInput（CC
-     * {@code getSystemPrompt(tools, model, dirs, mcpClients)} compact.ts:259-263）。
+     * <p><b>收参数，不自己 fetch</b>（[prompt-assembly-B]）：三通道
+     * （{@code params.systemPrompt()} pre-append / {@code userContext} / {@code systemContext}）与
+     * {@code params.toolUseContext()} 都是调用方（{@code collectRunMaterial}）已收集好的值，直接装箱 ——
+     * 不再经 {@link com.nexusai.application.agent.compact.fork.CacheSharingParamsBuilder#build}
+     * 重新 fetchSystemPromptParts / 重新组装。
+     * {@code CacheSharingParamsBuilder} 保留给**没有在飞 QueryParams** 的两条手工路径
+     * （{@code CompactCommand} / {@code PartialCompactConversation}），它们确实需要自己组装。
+     *
+     * <p>{@code forkContextMessages} = {@code state.modelView()}（模型面）· CC getCacheSharingParams
+     * 的 forkContextMessages 在调用点取自 messagesForQuery（query.ts:868/1417
+     * {@code forkContextMessages: messagesForQuery}）→ 必须是**投影后**的模型视图，
+     * 否则 fork 缓存前缀会带上 pre-boundary 历史（凭证与主请求不一致 + 泄漏被裁内容）。
      *
      * <p><b>fail-safe</b>：构建失败返回 null → 调用方跳过 fork 缓存共享（缓存优化可选，不阻断压缩）。
      *
-     * @param ctx                  loop 上下文（buildSystemPromptAssemblyInput）
-     * @param params               查询参数（toolUseContext 源）
-     * @param state                会话状态（custom systemPrompt + 压缩前消息）
-     * @param sysPromptCtxProvider 会话级 system/user 上下文提供者
-     * @param sysPromptAssembler   会话级默认 system prompt 组装器
-     * @return CacheSafeParams；构建失败或输入缺失 → null
+     * @param params 查询参数（三通道 + toolUseContext 源 = 调用方已收集值）
+     * @param state  会话状态（压缩前消息 = modelView 源）
+     * @return CacheSafeParams；构建失败 → null
      */
     private static CacheSafeParams buildCompactCacheSafeParams(
-            AgentLoopContext ctx,
             com.nexusai.application.agent.loop.QueryParams params,
-            AgentState state,
-            com.nexusai.application.agent.prompt.SystemPromptContextProvider sysPromptCtxProvider,
-            com.nexusai.application.agent.prompt.SystemPromptAssembler sysPromptAssembler) {
+            AgentState state) {
         try {
-            return CacheSharingParamsBuilder.build(
-                sysPromptCtxProvider,
-                () -> sysPromptAssembler.assemble(
-                    buildSystemPromptAssemblyInput(ctx, params, params.toolUseContext())),
-                state.systemPrompt(),
-                state.appendSystemPrompt(),               // [RES-SP31] 接线：fork 缓存共享 append 恒末尾（CC compact.ts:274）
+            return new CacheSafeParams(
+                params.systemPrompt(),                    // pre-append 形态（E-1a 契约：append 由使用点执行）
+                params.userContext(),
+                params.systemContext(),
                 params.toolUseContext(),
-                // [D10 双视图] 选边 = modelView()（模型面）。CC getCacheSharingParams 的
-                //   forkContextMessages 在调用点取自 messagesForQuery（query.ts:868/1417
-                //   `forkContextMessages: messagesForQuery`）→ 必须是**投影后**的模型视图，
-                //   否则 fork 缓存前缀会带上 pre-boundary 历史（凭证与主请求不一致 + 泄漏被裁内容）。
                 new ArrayList<>(state.modelView()),
                 useGlobalCacheScope(params.config()));    // [RES-R4] fork 与主线程同一 gate 判定（REQ-R4-3）
         } catch (Exception e) {
@@ -4265,19 +4263,23 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [prompt-assembly-A] per-run 系统提示「材料收集」· 对齐 CC 调用方每 turn 一次
+     * [prompt-assembly-B] per-run 系统提示「材料收集」· 由 {@code queryLoop} 的**调用方**调用
      * （{@code fetchSystemPromptParts} utils/queryContext.ts:44-74 → {@code buildEffectiveSystemPrompt}
      * utils/systemPrompt.ts:41-123 → coordinator userContext 合并 QueryEngine.ts:302-306）。
      *
-     * <p><b>禁止把它搬回 do-while 内</b>（CC query.ts:393-411「Immutable params — never reassigned
-     * during the query loop」+ :1991-1999 refreshTools 只刷 tools 不重算 systemPrompt）。
+     * <p><b>调用方</b>（CC 分层第 1 层，每 turn 一次）：{@code LlmAgentLoop.doRun}（主线程）/
+     * {@code SubagentExecutor}（子代理）/ {@code ExecAgentHook}（hook agent）—— 三者在
+     * {@code QueryParams.forLoop(...)} 之后、{@code queryLoop(...)} 之前调用本方法，把回灌三通道的
+     * 副本交给 queryLoop。CC 真源 {@code query.ts:393-411}「Immutable params — never reassigned
+     * during the query loop」—— {@code loop()} 收到**已折好**的提示，自己不重折。
      *
-     * <p><b>已知架构残差（E-1b 修）</b>：按 CC 的形态，材料收集应由 {@code queryLoop} 的**调用方**
-     * 完成（CC 的 {@code fetchSystemPromptParts} 就是调用方调的），{@code queryLoop} 只消费
-     * {@code params.systemPrompt()/userContext()/systemContext()}。本仓当前把它放在 {@code loop()}
-     * 的 do-while 之前（一次/run），于是「每 run 只收集一次」**不是结构性成立的**，只是"只有这一个
-     * 调用点"的偶然事实。E-1b 会把调用点上移到 4 个调用方（主线程/子代理/hook/fork），届时该性质
-     * 结构性成立。⚠️ 因此**本方法不应再加「证明只跑一次」的观测点**——生产代码不承载测试专用埋点。
+     * <p><b>生命周期自管</b>：{@link com.nexusai.application.agent.prompt.SystemPromptContextProvider}
+     * 由本方法创建并在 {@code finally} 中 {@code close()}（构造即注册缓存清理回调，注销成对，
+     * 异常路径同样关），调用方无需持有/关闭。会话级 {@link com.nexusai.application.agent.prompt.GitStatusProvider}
+     * 仍从 {@code ctx.sessionState()} 取（跨 run 共享同一实例 → 会话内 git 快照字节稳定）。
+     *
+     * <p><b>禁止把它搬回 do-while 内</b>（CC query.ts:1991-1999 refreshTools 只刷 tools 不重算
+     * systemPrompt）。⚠️ 本方法**不得**再加「证明只跑一次」的观测点 —— 生产代码不承载测试专用埋点。
      *
      * <p><b>runTuc vs perTurnTuc</b>：本方法派生的 runTuc 只用于读材料收集输入
      * （sessionId / availableTools / additionalWorkingDirectories / mcpClients）；它带来的
@@ -4285,62 +4287,135 @@ public class LlmAgentLoop implements AgentLoop {
      * 唯一语义 owner 仍是 do-while 内每轮的 perTurnTuc 派生（SubagentTool 读 parentTUC 的语义不受影响：
      * 它只在工具执行期读，那时已是 per-round 值）。
      *
-     * @param ctx                   loop 上下文
-     * @param params                入参（尚未回灌 systemPrompt/userContext/systemContext）
-     * @param state                 AgentState（custom/append 提示 + 会话冻结日期源）
-     * @param memoryMechanicsPrompt do-while 外已组装的 memory 机制提示（G-11 插入位）
-     * @param sysPromptCtxProvider  会话级 system/user 上下文提供者
-     * @param sysPromptAssembler    会话级 default 系统提示组装器
+     * @param ctx    loop 上下文（sessionState / claudemdEngine / featureFlags / telemetry 源）
+     * @param params 入参（尚未回灌 systemPrompt/userContext/systemContext）
+     * @param state  AgentState（custom/append 提示 + 会话冻结日期源 + 会话级 section 缓存）
      * @return 回灌三通道后的 QueryParams 副本（systemPrompt = effective 形态的段数组，**未** append
-     *         systemContext —— append 留在 do-while 内做幂等拼接，见 s10）
+     *         systemContext —— append 留在 do-while 内做「使用点一次」拼接，见 s10）
      */
-    private static com.nexusai.application.agent.loop.QueryParams collectRunMaterial(
+    public static com.nexusai.application.agent.loop.QueryParams collectRunMaterial(
             AgentLoopContext ctx,
             com.nexusai.application.agent.loop.QueryParams params,
-            AgentState state,
-            String memoryMechanicsPrompt,
-            com.nexusai.application.agent.prompt.SystemPromptContextProvider sysPromptCtxProvider,
-            com.nexusai.application.agent.prompt.SystemPromptAssembler sysPromptAssembler) {
-        final ToolUseContext prevStampedTuc = state.currentToolUseContext();
-        ToolUseContext runTuc;
+            AgentState state) {
+        // ── [IMP-SP-08] 会话级 system/user context 提供者 + 组装器（M8 重接线）──
+        // CC 组装链 QueryEngine.ts:286-325 → fetchSystemPromptParts（queryContext.ts:44-74，
+        // 三路并行 + custom 短路 I-13）。IMP-SP-05 组件层为会话级实例（CC 进程级 memoize →
+        // Java 会话级），缓存 gitStatus/claudeMd/currentDate（I-10 会话冻结日期来自
+        // AgentState.sessionStartDate）。旧 6-section 单 String 模型整类删除。
+        // [merge worktree-memory-align] UserContextProvider 注入 ClaudemdEngine（memory 对齐
+        //   IMP-M-P2-4 完整 getClaudeMds 链，claudemd.ts:1153-1195）：非 null 时 claudeMd 走完整
+        //   链（context.ts:170-172），null 回退单文件子集；避免重复注入（双 system-reminder）。
+        // [cache-hit-fix B] 会话级 git status 快照（CC context.ts:97 会话开始一次快照、会话内不更新）——
+        //   doRun 已把注册表实例注入 sessionState（同一 sessionId 跨 run 共享），跨 run 复用同一
+        //   GitStatusProvider（getGitStatus 实例级 memoize 只算一次）保 system 尾字节稳定（deepseek
+        //   单前缀缓存）；未注入（非 Spring / 无 sessionId / 无 sessionState）→ 回落每 run new。
+        com.nexusai.application.agent.prompt.GitStatusProvider gp =
+            (ctx.sessionState() != null && ctx.sessionState().gitStatusProvider() != null)
+                ? ctx.sessionState().gitStatusProvider()
+                : new com.nexusai.application.agent.prompt.GitStatusProvider();
+        // [RES-C2] R5-4 注销通道（Java 内部卫生，非 CC 对齐项）：本方法创建的 provider 在 finally
+        //   close() 注销（register/unregister 成对，CACHE_CLEAR_HOOKS 不随会话有界累积）。CC 参考：
+        //   getSystemContext 进程级 memoize（context.ts:116）不销毁 —— close 不改变任何缓存清理语义。
+        final com.nexusai.application.agent.prompt.SystemPromptContextProvider sysPromptCtxProvider =
+            new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
+                state.sessionStartDate(),
+                // [cwd-fix 2026-08-25] 显式传会话绑定 projectRoot（sessionState.workspaceDir，CC 启动冻结）——
+                //   旧构造 new UserContextProvider(claudemdEngine) 依赖 RequestContext.sessionId() 内部查，
+                //   system prompt 构建线程可能无会话 → getOriginalCwdLayer 落 user.dir（nexusai-backend），
+                //   LLM 误报工作目录（会话绑定 DingDing 实测）。workspaceDir 缺失 → 回退 getOriginalCwdLayer。
+                new com.nexusai.application.agent.prompt.UserContextProvider(
+                    (ctx.sessionState() != null && ctx.sessionState().workspaceDir() != null)
+                        ? ctx.sessionState().workspaceDir()
+                        : java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
+                            .getOriginalCwdLayer(state != null ? state.sessionId() : null)),
+                    System::getenv,
+                    ctx.claudemdEngine()),
+                gp);
         try {
-            runTuc = deriveTurnTuc(ctx, params, state, null);
+            // 0. memoryMechanicsPrompt（G-11 插入位）：custom 非空 && hasAutoMemPathOverride() →
+            //    loadMemoryPrompt()（CC QueryEngine.ts:316-319，组装在 while 前一次 · 每 query() 一次）。
+            //    随材料收集同批归位调用方 —— 调用点数量不变（每 run 一次），提示字节不变。
+            String memoryMechanicsPrompt = null;
+            {
+                String customSystemPrompt = state.systemPrompt();
+                if (customSystemPrompt != null) {
+                    // hasAutoMemPathOverride = env CLAUDE_COWORK_MEMORY_PATH_OVERRIDE（CC paths.ts:161-166）；
+                    // 本方法为静态方法 → 直取 defaultInstance（生产 bean 单例即 defaultInstance，per-session
+                    // ThreadLocal projectRoot 语义；override env 是唯一 opt-in 信号，JVM 测试经
+                    // AutoMemPaths.setOverrideEnvForTest 缝注入（同库 MemoryBareModeConfig.setEnvOverride 惯例））
+                    com.nexusai.application.agent.memory.AutoMemPaths amp =
+                        com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance();
+                    if (amp.hasAutoMemPathOverride()) {
+                        com.nexusai.application.agent.telemetry.Telemetry tel =
+                            ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
+                        com.nexusai.application.agent.memory.LoadMemoryPrompt memoryLoader =
+                            new com.nexusai.application.agent.memory.LoadMemoryPrompt(
+                                com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault(
+                                    tel,
+                                    com.nexusai.application.agent.memory.MemoryPromptBuilder::isKairosDeploymentFlagEnabled,
+                                    teamMemoryEnabledSupplier(ctx),
+                                    () -> ctx.featureFlags() != null && ctx.featureFlags().tenguMothCopse(),
+                                    // [IMP-C-5 · OPD-CM5-C-09] herring_clock 接线：disabled 分支 tengu_team_memdir_disabled
+                                    //   子事件门控接 FeatureFlags.tenguHerringClock()（CC memdir.ts:503-505 动态读 GB flag）
+                                    () -> ctx.featureFlags() != null && ctx.featureFlags().tenguHerringClock(),
+                                    // [IMP-C-6 · OPD-CM5-C-10] coral_fern 接线：「Searching past context」段门控接
+                                    //   FeatureFlags.coralFern()（CC getFeatureValue_CACHED_MAY_BE_STALE('tengu_coral_fern', false)，
+                                    //   memdir.ts:376 动态读 GB flag）
+                                    () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()));
+                        memoryMechanicsPrompt = memoryLoader.loadMemoryPrompt();
+                    }
+                }
+            }
+            // 会话级 default 组装器：boundary 门控 = shouldUseGlobalCacheScope()（betas.ts:227-233）·
+            //   DB settings.system_prompt_boundary_enabled 可覆盖（SystemPromptAssembler 内 SP-14）
+            final com.nexusai.application.agent.prompt.SystemPromptAssembler sysPromptAssembler =
+                new com.nexusai.application.agent.prompt.SystemPromptAssembler(
+                    state.systemPromptSectionCache(),
+                    () -> useGlobalCacheScope(params.config()));
+            final ToolUseContext prevStampedTuc = state.currentToolUseContext();
+            ToolUseContext runTuc;
+            try {
+                runTuc = deriveTurnTuc(ctx, params, state, null);
+            } finally {
+                state.setCurrentToolUseContext(prevStampedTuc);
+            }
+            // 1. fetchSystemPromptParts 等价（custom 短路 · queryContext.ts:44-74）
+            com.nexusai.application.agent.prompt.SystemPromptParts sysParts =
+                sysPromptCtxProvider.fetchSystemPromptParts(state.systemPrompt(), () ->
+                    sysPromptAssembler.assemble(buildSystemPromptAssemblyInput(ctx, params, runTuc)));
+            // 2. buildEffectiveSystemPrompt（systemPrompt.ts:41-123）· override/custom/append 三选一
+            //    [SP-01] override 实参 = 会话 loop_mode_override（V57）；[SP-02/03/04] 分支门控同前
+            String loopModeOverride = resolveLoopModeOverride(ctx, runTuc);
+            com.nexusai.application.agent.prompt.SystemPrompt effectiveSystemPrompt =
+                com.nexusai.application.agent.prompt.EffectiveSystemPromptBuilder.build(
+                    () -> com.nexusai.application.agent.prompt.SystemPrompt.from(sysParts.defaultSystemPrompt()),
+                    loopModeOverride,
+                    state.systemPrompt(),                  // customSystemPrompt（替换 default）
+                    memoryMechanicsPrompt,                 // memoryMechanicsPrompt（G-11：custom 与 append 之间）
+                    state.appendSystemPrompt(),            // appendSystemPrompt（OPD-SP-31 接线：恒末尾追加）
+                    buildEffectivePromptOptions(ctx, runTuc));
+            // 3. coordinator userContext 并入（QueryEngine.ts:302-306 · 合并语义不变）
+            java.util.Map<String, String> mergedUserContext =
+                mergeCoordinatorUserContext(ctx, runTuc, sysParts);
+            com.nexusai.application.agent.loop.QueryParams out = params
+                // CC 回灌口径 = **pre-append** 形态（query.ts:648 的 appendSystemContext 产物是另一个
+                //   局部 const fullSystemPrompt，systemPrompt 本身从不重赋 —— 见 query.ts:393-411 注释）。
+                //   故此处存 EffectiveSystemPromptBuilder 的产物（未 append systemContext）。
+                .withSystemPrompt(effectiveSystemPrompt.elements())
+                .withUserContext(mergedUserContext)
+                .withSystemContext(java.util.Map.copyOf(sysParts.systemContext()));
+            if (log.isDebugEnabled()) {
+                log.debug("[prompt-assembly-B] per-run 材料收集完成（调用方一次）: custom={}, "
+                        + "defaultBlocks={}, userKeys={}, systemKeys={}, runTuc={}",
+                    state.systemPrompt() != null, sysParts.defaultSystemPrompt().size(),
+                    sysParts.userContext().keySet(), sysParts.systemContext().keySet(),
+                    runTuc != null ? "非null" : "null");
+            }
+            return out;
         } finally {
-            state.setCurrentToolUseContext(prevStampedTuc);
+            // [RES-C2] R5-4：本方法创建的 provider 生命周期终结（close 幂等）
+            sysPromptCtxProvider.close();
         }
-        // 1. fetchSystemPromptParts 等价（custom 短路 · queryContext.ts:44-74）
-        com.nexusai.application.agent.prompt.SystemPromptParts sysParts =
-            sysPromptCtxProvider.fetchSystemPromptParts(state.systemPrompt(), () ->
-                sysPromptAssembler.assemble(buildSystemPromptAssemblyInput(ctx, params, runTuc)));
-        // 2. buildEffectiveSystemPrompt（systemPrompt.ts:41-123）· override/custom/append 三选一
-        //    [SP-01] override 实参 = 会话 loop_mode_override（V57）；[SP-02/03/04] 分支门控同前
-        String loopModeOverride = resolveLoopModeOverride(ctx, runTuc);
-        com.nexusai.application.agent.prompt.SystemPrompt effectiveSystemPrompt =
-            com.nexusai.application.agent.prompt.EffectiveSystemPromptBuilder.build(
-                () -> com.nexusai.application.agent.prompt.SystemPrompt.from(sysParts.defaultSystemPrompt()),
-                loopModeOverride,
-                state.systemPrompt(),                  // customSystemPrompt（替换 default）
-                memoryMechanicsPrompt,                 // memoryMechanicsPrompt（G-11：custom 与 append 之间）
-                state.appendSystemPrompt(),            // appendSystemPrompt（OPD-SP-31 接线：恒末尾追加）
-                buildEffectivePromptOptions(ctx, runTuc));
-        // 3. coordinator userContext 并入（QueryEngine.ts:302-306 · 合并语义不变）
-        java.util.Map<String, String> mergedUserContext =
-            mergeCoordinatorUserContext(ctx, runTuc, sysParts);
-        com.nexusai.application.agent.loop.QueryParams out = params
-            // CC 回灌口径 = **pre-append** 形态（query.ts:648 的 appendSystemContext 产物是另一个
-            //   局部 const fullSystemPrompt，systemPrompt 本身从不重赋 —— 见 query.ts:393-411 注释）。
-            //   故此处存 EffectiveSystemPromptBuilder 的产物（未 append systemContext）。
-            .withSystemPrompt(effectiveSystemPrompt.elements())
-            .withUserContext(mergedUserContext)
-            .withSystemContext(java.util.Map.copyOf(sysParts.systemContext()));
-        if (log.isDebugEnabled()) {
-            log.debug("[prompt-assembly-A] per-run 材料收集完成（do-while 外一次）: custom={}, "
-                    + "defaultBlocks={}, userKeys={}, systemKeys={}, runTuc={}",
-                state.systemPrompt() != null, sysParts.defaultSystemPrompt().size(),
-                sysParts.userContext().keySet(), sysParts.systemContext().keySet(),
-                runTuc != null ? "非null" : "null");
-        }
-        return out;
     }
 
     /**
@@ -4913,54 +4988,19 @@ public class LlmAgentLoop implements AgentLoop {
                 ? params.toolUseContext().queryTracking()
                 : null;
 
-        // ── [IMP-SP-08] 会话级 system/user context 提供者 + 组装器（M8 重接线）──
-        // CC 组装链 QueryEngine.ts:286-325 → fetchSystemPromptParts（queryContext.ts:44-74，
-        // 三路并行 + custom 短路 I-13）。IMP-SP-05 组件层为会话级实例（CC 进程级 memoize →
-        // Java 会话级），随本 loop 生命周期缓存 gitStatus/claudeMd/currentDate（I-10 会话冻结
-        // 日期来自 AgentState.sessionStartDate）。旧 6-section 单 String 模型整类删除。
-        // [merge worktree-memory-align] UserContextProvider 注入 ClaudemdEngine（memory 对齐
-        //   IMP-M-P2-4 完整 getClaudeMds 链，claudemd.ts:1153-1195）：非 null 时 claudeMd 走完整
-        //   链（context.ts:170-172），null 回退单文件子集；避免 loop 级重复注入（双 system-reminder）。
-        // [cache-hit-fix B] 会话级 git status 快照（CC context.ts:97 会话开始一次快照、会话内不更新）——
-        //   doRun 已把注册表实例注入 sessionState（同一 sessionId 跨 run 共享），跨 run 复用同一
-        //   GitStatusProvider（getGitStatus 实例级 memoize 只算一次）保 system 尾字节稳定（deepseek
-        //   单前缀缓存）；未注入（非 Spring / 无 sessionId / 无 sessionState）→ 回落每 run new。
-        com.nexusai.application.agent.prompt.GitStatusProvider gp =
-            (ctx.sessionState() != null && ctx.sessionState().gitStatusProvider() != null)
-                ? ctx.sessionState().gitStatusProvider()
-                : new com.nexusai.application.agent.prompt.GitStatusProvider();
-        final com.nexusai.application.agent.prompt.SystemPromptContextProvider sysPromptCtxProvider =
-            new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
-                state.sessionStartDate(),
-                // [cwd-fix 2026-08-25] 显式传会话绑定 projectRoot（sessionState.workspaceDir，CC 启动冻结）——
-                //   旧构造 new UserContextProvider(claudemdEngine) 依赖 RequestContext.sessionId() 内部查，
-                //   system prompt 构建线程可能无会话 → getOriginalCwdLayer 落 user.dir（nexusai-backend），
-                //   LLM 误报工作目录（会话绑定 DingDing 实测）。workspaceDir 缺失 → 回退 getOriginalCwdLayer。
-                new com.nexusai.application.agent.prompt.UserContextProvider(
-                    (ctx.sessionState() != null && ctx.sessionState().workspaceDir() != null)
-                        ? ctx.sessionState().workspaceDir()
-                        : java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
-                            .getOriginalCwdLayer(state != null ? state.sessionId() : null)),
-                    System::getenv,
-                    ctx.claudemdEngine()),
-                gp);
-        // [RES-C2] R5-4 注销通道（Java 内部卫生，非 CC 对齐项）：本 loop 会话生命周期结束（正常
-        //   return / 重入点 3763 return loop(...) / 异常出口）时 finally close() 注销缓存清理回调
-        //   （register/unregister 成对，CACHE_CLEAR_HOOKS 不再随会话有界累积）。CC 参考：
-        //   getSystemContext 进程级 memoize（context.ts:116）不销毁 —— close 不改变任何缓存清理
-        //   语义。重入点先跑内层 loop（各自 new 自身 provider）再跑外层 finally，两层各自 close，
-        //   表不累积。try/finally 包裹本方法余下全部主体（最小 diff，主体缩进不重排）。
+        // ── [prompt-assembly-B] 系统提示「材料收集」已上移到调用方（CC 分层第 1 层）──
+        // 三个生产调用方（LlmAgentLoop.doRun / SubagentExecutor / ExecAgentHook）在
+        // QueryParams.forLoop(...) 之后、queryLoop(...) 之前各调一次
+        // {@link #collectRunMaterial(AgentLoopContext, com.nexusai.application.agent.loop.QueryParams, AgentState)}，
+        // 把已回灌 systemPrompt/userContext/systemContext 的副本交给本 loop。
+        // CC 真源：query.ts:393-411「Immutable params — never reassigned during the query loop」
+        // —— 本方法收到**已折好**的提示，自己不重折（fetchSystemPromptParts 由调用方调，
+        // utils/queryContext.ts:44 + QueryEngine.ts:302）。存量守卫「params.systemPrompt 非空 ⇒ 跳过
+        // 材料收集」随之上移为**唯一形态**：调用方传什么，本方法就发什么（loop 不覆盖）。
         // [MEM-03] pendingMemoryPrefetch 声明于 try 外 —— finally（dispose + 遥测）需在
         //   正常/异常全部退出路径访问（CC `using` 绑定语义）
         com.nexusai.application.agent.memory.MemoryPrefetcher.MemoryPrefetch pendingMemoryPrefetch = null;
         try {
-        // boundary gate · 对齐 CC shouldUseGlobalCacheScope()（utils/betas.ts:227-233 =
-        //   firstParty && !CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS）。Java 默认 3P → boundary
-        //   不插入（OPD-SP-27）；firstParty 判定见 useGlobalCacheScope(params.config())。
-        final com.nexusai.application.agent.prompt.SystemPromptAssembler sysPromptAssembler =
-            new com.nexusai.application.agent.prompt.SystemPromptAssembler(
-                state.systemPromptSectionCache(),
-                () -> useGlobalCacheScope(params.config()));
         // 单 side-query（DEL-M-35：消除旧每轮双发 memoryFuture + findRelevantFuture）；消费点
         // 读 settledAt 零等待（CC attachments.ts:2337-2339），下轮迭代重试。
         // [MEM-08/G-27] tengu_moth_copse 门控经 FeatureFlags（ToolRegistrationConfig 装配
@@ -4979,91 +5019,6 @@ public class LlmAgentLoop implements AgentLoop {
                 log.debug("[LlmAgentLoop] turn={} relevant-memories prefetch 启动失败（跳过预取）: {}",
                     state.turnCount(), e.getMessage());
             }
-        }
-
-        // [IMP-MV2-11] memoryMechanicsPrompt 提前到 do-while 外计算一次（对齐 CC QueryEngine.ts:316-319
-        //   组装在 while 前一次 · 每 query() 一次）：custom 非空 && hasAutoMemPathOverride() →
-        //   loadMemoryPrompt()。旧实现 do-while 内每迭代重算 → 重复 ensureMemoryDirExists（幂等
-        //   IO）+ tengu_memdir_loaded 遥测每迭代重复发射（遥测计数失真）。AgentState.systemPrompt
-        //   为 final（per-run 不变，CC customSystemPrompt 为 query() 参数同义）→ 循环内复用同一值
-        //   语义等价。注：stop_hook_blocking 递归重入 loop() 会重新执行本组装（CC 同 query() 内
-        //   continue 不重算）——三条件叠加（stop-hook blocking + custom + override）极窄，按
-        //   OPD-MM-34「do-while 外一次」裁定执行，重入重算登记为已知残余。
-        String memoryMechanicsPrompt = null;
-        {
-            String customSystemPrompt = state.systemPrompt();
-            if (customSystemPrompt != null) {
-                // hasAutoMemPathOverride = env CLAUDE_COWORK_MEMORY_PATH_OVERRIDE（CC paths.ts:161-166）；
-                // loop 为静态方法 → 直取 defaultInstance（生产 bean 单例即 defaultInstance，per-session
-                // ThreadLocal projectRoot 语义；override env 是唯一 opt-in 信号，JVM 测试经
-                // AutoMemPaths.setOverrideEnvForTest 缝注入（同库 MemoryBareModeConfig.setEnvOverride 惯例））
-                com.nexusai.application.agent.memory.AutoMemPaths amp =
-                    com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance();
-                if (amp.hasAutoMemPathOverride()) {
-                    com.nexusai.application.agent.telemetry.Telemetry tel =
-                        ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
-                    com.nexusai.application.agent.memory.LoadMemoryPrompt memoryLoader =
-                        new com.nexusai.application.agent.memory.LoadMemoryPrompt(
-                            com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault(
-                                tel,
-                                com.nexusai.application.agent.memory.MemoryPromptBuilder::isKairosDeploymentFlagEnabled,
-                                teamMemoryEnabledSupplier(ctx),
-                                () -> ctx.featureFlags() != null && ctx.featureFlags().tenguMothCopse(),
-                                // [IMP-C-5 · OPD-CM5-C-09] herring_clock 接线：disabled 分支 tengu_team_memdir_disabled
-                                //   子事件门控接 FeatureFlags.tenguHerringClock()（CC memdir.ts:503-505 动态读 GB flag）
-                                () -> ctx.featureFlags() != null && ctx.featureFlags().tenguHerringClock(),
-                                // [IMP-C-6 · OPD-CM5-C-10] coral_fern 接线：「Searching past context」段门控接
-                                //   FeatureFlags.coralFern()（CC getFeatureValue_CACHED_MAY_BE_STALE('tengu_coral_fern', false)，
-                                //   memdir.ts:376 动态读 GB flag）
-                                () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()));
-                    memoryMechanicsPrompt = memoryLoader.loadMemoryPrompt();
-                }
-            }
-        }
-
-        // ══════════════════════════════════════════════════════════════════════════════
-        // [prompt-assembly-A] per-run 系统提示「材料收集」—— 从 do-while（per-tool-round）
-        //   搬到 do-while 之前（per-run = per user turn），对齐 CC 分层。
-        //
-        // CC 真源分层（三层，本块 = 第 1 层）：
-        //   (1) **每 turn（调用方）**：{@code fetchSystemPromptParts}（utils/queryContext.ts:44）
-        //       + {@code buildEffectiveSystemPrompt}（utils/systemPrompt.ts:41-123）—— 由调用方在
-        //       每 turn 算一次（QueryEngine.ts:302）。
-        //   (2) **每 tool 轮（queryLoop 内）**：{@code appendSystemContext}（query.ts:648，输入不可变
-        //       ⇒ 幂等）+ {@code prependUserContext}（query.ts:900）。
-        //   (3) **每次 API 调用（API 层）**：{@code buildSystemPromptBlocks}（services/api/claude.ts:3213-3237）。
-        //   query.ts:393-411 注释「Immutable params — never reassigned during the query loop」+
-        //   :1991-1999 refreshTools() 只刷 tools 不重算 systemPrompt（提示里工具清单接受 stale）
-        //   —— 是「本块必须写在循环外」的直接依据。
-        //
-        // Java 落点：本块紧跟 memoryMechanicsPrompt 组装块（同款「do-while 外一次」先例
-        //   IMP-MV2-11），处于外层 {@code try}（:4833，finally 关 sysPromptCtxProvider）内、
-        //   包 do-while 的嵌套 {@code try}（:4912）之外 —— 组装异常仍走 finally 的 close()。
-        //
-        // 回灌：结果经 {@link com.nexusai.application.agent.loop.QueryParams#withSystemPrompt} /
-        //   {@code withUserContext} / {@code withSystemContext} 写入本地 final 副本 {@code runParams}
-        //   （**不是**循环内重赋 {@code params}：Java 的 effectively-final 约束不允许——{@code params}
-        //   被循环内多处 lambda 捕获）。语义与 CC「params 不可变 + 调用方每 turn 传新值」等价。
-        //
-        // ⚠️ 守卫（fork 收敛预留通道）：{@code params.systemPrompt()} 非空 ⇒ 调用方已组装好系统提示
-        //   （CC {@code query({systemPrompt})} 语义）→ **跳过**本块全部材料收集，runParams = params。
-        //   本仓三条生产调用方恒传 {@code List.of()}（vestigial 参数）→ 生产恒走收集分支。
-        //
-        // ⚠️ runTuc（per-run TUC）vs perTurnTuc（per-round TUC）：runTuc 仅供本块读
-        //   sessionId / availableTools / additionalWorkingDirectories / mcpClients 等**材料收集输入**；
-        //   工具执行、权限门、streaming executor 一律仍用 per-round 的 perTurnTuc（:5550 每轮重新
-        //   派生 + stamp），故工具面语义零变化。queryTracking 传 null（工具面链 ID 语义不适用于
-        //   材料收集；toolExecContext 已确证 null-safe）。
-        // ══════════════════════════════════════════════════════════════════════════════
-        final com.nexusai.application.agent.loop.QueryParams runParams;
-        if (params.systemPrompt() != null && !params.systemPrompt().isEmpty()) {
-            runParams = params;
-            log.info("[prompt-assembly-A] params.systemPrompt 非空（{} 段）→ 调用方已组装，"
-                    + "跳过 per-run 材料收集（fork 收敛通道）· CC query.ts:182",
-                params.systemPrompt().size());
-        } else {
-            runParams = collectRunMaterial(ctx, params, state, memoryMechanicsPrompt,
-                sysPromptCtxProvider, sysPromptAssembler);
         }
 
         // [ER-IMP-03] try 包裹 do-while：Path3 重试耗尽抛出的 CannotRetryException 在本边界捕获，
@@ -5538,15 +5493,15 @@ public class LlmAgentLoop implements AgentLoop {
             // 自动压缩保护属缺口（探查 S-8）；递归死锁防护由 AutoCompactor canonical 守卫
             // 承担（IMP2-01 归一，SubagentAutoCompactGateCcTest.compactQuerySource_neverCompacts 固化）。
             if (autoCompactor != null) {
-                // [RES-②] fork 缓存共享参数生产（CC getCacheSharingParams compact.ts:250-287）：
-                // 压缩前用 loop 局部 sysPromptCtxProvider/sysPromptAssembler/state.systemPrompt()/
-                // params.toolUseContext()/state.rawMessages()（压缩前快照）构建 CacheSafeParams →
+                // [RES-②/prompt-assembly-B] fork 缓存共享参数生产（CC query.ts:653-660
+                // deps.autocompact(..., {systemPrompt, userContext, systemContext, ...})）：
+                // 压缩**收参数** —— 直接用调用方已收集的 params 三通道 +
+                // params.toolUseContext() + state.modelView()（压缩前快照）装箱 CacheSafeParams →
                 // CacheSafeParamsHolder.save（forkedAgent.ts:70-74 saveCacheSafeParams 等价）。
                 // autoCompactIfNeeded 同步调用 compactCallback.summarize → StreamCompactSummary 经
                 // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
                 // 泄漏到下一 turn。构建失败返回 null → 跳过 fork 缓存共享（不阻断压缩）。
-                CacheSafeParams compactCacheSafeParams = buildCompactCacheSafeParams(
-                    ctx, params, state, sysPromptCtxProvider, sysPromptAssembler);
+                CacheSafeParams compactCacheSafeParams = buildCompactCacheSafeParams(params, state);
                 CacheSafeParamsHolder.save(compactCacheSafeParams);
                 try {
                     // 结转测量源（DRIFT-12）= finalContextTokensFromLastResponse（tokens.ts:79 / Tokens.java:134），
@@ -5958,11 +5913,12 @@ public class LlmAgentLoop implements AgentLoop {
             messagesForLlm = AgentLoopContext.maybeInjectPlanModeAttachments(ctx, state, perTurnTuc, messagesForLlm);
 
             // ── s10: System Prompt 每 tool 轮段（对齐 CC query.ts:648 appendSystemContext + :900 prependUserContext）──
-            // [prompt-assembly-A 搬运] 组装链的**材料收集**半段（fetchSystemPromptParts /
-            //   buildEffectiveSystemPrompt / coordinator userContext 合并）已搬到 do-while 之前
-            //   （per-run = per user turn，对齐 CC 调用方 QueryEngine.ts:302 + queryContext.ts:44，
-            //   见本方法 do-while 前「per-run 系统提示材料收集」块）。本段只保留 CC 也写在
-            //   while(true) 内的两步 —— 它们的输入（runParams）已不可变 ⇒ **幂等**：
+            // [prompt-assembly-B 搬运] 组装链的**材料收集**半段（fetchSystemPromptParts /
+            //   buildEffectiveSystemPrompt / coordinator userContext 合并 / memoryMechanicsPrompt）
+            //   已上移到**调用方**（LlmAgentLoop.doRun / SubagentExecutor / ExecAgentHook，各一次/run，
+            //   对齐 CC 调用方 QueryEngine.ts:302 + queryContext.ts:44）。本段只保留 CC 也写在
+            //   while(true) 内的两步 —— 它们的输入（params 的 systemPrompt/systemContext/userContext
+            //   = 调用方回灌值）在本方法内不可变 ⇒ **幂等**：
             //   (a) appendSystemContext（api.ts:437-447）· CC query.ts:648
             //       {@code const fullSystemPrompt = asSystemPrompt(appendSystemContext(systemPrompt, systemContext))}
             //   (b) prependUserContext（api.ts:449-474）· CC query.ts:900 发请求那一刻贴一次
@@ -5970,18 +5926,17 @@ public class LlmAgentLoop implements AgentLoop {
             //   已下移到 :6116 ModelRequest 构造前（见该处 [prompt-assembly-A] 块）。
             //   [IMP-SP-08] 旧 6-section 单 String 模型整类删除；custom 非空时 default 完全不出现在
             //   结果（CC systemPrompt.ts:118-119 + queryContext.ts:62-63 短路）。
-            //   [IMP-MV2-11] memoryMechanicsPrompt 已在 do-while 外组装一次（同上，先例）。
             // 3. appendSystemContext（api.ts:437-447）· systemContext（gitStatus?/cacheBreaker?）并入 systemPrompt
             //    SystemPrompt.from = CC asSystemPrompt 等价（identity 品牌化，零拷贝/零归一化，
-            //    见 SystemPrompt#from）⇒ runParams 的 List<String> 往返无损。
+            //    见 SystemPrompt#from）⇒ params 的 List<String> 往返无损。
             // [E-1a 单一来源] 调用点 = appendSystemContext 的**使用点**（static 纯函数，唯一实现）：
-            //   runParams.systemPrompt() 恒为 **pre-append** 形态（AssembledSystemPrompt，尚未并入
+            //   params.systemPrompt() 恒为 **pre-append** 形态（AssembledSystemPrompt，尚未并入
             //   systemContext），每 tool 轮在此并入一次（本方法**非幂等** —— 对 post-append 值再
             //   并一次会多出末尾元素，破坏 prompt cache 前缀，见 SystemPromptContextProvider 契约）。
             java.util.List<String> fullSystemPrompt =
                 com.nexusai.application.agent.prompt.SystemPromptContextProvider.appendSystemContext(
-                    com.nexusai.application.agent.prompt.SystemPrompt.from(runParams.systemPrompt()),
-                    runParams.systemContext());
+                    com.nexusai.application.agent.prompt.SystemPrompt.from(params.systemPrompt()),
+                    params.systemContext());
             // [skill-listing-cc-align 2026-09-10] 旧 4.4 skill_listing 头部块已删：skill_listing 现为
             //   state.rawMessages() 中的真实消息（紧随当前用户消息之后，见 injectSkillListingForRun），
             //   经 messagesForQuery 自然进入请求，无需 prepend 到队首。
@@ -5991,13 +5946,13 @@ public class LlmAgentLoop implements AgentLoop {
             //    键，对齐 CC QueryEngine.ts:302-306；coordinatorMode.ts:80-108）—— 合并语义不变。
             //    ⚠️ 本行**不得**搬出循环：CC query.ts:900 每个 tool 轮都贴一次
             //    （搬出 ⇒ meta user 消息只贴一次，后续轮丢失 CLAUDE.md 上下文 / 顺序错位）。
-            messagesForLlm = AgentLoopContext.prependUserContext(messagesForLlm, runParams.userContext());
+            messagesForLlm = AgentLoopContext.prependUserContext(messagesForLlm, params.userContext());
             if (log.isDebugEnabled()) {
-                log.debug("LlmAgentLoop s10: 每 tool 轮 system prompt 段完成（per-run 材料收集已在 do-while 外）: "
+                log.debug("LlmAgentLoop s10: 每 tool 轮 system prompt 段完成（材料收集由调用方一次）: "
                         + "custom={}, promptSegments={}, userKeys={}, systemKeys={}",
-                    state.systemPrompt() != null, runParams.systemPrompt() != null
-                        ? runParams.systemPrompt().size() : 0,
-                    runParams.userContext().keySet(), runParams.systemContext().keySet());
+                    state.systemPrompt() != null, params.systemPrompt() != null
+                        ? params.systemPrompt().size() : 0,
+                    params.userContext().keySet(), params.systemContext().keySet());
             }
 
             // s11.x: 使用恢复状态中的有效模型（fallback 切换后自动生效）
@@ -6282,13 +6237,14 @@ public class LlmAgentLoop implements AgentLoop {
             //   cacheScope 标注），且此时用 **live tools** 判 MCP（claude.ts:1212-1214
             //   {@code useGlobalCacheFeature && filteredTools.some(t => t.isMcp === true && !willDefer(t))}）。
             //   Java 等价：第三参 {@code hasMcpToolInRequest(perTurnTuc)} 保持用**每轮**派生的
-            //   perTurnTuc（MCP 池刷新后当轮可见）—— 与 compute 用的 runParams 无关，故此处不降级为 run 级。
+            //   perTurnTuc（MCP 池刷新后当轮可见）—— 与 split 用的 gate 源（params.config()）无关，
+            //   故此处不降级为 run 级。
             //   [IMP-SP2-07 G1] gate 假 + MCP 工具存在 + firstParty → 静态段 GLOBAL 缓存前缀含 per-user
             //   MCP 段，与 CC 语义偏离（缓存不生效）；Java 无 tool-search → willDefer 恒 false
             //   （等价论证见 hasMcpToolInRequest）。
             List<com.nexusai.application.agent.prompt.SystemPromptBlock> systemPromptBlocks =
                 com.nexusai.application.agent.prompt.SystemPromptSplitter.splitSysPromptPrefix(
-                    fullSystemPrompt, useGlobalCacheScope(runParams.config()),
+                    fullSystemPrompt, useGlobalCacheScope(params.config()),
                     hasMcpToolInRequest(perTurnTuc));
             com.nexusai.application.agent.loop.ModelRequest request = new com.nexusai.application.agent.loop.ModelRequest(
                 params.config(),
@@ -7188,15 +7144,14 @@ public class LlmAgentLoop implements AgentLoop {
                         if (reactiveCcCtx.getSummaryProducer() == null) {
                             reactiveCcCtx.setSummaryProducer(ctx.reactiveCompactor().summaryProducer());
                         }
-                        // [S4-L5] fork 缓存共享参数生产（CC getCacheSharingParams compact.ts:250-287）：
-                        // reactive 路径与 auto 路径（:3590-3592）同构——用 loop 局部 sysPromptCtxProvider/
-                        // sysPromptAssembler/state.systemPrompt()/params.toolUseContext()/state.rawMessages()（压缩前
-                        // 快照）构建 CacheSafeParams → CacheSafeParamsHolder.save（forkedAgent.ts:70-74
+                        // [S4-L5/prompt-assembly-B] fork 缓存共享参数生产（CC query.ts:653-660）：
+                        // reactive 路径与 auto 路径同构——压缩**收参数**，直接用调用方已收集的
+                        // params 三通道 + params.toolUseContext() + state.modelView()（压缩前快照）
+                        // 装箱 CacheSafeParams → CacheSafeParamsHolder.save（forkedAgent.ts:70-74
                         // saveCacheSafeParams 等价）。tryReactiveCompact 经 compactCallback.summarize →
                         // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
                         // 泄漏到下一 turn。构建失败返回 null → 仍传 null（缓存优化可选，不阻断压缩）。
-                        CacheSafeParams reactiveCacheSafeParams = buildCompactCacheSafeParams(
-                            ctx, params, state, sysPromptCtxProvider, sysPromptAssembler);
+                        CacheSafeParams reactiveCacheSafeParams = buildCompactCacheSafeParams(params, state);
                         CacheSafeParamsHolder.save(reactiveCacheSafeParams);
                         try {
                         ReactiveCompactResult compacted =
@@ -7438,7 +7393,7 @@ public class LlmAgentLoop implements AgentLoop {
                         new com.nexusai.application.agent.hook.PostSamplingContext(
                             postSamplingMessages(psBase, msg, turnAssistantId),
                             // [IMP-HOOKS-S7 D3 + E-1a pre-append] systemPrompt 传组装段数组的
-                            //   **pre-append** 形态（= runParams.systemPrompt()，含 boundary 段），
+                            //   **pre-append** 形态（= params.systemPrompt()，含 boundary 段），
                             //   对齐 CC query.ts:1288-1290 executePostSamplingHooks 传 systemPrompt
                             //   （CC 的 REPLHookContext.systemPrompt 即 query() 不可变 params 的值，
                             //   **未经** appendSystemContext）。
@@ -7449,16 +7404,15 @@ public class LlmAgentLoop implements AgentLoop {
                             //   消费点：SessionMemoryService.sessionSystemPrompt →
                             //   CacheSafeParams.systemPrompt（pre-append + systemContext map）；
                             //   ApiQueryHookHelper（hook 查询）在自身使用点补 append。
-                            runParams.systemPrompt(),
-                            // [prompt-assembly-A] 空桩修复：userContext/systemContext 旧为
-                            //   QueryParams.forLoop 硬编码 Map.of()（恒空 → hook 一直拿空上下文）。
-                            //   改读 runParams（per-run 材料收集的真实产物）：
+                            params.systemPrompt(),
+                            // [prompt-assembly-B] 材料收集三通道来源 = 调用方回灌值（不再读 loop 局部
+                            //   旧 loop 局部副本 —— 已随收集上移调用方而删除）：
                             //   userContext = getUserContext 产物 ∪ coordinator 合并（CC
                             //   QueryEngine.ts:302-306 / query.ts:183），键含 claudeMd?/currentDate；
                             //   systemContext = getSystemContext 产物（query.ts:184），键含
                             //   gitStatus?/cacheBreaker?（custom 非空时按 queryContext.ts:71 I-13 短路为空）。
-                            runParams.userContext(),
-                            runParams.systemContext(),
+                            params.userContext(),
+                            params.systemContext(),
                             hookTuc,
                             params.querySource());
                 com.nexusai.application.agent.hook.PostSamplingHookRegistry.executeAll(
@@ -8011,7 +7965,7 @@ public class LlmAgentLoop implements AgentLoop {
                                 java.nio.file.Path.of(
                                     com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot()));
                     // [IMP-MV2-09 T9 + E-1a pre-append] fork 原料捕获：当轮主线程 systemPrompt 的
-                    //   **pre-append** 形态（= runParams.systemPrompt()，组装段数组含 boundary 段）/
+                    //   **pre-append** 形态（= params.systemPrompt()，组装段数组含 boundary 段）/
                     //   userContext / systemContext / 消息快照 —— 对齐 CC createCacheSafeParams(context)
                     //   （forkedAgent.ts:131-141，CC 的 systemPrompt 即 query() 不可变 params 的值，
                     //   **未经** appendSystemContext；append 由 fork 自身 query() 重跑：
@@ -8020,12 +7974,11 @@ public class LlmAgentLoop implements AgentLoop {
                     //   fork 无主系统提示 + prompt-cache key 与主线程不一致（cache 共享失效）。
                     //   经 StopHookPipeline 透传（D5-A workspaceDir 同款按会话捕获传参，防异步
                     //   runAsync 跨会话交错）。
-                    // [prompt-assembly-A] userContext/systemContext 改读 runParams（per-run 材料收集产物，
-                    //   do-while 前组装）——旧读点 sysParts 已随材料收集搬出 do-while 而不复存在；
-                    //   取值语义不变（非 coordinator 时 runParams.userContext() === sysParts.userContext()，
+                    // [prompt-assembly-B] 三段 = 调用方回灌值（旧 loop 局部读点已随材料收集上移
+                    //   调用方而删除）；取值语义不变（非 coordinator 时 userContext === 收集产物，
                     //   systemContext 逐键相同），且 coordinator 门真时与 CC QueryEngine.ts:302-306 的
                     //   合并后 userContext 一致。
-                    //   [E-1a 变更] systemPrompt 传 **pre-append** 的 runParams.systemPrompt()
+                    //   [E-1a 变更] systemPrompt 传 **pre-append** 的 params.systemPrompt()
                     //   （= CC 语义）：append 已移到使用点 —— fork 发送边界
                     //   {@code ProductionForkedQuery} 在 splitSysPromptPrefix 前恰并入一次
                     //   （systemContext 独立随第 3 参透传）。旧实现传 post-append 的 fullSystemPrompt
@@ -8033,12 +7986,12 @@ public class LlmAgentLoop implements AgentLoop {
                     //   同款先例：CacheSharingParamsBuilder（同批改为 pre-append）。
                     com.nexusai.application.agent.compact.fork.ForkRawMaterial forkRawMaterial =
                         new com.nexusai.application.agent.compact.fork.ForkRawMaterial(
-                            runParams.systemPrompt() != null
-                                ? List.copyOf(runParams.systemPrompt()) : List.of(),
-                            runParams.userContext() != null
-                                ? Map.copyOf(runParams.userContext()) : Map.of(),
-                            runParams.systemContext() != null
-                                ? Map.copyOf(runParams.systemContext()) : Map.of(),
+                            params.systemPrompt() != null
+                                ? List.copyOf(params.systemPrompt()) : List.of(),
+                            params.userContext() != null
+                                ? Map.copyOf(params.userContext()) : Map.of(),
+                            params.systemContext() != null
+                                ? Map.copyOf(params.systemContext()) : Map.of(),
                             // [D10 双视图] 选边 = modelView()（模型面 · fork 原料）。
                             //   CC forkedAgent.ts:131-141 createCacheSafeParams 的 messages 源 =
                             //   query.ts:868/1417 的 messagesForQuery（投影后）；取全量会让
@@ -8788,9 +8741,9 @@ public class LlmAgentLoop implements AgentLoop {
         }
         return state;
         } finally {
-            // [RES-C2] R5-4：会话级 sysPromptCtxProvider 生命周期终结（close 幂等，
-            //   register/unregister 成对，CACHE_CLEAR_HOOKS 不再随会话有界累积）
-            sysPromptCtxProvider.close();
+            // [RES-C2 搬运] 会话级 SystemPromptContextProvider 生命周期已随材料收集上移到调用方
+            //   （collectRunMaterial 内 try/finally close，close 幂等，register/unregister 成对）——
+            //   本 loop 不再持有该组件。
             // [MEM-03/G-20] 预取 dispose 等价（CC [Symbol.dispose] attachments.ts:2410-2418，
             //   query.ts `using` 绑定 → 全部退出路径触发）：abort 子控制器 + 发射
             //   tengu_memdir_prefetch_collected 遥测（hidden_by_first_iteration /
@@ -8809,7 +8762,7 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
             // [FIX-B3 unregister 生产接线] 成对注销 sentSkillNames / suppressNextSkillListing 静态注册表引用，
-            //   对齐 sysPromptCtxProvider close 的 register/unregister 成对先例。AgentLoopContextFactory.build()
+            //   对齐 SystemPromptContextProvider close 的 register/unregister 成对先例。AgentLoopContextFactory.build()
             //   在每次构造会话（主循环 forSession / subagent·hook shared()）时把 per-run 引用注册进
             //   SkillChangeDetector 静态注册表（IdentityHashMap 身份去重），此前生产零 unregister → 强引用
             //   泄漏（每会话 1 Map + 1 AtomicBoolean 永久不被移除）。loop() 是三条路径（主/子/hook 均经

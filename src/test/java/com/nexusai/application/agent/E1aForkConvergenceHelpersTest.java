@@ -141,7 +141,7 @@ class E1aForkConvergenceHelpersTest {
                 forkSource, "test-model", null, null, null, null, null,
                 minimalDeps(), null);
 
-            assertThatThrownBy(() -> LlmAgentLoop.queryLoop(params, state, new ArrayList<>()))
+            assertThatThrownBy(() -> LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>()))
                 .as("fork 来源 %s 漏注入 canUseTool 必须 fail loud（INV-6 · 对齐 ProductionForkedQuery 同判据）",
                     forkSource)
                 .isInstanceOf(IllegalStateException.class)

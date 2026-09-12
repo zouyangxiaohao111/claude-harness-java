@@ -151,7 +151,7 @@ class PtlRecoveryIntegrationTest {
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", maxTurns, null, null, null, null,
             deps, ProviderConfig.empty());
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
     }
 
     // ─────────────────────── 用例 ───────────────────────

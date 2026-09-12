@@ -225,14 +225,16 @@ class LlmAgentLoopTeammateHookIsMetaTest {
             @Override public String resolveModel() { return "test-model"; }
         };
 
-        assertThatCode(() -> LlmAgentLoop.queryLoop(
+        // [prompt-assembly-B] 测试即调用方：按生产契约先 collectRunMaterial 回灌三通道，再交 queryLoop。
+        com.nexusai.application.agent.loop.QueryParams rawParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
                 tucWithNotification(null).withAvailableTools(List.of(
                     TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
-            state, new ArrayList<>()))
+                deps, ProviderConfig.empty());
+        com.nexusai.application.agent.loop.QueryParams callerParams = LlmAgentLoop.collectRunMaterial(rawParams.deps().context(), rawParams, state);
+        assertThatCode(() -> LlmAgentLoop.queryLoop(callerParams, state, new ArrayList<>()))
             .as("teammate 收尾段 hook 回注链路不应抛穿 queryLoop")
             .doesNotThrowAnyException();
 

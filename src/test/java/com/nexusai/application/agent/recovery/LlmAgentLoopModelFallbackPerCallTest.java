@@ -169,7 +169,7 @@ class LlmAgentLoopModelFallbackPerCallTest {
             req.fallbackModel(), // DEC-RV-02 接线点：RunRequest.fallbackModel → QueryParams.fallbackModel
             null, null, deps, ProviderConfig.empty());
 
-        com.nexusai.application.agent.LlmAgentLoop.queryLoop(queryParams, state, new ArrayList<>());
+        com.nexusai.application.agent.LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(queryParams.deps().context(), queryParams, state), state, new ArrayList<>());
 
         // 断言：4 次调用 —— 前 3 次原模型，第 4 次（降级重试）必须用 per-call-A，绝不用 env-B
         assertThat(calledModels)

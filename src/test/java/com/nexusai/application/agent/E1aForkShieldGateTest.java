@@ -135,12 +135,12 @@ class E1aForkShieldGateTest {
         AgentState state = new AgentState("sys", sessionId, null);
         state.appendMessage(userMessage("m1", "q"));
 
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null, tuc(sessionId), QuerySource.EXTRACT_MEMORIES,
                 "test-model", null, null, null, null, null,
                 deps(ctx, true), ProviderConfig.empty())
-                .withCanUseTool(allowAllCanUseTool()),
+                .withCanUseTool(allowAllCanUseTool());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         assertThat(listingContent(state.rawMessages()))
@@ -153,11 +153,11 @@ class E1aForkShieldGateTest {
         // 对照：同一 ctx/注册表下主线程来源照常注入
         AgentState mainState = new AgentState("sys", sessionId, null);
         mainState.appendMessage(userMessage("m2", "q2"));
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams1 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 mainState.rawMessages(), null, tuc(sessionId), QuerySource.USER,
                 "test-model", null, null, null, null, null,
-                deps(ctx, true), ProviderConfig.empty()),
+                deps(ctx, true), ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, mainState),
             mainState, new ArrayList<>());
         assertThat(listingContent(mainState.rawMessages()))
             .as("对照：主线程来源必须注入 skill_listing（门只屏蔽后台 fork 来源）")
@@ -204,11 +204,11 @@ class E1aForkShieldGateTest {
         state.appendMessage(userMessage("m1", "q"));
 
         QuerySource s = source;
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams2 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null, tuc(sessionId), s, "test-model",
                 null, null, null, null, null, deps(ctx, s == QuerySource.USER), ProviderConfig.empty())
-                .withCanUseTool(allowAllCanUseTool()),
+                .withCanUseTool(allowAllCanUseTool());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams2.deps().context(), callerParams2, state),
             state, new ArrayList<>());
 
         d.exitReason = state.exitReason();

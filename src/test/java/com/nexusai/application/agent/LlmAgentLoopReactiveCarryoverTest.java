@@ -187,7 +187,7 @@ class LlmAgentLoopReactiveCarryoverTest {
             QuerySource.USER, "test-model", 8,
             new TaskBudget(200_000), null, null, null, deps, ProviderConfig.empty());
 
-        LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>());
 
         // ① reactive compact 真实成功（消息被压缩）
         assertThat(state.rawMessages().size())

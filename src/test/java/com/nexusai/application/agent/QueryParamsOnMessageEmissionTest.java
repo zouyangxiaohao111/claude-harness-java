@@ -118,7 +118,8 @@ class QueryParamsOnMessageEmissionTest {
         AgentState state = stateWithUserMessage();
         List<ChatMessageDto> emitted = new ArrayList<>();
 
-        LlmAgentLoop.queryLoop(runParams(provider, state, emitted::add), state, new ArrayList<>());
+        QueryParams callerParams0 = runParams(provider, state, emitted::add);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>());
 
         // 发射点 ① assistant(tool_calls)
         ChatMessageDto assistantToolCalls = emitted.stream()
@@ -163,7 +164,8 @@ class QueryParamsOnMessageEmissionTest {
         List<ChatMessageDto> before = List.copyOf(state.rawMessages());
         QueryParams params = runParams(provider, state, msg -> { });
         // 显式传 null 覆盖（紧凑构造器必须归一为 no-op，否则发射点 NPE）
-        LlmAgentLoop.queryLoop(params.withOnMessage(null), state, new ArrayList<>());
+        QueryParams callerParams1 = params.withOnMessage(null);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state), state, new ArrayList<>());
 
         assertThat(callCount.get()).as("未注入回调不影响模型调用轮次").isEqualTo(2);
         assertThat(state.rawMessages()).as("消息落库行为逐条不变").hasSizeGreaterThan(before.size());

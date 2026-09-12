@@ -65,13 +65,23 @@ import static org.mockito.Mockito.when;
  *   <li>{@link #threePathsBlocksByteIdenticalToGolden()} —— 三路（主线程/子代理/hook agent）
  *       系统提示产物逐位相同（金样取自改动前的 master 运行输出）；</li>
  *   <li>{@link #callerSuppliedSystemPrompt_skipsMaterialCollection()} —— 调用方已组装
- *       （{@code params.systemPrompt()} 非空）时 loop **不得覆盖**：发送 blocks 必须来自调用方传入值。</li>
+ *       （{@code params.systemPrompt()} 非空）时 loop **不得覆盖**：发送 blocks 必须来自调用方传入值
+ *       （[prompt-assembly-B] 本用例现在正是「loop() 收到已折好的提示，自己不重折」的直接锁 ——
+ *       它**故意不**调 collectRunMaterial）。</li>
  * </ol>
  *
  * <p><b>[小档 2026-09-12] 「每 run 只收集一次」不再设计数观测点</b>：该性质当前只是「只有一个调用点」
  * 的偶然事实，**不是结构性成立的**；为它往生产代码里加 {@code AtomicInteger} + 两个测试访问器属
  * 「生产承载测试专用埋点」，已删除。结构性保证由 E-1b（材料收集上移到 4 个调用方）提供。
  * 相应地本类不再断言该性质 —— 它对可观测产物不敏感，无法用产物断言替代，硬造观测点得不偿失。
+ *
+ * <p><b>[prompt-assembly-B · E-1b-1] 材料收集已上移到调用方</b>：{@code loop()} 不再自行收集
+ * （旧守卫「params.systemPrompt 非空 ⇒ 跳过收集」随之上移为唯一形态 —— 调用方传什么就发什么）。
+ * 本类作为 {@code queryLoop} 的**调用方**，在驱动前按生产契约调
+ * {@code LlmAgentLoop.collectRunMaterial(ctx, params, state)} 回灌三通道（三个生产调用方
+ * {@code doRun} / {@code SubagentExecutor} / {@code ExecAgentHook} 同款位置）——
+ * 这也是「三路金样逐位相同」得以继续成立的前提：材料收集的产物与落点均未变，只是 owner 从
+ * {@code loop()} 换成调用方。
  *
  * <p>测试脚手架：mock provider 第 1 次回 tool_calls、第 2 次回 stop ⇒ 单 run 两个工具轮；
  * 捕获每次 provider 调用收到的 {@code systemPromptBlocks}（{@code stream} 第 3 实参）。
@@ -207,6 +217,8 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
         assertThat(params.userContext()).containsEntry("callerKey", "callerValue");
         assertThat(params.systemContext()).containsEntry("callerSysKey", "callerSysValue");
 
+        // [prompt-assembly-B] 本用例**故意不收集**：验证 loop() 收到调用方已折好的提示后不重折/不覆盖
+        //   （CC query.ts:393-411「Immutable params — never reassigned during the query loop」）。
         LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
 
         assertThat(captured)
@@ -215,6 +227,79 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
                 // appendSystemContext 产 2 段（[系统提示, "callerSysKey: callerSysValue"]），
                 // splitSysPromptPrefix 以空行拼接为单 block（CC buildSystemPromptBlocks 同款）。
                 new SystemPromptBlock("CALLER-ASSEMBLED-PROMPT\n\ncallerSysKey: callerSysValue", CacheScope.ORG))));
+    }
+
+    // ─────────── 调用方边界：主线程 doRun（生产调用方）已收集 ⇒ provider 边界可见 ───────────
+
+    /**
+     * [prompt-assembly-B] 生产调用方 {@code LlmAgentLoop.doRun}（主线程）必须**自己**收集材料：
+     * 断言落在 <b>provider 边界</b>（{@code provider.stream(...)} 收到的 blocks / history）——
+     * 而不是任何生产代码里的观测点。
+     *
+     * <p><b>WHY（规则九 · 测试验证意图）</b>：本批把材料收集从 {@code loop()} 内部搬到三个生产调用方
+     * （{@code doRun} / {@code SubagentExecutor} / {@code ExecAgentHook}）。若某个调用方漏调
+     * {@code collectRunMaterial}（= 变异：用未回灌的 params 直接交给 queryLoop），其发送的
+     * system prompt 就只剩空段 → 本用例的 append 尾段断言必红。
+     *
+     * <p><b>RED 条件（变异验证）</b>：删掉 {@code doRun} 里的
+     * {@code queryParams = collectRunMaterial(mainCtx, queryParams, state);} → run 走
+     * {@code loop()} 时 {@code params.systemPrompt()} 为空 ⇒ append 尾段
+     * （{@code E1B-APPEND-MARKER}，只可能来自材料收集的 buildEffectiveSystemPrompt）不再到达
+     * provider；同时 userContext 通道（{@code currentDate} meta user 消息）缺失 → 红。
+     *
+     * <p>标记串选 appendSystemPrompt（{@code RunRequest.forTest(..., appendSystemPrompt)} 重载）：
+     * 它经 RunRequest → AgentState.appendSystemPrompt → 材料收集（恒末尾追加）→ s10 → 发送 blocks，
+     * 全程与仓库内容 / 环境无关，断言确定性。
+     */
+    @Test
+    @DisplayName("[调用方边界] doRun（主线程调用方）收集三通道 → provider 边界收到 append 尾段 + userContext 前置")
+    void mainThreadCaller_doRunCollectsMaterial_providerBoundarySeesIt() {
+        final String appendMarker = "E1B-APPEND-MARKER-7f3a";
+        List<List<SystemPromptBlock>> blocks = new ArrayList<>();
+        List<List<ChatMessageDto>> histories = new ArrayList<>();
+        LlmProvider provider = Mockito.mock(LlmProvider.class);
+        org.mockito.stubbing.Answer<Object> answer = inv -> {
+            Object[] args = inv.getArguments();
+            @SuppressWarnings("unchecked")
+            List<SystemPromptBlock> b = (List<SystemPromptBlock>) args[2];
+            @SuppressWarnings("unchecked")
+            List<ChatMessageDto> h = (List<ChatMessageDto>) args[3];
+            blocks.add(b == null ? List.of() : List.copyOf(b));
+            histories.add(h == null ? List.of() : List.copyOf(h));
+            int msgIdx = args.length == 19 ? 11 : 10;
+            int doneIdx = args.length == 19 ? 17 : 16;
+            @SuppressWarnings("unchecked")
+            java.util.function.Consumer<AssistantMessage> onMsg =
+                (java.util.function.Consumer<AssistantMessage>) args[msgIdx];
+            Runnable onComplete = (Runnable) args[doneIdx];
+            if (onMsg != null) {
+                onMsg.accept(new AssistantMessage("done", "stop", List.of()));
+            }
+            onComplete.run();
+            return null;
+        };
+        Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
+        when(factory.getProvider(any(), any())).thenReturn(provider);
+
+        // 生产入口：AgentLoop.run(RunRequest) → doRun（真实 AgentLoopContext 由 buildMainLoopContext 构造）
+        new LlmAgentLoop(factory).run(
+            RunRequest.forTest("hello", "test-model", null, appendMarker));
+
+        assertThat(blocks).as("provider 必须被调用").isNotEmpty();
+        String sent = blocks.get(0).stream().map(SystemPromptBlock::text)
+            .collect(java.util.stream.Collectors.joining("\n\n"));
+        assertThat(sent)
+            .as("[调用方边界] doRun 未收集材料 ⇒ append 尾段不会到达 provider（变异必红）；"
+                + "收集到位 ⇒ EffectiveSystemPromptBuilder 的 append 恒末尾段可见")
+            .contains(appendMarker);
+        assertThat(histories.get(0))
+            .as("[调用方边界] userContext 经 prependUserContext 前置 meta user 消息（currentDate 恒在）"
+                + "—— 仅当 doRun 收集了 userContext 才出现")
+            .anyMatch(m -> m.isMeta() && m.content() != null && m.content().contains("currentDate"));
     }
 
     // ═══════════════════════════ 脚手架 ═══════════════════════════
@@ -244,11 +329,11 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
         }
         PermissionMode mode = "HOOK".equals(kind) ? PermissionMode.DONT_ASK : PermissionMode.DEFAULT;
 
-        LlmAgentLoop.queryLoop(
-            com.nexusai.application.agent.loop.QueryParams.forLoop(
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), List.of(), tuc(sessionId, mode), qs, "test-model",
                 null, null, null, null, null, depsOf(ctx, "MAIN".equals(kind), "fixed-chain"),
-                ProviderConfig.empty()),
+                ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         return new Run(callCount, captured);

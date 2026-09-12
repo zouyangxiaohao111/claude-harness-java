@@ -161,10 +161,10 @@ class ImageValidatorTest {
         AtomicInteger callModelInvoked = new AtomicInteger(0);
         var deps = new LoopDepsForTest(ctx, callModelInvoked);
 
-        var result = LlmAgentLoop.queryLoop(
-            QueryParamsForTest.forLoop(state.rawMessages(), null, baseTuc,
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = QueryParamsForTest.forLoop(state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        var result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         // 1) 不调模型

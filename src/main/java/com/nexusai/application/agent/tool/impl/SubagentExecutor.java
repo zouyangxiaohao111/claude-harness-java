@@ -4231,10 +4231,10 @@ public class SubagentExecutor {
                 }
                 com.nexusai.application.agent.loop.QueryParams queryParams =
                     com.nexusai.application.agent.loop.QueryParams.forLoop(
-                        // [prompt-assembly-A] forLoop 第 2 实参 = QueryParams.systemPrompt（CC SystemPrompt
-                        //   段数组语义）——本仓 vestigial（0 生产读点）：子代理真实提示来源 =
-                        //   AgentState.systemPrompt()（下一行 new AgentState(agentSystemPrompt, ...)）+
-                        //   loop 内 per-run 材料收集。恒传 List.of() ⇒ loop 走材料收集（现状行为）。
+                        // [prompt-assembly-B] forLoop 第 2 实参 = QueryParams.systemPrompt（CC SystemPrompt
+                        //   段数组语义）——本行仍传 List.of() 占位，真实值由 forLoop 之后的
+                        //   collectRunMaterial 回灌（调用方 = CC QueryEngine.ts:302 位置）。子代理真实提示
+                        //   来源 = AgentState.systemPrompt()（new AgentState(agentSystemPrompt, ...)）。
                         state.rawMessages(), java.util.List.of(), baseTuc,
                         forkQuerySource, effectiveModel, maxTurns, null, null, null, null,
                         deps, providerConfig)
@@ -4273,6 +4273,10 @@ public class SubagentExecutor {
                                 messageSink.accept(pm);
                             }
                         });
+                // [prompt-assembly-B] 材料收集归位调用方（CC 分层第 1 层）：queryLoop 只消费已折好的
+                //   systemPrompt/userContext/systemContext（query.ts:393-411「Immutable params」）。
+                queryParams = LlmAgentLoop.collectRunMaterial(
+                    queryParams.deps().context(), queryParams, state);
                 log.info("[SubagentExecutor] [R1-THINK] thinkingConfig 注入 QueryParams: type={} budgetTokens={} "
                         + "(fork 继承父 / 非 fork disabled · CC runAgent.ts:682-684)",
                         queryParams.thinkingConfig().type(), queryParams.thinkingConfig().budgetTokens());

@@ -199,7 +199,8 @@ class AgentStateDualViewTest {
         List<List<ChatMessageDto>> histories = new ArrayList<>();
         LlmProviderFactory factory = capturingProviderFactory(histories);
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
-        LlmAgentLoop.queryLoop(forLoopParams(ctx, state), state, new ArrayList<>());
+        QueryParams callerParams0 = forLoopParams(ctx, state);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>());
 
         assertThat(histories).as("LLM 至少被调用一次").isNotEmpty();
         List<String> sentIds = histories.get(histories.size() - 1).stream()

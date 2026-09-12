@@ -30,17 +30,15 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.when;
 
 /**
- * RES-C2 · {@code LlmAgentLoop.loop()} 会话生命周期结束 close provider 意图测试
+ * RES-C2 · {@code SystemPromptContextProvider} 生命周期结束 close 意图测试
  * （R5-4 另两处 new provider 接注销通道之一）。
  *
- * <p><b>WHY（CLAUDE.md 规则九）</b>：loop() 每次调用构造会话级
- * {@code sysPromptCtxProvider}（:2219，register +1 hook）；若 loop 生命周期结束（正常 return /
- * 重入点 return / 异常出口）不 close → 每次会话永久泄漏一个 Runnable。本测试驱动一次完整
- * queryLoop（mock provider 单轮 stop 结束），断言 {@code CACHE_CLEAR_HOOKS} 回到基线。
- * 若删除 loop() 的 finally close（回退到「只构造不注销」），本测试变红。
- *
- * <p>重入点语义：loop() 重入（blockingError → {@code return loop(...)}）会先跑内层再跑外层
- * finally —— 两层各自 close 自身 provider，表不累积（本用例单层单轮已覆盖出口不变量）。
+ * <p><b>[prompt-assembly-B · E-1b-1] provider 归属已随材料收集上移调用方</b>：provider 现在由
+ * {@code LlmAgentLoop.collectRunMaterial} 创建（构造即 register +1 hook），在**该方法自己的**
+ * {@code finally} 里 {@code close()} 注销 —— 异常路径同样成对。本测试作为调用方，
+ * 按生产契约先调 {@code collectRunMaterial} 再交 {@code queryLoop}，断言
+ * {@code CACHE_CLEAR_HOOKS} 回到基线。若删除 collectRunMaterial 的 finally close
+ * （回退到「只构造不注销」），本测试变红。
  *
  * <p>隔离：{@code CACHE_CLEAR_HOOKS} 为进程级静态表，本用例只做相对断言（before/after）。
  */
@@ -56,7 +54,7 @@ class LlmAgentLoopCloseTest {
     }
 
     @Test
-    @DisplayName("会话 loop 结束 → sysPromptCtxProvider close（CACHE_CLEAR_HOOKS 回到基线）")
+    @DisplayName("材料收集调用结束 → SystemPromptContextProvider close（CACHE_CLEAR_HOOKS 回到基线）")
     void sessionLoopEnd_closesProvider() throws Exception {
         // ── 1. provider：mock 单轮立即产出 stop 消息（无工具调用 → 单轮自然结束）──
         LlmProvider provider = Mockito.mock(LlmProvider.class);
@@ -90,11 +88,11 @@ class LlmAgentLoopCloseTest {
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash")));
 
         int before = tableSize();
-        LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(
+        QueryParams callerParams0 = QueryParams.forLoop(
                 state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new java.util.ArrayList<>());
 
         assertThat(tableSize())

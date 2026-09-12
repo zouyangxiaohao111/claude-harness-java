@@ -303,9 +303,9 @@ class LlmAgentLoopSkillListingInjectTest {
 
         ToolUseContext tuc = new ToolUseContext(agentId, sessionUuid, PermissionMode.DEFAULT,
             Map.of(), List.of(skillTool));
-        LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null, tuc, QuerySource.USER, "test-model",
-                null, null, null, null, null, new SubagentLoopDeps(ctx), ProviderConfig.empty()),
+        QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null, tuc, QuerySource.USER, "test-model",
+                null, null, null, null, null, new SubagentLoopDeps(ctx), ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         String listing = listingContent(state.rawMessages());

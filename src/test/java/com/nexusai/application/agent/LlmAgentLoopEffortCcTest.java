@@ -86,11 +86,11 @@ class LlmAgentLoopEffortCcTest {
             @Override public boolean isMainLoop() { return true; }
         };
 
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null,
+        QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
@@ -135,12 +135,12 @@ class LlmAgentLoopEffortCcTest {
             @Override public boolean isMainLoop() { return false; }
         };
 
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null,
+        QueryParams callerParams1 = QueryParams.forLoop(state.rawMessages(), null,
                 // [session-id-short] of(agentId, sessionId)：forkSessionId 是 short sessionId，forkAgentId 是 UUID agentId
                 ToolUseContext.of(forkAgentId, forkSessionId),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state),
             state, new ArrayList<>());
 
         assertThat(result.aborted()).isFalse();
@@ -180,11 +180,11 @@ class LlmAgentLoopEffortCcTest {
             @Override public boolean isMainLoop() { return true; }
         };
 
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null,
+        QueryParams callerParams2 = QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams2.deps().context(), callerParams2, state),
             state, new ArrayList<>());
 
         assertThat(result.aborted()).isFalse();

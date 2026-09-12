@@ -292,7 +292,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
                 deps, ProviderConfig.empty());
 
         // WHEN: queryLoop 首轮（DRIFT-6 测量源 = messagesForQuery = state.rawMessages() 含注入历史）
-        LlmAgentLoop.queryLoop(params, state, new java.util.ArrayList<>(), auto);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new java.util.ArrayList<>(), auto);
 
         // THEN: 首轮 auto-compact 触发 → state.rawMessages() 被压缩替换（含 compact_boundary 摘要，
         //       不再含全部原始注入历史）——证明注入历史进入了压缩/测量管线，不因「历史在上下文而

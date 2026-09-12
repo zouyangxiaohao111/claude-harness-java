@@ -241,7 +241,8 @@ class CachedMcBoundaryWiringCcTest {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         state.appendMessage(singleMessage("m1", "question"));
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, completingProviderFactory(), null, null, null);
-        LlmAgentLoop.queryLoop(forLoopParams(ctx, state), state, new ArrayList<>());
+        QueryParams callerParams0 = forLoopParams(ctx, state);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>());
 
         // 流正常完成（assistant 消息已提交）→ 流结束点必须已消费 pendingCacheEdits
         assertThat(state.rawMessages().stream().anyMatch(m -> m.role() == Role.assistant))
@@ -260,7 +261,8 @@ class CachedMcBoundaryWiringCcTest {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         state.appendMessage(singleMessage("m1", "question"));
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, completingProviderFactory(), null, null, null);
-        LlmAgentLoop.queryLoop(forLoopParams(ctx, state), state, new ArrayList<>());
+        QueryParams callerParams1 = forLoopParams(ctx, state);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state), state, new ArrayList<>());
 
         assertThat(MicroCompactor.consumePendingCacheEdits())
             .as("feature 关 → 流结束点不消费（query.ts:870 短路，不触碰模块态）").isNotNull();
@@ -279,7 +281,8 @@ class CachedMcBoundaryWiringCcTest {
             AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
             state.appendMessage(singleMessage("m1", "question"));
             AgentLoopContext ctx = TestContexts.agentLoopContext(null, completingProviderFactory(), null, null, null);
-            LlmAgentLoop.queryLoop(forLoopParams(ctx, state), state, new ArrayList<>());
+            QueryParams callerParams2 = forLoopParams(ctx, state);
+            LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams2.deps().context(), callerParams2, state), state, new ArrayList<>());
 
             assertThat(app.list.stream()
                 .anyMatch(e -> e.getFormattedMessage().contains("markToolsSentToAPIState")))

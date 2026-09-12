@@ -201,12 +201,12 @@ class LlmAgentLoopTaskBudgetCcTest {
         // 【GR-1 返工】4 参 queryLoop 注入 autoCompactor → 主自动压缩路径真实执行并 emit
         //   tengu_auto_compact_succeeded + task_budget 结转（旧 3 参 queryLoop autoCompactor=null
         //   → 自动压缩跳过，断言必然失败，属陈旧 harness）。
-        LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null,
+        QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null,
                 new TaskBudget(200_000),   // CC query.ts:197 {total} 输入契约；remaining loop 内维护
-                null, null, null, deps, ProviderConfig.empty()),
+                null, null, null, deps, ProviderConfig.empty());
+        LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>(),
             autoCompactor);
 

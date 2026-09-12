@@ -209,10 +209,10 @@ class ModelCallerTest {
             }
         };
 
-        LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.rawMessages(), null, baseTuc,
+        com.nexusai.application.agent.loop.QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty());
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
             state, new ArrayList<>());
 
         assertThat(callModelInvoked[0])

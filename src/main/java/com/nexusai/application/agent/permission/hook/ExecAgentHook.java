@@ -411,13 +411,16 @@ public class ExecAgentHook {
             List<String> consumedCommandUuids = new ArrayList<>();
             com.nexusai.application.agent.loop.QueryParams queryParams =
                 com.nexusai.application.agent.loop.QueryParams.forLoop(
-                    // [prompt-assembly-A] 2nd arg = QueryParams.systemPrompt（CC SystemPrompt 段数组语义）——
-                    //   本仓 vestigial（0 生产读点）：hook agent 真实提示来源 = AgentState.systemPrompt()
-                    //   （下一行 new AgentState(systemPrompt, ...)）+ loop 内 per-run 材料收集。
-                    //   恒传 List.of() ⇒ loop 走材料收集（现状行为）。
+                    // [prompt-assembly-B] 2nd arg = QueryParams.systemPrompt（CC SystemPrompt 段数组语义）——
+                    //   本行仍传 List.of() 占位，真实值由下一行的 collectRunMaterial 回灌
+                    //   （调用方 = CC QueryEngine.ts:302 位置）。hook agent 真实提示来源 =
+                    //   AgentState.systemPrompt()（new AgentState(systemPrompt, ...)）。
                     state.rawMessages(), java.util.List.of(), baseTuc,
                     QuerySource.HOOK_AGENT, modelName, MAX_AGENT_TURNS, null, null, null, null,
                     deps, effectiveConfig);
+            // [prompt-assembly-B] 材料收集归位调用方（CC 分层第 1 层）：queryLoop 只消费已折好的
+            //   systemPrompt/userContext/systemContext（query.ts:393-411「Immutable params」）。
+            queryParams = LlmAgentLoop.collectRunMaterial(sharedCtx, queryParams, state);
             // [P2-23 · 2026-09-11] skillListingResume 恒 false（经 3 参重载 = 默认 false）——
             //   此处【不是】缺陷：CC 每次 hook 调用生成**新** agentId
             //   （execAgentHook.ts:144-150 `hook-agent-${randomUUID()}`）→ skills sent 槽恒空

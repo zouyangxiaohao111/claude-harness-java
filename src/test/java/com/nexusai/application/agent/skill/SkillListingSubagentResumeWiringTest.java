@@ -86,7 +86,8 @@ class SkillListingSubagentResumeWiringTest {
         //   这正是「续跑」的真实形态：进程内已发过一次，但槽位已被回收。
         SkillListingSentRegistry.removeAgentKey(SESSION_KEY, AGENT_ID.toString());
 
-        LlmAgentLoop.queryLoop(h.params(state), state, new ArrayList<>(), /*skillListingResume=*/true);
+        QueryParams callerParams0 = h.params(state);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>(), /*skillListingResume=*/true);
 
         assertThat(listingContent(state.rawMessages()))
             .as("续跑 run 不得重发整份清单（CC 同 agentId sent 非空 → newSkills 空 → 不注入，"
@@ -101,7 +102,8 @@ class SkillListingSubagentResumeWiringTest {
         Harness h = new Harness();
 
         AgentState state = h.subagentState();
-        LlmAgentLoop.queryLoop(h.params(state), state, new ArrayList<>(), /*skillListingResume=*/false);
+        QueryParams callerParams1 = h.params(state);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state), state, new ArrayList<>(), /*skillListingResume=*/false);
 
         assertThat(listingContent(state.rawMessages()))
             .as("全新子代理（新 agentId · sent 空）必须得到自己的首份整份清单 "
