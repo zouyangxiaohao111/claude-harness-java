@@ -1054,6 +1054,10 @@ public class ToolRegistrationConfig {
             @Autowired(required = false) com.nexusai.domain.provider.ProviderService providerService,
             @Autowired(required = false) com.nexusai.application.agent.settings.storage.FileConfigStorage configStorage,
             com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionForkedQuery,
+            // [E-1b-2] fork 生产 seam 已切到主循环 queryLoop（本 bean 只有此一处消费 setForkedQuery）；
+            //   productionForkedQuery 仍注入（同 bean 的 buildForkSuppliers 族用途：configSupplier/
+            //   modelSupplier）→ 一行回退 = 把下方 setForkedQuery 换回 productionForkedQuery。
+            com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopForkedQuery,
             com.nexusai.application.agent.telemetry.Telemetry telemetry,
             com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
 
@@ -1083,7 +1087,9 @@ public class ToolRegistrationConfig {
             null,                 // sdkStatusSetter
             null,                 // streamModeSetter
             null);                // responseLengthSetter
-        summary.setForkedQuery(productionForkedQuery);
+        // [E-1b-2] fork 生产 seam = 主循环 queryLoop（QueryLoopForkedQuery）。回退：改回
+        //   productionForkedQuery（旧实现与 seam 均保留）。
+        summary.setForkedQuery(queryLoopForkedQuery);
         // [IMP-A3-2 SCS-15/17 装配缺口修复 · MG-1] CC logEvent 遥测注入（compact.ts:1214/1235/1242/1364/1379
         //   tengu_compact_cache_sharing_success/fallback/streaming_retry/failed；null 安全，Spring @Component
         //   自动注入）。对齐 MicroCompactor.setTelemetry 先例（:833）——此前未调用 → 静态槽位恒 null →
@@ -1492,6 +1498,9 @@ public class ToolRegistrationConfig {
     public com.nexusai.application.agent.memory.SessionMemoryService sessionMemoryService(
             @org.springframework.context.annotation.Lazy ToolRegistry toolRegistry,
             com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionForkedQuery,
+            // [E-1b-2] fork 生产 seam 已切到主循环 queryLoop（本 bean 只有此一处消费 setForkedQuery）；
+            //   productionForkedQuery 仍注入（同 bean 的 modelSupplier / configSupplier 用途）
+            com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopForkedQuery,
             com.nexusai.application.agent.telemetry.Telemetry telemetry,
             // [FIX-SM] ObjectProvider 懒解析 autoCompactor → isAutoCompactEnabled 门控。
             //   避免 autoCompactor(→sessionMemoryService) ↔ sessionMemoryService(→autoCompactor)
@@ -1554,7 +1563,9 @@ public class ToolRegistrationConfig {
         //   doExtractSessionMemory:581 log.warn 提前 return（跳过 fork + markExtractionCompleted 跳过 →
         //   extractionStartedAt 滞留，SM 压缩 wait 阻塞满 15s）。与 ExtractMemoriesAgent/AutoDreamConsolidator
         //   同源（IMP-M-P0-3 模式，ExtractMemoriesAgent bean :1168/:1171）。
-        svc.setForkedQuery(productionForkedQuery);
+        // [E-1b-2] fork 生产 seam = 主循环 queryLoop（QueryLoopForkedQuery）。回退：改回
+        //   productionForkedQuery（旧实现与 seam 均保留）。
+        svc.setForkedQuery(queryLoopForkedQuery);
         // cache-safe params supplier：fork 消息前缀 + 主线程工具集（buildProductionCacheSafeParams
         //   唯一有效载荷 toolUseContext，SystemPrompt/Context 由 SessionMemoryService.mergeSystemPrompt/
         //   mergeContext 用会话原料补全 —— doExtractSessionMemory:537-562）
@@ -1618,13 +1629,17 @@ public class ToolRegistrationConfig {
             com.nexusai.application.agent.memory.MemoryStorage memoryStorage,
             @org.springframework.context.annotation.Lazy ToolRegistry toolRegistry,
             com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionForkedQuery,
+            // [E-1b-2] fork 生产 seam 已切到主循环 queryLoop（本 bean 只有此一处消费 setForkedQuery）
+            com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopForkedQuery,
             com.nexusai.application.agent.telemetry.Telemetry telemetry,
             com.nexusai.application.agent.loop.FeatureFlags featureFlags) {
         com.nexusai.application.agent.memory.ExtractMemoriesAgent agent =
             new com.nexusai.application.agent.memory.ExtractMemoriesAgent(memoryStorage);
         // IMP-M-P0-3: 生产 fork seam 首接入（R9/IMP-18 收敛）——注入专用多轮 fork loop，
         // canUseTool 受限门控真实生效（INV-6）；此前 seam 缺失跳过分支已改 fail-loud。
-        agent.setForkedQuery(productionForkedQuery);
+        // [E-1b-2] fork 生产 seam = 主循环 queryLoop（QueryLoopForkedQuery）。回退：改回
+        //   productionForkedQuery（旧实现与 seam 均保留）。
+        agent.setForkedQuery(queryLoopForkedQuery);
         // cache-safe params supplier：toolUseContext 携带主线程工具集（fork 需要真实工具数组
         //   Read/Write/Edit/Bash 等 + abort/权限继承；createMinimalCacheSafeParams 无工具集 → 空 tools）
         agent.setCacheSafeParamsSupplier(() -> buildProductionCacheSafeParams(toolRegistry));
@@ -1670,6 +1685,8 @@ public class ToolRegistrationConfig {
             com.nexusai.application.agent.memory.MemoryStorage memoryStorage,
             @org.springframework.context.annotation.Lazy ToolRegistry toolRegistry,
             com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionForkedQuery,
+            // [E-1b-2] fork 生产 seam 已切到主循环 queryLoop（本 bean 只有此一处消费 setForkedQuery）
+            com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopForkedQuery,
             com.nexusai.application.agent.telemetry.Telemetry telemetry,
             com.nexusai.application.agent.tasks.DreamTaskRegistry dreamTaskRegistry,
             // FIX-AD: 动态阈值（CC GB tengu_onyx_plover minHours/minSessions → Spring property 代偿，
@@ -1681,7 +1698,9 @@ public class ToolRegistrationConfig {
         // IMP-M-P0-3: 生产 fork seam 首接入——注入专用多轮 fork loop（autoDream.ts:224-233
         //   runForkedAgent({querySource:'auto_dream', skipTranscript:true})），canUseTool 受限门控
         //   真实生效（INV-6）；未注入由 RunForkedAgent.run 守卫 fail-loud（IMP-MV2-30 DC-8）。
-        consolidator.setForkedQuery(productionForkedQuery);
+        // [E-1b-2] fork 生产 seam = 主循环 queryLoop（QueryLoopForkedQuery）。回退：改回
+        //   productionForkedQuery（旧实现与 seam 均保留）。
+        consolidator.setForkedQuery(queryLoopForkedQuery);
         consolidator.setCacheSafeParamsSupplier(() -> buildProductionCacheSafeParams(toolRegistry));
         // IMP-M-P2-1: 遥测（tengu_auto_dream_fired/completed/failed · autoDream.ts:195/252/267）
         consolidator.setTelemetry(telemetry);
@@ -1748,6 +1767,57 @@ public class ToolRegistrationConfig {
             suppliers.providerSupplier(), suppliers.modelSupplier(), suppliers.configSupplier(), toolRegistry,
             null,
             sessionForkModelRoute(llmProviderFactory, modelMapper, providerMapper, providerService));
+    }
+
+    /**
+     * [E-1b-2 · fork 收敛] 生产 ForkedQuery = 主循环 {@code LlmAgentLoop.queryLoop}
+     * （{@link com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery}）。
+     *
+     * <p><b>WHY</b>: CC 的 fork <b>直接调主循环 {@code query()}</b>（forkedAgent.ts:564），没有
+     * 独立的循环/工具执行代码。本 bean 把 4 个调用方（compact / session-memory / extract-memories /
+     * auto-dream，共 6 个 fork 入口）的 {@code setForkedQuery} 注入点从自建循环
+     * {@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery} 切到本实现 ——
+     * 工具执行链（hook 链 / schema 校验 / 语义校验 / 权限门 / decision telemetry）全量继承主循环
+     * （用户决策 2）。
+     *
+     * <p><b>一行回退</b>: 旧类与 {@link RunForkedAgent.ForkedQuery} seam 均保留（E-2 才删）；
+     * 4 处 {@code setForkedQuery(...)} 改回 {@code productionForkedQuery} 即回退。
+     *
+     * <p><b>为什么只有本 bean 需要 AgentLoopContextFactory</b>: 4 个调用方 bean 只拿
+     * {@link RunForkedAgent.ForkedQuery} 接口引用（装配形态不变），隔离 ctx 的构造收敛在本 bean 内。
+     *
+     * <p><b>@Lazy 的原因（不得去除）</b>: {@code AgentLoopContextFactory} 字段注入
+     * ExtractMemoriesAgent / AutoDreamConsolidator，而这两个 bean 的 @Bean 方法参数含本 bean ⇒
+     * 直接注入会形成 bean 循环引用（Spring 默认 allow-circular-references=false 会启动失败）。
+     * {@code @Lazy} 注入惰性代理，运行期（fork 真正发起时）才解析 —— 与同文件
+     * {@code @Lazy ToolRegistry} 同一惯例。
+     *
+     * @param llmProviderFactory  provider 工厂（回落 provider 解析）
+     * @param modelMapper         模型 mapper（会话模型直传解析）
+     * @param providerMapper      provider mapper（会话模型直传解析）
+     * @param providerService     provider 服务（解密 apiKey）
+     * @param configStorage       settings.json 读取（回落模型名）
+     * @param contextFactory      [@Lazy] 主循环上下文工厂（fork 隔离 ctx）
+     * @return 主循环 fork 实现
+     */
+    @Bean
+    public com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopForkedQuery(
+            com.nexusai.infra.llm.LlmProviderFactory llmProviderFactory,
+            @Autowired(required = false) com.nexusai.repository.provider.mapper.ModelMapper modelMapper,
+            @Autowired(required = false) com.nexusai.repository.provider.mapper.ProviderMapper providerMapper,
+            @Autowired(required = false) com.nexusai.domain.provider.ProviderService providerService,
+            @Autowired(required = false) com.nexusai.application.agent.settings.storage.FileConfigStorage configStorage,
+            @org.springframework.context.annotation.Lazy
+            com.nexusai.application.agent.loop.AgentLoopContextFactory contextFactory) {
+        ForkSuppliers suppliers = buildForkSuppliers(
+            llmProviderFactory, modelMapper, providerMapper, providerService, configStorage);
+        log.info("E-1b-2: 注册 QueryLoopForkedQuery（fork 走主循环 queryLoop · 4 调用方 6 入口 seam "
+            + "切换，ProductionForkedQuery 保留可一行回退）");
+        return new com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery(
+            sessionForkModelRoute(llmProviderFactory, modelMapper, providerMapper, providerService),
+            suppliers.modelSupplier(),
+            suppliers.configSupplier(),
+            contextFactory);
     }
 
     /**
