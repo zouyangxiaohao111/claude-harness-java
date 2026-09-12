@@ -12,6 +12,7 @@ import com.nexusai.application.agent.compact.CompactWarningState;
 import com.nexusai.application.agent.compact.CompactionResult;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.PostCompactCleanup;
+import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.application.agent.compact.PostCompactionState;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
@@ -407,8 +408,14 @@ public final class CompactCommand {
             return ApplyOutcome.NO_PERSIST_CHANNEL;
         }
         try {
+            // [P2-9 · 2026-09-12] 直接通道（③ manual /compact）接共用 BUSY_SNAPSHOT 重试
+            //   （SqliteBusyRetry，与 ①②④⑤ 同档）：appendPostCompactMessages 是 @Transactional，
+            //   本方法（static，无 @Transactional）调用的是 Spring 代理 bean → 每次重试天然开新事务。
+            //   回落分支（state.persistCompactedMessages → ChatService.compactPersistListener）已在
+            //   ChatService 侧接同一包装 → 此处<b>不再包第二层</b>（否则 = 25 次尝试，偏离同档策略）。
             List<ChatMessageDto> normalized = hasDirectChannel
-                ? messageService.appendPostCompactMessages(sessionId, postCompact)
+                ? SqliteBusyRetry.executeWithBusyRetry("[CompactCommand] /compact 落库",
+                    () -> messageService.appendPostCompactMessages(sessionId, postCompact))
                 : state.persistCompactedMessages(postCompact);
             state.replaceMessages(normalized != null ? normalized : postCompact);
             log.info("[CompactCommand] /compact 压缩结果已 append-only 落库并写回会话状态: session={} 条数={}"

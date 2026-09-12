@@ -26,6 +26,7 @@ import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -79,6 +80,18 @@ import static org.mockito.Mockito.when;
  * 同机制）。
  */
 class ManualCacheClearCcIntegrationTest {
+
+    /**
+     * 历史 /clear 用例停用说明 · [P0-0 / N1 · 2026-09-11 用户拍板]。
+     *
+     * <p>WHY：本类第 3 节两个用例断言 {@code executeBuiltin("clear")} 的清理链（runPostCompactCleanup
+     * 等价清理 + session_start reason 补偿 / invokedSkills 保留）——停用后该分支已抛 ConflictException，
+     * 清理链不可达。清理链代码按决策保留不删（砍掉属另一决策，仅登记），故用例只禁用、不删除。
+     */
+    private static final String CLEAR_DISABLED_REASON =
+        "[P0-0/N1 2026-09-11 用户拍板] /clear 已停用：CommandController 对 clear（含别名 reset/new）直接抛 "
+        + "ConflictException → 本用例覆盖的会话级清理链已不可达（清理链代码按决策保留不删，仅登记）。"
+        + "fail-loud 守卫见 CommandControllerBuiltInCommandsTest#executeBuiltin_clear_isDisabled_failsLoud。";
 
     private static final String SESSION = "s1";
     private static final String AGENT = "agent-1";
@@ -381,6 +394,7 @@ class ManualCacheClearCcIntegrationTest {
     // 3. /clear 等价清理（对齐 CC caches.ts:74 无参 runPostCompactCleanup + :84 session_start 补偿）
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear: executeBuiltin('clear') → runPostCompactCleanup 等价清理 + session_start reason 补偿（CC caches.ts:74/84）")
     void clearCommand_runsPostCompactCleanupEquivalent() {
         wireSpies();
@@ -416,6 +430,7 @@ class ManualCacheClearCcIntegrationTest {
 
     /** 会话级 AgentState 存在时 /clear 不破坏既有 invokedSkills 保留语义（回归，OPD-TP-19）。 */
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear: 后台化 agent invokedSkills 保留语义回归（OPD-TP-19 不受 runPostCompactCleanup 影响）")
     void clearCommand_preservesBackgroundedAgentSkills() {
         wireSpies();

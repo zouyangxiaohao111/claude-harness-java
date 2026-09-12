@@ -11,7 +11,7 @@ import { AgentSelector } from './AgentSelector'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { readFile, stat } from '@tauri-apps/plugin-fs'
-import { COMMAND_ITEMS } from './CommandPalette'
+import { COMMAND_ITEMS, isDisabledCommand } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
@@ -249,8 +249,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     if (!t.startsWith('/') || t.includes(' ')) return null
     const q = t.slice(1).toLowerCase()
     // 合并本地内置 + 后端技能命令（技能名 / 插件名前缀触发提示，如 /update-config、/zjkycode）
-    const all: { name: string; description: string; aliases?: string[]; pluginName?: string }[] = [...COMMAND_ITEMS]
+    // [P0-0/N1 决策] 已停用命令（/clear 及别名 reset/new）不进补全：后端 GET /api/command 仍会回
+    //   clear（BuiltInCommands 经 SkillRegistry 五源进入），不滤则补全里重新冒出必失败入口。
+    const all: { name: string; description: string; aliases?: string[]; pluginName?: string }[] =
+      [...COMMAND_ITEMS].filter((c) => !isDisabledCommand(c.name))
     for (const r of remoteCommands) {
+      if (isDisabledCommand(r.name)) continue
       if (!all.some((c) => c.name === r.name)) all.push({ name: r.name, description: r.description ?? '', aliases: undefined, pluginName: r.pluginName ?? undefined })
     }
     // 匹配：技能名 / 别名 / 插件名前缀（输入 /zjkycode 显示该插件全部技能）

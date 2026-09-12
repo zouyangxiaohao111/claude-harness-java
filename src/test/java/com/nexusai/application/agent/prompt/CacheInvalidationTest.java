@@ -8,6 +8,7 @@ import com.nexusai.application.agent.config.ToolRegistrationConfig;
 import com.nexusai.common.RequestContext;
 import com.nexusai.model.command.dto.BuiltInCommandDto;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -42,6 +43,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （write/delete/setSectionCacheInvalidator）随被删 API 一并移除。
  */
 class CacheInvalidationTest {
+
+    /**
+     * 历史 /clear 用例停用说明 · [P0-0 / N1 · 2026-09-11 用户拍板]。
+     *
+     * <p>WHY：这两个用例断言「executeBuiltin(clear) 清 section 缓存」——停用后该分支已抛
+     * ConflictException，清理链不可达。清理链代码按决策保留不删（砍掉属另一决策，仅登记），
+     * 故用例只禁用、不删除，待用户裁定清理链去留后再定去留。
+     */
+    private static final String CLEAR_DISABLED_REASON =
+        "[P0-0/N1 2026-09-11 用户拍板] /clear 已停用：CommandController 对 clear（含别名 reset/new）直接抛 "
+        + "ConflictException → 本用例覆盖的会话级清理链已不可达（清理链代码按决策保留不删，仅登记）。"
+        + "fail-loud 守卫见 CommandControllerBuiltInCommandsTest#executeBuiltin_clear_isDisabled_failsLoud。";
 
     /** 统一夹具：注册同 name section 到 AgentState 的会话级缓存，compute 计数可断言。 */
     private static final class Fixture {
@@ -88,6 +101,7 @@ class CacheInvalidationTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear 触发: executeBuiltin(clear) 清缓存 → 同 name 重算，返回 DTO 不变")
     void clearViaCommandController_trigger() {
         Fixture fx = new Fixture();
@@ -110,6 +124,7 @@ class CacheInvalidationTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear 无会话上下文 → 失效跳过，缓存不清（保 CommandController 测试兼容）")
     void clearWithoutSession_skips() {
         Fixture fx = new Fixture();

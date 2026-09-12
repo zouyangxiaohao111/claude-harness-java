@@ -28,6 +28,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -299,14 +300,67 @@ class PartialCompactBusySnapshotTest {
     @Test
     @DisplayName("isSqliteBusy：沿 cause 链匹配 SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT；非 BUSY 不匹配")
     void isSqliteBusyMatchesOnlyBusyErrors() {
-        assertThat(PartialCompactService.isSqliteBusy(new RuntimeException(BUSY_SNAPSHOT_MSG))).isTrue();
-        assertThat(PartialCompactService.isSqliteBusy(
+        // [P2-9 · 2026-09-12] 判别已下沉 SqliteBusyRetry（5 通道共用的单点，不再 PartialCompactService 私有）
+        assertThat(SqliteBusyRetry.isSqliteBusy(new RuntimeException(BUSY_SNAPSHOT_MSG))).isTrue();
+        assertThat(SqliteBusyRetry.isSqliteBusy(
             new RuntimeException("### Error updating database (see cause)",
                 new IllegalStateException("[SQLITE_BUSY] database is locked")))).isTrue();
-        assertThat(PartialCompactService.isSqliteBusy(
+        assertThat(SqliteBusyRetry.isSqliteBusy(
             new RuntimeException("NOT NULL constraint failed"))).isFalse();
-        assertThat(PartialCompactService.isSqliteBusy(
+        assertThat(SqliteBusyRetry.isSqliteBusy(
             new RuntimeException("outer", new IllegalArgumentException("inner")))).isFalse();
-        assertThat(PartialCompactService.isSqliteBusy(null)).isFalse();
+        assertThat(SqliteBusyRetry.isSqliteBusy(null)).isFalse();
+    }
+
+    /**
+     * [P2-9 · 2026-09-12] <b>partial 原子性未破</b>：重试包装下沉到共用 {@link SqliteBusyRetry} 后，
+     * 落库与 {@code updateConversationId} 仍在<b>同一事务</b>内（共用方法以 {@code extraSameTxAction}
+     * 形参承载后者）。
+     *
+     * <p><b>RED</b>：把 {@code updateConversationId} 挪出 {@code template.execute} 回调（= 两处写各自
+     * 独立事务）→ 本用例红（rolledBack 不再等于 1 / extra 事件落在 tx-commit 之后）。
+     *
+     * <p>为什么重要：两处写必须同生共死 —— 否则会出现「boundary 已落库、conversationId 仍是旧值」
+     * 的半写，下一次 partial 会基于旧 conversationId 再压一次（重复压缩 + 归属错乱）。
+     */
+    @Test
+    @DisplayName("[P2-9] 原子性：updateConversationId 在主写之后、同一事务内；其抛错 → 整体回滚（无半写）")
+    void partialAtomicityKept_extraActionSharesTransaction() {
+        List<String> events = new ArrayList<>();
+        RecordingTxManager tx = new RecordingTxManager(events);
+
+        MessageService messageService = mock(MessageService.class);
+        SessionService sessionService = mock(SessionService.class);
+        StreamCompactSummary summary = mock(StreamCompactSummary.class);
+        when(messageService.listForResume(anyString())).thenReturn(fourMessages());
+        when(messageService.appendPostCompactMessages(anyString(), anyList())).thenAnswer(inv -> {
+            events.add("write");
+            return inv.getArgument(1);
+        });
+        // 额外同事务动作抛错（非 BUSY）→ 必须整体回滚，且不再开新事务重试（不可重试错误）。
+        // updateConversationId 返回 void → 只能用 doAnswer（when(...) 不适用于 void 方法）。
+        doAnswer(inv -> {
+            events.add("update-conv");
+            throw new IllegalStateException("updateConversationId failed");
+        }).when(sessionService).updateConversationId(anyString(), anyString());
+        when(summary.summarize(anyString(), anyList()))
+            .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
+
+        PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
+        svc.setTransactionManager(tx);
+
+        assertThatThrownBy(() -> svc.partialCompact(SESSION,
+                new PartialCompactRequest("a1", PartialCompactRequest.Direction.UP_TO, null)))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("updateConversationId failed");
+
+        // ① 额外动作与主写同事务：write → update-conv 都落在 tx-begin 与回滚之间
+        assertThat(events.indexOf("write")).isGreaterThan(events.indexOf("tx-begin"));
+        assertThat(events.indexOf("update-conv")).isGreaterThan(events.indexOf("write"));
+        assertThat(events).doesNotContain("tx-commit");
+        // ② 原子性：整体回滚一次（主写不会单独提交）
+        assertThat(tx.began.get()).as("非 BUSY 错误不重试 → 只开 1 个事务").isEqualTo(1);
+        assertThat(tx.rolledBack.get()).isEqualTo(1);
+        assertThat(tx.committed.get()).isZero();
     }
 }

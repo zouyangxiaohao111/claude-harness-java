@@ -23,8 +23,27 @@ export interface CommandItem {
   source?: string | null
 }
 
+/**
+ * 已停用命令 · [P0-0 / N1 决策 2026-09-11 用户拍板] /clear 在此平台永久停用。
+ *
+ * WHY 停用（审计 §零 P0-0，均已取证）：/clear 与 CC 语义相反 —— ①会话 id 复用（无 CC
+ * `regenerateSessionId` 对应物）；②DB 消息一条不删，下一轮全量重放 ⇒「释放上下文」完全没达成
+ * （模型下轮仍看到全部旧历史）；③SessionStart hook 双发（clear 时点 + 下轮恢复 cold 再一发）；
+ * ④该次请求内存里 skill_listing 两份。用户裁定：不需要 /clear，新建会话直接用界面「+」。
+ *
+ * 前后端一同停用：本表（命令面板清单 / 斜杠补全 / 已知命令解析）与后端 CommandController
+ * 一并拒绝。含别名 reset / new —— 后端 BuiltInCommands.findByName 是 name+aliases 三维匹配，
+ * 只删主名仍能从别名命中 /clear。
+ */
+export const DISABLED_COMMANDS: ReadonlySet<string> = new Set(['clear', 'reset', 'new'])
+
+/** 是否为已停用命令（含别名，大小写不敏感） */
+export function isDisabledCommand(name: string): boolean {
+  return DISABLED_COMMANDS.has(name.toLowerCase())
+}
+
 export const COMMAND_ITEMS: CommandItem[] = [
-  { name: 'clear', description: '清空会话历史，释放上下文', aliases: ['reset', 'new'] },
+  // [P0-0/N1] 'clear'（别名 reset/new）已移除 —— 见 DISABLED_COMMANDS
   { name: 'compact', description: '保留一份摘要，压缩当前会话' },
   { name: 'config', description: '打开配置面板', aliases: ['settings'] },
   { name: 'help', description: '查看帮助与可用命令' },
@@ -39,9 +58,10 @@ export const COMMAND_ITEMS: CommandItem[] = [
   { name: 'chrome', description: '连接 NexusAI in Chrome 浏览器扩展', type: 'local-jsx', hint: '/chrome' },
 ]
 
-/** name / 别名命中即视为已注册命令（slash 解析时直接执行，无需弹面板） */
+/** name / 别名命中即视为已注册命令（slash 解析时直接执行，无需弹面板）· 已停用命令恒不命中 */
 export function isKnownCommand(name: string): boolean {
   const n = name.toLowerCase()
+  if (isDisabledCommand(n)) return false
   return COMMAND_ITEMS.some((c) => c.name === n || (c.aliases ?? []).includes(n))
 }
 
@@ -189,10 +209,15 @@ export function CommandPalette({ onClose, onExecute }: CommandPaletteProps) {
   // 合并命令目录：后端 builtins 优先（带 type），技能命令其次，本地 COMMAND_ITEMS 补充
   const items = useMemo<CommandItem[]>(() => {
     const map = new Map<string, CommandItem>()
+    // [P0-0/N1 决策] 已停用命令不入面板：后端 GET /builtins（BuiltInCommands 注册表保留 clear）
+    //   与 GET /api/command（SkillRegistry 五源含 BUILTIN）仍会回 clear —— 合并前统一过滤，
+    //   否则面板会重新出现该入口（半死状态：点了必失败）。
     for (const b of builtins) {
+      if (isDisabledCommand(b.name)) continue
       map.set(b.name, { name: b.name, type: b.type, description: b.description ?? '', aliases: b.aliases ?? undefined, hint: b.argumentHint ?? undefined })
     }
     for (const s of skillCommands) {
+      if (isDisabledCommand(s.name)) continue
       if (!map.has(s.name)) map.set(s.name, {
         name: s.name,
         description: s.description ?? '',

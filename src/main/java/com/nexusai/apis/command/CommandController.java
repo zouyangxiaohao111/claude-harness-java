@@ -13,6 +13,7 @@ import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.ResumeAgentResult;
 import com.nexusai.application.agent.subagent.ResumeService;
 import com.nexusai.common.RequestContext;
+import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.model.command.ClientEnv;
@@ -327,6 +328,11 @@ public class CommandController {
      * resetGetMemoryFilesCache('session_start') + clearInvokedSkillsPreservingBackgrounded，
      * 对齐 CC clearSessionCaches caches.ts:47-144）。「不执行后端副作用」不适用 clear。
      *
+     * <p><b>⚠ [P0-0/N1 · 2026-09-11 用户拍板] /clear 已停用</b>：本端点对 clear（含别名 reset/new）
+     * <b>直接抛 {@link ConflictException}（fail loud，409）</b>，不再静默"装作清了"——上述会话级清理链
+     * 与 SessionEnd/SessionStart 发射随之<b>不可达</b>（代码按决策保留不删，仅登记）。用户裁定新建会话
+     * 改用界面「+」；前端入口（命令面板清单 / 斜杠补全 / 已知命令解析）同步移除。
+     *
      * <p><b>[RES-④] resume 例外分支</b>：用户拍板 resume 走后端真实重建（CC resumeAgentBackground），
      * 前端 POST {@code /builtins/resume/execute} + 请求体 {agentId, prompt} → 返回
      * {@link ResumeAgentResult}（agentId/description/outputFile，前端凭 outputFile 轮询任务输出）。
@@ -376,6 +382,24 @@ public class CommandController {
                     .sorted()
                     .collect(java.util.stream.Collectors.joining(", ")));
         }
+        // [P0-0 / N1 · 2026-09-11 用户拍板] /clear 停用 · fail-loud 门（先于一切命令分支，别名 reset/new 同拦）
+        //   WHY 停用（审计 §零 P0-0 三条子问题，均已取证）：
+        //   ① 会话 id 复用 —— 全仓无 CC {@code regenerateSessionId}（commands/clear/conversation.ts:240）对应物；
+        //   ② 上下文未释放 —— DB 消息一条不删，下轮全量重放（LlmAgentLoop 历史注入）⇒「释放上下文」完全未达成；
+        //   ③ SessionStart hook 双发 —— clear 时点一发（本方法历史分支）+ 下轮 SessionStartSeenRegistry.remove
+        //      恢复 cold 再一发；
+        //   ④ 该轮请求内存里 skill_listing 两份（历史注入 + 新整份）。
+        //   用户裁定：不需要 /clear（新建会话用界面「+」）→ 后端不再静默"装作清了"，改为显式失败（铁律：显式失败）。
+        //   ⚠ 下方历史清理链代码保留不删（砍掉属另一决策，仅登记）；本门一旦抛异常，该链恒不可达。
+        if ("clear".equals(hit.getName())) {
+            if (log.isDebugEnabled()) {
+                log.debug("[CommandController] executeBuiltin({}) → /clear 已停用，拒绝执行（别名 reset/new 同拦，P0-0/N1）", name);
+            }
+            log.warn("[CommandController] executeBuiltin({}) 拒绝执行：/clear 已停用（P0-0/N1 决策），请用界面「+」新建会话", name);
+            throw new ConflictException(
+                "/clear 已停用：本命令不再清空当前会话（旧实现既不新建会话 id，也不删除历史消息，"
+                    + "无法达成「释放上下文」）。请用界面「+」新建会话。");
+        }
         if (log.isDebugEnabled()) {
             log.debug("[CommandController] executeBuiltin({}) 命中内置命令 {} (type={})",
                 name, hit.getName(), hit.getType());
@@ -399,6 +423,10 @@ public class CommandController {
             }
             return executeCompactBuiltin(null, null);
         }
+        // ⚠⚠ 以下 /clear 历史分支自 2026-09-11（P0-0/N1 决策）起【不可达】——上方 fail-loud 门已对 clear
+        //   （含别名 reset/new）抛 ConflictException，本分支永不进入。清理链按决策【保留不删】（删除属另一
+        //   决策，仅登记，见审计 §零 P0-0 / §12.4 N1）——请勿在此新增依赖；恢复 /clear 须先经用户拍板并
+        //   同步前端入口（CommandPalette.COMMAND_ITEMS / App.sendMessage 停用门）。
         // [IMP-SP-07] /clear 失效接线：clear 命令触发会话级 system prompt section 缓存失效
         if ("clear".equals(hit.getName())) {
             invalidateSystemPromptSections("executeBuiltin(/clear)");

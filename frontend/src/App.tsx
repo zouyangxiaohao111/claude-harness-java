@@ -50,7 +50,7 @@ import { NotificationBanner } from '@/components/center/NotificationBanner'
 import { Composer } from '@/components/center/Composer'
 import { TraceView } from '@/components/center/TraceView'
 import { useCommandQueue } from '@/hooks/useCommandQueue'
-import { CommandPalette, isKnownCommand } from '@/components/center/CommandPalette'
+import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
 import { AgentsPanel } from '@/components/center/AgentsPanel'
 import { ChromePanel } from '@/components/center/ChromePanel'
 import { SkillSurvey } from '@/components/center/SkillSurvey'
@@ -1374,6 +1374,13 @@ function App() {
   //   后端 /compact 字面端点以 {args} 请求体接收并透传为 customInstructions（CC compact.ts:54），
   //   有指令时跳过 SM 优先直压（compact.ts:44-48）。不带 args → 裸 "/compact" 语义不变。
   const runBuiltin = useCallback(async (name: string, args?: string) => {
+    // [P0-0/N1 决策 2026-09-11] 已停用命令（/clear 及别名 reset/new）前端零请求显式拒绝 —— 唯一执行
+    //   漏斗（命令面板 onExecute / composer 分发都汇到此）。后端同样抛 409 fail loud，此处只为不
+    //   发无谓请求 + 给用户可读中文提示（而非把 409 detail 丢给 toast）。
+    if (isDisabledCommand(name)) {
+      showToast('该命令已停用：请用界面「+」新建会话', 'info')
+      return
+    }
     try {
       // 透传 activeSessionId：/clear 等会话级内置命令的后端清理链读 MDC 会话，不带则 no-op（finding-2）
       // 透传 args：/compact 自定义指令（后端 CompactExecuteRequest{args}）；其余命令忽略该字段
@@ -1413,6 +1420,15 @@ function App() {
     // 命令触发：`/` 开头 → 命中内置命令名直接执行，未命中打开命令面板
     if (text.startsWith('/')) {
       const name = text.slice(1).split(' ')[0]
+      // [P0-0/N1 决策 2026-09-11] 已停用命令显式拒绝：/clear（含别名 reset/new）在本平台永久停用
+      //   （会话 id 复用 + 消息不删 ⇒「释放上下文」从未达成，详见 CommandPalette.DISABLED_COMMANDS）。
+      //   WHY 必须在此拦截（而非仅靠清单移除）：'clear' 在 remoteCmdNames（GET /api/command 含
+      //   builtin 源）里 → 落下方发送路径会被当普通消息发给模型（静默假执行）。
+      if (isDisabledCommand(name)) {
+        showToast('该命令已停用：请用界面「+」新建会话', 'info')
+        setComposerText('')
+        return
+      }
       // 已知命令 → 前端动作 / 内置执行（分发后 return，不发送）
       if (name === 'help') {
         // /help → 命令面板（前端展示全部命令 + 描述，不依赖后端）

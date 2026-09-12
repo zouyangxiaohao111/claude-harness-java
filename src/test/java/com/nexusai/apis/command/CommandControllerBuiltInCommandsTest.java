@@ -20,6 +20,7 @@ import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.model.command.Command;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.web.servlet.MockMvc;
@@ -29,8 +30,10 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -57,6 +60,20 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * </ol>
  */
 class CommandControllerBuiltInCommandsTest {
+
+    /**
+     * 历史 /clear 用例共用停用说明 · [P0-0 / N1 · 2026-09-11 用户拍板]。
+     *
+     * <p>WHY 留着不删：这些用例覆盖的是「/clear 的会话级清理链 + SessionEnd/SessionStart 发射」——
+     * 停用后该分支不可达，用例必然失败。按决策<b>清理链代码保留不删</b>（砍掉属另一决策，仅登记，
+     * 见审计 §零 P0-0 / §12.4 N1），故此处也只禁用、不删除用例，待用户裁定清理链去留后再定去留。
+     * 停用后的行为由 {@code executeBuiltin_clear_isDisabled_failsLoud} 等守卫用例锁定。
+     */
+    private static final String CLEAR_DISABLED_REASON =
+        "[P0-0/N1 2026-09-11 用户拍板] /clear 已停用：CommandController 对 clear（含别名 reset/new）直接抛 "
+        + "ConflictException → 本用例覆盖的会话级清理链/副作用发射已不可达（清理链代码按决策保留不删，仅登记）。"
+        + "停用依据见审计 §零 P0-0（会话 id 复用 / 消息不删 / SessionStart 双发 / 内存 skill_listing 双份）；"
+        + "fail-loud 守卫见 executeBuiltin_clear_isDisabled_failsLoud。";
 
     private CommandController controller;
     private CommandService commandService;
@@ -119,6 +136,7 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("POST /builtins/clear/execute?sessionId=X → 生产链路清 SkillListingSentRegistry（finding-2：此前 MDC 无会话 → no-op）")
     void executeBuiltin_clear_withSessionId_clearsSkillListingRegistry() throws Exception {
         String sid = "sess-clear-" + java.util.UUID.randomUUID().toString().substring(0, 8);
@@ -144,6 +162,7 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("POST /api/command/builtins/clear/execute 200 + type='local' 元数据（薄触发）")
     void executeBuiltin_clear_ok() throws Exception {
         mockMvc.perform(post("/api/command/builtins/clear/execute"))
@@ -264,6 +283,7 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("[OPD-TP-19] /clear preservedAgentIds：后台化任务 agentId 保留，前台化任务不保留（CC conversation.ts:93）")
     void executeBuiltin_clear_preservesBackgroundedAgentSkills() throws Exception {
         // WHY: /clear 必须让后台化会话（Ctrl+B / POST background）不受影响 —— 其 agentId 进 preserved 集合，
@@ -299,6 +319,7 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("[IMP-SP2-08] /clear 无 preserved → resetPromptCacheBreakDetection 清空 PREVIOUS（CC caches.ts:63）")
     void executeBuiltin_clear_resetsPromptCacheBreakDetection() throws Exception {
         // WHY: CC clearSessionCaches（caches.ts:47-63）在 !hasPreserved（无后台化任务保留）时调
@@ -324,6 +345,7 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("[IMP-SP2-08] /clear 有 preserved 后台化任务 → 不 reset PREVIOUS（CC caches.ts:63 !hasPreserved 门控）")
     void executeBuiltin_clear_withPreserved_skipsReset() throws Exception {
         // WHY: preserved 非空（后台化任务存在）时 hasPreserved=true → CC caches.ts:63 跳过 reset。
@@ -353,6 +375,76 @@ class CommandControllerBuiltInCommandsTest {
         assertThat(detector.getTrackedSourceCount())
             .as("preserved 非空 → !hasPreserved 门控关 → PREVIOUS 保留（CC caches.ts:63）")
             .isEqualTo(1);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    //  [P0-0 / N1 · 2026-09-11 用户拍板] /clear 停用 · fail-loud 守卫
+    //  （上方同区 5 个历史 /clear 用例已 @Disabled：其覆盖的清理链/副作用发射随停用一并不可达）
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * WHY（CLAUDE.md 规则 9 · 测试验证意图）：nexusai 的 /clear 与 CC 语义<b>相反</b>（审计 §零 P0-0，已取证）——
+     * <ol>
+     *   <li>会话身份：CC 换新 sessionId（{@code regenerateSessionId}，commands/clear/conversation.ts:240），
+     *       Java 复用同一 sessionId（全仓无对应物）；</li>
+     *   <li>历史上下文：CC {@code setMessages([])} 真清空，Java <b>DB 一条不删</b>、下一轮全量重放
+     *       ⇒「释放上下文」完全没达成（模型下轮仍看到全部旧历史）；</li>
+     *   <li>SessionStart hook 双发（clear 时点 + 下轮 SessionStartSeenRegistry.remove 恢复 cold 再一发）；</li>
+     *   <li>该次请求内存里 skill_listing 两份（历史注入 + 新整份）。</li>
+     * </ol>
+     * 用户裁定不需要 /clear（新建会话用界面「+」）→ 后端<b>不得再静默"装作清了"</b>，必须显式失败
+     * （规则十二 显式失败）。本用例是该决策的守卫：若有人把抛异常改回返回 DTO 元数据（HTTP 200 假成功）→ 立即 RED。
+     */
+    @Test
+    @DisplayName("[P0-0/N1] /clear 停用：POST /builtins/clear/execute → 409 显式失败（不再 200 假成功）")
+    void executeBuiltin_clear_isDisabled_failsLoud() throws Exception {
+        mockMvc.perform(post("/api/command/builtins/clear/execute"))
+            .andExpect(status().isConflict())
+            .andExpect(jsonPath("$.detail", containsString("已停用")))
+            .andExpect(jsonPath("$.detail", containsString("「+」")));
+    }
+
+    /**
+     * WHY：后端 {@code BuiltInCommands.findByName} 是 name+aliases <b>三维匹配</b>（'reset'/'new' → clear，
+     * 见 BuiltInCommands.clear() 的 aliases）。若只拦主名，敲 /reset、/new 仍会跑进已停用的清理链 ——
+     * 前端 DISABLED_COMMANDS 同为 {clear, reset, new} 三元组，两端必须一致。
+     */
+    @Test
+    @DisplayName("[P0-0/N1] /clear 别名 reset/new 一并停用（findByName 三维匹配：只拦主名挡不住别名）")
+    void executeBuiltin_clearAliases_alsoDisabled() throws Exception {
+        mockMvc.perform(post("/api/command/builtins/reset/execute")).andExpect(status().isConflict());
+        mockMvc.perform(post("/api/command/builtins/new/execute")).andExpect(status().isConflict());
+    }
+
+    /**
+     * WHY：停用必须<b>真停用</b>——旧实现的净效应（SessionEnd(reason='clear') + SessionStart(source='clear')
+     * 双 hook 发射、SessionStartSeenRegistry/SkillListingSentRegistry 的会话级清理）一律不得再发生。
+     * 本用例同时锁两条腿：①不回落到 200；②不回落到"假成功副作用"（hook 零发射 + 去重态未被重置）。
+     * 把抛异常改回返回 DTO → 本用例 RED（fail-loud 守卫的第二道）。
+     */
+    @Test
+    @DisplayName("[P0-0/N1 守卫] 停用即真停用：不发 SessionEnd/SessionStart hook、不重置会话级 skill_listing 去重态")
+    void executeBuiltin_clear_noLongerRunsLegacySideEffects() throws Exception {
+        com.nexusai.application.agent.permission.hook.HookRegistry hookRegistry =
+            mock(com.nexusai.application.agent.permission.hook.HookRegistry.class);
+        ReflectionTestUtils.setField(controller, "hookRegistry", hookRegistry);
+        String sid = "sess-clear-disabled-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        // 预置「该会话已发过 skill_listing」（旧 /clear 会 removeSession → 下一次 decide 重发整份）
+        com.nexusai.application.agent.skill.SkillListingSentRegistry.decide(sid, "", List.of("commit"), false);
+        assertThat(com.nexusai.application.agent.skill.SkillListingSentRegistry.isInitialized(sid, ""))
+            .as("前置：该会话 skill_listing 已初始化（否则下面的「未被重置」断言无意义）")
+            .isTrue();
+
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", sid))
+            .andExpect(status().isConflict());
+
+        verify(hookRegistry, never()).executeEvent(any(com.nexusai.application.agent.permission.hook.HookEvent.class));
+        verify(hookRegistry, never()).executeSessionEndHooks(any(), any(), any(), any());
+        assertThat(com.nexusai.application.agent.skill.SkillListingSentRegistry
+                .decide(sid, "", List.of("commit"), true).names())
+            .as("停用后会话级 skill_listing 去重态不得被重置：sent 仍含 commit → 增量分支无新技能 → 恒空"
+                + "（旧 /clear 走 resetSentSkillNames 语义会重发整份）")
+            .isEmpty();
     }
 
     @Test

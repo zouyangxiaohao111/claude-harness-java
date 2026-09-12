@@ -7,6 +7,7 @@ import com.nexusai.application.agent.AgentEvent;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.compact.ContextUsageCalculator;
+import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.application.agent.tasks.NotificationQueue;
 import com.nexusai.application.agent.tasks.QueueEventPublisher;
@@ -1267,7 +1268,17 @@ public class ChatService {
         //   messageService 未装配（非 Spring 单测）→ 不武装，loop 侧原样返回仅替换内存。
         if (messageService != null) {
             state.setCompactPersistListener(msgs -> {
-                List<ChatMessageDto> normalized = messageService.appendPostCompactMessages(sessionId, msgs);
+                // [P2-9 · 2026-09-12] BUSY_SNAPSHOT 重试：与 partial(⑤) 共用同一包装 SqliteBusyRetry。
+                //   WHY（同源故障 = 同策略）：本通道承载 ① auto / ② reactive / ④ SM 三条落库路，
+                //   与 partial 走同一个出口 MessageService.appendPostCompactMessages（@Transactional，
+                //   先读 knownIds 拿读快照再写）→ WAL 下并发提交顶掉快照即抛 SQLITE_BUSY_SNAPSHOT。
+                //   此前只有 partial 重试 → ①②④ 命中即失败（内存已换压缩视图 / DB 未落 → 下轮从 DB
+                //   恢复压缩前全量 → 每轮重复压缩）。
+                //   换新事务正确性：本方法（armRealTimePersist）无 @Transactional，messageService 是
+                //   Spring 代理 bean → 每次 executeWithBusyRetry 重新调用 = 一次新事务、一次新读快照。
+                List<ChatMessageDto> normalized = SqliteBusyRetry.executeWithBusyRetry(
+                    "[compact-persist] append-only 落库",
+                    () -> messageService.appendPostCompactMessages(sessionId, msgs));
                 if (log.isInfoEnabled()) {
                     log.info("[compact-persist] compact 结果已 append-only 落库: session={} 条数={}（不删旧行 · 对齐 CC recordTranscript）",
                         sessionId, normalized.size());

@@ -9,6 +9,7 @@ import com.nexusai.application.agent.compact.CompactionResult;
 import com.nexusai.application.agent.compact.CompactWarningState;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.PostCompactionState;
+import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.config.ToolRegistrationConfig;
 import com.nexusai.application.agent.memory.SessionMemoryService;
@@ -390,5 +391,91 @@ class CompactCommandPersistWritebackTest {
             "", registry, null, null, sm, null, null, null, null, null, messageService);
         assertThat(out).isInstanceOf(String.class);
         return (String) out;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [P2-9 · 2026-09-12] ③ manual /compact 通道接共用 BUSY_SNAPSHOT 重试
+    // ════════════════════════════════════════════════════════════════════
+
+    /** 真机异常文案（取自 3461 实例 500 响应体）。 */
+    private static final String BUSY_SNAPSHOT_MSG =
+        "[SQLITE_BUSY_SNAPSHOT] Another database connection has already written to the database"
+            + " (database is locked)";
+
+    /** 生产形状：最外层 MyBatis 包装（message 不带 SQLITE_BUSY），文案在 cause 链上。 */
+    private static RuntimeException busySnapshot() {
+        return new RuntimeException(
+            "### Error updating database. Cause: org.sqlite.SQLiteException (see cause)",
+            new IllegalStateException(BUSY_SNAPSHOT_MSG));
+    }
+
+    /**
+     * [P2-9 · 2026-09-12] <b>③ manual {@code /compact} 首次抛 BUSY_SNAPSHOT → 共用重试后成功</b>。
+     *
+     * <p><b>WHY（规则九）</b>：manual 与 auto/reactive/SM/partial 走的是<b>同一个</b> DB 出口
+     * （{@code MessageService.appendPostCompactMessages}，先读 knownIds 拿读快照再写）→ WAL 下并发提交
+     * 顶掉快照即抛 BUSY_SNAPSHOT，属于<b>同源故障</b>。此前只有 partial 有重试，manual 命中即
+     * {@code PERSIST_FAILED}（用户可见「压缩结果写库失败」+ 下轮重复压缩）。本用例钉死
+     * 「同源故障 = 同策略」。
+     *
+     * <p><b>RED</b>：把 {@code applyResultToState} 的直接通道改回裸调
+     * {@code messageService.appendPostCompactMessages(...)}（不包 {@link SqliteBusyRetry}）→ 第 1 次
+     * 就抛 → outcome 变 {@code PERSIST_FAILED}、调用次数 = 1 → 红。
+     */
+    @Test
+    @DisplayName("[P2-9] ③ manual：首次 BUSY_SNAPSHOT → 共用重试后成功（PERSISTED，不降级不谎报）")
+    void manualChannelRetriesBusySnapshotThenSucceeds() {
+        MessageService messageService = mock(MessageService.class);
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        when(messageService.appendPostCompactMessages(eq(SESSION), anyList())).thenAnswer(inv -> {
+            if (calls.incrementAndGet() == 1) {
+                throw busySnapshot();
+            }
+            return inv.getArgument(1);
+        });
+        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        CompactionResult result = CompactCommand.call("  ", traditionalCtx(List.of(
+            msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")))).compactionResult();
+
+        CompactCommand.ApplyOutcome outcome =
+            CompactCommand.applyResultToState(state, SESSION, result, messageService);
+
+        assertThat(outcome)
+            .as("BUSY_SNAPSHOT 是瞬态并发错误 → 重试后必须成功，不得让用户看到「写库失败」")
+            .isEqualTo(CompactCommand.ApplyOutcome.PERSISTED);
+        assertThat(calls.get()).as("第 1 次 BUSY → 第 2 次成功").isEqualTo(2);
+        assertThat(state.messages()).as("内存已替换为落库归一化列表").isNotEmpty();
+    }
+
+    /**
+     * [P2-9 · 2026-09-12] <b>③ manual BUSY_SNAPSHOT 耗尽 → {@code PERSIST_FAILED}（fail loud）</b>。
+     *
+     * <p>重试是<b>有限</b>的：持续 BUSY（如另一个写事务长时间不释放）必须显式失败并让用户看到
+     * 「历史未更新」告警，绝不静默当成功（规则十二）。
+     *
+     * <p><b>RED</b>：把耗尽分支改成静默返回（吞异常 / 返回 {@code PERSISTED}）→ 红。
+     */
+    @Test
+    @DisplayName("[P2-9] ③ manual：BUSY_SNAPSHOT 耗尽 → PERSIST_FAILED（尝试次数 = 共用上限，不静默）")
+    void manualChannelFailsLoudAfterBusyRetriesExhausted() {
+        MessageService messageService = mock(MessageService.class);
+        java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        when(messageService.appendPostCompactMessages(eq(SESSION), anyList())).thenAnswer(inv -> {
+            calls.incrementAndGet();
+            throw busySnapshot();
+        });
+        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        CompactionResult result = CompactCommand.call("  ", traditionalCtx(List.of(
+            msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")))).compactionResult();
+
+        CompactCommand.ApplyOutcome outcome =
+            CompactCommand.applyResultToState(state, SESSION, result, messageService);
+
+        assertThat(outcome)
+            .as("耗尽必须降级为显式失败（调用方在 displayText 里明示历史未更新）")
+            .isEqualTo(CompactCommand.ApplyOutcome.PERSIST_FAILED);
+        assertThat(calls.get())
+            .as("尝试次数 = 共用上限（与 ①②④⑤ 同档；另起一套 = 策略分裂复发）")
+            .isEqualTo(SqliteBusyRetry.MAX_WRITE_ATTEMPTS);
     }
 }

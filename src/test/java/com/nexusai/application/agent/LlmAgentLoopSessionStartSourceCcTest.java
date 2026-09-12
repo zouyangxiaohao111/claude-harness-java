@@ -17,6 +17,7 @@ import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -67,6 +68,18 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("[IMP-LL-02] SessionStart source 补 resume/clear（前端触发对齐）")
 class LlmAgentLoopSessionStartSourceCcTest {
+
+    /**
+     * 历史 /clear 用例停用说明 · [P0-0 / N1 · 2026-09-11 用户拍板]。
+     *
+     * <p>WHY：本类第 4 节两个用例断言「CommandController /clear 分支发射 SessionStart(source='clear')
+     * / SessionEnd(reason='clear')」——停用后 clear 分支已抛 ConflictException，两处发射点不可达。
+     * 发射代码按决策保留不删（砍掉属另一决策，仅登记），故用例只禁用、不删除。
+     */
+    private static final String CLEAR_DISABLED_REASON =
+        "[P0-0/N1 2026-09-11 用户拍板] /clear 已停用：CommandController 对 clear（含别名 reset/new）直接抛 "
+        + "ConflictException → 本用例覆盖的 SessionEnd/SessionStart 发射点已不可达（按决策保留不删，仅登记）。"
+        + "fail-loud 守卫见 CommandControllerBuiltInCommandsTest#executeBuiltin_clear_isDisabled_failsLoud。";
 
     /** 生产 sessionId 原始键（"sess-xxx" 格式 · SessionService.generateId 前缀）。 */
     private static final String SESSION_KEY = "sess-ab12cd34";
@@ -264,6 +277,7 @@ class LlmAgentLoopSessionStartSourceCcTest {
     // ── 4. clear：前端 /clear 命令 → CommandController /clear 分支发射 SessionStart('clear') ──
 
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear: CommandController /clear 分支发射 SessionStart source='clear'（CC conversation.ts:245）")
     void clearCommand_firesSessionStartSourceClear() {
         // WHY: web 端「clear 会话」= 前端 POST /api/command/builtins/clear/execute → 本分支。
@@ -297,6 +311,7 @@ class LlmAgentLoopSessionStartSourceCcTest {
      * SESSION_START（CC conversation.ts:69 → :245 顺序）。
      */
     @Test
+    @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear: CommandController /clear 分支先发射 SessionEnd(reason='clear') 再 SessionStart('clear')（CC conversation.ts:69→:245）")
     void clearCommand_firesSessionEndClearThenSessionStartClear() {
         List<HookEvent> captured = new ArrayList<>();
