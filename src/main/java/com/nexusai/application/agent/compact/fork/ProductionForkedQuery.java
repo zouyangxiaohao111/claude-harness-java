@@ -224,12 +224,17 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
         ProviderConfig config = configSupplier != null ? configSupplier.get() : null;
         LlmProvider provider = providerSupplier != null ? providerSupplier.get() : null;
 
-        // [IMP-MV2-09 T9] userContext 前置 meta user 消息 · 对齐 CC query.ts:660
+        // [IMP-MV2-09 T9] userContext 前置 meta user 消息 · 对齐 CC query.ts:660/900
         //   {@code prependUserContext(messagesForQuery, userContext)} —— fork 重建主线程
         //   消息前缀（forkedAgent.ts:545-556 透传 userContext 后 fork 自身 query 再前置）；
         //   CloudeMd/currentDate 等上下文是 Anthropic prompt cache 前缀一部分，不前置则
         //   fork 消息前缀与主线程不一致（缓存永不命中）。空 userContext → 原列表（no-op）。
-        //   StreamCompactSummary.withUserContextPrepended 同款语义（compact fork 路径先例）。
+        //   [userctx-single-prepend] 这里是 userContext 的<b>唯一</b>前置点：上游
+        //   StreamCompactSummary 不再前置（CC forkedAgent.ts:543 initialMessages 不贴
+        //   userContext；只把 userContext 当参数透传到发送边界，query.ts:900 贴一次）。
+        //   两处都贴 → 请求变 [meta, meta, ...]（metaUserMessage 每次 UUID.randomUUID()
+        //   且 prependUserContext 不幂等）→ 与主线程 [meta, ...] 前缀错位，message[1]
+        //   起 prompt cache 永不命中。
         List<ChatMessageDto> runningMessages = new ArrayList<>(
             com.nexusai.application.agent.loop.AgentLoopContext.prependUserContext(
                 new ArrayList<>(params.messages()), params.userContext()));

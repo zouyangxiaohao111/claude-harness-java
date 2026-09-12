@@ -6,7 +6,7 @@
  *   增长文本做**增量尾窗解析**（冻结前部块缓存为 React 元素），无整段 innerHTML 重写，
  *   根治「打字到代码块/长内容卡顿」。[markdown-fix] 不跑文本预处理（全局改写会破坏
  *   尾窗 verbatim-slice 不变量）；代码块由真实语法树渐进成形（未闭合 fence 也产 code 节点）。
- * - streaming=false（缺省）：settled 一次全量 —— parseGfmWithMath →
+ * - streaming=false（缺省）：settled 一次全量 —— [rescue] 脏输入抢救（repair）→ parseGfmWithMath →
  *   引用自愈 / ```math / shiki 高亮都在这臂生效。
  *
  * [chat-switch-stream-align] deepseek 对照两项增强：
@@ -25,6 +25,7 @@ import { memo, useMemo, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { IncrementalMarkdownParser } from './incremental.ts'
 import { parseGfm, parseGfmWithMath } from './parse.ts'
+import { PROD_REPAIR_OPTS, repair } from './rescue.ts'
 import {
   collectReferenceTargets,
   createReferenceTargets,
@@ -51,12 +52,19 @@ export interface MarkdownTextProps {
 
 /** 一次 settled 全量渲染：带 math 语法 → 引用解析 + 脚注区。
  *  [markdown-fix] 对齐 dsh：不再跑 applySettledPatches 文本预处理（原整文本正则会把围栏内
- *  #include/#define/#region/python #! 等代码行插空格、奇数 ``` 全剥离 → 同段代码「流式对收口错」）。 */
+ *  #include/#define/#region/python #! 等代码行插空格、奇数 ``` 全剥离 → 同段代码「流式对收口错」）。
+ *  [rescue] 与之相反：rescue 的判据取自真解析器（非整文本正则），且只做「还原模型本意的断行/
+ *  补空格」，不碰围栏内代码 —— 两者不冲突（见 rescue.ts 的 C1/C3 约束）。 */
 function renderSettled(
   text: string,
   onRunHtml: ((code: string) => void) | undefined,
 ): ReactNode[] {
-  const root = parseGfmWithMath(text)
+  // [rescue] 脏输入抢救：把模型输出的粘连标记还原成解析器能读懂的形态。
+  // 只走 settled（方案 B）——流式臂不调用，避免长度改写破坏增量解析器的「前缀原样」
+  // 不变量。流式期仍会裸露，收口时一次终跳修正（MarkdownText 本就有该机制）。
+  // 必须留在 renderSettled 内部（而非调用侧）：settledCache 的键是**原始正文**，
+  // 在调用侧先修补会让键变成修补后的字符串，且复制/搜索/ContentGuard 会看到被改写的正文。
+  const root = parseGfmWithMath(repair(text, PROD_REPAIR_OPTS).out)
   const targets = createReferenceTargets()
   collectReferenceTargets(root.children, targets)
   const context = {

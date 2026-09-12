@@ -3,8 +3,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { MarkdownText, acquireStreamingRenderer } from '../MarkdownText.tsx'
 
 const noop = () => {}
-function render(text: string, streaming = false) {
-  return renderToStaticMarkup(<MarkdownText text={text} streaming={streaming} onRunHtml={noop} />)
+function render(text: string, streaming = false, className?: string) {
+  return renderToStaticMarkup(<MarkdownText text={text} streaming={streaming} className={className} onRunHtml={noop} />)
 }
 
 describe('breaks 软换行（对齐旧 marked breaks:true）', () => {
@@ -108,7 +108,7 @@ describe('XSS 自持（替代 DOMPurify）', () => {
   })
 })
 
-describe('streaming 与 settled 一致性（[markdown-fix] 去 patches 后同源文本逐字节一致）', () => {
+describe('streaming 与 settled 一致性（[markdown-fix] 去 patches 后同源；[rescue] 粘连标记是唯一例外）', () => {
   it('heading/段落/表格/列表/强调/链接 两种形态渲染一致', () => {
     const text = '## 标题\n\n一段有 **加粗** 与 [链接](https://e.com) 的文本。\n\n| x | y |\n| --- | --- |\n| 1 | 2 |\n\n- 甲\n- 乙'
     expect(render(text, true)).toBe(render(text, false))
@@ -118,12 +118,80 @@ describe('streaming 与 settled 一致性（[markdown-fix] 去 patches 后同源
     expect(html).toContain('<sup>1</sup>')
     expect(html).toContain('data-footnotes')
   })
-  it('`##核心`（无空格 ATX）两态一致按 CommonMark 段落渲染（原 settled-only patch 已移除 · 对齐 dsh）', () => {
-    const text = '##核心\n\n正文'
-    expect(render(text, true)).toBe(render(text, false))
-    const settled = render(text, false)
-    expect(settled).toContain('##核心')
-    expect(settled).not.toContain('<h2>')
+  it('无空格 ATX 标题被抢救为真标题（有意偏离 dsh）', () => {
+    // 此处有意偏离 deepseek-harness：dsh 明文选择「不修复格式错误的模型输出」
+    // （其 parse.ts 注释自述 "not a regex rewrite or malformed-model-output repair"），
+    // 并把该降级行为钉死为测试契约。本项目选择抢救 —— 依据：全库 1143 条真实 assistant
+    // 消息实测，中文模型输出里 `##标题`（# 后无空格）是系统性习惯，不修则整块裸露。
+    // 详见 docs/zjkycode/specs/2026-09-12-markdown-dirty-input-rescue-design.md §8。
+    const settled = render('##核心\n正文\n')
+    expect(settled).toContain('<h2>核心</h2>')
+    expect(settled).not.toContain('##核心')
+    // 两态不再逐字节相等：流式臂不抢救（方案 B）。差异只允许是「裸露减少」——
+    // 写成对照形态（两臂各有正向 + 镜像反向），「仍然裸露」与「没有变成标题」都要钉住。
+    const streaming = render('##核心\n正文\n', true)
+    expect(streaming).toContain('<p>##核心')
+    expect(streaming).not.toContain('<h2>')
+  })
+})
+
+// —— 以下两条 [rescue] describe 按设计文档 §7 的层序排列（层 3 两态 → 层 4 回滚哨兵）；
+//    历史回归钉（[markdown-fix] / [chat-switch-stream-align]）统一排在其后。
+describe('[rescue] 两态差异只允许是「裸露减少」', () => {
+  it('流式臂不抢救：含粘连标记的文本在 streaming 下仍裸露', () => {
+    const t = '##一句话结论\n'
+    expect(render(t, true)).toContain('##一句话结论')      // 流式仍裸露（预期）
+    expect(render(t, false)).toContain('<h2>一句话结论</h2>')  // 定稿已抢救
+  })
+  it('P1 路径的两态：定稿救出表格、流式仍裸露', () => {
+    const t = '##已压缩|批次 |内容 |\n|---|---|\n|1 |a |\n'
+    expect(render(t, true)).toContain('##已压缩')
+    expect(render(t)).toContain('<table>')
+  })
+  it('P0 放弃闸下 P2 仍生效（两态差异只是裸露减少）', () => {
+    const t = '##标题\n正文```\n'
+    const settled = render(t)
+    expect(settled).toContain('<h2>标题</h2>')   // P2 生效
+    expect(settled).toContain('正文```')          // P0 被平衡闸挡住，围栏原样
+    expect(render(t, true)).toContain('##标题')   // 流式仍裸露
+  })
+  it('抢救与 className 无关（用户气泡 user-text md 同路）', () => {
+    // 用户气泡的真接线在 MessageList.tsx（ContentGuard className="user-text md" → MarkdownText settled）；
+    // 本测试钉的是 renderSettled 不读 className，故两类气泡同路。有 @引用 的用户消息走另一条路，不抢救。
+    const html = render('##一句话结论', false, 'user-text md')
+    expect(html).toContain('<h2>一句话结论</h2>')
+  })
+})
+
+describe('[rescue] 层 4 · 回滚哨兵（抢救不破坏合法语法）', () => {
+  it('合法 ATX 一级标题仍出 <h1>', () => {
+    const html = render('# 标题\n')
+    expect(html).toContain('<h1>标题</h1>')
+  })
+  it('合法无序列表仍渲染为 <ul><li>（回滚守卫）', () => {
+    const html = render('- 项一\n- 项二\n')
+    expect(html).toContain('<ul>')
+    expect(html.match(/<li>/g)).toHaveLength(2)
+  })
+  it('链接引用定义仍被解析（`[foo]: /url` + `[foo]`）', () => {
+    // 注：不断言 href —— '/url' 是相对 URL，会 render.tsx 的 sanitizeUrl 协议白名单
+    // （仅 http/https/mailto）判空而降级为纯文本。本测试钉的是「definition 仍被解析」：
+    // 引用被解析 ⇒ 渲染为 label 文本；对照：无定义时方括号会保留（见下条）。
+    // 本用例在 rescue 关闭时同样绿 —— 它钉的是回归边界，不是 rescue 行为。
+    const html = render('[foo]: /url\n\n见 [foo]\n')
+    expect(html).toContain('见 foo')
+    expect(html).not.toContain('[foo]')
+  })
+  it('对照：无定义的引用保留方括号字面量', () => {
+    expect(render('见 [foo]\n')).toContain('[foo]')
+  })
+  it('围栏内的表格分隔行与无空格 ATX 形状一律不被改动', () => {
+    // 最危险的雷：`|---|` / `##x` 恰好是 P1/P2 的判据形状，围栏态一判错就会被改写
+    const html = render('```\n|---|\n##不是标题\n```\n')
+    expect(html).toContain('|---|')
+    expect(html).toContain('##不是标题')
+    expect(html).not.toContain('<h2>')
+    expect(html).not.toContain('<table>')
   })
 })
 

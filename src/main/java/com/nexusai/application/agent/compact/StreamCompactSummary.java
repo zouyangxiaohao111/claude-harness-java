@@ -6,7 +6,6 @@ import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.compact.fork.ForkedAgentParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
-import com.nexusai.application.agent.loop.AgentLoopContext;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.prompt.SystemPromptSplitter;
 import com.nexusai.application.agent.tool.AbortController;
@@ -74,8 +73,16 @@ import java.util.function.Supplier;
  * <ul>
  *   <li>[IMP2-23 ⊕-7] CC {@code runForkedAgent}（forkedAgent.ts:489）在 Java 端由
  *       {@link #tryForkCacheSharing} 委托执行（旧内联 buildForkRequest + streamOnce 双轨
- *       已删除，收敛为 RunForkedAgent 单一实现）；userContext 前置（query.ts:660）经
- *       {@link #withUserContextPrepended} 保留在 forkContextMessages 副本队首。</li>
+ *       已删除，收敛为 RunForkedAgent 单一实现）。</li>
+ *   <li><b>[userctx-single-prepend] userContext 只在发送边界前置一次</b>：CC
+ *       {@code forkedAgent.ts:543} 的 {@code initialMessages = [...forkContextMessages,
+ *       ...promptMessages]} <b>不贴</b> userContext；userContext 作为参数透传到 query
+ *       （forkedAgent.ts:569-573），由 {@code query.ts:900}
+ *       {@code messages: prependUserContext(messagesForQuery, userContext)} 在<b>发请求那一刻</b>
+ *       贴一次。本类此前额外前置一次（外层副本）→ 请求变 {@code [meta, meta, ...]}，
+ *       与主线程 {@code [meta, ...]} 前缀不一致 → message[1] 起 prompt cache 永不命中。
+ *       现由 {@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery}
+ *       内层前置独自承担（唯一前置点）。</li>
  *   <li>CC {@code isSessionActivityTrackingActive} 对应 {@code sessionActivityTrackingActive}
  *       标志 + {@code sessionActivitySignal} 回调。</li>
  * </ul>
@@ -487,42 +494,6 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * [IMP2-23 ⊕-7] userContext 前置后的 cache-safe params 副本 · 对齐 CC query.ts:660
-     * {@code prependUserContext(messagesForQuery, userContext)}。
-     *
-     * <p><b>[RES-② F1] WHY</b>: 用户上下文（claudeMd?/currentDate）是 Anthropic prompt cache
-     * 前缀的一部分，fork 不前置则前缀与主线程不一致、消息前缀缓存永不命中。旧内联实现
-     * buildForkRequest 在消息队首前置 {@code <system-reminder>} meta user 消息；收敛后
-     * RunForkedAgent 的 initialMessages = [...forkContextMessages, ...promptMessages]
-     * （forkedAgent.ts:524），故前置语义迁移为「forkContextMessages 副本队首前置」——
-     * 发送消息序列不变（[meta, ...forkCtx, summaryRequest]）。userContext 空 map 时原样
-     * 返回（对齐 CC api.ts:457-459 空 context 不污染前缀）。
-     *
-     * @param cs 原 cache-safe params
-     * @return 副本（forkContextMessages 已前置）或原对象（无 userContext / 空 map）
-     */
-    private static CacheSafeParams withUserContextPrepended(CacheSafeParams cs) {
-        if (cs == null || cs.userContext() == null || cs.userContext().isEmpty()) {
-            return cs;
-        }
-        List<ChatMessageDto> forkMessages = new ArrayList<>();
-        if (cs.forkContextMessages() != null) {
-            forkMessages.addAll(cs.forkContextMessages());
-        }
-        // [RES-② F1] 复用主 loop 同款实现（LlmAgentLoop:2802 同一实现，渲染字节一致 → fork
-        //   前缀与主线程 cache key 对齐）；返回新 CacheSafeParams（record 不可变 → 副本）。
-        List<ChatMessageDto> prepended = AgentLoopContext.prependUserContext(forkMessages, cs.userContext());
-        if (log.isDebugEnabled()) {
-            log.debug("[StreamCompactSummary] fork 消息 userContext 前置: keys={} 消息 {} 条 → {} 条"
-                    + "（forkCtx={} + summary=1）",
-                cs.userContext().size(), forkMessages.size(), prepended.size(),
-                cs.forkContextMessages() == null ? 0 : cs.forkContextMessages().size());
-        }
-        return new CacheSafeParams(cs.systemPrompt(), cs.userContext(), cs.systemContext(),
-            cs.toolUseContext(), prepended, cs.useGlobalCacheScope());
-    }
-
-    /**
      * fork 缓存共享路径 · [IMP2-23 ⊕-7] 委托 {@link RunForkedAgent#run} 单一实现
      * （forkedAgent.ts:489-626），对齐 CC compact.ts:1188-1200：
      * {@code runForkedAgent({promptMessages:[summaryRequest], cacheSafeParams,
@@ -562,7 +533,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
         try {
             ForkedAgentParams params = new ForkedAgentParams(
                 List.of(CompactConversation.buildSummaryRequestMessage(summaryRequest)),  // promptMessages = [summaryRequest]（compact.ts:1189）
-                withUserContextPrepended(cacheSafeParams),            // F1：userContext 前置（query.ts:660）
+                cacheSafeParams,                                      // F1：userContext 不在此前置（见下方注释）
                 RunForkedAgent.createCompactCanUseTool(),             // compact.ts:1191 deny
                 QuerySource.COMPACT,                                  // compact.ts:1192
                 "compact",                                            // compact.ts:1193 forkLabel
@@ -574,9 +545,17 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 null,                                                 // onMessage
                 null);                                                // readFileState
             if (log.isDebugEnabled()) {
-                log.debug("[StreamCompactSummary] fork 缓存共享触发: forkMsgs={} userContextKeys={}"
+                // [userctx-single-prepend] 消息条数口径：此处 forkContextMessages 条数 = 未前置的
+                //   fork 前缀条数；userContext 非空时 meta 消息由 ProductionForkedQuery 在发送边界
+                //   前置一次（query.ts:900 = prependUserContext(messagesForQuery, userContext)），
+                //   实际下发条数 = forkCtx + 1(summary) + (userContext 空 ? 0 : 1)。
+                //   本类<b>不再</b>前置（CC forkedAgent.ts:543 initialMessages 不贴 userContext）。
+                log.debug("[StreamCompactSummary] fork 缓存共享触发: forkCtxMsgs={} userContextKeys={}"
+                        + " 实际下发Msgs={}（发送边界前置 1 条 meta）"
                         + " maxOutputTokens=null skipCacheWrite=true maxTurns=1 querySource=compact",
-                    cacheSafeParams.forkContextMessages().size(), cacheSafeParams.userContext().keySet());
+                    cacheSafeParams.forkContextMessages().size(), cacheSafeParams.userContext().keySet(),
+                    cacheSafeParams.forkContextMessages().size() + 1
+                        + (cacheSafeParams.userContext().isEmpty() ? 0 : 1));
             }
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
 
@@ -601,10 +580,13 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                         cacheSharingSuccessAttrs(preCompactTokenCount, result));
                 }
                 if (log.isInfoEnabled()) {
+                    // [userctx-single-prepend] 口径同上方 debug：+1 恒为 summaryRequest；userContext
+                    //   非空时发送边界再前置 1 条 meta（本类不前置）。
                     log.info("[StreamCompactSummary] fork 缓存共享成功: forkMsgs={} summaryChars={} usage={} · CC compact.ts:1201-1230",
                         params.promptMessages().size()
                             + (cacheSafeParams.forkContextMessages() == null
-                                ? 0 : cacheSafeParams.forkContextMessages().size()),
+                                ? 0 : cacheSafeParams.forkContextMessages().size())
+                            + (cacheSafeParams.userContext().isEmpty() ? 0 : 1),
                         text.length(), success.usage());
                 }
                 return success;

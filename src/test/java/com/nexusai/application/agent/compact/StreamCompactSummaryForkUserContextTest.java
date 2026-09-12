@@ -3,11 +3,13 @@ package com.nexusai.application.agent.compact;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
+import com.nexusai.application.agent.compact.fork.ProductionForkedQuery;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.CacheScope;
 import com.nexusai.application.agent.prompt.SystemPromptAssembler;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -30,24 +32,28 @@ import java.util.function.Consumer;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * [RES-② F1] fork 消息 userContext 前置 · 对齐 CC query.ts:660 {@code prependUserContext}。
+ * fork 消息 userContext 前置 · 对齐 CC {@code query.ts:900} {@code prependUserContext}
+ * （forkedAgent.ts:543 initialMessages <b>不贴</b> userContext，userContext 作参数透传到
+ * 发送边界才贴一次）。
  *
- * <p><b>WHY 本测试存在（意图）</b>: CC 对主线程与 fork 查询都执行
- * {@code prependUserContext(messagesForQuery, userContext)}（query.ts:660）—— 用户上下文
- * （claudeMd?/currentDate）是 Anthropic prompt cache 前缀的一部分，fork 不前置则前缀与主线程
- * 不一致、fork 缓存共享永不命中。F1 使 {@code CacheSafeParams.userContext} 从死字段变活：
- * forkMessages = [userContext 元消息, ...forkContextMessages, summaryRequest]。
+ * <p><b>WHY 本测试存在（意图）</b>: 用户上下文（claudeMd?/currentDate）是 Anthropic prompt
+ * cache 前缀的一部分 —— fork 不前置则消息前缀与主线程不一致、fork 缓存共享永不命中；
+ * 但前置<b>两次</b>（StreamCompactSummary 外层 + ProductionForkedQuery 内层）会得到
+ * {@code [meta, meta, ...]}，与主线程 {@code [meta, ...]} 从 message[1] 起错位，同样
+ * 使 prompt cache 永不命中，且 `AgentLoopContext.prependUserContext` 无去重、每次
+ * {@code UUID.randomUUID()}（不幂等）。本测试钉扎「<b>恰好前置一次</b>」。
  *
- * <p><b>[IMP2-23 ⊕-7] 断言面迁移</b>: 旧内联 {@code buildForkRequest} 已删除（fork 双实现
- * 收敛为 RunForkedAgent 委托），F1 前置语义经 {@code StreamCompactSummary.withUserContextPrepended}
- * 保留在 cache-safe params 副本队首；本测试经 {@link ForkConvergenceCcContractTest.RecordingQuery}
- * 捕获委托后的 ForkQueryParams 消息序列断言（发送序列不变：[meta, ...forkCtx, summary]）。
+ * <p><b>[userctx-single-prepend] 断言面 = 真实发给 provider 的 messages</b>: 旧版本经
+ * {@link ForkConvergenceCcContractTest.RecordingQuery} 假替身断言（该替身只记录
+ * RunForkedAgent 交给 seam 的中间产物，<b>从不执行</b> ProductionForkedQuery 的发送边界
+ * 前置）→ 双前置 bug 恒绿。现改为注入真实 {@code ProductionForkedQuery} + 捕获 provider 入参的
+ * {@link ForkConvergenceCcContractTest.CapturingProvider}。
  *
  * <p><b>断言 WHY</b>:
  * <ul>
- *   <li>userContext 非空 → 队首是 {@code <system-reminder>} meta user 消息且含 userContext key
- *       （若将来有人改回"不前置"，本断言 RED → 缓存共享目标再次失活）</li>
- *   <li>userContext 空 map → 原样返回（对齐 CC api.ts:457-459，空 context 不污染前缀）</li>
+ *   <li>userContext 非空 → provider 实收 = [meta, ...forkCtx, summary] 且 meta <b>恰好 1 条</b>
+ *       （外层前置加回去 → 5 条 / 2 meta → RED）</li>
+ *   <li>userContext 空 map → 2 条无 meta（对齐 CC api.ts:457-459，空 context 不污染前缀）</li>
  *   <li>INV-7 不变量不回归：maxOutputTokens=null / skipCacheWrite=true / abortController 透传
  *       （经委托参数断言）</li>
  * </ul>
@@ -57,7 +63,7 @@ class StreamCompactSummaryForkUserContextTest {
     private static final String SUMMARY_REQUEST = "请对会话做摘要";
 
     @Test
-    @DisplayName("F1: userContext 非空 → forkMessages 队首前置 meta user 消息（forkCtx 后 summary 最后）")
+    @DisplayName("F1（真实生产路径）: provider 实收队首 1 条 meta user 消息（forkCtx 后 summary 最后）")
     void forkMessages_prependsUserContextMetaMessage() {
         CacheSafeParams cs = new CacheSafeParams(
             List.of("systemPrompt"),
@@ -66,17 +72,26 @@ class StreamCompactSummaryForkUserContextTest {
             baseContext(),
             List.of(userMessage("c1", "ctx1"), userMessage("c2", "ctx2")));
         AbortController abort = new AbortController();
-        ForkConvergenceCcContractTest.RecordingQuery recording = new ForkConvergenceCcContractTest.RecordingQuery();
-        recording.respond(new ForkedAgentResult(
-            List.of(assistantMessage("summary text")), ForkedAgentResult.ForkUsage.empty()));
+        ForkConvergenceCcContractTest.CapturingProvider provider =
+            new ForkConvergenceCcContractTest.CapturingProvider();
 
-        compactSummaryWith(cs, abort, recording).streamCompactSummary(
+        scsWithRealForkLoop(cs, abort, provider).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
             "model", fakeProvider(), ProviderConfig.empty());
 
-        // 前置后总条数 = 1(userContext meta) + 2(forkCtx) + 1(summary) = 4
-        List<ChatMessageDto> fork = recording.lastParams().messages();
-        assertThat(fork).hasSize(4);
+        // ⚠️ 断言面 = 真实 ProductionForkedQuery 实际发给 provider 的 messages（旧断言读
+        //   RunForkedAgent 交给 seam 的中间产物 → 假替身从不执行 ProductionForkedQuery:233-235
+        //   的发送边界前置 → 「外层 + 内层双前置」bug 在该替身下恒绿 → 已被本改造取代）。
+        List<ChatMessageDto> fork = provider.lastHistory();
+        assertThat(fork).as("fake provider 必须真实收到 fork 请求（否则本测试空转）").isNotNull();
+        // 1(userContext meta) + 2(forkCtx) + 1(summary) = 4（双层都贴 → 5 条 → RED）
+        assertThat(fork)
+            .as("userContext 只前置一次（CC query.ts:900）：双层都贴 → [meta, meta, ...] → 主线程"
+                + " [meta, ...] 前缀错位 → message[1] 起 prompt cache 永不命中")
+            .hasSize(4);
+        assertThat(fork.stream().filter(ChatMessageDto::isMeta).count())
+            .as("meta 消息必须恰好 1 条（AgentLoopContext.prependUserContext 无去重、不幂等）")
+            .isEqualTo(1);
         ChatMessageDto meta = fork.get(0);
         assertThat(meta.isMeta()).as("userContext 元消息必须 isMeta=true（CC createUserMessage isMeta:true）").isTrue();
         assertThat(meta.role()).isEqualTo(Role.user);
@@ -90,20 +105,20 @@ class StreamCompactSummaryForkUserContextTest {
     }
 
     @Test
-    @DisplayName("F1: userContext 空 map → forkMessages 原样返回（不污染前缀）")
+    @DisplayName("F1（真实生产路径）: userContext 空 map → provider 实收 2 条无 meta（不污染前缀）")
     void forkMessages_emptyUserContext_passthrough() {
         CacheSafeParams cs = new CacheSafeParams(
             List.of("systemPrompt"), Map.of(), Map.of(), baseContext(),
             List.of(userMessage("c1", "ctx1")));
-        ForkConvergenceCcContractTest.RecordingQuery recording = new ForkConvergenceCcContractTest.RecordingQuery();
-        recording.respond(new ForkedAgentResult(
-            List.of(assistantMessage("summary text")), ForkedAgentResult.ForkUsage.empty()));
+        ForkConvergenceCcContractTest.CapturingProvider provider =
+            new ForkConvergenceCcContractTest.CapturingProvider();
 
-        compactSummaryWith(cs, new AbortController(), recording).streamCompactSummary(
+        scsWithRealForkLoop(cs, new AbortController(), provider).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
             "model", fakeProvider(), ProviderConfig.empty());
 
-        List<ChatMessageDto> fork = recording.lastParams().messages();
+        List<ChatMessageDto> fork = provider.lastHistory();
+        assertThat(fork).as("fake provider 必须真实收到 fork 请求").isNotNull();
         assertThat(fork).hasSize(2);
         assertThat(fork.get(0).content()).isEqualTo("ctx1");
         assertThat(fork.get(1).content()).isEqualTo(SUMMARY_REQUEST);
@@ -267,6 +282,25 @@ class StreamCompactSummaryForkUserContextTest {
     // ════════════════════════════════════════════════════════════════════
     // 测试工具
     // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 13 参构造 + <b>真实生产 fork loop</b>（{@link ProductionForkedQuery}）·
+     * 消息拼接断言面（「最终发给 provider 的 messages」）。
+     *
+     * <p><b>为什么不用 {@link ForkConvergenceCcContractTest.RecordingQuery}</b>: 假替身只记录
+     * RunForkedAgent 交给 seam 的中间产物，<b>从不执行</b> {@code ProductionForkedQuery:233-235}
+     * 的发送边界 {@code prependUserContext} —— 「外层 + 内层双前置」bug 在替身下恒绿。
+     */
+    private static StreamCompactSummary scsWithRealForkLoop(
+            CacheSafeParams cs, AbortController abort,
+            ForkConvergenceCcContractTest.CapturingProvider provider) {
+        StreamCompactSummary scs = new StreamCompactSummary(
+            () -> fakeProvider(), () -> "model", ProviderConfig::empty,
+            () -> cs, () -> abort, null, null, false, true, false, null, null, null);
+        scs.setForkedQuery(new ProductionForkedQuery(
+            () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
+        return scs;
+    }
 
     /** 13 参构造 + fork seam 注入（⊕-7 委托断言面）。 */
     private static StreamCompactSummary compactSummaryWith(CacheSafeParams cs, AbortController abort,
