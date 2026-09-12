@@ -2,6 +2,7 @@ package com.nexusai.application.agent.loop;
 
 import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.TaskBudget;
+import com.nexusai.application.agent.permission.hook.HookPermissionResolver;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.infra.llm.LlmProvider.ChatRequestOptions.ThinkingConfig;
@@ -17,9 +18,16 @@ import java.util.function.Consumer;
  *
  * <p><b>[H7-arch Phase 5-2 B1]</b> 旧 {@code agent.QueryParams}（run 契约）已改名
  * {@code RunRequest}；本 record 承载 loop 级输入，严格对齐 CC QueryParams 13 字段：
- * 6 必填（messages / systemPrompt / userContext / systemContext /
- * toolUseContext / querySource）+ 6 可选（fallbackModel / maxOutputTokensOverride /
- * maxTurns / skipCacheWrite / taskBudget / deps）。
+ * 7 必填（messages / systemPrompt / userContext / systemContext /
+ * <b>canUseTool</b> / toolUseContext / querySource）+ 6 可选（fallbackModel /
+ * maxOutputTokensOverride / maxTurns / skipCacheWrite / taskBudget / deps）。
+ *
+ * <p><b>[5b · canUseTool 通道恢复]</b> {@link #canUseTool} 为 CC 第 5 必填字段
+ * （query.ts:243）。CC 侧 fork 经 {@code createSubagentContext()} 后用**自己的受限
+ * canUseTool** 调同一个 query（forkedAgent.ts:569 {@code canUseTool} 透传）；
+ * H9-GAP-4 删除本字段使主循环无法承载受限权限 → fork 只能自建循环。本批把通道补回：
+ * <b>Java 侧 null 语义 = 未注入 → 回落 {@code ToolPermissionGate}（现状）</b>，
+ * 非 null → 逐位覆盖内层 gate 决策。
  *
  * <p><b>[IMP2-05 值域复活] {@link #querySourceValue}</b> —— 第 18 字段（String，nullable）。
  * 枚举 {@code querySource} 承担守卫类别，本字段承担 CC 动态 agentType 级精确值
@@ -55,11 +63,24 @@ public record QueryParams(
     String systemPrompt,                                             // CC 必填 · CC original: systemPrompt (Open-ClaudeCode/src/query.ts:182)
     Map<String, String> userContext,                                 // CC 必填（⚠️ 必须 Map，非 String！）· CC original: userContext {[k]:string} (Open-ClaudeCode/src/query.ts:183)
     Map<String, String> systemContext,                               // CC 必填（⚠️ 必须 Map）· CC original: systemContext (Open-ClaudeCode/src/query.ts:184)
-    // [merge 冲突解决] line B 删除 ToolHooks (R32-D 死代码, 0 生产调用)。
-    //   [H9-GAP-4] canUseTool 字段已删除: H9 复活后全仓 grep 仅 JavaDoc 引用, 无生产消费点
-    //   (StreamingToolExecutor gate 路径走 ToolPermissionGate.check 6 参 forceDecision, H8 路径)。
-    //   Java 端 canUseTool 等价物 = ToolPermissionGate.check (useCanUseTool.tsx:27 的 Java 实现),
-    //   QueryParams 上的 4 参壳是死结构 → 按 CC 对齐纪律删除, 消除"结构体无调用方"契约错位。
+    // [5b · canUseTool 通道恢复] 受限 canUseTool 覆盖（CC 必填第 5 字段）。
+    //   [历史] [merge 冲突解决] line B 曾删除 ToolHooks (R32-D 死代码, 0 生产调用)。
+    //   [历史] [H9-GAP-4] canUseTool 字段曾被删除，理由 = "全仓 grep 仅 JavaDoc 引用, 无生产消费点
+    //     (StreamingToolExecutor gate 路径走 ToolPermissionGate.check 6 参 forceDecision)"。
+    //   [5b 复核] 该结论**只对主线程成立、对 fork 不成立**：fork 最刚需的能力正是**按 input 内容判定**
+    //     的受限权限（CC createAutoMemCanUseTool, extractMemories.ts:170-229：Read/Grep/Glob 无条件放行、
+    //     同一个 Bash 仅只读命令放行、Edit/Write 仅 auto-memory 目录内），这种语义
+    //     `availableTools` 白名单表达不了 → 故本批恢复通道（D2 fork 收敛的硬前置）。
+    //   [形态] 类型 = {@link com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool}
+    //     —— 本仓既有的「CC CanUseToolFn 等价物」(HookPermissionResolver.java:132-152，签名
+    //     (tool, input, ctx, toolUseId, forceDecision) → DecisionResult)，与 fork 侧
+    //     {@code RunForkedAgent.ForkQueryParams.canUseTool} **同型**，5c 可零转换透传。
+    //   [默认] null = 未注入 → 回落现状：StreamingToolExecutor 内层消费
+    //     {@code ToolPermissionGate.check}(beans.permissionGate / createSpringBean)，
+    //     主线程 / 子代理 / hook agent 三路生产路径逐位不变（回归底线）。
+    //   CC original: {@code canUseTool: CanUseToolFn} (Open-ClaudeCode/src/query.ts:243) ·
+    //     消费点 query.ts:763 / :978 / :1174（StreamingToolExecutor 构造）/ :1671（runTools）。
+    HookPermissionResolver.CanUseTool canUseTool,
     ToolUseContext toolUseContext,                                   // CC 必填（com.nexusai.application.agent.tool.ToolUseContext）· CC original: toolUseContext (Open-ClaudeCode/src/query.ts:186)
     QuerySource querySource,                                         // CC 必填（compact ctor 校验非空）· CC original: querySource (Open-ClaudeCode/src/query.ts:188)
     // [IMP2-05 值域复活] 运行时 querySource 精确字符串（agentType 级：'agent:builtin:<type>' /
@@ -99,9 +120,10 @@ public record QueryParams(
      * run()/SubagentExecutor/ExecAgentHook 三调用方工厂。
      *
      * <p>覆盖 record 全部调用方必填字段；userContext/systemContext 默认空 Map。
-     * [H9-GAP-4] canUseTool 字段已删除 — Java 端 canUseTool 等价物是
-     * {@link ToolPermissionGate#check} (StreamingToolExecutor 生产路径), QueryParams
-     * 不再承载死结构。
+     * <b>[5b]</b> {@code canUseTool} 默认 null —— 三路生产调用方（主线程 run() /
+     * SubagentExecutor / ExecAgentHook）当前均不注入受限 canUseTool，取到的内层
+     * {@code ToolPermissionGate} 与 5b 之前<b>逐位相同</b>（回归底线）。分支/子代理如需受限
+     * 权限，经 {@link #withCanUseTool} 注入（5c fork 收敛消费）。
      * 可选字段（fallbackModel / skipCacheWrite /
      * maxOutputTokensOverride / taskBudget / maxTurns）可为 null（CC 可选语义）。
      *
@@ -134,6 +156,7 @@ public record QueryParams(
             ProviderConfig config) {
         return new QueryParams(
             messages, systemPrompt, Map.of(), Map.of(),
+            null, // [5b] canUseTool null → 内层回落 ToolPermissionGate（主线程/子代理/hook agent 现状，零行为变化）
             toolUseContext, querySource,
             null, // [IMP2-05] querySourceValue null → 发射侧回退 category.canonical()（向后兼容；
                   //       agent B 接线后经 withQuerySourceValue 注入 agentType 级精确值）
@@ -172,6 +195,7 @@ public record QueryParams(
     public QueryParams withQuerySourceValue(String querySourceValue) {
         return new QueryParams(
             messages, systemPrompt, userContext, systemContext,
+            canUseTool,
             toolUseContext, querySource, querySourceValue, fallbackModel,
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
@@ -189,6 +213,7 @@ public record QueryParams(
     public QueryParams withThinkingConfig(ThinkingConfig thinkingConfig) {
         return new QueryParams(
             messages, systemPrompt, userContext, systemContext,
+            canUseTool,
             toolUseContext, querySource, querySourceValue, fallbackModel,
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,
@@ -209,6 +234,34 @@ public record QueryParams(
     public QueryParams withOnToolProgress(Consumer<Tool.ToolProgress> onToolProgress) {
         return new QueryParams(
             messages, systemPrompt, userContext, systemContext,
+            canUseTool,
+            toolUseContext, querySource, querySourceValue, fallbackModel,
+            maxOutputTokensOverride, maxTurns, skipCacheWrite,
+            taskBudget, deps, config, modelName,
+            thinkingConfig,
+            onToolProgress);
+    }
+
+    /**
+     * [5b · canUseTool 通道恢复] 派生副本 · 注入受限 canUseTool（CC QueryParams 第 5 必填字段）。
+     *
+     * <p><b>WHY（INV-6 受限权限）</b>：fork 最刚需的能力是<b>按 input 内容判定</b>的权限
+     * （CC {@code createAutoMemCanUseTool}, extractMemories.ts:170-229：Read/Grep/Glob 放行、
+     * Bash 仅只读命令、Edit/Write 仅 auto-memory 目录内），`availableTools` 白名单无法表达。
+     * CC 侧 fork 走 {@code createSubagentContext()} 后把<b>自己的</b> canUseTool 传给同一个
+     * query（forkedAgent.ts:569）；本方法即 Java 侧的等价注入点。
+     *
+     * <p><b>契约</b>：与内层 {@code ToolPermissionGate.check} 6 参<b>同型</b>
+     * （{@code HookPermissionResolver.CanUseTool}，即 CC {@code CanUseToolFn} 的 Java 等价物）。
+     * 非 null → 覆盖内层 gate 决策；null → 回落 gate（现状，零行为变化）。
+     *
+     * @param canUseTool 受限权限判定函数（null = 清除覆盖 → 回落内层 gate）
+     * @return 仅 canUseTool 不同的副本
+     */
+    public QueryParams withCanUseTool(HookPermissionResolver.CanUseTool canUseTool) {
+        return new QueryParams(
+            messages, systemPrompt, userContext, systemContext,
+            canUseTool,
             toolUseContext, querySource, querySourceValue, fallbackModel,
             maxOutputTokensOverride, maxTurns, skipCacheWrite,
             taskBudget, deps, config, modelName,

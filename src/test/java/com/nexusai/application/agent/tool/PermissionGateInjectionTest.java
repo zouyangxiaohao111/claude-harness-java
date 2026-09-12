@@ -240,7 +240,10 @@ class PermissionGateInjectionTest {
             .isLessThan(toolExecuteIdx);
 
         // 3. 验证 gate null fallback: null 时退化为 allow (向后兼容单测)
-        assertThat(source).contains("if (permissionGate != null && ctx != null && ctx.permissionContext() != null)");
+        // [5b · canUseTool 通道] 该条件被提升为 `gateDecisionSourcePresent` 变量，并与受限
+        //   canUseTool 覆盖做 `∨`（canUseTool == null 时语义逐位不变）→ 断言去掉 `if (` 前缀，
+        //   仍钉住同一 fallback 条件（gate 非 null 且 ctx/permCtx 齐备），不随外层表达式形状漂移。
+        assertThat(source).contains("permissionGate != null && ctx != null && ctx.permissionContext() != null");
     }
 
     // ─────────────────────── 5. 决策 telemetry 归因 (h) (CC toolExecution.ts:948-977 + 1001-1022) ───────────────────────

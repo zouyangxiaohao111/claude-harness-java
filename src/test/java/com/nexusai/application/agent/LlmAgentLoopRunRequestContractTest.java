@@ -325,8 +325,11 @@ class LlmAgentLoopRunRequestContractTest {
         org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
             () -> new QueryParams(
                 messages, "sys", java.util.Map.of(), java.util.Map.of(),
+                // [5b] canUseTool 为第 5 字段（CC query.ts:243 必填；Java 侧 null = 回落内层 gate）；
+                // 本测试锁定 compact ctor 的 querySource 非空校验，canUseTool 传 null 不影响校验。
+                null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
-                // [IMP2-05] querySourceValue 为第 7 字段（精确值通道，null = 回退 category.canonical()）；
+                // [IMP2-05] querySourceValue 为第 8 字段（精确值通道，null = 回退 category.canonical()）；
                 // 本测试锁定 compact ctor 的 querySource 非空校验，querySourceValue 传 null 不影响校验。
                 null, null, null, null, null, null, null, null, ProviderConfig.empty(), "test-model",
                 null, null),

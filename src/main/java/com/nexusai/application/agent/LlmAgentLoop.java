@@ -5570,7 +5570,10 @@ public class LlmAgentLoop implements AgentLoop {
                 ? AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc, state, turnAssistantId,
                     (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
                     true /* deferredModifier */,
-                    buildSubagentAgentOptions(params.querySource(), params.thinkingConfig()), null /* assistantMessage 完整回调后注入 */)
+                    buildSubagentAgentOptions(params.querySource(), params.thinkingConfig()), null /* assistantMessage 完整回调后注入 */,
+                    // [5b] 受限 canUseTool 通道 · 三路生产路径恒 null（forLoop 未注入）→ 回落 beans.permissionGate，
+                    //   逐位不变；fork 收敛（5c）经 QueryParams.withCanUseTool 注入（INV-6）。
+                    params.canUseTool())
                 : null;
             // [R32-b12 Fix-v3 P1-1] 注入 telemetry bean · 修复 P1-1 阻塞缺陷:
             //   manual `new StreamingToolExecutor(...)` 绕过 Spring @Autowired,
@@ -6200,7 +6203,8 @@ public class LlmAgentLoop implements AgentLoop {
                                 state, turnAssistantId,
                                 (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
                                 true /* deferredModifier */,
-                                buildSubagentAgentOptions(params.querySource(), params.thinkingConfig()), null);
+                                buildSubagentAgentOptions(params.querySource(), params.thinkingConfig()), null,
+                                params.canUseTool()); // [5b] 受限 canUseTool 通道（三路生产路径恒 null → 现状）
                         }
                         log.info("[LlmAgentLoop] turn={} streaming-fallback: 已 tombstone {} 条部分消息 + 重建 executor · CC query.ts:712-741",
                             state.turnCount(), capturedMsg[0] != null ? 1 : 0);
@@ -6433,7 +6437,7 @@ public class LlmAgentLoop implements AgentLoop {
                 // 有 fallbackModel → 切换模型 + 清理 + 重建 executor + yield warning system message + 重试。
                 if (streamError instanceof FallbackTriggeredError fte) {
                     handleModelFallback(ctx, state, recoveryState, fte, capturedMsg, streamingExecRef,
-                        turnAssistantId, params.querySource(), params.thinkingConfig(), perTurnTuc, acc, reasoningBuf, seenToolCalls, seenToolIds, chunkCount, reasoningStartMs, reasoningEndMs, firstTokenMs);
+                        turnAssistantId, params.querySource(), params.thinkingConfig(), params.canUseTool(), perTurnTuc, acc, reasoningBuf, seenToolCalls, seenToolIds, chunkCount, reasoningStartMs, reasoningEndMs, firstTokenMs);
                     // handleModelFallback 仅处理 fallbackModel 非空；无 fallback → 不重试，走下方错误路径
                     if (fte.fallbackModel() != null && !fte.fallbackModel().isBlank()) {
                         log.info("[LlmAgentLoop] turn={} model fallback 恢复完成，重试 LLM 调用 ({} → {}) · CC query.ts:952-953",
@@ -6701,7 +6705,7 @@ public class LlmAgentLoop implements AgentLoop {
                         // [H7-arch Phase 5 P4 C3] 连续 529 达阈值 + 配置 fallback → TransientErrorHandler 抛错
                         // 对齐 CC query.ts:894-953: 清理 + 重建 executor + warning message + 重试。
                         handleModelFallback(ctx, state, recoveryState, fte, capturedMsg, streamingExecRef,
-                            turnAssistantId, params.querySource(), params.thinkingConfig(), perTurnTuc, acc, reasoningBuf, seenToolCalls, seenToolIds, chunkCount, reasoningStartMs, reasoningEndMs, firstTokenMs);
+                            turnAssistantId, params.querySource(), params.thinkingConfig(), params.canUseTool(), perTurnTuc, acc, reasoningBuf, seenToolCalls, seenToolIds, chunkCount, reasoningStartMs, reasoningEndMs, firstTokenMs);
                         if (fte.fallbackModel() != null && !fte.fallbackModel().isBlank()) {
                             log.warn("[LlmAgentLoop] turn={} 529 触发 model fallback ({} → {})，重试 · CC withRetry.ts:337-351",
                                 state.turnCount(), fte.originalModel(), fte.fallbackModel());
@@ -7481,7 +7485,9 @@ public class LlmAgentLoop implements AgentLoop {
                     params.thinkingConfig(), allowedDecisionsView, toolDecisionsForExec, params.onToolProgress(),
                     computeReasoningDurationMs(reasoningStartMs, reasoningEndMs),
                     // [B7-R9] 输出解码耗时 decodeMs（工具轮 assistant 消息挂载；同 reasoningDurationMs 传参位）
-                    computeDecodeMs(firstTokenMs));
+                    computeDecodeMs(firstTokenMs),
+                    // [5b] 受限 canUseTool 通道（fallback 路径重建 executor 也要拿到；三路生产路径恒 null → 现状）
+                    params.canUseTool());
                 if (!"continue".equals(result)) {
                     break;
                 }
@@ -9926,6 +9932,8 @@ public class LlmAgentLoop implements AgentLoop {
             String turnAssistantId,
             QuerySource querySource,
             ThinkingConfig thinkingConfig,
+            // [5b] 受限 canUseTool 通道 · 重建 executor 必须继承同一决策源（三路生产路径恒 null → 现状）
+            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseTool,
             ToolUseContext perTurnTuc,
             StringBuilder acc,
             StringBuilder reasoningBuf,
@@ -9978,7 +9986,7 @@ public class LlmAgentLoop implements AgentLoop {
                 state, turnAssistantId,
                 (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
                 true /* deferredModifier */,
-                buildSubagentAgentOptions(querySource, thinkingConfig), null);
+                buildSubagentAgentOptions(querySource, thinkingConfig), null, canUseTool);
         }
         // 4) tengu_model_fallback_triggered 遥测等价（slf4j+logback 中文）· CC query.ts:932-941
         //    entrypoint='cli'（CC 硬编码，Java 主循环等价）；queryChainId→sessionId；queryDepth→turnCount

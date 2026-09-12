@@ -279,6 +279,20 @@ public class StreamingToolExecutor {
      */
     private final ToolPermissionGate permissionGate;
     /**
+     * [5b · canUseTool 通道] 受限 canUseTool 覆盖（CC {@code StreamingToolExecutor(tools,
+     * canUseTool, toolUseContext)} 第 2 参，query.ts:763/:978/:1174）。
+     *
+     * <p><b>WHY（INV-6）</b>：fork 的受限权限（CC {@code createAutoMemCanUseTool},
+     * extractMemories.ts:170-229）是<b>按 input 内容</b>判定的函数（同一个 Bash 只读才放行），
+     * 白名单表达不了，必须作为决策函数传入。
+     *
+     * <p><b>优先级</b>：非 null → <b>逐位覆盖</b> {@link #permissionGate}；null → 现状回落
+     * gate（主线程 / 子代理 / hook agent 三路生产路径逐位不变）。
+     * 来源 = {@code QueryParams.canUseTool} 经 {@code AgentLoopContext.buildStreamingExecutor}
+     * 的 9 参重载透传（LlmAgentLoop 三处 build 点 + handleModelFallback 重建点）。
+     */
+    private final HookPermissionResolver.CanUseTool canUseTool;
+    /**
      * [hooks_v3 H-PERM-02 · 1-7] Hook 权限决策解析器 · 实例注入.
      *
      * <p>对齐 CC {@code resolveHookPermissionDecision} (toolHooks.ts:332-433): 原静态单例
@@ -501,7 +515,28 @@ public class StreamingToolExecutor {
     public StreamingToolExecutor(ToolRegistry registry, ToolUseContext ctx,
                                  java.util.function.BiConsumer<AgentToolResult<?>, String> extendedHandler,
                                  ToolPermissionGate gate, HookRegistry hookRegistry) {
-        this(registry, defaultExecutor(), ctx, extendedHandler, gate, hookRegistry);
+        this(registry, defaultExecutor(), ctx, extendedHandler, gate, null, hookRegistry);
+    }
+
+    /**
+     * [5b · canUseTool 通道] 6 参便捷构造器（含受限 canUseTool）· 用 {@link #defaultExecutor()}.
+     *
+     * <p>生产唯一入口 = {@code AgentLoopContext.buildStreamingExecutor}（受限 canUseTool 非 null
+     * 时走本构造）；{@code canUseTool = null} 时与 5 参构造逐位等价（三路生产路径现状）。
+     *
+     * @param registry     工具注册表
+     * @param ctx          工具调用上下文
+     * @param extendedHandler ExtendedToolResult 应用回调
+     * @param gate         权限门（可为 null；canUseTool 非 null 时不被消费）
+     * @param canUseTool   受限 canUseTool 覆盖（可为 null → 回落 gate）
+     * @param hookRegistry hook 注册中心（可为 null → 不串联 hook）
+     * @since 5b
+     */
+    public StreamingToolExecutor(ToolRegistry registry, ToolUseContext ctx,
+                                 java.util.function.BiConsumer<AgentToolResult<?>, String> extendedHandler,
+                                 ToolPermissionGate gate, HookPermissionResolver.CanUseTool canUseTool,
+                                 HookRegistry hookRegistry) {
+        this(registry, defaultExecutor(), ctx, extendedHandler, gate, canUseTool, hookRegistry);
     }
 
     /**
@@ -513,7 +548,7 @@ public class StreamingToolExecutor {
      * 出口调 {@link HookRegistry#executePostToolUse} 做 MCP-specific 分流.
      *
      * <p>{@code hookRegistry} 可为 null —— null 时退化为不串联 hook (向后兼容批次 1).
-     * 本构造是 canonical 全参构造, 其余便捷构造 (1/2/3/4/5 参) 全部委托本构造.
+     * [5b] 本构造委托 7 参 canonical 构造（{@code canUseTool = null} → 回落 gate，现状不变）。
      *
      * @param registry              工具注册表
      * @param executor              后台线程池
@@ -526,6 +561,32 @@ public class StreamingToolExecutor {
     public StreamingToolExecutor(ToolRegistry registry, ExecutorService executor, ToolUseContext ctx,
                                  java.util.function.BiConsumer<AgentToolResult<?>, String> extendedResultHandler,
                                  ToolPermissionGate gate, HookRegistry hookRegistry) {
+        this(registry, executor, ctx, extendedResultHandler, gate, null, hookRegistry);
+    }
+
+    /**
+     * [5b · canUseTool 通道] 7 参 canonical 全参构造器 · 对齐 CC
+     * {@code StreamingToolExecutor(tools, canUseTool, toolUseContext)}（query.ts:763）.
+     *
+     * <p><b>WHY 第 6 参独立于 gate</b>：CC 的 canUseTool 是<b>决策函数</b>而非 gate 对象
+     * （{@code CanUseToolFn}, useCanUseTool.tsx:37）；Java 内层 gate.check 只是该函数的
+     * <b>默认实现</b>。fork 的受限 canUseTool（createAutoMemCanUseTool）需整体替换该函数，
+     * 而非改 gate 配置 —— 故本参数与 {@code gate} 并存，非 null 时优先（INV-6）。
+     * 其余便捷构造（1/2/3/4/5/6 参）全部委托本构造（{@code canUseTool = null} → 现状）。
+     *
+     * @param registry              工具注册表
+     * @param executor              后台线程池
+     * @param ctx                   工具调用上下文
+     * @param extendedResultHandler ExtendedToolResult dispatch handler（可为 null）
+     * @param gate                  工具执行权限门（可为 null；canUseTool 非 null 时不被消费）
+     * @param canUseTool            受限 canUseTool 覆盖（可为 null → 回落 gate，零行为变化）
+     * @param hookRegistry          hook 注册中心（可为 null → 不串联 hook）
+     * @since 5b
+     */
+    public StreamingToolExecutor(ToolRegistry registry, ExecutorService executor, ToolUseContext ctx,
+                                 java.util.function.BiConsumer<AgentToolResult<?>, String> extendedResultHandler,
+                                 ToolPermissionGate gate, HookPermissionResolver.CanUseTool canUseTool,
+                                 HookRegistry hookRegistry) {
         if (registry == null) throw new IllegalArgumentException("registry is null");
         if (executor == null) throw new IllegalArgumentException("executor is null");
         this.registry = registry;
@@ -533,6 +594,7 @@ public class StreamingToolExecutor {
         this.ctx = ctx;
         this.extendedResultHandler = extendedResultHandler;
         this.permissionGate = gate;
+        this.canUseTool = canUseTool;
         this.hookRegistry = hookRegistry;
         // [R32-#29] siblingAbortController 是 ctx.abortController() 的 child.
         // ctx == null 时退化为独立 AbortController(无 parent 传播).
@@ -1645,6 +1707,8 @@ public class StreamingToolExecutor {
                     }
                     // gate == null → 跳过 resolver (向后兼容: 仅 hook Deny 阻断);
                     // ctx == null 或 ctx.permissionContext() == null → skip (无规则集).
+                    // [5b · canUseTool 通道] canUseTool 非 null → 决策源存在（无需 gate）；
+                    //   CC 侧 StreamingToolExecutor 只持 canUseTool、无 gate 概念（query.ts:763）。
                     // [FIX-A-R2] permission 门输入选型：hook 未改 input → 用 backfilledInput
                     //   （file_path 已绝对化），使相对/~ 路径命中权限内容规则（对齐 CC
                     //   toolExecution.ts:921-936 resolveHookPermissionDecision 第 3 参
@@ -1660,7 +1724,12 @@ public class StreamingToolExecutor {
                     }
                     PermissionResult finalDecision = hookPermission;
                     HookPermissionResolver.ResolvedPermission resolved = null;
-                    if (permissionGate != null && ctx != null && ctx.permissionContext() != null) {
+                    // [5b] 决策源 = 现状 gate 路径（已蕴含 ctx != null）∨ 受限 canUseTool 覆盖。
+                    //   canUseTool == null（主线程/子代理/hook agent 三路）→ 逐位等价 5b 前判定。
+                    boolean gateDecisionSourcePresent =
+                        permissionGate != null && ctx != null && ctx.permissionContext() != null;
+                    boolean hasPermissionDecisionSource = canUseTool != null || gateDecisionSourcePresent;
+                    if (hasPermissionDecisionSource && ctx != null) {
                         try {
                             HookPermissionResolver.ResolvedPermission r =
                                 permissionResolver.resolve(
@@ -1669,10 +1738,15 @@ public class StreamingToolExecutor {
                                     (tool, input, cctx, toolUseId, forceDecision) -> {
                                         // Java 端 canUseTool 等价 = gate.check 6 参 (forceDecision
                                         // 透传, 对齐 CC useCanUseTool.tsx:37 forceDecision 短路管线).
-                                        ToolPermissionGate.DecisionResult gr = permissionGate.check(
-                                            tool,
-                                            new ToolUseBlock(toolUseId, tool.name(), input),
-                                            input, cctx, cctx.permissionContext(), forceDecision);
+                                        // [5b] 受限 canUseTool 优先（CC forkedAgent.ts:569 把 fork 自己的
+                                        //   canUseTool 传给同一个 query）→ 让「同一个 Bash 只读才放行」
+                                        //   这类按 input 判定的受限语义可表达（INV-6）。
+                                        ToolPermissionGate.DecisionResult gr = canUseTool != null
+                                            ? canUseTool.canUse(tool, input, cctx, toolUseId, forceDecision)
+                                            : permissionGate.check(
+                                                tool,
+                                                new ToolUseBlock(toolUseId, tool.name(), input),
+                                                input, cctx, cctx.permissionContext(), forceDecision);
                                         // [A1 撤外层] (h) 决策 telemetry 归因 · 对齐 CC toolExecution.ts:948-977
                                         log.info("TOOL permission gate check: callId={} tool={} decision={}",
                                             abbreviate(toolUseId, 24), tool.name(), gr.decision());

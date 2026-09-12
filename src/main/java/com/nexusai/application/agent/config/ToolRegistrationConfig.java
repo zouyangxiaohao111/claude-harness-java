@@ -1722,6 +1722,12 @@ public class ToolRegistrationConfig {
      * 受限 canUseTool（Read/Grep/Glob + 只读 Bash + auto-memory 目录内 Edit/Write）。本 bean
      * 经 {@code HookPermissionResolver.resolve(canUseTool)} 直接消费受限 canUseTool。
      *
+     * <p><b>[5b 更新 · 2026-09-12] 上述前提已不成立</b>：批次 5b 已把受限 canUseTool 通道补回
+     * （{@code QueryParams.canUseTool} → {@code AgentLoopContext.buildStreamingExecutor} →
+     * {@code StreamingToolExecutor}，优先级 canUseTool &gt; 单例 gate）——即"主循环无消费点"的
+     * 理由已被消除。本 bean（自建 loop）在<b>批次 5c</b>（fork 收敛到 queryLoop + 删本类）落地前
+     * <b>保持现状不动</b>；5c 时 fork 的受限函数直接经 {@code QueryParams.withCanUseTool} 注入。
+     *
      * @param llmProviderFactory LLM provider 工厂（按 config 分发）
      * @param toolRegistry       主线程工具注册表（@Lazy 懒代理，执行期已填充；fork 工具集）
      * @return 生产 fork loop（逐轮 provider 调用 + ToolRegistry 执行 + canUseTool 门控）

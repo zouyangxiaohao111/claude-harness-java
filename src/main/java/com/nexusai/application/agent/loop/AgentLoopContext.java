@@ -1501,6 +1501,45 @@ public record AgentLoopContext(
             boolean deferredModifier,
             AgentOptions agentOptions,
             ForkSubagentMessages.Message assistantMessage) {
+        // [5b] 8 参兼容入口 · canUseTool=null → 回落 beans.permissionGate（三路生产路径逐位不变）
+        return buildStreamingExecutor(ctx, perTurnTuc, state, turnAssistantId, extendedHandler,
+            deferredModifier, agentOptions, assistantMessage, null);
+    }
+
+    /**
+     * [5b · canUseTool 通道] 9 参 buildStreamingExecutor · 透传受限 canUseTool 覆盖。
+     *
+     * <p><b>优先级（本方法即优先级决策点）</b>：{@code canUseToolOverride}（来自
+     * {@code QueryParams.canUseTool}，CC 第 5 必填字段 query.ts:243）<b>优先于</b>
+     * 单例 {@code beans.permissionGate()} —— 对齐 CC {@code StreamingToolExecutor(tools,
+     * canUseTool, toolUseContext)}（query.ts:763）：CC 侧 executor 只持调用方给的 canUseTool，
+     * 没有"单例 gate"这一层；Java 的 gate 只是 canUseTool 的<b>默认实现</b>。
+     *
+     * <p><b>未传（null）时零行为变化</b>：gate 解析路径（beans.permissionGate → createSpringBean
+     * fallback → null）与日志逐位不变，executor 内层决策表达式在 canUseTool==null 时与 5b 前
+     * 逐位等价 → 主线程 / 子代理 / hook agent 三条生产路径行为不变。
+     *
+     * @param ctx                 loop 基础设施（ToolExecutionBeans + hookRegistry）
+     * @param perTurnTuc          本轮 per-turn TUC（executor 的 tool ctx + 工具来源）
+     * @param state               AgentState（lineage + extended result apply）
+     * @param turnAssistantId     本轮 assistant 消息 id
+     * @param extendedHandler     ExtendedToolResult 应用回调
+     * @param deferredModifier    deferred context modifier 开关
+     * @param agentOptions        子代理执行上下文（可 null）
+     * @param assistantMessage    完整 assistant 消息回调载体（可 null）
+     * @param canUseToolOverride  受限 canUseTool 覆盖（null → 回落 beans.permissionGate，现状）
+     * @return StreamingToolExecutor；perTurnTuc 无工具时返回 null（调用方跳过）
+     * @since 5b
+     */
+    public static StreamingToolExecutor buildStreamingExecutor(AgentLoopContext ctx,
+            com.nexusai.application.agent.tool.ToolUseContext perTurnTuc,
+            AgentState state,
+            String turnAssistantId,
+            java.util.function.BiConsumer<AgentToolResult<?>, String> extendedHandler,
+            boolean deferredModifier,
+            AgentOptions agentOptions,
+            ForkSubagentMessages.Message assistantMessage,
+            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseToolOverride) {
         if (perTurnTuc == null || perTurnTuc.availableTools().isEmpty()) {
             return null;
         }
@@ -1540,6 +1579,7 @@ public record AgentLoopContext(
                 ? extendedHandler
                 : (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
             gate,
+            canUseToolOverride,
             ctx.hookRegistry());
         exec.setSubagentExecutionContext(agentOptions, assistantMessage);
         if (beans != null && beans.telemetry() != null) {
@@ -1584,6 +1624,12 @@ public record AgentLoopContext(
                 beans != null && beans.inputSanitizer() != null, beans != null && beans.inputValidator() != null,
                 deferredModifier, abbreviate(turnAssistantId, 12), perTurnTuc.availableTools().size());
         }
+        if (canUseToolOverride != null) {
+            // [5b] 受限 canUseTool 覆盖生效 · 决策优先级 canUseTool > gate（CC query.ts:763）
+            log.info("AgentLoopContext buildStreamingExecutor: 受限 canUseTool 覆盖已生效 "
+                    + "(gate={} 不被消费) tools={} · 对齐 CC query.ts:763 StreamingToolExecutor(tools, canUseTool, ctx)",
+                gate != null, perTurnTuc.availableTools().size());
+        }
         return exec;
     }
 
@@ -1603,7 +1649,8 @@ public record AgentLoopContext(
             java.util.function.BiConsumer<AgentToolResult<?>, String> extendedHandler,
             AgentOptions agentOptions,
             ForkSubagentMessages.Message assistantMessage,
-            java.util.function.Consumer<Tool.ToolProgress> onToolProgress) {
+            java.util.function.Consumer<Tool.ToolProgress> onToolProgress,
+            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseTool) {
         com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome outcome;
         if (streamingExec != null) {
             streamingExec.setSubagentExecutionContext(agentOptions, assistantMessage);
@@ -1634,7 +1681,7 @@ public record AgentLoopContext(
             log.warn("AgentLoopContext runTools 顶层入口 [fallback path]: batch mode, calls={}",
                 toolCalls.size());
             StreamingToolExecutor exec = buildStreamingExecutor(ctx, perTurnTuc, state, turnAssistantId,
-                extendedHandler, true /* deferredModifier */, agentOptions, assistantMessage);
+                extendedHandler, true /* deferredModifier */, agentOptions, assistantMessage, canUseTool);
             if (exec == null) {
                 return new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(List.of(), java.util.Map.of(), java.util.Map.of());
             }
@@ -1698,6 +1745,40 @@ public record AgentLoopContext(
             java.util.function.Consumer<Tool.ToolProgress> onToolProgress,
             Long reasoningDurationMs,
             Long decodeMs) {
+        // [5b] 16 参兼容入口 · canUseTool=null → 回落 beans.permissionGate（三路生产路径逐位不变）
+        return handleToolCallsTurn(ctx, perTurnTuc, state, msg, assistantText, chunkCount,
+            turnAssistantId, streamingExec, seenToolCalls, querySource, thinkingConfig,
+            allowedDecisions, toolDecisions, onToolProgress, reasoningDurationMs, decodeMs, null);
+    }
+
+    /**
+     * [5b · canUseTool 通道] 17 参 handleToolCallsTurn · 透传受限 canUseTool 覆盖。
+     *
+     * <p><b>为何需要</b>：本方法的 fallback 路径（{@code streamingExec == null}）会经
+     * {@link #runTools} → {@link #buildStreamingExecutor} 新建 executor —— 该路径也必须
+     * 拿到受限 canUseTool，否则「fork 在 streaming 关闭时权限不受限」（INV-6 破坏）。
+     * 优先级与零行为变化同 8/9 参 {@code buildStreamingExecutor}。
+     *
+     * @param canUseTool 受限 canUseTool 覆盖（null → 回落 beans.permissionGate，现状）
+     * @since 5b
+     */
+    public static String handleToolCallsTurn(AgentLoopContext ctx,
+            com.nexusai.application.agent.tool.ToolUseContext perTurnTuc,
+            AgentState state,
+            AssistantMessage msg,
+            String assistantText,
+            int chunkCount,
+            String turnAssistantId,
+            StreamingToolExecutor streamingExec,
+            List<ToolUseBlock> seenToolCalls,
+            QuerySource querySource,
+            ThinkingConfig thinkingConfig,
+            Map<String, PermissionResult.Allow> allowedDecisions,
+            Map<String, ToolDecisionInfo> toolDecisions,
+            java.util.function.Consumer<Tool.ToolProgress> onToolProgress,
+            Long reasoningDurationMs,
+            Long decodeMs,
+            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseTool) {
         if (perTurnTuc == null || perTurnTuc.availableTools().isEmpty()) {
             state.setError("assistant returned tool_calls but per-turn TUC has no availableTools");
             state.setExitReason(AgentState.ExitReason.STREAM_ERROR);
@@ -1767,11 +1848,11 @@ public record AgentLoopContext(
         if (streamingExec != null && streamingExec.size() > 0) {
             outcome = runTools(ctx, perTurnTuc, state, msg.toolCalls(), turnAssistantId, streamingExec,
                 (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
-                subagentOptions, forkAssistantMessage, onToolProgress);
+                subagentOptions, forkAssistantMessage, onToolProgress, canUseTool);
         } else {
             outcome = runTools(ctx, perTurnTuc, state, msg.toolCalls(), turnAssistantId, null,
                 (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
-                subagentOptions, forkAssistantMessage, onToolProgress);
+                subagentOptions, forkAssistantMessage, onToolProgress, canUseTool);
         }
         List<com.nexusai.application.agent.tool.ToolResult> results = outcome.results();
         // [IMP-C2] toolUseId → isError 透传（ToolResult 4 字段契约删除 isError，执行器推导）
