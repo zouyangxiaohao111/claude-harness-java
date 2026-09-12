@@ -108,8 +108,9 @@ class PersistGateAgentBranchCcTest {
         return session;
     }
 
-    private String contentOf(AgentState state, String toolCallId) {
-        return state.rawMessages().stream()
+    /** [R3] 断言目标改为**返回的投影列表**（预算为请求级纯局部，不再写 state）。 */
+    private String contentOf(List<ChatMessageDto> messages, String toolCallId) {
+        return messages.stream()
             .filter(m -> toolCallId.equals(m.toolCallId()))
             .findFirst()
             .orElseThrow()
@@ -185,10 +186,11 @@ class PersistGateAgentBranchCcTest {
         AgentState state = overBudgetState(SUBAGENT_ID);
         AgentLoopContext ctx = buildCtx(sessionWith(), GATE_ON);
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.SUBAGENT, Set.of());
+        List<ChatMessageDto> out = AgentLoopContext.applyPerMessageBudget(
+            ctx, state, QuerySource.SUBAGENT, Set.of(), state.rawMessages());
 
-        // 落库证据：内容被替换为 preview（聚合预算路径生效）
-        assertThat(contentOf(state, "call_t1"))
+        // 落库证据：内容被替换为 preview（[R3] 请求级纯局部 → 断言返回投影列表）
+        assertThat(contentOf(out, "call_t1"))
             .startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
         // 落库证据：sidechain 文件存在且为 content-replacement 条目（R28-3.7 §1.3 agentId 路由）
         Path sidechain = SessionStorage.getAgentTranscriptPath(workspaceDir, SESSION_STR, SUBAGENT_ID.toString());
@@ -207,9 +209,10 @@ class PersistGateAgentBranchCcTest {
         AgentState state = overBudgetState(SUBAGENT_ID);
         AgentLoopContext ctx = buildCtx(sessionWith(), GATE_ON);
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.FORK, Set.of());
+        List<ChatMessageDto> out = AgentLoopContext.applyPerMessageBudget(
+            ctx, state, QuerySource.FORK, Set.of(), state.rawMessages());
 
-        assertThat(contentOf(state, "call_t1"))
+        assertThat(contentOf(out, "call_t1"))
             .startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
         Path sidechain = SessionStorage.getAgentTranscriptPath(workspaceDir, SESSION_STR, SUBAGENT_ID.toString());
         assertThat(sidechain)
@@ -230,9 +233,10 @@ class PersistGateAgentBranchCcTest {
         AgentState state = overBudgetState(null);   // agentId=null = 主线程
         AgentLoopContext ctx = buildCtx(sessionWith(), GATE_ON);
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of());
+        List<ChatMessageDto> out = AgentLoopContext.applyPerMessageBudget(
+            ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), state.rawMessages());
 
-        assertThat(contentOf(state, "call_t1"))
+        assertThat(contentOf(out, "call_t1"))
             .startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
         Path sessionFile = SessionStorage.getSessionFile(workspaceDir, SESSION_STR);
         assertThat(sessionFile)
@@ -250,9 +254,10 @@ class PersistGateAgentBranchCcTest {
         AgentState state = overBudgetState(null);
         AgentLoopContext ctx = buildCtx(sessionWith(), GATE_ON);
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.USER, Set.of());
+        List<ChatMessageDto> out = AgentLoopContext.applyPerMessageBudget(
+            ctx, state, QuerySource.USER, Set.of(), state.rawMessages());
 
-        assertThat(contentOf(state, "call_t1"))
+        assertThat(contentOf(out, "call_t1"))
             .startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
         assertThat(SessionStorage.getSessionFile(workspaceDir, SESSION_STR))
             .as("USER canonical=repl_main_thread → session.jsonl（CC 主线程唯一值 repl_main_thread）")
@@ -331,11 +336,14 @@ class PersistGateAgentBranchCcTest {
         AgentLoopContext ctx = buildCtx(session, FeatureFlags.ALL_DISABLED);
         ContentReplacementState crs = session.contentReplacementState();
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.SUBAGENT, Set.of());
+        List<ChatMessageDto> input = state.rawMessages();
+        List<ChatMessageDto> out = AgentLoopContext.applyPerMessageBudget(
+            ctx, state, QuerySource.SUBAGENT, Set.of(), input);
 
         assertThat(crs.seenIds()).as("gate 关 → contentReplacementState 无新增 seen").isEmpty();
         assertThat(crs.replacements()).as("gate 关 → contentReplacementState 无新增 replacement").isEmpty();
-        assertThat(contentOf(state, "call_t1")).as("gate 关 → 内容保持完整").hasSize(150_000);
+        assertThat(out).as("[R3] gate 关 → 原样返回入参引用（CC no-op 返回原数组）").isSameAs(input);
+        assertThat(contentOf(state.rawMessages(), "call_t1")).as("gate 关 → 内容保持完整").hasSize(150_000);
         assertThat(SessionStorage.getAgentTranscriptPath(workspaceDir, SESSION_STR, SUBAGENT_ID.toString()))
             .as("gate 关 → 不写 sidechain")
             .doesNotExist();

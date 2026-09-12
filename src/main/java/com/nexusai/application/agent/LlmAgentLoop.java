@@ -5164,7 +5164,11 @@ public class LlmAgentLoop implements AgentLoop {
                     }
                 }
             }
-            AgentLoopContext.applyPerMessageBudget(ctx, state, params.querySource(), skipToolNames);
+            // [R3 2026-09-12] 赋回投影数组 —— CC query.ts:379 `messagesForQuery = await
+            //   applyToolResultBudget(messagesForQuery, …)`：预算为**请求级纯局部**（只作用本次请求投影、
+            //   不写 state），同一请求模型即看到 preview（原「只写 state → 晚一轮迭代才生效」已修）。
+            messagesForQuery = AgentLoopContext.applyPerMessageBudget(
+                ctx, state, params.querySource(), skipToolNames, messagesForQuery);
 
             // ── s19-P1-6 + FIX-LOOP-6 (A10): assemble_tool_pool 每轮 turn 顶部刷新 MCP 工具池 ──
             // MCP server 上线/下线 → McpServerService 工具集合变化 → 替换 ToolRegistry 同名 entry.

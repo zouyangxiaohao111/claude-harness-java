@@ -94,12 +94,18 @@ class ApplyPerMessageBudgetBudgetConstantTest {
         return session;
     }
 
-    private String contentOf(AgentState state, String toolCallId) {
-        return state.rawMessages().stream()
+    /** [R3] 断言目标从 state 改为**返回的投影列表**（预算为请求级纯局部，不写 state）。 */
+    private String contentOf(List<ChatMessageDto> messages, String toolCallId) {
+        return messages.stream()
             .filter(m -> toolCallId.equals(m.toolCallId()))
             .findFirst()
             .orElseThrow()
             .content();
+    }
+
+    /** 组装本轮请求投影（初始 = state.rawMessages()，与 LlmAgentLoop 的 messagesForQuery 同源）。 */
+    private List<ChatMessageDto> projectionOf(AgentState state) {
+        return new java.util.ArrayList<>(state.rawMessages());
     }
 
     @Test
@@ -125,9 +131,10 @@ class ApplyPerMessageBudgetBudgetConstantTest {
         AgentState state = stateWith(List.of(asst, tool));
         AgentLoopContext ctx = buildGateOnCtx(sessionWith());
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of());
+        List<ChatMessageDto> out =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), projectionOf(state));
 
-        assertThat(contentOf(state, "call_t1"))
+        assertThat(contentOf(out, "call_t1"))
             .as("60K < 200K 聚合预算 → 内容必须保持完整，不被聚合路径替换")
             .doesNotStartWith(ToolResultStorage.PERSISTED_OUTPUT_TAG)
             .hasSize(60_000);
@@ -143,14 +150,16 @@ class ApplyPerMessageBudgetBudgetConstantTest {
         AgentState state = stateWith(List.of(asst1, tool1, asst2, tool2));
         AgentLoopContext ctx = buildGateOnCtx(sessionWith());
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of());
+        List<ChatMessageDto> out =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), projectionOf(state));
 
-        assertThat(contentOf(state, "call_t1")).as("150K 组 <200K → 不替换").hasSize(150_000);
-        assertThat(contentOf(state, "call_t2")).as("60K 组 <200K → 不替换").hasSize(60_000);
+        assertThat(contentOf(out, "call_t1")).as("150K 组 <200K → 不替换").hasSize(150_000);
+        assertThat(contentOf(out, "call_t2")).as("60K 组 <200K → 不替换").hasSize(60_000);
     }
 
     @Test
-    @DisplayName("B5: 150K + 80K 同组累计 230K > 200K → 选最大 fresh（150K）持久化为 preview")
+    @DisplayName("B5/R3: 150K + 80K 同组累计 230K > 200K → 选最大 fresh（150K）持久化，"
+        + "**同一请求**返回列表即见 preview（且 state 不写 = 纯局部）")
     void sameGroup_over200k_selectsLargestFresh() {
         ChatMessageDto asst = asst("asst-1", "A");
         ChatMessageDto toolBig = tool("tool-1", "call_t1", "A", "x".repeat(150_000));
@@ -158,14 +167,43 @@ class ApplyPerMessageBudgetBudgetConstantTest {
         AgentState state = stateWith(List.of(asst, toolBig, toolSmall));
         AgentLoopContext ctx = buildGateOnCtx(sessionWith());
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of());
+        List<ChatMessageDto> out =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), projectionOf(state));
 
-        assertThat(contentOf(state, "call_t1"))
-            .as("同组 230K > 200K → 最大 fresh(150K) 被聚合路径持久化为 preview")
+        assertThat(contentOf(out, "call_t1"))
+            .as("[R3] 同一请求返回列表里 tool_result 内容必须**已是 preview**（CC query.ts:379 赋回投影）")
             .startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
-        assertThat(contentOf(state, "call_t2"))
+        assertThat(contentOf(out, "call_t2"))
             .as("次大 fresh(80K) 未选 → 内容保持完整（markSeen 冻结）")
             .hasSize(80_000);
+        // [R3] 纯局部证据：state.rawMessages() 仍保留全量原文（CC replaceToolResultContents 不改持久化 messages）。
+        assertThat(contentOf(state.rawMessages(), "call_t1"))
+            .as("[R3] 预算不写 state → state.rawMessages() 该条仍为全量原文（纯局部，对齐 CC）")
+            .doesNotStartWith(ToolResultStorage.PERSISTED_OUTPUT_TAG)
+            .hasSize(150_000);
+    }
+
+    @Test
+    @DisplayName("R3: 多轮（同一 contentReplacementState）→ 第二轮靠 mustReapply 从 state 重放 cached preview")
+    void multiTurn_mustReapplyFromCachedState() {
+        ChatMessageDto asst = asst("asst-1", "A");
+        ChatMessageDto toolBig = tool("tool-1", "call_t1", "A", "x".repeat(250_000));
+        AgentState state = stateWith(List.of(asst, toolBig));
+        AgentLoopContext ctx = buildGateOnCtx(sessionWith());
+
+        // 第一轮：替换 → 返回列表见 preview（state.rawMessages() 仍是原文）
+        List<ChatMessageDto> turn1 =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), projectionOf(state));
+        String preview1 = contentOf(turn1, "call_t1");
+        assertThat(preview1).startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
+
+        // 第二轮：同一 state（LoopSessionState 内 contentReplacementState 跨 turn 存活）→
+        //   该 id isSeen + replacements 有值 ⇒ 归入 mustReapply ⇒ cached 重放（CC :784 / :906）
+        List<ChatMessageDto> turn2 =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), projectionOf(state));
+        assertThat(contentOf(turn2, "call_t1"))
+            .as("[R3] 第二轮必须靠 mustReapply 重放同一 cached preview（byte-identical，护 prompt cache）")
+            .isEqualTo(preview1);
     }
 
     @Test
@@ -182,16 +220,17 @@ class ApplyPerMessageBudgetBudgetConstantTest {
         ContentReplacementState crs = ctx.sessionState().contentReplacementState();
 
         // skipToolNames={Read}：Read 结果仅 markSeen 不落盘；Bash 结果仍按预算处理
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of("Read"));
+        List<ChatMessageDto> out =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of("Read"), projectionOf(state));
 
         assertThat(crs.isSeen("call_t1"))
             .as("B7: Read(Infinity) fresh 必须 markSeen（frozen 化，CC toolResultStorage.ts:818-819）")
             .isTrue();
-        assertThat(contentOf(state, "call_t1"))
+        assertThat(contentOf(out, "call_t1"))
             .as("B7: Read 结果仅 markSeen，不落盘不替换")
             .doesNotStartWith(ToolResultStorage.PERSISTED_OUTPUT_TAG)
             .hasSize(300_000);
-        assertThat(contentOf(state, "call_t2"))
+        assertThat(contentOf(out, "call_t2"))
             .as("B7: 同组非 skip(Bash) 结果仍按预算处理（300K+250K 扣掉 Read 后 eligible 250K > 200K → 落盘）")
             .startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG);
     }
@@ -206,11 +245,14 @@ class ApplyPerMessageBudgetBudgetConstantTest {
         AgentLoopContext ctx = buildCtx(session, FeatureFlags.ALL_DISABLED);  // budgetAggregateGate=false
         ContentReplacementState crs = session.contentReplacementState();
 
-        AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of());
+        List<ChatMessageDto> input = projectionOf(state);
+        List<ChatMessageDto> out =
+            AgentLoopContext.applyPerMessageBudget(ctx, state, QuerySource.REPL_MAIN_THREAD, Set.of(), input);
 
         assertThat(crs.seenIds()).as("gate 关 → contentReplacementState 无新增 seen").isEmpty();
         assertThat(crs.replacements()).as("gate 关 → contentReplacementState 无新增 replacement").isEmpty();
-        assertThat(contentOf(state, "call_t1"))
+        assertThat(out).as("[R3] gate 关 → 原样返回入参引用（CC no-op 返回原数组）").isSameAs(input);
+        assertThat(contentOf(state.rawMessages(), "call_t1"))
             .as("gate 关 → 内容保持完整（聚合预算路径 no-op）")
             .hasSize(300_000);
     }

@@ -170,7 +170,10 @@ class LlmAgentLoopWiringOrderTest {
         // [D10 双视图 2026-09-12] 入口投影改为**派生**（state.modelView()，不写回 state）——
         //   源码锚点随之更新；顺序不变量（boundary → 预算 → snip → …）不变。
         int boundaryIdx = source.indexOf("List<ChatMessageDto> entryModelView = state.modelView();");
-        int budgetIdx = source.indexOf("AgentLoopContext.applyPerMessageBudget(ctx, state, params.querySource(), skipToolNames)");
+        // [R3 2026-09-12] 锚点改**赋值形态** —— CC query.ts:379 `messagesForQuery = await
+        //   applyToolResultBudget(messagesForQuery, …)`。去掉 `messagesForQuery = ` 前缀（赋回步骤消失）
+        //   本断言即转红；ApplyPerMessageBudgetBudgetConstantTest 的「同一请求即见 preview」断言同步转红。
+        int budgetIdx = source.indexOf("messagesForQuery = AgentLoopContext.applyPerMessageBudget(");
         int snipIdx = source.indexOf("snipCompactIfNeeded(messagesForQuery)");
         int microIdx = source.indexOf("microCompactor.microcompactMessages(beforeMicro");
         int collapseIdx = source.indexOf("applyCollapsesIfNeeded(messagesForQuery");

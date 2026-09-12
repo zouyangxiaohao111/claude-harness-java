@@ -525,17 +525,26 @@ public record AgentLoopContext(
      * 关时整段跳过 = no-op（CC query.ts:369-372 contentReplacementState=undefined）。
      * persist gate {@code LlmAgentLoop.shouldPersistReplacements}（REPL_MAIN_THREAD 前缀 /
      * AGENT_ 前缀才写 sessionStorage）属实。
+     *
+     * <p><b>[R3 2026-09-12] 改为返回替换后的投影列表（对齐 CC 请求级纯局部预算）</b>：
+     * CC {@code query.ts:379-393} = {@code messagesForQuery = await applyToolResultBudget(
+     * messagesForQuery, toolUseContext.contentReplacementState, …)} —— 结果**赋回投影数组**，
+     * 同一请求模型即见 preview；且 {@code toolResultStorage.ts:699-728 replaceToolResultContents}
+     * 只返回**新的 Message[]**、**不改持久化 messages**（CC 每轮靠 mustReapply 从
+     * {@code contentReplacementState} 重放已替换项）。故本方法：① 入参 = 本轮投影
+     * {@code messagesForQuery}，返回 = 替换后的新列表（无替换时返回入参原引用）；
+     * ② **不再写 state** —— 原 {@code replaceMessageContent → state.replaceMessages} 已删除
+     * （nexusai 原「只写 state」使触发轮仍发全量原文、晚一轮才生效）。
+     *
+     * <p><b>顺序不变量</b>：调用点位于 snip/micro 之前（CC query.ts:379 budget 早于 :401 snip /
+     * :414 micro，同处注释 "Runs BEFORE microcompact"）。
+     *
+     * @return 替换后的投影列表（无任何替换时返回 {@code messagesForQuery} 原引用）
      */
-    public static void applyPerMessageBudget(AgentLoopContext ctx, AgentState state, QuerySource querySource,
-            java.util.Set<String> skipToolNames) {
-        if (state == null || state.rawMessages() == null || state.rawMessages().isEmpty()) return;
-        // [D10 双视图] 选边 = modelView()（模型面分析源）。CC query.ts:567
-        //   `messagesForQuery = await applyToolResultBudget(messagesForQuery, ...)` —— 预算的
-        //   读侧判据（group 切分 / totalSize / frozen-fresh 分区）都作用在**投影后**数组上。
-        //   写侧仍落回 rawMessages()（本方法末尾 replaceMessageContent）：工具结果内容替换按
-        //   toolUseId 精确命中，两条路径命中的是同一批 id ⇒ state.modelView() 的结果与改造前
-        //   逐条一致（回归底线不变），同时 raw 不会被投影缩水。
-        java.util.List<ChatMessageDto> budgetAnalysisView = state.modelView();
+    public static java.util.List<ChatMessageDto> applyPerMessageBudget(AgentLoopContext ctx, AgentState state,
+            QuerySource querySource, java.util.Set<String> skipToolNames,
+            java.util.List<ChatMessageDto> messagesForQuery) {
+        if (messagesForQuery == null || messagesForQuery.isEmpty()) return messagesForQuery;
         // OD-01 S4 ③ gate：budgetAggregateGate（tengu_hawthorn_steeple）关 → 整段跳过
         // （CC query.ts:369-372 contentReplacementState=undefined 时 applyToolResultBudget no-op）
         if (ctx == null || ctx.featureFlags() == null || !ctx.featureFlags().budgetAggregateGate()) {
@@ -543,8 +552,10 @@ public record AgentLoopContext(
                 log.debug("[applyPerMessageBudget] budgetAggregateGate=false（tengu_hawthorn_steeple 关）跳过聚合预算"
                     + "（CC query.ts:369-372 contentReplacementState=undefined no-op）");
             }
-            return;
+            return messagesForQuery;
         }
+        // [R3] 读侧判据 = 入参投影数组（CC query.ts:379 `applyToolResultBudget(messagesForQuery, …)`）。
+        java.util.List<ChatMessageDto> budgetAnalysisView = messagesForQuery;
         // B5：聚合预算 = MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200K（CC toolLimits.ts:49 · getPerMessageBudgetLimit）
         int limit = com.nexusai.application.agent.tool.ToolResultStorage.getPerMessageBudgetLimit();
         LoopSessionState session = ctx.sessionState();
@@ -561,7 +572,7 @@ public record AgentLoopContext(
         // D-17 宿主迁回 CC 真源同名类 toolResultStorage.ts，3 处留 1）
         java.util.List<java.util.List<ChatMessageDto>> groups =
             com.nexusai.application.agent.tool.ToolResultStorage.collectCandidatesByMessage(budgetAnalysisView);
-        if (groups.isEmpty()) return;
+        if (groups.isEmpty()) return messagesForQuery;
 
         // 2. 累积 total size
         int totalSize = 0;
@@ -570,7 +581,11 @@ public record AgentLoopContext(
                 if (m.content() != null) totalSize += m.content().length();
             }
         }
-        if (totalSize <= limit) return;
+        if (totalSize <= limit) return messagesForQuery;
+
+        // [R3] CC replacementMap（toolResultStorage.ts:775）：mustReapply（cached 重放）+ 本轮新替换的
+        //   preview 都进同一张表，最后一次性 replaceToolResultContents 作用于投影数组（CC :906）。
+        java.util.Map<String, String> replacementMap = new java.util.LinkedHashMap<>();
 
         // 3. 处理每个 group
         for (java.util.List<ChatMessageDto> group : groups) {
@@ -588,6 +603,14 @@ public record AgentLoopContext(
                     }
                 } else {
                     fresh.add(m);
+                }
+            }
+            // [R3] CC :784 `mustReapply.forEach(c => replacementMap.set(c.toolUseId, c.replacement))`
+            //   —— cached preview 重放到**本请求投影**（不再写 state）。
+            for (ChatMessageDto m : mustReapply) {
+                String cached = contentReplacementState.getReplacement(m.toolCallId());
+                if (cached != null) {
+                    replacementMap.put(m.toolCallId(), cached);
                 }
             }
             if (fresh.isEmpty()) continue;  // 全部已 seen
@@ -652,19 +675,20 @@ public record AgentLoopContext(
                     com.nexusai.application.agent.tool.SessionStorage.writeContentReplacement(
                         workspaceDir, sessionId, agentIdStr, toolUseId, preview);
                 }
-                // 替换 state.messages 中的对应 message（CC replaceToolResultContents 镜像）
-                replaceMessageContent(state, toolUseId, preview);
+                // [R3] 进 replacementMap（CC :906 replaceToolResultContents 的应用面），随本请求返回；
+                //   不再写 state（纯局部，对齐 CC toolResultStorage.ts:699-728）。
+                replacementMap.put(toolUseId, preview);
                 log.info("[R28-3.5] per-message budget: persisted toolUseId={} path={}",
                     toolUseId, persisted.filepath());
             }
-            // 3f. mustReapply 部分：同步替换为 cached preview（保证 prompt cache 稳定）
-            for (ChatMessageDto m : mustReapply) {
-                String cached = contentReplacementState.getReplacement(m.toolCallId());
-                if (cached != null && !cached.equals(m.content())) {
-                    replaceMessageContent(state, m.toolCallId(), cached);
-                }
-            }
+            // 3f. [R3] mustReapply 的 cached 重放已在 partition 后写入 replacementMap（CC :784）；
+            //   旧 `replaceMessageContent(state, …)` 写 state 分支已删（CC 不改持久化 messages）。
         }
+
+        // [R3] 无任何替换 → 返回入参原引用（CC :896-898 replacementMap.size()==0 → 原数组）；
+        //   有替换 → 一次性 replaceToolResultContents 应用到投影数组（CC :906）。
+        if (replacementMap.isEmpty()) return messagesForQuery;
+        return replaceToolResultContents(messagesForQuery, replacementMap);
     }
 
     /** 计算 messages 的 content length 总和（null-safe） */
@@ -711,26 +735,21 @@ public record AgentLoopContext(
         return selected;
     }
 
-    /** 替换 state.messages 中指定 toolUseId 对应 ChatMessageDto 的 content。 */
-    private static void replaceMessageContent(AgentState state, String toolUseId, String newContent) {
-        if (state == null || toolUseId == null || newContent == null) return;
-        java.util.List<ChatMessageDto> mutable = new java.util.ArrayList<>(state.rawMessages());
-        boolean changed = false;
-        for (int i = 0; i < mutable.size(); i++) {
-            ChatMessageDto m = mutable.get(i);
-            if (m.toolCallId() != null && m.toolCallId().equals(toolUseId)) {
-                mutable.set(i, new ChatMessageDto(
-                    m.id(), m.sessionId(), m.role(), m.author(),
-                    newContent, m.reasoning(), m.toolCalls(), m.finishReason(),
-                    m.inputTokens(), m.outputTokens(), m.time(), m.createdAt(),
-                    m.toolCallId(), m.assistantMessageId(),
-                    m.acceptFeedback(), m.contentBlocks(), m.imagePasteIds()));
-                changed = true;
-            }
+    /**
+     * 返回新的列表：toolCallId ∈ replacementMap 的消息 content 替换为 preview，其余**按引用透传** ·
+     * 对齐 CC {@code replaceToolResultContents}（toolResultStorage.ts:699-728）。
+     *
+     * <p>CC：{@code messages.map(message => …)} —— 需要替换的消息返回**新对象**（tool_result 内容换成
+     * replacement），无需替换的**按引用透传**；**入参数组不被修改**（故 CC 需每轮 mustReapply 重放）。
+     */
+    private static java.util.List<ChatMessageDto> replaceToolResultContents(
+            java.util.List<ChatMessageDto> messages, java.util.Map<String, String> replacementMap) {
+        java.util.List<ChatMessageDto> out = new java.util.ArrayList<>(messages.size());
+        for (ChatMessageDto m : messages) {
+            String replacement = m.toolCallId() != null ? replacementMap.get(m.toolCallId()) : null;
+            out.add(replacement == null ? m : m.withContent(replacement));
         }
-        if (changed) {
-            state.replaceMessages(mutable);
-        }
+        return out;
     }
 
     // [skill-listing-cc-align 2026-09-10] 旧 computeSkillListingDelta / SkillListingDelta 已删除：
