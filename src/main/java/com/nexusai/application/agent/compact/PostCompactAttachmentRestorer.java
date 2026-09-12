@@ -1259,8 +1259,10 @@ public final class PostCompactAttachmentRestorer {
     /** CC claude-in-chrome server 名 · NEXUSAI_IN_CHROME_MCP_SERVER_NAME（claudeInChrome/common.ts:12；CC 原值 'claude-in-chrome'，品牌改名 → 'nexusai-in-chrome'） */
     public static final String NEXUSAI_IN_CHROME_MCP_SERVER_NAME = "nexusai-in-chrome";
 
-    /** env 注入 seam（测试用）· 镜像 ToolSearchService.envOverride 模式；null → System.getenv()。 */
-    static volatile java.util.Map<String, String> envOverride = null;
+    // [R9(b) env seam 归一] 本类原有的第二份 env 注入 seam（envOverride 字段）已删除：
+    //   两条门（shouldInjectAgentListInMessages / isMcpInstructionsDeltaEnabled）改调
+    //   ToolSearchService.currentEnv()（全仓唯一 env 读取入口）。语义不变（仅换「从哪读 env」），
+    //   测试注入统一走 ToolSearchService.envOverride。
 
     /**
      * [IMP2-03] 生产路径附件填充 · 对齐 CC compact.ts:545-560（async-agent → plan → plan_mode
@@ -1650,7 +1652,8 @@ public final class PostCompactAttachmentRestorer {
      * 私有面）→ feature 通道默认关登记。
      */
     public static boolean shouldInjectAgentListInMessages() {
-        java.util.Map<String, String> e = envOverride != null ? envOverride : System.getenv();
+        // [R9(b) env seam 归一] 统一走 ToolSearchService.currentEnv()（本类第二份 seam 已删）
+        java.util.Map<String, String> e = ToolSearchService.currentEnv();
         if (isEnvTruthy(e.get("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES"))) {
             return true;
         }
@@ -1665,7 +1668,8 @@ public final class PostCompactAttachmentRestorer {
      * CLAUDE_CODE_MCP_INSTR_DELTA 优先，feature tengu_basalt_3kr / USER_TYPE=ant 默认关。
      */
     public static boolean isMcpInstructionsDeltaEnabled() {
-        java.util.Map<String, String> e = envOverride != null ? envOverride : System.getenv();
+        // [R9(b) env seam 归一] 统一走 ToolSearchService.currentEnv()（本类第二份 seam 已删）
+        java.util.Map<String, String> e = ToolSearchService.currentEnv();
         if (isEnvTruthy(e.get("CLAUDE_CODE_MCP_INSTR_DELTA"))) {
             return true;
         }

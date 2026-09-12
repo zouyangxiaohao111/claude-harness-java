@@ -59,7 +59,8 @@ class DeferredToolsDeltaUnifiedGateTest {
         // 静态槽位 + env seam 全局单例 → 逐测复位，杜绝串扰（统一判定读 staticResolver）。
         PromptAlignSettingsResolver.setStaticResolver(null);
         ToolSearchService.envOverride = null;
-        PostCompactAttachmentRestorer.envOverride = null;
+        // [R9(b) env seam 归一] PostCompactAttachmentRestorer 的第二份 envOverride 已删除，
+        //   全部 env 入口统一为 ToolSearchService.envOverride。
     }
 
     // ════════════════════════════════════════════════════════════════════

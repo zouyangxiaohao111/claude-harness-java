@@ -18,6 +18,7 @@ import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.toolsearch.SchemaNotSentHint;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
@@ -905,6 +906,8 @@ class PartialCompactConversationTest {
     }
     // ════════════════════════════════════════════════════════════════════
     // extractDiscoveredToolNames boundary 携带（toolSearch.ts:553-560）· IMP-MV2-04
+    //   [R9(a) 三份合一] 原 PartialCompactConversation 拷贝已删 → 断言改测统一真源
+    //   SchemaNotSentHint（等价或加强，覆盖不丢）。
     // ════════════════════════════════════════════════════════════════════
 
     @Test
@@ -933,7 +936,7 @@ class PartialCompactConversationTest {
             false, null, null, null, null);
 
         List<ChatMessageDto> messages = List.of(boundaryDto, userWithToolResult);
-        assertThat(PartialCompactConversation.extractDiscoveredToolNames(messages))
+        assertThat(SchemaNotSentHint.extractDiscoveredToolNames(messages))
             .as("boundary 携带集与 tool_reference 扫描并集（SM/partial 双路径共享）")
             .containsExactlyInAnyOrder("ToolA", "ToolB", "ToolC");
     }
@@ -957,14 +960,14 @@ class PartialCompactConversationTest {
             List.of(toolResult), List.of(), null, false, false, null, null,
             false, null, null, null, null);
 
-        assertThat(PartialCompactConversation.extractDiscoveredToolNames(List.of(boundaryDto, userWithToolResult)))
+        assertThat(SchemaNotSentHint.extractDiscoveredToolNames(List.of(boundaryDto, userWithToolResult)))
             .containsExactly("ToolC");
     }
 
     @Test
     @DisplayName("extractDiscoveredToolNames: 空消息列表 → 空集；null 输入 → 空集（toolSearch.ts:546）")
     void extractDiscoveredToolNamesEmptyInputs() {
-        assertThat(PartialCompactConversation.extractDiscoveredToolNames(null)).isEmpty();
-        assertThat(PartialCompactConversation.extractDiscoveredToolNames(List.of())).isEmpty();
+        assertThat(SchemaNotSentHint.extractDiscoveredToolNames(null)).isEmpty();
+        assertThat(SchemaNotSentHint.extractDiscoveredToolNames(List.of())).isEmpty();
     }
 }

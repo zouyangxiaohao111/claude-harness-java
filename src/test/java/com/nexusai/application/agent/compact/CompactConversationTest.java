@@ -8,6 +8,7 @@ import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
+import com.nexusai.application.agent.toolsearch.SchemaNotSentHint;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
@@ -553,6 +554,40 @@ class CompactConversationTest {
     }
 
     @Test
+    @DisplayName("✗-5: 全量压缩 boundary 从「扁平 Role.tool 工具结果」携带 preCompactDiscoveredTools（生产形状）")
+    void fullCompactBoundaryCarriesPreCompactDiscoveredTools_fromFlattenedToolResult() {
+        // WHY (规则九 · 验证意图)：上面那条用例构造的是 CC 原生形状 —— tool_result 包裹块嵌在
+        //   Role.user 消息 content 内；<b>只扫 Role.user 的旧拷贝同样能通过</b>，故它不能判别
+        //   真源的「Role.tool 扫描」半是否生效（变异实测：真源去掉 Role.tool 扫描后该用例仍绿）。
+        //   生产真实形状是 LlmAgentLoop.toolResultMessage 产出的<b>扁平 Role.tool 消息</b>：
+        //   contentBlocks 直接承载 ToolSearchTool 命中的 tool_reference 项（非包裹块）。
+        //   压缩必须把这些名字带过压缩边界 —— 否则 boundary 落库元数据丢集合，压缩后 gate4 对
+        //   已发现工具误判「未发现」→ 向 LLM 注入误导 hint（语义回归）。
+        ObjectNode flatRef = JsonNodeFactory.instance.objectNode();
+        flatRef.put("type", "tool_reference");
+        flatRef.put("tool_name", "mcp__github__create_issue");
+        ChatMessageDto flattenedToolResult = new ChatMessageDto(
+            "t-ref", SESSION, Role.tool, "tool", "",
+            null, List.of(), FinishReason.stop, null, null, "刚刚",
+            OffsetDateTime.now(), "call-ref-1", null, null,
+            List.of(flatRef), List.of(), null, false, false, null);
+        List<ChatMessageDto> messages = List.of(
+            msg("u1", Role.user, "first"),
+            msg("a1", Role.assistant, "resp"),
+            flattenedToolResult);
+
+        CompactionResult result = CompactConversation.compactConversation(
+            messages, ctx((m, prompt, preTokens) ->
+                new CompactConversation.SummaryResult("valid summary",
+                    new CompactConversation.TokenUsage(10, 5, 0, 0)),
+                new ArrayList<>()), true, null, false, null);
+
+        assertThat(result.boundaryMarker().compactMetadata().preCompactDiscoveredTools())
+            .as("扁平 Role.tool 的 tool_reference.tool_name 必须写入 boundary（Role.tool 扫描半 load-bearing）")
+            .containsExactly("mcp__github__create_issue");
+    }
+
+    @Test
     @DisplayName("✗-5: 无 tool_reference 时 boundary 不写 preCompactDiscoveredTools（compact.ts:607 if size>0）")
     void fullCompactWithoutDiscoveredToolsOmitsField() {
         CompactionResult result = CompactConversation.compactConversation(
@@ -568,7 +603,7 @@ class CompactConversationTest {
     }
 
     @Test
-    @DisplayName("✗-5: extractDiscoveredToolNames boundary carry + tool_reference 扫描（toolSearch.ts:545-592）")
+    @DisplayName("✗-5: extractDiscoveredToolNames boundary carry + tool_reference 扫描（R9(a) 真源 toolSearch.ts:545-592）")
     void extractDiscoveredToolNamesCarriesBoundaryAndScansReferences() {
         // boundary carry：已有 boundary 的 compactMetadata.preCompactDiscoveredTools 带过压缩边界
         CompactBoundaryMessage boundary = CompactBoundaryMessage.createCompactBoundaryMessage(
@@ -599,7 +634,8 @@ class CompactConversationTest {
             OffsetDateTime.now(), null, null, null,
             List.of(textBlock), List.of(), null, false, false, null);
 
-        java.util.Set<String> discovered = CompactConversation.extractDiscoveredToolNames(
+        // [R9(a) 三份合一] 原 CompactConversation 拷贝已删, 断言改测统一真源 SchemaNotSentHint。
+        java.util.Set<String> discovered = SchemaNotSentHint.extractDiscoveredToolNames(
             List.of(boundary.toChatMessageDto(), userWithRef, userText));
 
         assertThat(discovered)

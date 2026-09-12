@@ -11,6 +11,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -49,11 +50,9 @@ import java.util.Set;
  *       包裹块）+ {@link Role#tool}（扁平化 tool_result，contentBlocks 直接承载项）消息内的
  *       {@code tool_reference.tool_name} (CC toolSearch.ts:545-592；Role.tool 为 CC user
  *       消息内 tool_result 的 Java 扁平化，Provider 翻译回 role=user，LLM 视角即 CC user
- *       消息)。boundary 携带路径
- *       ({@code compactMetadata.preCompactDiscoveredTools}) Java ChatMessageDto 层不可
- *       表达（boundary 消息不携带 compactMetadata，同
- *       {@link com.nexusai.application.agent.compact.PartialCompactConversation} 限制）→
- *       登记 N/A。H4 引入 defer_loading 后 MCP/deferred 工具经 tool_reference 发现才发送
+ *       消息) + {@code compact_boundary} 携带的
+ *       {@code compactMetadata.preCompactDiscoveredTools}（见方法 javadoc）;
+ *       H4 引入 defer_loading 后 MCP/deferred 工具经 tool_reference 发现才发送
  *       → 生产 tool_result 可含 tool_reference → discovered 非空 → gate4 拦截生效
  *       （是否注入取决于实际消息历史, 不再恒放行）;</li>
  *   <li>H4 起 MCP/deferred 工具 schema 经 {@code willDefer} 延迟发送（defer_loading:true,
@@ -150,33 +149,42 @@ public final class SchemaNotSentHint {
     /**
      * 对齐 CC {@code extractDiscoveredToolNames(messages)} (toolSearch.ts:545-592) · 第 4 道门.
      *
+     * <p><b>[R9(a) 三份合一 · 唯一真源]</b> 本方法是全仓 {@code extractDiscoveredToolNames}
+     * 的唯一实现。原先 {@code CompactConversation} / {@code PartialCompactConversation}
+     * 各有一份拷贝 + 本类一份，现全部委托到此处。
+     *
      * <p>CC 扫描消息历史: system {@code compact_boundary} 的
      * {@code compactMetadata.preCompactDiscoveredTools} + user 消息 tool_result 内容内的
      * {@code tool_reference.tool_name}, 返回 discovered tool name 集合.
      *
-     * <p>Java 映射（对照 {@code PartialCompactConversation#extractDiscoveredToolNames}
-     * 真扫描 :474-504）：{@code ctx.messages()} 为 {@code List<?>}，元素经
+     * <p>Java 映射：{@code messages} 为 {@code List<?>}，元素经
      * {@code instanceof ChatMessageDto} 守卫（生产可能含非 ChatMessageDto 元素, 防
      * ClassCastException）。
      *
-     * <p><b>扫描角色（对齐 CC user 消息语义）</b>: CC 中 tool_result 块存于 user 消息
+     * <p><b>扫描角色（CC 结构 + Java 表示适配）</b>: CC 中 tool_result 块存于 user 消息
      * （messages.ts:505 createUserMessage {@code role:'user'}），content 数组内嵌
-     * tool_reference（toolSearch.ts:568-578）。Java 把 CC user 消息内的 tool_result 扁平化为
+     * tool_reference（toolSearch.ts:568-578）—— 所以 CC <b>只扫 user</b> 就够。
+     * <b>这不是我们的表示</b>：Java 把 CC user 消息内的 tool_result 扁平化为独立的
      * {@link Role#tool} ChatMessageDto（{@code LlmAgentLoop.toolResultMessage} 工厂，
      * {@code ToolResultStorage} 候选提取一致；Provider 翻译 Role.tool → role=user，LLM 视角
-     * 即 CC user 消息，见 AnthropicSdkProvider.buildSdkMessages）—— 因此两个角色都扫:
+     * 即 CC user 消息，见 AnthropicSdkProvider.buildSdkMessages）—— <b>只扫 user 会漏掉
+     * 全部扁平化工具结果</b>。因此两个角色都扫:
      * <ul>
      *   <li>{@link Role#user}：{@code contentBlocks} 内含 type==tool_result 包裹块，块内
-     *       content 数组扫 tool_reference.tool_name（既有路径，行为不变）;</li>
+     *       content 数组扫 tool_reference.tool_name（CC 原生形状）;</li>
      *   <li>{@link Role#tool}：扁平化 tool_result，{@code contentBlocks} 即
      *       tool_result.content 数组 —— 主形状为直接 tool_reference 项，兼容形状为
-     *       tool_result 包裹块；两分支均以 {@code isToolReferenceWithName} 判定，无语义重叠。</li>
+     *       tool_result 包裹块；两分支均以 {@code isToolReferenceWithName} 判定，无语义重叠。
+     *       <b>此半为 Java 表示特有的 load-bearing 适配，去掉即漏扫（变异自证）。</b></li>
      * </ul>
      *
-     * <p><b>boundary 携带路径 N/A</b>: {@code compact_boundary} 消息的
-     * {@code compactMetadata.preCompactDiscoveredTools} 在 Java ChatMessageDto 层不可
-     * 表达（boundary ChatMessageDto 不携带 compactMetadata）—— 同
-     * {@code PartialCompactConversation} 限制, 登记 N/A, 不模拟.
+     * <p><b>boundary 携带</b>: {@code compact_boundary} 消息的
+     * {@code compactMetadata.preCompactDiscoveredTools}（CC toolSearch.ts:551-560）——
+     * 压缩会抹掉 tool_reference 块，boundary 快照把已发现集合带过压缩边界。判别<b>内联</b>
+     * （{@code role()==system && subtype()=='compact_boundary'}，等价 {@code BoundaryReader
+     * .isCompactBoundaryMessage}）—— 对齐 CC toolSearch.ts:550 内联理由，避免 toolsearch → compact
+     * 反向依赖；读 {@code ChatMessageDto.compactMetadata()}
+     * （该 DTO 字段早已存在，与 CC {@code msg.compactMetadata} 同形）。
      *
      * @param messages 消息历史 (CC {@code Message[]}, Java {@code List<?>})
      * @return discovered tool name 集合 (无 → 空集, 非 null)
@@ -191,7 +199,26 @@ public final class SchemaNotSentHint {
             if (!(messageObj instanceof ChatMessageDto message)) {
                 continue;
             }
-            // CC toolSearch.ts:563 只扫含 tool_result 的消息。Java 侧 Role.user（contentBlocks
+            // 1. compact_boundary → carry preCompactDiscoveredTools（CC toolSearch.ts:551-560），
+            //    然后 continue（boundary 不承载 tool_reference 块）。
+            //    判别内联、不调用 BoundaryReader.isCompactBoundaryMessage —— 对齐 CC toolSearch.ts:550
+            //    的内联理由（原文："Inline type check rather than isCompactBoundaryMessage —
+            //    utils/messages.ts imports from this file, so importing back would be circular"）：
+            //    避免 toolsearch → compact 反向依赖成环。判据与 BoundaryReader
+            //    （role==system && subtype=='compact_boundary'）逐字等价。
+            if (message.role() == Role.system
+                && "compact_boundary".equals(message.subtype())) {
+                Map<String, Object> meta = message.compactMetadata();
+                if (meta != null && meta.get("preCompactDiscoveredTools") instanceof List<?> carried) {
+                    for (Object name : carried) {
+                        if (name instanceof String s && !s.isBlank()) {
+                            discovered.add(s);
+                        }
+                    }
+                }
+                continue;
+            }
+            // 2. CC toolSearch.ts:563 只扫含 tool_result 的消息。Java 侧 Role.user（contentBlocks
             // 内含 tool_result 包裹块）与 Role.tool（CC user 消息内 tool_result 的扁平化，
             // contentBlocks 即 tool_result.content 数组）同属 CC user 消息语义，一并扫描。
             if (message.role() != Role.user && message.role() != Role.tool) {

@@ -2,6 +2,7 @@ package com.nexusai.application.agent.toolsearch;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.application.agent.compact.CompactBoundaryMessage;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.McpServerInfo;
@@ -279,6 +280,26 @@ class SchemaNotSentHintFullCoverageTest {
     }
 
     // ─────────────────────── gate4: discovered set 扫描 ───────────────────────
+
+    @Test
+    @DisplayName("[R9(a)] 真源 boundary 携带: compact_boundary.preCompactDiscoveredTools 并入 discovered set")
+    void gate4_truthSource_carriesBoundaryTools() {
+        // WHY (CC toolSearch.ts:551-560): 压缩会抹掉 tool_reference 块, boundary 快照把已发现
+        //   集合带过压缩边界 → 多次压缩链上集合不收缩。R9(a) 前真源缺此分支（登记 N/A）,
+        //   而两份拷贝有 → 三份行为不一致; 合一后真源补上。变异: 去掉 boundary 分支 → 本用例转红。
+        ChatMessageDto boundary = CompactBoundaryMessage.createCompactBoundaryMessage(
+                "auto", 100, "parent-1", null, null)
+            .withCompactMetadata(new CompactBoundaryMessage.CompactMetadata(
+                "auto", 100, null, null, List.of("mcp__carried__tool"), null))
+            .toChatMessageDto();
+
+        Set<String> discovered = SchemaNotSentHint.extractDiscoveredToolNames(
+            List.of(boundary, userMsgWithToolReference("mcp__fresh__tool")));
+
+        assertThat(discovered)
+            .as("boundary carry ∪ tool_reference 扫描（CC 结构 + 我们的表示适配）")
+            .containsExactlyInAnyOrder("mcp__carried__tool", "mcp__fresh__tool");
+    }
 
     @Test
     @DisplayName("gate4 真扫描: 含 tool_result→tool_reference 的 user 消息 → discovered 非空")

@@ -265,9 +265,15 @@ public final class ToolSearchService {
     /**
      * 读取当前 env 快照 · 测试经 {@link #envOverride} 注入，生产读 {@code System.getenv()}。
      *
+     * <p><b>[R9(b) env seam 归一]</b> 本方法是全仓「env 读取入口」的单点。原先
+     * {@code PostCompactAttachmentRestorer} 自带第二份 {@code envOverride} 字段（同类两个
+     * env 入口），现该类两条门（{@code shouldInjectAgentListInMessages} /
+     * {@code isMcpInstructionsDeltaEnabled}）改调此处，第二份 seam 已删除。语义不变：只换
+     * 「从哪读 env」，{@code isEnvTruthy} / {@code USER_TYPE==ant} 等判据不动。
+     *
      * @return env 快照（非 null）
      */
-    private static Map<String, String> currentEnv() {
+    public static Map<String, String> currentEnv() {
         return envOverride != null ? envOverride : System.getenv();
     }
 

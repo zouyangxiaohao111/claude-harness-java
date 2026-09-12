@@ -1614,9 +1614,10 @@ public class SessionMemoryService {
             // [SM-03] preCompactDiscoveredTools（GAP-4）· CC sessionMemoryCompact.ts:447-459
             //   非空时写入 compactMetadata（排序）——旧实现 5 参便捷构造 → compactMetadata
             //   preCompactDiscoveredTools 恒空（NOT_ALIGNED）。实现同
-            //   PartialCompactConversation:341-352（compact.ts:1023-1028）。
+            //   PartialCompactConversation（compact.ts:1023-1028），[R9(a) 三份合一] 起
+            //   统一委托唯一真源 SchemaNotSentHint.extractDiscoveredToolNames。
             java.util.Set<String> preCompactDiscovered =
-                PartialCompactConversation.extractDiscoveredToolNames(messages);
+                com.nexusai.application.agent.toolsearch.SchemaNotSentHint.extractDiscoveredToolNames(messages);
             if (!preCompactDiscovered.isEmpty()) {
                 List<String> sorted = new ArrayList<>(preCompactDiscovered);
                 java.util.Collections.sort(sorted);

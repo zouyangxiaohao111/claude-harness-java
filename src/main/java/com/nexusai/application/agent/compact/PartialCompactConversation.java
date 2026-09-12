@@ -12,10 +12,10 @@ import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.toolsearch.SchemaNotSentHint;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
-import com.fasterxml.jackson.databind.JsonNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -489,7 +489,8 @@ public final class PartialCompactConversation {
                 "manual", preCompactTokenCount, lastPreCompactUuid, userFeedback, messagesToSummarize.size());
 
             // ── 18. preCompactDiscoveredTools（compact.ts:1023-1028）──
-            Set<String> preCompactDiscovered = extractDiscoveredToolNames(allMessages);
+            // [R9(a) 三份合一] 委托唯一真源 SchemaNotSentHint（含 Role.user + Role.tool + boundary carry）
+            Set<String> preCompactDiscovered = SchemaNotSentHint.extractDiscoveredToolNames(allMessages);
             if (!preCompactDiscovered.isEmpty()) {
                 List<String> sorted = new ArrayList<>(preCompactDiscovered);
                 Collections.sort(sorted);
@@ -604,83 +605,6 @@ public final class PartialCompactConversation {
             && CompactConversation.SUMMARY_SUBTYPE.equals(m.subtype());
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // extractDiscoveredToolNames（compact.ts:1023-1028 / toolSearch.ts:545-577）
-    // ════════════════════════════════════════════════════════════════════
-
-    /**
-     * 提取已发现的 deferred 工具名 · 对齐 CC {@code extractDiscoveredToolNames}
-     * （toolSearch.ts:545-592）。
-     *
-     * <p>CC 语义：
-     * <ol>
-     *   <li>{@code compact_boundary} system 消息 → carry 其
-     *       {@code compactMetadata.preCompactDiscoveredTools}（toolSearch.ts:553-560）——
-     *       压缩会抹掉 tool_reference 块，boundary 快照把已发现集合带过压缩边界；</li>
-     *   <li>user 消息 tool_result 内容内的 {@code tool_reference.tool_name}
-     *       （toolSearch.ts:562-580，ToolSearch 命中输出，ToolSearchTool.ts:462-469）。</li>
-     * </ol>
-     *
-     * <p>Java 映射：boundary 判别经 {@link BoundaryReader#isCompactBoundaryMessage}
-     * （messages.ts:4608），carry 读 {@code ChatMessageDto.compactMetadata()}（IMP2-14
-     * 序列化闭环后 DTO 层携带，与 {@link CompactConversation#extractDiscoveredToolNames}
-     * legacy 路径同构）；tool_reference 扫描 user 消息 contentBlocks 中
-     * type='tool_result' 的 JsonNode 块。返回集为空时 boundary 不写该字段
-     * （CC :1024 if size>0）。
-     *
-     * @param messages 全量消息
-     * @return 已发现工具名集合（无 → 空集）
-     */
-    public static Set<String> extractDiscoveredToolNames(List<ChatMessageDto> messages) {
-        Set<String> discovered = new HashSet<>();
-        if (messages == null) {
-            return discovered;
-        }
-        for (ChatMessageDto m : messages) {
-            if (m == null) {
-                continue;
-            }
-            // 1. compact_boundary → carry preCompactDiscoveredTools（toolSearch.ts:553-560）
-            if (BoundaryReader.isCompactBoundaryMessage(m)) {
-                Map<String, Object> meta = m.compactMetadata();
-                if (meta != null) {
-                    Object carried = meta.get("preCompactDiscoveredTools");
-                    if (carried instanceof List<?> list) {
-                        for (Object name : list) {
-                            if (name instanceof String s && !s.isBlank()) {
-                                discovered.add(s);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            // 2. user 消息 tool_result 块内的 tool_reference.tool_name（toolSearch.ts:562-580）
-            if (m.role() != Role.user || m.contentBlocks() == null) {
-                continue;
-            }
-            for (Object blockObj : m.contentBlocks()) {
-                if (!(blockObj instanceof JsonNode block) || !block.isObject()) {
-                    continue;
-                }
-                if (!"tool_result".equals(block.path("type").asText(""))) {
-                    continue;
-                }
-                JsonNode content = block.path("content");
-                if (!content.isArray()) {
-                    continue;
-                }
-                for (JsonNode item : content) {
-                    if (item.isObject()
-                        && "tool_reference".equals(item.path("type").asText(""))
-                        && item.path("tool_name").isTextual()) {
-                        discovered.add(item.path("tool_name").asText());
-                    }
-                }
-            }
-        }
-        return discovered;
-    }
 
     // ════════════════════════════════════════════════════════════════════
     // 小工具

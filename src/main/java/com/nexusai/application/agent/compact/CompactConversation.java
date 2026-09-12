@@ -7,6 +7,7 @@ import com.nexusai.application.agent.compact.CompactProgressEvent.HooksStart.Hoo
 import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.toolsearch.SchemaNotSentHint;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.repository.provider.mapper.ModelMapper;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
@@ -29,7 +30,6 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import com.fasterxml.jackson.databind.JsonNode;
 
 /**
  * 全量压缩单函数 · 对齐 CC {@code compactConversation}
@@ -458,7 +458,8 @@ public final class CompactConversation {
                 trigger, preCompactTokenCount, lastUuid, null, null);
             // ✗-5 全量路径：提取 deferred 工具名写入 boundary compactMetadata（compact.ts:606-611）
             //   extractDiscoveredToolNames(messages) → 非空时按名排序（CC [...set].sort()）
-            Set<String> preCompactDiscovered = extractDiscoveredToolNames(messages);
+            // [R9(a) 三份合一] 委托唯一真源 SchemaNotSentHint（含 Role.user + Role.tool + boundary carry）
+            Set<String> preCompactDiscovered = SchemaNotSentHint.extractDiscoveredToolNames(messages);
             if (!preCompactDiscovered.isEmpty()) {
                 CompactBoundaryMessage.CompactMetadata oldMeta = boundaryMarker.compactMetadata();
                 List<String> sorted = new ArrayList<>(preCompactDiscovered);
@@ -1045,80 +1046,6 @@ public final class CompactConversation {
             return null;
         }
         return messages.get(messages.size() - 1).id();
-    }
-
-    /**
-     * 提取消息历史中已发现的 deferred 工具名 · 对齐 CC {@code extractDiscoveredToolNames}
-     * （utils/toolSearch.ts:545-592）。
-     *
-     * <p>CC 语义：
-     * <ol>
-     *   <li>{@code compact_boundary} system 消息 → carry 其
-     *       {@code compactMetadata.preCompactDiscoveredTools}（toolSearch.ts:553-560）——
-     *       压缩会抹掉 tool_reference 块，boundary 快照把已发现集合带过压缩边界；</li>
-     *   <li>user 消息 tool_result 内容内的 {@code tool_reference.tool_name}
-     *       （toolSearch.ts:562-580，ToolSearch 命中输出，ToolSearchTool.ts:462-469）。</li>
-     * </ol>
-     *
-     * <p>Java 映射：boundary 判别经 {@link BoundaryReader#isCompactBoundaryMessage}
-     * （messages.ts:4608），carry 读 {@code ChatMessageDto.compactMetadata()}（IMP2-14
-     * 序列化闭环后 DTO 层携带）；tool_reference 扫描 user 消息 contentBlocks 中
-     * type='tool_result' 的 JsonNode 块（与 PartialCompactConversation 扫描同构）。
-     * 与 {@link com.nexusai.application.agent.toolsearch.SchemaNotSentHint}
-     * 第 4 道门共享同一 CC 真源语义。
-     *
-     * @param messages 压缩前消息链
-     * @return 已发现工具名集合（无 → 空集）
-     */
-    static Set<String> extractDiscoveredToolNames(List<ChatMessageDto> messages) {
-        Set<String> discovered = new HashSet<>();
-        if (messages == null) {
-            return discovered;
-        }
-        for (ChatMessageDto m : messages) {
-            if (m == null) {
-                continue;
-            }
-            // 1. compact_boundary → carry preCompactDiscoveredTools（toolSearch.ts:553-560）
-            if (BoundaryReader.isCompactBoundaryMessage(m)) {
-                Map<String, Object> meta = m.compactMetadata();
-                if (meta != null) {
-                    Object carried = meta.get("preCompactDiscoveredTools");
-                    if (carried instanceof List<?> list) {
-                        for (Object name : list) {
-                            if (name instanceof String s && !s.isBlank()) {
-                                discovered.add(s);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            // 2. user 消息 tool_result 块内的 tool_reference.tool_name（toolSearch.ts:562-580）
-            if (m.role() != Role.user || m.contentBlocks() == null) {
-                continue;
-            }
-            for (Object blockObj : m.contentBlocks()) {
-                if (!(blockObj instanceof JsonNode block) || !block.isObject()) {
-                    continue;
-                }
-                if (!"tool_result".equals(block.path("type").asText(""))) {
-                    continue;
-                }
-                JsonNode content = block.path("content");
-                if (!content.isArray()) {
-                    continue;
-                }
-                for (JsonNode item : content) {
-                    if (item.isObject()
-                        && "tool_reference".equals(item.path("type").asText(""))
-                        && item.path("tool_name").isTextual()) {
-                        discovered.add(item.path("tool_name").asText());
-                    }
-                }
-            }
-        }
-        return discovered;
     }
 
     /** transcript 路径（CC getTranscriptPath()，compact.ts:613）· D3 读兼容：读 nexusai 现有 transcript（无 claude 回落）。 */
