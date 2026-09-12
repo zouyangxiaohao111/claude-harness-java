@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { ChatMessageDto, ToolCallDto } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 import { pairCompactSummaries } from '@/utils/compactPairing'
+import { PREVIEW_SOURCE_CHARACTERS, projectPreview } from '@/markdown/plainPreview'
 
 /** 轨迹视图 · dsh 式记录列表：从会话消息历史派生 user/assistant/tool 记录（按 turn 分组）。
  *  数据源：chatStore.messages[activeSessionId]（真实后端消息历史，含 toolCalls）。 */
@@ -121,16 +122,42 @@ function snipBoundaryMarker(msg: ChatMessageDto): TraceRecord {
   }
 }
 
+/** 轨迹记录单行预览：有界源文 → 纯文本投影 → 折成单行 → 超 60 字截断 + 省略号。
+ *
+ *  <p>投影走 {@link projectPreview}：**先按字符截断源文、再投影**（顺序不可换，已由
+ *  markdown/__tests__/plainPreview.test.ts 钉住 —— 反过来等于对全文 parse）。
+ *  窗口大小用 {@link PREVIEW_SOURCE_CHARACTERS}（与 harness 同值的单点约定，见 plainPreview.ts）。
+ *
+ *  <p>投影用 parseGfm（流式臂：**无 math 扩展、不跑 rescue**），故行内 {@code $$x$$} 与
+ *  粘连标记（{@code ##标题}，即 rescue 会补空格的那类）**在本预览里保持字面** —— 与展开态
+ *  渲染可能不同（预览少剥、不藏内容，两者语法不同源）。投影还逐行 trim，**代码块缩进会被
+ *  抹平**（已知取舍）。
+ *
+ *  <p>投影结果**可能为空串**（当这 {@link PREVIEW_SOURCE_CHARACTERS} 个字符全是
+ *  thematicBreak / definition 时，例如用户只发了 {@code ---} 或一行
+ *  {@code [ref]: http://…}）→ txt 为空，此时本落点会渲染出一条空内容记录行（kind/time 仍在；
+ *  详情浮层仍可按 full 看原文）。**派生影响**：{@code turns} 分组里 turn 标题取自
+ *  {@code recs[0].txt.slice(0, 30)}，故空投影的 user 消息会把 turn 标题一起变空（渲染成
+ *  「#1 」而此前是「#1 ---」）——同属该边界的后果，此处保留（不额外造兜底文案）。
+ *
+ *  <p>WHY：原先 user/system 分支把 markdown 源文**全文直出**、assistant 分支取源文前 60 字
+ *  → {@code #} 标题 / {@code **} 粗体 / 围栏等标记字面泄漏；顺带把「用户长正文把轨迹列表撑爆」
+ *  收敛成单行（3 个分支同一口径）。{@code full} 仍是原文，详情浮层看原文，不受投影影响。 */
+function previewTxt(content: string): string {
+  const plain = projectPreview(content, PREVIEW_SOURCE_CHARACTERS).replace(/\s+/g, ' ').trim()
+  return plain.length > 60 ? `${plain.slice(0, 60)}…` : plain
+}
+
 /** 单条消息 → 轨迹记录数组（user 1 条 / assistant 1 条 + 每条 toolCall 1 条，保持顺序） */
 function toRecords(msg: ChatMessageDto, snipped: boolean): TraceRecord[] {
   const time = msg.time ?? msg.createdAt ?? ''
   const content = msg.content ?? ''
   if (msg.role === 'user') {
-    return [{ kind: 'user', toolClass: '', toolName: '', txt: content, time, full: content, snipped }]
+    return [{ kind: 'user', toolClass: '', toolName: '', txt: previewTxt(content), time, full: content, snipped }]
   }
   if (msg.role === 'system') {
     // fallback / 系统消息：归为 assistant 类别，避免空行
-    return [{ kind: 'assistant', toolClass: '', toolName: '', txt: content, time, full: content, snipped }]
+    return [{ kind: 'assistant', toolClass: '', toolName: '', txt: previewTxt(content), time, full: content, snipped }]
   }
   const records: TraceRecord[] = []
   for (const tc of msg.toolCalls ?? []) {
@@ -149,7 +176,7 @@ function toRecords(msg: ChatMessageDto, snipped: boolean): TraceRecord[] {
       kind: 'assistant',
       toolClass: '',
       toolName: '',
-      txt: content.length > 60 ? `${content.slice(0, 60)}…` : content,
+      txt: previewTxt(content),
       time,
       full: content,
       snipped,
@@ -171,70 +198,91 @@ interface TraceViewProps {
   snippedIds?: string[]
 }
 
-export function TraceView({ messages, snippedIds = [] }: TraceViewProps) {
+/** 一组轨迹记录（一个 turn + 其标题） */
+interface Turn {
+  num: number
+  title: string
+  records: TraceRecord[]
+}
+
+/** snippedIds 的缺省值：模块级常量，**不是**每次调用新建的 [] —— 否则该 prop 恒换引用，
+ *  下游 useMemo 依赖永不相等、缓存全废（调用点 App.tsx:350 已在传稳定引用）。 */
+const EMPTY_SNIPPED_IDS: string[] = []
+
+export function TraceView({ messages, snippedIds = EMPTY_SNIPPED_IDS }: TraceViewProps) {
   // [轨迹详情] 点击记录行 → 浮层看完整内容
   const [detail, setDetail] = useState<TraceRecord | null>(null)
   const detailLabel = detail
     ? (detail.detailTitle ?? (detail.compact ? '压缩摘要' : detail.kind === 'user' ? '用户消息' : detail.kind === 'tool' ? `工具调用 · ${detail.toolName || 'tool'}` : '助手回复'))
     : ''
-  const visible = messages.filter((m) => !m.isMeta)
+  // [性能] 以下 useMemo 必须位于**所有提前 return 之前**（守 hooks 顺序 —— 分组循环原先在
+  //   `visible.length === 0` 的提前 return 之后，直接把 useMemo 放那儿会破坏 hooks 顺序）。
+  //   WHY 要包：分组会对**全量消息**逐条跑 toRecords → previewTxt → projectPreview（非增量 parse，
+  //   实测 ~1.5ms/条，1000 条 ≈ 1.5s/次渲染），而改动前这里是廉价切片（~0）；trace tab 打开期间
+  //   每次结构性重渲（点行开详情、父组件重渲）都会整份重跑。依赖全部取稳定引用（props 快照 +
+  //   会话级 store 数组），故同一份输入只算一次。与 MessageList.ContentGuard 的 useMemo 同款写法。
+  const visible = useMemo(() => messages.filter((m) => !m.isMeta), [messages])
+  const snippedSet = useMemo(() => new Set(snippedIds), [snippedIds])
+  // [compact 边界] 一次前向扫出的 boundary↔摘要 配对表（栈式配对；跨 boundary 扫描会漏掉 from 方向的
+  //   外边界摘要 —— 详见 utils/compactPairing.ts 注释）。按 boundary 消息 id 查表。
+  const summaryByBoundary = useMemo(() => pairCompactSummaries(visible), [visible])
+
+  // 按 turn 分组：每条 user 消息开新 turn；无 user 起始时兜底为单 turn
+  const turns = useMemo(() => {
+    const out: Turn[] = []
+    let cur: Turn | null = null
+    for (let i = 0; i < visible.length; i++) {
+      const msg = visible[i]
+      // [compact 边界] compact 替换点（CC boundary → summary → kept…）→ 当前 turn 内插一条「已压缩」标记行；
+      //   无 turn 上下文（如压缩后首条）时兜底开「会话」分组（与下方非 user 起始同款兜底）。
+      //   摘要正文取自 boundary↔摘要 配对表（pairCompactSummaries；后端的摘要消息本身也会
+      //   作为普通 user 记录渲染，此处只借用其正文作为标记详情）。
+      if (msg.subtype === 'compact_boundary') {
+        if (cur === null) {
+          cur = { num: out.length + 1, title: '会话', records: [] }
+          out.push(cur)
+        }
+        cur.records.push(compactMarker(msg, summaryByBoundary.get(msg.id) ?? ''))
+        continue
+      }
+      // [compact 边界] microcompact 微压缩分界 → 居中标记条（与聊天区同文案），不落普通记录行
+      if (msg.subtype === 'microcompact_boundary') {
+        if (cur === null) {
+          cur = { num: out.length + 1, title: '会话', records: [] }
+          out.push(cur)
+        }
+        cur.records.push(microcompactMarker(msg))
+        continue
+      }
+      // [snip 边界] snip 裁剪分界 → 居中标记条（与聊天区同文案），不落普通记录行（P2-19）
+      if (msg.subtype === 'snip_boundary') {
+        if (cur === null) {
+          cur = { num: out.length + 1, title: '会话', records: [] }
+          out.push(cur)
+        }
+        cur.records.push(snipBoundaryMarker(msg))
+        continue
+      }
+      const recs = toRecords(msg, msg.id != null && snippedSet.has(msg.id))
+      if (recs.length === 0) continue
+      if (msg.role === 'user') {
+        cur = { num: out.length + 1, title: recs[0].txt.slice(0, 30), records: [] }
+        out.push(cur)
+      } else if (cur === null) {
+        cur = { num: out.length + 1, title: '会话', records: [] }
+        out.push(cur)
+      }
+      cur.records.push(...recs)
+    }
+    return out
+  }, [visible, snippedSet, summaryByBoundary])
+
   if (visible.length === 0) {
     return (
       <div className="trace-view">
         <div className="trace-empty">该会话暂无轨迹</div>
       </div>
     )
-  }
-  const snippedSet = new Set(snippedIds)
-  // [compact 边界] 一次前向扫出的 boundary↔摘要 配对表（栈式配对；跨 boundary 扫描会漏掉 from 方向的
-  //   外边界摘要 —— 详见 utils/compactPairing.ts 注释）。按 boundary 消息 id 查表。
-  const summaryByBoundary = pairCompactSummaries(visible)
-
-  // 按 turn 分组：每条 user 消息开新 turn；无 user 起始时兜底为单 turn
-  const turns: { num: number; title: string; records: TraceRecord[] }[] = []
-  let cur: { num: number; title: string; records: TraceRecord[] } | null = null
-  for (let i = 0; i < visible.length; i++) {
-    const msg = visible[i]
-    // [compact 边界] compact 替换点（CC boundary → summary → kept…）→ 当前 turn 内插一条「已压缩」标记行；
-    //   无 turn 上下文（如压缩后首条）时兜底开「会话」分组（与下方非 user 起始同款兜底）。
-    //   摘要正文取自 boundary↔摘要 配对表（pairCompactSummaries；后端的摘要消息本身也会
-    //   作为普通 user 记录渲染，此处只借用其正文作为标记详情）。
-    if (msg.subtype === 'compact_boundary') {
-      if (cur === null) {
-        cur = { num: turns.length + 1, title: '会话', records: [] }
-        turns.push(cur)
-      }
-      cur.records.push(compactMarker(msg, summaryByBoundary.get(msg.id) ?? ''))
-      continue
-    }
-    // [compact 边界] microcompact 微压缩分界 → 居中标记条（与聊天区同文案），不落普通记录行
-    if (msg.subtype === 'microcompact_boundary') {
-      if (cur === null) {
-        cur = { num: turns.length + 1, title: '会话', records: [] }
-        turns.push(cur)
-      }
-      cur.records.push(microcompactMarker(msg))
-      continue
-    }
-    // [snip 边界] snip 裁剪分界 → 居中标记条（与聊天区同文案），不落普通记录行（P2-19）
-    if (msg.subtype === 'snip_boundary') {
-      if (cur === null) {
-        cur = { num: turns.length + 1, title: '会话', records: [] }
-        turns.push(cur)
-      }
-      cur.records.push(snipBoundaryMarker(msg))
-      continue
-    }
-    const recs = toRecords(msg, msg.id != null && snippedSet.has(msg.id))
-    if (recs.length === 0) continue
-    if (msg.role === 'user') {
-      cur = { num: turns.length + 1, title: recs[0].txt.slice(0, 30), records: [] }
-      turns.push(cur)
-    } else if (cur === null) {
-      cur = { num: turns.length + 1, title: '会话', records: [] }
-      turns.push(cur)
-    }
-    cur.records.push(...recs)
   }
   if (turns.length === 0) {
     return <div className="trace-view"><div className="trace-empty">该会话暂无轨迹</div></div>

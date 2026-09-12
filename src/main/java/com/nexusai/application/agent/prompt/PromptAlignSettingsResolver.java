@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.prompt;
 
+import com.nexusai.application.agent.toolsearch.ToolSearchService;
 import com.nexusai.repository.settings.entity.SettingsRecord;
 import com.nexusai.repository.settings.mapper.SettingsMapper;
 import org.slf4j.Logger;
@@ -246,5 +247,33 @@ public class PromptAlignSettingsResolver {
     public static Boolean staticSystemPromptBoundaryEnabled() {
         PromptAlignSettingsResolver r = staticResolver;
         return r != null ? r.systemPromptBoundaryEnabled() : null;
+    }
+
+    /**
+     * [dtd-cfg] deferred_tools_delta 门控 <b>统一判定（唯一真源）</b>：把「外圈 DB 覆盖」与
+     * 「内圈 env 门」合并为一个判定，供主循环 / 压缩内圈 / prepend 三处共用。
+     *
+     * <p><b>WHY 存在</b>：此前该判定分裂成两份——主循环经
+     * {@code LlmAgentLoop.deferredToolsDeltaGate(ctx)}（DB 覆盖，:3645-3662），而压缩内圈
+     * {@code PostCompactAttachmentRestorer}（:1412/:1639）与主循环 prepend（{@code LlmAgentLoop:11708}）
+     * 各读 env-only 拷贝。结果是 DB 打开、env 关（生产默认即此）时：外圈发 delta 附件，内圈
+     * 压缩重宣布被 env 门挡掉、prepend 又照发全量清单 → 开关空转 + 双发。此处收敛为一处。
+     *
+     * <p><b>语义（CC {@code toolSearch.ts:629-634}）</b>：true → 用持久化增量附件
+     * {@code deferred_tools_delta} 公告 deferred 工具；false → 每轮在消息队首 prepend 全量
+     * {@code <available-deferred-tools>} 清单。默认 false。
+     *
+     * <p><b>取值链</b>：DB {@code settings.deferred_tools_delta_enabled}（经静态槽位
+     * {@link #staticResolver}，即 ToolRegistrationConfig 接线的主 bean，与 ctx.sessionState()
+     * 的 resolver 同一实例）有值即用；null（未配置 / 无 Spring 上下文 / 行缺失）→ 回落
+     * {@link ToolSearchService#isDeferredToolsDeltaEnabled()}（env {@code USER_TYPE=ant}，
+     * 生产默认非 ant = false）。保留 env 兜底 = 对齐 CC 的 ant 开发通道，生产默认 false。
+     *
+     * @return true = delta 增量附件路径；false = 每轮 prepend 全量清单（默认）
+     */
+    public static boolean staticDeferredToolsDeltaEnabled() {
+        PromptAlignSettingsResolver r = staticResolver;
+        Boolean v = (r == null) ? null : r.deferredToolsDeltaEnabled();
+        return (v != null) ? v : ToolSearchService.isDeferredToolsDeltaEnabled();
     }
 }

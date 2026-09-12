@@ -3643,23 +3643,10 @@ public class LlmAgentLoop implements AgentLoop {
      * 实例 dedup 字段已随 C-8 双实现漂移删除（D-5），dedup 状态收敛为 LoopSessionState 内 fresh
      * 初始化（每 agent 独立、不跨 session 共享 · 对齐 CC 每进程 sentSkillNames 空 Map 起点）。
      */
-    /**
-     * [prompt-align CTX-09] deferred_tools_delta 门控 · DB deferred_tools_delta_enabled 覆盖
-     * （PromptAlignSettingsResolver，null→回落 ToolSearchService.isDeferredToolsDeltaEnabled 默认关；
-     * CC toolSearch.ts:629-706 delta 门控 USER_TYPE=ant||feature tengu_glacier_2xr）。
-     *
-     * <p>静态 loop 方法经 ctx.sessionState() 取 resolver（CTX-02 已把 resolver 注入 LoopSessionState）；
-     * subagent/hook 会话路径（factory freshSession）未注入 resolver → 回落默认（与 CTX-02 同登记项）。
-     *
-     * @param ctx loop 上下文（sessionState 承载 resolver）
-     * @return true = delta 启用（DB 显式开 或 默认 env gate 真）
-     */
-    private static boolean deferredToolsDeltaGate(AgentLoopContext ctx) {
-        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver r =
-            ctx != null && ctx.sessionState() != null ? ctx.sessionState().promptAlignSettingsResolver() : null;
-        Boolean v = (r == null) ? null : r.deferredToolsDeltaEnabled();
-        return (v != null) ? v : ToolSearchService.isDeferredToolsDeltaEnabled();
-    }
+    // [dtd-cfg] 原 deferredToolsDeltaGate(ctx)（DB via ctx.sessionState resolver → 回落 env）已删除：
+    //   统一判定收敛为 PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()（静态槽位 =
+    //   ToolRegistrationConfig 接线的主 bean，与 ctx.sessionState() 的 resolver 同一实例；压缩内圈
+    //   静态无 ctx 也能读同一判定）。调用点见下方 delta 分支 + ToolsAssembly.prependAvailableDeferredTools。
 
     private AgentLoopContext.LoopSessionState buildSessionStateFromInstance() {
         AgentLoopContext.LoopSessionState session = new AgentLoopContext.LoopSessionState();
@@ -6058,10 +6045,14 @@ public class LlmAgentLoop implements AgentLoop {
             //   对齐 CC「persisted deferred_tools_delta attachments」语义）。
             // [prompt-align CTX-09] 双表示：state.appendMessage(dtd) 持久化 JSON（scan 源），LLM 注入
             //   dtd.withContent(renderDeferredToolsDelta(dtd.content())) 人类可读副本（对齐 CC
-            //   messages.ts:4178-4195 渲染，替代 JSON payload 直塞 LLM）。门控加 DB
-            //   deferred_tools_delta_enabled 覆盖（deferredToolsDeltaGate，null→ToolSearchService
-            //   isDeferredToolsDeltaEnabled 默认关）。
-            if (toolsAssembly.useToolSearch() && deferredToolsDeltaGate(ctx)) {
+            //   messages.ts:4178-4195 渲染，替代 JSON payload 直塞 LLM）。
+            // [dtd-cfg] 门控 = 统一判定 staticDeferredToolsDeltaEnabled（DB
+            //   settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant 默认关）·
+            //   与 prependAvailableDeferredTools / 压缩内圈共用同一判定，消除「DB 开、env 关
+            //   → delta 附件与旧 prepend 双发」。
+            if (toolsAssembly.useToolSearch()
+                    && com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                        .staticDeferredToolsDeltaEnabled()) {
                 ChatMessageDto dtd = PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
                         perTurnTuc.availableTools(), effectiveModel, perTurnTuc.effectiveProviderType(),
                         messagesForLlm);
@@ -11703,13 +11694,20 @@ public class LlmAgentLoop implements AgentLoop {
          * !isDeferredToolsDeltaEnabled()} → 消息队首插入 meta user message
          * {@code <available-deferred-tools>\n{deferred 名排序 join}\n</available-deferred-tools>}
          * （formatDeferredToolLine = tool.name，prompt.ts:115-117；CC 无 list 时跳过）。
-         * 完整 deferred_tools_delta attachment 跨 compact 登记 OPD-H-06 残留。
+         *
+         * <p>[dtd-cfg] 门控 = <b>统一判定</b>
+         * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（DB
+         * settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant 默认关）。原直读
+         * env-only {@code ToolSearchService.isDeferredToolsDeltaEnabled()} 会让「DB 开、env 关」
+         * 时本 prepend 照发全量清单（与主循环 delta 附件双发）→ 已收敛到同一判定。
          *
          * @param messages 组装后消息（prependUserContext 之后、ModelRequest 构建之前调用）
          * @return 前插后的消息列表（未命中门控 → 原列表）
          */
         public List<ChatMessageDto> prependAvailableDeferredTools(List<ChatMessageDto> messages) {
-            if (!useToolSearch || ToolSearchService.isDeferredToolsDeltaEnabled()) {
+            if (!useToolSearch
+                    || com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                        .staticDeferredToolsDeltaEnabled()) {
                 return messages;
             }
             if (deferredToolNames == null || deferredToolNames.isEmpty()) {

@@ -1,9 +1,11 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { MarkdownText } from '@/markdown/MarkdownText'
+import { projectPreview } from '@/markdown/plainPreview'
 import type { ChatMessageDto } from '@/api/types'
 import { subagentColor } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 import { extractAtRefs } from '@/utils/atRefs'
+import { headTailCap } from '@/utils/headTailCap'
 
 // @引用 token（@"引号路径" 或 @路径 · 遇空白/中文标点/右括号/引号结束）
 const AT_MENTION_RE = /@"[^"]+"|@[^\s，。、；：（()）“”"'#]+/g
@@ -121,11 +123,21 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-/** ANSI 终端输出渲染（借鉴 TerminalBlock：彩色 spans + 超长 head-tail 截断）。 */
+/** ANSI 终端输出渲染（借鉴 TerminalBlock：彩色 spans + 超长 head-tail 截断，
+ *  切分口径走 {@link headTailCap}）。 */
 function AnsiOutput({ text, error }: { text: string; error?: boolean }) {
   const [expanded, setExpanded] = useState(false)
-  // 截断阈值：对齐 DeepSeek DEFAULT_TERMINAL_MAX_LINES（16 行），超长折叠中间
+  // 折叠上限 16 行：对齐 DeepSeek DEFAULT_TERMINAL_MAX_LINES。切分交给 headTailCap ——
+  // 它按 ceil(16/2)=8 给出「前 8 + 后 8」的行数（展开态 capped=false，本组件据此渲染全量），故这里必须传 16
+  // 而不是 8（传 8 会退化成 4/4）。按钮显隐门控用 hidden > 0 而非 capped：capped 含
+  // !expanded，用它会让【展开后按钮消失、无法收起】。
   const MAX_LINES = 16
+  // 本仓三个「窗口」常量各司其职，勿互相套用（三处口径独立，改一处不影响其余）：
+  //   · MAX_LINES = 16（本处）—— 行数窗口 · 终端输出折叠，按「行」切头/尾
+  //   · HEAVY_PREVIEW_CHARS = 5000（同文件 ContentGuard）—— 字符窗口 · 超长 markdown
+  //     正文的折叠预览，按「字符」截源文再投影成纯文本
+  //   · PREVIEW_SOURCE_CHARACTERS = 2048（@/markdown/plainPreview，单点）—— 字符窗口 ·
+  //     轨迹列表 / 弹窗列表的纯文本预览，按「字符」截源文再投影成纯文本
   const lines = useMemo(() => parseAnsiLines(text), [text])
   // 去除末尾纯空行（命令输出的换行终止符不是额外空行）
   const trimmed = useMemo(() => {
@@ -133,9 +145,8 @@ function AnsiOutput({ text, error }: { text: string; error?: boolean }) {
     while (arr.length > 1 && arr[arr.length - 1]!.every((s) => s.text.trim() === '')) arr.pop()
     return arr
   }, [lines])
-  const capped = trimmed.length > MAX_LINES
-  const hidden = capped ? trimmed.length - MAX_LINES : 0
-  const shown = expanded || !capped ? trimmed : trimmed.slice(0, MAX_LINES)
+  // 纯算术（只吃行数、不 parse），随渲染直接算即可，无需 useMemo。
+  const { hidden, capped, headLines, tailLines } = headTailCap(trimmed.length, MAX_LINES, expanded)
 
   const renderLine = (line: AnsiLine, i: number) => (
     <div key={i} className="tc-ansi-line">
@@ -147,12 +158,13 @@ function AnsiOutput({ text, error }: { text: string; error?: boolean }) {
 
   return (
     <div className={`tc-ansi${error ? ' error' : ''}`}>
-      {shown.map(renderLine)}
-      {capped && (
+      {(capped ? trimmed.slice(0, headLines) : trimmed).map(renderLine)}
+      {hidden > 0 && (
         <button type="button" className="tc-ansi-toggle" onClick={() => setExpanded((v) => !v)}>
           {expanded ? '收起' : `… 展开其余 ${hidden} 行`}
         </button>
       )}
+      {capped && trimmed.slice(trimmed.length - tailLines).map(renderLine)}
     </div>
   )
 }
@@ -427,14 +439,33 @@ function StopHookSummaryRow({ payload }: { payload: NonNullable<ChatMessageDto['
 
 /** 单条超长正文防护：正文 > HEAVY_CONTENT_CHARS 时只渲染截断纯文本预览 + 「查看完整内容」，
  *  展开后才走整段 mdast（MarkdownText）。否则打开含 350KB 级单条消息的会话会被一条 DOM 卡死
- *  ——窗口化只限「条数」不限「单条体积」。初始加载不被病理大消息阻塞，展开由用户主动触发。 */
+ *  ——窗口化只限「条数」不限「单条体积」。初始加载不被病理大消息阻塞，展开由用户主动触发。
+ *  预览层已做 markdown→纯文本投影（projectPreview）：原先直接把 markdown 源文塞进
+ *  <pre>，`#` 标题 / `**` 粗体 / 围栏等标记字面泄漏。投影语法与展开态**不同源** —— 用流式臂
+ *  parseGfm（无 math 扩展、不跑 rescue），故行内 $$…$$ 与粘连标记（`##标题` 这类 rescue 会
+ *  补空格的）在预览里保持字面，与展开态可能不同（预览少剥、不藏内容）；且投影逐行 trim，
+ *  代码块缩进会被抹平 —— 均为已拍板接受的取舍。 */
 const HEAVY_CONTENT_CHARS = 20_000
 const HEAVY_PREVIEW_CHARS = 5_000
 function ContentGuard({ text, className, onRunHtml }: { text: string; className: string; onRunHtml?: (code: string) => void }) {
   const heavy = text.length > HEAVY_CONTENT_CHARS
   const [expanded, setExpanded] = useState(false)
+  // 预览：先按字符截断源文、再投影（顺序不可换 —— 反过来会对 >20KB 全文 parse，
+  // 正好抵消本组件「不 parse 超长正文」的存在理由）。
+  // 投影用流式臂语法（parseGfm：无 math 扩展、不跑 rescue），故行内 $$…$$ 与粘连标记
+  // （##标题 这类 rescue 会补空格的）在此保持字面，与展开态可能不同 —— 已拍板接受。
+  // 另：投影逐行 trim，代码块缩进会抹平（<pre> 预览的已知取舍）。
+  // useMemo 必须位于提前 return 之前（守 hooks 顺序），但 heavy 短路不可省：text 来自
+  // msg.content，流式期间每帧变化，不短路则每条正常消息（≤20000 字符）在流式期间每帧都会
+  // 白跑一次非增量 micromark 解析，而 MarkdownText 本身已是增量解析 —— 这笔是净增开销。
+  // 该值仅在「heavy 且未展开」分支被读（heavy=false 必然走上面的提前 return），
+  // 故短路产生的 '' 不会被读到。注意投影本身也可能返回空串（例如切片全是
+  // thematicBreak/definition），那种空预览是已知边界，非本短路所致。
+  const shown = useMemo(
+    () => (heavy ? projectPreview(text, HEAVY_PREVIEW_CHARS) : ''),
+    [text, heavy],
+  )
   if (!heavy || expanded) return <MarkdownText text={text} className={className} onRunHtml={onRunHtml} />
-  const shown = text.slice(0, HEAVY_PREVIEW_CHARS)
   return (
     <div className={className}>
       <pre className="heavy-preview">{shown}{text.length > HEAVY_PREVIEW_CHARS ? '…' : ''}</pre>

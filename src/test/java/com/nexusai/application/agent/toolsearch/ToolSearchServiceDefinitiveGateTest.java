@@ -315,9 +315,20 @@ class ToolSearchServiceDefinitiveGateTest {
     @DisplayName("isDeferredToolsDeltaEnabled：默认 false（USER_TYPE≠ant + glacier flag Java N/A）")
     void isDeferredToolsDeltaEnabled_defaultFalse() {
         // WHY: toolSearch.ts:629-633 —— false → claude.ts:1330 prepend 路径（H4 实现）；
-        //   true → 完整 deferred_tools_delta attachment（OPD-H-06 残留）。USER_TYPE 读 System.getenv
-        //   只读不可注入，此处仅断言默认非 'ant' 环境 → false。
+        //   true → 完整 deferred_tools_delta attachment（OPD-H-06 残留）。
+        // [dtd-cfg] 该 env 层判据现经 currentEnv() seam（测试可注入）；未注入时读 System.getenv()
+        //   → 默认非 'ant' 环境 → false。生产「前端可配」入口是 DB 覆盖（统一判定
+        //   PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled，另测）。
         assertThat(ToolSearchService.isDeferredToolsDeltaEnabled()).isFalse();
+    }
+
+    @Test
+    @DisplayName("isDeferredToolsDeltaEnabled：currentEnv seam 注入 USER_TYPE=ant → true（env 层可注入，dtd-cfg）")
+    void isDeferredToolsDeltaEnabled_envSeam_antTrue() {
+        // WHY（dtd-cfg）：把 System.getenv 直读改为 currentEnv() seam —— 内圈拷贝删除后 env 层
+        //   可测、可注入。变异：改回 System.getenv("USER_TYPE") 直读 → 本用例注入失效 → false → 红。
+        ToolSearchService.envOverride = Map.of("USER_TYPE", "ant");
+        assertThat(ToolSearchService.isDeferredToolsDeltaEnabled()).isTrue();
     }
 
     private static List<String> names(List<Tool> tools) {

@@ -6516,6 +6516,41 @@ html {
   max-height: 160px;
   overflow: auto;
 }
+
+/* ===== 可折叠 JSON 块（JsonBlock · 移植自 deepseek-harness JsonBlock.module.css）=====
+   token 映射：label-secondary → --ink-subtle ／ interactive-bg-hover → --surface-2
+   （就近语义：全仓透明按钮 hover 惯例）／ markdown-code-block → 本仓无对应，复用 surface 层
+   --surface-2（与 .pb-input 同底）／border-l1 → --hairline；font-family-code → --font-mono。
+   所选变量在 .app[data-theme="dark"] 下均有覆盖（surface-2/ink-subtle/ink/hairline），无硬编码浅色。 */
+.json-block {
+  margin: 4px 0;
+}
+.json-block-toggle {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--ink-subtle);
+  padding: 2px 6px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: var(--r-sm);
+}
+.json-block-toggle:hover {
+  background: var(--surface-2);
+}
+.json-block-body {
+  margin: 4px 0 0;
+  padding: 8px;
+  max-height: 200px;
+  overflow: auto;
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--ink);
+}
 .pb-abort {
   border: 1px solid var(--hairline);
   background: transparent;

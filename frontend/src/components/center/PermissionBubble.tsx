@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { JsonBlock } from '@/markdown/JsonBlock'
 import type { PermissionRequestItem } from '@/stores/chatStore'
 import type { AskUserAnswers, AskUserAnnotations, AskUserQuestion } from '@/api/types'
 
@@ -51,9 +52,12 @@ function WorkerBadge({ color }: { color?: string | null }) {
 
 /** 工具参数展示（普通权限弹窗 · toolInput 对齐 CC per-tool PermissionComponent 展示 input） */
 function ToolInput({ toolInput }: { toolInput: unknown }) {
+  // JsonBlock 无 null 守卫 → 由调用方先挡（无参数时不渲染参数区）
   if (toolInput == null) return null
-  const text = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput, null, 2)
-  return <pre className="pb-input">{text}</pre>
+  // toolInput 可能是 JSON 字符串节点（后端 JsonNode 序列化而来）：先尝试 parse，
+  // 解析失败再按裸字符串交给 JsonBlock（它会 stringify，故裸串会带引号显示 —— 但那比丢内容好）。
+  // 非字符串入参直接交给 JsonBlock 走 JSON.stringify（与改造前的分支等价）。
+  return <JsonBlock label="工具参数" payload={typeof toolInput === 'string' ? tryParse(toolInput) ?? toolInput : toolInput} defaultOpen />
 }
 
 export function PermissionBubble({ request, onDecision, onAbort }: Props) {

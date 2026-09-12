@@ -719,17 +719,25 @@ public final class ToolSearchService {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * deferred 工具 delta attachment 是否启用 · 对齐 CC {@code isDeferredToolsDeltaEnabled}
-     * （toolSearch.ts:629-633）· {@code USER_TYPE==='ant' || glacier feature flag}。
+     * deferred 工具 delta attachment 是否启用 · <b>env 层</b>实现，对齐 CC
+     * {@code isDeferredToolsDeltaEnabled}（toolSearch.ts:629-633）· {@code USER_TYPE==='ant'
+     * || glacier feature flag}。
      *
      * <p>Java 无 glacier feature flag（FeatureFlags 无 {@code tengu_glacier_2xr} 键）→ 只读
-     * {@code USER_TYPE}。true → 完整 deferred_tools_delta attachment 承载（跨 compact 残留
-     * OPD-H-06）；false → 主循环走 claude.ts:1330 prepend 路径（本批次实现）。
+     * {@code USER_TYPE}（经 {@link #currentEnv()} seam，测试可注入）。true → 完整
+     * deferred_tools_delta attachment 承载（跨 compact 残留 OPD-H-06）；false → 主循环走
+     * claude.ts:1330 prepend 路径。
+     *
+     * <p><b>[dtd-cfg] 本方法是「env 层」而不是生产唯一真源</b>：统一判定 =
+     * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（DB
+     * {@code settings.deferred_tools_delta_enabled} 覆盖 → 回落本方法）。主循环 / 压缩
+     * 内圈 / prepend 三处均只经该统一判定，不再直读本方法（消除「DB 开、env 关 → 内外圈
+     * 判定相反」的分叉）。
      *
      * @return true = delta attachment 启用（prepend 路径关闭）
      */
     public static boolean isDeferredToolsDeltaEnabled() {
-        return "ant".equals(System.getenv("USER_TYPE"));
+        return "ant".equals(currentEnv().get("USER_TYPE"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

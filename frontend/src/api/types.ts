@@ -429,6 +429,10 @@ export interface AppSettings {
   enabledPlugins?: Record<string, boolean> | null
   /** 插件双读开关（settings.plugin_claude_fallback 0/1 · null = 回落默认 true：nexusai DB + CC settings.json 双读合并） */
   pluginClaudeFallback?: boolean | null
+  // V60 契约：提示词对齐门控列（后端 settings.deferred_tools_delta_enabled · INTEGER 列）
+  /** 工具延迟加载公告方式（settings.deferred_tools_delta_enabled · null/未配置 = 默认关闭）：
+   *  开 = 只公告变化的工具清单（增量附件，省 token）；关 = 每轮在消息队首发送完整清单。 */
+  deferredToolsDeltaEnabled?: boolean | null
 }
 
 /** PUT /api/v1/settings 部分更新请求 · 后端 merge 策略：仅覆盖非 null 字段 */

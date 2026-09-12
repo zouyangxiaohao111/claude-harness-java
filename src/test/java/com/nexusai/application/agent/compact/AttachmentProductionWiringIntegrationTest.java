@@ -51,6 +51,10 @@ class AttachmentProductionWiringIntegrationTest {
     @AfterEach
     void resetEnvSeam() {
         PostCompactAttachmentRestorer.envOverride = null;
+        // [dtd-cfg] deferred_tools_delta 门控已收敛到 ToolSearchService.currentEnv()（经统一判定
+        //   PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled）→ 测试须复位该 seam。
+        com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride = null;
+        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver.setStaticResolver(null);
         CompactConversation.setSessionAgentStateRegistry(null);
     }
 
@@ -140,10 +144,14 @@ class AttachmentProductionWiringIntegrationTest {
     void deltaGatesOnProduceThreeDeltaAttachments() {
         // gate 注入（CC isDeferredToolsDeltaEnabled USER_TYPE=ant / shouldInjectAgentListInMessages
         // env / isMcpInstructionsDeltaEnabled env，测试 seam 替代真实环境）
+        // [dtd-cfg] deferred_tools_delta 门控现走 ToolSearchService.currentEnv() seam（统一判定回落 env）
+        //   → 该 gate 的开注入须打到 ToolSearchService.envOverride；另两 gate 仍读本类 envOverride。
         PostCompactAttachmentRestorer.envOverride = Map.of(
             "USER_TYPE", "ant",
             "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true",
             "CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+        com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride =
+            Map.of("USER_TYPE", "ant");
 
         // 工具池：MCP 工具（恒 deferred）+ ToolSearch（gate2/4 目标）+ Agent 工具
         List<Tool> tools = new ArrayList<>();
@@ -211,6 +219,9 @@ class AttachmentProductionWiringIntegrationTest {
             "USER_TYPE", "ant",
             "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true",
             "CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+        // [dtd-cfg] delta 门控 seam 移到 ToolSearchService（统一判定回落 env）
+        com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride =
+            Map.of("USER_TYPE", "ant");
 
         List<Tool> tools = new ArrayList<>();
         tools.add(tool("mcp__docs-server__search", true));

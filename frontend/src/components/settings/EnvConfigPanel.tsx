@@ -47,6 +47,8 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
   const [wsApiKey, setWsApiKey] = useState<string>(settings?.apiKey ?? '')
   const [wsBaseUrl, setWsBaseUrl] = useState<string>(settings?.websearchBaseUrl ?? '')
   const [wsDomainCheckUrl, setWsDomainCheckUrl] = useState<string>(settings?.websearchDomainCheckUrl ?? '')
+  // 工具延迟加载公告方式（settings.deferredToolsDeltaEnabled · 未配置 = 关闭）
+  const [dtdDeltaEnabled, setDtdDeltaEnabled] = useState<boolean>(settings?.deferredToolsDeltaEnabled ?? false)
   // away-summary 门控（localStorage · 两开关都开才触发 blur 摘要；后端 features API 补后接入）
   const [gates, setGates] = useState<{ AWAY_SUMMARY?: boolean; tengu_sedge_lantern?: boolean }>(() => {
     try { return JSON.parse(localStorage.getItem(AWAY_GATES_KEY) ?? '{}') } catch { return {} }
@@ -66,6 +68,11 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
     setWsBaseUrl(settings?.websearchBaseUrl ?? '')
     setWsDomainCheckUrl(settings?.websearchDomainCheckUrl ?? '')
   }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.apiKey, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl])
+
+  // 工具延迟加载公告方式草稿 ← settings（后端异步加载后回填）
+  useEffect(() => {
+    setDtdDeltaEnabled(settings?.deferredToolsDeltaEnabled ?? false)
+  }, [settings?.deferredToolsDeltaEnabled])
 
   // 挂载时读 /memory/config 开关；失败 fail loud（内联错误文案，不阻塞其他 envc 区块）
   useEffect(() => {
@@ -650,6 +657,30 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
                 </div>
               )}
             </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 模块：工具加载（延迟加载工具的公告方式 · 写 settings.deferredToolsDeltaEnabled） */}
+      <div className="envc-card">
+        <div className="envc-card-title">工具加载</div>
+        <div className="envc-row">
+          <div className="envc-label-group">
+            <span className="envc-name">延迟加载公告用增量方式</span>
+            <span className="envc-desc">开启后只公告变化的工具清单（省 token）；关闭则每轮发送完整清单。默认关闭</span>
+          </div>
+          <div className="envc-control">
+            <label className="settings-switch">
+              <input
+                type="checkbox"
+                checked={dtdDeltaEnabled}
+                onChange={(e) => {
+                  setDtdDeltaEnabled(e.target.checked)
+                  void onSaveSettings({ deferredToolsDeltaEnabled: e.target.checked })
+                }}
+              />
+              <span></span>
+            </label>
           </div>
         </div>
       </div>

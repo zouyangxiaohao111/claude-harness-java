@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { ChatMessageDto } from '@/api/types'
+import { PREVIEW_SOURCE_CHARACTERS, projectPreview } from '@/markdown/plainPreview'
 
 interface Props {
   messages: ChatMessageDto[]
@@ -27,9 +28,33 @@ function pivotList(messages: ChatMessageDto[]): ChatMessageDto[] {
   )
 }
 
-/** 列表项单行预览（折叠空白 + 截断） */
+/** 列表项单行预览（markdown→纯文本投影 + 折叠空白 + 截 60 字）
+ *
+ *  <p>投影走 {@link projectPreview}：**先按字符截断源文、再投影**（顺序不可换，已由
+ *  markdown/__tests__/plainPreview.test.ts 钉住 —— 反过来等于对全文 parse）。
+ *  窗口大小用 {@link PREVIEW_SOURCE_CHARACTERS}（与 harness 同值的单点约定，见 plainPreview.ts）。
+ *
+ *  <p>投影用 parseGfm（流式臂：**无 math 扩展、不跑 rescue**），故行内 {@code $$x$$} 与粘连标记
+ *  （{@code ##标题}，即 rescue 会补空格的那类）**在本预览里保持字面** —— 与展开态渲染可能不同
+ *  （预览少剥、不藏内容，两者语法不同源）。投影还逐行 trim，**代码块缩进会被抹平**（已知取舍）。
+ *
+ *  <p>保留 {@code || '(空消息)'} 兜底：投影结果**可能为空串**（切片全是 thematicBreak / definition
+ *  时），不兜底会渲染成一行空白项。
+ *
+ *  <p><b>与 CC 的有意偏离（规则七：显式暴露冲突、明确择一、标记另一处）</b>。
+ *  CC 侧这个列表走的是**单行分支**：调用点传 {@code paddingRight={10}}
+ *  （claude-code-best/src/components/MessageSelector.tsx:488-492）→ 落到 {@code :721}
+ *  {@code truncate(messageText, columns - paddingRight, true)}；而 {@code truncate} 的第三参
+ *  {@code singleLine=true} 是「**有换行就在首个换行处截断并补 …，丢掉后续行**」（无换行才按宽度截）——
+ *  claude-code-best/src/utils/truncate.ts:142-153。（{@code :418} 那个无 paddingRight 的分支渲染的
+ *  是「待恢复消息」头部、不是列表，别拿它当对照。）
+ *  <br>CC 对用户 prompt **只做 stripDisplayTags（剥系统注入的 XML-like 标签）、不剥 markdown**
+ *  （{@code :660} {@code const messageText = stripDisplayTags(rawMessageText)}）。
+ *  <br>本仓两处都选择偏离：**剥 markdown** + **折空白（保留全部文字）**。理由：用户粘贴代码块 /
+ *  标题时，不剥的预览在单行列表里可读性显著变差（{@code **}/{@code #}/围栏占掉本就紧张的 60 字
+ *  窗口）；而本仓列表项是单行 HTML（CSS nowrap + ellipsis），折空白比 CC 的「丢后续行」信息更多。 */
 function listPreview(m: ChatMessageDto): string {
-  const text = (m.content ?? '').replace(/\s+/g, ' ').trim()
+  const text = projectPreview(m.content ?? '', PREVIEW_SOURCE_CHARACTERS).replace(/\s+/g, ' ').trim()
   return text.slice(0, 60) || '(空消息)'
 }
 

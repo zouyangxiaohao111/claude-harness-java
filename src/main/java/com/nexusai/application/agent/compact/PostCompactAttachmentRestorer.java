@@ -1394,8 +1394,10 @@ public final class PostCompactAttachmentRestorer {
      * deferred_tools_delta 生产 · 对齐 CC {@code getDeferredToolsDeltaAttachment}
      * （attachments.ts:1455-1475）+ {@code getDeferredToolsDelta}（toolSearch.ts:646-706）。
      *
-     * <p>Gate 链（任一不过 → null）：isDeferredToolsDeltaEnabled（feature tengu_glacier_2xr /
-     * USER_TYPE=ant，默认关）→ isToolSearchEnabledOptimistic（SchemaNotSentHint）→
+     * <p>Gate 链（任一不过 → null）：<b>统一判定</b>
+     * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（DB
+     * settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant，默认关）→
+     * isToolSearchEnabledOptimistic（SchemaNotSentHint）→
      * toolReferenceUsable（单点：provider 语义 取与 模型能力，判不出即不支持）→
      * isToolSearchToolAvailable（ToolSearch 在工具池）。内容：当前 deferred 工具集
      * （isDeferredTool：MCP 工具恒 defer，alwaysLoad 排除，ToolSearch 自身不 defer，
@@ -1409,7 +1411,11 @@ public final class PostCompactAttachmentRestorer {
      */
     public static ChatMessageDto deferredToolsDeltaAttachment(
             List<Tool> tools, String model, String providerType, List<ChatMessageDto> messages) {
-        if (!isDeferredToolsDeltaEnabled()) {
+        // [dtd-cfg] 统一判定（DB settings.deferred_tools_delta_enabled → 回落 env USER_TYPE=ant）
+        //   替代本类原有的 env-only 拷贝（原 :1639）——否则前端把 DB 开关打开后，压缩内圈
+        //   仍判关 → DB 开关被内层挡成空转。单点 = PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()。
+        if (!com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                .staticDeferredToolsDeltaEnabled()) {
             return null;
         }
         if (!ToolSearchService.isToolSearchEnabledOptimistic()) {
@@ -1632,14 +1638,10 @@ public final class PostCompactAttachmentRestorer {
 
     // ── delta gate（默认关 · env 覆盖镜像 CC）──
 
-    /**
-     * CC isDeferredToolsDeltaEnabled（toolSearch.ts:629-634）：USER_TYPE=ant 或 feature
-     * tengu_glacier_2xr。Java 无 GrowthBook 通道（OD-03 外部）→ 仅镜像 env，默认 false。
-     */
-    public static boolean isDeferredToolsDeltaEnabled() {
-        java.util.Map<String, String> e = envOverride != null ? envOverride : System.getenv();
-        return "ant".equals(e.get("USER_TYPE"));
-    }
+    // [dtd-cfg R9 收敛] 原此处有一份 isDeferredToolsDeltaEnabled() env-only 拷贝，已删除：
+    //   真源 = ToolSearchService.isDeferredToolsDeltaEnabled()（env 层）+ 统一判定
+    //   PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()（DB 覆盖 → env 回落）。
+    //   deferredToolsDeltaAttachment 已改调统一判定；本类不再持第二份判据（同 R9 型分叉隐患消除）。
 
     /**
      * CC shouldInjectAgentListInMessages（AgentTool/prompt.ts:59-64）：env
