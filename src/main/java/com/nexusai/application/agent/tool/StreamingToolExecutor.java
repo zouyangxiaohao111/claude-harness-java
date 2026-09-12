@@ -2056,7 +2056,7 @@ public class StreamingToolExecutor {
                 // t.result 类型是 AgentToolResult<?> (sealed, 唯一实现 ToolResult), 非 null 即需 dispatch.
                 // ── [hook message 普通消息通道] PreToolUse hook plain message 合并进 newMessages ──
                 // 对齐 CC resultingMessages.push(result.message) (toolExecution.ts:815) → 与
-                // tool_result 同批 (ToolResultApplier.apply → state.messages().addAll)、一次性
+                // tool_result 同批 (ToolResultApplier.apply → state.rawMessages().addAll)、一次性
                 // (query.ts:1395 filter type==='user' → :1716 messages 同批). 复用 retry isMeta
                 // 同一约定通道 (StreamingToolExecutor.java maybeFirePermissionDeniedRetry 先例).
                 // 兜底: t.result 为 null (未执行/测试场景) 时直接 appendMessage 保底送达.
@@ -3508,7 +3508,7 @@ public class StreamingToolExecutor {
          * <p>WHY 不直接 appendAttachment: CC 中 hook message 是普通 user 消息, 非 attachment
          * (Java 旧实现把它包成 hook_user_message attachment 常驻 state.attachments 每轮重渲染).
          * 本字段由 {@code injectPreToolUseHookAttachments} 收集, dispatch 时合并进
-         * {@code t.result.newMessages} → ToolResultApplier.apply → state.messages().addAll,
+         * {@code t.result.newMessages} → ToolResultApplier.apply → state.rawMessages().addAll,
          * 与 tool_result 同一批送达模型, 不落入 AgentState.attachments.
          */
         java.util.List<ChatMessageDto> pendingHookUserMessages = new ArrayList<>();

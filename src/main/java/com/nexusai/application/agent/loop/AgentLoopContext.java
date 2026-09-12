@@ -528,7 +528,14 @@ public record AgentLoopContext(
      */
     public static void applyPerMessageBudget(AgentLoopContext ctx, AgentState state, QuerySource querySource,
             java.util.Set<String> skipToolNames) {
-        if (state == null || state.messages() == null || state.messages().isEmpty()) return;
+        if (state == null || state.rawMessages() == null || state.rawMessages().isEmpty()) return;
+        // [D10 双视图] 选边 = modelView()（模型面分析源）。CC query.ts:567
+        //   `messagesForQuery = await applyToolResultBudget(messagesForQuery, ...)` —— 预算的
+        //   读侧判据（group 切分 / totalSize / frozen-fresh 分区）都作用在**投影后**数组上。
+        //   写侧仍落回 rawMessages()（本方法末尾 replaceMessageContent）：工具结果内容替换按
+        //   toolUseId 精确命中，两条路径命中的是同一批 id ⇒ state.modelView() 的结果与改造前
+        //   逐条一致（回归底线不变），同时 raw 不会被投影缩水。
+        java.util.List<ChatMessageDto> budgetAnalysisView = state.modelView();
         // OD-01 S4 ③ gate：budgetAggregateGate（tengu_hawthorn_steeple）关 → 整段跳过
         // （CC query.ts:369-372 contentReplacementState=undefined 时 applyToolResultBudget no-op）
         if (ctx == null || ctx.featureFlags() == null || !ctx.featureFlags().budgetAggregateGate()) {
@@ -547,13 +554,13 @@ public record AgentLoopContext(
         // B7: skipToolNames 非空时构建 tool_use_id→tool_name map · 对齐 CC buildToolNameMap
         //（toolResultStorage.ts:536-549）· 仅按需构建（skipToolNames.size > 0，CC :780-782）。
         java.util.Map<String, String> nameByToolUseId = (skipToolNames != null && !skipToolNames.isEmpty())
-            ? buildToolNameMap(state.messages()) : null;
+            ? buildToolNameMap(budgetAnalysisView) : null;
 
         // 1. 收集 group: 连续 tool message 视为同一 API-level user message group
         // [IMP-22/IMP-13] 统一宿主：ToolResultStorage.collectCandidatesByMessage（D-05 迁移去重 +
         // D-17 宿主迁回 CC 真源同名类 toolResultStorage.ts，3 处留 1）
         java.util.List<java.util.List<ChatMessageDto>> groups =
-            com.nexusai.application.agent.tool.ToolResultStorage.collectCandidatesByMessage(state.messages());
+            com.nexusai.application.agent.tool.ToolResultStorage.collectCandidatesByMessage(budgetAnalysisView);
         if (groups.isEmpty()) return;
 
         // 2. 累积 total size
@@ -707,7 +714,7 @@ public record AgentLoopContext(
     /** 替换 state.messages 中指定 toolUseId 对应 ChatMessageDto 的 content。 */
     private static void replaceMessageContent(AgentState state, String toolUseId, String newContent) {
         if (state == null || toolUseId == null || newContent == null) return;
-        java.util.List<ChatMessageDto> mutable = new java.util.ArrayList<>(state.messages());
+        java.util.List<ChatMessageDto> mutable = new java.util.ArrayList<>(state.rawMessages());
         boolean changed = false;
         for (int i = 0; i < mutable.size(); i++) {
             ChatMessageDto m = mutable.get(i);
@@ -832,16 +839,16 @@ public record AgentLoopContext(
     /**
      * 获取最后一条 assistant 消息 · CC utils/messages.ts getLastAssistantMessage。
      *
-     * <p>反向遍历 state.messages()，返回第一条 role=assistant 的消息。
+     * <p>反向遍历 state.rawMessages()，返回第一条 role=assistant 的消息。
      * 供 D1 消息级 PTL 判定（isWithheld413 = isApiErrorMessage && isPromptTooLongMessage）使用。
      *
      * @param state AgentState
      * @return 最后一条 assistant 消息（null = 无）
      */
     public static ChatMessageDto getLastAssistantMessage(AgentState state) {
-        if (state == null || state.messages() == null) return null;
-        for (int i = state.messages().size() - 1; i >= 0; i--) {
-            ChatMessageDto m = state.messages().get(i);
+        if (state == null || state.rawMessages() == null) return null;
+        for (int i = state.rawMessages().size() - 1; i >= 0; i--) {
+            ChatMessageDto m = state.rawMessages().get(i);
             if (m.role() == Role.assistant) return m;
         }
         return null;
@@ -849,17 +856,17 @@ public record AgentLoopContext(
 
     /** 估算当前 turn 的 token 用量 · static 化自 LlmAgentLoop#estimateTurnTokens。 */
     public static int estimateTurnTokens(AgentLoopContext ctx, AgentState state) {
-        if (state == null || state.messages() == null) return 0;
+        if (state == null || state.rawMessages() == null) return 0;
         TokenEstimator tokenEstimator = ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().tokenEstimator() : null;
         if (tokenEstimator != null) {
             int total = 0;
-            for (ChatMessageDto m : state.messages()) {
+            for (ChatMessageDto m : state.rawMessages()) {
                 total += tokenEstimator.estimateMessageTokens(m);
             }
             return total;
         }
         int chars = 0;
-        for (ChatMessageDto m : state.messages()) {
+        for (ChatMessageDto m : state.rawMessages()) {
             if (m.content() != null) chars += m.content().length();
         }
         return chars / 4;
@@ -1187,7 +1194,7 @@ public record AgentLoopContext(
         if (!gate || state == null) {
             return List.of();
         }
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         if (messages == null || messages.isEmpty()) {
             return List.of();
         }
@@ -1301,7 +1308,7 @@ public record AgentLoopContext(
     /**
      * 从 base TUC 派生每轮 per-turn TUC · static 化自 LlmAgentLoop#toolExecContext（P3-⑤ 线程化）。
      *
-     * <p><b>每轮派生</b>：queryTracking stamp（A2 已有）+ messages 快照（state.messages()）+
+     * <p><b>每轮派生</b>：queryTracking stamp（A2 已有）+ messages 快照（state.rawMessages()）+
      * permission context 重建（ctx.permissionContextBuilder()）。会话 UI/C2/session 回调、
      * abortController、availableTools、nonInteractiveSession、onCompactProgress 均从 base TUC
      * 继承（会话级不变）。派生结果经 {@code state.setCurrentToolUseContext} stamp（对齐 CC
@@ -1331,9 +1338,13 @@ public record AgentLoopContext(
             if (log.isDebugEnabled()) {
                 log.debug("AgentLoopContext toolExecContext: hook agent DONT_ASK permCtx 保留 (不重建)");
             }
+            // [D10 双视图] 选边 = modelView()（模型面）：CC query.ts:744-746 把
+            //   toolUseContext.messages **重新绑定**为 messagesForQuery —— per-turn TUC 是
+            //   工具（SnipTool 数目标 user / SubagentTool 取 fork 上下文）与 fork 的上下文来源，
+            //   必须是投影面，否则被 snip 删除 / pre-boundary 内容经工具通道回流。
             com.nexusai.application.agent.tool.ToolUseContext hookTuc = baseTuc
                 .withQueryTracking(queryTracking)
-                .withMessages(state.messages() != null ? state.messages() : List.of());
+                .withMessages(state.modelView());
             state.setCurrentToolUseContext(hookTuc);
             return hookTuc;
         }
@@ -1397,7 +1408,9 @@ public record AgentLoopContext(
         }
         com.nexusai.application.agent.tool.ToolUseContext perTurnTuc = baseTuc
             .withQueryTracking(queryTracking)
-            .withMessages(state.messages() != null ? state.messages() : List.of())
+            // [D10 双视图] 选边 = modelView()（模型面）：CC query.ts:744-746 把
+            //   toolUseContext.messages 重新绑定为 messagesForQuery（本方法 JavaDoc :1304 同义）。
+            .withMessages(state.modelView())
             .withPermissionContext(permCtx, permMode)
             // [openai-lazy] 注入当前 turn 有效模型名（模型能力解析消费：ReadFileTool / fork 直传等）。
             //   state.currentModel() = LlmAgentLoop doRun 入口 + 每轮 effectiveModel 覆盖写。
@@ -1577,7 +1590,7 @@ public record AgentLoopContext(
             perTurnTuc,
             extendedHandler != null
                 ? extendedHandler
-                : (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
+                : (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
             gate,
             canUseToolOverride,
             ctx.hookRegistry());
@@ -1847,11 +1860,11 @@ public record AgentLoopContext(
             LlmAgentLoop.toForkAssistantMessage(turnAssistantId, msg);
         if (streamingExec != null && streamingExec.size() > 0) {
             outcome = runTools(ctx, perTurnTuc, state, msg.toolCalls(), turnAssistantId, streamingExec,
-                (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
+                (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
                 subagentOptions, forkAssistantMessage, onToolProgress, canUseTool);
         } else {
             outcome = runTools(ctx, perTurnTuc, state, msg.toolCalls(), turnAssistantId, null,
-                (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
+                (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
                 subagentOptions, forkAssistantMessage, onToolProgress, canUseTool);
         }
         List<com.nexusai.application.agent.tool.ToolResult> results = outcome.results();
@@ -1914,7 +1927,7 @@ public record AgentLoopContext(
             if (resultIdx >= results.size()) {
                 // [fix-toolcalls-400 B] 配对防御：执行器结果数 < tool_calls 数（如混合批里空参工具
                 //   未被流式回调加入，见根因 1.1）时不再静默 break —— 为每个未覆盖 tool_call 生成
-                //   synthetic error tool_result，保证每个 tool_call 都有 tool 响应。否则 state.messages()
+                //   synthetic error tool_result，保证每个 tool_call 都有 tool 响应。否则 state.rawMessages()
                 //   变 [assistant(N calls), tool(S<N results)] → OpenAI 400 "insufficient tool messages
                 //   following tool_calls message"（对齐 CC yieldMissingToolResultBlocks query.ts:123-149，
                 //   handleModelFallback:7368-7380 同款；turnAssistantId = CC sourceToolAssistantUUID 等价位）。
@@ -1960,7 +1973,7 @@ public record AgentLoopContext(
                             && !allowDecision.contentBlocks().isEmpty()))) {
                 int imageCount = LlmAgentLoop.countImageBlocks(allowDecision.contentBlocks());
                 List<String> imageIds = LlmAgentLoop.generateImagePasteIds(
-                    LlmAgentLoop.computeNextImagePasteId(state.messages()), imageCount);
+                    LlmAgentLoop.computeNextImagePasteId(state.rawMessages()), imageCount);
                 toolResultMsg = LlmAgentLoop.toolResultMessage(applied,
                     toolUseId, isError,
                     tool,
@@ -2135,7 +2148,7 @@ public record AgentLoopContext(
      *
      * <p><b>WHY</b>: 工具 {@code newMessages} 有 7 个生产者，其中多数（Read pdf 页图 / SkillTool
      * 指令 / hook 普通消息 / permission retry isMeta user 消息等）按 [fix-toolcalls-400 C] 约定
-     * 只进 {@code state.messages()} 不上落盘通道；但 {@code snip_boundary} 是例外 —— CC
+     * 只进 {@code state.rawMessages()} 不上落盘通道；但 {@code snip_boundary} 是例外 —— CC
      * {@code /force-snip} 命令直接 {@code setMessages(prev => [...prev, boundary])}
      * （commands/force-snip.ts:42），boundary 属「消息存储追加」，必被 {@code recordTranscript}
      * 写盘（sessionStorage.ts:2003-2010 自述：不落盘 → resume 立即 PTL）。nexusai 等价物 =
@@ -2368,7 +2381,7 @@ public record AgentLoopContext(
      * <ul>
      *   <li>hook_user_message (Java 特有, CC result.message → 普通 user message) → <b>不走
      *       attachment 渲染</b>: 两端生产已改普通消息通道结算 (PreToolUse → newMessages;
-     *       非 PreToolUse → state.messages() 一次性 user 消息), 渲染 case 已删除 (下 :2175)</li>
+     *       非 PreToolUse → state.rawMessages() 一次性 user 消息), 渲染 case 已删除 (下 :2175)</li>
      *   <li>hook_blocking_error (:4090-4097) → "{hookName} hook blocking error: {content}"
      *       (CC 含 command 字段, Java AttachmentMessageDto 未承载 → 仅 error 文本)</li>
      *   <li>hook_stopped_continuation (:4130-4136) → "{hookName} hook stopped continuation: {content}"</li>
@@ -2635,8 +2648,11 @@ public record AgentLoopContext(
             PlanModeAttachments.PlanModeFlags flags = PlanModeAttachments.getOrCreateFlags(appState);
 
             List<AttachmentMessageDto> produced = new ArrayList<>();
+            // [D10 双视图] 选边 = modelView()（模型面）：plan_mode 附件是**注入给模型的**
+            //   attachment（本方法入参 messagesForLlm 的同类），其 messages 判据源 = CC
+            //   attachments.ts getPlanModeAttachments 的 messagesForQuery。
             produced.addAll(PlanModeAttachments.getPlanModeAttachments(
-                state.messages(), state.attachments(), mode, state.agentId(), provider, flags, state.turnCount()));
+                state.modelView(), state.attachments(), mode, state.agentId(), provider, flags, state.turnCount()));
             produced.addAll(PlanModeAttachments.getPlanModeExitAttachment(
                 mode, state.agentId(), provider, flags));
 
@@ -2833,7 +2849,7 @@ public record AgentLoopContext(
      * 消息</b>（messagesForQuery 已由 query.ts:591-592 snipCompactIfNeeded 剔除 removedUuids；CCB store
      * 同样 append-only，但判据数的是投影面）。Java 侧相应取 {@code messagesForLlm}（本方法注入目标，初值
      * = 本迭代 messagesForQuery · LlmAgentLoop:5301，snip 投影在 :5014 / autocompact :5138 已就位），即
-     * 「本轮实际发给模型的消息链」。<b>不能数 {@code state.messages()} 全量</b>：Java snip 是请求级投影
+     * 「本轮实际发给模型的消息链」。<b>不能数 {@code state.rawMessages()} 全量</b>：Java snip 是请求级投影
      * （B5 d-2，state 保留被 snip 消息不删），若数全量则模型越 snip、判据不降，达阈值后每轮重复注入 nudge
      * （旧缺陷，固化见 LlmAgentLoopSnipMicroWiringTest）。state 参数仅保留用于守卫 + 诊断日志
      * （全量 vs 可见条数对比，可确认 snip 生效）。注入位置 = 消息流队尾（对齐 CC query.ts:1588 yield
@@ -2896,7 +2912,7 @@ public record AgentLoopContext(
             : 0;
         int snipNudgeThreshold = SnipCompactor.resolveSnipNudgeThreshold(dbNudgeThreshold, effectiveWindow);
         // [snip-nudge-count] 判据 = messagesForLlm（snip 投影后模型可见消息，对齐 CCB query.ts:1894
-        //   messagesForQuery.concat(assistantMessages, toolResults)）—— 非 state.messages() 全量：
+        //   messagesForQuery.concat(assistantMessages, toolResults)）—— 非 state.rawMessages() 全量：
         //   Java snip 只做请求级投影（B5 d-2，state 保留被 snip 消息），数全量则模型 snip 后判据不降、
         //   达阈值每轮重复 nudge（旧缺陷）。
         if (!SnipCompactor.shouldNudgeForSnips(messagesForLlm, snipNudgeThreshold)) {
@@ -2904,7 +2920,7 @@ public record AgentLoopContext(
                 log.debug("[LlmAgentLoop] context_efficiency nudge 跳过: 模型可见消息={} 条 < 阈值{}（db={} effectiveWindow={}, state 全量={} 诊断）· CC attachments.ts:3978/snipCompact.ts:163-165 + CCB query.ts:1894",
                     messagesForLlm != null ? messagesForLlm.size() : 0,
                     snipNudgeThreshold, dbNudgeThreshold, effectiveWindow,
-                    state != null && state.messages() != null ? state.messages().size() : 0);
+                    state != null && state.rawMessages() != null ? state.rawMessages().size() : 0);
             }
             return messagesForLlm;
         }
@@ -2916,7 +2932,7 @@ public record AgentLoopContext(
         if (log.isInfoEnabled()) {
             log.info("[LlmAgentLoop] context_efficiency nudge 注入 LLM 队尾: 模型可见消息={} 条 ≥阈值{}（db={} effectiveWindow={}, state 全量={} 诊断）, isMeta=true · CC attachments.ts:929-937/:3963-3983 + messages.ts:4148-4161 + CCB query.ts:1894",
                 messagesForLlm.size(), snipNudgeThreshold, dbNudgeThreshold, effectiveWindow,
-                state != null && state.messages() != null ? state.messages().size() : 0);
+                state != null && state.rawMessages() != null ? state.rawMessages().size() : 0);
         }
         return withNudge;
     }
@@ -2927,7 +2943,7 @@ public record AgentLoopContext(
      * 末尾追加 {@code \n[id:<6位短id>]} tag，让模型能引用消息 ID 调用 SnipTool
      * （CCB "This lets Claude reference message IDs when calling the snip tool"）。
      *
-     * <p><b>只改 API-bound 副本，不污染 state.messages()</b>（CCB messages.ts:1914-1916
+     * <p><b>只改 API-bound 副本，不污染 state.rawMessages()</b>（CCB messages.ts:1914-1916
      * "Only mutates the API-bound copy, not the stored message"）：ChatMessageDto 不可变，
      * 用 {@code withContent(content + tag)} 构造副本。门控与 CCB messages.ts:2673-2685 一致：
      * HISTORY_SNIP 开 + isSnipRuntimeEnabled() —— "don't inject [id:] tags when the tool
@@ -3150,7 +3166,7 @@ public record AgentLoopContext(
             //     pendingHookUserMessages → newMessages 桥 (与 tool_result 同批, 一次性).
             //   - 非 PreToolUse (SessionStart/Setup/UserPromptSubmit/SessionEnd/failure):
             //     LlmAgentLoop.injectHookResultMessage → appendPlainHookMessage →
-            //     state.messages() 一次性 user 消息 (对齐 CC sessionStart.ts:141-142).
+            //     state.rawMessages() 一次性 user 消息 (对齐 CC sessionStart.ts:141-142).
             //   若仍残留 hook_user_message attachment (防御), 走 default → 不渲染, 避免
             //   常驻 attachment 每轮重渲染成 isMeta 消息.
             case "hook_blocking_error":

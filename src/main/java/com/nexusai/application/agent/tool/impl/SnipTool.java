@@ -51,14 +51,14 @@ import java.util.UUID;
  * <p>Java 端对应链路（已接线）：
  * <ol>
  *   <li><b>本工具 execute()</b>：读 {@code ctx.messages()}（per-turn TUC 承载的
- *       {@code state.messages()} 快照，AgentLoopContext.toolExecContext），把
+ *       {@code state.rawMessages()} 快照，AgentLoopContext.toolExecContext），把
  *       {@code message_ids} 中<b>实际存在</b>的消息 id 收进 {@code removedUuids}，构造
  *       snip_boundary system 消息（content = 摘要），经 {@link ToolResult#successWithNewMessages}
  *       {@code newMessages} 通道注入会话历史（ToolResultApplier.apply → state.stashNewMessages 暂存，
  *       由 AgentLoopContext.flushNewMessagesAfterToolResult 在 tool_result 之后逐条追加；
  *       [snip-boundary-persist] boundary 经 appendMessage 触 appendListener → 落库 + STOMP）。</li>
  *   <li><b>LlmAgentLoop snip 步骤</b>（LlmAgentLoop.java:3761-3787，对齐 CC query.ts:401-410）：
- *       下轮 do-while 迭代开头，{@code new SnipCompactor().snipCompactIfNeeded(state.messages())}
+ *       下轮 do-while 迭代开头，{@code new SnipCompactor().snipCompactIfNeeded(state.rawMessages())}
  *       反向扫到 boundary，按 {@code removedUuids} 生成<b>请求级投影</b>
  *       {@code messagesForQuery}（对齐 CC query.ts:592 {@code messagesForQuery = snipResult.messages}），
  *       只替换发往 provider 的本轮消息链、<b>不</b>改 {@code AgentState.messages()} 本身
@@ -268,7 +268,7 @@ public class SnipTool implements Tool {
         }
         String reason = input.hasNonNull("reason") ? input.get("reason").asText() : null;
 
-        // ── 访问会话历史（ctx.messages() = per-turn TUC 承载的 state.messages() 快照）──
+        // ── 访问会话历史（ctx.messages() = per-turn TUC 承载的 state.rawMessages() 快照）──
         if (ctx == null) {
             log.warn("[SnipTool] execute 无 ToolUseContext，无法访问会话历史（fail loud）: id={}", call.id());
             return ToolResult.error(call.id(),
@@ -314,7 +314,7 @@ public class SnipTool implements Tool {
         log.info("[SnipTool] 裁剪 {} 条历史消息（requested={}, 目标 user={}）: boundary={} · CCB SnipTool.ts:81-91",
             snippedCount, requestedIds.size(), targetUserIndices.size(), boundary.id());
 
-        // boundary 经 newMessages 通道注入 state.messages()（ToolResultApplier.apply，
+        // boundary 经 newMessages 通道注入 state.rawMessages()（ToolResultApplier.apply，
         // ToolResultApplier.java:69-71）；下轮 LlmAgentLoop snip 步骤按 removedUuids 物理剔除。
         return ToolResult.successWithNewMessages(call.id(), dataJson, List.of(boundary));
     }
@@ -374,7 +374,7 @@ public class SnipTool implements Tool {
      * 这个短 id）；② 完整 id（兼容旧调用/显式 UUID）。仅匹配 user 消息（区间删除的锚点，
      * 对齐 CCB 只给 user 消息注入 [id:] tag 的语义）。
      *
-     * @param messages     ctx.messages()（state.messages() 快照）
+     * @param messages     ctx.messages()（state.rawMessages() 快照）
      * @param requestedIds 模型传入的 message_ids（short id / 完整 id）
      * @return 目标 user 消息 index（升序去重）
      */

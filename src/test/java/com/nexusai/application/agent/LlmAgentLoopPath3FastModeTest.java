@@ -95,7 +95,7 @@ class LlmAgentLoopPath3FastModeTest {
         };
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,

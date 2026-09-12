@@ -36,13 +36,13 @@ import static org.mockito.Mockito.when;
  * [fix-loop-resume-history] 主路径/后台任务 DB 历史注入 loop 级测试（计划 §6 T2/T5）。
  *
  * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图）</b>: 主路径注入块（LlmAgentLoop.doRun:1890-1951）
- * 把 DB 历史全量灌入 state.messages() 并登记 prePersistedMessageIds（对齐 CC
+ * 把 DB 历史全量灌入 state.rawMessages() 并登记 prePersistedMessageIds（对齐 CC
  * {@code loadConversationForResume} 全量注入）。此前只有 service 层（T1
  * MessageServiceResumeExcludingTest）与 ChatService 层（T3 skip 用例）覆盖，注入块本体零直接
  * 测试。本测试经<b>真实 LlmAgentLoop.run</b>（mocked provider 首调 stop + mocked MessageService
  * 返回历史）钉死注入语义：
  * <ul>
- *   <li>主路径注入：run 后 state.messages() 前缀=注入历史、历史之后含当前用户消息、
+ *   <li>主路径注入：run 后 state.rawMessages() 前缀=注入历史、历史之后含当前用户消息、
  *       prePersistedMessageIds 含历史 id（否则 replayAndPersist 无法跳过重插 → 幽灵行回归）</li>
  *   <li>best-effort 失败：messageService.listBySession 抛异常 → loop 不阻断、无注入
  *       （对齐 skill 恢复块同款容错语义，残留变量不影响后续 turn）</li>
@@ -50,8 +50,8 @@ import static org.mockito.Mockito.when;
  *   <li>[Re-think R2 修复] agentId != null 且 setTaskStreamContext 置真（后台化主会话任务，
  *       MainSessionBackgroundService:348）→ 注入全量会话历史（对齐 CC LocalMainSessionTask
  *       bgMessages 进 query({messages})，修复「后台通道模型上下文缺先前消息」）</li>
- *   <li>[计划 §6 T5] 注入超窗历史 → 首轮 auto-compact 触发、state.messages() 被替换
- *       （DRIFT-6 测量源 = messagesForQuery = 含历史的 state.messages() 快照）</li>
+ *   <li>[计划 §6 T5] 注入超窗历史 → 首轮 auto-compact 触发、state.rawMessages() 被替换
+ *       （DRIFT-6 测量源 = messagesForQuery = 含历史的 state.rawMessages() 快照）</li>
  * </ul>
  *
  * <p><b>测试基建</b>: 复用 LlmAgentLoopResumeRestoreEntryTest 同款真实 run 模式（裸
@@ -134,7 +134,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
     }
 
     @Test
-    @DisplayName("主路径注入: run 后 state.messages() 前缀=注入历史、历史后含当前用户消息、prePersistedMessageIds 含历史 id")
+    @DisplayName("主路径注入: run 后 state.rawMessages() 前缀=注入历史、历史后含当前用户消息、prePersistedMessageIds 含历史 id")
     void resumeInjection_realRun_historyPrependedAndRegistered() {
         // GIVEN: 原始转录含 [历史 assistant, 历史 tool, 当前用户消息]；注入块经
         //        listForResumeExcluding(raw, "msg-1") 排除当前用户消息 → 注入 [hist-asst, hist-tool]
@@ -158,10 +158,10 @@ class LlmAgentLoopDbHistoryInjectionTest {
         AgentState state = loop.run(RunRequest.session("resume query", sessionUuid, null,
             ProviderConfig.empty(), "test-model", null, null));
 
-        // ① 注入历史在 state.messages() 前缀（顺序保序：注入块 1889-1914 先于用户消息 2480）
-        List<ChatMessageDto> msgs = state.messages();
+        // ① 注入历史在 state.rawMessages() 前缀（顺序保序：注入块 1889-1914 先于用户消息 2480）
+        List<ChatMessageDto> msgs = state.rawMessages();
         assertThat(msgs).extracting(ChatMessageDto::id)
-            .as("主路径注入后 state.messages() 前缀必须是 DB 历史（对齐 CC loadConversationForResume 全量注入）")
+            .as("主路径注入后 state.rawMessages() 前缀必须是 DB 历史（对齐 CC loadConversationForResume 全量注入）")
             .startsWith(HIST_ASST_ID, HIST_TOOL_ID);
 
         // ② 历史之后含当前用户消息（本 run 的用户 prompt）
@@ -219,8 +219,8 @@ class LlmAgentLoopDbHistoryInjectionTest {
         assertThat(state.prePersistedMessageIds())
             .as("子代理（无任务流上下文）→ 不得注入 DB 历史（prePersistedMessageIds 保持 null）")
             .isNull();
-        assertThat(state.messages()).extracting(ChatMessageDto::id)
-            .as("子代理（无任务流上下文）→ 历史不得出现在 state.messages()")
+        assertThat(state.rawMessages()).extracting(ChatMessageDto::id)
+            .as("子代理（无任务流上下文）→ 历史不得出现在 state.rawMessages()")
             .doesNotContain(HIST_ASST_ID);
     }
 
@@ -252,7 +252,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
         // THEN: 后台 loop 模型上下文含先前会话（修复「后台通道模型上下文缺先前消息」），
         //       历史 id 登记 prePersistedMessageIds
         assertThat(state).isNotNull();
-        assertThat(state.messages()).extracting(ChatMessageDto::id)
+        assertThat(state.rawMessages()).extracting(ChatMessageDto::id)
             .as("后台任务必须注入会话历史（CC bgMessages 进 query({messages})）")
             .startsWith(HIST_ASST_ID, HIST_TOOL_ID);
         assertThat(state.prePersistedMessageIds())
@@ -261,9 +261,9 @@ class LlmAgentLoopDbHistoryInjectionTest {
     }
 
     @Test
-    @DisplayName("T5: 注入超窗历史 → 首轮 auto-compact 触发（state.messages() 被替换，测量源含历史）")
+    @DisplayName("T5: 注入超窗历史 → 首轮 auto-compact 触发（state.rawMessages() 被替换，测量源含历史）")
     void injectedOverWindowHistory_firstTurnAutoCompact() {
-        // GIVEN: state.messages() 前缀 = 注入的 DB 历史（模拟 listForResumeExcluding 产物，超窗），
+        // GIVEN: state.rawMessages() 前缀 = 注入的 DB 历史（模拟 listForResumeExcluding 产物，超窗），
         //        其后为当前用户消息 —— 与注入块产出的 [历史..., 当前用户] 顺序一致
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         for (int i = 0; i < 50; i++) {
@@ -286,21 +286,21 @@ class LlmAgentLoopDbHistoryInjectionTest {
         };
         com.nexusai.application.agent.loop.QueryParams params =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());
 
-        // WHEN: queryLoop 首轮（DRIFT-6 测量源 = messagesForQuery = state.messages() 含注入历史）
+        // WHEN: queryLoop 首轮（DRIFT-6 测量源 = messagesForQuery = state.rawMessages() 含注入历史）
         LlmAgentLoop.queryLoop(params, state, new java.util.ArrayList<>(), auto);
 
-        // THEN: 首轮 auto-compact 触发 → state.messages() 被压缩替换（含 compact_boundary 摘要，
+        // THEN: 首轮 auto-compact 触发 → state.rawMessages() 被压缩替换（含 compact_boundary 摘要，
         //       不再含全部原始注入历史）——证明注入历史进入了压缩/测量管线，不因「历史在上下文而
         //       测量源不含历史」虚低/漏压缩
-        assertThat(state.messages())
-            .as("注入超窗历史必须在首轮触发 auto-compact（state.messages() 被替换为压缩集）")
+        assertThat(state.rawMessages())
+            .as("注入超窗历史必须在首轮触发 auto-compact（state.rawMessages() 被替换为压缩集）")
             .anyMatch(m -> "compact_boundary".equals(m.subtype()));
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("压缩替换后原始超窗历史不得全量残留")
             .noneMatch(m -> "hist-0".equals(m.id()));
     }

@@ -146,7 +146,7 @@ class PtlRecoveryIntegrationTest {
             @Override public boolean isMainLoop() { return true; }
         };
         QueryParams params = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", maxTurns, null, null, null, null,
@@ -168,7 +168,7 @@ class PtlRecoveryIntegrationTest {
         runLoop(ctx, state, 8);
 
         // 恢复路径成功触发（消息被 collapse drain / reactive compact 压缩）
-        assertThat(state.messages().size())
+        assertThat(state.rawMessages().size())
             .as("PTL 必须走恢复路径（collapse drain / reactive compact 压缩消息）· CC query.ts:1086-1166")
             .isLessThan(original.size());
         // 恢复失败即 surface（非 STREAM_ERROR 退化 · D-25 删除前置不变量）
@@ -200,7 +200,7 @@ class PtlRecoveryIntegrationTest {
         //   60→51/52 为循环顶 applyCollapsesIfNeeded（CC query.ts:440-447）对 60 条可 snip 消息的
         //   L2 Snip 投影（snip 条数与迭代序相关，区间断言防抖动）；reactive compact stub 命中
         //   会进一步缩到 ~6 条，故 size > 20 即证明恢复链未触发。
-        assertThat(state.messages().size())
+        assertThat(state.rawMessages().size())
             .as("[P-11] 异常级 media 错误直 surface：仅循环顶压缩投影（60→~51），不得触发 reactive compact（~6 条）· CC errors.ts:147-153")
             .isGreaterThan(20);
         // surface 语义对齐 CC query.ts:1175 isWithheldMedia ? 'image_error'
@@ -231,7 +231,7 @@ class PtlRecoveryIntegrationTest {
         // CC 子串 errors.ts:133-139）→ isMediaError 命中 → reactive compact 恢复链触发（60 条压缩
         // 到 ~6）。若断链（errorDetails 无生产者），恢复链不触发 → 消息数保持 >20（同
         // exceptionLevelMediaError_directSurface 断言）→ 本断言 RED。
-        assertThat(state.messages().size())
+        assertThat(state.rawMessages().size())
             .as("[P-11 生产生产者] CC 媒体尺寸错误必须走消息级恢复链（reactive compact 压缩消息数），"
                 + "非异常级直 surface（size 保持 >20）· CC claude.ts:2743/2801 + errors.ts:612-623")
             .isLessThan(original.size());
@@ -285,7 +285,7 @@ class PtlRecoveryIntegrationTest {
             .as("PTL 恢复失败必须跳过 STOP 流水线：blocking stop hook 不得被调用（防死亡螺旋 · CC query.ts:1168-1182）")
             .isZero();
         // ② 不 append blocking user message（§14 :3362 appendMessage 重入通道被门控）
-        assertThat(state.messages().stream().map(ChatMessageDto::content))
+        assertThat(state.rawMessages().stream().map(ChatMessageDto::content))
             .as("不得 append blocking user message（hook blockingError 注入 LLM 的重入通道被门控）")
             .doesNotContain("hook_blocking: death spiral guard");
         // ③ 以 PROMPT_TOO_LONG 退出，非 MAX_TURNS 烧毁

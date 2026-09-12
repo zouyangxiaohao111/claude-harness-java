@@ -35,7 +35,7 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>WHY (CLAUDE.md 规则 9 · 测试验证意图)</b>: 纯文本 turn（:5890）与 max_tokens 截断续写
  * （:5599）append 的 assistant 消息 id 必须 == 本 turn {@code prepareAssistantMessageId()} 的返回值
- * （=流式 chunk.assistantMessageId 同源），否则 state.messages() 内 id 与前端块 id 不一致，后续
+ * （=流式 chunk.assistantMessageId 同源），否则 state.rawMessages() 内 id 与前端块 id 不一致，后续
  * ChatService 落库（B1 取末条 assistant 真实 id）也无法同源。变异点：
  * <ul>
  *   <li>5890 未传 4-参 → 纯文本 assistant id 随机 ≠ turnAssistantId → 红</li>
@@ -65,7 +65,7 @@ class LlmAgentLoopAssistantIdSameSourceTest {
             @Override public boolean isMainLoop() { return true; }
         };
         QueryParams params = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8))
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", null, null, null, null, null,
@@ -194,7 +194,7 @@ class LlmAgentLoopAssistantIdSameSourceTest {
             .hasSizeGreaterThanOrEqualTo(3);
         // 截断 assistant 消息（content="response N"）id 必须与对应迭代 turnAssistantId 一致（同源）
         //   —— 末次耗尽调用（exhausted）不追加截断 assistant，故 truncationAsst.size() <= capturedTurnIds.size()
-        List<ChatMessageDto> truncationAsst = state.messages().stream()
+        List<ChatMessageDto> truncationAsst = state.rawMessages().stream()
             .filter(m -> m.role() == Role.assistant)
             .filter(m -> m.content() != null && m.content().startsWith("response "))
             .toList();
@@ -215,7 +215,7 @@ class LlmAgentLoopAssistantIdSameSourceTest {
     // ── helpers ──
 
     private static ChatMessageDto lastAssistant(AgentState state) {
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {

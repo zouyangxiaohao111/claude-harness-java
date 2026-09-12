@@ -81,7 +81,7 @@ class SubagentExecutorCountToolUsesTest {
     @DisplayName("startInclusive 前缀跳过（父 context / fork 前缀不计数）")
     void countToolUses_shouldSkipPrefixBeforeStartInclusive() {
         // WHY: D3 实现语义 —— CC agentMessages 不含 initialMessages/fork 前缀（AgentTool.tsx:786
-        //   空数组 + :1065 push），Java finalState.messages() 含 initialMsgCount 前缀。父 context
+        //   空数组 + :1065 push），Java finalState.rawMessages() 含 initialMsgCount 前缀。父 context
         //   的 tool_use 不应计入子 agent 自身工具调用计数（SubagentExecutor.java:3699-3700）。
         //   startInclusive=initialMsgCount 即该前缀分界；此用例验证分界前全部跳过。
         List<ChatMessageDto> messages = List.of(
@@ -102,7 +102,7 @@ class SubagentExecutorCountToolUsesTest {
     @DisplayName("null 安全：null 列表 / null toolCalls / 越界 startInclusive 均不抛异常")
     void countToolUses_shouldBeNullSafe() {
         // WHY: finalState 可能为 null（queryLoop 异常/abort 路径），summarySource 回退到
-        //   state.messages()；历史 DB 消息 toolCalls 可能为 null（旧消息无解析）。countToolUses
+        //   state.rawMessages()；历史 DB 消息 toolCalls 可能为 null（旧消息无解析）。countToolUses
         //   作为 metrics 计算不得在这些输入下抛 NPE —— 规则十二 Fail loud 之外，异常路径
         //   本身已有 catch 兜底，计数函数应保持纯函数性质（null 输入 → 0）。
         assertThat(SubagentExecutor.countToolUses(null, 0))

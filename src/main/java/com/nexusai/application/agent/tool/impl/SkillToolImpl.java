@@ -1725,7 +1725,7 @@ public class SkillToolImpl implements Tool {
             //   - newMessages = 技能指令文本 (含 <command-name> 标签 + 正文), 注入对话历史供 LLM 消费
             // 之前 (真 dead code): systemPrompt 构造后被丢弃, 仅返回 data → SkillTool 对 LLM 零有效内容.
             // 现在: 把 systemPrompt 作为 user newMessage 塞进 ExtendedToolResult,
-            //       LlmAgentLoop 经 ExtendedToolResultApplier 注入 state.messages() (跨 turn 持久).
+            //       LlmAgentLoop 经 ExtendedToolResultApplier 注入 state.rawMessages() (跨 turn 持久).
             // [A1·退役 ExtendedToolResult] base 折入 successWithNewMessages (CC Tool.ts:323 newMessages)
             //
             // P2-16 图片块通道：promptFn（MCP prompt）返回的 image 块经 newMessage.contentBlocks

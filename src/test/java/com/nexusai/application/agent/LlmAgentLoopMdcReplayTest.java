@@ -91,7 +91,7 @@ class LlmAgentLoopMdcReplayTest {
             // ── 3. 驱动真实 queryLoop（同 WiringOrderTest 路径）──
             AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
             LoopResult result = LlmAgentLoop.queryLoop(
-                QueryParams.forLoop(state.messages(), null,
+                QueryParams.forLoop(state.rawMessages(), null,
                     ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                     QuerySource.USER, "test-model", null, null, null, null, null,
                     deps, ProviderConfig.empty()),
@@ -142,7 +142,7 @@ class LlmAgentLoopMdcReplayTest {
             // ── 3. 驱动真实 queryLoop（同 MDC 回放测试路径）──
             AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
             LoopResult result = LlmAgentLoop.queryLoop(
-                QueryParams.forLoop(state.messages(), null,
+                QueryParams.forLoop(state.rawMessages(), null,
                     ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                     QuerySource.USER, "test-model", null, null, null, null, null,
                     deps, ProviderConfig.empty()),

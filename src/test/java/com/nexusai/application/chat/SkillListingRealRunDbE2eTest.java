@@ -54,7 +54,7 @@ import static org.mockito.Mockito.when;
  * [skill-listing 端到端 · 2026-09-10] <b>真实 run → 真实 MessageService → 真实 SQLite → listBySession(seq) 重放</b>。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 验证意图）</b>：skill_listing 回归 CC 的一致性验证此前<b>只到</b>两层——
- * ① 内存态 {@code state.messages()} 索引断言（{@code LlmAgentLoopSkillListingInjectTest}）；
+ * ① 内存态 {@code state.rawMessages()} 索引断言（{@code LlmAgentLoopSkillListingInjectTest}）；
  * ② 手工构造 DTO 调落库分支（{@code ChatServiceSkillListingPersistTest} / {@code ChatServiceSkillListingSeqStampTest}）。
  * <b>从未有一条真实 run 把「注入 → 落库 → 重放」整链串起来</b>：位置（清单在用户消息之后）到底能不能经
  * DB 的 {@code messages.seq} 还原，只是被单测分别推断，未被同一条 run 观察。
@@ -188,7 +188,7 @@ class SkillListingRealRunDbE2eTest {
         AgentState state = runOnce(uid(), "first query");
 
         // 内存态也已注入（sanity：证明 run 真跑了注入链）
-        assertThat(listingContent(state.messages())).as("真实 run 内已注入 skill_listing").isNotNull();
+        assertThat(listingContent(state.rawMessages())).as("真实 run 内已注入 skill_listing").isNotNull();
 
         List<MessageRecord> rows = dbRowsBySeq();
         List<MessageRecord> listings = rows.stream()
@@ -273,7 +273,7 @@ class SkillListingRealRunDbE2eTest {
         List<String> listingIdsBeforeRun2 = listingRows().stream().map(MessageRecord::getId).toList();
         AgentState s2 = runOnce(uid(), "second query");
         // 内存态历史注入会带出 run1 的清单行 —— 断言「没有新增清单消息（id 均为 run2 前既有 id）」
-        assertThat(listingIds(s2.messages()))
+        assertThat(listingIds(s2.rawMessages()))
             .as("无新技能 → 内存态不追加任何新清单消息（历史注入的 run1 行除外）")
             .allMatch(listingIdsBeforeRun2::contains);
         assertThat(listingRows().stream().map(MessageRecord::getId).toList())
@@ -292,7 +292,7 @@ class SkillListingRealRunDbE2eTest {
             .doesNotContain("commit")
             .doesNotContain("review");
         // run3 内存态新注入的清单行 id = 差量行 id（历史注入的 run1 行 id 不同）
-        assertThat(listingIds(s3.messages())).as("run3 内存态新增注入差量清单").contains(delta.getId());
+        assertThat(listingIds(s3.rawMessages())).as("run3 内存态新增注入差量清单").contains(delta.getId());
 
         // 差量行的 seq 仍紧随其当前用户消息（run 自己落库的 busy-queued user 行）
         List<MessageRecord> rows = dbRowsBySeq();

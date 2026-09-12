@@ -83,6 +83,15 @@ public class AgentState {
     /** [R32-b15 Stage 2 C5] lineage 操作日志. */
     private static final Logger log = LoggerFactory.getLogger(AgentState.class);
 
+    /**
+     * 全量消息清单（append-only）· <b>[D10 双视图] 本字段是唯一的真实存储</b>。
+     *
+     * <p>外部读一律经两个显式命名的视图出口，不再暴露裸 getter：
+     * <ul>
+     *   <li>{@link #rawMessages()} —— 全量、<b>永不投影</b>（对齐 CC {@code query()} 的 {@code messages} 形参）</li>
+     *   <li>{@link #modelView()} —— 模型视图（对齐 CC {@code query.ts:523 的 messagesForQuery}）</li>
+     * </ul>
+     */
     private final List<ChatMessageDto> messages;
     /** s01 [P2] 修补新增 · 对齐 CC utils/attachments.ts:3201 */
     private final List<AttachmentMessageDto> attachments;
@@ -148,7 +157,7 @@ public class AgentState {
      * [fix-loop-resume-history] 注入的 DB 历史消息 id 集 · ChatService.replayAndPersist 跳过
      * （防重复落库）。doRun 主路径恢复（对齐 CC loadConversationForResume 全量注入）把 DB 历史
      * （含 deserializer 合成的 Continue/sentinel 消息，id 为临时 UUID）灌入 {@link #messages}
-     * 后登记本集 —— replayAndPersist 遍历 state.messages() 时凡 id ∈ 本集即跳过（history 消息带
+     * 后登记本集 —— replayAndPersist 遍历 state.rawMessages() 时凡 id ∈ 本集即跳过（history 消息带
      * 原始 DB id 作 PK，重插必 duplicate-key 崩；合成 sentinel/Continue CC 也不写 transcript，
      * 语义一致）。本轮新生成的 assistant/tool 消息 id 不在集合 → 正常落库（行为不变）。
      *
@@ -410,7 +419,63 @@ public class AgentState {
 
     // ── accessors ──
 
-    public List<ChatMessageDto> messages() { return messages; }
+    /**
+     * <b>[D10 双视图 · 视图 ①] 全量消息</b> —— append-only、<b>永不投影</b>。
+     *
+     * <p><b>CC 对照</b>：本方法 = CC {@code query()} 的 {@code messages} 形参
+     * （{@code query.ts:238-256}）。该形参在整个 query 生命周期内<b>一直活着且不被投影改写</b>
+     * —— CC 只在 {@code query.ts:523} 由它<b>派生</b>出 {@code messagesForQuery}（另起名字），
+     * 此后再无 `messages` 的模型面读取；REPL/导出/持久化等「要真实历史」的消费方仍读它。
+     *
+     * <p><b>谁会读它</b>（选边规则，见 {@link #modelView()} 的互补说明）：
+     * 落库 / 血缘 / 持久化 / resume 注入 / 终态事件取末条 / 计数与诊断 / 需要真实历史者。
+     *
+     * <p><b>WHY 必须有这个名字（本批的全部意义）</b>：改造前本类只有一个 {@code messages()}
+     * getter，它在 {@code LlmAgentLoop} 循环入口被 {@code replaceMessages(compactTarget)}
+     * <b>破坏性写回</b>——入口前读它拿到全量、入口后读它拿到「已剥离 compact boundary +
+     * 已投影 snip」的<b>有损</b>视图，判定只能靠数行号。双视图后全量在内存里一直活着，
+     * 且与模型视图<b>不同名</b>：任何消费方必须在编译期显式选一个，选错一眼可见。
+     *
+     * <p><b>返回可变内部列表</b>（非拷贝）：与改造前 {@code messages()} 语义逐字一致
+     * —— {@code ToolResultApplier} 的兜底分支会向它 append；调用方若需快照请自行拷贝。
+     *
+     * @return 全量消息（活引用，勿在不理解 append 语义时改写）
+     */
+    public List<ChatMessageDto> rawMessages() { return messages; }
+
+    /**
+     * <b>[D10 双视图 · 视图 ②] 模型视图</b> —— 每次调用<b>派生</b>（不写回、不改 state）。
+     *
+     * <p><b>CC 对照</b>：本方法 = CC {@code query.ts:523}
+     * {@code let messagesForQuery = getMessagesAfterCompactBoundary(messages)}。
+     * 派生规则逐字对齐 CC {@code messages.ts:5083-5096}：从<b>最后一个 compact boundary
+     * （含）</b>向后切片，并对切片应用 {@code projectSnippedView}（剔除被 snip 删除的
+     * {@code removedUuids} 消息）。<b>[N2 2026-09-11]</b> snip 投影 = 回放门，不受 HISTORY_SNIP
+     * 运行时开关门控（历史 snip 不复活）；无 boundary/无 removedUuids 时原样返回。
+     *
+     * <p><b>谁会读它</b>（模型面）：进 LLM 请求的消息数组、压缩/summary 的输入、
+     * fork 原料、stop/post-sampling hook 载荷、per-turn {@code ToolUseContext.messages}
+     * （CC {@code query.ts:744-746} 把 TUC.messages 重新绑定为 {@code messagesForQuery}）。
+     *
+     * <p><b>为什么不写回 state</b>：CC 的投影是<b>纯函数派生</b>——{@code messagesForQuery}
+     * 是一个与 {@code messages} 同时存在的<b>另一个局部数组</b>，从不回写 {@code messages}。
+     * 改造前 nexusai 用 {@code state.replaceMessages(compactTarget)} 把投影写回，
+     * 导致 pre-boundary 历史当场从内存消失（只剩 DB），且同一个 getter 在不同代码位置
+     * 语义不同 —— 这正是「靠自觉」的根因（见 AgentState 类注释 / D10 双视图）。
+     *
+     * <p><b>成本</b>：每次调用 O(n) 重建列表（切片 + snip 扫描）。与 CC 每轮
+     * {@code query.ts:523} 派生一次等价；调用点应「每轮取一次存局部变量」，
+     * 不要在高频内层循环里反复调用。
+     *
+     * @return 模型视图（新列表；不含 pre-boundary 历史与被 snip 删除的消息）
+     */
+    public List<ChatMessageDto> modelView() {
+        // 外层 new ArrayList 双重保险：
+        //   ① BoundaryReader 在「空列表」入参时**原样返回入参**（会 alias 内部 messages）——包一层杜绝别名；
+        //   ② 下游消费者期望**可变**列表（与改造前 state.messages() 返回可变 ArrayList 一致）。
+        return new ArrayList<>(com.nexusai.application.agent.compact.BoundaryReader
+            .getMessagesAfterCompactBoundary(rawMessages()));
+    }
 
     /**
      * [2026-08-25 flow 重构] 最后一条 user 消息 id（消息链推导，对齐 CC parentUuid 链）。
@@ -1272,9 +1337,9 @@ public class AgentState {
         return java.time.LocalDate.now().toString();
     }
 
-    // ── [H6-FIX] Stop hook summary 本地暂存（UI/transcript 呈现源 · 绝不进入 state.messages()）──
+    // ── [H6-FIX] Stop hook summary 本地暂存（UI/transcript 呈现源 · 绝不进入 state.rawMessages()）──
     // WHY: CC createStopHookSummaryMessage (messages.ts:4398-4420) yield 给 UI transcript
-    //   (stopHooks.ts:299)，Java 端 append 进 state.messages() 会被 OpenAI provider 原样序列化发给
+    //   (stopHooks.ts:299)，Java 端 append 进 state.rawMessages() 会被 OpenAI provider 原样序列化发给
     //   LLM 污染上下文（R32C1 证实 isMeta 不影响 provider 序列化，CHANGELOG 0.2.29 ⑥）→ 本地暂存
     //   + collapse 折叠，由 transcript/UI 层读取（AgentLoopExitedEvent.state() 可访问）。
     // [合并说明 2026-08-08] 远程 ab54f3cc 曾以"0 消费方"删除本通道；FOLLOWUP 批 EX-D（09 §7.5 R6）
@@ -1446,7 +1511,7 @@ public class AgentState {
      * 消息）→ :1566-1570 push result.newMessages（页图消息）。
      *
      * <p><b>WHY（根因）</b>: 旧实现 {@code ToolResultApplier.apply} 在工具执行 dispatch 期就
-     * {@code state.messages().addAll(tr.newMessages())}，早于 step 3 才 append 的 {@code tool_result}
+     * {@code state.rawMessages().addAll(tr.newMessages())}，早于 step 3 才 append 的 {@code tool_result}
      * → state.messages 顺序变成 [assistant(tool_calls), user(isMeta 页图), tool(tool_result)]。
      * provider 原序透传 → assistant tool_calls 后夹 image user 消息 → Anthropic 400
      * "assistant message with tool_calls must be followed by tool messages"。本 map 让 newMessages

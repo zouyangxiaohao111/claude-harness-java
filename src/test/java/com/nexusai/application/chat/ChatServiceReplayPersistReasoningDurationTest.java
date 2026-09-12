@@ -235,7 +235,7 @@ class ChatServiceReplayPersistReasoningDurationTest {
     @DisplayName("实时原位落库 queued-user created_at 严格介于 assistantA 与 assistantB 之间（单调时间戳保序）")
     void inPlaceQueuedUserCreatedAt_isMonotonicBetweenAssistants() {
         // GIVEN: assistantA(工具轮) → tool → mid-turn 注入 queued-user → assistantB(纯文本)，
-        //   queued-user 同时 append 进 state.messages()（真实 LlmAgentLoop 工具边界注入模型）。
+        //   queued-user 同时 append 进 state.rawMessages()（真实 LlmAgentLoop 工具边界注入模型）。
         //   注意实时化时序：addInjectedQueuedMessage 必须先于 append（user 分支在 append 时点反查）。
         AgentState state = new AgentState("sys");
         state.addInjectedQueuedMessage("msg-queued-1", "忙时追问");

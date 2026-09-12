@@ -46,7 +46,7 @@ import java.util.Set;
  * <p><b>[snip-state-fix 2026-09-10 语义澄清]</b> {@code includeSnipped} 的两种取值在本仓的用途：
  * <ul>
  *   <li>{@code false}（单参重载缺省，CC 的 model-facing 用法）：用于**模型面**——本仓
- *       {@code LlmAgentLoop} 循环入口用它生成 {@code state.messages()} 的内容（state 在本仓循环里
+ *       {@code LlmAgentLoop} 循环入口用它生成 {@code state.rawMessages()} 的内容（state 在本仓循环里
  *       扮演 CC {@code messagesForQuery} 的角色）。</li>
  *   <li>{@code true}：CC 在 REPL/UI 面用（{@code REPL.tsx:3167-3169}，保留滚动回看）。本仓**当前
  *       无可用的调用方**——因为「REPL 全量历史」在本仓由 **DB** 承担（前端/轨迹读 DB，DB
@@ -67,7 +67,7 @@ import java.util.Set;
  * <table>
  *   <tr><th>调用点</th><th>用途</th><th>回放/执行</th></tr>
  *   <tr><td>{@code LlmAgentLoop.java:5085}</td><td>循环入口 boundary 剥离 + snip 投影写回
- *       {@code state.messages()}（state 扮演 CC {@code messagesForQuery} 角色）→ 模型面</td>
+ *       {@code state.rawMessages()}（state 扮演 CC {@code messagesForQuery} 角色）→ 模型面</td>
  *       <td><b>回放</b></td></tr>
  *   <tr><td>{@code CompactCommand.java:217}</td><td>手动 {@code /compact}：剥离结果即压缩输入
  *       （喂给摘要模型）→ 模型面</td><td><b>回放</b></td></tr>
@@ -285,7 +285,7 @@ public final class BoundaryReader {
      * 用法），应用投影。
      * ⚠️ 本仓**当前只有 false 的调用方**（5 处静态调用面，见类注释的 [N2] 段——经逐一审计全部为
      * 「回放」语义）——「REPL 全量历史」由 DB 承担，循环内 state 不需第二份全量；
-     * 若将来要新增 true 的调用方，必须同时审计所有吃 {@code state.messages()} 的模型相邻消费点。
+     * 若将来要新增 true 的调用方，必须同时审计所有吃 {@code state.rawMessages()} 的模型相邻消费点。
      *
      * @param messages      消息列表
      * @param includeSnipped 是否保留被 snip 删除的消息（CC options.includeSnipped，messages.ts:4648）

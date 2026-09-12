@@ -151,7 +151,7 @@ class CompactCommandPersistWritebackTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("传统分支: /compact 结果经 appendPostCompactMessages 落库 + state.messages() 替换为压缩后视图")
+    @DisplayName("传统分支: /compact 结果经 appendPostCompactMessages 落库 + state.rawMessages() 替换为压缩后视图")
     void traditionalPathPersistsAndReplacesStateMessages() {
         MessageService messageService = mock(MessageService.class);
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
@@ -172,10 +172,10 @@ class CompactCommandPersistWritebackTest {
         verify(messageService).appendPostCompactMessages(eq(SESSION), captor.capture());
         assertBoundaryAndSummaryPersisted(captor.getValue(), result);
         // 内存已替换为落库归一化列表（memory 与 DB id 一致，对齐 LlmAgentLoop.persistCompactedMessages）
-        assertThat(state.messages())
-            .as("state.messages() 已替换为压缩后视图（旧实现恒为压缩前全量）")
+        assertThat(state.rawMessages())
+            .as("state.rawMessages() 已替换为压缩后视图（旧实现恒为压缩前全量）")
             .isEqualTo(captor.getValue());
-        assertThat(state.messages().get(0).subtype()).isEqualTo("compact_boundary");
+        assertThat(state.rawMessages().get(0).subtype()).isEqualTo("compact_boundary");
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -183,7 +183,7 @@ class CompactCommandPersistWritebackTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("SM 优先分支: 同样落库 boundary+摘要并替换 state.messages()（两条分支不得只修一条）")
+    @DisplayName("SM 优先分支: 同样落库 boundary+摘要并替换 state.rawMessages()（两条分支不得只修一条）")
     void smPathPersistsAndReplacesStateMessages(@TempDir Path baseDir) throws Exception {
         SessionMemoryService sm = newSmService(baseDir);
         MessageService messageService = mock(MessageService.class);
@@ -210,7 +210,7 @@ class CompactCommandPersistWritebackTest {
         ArgumentCaptor<List<ChatMessageDto>> captor = ArgumentCaptor.forClass(List.class);
         verify(messageService).appendPostCompactMessages(eq(SESSION), captor.capture());
         assertBoundaryAndSummaryPersisted(captor.getValue(), result);
-        assertThat(state.messages()).isEqualTo(captor.getValue());
+        assertThat(state.rawMessages()).isEqualTo(captor.getValue());
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -237,7 +237,7 @@ class CompactCommandPersistWritebackTest {
             .as("无通道 → 必须显式失败（当前 bug 的本质就是此处静默什么都不做）")
             .isEqualTo(CompactCommand.ApplyOutcome.NO_PERSIST_CHANNEL);
         // 内存仍替换（本会话按压缩后视图继续），但 DB 未更新 —— 显式失败而非静默
-        assertThat(state.messages()).isEqualTo(CompactionResult.buildPostCompactMessages(result));
+        assertThat(state.rawMessages()).isEqualTo(CompactionResult.buildPostCompactMessages(result));
     }
 
     @Test
@@ -261,7 +261,7 @@ class CompactCommandPersistWritebackTest {
 
         assertThat(outcome).isEqualTo(CompactCommand.ApplyOutcome.PERSISTED);
         assertBoundaryAndSummaryPersisted(capturedByState, result);
-        assertThat(state.messages()).isEqualTo(CompactionResult.buildPostCompactMessages(result));
+        assertThat(state.rawMessages()).isEqualTo(CompactionResult.buildPostCompactMessages(result));
     }
 
     @Test
@@ -281,7 +281,7 @@ class CompactCommandPersistWritebackTest {
             CompactCommand.applyResultToState(state, SESSION, result, messageService);
 
         assertThat(outcome).isEqualTo(CompactCommand.ApplyOutcome.PERSIST_FAILED);
-        assertThat(state.messages()).isEqualTo(CompactionResult.buildPostCompactMessages(result));
+        assertThat(state.rawMessages()).isEqualTo(CompactionResult.buildPostCompactMessages(result));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -319,7 +319,7 @@ class CompactCommandPersistWritebackTest {
         assertThat(persisted.get(0).subtype())
             .as("库里应出现 compact_boundary 行（修复前恒 0）")
             .isEqualTo("compact_boundary");
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("会话内存已是压缩后视图（下次拉取历史即压缩后态）")
             .isEqualTo(persisted);
         assertThat(out)
@@ -352,8 +352,8 @@ class CompactCommandPersistWritebackTest {
             .as("无通道时用户可见文案必须明示「压缩结果未写入历史」（当前 bug 的本质 = 静默）")
             .contains(CompactCommand.WARN_NO_PERSIST_CHANNEL);
         // 内存仍按压缩后视图继续（boundary 在首位）
-        assertThat(state.messages()).isNotEmpty();
-        assertThat(state.messages().get(0).subtype()).isEqualTo("compact_boundary");
+        assertThat(state.rawMessages()).isNotEmpty();
+        assertThat(state.rawMessages().get(0).subtype()).isEqualTo("compact_boundary");
     }
 
     /**
@@ -444,7 +444,7 @@ class CompactCommandPersistWritebackTest {
             .as("BUSY_SNAPSHOT 是瞬态并发错误 → 重试后必须成功，不得让用户看到「写库失败」")
             .isEqualTo(CompactCommand.ApplyOutcome.PERSISTED);
         assertThat(calls.get()).as("第 1 次 BUSY → 第 2 次成功").isEqualTo(2);
-        assertThat(state.messages()).as("内存已替换为落库归一化列表").isNotEmpty();
+        assertThat(state.rawMessages()).as("内存已替换为落库归一化列表").isNotEmpty();
     }
 
     /**

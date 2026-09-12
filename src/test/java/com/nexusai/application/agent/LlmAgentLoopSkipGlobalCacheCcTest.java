@@ -108,7 +108,7 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
 
         // ── 4. queryLoop（gate=true 经 params.config() 注入）──
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null, tuc,
+            QueryParams.forLoop(state.rawMessages(), null, tuc,
                 QuerySource.USER, "test-model", null,
                 null, null, null, null, deps, firstParty),
             state, new ArrayList<>());
@@ -157,7 +157,7 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
         ProviderConfig firstParty = new ProviderConfig("https://api.anthropic.com", "sk-test");
 
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null, tuc,
+            QueryParams.forLoop(state.rawMessages(), null, tuc,
                 QuerySource.USER, "test-model", null,
                 null, null, null, null, deps, firstParty),
             state, new ArrayList<>());

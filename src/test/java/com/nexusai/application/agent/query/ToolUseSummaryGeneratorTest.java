@@ -364,7 +364,7 @@ class ToolUseSummaryGeneratorTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(

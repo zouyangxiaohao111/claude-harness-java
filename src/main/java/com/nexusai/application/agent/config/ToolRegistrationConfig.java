@@ -2198,7 +2198,7 @@ public class ToolRegistrationConfig {
      *   <li>session 解析：RequestContext.sessionId（ChatService 已 set MDC，short 直键）
      *       → SessionAgentStateRegistry.get（[session-id-short] 不再 parseSessionUuid）</li>
      *   <li>AgentState 未注册 → log.warn fail loud，不静默当压缩成功</li>
-     *   <li>构造 {@link CompactCommandContext}：messages=state.messages()，SM=sessionMemoryService
+     *   <li>构造 {@link CompactCommandContext}：messages=state.rawMessages()，SM=sessionMemoryService
      *       （IMP-M-P0-3 注入，生产非 null → 空指令 SM 优先可达；null 时 null-safe 跳过），
      *       microCompactor=new MicroCompactor()，
      *       reactiveCompactor 注入，summaryProducer=StreamCompactSummary 包装（对齐
@@ -2276,8 +2276,8 @@ public class ToolRegistrationConfig {
         }
         String sessionId = state.sessionId() != null ? state.sessionId() : rawSessionId;
         String agentId = state.agentId() != null ? state.agentId().toString() : null;
-        if (state.messages() == null) {
-            log.warn("[R1] /compact 会话消息为空（state.messages()=null）: sessionId={}，跳过压缩", sessionId);
+        if (state.rawMessages() == null) {
+            log.warn("[R1] /compact 会话消息为空（state.rawMessages()=null）: sessionId={}，跳过压缩", sessionId);
             return "/compact 会话消息为空。";
         }
         // ── 3. 构造 CompactCommandContext + 调用（compact.ts:40 call）──
@@ -2297,7 +2297,7 @@ public class ToolRegistrationConfig {
         SystemPromptContextProvider manualProvider =
             buildManualSystemPromptCtxProvider(state, claudemdEngine);
         CompactCommand.CompactCommandContext ctx = buildCompactCommandContext(
-            state.messages(), sessionId, agentId, resolveManualCompactModel(state),
+            state.rawMessages(), sessionId, agentId, resolveManualCompactModel(state),
             reactiveCompactor, streamCompactSummary,
             sessionMemoryService,
             state.currentToolUseContext(),
@@ -2527,7 +2527,7 @@ public class ToolRegistrationConfig {
         }
         log.info("[R1] /compact 空闲会话 AgentState 已从 DB 历史重建: session={} 历史 {} 条"
                 + "（raw={} 排除在途={}；对齐 CC REPL 恒持 messages，compact.ts:44）",
-            rawSessionId, rebuilt.messages().size(), raw.size(), excludeId != null);
+            rawSessionId, rebuilt.rawMessages().size(), raw.size(), excludeId != null);
         return rebuilt;
     }
 

@@ -61,7 +61,7 @@ class LlmAgentLoopStopHookBlockingIsMetaTest {
     private static final String BLOCKING_TEXT = "检查未通过，请修复后继续";
 
     @Test
-    @DisplayName("in-loop Stop hook 返回 blockingError → 注入 state.messages() 的 user 消息 isMeta=true")
+    @DisplayName("in-loop Stop hook 返回 blockingError → 注入 state.rawMessages() 的 user 消息 isMeta=true")
     void inLoopBlockingError_injectsIsMetaUserMessage() {
         // ── provider：单文本帧 → 无 tool_calls → 进入 stop hooks 分支 ──
         LlmProvider provider = Mockito.mock(LlmProvider.class);
@@ -112,7 +112,7 @@ class LlmAgentLoopStopHookBlockingIsMetaTest {
         // ── 执行（blocking → 重入；重入上限安全阀终止，全程不抛）──
         assertThatCode(() -> LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 tucWithNotification(null).withAvailableTools(List.of(
                     TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
@@ -122,7 +122,7 @@ class LlmAgentLoopStopHookBlockingIsMetaTest {
             .doesNotThrowAnyException();
 
         // ── 断言：回注的 user 消息存在且 isMeta=true ──
-        List<ChatMessageDto> injected = state.messages().stream()
+        List<ChatMessageDto> injected = state.rawMessages().stream()
             .filter(m -> Role.user.equals(m.role()) && m.content() != null
                 && m.content().contains(BLOCKING_TEXT))
             .toList();

@@ -103,7 +103,7 @@ class ChatServiceReplayPersistReasoningTest {
     @Test
     @DisplayName("prePersistedMessageIds 命中的历史 assistant 不重插（防 PK 冲突双写）")
     void skipPrePersistedHistoryAssistant() {
-        // WHY（fix-loop-resume-history 双通道铁律）: doRun 主路径恢复把 DB 历史灌入 state.messages()
+        // WHY（fix-loop-resume-history 双通道铁律）: doRun 主路径恢复把 DB 历史灌入 state.rawMessages()
         //   并登记 prePersistedMessageIds。若实时落库仍遍历重插 history 消息 —— 其携带
         //   原始 DB id 作 PK，重插必 duplicate-key 崩；合成 sentinel/Continue（临时 UUID id，已收集进
         //   集合）CC 也不写 transcript。变异点：跳过逻辑不生效 → insert 两次（h1 + final）→ 红。
@@ -132,7 +132,7 @@ class ChatServiceReplayPersistReasoningTest {
     @Test
     @DisplayName("注入历史（末条 assistant ∈ prePersisted）+ 本轮未产出新 assistant → 零落库（幽灵行防御）")
     void skipFinalPersistWhenLastAssistantIsInjectedHistory() {
-        // WHY（fix-loop-resume-history 新回归）: doRun 注入块把 DB 历史灌入 state.messages() 后，
+        // WHY（fix-loop-resume-history 新回归）: doRun 注入块把 DB 历史灌入 state.rawMessages() 后，
         //   lastAssistant() 从末向前扫描会命中注入的历史 assistant。若本轮 run 未 append 新
         //   assistant 即退出（取消/中断 / NO_ASSISTANT_TEXT 空流 / stream timeout / stop-hook 阻断），
         //   历史内容会被以全新随机 id 落库 = 幽灵重复行。变异点：prePersisted 跳过未生效 → insert 一次

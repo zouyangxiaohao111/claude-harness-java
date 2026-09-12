@@ -62,7 +62,7 @@ import static org.mockito.Mockito.when;
  *   <li>{@code MessageService.countNonMetaMessages}（{@code WHERE is_meta IS NULL OR is_meta != 1}）
  *       不再计入 → 轨迹条数徽标不虚高。</li>
  * </ul>
- * <b>模型面不受影响</b>：isMeta 绝不用于模型侧过滤（CC 同），本消息仍在 {@code state.messages()} 内
+ * <b>模型面不受影响</b>：isMeta 绝不用于模型侧过滤（CC 同），本消息仍在 {@code state.rawMessages()} 内
  * 参与 {@code messagesForLlm}。
  *
  * @since 2026-09-12（appendPlainHookMessage 对齐 CC）
@@ -183,7 +183,7 @@ class LlmAgentLoopPlainHookMessageCcAlignTest {
 
     /** 仅取 role=user 且 content 含 "hook success:" 的消息（被测注入消息唯一标识）. */
     private static ChatMessageDto hookInjected(AgentState state) {
-        return state.messages().stream()
+        return state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && m.content() != null && m.content().contains("hook success:"))
             .findFirst()
             .orElse(null);
@@ -191,7 +191,7 @@ class LlmAgentLoopPlainHookMessageCcAlignTest {
 
     /** 非 meta 的 user 消息（镜像 MessageService.countNonMetaMessages 的 is_meta 口径）. */
     private static List<ChatMessageDto> nonMetaUsers(AgentState state) {
-        return state.messages().stream()
+        return state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && !m.isMeta())
             .toList();
     }
@@ -276,7 +276,7 @@ class LlmAgentLoopPlainHookMessageCcAlignTest {
 
         ChatMessageDto injected = hookInjected(state);
         assertThat(injected).isNotNull();
-        String realUserMessageId = state.messages().stream()
+        String realUserMessageId = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && !m.isMeta())
             .map(ChatMessageDto::id)
             .reduce((a, b) -> b)   // 最后一条非 meta user = 真实用户输入 "hello"
@@ -323,7 +323,7 @@ class LlmAgentLoopPlainHookMessageCcAlignTest {
     }
 
     @Test
-    @DisplayName("模型面不变：注入消息仍在 state.messages() 内（isMeta 绝不用于模型侧过滤，CC 同）")
+    @DisplayName("模型面不变：注入消息仍在 state.rawMessages() 内（isMeta 绝不用于模型侧过滤，CC 同）")
     void injectedMessage_stillVisibleToModel() throws Exception {
         // WHY: isMeta=true 只影响 UI 与读侧归属/计数口径，绝不从 messagesForLlm 剔除 ——
         //      CC 的 meta user 消息同样进 API 请求（否则 hook 反馈到不了模型，本通道即失效）。
@@ -333,7 +333,7 @@ class LlmAgentLoopPlainHookMessageCcAlignTest {
 
         AgentState state = loop.run(RunRequest.forTest("hello", "test-model", null));
 
-        assertThat(hookInjected(state)).as("消息确实落在 state.messages()（transcript/模型面同源）").isNotNull();
+        assertThat(hookInjected(state)).as("消息确实落在 state.rawMessages()（transcript/模型面同源）").isNotNull();
         assertThat(history.get())
             .as("LLM 请求 history 必须含该 hook 文本（模型可见）")
             .anySatisfy(m -> assertThat(m.content()).contains("SessionStart hook success: hook message 1"));

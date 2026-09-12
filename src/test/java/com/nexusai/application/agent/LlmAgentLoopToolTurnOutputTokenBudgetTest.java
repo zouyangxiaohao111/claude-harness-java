@@ -114,7 +114,7 @@ class LlmAgentLoopToolTurnOutputTokenBudgetTest {
         // ── 4. 执行 queryLoop ──
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(
@@ -128,7 +128,7 @@ class LlmAgentLoopToolTurnOutputTokenBudgetTest {
         assertThat(calledModels)
             .as("[V-TOK-01] 工具回合 output_tokens 计入后 turnTokens=1100 ≥ 90%×1000 → stop，无需第 3 次模型调用（漏工具回合时 300<900 → continue → 第 3 次调用）")
             .hasSize(2);
-        assertThat(state.messages().stream().map(m -> m.content()))
+        assertThat(state.rawMessages().stream().map(m -> m.content()))
             .as("[V-TOK-01] 工具回合计入后 budget stop（非 continue）→ 不得注入 nudge（CC query.ts:1316-1340 continue 才有 nudge）")
             .noneMatch(c -> c != null && c.contains("Keep working"));
     }

@@ -49,7 +49,7 @@ import static org.mockito.Mockito.when;
  * 而是 doRun 内每 run 一次决策 + 真实消息（state.appendMessage）尾随当前用户消息注入。本测试经
  * <b>真实 LlmAgentLoop.run</b>（mocked provider 首调 stop + mocked SkillCatalog/ToolRegistry）断言：
  * <ol>
- *   <li>全新会话首 run（resume=false）→ state.messages() 中出现一条 subtype=skill_listing 的
+ *   <li>全新会话首 run（resume=false）→ state.rawMessages() 中出现一条 subtype=skill_listing 的
  *       isMeta user 消息，且<b>紧随当前用户消息之后</b>（= CC processTextPrompt.ts:97
  *       {@code [userMessage, ...attachmentMessages]}）；</li>
  *   <li>内容形态 = CC messages.ts:4160-4170 渲染契约。</li>
@@ -148,7 +148,7 @@ class LlmAgentLoopSkillListingInjectTest {
             ProviderConfig.empty(), "test-model", null, null));
 
         // 定位注入消息（subtype=skill_listing）
-        List<ChatMessageDto> msgs = state.messages();
+        List<ChatMessageDto> msgs = state.rawMessages();
         int listingIdx = -1;
         int userIdx = -1;
         for (int i = 0; i < msgs.size(); i++) {
@@ -181,7 +181,7 @@ class LlmAgentLoopSkillListingInjectTest {
     }
 
     /**
-     * [finding-3 修复 2026-09-10] <b>消费层回归守卫</b>：真正塞进 {@code state.messages()} 的清单必须
+     * [finding-3 修复 2026-09-10] <b>消费层回归守卫</b>：真正塞进 {@code state.rawMessages()} 的清单必须
      * 只含本次 decision 的增量技能，而不是渲染全量 commands。
      *
      * <p><b>WHY（CLAUDE.md 规则 9）</b>：{@code injectSkillListingForRun} 用
@@ -238,7 +238,7 @@ class LlmAgentLoopSkillListingInjectTest {
         loop.setStreamContext(null, SESSION_KEY, "msg-1");
         AgentState s1 = loop.run(RunRequest.session("first query", sessionUuid, null,
             ProviderConfig.empty(), "test-model", null, null));
-        String listing1 = listingContent(s1.messages());
+        String listing1 = listingContent(s1.rawMessages());
         assertThat(listing1).as("首 run 注入整份").contains("commit").contains("review");
 
         // run 2：转录含历史（id a-1 ≠ msg-2）→ resume=true；全量新增 new-skill → 只应发增量
@@ -248,7 +248,7 @@ class LlmAgentLoopSkillListingInjectTest {
         AgentState s2 = loop.run(RunRequest.session("second query", sessionUuid, null,
             ProviderConfig.empty(), "test-model", null, null));
 
-        String listing2 = listingContent(s2.messages());
+        String listing2 = listingContent(s2.rawMessages());
         assertThat(listing2)
             .as("第二 run 只注入增量 new-skill —— 消费层若忽略 decision.names() 渲染全量则 RED")
             .isNotNull()
@@ -304,11 +304,11 @@ class LlmAgentLoopSkillListingInjectTest {
         ToolUseContext tuc = new ToolUseContext(agentId, sessionUuid, PermissionMode.DEFAULT,
             Map.of(), List.of(skillTool));
         LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null, tuc, QuerySource.USER, "test-model",
+            QueryParams.forLoop(state.rawMessages(), null, tuc, QuerySource.USER, "test-model",
                 null, null, null, null, null, new SubagentLoopDeps(ctx), ProviderConfig.empty()),
             state, new ArrayList<>());
 
-        String listing = listingContent(state.messages());
+        String listing = listingContent(state.rawMessages());
         assertThat(listing)
             .as("子代理（isMainLoop=false）必须拿到自己的 turn-0 skill_listing（CC attachments.ts:2672-2676）")
             .isNotNull()
@@ -374,7 +374,7 @@ class LlmAgentLoopSkillListingInjectTest {
         loop.setStreamContext(null, SESSION_KEY, "msg-1");
         AgentState s1 = loop.run(RunRequest.session("first query", sessionUuid, null,
             ProviderConfig.empty(), "test-model", null, null));
-        assertThat(listingContent(s1.messages())).as("零技能首 run → 不注入").isNull();
+        assertThat(listingContent(s1.rawMessages())).as("零技能首 run → 不注入").isNull();
 
         // run 2：转录含历史（id a-1 ≠ msg-2）→ resume=true + 技能出现 → 必须注入整份
         when(messageService.listBySession(SESSION_KEY)).thenReturn(List.of(prevAssistant, secondUser));
@@ -383,7 +383,7 @@ class LlmAgentLoopSkillListingInjectTest {
         AgentState s2 = loop.run(RunRequest.session("second query", sessionUuid, null,
             ProviderConfig.empty(), "test-model", null, null));
 
-        assertThat(listingContent(s2.messages()))
+        assertThat(listingContent(s2.rawMessages()))
             .as("技能出现后必须注入 —— 修复前该会话被永久 suppress（INITIALIZED 未置 → resume 落分支 3）")
             .isNotNull()
             .contains("late-skill");
@@ -417,7 +417,7 @@ class LlmAgentLoopSkillListingInjectTest {
         // run1：!resume + 无 Skill 工具 → 守卫补记 markInitialized（无注入）
         AgentState f1 = runOnce(freshSession, "msg-1", "first query",
             toolRegistryWithoutSkill(), fMsgSvc, freshCatalog);
-        assertThat(listingContent(f1.messages())).as("无 Skill 工具 → 不注入").isNull();
+        assertThat(listingContent(f1.rawMessages())).as("无 Skill 工具 → 不注入").isNull();
         assertThat(SkillListingSentRegistry.isInitialized(freshSession, ""))
             .as("fresh(!resume) 守卫必须补记 initialized（= CC suppressNext=false）").isTrue();
 
@@ -427,7 +427,7 @@ class LlmAgentLoopSkillListingInjectTest {
         when(fMsgSvc.listForResumeExcluding(anyList(), anyString())).thenReturn(List.of(assistantMsg("a-1", SESSION_KEY, "ans")));
         AgentState f2 = runOnce(freshSession, "msg-2", "second query",
             toolRegistryWithSkill(), fMsgSvc, freshCatalog);
-        assertThat(listingContent(f2.messages()))
+        assertThat(listingContent(f2.rawMessages()))
             .as("fresh 无工具 run 补记后技能出现 → 必须注入整份")
             .isNotNull().contains("late-skill");
 
@@ -448,7 +448,7 @@ class LlmAgentLoopSkillListingInjectTest {
         // run2：有 Skill 工具 + 技能 → 落 branch 3 suppress（转录已含上一进程清单），不得注入整份
         AgentState c2 = runOnce(coldSession, "msg-3", "third query",
             toolRegistryWithSkill(), cMsgSvc, coldCatalog);
-        assertThat(listingContent(c2.messages()))
+        assertThat(listingContent(c2.rawMessages()))
             .as("冷 resume 无工具 run 后首个 decide 仍 suppress（无条件补记会反向偏离 CC）").isNull();
     }
 
@@ -511,7 +511,7 @@ class LlmAgentLoopSkillListingInjectTest {
             List.of(), List.of(), null, false, false, null);
     }
 
-    /** 取 state.messages() 中 subtype=skill_listing 消息的 content（无则 null）。 */
+    /** 取 state.rawMessages() 中 subtype=skill_listing 消息的 content（无则 null）。 */
     private static String listingContent(List<ChatMessageDto> msgs) {
         for (ChatMessageDto m : msgs) {
             if (m != null && "skill_listing".equals(m.subtype())) {

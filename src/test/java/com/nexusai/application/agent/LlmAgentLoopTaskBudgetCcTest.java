@@ -202,7 +202,7 @@ class LlmAgentLoopTaskBudgetCcTest {
         //   tengu_auto_compact_succeeded + task_budget 结转（旧 3 参 queryLoop autoCompactor=null
         //   → 自动压缩跳过，断言必然失败，属陈旧 harness）。
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null,
+            QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null,
                 new TaskBudget(200_000),   // CC query.ts:197 {total} 输入契约；remaining loop 内维护

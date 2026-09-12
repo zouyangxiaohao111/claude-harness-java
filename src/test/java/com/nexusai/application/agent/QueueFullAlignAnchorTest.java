@@ -82,7 +82,7 @@ class QueueFullAlignAnchorTest {
 
         // [P0-1 机制切换] state 存原文 RAW + queuedOrigin（壳只在发送边界 wrapQueuedMessagesForApi 生成）；
         //   契约：busy-queued 原文 + queuedOrigin=busy-queued；turn-0 主 prompt（workload=null）原文不套壳。
-        List<String> userContents = state.messages().stream()
+        List<String> userContents = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(ChatMessageDto::content)
             .toList();
@@ -94,7 +94,7 @@ class QueueFullAlignAnchorTest {
             .as("turn-0 主 prompt（workload=null）后注入，走原文不套壳（对齐 CC handlePromptSubmit）")
             .isEqualTo("主问题");
         // busy-queued state 消息带 queuedOrigin=busy-queued + isMeta=false
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && "忙时追问".equals(m.content()))
             .findFirst())
             .as("busy-queued state 消息必须带 queuedOrigin=busy-queued（发送层据此包壳）+ isMeta=false")

@@ -141,7 +141,7 @@ class LlmAgentLoopTeammateHookIsMetaTest {
      * （而不是跑到重入安全阀）。
      *
      * @param firedHook 本次要触发的回注点（TASK_COMPLETED / TEAMMATE_IDLE）
-     * @return 注入 state.messages() 的、content 含 {@link #BLOCK_TEXT} 的 user 消息
+     * @return 注入 state.rawMessages() 的、content 含 {@link #BLOCK_TEXT} 的 user 消息
      */
     private List<ChatMessageDto> runTeammateTurnEnd(HookEventType firedHook) {
         boolean taskCompletedArmed = firedHook == HookEventType.TASK_COMPLETED;
@@ -227,7 +227,7 @@ class LlmAgentLoopTeammateHookIsMetaTest {
 
         assertThatCode(() -> LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 tucWithNotification(null).withAvailableTools(List.of(
                     TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
@@ -237,7 +237,7 @@ class LlmAgentLoopTeammateHookIsMetaTest {
             .doesNotThrowAnyException();
 
         LAST_RUN_STATE = state;
-        return state.messages().stream()
+        return state.rawMessages().stream()
             .filter(m -> Role.user.equals(m.role()) && m.content() != null && m.content().contains(BLOCK_TEXT))
             .toList();
     }

@@ -420,7 +420,7 @@ public final class CompactCommand {
             state.replaceMessages(normalized != null ? normalized : postCompact);
             log.info("[CompactCommand] /compact 压缩结果已 append-only 落库并写回会话状态: session={} 条数={}"
                     + "（boundary+summary 入历史 · 不删旧行 · 通道={}）",
-                sessionId != null ? sessionId : state.sessionId(), state.messages().size(),
+                sessionId != null ? sessionId : state.sessionId(), state.rawMessages().size(),
                 hasDirectChannel ? "messageService" : "state.compactPersistListener");
             return ApplyOutcome.PERSISTED;
         } catch (Exception e) {

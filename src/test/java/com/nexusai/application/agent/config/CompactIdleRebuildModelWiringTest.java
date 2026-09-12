@@ -141,7 +141,7 @@ class CompactIdleRebuildModelWiringTest {
         assertThat(ContextUsageCalculator.isAnthropic(mm, pm, cc.getModel()))
             .as("anthropic provider → 4 项和分派")
             .isTrue();
-        assertThat(Tokens.tokenCountWithEstimation(rebuilt.messages(),
+        assertThat(Tokens.tokenCountWithEstimation(rebuilt.rawMessages(),
                 ContextUsageCalculator.isAnthropic(mm, pm, cc.getModel())))
             .as("压缩前 token = Claude usage 三字段独立 → input+cacheRead+cacheCreate+output = 188374"
                 + "（若模型缺失 → 回落非 Anthropic → 只得 input+output=94625 = 少计）")
@@ -166,7 +166,7 @@ class CompactIdleRebuildModelWiringTest {
         assertThat(ContextUsageCalculator.isAnthropic(mm, pm, cc.getModel()))
             .as("deepseek provider.type=openai_compatible → 非 Anthropic（prompt_tokens 已含 cache hit）")
             .isFalse();
-        assertThat(Tokens.tokenCountWithEstimation(rebuilt.messages(),
+        assertThat(Tokens.tokenCountWithEstimation(rebuilt.rawMessages(),
                 ContextUsageCalculator.isAnthropic(mm, pm, cc.getModel())))
             .as("deepseek 求和 = input 93749 + output 876 = 94625（4 项和 188374 会把 cache read 双计）")
             .isEqualTo(DEEPSEEK_INPUT_OUTPUT);
@@ -224,7 +224,7 @@ class CompactIdleRebuildModelWiringTest {
         ProviderMapper pm = mock(ProviderMapper.class);
         // 唯一权威：模型不可得 → false（非 Anthropic），与 CompactConversation.resolveAnthropic 同向
         assertThat(ContextUsageCalculator.isAnthropic(mm, pm, cc.getModel())).isFalse();
-        assertThat(Tokens.tokenCountWithEstimation(rebuilt.messages(),
+        assertThat(Tokens.tokenCountWithEstimation(rebuilt.rawMessages(),
                 ContextUsageCalculator.isAnthropic(mm, pm, cc.getModel())))
             .as("回落方向与唯一权威逐值一致：非 Anthropic → input+output（不是 4 项和）")
             .isEqualTo(DEEPSEEK_INPUT_OUTPUT);
@@ -342,7 +342,7 @@ class CompactIdleRebuildModelWiringTest {
                                                                AgentState state,
                                                                String model) {
         CompactCommand.CompactCommandContext commandCtx = config.buildCompactCommandContext(
-            state.messages(), SESSION, AGENT, model,
+            state.rawMessages(), SESSION, AGENT, model,
             null,   // reactiveCompactor
             null,   // streamCompactSummary
             null,   // sessionMemoryService

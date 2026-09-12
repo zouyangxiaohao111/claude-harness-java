@@ -67,7 +67,7 @@ class BlockingMeasurementSourceCcTest {
         List<ChatMessageDto>[] sentHistory = new List[1];
         LlmProvider provider = normalCompletingProvider(sentHistory);
         AgentState state = stateWithOneUserMessage();
-        List<ChatMessageDto> baseChain = new ArrayList<>(state.messages());
+        List<ChatMessageDto> baseChain = new ArrayList<>(state.rawMessages());
 
         // memoryPrefetcher 返回 null 句柄 → 无注入（CC 无相关记忆场景）
         MemoryPrefetcher prefetcher = Mockito.mock(MemoryPrefetcher.class);
@@ -78,7 +78,7 @@ class BlockingMeasurementSourceCcTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
@@ -100,7 +100,7 @@ class BlockingMeasurementSourceCcTest {
         List<ChatMessageDto>[] sentHistory = new List[1];
         LlmProvider provider = normalCompletingProvider(sentHistory);
         AgentState state = stateWithOneUserMessage();
-        List<ChatMessageDto> baseChain = new ArrayList<>(state.messages());
+        List<ChatMessageDto> baseChain = new ArrayList<>(state.rawMessages());
 
         // ── relevant_memories 预取注入（对齐 CC query.ts:1599-1614 consume → 当前 turn 注入）──
         MemoryPrefetcher prefetcher = Mockito.mock(MemoryPrefetcher.class);
@@ -117,7 +117,7 @@ class BlockingMeasurementSourceCcTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),

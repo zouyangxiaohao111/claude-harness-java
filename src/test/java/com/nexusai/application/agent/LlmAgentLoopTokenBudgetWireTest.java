@@ -86,7 +86,7 @@ class LlmAgentLoopTokenBudgetWireTest {
             .as("用户 prompt '+500k' 必须解析为预算 500000 写入 AgentState（REPL.tsx:2895 parseTokenBudget(input)）")
             .isEqualTo(500_000);
         // 2) checkTokenBudget 走 continue：nudge（CC utils/tokenBudget.ts:66-73 千分位文案）注入 messages
-        assertThat(state.messages().stream().map(m -> m.content()))
+        assertThat(state.rawMessages().stream().map(m -> m.content()))
             .as("budget=500000 且 turnTokens<90% → continue 注入 nudge（CC query.ts:1330 token_budget_continuation）")
             .anyMatch(c -> c != null && c.contains("Keep working") && c.contains("/ 500,000"));
         // 3) 主线程（agentId=sessionId 归一为 null）不得 MAX_OUTPUT_TOKENS 停机
@@ -112,7 +112,7 @@ class LlmAgentLoopTokenBudgetWireTest {
         assertThat(state.exitReason())
             .as("budget=null → stop(null) 不得 MAX_OUTPUT_TOKENS 停机（CC query.ts:1312 stop(null)=正常 completed）")
             .isNotEqualTo(AgentState.ExitReason.MAX_OUTPUT_TOKENS);
-        assertThat(state.messages().stream().anyMatch(m -> m.role() == Role.assistant))
+        assertThat(state.rawMessages().stream().anyMatch(m -> m.role() == Role.assistant))
             .as("stop(null) 不 break → loop 继续 → provider 被真实调用并产出 assistant 消息")
             .isTrue();
     }

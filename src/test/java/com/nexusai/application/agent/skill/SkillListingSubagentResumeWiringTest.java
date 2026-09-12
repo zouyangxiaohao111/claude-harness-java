@@ -88,7 +88,7 @@ class SkillListingSubagentResumeWiringTest {
 
         LlmAgentLoop.queryLoop(h.params(state), state, new ArrayList<>(), /*skillListingResume=*/true);
 
-        assertThat(listingContent(state.messages()))
+        assertThat(listingContent(state.rawMessages()))
             .as("续跑 run 不得重发整份清单（CC 同 agentId sent 非空 → newSkills 空 → 不注入，"
                 + "attachments.ts:2799-2803）；恒 resume=false 的实现会在此注入整份 → RED")
             .isNull();
@@ -103,7 +103,7 @@ class SkillListingSubagentResumeWiringTest {
         AgentState state = h.subagentState();
         LlmAgentLoop.queryLoop(h.params(state), state, new ArrayList<>(), /*skillListingResume=*/false);
 
-        assertThat(listingContent(state.messages()))
+        assertThat(listingContent(state.rawMessages()))
             .as("全新子代理（新 agentId · sent 空）必须得到自己的首份整份清单 "
                 + "（CC attachments.ts:2672-2676「subagents get their own turn-0 listing」）")
             .isNotNull()
@@ -186,7 +186,7 @@ class SkillListingSubagentResumeWiringTest {
             ToolUseContext tuc = ToolUseContext.of(AGENT_ID, SESSION_KEY, PermissionMode.DEFAULT,
                 List.of(skillTool));
             return QueryParams.forLoop(
-                state.messages(), "sys", tuc,
+                state.rawMessages(), "sys", tuc,
                 QuerySource.SUBAGENT, "test-model", 4,
                 null, null, null, null,
                 new SubagentLoopDeps(contextFactory.shared(null)), ProviderConfig.empty());

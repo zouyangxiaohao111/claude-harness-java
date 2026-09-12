@@ -87,7 +87,7 @@ class LlmAgentLoopPerTurnModelUpdateTest {
         // ── 4. 执行 queryLoop ──
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(
@@ -160,7 +160,7 @@ class LlmAgentLoopPerTurnModelUpdateTest {
         // ── 执行 queryLoop ──
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(
@@ -265,7 +265,7 @@ class LlmAgentLoopPerTurnModelUpdateTest {
         // ── 4. 执行 queryLoop（modelName=vision-model，模拟 vision 子代理；state 未 preset currentModel）──
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(capturingTool)),

@@ -33,9 +33,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("[P1-6-READ-2] invoked_skills attachment 类型 + 渲染")
 class AttachmentRenderTest {
 
-    /** 空 messagesForLlm（对齐 LlmAgentLoop 组装入口: state.messages() 为起点）. */
+    /** 空 messagesForLlm（对齐 LlmAgentLoop 组装入口: state.rawMessages() 为起点）. */
     private List<ChatMessageDto> baseMessages(AgentState state) {
-        return new ArrayList<>(state.messages());
+        return new ArrayList<>(state.rawMessages());
     }
 
     @Test

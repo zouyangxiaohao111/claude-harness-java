@@ -224,8 +224,8 @@ class AutoCompactTrackingStateTest {
             .isGreaterThan(0);
         assertThat(source)
             .as("压缩成功后必须把压缩结果回填为 messagesForQuery（CC query.ts:666）——漏掉即反复压缩")
-            .contains("messagesForQuery = new ArrayList<>(state.messages());");
-        assertThat(source.indexOf("messagesForQuery = new ArrayList<>(state.messages());"))
+            .contains("messagesForQuery = new ArrayList<>(state.rawMessages());");
+        assertThat(source.indexOf("messagesForQuery = new ArrayList<>(state.rawMessages());"))
             .as("回填必须发生在压缩成功分支内（persistCompactedMessages 之后）")
             .isGreaterThan(persistIdx);
     }

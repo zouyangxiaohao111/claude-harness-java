@@ -244,7 +244,7 @@ class CachedMcBoundaryWiringCcTest {
         LlmAgentLoop.queryLoop(forLoopParams(ctx, state), state, new ArrayList<>());
 
         // 流正常完成（assistant 消息已提交）→ 流结束点必须已消费 pendingCacheEdits
-        assertThat(state.messages().stream().anyMatch(m -> m.role() == Role.assistant))
+        assertThat(state.rawMessages().stream().anyMatch(m -> m.role() == Role.assistant))
             .as("完成 provider 必须产出 assistant 消息（流正常完成前置）").isTrue();
         assertThat(MicroCompactor.consumePendingCacheEdits())
             .as("MISS-1: LlmAgentLoop 流结束点必须调用 maybeCreateMicrocompactBoundaryMessage 消费模块态（query.ts:866-892 生产接线）")
@@ -448,7 +448,7 @@ class CachedMcBoundaryWiringCcTest {
             @Override public boolean isMainLoop() { return true; }
         };
         return QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());

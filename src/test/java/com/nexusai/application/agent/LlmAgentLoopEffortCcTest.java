@@ -87,7 +87,7 @@ class LlmAgentLoopEffortCcTest {
         };
 
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null,
+            QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
@@ -136,7 +136,7 @@ class LlmAgentLoopEffortCcTest {
         };
 
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null,
+            QueryParams.forLoop(state.rawMessages(), null,
                 // [session-id-short] of(agentId, sessionId)：forkSessionId 是 short sessionId，forkAgentId 是 UUID agentId
                 ToolUseContext.of(forkAgentId, forkSessionId),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
@@ -181,7 +181,7 @@ class LlmAgentLoopEffortCcTest {
         };
 
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null,
+            QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
                 deps, ProviderConfig.empty()),

@@ -301,7 +301,7 @@ public class CommandRegistrationConfigCInfoSettings {
                 log.warn("[CommandRegistrationConfigCInfoSettings] /think-back 会话 {} 无 AgentState（无进行中循环）", sessionId);
                 return;
             }
-            List<String> thinkingBlocks = state.messages().stream()
+            List<String> thinkingBlocks = state.rawMessages().stream()
                 .filter(m -> m.role() == Role.assistant)
                 .filter(m -> m.reasoning() != null && !m.reasoning().isBlank())
                 .map(ChatMessageDto::reasoning)

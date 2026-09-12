@@ -162,7 +162,7 @@ class LlmAgentLoopModelFallbackPerCallTest {
         RunRequest req = RunRequest.session("question", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null,
             ProviderConfig.empty(), OPUS_ELIGIBLE, null, null, PER_CALL_A, null);
         QueryParams queryParams = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, OPUS_ELIGIBLE, null, null,

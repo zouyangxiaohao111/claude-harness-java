@@ -108,7 +108,7 @@ class LlmAgentLoopModelFallbackTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(
@@ -121,11 +121,11 @@ class LlmAgentLoopModelFallbackTest {
         assertThat(calledModels)
             .as("重试必须发生（2 次 provider 调用）且第 2 次用 fallbackModel（CC query.ts:896 currentModel=fallbackModel）")
             .containsExactly("test-model", "fallback-model");
-        assertThat(state.messages().stream().anyMatch(m ->
+        assertThat(state.rawMessages().stream().anyMatch(m ->
                 m.role() == Role.tool && m.content() != null && m.content().contains("Model fallback triggered")))
             .as("orphan tool_use 必须造 is_error tool_result（CC yieldMissingToolResultBlocks）")
             .isTrue();
-        assertThat(state.messages().stream().anyMatch(m ->
+        assertThat(state.rawMessages().stream().anyMatch(m ->
                 m.role() == Role.system
                     && "informational".equals(m.subtype())
                     && "warning".equals(m.level())
@@ -177,7 +177,7 @@ class LlmAgentLoopModelFallbackTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(
                     java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(java.util.List.of(
@@ -188,7 +188,7 @@ class LlmAgentLoopModelFallbackTest {
 
         // ── 断言：warning 内容用显示名（CC model.ts:395-412 renderModelName）──
         // [P-27] 改读 role=system 消息（旧 model_fallback_warning attachment 已删, query.ts:945-948）
-        String warningContent = state.messages().stream()
+        String warningContent = state.rawMessages().stream()
             .filter(m -> m.role() == Role.system && "warning".equals(m.level()))
             .map(ChatMessageDto::content)
             .findFirst().orElse(null);

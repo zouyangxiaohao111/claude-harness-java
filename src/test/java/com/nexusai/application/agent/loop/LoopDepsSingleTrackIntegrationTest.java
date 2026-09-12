@@ -140,7 +140,7 @@ class LoopDepsSingleTrackIntegrationTest {
         };
 
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null, baseTuc,
+            QueryParams.forLoop(state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
             state, new ArrayList<>());

@@ -96,7 +96,7 @@ class TokenBudgetMainThreadContinuationTest {
         assertThat(state.turnCount())
             .as("主线程必须至少跑满 1 轮 LLM 调用（恒 stop 首迭代 break 时无任何调用）")
             .isGreaterThanOrEqualTo(1);
-        assertThat(state.messages().stream().anyMatch(m -> m.role() == com.nexusai.model.session.dto.Role.assistant))
+        assertThat(state.rawMessages().stream().anyMatch(m -> m.role() == com.nexusai.model.session.dto.Role.assistant))
             .as("loop 必须真实产出 assistant 消息（停机缺陷时 provider 从未被调用 -> 无 assistant）")
             .isTrue();
     }

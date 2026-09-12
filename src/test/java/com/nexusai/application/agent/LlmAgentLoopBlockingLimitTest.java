@@ -94,7 +94,7 @@ class LlmAgentLoopBlockingLimitTest {
         // ── 4. 驱动 loop（[H7-arch Phase 5-2 B1] 收敛签名：queryLoop(loop.QueryParams, state, uuids)）──
         LoopResult result = LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
@@ -107,7 +107,7 @@ class LlmAgentLoopBlockingLimitTest {
         // provider.stream 必须 0 次调用（loop 已调用 provider.type()，故不能用 verifyNoInteractions）
         verify(provider, never()).stream(
             any(), anyString(), anyList(), anyList(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
-        assertThat(state.messages().get(state.messages().size() - 1).content())
+        assertThat(state.rawMessages().get(state.rawMessages().size() - 1).content())
             .as("blocking-limit 必须 append PROMPT_TOO_LONG assistant 错误消息（CC createAssistantAPIErrorMessage）")
             .contains("too long");
     }
@@ -154,7 +154,7 @@ class LlmAgentLoopBlockingLimitTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.COMPACT, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),

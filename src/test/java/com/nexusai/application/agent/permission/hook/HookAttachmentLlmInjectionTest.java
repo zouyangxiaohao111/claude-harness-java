@@ -32,7 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ul>
  *   <li>hook_user_message → <b>不走 attachment 渲染</b>（RE-THINK: CC result.message → 普通
  *       user 消息, 生产两端已改普通消息通道结算: PreToolUse → newMessages; 非 PreToolUse →
- *       state.messages() 一次性; 渲染 case 已删除 AgentLoopContext:2175）</li>
+ *       state.rawMessages() 一次性; 渲染 case 已删除 AgentLoopContext:2175）</li>
  *   <li>hook_blocking_error → {@code "<system-reminder>\n{hookName} hook blocking error from command:
  *       "{command}": {content}\n</system-reminder>"}（prompt-align bd982d7e0 补 command 段；
  *       batch1-A 补 system-reminder 包裹，对齐 CC messages.ts:4530-4538）</li>
@@ -52,9 +52,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("[H8-v2-fix] hook attachment 消费者侧 LLM 注入")
 class HookAttachmentLlmInjectionTest {
 
-    /** 空 messagesForLlm（对齐 LlmAgentLoop 组装入口: state.messages() 为起点）. */
+    /** 空 messagesForLlm（对齐 LlmAgentLoop 组装入口: state.rawMessages() 为起点）. */
     private List<ChatMessageDto> baseMessages(AgentState state) {
-        return new ArrayList<>(state.messages());
+        return new ArrayList<>(state.rawMessages());
     }
 
     @Test
@@ -63,7 +63,7 @@ class HookAttachmentLlmInjectionTest {
         // WHY: RE-THINK 修正——hook message 是普通 user 消息（CC sessionStart.ts:141-142
         //      hookMessages → initialMessages; toolHooks.ts:478-480 → resultingMessages），
         //      <b>不是 attachment 通道</b>。两端生产已改普通消息通道结算（PreToolUse →
-        //      newMessages; 非 PreToolUse → state.messages() 一次性 user 消息），本渲染器
+        //      newMessages; 非 PreToolUse → state.rawMessages() 一次性 user 消息），本渲染器
         //      （maybeInjectHookAttachments）对 hook_user_message attachment 必须返回原样
         //      （渲染 case 已删除 → default → null）。若此处注入，说明有残留生产端仍把 hook
         //      message 包成 attachment → 每轮重渲染成 isMeta 消息 → 双发污染。
@@ -207,7 +207,7 @@ class HookAttachmentLlmInjectionTest {
         //      （:3488-3490 wrapInSystemReminder），② 前缀逐字 `${hookName} hook success: `，
         //      ③ isMeta:true（元消息：不落用户可见面）。
         //      [跨读侧后果] isMeta=true 是同批 dba36e1 已定的归属口径：本注入消息只进 messagesForLlm
-        //      副本（LlmAgentLoop:5711），不入 state.messages() ⇒ AgentState.lastUserMessageId()
+        //      副本（LlmAgentLoop:5711），不入 state.rawMessages() ⇒ AgentState.lastUserMessageId()
         //      （:425 `!m.isMeta()` 过滤）与 MessageService.countNonMetaMessages 双双不选中/不计数。
         AgentState state = new AgentState("system-prompt");
         state.appendAttachment(AttachmentMessageDto.hookSuccess(
@@ -322,11 +322,11 @@ class HookAttachmentLlmInjectionTest {
     }
 
     @Test
-    @DisplayName("[batch1-A] 渲染结果全部 isMeta=true 且不入 state.messages()（跨读侧：lastUserMessageId / 落库条数均不选中）")
+    @DisplayName("[batch1-A] 渲染结果全部 isMeta=true 且不入 state.rawMessages()（跨读侧：lastUserMessageId / 落库条数均不选中）")
     void renderedHookMessages_areMetaAndNeverEnterStateMessages() {
         // WHY (规则九 · 为什么重要): 渲染产物是 LLM 请求面专供副本（LlmAgentLoop:5711
         //   `messagesForLlm = maybeInjectHookAttachments(...)`，随后仅用于 ModelRequest 组装
-        //   :6127），**不得**回流 state.messages()。若回流，两件事会坏：
+        //   :6127），**不得**回流 state.rawMessages()。若回流，两件事会坏：
         //   ① AgentState.lastUserMessageId()（:425 遍历 messages 取最后 `!isMeta()` 的 user）
         //      会把 hook 文本当「最后一条真实用户消息」→ 事件/落库 userMessageId 归属错乱；
         //   ② MessageService.countNonMetaMessages（DB 侧非元消息条数，驱动轨迹条数徽标）虚高。
@@ -358,8 +358,8 @@ class HookAttachmentLlmInjectionTest {
             .as("hook 渲染消息必须 isMeta=true（CC :4536/:4554/:4566）")
             .allSatisfy(m -> assertThat(m.isMeta()).isTrue());
 
-        // ③ 读侧不受污染：state.messages() 未被追加，lastUserMessageId() 仍锚真实用户消息
-        assertThat(state.messages()).as("渲染产物不得回流 state.messages()").hasSize(1);
+        // ③ 读侧不受污染：state.rawMessages() 未被追加，lastUserMessageId() 仍锚真实用户消息
+        assertThat(state.rawMessages()).as("渲染产物不得回流 state.rawMessages()").hasSize(1);
         assertThat(state.lastUserMessageId())
             .as("isMeta 渲染消息不得被 lastUserMessageId() 选中（AgentState:425 !isMeta 过滤）")
             .isEqualTo("u0");

@@ -29,7 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>: Read pdf pages 等工具返回 {@code newMessages}
  * （isMeta image user 消息，20 image block）时，若 {@code ToolResultApplier.apply} 在工具执行
- * dispatch 期就 {@code state.messages().addAll(tr.newMessages())}（早于 handleToolCallsTurn step 3
+ * dispatch 期就 {@code state.rawMessages().addAll(tr.newMessages())}（早于 handleToolCallsTurn step 3
  * 才 append 的 tool_result），state.messages 顺序变成
  * {@code [assistant(tool_calls), user(isMeta 页图), tool(tool_result)]} → provider 原序透传 →
  * assistant tool_calls 后夹 image user 消息 → Anthropic 400 "assistant message with tool_calls must
@@ -108,7 +108,7 @@ class ToolResultNewMessagesOrderingTest {
         assertThat(result).as("工具轮返回 continue 让外层 loop 继续").isEqualTo("continue");
 
         // ── 5. 断言顺序：assistant(tool_calls) → tool(tool_result) → user(isMeta newMessages) ──
-        List<ChatMessageDto> msgs = state.messages();
+        List<ChatMessageDto> msgs = state.rawMessages();
         // 意图锚 5a：倒数第 3 条 = 含 toolCalls 的 assistant（Read）
         ChatMessageDto assistant = msgs.get(msgs.size() - 3);
         assertThat(assistant.role()).as("倒数第 3 条必须是 assistant").isEqualTo(Role.assistant);
@@ -173,7 +173,7 @@ class ToolResultNewMessagesOrderingTest {
             null, null, null, null, null);
         assertThat(result).isEqualTo("continue");
 
-        List<ChatMessageDto> msgs = state.messages();
+        List<ChatMessageDto> msgs = state.rawMessages();
         assertThat(msgs).hasSize(2);
         assertThat(msgs.get(0).role()).isEqualTo(Role.assistant);
         assertThat(msgs.get(1).role()).isEqualTo(Role.tool);

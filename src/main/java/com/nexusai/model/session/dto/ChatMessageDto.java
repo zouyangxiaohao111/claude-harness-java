@@ -215,7 +215,7 @@ public record ChatMessageDto(
     // WHY（P0-1 OD-1/OD-3 方案 A「存原文+标记列+发送时包壳」）：mid-turn 注入的排队用户消息
     //   来源标记，state → DB（V67 queued_origin 列）→ resume 全程贯穿；LlmAgentLoop 发送层
     //   wrapQueuedMessagesForApi 在 ModelRequest 构造前按标记对 user 消息生成带壳副本（只改
-    //   API-bound 副本，不污染 state.messages()）。
+    //   API-bound 副本，不污染 state.rawMessages()）。
     //   取值（scope 收窄，§4.1）：
     //     'busy-queued'        = 真实用户工作途中排队消息（唯一落库标记；发送层中文提醒壳【Java 独有】）；
     //     'task-notification'  = mid-turn 后台命令完成通知（不落库，发送层 TASK_NOTIFICATION_PREFIX 壳）；

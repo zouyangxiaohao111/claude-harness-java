@@ -149,7 +149,7 @@ class LlmAgentLoopOdD2DrainSuppressionTest {
             @Override public boolean isMainLoop() { return true; }
         };
         QueryParams params = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), sid)
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", 8, null, null, null, null,
@@ -160,7 +160,7 @@ class LlmAgentLoopOdD2DrainSuppressionTest {
         // ① 确有 3 次模型调用（截断恢复 → 真工具轮 → 收尾文本）
         assertThat(callCount.get()).as("截断恢复→工具轮→收尾 = 3 次 LLM 调用").isEqualTo(3);
         // ② 场景完整性：恢复消息确实出现过（证明走的是截断恢复路径，非纯工具链误配）
-        assertThat(state.messages().stream().map(ChatMessageDto::content))
+        assertThat(state.rawMessages().stream().map(ChatMessageDto::content))
             .as("截断恢复消息已追加（证明 max_tokens 恢复路径真实发生）")
             .contains(RESUME_TEXT);
         // ③ OD-D2 核心：恢复 continue 后的下一模型调用（call1）时，busy-queued 必须仍在队列
@@ -168,7 +168,7 @@ class LlmAgentLoopOdD2DrainSuppressionTest {
         assertThat(queueAtCall).as("每次模型调用的队列 size（call0 空 → call1 应仍有 busy → call2 已 drain）")
             .containsExactly(0, 1, 0);
         // ④ 保留红线：真工具轮后 drain 注入 state（busy 恰一次）
-        long busyInState = state.messages().stream()
+        long busyInState = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && m.content() != null && m.content().contains(BUSY_TEXT))
             .count();
         assertThat(busyInState).as("busy-queued 最终注入 state 恰一次（真工具轮后 drain，无双发）").isEqualTo(1);

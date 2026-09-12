@@ -118,14 +118,21 @@ class LlmAgentLoopSnipMicroWiringTest {
         //   → 被裁消息回到模型上下文）。该断言编码的是**旧的 (A) 语义**，与用户拍板相反：
         //   关掉开关只应禁止「产生新 snip」，不应让已执行过的 snip 失效 —— 历史 snip_boundary 与
         //   compact boundary 同为「同类历史裁剪标记」，后者的剥离本就恒定无门，二者必须对称。
-        //   ⇒ 门关时 state（本仓扮演 CC messagesForQuery 角色）仍应剔除 removedUuids。
-        assertThat(ids(state))
-            .as("[N2] 回放门不受开关门控 → 历史 snip 的 u0..u9 仍被剔除（决策 B：不复活）")
+        //   ⇒ 门关时**模型视图**仍应剔除 removedUuids。
+        // [D10 双视图 2026-09-12] 回放门的作用面 = state.modelView()（派生），**不再**写回 state：
+        //   改造前该断言查 state.messages()（入口写回后 = 投影面），双视图后 state 是**全量**，
+        //   投影只体现在 modelView() 上。两个断言一并对齐（同一时刻并存、互不影响）。
+        assertThat(ids(state.modelView()))
+            .as("[N2] 回放门不受开关门控 → 模型视图不含历史 snip 的 u0..u9（决策 B：不复活）")
             .doesNotContain("u0", "u9");
+        assertThat(ids(state))
+            .as("[D10 双视图] rawMessages() 全量保活 → 被 snip 的 u0..u9 仍在内存全量里"
+                + "（改造前被入口 replaceMessages 破坏性砍掉，只剩 DB）")
+            .contains("u0", "u9");
         assertThat(ids(state))
             .as("[N2] 执行门仍生效：未产生**新** boundary（历史 boundary 原样保留，不被重复执行/改写）")
             .contains("snip-boundary-1");
-        long boundaryCount = state.messages().stream()
+        long boundaryCount = state.rawMessages().stream()
             .filter(m -> m.subtype() != null && "snip_boundary".equals(m.subtype())).count();
         assertThat(boundaryCount)
             .as("[N2] 门关 → snip 步骤被 feature 门跳过（CC query.ts:401），boundary 数量不增")
@@ -156,13 +163,17 @@ class LlmAgentLoopSnipMicroWiringTest {
         //   SingleSourceTest 还会 @AfterEach 复位它），只有该槽被生产 @Bean 写入时入口回放投影才会执行。
         //   而生产 application.yml:337 `history-snip: true` → 槽被写活 → 生产里 state **本来就是**被
         //   投影过的（LlmAgentLoop 入口块的既有注释亦明写「被 snip 消息已在入口 boundary 剥离块从
-        //   state.messages() 移除……不是 state 仍留着它们」）。即旧断言 = 测试/生产分叉。
+        //   state.rawMessages() 移除……不是 state 仍留着它们」）。即旧断言 = 测试/生产分叉。
         //   [N2] 回放门去门控后两边统一：state 恒为投影面（本仓 state 扮演 CC messagesForQuery 角色）。
         //   B5 d-2「不做 DB 层持久化删除」的意图不变 —— removedUuids 消息仍完整留在 **DB**
         //   （append-only，前端/轨迹直读 DB），该契约由落库侧测试覆盖，不应由内存 state 断言。
-        assertThat(ids(state))
-            .as("[N2] 回放门恒定执行 → state（messagesForQuery 角色）不含被 snip 的 u0..u9")
+        // [D10 双视图 2026-09-12] 投影作用面 = modelView()（派生）；state（全量）保活被 snip 的消息。
+        assertThat(ids(state.modelView()))
+            .as("[D10 双视图] 模型视图不含被 snip 的 u0..u9（回放门恒定执行）")
             .doesNotContain("u0", "u9");
+        assertThat(ids(state))
+            .as("[D10 双视图] rawMessages() 保活被 snip 的 u0..u9（append-only，不再被入口写回砍掉）")
+            .contains("u0", "u9");
         assertThat(ids(state))
             .as("snip 后 boundary 保留在 state（输入含 boundary，真源 kept 含 boundary，snipCompact.ts:128-139）")
             .contains("snip-boundary-1");
@@ -369,7 +380,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             .as("B1+B5 d-2: microcompact 结果必须替换请求级 messagesForQuery（m2 被 micro 丢弃后不应进 LLM 请求）· CC query.ts:415")
             .doesNotContain("m2");
         assertThat(ids(state))
-            .as("B5 d-2: microcompact 不再持久化替换 state.messages()（state 保留全量，REPL/transcript 保留 m2）")
+            .as("B5 d-2: microcompact 不再持久化替换 state.rawMessages()（state 保留全量，REPL/transcript 保留 m2）")
             .contains("m2");
     }
 
@@ -422,11 +433,14 @@ class LlmAgentLoopSnipMicroWiringTest {
         // ⚠️ [N2 2026-09-11] 旧断言为 `contains("u0","u9")`（as「B5 d-2: state 保留全量」）——
         //   同 [snipGateOn_runsSnip] 的注释：它只在测试 JVM 里成立（旧门② 静态槽默认 ALL_DISABLED），
         //   而生产 application.yml:337 `history-snip: true` 早已把槽写活 → 生产入口**本就**在投影。
-        //   [N2] 回放门去门控后两侧统一：state = 投影面（本仓 state 扮演 CC messagesForQuery 角色）。
-        //   B5 d-2 的本意（不持久化删除）说的是 **DB**，其契约由落库侧测试覆盖。
-        assertThat(ids(state))
-            .as("[N2] state（messagesForQuery 角色）不含被 snipped 的 u0..u9 —— 回放门恒定执行")
+        //   [N2] 回放门去门控后两侧统一。B5 d-2 的本意（不持久化删除）说的是 **DB**，其契约由落库侧测试覆盖。
+        // [D10 双视图 2026-09-12] 投影作用面 = modelView()（派生、不写回）；state（全量）保活。
+        assertThat(ids(state.modelView()))
+            .as("[D10 双视图] 模型视图不含被 snipped 的 u0..u9 —— 回放门恒定执行")
             .doesNotContain("u0", "u9");
+        assertThat(ids(state))
+            .as("[D10 双视图] rawMessages() 全量保活被 snipped 的 u0..u9（append-only 语义）")
+            .contains("u0", "u9");
         assertThat(histories)
             .as("LLM 至少被调用一次（history 被捕获）")
             .isNotEmpty();
@@ -572,12 +586,12 @@ class LlmAgentLoopSnipMicroWiringTest {
     @DisplayName("nudge 判据对齐 CCB: snip 大幅剔除后模型可见 <阈值 → 不注入（state 全量仍 ≥阈值 · CCB query.ts:1894）")
     void nudgeAfterLargeSnip_skipsWhenVisibleBelowThreshold() {
         // WHY: [snip-nudge-count 修复] CCB 真源 query.ts:1894 nudge 判据 = messagesForQuery(已 snip 投影)
-        //   .concat(assistantMessages, toolResults) —— 数「模型可见」消息；Java 旧判据数 state.messages()
+        //   .concat(assistantMessages, toolResults) —— 数「模型可见」消息；Java 旧判据数 state.rawMessages()
         //   全量（B5 d-2 起 snip 只做请求级投影、state 保留被 snip 消息不删）→ 模型越 snip 判据不降、
         //   达阈值后每轮重复注入 nudge（用户实测「一直提示」缺陷）。
         //   本测试构造 state=31 条（30 "hi" user u0..u29 + boundary removedUuids=u0..u19）≥ 阈值 30 →
         //   旧判据会注入；但 snip 投影后模型可见 = boundary+u20..u29 = 11 条 < 30 → 新判据（对齐 CCB）
-        //   必须不注入。RED teeth: 判据改回 state.messages() → 本测试 fail。
+        //   必须不注入。RED teeth: 判据改回 state.rawMessages() → 本测试 fail。
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         List<ChatMessageDto> msgs = new ArrayList<>(largeMessages(30));
         msgs.add(snipBoundary("snip-boundary-nudge", removedUuids(0, 20)));
@@ -620,14 +634,14 @@ class LlmAgentLoopSnipMicroWiringTest {
             @Override public boolean isMainLoop() { return true; }
         };
         return QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             source, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
     }
 
     private static List<String> ids(AgentState state) {
-        return state.messages().stream()
+        return state.rawMessages().stream()
             .map(m -> m.id() != null ? m.id() : "").toList();
     }
 

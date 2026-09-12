@@ -129,7 +129,7 @@ class ChannelInjectionUntrustedBranchTest {
         AgentState state = loop.run(RunRequest.forTest("main-prompt", "test-model", null));
 
         // 机制切换：state 存原文 RAW + queuedOrigin 标记（包壳已移发送边界，state 不再带壳）
-        ChatMessageDto stateChannel = state.messages().stream()
+        ChatMessageDto stateChannel = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> m.queuedOrigin() != null && m.queuedOrigin().startsWith("channel"))
             .findFirst().orElse(null);
@@ -179,7 +179,7 @@ class ChannelInjectionUntrustedBranchTest {
         AgentState state = loop.run(RunRequest.forTest("main", "test-model", null));
 
         // state：channel 消息 isMeta=true（CC metaProp：origin 非 undefined → isMeta:true）
-        ChatMessageDto stateChannel = state.messages().stream()
+        ChatMessageDto stateChannel = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> m.queuedOrigin() != null && m.queuedOrigin().startsWith("channel"))
             .findFirst().orElse(null);
@@ -212,7 +212,7 @@ class ChannelInjectionUntrustedBranchTest {
         AgentState state = loop.run(RunRequest.forTest("main", "test-model", null));
 
         // state：turn-0 prompt 原文（workload=null 非排队 → 不套 CC queued human 壳，不包壳）
-        ChatMessageDto plainState = state.messages().stream()
+        ChatMessageDto plainState = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> "plain-user-prompt".equals(m.content()))
             .findFirst().orElse(null);
@@ -248,7 +248,7 @@ class ChannelInjectionUntrustedBranchTest {
         AgentState state = loop.run(RunRequest.forTest("hello", "test-model", null));
 
         // state：原文 RAW + queuedOrigin=task-notification（包壳在发送边界）
-        ChatMessageDto notifState = state.messages().stream()
+        ChatMessageDto notifState = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> "notif-1".equals(m.content()))
             .findFirst().orElse(null);

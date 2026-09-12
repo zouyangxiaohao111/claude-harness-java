@@ -189,7 +189,7 @@ class SnipToolTest {
                 ctxWithMessages(history)));
         ChatMessageDto boundary = result.newMessages().get(0);
 
-        // boundary 追加到会话历史（ToolResultApplier.apply → state.messages().addAll）
+        // boundary 追加到会话历史（ToolResultApplier.apply → state.rawMessages().addAll）
         history.add(boundary);
 
         // LlmAgentLoop 下轮 snip 步骤（LlmAgentLoop.java:3761-3787，CC query.ts:401-410）

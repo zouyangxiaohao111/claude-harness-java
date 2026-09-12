@@ -162,7 +162,7 @@ class ImageValidatorTest {
         var deps = new LoopDepsForTest(ctx, callModelInvoked);
 
         var result = LlmAgentLoop.queryLoop(
-            QueryParamsForTest.forLoop(state.messages(), null, baseTuc,
+            QueryParamsForTest.forLoop(state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
             state, new ArrayList<>());

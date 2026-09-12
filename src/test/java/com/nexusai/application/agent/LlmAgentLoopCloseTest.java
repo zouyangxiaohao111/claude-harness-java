@@ -92,7 +92,7 @@ class LlmAgentLoopCloseTest {
         int before = tableSize();
         LlmAgentLoop.queryLoop(
             QueryParams.forLoop(
-                state.messages(), null, baseTuc,
+                state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
             state, new java.util.ArrayList<>());

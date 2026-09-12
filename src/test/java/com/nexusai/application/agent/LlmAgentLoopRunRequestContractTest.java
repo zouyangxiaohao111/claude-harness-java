@@ -82,7 +82,7 @@ class LlmAgentLoopRunRequestContractTest {
 
         // ── 4. 断言 ──
         assertThat(state).as("run(RunRequest) 必须返回非 null AgentState").isNotNull();
-        assertThat(state.messages().stream().anyMatch(m -> m.role() == Role.assistant))
+        assertThat(state.rawMessages().stream().anyMatch(m -> m.role() == Role.assistant))
             .as("适配器必须接通 loop：至少 1 条 assistant 消息（run() 追加 user → loop 追加 assistant）")
             .isTrue();
         assertThat(state.exitReason())
@@ -126,7 +126,7 @@ class LlmAgentLoopRunRequestContractTest {
         assertThat(state.exitReason())
             .as("reasoning-only 是合法收尾：不得以 NO_ASSISTANT_TEXT 判死 run（对齐 CC 无该终止）")
             .isEqualTo(AgentState.ExitReason.NORMAL);
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("reasoning 必须随 assistant 消息落历史（修复后走正常 appendMessage，不再被 break 丢弃）")
             .anyMatch(m -> m.role() == Role.assistant && "模型深度思考内容(不含正文)".equals(m.reasoning()));
     }
@@ -301,7 +301,7 @@ class LlmAgentLoopRunRequestContractTest {
         com.nexusai.application.agent.loop.AgentLoopContext ctx =
             TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = QueryParams.forLoop(
-            state.messages(), "sys",
+            state.rawMessages(), "sys",
             com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             new LlmAgentLoop.MainLoopDeps(ctx, loop::getModelForCall), ProviderConfig.empty());

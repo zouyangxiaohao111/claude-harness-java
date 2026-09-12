@@ -144,7 +144,7 @@ class LlmAgentLoopReentryTokenBudgetCarryoverTest {
         // ── 5. 执行 queryLoop ──
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(List.of(
                         com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
@@ -158,7 +158,7 @@ class LlmAgentLoopReentryTokenBudgetCarryoverTest {
         assertThat(calledModels)
             .as("[V-TOK/DEC-RV-04] stop_hook_blocking 重入透传累计 → 重入后 1100 ≥ 90%×1000 → stop，共 2 次模型调用（重入归零时 frame2 仅 300<900 → continue → 第 3 次调用）")
             .hasSize(2);
-        assertThat(state.messages().stream().map(m -> m.content()))
+        assertThat(state.rawMessages().stream().map(m -> m.content()))
             .as("[V-TOK/DEC-RV-04] 透传累计后 budget stop（非 continue）→ 不得注入 nudge（CC query.ts:1316-1340 continue 才有 nudge）")
             .noneMatch(c -> c != null && c.contains("Keep working"));
     }
@@ -231,7 +231,7 @@ class LlmAgentLoopReentryTokenBudgetCarryoverTest {
             .as("[SH-02 B] 重入 STOP 事件 stop_hook_active=true（CC hooks.ts:3683 stopHookActive 透传，告知 hook 自愈，不跳过重跑）")
             .isEqualTo(Boolean.TRUE);
         // B-4：blocking 反馈注入 LLM（CC stopHooks.ts:257-267 blockingErrors → query.ts:1274-1277 append user message）
-        assertThat(state.messages().stream().map(m -> m.content()))
+        assertThat(state.rawMessages().stream().map(m -> m.content()))
             .as("[SH-02 B] blockingError 注入 LLM 反馈（CC getStopHookMessage 前缀）")
             .anyMatch(c -> c != null && c.contains("Stop hook feedback:"));
     }
@@ -355,7 +355,7 @@ class LlmAgentLoopReentryTokenBudgetCarryoverTest {
         };
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                     .withAvailableTools(List.of(
                         com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),

@@ -101,21 +101,35 @@ class LlmAgentLoopWiringOrderTest {
 
         // ── 3. 驱动 loop ──
         LoopResult result = LlmAgentLoop.queryLoop(
-            QueryParams.forLoop(state.messages(), null,
+            QueryParams.forLoop(state.rawMessages(), null,
                 ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
             state, new ArrayList<>());
 
-        // ── 4. 断言: pre1 已剥离，工作上下文 = [boundary, post1, assistant] ──
+        // ── 4. 断言 [D10 双视图 2026-09-12 改造]：pre1 从**模型视图**剥离，但**全量保活** ──
+        // 改造前本用例断言 `state.messages()` 不再含 pre1（入口 replaceMessages 破坏性写回，全量当场丢失）。
+        // 双视图后语义二分（CC 对照：query.ts:523 的 messages / messagesForQuery 两者同时存在）：
+        //   · state.rawMessages() = CC `messages` → **保留** pre1（append-only，永不投影）
+        //   · state.modelView()   = CC `messagesForQuery` → **不含** pre1（从最后一个 boundary 切片）
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
-        List<String> contents = state.messages().stream()
+        List<String> rawIds = state.rawMessages().stream()
             .map(m -> m.id() != null ? m.id() : "").toList();
-        assertThat(contents)
-            .as("pre-boundary 消息必须被剥离（DRIFT-17 · CC query.ts:365 getMessagesAfterCompactBoundary）")
+        assertThat(rawIds)
+            .as("[D10 双视图] rawMessages() 必须保留 pre-boundary 消息 pre1"
+                + "（对齐 CC `messages` 形参一直活着；改造前被 replaceMessages 破坏性砍掉）")
+            .contains("pre1");
+        assertThat(rawIds)
+            .as("boundary 消息（含）向后保留于全量")
+            .contains("post1");
+        List<String> modelIds = state.modelView().stream()
+            .map(m -> m.id() != null ? m.id() : "").toList();
+        assertThat(modelIds)
+            .as("[D10 双视图] modelView() 不含 pre-boundary 消息 pre1"
+                + "（DRIFT-17 · CC query.ts:523 getMessagesAfterCompactBoundary 的派生语义）")
             .doesNotContain("pre1");
-        assertThat(contents)
-            .as("boundary 消息（含）向后保留")
+        assertThat(modelIds)
+            .as("[D10 双视图] 模型视图从最后一个 boundary（含）向后保留 post1")
             .contains("post1");
     }
 
@@ -153,7 +167,9 @@ class LlmAgentLoopWiringOrderTest {
     void mainLoop_ccOrderCheckpoints() throws IOException {
         String source = Files.readString(Path.of(LLM_LOOP_PATH));
 
-        int boundaryIdx = source.indexOf("BoundaryReader.getMessagesAfterCompactBoundary(state.messages())");
+        // [D10 双视图 2026-09-12] 入口投影改为**派生**（state.modelView()，不写回 state）——
+        //   源码锚点随之更新；顺序不变量（boundary → 预算 → snip → …）不变。
+        int boundaryIdx = source.indexOf("List<ChatMessageDto> entryModelView = state.modelView();");
         int budgetIdx = source.indexOf("AgentLoopContext.applyPerMessageBudget(ctx, state, params.querySource(), skipToolNames)");
         int snipIdx = source.indexOf("snipCompactIfNeeded(messagesForQuery)");
         int microIdx = source.indexOf("microCompactor.microcompactMessages(beforeMicro");
@@ -533,7 +549,7 @@ class LlmAgentLoopWiringOrderTest {
         assertThat(source)
             .as("GR-1 自动压缩成功后用 l4Result.messages()（compactConversation 单函数 buildPostCompactMessages 完整尾段）取代消息链（L4 尾段不丢）")
             .contains("persistCompactedMessages(state, l4Result.messages());")
-            .contains("messagesForQuery = new ArrayList<>(state.messages());");
+            .contains("messagesForQuery = new ArrayList<>(state.rawMessages());");
     }
 
     // ─────────────────────── helpers ───────────────────────

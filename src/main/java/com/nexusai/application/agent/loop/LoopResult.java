@@ -22,7 +22,7 @@ public record LoopResult(
     boolean aborted
 ) {
     // [H7-arch Phase 5 P5 C1] newMessages 死字段已删：SubagentExecutor/ExecAgentHook 用
-    // finalState.messages() + initialMsgCount，不消费 result.newMessages()（审计 C1）。
+    // finalState.rawMessages() + initialMsgCount，不消费 result.newMessages()（审计 C1）。
     // [IMP-SUB-03 返工] totalToolUseCount 死字段已删（H7-arch Phase 5 审计 C2）：
     //   全仓 grep 确认零消费方（run 只用 finalState；ExecAgentHook 只用 totalTurns），
     //   构造点恒硬编码 0 —— 曾误导为"真实工具调用计数"的潜在陷阱。真实计数由

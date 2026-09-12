@@ -144,7 +144,7 @@ class LlmAgentLoopReasoningDurationTest {
     // ── helpers ──
 
     private static ChatMessageDto lastAssistant(AgentState state) {
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {
@@ -165,7 +165,7 @@ class LlmAgentLoopReasoningDurationTest {
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash")));
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null, baseTuc,
+                state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
             state, new java.util.ArrayList<>());

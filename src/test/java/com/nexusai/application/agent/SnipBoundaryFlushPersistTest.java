@@ -46,8 +46,8 @@ import static org.mockito.Mockito.verify;
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>: 生产路径下 boundary 由工具 {@code newMessages}
  * 通道投递 —— {@code ToolResultApplier.apply → state.stashNewMessages}，随后
  * {@code AgentLoopContext.flushNewMessagesAfterToolResult}（tool_result 之后）或
- * {@code drainLeftoverNewMessages}（无配对 tool_result 边缘路径）追加到 {@code state.messages()}。
- * 历史上两处均走裸 {@code state.messages().addAll(...)}，<b>不触发</b> {@code appendListener}，
+ * {@code drainLeftoverNewMessages}（无配对 tool_result 边缘路径）追加到 {@code state.rawMessages()}。
+ * 历史上两处均走裸 {@code state.rawMessages().addAll(...)}，<b>不触发</b> {@code appendListener}，
  * 而 snip_boundary 的<b>唯一</b>落库分支 {@code ChatService.persistAppendedMessage} 恰是监听器实现体
  * → 生产路径永不落库（会话 sess-fcdcdc68 实证：2550 条消息 / 59 次 Snip 成功，库中
  * {@code snip_metadata} 恒 0 行）→ F5/重启后上下文回归。
@@ -203,10 +203,10 @@ class SnipBoundaryFlushPersistTest {
         assertThat(state.prePersistedMessageIds() == null || !state.prePersistedMessageIds().contains("u0"))
             .as("u0 非历史注入（prePersisted 未登记）→ 若为 boundary 不会被监听器跳过").isTrue();
 
-        // ── 4. per-turn TUC：availableTools=snipTool + messages=state.messages()（工具读 ctx.messages）──
+        // ── 4. per-turn TUC：availableTools=snipTool + messages=state.rawMessages()（工具读 ctx.messages）──
         ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), SESSION)
             .withAvailableTools(List.of(snipTool))
-            .withMessages(state.messages());
+            .withMessages(state.rawMessages());
         String turnAssistantId = UUID.randomUUID().toString();
 
         // ── 4b. 前置断言：SnipTool 确实产出 boundary（否则会因 TUC 未带 messages 而"假红"）──
@@ -268,7 +268,7 @@ class SnipBoundaryFlushPersistTest {
         // 真 SnipTool 产出 boundary（同一实现链路），随后模拟「暂存了但本 turn 无对应 tool_result 配对」──
         ToolUseContext snipTuc = ToolUseContext.of(UUID.randomUUID(), session)
             .withAvailableTools(List.of(snipTool))
-            .withMessages(state.messages());
+            .withMessages(state.rawMessages());
         ToolResult<String> snipResult = asToolResult(snipTool.execute(snipCall("u0"), snipTuc));
         assertThat(snipResult.newMessages()).as("前置：SnipTool 产出 boundary").isNotEmpty();
         ChatMessageDto boundary = snipResult.newMessages().get(0);
@@ -326,7 +326,7 @@ class SnipBoundaryFlushPersistTest {
 
         ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), session)
             .withAvailableTools(List.of(pdfTool))
-            .withMessages(state.messages());
+            .withMessages(state.rawMessages());
         String turnAssistantId = UUID.randomUUID().toString();
         ToolUseBlock call = new ToolUseBlock("call_pdf_1", "Read",
             JSON.createObjectNode().put("file_path", "/tmp/sample.pdf").put("pages", "1-2"));
@@ -343,7 +343,7 @@ class SnipBoundaryFlushPersistTest {
         assertThat(result).isEqualTo("continue");
 
         // 顺序护栏：逐条 add 与 addAll 等价 → 仍为 assistant(tool_calls) → tool(tool_result) → user(isMeta 页图)
-        List<ChatMessageDto> msgs = state.messages();
+        List<ChatMessageDto> msgs = state.rawMessages();
         assertThat(msgs).hasSize(3);
         assertThat(msgs.get(0).role()).isEqualTo(Role.assistant);
         assertThat(msgs.get(1).role()).isEqualTo(Role.tool);

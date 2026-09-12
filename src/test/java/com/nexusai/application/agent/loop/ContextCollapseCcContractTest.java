@@ -150,7 +150,9 @@ class ContextCollapseCcContractTest {
             .as("LlmAgentLoop 必须包含 applyCollapsesIfNeeded 调用点（CC query.ts:440-447）")
             .contains("applyCollapsesIfNeeded(");
         // drain 必须先于 reactive compact（CC 顺序 query.ts:1086-1117 在 1119-1166 之前）
-        int drainIdx = source.indexOf("recoverFromOverflow(state.messages()");
+        // [D10 双视图 2026-09-12] 源码锚点随之更新：drain 输入改为派生模型视图
+        //   `recoverFromOverflow(state.modelView()`（CC query.ts:875 的输入是 messagesForQuery）。
+        int drainIdx = source.indexOf("recoverFromOverflow(state.modelView()");
         int reactiveIdx = source.indexOf("tryReactiveCompact(");
         assertThat(drainIdx)
             .as("LlmAgentLoop PTL 必须包含 collapse drain（recoverFromOverflow）")

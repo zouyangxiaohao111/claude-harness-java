@@ -952,7 +952,7 @@ public class ChatService {
 
             // [实时落库 2026-09-03] run() 返回后收口：解除 appendListener（防泄漏/下轮误触发）+ queued-user
             //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
-            //   批量已删——消息已实时落库，此处不再遍历 state.messages()。
+            //   批量已删——消息已实时落库，此处不再遍历 state.rawMessages()。
             if (state != null) {
                 // [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks / getRemainingResults 收尾]
                 //   非 NORMAL 终态(用户停止 ABORTED / STREAM_ERROR / MAX_TURNS 等)时，为"有 tool_use 但
@@ -985,7 +985,7 @@ public class ChatService {
 
             log.info("AGENT done: turns={} exit={} totalChars={}",
                 state.turnCount(), state.exitReason(),
-                state.messages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
+                state.rawMessages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
 
             // 6) 消息已实时落库（appendListener → persistAppendedMessage，run 全程逐条落），无 run 末批量。
             //   原 replayAndPersist 已删：本处仅收口（clearAppendListener + persistInjectedQueuedMessages
@@ -1325,7 +1325,7 @@ public class ChatService {
      * [实时落库 2026-09-03] appendListener 单条实时落库（核心）· 由原 replayAndPersist 循环逐条提取。
      *
      * <p>每 append 一条消息即同步落 DB（对齐 CC recordTranscript append-only 实时写，替代原 run 末
-     * replayAndPersist 批量遍历 {@code state.messages()}）。分支语义与 replayAndPersist 现状逐字一致：
+     * replayAndPersist 批量遍历 {@code state.rawMessages()}）。分支语义与 replayAndPersist 现状逐字一致：
      * <ul>
      *   <li><b>snip_boundary</b>：判重 selectOneById → insert system 行（subtype/snipMetadata）+ removedUuids
      *       非空推 MessageBoundaryEvent（压缩机制零改动，仅触发时机提前到 append 即落）</li>
@@ -1697,7 +1697,7 @@ public class ChatService {
     }
 
     /**
-     * [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks] 非正常终态收尾：为 {@code state.messages()}
+     * [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks] 非正常终态收尾：为 {@code state.rawMessages()}
      * 中「含 toolCalls 但缺对应 tool_result」的孤儿 tool_use 补 synthetic is_error tool 消息。此刻 run 已返回
      * 但 appendListener 仍武装 → {@code state.appendMessage} 即触发 {@link #persistAppendedMessage}
      * （Role.tool 分支 → toolCallMapper.update 补写 DB tool_call.result + STOMP 推 MessageToolResultEvent），
@@ -1708,7 +1708,7 @@ public class ChatService {
      * @param sessionId 会话 id（数据流日志）
      */
     private void repairOrphanToolResults(AgentState state, String sessionId) {
-        var messages = state.messages();
+        var messages = state.rawMessages();
         java.util.Set<String> toolResultIds = new java.util.HashSet<>();
         for (var m : messages) {
             if (m != null && m.toolCallId() != null) {
@@ -1769,7 +1769,7 @@ public class ChatService {
      * 此前 MessageCompleteEvent 构造 reasoning 恒传 null → 前端收口消息思考丢失；本方法补上真实值。
      */
     private String lastAssistantReasoning(AgentState state) {
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {
@@ -1786,7 +1786,7 @@ public class ChatService {
      * {@code replayAndPersist} 的 finalReasoningDurationMs 捕获（finalReasoningDurationMs = m.reasoningDurationMs()）。
      */
     private Long lastAssistantReasoningDurationMs(AgentState state) {
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {
@@ -1817,10 +1817,10 @@ public class ChatService {
      * @return 末条带 usage 的 assistant 消息 usage；无 → null
      */
     private AgentUsage lastAssistantUsage(AgentState state) {
-        if (state == null || state.messages() == null) {
+        if (state == null || state.rawMessages() == null) {
             return null;
         }
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant && m.usage() != null) {
@@ -1838,7 +1838,7 @@ public class ChatService {
      * 跨度，经 withDecodeMs 挂载）。null = 无计时（NON_NULL 省略，前端 null=无数据）。
      */
     private Long lastAssistantDecodeMs(AgentState state) {
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {
@@ -1861,7 +1861,7 @@ public class ChatService {
      * @return 末条非 null assistant ChatMessageDto；无 assistant → null
      */
     private ChatMessageDto lastAssistantMessage(AgentState state) {
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto m = messages.get(i);
             if (m != null && m.role() == Role.assistant) {

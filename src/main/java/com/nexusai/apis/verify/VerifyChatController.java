@@ -113,8 +113,8 @@ public class VerifyChatController {
         long durationMs = (System.nanoTime() - start) / 1_000_000;
 
         String userText = req.prompt();
-        for (int i = state.messages().size() - 1; i >= 0; i--) {
-            ChatMessageDto m = state.messages().get(i);
+        for (int i = state.rawMessages().size() - 1; i >= 0; i--) {
+            ChatMessageDto m = state.rawMessages().get(i);
             if (m.role() == Role.user && m.content() != null) {
                 userText = m.content();
                 break;
@@ -122,7 +122,7 @@ public class VerifyChatController {
         }
 
         List<ToolCallRecord> toolCalls = new ArrayList<>();
-        for (ChatMessageDto m : state.messages()) {
+        for (ChatMessageDto m : state.rawMessages()) {
             if (m.role() == Role.assistant && m.toolCalls() != null) {
                 for (ToolCallDto tc : m.toolCalls()) {
                     toolCalls.add(new ToolCallRecord(
@@ -154,7 +154,7 @@ public class VerifyChatController {
             state.exitReason() == null ? null : state.exitReason().name(),
             state.lastError(),
             durationMs,
-            state.messages().size(),
+            state.rawMessages().size(),
             toolCalls,
             recorder.events
         );

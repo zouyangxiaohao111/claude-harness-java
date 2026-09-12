@@ -409,7 +409,7 @@ public class ExecAgentHook {
             List<String> consumedCommandUuids = new ArrayList<>();
             com.nexusai.application.agent.loop.QueryParams queryParams =
                 com.nexusai.application.agent.loop.QueryParams.forLoop(
-                    state.messages(), systemPrompt, baseTuc,
+                    state.rawMessages(), systemPrompt, baseTuc,
                     QuerySource.HOOK_AGENT, modelName, MAX_AGENT_TURNS, null, null, null, null,
                     deps, effectiveConfig);
             // [P2-23 · 2026-09-11] skillListingResume 恒 false（经 3 参重载 = 默认 false）——
@@ -609,7 +609,7 @@ public class ExecAgentHook {
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * 从 finalState.messages() 提取 StructuredOutput attachment 的 {ok,reason} · 对齐 CC
+     * 从 finalState.rawMessages() 提取 StructuredOutput attachment 的 {ok,reason} · 对齐 CC
      * execAgentHook.ts:212-226 {@code message.type === 'attachment' && message.attachment.type === 'structured_output'}.
      *
      * <p><b>[H13] 检测路径修正（替代 tool_call 反向扫）</b>: CC 检测的是 SyntheticOutputTool 返回的
@@ -624,8 +624,8 @@ public class ExecAgentHook {
      * @return StructuredOutput 的 {ok,reason} JsonNode；null = 无合法 structured output
      */
     private JsonNode extractStructuredOutput(AgentState finalState) {
-        if (finalState == null || finalState.messages() == null) return null;
-        List<ChatMessageDto> messages = finalState.messages();
+        if (finalState == null || finalState.rawMessages() == null) return null;
+        List<ChatMessageDto> messages = finalState.rawMessages();
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto msg = messages.get(i);
             if (msg == null || msg.role() != Role.tool) continue;

@@ -127,7 +127,7 @@ public record QueryParams(
      * 可选字段（fallbackModel / skipCacheWrite /
      * maxOutputTokensOverride / taskBudget / maxTurns）可为 null（CC 可选语义）。
      *
-     * @param messages                loop 消息列表（run(): state.messages()）
+     * @param messages                loop 消息列表（run(): state.rawMessages()）
      * @param systemPrompt            system prompt
      * @param toolUseContext          初始 ToolUseContext（B1 占位；loop 内部仍用 toolExecContext 重建）
      * @param querySource             查询来源（compact ctor 已校验非空）

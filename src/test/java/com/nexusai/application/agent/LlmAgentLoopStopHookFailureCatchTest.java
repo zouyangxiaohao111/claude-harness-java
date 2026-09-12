@@ -57,7 +57,7 @@ import static org.mockito.Mockito.when;
  * <ul>
  *   <li><b>in-loop Stop hook 抛异常</b> → catch 不吞静默：用户可见 notification（addNotification
  *       id='stop-hook-failed'）发出 + 优雅退出，异常不抛穿 queryLoop；且<b>不 append 到
- *       state.messages()</b>（对齐 CC 模型不可见）——旧实现无此反馈（RED）。</li>
+ *       state.rawMessages()</b>（对齐 CC 模型不可见）——旧实现无此反馈（RED）。</li>
  *   <li><b>teammate 段 hook 抛异常</b>（TeammateIdle executeEventAll throw）→ 新 catch 兜底：
  *       异常不抛到 run() 边界、正常退出（NORMAL）、用户可见 notification 发出——旧实现异常
  *       直接抛穿（RED）。</li>
@@ -128,7 +128,7 @@ class LlmAgentLoopStopHookFailureCatchTest {
         // ── 执行（旧实现：异常抛穿 queryLoop → 本行抛错 RED）──
         assertThatCode(() -> LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 baseTuc.withAvailableTools(List.of(
                     com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
@@ -146,9 +146,9 @@ class LlmAgentLoopStopHookFailureCatchTest {
         assertThat(n.level()).isEqualTo(Notification.Level.ERROR);
         assertThat(n.body()).contains("stop hook boom");
 
-        // ── 模型不可见守卫：'Stop hook failed' 不进 state.messages()（CC subtype informational）──
-        assertThat(state.messages().stream().map(m -> m.content()))
-            .as("[SH-03] 'Stop hook failed' 系统消息不得进 state.messages()（CC subtype='informational' 模型不可见）")
+        // ── 模型不可见守卫：'Stop hook failed' 不进 state.rawMessages()（CC subtype informational）──
+        assertThat(state.rawMessages().stream().map(m -> m.content()))
+            .as("[SH-03] 'Stop hook failed' 系统消息不得进 state.rawMessages()（CC subtype='informational' 模型不可见）")
             .noneMatch(c -> c != null && c.contains("Stop hook failed"));
 
         // ── 优雅退出：budget stop → NORMAL ──
@@ -218,7 +218,7 @@ class LlmAgentLoopStopHookFailureCatchTest {
         // ── 执行（旧实现：teammate 段无 try → 异常抛穿 queryLoop RED）──
         assertThatCode(() -> LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null,
+                state.rawMessages(), null,
                 baseTuc.withAvailableTools(List.of(
                     com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,

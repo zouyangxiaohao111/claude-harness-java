@@ -145,7 +145,7 @@ class MaxOutputTokensEscalationIntegrationTest {
             }
         };
         QueryParams params = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", maxTurns, null, null, null, null,
@@ -187,7 +187,7 @@ class MaxOutputTokensEscalationIntegrationTest {
         //   —— DC-22 已删 hasEscalated 粘性字段，升级信号活在 override 参数（CC query.ts:1201
         //   maxOutputTokensOverride === undefined re-arm）。
         // ② 升级后重试成功 → 无恢复消息（不再截断后无恢复消息）
-        assertThat(state.messages().stream().map(ChatMessageDto::content))
+        assertThat(state.rawMessages().stream().map(ChatMessageDto::content))
             .as("升级重试成功（不截断）→ 不得追加续写恢复消息（CC query.ts:1223 只在重试仍截断时追加）")
             .doesNotContain("Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces.");
         // ③ 正常退出，非 MAX_OUTPUT_TOKENS 耗尽
@@ -228,7 +228,7 @@ class MaxOutputTokensEscalationIntegrationTest {
             .as("[P-6] 多轮恢复耗尽 exit reason = NORMAL（CC query.ts:1264 return completed，非 MAX_OUTPUT_TOKENS）")
             .isEqualTo(AgentState.ExitReason.NORMAL);
         // ② 多轮恢复 ≤3：续写恢复消息不超过 MAX_OUTPUT_TOKENS_RECOVERY_LIMIT=3
-        long recoveryMessages = state.messages().stream()
+        long recoveryMessages = state.rawMessages().stream()
             .map(ChatMessageDto::content)
             .filter("Output token limit hit. Resume directly — no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."::equals)
             .count();
@@ -242,7 +242,7 @@ class MaxOutputTokensEscalationIntegrationTest {
             .isEqualTo(1);
         // ④ [IMP-15 REWORK] 耗尽必须 surface CC 截断错误 assistant 消息（query.ts:1254-1256 +
         //    claude.ts:2272-2279 content 原文格式），而非只置 exitReason 静默丢弃（半对齐修复）。
-        assertThat(state.messages().stream().map(ChatMessageDto::content))
+        assertThat(state.rawMessages().stream().map(ChatMessageDto::content))
             .as("恢复耗尽后 transcript 必须含 CC 格式 assistant 错误消息（output token maximum）")
             .anyMatch(c -> c != null && c.contains("output token maximum"));
     }

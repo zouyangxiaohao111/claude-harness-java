@@ -25,7 +25,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>: 根因 1.1 —— 空参工具（arguments:""）在流式回调里
  * {@code isComplete()} 恒 false → 永不 add 进 executor → {@code msg.toolCalls()} 有 N 个而执行器只产
- * S&lt;N 个结果。原实现 :1747 静默 {@code break} → state.messages() 变 [assistant(N calls), tool(S results)]
+ * S&lt;N 个结果。原实现 :1747 静默 {@code break} → state.rawMessages() 变 [assistant(N calls), tool(S results)]
  * → OpenAI 400 "insufficient tool messages following tool_calls message"。本测试锁定配对防御：执行器
  * 结果数 &lt; 调用数时，为每个未覆盖 tool_call 生成 synthetic error tool_result（对齐 CC
  * yieldMissingToolResultBlocks query.ts:123-149），保证每个 tool_call 都有 tool 响应。
@@ -78,19 +78,19 @@ class HandleToolCallsTurnPairingTest {
 
         // ── 5. 断言：assistant(2 calls) + call#1 真结果 + call#2 synthetic error ──
         // 5a. assistant 消息保留 2 个 toolCalls
-        List<ChatMessageDto> assistantMsgs = state.messages().stream()
+        List<ChatMessageDto> assistantMsgs = state.rawMessages().stream()
             .filter(m -> m.role() == Role.assistant && m.toolCalls() != null)
             .toList();
         assertThat(assistantMsgs).as("必须有一条含 toolCalls 的 assistant").hasSize(1);
         assertThat(assistantMsgs.get(0).toolCalls()).as("assistant 保留全部 N 个 tool_calls").hasSize(2);
         // 5b. call#1 有真实 tool 响应
-        List<ChatMessageDto> tr1 = state.messages().stream()
+        List<ChatMessageDto> tr1 = state.rawMessages().stream()
             .filter(m -> "call_pair_1".equals(m.toolCallId()))
             .toList();
         assertThat(tr1).as("call#1 必须有真实 tool 响应").hasSize(1);
         assertThat(tr1.get(0).isError()).as("call#1 成功结果 isError=false").isFalse();
         // 5c. call#2 补 synthetic error
-        List<ChatMessageDto> tr2 = state.messages().stream()
+        List<ChatMessageDto> tr2 = state.rawMessages().stream()
             .filter(m -> "call_pair_2".equals(m.toolCallId()))
             .toList();
         assertThat(tr2).as("call#2 必须补 synthetic error tool_result").hasSize(1);
@@ -100,7 +100,7 @@ class HandleToolCallsTurnPairingTest {
             .as("synthetic assistantMessageId = CC sourceToolAssistantUUID 等价位")
             .isEqualTo(turnAssistantId);
         // 5d. 意图锚：每个 tool_call id 都有 tool 响应（配对完整性 → 注入历史合法 → 不再 400）
-        java.util.Set<String> toolResultIds = state.messages().stream()
+        java.util.Set<String> toolResultIds = state.rawMessages().stream()
             .filter(m -> m.toolCallId() != null)
             .map(ChatMessageDto::toolCallId)
             .collect(java.util.stream.Collectors.toSet());

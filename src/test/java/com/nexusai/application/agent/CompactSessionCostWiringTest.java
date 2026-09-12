@@ -158,7 +158,7 @@ class CompactSessionCostWiringTest {
     void reactiveCompactSuccess_addsCompactionCallToSessionCost() {
         AgentState state = newState();
         preCompactMessages().forEach(state::appendMessage);
-        int original = state.messages().size();
+        int original = state.rawMessages().size();
 
         ReactiveCompactor rc = new ReactiveCompactor(
             new TokenEstimator()::estimateMessageTokens,
@@ -169,7 +169,7 @@ class CompactSessionCostWiringTest {
         LlmAgentLoop.queryLoop(reactiveParams(state, COMPACT_MODEL, ctx), state, new ArrayList<>());
 
         // 前置：reactive compact 真实发生（消息被压缩）——否则本测试空转
-        assertThat(state.messages().size())
+        assertThat(state.rawMessages().size())
             .as("PTL 必须走 reactive compact（消息数下降）· CC query.ts:1138")
             .isLessThan(original);
 
@@ -326,7 +326,7 @@ class CompactSessionCostWiringTest {
 
     private static QueryParams params(AgentState state, String resolvedModel, AgentLoopContext ctx) {
         return QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, TRAP_MODEL, null,
             null, null, null, null,
@@ -336,7 +336,7 @@ class CompactSessionCostWiringTest {
     /** reactive 场景：60 条历史 + 末位 assistant 带 usage（触发 PTL → reactive compact）。 */
     private static QueryParams reactiveParams(AgentState state, String resolvedModel, AgentLoopContext ctx) {
         return QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", 8,
             null, null, null, null,

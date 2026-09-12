@@ -69,7 +69,7 @@ class AsyncHookResponseDeliveryTest {
 
         AgentLoopContext ctx = wiredContext(hookRegistry);
         AgentState state = new AgentState("system");
-        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.messages());
+        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.rawMessages());
 
         List<ChatMessageDto> result = AgentLoopContext.maybeInjectAsyncHookResponses(ctx, state, messagesForLlm);
 
@@ -101,7 +101,7 @@ class AsyncHookResponseDeliveryTest {
 
         AgentLoopContext ctx = wiredContext(hookRegistry);
         AgentState state = new AgentState("system");
-        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.messages());
+        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.rawMessages());
 
         List<ChatMessageDto> result = AgentLoopContext.maybeInjectAsyncHookResponses(ctx, state, messagesForLlm);
 
@@ -127,7 +127,7 @@ class AsyncHookResponseDeliveryTest {
             "system", "base", null, List.of(), null, null, null,
             "刚刚", java.time.OffsetDateTime.now(), null, null,
             null, List.of(), List.of()));
-        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.messages());
+        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.rawMessages());
 
         List<ChatMessageDto> result = AgentLoopContext.maybeInjectAsyncHookResponses(ctx, state, messagesForLlm);
 
@@ -141,7 +141,7 @@ class AsyncHookResponseDeliveryTest {
         //      不能抛 NPE 拖垮 LLM loop.
         AgentLoopContext ctx = wiredContext(null);
         AgentState state = new AgentState("system");
-        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.messages());
+        List<ChatMessageDto> messagesForLlm = new ArrayList<>(state.rawMessages());
 
         List<ChatMessageDto> result = AgentLoopContext.maybeInjectAsyncHookResponses(ctx, state, messagesForLlm);
 

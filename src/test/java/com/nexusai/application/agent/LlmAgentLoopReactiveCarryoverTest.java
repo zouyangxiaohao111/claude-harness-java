@@ -174,7 +174,7 @@ class LlmAgentLoopReactiveCarryoverTest {
 
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         preCompactMessages().forEach(state::appendMessage);
-        int original = state.messages().size();
+        int original = state.rawMessages().size();
 
         AgentLoopContext ctx = reactiveCtx(ptlOnceThenStopProvider());
         LoopDeps deps = new LoopDeps() {
@@ -182,7 +182,7 @@ class LlmAgentLoopReactiveCarryoverTest {
             @Override public boolean isMainLoop() { return true; }
         };
         QueryParams params = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", 8,
             new TaskBudget(200_000), null, null, null, deps, ProviderConfig.empty());
@@ -190,7 +190,7 @@ class LlmAgentLoopReactiveCarryoverTest {
         LlmAgentLoop.queryLoop(params, state, new ArrayList<>());
 
         // ① reactive compact 真实成功（消息被压缩）
-        assertThat(state.messages().size())
+        assertThat(state.rawMessages().size())
             .as("PTL 必须走 reactive compact 压缩消息（消息数下降）· CC query.ts:1138 reactive compacted")
             .isLessThan(original);
         // ② reactive 分支执行结转（与 proactive 同一公式）

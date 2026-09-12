@@ -123,7 +123,7 @@ class SubagentStreamingMidFlightTest {
         state.appendMessage(dto(Role.user, "m1", null, null, null));
         state.appendMessage(dto(Role.assistant, "m2", null, 1, 1));
         // 无异常 = 通过; 消息正常落库
-        assertThat(state.messages()).hasSize(2);
+        assertThat(state.rawMessages()).hasSize(2);
     }
 
     @Test

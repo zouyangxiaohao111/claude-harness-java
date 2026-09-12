@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>测试方式 (对齐 SubagentExecutorForkPathTest seam 模式): queryLoop 无 per-message 回调
  * (LlmAgentLoop, S4-1 范围外), 流式 emit 经 {@link SubagentExecutor#toSubagentMessage(ChatMessageDto)}
- * seam 从 finalState.messages() 逐条产出. 本测试验证 seam 语义 = 验证生产逻辑. RED 依据:
+ * seam 从 finalState.rawMessages() 逐条产出. 本测试验证 seam 语义 = 验证生产逻辑. RED 依据:
  * toSubagentMessage / SubagentMessage 在 S4 实施前不存在 (编译即失败).
  */
 @DisplayName("[S4] runAgent 流式化 (SubagentMessage 消息粒度 / executeStreaming 入口)")

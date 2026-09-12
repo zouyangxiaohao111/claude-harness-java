@@ -94,7 +94,7 @@ class LlmAgentLoopStreamingFallbackTombstoneTest {
 
         LlmAgentLoop.queryLoop(
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), null, baseTuc,
+                state.rawMessages(), null, baseTuc,
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty()),
             state, new java.util.ArrayList<>());

@@ -95,7 +95,7 @@ class ApplyPerMessageBudgetBudgetConstantTest {
     }
 
     private String contentOf(AgentState state, String toolCallId) {
-        return state.messages().stream()
+        return state.rawMessages().stream()
             .filter(m -> toolCallId.equals(m.toolCallId()))
             .findFirst()
             .orElseThrow()

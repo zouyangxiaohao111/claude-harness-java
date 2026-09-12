@@ -111,7 +111,7 @@ public class StructuredOutputEnforcementHook implements GenericHook {
         // [IMPL-10] DEL-TH-04: per-call 超时测量（CC hookHelpers.ts:81 timeout:5000 对单次
         //   callback 调用施加；Java callback 同步执行，按调用耗时判定）。
         long callStartNs = System.nanoTime();
-        boolean success = hasSuccessfulToolCall(state.messages(), ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME);
+        boolean success = hasSuccessfulToolCall(state.rawMessages(), ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME);
         long callElapsedMs = (System.nanoTime() - callStartNs) / 1_000_000L;
         if (callElapsedMs > CALL_TIMEOUT_MS) {
             if (log.isWarnEnabled()) {

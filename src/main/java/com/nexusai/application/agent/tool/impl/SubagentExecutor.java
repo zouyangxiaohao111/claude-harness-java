@@ -3998,7 +3998,7 @@ public class SubagentExecutor {
                         pending.size(), agentId, coordGate, coordinatorWrapped);
                 }
             }
-            int initialMsgCount = state.messages().size();
+            int initialMsgCount = state.rawMessages().size();
 
             // [S4-1 流式化] 初始消息加载完成后武装 appendListener (mid-flight 单点方案):
             //   对齐 CC runAgent.ts:748-806 for-await 逐消息 yield — appendMessage 是唯一消息
@@ -4110,7 +4110,7 @@ public class SubagentExecutor {
                 log.info("[SubagentExecutor] Query loop 启动前已 abort, 跳过 LLM 调用: agentId={}", agentId);
                 // [S4] usage/totalTokens 兜底 (无 LLM 调用 → 0/EMPTY, 对齐 CC 无 assistant message 路径)
                 return SubagentResult.aborted(
-                        extractConclusionFromMessages(state.messages()), 0, 0L, agentIdHex,
+                        extractConclusionFromMessages(state.rawMessages()), 0, 0L, agentIdHex,
                         0L, AgentUsage.EMPTY);
             }
     
@@ -4231,7 +4231,7 @@ public class SubagentExecutor {
                 }
                 com.nexusai.application.agent.loop.QueryParams queryParams =
                     com.nexusai.application.agent.loop.QueryParams.forLoop(
-                        state.messages(), agentSystemPrompt, baseTuc,
+                        state.rawMessages(), agentSystemPrompt, baseTuc,
                         forkQuerySource, effectiveModel, maxTurns, null, null, null, null,
                         deps, providerConfig)
                         // [IMP2-05 运行时接线] 注入 agentType 级精确 querySource（CC querySource 值域
@@ -4286,21 +4286,21 @@ public class SubagentExecutor {
                 result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids, skillListingResume);
             } catch (Exception e) {
                 log.error("[SubagentExecutor] [H7-arch Phase 2] queryLoop 抛出: {}", e.toString());
-                String fallbackText = extractConclusionFromMessages(state.messages());
-                // [S4] 异常路径 usage 兜底: 从已累积的 state.messages() 提取 (可能含已产出的 assistant 消息)
-                AgentUsage fallbackUsage = extractUsageFromMessages(state.messages());
+                String fallbackText = extractConclusionFromMessages(state.rawMessages());
+                // [S4] 异常路径 usage 兜底: 从已累积的 state.rawMessages() 提取 (可能含已产出的 assistant 消息)
+                AgentUsage fallbackUsage = extractUsageFromMessages(state.rawMessages());
                 // [A5-2] 子 Agent 预算求和分派：按 effectiveModel 判 anthropic（deepseek input 已含
                 //   cache hit，4 项和双计 over-count）。mapper 不可得 → 回落 anthropic 语义。
                 boolean fallbackAnthropic = (modelMapper != null && providerMapper != null)
                     ? ContextUsageCalculator.isAnthropic(modelMapper, providerMapper, effectiveModel)
                     : true;
-                long fallbackTokens = extractTotalTokens(state.messages(), fallbackAnthropic);
+                long fallbackTokens = extractTotalTokens(state.rawMessages(), fallbackAnthropic);
                 // [R-A2] A-2 异常 catch 路径 totalToolUseCount 真实计数 · 对齐 CC agentToolUtils.ts:262-274
-                //   countToolUses —— queryLoop 异常时 state.messages() 可能已累积部分 assistant 消息
+                //   countToolUses —— queryLoop 异常时 state.rawMessages() 可能已累积部分 assistant 消息
                 //   （已产出的 tool_use 块），原两分支硬编码 0 会让父 Agent 在异常场景系统性低估子
                 //   Agent 工具用量（tool budget / task-notification usage 段）。与正常完成路径 :4033
                 //   同口径：从 initialMsgCount 起计数（父 context / fork 前缀 tool_use 不计入子 Agent）。
-                int fallbackToolUseCount = countToolUses(state.messages(), initialMsgCount);
+                int fallbackToolUseCount = countToolUses(state.rawMessages(), initialMsgCount);
                 if (log.isInfoEnabled()) {
                     log.info("[SubagentExecutor] [R-A2] queryLoop 异常路径 totalToolUseCount 真实计数: "
                             + "agentId={} toolUseCount={} aborted={} (CC countToolUses agentToolUtils.ts:262-274)",
@@ -4315,7 +4315,7 @@ public class SubagentExecutor {
                 //   故仅 !isAsync 分支走错误恢复分类。
                 if (!subagentCtx.abortController().isCancelled() && !isAsync) {
                     fallbackText = applySyncErrorRecoveryClassification(
-                            state.messages(), effectiveForkMode, effectiveType,
+                            state.rawMessages(), effectiveForkMode, effectiveType,
                             fallbackToolUseCount,
                             subagentCtx, fallbackText);
                 }
@@ -4331,7 +4331,7 @@ public class SubagentExecutor {
             AgentState finalState = result.finalState();
     
             boolean aborted = result.aborted() || (finalState != null && finalState.cancelled());
-            List<ChatMessageDto> summarySource = finalState != null ? finalState.messages() : state.messages();
+            List<ChatMessageDto> summarySource = finalState != null ? finalState.rawMessages() : state.rawMessages();
             String summary = extractConclusionFromMessages(summarySource);
             // [IMP-SUB-03] D3 totalToolUseCount 恒 0 修复 · 对齐 CC agentToolUtils.ts:262-274
             //   countToolUses(agentMessages) —— 从消息历史 tool_use 计数填充。原恒 0 的
@@ -4340,7 +4340,7 @@ public class SubagentExecutor {
             //   CC finalizeAgentTool 在 finalize 站点（agentToolUtils.ts:320）计数而非 query 循环，
             //   Java 等价位 = 本 result 构造点。CC agentMessages = query 循环产出消息
             //   （AgentTool.tsx:786 空数组 + :1065 push，不含 initialMessages/fork 前缀）；
-            //   Java finalState.messages() 含 initialMsgCount 前缀（父 context 的 tool_use 不应计入
+            //   Java finalState.rawMessages() 含 initialMsgCount 前缀（父 context 的 tool_use 不应计入
             //   子 agent 自身计数），故从 initialMsgCount 起计数。
             int totalToolUseCount = countToolUses(summarySource, initialMsgCount);
             int totalTurns = result.totalTurns();
@@ -4355,7 +4355,7 @@ public class SubagentExecutor {
     
             log.info("[SubagentExecutor] [H7-arch Phase 2] queryLoop 完成: agentId={} turns={} toolUseCount={} msgs={} aborted={} totalTokens={}",
                     agentId, totalTurns, totalToolUseCount,
-                    finalState != null ? finalState.messages().size() : initialMsgCount, aborted, totalTokens);
+                    finalState != null ? finalState.rawMessages().size() : initialMsgCount, aborted, totalTokens);
 
             // [IMP-SUB-25 D-3] handoff 安全分类 · 对齐 CC AgentTool.tsx:1238 / agentToolUtils.ts:608
             //   （completed 终态复核；abort 路径不分类）。
@@ -4474,7 +4474,7 @@ public class SubagentExecutor {
      * 非空 → 走真实 2-stage LLM 分类，不再短路 ALLOW）。{@code subagentType} 仅作决策日志
      * agentType 字段消费，不再投影作 toolName。
      *
-     * @param agentMessages    子 Agent 终态消息（finalState.messages()）
+     * @param agentMessages    子 Agent 终态消息（finalState.rawMessages()）
      * @param effectiveMode    子 Agent 实际生效权限模式（CC toolPermissionContext.mode 语义，
      *                         调用点传 {@code effectiveForkMode} 而非 agent 声明 mode）
      * @param subagentType     子 Agent 类型（CC subagentType，:440 agentType，仅决策日志用）
@@ -4590,7 +4590,7 @@ public class SubagentExecutor {
      * 有/无 assistant 消息）；本方法需经 {@link #classifyHandoffIfNeeded} 读
      * {@code yoloClassifier}/{@code transcriptClassifierEnabled} 字段，故为实例方法而非 static。
      *
-     * @param messages       异常时已累积的子 Agent 消息（state.messages()，含 initialMsgCount 前缀）
+     * @param messages       异常时已累积的子 Agent 消息（state.rawMessages()，含 initialMsgCount 前缀）
      * @param effectiveMode  子 Agent 生效权限模式（effectiveForkMode：成功派生则真实解析值，
      *                       :3593 之前异常时为 permissionMode 兜底）
      * @param subagentType   子 Agent 类型（CC subagentType，决策日志 agentType 用）
@@ -4704,7 +4704,7 @@ public class SubagentExecutor {
      * AgentUsage.EMPTY 零初始化哨兵 (对齐 CC emptyUsage.ts:8). 不再有"assistant 有 tokens 但读成
      * null"的半对齐 (DEC-04 症状: 恒 0/EMPTY).
      *
-     * @param messages 子 Agent 完整消息历史 (finalState.messages())
+     * @param messages 子 Agent 完整消息历史 (finalState.rawMessages())
      * @return usage record (末尾 assistant 消息的完整 usage; 无 assistant → EMPTY)
      */
     static AgentUsage extractUsageFromMessages(List<ChatMessageDto> messages) {
@@ -4764,7 +4764,7 @@ public class SubagentExecutor {
      * {@code startInclusive} 起始下标（initialMsgCount），跳过初始/fork 前缀消息 —— 父
      * context 的 tool_use 不应计入子 agent 自身工具调用计数。
      *
-     * @param messages       子 Agent 消息历史（finalState.messages()）
+     * @param messages       子 Agent 消息历史（finalState.rawMessages()）
      * @param startInclusive 起始下标（initialMsgCount = 初始/fork 前缀消息数，0 = 全量计数）
      * @return tool_use 块总数
      */

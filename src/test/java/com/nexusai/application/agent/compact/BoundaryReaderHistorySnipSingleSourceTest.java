@@ -190,7 +190,7 @@ class BoundaryReaderHistorySnipSingleSourceTest {
 
         // 入口剥离面（:4738 的返回值直接替换 state 前缀）——同一 API 亦被 CompactCommand:215 /
         // PartialCompactService:195 / StreamCompactSummary:744 / SkillifySkillRegistrar:301 消费。
-        assertThat(ids(BoundaryReader.getMessagesAfterCompactBoundary(state.messages())))
+        assertThat(ids(BoundaryReader.getMessagesAfterCompactBoundary(state.rawMessages())))
             .as("入口剥离面（:4738 · 静态槽门②）不得含被 snip 剔除的 u0 —— 修复前静态槽死 → 泄漏")
             .doesNotContain("u0")
             .contains("snip-boundary-1");
@@ -307,7 +307,7 @@ class BoundaryReaderHistorySnipSingleSourceTest {
             @Override public boolean isMainLoop() { return true; }
         };
         QueryParams params = QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());

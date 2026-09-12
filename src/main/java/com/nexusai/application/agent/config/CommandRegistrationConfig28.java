@@ -935,7 +935,7 @@ public class CommandRegistrationConfig28 {
             return 0;
         }
         AgentState state = registry.get(sessionId);
-        return state != null && state.messages() != null ? state.messages().size() : 0;
+        return state != null && state.rawMessages() != null ? state.rawMessages().size() : 0;
     }
 
     /** 从 InsightsCollector 报告内容解析 turn 数（"**Turn count**: N"）。 */

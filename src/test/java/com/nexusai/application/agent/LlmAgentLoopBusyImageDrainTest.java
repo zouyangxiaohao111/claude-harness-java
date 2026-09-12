@@ -134,10 +134,10 @@ class LlmAgentLoopBusyImageDrainTest {
     }
 
     private static ChatMessageDto findById(AgentState state, String id) {
-        if (state.messages() == null) {
+        if (state.rawMessages() == null) {
             return null;
         }
-        for (ChatMessageDto m : state.messages()) {
+        for (ChatMessageDto m : state.rawMessages()) {
             if (m != null && id.equals(m.id())) {
                 return m;
             }

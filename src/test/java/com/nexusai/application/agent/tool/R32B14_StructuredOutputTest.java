@@ -79,7 +79,7 @@ class R32B14_StructuredOutputTest {
         // AgentState.recordStructuredOutput (b14 本地暂存通道, 后续 provider 序列化).
         AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
         ToolResult<Map<String, Object>> result = ToolResult.successWithStructuredOutput("toolu-5", "ack", Map.of("value", "kept"));
-        ToolResult<?> applied = ToolResultApplier.apply(result, state.messages(), state, "toolu-5");
+        ToolResult<?> applied = ToolResultApplier.apply(result, state.rawMessages(), state, "toolu-5");
         assertEquals("ack", applied.data() instanceof Map<?, ?> m ? m.get("summary") : applied.data());
         assertEquals("kept", state.takeStructuredOutput("toolu-5").get("value"));
         assertTrue(state.takeStructuredOutput("toolu-5").isEmpty());
@@ -94,7 +94,7 @@ class R32B14_StructuredOutputTest {
         AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
         Map<String, Object> output = Map.of("answer", "yes", "score", 3);
         ToolResult<Map<String, Object>> result = ToolResult.successWithStructuredOutput("toolu-8", "ack", output);
-        ToolResultApplier.apply(result, state.messages(), state, "toolu-8");
+        ToolResultApplier.apply(result, state.rawMessages(), state, "toolu-8");
 
         List<AttachmentMessageDto> attachments = state.attachments();
         assertEquals(1, attachments.size());

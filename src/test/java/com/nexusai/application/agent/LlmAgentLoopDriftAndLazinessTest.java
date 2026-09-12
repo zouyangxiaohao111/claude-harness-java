@@ -215,7 +215,7 @@ class LlmAgentLoopDriftAndLazinessTest {
                 // [V-SH 返工 2026-08-09] s09 HOOK_STOPPED gate 追加（+8 行，s09 位于三 gate 之前）
                 //   -> 三 gate 实测 5381/5387/5400。按 ±8 容差以实测三 gate 集中区间重锚
                 //   -> [5373,5408]。
-                // [V-FB 返工 2026-08-09] V-FB-03 tengu_query_error 全量计数（state.messages() stream
+                // [V-FB 返工 2026-08-09] V-FB-03 tengu_query_error 全量计数（state.rawMessages() stream
                 //   assistant 消息数 + tool_use 块数，替代 0/1 硬编码，~+13 行，位于三 gate 之前）
                 //   -> 三 gate 实测 5393/5399/5412。按 ±8 容差以实测三 gate 集中区间重锚
                 //   -> [5385,5420]。

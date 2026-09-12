@@ -245,7 +245,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
         ArgumentCaptor<List<ChatMessageDto>> persisted = ArgumentCaptor.forClass(List.class);
         verify(messageService).appendPostCompactMessages(eq(SESSION), persisted.capture());
         assertThat(persisted.getValue().get(0).subtype()).isEqualTo("compact_boundary");
-        assertThat(live.messages())
+        assertThat(live.rawMessages())
             .as("live state 内存仍是压缩后视图（原有写回语义不变）")
             .isEqualTo(persisted.getValue());
     }

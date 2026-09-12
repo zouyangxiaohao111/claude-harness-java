@@ -93,7 +93,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
         // [prompt-wrap-fix] turn-0 首次输入（workload=null）对齐 CC handlePromptSubmit：注入原文不套壳
         //   （wrapCommandText human 前缀 'The user sent a new message' 仅 busy-queued 排队使用）——
         //   模型正确识别「用户已发新消息」，直接回复该输入
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(m -> m.content()).toList())
             .as("主线程 prompt 必须经队列 drain 注入为 user 消息（turn-0 首次输入 = 原文，不套 CC human 前缀）")
@@ -132,7 +132,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             com.nexusai.infra.llm.ProviderConfig.empty(), "test-model", null, null));
 
         // 本回合 drain（[3a] currentSessionId=sid）只捞 A 自己的 prompt，B 的 cron 留队列
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(m -> m.content()).toList())
             .as("A 的回合必须经队列 drain 注入本会话 prompt（turn-0 首次输入 = 原文，不套 CC human 前缀）")
@@ -165,7 +165,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
 
         // CC query.ts:1577 subagent 绝不消费 prompt → prompt 不得入队 (直 append)
         assertThat(queue.size()).as("subagent prompt 不得入统一队列").isZero();
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(m -> m.content()).toList())
             .as("subagent prompt 直 append 进 messages")
@@ -200,7 +200,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
         // [prompt-wrap-fix] 3 条 prompt 的 workload 均为 null（turn-0 首次输入）→ 对齐 CC
         //   handlePromptSubmit 原文语义：注入消息 content = 原始文本，不套 wrapCommandText human 壳
         //   （前缀仅 busy-queued 排队使用）。
-        java.util.List<String> userContents = state.messages().stream()
+        java.util.List<String> userContents = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(ChatMessageDto::content)
             .toList();
@@ -239,7 +239,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
         // [prompt-wrap-fix] workload=null 的 prompt（turn-0 首次输入）对齐 CC handlePromptSubmit：
         //   注入消息 content = 原始文本，绝不套 'The user sent a new message' 壳
         //   （wrapCommandText human 分支 messages.ts:5991-6006 仅 queued/busy-queued 使用）
-        java.util.List<String> userContents = state.messages().stream()
+        java.util.List<String> userContents = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(ChatMessageDto::content)
             .toList();
@@ -279,21 +279,21 @@ class LlmAgentLoopUnifiedQueuePromptTest {
         AgentState state = loop.run(RunRequest.forTest("hello", "test-model", null));
 
         // [P0-1 机制切换] state 存原文 RAW + queuedOrigin=task-notification（壳只在发送边界生成）
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(ChatMessageDto::content)
             .filter(c -> c != null && !c.equals("hello"))
             .toList())
             .as("3 条通知 state 存原文 RAW（非壳文本；包壳在发送边界 wrapQueuedMessagesForApi）")
             .containsExactlyInAnyOrder("notif-1", "notif-2", "notif-3");
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> m.queuedOrigin() != null && m.queuedOrigin().equals("task-notification"))
             .map(ChatMessageDto::content))
             .as("task-notification state 消息必须带 queuedOrigin=task-notification（发送层据此包壳）")
             .containsExactlyInAnyOrder("notif-1", "notif-2", "notif-3");
         // [P0-3 OD-D3] mid-turn task-notification isMeta=false→true（UI 隐藏、模型可见）
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> m.queuedOrigin() != null && m.queuedOrigin().equals("task-notification"))
             .map(ChatMessageDto::isMeta)
@@ -362,7 +362,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
         AgentState state = loop.run(RunRequest.forTest("main-prompt", "test-model", null));
 
         // [P0-1 机制切换] state 存原文 RAW + queuedOrigin（壳只在发送边界生成）
-        java.util.List<String> userContents = state.messages().stream()
+        java.util.List<String> userContents = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .map(ChatMessageDto::content)
             .toList();
@@ -390,7 +390,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             .as("cron 触发 prompt 套 CC wrapCommandText 默认 human 壳 + system-reminder 包裹（UP-04 对齐 CC 真源）")
             .contains(cronExpected);
         // ②' cron mid-turn 注入 isMeta=true（C5-cron：state 上判别，content 为原文）
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> m.content() != null && m.content().equals("cron-triggered-prompt"))
             .findFirst())
@@ -412,7 +412,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             .as("task-notification 发送边界保持 :5502 前缀（逐字）+ system-reminder 包裹")
             .contains(LlmAgentLoop.wrapQueuedContentForApi("task-notification", "notif-1"));
         // ⑤ [P0-3 OD-D3] mid-turn task-notification isMeta=false→true（UI 隐藏、模型可见）
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user)
             .filter(m -> m.content() != null && m.content().equals("notif-1"))
             .findFirst())
@@ -455,7 +455,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             com.nexusai.infra.llm.ProviderConfig.empty(), "test-model", null, null));
 
         // ① [P0-1 机制切换] mid-turn 注入：state 存原文 RAW + queuedOrigin=busy-queued（壳只在发送边界）
-        ChatMessageDto busyState = state.messages().stream()
+        ChatMessageDto busyState = state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && busyUuid.equals(m.id()))
             .findFirst().orElse(null);
         assertThat(busyState)
@@ -475,7 +475,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             .as("busy-queued 发送边界必须注入中文提醒壳（含原文忙时追问）")
             .anyMatch(c -> c.contains("忙时追问"));
         // ② 注入消息携带原队列 uuid 作消息 id（CC messages.ts:3782 source_uuid → createUserMessage uuid）
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && busyUuid.equals(m.id()))
             .map(ChatMessageDto::content).toList())
             .as("注入的 busy-queued user 消息必须携带原队列 uuid 作消息 id")
@@ -488,7 +488,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             .anyMatch(inj -> busyUuid.equals(inj.uuid()) && "忙时追问".equals(inj.content())
                 && "busy-queued".equals(inj.queuedOrigin()));
         // ⑤ 不进图片分支：注入消息无 contentBlocks/imagePasteIds（纯文本 queued_command）
-        assertThat(state.messages().stream()
+        assertThat(state.rawMessages().stream()
             .filter(m -> m.role() == Role.user && busyUuid.equals(m.id()))
             .findFirst().orElseThrow())
             .as("busy-queued 恒走纯文本分支（无图片 block，不误附残留 pending 图片）")

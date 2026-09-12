@@ -77,10 +77,10 @@ class LlmAgentLoopCompactPersistFailLoudTest {
         invokePersistCompactedMessages(state, postCompact);
 
         // ① 内存替换（本 run 请求面用压缩后视图，不阻断主循环）
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("落库不可用时内存仍须替换为压缩后视图（服务本 run 的请求面）")
             .hasSize(2);
-        assertThat(state.messages().get(0).id()).isEqualTo("boundary-1");
+        assertThat(state.rawMessages().get(0).id()).isEqualTo("boundary-1");
 
         // ② 显式失败：ERROR 级日志明确「未写入历史」（旧实现的 log.info「已 append-only 落库」= 假成功）
         List<String> errors = appender.list.stream()
@@ -126,7 +126,7 @@ class LlmAgentLoopCompactPersistFailLoudTest {
         assertThat(persisted.get())
             .as("已武装必须把 post-compact 消息集交给落库通道")
             .isEqualTo(postCompact);
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("内存必须用落库返回的归一化列表覆盖（memory 与 DB id 一致）")
             .isEqualTo(normalized);
         assertThat(appender.list.stream()

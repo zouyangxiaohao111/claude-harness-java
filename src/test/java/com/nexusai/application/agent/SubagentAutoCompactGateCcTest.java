@@ -68,7 +68,7 @@ class SubagentAutoCompactGateCcTest {
         QueryParams params = forLoopParams(ctx, QuerySource.SUBAGENT, state);
         LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("子代理超阈必须触发自动压缩（CC shouldAutoCompact 无 agent:* 守卫；DRIFT-8/S-8）")
             .anyMatch(m -> "compact_boundary".equals(m.subtype()));
     }
@@ -85,7 +85,7 @@ class SubagentAutoCompactGateCcTest {
         QueryParams params = forLoopParams(ctx, QuerySource.FORK, state);
         LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("fork 子代理超阈必须触发自动压缩（CC runAgent.ts:748 同一 query()，agent:builtin:fork 非守卫源）")
             .anyMatch(m -> "compact_boundary".equals(m.subtype()));
     }
@@ -103,7 +103,7 @@ class SubagentAutoCompactGateCcTest {
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
         LoopResult result = LlmAgentLoop.queryLoop(params, state, new ArrayList<>(), auto);
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("主线程超阈必须触发自动压缩（既有行为保持）")
             .anyMatch(m -> "compact_boundary".equals(m.subtype()));
     }
@@ -118,7 +118,7 @@ class SubagentAutoCompactGateCcTest {
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.COMPACT, state);
-        assertThat(state.messages())
+        assertThat(state.rawMessages())
             .as("querySource=compact（压缩 fork）必须被递归守卫拦截，永不自动压缩（autoCompact.ts:171-173；S-3 风险注记）")
             .noneMatch(m -> "compact_boundary".equals(m.subtype()));
     }
@@ -153,7 +153,7 @@ class SubagentAutoCompactGateCcTest {
             @Override public boolean isMainLoop() { return true; }
         };
         return QueryParams.forLoop(
-            state.messages(), null,
+            state.rawMessages(), null,
             ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             source, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());

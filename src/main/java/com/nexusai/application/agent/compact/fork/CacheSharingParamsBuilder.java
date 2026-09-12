@@ -78,7 +78,7 @@ public final class CacheSharingParamsBuilder {
      *                             {@code context}（compact.ts:285；Java 取 params.toolUseContext()）
      * @param forkContextMessages  主线程压缩前消息（cache prefix 复用）· CC original:
      *                             {@code forkContextMessages}（compact.ts:286；Java 取
-     *                             autoCompact 触发点 state.messages() 压缩前快照）
+     *                             autoCompact 触发点 state.rawMessages() 压缩前快照）
      * @param useGlobalCacheScope  boundary/gate 判定值（fork 与主线程一致）· CC original:
      *                             {@code shouldUseGlobalCacheScope()}（utils/betas.ts:227-233）；
      *                             Java 由调用方注入（LlmAgentLoop auto / CompactCommand manual）

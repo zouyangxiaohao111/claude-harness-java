@@ -314,7 +314,7 @@ public class CommandRegistrationConfigGroupB {
                 return UserInputDispatcher.LocalCommandResult.text(
                     "/force-snip 会话未注册 AgentState（无进行中循环）。");
             }
-            List<ChatMessageDto> messages = state.messages();
+            List<ChatMessageDto> messages = state.rawMessages();
             if (messages == null || messages.isEmpty()) {
                 log.warn("[CommandRegistrationConfigGroupB] /force-snip 会话消息为空: sessionId={}", rawSessionId);
                 return UserInputDispatcher.LocalCommandResult.text("/force-snip 会话消息为空。");

@@ -1119,7 +1119,7 @@ public class LlmAgentLoop implements AgentLoop {
             state.replaceMessages(normalized != null ? normalized : postCompactMessages);
             if (log.isInfoEnabled()) {
                 log.info("[compact-persist] compact 结果已 append-only 落库（不删旧行）: session={} 条数={}",
-                    sid, state.messages().size());
+                    sid, state.rawMessages().size());
             }
         } catch (Exception e) {
             // fail-loud（规则十二）：未落库 → 下轮 run 从 DB 恢复压缩前全量 → 会重复压缩（显式失败，非静默）
@@ -2434,7 +2434,7 @@ public class LlmAgentLoop implements AgentLoop {
         // WHY: 现状 doRun 每 run 新建 AgentState（本行）只 append 当前用户消息（:2522），resume
         //   会话模型上下文无先前消息。本块把 DB 历史（listForResumeExcluding：排除在途当前用户消息 +
         //   SessionResumeDeserializer 中断语义漏斗，CC deserializeMessagesWithInterruptDetection:167-255）
-        //   全量灌入 state.messages()，使 messagesForLlm / messagesForQuery / auto-compact 全部看到
+        //   全量灌入 state.rawMessages()，使 messagesForLlm / messagesForQuery / auto-compact 全部看到
         //   全量上下文（CC query({messages: resumeMessages}) 全量注入历史无裁剪，靠 auto-compact 压窗）。
         //   注入必须早于 :2035 countStructuredOutputCalls 基线（历史含 StructuredOutput 调用时
         //   基线/每轮 delta 口径一致，防 enforcement 误触发）。
@@ -2457,7 +2457,7 @@ public class LlmAgentLoop implements AgentLoop {
         //   resume 边界「无条件重跑并 push」，见 CC conversationRecovery.ts:565-568）；同进程内已跑过的会话
         //   （热）§14 整段跳过（对齐 CC 同进程内轮不重跑）。B 级 resumedFromDb 局部变量（按「DB 历史空不空」
         //   判续聊）已删除——它会把「重启后首条消息」误判为续聊而整体跳过，丢失 watchPaths 副作用补回。
-        //   cold 判据求值在 §14 门控（见下方）；本恢复块只负责把 DB 历史灌入 state.messages()，供 §14 cold
+        //   cold 判据求值在 §14 门控（见下方）；本恢复块只负责把 DB 历史灌入 state.rawMessages()，供 §14 cold
         //   时的 V1「存在即跳过」注入去重消费（恢复历史已含 hook_additional_context 副本 → 跑副作用不重注入）。
         //   真子代理不调 LlmAgentLoop.run（SubagentExecutor.java:2015）不涉及。
         // [fix-loop-resume-history] 会话原始转录一次性读取（消除重复 DB I/O · 低效非错误）：
@@ -2485,7 +2485,7 @@ public class LlmAgentLoop implements AgentLoop {
                     filterIncompleteAssistantToolCalls(
                         messageService.listForResumeExcluding(resumeRawTranscript, streamUserMessageId)));
                 if (resumeHistory != null && !resumeHistory.isEmpty()) {
-                    // [C 级 2026-09-07] 恢复注入块只把 DB 既有历史灌入 state.messages()（注册 prePersisted +
+                    // [C 级 2026-09-07] 恢复注入块只把 DB 既有历史灌入 state.rawMessages()（注册 prePersisted +
                     //   appendMessage 循环，供消息产出钩子跳过历史 id）。§14 SessionStart 是否执行由进程级
                     //   cold 判据（SessionStartSeenRegistry）在下方门控求值，不再按「本分支是否恢复出历史」判断
                     //   ——resumed 与否只影响 V1 注入去重（恢复历史已含 hook 副本则不重注入），不阻断 cold 重启后
@@ -2645,7 +2645,7 @@ public class LlmAgentLoop implements AgentLoop {
                 //   R1（loop 暴露 schema 专用工具）与 R2（MAX_STRUCTURED_OUTPUT_RETRIES 安全阀）
                 //   都从 state 读取本字段（不引入 QueryParams 字段改动）。
                 state.setStructuredOutputJsonSchema(params.jsonSchema());
-                state.setInitialStructuredOutputCalls(countStructuredOutputCalls(state.messages()));
+                state.setInitialStructuredOutputCalls(countStructuredOutputCalls(state.rawMessages()));
                 if (log.isInfoEnabled()) {
                     log.info("[LlmAgentLoop] 主循环 structured output enforcement 已注册: sessionId={} jsonSchema 属性数={} initialStructuredOutputCalls={} (CC QueryEngine.ts:331-333)",
                         sessionId, params.jsonSchema().size(), state.initialStructuredOutputCalls());
@@ -3379,7 +3379,7 @@ public class LlmAgentLoop implements AgentLoop {
         //   （web 主线程）当前用户消息经 notificationQueue 入队（上 :3151），真正 append 在 do-while 首轮
         //   turn-0 drain（loop 内 :4721 → :8320）→ 原实现使清单排到用户消息<b>之前</b>（全新会话即 index 0 =
         //   头部），与 CC [userMessage, ...attachments] 相反。现注入下移至 loop() turn-0 drain 之后，
-        //   确保当前用户消息先入 state.messages()、清单尾随其后。resume 判据仍复用本处 skillListingResume
+        //   确保当前用户消息先入 state.rawMessages()、清单尾随其后。resume 判据仍复用本处 skillListingResume
         //   （会话有历史续跑，非 JVM 冷热），经 queryLoop 透传进 loop。
         // [queue-full-align P1 + P3] now 优先级中断消费方 + run 队列引用捕获（对齐 CC print.ts:1858-1863）
         // Priority.NOW 枚举存在（NotificationQueue）但 0 生产者 + 0 消费方 → 本步补消费方：
@@ -3450,7 +3450,7 @@ public class LlmAgentLoop implements AgentLoop {
         MainLoopDeps mainDeps = new MainLoopDeps(mainCtx, this::getModelForCall);
         com.nexusai.application.agent.loop.QueryParams queryParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
-                state.messages(), params.systemPrompt(), baseTuc, querySource, modelName,
+                state.rawMessages(), params.systemPrompt(), baseTuc, querySource, modelName,
                 maxTurns, params.taskBudget(), params.fallbackModel(),
                 params.skipCacheWrite(), params.maxOutputTokensOverride(),
                 mainDeps, params.config());
@@ -3484,7 +3484,7 @@ public class LlmAgentLoop implements AgentLoop {
         }
 
         log.info("LlmAgentLoop.run done: turns={} msgs={} exit={} error={}",
-            out.turnCount(), out.messages().size(), out.exitReason(), out.lastError());
+            out.turnCount(), out.rawMessages().size(), out.exitReason(), out.lastError());
 
         // 事件 4：loop 退出
         publishEvent(new AgentLoopExitedEvent(out, out.exitReason(), out.turnCount()));
@@ -4061,7 +4061,7 @@ public class LlmAgentLoop implements AgentLoop {
      * <p>源数据与 CC 一一对应：sysPromptCtxProvider/sysPromptAssembler（loop 局部会话级组件）、
      * {@code state.systemPrompt()}（CC {@code context.options.customSystemPrompt} compact.ts:269）、
      * {@code params.toolUseContext()}（CC {@code context} compact.ts:285，fork 继承权限）、
-     * {@code state.messages()} 压缩前快照（CC {@code messagesForCompact} compact.ts:104）。
+     * {@code state.rawMessages()} 压缩前快照（CC {@code messagesForCompact} compact.ts:104）。
      * defaultAssemble 经 sysPromptAssembler.assemble + buildSystemPromptAssemblyInput（CC
      * {@code getSystemPrompt(tools, model, dirs, mcpClients)} compact.ts:259-263）。
      *
@@ -4088,7 +4088,11 @@ public class LlmAgentLoop implements AgentLoop {
                 state.systemPrompt(),
                 state.appendSystemPrompt(),               // [RES-SP31] 接线：fork 缓存共享 append 恒末尾（CC compact.ts:274）
                 params.toolUseContext(),
-                new ArrayList<>(state.messages()),
+                // [D10 双视图] 选边 = modelView()（模型面）。CC getCacheSharingParams 的
+                //   forkContextMessages 在调用点取自 messagesForQuery（query.ts:868/1417
+                //   `forkContextMessages: messagesForQuery`）→ 必须是**投影后**的模型视图，
+                //   否则 fork 缓存前缀会带上 pre-boundary 历史（凭证与主请求不一致 + 泄漏被裁内容）。
+                new ArrayList<>(state.modelView()),
                 useGlobalCacheScope(params.config()));    // [RES-R4] fork 与主线程同一 gate 判定（REQ-R4-3）
         } catch (Exception e) {
             log.warn("[LlmAgentLoop] turn={} 构建 CacheSafeParams 失败，跳过 fork 缓存共享（不阻断压缩）: {}",
@@ -4846,7 +4850,7 @@ public class LlmAgentLoop implements AgentLoop {
                 com.nexusai.application.agent.tool.AbortController turnAbort =
                     params.toolUseContext() != null ? params.toolUseContext().abortController() : null;
                 // MEM-03：turn 级 abort 控制器透传（CC attachments.ts:2390 createChildAbortController）
-                pendingMemoryPrefetch = ctx.memoryPrefetcher().startPrefetch(state.messages(), readFileState, turnAbort);
+                pendingMemoryPrefetch = ctx.memoryPrefetcher().startPrefetch(state.rawMessages(), readFileState, turnAbort);
             } catch (Exception e) {
                 log.debug("[LlmAgentLoop] turn={} relevant-memories prefetch 启动失败（跳过预取）: {}",
                     state.turnCount(), e.getMessage());
@@ -5036,7 +5040,7 @@ public class LlmAgentLoop implements AgentLoop {
             // 不重新 snapshot）。本检查只在 state.structuredOutputJsonSchema() 非 null（结构化输出
             // 模式）时激活，其余 run 零变化。
             if (state.structuredOutputJsonSchema() != null) {
-                int callsThisQuery = countStructuredOutputCalls(state.messages())
+                int callsThisQuery = countStructuredOutputCalls(state.rawMessages())
                         - state.initialStructuredOutputCalls();
                 int maxRetries = maxStructuredOutputRetries();
                 if (callsThisQuery >= maxRetries) {
@@ -5048,71 +5052,60 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
 
-            // ── [IMP-12/DRIFT-17] 循环入口 boundary 剥离 + snip 投影 · CC query.ts:523
+            // ── [IMP-12/DRIFT-17 + D10 双视图 2026-09-12] 循环入口：模型视图**派生** · CC query.ts:523
             //    `let messagesForQuery = getMessagesAfterCompactBoundary(messages)` ──
-            // 从最后一个 compact boundary（含）向后切片，去 pre-boundary 冗余历史。
+            // 从最后一个 compact boundary（含）向后切片 + snip 投影（剔除 removedUuids），去 pre-boundary
+            // 冗余历史 —— 这是**模型视图**，由 {@link AgentState#modelView()} 单点派生。
             //
-            // ⚠️ [snip-state-fix 2026-09-10 · 为什么这里"故意"用单参重载（includeSnipped=false）]
-            //   单参重载（BoundaryReader:203-205）恒传 false ⇒ 除切片外还会应用 projectSnippedView
-            //   （收集**全部** snip_boundary 的 removedUuids）把被裁剪消息一并剔除；结果经
-            //   state.replaceMessages **写回内存清单**。这不是 bug、是**有意为之且被全仓依赖**的语义，
-            //   不要"修"成 includeSnipped=true：
+            // ⚠️ [D10 双视图 · 改造说明] 改造前此处是 `state.replaceMessages(compactTarget)`：
+            //   投影**破坏性写回** state，pre-boundary 全量当场从内存消失（只剩 DB），
+            //   且同一个 getter 在入口前/后语义不同（判定靠数行号）= 审计所称「靠自觉」的根因。
+            //   双视图后：{@code state.rawMessages()} 全量保活、永不投影；投影只**派生**不写回 ——
+            //   与 CC 完全同构（CC 的 {@code messages} 形参一直活着，{@code messagesForQuery}
+            //   是另起名字的派生局部，两者同时存在）。
+            //   所有"模型相邻"消费点已逐个显式选边到 {@code state.modelView()}（见下方各调用点注释），
+            //   「要真实历史」的消费点用 {@code state.rawMessages()}。新增消费方**必须在编译期选一个名字**。
+            //
+            // ⚠️ [snip-state-fix 2026-09-10 保留结论 · 为什么"故意"用单参重载（includeSnipped=false）]
+            //   单参重载恒传 false ⇒ 除切片外还会应用 projectSnippedView（收集**全部** snip_boundary 的
+            //   removedUuids）把被裁剪消息一并剔除。不要"修"成 includeSnipped=true：
             //   ⚠️ [N2 2026-09-11 · 回放门] 该投影**不受** historySnip 运行时开关门控（决策 B：
-            //      历史 snip 不复活）。即：此处是**回放门**——只要历史里有 snip_boundary 就剔除其
-            //      removedUuids（与 compact boundary 剥离对称，后者本就恒定无门）；开关只管**执行门**
+            //      历史 snip 不复活）—— 只要历史里有 snip_boundary 就剔除其 removedUuids
+            //      （与 compact boundary 剥离对称，后者本就恒定无门）；开关只管**执行门**
             //      （下方 snip 步骤 `if (historySnipEnabled)` 是否产生**新** snip）。无 snip 历史时
             //      projectSnippedView 原样返回 → 行为与改前一致。CC 的 feature('HISTORY_SNIP') 是
             //      构建期常量（messages.ts:5088），两语义在 CC 天然同源，本仓因改运行时开关才拆分。
-            //     · 本仓 state.messages() 在循环里扮演的是 CC `messagesForQuery` 的角色 —— CC 的
-            //       query() 全程只用 messagesForQuery（:746 发模型 / :660 fork 上下文 /
-            //       :836,:855 token 扣减 / :1520,:1575,:1613 stop hook），全量 `messages` 只被读
-            //       一次（:523 生成 messagesForQuery），其唯一去处是 REPL/界面滚动回看；
-            //     · 本仓「REPL 全量历史」那一份由 **DB** 承担（前端/轨迹读 DB；DB append-only
-            //       从不删行）—— 循环内的 state 无需再留第二份全量；
-            //     · 目前约 10 个"模型相邻"消费点**直接吃 state.messages()** 并依赖它已投影
-            //       （用「搜关键字」而非行号定位，避免行号漂移误导；全部在本文件内 grep 即得）：
-            //         `tryReactiveCompact(new ReactiveCompactor.TryReactiveCompactParams(` 的 messages 实参
-            //         `buildCompactCacheSafeParams` 内的 `new ArrayList<>(state.messages())`
-            //         `recoverFromOverflow(state.messages()`
-            //         `executeStopHooksCollecting` 两处 messages 实参
-            //         `executeExtractMemoriesAndAutoDream(... List.copyOf(state.messages())`
-            //         `ForkRawMaterial(List.copyOf(state.messages())`
-            //         `PostSamplingContext(` 的 messages 实参
-            //       改成 includeSnipped=true 会让它们**集体**从「已过滤」翻转为「未过滤」，
-            //       实测后果：reactive compact 把被裁剪内容摘要后**回灌模型**、
-            //       extract-memories/auto-dream 把被裁剪内容**写进 memory 文件**（永久污染）、
-            //       compact 的 cache-safe 上下文与真实压缩输入分歧。
-            //     ⇒ 真要在内存里保留全量（例如让 hook/UI 看到真实历史），必须**同时**把上面这些
-            //       消费点逐个改成显式取投影面，否则静默泄漏。CC 侧对应物见 query.ts:1407-1416
-            //       （reactive compact 亦传 messagesForQuery）。
+            //   · 改成 includeSnipped=true 会让所有已选边到 modelView() 的消费点**集体**翻转为
+            //     「未过滤」，实测后果：reactive compact 把被裁剪内容摘要后**回灌模型**、
+            //     extract-memories/auto-dream 把被裁剪内容**写进 memory 文件**（永久污染）、
+            //     compact 的 cache-safe 上下文与真实压缩输入分歧。CC 侧对应物见 query.ts:1407-1416
+            //     （reactive compact 亦传 messagesForQuery）。
+            //   · 本仓「REPL/界面全量历史」那一份由 **DB** 承担（前端/轨迹读 DB；DB append-only 不删行），
+            //     另加本批新增的内存 {@code rawMessages()}（供 hook/落库/血缘/持久化显式取全量）。
             //
-            // 边界情况：**无** compact boundary 时本块同样可能替换 state —— projectSnippedView
-            //   只做删除（removedSet 非空则 filter，绝不等量改写），故 size 判据有效、不会漏判；
-            //   即"无 boundary → 不替换"仅在 snip 也没裁剪过任何消息时成立。
-            int preBoundaryCount = state.messages().size();
-            List<ChatMessageDto> compactTarget = BoundaryReader.getMessagesAfterCompactBoundary(state.messages());
-            if (compactTarget.size() != preBoundaryCount) {
-                state.replaceMessages(compactTarget);
-                log.info("[LlmAgentLoop] turn={} 循环入口 boundary 剥离/裁剪投影: {} → {} messages（state=CC messagesForQuery 角色）· CC query.ts:523",
-                    state.turnCount(), preBoundaryCount, compactTarget.size());
+            // 边界情况：无 boundary 且无 snip 裁剪时 {@code modelView()} 内容与 {@code rawMessages()}
+            //   逐条相同（同 size，不触发下面的日志）。
+            List<ChatMessageDto> entryModelView = state.modelView();
+            int preBoundaryCount = state.rawMessages().size();
+            if (entryModelView.size() != preBoundaryCount) {
+                log.info("[LlmAgentLoop] turn={} 循环入口模型视图派生（不写回 state，全量保活）: 全量 {} → 模型视图 {} messages · CC query.ts:523 + D10 双视图",
+                    state.turnCount(), preBoundaryCount, entryModelView.size());
             }
 
             // ── [B5 d-2] 请求级投影局部 messagesForQuery · CC query.ts:523
             //    `let messagesForQuery = [...getMessagesAfterCompactBoundary(messages)]` ──
-            // 对齐 CC：请求面压缩链（snip/micro/collapse/autocompact）**只替换本局部**。
-            // ⚠️ 但 state.messages() **不是**「保持完整」：snip 的那一份在入口（上方 boundary 剥离块）
-            //   已随 projectSnippedView 写回 state —— 本仓 state 承担 CC `messagesForQuery` 的角色
-            //   （详见该块注释）。本局部只是在其之上再做**本轮**的请求级压缩。
-            //   「removedUuids 消息保留全量」说的是 **DB**（append-only 不删行），**不是内存 state**。
+            // 对齐 CC：请求面压缩链（snip/micro/collapse/autocompact）**只替换本局部**、不写回 state。
+            // [D10 双视图] 本局部的**派生源**从「已被入口写回的 state」改为 {@code state.modelView()}
+            //   —— 派生规则逐字相同，故内容与改造前逐条一致（回归底线：模型面行为不变）。
             // 防御性拷贝隔离后续 state 变异（relevant_memories append / deferred_tools_delta append /
-            // reactive replace），默认（historySnip 关 + 无压缩触发）本局部内容 == state.messages()。
+            // reactive replace），默认（historySnip 关 + 无压缩触发）本局部内容 == state.rawMessages()。
             // [toolsum-display 2026-09-09] tool_use_summary 是 UI 展示行（DB 落库 / 前端渲染），
             // 绝不进模型上下文（防摘要批次变动断前缀缓存）。messagesForQuery 是 messagesForLlm /
             // token 测量 / snip-micro-collapse-autocompact 的共同快照源，在此剔除摘要行覆盖全链路
             // （实时多迭代 / stop-hook 重入 / DB 恢复注入后的新一轮都经此快照）。
             // 注：本迭代 await 的 summary append 晚于此快照；过滤主要拦截「上一轮/恢复注入」的摘要行。
             List<ChatMessageDto> messagesForQuery = new ArrayList<>();
-            for (ChatMessageDto m : state.messages()) {
+            for (ChatMessageDto m : entryModelView) {
                 if (isToolUseSummaryRow(m)) {
                     if (log.isDebugEnabled()) {
                         log.debug("[LlmAgentLoop] messagesForQuery 剔除 tool_use_summary 展示行（不进模型）: id={} contentLen={}",
@@ -5240,7 +5233,7 @@ public class LlmAgentLoop implements AgentLoop {
             SkillSearchPrefetch.PrefetchHandle pendingSkillPrefetch = null;
             if (ctx.featureFlags().skillPrefetch() && ctx.skillSearchPrefetch() != null) {
                 pendingSkillPrefetch = ctx.skillSearchPrefetch().startSkillDiscoveryPrefetch(
-                    null, state.messages(), params.toolUseContext());
+                    null, state.rawMessages(), params.toolUseContext());
                 if (log.isDebugEnabled()) {
                     log.debug("[LlmAgentLoop] turn={} skillPrefetch start (handle 非空={}) · CC query.ts:331-335",
                         state.turnCount(), pendingSkillPrefetch != null);
@@ -5291,7 +5284,7 @@ public class LlmAgentLoop implements AgentLoop {
                 snipTokensFreed = snipResult.tokensFreed();
                 // [B5 d-2] CC query.ts:591-595 `messagesForQuery = snipResult.messages` 请求级投影：
                 // 只替换局部 messagesForQuery，不做 DB 层的持久化删除（removedUuids 消息在 **DB** 仍在）。
-                // ⚠️ 内存层面：被 snip 消息**已在入口 boundary 剥离块**从 state.messages() 移除
+                // ⚠️ 内存层面：被 snip 消息**已在入口 boundary 剥离块**从 state.rawMessages() 移除
                 //   （见该块注释）—— 故本处对 state 而言是幂等空操作，**不是**「state 仍留着它们」。
                 // 未执行（无 boundary）时 messages 与入参同引用 → 赋值无副作用。
                 messagesForQuery = snipResult.messages();
@@ -5362,7 +5355,7 @@ public class LlmAgentLoop implements AgentLoop {
             if (autoCompactor != null) {
                 // [RES-②] fork 缓存共享参数生产（CC getCacheSharingParams compact.ts:250-287）：
                 // 压缩前用 loop 局部 sysPromptCtxProvider/sysPromptAssembler/state.systemPrompt()/
-                // params.toolUseContext()/state.messages()（压缩前快照）构建 CacheSafeParams →
+                // params.toolUseContext()/state.rawMessages()（压缩前快照）构建 CacheSafeParams →
                 // CacheSafeParamsHolder.save（forkedAgent.ts:70-74 saveCacheSafeParams 等价）。
                 // autoCompactIfNeeded 同步调用 compactCallback.summarize → StreamCompactSummary 经
                 // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
@@ -5418,10 +5411,10 @@ public class LlmAgentLoop implements AgentLoop {
                         //   boundary/summary 新行 + 把 kept 段 created_at 重挂到 boundary 之后，绝不删旧行；
                         //   加载/请求侧按最后 boundary 剪枝）。否则只改内存 → 每 run 从 DB 恢复全量 →
                         //   反复自动压缩。persistCompactedMessages 内部以归一化列表覆盖 state，
-                        //   故 messagesForQuery 取 state.messages() 的<b>拷贝</b>
+                        //   故 messagesForQuery 取 state.rawMessages() 的<b>拷贝</b>
                         //   （与 DB id 一致；拷贝保持「本局部与 state 隔离」不变量，见 :4800 防御性拷贝注释）。
                         persistCompactedMessages(state, l4Result.messages());
-                        messagesForQuery = new ArrayList<>(state.messages());
+                        messagesForQuery = new ArrayList<>(state.rawMessages());
                         // [H7-arch Phase 5 P4 C1] 本 turn 已压缩 → blocking-limit 跳过（CC: !compactionResult）
                         justCompacted = true;
                         // [MISS-3/IMP2-07] 压缩成功复位 → AutoCompactTrackingState.recordSuccess 内
@@ -5496,7 +5489,7 @@ public class LlmAgentLoop implements AgentLoop {
             LlmProvider provider = ctx.llmProviderFactory().getProvider(params.config(),
                 resolveMainProviderType(ctx, params.modelName()));
             log.debug("LlmAgentLoop turn={} model={} provider={} msgs={}",
-                state.turnCount(), params.modelName(), provider.type(), state.messages().size());
+                state.turnCount(), params.modelName(), provider.type(), state.rawMessages().size());
 
             // Phase 6·s02：捕获 onAssistantMessage 回调里的完整 message
             AssistantMessage[] capturedMsg = {null};
@@ -5530,7 +5523,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   回调里分配 (tool_call 回调早于 onAssistantMessage).
             String turnAssistantId = state.prepareAssistantMessageId();
             // [2026-08-25 flow 重构] 每轮回答归属 userMessageId（消息链推导，对齐 CC parentUuid）：
-            //   工具边界消费排队注入后 state.messages() 最后 user = 排队 uuid；否则 = 本轮 user。
+            //   工具边界消费排队注入后 state.rawMessages() 最后 user = 排队 uuid；否则 = 本轮 user。
             //   作为局部变量传入 provider.stream 回调闭包（同 turnAssistantId 模式），chunk 事件用它
             //   ——多排队连续消费时每轮归属 = 该轮回答的 user，事件/落库同源（替代旧 queuedFlowUuid ThreadLocal）。
             String lastUserMsg = state.lastUserMessageId();
@@ -5568,7 +5561,7 @@ public class LlmAgentLoop implements AgentLoop {
             StreamingToolExecutor[] streamingExecRef = new StreamingToolExecutor[1];
             streamingExecRef[0] = (perTurnTuc != null && !perTurnTuc.availableTools().isEmpty() && streamingEnabled)
                 ? AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc, state, turnAssistantId,
-                    (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
+                    (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
                     true /* deferredModifier */,
                     buildSubagentAgentOptions(params.querySource(), params.thinkingConfig()), null /* assistantMessage 完整回调后注入 */,
                     // [5b] 受限 canUseTool 通道 · 三路生产路径恒 null（forLoop 未注入）→ 回落 beans.permissionGate，
@@ -5818,7 +5811,7 @@ public class LlmAgentLoop implements AgentLoop {
             java.util.List<String> fullSystemPrompt =
                 sysPromptCtxProvider.appendSystemContext(systemPrompt, sysParts.systemContext());
             // [skill-listing-cc-align 2026-09-10] 旧 4.4 skill_listing 头部块已删：skill_listing 现为
-            //   state.messages() 中的真实消息（紧随当前用户消息之后，见 injectSkillListingForRun），
+            //   state.rawMessages() 中的真实消息（紧随当前用户消息之后，见 injectSkillListingForRun），
             //   经 messagesForQuery 自然进入请求，无需 prepend 到队首。
             // 4. prependUserContext（api.ts:449-474）· userContext（claudeMd?/currentDate）前置 meta user 消息
             //    （CLAUDE.md 顶部上下文由此通道注入；空 context → 原列表）
@@ -6055,7 +6048,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   Java 消息模型：author='attachment' + subtype='deferred_tools_delta' + content=JSON payload
             //   （与 compact 路径 PostCompactAttachmentRestorer 同款形状，scanAnnouncedDeltaNames
             //   跨 turn 重建 announced 集依赖该 JSON）。前置到 messagesForLlm（本轮 LLM 可见）
-            //   + 持久化到 state.messages()（persisted attachment，下轮 announced-set 扫描可找回；
+            //   + 持久化到 state.rawMessages()（persisted attachment，下轮 announced-set 扫描可找回；
             //   对齐 CC「persisted deferred_tools_delta attachments」语义）。
             // [prompt-align CTX-09] 双表示：state.appendMessage(dtd) 持久化 JSON（scan 源），LLM 注入
             //   dtd.withContent(renderDeferredToolsDelta(dtd.content())) 人类可读副本（对齐 CC
@@ -6086,14 +6079,14 @@ public class LlmAgentLoop implements AgentLoop {
             // [P0-1 OD-1/OD-3] 发送层包壳 transform（唯一发送边界 · 对齐 CC normalizeMessagesForAPI
             //   messages.ts:2269-2291）：对 messagesForLlm 中 user 且 queuedOrigin 命中消息生成带壳副本
             //   （busy-queued 中文提醒 / task-notification 前缀 / coordinator / channel|server / cron human 壳），
-            //   只改 API-bound 副本不污染 state.messages()；live 与 resume（DB queued_origin 读回）共用 →
+            //   只改 API-bound 副本不污染 state.rawMessages()；live 与 resume（DB queued_origin 读回）共用 →
             //   修 resume 丢壳。MINOR-4 定序：包壳【先于】maybeAppendSnipIdTags —— CC wrapCommandText 先包壳、
             //   appendMessageTagToUserMessage 后追加 [id:xxx]，故 [id] 位于壳外（与 CC 一致）。
             messagesForLlm = wrapQueuedMessagesForApi(messagesForLlm);
             // [snip-ccb-align] [id:xxx] tag 注入（对齐 CCB messages.ts:2667-2686 appendMessageTagToUserMessage）：
             //   HISTORY_SNIP 门控给 user 消息（非 isMeta）API 副本末尾追加 [id:<6位短id>]，
             //   让模型能引用消息 ID 调用 SnipTool。只改发送副本（ChatMessageDto.withContent），
-            //   不污染 state.messages()；门关 → 原引用（零行为变化）。
+            //   不污染 state.rawMessages()；门关 → 原引用（零行为变化）。
             messagesForLlm = AgentLoopContext.maybeAppendSnipIdTags(ctx, settingsResolver, messagesForLlm);
             // [bg-wait-hint Layer-1] 消费 doRun 暂存的后台等待提示（每 run 仅一次：takePending 清空）
             if (ctx.sessionState() != null) {
@@ -6201,7 +6194,7 @@ public class LlmAgentLoop implements AgentLoop {
                             streamingExecRef[0].discard();
                             streamingExecRef[0] = AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc,
                                 state, turnAssistantId,
-                                (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
+                                (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
                                 true /* deferredModifier */,
                                 buildSubagentAgentOptions(params.querySource(), params.thinkingConfig()), null,
                                 params.canUseTool()); // [5b] 受限 canUseTool 通道（三路生产路径恒 null → 现状）
@@ -6909,7 +6902,7 @@ public class LlmAgentLoop implements AgentLoop {
                     //
                     // Java 同步模型等价实现（行为对齐 CC）：错误消息在本作用域保留（ptlErrMsg /
                     // mediaErrMsg = CC 内部 assistantMessages 条目），恢复窗口内【不 commit 到
-                    // state.messages()】——保持 drain / reactive compact 输入 = 压缩前消息（对齐 CC
+                    // state.rawMessages()】——保持 drain / reactive compact 输入 = 压缩前消息（对齐 CC
                     // messagesForQuery 不含失败请求错误消息 · query.ts:1095/1124），即「不 yield /
                     // 不 commit 给前端」；恢复成功 → 不 commit（CC 压缩 replaceMessages 丢弃该消息）；
                     // 恢复失败 → 下方 surfaceRecoveryFailure 显式 commit 被 withhold 的错误消息
@@ -6937,7 +6930,10 @@ public class LlmAgentLoop implements AgentLoop {
                         // Gate: 上次不是 COLLAPSE_DRAIN_RETRY（已 drain 过 → 跳过 drain 直接 reactive compact）
                         if (withheldByCollapse && recoveryState.getLastReason() != LoopReason.COLLAPSE_DRAIN_RETRY) {
                             ContextCollapse.DrainResult drain =
-                                ctx.contextCollapse().recoverFromOverflow(state.messages(), params.querySource().canonical());
+                                // [D10 双视图] 选边 = modelView()（模型面）。CC query.ts:875
+                                //   `messagesForQuery = buildPostCompactMessages(...)` 的输入是
+                                //   **投影后**数组；取全量会把 pre-boundary 历史重新灌回压缩结果。
+                                ctx.contextCollapse().recoverFromOverflow(state.modelView(), params.querySource().canonical());
                             if (drain.hasEffect()) {
                                 state.replaceMessages(drain.messages());
                                 recoveryState.setLastReason(LoopReason.COLLAPSE_DRAIN_RETRY);
@@ -7005,7 +7001,7 @@ public class LlmAgentLoop implements AgentLoop {
                         }
                         // [S4-L5] fork 缓存共享参数生产（CC getCacheSharingParams compact.ts:250-287）：
                         // reactive 路径与 auto 路径（:3590-3592）同构——用 loop 局部 sysPromptCtxProvider/
-                        // sysPromptAssembler/state.systemPrompt()/params.toolUseContext()/state.messages()（压缩前
+                        // sysPromptAssembler/state.systemPrompt()/params.toolUseContext()/state.rawMessages()（压缩前
                         // 快照）构建 CacheSafeParams → CacheSafeParamsHolder.save（forkedAgent.ts:70-74
                         // saveCacheSafeParams 等价）。tryReactiveCompact 经 compactCallback.summarize →
                         // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
@@ -7020,16 +7016,24 @@ public class LlmAgentLoop implements AgentLoop {
                                     recoveryState.isHasAttemptedReactiveCompact(),
                                     params.querySource().canonical(),
                                     state.cancelled(),
-                                    state.messages(),
+                                    // [D10 双视图] 选边 = modelView()（模型面）。CC query.ts:1411/1495
+                                    //   的 reactive compact 亦传 messagesForQuery（【本批已登记清单第 1 条】）——
+                                    //   取全量会把 pre-boundary 历史摘要后**回灌模型**并污染压缩结果。
+                                    state.modelView(),
                                     reactiveCacheSafeParams,
                                     reactiveCcCtx));
                         if (compacted != null) {
-                            int before = state.messages().size();
+                            // [D10 双视图] 选边 = modelView()：日志对比的是「本轮送压缩的模型视图 → 压缩后」，
+                            //   取全量会让前后口径不一致（全量含 pre-boundary，压缩后不含）。
+                            int before = state.modelView().size();
                             // [ER-IMP-13] task_budget 跨 reactive compact 结转 · CC query.ts:1138-1146
                             // 同 proactive 路径（query.ts:508-515）：replaceMessages 对旧列表 in-place
                             // clear+addAll（AgentState.java:520-522），必须先拷贝 preCompact，否则
                             // finalContextTokensFromLastResponse 读到压缩后列表 → 0（measured 失真）。
-                            java.util.List<ChatMessageDto> preCompactMessages = new java.util.ArrayList<>(state.messages());
+                            // [D10 双视图] 选边 = modelView()（模型面测量源）。CC query.ts:1427
+                            //   `finalContextTokensFromLastResponse(messagesForQuery)` —— 压缩前
+                            //   测量源是**投影后**数组（与本轮真正送去压缩的数组同源）。
+                            java.util.List<ChatMessageDto> preCompactMessages = new java.util.ArrayList<>(state.modelView());
                             java.util.List<ChatMessageDto> postCompactMessages = compacted.buildPostCompactMessages();
                             // [SM/compact 对齐 CC] 落库 = append-only（CC transcript append-only；同 proactive 路径）·
                             //   preCompactMessages 快照已在上方替换前拷好（task_budget 结转仍需压缩前数组）。
@@ -7118,13 +7122,13 @@ public class LlmAgentLoop implements AgentLoop {
                 //   assistantMessages.flatMap(... tool_use 块).length（全量 tool_use 块数）。
                 //   旧实现仅计当前失败流的单条 capturedMsg（0/1）+ 其 toolCalls —— 半实现。
                 //   修复：assistantMessages 对应当前 query 已提交的 assistant 消息，Java 侧等价
-                //   数据 = state.messages() 中 role==assistant 的已提交消息（含本轮捕获的
+                //   数据 = state.rawMessages() 中 role==assistant 的已提交消息（含本轮捕获的
                 //   capturedMsg，其未提交时 CC 亦未入 assistantMessages 数组 → 语义一致）。
                 AssistantMessage erroredMsg = capturedMsg[0];
-                long vfbAssistantCount = state.messages().stream()
+                long vfbAssistantCount = state.rawMessages().stream()
                     .filter(m -> m.role() == com.nexusai.model.session.dto.Role.assistant)
                     .count();
-                long vfbToolUseCount = state.messages().stream()
+                long vfbToolUseCount = state.rawMessages().stream()
                     .filter(m -> m.role() == com.nexusai.model.session.dto.Role.assistant)
                     .flatMap(m -> m.toolCalls() != null ? m.toolCalls().stream() : java.util.stream.Stream.empty())
                     .count();
@@ -7219,8 +7223,16 @@ public class LlmAgentLoop implements AgentLoop {
             // CC postSamplingHooks.ts:45-70 内部遍历 + logError continue，Java 等价 executeAll。
             // [Session H12] hook 接收 REPLHookContext 等价 PostSamplingContext（CC postSamplingHooks.ts:53-60），
             if (msg != null) {
-                java.util.List<com.nexusai.model.session.dto.ChatMessageDto> psBase =
-                        params.messages() != null ? params.messages() : state.messages();
+                // [D10 双视图] 选边 = modelView()（模型面）。post-sampling hook 拿到的
+                //   PostSamplingContext.messages 是 CC `REPLHookContext.messages` 等价物
+                //   （postSamplingHooks.ts:53-60）→ 其源 = query.ts:1288-1289 的 messagesForQuery。
+                //   ⚠️ 计划与代码不符（如实记录）：审计 §八 的"约 10 个消费点"清单把本点写作
+                //   「PostSamplingContext( 的 messages 实参」并假设它吃的是"已投影的 state"，
+                //   实际改造前源码是 `params.messages()`（QueryParams.forLoop 在 run() 入口捕获的
+                //   **活引用**，见审计 §八 绕过点 4）—— 即入口投影对它**根本不生效**，它一直拿全量。
+                //   本批按 CC 语义改为 modelView()：这是**有意**的对齐修复（消掉一个既有绕过点），
+                //   不是"视图从哪来"的机械替换，登记在报告中。
+                java.util.List<com.nexusai.model.session.dto.ChatMessageDto> psBase = state.modelView();
                 // [SM/fork 模型直传] hook 的 toolUseContext 必须是「本轮真正模型」的上下文：
                 //   params.toolUseContext() 是 run 级 TUC，effectiveModelName 恒空 → SM fork 会话模型
                 //   直传解析拿不到模型 → model=null → provider 回落 mock（假回复、永不 Edit）。用本轮
@@ -7547,8 +7559,10 @@ public class LlmAgentLoop implements AgentLoop {
                     //   非交互标记透传（默认 true = 非交互，对齐 CC state.ts:1057-1059）。
                     boolean isNonInteractiveSession = ctx.sdkEventQueue() != null
                         ? ctx.sdkEventQueue().isNonInteractiveSession() : true;
+                    // [D10 双视图] 选边 = modelView()（模型面）：第 3 参 = 「含 tool 结果的消息链」，
+                    //   摘要提示词会把它喂给 Haiku → 与改造前 state（入口写回后 = 投影面）逐条一致。
                     pendingToolUseSummary = ctx.toolUseSummaryGenerator().generateToolUseSummaryAsync(
-                        state, msg.toolCalls(), state.messages(), lastAssistantText, isNonInteractiveSession);
+                        state, msg.toolCalls(), state.modelView(), lastAssistantText, isNonInteractiveSession);
                     log.info("[LlmAgentLoop] turn={} tool_use_summary 生产 (toolCalls={}, agentId=null, isNonInteractiveSession={}) · CC query.ts:1469-1481",
                         state.turnCount(), msg.toolCalls().size(), isNonInteractiveSession);
                 }
@@ -7635,7 +7649,7 @@ public class LlmAgentLoop implements AgentLoop {
             state.setFinishReason("stop");
             // [DEC-04] assistant 消息携带 provider usage · CC finalizeAgentTool message.usage 透传
             //   （agentToolUtils.ts:355）。msg 为 null（异常路径）→ 无 usage 附加。
-            // [同源改造] 4-参补传 turnAssistantId：state.messages() 内该消息 id == 流式
+            // [同源改造] 4-参补传 turnAssistantId：state.rawMessages() 内该消息 id == 流式
             //   chunk.assistantMessageId == 后续 ChatService 落库 id（配合 ChatService B1），三处同源。
             state.appendMessage(toMessage(Role.assistant, text,
                 msg != null ? msg.reasoning() : null, turnAssistantId)
@@ -7786,7 +7800,12 @@ public class LlmAgentLoop implements AgentLoop {
                                 ? Map.copyOf(sysParts.userContext()) : Map.of(),
                             sysParts != null && sysParts.systemContext() != null
                                 ? Map.copyOf(sysParts.systemContext()) : Map.of(),
-                            List.copyOf(state.messages()),
+                            // [D10 双视图] 选边 = modelView()（模型面 · fork 原料）。
+                            //   CC forkedAgent.ts:131-141 createCacheSafeParams 的 messages 源 =
+                            //   query.ts:868/1417 的 messagesForQuery（投影后）；取全量会让
+                            //   extract-memories/auto-dream 把 pre-boundary / 被 snip 内容
+                            //   **写进 memory 文件永久污染**（本文件入口块注释已实测记录该后果）。
+                            List.copyOf(state.modelView()),
                             // [SM-fork 模型直传 2026-09-10] 当轮会话运行模型（= CC
                             //   toolUseContext.options.mainLoopModel）随 fork 原料透传 ——
                             //   extract/dream fork 的 toolUseContext 由此补齐 effectiveModelName，
@@ -7819,7 +7838,10 @@ public class LlmAgentLoop implements AgentLoop {
                         stopMainAgentId,                // 子代理 id（null = 主线程）· CC !toolUseContext.agentId
                         ctx.extractMemoriesAgent(),
                         ctx.autoDreamConsolidator(),    // null = 未注入 → dream 跳过（StopHookPipeline:266）
-                        List.copyOf(state.messages()),  // CC stopHookContext.messages（[...messagesForQuery, ...assistantMessages] 近似）
+                        // [D10 双视图] 选边 = modelView()（模型面）：CC stopHookContext.messages
+                        //   = [...messagesForQuery, ...assistantMessages] 近似 → 必须是投影面，
+                        //   否则记忆提取会把 pre-boundary / 被裁剪内容写进 memory 文件（永久污染）。
+                        List.copyOf(state.modelView()),
                         params.toolUseContext() != null && params.toolUseContext().isNonInteractiveSession(),
                         params.toolUseContext() != null ? params.toolUseContext().appendSystemMessage() : null,
                         MemoryBareModeConfig.isBareMode(), // CC stopHooks.ts:136 if (!isBareMode()) 外层守卫
@@ -7830,10 +7852,11 @@ public class LlmAgentLoop implements AgentLoop {
                     // [IMP-HOOKS-S5 D-11 ①] executeEvent 折叠单条 → executeStopHooksCollecting
                     //   逐 result 消费（CC stopHooks.ts:200-295 for-await 循环：:257-267 全部
                     //   blockingError 逐个 push → 全部注入；:269-280 preventContinuation；
-                    //   :283-294 abort 早返）。messages 传 state.messages()（CC executeStopHooks
-                    //   messages → execPromptHook 会话历史；§14 :4688 同款）。
+                    //   :283-294 abort 早返）。[D10 双视图] 选边 = modelView()（模型面）：
+                    //   CC executeStopHooks 的 messages 源 = messagesForQuery（query.ts:1558）
+                    //   → execPromptHook 会话历史 prepend 的必须是**投影面**（§14 同款，见下方同名调用点）。
                     HookRegistry.StopHookCollectResult loopStopCollect =
-                        ctx.hookRegistry().executeStopHooksCollecting(stopEvent, stopParentTuc, state.messages());
+                        ctx.hookRegistry().executeStopHooksCollecting(stopEvent, stopParentTuc, state.modelView());
                     stopHooksEvaluated = true;
                     if (loopStopCollect != null && !loopStopCollect.results().isEmpty()) {
                         boolean stopAborted = params.toolUseContext() != null
@@ -8099,16 +8122,21 @@ public class LlmAgentLoop implements AgentLoop {
                 params.toolUseContext() != null
                     && params.toolUseContext().permissionMode() == PermissionMode.PLAN,
                 false);
+        // [D10 双视图] 选边 = modelView()（模型面）：SuggestionContext 派生自
+        //   CC stopHookContext.messages（= messagesForQuery），用于生成「下一步建议」的提示词输入。
         StopHookPipeline.executePromptSuggestion(bareMode, ctx.promptSuggestion(),
             com.nexusai.application.agent.api.PromptSuggestion.SuggestionContext.fromMessages(
-                state.messages(), sugAppState));
+                state.modelView(), sugAppState));
         StopHookPipeline.cleanupComputerUseAfterTurn(mainAgentId);
         // [V-TOK-04] stop hooks 已在 do-while 纯文本分支 budget check 前评估 -> 跳过避免双触发
 
         if (ctx.hookRegistry() != null && !stopHooksEvaluated) {
             try {
-                String lastAssistantText = state.messages().isEmpty() ? null :
-                    state.messages().get(state.messages().size() - 1).content();
+                // [D10 双视图] 选边 = modelView()（模型面）：本值进 STOP hook 载荷
+                //   （CC stopHookContext.messages 等价 → messagesForQuery 的末条）。
+                List<ChatMessageDto> stopView = state.modelView();
+                String lastAssistantText = stopView.isEmpty() ? null :
+                    stopView.get(stopView.size() - 1).content();
                 // [对抗核验 H13-GAP-5 v3] STOP 事件注入 agent_type（CC BaseHookInput agent_type,
                 // coreSchemas.ts:393）—— 从 per-turn TUC 读取（子 Agent 循环非 null, 主循环 null =
                 // 对齐 CC hooks.ts:2283-2286 的 hookInput.agent_type ?? undefined）。
@@ -8164,9 +8192,10 @@ public class LlmAgentLoop implements AgentLoop {
                 //   （executeEventAll 逐 hook，对齐 CC stopHooks.ts:175-333 逐 result 累计）。
                 // [H2/CCJ-EXEC-01] messages 透传 · CC hooks.ts:3688-3696 executeStopHooks
                 //   把 messages 传给 executeHooks → execPromptHook 会话历史 prepend；
-                //   state.messages() 在本作用域可用（:4626 lastAssistantText 同源）
+                //   [D10 双视图] 选边 = modelView()（模型面）—— CC 该参数源 = messagesForQuery
+                //   （query.ts:1558/1613），取全量会把 pre-boundary / 被 snip 内容喂给 hook agent。
                 HookRegistry.StopHookCollectResult stopCollect =
-                    ctx.hookRegistry().executeStopHooksCollecting(stopEvent, stopParentTuc, state.messages());
+                    ctx.hookRegistry().executeStopHooksCollecting(stopEvent, stopParentTuc, state.modelView());
                 if (stopCollect != null && !stopCollect.results().isEmpty()) {
                     // [H6] abort 检查（对齐 CC stopHooks.ts:265-282）：中止 → 早返，
                     //   不生成 summary、不重入（Java 批量收集后一次性检查，等价 CC 循环内早返）。
@@ -8194,7 +8223,7 @@ public class LlmAgentLoop implements AgentLoop {
                     } else {
                         // [R6] hookCount>0 → stop_hook_summary（对齐 CC stopHooks.ts:298-308
                         //   createStopHookSummaryMessage → UI transcript）。Java 走 AgentState 本地
-                        //   暂存通道（@JsonIgnore，绝不进 state.messages()，R32C1 防 LLM 上下文污染）。
+                        //   暂存通道（@JsonIgnore，绝不进 state.rawMessages()，R32C1 防 LLM 上下文污染）。
                         if (stopCollect.hookCount() > 0) {
                             CollapseHookSummaries.HookMessage stopSummary = new CollapseHookSummaries.SimpleHookMsg(
                                 // [IMP-HOOKS-S7 H6] hookLabel=null · CC stopHooks.ts:297-308 8 参
@@ -8582,7 +8611,7 @@ public class LlmAgentLoop implements AgentLoop {
             boolean sleepRan) {
         // [2026-08-25 flow 重构] 排队 flow 归属已改每轮 state.lastUserMessageId() 消息链推导
         //   （对齐 CC parentUuid），不再需要工具边界清/set ThreadLocal——排队 user 注入后
-        //   state.messages() 最后 user 即排队 uuid，每轮 turnUserMessageId 自然命中。
+        //   state.rawMessages() 最后 user 即排队 uuid，每轮 turnUserMessageId 自然命中。
         if (ctx == null || ctx.notificationQueue() == null) return 0;
         // [OPD-TP-03] agentId scoping · 对齐 CC query.ts:1569+1574-1577:
         // 主线程只消费 agentId==undefined 的项 (cmd.agentId===undefined);
@@ -8843,7 +8872,7 @@ public class LlmAgentLoop implements AgentLoop {
      * 原文包壳，snip tag 随后追加到最终 content 末尾，故 [id] 位于壳外，与 CC 一致）。
      *
      * <p>遍历 user 消息且 queuedOrigin 命中 → 生成带壳副本（ChatMessageDto.withContent），只改
-     * API-bound 副本，不污染 state.messages()（红线 §六.8：token 估算走 messagesForQuery 注入前基线，
+     * API-bound 副本，不污染 state.rawMessages()（红线 §六.8：token 估算走 messagesForQuery 注入前基线，
      * 本 transform 后置不喂带壳内容）。
      *
      * <p><b>幂等优先（reflector MINOR-1）</b>：content 已以 {@code <system-reminder>} 开头 → 原样跳过。
@@ -9095,7 +9124,7 @@ public class LlmAgentLoop implements AgentLoop {
      * 的 {@code messages: [userMessage, ...attachmentMessages]}（processTextPrompt.ts:97）。
      *
      * <p><b>位置与落库</b>：在 {@code loop()} 首轮 <b>turn-0 drain 之后</b> 调用 →
-     * 此刻当前用户消息（队列 drain / 直拼 / batch）已进入 {@code state.messages()}，{@link
+     * 此刻当前用户消息（队列 drain / 直拼 / batch）已进入 {@code state.rawMessages()}，{@link
      * AgentState#appendMessage} 使注入消息尾随当前用户消息（= CC 首条用户消息之后），并经
      * ChatService 实时落库 appendListener 成为真实消息 → 重放可还原同一位置。
      * <b>位置键 = {@code messages.seq}（V70）非 created_at</b>：落库走 2 参
@@ -9346,7 +9375,7 @@ public class LlmAgentLoop implements AgentLoop {
             state.agentId(), state.sessionId(), mode,
             java.util.Map.of(), baseTools, "",
             runAbortController != null ? runAbortController : com.nexusai.application.agent.tool.AbortController.NOOP,
-            state.messages() != null ? state.messages() : List.of(),
+            state.rawMessages() != null ? state.rawMessages() : List.of(),
             permCtx, mode,
             buildMcpClients(), nonInteractiveSession,
             state.systemPrompt() != null ? state.systemPrompt() : "",
@@ -9600,16 +9629,16 @@ public class LlmAgentLoop implements AgentLoop {
      * chars / 4 (CC rule of thumb 简化版).
      */
     public int estimateTurnTokens(AgentState state) {
-        if (state == null || state.messages() == null) return 0;
+        if (state == null || state.rawMessages() == null) return 0;
         if (tokenEstimator != null) {
             int total = 0;
-            for (ChatMessageDto m : state.messages()) {
+            for (ChatMessageDto m : state.rawMessages()) {
                 total += tokenEstimator.estimateMessageTokens(m);
             }
             return total;
         }
         int chars = 0;
-        for (ChatMessageDto m : state.messages()) {
+        for (ChatMessageDto m : state.rawMessages()) {
             if (m.content() != null) chars += m.content().length();
         }
         return chars / 4;
@@ -9984,7 +10013,7 @@ public class LlmAgentLoop implements AgentLoop {
             streamingExecRef[0].discard();
             streamingExecRef[0] = AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc,
                 state, turnAssistantId,
-                (er, id) -> ToolResultApplier.apply(er, state.messages(), state, id),
+                (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
                 true /* deferredModifier */,
                 buildSubagentAgentOptions(querySource, thinkingConfig), null, canUseTool);
         }
@@ -10196,7 +10225,7 @@ public class LlmAgentLoop implements AgentLoop {
                 // [hook message 普通消息通道] hook_user_message 是 String 消息的包装载体
                 //   （AggregatedHookResult.messageChannel）。CC result.message 是普通 user 消息
                 //   （sessionStart.ts:141-142 hookMessages → initialMessages；toolHooks.ts:478-480
-                //   → resultingMessages）。一次性 appendMessage 进 state.messages()，不常驻
+                //   → resultingMessages）。一次性 appendMessage 进 state.rawMessages()，不常驻
                 //   attachment（避免 maybeInjectHookAttachments 每轮重渲染成 isMeta 消息）。
                 //   hookName 优先取 attachment 自带值（CC attachment.hookName 同源），
                 //   缺省回落到事件名（CC hooks.ts:2123 无 matchQuery 时 hookName == hookEvent）。
@@ -11948,9 +11977,9 @@ public class LlmAgentLoop implements AgentLoop {
 
     /** R32-b14: 统计当前查询中 StructuredOutput tool_use 次数。 */
     public static int countStructuredOutputToolCalls(AgentState state) {
-        if (state == null || state.messages() == null) return 0;
+        if (state == null || state.rawMessages() == null) return 0;
         int count = 0;
-        for (ChatMessageDto message : state.messages()) {
+        for (ChatMessageDto message : state.rawMessages()) {
             if (message == null || message.toolCalls() == null) continue;
             for (ToolCallDto call : message.toolCalls()) {
                 if (call != null
@@ -13459,7 +13488,7 @@ public class LlmAgentLoop implements AgentLoop {
      * 跨所有 user message 累计 {@code maxId + 1} 为下一个 image ID。本方法根据传入的
      * {@code baseId} + {@code imageCount} 生成 {@code [baseId, baseId+1, ..., baseId+imageCount-1]}。
      *
-     * <p>b9 简化: baseId 由调用方提供(state.messages() 中最大 imagePasteIds + 1),
+     * <p>b9 简化: baseId 由调用方提供(state.rawMessages() 中最大 imagePasteIds + 1),
      * 本方法只负责序列生成,避免在工厂内部访问 AgentState(违反 record 静态方法约束)。
      *
      * @param baseId      起始 ID(由 {@code computeNextImagePasteId} 算出)
@@ -13494,7 +13523,7 @@ public class LlmAgentLoop implements AgentLoop {
      * <p>修复: 扫描所有 Role(user + tool + assistant),保证跨 turn 全局单调递增。
      * 仍是 CC 对齐的精神(全局唯一),只是数据载体扩展(record vs raw user msg)。
      *
-     * <p>如果当前 message stream 是 {@code state.messages()} 中既有 message,需调用方
+     * <p>如果当前 message stream 是 {@code state.rawMessages()} 中既有 message,需调用方
      * 排除即将追加的当前 message(否则会得到自身 maxId + 1 重复)。
      *
      * @param messages  当前 turn 前的所有消息
@@ -13696,8 +13725,8 @@ public class LlmAgentLoop implements AgentLoop {
      * <p>Java 端 toolUseBlocks 等价 = 反向扫描 messages() 最近一条 assistant 消息的 toolCalls。
      */
     private static boolean didLastTurnUseSleep(AgentState state) {
-        if (state == null || state.messages() == null) return false;
-        java.util.List<com.nexusai.model.session.dto.ChatMessageDto> msgs = state.messages();
+        if (state == null || state.rawMessages() == null) return false;
+        java.util.List<com.nexusai.model.session.dto.ChatMessageDto> msgs = state.rawMessages();
         for (int i = msgs.size() - 1; i >= 0; i--) {
             com.nexusai.model.session.dto.ChatMessageDto m = msgs.get(i);
             if (m.role() == Role.assistant) {
@@ -13793,7 +13822,7 @@ public class LlmAgentLoop implements AgentLoop {
         if (!gate || state == null) {
             return List.of();
         }
-        List<ChatMessageDto> messages = state.messages();
+        List<ChatMessageDto> messages = state.rawMessages();
         if (messages == null || messages.isEmpty()) {
             return List.of();
         }
