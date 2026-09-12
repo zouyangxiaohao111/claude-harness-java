@@ -539,7 +539,10 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 "compact",                                            // compact.ts:1193 forkLabel
                 null,                                                 // maxOutputTokens（INV-7 · compact.ts:1181-1187）
                 1,                                                    // maxTurns（compact.ts:1194）
-                false,                                                // skipTranscript（CC 未传 → undefined/false）
+                // skipTranscript（CC 未传 → undefined/false）。[E-1a 有意偏离 · D-E1a-01] 本仓 fork
+                //   一律不记 sidechain transcript（零消费者；CC 在 false 时记 recordSidechainTranscript）
+                //   —— 登记处 docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md。
+                false,
                 true,                                                 // skipCacheWrite（compact.ts:1195）
                 abortController,                                      // overrides.abortController（compact.ts:1196-1199）
                 null,                                                 // onMessage

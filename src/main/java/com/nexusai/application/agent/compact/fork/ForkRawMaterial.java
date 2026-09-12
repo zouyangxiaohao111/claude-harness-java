@@ -15,17 +15,21 @@ import java.util.Map;
  * 没有 post-sampling 上下文（PostSamplingContext）—— RES-C5 降级根源（stop-hook 无 post-sampling
  * 上下文，fork systemPrompt/userContext/systemContext 恒空 → 提取子代理无主系统提示 +
  * prompt-cache key 与主线程不一致，每轮 fork 全价计费）。本 record 承载当轮主线程
- * systemPrompt（fullSystemPrompt，<b>已含 appendSystemContext 并入的 systemContext</b>）/
- * userContext / systemContext / forkContextMessages（消息快照），在 LlmAgentLoop:5154
- * 调用点按会话捕获后经 StopHookPipeline 透传 extract/dream —— fork 载荷与主线程同值，
- * cache 共享恢复（design 03 §10-1）。
+ * systemPrompt（<b>pre-append</b> 组装段数组）/ userContext / systemContext /
+ * forkContextMessages（消息快照），在 LlmAgentLoop stop-hook 捕获点按会话捕获后经
+ * StopHookPipeline 透传 extract/dream —— fork 载荷与主线程同值，cache 共享恢复（design 03 §10-1）。
  *
- * <p><b>为什么 systemPrompt 传 fullSystemPrompt（已含 systemContext）而非 CC 的
- * pre-append 数组</b>: CC 的 fork 在自身 query() 内 <b>重新执行</b>
- * {@code appendSystemContext + prependUserContext}（query.ts:449-450/:660，forkedAgent.ts:545-556
- * 透传原始三参）；Java {@link ProductionForkedQuery} 发送边界只做
- * {@code splitSysPromptPrefix(params.systemPrompt())}（无 appendSystemContext 步骤）——因此
- * Java 侧必须传已并入 systemContext 的 fullSystemPrompt，fork 发送 blocks 才与主线程一致。
+ * <p><b>[E-1a] systemPrompt 是 CC 语义的 pre-append 形态</b>（组装段数组，含 boundary 段，
+ * <b>未经</b> {@code appendSystemContext}）: 与 CC 一致 —— CC 的 fork 在自身 query() 内
+ * <b>重新执行</b> {@code appendSystemContext + prependUserContext}（query.ts:449-450/:660，
+ * forkedAgent.ts:545-556 透传原始三参）。Java {@link ProductionForkedQuery} 发送边界现同样
+ * <b>先</b> {@code appendSystemContext(systemPrompt, systemContext)} <b>再</b>
+ * {@code splitSysPromptPrefix}（append 使用点，单一 static 实现）——因此本字段存 pre-append
+ * 值 + 独立 {@link #systemContext} map 即可让 fork 发送 blocks 与主线程一致。
+ *
+ * <p><b>为什么不能存 post-append</b>: {@code appendSystemContext} <b>非幂等</b>（每次调用把
+ * systemContext map join 成字符串追加为末尾元素）；存 post-append ⇒ 使用点再 append 一次 ⇒
+ * 末尾多一段 ⇒ 发送 blocks 与主线程不一致 ⇒ prompt cache 永不命中（IMP-MV2-09 T9 同类根因）。
  *
  * <p><b>null 语义</b>: 无捕获（非主循环入口，如测试/直构）→ agents 保持现有兜底
  * （createMinimalCacheSafeParams / supplier 原样），<b>不 fail-loud</b>（捕获缺失 ≠ seam

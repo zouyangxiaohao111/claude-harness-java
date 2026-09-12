@@ -78,6 +78,26 @@ class AutoCompactorCcContractTest {
     }
 
     @Test
+    @DisplayName("[E-1a] 守卫: 后台 fork 来源 extract_memories/auto_dream（含生产大写归一）→ 超阈不压缩")
+    void guard_backgroundForkSources_expandedDomain() {
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        List<ChatMessageDto> big = largeMessages(50);
+
+        // E-1a fork 屏蔽档：豁免值域扩到 4 个后台 fork 来源（compact/session_memory 由上方用例覆盖）
+        assertThat(auto.shouldAutoCompact(big, null, "extract_memories", 0))
+            .as("extract-memories 后台 fork 不得触发嵌套压缩（fork 继承完整对话）").isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "EXTRACT_MEMORIES", 0))
+            .as("生产大写枚举名归一后亦须命中").isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "auto_dream", 0))
+            .as("auto-dream 后台 fork 不得触发嵌套压缩").isFalse();
+        assertThat(auto.shouldAutoCompact(big, null, "AUTO_DREAM", 0))
+            .as("生产大写枚举名归一后亦须命中").isFalse();
+        // 对照：主线程来源超阈照常压缩（阈值真实生效 —— 避免"全部返回 false"式假绿）
+        assertThat(auto.shouldAutoCompact(big, null, "repl_main_thread", 0))
+            .as("主线程来源不在屏蔽档，超阈必须压缩").isTrue();
+    }
+
+    @Test
     @DisplayName("非守卫源 user 超阈 → shouldAutoCompact=true（阈值真实生效）")
     void guardUserAboveThreshold() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));

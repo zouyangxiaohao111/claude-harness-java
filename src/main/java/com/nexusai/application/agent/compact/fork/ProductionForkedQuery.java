@@ -309,13 +309,26 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
             }
         }
         int historySize = runningMessages != null ? runningMessages.size() : -1;
-        int systemSegments = params.systemPrompt() != null ? params.systemPrompt().size() : -1;
+        // ══════════════════════════════════════════════════════════════════
+        // [E-1a] fork 发送边界 appendSystemContext · 使用点（单一实现 static 调用）
+        //   CC 真源：fork 自身 query() 内重跑 appendSystemContext（query.ts:449-450 / :660，
+        //   forkedAgent.ts:545-556 把原始 pre-append systemPrompt + systemContext 透传）。
+        //   WHY 在**使用点**而非上游：appendSystemContext **非幂等**（每次调用都把 systemContext
+        //   map join 成字符串追加为末尾元素）；上游（CacheSharingParamsBuilder /
+        //   ForkRawMaterial 捕获点 / PostSamplingContext）统一存 **pre-append** 形态 + 独立
+        //   systemContext map，本处恰好并入一次 —— 与改动前「上游 post-append + 此处不 append」
+        //   产出**逐字节相同**，且对 post-append 值再并入的 cache 破坏风险被结构性消除
+        //   （IMP-MV2-09 T9 同类 bug：多一段末尾 → 发送 blocks 与主线程不一致 → cache 永不命中）。
+        // ══════════════════════════════════════════════════════════════════
+        List<String> fullSystemPrompt =
+            com.nexusai.application.agent.prompt.SystemPromptContextProvider.appendSystemContext(
+                com.nexusai.application.agent.prompt.SystemPrompt.from(params.systemPrompt()),
+                params.systemContext());
+        int systemSegments = fullSystemPrompt.size();
         int systemChars = 0;
-        if (params.systemPrompt() != null) {
-            for (String s : params.systemPrompt()) {
-                if (s != null) {
-                    systemChars += s.length();
-                }
+        for (String s : fullSystemPrompt) {
+            if (s != null) {
+                systemChars += s.length();
             }
         }
         log.info("[ProductionForkedQuery] fork 工具下发: querySource={} model={} provider={} visibleTools={} "
@@ -344,12 +357,15 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
         //   MCP 工具 · CC claude.ts:1212-1214 + claude.ts:1377；Java 无 tool-search → willDefer 恒
         //   false，等价论证见 hasMcpTool）。与 buildToolsArray 同源（:168 forkCtx.availableTools()）。
         List<SystemPromptBlock> systemPromptBlocks = SystemPromptSplitter.splitSysPromptPrefix(
-            params.systemPrompt(), params.useGlobalCacheScope(),
+            fullSystemPrompt, params.useGlobalCacheScope(),
             params.useGlobalCacheScope() && hasMcpTool(forkCtx));
         if (log.isDebugEnabled()) {
-            log.debug("[ProductionForkedQuery] 发送边界 systemPrompt blocks 组装完成: sourceBlocks={} "
-                    + "gate={} sendBlocks={}（boundary 已剥离 · blocks 数组发送）· 对齐 LlmAgentLoop:2897-2904",
-                params.systemPrompt().size(), params.useGlobalCacheScope(), systemPromptBlocks.size());
+            log.debug("[ProductionForkedQuery] 发送边界 systemPrompt blocks 组装完成: sourceBlocks={}"
+                    + "（pre-append 输入 {} 段 + appendSystemContext 并入）gate={} sendBlocks={}"
+                    + "（boundary 已剥离 · blocks 数组发送）· 对齐 LlmAgentLoop:2897-2904",
+                fullSystemPrompt.size(),
+                params.systemPrompt() != null ? params.systemPrompt().size() : 0,
+                params.useGlobalCacheScope(), systemPromptBlocks.size());
         }
 
         int turns = 0;

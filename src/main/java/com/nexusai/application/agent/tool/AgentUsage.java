@@ -128,6 +128,59 @@ public record AgentUsage(
     }
 
     /**
+     * [E-1a] 从消息列表累加 usage（逐条取值、逐字段相加）· 对齐 CC {@code accumulateUsage}
+     * (Open-ClaudeCode/src/utils/forkedAgent.ts:557-566 · NonNullableUsage 逐字段相加) 的
+     * Java 等价物 —— 供 fork（{@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery}
+     * 现逐轮累加）与子代理（{@code SubagentExecutor}）共用的单一实现。
+     *
+     * <p><b>WHY 需要它（与既有提取器区别）</b>：{@code SubagentExecutor.extractUsageFromMessages}
+     * 是 <b>last-only</b>（对齐 CC agentToolUtils.ts:355 取末尾 assistant 的 usage 透传）——
+     * 多轮 fork 的「全程累计」语义与它不同，不能复用（否则累计退化为末尾单轮）。
+     * 本方法是「多轮累加」的单一实现。
+     *
+     * <p><b>语义</b>：遍历全部消息，逐条取其 {@code usage()}；某条为 null → <b>累加 0</b>
+     * （对齐 CC 对缺失 usage 的 EMPTY 语义）。只对 4 个计数 token 字段求和
+     * （input/output/cacheCreation/cacheRead）—— 嵌套/枚举/字符串字段（server_tool_use /
+     * service_tier / cache_creation / inference_geo / iterations / speed /
+     * cache_deleted_input_tokens）无「相加」语义，按 {@link #EMPTY} 零初始化形状返回。
+     *
+     * <p><b>已知边界（如实登记）</b>：DB 水合/旧构造消息只有 inputTokens/outputTokens 两个 int
+     * 字段、{@code usage()} 为 null → 本方法贡献 0（不用 {@link #fromInputOutput} 回退投影，
+     * 以保持「null → 0」的 CC 累加语义）。E-1b 若用于 DB 水合消息，需按该批实际数据源复核。
+     *
+     * @param messages 消息列表（null/空 → {@link #EMPTY}）
+     * @return 4 个计数 token 字段的逐条累加（无任何 usage → EMPTY）
+     */
+    public static AgentUsage accumulateFromMessages(List<com.nexusai.model.session.dto.ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return EMPTY;
+        }
+        long input = 0L;
+        long output = 0L;
+        long cacheCreate = 0L;
+        long cacheRead = 0L;
+        for (com.nexusai.model.session.dto.ChatMessageDto msg : messages) {
+            if (msg == null || msg.usage() == null) {
+                continue;   // other == null → 累加 0（CC EMPTY 语义）
+            }
+            AgentUsage u = msg.usage();
+            input += u.inputTokens();
+            output += u.outputTokens();
+            if (u.cacheCreationInputTokens() != null) {
+                cacheCreate += u.cacheCreationInputTokens();
+            }
+            if (u.cacheReadInputTokens() != null) {
+                cacheRead += u.cacheReadInputTokens();
+            }
+        }
+        // 非计数字段无「相加」语义 → 按 EMPTY 零初始化形状返回（不伪造 provider 未上报的嵌套值）
+        return new AgentUsage(input, output, cacheCreate, cacheRead,
+            EMPTY.serverToolUse(), EMPTY.serviceTier(), EMPTY.cacheCreation(),
+            EMPTY.inferenceGeo(), EMPTY.iterations(), EMPTY.speed(),
+            EMPTY.cacheDeletedInputTokens());
+    }
+
+    /**
      * 汇总全部 4 个 token 字段 · 对齐 CC {@code getTokenCountFromUsage} (tokens.ts:46-53)
      * {@code input_tokens + (cache_creation_input_tokens ?? 0) + (cache_read_input_tokens ?? 0) + output_tokens}.
      *

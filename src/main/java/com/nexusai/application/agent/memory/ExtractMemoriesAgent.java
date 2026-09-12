@@ -853,6 +853,10 @@ public class ExtractMemoriesAgent {
                 QuerySource.EXTRACT_MEMORIES, "extract_memories",
                 /*maxOutputTokens*/ null,
                 /*maxTurns*/ 5,
+                // skipTranscript=true。 [E-1a 有意偏离 · D-E1a-01] 本仓 fork 一律不记 sidechain
+                //   transcript（零消费者；CC 在 false 时才记 recordSidechainTranscript）—— 本值为
+                //   true 与「一律不记」结论一致，字段保留不接线。登记处
+                //   docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md。
                 /*skipTranscript*/ true,
                 /*skipCacheWrite*/ false,
                 /*abortController*/ null,

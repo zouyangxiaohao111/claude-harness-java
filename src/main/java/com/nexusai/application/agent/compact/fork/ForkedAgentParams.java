@@ -43,7 +43,16 @@ import java.util.function.Consumer;
  *                        {@code maxTurns?: number} (forkedAgent.ts:105)；compact 场景 = 1
  * @param skipTranscript  跳过 sidechain transcript 记录 · CC original:
  *                        {@code skipTranscript?: boolean} (forkedAgent.ts:109)；
- *                        extract-memories/auto-dream 后台 fork = true（不污染主 transcript）
+ *                        extract-memories/auto-dream 后台 fork = true（不污染主 transcript）。
+ *                        <b>[E-1a 有意偏离 · 零消费者 · 见登记处 D-E1a-01]</b> CC 在
+ *                        {@code skipTranscript=false}（或未传）时会记 sidechain transcript
+ *                        （{@code recordSidechainTranscript}）；<b>本仓 fork 一律不记 sidechain
+ *                        transcript</b>（无论本值为 true/false —— Java fork 链
+ *                        {@link RunForkedAgent} / {@code ProductionForkedQuery} 无任何 transcript
+ *                        I/O）。此为<b>用户裁定的有意偏离</b>（2026-09-12 E-1a），故字段保留但
+ *                        不接线（CC 有对应物，符合本仓「死代码不一定要删」）。登记处：
+ *                        {@code docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md}
+ *                        （条目 D-E1a-01）。
  * @param skipCacheWrite  最后一条消息不写新 prompt cache 条目 · CC original:
  *                        {@code skipCacheWrite?: boolean} (forkedAgent.ts:112)；
  *                        compact 场景 = true（fork 不写缓存）

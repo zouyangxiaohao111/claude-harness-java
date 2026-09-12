@@ -213,9 +213,17 @@ public final class ApiQueryHookHelper {
                 String uuid = UUID.randomUUID().toString();
                 String userMessage = config.buildMessages().apply(hookCtx);
                 hookCtx = hookCtx.withQueryMessageCount(1); // Java 单消息等价
+                // [E-1a pre-append 契约] PostSamplingContext.systemPrompt 存 **pre-append** 形态
+                //   （REPLHookContext.systemPrompt 等价 · CC query.ts:1001-1008），本使用点补
+                //   appendSystemContext 一次（单一实现 static 调用）→ join 产物与改动前
+                //   「上下文里已是 post-append」逐字节相同（本方法即该字段的 append 使用点）。
+                List<String> appendedCtxPrompt =
+                    com.nexusai.application.agent.prompt.SystemPromptContextProvider.appendSystemContext(
+                        com.nexusai.application.agent.prompt.SystemPrompt.from(hookCtx.systemPrompt()),
+                        hookCtx.systemContext());
                 String systemPrompt = config.systemPrompt() != null
                         ? config.systemPrompt()
-                        : hookCtx.systemPrompt().stream()
+                        : appendedCtxPrompt.stream()
                             .filter(s -> s != null && !s.isBlank()
                                 && !com.nexusai.application.agent.prompt.SystemPromptAssembler
                                     .SYSTEM_PROMPT_DYNAMIC_BOUNDARY.equals(s))

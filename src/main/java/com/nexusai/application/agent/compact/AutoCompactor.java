@@ -146,9 +146,13 @@ public class AutoCompactor {
      * （LlmAgentLoop {@code params.querySource()}）；本字段保存当前调用来源，默认
      * 'user'（主线程）。守卫判定（INV-6）：
      * <pre>
-     *   querySource === 'session_memory' || 'compact' → false（autoCompact.ts:171-173）
+     *   querySource ∈ {session_memory, compact} → false（autoCompact.ts:171-173）
      *   CONTEXT_COLLAPSE 启用 && querySource === 'marble_origami' → false（autoCompact.ts:179-183）
      * </pre>
+     *
+     * <p><b>[E-1a fork 屏蔽档]</b>：第一条豁免值域扩到
+     * {@link com.nexusai.application.agent.QuerySource#isBackgroundForkSource}
+     * （+ extract_memories / auto_dream）—— 后两者今天不走主循环（E-1b 才收敛），现网行为零变化。
      */
     private String querySource = "user";
 
@@ -595,8 +599,13 @@ public class AutoCompactor {
         // IMP2-01（S-3）：判定入口 canonical 归一——生产传 name() 大写枚举名
         // （SESSION_MEMORY/COMPACT/MARBLE_ORIGAMI）先归一 CC 小写值域再比较；
         // 小写既有值域幂等。
+        // [E-1a fork 屏蔽档] 豁免值域改由单点判据 {@link QuerySource#isBackgroundForkSource}
+        //   承担（compact / session_memory / extract_memories / auto_dream）—— 前两者与旧写死
+        //   比较逐位等价；新增的两来源今天不走主循环（E-1b 才收敛），故现网行为零变化。
+        //   （marble_origami 不是 fork 来源，其 CONTEXT_COLLAPSE 门在下方单独保留。）
         String canonical = com.nexusai.application.agent.QuerySource.canonicalize(querySource);
-        if ("session_memory".equals(canonical) || "compact".equals(canonical)) {
+        if (com.nexusai.application.agent.QuerySource.isBackgroundForkSource(
+                com.nexusai.application.agent.QuerySource.fromString(canonical))) {
             if (log.isDebugEnabled()) {
                 log.debug("[AutoCompactor] 递归守卫: querySource={} 跳过自动压缩 (fork 死锁防护)",
                     querySource);

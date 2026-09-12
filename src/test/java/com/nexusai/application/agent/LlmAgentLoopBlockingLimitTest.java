@@ -157,7 +157,12 @@ class LlmAgentLoopBlockingLimitTest {
                 state.rawMessages(), null,
                 com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.COMPACT, "test-model", null, null, null, null, null,
-                deps, ProviderConfig.empty()),
+                deps, ProviderConfig.empty())
+                // [E-1a fail-loud 契约] 后台 fork 来源必须注入受限 canUseTool（否则 queryLoop 入口
+                //   直接抛 IllegalStateException —— 与 ProductionForkedQuery 同判据）；本用例只验
+                //   blocking-limit 豁免，注入恒 ALLOW 的最小 canUseTool 即可（不进入工具路径）。
+                .withCanUseTool((tool, input, tuc, toolUseId, forceDecision) ->
+                    com.nexusai.application.agent.permission.ToolPermissionGate.DecisionResult.allow()),
             state, new java.util.ArrayList<>());
 
         assertThat(state.exitReason())

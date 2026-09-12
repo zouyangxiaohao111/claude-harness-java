@@ -270,6 +270,34 @@ public enum QuerySource {
     }
 
     /**
+     * [E-1a] 后台 fork 来源判定 · 「fork 屏蔽档」的唯一判据（单点，勿在各消费点另写值域）。
+     *
+     * <p><b>值域 = 4 个后台 fork 来源</b>：{@link #COMPACT} / {@link #SESSION_MEMORY} /
+     * {@link #EXTRACT_MEMORIES} / {@link #AUTO_DREAM} —— 即「继承主线程完整对话、但不产生
+     * 主会话语义」的后台 fork（压缩摘要 / 会话记忆 / 记忆提取 / 梦境整理）。
+     *
+     * <p><b>WHY 需要（E-1b 前置机制）</b>：这 4 个来源的生产实现今天走专用循环
+     * （{@code ProductionForkedQuery}）；E-1b 收敛到主循环 {@code queryLoop} 后，主循环内若干
+     * <b>主会话专属副作用</b>（blocking-limit 预检 / autocompact / turn 事件发布 / post-sampling
+     * hooks / skill_listing 注入）会**对 fork 也执行** —— 而 Java 的 {@code AgentLoopContext}
+     * 携带主会话级 bean（事件桥 / state / 注册表），CC 侧靠 fork 的**隔离上下文**
+     * （{@code createSubagentContext}）天然隔离。本判据 = 该隔离意图的 Java 表达（用户裁定）。
+     *
+     * <p><b>为什么不含 {@link #FORK} / {@link #SUBAGENT}</b>：这两者是<b>子代理</b>（不是后台
+     * fork）—— CC 侧子代理走同一 {@code query()} 且<b>确实</b>享受这些能力（skill_listing 有自己
+     * 的一份 · attachments.ts:2672-2676；memory 预取照常启动 · query.ts:301-304；autocompact
+     * 照常触发 · autoCompact.ts:171-183 值域不含 agent:*）。把它们并入判据会**改变现网子代理
+     * 行为**（本批红线：不改现有行为）。
+     *
+     * @param source 查询来源枚举（null → false）
+     * @return true = 后台 fork 来源（应屏蔽主会话专属副作用）
+     */
+    public static boolean isBackgroundForkSource(QuerySource source) {
+        return source == COMPACT || source == SESSION_MEMORY
+            || source == EXTRACT_MEMORIES || source == AUTO_DREAM;
+    }
+
+    /**
      * 派生 fallback · 对齐 Java 旧版本 deriveQuerySource(state) 行为。
      *
      * <p>仅在 caller 没显式传 querySource 时使用。主线程通常应该传 USER/REPL_MAIN_THREAD，

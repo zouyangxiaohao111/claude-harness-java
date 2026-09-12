@@ -983,6 +983,9 @@ public class AutoDreamConsolidator {
             QuerySource.AUTO_DREAM, "auto_dream",
             /*maxOutputTokens*/ null,
             /*maxTurns*/ null,
+            // skipTranscript=true。 [E-1a 有意偏离 · D-E1a-01] 本仓 fork 一律不记 sidechain
+            //   transcript（零消费者；CC 在 false 时才记 recordSidechainTranscript）—— 字段保留
+            //   不接线。登记处 docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md。
             /*skipTranscript*/ true,
             /*skipCacheWrite*/ false,
             abortController,

@@ -169,9 +169,16 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             .as("[验收2] systemContext 必须非空（旧实现恒 Map.of() 空桩）——CC query.ts:184 getSystemContext 产物"
                 + "（custom=null 时不短路）；注入的 gitStatus 必须原样到达 hook")
             .containsEntry("gitStatus", "GIT-STATUS-GOLDEN");
-        // systemContext 必须真被 appendSystemContext 并入系统提示尾段（键与 sysParts 一致）
+        // [E-1a pre-append 契约] PostSamplingContext.systemPrompt = 组装段数组（**未经**
+        //   appendSystemContext），systemContext 独立随第 4 参透传（上方已断言）；
+        //   append 在使用点（fork 发送边界 ProductionForkedQuery / hook 查询 ApiQueryHookHelper）。
         assertThat(ps.systemPrompt())
-            .as("systemContext 的 `key: value` 行必须并入系统提示段数组（CC api.ts:437-447）")
+            .as("[E-1a] systemPrompt 必须是 pre-append 形态（不得预先并入 systemContext 段）")
+            .noneSatisfy(seg -> assertThat(seg).contains("gitStatus: GIT-STATUS-GOLDEN"));
+        assertThat(com.nexusai.application.agent.prompt.SystemPromptContextProvider.appendSystemContext(
+                com.nexusai.application.agent.prompt.SystemPrompt.from(ps.systemPrompt()),
+                ps.systemContext()))
+            .as("使用点 append 后 systemContext 的 `key: value` 行必须并入系统提示段数组（CC api.ts:437-447）")
             .anySatisfy(seg -> assertThat(seg).contains("gitStatus: GIT-STATUS-GOLDEN"));
         assertThat(run.modelCalls.get()).isEqualTo(2);
     }

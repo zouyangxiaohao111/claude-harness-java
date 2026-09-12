@@ -4117,6 +4117,33 @@ public record AgentLoopContext(
     }
 
     /**
+     * [E-1a] 「本 query 产出消息」切片 · 对齐 CC 的 {@code agentMessages} 语义
+     * （Open-ClaudeCode/src/tools/AgentTool/agentToolUtils.ts:320 {@code countToolUses(agentMessages)} /
+     * :355 {@code getLastAssistantMessage(agentMessages)} —— CC 的 agentMessages 是 query 循环
+     * <b>产出</b>消息数组，不含 initialMessages/fork 前缀）。
+     *
+     * <p><b>WHY 需要它</b>：Java 的 {@code LoopResult.finalState.rawMessages()} =
+     * <b>初始消息 + 产出消息</b>；而 fork 的 {@code ForkedAgentResult.messages()} 只有产出消息。
+     * E-1b fork 走主循环后，要拿到与 {@code ForkedAgentResult.messages()} 同语义的列表，必须
+     * 按「初始消息数」切片 —— 这是 {@code lastAssistantMessage} 取错消息的根因场景
+     * （初始/父上下文以 assistant 结尾时，不切片会取到<b>父</b>的末尾 assistant）。
+     *
+     * <p>既有等价物 = {@code SubagentExecutor.countToolUses(messages, startInclusive)} 的起始下标
+     * 约定（package-private，fork 侧不可达）—— 本方法是该切片语义的<b>单一可复用实现</b>。
+     *
+     * @param all         全量消息（{@code finalState.rawMessages()} / {@code state.rawMessages()}）
+     * @param initialCount 初始消息数（{@code state.rawMessages().size()} 在循环启动前的快照）
+     * @return 产出消息子列表（initialCount ≥ size → 空列表；元素共享，不深拷贝）
+     */
+    public static java.util.List<ChatMessageDto> producedMessages(
+            java.util.List<ChatMessageDto> all, int initialCount) {
+        if (all == null || initialCount >= all.size()) {
+            return java.util.List.of();
+        }
+        return java.util.List.copyOf(all.subList(Math.max(initialCount, 0), all.size()));
+    }
+
+    /**
      * [skill-listing-cc-align 2026-09-10] skill_listing 注入消息构造 · 对齐 CC 渲染契约。
      *
      * <p><b>CC 真源（复核后）</b>：

@@ -297,11 +297,26 @@ public class SystemPromptContextProvider {
      * <p>{@code [...systemPrompt, Object.entries(context).map(([k,v]) => `${k}: ${v}`).join('\n')]}
      * 后 filter(Boolean)——空 context 时 join 为空串被过滤；元素 null/空也过滤。
      *
-     * @param systemPrompt 品牌化 system prompt 数组
+     * <p><b>[E-1a 单一来源 · pre-append 契约] 本方法是全仓唯一的 append 实现，
+     * 且是 {@code static}</b>（无实例状态）—— 三个调用点都是「使用点」：
+     * <ul>
+     *   <li>主循环 {@code LlmAgentLoop} s10（每 tool 轮 · CC query.ts:648）</li>
+     *   <li>fork 发送边界 {@code ProductionForkedQuery}（CC forkedAgent 自身 query() 内重跑）</li>
+     *   <li>hook 查询 {@code ApiQueryHookHelper}（CC apiQueryHookHelper.ts:73-75）</li>
+     * </ul>
+     * <b>契约</b>：持有 {@code systemPrompt} 的字段（{@code QueryParams.systemPrompt} /
+     * {@code CacheSafeParams.systemPrompt} / {@code ForkRawMaterial.systemPrompt} /
+     * {@code PostSamplingContext.systemPrompt}）一律存 <b>pre-append</b> 形态
+     * （尚未并入 systemContext 的组装段数组）+ 独立 {@code systemContext} map；由各<b>使用点</b>
+     * 调本方法并入 —— 因为本方法<b>不是幂等函数</b>（每次调用都追加一个末尾元素），
+     * 对 post-append 值再 append 一次 → fork 发送 blocks 与主线程不一致 → prompt cache 永不命中
+     * （IMP-MV2-09 T9 同类 bug）。
+     *
+     * @param systemPrompt 品牌化 system prompt 数组（<b>pre-append</b> 形态）
      * @param context      system 通道上下文 map（{@code key: value} 行，换行拼接为单元素）
      * @return 并入后的系统提示数组（原元素 + 条件 context 块）
      */
-    public List<String> appendSystemContext(SystemPrompt systemPrompt, Map<String, String> context) {
+    public static List<String> appendSystemContext(SystemPrompt systemPrompt, Map<String, String> context) {
         List<String> result = new ArrayList<>();
         if (systemPrompt != null) {
             result.addAll(systemPrompt.elements());

@@ -801,6 +801,10 @@ public class SessionMemoryService {
                 QuerySource.SESSION_MEMORY, "session_memory",
                 /*maxOutputTokens*/ null,
                 /*maxTurns*/ null,
+                // skipTranscript=false（CC sessionMemory.ts:318-325 未传）。[E-1a 有意偏离 ·
+                //   D-E1a-01] 本仓 fork **一律不记** sidechain transcript（零消费者；CC 在 false 时
+                //   才记 recordSidechainTranscript）—— 故本值虽为 false，也没有 transcript I/O。
+                //   登记处 docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md。
                 /*skipTranscript*/ false,
                 /*skipCacheWrite*/ false,
                 /*abortController*/ null,
@@ -927,6 +931,8 @@ public class SessionMemoryService {
                 QuerySource.SESSION_MEMORY, "session_memory_manual",
                 /*maxOutputTokens*/ null,
                 /*maxTurns*/ null,
+                // skipTranscript=false。[E-1a 有意偏离 · D-E1a-01] 同 extract 路径：本仓 fork 一律
+                //   不记 sidechain transcript。登记处 docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md。
                 /*skipTranscript*/ false,
                 /*skipCacheWrite*/ false,
                 /*abortController*/ null,
@@ -2230,9 +2236,16 @@ public class SessionMemoryService {
      *
      * <p><b>[IMP-HOOKS-S7 D3]</b>: 旧实现自称"PostSamplingContext.systemPrompt 为 String
      * （RunRequest 自定义提示，非完整组装数组），故单元素 List 表达；完整组装数组需系统
-     * 提示组装链，出本 session 范围"—— 该偏差已消除：LlmAgentLoop :4144 现传组装段数组
-     * fullSystemPrompt（appendSystemContext 产物，含 boundary 段，对齐 CC query.ts:1001-1008
-     * systemPrompt 段数组），此处直接 {@code List.copyOf} 直通（空 → 空 List 降级，不抛错）。
+     * 提示组装链，出本 session 范围"—— 该偏差已消除：LlmAgentLoop 现传组装段数组
+     * （runParams.systemPrompt()，含 boundary 段，对齐 CC query.ts:1001-1008 systemPrompt
+     * 段数组），此处直接 {@code List.copyOf} 直通（空 → 空 List 降级，不抛错）。
+     *
+     * <p><b>[E-1a pre-append 契约]</b>: 该数组是 <b>pre-append</b> 形态（未经
+     * {@code appendSystemContext}）—— 与 CC 同义（CC REPLHookContext.systemPrompt 即 query()
+     * 不可变 params）。因此本方法产出的 {@code CacheSafeParams.systemPrompt} 也是 pre-append，
+     * append 由 fork 发送边界（{@code ProductionForkedQuery}）恰做一次；systemContext 独立随
+     * psContext.systemContext() 透传（{@code mergeContext}）—— 对 post-append 值再并入会让
+     * SM fork 系统提示多一段 → prompt cache 永不命中。
      *
      * @param psContext post-sampling hook 上下文（REPLHookContext 等价；null → 降级空）
      * @return 会话 systemPrompt 数组（原样拷贝；null/空 → 空 List）

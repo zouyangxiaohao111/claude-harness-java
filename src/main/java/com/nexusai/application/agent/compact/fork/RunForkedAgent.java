@@ -95,8 +95,9 @@ public final class RunForkedAgent {
      * （forkedAgent.ts:545-556）。
      *
      * @param messages             initialMessages（forkContextMessages + promptMessages）
-     * @param systemPrompt         主线程 system prompt <b>发送前数组</b>（含 boundary 元素；
-     *                             发送边界才剥离）· CC original:
+     * @param systemPrompt         主线程 system prompt **pre-append** 数组（组装段数组，含
+     *                             boundary 元素；发送边界才剥离，appendSystemContext 由
+     *                             {@code ProductionForkedQuery} 使用点恰做一次）· CC original:
      *                             {@code systemPrompt: SystemPrompt} (forkedAgent.ts:59)
      * @param userContext          user context（cache-safe）
      * @param systemContext        system context（cache-safe）
@@ -158,6 +159,11 @@ public final class RunForkedAgent {
     /**
      * 运行 fork 查询 loop · 对齐 CC {@code runForkedAgent}（forkedAgent.ts:489-626）。
      *
+     * <p><b>[E-1a 有意偏离 · 见登记处 D-E1a-01]</b> {@code params.skipTranscript()} <b>不被消费</b>
+     * —— CC 在 {@code skipTranscript=false} 时会调 {@code recordSidechainTranscript} 写 sidechain
+     * transcript 文件；本仓 fork 链无论该值如何<b>都不写</b> transcript（用户裁定：明确不记
+     * sidechain）。登记处：{@code docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md}。
+     *
      * @param params fork 参数（promptMessages / cacheSafeParams / canUseTool / querySource /
      *               forkLabel / maxOutputTokens / maxTurns / skipCacheWrite / abortController）
      * @param query  Java query() seam（生产接 LlmAgentLoop.run；测试注入 RecordingQuery）
@@ -197,6 +203,9 @@ public final class RunForkedAgent {
         // query({systemPrompt}) 不经 join 扁平化）：boundary 元素保留到发送边界（ProductionForkedQuery
         // streamOnce 前按 useGlobalCacheScope gate 调 splitSysPromptPrefix 剥离，与主线程
         // LlmAgentLoop:2903-2911 同款），boundary 永不达 LLM。
+        // [E-1a] 透传的是 **pre-append** 数组（+ 第 4 参 systemContext map）：appendSystemContext
+        // 由发送边界（ProductionForkedQuery）使用点恰做一次 —— 与 CC forkedAgent 自身 query()
+        // 内重跑 append 同构（query.ts:449-450/:660）。此处不得预先 append（非幂等）。
         ForkQueryParams queryParams = new ForkQueryParams(
             initialMessages,
             cs.systemPrompt(),

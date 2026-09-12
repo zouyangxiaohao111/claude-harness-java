@@ -34,9 +34,16 @@ import java.util.Map;
  *       <b>[IMP-HOOKS-S7 D3]</b> {@code SystemPrompt = readonly string[]}（systemPromptType.ts:8-14）
  *       —— 段数组（含 boundary 独立元素；CC buildEffectiveSystemPrompt systemPrompt.ts:115-122
  *       + api.ts:321-435 splitSysPromptPrefix 发送时才滤 boundary）。Java 端由
- *       LlmAgentLoop s10 组装链的 {@code fullSystemPrompt}（:3179-3182 appendSystemContext 产物）
- *       透传，与 query.ts:1001-1008 传 {@code systemPrompt} 段数组同构。旧 String 单值
- *       表达（RunRequest.systemPrompt 自定义提示）为偏离，已删除。</li>
+ *       LlmAgentLoop per-run 材料收集产物 {@code runParams.systemPrompt()}（★ 组装段数组）透传，
+ *       与 query.ts:1001-1008 传 {@code systemPrompt} 段数组同构。旧 String 单值
+ *       表达（RunRequest.systemPrompt 自定义提示）为偏离，已删除。
+ *       <br><b>[E-1a] 本字段是 pre-append 形态</b>（尚未并入 {@link #systemContext} 的组装段
+ *       数组）—— CC 同义（query.ts:1001-1008 传的是 query() 不可变 params，未经
+ *       {@code appendSystemContext}）。{@code appendSystemContext} <b>非幂等</b>（每次调用追加
+ *       末尾元素），故 append 只在<b>使用点</b>各做一次：fork 路径 =
+ *       {@code ProductionForkedQuery} 发送边界；hook 查询 = {@code ApiQueryHookHelper}。
+ *       消费方若需要「发送形态」的数组，须自行调
+ *       {@link com.nexusai.application.agent.prompt.SystemPromptContextProvider#appendSystemContext}。</li>
  *   <li>{@code userContext} — CC original: userContext (postSamplingHooks.ts:14), 可空</li>
  *   <li>{@code systemContext} — CC original: systemContext (postSamplingHooks.ts:15), 可空</li>
  *   <li>{@code toolUseContext} — CC original: toolUseContext (postSamplingHooks.ts:16), 可空

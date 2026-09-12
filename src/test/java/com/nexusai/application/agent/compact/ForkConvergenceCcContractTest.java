@@ -142,10 +142,17 @@ class ForkConvergenceCcContractTest {
         assertThat(messages.get(3).content()).as("summaryRequest 恒在末尾（forkedAgent.ts:524 + compact.ts:1189）")
             .isEqualTo(SUMMARY_REQUEST);
         // cache-safe 参数透传（systemPrompt 数组 → 发送边界 blocks）
+        // [E-1a pre-append 契约] cs 的 systemPrompt 是 **pre-append** 数组（[main-system-prompt]），
+        //   systemContext（{"os":"linux"}）独立成 map；ProductionForkedQuery 发送边界恰 append
+        //   一次 → 实发 block 文本 = "main-system-prompt\n\nos: linux"（3P gate=false → 单 ORG block）。
         assertThat(provider.lastSystemBlocks())
             .as("cache-safe systemPrompt 必须透传到发送边界（splitSysPromptPrefix 产物）")
             .extracting(SystemPromptBlock::text)
-            .contains("main-system-prompt");
+            .anyMatch(t -> t != null && t.contains("main-system-prompt"));
+        assertThat(provider.lastSystemBlocks())
+            .as("systemContext 段必须在发送边界被 appendSystemContext 并入（使用点恰一次）")
+            .extracting(SystemPromptBlock::text)
+            .anyMatch(t -> t != null && t.contains("os: linux"));
     }
 
     @Test

@@ -48,6 +48,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>custom 短路（I-13）—— custom 非空时 defaultAssemble 不被调用（default 完全不出现在结果）</li>
  *   <li>Holder 槽位 save/get/clear + ThreadLocal 会话隔离（并发 loop 防串台）</li>
  * </ol>
+ *
+ * <p><b>[E-1a pre-append 契约]</b>：{@code CacheSafeParams.systemPrompt} 存的是<b>未经</b>
+ * {@code appendSystemContext} 的组装段数组 + 独立 {@code systemContext} map；append 由使用点
+ * （fork 发送边界 {@code ProductionForkedQuery}）恰做一次。故本测试对 {@code systemPrompt()} 的
+ * 断言不含 {@code gitStatus} 段 —— 发送字节逐字节金样见
+ * {@link ForkSystemPromptPreAppendContractTest}（改动前后一致）。
  */
 class CacheSharingParamsBuilderTest {
 
@@ -145,11 +151,14 @@ class CacheSharingParamsBuilderTest {
 
         // defaultAssemble 恰好被调用一次（CC getSystemPrompt compact.ts:259-263）
         assertThat(assembleCalls).hasValue(1);
-        // systemPrompt = default 元素数组 + systemContext(gitStatus) 并入（[RES-R4] 数组语义）
+        // [E-1a pre-append 契约] systemPrompt = default 元素数组 **pre-append** 形态（不含
+        //   systemContext 段）；systemContext 独立成 map 随第 3 字段透传，append 由使用点
+        //   （ProductionForkedQuery 发送边界）恰做一次 —— 发送字节见
+        //   ForkSystemPromptPreAppendContractTest 金样（本断言面 = 字段，金样面 = 发送 blocks）。
         assertThat(cs.systemPrompt())
-            .as("default 元素 + appendSystemContext 并入的 gitStatus 块，顺序保持发送序")
-            .containsExactly("DEFAULT-1", "DEFAULT-2", "gitStatus: GIT-BLOCK");
-        // systemContext 来源 = getSystemContext（git 块）
+            .as("default 元素数组（pre-append · 未经 appendSystemContext）")
+            .containsExactly("DEFAULT-1", "DEFAULT-2");
+        // systemContext 来源 = getSystemContext（git 块）· 独立通道（append 在使用点）
         assertThat(cs.systemContext()).containsEntry("gitStatus", "GIT-BLOCK");
         // userContext 不受 custom 影响
         assertThat(cs.userContext()).containsEntry("claudeMd", "项目指令");
@@ -167,12 +176,12 @@ class CacheSharingParamsBuilderTest {
             null, "APPEND-CMD",
             tuc, forkMsgs, false); // [RES-R4-1] gate 显式传（3P 默认场景）
 
-        // default 组装元素后紧跟 append（EffectiveSystemPromptBuilder 恒末尾追加 :121）→
-        // systemContext(gitStatus) 由 appendSystemContext 再并到末尾。断言 append 紧跟 default、
-        // 在 systemContext 之前 = 恒末尾语义（CC buildEffectiveSystemPrompt 结果 + api.ts:437-447 并入）。
+        // default 组装元素后紧跟 append（EffectiveSystemPromptBuilder 恒末尾追加 :121）——
+        // [E-1a pre-append 契约] systemContext(gitStatus) **不在此并入**（append 由使用点
+        //   ProductionForkedQuery 恰做一次），故字段断言止于 append 元素（恒末尾语义不含 context 段）。
         assertThat(cs.systemPrompt())
-            .as("append 必须紧跟 default 元素末尾（恒末尾追加），随后才是 systemContext 并入（[RES-R4] 数组语义）")
-            .containsExactly("DEFAULT-1", "DEFAULT-2", "APPEND-CMD", "gitStatus: GIT-BLOCK");
+            .as("append 必须紧跟 default 元素末尾（恒末尾追加）· pre-append 形态不含 systemContext 段")
+            .containsExactly("DEFAULT-1", "DEFAULT-2", "APPEND-CMD");
     }
 
     @Test

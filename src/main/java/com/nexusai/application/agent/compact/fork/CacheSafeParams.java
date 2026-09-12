@@ -20,6 +20,13 @@ import java.util.Map;
  * 表达数组（Java 对 CC branded 数组的直接表示）；<b>不再</b>在构建器里无条件
  * {@code String.join("\n\n", ...)} 扁平化（旧实现丢失 boundary 元素）。
  *
+ * <p><b>[E-1a] systemPrompt 是 pre-append 形态</b>（尚未并入 {@link #systemContext} 的组装段
+ * 数组）—— 与 CC 一致（CC 的 {@code systemPrompt} 即 {@code query()} 不可变 params 的值，
+ * 未经 {@code appendSystemContext}；fork 自身 query() 内重跑，query.ts:449-450/:660）。
+ * {@code appendSystemContext} <b>非幂等</b>（每次调用追加一个末尾元素），故 append 只在
+ * <b>使用点</b>执行一次（Java 侧 = {@code ProductionForkedQuery} 发送边界）——
+ * 对 post-append 值再并入会多一段 → 发送 blocks 与主线程不一致 → prompt cache 永不命中。
+ *
  * <p><b>useGlobalCacheScope（RES-R4 · Java 侧通信通道）</b>: 主线程发送边界用
  * {@code shouldUseGlobalCacheScope()}（betas.ts:227-233，firstParty && !DISABLE_EXPERIMENTAL_BETAS）
  * 决定 split 模式（boundary→global/默认→org）。fork 发送边界必须与主线程<b>同一 gate 判定</b>
@@ -34,8 +41,9 @@ import java.util.Map;
  * budget_tokens → thinking config 偏移 → 破坏主线程 cache key（forkedAgent.ts:46-56，
  * compact.ts:1181-1187）。因此 fork 路径 <b>禁止设 maxOutputTokens</b>。
  *
- * @param systemPrompt        主线程 system prompt <b>发送前数组</b>（含 boundary 元素；
- *                             发送边界才剥离）· CC original:
+ * @param systemPrompt        主线程 system prompt **pre-append** 数组（组装段数组，含 boundary
+ *                             元素；发送边界才剥离，且由使用点 appendSystemContext 并入
+ *                             {@link #systemContext}）· CC original:
  *                             {@code systemPrompt: SystemPrompt} (forkedAgent.ts:59)
  * @param userContext         user context（前置于 messages，影响 cache）· CC original:
  *                            {@code userContext: { [k: string]: string }} (forkedAgent.ts:61)

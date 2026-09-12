@@ -3848,6 +3848,18 @@ public class LlmAgentLoop implements AgentLoop {
             log.info("[queryLoop] 入口: querySource={} isMainLoop={} model={} turn={}",
                 params.querySource(), params.deps().isMainLoop(), params.modelName(), state.turnCount());
         }
+        // ── [E-1a fail-loud] 后台 fork 来源必须注入受限 canUseTool（INV-6）──
+        //   CC 的 fork 用**自己的**受限 canUseTool 调同一个 query（forkedAgent.ts:569 透传
+        //   createAutoMemCanUseTool / createCompactCanUseTool）；Java 的 canUseTool == null 语义
+        //   = 回落内层 ToolPermissionGate（**全权限**）。主线程/子代理/hook agent 本就该回落
+        //   （现状，零变化）；后台 fork 若漏注入则**静默变全权限** → 与
+        //   ProductionForkedQuery.executeGatedTool 的 fail-loud 同判据，此处对齐为 fail-loud
+        //   （异常直接暴露，不静默降级）。
+        if (QuerySource.isBackgroundForkSource(params.querySource()) && params.canUseTool() == null) {
+            throw new IllegalStateException("[queryLoop] 后台 fork 来源（querySource="
+                + params.querySource() + "）未注入 canUseTool —— fork 工具将退回内层 permissionGate"
+                + "（全权限），INV-6 破坏，fail loud（对齐 ProductionForkedQuery 同判据）");
+        }
         // [P-8] CC query.ts:276 初始 turnCount:1 —— Java AgentState 初始 0，入口补齐；
         //   递归重入（stop_hook_blocking loop(..., true)）不经本方法，turnCount 保持（CC:1301）。
         if (state.turnCount() == 0) {
@@ -5168,11 +5180,23 @@ public class LlmAgentLoop implements AgentLoop {
                 //   差异仅在「run 中途新增技能」的公告时机（CC 当轮即公告，nexusai 要等下一 run）。属有意
                 //   简化：移出 firstIteration 会让每轮都尝试构造/落库清单消息，而增量去重后绝大多数轮为
                 //   「无新增 → 不注入」，收益小、改动面与落库噪声大。
-                try {
-                    injectSkillListingForRun(ctx, params.toolUseContext(), state,
-                        params.modelName(), skillListingResume, autoCompactor);
-                } catch (Exception e) {
-                    log.warn("[LlmAgentLoop] skill_listing 注入失败（best-effort 不阻断 run）: {}", e.getMessage());
+                // [E-1a fork 屏蔽档] 后台 fork 来源不注入 skill_listing —— 其注册表
+                //   （SkillListingSentRegistry）键 = agentId ?? ""，fork 的 agentId=null 会与
+                //   主线程共用槽位（fork 的 decides/写入会污染主线程的发过清单状态）；且清单对
+                //   后台摘要/记忆提取无意义（CC 侧该注入按 agentKey 分桶，隔离上下文另有一份）。
+                //   子代理（FORK/SUBAGENT/HOOK_AGENT）不在此判据内 —— 子代理确有自己 turn-0 的
+                //   清单（attachments.ts:2672-2676），行为不变。
+                if (QuerySource.isBackgroundForkSource(params.querySource())) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[E-1a] 后台 fork 来源跳过 skill_listing 注入: querySource={}", params.querySource());
+                    }
+                } else {
+                    try {
+                        injectSkillListingForRun(ctx, params.toolUseContext(), state,
+                            params.modelName(), skillListingResume, autoCompactor);
+                    } catch (Exception e) {
+                        log.warn("[LlmAgentLoop] skill_listing 注入失败（best-effort 不阻断 run）: {}", e.getMessage());
+                    }
                 }
             }
             firstIteration = false;
@@ -5642,7 +5666,15 @@ public class LlmAgentLoop implements AgentLoop {
             // 详见纯文本分支（~line 4100）的 post-response budget check。
 
             // 事件 2：turn 启动
-            AgentLoopContext.publishEvent(ctx, new AgentTurnStartedEvent(state, state.turnCount(), params.modelName()));
+            // [E-1a fork 屏蔽档] 后台 fork 来源不发布 turn 事件 —— AgentLoopContext 的事件桥是
+            //   主会话级的（EventPublisher/前端 STOMP），fork 走 queryLoop 后若照发会把 fork 的
+            //   turn 生命周期发进主会话 UI 事件流（CC 侧靠隔离上下文天然隔离，无此问题）。
+            //   子代理（FORK/SUBAGENT/HOOK_AGENT）不在此判据内，行为不变。
+            if (!QuerySource.isBackgroundForkSource(params.querySource())) {
+                AgentLoopContext.publishEvent(ctx, new AgentTurnStartedEvent(state, state.turnCount(), params.modelName()));
+            } else if (log.isDebugEnabled()) {
+                log.debug("[E-1a] 后台 fork 来源跳过 AgentTurnStarted 发布: querySource={}", params.querySource());
+            }
 
             // [MAINCHAIN-01] 主链按 providerType 路由（对齐 ChatService:163 2 参 getProvider）。
             // 1 参重载恒落 openai_sdk → anthropic 型 provider 主链路由错（reverify 核验证实）。
@@ -5942,9 +5974,14 @@ public class LlmAgentLoop implements AgentLoop {
             // 3. appendSystemContext（api.ts:437-447）· systemContext（gitStatus?/cacheBreaker?）并入 systemPrompt
             //    SystemPrompt.from = CC asSystemPrompt 等价（identity 品牌化，零拷贝/零归一化，
             //    见 SystemPrompt#from）⇒ runParams 的 List<String> 往返无损。
-            java.util.List<String> fullSystemPrompt = sysPromptCtxProvider.appendSystemContext(
-                com.nexusai.application.agent.prompt.SystemPrompt.from(runParams.systemPrompt()),
-                runParams.systemContext());
+            // [E-1a 单一来源] 调用点 = appendSystemContext 的**使用点**（static 纯函数，唯一实现）：
+            //   runParams.systemPrompt() 恒为 **pre-append** 形态（AssembledSystemPrompt，尚未并入
+            //   systemContext），每 tool 轮在此并入一次（本方法**非幂等** —— 对 post-append 值再
+            //   并一次会多出末尾元素，破坏 prompt cache 前缀，见 SystemPromptContextProvider 契约）。
+            java.util.List<String> fullSystemPrompt =
+                com.nexusai.application.agent.prompt.SystemPromptContextProvider.appendSystemContext(
+                    com.nexusai.application.agent.prompt.SystemPrompt.from(runParams.systemPrompt()),
+                    runParams.systemContext());
             // [skill-listing-cc-align 2026-09-10] 旧 4.4 skill_listing 头部块已删：skill_listing 现为
             //   state.rawMessages() 中的真实消息（紧随当前用户消息之后，见 injectSkillListingForRun），
             //   经 messagesForQuery 自然进入请求，无需 prepend 到队首。
@@ -6003,7 +6040,9 @@ public class LlmAgentLoop implements AgentLoop {
             // blocking limit = effectiveWindow - 3000（CompactThresholdSystem.getBlockingLimit，S3-B6）。
             // 跳过条件（对齐 CC）：
             //   1) 本 turn 刚压缩过（!compactionResult）——压缩后 token 已降，重复预检无意义；
-            //   2) compact/session_memory 源——forked agent 继承完整对话，预检会死锁（compact 需运行来降 token）；
+            //   2) 后台 fork 源（{@link QuerySource#isBackgroundForkSource}：compact / session_memory /
+            //      extract_memories / auto_dream）——forked agent 继承完整对话，预检会死锁
+            //      （compact 需运行来降 token）；
             //   3) reactiveCompact 启用 && autoCompact 启用——synthetic 错误返回在 API 调用前，RC 收不到 PTL 无法反应；
             //   4) contextCollapse 启用 && autoCompact 启用（collapseOwnsIt）——drain 在真实 413 上跑，
             //      synthetic preempt 会饿死恢复路径。
@@ -6017,9 +6056,13 @@ public class LlmAgentLoop implements AgentLoop {
             boolean collapseOwnsBlocking = ctx.contextCollapse() != null
                 && ctx.contextCollapse().isContextCollapseEnabled()
                 && autoCompactor != null && autoCompactor.isAutoCompactEnabled();
+            //   [E-1a fork 屏蔽档] 豁免值域由 COMPACT/SESSION_MEMORY 扩到
+            //   {@link QuerySource#isBackgroundForkSource}（+ EXTRACT_MEMORIES / AUTO_DREAM）——
+            //   单一判据，勿在本行另写值域。新增的两来源今天不走本循环（E-1b 才收敛），
+            //   故现网行为零变化；E-1b 后 fork 与 compact 同样豁免（fork 继承完整对话，
+            //   预检会死锁）。
             if (!justCompacted
-                && params.querySource() != QuerySource.COMPACT
-                && params.querySource() != QuerySource.SESSION_MEMORY
+                && !QuerySource.isBackgroundForkSource(params.querySource())
                 && !rcOwnsBlocking
                 && !collapseOwnsBlocking) {
                 // [S3-B6] blocking 窗口统一到 CompactThresholdSystem（CC autoCompact.ts:33-49/122-134）：
@@ -7368,7 +7411,12 @@ public class LlmAgentLoop implements AgentLoop {
             // 不中断主链）。修复审计 A1：PostSamplingHookRegistry 原为 0 引用（"看似接入实则断路"）。
             // CC postSamplingHooks.ts:45-70 内部遍历 + logError continue，Java 等价 executeAll。
             // [Session H12] hook 接收 REPLHookContext 等价 PostSamplingContext（CC postSamplingHooks.ts:53-60），
-            if (msg != null) {
+            // [E-1a fork 屏蔽档] 后台 fork 来源不跑 post-sampling hooks —— 这些 hook
+            //   （SkillImprovementHook / SessionMemoryService / MagicDocs ...）吃主会话级 ctx
+            //   （appState / EventPublisher / 会话注册表），fork 走 queryLoop 后若照跑会把 fork 的
+            //   消息写进主会话状态（CC 侧靠隔离上下文天然隔离）。子代理（FORK/SUBAGENT/
+            //   HOOK_AGENT）不在此判据内，行为不变。
+            if (msg != null && !QuerySource.isBackgroundForkSource(params.querySource())) {
                 // [D10 双视图] 选边 = modelView()（模型面）。post-sampling hook 拿到的
                 //   PostSamplingContext.messages 是 CC `REPLHookContext.messages` 等价物
                 //   （postSamplingHooks.ts:53-60）→ 其源 = query.ts:1288-1289 的 messagesForQuery。
@@ -7389,17 +7437,19 @@ public class LlmAgentLoop implements AgentLoop {
                 com.nexusai.application.agent.hook.PostSamplingContext psContext =
                         new com.nexusai.application.agent.hook.PostSamplingContext(
                             postSamplingMessages(psBase, msg, turnAssistantId),
-                            // [IMP-HOOKS-S7 D3] systemPrompt 传组装段数组（本 loop 方法作用域
-                            //   fullSystemPrompt · appendSystemContext 产物，含 boundary 段），
-                            //   对齐 CC query.ts:1288-1290 executePostSamplingHooks 传 systemPrompt。
-                            //   [prompt-assembly-A] 保持 post-append 形态（**CC 传 pre-append** 的 Java
-                            //   取舍）：下游消费链 PostSamplingContext.systemPrompt →
-                            //   SessionMemoryService.sessionSystemPrompt → CacheSafeParams.systemPrompt
-                            //   → ProductionForkedQuery.splitSysPromptPrefix（发送边界**不重跑**
-                            //   appendSystemContext，见 ForkRawMaterial javadoc 论证）—— 传 pre-append
-                            //   会让 SM fork 系统提示缺 systemContext 段 → cache key 与主线程不一致。
-                            //   同款先例：CacheSharingParamsBuilder:126。
-                            fullSystemPrompt,
+                            // [IMP-HOOKS-S7 D3 + E-1a pre-append] systemPrompt 传组装段数组的
+                            //   **pre-append** 形态（= runParams.systemPrompt()，含 boundary 段），
+                            //   对齐 CC query.ts:1288-1290 executePostSamplingHooks 传 systemPrompt
+                            //   （CC 的 REPLHookContext.systemPrompt 即 query() 不可变 params 的值，
+                            //   **未经** appendSystemContext）。
+                            //   [E-1a 变更] 旧实现传 post-append 的 fullSystemPrompt（Java 特有取舍，
+                            //   因 fork 发送边界当时不重跑 append）；E-1a 把 append 移到使用点后，
+                            //   本字段回归 CC 的 pre-append 语义，systemContext 独立随第 4 参透传，
+                            //   fork 发送边界（ProductionForkedQuery）仍恰并入一次 → 发送字节不变。
+                            //   消费点：SessionMemoryService.sessionSystemPrompt →
+                            //   CacheSafeParams.systemPrompt（pre-append + systemContext map）；
+                            //   ApiQueryHookHelper（hook 查询）在自身使用点补 append。
+                            runParams.systemPrompt(),
                             // [prompt-assembly-A] 空桩修复：userContext/systemContext 旧为
                             //   QueryParams.forLoop 硬编码 Map.of()（恒空 → hook 一直拿空上下文）。
                             //   改读 runParams（per-run 材料收集的真实产物）：
@@ -7839,8 +7889,13 @@ public class LlmAgentLoop implements AgentLoop {
             //   turnUserMessageId/turnAssistantId/msg/decodeMs。msg null（异常路径）→ 方法内 no-op）
             publishMessageUsage(ctx, state, effectiveModel, turnUserMessageId, turnAssistantId,
                 msg, computeDecodeMs(firstTokenMs));
-            AgentLoopContext.publishEvent(ctx, new AgentTurnCompletedEvent(
-                state, state.turnCount(), chunkCount[0], text.length(), state.finishReason()));
+            // [E-1a fork 屏蔽档] 同 AgentTurnStarted（后台 fork 不发主会话 turn 事件；子代理不变）
+            if (!QuerySource.isBackgroundForkSource(params.querySource())) {
+                AgentLoopContext.publishEvent(ctx, new AgentTurnCompletedEvent(
+                    state, state.turnCount(), chunkCount[0], text.length(), state.finishReason()));
+            } else if (log.isDebugEnabled()) {
+                log.debug("[E-1a] 后台 fork 来源跳过 AgentTurnCompleted 发布: querySource={}", params.querySource());
+            }
             // [DRIFT-7/8] genuine next_turn 复位（真实 assistant 响应后 · CC query.ts:1721，不误清恢复状态）
             // [P-8] 本分支不做 incrementTurn：CC token_budget_continuation / stop_hook_blocking
             //   保持 turnCount（query.ts:1301/:1337），仅工具路径 next_turn 边界递增（:4713）。
@@ -7955,9 +8010,11 @@ public class LlmAgentLoop implements AgentLoop {
                             : com.nexusai.application.agent.tool.SessionStorage.getProjectDir(
                                 java.nio.file.Path.of(
                                     com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot()));
-                    // [IMP-MV2-09 T9] fork 原料捕获：当轮主线程 systemPrompt（fullSystemPrompt ·
-                    //   已含 appendSystemContext 并入的 systemContext）/ userContext / systemContext /
-                    //   消息快照 —— 对齐 CC createCacheSafeParams(context)（forkedAgent.ts:131-141，
+                    // [IMP-MV2-09 T9 + E-1a pre-append] fork 原料捕获：当轮主线程 systemPrompt 的
+                    //   **pre-append** 形态（= runParams.systemPrompt()，组装段数组含 boundary 段）/
+                    //   userContext / systemContext / 消息快照 —— 对齐 CC createCacheSafeParams(context)
+                    //   （forkedAgent.ts:131-141，CC 的 systemPrompt 即 query() 不可变 params 的值，
+                    //   **未经** appendSystemContext；append 由 fork 自身 query() 重跑：
                     //   extractMemories.ts:372 / autoDream.ts:226 消费全量载荷）。修复
                     //   ToolRegistrationConfig.buildProductionCacheSafeParams 空载荷（三段恒空）→
                     //   fork 无主系统提示 + prompt-cache key 与主线程不一致（cache 共享失效）。
@@ -7968,17 +8025,16 @@ public class LlmAgentLoop implements AgentLoop {
                     //   取值语义不变（非 coordinator 时 runParams.userContext() === sysParts.userContext()，
                     //   systemContext 逐键相同），且 coordinator 门真时与 CC QueryEngine.ts:302-306 的
                     //   合并后 userContext 一致。
-                    //   ⚠️ systemPrompt **仍传 post-append 的 fullSystemPrompt 而非 runParams.systemPrompt()**
-                    //   （CC 传 pre-append）：Java 特有取舍 —— fork 发送边界
-                    //   {@code ProductionForkedQuery.splitSysPromptPrefix(params.systemPrompt())} **不重跑**
-                    //   appendSystemContext（ForkRawMaterial 类 javadoc 已论证），传 pre-append 会让 fork
-                    //   系统提示缺 systemContext 段 → prompt-cache key 与主线程不一致（正是 T9 修的 bug）。
-                    //   同款先例：CacheSharingParamsBuilder:126（CacheSafeParams.systemPrompt 亦取
-                    //   appendSystemContext 产物 + 独立 systemContext map）。
-                    //   fullSystemPrompt 为当轮 do-while 体级局部变量（s10 组装），此处同作用域可见。
+                    //   [E-1a 变更] systemPrompt 传 **pre-append** 的 runParams.systemPrompt()
+                    //   （= CC 语义）：append 已移到使用点 —— fork 发送边界
+                    //   {@code ProductionForkedQuery} 在 splitSysPromptPrefix 前恰并入一次
+                    //   （systemContext 独立随第 3 参透传）。旧实现传 post-append 的 fullSystemPrompt
+                    //   是 Java 特有取舍（当时发送边界不重跑 append）；两形态在本批**发送字节相同**。
+                    //   同款先例：CacheSharingParamsBuilder（同批改为 pre-append）。
                     com.nexusai.application.agent.compact.fork.ForkRawMaterial forkRawMaterial =
                         new com.nexusai.application.agent.compact.fork.ForkRawMaterial(
-                            fullSystemPrompt != null ? List.copyOf(fullSystemPrompt) : List.of(),
+                            runParams.systemPrompt() != null
+                                ? List.copyOf(runParams.systemPrompt()) : List.of(),
                             runParams.userContext() != null
                                 ? Map.copyOf(runParams.userContext()) : Map.of(),
                             runParams.systemContext() != null
