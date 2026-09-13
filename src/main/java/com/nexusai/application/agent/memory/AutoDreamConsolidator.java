@@ -373,8 +373,8 @@ public class AutoDreamConsolidator {
      * （@Bean 共享 + 异步 consolidateIfNeeded 的跨会话交错窗口），调用点（LlmAgentLoop
      * stop-hook 注入处）按会话捕获后经 StopHookPipeline 透传。
      *
-     * @param workspaceDir 会话 transcript 扫描根目录（CC getProjectDir(cwd) ·
-     *                     consolidationLock.ts:121）
+     * @param workspaceDir <b>项目根</b>（= CC {@code getOriginalCwd()}）· ⚠️ 调用方**不得预先派生**，
+     *                     派生一次由 {@link #scanSessionTranscripts} 内部做（consolidationLock.ts:118-124）
      * @param sessionId    当前 session ID（排除自身 · CC autoDream.ts:164；null = 不排除）
      * @param appendSystemMessage UI 系统消息回调（CC toolUseContext.appendSystemMessage；
      *                            null = fork 成功不追加 Improved 完成消息）
@@ -414,8 +414,8 @@ public class AutoDreamConsolidator {
      * 修复 fork 空载荷（ToolRegistrationConfig:1468-1469）→ dream fork 恢复主系统提示 +
      * prompt-cache key 与主线程一致；null = 无捕获（非主循环调用方），保持既有兜底。
      *
-     * @param workspaceDir 会话 transcript 扫描根目录（CC getProjectDir(cwd) ·
-     *                     consolidationLock.ts:121）
+     * @param workspaceDir <b>项目根</b>（= CC {@code getOriginalCwd()}）· ⚠️ 调用方**不得预先派生**，
+     *                     派生一次由 {@link #scanSessionTranscripts} 内部做（consolidationLock.ts:118-124）
      * @param sessionId    当前 session ID（排除自身 · CC autoDream.ts:164；null = 不排除）
      * @param appendSystemMessage UI 系统消息回调（CC toolUseContext.appendSystemMessage；
      *                            null = fork 成功不追加 Improved 完成消息）
@@ -459,8 +459,8 @@ public class AutoDreamConsolidator {
      * ThreadLocal 读写（@Bean 共享 + 异步 consolidateIfNeeded 的跨会话交错窗口），调用点
      * （LlmAgentLoop stop-hook 注入处）按会话捕获后经 StopHookPipeline 透传。
      *
-     * @param workspaceDir 会话 transcript 扫描根目录（CC getProjectDir(cwd) ·
-     *                     consolidationLock.ts:121）
+     * @param workspaceDir <b>项目根</b>（= CC {@code getOriginalCwd()}）· ⚠️ 调用方**不得预先派生**，
+     *                     派生一次由 {@link #scanSessionTranscripts} 内部做（consolidationLock.ts:118-124）
      * @param sessionId    当前 session ID（排除自身 · CC autoDream.ts:164；null = 不排除）
      * @param appendSystemMessage UI 系统消息回调（CC toolUseContext.appendSystemMessage；
      *                            null = fork 成功不追加 Improved 完成消息）
@@ -592,9 +592,12 @@ public class AutoDreamConsolidator {
      * 对齐 listCandidates 语义：name.endsWith('.jsonl') + validateUuid(name 去 .jsonl)
      * （sessionStoragePortable.ts:26-30，agent-*.jsonl 非 UUID 被排除）+ mtime > sinceMs + 排除当前 session。
      *
-     * @param workspaceDir 会话 transcript 扫描根目录（[S2] 调用方已传 config-home 项目 slug 目录
-     *                     = CC getProjectDir(cwd) · consolidationLock.ts:121；D5-A/M-11 参数化显式传入；
-     *                     null → 会话门阻断）
+     * @param workspaceDir <b>项目根</b>（= CC {@code getOriginalCwd()}）· ⚠️ **调用方不得预先派生**：
+     *                     本方法内部会做一次 {@code SessionStorage.getProjectDir(workspaceDir)}
+     *                     （= CC {@code listSessionsTouchedSince} 的 {@code getProjectDir(getOriginalCwd())}，
+     *                     consolidationLock.ts:118-124）。[FIX-AD-02 2026-09-13] 旧注释写"调用方已传
+     *                     config-home 项目 slug 目录"，导致调用方**又派生一次** ⇒ 双重 slug 目录不存在
+     *                     ⇒ 会话门恒阻断 ⇒ doConsolidate 永不执行。null → 会话门阻断。
      * @param sessionId    当前 session ID（排除自身 · CC autoDream.ts:164；null = 不排除）
      * @param sinceMs      上次合并时间 ms
      * @return mtime 晚于 sinceMs 的 sessionId 列表（已排除当前 session）
@@ -705,7 +708,7 @@ public class AutoDreamConsolidator {
      *       rollbackConsolidationLock(priorMtime)（autoDream.ts:266-271）</li>
      * </ol>
      *
-     * @param workspaceDir 会话 transcript 扫描根目录（[S2] 调用方根已迁 config-home 项目 slug 目录，
+     * @param workspaceDir <b>项目根</b>（= CC {@code getOriginalCwd()}）· ⚠️ 调用方**不得预先派生**（[S2] 旧注释的 slug 措辞已废，
      *                     D5-A/M-11 参数化透传；null → transcriptDir 降级 memoryRoot）
      * @param priorMtime  锁获取前 mtime（rollback 回退目标）
      * @param sessionIds  门控收集的待审 session 列表（extra + 遥测）
@@ -826,8 +829,10 @@ public class AutoDreamConsolidator {
      * 4 阶段模板 + args）→ ④ buildForkParams 构建受限 canUseTool fork → ⑤ RunForkedAgent
      * 执行整合。返回 {@link DreamResult}（当前仅测试消费）。
      *
-     * @param workspaceDir 会话 transcript 扫描根目录（CC getProjectDir(getOriginalCwd()) ·
-     *                     consolidationLock.ts:121；null → transcriptDir 降级 memoryRoot）
+     * @param workspaceDir ⚠️ **本方法直接用其 {@code toString()} 当 transcriptDir**（不派生）——
+     *                     与 {@link #scanSessionTranscripts} 的「传项目根、内部派生一次」契约**不同**，
+     *                     [FIX-AD-02 2026-09-13] 已登记为契约冲突（规则七，未强行统一；本路径生产
+     *                     未接线，见类 javadoc「保留未接线」）。null → transcriptDir 降级 memoryRoot
      * @param args         用户附加上下文（CC dream.ts:37-38 {@code ## Additional context from user}；
      *                     null/blank → 不附加）
      * @return 手动整合结果（started + writtenPaths）
@@ -841,7 +846,7 @@ public class AutoDreamConsolidator {
      * {@code forkRawMaterial} 透传（主线程 systemPrompt/userContext/systemContext/快照 ·
      * forkedAgent.ts:131-141；null = 无捕获兜底，走 createMinimalCacheSafeParams）。
      *
-     * @param workspaceDir   会话 transcript 扫描根目录（CC getProjectDir(getOriginalCwd())）
+     * @param workspaceDir   ⚠️ 同 {@link #doDream(Path, String, ForkRawMaterial)}：直接当 transcriptDir 用（不派生）
      * @param args           用户附加上下文（CC dream.ts:37-38；null/blank → 不附加）
      * @param forkRawMaterial fork 原料（主线程 systemPrompt 等 · forkedAgent.ts:131-141；null = 兜底）
      * @return 手动整合结果（started + writtenPaths）

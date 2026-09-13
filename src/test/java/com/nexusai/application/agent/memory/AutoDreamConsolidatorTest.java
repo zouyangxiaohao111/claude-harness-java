@@ -773,6 +773,29 @@ class AutoDreamConsolidatorTest {
     }
 
     @Test
+    @DisplayName("[FIX-AD-02] scanSessionTranscripts 契约：参数必须是『项目根』—— 传『已派生目录』必得空")
+    void scanSessionTranscripts_doubleDerivedDir_yieldsEmpty() throws IOException {
+        // WHY（CLAUDE.md 规则九）：2026-09-13 实机确认的生产缺陷 —— LlmAgentLoop 曾把
+        //   SessionStorage.getProjectDir(root) 传进来，而本方法内部**又**派生一次 ⇒
+        //   getProjectDir(getProjectDir(root)) = {projects}/sanitize({projects}/sanitize(root))
+        //   这个**不存在**的目录 ⇒ 会话门恒 0 < minSessions ⇒ doConsolidate **永不执行**
+        //   （旁证：~/.nexusai/projects 下从无 .consolidate-lock —— 生产 autoDream 从未真正合并过）。
+        //
+        // 契约 = CC listSessionsTouchedSince：consolidationLock.ts:118
+        //   「const dir = getProjectDir(getOriginalCwd())」—— **参数是 cwd/项目根，派生只做一次**。
+        //   本测试把该契约变成可执行断言：去掉内部派生、或调用方又预先派生，下列两条之一必红。
+        writeSessions(ws, 3);
+        // ① 传项目根 → 内部派生一次 → 找到（= CC 语义）
+        assertThat(consolidator.scanSessionTranscripts(ws, null, 0))
+            .as("参数 = 项目根 ⇒ 内部派生一次 ⇒ 找到 3 个会话")
+            .hasSize(3);
+        // ② 传已派生目录 → 二次派生到不存在的位置 ⇒ 空（缺陷形状；同时钉死「参数必须是根」）
+        assertThat(consolidator.scanSessionTranscripts(SessionStorage.getProjectDir(ws), null, 0))
+            .as("参数必须是项目根：传已派生目录 ⇒ 二次派生到不存在位置 ⇒ 扫描得空（旧生产缺陷形状）")
+            .isEmpty();
+    }
+
+    @Test
     @DisplayName("D5-A/M-11：consolidateIfNeeded 参数化 —— 显式 workspaceDir 生效（有会话目录不触发误扫）")
     void consolidateIfNeeded_explicitWorkspaceDirBlocksWhenDirEmpty() throws IOException {
         // WHY: workspaceDir 参数化回归锚点 —— 即使其他目录（本测试 ws）已备 5 会话，

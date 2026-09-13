@@ -7954,16 +7954,22 @@ public class LlmAgentLoop implements AgentLoop {
                     //   StopHookPipeline 透传 consolidateIfNeeded(workspaceDir, sessionId, append)
                     //   （CC getProjectDir(cwd) · consolidationLock.ts:121；排除自身 session ·
                     //   autoDream.ts:164）。原 s09 会话绑定随阶段 4 移入每轮（避免共享 bean 残留旧会话）。
-                    // [S2 迁移] auto-dream transcript 扫描/提示根随迁 config-home 项目 slug 目录
-                    //   （CC getProjectDir(getOriginalCwd()) · consolidationLock.ts:121；旧 workspaceDir
-                    //   在 S2 后指向项目目录内已无 flat transcript，改调用方根走 config-home 派生）
+                    // [FIX-AD-02 2026-09-13] **调用方一律传项目根，派生交给 helper** —— 不得在此预先派生。
+                    //   契约：scanSessionTranscripts 内部已做 SessionStorage.getProjectDir(workspaceDir)
+                    //   （= CC listSessionsTouchedSince 的 getProjectDir(getOriginalCwd())，
+                    //   consolidationLock.ts:118-124「const dir = getProjectDir(getOriginalCwd())」）。
+                    //   [缺陷] 旧实现此处**又**派生一次 ⇒ getProjectDir(getProjectDir(root)) =
+                    //   {projects}/sanitize({projects}/sanitize(root)) 这个**不存在**的目录 ⇒
+                    //   AutoDreamConsolidator:610 「transcript 基目录不存在或不可读，会话门阻断」⇒
+                    //   会话数恒 0 < minSessions ⇒ doConsolidate **永不执行**（生产 autoDream 从未真正
+                    //   合并过；旁证：~/.nexusai/projects 下无任何 .consolidate-lock）。
+                    //   同文件 :8360 getAgentTranscriptPath(sessionState().workspaceDir(), ...) 是同款
+                    //   正确范式（传项目根，helper 内派生一次）。
                     java.nio.file.Path inLoopDreamWs =
                         (ctx.sessionState() != null && ctx.sessionState().workspaceDir() != null)
-                            ? com.nexusai.application.agent.tool.SessionStorage.getProjectDir(
-                                ctx.sessionState().workspaceDir())
-                            : com.nexusai.application.agent.tool.SessionStorage.getProjectDir(
-                                java.nio.file.Path.of(
-                                    com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot()));
+                            ? ctx.sessionState().workspaceDir()
+                            : java.nio.file.Path.of(
+                                com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
                     // [IMP-MV2-09 T9 + E-1a pre-append] fork 原料捕获：当轮主线程 systemPrompt 的
                     //   **pre-append** 形态（= params.systemPrompt()，组装段数组含 boundary 段）/
                     //   userContext / systemContext / 消息快照 —— 对齐 CC createCacheSafeParams(context)
