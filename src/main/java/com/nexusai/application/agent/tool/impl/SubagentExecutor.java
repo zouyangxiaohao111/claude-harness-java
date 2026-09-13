@@ -1962,14 +1962,20 @@ public class SubagentExecutor {
             llmProviderFactory, providerConfig, effectiveModel,
             progressTracker, sdkEventQueue);
         // ── Step 20: query 主循环（内联，不委托 LlmAgentLoop.run）──
-        // [IMP-D F4/M-05] spawn 作用域注入会话 projectRoot（修 M-05/M-06 · 模板
-        //   AgentContext.runWithAgentContext :154-166 同款 capture/set/restore；
-        //   subagent-reverify #10 已裁决接线模式）。sync 路径 = 工具线程（IMP-C 已传播）
-        //   同值成对；async/resume 路径 = SubagentTool asyncWorker 线程体已注入父值，此处
-        //   capture/set/restore 同值成对；多嵌套子代理（子再 spawn）restore 外层原值不串台。
+        // [批 2 · B 类清理] 原此处为
+        //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
+        //   （AutoMemPaths:113 返回值直接 set 回 ThreadLocal，恒 no-op），注释却声称
+        //   「spawn 作用域注入会话 projectRoot（修 M-05/M-06）」——与实语句不符，已删除该 set。
+        //   会话 projectRoot 的真实注入源在 spawn 之外（sync = StreamingToolExecutor 工具池
+        //   :2465 调度线程捕获注入；async/resume = SubagentTool asyncWorker :3195 注入父值），
+        //   本作用域无需重复注入。
+        //   保留 capture/restore 成对，语义校正为「退出复位」而非「注入」：子代理 loop 内
+        //   prompt 组装经 {@code ensureAutoMemoryProjectRootResolvedForPrompt}
+        //   （LlmAgentLoop:4642/:4704）会在本线程**未成对** set 会话 projectRoot（该处语义即
+        //   「回填本线程」），本线程是池化线程（工具池 / asyncWorker）——不在此复位则残留值
+        //   随线程复用泄漏到下一个会话的工具执行（AutoMemPaths:95 记载的 JVM 级隐患）。
         SubagentResult loopResult = null;
         final String prevSubagentProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-        AutoMemPaths.setCurrentProjectRoot(prevSubagentProjectRoot);
         try {
             // [R2-CTX] subagent spawn 包裹 runWithAgentContext（analytics 归因 · CC AgentTool.tsx:733/:785/:911）。
             //   每次 spawn 新建 SubagentContext 并包住 runSubagentQueryLoop，使 query loop 内事件
@@ -2187,8 +2193,10 @@ public class SubagentExecutor {
                 log.debug("[SubagentExecutor] Step 21: 完整清理已完成 agent={} (a+16hex={})", agentId, agentIdHex);
             }
 
-            // [IMP-D F4/M-05] 恢复 spawn 作用域外层 projectRoot（成对 restore · 线程池复用防串台，
-            //   对齐 HookRegistry.withSessionProjectRoot 同款模式；null → 移除回落生效）。
+            // [批 2 · B 类清理] spawn 作用域退出复位（**非**「恢复被本作用域覆盖的值」——本作用域
+            //   已无 set，见 Step 20 注释）：清理子代理 loop 内 prompt 组装（LlmAgentLoop:4642）
+            //   在本池化线程上未成对 set 的会话 projectRoot，防线程复用串台
+            //   （对齐 HookRegistry.withSessionProjectRoot 同款 restore 模式；null → 移除回落生效）。
             AutoMemPaths.restoreCurrentProjectRoot(prevSubagentProjectRoot);
         }
 
@@ -4339,7 +4347,24 @@ public class SubagentExecutor {
                 //   （对齐 CC：同 agentId 的 sent 非空 → newSkills 空 → 不注入，attachments.ts:2799-2809）。
                 //   全新 spawn → false → 该 agent 首份整份清单（CC 新 agentId sent 空 → isInitial，
                 //   attachments.ts:2672-2676 turn-0 listing 保证不变）。
-                result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids, skillListingResume);
+                // [批 2 · C 类] 子代理 loop 压缩推送注册（= run() 同源单点 registerSessionPushContext）。
+                //   WHY：本路径直调**静态** queryLoop，不经 run()（run() 是唯一注册点）⇒ 本线程
+                //   （sync = 工具池固定 8 线程 / async = asyncWorker）无 CompactWarningState /
+                //   CompactProgressState 注册 ⇒ 子代理 reactive 压缩（ctx.reactiveCompactor() 由
+                //   AgentLoopContextFactory bean 注入，与主循环同源、生产可达）的进度推送静默丢弃：
+                //   token-warning 侧 CompactWarningState:206-212 静默 return（仅 DEBUG）；progress 侧
+                //   CompactProgressState.current() 返 null → CompactConversationContext:186 回落
+                //   tuc.onCompactProgress 字段，而该字段生产无任何接线者（LlmAgentLoop.setOnCompactProgress
+                //   零生产调用）⇒ 恒 noop。
+                //   wsTemplate 取子代理自身的 AgentLoopContext（factory.shared → 同一 @Autowired bean）；
+                //   sessionId = 父会话 short id（与前端 useChatSocket 订阅的 topic 一致）。
+                boolean sessionPushRegistered = LlmAgentLoop.registerSessionPushContext(
+                    deps.context() != null ? deps.context().wsTemplate() : null, sessionId);
+                try {
+                    result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids, skillListingResume);
+                } finally {
+                    LlmAgentLoop.clearSessionPushContext(sessionPushRegistered);
+                }
             } catch (Exception e) {
                 log.error("[SubagentExecutor] [H7-arch Phase 2] queryLoop 抛出: {}", e.toString());
                 String fallbackText = extractConclusionFromMessages(state.rawMessages());

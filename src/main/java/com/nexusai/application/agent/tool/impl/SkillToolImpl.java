@@ -801,7 +801,8 @@ public class SkillToolImpl implements Tool {
      *   <li>{@code execution_context} — 'inline' / 'fork'（CC :161/:684）</li>
      *   <li>{@code invocation_trigger} — queryDepth&gt;0 ? 'nested-skill' : 'claude-proactive'（CC :162-164/:685-687）</li>
      *   <li>{@code query_depth} — ctx.queryTracking() Map 的 depth 键，缺省 0（CC :150/:673）</li>
-     *   <li>{@code parent_agent_id} — AgentContext.getAgentContext()?.agentId，null 省略（CC :151/:166-169/:674/:689-692）</li>
+     *   <li>{@code parent_agent_id} — 显式传参 ctx.agentId()（对齐 CC getAgentContext()?.agentId；
+     *       CC 语义 :151/:166-169/:674/:689-692），null 省略（[批 2] 取值源改显式，见 resolveParentAgentId javadoc）</li>
      *   <li>{@code was_discovered} — EXPERIMENTAL_SKILL_SEARCH 门控发射；ctx.discoveredSkillNames()
      *       含 commandName（CC :139-146/:661-668；feature-off 时整字段省略，见 △-2 注记）</li>
      * </ul>
@@ -865,7 +866,8 @@ public class SkillToolImpl implements Tool {
         String invocationTrigger = queryDepth > 0 ? "nested-skill" : "claude-proactive";
 
         // CC :151/:674 parentAgentId = getAgentContext()?.agentId（null/blank → 省略字段）
-        String parentAgentId = resolveParentAgentId();
+        // [批 2] 取值源改显式传参 ctx.agentId()（不再读 AgentContext ThreadLocal，见方法 javadoc）
+        String parentAgentId = resolveParentAgentId(ctx);
 
         // CC :139-146/:661-668 was_discovered（ALIGN-ST-1 △-2 门控发射：
         //   CC 仅当 feature('EXPERIMENTAL_SKILL_SEARCH') && isSkillSearchEnabled() 时发射，
@@ -1049,26 +1051,32 @@ public class SkillToolImpl implements Tool {
     }
 
     /**
-     * 解析当前 agent context 的 agentId · 对齐 CC {@code getAgentContext()?.agentId}
+     * 解析当前 agent 的 agentId · 对齐 CC {@code getAgentContext()?.agentId}
      * （SkillTool.ts:151/:674）。
      *
-     * <p>主会话无 AgentContext → null（对齐 CC undefined，父 agent id 字段省略）；
-     * SubagentContext/TeammateAgentContext 各自取 agentId（agentContext.ts:34/:62）。
+     * <p><b>[批 2 · AgentContext 显式化] 取值源 = 显式传入的 {@link ToolUseContext#agentId()}，
+     * 不再读 {@link AgentContext#getAgentContext()} ThreadLocal。</b>
      *
-     * @return 当前 agent 的 id；无 agent context 或类型不匹配 → null
+     * <p><b>WHY</b>：本工具在 {@code StreamingToolExecutor.executeAsync} 的 fixed-8 池线程执行
+     * （该文件 {@code grep -c AgentContext} = 0，池只回放 MDC/projectRoot，不回放 AgentContext）
+     * ⇒ ThreadLocal 读恒 null ⇒ {@code parent_agent_id} 生产路径<b>永不下发</b>。CC 靠
+     * {@code AsyncLocalStorage} 跨 await 自动传播（agentContext.ts:93），Java 无此物，故改为
+     * 显式传参：TUC 由工具执行闭包显式携带（{@code tool.execute(call, ctx, cb)}），
+     * {@code ctx.agentId()} 即子代理身份（{@code SubagentExecutor:1557} 取 {@code agentTuc.agentId()}
+     * 且 {@code buildSubagentAgentContext} 用同一值 ⇒ 与 AgentContext.agentId 同源等价）。
+     *
+     * <p>主会话 {@code ctx.agentId()==null} → null（对齐 CC undefined，父 agent id 字段省略）；
+     * 子代理/teammate 路径 TUC 均显式传非 null packed agentId（见 {@link ToolUseContext} 不变量）。
+     *
+     * @param ctx 工具执行上下文（显式参数 · 跨线程存活，不依赖 ThreadLocal）
+     * @return 当前 agent 的 id（a+16hex）；ctx 为 null 或无 agentId → null
      */
-    private static String resolveParentAgentId() {
-        AgentContext agentContext = AgentContext.getAgentContext();
-        if (agentContext == null) {
+    private static String resolveParentAgentId(ToolUseContext ctx) {
+        if (ctx == null || ctx.agentId() == null) {
             return null;
         }
-        if (agentContext instanceof AgentContext.SubagentContext sc) {
-            return sc.agentId();
-        }
-        if (agentContext instanceof AgentContext.TeammateAgentContext tc) {
-            return tc.agentId();
-        }
-        return null;
+        // unpackAgentId: TUC 承载 packAgentId(a+16hex) 可逆编码 → 还原 CC 语义的 a+16hex 形制
+        return AgentContext.unpackAgentId(ctx.agentId());
     }
 
     // ════════════════════════════════════════════════════════════════════════

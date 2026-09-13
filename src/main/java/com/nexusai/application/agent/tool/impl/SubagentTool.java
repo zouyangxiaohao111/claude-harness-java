@@ -2951,12 +2951,16 @@ public class SubagentTool implements Tool {
                 currentCwd);
         }
 
-        // [IMP-D F4/M-05] 同步 spawn 作用域注入会话 projectRoot（修 M-05/M-06 · 模板
-        //   AgentContext.runWithAgentContext :154-166 同款 capture/set/restore）。sync 在工具
-        //   线程执行（IMP-C 已传播）→ 同值成对；多嵌套子代理（子再 spawn）restore 外层原值，
-        //   嵌套链不串台。
+        // [批 2 · B 类清理] 原此处为
+        //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
+        //   （AutoMemPaths:113 返回值直接 set 回 ThreadLocal，恒 no-op），注释却声称
+        //   「同步 spawn 作用域注入会话 projectRoot（修 M-05/M-06）」——与实语句不符，已删除该 set。
+        //   真实注入源 = 本方法调用方 StreamingToolExecutor 工具池 :2465（调度线程捕获 →
+        //   任务体线程注入，sync 与 async 同源），本作用域无需重复注入。
+        //   保留 capture/restore 成对，语义校正为「退出复位」：子代理 loop 内 prompt 组装
+        //   （LlmAgentLoop:4642 ensureAutoMemoryProjectRootResolvedForPrompt）会在**本池化线程**
+        //   未成对 set 会话 projectRoot；不在此复位则残留值随线程复用泄漏到别的会话工具执行。
         final String prevSyncProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-        AutoMemPaths.setCurrentProjectRoot(prevSyncProjectRoot);
         // [IMP-SUB-28 A5] sync 路径接流式（原残余 executor.execute → sink=null 不达父 caller）。
         //   父 caller（StreamingToolExecutor 注入 onProgress）现可逐消息观测子 Agent 产出。
         //   CC 真源 AgentTool.tsx:783-810 同步路径 for-await + onProgress 上报。
@@ -3025,7 +3029,9 @@ public class SubagentTool implements Tool {
             // P0-2 修复: 与 doExecute 中的 setCwd('tool-' + toolUseId, ...) 配对的清理,
             //   避免 activeSessionCount 单调递增 (清理到对应前缀 key, 无 entry 时 no-op).
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
-            // [IMP-D F4/M-05] 成对 restore（null → 移除回落生效 · 线程池复用防串台）。
+            // [批 2 · B 类清理] 退出复位（**非**「恢复被本作用域覆盖的值」——本作用域已无 set，
+            //   见 executeSync 入口注释）：清理子代理 loop 内 prompt 组装（LlmAgentLoop:4642）
+            //   在本池化线程上未成对 set 的会话 projectRoot；null → 移除回落生效。
             AutoMemPaths.restoreCurrentProjectRoot(prevSyncProjectRoot);
         }
     }
@@ -3391,11 +3397,14 @@ public class SubagentTool implements Tool {
         //   使降级路径 identity 与 async 生成点一致（CC AgentTool.tsx:580 earlyAgentId），
         //   无 BackgroundTask 时也不影响（无 taskId 引用，纯一致性）。
         executor.setAgentIdOverride(agentId);
-        // [IMP-D F4/M-05] 降级 sync 同样注入会话 projectRoot（工具线程 IMP-C 已传播 → 同值成对；
-        //   多嵌套 restore 外层原值）。
+        // [批 2 · B 类清理] 原此处为
+        //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
+        //   （AutoMemPaths:113 返回值直接 set 回 ThreadLocal，恒 no-op）；真实注入源 = 本方法
+        //   调用方工具池 :2465（StreamingToolExecutor 调度线程捕获 → 任务体线程注入）。已删除该 set。
+        //   保留 capture/restore 成对，语义校正为「退出复位」（清理子代理 loop 内 prompt 组装
+        //   LlmAgentLoop:4642 在本池化线程上未成对 set 的值）。
         // [IMP-SUB-28 A5] 降级 sync 路径同样接流式（同步语义 → 父 onProgress 可观测）。
         final String prevFallbackProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-        AutoMemPaths.setCurrentProjectRoot(prevFallbackProjectRoot);
         // [冲突裁决·并集] HEAD=IMP-G4 组11-1 analytics+agentNameRegistry 注入（降级 sync 同样 hard_metrics
         //   归因 + name→agentId）；subagent_v3=IMP-SUB-28 A5 fallbackStreamingSink 降级 sync 流式接线
         //   （CC AgentTool.tsx:783-810 onProgress）。两组语句独立互补、无顺序依赖，全部保留。
@@ -3447,7 +3456,8 @@ public class SubagentTool implements Tool {
         } finally {
             // P0-2 修复: executeAsync 降级到同步执行的清理 (与 doExecute 中的 setCwd 配对).
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
-            // [IMP-D F4/M-05] 成对 restore（null → 移除回落生效 · 线程池复用防串台）。
+            // [批 2 · B 类清理] 退出复位（非「恢复被本作用域覆盖的值」——本作用域已无 set，
+            //   见本方法入口注释）；null → 移除回落生效。
             AutoMemPaths.restoreCurrentProjectRoot(prevFallbackProjectRoot);
         }
     }

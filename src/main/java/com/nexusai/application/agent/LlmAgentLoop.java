@@ -2298,32 +2298,13 @@ public class LlmAgentLoop implements AgentLoop {
         // 在同一会话线程同步执行 → CompactWarningState suppress/clear（触发点1/2）+ 上下文接近阈值
         // （触发点3）推送可达。无 wsTemplate（非 STOMP 路径）→ 不注册，推送安全跳过
         // （store + 订阅者行为不回归）。
-        com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext tokenWarningPushCtx = null;
-        if (this.wsTemplate != null && params.sessionId() != null) {
-            // [session-id-short] pushSessionId 为 short（sess-xxx），/topic/sessions/{sess-xxx}/token-warning
-            // 与前端 useChatSocket 订阅一致（原 UUID 段恒不命中 —— 原始 bug 根治）。
-            String pushSessionId = params.sessionId();
-            tokenWarningPushCtx = new com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext(
-                pushSessionId,
-                warning -> this.wsTemplate.convertAndSend(
-                    "/topic/sessions/" + pushSessionId + "/token-warning", warning));
-            com.nexusai.application.agent.compact.CompactWarningState.registerPushContext(tokenWarningPushCtx);
-            // [compact-progress-push 2026-09-04] auto 压缩进度 STOMP 推送（对齐 CC REPL spinner）。
-            //   auto compactConversation 的 ccCtx（buildAutoContext）经 CompactConversationContext
-            //   getOnCompactProgress 委托本线程注册 → 推前端 topic。finally clear（register 成对）。
-            com.nexusai.application.agent.compact.CompactProgressState.register(event ->
-                this.wsTemplate.convertAndSend(
-                    com.nexusai.application.agent.compact.CompactProgressState.topic(pushSessionId),
-                    com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event)));
-        }
+        // [批 2 · C 类] 注册体抽为静态单点 {@link #registerSessionPushContext} —— 子代理路径
+        // （SubagentExecutor 直调静态 queryLoop，不经 run()）复用同一注册，见该法 javadoc。
+        boolean sessionPushRegistered = registerSessionPushContext(this.wsTemplate, params.sessionId());
         try {
             return doRun(params);
         } finally {
-            if (tokenWarningPushCtx != null) {
-                com.nexusai.application.agent.compact.CompactWarningState.clearPushContext();
-            }
-            // [compact-progress-push] auto 压缩进度推送清除（register 成对；幂等）
-            com.nexusai.application.agent.compact.CompactProgressState.clear();
+            clearSessionPushContext(sessionPushRegistered);
             markIdle(params.sessionId());
             // [queue-full-align P1] 注销 now 中断监听器（防跨 run 泄漏；队列 onChange 常驻 NOTIFY_EXECUTOR）
             if (nowAbortListener != null && runQueueRef != null) {
@@ -2342,6 +2323,77 @@ public class LlmAgentLoop implements AgentLoop {
             }
             com.nexusai.application.agent.memory.AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
         }
+    }
+
+    /**
+     * [批 2 · C 类] 注册会话级压缩推送上下文 · <b>run() 与子代理 loop 路径共享的单点</b>
+     * （token-warning ThreadLocal + compact-progress ThreadLocal，对齐 CacheSafeParamsHolder 模式）。
+     *
+     * <p><b>WHY 需要跨路径单点</b>：{@code SubagentExecutor} 直调静态
+     * {@link #queryLoop(com.nexusai.application.agent.loop.QueryParams, AgentState, java.util.List, boolean)}
+     * 执行子代理主循环，<b>不经 run()</b> —— 而两个消费点都只读当前线程注册的 ThreadLocal：
+     * <ul>
+     *   <li>{@code CompactConversationContext.getOnCompactProgress()}（LlmAgentLoop:7219 reactive
+     *       压缩块经 buildAutoContext 取 ccCtx）→ {@code CompactProgressState.current()}</li>
+     *   <li>{@code StreamCompactSummary:886}（摘要流逐 chunk 进度条蠕动源）→
+     *       {@code CompactProgressState.current()}</li>
+     *   <li>{@code CompactWarningState.publishTokenWarning}（触发点3）→ 线程 pushContext</li>
+     * </ul>
+     * 子代理 loop 跑在<b>别的池化线程</b>（sync = 工具池 / async = asyncWorker），ThreadLocal 不跨线程
+     * ⇒ 不补注册则子代理 reactive 压缩（{@code ctx.reactiveCompactor()} 由 AgentLoopContextFactory
+     * bean 注入，与主循环同源、可达）的进度推送<b>静默丢弃</b>：token-warning 侧
+     * {@code CompactWarningState:206-212} 静默 return（仅 DEBUG 日志）；progress 侧
+     * {@code CompactProgressState.current()} 返 null，消费点回落 no-op
+     * （{@code CompactConversationContext:186} 的 {@code tuc.onCompactProgress} 字段生产无接线者 ⇒ 恒 noop）。
+     *
+     * <p><b>与 AgentContext 的区别</b>：本批「一律显式传参」针对 {@code AgentContext}（会话/代理身份）。
+     * 本通道是压缩推送 sink，其两个消费点（{@code CompactProgressState.current()}）无显式载体可传
+     * （StreamCompactSummary 无 ccCtx/TUC 参数），故按既有 ThreadLocal 设计补注册（与
+     * ToolRegistrationConfig:2433 manual /compact 路径同款做法），不新建第二通道。
+     *
+     * @param ws        STOMP 模板（null = 非 STOMP 路径 → 不注册，推送安全跳过）
+     * @param sessionId short 会话 id（sess-xxx，与前端 useChatSocket 订阅一致）
+     * @return true = 已注册（调用方 finally 必须成对调 {@link #clearSessionPushContext(boolean)}）
+     */
+    public static boolean registerSessionPushContext(
+            org.springframework.messaging.simp.SimpMessagingTemplate ws, String sessionId) {
+        if (ws == null || sessionId == null) {
+            return false;
+        }
+        // [session-id-short] pushSessionId 为 short（sess-xxx），/topic/sessions/{sess-xxx}/token-warning
+        // 与前端 useChatSocket 订阅一致（原 UUID 段恒不命中 —— 原始 bug 根治）。
+        com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext tokenWarningPushCtx =
+            new com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext(
+                sessionId,
+                warning -> ws.convertAndSend("/topic/sessions/" + sessionId + "/token-warning", warning));
+        com.nexusai.application.agent.compact.CompactWarningState.registerPushContext(tokenWarningPushCtx);
+        // [compact-progress-push 2026-09-04] 压缩进度 STOMP 推送（对齐 CC REPL spinner）。
+        //   compactConversation 的 ccCtx（buildAutoContext）经 CompactConversationContext
+        //   getOnCompactProgress 委托本线程注册 → 推前端 topic。finally clear（register 成对）。
+        com.nexusai.application.agent.compact.CompactProgressState.register(event ->
+            ws.convertAndSend(
+                com.nexusai.application.agent.compact.CompactProgressState.topic(sessionId),
+                com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event)));
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] 会话压缩推送上下文已注册（token-warning + compact-progress）: session={} "
+                + "topic={}", sessionId,
+                com.nexusai.application.agent.compact.CompactProgressState.topic(sessionId));
+        }
+        return true;
+    }
+
+    /**
+     * [批 2 · C 类] 清除 {@link #registerSessionPushContext} 注册的推送上下文（register 成对；
+     * 只在注册成功时清 token-warning 通道，compact-progress clear 幂等恒调）。
+     *
+     * @param registered {@link #registerSessionPushContext} 返回值
+     */
+    public static void clearSessionPushContext(boolean registered) {
+        if (registered) {
+            com.nexusai.application.agent.compact.CompactWarningState.clearPushContext();
+        }
+        // [compact-progress-push] 压缩进度推送清除（register 成对；幂等）
+        com.nexusai.application.agent.compact.CompactProgressState.clear();
     }
 
     /**
