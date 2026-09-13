@@ -19,7 +19,6 @@ import com.nexusai.application.agent.compact.StreamCompactSummary;
 import com.nexusai.application.agent.compact.TokenCounter;
 import com.nexusai.application.agent.compact.TokenEstimator;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.lsp.LspManager;
 import com.nexusai.application.agent.plugin.BuiltinPluginRegistry;
 import com.nexusai.application.agent.plugin.PluginLoader;
@@ -1092,28 +1091,15 @@ public class ToolRegistrationConfig {
 
         ForkSuppliers suppliers = buildForkSuppliers(
             llmProviderFactory, modelMapper, providerMapper, providerService, configStorage);
-        // [RES-②] fork 缓存共享接线：cacheSafeParamsSupplier 读 ThreadLocal 槽位
-        // （LlmAgentLoop autoCompact 触发点经 CacheSharingParamsBuilder 构建 + Holder 保存；
-        //  get()=null 时 StreamCompactSummary 内部跳过 fork 路径 → 流式 fallback，不破坏 3 参语义）。
-        java.util.function.Supplier<CacheSafeParams> cacheSafeParamsSupplier =
-            () -> CacheSafeParamsHolder.get();
+        // [批 5a] fork 缓存共享与摘要中断源不再经 supplier 读 ThreadLocal：
+        //   两者改由 CompactConversationContext 显式携带（CC `cacheSafeParams` 显式参数
+        //   compact.ts:414/:1176/:1183 + `context.abortController` compact.ts:418/:1347），
+        //   StreamCompactSummary 经 summarize(…, ctx) 读取。
         // [IMP2-23 ⊕-7] fork 双实现收敛：注入 ProductionForkedQuery（生产 fork loop 单一实现，
         //   extract/auto-dream 同 seam）→ tryForkCacheSharing 委托 RunForkedAgent（maxTurns=1 +
         //   canUseTool=deny + skipCacheWrite=true 由参数表达，CC compact.ts:1188-1200）。
         StreamCompactSummary summary = new StreamCompactSummary(
             suppliers.providerSupplier(), suppliers.modelSupplier(), suppliers.configSupplier(),
-            cacheSafeParamsSupplier,
-            // [可中断 2026-09-04 · CC Esc] abort 源接当前压缩 AbortController：四条压缩路径均在压缩
-            //   期间 registerAbort —— manual /compact（本文件 :2454）/ partial
-            //   （PartialCompactService:470）/ auto（LlmAgentLoop auto 压缩块）/
-            //   reactive 应急压缩（LlmAgentLoop reactive 压缩块）——后两条 2026-09-13 补。
-            //   ⛔ 更正（2026-09-13）：本条原写作「manual 与 auto 均注册」，但 auto 侧当时<b>从未</b>
-            //   注册过（auto 路径两条 abort 通道全空 → 自动压缩实际不可中断）——是本仓「注释不可信」
-            //   的又一实例。两条自动压缩路径（auto / reactive）现已补齐，本条注释与代码一致。
-            //   取到 → 摘要 provider 硬断流（CC Esc 打断 commands/compact/compact.ts:135
-            //   'Compaction canceled.'）。无当前压缩 → null → StreamCompactSummary
-            //   回落 NOOP（摘要不可中断 = 原行为，不回归）。
-            () -> com.nexusai.application.agent.compact.CompactProgressState.currentAbort(),
             null,                 // sessionActivitySignalSupplier
             null,                 // keepaliveExecutor（不启动 keepalive）
             false,                // sessionActivityTrackingActive
@@ -2443,6 +2429,16 @@ public class ToolRegistrationConfig {
         //   次数有界累积）。成功/业务失败/异常三路均注销（close 幂等）。
         SystemPromptContextProvider manualProvider =
             buildManualSystemPromptCtxProvider(state, claudemdEngine);
+        // [批 5a] 摘要中断源 + 进度 sink 前置构造：两者改由 CompactConversationContext 显式携带
+        //   （CC `context.abortController` compact.ts:418 + `context.onCompactProgress` Tool.ts:239），
+        //   故必须在 ccCtx 工厂（下行的 compactConversationContextSupplier）之前就绪。
+        //   compactAbort 语义不变：REST 线程无 run 级控制器 → 新建 + 会话级登记桥接（前端 Esc）。
+        com.nexusai.application.agent.tool.AbortController compactAbort =
+            new com.nexusai.application.agent.tool.AbortController();
+        String manualPushSessionId = state.sessionId() != null ? state.sessionId() : sessionId;
+        java.util.function.Consumer<com.nexusai.application.agent.compact.CompactProgressEvent>
+            manualProgressSink = com.nexusai.application.agent.LlmAgentLoop
+                .compactProgressSink(wsTemplate, manualPushSessionId);
         CompactCommand.CompactCommandContext ctx = buildCompactCommandContext(
             state.rawMessages(), sessionId, agentId, resolveManualCompactModel(state),
             reactiveCompactor, streamCompactSummary,
@@ -2453,7 +2449,9 @@ public class ToolRegistrationConfig {
             state.systemPrompt(),
             state.appendSystemPrompt(),            // [RES-SP31] 接线：manual /compact fork 缓存共享 append 恒末尾
             useGlobalCacheScope,                   // [RES-R4-1] firstParty gate（REQ-R4-3 与主线程同一判定）
-            telemetry);                            // [IMP-CM-17] tengu_compact 结构化遥测接线
+            telemetry,                             // [IMP-CM-17] tengu_compact 结构化遥测接线
+            compactAbort,                          // [批 5a] 摘要断流源（显式载荷）
+            manualProgressSink);                   // [批 5a] 进度推送 sink（显式载荷；null = 非 STOMP）
         // [IMP2-17 △-7] 用户取消桥接：Java 用户取消是 AgentState.cancelled() 布尔信号
         // （AgentState:947，对齐 CC abortController 的入口注释），run 级 AbortController 未
         // 接线 state.cancel → 此处补桥：会话已取消 → 命令级取消信号立即置位，
@@ -2485,24 +2483,15 @@ public class ToolRegistrationConfig {
                     warning -> wsTemplate.convertAndSend(
                         "/topic/sessions/" + pushSessionId + "/token-warning", warning));
                 CompactWarningState.registerPushContext(tokenWarningPushCtx);
-                // [compact-progress-push 2026-09-04] 压缩进度 STOMP 推送注册（对齐 CC REPL
-                //   onCompactProgress spinner：hooks_start / compact_start「Compacting conversation」/
-                //   compact_end）。compactConversation 全链 emit → CompactConversationContext
-                //   getOnCompactProgress 委托本注册 → convertAndSend 前端 topic。finally clear。
-                com.nexusai.application.agent.compact.CompactProgressState.register(event ->
-                    wsTemplate.convertAndSend(
-                        com.nexusai.application.agent.compact.CompactProgressState.topic(pushSessionId),
-                        com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event)));
+                // [批 5a] 压缩进度 sink 已在上方装箱（manualProgressSink → ccCtx.onCompactProgress）；
+                //   原 CompactProgressState.register 的 ThreadLocal 已删。
             }
         }
-        // [可中断 2026-09-04 · CC Esc] 当前压缩 AbortController：registerAbort（ThreadLocal，摘要
-        //   中断源——streamCompactSummary abortControllerSupplier 已接 currentAbort）+ registerSessionAbort
-        //   （会话级，前端停止/Esc → cancelSession → CompactProgressState.abortForSession abort 摘要）。
-        //   finally clearAbort + removeSessionAbort（成对防泄漏）。对齐 CC 压缩中 Esc → abortController
+        // [可中断 2026-09-04 · CC Esc] 会话级在飞压缩登记（前端停止/Esc → cancelSession →
+        //   CompactProgressState.abortForSession abort 摘要）；摘要断流源（compactAbort）已在上方
+        //   装箱进 ccCtx.abortController（[批 5a]，原 registerAbort 的 ThreadLocal 已删）。
+        //   finally removeSessionAbort（成对防泄漏）。对齐 CC 压缩中 Esc → abortController
         //   → provider 断流 → 'Compaction canceled.'（compact.ts:126-127）。
-        com.nexusai.application.agent.tool.AbortController compactAbort =
-            new com.nexusai.application.agent.tool.AbortController();
-        com.nexusai.application.agent.compact.CompactProgressState.registerAbort(compactAbort);
         com.nexusai.application.agent.compact.CompactProgressState.registerSessionAbort(sessionId, compactAbort);
         try {
             CompactCommand.CompactCommandResult result = CompactCommand.call(args, ctx);
@@ -2556,10 +2545,9 @@ public class ToolRegistrationConfig {
             if (tokenWarningPushCtx != null) {
                 CompactWarningState.clearPushContext();
             }
-            // [compact-progress-push] 压缩进度推送清除（register 成对；幂等，未注册也安全）
-            com.nexusai.application.agent.compact.CompactProgressState.clear();
-            // [可中断] 压缩 AbortController 清理（register 成对；幂等）
-            com.nexusai.application.agent.compact.CompactProgressState.clearAbort();
+            // [批 5a] 进度 sink / 摘要断流源无 ThreadLocal 槽位需清（原 clear()/clearAbort() 已删）——
+            //   两者随 ccCtx 引用生命周期回收。
+            // [可中断] 会话级在飞压缩登记清理（register 成对；幂等）
             com.nexusai.application.agent.compact.CompactProgressState.removeSessionAbort(sessionId);
             // [RES-C2] R5-4：manual provider 生命周期终结（close 幂等）
             manualProvider.close();
@@ -2832,7 +2820,10 @@ public class ToolRegistrationConfig {
             String customSystemPrompt,
             String appendSystemPrompt,
             boolean useGlobalCacheScope,
-            com.nexusai.application.agent.telemetry.Telemetry telemetry) {
+            com.nexusai.application.agent.telemetry.Telemetry telemetry,
+            com.nexusai.application.agent.tool.AbortController compactAbort,
+            java.util.function.Consumer<
+                com.nexusai.application.agent.compact.CompactProgressEvent> progressSink) {
         // [IMP2-17 △-7] 生产 AbortController 接线：不复用断开 new AbortController()（恒未取消 →
         // abort 分支生产不可达）。改复用会话 run 级 live 取消信号（toolUseContext.abortController()，
         // CC context.abortController 等价，Tool.ts:180 透传链）——权限拒绝/兄弟工具错误/流
@@ -2845,7 +2836,7 @@ public class ToolRegistrationConfig {
             messages, sessionId, agentId, "compact", false, abortController,
             sessionMemoryService, new MicroCompactor(), reactiveCompactor,
             () -> buildCompactConversationContext(sessionId, agentId, model, streamCompactSummary,
-                toolUseContext, telemetry),
+                toolUseContext, telemetry, compactAbort, progressSink),
             notifyCompactionRunnable(agentId), clearUserContextCacheRunnable(),
             toolUseContext, sysPromptCtxProvider, defaultSysPromptAssemble, customSystemPrompt,
             appendSystemPrompt, useGlobalCacheScope,
@@ -3011,10 +3002,18 @@ public class ToolRegistrationConfig {
                                                                        String model,
                                                                        StreamCompactSummary streamCompactSummary,
                                                                        ToolUseContext toolUseContext,
-                                                                       com.nexusai.application.agent.telemetry.Telemetry telemetry) {
+                                                                       com.nexusai.application.agent.telemetry.Telemetry telemetry,
+                                                                       com.nexusai.application.agent.tool.AbortController compactAbort,
+                                                                       java.util.function.Consumer<
+                                                                           com.nexusai.application.agent.compact.CompactProgressEvent> progressSink) {
         CompactConversationContext cc = new CompactConversationContext();
         cc.setSessionId(sessionId);
         cc.setAgentId(agentId);
+        // [批 5a] 摘要中断源 + 进度 sink 显式装箱（CC `context.abortController` compact.ts:418 与
+        //   `context.onCompactProgress` Tool.ts:239）——原经 CompactProgressState 的
+        //   currentAbort/register 两个 ThreadLocal。
+        cc.setAbortController(compactAbort);
+        cc.setOnCompactProgress(progressSink);
         // [P3-a] 本会话有效模型（与 auto 路径 AutoCompactor.model / buildAutoContext 同口径）——
         //   不设 → ctx.getModel()=null → 协议判定不可分派 → deepseek 求和翻倍（见 javadoc）。
         cc.setModel(model);
@@ -3040,7 +3039,7 @@ public class ToolRegistrationConfig {
                     // [IMP-CM-14 F02] 透传 StreamCompactSummary.summarize 返回的 SummaryResult
                     //   （text + 压缩 API 真实 usage）——旧实现丢弃 usage 改包 new SummaryResult(text, null)
                     //   使 postCompactTokenCount/compactionInputTokens 恒 null/0（f4/f5 根因之一）。
-                    return streamCompactSummary.summarize(compactPrompt, messagesToSummarize);
+                    return streamCompactSummary.summarize(compactPrompt, messagesToSummarize, cc);
                 } catch (Exception e) {
                     throw e instanceof RuntimeException re ? re : new RuntimeException(e);
                 }

@@ -9,6 +9,7 @@ import com.nexusai.application.agent.prompt.SystemPromptAssembler;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.prompt.SystemPromptContextProvider;
 import com.nexusai.application.agent.prompt.UserContextProvider;
+import com.nexusai.application.agent.compact.CompactConversationContext;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -173,14 +174,14 @@ class ForkSystemPromptPreAppendContractTest {
     private List<SystemPromptBlock> send(CacheSafeParams cs) {
         Capturing provider = new Capturing();
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> provider, () -> "model", ProviderConfig::empty,
-            () -> cs, () -> new AbortController(), null, null,
+            () -> provider, () -> "model", ProviderConfig::empty, null, null,
             false, true, false, null, null, null);
         scs.setForkedQuery(new ProductionForkedQuery(
             () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
         scs.streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", provider, ProviderConfig.empty());
+            "model", provider, ProviderConfig.empty(),
+            new CompactConversationContext().setCacheSafeParams(cs).setAbortController(new AbortController()));
         assertThat(provider.blocks).as("fake provider 必须真实收到 fork 请求（否则本测试空转）").isNotNull();
         return provider.blocks;
     }

@@ -60,6 +60,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class StreamCompactSummaryForkUserContextTest {
 
+    /** [批 5a] 显式压缩上下文工厂（载体 CacheSafeParamsHolder/ThreadLocal 已删 → 值随 ctx 下传）。 */
+    private static CompactConversationContext ctxOf(CacheSafeParams cs, AbortController abort) {
+        return new CompactConversationContext().setCacheSafeParams(cs).setAbortController(abort);
+    }
+
+
     private static final String SUMMARY_REQUEST = "请对会话做摘要";
 
     @Test
@@ -77,7 +83,7 @@ class StreamCompactSummaryForkUserContextTest {
 
         scsWithRealForkLoop(cs, abort, provider).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", fakeProvider(), ProviderConfig.empty());
+            "model", fakeProvider(), ProviderConfig.empty(), ctxOf(cs, abort));
 
         // ⚠️ 断言面 = 真实 ProductionForkedQuery 实际发给 provider 的 messages（旧断言读
         //   RunForkedAgent 交给 seam 的中间产物 → 假替身从不执行 ProductionForkedQuery:233-235
@@ -115,7 +121,7 @@ class StreamCompactSummaryForkUserContextTest {
 
         scsWithRealForkLoop(cs, new AbortController(), provider).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", fakeProvider(), ProviderConfig.empty());
+            "model", fakeProvider(), ProviderConfig.empty(), ctxOf(cs, new AbortController()));
 
         List<ChatMessageDto> fork = provider.lastHistory();
         assertThat(fork).as("fake provider 必须真实收到 fork 请求").isNotNull();
@@ -141,7 +147,7 @@ class StreamCompactSummaryForkUserContextTest {
 
         compactSummaryWith(cs, abort, recording).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", fakeProvider(), ProviderConfig.empty());
+            "model", fakeProvider(), ProviderConfig.empty(), ctxOf(cs, abort));
 
         RunForkedAgent.ForkQueryParams q = recording.lastParams();
         assertThat(q.maxOutputTokensOverride()).as("fork 设 maxOutputTokens 会改 budget_tokens 破坏主线程 cache key").isNull();
@@ -180,13 +186,13 @@ class StreamCompactSummaryForkUserContextTest {
             }
         };
 
-        // 3 参构造：cacheSafeParamsSupplier=null → fork 路径跳过 → 直落流式 fallback
+        // 3 参构造：ctx 无 cacheSafeParams → fork 路径跳过 → 直落流式 fallback
         StreamCompactSummary scs = new StreamCompactSummary(() -> fake, () -> "model", ProviderConfig::empty);
 
         // [IMP-CM-14 F02] streamCompactSummary 返回 SummaryResult（text + usage）
         CompactConversation.SummaryResult result = scs.streamCompactSummary(
             List.of(userMessage("c1", "ctx1"), userMessage("c2", "ctx2")),
-            SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty());
+            SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty(), ctxOf(null, new AbortController()));
 
         // WHY: CC streamingFallback 直调 queryModelWithStreaming（compact.ts:1292-1304）无 userContext
         //   参数（claude.ts:752 签名无 userContext 字段）→ fallback 消息不得含 userContext meta 消息。
@@ -261,14 +267,14 @@ class StreamCompactSummaryForkUserContextTest {
 
         // ── 3. 全量构造（cacheSafeParamsSupplier 注入 + promptCacheSharingEnabled=true）──
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fake, () -> "model", () -> new ProviderConfig("https://api.anthropic.com", "sk-test"),
-            () -> cs, () -> new AbortController(), () -> null, null,
+            () -> fake, () -> "model", () -> new ProviderConfig("https://api.anthropic.com", "sk-test"), () -> null, null,
             false, true, false, null, null, null);
 
         // [IMP-CM-14 F02] streamCompactSummary 返回 SummaryResult（text + usage）
         CompactConversation.SummaryResult result = scs.streamCompactSummary(
             List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0,
-            "model", fake, new ProviderConfig("https://api.anthropic.com", "sk-test"));
+            "model", fake, new ProviderConfig("https://api.anthropic.com", "sk-test"),
+            ctxOf(cs, new AbortController()));
 
         // ── 4. 断言 ──
         assertThat(result).as("fork 摘要结果正常返回").isNotNull();
@@ -297,8 +303,7 @@ class StreamCompactSummaryForkUserContextTest {
             CacheSafeParams cs, AbortController abort,
             ForkConvergenceCcContractTest.CapturingProvider provider) {
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fakeProvider(), () -> "model", ProviderConfig::empty,
-            () -> cs, () -> abort, null, null, false, true, false, null, null, null);
+            () -> fakeProvider(), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         scs.setForkedQuery(new ProductionForkedQuery(
             () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
         return scs;
@@ -308,8 +313,7 @@ class StreamCompactSummaryForkUserContextTest {
     private static StreamCompactSummary compactSummaryWith(CacheSafeParams cs, AbortController abort,
                                                            ForkConvergenceCcContractTest.RecordingQuery recording) {
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fakeProvider(), () -> "model", ProviderConfig::empty,
-            () -> cs, () -> abort, null, null, false, true, false, null, null, null);
+            () -> fakeProvider(), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         scs.setForkedQuery(recording);
         return scs;
     }

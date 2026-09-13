@@ -182,7 +182,7 @@ class LlmAgentLoopTaskBudgetCcTest {
         //（autoCompactIfNeeded → compactConversation 单函数），无旧编排器委托。
         TokenCounter highTokens = msgs -> 200_000;
         AutoCompactor autoCompactor = new AutoCompactor(highTokens,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>ok</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>ok</summary>", null));
 
         // ── 3. state 预置：末位 assistant 消息带 usage → 结转测量源非 0 ──
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);

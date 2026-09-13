@@ -275,7 +275,7 @@ class LlmAgentLoopSnipMicroWiringTest {
         // usage=130000 >= 127000 → 拦截（旧公式 rawWindow−3000=197000 下不拦截；
         //   对照 b6BlockingWindow_fallbackRawWindow 同 usage=130000 → 兜底 197000 不拦截）
         AutoCompactor auto = new AutoCompactor(msgs -> 50,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>", null));
         CompactThresholdSystem cts = new CompactThresholdSystem(null);
         cts.setModelContextWindowResolver(model -> 150_000);
         // 测试隔离 model 解析：resolveMaxOutputTokensForModel('test-model') 走真实链返回值不受控 →

@@ -272,7 +272,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
         state.appendMessage(singleMessage("current", "current query"));
         // eager autoCompactor：tokenCounter 恒 200_000 → 超窗即触发（SubagentAutoCompactGateCcTest 同款）
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>compacted</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>compacted</summary>", null));
 
         // provider 先独立构造（stopProvider 内部 doAnswer.when 嵌套，不能在 thenReturn 实参求值内调用，
         // 否则 Mockito UnfinishedStubbing 检测触发）再 stub factory

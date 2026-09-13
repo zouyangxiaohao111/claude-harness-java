@@ -80,7 +80,7 @@ class DisableCompactDbPrimaryTest {
     /** 恒定高 token → shouldAutoCompact 阈值必达（排除阈值因素，聚焦 DISABLE 门）。 */
     private AutoCompactor autoCompactor(CompactSettingsResolver resolver, Map<String, String> env) {
         AutoCompactor ac = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         if (resolver != null) {
             ac.setSettingsResolver(resolver);
         }
@@ -235,7 +235,7 @@ class DisableCompactDbPrimaryTest {
 
     private static ReactiveCompactor reactiveCompactor(CompactSettingsResolver resolver, Map<String, String> env) {
         ReactiveCompactor rc = new ReactiveCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         rc.setEnabled(true);
         if (resolver != null) {
             rc.setSettingsResolver(resolver);

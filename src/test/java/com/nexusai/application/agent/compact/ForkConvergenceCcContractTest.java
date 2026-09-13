@@ -79,13 +79,13 @@ class ForkConvergenceCcContractTest {
         RecordingQuery recording = new RecordingQuery();
 
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty,
-            () -> cs, () -> abort, null, null, false, true, false, null, null, null);
+            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         scs.setForkedQuery(recording);
 
         scs.streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0, "model",
-            providerReturning("fallback text"), ProviderConfig.empty());
+            providerReturning("fallback text"), ProviderConfig.empty(),
+            new CompactConversationContext().setCacheSafeParams(cs).setAbortController(abort));
 
         RunForkedAgent.ForkQueryParams q = recording.lastParams();
         // INV-7: fork 不设 maxOutputTokens（破坏 cache key · compact.ts:1181-1187）
@@ -117,7 +117,7 @@ class ForkConvergenceCcContractTest {
 
         scsWithRealForkLoop(cs, provider).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", providerReturning("fallback text"), ProviderConfig.empty());
+            "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         // ⚠️ 断言面 = 真实 ProductionForkedQuery 实际交给 provider 的 messages
         //   （旧断言读 RunForkedAgent 交给 seam 的中间产物 → 假替身 RecordingQuery 从不执行
@@ -163,7 +163,7 @@ class ForkConvergenceCcContractTest {
 
         scsWithRealForkLoop(cs, provider).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", providerReturning("fallback text"), ProviderConfig.empty());
+            "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         List<ChatMessageDto> messages = provider.lastHistory();
         assertThat(messages).as("fake provider 必须真实收到 fork 请求").isNotNull();
@@ -185,10 +185,11 @@ class ForkConvergenceCcContractTest {
             List.of(userMessage("u0", "前置 user"), assistantMessage("summary text", false)),
             ForkedAgentResult.ForkUsage.empty()));
 
+        CacheSafeParams cs = cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1")));
         CompactConversation.SummaryResult result =
-            compactSummaryWith(cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1"))), recording)
+            compactSummaryWith(cs, recording)
             .streamCompactSummary(List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-                "model", providerReturning("fallback text"), ProviderConfig.empty());
+                "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         assertThat(result).as("最后 assistant 文本 = 摘要文本（compact.ts:1201-1210）").isNotNull();
         assertThat(result.text()).as("最后 assistant 文本 = 摘要文本（compact.ts:1201-1210）").isEqualTo("summary text");
@@ -200,10 +201,11 @@ class ForkConvergenceCcContractTest {
         RecordingQuery recording = new RecordingQuery();
         recording.respond(new ForkedAgentResult(List.of(), ForkedAgentResult.ForkUsage.empty()));
 
+        CacheSafeParams cs = cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1")));
         CompactConversation.SummaryResult result =
-            compactSummaryWith(cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1"))), recording)
+            compactSummaryWith(cs, recording)
             .streamCompactSummary(List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-                "model", providerReturning("fallback text"), ProviderConfig.empty());
+                "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         assertThat(result).as("fork 无文本 → 流式 fallback 产出摘要").isNotNull();
         assertThat(result.text()).as("fork 无文本 → 流式 fallback 产出摘要").isEqualTo("fallback text");
@@ -217,10 +219,11 @@ class ForkConvergenceCcContractTest {
             List.of(assistantMessage("Request was aborted.", true)),
             ForkedAgentResult.ForkUsage.empty()));
 
+        CacheSafeParams cs = cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1")));
         CompactConversation.SummaryResult result =
-            compactSummaryWith(cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1"))), recording)
+            compactSummaryWith(cs, recording)
             .streamCompactSummary(List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-                "model", providerReturning("fallback text"), ProviderConfig.empty());
+                "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         assertThat(result).as("abort 合成的 API 错误消息不得作为摘要成功返回（CC compact.ts:1205-1210）").isNotNull();
         assertThat(result.text())
@@ -236,10 +239,11 @@ class ForkConvergenceCcContractTest {
             List.of(assistantMessage("API Error: 401 authentication_error", false)),
             ForkedAgentResult.ForkUsage.empty()));
 
+        CacheSafeParams cs = cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1")));
         CompactConversation.SummaryResult result =
-            compactSummaryWith(cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1"))), recording)
+            compactSummaryWith(cs, recording)
             .streamCompactSummary(List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-                "model", providerReturning("fallback text"), ProviderConfig.empty());
+                "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         assertThat(result).as("API 错误前缀文本不得作为摘要成功返回").isNotNull();
         assertThat(result.text()).as("API 错误前缀文本不得作为摘要成功返回").isEqualTo("fallback text");
@@ -253,10 +257,11 @@ class ForkConvergenceCcContractTest {
             throw new IllegalStateException("fork loop failed");
         });
 
+        CacheSafeParams cs = cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1")));
         CompactConversation.SummaryResult result =
-            compactSummaryWith(cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1"))), recording)
+            compactSummaryWith(cs, recording)
             .streamCompactSummary(List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-                "model", providerReturning("fallback text"), ProviderConfig.empty());
+                "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         assertThat(result).as("fork 异常 → 流式 fallback（不抛给上层）").isNotNull();
         assertThat(result.text()).as("fork 异常 → 流式 fallback（不抛给上层）").isEqualTo("fallback text");
@@ -267,13 +272,12 @@ class ForkConvergenceCcContractTest {
     void delegation_seamNotInjected_fallsBackToStreaming() {
         CacheSafeParams cs = cacheSafeParams(Map.of(), List.of(userMessage("c1", "ctx1")));
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty,
-            () -> cs, null, null, null, false, true, false, null, null, null);
+            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         // 未调用 setForkedQuery
 
         CompactConversation.SummaryResult result = scs.streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
-            "model", providerReturning("fallback text"), ProviderConfig.empty());
+            "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
         assertThat(result).as("seam 未注入 → fork 路径不可用，必须落流式 fallback").isNotNull();
         assertThat(result.text())
@@ -293,10 +297,15 @@ class ForkConvergenceCcContractTest {
      * <b>从不执行</b> {@code ProductionForkedQuery:233-235} 的发送边界
      * {@code prependUserContext} → 「外层 + 内层双前置」bug 在该替身下恒绿。
      */
-    private static StreamCompactSummary scsWithRealForkLoop(CacheSafeParams cs, CapturingProvider provider) {
+        /** [批 5a] 显式压缩上下文（CC compactConversation 的 context + cacheSafeParams 参数）。 */
+    private static CompactConversationContext ctxOf(CacheSafeParams cs) {
+        return new CompactConversationContext().setCacheSafeParams(cs)
+            .setAbortController(new AbortController());
+    }
+
+private static StreamCompactSummary scsWithRealForkLoop(CacheSafeParams cs, CapturingProvider provider) {
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty,
-            () -> cs, () -> new AbortController(), null, null, false, true, false, null, null, null);
+            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         scs.setForkedQuery(new ProductionForkedQuery(
             () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
         return scs;
@@ -304,8 +313,7 @@ class ForkConvergenceCcContractTest {
 
     private static StreamCompactSummary compactSummaryWith(CacheSafeParams cs, RecordingQuery recording) {
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty,
-            () -> cs, () -> new AbortController(), null, null, false, true, false, null, null, null);
+            () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         scs.setForkedQuery(recording);
         return scs;
     }

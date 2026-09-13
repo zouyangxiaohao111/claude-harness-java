@@ -3,7 +3,6 @@ package com.nexusai.application.agent.compact;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.SystemPromptInjection;
 import com.nexusai.application.agent.tool.AbortController;
@@ -93,7 +92,7 @@ class PartialCompactServiceTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1)); // 模拟归一化：返回原列表
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult(summaryText, null));
         return new PartialCompactService(messageService, sessionService, summary);
     }
@@ -101,8 +100,6 @@ class PartialCompactServiceTest {
     @AfterEach
     void tearDown() {
         // [partial-progress] 统一通道静态槽位复位（用例失败/中断时防跨用例串台）· 幂等
-        CompactProgressState.clear();
-        CompactProgressState.clearAbort();
         CompactProgressState.removeSessionAbort(SESSION);
     }
 
@@ -116,7 +113,7 @@ class PartialCompactServiceTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
 
@@ -160,7 +157,7 @@ class PartialCompactServiceTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
 
@@ -194,7 +191,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenThrow(new IllegalArgumentException(
                 PartialCompactConversation.ERROR_MESSAGE_NOTHING_TO_SUMMARIZE_AFTER));
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
@@ -238,7 +235,7 @@ class PartialCompactServiceTest {
         SessionService sessionService = mock(SessionService.class);
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
-        when(summary.summarize(anyString(), anyList())).thenReturn(null); // 模型未产出摘要
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any())).thenReturn(null); // 模型未产出摘要
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
 
         assertThatThrownBy(() -> svc.partialCompact(SESSION,
@@ -257,7 +254,7 @@ class PartialCompactServiceTest {
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any())).thenAnswer(inv -> {
             capturedPrompts.add(inv.getArgument(0));
             // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）
             return new CompactConversation.SummaryResult("summary ok", null);
@@ -309,9 +306,10 @@ class PartialCompactServiceTest {
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
-            // 摘要生产期间读 ThreadLocal 槽位（StreamCompactSummary cacheSafeParamsSupplier=Holder.get() 读侧）
-            seenDuringSummarize.set(CacheSafeParamsHolder.get());
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any())).thenAnswer(inv -> {
+            // [批 5a] 摘要生产期间读**显式载荷**（第 3 实参 ctx · 原 Holder ThreadLocal 槽位已删）
+            seenDuringSummarize.set(
+                ((CompactConversationContext) inv.getArgument(2)).getCacheSafeParams());
             // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）
             return new CompactConversation.SummaryResult("summary ok", null);
         });
@@ -329,8 +327,10 @@ class PartialCompactServiceTest {
         assertThat(cs.toolUseContext()).isSameAs(tuc);          // 会话一致 TUC 透传
         assertThat(cs.systemPrompt()).contains("CUSTOM-PROMPT"); // custom 替换 default（I-13）
         assertThat(cs.userContext()).containsKey("currentDate"); // 会话级 userContext（sessionStartDate 冻结）
-        // 压缩后槽位清空（finally clear，防串台/泄漏到下一流程）
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        // [批 5a] 重表达：原「压缩后槽位清空（finally clear）」断言已删除的 ThreadLocal 槽位。
+        //   新语义 = 无进程级残留（值按 ctx 作用域）。
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位（原 Holder 清空断言的重表达）").isNull();
         assertThat(resp.messages()).isNotEmpty();
     }
 
@@ -354,7 +354,7 @@ class PartialCompactServiceTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
         PartialCompactService svc = new PartialCompactService(
             messageService, sessionService, summary, registry, null, null);
@@ -428,7 +428,7 @@ class PartialCompactServiceTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
         PartialCompactService svc = new PartialCompactService(
             messageService, sessionService, summary, registry, null, null);
@@ -488,7 +488,7 @@ class PartialCompactServiceTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
         PartialCompactService svc = new PartialCompactService(
             messageService, sessionService, summary, registry, null, null);
@@ -540,20 +540,25 @@ class PartialCompactServiceTest {
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        when(summary.summarize(anyString(), anyList()))
-            .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
+        // [批 5a] 摘要期间收到的显式 ctx（进度 sink 的载体）
+        java.util.concurrent.atomic.AtomicReference<CompactConversationContext> ccAtSummarize =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> {
+                ccAtSummarize.set((CompactConversationContext) inv.getArgument(2));
+                return new CompactConversation.SummaryResult("summary ok", null);
+            });
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
 
         SimpMessagingTemplate wsTemplate = mock(SimpMessagingTemplate.class);
         List<String> topics = new ArrayList<>();
         List<Object> payloads = new ArrayList<>();
         List<Boolean> sinkRegisteredAtPush = new ArrayList<>();
-        // 每次推送记录主题 + 载荷 + 「该线程 ThreadLocal 注册是否在飞」——证明推送出自本 REST 线程
-        // 注册的统一通道（而非其它路径），且注册在压缩期间真实生效（不是事后补发）。
+        // 每次推送记录主题 + 载荷 —— 推送发生在摘要生产期间（sink 已由 ctx 显式携带，非事后补发）。
         org.mockito.Mockito.doAnswer(inv -> {
             topics.add(inv.getArgument(0));
             payloads.add(inv.getArgument(1));
-            sinkRegisteredAtPush.add(CompactProgressState.current() != null);
+            sinkRegisteredAtPush.add(ccAtSummarize.get() != null);
             return null;
         }).when(wsTemplate).convertAndSend(anyString(), org.mockito.ArgumentMatchers.any(Object.class));
         svc.setWsTemplate(wsTemplate);
@@ -564,8 +569,19 @@ class PartialCompactServiceTest {
         assertThat(topics).as("进度事件全部推到会话级 compact-progress topic（与 CompactProgressState.topic 同源）")
             .isNotEmpty()
             .allMatch("/topic/sessions/s1/compact-progress"::equals);
-        assertThat(sinkRegisteredAtPush).as("推送发生在 ThreadLocal 注册在飞期间（非事后补发）")
-            .containsOnly(true);
+        // [批 5a] 重表达（原「推送发生在 ThreadLocal 注册在飞期间，非事后补发」）：sink 现随 ctx
+        //   在 buildContext 时**预先**装箱 ⇒ 摘要**之前**的 hooks_start/compact_start 也能推到前端
+        //   （前两条 flag=false 即该证据），而 summary 之后的推送 flag=true —— 整体证明不是事后补发。
+        assertThat(sinkRegisteredAtPush)
+            .as("前两条推送发生在摘要生产之前（hooks_start/compact_start）⇒ 非事后补发")
+            .startsWith(false, false)
+            .endsWith(true);
+        // [批 5a] 重表达（原「推送出自本 REST 线程 ThreadLocal 注册」）：sink 现随 ctx 显式携带 ——
+        //   ctx 非 null 且其 sink 与推送到 STOMP 的那个同源（由下方 topics/payloads 断言共同坐实：
+        //   sink 若未装箱则一条推送都不会发生）。
+        assertThat(ccAtSummarize.get()).as("summarize 收到显式 ctx").isNotNull();
+        assertThat(ccAtSummarize.get().getOnCompactProgress())
+            .as("该 ctx 确实携带进度 sink（非孤立上下文）").isNotNull();
         List<String> types = payloads.stream()
             .map(p -> ((com.fasterxml.jackson.databind.node.ObjectNode) p).path("type").asText())
             .toList();
@@ -589,7 +605,7 @@ class PartialCompactServiceTest {
      * <p><b>RED 条件</b>：删去 {@code partialCompact} finally 内的三处 clear → 本用例红。
      */
     @Test
-    @DisplayName("[partial-progress] 注册/清理成对：调用后无 ThreadLocal/会话级残留")
+    @DisplayName("[partial-progress] 注册/清理成对：调用后无 ThreadLocal/会话级残留（[批 5a] 断流源已改 ctx 显式携带）")
     void partialProgress_channelCleanedUpAfterCall() {
         MessageService messageService = mock(MessageService.class);
         SessionService sessionService = mock(SessionService.class);
@@ -597,18 +613,30 @@ class PartialCompactServiceTest {
         when(messageService.listForResume(anyString())).thenReturn(fourMessages());
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        when(summary.summarize(anyString(), anyList()))
-            .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
+        java.util.concurrent.atomic.AtomicReference<AbortController> abortAtSummarize =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> {
+                abortAtSummarize.set(
+                    ((CompactConversationContext) inv.getArgument(2)).getAbortController());
+                return new CompactConversation.SummaryResult("summary ok", null);
+            });
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
         svc.setWsTemplate(mock(SimpMessagingTemplate.class));
 
-        assertThat(CompactProgressState.current()).as("前置：无残留").isNull();
         svc.partialCompact(SESSION,
             new PartialCompactRequest("u1", PartialCompactRequest.Direction.FROM, null));
 
-        assertThat(CompactProgressState.current()).as("清后 ThreadLocal 进度槽出栈").isNull();
-        assertThat(CompactProgressState.currentAbort()).as("清后 ThreadLocal abort 槽出栈（摘要断流源不复用）").isNull();
-        assertThat(CompactProgressState.abortForSession(SESSION)).as("清后会话级无在飞压缩可 abort").isFalse();
+        // [批 5a] 重表达：原两条断言读的是已删除的 ThreadLocal（进度槽 / abort 槽）。
+        //   新语义 = 断流源与 sink 随本次压缩的 ctx 产生/回收 ⇒ 不可能被下一次压缩读到。
+        //   正向对照：新建 ctx 的载荷与本次不同源（证明确实没有共享槽位，而非「恰好为 null」）。
+        assertThat(abortAtSummarize.get()).as("前置对照：摘要期间确实有断流源（否则断言空转）")
+            .isNotNull();
+        assertThat(new CompactConversationContext().getAbortController())
+            .as("新压缩的 ctx 不携带本次压缩的断流源（原 ThreadLocal 残留断言的重表达）")
+            .isNotSameAs(abortAtSummarize.get());
+        assertThat(CompactProgressState.abortForSession(SESSION))
+            .as("清后会话级无在飞压缩可 abort（跨线程通道，仍为显式 map）").isFalse();
     }
 
     /**
@@ -637,14 +665,19 @@ class PartialCompactServiceTest {
             new java.util.concurrent.atomic.AtomicReference<>(false);
         java.util.concurrent.atomic.AtomicReference<Boolean> restThreadSawCancelled =
             new java.util.concurrent.atomic.AtomicReference<>(false);
+        // [批 5a] 摘要断流源现随 ctx 显式下传（第 3 实参）
+        java.util.concurrent.atomic.AtomicReference<AbortController> abortObservedAtSummarize =
+            new java.util.concurrent.atomic.AtomicReference<>();
         // 摘要生产在 REST 线程执行 → 借此处模拟「压缩进行中，前端从另一线程发 cancel」
-        when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any())).thenAnswer(inv -> {
             Thread canceller = new Thread(() ->
                 crossThreadAbortHit.set(CompactProgressState.abortForSession(SESSION)),
                 "test-cancel-thread");
             canceller.start();
             canceller.join(5000);
-            AbortController inFlight = CompactProgressState.currentAbort();
+            AbortController inFlight =
+                ((CompactConversationContext) inv.getArgument(2)).getAbortController();
+            abortObservedAtSummarize.set(inFlight);
             restThreadSawCancelled.set(inFlight != null && inFlight.isCancelled());
             return new CompactConversation.SummaryResult("summary ok", null);
         });
@@ -656,7 +689,7 @@ class PartialCompactServiceTest {
         assertThat(crossThreadAbortHit.get())
             .as("另一线程（模拟前端 cancelSession）abort 命中在飞 partial 压缩").isTrue();
         assertThat(restThreadSawCancelled.get())
-            .as("REST 线程摘要断流源（currentAbort）为同一实例且已取消").isTrue();
+            .as("REST 线程摘要断流源（ctx 显式携带的 abortController）为同一实例且已取消").isTrue();
         assertThat(CompactProgressState.abortForSession(SESSION)).as("收尾后无残留可 abort").isFalse();
     }
 

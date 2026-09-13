@@ -72,8 +72,6 @@ class PartialCompactSessionCostWiringTest {
 
     @AfterEach
     void tearDown() {
-        CompactProgressState.clear();
-        CompactProgressState.clearAbort();
         CompactProgressState.removeSessionAbort(SESSION);
         // 静态 holder 复位（防跨用例串台）· setter 接受 null → 解注册
         PartialCompactConversation.setSessionAgentStateRegistry(null);
@@ -173,7 +171,7 @@ class PartialCompactSessionCostWiringTest {
         when(messageService.listForResume(anyString())).thenReturn(sessionMessages);
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary text",
                 new CompactConversation.TokenUsage(C_INPUT, C_OUTPUT, C_CACHE_READ, C_CACHE_CREATE)));
         PartialCompactService svc = new PartialCompactService(

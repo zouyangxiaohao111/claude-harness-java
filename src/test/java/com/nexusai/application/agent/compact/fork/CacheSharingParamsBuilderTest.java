@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.compact.fork;
 
+import com.nexusai.application.agent.compact.CompactConversationContext;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.CacheScope;
 import com.nexusai.application.agent.prompt.GitStatusProvider;
@@ -285,57 +286,57 @@ class CacheSharingParamsBuilderTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 验收 2 · Holder 槽位 save/get/clear + ThreadLocal 会话隔离
+    // [批 5a] 验收 2（重表达）· fork 参数随 CompactConversationContext 显式携带
     // ════════════════════════════════════════════════════════════════════
+    // 原两条用例断言已删除的载体 CacheSafeParamsHolder（save/get/clear + ThreadLocal 线程隔离），
+    // 其主题在改造后不复存在（值不再有进程级/线程级槽位）。语义**重表达**为「值挂在传入的 ctx 上，
+    // 因而按上下文天然隔离」——不再依赖线程身份（原断言不是被静默删掉，而是换了承载物）。
 
     @Test
-    @DisplayName("Holder: save/get 同线程可读，clear 后为 null")
-    void holder_saveGetClear() {
+    @DisplayName("[批 5a] fork 参数随 ctx 显式携带：set/get 同源，置 null 后可读回 null")
+    void ctx_carriesCacheSafeParams() {
         ToolUseContext tuc = baseContext();
         CacheSafeParams cs = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc, List.of());
 
-        CacheSafeParamsHolder.clear();
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        CompactConversationContext ctx = new CompactConversationContext();
+        assertThat(ctx.getCacheSafeParams()).as("默认 null（无 fork 前缀 → 跳过 fork 路径）").isNull();
 
-        CacheSafeParamsHolder.save(cs);
-        assertThat(CacheSafeParamsHolder.get()).isSameAs(cs);
+        ctx.setCacheSafeParams(cs);
+        assertThat(ctx.getCacheSafeParams()).as("显式装箱后同源可读").isSameAs(cs);
 
-        CacheSafeParamsHolder.clear();
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        ctx.setCacheSafeParams(null);
+        assertThat(ctx.getCacheSafeParams()).as("置 null 后可读回 null").isNull();
     }
 
     @Test
-    @DisplayName("Holder: ThreadLocal 会话隔离——主线程 save 不影响其他线程（并发 loop 防串台）")
-    void holder_threadLocalIsolation() throws InterruptedException {
+    @DisplayName("[批 5a] 会话隔离由「按 ctx 携带」保证：另一线程持自己的 ctx 读到自己的参数")
+    void ctx_isolation_noSharedSlot() throws InterruptedException {
         ToolUseContext tuc = baseContext();
+        CacheSafeParams mainCs = new CacheSafeParams(List.of("main-sys"), Map.of(), Map.of(), tuc, List.of());
+        CompactConversationContext mainCtx = new CompactConversationContext().setCacheSafeParams(mainCs);
+        CacheSafeParams otherCs = new CacheSafeParams(List.of("other-sys"), Map.of(), Map.of(), tuc, List.of());
+        CompactConversationContext otherCtx = new CompactConversationContext().setCacheSafeParams(otherCs);
+
+        AtomicReference<CacheSafeParams> seenByOtherThread = new AtomicReference<>();
         CountDownLatch otherReady = new CountDownLatch(1);
         CountDownLatch proceed = new CountDownLatch(1);
-        AtomicReference<CacheSafeParams> otherThreadGet = new AtomicReference<>();
-
         Thread other = new Thread(() -> {
             try {
                 otherReady.countDown();
                 proceed.await(2, TimeUnit.SECONDS);
-                otherThreadGet.set(CacheSafeParamsHolder.get());
+                seenByOtherThread.set(otherCtx.getCacheSafeParams());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         });
         other.start();
         otherReady.await(2, TimeUnit.SECONDS);
-
-        CacheSafeParamsHolder.clear();
-        CacheSafeParams mainCs = new CacheSafeParams(List.of("main-sys"), Map.of(), Map.of(), tuc, List.of());
-        CacheSafeParamsHolder.save(mainCs);
-
         proceed.countDown();
         other.join(2_000);
 
-        // 其他线程读不到主线程槽位（null）；主线程可读同一实例
-        assertThat(otherThreadGet.get()).isNull();
-        assertThat(CacheSafeParamsHolder.get()).isSameAs(mainCs);
-
-        CacheSafeParamsHolder.clear();
+        assertThat(seenByOtherThread.get()).as("另一线程读到自己的 ctx 参数").isSameAs(otherCs);
+        assertThat(seenByOtherThread.get()).as("不得串成主线程的参数").isNotSameAs(mainCs);
+        assertThat(mainCtx.getCacheSafeParams()).as("主线程 ctx 不受影响").isSameAs(mainCs);
     }
 
     // ════════════════════════════════════════════════════════════════════

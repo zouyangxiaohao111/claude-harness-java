@@ -170,7 +170,7 @@ class ManualCompactSessionCostWiringTest {
         SessionAgentStateRegistry registry = registryWith(live);
 
         StreamCompactSummary failing = mock(StreamCompactSummary.class);
-        when(failing.summarize(anyString(), anyList()))
+        when(failing.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenThrow(new RuntimeException("boom: summary production failed"));
 
         ToolRegistrationConfig config = configWithCalculator();
@@ -210,7 +210,7 @@ class ManualCompactSessionCostWiringTest {
     /** 摘要生产 mock：返回真实 usage（= compactionUsage 的原料）。 */
     private static StreamCompactSummary summaryReturningUsage() {
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary text",
                 new CompactConversation.TokenUsage(C_INPUT, C_OUTPUT, C_CACHE_READ, C_CACHE_CREATE)));
         return summary;

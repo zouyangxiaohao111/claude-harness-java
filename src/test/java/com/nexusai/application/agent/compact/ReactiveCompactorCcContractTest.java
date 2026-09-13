@@ -1,6 +1,5 @@
 package com.nexusai.application.agent.compact;
 
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.recovery.RecoveryState;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -55,7 +54,6 @@ class ReactiveCompactorCcContractTest {
     void resetStaticState() {
         // compactConversation 成功路径 markPostCompaction（非 UUID 回落进程级布尔）→ 复位防串台。
         PostCompactionState.clear(SESSION);
-        CacheSafeParamsHolder.clear();
     }
 
     /** 记录调用的 stub 摘要回调 · 断言 summarize 被 compactConversation 委托。 */
@@ -65,11 +63,16 @@ class ReactiveCompactorCcContractTest {
         final AtomicReference<List<ChatMessageDto>> capturedMessages = new AtomicReference<>();
         volatile String summaryText = "reactive-summary-stub";
 
+        /** [批 5a] 记录按上下文下传的 ctx（显式载体回归锁）。 */
+        final AtomicReference<CompactConversationContext> capturedCtx = new AtomicReference<>();
+
         @Override
-        public CompactConversation.SummaryResult summarize(String prompt, List<ChatMessageDto> messages) {
+        public CompactConversation.SummaryResult summarize(String prompt, List<ChatMessageDto> messages,
+                                                           CompactConversationContext ctx) {
             calls.incrementAndGet();
             capturedPrompt.set(prompt);
             capturedMessages.set(messages);
+            capturedCtx.set(ctx);
             // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）
             return new CompactConversation.SummaryResult(summaryText, null);
         }

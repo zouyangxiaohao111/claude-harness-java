@@ -4,7 +4,6 @@ import com.nexusai.application.agent.api.ApiErrors;
 import com.nexusai.application.agent.compact.CompactProgressEvent.HooksStart;
 import com.nexusai.application.agent.compact.CompactProgressEvent.HooksStart.HookType;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.compact.fork.CacheSharingParamsBuilder;
 import com.nexusai.application.agent.prompt.SystemPrompt;
 import com.nexusai.application.agent.prompt.SystemPromptContextProvider;
@@ -331,7 +330,8 @@ public final class PartialCompactConversation {
             // best-effort：toolUseContext/sysPromptCtxProvider 缺失 → build 返回 null → save(null) →
             // StreamCompactSummary 跳过 fork 路径走流式 fallback（缓存共享为优化项，不阻断压缩）。
             CacheSafeParams cacheSafeParams = buildCacheSafeParamsForPartial(ctx, apiMessages);
-            CacheSafeParamsHolder.save(cacheSafeParams);
+            // [批 5a] 显式装箱（CC partialCompactConversation 的 cacheSafeParams 参数，compact.ts:805）。
+            ctx.setCacheSafeParams(cacheSafeParams);
             log.info("[PartialCompactConversation] fork 缓存共享通道: saved={}（up_to={}）",
                 cacheSafeParams != null, upTo);
 
@@ -382,9 +382,9 @@ public final class PartialCompactConversation {
                 //   CacheSafeParams 为不可变 record → 以 truncated 构造新实例并 re-save
                 //   （CacheSafeParamsHolder.save 同线程覆盖槽位，StreamCompactSummary fork 读侧下次读取即新前缀）；
                 //   仅当首轮已 save 非 null 时更新（无 PTL 触发 → 无更新开销；首轮 save(null) → 跳过）。
-                CacheSafeParams saved = CacheSafeParamsHolder.get();
+                CacheSafeParams saved = ctx.getCacheSafeParams();
                 if (saved != null) {
-                    CacheSafeParamsHolder.save(new CacheSafeParams(
+                    ctx.setCacheSafeParams(new CacheSafeParams(
                         saved.systemPrompt(), saved.userContext(), saved.systemContext(),
                         saved.toolUseContext(), new ArrayList<>(truncated), saved.useGlobalCacheScope(),
                         // [TL-W1b P1] 会话绑定 projectRoot 逐字段保留（本处只换 forkContextMessages，
@@ -556,9 +556,8 @@ public final class PartialCompactConversation {
             throw error;
         } finally {
             // ── 25. finally 收尾（compact.ts:1100-1105）──
-            // [RES-OPD-SP33] 清空 fork 缓存共享槽位（对齐 R1 CompactCommand finally clear +
-            //     LlmAgentLoop:2577），防槽位串台/泄漏到下一流程。
-            CacheSafeParamsHolder.clear();
+            // [批 5a] fork 参数随 ccCtx 引用生命周期回收（原 CacheSafeParamsHolder.clear() 的
+            //   ThreadLocal 槽位已删）。
             ctx.getStreamModeSetter().accept(SpinnerMode.REQUESTING);
             ctx.getResponseLengthSetter().accept(0);
             ctx.getOnCompactProgress().accept(new CompactProgressEvent.CompactEnd());

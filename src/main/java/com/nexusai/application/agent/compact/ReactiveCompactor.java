@@ -252,14 +252,15 @@ public class ReactiveCompactor {
      *
      * @return SummaryProducer 适配器；compactCallback 为 null → null
      */
-    public CompactConversation.SummaryProducer summaryProducer() {
+    public CompactConversation.SummaryProducer summaryProducer(CompactConversationContext ccCtx) {
         if (compactCallback == null) {
             return null;
         }
         return (messagesToSummarize, compactPrompt, preCompactTokenCount) -> {
             try {
                 // [IMP-CM-14 F02] 透传回调返回的 SummaryResult（text + usage）——不丢 usage
-                return compactCallback.summarize(compactPrompt, messagesToSummarize);
+                // [批 5a] ccCtx 显式下传（原经 ThreadLocal 隐式通道）
+                return compactCallback.summarize(compactPrompt, messagesToSummarize, ccCtx);
             } catch (RuntimeException re) {
                 throw re;
             } catch (Exception e) {
@@ -300,7 +301,7 @@ public class ReactiveCompactor {
             return ReactiveCompactOutcome.fail("CompactConversationContext is required");
         }
         if (ccCtx.getSummaryProducer() == null) {
-            ccCtx.setSummaryProducer(summaryProducer());
+            ccCtx.setSummaryProducer(summaryProducer(ccCtx));
         }
         try {
             // CC reactiveCompact.ts:22-35 compactConversation(messages, toolUseContext, params, true,
@@ -363,7 +364,7 @@ public class ReactiveCompactor {
             return null;
         }
         if (ccCtx.getSummaryProducer() == null) {
-            ccCtx.setSummaryProducer(summaryProducer());
+            ccCtx.setSummaryProducer(summaryProducer(ccCtx));
         }
         try {
             // CC reactiveCompact.ts:75-88 compactConversation(messages, toolUseContext, params, true,

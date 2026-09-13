@@ -11,7 +11,6 @@ import com.nexusai.application.agent.toolsearch.SchemaNotSentHint;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.repository.provider.mapper.ModelMapper;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -366,9 +365,14 @@ public final class CompactConversation {
                 //   CacheSafeParams 为不可变 record → 以 truncated 重建并 re-save
                 //   （CacheSafeParamsHolder.save 同线程覆盖槽位，StreamCompactSummary fork 读侧
                 //   下次读取即新前缀）；仅当槽位非 null 时更新（无 fork 前缀 → 无缓存共享，跳过）。
-                CacheSafeParams saved = CacheSafeParamsHolder.get();
+                // [批 5a] CC 此处是**局部变量** `let retryCacheSafeParams = cacheSafeParams` +
+                //   `retryCacheSafeParams = {...cacheSafeParams, forkContextMessages: truncated}`
+                //   （compact.ts:470/:886）——原 Java 实现用 CacheSafeParamsHolder 的
+                //   get/save 往返模拟局部变量（跨 600 行的 ThreadLocal 往返 = 隐式通道），
+                //   现直接读写 ccCtx 的显式字段。
+                CacheSafeParams saved = ctx.getCacheSafeParams();
                 if (saved != null) {
-                    CacheSafeParamsHolder.save(new CacheSafeParams(
+                    ctx.setCacheSafeParams(new CacheSafeParams(
                         saved.systemPrompt(), saved.userContext(), saved.systemContext(),
                         saved.toolUseContext(), new ArrayList<>(truncated), saved.useGlobalCacheScope(),
                         // [TL-W1b P1] 会话绑定 projectRoot 逐字段保留（本处只换 forkContextMessages，

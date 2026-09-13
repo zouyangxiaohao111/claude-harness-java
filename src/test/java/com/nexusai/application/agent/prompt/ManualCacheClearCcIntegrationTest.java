@@ -10,7 +10,6 @@ import com.nexusai.application.agent.compact.PostCompactionState;
 import com.nexusai.application.agent.compact.PostCompactCleanup;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.CompactConversationContext;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.config.ToolRegistrationConfig;
 import com.nexusai.application.agent.context.ClaudemdEngine;
 import com.nexusai.application.agent.loop.FeatureFlags;
@@ -142,7 +141,6 @@ class ManualCacheClearCcIntegrationTest {
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
-        CacheSafeParamsHolder.clear();
     }
 
     /** 注入全部 spy 协作器（main-thread 操作可观察）。 */
@@ -260,7 +258,7 @@ class ManualCacheClearCcIntegrationTest {
         AtomicInteger reactiveCalls = new AtomicInteger();
         ReactiveCompactor reactive = new ReactiveCompactor(
             msgs -> 200_000,
-            (prompt, msgs) -> new CompactConversation.SummaryResult("reactive summary stub", null)) {
+            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("reactive summary stub", null)) {
             @Override
             public ReactiveCompactor.ReactiveCompactOutcome reactiveCompactOnPromptTooLong(
                     List<ChatMessageDto> messages, CompactConversationContext ccCtx, String customInstructions) {
@@ -319,11 +317,16 @@ class ManualCacheClearCcIntegrationTest {
             ReactiveCompactor.class, com.nexusai.application.agent.compact.StreamCompactSummary.class,
             SessionMemoryService.class, com.nexusai.application.agent.tool.ToolUseContext.class,
             com.nexusai.application.agent.prompt.SystemPromptContextProvider.class,
-            Supplier.class, String.class, String.class, boolean.class, Telemetry.class);
+            Supplier.class, String.class, String.class, boolean.class, Telemetry.class,
+            // [批 5a] 生产签名追加 compactAbort + progressSink 两个显式载荷（14 → 16 参）
+            com.nexusai.application.agent.tool.AbortController.class,
+            java.util.function.Consumer.class);
         build.setAccessible(true);
         CompactCommand.CompactCommandContext ctx = (CompactCommand.CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT, null,
-            null, null, null, null, null, null, null, null, false, null);
+            null, null, null, null, null, null, null, null, false, null,
+            null,   // [批 5a] compactAbort
+            null);  // [批 5a] progressSink
 
         // ── 2a. clearUserContextCache 真实接线：注册观察钩子 → 执行 → 钩子触发 ──
         AtomicInteger cacheClears = registerClearCounter();
@@ -369,11 +372,16 @@ class ManualCacheClearCcIntegrationTest {
             ReactiveCompactor.class, com.nexusai.application.agent.compact.StreamCompactSummary.class,
             SessionMemoryService.class, com.nexusai.application.agent.tool.ToolUseContext.class,
             com.nexusai.application.agent.prompt.SystemPromptContextProvider.class,
-            Supplier.class, String.class, String.class, boolean.class, Telemetry.class);
+            Supplier.class, String.class, String.class, boolean.class, Telemetry.class,
+            // [批 5a] 生产签名追加 compactAbort + progressSink 两个显式载荷（14 → 16 参）
+            com.nexusai.application.agent.tool.AbortController.class,
+            java.util.function.Consumer.class);
         build.setAccessible(true);
         CompactCommand.CompactCommandContext ctx = (CompactCommand.CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT, null,
-            null, null, null, null, null, null, null, null, false, null);
+            null, null, null, null, null, null, null, null, false, null,
+            null,   // [批 5a] compactAbort
+            null);  // [批 5a] progressSink
 
         List<PromptCacheBreakDetection.CacheBreakResult> events = new ArrayList<>();
         PromptCacheBreakDetection detector = new PromptCacheBreakDetection(events::add);

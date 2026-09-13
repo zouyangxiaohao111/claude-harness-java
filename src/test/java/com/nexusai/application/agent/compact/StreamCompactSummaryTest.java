@@ -34,6 +34,7 @@ import java.util.UUID;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.when;
 
 /**
@@ -52,6 +53,21 @@ import static org.mockito.Mockito.when;
  * </ol>
  */
 class StreamCompactSummaryTest {
+
+    /**
+     * [批 5a] 显式压缩上下文工厂 —— 取代原 {@code new StreamCompactSummary(…, () -> params, …)}
+     * 的 ctor supplier 注入（载体已删）：fork 参数/中断源现随 ctx 显式下传。
+     */
+    private static CompactConversationContext ctxOf(CacheSafeParams cs) {
+        return new CompactConversationContext().setCacheSafeParams(cs)
+            .setAbortController(new AbortController());
+    }
+
+    /** 无 fork 前缀的显式上下文（原 ctor 传 null supplier 的等价物）。 */
+    private static CompactConversationContext ctx() {
+        return ctxOf(null);
+    }
+
 
     private static final String SUMMARY_REQUEST = "请对会话做摘要";
     // ════════════════════════════════════════════════════════════════════
@@ -155,12 +171,11 @@ class StreamCompactSummaryTest {
             Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
         CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc, List.of());
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fake, () -> "model", ProviderConfig::empty,
-            () -> params, null, null, null, false, true, false, null, null, null);
+            () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
 
         // [IMP-CM-14 F02] streamCompactSummary 返回 SummaryResult（text + usage）
         CompactConversation.SummaryResult result = scs.streamCompactSummary(
-            List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty());
+            List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty(), ctxOf(params));
 
         assertThat(result).as("fallback 摘要结果正常返回").isNotNull();
         assertThat(result.text()).as("fallback 摘要文本正常返回").isEqualTo("summary text");
@@ -201,11 +216,10 @@ class StreamCompactSummaryTest {
             }
         };
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fake, () -> "model", ProviderConfig::empty,
-            null, null, null, null, false, true, false, null, null, null);
+            () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
 
         CompactConversation.SummaryResult result = scs.streamCompactSummary(
-            List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty());
+            List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty(), ctx());
 
         // WHY: CC compact.ts:645 compactionUsage = getTokenUsage(summaryResponse) 读 API 响应
         //   usage 供 metrics/遥测消费。Java 旧实现 summarize 返回 String 丢 usage，生产 adapter
@@ -253,13 +267,12 @@ class StreamCompactSummaryTest {
             CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
                 List.of(userMessage("forkctx1", "fork ctx")));
             StreamCompactSummary scs = new StreamCompactSummary(
-                () -> (LlmProvider) null, () -> "model", ProviderConfig::empty,
-                () -> params, null, null, null, false, true, false, null, null, null);
+                () -> (LlmProvider) null, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
             scs.setForkedQuery(query);
 
             CompactConversation.SummaryResult summary = scs.streamCompactSummary(
                 List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
-                null, ProviderConfig.empty());
+                null, ProviderConfig.empty(), ctxOf(params));
 
             // WHY: CC compact.ts:1214-1227 在 fork 成功时发射结构化成功事件（含 cacheHitRate 计算）；
             //   Java 旧实现仅 log.info，无事件 → fork 缓存共享成功路径不可观测（△-A3-4）。
@@ -304,13 +317,12 @@ class StreamCompactSummaryTest {
             CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
                 List.of(userMessage("forkctx1", "fork ctx")));
             StreamCompactSummary scs = new StreamCompactSummary(
-                () -> (LlmProvider) null, () -> "model", ProviderConfig::empty,
-                () -> params, null, null, null, false, true, false, null, null, null);
+                () -> (LlmProvider) null, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
             scs.setForkedQuery(query);
 
             CompactConversation.SummaryResult summary = scs.streamCompactSummary(
                 List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
-                null, ProviderConfig.empty());
+                null, ProviderConfig.empty(), ctxOf(params));
 
             assertThat(summary).as("fork 成功摘要返回").isNotNull();
             Mockito.verify(telemetry).recordEvent(
@@ -358,13 +370,12 @@ class StreamCompactSummaryTest {
                 }
             };
             StreamCompactSummary scs = new StreamCompactSummary(
-                () -> fake, () -> "model", ProviderConfig::empty,
-                () -> params, null, null, null, false, true, false, null, null, null);
+                () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
             scs.setForkedQuery(query);
 
             CompactConversation.SummaryResult summary = scs.streamCompactSummary(
                 List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
-                fake, ProviderConfig.empty());
+                fake, ProviderConfig.empty(), ctxOf(params));
 
             // WHY: CC compact.ts:1235-1239 无文本/API 错误时发射 reason='no_text_response' fallback 事件；
             //   Java 旧实现仅 log.warn（△-A3-4）。
@@ -412,13 +423,12 @@ class StreamCompactSummaryTest {
                 }
             };
             StreamCompactSummary scs = new StreamCompactSummary(
-                () -> fake, () -> "model", ProviderConfig::empty,
-                () -> params, null, null, null, false, true, false, null, null, null);
+                () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
             scs.setForkedQuery(query);
 
             CompactConversation.SummaryResult summary = scs.streamCompactSummary(
                 List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
-                fake, ProviderConfig.empty());
+                fake, ProviderConfig.empty(), ctxOf(params));
 
             // WHY: CC compact.ts:1242-1246 catch 分支发射 reason='error' fallback 事件；
             //   Java 旧实现仅 log.warn（△-A3-4）。
@@ -464,12 +474,11 @@ class StreamCompactSummaryTest {
             };
             // retryEnabled=true → maxAttempts=2（CC tengu_compact_streaming_retry 默认 false，测试显式开）
             StreamCompactSummary scs = new StreamCompactSummary(
-                () -> fake, () -> "model", ProviderConfig::empty,
-                null, null, null, null, false, true, true, null, null, null);
+                () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, true, null, null, null);
 
             CompactConversation.SummaryResult summary = scs.streamCompactSummary(
                 List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
-                fake, ProviderConfig.empty());
+                fake, ProviderConfig.empty(), ctx());
 
             // WHY: CC compact.ts:1364-1368 重试前发射结构化 retry 事件；Java 旧实现仅 log.warn（△-A3-3）。
             //   RED teeth：删掉 retry 事件 → 断言失败。
@@ -512,13 +521,12 @@ class StreamCompactSummaryTest {
             };
             // retryEnabled=false → maxAttempts=1 → 单次失败直接抛错
             StreamCompactSummary scs = new StreamCompactSummary(
-                () -> fake, () -> "model", ProviderConfig::empty,
-                null, null, null, null, false, true, false, null, null, null);
+                () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
 
             org.junit.jupiter.api.Assertions.assertThrows(
                 StreamCompactSummary.StreamCompactSummaryException.class,
                 () -> scs.streamCompactSummary(List.of(userMessage("c1", "ctx1")),
-                    SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty()));
+                    SUMMARY_REQUEST, 0, "model", fake, ProviderConfig.empty(), ctx()));
 
             // WHY: CC compact.ts:1379-1387 全部尝试失败后发射 failed 事件（reason='no_streaming_response'
             //   + hasStartedStreaming/retryEnabled/attempts/promptCacheSharingEnabled）；Java 旧实现仅
@@ -586,13 +594,12 @@ class StreamCompactSummaryTest {
             }
         };
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fake, () -> "model", ProviderConfig::empty,
-            null, null, null, null, false, true, false, null,
+            () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null,
             modes::add, n -> { });
 
         AssistantMessage result = scs.streamOnce(fake, ProviderConfig.empty(), "model",
             List.of("sys"), false, List.of(userMessage("c1", "ctx1")),
-            null, null, new AbortController());
+            null, null, new AbortController(), ctx());
 
         assertThat(result).isNotNull();
         assertThat(modes)
@@ -625,13 +632,12 @@ class StreamCompactSummaryTest {
             }
         };
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fake, () -> "model", ProviderConfig::empty,
-            null, null, null, null, false, true, false, null, null,
+            () -> fake, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null,
             lengths::add);
 
         scs.streamOnce(fake, ProviderConfig.empty(), "model",
             List.of("sys"), false, List.of(userMessage("c1", "ctx1")),
-            null, null, new AbortController());
+            null, null, new AbortController(), ctx());
 
         assertThat(lengths)
             .as("每个 text_delta 累加（CC length => length + delta；旧实现每次覆盖为 chunk.length）")
@@ -721,12 +727,11 @@ class StreamCompactSummaryTest {
             }
         };
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> slow, () -> "model", ProviderConfig::empty,
-            null, null, null, null, false, true, false, null, null, null);
+            () -> slow, () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
 
         AssistantMessage result = scs.streamOnce(slow, ProviderConfig.empty(), "model",
             List.of("sys"), false, List.of(userMessage("c1", "ctx1")),
-            null, null, new AbortController());
+            null, null, new AbortController(), ctx());
 
         assertThat(result)
             .as("流未结束则持续等待（CC 无硬超时；等待到 provider 完成返回）")
@@ -759,4 +764,50 @@ class StreamCompactSummaryTest {
             null, null, "刚刚", OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false);
     }
+    @Test
+    @DisplayName("[批 5a] 断流源必须取自 ctx.abortController（非进程级槽位）：已取消的 ctx → 摘要立即中断")
+    void abortSourceIsReadFromCtx() {
+        // WHY（规则九）：Esc/停止键能否打断压缩，完全取决于本读取点是否真的取 ctx 携带的控制器。
+        //   ⛔ 判别力：把该读取行改成 AbortController.NOOP（= 不读 ctx）⇒ 本用例转红（已反向实验验证）。
+        LlmProvider fake = new LlmProvider() {
+            @Override public String type() { return "test"; }
+            @Override public void stream(ProviderConfig c, String m, List<SystemPromptBlock> sp,
+                                         List<ChatMessageDto> h, ArrayNode t, Integer maxOut,
+                                         TaskBudgetParam tb, String ev, String qs,
+                                         Consumer<String> oc, Consumer<AssistantMessage> oa,
+                                         Consumer<ToolUseBlock> otc, Consumer<String> orc,
+                                         Runnable osf, AbortController ac,
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                                         com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                oc.accept("fallback text");
+                oa.accept(new AssistantMessage("summary text", "stop", List.of()));
+                ocp.run();
+            }
+            @Override public String chat(ProviderConfig c, String m, String sp, String userMessage) {
+                return "summary text";
+            }
+        };
+        StreamCompactSummary scs = new StreamCompactSummary(
+            () -> fake, () -> "model", ProviderConfig::empty, null, null, false, false, false, null, null, null);
+
+        AbortController cancelled = new AbortController();
+        cancelled.abort("user_cancel");
+        CompactConversationContext ctx = new CompactConversationContext().setAbortController(cancelled);
+
+        assertThatThrownBy(() -> scs.streamCompactSummary(
+                List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
+                fake, ProviderConfig.empty(), ctx))
+            .as("ctx 携带的断流源已取消 → 摘要生产必须立即中断（Esc 可达）")
+            .isInstanceOf(StreamCompactSummary.StreamCompactSummaryException.class);
+
+        // 正向对照：未取消的 ctx → 不因 abort 中断（区分 abort 分支与其它失败路径）
+        CompactConversationContext okCtx =
+            new CompactConversationContext().setAbortController(new AbortController());
+        assertThat(okCtx.getAbortController().isCancelled()).as("对照 ctx 未取消").isFalse();
+        assertThat(scs.streamCompactSummary(
+                List.of(userMessage("c1", "ctx1")), SUMMARY_REQUEST, 0, "model",
+                fake, ProviderConfig.empty(), okCtx))
+            .as("对照：未取消的 ctx 正常产出摘要").isNotNull();
+    }
+
 }

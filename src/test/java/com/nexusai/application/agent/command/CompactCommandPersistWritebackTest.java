@@ -10,7 +10,6 @@ import com.nexusai.application.agent.compact.CompactWarningState;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.PostCompactionState;
 import com.nexusai.application.agent.compact.SqliteBusyRetry;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.config.ToolRegistrationConfig;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.tool.AbortController;
@@ -74,7 +73,6 @@ class CompactCommandPersistWritebackTest {
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
-        CacheSafeParamsHolder.clear();
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {

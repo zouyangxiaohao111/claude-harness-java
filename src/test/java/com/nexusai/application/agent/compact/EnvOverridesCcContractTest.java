@@ -107,7 +107,7 @@ class EnvOverridesCcContractTest {
 
     private static AutoCompactor autoCompactorWithEnv(Map<String, String> env) {
         AutoCompactor ac = new AutoCompactor(msgs -> 0,
-            (prompt, msgs) -> new CompactConversation.SummaryResult("", null));
+            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("", null));
         ac.setEnvProvider(env::get);
         return ac;
     }

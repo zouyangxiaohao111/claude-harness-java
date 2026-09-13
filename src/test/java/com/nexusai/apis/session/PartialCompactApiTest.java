@@ -75,7 +75,7 @@ class PartialCompactApiTest {
         when(messageService.appendPostCompactMessages(anyString(), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
         // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）；mock 摘要 usage=null
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new com.nexusai.application.agent.compact.CompactConversation.SummaryResult(summaryText, null));
 
         ChatController controller = new ChatController();

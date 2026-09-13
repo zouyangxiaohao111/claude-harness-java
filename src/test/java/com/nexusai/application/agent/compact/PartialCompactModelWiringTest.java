@@ -92,8 +92,6 @@ class PartialCompactModelWiringTest {
     void restore() throws Exception {
         writeStaticMapper("modelMapper", savedModelMapper);
         writeStaticMapper("providerMapper", savedProviderMapper);
-        CompactProgressState.clear();
-        CompactProgressState.clearAbort();
         CompactProgressState.removeSessionAbort(SESSION);
     }
 
@@ -279,7 +277,7 @@ class PartialCompactModelWiringTest {
 
     private static StreamCompactSummary summaryMock() {
         StreamCompactSummary summary = mock(StreamCompactSummary.class);
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
         return summary;
     }

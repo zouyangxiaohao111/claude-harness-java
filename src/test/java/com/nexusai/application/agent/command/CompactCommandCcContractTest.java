@@ -11,7 +11,6 @@ import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.PostCompactionState;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.GitStatusProvider;
@@ -70,7 +69,6 @@ class CompactCommandCcContractTest {
         // SESSION="s1" 非 UUID → 方案 1b 走回落进程级单布尔（clear 复位之）；会话级隔离由
         // PostCompactionStateTest 覆盖，本测试仅清回落布尔防跨用例污染。
         PostCompactionState.clear(SESSION);
-        CacheSafeParamsHolder.clear();
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {
@@ -496,7 +494,7 @@ class CompactCommandCcContractTest {
         AtomicInteger reactiveCalls = new AtomicInteger();
         ReactiveCompactor reactive = new ReactiveCompactor(
             msgs -> 200_000,
-            (prompt, msgs) -> new CompactConversation.SummaryResult("reactive summary stub", null)) {
+            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("reactive summary stub", null)) {
             @Override
             public ReactiveCompactor.ReactiveCompactOutcome reactiveCompactOnPromptTooLong(
                     List<ChatMessageDto> messages, CompactConversationContext ccCtx, String customInstructions) {
@@ -574,14 +572,17 @@ class CompactCommandCcContractTest {
             msg("m2", Role.assistant, "yo"),
             msg("m3", Role.user, "how are you"));
         AtomicReference<CacheSafeParams> seenDuringSummarize = new AtomicReference<>();
+        // [批 5a] 显式载体：fork 参数现挂在 CompactConversationContext 上（原 CacheSafeParamsHolder
+        //   的 ThreadLocal 槽位已删）。ctx 工厂 `() -> cc` 返回稳定实例 ⇒ 可持引用在摘要期间读取。
+        AtomicReference<CompactConversationContext> ccRef = new AtomicReference<>();
         CompactCommandContext c = ctx(preCompact, null, null,
             (m, p, t) -> {
-                // summaryProducer 即 StreamCompactSummary fork 读侧（cacheSafeParamsSupplier=Holder.get()）
-                seenDuringSummarize.set(CacheSafeParamsHolder.get());
+                seenDuringSummarize.set(ccRef.get().getCacheSafeParams());
                 return new CompactConversation.SummaryResult("summary ok", null);
             },
             new ArrayList<>(), new AbortController(), () -> { },
             tuc, sysCtx, defaultAssemble, "CUSTOM-PROMPT", false, () -> false);  // 3P 默认 gate=false
+        ccRef.set(c.compactConversationContextSupplier().get());
 
         CompactCommand.CompactCommandResult result = CompactCommand.call("  ", c);
 
@@ -597,8 +598,10 @@ class CompactCommandCcContractTest {
         assertThat(cs.forkContextMessages()).isEqualTo(preCompact); // 压缩前消息快照
         // [RES-R4-1] gate 随 ctx 注入透传到 CacheSafeParams（3P 默认场景 gate=false，与主线程同一判定）
         assertThat(cs.useGlobalCacheScope()).isFalse();
-        // 压缩后槽位清空（finally clear，防串台/泄漏到下一 turn）
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        // [批 5a] 重表达：原「压缩后槽位清空（finally clear）」断言的是已删除的 ThreadLocal 槽位；
+        //   现语义 = 无进程级残留 —— 新建 ctx 恒为 null（值只活在本次压缩的 ctx 上，不可能串台）。
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位：新 ctx 恒 null（值按上下文作用域，跨压缩不可能泄漏）").isNull();
     }
 
     /**
@@ -637,13 +640,16 @@ class CompactCommandCcContractTest {
             msg("m2", Role.assistant, "yo"),
             msg("m3", Role.user, "how are you"));
         AtomicReference<CacheSafeParams> seenDuringSummarize = new AtomicReference<>();
+        // [批 5a] 同 site 1：显式载体 = CompactConversationContext
+        AtomicReference<CompactConversationContext> ccRef = new AtomicReference<>();
         CompactCommandContext c = ctx(preCompact, null, null,
             (m, p, t) -> {
-                seenDuringSummarize.set(CacheSafeParamsHolder.get());
+                seenDuringSummarize.set(ccRef.get().getCacheSafeParams());
                 return new CompactConversation.SummaryResult("summary ok", null);
             },
             new ArrayList<>(), new AbortController(), () -> { },
             tuc, sysCtx, null, "CUSTOM-PROMPT", true, () -> false);  // firstParty gate（REQ-R4-3）
+        ccRef.set(c.compactConversationContextSupplier().get());
 
         CompactCommand.CompactCommandResult result = CompactCommand.call("  ", c);
 
@@ -652,7 +658,8 @@ class CompactCommandCcContractTest {
         assertThat(cs).isNotNull();
         // gate 值随 CacheSafeParams 携带（fork 发送边界 split 模式决定因子，REQ-R4-1/3）
         assertThat(cs.useGlobalCacheScope()).isTrue();
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位：新 ctx 恒 null（原 Holder 槽位断言的重表达）").isNull();
     }
 
     @Test

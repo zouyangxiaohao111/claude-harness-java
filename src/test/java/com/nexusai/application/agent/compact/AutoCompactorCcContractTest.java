@@ -49,7 +49,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("守卫: querySource=session_memory → shouldAutoCompact=false（INV-6）")
     void guardSessionMemory() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         assertThat(auto.shouldAutoCompact(big, null, "session_memory", 0)).isFalse();
@@ -58,7 +58,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("守卫: querySource=compact → shouldAutoCompact=false（INV-6）")
     void guardCompact() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         assertThat(auto.shouldAutoCompact(big, null, "compact", 0)).isFalse();
@@ -67,7 +67,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("守卫: CONTEXT_COLLAPSE 启用 && querySource=marble_origami → false（INV-6）")
     void guardMarbleOrigami() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         // 未启用 CONTEXT_COLLAPSE 时 marble_origami 不守卫（autoCompact.ts:179 feature 门控）
@@ -80,7 +80,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("[E-1a] 守卫: 后台 fork 来源 extract_memories/auto_dream（含生产大写归一）→ 超阈不压缩")
     void guard_backgroundForkSources_expandedDomain() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         // E-1a fork 屏蔽档：豁免值域扩到 4 个后台 fork 来源（compact/session_memory 由上方用例覆盖）
@@ -100,7 +100,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("非守卫源 user 超阈 → shouldAutoCompact=true（阈值真实生效）")
     void guardUserAboveThreshold() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         assertThat(auto.shouldAutoCompact(big, null, "user", 0)).isTrue();
@@ -109,7 +109,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("守卫（生产值域）: 大写 SESSION_MEMORY/COMPACT/MARBLE_ORIGAMI 归一后命中（S-3，INV-18）")
     void guard_productionUppercaseEnumNames_hit() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         // 生产 LlmAgentLoop 传 querySource().name() 大写枚举名 → canonical 归一后守卫命中
@@ -132,7 +132,7 @@ class AutoCompactorCcContractTest {
         // session_memory/compact/marble_origami；子代理源（runAgent.ts:748 同一 query()）
         // 达阈值照常 proactive 压缩。本用例固化 gate 移除后单元层语义（集成层由
         // SubagentAutoCompactGateCcTest 覆盖）。
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         assertThat(auto.shouldAutoCompact(big, null, "agent:subagent", 0))
@@ -162,7 +162,7 @@ class AutoCompactorCcContractTest {
     @DisplayName("熔断: 失败 2 次未熔断，第 3 次触发 ≥3 停止（INV-5）")
     void circuitBreakerTripsAt3() {
         // 恒定高 token → 每次都会尝试；callback 恒抛错 → 失败 +1
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> { throw new RuntimeException("boom"); });
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> { throw new RuntimeException("boom"); });
 
         auto.tryAutoCompact(largeMessages(50));
         assertThat(auto.getTracking().getConsecutiveFailures()).isEqualTo(1);
@@ -186,12 +186,12 @@ class AutoCompactorCcContractTest {
     @DisplayName("熔断: 成功复位 0（INV-5）")
     void successResetsFailureCount() {
         // 首次失败
-        AutoCompactor fail = new AutoCompactor(msgs -> 200_000, (p, m) -> { throw new RuntimeException("boom"); });
+        AutoCompactor fail = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> { throw new RuntimeException("boom"); });
         fail.tryAutoCompact(largeMessages(50));
         assertThat(fail.getTracking().getConsecutiveFailures()).isEqualTo(1);
 
         // 用成功 callback 的实例：成功 → consecutiveFailures 复位 0
-        AutoCompactor ok = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("<summary>good</summary>", null));
+        AutoCompactor ok = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>good</summary>", null));
         // 预先模拟一次失败
         ok.getTracking().recordFailure();
         assertThat(ok.getTracking().getConsecutiveFailures()).isEqualTo(1);
@@ -205,7 +205,7 @@ class AutoCompactorCcContractTest {
     @DisplayName("熔断: USER_ABORT 计入失败数（CC autoCompact.ts:341-342 无条件 +1）")
     void userAbortCountsTowardBreaker() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> { throw new IllegalArgumentException(CompactConstants.ERROR_MESSAGE_USER_ABORT); });
+            (p, m, ctx) -> { throw new IllegalArgumentException(CompactConstants.ERROR_MESSAGE_USER_ABORT); });
 
         auto.tryAutoCompact(largeMessages(50));
         // USER_ABORT 也计入（hasExactErrorMessage 仅门控 logError，不门控计数）
@@ -219,7 +219,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("env: DISABLE_COMPACT → isAutoCompactEnabled=false（autoCompact.ts:148）")
     void disableCompactEnv() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setEnvProvider(key -> "DISABLE_COMPACT".equals(key) ? "true" : null);
 
         assertThat(auto.isAutoCompactEnabled()).isFalse();
@@ -230,7 +230,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("env: DISABLE_AUTO_COMPACT → isAutoCompactEnabled=false（autoCompact.ts:152）")
     void disableAutoCompactEnv() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setEnvProvider(key -> "DISABLE_AUTO_COMPACT".equals(key) ? "1" : null);
 
         assertThat(auto.isAutoCompactEnabled()).isFalse();
@@ -239,7 +239,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("env: 无 disable env + autoCompactEnabled=true → 启用")
     void enabledByDefault() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         assertThat(auto.isAutoCompactEnabled()).isTrue();
     }
 
@@ -259,7 +259,7 @@ class AutoCompactorCcContractTest {
         smService.setSmSessionMemoryEnabled(true);
         smService.setSmCompactEnabled(true);
 
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("should not be called", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
         auto.setSessionMemoryService(smService);
         auto.setSessionId("s1");
         auto.setAgentId("agent-1");
@@ -300,7 +300,7 @@ class AutoCompactorCcContractTest {
         smService.setSmSessionMemoryEnabled(true);
         smService.setSmCompactEnabled(true);
 
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("should not be called", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
         auto.setSessionMemoryService(smService);
         auto.setSessionId("s1");
         auto.setAgentId("agent-1");
@@ -328,7 +328,7 @@ class AutoCompactorCcContractTest {
         // 按门控调用 notifyCompaction.accept(querySource, agentId)。
         SessionMemoryService smService = new SessionMemoryService(baseDir);
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setSessionMemoryService(smService);
         auto.setSessionId("s1");
         auto.setAgentId("agent-1");
@@ -349,7 +349,7 @@ class AutoCompactorCcContractTest {
     void fullPathNotifyCompaction_gatedOff(@TempDir Path baseDir) {
         SessionMemoryService smService = new SessionMemoryService(baseDir);
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setSessionMemoryService(smService);
         auto.setSessionId("s1");
         auto.setAgentId("agent-1");
@@ -371,7 +371,7 @@ class AutoCompactorCcContractTest {
     void smUnavailableFallsBackToL4(@TempDir Path baseDir) {
         SessionMemoryService smService = new SessionMemoryService(baseDir);
         // SM feature 未启用 → shouldUseSessionMemoryCompaction=false
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setSessionMemoryService(smService);
         auto.setSessionId("s1");
 
@@ -394,7 +394,7 @@ class AutoCompactorCcContractTest {
         smService.setSmCompactEnabled(true);
 
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("should not be called", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
         auto.setSessionMemoryService(smService);
         auto.setSessionId("s1");
         auto.setAgentId("agent-1");
@@ -437,7 +437,7 @@ class AutoCompactorCcContractTest {
     @DisplayName("PTL: 前缀摘要触发重试，第二次成功（INV-16）")
     void ptlRetryThenSucceeds() {
         List<String> calls = new ArrayList<>();
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> {
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> {
             calls.add("call-" + m.size());
             if (calls.size() == 1) {
                 return new CompactConversation.SummaryResult(
@@ -457,7 +457,7 @@ class AutoCompactorCcContractTest {
     @DisplayName("PTL: 重试耗尽（3 次后仍 PTL）→ 失败 +1（MAX_PTL_RETRIES=3，INV-16）")
     void ptlRetryExhausted() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult(
+            (p, m, ctx) -> new CompactConversation.SummaryResult(
                 "Prompt is too long. Try reducing the length of the messages.", null));
 
         AutoCompactor.AutoCompactResult result = auto.tryAutoCompact(ptlMessages(10));
@@ -473,7 +473,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("REACTIVE_COMPACT 抑制门: feature + tengu_cobalt_raccoon 双 true → false（autoCompact.ts:195-199）")
     void reactiveOnlyModeSuppresses() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setReactiveCompactEnabled(true);
         auto.setReactiveOnlyMode(true);
 
@@ -484,7 +484,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("REACTIVE_COMPACT 抑制门: feature=true 但 tengu=false → 不抑制（autoCompact.ts:196 缺省）")
     void reactiveFeatureWithoutGrowthbookDoesNotSuppress() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setReactiveCompactEnabled(true);
         // tengu_cobalt_raccoon 缺省 false → growthbook 未配置时自动压缩仍活跃
         assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
@@ -493,7 +493,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("REACTIVE_COMPACT 抑制门: tengu=true 但 feature=false → 不抑制（feature 门控）")
     void growthbookWithoutFeatureDoesNotSuppress() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setReactiveOnlyMode(true);
         // REACTIVE_COMPACT feature 关闭 → 抑制不生效
         assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
@@ -502,7 +502,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("CONTEXT_COLLAPSE 抑制门: feature + isContextCollapseEnabled 双 true → false（autoCompact.ts:215-223）")
     void contextCollapseModeSuppresses() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setContextCollapseEnabled(true);
         auto.setContextCollapseModeEnabled(true);
 
@@ -513,7 +513,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("CONTEXT_COLLAPSE 抑制门: feature=true 但 isContextCollapseEnabled=false → 不抑制")
     void contextCollapseFeatureWithoutRuntimeDoesNotSuppress() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setContextCollapseEnabled(true);
         // isContextCollapseEnabled()=false → collapse 未运行时自动压缩仍活跃
         assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
@@ -522,7 +522,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("CONTEXT_COLLAPSE 抑制门: isContextCollapseEnabled=true 但 feature=false → 不抑制")
     void contextCollapseRuntimeWithoutFeatureDoesNotSuppress() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("summary", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setContextCollapseModeEnabled(true);
         // CONTEXT_COLLAPSE feature 关闭 → 抑制不生效
         assertThat(auto.shouldAutoCompact(largeMessages(50), null, "user", 0)).isTrue();
@@ -534,7 +534,7 @@ class AutoCompactorCcContractTest {
         // 双门开启 → autoCompactIfNeeded 返回 wasCompacted=false（不触发 L4 摘要回调）
         AtomicInteger summarizeCalls = new AtomicInteger();
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> { summarizeCalls.incrementAndGet();
+            (p, m, ctx) -> { summarizeCalls.incrementAndGet();
                 return new CompactConversation.SummaryResult("<summary>no-op</summary>", null); });
         auto.setReactiveCompactEnabled(true);
         auto.setReactiveOnlyMode(true);
@@ -553,7 +553,7 @@ class AutoCompactorCcContractTest {
     @DisplayName("L4 legacy 成功链: setLastSummarizedMessageId(null) + runPostCompactCleanup + 复位 0（autoCompact.ts:325-326）")
     void l4LegacySuccessChain() {
         AtomicInteger cleanupCalls = new AtomicInteger();
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setRunPostCompactCleanup(cleanupCalls::incrementAndGet);
         // 预置旧 lastSummarizedMessageId → L4 成功后应复位（autoCompact.ts:325 注释：legacy compaction
         // 替换全部消息，旧 message UUID 在新 messages 数组中已不存在）
@@ -573,7 +573,7 @@ class AutoCompactorCcContractTest {
     @Test
     @DisplayName("recompactionInfo 输入源: 成功复位后 tracking 轮换 turnId + 归零 turnCounter（query.ts:521-526，IMP2-07）")
     void recompactionInfoInputsAfterSuccess() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         // 预置 previousCompact 状态（isRecompactionInChain ← tracking.compacted，autoCompact.ts:280）
         auto.getTracking().markCompacted();
         auto.getTracking().startNewTurn();
@@ -706,7 +706,7 @@ class AutoCompactorCcContractTest {
         });
         // 消息 token 数 = 100_000：在 small-model 阈值（≤37k）之上、big-model 阈值（≥167k）之下，
         // 两判定必然相反（reserved 减法 ≤20k 不影响区间分离）。
-        AutoCompactor auto = new AutoCompactor(msgs -> 100_000, (p, m) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 100_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
         auto.setThresholdSystem(ts);
         List<ChatMessageDto> msgs = largeMessages(50);
 
@@ -753,7 +753,7 @@ class AutoCompactorCcContractTest {
         //（null）时 must 不 NPE、回落默认窗（CC context.ts:9 MODEL_CONTEXT_WINDOW_DEFAULT 200k，
         // AutoCompactor 默认 thresholdSystem 未注入 resolver → null 模型走 200k 默认），
         // 与既有 tryAutoCompact（ccContext=null）路径语义一致。
-        AutoCompactor auto = new AutoCompactor(msgs -> 10_000, (p, m) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
+        AutoCompactor auto = new AutoCompactor(msgs -> 10_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
 
         AutoCompactor.AutoCompactResult r = auto.autoCompactIfNeeded(
             largeMessages(20), 0, "user", new CompactConversationContext());
@@ -782,7 +782,7 @@ class AutoCompactorCcContractTest {
         CompactThresholdSystem ts = new CompactThresholdSystem(null);
         ts.setModelContextWindowResolver(model -> "small-model".equals(model) ? 50_000 : 200_000);
         AutoCompactor auto = new AutoCompactor(msgs -> 100_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>no-op</summary>", null));
         auto.setThresholdSystem(ts);
         List<ChatMessageDto> msgs = largeMessages(50);
 

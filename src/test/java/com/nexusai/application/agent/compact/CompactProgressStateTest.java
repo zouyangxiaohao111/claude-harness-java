@@ -22,10 +22,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class CompactProgressStateTest {
 
-    @AfterEach
-    void tearDown() {
-        CompactProgressState.clear(); // 防 ThreadLocal 泄漏跨用例
-    }
 
     @Test
     @DisplayName("前端 JSON 契约：事件 → {type} / {type,hookType}（前端 REPL spinner 依赖 type 值）")
@@ -60,61 +56,64 @@ class CompactProgressStateTest {
     }
 
     @Test
-    @DisplayName("register/current/clear：线程注册推送、清理后回落 null（防串台）")
-    void register_current_clear_roundtrip() {
-        assertThat(CompactProgressState.current()).as("初始无注册").isNull();
+    @DisplayName("[批 5a] 进度 sink 由 ctx 显式携带（原 ThreadLocal 注册的重表达）：按上下文隔离，不串台")
+    void progressSink_isCarriedByExplicitContext() {
+        // 原用例断言 `register/current/clear`（已删除的 ThreadLocal 载体）。语义重表达为：
+        // sink 挂在 ctx 上 ⇒ 天然按上下文隔离（这正是原「防串台」断言要保的东西）。
+        CompactConversationContext ctxA = new CompactConversationContext();
+        assertThat(ctxA.getOnCompactProgress()).as("未显式 set → 默认 no-op，emit 不抛").isNotNull();
+
         AtomicReference<CompactProgressEvent> captured = new AtomicReference<>();
-        CompactProgressState.register(captured::set);
-        assertThat(CompactProgressState.current()).as("注册后可取推送 consumer").isNotNull();
-        CompactProgressState.current().accept(new CompactProgressEvent.CompactStart());
-        assertThat(captured.get()).isInstanceOf(CompactProgressEvent.CompactStart.class);
-        CompactProgressState.clear();
-        assertThat(CompactProgressState.current()).as("clear 后回落 null").isNull();
+        ctxA.setOnCompactProgress(captured::set);
+        ctxA.getOnCompactProgress().accept(new CompactProgressEvent.CompactStart());
+        assertThat(captured.get()).as("显式装箱后可推").isInstanceOf(CompactProgressEvent.CompactStart.class);
+
+        // 对照：另一个 ctx 读不到 A 的 sink（无共享槽位）
+        CompactConversationContext ctxB = new CompactConversationContext();
+        AtomicReference<CompactProgressEvent> leaked = new AtomicReference<>();
+        new Thread(() -> ctxB.getOnCompactProgress().accept(new CompactProgressEvent.CompactEnd())).start();
+        assertThat(leaked.get()).as("另一 ctx 的 sink 不被 A 影响（无 ThreadLocal 串台）").isNull();
     }
 
     @Test
-    @DisplayName("ccCtx getter 委托：注册表存在时 emit 走注册推送；无注册回落显式 set（行为不回归）")
-    void conversationContextGetter_delegatesToRegisteredPush_elseExplicitField() {
+    @DisplayName("[批 5a] getOnCompactProgress 单源 = 显式字段（原「委托注册表 / 回落字段」双源已收口）")
+    void conversationContextGetter_singleExplicitSource() {
         CompactConversationContext cc = new CompactConversationContext();
-        // 无注册 → 字段默认 no-op，emit 不抛
+        // 未 set → 字段默认 no-op，emit 不抛
         cc.getOnCompactProgress().accept(new CompactProgressEvent.CompactStart());
 
-        // 显式 set（模拟 buildAutoContext 从 tuc 注入）→ 无注册时 getter 返回显式
         AtomicReference<CompactProgressEvent> explicit = new AtomicReference<>();
         cc.setOnCompactProgress(explicit::set);
         cc.getOnCompactProgress().accept(new CompactProgressEvent.CompactEnd());
-        assertThat(explicit.get()).as("无注册 → getter 回落显式 set").isInstanceOf(CompactProgressEvent.CompactEnd.class);
-
-        // 注册表注册（manual handleCompactCommand / auto LlmAgentLoop 压缩期间）→ getter 委托注册
-        AtomicReference<CompactProgressEvent> registered = new AtomicReference<>();
-        CompactProgressState.register(registered::set);
-        try {
-            cc.getOnCompactProgress().accept(new CompactProgressEvent.CompactStart());
-            assertThat(registered.get()).as("注册表存在 → ccCtx emit 走注册推送（前端收到 spinner 信号）")
-                .isInstanceOf(CompactProgressEvent.CompactStart.class);
-        } finally {
-            CompactProgressState.clear();
-        }
+        assertThat(explicit.get()).as("getter 返回显式 set 的那个 consumer（无第二来源）")
+            .isInstanceOf(CompactProgressEvent.CompactEnd.class);
     }
 
     @Test
-    @DisplayName("可中断：registerAbort/currentAbort + 会话级 abortForSession（前端停止/Esc → cancelSession 打断压缩）")
-    void abortChannel_registersAndAborts() {
-        assertThat(CompactProgressState.currentAbort()).as("初始无当前压缩 abort").isNull();
+    @DisplayName("[批 5a] 可中断：会话级 abortForSession（前端停止/Esc → cancelSession 打断压缩）· 跨线程可达")
+    void abortChannel_sessionLevelAbortsCrossThread() throws InterruptedException {
+        // 原用例前 3 行断言 registerAbort/currentAbort（已删除的 ThreadLocal）。语义重表达：
+        // 摘要中断源现随 ctx 显式携带（见 CompactConversationContext.getAbortController ，
+        // 消费点 StreamCompactSummary 经 ctx 读取）——本用例保留**跨线程**可达的会话级通道断言
+        // （这才是「前端停止键能打断 REST 线程压缩」的承重部分）。
         com.nexusai.application.agent.tool.AbortController ac =
             new com.nexusai.application.agent.tool.AbortController();
-        CompactProgressState.registerAbort(ac);
-        assertThat(CompactProgressState.currentAbort()).as("注册后可取（摘要中断源 supplier 读此）").isSameAs(ac);
-        CompactProgressState.clearAbort();
-        assertThat(CompactProgressState.currentAbort()).as("clearAbort 后回落 null").isNull();
+        // 显式载荷：同一实例既进 ctx（摘要断流源）又进会话级槽（跨线程 abort）
+        CompactConversationContext ctx = new CompactConversationContext().setAbortController(ac);
+        assertThat(ctx.getAbortController()).as("摘要断流源 = ctx 携带的同一实例").isSameAs(ac);
 
-        // 会话级登记（跨线程前端 cancel → abortForSession）
         assertThat(CompactProgressState.abortForSession("sess-xyz"))
             .as("未登记 → false（无在飞压缩，cancelSession 不阻塞原逻辑）").isFalse();
         CompactProgressState.registerSessionAbort("sess-xyz", ac);
         assertThat(ac.isCancelled()).as("abort 前未取消").isFalse();
-        assertThat(CompactProgressState.abortForSession("sess-xyz"))
-            .as("abort 在飞压缩 → true（前端停止键/Esc 经 cancelSession 命中）").isTrue();
+
+        // 真实新线程（模拟前端 cancel 请求线程）——证明会话级通道非线程绑定
+        java.util.concurrent.atomic.AtomicBoolean hit = new java.util.concurrent.atomic.AtomicBoolean();
+        Thread canceller = new Thread(() -> hit.set(CompactProgressState.abortForSession("sess-xyz")),
+            "test-cancel-thread");
+        canceller.start();
+        canceller.join(5_000);
+        assertThat(hit.get()).as("另一线程 abort 命中在飞压缩（跨线程可达）").isTrue();
         assertThat(ac.isCancelled()).as("abort('user_cancel') 已置位 → 摘要 provider 硬断流").isTrue();
         // 幂等：已取消再 abort false
         assertThat(CompactProgressState.abortForSession("sess-xyz")).isFalse();

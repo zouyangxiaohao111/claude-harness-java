@@ -76,10 +76,14 @@ public class AutoCompactor {
          *
          * @param prompt   压缩提示词（来自 {@link CompactPrompt#buildCompactPrompt()}）
          * @param messages 待压缩的消息列表（用于 LLM 上下文）
+         * @param ctx      压缩上下文（[批 5a] 显式载体：CC {@code compactConversation(…, context,
+         *                 cacheSafeParams, …)} 的 context/cacheSafeParams 对应物 compact.ts:414）
+         *                 —— abortController / fork 缓存共享参数 / 进度 sink 经此读取
          * @return 含 usage 的摘要结果（text 含 &lt;analysis&gt; + &lt;summary&gt;；usage 非 null，可零值）
          * @throws Exception LLM 调用失败
          */
-        CompactConversation.SummaryResult summarize(String prompt, List<ChatMessageDto> messages) throws Exception;
+        CompactConversation.SummaryResult summarize(String prompt, List<ChatMessageDto> messages,
+                                                    CompactConversationContext ctx) throws Exception;
     }
 
     /** Token 计数器 */
@@ -1075,7 +1079,8 @@ public class AutoCompactor {
                 try {
                     // [IMP-CM-14 F02] 直接透传回调返回的 SummaryResult（text + usage）——
                     //   旧实现丢弃 usage 改包 new SummaryResult(text, null) 是 f4/f5 metrics 恒 null 根因
-                    return compactCallback.summarize(compactPrompt, messagesToSummarize);
+                    // [批 5a] ctx 显式下传（原经 ThreadLocal 隐式通道）
+                    return compactCallback.summarize(compactPrompt, messagesToSummarize, ctx);
                 } catch (Exception e) {
                     throw e instanceof RuntimeException re ? re : new RuntimeException(e);
                 }

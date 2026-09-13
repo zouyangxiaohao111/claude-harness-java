@@ -3,7 +3,6 @@ package com.nexusai.application.agent.config;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.compact.CompactWarningState;
 import com.nexusai.application.agent.compact.PostCompactionState;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -69,7 +68,6 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
-        CacheSafeParamsHolder.clear();
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {

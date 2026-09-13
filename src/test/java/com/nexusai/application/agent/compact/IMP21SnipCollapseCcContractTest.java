@@ -96,7 +96,7 @@ class IMP21SnipCollapseCcContractTest {
     @DisplayName("INV-9: shouldAutoCompact 减法 tokenCount − snipTokensFreed（autoCompact.ts:225）")
     void inv9ShouldAutoCompactSubtractsSnipTokensFreed() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         // 无 snip: tokenCount=200_000 ≥ 阈值 → 需压缩
@@ -110,7 +110,7 @@ class IMP21SnipCollapseCcContractTest {
     void inv9TryAutoCompactForwardsSnipTokensFreed() {
         AtomicInteger llmCalls = new AtomicInteger();
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> { llmCalls.incrementAndGet();
+            (p, m, ctx) -> { llmCalls.incrementAndGet();
                 return new CompactConversation.SummaryResult("<summary>ok</summary>", null); });
 
         // snip 已释放足量 token → shouldAutoCompact false → 不触发 L4 LLM 摘要
@@ -120,7 +120,7 @@ class IMP21SnipCollapseCcContractTest {
 
         // 无 snip 透传 → 应触发压缩路径
         AutoCompactor auto2 = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>valid summary</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>valid summary</summary>", null));
         assertThat(auto2.tryAutoCompact(largeMessages(50), 0).wasCompacted()).isTrue();
     }
 

@@ -90,7 +90,7 @@ class PtlRecoveryIntegrationTest {
         // 保 reactive compact 成功路径覆盖（60 条 → tail_start=55，摘要 1 + 尾部 5 = 6 条 < 60）。
         ReactiveCompactor rc = new ReactiveCompactor(
             new TokenEstimator()::estimateMessageTokens,
-            (prompt, msgs) -> new CompactConversation.SummaryResult("reactive summary stub", null));
+            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("reactive summary stub", null));
         rc.setEnabled(true);
         // AgentLoopContext · 位置与 TestContexts.agentLoopContext 同构（feature 三件套，GR-3 后无压缩组件位）
         return new AgentLoopContext(

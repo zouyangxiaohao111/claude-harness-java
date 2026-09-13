@@ -83,7 +83,7 @@ class AutoCompactTrackingStateTest {
         //   压缩 → 撞 blocking-limit / provider 413 → 触发 reactive compact → 正是历史
         //   「反复 autoCompact / 上下文失控」事故的判据根因面。
         AutoCompactor auto = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> { throw new RuntimeException("session-A boom"); });
+            (p, m, ctx) -> { throw new RuntimeException("session-A boom"); });
         AutoCompactTrackingState sessionA = new AutoCompactTrackingState();
         AutoCompactTrackingState sessionB = new AutoCompactTrackingState();
 
@@ -127,7 +127,7 @@ class AutoCompactTrackingStateTest {
         //   生产路径 ①不写、②不读 实例字段。
         // ① 不写：失败计数落调用方传入的对象，不落实例字段。
         AutoCompactor auto = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> { throw new RuntimeException("boom"); });
+            (p, m, ctx) -> { throw new RuntimeException("boom"); });
         AutoCompactTrackingState perQuery = new AutoCompactTrackingState();
 
         callLikeLlmAgentLoop(auto, largeMessages(50), perQuery);
@@ -144,7 +144,7 @@ class AutoCompactTrackingStateTest {
         //    本会话首判就会被短路（wasCompacted=false）；正确实现下本会话 tracking 干净 → 正常压缩。
         //    这正是历史事故里"B 会话被 A 的熔断拖住、上下文不再被压缩"的直接复现。
         AutoCompactor other = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>clean-session</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>clean-session</summary>", null));
         other.getTracking().setConsecutiveFailures(3);   // 模拟另一会话遗留的熔断态（旧实现的串台载体）
         assertThat(other.getTracking().isCircuitBreakerOpen()).isTrue();
 
@@ -174,7 +174,7 @@ class AutoCompactTrackingStateTest {
         //   本测试用「消息数 × 10k」的真实计数桩复现该链路：压缩一次后把结果作为新消息链再判，
         //   必须"不再压"；若压缩结果没有回流（wasCompacted=true 却返回原消息链），第二次必然又压 → 红。
         AutoCompactor auto = new AutoCompactor(msgs -> msgs.size() * 10_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>one-shot</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>one-shot</summary>", null));
         AutoCompactTrackingState tracking = new AutoCompactTrackingState();
         List<ChatMessageDto> beforeIteration = largeMessages(50);
 
@@ -242,7 +242,7 @@ class AutoCompactTrackingStateTest {
         //   实例字段 + run 入口 reset() 模拟该语义：单会话串行"看起来"对，但那是共享状态上的时序
         //   补丁（并发会话互相清零）。本测试锁"每个 query() 一个对象"。
         AutoCompactor auto = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> { throw new RuntimeException("query-1 boom"); });
+            (p, m, ctx) -> { throw new RuntimeException("query-1 boom"); });
 
         // query 1：3 次失败 → 熔断（同一单例实例上的第 1 段 query）
         AutoCompactTrackingState query1 = new AutoCompactTrackingState();
@@ -306,7 +306,7 @@ class AutoCompactTrackingStateTest {
         //   熔断计数 0 / turnCounter 0），不会把上一段生命周期的判据带进新段。Java 等价物 = 新建
         //   AutoCompactTrackingState（LlmAgentLoop 在 reactive 成功分支执行）。本测试锁该对象的语义。
         AutoCompactor auto = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> { throw new RuntimeException("boom"); });
+            (p, m, ctx) -> { throw new RuntimeException("boom"); });
         AutoCompactTrackingState session = new AutoCompactTrackingState();
         for (int i = 0; i < 3; i++) {
             callLikeLlmAgentLoop(auto, largeMessages(50), session);
@@ -324,7 +324,7 @@ class AutoCompactTrackingStateTest {
 
         // 复位后：真正的压缩能执行（不被上一段熔断短路）
         AutoCompactor ok = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>after-reactive</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>after-reactive</summary>", null));
         assertThat(callLikeLlmAgentLoop(ok, largeMessages(50), session).wasCompacted())
             .as("复位后压缩尝试必须真正执行（熔断计数已归零 · CC :1442 语义）")
             .isTrue();

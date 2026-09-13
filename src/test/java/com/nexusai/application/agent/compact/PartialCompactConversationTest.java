@@ -7,7 +7,6 @@ import com.nexusai.application.agent.compact.CompactBoundaryMessage.CompactMetad
 import com.nexusai.application.agent.compact.CompactBoundaryMessage.CompactMetadata.PreservedSegment;
 import com.nexusai.application.agent.compact.CompactProgressEvent.HooksStart;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.GitStatusProvider;
 import com.nexusai.application.agent.prompt.SystemPrompt;
@@ -371,9 +370,11 @@ class PartialCompactConversationTest {
         List<List<String>> forkPrefixesPerCall = new ArrayList<>();
         List<List<String>> sentMessagesPerCall = new ArrayList<>();
         List<String> forkProjectRootsPerCall = new ArrayList<>();   // [TL-W1b P1]
+        // [批 5a] 自引用：lambda 内读 live ctx（fork 载荷现挂在 ctx 上，不再是 CacheSafeParamsHolder 槽位）
+        java.util.concurrent.atomic.AtomicReference<CompactConversationContext> ccRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
         CompactConversationContext c = ctx((messages, prompt, preTokens) -> {
-            // summaryProducer 即 StreamCompactSummary fork 读侧（cacheSafeParamsSupplier=Holder.get()）
-            CacheSafeParams cs = CacheSafeParamsHolder.get();
+            CacheSafeParams cs = ccRef.get().getCacheSafeParams();
             forkPrefixesPerCall.add(cs == null
                 ? List.of()
                 : cs.forkContextMessages().stream().map(ChatMessageDto::id).toList());
@@ -385,6 +386,7 @@ class PartialCompactConversationTest {
             }
             return okSummary();
         }, new ArrayList<>());
+        ccRef.set(c);
         c.setToolUseContext(tuc);
         c.setSysPromptCtxProvider(sysCtx);
         c.setDefaultSysPromptAssemble(defaultAssemble);
@@ -413,7 +415,8 @@ class PartialCompactConversationTest {
             .as("PTL retry re-save 必须逐字段保留会话 projectRoot（会话线程按 sessionId 解析产物）")
             .containsExactly(W1B_PROJECT_ROOT, W1B_PROJECT_ROOT);
         // 压缩后槽位清空（finally clear）
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位（原 Holder 清空断言的重表达）").isNull();
     }
 
     @Test
@@ -634,11 +637,14 @@ class PartialCompactConversationTest {
                 }
             });
         AtomicReference<CacheSafeParams> seenDuringSummarize = new AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<CompactConversationContext> ccRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
         CompactConversationContext c = ctx((messages, prompt, preTokens) -> {
-            // summaryProducer 即 StreamCompactSummary fork 读侧（cacheSafeParamsSupplier=Holder.get()）
-            seenDuringSummarize.set(CacheSafeParamsHolder.get());
+            seenDuringSummarize.set(ccRef.get().getCacheSafeParams());
             return okSummary();
         }, new ArrayList<>());
+        ccRef.set(c);
+        ccRef.set(c);
         c.setToolUseContext(tuc);
         c.setSysPromptCtxProvider(sysCtx);
         c.setDefaultSysPromptAssemble(defaultAssemble);
@@ -664,7 +670,8 @@ class PartialCompactConversationTest {
         assertThat(cs.forkContextMessages()).extracting(ChatMessageDto::id).containsExactly("u0", "a0");
         assertThat(cs.useGlobalCacheScope()).isFalse();
         // 压缩后槽位清空（finally clear，防串台/泄漏到下一流程）
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位（原 Holder 清空断言的重表达）").isNull();
     }
 
     @Test
@@ -691,10 +698,14 @@ class PartialCompactConversationTest {
                 }
             });
         AtomicReference<CacheSafeParams> seenDuringSummarize = new AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<CompactConversationContext> ccRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
         CompactConversationContext c = ctx((messages, prompt, preTokens) -> {
-            seenDuringSummarize.set(CacheSafeParamsHolder.get());
+            seenDuringSummarize.set(ccRef.get().getCacheSafeParams());
             return okSummary();
         }, new ArrayList<>());
+        ccRef.set(c);
+        ccRef.set(c);
         c.setToolUseContext(tuc);
         c.setSysPromptCtxProvider(sysCtx);
         c.setCustomSystemPrompt("CUSTOM-PROMPT");
@@ -709,7 +720,8 @@ class PartialCompactConversationTest {
         assertThat(cs).isNotNull();
         // from: forkContextMessages = apiMessages = 全量 allMessages（compact.ts:852-858 tail 不缓存）
         assertThat(cs.forkContextMessages()).extracting(ChatMessageDto::id).containsExactly("u0", "a0", "u1");
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位（原 Holder 清空断言的重表达）").isNull();
     }
 
     @Test
@@ -717,10 +729,14 @@ class PartialCompactConversationTest {
     void missingIngredientsSkipsCacheSharingWithoutBlocking() {
         // 无 ToolUseContext/sysPromptCtxProvider（生产 REST 线程未接线时的既有行为）
         AtomicReference<CacheSafeParams> seenDuringSummarize = new AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<CompactConversationContext> ccRef =
+            new java.util.concurrent.atomic.AtomicReference<>();
         CompactConversationContext c = ctx((messages, prompt, preTokens) -> {
-            seenDuringSummarize.set(CacheSafeParamsHolder.get());
+            seenDuringSummarize.set(ccRef.get().getCacheSafeParams());
             return okSummary();
         }, new ArrayList<>());
+        ccRef.set(c);
+        ccRef.set(c);
 
         List<ChatMessageDto> all = List.of(
             msg("u0", Role.user, "early 0"),
@@ -732,7 +748,8 @@ class PartialCompactConversationTest {
         // 摘要期间槽位空（fork 跳过，走流式 fallback）——缓存共享为优化项，不阻断压缩
         assertThat(seenDuringSummarize.get()).isNull();
         assertThat(result.summaryMessages()).isNotEmpty();
-        assertThat(CacheSafeParamsHolder.get()).isNull();
+        assertThat(new CompactConversationContext().getCacheSafeParams())
+            .as("无进程级槽位（原 Holder 清空断言的重表达）").isNull();
     }
 
     // ════════════════════════════════════════════════════════════════════

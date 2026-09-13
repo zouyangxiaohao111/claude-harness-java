@@ -94,7 +94,7 @@ class LlmAgentLoopReactiveCarryoverTest {
         FeatureFlags flags = new FeatureFlags(true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
         ReactiveCompactor rc = new ReactiveCompactor(
             new TokenEstimator()::estimateMessageTokens,
-            (prompt, msgs) -> new CompactConversation.SummaryResult("reactive summary stub", null));
+            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("reactive summary stub", null));
         rc.setEnabled(true);
         // [MR-T05] 融合后 AgentLoopContext record = 34 组件（DEL-14 删 commandQueue 后下标 −1，
         //   WF-3 sdkEventQueue 收尾 pos34）· 逐位对齐工作区已解 record（AgentLoopContext.java:125-171）

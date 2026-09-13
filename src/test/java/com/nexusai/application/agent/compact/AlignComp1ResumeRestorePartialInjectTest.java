@@ -280,7 +280,7 @@ class AlignComp1ResumeRestorePartialInjectTest {
             when(messageService.appendPostCompactMessages(anyString(), anyList()))
                 .thenAnswer(inv -> inv.getArgument(1));
             // [IMP-CM-14 F02] summarize 返回 SummaryResult（text + usage）
-            when(summary.summarize(anyString(), anyList()))
+            when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
                 .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
             PartialCompactService svc = new PartialCompactService(
                 messageService, sessionService, summary, registry, null, null);

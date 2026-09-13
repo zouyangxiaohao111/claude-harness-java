@@ -1,5 +1,6 @@
 package com.nexusai.application.agent;
 
+import com.nexusai.application.agent.compact.CompactConversationContext;
 import com.nexusai.application.agent.compact.AutoCompactor;
 import com.nexusai.application.agent.compact.CompactConversation;
 import com.nexusai.application.agent.compact.CompactProgressState;
@@ -224,7 +225,7 @@ class LlmAgentLoopAutoCompactAbortTest {
         AtomicBoolean summarizeRan = new AtomicBoolean(false);
         AutoCompactor autoCompactor = new AutoCompactor(
             msgs -> 2_000_000,
-            (prompt, messages) -> {
+            (prompt, messages, ctx) -> {
                 summarizeRan.set(true);
                 return new CompactConversation.SummaryResult(
                     "<summary>ok</summary>", compactionUsage());
@@ -241,10 +242,12 @@ class LlmAgentLoopAutoCompactAbortTest {
         assertThat(summarizeRan.get())
             .as("前置：auto 压缩必须真的跑过（否则下面两条断言对「没注册过」也成立 = 空断言）")
             .isTrue();
-        assertThat(CompactProgressState.currentAbort())
-            .as("finally 的 clearAbort 必须把当前压缩 abort 源出栈：残留会让后续 StreamCompactSummary"
-                + " 读到<b>上一次</b>压缩的控制器（跨 turn 串台）")
-            .isNull();
+        // [批 5a] 重表达：原断言「finally clearAbort 把 ThreadLocal abort 源出栈」——载体已删。
+        //   新语义 = 断流源随本次压缩的 ctx 产生/回收：新建 ctx 恒拿到与新实例无关的默认值，
+        //   上一次压缩的控制器不可能被读到（跨 turn 串台的成因随载体一并消失）。
+        assertThat(new CompactConversationContext().getAbortController())
+            .as("新压缩的 ctx 不携带上一次压缩的控制器（原 ThreadLocal 残留断言的重表达）")
+            .isNotSameAs(runAbort);
         assertThat(CompactProgressState.abortForSession(SESSION_FINISHED))
             .as("finally 的 removeSessionAbort 必须移除会话槽位：runAbort 此处<b>未被取消</b>，"
                 + "残留 → 本断言返回 true（前端之后按 Esc 会去 abort 一个已经结束的压缩，"
@@ -269,11 +272,11 @@ class LlmAgentLoopAutoCompactAbortTest {
         return new AutoCompactor(
             // 恒越阈值（对任意窗口解析结果都触发；同 CompactSessionCostWiringTest 口径）
             msgs -> 2_000_000,
-            (prompt, messages) -> {
-                abortRead.set(CompactProgressState.currentAbort());
+            (prompt, messages, ctx) -> {
+                abortRead.set(ctx.getAbortController());
                 inside.countDown();
                 release.await(AWAIT_SECONDS, TimeUnit.SECONDS);
-                AbortController ac = CompactProgressState.currentAbort();
+                AbortController ac = ctx.getAbortController();
                 sawCancelled.set(ac != null && ac.isCancelled());
                 return new CompactConversation.SummaryResult(
                     "<summary>ok</summary>", compactionUsage());

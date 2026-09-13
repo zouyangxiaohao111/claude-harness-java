@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.compact.CompactProgressEvent.HooksStart;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
@@ -417,7 +416,6 @@ class CompactConversationTest {
         CacheSafeParams initial = new CacheSafeParams(
             List.of("sys"), Map.of(), Map.of(), baseToolUseContext(), new ArrayList<>(messages),
             false, "C:/proj/w1b-ptl");
-        CacheSafeParamsHolder.save(initial);
         try {
             AtomicInteger calls = new AtomicInteger();
             AtomicReference<List<ChatMessageDto>> lastSummarized = new AtomicReference<>();
@@ -430,7 +428,10 @@ class CompactConversationTest {
                 return new CompactConversation.SummaryResult(
                     "valid summary", new CompactConversation.TokenUsage(10, 5, 0, 0));
             };
-            CompactConversation.compactConversation(messages, ctx(producer, new ArrayList<>()), true, null, false, null);
+            // [批 5a] 显式载体：fork 参数挂在 CompactConversationContext 上（原 CacheSafeParamsHolder 槽位已删）
+            CompactConversationContext ccCtx = ctx(producer, new ArrayList<>());
+            ccCtx.setCacheSafeParams(initial);
+            CompactConversation.compactConversation(messages, ccCtx, true, null, false, null);
 
             // 重试轮 summarize 收到截断后消息（PTL 截断生效）
             assertThat(lastSummarized.get()).as("第二次 summarize 必须收到截断集").isNotNull();
@@ -445,11 +446,11 @@ class CompactConversationTest {
             assertThat(lastSummarized.get().get(0).content())
                 .as("截断集首条为 PTL_RETRY_MARKER（group 0 被丢且首条为 assistant → 前置合成标记）")
                 .isEqualTo(CompactConstants.PTL_RETRY_MARKER);
-            // △-3 RED teeth：holder forkContextMessages 必须 re-save 为该轮实际摘要消息
+            // △-3 RED teeth：ctx 载荷 forkContextMessages 必须 re-write 为该轮实际摘要消息
             //（CC compact.ts:487-490 retryCacheSafeParams.forkContextMessages = truncated；
             //  旧实现不更新 → holder 仍为压缩前全量 → fork 重试轮缓存前缀偏移）
-            CacheSafeParams updated = CacheSafeParamsHolder.get();
-            assertThat(updated).as("holder 槽位必须仍在（压缩期间不清空）").isNotNull();
+            CacheSafeParams updated = ccCtx.getCacheSafeParams();
+            assertThat(updated).as("ctx 载荷必须仍在（压缩期间不清空）").isNotNull();
             assertThat(updated.forkContextMessages())
                 .as("PTL 重试后 fork 前缀必须 re-save 为截断集（对齐 CC compact.ts:487-490）")
                 .isEqualTo(lastSummarized.get());
@@ -460,7 +461,6 @@ class CompactConversationTest {
                 .as("PTL 重试 re-save 必须逐字段保留 projectRoot（会话态载具，不参与 cache key）")
                 .isEqualTo("C:/proj/w1b-ptl");
         } finally {
-            CacheSafeParamsHolder.clear();
         }
     }
 

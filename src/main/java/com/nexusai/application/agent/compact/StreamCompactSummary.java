@@ -144,11 +144,18 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
 
     /** fork cache-safe 前缀（CC CacheSafeParams 5 字段：systemPrompt/userContext/systemContext/
      *  toolUseContext/forkContextMessages · forkedAgent.ts:57-68；null → 跳过 fork 路径）。
-     *  [IMP-SP-08 DEL-SP-26] 由嵌套 3 字段 record 改引 CC 对齐的 fork.CacheSafeParams（消除双 record 漂移）。 */
-    private final Supplier<CacheSafeParams> cacheSafeParamsSupplier;
+     *  [IMP-SP-08 DEL-SP-26] 由嵌套 3 字段 record 改引 CC 对齐的 fork.CacheSafeParams（消除双 record 漂移）。
+     *  [批 5a] 原为 {@code Supplier<CacheSafeParams>} 字段（读 {@code CacheSafeParamsHolder} 的
+     *  ThreadLocal 槽位 = 进程内隐式通道）；CC 在同处是<b>显式函数参数</b>
+     *  （{@code compactConversation(…, cacheSafeParams, …)} compact.ts:414 /
+     *  {@code streamCompactSummary({… cacheSafeParams})} compact.ts:1176/:1183）⇒ 改为经
+     *  {@code summarize(…, ctx)} 传入的 {@link CompactConversationContext#getCacheSafeParams()} 显式携带。 */
 
-    /** abortController（对齐 CC context.abortController.signal；null → NOOP） */
-    private final Supplier<AbortController> abortControllerSupplier;
+    /** abortController（对齐 CC context.abortController.signal）。
+     *  [批 5a] 原为 {@code Supplier<AbortController>} 字段（读 {@code CompactProgressState.currentAbort()}
+     *  的 ThreadLocal = 进程内隐式通道）；CC 取的是 {@code context.abortController}
+     *  （compact.ts:418 pre-hooks / :1347 摘要流式请求）⇒ 改为经 {@code summarize(…, ctx)} 传入的
+     *  {@link CompactConversationContext#getAbortController()} 显式携带。 */
 
     /** keepalive 信号（对齐 CC sendSessionActivitySignal） */
     private final Supplier<Runnable> sessionActivitySignalSupplier;
@@ -289,8 +296,6 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      * @param providerSupplier             provider 解析
      * @param modelSupplier                model 解析
      * @param configSupplier               provider 配置解析
-     * @param cacheSafeParamsSupplier      fork cache-safe 前缀（null → 跳过 fork 路径）
-     * @param abortControllerSupplier      abortController（null → NOOP）
      * @param sessionActivitySignalSupplier keepalive 信号（可 null）
      * @param keepaliveExecutor            keepalive 调度器（null → 不启动 keepalive）
      * @param sessionActivityTrackingActive 会话活动跟踪是否激活
@@ -304,8 +309,6 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             Supplier<LlmProvider> providerSupplier,
             Supplier<String> modelSupplier,
             Supplier<ProviderConfig> configSupplier,
-            Supplier<CacheSafeParams> cacheSafeParamsSupplier,
-            Supplier<AbortController> abortControllerSupplier,
             Supplier<Runnable> sessionActivitySignalSupplier,
             ScheduledExecutorService keepaliveExecutor,
             boolean sessionActivityTrackingActive,
@@ -317,8 +320,6 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
         this.providerSupplier = providerSupplier;
         this.modelSupplier = modelSupplier;
         this.configSupplier = configSupplier;
-        this.cacheSafeParamsSupplier = cacheSafeParamsSupplier;
-        this.abortControllerSupplier = abortControllerSupplier;
         this.sessionActivitySignalSupplier = sessionActivitySignalSupplier;
         this.keepaliveExecutor = keepaliveExecutor;
         this.sessionActivityTrackingActive = sessionActivityTrackingActive;
@@ -341,7 +342,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             Supplier<String> modelSupplier,
             Supplier<ProviderConfig> configSupplier) {
         this(providerSupplier, modelSupplier, configSupplier,
-            null, null, null, null, false, true, false,
+            null, null, false, true, false,
             null, null, null);
     }
 
@@ -391,14 +392,19 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      *         可零值但非 null · CC getTokenUsage 对真实 assistant 响应恒返回 usage）
      */
     @Override
-    public CompactConversation.SummaryResult summarize(String prompt, List<ChatMessageDto> messages) {
+    public CompactConversation.SummaryResult summarize(String prompt, List<ChatMessageDto> messages,
+                                                       CompactConversationContext ctx) {
+        if (ctx == null) {
+            throw new IllegalArgumentException(
+                "StreamCompactSummary.summarize: ctx required（CC compact.ts:414 context/cacheSafeParams 显式参数）");
+        }
         String model = modelSupplier.get();
         ProviderConfig config = configSupplier.get();
         LlmProvider provider = providerSupplier.get();
         int preCompactTokenCount = estimateTokens(messages);
         try {
             CompactConversation.SummaryResult summary =
-                streamCompactSummary(messages, prompt, preCompactTokenCount, model, provider, config);
+                streamCompactSummary(messages, prompt, preCompactTokenCount, model, provider, config, ctx);
             if (log.isInfoEnabled()) {
                 log.info("[StreamCompactSummary] L4 摘要生产成功: preTokens={} summaryChars={} usage={} model={}",
                     preCompactTokenCount, summary == null ? 0 : summary.text().length(),
@@ -441,6 +447,9 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      * @param model             当前模型（CC context.options.mainLoopModel）
      * @param provider          LLM provider
      * @param config            provider 运行时配置
+     * @param ctx               压缩上下文（[批 5a] 显式载体：CC {@code context} + {@code cacheSafeParams}
+     *                          显式参数，compact.ts:414/:1176）——abortController / fork 缓存共享参数 /
+     *                          进度 sink 全部经此读取，⛔ 不再读 ThreadLocal
      * @return 含 usage 的摘要结果（text 恒非 null；usage 可零值但非 null · CC 对真实
      *         assistant 响应恒返回 usage）
      * @throws StreamCompactSummaryException 无流式响应时抛 {@link #ERROR_MESSAGE_INCOMPLETE_RESPONSE}
@@ -451,9 +460,14 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             int preCompactTokenCount,
             String model,
             LlmProvider provider,
-            ProviderConfig config) throws StreamCompactSummaryException {
-        AbortController abortController =
-            abortControllerSupplier != null ? abortControllerSupplier.get() : AbortController.NOOP;
+            ProviderConfig config,
+            CompactConversationContext ctx) throws StreamCompactSummaryException {
+        if (ctx == null) {
+            throw new IllegalArgumentException(
+                "StreamCompactSummary.streamCompactSummary: ctx required（CC compact.ts:414）");
+        }
+        // [批 5a] abort 源 = CC context.abortController（compact.ts:418/:1347）· 显式携带
+        AbortController abortController = ctx.getAbortController();
         if (abortController == null) {
             abortController = AbortController.NOOP;
         }
@@ -465,8 +479,10 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
         ScheduledFuture<?> keepaliveFuture = startKeepalive();
         try {
             // ── 2. fork 缓存共享（CC compact.ts:1155-1248）──
-            if (promptCacheSharingEnabled && cacheSafeParamsSupplier != null) {
-                CacheSafeParams cacheSafeParams = cacheSafeParamsSupplier.get();
+            if (promptCacheSharingEnabled) {
+                // [批 5a] fork 参数源 = CC 显式参数 cacheSafeParams（compact.ts:1176/:1183），
+                //   不再读 CacheSafeParamsHolder 的 ThreadLocal 槽位。
+                CacheSafeParams cacheSafeParams = ctx.getCacheSafeParams();
                 if (cacheSafeParams != null && cacheSafeParams.forkContextMessages() != null
                         && !cacheSafeParams.forkContextMessages().isEmpty()) {
                     CompactConversation.SummaryResult forkResult = tryForkCacheSharing(
@@ -479,7 +495,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
 
             // ── 3. 流式 fallback（CC compact.ts:1250-1389）──
             return streamingFallback(
-                messages, summaryRequest, preCompactTokenCount, model, provider, config, abortController);
+                messages, summaryRequest, preCompactTokenCount, model, provider, config, abortController, ctx);
         } finally {
             // ── keepalive finally 清理（CC compact.ts:1394 clearInterval）──
             if (keepaliveFuture != null) {
@@ -726,7 +742,8 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             String model,
             LlmProvider provider,
             ProviderConfig config,
-            AbortController abortController) throws StreamCompactSummaryException {
+            AbortController abortController,
+            CompactConversationContext ctx) throws StreamCompactSummaryException {
 
         int maxOutputTokensOverride = maxOutputTokensOverride(model);
         // [V54 token-compact-fix B1-2] 流式重试上限 DB 实时读（settings.max_compact_streaming_retries
@@ -757,9 +774,9 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 boolean[] streamingStartedSink = new boolean[1];
                 response = streamOnce(provider, config, model, List.of(SUMMARY_SYSTEM_PROMPT),
                     false, /* 3P 默认 · fallback 无 boundary（streamingFallback 不参与缓存共享） */
-                    apiMessages, fallbackToolsArray() /* 受限工具集 · 对齐 CC compact.ts:1265-1290
+                    apiMessages, fallbackToolsArray(ctx) /* 受限工具集 · 对齐 CC compact.ts:1265-1290
                         [FileReadTool]（canUseTool=deny 白名单只读；旧实现传 null 空工具集） */,
-                    maxOutputTokensOverride, abortController, streamingStartedSink);
+                    maxOutputTokensOverride, abortController, streamingStartedSink, ctx);
                 hasStartedStreaming = streamingStartedSink[0];
             } catch (StreamCompactSummaryException e) {
                 throw e;
@@ -832,9 +849,10 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             List<ChatMessageDto> history,
             com.fasterxml.jackson.databind.node.ArrayNode tools,
             Integer maxOutputTokensOverride,
-            AbortController abortController) throws StreamCompactSummaryException {
+            AbortController abortController,
+            CompactConversationContext ctx) throws StreamCompactSummaryException {
         return streamOnce(provider, config, model, systemPrompt, useGlobalCacheScope, history,
-            tools, maxOutputTokensOverride, abortController, null);
+            tools, maxOutputTokensOverride, abortController, null, ctx);
     }
 
     /**
@@ -855,9 +873,14 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             com.fasterxml.jackson.databind.node.ArrayNode tools,
             Integer maxOutputTokensOverride,
             AbortController abortController,
-            boolean[] hasStartedStreamingOut) throws StreamCompactSummaryException {
+            boolean[] hasStartedStreamingOut,
+            CompactConversationContext ctx) throws StreamCompactSummaryException {
         if (provider == null) {
             throw new StreamCompactSummaryException(ERROR_MESSAGE_INCOMPLETE_RESPONSE);
+        }
+        if (ctx == null) {
+            throw new IllegalArgumentException(
+                "StreamCompactSummary.streamOnce: ctx required（批 5a 显式载体 · 进度 sink 源）");
         }
         CompletableFuture<AssistantMessage> future = new CompletableFuture<>();
         final boolean[] onAssistantFired = {false};
@@ -881,12 +904,10 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 int total = streamedChars.addAndGet(chunk.length());
                 responseLengthSetter.accept(total);
                 // [真进度 2026-09-04] 摘要流已收字符 → 当前压缩进度推送（前端进度条蠕动源）。
-                //   经 CompactProgressState.current()（manual/auto 压缩期间注册的 STOMP 推送）；
-                //   无注册 → no-op 不回归。
-                java.util.function.Consumer<CompactProgressEvent> progressSink = CompactProgressState.current();
-                if (progressSink != null) {
-                    progressSink.accept(new CompactProgressEvent.SummaryProgress(total));
-                }
+                //   [批 5a] 进度 sink 源 = CC {@code context.onCompactProgress}（Tool.ts:239，
+                //   REPL.tsx:3000 显式设）——显式经 ctx 携带，⛔ 不再读 CompactProgressState
+                //   的 ThreadLocal（原实现：ThreadLocal 取不到 → 恒 null → 静默丢弃）。
+                ctx.getOnCompactProgress().accept(new CompactProgressEvent.SummaryProgress(total));
             }
         };
 
@@ -1364,8 +1385,9 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      * 主循环 merged tools 的 Java 同源，forkedAgent.ts:65 CC options.tools 同源）；
      * 槽位空 → null（无工具源，退化传 null）。
      */
-    private com.fasterxml.jackson.databind.node.ArrayNode fallbackToolsArray() {
-        CacheSafeParams params = cacheSafeParamsSupplier != null ? cacheSafeParamsSupplier.get() : null;
+    private com.fasterxml.jackson.databind.node.ArrayNode fallbackToolsArray(CompactConversationContext ctx) {
+        // [批 5a] fork 参数源 = 显式 ctx（原读 CacheSafeParamsHolder ThreadLocal 槽位）
+        CacheSafeParams params = ctx.getCacheSafeParams();
         List<Tool> available = params != null && params.toolUseContext() != null
             ? params.toolUseContext().availableTools() : null;
         return buildFallbackToolsArray(available,

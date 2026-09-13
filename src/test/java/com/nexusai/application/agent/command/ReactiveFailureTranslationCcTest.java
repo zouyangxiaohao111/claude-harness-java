@@ -7,7 +7,6 @@ import com.nexusai.application.agent.compact.CompactConversationContext;
 import com.nexusai.application.agent.compact.CompactProgressEvent;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.SystemPromptContextProvider;
 import com.nexusai.application.agent.tool.AbortController;
@@ -62,7 +61,6 @@ class ReactiveFailureTranslationCcTest {
     @AfterEach
     void resetStaticState() {
         com.nexusai.application.agent.compact.CompactWarningState.clearCompactWarningSuppression();
-        CacheSafeParamsHolder.clear();
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {
@@ -133,7 +131,7 @@ class ReactiveFailureTranslationCcTest {
         // reactive-only 路由已死（CC 恒 false），失败翻译改直接单测 classifyReactiveFailure +
         // translateReactiveFailureReason（引用面语义 compact.ts:181-194，不依赖路由触发）。
         ReactiveCompactor reactive = new ReactiveCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("stub summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("stub summary", null));
         reactive.setEnabled(true);
         CompactCommandContext c = ctx(manyMessages(5), reactive, new AbortController(),
             baseCc(new ArrayList<>()), null, null);
@@ -168,7 +166,7 @@ class ReactiveFailureTranslationCcTest {
         AbortController abort = new AbortController();
         abort.abort("interrupt");
         ReactiveCompactor reactive = new ReactiveCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("stub summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("stub summary", null));
         reactive.setEnabled(true);
         CompactCommandContext c = ctx(manyMessages(60), reactive, abort,
             baseCc(new ArrayList<>()), null, null);
@@ -199,7 +197,7 @@ class ReactiveFailureTranslationCcTest {
     void hooksAndCacheParamsRunConcurrentlyWithNonNullCacheSafeParams() {
         AtomicInteger reactiveCalls = new AtomicInteger();
         ReactiveCompactor reactive = new ReactiveCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("stub summary", null)) {
+            (p, m, ctx) -> new CompactConversation.SummaryResult("stub summary", null)) {
             @Override
             public ReactiveCompactor.ReactiveCompactOutcome reactiveCompactOnPromptTooLong(
                     List<ChatMessageDto> messages, CompactConversationContext ccCtx, String customInstructions) {
@@ -242,18 +240,23 @@ class ReactiveFailureTranslationCcTest {
             new com.nexusai.application.agent.telemetry.Telemetry();
 
         // 与 ManualCacheClearCcIntegrationTest 相同的反射模式调用生产接线（package-private）
-        // 生产签名 14 参（agentId 后追加 model · [P3-a]，末尾 Telemetry），此处同步 14 参。
+        // 生产签名 16 参（agentId 后追加 model · [P3-a]，末尾 Telemetry；[批 5a] 再追加
+        //   compactAbort + progressSink 两个显式载荷），此处同步 16 参。
         Method build = com.nexusai.application.agent.config.ToolRegistrationConfig.class.getDeclaredMethod(
             "buildCompactCommandContext",
             List.class, String.class, String.class, String.class,
             ReactiveCompactor.class, com.nexusai.application.agent.compact.StreamCompactSummary.class,
             com.nexusai.application.agent.memory.SessionMemoryService.class, ToolUseContext.class,
             SystemPromptContextProvider.class, Supplier.class, String.class, String.class, boolean.class,
-            com.nexusai.application.agent.telemetry.Telemetry.class);
+            com.nexusai.application.agent.telemetry.Telemetry.class,
+            com.nexusai.application.agent.tool.AbortController.class,
+            java.util.function.Consumer.class);
         build.setAccessible(true);
         CompactCommandContext ctx = (CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
-            SESSION, AGENT, null, null, null, null, tuc, null, null, null, null, false, telemetry);
+            SESSION, AGENT, null, null, null, null, tuc, null, null, null, null, false, telemetry,
+            null,   // [批 5a] compactAbort（显式载荷）
+            null);  // [批 5a] progressSink（显式载荷）
 
         // 生产接线断言：命令级取消信号 == 会话 live 信号（不再是断开 new AbortController()）
         assertThat(ctx.abortController())

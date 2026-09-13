@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.compact;
 
+import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
@@ -78,6 +79,20 @@ public class CompactConversationContext {
     private Consumer<Integer> responseLengthSetter = len -> { };
     /** CC context.abortController（null → NOOP） */
     private AbortController abortController = AbortController.NOOP;
+
+    /**
+     * fork 缓存共享参数 · CC original: {@code compactConversation(…, cacheSafeParams, …)}
+     * 第 3 个<b>显式函数参数</b>（compact.ts:414）+ {@code partialCompactConversation}
+     * （compact.ts:805）+ {@code streamCompactSummary({… cacheSafeParams})}（compact.ts:1176/:1183）。
+     *
+     * <p><b>[批 5a] 显式载体</b>：原实现经 {@code CacheSafeParamsHolder} 的 ThreadLocal 槽位
+     * 跨「调用方 → StreamCompactSummary」传递（进程内隐式通道）。CC 在同处是显式参数传递 ⇒
+     * 本字段承接之（CC 无会话上下文对象，Java 的 {@code context} 即本类）。
+     * PTL 重试轮直接覆写本字段（CC {@code let retryCacheSafeParams}，compact.ts:470/:886）。
+     *
+     * <p>null = 无 fork 前缀（跳过 fork 缓存共享，落流式 fallback；缓存共享为优化项，不阻断压缩）。
+     */
+    private CacheSafeParams cacheSafeParams;
 
     /** 摘要生产（CC streamCompactSummary；必填，生产由 IMP-01 适配器提供） */
     private CompactConversation.SummaryProducer summaryProducer;
@@ -180,11 +195,11 @@ public class CompactConversationContext {
     public Path getWorkspaceDir() { return workspaceDir; }
     public SessionStorage.SessionMetadata getSessionMetadata() { return sessionMetadata; }
     public Consumer<CompactProgressEvent> getOnCompactProgress() {
-        // [compact-progress-push 2026-09-04] 显式 set（buildAutoContext 从 tuc、测试注入）优先；
-        //   未显式设置时委托 CompactProgressState 线程注册（manual/auto 压缩期间注册 STOMP 推送，
-        //   对齐 CC REPL onCompactProgress spinner）。无注册 → 回落字段默认 no-op（行为不回归）。
-        Consumer<CompactProgressEvent> registered = CompactProgressState.current();
-        return registered != null ? registered : onCompactProgress;
+        // [批 5a] 显式单源：CC {@code context.onCompactProgress}（Tool.ts:239，REPL.tsx:3000 显式设）
+        //   —— 原实现回落到 CompactProgressState 的 ThreadLocal 注册（进程内隐式通道），已删。
+        //   未显式设置 = 本就不需要推送（非 STOMP 路径/测试直构）→ 字段默认 no-op（≥WARN 由
+        //   装配侧承担：LlmAgentLoop/PartialCompactService 在 wsTemplate 缺失时已 log.warn）。
+        return onCompactProgress;
     }
     public Consumer<SDKStatus> getSdkStatusSetter() { return sdkStatusSetter; }
     public Consumer<SpinnerMode> getStreamModeSetter() { return streamModeSetter; }
@@ -267,6 +282,19 @@ public class CompactConversationContext {
     }
     public CompactConversationContext setAbortController(AbortController abortController) {
         this.abortController = abortController != null ? abortController : AbortController.NOOP; return this;
+    }
+
+    /** [批 5a] fork 缓存共享参数 · CC {@code cacheSafeParams} 显式参数（compact.ts:414）的载体。 */
+    public CacheSafeParams getCacheSafeParams() {
+        return cacheSafeParams;
+    }
+
+    /**
+     * [批 5a] 设置 fork 缓存共享参数（null = 无 fork 前缀 → StreamCompactSummary 跳过 fork 路径）。
+     * PTL 重试轮覆写本字段（CC {@code retryCacheSafeParams}，compact.ts:886）。
+     */
+    public CompactConversationContext setCacheSafeParams(CacheSafeParams cacheSafeParams) {
+        this.cacheSafeParams = cacheSafeParams; return this;
     }
     public CompactConversationContext setSummaryProducer(CompactConversation.SummaryProducer summaryProducer) {
         this.summaryProducer = summaryProducer; return this;

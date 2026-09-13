@@ -61,7 +61,7 @@ class R32B15Stage3_1_AutoCompactorC13Test {
     @DisplayName("熔断器: LLM 失败 → consecutiveFailures+1，连续 3 次 → 停止尝试 (INV-5)")
     void llmFailureIncrementsCircuitBreaker() {
         AutoCompactor auto = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> { throw new RuntimeException("LLM failure"); });
+            (p, m, ctx) -> { throw new RuntimeException("LLM failure"); });
 
         auto.tryAutoCompact(largeMessages(50));
         assertThat(auto.getTracking().getConsecutiveFailures()).isEqualTo(1);
@@ -81,7 +81,7 @@ class R32B15Stage3_1_AutoCompactorC13Test {
     @DisplayName("递归守卫: querySource=session_memory/compact → shouldAutoCompact=false (INV-6)")
     void recursiveGuardByQuerySource() {
         AutoCompactor auto = new AutoCompactor(HIGH_TOKEN,
-            (p, m) -> new CompactConversation.SummaryResult("summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         List<ChatMessageDto> big = largeMessages(50);
 
         assertThat(auto.shouldAutoCompact(big, null, "session_memory", 0)).isFalse();

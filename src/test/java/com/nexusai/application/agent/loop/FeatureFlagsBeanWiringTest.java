@@ -190,7 +190,7 @@ class FeatureFlagsBeanWiringTest {
         // 镜像生产接线（ToolRegistrationConfig.autoCompactor）的注入方式
         FeatureFlags on = new FeatureFlags(true, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false); // reactiveCompact=true, contextCollapse=true
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         auto.setReactiveCompactEnabled(on.reactiveCompact());
         auto.setContextCollapseEnabled(on.contextCollapse());
         auto.setReactiveOnlyMode(false);
@@ -202,7 +202,7 @@ class FeatureFlagsBeanWiringTest {
 
         // 对照：默认全关（生产默认 ALL_DISABLED）→ 不抑制 → 超阈照常
         AutoCompactor off = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("summary", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("summary", null));
         assertThat(off.shouldAutoCompact(List.of(), null, "user", 0))
             .as("默认全关时不得抑制（对齐 CC flag 默认关闭）")
             .isTrue();

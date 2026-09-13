@@ -137,7 +137,7 @@ class SubagentAutoCompactGateCcTest {
     /** 超阈 autoCompactor：tokenCounter 恒 200_000，默认窗口 → shouldAutoCompact=true（非守卫源）。 */
     private static AutoCompactor autoCompactor() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult(SUMMARY_MARK + "compact</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult(SUMMARY_MARK + "compact</summary>", null));
         return auto;
     }
 

@@ -163,7 +163,7 @@ class CompactSessionCostWiringTest {
 
         ReactiveCompactor rc = new ReactiveCompactor(
             new TokenEstimator()::estimateMessageTokens,
-            (prompt, msgs) -> new CompactConversation.SummaryResult("reactive summary", compactionUsage()));
+            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("reactive summary", compactionUsage()));
         rc.setEnabled(true);
         AgentLoopContext ctx = agentLoopContext(ptlOnceThenStopProvider(), rc, recordingCalculator());
 
@@ -296,7 +296,7 @@ class CompactSessionCostWiringTest {
      */
     private static AutoCompactor autoCompactor() {
         return new AutoCompactor(msgs -> 2_000_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>ok</summary>", compactionUsage()));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>ok</summary>", compactionUsage()));
     }
 
     /**

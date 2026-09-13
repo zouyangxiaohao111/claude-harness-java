@@ -69,7 +69,6 @@ import com.nexusai.application.agent.compact.BoundaryReader;
 import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.compact.fork.CacheSharingParamsBuilder;
 import com.nexusai.application.agent.compact.CompactConversation;
 import com.nexusai.application.agent.compact.CompactConversationContext;
@@ -2300,9 +2299,18 @@ public class LlmAgentLoop implements AgentLoop {
         // [批 2 · C 类] 注册体抽为静态单点 {@link #registerSessionPushContext} —— 子代理路径
         // （SubagentExecutor 直调静态 queryLoop，不经 run()）复用同一注册，见该法 javadoc。
         boolean sessionPushRegistered = registerSessionPushContext(this.wsTemplate, params.sessionId());
+        // [批 5a] 压缩进度 sink 显式装箱（原 CompactProgressState 的 ThreadLocal 注册）：
+        //   CC 真源 = `context.onCompactProgress`（Tool.ts:239；REPL.tsx:3000 显式赋值），Java
+        //   对应物 = ToolUseContext.onCompactProgress → CompactConversationContext.onCompactProgress。
+        //   在 run() 入口写入实例字段 → buildBaseToolUseContext(:9828) 塞进 base TUC →
+        //   buildAutoContext(:596) 透传 CC 的 ccCtx → 压缩链消费；子代理经
+        //   SubagentExecutor:460 `source.onCompactProgress()` 同源透传。
+        //   wsTemplate 缺失（非 STOMP 路径）→ null → 字段回落 no-op（与旧「不注册」行为一致）。
+        setOnCompactProgress(compactProgressSink(this.wsTemplate, params.sessionId()));
         try {
             return doRun(params);
         } finally {
+            setOnCompactProgress(null);
             clearSessionPushContext(sessionPushRegistered);
             markIdle(params.sessionId());
             // [queue-full-align P1] 注销 now 中断监听器（防跨 run 泄漏；队列 onChange 常驻 NOTIFY_EXECUTOR）
@@ -2326,29 +2334,24 @@ public class LlmAgentLoop implements AgentLoop {
 
     /**
      * [批 2 · C 类] 注册会话级压缩推送上下文 · <b>run() 与子代理 loop 路径共享的单点</b>
-     * （token-warning ThreadLocal + compact-progress ThreadLocal，对齐 CacheSafeParamsHolder 模式）。
+     * （token-warning pushContext；[批 5a] compact-progress 通道已迁出，见下）。
      *
      * <p><b>WHY 需要跨路径单点</b>：{@code SubagentExecutor} 直调静态
      * {@link #queryLoop(com.nexusai.application.agent.loop.QueryParams, AgentState, java.util.List, boolean)}
-     * 执行子代理主循环，<b>不经 run()</b> —— 而两个消费点都只读当前线程注册的 ThreadLocal：
-     * <ul>
-     *   <li>{@code CompactConversationContext.getOnCompactProgress()}（LlmAgentLoop:7219 reactive
-     *       压缩块经 buildAutoContext 取 ccCtx）→ {@code CompactProgressState.current()}</li>
-     *   <li>{@code StreamCompactSummary:886}（摘要流逐 chunk 进度条蠕动源）→
-     *       {@code CompactProgressState.current()}</li>
-     *   <li>{@code CompactWarningState.publishTokenWarning}（触发点3）→ 线程 pushContext</li>
-     * </ul>
+     * 执行子代理主循环，<b>不经 run()</b> —— 而 token-warning 的消费点
+     * {@code CompactWarningState.publishTokenWarning}（触发点3）读线程 pushContext。
      * 子代理 loop 跑在<b>别的池化线程</b>（sync = 工具池 / async = asyncWorker），ThreadLocal 不跨线程
-     * ⇒ 不补注册则子代理 reactive 压缩（{@code ctx.reactiveCompactor()} 由 AgentLoopContextFactory
-     * bean 注入，与主循环同源、可达）的进度推送<b>静默丢弃</b>：token-warning 侧
-     * {@code CompactWarningState:206-212} 静默 return（仅 DEBUG 日志）；progress 侧
-     * {@code CompactProgressState.current()} 返 null，消费点回落 no-op
-     * （{@code CompactConversationContext:186} 的 {@code tuc.onCompactProgress} 字段生产无接线者 ⇒ 恒 noop）。
+     * ⇒ 不补注册则子代理压缩的 token-warning 推送静默丢弃（{@code CompactWarningState:206-212}
+     * 静默 return，仅 DEBUG 日志）。
      *
-     * <p><b>与 AgentContext 的区别</b>：本批「一律显式传参」针对 {@code AgentContext}（会话/代理身份）。
-     * 本通道是压缩推送 sink，其两个消费点（{@code CompactProgressState.current()}）无显式载体可传
-     * （StreamCompactSummary 无 ccCtx/TUC 参数），故按既有 ThreadLocal 设计补注册（与
-     * ToolRegistrationConfig:2433 manual /compact 路径同款做法），不新建第二通道。
+     * <p>⛔ <b>[批 5a] 更正本段旧述</b>：本条曾称 compact-progress 的消费点
+     * 「{@code CompactProgressState.current()} 无显式载体可传（StreamCompactSummary 无 ccCtx/TUC 参数）」。
+     * 实测<b>不成立</b> —— CC 在此处用的是 {@code context.onCompactProgress}（Tool.ts:239）显式字段，
+     * Java 对应载体早已存在（{@code ToolUseContext.onCompactProgress} → 本类实例字段 →
+     * {@code CompactConversationContext.onCompactProgress}）。真正的缺口只是
+     * {@code LlmAgentLoop.setOnCompactProgress} 生产零调用（字段恒 no-op），故 ThreadLocal 顶替了它。
+     * ⇒ 现改由 {@link #compactProgressSink} + 实例字段显式携带（run() 入口装箱、finally 复位），
+     * 子代理经 {@code SubagentExecutor:460 source.onCompactProgress()} 同源透传 —— 补偿注册点消失。
      *
      * @param ws        STOMP 模板（null = 非 STOMP 路径 → 不注册，推送安全跳过）
      * @param sessionId short 会话 id（sess-xxx，与前端 useChatSocket 订阅一致）
@@ -2366,19 +2369,36 @@ public class LlmAgentLoop implements AgentLoop {
                 sessionId,
                 warning -> ws.convertAndSend("/topic/sessions/" + sessionId + "/token-warning", warning));
         com.nexusai.application.agent.compact.CompactWarningState.registerPushContext(tokenWarningPushCtx);
-        // [compact-progress-push 2026-09-04] 压缩进度 STOMP 推送（对齐 CC REPL spinner）。
-        //   compactConversation 的 ccCtx（buildAutoContext）经 CompactConversationContext
-        //   getOnCompactProgress 委托本线程注册 → 推前端 topic。finally clear（register 成对）。
-        com.nexusai.application.agent.compact.CompactProgressState.register(event ->
-            ws.convertAndSend(
-                com.nexusai.application.agent.compact.CompactProgressState.topic(sessionId),
-                com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event)));
+        // [批 5a] 压缩进度 sink 不再在此注册（原 CompactProgressState.register 的 ThreadLocal 已删）
+        //   —— 改由 {@link #compactProgressSink} 显式构造后经 TUC/ccCtx 传递（见 run() 与
+        //   ToolRegistrationConfig/PartialCompactService 三路装箱）。
         if (log.isDebugEnabled()) {
-            log.debug("[LlmAgentLoop] 会话压缩推送上下文已注册（token-warning + compact-progress）: session={} "
-                + "topic={}", sessionId,
-                com.nexusai.application.agent.compact.CompactProgressState.topic(sessionId));
+            log.debug("[LlmAgentLoop] 会话压缩推送上下文已注册（token-warning）: session={}",
+                sessionId);
         }
         return true;
+    }
+
+    /**
+     * [批 5a] 构造 per-session 压缩进度 sink（CC {@code context.onCompactProgress}，
+     * Tool.ts:239 / REPL.tsx:3000）· <b>显式单点工厂</b>，供 run() / manual / partial 三路装箱。
+     *
+     * <p>取代原 {@code CompactProgressState.register(…)} 的 ThreadLocal 注册：ThreadLocal 不跨线程，
+     * 子代理（工具池/asyncWorker）读不到 ⇒ 需 4 处补偿注册；显式传递后无补偿点。
+     *
+     * @param ws        STOMP 模板（null → 返回 null = 无推送上下文；压缩照常，不阻断）
+     * @param sessionId short 会话 id（sess-xxx，与前端订阅一致）
+     * @return sink；ws 或 sessionId 缺失 → null（调用方按「无推送」处理，不得静默当成功）
+     */
+    public static java.util.function.Consumer<
+            com.nexusai.application.agent.compact.CompactProgressEvent> compactProgressSink(
+            org.springframework.messaging.simp.SimpMessagingTemplate ws, String sessionId) {
+        if (ws == null || sessionId == null) {
+            return null;
+        }
+        return event -> ws.convertAndSend(
+            com.nexusai.application.agent.compact.CompactProgressState.topic(sessionId),
+            com.nexusai.application.agent.compact.CompactProgressState.toFrontendJson(event));
     }
 
     /**
@@ -2391,8 +2411,8 @@ public class LlmAgentLoop implements AgentLoop {
         if (registered) {
             com.nexusai.application.agent.compact.CompactWarningState.clearPushContext();
         }
-        // [compact-progress-push] 压缩进度推送清除（register 成对；幂等）
-        com.nexusai.application.agent.compact.CompactProgressState.clear();
+        // [批 5a] 压缩进度 sink 无槽位需清（原 CompactProgressState.clear() 的 ThreadLocal 已删；
+        //   sink 现随 TUC/ccCtx 引用生命周期回收，run() finally 已把实例字段复位为 no-op）。
     }
 
     /**
@@ -5638,7 +5658,6 @@ public class LlmAgentLoop implements AgentLoop {
                 // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
                 // 泄漏到下一 turn。构建失败返回 null → 跳过 fork 缓存共享（不阻断压缩）。
                 CacheSafeParams compactCacheSafeParams = buildCompactCacheSafeParams(params, state);
-                CacheSafeParamsHolder.save(compactCacheSafeParams);
                 // ── [auto-compact 可中断 2026-09-13] 补齐「摘要断流源 + 会话级 Esc 桥」两条 abort 通道 ──
                 // WHY（要修的缺陷）：auto 路径此前只注册了进度推送（run() :2314 register），两条 abort
                 //   通道全空 → ① 摘要 streamCompactSummary 的 abortControllerSupplier
@@ -5666,19 +5685,20 @@ public class LlmAgentLoop implements AgentLoop {
                 // NOOP 守卫（fail loud）：无 run 控制器时 base TUC 回落 AbortController.NOOP
                 //   （buildBaseToolUseContext）。NOOP 永不取消 → 注册它会让 abortForSession 恒返回
                 //   true 却什么也没 abort（假「已打断」信号）→ 显式跳过并留痕。
-                // 清理：下方 finally 按 manual 顺序 clearAbort → removeSessionAbort
-                //   （ToolRegistrationConfig:2510-2512）；进度推送槽（clear）不在本块注册，
-                //   由 run() :2314 注册 / :2326 清理成对负责。
+                // 清理：下方 finally 按 manual 顺序 removeSessionAbort。
+                // [批 5a] 摘要断流源不再经 CompactProgressState 的 ThreadLocal 注册：改由
+                //   {@code ccCtx.setAbortController(...)}（buildAutoContext 已从 tuc 显式透传，
+                //   与 CC context.abortController 同源）；本块只保留<b>会话级</b>登记
+                //   （registerSessionAbort / removeSessionAbort —— 已是 sessionId 显式键的 map）。
                 com.nexusai.application.agent.tool.AbortController autoCompactAbort =
                     params.toolUseContext() != null ? params.toolUseContext().abortController() : null;
                 boolean autoCompactAbortRegistered = autoCompactAbort != null
                     && autoCompactAbort != com.nexusai.application.agent.tool.AbortController.NOOP;
                 if (autoCompactAbortRegistered) {
-                    com.nexusai.application.agent.compact.CompactProgressState.registerAbort(autoCompactAbort);
                     com.nexusai.application.agent.compact.CompactProgressState
                         .registerSessionAbort(state.sessionId(), autoCompactAbort);
                     if (log.isDebugEnabled()) {
-                        log.debug("[auto-compact 可中断] 摘要断流源 + 会话级 Esc 桥已注册: sessionId={} abort={}",
+                        log.debug("[auto-compact 可中断] 会话级 Esc 桥已注册: sessionId={} abort={}",
                             state.sessionId(), autoCompactAbort);
                     }
                 } else if (log.isDebugEnabled()) {
@@ -5697,6 +5717,13 @@ public class LlmAgentLoop implements AgentLoop {
                     CompactConversationContext ccCtx = CompactConversation.buildAutoContext(
                         params.toolUseContext(), compactEffectiveModel,
                         params.querySource().canonical(), ctx.hookRegistry());
+                    // [批 5a] fork 缓存共享参数显式装箱（CC compactConversation(…, cacheSafeParams, …)
+                    //   compact.ts:414；原经 CacheSafeParamsHolder 的 ThreadLocal 槽位跨到
+                    //   StreamCompactSummary）——⛔ 无槽位可 save 时即 null，行为与旧 save(null) 一致。
+                    ccCtx.setCacheSafeParams(compactCacheSafeParams);
+                    // [批 5a] 进度 sink 显式装箱（CC context.onCompactProgress Tool.ts:239）：
+                    //   由 run() 入口构造的 per-session sink 经 base TUC 携带 → buildAutoContext
+                    //   已透传（:596 ctx.setOnCompactProgress(tuc.onCompactProgress())），此处不覆写。
                     // [IMP-CM-17] tengu_compact 结构化遥测接线（compact.ts:650-695 logEvent）：
                     //   telemetry 注入压缩上下文 → compactConversation 成功路径发射全字段事件。
                     //   queryChainId/queryDepth 来自查询跟踪（CC context.queryTracking）；未接线 → 空/ -1。
@@ -5789,17 +5816,16 @@ public class LlmAgentLoop implements AgentLoop {
                         }
                     }
                 } finally {
-                    // [auto-compact 可中断 2026-09-13] 与上方注册成对清理（顺序对齐 manual
-                    //   ToolRegistrationConfig:2510-2512 clearAbort → removeSessionAbort）。
+                    // [auto-compact 可中断 2026-09-13] 与上方注册成对清理（顺序对齐 manual）。
                     //   只在「本轮确实注册过」时清 —— 未注册（NOOP/无 TUC）时无条件 removeSessionAbort
                     //   会把<b>另一线程</b>为同一会话注册的在飞压缩槽（如并发 manual /compact）
-                    //   误删，使那次压缩不再可中断。幂等：两处 remove 对未注册为空操作。
+                    //   误删，使那次压缩不再可中断。幂等：remove 对未注册为空操作。
+                    // [批 5a] clearAbort / CacheSafeParamsHolder.clear() 已随 ThreadLocal 载体删除
+                    //   —— 摘要断流源与 fork 参数现随 ccCtx 的引用生命周期回收，无需显式清槽。
                     if (autoCompactAbortRegistered) {
-                        com.nexusai.application.agent.compact.CompactProgressState.clearAbort();
                         com.nexusai.application.agent.compact.CompactProgressState
                             .removeSessionAbort(state.sessionId());
                     }
-                    CacheSafeParamsHolder.clear();
                 }
             }
 
@@ -7325,7 +7351,7 @@ public class LlmAgentLoop implements AgentLoop {
                             params.toolUseContext(), reactiveCompactModel,
                             params.querySource().canonical(), ctx.hookRegistry());
                         if (reactiveCcCtx.getSummaryProducer() == null) {
-                            reactiveCcCtx.setSummaryProducer(ctx.reactiveCompactor().summaryProducer());
+                            reactiveCcCtx.setSummaryProducer(ctx.reactiveCompactor().summaryProducer(reactiveCcCtx));
                         }
                         // [S4-L5/prompt-assembly-B] fork 缓存共享参数生产（CC query.ts:653-660）：
                         // reactive 路径与 auto 路径同构——压缩**收参数**，直接用调用方已收集的
@@ -7335,7 +7361,9 @@ public class LlmAgentLoop implements AgentLoop {
                         // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
                         // 泄漏到下一 turn。构建失败返回 null → 仍传 null（缓存优化可选，不阻断压缩）。
                         CacheSafeParams reactiveCacheSafeParams = buildCompactCacheSafeParams(params, state);
-                        CacheSafeParamsHolder.save(reactiveCacheSafeParams);
+                        // [批 5a] 显式装箱（原 CacheSafeParamsHolder.save 的 ThreadLocal 槽位）——
+                        //   ccCtx 在 :7330 已构建，直接 set。
+                        reactiveCcCtx.setCacheSafeParams(reactiveCacheSafeParams);
                         // ── [reactive-compact 可中断 2026-09-13] 与 auto 压缩块（:5528-5569）同款补齐 ──
                         // WHY：reactive 应急压缩与 auto 完全同构 —— 同样
                         //   {@code buildAutoContext(params.toolUseContext(), …)}（:7219）取 ccCtx、
@@ -7357,12 +7385,12 @@ public class LlmAgentLoop implements AgentLoop {
                             && reactiveCompactAbort
                                 != com.nexusai.application.agent.tool.AbortController.NOOP;
                         if (reactiveCompactAbortRegistered) {
-                            com.nexusai.application.agent.compact.CompactProgressState
-                                .registerAbort(reactiveCompactAbort);
+                            // [批 5a] 摘要断流源改由 ccCtx.setAbortController 显式携带（见 auto 块），
+                            //   本块只保留会话级登记。
                             com.nexusai.application.agent.compact.CompactProgressState
                                 .registerSessionAbort(state.sessionId(), reactiveCompactAbort);
                             if (log.isDebugEnabled()) {
-                                log.debug("[reactive-compact 可中断] 摘要断流源 + 会话级 Esc 桥已注册: "
+                                log.debug("[reactive-compact 可中断] 会话级 Esc 桥已注册: "
                                     + "sessionId={} abort={}", state.sessionId(), reactiveCompactAbort);
                             }
                         } else if (log.isDebugEnabled()) {
@@ -7448,11 +7476,9 @@ public class LlmAgentLoop implements AgentLoop {
                             //   且只在确实注册过时才清 —— 未注册时无条件 remove 会误删另一线程为
                             //   同一会话注册的在飞压缩槽）。幂等。
                             if (reactiveCompactAbortRegistered) {
-                                com.nexusai.application.agent.compact.CompactProgressState.clearAbort();
                                 com.nexusai.application.agent.compact.CompactProgressState
                                     .removeSessionAbort(state.sessionId());
                             }
-                            CacheSafeParamsHolder.clear();
                         }
                         // 恢复失败 → surface + STOP_FAILURE + 跳过 stop pipeline · CC query.ts:1168-1182
                         skipStopPipeline = true;

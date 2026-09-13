@@ -256,7 +256,7 @@ class CompactIdleRebuildModelWiringTest {
         MessageService messageService = idleMessageService();
         com.nexusai.application.agent.compact.StreamCompactSummary summary =
             mock(com.nexusai.application.agent.compact.StreamCompactSummary.class);
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary text", null));
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
@@ -291,7 +291,7 @@ class CompactIdleRebuildModelWiringTest {
         MessageService messageService = idleMessageService();
         com.nexusai.application.agent.compact.StreamCompactSummary summary =
             mock(com.nexusai.application.agent.compact.StreamCompactSummary.class);
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary text", null));
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
@@ -357,7 +357,9 @@ class CompactIdleRebuildModelWiringTest {
             null,   // customSystemPrompt
             null,   // appendSystemPrompt
             false,  // useGlobalCacheScope
-            null);  // telemetry
+            null,   // telemetry
+            null,   // [批 5a] compactAbort（显式载荷；null → NOOP）
+            null);  // [批 5a] progressSink（显式载荷；null → 非 STOMP，不推）
         return commandCtx.compactConversationContextSupplier().get();
     }
 

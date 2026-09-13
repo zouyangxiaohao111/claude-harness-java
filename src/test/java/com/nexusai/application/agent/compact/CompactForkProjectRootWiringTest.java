@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.compact.fork.CacheSharingParamsBuilder;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
@@ -76,7 +75,6 @@ class CompactForkProjectRootWiringTest {
     @AfterEach
     void tearDown() {
         SessionProjectRoot.clearSession(SESSION);
-        CacheSafeParamsHolder.clear();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -164,7 +162,8 @@ class CompactForkProjectRootWiringTest {
 
         compactSummaryWith(cs, recording).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), "请对会话做摘要", 0,
-            "model", fakeProvider(), ProviderConfig.empty());
+            "model", fakeProvider(), ProviderConfig.empty(),
+            new CompactConversationContext().setCacheSafeParams(cs).setAbortController(new AbortController()));
 
         RunForkedAgent.ForkQueryParams q = recording.lastParams();
         assertThat(q).as("必须真实发起 fork（否则本测试空转）").isNotNull();
@@ -188,7 +187,8 @@ class CompactForkProjectRootWiringTest {
 
         compactSummaryWith(cs, recording).streamCompactSummary(
             List.of(userMessage("u1", "ctx")), "请对会话做摘要", 0,
-            "model", fakeProvider(), ProviderConfig.empty());
+            "model", fakeProvider(), ProviderConfig.empty(),
+            new CompactConversationContext().setCacheSafeParams(cs).setAbortController(new AbortController()));
 
         assertThat(recording.lastParams().projectRoot())
             .as("null = 不造字段（fork 端 shared(null) 走 CwdResolution originalCwd 回落，非 config home）")
@@ -230,8 +230,7 @@ class CompactForkProjectRootWiringTest {
     private static StreamCompactSummary compactSummaryWith(
             CacheSafeParams cs, ForkConvergenceCcContractTest.RecordingQuery recording) {
         StreamCompactSummary scs = new StreamCompactSummary(
-            () -> fakeProvider(), () -> "model", ProviderConfig::empty,
-            () -> cs, () -> new AbortController(), null, null, false, true, false, null, null, null);
+            () -> fakeProvider(), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
         scs.setForkedQuery(recording);
         return scs;
     }

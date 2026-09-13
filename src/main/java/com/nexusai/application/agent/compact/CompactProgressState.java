@@ -6,7 +6,7 @@ import com.nexusai.application.agent.tool.AbortController;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.function.Consumer;
+import java.util.function.Consumer; // [批 5a] 仅 javadoc 引用（载体已删）
 
 /**
  * 压缩进度 STOMP 推送 + 会话可中断状态（2026-09-04 · 对齐 CC REPL spinner + CC Esc 打断）。
@@ -30,9 +30,11 @@ import java.util.function.Consumer;
  *       摘要 provider 硬断流 → 压缩 catch 返回 "Compaction canceled."（对齐 CC compact.ts:126）。</li>
  * </ol>
  *
- * <p>存储：ThreadLocal 承载当前线程（进度推送 + 当前压缩 abort）；会话级 abort 用
- * {@link ConcurrentHashMap}（跨线程前端 cancel 需要）。无注册 → no-op（测试/非 STOMP 路径
- * 行为不回归）。
+ * <p>存储（[批 5a] 改造后）：<b>仅会话级 abort</b> 用 {@link ConcurrentHashMap}（跨线程前端
+ * cancel 需要）。进度推送 sink 与摘要中断源<b>不再经本类</b> —— 改由
+ * {@link CompactConversationContext} 显式携带（CC {@code context.onCompactProgress} /
+ * {@code context.abortController} 对应物，见下方「两个 ThreadLocal 载体已删除」段）。
+ * 无在飞压缩 → {@link #abortForSession} 返 false（测试/非 STOMP 路径行为不回归）。
  */
 public final class CompactProgressState {
 
@@ -43,44 +45,28 @@ public final class CompactProgressState {
     /** STOMP topic 后缀 · 前端订阅点（收到 compact_start 转圈 / compact_progress 走条 / compact_end 收起）。 */
     public static final String TOPIC_SUFFIX = "/compact-progress";
 
-    /** 当前线程压缩进度推送上下文 · 对齐 CompactWarningState ThreadLocal 会话隔离模式。 */
-    private static final ThreadLocal<Consumer<CompactProgressEvent>> push = new ThreadLocal<>();
-    /** 当前压缩 AbortController（摘要中断源）· 压缩线程 register，StreamCompactSummary abort 取。 */
-    private static final ThreadLocal<AbortController> currentAbort = new ThreadLocal<>();
     /** 会话级在飞压缩 AbortController · 跨线程（前端 cancel）abort 用。 */
     private static final ConcurrentMap<String, AbortController> sessionAborts = new ConcurrentHashMap<>();
 
     private CompactProgressState() { /* 工具类不可实例化 */ }
 
-    /** 注册当前线程进度推送（压缩开始前；finally {@link #clear}，ThreadLocal 防串台）。 */
-    public static void register(Consumer<CompactProgressEvent> consumer) {
-        push.set(consumer);
-    }
-
-    /** 清除当前线程进度推送（压缩结束 finally；幂等）。 */
-    public static void clear() {
-        push.remove();
-    }
-
-    /** 当前线程进度推送；无注册 → null（调用方回落 no-op）。 */
-    public static Consumer<CompactProgressEvent> current() {
-        return push.get();
-    }
-
-    /** 注册当前压缩 AbortController（摘要中断源）· 压缩线程；finally {@link #clearAbort}。 */
-    public static void registerAbort(AbortController abortController) {
-        currentAbort.set(abortController);
-    }
-
-    /** 清除当前压缩 AbortController（幂等）。 */
-    public static void clearAbort() {
-        currentAbort.remove();
-    }
-
-    /** 当前压缩 AbortController；无 → null（StreamCompactSummary 回落 NOOP）。 */
-    public static AbortController currentAbort() {
-        return currentAbort.get();
-    }
+    // ════════════════════════════════════════════════════════════════════
+    // [批 5a] 两个 ThreadLocal 载体已删除（push / currentAbort）
+    // ════════════════════════════════════════════════════════════════════
+    // 原实现：`ThreadLocal<Consumer<CompactProgressEvent>> push`（进度推送 sink）与
+    // `ThreadLocal<AbortController> currentAbort`（摘要中断源）—— 进程内隐式通道，
+    // 「ThreadLocal 不跨线程」使其在派生线程（子代理 queryLoop 的工具池、asyncWorker）
+    // 上恒空，靠 3 处补偿注册（LlmAgentLoop.run / ToolRegistrationConfig manual /
+    // PartialCompactService partial / SubagentExecutor 子代理）维持。
+    //
+    // CC 真源（无 ThreadLocal、无补偿注册）：
+    //   · 进度 sink → `context.onCompactProgress`（Tool.ts:239 可选字段；REPL.tsx:3000 显式设）
+    //   · 摘要中断源 → `context.abortController.signal`（compact.ts:418/:1347）
+    // ⇒ 两者都改由 {@link CompactConversationContext} 显式携带（Java 的 `context` 对应物）：
+    //   进度 sink 经 `ctx.setOnCompactProgress(...)`（buildAutoContext 从 ToolUseContext 透传，
+    //   与 CC context 链同构）；中断源经 `ctx.setAbortController(...)`（buildAutoContext /
+    //   PartialCompactService / ToolRegistrationConfig manual 三路显式赋值）。
+    //   StreamCompactSummary 消费侧经 `summarize(…, ctx)` 读取，⛔ 不再有 ThreadLocal 回放。
 
     /** 会话级登记在飞压缩 AbortController · 供前端 cancel（跨线程 abort）。 */
     public static void registerSessionAbort(String sessionId, AbortController abortController) {

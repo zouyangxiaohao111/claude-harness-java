@@ -167,7 +167,7 @@ class PartialCompactBusySnapshotTest {
             events.add("write");
             return inv.getArgument(1);
         });
-        when(summary.summarize(anyString(), anyList())).thenAnswer(inv -> {
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any())).thenAnswer(inv -> {
             events.add("summarize"); // 几十秒的 LLM 调用（真机实测 31s）
             return new CompactConversation.SummaryResult("summary ok", null);
         });
@@ -228,7 +228,7 @@ class PartialCompactBusySnapshotTest {
             }
             return inv.getArgument(1);
         });
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
 
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
@@ -274,7 +274,7 @@ class PartialCompactBusySnapshotTest {
             calls.incrementAndGet();
             throw new IllegalStateException("NOT NULL constraint failed: messages.id");
         });
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
 
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);
@@ -336,7 +336,7 @@ class PartialCompactBusySnapshotTest {
             events.add("update-conv");
             throw new IllegalStateException("updateConversationId failed");
         }).when(sessionService).updateConversationId(anyString(), anyString());
-        when(summary.summarize(anyString(), anyList()))
+        when(summary.summarize(anyString(), anyList(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new CompactConversation.SummaryResult("summary ok", null));
 
         PartialCompactService svc = new PartialCompactService(messageService, sessionService, summary);

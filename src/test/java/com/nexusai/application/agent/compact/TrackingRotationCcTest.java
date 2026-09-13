@@ -39,7 +39,7 @@ class TrackingRotationCcTest {
 
     private static AutoCompactor compactingAutoCompactor() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         return auto;
     }
 
@@ -123,7 +123,7 @@ class TrackingRotationCcTest {
     @Test
     @DisplayName("熔断范围: 单次 run 内累计（回合间不清零），run 边界 reset() 归零（S-7 per-run 登记）")
     void circuitBreakerAccumulatesWithinRunAndResetsAtRunBoundary() {
-        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m) -> { throw new RuntimeException("boom"); });
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> { throw new RuntimeException("boom"); });
 
         // run 内两次失败（两个工具回合）→ 累计不归零
         auto.tryAutoCompact(largeMessages(50));

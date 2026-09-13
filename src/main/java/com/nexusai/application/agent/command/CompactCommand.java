@@ -16,7 +16,6 @@ import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.application.agent.compact.PostCompactionState;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
-import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.compact.fork.CacheSharingParamsBuilder;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.application.agent.memory.SessionMemoryService;
@@ -280,7 +279,9 @@ public final class CompactCommand {
             // 并 save → compactConversation 内 summaryProducer 触发时 Holder 非 null → fork 路径可达
             // （manual 与 auto 同一线程内 save→summarize→finally clear 契约，LlmAgentLoop:2535/2577）。
             CacheSafeParams cacheSafeParams = buildCacheSafeParamsForCompact(ctx, messagesForCompact);
-            CacheSafeParamsHolder.save(cacheSafeParams);
+            // [批 5a] 显式装箱（CC compact.ts:101-108 `compactConversation(…, cacheSafeParams, …)`
+            //   第 3 实参）——原经 CacheSafeParamsHolder 的 ThreadLocal 槽位。
+            ccCtx.setCacheSafeParams(cacheSafeParams);
             try {
                 CompactionResult result = CompactConversation.compactConversation(
                     messagesForCompact, ccCtx, false, customInstructions, false, null);
@@ -303,8 +304,7 @@ public final class CompactCommand {
 
                 return new CompactCommandResult(result, buildDisplayText(ctx, result.userDisplayMessage()));
             } finally {
-                // finally 清槽防串台/泄漏（对齐 LlmAgentLoop auto 路径 finally clear :2577）。
-                CacheSafeParamsHolder.clear();
+                // [批 5a] 无需清槽：fork 参数随 ccCtx 引用生命周期回收（原 CacheSafeParamsHolder.clear()）。
             }
         } catch (Exception error) {
             // ── 8. 错误翻译四分支（compact.ts:125-135）──
@@ -515,13 +515,13 @@ public final class CompactCommand {
             // [reactive-align 2026-08-18] fork 缓存共享经 CacheSafeParamsHolder 槽位
             // （CC compact.ts:175-179 cacheSafeParams 直传语义 → Java compactConversation 读 Holder）：
             // 并发构建产物 save → compactConversation 内 StreamCompactSummary 读取 → finally clear。
-            CacheSafeParamsHolder.save(cacheSafeParams);
+            ccCtx.setCacheSafeParams(cacheSafeParams);
             ReactiveCompactor.ReactiveCompactOutcome outcome;
             try {
                 outcome = ctx.reactiveCompactor().reactiveCompactOnPromptTooLong(
                     messages, ccCtx, mergedInstructions);
             } finally {
-                CacheSafeParamsHolder.clear();
+                // [批 5a] 无需清槽（原 CacheSafeParamsHolder.clear()）。
             }
             if (!outcome.ok()) {
                 // [IMP2-17 △-4] !ok → 四 reason 翻译（compact.ts:181-194）：too_few_groups→

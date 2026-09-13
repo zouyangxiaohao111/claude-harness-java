@@ -60,7 +60,7 @@ class PlanModeCompactContextWiringTest {
     @DisplayName("auto 回落: AutoCompactor.setToolUseContext → buildDefaultCompactConversationContext().isInPlanMode()==true")
     void autoCompactorFallback_wiresToolUseContext() {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
-            (p, m) -> new CompactConversation.SummaryResult("<summary>x</summary>", null));
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>x</summary>", null));
         auto.setToolUseContext(planModeTuc(PermissionMode.PLAN));
 
         // [P2-7] 回落上下文构建现接收 model 显式入参（原读 AutoCompactor.model 实例字段）
