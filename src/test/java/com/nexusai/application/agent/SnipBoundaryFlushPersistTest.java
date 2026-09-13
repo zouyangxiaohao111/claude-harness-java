@@ -198,8 +198,12 @@ class SnipBoundaryFlushPersistTest {
         MessageMapper messageMapper = armPersist(state, SESSION, STREAM_TOPIC, wsTemplate);
 
         // ── 3. 播入目标 user 消息 u0（历史锚点；appendMessage 触监听器但 user 分支 no-op）──
+        // [snip-protect-recent D4] 首尾双保护：前置 up 占首条位 + 尾部 u1/u2 受保护 → u0 才是合法目标
         ChatMessageDto u0 = msg("u0", Role.user, "open baidu");
+        state.appendMessage(msg("up", Role.user, "earlier task"));
         state.appendMessage(u0);
+        state.appendMessage(msg("u1", Role.user, "later turn 1"));
+        state.appendMessage(msg("u2", Role.user, "later turn 2"));
         assertThat(state.prePersistedMessageIds() == null || !state.prePersistedMessageIds().contains("u0"))
             .as("u0 非历史注入（prePersisted 未登记）→ 若为 boundary 不会被监听器跳过").isTrue();
 
@@ -263,7 +267,11 @@ class SnipBoundaryFlushPersistTest {
         MessageMapper messageMapper = armPersist(state, session, topic, wsTemplate);
 
         ChatMessageDto u0 = msg("u0", Role.user, "open baidu");
+        // [snip-protect-recent D4] 首尾双保护：前置 up 占首条位 + 尾部 u1/u2 受保护 → u0 才是合法目标
+        state.appendMessage(msg("up", Role.user, "earlier task"));
         state.appendMessage(u0);
+        state.appendMessage(msg("u1", Role.user, "later turn 1"));
+        state.appendMessage(msg("u2", Role.user, "later turn 2"));
 
         // 真 SnipTool 产出 boundary（同一实现链路），随后模拟「暂存了但本 turn 无对应 tool_result 配对」──
         ToolUseContext snipTuc = ToolUseContext.of(UUID.randomUUID(), session)

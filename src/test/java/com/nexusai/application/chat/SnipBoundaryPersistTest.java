@@ -127,7 +127,11 @@ class SnipBoundaryPersistTest {
         ChatMessageDto asst0 = msg("a0", Role.assistant, "searching");
         ChatMessageDto tool0 = msg("t0", Role.tool, "result", "call_0");
         ChatMessageDto user1 = msg("u1", Role.user, "next");
-        List<ChatMessageDto> history = new ArrayList<>(List.of(user0, asst0, tool0, user1));
+        // [snip-protect-recent D4] history 仅作 SnipTool 输入（appends 用显式变量）；
+        //   前置换首条 up + 尾部 u2/u3 → 首尾双保护下 u0 才是合法目标（本用例意图 = boundary 落库 + STOMP 推送）
+        List<ChatMessageDto> history = new ArrayList<>(List.of(
+            msg("up", Role.user, "earlier task"), user0, asst0, tool0, user1,
+            msg("u2", Role.user, "later 1"), msg("u3", Role.user, "later 2")));
 
         ToolResult<String> snipResult = asToolResult(
             new SnipTool(snipEnabledFlags()).execute(snipCall("u0"), ctxWithMessages(history)));

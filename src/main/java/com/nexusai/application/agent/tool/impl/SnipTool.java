@@ -25,7 +25,9 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * SnipTool · 对齐 CC 真源 {@code Open-ClaudeCode/src/tools/SnipTool/SnipTool.ts}。
@@ -155,6 +157,13 @@ public class SnipTool implements Tool {
             + "Guidelines:\n"
             + "- message_ids must contain the [id:xxx] short IDs shown at the end of each user message "
             + "(NOT message content — content text never matches)\n"
+            // [snip-protect-recent] 数字由 KEEP_RECENT_USER_TURNS 拼接，不写死字面量（改常量 → 文案同步）
+            + "- The " + SnipCompactor.KEEP_RECENT_USER_TURNS + " most recent user messages carry NO [id:] tag "
+            + "and cannot be snipped — they define the current task and must stay in context\n"
+            // [snip-protect-recent D4] 首条保护必须【显式】写出：上一条「最近 N 条」在语义上暗示
+            //   更早的消息可弃，不声明首条也受保护模型会理所当然去裁 U₁ —— 那正是 D4 要堵的症状。
+            + "- The FIRST user message also carries NO [id:] tag and cannot be snipped — "
+            + "it holds the original task and its constraints\n"
             + "- Snip deletes by user-message boundary: snipping a user message also removes its following "
             + "assistant reply and tool results together (up to the next user message), so tool call/result "
             + "pairs stay intact\n"
@@ -196,7 +205,13 @@ public class SnipTool implements Tool {
             "IDs of the messages to snip from history. Use the [id:xxx] short IDs shown at the end of each "
                 + "user message (NOT message content — content text never matches). Snipped messages are "
                 + "replaced with a short summary. Deletes by user-message boundary: snipping a user message "
-                + "also removes its following assistant reply and tool results up to the next user message.");
+                + "also removes its following assistant reply and tool results up to the next user message. "
+                // [snip-protect-recent] 指向同一规则（数字同由常量拼接）
+                + "The " + SnipCompactor.KEEP_RECENT_USER_TURNS + " most recent user messages carry no [id:] "
+                + "tag and cannot be snipped — they define the current task and must stay in context. "
+                // [snip-protect-recent D4] 两条规则都指向：首条承载原始任务与约束，同样不可裁
+                + "The FIRST user message also carries no [id:] tag and cannot be snipped — "
+                + "it holds the original task and its constraints.");
 
         ObjectNode reason = props.putObject("reason");
         reason.put("type", "string");
@@ -286,6 +301,39 @@ public class SnipTool implements Tool {
                 requestedIds.size());
             return ToolResult.error(call.id(),
                 "Snip message_ids 未匹配到会话中的任何 user 消息。message_ids 应为 user 消息末尾的 [id:xxx] 短 id（每个 user 消息带 [id:xxx] tag）。");
+        }
+
+        // ── [snip-protect-recent 2026-09-13] 硬门：最后 KEEP_RECENT_USER_TURNS 条非 meta 用户消息不可 snip ──
+        //   WHY（设计规范 §5.2）：这两条消息定义「当前任务」，被裁后模型丢失意图
+        //   （用户症状「裁剪后 AI 不知道干嘛了」）。
+        //   D3 原子性：整次失败 —— 绝不静默跳过被保护项继续裁其余（规则十二 fail loud）；
+        //   代价已登记：批量点名时合法项也需重试一次，错误信息指明被保护项故重试可收敛。
+        //   规范 §2.4：拒绝保护项后删除区间必然在保护区首条 user 处停下 → 不改 nextUserIndex / 区间合并。
+        Set<Integer> protectedIdx = SnipCompactor.protectedUserIndices(ctx.messages());
+        List<Integer> violatedIdx = targetUserIndices.stream().filter(protectedIdx::contains).toList();
+        if (!violatedIdx.isEmpty()) {
+            List<?> messages = ctx.messages();
+            String protectedRefs = violatedIdx.stream()
+                .map(i -> {
+                    Object o = messages.get(i);
+                    return (o instanceof ChatMessageDto m)
+                        ? "[id:" + SnipCompactor.deriveShortMessageId(m.id()) + "]"
+                        : ("message index " + i);
+                })
+                .collect(Collectors.joining(", "));
+            // 日志计数口径：requested = 模型点名的条数（与 :293 既有那条同口径同标签）；
+            //   勿用 targetUserIndices.size()（那是【匹配到】的条数，点名 3 条只匹配到 2 条时会误导排障）。
+            log.warn("[SnipTool] 拒绝 snip 调用：目标命中受保护的最近 {} 条用户消息（保护项={}，requested={}）· 规范 §5.2 硬门（整次失败）",
+                SnipCompactor.KEEP_RECENT_USER_TURNS, protectedRefs, requestedIds.size());
+            // 文案语言：本仓自建的「面向模型的工具错误」用中文，与同方法内既有三条错误
+            //   （message_ids 为空 / 无 TUC / 未匹配到 user）一致（规则十一：同件一致性 > 跨件一致性）。
+            //   prompt() 保持英文 —— 该方法逐字对齐 CC 原文，追加条目随其风格。
+            return ToolResult.error(call.id(),
+                "不能 snip 最近 " + SnipCompactor.KEEP_RECENT_USER_TURNS + " 条用户消息："
+                    + "它们定义了当前任务，必须始终保留在上下文中。"
+                    + "受保护（未裁剪）：" + protectedRefs + "。"
+                    + "本次请求已整体拒绝 —— 未裁剪任何消息。"
+                    + "请改用更早的用户消息 [id:xxx] 重新发起。");
         }
 
         // ── 区间删除 → removedUuids（对齐 CCB /force-snip removedUuids 语义，但只删模型指定区间）──

@@ -141,6 +141,110 @@ public class SnipCompactor {
         return sb.toString();
     }
 
+    // ────────────────────────────────────────────────────────────────────
+    // [snip-protect-recent 2026-09-13] 最近 N 条「非 meta 用户消息」保护判据（单点）
+    // ────────────────────────────────────────────────────────────────────
+
+    /**
+     * 受保护、不可被 snip 的最近「非 meta 用户消息」条数。
+     *
+     * <p><b>WHY = 2</b>：用户原话「最后两个用户对话不能压缩」（设计规范 D1）—— 这两轮用户消息
+     * 定义<b>当前任务</b>，被裁掉后模型失去意图（症状「裁剪后 AI 不知道干嘛了」）。
+     * 先取命名常量、暂不配置化（YAGNI：规范 §3 非目标；如需按会话/窗口调整见残留 S3）。
+     */
+    public static final int KEEP_RECENT_USER_TURNS = 2;
+
+    /**
+     * 是否同时保护<b>首条</b>非 meta 用户消息（原始任务陈述 + 约束）。见设计规范 D4 · 首尾双保护。
+     *
+     * <p><b>WHY</b>：2026-09-13 审查者发现硬门<b>无下界</b> —— {@code SnipTool.resolveTargetUserIndices}
+     * 对 index 0 与 index n-1 一视同仁，模型仍可裁掉 U₁，此时模型的处境与用户报告的
+     * 「裁完 AI 不知道干嘛了」<b>同构</b>（只是触发点从「最新两条」换成「最早那条」）；
+     * 且 {@code SnipTool.prompt()} 里「最近 N 条」那条规则<b>在语义上暗示更早的消息可弃</b>。
+     * 故首条与尾部同保。
+     *
+     * <p><b>代价已登记</b>（规范 §6.1②）：保护集 = {@code {首条} ∪ {最后 KEEP_RECENT_USER_TURNS 条}}，
+     * 故非 meta 用户消息 <b>≤3 条时 snip 一条都裁不了</b>（比 D1 单独作用时多吃一轮）—— 判定可接受。
+     */
+    public static final boolean KEEP_FIRST_USER_MESSAGE = true;
+
+    /**
+     * 返回不可被 snip 的<b>非 meta 用户消息</b>的 index 集合 =
+     * <b>{首条非 meta user} ∪ {最后 {@link #KEEP_RECENT_USER_TURNS} 条非 meta user}</b>。
+     *
+     * <p><b>WHY 尾部</b>：snip 是<b>模型驱动</b>的（模型点 {@code [id:]} 短 id，见
+     * {@link #deriveShortMessageId(String)}），而此前 {@code [id:]} tag 打给<b>所有</b>非 meta
+     * user 消息（<b>含最新一条</b>）、且 {@code SnipTool.resolveTargetUserIndices} 无任何 index
+     * 下限 —— 模型能把投影裁光，导致「裁完 AI 不知道干嘛了」。最后两条用户消息定义了<b>当前任务</b>，
+     * 必须始终留在上下文里。
+     *
+     * <p><b>WHY 首条</b>（D4）：首条用户消息承载<b>原始任务陈述与其约束</b>，被裁后症状同构
+     * —— 见 {@link #KEEP_FIRST_USER_MESSAGE} 的说明。
+     *
+     * <p><b>与 {@code AgentLoopContext.maybeAppendSnipIdTags} 的过滤条件必须语义一致</b>
+     * （{@code role()==user && !isMeta}；本处判定见 {@link #isNonMetaUser(Object)}，
+     * 彼处取反 continue 见该方法内的首行守卫）—— <b>改一处必须同步改另一处</b>，
+     * 否则会出现「打了标记但不可裁」或「没打标记却可裁」的不一致（规则十一：同一能力只留一套判据）。
+     *
+     * <p>两处形态不同（断言式判定 vs 取反 continue），<b>刻意不抽公共谓词</b>：抽出会把
+     * 「候选过滤」（哪些消息可参与匹配）与「保护决策」（哪些消息不可被裁）两件事耦合起来。
+     *
+     * <p><b>不改区间删除逻辑的理由</b>（设计规范 §2.4）：{@code SnipTool.nextUserIndex} 找的是
+     * 「目标之后第一条 user」，故拒绝保护项后删除区间<b>必然在保护区的第一条 user 处停下</b> ——
+     * 本判据是保护区的唯一来源，区间合并无需感知它。
+     *
+     * @param messages 会话消息列表（可含 null 元素、可含 isMeta；为 {@code List<?>} 以兼容
+     *                 {@code SnipTool} 的 {@code ctx.messages()} 与 {@code AgentLoopContext} 的
+     *                 {@code messagesForLlm} 两种入参形态）
+     * @return 受保护消息的 index 集合（<b>已去重</b>：短会话里首条可能就是最后两条之一）；
+     *         null/空列表、或无非 meta user 消息 → 空集
+     */
+    public static Set<Integer> protectedUserIndices(List<?> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return Set.of();
+        }
+        Set<Integer> protectedIdx = new HashSet<>();
+
+        // ── ① 尾部：最后 KEEP_RECENT_USER_TURNS 条非 meta user（倒扫，命中 N 条即停）──
+        //   计数用独立变量 tailHits，【不要改用 protectedIdx.size()】。
+        //   今天两者等价 —— 本方法顺序是「先扫尾（①）、后并入首条（②）」。但若有人把 ② 的扫描
+        //   挪到 ① 之前（或改成以集合大小计数的单趟扫描），size() 会在【非 meta user ≥ 3 条】时
+        //   少保护尾部一条（实测 n=3 得 [0,4]、正确是 [0,2,4]，丢中间那条）；而 1~2 条时因
+        //   HashSet 去重恰好无害（n=1→[0]、n=2→[0,2] 两种写法同结果），故【那种输入查不出问题】。
+        //   即：这里要的是【顺序无关】的稳健性，不是在修当前存在的 bug。
+        int tailHits = 0;
+        for (int i = messages.size() - 1; i >= 0 && tailHits < KEEP_RECENT_USER_TURNS; i--) {
+            if (isNonMetaUser(messages.get(i))) {
+                protectedIdx.add(i);
+                tailHits++;
+            }
+        }
+
+        // ── ② 首部（D4 首尾双保护）：首条非 meta user = 原始任务陈述 + 约束 ──
+        if (KEEP_FIRST_USER_MESSAGE) {
+            for (int i = 0; i < messages.size(); i++) {
+                if (isNonMetaUser(messages.get(i))) {
+                    protectedIdx.add(i);   // HashSet → 与 ① 自动去重
+                    break;
+                }
+            }
+        }
+        return protectedIdx;
+    }
+
+    /**
+     * 受保护候选：{@code role()==user && !isMeta}。
+     *
+     * <p>本方法内 ① 尾部扫描与 ② 首部扫描<b>共用同一判据</b>（避免同文件内两套写法漂移）；
+     * 跨文件的那份对应物是 {@code AgentLoopContext.maybeAppendSnipIdTags} 的循环首行守卫
+     * （{@code m.role() != Role.user || isMeta → continue}），两处须语义一致。
+     */
+    private static boolean isNonMetaUser(Object o) {
+        return o instanceof ChatMessageDto m
+            && m.role() == Role.user
+            && !Boolean.TRUE.equals(m.isMeta());
+    }
+
     /**
      * 执行 Snip 压缩 · CC original: snipCompactIfNeeded (snipCompact.ts:83-147)
      *

@@ -125,8 +125,12 @@ class ChatServiceTranscriptFlagsPersistTest {
         ChatMessageDto tool0 = text("t0", Role.tool, "result", List.of(), "call_0");
         ChatMessageDto assistantPlain = text("a1", Role.assistant, "done");
         ChatMessageDto user1 = text("u1", Role.user, "next");
+        // [snip-protect-recent D4] history 仅作 SnipTool 输入（appends 用显式变量）；
+        //   前置换首条 up + 尾部 u2/u3 → 首尾双保护下 u0 才是合法目标（本用例意图 = transcript flags 落库）
         List<ChatMessageDto> history = new ArrayList<>(
-            List.of(user0, assistantWithTools, tool0, assistantPlain, user1));
+            List.of(text("up", Role.user, "earlier task"),
+                user0, assistantWithTools, tool0, assistantPlain, user1,
+                text("u2", Role.user, "later 1"), text("u3", Role.user, "later 2")));
 
         ToolResult<String> snipResult = asToolResult(
             new SnipTool(snipEnabledFlags()).execute(snipCall("u0"), ctxWithMessages(history)));

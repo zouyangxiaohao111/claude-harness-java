@@ -15,6 +15,7 @@ import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.OffsetDateTime;
@@ -141,14 +142,17 @@ class SnipCcbAlignTest {
 
     @Test
     void execute_rangeDelete_includesAssistantAndToolPair() {
-        // 历史：user0 → assistant0(tool_calls=call_0) → tool0(tool_result) → user1 → assistant1 → user2
+        // 历史：userPre → assistantPre → user0 → assistant0(tool_calls=call_0) → tool0(tool_result) → user1 → assistant1 → user2
+        // [snip-protect-recent D4] 前置一轮 userPre 占住「首条」保护位 → u0 落在中间、仍可被裁
+        ChatMessageDto userPre = msg("up", Role.user, "earlier task");
+        ChatMessageDto asstPre = msg("ap", Role.assistant, "ok");
         ChatMessageDto user0 = msg("u0", Role.user, "open baidu");
         ChatMessageDto asst0 = msg("a0", Role.assistant, "searching");
         ChatMessageDto tool0 = msg("t0", Role.tool, "result of call_0", "call_0");
         ChatMessageDto user1 = msg("u1", Role.user, "open apple");
         ChatMessageDto asst1 = msg("a1", Role.assistant, "ok");
         ChatMessageDto user2 = msg("u2", Role.user, "login");
-        List<ChatMessageDto> history = history(user0, asst0, tool0, user1, asst1, user2);
+        List<ChatMessageDto> history = history(userPre, asstPre, user0, asst0, tool0, user1, asst1, user2);
 
         ToolResult<String> result =
             asToolResult(new SnipTool(snipEnabledFlags()).execute(snipCall("u0"), ctxWithMessages(history)));
@@ -169,7 +173,12 @@ class SnipCcbAlignTest {
         ChatMessageDto user1 = msg("u1", Role.user, "b");
         ChatMessageDto asst1 = msg("a1", Role.assistant, "r2");
         ChatMessageDto user2 = msg("u2", Role.user, "c");
-        List<ChatMessageDto> history = history(user0, asst0, user1, asst1, user2);
+        ChatMessageDto asst2 = msg("a2", Role.assistant, "r3");
+        ChatMessageDto user3 = msg("u3", Role.user, "d");
+        ChatMessageDto userPre = msg("up", Role.user, "earlier task");
+        ChatMessageDto asstPre = msg("ap", Role.assistant, "ok");
+        // [snip-protect-recent D4] 首条保护：前置 userPre 占首条位 + 尾部 u2/u3 受保护 → u0/u1 才合法
+        List<ChatMessageDto> history = history(userPre, asstPre, user0, asst0, user1, asst1, user2, asst2, user3);
 
         // 指定 u0、u1 → 区间 [0,2) 与 [1,3) 重叠 → 合并 [0,3)
         ToolResult<String> result = asToolResult(
@@ -187,10 +196,15 @@ class SnipCcbAlignTest {
     @Test
     void execute_shortIdMatch_resolvesToUserMessageAndRangeDeletes() {
         String u0Id = "u0-" + UUID.randomUUID();
+        ChatMessageDto userPre = msg("up", Role.user, "earlier task");
+        ChatMessageDto asstPre = msg("ap", Role.assistant, "ok");
         ChatMessageDto user0 = msg(u0Id, Role.user, "open baidu");
         ChatMessageDto asst0 = msg("a0", Role.assistant, "searching");
         ChatMessageDto user1 = msg("u1", Role.user, "next");
-        List<ChatMessageDto> history = history(user0, asst0, user1);
+        ChatMessageDto asst1 = msg("a1", Role.assistant, "ok");
+        ChatMessageDto user2 = msg("u2", Role.user, "third");
+        // [snip-protect-recent D4] 首条保护：前置 userPre + 尾部 u1/u2 受保护 → u0 才合法
+        List<ChatMessageDto> history = history(userPre, asstPre, user0, asst0, user1, asst1, user2);
 
         String shortId = SnipCompactor.deriveShortMessageId(u0Id);
         ToolResult<String> result = asToolResult(
@@ -209,7 +223,10 @@ class SnipCcbAlignTest {
         ChatMessageDto user0 = msg("u0", Role.user, "a");
         ChatMessageDto user1 = msg("u1", Role.user, "b");
         ChatMessageDto user2 = msg("u2", Role.user, "c");
-        List<ChatMessageDto> history = history(user0, user1, user2);
+        ChatMessageDto user3 = msg("u3", Role.user, "d");
+        ChatMessageDto user4 = msg("u4", Role.user, "e");
+        // [snip-protect-recent] 5 条 user → 最后 2 条（u3/u4）受保护，u1 才是合法目标
+        List<ChatMessageDto> history = history(user0, user1, user2, user3, user4);
 
         ToolResult<String> result = asToolResult(
             new SnipTool(snipEnabledFlags()).execute(snipCall("u1"), ctxWithMessages(history)));
@@ -243,19 +260,24 @@ class SnipCcbAlignTest {
         CompactSettingsResolver resolver = mock(CompactSettingsResolver.class);
         when(resolver.historySnipEnabled()).thenReturn(true);
 
+        ChatMessageDto userPre = msg("up", Role.user, "earlier task");
         ChatMessageDto user = msg("u0", Role.user, "open baidu");
         ChatMessageDto asst = msg("a0", Role.assistant, "ok");
         ChatMessageDto metaUser = msg("u1", Role.user, "nudge text", null, true);
-        List<ChatMessageDto> messages = List.of(user, asst, metaUser);
+        ChatMessageDto user1 = msg("u2", Role.user, "second");
+        ChatMessageDto user2 = msg("u3", Role.user, "third");
+        // [snip-protect-recent D4] 首条 up 与尾两条 u2/u3 受保护 → 只有中间轮 u0 会打标记
+        //   （本条用例的意图 = 非 meta user 打标记、assistant/isMeta 不打）
+        List<ChatMessageDto> messages = List.of(userPre, user, asst, metaUser, user1, user2);
 
         List<ChatMessageDto> out = AgentLoopContext.maybeAppendSnipIdTags(null, resolver, messages);
 
-        assertEquals(3, out.size(), "注入不增删消息数");
+        assertEquals(6, out.size(), "注入不增删消息数");
         String expectTag = "\n[id:" + SnipCompactor.deriveShortMessageId("u0") + "]";
-        assertTrue(out.get(0).content().endsWith(expectTag),
+        assertTrue(out.get(1).content().endsWith(expectTag),
             "user 非 isMeta 消息末尾追加 [id:短id] tag（对齐 CCB messages.ts:2667-2686）");
-        assertEquals("ok", out.get(1).content(), "assistant 消息不加 tag（CCB 只给 user）");
-        assertEquals("nudge text", out.get(2).content(), "isMeta user 消息不加 tag（CCB appendMessageTagToUserMessage isMeta 跳过）");
+        assertEquals("ok", out.get(2).content(), "assistant 消息不加 tag（CCB 只给 user）");
+        assertEquals("nudge text", out.get(3).content(), "isMeta user 消息不加 tag（CCB appendMessageTagToUserMessage isMeta 跳过）");
     }
 
     @Test
@@ -279,6 +301,56 @@ class SnipCcbAlignTest {
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // [snip-protect-recent 2026-09-13 · D4 后扩为「首尾都不打」] 受保护的非 meta 用户消息不打 [id:] 标记
+    //   WHY：模型看不到 id 即无法点名（三层保护的「防误操」层；真正的保护是 SnipTool 硬门）。
+    // ────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("受保护的消息（首条 + 最后 2 条）不带 [id:] 标记")
+    void maybeAppendSnipIdTags_protectedMessagesCarryNoTag() {
+        CompactSettingsResolver resolver = mock(CompactSettingsResolver.class);
+        when(resolver.historySnipEnabled()).thenReturn(true);
+
+        // 5 轮 U/A：非 meta user = index 0,2,4,6,8 → 保护集 = {首条 0} ∪ {最后两条 6,8}
+        List<ChatMessageDto> messages = List.of(
+            msg("u1", Role.user, "turn1"), msg("a1", Role.assistant, "r1"),
+            msg("u2", Role.user, "turn2"), msg("a2", Role.assistant, "r2"),
+            msg("u3", Role.user, "turn3"), msg("a3", Role.assistant, "r3"),
+            msg("u4", Role.user, "turn4"), msg("a4", Role.assistant, "r4"),
+            msg("u5", Role.user, "turn5"), msg("a5", Role.assistant, "r5"));
+
+        List<ChatMessageDto> out = AgentLoopContext.maybeAppendSnipIdTags(null, resolver, messages);
+
+        assertFalse(out.get(0).content().contains("[id:"),
+            "★ 首条（u1）受保护（D4）→ 不打标记（原始任务陈述 + 约束，模型不得点名）");
+        assertTrue(out.get(2).content().contains("[id:"),
+            "第 2 条非 meta user（u2）落在中间 → 打标记（可被点名）");
+        assertTrue(out.get(4).content().contains("[id:"), "第 3 条非 meta user（u3）打标记");
+        assertFalse(out.get(6).content().contains("[id:"),
+            "倒数第二条（u4）受保护 → 不打标记（模型看不到 id 即无法点名）");
+        assertFalse(out.get(8).content().contains("[id:"),
+            "最后一条（u5）受保护 → 不打标记（这是用户症状的直接修复点）");
+    }
+
+    @Test
+    @DisplayName("短会话（非 meta 用户消息 ≤2 条）→ 一条标记都不打，返回原引用")
+    void maybeAppendSnipIdTags_shortSession_returnsOriginalReference() {
+        CompactSettingsResolver resolver = mock(CompactSettingsResolver.class);
+        when(resolver.historySnipEnabled()).thenReturn(true);
+
+        // 2 条非 meta user → 全部受保护 → 零 tag 注入
+        List<ChatMessageDto> twoUsers =
+            List.of(msg("u1", Role.user, "a"), msg("a1", Role.assistant, "r1"), msg("u2", Role.user, "b"));
+        assertSame(twoUsers, AgentLoopContext.maybeAppendSnipIdTags(null, resolver, twoUsers),
+            "2 条非 meta user 全受保护 → 返回原引用（零副作用，assertSame 钉住）");
+
+        // 1 条非 meta user → 同样全保护
+        List<ChatMessageDto> oneUser = List.of(msg("u1", Role.user, "a"), msg("a1", Role.assistant, "r1"));
+        assertSame(oneUser, AgentLoopContext.maybeAppendSnipIdTags(null, resolver, oneUser),
+            "1 条非 meta user 全受保护 → 返回原引用");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // 链路验证：SnipTool 只【添加 boundary】标记 removedUuids，不直接删除 state.messages；
     // 真正的剔除由下轮查询引擎（snipCompactIfNeeded）对模型请求面投影执行，state.messages 保留全量
     // ────────────────────────────────────────────────────────────────────
@@ -290,7 +362,14 @@ class SnipCcbAlignTest {
         ChatMessageDto asst0 = msg("a0", Role.assistant, "searching");
         ChatMessageDto tool0 = msg("t0", Role.tool, "result", "call_0");
         ChatMessageDto user1 = msg("u1", Role.user, "next");
-        List<ChatMessageDto> history = history(user0, asst0, tool0, user1);
+        ChatMessageDto asst1 = msg("a1", Role.assistant, "ok");
+        ChatMessageDto user2 = msg("u2", Role.user, "more");
+        ChatMessageDto asst2 = msg("a2", Role.assistant, "ok2");
+        ChatMessageDto user3 = msg("u3", Role.user, "more2");
+        ChatMessageDto userPre = msg("up", Role.user, "earlier task");
+        ChatMessageDto asstPre = msg("ap", Role.assistant, "ok");
+        // [snip-protect-recent D4] 首条保护：前置 userPre 占首条位 + 尾部 u2/u3 受保护 → u0 才合法
+        List<ChatMessageDto> history = history(userPre, asstPre, user0, asst0, tool0, user1, asst1, user2, asst2, user3);
         int before = history.size();
 
         ToolResult<String> result =

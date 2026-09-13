@@ -1,5 +1,8 @@
 package com.nexusai.application.agent.tool.impl;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -16,6 +19,7 @@ import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
+import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.OffsetDateTime;
@@ -146,10 +150,11 @@ class SnipToolTest {
 
     @Test
     void execute_withoutReason_defaultsSummaryToSnippedCount() {
-        List<ChatMessageDto> history = history("u0", "u1", "u2");
+        // [snip-protect-recent D4] 5 条 user → 首条 u0 + 尾两条 u3/u4 受保护，u1 才是合法目标
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
         SnipTool tool = new SnipTool(snipEnabledFlags());
 
-        ToolResult<String> result = asToolResult(tool.execute(snipCall("u0"), ctxWithMessages(history)));
+        ToolResult<String> result = asToolResult(tool.execute(snipCall("u1"), ctxWithMessages(history)));
 
         JsonNode data = parse(result.data());
         assertEquals(1, data.path("snipped_count").asInt());
@@ -160,10 +165,11 @@ class SnipToolTest {
 
     @Test
     void execute_ignoresMessageIdsNotInHistory() {
-        List<ChatMessageDto> history = history("u0", "u1", "u2");
+        // [snip-protect-recent] 5 条 user → 最后 2 条（u3/u4）受保护，u1/u2 才是合法目标
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
         SnipTool tool = new SnipTool(snipEnabledFlags());
 
-        // u1 存在、ghost 不存在 → 只裁剪 u1
+        // u1/u2 存在、ghost 不存在 → 只裁剪 u1,u2
         ToolResult<String> result =
             asToolResult(tool.execute(snipCall("u1", "ghost", "u2"), ctxWithMessages(history)));
 
@@ -225,7 +231,8 @@ class SnipToolTest {
         SnipTool tool = new SnipTool(snipEnabledFlags());
         ToolResult<String> result =
             asToolResult(tool.execute(snipCallWithReason("long exploration", "u0", "u1"),
-                ctxWithMessages(history("u0", "u1", "u2"))));
+                // [snip-protect-recent D4] 首条 'up' 受保护（首尾双保护）→ u0/u1 落在中间、仍合法
+                ctxWithMessages(history("up", "u0", "u1", "u2", "u3", "u4"))));
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "tool-use-1", false);
         assertEquals("Snipped 2 messages. Summary: long exploration", block.content(),
@@ -276,6 +283,149 @@ class SnipToolTest {
     }
 
     // ────────────────────────────────────────────────────────────────────
+    // [snip-protect-recent 2026-09-13] 硬门：最后 KEEP_RECENT_USER_TURNS 条非 meta 用户消息不可 snip
+    //   WHY（设计规范 §5.2）：这两条定义「当前任务」，被裁 → 模型丢失意图
+    //   （用户症状「裁剪后 AI 不知道干嘛了」）。D3：整次失败（原子），绝不静默跳过。
+    // ────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("点名最后一条用户消息 → 拒绝")
+    void rejectsNewestUserMessage() {
+        // 5 条 user → 受保护 = 最后 2 条（index 3,4）= u3,u4
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+
+        ToolResult<String> result = asToolResult(
+            new SnipTool(snipEnabledFlags()).execute(snipCall("u4"), ctxWithMessages(history)));
+
+        assertTrue(result.data().contains("不能 snip 最近 " + SnipCompactor.KEEP_RECENT_USER_TURNS
+                + " 条用户消息"),
+            "① 说明被保护的是最近 N 条用户消息");
+        assertTrue(result.data().contains("定义了当前任务，必须始终保留在上下文中"),
+            "② 说明原因（定义当前任务，必须留在上下文）");
+        assertTrue(result.data().contains("请改用更早的用户消息"),
+            "③ 给出可行动建议（改选更早的消息；错误里点名被保护项故重试可收敛）");
+        assertTrue(result.data().contains("受保护（未裁剪）："),
+            "错误点名列出了被保护的具体条目");
+        assertTrue(result.newMessages().isEmpty(), "拒绝调用不注入 boundary");
+    }
+
+    @Test
+    @DisplayName("点名最后第二条用户消息 → 拒绝")
+    void rejectsSecondNewestUserMessage() {
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+
+        ToolResult<String> result = asToolResult(
+            new SnipTool(snipEnabledFlags()).execute(snipCall("u3"), ctxWithMessages(history)));
+
+        assertTrue(result.data().contains("不能 snip 最近 " + SnipCompactor.KEEP_RECENT_USER_TURNS
+                + " 条用户消息"), "倒数第二条同样受保护");
+        assertTrue(result.newMessages().isEmpty(), "拒绝调用不注入 boundary");
+    }
+
+    @Test
+    @DisplayName("点名第三条倒数的用户消息 → 通过，且 removedUuids 不含任何保护项")
+    void allowsThirdNewestAndNeverTouchesProtected() {
+        // 设计规范 §2.4 的守护测试：拒绝保护项后，删除区间必然在保护区首条 user 处停下
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+
+        ToolResult<String> result = asToolResult(
+            new SnipTool(snipEnabledFlags()).execute(snipCall("u2"), ctxWithMessages(history)));
+
+        assertEquals(1, result.newMessages().size(), "合法目标 → 正常注入 boundary");
+        List<?> removed = (List<?>) result.newMessages().get(0).snipMetadata().get("removedUuids");
+        assertEquals(List.of("u2"), removed, "区间 [u2, u3) 在保护区首条 user（u3）处停下");
+        assertFalse(removed.contains("u3"), "保护区（倒数第二）不被吞");
+        assertFalse(removed.contains("u4"), "保护区（最后一条）不被吞");
+    }
+
+    @Test
+    @DisplayName("合法与保护项混在一批 → 整次拒绝，removedUuids 为空（原子性）")
+    void mixedBatchFailsAtomically() {
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+
+        // u1 合法（倒数第四）+ u4 受保护（最后一条）→ 整次失败，u1 也不执行（D3 原子语义）
+        ToolResult<String> result = asToolResult(
+            new SnipTool(snipEnabledFlags()).execute(snipCall("u1", "u4"), ctxWithMessages(history)));
+
+        assertTrue(result.data().contains("本次请求已整体拒绝"),
+            "混合批整次失败（不做部分成功，避免模型误以为全成功）");
+        assertTrue(result.newMessages().isEmpty(),
+            "removedUuids 为空 —— 合法的 u1 也不执行（原子性）");
+    }
+
+    @Test
+    @DisplayName("拒绝日志的 requested 取模型点名条数（不是匹配到的条数）")
+    void rejectLogCountsRequestedNotMatched() {
+        // 点名 3 条（u1 合法 / ghost 不存在 / u4 受保护）→ 实际匹配到 2 条 → 拒绝。
+        //   旧写法用 targetUserIndices.size() 会把日志写成「点名 2 条」，排障时误导。
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+        ListAppender<ILoggingEvent> app = attachWarnCapture();
+
+        try {
+            ToolResult<String> result = asToolResult(new SnipTool(snipEnabledFlags())
+                .execute(snipCall("u1", "ghost", "u4"), ctxWithMessages(history)));
+
+            assertTrue(result.data().contains("本次请求已整体拒绝"), "前置：整次拒绝已发生");
+            List<String> logs = app.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+            assertTrue(logs.stream().anyMatch(m -> m.contains("requested=3")),
+                "日志 requested 必须 = 模型点名条数 3（与同方法既有那条同口径）");
+            assertFalse(logs.stream().anyMatch(m -> m.contains("requested=2")),
+                "不得写成匹配到的 2 条（点名 3 条只匹配到 2 条时报 2 会误导排障）");
+            assertTrue(logs.stream().anyMatch(
+                    m -> m.contains(SnipCompactor.deriveShortMessageId("u4"))),
+                "日志点名列出了被保护的具体条目");
+        } finally {
+            detachWarnCapture(app);
+        }
+    }
+
+    @Test
+    @DisplayName("点名首条用户消息 → 拒绝（D4 首尾双保护）")
+    void rejectsFirstUserMessage() {
+        // D4：首条承载原始任务陈述 + 约束。硬门若只保尾部，模型可裁 U₁ ——
+        //   模型处境与用户报告的「裁完 AI 不知道干嘛了」同构（触发点换成「最早那条」）
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+
+        ToolResult<String> result = asToolResult(
+            new SnipTool(snipEnabledFlags()).execute(snipCall("u0"), ctxWithMessages(history)));
+
+        assertTrue(result.data().contains("不能 snip 最近 " + SnipCompactor.KEEP_RECENT_USER_TURNS
+                + " 条用户消息"), "★ 点名首条（index 0）必须被拒 —— 硬门下界补齐");
+        assertTrue(result.newMessages().isEmpty(), "拒绝调用不注入 boundary");
+    }
+
+    @Test
+    @DisplayName("首条与尾条混点名 → 整次拒绝（原子性对 D4 同样成立）")
+    void rejectsFirstAndTailMixedBatchAtomically() {
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", "u4");
+
+        // u0 首条 + u4 尾条 都受保护，u1 合法 → 整次失败
+        ToolResult<String> result = asToolResult(new SnipTool(snipEnabledFlags())
+            .execute(snipCall("u0", "u1", "u4"), ctxWithMessages(history)));
+
+        assertTrue(result.data().contains("本次请求已整体拒绝"), "首尾混合批同样整次失败");
+        assertTrue(result.newMessages().isEmpty(), "合法的 u1 也不执行（原子性）");
+        assertTrue(result.data().contains(SnipCompactor.deriveShortMessageId("u0"))
+                && result.data().contains(SnipCompactor.deriveShortMessageId("u4")),
+            "错误点名列出了首条与尾条两个保护项");
+    }
+
+    @Test
+    @DisplayName("用完整 UUID 点名保护项 → 也被拒")
+    void rejectsProtectedTargetByFullId() {
+        // 设计规范 §6 边界 6：完整 UUID 形态点名保护项，硬门同样覆盖（resolveTargetUserIndices 两种形态都匹配，硬门在其后）
+        String newestFullId = UUID.randomUUID().toString();
+        List<ChatMessageDto> history = history("u0", "u1", "u2", "u3", newestFullId);
+
+        ToolResult<String> result = asToolResult(
+            new SnipTool(snipEnabledFlags()).execute(snipCall(newestFullId), ctxWithMessages(history)));
+
+        assertTrue(result.data().contains("不能 snip 最近 " + SnipCompactor.KEEP_RECENT_USER_TURNS
+                + " 条用户消息"), "完整 UUID 形态点名保护项也被拒");
+        assertTrue(result.newMessages().isEmpty(), "拒绝调用不注入 boundary");
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     // helpers
     // ────────────────────────────────────────────────────────────────────
 
@@ -285,5 +435,24 @@ class SnipToolTest {
         } catch (Exception e) {
             throw new AssertionError("data 非合法 JSON: " + json, e);
         }
+    }
+
+    /** 挂 WARN 捕获到 SnipTool logger（照 SqliteBusyRetryTest:289 同构）。 */
+    private static ListAppender<ILoggingEvent> attachWarnCapture() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SnipTool.class);
+        logger.setLevel(Level.WARN);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void detachWarnCapture(ListAppender<ILoggingEvent> appender) {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SnipTool.class);
+        logger.detachAppender(appender);
+        appender.stop();
+        logger.setLevel(null); // 恢复继承（logback-test.xml 的 com.nexusai 级别），不污染同 JVM 其它用例
     }
 }

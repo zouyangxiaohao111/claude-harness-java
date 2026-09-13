@@ -3021,10 +3021,23 @@ public record AgentLoopContext(
             return messagesForLlm;
         }
         List<ChatMessageDto> out = null;
+        // [snip-protect-recent 2026-09-13 · D4 后为「首尾双保护」] 受保护的非 meta 用户消息不打 [id:] 标记
+        //   = {首条} ∪ {最后 SnipCompactor.KEEP_RECENT_USER_TURNS 条} —— 模型看不到 id 即无法点名
+        //   （三层保护的「防误操」层；真正的保护是 SnipTool 的硬门）。
+        //   判据与 SnipCompactor.protectedUserIndices 单点共享，过滤条件必须与之【语义一致】
+        //   （role==user && !isMeta：本循环取反 continue 见下方循环首行守卫，
+        //   彼处断言式判定见 SnipCompactor.isNonMetaUser(Object)）—— 改一处必须同步改另一处，
+        //   否则会出现「打了标记但不可裁」或「没打标记却可裁」的不一致（规则十一：同一能力只留一套判据）。
+        //   两处形态不同（取反 continue vs 断言式判定），刻意不抽公共谓词：抽出会把「候选过滤」
+        //   与「保护决策」两件事耦合起来。
+        Set<Integer> protectedIdx = SnipCompactor.protectedUserIndices(messagesForLlm);
         for (int i = 0; i < messagesForLlm.size(); i++) {
             ChatMessageDto m = messagesForLlm.get(i);
             if (m == null || m.role() != Role.user || Boolean.TRUE.equals(m.isMeta())) {
                 continue;   // 非目标消息：out 已初始化时元素已在复制中，无需额外处理
+            }
+            if (protectedIdx.contains(i)) {
+                continue;   // 受保护（首条 + 最后 N 条非 meta 用户消息，D4 首尾双保护）：不打标记
             }
             String tag = "\n[id:" + SnipCompactor.deriveShortMessageId(m.id()) + "]";
             String content = m.content() == null ? tag : m.content() + tag;
