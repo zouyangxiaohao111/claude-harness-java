@@ -502,142 +502,138 @@ public class RemoteAgentTaskService {
             }
             // [批 3b-D7] 定时器线程的 MDC sessionId 回放**已删**（原唯一文档化消费方是
             //   taskOutputDirSupplier → BackgroundTaskRunner.resolveSessionId 读 MDC；现输出根由各
-            //   调用点显式传会话）。⛔ 用户铁律：会话态一律显式传参，回放不算合规。
+            //   调用点显式传会话）。⛔ 用户铁律：会话态一律显式传参，回放不算合规。（批 4b-2：随之留下的空 try/finally 壳亦已删除）
             try {
-                try {
-                    RemoteAgentTaskState task = remoteTasks.get(taskId);
-                    // CC :557-563 — 任务被杀/已终态 → 静默 return（session 保留）
-                    if (task == null || task.status() != BackgroundTaskStatus.RUNNING) {
-                        return;
-                    }
-                // CC :564-578 pollRemoteSessionEvents(lastEventId) 增量
-                RemoteSessionsApi.PollResult response = sessionsApi.pollEvents(task.sessionId(), lastEventId);
-                lastEventId = response.lastEventId();
-                boolean logGrew = response.newEvents() != null && !response.newEvents().isEmpty();
-                if (logGrew) {
-                    accumulatedLog.addAll(response.newEvents());
-                    String deltaText = deltaText(response.newEvents(), task.isRemoteReview());
-                    if (!deltaText.isEmpty()) {
-                        Path output = Path.of(task.base().outputFile());
-                        RemoteTaskOutput.append(output, deltaText + "\n");
-                    }
-                }
-                // CC :579-589 archived → completed+notify+evict+删 sidecar
-                if ("archived".equals(response.sessionStatus())) {
-                    completeTask(taskId, task.title(), "completed", task.toolUseId());
+                RemoteAgentTaskState task = remoteTasks.get(taskId);
+                // CC :557-563 — 任务被杀/已终态 → 静默 return（session 保留）
+                if (task == null || task.status() != BackgroundTaskStatus.RUNNING) {
                     return;
                 }
-                // CC :590-604 completionChecker → 非 null 即完成
-                RemoteTaskCompletionChecker checker = COMPLETION_CHECKERS.get(task.remoteTaskType());
-                if (checker != null) {
-                    String completionResult = checker.check(task.remoteTaskMetadata());
-                    if (completionResult != null) {
-                        completeTask(taskId, completionResult, "completed", task.toolUseId());
-                        return;
-                    }
+            // CC :564-578 pollRemoteSessionEvents(lastEventId) 增量
+            RemoteSessionsApi.PollResult response = sessionsApi.pollEvents(task.sessionId(), lastEventId);
+            lastEventId = response.lastEventId();
+            boolean logGrew = response.newEvents() != null && !response.newEvents().isEmpty();
+            if (logGrew) {
+                accumulatedLog.addAll(response.newEvents());
+                String deltaText = deltaText(response.newEvents(), task.isRemoteReview());
+                if (!deltaText.isEmpty()) {
+                    Path output = Path.of(task.base().outputFile());
+                    RemoteTaskOutput.append(output, deltaText + "\n");
                 }
-                // CC :610 result 事件（isUltraplan/isLongRunning 跳过）
-                boolean ultraOrLong = Boolean.TRUE.equals(task.isUltraplan()) || Boolean.TRUE.equals(task.isLongRunning());
-                Map<String, Object> result = ultraOrLong ? null : findLastResult(accumulatedLog);
+            }
+            // CC :579-589 archived → completed+notify+evict+删 sidecar
+            if ("archived".equals(response.sessionStatus())) {
+                completeTask(taskId, task.title(), "completed", task.toolUseId());
+                return;
+            }
+            // CC :590-604 completionChecker → 非 null 即完成
+            RemoteTaskCompletionChecker checker = COMPLETION_CHECKERS.get(task.remoteTaskType());
+            if (checker != null) {
+                String completionResult = checker.check(task.remoteTaskMetadata());
+                if (completionResult != null) {
+                    completeTask(taskId, completionResult, "completed", task.toolUseId());
+                    return;
+                }
+            }
+            // CC :610 result 事件（isUltraplan/isLongRunning 跳过）
+            boolean ultraOrLong = Boolean.TRUE.equals(task.isUltraplan()) || Boolean.TRUE.equals(task.isLongRunning());
+            Map<String, Object> result = ultraOrLong ? null : findLastResult(accumulatedLog);
 
-                // CC :619-621 remote-review 缓存 tag（delta 扫描）
-                if (Boolean.TRUE.equals(task.isRemoteReview()) && logGrew && cachedReviewContent == null) {
-                    cachedReviewContent = RemoteAgentLogParser.extractReviewTagFromLog(response.newEvents());
-                }
-                // CC :627-656 心跳 progress 解析（最后一次出现）
-                RemoteAgentTaskState.ReviewProgress[] newProgressHolder = {null};
-                if (Boolean.TRUE.equals(task.isRemoteReview()) && logGrew) {
-                    newProgressHolder[0] = parseReviewProgress(response.newEvents());
-                }
-                // CC :660-665 stableIdle
-                boolean hasAnyOutput = hasAnyOutput(accumulatedLog, task.isRemoteReview());
-                if ("idle".equals(response.sessionStatus()) && !logGrew && hasAnyOutput) {
-                    consecutiveIdlePolls++;
-                } else {
-                    consecutiveIdlePolls = 0;
-                }
-                boolean stableIdle = consecutiveIdlePolls >= STABLE_IDLE_POLLS;
-                // CC :681-687 sessionDone / reviewTimedOut / newStatus
-                boolean hasSessionStartHook = hasSessionStartHook(accumulatedLog);
-                boolean hasAssistantEvents = hasAssistantEvents(accumulatedLog);
-                boolean sessionDone = Boolean.TRUE.equals(task.isRemoteReview())
-                    && (cachedReviewContent != null || (!hasSessionStartHook && stableIdle && hasAssistantEvents));
-                boolean reviewTimedOut = Boolean.TRUE.equals(task.isRemoteReview())
-                    && System.currentTimeMillis() - task.pollStartedAt() > REMOTE_REVIEW_TIMEOUT_MS;
-                String newStatus;
-                if (result != null) {
-                    newStatus = "success".equals(String.valueOf(result.get("subtype"))) ? "completed" : "failed";
-                } else if (sessionDone || reviewTimedOut) {
-                    newStatus = "completed";
-                } else {
-                    newStatus = accumulatedLog.isEmpty() ? "starting" : "running";
-                }
-                boolean terminal = result != null || sessionDone || reviewTimedOut;
-                long endTime = terminal ? System.currentTimeMillis() : 0L;
-
-                // CC :693-719 race 守卫 updateTaskState（prevTask.status!=='running'→bail）
-                boolean[] raceTerminated = {false};
-                RemoteAgentTaskState applied = remoteTasks.computeIfPresent(taskId, (k, prev) -> {
-                    if (prev.status() != BackgroundTaskStatus.RUNNING) {
-                        raceTerminated[0] = true;
-                        return prev;
-                    }
-                    boolean statusUnchanged = "running".equals(newStatus) || "starting".equals(newStatus);
-                    if (!logGrew && statusUnchanged) {
-                        return prev;
-                    }
-                    RemoteAgentTaskState updated = prev
-                        .withStatus("starting".equals(newStatus)
-                            ? BackgroundTaskStatus.RUNNING : parseStatus(newStatus))
-                        .withLog(new java.util.ArrayList<>(accumulatedLog));
-                    if (logGrew) {
-                        updated = updated.withTodoList(RemoteAgentLogParser.extractTodoListFromLog(accumulatedLog));
-                    }
-                    if (newProgressHolder[0] != null) {
-                        updated = updated.withReviewProgress(newProgressHolder[0]);
-                    }
-                    if (terminal) {
-                        updated = updated.withEndTime(endTime);
-                    }
-                    return updated;
-                });
-                if (raceTerminated[0]) {
-                    return;
-                }
-                if (applied != null) {
-                    framework.updateTaskState(taskId, applied.base());
-                }
-                // CC :723-758 完成/超时 → 通知 + evict + 删 sidecar
-                if (terminal) {
-                    String finalStatus = result != null && !"success".equals(String.valueOf(result.get("subtype")))
-                        ? "failed" : "completed";
-                    if (Boolean.TRUE.equals(task.isRemoteReview())) {
-                        completeRemoteReview(taskId, task, result, reviewTimedOut, sessionDone, finalStatus);
-                        return;
-                    }
-                    completeTask(taskId, task.title(), finalStatus, task.toolUseId());
-                    return;
-                }
-            } catch (Exception e) {
-                log.error("RemoteAgentTaskService.poll: task {} 轮询异常: {}", taskId, e.getMessage());
-                // CC :760-763 — API 错误重置 idle 计数
+            // CC :619-621 remote-review 缓存 tag（delta 扫描）
+            if (Boolean.TRUE.equals(task.isRemoteReview()) && logGrew && cachedReviewContent == null) {
+                cachedReviewContent = RemoteAgentLogParser.extractReviewTagFromLog(response.newEvents());
+            }
+            // CC :627-656 心跳 progress 解析（最后一次出现）
+            RemoteAgentTaskState.ReviewProgress[] newProgressHolder = {null};
+            if (Boolean.TRUE.equals(task.isRemoteReview()) && logGrew) {
+                newProgressHolder[0] = parseReviewProgress(response.newEvents());
+            }
+            // CC :660-665 stableIdle
+            boolean hasAnyOutput = hasAnyOutput(accumulatedLog, task.isRemoteReview());
+            if ("idle".equals(response.sessionStatus()) && !logGrew && hasAnyOutput) {
+                consecutiveIdlePolls++;
+            } else {
                 consecutiveIdlePolls = 0;
-                // CC :765-783 — 即使 API 失败仍检查 review timeout
-                try {
-                    RemoteAgentTaskState task = remoteTasks.get(taskId);
-                    if (task != null && Boolean.TRUE.equals(task.isRemoteReview())
-                            && task.status() == BackgroundTaskStatus.RUNNING
-                            && System.currentTimeMillis() - task.pollStartedAt() > REMOTE_REVIEW_TIMEOUT_MS) {
-                        completeTask(taskId, task.title(), "failed", task.toolUseId());
-                        return;
-                    }
-                } catch (Exception ignored) {
-                    // best effort
+            }
+            boolean stableIdle = consecutiveIdlePolls >= STABLE_IDLE_POLLS;
+            // CC :681-687 sessionDone / reviewTimedOut / newStatus
+            boolean hasSessionStartHook = hasSessionStartHook(accumulatedLog);
+            boolean hasAssistantEvents = hasAssistantEvents(accumulatedLog);
+            boolean sessionDone = Boolean.TRUE.equals(task.isRemoteReview())
+                && (cachedReviewContent != null || (!hasSessionStartHook && stableIdle && hasAssistantEvents));
+            boolean reviewTimedOut = Boolean.TRUE.equals(task.isRemoteReview())
+                && System.currentTimeMillis() - task.pollStartedAt() > REMOTE_REVIEW_TIMEOUT_MS;
+            String newStatus;
+            if (result != null) {
+                newStatus = "success".equals(String.valueOf(result.get("subtype"))) ? "completed" : "failed";
+            } else if (sessionDone || reviewTimedOut) {
+                newStatus = "completed";
+            } else {
+                newStatus = accumulatedLog.isEmpty() ? "starting" : "running";
+            }
+            boolean terminal = result != null || sessionDone || reviewTimedOut;
+            long endTime = terminal ? System.currentTimeMillis() : 0L;
+
+            // CC :693-719 race 守卫 updateTaskState（prevTask.status!=='running'→bail）
+            boolean[] raceTerminated = {false};
+            RemoteAgentTaskState applied = remoteTasks.computeIfPresent(taskId, (k, prev) -> {
+                if (prev.status() != BackgroundTaskStatus.RUNNING) {
+                    raceTerminated[0] = true;
+                    return prev;
                 }
+                boolean statusUnchanged = "running".equals(newStatus) || "starting".equals(newStatus);
+                if (!logGrew && statusUnchanged) {
+                    return prev;
+                }
+                RemoteAgentTaskState updated = prev
+                    .withStatus("starting".equals(newStatus)
+                        ? BackgroundTaskStatus.RUNNING : parseStatus(newStatus))
+                    .withLog(new java.util.ArrayList<>(accumulatedLog));
+                if (logGrew) {
+                    updated = updated.withTodoList(RemoteAgentLogParser.extractTodoListFromLog(accumulatedLog));
+                }
+                if (newProgressHolder[0] != null) {
+                    updated = updated.withReviewProgress(newProgressHolder[0]);
+                }
+                if (terminal) {
+                    updated = updated.withEndTime(endTime);
+                }
+                return updated;
+            });
+            if (raceTerminated[0]) {
+                return;
             }
-            } finally {
-                // [批 3b-D7] 回放已删 → 定时器线程现零 ThreadLocal 会话态读写，无需清理
+            if (applied != null) {
+                framework.updateTaskState(taskId, applied.base());
             }
+            // CC :723-758 完成/超时 → 通知 + evict + 删 sidecar
+            if (terminal) {
+                String finalStatus = result != null && !"success".equals(String.valueOf(result.get("subtype")))
+                    ? "failed" : "completed";
+                if (Boolean.TRUE.equals(task.isRemoteReview())) {
+                    completeRemoteReview(taskId, task, result, reviewTimedOut, sessionDone, finalStatus);
+                    return;
+                }
+                completeTask(taskId, task.title(), finalStatus, task.toolUseId());
+                return;
+            }
+        } catch (Exception e) {
+            log.error("RemoteAgentTaskService.poll: task {} 轮询异常: {}", taskId, e.getMessage());
+            // CC :760-763 — API 错误重置 idle 计数
+            consecutiveIdlePolls = 0;
+            // CC :765-783 — 即使 API 失败仍检查 review timeout
+            try {
+                RemoteAgentTaskState task = remoteTasks.get(taskId);
+                if (task != null && Boolean.TRUE.equals(task.isRemoteReview())
+                        && task.status() == BackgroundTaskStatus.RUNNING
+                        && System.currentTimeMillis() - task.pollStartedAt() > REMOTE_REVIEW_TIMEOUT_MS) {
+                    completeTask(taskId, task.title(), "failed", task.toolUseId());
+                    return;
+                }
+            } catch (Exception ignored) {
+                // best effort
+            }
+        }
             // CC :787-789 — 继续轮询
             scheduleNext();
         }

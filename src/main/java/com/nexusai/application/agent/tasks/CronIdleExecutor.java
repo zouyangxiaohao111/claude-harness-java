@@ -790,213 +790,210 @@ public class CronIdleExecutor {
             log.warn("CronIdleExecutor: cmd 无 sessionId → 本 run 无会话锚（回落全局会话/user.dir，"
                 + "DURABLE 或兼容路径，CRON-D5）: mode={} workload={}", cmd.mode(), cmd.workload());
         }
-        try {
-            // [cron-durable-session-fire] RunRequest 会话 ID 判定：
-            //   SESSION / 无项目锚（DURABLE 无会话直建 boundProject=null）→ 既有 resolveSessionUuid
-            //   （真实会话 short / null→GLOBAL_SESSION_KEY 兜底）；
-            //   DURABLE（boundProject!=null）→ 创建会话存活判定：存活 → 创建会话 short（transcript
-            //   归创建会话文件）；已关 / 无会话 → null（headless 无 transcript —— null 使
-            //   SessionStorage 三 seam 返回 null，消费方跳过写 transcript）。
-            // [session-id-short] resolveSessionUuid 返回 short 直键（不再 parseSessionUuid 归一化）。
-            String sessionUuid;
-            if (boundProject != null && !boundProject.isBlank()) {
-                boolean creatingSessionAlive = cmd.sessionId() != null && !cmd.sessionId().isBlank()
-                    && isSessionAlive(cmd.sessionId());
-                if (creatingSessionAlive) {
-                    sessionUuid = resolveSessionUuid(cmd.sessionId());
-                    log.info("CronIdleExecutor: DURABLE fire 归创建会话（存活判定通过）: sessionId={} "
-                            + "sessionUuid={}（transcript 归创建会话文件，[PROBE-DUR] Java 近似 CRON-D5："
-                            + "CC 实际注入挂载 scheduler 的活跃会话）",
-                        cmd.sessionId(), sessionUuid);
-                } else {
-                    sessionUuid = null;
-                    log.info("CronIdleExecutor: DURABLE fire headless 无 transcript（创建会话已关/无会话）: "
-                            + "sessionId={}（RunRequest.sessionId=null → SessionStorage 路径 null → 不写 transcript）",
-                        cmd.sessionId());
-                }
+        // [批 3c] 原「清裸 MDC 会话槽」（与已删的 setSession 成对）已删：本 run 不再写任何
+        //   界面/日志 MDC 槽。
+        // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot) 已删：
+        //   projectRoot ThreadLocal 载体删除，本 fire 不再捕获/回放任何线程槽。
+        // [批 1 · 方向 C] 原 finally 的 loop.clearCronProjectRootOverride()（per-run 项目身份
+        //   override 清空）随该实例字段一并删除：项目锚改由 RunRequest 承载（req 随本 fire
+        //   局部变量丢弃 → 无线程池串台面，无需清空装置）。
+        // [cron-durable-session-fire] RunRequest 会话 ID 判定：
+        //   SESSION / 无项目锚（DURABLE 无会话直建 boundProject=null）→ 既有 resolveSessionUuid
+        //   （真实会话 short / null→GLOBAL_SESSION_KEY 兜底）；
+        //   DURABLE（boundProject!=null）→ 创建会话存活判定：存活 → 创建会话 short（transcript
+        //   归创建会话文件）；已关 / 无会话 → null（headless 无 transcript —— null 使
+        //   SessionStorage 三 seam 返回 null，消费方跳过写 transcript）。
+        // [session-id-short] resolveSessionUuid 返回 short 直键（不再 parseSessionUuid 归一化）。
+        String sessionUuid;
+        if (boundProject != null && !boundProject.isBlank()) {
+            boolean creatingSessionAlive = cmd.sessionId() != null && !cmd.sessionId().isBlank()
+                && isSessionAlive(cmd.sessionId());
+            if (creatingSessionAlive) {
+                sessionUuid = resolveSessionUuid(cmd.sessionId());
+                log.info("CronIdleExecutor: DURABLE fire 归创建会话（存活判定通过）: sessionId={} "
+                        + "sessionUuid={}（transcript 归创建会话文件，[PROBE-DUR] Java 近似 CRON-D5："
+                        + "CC 实际注入挂载 scheduler 的活跃会话）",
+                    cmd.sessionId(), sessionUuid);
             } else {
-                // [R4] 已删会话的后台任务通知 → headless null 会话（无 transcript）：
-                //   mainThreadConsumable 已放行该通知（会话已删仍消费），此处 RunRequest.sessionId=null →
-                //   AgentState.sessionId=null → SessionStorage 三 seam 返回 null → 不写死会话 transcript
-                //   （复用 DURABLE 已关分支 :437-442 的 headless 语义，通知作为全局通知被模型消费，不滞留队列）。
-                if (NotificationQueue.MODE_TASK_NOTIFICATION.equals(cmd.mode())
-                        && cmd.sessionId() != null && !cmd.sessionId().isBlank()
-                        && !isSessionAlive(cmd.sessionId())) {
-                    sessionUuid = null;
-                    log.info("CronIdleExecutor: task-notification 创建会话已删 → headless 消费（无 transcript）: "
-                            + "sessionId={}（通知作为全局通知被模型消费，不滞留队列）", cmd.sessionId());
-                } else {
-                    sessionUuid = resolveSessionUuid(sessionId);
-                }
+                sessionUuid = null;
+                log.info("CronIdleExecutor: DURABLE fire headless 无 transcript（创建会话已关/无会话）: "
+                        + "sessionId={}（RunRequest.sessionId=null → SessionStorage 路径 null → 不写 transcript）",
+                    cmd.sessionId());
             }
-            // [C4 · 修订 UP-05] task-notification 空闲路径发原文（无前缀）· CC 真源：空闲触发
-            //   useQueueProcessor.ts:30-61 → processQueueIfReady → executeQueuedInput → processTextPrompt
-            //   （processTextPrompt.ts:89-94 createUserMessage({content: input}) 发原文，无任何前缀）。
-            //   wrapCommandText case 'task-notification' 前缀（messages.ts:5501-5502）仅用于 mid-turn
-            //   queued_command 注入（LlmAgentLoop.drainAndInjectQueued C4 分支）。
-            //   原实现强制加前缀声称『与 mid-turn drain 字节一致（两路径共享前缀）』属错误语义 ——
-            //   空闲=processTextPrompt 原文 / mid-turn=wrapCommandText 前缀为 CC 真源分化，用户已拍板
-            //   对齐 CC 双证 → 空闲路径去前缀回退原文（task-notification 与 prompt 统一发原文）。
-            // [Fix-P2 · Issue 2] userPrompt 统一 cmd.value() 原文（slash 与非 slash 路径一致）：
-            //   技能内容不再作 prompt 覆盖 —— 已由 executeQueuedInput 在 run 前落 isMeta DB 消息
-            //   （persistSlashMeta），LlmAgentLoop.run 经 listForResumeExcluding 从历史重载（对齐 P1
-            //   ChatService userPrompt=req.content()；CC 可见 user 消息实为 XML metadata，web 以原始
-            //   /command 气泡等价，登记差异）。
-            String promptValue = cmd.value();
-            // [OD-D6] 批量模式（extraPrompts 非空）→ RunRequest.sessionBatch：首条原文 + 后续 N-1 条原文
-            //   一次 run（对齐 CC onQuery(newMessages)）；null → 单条模式（现状 RunRequest.session）。
-            RunRequest req;
-            if (extraPrompts != null && !extraPrompts.isEmpty()) {
-                List<String> allPrompts = new ArrayList<>(extraPrompts.size() + 1);
-                allPrompts.add(promptValue);
-                allPrompts.addAll(extraPrompts);
-                req = RunRequest.sessionBatch(allPrompts, sessionUuid, null, config, modelName, null, null);
-                if (log.isInfoEnabled()) {
-                    log.info("CronIdleExecutor: 启动 agent_loop（OD-D6 批量 {} 条）, mode={}, model={}, sessionId={}",
-                        allPrompts.size(), cmd.mode(), modelName, sessionUuid);
-                }
+        } else {
+            // [R4] 已删会话的后台任务通知 → headless null 会话（无 transcript）：
+            //   mainThreadConsumable 已放行该通知（会话已删仍消费），此处 RunRequest.sessionId=null →
+            //   AgentState.sessionId=null → SessionStorage 三 seam 返回 null → 不写死会话 transcript
+            //   （复用 DURABLE 已关分支 :437-442 的 headless 语义，通知作为全局通知被模型消费，不滞留队列）。
+            if (NotificationQueue.MODE_TASK_NOTIFICATION.equals(cmd.mode())
+                    && cmd.sessionId() != null && !cmd.sessionId().isBlank()
+                    && !isSessionAlive(cmd.sessionId())) {
+                sessionUuid = null;
+                log.info("CronIdleExecutor: task-notification 创建会话已删 → headless 消费（无 transcript）: "
+                        + "sessionId={}（通知作为全局通知被模型消费，不滞留队列）", cmd.sessionId());
             } else {
-                // [OD-D5] 端后兜底携附件：残留带图 busy-queued（cmd.attachments() 含 ≤5MB base64 image）
-                //   → 10 参 RunRequest.session 附件重载 → doRun registerRunPromptImages 单次注册
-                //   （enqueue 未预登记 → 无双份；reflector MAJOR-5）。task-notification/cron 无附件 →
-                //   cmd.attachments() 空列表，行为零变化。sessionBatch 无需补附件（OD-D6 batch 仅
-                //   task-notification，不携图）。
-                req = RunRequest.session(
-                    promptValue, sessionUuid, null, config, modelName, null,
-                    null, null, null, cmd.attachments());
-                log.info("CronIdleExecutor: 启动 agent_loop, mode={}, prompt长度={}, model={}, sessionId={}, attachments={}",
-                    cmd.mode(), promptValue.length(), modelName, sessionUuid,
-                    cmd.attachments() == null ? 0 : cmd.attachments().size());
+                sessionUuid = resolveSessionUuid(sessionId);
             }
-            // [批 1 · 方向 C] DURABLE 项目锚显式传参（QueueItem.boundProject → RunRequest.boundProject）：
-            //   本 run 的 cwd / memory 项目身份由【值】承载、跨线程可见，替代原两条 ThreadLocal 通道
-            //   （CwdResolution.runWithCwdOverride + LlmAgentLoop.setCronProjectRootOverride）。
-            //   缺值语义（用户 2026-09-13 裁定 1）：
-            //     (a) 本该有却没有 ⇒ 不适用（DURABLE 无项目锚是本仓已知合法形态）；
-            //     (b) 本路径不需要 ⇒ 可跳过，但必须 ≥ WARN 可观测（⛔ 不得只 DEBUG）——
-            //         「无锚且无 sessionId」（全局 cron / 无会话直建 DURABLE）时项目根无处可解析，
-            //         回落 user.dir/configHome，故 WARN；「无锚但有 sessionId」（SESSION fire）
-            //         项目根由 sessionId 解析（值不缺失，未被跳过）→ INFO 留痕即可。
-            if (boundProject != null && !boundProject.isBlank()) {
-                req = req.withBoundProject(boundProject);
-                log.info("CronIdleExecutor: 显式项目锚已挂载 RunRequest boundProject={} "
-                        + "mode={} sessionId={}（批 1 方向 C：替代 runWithCwdOverride / cronProjectRootOverride "
-                        + "两条 ThreadLocal 通道，对齐 CC 值随队列命令直传）",
-                    boundProject, cmd.mode(), sessionId);
-            } else if (sessionId == null || sessionId.isBlank()) {
-                log.warn("CronIdleExecutor: 本 run 无项目锚（QueueItem.boundProject 空）且无 sessionId"
-                        + "→ cwd/memory 项目根无处可解析，回落 user.dir/configHome（合法 (b) 类跳过，"
-                        + "但必须可观测：mode={} workload={}）", cmd.mode(), cmd.workload());
-            } else {
-                log.info("CronIdleExecutor: 本 run 无显式项目锚（QueueItem.boundProject 空）→ 项目根由 sessionId 解析"
-                        + "（session={} mode={}，值未缺失，非跳过）", sessionId, cmd.mode());
+        }
+        // [C4 · 修订 UP-05] task-notification 空闲路径发原文（无前缀）· CC 真源：空闲触发
+        //   useQueueProcessor.ts:30-61 → processQueueIfReady → executeQueuedInput → processTextPrompt
+        //   （processTextPrompt.ts:89-94 createUserMessage({content: input}) 发原文，无任何前缀）。
+        //   wrapCommandText case 'task-notification' 前缀（messages.ts:5501-5502）仅用于 mid-turn
+        //   queued_command 注入（LlmAgentLoop.drainAndInjectQueued C4 分支）。
+        //   原实现强制加前缀声称『与 mid-turn drain 字节一致（两路径共享前缀）』属错误语义 ——
+        //   空闲=processTextPrompt 原文 / mid-turn=wrapCommandText 前缀为 CC 真源分化，用户已拍板
+        //   对齐 CC 双证 → 空闲路径去前缀回退原文（task-notification 与 prompt 统一发原文）。
+        // [Fix-P2 · Issue 2] userPrompt 统一 cmd.value() 原文（slash 与非 slash 路径一致）：
+        //   技能内容不再作 prompt 覆盖 —— 已由 executeQueuedInput 在 run 前落 isMeta DB 消息
+        //   （persistSlashMeta），LlmAgentLoop.run 经 listForResumeExcluding 从历史重载（对齐 P1
+        //   ChatService userPrompt=req.content()；CC 可见 user 消息实为 XML metadata，web 以原始
+        //   /command 气泡等价，登记差异）。
+        String promptValue = cmd.value();
+        // [OD-D6] 批量模式（extraPrompts 非空）→ RunRequest.sessionBatch：首条原文 + 后续 N-1 条原文
+        //   一次 run（对齐 CC onQuery(newMessages)）；null → 单条模式（现状 RunRequest.session）。
+        RunRequest req;
+        if (extraPrompts != null && !extraPrompts.isEmpty()) {
+            List<String> allPrompts = new ArrayList<>(extraPrompts.size() + 1);
+            allPrompts.add(promptValue);
+            allPrompts.addAll(extraPrompts);
+            req = RunRequest.sessionBatch(allPrompts, sessionUuid, null, config, modelName, null, null);
+            if (log.isInfoEnabled()) {
+                log.info("CronIdleExecutor: 启动 agent_loop（OD-D6 批量 {} 条）, mode={}, model={}, sessionId={}",
+                    allPrompts.size(), cmd.mode(), modelName, sessionUuid);
             }
-            // [queue-first B3] 真实会话命令 → 注入 streamContext（镜像 ChatService.processUserMessage
-            //   setStreamContext：wsTemplate + sessionId + userMessageId），否则助手回复不推 STOMP 前端收不到。
-            //   「真实会话」判定 = sessionUuid（与下方 replayAndPersist :640 同源）：非 null 非 GLOBAL 才推流
-            //   —— 覆盖 busy-queued / cron / task-notification（子代理/后台任务完成后主 agent 处理回复用户可见，
-            //   2026-08-27 联调修复）；headless（task-notification 会话已删 / DURABLE 已关 → sessionUuid=null）
-            //   与全局（GLOBAL_SESSION_KEY）不推流（无前端会话可收）。
-            if (sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid) && wsTemplate != null) {
-                loop.setStreamContext(wsTemplate, cmd.sessionId(), cmd.uuid());
+        } else {
+            // [OD-D5] 端后兜底携附件：残留带图 busy-queued（cmd.attachments() 含 ≤5MB base64 image）
+            //   → 10 参 RunRequest.session 附件重载 → doRun registerRunPromptImages 单次注册
+            //   （enqueue 未预登记 → 无双份；reflector MAJOR-5）。task-notification/cron 无附件 →
+            //   cmd.attachments() 空列表，行为零变化。sessionBatch 无需补附件（OD-D6 batch 仅
+            //   task-notification，不携图）。
+            req = RunRequest.session(
+                promptValue, sessionUuid, null, config, modelName, null,
+                null, null, null, cmd.attachments());
+            log.info("CronIdleExecutor: 启动 agent_loop, mode={}, prompt长度={}, model={}, sessionId={}, attachments={}",
+                cmd.mode(), promptValue.length(), modelName, sessionUuid,
+                cmd.attachments() == null ? 0 : cmd.attachments().size());
+        }
+        // [批 1 · 方向 C] DURABLE 项目锚显式传参（QueueItem.boundProject → RunRequest.boundProject）：
+        //   本 run 的 cwd / memory 项目身份由【值】承载、跨线程可见，替代原两条 ThreadLocal 通道
+        //   （CwdResolution.runWithCwdOverride + LlmAgentLoop.setCronProjectRootOverride）。
+        //   缺值语义（用户 2026-09-13 裁定 1）：
+        //     (a) 本该有却没有 ⇒ 不适用（DURABLE 无项目锚是本仓已知合法形态）；
+        //     (b) 本路径不需要 ⇒ 可跳过，但必须 ≥ WARN 可观测（⛔ 不得只 DEBUG）——
+        //         「无锚且无 sessionId」（全局 cron / 无会话直建 DURABLE）时项目根无处可解析，
+        //         回落 user.dir/configHome，故 WARN；「无锚但有 sessionId」（SESSION fire）
+        //         项目根由 sessionId 解析（值不缺失，未被跳过）→ INFO 留痕即可。
+        if (boundProject != null && !boundProject.isBlank()) {
+            req = req.withBoundProject(boundProject);
+            log.info("CronIdleExecutor: 显式项目锚已挂载 RunRequest boundProject={} "
+                    + "mode={} sessionId={}（批 1 方向 C：替代 runWithCwdOverride / cronProjectRootOverride "
+                    + "两条 ThreadLocal 通道，对齐 CC 值随队列命令直传）",
+                boundProject, cmd.mode(), sessionId);
+        } else if (sessionId == null || sessionId.isBlank()) {
+            log.warn("CronIdleExecutor: 本 run 无项目锚（QueueItem.boundProject 空）且无 sessionId"
+                    + "→ cwd/memory 项目根无处可解析，回落 user.dir/configHome（合法 (b) 类跳过，"
+                    + "但必须可观测：mode={} workload={}）", cmd.mode(), cmd.workload());
+        } else {
+            log.info("CronIdleExecutor: 本 run 无显式项目锚（QueueItem.boundProject 空）→ 项目根由 sessionId 解析"
+                    + "（session={} mode={}，值未缺失，非跳过）", sessionId, cmd.mode());
+        }
+        // [queue-first B3] 真实会话命令 → 注入 streamContext（镜像 ChatService.processUserMessage
+        //   setStreamContext：wsTemplate + sessionId + userMessageId），否则助手回复不推 STOMP 前端收不到。
+        //   「真实会话」判定 = sessionUuid（与下方 replayAndPersist :640 同源）：非 null 非 GLOBAL 才推流
+        //   —— 覆盖 busy-queued / cron / task-notification（子代理/后台任务完成后主 agent 处理回复用户可见，
+        //   2026-08-27 联调修复）；headless（task-notification 会话已删 / DURABLE 已关 → sessionUuid=null）
+        //   与全局（GLOBAL_SESSION_KEY）不推流（无前端会话可收）。
+        if (sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid) && wsTemplate != null) {
+            loop.setStreamContext(wsTemplate, cmd.sessionId(), cmd.uuid());
+            if (log.isInfoEnabled()) {
+                log.info("CronIdleExecutor: 真实会话注入 streamContext session={} userMsgId={} mode={} workload={}",
+                    cmd.sessionId(), cmd.uuid(), cmd.mode(), cmd.workload());
+            }
+        }
+        // [实时落库 2026-09-03] cron run 前武装实时落库 SPI（与主会话同一 ChatService.armRealTimePersist）：
+        //   doRun 历史注入完成后回调 → setAppendListener，cron 轮 assistant/tool/snip_boundary 逐条实时落库
+        //   （对齐 CC onFireTask 结果实时写 transcript）。门控三条件：真实会话（非 GLOBAL）/ chatService
+        //   注入 / loop.run 前。传 cmd.uuid()（=cron user 消息 id）作 DB user_message_id 归属根
+        //   （对齐原 replayAndPersist lastUserMessageId = cmd.uuid()）。cron 无 queued-user → user 分支天然跳过。
+        if (chatService != null && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)) {
+            String persistTopic = "/topic/sessions/" + sessionUuid + "/stream";
+            org.springframework.messaging.simp.SimpMessagingTemplate persistWs = wsTemplate;
+            loop.setPostHistoryPersistEnabler(state ->
+                chatService.armRealTimePersist(state, sessionUuid, persistTopic, persistWs, cmd.uuid()));
+            if (log.isInfoEnabled()) {
+                log.info("CronIdleExecutor: 实时落库 SPI 已武装 session={} userMsgId={} mode={}"
+                        + "（对齐 CC onFireTask 逐条实时写 transcript）",
+                    sessionUuid, cmd.uuid(), cmd.mode());
+            }
+        }
+        // [批 1 · 方向 C] 项目锚（boundProject）已在 req 上显式挂载（见上方 withBoundProject），
+        //   本处直接 run —— 不再经 ThreadLocal 通道注入执行线程：
+        //   原两条通道已删：① CwdResolution.runWithCwdOverride（ThreadLocal CURRENT_OVERRIDE，
+        //   派生线程读不到 → 工具链落 user.dir 的静默错值）；② loop.setCronProjectRootOverride
+        //   （实例字段 + Consumption 端写 AutoMemPaths ThreadLocal）。现 lane：值在 req 上
+        //   → resolveSessionProjectRoot(boundProject) → workspaceDir + base TUC effectiveCwd。
+        // [cron-complete 修复] 本轮耗时锚点（publishCompleteEvent duration_ms 装配用 · 与
+        //   ChatService.processUserMessage :330 同款 turn 墙钟近似）。
+        long turnStartMs = System.currentTimeMillis();
+        AgentState runState = loop.run(req);
+        // [cron-fire-visible · 目标2 实时化 2026-09-03] cron 触发结果落库 · 对齐 CC onFireTask
+        //   （useScheduledTasks.ts:110-113）：run 全程由实时落库 appendListener 逐条落 DB（run 前已武装
+        //   SPI，见上），此处仅收口：runState 非 null → 解除 appendListener（防泄漏）+ 推 message.complete。
+        //   原 replayAndPersist 批量已删。门控条件（run 前武装已判真实会话 + chatService 注入；此处
+        //   补 runState 非 null）：
+        //   ① sessionUuid 真实会话（非 null 非 GLOBAL）——headless（DURABLE 已关 / task-notification
+        //      已删会话 / missed 通知）无 transcript 不落库（对齐 [cron-durable-session-fire] headless 语义）
+        //      → run 前未武装，listener 恒 null，本处 clear 无害；
+        //   ② runState 非 null（run() 抛异常 → 无终态可收口，外层 executeQueuedInput catch 已 log.error）；
+        //   ③ chatService 注入（非 Spring 单测 null → 跳过不阻断 loop）。
+        if (runState != null) {
+            // [实时落库] run 返回后收口：解除 appendListener（防泄漏 / 下轮误触发）——恒在 runState 非 null
+            //   时执行（未武装时 listener 恒 null，clear 无害），对齐主会话 processUserMessage 收口语义。
+            runState.clearAppendListener();
+            // [SM/compact 对齐 CC] 同步解除压缩落库监听（armRealTimePersist 同点武装，防泄漏下轮）
+            runState.clearCompactPersistListener();
+        }
+        if (runState != null && chatService != null
+                && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)) {
+            String streamTopic = "/topic/sessions/" + sessionUuid + "/stream";
+            try {
+                // [cron-complete 修复] 推 message.complete 收口（userMessageId=cron user 消息 id，
+                //   对齐 effectiveEventUserMessageId 语义 = state.lastUserMessageId()=cmd.uuid()）：
+                //   复用 ChatService publishCompleteEvent（正常 turn 同款装配），前端 finalize cron 块，
+                //   不再残留 streams（根治被后续用户 turn complete 混收口倒挂）。realAssistantId=null →
+                //   方法内部回落末条 assistant 真实 id。wsTemplate null → sendAndLog 守卫跳过推送仅落库。
+                chatService.publishCompleteEvent(sessionUuid, cmd.uuid(), runState, streamTopic, wsTemplate,
+                    turnStartMs, null);
                 if (log.isInfoEnabled()) {
-                    log.info("CronIdleExecutor: 真实会话注入 streamContext session={} userMsgId={} mode={} workload={}",
-                        cmd.sessionId(), cmd.uuid(), cmd.mode(), cmd.workload());
+                    log.info("CronIdleExecutor: cron 触发实时落库+complete 收口完成 session={} mode={}"
+                            + "（对齐 CC onFireTask 结果实时写 transcript + 正常 turn complete 收口）",
+                        sessionUuid, cmd.mode());
                 }
+            } catch (Exception e) {
+                log.error("CronIdleExecutor: cron 触发 complete 收口失败 session={}: {}",
+                    sessionUuid, e.toString(), e);
             }
-            // [实时落库 2026-09-03] cron run 前武装实时落库 SPI（与主会话同一 ChatService.armRealTimePersist）：
-            //   doRun 历史注入完成后回调 → setAppendListener，cron 轮 assistant/tool/snip_boundary 逐条实时落库
-            //   （对齐 CC onFireTask 结果实时写 transcript）。门控三条件：真实会话（非 GLOBAL）/ chatService
-            //   注入 / loop.run 前。传 cmd.uuid()（=cron user 消息 id）作 DB user_message_id 归属根
-            //   （对齐原 replayAndPersist lastUserMessageId = cmd.uuid()）。cron 无 queued-user → user 分支天然跳过。
-            if (chatService != null && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)) {
-                String persistTopic = "/topic/sessions/" + sessionUuid + "/stream";
-                org.springframework.messaging.simp.SimpMessagingTemplate persistWs = wsTemplate;
-                loop.setPostHistoryPersistEnabler(state ->
-                    chatService.armRealTimePersist(state, sessionUuid, persistTopic, persistWs, cmd.uuid()));
-                if (log.isInfoEnabled()) {
-                    log.info("CronIdleExecutor: 实时落库 SPI 已武装 session={} userMsgId={} mode={}"
-                            + "（对齐 CC onFireTask 逐条实时写 transcript）",
-                        sessionUuid, cmd.uuid(), cmd.mode());
+            // [title-cc-align] CronIdleExecutor 收口补 title 生成 · 对齐 CC 所有路径汇聚 onQuery
+            //   都会检查 title（initReplBridge.ts:349-378 onUserMessage）：busy-queued（用户消息）
+            //   计数生效；cron/task-notification（非 title-worthy，isMeta=true）计数不增，幂等安全。
+            //   OD-D6 批量合并轮同样走本收口（runAgentLoop 公共路径）→ title 对合并轮生效。
+            //   sessionUuid 真实会话（headless null → 本分支不达）；cmd.uuid()=该轮 user 消息 id。
+            try {
+                SessionRecord s = sessionMapper != null ? sessionMapper.selectOneById(sessionUuid) : null;
+                if (s != null) {
+                    chatService.maybeGenerateTitle(s, cmd.uuid(),
+                        runState.lastAssistant() == null ? "" : runState.lastAssistant(), wsTemplate);
                 }
+            } catch (Exception e) {
+                log.warn("CronIdleExecutor: 收口 title 生成失败 session={}: {}",
+                    sessionUuid, e.getMessage());
             }
-            // [批 1 · 方向 C] 项目锚（boundProject）已在 req 上显式挂载（见上方 withBoundProject），
-            //   本处直接 run —— 不再经 ThreadLocal 通道注入执行线程：
-            //   原两条通道已删：① CwdResolution.runWithCwdOverride（ThreadLocal CURRENT_OVERRIDE，
-            //   派生线程读不到 → 工具链落 user.dir 的静默错值）；② loop.setCronProjectRootOverride
-            //   （实例字段 + Consumption 端写 AutoMemPaths ThreadLocal）。现 lane：值在 req 上
-            //   → resolveSessionProjectRoot(boundProject) → workspaceDir + base TUC effectiveCwd。
-            // [cron-complete 修复] 本轮耗时锚点（publishCompleteEvent duration_ms 装配用 · 与
-            //   ChatService.processUserMessage :330 同款 turn 墙钟近似）。
-            long turnStartMs = System.currentTimeMillis();
-            AgentState runState = loop.run(req);
-            // [cron-fire-visible · 目标2 实时化 2026-09-03] cron 触发结果落库 · 对齐 CC onFireTask
-            //   （useScheduledTasks.ts:110-113）：run 全程由实时落库 appendListener 逐条落 DB（run 前已武装
-            //   SPI，见上），此处仅收口：runState 非 null → 解除 appendListener（防泄漏）+ 推 message.complete。
-            //   原 replayAndPersist 批量已删。门控条件（run 前武装已判真实会话 + chatService 注入；此处
-            //   补 runState 非 null）：
-            //   ① sessionUuid 真实会话（非 null 非 GLOBAL）——headless（DURABLE 已关 / task-notification
-            //      已删会话 / missed 通知）无 transcript 不落库（对齐 [cron-durable-session-fire] headless 语义）
-            //      → run 前未武装，listener 恒 null，本处 clear 无害；
-            //   ② runState 非 null（run() 抛异常 → 无终态可收口，外层 executeQueuedInput catch 已 log.error）；
-            //   ③ chatService 注入（非 Spring 单测 null → 跳过不阻断 loop）。
-            if (runState != null) {
-                // [实时落库] run 返回后收口：解除 appendListener（防泄漏 / 下轮误触发）——恒在 runState 非 null
-                //   时执行（未武装时 listener 恒 null，clear 无害），对齐主会话 processUserMessage 收口语义。
-                runState.clearAppendListener();
-                // [SM/compact 对齐 CC] 同步解除压缩落库监听（armRealTimePersist 同点武装，防泄漏下轮）
-                runState.clearCompactPersistListener();
+        } else if (runState != null) {
+            if (log.isDebugEnabled()) {
+                log.debug("CronIdleExecutor: cron 结果跳过收口 sessionUuid={} chatServiceNull={}"
+                        + "（headless 无 transcript / 非 Spring 单测）",
+                    sessionUuid, chatService == null);
             }
-            if (runState != null && chatService != null
-                    && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)) {
-                String streamTopic = "/topic/sessions/" + sessionUuid + "/stream";
-                try {
-                    // [cron-complete 修复] 推 message.complete 收口（userMessageId=cron user 消息 id，
-                    //   对齐 effectiveEventUserMessageId 语义 = state.lastUserMessageId()=cmd.uuid()）：
-                    //   复用 ChatService publishCompleteEvent（正常 turn 同款装配），前端 finalize cron 块，
-                    //   不再残留 streams（根治被后续用户 turn complete 混收口倒挂）。realAssistantId=null →
-                    //   方法内部回落末条 assistant 真实 id。wsTemplate null → sendAndLog 守卫跳过推送仅落库。
-                    chatService.publishCompleteEvent(sessionUuid, cmd.uuid(), runState, streamTopic, wsTemplate,
-                        turnStartMs, null);
-                    if (log.isInfoEnabled()) {
-                        log.info("CronIdleExecutor: cron 触发实时落库+complete 收口完成 session={} mode={}"
-                                + "（对齐 CC onFireTask 结果实时写 transcript + 正常 turn complete 收口）",
-                            sessionUuid, cmd.mode());
-                    }
-                } catch (Exception e) {
-                    log.error("CronIdleExecutor: cron 触发 complete 收口失败 session={}: {}",
-                        sessionUuid, e.toString(), e);
-                }
-                // [title-cc-align] CronIdleExecutor 收口补 title 生成 · 对齐 CC 所有路径汇聚 onQuery
-                //   都会检查 title（initReplBridge.ts:349-378 onUserMessage）：busy-queued（用户消息）
-                //   计数生效；cron/task-notification（非 title-worthy，isMeta=true）计数不增，幂等安全。
-                //   OD-D6 批量合并轮同样走本收口（runAgentLoop 公共路径）→ title 对合并轮生效。
-                //   sessionUuid 真实会话（headless null → 本分支不达）；cmd.uuid()=该轮 user 消息 id。
-                try {
-                    SessionRecord s = sessionMapper != null ? sessionMapper.selectOneById(sessionUuid) : null;
-                    if (s != null) {
-                        chatService.maybeGenerateTitle(s, cmd.uuid(),
-                            runState.lastAssistant() == null ? "" : runState.lastAssistant(), wsTemplate);
-                    }
-                } catch (Exception e) {
-                    log.warn("CronIdleExecutor: 收口 title 生成失败 session={}: {}",
-                        sessionUuid, e.getMessage());
-                }
-            } else if (runState != null) {
-                if (log.isDebugEnabled()) {
-                    log.debug("CronIdleExecutor: cron 结果跳过收口 sessionUuid={} chatServiceNull={}"
-                            + "（headless 无 transcript / 非 Spring 单测）",
-                        sessionUuid, chatService == null);
-                }
-            }
-        } finally {
-            // [批 3c] 原「清裸 MDC 会话槽」（与已删的 setSession 成对）已删：本 run 不再写任何
-            //   界面/日志 MDC 槽。
-            // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot) 已删：
-            //   projectRoot ThreadLocal 载体删除，本 fire 不再捕获/回放任何线程槽。
-            // [批 1 · 方向 C] 原 finally 的 loop.clearCronProjectRootOverride()（per-run 项目身份
-            //   override 清空）随该实例字段一并删除：项目锚改由 RunRequest 承载（req 随本 fire
-            //   局部变量丢弃 → 无线程池串台面，无需清空装置）。
         }
     }
 

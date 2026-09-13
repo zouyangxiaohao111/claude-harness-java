@@ -1,6 +1,7 @@
 package com.nexusai.apis.session;
 
 import com.nexusai.application.agent.agent.AgentMemoryDirectory;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.infra.exception.ValidationException;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -26,12 +27,16 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code getAgentMemoryEntrypoint(agentType, scope)}（agentMemory.ts:109-114），返回
  * {@code join(getAgentMemoryDir(agentType, scope), 'MEMORY.md')}。本端点提供 REST 载体：
  * <pre>
- *   GET /api/v1/session-memory/export?agentType={type}&amp;scope={user|project|local}
+ *   GET /api/v1/session-memory/export?agentType={type}&amp;scope={user|project|local}[&amp;sessionId={sess-xxx}]
  *   → {
  *       entrypoint: "&lt;memoryDir&gt;/MEMORY.md",          // getAgentMemoryEntrypoint 结果
  *       files:      [{ path: "&lt;memoryDir&gt;/MEMORY.md", content: "..." }, ...]  // 目录内 .md 文件
  *     }
  * </pre>
+ *
+ * <p><b>[批 4b-2 · 用户裁定 #14] {@code sessionId} 必填规则</b>：{@code scope=project|local} 时**必填**
+ * （缺/解析不到 ⇒ 400）；{@code scope=user} 时**可省**（USER 基址 = memoryBase 存储基座，非项目身份，
+ * 与 cwd 无关）。
  *
  * <p><b>语义</b>（对齐 CC agentMemory.ts 导出面）：
  * <ul>
@@ -53,6 +58,10 @@ import org.springframework.web.bind.annotation.RestController;
  * <ul>
  *   <li>agentType 空/缺失 → {@link ValidationException}（400）；</li>
  *   <li>scope 非法（非 user/project/local）→ {@link ValidationException}（400）；</li>
+ *   <li><b>[批 4b-2]</b> scope=project/local 且 sessionId 缺失/空白 → {@link ValidationException}（400）；</li>
+ *   <li><b>[批 4b-2]</b> scope=project/local 且 sessionId 解析不到会话项目根（会话存在但无绑定 /
+ *       无此会话）→ {@link ValidationException}（400）。⛔ 此后端**绝不**回落 config home / user.dir
+ *       拼假项目根（那会返回与请求方无关的目录）；</li>
  *   <li>{@link AgentMemoryDirectory} 未接线 → 500（fail loud：记忆目录解析是本端点唯一职责，
  *       无静默降级，对齐 MemoryController resolveEngine 同语义）。</li>
  * </ul>
@@ -87,12 +96,15 @@ public class SessionMemoryExportController {
      *
      * @param agentType 子代理/会话 agent 类型名（目录名，冒号自动替换为横杠 · agentMemory.ts:20-22）
      * @param scope     memory scope：user / project / local（agentMemory.ts:13）
+     * @param sessionId 会话标识（{@code ?sessionId=}）· <b>[批 4b-2]</b> project/local 必填（其记忆目录
+     *                  基址 = 该会话的项目根）；user 可省（基址 = memoryBase，非项目身份）
      * @return {@code {entrypoint, files: [{path, content}]}}
      */
     @GetMapping(produces = MediaType.APPLICATION_JSON_VALUE)
     public SessionMemoryExportResponse export(
             @RequestParam(value = "agentType", defaultValue = "general-purpose") String agentType,
-            @RequestParam(value = "scope", defaultValue = "user") String scope) {
+            @RequestParam(value = "scope", defaultValue = "user") String scope,
+            @RequestParam(value = "sessionId", required = false) String sessionId) {
         AgentMemoryDirectory dir = resolveDirectory();
         if (agentType == null || agentType.isBlank()) {
             log.warn("[SessionMemoryExportController] GET /session-memory/export: agentType 缺失/空 → 400");
@@ -104,15 +116,73 @@ public class SessionMemoryExportController {
                 + "（有效: user/project/local）→ 400", scope);
             throw new ValidationException("scope must be one of: user, project, local");
         }
+        // [批 4b-2 · 用户裁定 #14] PROJECT/LOCAL 基址 = <会话项目根>/.nexusai/agent-memory[-local]/<type>
+        //   ⇒ 必须有会话项目根，且只能由本请求**显式传参**的 sessionId 解析（用户铁律：会话态一律
+        //   显式传参，回放不算合规；本端点无会话上下文可用）。缺失/解析不到一律 400：
+        //   ⛔ 不是 500（改前：AgentMemoryDirectory.requireProjectRoot 抛 IllegalStateException →
+        //      客户端无法区分自己传错与后端故障）
+        //   ⛔ 不是静默回落 config home / user.dir（批 4b-1 前行为：把
+        //      ~/.nexusai/.nexusai/agent-memory/<type> 这种「双重嵌套假目录」原样返回前端）。
+        // USER scope 基址 = memoryBase（config home 存储基座，**非**项目身份）⇒ 与 cwd 无关，无需 sessionId。
+        String explicitProjectRoot = null;
+        if (memoryScope != AgentMemoryDirectory.AgentMemoryScope.USER) {
+            explicitProjectRoot = resolveSessionProjectRoot(sessionId, scope);
+        }
         // CC getAgentMemoryEntrypoint（agentMemory.ts:109-114）= getAgentMemoryDir(agentType, scope)/MEMORY.md
-        Path entrypoint = dir.getAgentMemoryEntrypoint(agentType, memoryScope);
+        Path entrypoint = dir.getAgentMemoryEntrypoint(agentType, memoryScope, explicitProjectRoot);
         Path memoryDir = entrypoint.getParent();
         List<MemoryFileExport> files = listMemoryFiles(memoryDir);
         if (log.isInfoEnabled()) {
             log.info("[SessionMemoryExportController] GET /session-memory/export 完成: agentType={} scope={}"
-                + " entrypoint={} files={}", agentType, scope, entrypoint, files.size());
+                + " sessionId={} projectRoot={} entrypoint={} files={}",
+                agentType, scope, sessionId, explicitProjectRoot, entrypoint, files.size());
         }
         return new SessionMemoryExportResponse(entrypoint.toString(), files);
+    }
+
+    /**
+     * [批 4b-2 · 用户裁定 #14] 解析 PROJECT/LOCAL scope 所需的<b>会话项目根</b>（必填 sessionId）。
+     *
+     * <p><b>数据流</b>：{@code ?sessionId=} → {@link SessionProjectRoot#lookup(String)}（会话冻结表 /
+     * miss 回源 DB）→ 项目根绝对路径 → {@code AgentMemoryDirectory.getAgentMemoryEntrypoint(...,
+     * explicitProjectRoot)}（会话项目根显式传入，不再经任何 ThreadLocal 载体）。
+     *
+     * <p><b>三个失败出口全部 400（⛔ 无一处静默）</b>：
+     * <ol>
+     *   <li>sessionId 缺失/空白 ⇒ 「本该有却没有」⇒ 400；</li>
+     *   <li>会话存在但无绑定项目根（DB 有行、{@code main_project_id} 空 / {@code projects.path} 失效）
+     *       ⇒ 数据链路异常，400（该会话导不出 project/local 记忆）；</li>
+     *   <li>无此会话（合成/伪造/已删 id：MCP 入站、standalone fork 等现造 id）⇒ 400。
+     *       ⛔ 刻意<b>不</b>走 {@code CwdResolution.getCwdForNonSession()} 的「无会话出口」
+     *       （那会返回进程 user.dir = 与请求方无关的目录，正是本批要消灭的「冒充项目根」）。</li>
+     * </ol>
+     *
+     * @param sessionId 请求显式传入的会话标识（{@code ?sessionId=}）
+     * @param scope     原样 scope 字面量（仅用于日志/错误消息）
+     * @return 会话项目根绝对路径（恒非空 —— 否则抛）
+     * @throws ValidationException 上述任一失败出口（REST → 400）
+     */
+    private String resolveSessionProjectRoot(String sessionId, String scope) {
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[SessionMemoryExportController] GET /session-memory/export: scope={} 需要会话项目根，"
+                + "但缺少 ?sessionId= → 400（⛔ 不回落 config home / user.dir 冒充项目根）", scope);
+            throw new ValidationException("sessionId is required for scope=" + scope);
+        }
+        SessionProjectRoot.Lookup lookup = SessionProjectRoot.lookup(sessionId);
+        String projectRoot = lookup.projectRoot();
+        if (projectRoot == null || projectRoot.isBlank()) {
+            log.warn("[SessionMemoryExportController] GET /session-memory/export: scope={} 需要会话项目根，"
+                + "但 sessionId={} 解析不到（sessionKnown={}：{}）→ 400"
+                + "（⛔ 不回落 config home / user.dir 冒充项目根）",
+                scope, sessionId, lookup.sessionKnown(),
+                lookup.sessionKnown() ? "会话存在但无绑定项目根/绑定失效" : "无此会话（合成/伪造/已删 id）");
+            throw new ValidationException("sessionId has no bound project root for scope=" + scope);
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[SessionMemoryExportController] scope={} 会话项目根解析成功: sessionId={} projectRoot={}",
+                scope, sessionId, projectRoot);
+        }
+        return projectRoot;
     }
 
     /**

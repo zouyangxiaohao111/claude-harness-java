@@ -461,6 +461,22 @@ public record AgentLoopContext(
          *  <p>cwd-align-ext：默认取会话 originalCwd（CC subagent transcript 锚 getProjectDir(getOriginalCwd())
          *  sessionStorage.ts:202-205）；无 sessionId 回落 user.dir（方案 1，零行为变化）。 */
         private Path workspaceDir = Path.of(resolveDefaultWorkspaceDir());
+        /**
+         * [批 4b-2] 本 run 的<b>显式项目锚</b>（该回合的项目根，<b>非</b>会话键）· 唯一生产来源 =
+         * {@code RunRequest.boundProject()}（CronIdleExecutor 的 DURABLE cron fire 把
+         * {@code QueueItem.boundProject()} 挂上）。
+         *
+         * <p><b>为什么必须独立于 {@link #workspaceDir()}</b>：workspaceDir 虽然也承载该锚，但它的
+         * <b>默认值</b>是 {@code CwdResolution.getOriginalCwdLayerForNonSession() ?? user.dir}
+         * （见 {@link #resolveDefaultWorkspaceDir()}）—— 消费方<b>无法区分</b>「真的携带了显式锚」
+         * 与「进程工作目录兜底」。auto-memory 的会话项目根判据恰好要求「确定有锚才注入」
+         * （⛔ 否则就是用 user.dir 冒充项目根，正是 ThreadLocal 改造要消灭的缺陷）。
+         *
+         * <p><b>默认 {@code null} = 本 run 不携带显式锚</b> ⇒ 消费方回落既有会话解析路径
+         * （行为零变化：主循环无锚 run / 子代理 / hook agent 三路均不写本字段，context 工厂
+         * {@code freshSession} 新建的实例亦恒 null）。</p>
+         */
+        private Path explicitProjectAnchor;
         /** [cache-hit-fix B] 会话级 GitStatusProvider · CC context.ts:97 会话开始一次快照、会话内不更新。
          *  doRun 建 mainCtx 后经 SessionGitStatusRegistry 注入（跨 run 共享同一实例，system 尾字节稳定 →
          *  保护 deepseek 单前缀缓存）；null = 未注入（非 Spring / 无 sessionId）→ loop() 回落每 run new。 */
@@ -497,6 +513,9 @@ public record AgentLoopContext(
         public void setContentReplacementState(ContentReplacementState v) { this.contentReplacementState = v; }
         public Path workspaceDir() { return workspaceDir; }
         public void setWorkspaceDir(Path v) { this.workspaceDir = v; }
+        /** [批 4b-2] 显式项目锚（{@code RunRequest.boundProject} 的显式下传载体）；null = 本 run 无锚。 */
+        public Path explicitProjectAnchor() { return explicitProjectAnchor; }
+        public void setExplicitProjectAnchor(Path v) { this.explicitProjectAnchor = v; }
         public com.nexusai.application.agent.prompt.GitStatusProvider gitStatusProvider() { return gitStatusProvider; }
         public void setGitStatusProvider(com.nexusai.application.agent.prompt.GitStatusProvider v) { this.gitStatusProvider = v; }
         public java.util.function.Function<java.util.Map<String, Object>, java.util.Map<String, Object>> appStateReader() {

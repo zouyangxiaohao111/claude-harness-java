@@ -3731,6 +3731,9 @@ public class LlmAgentLoop implements AgentLoop {
         //   isTodoV2Enabled；生产与 5 参 factory.forSession 共用本方法为唯一汇聚点）。
         session.setPromptAlignSettingsResolver(promptAlignSettingsResolver);
         session.setWorkspaceDir(workspaceDir);
+        // [批 4b-2] 显式项目锚显式下传（与 workspaceDir 分开承载：后者含 user.dir 兜底默认值，
+        //   消费方无法区分「真锚」；见字段 javadoc）。无锚 run → null（行为零变化）。
+        session.setExplicitProjectAnchor(explicitProjectAnchor);
         // [S05] todo 读侧迁移：会话 appState 读通道注入（对齐 CC Tool.ts:182 getAppState；
         //   AgentLoopContext.maybeInjectTodoReminder 经 ctx.sessionState().appStateReader() 读
         //   appState.todos[agentId ?? sessionId]，对齐 CC attachments.ts:3304-3306）。
@@ -4687,14 +4690,18 @@ public class LlmAgentLoop implements AgentLoop {
      * 由 {@link com.nexusai.application.agent.memory.MemoryPromptBuilder#loadMemoryPrompt(String)}
      * 消费。</p>
      *
-     * <p><b>解析顺序（与改造前的 ThreadLocal 取值点逐位对齐，保证行为一致）</b>：
+     * <p><b>解析顺序（[批 4b-2] 已改为与代码一致 —— 以代码为准）</b>：
      * <ol>
      *   <li>auto-memory 未启用（{@code BundledSkillEnabledGates.isAutoMemoryEnabled()} false）→ 无注入义务，
      *       返回 {@code null}（MemoryPromptBuilder disabled 分支自行输出 null，不视为错误）。</li>
-     *   <li>{@code ctx.sessionState().workspaceDir()} 非空 → 直接返回。这是 run() 入口
-     *       {@code resolveSessionProjectRoot()} 的产物（<b>原 ThreadLocal 承载的同一值</b>，含
-     *       cron DURABLE 显式项目锚），故本步即「改造前 current 非空 → 直接返回」的等价物。</li>
-     *   <li>否则当前有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
+     *   <li><b>[批 4b-2 新增]</b> {@code ctx.sessionState().explicitProjectAnchor()} 非空 → 直接返回。
+     *       这是 run() 入口 {@code resolveSessionProjectRoot()} <b>显式锚分支</b>的产物
+     *       （{@code RunRequest.boundProject()} 直传，cron DURABLE fire），<b>不带会话 id</b>
+     *       （创建会话已关 → headless）。故本步必须在下一步「sessionId 判空」<b>之前</b>，否则锚
+     *       会随「无会话」被一律跳过（批 4b-1 登记的未决 (a) 缺口）。</li>
+     *   <li>无锚且当前 {@code streamSessionId} 为空白（真无会话：headless 无锚代）→ 无项目可锚，
+     *       ≥WARN 后返回 {@code null}（⛔ 不回落 user.dir / config home）。</li>
+     *   <li>有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
      *       冻结值（{@code run()} 入口 DB 兜底 {@code tryResolveBoundProjectFromDb}
      *       {@code sessions.main_project_id → projects.path} 成功后的产物 = DB 主路径结果；
      *       不重复查 DB，符合 F1 会话内不重查语义）。</li>
@@ -4702,24 +4709,41 @@ public class LlmAgentLoop implements AgentLoop {
      *       <b>当场 catch</b>：fail loud 记 error，本轮不注入 auto 记忆段，不让整个 turn 崩溃。</li>
      * </ol>
      *
-     * @param ctx loop 上下文（{@code streamSessionId} / {@code sessionState().workspaceDir()} 源）
-     * @return 会话项目根；auto-memory 未启用 或 确无会话（sessionId 空白且无 workspaceDir）→ null
+     * <p><b>⛔ 刻意不读 {@code ctx.sessionState().workspaceDir()}</b>：该字段的默认值是
+     * {@code CwdResolution.getOriginalCwdLayerForNonSession() ?? user.dir}
+     * （{@code LoopSessionState.resolveDefaultWorkspaceDir()}），读它等于把<b>进程工作目录</b>
+     * 当项目身份 —— 正是本批要消灭的「冒充项目根」。锚改经独立字段
+     * {@code explicitProjectAnchor} 承载（默认为 null，只有真携带锚的 run 才非空）。
+     *
+     * @param ctx loop 上下文（{@code streamSessionId} / {@code sessionState().explicitProjectAnchor()} 源）
+     * @return 会话项目根；auto-memory 未启用 或 无锚且无会话 id → null
      * @throws AutoMemoryNoBoundProjectException 会话存在但 DB 无绑定项目（且 auto-memory 启用）
      */
     private static String resolveAutoMemoryProjectRoot(com.nexusai.application.agent.loop.AgentLoopContext ctx) {
         if (!com.nexusai.application.agent.skill.BundledSkillEnabledGates.isAutoMemoryEnabled()) {
             return null;
         }
+        // [批 4b-2 · 未决 (a) 闭口] 显式项目锚优先：cron DURABLE fire 携带 RunRequest.boundProject
+        //   但**可能没有会话 id**（创建会话已关 → headless），锚由 doRun 的显式锚分支登记在
+        //   LoopSessionState.explicitProjectAnchor（值显式传参，零 ThreadLocal）。必须在下面的
+        //   sessionId 判空**之前**读，否则锚会随「无会话」被一律跳过 = 批 4b-1 登记的缺口。
+        //   ⛔ 读的是独立字段而非 workspaceDir（后者含 user.dir 兜底默认值，无法区分「真锚」）。
+        java.nio.file.Path anchor = ctx.sessionState() != null
+            ? ctx.sessionState().explicitProjectAnchor() : null;
+        if (anchor != null && !anchor.toString().isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[LlmAgentLoop] auto-memory 组装取显式项目锚（RunRequest.boundProject 直传 · "
+                    + "cron DURABLE fire，无会话 id 亦然）: projectRoot={}", anchor);
+            }
+            return anchor.toString();
+        }
         String sessionId = ctx.streamSessionId();
         if (sessionId == null || sessionId.isBlank()) {
-            // 无会话（cron headless / 无锚代）→ 确无会话项目根：不注入、不抛（保持原语义）。
-            // ⚠ 登记（批 4b-1 残留）：cron DURABLE fire 的显式项目锚（RunRequest.boundProject）不经本
-            //   解析器（QueryParams 无该字段）—— 该情形下原实现靠 ThreadLocal 注入锚值，现按「无有效
-            //   项目」跳过（≥WARN 可观测）。闭口方式 = 把锚显式穿到本方法（需改 collectRunMaterial
-            //   三处调用签名），留待批 4b-2 / 批 5。⛔ 绝不为此回落 user.dir / config home。
+            // 无锚且无会话（cron headless 无锚代 / 非会话调用）→ 确无会话项目根：不注入、不抛。
+            // ⛔ 绝不为此回落 user.dir / config home 冒充项目根（≥WARN 可观测，非静默）。
             if (log.isWarnEnabled()) {
-                log.warn("[LlmAgentLoop] auto-memory 组装无会话 id（headless/无锚）⇒ 本轮不注入 auto 记忆段"
-                    + "（⛔ 不回落 config home / user.dir 冒充项目根）");
+                log.warn("[LlmAgentLoop] auto-memory 组装无会话 id 且无显式项目锚（headless/无锚）⇒ "
+                    + "本轮不注入 auto 记忆段（⛔ 不回落 config home / user.dir 冒充项目根）");
             }
             return null;
         }
@@ -11000,6 +11024,19 @@ public class LlmAgentLoop implements AgentLoop {
     private java.nio.file.Path workspaceDir;
 
     /**
+     * [批 4b-2] 本 run 的<b>显式项目锚</b>（{@code RunRequest.boundProject()} 的归一化值）· 仅在
+     * {@link #resolveSessionProjectRoot(String)} 的<b>显式锚分支</b>赋值，其余路径恒 null。
+     *
+     * <p><b>WHY 与 {@link #workspaceDir} 分离</b>：workspaceDir 还承载「会话绑定项目根」，
+     * 而 {@code LoopSessionState.workspaceDir} 的默认值是 {@code user.dir} 兜底 —— 消费方无法
+     * 区分「真锚」与「进程工作目录」。auto-memory 需要「确定有锚才注入」（⛔ 不许 user.dir 冒充项目根），
+     * 故独立字段承载，经 {@link #buildSessionStateFromInstance()} 透传
+     * {@code LoopSessionState.explicitProjectAnchor}（批 4b-2 未决 (a) 的闭口：把锚显式穿到
+     * {@link #resolveAutoMemoryProjectRoot}，⛔ 不经任何 ThreadLocal）。
+     */
+    private java.nio.file.Path explicitProjectAnchor;
+
+    /**
      * 会话 projectRoot 解析器 · ODF-A1 per-session 注入 seam。
      *
      * <p>入参为会话 DB 主键字符串（{@code "sess-..."}，对应 LlmAgentLoop.streamSessionId）；
@@ -11108,6 +11145,9 @@ public class LlmAgentLoop implements AgentLoop {
      *        null/空白 = 无显式锚 → 走既有 streamSessionId 会话解析。
      */
     private void resolveSessionProjectRoot(String projectRootOverride) {
+        // [批 4b-2] 显式锚载体先清零：本字段只反映**本次** run 的锚，⛔ 不许上一 run 的值残留
+        //   （run() 可被同一实例重入）漂进 auto-memory 的项目根判据。
+        this.explicitProjectAnchor = null;
         // [批 1 · 方向 C] 显式项目锚整体注入（对齐 CC fire 回合 projectRoot=创建项目
         // cronTasks.ts:74-83 + paths.ts:223-235）——必须放在函数体首行、streamSessionId null
         // 守卫【之前】：cron 路径 streamSessionId 可为 null（创建会话已关 → headless），若放在
@@ -11117,6 +11157,9 @@ public class LlmAgentLoop implements AgentLoop {
         if (projectRootOverride != null && !projectRootOverride.isBlank()) {
             String normalized = normalizeSessionProjectRoot(projectRootOverride);
             this.workspaceDir = java.nio.file.Path.of(normalized);
+            // [批 4b-2] 同值登记显式锚载体（归一化后的值，与 workspaceDir 同源）——
+            //   下游 auto-memory 解析器据此在「无会话 id 的 headless fire」下也能取到项目根（未决 (a) 闭口）。
+            this.explicitProjectAnchor = this.workspaceDir;
             // [cron-durable-session-fire] transcript 键 = RunRequest.sessionId（CronIdleExecutor
             // 创建会话存活判定后传创建会话 key → 归创建会话文件；已关 → null → 不写 transcript），
             // 本锚仅承担项目身份注入，不触碰 transcript 键。
