@@ -506,14 +506,17 @@ public class SkillRegistry {
      * (b) workflow 从 {@code ~/.nexusai/.nexusai/workflows} 扫描（命令消失）；
      * (c) 缓存槽与 loop 线程分裂（重复加载）。
      *
-     * <p><b>未注入</b>（POJO/测试直构）＝ 维持既有静态回落
-     * {@link AutoMemPaths#currentSessionProjectRoot()}（确定性非 null，行为不变）。
+     * <p><b>未注入</b>（POJO/测试直构）＝ 静态回落
+     * {@link AutoMemPaths#currentSessionProjectRootOrNull()}（批 4b-1：原三级回落版
+     * {@code currentSessionProjectRoot()} 已随 ThreadLocal 载体删除，现仅剩显式 env 配置或 null）。
+     * 生产不可达（唯一构造点 {@code ToolRegistrationConfig:480} 必调 {@code setCwdSupplier}），
+     * 故该降级仅影响直构测试；返回 null 时下游 SkillsLoader 自身 cwdSupplier 兜底（⛔ 不再回落 config home）。
      *
      * @param sessionId 显式会话 ID（调用方传入；非会话来源可传 null）
-     * @return 会话 cwd；未绑定会话 → null（下游 SkillsLoader 自身 cwdSupplier 回落会话 cwd，非 config home）
+     * @return 会话 cwd；未绑定会话 / 无静态回落源 → null（下游 SkillsLoader 自身 cwdSupplier 回落会话 cwd，非 config home）
      */
     private String resolveSessionCwd(String sessionId) {
-        return cwdSupplier != null ? cwdSupplier.apply(sessionId) : AutoMemPaths.currentSessionProjectRoot();
+        return cwdSupplier != null ? cwdSupplier.apply(sessionId) : AutoMemPaths.currentSessionProjectRootOrNull();
     }
 
     /**

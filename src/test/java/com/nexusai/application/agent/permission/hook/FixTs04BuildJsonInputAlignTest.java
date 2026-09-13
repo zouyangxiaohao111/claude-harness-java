@@ -133,13 +133,11 @@ class FixTs04BuildJsonInputAlignTest {
 
     @AfterEach
     void tearDown() {
-        AutoMemPaths.resetCurrentProjectRoot();
     }
 
     @Test
     @DisplayName("1. PreToolUse + subagent ctx → jsonInput 含 transcript_path/cwd/agent_type/permission_mode/session_id")
     void preToolUse_subagentCtx_jsonInputAllSixFields() throws Exception {
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
 
@@ -179,7 +177,6 @@ class FixTs04BuildJsonInputAlignTest {
         //   effectiveCwd=null → compact ctor 经 CwdResolution.getCwd(sessionId) 解析 → boundProject
         //   （SessionProjectRoot.getForSession，work 域）。绑定 sessionId→"C:/proj" 验证 hook cwd 经
         //   CwdResolution.boundProject 流转（非 AutoMemPaths identity —— CC getCwd 不读 identity projectRoot）。
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
 
@@ -207,7 +204,6 @@ class FixTs04BuildJsonInputAlignTest {
     @Test
     @DisplayName("3. 事件 sessionId=null → session_id 回退到显式载体 parentTuc.sessionId()（REQ-01）")
     void sessionIdNullEvent_fallsBackToParentTucSession() throws Exception {
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
 
@@ -235,7 +231,6 @@ class FixTs04BuildJsonInputAlignTest {
     @Test
     @DisplayName("4. Stop 事件 data 已有 agent_type → 不双写（单值 REQ-06）")
     void stopEvent_dataAgentType_singleValue() throws Exception {
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.STOP);
 
@@ -260,7 +255,6 @@ class FixTs04BuildJsonInputAlignTest {
     @Test
     @DisplayName("5. permissionRequest 7 参顶层 permission_mode 已有 → 不覆盖（ctx DEFAULT 不覆盖 acceptEdits）")
     void permissionRequest_topLevelPermissionMode_notOverridden() throws Exception {
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PERMISSION_REQUEST);
 
@@ -287,7 +281,6 @@ class FixTs04BuildJsonInputAlignTest {
         // WHY [G14]: 无 ctx 事件 parentTuc=null → L3 CwdResolution.getCwd(sessionId)。绑定 sessionId→
         //   "C:/proj" 验证无 ctx 场景 hook cwd 经 CwdResolution.boundProject 恒备（REQ-01 三恒备字段），
         //   非 AutoMemPaths.identity（CC createBaseHookInput cwd=getCwd()）。
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.SESSION_START, null);
 
@@ -314,7 +307,6 @@ class FixTs04BuildJsonInputAlignTest {
     @Test
     @DisplayName("7. PermissionDenied 工具事件 + subagent ctx → agent_type/permission_mode 注入")
     void permissionDeniedToolEvent_injectsCtxFields() throws Exception {
-        AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PERMISSION_DENIED);
 

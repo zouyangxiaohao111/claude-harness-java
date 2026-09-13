@@ -419,10 +419,27 @@ public class ClaudemdEngine {
      * @return 有序 MemoryFileInfo 列表（父在前，@include 子在后）
      */
     public List<MemoryFileInfo> getMemoryFiles(boolean forceIncludeExternal, String sessionId) {
+        return getMemoryFiles(forceIncludeExternal, sessionId, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #getMemoryFiles(boolean, String)}。
+     *
+     * <p>WHY 需要会话项目根：AutoMem entrypoint（{@code getAutoMemEntrypoint}）与 TeamMem 目录
+     * （{@code getTeamMemPath}）都派生自 per-project auto-memory 目录 —— 原先经
+     * {@code AutoMemPaths.CURRENT_PROJECT_ROOT} ThreadLocal 隐式解析，载体已删 ⇒ 会话线程由调用方
+     * 显式传入（缺失 ⇒ 返回 null 即该两项跳过，⛔ 不回落 config home 拼假目录）。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（null → 无显式根：AutoMem/TeamMem 两项不产出）
+     */
+    public List<MemoryFileInfo> getMemoryFiles(boolean forceIncludeExternal, String sessionId,
+                                               String sessionProjectRoot) {
         // [批 3c] sessionId 为**显式入参**（原经裸 MDC 会话槽取，该槽已删）：仅用于 InstructionsLoaded
         //   hook 载荷的 session_id 字段，不参与缓存键（缓存键仍为 forceIncludeExternal，与旧行为一致）。
+        // [批 4b-1] sessionProjectRoot 同为显式入参（原经 AutoMemPaths ThreadLocal 取），亦不参与缓存键
+        //   —— 与 sessionId 同款既有语义（缓存按 forceIncludeExternal 单飞，首个调用者的会话上下文胜出）。
         return memoryFilesCache.computeIfAbsent(forceIncludeExternal,
-            key -> computeMemoryFiles(key, sessionId));
+            key -> computeMemoryFiles(key, sessionId, sessionProjectRoot));
     }
 
     /**
@@ -430,7 +447,8 @@ public class ClaudemdEngine {
      * （CLD-01）。one-shot 标志（{@link #consumeNextEagerLoadReason}/{@link #hasLoggedInitialLoad}）
      * 在单飞语义下每次缓存 miss 仅消费一次。
      */
-    private List<MemoryFileInfo> computeMemoryFiles(boolean forceIncludeExternal, String sessionId) {
+    private List<MemoryFileInfo> computeMemoryFiles(boolean forceIncludeExternal, String sessionId,
+                                                    String sessionProjectRoot) {
         long startTime = System.currentTimeMillis();
         if (log.isDebugEnabled()) {
             log.debug("[ClaudemdEngine] getMemoryFiles 开始: forceIncludeExternal={}", forceIncludeExternal);
@@ -536,7 +554,9 @@ public class ClaudemdEngine {
 
         // 6. Memdir entrypoint（MEMORY.md）· isAutoMemoryEnabled 门控
         if (BundledSkillEnabledGates.isAutoMemoryEnabled()) {
-            MemoryFileInfo entry = safelyReadEntrypoint(autoMemPaths.getAutoMemEntrypoint(),
+            // [批 4b-1] 显式会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）
+            MemoryFileInfo entry = safelyReadEntrypoint(
+                autoMemPaths.getAutoMemEntrypoint(sessionProjectRoot),
                 ClaudemdMemoryType.AUTO_MEM);
             if (entry != null) {
                 String normalized = normalizeForComparison(entry.path());
@@ -550,7 +570,8 @@ public class ClaudemdEngine {
         // 7. Team memory entrypoint · feature('TEAMMEM') 门控
         if (bool(teamMemoryEnabled) && memoryFileDetection.isTeamMemoryEnabled()) {
             // A′: 无有效项目 → team 目录不存在（getTeamMemPath()==null）→ 跳过（不拼 null 进 Paths.get）
-            String teamMemDir = memoryFileDetection.getTeamMemPath();
+            // [批 4b-1] 显式会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）
+            String teamMemDir = memoryFileDetection.getTeamMemPath(sessionProjectRoot);
             if (teamMemDir == null) {
                 if (log.isDebugEnabled()) {
                     log.debug("[ClaudemdEngine] 无有效项目，team memory 目录不存在，跳过 TeamMem entrypoint");
@@ -1672,6 +1693,15 @@ public class ClaudemdEngine {
      *                  {@link #resolveOriginalCwd(String)} 一次性 WARN + user.dir 兜底
      */
     public String getMemoryPath(ClaudemdMemoryType type, String sessionId) {
+        return getMemoryPath(type, sessionId, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #getMemoryPath(ClaudemdMemoryType, String)}。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（AUTO_MEM/TEAM_MEM 分支必需；null → 该两分支返回 null）
+     */
+    public String getMemoryPath(ClaudemdMemoryType type, String sessionId, String sessionProjectRoot) {
         return switch (type) {
             // 决策 D1/D3：User memory 改 NexusaiPaths 自有根优先；nexusai 文件缺失时读取链
             //   claude 回落（读 ~/.claude/CLAUDE.md，CC 只读兼容）。
@@ -1681,10 +1711,11 @@ public class ClaudemdEngine {
             case LOCAL -> Paths.get(resolveOriginalCwd(sessionId), "CLAUDE.local.md").toString();
             case PROJECT -> Paths.get(resolveOriginalCwd(sessionId), "CLAUDE.md").toString();
             case MANAGED -> Paths.get(ClaudePaths.getManagedFilePath(), "CLAUDE.md").toString();
-            case AUTO_MEM -> autoMemPaths.getAutoMemEntrypoint();   // A′: 无有效项目 → null
+            // A′: 无有效项目 → null；[批 4b-1] 项目根显式传入（原经 ThreadLocal 隐式解析）
+            case AUTO_MEM -> autoMemPaths.getAutoMemEntrypoint(sessionProjectRoot);
             case TEAM_MEM -> {
                 // A′: 无有效项目 → team 目录不存在 → null（不拼 null 进 Paths.get）
-                String teamMemDir = memoryFileDetection.getTeamMemPath();
+                String teamMemDir = memoryFileDetection.getTeamMemPath(sessionProjectRoot);
                 yield teamMemDir == null ? null : Paths.get(teamMemDir, "MEMORY.md").toString();
             }
         };

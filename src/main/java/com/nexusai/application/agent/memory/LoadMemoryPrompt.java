@@ -37,8 +37,34 @@ public class LoadMemoryPrompt {
 
     private final MemoryPromptBuilder builder;
 
+    /**
+     * [批 4b-1] 会话项目根（显式下传）· {@code null} = 调用方未提供显式根 → 退回
+     * {@link MemoryPromptBuilder#loadMemoryPrompt()} 的无参路径（类级根供应 = env 或 null）。
+     *
+     * <p><b>WHY 显式</b>：{@link MemoryPromptBuilder} 的 per-project auto-memory 目录需要「会话绑定项目根」。
+     * 批 4b-1 前该值经 {@code AutoMemPaths.CURRENT_PROJECT_ROOT} ThreadLocal 隐式读取（载体已删）；
+     * 现由装配点（{@code LlmAgentLoop.buildSystemPromptAssemblyInput}）解析一次并随本对象显式传递
+     * —— 用户铁律：会话态一律显式传参（回放不算合规）。
+     */
+    private final String sessionProjectRoot;
+
+    /**
+     * 兼容构造器 · 无显式根（退回类级根供应语义，行为与批 4b-1 前一致）。
+     */
     public LoadMemoryPrompt(MemoryPromptBuilder builder) {
+        this(builder, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根构造器。
+     *
+     * @param builder            记忆 prompt 构建器
+     * @param sessionProjectRoot 会话绑定项目根（该会话的 auto-memory per-project 派生基址）；
+     *                           {@code null} = 未提供 → 退回无参路径（env/类级供应）
+     */
+    public LoadMemoryPrompt(MemoryPromptBuilder builder, String sessionProjectRoot) {
         this.builder = builder;
+        this.sessionProjectRoot = sessionProjectRoot;
     }
 
     /**
@@ -47,7 +73,9 @@ public class LoadMemoryPrompt {
      * @return 行为指令 prompt 文本；auto memory 禁用时返回 {@code null}（INV-3 disabled→null）
      */
     public String loadMemoryPrompt() {
-        String prompt = builder.loadMemoryPrompt();
+        String prompt = sessionProjectRoot != null
+            ? builder.loadMemoryPrompt(sessionProjectRoot)
+            : builder.loadMemoryPrompt();
         if (log.isDebugEnabled()) {
             log.debug("[LoadMemoryPrompt] 分发结果: {}", prompt == null ? "null(disabled)" : prompt.length() + " chars");
         }
@@ -60,8 +88,9 @@ public class LoadMemoryPrompt {
      * <p>内部委托 {@link #loadMemoryPrompt()}（同一分发源）：非 null → 单个 attachment；
      * disabled（null）→ 空列表（memory section 不产生内容）。
      *
-     * <p>原 {@code loadMemoryPrompt(PromptContext)} 的 ctx 参数已删除（DC-V5-14：B 契约 ctx 未消费，
-     * 多会话记忆隔离由 AutoMemPaths ThreadLocal projectRoot 保证，不依赖 PromptContext）。
+     * <p>原 {@code loadMemoryPrompt(PromptContext)} 的 ctx 参数已删除（DC-V5-14：B 契约 ctx 未消费）。
+     * [批 4b-1] 多会话记忆隔离改由<b>构造期显式携带的 sessionProjectRoot</b> 保证（原经 AutoMemPaths
+     * ThreadLocal，载体已删除 —— 用户铁律：会话态一律显式传参）。
      *
      * @return 记忆附件列表（可为空）
      */

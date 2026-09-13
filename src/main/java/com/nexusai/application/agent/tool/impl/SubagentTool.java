@@ -7,7 +7,6 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.coordinator.CoordinatorMode;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionRule;
@@ -2918,7 +2917,7 @@ public class SubagentTool implements Tool {
         AgentDefinitionRegistry reg = registryFor(sessionCwdFor(parentCtx));
 
         // 创建 SubagentExecutor（方案 1：复用 LlmAgentLoop）
-        String effectiveSystemPrompt = getEffectiveSystemPrompt(selectedAgent);
+        String effectiveSystemPrompt = getEffectiveSystemPrompt(selectedAgent, parentCtx);
         // s06 P2-2 修补: 从 mainLoop 提取 parentToolUseContext (对齐 CC AgentTool.tsx:700)
         // 之前 audit 偏差: parentTUC 硬编码 null, 子 Agent 完全独立于父 (cold start)
         // [2026-08-26 父TUC 修复] parentCtx（executeSync/Async 从 doExecute 的 ctx 透传 =
@@ -3003,16 +3002,9 @@ public class SubagentTool implements Tool {
                 currentCwd);
         }
 
-        // [批 2 · B 类清理] 原此处为
-        //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
-        //   （AutoMemPaths:113 返回值直接 set 回 ThreadLocal，恒 no-op），注释却声称
-        //   「同步 spawn 作用域注入会话 projectRoot（修 M-05/M-06）」——与实语句不符，已删除该 set。
-        //   真实注入源 = 本方法调用方 StreamingToolExecutor 工具池 :2465（调度线程捕获 →
-        //   任务体线程注入，sync 与 async 同源），本作用域无需重复注入。
-        //   保留 capture/restore 成对，语义校正为「退出复位」：子代理 loop 内 prompt 组装
-        //   （LlmAgentLoop:4642 ensureAutoMemoryProjectRootResolvedForPrompt）会在**本池化线程**
-        //   未成对 set 会话 projectRoot；不在此复位则残留值随线程复用泄漏到别的会话工具执行。
-        final String prevSyncProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
+        // [批 2 · B 类清理 + 批 4b-1] 原有的一对 capture/restore（原语义「退出复位子代理 loop 内
+        //   prompt 组装未成对 set 的会话 projectRoot」）已随 ThreadLocal 载体删除一并移除：
+        //   载体不复存在 ⇒ 无「未成对 set 的残留值」可复位（用户铁律：会话态一律显式传参）。
         // [IMP-SUB-28 A5] sync 路径接流式（原残余 executor.execute → sink=null 不达父 caller）。
         //   父 caller（StreamingToolExecutor 注入 onProgress）现可逐消息观测子 Agent 产出。
         //   CC 真源 AgentTool.tsx:783-810 同步路径 for-await + onProgress 上报。
@@ -3081,10 +3073,8 @@ public class SubagentTool implements Tool {
             // P0-2 修复: 与 doExecute 中的 setCwd('tool-' + toolUseId, ...) 配对的清理,
             //   避免 activeSessionCount 单调递增 (清理到对应前缀 key, 无 entry 时 no-op).
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
-            // [批 2 · B 类清理] 退出复位（**非**「恢复被本作用域覆盖的值」——本作用域已无 set，
-            //   见 executeSync 入口注释）：清理子代理 loop 内 prompt 组装（LlmAgentLoop:4642）
-            //   在本池化线程上未成对 set 的会话 projectRoot；null → 移除回落生效。
-            AutoMemPaths.restoreCurrentProjectRoot(prevSyncProjectRoot);
+            // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevSyncProjectRoot) 已删
+            //   （ThreadLocal 载体删除，见 executeSync 入口注释）。
         }
     }
 
@@ -3230,26 +3220,20 @@ public class SubagentTool implements Tool {
                 final UUID ag = agentId;
                 // [Phase A 任务 6] 构造 AsyncAgentFinalizer (注入 runner, 集中收敛终态化逻辑)
                 AsyncAgentFinalizer finalizer = new AsyncAgentFinalizer(runnerRef);
-                // [IMP-D F4/M-05] 调度线程（工具线程 · IMP-C 已注入）捕获父会话 projectRoot →
-                //   asyncWorker 新线程（ThreadLocal 不跨线程）注入：子代理 agent-memory / hook 载荷 /
-                //   transcript / userContext 读会话值而非回落（修 M-05/M-06/M-12）。restore 线程原值
-                //   成对，多嵌套子代理不串台。
-                final String parentProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
+                // [批 4b-1] 原 [IMP-D F4/M-05]「调度线程捕获父会话 projectRoot → asyncWorker 注入 →
+                //   finally restore」回放块已删：AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 载体
+                //   删除，无可回放对象（用户铁律：会话态一律显式传参，回放不算合规）。
                 // [批 3c] 原此处有 [reqId MDC 传播] 回放块（调度线程捕获 MDC context map → 异步线程
                 //   setContextMap → finally restore），已**删除**：其唯一消费者是 (a) logback
                 //   %X{sessionId}/%X{reqId} 前缀（本批已移除）与 (b) TaskSystemConfig.isTodoV2Enabled()
                 //   读 MDC reqId（本批已改为**进程级**判定）。会话标识改由各调用点**显式传参**。
-                //   ⚠ 下方 AutoMemPaths projectRoot 回放**仍然承重**（归批 4 收敛），保留不动。
                 Thread asyncWorker = new Thread(() -> {
-                    // [IMP-D F4/M-05] 线程体注入：capture 线程原值 → set 父值 → finally restore（成对）。
-                    String prevAsyncProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
+                    // [批 4b-1] 原「capture 线程原值 -> set 父值 -> finally restore」回放块已删：
+                    //   AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 载体删除，无可回放对象
+                    //   （用户铁律：会话态一律显式传参，回放不算合规）。
                     try {
-                        if (parentProjectRoot != null && !parentProjectRoot.isBlank()) {
-                            AutoMemPaths.setCurrentProjectRoot(parentProjectRoot);
-                        }
-                        try {
                         ToolRegistry subagentToolRegistry = createSubagentToolRegistry(sel, true);
-                        String effectiveSystemPrompt = getEffectiveSystemPrompt(sel);
+                        String effectiveSystemPrompt = getEffectiveSystemPrompt(sel, parentTUC);
                         SubagentExecutor exec = new SubagentExecutor(
                             subagentToolRegistry, hookRegistry, mainLoop,
                             llmProviderFactory, effectiveProviderConfig(effectiveModel),
@@ -3353,11 +3337,7 @@ public class SubagentTool implements Tool {
                                     registeredName, ag);
                             }
                         }
-                    }
-                    } finally {
-                        // [IMP-D F4/M-05] 成对 restore 线程原值（null → 移除回落生效）。
-                        AutoMemPaths.restoreCurrentProjectRoot(prevAsyncProjectRoot);
-                    }
+                        }
                 }, "async-subagent-" + ag);
                 asyncWorker.setDaemon(true);
                 asyncWorker.start();
@@ -3386,7 +3366,7 @@ public class SubagentTool implements Tool {
         // 降级路径 (backgroundTaskRunner 未注入或失败): 同步执行
         log.warn("[SubagentTool] Phase 3: BackgroundTaskRunner 未注入, 降级到同步执行 (临时)");
         ToolRegistry subagentToolRegistry = createSubagentToolRegistry(selectedAgent, false);
-        String effectiveSystemPrompt = getEffectiveSystemPrompt(selectedAgent);
+        String effectiveSystemPrompt = getEffectiveSystemPrompt(selectedAgent, parentCtx);
         // [2026-08-26 父TUC 修复] parentCtx 替代 mainLoop（恒 null）
         ToolUseContext parentTUC = parentCtx != null
                 ? parentCtx
@@ -3438,14 +3418,9 @@ public class SubagentTool implements Tool {
         //   使降级路径 identity 与 async 生成点一致（CC AgentTool.tsx:580 earlyAgentId），
         //   无 BackgroundTask 时也不影响（无 taskId 引用，纯一致性）。
         executor.setAgentIdOverride(agentId);
-        // [批 2 · B 类清理] 原此处为
-        //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
-        //   （AutoMemPaths:113 返回值直接 set 回 ThreadLocal，恒 no-op）；真实注入源 = 本方法
-        //   调用方工具池 :2465（StreamingToolExecutor 调度线程捕获 → 任务体线程注入）。已删除该 set。
-        //   保留 capture/restore 成对，语义校正为「退出复位」（清理子代理 loop 内 prompt 组装
-        //   LlmAgentLoop:4642 在本池化线程上未成对 set 的值）。
+        // [批 2 · B 类清理 + 批 4b-1] 原有的一对 capture/restore 已随 ThreadLocal 载体删除一并移除
+        //   （见 executeSync 入口注释：载体不复存在 ⇒ 无残留值可复位）。
         // [IMP-SUB-28 A5] 降级 sync 路径同样接流式（同步语义 → 父 onProgress 可观测）。
-        final String prevFallbackProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
         // [冲突裁决·并集] HEAD=IMP-G4 组11-1 analytics+agentNameRegistry 注入（降级 sync 同样 hard_metrics
         //   归因 + name→agentId）；subagent_v3=IMP-SUB-28 A5 fallbackStreamingSink 降级 sync 流式接线
         //   （CC AgentTool.tsx:783-810 onProgress）。两组语句独立互补、无顺序依赖，全部保留。
@@ -3497,9 +3472,8 @@ public class SubagentTool implements Tool {
         } finally {
             // P0-2 修复: executeAsync 降级到同步执行的清理 (与 doExecute 中的 setCwd 配对).
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
-            // [批 2 · B 类清理] 退出复位（非「恢复被本作用域覆盖的值」——本作用域已无 set，
-            //   见本方法入口注释）；null → 移除回落生效。
-            AutoMemPaths.restoreCurrentProjectRoot(prevFallbackProjectRoot);
+            // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevFallbackProjectRoot) 已删
+            //   （ThreadLocal 载体删除，见本方法入口注释）。
         }
     }
 
@@ -3770,25 +3744,19 @@ public class SubagentTool implements Tool {
         }
         AsyncAgentFinalizer finalizer = new AsyncAgentFinalizer(runnerRef);
         // [IMP-D F4/M-05] resume 调度线程（调用线程）捕获父会话 projectRoot → 注入
-        //   asyncWorker 新线程（ThreadLocal 不跨线程 · 修 M-05/M-06）。restore 成对。
-        final String parentResumeProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
+        // [批 4b-1] 原「resume 调度线程捕获父会话 projectRoot -> asyncWorker 新线程注入 ->
+        //   finally restore」回放块已删（CURRENT_PROJECT_ROOT ThreadLocal 载体删除，无可回放对象）。
         // [批 3c] 原 [reqId MDC 传播] 回放块已删（同 executeAsync 的 WHY：logback 前缀已移除 +
         //   isTodoV2Enabled 判定已进程级；会话标识一律显式传参）。
-        //   ⚠ 下方 AutoMemPaths projectRoot 回放仍承重（归批 4），保留不动。
+        // [批 4b-1] 原「⚠ 下方 AutoMemPaths projectRoot 回放仍承重」注记作废：该回放已删。
         Thread asyncWorker = new Thread(() -> {
-            // [IMP-D F4/M-05] 线程体注入：capture 线程原值 → set 父值 → finally restore（成对）。
-            String prevResumeProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-            try {
-                if (parentResumeProjectRoot != null && !parentResumeProjectRoot.isBlank()) {
-                    AutoMemPaths.setCurrentProjectRoot(parentResumeProjectRoot);
-                }
             try {
                 // [FORK-05] fork-resume 判定 = forkParentSystemPrompt 非空（CC isResumedFork；
                 //   resumeAgent.ts:161-164 workerTools 分支 + :190 useExactTools）——fork-resume 走父精确
                 //   工具池（绕过 4-SET 过滤），非 fork resume 走常规过滤（行为不变）
                 boolean isResumedFork = fp != null && !fp.isBlank();
                 ToolRegistry subagentToolRegistry = createSubagentToolRegistry(sel, true, isResumedFork);
-                String effectiveSystemPrompt = getEffectiveSystemPrompt(sel);
+                String effectiveSystemPrompt = getEffectiveSystemPrompt(sel, parentTUC);
                 SubagentExecutor exec = new SubagentExecutor(
                     subagentToolRegistry, hookRegistry, mainLoop,
                     llmProviderFactory, effectiveProviderConfig(effectiveModel),
@@ -3859,10 +3827,6 @@ public class SubagentTool implements Tool {
                     "Subagent " + sel.agentType() + " resume failed: " + e.getMessage(),
                     ag.toString());
                 finalizer.finalize(ag.toString(), failure);
-            }
-            } finally {
-                // [IMP-D F4/M-05] 成对 restore 线程原值（null → 移除回落生效）。
-                AutoMemPaths.restoreCurrentProjectRoot(prevResumeProjectRoot);
             }
         }, "resume-subagent-" + ag);
         asyncWorker.setDaemon(true);
@@ -4050,7 +4014,7 @@ public class SubagentTool implements Tool {
                     sessionId, sessionAgentStateRegistry != null);
             }
         }
-        return getEffectiveSystemPrompt(selectedAgent);
+        return getEffectiveSystemPrompt(selectedAgent, ctx);
     }
 
     /**
@@ -4143,6 +4107,16 @@ public class SubagentTool implements Tool {
      * 不可得（罕见/测试）时经其回落本方法（现行为保持）。本方法本体不改，非 fork 消费点语义零变化。
      */
     private String getEffectiveSystemPrompt(AgentDefinition selectedAgent) {
+        return getEffectiveSystemPrompt(selectedAgent, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话上下文版本 · 见 {@link #getEffectiveSystemPrompt(AgentDefinition)}。
+     *
+     * @param ctx 用于解析 agent-memory PROJECT/LOCAL scope 的项目根（{@code ctx.effectiveCwd()}）；
+     *            null → 无显式根（PROJECT/LOCAL 记忆按 (a) fail-loud，⛔ 不回落 config home）
+     */
+    private String getEffectiveSystemPrompt(AgentDefinition selectedAgent, ToolUseContext ctx) {
         String agentPrompt = selectedAgent.getSystemPrompt(null, List.of());
         // [FIX-AM REQ-M-19] 补 memory 注入路径（对齐 CC loadAgentsDir.ts:481-488/726-732
         //   getSystemPrompt 闭包：systemPrompt + '\n\n' + loadAgentMemoryPrompt(...)）。
@@ -4157,9 +4131,13 @@ public class SubagentTool implements Tool {
             com.nexusai.application.agent.agent.AgentMemoryDirectory.AgentMemoryScope scope =
                 com.nexusai.application.agent.agent.AgentMemoryDirectory.fromName(selectedAgent.memory().get());
             if (scope != null) {
+                // [批 4b-1] 显式传会话 cwd（ToolUseContext.effectiveCwd）——agent-memory
+                //   PROJECT/LOCAL scope 的项目根原经 AutoMemPaths ThreadLocal 隐式读取，载体已删。
+                String agentMemoryCwd = (ctx != null && ctx.effectiveCwd() != null)
+                    ? ctx.effectiveCwd().toString() : null;
                 String memoryPrompt = com.nexusai.application.agent.agent.AgentMemoryDirectory
                         .productionDefault()
-                        .loadAgentMemoryPrompt(selectedAgent.agentType(), scope);
+                        .loadAgentMemoryPrompt(selectedAgent.agentType(), scope, agentMemoryCwd);
                 if (memoryPrompt != null && !memoryPrompt.isEmpty()) {
                     if (log.isDebugEnabled()) {
                         log.debug("[SubagentTool] getEffectiveSystemPrompt 补 agent-memory 注入: agentType={} scope={}",

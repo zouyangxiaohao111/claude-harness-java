@@ -52,7 +52,7 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
     @AfterEach
     void cleanup() {
         SessionProjectRoot.reset();
-        AutoMemPaths.resetCurrentProjectRoot();
+        // [批 4b-1] 原 AutoMemPaths.resetCurrentProjectRoot() 已删（ThreadLocal 载体删除）。
     }
 
     /**
@@ -93,9 +93,8 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         assertThat(loop.workspaceDir())
             .as("F7: resolver 返回值必须 realpath 归一后落 workspaceDir")
             .isEqualTo(real);
-        assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("F7: ThreadLocal 注入值必须与 workspaceDir 一致（NFC+realpath）")
-            .isEqualTo(real.toString());
+        // [批 4b-1] 原断言「AutoMemPaths.currentSessionProjectRoot() == real」随 ThreadLocal 载体删除 ——
+        //   会话项目根的唯一载体 = workspaceDir（上面已断言），不再有第二份线程槽副本可比对。
         assertThat(SessionProjectRoot.getForSession(SESSION_ID))
             .as("F1: 首 run 解析成功必须冻结会话（setForSession 首写胜）")
             .isEqualTo(real.toString());
@@ -125,9 +124,7 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         assertThat(loop.workspaceDir())
             .as("F1: bind() 冻结值（未归一）命中后必须归一为 NFC+realpath，与 resolver 分支产出一致")
             .isEqualTo(real);
-        assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("F1: 冻结命中路径 ThreadLocal 注入归一值")
-            .isEqualTo(real.toString());
+        // [批 4b-1] 同上：不再有 ThreadLocal 副本可断言（冻结表值见上方 getForSession 断言）。
     }
 
     @Test
@@ -150,10 +147,8 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         assertThat(loop.workspaceDir())
             .as("未注入未冻结（无绑定项目）→ workspaceDir 保持 null，不得回落 configHome")
             .isNull();
-        assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("未注入未冻结 → ThreadLocal 未被触碰，回落链（env ?? config-home）本身不动（P5/W3 另批）")
-            .isNotNull()
-            .isNotBlank();
+        // [批 4b-1] 原断言「ThreadLocal 未被触碰 → 仍非 null」随载体删除 —— 现「确无项目根」的唯一
+        //   表达即 workspaceDir=null（上方断言），且不得再有任何回落链（config home 回落已废除）。
     }
 
     @Test
@@ -215,9 +210,8 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         assertThat(loop.workspaceDir())
             .as("显式锚非空 → workspaceDir 锚该值（realpath 归一）")
             .isEqualTo(real);
-        assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("显式锚非空 → memory 项目根锚该值（AutoMemPaths 落 projects/<gitRoot>/memory）")
-            .isEqualTo(real.toString());
+        // [批 4b-1] 原断言「ThreadLocal 锚该值」随载体删除：显式锚现由 workspaceDir 承载，
+        //   auto-memory 消费点从 workspaceDir 显式取根（上方 workspaceDir 断言即覆盖本语义）。
         assertThat(SessionProjectRoot.getForSession(SESSION_ID))
             .as("显式锚路径不得冻结 SessionProjectRoot（GLOBAL 兜底键防跨任务污染）")
             .isNull();

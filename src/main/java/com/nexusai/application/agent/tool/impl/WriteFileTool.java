@@ -235,7 +235,9 @@ public class WriteFileTool implements Tool {
                     //   checkWritePermissionForTool 的 isAgentMemoryPath 预检查）：
                     //   CC 置于 memdir carve-out 之前（filesystem.ts:1554 isAgentMemoryPath → 1565 memdir）。
                     //   无 isAutoMemoryEnabled 门控（isAgentMemoryPath 是纯路径判定，agentMemory.ts:67-104）。
-                    if (agentMemoryDirectory != null && agentMemoryDirectory.isAgentMemoryPath(absolute)) {
+                    // [批 4b-1] 显式传会话 cwd（原经 AutoMemPaths ThreadLocal 隐式读取，载体已删）
+                    if (agentMemoryDirectory != null && agentMemoryDirectory.isAgentMemoryPath(absolute,
+                            ctx != null && ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null)) {
                         if (log.isDebugEnabled()) {
                             log.debug("WriteFileTool: agent-memory 写 carve-out 静默 allow (IMP-M-P2-2): {}",
                                 relPath);

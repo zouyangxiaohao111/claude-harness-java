@@ -208,11 +208,26 @@ public final class MemoryFileDetection {
      * Windows 小写化（toComparable 语义，REQ-M-21）。
      */
     public boolean isAutoMemFile(String filePath) {
+        // [批 4b-1] 无参 legacy = 「未提供显式根」→ 读实例供应（env / POJO 注入），与原契约一致。
+        return filePath != null && autoMemoryEnabled.getAsBoolean()
+            && autoMemPaths.isAutoMemPath(filePath);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #isAutoMemFile(String)}。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（auto-memory per-project 基址；null → 无显式根：
+     *                           显式 override/settings 路径仍可命中，per-project 派生段不命中）
+     */
+    public boolean isAutoMemFile(String filePath, String sessionProjectRoot) {
         if (filePath == null) {
             return false;
         }
         if (autoMemoryEnabled.getAsBoolean()) {
-            boolean hit = autoMemPaths.isAutoMemPath(filePath);
+            // [批 4b-1] null = 「未提供显式根」⇒ 回落实例供应（env / POJO 注入 supplier），同批内统一约定。
+            boolean hit = (sessionProjectRoot == null || sessionProjectRoot.isBlank())
+                ? autoMemPaths.isAutoMemPath(filePath)
+                : autoMemPaths.isAutoMemPath(filePath, sessionProjectRoot);
             if (log.isDebugEnabled()) {
                 log.debug("[MemoryFileDetection] isAutoMemFile 门控开启，命中={}: {}", hit, filePath);
             }
@@ -266,7 +281,12 @@ public final class MemoryFileDetection {
      * getTeamMemPath 尾分隔符防前缀攻击（team-evil 不命中）。
      */
     public boolean isTeamMemPath(String filePath) {
-        return teamMemPaths.isTeamMemPath(filePath);
+        return isTeamMemPath(filePath, null);
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #isTeamMemPath(String)}。 */
+    public boolean isTeamMemPath(String filePath, String sessionProjectRoot) {
+        return teamMemPaths.isTeamMemPath(filePath, sessionProjectRoot);
     }
 
     /**
@@ -274,7 +294,12 @@ public final class MemoryFileDetection {
      * CC original: {@code isTeamMemFile}（teamMemPaths.ts:290-292）。
      */
     public boolean isTeamMemFile(String filePath) {
-        return teamMemPaths.isTeamMemFile(filePath);
+        return isTeamMemFile(filePath, null);
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #isTeamMemFile(String)}。 */
+    public boolean isTeamMemFile(String filePath, String sessionProjectRoot) {
+        return teamMemPaths.isTeamMemFile(filePath, sessionProjectRoot);
     }
 
     /**
@@ -282,7 +307,12 @@ public final class MemoryFileDetection {
      * （teamMemPaths.ts:84-86）= join(getAutoMemPath(), 'team') + sep。随 T1 基址联动（REQ-M-11）。
      */
     public String getTeamMemPath() {
-        return teamMemPaths.getTeamMemPath();
+        return getTeamMemPath(null);
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #getTeamMemPath()}。 */
+    public String getTeamMemPath(String sessionProjectRoot) {
+        return teamMemPaths.getTeamMemPath(sessionProjectRoot);
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -298,13 +328,18 @@ public final class MemoryFileDetection {
      * <p>用于 collapse/badge 逻辑：用户托管文件应显示完整 diff。
      */
     public boolean isAutoManagedMemoryFile(String filePath) {
+        return isAutoManagedMemoryFile(filePath, null);
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #isAutoManagedMemoryFile(String)}。 */
+    public boolean isAutoManagedMemoryFile(String filePath, String sessionProjectRoot) {
         if (filePath == null) {
             return false;
         }
-        boolean result = isAutoMemFile(filePath)
-            || (teamMemFeatureEnabled.getAsBoolean() && isTeamMemFile(filePath))
+        boolean result = isAutoMemFile(filePath, sessionProjectRoot)
+            || (teamMemFeatureEnabled.getAsBoolean() && isTeamMemFile(filePath, sessionProjectRoot))
             || detectSessionFileType(filePath) != null
-            || isAgentMemFile(filePath);
+            || isAgentMemFile(filePath, sessionProjectRoot);
         if (log.isDebugEnabled()) {
             log.debug("[MemoryFileDetection] isAutoManagedMemoryFile 判定={}: {}", result, filePath);
         }
@@ -318,11 +353,24 @@ public final class MemoryFileDetection {
      * 组合（CC :169-171：feature && isTeamMemoryEnabled && isTeamMemPath）。
      */
     public boolean isMemoryDirectory(String dirPath) {
+        // [批 4b-1] 无参 legacy = 「未提供显式根」→ 读实例供应（env / POJO 注入），与原契约一致。
         if (dirPath == null) {
             return false;
         }
         String normalizedCmp = toComparable(Paths.get(dirPath).normalize().toString());
-        boolean result = classifyMemoryDirectory(normalizedCmp, dirPath);
+        return classifyMemoryDirectory(normalizedCmp, dirPath, autoMemPaths.projectRoot());
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #isMemoryDirectory(String)}。 */
+    public boolean isMemoryDirectory(String dirPath, String sessionProjectRoot) {
+        if (dirPath == null) {
+            return false;
+        }
+        String normalizedCmp = toComparable(Paths.get(dirPath).normalize().toString());
+        // null = 「未提供显式根」⇒ 回落实例供应（同批内统一约定）
+        boolean result = classifyMemoryDirectory(normalizedCmp, dirPath,
+            (sessionProjectRoot == null || sessionProjectRoot.isBlank())
+                ? autoMemPaths.projectRoot() : sessionProjectRoot);
         if (log.isDebugEnabled()) {
             log.debug("[MemoryFileDetection] isMemoryDirectory 判定={}: {}", result, dirPath);
         }
@@ -330,7 +378,7 @@ public final class MemoryFileDetection {
     }
 
     /** isMemoryDirectory 内部判定（与日志解耦，保持数据流可测试）。 */
-    private boolean classifyMemoryDirectory(String normalizedCmp, String dirPath) {
+    private boolean classifyMemoryDirectory(String normalizedCmp, String dirPath, String sessionProjectRoot) {
         // agent-memory 目录可在 cwd（project scope）、configDir、memoryBaseDir 下（CC :161-167）
         if (autoMemoryEnabled.getAsBoolean()
             && (normalizedCmp.contains("/agent-memory/")
@@ -341,12 +389,12 @@ public final class MemoryFileDetection {
         // feature('TEAMMEM') && isTeamMemoryEnabled() && isTeamMemPath(normalizedPath)）
         if (teamMemFeatureEnabled.getAsBoolean()
             && teamMemPaths.isTeamMemoryEnabled()
-            && teamMemPaths.isTeamMemPath(Paths.get(dirPath).normalize().toString())) {
+            && teamMemPaths.isTeamMemPath(Paths.get(dirPath).normalize().toString(), sessionProjectRoot)) {
             return true;
         }
         // auto-memory 路径 override 检查（CC :177-187）
         if (autoMemoryEnabled.getAsBoolean()) {
-            String autoMemPath = autoMemPaths.getAutoMemPath();
+            String autoMemPath = autoMemPaths.getAutoMemPath(sessionProjectRoot);
             // A′: 无有效项目 → 无 auto-memory 目录 → 不命中（跳过该子判定）
             if (autoMemPath != null) {
                 String autoMemDirCmp = toComparable(stripTrailing(autoMemPath));
@@ -385,11 +433,11 @@ public final class MemoryFileDetection {
      * isAgentMemoryPath（normalize + 各 scope 基址 {@code +sep} 尾分隔符）。门控保留
      * （CC :120-122 {@code if (isAutoMemoryEnabled()) return isAgentMemoryPath(filePath)}）。
      */
-    private boolean isAgentMemFile(String filePath) {
+    private boolean isAgentMemFile(String filePath, String sessionProjectRoot) {
         if (!autoMemoryEnabled.getAsBoolean()) {
             return false;
         }
-        return agentMemoryDirectory.isAgentMemoryPath(filePath);
+        return agentMemoryDirectory.isAgentMemoryPath(filePath, sessionProjectRoot);
     }
 
     private static String stripTrailing(String s) {
@@ -425,8 +473,18 @@ public final class MemoryFileDetection {
      * （posixPathToWindowsPath），下游谓词只依赖 toComparable（CC :258-263）。
      */
     public boolean isShellCommandTargetingMemory(String command) {
+        // [批 4b-1] 无参 legacy = 「未提供显式根」→ 读实例供应（env / POJO 注入），与原契约一致。
+        return isShellCommandTargetingMemory(command, autoMemPaths.projectRoot());
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #isShellCommandTargetingMemory(String)}。 */
+    public boolean isShellCommandTargetingMemory(String command, String sessionProjectRoot) {
         if (command == null) {
             return false;
+        }
+        // null = 「未提供显式根」⇒ 回落实例供应（同批内统一约定）
+        if (sessionProjectRoot == null || sessionProjectRoot.isBlank()) {
+            sessionProjectRoot = autoMemPaths.projectRoot();
         }
         String configDir = configHomeSupplier.get();
         // 决策 D1/D3：claude 配置根纳入快速检查（D3 transcript 读回落，命令提及 ~/.claude 亦命中）
@@ -435,7 +493,7 @@ public final class MemoryFileDetection {
         // A′: 无有效项目 → 无 auto-memory 目录 → 空串（不参与命令快速命中判定）
         String autoMemDir = "";
         if (autoMemoryEnabled.getAsBoolean()) {
-            String autoMem = autoMemPaths.getAutoMemPath();
+            String autoMem = autoMemPaths.getAutoMemPath(sessionProjectRoot);
             if (autoMem != null) {
                 autoMemDir = stripTrailing(autoMem);
             }

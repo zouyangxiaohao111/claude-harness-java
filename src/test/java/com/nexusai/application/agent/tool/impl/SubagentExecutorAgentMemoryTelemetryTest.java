@@ -185,10 +185,13 @@ class SubagentExecutorAgentMemoryTelemetryTest {
 
     private static void invokeBuildAgentSystemPrompt(SubagentExecutor executor, boolean isForkPath,
             AgentDefinition agent) throws Exception {
+        // [批 4b-1] 第 7 参 = sessionProjectRoot（会话项目根显式传参；原经 AutoMemPaths ThreadLocal）。
+        //   本用例 executor 未注入 agentMemoryDirectory ⇒ agentMemoryPrompt 早退，传 null 不影响断言。
         Method m = SubagentExecutor.class.getDeclaredMethod("buildAgentSystemPrompt",
-            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class);
+            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class,
+            String.class);
         m.setAccessible(true);
-        m.invoke(executor, isForkPath, agent, List.of(), "claude-sonnet-4-6", List.of(), null);
+        m.invoke(executor, isForkPath, agent, List.of(), "claude-sonnet-4-6", List.of(), null, null);
     }
 
     private SubagentExecutor newExecutor() {

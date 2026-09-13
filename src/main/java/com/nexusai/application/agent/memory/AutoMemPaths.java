@@ -76,151 +76,27 @@ public final class AutoMemPaths {
     }
 
     /**
-     * 当前会话 projectRoot · CC STATE.projectRoot（bootstrap/state.ts:277-279）等价。
+     * <b>唯一入口</b> · 读取「显式配置的项目根」：{@code NEXUSAI_PROJECT_DIR} env（nexusai 命名，
+     * 决策 D1/D6；CC 原 {@code CLAUDE_PROJECT_DIR}）；未配置 ⇒ <b>null</b>。
      *
-     * <p><b>ODF-A1-R2（返工）</b>：由 static volatile 改 {@link ThreadLocal} —— 对齐
-     * 裸 MDC 会话槽（批 3c 已删除）的线程局部模式。CC 单进程单会话
-     * （STATE.projectRoot 无并发）；Java Web 后端同一 JVM 多会话并发（{@code chatExecutor}
-     * 线程池），static volatile 会被后写会话覆盖 → 会话 A 的异步/后续内存读解析到会话 B 目录
-     * （跨会话污染）。ThreadLocal 使每个会话线程持有独立 projectRoot：会话 A 线程注入 A、
-     * 会话 B 线程注入 B，互不干扰。
+     * <h2>⭐ [批 4b-1] 本方法原名 {@code currentSessionProjectRootOrNull()}，语义已收敛为「无载体」</h2>
+     * <p>批 4b-1 删除了本类最后一个环境态会话槽 {@code CURRENT_PROJECT_ROOT}（ThreadLocal）及其
+     * 4 个配套方法（{@code set/capture/restore/resetCurrentProjectRoot}）与旧的三级回落版
+     * {@code currentSessionProjectRoot()}（原第 3 级回落 {@link NexusaiPaths#getAppConfigHomeDir()}
+     * 把<b>配置主目录当项目根</b>，与 cwd 身份域红线冲突）。删载体后<b>两套读取入口合并为本方法一个</b>。</p>
      *
-     * <p>读取链：memory 路径的主要消费者在<b>会话线程</b>（LlmAgentLoop.run() 所在线程：
-     * AutoMemPaths/MemoryPrefetcher/MemoryPromptBuilder 直接计算；prefetch 异步任务拿到的是
-     * 入参 memoryDirs，不再回读 holder）；但工具池（StreamingToolExecutor.executeAsync）、
-     * HOOK_EXECUTOR（HookRegistry supplyAsync）、pollScheduler 定时器（RemoteAgentTaskService
-     * tick）等<b>非会话线程</b>也会经 {@link #currentSessionProjectRoot()} 惰性读取 —— 由
-     * IMP-C (D2-A/F3) 的捕获-回放传播（调度线程 capture → 任务体开头 set → finally restore，
-     * 见各调用点注释）使这些线程解析到会话绑定 P；未注入线程回落 CLAUDE_PROJECT_DIR env ??
-     * config-home。会话结束由 LlmAgentLoop.run() finally
-     * {@link #restoreCurrentProjectRoot(String)} 复位（线程池复用防泄漏），使无项目绑定会话
-     * 回落 config-home 真正生效。
+     * <p><b>⚠️ 删除载体的直接后果（消费方必读）</b>：会话线程不再有隐式根可用 ⇒ 凡「本该有会话项目根」
+     * 的消费点<b>必须显式传入</b>根（本批把 auto-memory 层 12 处消费点改为显式 {@code sessionProjectRoot}
+     * 形参）。⛔ 任何消费方都不得把「本方法返回 null」当成「无处可取」的永久借口：那会让
+     * auto-memory 系统提示词 / CLAUDE.md entrypoint / 权限 carve-out 基址<b>静默失效</b>
+     * （用户铁律：本该有却没有 ⇒ 抛；本就不需要 ⇒ 跳过但日志 ≥ WARN）。</p>
      *
-     * <p>CC 真源：启动时 {@code realpath(cwd)} 冻结为 projectRoot（state.ts:271/279），会话中不更新
-     * （state.ts:519-525）；Java 由 run() 入口一次注入（{@code resolveSessionProjectRoot()}）。
+     * <p><b>保留本方法的目的</b>：① 身份域显式部署配置（进程级 env）；② 无会话上下文场景
+     * （bean 构造期 / 非会话调用）的「确无项目根」判据 —— 返回 null 而非伪造 config home。</p>
      *
-     * <h2>⚠️ [批 4 待收敛] 这是本仓<b>最后一个环境态会话槽</b>（batch 3c 遗留清单）</h2>
-     * <p>批 3c（2026-09-13）已删除裸 MDC 会话槽工具类（{@code com.nexusai.common} 包，批 3c 删除）与
-     * 其请求边界清理 Filter、logback {@code %X{sessionId}} 前缀。本 ThreadLocal 是
-     * <b>同物种的第二个 ambient 槽</b>，本批<b>刻意不动</b>（用户裁定归批 4），但必须先登记清楚：</p>
-     * <ul>
-     *   <li><b>它有与 MDC 相同的「第三态」风险</b>：不是 null，而是<b>上一个任务/上一个会话残留的、
-     *       别的会话的 projectRoot</b> —— 线程池（fixed-8 / SSE / 虚拟线程）复用时读到看起来完全合法
-     *       的错值。旧 MDC 的剧毒之处（日志前缀本身从该槽取 ⇒ 错了也无法靠日志发现）在本槽同样成立：
-     *       日志/路径解析都经 {@link #currentSessionProjectRoot()}。</li>
-     *   <li><b>它现在是承重的</b>：{@code AgentMemoryDirectory.cwdSupplier}／{@code projectRootSupplier}
-     *       （{@code AgentMemoryDirectory.buildProductionDefault():143/146}）、claudemd 扫描根、
-     *       settings 读取链、tool/hook 载荷的 cwd 都经它取会话值。</li>
-     * </ul>
-     * <p><b>批 4 必须一起处理的回放点清单</b>（capture → setContextMap/set → finally restore 的
-     * 「回放」模式，与 MDC 回放同源；批 3c 删 MDC 回放时<b>保留了</b>这些 projectRoot 回放，因为它们
-     * 此时仍承重）：</p>
-     * <ol>
-     *   <li>{@code application/agent/LlmAgentLoop.java} —— {@code STREAM_EXECUTOR} 虚拟线程回放：
-     *       loop 线程 {@code captureCurrentProjectRoot()}（约 :6594）、任务体 {@code setCurrentProjectRoot}
-     *       （约 :6621）、{@code finally restoreCurrentProjectRoot}（约 :6638）</li>
-     *   <li>{@code application/agent/tool/StreamingToolExecutor.java} —— 调度线程 capture（约 :1277）、
-     *       {@code withSessionProjectRoot} 包装内 set（约 :2462-2470）/ restore（约 :2474-2476）</li>
-     *   <li>{@code application/agent/tool/impl/SubagentTool.java} —— {@code executeAsync} 父值 capture
-     *       （约 :3195）→ 子代理线程 set（约 :3210）/ restore；{@code executeResumeAsync} 同款
-     *       （约 :3745/:3752/:3843）</li>
-     *   <li>{@code application/agent/team/SpawnInProcess.java} —— teammate runner 线程 capture
-     *       （约 :368）/ set（约 :373）/ restore（约 :385-387）</li>
-     *   <li>{@code application/agent/permission/hook/HookRegistry.java} —— {@code withSessionProjectRoot}
-     *       （HOOK_EXECUTOR supplyAsync 路径）</li>
-     *   <li>{@code application/agent/tasks/RemoteAgentTaskService.java} / {@code CronIdleExecutor.java}
-     *       —— pollScheduler 定时器 tick 的注入点</li>
-     *   <li>{@code application/agent/prompt/SystemPromptSections.java} —— 静态 {@code cwdSupplier}
-     *       （测试缝 + 会话回落）</li>
-     *   <li>{@code application/agent/skill/SkillRegistry.java} —— 未注入 cwdSupplier 时的静态回落
-     *       {@link #currentSessionProjectRoot()}（批 3c 起：生产已改显式 sessionId 入参，此回落仅
-     *       POJO/测试直构路径）</li>
-     *   <li>{@code source = "replay"} 的其余消费点：{@code ClaudemdEngine}、{@code MemoryPromptBuilder}、
-     *       {@code MemoryPrefetcher}、{@code AttachmentStoreBase}、{@code EnterWorktreeTool} 等</li>
-     * </ol>
-     * <p><b>批 4 的收敛方向</b>（与批 3c 同法）：把 {@code Supplier<String>} 改成
-     * {@code Function<String,String>}（sessionId → projectRoot）或按会话查 DB，把 sessionId 从
-     * 调用入口显式穿透到每个消费点，然后删除本 ThreadLocal 与全部回放点；无显式来源处按
-     * 「本该有却没有 ⇒ 抛 / 本就不需要 ⇒ 跳过但日志 ≥ WARN」处理。</p>
-     */
-    private static final ThreadLocal<String> CURRENT_PROJECT_ROOT = new ThreadLocal<>();
-
-    /** 设置当前线程的会话 projectRoot（对齐 CC setProjectRoot 启动冻结语义 · 会话中不更新）。 */
-    public static void setCurrentProjectRoot(String projectRoot) {
-        if (projectRoot == null || projectRoot.isBlank()) {
-            CURRENT_PROJECT_ROOT.remove();
-        } else {
-            CURRENT_PROJECT_ROOT.set(projectRoot);
-        }
-    }
-
-    /** 捕获当前线程 projectRoot 原值（供嵌套 run() 出口恢复 · 可为 null）。 */
-    public static String captureCurrentProjectRoot() {
-        return CURRENT_PROJECT_ROOT.get();
-    }
-
-    /** 恢复被嵌套 run() 覆盖前的 projectRoot 原值（null → 移除，回落生效）。 */
-    public static void restoreCurrentProjectRoot(String prev) {
-        if (prev == null || prev.isBlank()) {
-            CURRENT_PROJECT_ROOT.remove();
-        } else {
-            CURRENT_PROJECT_ROOT.set(prev);
-        }
-    }
-
-    /** 复位当前线程 projectRoot（会话结束清理 · 线程池复用防泄漏）。 */
-    public static void resetCurrentProjectRoot() {
-        CURRENT_PROJECT_ROOT.remove();
-    }
-
-    /**
-     * 读取当前线程的会话 projectRoot。
-     *
-     * <p>未设置（无会话上下文：bean 构造期/非会话调用）→ 回落 {@code NEXUSAI_PROJECT_DIR} env
-     * （nexusai 命名，决策 D1/D6；CC 原 {@code CLAUDE_PROJECT_DIR}）
-     * 或 {@link NexusaiPaths#getAppConfigHomeDir()}（确定性非 null，绝不读 JVM 进程工作目录 ——
-     * ODF-A1 验收：同一 JVM 内不同 cwd 会话必须解析出不同 memory 目录）。
-     *
-     * @return 非 null 的 projectRoot 字符串
-     */
-    public static String currentSessionProjectRoot() {
-        String pr = CURRENT_PROJECT_ROOT.get();
-        if (pr != null && !pr.isBlank()) {
-            return pr;
-        }
-        String env = System.getenv(CLAUDE_PROJECT_DIR_ENV);
-        if (env != null && !env.isBlank()) {
-            return env;
-        }
-        return NexusaiPaths.getAppConfigHomeDir();
-    }
-
-    /**
-     * [TL-W3 Phase B] 读取当前线程的会话 projectRoot · <b>无 config-home 回落</b>（memory 路径层专用）。
-     *
-     * <p><b>WHY</b>：{@link #currentSessionProjectRoot()} 第 3 级回落把 {@link NexusaiPaths#getAppConfigHomeDir()}
-     * （{@code ~/.nexusai}，<b>配置主目录</b>）当作「项目根」返回 —— 与 cwd 语义红线冲突
-     * （CC {@code getOriginalCwd()} 只是 {@code STATE.originalCwd}，无 config-home 回落）。无会话上下文的
-     * 线程（bean 构造期 / REST / HOOK_EXECUTOR / 定时器 / teammate 裸线程）读它就等于拿 config home
-     * 冒充项目身份：memory per-project 派生会产出
-     * {@code <memoryBase>/projects/<configHome slug>/memory} 假目录、agent-memory 落
-     * {@code <configHome>/.nexusai/agent-memory} 假目录、子代理 userContext 读到 config home 的
-     * CLAUDE.md。本方法把这些调用点收口到 <b>null</b> 语义，由各消费方的 A′ 判定（
-     * {@link #isEligibleProjectRoot(String)}）与既有 null 守卫承担 skip，<b>绝不伪造项目根</b>。
-     *
-     * <p><b>与 {@link #currentSessionProjectRoot()} 的唯一差别</b>：env 也缺失时返回 null 而非 config home。
-     * env（{@code NEXUSAI_PROJECT_DIR}/{@code CLAUDE_PROJECT_DIR}）属身份域显式配置，两台阶共用。
-     *
-     * <p><b>不改 {@link #currentSessionProjectRoot()} 契约</b>：它仍有大量调用方（身份域 +
-     * 未收口的读取点），本方法只供 memory 路径层逐步迁移。
-     *
-     * @return 会话/身份 projectRoot；无会话上下文且无 env → null（不回落 config home）
+     * @return 显式配置的项目根；未配置 → null（<b>绝不回落 config home / user.dir</b>）
      */
     public static String currentSessionProjectRootOrNull() {
-        String pr = CURRENT_PROJECT_ROOT.get();
-        if (pr != null && !pr.isBlank()) {
-            return pr;
-        }
         String env = System.getenv(CLAUDE_PROJECT_DIR_ENV);
         if (env != null && !env.isBlank()) {
             return env;
@@ -243,13 +119,13 @@ public final class AutoMemPaths {
      * [TL-W1 P3] 显式 projectRoot 贯穿的 settings 读取器（{@code explicitRoot → autoMemoryDirectory}）。
      *
      * <p><b>WHY</b>：{@link #getAutoMemPath(String)} / {@link #getAutoMemBase(String)} 自称「不依赖
-     * supplier/ThreadLocal」，但其 settings 源（localSettings = {@code {projectRoot}/.nexusai/settings.local.json}）
+     * supplier」，但其 settings 源（localSettings = {@code {projectRoot}/.nexusai/settings.local.json}）
      * 若经无参 {@link #getAutoMemPathSetting()} → {@link #readAutoMemoryDirectorySetting()} 解析，
-     * 会回读 {@code currentSessionProjectRoot()} ThreadLocal —— 异步 fork 线程读不到 → 回落 config home
-     * ⇒ 显式重载的「零 ThreadLocal」定案被推翻（审计 P3）。现把 projectRoot 作为入参贯穿整条 settings 链：
+     * 会回读类级根供应（批 4b-1 前是 ThreadLocal）—— 异步 fork 线程读不到 → 回落 config home
+     * ⇒ 显式重载的「零环境态」定案被推翻（审计 P3）。现把 projectRoot 作为入参贯穿整条 settings 链：
      * 本字段非 null 时，显式重载只用入参拼 localSettings 源；<b>仅无参重载路径</b>
-     * （{@code getAutoMemPath()}/{@code getAutoMemBase()}/{@code getAutoMemPathSetting()}）才允许读
-     * ThreadLocal（会话线程语义）。
+     * （{@code getAutoMemPath()}/{@code getAutoMemBase()}/{@code getAutoMemPathSetting()}）才读
+     * {@link #projectRootSupplier}（= {@link #currentSessionProjectRootOrNull()}，批 4b-1 起 = env 或 null）。
      *
      * <p>生产 {@link #defaultInstance()} 用 5 参构造注入 {@code AutoMemPaths::readAutoMemoryDirectorySetting}；
      * 4 参构造（测试/P0JO）保持 {@code null} → 显式重载回落 {@link #settingsDirSupplier}（行为不变）。
@@ -289,7 +165,8 @@ public final class AutoMemPaths {
      * @param memoryBaseDirSupplier CC getMemoryBaseDir() 的 memoryBase 供应（env CLAUDE_CODE_REMOTE_MEMORY_DIR 或 null）
      * @param overrideSupplier      CC getAutoMemPathOverride() 的 env 供应（CLAUDE_COWORK_MEMORY_PATH_OVERRIDE）
      * @param settingsDirSupplier   CC getAutoMemPathSetting() 的 settings 供应（<b>仅无参重载路径</b>消费；
-     *                              生产 = {@link #readAutoMemoryDirectorySetting()}，会读会话 ThreadLocal）
+     *                              生产 = {@link #readAutoMemoryDirectorySetting()}，读
+     *                              {@link #currentSessionProjectRootOrNull()}（批 4b-1 起 = env 或 null））
      * @param settingsDirResolver   显式 projectRoot 贯穿的 settings 读取器（{@code explicitRoot → autoMemoryDirectory}）·
      *                              null → 显式重载回落 {@code settingsDirSupplier}（测试/P0JO 行为不变）
      */
@@ -318,22 +195,20 @@ public final class AutoMemPaths {
     }
 
     /**
-     * 生产默认实例 · ODF-A1：projectRoot 从 {@link #currentSessionProjectRoot()}
-     * 惰性读取（per-session ThreadLocal 注入，绝不读 JVM 进程工作目录）。
+     * 生产默认实例 · 类级根供应 = {@link #currentSessionProjectRootOrNull()}（显式 env 或 null）。
      *
-     * <p>bean 构造期/无会话上下文 → CLAUDE_PROJECT_DIR env ?? config home（确定性回落）。
-     * 有会话时 LlmAgentLoop.run() 入口经 {@link #setCurrentProjectRoot(String)} 注入，
-     * 本 supplier 即解析到该线程会话的 projectRoot（对齐 CC getProjectRoot 全局态，
-     * ThreadLocal 按会话线程隔离 —— 多会话并发各自解析本会话目录）。
+     * <p><b>[批 4b-1 变更]</b>：本 supplier 原为「会话 ThreadLocal 注入」的惰性读取点，现随载体删除
+     * 退化为<b>仅 env</b>。会话线程的根不再隐式可得 ⇒ auto-memory 层的生产消费点必须<b>显式传入
+     * sessionProjectRoot</b>（见 {@link #getAutoMemPath(String)}）；本实例只能解析「有 override /
+     * settings 显式配置」或「进程级 env」两类路径，其余一律 null（不伪造）。
      */
     public static AutoMemPaths defaultInstance() {
         return new AutoMemPaths(
-            // [TL-W3 Phase B] 原接线 AutoMemPaths::currentSessionProjectRoot —— 无会话上下文的线程
-            //   （bean 构造期 / REST / HOOK_EXECUTOR / 定时器 / teammate 裸线程）会拿到 config home
-            //   冒充项目根（P5 根源）。本实例是「全仓 memory 路径解析的根供应器」，其消费方（
-            //   getAutoMemPath/getAutoMemBase/projectRoot）全部经 isEligibleProjectRoot 拒绝 config home
-            //   ⇒ 换 orNull 后**结果等价**（同样 skip）但不再伪造；projectRoot() 由此在无会话线程返回
-            //   null（消费方 MemoryPromptBuilder 已 null-safe 并回落 "."）。
+            // [批 4b-1] 原接线 AutoMemPaths::currentSessionProjectRoot（config home 第 3 级回落）
+            //   → [TL-W3 Phase B] 换 currentSessionProjectRootOrNull（不再伪造）→ [批 4b-1] 删 ThreadLocal
+            //   后其实现即「env ?? null」。消费方（getAutoMemPath/getAutoMemBase/projectRoot）全部经
+            //   isEligibleProjectRoot 拒绝 config home；无有效项目 → null（消费方按 A′/(a)/(b) 处理，
+            //   ⛔ 不得静默把提示词丢掉）。
             AutoMemPaths::currentSessionProjectRootOrNull,
             () -> System.getenv(REMOTE_MEMORY_DIR_ENV),
             () -> overrideEnvSeam != null ? overrideEnvSeam : System.getenv(COWORK_OVERRIDE_ENV),
@@ -548,7 +423,7 @@ public final class AutoMemPaths {
      * <p><b>缺陷根因</b>：无绑定/回落场景会把配置主目录（{@code ~/.nexusai}）当「项目」派生
      * slug（{@code projects/C--Users-WIN--nexusai/memory}）—— feedback 等 auto 记忆被写进
      * config-home 自身（生产实测 MemoryStorage A1 修复同源）。处理放在 memory per-project
-     * 路径层（<b>不改</b> {@link #currentSessionProjectRoot()} 对外契约，它有 12 处调用方）：
+     * 路径层（<b>不改</b> {@link #currentSessionProjectRootOrNull()} 对外契约）：
      * <ul>
      *   <li>projectRoot null/blank → 无效；</li>
      *   <li>normalize 后与 {@link #getMemoryBaseDir()}（memoryBase）相等 → 无效；</li>
@@ -557,7 +432,7 @@ public final class AutoMemPaths {
      *
      * <p><b>[决策 2026-09-08] DB 主路径解析在上游完成</b>：auto-memory 目录的主路径 = 会话绑定项目
      * （LlmAgentLoop.run() 入口 resolveSessionProjectRoot → tryResolveBoundProjectFromDb：
-     * {@code sessions.main_project_id → projects.path}，成功注入 ThreadLocal）。本方法是路径层
+     * {@code sessions.main_project_id → projects.path}，批 4b-1 起经<b>显式入参</b>传给消费方）。本方法是路径层
      * 纯防御（null/blank/config-home/memoryBase 永不拼接）——走到 null 只表示「上游无有效项目」，
      * 不是本方法负责去查 DB。调用方（MemoryPromptBuilder/LlmAgentLoop 守卫）据此 fail loud。
      *
@@ -608,8 +483,9 @@ public final class AutoMemPaths {
      * （anthropics/claude-code#24382）。
      *
      * <p>[A1 重做 2026-09-04] 委托 {@link #getAutoMemBase(String)}（显式 projectRoot 解析），
-     * 本方法读注入 supplier（ThreadLocal currentSessionProjectRoot）。异步 fork 线程不读本方法
-     * （无 ThreadLocal），改由调用方在会话线程按显式 projectRoot 调重载后传参。
+     * 本方法读注入 supplier（批 4b-1 前是会话 ThreadLocal，现 = env 或 null）。
+     * <b>会话线程请改用显式重载</b> {@link #getAutoMemBase(String)} 并传入会话项目根 ——
+     * 否则本方法在会话中恒返回 null（载体已删）。
      */
     public String getAutoMemBase() {
         return getAutoMemBase(projectRootSupplier.get());
@@ -651,9 +527,10 @@ public final class AutoMemPaths {
      * auto-memory 目录路径 · CC original: {@code getAutoMemPath}（paths.ts:223-235）。
      *
      * <p>[A1 重做 2026-09-04] 委托 {@link #getAutoMemPath(String)}（显式 projectRoot 解析），
-     * 本方法读注入 supplier（ThreadLocal currentSessionProjectRoot）。<b>异步 fork 线程不读本
-     * 方法</b>（无 ThreadLocal 回落 config-home）—— 改由调用方在会话线程按显式 projectRoot 调
-     * 重载后传参（对齐 CC extractMemories.ts:339 runExtraction 先 getAutoMemPath 再 fork）。
+     * 本方法读注入 supplier（批 4b-1 前是会话 ThreadLocal，现 = env 或 null）。
+     * <b>会话线程请改用显式重载</b> {@link #getAutoMemPath(String)}（对齐 CC
+     * extractMemories.ts:339 runExtraction 先 getAutoMemPath 再 fork）—— 否则本方法在会话中
+     * 恒返回 null（载体已删）。
      *
      * @return 带唯一尾分隔符的 auto-memory 目录；无有效项目（config-home 回落，无 override/settings）
      *         → null（A′，per-project auto 记忆不存在）
@@ -698,9 +575,9 @@ public final class AutoMemPaths {
         String override = getAutoMemPathOverride();
         if (override == null) {
             // [TL-W1 P3] 显式重载把 projectRoot 贯穿到 settings 读取链（localSettings 源只用入参拼路径）——
-            //   旧写法调无参 getAutoMemPathSetting() → readAutoMemoryDirectorySetting() → 回读
-            //   currentSessionProjectRoot() ThreadLocal，异步 fork 线程读不到 → config home，
-            //   推翻「显式重载不读 ThreadLocal」定案（审计 P3）。
+            //   旧写法调无参 getAutoMemPathSetting() → readAutoMemoryDirectorySetting() → 回读类级根供应
+            //   （批 4b-1 前是会话 ThreadLocal），异步 fork 线程读不到 → config home，
+            //   推翻「显式重载不读环境态」定案（审计 P3）。
             override = getAutoMemPathSetting(projectRoot);
         }
         if (override != null) {
@@ -744,7 +621,20 @@ public final class AutoMemPaths {
      * 与 getAutoMemPath 同解析顺序。
      */
     public String getAutoMemEntrypoint() {
-        String autoMem = getAutoMemPath();
+        return getAutoMemEntrypoint(projectRootSupplier.get());
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #getAutoMemEntrypoint()}。
+     *
+     * <p>会话线程必须走本重载：per-project auto-memory 目录需会话项目根（原经
+     * {@code CURRENT_PROJECT_ROOT} ThreadLocal 隐式解析，载体已删）。
+     *
+     * @param explicitProjectRoot 会话绑定项目根；null → 无有效项目（无 override/settings 时返回 null）
+     * @return {@code <autoMemPath>/MEMORY.md}；无有效项目 → null
+     */
+    public String getAutoMemEntrypoint(String explicitProjectRoot) {
+        String autoMem = getAutoMemPath(explicitProjectRoot);
         // A′: 无有效项目 → auto-memory 目录不存在 → entrypoint 不存在（返回 null，调用方跳过）
         return autoMem == null ? null : Paths.get(autoMem, AUTO_MEM_ENTRYPOINT_NAME).toString();
     }
@@ -787,6 +677,15 @@ public final class AutoMemPaths {
      * （{@code /foo/team-evil} 不匹配 {@code /foo/team/}）。
      */
     public boolean isAutoMemPath(String absolutePath) {
+        return isAutoMemPath(absolutePath, projectRootSupplier.get());
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #isAutoMemPath(String)}。
+     *
+     * @param explicitProjectRoot 会话绑定项目根（null → 无有效项目 → 返回 false）
+     */
+    public boolean isAutoMemPath(String absolutePath, String explicitProjectRoot) {
         if (absolutePath == null) {
             return false;
         }
@@ -794,7 +693,7 @@ public final class AutoMemPaths {
         if (normalizedPath == null) {
             return false;
         }
-        String autoMem = getAutoMemPath();
+        String autoMem = getAutoMemPath(explicitProjectRoot);
         // A′: 无有效项目 → 无 auto-memory 目录 → 任何路径都不在其内（返回 false）
         if (autoMem == null) {
             return false;
@@ -1097,12 +996,13 @@ public final class AutoMemPaths {
      * @return autoMemoryDirectory 值或 null
      */
     private static String readAutoMemoryDirectorySetting() {
-        // [TL-W1 P3] 无参重载 = 唯一允许读会话 ThreadLocal 的路径（会话线程语义）；
-        //   显式重载走 readAutoMemoryDirectorySetting(String)（projectRoot 贯穿，零 ThreadLocal）。
-        // [TL-W3 Phase B] 原传 currentSessionProjectRoot() —— 无会话线程拿 config home 派生
-        //   localSettings 源 {@code <configHome>/.nexusai/settings.local.json}（把配置主目录当项目，
-        //   与 A′「config-home 永不作为项目身份」冲突）。改 orNull → 无项目即跳过 localSettings 源，
-        //   只读 DB + user 源（readAutoMemoryDirectorySetting(null) 的既有分支）。
+        // [TL-W1 P3] 无参重载 = 唯一允许读类级根供应的路径；
+        //   显式重载走 readAutoMemoryDirectorySetting(String)（projectRoot 贯穿，零环境态）。
+        // [TL-W3 Phase B / 批 4b-1 收尾] 原传 currentSessionProjectRoot()（第 3 级回落 config home）
+        //   —— 会把配置主目录当项目派生 localSettings 源 {@code <configHome>/.nexusai/settings.local.json}
+        //   （与 A′「config-home 永不作为项目身份」冲突）。批 4b-1 删载体后本方法读 env 或 null：
+        //   无显式配置即跳过 localSettings 源，只读 DB + user 源（readAutoMemoryDirectorySetting(null)
+        //   的既有分支）。会话线程请改用显式重载。
         return readAutoMemoryDirectorySetting(currentSessionProjectRootOrNull());
     }
 

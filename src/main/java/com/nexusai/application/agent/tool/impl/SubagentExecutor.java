@@ -1588,7 +1588,9 @@ public class SubagentExecutor {
         // [IMP-G4 F5] systemContext 接 SystemPromptContextProvider.getSystemContext()（CC runAgent.ts:380-383
         //   memoized）：resolveSystemContextText() 惰性构造会话级 provider（未注入时）→ gitStatus/cacheBreaker
         //   map → "key: value" 行渲染（对齐 SystemPromptContextProvider.appendSystemContext :304-322 渲染格式）。
-        String userContext = userContextFor(agentDefinition);
+        // [批 4b-1] 显式传子代理会话 cwd（userContext = 会话项目根的 CLAUDE.md；原经 ThreadLocal 隐式读取）
+        String userContext = userContextFor(agentDefinition, agentTuc != null && agentTuc.effectiveCwd() != null
+            ? agentTuc.effectiveCwd().toString() : null);
         String systemContext = resolveSystemContextText();
 
         // ── Step 9: agentSystemPrompt ──
@@ -1603,7 +1605,9 @@ public class SubagentExecutor {
         String agentSystemPrompt = resolveForkAgentSystemPrompt(
             isForkPath, forkParams,
             () -> buildAgentSystemPrompt(isForkPath, promptAgent, resolvedTools, effectiveModel,
-                additionalWorkingDirList, userContext));
+                additionalWorkingDirList, userContext,
+                // [批 4b-1] 显式传子代理会话 cwd（agent-memory PROJECT/LOCAL 项目根；原经 ThreadLocal）
+                agentTuc.effectiveCwd() != null ? agentTuc.effectiveCwd().toString() : null));
         log.info("[SubagentExecutor] Step 9: systemPrompt 长度={}", agentSystemPrompt.length());
 
         // ── Step 10: contextMessages + initialMessages 装配 ──
@@ -1971,16 +1975,10 @@ public class SubagentExecutor {
         //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
         //   （AutoMemPaths:113 返回值直接 set 回 ThreadLocal，恒 no-op），注释却声称
         //   「spawn 作用域注入会话 projectRoot（修 M-05/M-06）」——与实语句不符，已删除该 set。
-        //   会话 projectRoot 的真实注入源在 spawn 之外（sync = StreamingToolExecutor 工具池
-        //   :2465 调度线程捕获注入；async/resume = SubagentTool asyncWorker :3195 注入父值），
-        //   本作用域无需重复注入。
-        //   保留 capture/restore 成对，语义校正为「退出复位」而非「注入」：子代理 loop 内
-        //   prompt 组装经 {@code ensureAutoMemoryProjectRootResolvedForPrompt}
-        //   （LlmAgentLoop:4642/:4704）会在本线程**未成对** set 会话 projectRoot（该处语义即
-        //   「回填本线程」），本线程是池化线程（工具池 / asyncWorker）——不在此复位则残留值
-        //   随线程复用泄漏到下一个会话的工具执行（AutoMemPaths:95 记载的 JVM 级隐患）。
+        // [批 4b-1] 剩下的一对 capture/restore 亦已删：CURRENT_PROJECT_ROOT ThreadLocal 载体
+        //   删除后无「本线程被未成对 set」可言（prompt 组装的项目根改由显式形参承载），
+        //   线程复用串台的载体本身不复存在。
         SubagentResult loopResult = null;
-        final String prevSubagentProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
         try {
             // [R2-CTX] subagent spawn 包裹 runWithAgentContext（analytics 归因 · CC AgentTool.tsx:733/:785/:911）。
             //   每次 spawn 新建 SubagentContext 并包住 runSubagentQueryLoop，使 query loop 内事件
@@ -2208,11 +2206,8 @@ public class SubagentExecutor {
                 log.debug("[SubagentExecutor] Step 21: 完整清理已完成 agent={} (a+16hex={})", agentId, agentIdHex);
             }
 
-            // [批 2 · B 类清理] spawn 作用域退出复位（**非**「恢复被本作用域覆盖的值」——本作用域
-            //   已无 set，见 Step 20 注释）：清理子代理 loop 内 prompt 组装（LlmAgentLoop:4642）
-            //   在本池化线程上未成对 set 的会话 projectRoot，防线程复用串台
-            //   （对齐 HookRegistry.withSessionProjectRoot 同款 restore 模式；null → 移除回落生效）。
-            AutoMemPaths.restoreCurrentProjectRoot(prevSubagentProjectRoot);
+            // [批 4b-1] 原 spawn 作用域退出复位（restoreCurrentProjectRoot(prevSubagentProjectRoot)）
+            //   已删：ThreadLocal 载体删除，本作用域不再持有任何线程槽（用户铁律：会话态一律显式传参）。
         }
 
         // ── Step 22: extract conclusion ──
@@ -3216,7 +3211,8 @@ public class SubagentExecutor {
      */
     private String buildAgentSystemPrompt(boolean isForkPath, AgentDefinition agentDefinition,
                                           List<Tool> resolvedTools, String effectiveModel,
-                                          List<String> additionalWorkingDirectories, String userContext) {
+                                          List<String> additionalWorkingDirectories, String userContext,
+                                          String sessionProjectRoot) {
         // [R2-ENVINFO] 模型经 getSystemPrompt(modelId, dirs) 逐调用显式传参 · 对齐 CC enhanceSystemPromptWithEnvDetails
         //   入参 resolvedAgentModel（runAgent.ts:340）。CC 无进程级/线程级静态模型槽——旧实现
         //   SubagentEnvInfo.setDefaultModelId(ThreadLocal) 静态槽已删，effectiveModel 直接作为显式参数
@@ -3243,7 +3239,7 @@ public class SubagentExecutor {
         //   Java 端 CustomAgentDefinition.getSystemPrompt 是静态内容（无 CC 闭包），故注入点在
         //   消费端 buildAgentSystemPrompt；[OPD-CM5-F-25] isAutoMemoryEnabled 门控在此调用方
         //   （对齐 CC 调用方门控，loadAgentMemoryPrompt 已去内部门控）。
-        String memoryPrompt = agentMemoryPrompt(agentDefinition);
+        String memoryPrompt = agentMemoryPrompt(agentDefinition, sessionProjectRoot);
         if (memoryPrompt != null && !memoryPrompt.isEmpty()) {
             enhanced.append("\n\n").append(memoryPrompt);
         }
@@ -3288,7 +3284,7 @@ public class SubagentExecutor {
      * @param agentDefinition 待生成 system prompt 的 agent 定义
      * @return memory prompt 文本或 null
      */
-    private String agentMemoryPrompt(AgentDefinition agentDefinition) {
+    private String agentMemoryPrompt(AgentDefinition agentDefinition, String agentCwd) {
         if (agentMemoryDirectory == null) {
             return null;
         }
@@ -3306,7 +3302,12 @@ public class SubagentExecutor {
         if (scope == null) {
             return null;
         }
-        String prompt = agentMemoryDirectory.loadAgentMemoryPrompt(agentDefinition.agentType(), scope);
+        // [批 4b-1] 显式传子代理会话 cwd（= ToolUseContext.effectiveCwd = CwdResolution.getCwd(sessionId)
+        //   / worktree 显式覆盖）：agent-memory PROJECT/LOCAL scope 的项目根原先经
+        //   AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 隐式读取，载体已删 ⇒ 必须显式下传，
+        //   否则 PROJECT/LOCAL 记忆直接 fail-loud（(a)：本该有却没有）。
+        String prompt = agentMemoryDirectory.loadAgentMemoryPrompt(
+            agentDefinition.agentType(), scope, agentCwd);
         if (prompt == null || prompt.isEmpty()) {
             return null;
         }
@@ -4252,13 +4253,14 @@ public class SubagentExecutor {
                         // [IMP-D F4/M-07] 子代理 LoopSessionState.workspaceDir 注入会话 projectRoot
                         //   （修 M-07 user.dir 兜底链：STOP hook transcript_path → P/<session>/subagents/...）。
                         //   本线程已由 spawn 作用域注入（Step 20），读 holder 即会话值。
-                        // [TL-W3 Phase A] 上游回放核验：sync/async/fallback/resume 四条 SubagentTool 入口
-                        //   与 SkillToolImpl fork 入口均在工具线程（StreamingToolExecutor 已回放）——
-                        //   但 teammate 路径（SpawnInProcess 的 teammate-<id> 裸线程，只回放 MDC 不回放
-                        //   projectRoot）不经上述入口，读 currentSessionProjectRoot() 会回落 config home
-                        //   ⇒ 子代理 workspaceDir 指向配置主目录。改 orNull：无会话上下文即 null →
-                        //   shared(null) 走既有「无会话上下文」分支（workspaceDir 回落 bean ?? user.dir）。
-                        contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull()));
+                        // [批 4b-1] 原接线 AutoMemPaths.currentSessionProjectRootOrNull()（ThreadLocal 载体已删
+                        //   ⇒ 恒 null）→ 改**按本子代理会话 id 查冻结表**（用户铁律：直传或按 sessionId 查；
+                        //   ⛔ 不回落 config home）。来源覆盖全部调度线程（含原回放覆盖不到的 teammate 裸
+                        //   线程）；查不到（未绑定会话）→ null → shared(null) 走既有「无会话上下文」分支。
+                        contextFactory.shared(subagentCtx != null && subagentCtx.sessionId() != null
+                            ? com.nexusai.common.SessionProjectRoot.getForSession(
+                                subagentCtx.sessionId().toString())
+                            : null));
                 // [RES-R6] resume 重建的 ContentReplacementState 注入 query loop session state
                 // （对齐 CC resumeAgent.ts:194 runAgentParams.contentReplacementState → query.ts:372-389
                 //   applyToolResultBudget 消费同一实例）。null（父 live state 不可得 / 非 resume）→
@@ -5282,9 +5284,8 @@ public class SubagentExecutor {
      * CLAUDE.md** 注入子代理 userContext（读错项目上下文，且静默）。改 orNull：无会话上下文
      * → 返回空串（不注入 userContext），绝不拿 config home 冒充项目根。
      */
-    private String resolveUserContext() {
+    private String resolveUserContext(String sessionProjectRoot) {
         try {
-            String sessionProjectRoot = AutoMemPaths.currentSessionProjectRootOrNull();
             if (sessionProjectRoot == null || sessionProjectRoot.isBlank()) {
                 if (log.isDebugEnabled()) {
                     log.debug("[SubagentExecutor] resolveUserContext 无会话 projectRoot（无会话上下文线程）"
@@ -5317,9 +5318,22 @@ public class SubagentExecutor {
      * rebase 后保留单一生产调用点，避免测试契约与 Step 8 内联逻辑再次漂移。
      */
     String userContextFor(AgentDefinition agentDefinition) {
+        return userContextFor(agentDefinition, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #userContextFor(AgentDefinition)}。
+     *
+     * <p>WHY 需要显式根：userContext = 会话项目根的 {@code CLAUDE.md}。该根原先经
+     * {@code AutoMemPaths.currentSessionProjectRootOrNull()}（ThreadLocal）隐式读取，载体已删
+     * ⇒ 会话线程必须显式传入；缺失 ⇒ 返回空串（不注入，⛔ 绝不回落 config home 冒充项目根）。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（{@code ToolUseContext.effectiveCwd()} 等）；null → 不注入
+     */
+    String userContextFor(AgentDefinition agentDefinition, String sessionProjectRoot) {
         boolean omitClaudeMd = agentDefinition != null
                 && agentDefinition.omitClaudeMd().orElse(false);
-        return omitClaudeMd ? "" : resolveUserContext();
+        return omitClaudeMd ? "" : resolveUserContext(sessionProjectRoot);
     }
 
     // ── systemContext 解析（DEL-SP-16 + IMP-G4 F5）──

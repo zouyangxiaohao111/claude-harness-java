@@ -271,6 +271,10 @@ public final class SessionFileAccessHooks {
         }
         // CC :158-159 subagentName = getSubagentLogName()；subagentProps = subagentName ? {subagent_name} : {}
         java.util.Map<String, Object> subagentProps = subagentProps(ctx);
+        // [批 4b-1] 显式会话项目根（memdir / team memory 路径判定的派生基址；原经 AutoMemPaths
+        //   ThreadLocal 隐式解析，载体已删）——本方法持 ctx，取 effectiveCwd 显式下传。
+        final String sessionProjectRoot = (ctx != null && ctx.effectiveCwd() != null)
+            ? ctx.effectiveCwd().toString() : null;
         FileType fileType = getSessionFileTypeFromInput(toolName, input);
         if (fileType == FileType.SESSION_MEMORY) {
             log.info("[SessionFileAccessHooks] 会话记忆文件被访问: tool={} subagent_name={}",
@@ -284,7 +288,7 @@ public final class SessionFileAccessHooks {
 
         // Memdir 访问追踪 (CC :168-186)
         String filePath = getFilePathFromInput(toolName, input);
-        if (filePath != null && isAutoMemFile(filePath)) {
+        if (filePath != null && isAutoMemFile(filePath, sessionProjectRoot)) {
             log.info("[SessionFileAccessHooks] memdir 文件被访问: tool={} path={}", toolName, filePath);
             doubleEmit("tengu_memdir_accessed",
                 mergeAttrs(Map.of("tool", toolName), subagentProps));
@@ -303,7 +307,7 @@ public final class SessionFileAccessHooks {
         // Edit/Write 后 notifyTeamMemoryWrite（防 fs.watch 漏事件，watcher.ts:314-319）
         if (filePath != null
             && memoryFileDetection.teamMemPaths().isTeamMemFeatureEnabled()
-            && memoryFileDetection.isTeamMemFile(filePath)) {
+            && memoryFileDetection.isTeamMemFile(filePath, sessionProjectRoot)) {
             log.info("[SessionFileAccessHooks] team memory 文件被访问: tool={} path={}", toolName, filePath);
             doubleEmit("tengu_team_mem_accessed",
                 mergeAttrs(Map.of("tool", toolName), subagentProps));
@@ -504,5 +508,13 @@ public final class SessionFileAccessHooks {
      */
     boolean isAutoMemFile(String filePath) {
         return memoryFileDetection.isAutoMemFile(filePath);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #isAutoMemFile(String)}（AutoMem/TeamMem 路径
+     * 判定派生于会话项目根；原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）。
+     */
+    boolean isAutoMemFile(String filePath, String sessionProjectRoot) {
+        return memoryFileDetection.isAutoMemFile(filePath, sessionProjectRoot);
     }
 }

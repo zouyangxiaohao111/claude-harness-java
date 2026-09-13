@@ -132,7 +132,9 @@ public record PathValidationEnv(
         if (autoMemPaths == null) {
             return this;
         }
-        String base = autoMemPaths.getAutoMemPath();
+        // [批 4b-1] 显式传会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）：
+        //   本 env 的 effectiveCwd 即 CwdResolution.getCwd(sessionId) 的显式快照。
+        String base = autoMemPaths.getAutoMemPath(effectiveCwd);
         return new PathValidationEnv(sessionId, agentId, effectiveCwd, originalCwd,
             claudeConfigHomeDir, nexusaiConfigHomeDir, scratchpadEnabled, claudeTempDir,
             autoMemPaths.hasAutoMemPathOverride(),

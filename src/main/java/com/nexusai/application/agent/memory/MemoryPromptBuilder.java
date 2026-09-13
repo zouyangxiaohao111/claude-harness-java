@@ -858,6 +858,18 @@ public final class MemoryPromptBuilder {
      */
     public List<String> buildMemoryLines(String displayName, String memoryDir,
                                          List<String> extraGuidelines, boolean skipIndex) {
+        return buildMemoryLines(displayName, memoryDir, extraGuidelines, skipIndex,
+            autoMemPaths != null ? autoMemPaths.projectRoot() : null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #buildMemoryLines(String, String, List, boolean)}。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（仅用于「Searching past context」段的 transcript 搜索根）
+     */
+    public List<String> buildMemoryLines(String displayName, String memoryDir,
+                                         List<String> extraGuidelines, boolean skipIndex,
+                                         String sessionProjectRoot) {
         List<String> howToSave;
         if (skipIndex) {
             howToSave = new ArrayList<>(List.of(
@@ -924,7 +936,7 @@ public final class MemoryPromptBuilder {
         }
         // CC memdir.ts:259 `...(extraGuidelines ?? []), ''` —— 无论有无 extras 恒有尾部空行
         lines.add("");
-        lines.addAll(buildSearchingPastContextSection(memoryDir));
+        lines.addAll(buildSearchingPastContextSection(memoryDir, sessionProjectRoot));
         return lines;
     }
 
@@ -940,6 +952,17 @@ public final class MemoryPromptBuilder {
      * @return 完整 prompt 文本
      */
     public String buildMemoryPrompt(String displayName, String memoryDir, List<String> extraGuidelines) {
+        return buildMemoryPrompt(displayName, memoryDir, extraGuidelines,
+            autoMemPaths != null ? autoMemPaths.projectRoot() : null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #buildMemoryPrompt(String, String, List)}。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（仅用于「Searching past context」段的 transcript 搜索根）
+     */
+    public String buildMemoryPrompt(String displayName, String memoryDir, List<String> extraGuidelines,
+                                    String sessionProjectRoot) {
         String entrypointContent;
         try {
             entrypointContent = entrypointReader.apply(memoryDir + java.io.File.separator + ENTRYPOINT_NAME);
@@ -947,7 +970,8 @@ public final class MemoryPromptBuilder {
             log.warn("[MemoryPromptBuilder] buildMemoryPrompt 读取 entrypoint 异常，按空处理: {} {}", memoryDir, e.getMessage());
             entrypointContent = "";
         }
-        List<String> lines = new ArrayList<>(buildMemoryLines(displayName, memoryDir, extraGuidelines, false));
+        List<String> lines = new ArrayList<>(buildMemoryLines(displayName, memoryDir, extraGuidelines, false,
+            sessionProjectRoot));
 
         if (entrypointContent != null && !entrypointContent.trim().isEmpty()) {
             EntrypointTruncation t = truncateEntrypointContent(entrypointContent);
@@ -990,11 +1014,25 @@ public final class MemoryPromptBuilder {
      * @return 段行列表（gate 关闭时空）
      */
     public List<String> buildSearchingPastContextSection(String autoMemDir) {
+        return buildSearchingPastContextSection(autoMemDir, autoMemPaths != null ? autoMemPaths.projectRoot() : null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #buildSearchingPastContextSection(String)}。
+     *
+     * @param autoMemDir         auto memory 目录
+     * @param sessionProjectRoot 会话绑定项目根（transcript 搜索根的项目 slug 来源）；
+     *                           null/blank → 无法指向真实 transcript 目录（回退 "." 即提示失效，
+     *                           调用方须显式传入；本方法只做防御性不崩）
+     * @return 段行列表（gate 关闭时空）
+     */
+    public List<String> buildSearchingPastContextSection(String autoMemDir, String sessionProjectRoot) {
         if (!coralFernFlag.getAsBoolean()) {
             return List.of();
         }
-        // ODF-A1: 会话 projectRoot（CC getOriginalCwd 等价）· 绝不读 JVM 进程工作目录
-        String projectRoot = autoMemPaths != null ? autoMemPaths.projectRoot() : ".";
+        // [批 4b-1] 会话 projectRoot 由调用方显式传入（原经 AutoMemPaths ThreadLocal 隐式读取，
+        //   载体已删）· 绝不读 JVM 进程工作目录
+        String projectRoot = sessionProjectRoot;
         if (projectRoot == null || projectRoot.isBlank()) {
             projectRoot = ".";
         }
@@ -1034,19 +1072,30 @@ public final class MemoryPromptBuilder {
 
     /**
      * Assistant 模式 daily-log prompt · CC original: {@code buildAssistantDailyLogPrompt}
-     * （memdir.ts:327-370）。KAIROS 门控由 {@link #loadMemoryPrompt()} 负责；本方法只构建文本。
+     * （memdir.ts:327-370）。KAIROS 门控由 {@link #loadMemoryPrompt(String)} 负责；本方法只构建文本。
      * 路径描述用「模式」而非今日字面路径（prompt 被 systemPromptSection 缓存，日期变更不失效，
      * 模型从 currentDate attachment 推导当日日期）。
      *
-     * @param skipIndex CC tengu_moth_copse flag：true 时省略 MEMORY.md 蒸馏索引段
-     * @return daily-log prompt 文本
+     * <p>[批 4b-1] 显式会话项目根版本；无参重载 {@link #buildAssistantDailyLogPrompt(boolean)}
+     * 保留兼容（退回类级根供应）。
+     *
+     * @param skipIndex          CC tengu_moth_copse flag：true 时省略 MEMORY.md 蒸馏索引段
+     * @param sessionProjectRoot 会话绑定项目根（auto-memory per-project 派生基址）；null = 无有效项目
+     * @return daily-log prompt 文本；无有效项目 → null
      */
     public String buildAssistantDailyLogPrompt(boolean skipIndex) {
-        String memoryDir = autoMemPaths.getAutoMemPath();
+        return buildAssistantDailyLogPrompt(skipIndex, autoMemPaths.projectRoot());
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #buildAssistantDailyLogPrompt(boolean)}。
+     */
+    public String buildAssistantDailyLogPrompt(boolean skipIndex, String sessionProjectRoot) {
+        String memoryDir = autoMemPaths.getAutoMemPath(sessionProjectRoot);
         // A′: 无有效项目 → auto-memory 目录不存在 → 无 daily-log 可写（返回 null，调用方跳过）
         if (memoryDir == null) {
             log.warn("[MemoryPromptBuilder] buildAssistantDailyLogPrompt 无有效项目（auto-memory per-project "
-                + "目录不存在，rawRoot={}），返回 null", autoMemPaths.projectRoot());
+                + "目录不存在，rawRoot={}），返回 null", sessionProjectRoot);
             return null;
         }
         String logPathPattern = Paths.get(memoryDir, "logs", "YYYY", "MM", "YYYY-MM-DD.md").toString();
@@ -1080,7 +1129,7 @@ public final class MemoryPromptBuilder {
                     + "` is the distilled index (maintained nightly from your logs) and is loaded into your context automatically. Read it for orientation, but do not edit it directly — record new information in today's log instead.",
                 ""));
         }
-        lines.addAll(buildSearchingPastContextSection(memoryDir));
+        lines.addAll(buildSearchingPastContextSection(memoryDir, sessionProjectRoot));
         return String.join("\n", lines);
     }
 
@@ -1102,13 +1151,27 @@ public final class MemoryPromptBuilder {
      * @return 行为指令 prompt 文本；auto memory 禁用时返回 {@code null}（INV-3）
      */
     public String loadMemoryPrompt() {
+        return loadMemoryPrompt(autoMemPaths.projectRoot());
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #loadMemoryPrompt()}。
+     *
+     * <p><b>会话线程必须走本重载</b>：per-project auto 记忆目录（{@code getAutoMemPath(sessionProjectRoot)}）
+     * 与「Searching past context」段的 transcript 搜索根都取自入参；无入参（null）时按「无有效项目」
+     * fail-loud 记 error 并返回 null（绝不回落 config home 冒充项目根）。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（原经 AutoMemPaths ThreadLocal 隐式承载，批 4b-1 改显式传参）
+     * @return 行为指令 prompt 文本；auto memory 禁用 / 无有效项目时返回 {@code null}
+     */
+    public String loadMemoryPrompt(String sessionProjectRoot) {
         boolean autoEnabled = autoMemoryEnabled.getAsBoolean();
         boolean skipIndex = mothCopseFlag.getAsBoolean();
 
         // 1. KAIROS daily-log（takes precedence over TEAMMEM）
         if (kairosActive.getAsBoolean() && autoEnabled) {
             // A′: 无有效项目（config-home 回落）→ per-project auto 记忆目录不存在 → 跳过 daily-log
-            String autoDirKairos = autoMemPaths.getAutoMemPath();
+            String autoDirKairos = autoMemPaths.getAutoMemPath(sessionProjectRoot);
             if (autoDirKairos == null) {
                 // [决策 2026-09-08] 出现即错误（fail loud）：auto 记忆启用但无有效项目（DB 主路径
                 //   查不到绑定 / override/settings 显式路径均缺席）→ log.error，仍返回 null 不注入
@@ -1124,7 +1187,7 @@ public final class MemoryPromptBuilder {
                 log.error("[MemoryPromptBuilder] loadMemoryPrompt KAIROS 分支无有效项目（auto-memory per-project "
                     + "目录不存在 = 会话未绑定项目，DB 主路径解析为空），跳过 daily-log 注入，拒绝以 config-home "
                     + "假目录充当项目; rawRoot={} thread={}",
-                    autoMemPaths.projectRoot(), Thread.currentThread().getName());
+                    sessionProjectRoot, Thread.currentThread().getName());
                 return null;
             }
             // CC memdir.ts:433-436 logMemoryDirCounts(getAutoMemPath(), {memory_type: 'auto'})
@@ -1132,7 +1195,7 @@ public final class MemoryPromptBuilder {
             if (log.isDebugEnabled()) {
                 log.debug("[MemoryPromptBuilder] loadMemoryPrompt 走 KAIROS daily-log 分支");
             }
-            return buildAssistantDailyLogPrompt(skipIndex);
+            return buildAssistantDailyLogPrompt(skipIndex, sessionProjectRoot);
         }
 
         // Cowork 注入 memory 策略文本 env var（memdir.ts:441-446）
@@ -1144,7 +1207,7 @@ public final class MemoryPromptBuilder {
 
         // 2. TEAMMEM 合并分支
         if (teamMemoryEnabled.getAsBoolean()) {
-            String autoDir = autoMemPaths.getAutoMemPath();
+            String autoDir = autoMemPaths.getAutoMemPath(sessionProjectRoot);
             // A′: 无有效项目 → auto/team per-project 目录均不存在 → 跳过 TEAMMEM（对齐 CC：无项目无 team 记忆）
             if (autoDir == null) {
                 // [决策 2026-09-08] 出现即错误（fail loud）——见 KAIROS 分支注释：autoDir==null = DB 主路径
@@ -1153,7 +1216,7 @@ public final class MemoryPromptBuilder {
                 log.error("[MemoryPromptBuilder] loadMemoryPrompt TEAMMEM 分支无有效项目（auto-memory per-project "
                     + "目录不存在 = 会话未绑定项目，DB 主路径解析为空），跳过 team 记忆注入，拒绝以 config-home "
                     + "假目录充当项目; rawRoot={} thread={}",
-                    autoMemPaths.projectRoot(), Thread.currentThread().getName());
+                    sessionProjectRoot, Thread.currentThread().getName());
                 return null;
             }
             String teamDir = Paths.get(autoDir, "team").toString();
@@ -1168,7 +1231,7 @@ public final class MemoryPromptBuilder {
 
         // 3. auto-only 分支
         if (autoEnabled) {
-            String autoDir = autoMemPaths.getAutoMemPath();
+            String autoDir = autoMemPaths.getAutoMemPath(sessionProjectRoot);
             // A′: 无有效项目 → per-project auto 记忆目录不存在 → 不注入 auto 记忆（对齐 CC：无项目会话
             //   本就不该有 per-project 目录）。此处不 emitMemdirDisabled（非禁用，是"无项目"）。
             //   [决策 2026-09-08] 出现即错误（fail loud）——autoDir==null = DB 主路径无绑定项目且
@@ -1180,7 +1243,7 @@ public final class MemoryPromptBuilder {
                 log.error("[MemoryPromptBuilder] loadMemoryPrompt auto-only 分支无有效项目（auto-memory per-project "
                     + "目录不存在 = 会话未绑定项目，DB 主路径解析为空），跳过 auto 记忆注入，拒绝以 config-home "
                     + "假目录充当项目; rawRoot={} thread={}",
-                    autoMemPaths.projectRoot(), Thread.currentThread().getName());
+                    sessionProjectRoot, Thread.currentThread().getName());
                 return null;
             }
             ensureMemoryDirExists(autoDir);
@@ -1189,7 +1252,8 @@ public final class MemoryPromptBuilder {
             if (log.isDebugEnabled()) {
                 log.debug("[MemoryPromptBuilder] loadMemoryPrompt 走 auto-only 分支 dir={}", autoDir);
             }
-            return String.join("\n", buildMemoryLines(AUTO_MEM_DISPLAY_NAME, autoDir, extraGuidelines, skipIndex));
+            return String.join("\n", buildMemoryLines(AUTO_MEM_DISPLAY_NAME, autoDir, extraGuidelines, skipIndex,
+                sessionProjectRoot));
         }
 
         // 4. disabled → null（CC tengu_memdir_disabled telemetry：两属性 + herring_clock 时 team 子事件）

@@ -857,17 +857,12 @@ class ExecAgentHookSemanticsTest {
      *
      * <p>RED 条件：把实现回退为 {@code currentSessionProjectRoot()} → 本用例红。
      */
-    @Test
-    @DisplayName("[TL-W3] hook agent ctx 根用 currentSessionProjectRootOrNull()（无会话上下文不伪造 config home）")
-    void execAgentHook_workspaceRootUsesOrNullVariant() throws Exception {
-        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
-            "src/main/java/com/nexusai/application/agent/permission/hook/ExecAgentHook.java"));
-        org.assertj.core.api.Assertions.assertThat(source)
-            .as("ExecAgentHook 必须经 contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull()) 注入根"
-                + "（旧 currentSessionProjectRoot() 在无回放调度线程回落 config home → workspaceDir/CLAUDE.md 指错目录）")
-            .contains("contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull())")
-            .doesNotContain("contextFactory.shared(AutoMemPaths.currentSessionProjectRoot())");
-    }
+    // [批 4b-1 已退役] 原「hook agent ctx 根用 currentSessionProjectRootOrNull()」**源码字面守卫**：
+    //   它 readString(ExecAgentHook.java) 后断言 contains/doesNotContain 某段源代码文本 —— 属「源级
+    //   字面守卫」（对格式化/重命名零容忍，且 doesNotContain 支恒绿 = 零鉴别力）。批 4b-1 后该接线改为
+    //   「按显式 sessionId 查 SessionProjectRoot 冻结表」（无环境态、覆盖全部调度线程），行为守卫落在
+    //   AutoMemoryExplicitRootPlumbingTest 与 SubagentProjectRootInheritanceTest#shared_withProjectRoot
+    //   等正向锚用例。
 
     // ════════════════════════════════════════════════════════════════════════
     // 夹具 helper

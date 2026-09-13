@@ -1270,10 +1270,9 @@ public class StreamingToolExecutor {
 
     /** 启动工具后台执行 (CC executeTool line 265-405). */
     private void executeAsync(TrackedTool t) {
-        // [IMP-C D2-A/F3] 调度线程（会话线程）捕获 projectRoot → 任务体线程注入 →
-        //   finally restore 外层原值（对齐 LlmAgentLoop.run() :1637/:1645 capture/restore 语义；
-        //   restore 而非 remove —— 线程池复用防泄漏，null 捕获值不 set 保持回落）。
-        final String scheduledProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
+        // [批 4b-1] 原此处「调度线程捕获 projectRoot → 任务体注入 → finally restore」回放块已删：
+        //   AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 载体删除后无可回放对象（用户铁律：
+        //   会话态一律显式传参，回放不算合规）。工具体内需要项目根者由其自身显式来源提供。
         t.status = Status.EXECUTING;
         // [R32-b8 #3 P0-2 校正] 在 executeAsync() 入口 (执行真正开始时) 触发 in-progress 标记 ·
         //   对齐 CC StreamingToolExecutor.ts:267 executeTool 入口 + toolOrchestration.ts:127/160
@@ -1286,7 +1285,7 @@ public class StreamingToolExecutor {
         //   → setHasInterruptibleToolInProgress(false); 若全为 cancel → setHasInterruptibleToolInProgress(true).
         //   入口先设 false (默认保守), 然后单独处理"全 cancel"路径.
         updateInterruptibleStateOnStart(t);
-        t.promise = CompletableFuture.runAsync(withSessionProjectRoot(scheduledProjectRoot, () -> {
+        t.promise = CompletableFuture.runAsync(() -> {
             long t0 = System.currentTimeMillis();
             log.info("TOOL exec: name={} id={} input={}",
                 t.call.name(), abbreviate(t.call.id(), 24), abbreviate(t.call.input().toString(), 200));
@@ -2432,33 +2431,13 @@ public class StreamingToolExecutor {
                     }
                 }
             }
-        }), executor);
+        }, executor);
     }
 
-    /**
-     * [IMP-C D2-A/F3] 跨线程 projectRoot 传播载体 —— 调度线程捕获值注入任务体线程。
-     *
-     * <p>WHY projectRoot: 工具执行在 fixed-8 池线程（{@code runAsync(..., executor)}），ThreadLocal 不跨线程；
-     *   不传播则工具体内 {@link AutoMemPaths#currentSessionProjectRoot()} 读回落值
-     *   （CLAUDE_PROJECT_DIR env ?? config home），而非会话绑定 P（M-04：工具/HOOK/定时器
-     *   线程 7+ 消费者受影响）。模式对齐 {@link com.nexusai.application.agent.LlmAgentLoop#run()}
-     *   capture/restore（:1637/:1645）：调度线程（会话线程）捕获一次，任务体开头 set，
-     *   finally restore 外层原值（restore 而非 remove —— 线程池复用防泄漏，null 捕获值
-     *   不 set，保持回落语义）。
-     */
-    private static Runnable withSessionProjectRoot(String scheduledProjectRoot, Runnable task) {
-        return () -> {
-            String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-            try {
-                if (scheduledProjectRoot != null && !scheduledProjectRoot.isBlank()) {
-                    AutoMemPaths.setCurrentProjectRoot(scheduledProjectRoot);
-                }
-                task.run();
-            } finally {
-                AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
-            }
-        };
-    }
+    // [批 4b-1 已删] 原 withSessionProjectRoot(String, Runnable) —— AutoMemPaths.CURRENT_PROJECT_ROOT
+    //   （ThreadLocal）跨线程「捕获-回放」包装器。载体删除后该包装器退化为恒等函数
+    //   （无会话态可回放），唯一调用点（executeAsync）已直接内联原 lambda 提交到工具池。
+    //   ⛔ 用户铁律：会话态一律显式传参，回放不算合规 —— 不得以任何形式复活本模式。
 
     /**
      * [P0-3] Map → JsonNode 整体转换 · 用于 AHR.updatedInput 全替换 ·

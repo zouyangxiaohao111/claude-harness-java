@@ -2282,11 +2282,10 @@ public class LlmAgentLoop implements AgentLoop {
     // R29: 唯一契约 · 对齐 CC query.ts:219 query(params) · AgentLoop interface 已声明
     @Override
     public AgentState run(RunRequest params) {
-        // ODF-A1-R2: 会话 projectRoot ThreadLocal push/pop —— run() 是会话线程执行边界。
-        // 入口捕获外层原值（嵌套 run/subagent 场景），出口 finally 恢复（对齐 EVENT_BUFFER 先例：
-        // ThreadLocal 线程隔离 + 会话结束复位，消除会话结束残留继承，使无项目绑定会话回落 config-home
-        // 真正生效）。[批 3c] 原此处引用的「裸 MDC 会话槽模式」已随该槽一并删除（会话一律显式传参）。
-        String prevProjectRoot = com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
+        // [批 4b-1 已删] 原此处为 AutoMemPaths.CURRENT_PROJECT_ROOT（ThreadLocal）的
+        //   capture/restore 成对块（run() 会话线程边界 push/pop）。载体删除后无可捕获/恢复对象；
+        //   会话项目根的唯一载体 = 本实例 workspaceDir（+ ctx.sessionState().workspaceDir()），
+        //   由 resolveSessionProjectRoot() 显式解析后传给 auto-memory 消费点（用户铁律：显式传参）。
         // CRON-D2: 会话运行态登记（对齐 CC isQueryActive）—— 入口计数 +1，finally 计数 -1。
         // CronIdleExecutor 据此判空闲才轮询启动 cron 队列，活动 turn 不打断。
         markRunning(params.sessionId());
@@ -2321,7 +2320,7 @@ public class LlmAgentLoop implements AgentLoop {
                     log.warn("LlmAgentLoop: turn 结束队列通知触发失败: {}", e.getMessage());
                 }
             }
-            com.nexusai.application.agent.memory.AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
+            // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot) 已删（载体删除）。
         }
     }
 
@@ -2428,7 +2427,8 @@ public class LlmAgentLoop implements AgentLoop {
         }
     }
 
-    /** run() 主体（ODF-A1-R2：projectRoot ThreadLocal push/pop 由 run() 包装负责）。 */
+    /** run() 主体（[批 4b-1] 会话项目根不再经 ThreadLocal 传播：由 resolveSessionProjectRoot 解析后
+     *  存 workspaceDir / SessionProjectRoot，消费点显式传参）。 */
     private AgentState doRun(RunRequest params) {
         // ── R28-1: 唯一入口 · 对齐 CC query.ts:219 query(params) ──
         // RunRequest 紧凑构造器已校验 userPrompt + querySource 此处不再重复
@@ -4421,14 +4421,17 @@ public class LlmAgentLoop implements AgentLoop {
                 String customSystemPrompt = state.systemPrompt();
                 if (customSystemPrompt != null) {
                     // hasAutoMemPathOverride = env CLAUDE_COWORK_MEMORY_PATH_OVERRIDE（CC paths.ts:161-166）；
-                    // 本方法为静态方法 → 直取 defaultInstance（生产 bean 单例即 defaultInstance，per-session
-                    // ThreadLocal projectRoot 语义；override env 是唯一 opt-in 信号，JVM 测试经
-                    // AutoMemPaths.setOverrideEnvForTest 缝注入（同库 MemoryBareModeConfig.setEnvOverride 惯例））
+                    // 本方法为静态方法 → 直取 defaultInstance（生产 bean 单例即 defaultInstance；
+                    // override env 是唯一 opt-in 信号，JVM 测试经 AutoMemPaths.setOverrideEnvForTest
+                    // 缝注入（同库 MemoryBareModeConfig.setEnvOverride 惯例））
                     com.nexusai.application.agent.memory.AutoMemPaths amp =
                         com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance();
                     if (amp.hasAutoMemPathOverride()) {
                         com.nexusai.application.agent.telemetry.Telemetry tel =
                             ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
+                        // [批 4b-1] 显式传会话项目根（原经 AutoMemPaths ThreadLocal 隐式读取）：
+                        //   与 :4775 装配点同一解析器，保证 override/settings 与 per-project 两路同根。
+                        String mechanicsProjectRoot = resolveAutoMemoryProjectRoot(ctx);
                         com.nexusai.application.agent.memory.LoadMemoryPrompt memoryLoader =
                             new com.nexusai.application.agent.memory.LoadMemoryPrompt(
                                 com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault(
@@ -4442,7 +4445,8 @@ public class LlmAgentLoop implements AgentLoop {
                                     // [IMP-C-6 · OPD-CM5-C-10] coral_fern 接线：「Searching past context」段门控接
                                     //   FeatureFlags.coralFern()（CC getFeatureValue_CACHED_MAY_BE_STALE('tengu_coral_fern', false)，
                                     //   memdir.ts:376 动态读 GB flag）
-                                    () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()));
+                                    () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()),
+                                mechanicsProjectRoot);
                         memoryMechanicsPrompt = memoryLoader.loadMemoryPrompt();
                     }
                 }
@@ -4675,52 +4679,61 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [auto-memory DB 主路径 · 决策 2026-09-08] memory 段组装前确认 projectRoot 已解析到会话绑定项目。
+     * [auto-memory DB 主路径 · 决策 2026-09-08 / 批 4b-1 显式化] 解析 memory 段组装所需的<b>会话项目根</b>。
      *
-     * <p><b>取舍/语义</b>：
-     * <ul>
+     * <p><b>[批 4b-1 变更]</b>：原方法名 {@code ensureAutoMemoryProjectRootResolvedForPrompt}，语义是
+     * 「把根<b>回填到本线程 ThreadLocal</b>」；载体删除后改为<b>返回值 + 显式下传</b>（用户铁律：
+     * 会话态一律显式传参，回放不算合规）。返回值直接进 {@code LoadMemoryPrompt} 构造器，
+     * 由 {@link com.nexusai.application.agent.memory.MemoryPromptBuilder#loadMemoryPrompt(String)}
+     * 消费。</p>
+     *
+     * <p><b>解析顺序（与改造前的 ThreadLocal 取值点逐位对齐，保证行为一致）</b>：
+     * <ol>
      *   <li>auto-memory 未启用（{@code BundledSkillEnabledGates.isAutoMemoryEnabled()} false）→ 无注入义务，
-     *       直接返回（MemoryPromptBuilder disabled 分支自行输出 null，不视为错误）。</li>
-     *   <li>本线程已注入有效 projectRoot（{@code AutoMemPaths.captureCurrentProjectRoot()} 非空，
-     *       LlmAgentLoop.run() 入口 resolveSessionProjectRoot 成功产物）→ 已解析，直接返回。</li>
-     *   <li>缺注入但当前有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
-     *       冻结值回填本线程 —— 冻结值 = run() 入口 DB 兜底（{@code tryResolveBoundProjectFromDb}：
-     *       {@code sessions.main_project_id → projects.path} → 校验 → setCurrentProjectRoot +
-     *       SessionProjectRoot.setForSession）成功后的产物，即 DB 主路径解析结果（"等价"于再查一次
-     *       DB；不重复查，符合 F1 会话内不重查语义）。</li>
+     *       返回 {@code null}（MemoryPromptBuilder disabled 分支自行输出 null，不视为错误）。</li>
+     *   <li>{@code ctx.sessionState().workspaceDir()} 非空 → 直接返回。这是 run() 入口
+     *       {@code resolveSessionProjectRoot()} 的产物（<b>原 ThreadLocal 承载的同一值</b>，含
+     *       cron DURABLE 显式项目锚），故本步即「改造前 current 非空 → 直接返回」的等价物。</li>
+     *   <li>否则当前有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
+     *       冻结值（{@code run()} 入口 DB 兜底 {@code tryResolveBoundProjectFromDb}
+     *       {@code sessions.main_project_id → projects.path} 成功后的产物 = DB 主路径结果；
+     *       不重复查 DB，符合 F1 会话内不重查语义）。</li>
      *   <li>仍解析不到（DB 确实无绑定）→ 抛 {@link AutoMemoryNoBoundProjectException}，由调用方
      *       <b>当场 catch</b>：fail loud 记 error，本轮不注入 auto 记忆段，不让整个 turn 崩溃。</li>
-     * </ul>
+     * </ol>
      *
-     * <p>DB 查询为何不在此重复：本方法位于 static 组装路径（buildSystemPromptAssemblyInput），无
-     * sessionMapper/projectMapper 实例依赖；真正的 DB 直查兜底在实例方法
-     * {@link LlmAgentLoop#resolveSessionProjectRoot()} 的
-     * {@code tryResolveBoundProjectFromDb}（run() 入口已执行并冻结）。此处读取冻结值即等价消费 DB
-     * 结果，同时修复「有绑定但本线程 ThreadLocal 未回放 → 回落 config-home → 该轮记忆漏注入」。
-     *
-     * @param ctx loop 上下文（{@code streamSessionId} 源）
+     * @param ctx loop 上下文（{@code streamSessionId} / {@code sessionState().workspaceDir()} 源）
+     * @return 会话项目根；auto-memory 未启用 或 确无会话（sessionId 空白且无 workspaceDir）→ null
      * @throws AutoMemoryNoBoundProjectException 会话存在但 DB 无绑定项目（且 auto-memory 启用）
      */
-    private static void ensureAutoMemoryProjectRootResolvedForPrompt(com.nexusai.application.agent.loop.AgentLoopContext ctx) {
+    private static String resolveAutoMemoryProjectRoot(com.nexusai.application.agent.loop.AgentLoopContext ctx) {
         if (!com.nexusai.application.agent.skill.BundledSkillEnabledGates.isAutoMemoryEnabled()) {
-            return;
+            return null;
         }
         String sessionId = ctx.streamSessionId();
         if (sessionId == null || sessionId.isBlank()) {
-            return;
+            // 无会话（cron headless / 无锚代）→ 确无会话项目根：不注入、不抛（保持原语义）。
+            // ⚠ 登记（批 4b-1 残留）：cron DURABLE fire 的显式项目锚（RunRequest.boundProject）不经本
+            //   解析器（QueryParams 无该字段）—— 该情形下原实现靠 ThreadLocal 注入锚值，现按「无有效
+            //   项目」跳过（≥WARN 可观测）。闭口方式 = 把锚显式穿到本方法（需改 collectRunMaterial
+            //   三处调用签名），留待批 4b-2 / 批 5。⛔ 绝不为此回落 user.dir / config home。
+            if (log.isWarnEnabled()) {
+                log.warn("[LlmAgentLoop] auto-memory 组装无会话 id（headless/无锚）⇒ 本轮不注入 auto 记忆段"
+                    + "（⛔ 不回落 config home / user.dir 冒充项目根）");
+            }
+            return null;
         }
-        String current = com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
-        if (current != null && !current.isBlank()) {
-            return;
-        }
+        // 会话项目根 = 冻结表（run() 入口 resolveSessionProjectRoot / DB 兜底 的产物）·
+        // ⛔ 刻意不读 ctx.sessionState().workspaceDir()：该字段的默认值 = 进程 user.dir
+        //   （LoopSessionState 字段初始化器），读它等于把「进程工作目录」当项目身份 —— 正是本批
+        //   要消灭的缺陷（A′ 的同一红线）。
         String frozen = com.nexusai.common.SessionProjectRoot.getForSession(sessionId);
         if (frozen != null && !frozen.isBlank()) {
-            com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(frozen);
             if (log.isDebugEnabled()) {
-                log.debug("[LlmAgentLoop] auto-memory 组装线程缺 projectRoot，从会话冻结值回填（DB 主路径）: "
+                log.debug("[LlmAgentLoop] auto-memory 组装解析会话项目根（会话冻结值 / DB 主路径）: "
                     + "session={} projectRoot={}", sessionId, frozen);
             }
-            return;
+            return frozen;
         }
         throw new com.nexusai.application.agent.memory.AutoMemoryNoBoundProjectException(sessionId);
     }
@@ -4762,12 +4775,11 @@ public class LlmAgentLoop implements AgentLoop {
             ctx.toolExecutionBeans() != null ? ctx.toolExecutionBeans().telemetry() : null;
         com.nexusai.application.agent.memory.LoadMemoryPrompt memoryLoader;
         try {
-            // [auto-memory DB 主路径 · 决策 2026-09-08] memory 段组装前确认 projectRoot 已解析到
-            //   会话绑定项目（DB 派生）——不走则当前线程可能是无 ThreadLocal 回放的非 run() 线程
-            //   （compact/queryLoop 等组装上下文），会回落 config-home → getAutoMemPath 返回 null →
-            //   有绑定也不注入（缺陷）。本步用 SessionProjectRoot 冻结值（run() 入口 DB 兜底
-            //   tryResolveBoundProjectFromDb 成功后的产物）回填本线程，保证「有绑定必注入 D 目录」。
-            ensureAutoMemoryProjectRootResolvedForPrompt(ctx);
+            // [auto-memory DB 主路径 · 决策 2026-09-08 / 批 4b-1 显式化] memory 段组装前解析「会话项目根」
+            //   并**显式传入** LoadMemoryPrompt（原实现是把根回填到本线程 ThreadLocal，由
+            //   MemoryPromptBuilder 隐式读取 —— 载体已删，见 resolveAutoMemoryProjectRoot javadoc）。
+            //   解析顺序保证「有绑定必注入 D 目录」，且绝不回落 config-home / user.dir。
+            String autoMemoryProjectRoot = resolveAutoMemoryProjectRoot(ctx);
             memoryLoader = new com.nexusai.application.agent.memory.LoadMemoryPrompt(
                 com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault(
                     tel,
@@ -4780,7 +4792,8 @@ public class LlmAgentLoop implements AgentLoop {
                     // [IMP-C-6 · OPD-CM5-C-10] coral_fern 接线：「Searching past context」段门控接
                     //   FeatureFlags.coralFern()（CC getFeatureValue_CACHED_MAY_BE_STALE('tengu_coral_fern', false)，
                     //   memdir.ts:376 动态读 GB flag）
-                    () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()));
+                    () -> ctx.featureFlags() != null && ctx.featureFlags().coralFern()),
+                autoMemoryProjectRoot);
         } catch (com.nexusai.application.agent.memory.AutoMemoryNoBoundProjectException e) {
             // fail loud + 降级取舍（决策 2026-09-08）：DB 确实无绑定 → 会话态错误，但不得击穿整个
             //   user turn —— 记 log.error（中文、sessionId/线程/原因）后本轮 memory 段不注入任何内容
@@ -5102,7 +5115,14 @@ public class LlmAgentLoop implements AgentLoop {
                 com.nexusai.application.agent.tool.AbortController turnAbort =
                     params.toolUseContext() != null ? params.toolUseContext().abortController() : null;
                 // MEM-03：turn 级 abort 控制器透传（CC attachments.ts:2390 createChildAbortController）
-                pendingMemoryPrefetch = ctx.memoryPrefetcher().startPrefetch(state.rawMessages(), readFileState, turnAbort);
+                // [批 4b-1] 显式传会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）：
+                //   来源 = ToolUseContext.effectiveCwd()（= CwdResolution.getCwd(sessionId) / 显式锚）；
+                //   缺失 → null（预取内部按 (b) 跳过 PROJECT/LOCAL 目录 + ≥WARN，不回落 config home）。
+                String prefetchProjectRoot = (params.toolUseContext() != null
+                        && params.toolUseContext().effectiveCwd() != null)
+                    ? params.toolUseContext().effectiveCwd().toString() : null;
+                pendingMemoryPrefetch = ctx.memoryPrefetcher().startPrefetch(
+                    state.rawMessages(), readFileState, turnAbort, prefetchProjectRoot);
             } catch (Exception e) {
                 log.debug("[LlmAgentLoop] turn={} relevant-memories prefetch 启动失败（跳过预取）: {}",
                     state.turnCount(), e.getMessage());
@@ -6604,15 +6624,9 @@ public class LlmAgentLoop implements AgentLoop {
             // [H7-arch Phase 5-2 P3-④] 提交 LLM call（loop 不再直接 provider.stream）。
             // [对抗核验 H13-GAP-4 v3] 后台线程执行 callModel → loop 线程空闲执行 abort 感知轮询
             //（同步 provider 不阻塞 loop 线程; abort 后 ≤500ms 退出等待, 对齐 CC 硬中断）。
-            // [IMP-A · F3 · OPD-SPR-11] 同帧捕获会话 projectRoot → 回放到 STREAM_EXECUTOR 虚拟
-            //   线程（虚拟线程不继承创建线程的 ThreadLocal）。WHY: 流式路径在
-            //   虚拟线程执行的消费链（post-compaction consume / StreamingToolExecutor.add 捕获
-            //   等）读 AutoMemPaths.currentSessionProjectRoot()，不回放则读到回落值
-            //   （CLAUDE_PROJECT_DIR env ?? config-home）而非会话绑定 P。null 捕获值不注入
-            //   （保持回落语义）；任务体 capture 原值 + finally restore 防虚拟线程池复用污染
-            //   下个任务（对齐 HookRegistry.withSessionProjectRoot 同款成对模式）。
-            final String streamProjectRoot =
-                com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
+            // [批 4b-1 已删] 原 [IMP-A · F3 · OPD-SPR-11]「同帧捕获会话 projectRoot → 回放到
+            //   STREAM_EXECUTOR 虚拟线程」回放块已删：CURRENT_PROJECT_ROOT ThreadLocal 载体删除，
+            //   无可回放对象（用户铁律：会话态一律显式传参，回放不算合规）。
             // [GAP-R1 线程传播] loop 线程（runner，已被 SpawnInProcess runWithTeammateContext 包）捕获
             //   teammate 上下文，回放到 STREAM_EXECUTOR 虚拟线程 —— 对齐 CC AsyncLocalStorage 跨异步
             //   continuation 自动传播（inProcessRunner.ts:1160 runWithTeammateContext 包 runAgent）。
@@ -6629,24 +6643,16 @@ public class LlmAgentLoop implements AgentLoop {
                     teammateStreamCtx.getData().agentId());
             }
             STREAM_EXECUTOR.execute(() -> {
-                // [IMP-A · F3] 任务体先捕获虚拟线程原值（池复用可能残留）→ set 回放值 → finally restore
-                String prevStreamProjectRoot =
-                    com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
-                try {
-                    if (streamProjectRoot != null && !streamProjectRoot.isBlank()) {
-                        com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(streamProjectRoot);
-                    }
-                    if (teammateStreamCtx != null) {
-                        com.nexusai.application.agent.team.TeammateContext.runWithTeammateContext(
-                            teammateStreamCtx, () -> {
-                                params.deps().callModel(request);
-                                return null;
-                            });
-                    } else {
-                        params.deps().callModel(request);
-                    }
-                } finally {
-                    com.nexusai.application.agent.memory.AutoMemPaths.restoreCurrentProjectRoot(prevStreamProjectRoot);
+                // [批 4b-1] 原 projectRoot 回放（capture 原值 → set 回放值 → finally restore）已删：
+                //   ThreadLocal 载体删除。仅保留 teammate 上下文的回放（另一载体，另行收敛）。
+                if (teammateStreamCtx != null) {
+                    com.nexusai.application.agent.team.TeammateContext.runWithTeammateContext(
+                        teammateStreamCtx, () -> {
+                            params.deps().callModel(request);
+                            return null;
+                        });
+                } else {
+                    params.deps().callModel(request);
                 }
             });
             if (log.isDebugEnabled()) {
@@ -10983,10 +10989,11 @@ public class LlmAgentLoop implements AgentLoop {
      *
      * <p>WHY 不再默认 {@code Path.of(AutoMemPaths.currentSessionProjectRoot())}：本类为
      * {@code @Scope("prototype")}（每次 {@code loopProvider.getObject()} 新实例），<b>字段初始化器
-     * 在构造期求值</b>，而 projectRoot ThreadLocal 只在 {@link #run()} 内注入 ⇒ 构造期恒空 ⇒
+     * 在构造期求值</b>，而会话 projectRoot 只在 {@link #run()} 内解析 ⇒ 构造期恒空 ⇒
      * 初值恒为 {@code env ?? ~/.nexusai}（configHome）。run() 的未命中分支（无 streamSessionId /
      * resolver null / resolver 空 / 目录无效 / 异常）都不覆盖该值 ⇒ configHome 经
      * {@code buildSessionStateFromInstance → session.setWorkspaceDir} 进入 AgentState，
+     * （[批 4b-1] 承载该值的 ThreadLocal 载体已删除，字段初值仍是裸 null —— 不得复活构造期读取）
      * 成为主腿读到 configHome 的真正来源（违铁律「绝不回落 configHome 冒充项目根」）。
      * 测试可经 setter 覆盖。
      */
@@ -11084,7 +11091,6 @@ public class LlmAgentLoop implements AgentLoop {
             return false;
         }
         this.workspaceDir = java.nio.file.Path.of(normalized);
-        com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(normalized);
         com.nexusai.common.SessionProjectRoot.setForSession(sessionIdStr, normalized);
         log.info("[LlmAgentLoop] 会话 projectRoot DB 兜底注入（resolve 失败出口）: session={} projectRoot={}",
             sessionIdStr, normalized);
@@ -11111,7 +11117,6 @@ public class LlmAgentLoop implements AgentLoop {
         if (projectRootOverride != null && !projectRootOverride.isBlank()) {
             String normalized = normalizeSessionProjectRoot(projectRootOverride);
             this.workspaceDir = java.nio.file.Path.of(normalized);
-            com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(normalized);
             // [cron-durable-session-fire] transcript 键 = RunRequest.sessionId（CronIdleExecutor
             // 创建会话存活判定后传创建会话 key → 归创建会话文件；已关 → null → 不写 transcript），
             // 本锚仅承担项目身份注入，不触碰 transcript 键。
@@ -11146,7 +11151,6 @@ public class LlmAgentLoop implements AgentLoop {
                 return;
             }
             this.workspaceDir = java.nio.file.Path.of(normalized);
-            com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(normalized);
             log.info("[LlmAgentLoop] 会话 projectRoot 命中冻结（F1 不再查 DB）: session={} projectRoot={}",
                 sessionIdStr, normalized);
             return;
@@ -11192,7 +11196,6 @@ public class LlmAgentLoop implements AgentLoop {
                 return;
             }
             this.workspaceDir = java.nio.file.Path.of(normalized);
-            com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(normalized);
             // [IMP-A · F1] 首 run 冻结（首写胜）：后续 run 直接命中冻结值，不重查 DB
             com.nexusai.common.SessionProjectRoot.setForSession(sessionIdStr, normalized);
             log.info("[LlmAgentLoop] 会话 projectRoot 注入（CC 启动冻结）: session={} projectRoot={}",

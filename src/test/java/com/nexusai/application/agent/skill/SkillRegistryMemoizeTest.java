@@ -207,31 +207,27 @@ class SkillRegistryMemoizeTest {
         writeSkill(pb, ".claude/skills/pb-only", "pb-only");
         BundledSkills.clear(); // 隔离跨测试泄漏的 bundled 注册集
 
-        // 生产接线语义：cwdSupplier = sessionId -> 会话 projectRoot（ToolRegistrationConfig:393）
-        // [批 3c] setCwdSupplier 形参由 Supplier<String> 改 Function<String,String>（会话 cwd 供应通道）；
-        //   本用例仍以「当前线程注入的 projectRoot」模拟会话 cwd（ThreadLocal 测试缝，见下），
-        //   故忽略 sessionId 形参 → 各 getAllCommands 调用一律显式 null。
+        // 生产接线语义：cwdSupplier = sessionId -> 会话 projectRoot（ToolRegistrationConfig:547）。
+        // [批 4b-1] 原实现经 AutoMemPaths ThreadLocal 隐式注入会话 cwd（载体已删）；现由测试用
+        //   AtomicReference 显式供应（等价于生产「按会话解析出的根」），缓存键必须随供应值变化。
         SkillRegistry registry = new SkillRegistry(tempDir.resolve("shared-root").toString());
-        registry.setCwdSupplier(sessionId -> AutoMemPaths.currentSessionProjectRoot());
+        java.util.concurrent.atomic.AtomicReference<String> sessionRoot =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        registry.setCwdSupplier(sessionId -> sessionRoot.get());
 
-        // 会话 A：当前线程注入 Pa → 键含 Pa → 加载 Pa/.claude/skills
-        String prev = AutoMemPaths.captureCurrentProjectRoot();
-        try {
-            AutoMemPaths.setCurrentProjectRoot(pa.toString());
-            assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("pa-only");
+        // 会话 A：供应 Pa → 键含 Pa → 加载 Pa/.claude/skills
+        sessionRoot.set(pa.toString());
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("pa-only");
 
-            // 会话 B：同一 registry 实例、同 skillsRoot，仅 projectRoot 切换 → 键含 Pb → 新缓存槽。
-            // RED 于现状（键 = skillsRoot）：B 阶段命中 A 的缓存槽 → 仍含 pa-only → doesNotContain 失败。
-            AutoMemPaths.setCurrentProjectRoot(pb.toString());
-            assertThat(registry.getAllCommands(null)).extracting(Command::getName)
-                .contains("pb-only").doesNotContain("pa-only");
+        // 会话 B：同一 registry 实例、同 skillsRoot，仅 cwd 供应值切换 → 键含 Pb → 新缓存槽。
+        // RED 于现状（键 = skillsRoot）：B 阶段命中 A 的缓存槽 → 仍含 pa-only → doesNotContain 失败。
+        sessionRoot.set(pb.toString());
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
+            .contains("pb-only").doesNotContain("pa-only");
 
-            // 切回会话 A：A 槽位仍完好（不被 B 的加载污染）
-            AutoMemPaths.setCurrentProjectRoot(pa.toString());
-            assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("pa-only");
-        } finally {
-            AutoMemPaths.restoreCurrentProjectRoot(prev); // capture/restore 成对，restore 外层原值
-        }
+        // 切回会话 A：A 槽位仍完好（不被 B 的加载污染）
+        sessionRoot.set(pa.toString());
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("pa-only");
     }
 
     @Test
@@ -243,30 +239,19 @@ class SkillRegistryMemoizeTest {
         writeSkill(pb, ".claude/skills/pb-only", "pb-only");
         BundledSkills.clear();
 
+        // [批 4b-1] 生产接线 = cwdSupplier 按**显式 sessionId** 解析会话 cwd
+        //   （ToolRegistrationConfig:547 sessionId -> SessionProjectRoot.getForSession(sessionId)）。
+        //   原用例以「工具线程 ThreadLocal 捕获-回放」模拟（载体已删）。现按生产同形：两个工具线程
+        //   各带自己的 sessionId 并发首触发 —— 键必须各取自己的会话 cwd，互不污染（真实并发锚）。
         SkillRegistry registry = new SkillRegistry(tempDir.resolve("shared-root").toString());
-        registry.setCwdSupplier(sessionId -> AutoMemPaths.currentSessionProjectRoot());
+        registry.setCwdSupplier(sessionId -> "sess-a".equals(sessionId) ? pa.toString() : pb.toString());
 
-        // 两个工具线程（fixed-8 池语义，非会话线程）：IMP-C 捕获-回放传播在任务体开头注入会话
-        // projectRoot（StreamingToolExecutor.executeAsync 模式），finally reset 防线程复用泄漏。
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
-            Future<List<String>> fA = pool.submit(() -> {
-                AutoMemPaths.setCurrentProjectRoot(pa.toString());
-                // [批 3c] 无会话 → 显式 null（会话 cwd 经 ThreadLocal 注入，非 sessionId 形参）
-                try {
-                    return registry.getAllCommands(null).stream().map(Command::getName).toList();
-                } finally {
-                    AutoMemPaths.resetCurrentProjectRoot();
-                }
-            });
-            Future<List<String>> fB = pool.submit(() -> {
-                AutoMemPaths.setCurrentProjectRoot(pb.toString());
-                try {
-                    return registry.getAllCommands(null).stream().map(Command::getName).toList();
-                } finally {
-                    AutoMemPaths.resetCurrentProjectRoot();
-                }
-            });
+            Future<List<String>> fA = pool.submit(() -> registry.getAllCommands("sess-a").stream()
+                .map(Command::getName).toList());
+            Future<List<String>> fB = pool.submit(() -> registry.getAllCommands("sess-b").stream()
+                .map(Command::getName).toList());
             // 各自首触发各自槽位：A 结果 = Pa 的 skills、B 结果 = Pb 的 skills，互不污染
             assertThat(fA.get()).contains("pa-only").doesNotContain("pb-only");
             assertThat(fB.get()).contains("pb-only").doesNotContain("pa-only");

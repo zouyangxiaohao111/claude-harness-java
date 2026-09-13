@@ -150,7 +150,15 @@ class SessionFileAccessHooksTest {
         SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry, autoMemPaths);
         String path = autoMemPaths.getAutoMemPath() + "MEMORY.md";
 
-        hooks.handleSessionFileAccess("Read", inputWithPath(path), com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
+        // [批 4b-1] memdir 判定需要「会话项目根」——生产取自 ctx.effectiveCwd()
+        //   （= CwdResolution.getCwd(sessionId) = 会话绑定项目）。测试用冻结表显式绑定本会话，
+        //   使 POJO ctx 的 effectiveCwd 解析到本用例的 projectRoot（原经 ThreadLocal 隐式给出）。
+        com.nexusai.common.SessionProjectRoot.setForSession("sess-test", projectRoot.toString());
+        try {
+            hooks.handleSessionFileAccess("Read", inputWithPath(path), com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
+        } finally {
+            com.nexusai.common.SessionProjectRoot.clearSession("sess-test");
+        }
 
         assertThat(telemetry.events).contains("tengu_memdir_accessed");
         assertThat(telemetry.events).contains("tengu_memdir_file_read");

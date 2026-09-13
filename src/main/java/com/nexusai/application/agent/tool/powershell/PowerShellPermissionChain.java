@@ -126,13 +126,28 @@ public class PowerShellPermissionChain {
      * @return true = 内部路径，应放行
      */
     boolean internalPathCarveOut(String resolvedPath, String operationType) {
+        return internalPathCarveOut(resolvedPath, operationType, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #internalPathCarveOut(String, String)}。
+     *
+     * <p>WHY 需要会话项目根：agent-memory PROJECT/LOCAL carve-out 基址 = {@code <会话 cwd>/.nexusai/agent-memory*}。
+     * 该值原先经 {@code AutoMemPaths.CURRENT_PROJECT_ROOT} ThreadLocal 隐式解析，载体已删 ⇒
+     * 由 {@code check(...)} 从 {@code ctx.effectiveCwd()} 显式绑定；缺失 ⇒ 该两段判定跳过（fail-closed：
+     * 不放行，走正常路径校验），⛔ 不回落 config home 拼假基址（否则放行面扩张）。
+     *
+     * @param sessionProjectRoot 会话项目根（null → 无显式根，PROJECT/LOCAL 段不放行）
+     */
+    boolean internalPathCarveOut(String resolvedPath, String operationType, String sessionProjectRoot) {
         if (resolvedPath == null) {
             return false;
         }
         boolean read = "read".equals(operationType);
         // 写/创建：agent-memory / auto-memory（CC checkEditableInternalPath isAgentMemoryPath + memdir）
         if (!read) {
-            if (agentMemoryDirectory != null && agentMemoryDirectory.isAgentMemoryPath(resolvedPath)) {
+            if (agentMemoryDirectory != null
+                && agentMemoryDirectory.isAgentMemoryPath(resolvedPath, sessionProjectRoot)) {
                 if (log.isDebugEnabled()) {
                     log.debug("PowerShellPermissionChain: 内部可编辑路径 carve-out 放行（agent-memory）path={}",
                         resolvedPath);
@@ -154,7 +169,8 @@ public class PowerShellPermissionChain {
             return false;
         }
         // 读：agent-memory / auto-memory / bundled-skills（CC checkReadableInternalPath 三 carve-out）
-        if (agentMemoryDirectory != null && agentMemoryDirectory.isAgentMemoryPath(resolvedPath)) {
+        if (agentMemoryDirectory != null
+            && agentMemoryDirectory.isAgentMemoryPath(resolvedPath, sessionProjectRoot)) {
             if (log.isDebugEnabled()) {
                 log.debug("PowerShellPermissionChain: 内部可读路径 carve-out 放行（agent-memory）path={}",
                     resolvedPath);
@@ -339,7 +355,11 @@ public class PowerShellPermissionChain {
         // TR-C2-Q2 / 组 1-4⑤：注入内部可编辑/可读路径 carve-out（this::internalPathCarveOut），
         // isPathAllowed step2/step3.5 对 agent-memory/auto-memory/bundled-skills 内部路径放行。
         // ThreadLocal 单请求同步作用域，finally 清除防跨请求泄漏；未注入 bean → carve-out 恒 false。
-        PowerShellPathValidator.setInternalPathCarveOut(this::internalPathCarveOut);
+        // [批 4b-1] 显式绑定会话项目根（原经 AutoMemPaths ThreadLocal 隐式读取，载体已删）：
+        //   agent-memory PROJECT/LOCAL carve-out 基址取自 ctx.effectiveCwd()（= 会话 cwd）。
+        final String carveOutProjectRoot = cwd != null ? cwd.toString() : null;
+        PowerShellPathValidator.setInternalPathCarveOut(
+            (p, op) -> internalPathCarveOut(p, op, carveOutProjectRoot));
         PermissionResult pathResult;
         try {
             pathResult = PowerShellPathValidator.check(input, parsed, permCtx, cwd, hasCdSubCommand);

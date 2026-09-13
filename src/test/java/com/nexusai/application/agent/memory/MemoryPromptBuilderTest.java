@@ -258,7 +258,6 @@ class MemoryPromptBuilderTest {
             Files.createDirectories(projectMemoryDir);
 
             // 模拟会话线程：注入会话 projectRoot（LlmAgentLoop.run() resolveSessionProjectRoot 等价）
-            AutoMemPaths.setCurrentProjectRoot(boundProject.toString());
 
             // 真实 AutoMemPaths（defaultInstance supplier = currentSessionProjectRoot ThreadLocal）
             MemoryPromptBuilder b = new MemoryPromptBuilder(
@@ -272,7 +271,7 @@ class MemoryPromptBuilderTest {
                 () -> null,   // coworkEnv
                 p -> "");     // entrypointReader
 
-            String prompt = b.loadMemoryPrompt();
+            String prompt = b.loadMemoryPrompt(boundProject.toString());
 
             // auto-only prompt 首行目录 = 该绑定项目的 per-project 记忆目录（buildMemoryLines :901）
             assertThat(prompt).contains("file-based memory system at `" + projectMemoryDir + java.io.File.separator + "`");
@@ -283,7 +282,6 @@ class MemoryPromptBuilderTest {
                     .resolve(AutoMemPaths.sanitizePath(configHome.toString()))
                     .resolve("memory").toString());
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -314,7 +312,6 @@ class MemoryPromptBuilderTest {
                 .as("无绑定项目：auto 分支返回 null，不注入 config-home 假目录（A′ 拦截）")
                 .isNull();
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -498,20 +495,18 @@ class MemoryPromptBuilderTest {
         //      故这里注入一个临时绑定项目根（模拟 LlmAgentLoop.resolveSessionProjectRoot 成功），
         //      并隔离 config home 到 @TempDir（防 per-project 目录真实写 ~/.nexusai）。
         NexusaiPaths.setConfigHomeDirOverride(dir.toString());
-        AutoMemPaths.setCurrentProjectRoot(dir.resolve("proj").toString());
         try {
             MemoryPromptBuilder prod = MemoryPromptBuilder.productionDefault(null, () -> true);
             if (!BundledSkillEnabledGates.isAutoMemoryEnabled()) {
                 // 环境显式禁用 auto memory → CC 三重组第二项失败 → KAIROS 分支不进 → null（memdir.ts:432/506）
-                assertThat(prod.loadMemoryPrompt()).isNull();
+                assertThat(prod.loadMemoryPrompt(dir.resolve("proj").toString())).isNull();
                 return;
             }
-            assertThat(prod.loadMemoryPrompt())
+            assertThat(prod.loadMemoryPrompt(dir.resolve("proj").toString()))
                 .contains("# auto memory")
                 .contains("## What to log")
                 .contains("append-only");
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -533,21 +528,19 @@ class MemoryPromptBuilderTest {
 
         // A′: 注入临时绑定项目根（config-home 回落会使 loadMemoryPrompt 返回 null，见 0.x A′ 语义）
         NexusaiPaths.setConfigHomeDirOverride(dir.toString());
-        AutoMemPaths.setCurrentProjectRoot(dir.resolve("proj").toString());
         try {
             MemoryPromptBuilder bOn = MemoryPromptBuilder.productionDefaultWithMothCopse(null, on::tenguMothCopse);
             MemoryPromptBuilder bOff = MemoryPromptBuilder.productionDefaultWithMothCopse(null, off::tenguMothCopse);
             if (!BundledSkillEnabledGates.isAutoMemoryEnabled()) {
-                assertThat(bOn.loadMemoryPrompt()).isNull();
+                assertThat(bOn.loadMemoryPrompt(dir.resolve("proj").toString())).isNull();
                 return;
             }
-            assertThat(bOn.loadMemoryPrompt())
+            assertThat(bOn.loadMemoryPrompt(dir.resolve("proj").toString()))
                 .contains("## How to save memories")
                 .contains("Write each memory to its own file")
                 .doesNotContain("two-step process");
-            assertThat(bOff.loadMemoryPrompt()).contains("Saving a memory is a two-step process:");
+            assertThat(bOff.loadMemoryPrompt(dir.resolve("proj").toString())).contains("Saving a memory is a two-step process:");
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -557,18 +550,16 @@ class MemoryPromptBuilderTest {
     void productionDefault_kairosActiveFalse_fallsThroughToAuto(@TempDir Path dir) {
         // A′: 注入临时绑定项目根（config-home 回落会使 loadMemoryPrompt 返回 null，见 0.x A′ 语义）
         NexusaiPaths.setConfigHomeDirOverride(dir.toString());
-        AutoMemPaths.setCurrentProjectRoot(dir.resolve("proj").toString());
         try {
             MemoryPromptBuilder prod = MemoryPromptBuilder.productionDefault(null, () -> false);
             if (!BundledSkillEnabledGates.isAutoMemoryEnabled()) {
-                assertThat(prod.loadMemoryPrompt()).isNull();
+                assertThat(prod.loadMemoryPrompt(dir.resolve("proj").toString())).isNull();
                 return;
             }
-            assertThat(prod.loadMemoryPrompt())
+            assertThat(prod.loadMemoryPrompt(dir.resolve("proj").toString()))
                 .contains("Saving a memory is a two-step process:")
                 .doesNotContain("## What to log");
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -845,11 +836,10 @@ class MemoryPromptBuilderTest {
         //       语义）→ 环境显式禁用 auto 时回落 disabled（null），与 CC 一致。
         // A′: 注入临时绑定项目根（config-home 回落会使 loadMemoryPrompt 返回 null，见 0.x A′ 语义）
         NexusaiPaths.setConfigHomeDirOverride(dir.toString());
-        AutoMemPaths.setCurrentProjectRoot(dir.resolve("proj").toString());
         try {
             MemoryPromptBuilder prod = MemoryPromptBuilder.productionDefault(null, () -> false, () -> true);
 
-            String prompt = prod.loadMemoryPrompt();
+            String prompt = prod.loadMemoryPrompt(dir.resolve("proj").toString());
 
             if (!BundledSkillEnabledGates.isAutoMemoryEnabled()) {
                 // 环境显式禁用 auto memory → 三闸第二项失败 → TEAMMEM 分支不进 → null（memdir.ts:448-449/506）
@@ -858,7 +848,6 @@ class MemoryPromptBuilderTest {
             }
             assertThat(prompt).contains("## Memory scope");
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -870,11 +859,10 @@ class MemoryPromptBuilderTest {
         //       默认 false）时 TEAMMEM 分支不可达，行为与接线前完全一致（auto-only 或 disabled→null）。
         // A′: 注入临时绑定项目根（config-home 回落会使 loadMemoryPrompt 返回 null，见 0.x A′ 语义）
         NexusaiPaths.setConfigHomeDirOverride(dir.toString());
-        AutoMemPaths.setCurrentProjectRoot(dir.resolve("proj").toString());
         try {
             MemoryPromptBuilder prod = MemoryPromptBuilder.productionDefault(null);
 
-            String prompt = prod.loadMemoryPrompt();
+            String prompt = prod.loadMemoryPrompt(dir.resolve("proj").toString());
 
             if (!BundledSkillEnabledGates.isAutoMemoryEnabled()) {
                 assertThat(prompt).isNull();
@@ -883,7 +871,6 @@ class MemoryPromptBuilderTest {
             assertThat(prompt).contains("# auto memory");
             assertThat(prompt).doesNotContain("## Memory scope");
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }

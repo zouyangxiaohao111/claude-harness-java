@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.attachment.AttachmentMessageDto;
 import com.nexusai.application.agent.mcp.HeadersHelper;
-import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.explainer.PermissionMessageGenerator;
@@ -1385,30 +1384,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         return t;
     });
 
-    /**
-     * [IMP-C D2-A/F3] 跨线程 projectRoot 传播载体 —— 调度线程捕获值注入 HOOK_EXECUTOR 线程。
-     *
-     * <p>WHY: hook 在 {@link #HOOK_EXECUTOR} cached 池线程执行，ThreadLocal 不跨线程；不传播则
-     *   hook 载荷（cwd/transcript_path/agent-memory carve-out 等）在池线程读回落值
-     *   （CLAUDE_PROJECT_DIR env ?? config home）而非会话绑定 P（M-04/D2）。模式对齐
-     *   LlmAgentLoop.run() capture/restore（:1637/:1645）：调度线程（hook 提交线程 =
-     *   会话/工具执行线程）捕获一次，任务体开头 set，finally restore 外层原值（restore 而非
-     *   remove —— 线程池复用防泄漏，null 捕获值不 set，保持回落语义）。
-     */
-    private static <T> Supplier<T> withSessionProjectRoot(Supplier<T> task) {
-        final String scheduledProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-        return () -> {
-            String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-            try {
-                if (scheduledProjectRoot != null && !scheduledProjectRoot.isBlank()) {
-                    AutoMemPaths.setCurrentProjectRoot(scheduledProjectRoot);
-                }
-                return task.get();
-            } finally {
-                AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
-            }
-        };
-    }
+    // [批 4b-1 已删] 原 withSessionProjectRoot(Supplier) —— AutoMemPaths.CURRENT_PROJECT_ROOT
+    //   （ThreadLocal）跨线程「捕获-回放」包装器。载体删除后该包装器退化为恒等函数
+    //   （无会话态可回放），6 个调用点已直接内联原 lambda 提交到 HOOK_EXECUTOR。
+    //   ⛔ 用户铁律：会话态一律显式传参，回放不算合规 —— 不得以任何形式复活本模式。
 
     // ════════════════════════════════════════════════════════════════════════
     // 注册 / 注销 — PreToolUse / PostToolUse
@@ -2541,8 +2520,8 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             String toolUseSummary) {
         long preHookStartNs = System.nanoTime();
         return CompletableFuture.supplyAsync(
-                withSessionProjectRoot(() -> hook.onPreToolUse(toolName, input, ctx,
-                    toolUseId, toolUseSummary)), HOOK_EXECUTOR)
+                () -> hook.onPreToolUse(toolName, input, ctx,
+                    toolUseId, toolUseSummary), HOOK_EXECUTOR)
             .orTimeout(hookTimeoutMs, TimeUnit.MILLISECONDS)
             .handle((result, ex) -> {
                 if (ex == null) {
@@ -2593,7 +2572,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             ToolResult<?> result, ToolUseContext ctx, boolean stopHookActive) {
         long postHookStartNs = System.nanoTime();
         return CompletableFuture.supplyAsync(
-                withSessionProjectRoot(() -> hook.onPostToolUse(toolName, input, result, ctx, stopHookActive)), HOOK_EXECUTOR)
+                () -> hook.onPostToolUse(toolName, input, result, ctx, stopHookActive), HOOK_EXECUTOR)
             .orTimeout(hookTimeoutMs, TimeUnit.MILLISECONDS)
             .handle((hookResult, ex) -> {
                 if (ex == null) {
@@ -2635,7 +2614,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             ToolResult<?> errorResult, ToolUseContext ctx, boolean stopHookActive) {
         long failHookStartNs = System.nanoTime();
         return CompletableFuture.supplyAsync(
-                withSessionProjectRoot(() -> hook.onPostToolUseFailure(toolName, input, errorResult, ctx, stopHookActive)),
+                () -> hook.onPostToolUseFailure(toolName, input, errorResult, ctx, stopHookActive),
                 HOOK_EXECUTOR)
             .orTimeout(hookTimeoutMs, TimeUnit.MILLISECONDS)
             .handle((hookResult, ex) -> {
@@ -2678,7 +2657,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             String hookName, GenericHook hook, HookEvent event) {
         long genericHookStartNs = System.nanoTime();
         return CompletableFuture.supplyAsync(
-                withSessionProjectRoot(() -> hook.onEvent(event)), HOOK_EXECUTOR)
+                () -> hook.onEvent(event), HOOK_EXECUTOR)
             .orTimeout(hookTimeoutMs, TimeUnit.MILLISECONDS)
             .handle((result, ex) -> {
                 if (ex == null) {
@@ -4441,13 +4420,13 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             //   (session 环境脚本路径). 覆盖 settings + session 全来源 (getMatchingHooks
             //   合并序 == CC getHooksConfig 合并序), 恒唯一.
             int hookIndex = i;
-            futures.add(CompletableFuture.supplyAsync(withSessionProjectRoot(() -> {
+            futures.add(CompletableFuture.supplyAsync(() -> {
                 // [IMP-A2-1 · MG-5] 批级 abort 透传 executeOneConfiguredHook → 执行器 parentAbort
                 GenericHook.HookResult r = executeOneConfiguredHook(enriched, mh, jsonInput,
                     parentTuc, hookIndex, messages, defaultTimeoutMs, promptRequester, batchAbort);
                 completed.add(new IndexedHookResult(hookIndex, r));
                 return r;
-            }), HOOK_EXECUTOR));
+            }, HOOK_EXECUTOR));
         }
         // 并行等待全部完成 · 对齐 CC all(hookPromises) (hooks.ts:2744).
         try {
@@ -6286,9 +6265,9 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             // [ALIGN-HOOKS-2] hookIndex = 事件匹配列表位置 · 同 executeConfiguredHooks
             //   (CC :3084-3085 map index → :3293 → :925 CLAUDE_ENV_FILE)
             int hookIndex = i;
-            futures.add(CompletableFuture.supplyAsync(withSessionProjectRoot(
+            futures.add(CompletableFuture.supplyAsync(
                 () -> executeOneConfiguredHookCollecting(
-                    hookEvent, mh, jsonInput, watchPaths, null, hookIndex)), HOOK_EXECUTOR));
+                    hookEvent, mh, jsonInput, watchPaths, null, hookIndex), HOOK_EXECUTOR));
         }
         try {
             CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();

@@ -214,9 +214,11 @@ public class UserContextProvider {
             try {
                 java.util.List<com.nexusai.application.agent.context.MemoryFileInfo> files =
                     claudemdEngine.filterInjectedMemoryFiles(
-                        // [批 3c] 本类无会话来源 → (b) 类合法跳过：显式传 null（回落进程 user.dir）。
-                        //   仅影响 InstructionsLoaded hook 载荷 session_id，CLAUDE.md 内容本身由 projectRoot 决定。
-                        claudemdEngine.getMemoryFiles(false, sessionId));
+                        // [批 3c] sessionId 仅影响 InstructionsLoaded hook 载荷。
+                        // [批 4b-1] 显式传会话项目根（AutoMem/TeamMem entrypoint 派生基址；
+                        //   原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）——本类 projectRoot 字段即该值。
+                        claudemdEngine.getMemoryFiles(false, sessionId,
+                            projectRoot != null ? projectRoot.toString() : null));
                 String full = claudemdEngine.getClaudeMds(files, null);
                 if (full == null || full.isEmpty()) {
                     return null;

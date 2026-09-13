@@ -531,8 +531,13 @@ public final class PostCompactAttachmentRestorer {
             paths.add(Paths.get(workspaceDir, "CLAUDE.md").normalize().toString());
         }
         // AutoMem → getAutoMemEntrypoint()（config.ts:1791-1792；CC try/catch 语义：取不到则跳过）
+        // [批 4b-1] 显式传会话项目根（workspaceDir 参数即会话绑定项目根；原经 AutoMemPaths
+        //   ThreadLocal 隐式解析，载体已删 ⇒ 不传则恒 null → Paths.get(null) NPE 被下方 catch 吞）。
         try {
-            paths.add(Paths.get(AutoMemPaths.defaultInstance().getAutoMemEntrypoint()).normalize().toString());
+            String autoMemEntrypoint = AutoMemPaths.defaultInstance().getAutoMemEntrypoint(workspaceDir);
+            if (autoMemEntrypoint != null) {
+                paths.add(Paths.get(autoMemEntrypoint).normalize().toString());
+            }
         } catch (RuntimeException e) {
             log.warn("[PostCompactAttachmentRestorer] AutoMem 入口路径解析失败，跳过该 memory 排除项: {}",
                 e.getMessage());

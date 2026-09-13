@@ -536,8 +536,8 @@ public class ExtractMemoriesAgent {
      * 异步提取入口（fire-and-forget）· 对齐 CC {@code executeExtractMemories}
      * （extractMemories.ts:598-603）+ {@code extractor}（:569-577）。
      *
-     * <p>[A1 重做 2026-09-04] <b>memoryDir 显式传参</b>—— 本方法在<b>会话线程</b>
-     * （LlmAgentLoop stop-hook 同步调用，projectRoot ThreadLocal 可靠）被调用，故在进入
+     * <p>[A1 重做 2026-09-04 · 批 4b-1 校正] <b>memoryDir 显式传参</b>—— 本方法在<b>会话线程</b>
+     * （LlmAgentLoop stop-hook 同步调用，会话项目根由调用方显式传入）被调用，故在进入
      * runAsync（ForkJoinPool，不继承会话 ThreadLocal）<b>之前</b>把 memoryDir 解析为不可变
      * 字符串，闭包贯穿 fork 全链 —— fork 线程绝不回读 AutoMemPaths/ThreadLocal，杜绝
      * 「ThreadLocal 获取失败 → 回落 config-home → 记忆写错目录」。

@@ -202,8 +202,10 @@ class ChatServiceResumeWorktreeTest {
         // RED: 把兜底腿改回 AutoMemPaths.currentSessionProjectRoot() → 本用例立即变红
         //   （config home 锚下的 worktree-state 被读回 → tracker 被写入）。
         // 造"旧回落腿会读到的" config home 锚 worktree-state：
-        String cfgHomeAnchorRoot = com.nexusai.application.agent.memory.AutoMemPaths
-            .currentSessionProjectRoot();
+        // [批 4b-1] 原取 AutoMemPaths.currentSessionProjectRoot()（＝旧三级回落的 config home 分支）——
+        //   该回落链已废除（载体删除）⇒ 直接取被回落的那个 config home 根，语义不变（造「旧回落腿
+        //   会读到的」锚目录）。
+        String cfgHomeAnchorRoot = com.nexusai.application.agent.skill.NexusaiPaths.getAppConfigHomeDir();
         Path wt = Files.createDirectory(workspaceDir.resolve("wt-legacy"));
         SessionStorage.writeWorktreeState(Path.of(cfgHomeAnchorRoot), sessionKey,
             fullWorktreeSession(wt.toString(), "/home/user/orig", "wt-legacy", "feature/legacy", false));

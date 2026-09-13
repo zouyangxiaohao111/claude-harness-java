@@ -190,7 +190,14 @@ public class TeamMemoryWatcher implements ApplicationRunner {
         }
 
         // 无条件启动 watcher（空目录 watch 廉价；懒启动造成 fresh repo bootstrap 死区，CC :293-295）
-        startFileWatcher(teamMemPaths.getTeamMemPath());
+        // [批 4b-1] team 目录需会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）：
+        //   watcher 线程无显式会话根 → 跳过启动（(b)，⛔ 不回落 config home 拼假目录）。
+        String watchTeamMemPath = teamMemPaths.getTeamMemPath();
+        if (watchTeamMemPath == null) {
+            log.warn("team-memory-watcher: 无会话项目根 → team memory 目录不存在，跳过 file watcher 启动");
+            return;
+        }
+        startFileWatcher(watchTeamMemPath);
 
         if (log.isInfoEnabled()) {
             log.info("tengu_team_mem_sync_started initial_pull_success={} initial_files_pulled={} "

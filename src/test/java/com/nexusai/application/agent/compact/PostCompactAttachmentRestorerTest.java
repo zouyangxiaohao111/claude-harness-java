@@ -46,7 +46,6 @@ class PostCompactAttachmentRestorerTest {
 
     @AfterEach
     void tearDown() {
-        AutoMemPaths.resetCurrentProjectRoot();
         ClaudePaths.setConfigDirOverride(null);
         ClaudePaths.setManagedFilePathOverride(null);
         NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
@@ -86,10 +85,11 @@ class PostCompactAttachmentRestorerTest {
             ClaudePaths.setManagedFilePathOverride(managed.toString());
             // G5：memoryPathsForPostCompactRestore 亦含 nexusai 自有根 → 唯一 appName 隔离（防读真实 ~/.nexusai）
             NexusaiPaths.setAppNameOverride("nexusai-test-" + tempDir.getFileName());
-            AutoMemPaths.setCurrentProjectRoot(sessionRoot.toString());
 
             AutoMemPaths autoMemPaths = AutoMemPaths.defaultInstance();
-            String autoMemEntrypoint = autoMemPaths.getAutoMemEntrypoint();
+            // [批 4b-1] 显式传会话项目根（= 下游 restoreFileAttachments 的 workspaceDir 参数）——
+            //   原无参调用经 ThreadLocal 隐式解析，载体已删。
+            String autoMemEntrypoint = autoMemPaths.getAutoMemEntrypoint(sessionRoot.toString());
             String user = configHome + sep + "CLAUDE.md";
             String project = sessionRoot + sep + "CLAUDE.md";
             String local = sessionRoot + sep + "CLAUDE.local.md";
@@ -106,7 +106,6 @@ class PostCompactAttachmentRestorerTest {
             assertThat(restored).hasSize(1);
             assertThat(restored.get(0).content()).contains(normalFile);
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             ClaudePaths.setConfigDirOverride(null);
             ClaudePaths.setManagedFilePathOverride(null);
             NexusaiPaths.setAppNameOverride(null);
@@ -125,7 +124,6 @@ class PostCompactAttachmentRestorerTest {
             ClaudePaths.setConfigDirOverride(configHome.toString());
             // G5：memoryPathsForPostCompactRestore 亦含 nexusai 自有根 → 唯一 appName 隔离（防读真实 ~/.nexusai）
             NexusaiPaths.setAppNameOverride("nexusai-test-" + tempDir.getFileName());
-            AutoMemPaths.setCurrentProjectRoot(sessionRoot.toString());
             String sep = java.io.File.separator;
             String subdirClaudeMd = sessionRoot + sep + "notes" + sep + "CLAUDE.md";
             String claudeNotes = sessionRoot + sep + "docs" + sep + "claude-notes.md";
@@ -139,7 +137,6 @@ class PostCompactAttachmentRestorerTest {
             assertThat(restored.get(1).content()).contains(claudeNotes);
             assertThat(restored.get(2).content()).contains(claudeLocalNotes);
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
         }
@@ -158,14 +155,12 @@ class PostCompactAttachmentRestorerTest {
             ClaudePaths.setConfigDirOverride(configHome.toString());
             // G5：memoryPathsForPostCompactRestore 亦含 nexusai 自有根 → 唯一 appName 隔离（防读真实 ~/.nexusai）
             NexusaiPaths.setAppNameOverride("nexusai-test-" + tempDir.getFileName());
-            AutoMemPaths.setCurrentProjectRoot(sessionRoot.toString());
             String otherClaudeMd = otherProject + java.io.File.separator + "CLAUDE.md";
             List<ChatMessageDto> restored = PostCompactAttachmentRestorer.restoreFileAttachments(
                 state(otherClaudeMd, "1"), 10, Set.of());
             assertThat(restored).hasSize(1);
             assertThat(restored.get(0).content()).contains(otherClaudeMd);
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
         }

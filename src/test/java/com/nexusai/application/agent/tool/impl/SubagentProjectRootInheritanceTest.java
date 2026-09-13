@@ -26,46 +26,40 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * [IMP-D F4] 子代理 projectRoot 继承测试（M-05/M-06/M-07/M-08/M-12）。
  *
- * <p>WHY（整合版 F4 + OPD-M-38 + subagent-reverify #10）：子代理线程（sync=工具池线程 /
- * async=new Thread）从不携带 {@link AutoMemPaths#CURRENT_PROJECT_ROOT} ThreadLocal →
- * agent-memory 注入回落 config home（M-05）、hook 载荷 cwd/transcript_path 错位（M-06）、
- * loop workspaceDir=user.dir（M-07）、userContext 根=user.dir（M-12）、worktree 隔离
- * agent-memory 根错位（M-08）。修复 = spawn 入口 capture/set/restore（模板
- * {@code AgentContext.runWithAgentContext} :154-166）+ shared(projectRoot) 参数化 +
- * userContext 改读会话 projectRoot + withEffectiveCwd 覆盖。
+ * <p>WHY（整合版 F4 + OPD-M-38 + subagent-reverify #10）：子代理 spawn 入口把**会话项目根**
+ * 交给子代理（agent-memory 注入 / loop workspaceDir / userContext / worktree 隔离根）。
+ * 批 4b-1 前该值经 {@link AutoMemPaths#CURRENT_PROJECT_ROOT} ThreadLocal 捕获-回放传播；
+ * 载体删除后一律**显式传参**（用户铁律：会话态一律显式传参，回放不算合规）——
+ * 生产来源 = {@code ToolUseContext.effectiveCwd()} / {@code shared(projectRoot)} 参数。
  *
- * <p>RED 条件：删除 spawn 注入 / shared 参数 / userContext 根改造 / withEffectiveCwd →
+ * <p>RED 条件：删除显式传参（agent-memory 根 / shared 参数 / withEffectiveCwd 覆盖）→
  * 对应断言失败。
  */
 @DisplayName("IMP-D · 子代理 projectRoot 继承（F4: M-05/M-06/M-07/M-08/M-12）")
 class SubagentProjectRootInheritanceTest {
 
-    @AfterEach
-    void tearDown() {
-        AutoMemPaths.resetCurrentProjectRoot();
-    }
 
     @Test
     @DisplayName("spawn 注入后 agent-memory project scope 根 = 会话 projectRoot（无 config-home mkdir 副作用）")
     void agentMemory_projectScope_resolvesToSessionProjectRoot(@TempDir Path project,
                                                                @TempDir Path configHome) {
-        // GIVEN: 生产同构 AgentMemoryDirectory（cwdSupplier = currentSessionProjectRoot），
-        //   ensureDirConsumer 捕获 mkdir 目标（断言无 config-home 副作用）
+        // GIVEN: AgentMemoryDirectory（cwd/projectRoot 显式传入 = 会话项目根；批 4b-1 起不再经
+        //   ThreadLocal 隐式注入），ensureDirConsumer 捕获 mkdir 目标（断言无 config-home 副作用）
         List<String> mkdirTargets = new CopyOnWriteArrayList<>();
         AgentMemoryDirectory dir = new AgentMemoryDirectory(
-            AutoMemPaths::currentSessionProjectRoot,
+            project::toString,
             () -> configHome,
             () -> null,
-            () -> Paths.get(AutoMemPaths.currentSessionProjectRoot()),
+            () -> Paths.get(project.toString()),
             AutoMemPaths::sanitizePath,
             mkdirTargets::add,
             () -> null,
             () -> true, // autoMemoryEnabled 开 → 走真实 prompt 构建 + mkdir 路径（OPD-M-38 注入面）
             MemoryPromptBuilder.productionDefault());
 
-        // WHEN: 子代理 spawn 线程注入会话 projectRoot（IMP-D asyncWorker set / IMP-C 工具线程传播）
-        AutoMemPaths.setCurrentProjectRoot(project.toString());
-        String prompt = dir.loadAgentMemoryPrompt("my-agent", AgentMemoryDirectory.AgentMemoryScope.PROJECT);
+        // WHEN: 显式传会话项目根（生产 = 各 spawn 入口 ToolUseContext.effectiveCwd()）
+        String prompt = dir.loadAgentMemoryPrompt("my-agent",
+            AgentMemoryDirectory.AgentMemoryScope.PROJECT, project.toString());
 
         // THEN: 读 P/.nexusai/agent-memory/（非 config-home · 修 M-05），无 config-home mkdir 副作用
         assertThat(prompt).as("门控开启时必须产出真实 memory prompt").isNotEmpty();
@@ -76,40 +70,11 @@ class SubagentProjectRootInheritanceTest {
             .noneMatch(t -> t.contains(configHome.toString()));
     }
 
-    @Test
-    @DisplayName("asyncWorker 跨线程注入：新线程 capture/set/restore 成对，子代理线程读到会话 projectRoot")
-    void asyncWorker_threadInjection_readsSessionProjectRoot(@TempDir Path project) throws Exception {
-        // GIVEN: 调度线程（工具线程，IMP-C 已传播）持有会话值
-        AutoMemPaths.setCurrentProjectRoot(project.toString());
-        final String parentRoot = AutoMemPaths.captureCurrentProjectRoot();
-
-        // WHEN: 模拟 SubagentTool asyncWorker 线程体（capture 线程原值 → set 父值 → finally restore）
-        CountDownLatch done = new CountDownLatch(1);
-        AtomicReference<String> insideWorker = new AtomicReference<>();
-        AtomicReference<String> afterRestore = new AtomicReference<>();
-        Thread worker = new Thread(() -> {
-            String prev = AutoMemPaths.captureCurrentProjectRoot();
-            try {
-                if (parentRoot != null && !parentRoot.isBlank()) {
-                    AutoMemPaths.setCurrentProjectRoot(parentRoot);
-                }
-                insideWorker.set(AutoMemPaths.currentSessionProjectRoot());
-            } finally {
-                AutoMemPaths.restoreCurrentProjectRoot(prev);
-                afterRestore.set(AutoMemPaths.captureCurrentProjectRoot());
-            }
-            done.countDown();
-        });
-        worker.start();
-        assertThat(done.await(5, TimeUnit.SECONDS)).as("worker 必须在 5s 内完成").isTrue();
-
-        // THEN: 新线程读到会话值（修 M-05）；restore 后线程回落；调度线程值不受影响（ThreadLocal 隔离）
-        assertThat(insideWorker.get()).as("asyncWorker 线程内 currentSessionProjectRoot() == 会话 P").isEqualTo(project.toString());
-        assertThat(afterRestore.get()).as("restore 线程原值（新线程 null）→ 回落").isNull();
-        assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("调度线程 ThreadLocal 不被子代理线程改动")
-            .isEqualTo(project.toString());
-    }
+    // [批 4b-1 已退役] 原「asyncWorker 跨线程注入：新线程 capture/set/restore 成对，子代理线程读到
+    //   会话 projectRoot」用例 —— 其被验证的机制 = AutoMemPaths.CURRENT_PROJECT_ROOT（ThreadLocal）
+    //   捕获-回放，该载体已随批 4b-1 删除（用户铁律：会话态一律显式传参，回放不算合规；
+    //   ⛔ 不得保留「删了实现仍恒绿」的回放断言）。子代理项目根的显式继承现由本类其余用例
+    //   （显式入参 agent-memory / shared(projectRoot) / withEffectiveCwd）正向锚守护。
 
     @Test
     @DisplayName("shared(projectRoot) 注入子代理 LoopSessionState.workspaceDir（修 M-07 user.dir 兜底链）")
@@ -136,11 +101,11 @@ class SubagentProjectRootInheritanceTest {
         Files.writeString(project.resolve("CLAUDE.md"), "# 项目指令\n仅在绑定项目中生效\n");
         SubagentExecutor executor = new SubagentExecutor(null, null, null, null, null, "model", "system-prompt");
 
-        // WHEN: 子代理 spawn 线程注入会话 projectRoot 后解析 userContext
-        AutoMemPaths.setCurrentProjectRoot(project.toString());
+        // WHEN: 显式传会话项目根后解析 userContext（[批 4b-1] 原经 ThreadLocal 隐式注入；载体已删
+        //   ⇒ 由调用方显式传入 = 生产 SubagentExecutor.executeStreaming 的 agentTuc.effectiveCwd()）
         AgentDefinition def = AgentDefinition.BuiltInAgentDefinition.builder(
             "test-agent", "when to use", (ctx, dirs) -> "sys").build();
-        String userContext = executor.userContextFor(def);
+        String userContext = executor.userContextFor(def, project.toString());
 
         // THEN: P/CLAUDE.md 内容进入 userContext（M-12：非 user.dir/CLAUDE.md）
         assertThat(userContext).as("P/CLAUDE.md 必须被读到（修 M-12 user.dir 根）").contains("项目指令");
@@ -156,7 +121,6 @@ class SubagentProjectRootInheritanceTest {
         //   无会话上下文时**必须不注入**（旧 currentSessionProjectRoot() → 注入 → 本断言红）。
         NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
         Files.writeString(configHome.resolve("CLAUDE.md"), "# config-home 指令（不得作为项目 CLAUDE.md 注入）");
-        AutoMemPaths.setCurrentProjectRoot(null);
         try {
             SubagentExecutor executor = new SubagentExecutor(null, null, null, null, null, "model", "system-prompt");
             AgentDefinition def = AgentDefinition.BuiltInAgentDefinition.builder(
@@ -166,7 +130,6 @@ class SubagentProjectRootInheritanceTest {
                 .as("无会话上下文 ⇒ 不注入 userContext（绝不拿 config home 的 CLAUDE.md 冒充项目指令）")
                 .isEmpty();
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -174,8 +137,18 @@ class SubagentProjectRootInheritanceTest {
     @Test
     @DisplayName("worktree 隔离 agent-memory 根改绑 effectiveCwd；非 worktree 保持 projectRoot（M-08）")
     void withEffectiveCwd_overridesProjectScopeRoot(@TempDir Path project, @TempDir Path worktree) {
-        AutoMemPaths.setCurrentProjectRoot(project.toString());
-        AgentMemoryDirectory dir = AgentMemoryDirectory.productionDefault();
+        // [批 4b-1] 原用 productionDefault()（其 projectRootSupplier 经 ThreadLocal 注入）——载体已删，
+        //   改为显式商定根构造实例（与生产装配同形）。
+        AgentMemoryDirectory dir = new AgentMemoryDirectory(
+            project::toString,
+            () -> Paths.get(project.toString(), ".nexusai", "agent-memory-base"),
+            () -> null,
+            () -> project,
+            AutoMemPaths::sanitizePath,
+            p -> { /* 纯路径解析，不 mkdir */ },
+            () -> null,
+            () -> true,
+            MemoryPromptBuilder.productionDefault());
 
         // WHEN: SubagentExecutor Step 18 worktree 隔离生效 → withEffectiveCwd(worktreePath)
         AgentMemoryDirectory worktreeDir = dir.withEffectiveCwd(worktree.toString());
@@ -193,29 +166,7 @@ class SubagentProjectRootInheritanceTest {
         assertThat(dir.withEffectiveCwd("  ")).as("blank 覆盖必须回落原实例").isSameAs(dir);
     }
 
-    @Test
-    @DisplayName("多嵌套 spawn restore 成对：内层恢复外层原值，链尾不串台（subagent-reverify #10）")
-    void nestedSpawn_restorePairs_preserveOuterValue(@TempDir Path outer, @TempDir Path inner) {
-        // 外层 = 子代理 spawn 作用域（Step 20 模式：capture → set → loop → restore）
-        AutoMemPaths.setCurrentProjectRoot(outer.toString());
-        String prevOuter = AutoMemPaths.captureCurrentProjectRoot();
-        AutoMemPaths.setCurrentProjectRoot(prevOuter);
-        try {
-            // 内层 = 孙子 spawn（同线程捕获当前值 → set 同值 → restore 同值）
-            String prevInner = AutoMemPaths.captureCurrentProjectRoot();
-            AutoMemPaths.setCurrentProjectRoot(prevInner);
-            try {
-                assertThat(AutoMemPaths.currentSessionProjectRoot())
-                    .as("嵌套链内子代理读到外层会话值").isEqualTo(outer.toString());
-            } finally {
-                AutoMemPaths.restoreCurrentProjectRoot(prevInner);
-            }
-            assertThat(AutoMemPaths.currentSessionProjectRoot())
-                .as("内层 restore 后外层值保持").isEqualTo(outer.toString());
-        } finally {
-            AutoMemPaths.restoreCurrentProjectRoot(prevOuter);
-        }
-        assertThat(AutoMemPaths.captureCurrentProjectRoot())
-            .as("链尾 restore 后无残留").isEqualTo(outer.toString());
-    }
+    // [批 4b-1 已退役] 原「多嵌套 spawn restore 成对」用例（同上：验证的 ThreadLocal 捕获-回放
+    //   载体已删）。嵌套子代理的项目根现由各 spawn 入口**显式传参**（ToolUseContext.effectiveCwd）
+    //   承载，无线程槽可残留，故无「成对 restore」语义需要守护。
 }

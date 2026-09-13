@@ -199,6 +199,20 @@ public class MemoryPrefetcher {
      */
     public MemoryPrefetch startPrefetch(List<ChatMessageDto> messages, FileStateCache readFileState,
                                         AbortController turnAbortController) {
+        return startPrefetch(messages, readFileState, turnAbortController, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #startPrefetch(List, FileStateCache, AbortController)}。
+     *
+     * <p>WHY 需要：预取的检索目录（agent-memory PROJECT/LOCAL scope、auto-memory per-project）原先经
+     * {@code AutoMemPaths.CURRENT_PROJECT_ROOT} ThreadLocal 隐式解析，载体已删 ⇒ 会话线程必须显式传入，
+     * 否则目录解析不出（auto-memory 静默不预取 = 功能退化）。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（{@code ToolUseContext.effectiveCwd()} / 会话绑定项目）；null → 无显式根
+     */
+    public MemoryPrefetch startPrefetch(List<ChatMessageDto> messages, FileStateCache readFileState,
+                                        AbortController turnAbortController, String sessionProjectRoot) {
         // 门控 1：isAutoMemoryEnabled · 门控 2：tengu_moth_copse（GB flag）
         if (!autoMemoryEnabled.getAsBoolean() || !mothCopseFlag.getAsBoolean()) {
             if (log.isDebugEnabled()) {
@@ -252,7 +266,7 @@ public class MemoryPrefetcher {
             : new AbortController();
         // G-19/G-69（F3 补登）：@-mention 检索隔离 —— 输入含 agent @-mention → 仅搜索匹配
         // agent 的 memory 目录；否则 [getAutoMemPath()]（attachments.ts:2204-2213）。
-        List<Path> memoryDirs = resolveMemoryDirs(input);
+        List<Path> memoryDirs = resolveMemoryDirs(input, sessionProjectRoot);
 
         // promise 恒正常完成（catch → []）· CC :2392-2404
         CompletableFuture<List<RelevantMemoryAttachment>> promise = CompletableFuture.supplyAsync(
@@ -292,6 +306,16 @@ public class MemoryPrefetcher {
      * @return 检索目录列表（CC original: dirs）
      */
     List<Path> resolveMemoryDirs(String input) {
+        return resolveMemoryDirs(input, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #resolveMemoryDirs(String)}。
+     *
+     * @param sessionProjectRoot 会话绑定项目根；null → USER scope 仍可用，PROJECT/LOCAL 检索目录
+     *                           按 (b) 跳过 + ≥WARN（⛔ 不回落 config home 拼假目录）
+     */
+    List<Path> resolveMemoryDirs(String input, String sessionProjectRoot) {
         List<Path> dirs = new ArrayList<>();
         AgentDefinitionRegistry registry = agentRegistrySupplier != null ? agentRegistrySupplier.get() : null;
         if (input != null && registry != null && agentMemoryDirectory != null) {
@@ -307,14 +331,23 @@ public class MemoryPrefetcher {
                 if (scope == null) {
                     continue;   // 非法 scope（加载层已校验，防御性跳过）
                 }
-                dirs.add(agentMemoryDirectory.getAgentMemoryDir(agentType, scope));
+                // [批 4b-1] PROJECT/LOCAL 需要会话项目根：缺失 ⇒ (b) 跳过该 mention 目录 + ≥WARN
+                //   （预取是 best-effort 优化，不因单目录缺失打死预取；⛔ 不回落 config home）。
+                if (scope != AgentMemoryDirectory.AgentMemoryScope.USER
+                        && (sessionProjectRoot == null || sessionProjectRoot.isBlank())) {
+                    log.warn("[MemoryPrefetcher] @mention agent '{}' memory scope={} 需要会话项目根但未显式传入"
+                        + " → 跳过该检索目录（不回落 config home）", agentType, scope);
+                    continue;
+                }
+                dirs.add(agentMemoryDirectory.getAgentMemoryDir(agentType, scope, sessionProjectRoot));
             }
         }
         // CC :2213 dirs = memoryDirs.length > 0 ? memoryDirs : [getAutoMemPath()]
         if (!dirs.isEmpty()) {
             return dirs;
         }
-        String autoMem = autoMemPaths.getAutoMemPath();
+        // [批 4b-1] 显式会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）
+        String autoMem = autoMemPaths.getAutoMemPath(sessionProjectRoot);
         // A′: 无有效项目（config-home 回落）→ auto-memory per-project 目录不存在 → 空检索目录（跳过预取）
         if (autoMem == null) {
             if (log.isDebugEnabled()) {

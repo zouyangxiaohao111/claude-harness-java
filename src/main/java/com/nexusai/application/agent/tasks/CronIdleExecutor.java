@@ -3,7 +3,6 @@ package com.nexusai.application.agent.tasks;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.RunRequest;
-import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.query.QueryConfig;
 import com.nexusai.application.agent.query.TokenBudgetChecker;
 import com.nexusai.application.agent.tool.config.CronEnabledGates;
@@ -601,49 +600,44 @@ public class CronIdleExecutor {
                     //     shouldQuery=false :657-722；未知命令 "Unknown skill" :333-361）。
                     //   - 解析抛异常 → 外层 catch 兜底 log.error，不阻断循环。
                     if (isSlashCommand(cmd) && slashInterceptor != null) {
-                        String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-                        try {
-                            // [CRON-D5 改2 · 批 3c] 原「恢复创建会话 MDC（local handler 依赖裸 MDC 会话槽）」
-                            //   已删：会话标识改由**显式形参**直传（intercept(cmd.sessionId(), ...)）→
-                            //   UserInputDispatcher 的 handler 形参为 (args, sessionId, inFlightUserMessageId)
-                            //   → 本地执行链不再有经 MDC 读会话的通道，也就无需线程池复用的还原装置。
-                            SlashCommandInterceptor.SlashResolution slash = slashInterceptor.intercept(
-                                cmd.sessionId(), consumedUserId, cmd.value(),
-                                cmd.sessionId() != null
-                                    ? "/topic/sessions/" + cmd.sessionId() + "/stream" : null,
-                                wsTemplate);
-                            if (slash.handled()) {
-                                if (slash.shouldQuery()) {
-                                    // [Fix-P2 · Issue 2] prompt 型技能内容 isMeta 落库（镜像
-                                    //   ChatService.java:598-617 slashMetaId 模式，对齐 CC
-                                    //   processSlashCommand.tsx:915-918 createUserMessage isMeta:true）：
-                                    //   resume/压缩按 id 排除当前 user、metaId 独立 id 会被载入历史 →
-                                    //   技能内容随 transcript 持久可恢复（P1 直连路径已落，P2 排队路径
-                                    //   此前缺失 —— 该轮被压缩/resume 技能内容永久丢失，转录里只有裸 /cmd）。
-                                    //   best-effort：落库失败不阻断主链（对齐 P1 与 cron isMeta 先例）。
-                                    persistSlashMeta(cmd, slash, consumedUserId);
-                                    // [Fix-P2 · Issue 2] userPrompt 用 cmd.value() 原文（非技能内容）：
-                                    //   LlmAgentLoop.run 会从 DB 历史重载刚落的 isMeta 技能内容
-                                    //   （listForResumeExcluding 排除 streamUserMessageId=cmd.uuid() 但
-                                    //   保留 metaId），若仍传技能内容作 prompt → 技能内容在模型上下文
-                                    //   出现两次（双注入）。对齐 P1：技能内容仅作 isMeta 消息，
-                                    //   userPrompt = 原文 /command（P1 ChatService :722 userPrompt=req.content()）。
-                                    //   技能级 model 覆盖 CC processSlashCommand.tsx:917。
-                                    runOneAgentLoop(cmd, slashModelOverride(slash));
-                                } else {
-                                    // 非查询型终态 → 不起 LLM turn（unknown / local / local-jsx /
-                                    //   userInvocable=false / fork 占位）
-                                    handleNonQueryingSlash(cmd, slash, consumedUserId);
-                                }
-                                continue;
+                        // [CRON-D5 改2 · 批 3c] 原「恢复创建会话 MDC（local handler 依赖裸 MDC 会话槽）」
+                        //   已删：会话标识改由**显式形参**直传（intercept(cmd.sessionId(), ...)）→
+                        //   UserInputDispatcher 的 handler 形参为 (args, sessionId, inFlightUserMessageId)
+                        //   → 本地执行链不再有经 MDC 读会话的通道，也就无需线程池复用的还原装置。
+                        SlashCommandInterceptor.SlashResolution slash = slashInterceptor.intercept(
+                            cmd.sessionId(), consumedUserId, cmd.value(),
+                            cmd.sessionId() != null
+                                ? "/topic/sessions/" + cmd.sessionId() + "/stream" : null,
+                            wsTemplate);
+                        if (slash.handled()) {
+                            if (slash.shouldQuery()) {
+                                // [Fix-P2 · Issue 2] prompt 型技能内容 isMeta 落库（镜像
+                                //   ChatService.java:598-617 slashMetaId 模式，对齐 CC
+                                //   processSlashCommand.tsx:915-918 createUserMessage isMeta:true）：
+                                //   resume/压缩按 id 排除当前 user、metaId 独立 id 会被载入历史 →
+                                //   技能内容随 transcript 持久可恢复（P1 直连路径已落，P2 排队路径
+                                //   此前缺失 —— 该轮被压缩/resume 技能内容永久丢失，转录里只有裸 /cmd）。
+                                //   best-effort：落库失败不阻断主链（对齐 P1 与 cron isMeta 先例）。
+                                persistSlashMeta(cmd, slash, consumedUserId);
+                                // [Fix-P2 · Issue 2] userPrompt 用 cmd.value() 原文（非技能内容）：
+                                //   LlmAgentLoop.run 会从 DB 历史重载刚落的 isMeta 技能内容
+                                //   （listForResumeExcluding 排除 streamUserMessageId=cmd.uuid() 但
+                                //   保留 metaId），若仍传技能内容作 prompt → 技能内容在模型上下文
+                                //   出现两次（双注入）。对齐 P1：技能内容仅作 isMeta 消息，
+                                //   userPrompt = 原文 /command（P1 ChatService :722 userPrompt=req.content()）。
+                                //   技能级 model 覆盖 CC processSlashCommand.tsx:917。
+                                runOneAgentLoop(cmd, slashModelOverride(slash));
+                            } else {
+                                // 非查询型终态 → 不起 LLM turn（unknown / local / local-jsx /
+                                //   userInvocable=false / fork 占位）
+                                handleNonQueryingSlash(cmd, slash, consumedUserId);
                             }
-                            // handled=false（文件路径疑似回落普通 prompt / 未知命令类型）→ 落下方
-                            //   runOneAgentLoop 原文路径（对齐 CC processSlashCommand.tsx:362-380）
-                        } finally {
-                            // [批 3c] 原「清裸 MDC 会话槽」（与上方 setSession 成对）已删；
-                            //   projectRoot 线程槽的 capture/restore 保留（与 MDC 无关，仍是派生线程必需的还原）。
-                            AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
+                            continue;
                         }
+                        // handled=false（文件路径疑似回落普通 prompt / 未知命令类型）→ 落下方
+                        //   runOneAgentLoop 原文路径（对齐 CC processSlashCommand.tsx:362-380）
+                        // [批 4b-1] 原 projectRoot ThreadLocal 的 capture/restore 成对块已删
+                        //   （载体删除，无可回放对象；用户铁律：会话态一律显式传参）。
                     }
                     runOneAgentLoop(cmd);
                 } catch (Exception e) {
@@ -788,7 +782,7 @@ public class CronIdleExecutor {
         //   会话标识不再经 MDC 载体传播（载体已随本批删除）。cron run 的会话来源全部是显式载体 ——
         //   RunRequest.session/sessionBatch(sessionUuid)（下方）、loop.setStreamContext(ws, cmd.sessionId(), …)、
         //   chatService.armRealTimePersist(state, sessionUuid, …)：值随调用直传，无线程槽残留面。
-        //   仅保留 projectRoot 线程槽的 capture/restore（派生线程必需，与 MDC 无关）。
+        //   [批 4b-1] projectRoot 线程槽的 capture/restore 亦已删除（载体删除，无可回放对象）。
         if (sessionId != null && !sessionId.isBlank()) {
             log.info("CronIdleExecutor: cron 命令会话上下文 sessionId={} "
                     + "（批 3c：显式载体直传 RunRequest/streamContext/落库，不再写裸 MDC）", sessionId);
@@ -796,7 +790,6 @@ public class CronIdleExecutor {
             log.warn("CronIdleExecutor: cmd 无 sessionId → 本 run 无会话锚（回落全局会话/user.dir，"
                 + "DURABLE 或兼容路径，CRON-D5）: mode={} workload={}", cmd.mode(), cmd.workload());
         }
-        String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
         try {
             // [cron-durable-session-fire] RunRequest 会话 ID 判定：
             //   SESSION / 无项目锚（DURABLE 无会话直建 boundProject=null）→ 既有 resolveSessionUuid
@@ -998,8 +991,9 @@ public class CronIdleExecutor {
             }
         } finally {
             // [批 3c] 原「清裸 MDC 会话槽」（与已删的 setSession 成对）已删：本 run 不再写任何
-            //   界面/日志 MDC 槽；projectRoot 线程槽的 restore 保持不变（capture/restore 语义不受影响）。
-            AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
+            //   界面/日志 MDC 槽。
+            // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot) 已删：
+            //   projectRoot ThreadLocal 载体删除，本 fire 不再捕获/回放任何线程槽。
             // [批 1 · 方向 C] 原 finally 的 loop.clearCronProjectRootOverride()（per-run 项目身份
             //   override 清空）随该实例字段一并删除：项目锚改由 RunRequest 承载（req 随本 fire
             //   局部变量丢弃 → 无线程池串台面，无需清空装置）。

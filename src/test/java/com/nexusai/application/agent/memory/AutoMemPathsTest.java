@@ -99,21 +99,21 @@ class AutoMemPathsTest {
     }
 
     @Test
-    @DisplayName("A′: projectRoot == config-home（ThreadLocal 回落）→ defaultInstance.getAutoMemPath() 返回 null")
+    @DisplayName("A′: 显式 projectRoot == config-home → getAutoMemPath(root) 返回 null（config-home 永不冒充项目根）")
     void getAutoMemPath_configHomeAsProjectRoot_returnsNull(@TempDir Path configHome) {
-        // WHY: 生产 defaultInstance 的 supplier = currentSessionProjectRoot()，无 ThreadLocal 注入时
-        //      回落 config-home。若 getAutoMemPath 仍拼 projects/sanitize(configHome)/memory 即缺陷 A
-        //      复现；A′ 使 config-home 作项目根时返回 null（memory 域 skip）。
+        // WHY: per-project auto-memory 目录 = <memoryBase>/projects/<sanitize(projectRoot)>/memory。
+        //   config-home（~/.nexusai）是**配置主目录**，不是项目身份；若被当项目根拼接即产出
+        //   <memoryBase>/projects/C--Users-...--nexusai/memory 假目录（缺陷 A）。A′ 判定使它返回 null。
+        //   [批 4b-1] 该判定原先由 defaultInstance 的 ThreadLocal 回落触发；载体删除后改由
+        //   **显式入参**驱动（同一判定，且更强：无环境态依赖）。
         NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
         BundledSkillEnabledGates.bridgeSettingsMapper(null);   // 清 DB 桥接泄漏（settings 链回落 null）
-        AutoMemPaths.setCurrentProjectRoot(configHome.toString());
         try {
             AutoMemPaths paths = AutoMemPaths.defaultInstance();
-            assertThat(paths.getAutoMemPath())
+            assertThat(paths.getAutoMemPath(configHome.toString()))
                 .as("config-home 自身不能作为 per-project 项目根 → null")
                 .isNull();
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
         }
     }
@@ -137,7 +137,6 @@ class AutoMemPathsTest {
         //   （任一断言都会红：projectRoot 非 null / settings 命中 config-home 的 localSettings）。
         NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
         BundledSkillEnabledGates.bridgeSettingsMapper(null);   // 清 DB 桥接泄漏（否则 DB 列优先）
-        AutoMemPaths.setCurrentProjectRoot(null);               // 无会话上下文（无 ThreadLocal）
         AutoMemPaths paths = AutoMemPaths.defaultInstance();
         // 夹具：config home 自身被当「项目」时才会命中的 localSettings 源
         Path fakeProjectLocal = Files.createDirectories(
@@ -156,7 +155,6 @@ class AutoMemPathsTest {
                 .as("无有效项目 ⇒ per-project auto-memory 目录不存在（A′）")
                 .isNull();
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             NexusaiPaths.setConfigHomeDirOverride(null);
             paths.clearCache();
         }
@@ -403,39 +401,37 @@ class AutoMemPathsTest {
     }
 
     @Test
-    @DisplayName("ODF-A1 holder: defaultInstance 按会话 projectRoot 惰性解析（setCurrentProjectRoot 生效）")
-    void defaultInstance_readsSessionHolder(@TempDir Path projectA, @TempDir Path projectB) {
-        // WHY: AutoMemPaths bean 是单例，但 projectRoot 经 supplier 惰性读 ThreadLocal ——
-        //      生产会话在 LlmAgentLoop.run() 入口 setCurrentProjectRoot 注入后，同一 bean
-        //      实例即可解析出各自会话的 memory 目录（对齐 CC STATE.projectRoot 全局态）。
+    @DisplayName("[批 4b-1] 单例 bean + 显式 projectRoot：同一实例按入参解析各自会话 memory 目录")
+    void sharedInstance_resolvesPerExplicitProjectRoot(@TempDir Path projectA, @TempDir Path projectB) {
+        // WHY: AutoMemPaths bean 是单例（defaultInstance 生产单例 @Bean 多会话共享）。批 4b-1 前
+        //   projectRoot 经 CURRENT_PROJECT_ROOT ThreadLocal 隐式注入；载体删除后改由调用方**显式传入**
+        //   （用户铁律：会话态一律显式传参，回放不算合规）。本用例钉住：同一实例、两次不同入参
+        //   ⇒ 各解析自己的 per-project 目录且互不相等（memoize 缓存按 projectRoot 独立槽，不串台）。
+        //   ⛔ 无入参（无显式根且 env 未配置）⇒ null：不得伪造任何目录。
         AutoMemPaths paths = AutoMemPaths.defaultInstance();
-        try {
-            AutoMemPaths.setCurrentProjectRoot(projectA.toString());
-            String autoMemA = paths.getAutoMemPath();
-            AutoMemPaths.setCurrentProjectRoot(projectB.toString());
-            String autoMemB = paths.getAutoMemPath();
+        String autoMemA = paths.getAutoMemPath(projectA.toString());
+        String autoMemB = paths.getAutoMemPath(projectB.toString());
 
-            assertThat(autoMemA)
-                .as("注入 projectA 后 defaultInstance 解析到 projectA 的 memory 目录")
-                .contains(AutoMemPaths.sanitizePath(projectA.toString()));
-            assertThat(autoMemB)
-                .as("注入 projectB 后 defaultInstance 解析到 projectB 的 memory 目录（memoize 按 projectRoot 重算）")
-                .contains(AutoMemPaths.sanitizePath(projectB.toString()));
-            assertThat(autoMemA).as("两会话 memory 目录不同").isNotEqualTo(autoMemB);
-        } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
-        }
+        assertThat(autoMemA)
+            .as("显式传 projectA ⇒ 解析到 projectA 的 memory 目录")
+            .contains(AutoMemPaths.sanitizePath(projectA.toString()));
+        assertThat(autoMemB)
+            .as("显式传 projectB ⇒ 解析到 projectB 的 memory 目录")
+            .contains(AutoMemPaths.sanitizePath(projectB.toString()));
+        assertThat(autoMemA).as("两会话 memory 目录不同").isNotEqualTo(autoMemB);
+        assertThat(paths.getAutoMemPath(null))
+            .as("无显式会话根（env 未配置）⇒ 不得伪造目录")
+            .isNull();
     }
 
     @Test
-    @DisplayName("ODF-A1-R2 并发隔离: 两线程交错 setCurrentProjectRoot/getAutoMemPath 各解析本会话目录（ThreadLocal 隔离）")
+    @DisplayName("[批 4b-1] 并发隔离: 两线程交错显式传参 getAutoMemPath(root) 各解析本会话目录（共享单例 + memoize 独立槽）")
     void perSession_concurrentIsolation(@TempDir Path projectA, @TempDir Path projectB) throws Exception {
-        // WHY (规则九 · 验证并发意图而非仅顺序行为): 返工前 currentSessionProjectRoot 是 static
-        //      volatile 单值 —— 会话 A 写 holder=A 后会话 B 可覆盖 holder=B，A 的后续内存读解析到
-        //      B 的目录（跨会话污染，语义不等价 CC：CC 单进程单会话无并发）。ThreadLocal 使每会话
-        //      线程持有独立 projectRoot。本测试用<b>共享</b> defaultInstance（= 生产单例 bean 场景）
-        //      两线程经 CyclicBarrier 同时起跑、交错 200 轮注入/读取，断言各线程始终解析到
-        //      本会话 sanitized 目录。static volatile 下该测试会红（后写覆盖），ThreadLocal 下恒绿。
+        // WHY (规则九 · 验证并发意图而非仅顺序行为): AutoMemPaths 生产为**单例 bean**，多会话并发共享。
+        //   批 4b-1 删除 CURRENT_PROJECT_ROOT ThreadLocal 载体后，projectRoot 由调用方**显式传入**
+        //   （用户铁律：会话态一律显式传参，回放不算合规）。本测试用共享 defaultInstance（= 生产单例
+        //   bean 场景）两线程经 CyclicBarrier 同时起跑、交错 200 轮传各自的 root，断言各线程**始终**
+        //   解析到本线程 root 的 sanitized 目录（若退化为全局值/单槽缓存，该测试会红）。
         AutoMemPaths shared = AutoMemPaths.defaultInstance();
         java.util.concurrent.atomic.AtomicReference<Throwable> failure =
             new java.util.concurrent.atomic.AtomicReference<>();
@@ -446,12 +442,11 @@ class AutoMemPathsTest {
             try {
                 barrier.await();
                 for (int i = 0; i < 200; i++) {
-                    AutoMemPaths.setCurrentProjectRoot(myRoot);
                     // 交错点：让另一线程有机会覆盖（static volatile 下此处会串台）
                     if ((i & 1) == 0) {
                         Thread.yield();
                     }
-                    String path = shared.getAutoMemPath();
+                    String path = shared.getAutoMemPath(myRoot);
                     if (!path.contains(AutoMemPaths.sanitizePath(myRoot))) {
                         throw new AssertionError(
                             "会话 " + myRoot + " 第 " + i + " 轮解析到非本会话目录: " + path);
@@ -460,7 +455,6 @@ class AutoMemPathsTest {
             } catch (Throwable t) {
                 failure.compareAndSet(null, t);
             } finally {
-                AutoMemPaths.resetCurrentProjectRoot();
                 done.countDown();
             }
         };
@@ -474,7 +468,7 @@ class AutoMemPathsTest {
             .as("并发隔离测试 30s 内必须完成（两线程 200 轮 × 2）")
             .isTrue();
         assertThat(failure.get())
-            .as("并发隔离失败（ThreadLocal 未按会话线程隔离 → 跨会话污染）")
+            .as("并发隔离失败（共享单例未按显式 projectRoot 隔离 → 跨会话污染）")
             .isNull();
     }
 
@@ -583,7 +577,7 @@ class AutoMemPathsTest {
         //      线程 B（projectRoot==旧 key）命中旧 key 取到 A 的新 value → 跨会话路径错配
         //      （isAutoMemPath 前缀判定/注入目录错误，medium，EV-036）。CC lodash memoize 按 key
         //      独立槽（paths.ts:223-235）→ ConcurrentHashMap 每 projectRoot 独立槽，无跨槽错配。
-        //      本测试用生产 defaultInstance（ThreadLocal projectRoot 注入）+ 两线程交错 300 轮：
+        //      本测试用生产 defaultInstance（批 4b-1 起 projectRoot 显式传入）+ 两线程交错 300 轮：
         //      每线程首轮固化本会话路径，后续轮必须恒等（同 root 槽缓存稳定）且含本会话 sanitized 名。
         AutoMemPaths shared = AutoMemPaths.defaultInstance();
         java.util.concurrent.CyclicBarrier barrier = new java.util.concurrent.CyclicBarrier(2);
@@ -593,17 +587,15 @@ class AutoMemPathsTest {
         java.util.function.BiConsumer<String, String> session = (myRoot, otherRoot) -> {
             try {
                 barrier.await();
-                AutoMemPaths.setCurrentProjectRoot(myRoot);
-                String first = shared.getAutoMemPath();
+                String first = shared.getAutoMemPath(myRoot);
                 if (!first.contains(AutoMemPaths.sanitizePath(myRoot))) {
                     throw new AssertionError("首轮即解析到非本会话目录: " + first);
                 }
                 for (int i = 0; i < 300; i++) {
-                    AutoMemPaths.setCurrentProjectRoot(myRoot);
                     if ((i & 1) == 0) {
                         Thread.yield();
                     }
-                    String path = shared.getAutoMemPath();
+                    String path = shared.getAutoMemPath(myRoot);
                     if (!path.equals(first)) {
                         throw new AssertionError(
                             "会话 " + myRoot + " 第 " + i + " 轮缓存槽错配: 期望 " + first + " 实得 " + path);
@@ -616,7 +608,6 @@ class AutoMemPathsTest {
             } catch (Throwable t) {
                 failure.compareAndSet(null, t);
             } finally {
-                AutoMemPaths.resetCurrentProjectRoot();
                 done.countDown();
             }
         };
@@ -687,12 +678,10 @@ class AutoMemPathsTest {
             Path memDir = Files.createDirectories(projectRoot.resolve("custom-mem"));
             Files.writeString(nexusaiDir.resolve("settings.local.json"),
                 "{\"autoMemoryDirectory\": " + SETTINGS_JSON.writeValueAsString(memDir.toString()) + "}");
-            AutoMemPaths.setCurrentProjectRoot(projectRoot.toString());
-            assertThat(paths.getAutoMemPath())
-                .as("local 源必须从 {projectRoot}/.nexusai/settings.local.json 读取")
+            assertThat(paths.getAutoMemPath(projectRoot.toString()))
+                .as("local 源必须从 {projectRoot}/.nexusai/settings.local.json 读取（显式入参 projectRoot）")
                 .isEqualTo(memDir.toString() + java.io.File.separator);
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
             paths.clearCache();
@@ -700,38 +689,35 @@ class AutoMemPathsTest {
     }
 
     @Test
-    @DisplayName("[TL-W1 P3] 显式重载不读 ThreadLocal：CURRENT_PROJECT_ROOT 项目的 localSettings 不得泄漏到 getAutoMemPath(其他项目)")
-    void getAutoMemPath_explicitOverloadIgnoresThreadLocalProjectRoot(
-            @TempDir Path threadLocalRoot, @TempDir Path otherRoot, @TempDir Path configHome) throws Exception {
-        // WHY（规则九 · 审计 P3）: getAutoMemPath(String) 自称「不依赖 supplier/ThreadLocal」，但其
-        //   settings 源旧经无参 getAutoMemPathSetting() → readAutoMemoryDirectorySetting() →
-        //   currentSessionProjectRoot() **回读 ThreadLocal**（DB 列 auto_memory_directory 生产默认为
-        //   NULL → 必走该分支）⇒ 显式重载的「零 ThreadLocal」定案被推翻：异步 fork 线程无 ThreadLocal
-        //   → 该值回落 config home。本测试钉住：ThreadLocal = P 时，getAutoMemPath(其他项目) **只**用
-        //   入参解析（不得命中 P 的 localSettings）；无参重载仍走 P（会话线程语义，允许读 ThreadLocal）。
-        // 时序同 OPD-R2-02 用例：setAppNameOverride/configDirOverride 必须先于夹具路径解析。
+    @DisplayName("[批 4b-1] 显式重载只用入参：getAutoMemPath(其他项目) 不得命中本项目 P 的 localSettings")
+    void getAutoMemPath_explicitOverloadUsesOnlyItsOwnProjectRoot(
+            @TempDir Path ownRoot, @TempDir Path otherRoot, @TempDir Path configHome) throws Exception {
+        // WHY（规则九 · 审计 P3）：getAutoMemPath(String) 自称「不依赖 supplier/环境态」，但其 settings 源
+        //   旧经无参 getAutoMemPathSetting() → readAutoMemoryDirectorySetting() → 回读会话 ThreadLocal
+        //   ⇒ 显式重载的「零环境态」定案被推翻（异步 fork 线程读到别的项目/回落）。批 4b-1 删载体后，
+        //   无参路径已无任何隐式来源（env 未配置 ⇒ null）。本用例钉住两条：
+        //   ① 显式重载传「本项目」⇒ 命中本项目 localSettings（正向锚，保证链没断）；
+        //   ② 显式重载传「其他项目」⇒ 绝不命中本项目的 localSettings（旧实现会命中 → 本断言红）。
         AutoMemPaths paths = AutoMemPaths.defaultInstance();
         ClaudePaths.setConfigDirOverride(configHome.toString());
         NexusaiPaths.setAppNameOverride("nexusai-test-" + configHome.getFileName());
         BundledSkillEnabledGates.bridgeSettingsMapper(null);
         try {
-            Path nexusaiDir = Files.createDirectories(threadLocalRoot.resolve(NexusaiPaths.getProjectDirName()));
-            Path memDir = Files.createDirectories(threadLocalRoot.resolve("threadlocal-mem"));
+            Path nexusaiDir = Files.createDirectories(ownRoot.resolve(NexusaiPaths.getProjectDirName()));
+            Path memDir = Files.createDirectories(ownRoot.resolve("own-project-mem"));
             Files.writeString(nexusaiDir.resolve("settings.local.json"),
                 "{\"autoMemoryDirectory\": " + SETTINGS_JSON.writeValueAsString(memDir.toString()) + "}");
 
-            AutoMemPaths.setCurrentProjectRoot(threadLocalRoot.toString());
-            // 对照支：无参重载（会话线程语义）→ 读 ThreadLocal 项目 P 的 localSettings（既有定案）
-            assertThat(paths.getAutoMemPath())
-                .as("无参重载 = 唯一允许读 ThreadLocal 的路径（会话线程语义）")
+            assertThat(paths.getAutoMemPath(ownRoot.toString()))
+                .as("显式重载传本项目 ⇒ 命中本项目 localSettings（settings 链未被改坏）")
                 .isEqualTo(memDir.toString() + java.io.File.separator);
-            // 主张支：显式重载传**其他**项目 → 绝不命中 P 的 localSettings
-            //   （旧实现内部调无参 getAutoMemPathSetting() → ThreadLocal=P → 命中 → 本断言红）
             assertThat(paths.getAutoMemPath(otherRoot.toString()))
-                .as("显式重载必须只用入参 projectRoot 解析 settings 链（旧实现回读 ThreadLocal → 命中 P 的 localSettings）")
-                .doesNotContain("threadlocal-mem");
+                .as("显式重载必须只用入参 projectRoot 解析 settings 链（不得命中其他项目的 localSettings）")
+                .doesNotContain("own-project-mem");
+            assertThat(paths.getAutoMemPath(null))
+                .as("[批 4b-1] 无显式根且 env 未配置 ⇒ 无隐式来源，不得伪造（载体已删）")
+                .isNull();
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
             paths.clearCache();
@@ -759,7 +745,6 @@ class AutoMemPathsTest {
                 .isFalse();
         } finally {
             BundledSkillEnabledGates.bridgeSettingsMapper(null);
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
             System.setProperty("user.home", originalUserHome);   // G5：复位 user.home
@@ -799,7 +784,6 @@ class AutoMemPathsTest {
                 .isFalse();
         } finally {
             BundledSkillEnabledGates.bridgeSettingsMapper(null);
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
         }

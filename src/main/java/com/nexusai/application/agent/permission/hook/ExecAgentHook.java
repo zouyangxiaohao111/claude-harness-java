@@ -382,7 +382,14 @@ public class ExecAgentHook {
             //   CLAUDE.md 根指向配置主目录（读错项目、写错记忆），且**静默**。改 orNull：无会话上下文
             //   即 null → shared(null) 走既有「无会话上下文」分支（LoopSessionState.workspaceDir 回落
             //   bean ?? user.dir），不再伪造 config home。
-            AgentLoopContext sharedCtx = contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull());
+            // [批 4b-1] 原接线 AutoMemPaths.currentSessionProjectRootOrNull()（ThreadLocal 载体已删 ⇒
+            //   恒 null）→ 改**按显式 sessionId 查冻结表**（用户铁律：直传或按 sessionId 查；
+            //   ⛔ 不再回落 config home）。该来源覆盖全部调度线程（含原回放覆盖不到者），
+            //   查不到（未绑定会话）→ null → shared(null) 走既有「无会话上下文」分支。
+            String hookAgentProjectRoot = (sessionId != null && !sessionId.isBlank())
+                ? com.nexusai.common.SessionProjectRoot.getForSession(sessionId)
+                : null;
+            AgentLoopContext sharedCtx = contextFactory.shared(hookAgentProjectRoot);
             AtomicInteger assistantMessageCounter = new AtomicInteger(0);
             AtomicBoolean maxTurnsBreakerFired = new AtomicBoolean(false);
             LoopDeps deps = new LoopDeps() {

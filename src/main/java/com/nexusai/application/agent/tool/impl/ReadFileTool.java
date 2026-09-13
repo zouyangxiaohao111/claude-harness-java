@@ -1224,7 +1224,9 @@ public class ReadFileTool implements Tool {
         //   memoryFileFreshnessPrefix(data) = memoryFreshnessNote(mtimeMs)（>1 day 才非空）。
         String freshnessNote = "";
         if (memoryFileDetection != null && memoryAge != null
-                && memoryFileDetection.isAutoMemFile(file.toString())) {
+                // [批 4b-1] 显式传会话 cwd（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）
+                && memoryFileDetection.isAutoMemFile(file.toString(),
+                    ctx != null && ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null)) {
             freshnessNote = memoryAge.memoryFreshnessNote(mtime);
             if (log.isDebugEnabled()) {
                 log.debug("ReadFileTool: auto-memory 文件注入新鲜度标记: path={} mtime={} noteLen={}",

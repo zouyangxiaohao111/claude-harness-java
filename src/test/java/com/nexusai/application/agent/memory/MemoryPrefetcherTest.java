@@ -390,7 +390,9 @@ class MemoryPrefetcherTest {
         Path cwd = Files.createTempDirectory("cwd-agent");
         MemoryPrefetcher prefetcher = buildWithAgents(memDir, cwd, registry);
 
-        List<Path> dirs = prefetcher.resolveMemoryDirs("help me @agent-code-x refactor this");
+        // [批 4b-1] 显式传会话项目根（mention 的 agent memory scope=project 需要它；原经
+        //   AutoMemPaths ThreadLocal 隐式解析，载体已删）
+        List<Path> dirs = prefetcher.resolveMemoryDirs("help me @agent-code-x refactor this", cwd.toString());
 
         assertThat(dirs).as("agent @-mention → 仅 agent memory 目录（project scope）")
             .containsExactly(cwd.resolve(NexusaiPaths.getProjectDirName()).resolve("agent-memory").resolve("code-x"));
@@ -405,7 +407,8 @@ class MemoryPrefetcherTest {
         Path cwd = Files.createTempDirectory("cwd-agent");
         MemoryPrefetcher prefetcher = buildWithAgents(memDir, cwd, registry);
 
-        List<Path> dirs = prefetcher.resolveMemoryDirs("please @\"reviewer (agent)\" check this");
+        // [批 4b-1] 同上：显式传会话项目根
+        List<Path> dirs = prefetcher.resolveMemoryDirs("please @\"reviewer (agent)\" check this", cwd.toString());
 
         assertThat(dirs).as("引号形态 mention 必须识别（attachments.ts:2812-2818）")
             .containsExactly(cwd.resolve(NexusaiPaths.getProjectDirName()).resolve("agent-memory").resolve("reviewer"));

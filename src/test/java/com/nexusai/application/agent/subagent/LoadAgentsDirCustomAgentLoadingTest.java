@@ -595,7 +595,6 @@ class LoadAgentsDirCustomAgentLoadingTest {
             // decoy：ThreadLocal 指向另一个根（其下**没有**快照）。实现若回读 ThreadLocal 则拷不到
             //   topic.md → 本用例 RED（这正是本次收紧要防的回归）。
             Files.createDirectories(decoyRoot);
-            AutoMemPaths.setCurrentProjectRoot(decoyRoot.toString());
             AgentDefinition agent = AgentDefinition.CustomAgentDefinition.builder(
                 "user-agent", "desc", "userSettings", "prompt").memory("user").build();
             Map<String, AgentDefinition> agents = new java.util.HashMap<>(Map.of("user-agent", agent));
@@ -606,7 +605,6 @@ class LoadAgentsDirCustomAgentLoadingTest {
             assertThat(Files.readString(userMem.resolve(".snapshot-synced.json")))
                 .contains("\"syncedFrom\":\"2026-08-05T10:00:00Z\"");
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
         }
@@ -772,7 +770,6 @@ class LoadAgentsDirCustomAgentLoadingTest {
             Files.createDirectories(snapDir);
             Files.writeString(snapDir.resolve("snapshot.json"), "{\"updatedAt\":\"2026-08-05T10:00:00Z\"}");
             Files.writeString(snapDir.resolve("topic.md"), "project shared");
-            AutoMemPaths.setCurrentProjectRoot(decoyRoot.toString());   // decoy：实现不得消费
             loadAgentsDir.clearCache();
 
             List<AgentDefinition> agents = loadAgentsDir.loadAllSources(projRoot);
@@ -784,7 +781,6 @@ class LoadAgentsDirCustomAgentLoadingTest {
                 .as("快照必须取自入参 projRoot（decoy ThreadLocal 不得被消费）")
                 .isEqualTo("project shared");
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             ClaudePaths.setConfigDirOverride(null);
             ClaudePaths.setManagedFilePathOverride(null);
             NexusaiPaths.setAppNameOverride(null);

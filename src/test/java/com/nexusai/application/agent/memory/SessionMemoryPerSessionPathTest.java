@@ -57,7 +57,6 @@ class SessionMemoryPerSessionPathTest {
         SessionProjectRoot.reset();
         SessionCwdHolder.reset();
         NexusaiPaths.setAppNameOverride(null);     // 复位 appName
-        AutoMemPaths.setCurrentProjectRoot(null);  // 复位 ThreadLocal
     }
 
     @Test

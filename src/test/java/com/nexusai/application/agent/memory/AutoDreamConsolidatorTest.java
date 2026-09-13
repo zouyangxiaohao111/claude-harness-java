@@ -284,7 +284,6 @@ class AutoDreamConsolidatorTest {
         //   settings.json 干扰（同 consolidateIfNeeded_defaultDisabledSkipsFork 惯例）。
         writeSessions(ws, 5);
         Path configHome = Files.createDirectories(tempDir.resolve("cfg-home-remote"));
-        AutoMemPaths.setCurrentProjectRoot(tempDir.resolve("proj-remote").toString());
         ClaudePaths.setConfigDirOverride(configHome.toString());
         // G5：autoMemory 门读 nexusai 自有根 settings.json（BundledSkillEnabledGates.java:189）→
         //   唯一 appName 隔离（防读/写真实 ~/.nexusai）
@@ -297,7 +296,6 @@ class AutoDreamConsolidatorTest {
         } finally {
             System.clearProperty("NEXUSAI_AUTO_DREAM");
             MemoryRemoteModeConfig.reset();
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
         }
@@ -315,7 +313,6 @@ class AutoDreamConsolidatorTest {
         //   回落）保守保留。
         writeSessions(ws, 5);
         Path configHome = Files.createDirectories(tempDir.resolve("cfg-home"));
-        AutoMemPaths.setCurrentProjectRoot(tempDir.resolve("proj").toString());
         ClaudePaths.setConfigDirOverride(configHome.toString());
         // G5：autoMemory 门读 nexusai 自有根 settings.json（BundledSkillEnabledGates.java:189）→
         //   唯一 appName 隔离（防读/写真实 ~/.nexusai）
@@ -324,7 +321,6 @@ class AutoDreamConsolidatorTest {
             consolidator.consolidateIfNeeded(ws, null, null);
             assertThat(query.called()).isTrue();
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
         }
@@ -361,7 +357,6 @@ class AutoDreamConsolidatorTest {
         //   ExtractMemoriesAgent.java:878-885）。
         writeSessions(ws, 5);
         Path configHome = Files.createDirectories(tempDir.resolve("cfg-home"));
-        AutoMemPaths.setCurrentProjectRoot(tempDir.resolve("proj").toString());
         ClaudePaths.setConfigDirOverride(configHome.toString());
         // G5：autoMemory 门读 nexusai 自有根 settings.json（BundledSkillEnabledGates.java:189）→
         //   唯一 appName 隔离（防读/写真实 ~/.nexusai）
@@ -371,7 +366,6 @@ class AutoDreamConsolidatorTest {
             consolidator.consolidateIfNeeded(ws, null, null);
             assertThat(query.called()).isFalse();
         } finally {
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
             System.clearProperty("NEXUSAI_AUTO_DREAM");
@@ -394,7 +388,6 @@ class AutoDreamConsolidatorTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         Path configHome = Files.createDirectories(tempDir.resolve("cfg-home"));
-        AutoMemPaths.setCurrentProjectRoot(tempDir.resolve("proj").toString());
         ClaudePaths.setConfigDirOverride(configHome.toString());
         // G5：autoMemory 门读 nexusai 自有根 settings.json（BundledSkillEnabledGates.java:189）→
         //   唯一 appName 隔离（防读/写真实 ~/.nexusai）
@@ -404,7 +397,6 @@ class AutoDreamConsolidatorTest {
             assertThat(query.called()).isTrue();
         } finally {
             BundledSkillEnabledGates.bridgeSettingsMapper(null);
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
         }
@@ -422,7 +414,6 @@ class AutoDreamConsolidatorTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         Path configHome = Files.createDirectories(tempDir.resolve("cfg-home"));
-        AutoMemPaths.setCurrentProjectRoot(tempDir.resolve("proj").toString());
         ClaudePaths.setConfigDirOverride(configHome.toString());
         // G5：autoMemory 门读 nexusai 自有根 settings.json（BundledSkillEnabledGates.java:189）→
         //   唯一 appName 隔离（防读/写真实 ~/.nexusai）
@@ -432,7 +423,6 @@ class AutoDreamConsolidatorTest {
             assertThat(query.called()).isFalse();
         } finally {
             BundledSkillEnabledGates.bridgeSettingsMapper(null);
-            AutoMemPaths.setCurrentProjectRoot(null);
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
         }

@@ -297,7 +297,9 @@ public class ReadPermissionChecker {
         //   if (isAgentMemoryPath(normalizedPath)) return { behavior:'allow', reason:'Agent memory files are allowed for reading' }
         // CC 置于 memdir carve-out 之前（filesystem.ts:1704 isAgentMemoryPath → 1716 memdir）。
         // 无 isAutoMemoryEnabled 门控（isAgentMemoryPath 是纯路径判定，agentMemory.ts:67-104）。
-        if (agentMemoryDirectory != null && agentMemoryDirectory.isAgentMemoryPath(expanded)) {
+        // [批 4b-1] 显式传会话 cwd（原经 AutoMemPaths ThreadLocal 隐式读取，载体已删）
+        if (agentMemoryDirectory != null && agentMemoryDirectory.isAgentMemoryPath(expanded,
+                ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null)) {
             if (log.isDebugEnabled()) {
                 log.debug("[ReadPermissionChecker] agent-memory 读 carve-out 静默 allow (IMP-M-P2-2): path={}",
                     path);

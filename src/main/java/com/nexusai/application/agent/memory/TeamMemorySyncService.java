@@ -209,7 +209,16 @@ public class TeamMemorySyncService {
      * （不离开机器）。学到的 maxEntries 非 null 时按字母序裁剪。
      */
     LocalRead readLocalTeamMemory(Integer maxEntries) throws IOException {
-        Path teamDir = Paths.get(teamMemPaths.getTeamMemPath());
+        // [批 4b-1] team 目录派生自 per-project auto-memory 目录（需会话项目根；原经 AutoMemPaths
+        //   ThreadLocal 隐式解析，载体已删）。本同步线程无显式会话根 → 返回空读（(b) 本线程确无
+        //   会话项目根：跳过本地读取，⛔ 不回落 config home 拼假目录）。
+        String teamMemPath = teamMemPaths.getTeamMemPath();
+        if (teamMemPath == null) {
+            log.warn("[TeamMemorySyncService] 无会话项目根 → team memory 目录不存在，跳过本地读取"
+                + "（⛔ 不回落 config home 冒充项目根）");
+            return new LocalRead(Map.of(), List.of());
+        }
+        Path teamDir = Paths.get(teamMemPath);
         Map<String, String> entries = new LinkedHashMap<>();
         List<com.nexusai.application.agent.team.TeamMemorySyncTypes.SkippedSecretFile> skippedSecrets = new ArrayList<>();
         walkDir(teamDir, teamDir, entries, skippedSecrets);

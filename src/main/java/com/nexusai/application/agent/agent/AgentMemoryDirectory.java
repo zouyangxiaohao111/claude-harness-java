@@ -140,10 +140,16 @@ public final class AgentMemoryDirectory {
         AutoMemPaths autoMemPaths = AutoMemPaths.defaultInstance();
         MemoryPromptBuilder promptBuilder = MemoryPromptBuilder.productionDefault();
         return new AgentMemoryDirectory(
-            AutoMemPaths::currentSessionProjectRoot,
+            // [批 4b-1] 原接线 AutoMemPaths::currentSessionProjectRoot（config home 第 3 级回落）
+            //   —— CURRENT_PROJECT_ROOT ThreadLocal 载体已删除，改用无载体出口（env 或 null）。
+            //   ⛔ 只绑 lambda、不即时求值（R2：本工厂在类加载期执行）。
+            AutoMemPaths::currentSessionProjectRootOrNull,
             () -> java.nio.file.Paths.get(autoMemPaths.getMemoryBaseDir()),
             () -> System.getenv(AutoMemPaths.REMOTE_MEMORY_DIR_ENV),
-            () -> java.nio.file.Paths.get(AutoMemPaths.currentSessionProjectRoot()),
+            () -> {
+                String r = AutoMemPaths.currentSessionProjectRootOrNull();
+                return (r == null || r.isBlank()) ? null : java.nio.file.Paths.get(r);
+            },
             AutoMemPaths::sanitizePath,
             promptBuilder::ensureMemoryDirExists,
             () -> System.getenv(MemoryPromptBuilder.COWORK_EXTRA_GUIDELINES_ENV),
@@ -182,7 +188,10 @@ public final class AgentMemoryDirectory {
             () -> effectiveCwd,
             memoryBaseSupplier,
             remoteMemoryDirSupplier,
-            projectRootSupplier,
+            // [批 4b-1 · R7 半分裂修复] 原实现只替换 cwdSupplier、原样透传 projectRootSupplier ⇒
+            //   派生实例的「项目根」来源与「cwd」来源分裂（remote mount 腿读的正是 projectRootSupplier，
+            //   会解析到别的根）。本实例语义 = 「钉死到这个有效工作目录」，故两个 supplier 同源覆盖。
+            () -> java.nio.file.Paths.get(effectiveCwd),
             sanitizePathFn,
             ensureDirConsumer,
             coworkExtraGuidelinesSupplier,
@@ -203,10 +212,14 @@ public final class AgentMemoryDirectory {
     public static AgentMemoryDirectory fromAutoMemPaths(AutoMemPaths autoMemPaths,
                                                         BooleanSupplier autoMemoryEnabled) {
         return new AgentMemoryDirectory(
-            AutoMemPaths::currentSessionProjectRoot,
+            // [批 4b-1] 同 buildProductionDefault：无载体出口（env 或 null）；只绑 lambda 不即时求值。
+            AutoMemPaths::currentSessionProjectRootOrNull,
             () -> java.nio.file.Paths.get(autoMemPaths.getMemoryBaseDir()),
             () -> System.getenv(AutoMemPaths.REMOTE_MEMORY_DIR_ENV),
-            () -> java.nio.file.Paths.get(AutoMemPaths.currentSessionProjectRoot()),
+            () -> {
+                String r = AutoMemPaths.currentSessionProjectRootOrNull();
+                return (r == null || r.isBlank()) ? null : java.nio.file.Paths.get(r);
+            },
             AutoMemPaths::sanitizePath,
             path -> { /* 检测纯谓词：不 mkdir */ },
             () -> System.getenv(MemoryPromptBuilder.COWORK_EXTRA_GUIDELINES_ENV),
@@ -235,32 +248,104 @@ public final class AgentMemoryDirectory {
         return agentType.replace(":", "-");
     }
 
-    /** CC getLocalAgentMemoryDir — local scope (含 remote mount 处理, agentMemory.ts:29-44). */
-    public java.nio.file.Path getLocalAgentMemoryDir(String dirName) {
+    /**
+     * 解析有效项目根（cwd）· <b>显式入参优先</b>，否则回落实例 supplier（批 4b-1 起 = env 或 null）。
+     *
+     * <p>[批 4b-1] 原实现直接读 {@code cwdSupplier.get()}（= {@code AutoMemPaths.currentSessionProjectRoot()}
+     * 的 ThreadLocal 值）；载体删除后该 supplier 在会话中恒为 null ⇒ 项目作用域（PROJECT/LOCAL）必须由
+     * <b>调用方显式传入</b>会话 cwd（{@code ToolUseContext.effectiveCwd()} / 会话绑定项目根）。
+     * ⛔ 绝不回落 config home / user.dir（那正是本批要消灭的「冒充项目根」）。
+     *
+     * @param explicitProjectRoot 显式会话项目根（可为 null = 无显式来源）
+     * @return 有效项目根；无 → null
+     */
+    private String resolveRoot(String explicitProjectRoot) {
+        if (explicitProjectRoot != null && !explicitProjectRoot.isBlank()) {
+            return explicitProjectRoot;
+        }
+        if (projectRootSupplier != null) {
+            java.nio.file.Path p = projectRootSupplier.get();
+            if (p != null && !p.toString().isBlank()) {
+                return p.toString();
+            }
+        }
+        String cwd = cwdSupplier != null ? cwdSupplier.get() : null;
+        return (cwd != null && !cwd.isBlank()) ? cwd : null;
+    }
+
+    /**
+     * 取「项目作用域」必需的项目根 · 缺值 = <b>(a) 本该有却没有 ⇒ 抛</b>。
+     *
+     * <p>判据：PROJECT/LOCAL scope 的记忆目录本体就是 {@code <项目根>/.nexusai/agent-memory*}，
+     * 项目根缺失时<b>没有合法产物</b>（伪造一个 config home 目录就是本批要消灭的缺陷）⇒ fail loud，
+     * 由调用方在入口解析并显式传入（{@code ToolUseContext.effectiveCwd()}）。
+     */
+    private String requireProjectRoot(String explicitProjectRoot, String scopeName) {
+        String root = resolveRoot(explicitProjectRoot);
+        if (root == null || root.isBlank()) {
+            throw new IllegalStateException(
+                "[AgentMemoryDirectory] agent-memory scope=" + scopeName + " 需要会话项目根（cwd），但未解析到。"
+                    + "调用方须显式传入（ToolUseContext.effectiveCwd() / 会话绑定项目根）；"
+                    + "⛔ 不回落 config home / user.dir 冒充项目根（AutoMemPaths.CURRENT_PROJECT_ROOT 载体已删除，批 4b-1）");
+        }
+        return root;
+    }
+
+    /** 项目作用域前缀段缺失的告警一次性开关（isAgentMemoryPath 的 (b) 类跳过路径）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean PROJECT_SCOPE_SKIP_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * CC getLocalAgentMemoryDir — local scope (含 remote mount 处理, agentMemory.ts:29-44).
+     *
+     * @param explicitProjectRoot 显式会话项目根（null → 回落实例 supplier = env 或 null）
+     */
+    public java.nio.file.Path getLocalAgentMemoryDir(String dirName, String explicitProjectRoot) {
+        // [批 4b-1 · R7] 原「projectRootSupplier != null ? ... : cwdSupplier.get()」三元式的 else 腿
+        //   在旧接线（恒非 null 的 Paths.get 包装）下是死码；载体删除后它会第一次变活并可能拼 null。
+        //   现收口为单一 root（显式入参优先）⇒ 无死分支、无静默回落 config home：
+        //   root 缺失 = 本该有却没有 ⇒ (a) 抛（requireProjectRoot）。
+        String root = requireProjectRoot(explicitProjectRoot, "local");
         String remoteDir = remoteMemoryDirSupplier != null ? remoteMemoryDirSupplier.get() : null;
         if (remoteDir != null && !remoteDir.isEmpty()) {
             // [FIX-AM REQ-M-19] remote mount 项目名对齐 CC agentMemory.ts:35-37
             //   findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot()：
             //   用 canonical git root（worktree → 主仓库根）让同一仓库所有 worktree 共享
             //   agent-memory-local 目录（对齐 AutoMemPaths.getAutoMemBase 既有语义）。
-            String projectRoot = projectRootSupplier.get() != null
-                ? projectRootSupplier.get().toString() : cwdSupplier.get();
-            String canonical = AutoMemPaths.findCanonicalGitRoot(projectRoot);
-            String projectPath = sanitizePathFn.apply(canonical != null ? canonical : projectRoot);
+            String canonical = AutoMemPaths.findCanonicalGitRoot(root);
+            String projectPath = sanitizePathFn.apply(canonical != null ? canonical : root);
             return java.nio.file.Paths.get(remoteDir, "projects", projectPath,
                 "agent-memory-local", dirName);
         }
-        return java.nio.file.Paths.get(cwdSupplier.get(), NexusaiPaths.getProjectDirName(), "agent-memory-local", dirName);
+        return java.nio.file.Paths.get(root, NexusaiPaths.getProjectDirName(), "agent-memory-local", dirName);
+    }
+
+    /** CC getLocalAgentMemoryDir · 无显式入参重载（回落实例 supplier；会话线程请用显式重载）。 */
+    public java.nio.file.Path getLocalAgentMemoryDir(String dirName) {
+        return getLocalAgentMemoryDir(dirName, null);
     }
 
     /** CC getAgentMemoryDir（agentMemory.ts:52-65）. */
     public java.nio.file.Path getAgentMemoryDir(String agentType, AgentMemoryScope scope) {
+        return getAgentMemoryDir(agentType, scope, null);
+    }
+
+    /**
+     * CC getAgentMemoryDir（agentMemory.ts:52-65）· <b>[批 4b-1] 显式会话项目根版本</b>。
+     *
+     * <p>PROJECT/LOCAL 由 {@code explicitProjectRoot} 决定基址（缺失 ⇒ (a) 抛）；USER 与 cwd 无关。
+     *
+     * @param explicitProjectRoot 显式会话项目根（{@code ToolUseContext.effectiveCwd()} 等）；null → supplier
+     */
+    public java.nio.file.Path getAgentMemoryDir(String agentType, AgentMemoryScope scope,
+                                                String explicitProjectRoot) {
         String dirName = sanitizeAgentTypeForPath(agentType);
         switch (scope) {
             case PROJECT:
-                return java.nio.file.Paths.get(cwdSupplier.get(), NexusaiPaths.getProjectDirName(), "agent-memory", dirName);
+                return java.nio.file.Paths.get(requireProjectRoot(explicitProjectRoot, "project"),
+                    NexusaiPaths.getProjectDirName(), "agent-memory", dirName);
             case LOCAL:
-                return getLocalAgentMemoryDir(dirName);
+                return getLocalAgentMemoryDir(dirName, explicitProjectRoot);
             case USER:
                 return memoryBaseSupplier.get().resolve("agent-memory").resolve(dirName);
             default:
@@ -279,6 +364,23 @@ public final class AgentMemoryDirectory {
      * @return true = 位于任一 agent memory 目录内
      */
     public boolean isAgentMemoryPath(String absolutePath) {
+        return isAgentMemoryPath(absolutePath, null);
+    }
+
+    /**
+     * CC isAgentMemoryPath（agentMemory.ts:74/80/97）· <b>[批 4b-1] 显式会话项目根版本</b>。
+     *
+     * <p><b>缺根处置 = (b) 跳过 + ≥WARN（fail-closed）</b>：项目根不可得时 PROJECT/LOCAL 两段基址
+     * 无法判定 —— 本方法是<b>权限放行谓词</b>（carve-out），「判不了」的正确答案是<b>不放行</b>
+     * （返回 false → 走正常权限流），⛔ 绝不退回用 config home 拼假基址（那会让 allowlist 变成
+     * {@code <configHome>/.nexusai/agent-memory/**} 假目录：真项目目录被拒 + 放行面扩张，本批要消灭的缺陷）。
+     * USER 段基址是 memoryBase（config home 存储基座，非项目身份）⇒ 与 cwd 无关，恒可判定。
+     *
+     * @param absolutePath        待检查路径
+     * @param explicitProjectRoot 显式会话项目根（null → 回落实例 supplier）
+     * @return true = 位于任一 agent memory 目录内
+     */
+    public boolean isAgentMemoryPath(String absolutePath, String explicitProjectRoot) {
         String normalized = java.nio.file.Paths.get(absolutePath).normalize().toString();
         String sep = java.io.File.separator;
         java.nio.file.Path memoryBase = memoryBaseSupplier.get();
@@ -287,9 +389,19 @@ public final class AgentMemoryDirectory {
         if (normalized.startsWith(memoryBase.resolve("agent-memory").toString() + sep)) {
             return true;
         }
+        String root = resolveRoot(explicitProjectRoot);
+        if (root == null || root.isBlank()) {
+            // (b) 本线程无会话项目根 ⇒ 无法判定 PROJECT/LOCAL 两段：跳过（不放行）+ ≥WARN 一次。
+            if (PROJECT_SCOPE_SKIP_WARNED.compareAndSet(false, true)) {
+                log.warn("[AgentMemoryDirectory] isAgentMemoryPath 未取到会话项目根（cwd）→ 跳过 PROJECT/LOCAL "
+                    + "agent-memory 判定（不放行，走正常权限流）。调用方应显式传入 ToolUseContext.effectiveCwd()；"
+                    + "⛔ 不回落 config home 冒充项目根: path={}", absolutePath);
+            }
+            return false;
+        }
         // Project scope: join(cwd, '.nexusai', 'agent-memory') + sep（agentMemory.ts:80 · 决策 D6 项目写迁移）
         if (normalized.startsWith(
-            java.nio.file.Paths.get(cwdSupplier.get(), NexusaiPaths.getProjectDirName(), "agent-memory").toString() + sep)) {
+            java.nio.file.Paths.get(root, NexusaiPaths.getProjectDirName(), "agent-memory").toString() + sep)) {
             return true;
         }
         // Local scope（agentMemory.ts:86-101）
@@ -302,7 +414,7 @@ public final class AgentMemoryDirectory {
                 return true;
             }
         } else if (normalized.startsWith(
-            java.nio.file.Paths.get(cwdSupplier.get(), NexusaiPaths.getProjectDirName(), "agent-memory-local").toString() + sep)) {
+            java.nio.file.Paths.get(root, NexusaiPaths.getProjectDirName(), "agent-memory-local").toString() + sep)) {
             return true;
         }
         return false;
@@ -321,7 +433,17 @@ public final class AgentMemoryDirectory {
      * @return agent memory 入口文件路径（{@code <memoryDir>/MEMORY.md}）
      */
     public java.nio.file.Path getAgentMemoryEntrypoint(String agentType, AgentMemoryScope scope) {
-        return getAgentMemoryDir(agentType, scope).resolve("MEMORY.md");
+        return getAgentMemoryEntrypoint(agentType, scope, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #getAgentMemoryEntrypoint(String, AgentMemoryScope)}。
+     *
+     * @param explicitProjectRoot 显式会话项目根（PROJECT/LOCAL 必需；缺失 ⇒ IllegalStateException）
+     */
+    public java.nio.file.Path getAgentMemoryEntrypoint(String agentType, AgentMemoryScope scope,
+                                                       String explicitProjectRoot) {
+        return getAgentMemoryDir(agentType, scope, explicitProjectRoot).resolve("MEMORY.md");
     }
 
     /**
@@ -340,6 +462,20 @@ public final class AgentMemoryDirectory {
      * @return memory prompt 文本（纯构建，无门控）
      */
     public String loadAgentMemoryPrompt(String agentType, AgentMemoryScope scope) {
+        return loadAgentMemoryPrompt(agentType, scope, null);
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #loadAgentMemoryPrompt(String, AgentMemoryScope)}。
+     *
+     * <p>PROJECT/LOCAL scope 的项目根缺失 ⇒ {@link #requireProjectRoot} 抛 IllegalStateException（(a) 类）；
+     * 同时把根显式下传给 {@link MemoryPromptBuilder#buildMemoryPrompt(String, String, List, String)}
+     * （transcript 搜索根，原经 AutoMemPaths ThreadLocal 隐式读取）。
+     *
+     * @param explicitProjectRoot 显式会话项目根（{@code ToolUseContext.effectiveCwd()} 等）
+     */
+    public String loadAgentMemoryPrompt(String agentType, AgentMemoryScope scope,
+                                        String explicitProjectRoot) {
         String scopeNote;
         switch (scope) {
             case USER:
@@ -355,7 +491,7 @@ public final class AgentMemoryDirectory {
                 scopeNote = "";
         }
 
-        java.nio.file.Path memoryDir = getAgentMemoryDir(agentType, scope);
+        java.nio.file.Path memoryDir = getAgentMemoryDir(agentType, scope, explicitProjectRoot);
 
         // Fire-and-forget mkdir（agentMemory.ts:165 void ensureMemoryDirExists）
         if (ensureDirConsumer != null) {
@@ -377,7 +513,7 @@ public final class AgentMemoryDirectory {
                 : java.util.List.of(scopeNote);
 
         String prompt = promptBuilder.buildMemoryPrompt(
-            "Persistent Agent Memory", memoryDir.toString(), extraGuidelines);
+            "Persistent Agent Memory", memoryDir.toString(), extraGuidelines, explicitProjectRoot);
         if (log.isDebugEnabled()) {
             log.debug("[AgentMemoryDirectory] loadAgentMemoryPrompt 构建 agent memory prompt: agentType={} scope={} dir={} 长度={}",
                 agentType, scope, memoryDir, prompt.length());

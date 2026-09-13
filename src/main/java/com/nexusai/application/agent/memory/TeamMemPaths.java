@@ -183,7 +183,28 @@ public final class TeamMemPaths {
      * <p>OPD-R2-06：CC :85 {@code (join(getAutoMemPath(), 'team') + sep).normalize('NFC')}。
      */
     public String getTeamMemPath() {
-        String autoMem = autoMemPaths.getAutoMemPath();
+        return teamMemPathOf(autoMemPaths.getAutoMemPath());
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #getTeamMemPath()}。
+     *
+     * <p>team memory 目录 = {@code <autoMemPath>/team/}，而 auto-memory per-project 目录需要会话项目根；
+     * 该值原先经 {@code AutoMemPaths.CURRENT_PROJECT_ROOT} ThreadLocal 隐式解析，载体已删 ⇒ 会话线程
+     * 由调用方显式传入（缺失 ⇒ 返回 null 由调用方跳过，⛔ 不回落 config home 拼假目录）。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（null → 无显式根，返回 null）
+     */
+    public String getTeamMemPath(String sessionProjectRoot) {
+        // [批 4b-1] null = 「未提供显式根」⇒ 回落实例供应（env / POJO 注入 supplier），与本批
+        //   AgentMemoryDirectory.resolveRoot 同约定；非 null 才走显式根（不回落 config home）。
+        return teamMemPathOf(sessionProjectRoot != null && !sessionProjectRoot.isBlank()
+            ? autoMemPaths.getAutoMemPath(sessionProjectRoot)
+            : autoMemPaths.getAutoMemPath());
+    }
+
+    /** 由已解析的 auto-memory 目录派生 team 目录（无有效项目 → null，调用方跳过）。 */
+    private static String teamMemPathOf(String autoMem) {
         // A′: 无有效项目 → auto-memory 目录不存在 → team 子目录亦不存在（返回 null，调用方跳过）
         if (autoMem == null) {
             return null;
@@ -342,6 +363,15 @@ public final class TeamMemPaths {
      * 用 validateTeamMemWritePath/validateTeamMemKey（含 symlink 解析）。
      */
     public boolean isTeamMemPath(String filePath) {
+        return isTeamMemPath(filePath, null);   // null ⇒ 回落实例供应（同上约定）
+    }
+
+    /**
+     * [批 4b-1] 显式会话项目根版本 · 见 {@link #isTeamMemPath(String)}。
+     *
+     * @param sessionProjectRoot 会话绑定项目根（null → 无显式根 → 返回 false：无法判定，fail-closed）
+     */
+    public boolean isTeamMemPath(String filePath, String sessionProjectRoot) {
         if (filePath == null) {
             return false;
         }
@@ -350,8 +380,8 @@ public final class TeamMemPaths {
         // Paths.get().toAbsolutePath().normalize() 输出平台原生分隔符，getTeamMemPath()
         // 同为原生分隔符 → 直比较即可（不再 toComparable 小写折叠）。
         String resolvedPath = Paths.get(filePath).toAbsolutePath().normalize().toString();
-        String teamDir = getTeamMemPath();
-        // A′: 无有效项目 → 无 team 目录 → 任何路径都不在 team 内
+        String teamDir = getTeamMemPath(sessionProjectRoot);
+        // A′: 无有效项目 / 无显式会话项目根 → 无 team 目录 → 任何路径都不在 team 内
         if (teamDir == null) {
             return false;
         }
@@ -427,7 +457,12 @@ public final class TeamMemPaths {
      * （teamMemPaths.ts:290-292）= isTeamMemoryEnabled() && isTeamMemPath()。
      */
     public boolean isTeamMemFile(String filePath) {
-        return isTeamMemoryEnabled() && isTeamMemPath(filePath);
+        return isTeamMemFile(filePath, null);
+    }
+
+    /** [批 4b-1] 显式会话项目根版本 · 见 {@link #isTeamMemFile(String)}。 */
+    public boolean isTeamMemFile(String filePath, String sessionProjectRoot) {
+        return isTeamMemoryEnabled() && isTeamMemPath(filePath, sessionProjectRoot);
     }
 
     /**

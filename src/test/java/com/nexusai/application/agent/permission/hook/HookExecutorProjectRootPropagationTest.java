@@ -25,29 +25,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * [IMP-C D2-A/F3] HOOK_EXECUTOR 线程 projectRoot 捕获-回放传播集成测试。
  *
- * <p>WHY (M-04 D2): {@link HookRegistry#HOOK_EXECUTOR} cached 池线程执行 hook，ThreadLocal
- * 不跨线程 —— 不传播则 hook 执行路径（programmatic hook 回调 / configured hook spawn cwd
- * {@link CommandHookExecutor#resolveSpawnCwd} 池线程求值）读回落值而非会话绑定 P。
- * 修复 = 提交线程（会话/工具执行线程）capture → 任务体开头 set → finally restore
- * （{@code withSessionProjectRoot}，对齐 LlmAgentLoop.run() :1637/:1645）。
- *
- * <p>RED 条件：删除 {@code withSessionProjectRoot} 包裹 → HOOK_EXECUTOR 线程读到回落值 ≠ P。
+ * <p>[批 4b-1] 原「HOOK_EXECUTOR 线程 projectRoot 捕获-回放传播」用例已退役（载体
+ * {@code AutoMemPaths.CURRENT_PROJECT_ROOT} 删除，用户铁律：会话态一律显式传参）。本类现只保留
+ * <b>活守卫</b>：configured command hook 的 spawn cwd 经 {@link CwdResolution}（sessionId 键冻结表）
+ * 在池线程求值 = 会话项目根 —— 该链路与 ThreadLocal 无关，跨线程无需回放。
  */
 @DisplayName("IMP-C · HOOK_EXECUTOR 线程 projectRoot 捕获-回放传播（HookRegistry withSessionProjectRoot）")
 class HookExecutorProjectRootPropagationTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    @AfterEach
-    void tearDown() {
-        AutoMemPaths.resetCurrentProjectRoot();
-    }
 
     /** 捕获 hookCwd 与池线程 projectRoot 的 stub · 不启动真实进程。 */
     static class StubCaptureExecutor extends CommandHookExecutor {
         final AtomicReference<String> capturedJsonInput = new AtomicReference<>();
         final AtomicReference<String> capturedHookCwd = new AtomicReference<>();
-        final AtomicReference<String> seenOnHookThread = new AtomicReference<>();
         private final Function<String, CommandHookExecutor.CommandHookResult> responder;
 
         StubCaptureExecutor(Function<String, CommandHookExecutor.CommandHookResult> responder) {
@@ -59,7 +51,6 @@ class HookExecutorProjectRootPropagationTest {
                                                              String jsonInput, String pluginRoot, String pluginId,
                                                              String skillRoot, Integer hookIndex,
                                                              boolean forceSyncExecution, AbortController parentAbort) {
-            seenOnHookThread.set(AutoMemPaths.currentSessionProjectRoot());
             capturedJsonInput.set(jsonInput);
             return responder.apply(jsonInput);
         }
@@ -72,7 +63,6 @@ class HookExecutorProjectRootPropagationTest {
                                                              long defaultTimeoutMs, String hookCwd) {
             // 本重载在 HOOK_EXECUTOR 线程执行（executeOneConfiguredHook supplyAsync 任务体）——
             // 捕获 hookCwd（resolveSpawnCwd 池线程求值）+ 同线程 projectRoot。
-            seenOnHookThread.set(AutoMemPaths.currentSessionProjectRoot());
             capturedHookCwd.set(hookCwd);
             capturedJsonInput.set(jsonInput);
             return responder.apply(jsonInput);
@@ -110,38 +100,11 @@ class HookExecutorProjectRootPropagationTest {
             Map.of(), false, "", null);
     }
 
-    @Test
-    @DisplayName("programmatic PreToolUse hook 在 HOOK_EXECUTOR 线程读到会话绑定 projectRoot")
-    void programmaticHook_onHookExecutorThread_readsSessionProjectRoot() throws Exception {
-        // WHY: registerPreToolUse 走 submitPreToolUseHook（supplyAsync + HOOK_EXECUTOR）——
-        //      修复生效 = onPreToolUse 回调线程（池线程）读到 P。
-        String P = Files.createTempDirectory("imp-c-hook-prog").toString();
-        HookRegistry registry = new HookRegistry();
-        AtomicReference<String> seen = new AtomicReference<>();
-        AtomicReference<String> threadName = new AtomicReference<>();
-        CountDownLatch done = new CountDownLatch(1);
-        registry.registerPreToolUse("probe", (toolName, input, ctx) -> {
-            threadName.set(Thread.currentThread().getName());
-            seen.set(AutoMemPaths.currentSessionProjectRoot());
-            done.countDown();
-            return AggregatedHookResult.proceed();
-        });
-        try {
-            AutoMemPaths.setCurrentProjectRoot(P);
-            registry.executePreToolUse("Bash", JSON.createObjectNode(), mainThreadCtx(), "tu-1");
-            assertThat(done.await(5, TimeUnit.SECONDS))
-                .as("hook 必须在 5s 内执行")
-                .isTrue();
-            assertThat(threadName.get())
-                .as("programmatic hook 必须在 HOOK_EXECUTOR 线程执行（非测试线程）")
-                .contains("nexusai-hook-");
-            assertThat(seen.get())
-                .as("HOOK_EXECUTOR 线程必须读到会话绑定 projectRoot（捕获-回放传播）")
-                .isEqualTo(P);
-        } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
-        }
-    }
+    // [批 4b-1 已退役] 原「programmatic PreToolUse hook 在 HOOK_EXECUTOR 线程读到会话绑定 projectRoot」
+    //   用例——其被验证的机制 = AutoMemPaths.CURRENT_PROJECT_ROOT（ThreadLocal）捕获-回放，该载体
+    //   已随批 4b-1 删除（用户铁律：会话态一律显式传参，回放不算合规，不得保留「删了实现仍恒绿」
+    //   的回放断言）。会话项目根的显式传递现由下面的 configured-hook spawn cwd 用例与
+    //   AutoMemoryExplicitRootPlumbingTest 正向锚守护。
 
     @Test
     @DisplayName("configured command hook spawn cwd = 会话项目根（CwdResolution 池线程求值 G14）")
@@ -157,17 +120,14 @@ class HookExecutorProjectRootPropagationTest {
         StubCaptureExecutor stub = new StubCaptureExecutor(HookExecutorProjectRootPropagationTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
         try {
-            AutoMemPaths.setCurrentProjectRoot(P); // 仍供 seenOnHookThread（CLAUDE_PROJECT_DIR env 域）
+            // [批 4b-1] 原 setCurrentProjectRoot(P) 已删（载体删除）；会话项目根经
+            //   SessionProjectRoot 冻结表（sessionId 键）显式解析 —— 跨线程无需回放。
             com.nexusai.common.SessionProjectRoot.setForSession(sid, P); // 供 CwdResolution.getCwd
             registry.executePreToolUse("Bash", JSON.createObjectNode(), mainThreadCtx(), "tu-1");
-            assertThat(stub.seenOnHookThread.get())
-                .as("configured hook 在 HOOK_EXECUTOR 线程执行时必须读到会话绑定 projectRoot（CLAUDE_PROJECT_DIR env 域）")
-                .isEqualTo(P);
             assertThat(stub.capturedHookCwd.get())
                 .as("hook spawn cwd（CwdResolution.getCwd 池线程求值）必须 = 会话项目根 P（G14 单一入口）")
                 .isEqualTo(com.nexusai.application.agent.agent.CwdResolution.normalizeCwd(P));
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             com.nexusai.common.SessionProjectRoot.clearSession(sid);
         }
     }
