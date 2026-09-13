@@ -34,7 +34,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>驱动方式：{@code new LlmAgentLoop(factory)}（单测裸构造，同 ResumeRestoreEntryTest 基建）
  * + {@code setStreamContext}（设 streamSessionId）+ {@code setSessionProjectRootResolver}
- * （计数 mock）→ 反射调用 private {@code resolveSessionProjectRoot()}。
+ * （计数 mock）→ 反射调用 private {@code resolveSessionProjectRoot(String projectRootOverride)}。
+ *
+ * <p><b>[批 1 · 方向 C 改锚]</b> 方法签名从无参改为单显式参数（= {@code RunRequest.boundProject()}
+ * 直传的项目锚）：原「调用方 {@code setCronProjectRootOverride} 写实例字段 → 消费端读字段并在
+ * 同一线程写 AutoMemPaths ThreadLocal」的隐式通道已删，改为值随参数进入。本节两个 cron 用例的
+ * 断言目标（workspaceDir / AutoMemPaths / 不冻结 SessionProjectRoot）原样保留，仅载体改锚。
  */
 @DisplayName("[IMP-A F1] resolveSessionProjectRoot 会话级冻结：首 run 冻结、会话内不重查 DB")
 class LlmAgentLoopSessionProjectRootFreezeTest {
@@ -50,10 +55,22 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         AutoMemPaths.resetCurrentProjectRoot();
     }
 
-    private static void invokeResolve(LlmAgentLoop loop) throws Exception {
-        Method m = LlmAgentLoop.class.getDeclaredMethod("resolveSessionProjectRoot");
+    /**
+     * 反射调 {@code resolveSessionProjectRoot(String projectRootOverride)}。
+     *
+     * <p>[批 1 · 方向 C] 方法签名从无参改为<b>单显式参数</b>（run 携带的项目锚，
+     * {@code RunRequest.boundProject()} 直传）：原「无参 + 实例字段 cronProjectRootOverride」
+     * 的 ThreadLocal 通道已删。锚 = null 复现无锚路径（普通会话 / SESSION fire）。
+     */
+    private static void invokeResolve(LlmAgentLoop loop, String projectRootOverride) throws Exception {
+        Method m = LlmAgentLoop.class.getDeclaredMethod("resolveSessionProjectRoot", String.class);
         m.setAccessible(true);
-        m.invoke(loop);
+        m.invoke(loop, projectRootOverride);
+    }
+
+    /** 无锚调用（普通会话 / SESSION fire 形态）。 */
+    private static void invokeResolve(LlmAgentLoop loop) throws Exception {
+        invokeResolve(loop, null);
     }
 
     @Test
@@ -170,45 +187,49 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         assertThat(SessionProjectRoot.getForSession(SESSION_ID)).isNull();
     }
 
-    // ============ 批次乙 cron-mem: DURABLE cron 项目身份 override（boundProject 整体注入） ============
+    // ====== [批 1 方向 C] DURABLE cron 项目锚：显式参数传值（原 ThreadLocal 通道已删） ======
 
     @Test
-    @DisplayName("批次乙 cron-mem: cronProjectRootOverride（DURABLE 项目身份）→ streamSessionId=null 空守卫也注入 boundProject，不冻结 SessionProjectRoot")
-    void cronProjectRootOverride_injectsBeforeNullGuard_withoutFreeze() throws Exception {
+    @DisplayName("[批 1 方向 C] 显式项目锚（DURABLE 项目身份）→ streamSessionId=null 空守卫也注入锚值，不冻结 SessionProjectRoot")
+    void explicitProjectAnchor_injectsBeforeNullGuard_withoutFreeze() throws Exception {
         // WHY（规则九）: CC durable cron fire 把 prompt 塞回创建会话命令队列（useScheduledTasks.ts:71-82
         // enqueueForLead，不新建会话/无全局会话）→ 该回合 memory 归属创建项目 projectRoot git root
         // （cronTasks.ts:74-83 文件位置锚 → paths.ts:223-235 getAutoMemPath）。DURABLE cron 的
-        // streamSessionId 恒 null → 旧 resolveSessionProjectRoot 在 null 守卫提前 return → memory/
-        // workspaceDir 落 CLAUDE_PROJECT_DIR env ?? config-home（全局，偏离 CC）。override 检查必须
-        // 放在 null 守卫【之前】→ workspaceDir + AutoMemPaths ThreadLocal 同时锚 boundProject；
-        // 不冻结 SessionProjectRoot（GLOBAL_SESSION_UUID 是所有 DURABLE 任务的共享兜底键，
-        // 冻结会造成跨项目 memory 污染）。RED: 删除 override 首行检查 → 本测试在 streamSessionId=null
-        // 下恒走空守卫 return，workspaceDir/ThreadLocal 断言变红。
+        // streamSessionId 可为 null（创建会话已关 → headless）→ 若锚检查放在 null 守卫【之后】，
+        // 守卫会永远提前 return → memory/workspaceDir 落 CLAUDE_PROJECT_DIR env ?? config-home
+        // （全局，偏离 CC）。锚检查必须在 null 守卫【之前】→ workspaceDir + AutoMemPaths 同时锚
+        // 显式锚值；不冻结 SessionProjectRoot（GLOBAL_SESSION_UUID 是所有 DURABLE 任务的共享兜底键，
+        // 冻结会造成跨项目 memory 污染）。
+        //
+        // [批 1 改锚] 载体从「实例字段 setCronProjectRootOverride（消费端写 ThreadLocal）」换成
+        // 「方法显式参数 projectRootOverride（= RunRequest.boundProject 直传，对齐 CC 把 cwd 作为值
+        // 带在队列命令上 useScheduledTasks.ts:52/:110）」。
+        // RED（反向实验 · 有鉴别力）: 实现退回旧通道（忽略入参、改读实例字段）⇒ 本测试入参传锚
+        // 而无实例字段 → 走 null 守卫 return → workspaceDir/AutoMemPaths 断言变红。
         Path real = Files.createDirectories(tempDir.resolve("proj-cron")).toRealPath();
         LlmAgentLoop loop = new LlmAgentLoop(Mockito.mock(LlmProviderFactory.class));
-        // 不 setStreamContext → streamSessionId=null（DURABLE cron 形态）
-        loop.setCronProjectRootOverride(tempDir.resolve("proj-cron").toString());
+        // 不 setStreamContext → streamSessionId=null（headless DURABLE 形态）
 
-        invokeResolve(loop);
+        invokeResolve(loop, tempDir.resolve("proj-cron").toString());   // 显式锚 = RunRequest.boundProject
 
         assertThat(loop.workspaceDir())
-            .as("override 非空 → workspaceDir 锚 boundProject（realpath 归一，对齐 :7349-7350 注入点）")
+            .as("显式锚非空 → workspaceDir 锚该值（realpath 归一）")
             .isEqualTo(real);
         assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("override 非空 → memory ThreadLocal 锚 boundProject（AutoMemPaths 落 projects/<gitRoot>/memory）")
+            .as("显式锚非空 → memory 项目根锚该值（AutoMemPaths 落 projects/<gitRoot>/memory）")
             .isEqualTo(real.toString());
         assertThat(SessionProjectRoot.getForSession(SESSION_ID))
-            .as("override 路径不得冻结 SessionProjectRoot（GLOBAL 兜底键防跨任务污染）")
+            .as("显式锚路径不得冻结 SessionProjectRoot（GLOBAL 兜底键防跨任务污染）")
             .isNull();
     }
 
     @Test
-    @DisplayName("批次乙 cron-mem: override 未置（SESSION/普通路径）→ 既有会话解析不变（resolver 仍被调用、照常冻结）")
-    void noOverride_sessionPathUnchanged() throws Exception {
-        // WHY（规则九）: override 默认 null → 不得触碰 SESSION 路径。cron-mem 批次只对 DURABLE
-        // boundProject 非空时注入（ScheduleService 仅 DURABLE 存 bound_project 列）；SESSION fire /
-        // 普通会话 run 必须保持既有 streamSessionId 解析（resolver 调用 / 冻结）零变化。RED: 若 override
-        // 检查误放错位置（如意外短路 session 分支）→ resolver 计数/冻结断言变红。
+    @DisplayName("[批 1 方向 C] 无显式锚（SESSION/普通路径）→ 既有会话解析不变（resolver 仍被调用、照常冻结）")
+    void noAnchor_sessionPathUnchanged() throws Exception {
+        // WHY（规则九）: 显式锚参数 null → 不得触碰 SESSION 路径。DURABLE 才携带 boundProject
+        // （ScheduleService 仅 DURABLE 存 bound_project 列，且 SESSION fire 的 boundProject 恒 null）；
+        // SESSION fire / 普通会话 run 必须保持既有 streamSessionId 解析（resolver 调用 / 冻结）零变化。
+        // RED: 若锚检查误放错位置（如意外短路 session 分支）→ resolver 计数/冻结断言变红。
         Path real = Files.createDirectories(tempDir.resolve("proj-session")).toRealPath();
         AtomicInteger resolverCalls = new AtomicInteger();
         LlmAgentLoop loop = new LlmAgentLoop(Mockito.mock(LlmProviderFactory.class));
@@ -235,24 +256,24 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
     // ============ [cron-durable-session-fire] DURABLE fire 归创建会话（去 per-task 虚拟键） ============
 
     @Test
-    @DisplayName("cronProjectRootOverride 只锚 workspaceDir/memory；transcript 纯 sessionId 解析归创建会话（无 override 残留）")
-    void cronProjectRootOverride_setsWorkspaceDir_transcriptResolvesBySessionId() throws Exception {
-        // WHY（规则九 · 测试验证意图）: DURABLE fire 项目身份注入（cronProjectRootOverride）只锚
-        // workspaceDir + AutoMemPaths（批次乙 cron-mem）；transcript 键由 RunRequest.sessionId
-        // （CronIdleExecutor 存活判定后传创建会话 UUID）经 SessionStorage 纯 sessionId 解析 →
-        // {boundProject}/{创建会话UUID}.jsonl。已删 per-task 虚拟键 override companion ——
-        // RED: 若残留 override 注入，transcript 落虚拟键文件而非创建会话文件 → 变红。
+    @DisplayName("[批 1 方向 C] 显式项目锚只锚 workspaceDir/memory；transcript 纯 sessionId 解析归创建会话（锚不落入 transcript 键）")
+    void explicitProjectAnchor_setsWorkspaceDir_transcriptResolvesBySessionId() throws Exception {
+        // WHY（规则九 · 测试验证意图）: 显式项目锚（RunRequest.boundProject → 本方法入参）只锚
+        // workspaceDir + AutoMemPaths 项目身份；transcript 键由 RunRequest.sessionId
+        // （CronIdleExecutor 存活判定后传创建会话 key）经 SessionStorage 纯 sessionId 解析 →
+        // {configHome}/projects/{slug}/{创建会话UUID}.jsonl。已删 per-task 虚拟键 companion ——
+        // RED: 若锚值被当作 transcript 键（或残留 per-task override），transcript 落虚拟键文件
+        // 而非创建会话文件 → 变红。
         Path real = Files.createDirectories(tempDir.resolve("proj-durable-s")).toRealPath();
         String creatingSessionUuid =
             com.nexusai.common.SessionKeys.canonicalUuid("sess-1234abcd").toString();
         LlmAgentLoop loop = new LlmAgentLoop(Mockito.mock(LlmProviderFactory.class));
-        // 不 setStreamContext → streamSessionId=null（DURABLE cron 形态）
-        loop.setCronProjectRootOverride(tempDir.resolve("proj-durable-s").toString());
+        // 不 setStreamContext → streamSessionId=null（headless DURABLE 形态）
 
-        invokeResolve(loop);
+        invokeResolve(loop, tempDir.resolve("proj-durable-s").toString());   // 显式锚 = RunRequest.boundProject
 
         assertThat(loop.workspaceDir())
-            .as("cronProjectRootOverride → workspaceDir 锚 boundProject（项目身份注入）")
+            .as("显式项目锚 → workspaceDir 锚该值（项目身份注入）")
             .isEqualTo(real);
         // 消费方统一底层 = SessionStorage.getTranscriptPath（SessionMemoryService:1365 /
         // CompactConversation:970 / PartialCompactConversation:670 / CommandHookExecutor:1921）

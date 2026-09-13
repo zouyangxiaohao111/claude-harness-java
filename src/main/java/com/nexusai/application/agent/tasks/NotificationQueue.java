@@ -106,9 +106,12 @@ public class NotificationQueue {
      *                          cronTasks.ts:74-83，队列跨线程无需传；Java 全局单表须显式落列 V23，
      *                          fire 时经 QueueItem 透传）— DURABLE 任务创建会话绑定项目
      *                          （ScheduleDto.boundProject，SESSION/无会话 null），队列跨线程边界 MDC
-     *                          不可传，消费线程（CronIdleExecutor.runOneAgentLoop）据此把项目上下文
-     *                          注入执行线程（CwdResolution.runWithCwdOverride），使 CwdResolution.getCwd
-     *                          解析到创建项目而非 user.dir（对齐 CC durable 文件位置锚项目语义）。
+     *                          不可传，消费线程（CronIdleExecutor.runOneAgentLoop）据此把项目锚
+     *                          <b>作为值显式挂到 RunRequest</b>（RunRequest.withBoundProject → LlmAgentLoop
+     *                          的 resolveSessionProjectRoot / base TUC effectiveCwd；[批 1 方向 C]
+     *                          原 CwdResolution.runWithCwdOverride ThreadLocal 通道已删，派生线程读不到），
+     *                          解析到创建项目而非 user.dir（对齐 CC durable 文件位置锚项目语义 +
+     *                          CC 把 cwd 作为值带在队列命令上 useScheduledTasks.ts:52/:110）。
      *                          [cron-durable-session-fire] 同时作 drain 判别符：boundProject!=null =
      *                          DURABLE（创建会话已关也照常 fire），null = SESSION（必须会话存活）。
      *                          null = 无项目锚（SESSION 走 sessionId 恢复路径 / DURABLE 无会话直建），

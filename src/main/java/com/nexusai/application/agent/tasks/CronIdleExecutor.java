@@ -3,7 +3,6 @@ package com.nexusai.application.agent.tasks;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.RunRequest;
-import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.query.QueryConfig;
 import com.nexusai.application.agent.query.TokenBudgetChecker;
@@ -670,15 +669,21 @@ public class CronIdleExecutor {
      * （对齐 CC 单进程 ambient：任务即属创建会话）。SESSION scope cron 恢复 sessionId 时 log.info
      * 中文记录（日志自动带 [sessionId=...] 前缀）；DURABLE/无 sessionId 回落 GLOBAL（现状）。
      *
-     * <p><b>[批次X Q2]</b>（DURABLE 项目锚恢复 · 对齐 CC durable 文件位置锚项目）：SESSION 任务
-     * 走 {@code cmd.sessionId()} 恢复（会话仍存活才可命中 boundProject）；DURABLE 任务锚从
+     * <p><b>[批次X Q2 + 批 1 · 方向 C]</b>（DURABLE 项目锚 · 对齐 CC durable 文件位置锚项目）：
+     * SESSION 任务走 {@code cmd.sessionId()} 恢复（会话仍存活才可命中 boundProject）；DURABLE 任务锚从
      * {@code cmd.boundProject()}（V23 bound_project 列，TestJob fire 经 QueueItem 透传）取 ——
-     * 非空时用 {@link CwdResolution#runWithCwdOverride} 注入执行线程 cwd override（对齐 CC
-     * cwd.ts:12-14 runWithCwdOverride / AsyncLocalStorage 语义），使 {@code CwdResolution.getCwd}
-     * 四层解析（override→sessionCwd→boundProject→user.dir）直接命中 override 层解析到创建项目
-     * 而非 user.dir。无会话直建 DURABLE（boundProject=null）→ 兜底 user.dir（已知差异：CC 所有
-     * durable 任务都在会话里创建）。两路径清晰分离：SESSION 走 sessionId 恢复（MDC/boundProject 层），
-     * DURABLE 走 boundProject 列注入（override 层）。
+     * <b>[批 1]</b> 非空时经 {@link RunRequest#withBoundProject(String)} 挂到本 run 的
+     * {@link RunRequest} 上（<b>显式值传参</b>：对齐 CC 把 cwd 作为值带在队列命令上
+     * useScheduledTasks.ts:52/:110 {@code currentDir: getCwd()}；CC 的
+     * {@code utils/cwd.ts:4} AsyncLocalStorage 在 cron 路径零调用），
+     * {@code LlmAgentLoop} 从 {@code RunRequest.boundProject()} 取出 → workspaceDir + memory 项目身份
+     * + base TUC {@code effectiveCwd}（本回合 cwd）。
+     * <b>原两条 ThreadLocal 通道已删</b>（① {@code CwdResolution.runWithCwdOverride}；
+     * ② {@code LlmAgentLoop.setCronProjectRootOverride}）—— 派生线程读不到 ThreadLocal 会静默落
+     * user.dir（正是用户 2026-09-13 裁定的失效模式）。
+     * 无项目锚的形态有两类，缺值语义按用户裁定 1 分离：无锚且无 sessionId（全局 cron / 无会话直建
+     * DURABLE）→ 项目根无处解析、回落 user.dir/configHome ⇒ <b>WARN</b> 留痕；无锚但有 sessionId
+     * （SESSION fire）→ 项目根由 sessionId 解析（值未缺失，未跳过）⇒ INFO。
      *
      * <p><b>[cron-durable-session-fire]</b>（DURABLE fire 归创建会话 · 去 per-task 虚拟键）：
      * DURABLE 命令现在携带创建会话 sessionId（CronCreateTool DURABLE 分支存创建会话），
@@ -867,6 +872,29 @@ public class CronIdleExecutor {
                     cmd.mode(), promptValue.length(), modelName, sessionUuid,
                     cmd.attachments() == null ? 0 : cmd.attachments().size());
             }
+            // [批 1 · 方向 C] DURABLE 项目锚显式传参（QueueItem.boundProject → RunRequest.boundProject）：
+            //   本 run 的 cwd / memory 项目身份由【值】承载、跨线程可见，替代原两条 ThreadLocal 通道
+            //   （CwdResolution.runWithCwdOverride + LlmAgentLoop.setCronProjectRootOverride）。
+            //   缺值语义（用户 2026-09-13 裁定 1）：
+            //     (a) 本该有却没有 ⇒ 不适用（DURABLE 无项目锚是本仓已知合法形态）；
+            //     (b) 本路径不需要 ⇒ 可跳过，但必须 ≥ WARN 可观测（⛔ 不得只 DEBUG）——
+            //         「无锚且无 sessionId」（全局 cron / 无会话直建 DURABLE）时项目根无处可解析，
+            //         回落 user.dir/configHome，故 WARN；「无锚但有 sessionId」（SESSION fire）
+            //         项目根由 sessionId 解析（值不缺失，未被跳过）→ INFO 留痕即可。
+            if (boundProject != null && !boundProject.isBlank()) {
+                req = req.withBoundProject(boundProject);
+                log.info("CronIdleExecutor: 显式项目锚已挂载 RunRequest boundProject={} "
+                        + "mode={} sessionId={}（批 1 方向 C：替代 runWithCwdOverride / cronProjectRootOverride "
+                        + "两条 ThreadLocal 通道，对齐 CC 值随队列命令直传）",
+                    boundProject, cmd.mode(), sessionId);
+            } else if (sessionId == null || sessionId.isBlank()) {
+                log.warn("CronIdleExecutor: 本 run 无项目锚（QueueItem.boundProject 空）且无 sessionId"
+                        + "→ cwd/memory 项目根无处可解析，回落 user.dir/configHome（合法 (b) 类跳过，"
+                        + "但必须可观测：mode={} workload={}）", cmd.mode(), cmd.workload());
+            } else {
+                log.info("CronIdleExecutor: 本 run 无显式项目锚（QueueItem.boundProject 空）→ 项目根由 sessionId 解析"
+                        + "（session={} mode={}，值未缺失，非跳过）", sessionId, cmd.mode());
+            }
             // [queue-first B3] 真实会话命令 → 注入 streamContext（镜像 ChatService.processUserMessage
             //   setStreamContext：wsTemplate + sessionId + userMessageId），否则助手回复不推 STOMP 前端收不到。
             //   「真实会话」判定 = sessionUuid（与下方 replayAndPersist :640 同源）：非 null 非 GLOBAL 才推流
@@ -896,27 +924,16 @@ public class CronIdleExecutor {
                         sessionUuid, cmd.uuid(), cmd.mode());
                 }
             }
-            // 批次X Q2: DURABLE 任务有 boundProject 锚 → runWithCwdOverride 注入执行线程 cwd override
-            // （对齐 CC cwd.ts:12-14），CwdResolution.getCwd 四层解析命中 override 层解析到创建项目；
-            // 无锚（null/空白）→ 直接 run 兜底 user.dir（现状不变）。
-            // 批次乙（cron-mem）: 同分支把 boundProject 作为该回合【项目身份】整体注入 loop
-            // （per-run override → resolveSessionProjectRoot 首行命中 → workspaceDir + AutoMemPaths
-            // ThreadLocal 同时锚 boundProject，对齐 CC fire 回合 projectRoot=创建项目 memory 归属
-            // useScheduledTasks.ts:71-82 + paths.ts:223-235）——补齐批次X 仅对齐 cwd 的 memory 缺口。
+            // [批 1 · 方向 C] 项目锚（boundProject）已在 req 上显式挂载（见上方 withBoundProject），
+            //   本处直接 run —— 不再经 ThreadLocal 通道注入执行线程：
+            //   原两条通道已删：① CwdResolution.runWithCwdOverride（ThreadLocal CURRENT_OVERRIDE，
+            //   派生线程读不到 → 工具链落 user.dir 的静默错值）；② loop.setCronProjectRootOverride
+            //   （实例字段 + Consumption 端写 AutoMemPaths ThreadLocal）。现 lane：值在 req 上
+            //   → resolveSessionProjectRoot(boundProject) → workspaceDir + base TUC effectiveCwd。
             // [cron-complete 修复] 本轮耗时锚点（publishCompleteEvent duration_ms 装配用 · 与
             //   ChatService.processUserMessage :330 同款 turn 墙钟近似）。
             long turnStartMs = System.currentTimeMillis();
-            AgentState runState;
-            if (boundProject != null && !boundProject.isBlank()) {
-                log.info("CronIdleExecutor: 恢复 DURABLE cron 项目上下文 boundProject={} "
-                        + "（批次X Q2：对齐 CC durable 文件位置锚项目 cronTasks.ts:74-83，"
-                        + "CwdResolution 解析到创建项目而非 user.dir；批次乙 cron-mem："
-                        + "memory/workspaceDir 项目身份注入）", boundProject);
-                loop.setCronProjectRootOverride(boundProject);
-                runState = CwdResolution.runWithCwdOverride(boundProject, () -> loop.run(req));
-            } else {
-                runState = loop.run(req);
-            }
+            AgentState runState = loop.run(req);
             // [cron-fire-visible · 目标2 实时化 2026-09-03] cron 触发结果落库 · 对齐 CC onFireTask
             //   （useScheduledTasks.ts:110-113）：run 全程由实时落库 appendListener 逐条落 DB（run 前已武装
             //   SPI，见上），此处仅收口：runState 非 null → 解除 appendListener（防泄漏）+ 推 message.complete。
@@ -979,9 +996,9 @@ public class CronIdleExecutor {
         } finally {
             RequestContext.clear();
             AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
-            // 批次乙 cron-mem: 清空 per-run 项目身份 override（防线程池复用串台，同 prevProjectRoot
-            // capture/restore 模式；prototype 实例本随 fire 丢弃，显式清空双保险）
-            loop.clearCronProjectRootOverride();
+            // [批 1 · 方向 C] 原 finally 的 loop.clearCronProjectRootOverride()（per-run 项目身份
+            //   override 清空）随该实例字段一并删除：项目锚改由 RunRequest 承载（req 随本 fire
+            //   局部变量丢弃 → 无线程池串台面，无需清空装置）。
         }
     }
 

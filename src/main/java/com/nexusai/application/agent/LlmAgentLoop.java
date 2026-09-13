@@ -2397,8 +2397,10 @@ public class LlmAgentLoop implements AgentLoop {
         Integer maxTurns = params.maxTurns();
 
         // ODF-A1: 会话级 projectRoot 注入（对齐 CC 启动冻结）· 必须在 workspaceDir 首次使用前
-        //   （SessionStorage/FileChangedWatcher/auto-dream）解析
-        resolveSessionProjectRoot();
+        //   （SessionStorage/FileChangedWatcher/auto-dream）解析。
+        // [批 1 · 方向 C] 项目根来源显式化：run 携带的项目锚（cron DURABLE fire）从
+        //   RunRequest.boundProject 直传，不再读实例字段、不再经 ThreadLocal 通道。
+        resolveSessionProjectRoot(params.boundProject());
 
         // [P4-4 tracking 生命周期对齐 CC] 旧的 run() 入口 `autoCompactor.reset()`（S-7 补丁）已删：
         //   它作用在 AutoCompactor 单例 bean 的实例字段上，只能把"单会话串行"时序对齐 CC 的
@@ -3155,7 +3157,13 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
         }
-        ToolUseContext baseTuc = buildBaseToolUseContext(state, initialModeInput, initialModeConfig);
+        // [批 1 · 方向 C] 显式项目锚 → 本回合 cwd 快照（直传，替代已从 cron 路径删除的
+        //   CwdResolution.runWithCwdOverride ThreadLocal 通道）：锚存在时 base TUC 的
+        //   effectiveCwd 直接用该锚（跨线程可见的「值」，ThreadLocal 在派生线程读不到）；
+        //   无锚 → null → 构造器 CwdResolution 兜底（会话 cwd 层优先语义不变）。
+        java.nio.file.Path runExplicitCwd =
+            (params.boundProject() != null && !params.boundProject().isBlank()) ? this.workspaceDir : null;
+        ToolUseContext baseTuc = buildBaseToolUseContext(state, initialModeInput, initialModeConfig, runExplicitCwd);
         com.nexusai.application.agent.loop.AgentLoopContext mainCtx;
         if (contextFactory != null) {
             // [P3-③] 生产：factory.forSession 构造 ctx + 会话级可变状态（实例引用共享）+ override 事件通道
@@ -9533,7 +9541,8 @@ public class LlmAgentLoop implements AgentLoop {
     private ToolUseContext buildBaseToolUseContext(AgentState state) {
         return buildBaseToolUseContext(state,
             InitialPermissionModeResolver.Input.empty(),
-            InitialPermissionModeResolver.Config.defaults());
+            InitialPermissionModeResolver.Config.defaults(),
+            null);
     }
 
     /**
@@ -9547,7 +9556,8 @@ public class LlmAgentLoop implements AgentLoop {
      */
     private ToolUseContext buildBaseToolUseContext(AgentState state,
             InitialPermissionModeResolver.Input initialModeInput,
-            InitialPermissionModeResolver.Config initialModeConfig) {
+            InitialPermissionModeResolver.Config initialModeConfig,
+            java.nio.file.Path runExplicitCwd) {
         if (state.sessionId() == null) {
             return null;
         }
@@ -9601,7 +9611,12 @@ public class LlmAgentLoop implements AgentLoop {
             permCtx, mode,
             buildMcpClients(), nonInteractiveSession,
             state.systemPrompt() != null ? state.systemPrompt() : "",
-            null, null, null,
+            // [批 1 · 方向 C] effectiveCwd 显式传参：run 携带项目锚（cron DURABLE fire）时
+            //   用该锚作本回合 cwd 快照（跨线程可见的「值」）；无锚 → null → 构造器既有
+            //   CwdResolution.getCwd(sessionId) 兜底（override ?? sessionCwd ?? boundProject
+            //   ?? user.dir，对齐 CC getCwd；worktree/bash cd 语义不变）。
+            runExplicitCwd,
+            null, null,
             this.onCompactProgress,
             // [Stage 3.2 C2] 4 callback · 注入当前 LlmAgentLoop 实例引用
             (java.util.function.Function<java.util.Map<String, Object>, java.util.Map<String, Object>>)
@@ -10800,27 +10815,6 @@ public class LlmAgentLoop implements AgentLoop {
     private java.nio.file.Path workspaceDir;
 
     /**
-     * DURABLE cron 回合项目身份 override · 对齐 CC fire 回合 projectRoot=创建项目。
-     *
-     * <p><b>批次乙（cron-mem）</b>：CC durable cron fire 把 prompt 塞回<b>创建会话</b>的命令队列
-     * （useScheduledTasks.ts:71-82 enqueueForLead，不新建会话/无全局会话），该回合的 memory /
-     * workspaceDir 全部归属创建会话的 projectRoot（cronTasks.ts:74-83 文件位置锚项目 →
-     * paths.ts:223-235 getAutoMemPath = projectRoot git root）。Java 的 DURABLE cron 是全局
-     * 孤儿线程（创建会话可能已结束、streamSessionId 恒 null），批次X 已用
-     * {@code CwdResolution.runWithCwdOverride(boundProject)} 对齐 cwd；本 override 补齐
-     * <b>memory/workspaceDir</b>：{@link #resolveSessionProjectRoot()} 首行命中 → workspaceDir +
-     * AutoMemPaths ThreadLocal 同时锚到 boundProject（不落 CLAUDE_PROJECT_DIR env ?? config-home 全局）。
-     *
-     * <p>线程安全：本类为 @Scope("prototype")（:182-183），每次 cron fire 由
-     * {@code loopProvider.getObject()} 拿<b>全新实例</b> → per-run 字段实例级隔离，无跨任务污染
-     * /无并发串台；CronIdleExecutor 仍 finally 显式清空（双保险，对齐 prevProjectRoot
-     * capture/restore 模式）。
-     *
-     * <p>null（默认）= 不注入 → 走既有 streamSessionId 解析（SESSION 路径零改动）。
-     */
-    private String cronProjectRootOverride;
-
-    /**
      * 会话 projectRoot 解析器 · ODF-A1 per-session 注入 seam。
      *
      * <p>入参为会话 DB 主键字符串（{@code "sess-..."}，对应 LlmAgentLoop.streamSessionId）；
@@ -10839,26 +10833,6 @@ public class LlmAgentLoop implements AgentLoop {
     /** 测试钩子：覆盖 workspaceDir. */
     public void setWorkspaceDir(java.nio.file.Path dir) {
         this.workspaceDir = dir;
-    }
-
-    /**
-     * 注入 DURABLE cron 回合项目身份（per-run override · 批次乙 cron-mem）。
-     *
-     * <p>仅在 {@code CronIdleExecutor} 对 DURABLE（boundProject 非空）任务 run() 前调用；
-     * null/空白（SESSION 或普通会话路径）→ 不注入，走既有 streamSessionId 解析。
-     */
-    public void setCronProjectRootOverride(String projectRoot) {
-        this.cronProjectRootOverride = projectRoot;
-    }
-
-    /**
-     * 清空 per-run override（CronIdleExecutor finally 调用）。
-     *
-     * <p>prototype 实例本随 fire 丢弃；显式清空防共享池复用串台（双保险，同 prevProjectRoot
-     * capture/restore 模式 CronIdleExecutor:349/:383）。
-     */
-    public void clearCronProjectRootOverride() {
-        this.cronProjectRootOverride = null;
     }
 
     /** 暴露 currentWorkspaceDir 给 subagent fork (测试用). */
@@ -10939,24 +10913,32 @@ public class LlmAgentLoop implements AgentLoop {
         return true;
     }
 
-    private void resolveSessionProjectRoot() {
-        // [批次乙 cron-mem] DURABLE cron 回合项目身份整体注入（对齐 CC fire 回合
-        // projectRoot=创建项目 cronTasks.ts:74-83 + paths.ts:223-235）——必须放在函数体首行、
-        // streamSessionId null 守卫（:7339-7343）【之前】。cron 路径 streamSessionId 恒 null，
-        // 若放在守卫之后守卫会永远提前 return、override 永久失效。命中 → workspaceDir +
-        // AutoMemPaths ThreadLocal 同时锚 boundProject，直接 return（不查 session、不冻结
-        // SessionProjectRoot —— GLOBAL_SESSION_UUID 是所有 DURABLE 任务的共享兜底键，
-        // 冻结会造成跨项目 memory 污染）。
-        if (cronProjectRootOverride != null && !cronProjectRootOverride.isBlank()) {
-            String normalized = normalizeSessionProjectRoot(cronProjectRootOverride);
+    /**
+     * 会话/回合 projectRoot 单点解析 · run() 入口调用（{@code doRun} 首段）。
+     *
+     * @param projectRootOverride [批 1 · 方向 C] <b>显式项目锚</b>（该 run 携带的项目根，
+     *        非会话键）—— 唯一生产来源 = {@code RunRequest.boundProject()}（CronIdleExecutor
+     *        的 DURABLE cron fire 把 {@code QueueItem.boundProject()} 挂上）。<b>不再</b>从
+     *        实例字段读、<b>不再</b>由调用方写入任何 ThreadLocal 通道
+     *        （原 {@code CwdResolution.runWithCwdOverride} 已从 cron 路径删除）。
+     *        null/空白 = 无显式锚 → 走既有 streamSessionId 会话解析。
+     */
+    private void resolveSessionProjectRoot(String projectRootOverride) {
+        // [批 1 · 方向 C] 显式项目锚整体注入（对齐 CC fire 回合 projectRoot=创建项目
+        // cronTasks.ts:74-83 + paths.ts:223-235）——必须放在函数体首行、streamSessionId null
+        // 守卫【之前】：cron 路径 streamSessionId 可为 null（创建会话已关 → headless），若放在
+        // 守卫之后守卫会永远提前 return、锚永久失效。命中 → workspaceDir + AutoMemPaths
+        // 同时锚 boundProject，直接 return（不查 session、不冻结 SessionProjectRoot ——
+        // GLOBAL_SESSION_UUID 是所有 DURABLE 任务的共享兜底键，冻结会造成跨项目 memory 污染）。
+        if (projectRootOverride != null && !projectRootOverride.isBlank()) {
+            String normalized = normalizeSessionProjectRoot(projectRootOverride);
             this.workspaceDir = java.nio.file.Path.of(normalized);
             com.nexusai.application.agent.memory.AutoMemPaths.setCurrentProjectRoot(normalized);
-            // [cron-durable-session-fire] 已删 per-task 虚拟会话键 override companion（SessionStorage
-            // ThreadLocal override 机制已删）：transcript 键 = RunRequest.sessionId（CronIdleExecutor
-            // 创建会话存活判定后传创建会话 UUID → 归创建会话文件；已关 → null → 不写 transcript），
-            // 本 override 仅承担项目身份注入（批次乙 cron-mem），不再触碰 transcript 键。
-            log.info("[LlmAgentLoop] DURABLE cron projectRoot 注入（对齐 CC fire 回合 "
-                    + "projectRoot=创建项目）: projectRoot={}", normalized);
+            // [cron-durable-session-fire] transcript 键 = RunRequest.sessionId（CronIdleExecutor
+            // 创建会话存活判定后传创建会话 key → 归创建会话文件；已关 → null → 不写 transcript），
+            // 本锚仅承担项目身份注入，不触碰 transcript 键。
+            log.info("[LlmAgentLoop] 显式项目锚 projectRoot 注入（对齐 CC fire 回合 "
+                    + "projectRoot=创建项目 · RunRequest.boundProject 直传）: projectRoot={}", normalized);
             return;
         }
         String sessionIdStr = streamSessionId;

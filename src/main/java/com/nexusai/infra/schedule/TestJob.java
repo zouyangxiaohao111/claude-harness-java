@@ -344,8 +344,9 @@ public class TestJob implements Job {
      * （ScheduleDto.boundProject，DB bound_project 列 V23；SESSION scope / 无会话直建为 null）
      * 写入 {@code QueueItem.boundProject}。对齐 CC durable 任务的项目锚=文件位置
      * （cronTasks.ts:74-83，一个项目一个文件）；Java 全局单表跨线程边界必须随队列项存活，
-     * 消费线程（CronIdleExecutor.runOneAgentLoop）据此把项目上下文注入执行线程
-     * （CwdResolution.runWithCwdOverride），使 CwdResolution.getCwd 解析到创建项目而非 user.dir。
+     * 消费线程（CronIdleExecutor.runOneAgentLoop）据此把项目锚作为<b>值</b>显式挂到 RunRequest
+     * （[批 1 方向 C]：原 CwdResolution.runWithCwdOverride ThreadLocal 通道已删，派生线程读不到），
+     * 使该回合的 workspaceDir / memory / base TUC effectiveCwd 解析到创建项目而非 user.dir。
      *
      * <p><b>[cron-durable-session-fire]</b> {@code sessionId} 透传创建会话 id（SESSION scope 非空 /
      * DURABLE scope 创建于会话也非空，CronCreateTool DURABLE 分支存创建会话）：CC durable fire 归

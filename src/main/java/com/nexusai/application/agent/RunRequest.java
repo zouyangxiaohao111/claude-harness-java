@@ -16,7 +16,7 @@ import java.util.UUID;
  *   <li><b>Session 元数据</b>：{@link #sessionId} / {@link #agentId}（null = 主线程 / 权限系统不可用）</li>
  *   <li><b>可选</b>：{@link #systemPrompt} / {@link #appendSystemPrompt} / {@link #maxTurns} /
  *       {@link #taskBudget} / {@link #fallbackModel} / {@link #skipCacheWrite} /
- *       {@link #maxOutputTokensOverride} / {@link #attachments}</li>
+ *       {@link #maxOutputTokensOverride} / {@link #attachments} / {@link #boundProject}</li>
  * </ul>
  *
  * <p>[A1 · attachment-multimodal] {@link #attachments} 对齐 CC {@code pastedContents}
@@ -88,7 +88,28 @@ public record RunRequest(
      * 本字段为后续 N-1 条原文（idle 形态、isMeta=false，processTextPrompt.ts:89-94 无前缀）。
      * null/空 = 非批量（行为与现状一致）。
      */
-    List<String> batchUserPrompts
+    List<String> batchUserPrompts,
+    /**
+     * [批 1 · 方向 C] <b>显式项目锚</b>（该回合的项目根，非会话键）· 对齐 CC 把 cwd/项目根
+     * 作为<b>值</b>带在队列命令上（{@code currentDir: getCwd()}，
+     * useScheduledTasks.ts:52/:110 → QueuedCommand），而非经 AsyncLocalStorage 覆盖
+     * （{@code utils/cwd.ts:4} {@code cwdOverrideStorage} 在 CC 的 cron 路径<b>零调用</b>，
+     * 仅 AgentTool.tsx:794 / claudeCodeBackend.ts:239 / resumeAgent.ts:229 三处使用）。
+     *
+     * <p><b>来源链</b>：{@code ScheduleRecord.bound_project}（V23 列）→
+     * {@link com.nexusai.application.agent.tasks.NotificationQueue.QueueItem#boundProject()}
+     * → {@link CronIdleExecutor} 经 {@link #withBoundProject(String)} 挂到本字段 →
+     * {@code LlmAgentLoop.doRun} 显式取出（{@code params.boundProject()}）：
+     * <ul>
+     *   <li>{@code resolveSessionProjectRoot(boundProject)} —— workspaceDir + memory 项目身份；</li>
+     *   <li>base ToolUseContext 的 {@code effectiveCwd} 快照（该回合 cwd）。</li>
+     * </ul>
+     * 全程显式传参：跨线程（tool-exec / hook / 子代理）读的是<b>值</b>，不是 ThreadLocal。
+     *
+     * <p>null/空白 = 本回合不携带项目锚（普通会话 / SESSION fire / 全局 cron）→ 走既有
+     * streamSessionId 会话解析路径（行为与现状一致）。
+     */
+    String boundProject
 ) {
     /**
      * 紧凑构造器：校验 userPrompt / querySource 必传（对齐 CC 运行时检查）。
@@ -102,6 +123,26 @@ public record RunRequest(
         if (querySource == null) {
             throw new IllegalArgumentException("querySource is null");
         }
+    }
+
+    /**
+     * [批 1 · 方向 C] 返回携带显式项目锚的副本（其余字段不变）。
+     *
+     * <p>唯一生产调用方 = {@code CronIdleExecutor.runAgentLoop}（DURABLE cron fire：把
+     * {@link com.nexusai.application.agent.tasks.NotificationQueue.QueueItem#boundProject()}
+     * 挂到本 run 上）。用副本方法而非再加一组工厂重载：本 record 已有 10+ 工厂重载，
+     * 每加一个字段就翻倍增长（「反对架构上不必要的机械」）。
+     *
+     * @param boundProject 项目根绝对路径（null/空白 = 不携带 → 返回 {@code this}）
+     */
+    public RunRequest withBoundProject(String boundProject) {
+        if (boundProject == null || boundProject.isBlank() || boundProject.equals(this.boundProject)) {
+            return this;
+        }
+        return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
+            maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
+            permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
+            boundProject);
     }
 
     // ── [IMP2-10 · MISS-2 · OD-13] taskBudget 生产来源解析 ──
@@ -150,14 +191,14 @@ public record RunRequest(
     /** 最小化测试 helper：userPrompt + modelName + querySource（USER）；taskBudget 可选（null = 无任务预算）。 */
     public static RunRequest forTest(String userPrompt, String modelName, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, null, modelName, QuerySource.USER,
-            null, null, null, null, taskBudget, null, null, null, null, null, false, null, null, null);
+            null, null, null, null, taskBudget, null, null, null, null, null, false, null, null, null, null);
     }
 
     /** [RES-SP31] 测试 helper 重载：额外携带 appendSystemPrompt（验证 RunRequest → AgentState 传递链）。 */
     public static RunRequest forTest(String userPrompt, String modelName, TaskBudget taskBudget,
                                      String appendSystemPrompt) {
         return new RunRequest(userPrompt, null, modelName, QuerySource.USER,
-            null, null, null, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null);
+            null, null, null, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null);
     }
 
     /**
@@ -171,14 +212,14 @@ public record RunRequest(
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            null, null, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null);
+            null, null, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null, null);
     }
 
     /** [RES-SP31] user 工厂重载：额外携带 appendSystemPrompt（VerifyChatController 等主线程 HTTP 入口）。 */
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   String appendSystemPrompt, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            null, null, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null);
+            null, null, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null);
     }
 
     /**
@@ -192,7 +233,7 @@ public record RunRequest(
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   String appendSystemPrompt, String fallbackModel, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            null, null, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null);
+            null, null, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null, null);
     }
 
     /**
@@ -211,7 +252,7 @@ public record RunRequest(
                                   TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             null, null, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null, null);
     }
 
     /**
@@ -235,7 +276,7 @@ public record RunRequest(
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null, null);
     }
 
     /** [RES-SP31] session 工厂重载：额外携带 appendSystemPrompt（ChatService 主会话 HTTP 入口）。 */
@@ -243,7 +284,7 @@ public record RunRequest(
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null);
     }
 
     /**
@@ -258,7 +299,7 @@ public record RunRequest(
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null, null);
     }
 
     /**
@@ -278,7 +319,7 @@ public record RunRequest(
                                      TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null, null);
     }
 
     /**
@@ -296,7 +337,7 @@ public record RunRequest(
                                      TaskBudget taskBudget, JsonNode jsonSchema) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, null, null, null);
     }
 
     // ── [A1 · attachment-multimodal] 附件透传工厂重载 ──
@@ -314,7 +355,7 @@ public record RunRequest(
                                   TaskBudget taskBudget, List<AttachmentRequest> attachments) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             null, null, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, attachments, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, attachments, null, null);
     }
 
     /**
@@ -331,7 +372,7 @@ public record RunRequest(
                                      TaskBudget taskBudget, JsonNode jsonSchema, List<AttachmentRequest> attachments) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, null, null);
     }
 
     /**
@@ -351,7 +392,7 @@ public record RunRequest(
                                      TaskBudget taskBudget, List<AttachmentRequest> attachments) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, null, false, null, attachments, null);
+            appendSystemPrompt, null, false, null, attachments, null, null);
     }
 
     /**
@@ -385,6 +426,6 @@ public record RunRequest(
         List<String> rest = prompts.size() > 1 ? new java.util.ArrayList<>(prompts.subList(1, prompts.size())) : List.of();
         return new RunRequest(prompts.get(0), config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null, null, false,
-            null, null, rest);
+            null, null, rest, null);
     }
 }

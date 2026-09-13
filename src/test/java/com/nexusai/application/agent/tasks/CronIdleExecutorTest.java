@@ -1,5 +1,9 @@
 package com.nexusai.application.agent.tasks;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.RunRequest;
@@ -18,6 +22,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -476,17 +481,26 @@ class CronIdleExecutorTest {
     }
 
     @Test
-    @DisplayName("批次X Q2: DURABLE 任务（sessionId=null + boundProject 锚）→ run 期间 CwdResolution.getCwd 解析到创建项目（非 user.dir）")
-    void runOneAgentLoopPersistentRestoresBoundProjectContext() throws Exception {
+    @DisplayName("[批 1 方向 C] DURABLE 任务（sessionId=null + boundProject 锚）→ 锚随 RunRequest 直传；执行线程无 ThreadLocal cwd 劫持、无残留")
+    void runOneAgentLoopPersistentCarriesAnchorWithoutThreadLocalHijack() throws Exception {
         // WHY（规则九）：CC durable 任务的项目锚=文件位置 <projectRoot>/.claude/scheduled_tasks.json
         // （cronTasks.ts:74-83），一个项目一个文件=项目级作用域；fire 复用已绑定会话 cwd（不重取）。
-        // Java 全局单表把锚显式落 V23 bound_project 列，fire 时经 QueueItem.boundProject 透传，
-        // runOneAgentLoop 用 CwdResolution.runWithCwdOverride（对齐 CC cwd.ts:12-14）注入执行线程
-        // cwd override → CwdResolution.getCwd 四层解析（override→sessionCwd→boundProject→user.dir）
-        // 命中 override 层解析到创建项目。若不加 override，sessionId=null → 回落 user.dir
-        // （跨会话 cwd 错位：项目 A 下创建的 durable cron 重启后 fire 跑在 JVM 启动目录）。
+        // Java 全局单表把锚显式落 V23 bound_project 列，fire 时经 QueueItem.boundProject 透传 ——
+        // 该锚必须作为【值】随 run 命令直传（对齐 CC：cwd 作为值带在队列命令上
+        // useScheduledTasks.ts:52/:110 `currentDir: getCwd()`），消费端 = LlmAgentLoop 从
+        // RunRequest.boundProject 取（→ workspaceDir / memory / base TUC effectiveCwd）。
+        //
+        // [批 1 改锚] 原断言 = run 期间 CwdResolution.getCwd() == boundProject（依赖
+        // CwdResolution.runWithCwdOverride 写的 ThreadLocal CURRENT_OVERRIDE —— 派生线程读不到，
+        // 正是用户 2026-09-13 裁定的失效模式，已从 cron 路径删除）。新断言分两半：
+        //   ① 正向：本 run 携带锚值（显式通道在）；
+        //   ② 反向：执行线程上 CwdResolution.getCwd() 仍是 user.dir（无 cwd ThreadLocal 劫持），
+        //      且 run 结束后仍为 user.dir（无残留 ⇒ cronExecutor 线程池复用不串台）。
+        // RED（反向实验 · 有鉴别力）: 恢复 runWithCwdOverride 包裹 ⇒ ② 变红（run 期间 getCwd 被劫持
+        // 为 boundProject）；删掉 withBoundProject 挂载 ⇒ ① 变红。
         java.nio.file.Path tmp = Files.createTempDirectory("cron-x-persistent");
         String boundProject = CwdResolution.normalizeCwd(tmp.toAbsolutePath().toString());
+        String userDir = CwdResolution.normalizeCwd(System.getProperty("user.dir"));
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
@@ -495,9 +509,11 @@ class CronIdleExecutorTest {
 
         AtomicReference<String> cwdDuringRun = new AtomicReference<>();
         AtomicReference<String> mdcDuringRun = new AtomicReference<>();
+        AtomicReference<String> anchorDuringRun = new AtomicReference<>();
         doAnswer(inv -> {
             cwdDuringRun.set(CwdResolution.getCwd());
             mdcDuringRun.set(RequestContext.sessionId());
+            anchorDuringRun.set(((RunRequest) inv.getArgument(0)).boundProject());
             return null;
         }).when(loop).run(any(RunRequest.class));
 
@@ -507,11 +523,18 @@ class CronIdleExecutorTest {
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        assertThat(cwdDuringRun.get())
-            .as("DURABLE 任务 run 期间 CwdResolution.getCwd 必须解析到创建项目（非 user.dir）")
+        assertThat(anchorDuringRun.get())
+            .as("① DURABLE 任务的项目锚必须显式随 RunRequest 传进 run（值传递，非 ThreadLocal）")
             .isEqualTo(boundProject);
+        assertThat(cwdDuringRun.get())
+            .as("② 执行线程 CwdResolution.getCwd() 必须是 user.dir —— 无 ThreadLocal cwd 劫持"
+                + "（恢复 runWithCwdOverride 会把它变成 boundProject ⇒ 变红）")
+            .isEqualTo(userDir);
+        assertThat(CwdResolution.getCwd())
+            .as("② run 结束后 cwd 无残留（无线程池复用串台）")
+            .isEqualTo(userDir);
         assertThat(mdcDuringRun.get())
-            .as("DURABLE 任务 sessionId=null → MDC 不注入（项目锚走 boundProject override，不走 sessionId）")
+            .as("DURABLE 任务 sessionId=null → MDC 不注入（锚走 RunRequest，不走 sessionId）")
             .isNull();
         assertThat(RequestContext.sessionId())
             .as("finally 清理后 MDC 仍为 null（防 cronExecutor 线程串台）")
@@ -626,15 +649,18 @@ class CronIdleExecutorTest {
 
 
     @Test
-    @DisplayName("批次乙 cron-mem: DURABLE fire（boundProject 锚）→ run 前注入项目身份 override + finally 清空")
-    void runOneAgentLoopPersistentInjectsProjectIdentityOverride() throws Exception {
+    @DisplayName("[批 1 方向 C] DURABLE fire（boundProject 锚）→ 锚显式挂到 RunRequest（不再经实例方法/ThreadLocal）")
+    void runOneAgentLoopPersistentCarriesExplicitProjectAnchor() throws Exception {
         // WHY（规则九）: CC durable cron fire 回合 memory/workspaceDir 归属创建项目（useScheduledTasks.ts:71-82
-        // fire 注入创建会话 + paths.ts:223-235 getAutoMemPath=projectRoot git root）。批次X 只对齐了 cwd
-        // （runWithCwdOverride）；批次乙补 boundProject 作为【项目身份】整体注入 loop（setCronProjectRootOverride
-        // → resolveSessionProjectRoot 首行命中 → workspaceDir + AutoMemPaths ThreadLocal 锚 boundProject，
-        // 不落 CLAUDE_PROJECT_DIR env ?? config-home 全局）。若漏注入，DURABLE fire 的 memory 读全局
-        // （跨项目 memory 错位：项目 A 创建的 durable cron fire 读全局/项目 B 记忆）。顺序断言锁定
-        // 「先注入 override → 再 run → finally 清空」（防线程池复用串台）。
+        // fire 注入创建会话 + paths.ts:223-235 getAutoMemPath=projectRoot git root）。项目根必须
+        // 【作为值随命令直传】（对齐 CC QueuedCommand 上带 currentDir: getCwd()，useScheduledTasks.ts:52/:110
+        // —— CC 的 AsyncLocalStorage 通道在 cron 路径零调用），否则派生线程读不到 ThreadLocal → 静默
+        // 落 user.dir（用户 2026-09-13 裁定：一律显式传参）。若漏挂锚，DURABLE fire 的 cwd/memory 落
+        // 全局（跨项目错位：项目 A 创建的 durable cron fire 读全局/项目 B 记忆）。
+        // [批 1 改锚] 原断言 = inOrder.verify(loop).setCronProjectRootOverride(boundProject) +
+        // clearCronProjectRootOverride()（实例方法通道，已删）；现锚 = RunRequest.boundProject()
+        // （同一次 run 的参数值）—— 断言点从「调用过某方法」改为「run 收到的值」。
+        // RED（反向实验 · 有鉴别力）: 删掉 withBoundProject 挂载 ⇒ captor 值 null ⇒ 变红。
         java.nio.file.Path tmp = Files.createTempDirectory("cron-mem-persistent");
         String boundProject = CwdResolution.normalizeCwd(tmp.toAbsolutePath().toString());
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
@@ -649,21 +675,24 @@ class CronIdleExecutorTest {
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(loop);
-        inOrder.verify(loop).setCronProjectRootOverride(boundProject);
-        inOrder.verify(loop).run(any(RunRequest.class));
-        inOrder.verify(loop).clearCronProjectRootOverride();
+        ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
+        verify(loop).run(captor.capture());
+        assertThat(captor.getValue().boundProject())
+            .as("DURABLE fire → RunRequest.boundProject = QueueItem.boundProject（显式值传递）")
+            .isEqualTo(boundProject);
         Files.deleteIfExists(tmp);
     }
 
     @Test
-    @DisplayName("批次乙 cron-mem: SESSION fire（sessionId 非空、boundProject=null）→ 不注入项目身份 override（SESSION 零改动）")
-    void runOneAgentLoopSessionDoesNotInjectProjectIdentityOverride() throws Exception {
-        // WHY（规则九）: override 仅在 DURABLE boundProject 非空时置（ScheduleService:252-254 仅
+    @DisplayName("[批 1 方向 C] SESSION fire（sessionId 非空、boundProject=null）→ RunRequest 不携带项目锚（SESSION 零改动）")
+    void runOneAgentLoopSessionCarriesNoProjectAnchor() throws Exception {
+        // WHY（规则九）: 项目锚仅在 DURABLE boundProject 非空时挂（ScheduleService:212-214 仅
         // DURABLE 存 bound_project 列，SESSION 任务 boundProject=null）。SESSION fire 走既有
-        // sessionId 恢复路径（MDC/boundProject 层），不得触发 per-run override 注入 —— 否则 SESSION
-        // 路径被 override 劫持，违反批次乙「SESSION 零改动」设计边界。clearCronProjectRootOverride 恒在
-        // finally 执行（防御性清空，prototype 双保险）。
+        // sessionId 恢复路径（session cwd / boundProject 层解析），不得被锚劫持 —— 否则 SESSION
+        // 路径被劫持，违反「SESSION 零改动」设计边界。
+        // [批 1 改锚] 原断言 = verify(loop, never()).setCronProjectRootOverride(any())（该方法已删）；
+        // 现锚 = run 收到的 RunRequest.boundProject() 必须为 null。
+        // RED: 若把锚无条件挂上（不看 boundProject）⇒ 断言变红。
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
@@ -676,17 +705,21 @@ class CronIdleExecutorTest {
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        verify(loop, never()).setCronProjectRootOverride(any());
-        verify(loop).run(any(RunRequest.class));
-        verify(loop).clearCronProjectRootOverride();
+        ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
+        verify(loop).run(captor.capture());
+        assertThat(captor.getValue().boundProject())
+            .as("SESSION fire（boundProject=null）→ RunRequest 不携带项目锚")
+            .isNull();
     }
 
     @Test
-    @DisplayName("批次乙 cron-mem: DURABLE 无会话直建（boundProject=null）→ 不注入 override（兜底 GLOBAL，已知差异零回归）")
-    void runOneAgentLoopPersistentNullBoundProjectDoesNotInjectOverride() throws Exception {
+    @DisplayName("[批 1 方向 C] DURABLE 无会话直建（boundProject=null）→ RunRequest 不携带锚（兜底 GLOBAL，已知差异零回归）")
+    void runOneAgentLoopPersistentNullBoundProjectCarriesNoAnchor() throws Exception {
         // WHY: 无会话 REST 直建 DURABLE（sessionId=null + boundProject=null）是已知差异（CC 所有
-        // durable 任务都在会话里创建，B-memory-path-probe §4.4）→ 无项目锚可注入，override 不得凭空
-        // 设置（保持既有兜底 GLOBAL 行为）。clear 恒在 finally 执行。
+        // durable 任务都在会话里创建，B-memory-path-probe §4.4）→ 无项目锚可传，锚不得凭空设置
+        // （保持既有兜底 GLOBAL 行为）。
+        // [批 1 改锚] 原断言 = verify(loop, never()).setCronProjectRootOverride(any())（该方法已删）；
+        // 现锚 = run 收到的 RunRequest.boundProject() 为 null，且 sessionId 仍走 GLOBAL 兜底。
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
@@ -698,11 +731,56 @@ class CronIdleExecutorTest {
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        verify(loop, never()).setCronProjectRootOverride(any());
         ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
         verify(loop).run(captor.capture());
         assertThat(captor.getValue().sessionId()).isEqualTo(CronIdleExecutor.GLOBAL_SESSION_KEY);
-        verify(loop).clearCronProjectRootOverride();
+        assertThat(captor.getValue().boundProject())
+            .as("无项目锚（boundProject=null）→ RunRequest.boundProject 必须为 null")
+            .isNull();
+    }
+
+    // ====== [批 1 方向 C] 缺值语义：无锚可观测（用户裁定 1 · 禁止只 DEBUG） ======
+
+    @Test
+    @DisplayName("[批 1 方向 C] 全局 cron（boundProject=null 且无 sessionId）→ 项目根无处解析走高 WARN 留痕（非静默）")
+    void globalCronWithoutAnchor_logsWarnInsteadOfSilence() throws Exception {
+        // WHY（规则九 · 用户裁定 1）: 「本路径本就不需要项目根」属 (b) 类 ⇒ 可跳过，但日志级别必须
+        // ≥ WARN，禁止只写 DEBUG。全局 cron（无会话直建 DURABLE：sessionId=null + boundProject=null）
+        // 的 cwd/memory 项目根无处可解析，回落 user.dir / configHome —— 这正是本仓反复出现的
+        // 「静默读到一个看起来合法的错值」失效模式（~/.nexusai 冒充项目根），必须留痕。
+        // RED（反向实验 · 有鉴别力）: 删掉该 WARN 分支（回到只 loop.run(req) 的静默）⇒ 本测试变红。
+        Logger executorLogger = (Logger) LoggerFactory.getLogger(CronIdleExecutor.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        executorLogger.addAppender(appender);
+        try {
+            LlmAgentLoop loop = mock(LlmAgentLoop.class);
+            @SuppressWarnings("unchecked")
+            ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
+            when(provider.getObject()).thenReturn(loop);
+            ReflectionTestUtils.setField(executor, "loopProvider", provider);
+
+            // 全局 cron：无 sessionId + 无 boundProject
+            QueueItem cmd = new QueueItem("全局任务", "prompt", Priority.LATER, null,
+                null, true, NotificationQueue.WORKLOAD_CRON, false, null, null, null);
+
+            ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
+
+            List<String> warns = appender.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("无项目锚"))
+                .collect(java.util.stream.Collectors.toList());
+            assertThat(warns)
+                .as("全局 cron 无项目锚必须 ≥ WARN 可观测（禁止只 DEBUG / 静默）")
+                .isNotEmpty();
+            // 对照组：同一 run 不得携带锚（值确实缺失，而非被伪造）
+            ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
+            verify(loop).run(captor.capture());
+            assertThat(captor.getValue().boundProject()).isNull();
+        } finally {
+            executorLogger.detachAppender(appender);
+        }
     }
 
     // ============ [cron-durable-session-fire] DURABLE fire 归创建会话（去 per-task 虚拟键） ============
@@ -733,13 +811,13 @@ class CronIdleExecutorTest {
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
         ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
-        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(loop);
-        inOrder.verify(loop).setCronProjectRootOverride(boundProject);
-        inOrder.verify(loop).run(captor.capture());
+        verify(loop).run(captor.capture());
         assertThat(captor.getValue().sessionId())
             .as("创建会话存活 → RunRequest.sessionId=创建会话 UUID（transcript 归创建会话文件）")
             .isEqualTo(creatingSession);
-        inOrder.verify(loop).clearCronProjectRootOverride();
+        assertThat(captor.getValue().boundProject())
+            .as("[批 1 改锚] 同一 run 同时携带项目锚（原 setCronProjectRootOverride(boundProject) 断言改锚）")
+            .isEqualTo(boundProject);
         Files.deleteIfExists(tmp);
     }
 
@@ -770,13 +848,13 @@ class CronIdleExecutorTest {
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
         ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
-        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(loop);
-        inOrder.verify(loop).setCronProjectRootOverride(boundProject);
-        inOrder.verify(loop).run(captor.capture());
+        verify(loop).run(captor.capture());
         assertThat(captor.getValue().sessionId())
             .as("创建会话已关 → RunRequest.sessionId=null（headless 无 transcript）")
             .isNull();
-        inOrder.verify(loop).clearCronProjectRootOverride();
+        assertThat(captor.getValue().boundProject())
+            .as("[批 1 改锚] headless 仍携带项目锚（cwd/memory 归创建项目，transcript 无）")
+            .isEqualTo(boundProject);
         Files.deleteIfExists(tmp);
     }
 
@@ -802,22 +880,24 @@ class CronIdleExecutorTest {
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
         ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
-        org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(loop);
-        inOrder.verify(loop).setCronProjectRootOverride(boundProject);
-        inOrder.verify(loop).run(captor.capture());
+        verify(loop).run(captor.capture());
         assertThat(captor.getValue().sessionId())
             .as("无创建会话 → RunRequest.sessionId=null（headless 无 transcript）")
             .isNull();
-        inOrder.verify(loop).clearCronProjectRootOverride();
+        assertThat(captor.getValue().boundProject())
+            .as("[批 1 改锚] 无创建会话仍携带项目锚（cwd/memory 归创建项目，原 setCronProjectRootOverride 断言改锚）")
+            .isEqualTo(boundProject);
         Files.deleteIfExists(tmp);
     }
 
     @Test
-    @DisplayName("SESSION fire（sessionId 非空）→ RunRequest 用真实创建会话 UUID（transcript 归创建会话），不注入 override")
+    @DisplayName("SESSION fire（sessionId 非空）→ RunRequest 用真实创建会话 UUID（transcript 归创建会话），不携带项目锚")
     void runOneAgentLoopSessionUsesRealSessionUuid() throws Exception {
         // WHY: SESSION scope cron 走真实创建会话 UUID（CRON-D5 改3），transcript 归创建会话
         // （{workspaceDir}/{sessionId}.jsonl）——SESSION 路径不变（生命周期绑定由 scope 列承载，
-        // CronIdleExecutor 只代跑，不注入任何 override）。
+        // CronIdleExecutor 只代跑，不携带项目锚；boundProject 列仅 DURABLE 有值）。
+        // [批 1 改锚] 原断言 verify(loop, never()).setCronProjectRootOverride(any())（方法已删）→
+        // 现锚 = RunRequest.boundProject() 为 null。
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
@@ -835,8 +915,9 @@ class CronIdleExecutorTest {
         assertThat(captor.getValue().sessionId())
             .as("SESSION → RunRequest.sessionId=真实创建会话 UUID（transcript 归创建会话）")
             .isEqualTo(sessionId);
-        verify(loop, never()).setCronProjectRootOverride(any());
-        verify(loop).clearCronProjectRootOverride();
+        assertThat(captor.getValue().boundProject())
+            .as("[批 1 改锚] SESSION fire 不携带项目锚（原 never().setCronProjectRootOverride 断言改锚）")
+            .isNull();
     }
 
     @Test
