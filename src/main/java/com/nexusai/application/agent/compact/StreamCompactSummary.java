@@ -546,7 +546,15 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 true,                                                 // skipCacheWrite（compact.ts:1195）
                 abortController,                                      // overrides.abortController（compact.ts:1196-1199）
                 null,                                                 // onMessage
-                null);                                                // readFileState
+                null)                                                 // readFileState
+                // [TL-W1b P1 compact 链接线] 会话绑定 projectRoot 由**会话线程**在构造
+                //   CacheSafeParams 时解析（LlmAgentLoop.buildCompactCacheSafeParams =
+                //   主循环 auto/reactive 压缩；CacheSharingParamsBuilder.build = manual/partial
+                //   命令），随 CacheSafeParams 直传到此 —— 本类/fork 线程零会话态现算、
+                //   零 ThreadLocal 读（RunForkedAgent.run 在 fork 线程构造隔离 ctx）。
+                //   null = 构造点无会话上下文 → 不造字段（fork 端 shared(null) 走
+                //   CwdResolution originalCwd 回落，非 config home）。
+                .withProjectRoot(cacheSafeParams.projectRoot());
             if (log.isDebugEnabled()) {
                 // [userctx-single-prepend] 消息条数口径：此处 forkContextMessages 条数 = 未前置的
                 //   fork 前缀条数；userContext 非空时 meta 消息由 ProductionForkedQuery 在发送边界

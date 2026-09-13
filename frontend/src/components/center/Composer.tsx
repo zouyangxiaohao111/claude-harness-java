@@ -241,9 +241,11 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   const [remoteCommands, setRemoteCommands] = useState<CommandDto[]>([])
   useEffect(() => {
     let alive = true
-    commandApi.list().then((cs) => { if (alive) setRemoteCommands(cs) }).catch(() => {})
+    // [TL-W1 P4] sessionId 直传后端（REST 线程按会话解析绑定项目 → project 级命令进补全）；
+    //   切会话 → 重新拉取（避免上一个会话的项目命令滞留；同源 /skills 见 useSkills）。
+    commandApi.list(false, sessionId ?? undefined).then((cs) => { if (alive) setRemoteCommands(cs) }).catch(() => {})
     return () => { alive = false }
-  }, [])
+  }, [sessionId])
   const cmdMatches = useMemo(() => {
     const t = composerText
     if (!t.startsWith('/') || t.includes(' ')) return null

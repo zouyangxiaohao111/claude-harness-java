@@ -56,6 +56,19 @@ import java.util.Map;
  * @param useGlobalCacheScope boundary/gate 判定值（fork 与主线程一致）· CC original:
  *                            {@code shouldUseGlobalCacheScope()} (utils/betas.ts:227-233)，
  *                            Java 由调用方注入
+ * @param projectRoot         [TL-W1b P1] 会话绑定 projectRoot（= 会话冻结值
+ *                            {@code SessionProjectRoot.getForSession(sessionId)}，即主循环
+ *                            {@code ctx.sessionState().workspaceDir()} / CC {@code getOriginalCwd()}
+ *                            语义）—— compact 链的 {@link ForkedAgentParams} 构造点
+ *                            （{@code StreamCompactSummary.tryForkCacheSharing}）<b>没有</b>会话上下文，
+ *                            只有本 record，故会话态必须随本 record 一起流过 fork 参数。
+ *                            <b>值必须在有会话上下文的构造点解析</b>（会话线程，或按 sessionId 从全局表
+ *                            现算）—— 禁止在 fork/异步线程读 ThreadLocal：compact fork 的
+ *                            {@code RunForkedAgent.run} 经 query 在 fork 线程构造隔离 ctx，
+ *                            plain ThreadLocal 不继承 ⇒ 回落 config home 冒充项目根。
+ *                            null = 该构造点无会话上下文（如 {@code createMinimalCacheSafeParams}
+ *                            兜底构造）→ fork 端不造字段（{@code shared(null)} 走 CwdResolution
+ *                            originalCwd 回落，非 config home）。
  */
 public record CacheSafeParams(
         List<String> systemPrompt,
@@ -63,7 +76,10 @@ public record CacheSafeParams(
         Map<String, String> systemContext,
         ToolUseContext toolUseContext,
         List<ChatMessageDto> forkContextMessages,
-        boolean useGlobalCacheScope) {
+        boolean useGlobalCacheScope,
+        // [TL-W1b P1] 会话绑定 projectRoot（会话线程 / 按 sessionId 现算的直传值；
+        //   见 {@link #projectRoot()}）—— null = 构造点无会话上下文（不造字段）。
+        String projectRoot) {
 
     /**
      * 紧凑构造器 · null 兜底（对齐 CC createCacheSafeParams 从不产 null，
@@ -98,6 +114,25 @@ public record CacheSafeParams(
             Map<String, String> systemContext,
             ToolUseContext toolUseContext,
             List<ChatMessageDto> forkContextMessages) {
-        this(systemPrompt, userContext, systemContext, toolUseContext, forkContextMessages, false);
+        this(systemPrompt, userContext, systemContext, toolUseContext, forkContextMessages, false, null);
+    }
+
+    /**
+     * 6 参兼容构造器（无 projectRoot · [TL-W1b P1]）· 既有调用方（测试直构 / 无会话上下文的
+     * 兜底构造）语义不变：projectRoot=null → compact 链 fork 端 {@code shared(null)} 走
+     * CwdResolution originalCwd 回落（非 config home）。
+     *
+     * <p><b>有会话上下文的构造点必须改用 7 参构造</b>（会话线程 / 按 sessionId 现算的 projectRoot）；
+     * 6 参 = "本调用点拿不到会话态"的显式声明，不是默认值。
+     */
+    public CacheSafeParams(
+            List<String> systemPrompt,
+            Map<String, String> userContext,
+            Map<String, String> systemContext,
+            ToolUseContext toolUseContext,
+            List<ChatMessageDto> forkContextMessages,
+            boolean useGlobalCacheScope) {
+        this(systemPrompt, userContext, systemContext, toolUseContext, forkContextMessages,
+            useGlobalCacheScope, null);
     }
 }

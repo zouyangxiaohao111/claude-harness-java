@@ -122,7 +122,9 @@ function App() {
 
   // ---- 真实后端：4 个 settings 面板的 hook（Provider/Model + Skill/MCP/Database/Schedule） ----
   const providersApi = useProviders()
-  const skillsApi = useSkills()
+  // [TL-W1 P4] 传当前会话 id（= 下方 activeSessionId = sessionR.activeSession，此处尚未解构故直接用
+  //   同一源）：技能列表按会话绑定项目解析，并在切会话时重拉（不传 = 后端无会话上下文）。
+  const skillsApi = useSkills(sessionR.activeSession)
   const mcpApi = useMcp()
   const databasesApi = useDatabases()
   const schedulesApi = useSchedules()
@@ -1371,9 +1373,13 @@ function App() {
   const [remoteCmdNames, setRemoteCmdNames] = useState<Set<string>>(new Set())
   useEffect(() => {
     let alive = true
-    commandApi.list().then((cs) => { if (alive) setRemoteCmdNames(new Set(cs.map((c) => c.name))) }).catch(() => {})
+    // [TL-W1 P4] sessionId 直传后端：无 sessionId 时后端无会话上下文 → 绑定项目的 project 级命令
+    //   被判「非命令」→ 作为普通消息发出（本条判据失效）。切会话 → 重新拉取。
+    commandApi.list(false, activeSessionId ?? undefined)
+      .then((cs) => { if (alive) setRemoteCmdNames(new Set(cs.map((c) => c.name))) })
+      .catch(() => {})
     return () => { alive = false }
-  }, [])
+  }, [activeSessionId])
 
   // ---- 内置命令执行：统一走 executeBuiltin，成功/失败均显式反馈（fail loud）----
   // [P2-8] args：`/compact 用中文总结` 这类带参内置命令的尾部文本（命令名之后的全部内容）。
@@ -1866,6 +1872,7 @@ function App() {
       )}
       {showCommandPalette && (
         <CommandPalette
+          sessionId={activeSessionId}
           onClose={() => setShowCommandPalette(false)}
           onExecute={(name) => {
             setShowCommandPalette(false)

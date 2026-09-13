@@ -34,7 +34,19 @@ export interface BuiltInCommandDto {
 }
 
 export const commandApi = {
-  list: (reload = false) => api<CommandDto[]>(reload ? '?reload=true' : '', {}, CMD_BASE),
+  /**
+   * 命令列表 · `sessionId` 可选（[TL-W1 P4] 后端已加 `?sessionId=` 查询参数）。
+   *
+   * <p>带 sessionId → 后端把会话注入 RequestContext，SkillRegistry 的 cwdSupplier 能在 REST 线程
+   * 解析出**会话绑定项目** ⇒ 列表含该项目的 project 级技能 + workflow 命令；不带 → 后端无会话上下文
+   * （旧行为：绑定项目的命令在前端列表里消失）。与 /skills 同源同语义。
+   */
+  list: (reload = false, sessionId?: string) => {
+    const parts: string[] = []
+    if (reload) parts.push('reload=true')
+    if (sessionId) parts.push(`sessionId=${encodeURIComponent(sessionId)}`)
+    return api<CommandDto[]>(parts.length ? `?${parts.join('&')}` : '', {}, CMD_BASE)
+  },
   /** 单个命令详情 · GET /api/command/{id} */
   get: (id: string) => api<CommandDto>(`/${encodeURIComponent(id)}`, {}, CMD_BASE),
   builtins: () => api<BuiltInCommandDto[]>('/builtins', {}, CMD_BASE),

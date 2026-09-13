@@ -19,9 +19,11 @@ import com.nexusai.application.agent.tool.SDKStatus;
 import com.nexusai.application.agent.tool.SpinnerMode;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.toolsearch.SchemaNotSentHint;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -57,6 +59,19 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class PartialCompactConversationTest {
 
     private static final String SESSION = "s1";
+
+    // ── [TL-W1b P1] 会话冻结 projectRoot 登记（PTL retry re-save 逐字段保留验证用）─────
+    /** 专用会话键（不与 baseContext() 的随机会话冲突 → 不污染同类其他用例）。 */
+    private static final String W1B_SESSION = "sess-tlw1b-partial";
+    /** 会话绑定项目根：JVM 启动目录（绝对路径 + 目录存在 = SessionProjectRoot.setForSession 校验通过；
+     *  本用例不落任何真实文件，仅作为「会话态值」被观察）。 */
+    private static final String W1B_PROJECT_ROOT =
+        java.nio.file.Path.of("").toAbsolutePath().normalize().toString();
+
+    @AfterEach
+    void clearW1bSessionRoot() {
+        SessionProjectRoot.clearSession(W1B_SESSION);
+    }
 
     // ── 测试消息工厂 ───────────────────────────────────────────────────
 
@@ -324,7 +339,13 @@ class PartialCompactConversationTest {
     @Test
     @DisplayName("[RES-C4] PTL retry: 每截断更新 forkContextMessages=truncated（对齐 CC compact.ts:895-898）")
     void ptlRetryUpdatesForkContextMessagesToTruncated() {
-        ToolUseContext tuc = baseContext();
+        // [TL-W1b P1] 本用例的会话 TUC 用固定 sessionId 并登记会话冻结 projectRoot ——
+        //   验证 PTL retry 的 re-save 逐字段保留 projectRoot（会话态载具；漏转发 = 重试轮 fork
+        //   落 config home 冒充项目根，静默错目录）。清理由下方 @AfterEach 兜底。
+        ToolUseContext tuc = new ToolUseContext(
+            UUID.randomUUID(), W1B_SESSION, PermissionMode.DEFAULT,
+            Map.of(), List.of(), "", new AbortController(), List.of());
+        SessionProjectRoot.setForSession(W1B_SESSION, W1B_PROJECT_ROOT);
         Supplier<SystemPrompt> defaultAssemble = () -> {
             throw new IllegalStateException("custom 短路: defaultAssemble 不应被调用");
         };
@@ -349,12 +370,14 @@ class PartialCompactConversationTest {
             });
         List<List<String>> forkPrefixesPerCall = new ArrayList<>();
         List<List<String>> sentMessagesPerCall = new ArrayList<>();
+        List<String> forkProjectRootsPerCall = new ArrayList<>();   // [TL-W1b P1]
         CompactConversationContext c = ctx((messages, prompt, preTokens) -> {
             // summaryProducer 即 StreamCompactSummary fork 读侧（cacheSafeParamsSupplier=Holder.get()）
             CacheSafeParams cs = CacheSafeParamsHolder.get();
             forkPrefixesPerCall.add(cs == null
                 ? List.of()
                 : cs.forkContextMessages().stream().map(ChatMessageDto::id).toList());
+            forkProjectRootsPerCall.add(cs == null ? null : cs.projectRoot());   // [TL-W1b P1]
             sentMessagesPerCall.add(messages.stream().map(ChatMessageDto::id).toList());
             if (sentMessagesPerCall.size() == 1) {
                 return new CompactConversation.SummaryResult(
@@ -384,6 +407,11 @@ class PartialCompactConversationTest {
         assertThat(sentMessagesPerCall.get(1)).isNotEqualTo(sentMessagesPerCall.get(0));
         // retry 轮：fork 前缀必须跟随截断 = 该次实际发送消息（对齐 CC compact.ts:895-898）
         assertThat(forkPrefixesPerCall.get(1)).isEqualTo(sentMessagesPerCall.get(1));
+        // [TL-W1b P1] 两轮 fork 的会话态载具都必须非空且一致：re-save 只换 forkContextMessages，
+        //   漏转发 projectRoot → retry 轮 fork 落 config home 冒充项目根（静默错目录，无报错）。
+        assertThat(forkProjectRootsPerCall)
+            .as("PTL retry re-save 必须逐字段保留会话 projectRoot（会话线程按 sessionId 解析产物）")
+            .containsExactly(W1B_PROJECT_ROOT, W1B_PROJECT_ROOT);
         // 压缩后槽位清空（finally clear）
         assertThat(CacheSafeParamsHolder.get()).isNull();
     }

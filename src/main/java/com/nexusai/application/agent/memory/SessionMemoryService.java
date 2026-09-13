@@ -809,7 +809,17 @@ public class SessionMemoryService {
                 /*skipCacheWrite*/ false,
                 /*abortController*/ null,
                 /*onMessage*/ null,
-                setupCtx.readFileState());
+                setupCtx.readFileState())
+                // [TL-W1b P1 session_memory 链接线] 会话绑定 projectRoot —— 本方法跑在
+                //   post-sampling hook 线程（PostSamplingHookRegistry 单线程执行器，**非**会话线程），
+                //   故按会话 sessionId 从全局冻结表现算（SessionProjectRoot.getForSession：未绑定 →
+                //   null，**绝不**回落 config home）—— 这正是规则二允许的「按 sessionId 从全局表/DB
+                //   现算」；**不是** ThreadLocal 读（sessionId 来自 psContext.toolUseContext()，
+                //   是随对象图直传的普通值，不是线程局部变量）。
+                //   WHY: 提取 fork（RunForkedAgent → QueryLoopForkedQuery）在 fork 线程构造隔离 ctx，
+                //   plain ThreadLocal 不继承 ⇒ fork 内现算会话态会静默回落 ~/.nexusai 冒充项目根
+                //   ⇒ fork 的 ctx.workspaceDir 错（memory/skill/transcript 归属全错且无报错）。
+                .withProjectRoot(com.nexusai.common.SessionProjectRoot.getForSession(sessionId));
 
             if (forkedQuery == null) {
                 log.warn("[SessionMemory] fork 查询 seam 未注入（生产 ToolRegistrationConfig 必须 "
@@ -937,7 +947,11 @@ public class SessionMemoryService {
                 /*skipCacheWrite*/ false,
                 /*abortController*/ null,
                 /*onMessage*/ null,
-                setupCtx.readFileState());
+                setupCtx.readFileState())
+                // [TL-W1b P1 session_memory 链接线] 同 extract 路径：按会话 sessionId 从全局冻结表现算
+                //   （sessionId = 调用方直传的 toolUseContext.sessionId()，非 ThreadLocal）；
+                //   未绑定 → null（不造字段，绝不回落 config home 冒充项目根）。
+                .withProjectRoot(com.nexusai.common.SessionProjectRoot.getForSession(sessionId));
 
             if (forkedQuery == null) {
                 log.warn("[SessionMemory] manuallyExtractSessionMemory: fork 查询 seam 未注入"

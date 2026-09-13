@@ -136,7 +136,14 @@ class RunForkedAgentTest {
         // 会改 budget_tokens → thinking config 偏移 → 破坏主线程 cache key。
         // [RES-R4] 第 6 字段是 useGlobalCacheScope（gate 通信通道，CC betas.ts:227-233），
         // 非 thinking —— thinking 仍由 toolUseContext 派生。
-        assertThat(CacheSafeParams.class.getRecordComponents()).hasSize(6);
+        // [TL-W1b P1] 第 7 字段是 projectRoot（会话态直传载具，**不参与 cache key**）——
+        //   本断言面仍是「不得混入 cache-key 输入」：thinking / maxOutputTokens 进 record
+        //   ⇒ 红。projectRoot 是 fork ctx 的会话根（会话线程解析后流过 fork 参数），
+        //   与 cache key 无关（故允许）。
+        assertThat(CacheSafeParams.class.getRecordComponents())
+            .as("record 字段集 = 5 cache-key 参 + gate + projectRoot（会话态载具）；"
+                + "thinking/maxOutputTokens 不得进 record（会破坏主线程 cache key）")
+            .hasSize(7);
     }
 
     @Test
@@ -314,7 +321,11 @@ class RunForkedAgentTest {
             List.of(userMessage("sr", "prompt")), cs, RunForkedAgent.createCompactCanUseTool(),
             QuerySource.EXTRACT_MEMORIES, "extract_memories", null, 5,
             /*skipTranscript*/ true, /*skipCacheWrite*/ false, new AbortController(), null);
-        // 未接线（compact/session-memory 链现状）→ null（fork 端不造字段，走 originalCwd 回落）
+        // 未显式传 projectRoot 的构造器（11/12 参兼容构造）→ null：构造器**不伪造**会话态
+        //   （fork 端不造字段，走 originalCwd 回落）。⚠️ 这不代表各 fork 链可以省接线 ——
+        //   4 条链的 projectRoot 来源见：extract/dream = ForkRawMaterial（W1）、
+        //   compact = CacheSafeParams.projectRoot（W1b）、session_memory =
+        //   SessionProjectRoot.getForSession(sessionId)（W1b）。
         assertThat(params.projectRoot()).isNull();
         assertThat(params.withProjectRoot(null).projectRoot()).isNull();
 

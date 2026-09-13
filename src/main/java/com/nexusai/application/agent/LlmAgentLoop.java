@@ -4095,7 +4095,18 @@ public class LlmAgentLoop implements AgentLoop {
                 params.systemContext(),
                 params.toolUseContext(),
                 new ArrayList<>(state.modelView()),
-                useGlobalCacheScope(params.config()));    // [RES-R4] fork 与主线程同一 gate 判定（REQ-R4-3）
+                useGlobalCacheScope(params.config()),     // [RES-R4] fork 与主线程同一 gate 判定（REQ-R4-3）
+                // [TL-W1b P1 compact 链接线] 会话绑定 projectRoot —— 本方法在**会话线程**（主循环，
+                //   auto-compact :5504 / reactive :7154）执行，按会话 sessionId 从全局冻结表现算
+                //   （SessionProjectRoot.getForSession：未绑定 → null，**绝不**回落 config home）。
+                //   WHY: 压缩 fork（StreamCompactSummary → RunForkedAgent → QueryLoopForkedQuery）在
+                //   fork 线程构造隔离 ctx，plain ThreadLocal 不继承 ⇒ 在 fork 内现算会话态会静默
+                //   回落 ~/.nexusai 冒充项目根 ⇒ fork 的 ctx.workspaceDir 错（skill/memory/transcript
+                //   归属全错且无报错）。故会话态只在此处（会话线程）解析一次 → 随 CacheSafeParams
+                //   直传 → StreamCompactSummary 经 withProjectRoot 落到 fork 参数。
+                //   （= 主循环 ctx.sessionState().workspaceDir() 的同源值，对齐 CC getOriginalCwd 语义）
+                com.nexusai.common.SessionProjectRoot.getForSession(
+                    state != null ? state.sessionId() : null));
         } catch (Exception e) {
             log.warn("[LlmAgentLoop] turn={} 构建 CacheSafeParams 失败，跳过 fork 缓存共享（不阻断压缩）: {}",
                 state.turnCount(), e.toString());

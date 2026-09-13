@@ -2,6 +2,10 @@
  * useSkills · 全局 Skill 状态 + 真实后端 CRUD
  *
  * <p>所有变更走真实 API，成功后才更新本地 state；失败抛 ApiError 由调用方 toast。
+ *
+ * <p>[TL-W1 P4] {@code sessionId} 透传到 {@code GET /skills?sessionId=}：技能列表按**会话绑定项目**
+ * 解析（project 级技能/workflow 命令），并在切换会话时重新拉取 —— 不传则后端无会话上下文，
+ * 绑定项目的条目不会出现在列表里（旧行为）。
  */
 
 import { useCallback, useEffect, useState } from 'react'
@@ -22,7 +26,7 @@ export interface UseSkills {
   toggleSkill: (id: string, enabled: boolean) => Promise<Skill>
 }
 
-export function useSkills(): UseSkills {
+export function useSkills(sessionId?: string | null): UseSkills {
   const [list, setList] = useState<Skill[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -32,7 +36,8 @@ export function useSkills(): UseSkills {
     setLoading(true)
     setError(null)
     try {
-      const data = await skillApi.list()
+      // [TL-W1 P4] sessionId 直传后端（REST 线程按会话解析绑定项目 → project 级技能可见）
+      const data = await skillApi.list(sessionId ?? undefined)
       setList(data)
     } catch (e) {
       const msg = e instanceof ApiError ? e.userMessage() : String(e)
@@ -41,7 +46,7 @@ export function useSkills(): UseSkills {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [sessionId])
 
   // 挂载时自动 fetch
   useEffect(() => {

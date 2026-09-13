@@ -17,6 +17,7 @@ import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.ReadFileTool;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
@@ -190,6 +191,91 @@ class SessionMemoryForkSessionModelTest {
             .as("有会话模型时不得回落全局 supplier provider（settings 无 model → mock 假回复）")
             .isFalse();
         assertThat(usedModel.get()).isEqualTo("deepseek-v4.1-flash-expires-on-0910");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [TL-W1b P1] 会话 projectRoot 直传（W1 残留闭环）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * SM 提取 fork 必须带会话绑定 projectRoot。
+     *
+     * <p><b>WHY（规则九 · 测试验证意图）</b>：提取 hook 跑在 {@code PostSamplingHookRegistry} 的
+     * <b>单线程执行器</b>（非会话线程），而 fork 的隔离 ctx 由 {@code RunForkedAgent.run} 在
+     * <b>fork 线程</b>构造 —— plain ThreadLocal（AutoMemPaths.currentSessionProjectRoot / MDC）
+     * 两条边界都不继承 ⇒ fork 内现算会静默回落 {@code ~/.nexusai}（config home）并被当作项目根
+     * （fork 的 {@code ctx.workspaceDir} 错，记忆/技能/transcript 归属全错且无任何报错）。
+     * 故按会话 sessionId 从全局冻结表现算（sessionId 来自 {@code psContext.toolUseContext()}，
+     * 是随对象图直传的普通值，<b>不是</b> ThreadLocal）→ 落到 fork 参数。删除该实参 → 本测试 RED。
+     */
+    @Test
+    @DisplayName("[TL-W1b P1] 提取 fork: 会话未绑定 → projectRoot=null（不造假项目根）")
+    void extractSessionMemory_unboundSession_leavesProjectRootNull() {
+        RecordingQuery query = new RecordingQuery();
+        SessionMemoryService svc = new SessionMemoryService(baseDir);
+        svc.setForkedQuery(query);
+        svc.setSessionMemoryFeatureEnabled(true);
+        svc.setReadFileTool(readFileTool());
+
+        svc.extractSessionMemory(new PostSamplingContext(
+            List.of(asst("a1", 12000, List.of())), List.of("SYS"), Map.of(), Map.of(),
+            ctx(List.of(), null), QuerySource.REPL_MAIN_THREAD));
+
+        assertThat(query.captured).as("阈值满足 → 必须发起 fork（否则本测试空转）").isNotNull();
+        assertThat(query.captured.projectRoot())
+            .as("会话未绑定项目 → projectRoot=null（fork 端 shared(null) 走 originalCwd 回落，"
+                + "而非 config home 冒充项目根）")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("[TL-W1b P1] 提取 fork: 会话 projectRoot 由 sessionId 现算 → 直达 fork 参数")
+    void extractSessionMemory_carriesSessionProjectRootFromSessionId() {
+        RecordingQuery query = new RecordingQuery();
+        SessionMemoryService svc = new SessionMemoryService(baseDir);
+        svc.setForkedQuery(query);
+        svc.setSessionMemoryFeatureEnabled(true);
+        svc.setReadFileTool(readFileTool());
+
+        SessionProjectRoot.setForSession(SESSION_ID, baseDir.toString());
+        try {
+            svc.extractSessionMemory(new PostSamplingContext(
+                List.of(asst("a1", 12000, List.of())), List.of("SYS"), Map.of(), Map.of(),
+                ctx(List.of(), null), QuerySource.REPL_MAIN_THREAD));
+
+            assertThat(query.captured).as("阈值满足 → 必须发起 fork（否则本测试空转）").isNotNull();
+            assertThat(query.captured.projectRoot())
+                .as("会话绑定 projectRoot 必须随 fork 参数直传到 query seam —— 漏传 = hook/fork 线程"
+                    + "现算会话态 → ThreadLocal 取不到 → 回落 config home 冒充项目根（静默错目录）")
+                .isEqualTo(baseDir.toString());
+        } finally {
+            SessionProjectRoot.clearSession(SESSION_ID);
+        }
+    }
+
+    /** 手动提取路径（/summary）同一契约 —— 与自动提取是两处独立实参，故各自钉住。 */
+    @Test
+    @DisplayName("[TL-W1b P1] 手动提取 fork: 会话 projectRoot 由 sessionId 现算 → fork 参数")
+    void manuallyExtractSessionMemory_carriesSessionProjectRootFromSessionId() {
+        RecordingQuery query = new RecordingQuery();
+        SessionMemoryService svc = new SessionMemoryService(baseDir);
+        svc.setForkedQuery(query);
+        svc.setSessionMemoryFeatureEnabled(true);
+        svc.setReadFileTool(readFileTool());
+
+        SessionProjectRoot.setForSession(SESSION_ID, baseDir.toString());
+        try {
+            SessionMemoryService.ManualExtractionResult result = svc.manuallyExtractSessionMemory(
+                List.of(asst("a1", 12000, List.of())), ctx(List.of(), null));
+
+            assertThat(result.success()).as("手动提取成功（否则 fork 未发起，本测试空转）").isTrue();
+            assertThat(query.captured).isNotNull();
+            assertThat(query.captured.projectRoot())
+                .as("手动提取 fork 的会话 projectRoot 必须随参数直传（同自动提取契约）")
+                .isEqualTo(baseDir.toString());
+        } finally {
+            SessionProjectRoot.clearSession(SESSION_ID);
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -415,7 +415,8 @@ class CompactConversationTest {
             messages.add(msg("m" + i, i % 2 == 0 ? Role.user : Role.assistant, "message " + i));
         }
         CacheSafeParams initial = new CacheSafeParams(
-            List.of("sys"), Map.of(), Map.of(), baseToolUseContext(), new ArrayList<>(messages));
+            List.of("sys"), Map.of(), Map.of(), baseToolUseContext(), new ArrayList<>(messages),
+            false, "C:/proj/w1b-ptl");
         CacheSafeParamsHolder.save(initial);
         try {
             AtomicInteger calls = new AtomicInteger();
@@ -452,6 +453,12 @@ class CompactConversationTest {
             assertThat(updated.forkContextMessages())
                 .as("PTL 重试后 fork 前缀必须 re-save 为截断集（对齐 CC compact.ts:487-490）")
                 .isEqualTo(lastSummarized.get());
+            // [TL-W1b P1] re-save 是「只换 forkContextMessages」的逐字段重建 —— 其余字段漏转发
+            //   即静默丢失（此处 projectRoot = 会话态载具，丢了 → 重试轮 compact fork 落
+            //   config home 冒充项目根，无任何报错）。
+            assertThat(updated.projectRoot())
+                .as("PTL 重试 re-save 必须逐字段保留 projectRoot（会话态载具，不参与 cache key）")
+                .isEqualTo("C:/proj/w1b-ptl");
         } finally {
             CacheSafeParamsHolder.clear();
         }

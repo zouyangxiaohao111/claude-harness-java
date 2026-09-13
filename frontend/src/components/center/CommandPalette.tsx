@@ -185,10 +185,13 @@ function RowIcon({ name }: { name: string }) {
 interface CommandPaletteProps {
   onClose: () => void
   onExecute: (name: string) => void
+  /** [TL-W1 P4] 当前会话 id：`GET /api/command?sessionId=` 让后端在 REST 线程解析会话绑定项目
+   *  → 面板含该项目的 project 级技能/workflow 命令（不传 = 无会话上下文，绑定项目条目缺失）。 */
+  sessionId?: string | null
 }
 
 
-export function CommandPalette({ onClose, onExecute }: CommandPaletteProps) {
+export function CommandPalette({ onClose, onExecute, sessionId }: CommandPaletteProps) {
   const [query, setQuery] = useState('')
   const [active, setActive] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -203,9 +206,11 @@ export function CommandPalette({ onClose, onExecute }: CommandPaletteProps) {
   const [skillCommands, setSkillCommands] = useState<CommandDto[]>([])
   useEffect(() => {
     let alive = true
-    commandApi.list().then((cs) => { if (alive) setSkillCommands(cs) }).catch(() => {})
+    // [TL-W1 P4] sessionId 直传后端（REST 线程解析会话绑定项目 → project 级命令进面板）；
+    //   切会话（sessionId 变）→ 重新拉取，避免上一个会话的项目命令滞留。
+    commandApi.list(false, sessionId ?? undefined).then((cs) => { if (alive) setSkillCommands(cs) }).catch(() => {})
     return () => { alive = false }
-  }, [])
+  }, [sessionId])
   // 合并命令目录：后端 builtins 优先（带 type），技能命令其次，本地 COMMAND_ITEMS 补充
   const items = useMemo<CommandItem[]>(() => {
     const map = new Map<string, CommandItem>()

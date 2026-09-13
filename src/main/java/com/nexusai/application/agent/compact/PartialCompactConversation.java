@@ -386,7 +386,10 @@ public final class PartialCompactConversation {
                 if (saved != null) {
                     CacheSafeParamsHolder.save(new CacheSafeParams(
                         saved.systemPrompt(), saved.userContext(), saved.systemContext(),
-                        saved.toolUseContext(), new ArrayList<>(truncated), saved.useGlobalCacheScope()));
+                        saved.toolUseContext(), new ArrayList<>(truncated), saved.useGlobalCacheScope(),
+                        // [TL-W1b P1] 会话绑定 projectRoot 逐字段保留（本处只换 forkContextMessages，
+                        //   漏转发会让 PTL 重试轮 fork 丢掉会话态）。
+                        saved.projectRoot()));
                     log.info("[PartialCompactConversation] PTL retry 更新 fork 前缀: forkMsgs={} "
                             + "（对齐 CC compact.ts:895-898）",
                         truncated.size());

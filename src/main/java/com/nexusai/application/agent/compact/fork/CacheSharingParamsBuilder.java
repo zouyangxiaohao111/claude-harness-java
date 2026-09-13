@@ -137,7 +137,17 @@ public final class CacheSharingParamsBuilder {
             sysParts.systemContext(),
             toolUseContext,
             forkContextMessages,
-            useGlobalCacheScope);
+            useGlobalCacheScope,
+            // [TL-W1b P1 compact 链接线] 会话绑定 projectRoot —— 本方法由**会话线程**调用
+            //   （manual /compact = CompactCommand.buildCacheSafeParamsForCompact /
+            //   partial = PartialCompactConversation.buildCacheSafeParamsForPartial，两者都在命令
+            //   派发的会话线程上，且已持会话 ToolUseContext = 直传的会话态载体），故按
+            //   toolUseContext.sessionId() 从全局冻结表现算（未绑定 → null，**绝不**回落 config home）。
+            //   WHY: 压缩 fork（StreamCompactSummary → RunForkedAgent → QueryLoopForkedQuery）在 fork
+            //   线程构造隔离 ctx，plain ThreadLocal 不继承 ⇒ fork 内现算会话态会静默回落
+            //   ~/.nexusai 冒充项目根。会话态在此解析一次 → 随 CacheSafeParams 直传。
+            com.nexusai.common.SessionProjectRoot.getForSession(
+                toolUseContext != null ? toolUseContext.sessionId() : null));
 
         if (log.isInfoEnabled()) {
             log.info("[CacheSharingParamsBuilder] CacheSafeParams 构建完成: custom={}, "
