@@ -421,6 +421,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         : 'file'
       if (f.size > BASE64_LIMIT) {
         // 大文件 → multipart 上传落盘 → contentId
+        // [批 3a] 上传请求必须带会话（后端按 sessionId 归属附件）；旧实现 sessionId 缺省时
+        //   `if (sessionId)` 静默丢弃该字段 → 附件落到 'unknown' 归属（用户无感知）。改为显式拒绝。
+        if (!sessionId) {
+          showToast(`大文件需先打开一个会话再上传：${f.name}`, 'info')
+          return
+        }
         if (addedNamesRef.current.has(f.name)) return
         addedNamesRef.current.add(f.name)
         setAttachments((prev) => [...prev, { type, filename: f.name, mediaType, size: f.size, contentId: '__uploading__' }])
@@ -476,6 +482,11 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         const bytes = await readFile(p)
         if (bytes.length > BASE64_LIMIT) {
           // >5MB → multipart upload 落盘 → contentId
+          // [批 3a] 同上：无会话显式拒绝，不静默丢附件归属
+          if (!sessionId) {
+            showToast(`大文件需先打开一个会话再上传：${name}`, 'info')
+            continue
+          }
           const file = new File([bytes], name, { type: mediaType })
           const r = await uploadAttachment(file, sessionId)
           pending.push({ type, filename: name, mediaType, contentId: r.contentId, size: bytes.length })

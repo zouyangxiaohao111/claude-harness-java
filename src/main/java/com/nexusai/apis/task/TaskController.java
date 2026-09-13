@@ -63,8 +63,17 @@ import java.util.Map;
  * teammate→registry.kill / dream/remote 回退，错误码 NOT_FOUND / NOT_RUNNING /
  * UNSUPPORTED_TYPE，对齐 CC stopTask.ts:38-100）。
  *
- * <p><b>会话隔离</b>：null-session 任务（main-thread spawn 无 MDC / 测试直构）不属于任何会话，
- * 会话级过滤时被排除（正确隔离）；空 sessionId = 显式「全部」（前端恒传 activeSessionId ?? ''）。
+ * <p><b>会话隔离</b>：null-session 任务（main-thread spawn 无会话 / 测试直构）不属于任何会话，
+ * 会话级过滤时被排除（正确隔离）。
+ *
+ * <p><b>sessionId 契约（批 3a 澄清）</b>：本类四个端点分两类 ——
+ * <ul>
+ *   <li>{@code GET /api/v1/tasks} / {@code background-all} / {@code stop-all}：sessionId <b>可选</b>
+ *       （(b) 类「本就不需要」——全局「查看更多」视图语义），缺省 → 全量（<b>≥ WARN 日志留痕</b>，
+ *       不再只打 DEBUG）。会话级调用方（MessageList / AsyncTasksPanel / App）恒显式传当前会话。</li>
+ *   <li>{@code GET /api/v1/tasks/list}：sessionId <b>必填</b>（(a) 类 fail loud，缺 ⇒ 400）——
+ *       任务清单必须锚定单个会话，缺值无从解析 taskListId。</li>
+ * </ul>
  */
 @RestController
 @RequestMapping("/api/v1/tasks")
@@ -93,13 +102,18 @@ public class TaskController {
      * 异步任务清单 · GET /api/v1/tasks?sessionId=
      *
      * <p>sessionId 非空 → 只留 {@code sessionId.equals(task.sessionId())}（null-session 任务被排除）；
-     * sessionId 空/缺省 → 全部类型全量（前端「查看更多」弹窗）。
+     * sessionId 空/缺省 → 全部类型全量（前端「查看更多」弹窗，属 (b) 类合法跳过 → WARN 留痕）。
      *
-     * @param sessionId 会话 id（可选）
+     * @param sessionId 会话 id（可选；(b) 类全局视图语义）
      * @return TaskDto 列表（type/status 均 CC 小写值域）
      */
     @GetMapping
     public List<TaskDto> listTasks(@RequestParam(required = false) String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            // (b) 类「这条路径本就不需要会话」：全局「查看更多」视图。按用户缺值策略不得只打 DEBUG → WARN。
+            log.warn("[TaskController] GET /api/v1/tasks 未传 ?sessionId= → 返回全部会话的异步任务"
+                + "（(b) 类合法跳过：全局视图；会话级调用方应显式传当前会话）");
+        }
         List<BackgroundTask> all = backgroundTaskRunner.listAllTasks();
         List<TaskDto> result = new ArrayList<>();
         for (BackgroundTask task : all) {
@@ -127,23 +141,29 @@ public class TaskController {
      * <b>不同源</b>——本端点返回 TaskCreate 创建的任务（TaskService.listTasks → List&lt;Task&gt;），
      * 映射为 {@link TaskItemDto}（CC TaskSchema tasks.ts:76-88 全量投影）。
      *
-     * <p>会话机制：解析 sessionId（query ?sessionId= → MDC 兜底），非 null 先
-     * {@code RequestContext.setSession(sessionId)} 写 MDC（MemoryController:121-139 /
-     * TeamController:91-98 同款）→ {@link TaskService#getTaskListId()} 按 CC 优先级链
-     * （tasks.ts:199-210）解析 taskListId：env CLAUDE_CODE_TASK_LIST_ID / in-process teammate
-     * teamName / team.name / 会话级 leaderTeamName / 当前会话 MDC。任务读取无锁（CC listTasks
-     * 无锁 readdir，tasks.ts:443-456）。
+     * <p>会话机制（批 3a 改）：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400，不再回落 MDC）
+     * → 写回 MDC（单向传播，喂 {@link TaskService#getTaskListId()} 的会话级槽）→
+     * {@code getTaskListId()} 按 CC 优先级链（tasks.ts:199-210）解析 taskListId：
+     * env CLAUDE_CODE_TASK_LIST_ID / in-process teammate teamName / team.name / 会话级
+     * leaderTeamName / 当前会话。任务读取无锁（CC listTasks 无锁 readdir，tasks.ts:443-456）。
      *
-     * @param sessionId query {@code ?sessionId=}（可选；任务清单会话锚定）
+     * @param sessionId query {@code ?sessionId=}（<b>必填</b>；任务清单会话锚定）
      * @return TaskItemDto 列表（status 已 CC 小写值域）
      */
     @GetMapping("/list")
     public TaskListSnapshotDto listTasksMerged(@RequestParam(value = "sessionId", required = false) String sessionId) {
-        // 会话解析（MemoryController:136-140 / TeamController:91-98 同款）：query ?sessionId= → MDC 兜底
-        String sid = (sessionId != null && !sessionId.isBlank()) ? sessionId : RequestContext.sessionId();
-        if (sid != null) {
-            RequestContext.setSession(sid);
+        // 批 3a：sessionId **必填**（缺 ⇒ 400）。旧实现 query 缺值时回落 RequestContext.sessionId()
+        //   （裸 MDC）——MDC 第三态会读到上一请求残留的别的会话 id ⇒ 返回别的会话的任务清单
+        //   （taskListId / V1 todos 桶都按 sid 解析，静默串会话）。fail loud 消除该态。
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[TaskController] GET /api/v1/tasks/list 缺少会话标识 ?sessionId= → 400"
+                + "（会话态显式化，不再回落 MDC）");
+            throw new ValidationException("sessionId is required (GET /api/v1/tasks/list)");
         }
+        String sid = sessionId;
+        // taskListId 解析链（TaskService.getTaskListId）内部读 MDC 的会话级 leaderTeamName / 当前会话槽，
+        //   故这里仍把**显式收到的会话**写回 MDC（单向传播，绝不读回；3c 收敛为显式传参）。
+        RequestContext.setSession(sid);
         String taskListId = TaskService.getTaskListId();
         // [task-v2-merge] V1 V2 都查合并（用户拍板 2026-08-25：会话 V1（TodoWrite）/V2（TaskCreate）
         //   互斥只会有一个；端点两者都查返回，前端按非空方显示）：
@@ -154,9 +174,7 @@ public class TaskController {
         }
         List<TodoWriteTool.TodoItem> v1Todos = new ArrayList<>();
         Map<String, List<TodoWriteTool.TodoItem>> v1Buckets = readV1Todos(sid);
-        if (sid != null) {
-            v1Todos.addAll(v1Buckets.getOrDefault(sid, List.of()));
-        }
+        v1Todos.addAll(v1Buckets.getOrDefault(sid, List.of()));
         long updatedAt = System.currentTimeMillis();
         // [access-log 去噪] 与同 controller GET /api/v1/tasks 一致：前端 2s 轮询端点降 debug（联调 INFO 不刷屏）
         if (log.isDebugEnabled()) {

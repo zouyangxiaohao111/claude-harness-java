@@ -268,7 +268,13 @@ export function CommandPalette({ onClose, onExecute, sessionId }: CommandPalette
     }
     setFeedback(null)
     try {
-      const resp = (await commandApi.executeBuiltin(item.name)) as ResumeResult
+      // [批 3a] 后端口 sessionId 必填（缺值 400）；本面板 sessionId 可为 null（无活动会话）
+      //   → 此时不发请求，走显式反馈（而不是发出一个注定 400 的请求）。
+      if (!sessionId) {
+        setFeedback({ kind: 'error', text: '无活动会话：该命令需先打开一个会话' })
+        return
+      }
+      const resp = (await commandApi.executeBuiltin(item.name, sessionId)) as ResumeResult
       if (item.name === 'resume') {
         const aid = resp.agentId
         setFeedback(aid ? { kind: 'success', text: `已恢复 ${aid}` } : { kind: 'success', text: '已执行 /resume' })

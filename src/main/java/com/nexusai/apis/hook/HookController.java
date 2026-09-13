@@ -2,7 +2,7 @@ package com.nexusai.apis.hook;
 
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.permission.hook.HooksSettings;
-import com.nexusai.common.RequestContext;
+import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.model.hook.dto.HookItemDto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,16 +31,14 @@ import java.util.List;
  * 前端 HookPanel 按 source=PLUGIN_HOOK + pluginName 正确渲染（对齐 CC 双通道合并语义，
  * 非恢复 DEL-CFG-B 的 getAllHooks PLUGIN_HOOK 源）。
  *
- * <p><b>sessionId 解析</b>（复用 {@code MemoryController:136-137} 模式）:
- * query {@code ?sessionId=} 非空 → 用之；否则 {@link RequestContext#sessionId()}（MDC，可 null）。
- * <ul>
- *   <li>sessionId 非空 → {@code hooksSettings.getAllHooks(sessionId)}（settings + session 合并；
- *       {@code HookRegistry.setHooksSettings} 已接线 sessionHooksProvider → SessionHookStore，
- *       满足决策 4-3『运行时会话』）</li>
- *   <li>null/blank → {@code getAllHooks()}（settings-only；allowManagedHooksOnly 守卫语义，
- *       UI 安全缺省 —— HookPanel 当前不传 sessionId 即落此路径）</li>
- * </ul>
- * 两个分支都再 concat {@link HookRegistry#getRegisteredPluginHookConfigs()}（插件 hook 展示
+ * <p><b>sessionId 契约（批 3a 改）</b>:
+ * query {@code ?sessionId=} <b>必填</b>；缺 / 空白 ⇒ 400（{@link ValidationException}）。
+ * 恒走 {@code hooksSettings.getAllHooks(sessionId)}（settings + session 合并；
+ * {@code HookRegistry.setHooksSettings} 已接线 sessionHooksProvider → SessionHookStore，
+ * 满足决策 4-3『运行时会话』）。
+ * <p>旧实现「缺值 → MDC 兜底 → 仍缺则 getAllHooks() settings-only」两分支已删除：MDC 第三态会
+ * 静默串入别的会话 id；settings-only 缺省则由前端显式不调用本端点（无会话 = 显式错误态）表达。
+ * <p>再 concat {@link HookRegistry#getRegisteredPluginHookConfigs()}（插件 hook 展示
  * 与 sessionId 无关，CC registeredHooks 全局注册表语义）。
  *
  * <p><b>鉴权/CORS</b>: /api/v1/hooks 不在 {@code BearerTokenAuthFilterConfig:76-83} 受保护
@@ -61,27 +59,28 @@ public class HookController {
      * 获取所有 hook 列表 · 对齐 CC {@code getAllHooks()}（hooksSettings.ts:92-161）+
      * 插件 registeredHooks 通道（hooksConfigManager.ts:322-362）。
      *
-     * @param sessionIdParam query {@code ?sessionId=}（可选；非空走 settings+session 合并）
+     * @param sessionIdParam query {@code ?sessionId=}（<b>必填</b>；缺 / 空白 ⇒ 400）
      * @return HookItemDto 列表（settings + session + 插件；前端 HookItem 形状）
      */
     @GetMapping
     public List<HookItemDto> getAllHooks(
             @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
-        // 复用 MemoryController:136-137 模式：query ?sessionId= 优先，MDC 兜底（可 null）
-        String sessionId = (sessionIdParam != null && !sessionIdParam.isBlank())
-            ? sessionIdParam : RequestContext.sessionId();
-        if (log.isDebugEnabled()) {
-            log.debug("[HookController] GET /api/v1/hooks: sessionIdParam='{}' → 解析 sessionId={}",
-                sessionIdParam, sessionId);
+        // 批 3a：sessionId **必填**（缺 ⇒ 400）。旧实现 query 缺值时回落 RequestContext.sessionId()
+        //   （裸 MDC）——MDC 第三态会读到上一请求残留的别的会话 id，使本次请求展示的是别的会话的
+        //   SESSION_HOOK 合并结果（看起来完全合法，日志前缀同样来自 MDC ⇒ 无法自查）。fail loud 消除该态。
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            log.warn("[HookController] GET /api/v1/hooks 缺少会话标识 ?sessionId= → 400"
+                + "（会话态显式化，不再回落 MDC）");
+            throw new ValidationException("sessionId is required (GET /api/v1/hooks)");
         }
-        // settings（+ 可选 session）与插件 hooks 合并：CC 双通道（getAllHooks + registeredHooks）
+        String sessionId = sessionIdParam;
+        if (log.isDebugEnabled()) {
+            log.debug("[HookController] GET /api/v1/hooks: sessionId={}", sessionId);
+        }
+        // settings（+ session）与插件 hooks 合并：CC 双通道（getAllHooks + registeredHooks）
         List<com.nexusai.application.agent.permission.hook.IndividualHookConfig> merged =
             new ArrayList<>();
-        if (sessionId != null && !sessionId.isBlank()) {
-            merged.addAll(hooksSettings.getAllHooks(sessionId));
-        } else {
-            merged.addAll(hooksSettings.getAllHooks());
-        }
+        merged.addAll(hooksSettings.getAllHooks(sessionId));
         // 插件 hook（registered matcher store，pluginRoot != null）· 对齐 CC registeredHooks 通道
         if (hookRegistry != null) {
             merged.addAll(hookRegistry.getRegisteredPluginHookConfigs());

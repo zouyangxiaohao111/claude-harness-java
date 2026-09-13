@@ -20,18 +20,25 @@ export interface BackgroundTaskDto {
 }
 
 export const tasksApi = {
-  /** 会话级任务清单（sessionId 可选 · 只列当前会话任务） */
-  list: (sessionId?: string) => api<BackgroundTaskDto[]>(`/tasks${sessionId ? `?sessionId=${sessionId}` : ''}`),
+  /**
+   * 异步任务清单 · `sessionId` **必传**（批 3a：会话级调用方不应省）。
+   *
+   * <p>后端该端点 sessionId 仍为可选（(b) 类：全局「查看更多」视图语义，缺省会 WARN 并返回全部
+   * 会话的任务）。但本封装只服务于**会话级**调用方（MessageList 找当前会话的前台任务、
+   * AsyncTasksPanel 列当前会话任务），省值会让 A 会话看到 B 会话的任务 → 类型上要求必传。
+   */
+  list: (sessionId: string) => api<BackgroundTaskDto[]>(`/tasks?sessionId=${encodeURIComponent(sessionId)}`),
   /** 任务清单合并端点（TaskCreate V2 + TodoWrite V1 · V1/V2 互斥，前端按非空方显示）· GET /tasks/list?sessionId */
   listSnapshot: (sessionId: string) => api<TaskListSnapshotDto>(`/tasks/list?sessionId=${encodeURIComponent(sessionId)}`),
   /** 停止单任务（404 无该任务 / 409 非 running） */
   killTask: (taskId: string) => api<{ success: boolean }>(`/tasks/${encodeURIComponent(taskId)}/kill`, { method: 'POST' }),
   /** 前台任务转后台（对齐 CC Ctrl+B task:background · 后端 backgroundExistingForegroundTask） */
   background: (taskId: string) => api<{ success: boolean }>(`/tasks/${encodeURIComponent(taskId)}/background`, { method: 'POST' }),
-  /** 前台任务全部转后台（对齐 CC Ctrl+B · 会话级可选 · 后端按类型自动分发） */
-  backgroundAll: (sessionId?: string) =>
+  /** 前台任务全部转后台（对齐 CC Ctrl+B）。[批 3a] sessionId 改为**必传**：调用方（App Ctrl+B）
+   *  的语义就是「当前会话」，省值会退化成「全部会话」（后端 (b) 类路径 → WARN + 全量）。 */
+  backgroundAll: (sessionId: string) =>
     api<{ success: boolean; backgrounded: number }>(
-      `/tasks/background-all${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`,
+      `/tasks/background-all?sessionId=${encodeURIComponent(sessionId)}`,
       { method: 'POST' }),
   /** 停止当前会话全部任务（会话级） */
   stopAllTasks: (sessionId: string) => api<{ success: boolean }>(`/tasks/stop-all?sessionId=${sessionId}`, { method: 'POST' }),

@@ -323,6 +323,35 @@ class TaskControllerTest {
     }
 
     @Test
+    @DisplayName("[批 3a] GET /api/v1/tasks/list 缺 sessionId → 400（旧实现回落 MDC，第三态可串会话）")
+    void listTasksMerged_missingSessionId_is400() throws Exception {
+        // WHY（缺值策略 (a)）：taskListId / V1 todos 桶都按会话解析，缺会话等于「不知道列谁的清单」。
+        //   旧实现回落 RequestContext.sessionId()（裸 MDC）—— MDC 第三态会读到上一请求残留的
+        //   **别的会话** id ⇒ 返回别人的任务清单。变异点：改回 MDC 兜底 → 本用例红。
+        mockMvc.perform(get("/api/v1/tasks/list"))
+            .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/v1/tasks/list").param("sessionId", ""))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a] GET /api/v1/tasks（全局视图，(b) 类）sessionId 仍可选：缺省 → 200 全量")
+    void listTasks_globalViewWithoutSessionId_still200() throws Exception {
+        // (b) 类「这条路径本就不需要会话」：前端「查看更多」弹窗要跨会话全量，故本端点保留「可选」语义。
+        //   ⚠ 本用例**只**锁「仍 200 + 全量」；(b) 类要求的「日志 ≥ WARN」不在断言范围内（无法经
+        //   MockMvc 观测日志级别）→ 由源码/评审保证，不在此声称已验证。
+        registerAgent("sess-1");
+        registerAgent("sess-2");
+        mockMvc.perform(get("/api/v1/tasks"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$", hasSize(2)));
+
+        mockMvc.perform(get("/api/v1/tasks").param("sessionId", "sess-1"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$", hasSize(1)));
+    }
+
+    @Test
     @DisplayName("POST /api/v1/tasks/background-all → 前台 agent 后台化（已后台化 + monitor 跳过）")
     void backgroundAll_backgroundsForegroundAgentsOnly() throws Exception {
         // WHY: 对齐 CC Ctrl+B backgroundAll（LocalShellTask.tsx:390-410）——只后台化前台任务；

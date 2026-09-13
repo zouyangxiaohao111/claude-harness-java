@@ -32,6 +32,7 @@ import java.util.List;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -165,7 +166,7 @@ class CommandControllerBuiltInCommandsTest {
     @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("POST /api/command/builtins/clear/execute 200 + type='local' 元数据（薄触发）")
     void executeBuiltin_clear_ok() throws Exception {
-        mockMvc.perform(post("/api/command/builtins/clear/execute"))
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.name").value("clear"))
             .andExpect(jsonPath("$.type").value("local"))
@@ -178,12 +179,12 @@ class CommandControllerBuiltInCommandsTest {
     void executeBuiltin_aliasAndSlash() throws Exception {
         // [RES-④] continue 是 resume 的 alias（BuiltInCommands aliases），命中 resume → 走真实后端
         //   分支，无请求体 → 400（resume 需 agentId）。这验证 alias 解析正确导向 resume 分支。
-        mockMvc.perform(post("/api/command/builtins/continue/execute"))
+        mockMvc.perform(post("/api/command/builtins/continue/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isBadRequest());
         // 前导 '/' 剥除（REST 路径变量含 '/' 需编码 %2F，直接传未编码斜杠在路径中不合法 → 此处验证
         // findByName 的 '/' 剥除语义已在 BuiltInCommandsTest 覆盖；端点经 name 变量透传）。
         // init 非 resume 命令 → 仍返回元数据 DTO（薄触发不变）
-        mockMvc.perform(post("/api/command/builtins/init/execute"))
+        mockMvc.perform(post("/api/command/builtins/init/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.name").value("init"))
             .andExpect(jsonPath("$.type").value("prompt"));
@@ -192,7 +193,7 @@ class CommandControllerBuiltInCommandsTest {
     @Test
     @DisplayName("POST 未知名内置命令 → 404（REST 语义，区别于 CC getCommand 抛 ReferenceError，G-2 已登记）")
     void executeBuiltin_unknown_404() throws Exception {
-        mockMvc.perform(post("/api/command/builtins/nope/execute"))
+        mockMvc.perform(post("/api/command/builtins/nope/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isNotFound());
     }
 
@@ -221,7 +222,6 @@ class CommandControllerBuiltInCommandsTest {
         // WHY: 用户拍板 resume 走后端真实重建（CC resumeAgentBackground），前端消费
         // {agentId, description, outputFile} 轮询任务输出。若返回元数据 DTO 而非 ResumeAgentResult
         // → 前端无法 poll → resume 功能失效。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000b");
         // [R-A6 · A-6] web resume 链路需主会话 AgentState.currentModel()（对齐 CC resumeAgent.ts:131
         //   options.mainLoopModel）：mock registry 返已注册 AgentState（LlmAgentLoop.run() 模型解析后
         //   setCurrentModel + register 的真实形状）。缺此 stub → registry.get 返 null → executeResume
@@ -240,7 +240,7 @@ class CommandControllerBuiltInCommandsTest {
             org.mockito.ArgumentMatchers.isNull()))
             .thenReturn(new ResumeAgentResult("agent-x", "My Agent", expectedOutputFile));
 
-        mockMvc.perform(post("/api/command/builtins/resume/execute")
+        mockMvc.perform(post("/api/command/builtins/resume/execute").param("sessionId", "sess-cmd-test")
                 .contentType("application/json")
                 .content("{\"agentId\":\"00000000-0000-0000-0000-00000000000a\",\"prompt\":\"continue\"}"))
             .andExpect(status().isOk())
@@ -252,20 +252,22 @@ class CommandControllerBuiltInCommandsTest {
     @Test
     @DisplayName("[RES-④] resume 请求体缺 agentId → 400 ValidationException")
     void executeBuiltin_resume_missingAgentId_400() throws Exception {
-        mockMvc.perform(post("/api/command/builtins/resume/execute")
+        mockMvc.perform(post("/api/command/builtins/resume/execute").param("sessionId", "sess-cmd-test")
                 .contentType("application/json")
                 .content("{\"prompt\":\"continue\"}"))
             .andExpect(status().isBadRequest());
     }
 
     @Test
-    @DisplayName("[RES-④] resume 无 MDC sessionId（无会话上下文）→ 500")
-    void executeBuiltin_resume_noSession_500() throws Exception {
-        RequestContext.clear(); // 确保无 MDC sessionId
+    @DisplayName("[批 3a] resume 缺 sessionId → 400（旧实现读 MDC，缺值才 500）")
+    void executeBuiltin_resume_noSessionId_400() throws Exception {
+        // WHY（缺值策略 (a)）：resume 必须知道在哪个会话重建子代理。旧实现读裸 MDC（第三态可读到
+        //   上一请求残留的**别的会话** id）⇒ 会在别人的会话里重建。改为 REST 入口 fail loud 400。
+        //   变异点：把会话校验改回 MDC 兜底 → 本用例红（不再是 400）。
         mockMvc.perform(post("/api/command/builtins/resume/execute")
                 .contentType("application/json")
                 .content("{\"agentId\":\"00000000-0000-0000-0000-00000000000a\",\"prompt\":\"continue\"}"))
-            .andExpect(status().isInternalServerError());
+            .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -275,8 +277,7 @@ class CommandControllerBuiltInCommandsTest {
         //       options.mainLoopModel，fork 父提示重建 + 父模型继承）。mock registry.get() 默认返 null
         //       （AgentState 未注册）→ executeResume 必须 fail loud 抛错而非用假字节续跑（A-6 决策）。
         //       若该门禁缺失，AgentState 未注册时 resume 会静默降级 → fork 父提示无法重建。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000e");
-        mockMvc.perform(post("/api/command/builtins/resume/execute")
+        mockMvc.perform(post("/api/command/builtins/resume/execute").param("sessionId", "sess-cmd-test")
                 .contentType("application/json")
                 .content("{\"agentId\":\"00000000-0000-0000-0000-00000000000a\",\"prompt\":\"continue\"}"))
             .andExpect(status().isInternalServerError());
@@ -289,7 +290,6 @@ class CommandControllerBuiltInCommandsTest {
         // WHY: /clear 必须让后台化会话（Ctrl+B / POST background）不受影响 —— 其 agentId 进 preserved 集合，
         //   invokedSkills 只清主会话/null-agent（CC conversation.ts:93-106 + state.ts:1543-1555）。若
         //   后台化 agentId 未保留，/clear 会把后台会话已加载的 skill 内容清掉，后续继续查询时模型失忆。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000c");
         AgentState state = new AgentState("test-system-prompt");
         when(sessionAgentStateRegistry.get(org.mockito.ArgumentMatchers.any())).thenReturn(state);
         java.util.UUID bgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000aa");
@@ -308,7 +308,7 @@ class CommandControllerBuiltInCommandsTest {
         state.addInvokedSkill("fg-skill", "/s/fg.md", "c", fgAgent);
         state.addInvokedSkill("main-skill", "/s/main.md", "c", null);
 
-        mockMvc.perform(post("/api/command/builtins/clear/execute"))
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isOk());
 
         // 后台化 agent 的 skill 跨 /clear 存活；前台化 + null-agent（主会话）skill 被清
@@ -336,7 +336,7 @@ class CommandControllerBuiltInCommandsTest {
         // 注入 detector（懒建字段直接注入实例；PREVIOUS 为类级静态 Map，任意实例共享）
         ReflectionTestUtils.setField(controller, "promptCacheBreak", detector);
 
-        mockMvc.perform(post("/api/command/builtins/clear/execute"))
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isOk());
 
         assertThat(detector.getTrackedSourceCount())
@@ -351,7 +351,6 @@ class CommandControllerBuiltInCommandsTest {
         // WHY: preserved 非空（后台化任务存在）时 hasPreserved=true → CC caches.ts:63 跳过 reset。
         //       若 Java 无条件 reset，后台化子 agent 的 cache-break tracking 会被误清（跨 /clear
         //       续跑时首次 record 无 prev 参照 → 缓存 break 误报）。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000d");
         AgentState state = new AgentState("test-system-prompt");
         when(sessionAgentStateRegistry.get(org.mockito.ArgumentMatchers.any())).thenReturn(state);
         java.util.UUID bgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000aa");
@@ -369,7 +368,7 @@ class CommandControllerBuiltInCommandsTest {
         assertThat(detector.getTrackedSourceCount()).isEqualTo(1);
         ReflectionTestUtils.setField(controller, "promptCacheBreak", detector);
 
-        mockMvc.perform(post("/api/command/builtins/clear/execute"))
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isOk());
 
         assertThat(detector.getTrackedSourceCount())
@@ -398,7 +397,7 @@ class CommandControllerBuiltInCommandsTest {
     @Test
     @DisplayName("[P0-0/N1] /clear 停用：POST /builtins/clear/execute → 409 显式失败（不再 200 假成功）")
     void executeBuiltin_clear_isDisabled_failsLoud() throws Exception {
-        mockMvc.perform(post("/api/command/builtins/clear/execute"))
+        mockMvc.perform(post("/api/command/builtins/clear/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isConflict())
             .andExpect(jsonPath("$.detail", containsString("已停用")))
             .andExpect(jsonPath("$.detail", containsString("「+」")));
@@ -412,8 +411,8 @@ class CommandControllerBuiltInCommandsTest {
     @Test
     @DisplayName("[P0-0/N1] /clear 别名 reset/new 一并停用（findByName 三维匹配：只拦主名挡不住别名）")
     void executeBuiltin_clearAliases_alsoDisabled() throws Exception {
-        mockMvc.perform(post("/api/command/builtins/reset/execute")).andExpect(status().isConflict());
-        mockMvc.perform(post("/api/command/builtins/new/execute")).andExpect(status().isConflict());
+        mockMvc.perform(post("/api/command/builtins/reset/execute").param("sessionId", "sess-cmd-test")).andExpect(status().isConflict());
+        mockMvc.perform(post("/api/command/builtins/new/execute").param("sessionId", "sess-cmd-test")).andExpect(status().isConflict());
     }
 
     /**
@@ -458,11 +457,10 @@ class CommandControllerBuiltInCommandsTest {
         when(sessionMapper.selectOneById(any())).thenReturn(session);
         EffortCommand effortCommand = new EffortCommand(sessionMapper, sessionAgentStateRegistry);
         ReflectionTestUtils.setField(controller, "effortCommand", effortCommand);
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000f");
         AgentState state = new AgentState("test-system-prompt");
         when(sessionAgentStateRegistry.get(any())).thenReturn(state);
 
-        mockMvc.perform(post("/api/command/builtins/effort/execute")
+        mockMvc.perform(post("/api/command/builtins/effort/execute").param("sessionId", "sess-cmd-test")
                 .contentType("application/json")
                 .content("{\"args\":\"low\"}"))
             .andExpect(status().isOk())
@@ -484,9 +482,51 @@ class CommandControllerBuiltInCommandsTest {
         EffortCommand effortCommand = new EffortCommand(sessionMapper, sessionAgentStateRegistry);
         ReflectionTestUtils.setField(controller, "effortCommand", effortCommand);
 
-        mockMvc.perform(post("/api/command/builtins/effort/execute"))
+        mockMvc.perform(post("/api/command/builtins/effort/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.message").value("Effort level: auto (currently high)"));
+    }
+
+    @Test
+    @DisplayName("[批 3a] POST /builtins/{name}/execute 缺 sessionId → 400（不再读 MDC）")
+    void executeBuiltin_missingSessionId_is400() throws Exception {
+        // WHY（缺值策略 (a)）：通用入口是 /clear 等会话级内置命令的实际落点（DEC-9 薄触发），
+        //   旧实现缺 query 时回落 RequestContext.sessionId()（裸 MDC）—— MDC 第三态会读到上一请求
+        //   残留的**别的会话** id ⇒ /clear 的会话级清理作用到别的会话上。变异点：改回 MDC 兜底 → 红。
+        mockMvc.perform(post("/api/command/builtins/continue/execute"))
+            .andExpect(status().isBadRequest());
+        mockMvc.perform(post("/api/command/builtins/continue/execute").param("sessionId", ""))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a 反向实验] MDC 残留别的会话 id 时不串写：explicit=null 仍 400（回退 MDC 则红）")
+    void executeBuiltin_staleMdcDoesNotLeak() throws Exception {
+        // 装置：MDC 设成一个**合法**会话（模拟「上一请求残留」），请求不带 ?sessionId=。
+        //   若实现回退读 MDC，请求会 200 且按 sess-someone-else 执行会话级副作用 → 用例红。
+        RequestContext.setSession("sess-someone-else");
+        try {
+            mockMvc.perform(post("/api/command/builtins/continue/execute"))
+                .andExpect(status().isBadRequest());
+        } finally {
+            RequestContext.clear();
+        }
+    }
+
+    @Test
+    @DisplayName("[批 3a] POST /builtins/effort/execute 缺 sessionId → 400（C 类死参：端点此前根本无此入参）")
+    void executeEffortBuiltin_missingSessionId_is400() throws Exception {
+        // WHY：/effort 写的是**会话级**档位（V31 sessions.effort_level + 会话 AgentState）。旧实现
+        //   字面端点无 sessionId 入参、EffortCommand 只读 MDC ⇒ 前端纵使带 ?sessionId= 也是死参，
+        //   且 MDC 第三态会把档位写到别的会话。变异点：把会话校验删掉 → 本用例红（不再 400）。
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ReflectionTestUtils.setField(controller, "effortCommand",
+            new EffortCommand(sessionMapper, sessionAgentStateRegistry));
+        mockMvc.perform(post("/api/command/builtins/effort/execute")
+                .contentType("application/json")
+                .content("{\"args\":\"low\"}"))
+            .andExpect(status().isBadRequest());
+        verify(sessionMapper, org.mockito.Mockito.never()).selectOneById(anyString());
     }
 
     @Test
@@ -494,7 +534,7 @@ class CommandControllerBuiltInCommandsTest {
     void executeBuiltin_effort_notWired_500() throws Exception {
         // WHY: effort 后端执行依赖 EffortCommand 组件；未接线（plain JUnit 未注入）→ fail loud
         //   （对齐 executeResume 的 resumeService 未接线 → 500 模式），不静默降级。
-        mockMvc.perform(post("/api/command/builtins/effort/execute"))
+        mockMvc.perform(post("/api/command/builtins/effort/execute").param("sessionId", "sess-cmd-test"))
             .andExpect(status().isInternalServerError());
     }
 
@@ -515,10 +555,8 @@ class CommandControllerBuiltInCommandsTest {
         when(dispatcher.dispatchResult("/compact"))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 5 messages"));
-        RequestContext.setSession("sess-compact1");
 
-        mockMvc.perform(post("/api/command/builtins/compact/execute")
-                .param("sessionId", "sess-compact1"))
+        mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact1"))
             .andExpect(status().isOk())
             .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.content()
                 .string(org.hamcrest.Matchers.containsString("Compacted 5 messages")));
@@ -526,20 +564,21 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
-    @DisplayName("compact 无会话标识 → 200 中文说明（需 ?sessionId=，对齐 CC /compact 在当前会话压缩）")
-    void executeCompactBuiltin_noSession_returnsGuidance() throws Exception {
-        // WHY: CC 无「无会话 /compact」——命令必须知道压缩哪个会话。前端漏带 ?sessionId=（日志实证
-        //   曾无会话调用）→ 返回可理解的中文引导而非静默 / 误导错。
+    @DisplayName("[批 3a] compact 无会话标识 → 400（旧实现 200 + 中文说明文本，HTTP 层是成功码）")
+    void executeCompactBuiltin_noSession_is400() throws Exception {
+        // WHY（缺值策略 (a)）：CC 无「无会话 /compact」——命令必须知道压缩哪个会话。旧实现回落 MDC
+        //   （第三态可读到别的会话 id ⇒ 压缩错会话），且缺值时返回 200 + 中文文本 ⇒ 调用方无法按
+        //   状态码分流「成功/拒绝」。变异点：把会话校验改回 200+文本 → 本用例红。
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        RequestContext.clear();
 
-        // content().string() 默认 ISO-8859-1 会乱码中文 → 用 UTF-8 显式解码后断言
-        String body = mockMvc.perform(post("/api/command/builtins/compact/execute"))
-            .andExpect(status().isOk()).andReturn().getResponse()
-            .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
-        assertThat(body).contains("缺少会话标识");
+        mockMvc.perform(post("/api/command/builtins/compact/execute"))
+            .andExpect(status().isBadRequest());
+        mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", ""))
+            .andExpect(status().isBadRequest());
+        // fail loud：不得进入 dispatch（不压缩任何会话）
+        verify(dispatcher, org.mockito.Mockito.never()).dispatchResult(anyString());
     }
 
     @Test
@@ -551,10 +590,8 @@ class CommandControllerBuiltInCommandsTest {
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         when(dispatcher.dispatchResult("/compact")).thenReturn(null);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        RequestContext.setSession("sess-compact2");
 
-        String body = mockMvc.perform(post("/api/command/builtins/compact/execute")
-                .param("sessionId", "sess-compact2"))
+        String body = mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact2"))
             .andExpect(status().isOk()).andReturn().getResponse()
             .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
         assertThat(body).contains("命令未注册");
@@ -564,8 +601,7 @@ class CommandControllerBuiltInCommandsTest {
     @DisplayName("UserInputDispatcher 未注入（非容器）→ compact fail loud 500（对齐 effort/resume 模式）")
     void executeCompactBuiltin_notWired_500() throws Exception {
         // setUp 未注入 userInputDispatcher → null → 抛 IllegalStateException（GlobalExceptionHandler → 500）
-        mockMvc.perform(post("/api/command/builtins/compact/execute")
-                .param("sessionId", "sess-compact3"))
+        mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact3"))
             .andExpect(status().isInternalServerError());
     }
 
@@ -588,10 +624,8 @@ class CommandControllerBuiltInCommandsTest {
         when(dispatcher.dispatchResult("/compact 用中文总结"))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 5 messages"));
-        RequestContext.setSession("sess-compact-args");
 
-        mockMvc.perform(post("/api/command/builtins/compact/execute")
-                .param("sessionId", "sess-compact-args")
+        mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact-args")
                 .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
                 .content("{\"args\":\"用中文总结\"}"))
             .andExpect(status().isOk())
@@ -612,10 +646,8 @@ class CommandControllerBuiltInCommandsTest {
         when(dispatcher.dispatchResult("/compact"))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 1 messages"));
-        RequestContext.setSession("sess-compact-blank");
 
-        mockMvc.perform(post("/api/command/builtins/compact/execute")
-                .param("sessionId", "sess-compact-blank"))
+        mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact-blank"))
             .andExpect(status().isOk());
         verify(dispatcher).dispatchResult("/compact");
     }
@@ -638,10 +670,8 @@ class CommandControllerBuiltInCommandsTest {
         when(dispatcher.dispatchResult(any()))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 7 messages"));
-        RequestContext.setSession("sess-compact-p218");
 
-        String body = mockMvc.perform(post("/api/command/builtins/compact/execute")
-                .param("sessionId", "sess-compact-p218"))
+        String body = mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact-p218"))
             .andExpect(status().isOk()).andReturn().getResponse()
             .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
         assertThat(body).as("字面端点必须真实执行（displayText），不得退化为元数据 DTO")
@@ -662,10 +692,10 @@ class CommandControllerBuiltInCommandsTest {
         when(dispatcher.dispatchResult("/compact"))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted generic"));
-        RequestContext.setSession("sess-compact-p218b");
 
+        // [批 3a] executeBuiltinInternal 现为 3 参（会话由包装层显式传入，不再读 MDC）
         Object result = ReflectionTestUtils.invokeMethod(
-            controller, "executeBuiltinInternal", "compact", null);
+            controller, "executeBuiltinInternal", "compact", null, "sess-compact-p218b");
 
         verify(dispatcher).dispatchResult("/compact");
         assertThat(result).as("通用分支对 compact 必须真实执行（displayText），而非返回 BuiltInCommandDto 元数据")

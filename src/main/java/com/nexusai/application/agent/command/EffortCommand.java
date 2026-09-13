@@ -2,7 +2,6 @@ package com.nexusai.application.agent.command;
 
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.infra.llm.EffortSupport;
 import com.nexusai.repository.session.entity.SessionRecord;
@@ -36,7 +35,7 @@ import java.util.UUID;
  *
  * <p>L3（Java idiom）：TS `onDone(message)` → Java 返回 {@link EffortCommandResult}（message +
  * effortValue 会话更新值）；TS `useAppState`/`setAppState` → 经
- * {@link SessionAgentStateRegistry} 按 MDC sessionId 解析主会话 {@link AgentState}（P1-6 注册表）；
+ * {@link SessionAgentStateRegistry} 按显式 sessionId 解析主会话 {@link AgentState}（P1-6 注册表）；
  * TS `updateSettingsForSource('userSettings', {effortLevel})` → 会话级 {@link SessionMapper}
  * （写 sessions.effort_level，V31 列）。
  */
@@ -84,9 +83,12 @@ public class EffortCommand {
     /**
      * 主入口 · 对齐 CC effort.tsx:171-182 call() 参数分支（trim → help → current → executeEffort）。
      *
-     * @param args 斜杠命令参数字符串（可为 null/空）
+     * @param args      斜杠命令参数字符串（可为 null/空）
+     * @param sessionId 当前会话标识（<b>由 REST 入口显式传入</b>，批 3a：不再读
+     *                  {@code RequestContext.sessionId()} 的裸 MDC —— MDC 第三态会读到上一请求
+     *                  残留的**别的会话** id ⇒ 把 effort 档位写到别的会话上）
      */
-    public EffortCommandResult handle(String args) {
+    public EffortCommandResult handle(String args, String sessionId) {
         String trimmed = args == null ? "" : args.trim();
         if (COMMON_HELP_ARGS.contains(trimmed)) {
             if (log.isDebugEnabled()) {
@@ -95,9 +97,9 @@ public class EffortCommand {
             return new EffortCommandResult(HELP_TEXT, null);
         }
         if (trimmed.isEmpty() || "current".equals(trimmed) || "status".equals(trimmed)) {
-            return showCurrentEffort();
+            return showCurrentEffort(sessionId);
         }
-        return executeEffort(trimmed);
+        return executeEffort(trimmed, sessionId);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -113,9 +115,9 @@ public class EffortCommand {
      * （{@code Effort level: auto (currently X)}，getDisplayedEffortLevel 兜底 'high'）；有有效值 →
      * {@code Current effort level: X (desc)}。
      */
-    private EffortCommandResult showCurrentEffort() {
-        String appStateEffort = resolveSessionEffortValue();
-        String model = resolveCurrentModel();
+    private EffortCommandResult showCurrentEffort(String sessionId) {
+        String appStateEffort = resolveSessionEffortValue(sessionId);
+        String model = resolveCurrentModel(sessionId);
         EffortSupport.EffortEnvOverride env = readEnvOverride();
         String effectiveValue;
         if (env.suppress()) {
@@ -146,20 +148,20 @@ public class EffortCommand {
     /**
      * 执行 set 分支 · CC original: {@code executeEffort}（effort.tsx:107-118）。
      *
-     * <p>auto/unset → {@link #unsetEffortLevel()}；非 {@code EFFORT_LEVELS}（low/medium/high/xhigh/max）→
+     * <p>auto/unset → {@link #unsetEffortLevel(sessionId)}；非 {@code EFFORT_LEVELS}（low/medium/high/xhigh/max）→
      * 非法值报错（effort.tsx:113-115 字面量；[用户拍板 2026-08-22] 合法值加 xhigh，对齐 CC 新版本 UI）；否则
      * {@link #setEffortValue}。
      */
-    private EffortCommandResult executeEffort(String args) {
+    private EffortCommandResult executeEffort(String args, String sessionId) {
         String normalized = args.toLowerCase(Locale.ROOT);
         if ("auto".equals(normalized) || "unset".equals(normalized)) {
-            return unsetEffortLevel();
+            return unsetEffortLevel(sessionId);
         }
         // [V32] ultracode 特殊档：ultracode = xhigh effort + workflows 编排启用（用户拍板后端应有此概念）。
         //   effort 层落 xhigh（对齐前端 mapToBackend），sessions.ultracode_enabled 置 true；workflows 编排
         //   执行 Java 未实现（WorkflowTool stub，workflow-align 后置），本期持久化开关 + 展示。
         if ("ultracode".equals(normalized)) {
-            return setUltracodeMode();
+            return setUltracodeMode(sessionId);
         }
         if (!EffortSupport.isEffortLevel(normalized)) {
             String message = "Invalid argument: " + args + ". Valid options are: low, medium, high, xhigh, max, ultracode, auto";
@@ -168,7 +170,7 @@ public class EffortCommand {
             }
             return new EffortCommandResult(message, null);
         }
-        return setEffortValue(normalized);
+        return setEffortValue(normalized, sessionId);
     }
 
     /**
@@ -178,9 +180,9 @@ public class EffortCommand {
      * workflows 编排执行 Java 未实现（WorkflowTool stub，探查 workflow-align P0-P3 后置）——待编排就绪后
      * 本模式自动触发 workflow 脚本执行。env 冲突判定同 setEffortValue（CLAUDE_CODE_EFFORT_LEVEL 覆盖 effort 层）。
      */
-    private EffortCommandResult setUltracodeMode() {
+    private EffortCommandResult setUltracodeMode(String sessionId) {
         try {
-            writeSessionUltracode(true);
+            writeSessionUltracode(sessionId, true);
         } catch (Exception e) {
             log.warn("[EffortCommand] /effort ultracode 写入会话失败: {}", e.getMessage());
             return new EffortCommandResult("Failed to enable ultracode: " + e.getMessage(), null);
@@ -193,7 +195,7 @@ public class EffortCommand {
         if (log.isDebugEnabled()) {
             log.debug("[EffortCommand] /effort ultracode 启用：会话 ultracode_enabled=true + effort_level=xhigh");
         }
-        applyEffortValue("xhigh");
+        applyEffortValue(sessionId, "xhigh");
         return new EffortCommandResult(message, "xhigh");
     }
 
@@ -208,9 +210,9 @@ public class EffortCommand {
      * （effort.tsx:35-51）：冲突 → 会话值仍生效（effortUpdate）但消息提示 env 覆盖胜出；无冲突 →
      * 成功消息 {@code Set effort level to X: desc}。写会话失败 → 仅报错不设会话（CC 返回无 effortUpdate）。
      */
-    private EffortCommandResult setEffortValue(String effortValue) {
+    private EffortCommandResult setEffortValue(String effortValue, String sessionId) {
         try {
-            writeSessionEffort(effortValue);
+            writeSessionEffort(sessionId, effortValue);
         } catch (Exception e) {
             log.warn("[EffortCommand] /effort 写入会话 effort_level 失败: {} - {}", effortValue,
                 e.getMessage());
@@ -226,7 +228,7 @@ public class EffortCommand {
                 log.debug("[EffortCommand] /effort set '{}' 被 env 覆盖（{}）→ 会话仍写但提示清 env",
                     effortValue, env.raw());
             }
-            applyEffortValue(effortValue);
+            applyEffortValue(sessionId, effortValue);
             return new EffortCommandResult(message, effortValue);
         }
         String description = EffortSupport.getEffortValueDescription(effortValue);
@@ -235,7 +237,7 @@ public class EffortCommand {
             log.debug("[EffortCommand] /effort set '{}' 成功（env 无冲突）→ 会话写入",
                 effortValue);
         }
-        applyEffortValue(effortValue);
+        applyEffortValue(sessionId, effortValue);
         return new EffortCommandResult(message, effortValue);
     }
 
@@ -247,9 +249,9 @@ public class EffortCommand {
      * + 会话 effortValue=null。env 钉死档位（pinsLevel）→ 提示 env 仍控制本会话；否则
      * {@code Effort level set to auto}。
      */
-    private EffortCommandResult unsetEffortLevel() {
+    private EffortCommandResult unsetEffortLevel(String sessionId) {
         try {
-            writeSessionEffort(null);   // effortValue=null 时已在 writeSessionEffort 内连带清 ultracode（V32）
+            writeSessionEffort(sessionId, null);   // effortValue=null 时已在 writeSessionEffort 内连带清 ultracode（V32）
         } catch (Exception e) {
             log.warn("[EffortCommand] /effort auto 清除会话 effort_level 失败: {}", e.getMessage());
             return new EffortCommandResult("Failed to set effort level: " + e.getMessage(), null);
@@ -261,13 +263,13 @@ public class EffortCommand {
             if (log.isDebugEnabled()) {
                 log.debug("[EffortCommand] /effort auto 已清会话，但 env {} 钉死本会话 → 提示", env.raw());
             }
-            applyEffortValue(null);
+            applyEffortValue(sessionId, null);
             return new EffortCommandResult(message, null);
         }
         if (log.isDebugEnabled()) {
             log.debug("[EffortCommand] /effort auto 清除完成（会话 effort_level + AgentState），无 env 钉死 → 成功");
         }
-        applyEffortValue(null);
+        applyEffortValue(sessionId, null);
         return new EffortCommandResult("Effort level set to auto", null);
     }
 
@@ -276,19 +278,20 @@ public class EffortCommand {
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * 解析当前会话 DB 主键 · 经 {@link RequestContext#sessionId()}（MDC）取当前会话标识。
+     * 解析当前会话 DB 主键 · 由调用方<b>显式传入</b> sessionId（批 3a：不再读
+     * {@code RequestContext.sessionId()} 的裸 MDC —— MDC 第三态可读到上一请求残留的别的会话 id，
+     * 使 effort 写入落到别的会话行上）。
      *
-     * <p>[session-id-short] MDC sessionId 已统一 short（sess-xxx）→ 直返；存量旧 DB 行
+     * <p>[session-id-short] sessionId 已统一 short（sess-xxx）→ 直返；存量旧 DB 行
      * （派生 UUID 串）保留 {@link SessionKeys#originalKey(String)} 兜底分支（@Deprecated 兼容层）。
-     * 无 MDC sessionId（命令缺会话上下文）→ null（写会话跳过，保既有 null-safe 模式）。
+     * sessionId 为 null/空白（调用方无会话上下文）→ null（写会话跳过，保既有 null-safe 模式）。
      */
-    private String resolveSessionKey() {
-        String sessionIdStr = RequestContext.sessionId();
-        if (sessionIdStr == null) {
+    private String resolveSessionKey(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
-        String key = SessionKeys.originalKey(sessionIdStr);
-        return key != null ? key : sessionIdStr;
+        String key = SessionKeys.originalKey(sessionId);
+        return key != null ? key : sessionId;
     }
 
     /**
@@ -308,11 +311,11 @@ public class EffortCommand {
      *
      * @param enabled true = 启用 ultracode（effort_level=xhigh）；false = 关闭（effort_level 置 xhigh 兜底）
      */
-    private void writeSessionUltracode(boolean enabled) {
-        String sessionKey = resolveSessionKey();
+    private void writeSessionUltracode(String sessionId, boolean enabled) {
+        String sessionKey = resolveSessionKey(sessionId);
         if (sessionKey == null) {
             if (log.isDebugEnabled()) {
-                log.debug("[EffortCommand] 无 MDC sessionId → ultracode 会话写入跳过（仅 AgentState 运行时）");
+                log.debug("[EffortCommand] 无 sessionId → ultracode 会话写入跳过（仅 AgentState 运行时）");
             }
             return;
         }
@@ -331,11 +334,11 @@ public class EffortCommand {
         }
     }
 
-    private void writeSessionEffort(String effortValue) {
-        String sessionKey = resolveSessionKey();
+    private void writeSessionEffort(String sessionId, String effortValue) {
+        String sessionKey = resolveSessionKey(sessionId);
         if (sessionKey == null) {
             if (log.isDebugEnabled()) {
-                log.debug("[EffortCommand] 无 MDC sessionId（无会话上下文）→ 会话 effort_level 写入跳过（仅 AgentState 运行时写入）");
+                log.debug("[EffortCommand] 无 sessionId（无会话上下文）→ 会话 effort_level 写入跳过（仅 AgentState 运行时写入）");
             }
             return;
         }
@@ -365,14 +368,14 @@ public class EffortCommand {
     // ════════════════════════════════════════════════════════════════════════
 
     /** 会话级 effort 值 · 对齐 CC appState.effortValue（AgentState.java:652-671 [C-31]）。 */
-    private String resolveSessionEffortValue() {
-        AgentState state = resolveSessionState();
+    private String resolveSessionEffortValue(String sessionId) {
+        AgentState state = resolveSessionState(sessionId);
         return state != null ? state.effortValue() : null;
     }
 
     /** 会话当前模型 · 对齐 CC useMainLoopModel → AgentState.currentModel()（RES-C7）。 */
-    private String resolveCurrentModel() {
-        AgentState state = resolveSessionState();
+    private String resolveCurrentModel(String sessionId) {
+        AgentState state = resolveSessionState(sessionId);
         return state != null ? state.currentModel() : null;
     }
 
@@ -380,11 +383,11 @@ public class EffortCommand {
      * 写会话级 effort 值 · 对齐 CC ApplyEffortAndClose（effort.tsx:134-170
      * {@code setAppState(prev => ({...prev, effortValue}))}）。
      *
-     * <p>经 {@link SessionAgentStateRegistry} 按 MDC sessionId 解析主会话 AgentState；
+     * <p>经 {@link SessionAgentStateRegistry} 按显式 sessionId 解析主会话 AgentState；
      * 无会话上下文 / 未注册 → debug skip（保测试兼容，对齐 CommandController 既有 null-safe 模式）。
      */
-    private void applyEffortValue(String effortValue) {
-        AgentState state = resolveSessionState();
+    private void applyEffortValue(String sessionId, String effortValue) {
+        AgentState state = resolveSessionState(sessionId);
         if (state == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[EffortCommand] 会话 AgentState 不可得（无 MDC sessionId 或未注册）→ 会话 effortValue 写入跳过");
@@ -398,16 +401,16 @@ public class EffortCommand {
         }
     }
 
-    /** 按 MDC sessionId 解析主会话 AgentState（P1-6 注册表），不可得 → null。
-     *  [session-id-short] MDC sessionId 已 short 直键 registry（不再 UUID.fromString）。 */
-    private AgentState resolveSessionState() {
+    /** 按<b>显式传入</b>的 sessionId 解析主会话 AgentState（P1-6 注册表），不可得 → null。
+     *  [session-id-short] sessionId 已 short 直键 registry（不再 UUID.fromString）。
+     *  [批 3a] 不再读 RequestContext.sessionId()（裸 MDC，第三态可跨会话串值）。 */
+    private AgentState resolveSessionState(String sessionId) {
         if (sessionAgentStateRegistry == null) {
             return null;
         }
-        String sessionIdStr = RequestContext.sessionId();
-        if (sessionIdStr == null) {
+        if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
-        return sessionAgentStateRegistry.get(sessionIdStr);
+        return sessionAgentStateRegistry.get(sessionId);
     }
 }

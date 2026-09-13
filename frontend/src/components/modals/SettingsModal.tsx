@@ -49,6 +49,9 @@ interface SettingsModalProps {
   clearFast: () => void
   /** 打开记忆编辑器（设置页「环境配置」tab「记忆」模块入口；独立弹窗，z-index 高于本弹窗） */
   onOpenMemoryEditor: () => void
+  /** [批 3a] 当前活动会话 id：hook 列表 / 记忆配置（dreamStatus 为 per-project）后端口已必填
+   *  sessionId，缺值 400。null = 无活动会话 → 相应面板呈现显式错误态。 */
+  sessionId?: string | null
 }
 
 const THEME_LABELS: Record<ThemeMode, string> = {
@@ -101,6 +104,7 @@ export function SettingsModal({
   pickFast,
   clearFast,
   onOpenMemoryEditor,
+  sessionId,
 }: SettingsModalProps) {
   // 挂载时从后端读全局设置并初始化（仅当后端有值时覆盖本地默认；读取失败 toast 提示）
   useEffect(() => {
@@ -260,7 +264,7 @@ export function SettingsModal({
               </>
             )}
             {settingsTab === 'env' && (
-              <EnvConfigPanel settings={appSettings} onSaveSettings={onSaveSettings} onOpenMemoryEditor={onOpenMemoryEditor} />
+              <EnvConfigPanel settings={appSettings} onSaveSettings={onSaveSettings} onOpenMemoryEditor={onOpenMemoryEditor} sessionId={sessionId} />
             )}
             {settingsTab === 'model' && (
               <ModelSettingsPanel
@@ -280,7 +284,7 @@ export function SettingsModal({
             {settingsTab === 'schedules' && <SchedulesPanel schedulesApi={schedulesApi} showToast={showToast} />}
             {settingsTab === 'hooks' && (
               <>
-                <HookPanel />
+                <HookPanel sessionId={sessionId} />
                 {/* [V61] 插件管理（Hooks 下方 · enabledPlugins 启停 + pluginClaudeFallback 双读开关 + 导入 CC） */}
                 <PluginPanel settings={appSettings} onSaveSettings={onSaveSettings} />
               </>

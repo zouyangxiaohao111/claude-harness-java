@@ -12,8 +12,10 @@ export function useCommand() {
     catch (e) { setError(e instanceof ApiError ? e.userMessage() : String(e)) }
   }, [])
 
-  const execute = useCallback(async (name: string) => {
-    await commandApi.executeBuiltin(name)
+  // [批 3a] 后端口 sessionId 必传（缺值 400）——本 hook 是 CLI 时代的薄封装，无会话源，
+  //   故把 sessionId 上提为调用方入参（本 hook 目前无调用方，保留不删）。
+  const execute = useCallback(async (name: string, sessionId: string) => {
+    await commandApi.executeBuiltin(name, sessionId)
   }, [])
 
   useEffect(() => { void refresh() }, [refresh])

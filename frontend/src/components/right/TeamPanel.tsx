@@ -93,11 +93,13 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
       return
     }
     let cancelled = false
+    // [批 3a] narrow 到非空会话（上面的 guard 已在闭包外收窄；闭包内 TS 会放宽回 string|null）
+    const sid = sessionId
     // silent：轮询刷新不闪 loading（避免「加载中…」↔ 状态卡高度切换顶动下方模块 → 整个任务 tab 抖动）
     const fetchTeam = (silent = false) => {
       if (!silent) setLoading(true)
       sessionApi
-        .get(sessionId)
+        .get(sid)
         .then((s) => {
           if (cancelled) return
           const tc = s.teamContext ?? null
@@ -108,7 +110,7 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
             // 方案3：STOMP 订阅键 = leadSessionId（创建团队的会话），从 teamContext 透出
             setTeamName(name, tc?.leadSessionId ?? null)
             // 详情拉取失败不阻塞：状态卡仍可凭 teamName/leadAgentId 渲染
-            teamsApi.get(name).then(setTeam).catch(() => {})
+            teamsApi.get(name, sid).then(setTeam).catch(() => {})
           } else {
             // 会话无 team（非团队会话 / 后端已清 teamContext）→ 清空团队态
             clearTeam()
@@ -138,12 +140,18 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
 
   /** 创建团队（409「你已领导一个团队」由后端 userMessage 透出） */
   const handleCreate = async (v: { teamName: string; description?: string; agentType?: string }) => {
+    // [批 3a] 后端 sessionId 必填（team 的 leadSessionId 归属）。旧实现 `sessionId ?? undefined`
+    //   在无会话时把字段整个省掉 → 后端 400 或建出无会话锚的 team；改为显式前置拒绝。
+    if (!sessionId) {
+      showToast('无活动会话：创建团队需先打开一个会话', 'info')
+      return
+    }
     try {
       const created = await teamsApi.create({
         teamName: v.teamName.trim(),
         description: v.description?.trim() || undefined,
         agentType: v.agentType?.trim() || undefined,
-        sessionId: sessionId ?? undefined,
+        sessionId,
       })
       setShowCreate(false)
       // 后端重名自动换名 → 以响应名为准；leadSessionId 透出 → STOMP 订阅键
@@ -159,10 +167,10 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
 
   /** 解散团队：活跃成员先收 shutdown_request，仍活跃后端返回 409 */
   const dissolveTeam = async () => {
-    if (!teamName) return
+    if (!teamName || !sessionId) return
     if (!confirm('解散团队？活跃成员会先收到关闭请求')) return
     try {
-      await teamsApi.remove(teamName)
+      await teamsApi.remove(teamName, sessionId)
       clearTeam()
       setTeamContext(null)
       showToast('团队已解散', 'success')
@@ -185,13 +193,13 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
 
   /** 停止成员任务（非 lead 成员卡 ⏹ · kill 后成员从 config 移除 → 刷新团队） */
   const killMember = async (agentId: string) => {
-    if (!teamName) return
+    if (!teamName || !sessionId) return
     try {
       const res = await teamsApi.kill(teamName, agentId)
       if (!res?.success) { showToast('停止失败', 'info'); return }
       showToast(`已停止 @${agentId.split('@')[0]}`, 'success')
       // kill 后成员从 config 移除 → 刷新团队详情
-      const updated = await teamsApi.get(teamName)
+      const updated = await teamsApi.get(teamName, sessionId)
       setTeam(updated)
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
@@ -201,14 +209,14 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
   /** 添加成员 = spawn 真实子代理（Agent 工具 input 带 name → 后端写 config + 跑进程）。
    *  对齐 CC spawnMultiAgent：name 是成员唯一显示名（agentId = name@team），缺 name 后端只 fork 不入队。 */
   const addMember = async (v: { name: string; subagentType?: string; prompt?: string }) => {
-    if (!teamName) return
+    if (!teamName || !sessionId) return
     const name = v.name.trim()
     if (!name) {
       showToast('请填写成员名称（name 必填 · 作为成员唯一显示名）', 'info')
       return
     }
     try {
-      const updated = await teamsApi.spawnMember(teamName, {
+      const updated = await teamsApi.spawnMember(teamName, sessionId, {
         name,
         subagentType: v.subagentType?.trim() || 'general-purpose',
         prompt: v.prompt?.trim() || undefined,

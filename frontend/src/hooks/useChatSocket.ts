@@ -106,7 +106,8 @@ function subscribeTeamTopics(client: Client, leadSessionId: string) {
       } else if (evt.eventType === 'created' || evt.eventType === 'member_joined' || evt.eventType === 'member_left') {
         // created（团队创建）/ member_joined / member_left（成员增删）→ 以响应为准刷新详情 + 保留订阅键
         st.setTeamName(evt.teamName, leadSessionId)
-        teamsApi.get(evt.teamName).then(st.setTeam).catch(() => {})
+        // [批 3a] sessionId 必传：订阅键 leadSessionId 即该 team 的 lead 会话（后端按它做会话隔离校验）
+        teamsApi.get(evt.teamName, leadSessionId).then(st.setTeam).catch(() => {})
       }
     } catch { /* 非法载荷忽略 */ }
   })

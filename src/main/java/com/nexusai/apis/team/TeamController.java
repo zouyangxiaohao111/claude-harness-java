@@ -65,7 +65,7 @@ import java.util.stream.Stream;
  * <p>状态变化 STOMP：创建/解散/成员加入退出 → TeamStatusPublisher 推
  * {@code /topic/teams/{teamName}/status}（design doc §3.3）。REST 风格对齐 McpServerController
  * （@RestController + @RequestMapping + @Autowired 字段注入）；sessionId 解析对齐 MemoryController
- * （query ?sessionId= → MDC 兜底）。错误契约：ValidationException→400 / ConflictException→409 /
+ * （批 3a：query {@code ?sessionId=} **必填**，缺 ⇒ 400；不再回落 MDC）。错误契约：ValidationException→400 / ConflictException→409 /
  * NotFoundException→404（GlobalExceptionHandler 转 RFC 7807）。
  */
 @RestController
@@ -85,23 +85,32 @@ public class TeamController {
     @Autowired(required = false) private SpawnInProcess spawnInProcess;
 
     /**
-     * sessionId 解析：query ?sessionId= → MDC 兜底；写 MDC（MemoryController:121-139 同款）。
-     * 返回 null 表示无会话上下文（create 建 team 不落会话列，fail-soft）。
+     * [批 3a] 会话标识解析 · REST 入口**必填**（(a) 类 fail loud）：缺 / 空白 ⇒ 400。
+     *
+     * <p>旧实现（query {@code ?sessionId=} → {@code RequestContext.sessionId()} 裸 MDC 兜底 → 仍可
+     * null）有两个缺陷：<b>①</b> MDC 第三态会读到上一请求残留的**别的会话** id ⇒ 以别的会话身份
+     * 建/查/删 team；<b>②</b> 返回 null 被下游当「无会话上下文」静默降级（{@code list} 更因此跳过
+     * 会话过滤返回**全部会话**的 team = 跨会话名册泄漏，见 {@link #list}）。
+     *
+     * <p>解析成功写 MDC（单向传播，喂会话级下游；绝不读回）。
      */
-    private String resolveSessionId(String sessionIdParam) {
-        String sid = (sessionIdParam != null && !sessionIdParam.isBlank())
-                ? sessionIdParam : RequestContext.sessionId();
-        if (sid != null) {
-            RequestContext.setSession(sid);
+    private String requireSessionId(String sessionIdParam, String endpoint) {
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            log.warn("[TeamController] {} 缺少会话标识 ?sessionId= → 400（会话态显式化，不再回落 MDC）",
+                endpoint);
+            throw new ValidationException("sessionId is required (" + endpoint + ")");
         }
-        return sid;
+        RequestContext.setSession(sessionIdParam);
+        return sessionIdParam;
     }
 
     /**
-     * [team-panel-backend-bugfix] 从 team config.json 读 leadSessionId（public
-     * {@link TeamHelpers#readConfig} 返回 JSON 字符串，ENOENT → null；config 由创建时
-     * {@code TeamCreateTool.buildConfigJson} 写入 leadSessionId）。REST 解散前端默认不带
-     * sessionId → 反查该列兜底清 sessions.team_context，防残留。
+     * 从 team config.json 读 leadSessionId（public {@link TeamHelpers#readConfig} 返回 JSON
+     * 字符串，ENOENT → null；config 由创建时 {@code TeamCreateTool.buildConfigJson} 写入
+     * leadSessionId）。用途 = <b>会话隔离判据</b>（list/get 比对调用方会话）+ spawnMember 的
+     * parentSessionId（team 的 lead 会话）。
+     * <p>[批 3a] 旧 javadoc 所载「REST 解散前端默认不带 sessionId → 反查该列兜底」的用途已删除：
+     * delete 现为 sessionId 必填（缺 ⇒ 400），不再用 config 反查替换调用方身份。
      *
      * @param teamName 团队名
      * @return config.leadSessionId（字符串）；config 缺失 / 解析失败 → null
@@ -124,14 +133,18 @@ public class TeamController {
     /**
      * GET /api/v1/teams → 枚举 {configHome}/teams 下含 config.json 的子目录 → List&lt;TeamDto&gt;。
      *
-     * <p>[team-panel-backend-bugfix2] 会话隔离（用户拍板「不同会话看到不同 team」）：带 sessionId →
-     * 仅返回 {@code config.leadSessionId == sessionId} 的 team（对齐 multi-session-vs-cc-single-session
-     * 铁律 + STOMP 事件按 leadSessionId 推会话级 topic）；sessionId 缺失 → fail-loud 空列表
-     * （不回退全局，防跨会话名册泄漏）。
+     * <p>[team-panel-backend-bugfix2] 会话隔离（用户拍板「不同会话看到不同 team」）：仅返回
+     * {@code config.leadSessionId == sessionId} 的 team（对齐 multi-session-vs-cc-single-session
+     * 铁律 + STOMP 事件按 leadSessionId 推会话级 topic）。
+     *
+     * <p><b>[批 3a 缺陷修复]</b> 旧实现：{@code sid} 为 null 时**跳过**整个会话过滤 → 返回
+     * <b>全部会话</b>的 team（跨会话名册泄漏）；而同文件旧 javadoc 自称「sessionId 缺失 →
+     * fail-loud 空列表（不回退全局，防跨会话名册泄漏）」——是<b>假注释</b>（代码从不产生空列表）。
+     * 现 sessionId <b>必填</b>（缺 ⇒ 400），过滤无条件生效，泄漏路径从结构上不存在。
      */
     @GetMapping
-    public List<TeamDto> list(@RequestParam(required = false) String sessionId) {
-        String sid = resolveSessionId(sessionId);
+    public List<TeamDto> list(@RequestParam(value = "sessionId", required = false) String sessionId) {
+        String sid = requireSessionId(sessionId, "GET /api/v1/teams");
         Path teamsDir = TeammateMailbox.getTeamsDir();
         List<TeamDto> out = new ArrayList<>();
         if (Files.isDirectory(teamsDir)) {
@@ -140,11 +153,9 @@ public class TeamController {
                         .filter(dir -> Files.exists(dir.resolve("config.json")))
                         .forEach(dir -> {
                             String teamName = dir.getFileName().toString();
-                            if (sid != null && !sid.isBlank()) {
-                                String lead = leadSessionIdFromConfig(teamName);
-                                if (!sid.equals(lead)) {
-                                    return;
-                                }
+                            String lead = leadSessionIdFromConfig(teamName);
+                            if (!sid.equals(lead)) {
+                                return;     // 非本会话领导的 team → 不返回（跨会话名册隔离）
                             }
                             TeamDto dto = teamStatusPublisher.toDto(teamName);
                             if (dto != null) {
@@ -164,19 +175,21 @@ public class TeamController {
     /**
      * GET /api/v1/teams/{teamName} → TeamDto（name/members/teammateStatuses）；config 缺失 → 404。
      *
-     * <p>[team-panel-backend-bugfix2] 会话隔离：带 sessionId → config.leadSessionId 不匹配当前会话
-     * → 404（防跨会话名册泄漏，对齐 list() 会话过滤）；无 sessionId → 不拦截（兼容无会话上下文调用）。
+     * <p>[team-panel-backend-bugfix2] 会话隔离：config.leadSessionId 不匹配当前会话 → 404
+     * （防跨会话名册泄漏，对齐 list() 会话过滤）。
+     * <p><b>[批 3a]</b> sessionId <b>必填</b>（缺 ⇒ 400）：旧实现「无 sessionId → 不拦截」等于给出
+     * 跨会话读任意 team 详情（含成员名册）的免鉴权入口。
      */
     @GetMapping("/{teamName}")
-    public TeamDto get(@PathVariable String teamName, @RequestParam(required = false) String sessionId) {
+    public TeamDto get(@PathVariable String teamName,
+                       @RequestParam(value = "sessionId", required = false) String sessionId) {
         if (!teamHelpers.teamExists(teamName)) {
             throw new NotFoundException("Team " + teamName + " not found");
         }
-        if (sessionId != null && !sessionId.isBlank()) {
-            String lead = leadSessionIdFromConfig(teamName);
-            if (lead == null || !sessionId.equals(lead)) {
-                throw new NotFoundException("Team " + teamName + " not found");
-            }
+        requireSessionId(sessionId, "GET /api/v1/teams/{teamName}");
+        String lead = leadSessionIdFromConfig(teamName);
+        if (lead == null || !sessionId.equals(lead)) {
+            throw new NotFoundException("Team " + teamName + " not found");
         }
         TeamDto dto = teamStatusPublisher.toDto(teamName);
         if (dto == null) {
@@ -202,7 +215,9 @@ public class TeamController {
         if (req == null || req.teamName() == null || req.teamName().isBlank()) {
             throw new ValidationException("teamName is required");
         }
-        String sessionId = resolveSessionId(req.sessionId());
+        // [批 3a] sessionId 必填（body.sessionId；缺 / 空白 ⇒ 400）——team 归属哪个会话是结构性数据
+        //   （config.leadSessionId + sessions.team_context 双写），缺失则建出的 team 无会话锚。
+        String sessionId = requireSessionId(req.sessionId(), "POST /api/v1/teams");
         ObjectNode input = JsonNodeFactory.instance.objectNode();
         input.put("team_name", req.teamName());
         if (req.description() != null) {
@@ -213,9 +228,7 @@ public class TeamController {
         }
         ToolUseBlock block = new ToolUseBlock(UUID.randomUUID().toString(), TeamCreateTool.NAME, input);
         // [session-id-short] sessionId 已 short，直传（不再 canonicalUuid 派生 UUID）
-        ToolUseContext ctx = (sessionId != null)
-                ? ToolUseContext.of(UUID.randomUUID(), sessionId)
-                : null;
+        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionId);
         AgentToolResult<?> result = teamCreateTool.execute(block, ctx);
         String raw = String.valueOf(result.data());
         JsonNode dataNode = parseToolResult(result.data());
@@ -246,13 +259,12 @@ public class TeamController {
         if (!teamHelpers.teamExists(teamName)) {
             throw new NotFoundException("Team " + teamName + " not found");
         }
-        String sid = resolveSessionId(sessionId);
-        if (sid == null) {
-            // [team-panel-backend-bugfix] 前端解散默认不带 sessionId → 从 team config 的
-            //   leadSessionId 反查（创建时 buildConfigJson 已写该列），否则 sessions.team_context
-            //   残留 → 前端 TeamPanel 门控（teamContext 非 null）永不消失。
-            sid = leadSessionIdFromConfig(teamName);
-        }
+        // [批 3a] sessionId 必填（缺 ⇒ 400）。旧实现「缺值 → MDC 兜底 → 仍缺则从 team config 的
+        //   leadSessionId 反查」（[team-panel-backend-bugfix] 的临时兜底：当时前端解散不带 sessionId）。
+        //   该反查会把「调用方想用哪个会话」替换成「team 创建时的 lead 会话」——即**用别的会话的
+        //   身份**去清 sessions.team_context，跨会话副作用。前端 TeamPanel.dissolveTeam 现已显式传
+        //   当前会话（= lead），兜底分支删除。
+        String sid = requireSessionId(sessionId, "DELETE /api/v1/teams/{teamName}");
         AgentToolResult<?> result = teamDeleteTool.deleteTeamByName(teamName, sid, 0, "rest-" + UUID.randomUUID());
         JsonNode dataNode = parseToolResult(result.data());
         boolean ok = dataNode != null && dataNode.path("success").asBoolean(false);
@@ -301,7 +313,7 @@ public class TeamController {
      *
      * <p>流程：校验 bean/team/name → 构造 InProcessSpawnConfig（subagentType 空 → 回落
      * "general-purpose"；color=null / planModeRequired=false / model=null；cwd =
-     * CwdResolution.getCwd(null)，兜底 user.dir）→ SpawnContext(null, "rest-"+UUID) →
+     * CwdResolution.getCwd(显式 sessionId)）→ SpawnContext(leadSessionId 反查, "rest-"+UUID) →
      * spawnInProcessTeammate → 失败 → 409；成功 → 显式 publish member_joined（对齐 addMember:286，
      * spawnInProcessTeammate 内部仅 appendTeamMember 成功时推，端点兜底）+ toDto 返回含新成员。
      * 失败契约：spawnInProcess 未接线 / team 不存在 → 404；name 缺失 → 400（ValidationException）；
@@ -309,7 +321,9 @@ public class TeamController {
      */
     @PostMapping("/{teamName}/members/spawn")
     @ResponseStatus(HttpStatus.CREATED)
-    public TeamDto spawnMember(@PathVariable String teamName, @RequestBody SpawnMemberRequest req) {
+    public TeamDto spawnMember(@PathVariable String teamName,
+                               @RequestParam(value = "sessionId", required = false) String sessionId,
+                               @RequestBody SpawnMemberRequest req) {
         if (spawnInProcess == null) {
             throw new NotFoundException("SpawnInProcess bean unavailable");
         }
@@ -319,11 +333,12 @@ public class TeamController {
         if (req == null || req.name() == null || req.name().isBlank()) {
             throw new ValidationException("name is required (agentId = name@team)");
         }
-        // cwd 解析：CwdResolution.getCwd 恒非 null（L4 user.dir 兜底），再补一层硬兜底防回归
-        String cwd = CwdResolution.getCwd(null);
-        if (cwd == null || cwd.isBlank()) {
-            cwd = System.getProperty("user.dir", ".");
-        }
+        // [批 3a] 会话标识必填（缺 ⇒ 400）：旧实现 cwd 走 CwdResolution.getCwd(null)（无会话 →
+        //   L4 user.dir 兜底 = JVM 启动目录）→ 新成员的工作目录与本会话无关（错项目）。
+        //   现按**显式收到的会话**解析 cwd（CwdResolution.getCwd 恒非 null：L1 override → L2 sessionCwd
+        //   → L3 boundProject → L4 user.dir）。
+        String sid = requireSessionId(sessionId, "POST /api/v1/teams/{teamName}/members/spawn");
+        String cwd = CwdResolution.getCwd(sid);
         SpawnInProcess.InProcessSpawnConfig config = new SpawnInProcess.InProcessSpawnConfig(
             req.name(), teamName, req.prompt(), null /*color*/, false /*planModeRequired*/,
             null /*model*/, req.subagentType() != null ? req.subagentType() : "general-purpose", cwd);

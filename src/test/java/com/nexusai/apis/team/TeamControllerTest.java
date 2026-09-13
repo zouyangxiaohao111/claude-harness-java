@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.InProcessTeammateTaskRegistry;
@@ -38,9 +39,11 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItems;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
@@ -159,19 +162,47 @@ class TeamControllerTest {
     // ── list / get ───────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("GET /api/v1/teams → 枚举含 config.json 的 team（name/members/teammateStatuses）")
+    @DisplayName("GET /api/v1/teams?sessionId= → 枚举本会话 lead 的 team（name/members/teammateStatuses）")
     void list_enumeratesTeams() throws Exception {
-        // WHY: 前端多 team 场景经 GET /api/v1/teams 拉全量列表（design doc §3.2）。变异点：枚举漏 config
+        // WHY: 前端多 team 场景经 GET /api/v1/teams 拉列表（design doc §3.2）。变异点：枚举漏 config
         //   过滤 → 非 team 目录混入；teammateStatuses 装配缺失 → 成员网格无状态。
+        // [批 3a] sessionId 必填：fixture config.leadSessionId 恒为 "sess-1"（baseConfig:110）。
         writeTeamConfig("alpha-team", "team-lead");
         writeTeamConfig("beta-team", "team-lead", "mate");
 
-        mockMvc.perform(get("/api/v1/teams"))
+        mockMvc.perform(get("/api/v1/teams?sessionId=sess-1"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.length()").value(2))
             .andExpect(jsonPath("$[*].name").value(hasItems("alpha-team", "beta-team")))
             // teammateStatuses 排除 team-lead：beta-team 只有 mate 一个 status
             .andExpect(jsonPath("$[?(@.name=='beta-team')].teammateStatuses.length()").value(hasItems(1)));
+    }
+
+    @Test
+    @DisplayName("[批 3a] GET /api/v1/teams 缺 sessionId → 400（旧实现此处跳过过滤，返回全部会话名册）")
+    void list_missingSessionId_returns400() throws Exception {
+        // WHY（规则九）：旧实现 sid==null 时**跳过**整个会话过滤 → 返回**全部会话**的 team
+        //   （跨会话名册泄漏）；而同文件 javadoc 自称「缺失 → fail-loud 空列表」是假注释。
+        //   变异点：把 requireSessionId 改回「缺值返回 null」→ 本用例红（200 + 2 个 team）。
+        writeTeamConfig("alpha-team", "team-lead");
+        writeTeamConfig("beta-team", "team-lead", "mate");
+
+        mockMvc.perform(get("/api/v1/teams"))
+            .andExpect(status().isBadRequest());
+
+        mockMvc.perform(get("/api/v1/teams").param("sessionId", ""))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a] GET /api/v1/teams?sessionId=别的会话 → 空列表（跨会话名册不泄漏）")
+    void list_otherSession_seesNothing() throws Exception {
+        writeTeamConfig("alpha-team", "team-lead");
+        writeTeamConfig("beta-team", "team-lead", "mate");
+
+        mockMvc.perform(get("/api/v1/teams?sessionId=sess-other"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.length()").value(0));
     }
 
     @Test
@@ -192,7 +223,7 @@ class TeamControllerTest {
         mate.put("joinedAt", 123456789L);
         teamHelpers.writeConfig("detail-team", config.toString());
 
-        mockMvc.perform(get("/api/v1/teams/detail-team"))
+        mockMvc.perform(get("/api/v1/teams/detail-team?sessionId=sess-1"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.name").value("detail-team"))
             .andExpect(jsonPath("$.leadAgentId").value("team-lead@detail-team"))
@@ -211,7 +242,7 @@ class TeamControllerTest {
     @Test
     @DisplayName("GET /api/v1/teams/{teamName} → 未知 team → 404（不静默返回空）")
     void get_unknownTeam_returns404() throws Exception {
-        mockMvc.perform(get("/api/v1/teams/nonexistent"))
+        mockMvc.perform(get("/api/v1/teams/nonexistent?sessionId=sess-1"))
             .andExpect(status().isNotFound());
     }
 
@@ -305,30 +336,46 @@ class TeamControllerTest {
     }
 
     @Test
-    @DisplayName("DELETE /api/v1/teams/{teamName} 不带 sessionId → 从 config.leadSessionId 反查清 teamContext（bug 修复）")
-    void delete_withoutSessionId_fallsBackToConfigLeadSessionId() throws Exception {
-        // WHY: 前端解散默认不带 sessionId → TeamController.delete 的 sid=null →
-        //   deleteTeamByName 跳过 clearTeamContext → sessions.team_context 残留 → 前端面板不消失。
-        //   [team-panel-backend-bugfix] 从 team config.leadSessionId（创建时写入）反查兜底清列。
+    @DisplayName("[批 3a] DELETE /api/v1/teams/{teamName} 缺 sessionId → 400（不再反查 config 兜底）")
+    void delete_withoutSessionId_returns400() throws Exception {
+        // WHY（规则九）：旧实现缺 sessionId 时从 team config 的 leadSessionId 反查，**用别的会话的
+        //   身份**去清 sessions.team_context —— 调用方想清 A 会话，实际清了 config 里记的 lead 会话。
+        //   变异点：把 requireSessionId 改回反查兜底 → 本用例红（200 且清列）。
         SessionService sessionService = mock(SessionService.class);
         TeamDeleteTool deleteTool = new TeamDeleteTool(teamHelpers);
         deleteTool.setTeamStatusPublisher(publisher);
         ReflectionTestUtils.setField(deleteTool, "sessionService", sessionService);
         ReflectionTestUtils.setField(controller, "teamDeleteTool", deleteTool);
 
-        // writeTeamConfig 的 config.json 含 leadSessionId="sess-1"（:107 fixture）
         writeTeamConfig("noids-del", "team-lead");
 
-        // 不带 sessionId query param → 前端实际调用形态
         mockMvc.perform(delete("/api/v1/teams/noids-del"))
+            .andExpect(status().isBadRequest());
+
+        // fail loud：team 未删、任何会话的 teamContext 都未被清
+        assertThat(tempDir.resolve("teams/noids-del/config.json")).exists();
+        verify(sessionService, never()).clearTeamContext(anyString());
+    }
+
+    @Test
+    @DisplayName("[批 3a] DELETE /api/v1/teams/{teamName}?sessionId= → 显式会话被清 teamContext（删目录 + deleted）")
+    void delete_withSessionId_clearsThatTeamContext() throws Exception {
+        SessionService sessionService = mock(SessionService.class);
+        TeamDeleteTool deleteTool = new TeamDeleteTool(teamHelpers);
+        deleteTool.setTeamStatusPublisher(publisher);
+        ReflectionTestUtils.setField(deleteTool, "sessionService", sessionService);
+        ReflectionTestUtils.setField(controller, "teamDeleteTool", deleteTool);
+
+        writeTeamConfig("noids-del", "team-lead");
+
+        mockMvc.perform(delete("/api/v1/teams/noids-del?sessionId=sess-1"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.success").value(true));
 
         assertThat(tempDir.resolve("teams/noids-del")).doesNotExist();
-        // 关键断言：反查 config.leadSessionId("sess-1") 清理了该会话列的 teamContext
+        // 关键断言：清的是**调用方显式给的**会话列
         verify(sessionService).clearTeamContext("sess-1");
-        // [stomp-lead-session 方案 3] deleted 事件走 lead 会话：反查得到的 sess-1 预解析 →
-        //   /topic/sessions/sess-1/team-status（config 已删，靠 cleanup 前预解析 + 3 参 publish）
+        // [stomp-lead-session 方案 3] deleted 事件推 lead 会话 topic
         ArgumentCaptor<TeamStatusEvent> deletedCaptor = ArgumentCaptor.forClass(TeamStatusEvent.class);
         verify(ws).convertAndSend(eq("/topic/sessions/sess-1/team-status"), deletedCaptor.capture());
         assertThat(deletedCaptor.getValue().eventType()).isEqualTo("deleted");
@@ -341,12 +388,58 @@ class TeamControllerTest {
         ReflectionTestUtils.setField(controller, "teamDeleteTool", new TeamDeleteTool(teamHelpers));
         writeTeamConfig("active-del", "team-lead", "mate"); // mate 无 isActive → 活跃
 
-        mockMvc.perform(delete("/api/v1/teams/active-del"))
+        mockMvc.perform(delete("/api/v1/teams/active-del?sessionId=sess-1"))
             .andExpect(status().isConflict())
             .andExpect(jsonPath("$.success").value(false))
             .andExpect(jsonPath("$.message").value(containsString("active member(s): mate")));
 
         assertThat(tempDir.resolve("teams/active-del/config.json")).as("活跃成员存在时不得删除 team").exists();
+    }
+
+    // ── members/spawn（批 3a：会话态显式化）──────────────────────────────────
+
+    @Test
+    @DisplayName("[批 3a] POST /teams/{t}/members/spawn 缺 sessionId → 400（旧实现 getCwd(null) → user.dir 错项目）")
+    void spawnMember_missingSessionId_returns400() throws Exception {
+        // WHY（规则九）：spawn 出的成员 cwd 决定它读哪个项目的文件。旧实现 CwdResolution.getCwd(null)
+        //   （无会话）→ L4 user.dir 兜底 = **JVM 启动目录**，与调用方所在会话毫无关系。
+        writeTeamConfig("spawn-team", "team-lead");
+        ReflectionTestUtils.setField(controller, "spawnInProcess", mock(SpawnInProcess.class));
+
+        mockMvc.perform(post("/api/v1/teams/spawn-team/members/spawn")
+                .contentType(APPLICATION_JSON)
+                .content("{\"name\":\"worker\"}"))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a] spawnMember 的成员 cwd 取**显式 sessionId 的会话 cwd**（非 user.dir）")
+    void spawnMember_usesExplicitSessionCwd() throws Exception {
+        // 反向实验装置：会话 cwd 故意设成与 JVM user.dir **不同**的目录。若实现回退 getCwd(null)，
+        //   捕获到的 cwd 会是 user.dir → 本断言红。
+        writeTeamConfig("spawn-team", "team-lead");
+        String sessionCwd = tempDir.resolve("session-project").toAbsolutePath().normalize().toString();
+        java.nio.file.Files.createDirectories(java.nio.file.Path.of(sessionCwd));
+        SessionCwdHolder.set("sess-1", sessionCwd);
+
+        SpawnInProcess spawn = mock(SpawnInProcess.class);
+        when(spawn.spawnInProcessTeammate(any(), any())).thenReturn(
+            new SpawnInProcess.InProcessSpawnOutput(true, "worker@spawn-team", "t-1", null, null, null));
+        ReflectionTestUtils.setField(controller, "spawnInProcess", spawn);
+        try {
+            mockMvc.perform(post("/api/v1/teams/spawn-team/members/spawn?sessionId=sess-1")
+                    .contentType(APPLICATION_JSON)
+                    .content("{\"name\":\"worker\"}"))
+                .andExpect(status().isCreated());
+
+            ArgumentCaptor<SpawnInProcess.InProcessSpawnConfig> cfg =
+                ArgumentCaptor.forClass(SpawnInProcess.InProcessSpawnConfig.class);
+            verify(spawn).spawnInProcessTeammate(cfg.capture(), any());
+            assertThat(cfg.getValue().cwd()).isEqualTo(sessionCwd);
+            assertThat(cfg.getValue().cwd()).isNotEqualTo(System.getProperty("user.dir"));
+        } finally {
+            SessionCwdHolder.clear("sess-1");
+        }
     }
 
     // ── members（可选 join/leave）─────────────────────────────────────────────

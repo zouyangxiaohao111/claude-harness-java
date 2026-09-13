@@ -36,11 +36,13 @@ export const chatApi = {
 }
 
 /** 上传附件（multipart · 后端 U1）：大文件（>5MB）先落盘 → { contentId, filename, size }。
- *  sessionId：归属会话（上传须在会话内进行，否则后端 session=null 兜底 'unknown'，附件归属错位） */
-export async function uploadAttachment(file: File, sessionId?: string): Promise<{ contentId: string; filename: string; size: number }> {
+ *  sessionId：归属会话。**[批 3a] 由可选改必填** —— 旧实现 `if (sessionId) fd.append(...)` 在缺值时
+ *  **静默丢弃**会话字段，后端回落 'unknown' ⇒ 附件归属错位（用户看不到，也没有任何报错）。
+ *  现由调用方（Composer）在无会话时显式拒绝上传并提示，而非静默丢归属。 */
+export async function uploadAttachment(file: File, sessionId: string): Promise<{ contentId: string; filename: string; size: number }> {
   const fd = new FormData()
   fd.append('file', file)
-  if (sessionId) fd.append('sessionId', sessionId)
+  fd.append('sessionId', sessionId)
   const res = await fetch(`${BASE_URL}/attachments/upload`, {
     method: 'POST',
     headers: { 'X-Client-Env': 'react' },  // FormData 自动设 multipart boundary，不手动 Content-Type

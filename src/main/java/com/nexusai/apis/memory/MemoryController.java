@@ -116,17 +116,18 @@ public class MemoryController {
      *       editable=<b>true</b>；</li>
      *   <li><b>Project</b>（会话级可写）：{@code getMemoryFiles(false)} 中 type==PROJECT 的文件，
      *       file=相对 boundProject 路径，editable=true（<b>[D6 严格化] .claude 段恒 false</b>，
-     *       只读回落仍列出供只读展示；项目根 CLAUDE.md 保留可写）；<b>无 sessionId → 空列表</b>
-     *       （读宽容，不 400）。</li>
+     *       只读回落仍列出供只读展示；项目根 CLAUDE.md 保留可写）。</li>
      * </ol>
      * 顺序：Managed → User → Project。path 字段=绝对路径（仅展示，前端不回传）。
      *
-     * <p>会话机制：解析 sessionId（query {@code ?sessionId=} → MDC 兜底），非 null 先
-     * {@code RequestContext.setSession(sessionId)} 写 MDC → {@code CwdResolution.getOriginalCwdLayer()}
-     * 自动走 boundProject（SessionProjectRoot.getForSession）。GET/PUT 的 Project 档都先
+     * <p><b>会话机制（批 3a 改）</b>：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400）——
+     * 不再回落 MDC（旧实现「无 sessionId → 空列表，读宽容不 400」对「本该有却没有」的调用方是静默
+     * 降级：前端传空串即静默丢 Project 档）。收到后写 MDC（单向传播）→
+     * {@code CwdResolution.getOriginalCwdLayer()} 自动走 boundProject
+     * （SessionProjectRoot.getForSession）。GET/PUT 的 Project 档都先
      * {@code clearMemoryFileCaches()} 再 {@code getMemoryFiles(false)}（防 memoize 跨会话污染）。
      *
-     * @param sessionIdParam query {@code ?sessionId=}（可选；Project 档会话锚定）
+     * @param sessionIdParam query {@code ?sessionId=}（<b>必填</b>；Project 档会话锚定）
      * @return 记忆文件视图列表（{path,type,content,parent,exists,file,editable}）
      */
     @GetMapping(value = "/files", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -136,12 +137,17 @@ public class MemoryController {
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] GET /memory/files 查看记忆开始（缓存预热 + 加载）");
         }
-        // 解析 sessionId：query ?sessionId= → MDC 兜底；非 null 写 MDC（驱动 CwdResolution boundProject 层）
-        String sessionId = (sessionIdParam != null && !sessionIdParam.isBlank())
-            ? sessionIdParam : RequestContext.sessionId();
-        if (sessionId != null) {
-            RequestContext.setSession(sessionId);
+        // 批 3a：sessionId **必填**（缺 / 空白 ⇒ 400）。旧实现 query 缺值时回落 RequestContext.sessionId()
+        //   （裸 MDC）——MDC 第三态会读到上一请求残留的**别的会话**的 id ⇒ Project 档列出别的项目的
+        //   记忆文件、editable 白名单按错的 boundProject 计算（静默跨项目）。fail loud 消除该态。
+        //   非空写 MDC：驱动 CwdResolution.getOriginalCwdLayer() 的 boundProject 层（单向传播，不读回）。
+        String sessionId = sessionIdParam;
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[MemoryController] GET /memory/files 缺少会话标识 ?sessionId= → 400"
+                + "（会话态显式化，不再回落 MDC）");
+            throw new ValidationException("sessionId is required (GET /api/v1/memory/files)");
         }
+        RequestContext.setSession(sessionId);
         // memory.tsx:86-87 缓存预热：clear + get（CC call 在渲染前预热）
         engine.clearMemoryFileCaches();
         List<MemoryFileInfo> existing = engine.getMemoryFiles(false);
@@ -161,22 +167,19 @@ public class MemoryController {
             null, Files.isRegularFile(userPath), "CLAUDE.md", true));
 
         // 3. Project（会话级可写）：getMemoryFiles 中 type==PROJECT 的文件，file=相对 boundProject
-        if (sessionId != null) {
-            String boundProject = CwdResolution.getOriginalCwdLayer();
-            Path boundProjectAbs = Paths.get(boundProject).toAbsolutePath().normalize();
-            for (MemoryFileInfo file : existing) {
-                if (file.type() == ClaudemdMemoryType.PROJECT) {
-                    Path fileAbs = Paths.get(file.path()).toAbsolutePath().normalize();
-                    String rel = boundProjectAbs.relativize(fileAbs).toString();
-                    // [D6 严格化] editable 同步收敛：.claude 段恒 false（只读回落，仍列出供只读展示）；
-                    //   项目根 CLAUDE.md（非 .claude 非 .nexusai）保留可写（决策点 A）
-                    boolean editable = !containsClaudeDir(fileAbs);
-                    views.add(new MemoryFileView(file.path(), "Project", file.content(),
-                        file.parent(), true, rel, editable));
-                }
+        String boundProject = CwdResolution.getOriginalCwdLayer();
+        Path boundProjectAbs = Paths.get(boundProject).toAbsolutePath().normalize();
+        for (MemoryFileInfo file : existing) {
+            if (file.type() == ClaudemdMemoryType.PROJECT) {
+                Path fileAbs = Paths.get(file.path()).toAbsolutePath().normalize();
+                String rel = boundProjectAbs.relativize(fileAbs).toString();
+                // [D6 严格化] editable 同步收敛：.claude 段恒 false（只读回落，仍列出供只读展示）；
+                //   项目根 CLAUDE.md（非 .claude 非 .nexusai）保留可写（决策点 A）
+                boolean editable = !containsClaudeDir(fileAbs);
+                views.add(new MemoryFileView(file.path(), "Project", file.content(),
+                    file.parent(), true, rel, editable));
             }
         }
-        // 无 sessionId → Project 档返回空列表（读宽容，不 400）
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] GET /memory/files 完成: {} 个文件（sessionId={}）",
                 views.size(), sessionId);
@@ -228,10 +231,13 @@ public class MemoryController {
      *       （✗-3 低危展示性，差异登记 progress/IMP-MV2-16.md）。</li>
      * </ul>
      *
+     * @param sessionIdParam query {@code ?sessionId=}（<b>必填</b>，批 3a；缺 / 空白 ⇒ 400）——
+     *                       dreamStatus 为 per-project 数据，需会话锚定
      * @return {@code {autoMemoryEnabled, autoDreamEnabled, dreamStatus, lastConsolidatedAtMs}}
      */
     @GetMapping(value = "/config", produces = MediaType.APPLICATION_JSON_VALUE)
-    public MemoryConfigView getConfig() {
+    public MemoryConfigView getConfig(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
         MemoryStorage storage = resolveMemoryStorage();
         // CC isAutoMemoryEnabled()（paths.ts:30-56）—— 有效门控（env/settings/默认）
         boolean autoMemory = BundledSkillEnabledGates.isAutoMemoryEnabled();
@@ -245,14 +251,20 @@ public class MemoryController {
         //   请求线程读 AutoMemPaths ThreadLocal（恒空）→ 回落 config home → A′ null →
         //   new ConsolidationLock(null) 构造 NPE → 本端点 500（审计 P5/P9）。
         //   dream 锁状态是 **per-project** 数据：无会话上下文 ⇒ 无从解析 ⇒ 显式 fail-loud
-        //   （规则十二；不伪造 "never"）。REST 入口无 sessionId 参数属既有契约缺口
-        //   （前端 memory.ts getMemoryConfig 未传会话）→ 登记残差，本批不改前端契约。
-        java.nio.file.Path memDir = storage.memoryDir(com.nexusai.common.RequestContext.sessionId());
+        //   （规则十二；不伪造 "never"）。
+        // [批 3a] 旧实现无 sessionId 入参 → 只能读 RequestContext.sessionId()（裸 MDC，第三态可读到
+        //   上一请求残留的**别的会话** id → 报别的项目的 dream 状态）。现改为显式 query 必填：
+        //   缺 / 空白 ⇒ 400（(a) 类 fail loud），不再有 MDC 读取。
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            log.warn("[MemoryController] GET /memory/config 缺少会话标识 ?sessionId= → 400"
+                + "（dreamStatus 为 per-project 数据；会话态显式化，不再回落 MDC）");
+            throw new ValidationException("sessionId is required (GET /api/v1/memory/config)");
+        }
+        java.nio.file.Path memDir = storage.memoryDir(sessionIdParam);
         if (memDir == null) {
             throw new IllegalStateException("[MemoryController] GET /memory/config 无法解析 per-project "
-                + "记忆目录（无会话上下文/会话未绑定项目）→ dream 锁状态不可得。"
-                + "dreamStatus 为 per-project 数据，需会话上下文（RequestContext.sessionId）；"
-                + "绝不回落 config home 冒充项目（TL-W2 P9）");
+                + "记忆目录（会话未绑定项目）→ dream 锁状态不可得。sessionId=" + sessionIdParam
+                + "；绝不回落 config home 冒充项目（TL-W2 P9）");
         }
         long lastConsolidatedAtMs = new ConsolidationLock(memDir).readLastConsolidatedAt();
         String dreamStatus = lastConsolidatedAtMs == 0 ? "never" : "last_ran";
@@ -277,12 +289,16 @@ public class MemoryController {
      * 'tengu_auto_dream_toggled', {enabled})}）：非 null 字段各自发射对应事件（enabled=新值），
      * 对齐 CC logEvent 语义；telemetry 未注入（null）→ 静默跳过。
      *
+     * @param sessionIdParam query {@code ?sessionId=}（<b>必填</b>，批 3a）——响应体含 per-project 的
+     *                       {@code dreamStatus}，读取走 {@link #getConfig}，故与 GET 同契约
      * @param update 部分更新 {@code {autoMemoryEnabled?, autoDreamEnabled?}}
      * @return 更新后 {@code {autoMemoryEnabled, autoDreamEnabled, dreamStatus, lastConsolidatedAtMs}}
      */
     @PutMapping(value = "/config", consumes = MediaType.APPLICATION_JSON_VALUE,
         produces = MediaType.APPLICATION_JSON_VALUE)
-    public MemoryConfigView updateConfig(@RequestBody(required = false) MemoryConfigUpdate update) {
+    public MemoryConfigView updateConfig(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam,
+            @RequestBody(required = false) MemoryConfigUpdate update) {
         Boolean autoMemory = update == null ? null : update.autoMemoryEnabled();
         Boolean autoDream = update == null ? null : update.autoDreamEnabled();
         if (autoMemory != null || autoDream != null) {
@@ -297,7 +313,7 @@ public class MemoryController {
                 }
             }
         }
-        return getConfig();
+        return getConfig(sessionIdParam);
     }
 
     /**
@@ -445,8 +461,8 @@ public class MemoryController {
      *   <tr><td>项目</td><td>{@code Project}</td><td>会话 boundProject 下多文件</td><td>✅ sessionId</td><td>✅</td></tr>
      * </table>
      *
-     * <p><b>会话机制</b>：解析 sessionId 三源（body.sessionId → query {@code ?sessionId=} → MDC），
-     * 非 null 先 {@code RequestContext.setSession(sessionId)} 写 MDC。Project 档必须最终有 sessionId，
+     * <p><b>会话机制（批 3a 改）</b>：解析 sessionId <b>两源</b>（body.sessionId → query {@code ?sessionId=}；
+     * MDC 兜底已删），非 null 写 MDC（单向传播）。Project 档必须最终有 sessionId，
      * 否则 400。boundProject 取 {@code CwdResolution.getOriginalCwdLayer()}（MDC 已 setSession）。
      *
      * <p><b>Project 白名单（IMP-MV2-17 扩展）</b>：{@code clearMemoryFileCaches()} +
@@ -460,7 +476,7 @@ public class MemoryController {
      * sessionId / file → 400；白名单外 → 400；文件不存在 → {@link NotFoundException}（404）；写盘 IO
      * 失败 → {@link RuntimeException}（500，fail loud）。
      *
-     * @param sessionIdParam query {@code ?sessionId=}（可选；body.sessionId → query → MDC 三源）
+     * @param sessionIdParam query {@code ?sessionId=}（可选；body.sessionId → query 两源；Project 档缺失 ⇒ 400）
      * @param request        更新请求 {@code {type, file?, content, sessionId?}}
      * @return {@code {type, file, path, relativePath, content, message}}
      */
@@ -476,17 +492,17 @@ public class MemoryController {
             log.debug("[MemoryController] PUT /memory/files 收到更新请求: type={} file={} contentLen={}",
                 type, file, content == null ? -1 : content.length());
         }
-        // 解析 sessionId 三源：body.sessionId → query ?sessionId= → MDC；非 null 写 MDC
+        // 解析 sessionId 两源：body.sessionId → query ?sessionId=（[批 3a] 删掉第三源 MDC 兜底 ——
+        //   MDC 第三态会读到上一请求残留的**别的会话** id ⇒ Project 档白名单按错的 boundProject 计算、
+        //   覆盖写落到别的项目的记忆文件上）。User/Managed 档本就不需要会话（(b) 类），故仍可 null。
         String sessionId = null;
         if (request != null && request.sessionId() != null && !request.sessionId().isBlank()) {
             sessionId = request.sessionId();
         } else if (sessionIdParam != null && !sessionIdParam.isBlank()) {
             sessionId = sessionIdParam;
-        } else {
-            sessionId = RequestContext.sessionId();
         }
         if (sessionId != null) {
-            RequestContext.setSession(sessionId);
+            RequestContext.setSession(sessionId);   // 单向传播：驱动 CwdResolution boundProject 层
         }
         // type 校验：null/blank → 400；非法 → 400（值域仅 Managed/User/Project）
         if (type == null || type.isBlank()) {

@@ -44,20 +44,25 @@ async function fetchJson<T>(
 }
 
 export const branchApi = {
-  /** 列出所有 worktree 分支（git worktree list --porcelain） */
-  list: () => api<BranchWorktree[]>('/branches'),
-  /** 创建分支（WorktreeService.createWorktree） */
-  create: (slug: string) =>
-    fetchJson<BranchCreateResponse>('/branches', { method: 'POST', body: { slug } }),
-  /** 删除 worktree + 分支（WorktreeService.removeWorktree） */
-  remove: (slug: string, discardChanges = false) =>
+  /** 列出本会话仓库的 worktree 分支（git worktree list --porcelain）。
+   *  [批 3a] sessionId 必填：后端用它解析会话 boundProject → gitRoot（缺 ⇒ 400）。 */
+  list: (sessionId: string) => api<BranchWorktree[]>(`/branches?sessionId=${encodeURIComponent(sessionId)}`),
+  /** 创建分支（WorktreeService.createWorktree）· sessionId 必填（决定 gitRoot） */
+  create: (sessionId: string, slug: string) =>
+    fetchJson<BranchCreateResponse>(`/branches?sessionId=${encodeURIComponent(sessionId)}`,
+      { method: 'POST', body: { slug } }),
+  /** 删除 worktree + 分支（WorktreeService.removeWorktree）· sessionId 必填 */
+  remove: (sessionId: string, slug: string, discardChanges = false) =>
     fetchJson<BranchActionResponse>(
-      `/branches/${encodeURIComponent(slug)}?discardChanges=${discardChanges}`,
+      `/branches/${encodeURIComponent(slug)}?sessionId=${encodeURIComponent(sessionId)}`
+        + `&discardChanges=${discardChanges}`,
       { method: 'DELETE' }
     ),
-  /** 保留 worktree（WorktreeService.keepWorktree） */
-  keep: (slug: string) =>
-    fetchJson<BranchActionResponse>(`/branches/${encodeURIComponent(slug)}/keep`, { method: 'POST' }),
+  /** 保留 worktree（WorktreeService.keepWorktree）· sessionId 必填 */
+  keep: (sessionId: string, slug: string) =>
+    fetchJson<BranchActionResponse>(
+      `/branches/${encodeURIComponent(slug)}/keep?sessionId=${encodeURIComponent(sessionId)}`,
+      { method: 'POST' }),
 }
 
 export const exportApi = {

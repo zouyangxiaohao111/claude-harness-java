@@ -61,7 +61,8 @@ class ExtractMemoriesControllerTest {
 
     @AfterEach
     void tearDown() {
-        // 测试不设置 MDC sessionId（CwdResolution.getOriginalCwdLayer 回落 user.dir 确定性），无需清理
+        // 批 3a：会话标识走显式 query（不再依赖 MDC）；仍清理 MDC 防个别反向实验用例残留
+        com.nexusai.common.RequestContext.clear();
     }
 
     /**
@@ -105,7 +106,7 @@ class ExtractMemoriesControllerTest {
         String transcriptDir = com.nexusai.application.agent.tool.SessionStorage
             .getProjectDir(java.nio.file.Path.of(System.getProperty("user.dir", "."))).toString();
 
-        mockMvc().perform(post("/api/agent/dream"))
+        mockMvc().perform(post("/api/agent/dream?sessionId=sess-dream-test"))
             .andExpect(status().isOk())
             .andExpect(content().contentTypeCompatibleWith("text/plain"))
             .andExpect(content().string(org.hamcrest.Matchers.containsString(DREAM_PREFIX_HEADER)))
@@ -123,7 +124,7 @@ class ExtractMemoriesControllerTest {
         // WHY: CC dream.ts:36-37 await recordConsolidation() —— 手动 /dream 乐观盖章锁
         //   （consolidationLock.ts:130-140 mkdir + writeFile(lockPath(), String(process.pid))）。
         //   若端点不盖章 → lastConsolidatedAt 不推进，与 CC 手动 /dream 语义偏离。
-        mockMvc().perform(post("/api/agent/dream"))
+        mockMvc().perform(post("/api/agent/dream?sessionId=sess-dream-test"))
             .andExpect(status().isOk());
 
         Path lockFile = tempDir.resolve(ConsolidationLock.LOCK_FILE);
@@ -141,7 +142,7 @@ class ExtractMemoriesControllerTest {
     void args_appendsAdditionalContext() throws Exception {
         // WHY: CC dream.ts:42-44 if (args) prompt += '\n\n## Additional context from user\n\n' + args
         //   —— 用户可随 /dream 提供附加上下文指导 consolidation；若 args 被忽略 → 前端无法传达意图。
-        mockMvc().perform(post("/api/agent/dream")
+        mockMvc().perform(post("/api/agent/dream?sessionId=sess-dream-test")
                 .contentType("application/json")
                 .content("{\"args\":\"Focus on the build failure from yesterday\"}"))
             .andExpect(status().isOk())
@@ -155,15 +156,55 @@ class ExtractMemoriesControllerTest {
         // WHY: CC dream.ts:31 isEnabled: () => isAutoMemoryEnabled() —— auto-memory 关闭时 /dream
         //   skill 不可调用（命令未注册/未启用）。REST 以 400 表达 gate 关闭；若禁用时仍 200 →
         //   前端注入的 dream prompt 会被后续 LLM 消费但记忆目录未接线（memoryRoot 无意义）。
-        mockMvcGateClosed().perform(post("/api/agent/dream"))
+        mockMvcGateClosed().perform(post("/api/agent/dream?sessionId=sess-dream-test"))
             .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a] POST /dream 缺 sessionId → 400（memoryRoot/transcriptDir 均 per-project，必须显式锚定）")
+    void missingSessionId_400() throws Exception {
+        // WHY（缺值策略 (a)）：旧实现无 sessionId 入参 → 读 RequestContext.sessionId()（裸 MDC），
+        //   MDC 第三态 = 上一请求残留的**别的会话** id ⇒ dream 锁会盖到别的项目的记忆目录上。
+        //   变异点：把 requireSessionId 改回 MDC 兜底 → 本用例红（200）。
+        mockMvc().perform(post("/api/agent/dream"))
+            .andExpect(status().isBadRequest());
+        mockMvc().perform(post("/api/agent/dream").param("sessionId", ""))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a 反向实验] transcriptDir 取显式 sessionId 的 boundProject，MDC 残留别的会话不生效")
+    void transcriptDir_usesExplicitSessionId_notMdc() throws Exception {
+        // WHY（规则九）：CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd())。旧实现从
+        //   裸 MDC 取会话 ⇒ MDC 第三态（上一请求残留的别的会话）会让 dream 去读**别的项目**的转录。
+        //   装置：给显式 sessionId 绑一个与 user.dir 不同的 boundProject，同时把 MDC 设成无关会话。
+        //   若实现回退读 MDC（或无参 getOriginalCwdLayer()），transcriptDir 会变成 user.dir 派生值 → 红。
+        java.nio.file.Path explicitProject = tempDir.resolve("explicit-project");
+        java.nio.file.Files.createDirectories(explicitProject);
+        com.nexusai.common.SessionProjectRoot.setForSession("sess-dream-test", explicitProject.toString());
+        com.nexusai.common.RequestContext.setSession("sess-someone-else");   // MDC 残留（诱饵）
+        try {
+            String expectedTranscriptDir = com.nexusai.application.agent.tool.SessionStorage
+                .getProjectDir(explicitProject).toString();
+            mockMvc().perform(post("/api/agent/dream?sessionId=sess-dream-test"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString(
+                    "Session transcripts: `" + expectedTranscriptDir + "`")));
+            org.assertj.core.api.Assertions.assertThat(expectedTranscriptDir)
+                .as("装置有效性：显式会话的 boundProject 派生目录必须与 user.dir 派生值不同，否则本用例无鉴别力")
+                .isNotEqualTo(com.nexusai.application.agent.tool.SessionStorage
+                    .getProjectDir(java.nio.file.Path.of(System.getProperty("user.dir", "."))).toString());
+        } finally {
+            com.nexusai.common.SessionProjectRoot.clearSession("sess-dream-test");
+            com.nexusai.common.RequestContext.clear();
+        }
     }
 
     @Test
     @DisplayName("args 为空 body → 不追加 Additional context 段（CC dream.ts:42 if(args) 空值跳过）")
     void emptyArgs_skipsAdditionalContext() throws Exception {
         // WHY: CC dream.ts:42-44 仅 args 真值才追加；空/缺省 args → prompt 恒为前缀+base（无额外段）。
-        mockMvc().perform(post("/api/agent/dream"))
+        mockMvc().perform(post("/api/agent/dream?sessionId=sess-dream-test"))
             .andExpect(status().isOk())
             .andExpect(content().string(org.hamcrest.Matchers.not(
                 org.hamcrest.Matchers.containsString(ARGS_SECTION))));

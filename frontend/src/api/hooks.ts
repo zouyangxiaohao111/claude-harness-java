@@ -11,6 +11,13 @@ import { api } from './rest'
 import type { HookItem } from './types'
 
 export const hooksApi = {
-  /** GET /api/v1/hooks — 读取全部 hook 配置（后端 getAllHooks 合并多 source + 插件 hook） */
-  getAllHooks: () => api<HookItem[]>('/hooks'),
+  /**
+   * GET /api/v1/hooks?sessionId= — 读取全部 hook 配置（后端 getAllHooks 合并多 source + 插件 hook）。
+   *
+   * <p><b>sessionId 必填（批 3a）</b>：后端已去掉 MDC 兜底 —— 缺值直接 400。后端非空时走
+   * settings + session 合并（SESSION_HOOK 源），故**必须**带当前会话；调用方无会话时不得调用
+   * 本接口（显式错误态，而非静默返回 settings-only 列表）。
+   */
+  getAllHooks: (sessionId: string) =>
+    api<HookItem[]>(`/hooks?sessionId=${encodeURIComponent(sessionId)}`),
 }

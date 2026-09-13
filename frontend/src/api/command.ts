@@ -50,10 +50,12 @@ export const commandApi = {
   /** 单个命令详情 · GET /api/command/{id} */
   get: (id: string) => api<CommandDto>(`/${encodeURIComponent(id)}`, {}, CMD_BASE),
   builtins: () => api<BuiltInCommandDto[]>('/builtins', {}, CMD_BASE),
-  // sessionId：/clear（及后续其他会话级内置命令）必须带当前会话，否则后端清理链读 MDC 为 null → 全 no-op。
-  //   对齐 /compact 的 ?sessionId= 模式（CommandController.executeCompactBuiltin）。
-  executeBuiltin: (name: string, req?: unknown, sessionId?: string) =>
+  // sessionId：**必传**（批 3a）。后端口已把 ?sessionId= 改成必填（缺 / 空白 ⇒ 400，不再回落 MDC）——
+  //   旧实现「缺值 → 后端读 RequestContext.sessionId()」，而 MDC 第三态会读到上一请求残留的**别的
+  //   会话** id ⇒ /clear 等会话级命令的副作用作用到别的会话上。TS 侧同步收紧为 required，让编译器
+  //   在每个调用点强制把关（而非运行期才发现 400）。
+  executeBuiltin: (name: string, sessionId: string, req?: unknown) =>
     api<unknown>(
-      `/builtins/${encodeURIComponent(name)}/execute${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`,
+      `/builtins/${encodeURIComponent(name)}/execute?sessionId=${encodeURIComponent(sessionId)}`,
       { method: 'POST', body: req ?? undefined }, CMD_BASE),
 }

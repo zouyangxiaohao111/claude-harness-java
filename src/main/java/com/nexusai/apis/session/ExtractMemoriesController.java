@@ -14,6 +14,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -99,12 +100,23 @@ public class ExtractMemoriesController {
      *   <li>memory 存储未接线 → 500（fail loud，无静默降级）</li>
      * </ul>
      *
+     * @param sessionIdParam query {@code ?sessionId=}（<b>必填</b>，批 3a；缺 / 空白 ⇒ 400）——
+     *                       memoryRoot / transcriptDir 均为 per-project，需会话锚定
      * @param body POST JSON 请求体（可为空 body；{@link DreamRequest#args} 可选附加上下文，CC
      *             getPromptForCommand(args)）
      * @return 200 prompt 文本
      */
     @PostMapping(value = "/dream", produces = MediaType.TEXT_PLAIN_VALUE)
-    public ResponseEntity<String> dream(@RequestBody(required = false) DreamRequest body) {
+    public ResponseEntity<String> dream(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam,
+            @RequestBody(required = false) DreamRequest body) {
+        // [批 3a] sessionId 显式必填：缺 / 空白 ⇒ 400。旧实现无入参 → 读 RequestContext.sessionId()
+        //   （裸 MDC，第三态可读到上一请求残留的**别的会话** id）→ 把 dream 锁盖到别的项目的记忆目录上。
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            log.warn("[ExtractMemoriesController] POST /dream 缺少会话标识 ?sessionId= → 400"
+                + "（memoryRoot 为 per-project 数据；会话态显式化，不再回落 MDC）");
+            throw new ValidationException("sessionId is required (POST /api/agent/dream)");
+        }
         // gate · CC dream.ts:31 isEnabled: () => isAutoMemoryEnabled() —— skill 未启用命令不可调用
         if (!autoMemoryEnabled.getAsBoolean()) {
             log.warn("[ExtractMemoriesController] /dream 拒绝：isAutoMemoryEnabled=false（CC dream.ts:31"
@@ -115,21 +127,21 @@ public class ExtractMemoriesController {
         // [TL-W2 P9] memoryRoot 按**会话 sessionId 现算**（SessionProjectRoot.getForSession：未绑定
         //   → null，绝不回落 config home / 不读 ThreadLocal）。旧 storage.memoryDir() 无参在 Tomcat
         //   请求线程读 AutoMemPaths ThreadLocal（恒空）→ 回落 config home → A′ null →
-        //   memoryDir().toString() NPE → 500（审计 P9）。无会话上下文 ⇒ per-project 记忆目录不可得
-        //   → 显式 fail-loud（规则十二；端点文档已声明「memory 存储不可用 → 500 fail loud」）；
-        //   前端 /dream 未传会话属既有契约缺口 → 登记残差，本批不改前端契约。
-        java.nio.file.Path dreamMemDir = storage.memoryDir(com.nexusai.common.RequestContext.sessionId());
+        //   memoryDir().toString() NPE → 500（审计 P9）。会话未绑定项目 ⇒ per-project 记忆目录不可得
+        //   → 显式 fail-loud（规则十二；端点文档已声明「memory 存储不可用 → 500 fail loud」）。
+        // [批 3a] sessionId 由 query 显式传入（见方法头校验），不再读 RequestContext.sessionId()。
+        java.nio.file.Path dreamMemDir = storage.memoryDir(sessionIdParam);
         if (dreamMemDir == null) {
             throw new IllegalStateException("[ExtractMemoriesController] POST /dream 无法解析 per-project "
-                + "记忆目录（无会话上下文/会话未绑定项目）—— memoryRoot 为 per-project 数据，需会话上下文"
-                + "（RequestContext.sessionId）；绝不回落 config home（TL-W2 P9）");
+                + "记忆目录（会话未绑定项目）—— memoryRoot 为 per-project 数据，sessionId=" + sessionIdParam
+                + "；绝不回落 config home（TL-W2 P9）");
         }
         // CC dream.ts:33 memoryRoot = getAutoMemPath()（per-project）
         String memoryRoot = dreamMemDir.toString();
         // CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd()) —— [S2] Java 等价
         //   config-home 项目 slug 目录（getOriginalCwdLayer 层做 config-home 派生）
         String transcriptDir = com.nexusai.application.agent.tool.SessionStorage
-            .getProjectDir(java.nio.file.Path.of(CwdResolution.getOriginalCwdLayer())).toString();
+            .getProjectDir(java.nio.file.Path.of(CwdResolution.getOriginalCwdLayer(sessionIdParam))).toString();
         // CC dream.ts:36-37 await recordConsolidation() —— 手动 /dream 乐观盖章锁（best-effort）
         new ConsolidationLock(dreamMemDir).recordConsolidation();
         if (log.isDebugEnabled()) {

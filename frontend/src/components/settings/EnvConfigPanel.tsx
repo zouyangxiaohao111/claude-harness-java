@@ -14,13 +14,16 @@ interface EnvConfigPanelProps {
   onSaveSettings: (req: UpdateSettingsRequest) => Promise<void>
   /** 打开记忆编辑器（独立弹窗 MemoryEditorModal · 设置弹窗保持打开，编辑器 z-index 更高） */
   onOpenMemoryEditor: () => void
+  /** [批 3a] 当前活动会话 id：/memory/config 的 dreamStatus 是 per-project 数据，后端口已必填
+   *  sessionId（缺值 400）。null = 无活动会话 → 记忆区块呈现显式错误态。 */
+  sessionId?: string | null
 }
 
 /**
  * 环境配置面板（设置页「环境配置」tab）· 复用模型选择器环境配置 UI：
  * 自动压缩窗口 / 记忆模块（编辑器入口 + auto-memory/auto-dream 开关走 /memory/config + dream 状态 + 目录联动）/ away-summary 门控。
  */
-export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }: EnvConfigPanelProps) {
+export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, sessionId }: EnvConfigPanelProps) {
   // 默认权限模式抽屉（对齐 Composer 胶囊+抽屉 · 点击外部收起）
   const [permOpen, setPermOpen] = useState(false)
   const permRef = useRef<HTMLDivElement>(null)
@@ -75,9 +78,16 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
   }, [settings?.deferredToolsDeltaEnabled])
 
   // 挂载时读 /memory/config 开关；失败 fail loud（内联错误文案，不阻塞其他 envc 区块）
+  // [批 3a] 无活动会话 → 不发请求（后端 sessionId 必填会 400），直接内联错误态。
   useEffect(() => {
+    if (!sessionId) {
+      setMemCfg(null)
+      setMemCfgLoading(false)
+      setMemCfgError('无活动会话：记忆配置需带当前会话（后端 sessionId 必填）')
+      return
+    }
     let cancelled = false
-    getMemoryConfig()
+    getMemoryConfig(sessionId)
       .then((cfg) => {
         if (cancelled) return
         setMemCfg(cfg)
@@ -93,7 +103,7 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [sessionId])
 
   const saveCompactWindow = () => {
     const raw = compactDraft.trim()
@@ -255,7 +265,11 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor }:
 
   // auto-memory / auto-dream 开关切换 → PUT /memory/config 部分更新；成功回写本地，失败内联提示（fail loud）
   const toggleMemFlag = (on: boolean, key: 'autoMemoryEnabled' | 'autoDreamEnabled') => {
-    void updateMemoryConfig(key === 'autoMemoryEnabled' ? { autoMemoryEnabled: on } : { autoDreamEnabled: on })
+    if (!sessionId) {
+      setMemCfgError('无活动会话：记忆配置需带当前会话（后端 sessionId 必填）')
+      return
+    }
+    void updateMemoryConfig(sessionId, key === 'autoMemoryEnabled' ? { autoMemoryEnabled: on } : { autoDreamEnabled: on })
       .then((cfg) => {
         setMemCfg(cfg)
         setMemCfgError('')

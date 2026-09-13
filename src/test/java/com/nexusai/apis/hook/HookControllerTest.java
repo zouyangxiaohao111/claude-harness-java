@@ -33,12 +33,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *
  * <p><b>WHY</b>（CLAUDE.md 规则九 · 测试验证意图）:
  * <ol>
- *   <li><b>sessionId 三态路由</b>——无参数/blank → settings-only（{@code getAllHooks()}，UI 安全缺省）；
- *       ?sessionId=sess-xxx → settings+session 合并（{@code getAllHooks(sessionId)}，决策 4-3『运行时会话』）。
- *       若路由错位（blank 走了 session 合并 / sessionId 被忽略），HookPanel 展示错误。</li>
+ *   <li><b>[批 3a] sessionId 必填</b>——缺 / blank ⇒ <b>400</b>（不再回落 MDC，也不再退化为
+ *       settings-only）；?sessionId=sess-xxx → settings+session 合并（{@code getAllHooks(sessionId)}，
+ *       决策 4-3『运行时会话』）。旧契约（缺省 → settings-only / MDC 兜底）已删除。</li>
  *   <li><b>返回 shape 对齐前端 HookItem</b>（types.ts:855-865）——event/config.type/config.command|url/source
  *       字段齐全、null 子类型字段省略（前端 TS 可解析）。</li>
- *   <li><b>MDC 兜底</b>——无 query 但有 MDC sessionId 时落 session 合并（MemoryController:136-137 模式）。</li>
+ *   <li><b>MDC 不再被读取（反向实验）</b>——MDC 里残留别的会话 id 时请求仍 400：若实现回退读 MDC，
+ *       该用例立刻红（旧 {@code mdcSessionId_fallback} 用例已按新契约反转）。</li>
  * </ol>
  */
 class HookControllerTest {
@@ -57,7 +58,10 @@ class HookControllerTest {
         ReflectionTestUtils.setField(controller, "hookRegistry", hookRegistry);
         // 默认无插件 hook（现有用例 focus settings 合并；插件合并有专门用例覆盖）
         when(hookRegistry.getRegisteredPluginHookConfigs()).thenReturn(List.of());
-        mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
+        // setControllerAdvice：GlobalExceptionHandler 把 ValidationException → 400（缺 sessionId 断言状态码必需）
+        mockMvc = MockMvcBuilders.standaloneSetup(controller)
+            .setControllerAdvice(new com.nexusai.infra.exception.GlobalExceptionHandler())
+            .build();
     }
 
     @AfterEach
@@ -74,32 +78,23 @@ class HookControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/hooks 无参数 → 200 + settings-only（verify getAllHooks()，不走 session 合并）")
-    void noParam_usesSettingsOnly() throws Exception {
-        when(hooksSettings.getAllHooks()).thenReturn(List.of(sampleCommandHook()));
-
+    @DisplayName("[批 3a] GET /api/v1/hooks 无 sessionId → 400（不再退化为 settings-only）")
+    void noParam_is400() throws Exception {
         mockMvc.perform(get("/api/v1/hooks"))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.length()").value(1))
-            .andExpect(jsonPath("$[0].event").value("SESSION_START"))
-            .andExpect(jsonPath("$[0].config.type").value("command"))
-            .andExpect(jsonPath("$[0].config.command").value("echo hi"))
-            .andExpect(jsonPath("$[0].source").value("USER_SETTINGS"));
+            .andExpect(status().isBadRequest());
 
-        verify(hooksSettings).getAllHooks();
+        // fail loud：不解析、不查库、不静默降级
+        verify(hooksSettings, never()).getAllHooks();
         verify(hooksSettings, never()).getAllHooks(anyString());
     }
 
     @Test
-    @DisplayName("GET /api/v1/hooks?sessionId=blank → settings-only（blank 落缺省路径，同无参数）")
-    void blankSessionId_usesSettingsOnly() throws Exception {
-        when(hooksSettings.getAllHooks()).thenReturn(List.of(sampleCommandHook()));
-
+    @DisplayName("[批 3a] GET /api/v1/hooks?sessionId=blank → 400（blank 与缺省同判）")
+    void blankSessionId_is400() throws Exception {
         mockMvc.perform(get("/api/v1/hooks").param("sessionId", ""))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.length()").value(1));
+            .andExpect(status().isBadRequest());
 
-        verify(hooksSettings).getAllHooks();
+        verify(hooksSettings, never()).getAllHooks();
         verify(hooksSettings, never()).getAllHooks(anyString());
     }
 
@@ -117,30 +112,33 @@ class HookControllerTest {
     }
 
     @Test
-    @DisplayName("MDC 兜底：无 query 但有 MDC sessionId → getAllHooks(sessionId)（MemoryController:136-137 模式）")
-    void mdcSessionId_fallback() throws Exception {
+    @DisplayName("[批 3a 反向实验] MDC 残留别的会话 id 时不读 MDC：无 query 仍 400（若回退 MDC 则本用例红）")
+    void mdcSessionId_isIgnored_is400() throws Exception {
+        // WHY（规则九）：MDC 的 sessionId 第三态 = 上一个请求残留的**别的会话** id（看起来完全合法）
+        //   ⇒ 旧实现会把 B 会话的 hook 列表当成 A 会话的返回，且日志前缀同样取自 MDC ⇒ 无法自查。
+        //   本用例故意把 MDC 设成一个合法会话：若实现回退读 MDC，请求会 200 且
+        //   verify(never()).getAllHooks("sess-mdc") 立刻失败。
         RequestContext.setSession("sess-mdc");
         when(hooksSettings.getAllHooks("sess-mdc")).thenReturn(List.of(sampleCommandHook()));
 
         mockMvc.perform(get("/api/v1/hooks"))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.length()").value(1));
+            .andExpect(status().isBadRequest());
 
-        verify(hooksSettings).getAllHooks("sess-mdc");
+        verify(hooksSettings, never()).getAllHooks("sess-mdc");
         verify(hooksSettings, never()).getAllHooks();
     }
 
     @Test
     @DisplayName("返回 shape 对齐前端 HookItem（types.ts:855-865）：config.type/command|url 齐全、null 子类型字段省略")
     void returnShape_matchesFrontendHookItem() throws Exception {
-        when(hooksSettings.getAllHooks()).thenReturn(List.of(
+        when(hooksSettings.getAllHooks("sess-xxx")).thenReturn(List.of(
             sampleCommandHook(),
             new IndividualHookConfig(
                 HookEventType.PRE_TOOL_USE,
                 new HttpHook("https://x/h", null, null, null, null, "fetching", null),
                 "Read", HookSource.LOCAL_SETTINGS, null)));
 
-        mockMvc.perform(get("/api/v1/hooks"))
+        mockMvc.perform(get("/api/v1/hooks").param("sessionId", "sess-xxx"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.length()").value(2))
             // CommandHook → config.type='command' + command
@@ -169,12 +167,12 @@ class HookControllerTest {
     }
 
     @Test
-    @DisplayName("无参数 → settings + 插件 hook 合并（source=PLUGIN_HOOK + pluginName 透传，前端 HookPanel 渲染）")
-    void noParam_mergesPluginHooks() throws Exception {
-        when(hooksSettings.getAllHooks()).thenReturn(List.of(sampleCommandHook()));
+    @DisplayName("sessionId 分支 → settings + 插件 hook 合并（source=PLUGIN_HOOK + pluginName 透传，前端 HookPanel 渲染）")
+    void sessionId_mergesPluginHooks() throws Exception {
+        when(hooksSettings.getAllHooks("sess-xxx")).thenReturn(List.of(sampleCommandHook()));
         when(hookRegistry.getRegisteredPluginHookConfigs()).thenReturn(List.of(samplePluginHook()));
 
-        mockMvc.perform(get("/api/v1/hooks"))
+        mockMvc.perform(get("/api/v1/hooks").param("sessionId", "sess-xxx"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.length()").value(2))
             // settings hook 在前
@@ -187,7 +185,7 @@ class HookControllerTest {
             .andExpect(jsonPath("$[1].source").value("PLUGIN_HOOK"))
             .andExpect(jsonPath("$[1].pluginName").value("zjkycode@zjkycode"));
 
-        verify(hooksSettings).getAllHooks();
+        verify(hooksSettings).getAllHooks("sess-xxx");
         verify(hookRegistry).getRegisteredPluginHookConfigs();
     }
 
@@ -212,9 +210,9 @@ class HookControllerTest {
     void nullHookRegistry_skipsPluginMerge() throws Exception {
         // 覆盖 setUp 注入：模拟未注入 HookRegistry（生产 @Autowired 恒注入，直构测试防御）
         ReflectionTestUtils.setField(controller, "hookRegistry", null);
-        when(hooksSettings.getAllHooks()).thenReturn(List.of(sampleCommandHook()));
+        when(hooksSettings.getAllHooks("sess-xxx")).thenReturn(List.of(sampleCommandHook()));
 
-        mockMvc.perform(get("/api/v1/hooks"))
+        mockMvc.perform(get("/api/v1/hooks").param("sessionId", "sess-xxx"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.length()").value(1))
             .andExpect(jsonPath("$[0].source").value("USER_SETTINGS"));

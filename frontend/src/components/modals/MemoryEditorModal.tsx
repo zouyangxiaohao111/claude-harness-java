@@ -37,10 +37,19 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
   const [saving, setSaving] = useState(false)
 
   // 挂载/切换会话时拉取记忆文件列表（type 三档视图）；失败 fail loud（error 态 + 关闭按钮仍可用）
+  // [批 3a] 无活动会话 → 不发请求（后端 sessionId 必填，缺值 400），直接显式 error 态。
   const load = useCallback(() => {
     let cancelled = false
     setLoading(true)
     setError('')
+    if (!sessionId) {
+      setFiles([])
+      setSelectedKey('')
+      setDraft('')
+      setError('无活动会话：记忆文件需带当前会话（后端 sessionId 必填）')
+      setLoading(false)
+      return
+    }
     listMemoryFiles(sessionId)
       .then((list) => {
         if (cancelled) return

@@ -224,7 +224,7 @@ interface MessageListProps {
 }
 
 /** 工具调用卡片 · FNT-TC-01：消息级 matchedRule（后端 ChatMessageDto 顶层出站）→ 显示「已自动批准（规则X）」徽标；无数据静默 */
-function ToolCard({ tool, matchedRule, live = false }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean }) {
+function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean; sessionId: string }) {
   // 工具卡片默认折叠（用户手动点击展开 IN/OUT）· 对齐 Harness ToolRow；组件本地展开态
   const [expanded, setExpanded] = useState(false)
   const rule = matchedRule
@@ -279,13 +279,15 @@ function ToolCard({ tool, matchedRule, live = false }: { tool: NonNullable<ChatM
   useEffect(() => {
     if (!runningFront) { setBgTaskId(null); return }
     let alive = true
-    tasksApi.list().then((list) => {
+    // [批 3a] 显式带当前会话：不带会列出**全部会话**的后台任务（可能命中别的会话同 toolUseId 的任务
+    //   → 点「转后台」作用到别的会话的对象上）。本组件 sessionId 为必填 prop。
+    tasksApi.list(sessionId).then((list) => {
       if (!alive) return
       const t = (list ?? []).find((x) => x.toolUseId === tool.id && x.isBackgrounded !== true && x.status === 'running')
       if (t) setBgTaskId(t.id)
     }).catch(() => {})
     return () => { alive = false }
-  }, [runningFront, tool.id])
+  }, [runningFront, tool.id, sessionId])
   const doBackground = async () => {
     if (!bgTaskId) return
     try {
@@ -708,7 +710,7 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
               //   「¥ 金额」误读（此前「本轮 368」视觉像 $368 金额）
               <div className="msg-usage">本轮输出 {compactNumber(msg.outputTokens)} tokens</div>
             ) : null}
-            {msg.toolCalls?.map((t, i) => <ToolCard key={t.id ?? i} tool={t} matchedRule={msg.matchedRule} />)}
+            {msg.toolCalls?.map((t, i) => <ToolCard key={t.id ?? i} tool={t} matchedRule={msg.matchedRule} sessionId={msg.sessionId} />)}
           </div>
         </>
       )}
@@ -757,7 +759,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
           </div>
         )}
         {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} streamKey={`${sessionId}:${blockId}`} />}
-        {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live />)}
+        {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live sessionId={sessionId} />)}
       </div>
     </div>
   )

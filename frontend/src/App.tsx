@@ -1185,8 +1185,14 @@ function App() {
 
   // 会话级 effort：/effort 命令写当前会话（V31 effort_level + V32 ultracode_enabled）
   const saveEffort = useCallback(async (v: NonNullable<SessionDto['effortLevel']> | 'ultracode') => {
+    // [批 3a] 后端口 sessionId 必填（缺值 400）。旧实现不带会话 → effort 只能靠 MDC 解析（第三态可
+    //   写到别的会话）；现显式透传当前会话。
+    if (!activeSessionId) {
+      showToast('无活动会话：请先打开一个会话再设置推理等级', 'info')
+      return
+    }
     try {
-      await commandApi.executeBuiltin('effort', { args: v })
+      await commandApi.executeBuiltin('effort', activeSessionId, { args: v })
       const isUltra = v === 'ultracode'
       setSessions(storeSessions.map((s) =>
         s.id === activeSessionId
@@ -1394,12 +1400,13 @@ function App() {
       return
     }
     try {
-      // 透传 activeSessionId：/clear 等会话级内置命令的后端清理链读 MDC 会话，不带则 no-op（finding-2）
+      // [批 3a] 必传 activeSessionId：后端口已改必填（缺值 400），会话级内置命令（/compact 等）的
+      //   会话锚定全靠它 —— 不再由后端读 MDC 兜底（MDC 第三态会读到别的会话的 id）。
       // 透传 args：/compact 自定义指令（后端 CompactExecuteRequest{args}）；其余命令忽略该字段
       await commandApi.executeBuiltin(
         name,
+        activeSessionId,
         args ? { args } : undefined,
-        activeSessionId ?? undefined,
       )
       // [P3-b 前端配合 · 压缩归零] /compact 成功落库后重拉本会话消息：压缩替换了消息链，前端本地仍是
       //   压缩前的消息（含旧 assistant 的上下文快照）→ 「已用/窗口」停在压缩前的大值。重拉走
@@ -1921,6 +1928,7 @@ function App() {
           pickFast={pickFastModel}
           clearFast={clearFastModel}
           onOpenMemoryEditor={() => setShowMemoryEditor(true)}
+          sessionId={activeSessionId}
           close={() => uiDispatch({ type: 'CLOSE_SETTINGS' })}
           showToast={showToast}
         />

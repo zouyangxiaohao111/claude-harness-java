@@ -183,7 +183,7 @@ class MemoryControllerTest {
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# existing project claude.md", List.of()),
             MemoryFileInfo.of(claudeReadonlyPath, ClaudemdMemoryType.PROJECT, "# claude read-only", List.of())));
 
-        mockMvc.perform(get("/api/v1/memory/files"))
+        mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isOk())
             // Managed + User + Project(.nexusai 可写) + Project(.claude 只读) = 4
             .andExpect(jsonPath("$.length()").value(4))
@@ -230,16 +230,26 @@ class MemoryControllerTest {
     }
 
     @Test
-    @DisplayName("GET /api/v1/memory/files → 无 sessionId（query/MDC 全空）→ Project 档空列表，仅 Managed+User")
-    void listFiles_noSessionId_projectEmpty() throws Exception {
-        RequestContext.clear(); // 三源（query/MDC）全空 → 读宽容：Project 档不 400，返回空
-
+    @DisplayName("[批 3a] GET /api/v1/memory/files 无 sessionId → 400（旧实现「读宽容返回空 Project 档」已删）")
+    void listFiles_noSessionId_is400() throws Exception {
+        // WHY（缺值策略 (a) 本该有却没有 ⇒ 400）：Project 档由会话 boundProject 决定，缺会话无从解析。
+        //   旧实现静默返回「只有 Managed+User」的列表 ⇒ 前端看起来「项目记忆是空的」（把配置缺失伪装
+        //   成业务事实）。变异点：把 requireSessionId 改回「缺值即返回空」→ 本用例红（200）。
         mockMvc.perform(get("/api/v1/memory/files"))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.length()").value(2))
-            .andExpect(jsonPath("$[0].type").value("Managed"))
-            .andExpect(jsonPath("$[1].type").value("User"))
-            .andExpect(jsonPath("$[?(@.type=='Project')]").isEmpty());
+            .andExpect(status().isBadRequest());
+
+        mockMvc.perform(get("/api/v1/memory/files").param("sessionId", ""))
+            .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[批 3a 反向实验] MDC 残留别的会话 id 时不读 MDC：无 query 仍 400（若回退 MDC 则本用例红）")
+    void listFiles_mdcIsIgnored_is400() throws Exception {
+        // WHY（规则九）：MDC 第三态 = 上一请求残留的**别的会话** id（看起来完全合法）⇒ 旧实现会把 B
+        //   会话的 boundProject 当作 A 的返回 Project 档记忆文件（跨项目泄漏）而无人发现。
+        //   本例 setUp 已把 MDC 设成 TEST_SESSION（合法会话），若实现回退读 MDC 则请求 200。
+        mockMvc.perform(get("/api/v1/memory/files"))
+            .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -273,7 +283,7 @@ class MemoryControllerTest {
             MemoryFileInfo.of(autoMemPath, ClaudemdMemoryType.AUTO_MEM, "# auto mem", List.of()),
             MemoryFileInfo.of(teamMemPath, ClaudemdMemoryType.TEAM_MEM, "# team mem", List.of())));
 
-        mockMvc.perform(get("/api/v1/memory/files"))
+        mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isOk())
             // Managed + User + Project = 3（AutoMem/TeamMem 不在三档）
             .andExpect(jsonPath("$.length()").value(3))
@@ -295,7 +305,7 @@ class MemoryControllerTest {
             MemoryFileInfo.of(autoMemPath, ClaudemdMemoryType.AUTO_MEM, "# auto mem", List.of()),
             MemoryFileInfo.of(teamMemPath, ClaudemdMemoryType.TEAM_MEM, "# team mem", List.of())));
 
-        mockMvc.perform(get("/api/v1/memory/files"))
+        mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isOk())
             // 无 PROJECT 文件 → Project 档空；仅 Managed + User
             .andExpect(jsonPath("$.length()").value(2))
@@ -310,7 +320,7 @@ class MemoryControllerTest {
     void listFiles_engineNotWiredIs500() throws Exception {
         ReflectionTestUtils.setField(controller, "claudemdEngine", null);
 
-        mockMvc.perform(get("/api/v1/memory/files"))
+        mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isInternalServerError());
     }
 
@@ -648,7 +658,7 @@ class MemoryControllerTest {
                 mock(AccountOAuthTokenService.class), new ObjectMapper(), true))
             .build();
 
-        authMvc.perform(get("/api/v1/memory/files"))
+        authMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isUnauthorized());
         authMvc.perform(post("/api/v1/memory/files")
                 .contentType(APPLICATION_JSON)
@@ -658,7 +668,7 @@ class MemoryControllerTest {
                 .contentType(APPLICATION_JSON)
                 .content("{\"type\":\"User\",\"content\":\"# x\"}"))
             .andExpect(status().isUnauthorized());
-        authMvc.perform(get("/api/v1/memory/config"))
+        authMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
             .andExpect(status().isUnauthorized());
     }
 
@@ -679,7 +689,7 @@ class MemoryControllerTest {
             .addFilters(new BearerTokenAuthFilter(tokenService, new ObjectMapper(), true))
             .build();
 
-        authMvc.perform(get("/api/v1/memory/files")
+        authMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION)
                 .header("Authorization", "Bearer valid-token"))
             .andExpect(status().isOk());
 
@@ -696,7 +706,7 @@ class MemoryControllerTest {
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
 
-        bareMvc.perform(get("/api/v1/memory/files"))
+        bareMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isInternalServerError());
     }
 
@@ -705,7 +715,7 @@ class MemoryControllerTest {
     void listFiles_engineFailureIs500() throws Exception {
         when(claudemdEngine.getMemoryFiles(false)).thenThrow(new RuntimeException("disk unavailable"));
 
-        mockMvc.perform(get("/api/v1/memory/files"))
+        mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isInternalServerError());
     }
 
@@ -754,7 +764,7 @@ class MemoryControllerTest {
         // 未设置（AutoMemPathsTest:588 同款约定）；NEXUSAI_AUTO_DREAM 属性已由 setUp 清除；
         // DB 静态桥接未注入（null）→ 无 DB 值 → autoDream 回落默认 true（V56 用户拍板默认开，
         // 覆盖旧 OPD-CM3-24 Q1「未配置恒 false」——P0 矛盾修复：与运行时门控一致）。
-        mockMvc.perform(get("/api/v1/memory/config"))
+        mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.autoMemoryEnabled").value(true))
             .andExpect(jsonPath("$.autoDreamEnabled").value(true))
@@ -777,7 +787,7 @@ class MemoryControllerTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         try {
-            mockMvc.perform(get("/api/v1/memory/config"))
+            mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.autoMemoryEnabled").value(false))
                 .andExpect(jsonPath("$.autoDreamEnabled").value(true));
@@ -796,7 +806,7 @@ class MemoryControllerTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         try {
-            mockMvc.perform(get("/api/v1/memory/config"))
+            mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.autoDreamEnabled").value(true));
         } finally {
@@ -814,7 +824,7 @@ class MemoryControllerTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         try {
-            mockMvc.perform(get("/api/v1/memory/config"))
+            mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.autoDreamEnabled").value(false));
         } finally {
@@ -832,7 +842,7 @@ class MemoryControllerTest {
         long mtime = 1_700_000_000_000L;
         Files.setLastModifiedTime(lock, FileTime.fromMillis(mtime));
 
-        mockMvc.perform(get("/api/v1/memory/config"))
+        mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.dreamStatus").value("last_ran"))
             .andExpect(jsonPath("$.lastConsolidatedAtMs").value(mtime));
@@ -854,7 +864,7 @@ class MemoryControllerTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         try {
-            mockMvc.perform(put("/api/v1/memory/config")
+            mockMvc.perform(put("/api/v1/memory/config").param("sessionId", TEST_SESSION)
                     .contentType(APPLICATION_JSON)
                     .content("{\"autoMemoryEnabled\":false,\"autoDreamEnabled\":true}"))
                 .andExpect(status().isOk())
@@ -874,7 +884,7 @@ class MemoryControllerTest {
             assertFalse(root.has("autoDreamEnabled"), "V56 autoDreamEnabled 不再写 settings.json 文件承载键");
 
             // toggle 读写闭环：GET 读 DB settings 列（BundledSkillEnabledGates 桥接）
-            mockMvc.perform(get("/api/v1/memory/config"))
+            mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.autoMemoryEnabled").value(false))
                 .andExpect(jsonPath("$.autoDreamEnabled").value(true));
@@ -894,7 +904,7 @@ class MemoryControllerTest {
         when(mapper.selectOneById(1)).thenReturn(rec);
         BundledSkillEnabledGates.bridgeSettingsMapper(mapper);
         try {
-            mockMvc.perform(put("/api/v1/memory/config")
+            mockMvc.perform(put("/api/v1/memory/config").param("sessionId", TEST_SESSION)
                     .contentType(APPLICATION_JSON)
                     .content("{\"autoDreamEnabled\":false}"))
                 .andExpect(status().isOk())
@@ -915,7 +925,8 @@ class MemoryControllerTest {
     @Test
     @DisplayName("PUT /api/v1/memory/config → 空 body（全 null）不触发写盘，返回当前状态")
     void config_put_emptyBodyDoesNotWrite() throws Exception {
-        mockMvc.perform(put("/api/v1/memory/config").contentType(APPLICATION_JSON).content("{}"))
+        mockMvc.perform(put("/api/v1/memory/config").param("sessionId", TEST_SESSION)
+                .contentType(APPLICATION_JSON).content("{}"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.dreamStatus").value("never"));
 
@@ -928,7 +939,7 @@ class MemoryControllerTest {
     void config_get_memoryStorageNotWiredIs500() throws Exception {
         ReflectionTestUtils.setField(controller, "memoryStorage", null);
 
-        mockMvc.perform(get("/api/v1/memory/config"))
+        mockMvc.perform(get("/api/v1/memory/config").param("sessionId", TEST_SESSION))
             .andExpect(status().isInternalServerError());
     }
 
@@ -938,7 +949,7 @@ class MemoryControllerTest {
         Telemetry telemetry = new Telemetry();
         ReflectionTestUtils.setField(controller, "telemetry", telemetry);
 
-        mockMvc.perform(put("/api/v1/memory/config")
+        mockMvc.perform(put("/api/v1/memory/config").param("sessionId", TEST_SESSION)
                 .contentType(APPLICATION_JSON)
                 .content("{\"autoMemoryEnabled\":false,\"autoDreamEnabled\":true}"))
             .andExpect(status().isOk());
@@ -954,7 +965,7 @@ class MemoryControllerTest {
         Telemetry telemetry = new Telemetry();
         ReflectionTestUtils.setField(controller, "telemetry", telemetry);
 
-        mockMvc.perform(put("/api/v1/memory/config")
+        mockMvc.perform(put("/api/v1/memory/config").param("sessionId", TEST_SESSION)
                 .contentType(APPLICATION_JSON)
                 .content("{\"autoDreamEnabled\":false}"))
             .andExpect(status().isOk());

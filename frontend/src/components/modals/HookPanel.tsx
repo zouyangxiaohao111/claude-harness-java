@@ -3,6 +3,12 @@ import { ApiError } from '@/api/rest'
 import { hooksApi } from '@/api/hooks'
 import type { HookCommandConfig, HookItem } from '@/api/types'
 
+/** HookPanel props · sessionId 由 App → SettingsModal 逐层显式传入（批 3a：后端必填）。 */
+interface HookPanelProps {
+  /** 当前活动会话 id（null = 无活动会话 → 面板呈现显式错误态，不发请求） */
+  sessionId?: string | null
+}
+
 /** 事件名展示：SNAKE_CASE 枚举 → CC PascalCase（如 "SESSION_START" → "SessionStart"） */
 const formatEvent = (event: string): string =>
   event
@@ -48,23 +54,32 @@ const sourceLabel = (h: HookItem): string =>
  * HookPanel · FE-04 只读展示
  *
  * <p>按 hook 事件分组展示全部 hook（事件名 + hook 名 + 来源 + 组内优先级排序）。
- * <p>只读面板，不编辑；数据来自 hooksApi.getAllHooks()（后端 getAllHooks 合并多 source）。
+ * <p>只读面板，不编辑；数据来自 hooksApi.getAllHooks(sessionId)（后端 getAllHooks 合并多 source）。
  * <p>⚠ 后端 REST 端点尚未就绪时走显式错误态 + 重试（不静默）。
+ *
+ * <p><b>sessionId 必填（批 3a）</b>：后端已去掉 MDC 兜底，缺值直接 400。无活动会话时**不调用**
+ * 接口，直接呈现显式错误态（而不是悄悄发出一个注定 400 的请求）。
  */
-export function HookPanel() {
+export function HookPanel({ sessionId }: HookPanelProps) {
   const [hooks, setHooks] = useState<HookItem[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(() => {
+    if (!sessionId) {
+      setHooks([])
+      setLoading(false)
+      setError('无活动会话：hook 列表需带当前会话（后端 sessionId 必填）')
+      return
+    }
     setLoading(true)
     setError(null)
     hooksApi
-      .getAllHooks()
+      .getAllHooks(sessionId)
       .then((list) => setHooks(list ?? []))
       .catch((e) => setError(e instanceof ApiError ? e.userMessage() : String(e)))
       .finally(() => setLoading(false))
-  }, [])
+  }, [sessionId])
 
   useEffect(() => {
     load()
