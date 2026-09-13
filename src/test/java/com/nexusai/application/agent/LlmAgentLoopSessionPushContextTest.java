@@ -1,9 +1,7 @@
 package com.nexusai.application.agent;
 
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.nexusai.application.agent.compact.CompactProgressEvent;
-import com.nexusai.application.agent.compact.CompactProgressState;
 import com.nexusai.application.agent.compact.CompactWarningState;
+import com.nexusai.application.agent.loop.AgentLoopContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -14,7 +12,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -22,33 +19,29 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 /**
- * [批 2 · C 类] 子代理循环路径的压缩推送注册回归测试。
+ * 压缩推送上下文 · token-warning 通道（[批 5a-2] 显式化后的回归测试）。
  *
- * <p><b>缺陷（R2 实证）</b>：{@code SubagentExecutor} 直调<b>静态</b> {@code LlmAgentLoop.queryLoop}，
- * <b>不经 {@code run()}</b> —— 而 {@code run()} 是 {@code CompactWarningState.pushContext} /
- * {@code CompactProgressState.push} 的<b>唯一生产注册点</b>（子代理 loop 跑在工具池 / asyncWorker
- * 线程，ThreadLocal 不跨线程）⇒ 子代理 reactive 压缩（其 {@code ctx.reactiveCompactor()} 由
- * {@code AgentLoopContextFactory} bean 注入，与主循环同源、生产可达）的进度推送静默丢弃：
- * token-warning 侧 {@code CompactWarningState:206-212} 静默 return（仅 DEBUG）；progress 侧
- * {@code CompactProgressState.current()} 返 null → {@code CompactConversationContext:186} 回落
- * {@code TUC.onCompactProgress} 字段，而该字段生产无任何接线者 ⇒ 恒 noop。
+ * <p><b>改造前（缺陷态）</b>：{@code CompactWarningState.pushContext} 是 {@code ThreadLocal}，
+ * 靠 {@code LlmAgentLoop.run()} / manual / <b>子代理</b>三处成对注册维持。子代理直调静态
+ * {@code queryLoop} 不经 {@code run()}，且 loop 跑在工具池 / asyncWorker 线程 ⇒
+ * 「ThreadLocal 不跨线程」使子代理压缩的 token-warning 推送静默丢弃，必须**额外补偿注册**
+ * （原 {@code SubagentExecutor} 的 {@code registerSessionPushContext} 调用即为此而生）。
  *
- * <p><b>修法</b>：注册体抽为单点 {@code LlmAgentLoop.registerSessionPushContext(ws, sessionId)}
- * （{@code run()} 与子代理路径共用），子代理路径在 queryLoop 前后成对注册/清除。
+ * <p><b>改造后</b>：载体删除，push 上下文由 {@link LlmAgentLoop#compactWarningPushContext} 在
+ * **消费点就地构造** —— 两个输入 {@code ctx.wsTemplate()} 与 {@code state.sessionId()} 本就随
+ * loop 参数显式携带 ⇒ 任一线程上都可得，补偿注册全部消失。
  *
- * <p><b>夹具说明</b>：用例 1/2 全部在<b>独立真实池线程</b>（模拟子代理 loop 线程）上执行，
- * 且先断言「未注册时两条通道均静默」再断言「注册后两条通道均达 STOMP」——同一条用例内自带
- * <b>缺陷态对照</b>（反向实验的一部分）。用例 3 是<b>接线守卫（源级）</b>：只守「子代理调用点
- * 存在且成对」，不守运行时行为（运行时行为由用例 1 覆盖）——命名与断言已按此边界标注。
+ * <p><b>夹具说明（规则九）</b>：用例 1 在<b>独立真实池线程</b>上执行并断言「推送真的到达正确
+ * topic + 载荷 sessionId 正确」；用例 2 是<b>差分对照</b>（ws 缺失 ⇒ 无 pushCtx ⇒ 一条都不推，
+ * 且不抛 = 不阻断压缩）。二者合起来才能区分「推送可用」与「静默吞掉」。
  */
-@DisplayName("[批 2 · C] 子代理循环路径压缩推送注册（池线程 · 双通道）")
+@DisplayName("[批 5a-2] token-warning 推送上下文（显式就地构造 · 池线程可达）")
 class LlmAgentLoopSessionPushContextTest {
 
-    private static final String POOL_THREAD_NAME = "test-subagent-loop-pool";
+    private static final String POOL_THREAD_NAME = "test-subagent-loop-pool-1";
 
     private ExecutorService pool;
 
@@ -57,6 +50,7 @@ class LlmAgentLoopSessionPushContextTest {
         if (pool != null) {
             pool.shutdownNow();
         }
+        CompactWarningState.resetForTesting();
     }
 
     private ExecutorService newSubagentLoopPool() {
@@ -86,127 +80,101 @@ class LlmAgentLoopSessionPushContextTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // #1 未注册 → 双通道静默（缺陷态）；注册后 → 双通道达 STOMP（修复态）
+    // #1 池线程上由 (ctx.wsTemplate(), state.sessionId()) 就地构造 → 推达 STOMP
     // ══════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("池线程：未注册双通道静默 → registerSessionPushContext 后 progress+token-warning 均达 STOMP → clear 还原")
-    void poolThread_register_CarriesBothCompactChannels() throws Exception {
+    @DisplayName("池线程：compactWarningPushContext 就地构造 → publishTokenWarning 推达 token-warning topic（载荷 sessionId 正确）")
+    void derivedPushContext_fromPoolThread_reachesTokenWarningTopic() throws Exception {
         SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
         String sessionId = "sess-c0ffee01";
+        AgentState state = new AgentState("sys", sessionId, (java.util.UUID) null);
+        AgentLoopContext ctx = TestContexts.agentLoopContextWithWs(null, null, null, ws);
 
         runOnPoolThread(newSubagentLoopPool(), () -> {
-            // ── token-warning 侧：未注册（= 修复前的子代理 loop 线程状态）──
-            CompactWarningState.publishTokenWarning(sessionId, false, 123L, 200_000L, 42);
+            // 前置对照：未构造 push 上下文时（null）不推 —— 证明下面那次推送不是「总能推」
+            CompactWarningState.publishTokenWarning(null, false, 123L, 200_000L, 42);
             verify(ws, never()).convertAndSend(any(String.class), any(Object.class));
-            // compact-progress 消费点1（ccCtx）与消费点2（StreamCompactSummary:886）都读 current()，
-            // 未注册 → 无 sink 可推（此处以 current()==null 表达「静默 return」的根因）。
 
-            // ── [批 5a] 进度通道：显式 sink 工厂产物，池线程直接可用（与线程身份无关）──
-            //   原断言「ThreadLocal 不跨线程 ⇒ 池线程读不到 current()」——载体已删，
-            //   该缺口不复存在（这正是本改造要消灭的失效模式）。
-            java.util.function.Consumer<CompactProgressEvent> sink =
-                LlmAgentLoop.compactProgressSink(ws, sessionId);
-            assertThat(sink).as("ws+sessionId 齐备 → 有 sink（与线程无关）").isNotNull();
+            // 就地构造（= 生产消费点同款调用）
+            CompactWarningState.SessionPushContext pushCtx =
+                LlmAgentLoop.compactWarningPushContext(ctx, state);
+            assertThat(pushCtx).as("ws+sessionId 齐备 → 有 push 上下文（与线程身份无关）").isNotNull();
+            assertThat(pushCtx.sessionId()).as("sessionId 取自 state（= 原注册用的 params/subagentCtx 值）")
+                .isEqualTo(sessionId);
 
-            // 消费点1/2：进度事件 → STOMP compact-progress topic
-            sink.accept(new CompactProgressEvent.SummaryProgress(7));
-            ArgumentCaptor<Object> progressPayload = ArgumentCaptor.forClass(Object.class);
-            verify(ws).convertAndSend(eq(CompactProgressState.topic(sessionId)), progressPayload.capture());
-            assertThat(progressPayload.getValue()).as("载荷 = toFrontendJson(事件)").isInstanceOf(ObjectNode.class);
-            assertThat(((ObjectNode) progressPayload.getValue()).path("type").asText())
-                .as("前端契约 type 字段").isNotBlank();
+            CompactWarningState.publishTokenWarning(pushCtx, false, 123L, 200_000L, 42);
 
-            // ── token-warning 侧：注册（= run()/子代理同源单点，[批 5a] 本通道未改）──
-            boolean registered = LlmAgentLoop.registerSessionPushContext(ws, sessionId);
-            assertThat(registered).as("ws+sessionId 齐备 → 已注册").isTrue();
-
-            // 消费点3：token-warning → STOMP token-warning topic
-            CompactWarningState.publishTokenWarning(sessionId, false, 123L, 200_000L, 42);
-            ArgumentCaptor<Object> warningPayload = ArgumentCaptor.forClass(Object.class);
+            ArgumentCaptor<Object> payload = ArgumentCaptor.forClass(Object.class);
             verify(ws).convertAndSend(eq("/topic/sessions/" + sessionId + "/token-warning"),
-                warningPayload.capture());
-            assertThat(warningPayload.getValue()).isInstanceOf(AgentEvent.TokenWarning.class);
-            assertThat(((AgentEvent.TokenWarning) warningPayload.getValue()).sessionId()).isEqualTo(sessionId);
-
-            // ── 成对清除（防线程复用串台）→ 再推必须静默（次数不增）──
-            LlmAgentLoop.clearSessionPushContext(registered);
-            CompactWarningState.publishTokenWarning(sessionId, false, 1L, 1L, 1);
-            verify(ws, times(1)).convertAndSend(eq("/topic/sessions/" + sessionId + "/token-warning"),
-                any(Object.class));
-            verify(ws, times(1)).convertAndSend(eq(CompactProgressState.topic(sessionId)), any(Object.class));
+                payload.capture());
+            assertThat(payload.getValue()).isInstanceOf(AgentEvent.TokenWarning.class);
+            assertThat(((AgentEvent.TokenWarning) payload.getValue()).sessionId())
+                .as("载荷 sessionId = 会话 ID（前端据此归属）").isEqualTo(sessionId);
         });
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // #2 非 STOMP 路径（ws==null）→ 不注册（差分对照）
+    // #2/#3 差分对照：ws / sessionId 缺失 → 无 push 上下文（跳过推送，不抛）
     // ══════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("ws==null（非 STOMP 路径）→ 返回 false 且不注册（推送安全跳过 · 差分对照）")
-    void nullWs_skipsRegistration() throws Exception {
-        AtomicBoolean registered = new AtomicBoolean(true);
+    @DisplayName("wsTemplate==null（非 STOMP 路径）→ 无 push 上下文：跳过推送且不抛（不阻断压缩）")
+    void nullWs_yieldsNullPushContext_andPublishDoesNotThrow() throws Exception {
+        AgentState state = new AgentState("sys", "sess-c0ffee02", (java.util.UUID) null);
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, null, null, null, null);
+        assertThat(ctx.wsTemplate()).as("前置：该 ctx 无 wsTemplate").isNull();
 
         runOnPoolThread(newSubagentLoopPool(), () -> {
-            registered.set(LlmAgentLoop.registerSessionPushContext(null, "sess-c0ffee02"));
-            assertThat(LlmAgentLoop.compactProgressSink(null, "sess-c0ffee02"))
-                .as("ws 缺失 → 无 sink（调用方按「不推」处理）").isNull();
+            CompactWarningState.SessionPushContext pushCtx =
+                LlmAgentLoop.compactWarningPushContext(ctx, state);
+            assertThat(pushCtx).as("ws 缺失 → 无 push 上下文").isNull();
+            // (b) 类：跳过推送但**不抛**（压缩照常），且 ≥WARN 可观测由 CompactWarningState 承担。
+            //   触发点 3（publishTokenWarning）本身不改 store；触发点 1（suppress）才推进 store。
+            CompactWarningState.publishTokenWarning(pushCtx, true, 1L, 1L, 1);
+            CompactWarningState.suppressCompactWarning(pushCtx);
+            assertThat(CompactWarningState.isCompactWarningSuppressed())
+                .as("store 状态仍被推进（跳过的是推送，不是状态机）").isTrue();
         });
-
-        assertThat(registered.get()).as("无 wsTemplate → false（调用方据此跳过 clear）").isFalse();
     }
 
     @Test
-    @DisplayName("sessionId==null → 返回 false 且不注册（差分对照）")
-    void nullSessionId_skipsRegistration() throws Exception {
+    @DisplayName("sessionId==null → 无 push 上下文（差分对照）")
+    void nullSessionId_yieldsNullPushContext() throws Exception {
         SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
-        AtomicBoolean registered = new AtomicBoolean(true);
+        AgentState stateNoSid = new AgentState("sys", null, (java.util.UUID) null);
+        AgentLoopContext ctx = TestContexts.agentLoopContextWithWs(null, null, null, ws);
 
-        runOnPoolThread(newSubagentLoopPool(), () ->
-            registered.set(LlmAgentLoop.registerSessionPushContext(ws, null)));
-        assertThat(LlmAgentLoop.compactProgressSink(ws, null))
-            .as("sessionId 缺失 → 无 sink").isNull();
-
-        assertThat(registered.get()).isFalse();
-        verify(ws, never()).convertAndSend(any(String.class), any(Object.class));
+        runOnPoolThread(newSubagentLoopPool(), () -> {
+            assertThat(LlmAgentLoop.compactWarningPushContext(ctx, stateNoSid))
+                .as("sessionId 缺失 → 无 push 上下文").isNull();
+            verify(ws, never()).convertAndSend(any(String.class), any(Object.class));
+        });
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // #3 接线守卫（源级）：子代理调用点存在且成对
+    // #4 子代理路径行为等价：topic 用父会话 short id（= 原注册值）
     // ══════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("[接线守卫·源级] SubagentExecutor 在 queryLoop 前注册 / 后清除；run() 走同一单点")
-    void subagentPath_registrationIsWired() throws Exception {
-        // 本用例只守「调用点存在且成对」（运行时行为由用例 1 覆盖）。若有人删除子代理侧的注册
-        // 调用，本用例变红（这是它唯一的鉴别力，已在 @DisplayName 标注为源级守卫）。
-        String subagent = readSource(
-            "src/main/java/com/nexusai/application/agent/tool/impl/SubagentExecutor.java");
-        int register = subagent.indexOf("registerSessionPushContext(");
-        int loopCall = subagent.indexOf("LlmAgentLoop.queryLoop(");
-        int clear = subagent.indexOf("clearSessionPushContext(");
-        assertThat(register).as("子代理路径必须注册推送上下文").isGreaterThan(-1);
-        assertThat(loopCall).as("子代理路径必须调静态 queryLoop（本缺陷的前提）").isGreaterThan(-1);
-        assertThat(clear).as("子代理路径必须成对清除").isGreaterThan(-1);
-        assertThat(register).as("注册必须在 queryLoop 之前").isLessThan(loopCall);
-        assertThat(clear).as("清除必须在 queryLoop 之后").isGreaterThan(loopCall);
+    @DisplayName("子代理路径行为等价：push 上下文 sessionId = state.sessionId()（子代理 state 由 subagentCtx.sessionId() 构造）")
+    void subagentPath_topicUsesParentSessionId() {
+        // SubagentExecutor:4032 `String sessionId = subagentCtx.sessionId()` → :4050
+        // `new AgentState(agentSystemPrompt, sessionId, agentId)` ⇒ state.sessionId() 就是原
+        // registerSessionPushContext 用的那个值 ⇒ 推导出的 topic 逐字不变（改造前后一致）。
+        SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
+        String parentSessionId = "sess-parent01";
+        AgentState subagentState = new AgentState("subagent-sys", parentSessionId, java.util.UUID.randomUUID());
+        AgentLoopContext subagentCtx = TestContexts.agentLoopContextWithWs(null, null, null, ws);
 
-        String loop = readSource("src/main/java/com/nexusai/application/agent/LlmAgentLoop.java");
-        assertThat(loop).as("run() 必须复用同一注册单点（否则两条路径分叉）")
-            .contains("registerSessionPushContext(this.wsTemplate, params.sessionId())");
-        assertThat(loop).as("run() 必须成对清除")
-            .contains("clearSessionPushContext(sessionPushRegistered)");
-    }
+        CompactWarningState.SessionPushContext pushCtx =
+            LlmAgentLoop.compactWarningPushContext(subagentCtx, subagentState);
+        assertThat(pushCtx).as("子代理路径同样可得 push 上下文（无需补偿注册）").isNotNull();
+        assertThat(pushCtx.sessionId()).as("父会话 short id（与前端 useChatSocket 订阅的 topic 一致）")
+            .isEqualTo(parentSessionId);
 
-    private static String readSource(String relativePath) throws Exception {
-        StringBuilder sb = new StringBuilder();
-        try (java.io.BufferedReader reader =
-                 new java.io.BufferedReader(new java.io.FileReader(relativePath))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                sb.append(line).append('\n');
-            }
-        }
-        return sb.toString();
+        CompactWarningState.publishTokenWarning(pushCtx, true, 9L, 100L, 10);
+        verify(ws).convertAndSend(eq("/topic/sessions/" + parentSessionId + "/token-warning"),
+            any(Object.class));
     }
 }

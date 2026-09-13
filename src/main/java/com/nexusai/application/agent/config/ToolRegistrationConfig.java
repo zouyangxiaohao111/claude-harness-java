@@ -2439,6 +2439,16 @@ public class ToolRegistrationConfig {
         java.util.function.Consumer<com.nexusai.application.agent.compact.CompactProgressEvent>
             manualProgressSink = com.nexusai.application.agent.LlmAgentLoop
                 .compactProgressSink(wsTemplate, manualPushSessionId);
+        // [批 5a-2] token-warning push 上下文同构前置构造（显式载荷，取代 CompactWarningState 的
+        //   ThreadLocal 载体）。manual /compact 不经 LlmAgentLoop.loop ⇒ 无法就地构造，须由装配方注入。
+        //   wsTemplate / pushSessionId 缺失 ⇒ null ⇒ CompactWarningState 跳过推送并 ≥WARN（(b) 类）。
+        CompactWarningState.SessionPushContext manualWarningPushCtx =
+            (wsTemplate != null && manualPushSessionId != null)
+                ? new CompactWarningState.SessionPushContext(
+                    manualPushSessionId,
+                    warning -> wsTemplate.convertAndSend(
+                        "/topic/sessions/" + manualPushSessionId + "/token-warning", warning))
+                : null;
         CompactCommand.CompactCommandContext ctx = buildCompactCommandContext(
             state.rawMessages(), sessionId, agentId, resolveManualCompactModel(state),
             reactiveCompactor, streamCompactSummary,
@@ -2451,7 +2461,8 @@ public class ToolRegistrationConfig {
             useGlobalCacheScope,                   // [RES-R4-1] firstParty gate（REQ-R4-3 与主线程同一判定）
             telemetry,                             // [IMP-CM-17] tengu_compact 结构化遥测接线
             compactAbort,                          // [批 5a] 摘要断流源（显式载荷）
-            manualProgressSink);                   // [批 5a] 进度推送 sink（显式载荷；null = 非 STOMP）
+            manualProgressSink,                    // [批 5a] 进度推送 sink（显式载荷；null = 非 STOMP）
+            manualWarningPushCtx);                 // [批 5a-2] token-warning push 上下文（显式载荷）
         // [IMP2-17 △-7] 用户取消桥接：Java 用户取消是 AgentState.cancelled() 布尔信号
         // （AgentState:947，对齐 CC abortController 的入口注释），run 级 AbortController 未
         // 接线 state.cancel → 此处补桥：会话已取消 → 命令级取消信号立即置位，
@@ -2472,21 +2483,9 @@ public class ToolRegistrationConfig {
         //   reactive）STOMP no-op。此处按 LlmAgentLoop 同构补注册 + finally 清除（register/clear
         //   成对，ThreadLocal 防串台）。wsTemplate 未注入（非 STOMP 路径/直构测试）→ 不注册，
         //   推送安全跳过（store + 订阅者行为不回归）。
-        CompactWarningState.SessionPushContext tokenWarningPushCtx = null;
-        if (wsTemplate != null) {
-            // [session-id-short] pushSessionId 已 short 直键，/topic/sessions/{sess-xxx}/token-warning
-            // 与前端订阅一致（不再 parseSessionUuid 派生 UUID 段）
-            String pushSessionId = state.sessionId() != null ? state.sessionId() : rawSessionId;
-            if (pushSessionId != null) {
-                tokenWarningPushCtx = new CompactWarningState.SessionPushContext(
-                    pushSessionId,
-                    warning -> wsTemplate.convertAndSend(
-                        "/topic/sessions/" + pushSessionId + "/token-warning", warning));
-                CompactWarningState.registerPushContext(tokenWarningPushCtx);
-                // [批 5a] 压缩进度 sink 已在上方装箱（manualProgressSink → ccCtx.onCompactProgress）；
-                //   原 CompactProgressState.register 的 ThreadLocal 已删。
-            }
-        }
+        // [批 5a-2] token-warning 推送上下文已在上方显式装箱（manualWarningPushCtx →
+        //   CompactCommandContext.warningPushContext，最终随参数到达 CompactWarningState）——
+        //   原 CompactWarningState.registerPushContext 的 ThreadLocal 注册已删。
         // [可中断 2026-09-04 · CC Esc] 会话级在飞压缩登记（前端停止/Esc → cancelSession →
         //   CompactProgressState.abortForSession abort 摘要）；摘要断流源（compactAbort）已在上方
         //   装箱进 ccCtx.abortController（[批 5a]，原 registerAbort 的 ThreadLocal 已删）。
@@ -2541,10 +2540,8 @@ public class ToolRegistrationConfig {
             return "/compact 压缩异常: "
                 + (e.getMessage() != null ? e.getMessage() : e.toString());
         } finally {
-            // [MG-2 · IMP-BACK-3] 推送上下文清除（register 成对，对齐 LlmAgentLoop:1786-1788）
-            if (tokenWarningPushCtx != null) {
-                CompactWarningState.clearPushContext();
-            }
+            // [批 5a-2] token-warning push 上下文无槽位需清（原 clearPushContext 的 ThreadLocal 已删）——
+            //   值随 CompactCommandContext / 本次请求引用生命周期回收。
             // [批 5a] 进度 sink / 摘要断流源无 ThreadLocal 槽位需清（原 clear()/clearAbort() 已删）——
             //   两者随 ccCtx 引用生命周期回收。
             // [可中断] 会话级在飞压缩登记清理（register 成对；幂等）
@@ -2823,7 +2820,8 @@ public class ToolRegistrationConfig {
             com.nexusai.application.agent.telemetry.Telemetry telemetry,
             com.nexusai.application.agent.tool.AbortController compactAbort,
             java.util.function.Consumer<
-                com.nexusai.application.agent.compact.CompactProgressEvent> progressSink) {
+                com.nexusai.application.agent.compact.CompactProgressEvent> progressSink,
+            CompactWarningState.SessionPushContext warningPushContext) {
         // [IMP2-17 △-7] 生产 AbortController 接线：不复用断开 new AbortController()（恒未取消 →
         // abort 分支生产不可达）。改复用会话 run 级 live 取消信号（toolUseContext.abortController()，
         // CC context.abortController 等价，Tool.ts:180 透传链）——权限拒绝/兄弟工具错误/流
@@ -2842,7 +2840,8 @@ public class ToolRegistrationConfig {
             appendSystemPrompt, useGlobalCacheScope,
             // [SM-10] notifyCompaction 门控（DRIFT-9 影响面）· CC compact.ts:67-72
             //   feature('PROMPT_CACHE_BREAK_DETECTION') —— 从 FeatureFlags 单源接线
-            () -> featureFlags != null && featureFlags.promptCacheBreakDetection());
+            () -> featureFlags != null && featureFlags.promptCacheBreakDetection(),
+            warningPushContext);                   // [批 5a-2] token-warning push 上下文（显式载荷）
     }
 
     /**

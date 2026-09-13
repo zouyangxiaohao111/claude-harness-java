@@ -29,11 +29,11 @@ import java.util.function.Consumer;
  * <h2>CC 对齐（grep -n 自验 2026-08-04 + 2026-08-23 IMP-BACK-3，compactWarningState.ts / store.ts）</h2>
  * <table>
  *   <tr><th>本方法</th><th>CC original</th><th>行号</th></tr>
- *   <tr><td>suppressCompactWarning()</td><td>suppressCompactWarning()</td><td>compactWarningState.ts:11</td></tr>
- *   <tr><td>clearCompactWarningSuppression()</td><td>clearCompactWarningSuppression()</td><td>compactWarningState.ts:16</td></tr>
+ *   <tr><td>suppressCompactWarning(pushCtx)</td><td>suppressCompactWarning()</td><td>compactWarningState.ts:11</td></tr>
+ *   <tr><td>clearCompactWarningSuppression(pushCtx)</td><td>clearCompactWarningSuppression()</td><td>compactWarningState.ts:16</td></tr>
  *   <tr><td>isCompactWarningSuppressed()</td><td>compactWarningStore.getState()</td><td>compactWarningState.ts:8</td></tr>
  *   <tr><td>subscribe()</td><td>compactWarningStore.subscribe()</td><td>store.ts:19-21</td></tr>
- *   <tr><td>publishTokenWarning()</td><td>TokenWarning.tsx 载荷（后端定，decisions-log §32）</td><td>TokenWarning.tsx:87-178</td></tr>
+ *   <tr><td>publishTokenWarning(pushCtx,…)</td><td>TokenWarning.tsx 载荷（后端定，decisions-log §32）</td><td>TokenWarning.tsx:87-178</td></tr>
  * </table>
  *
  * <p><b>消费方</b>: {@code CompactCommand} 成功收尾链（IMP-10）；microcompact 链式入口
@@ -41,20 +41,24 @@ import java.util.function.Consumer;
  *
  * <p><b>STOMP 通道 3 触发点</b>（decisions-log §32「前端联动 · token_warning 事件契约」）：
  * <ol>
- *   <li><b>压缩成功 → suppressed=true</b>：{@link #suppressCompactWarning()} 状态 false→true
+ *   <li><b>压缩成功 → suppressed=true</b>：{@link #suppressCompactWarning(SessionPushContext)} 状态 false→true
  *       时经会话推送上下文推 {@code AgentEvent.TokenWarning(suppressed=true)}（5 个生产调用点：
  *       CompactCommand:252/:286/:424 + MicroCompactor:407/:524 不变，推送自动发生）；</li>
- *   <li><b>新压缩开始 → suppressed=false</b>：{@link #clearCompactWarningSuppression()} 状态
+ *   <li><b>新压缩开始 → suppressed=false</b>：{@link #clearCompactWarningSuppression(SessionPushContext)} 状态
  *       true→false 时推 {@code TokenWarning(suppressed=false)}（1 个生产调用点：MicroCompactor:246）；</li>
  *   <li><b>上下文接近阈值 → 推 token 用量</b>：{@link #publishTokenWarning} 由 LlmAgentLoop
  *       blocking-limit 预检（calculateTokenWarningState 处）显式调用，携带
  *       tokenUsage/contextWindow/percentLeft 完整数据。</li>
  * </ol>
  *
- * <p><b>会话推送上下文</b>: 静态方法无会话参数，用 {@link ThreadLocal} 承载当前线程会话的
- * STOMP 推送上下文（对齐 {@code CacheSafeParamsHolder} 线程隔离模式）；LlmAgentLoop
- * {@code run()} 入口注册、finally 清除，覆盖整轮 loop 内所有 compact 触发点。
- * 无推送上下文时（非 STOMP 路径/单测）推送安全跳过，仅写 store + 通知订阅者（行为不回归）。
+ * <p><b>会话推送上下文（[批 5a-2] 显式化）</b>: 原用 {@link ThreadLocal} 承载当前线程的
+ * STOMP 推送上下文（对齐 {@code CacheSafeParamsHolder} 线程隔离模式），靠 LlmAgentLoop
+ * {@code run()} / manual / 子代理三处成对注册维持。现改为 {@link SessionPushContext}
+ * **显式参数**传入三个会触发推送的方法（{@link #suppressCompactWarning} /
+ * {@link #clearCompactWarningSuppression} / {@link #publishTokenWarning}）——
+ * 构造点 = 值已在作用域内的两处（{@code LlmAgentLoop.loop} 的
+ * {@code (ctx.wsTemplate(), state.sessionId())}；{@code CompactCommandContext.warningPushContext()}）。
+ * 无推送上下文（非 STOMP 路径/单测）⇒ 跳过推送并 <b>≥WARN</b>，store 状态与订阅者仍推进（行为不回归）。
  */
 public final class CompactWarningState {
 
@@ -66,10 +70,25 @@ public final class CompactWarningState {
     /** 订阅监听器集 · 对齐 CC createStore 的 {@code Set<Listener>}（store.ts:12） */
     private static final List<Consumer<Boolean>> listeners = new CopyOnWriteArrayList<>();
 
-    /** 会话级 STOMP 推送上下文 · 对齐 CacheSafeParamsHolder ThreadLocal 隔离模式 */
-    private static final ThreadLocal<SessionPushContext> pushContext = new ThreadLocal<>();
-
     private CompactWarningState() { /* 工具类不可实例化 */ }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [批 5a-2] ThreadLocal<SessionPushContext> pushContext 载体已删除
+    // ════════════════════════════════════════════════════════════════════
+    // 原实现：`private static final ThreadLocal<SessionPushContext> pushContext` +
+    //   registerPushContext/clearPushContext —— 进程内隐式通道，靠 3 处成对注册
+    //   （LlmAgentLoop.run() / ToolRegistrationConfig manual / SubagentExecutor 子代理）
+    //   维持；「ThreadLocal 不跨线程」使子代理路径必须额外补偿注册。
+    //
+    // ⚠️ CC 无对应物（这是本载体与前三个载体的关键差别）：CC `compactWarningState.ts` 是
+    //   **session-less 模块 store**（`let` + createStore），`suppressCompactWarning()` /
+    //   `clearCompactWarningSuppression()` **无参**、无 STOMP 概念 —— CC 单进程单会话，前端直接
+    //   订阅模块 store。Java 是多会话 Web，push 必须带 sessionId + sender ⇒ **必须自造显式通道**。
+    //
+    // ⇒ 本批改为：push 上下文作为**显式参数**传入三个会触发推送的方法（见下），
+    //   构造点 = 值已在作用域内的两处（`LlmAgentLoop.loop` 的 (ctx.wsTemplate(), state.sessionId())；
+    //   `CompactCommand` 的 CompactCommandContext.warningPushContext()）。
+    //   取不到（null）⇒ **跳过推送并 ≥WARN**（(b) 类，禁只 DEBUG / 禁零日志）。
 
     /**
      * 会话 STOMP 推送上下文 · LlmAgentLoop {@code run()} 每会话线程注册。
@@ -110,40 +129,20 @@ public final class CompactWarningState {
     }
 
     /**
-     * 注册当前线程会话的 STOMP 推送上下文 · LlmAgentLoop {@code run()} 入口调用，
-     * finally 调用 {@link #clearPushContext()}（对齐 CacheSafeParamsHolder save/clear 成对契约）。
-     *
-     * @param context 会话推送上下文（sessionId + STOMP 发送器；null → 视为未注册，推送跳过）
-     */
-    public static void registerPushContext(SessionPushContext context) {
-        pushContext.set(context);
-        if (log.isDebugEnabled()) {
-            log.debug("[CompactWarningState] 注册会话推送上下文: session={}", context.sessionId());
-        }
-    }
-
-    /**
-     * 清除当前线程会话推送上下文 · LlmAgentLoop {@code run()} finally 调用，防 ThreadLocal 串台/泄漏。
-     */
-    public static void clearPushContext() {
-        pushContext.remove();
-        if (log.isDebugEnabled()) {
-            log.debug("[CompactWarningState] 会话推送上下文已清除");
-        }
-    }
-
-    /**
      * 压缩成功后抑制警告 · 对齐 CC {@code suppressCompactWarning()}
      * （compactWarningState.ts:11-13，compact.ts:75/115/202）。
      *
      * <p><b>触发点 1（decisions-log §32）</b>: 状态 false→true 时（CAS 成功）通知订阅者 +
-     * 若存在会话推送上下文则推 {@code TokenWarning(suppressed=true)}。幂等：已为 true 再调用
+     * 若 {@code pushCtx} 非 null 则推 {@code TokenWarning(suppressed=true)}。幂等：已为 true 再调用
      * 不重复通知/推送（对齐 CC setState 值未变不触发，store.ts:14-17）。
+     *
+     * @param pushCtx 会话推送上下文（[批 5a-2] 显式参数，取代 ThreadLocal 载体）；
+     *                null = 本路径无 STOMP 通道 ⇒ 跳过推送并 **WARN**（(b) 类，禁只 DEBUG）
      */
-    public static void suppressCompactWarning() {
+    public static void suppressCompactWarning(SessionPushContext pushCtx) {
         if (suppressed.compareAndSet(false, true)) {
             notifyListeners(true);
-            publishSuppressedChange(true);
+            publishSuppressedChange(pushCtx, true);
         }
         if (log.isDebugEnabled()) {
             log.debug("[CompactWarningState] suppressCompactWarning: 已抑制 compact 警告 (suppressed={})",
@@ -156,12 +155,14 @@ public final class CompactWarningState {
      * （compactWarningState.ts:16-18，microCompact.ts:259）。
      *
      * <p><b>触发点 2（decisions-log §32）</b>: 状态 true→false 时（CAS 成功）通知订阅者 +
-     * 若存在会话推送上下文则推 {@code TokenWarning(suppressed=false)}。
+     * 若 {@code pushCtx} 非 null 则推 {@code TokenWarning(suppressed=false)}。
+     *
+     * @param pushCtx 会话推送上下文（显式参数）；null ⇒ 跳过推送并 **WARN**
      */
-    public static void clearCompactWarningSuppression() {
+    public static void clearCompactWarningSuppression(SessionPushContext pushCtx) {
         if (suppressed.compareAndSet(true, false)) {
             notifyListeners(false);
-            publishSuppressedChange(false);
+            publishSuppressedChange(pushCtx, false);
         }
         if (log.isDebugEnabled()) {
             log.debug("[CompactWarningState] clearCompactWarningSuppression: 复位警告抑制 (suppressed={})",
@@ -192,41 +193,48 @@ public final class CompactWarningState {
      *       可选（null 时前端自行计算）。</li>
      * </ul>
      *
-     * <p>无会话推送上下文（非 STOMP 路径）时安全跳过并 debug 日志，不抛异常。
+     * <p>无会话推送上下文（非 STOMP 路径）时**跳过并 WARN**（(b) 类：合法跳过但必须可观测，
+     * 禁只 DEBUG —— 原实现此处只写 DEBUG，是本载体两处日志违例之一）。
      *
-     * @param sessionId     会话 ID（TokenWarning 载荷）
+     * @param pushCtx       会话推送上下文（[批 5a-2] 显式参数；sessionId 亦取自此处）
      * @param suppressed    当前警告抑制态（isCompactWarningSuppressed）
      * @param tokenUsage    当前 token 用量
      * @param contextWindow 有效上下文窗口（effectiveWindow）
      * @param percentLeft   剩余百分比（可 null）
      */
-    public static void publishTokenWarning(String sessionId, boolean suppressed, long tokenUsage,
+    public static void publishTokenWarning(SessionPushContext pushCtx, boolean suppressed, long tokenUsage,
                                            long contextWindow, Integer percentLeft) {
-        SessionPushContext ctx = pushContext.get();
-        if (ctx == null || ctx.sender() == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[CompactWarningState] publishTokenWarning: 无会话推送上下文，跳过 STOMP 推送: "
-                        + "session={} suppressed={} tokenUsage={} contextWindow={} percentLeft={}",
-                    sessionId, suppressed, tokenUsage, contextWindow, percentLeft);
-            }
+        if (pushCtx == null || pushCtx.sender() == null) {
+            log.warn("[CompactWarningState] publishTokenWarning: 无会话推送上下文 → 跳过 STOMP 推送"
+                    + "（非 STOMP 路径或未接线；store 状态与订阅者仍已推进）: "
+                    + "suppressed={} tokenUsage={} contextWindow={} percentLeft={}",
+                suppressed, tokenUsage, contextWindow, percentLeft);
             return;
         }
+        String sessionId = pushCtx.sessionId();
         AgentEvent.TokenWarning warning =
             AgentEvent.TokenWarning.of(sessionId, suppressed, tokenUsage, contextWindow, percentLeft);
-        ctx.sender().accept(warning);
+        pushCtx.sender().accept(warning);
         log.info("[CompactWarningState] 推 token_warning STOMP: session={} suppressed={} tokenUsage={} "
                 + "contextWindow={} percentLeft={} · decisions-log §32",
             sessionId, suppressed, tokenUsage, contextWindow, percentLeft);
     }
 
-    /** 触发点 1/2 内部推送：抑制态变化时经会话推送上下文推 TokenWarning（token 数据由触发点 3 补充）。 */
-    private static void publishSuppressedChange(boolean value) {
-        SessionPushContext ctx = pushContext.get();
-        if (ctx == null) {
-            // 无会话上下文（非 STOMP 路径）→ 仅写 store + 通知订阅者，不推 STOMP（行为不回归）
+    /**
+     * 触发点 1/2 内部推送：抑制态变化时经会话推送上下文推 TokenWarning（token 数据由触发点 3 补充）。
+     *
+     * @param pushCtx 会话推送上下文（null ⇒ 跳过并 **WARN**）
+     * @param value   最新抑制态
+     */
+    private static void publishSuppressedChange(SessionPushContext pushCtx, boolean value) {
+        if (pushCtx == null) {
+            // (b) 类：无 STOMP 推送通道 —— 仅写 store + 通知订阅者，不推 STOMP（行为不回归）。
+            // ⛔ 原实现此处**零日志**（本载体两处日志违例之二）⇒ 现 ≥WARN 可观测。
+            log.warn("[CompactWarningState] 抑制态变更({})无会话推送上下文 → 跳过 STOMP 推送"
+                    + "（非 STOMP 路径或未接线；store 与订阅者仍已推进）", value);
             return;
         }
-        publishTokenWarning(ctx.sessionId(), value, 0L, 0L, null);
+        publishTokenWarning(pushCtx, value, 0L, 0L, null);
     }
 
     private static void notifyListeners(boolean value) {
@@ -241,15 +249,15 @@ public final class CompactWarningState {
     }
 
     /**
-     * 测试重置 · 清空抑制态 + 订阅者 + 会话推送上下文（对齐 AutoModeState.resetForTesting 惯例）。
+     * 测试重置 · 清空抑制态 + 订阅者（对齐 AutoModeState.resetForTesting 惯例）。
      *
-     * <p><b>WHY</b>: 模块态 {@link AtomicBoolean}/{@link CopyOnWriteArrayList}/{@link ThreadLocal}
-     * 跨测试残留会污染断言（前例：AutoModeState / OfficialMcpRegistry resetForTesting）。
+     * <p><b>WHY</b>: 模块态 {@link AtomicBoolean}/{@link CopyOnWriteArrayList} 跨测试残留会污染断言
+     * （前例：AutoModeState / OfficialMcpRegistry resetForTesting）。
+     * [批 5a-2] 推送上下文已不再有模块态槽位（改显式参数）⇒ 无需清理。
      */
     public static void resetForTesting() {
         suppressed.set(false);
         listeners.clear();
-        pushContext.remove();
         if (log.isDebugEnabled()) {
             log.debug("[CompactWarningState] 测试重置完成");
         }

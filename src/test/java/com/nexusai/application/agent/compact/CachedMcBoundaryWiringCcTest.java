@@ -122,7 +122,7 @@ class CachedMcBoundaryWiringCcTest {
                     MicroCompactor.setCachedMicrocompactModelSupportedForTest(model);
                     ListAppender<ILoggingEvent> app = attachDebugCapture();
                     try {
-                        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION);
+                        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION, null);
                         boolean expect = feature && module && model;
                         assertThat(enteredCachedPath(app))
                             .as("门控矩阵 feature=%s module=%s model=%s → 期望进入=%s（CC microCompact.ts:280-282）",
@@ -148,7 +148,7 @@ class CachedMcBoundaryWiringCcTest {
                 "REPL_MAIN_THREAD"}) {
             ListAppender<ILoggingEvent> app = attachDebugCapture();
             try {
-                mc.microcompactMessages(messages, source, SESSION);
+                mc.microcompactMessages(messages, source, SESSION, null);
                 assertThat(enteredCachedPath(app))
                     .as("source=%s 必须视为 main-thread → cached 门控可进（microCompact.ts:249-251 canonical）", source)
                     .isTrue();
@@ -162,7 +162,7 @@ class CachedMcBoundaryWiringCcTest {
         for (String source : new String[] {"compact", "COMPACT", "session_memory", "SDK"}) {
             ListAppender<ILoggingEvent> app = attachDebugCapture();
             try {
-                mc.microcompactMessages(messages, source, SESSION);
+                mc.microcompactMessages(messages, source, SESSION, null);
                 assertThat(enteredCachedPath(app))
                     .as("source=%s 非 main-thread → cached 门控不可进（microCompact.ts:249-251）", source)
                     .isFalse();
@@ -284,7 +284,7 @@ class CachedMcBoundaryWiringCcTest {
         String sess = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         // 先经 cached 门控进入路径初始化 cachedMCState 模块态（ensureCachedMCState），
         // 使流结束点 markToolsSentToAPIState 的 toolsSentToAPI=true 日志可观测。
-        new MicroCompactor().microcompactMessages(buildMessagesWithTools(), "repl_main_thread", sess);
+        new MicroCompactor().microcompactMessages(buildMessagesWithTools(), "repl_main_thread", sess, null);
 
         ListAppender<ILoggingEvent> app = attachDebugCapture();
         try {
@@ -310,11 +310,11 @@ class CachedMcBoundaryWiringCcTest {
         MicroCompactor.resetMicrocompactState(SESSION);
         List<ChatMessageDto> messages = buildThirteenToolMessages();
         // 13 个可压缩工具 → active > triggerThreshold(10) → cachedMicrocompactPath 触发删除 → 入队 block
-        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION);
+        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION, null);
         assertThat(MicroCompactor.consumePendingCacheEditsBlock(SESSION))
             .as("前置：cached 路径触发删除 → pendingCacheEditsBlock 已入队").isNotNull();
         // 重新触发入队（上一步已 consume 清空），供 buildMessageParams 消费
-        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION);
+        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION, null);
 
         MessageCreateParams params = AnthropicSdkProvider.buildMessageParams(
             "claude-opus-4-1", null, messages, null, null, null, null, null, false, null, false, null);
@@ -357,7 +357,8 @@ class CachedMcBoundaryWiringCcTest {
 
         @Override
         public MicroCompactResult microcompactMessages(List<ChatMessageDto> messages, String querySource,
-                                                       String sessionId) {
+                                                       String sessionId,
+                                                       CompactWarningState.SessionPushContext warningPushContext) {
             capturedSource = querySource;
             return new MicroCompactResult(messages, null);
         }
@@ -369,7 +370,7 @@ class CachedMcBoundaryWiringCcTest {
         RecordingMicroCompactor micro = new RecordingMicroCompactor();
         CompactCommand.CompactCommandContext ctx = new CompactCommand.CompactCommandContext(
             List.of(singleMessage("m1", "hi")), null, null, null, false, null, null,
-            micro, null, null, null, null, null, null, null, null, null, false, () -> false);
+            micro, null, null, null, null, null, null, null, null, null, false, () -> false, null);  // [批 5a-2] warningPushContext
 
         Method m = CompactCommand.class.getDeclaredMethod(
             "microcompactMessages", List.class, CompactCommand.CompactCommandContext.class);
@@ -393,7 +394,7 @@ class CachedMcBoundaryWiringCcTest {
 
         ListAppender<ILoggingEvent> app = attachDebugCapture();
         try {
-            MicroCompactResult result = mc.microcompactMessages(messages, null, SESSION);
+            MicroCompactResult result = mc.microcompactMessages(messages, null, SESSION, null);
             assertThat(enteredCachedPath(app))
                 .as("V2-S4: null（undefined）→ isMainThreadSource=true，cached 门控可进（microCompact.ts:249-251/280-282）")
                 .isTrue();

@@ -138,6 +138,24 @@ public final class TestContexts {
     }
 
     /**
+     * [批 5a-2] 带 STOMP {@code wsTemplate} 的 loop 上下文 —— 供
+     * {@code LlmAgentLoop.compactWarningPushContext} 回归测试用（组件的唯一差异 = 第 16 位
+     * {@code wsTemplate}，其余与 7 参重载逐位相同）。
+     */
+    public static AgentLoopContext agentLoopContextWithWs(
+            ToolRegistry toolRegistry,
+            LlmProviderFactory factory,
+            QueryConfig queryConfig,
+            org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate) {
+        return new AgentLoopContext(
+            toolRegistry, null, null, null, null, null,
+            null, null, null, queryConfig, factory, null, null, null, null,
+            wsTemplate, null, null, null,
+            FeatureFlags.ALL_DISABLED, null, null, null, null, null,
+            null, null, null, null, null, null, null);
+    }
+
+    /**
      * [H7-arch Phase 5-2 P3-⑤] 最小 dummy Tool · 供需要真实 buildStreamingExecutor 的测试
      * （StreamingFallbackTombstoneTest / ModelFallbackTest）在 base TUC 注入非空 availableTools。
      *

@@ -242,7 +242,8 @@ class ToolRegistrationConfigMemoryBeansTest {
             null, null, null, null, null, false,
             new com.nexusai.application.agent.telemetry.Telemetry(),  // [IMP-CM-17] telemetry 接线（tengu_compact）
             null,  // [批 5a] compactAbort（显式载荷）
-            null); // [批 5a] progressSink（显式载荷）
+            null,  // [批 5a] progressSink（显式载荷）
+            null); // [批 5a-2] warningPushContext（显式载荷）
 
         assertThat(ctx.sessionMemoryService()).isSameAs(sm);
     }

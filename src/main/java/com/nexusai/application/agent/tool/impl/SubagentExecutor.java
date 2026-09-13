@@ -4407,24 +4407,14 @@ public class SubagentExecutor {
                 //   （对齐 CC：同 agentId 的 sent 非空 → newSkills 空 → 不注入，attachments.ts:2799-2809）。
                 //   全新 spawn → false → 该 agent 首份整份清单（CC 新 agentId sent 空 → isInitial，
                 //   attachments.ts:2672-2676 turn-0 listing 保证不变）。
-                // [批 2 · C 类] 子代理 loop 压缩推送注册（= run() 同源单点 registerSessionPushContext）。
-                //   WHY：本路径直调**静态** queryLoop，不经 run()（run() 是唯一注册点）⇒ 本线程
-                //   （sync = 工具池固定 8 线程 / async = asyncWorker）无 CompactWarningState /
-                //   CompactProgressState 注册 ⇒ 子代理 reactive 压缩（ctx.reactiveCompactor() 由
-                //   AgentLoopContextFactory bean 注入，与主循环同源、生产可达）的进度推送静默丢弃：
-                //   token-warning 侧 CompactWarningState:206-212 静默 return（仅 DEBUG）；progress 侧
-                //   CompactProgressState.current() 返 null → CompactConversationContext:186 回落
-                //   tuc.onCompactProgress 字段，而该字段生产无任何接线者（LlmAgentLoop.setOnCompactProgress
-                //   零生产调用）⇒ 恒 noop。
-                //   wsTemplate 取子代理自身的 AgentLoopContext（factory.shared → 同一 @Autowired bean）；
-                //   sessionId = 父会话 short id（与前端 useChatSocket 订阅的 topic 一致）。
-                boolean sessionPushRegistered = LlmAgentLoop.registerSessionPushContext(
-                    deps.context() != null ? deps.context().wsTemplate() : null, sessionId);
-                try {
-                    result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids, skillListingResume);
-                } finally {
-                    LlmAgentLoop.clearSessionPushContext(sessionPushRegistered);
-                }
+                // [批 5a-2] 压缩推送通道不再需要子代理补偿注册：
+                //   · 进度 sink（[批 5a]）经 base TUC 透传（SubagentExecutor:460 source.onCompactProgress()）；
+                //   · token-warning push 上下文由 LlmAgentLoop.compactWarningPushContext 在**消费点就地构造**
+                //     —— 其输入 ctx.wsTemplate() / state.sessionId() 在子代理路径同样可得，且
+                //     state.sessionId() == subagentCtx.sessionId()（本文件 :4032 → :4050），
+                //     与原注册用的值同源 ⇒ 推送 topic 逐字不变。
+                //   原「ThreadLocal 不跨线程 ⇒ 必须补偿注册」的成因（值在线程上不可达）已随载体删除消失。
+                result = LlmAgentLoop.queryLoop(queryParams, state, consumedCommandUuids, skillListingResume);
             } catch (Exception e) {
                 log.error("[SubagentExecutor] [H7-arch Phase 2] queryLoop 抛出: {}", e.toString());
                 String fallbackText = extractConclusionFromMessages(state.rawMessages());

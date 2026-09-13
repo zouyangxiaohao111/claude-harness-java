@@ -71,7 +71,7 @@ class CompactCommandPersistWritebackTest {
     @AfterEach
     void resetStaticState() {
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression();
+        CompactWarningState.clearCompactWarningSuppression(null);
         PostCompactionState.clear(SESSION);
     }
 
@@ -92,7 +92,7 @@ class CompactCommandPersistWritebackTest {
         cc.setOnCompactProgress(e -> { });
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, new AbortController(),
             null, new MicroCompactor(), null, () -> cc, () -> { }, () -> { },
-            null, null, null, null, null, false, () -> false);
+            null, null, null, null, null, false, () -> false, null);  // [批 5a-2] warningPushContext
     }
 
     /** SM 优先上下文 · baseDir 下 s1/session-memory/summary.md 提供真实 session memory。 */
@@ -108,7 +108,7 @@ class CompactCommandPersistWritebackTest {
         cc.setOnCompactProgress(e -> { });
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, new AbortController(),
             sm, new MicroCompactor(), null, () -> cc, () -> { }, () -> { },
-            null, null, null, null, null, false, () -> false);
+            null, null, null, null, null, false, () -> false, null);  // [批 5a-2] warningPushContext
     }
 
     private static SessionMemoryService newSmService(Path baseDir) throws Exception {
@@ -120,7 +120,7 @@ class CompactCommandPersistWritebackTest {
         sm.setSmSessionMemoryEnabled(true);
         sm.setSmCompactEnabled(true);
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression();
+        CompactWarningState.clearCompactWarningSuppression(null);
         return sm;
     }
 

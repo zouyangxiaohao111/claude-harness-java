@@ -371,14 +371,14 @@ class LlmAgentLoopSnipMicroWiringTest {
 
         MicroCompactor micro = Mockito.mock(MicroCompactor.class);
         List<ChatMessageDto> reduced = List.of(singleMessage("m1", "first"));
-        when(micro.microcompactMessages(anyList(), anyString(), anyString()))
+        when(micro.microcompactMessages(anyList(), anyString(), anyString(), org.mockito.ArgumentMatchers.any()))
             .thenReturn(new MicroCompactResult(reduced, null));
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
         LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), null, micro);
 
-        verify(micro).microcompactMessages(anyList(), anyString(), anyString());
+        verify(micro).microcompactMessages(anyList(), anyString(), anyString(), org.mockito.ArgumentMatchers.any());
         assertThat(histories)
             .as("LLM 至少被调用一次（history 被捕获）")
             .isNotEmpty();

@@ -330,19 +330,27 @@ public class MicroCompactor {
      * @param querySource CC QuerySource（主循环传 "repl_main_thread:..."；/compact 传 null
      *                    = CC undefined，V2-S4 对齐 compact.ts:98；null = 无源）
      * @param sessionId   显式会话 ID（会话桶键；见类 javadoc「会话键」）
+     * @param warningPushContext [批 5a-2] token-warning STOMP 推送上下文（**显式载荷**，取代
+     *                    {@code CompactWarningState} 的 ThreadLocal 载体）。调用方在值已在作用域内
+     *                    处构造（{@code LlmAgentLoop.loop} 的 {@code (ctx.wsTemplate(), state.sessionId())}；
+     *                    {@code CompactCommand} 的 {@code CompactCommandContext.warningPushContext()}）。
+     *                    null = 无 STOMP 通道 ⇒ 抑制态推送跳过并 ≥WARN（(b) 类，不阻断压缩）
      * @return microcompact 结果（{@code {messages, compactionInfo?}}）
      */
     public MicroCompactResult microcompactMessages(List<ChatMessageDto> messages, String querySource,
-                                                   String sessionId) {
+                                                   String sessionId,
+                                                   CompactWarningState.SessionPushContext warningPushContext) {
         if (messages == null) {
             throw new IllegalArgumentException("MicroCompactor.microcompactMessages: messages is null");
         }
 
         // ── 1. 压缩开始复位警告抑制（microCompact.ts:259 clearCompactWarningSuppression）──
-        CompactWarningState.clearCompactWarningSuppression();
+        //   [批 5a-2] push 上下文显式下传（原 ThreadLocal 载体已删）
+        CompactWarningState.clearCompactWarningSuppression(warningPushContext);
 
         // ── 2. time-based 短路（microCompact.ts:267-270 maybeTimeBasedMicrocompact）──
-        MicroCompactResult timeBased = maybeTimeBasedMicrocompact(messages, querySource, sessionId);
+        MicroCompactResult timeBased = maybeTimeBasedMicrocompact(messages, querySource, sessionId,
+            warningPushContext);
         if (timeBased != null) {
             if (log.isDebugEnabled()) {
                 log.debug("[MicroCompactor] microcompactMessages: time-based 触发短路，返回清除结果");
@@ -358,7 +366,7 @@ public class MicroCompactor {
                 && isCachedMicrocompactEnabled()
                 && isModelSupportedForCacheEditing(currentSessionState(sessionId).mainLoopModel)
                 && isMainThreadSource(querySource)) {
-            return cachedMicrocompactPath(messages, querySource, sessionId);
+            return cachedMicrocompactPath(messages, querySource, sessionId, warningPushContext);
         }
 
         // ── 4. 默认 no-op（legacy 路径已移除，microCompact.ts:288-292，INV-10）──
@@ -429,7 +437,8 @@ public class MicroCompactor {
      * @return 触发并清除后返回 {@code {messages}}；未触发返回 null
      */
     private MicroCompactResult maybeTimeBasedMicrocompact(List<ChatMessageDto> messages, String querySource,
-                                                          String sessionId) {
+                                                          String sessionId,
+                                                          CompactWarningState.SessionPushContext warningPushContext) {
         TimeBasedTriggerResult trigger = evaluateTimeBasedTrigger(messages, querySource);
         if (trigger == null) {
             return null;
@@ -503,7 +512,7 @@ public class MicroCompactor {
             "tokensSaved", tokensSaved));
 
         // 压缩成功抑制警告（microCompact.ts:511 suppressCompactWarning）
-        CompactWarningState.suppressCompactWarning();
+        CompactWarningState.suppressCompactWarning(warningPushContext);
         // 刚内容清除 + 服务端缓存失效 → 若 next turn cached-MC 带陈旧 state 运行会删不存在的工具
         // → 重置（microCompact.ts:513-517 resetMicrocompactState）
         resetMicrocompactState(sessionId);
@@ -546,7 +555,8 @@ public class MicroCompactor {
      * @return 无删除时 {@code {messages}}；删除时带 compactionInfo
      */
     private MicroCompactResult cachedMicrocompactPath(List<ChatMessageDto> messages, String querySource,
-                                                      String sessionId) {
+                                                      String sessionId,
+                                                      CompactWarningState.SessionPushContext warningPushContext) {
         if (log.isDebugEnabled()) {
             log.debug("[MicroCompactor] cached-MC 路径进入（CC cachedMicrocompactPath，microCompact.ts:305-399）· source={}",
                 querySource);
@@ -624,7 +634,7 @@ public class MicroCompactor {
             "keepRecent", config.keepRecent()));
 
         // ── ⑦ 压缩成功抑制警告（microCompact.ts:359 suppressCompactWarning）──
-        CompactWarningState.suppressCompactWarning();
+        CompactWarningState.suppressCompactWarning(warningPushContext);
 
         // ── ⑧ 通知 cache break 检测预期下降（microCompact.ts:361-367，feature 门在 notifier 内 gatedBy）──
         notifyCacheDeletion.accept(querySource != null ? querySource : "repl_main_thread", null);

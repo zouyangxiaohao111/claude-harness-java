@@ -65,7 +65,7 @@ class CompactCommandCcContractTest {
     void resetStaticState() {
         // [sm-cursor-sessionize] 清本会话游标（SESSION="s1"）
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression();
+        CompactWarningState.clearCompactWarningSuppression(null);
         // SESSION="s1" 非 UUID → 方案 1b 走回落进程级单布尔（clear 复位之）；会话级隔离由
         // PostCompactionStateTest 覆盖，本测试仅清回落布尔防跨用例污染。
         PostCompactionState.clear(SESSION);
@@ -113,7 +113,26 @@ class CompactCommandCcContractTest {
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, abort,
             sm, new MicroCompactor(), reactive, () -> cc, notifyCompaction, () -> { },
             tuc, sysCtx, defaultAssemble, customSystemPrompt, null, useGlobalCacheScope,
-            promptCacheBreakDetectionGate);
+            promptCacheBreakDetectionGate, null);  // [批 5a-2] warningPushContext
+    }
+
+    /**
+     * [批 5a-2] 同上，但注入真实 token-warning push 上下文 —— 守「manual /compact 的成功收尾链
+     * 真的把 ctx.warningPushContext() 传到 CompactWarningState」这段接线。
+     */
+    private static CompactCommandContext ctxWithWarningPush(List<ChatMessageDto> messages,
+                                            SessionMemoryService sm,
+                                            CompactConversation.SummaryProducer producer,
+                                            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext pushCtx) {
+        CompactConversationContext cc = new CompactConversationContext();
+        cc.setSessionId(SESSION);
+        cc.setAgentId(AGENT);
+        cc.setModel("claude-sonnet-4-5");
+        cc.setQuerySource("compact");
+        cc.setSummaryProducer(producer);
+        return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, new AbortController(),
+            sm, new MicroCompactor(), null, () -> cc, () -> { }, () -> { },
+            null, null, null, null, null, false, () -> false, pushCtx);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -441,7 +460,7 @@ class CompactCommandCcContractTest {
         smService.setSmSessionMemoryEnabled(true);
         smService.setSmCompactEnabled(true);
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression();
+        CompactWarningState.clearCompactWarningSuppression(null);
 
         List<String> notifyCalls = new ArrayList<>();
         CompactCommandContext c = ctx(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
@@ -700,4 +719,27 @@ class CompactCommandCcContractTest {
             UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
+    @Test
+    @DisplayName("[批 5a-2] manual /compact 成功收尾链把 ctx.warningPushContext() 传给 CompactWarningState → 真实推达 STOMP")
+    void manualPath_passesWarningPushContextToState() {
+        // WHY（规则九）：manual /compact 的成功链有 3 个 suppressCompactWarning 调用点；它们必须拿到
+        //   CompactCommandContext.warningPushContext()（而非 null），否则前端「Context low」横幅在手动
+        //   压缩后不会复位/更新 —— 且旧实现没有任何断言守这条接线。
+        //   ⛔ 判别力：把任一调用点的实参改成 null ⇒ 本用例转红（已反向实验验证）。
+        java.util.List<com.nexusai.application.agent.AgentEvent.TokenWarning> pushes = new ArrayList<>();
+        var pushCtx = new com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext(
+            SESSION, pushes::add);
+        List<ChatMessageDto> preCompact = List.of(
+            msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "hello"));
+
+        CompactCommandContext c = ctxWithWarningPush(preCompact, null,
+            (m, p, t2) -> new CompactConversation.SummaryResult("summary ok", null), pushCtx);
+
+        CompactCommand.CompactCommandResult result = CompactCommand.call("  ", c);
+
+        assertThat(result.compactionResult()).as("前置：压缩真的跑过（否则下面的空断言无意义）").isNotNull();
+        assertThat(pushes).as("manual 成功链必须推送 token_warning（前端横幅依赖）").isNotEmpty();
+        assertThat(pushes.get(0).sessionId()).as("载荷会话归属正确").isEqualTo(SESSION);
+    }
+
 }

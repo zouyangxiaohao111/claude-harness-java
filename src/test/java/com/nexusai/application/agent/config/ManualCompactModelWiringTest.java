@@ -112,7 +112,8 @@ class ManualCompactModelWiringTest {
             false,  // useGlobalCacheScope
             null,   // telemetry
             null,   // [批 5a] compactAbort（显式载荷；null → NOOP）
-            null);  // [批 5a] progressSink（显式载荷；null → 非 STOMP，不推）
+            null,   // [批 5a] progressSink（显式载荷；null → 非 STOMP，不推）
+            null);  // [批 5a-2] warningPushContext（显式载荷；null → token-warning 推送跳过 + WARN）
 
         CompactConversationContext cc = commandCtx.compactConversationContextSupplier().get();
 

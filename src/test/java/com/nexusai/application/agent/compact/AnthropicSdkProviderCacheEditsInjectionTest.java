@@ -152,7 +152,7 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
         List<ChatMessageDto> history = buildInjectionHistory();
         MicroCompactor.resetMicrocompactState(SESSION);
         // 通过完整路径尝试入队（门关 → cached 路径不触发 → 块不入队）
-        new MicroCompactor().microcompactMessages(history, "repl_main_thread", SESSION);
+        new MicroCompactor().microcompactMessages(history, "repl_main_thread", SESSION, null);
 
         MessageCreateParams params = buildParams(history);
         assertThat(MicroCompactor.consumePendingCacheEditsBlock(SESSION))
@@ -194,11 +194,11 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
     private static void enqueueCacheEditsBlock(List<ChatMessageDto> history) {
         // 13 个可压缩工具 → active(13) > triggerThreshold(10) → cached 路径删除 → 入队 block（8 个删除）
         List<ChatMessageDto> trigger = buildThirteenToolMessages();
-        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread", SESSION);
+        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread", SESSION, null);
         CacheEditsBlock queued = MicroCompactor.consumePendingCacheEditsBlock(SESSION);
         assertThat(queued).as("前置：cached 路径触发删除 → pendingCacheEditsBlock 已入队").isNotNull();
         // 重新触发入队，供 buildMessageParams 消费
-        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread", SESSION);
+        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread", SESSION, null);
     }
 
     private static MessageCreateParams buildParams(List<ChatMessageDto> history) {

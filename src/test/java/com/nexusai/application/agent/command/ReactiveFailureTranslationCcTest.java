@@ -60,7 +60,7 @@ class ReactiveFailureTranslationCcTest {
 
     @AfterEach
     void resetStaticState() {
-        com.nexusai.application.agent.compact.CompactWarningState.clearCompactWarningSuppression();
+        com.nexusai.application.agent.compact.CompactWarningState.clearCompactWarningSuppression(null);
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {
@@ -79,7 +79,7 @@ class ReactiveFailureTranslationCcTest {
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, abort,
             null, new MicroCompactor(), reactive, () -> cc, () -> { }, () -> { },
             tuc, sysCtx, () -> { throw new IllegalStateException("custom 短路: defaultAssemble 不应被调用"); },
-            "CUSTOM-PROMPT", null, false, () -> false);
+            "CUSTOM-PROMPT", null, false, () -> false, null);  // [批 5a-2] warningPushContext
     }
 
     private static CompactConversationContext baseCc(List<CompactProgressEvent> events) {
@@ -250,13 +250,16 @@ class ReactiveFailureTranslationCcTest {
             SystemPromptContextProvider.class, Supplier.class, String.class, String.class, boolean.class,
             com.nexusai.application.agent.telemetry.Telemetry.class,
             com.nexusai.application.agent.tool.AbortController.class,
-            java.util.function.Consumer.class);
+            java.util.function.Consumer.class,
+            // [批 5a-2] 生产签名再追加 warningPushContext（16 → 17 参）
+            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext.class);
         build.setAccessible(true);
         CompactCommandContext ctx = (CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
             SESSION, AGENT, null, null, null, null, tuc, null, null, null, null, false, telemetry,
             null,   // [批 5a] compactAbort（显式载荷）
-            null);  // [批 5a] progressSink（显式载荷）
+            null,   // [批 5a] progressSink（显式载荷）
+            null);  // [批 5a-2] warningPushContext（显式载荷）
 
         // 生产接线断言：命令级取消信号 == 会话 live 信号（不再是断开 new AbortController()）
         assertThat(ctx.abortController())

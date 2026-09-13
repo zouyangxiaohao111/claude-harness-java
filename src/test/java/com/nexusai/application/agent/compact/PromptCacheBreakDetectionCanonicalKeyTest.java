@@ -167,7 +167,7 @@ class PromptCacheBreakDetectionCanonicalKeyTest {
 
         // 生产值域触发 time-based MC → 默认 notifier（gatedBy 开启）→ cacheDeletionsPending
         new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1))
-            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD", SESSION);
+            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD", SESSION, null);
 
         detector.checkResponseForCacheBreak("REPL_MAIN_THREAD", 1000, 0, System.currentTimeMillis(), null, "r2");
         assertThat(BREAK_EVENTS.get()).as("feature 开时默认 notifier 必须生效（抑制误报）").isZero();
@@ -182,7 +182,7 @@ class PromptCacheBreakDetectionCanonicalKeyTest {
         PromptCacheBreakDetection detector = new PromptCacheBreakDetection(r -> BREAK_EVENTS.incrementAndGet(), true);
 
         new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1))
-            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD", SESSION);
+            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD", SESSION, null);
 
         assertThat(detector.getTrackedSourceCount())
             .as("feature 关时默认 notifier no-op，不产生任何跟踪状态").isZero();

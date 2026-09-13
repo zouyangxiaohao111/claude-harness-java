@@ -139,7 +139,7 @@ class ManualCacheClearCcIntegrationTest {
         // 复位 PromptCacheBreakDetection 静态 PREVIOUS 表（notifyCompaction 接线测试用）
         new PromptCacheBreakDetection(r -> {}).resetPromptCacheBreakDetection();
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression();
+        CompactWarningState.clearCompactWarningSuppression(null);
         PostCompactionState.clear(SESSION);
     }
 
@@ -192,7 +192,8 @@ class ManualCacheClearCcIntegrationTest {
             // [merge 适配 2026-08-14] 清理面收敛为 user-only 通道（SP-07 △-6：只清 getUserContext），
             //   显式 clear 与 runPostCompactCleanup 内部一致走 clearUserOnlyProviderCaches
             () -> SystemPromptInjection.clearUserOnlyProviderCaches(),
-            null, null, null, null, null, false, () -> flags.promptCacheBreakDetection());
+            null, null, null, null, null, false, () -> flags.promptCacheBreakDetection(),
+            null);  // [批 5a-2] warningPushContext
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -320,13 +321,16 @@ class ManualCacheClearCcIntegrationTest {
             Supplier.class, String.class, String.class, boolean.class, Telemetry.class,
             // [批 5a] 生产签名追加 compactAbort + progressSink 两个显式载荷（14 → 16 参）
             com.nexusai.application.agent.tool.AbortController.class,
-            java.util.function.Consumer.class);
+            java.util.function.Consumer.class,
+            // [批 5a-2] 生产签名再追加 warningPushContext（16 → 17 参）
+            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext.class);
         build.setAccessible(true);
         CompactCommand.CompactCommandContext ctx = (CompactCommand.CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT, null,
             null, null, null, null, null, null, null, null, false, null,
             null,   // [批 5a] compactAbort
-            null);  // [批 5a] progressSink
+            null,   // [批 5a] progressSink
+            null);  // [批 5a-2] warningPushContext
 
         // ── 2a. clearUserContextCache 真实接线：注册观察钩子 → 执行 → 钩子触发 ──
         AtomicInteger cacheClears = registerClearCounter();
@@ -375,13 +379,16 @@ class ManualCacheClearCcIntegrationTest {
             Supplier.class, String.class, String.class, boolean.class, Telemetry.class,
             // [批 5a] 生产签名追加 compactAbort + progressSink 两个显式载荷（14 → 16 参）
             com.nexusai.application.agent.tool.AbortController.class,
-            java.util.function.Consumer.class);
+            java.util.function.Consumer.class,
+            // [批 5a-2] 生产签名再追加 warningPushContext（16 → 17 参）
+            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext.class);
         build.setAccessible(true);
         CompactCommand.CompactCommandContext ctx = (CompactCommand.CompactCommandContext) build.invoke(
             config, List.of(msg("m1", Role.user, "hi")), SESSION, AGENT, null,
             null, null, null, null, null, null, null, null, false, null,
             null,   // [批 5a] compactAbort
-            null);  // [批 5a] progressSink
+            null,   // [批 5a] progressSink
+            null);  // [批 5a-2] warningPushContext
 
         List<PromptCacheBreakDetection.CacheBreakResult> events = new ArrayList<>();
         PromptCacheBreakDetection detector = new PromptCacheBreakDetection(events::add);

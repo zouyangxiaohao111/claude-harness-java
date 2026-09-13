@@ -173,7 +173,17 @@ public final class CompactCommand {
             String customSystemPrompt,
             String appendSystemPrompt,
             boolean useGlobalCacheScope,
-            java.util.function.BooleanSupplier promptCacheBreakDetectionGate) {
+            java.util.function.BooleanSupplier promptCacheBreakDetectionGate,
+            /**
+             * [批 5a-2] token-warning STOMP 推送上下文（**显式载荷**，取代
+             * {@code CompactWarningState} 的 ThreadLocal 载体）。
+             *
+             * <p>manual /compact 跑在 REST/独立请求线程，不经 {@code LlmAgentLoop.loop}
+             * ⇒ 无法像 auto/subagent 路径那样就地由 {@code (ctx.wsTemplate(), state.sessionId())}
+             * 构造，故由装配方（{@code ToolRegistrationConfig.handleCompactCommand}）显式注入。
+             * null = 无 STOMP 通道（非 STOMP 路径 / 测试直构）⇒ 抑制态推送跳过并 ≥WARN（(b) 类）。
+             */
+            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext warningPushContext) {
 
         public CompactCommandContext {
             if (messages == null) {
@@ -252,7 +262,7 @@ public final class CompactCommand {
                         ctx.notifyCompaction().run();
                     }
                     PostCompactionState.markPostCompaction(ctx.sessionId());
-                    CompactWarningState.suppressCompactWarning();
+                    CompactWarningState.suppressCompactWarning(ctx.warningPushContext());
                     log.info("[CompactCommand] SM 优先压缩成功: session={} agent={} preTokens={}",
                         ctx.sessionId(), ctx.agentId(), smResult.preCompactTokenCount());
                     return new CompactCommandResult(smResult, buildDisplayText(ctx, null));
@@ -291,7 +301,7 @@ public final class CompactCommand {
                 // getUserContext.cache.clear + runPostCompactCleanup。
                 // [sm-cursor-sessionize P0-2] 只清本会话游标（旧 static volatile 语义跨会话清空）
                 SessionMemoryService.setLastSummarizedMessageId(ctx.sessionId(), null);
-                CompactWarningState.suppressCompactWarning();
+                CompactWarningState.suppressCompactWarning(ctx.warningPushContext());
                 ctx.clearUserContextCache().run();
                 // [IMP2-02] 无参门：runPostCompactCleanup()（compact.ts:118 无参调用）
                 // → gate=TRUE 全执行（旧实现传 "compact" → gate=false → 缓存残留）。
@@ -546,7 +556,7 @@ public final class CompactCommand {
             // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
                     //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
                     PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
-            CompactWarningState.suppressCompactWarning();
+            CompactWarningState.suppressCompactWarning(ctx.warningPushContext());
             ctx.clearUserContextCache().run();
 
             // combinedMessage（compact.ts:209-212）
@@ -661,7 +671,7 @@ public final class CompactCommand {
         // cached 门控可进；time-based 不触发（microCompact.ts:427-433）。
         // [批 3c] 会话键 = ctx.sessionId() 显式传入（本类已有显式会话；不读任何环境态会话槽）。
         return ctx.microCompactor()
-            .microcompactMessages(messages, null, ctx.sessionId())
+            .microcompactMessages(messages, null, ctx.sessionId(), ctx.warningPushContext())
             .messages();
     }
 

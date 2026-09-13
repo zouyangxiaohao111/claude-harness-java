@@ -45,7 +45,7 @@ class TimeBasedMcConfigInjectionCcTest {
         MicroCompactor.setCachedMicrocompactEnabled(false);
         MicroCompactor.setNowForTest(0L);
         MicroCompactor.resetMicrocompactState(SESSION);
-        CompactWarningState.clearCompactWarningSuppression();
+        CompactWarningState.clearCompactWarningSuppression(null);
     }
 
     // ─────────────────────── 消息构造 ───────────────────────
@@ -107,7 +107,7 @@ class TimeBasedMcConfigInjectionCcTest {
         MicroCompactor.setNowForTest(now);
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
-        MicroCompactResult result = new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION);
+        MicroCompactResult result = new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION, null);
 
         assertThat(clearedCount(result.messages())).as("默认 enabled=false → time-based 不触发").isZero();
         assertThat(result.messages()).as("no-op 返回原列表引用").isSameAs(messages);
@@ -124,7 +124,7 @@ class TimeBasedMcConfigInjectionCcTest {
         MicroCompactor.setNowForTest(now);
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
-        MicroCompactResult result = injected(true, 60, 1).microcompactMessages(messages, "REPL_MAIN_THREAD", SESSION);
+        MicroCompactResult result = injected(true, 60, 1).microcompactMessages(messages, "REPL_MAIN_THREAD", SESSION, null);
 
         assertThat(clearedCount(result.messages()))
             .as("生产大写 name() + 注入 enabled=true → time-based 清除 2 条留 1").isEqualTo(2);
@@ -141,11 +141,11 @@ class TimeBasedMcConfigInjectionCcTest {
         MicroCompactor.setNowForTest(now);
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
-        MicroCompactResult strict = injected(true, 150, 5).microcompactMessages(messages, "repl_main_thread", SESSION);
+        MicroCompactResult strict = injected(true, 150, 5).microcompactMessages(messages, "repl_main_thread", SESSION, null);
         assertThat(clearedCount(strict.messages()))
             .as("gap=120min < 阈值 150min → 不触发").isZero();
 
-        MicroCompactResult loose = injected(true, 60, 1).microcompactMessages(messages, "repl_main_thread", SESSION);
+        MicroCompactResult loose = injected(true, 60, 1).microcompactMessages(messages, "repl_main_thread", SESSION, null);
         assertThat(clearedCount(loose.messages()))
             .as("gap=120min >= 阈值 60min → 触发（keepRecent=1 清 2 留 1）").isEqualTo(2);
     }
@@ -161,7 +161,7 @@ class TimeBasedMcConfigInjectionCcTest {
         MicroCompactor.setNowForTest(now);
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
-        MicroCompactResult result = injected(false, 30, 1).microcompactMessages(messages, "repl_main_thread", SESSION);
+        MicroCompactResult result = injected(false, 30, 1).microcompactMessages(messages, "repl_main_thread", SESSION, null);
 
         assertThat(clearedCount(result.messages()))
             .as("enabled=false → 即便 gap 超阈值也不触发").isZero();
@@ -183,12 +183,12 @@ class TimeBasedMcConfigInjectionCcTest {
         Supplier<MicroCompactor.TimeBasedMCConfig> source = config::get;
         MicroCompactor mc = new MicroCompactor(source);
 
-        MicroCompactResult before = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
+        MicroCompactResult before = mc.microcompactMessages(messages, "repl_main_thread", SESSION, null);
         assertThat(clearedCount(before.messages())).as("配置关 → 不触发").isZero();
 
         // 生产配置热更新（GB 等价：feature 值变化 → 下次评估生效）
         config.set(new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
-        MicroCompactResult after = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
+        MicroCompactResult after = mc.microcompactMessages(messages, "repl_main_thread", SESSION, null);
         assertThat(clearedCount(after.messages()))
             .as("同实例配置源更新后 → 下一次评估实时读取并触发").isEqualTo(2);
     }
