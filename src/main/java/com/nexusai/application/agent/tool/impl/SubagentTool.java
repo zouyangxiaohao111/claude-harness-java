@@ -3913,27 +3913,44 @@ public class SubagentTool implements Tool {
     }
 
     /**
-     * 解析 agent 定义的 permissionMode → {@link PermissionMode} · 对齐
-     * {@code SubagentExecutor.resolvePermissionMode}（同一语义：mode 字符串大写化匹配
-     * 枚举；空或非法 → DEFAULT）。
+     * 解析 agent 定义的 permissionMode → {@link PermissionMode} · 与
+     * {@code SubagentExecutor.resolvePermissionMode} <b>同一语义的第二拷贝</b>（判据/映射/日志
+     * 措辞必须保持一致，否则两处对同一 mode 给出不同结果）。
+     *
+     * <p>判据与理由详见 {@code SubagentExecutor.resolvePermissionMode}：① 走
+     * {@link PermissionMode#fromString} 对齐 CC {@code permissionModeFromString}
+     * （PermissionMode.ts:112-116，集合 = 5 external + auto，大小写敏感，未识别 → default）；
+     * ② fork 专用 {@link ForkSubagent#PERMISSION_MODE} 'bubble' 单独映射 BUBBLE（CC 侧靠类型直传）。
+     * 旧实现 {@code valueOf(mode.toUpperCase())} 认不出 acceptEdits / bypassPermissions / dontAsk
+     * 三个**合法**串（枚举名带下划线）→ 静默折叠 DEFAULT。
      *
      * <p>[OPD-SP-32] createSubagentToolRegistry 用它把真实 mode 传入
      * {@code AgentToolUtils.filterToolsForAgent}，使 plan-mode agent 命中
      * {@code agentToolUtils.ts:88-93} 的 ExitPlanMode 放行分支。
      *
      * @param agentDefinition 子代理定义
-     * @return 解析后的权限模式（空/非法 → {@link PermissionMode#DEFAULT}）
+     * @return 解析后的权限模式（未声明 → {@link PermissionMode#DEFAULT}；真非法串 → DEFAULT + WARN）
      */
     private static PermissionMode resolvePermissionMode(AgentDefinition agentDefinition) {
         String mode = agentDefinition.permissionMode().orElse(null);
         if (mode == null) {
             return PermissionMode.DEFAULT;
         }
-        try {
-            return PermissionMode.valueOf(mode.toUpperCase());
-        } catch (IllegalArgumentException e) {
+        PermissionMode resolved = PermissionMode.fromString(mode);
+        // 同 SubagentExecutor：fromString 对字面量 "default" 与未识别串都返回 DEFAULT，须区分二者。
+        if (resolved == PermissionMode.DEFAULT && !"default".equals(mode)) {
+            if (ForkSubagent.PERMISSION_MODE.equals(mode)) {
+                return PermissionMode.BUBBLE;
+            }
+            // [SEC-FAIL-LOUD] 真非法串不得静默降级：该结果决定 ExitPlanMode 是否放行（OPD-SP-32），
+            // 落空必须留痕并写明原始值（CC 同向：未识别 → 'default'）。
+            log.warn("[SubagentTool] agent '{}' 的 permissionMode '{}' 既非 CC 权限模式串"
+                + "（acceptEdits/bypassPermissions/default/dontAsk/plan/auto），也非 fork 专用 'bubble'"
+                + " → 降级为 DEFAULT (对齐 CC PermissionMode.ts:112-116 未识别 → 'default')",
+                agentDefinition.agentType(), mode);
             return PermissionMode.DEFAULT;
         }
+        return resolved;
     }
 
     /**

@@ -413,7 +413,18 @@ public final class BashPathValidator {
         //    OPD-WF5-FS-071：AST argv 分支——一次 tokenize 直接产每子命令 argv，
         //    替代 splitCommand_DEPRECATED 字符串段 + shell-quote 二次 re-parse
         //    （shell-quote 单引号反斜杠 bug 会静默返回 [] 跳过路径校验，CC :1072-1101）。
-        List<Subcommand> subcommands = tokenizeSubcommands(command);
+        //    [SEC-FAIL-LOUD] tokenize 失败必须 fail-closed：旧实现 catch → return List.of()
+        //    会让「子命令为空」被上层解读为「无需校验任何路径」→ 整个路径约束静默绕过
+        //    （fail-open，安全方向错）。CC 对等情形（parse abort / too-complex）一律 ask
+        //    （BashTool/bashPermissions.ts:1741-1760），本处同向。
+        List<Subcommand> subcommands;
+        try {
+            subcommands = tokenizeSubcommands(command);
+        } catch (SubcommandTokenizeException e) {
+            log.warn("BashPathValidator: 命令 tokenize 失败，子命令路径约束无法静态分析"
+                + " → fail-closed 转人工确认（禁止静默放行）command={}", command, e);
+            return ask("Command could not be tokenized; path constraints cannot be validated automatically");
+        }
         boolean compoundCommandHasCd = subcommands.stream()
             .anyMatch(sub -> isCdArgv(sub.argv()));
         // 4. 输出重定向校验（cd+redirect → ask；target /dev/null 跳过；create 类型校验）
@@ -450,6 +461,31 @@ public final class BashPathValidator {
     private record Subcommand(String text, List<String> argv) {}
 
     /**
+     * tokenize 注入缝 · 仅供测试驱动「tokenize 抛异常」分支（本仓惯例：TaskService.java ENV_READER、
+     * {@code loadAgentsDir.ENV_READER}）。生产恒为 {@link BashParser#tokenize}，行为零变化。
+     *
+     * <p>存在的必要性：失败分支实测不可达（见 {@link #tokenizeSubcommands} 注释），真实命令
+     * 无法驱动；若不注入，fail-closed 实现与「退回 {@code return List.of()}」两版无法被任何
+     * 测试区分（反向实验无从进行）。
+     */
+    static volatile java.util.function.Function<String, List<BashParser.Token>> TOKENIZER =
+        BashParser::tokenize;
+
+    /**
+     * 子命令切分失败信号 · fail-closed 载体（禁止静默返回空列表）。
+     *
+     * <p>安全语义：抛出即表示「本命令的子命令结构不可静态分析」，调用方 {@code check()}
+     * 必须拒绝自动放行（ask）。对应 CC {@code PARSE_ABORTED} 哨兵
+     * （src/utils/bash/parser.ts:85-92「Callers MUST treat this as fail-closed (too-complex)」）
+     * → bashPermissions.ts:1741-1760 返回 {@code behavior:'ask'}。
+     */
+    private static final class SubcommandTokenizeException extends RuntimeException {
+        SubcommandTokenizeException(Throwable cause) {
+            super(cause);
+        }
+    }
+
+    /**
      * 子命令 argv 切分 · 对齐 CC checkPathConstraints astCommands 分支
      * （pathValidation.ts:1072-1101）：一次 {@link BashParser#tokenize} 直接产每子命令 argv，
      * 替代 splitCommand_DEPRECATED 字符串段 + shell-quote 二次 re-parse（shell-quote 单引号
@@ -461,14 +497,21 @@ public final class BashPathValidator {
      * CC :912-916 用）。
      *
      * @param command 原始 bash 命令
-     * @return 子命令 argv 列表（tokenize 失败 → 空）
+     * @return 子命令 argv 列表（恒非 null；tokenize 失败 → 抛 {@link SubcommandTokenizeException}）
+     * @throws SubcommandTokenizeException tokenize 失败（不可静态分析 → 调用方必须 fail-closed）
      */
     private static List<Subcommand> tokenizeSubcommands(String command) {
         List<BashParser.Token> tokens;
         try {
-            tokens = BashParser.tokenize(command);
+            tokens = TOKENIZER.apply(command);
         } catch (Exception e) {
-            return List.of();
+            // 不吞异常：子命令不可静态分析必须向上暴露，交由 check() fail-closed。
+            // [SEC-FAIL-LOUD] 旧实现 return List.of() 把「失败」与「无子命令」混为一谈，
+            // 上层 anyMatch 恒 false → 路径校验整体静默跳过（安全方向错，fail-open）。
+            // 可达性实测：唯一已找到的抛点（未闭合 heredoc，BashParser.tryHeredoc 越界）在
+            // check() 步骤 2 hasDangerousRedirection 就被更早的 ask 拦下 → 本分支当前<潜伏>，
+            // 无真实命令可命中。仍必须 fail-closed：不可静态分析绝不能被判成「校验通过」。
+            throw new SubcommandTokenizeException(e);
         }
         List<Subcommand> result = new ArrayList<>();
         List<String> curArgv = new ArrayList<>();

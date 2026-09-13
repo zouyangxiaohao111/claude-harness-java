@@ -2595,14 +2595,56 @@ public class SubagentExecutor {
         return agentPermissionMode != PermissionMode.BUBBLE && isAsync;
     }
 
+    /**
+     * 解析 agent 定义的 permissionMode 字符串 → {@link PermissionMode}（单一判据）。
+     *
+     * <p><b>判据① · CC 用户可寻址模式串</b>：走 {@link PermissionMode#fromString}，逐串镜像 CC
+     * {@code permissionModeFromString}（PermissionMode.ts:112-116）的运行时集合
+     * {@code PERMISSION_MODES = INTERNAL_PERMISSION_MODES}（types/permissions.ts:34-41）
+     * = 5 个 external（acceptEdits / bypassPermissions / default / dontAsk / plan）+ auto；
+     * <b>大小写敏感</b>；未识别 → default（不抛、不返 null）。
+     *
+     * <p>旧实现 {@code PermissionMode.valueOf(mode.toUpperCase())} 是**另一套判据**，且因枚举名
+     * 带下划线（ACCEPT_EDITS / BYPASS_PERMISSIONS / DONT_ASK）而认不出对应的 CC 串
+     * （acceptEdits / bypassPermissions / dontAsk）→ 三个**合法**串被静默折叠为 DEFAULT
+     * （= 同一能力两套判据，本仓 R7）。
+     *
+     * <p><b>判据② · fork 专用 'bubble'</b>：CC 的 fork agent 定义是**程序化构造**的，
+     * permissionMode 直接赋 {@code 'bubble'}，消费侧按原值使用（runAgent.ts:424
+     * {@code agentPermissionMode = agentDefinition.permissionMode}；:443
+     * {@code agentPermissionMode === 'bubble'}）—— CC 侧类型即 PermissionMode，无需字符串解析。
+     * Java {@code AgentDefinition.permissionMode()} 是 String，故此处必须显式保留同义映射：
+     * 否则 {@link ForkSubagent#PERMISSION_MODE} 会被折叠为 DEFAULT，fork 子 agent 权限冒泡失效
+     * （{@link #resolveShouldAvoidPermissionPrompts} 与 {@code resolveEffectiveForkMode} 依赖 BUBBLE）。
+     *
+     * <p>注意 {@code 'bubble'} <b>不在</b> CC 的可寻址集合内（types/permissions.ts:34-41 注释自述
+     * 「Runtime validation set: modes that are user-addressable」不含 bubble），故它是独立判据而非
+     * 集合成员。
+     *
+     * @param agentDefinition 子代理定义
+     * @return 已识别模式；未声明 → DEFAULT；真非法串 → DEFAULT + WARN
+     */
     PermissionMode resolvePermissionMode(AgentDefinition agentDefinition) {
         String mode = agentDefinition.permissionMode().orElse(null);
         if (mode == null) return PermissionMode.DEFAULT;
-        try {
-            return PermissionMode.valueOf(mode.toUpperCase());
-        } catch (IllegalArgumentException e) {
+
+        PermissionMode resolved = PermissionMode.fromString(mode);
+        // fromString 对「字面量 'default'」与「未识别串」都返回 DEFAULT，需区分二者才能判断
+        // 是否真非法。该判据直接派生自 fromString 本身（同源），不会与它漂移出两套名单。
+        if (resolved == PermissionMode.DEFAULT && !"default".equals(mode)) {
+            if (ForkSubagent.PERMISSION_MODE.equals(mode)) {
+                return PermissionMode.BUBBLE;
+            }
+            // [SEC-FAIL-LOUD] 真非法串（CC 也不认）不得静默降级：agent 声明的权限模式落了空却零
+            // 日志，事后无法反查「为什么这个 agent 的 permissionMode 没生效」。CC 同向（未识别 →
+            // 'default'），本仓按 2026-09-13 裁定把级别升到 WARN 并写明原始值。
+            log.warn("[SubagentExecutor] agent '{}' 的 permissionMode '{}' 既非 CC 权限模式串"
+                + "（acceptEdits/bypassPermissions/default/dontAsk/plan/auto），也非 fork 专用 'bubble'"
+                + " → 降级为 DEFAULT (对齐 CC PermissionMode.ts:112-116 未识别 → 'default')",
+                agentDefinition.agentType(), mode);
             return PermissionMode.DEFAULT;
         }
+        return resolved;
     }
 
     // ════════════════════════════════════════════════════════════════════════
