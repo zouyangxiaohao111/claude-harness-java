@@ -33,6 +33,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("[OD-D8] BackgroundTaskRunner 普通 bash 终态通知 priority=NEXT")
 class BackgroundTaskRunnerOdD8NextTest {
 
+    /** [批 3b-D7 签名收紧] spawn 的 createSessionId 现为必填（旧测试传 null 依赖回落语义）。 */
+    private static final String D8_SESSION = "sess-od-d8-3b-fixture";
+
     @TempDir
     Path tempDir;
 
@@ -109,7 +112,7 @@ class BackgroundTaskRunnerOdD8NextTest {
         BackgroundTaskRunner runner = newRunner(nq);
         String command = "echo od-d8-complete; exit 0";
 
-        runner.spawn(newBashTask(command), command, null);
+        runner.spawn(newBashTask(command), command, D8_SESSION);
         awaitQueueNotEmpty(nq, "bash 完成通知入队");
 
         QueueItem item = nq.peek(q -> true).orElseThrow();
@@ -127,7 +130,7 @@ class BackgroundTaskRunnerOdD8NextTest {
         BackgroundTaskRunner runner = newRunner(nq);
         String command = "echo od-d8-fail; exit 3";
 
-        runner.spawn(newBashTask(command), command, null);
+        runner.spawn(newBashTask(command), command, D8_SESSION);
         awaitQueueNotEmpty(nq, "bash 失败通知入队");
 
         QueueItem item = nq.peek(q -> true).orElseThrow();
@@ -147,7 +150,7 @@ class BackgroundTaskRunnerOdD8NextTest {
         BackgroundTask task = newBashTask(command);
         String taskId = task.id();
 
-        runner.spawn(task, command, null);
+        runner.spawn(task, command, D8_SESSION);
         // 等任务进入 RUNNING（进程存活）再 cancel → markKilled 路径
         awaitUntil(() -> {
             java.util.Optional<BackgroundTask> t = runner.getTask(taskId);

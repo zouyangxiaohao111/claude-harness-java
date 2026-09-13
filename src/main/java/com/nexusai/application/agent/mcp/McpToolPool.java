@@ -1433,6 +1433,19 @@ public class McpToolPool {
      * @throws IllegalStateException 无 config 可重连 / 连接失败
      */
     public McpTransport ensureConnectedClient(String serverName, McpTransport.TransportConfig config) {
+        return ensureConnectedClient(serverName, config, null);
+    }
+
+    /**
+     * [批 3b] 显式会话重载 · {@code connectSessionId} = 发起本次连接的会话（channel 门序[3] 与
+     * channel handler 会话归属的<b>唯一显式源</b>）。null = 无会话（惰性重连 / 启动预取等
+     * 本就不需要会话态的路径）→ channel 门序[3] 恒 SESSION skip（fail-closed）。
+     *
+     * <p>⛔ 旧实现靠 {@link #connectTransport} 向 connectWorker 回放 MDC 让
+     * {@code RequestContext.sessionId()} 可读 —— 回放装置违反「会话态一律显式传参」铁律，已删。
+     */
+    public McpTransport ensureConnectedClient(String serverName, McpTransport.TransportConfig config,
+                                              @jakarta.annotation.Nullable String connectSessionId) {
         McpTransport.TransportConfig effective = config != null ? config : serverConfigs.get(serverName);
         // [impl-I-4 F2 rework] 「是否装配过」以 serverConfigKeys（key 永非 null）为准——serverConfigs
         // 为 ConcurrentHashMap（不允许 null 值），null-config（fake factory 自决）场景不 put，
@@ -1441,7 +1454,8 @@ public class McpToolPool {
         if (effective == null && !serverConfigKeys.containsKey(serverName)) {
             throw new IllegalStateException("MCP server not connected: " + serverName);
         }
-        return establishConnection(serverName, effective, getServerCacheKey(serverName, effective));
+        return establishConnection(serverName, effective, getServerCacheKey(serverName, effective),
+            connectSessionId);
     }
 
     /**
@@ -1451,9 +1465,11 @@ public class McpToolPool {
      * @param serverName MCP server 名
      * @param config     本次连接 config（可为 null → 工厂自决，兼容测试 fake factory）
      * @param key        对应缓存键（调用方已算好，避免重复序列化）
+     * @param connectSessionId [批 3b] 发起连接的服务所属会话（显式；null = 无会话 → channel 门序[3] fail-closed）
      * @return 已连接 transport
      */
-    private McpTransport establishConnection(String serverName, McpTransport.TransportConfig config, String key) {
+    private McpTransport establishConnection(String serverName, McpTransport.TransportConfig config, String key,
+                                             @jakarta.annotation.Nullable String connectSessionId) {
         McpTransport existing = activeTransports.get(serverName);
         String existingKey = serverConfigKeys.get(serverName);
         if (existing != null && key.equals(existingKey)
@@ -1484,7 +1500,7 @@ public class McpToolPool {
         } else {
             invalidateFetchCaches(serverName);
         }
-        McpTransport transport = connectTransport(serverName, config);
+        McpTransport transport = connectTransport(serverName, config, connectSessionId);
         serverConfigKeys.put(serverName, key);
         // [impl-I-4 F2 rework] ConcurrentHashMap 不允许 null 值：null-config（fake factory 自决）
         // 不 put serverConfigs（装配过标记由 serverConfigKeys 承接，ensureConnectedClient 已改判）。
@@ -1500,34 +1516,25 @@ public class McpToolPool {
      *
      * @param serverName MCP server 名
      * @param config     transport 配置
+     * @param connectSessionId [批 3b] 发起连接的服务所属会话（显式透传至 connectWorker；
+     *                         null = 无会话 → channel 门序[3] fail-closed）
      * @return 已连接 transport
      */
-    private McpTransport connectTransport(String serverName, McpTransport.TransportConfig config) {
+    private McpTransport connectTransport(String serverName, McpTransport.TransportConfig config,
+                                          @jakarta.annotation.Nullable String connectSessionId) {
         long timeoutMs = effectiveConnectTimeoutMs();
         AtomicBoolean timedOut = new AtomicBoolean(false);
         // [S02 X-4] 连接握手超时 race · 对齐 CC client.ts:1048-1077（connectPromise 与
         // getConnectionTimeoutMs() 超时 Promise race，超时 → transport.close() + 抛
         // 「connection timed out」）：create+start+initialize 在 worker 线程执行，超时即
         // close 已注册 transport + remove（防悬挂——任何连接路径不悬挂，I-2）。
-        // [S07] MDC 会话回放到连接 worker · 对齐既有 LlmAgentLoop:3771-3803 /
-        // YoloClassifierImpl:511-516 模式（注释明言 = CC AsyncLocalStorage 跨异步 continuation
-        // 自动传播的 Java 等价）。WHY: gate 门序[3 session]（doConnectTransport channel 分支
-        // :1636-1654）在 connectWorker 线程评估 ChannelSessionAllowlist.currentRequestSupplier()
-        // （RequestContext MDC 解析）——无回放则调用方（HTTP 请求线程）设置的 sessionId 不可见，
-        // 会话白名单注入生产不可达（恒 SESSION skip）。回放 + finally clear 防池化线程污染。
-        final java.util.Map<String, String> mdcCtx = org.slf4j.MDC.getCopyOfContextMap();
-        CompletableFuture<McpTransport> connectFuture = CompletableFuture.supplyAsync(() -> {
-            if (mdcCtx != null) {
-                org.slf4j.MDC.setContextMap(mdcCtx);
-            }
-            try {
-                return doConnectTransport(serverName, config, timedOut);
-            } finally {
-                if (mdcCtx != null) {
-                    org.slf4j.MDC.clear();
-                }
-            }
-        }, connectWorker);
+        // [批 3b] ⛔ 此处原有「MDC 会话回放到连接 worker」装置已删：它的唯一消费方是
+        //   ChannelSessionAllowlist.currentRequestSupplier()（gate 门序[3 session] 在 connectWorker
+        //   线程读 RequestContext.sessionId()）。回放属「用 ThreadLocal 冒充显式传递」，违反用户
+        //   铁律；现 sessionId 经本方法参数**显式**跨线程传给 doConnectTransport（值语义，无 ThreadLocal）。
+        CompletableFuture<McpTransport> connectFuture = CompletableFuture.supplyAsync(
+            () -> doConnectTransport(serverName, config, timedOut, connectSessionId),
+            connectWorker);
         try {
             return connectFuture.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (TimeoutException te) {
@@ -1562,7 +1569,7 @@ public class McpToolPool {
      * 每步检查 {@code timedOut}——超时触发后仍存活的 worker 关断本 transport 后中止（防僵尸）。
      */
     private McpTransport doConnectTransport(String serverName, McpTransport.TransportConfig config,
-                                            AtomicBoolean timedOut) {
+                                            AtomicBoolean timedOut, @jakarta.annotation.Nullable String connectSessionId) {
         McpTransport transport = transportFactory.create(config);
         transport.start(config);
         if (timedOut.get()) {
@@ -1695,13 +1702,15 @@ public class McpToolPool {
                 ChannelNotificationGate.ServerCapabilities serverCaps =
                     new ChannelNotificationGate.ServerCapabilities(experimental);
                 ChannelNotificationGate.ChannelGateResult gateResult = channelNotificationGate.gateChannelServer(
-                    serverName, serverCaps, pluginSourceResolver.apply(serverName));
+                    serverName, serverCaps, pluginSourceResolver.apply(serverName), connectSessionId);
                 if ("register".equals(gateResult.action())) {
-                    // Phase 4 (cron-notify): 捕获 channel 关联会话 sessionId（本方法在 connectWorker
-                    // MDC 回放下执行，RequestContext.sessionId() = 建立连接的会话；CC useManageMCPConnections
-                    // :523-530 channel 消息 enqueue 注入当前会话队列——Java 多会话须显式携带）。
-                    // MDC 回放见 connectTransport :1516-1520（mdcCtx 回放至 connectWorker）。
-                    final String channelSessionId = com.nexusai.common.RequestContext.sessionId();
+                    // Phase 4 (cron-notify): channel 关联会话 sessionId —— [批 3b] 由
+                    //   {@link #connectTransport} 参数显式跨线程传入（值语义），
+                    //   ⛔ 不再读 RequestContext.sessionId()（connectWorker 池线程上 MDC 恒 null /
+                    //   残留别会话 id，旧实现靠已删除的 MDC 回放装置才「看起来工作」）。
+                    //   CC useManageMCPConnections :523-530 channel 消息 enqueue 注入当前会话队列
+                    //   （CC 单进程 ambient）——Java 多会话须显式携带。
+                    final String channelSessionId = connectSessionId;
                     transport.setNotificationHandler(ChannelNotification.NOTIFICATION_METHOD,
                         params -> channelNotification.receiveNotification(serverName, params, channelSessionId));
                     log.info("[McpToolPool] {} channel 入站通知 handler 已注册（notifications/claude/channel）sessionId={}",
@@ -1766,6 +1775,20 @@ public class McpToolPool {
      * @return 该 server 注册的工具列表；连接期 401（needs-auth）→ 仅含 authenticate 伪工具
      */
     public List<McpToolEntry> assembleToolPool(String serverName, McpTransport.TransportConfig config) {
+        return assembleToolPool(serverName, config, null);
+    }
+
+    /**
+     * [批 3b] 显式会话重载 · {@code connectSessionId} = 发起本次装配的会话（channel 白名单
+     * 门序[3] 与 channel handler 会话归属的唯一显式源）。
+     *
+     * <p>生产路径：{@code McpServerController.start}（REST，?sessionId= 必填）→
+     * {@code McpServerService.start(id, sessionId)} → 本方法。无会话路径（启动预取
+     * {@code startEnabledBatch}、惰性/自动重连）传 null → channel 门序[3] 恒 SESSION skip
+     * （fail-closed，与 CC「server 未列入 --channels」同向）。
+     */
+    public List<McpToolEntry> assembleToolPool(String serverName, McpTransport.TransportConfig config,
+                                               @jakarta.annotation.Nullable String connectSessionId) {
         String key = getServerCacheKey(serverName, config);
         String existingKey = serverConfigKeys.get(serverName);
         if (serverTools.containsKey(serverName) && key.equals(existingKey)) {
@@ -1778,9 +1801,9 @@ public class McpToolPool {
             // config 为 null（测试 fake factory 自决场景）→ 直接走 establishConnection 不查
             // 存储 config（ensureConnectedClient 的「无 config → 抛」只用于惰性重连路径）。
             if (config != null) {
-                ensureConnectedClient(serverName, config);
+                ensureConnectedClient(serverName, config, connectSessionId);
             } else {
-                establishConnection(serverName, null, key);
+                establishConnection(serverName, null, key, connectSessionId);
             }
 
             // A4 Step 3: tools/list

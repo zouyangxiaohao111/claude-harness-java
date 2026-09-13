@@ -2,7 +2,7 @@ package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.bash.ShellExecutor;
-import com.nexusai.common.RequestContext;
+import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -122,7 +122,23 @@ public class LocalBashTaskRunner {
      * @return 执行结果
      */
     public BashResult execute(String command, String outputFile) throws IOException, InterruptedException {
-        return execute(command, outputFile, MAX_TASK_OUTPUT_BYTES);
+        return executeWithSession(command, outputFile, MAX_TASK_OUTPUT_BYTES, null);
+    }
+
+    /**
+     * [批 3b] 显式会话重载 · {@code sessionId} = 创建该后台任务的会话，用于解析后台进程 cwd
+     * （{@code CwdResolution.getCwd(sessionId)}，对齐 CC {@code Shell.ts:218 pwd() → spawn {cwd}}）。
+     *
+     * <p>⛔ 旧实现读 {@code RequestContext.sessionId()}（MDC）：本方法在
+     * {@code BackgroundTaskRunner} 的 executor 线程执行（提交前无 MDC 回放）⇒ 恒 null ⇒
+     * <b>后台命令永远跑在 user.dir 而不是会话 cwd</b>；若该池线程恰好残留别会话 MDC，更会跑在
+     * 别的会话 cwd 上。会话态一律显式传参。
+     *
+     * @param sessionId 创建会话 id（显式；null = 无会话 → 回落 user.dir）
+     */
+    public BashResult execute(String command, String outputFile, @Nullable String sessionId)
+            throws IOException, InterruptedException {
+        return executeWithSession(command, outputFile, MAX_TASK_OUTPUT_BYTES, sessionId);
     }
 
     /**
@@ -135,6 +151,12 @@ public class LocalBashTaskRunner {
      * @return 执行结果
      */
     BashResult execute(String command, String outputFile, long maxBytes) throws IOException, InterruptedException {
+        return executeWithSession(command, outputFile, maxBytes, null);
+    }
+
+    /** 4 参 execute 本体（[批 3b] 增显式 sessionId；3 参重载委托 sessionId=null 保持既有测试契约）。 */
+    private BashResult executeWithSession(String command, String outputFile, long maxBytes, String sessionId)
+            throws IOException, InterruptedException {
         log.info("LocalBashTaskRunner: executing command");
         if (log.isDebugEnabled()) {
             log.debug("LocalBashTaskRunner: command='{}'", abbreviate(command, 200));
@@ -150,7 +172,9 @@ public class LocalBashTaskRunner {
         //   wrapForBackground（仅 source 快照，无 pwd -P >| track，与前台 wrapForExec 的差别）。
         //   快照生成失败/超时 → resolveBackgroundSnapshot 返回 null → 三参 bash 加 -l login shell
         //   （bashProvider.ts:93-103 同款），不阻塞后台启动、不破坏既有行为。
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+        // [批 3b] cwd 的会话源 = 显式入参（⛔ 不再读 RequestContext.sessionId()：本方法在
+        //   BackgroundTaskRunner executor 线程执行，MDC 恒 null（→ 恒 user.dir）或残留别会话 id）。
+        String cwd = CwdResolution.getCwd(sessionId);
         Path snapshot = resolveBackgroundSnapshot();
         String wrappedCommand = ShellExecutor.wrapForBackground(command, snapshot);
         ProcessBuilder pb = ShellExecutor.bash(wrappedCommand,

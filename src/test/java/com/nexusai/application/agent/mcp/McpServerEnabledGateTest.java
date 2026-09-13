@@ -79,7 +79,7 @@ class McpServerEnabledGateTest {
         ReflectionTestUtils.setField(service, "mcpTransportFactory",
             Mockito.mock(McpTransportFactory.class));
         pool = Mockito.mock(McpToolPool.class);
-        Mockito.when(pool.assembleToolPool(Mockito.anyString(), Mockito.any()))
+        Mockito.when(pool.assembleToolPool(Mockito.anyString(), Mockito.any(), Mockito.any()))
             .thenReturn(List.of());
         Mockito.when(pool.fetchMcpSkills(Mockito.anyString())).thenReturn(List.of());
         ReflectionTestUtils.setField(service, "mcpToolPool", pool);
@@ -179,8 +179,23 @@ class McpServerEnabledGateTest {
         assertThat(updated.status())
             .as("running 状态 PATCH enabled=true 不得重复 start（CC toggle 仅 disabled 态触发重连）")
             .isEqualTo(McpStatus.running);
-        Mockito.verify(pool, Mockito.times(1)).assembleToolPool(Mockito.anyString(), Mockito.any());
+        Mockito.verify(pool, Mockito.times(1)).assembleToolPool(Mockito.anyString(), Mockito.any(), Mockito.any());
     }
+
+    /**
+     * [批 3b] 产出端覆盖：{@code start(id, sessionId)} 必须把<b>显式会话</b>透传到装配点
+     * （{@code assembleToolPool(name, config, sessionId)}）—— 它是 channel 白名单门序[3] 的唯一会话源。
+     * 若这里传 null/漏传，下游 gate 恒 fail-closed（或旧实现读 MDC ⇒ 派生线程串会话）。
+     */
+    @Test
+    @DisplayName("批 3b · start(id, sessionId) 把显式会话透传给 assembleToolPool（产出端）")
+    void start_passesExplicitSessionToAssemble() {
+        McpServerDto created = create("sess-pass-srv", true);
+        service.start(created.id(), "sess-3b-explicit");
+        Mockito.verify(pool).assembleToolPool(Mockito.eq("sess-pass-srv"), Mockito.any(),
+            Mockito.eq("sess-3b-explicit"));
+    }
+
     @Test
     @DisplayName("isMcpServerDisabled(name) 公共判定（enabled=false → true）")
     void isDisabledPublicJudge() {

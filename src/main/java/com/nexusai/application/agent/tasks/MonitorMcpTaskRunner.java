@@ -93,45 +93,20 @@ public class MonitorMcpTaskRunner {
      *
      * @param description 监控描述（用于 CC 摘要 `Monitor "${description}" ...`；monitor 入参应一致）
      * @param toolUseId   关联 tool_use block id（可空）
-     * @return 新任务 id（'m' 前缀）
-     */
-    public String registerTask(String description, String toolUseId) {
-        return registerTask(description, toolUseId, null);
-    }
-
-    /**
-     * 注册 MONITOR_MCP 任务（带 agent 归属）· OPD-TS-25：subagent 结束
-     * {@code killMonitorMcpTasksForAgent}（CC runAgent.ts:852-861）按 agentId 批量终止其 monitor
-     * 任务——monitor 任务须承载归属才能被 owner-scoped kill 命中（BackgroundTask.agentId）。
-     *
-     * @param description 监控描述（用于 CC 摘要 `Monitor "${description}" ...`）
-     * @param toolUseId   关联 tool_use block id（可空）
      * @param agentId     拥有此 monitor 任务的 sub-agent UUID（主线程/main-session 触发为 null，
-     *                    不归属任何 agent，不被 killMonitorMcpTasksForAgent 终止）
-     * @return 新任务 id（'m' 前缀）
-     */
-    public String registerTask(String description, String toolUseId, @Nullable UUID agentId) {
-        // Phase 4 (cron-notify): 无显式 sessionId 的既有入口 → 委托 4 参（sessionId=null 回落全局）。
-        return registerTask(description, toolUseId, agentId, null);
-    }
-
-    /**
-     * 注册 MONITOR_MCP 任务（带 agent 归属 + 创建会话）· Phase 4 (cron-notify)：
-     * 通知带创建会话 sessionId → drain 3a 注入创建会话回合（MonitorTool.execute 经
-     * {@code ctx.sessionId()} 透传创建会话）。
-     *
-     * @param description 监控描述（用于 CC 摘要 `Monitor "${description}" ...`）
-     * @param toolUseId   关联 tool_use block id（可空）
-     * @param agentId     拥有此 monitor 任务的 sub-agent UUID（主线程/main-session 触发为 null，
-     *                    不归属任何 agent，不被 killMonitorMcpTasksForAgent 终止）
-     * @param sessionId   创建此 monitor 任务的会话 sessionId（null → 回落全局）
+     *                    不归属任何 agent，不被 killMonitorMcpTasksForAgent 终止）· OPD-TS-25
+     *                    （CC runAgent.ts:852-861 按 agentId 批量终止其 monitor 任务）
+     * @param sessionId   创建此 monitor 任务的会话 id（<b>显式且必填</b>；Phase 4 cron-notify 通知归属；
+     *                    [批 3b-D7] 同时是输出根所属会话 —— 签名不留「可能没有」，
+     *                    生产调用方 MonitorTool 恒传 {@code ctx.sessionId()}）
      * @return 新任务 id（'m' 前缀）
      */
     public String registerTask(String description, String toolUseId, @Nullable UUID agentId,
-                               @Nullable String sessionId) {
+                               String sessionId) {
         String taskId = TaskIdGenerator.generate(TaskType.MONITOR_MCP);
         long now = System.currentTimeMillis();
-        String outputFile = defaultOutputFile(taskId);
+        // [批 3b-D7] 输出根 = 显式创建会话（registerTask(sessionId) 入参）
+        String outputFile = defaultOutputFile(sessionId, taskId);
         BackgroundTask task = new BackgroundTask(
             taskId, TaskType.MONITOR_MCP, BackgroundTaskStatus.RUNNING,
             description, toolUseId, now, null, null,
@@ -261,8 +236,14 @@ public class MonitorMcpTaskRunner {
      * @param taskId 任务 id（'m' 前缀）
      * @return 该任务输出文件绝对路径
      */
-    public String outputFileFor(String taskId) {
-        return defaultOutputFile(taskId);
+    /**
+     * 该任务的输出文件路径（[批 3b-D7] 会话态显式）。
+     *
+     * @param sessionId 创建该 monitor 任务的会话 id（显式；调用方 MonitorTool 持 ctx.sessionId()）
+     * @param taskId    task id
+     */
+    public String outputFileFor(String sessionId, String taskId) {
+        return defaultOutputFile(sessionId, taskId);
     }
 
     /**
@@ -384,13 +365,14 @@ public class MonitorMcpTaskRunner {
      * （{@code {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/<taskId>.output}）——CC 所有后台任务
      * （Bash/PS/monitor/agent/remote_agent）共用唯一 diskOutput 根（diskOutput.ts:50-55），
      * monitor_mcp 旧独立 flat 根 {@code {tmpdir}/nexusai-tasks}（无 per-session 层）为 Java 自创
-     * 偏离，已收敛。sessionId 来源 {@link BackgroundTaskRunner#resolveSessionId()} 同源
-     * （RequestContext.sessionId() 主源 → nexusai.sessionId sysprop → unknown）。
+     * 偏离，已收敛。sessionId 现为**显式入参**（批 3b-D7 · 用户裁定「一律显式传参」）；
+     * 旧三源（{@code RequestContext.sessionId()}（MDC）→ {@code nexusai.sessionId} sysprop →
+     * {@code "unknown"}）已随 {@code BackgroundTaskRunner.resolveSessionId()} 一并删除。
      * 父目录由 {@link #appendLine} 写前 createDirectories（对齐 CC ensureOutputDir，
      * diskOutput.ts:65-67 mkdir recursive）。
      */
-    private static String defaultOutputFile(String taskId) {
-        return BackgroundTaskRunner.taskOutputPath(taskId);
+    private static String defaultOutputFile(String sessionId, String taskId) {
+        return BackgroundTaskRunner.taskOutputPath(sessionId, taskId);
     }
 
     /**

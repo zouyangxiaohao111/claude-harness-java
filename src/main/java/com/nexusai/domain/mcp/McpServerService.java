@@ -1134,6 +1134,25 @@ public class McpServerService {
     // ============== start / stop / test ==============
 
     public McpServerDto start(String id) {
+        return start(id, null);
+    }
+
+    /**
+     * [批 3b] 显式会话重载 · {@code sessionId} = 发起本次启动的会话，是 channel 白名单门序[3]
+     * 与 channel handler 会话归属的<b>唯一显式源</b>（透传 {@link McpToolPool#assembleToolPool}
+     * → connectWorker → {@code gateChannelServer}）。
+     *
+     * <p>⛔ 旧实现由 {@code ChannelSessionAllowlist.currentRequestSupplier()} 在 connectWorker
+     * 线程读 {@code RequestContext.sessionId()}（MDC），靠 McpToolPool 的 MDC 回放才可见 ——
+     * 回放装置已随本批删除。
+     *
+     * <p>null = 无会话（启动预取 {@link #startEnabledBatch()}、PATCH enabled=true 自动重连等
+     * 本就不带会话的路径）→ channel 门序[3] 恒 SESSION skip（fail-closed）。
+     *
+     * @param id        MCP server DB id
+     * @param sessionId 发起启动的会话 id（显式；null = 无会话 → channel fail-closed）
+     */
+    public McpServerDto start(String id, String sessionId) {
         McpServerRecord r = mcpServerMapper.selectOneById(id);
         if (r == null) throw new NotFoundException("MCP server " + id + " not found");
         McpServer s = r.toDomain();
@@ -1173,24 +1192,25 @@ public class McpServerService {
             // PluginMcpIntegration 运行期注册表供给；未装配（null）→ 恒 null → plugin-kind
             // entry 对 gate fail-closed（对齐 CC pluginSource undefined fail），不产生安全绕过。
             mcpToolPool.setPluginSourceResolver(pluginSourceResolver(pluginMcpIntegration));
-            // [S07] session --channels 真实会话态注入：allowedChannelsSupplier = 当前请求会话
-            // （RequestContext MDC）白名单数据源（ChannelSessionAllowlist，CC getAllowedChannels
+            // [S07 / 批 3b] session --channels 真实会话态注入：allowedChannelsProvider = 显式
+            // sessionId → 白名单 的查表器（ChannelSessionAllowlist.sessionLookup，CC getAllowedChannels
             // state.ts:1676-1682 + setAllowedChannels state.ts:1680 的 --channels 等价物）。
-            // 无会话/无白名单 → 空表 fail-closed（gate 门序[3 session] 恒 SESSION skip，
-            // 安全默认与 CC「server 必须显式列入 --channels 才注册 handler」一致，channelNotification.ts:247-257）。
-            channelNotificationGate.setAllowedChannelsSupplier(channelSessionAllowlist.currentRequestSupplier());
+            // 会话由本方法 sessionId 参数显式透传至 connectWorker；无会话/无白名单 → 空表 fail-closed
+            // （gate 门序[3 session] 恒 SESSION skip，安全默认与 CC「server 必须显式列入 --channels
+            // 才注册 handler」一致，channelNotification.ts:247-257）。
+            channelNotificationGate.setAllowedChannelsProvider(channelSessionAllowlist.sessionLookup());
             if (log.isDebugEnabled()) {
-                log.debug("[McpServerService] start 注入 allowedChannelsSupplier=真实会话态(ChannelSessionAllowlist): " +
-                        "gate 门序[3 session] 按当前请求会话白名单判定（无会话/无白名单 → 空表 fail-closed）");
+                log.debug("[McpServerService] start 注入 allowedChannelsProvider=真实会话态(ChannelSessionAllowlist.sessionLookup): " +
+                        "gate 门序[3 session] 按**显式传入的会话**白名单判定（无会话/无白名单 → 空表 fail-closed）");
             }
             log.info("[McpServerService] start 接线 channel 生产链路：pluginSourceResolver={} " +
-                    "allowedChannelsSupplier=真实会话态(ChannelSessionAllowlist) 已注入（McpToolPool @Autowired 接 " +
+                    "allowedChannelsProvider=真实会话态(ChannelSessionAllowlist.sessionLookup) 已注入（McpToolPool @Autowired 接 " +
                     "ChannelNotification+ChannelNotificationGate，fail-loud）",
                 pluginMcpIntegration == null ? "恒 null（PluginMcpIntegration 未装配）" : "PluginMcpIntegration");
             // P2-15: 重连不读旧 fetch 缓存（对齐 CC onclose :1389-1396 清缓存 ——
             // 断开/重连创建新连接对象，不清则下轮 fetch 返回旧连接陈旧结果）。
             mcpToolPool.invalidateFetchCaches(s.getName());
-            List<McpToolPool.McpToolEntry> entries = mcpToolPool.assembleToolPool(s.getName(), transportConfig(s));
+            List<McpToolPool.McpToolEntry> entries = mcpToolPool.assembleToolPool(s.getName(), transportConfig(s), sessionId);
             entries.forEach(entry -> addMcpTool(entry.tool()));
             // P2-13: MCP skill 命令经 skill:// 资源发现生产
             // （对齐 CC getMcpToolsCommandsAndResources 四路并行 mcpSkills 支路 client.ts:2344-2356；
@@ -1300,8 +1320,8 @@ public class McpServerService {
         mcpToolPool.setPluginSourceResolver(pluginSourceResolver(pluginMcpIntegration));
         // [S3 needs-auth] OAuth 成功后真实工具替换回调（对齐 CC McpAuthTool.ts:140-161 setAppState 前缀替换）
         mcpToolPool.setMcpAuthToolSwapHandler(this::replaceServerToolsAfterAuth);
-        // [S07] 同 start()：真实会话态 allowedChannelsSupplier（无会话 → 空表 fail-closed）
-        channelNotificationGate.setAllowedChannelsSupplier(channelSessionAllowlist.currentRequestSupplier());
+        // [S07 / 批 3b] 同 start()：显式会话查表器（本路径无会话 → gate 门序[3] 空表 fail-closed）
+        channelNotificationGate.setAllowedChannelsProvider(channelSessionAllowlist.sessionLookup());
         List<McpToolPool.McpServerConfigEntry> entries = new ArrayList<>();
         for (McpServerRecord r : mcpServerMapper.selectAll()) {
             McpServer s = r.toDomain();

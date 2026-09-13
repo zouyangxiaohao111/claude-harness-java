@@ -107,9 +107,23 @@ public class McpServerController {
         return mcpServerService.test(id);
     }
 
+    /**
+     * 启动 MCP server · [批 3b] {@code ?sessionId=} <b>必填</b>（缺/空白 ⇒ 400）。
+     *
+     * <p>WHY 必须有会话：server 若声明 {@code claude/channel} 能力，channel 白名单门序[3 session]
+     * 需要「哪个会话在启动它」才能判定该 server 是否在本会话的 --channels 白名单内（CC
+     * getAllowedChannels state.ts:1676-1682）。旧实现靠 connectWorker 线程读 MDC（+回放装置）
+     * 取会话 —— 派生线程上要么 null 要么残留别会话 id。会话态一律显式传参。
+     */
     @PostMapping("/{id}/start")
-    public ResponseEntity<McpServerDto> start(@PathVariable String id) {
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(mcpServerService.start(id));
+    public ResponseEntity<McpServerDto> start(@PathVariable String id,
+                                              @RequestParam(value = "sessionId", required = false) String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[McpServerController] POST /api/v1/mcp/{}/start 缺少会话标识 ?sessionId= → 400"
+                + "（批 3b：会话态显式传参，不再回落 MDC）", id);
+            throw new com.nexusai.infra.exception.ValidationException("sessionId is required (POST /api/v1/mcp/{id}/start)");
+        }
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(mcpServerService.start(id, sessionId));
     }
 
     @PostMapping("/{id}/stop")

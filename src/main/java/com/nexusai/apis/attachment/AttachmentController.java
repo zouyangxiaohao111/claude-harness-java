@@ -5,7 +5,6 @@ import com.nexusai.application.agent.attachment.MediaAttachmentStore;
 import com.nexusai.application.agent.attachment.PdfAttachmentStore;
 import com.nexusai.application.agent.attachment.PdfAttachmentStore.StoredPdf;
 import com.nexusai.application.agent.attachment.MediaAttachmentStore.StoredMedia;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.AttachmentService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -144,7 +143,7 @@ public class AttachmentController {
      * 附件 multipart 上传 · 校验 → 分流落盘 → 返回 contentId。
      *
      * @param file      multipart 文件
-     * @param sessionId 会话 id（可选；缺省 → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（<b>必填</b>；批 3b：缺/空白 ⇒ 400，不再有 MDC / 'unknown' 兜底）
      * @return {@link PdfUploadResponse}：{contentId, filename, mediaType, size}
      */
     @PostMapping("/upload")
@@ -181,10 +180,17 @@ public class AttachmentController {
             throw new ValidationException("附件上传失败：文件内容与声明的类型不符（魔数校验失败）");
         }
 
-        // 会话归一化：显式 sessionId → MDC（RequestContext.sessionId()）→ 'unknown' 兜底（同
-        //   AttachmentStoreBase.resolveSessionId）——register 拒绝无主注册，附件表 session_id 需与
-        //   store 落盘目录所属会话一致（F5 预览 URL /content/{sessionId}/{contentId} 的 sessionId 即此值）
-        String resolvedSession = resolveSessionIdOrUnknown(sessionId);
+        // [批 3b] 会话**必填**（缺/空白 ⇒ 400）：register 拒绝无主注册，附件表 session_id 需与
+        //   store 落盘目录所属会话一致（F5 预览 URL /content/{sessionId}/{contentId} 的 sessionId 即此值）。
+        //   旧实现「显式 → MDC → 'unknown'」两级兜底已删：MDC 是 ThreadLocal（REST 线程复用第三态
+        //   可读到上一请求残留的别会话 id）+ 'unknown' 是伪造会话 id（会把无主附件塞进一个不存在的
+        //   会话桶，前端按真实会话 id 永远取不回）——两者都消除，缺值 fail loud。
+        String resolvedSession = sessionId;
+        if (resolvedSession == null || resolvedSession.isBlank()) {
+            log.warn("[AttachmentController] POST /api/v1/attachments/upload 缺少会话标识 ?sessionId= → 400"
+                + "（批 3b：MDC / 'unknown' 兜底已删，会话态一律显式传参）");
+            throw new ValidationException("sessionId is required (POST /api/v1/attachments/upload)");
+        }
 
         // 分流落盘：pdf → PdfAttachmentStore；image → ImageAttachmentStore；video/audio/file → MediaAttachmentStore
         try (InputStream in = file.getInputStream()) {
@@ -340,7 +346,7 @@ public class AttachmentController {
      * {@code {configHome}/image-cache/{sessionId}/{id}.*} 还原 —— 服务重启 / 200 上限 FIFO 逐出后仍可拉图
      * （对齐 CC「文件在盘，路径可重建」路径通道语义，imageStore.ts:104-124）。
      *
-     * @param sessionId 会话 id（路径变量；null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（路径变量；必填，无兜底）
      * @param id        图片 id（image-cache 空间 contentId）
      * @return {@code {mediaType, base64}}；内存 + 磁盘均未命中 → {@link NotFoundException} 404
      */
@@ -399,22 +405,6 @@ public class AttachmentController {
     // ════════════════════════════════════════════════════════════════════
     // 校验工具
     // ════════════════════════════════════════════════════════════════════
-
-    /**
-     * 会话归一化 · 显式 sessionId → MDC（{@link RequestContext#sessionId()}）→ 'unknown' 兜底，
-     * 镜像 {@code AttachmentStoreBase.resolveSessionId}（upload sessionId 可选，缺省时注册附件表
-     * 需与 store 落盘目录所属会话一致）。
-     */
-    private String resolveSessionIdOrUnknown(String sessionId) {
-        if (sessionId != null && !sessionId.isBlank()) {
-            return sessionId;
-        }
-        String fromMdc = RequestContext.sessionId();
-        if (fromMdc != null && !fromMdc.isBlank()) {
-            return fromMdc;
-        }
-        return "unknown";
-    }
 
     /**
      * 类型白名单 · mediaType 主类型 image/video/audio 或 PDF；或文件名扩展名白名单兜底。

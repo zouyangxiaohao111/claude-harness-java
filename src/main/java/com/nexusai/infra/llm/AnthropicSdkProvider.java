@@ -63,7 +63,6 @@ import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.application.agent.tool.ToolUseBlock;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.repository.provider.mapper.ModelMapper;
@@ -2819,11 +2818,20 @@ public class AnthropicSdkProvider implements LlmProvider {
         // header 的 ${session_id} 展开与这里同为「history 取第一条非空 sessionId」，
         // 本仓有「同一能力两套判据」的 R7 前科，故收敛到单点）。行为逐字等价。
         //
-        // ⚠️ 注意：下方 RequestContext.sessionId() 兜底属 consumePostCompaction 链路（本仓既有语义），
-        // 与 header 展开链路无关 —— SessionIdResolver 刻意不读 MDC（规范 §6.3），两条链路不复用兜底。
+        // [批 3b] ⛔ 删除 RequestContext.sessionId()（MDC）兜底：本方法跑在
+        //   LlmAgentLoop.STREAM_EXECUTOR 虚拟线程（doStream 尾部）——虚拟线程不继承创建线程的
+        //   ThreadLocal，MDC 要么 null（旧实现靠 LlmAgentLoop:6477 的显式回放兜住），要么是
+        //   该虚拟线程上一个任务残留的别会话 id；回放装置本身违反「会话态一律显式传参」铁律。
+        //   显式源 = history 内 ChatMessageDto.sessionId（DB 真值，主链必中）——与 header 展开
+        //   链路的判据同源（SessionIdResolver，R7「同一能力两套判据」收敛点）。
+        //   两源皆无 → null → PostCompactionState 回落进程级单布尔（本类既有语义，语义不丢），
+        //   按缺值规则记 WARN（禁只 DEBUG）。
         String sessionId = SessionIdResolver.fromHistory(history);
-        if (sessionId == null) {
-            sessionId = RequestContext.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            sessionId = null;
+            log.warn("[AnthropicSdkProvider] consumePostCompactionAtApiSuccess 无会话态："
+                + "history 未携带 sessionId（size={}）→ consume 回落进程级单布尔；thread={}",
+                history == null ? 0 : history.size(), Thread.currentThread().getName());
         }
         boolean isPostCompaction = PostCompactionState.consumePostCompaction(sessionId);
         if (isPostCompaction) {

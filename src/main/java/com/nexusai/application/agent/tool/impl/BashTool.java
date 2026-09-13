@@ -1076,7 +1076,9 @@ public class BashTool implements Tool {
         if (runInBackground && !backgroundTasksDisabled && backgroundTaskRunner != null) {
             // Phase 4 (cron-notify): 透传创建会话 sessionId（ctx.sessionId()，可靠源 —— 本工具在
             // tool-exec 池线程执行，MDC 无值）→ BackgroundTaskRunner.spawn → 完成通知注入创建会话回合。
-            String sessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
+            // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
+            //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
+            String sessionId = ctx != null ? ctx.sessionId() : null;
             return executeBackground(command, call.id(), sessionId);
         }
 
@@ -1114,7 +1116,9 @@ public class BashTool implements Tool {
             // Java 等价：spawn 前解析会话 cwd 作 pb.directory（对齐 CC spawn cwd=getCwd()）；
             // 命令尾部追加 pwd/cd 重定向到临时文件；跑完读回 → NFC 比对 → SessionCwdHolder.set
             // （内部 realpath+NFC，对齐 setCwdState + setCwd realpathSync）。
-            String sessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
+            // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
+            //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
+            String sessionId = ctx != null ? ctx.sessionId() : null;
             String sessionCwd = CwdResolution.getCwd(sessionId);
 
             // G2-4: spawn cwd 校验与回退 · 对齐 CC Shell.ts:218-238（realpath(cwd) ENOENT → 回落
@@ -1243,7 +1247,8 @@ public class BashTool implements Tool {
             boolean shouldAutoBackground = !backgroundTasksDisabled && isAutobackgroundingAllowed(command);
             if ((shouldAutoBackground || autoBgEligible) && backgroundTaskRunner != null) {
                 String taskId = TaskIdGenerator.generate(TaskType.LOCAL_BASH);
-                String outputFile = BackgroundTaskRunner.taskOutputPath(taskId);
+                // [批 3b-D7] 输出根所属会话 = 本工具 ctx 的会话（局部 sessionId，显式）
+                String outputFile = BackgroundTaskRunner.taskOutputPath(sessionId, taskId);
                 try {
                     Files.createDirectories(Path.of(outputFile).getParent());
                 } catch (Exception e) {
@@ -2686,7 +2691,8 @@ public class BashTool implements Tool {
         // 批次4 #10：outputFile 走 taskOutputPath 同源分层 {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/{taskId}.output
         // （对齐 CC getTaskOutputPath = join(getTaskOutputDir(), `${taskId}.output`)，diskOutput.ts:72-74；
         //   sessionId 防并发会话 clobber；扩展名 .output 对齐 CC，旧 user.dir/.nexusai/tasks + .txt 已删除）。
-        String outputFile = BackgroundTaskRunner.taskOutputPath(taskId);
+        // [批 3b-D7] 输出根所属会话 = 创建会话（executeBackground 的 createSessionId 入参，显式）
+        String outputFile = BackgroundTaskRunner.taskOutputPath(createSessionId, taskId);
 
         // 确保输出父目录存在（分层格式父目录不天然存在 · CC ensureOutputDir diskOutput.ts:65-67）
         try {
@@ -2718,9 +2724,20 @@ public class BashTool implements Tool {
      * effectiveCwd 缺失时的兜底 cwd · 对齐 CC getCwd()（bashPermissions.ts checkPathConstraints
      * 以 getCwd 为越界基准）。cwd-align-ext：user.dir 兜底 → 会话 cwd；无 sessionId 回落 user.dir
      * （方案 1，零行为变化）。
+     *
+     * <p><b>[批 3b]</b> sessionId 由调用方的 {@link ToolUseContext} <b>显式</b>传入（ctx 为 null
+     * → 无会话 → user.dir）。⛔ 不再读 {@code RequestContext.sessionId()}（MDC）：本方法在
+     * tool-exec 池线程执行，MDC 恒 null 或残留该池线程上一个任务的别会话 id —— 而它与
+     * {@link #gitReadOnlyGuardBlocked} 的 originalCwd <b>成对</b>构成 RO-17c 的
+     * 「cwd ≠ orig-cwd」判定（readOnlyValidation.ts:1956-1966）；单侧读 MDC 会让两侧取自不同
+     * 会话 ⇒ 安全守卫失真（本批「凡 A 写 B 读的改动两侧都要覆」原则）。
      */
-    private static String fallbackCwd() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    private static String fallbackCwd(ToolUseContext ctx) {
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        if (sessionId != null && sessionId.isBlank()) {
+            sessionId = null;
+        }
+        String cwd = CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 
@@ -3089,7 +3106,7 @@ public class BashTool implements Tool {
             if (hasDeny || hasAsk) {
                 String cwdStr = ctx != null && ctx.effectiveCwd() != null
                     ? ctx.effectiveCwd().toString()
-                    : fallbackCwd();
+                    : fallbackCwd(ctx);
                 DenyAskClassification denyAsk = classifyDenyAskParallel(
                     command, cwdStr, denyDescriptions, askDescriptions);
                 if (log.isDebugEnabled()) {
@@ -3265,7 +3282,7 @@ public class BashTool implements Tool {
             BashRuleMatcher.splitCommandSegments(command),
             ctx != null && ctx.effectiveCwd() != null
                 ? ctx.effectiveCwd().toString()
-                : fallbackCwd());
+                : fallbackCwd(ctx));
         if (fanoutSubcommands.size() > BashRuleMatcher.MAX_SUBCOMMANDS_FOR_SECURITY_CHECK) {
             int fanoutCount = fanoutSubcommands.size();
             if (log.isDebugEnabled()) {
@@ -3326,7 +3343,7 @@ public class BashTool implements Tool {
             // cwd-align-ext：path 约束越界基准兜底 = 会话 cwd（CC bashPermissions.ts:1112 checkPathConstraints 用 getCwd）
             Path cwd = ctx.effectiveCwd() != null
                 ? ctx.effectiveCwd()
-                : Path.of(fallbackCwd());
+                : Path.of(fallbackCwd(ctx));
             PermissionResult pathResult = BashPathValidator.check(command, cwd, ctx.permissionContext());
             if (!(pathResult instanceof PermissionResult.Passthrough)) {
                 if (log.isDebugEnabled()) {
@@ -3517,7 +3534,7 @@ public class BashTool implements Tool {
         if (ctx != null && ctx.permissionContext() != null) {
             Path cwd = ctx.effectiveCwd() != null
                 ? ctx.effectiveCwd()
-                : Path.of(fallbackCwd());
+                : Path.of(fallbackCwd(ctx));
             PermissionResult pathResult = BashPathValidator.check(command, cwd, ctx.permissionContext());
             if (!(pathResult instanceof PermissionResult.Passthrough)) {
                 if (log.isDebugEnabled()) {
@@ -3882,7 +3899,7 @@ public class BashTool implements Tool {
         // 5. cwd = effectiveCwd (对齐 CC getCwd) (CC :1474)
         String cwd = ctx != null && ctx.effectiveCwd() != null
             ? ctx.effectiveCwd().toString()
-            : fallbackCwd();
+            : fallbackCwd(ctx);
         return new PermissionResult.PendingClassifierCheck(command, cwd, allowDescriptions);
     }
 
@@ -4047,7 +4064,7 @@ public class BashTool implements Tool {
         // RO-17a：bare/被利用 git repo cwd（readOnlyValidation.ts:1930-1936）
         Path cwd = ctx != null && ctx.effectiveCwd() != null
             ? ctx.effectiveCwd()
-            : Path.of(fallbackCwd());
+            : Path.of(fallbackCwd(ctx));
         if (isCurrentDirectoryBareGitRepo(cwd)) {
             return true;
         }
@@ -4056,10 +4073,19 @@ public class BashTool implements Tool {
             return true;
         }
         // RO-17c：沙箱启用且 cwd≠orig-cwd（readOnlyValidation.ts:1956-1966）
-        // 批次4 #17：sessionId 取自 ctx.sessionId（无则 RequestContext），getOriginalCwdLayer 对齐 CC getOriginalCwd。
-        String sessionId = ctx != null && ctx.sessionId() != null
-            ? ctx.sessionId()
-            : RequestContext.sessionId();
+        // 批次4 #17：sessionId 取自 ctx.sessionId（显式载体），getOriginalCwdLayer 对齐 CC getOriginalCwd。
+        // [批 3b] ⛔ 删除 ctx 为 null / 无 sessionId 时的 RequestContext.sessionId()（MDC）兜底：
+        //   本方法在 tool-exec 池线程执行（无 MDC）→ 兜底恒 null 或读到该池线程上一个任务残留的
+        //   别会话 id（第三态）⇒ 用错会话的 originalCwd 比对，可能让越界命令通过（安全守卫失真）。
+        //   缺会话 → null → getOriginalCwdLayer(null) 回落 user.dir（本仓既有 Java 兜底语义，
+        //   对齐 CC getCwd catch → getOriginalCwd → STATE.originalCwd = 启动 cwd），记 WARN 暴露。
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        if (sessionId == null || sessionId.isBlank()) {
+            sessionId = null;
+            log.warn("[BashTool] gitReadOnlyGuardBlocked(RO-17c) 无会话态：ctx={} 未携带 sessionId "
+                + "（thread={}）→ originalCwd 回落 user.dir（MDC 兜底已删）",
+                ctx == null ? "null" : "sessionId=null", Thread.currentThread().getName());
+        }
         if (sandboxManager != null && sandboxManager.isEnabled()
                 && cwdDiffersFromOriginal(cwd, sessionId)) {
             return true;

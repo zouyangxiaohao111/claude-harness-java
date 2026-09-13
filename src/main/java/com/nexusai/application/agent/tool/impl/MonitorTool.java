@@ -177,7 +177,8 @@ public class MonitorTool implements Tool {
         String monitorSessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
         String taskId = monitorMcpTaskRunner.registerTask(
             description, call.id(), ctx != null ? ctx.agentId() : null, monitorSessionId);
-        String outputFile = monitorMcpTaskRunner.outputFileFor(taskId);
+        // [批 3b-D7] 输出根所属会话显式传入（本方法已从 ctx.sessionId() 取到）
+        String outputFile = monitorMcpTaskRunner.outputFileFor(monitorSessionId, taskId);
 
         // monitor() 是阻塞轮询循环（2s/次），必须在独立线程运行；终态由 monitor() 内部
         // transitionTerminal（updateTaskState + SDK + notificationQueue priority=NEXT）闭环。

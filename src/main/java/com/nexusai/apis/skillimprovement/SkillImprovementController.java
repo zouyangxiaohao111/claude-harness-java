@@ -135,7 +135,9 @@ public class SkillImprovementController {
 
         if (req.applied()) {
             // CC original: void applySkillImprovement(current.skillName, current.updates) (useSkillImprovementSurvey.ts:73)
-            skillImprovementHook.applySkillImprovement(pending.skillName(), pending.updates());
+            // [批 3b] 显式传会话 id（apply 体在 ForkJoinPool 派生线程执行，MDC 取不到会话；
+            //   该 id 同时是 store 键 = 该 suggestion 的归属会话，正是 SKILL.md 基准 cwd 的来源会话）。
+            skillImprovementHook.applySkillImprovement(req.sessionId(), pending.skillName(), pending.updates());
         }
 
         log.info("Skill improvement 决策已受理: session={} skill={} response={}",

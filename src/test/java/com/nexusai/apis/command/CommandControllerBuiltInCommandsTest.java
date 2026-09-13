@@ -231,7 +231,9 @@ class CommandControllerBuiltInCommandsTest {
         when(sessionAgentStateRegistry.get(org.mockito.ArgumentMatchers.any())).thenReturn(mainState);
         // [R2-DELETE] resumeAgentBackground 已对齐 CC 直接传参：新增第 5 参 parentContentReplacementState
         //   （web 端点传 null，受控残留 = CC :1006 feature off）。
-        String expectedOutputFile = com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath("agent-x");
+        // [批 3b-D7] 输出根所属会话 = 本请求显式传入的会话（端点在下方 param("sessionId","sess-cmd-test")）
+        String expectedOutputFile = com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
+            "sess-cmd-test", "agent-x");
         when(resumeService.resumeAgentBackground(
             org.mockito.ArgumentMatchers.any(),
             org.mockito.ArgumentMatchers.eq("continue"),

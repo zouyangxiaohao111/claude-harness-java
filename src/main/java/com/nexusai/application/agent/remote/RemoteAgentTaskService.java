@@ -7,7 +7,6 @@ import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskIdGenerator;
 import com.nexusai.application.agent.tasks.TaskType;
-import com.nexusai.common.RequestContext;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -90,7 +89,8 @@ public class RemoteAgentTaskService {
      * （call site 均持任务的 creatingSession），未绑定 → null → 不落盘（绝不回落 config home）。
      */
     private final Function<String, String> sessionProjectRootResolver;
-    private final Supplier<Path> taskOutputDirSupplier;
+    /** [批 3b-D7] 会话态显式：sessionId → 输出根（会话由各调用点显式传入）。 */
+    private final java.util.function.Function<String, Path> taskOutputDirSupplier;
     private final ScheduledExecutorService pollScheduler;
     /** 轮询间隔 · 生产默认 CC :540 POLL_INTERVAL_MS=1000；测试可注入更小值加速 */
     private final long pollIntervalMs;
@@ -100,7 +100,7 @@ public class RemoteAgentTaskService {
                                   @Nullable SdkEventQueue sdkEventQueue,
                                   RemoteSessionsApi sessionsApi,
                                   Function<String, String> sessionProjectRootResolver,
-                                  Supplier<Path> taskOutputDirSupplier,
+                                  java.util.function.Function<String, Path> taskOutputDirSupplier,
                                   ScheduledExecutorService pollScheduler) {
         this(framework, notificationQueue, sdkEventQueue, sessionsApi,
             sessionProjectRootResolver, taskOutputDirSupplier, pollScheduler, POLL_INTERVAL_MS);
@@ -112,7 +112,7 @@ public class RemoteAgentTaskService {
                                   @Nullable SdkEventQueue sdkEventQueue,
                                   RemoteSessionsApi sessionsApi,
                                   Function<String, String> sessionProjectRootResolver,
-                                  Supplier<Path> taskOutputDirSupplier,
+                                  java.util.function.Function<String, Path> taskOutputDirSupplier,
                                   ScheduledExecutorService pollScheduler,
                                   long pollIntervalMs) {
         this.framework = Objects.requireNonNull(framework);
@@ -180,8 +180,11 @@ public class RemoteAgentTaskService {
          * Phase 4 (cron-notify): 本地创建会话 sessionId。与 {@code sessionId}（CCR remote 会话，
          * API 轮询用）不同 —— 本字段是<b>本地</b>发起该远程任务的会话，完成通知注入该本地会话回合。
          * 由生产 caller（AgentTool 远端 / /review 命令）从 {@code ToolUseContext.sessionId()} 显式
-         * 透传（tool-exec 池线程无 MDC，不可依赖 {@code RequestContext.sessionId()}）；null 时回退
-         * MDC（register 在会话线程路径），仍 null → 回落全局。
+         * 透传（tool-exec 池线程无 MDC，不可依赖 {@code RequestContext.sessionId()}）。
+         * <b>[批 3b] 删 MDC 回退</b>：本字段是本方法<b>唯一</b>会话源；null = 显式声明「无创建会话」
+         * → 回落全局（CronIdleExecutor GLOBAL_SESSION_UUID），按缺值规则记 WARN（禁只 DEBUG）。
+         * 旧实现 {@code null ? RequestContext.sessionId() : …} 在派生线程（tool-exec 池）恒读到
+         * null/残留别会话 id —— 会话态一律显式传参，回放/兜底不算合规。
          */
         @Nullable String creatingSessionId
     ) {
@@ -208,16 +211,25 @@ public class RemoteAgentTaskService {
     public RegisteredRemoteTask registerRemoteAgentTask(RegisterOptions options) {
         String taskId = TaskIdGenerator.generate(TaskType.REMOTE_AGENT);
         long now = System.currentTimeMillis();
-        Path outputPath = RemoteTaskOutput.outputPath(taskOutputDirSupplier.get(), taskId);
-        // CC :420 void initTaskOutput — 注册前建空文件
-        RemoteTaskOutput.init(outputPath);
-
         // Phase 4 (cron-notify): 本地创建会话 = 显式透传（RegisterOptions.creatingSessionId，生产
-        //   caller 从 ctx.sessionId() 取）?? MDC 兜底（register 在会话线程路径）?? null（回落全局）。
+        //   caller 从 ctx.sessionId() 取）。[批 3b] ⛔ 删除 RequestContext.sessionId()（MDC）兜底 ——
+        //   registerRemoteAgentTask 由 tool-exec 池线程调用（无 MDC）或 REST 线程（残留别会话 id），
+        //   兜底只会静默串号。
         //   <b>绝不能把 options.sessionId()（CCR remote 会话）当创建会话</b> —— 二者语义不同，
         //   remote id 的 canonicalUuid 永不等于任何本地会话，drainForQuery 永不命中创建会话回合。
+        //   [批 3b-D7] 该会话同时是**输出根所属会话**（taskOutputDirSupplier.apply(sessionId)）——
+        //   故 null 不再可容忍：taskOutputDir 缺值 fail-loud（见 BackgroundTaskRunner.taskOutputDir）。
         String creatingSession = options.creatingSessionId() != null && !options.creatingSessionId().isBlank()
-            ? options.creatingSessionId() : RequestContext.sessionId();
+            ? options.creatingSessionId() : null;
+        if (creatingSession == null) {
+            log.warn("RemoteAgentTaskService.registerRemoteAgentTask: creatingSessionId 缺省 → 无会话可归属，"
+                + "taskOutputDir 将 fail-loud（taskId={} remoteSessionId={} thread={}）；"
+                + "生产 caller 必须从 ToolUseContext.sessionId() 显式透传",
+                taskId, options.sessionId(), Thread.currentThread().getName());
+        }
+        Path outputPath = RemoteTaskOutput.outputPath(taskOutputDirSupplier.apply(creatingSession), taskId);
+        // CC :420 void initTaskOutput — 注册前建空文件
+        RemoteTaskOutput.init(outputPath);
         BackgroundTask base = new BackgroundTask(taskId, TaskType.REMOTE_AGENT,
             BackgroundTaskStatus.RUNNING,
             options.title() != null ? options.title() : "",
@@ -307,7 +319,7 @@ public class RemoteAgentTaskService {
                 continue;
             }
             // CC :511-527 重建 state
-            Path outputPath = RemoteTaskOutput.outputPath(taskOutputDirSupplier.get(), meta.taskId());
+            Path outputPath = RemoteTaskOutput.outputPath(taskOutputDirSupplier.apply(meta.creatingSessionId()), meta.taskId());
             // Phase 4 (cron-notify): 恢复时从 sidecar 读回本地创建会话（meta.creatingSessionId）——
             // --resume 后恢复任务的通知仍注入创建会话回合；旧 sidecar 无该字段 → null（回落全局）。
             BackgroundTask base = new BackgroundTask(meta.taskId(), TaskType.REMOTE_AGENT,
@@ -444,7 +456,7 @@ public class RemoteAgentTaskService {
          * 已删除 —— 其唯一消费方是 {@code sessionDirSupplier}（tick 内惰性读
          * {@code AutoMemPaths.currentSessionProjectRoot()}）。sidecar 目录现改为按任务
          * creatingSession <b>现算</b>（{@link RemoteAgentTaskService#sessionDirFor}），且
-         * {@code taskOutputDirSupplier}（{@code BackgroundTaskRunner.taskOutputDir}）只读 MDC
+         * {@code taskOutputDirSupplier}（{@code BackgroundTaskRunner.taskOutputDir(String)}）现取显式会话
          * sessionId（{@code CwdResolution.getOriginalCwdLayer}），不读 projectRoot ThreadLocal
          * ⇒ tick 内已无 projectRoot 读点，回放无消费方（本类零 ThreadLocal 会话态读写）。
          */
@@ -488,9 +500,9 @@ public class RemoteAgentTaskService {
             if (!isRunning.get()) {
                 return;
             }
-            // [TL-W2 P7] 原 projectRoot ThreadLocal 回放已删（无消费方，见 PollLoop 字段注释）。
-            //   定时器线程仍注入 MDC sessionId（task 对象创建时冻结）：taskOutputDirSupplier 经
-            //   BackgroundTaskRunner.taskOutputDir → resolveSessionId / getOriginalCwdLayer 读它。
+            // [批 3b-D7] 定时器线程的 MDC sessionId 回放**已删**（原唯一文档化消费方是
+            //   taskOutputDirSupplier → BackgroundTaskRunner.resolveSessionId 读 MDC；现输出根由各
+            //   调用点显式传会话）。⛔ 用户铁律：会话态一律显式传参，回放不算合规。
             try {
                 try {
                     RemoteAgentTaskState task = remoteTasks.get(taskId);
@@ -498,8 +510,6 @@ public class RemoteAgentTaskService {
                     if (task == null || task.status() != BackgroundTaskStatus.RUNNING) {
                         return;
                     }
-                    // MDC sessionId 注入（task 对象创建时冻结；定时器线程无 MDC 上下文）
-                    RequestContext.setSession(task.sessionId());
                 // CC :564-578 pollRemoteSessionEvents(lastEventId) 增量
                 RemoteSessionsApi.PollResult response = sessionsApi.pollEvents(task.sessionId(), lastEventId);
                 lastEventId = response.lastEventId();
@@ -626,8 +636,7 @@ public class RemoteAgentTaskService {
                 }
             }
             } finally {
-                // 清 MDC（定时器线程复用防泄漏）；projectRoot ThreadLocal 已无注入点（TL-W2 P7）
-                RequestContext.clear();
+                // [批 3b-D7] 回放已删 → 定时器线程现零 ThreadLocal 会话态读写，无需清理
             }
             // CC :787-789 — 继续轮询
             scheduleNext();
@@ -741,7 +750,9 @@ public class RemoteAgentTaskService {
             : "failed".equals(status) ? "failed" : "was stopped";
         String toolUseIdLine = toolUseId != null && !toolUseId.isEmpty()
             ? "\n<tool-use-id>" + toolUseId + "</tool-use-id>" : "";
-        Path outputPath = taskOutputDirSupplier.get().resolve(taskId + ".output");
+        // [批 3b-D7] 输出根 = 该任务的创建会话（task 对象冻结值，显式）
+        String notifySession = remoteTasks.get(taskId) != null ? remoteTasks.get(taskId).base().sessionId() : null;
+        Path outputPath = taskOutputDirSupplier.apply(notifySession).resolve(taskId + ".output");
         String message = "<task-notification>\n"
             + "<task-id>" + taskId + "</task-id>" + toolUseIdLine + "\n"
             + "<task-type>remote_agent</task-type>\n"

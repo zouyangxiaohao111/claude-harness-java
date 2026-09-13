@@ -409,7 +409,8 @@ class ResumeServiceTest {
         assertThat(result.agentId()).isEqualTo(AGENT_ID_A16HEX);
         assertThat(result.description()).isEqualTo("My Agent");
         assertThat(result.outputFile())
-            .isEqualTo(com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(AGENT));
+            .as("输出根所属会话 = resumeAgentBackground 的会话参数（[批 3b-D7] 显式）")
+            .isEqualTo(com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(SESSION_UUID, AGENT));
     }
 
     // ────────────────────────────────────────────────────────────────────────

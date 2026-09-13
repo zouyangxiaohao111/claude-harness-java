@@ -267,8 +267,10 @@ public class ResumeService {
         //   {@code agentId} 即原 a+16hex string。前端以返回的 a+16hex 再入二次 resume →
         //   CommandController.toResumeAgentId → packAgentId → unpackAgentId 还原同键 → transcript
         //   命中（回环成立且形制一致）。outputFile 仍为实际输出文件
-        //   （BackgroundTaskRunner.taskOutputPath(agentId) 唯一根，写入侧同源）。
-        String outputFile = com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(agentIdStr);
+        //   （BackgroundTaskRunner.taskOutputPath(sessionId, agentId) 唯一根，写入侧同源）。
+        // [批 3b-D7] 输出根所属会话 = 本方法的主会话参数（显式；⛔ 不再由下游读 MDC）
+        String outputFile = com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
+            sessionId, agentIdStr);
         log.info("[ResumeService] resume 已注册后台续跑: agentId={}(a+16hex={}) type={} description={} outputFile={}",
             agentIdStr, agentIdHex, selectedAgent.agentType(), uiDescription, outputFile);
         return new ResumeAgentResult(agentIdHex, uiDescription, outputFile);

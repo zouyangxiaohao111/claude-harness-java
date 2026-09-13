@@ -2,7 +2,6 @@ package com.nexusai.apis.session;
 
 import com.nexusai.application.agent.memory.AwaySummaryService;
 import com.nexusai.application.agent.tool.AbortController;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.AwaySummaryRequest;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -39,13 +38,14 @@ import java.util.concurrent.TimeoutException;
  * {@link AwaySummaryService#generate} 走 {@code chatWithOptions} —— querySource='away_summary'
  * / skipCacheWrite=true / small-fast（haiku）/ thinking disabled（awaySummary.ts:44/:49/:54/:56）。
  *
- * <p><b>sessionId 源（ODF-B1R）</b>: <b>请求优先 + MDC 兜底</b>——CC 触发层在前端 REPL
- * （useAwaySummary.ts:32 起），会话上下文由前端持有，故前端 POST 可随请求传 sessionId（body JSON
- * {@code {"sessionId": "..."}} 或 query {@code ?sessionId=...}，body 优先）；请求未传时兜底
- * {@link RequestContext#sessionId()}（MDC）—— AS-05 rev2 显式单轨：bean 无 sessionId supplier，
- * ToolRegistrationConfig awaySummaryService @Bean（:1018-1040）构造参数为
+ * <p><b>sessionId 源（ODF-B1R / 批 3b 收敛）</b>: <b>仅请求显式源</b>——CC 触发层在前端 REPL
+ * （useAwaySummary.ts:32 起），会话上下文由前端持有，故前端 POST 随请求传 sessionId（body JSON
+ * {@code {"sessionId": "..."}} 或 query {@code ?sessionId=...}，body 优先）。
+ * <b>批 3b 已删 MDC 兜底</b>：{@code RequestContext.sessionId()} 读裸 MDC，REST 线程复用下第三态
+ * 可读到上一请求残留的别会话 id，静默给 A 会话生成 B 会话摘要。AS-05 rev2 显式单轨：bean 无
+ * sessionId supplier，ToolRegistrationConfig awaySummaryService @Bean（:1018-1040）构造参数为
  * llmProviderFactory/sessionMemoryService/四个可选 mapper·provider 依赖，无 sessionId 源。
- * 请求与 MDC 双空 → 500 fail loud（对齐 CommandController executeResume 同语义）。
+ * 请求两源皆空 → 500 fail loud（对齐 CommandController executeResume 同语义）。
  *
  * <p><b>null → 204</b>: 空 transcript / API error / abort / 异常 → 服务返回 null（CC
  * awaySummary.ts:33-35/:60-73），REST 以 204 空体表达（不抛 500）；LLM 调用超时（兜底限时）
@@ -89,8 +89,8 @@ public class AwaySummaryController {
             @RequestBody(required = false) AwaySummaryRequest body) {
         String sessionId = resolveSessionId(body, querySessionId);
         if (sessionId == null) {
-            log.warn("[AwaySummaryController] 请求(body/query)与 MDC 均无 sessionId → 500 fail loud"
-                    + "（对齐 CommandController executeResume；ODF-B1R 契约：请求优先+MDC 兜底）");
+            log.warn("[AwaySummaryController] 请求 body/query 均无 sessionId → 500 fail loud"
+                    + "（批 3b：MDC 兜底已删，会话态一律显式传参；对齐 CommandController executeResume）");
             throw new IllegalStateException("无会话上下文 (sessionId)");
         }
         // [S1] away-summary = 续聊加载历史通道 → listForResume（对齐 CC
@@ -150,12 +150,14 @@ public class AwaySummaryController {
     }
 
     /**
-     * [ODF-B1R] 解析 sessionId · <b>请求优先 + MDC 兜底</b>。
+     * [ODF-B1R / 批 3b] 解析 sessionId · <b>仅请求显式源</b>（body 优先，其次 query）。
      *
-     * <p>CC 触发层在前端 REPL（useAwaySummary.ts:32），会话上下文由前端持有——Web 前端 POST 可随请求
-     * 传 sessionId（body {@link AwaySummaryRequest#sessionId} 优先，其次 query
-     * {@code ?sessionId=...}）；请求均未传（或空白）时兜底 {@link RequestContext#sessionId()}（MDC，
-     * 与 ToolRegistrationConfig awaySummaryService @Bean :1018-1040 显式单轨一致）。三源均缺 → null（调用方 fail loud 500）。
+     * <p>CC 触发层在前端 REPL（useAwaySummary.ts:32），会话上下文由前端持有——Web 前端 POST 随请求
+     * 传 sessionId（body {@link AwaySummaryRequest#sessionId} 优先，其次 query {@code ?sessionId=...}）。
+     *
+     * <p><b>[批 3b] 删 MDC 兜底</b>：旧实现第三源 {@code RequestContext.sessionId()}（裸 MDC）。
+     * 本端点是 REST 入口，Tomcat 线程复用下 MDC 第三态可读到上一请求残留的别的会话 id ⇒ 给 A 会话
+     * 生成 B 会话的 away summary（静默串会话）。两源均缺 → null（调用方 fail loud 500）。
      *
      * @param body           POST JSON 请求体（可为 null）
      * @param querySessionId query 参数（可为 null）
@@ -168,6 +170,6 @@ public class AwaySummaryController {
         if (querySessionId != null && !querySessionId.isBlank()) {
             return querySessionId;
         }
-        return RequestContext.sessionId();
+        return null;
     }
 }

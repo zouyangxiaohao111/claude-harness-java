@@ -67,7 +67,11 @@ public class ChannelNotificationGate {
     private static final java.util.regex.Pattern SAFE_META_KEY =
         java.util.regex.Pattern.compile("^[a-zA-Z_][a-zA-Z0-9_]*$");
     private final Supplier<Boolean> channelsEnabledSupplier;
-    private Supplier<List<ChannelAllowlist.ChannelEntry>> allowedChannelsSupplier;
+    /**
+     * [批 3b] session --channels 白名单 · <b>显式 sessionId → 白名单</b> 的纯函数
+     * （旧 {@code Supplier<...>} 版本在读时才解析会话来源，只能读 ThreadLocal ⇒ 派生线程失真）。
+     */
+    private Function<String, List<ChannelAllowlist.ChannelEntry>> allowedChannelsProvider;
     private final Supplier<List<ChannelAllowlistEntry>> ledgerAllowlistSupplier;
     private final Function<String, String> escapeXmlAttrFn;
 
@@ -87,7 +91,10 @@ public class ChannelNotificationGate {
         Function<String, String> escapeXmlAttrFn
     ) {
         this.channelsEnabledSupplier = channelsEnabledSupplier == null ? () -> false : channelsEnabledSupplier;
-        this.allowedChannelsSupplier = allowedChannelsSupplier == null ? List::of : allowedChannelsSupplier;
+        // 兼容形：session 无关的常量/打桩 supplier → 忽略 sessionId 的 provider（既有测试注入点）。
+        //   生产走 setAllowedChannelsProvider(ChannelSessionAllowlist.sessionLookup())（显式会话查表）。
+        this.allowedChannelsProvider = allowedChannelsSupplier == null
+            ? sid -> List.of() : sid -> allowedChannelsSupplier.get();
         this.ledgerAllowlistSupplier = ledgerAllowlistSupplier == null ? List::of : ledgerAllowlistSupplier;
         this.escapeXmlAttrFn = escapeXmlAttrFn == null ? ChannelNotificationGate::escapeXmlAttr : escapeXmlAttrFn;
     }
@@ -106,14 +113,25 @@ public class ChannelNotificationGate {
             ChannelNotificationGate::escapeXmlAttr);
     }
 
-    /** 注入 session --channels 白名单 supplier（生产经 ChannelSessionAllowlist.currentRequestSupplier()，测试直注入）。 */
-    public void setAllowedChannelsSupplier(Supplier<List<ChannelAllowlist.ChannelEntry>> supplier) {
+    /**
+     * 注入 session --channels 白名单 <b>显式查表器</b>（生产经
+     * {@link ChannelSessionAllowlist#sessionLookup()}；sessionId 由
+     * {@link #gateChannelServer} 的调用方显式传入）。
+     */
+    public void setAllowedChannelsProvider(Function<String, List<ChannelAllowlist.ChannelEntry>> provider) {
         if (log.isDebugEnabled()) {
-            log.debug("[ChannelNotificationGate] 注入 session --channels 白名单 supplier: {}",
-                supplier != null ? "真实会话态(ChannelSessionAllowlist)" : "null(保持现态)");
+            log.debug("[ChannelNotificationGate] 注入 session --channels 白名单 provider: {}",
+                provider != null ? "真实会话态(ChannelSessionAllowlist.sessionLookup)" : "null(保持现态)");
         }
+        if (provider != null) {
+            this.allowedChannelsProvider = provider;
+        }
+    }
+
+    /** 兼容形（session 无关常量/打桩；既有测试注入点）· 委派 {@link #setAllowedChannelsProvider}。 */
+    public void setAllowedChannelsSupplier(Supplier<List<ChannelAllowlist.ChannelEntry>> supplier) {
         if (supplier != null) {
-            this.allowedChannelsSupplier = supplier;
+            setAllowedChannelsProvider(sid -> supplier.get());
         }
     }
 
@@ -170,15 +188,22 @@ public class ChannelNotificationGate {
      *   <li><b>capability</b>（L200-206）：{@code experimental['claude/channel']} truthy（{} 或 true）；
      *       缺失/undefined/显式 false 全失败</li>
      *   <li><b>runtime</b>（L211-217）：channelsEnabled（Java 配置，CC tengu_harbor）</li>
-     *   <li><b>session</b>（L250-257）：server 必须在 --channels 白名单</li>
+     *   <li><b>session</b>（L250-257）：server 必须在<b>该 sessionId</b> 的 --channels 白名单</li>
      *   <li><b>marketplace</b>（L259-276）：plugin-kind entry 校验安装来源 == 标签（pluginSource 无/错 → fail-closed）</li>
      *   <li><b>allowlist</b>（L278-313）：approved 白名单比对（DB ledger）；server-kind entry 恒 skip（schema 仅 plugin）</li>
      * </ol>
      * skip → 连接保持、handler 不注册（L183-186）。
+     *
+     * <p><b>[批 3b]</b> sessionId 为显式会话源（本方法常在 connectWorker 池线程执行，MDC 不可用）。
+     * null/blank → 白名单空表 → 门序[3]恒 SESSION skip（fail-closed，与 CC「server 未列入
+     * --channels」同向）。
+     *
+     * @param sessionId 发起本次连接的服务所属会话（显式；null = 无会话 → fail-closed）
      */
     public ChannelGateResult gateChannelServer(String serverName,
                                              ServerCapabilities capabilities,
-                                             String pluginSource) {
+                                             String pluginSource,
+                                             String sessionId) {
         // 1. capability（channelNotification.ts:200-206）
         Object exp = capabilities != null ? capabilities.experimental() : null;
         Map<?, ?> expMap = (exp instanceof Map<?, ?>) ? (Map<?, ?>) exp : null;
@@ -196,11 +221,12 @@ public class ChannelNotificationGate {
             return new ChannelGateResult("skip", GateKind.DISABLED,
                 "channels feature is not currently available");
         }
-        // 3. session --channels（L250-257）
-        ChannelAllowlist.ChannelEntry entry = findChannelEntry(serverName, allowedChannelsSupplier.get());
+        // 3. session --channels（L250-257）· [批 3b] 显式 sessionId 查表（无 ThreadLocal/MDC 源）
+        ChannelAllowlist.ChannelEntry entry =
+            findChannelEntry(serverName, allowedChannelsProvider.apply(sessionId));
         if (entry == null) {
-            log.info("[ChannelNotificationGate] 门序[3 session] 跳过 server={}: 不在本次会话 --channels 白名单中",
-                serverName);
+            log.info("[ChannelNotificationGate] 门序[3 session] 跳过 server={}: 不在该会话 --channels "
+                + "白名单中（sessionId={}）", serverName, sessionId);
             return new ChannelGateResult("skip", GateKind.SESSION,
                 "server " + serverName + " not in --channels list for this session");
         }
@@ -244,5 +270,18 @@ public class ChannelNotificationGate {
         log.info("[ChannelNotificationGate] 门序全过 → register server={} kind={} entry={}",
             serverName, entry.kind(), entry.name());
         return new ChannelGateResult("register", null, null);
+    }
+
+    /**
+     * 无会话重载 · 等价 {@code gateChannelServer(serverName, capabilities, pluginSource, null)}
+     * （门序[3 session] 恒 SESSION skip = fail-closed）。
+     *
+     * <p>保留给「本就不需要会话态」的调用方（既有单测直注入常量 supplier 的形态）；生产
+     * channel 注册路径一律走 4 参版本并显式传会话（McpToolPool 连接 worker）。
+     */
+    public ChannelGateResult gateChannelServer(String serverName,
+                                             ServerCapabilities capabilities,
+                                             String pluginSource) {
+        return gateChannelServer(serverName, capabilities, pluginSource, null);
     }
 }

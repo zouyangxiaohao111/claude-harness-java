@@ -14,7 +14,6 @@ import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.application.agent.skill.SkillsLoader;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.telemetry.Telemetry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.eventbus.ws.SkillImprovementSuggestionEvent;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
@@ -175,10 +174,17 @@ public class SkillImprovementHook {
     /**
      * [IMP-HOOKS-S8 CCJ-HOOKS-T8-05] SKILL.md 路径基准 · CC original: {@code getCwd()}
      * (skillImprovement.ts:198 + cwd.ts:19-32, 每次 apply 调用动态求值, 含 cwdOverrideStorage
-     * 异步本地覆盖) — Java 用 {@link Supplier}<Path> 调用时求值, 替代旧构造期冻结字段
-     * {@code Path.of("").toAbsolutePath()} (所有会话/调用共用同一基准, 语义漂移).
+     * 异步本地覆盖) — Java 用 {@link java.util.function.Function}&lt;sessionId, Path&gt; 调用时求值,
+     * 替代旧构造期冻结字段 {@code Path.of("").toAbsolutePath()}（所有会话/调用共用同一基准, 语义漂移）。
+     *
+     * <p><b>[批 3b] 键 = 显式 sessionId</b>：apply 经
+     * {@link CompletableFuture#runAsync(Runnable)} 提交到 ForkJoinPool（派生线程），
+     * 该线程上 {@code RequestContext.sessionId()}（MDC/ThreadLocal）恒为 null 或残留别会话 id；
+     * 旧 lambda {@code () -> Path.of(CwdResolution.getCwd(RequestContext.sessionId()))} 因此
+     * 在生产派生线程上取不到会话 cwd（本项目级技能判定/写回落到 user.dir）。
+     * 用户铁律：会话态一律显式传参、回放不算合规 ⇒ 改为 sessionId 显式入参。
      */
-    private final Supplier<Path> baseDirSupplier;
+    private final java.util.function.Function<String, Path> baseDirForSession;
     /** [P1-13] session-keyed suggestion store · CC original: AppState.skillImprovement.suggestion
      *  (skillImprovement.ts:160-165) — 检测器写入, REST 决策端点消费, 可空 (未接线时跳过 store 写). */
     private final SkillImprovementSuggestionStore suggestionStore;
@@ -244,11 +250,13 @@ public class SkillImprovementHook {
                 ctx -> findProjectSkill(skillRegistry, sessionAgentStateRegistry, ctx),
                 telemetry,
                 (skillName, updates) -> {},
-                // baseDirSupplier 调用时求值（对齐 CC skillImprovement.ts:198 getCwd()，cwd.ts:19-32）：
-                //   经 CwdResolution.getCwd(RequestContext.sessionId()) 取会话当前 cwd（含 override ??
-                //   sessionCwd ?? boundProject ?? user.dir 兜底链），替代旧 Path.of("") 冻结 JVM user.dir
+                // baseDirForSession 调用时求值（对齐 CC skillImprovement.ts:198 getCwd()，cwd.ts:19-32）：
+                //   经 CwdResolution.getCwd(显式 sessionId) 取该会话当前 cwd（含 sessionCwd ??
+                //   boundProject ?? user.dir 兜底链），替代旧 Path.of("") 冻结 JVM user.dir
                 //   （所有会话共用同一基准的语义漂移）。
-                () -> Path.of(CwdResolution.getCwd(RequestContext.sessionId())),
+                //   [批 3b] sessionId 由 applySkillImprovement 显式传入 —— 本 lambda 在
+                //   ForkJoinPool 派生线程求值，RequestContext.sessionId()（MDC）在那里恒 null/残留。
+                sessionId -> Path.of(CwdResolution.getCwd(sessionId)),
                 suggestionStore,
                 improvementEnabled);
     }
@@ -287,32 +295,32 @@ public class SkillImprovementHook {
                 ctx -> projectSkillProvider.get(),
                 telemetry,
                 appStateWriter,
-                () -> baseDir,
+                sessionId -> baseDir,
                 suggestionStore,
                 improvementEnabled);
     }
 
     /**
      * 全参注入构造 (package-private) · 生产/测试共用底座: ctx 感知 {@link ProjectSkillProvider} +
-     * 调用时求值 {@link Supplier}<Path> baseDir.
+     * 调用时求值 {@code Function<sessionId, Path>} baseDir.
      *
      * <p>[IMP-HOOKS-S8 CCJ-HOOKS-T8-04/05] 生产构造直传 {@code ctx -> findProjectSkill(...)}
      * (invoked + 项目级判定, 每次调用求值); 公开测试构造把 {@code Supplier<Optional<ProjectSkill>>}
-     * 打桩包装为忽略 ctx 的 provider, Path baseDir 包装为调用时求值 supplier.
+     * 打桩包装为忽略 ctx 的 provider, Path baseDir 包装为忽略 sessionId 的固定值函数.
      */
     SkillImprovementHook(
             SkillImprovementModelQuery modelQuery,
             ProjectSkillProvider projectSkillProvider,
             Telemetry telemetry,
             BiConsumer<String, List<SkillUpdate>> appStateWriter,
-            Supplier<Path> baseDirSupplier,
+            java.util.function.Function<String, Path> baseDirForSession,
             SkillImprovementSuggestionStore suggestionStore,
             boolean improvementEnabled) {
         this.modelQuery = modelQuery;
         this.projectSkillProvider = projectSkillProvider;
         this.telemetry = telemetry;
         this.appStateWriter = appStateWriter;
-        this.baseDirSupplier = baseDirSupplier;
+        this.baseDirForSession = baseDirForSession;
         this.suggestionStore = suggestionStore;
         this.improvementEnabled = improvementEnabled;
     }
@@ -590,26 +598,41 @@ public class SkillImprovementHook {
      * Error 不捕获 — 对齐 CC reject 同样不捕获致命错误), future 恒正常完成.
      *
      * <p>[IMP-HOOKS-S8 CCJ-HOOKS-T8-05] 路径基准每次 apply 调用时经
-     * {@link #baseDirSupplier} 求值 (CC getCwd() 动态语义), 非构造期冻结.
+     * {@link #baseDirForSession} 求值 (CC getCwd() 动态语义), 非构造期冻结.
      *
+     * <p><b>[批 3b] sessionId 显式入参</b>：apply 体在 {@link CompletableFuture#runAsync(Runnable)}
+     * 的 ForkJoinPool 派生线程执行，该线程 {@code RequestContext.sessionId()}（MDC/ThreadLocal）
+     * 恒 null 或残留别会话 id ⇒ 此前 lambda {@code () -> getCwd(RequestContext.sessionId())}
+     * 在生产取不到会话 cwd。现由调用方（{@code SkillImprovementController.decision}，REST 线程，
+     * 持有显式 sessionId）显式传入。
+     *
+     * <p>sessionId 为 null/blank ⇒ 抛 {@link IllegalArgumentException}（缺值 fail-loud：
+     * 该项目级技能改进必然归属某会话，静默回落 user.dir 会把 SKILL.md 写错位置）。
+     *
+     * @param sessionId 归属会话 id（显式；null/blank → 抛）
      * @param skillName skill 名 (相对 cwd/{@link NexusaiPaths#getProjectDirName()}/skills/&lt;name&gt;/SKILL.md，默认 .nexusai)
      * @param updates   SkillUpdate 列表
      * @return 完成信号 (测试用 join; 异常已内部捕获, 恒正常完成)
      */
-    public CompletableFuture<Void> applySkillImprovement(String skillName, List<SkillUpdate> updates) {
+    public CompletableFuture<Void> applySkillImprovement(String sessionId, String skillName,
+                                                         List<SkillUpdate> updates) {
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new IllegalArgumentException(
+                "applySkillImprovement 需要显式 sessionId（会话态一律显式传参；null → 派生线程取不到会话 cwd）");
+        }
         return CompletableFuture.runAsync(() -> {
             try {
-                doApplySkillImprovement(skillName, updates);
+                doApplySkillImprovement(sessionId, skillName, updates);
             } catch (Exception e) {
                 // [IMP-HOOKS-S8 CCJ-HOOKS-T8-07] 侧信道查询异常可观测 (对齐 CC unhandled rejection)
-                log.error("Skill improvement apply 异步执行异常: skill={} err={}", skillName,
-                        e.getMessage(), e);
+                log.error("Skill improvement apply 异步执行异常: session={} skill={} err={}", sessionId,
+                        skillName, e.getMessage(), e);
             }
         });
     }
 
 
-    private void doApplySkillImprovement(String skillName, List<SkillUpdate> updates) {
+    private void doApplySkillImprovement(String sessionId, String skillName, List<SkillUpdate> updates) {
         // [P1-13] 空名守卫 · CC original: if (!skillName) return (skillImprovement.ts:192).
         // WHY: REST 决策端点暴露后, null/blank skillName 直接走 resolve 会 NPE / 产生空目录路径,
         // 镜像 CC 先判空再读文件 (防 REST 暴露后的 NPE/路径穿越; 与 P2-17 同守卫).
@@ -619,12 +642,13 @@ public class SkillImprovementHook {
             }
             return;
         }
-        // [IMP-HOOKS-S8 CCJ-HOOKS-T8-05] 调用时求值: baseDirSupplier.get() 每次 apply 读取当前
-        //   基准 (CC getCwd(), skillImprovement.ts:198), 替代旧构造期冻结 Path 字段
+        // [IMP-HOOKS-S8 CCJ-HOOKS-T8-05] 调用时求值: baseDirForSession.apply(显式 sessionId) 每次
+        //   apply 读取该会话当前基准 (CC getCwd(), skillImprovement.ts:198)，替代旧构造期冻结 Path 字段
+        // [批 3b] 键 = 显式 sessionId（本方法体在 ForkJoinPool 派生线程，MDC 取不到会话）
         // 决策 D1/D6：技能改进是【写入】操作 → 直接写 nexusai 自有目录（.nexusai/skills），
         //   对齐 CC skillImprovement.ts:198 join(getCwd(), '.claude', 'skills', ...) 等价替换目录名，
         //   不回落 .claude（nexusai 自治；读侧才需要 .claude 回落兼容未导入过渡期）
-        Path baseDir = baseDirSupplier.get();
+        Path baseDir = baseDirForSession.apply(sessionId);
         // 决策 D1/D6 全动态：项目级 nexusai 目录名 = NexusaiPaths.getProjectDirName()（.{appName}）
         Path filePath = baseDir.resolve(NexusaiPaths.getProjectDirName()).resolve("skills")
                 .resolve(skillName).resolve("SKILL.md");

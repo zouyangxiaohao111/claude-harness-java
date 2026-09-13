@@ -31,7 +31,7 @@ import java.util.function.Supplier;
  * <ul>
  *   <li><b>输出根</b>（taskOutputDirSupplier）已从项目目录 {@code {projectRoot}/{sessionId}/tasks}
  *       迁 <b>temp 唯一根</b> {@code {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks} —— 与
- *       {@link BackgroundTaskRunner#taskOutputDir()} 同源（CC diskOutput.ts:50-55 唯一机制）。
+ *       {@link BackgroundTaskRunner#taskOutputDir(String)} 同源（CC diskOutput.ts:50-55 唯一机制）。
  *       旧项目目录根 = CC 无对应的 Java 自创偏离，已消除。</li>
  *   <li><b>红线豁免</b>：输出落点<b>不再</b>经 {@link AutoMemPaths#currentSessionProjectRoot()}
  *       （memory/身份域红线约束的是 projectRoot 解析来源，不是 task 输出落点）—— 只拆输出落点
@@ -130,7 +130,8 @@ public class RemoteTaskConfiguration {
      *       对齐 CC sessionStorage.ts:320-328。</li>
      * </ul>
      */
-    private Supplier<Path> taskOutputDirSupplier() {
-        return () -> Path.of(BackgroundTaskRunner.taskOutputDir());
+    private java.util.function.Function<String, Path> taskOutputDirSupplier() {
+        // [批 3b-D7] 会话态显式：sessionId → 该会话的输出根（⛔ 不再 Supplier 无参 + 下游读 MDC）
+        return sessionId -> Path.of(BackgroundTaskRunner.taskOutputDir(sessionId));
     }
 }

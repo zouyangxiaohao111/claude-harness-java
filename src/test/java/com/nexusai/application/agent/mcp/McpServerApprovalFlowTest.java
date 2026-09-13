@@ -77,7 +77,7 @@ class McpServerApprovalFlowTest {
         ReflectionTestUtils.setField(service, "mcpTransportFactory",
             Mockito.mock(McpTransportFactory.class));
         McpToolPool pool = Mockito.mock(McpToolPool.class);
-        Mockito.when(pool.assembleToolPool(Mockito.anyString(), Mockito.any()))
+        Mockito.when(pool.assembleToolPool(Mockito.anyString(), Mockito.any(), Mockito.any()))
             .thenReturn(List.of());
         Mockito.when(pool.fetchMcpSkills(Mockito.anyString())).thenReturn(List.of());
         ReflectionTestUtils.setField(service, "mcpToolPool", pool);

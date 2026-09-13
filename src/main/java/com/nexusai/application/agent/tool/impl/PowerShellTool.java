@@ -609,7 +609,9 @@ public class PowerShellTool implements Tool {
         if (runInBackground && backgroundTaskRunner != null) {
             // Phase 4 (cron-notify): 透传创建会话 sessionId（ctx.sessionId()，可靠源 —— 本工具在
             // tool-exec 池线程执行，MDC 无值）→ BackgroundTaskRunner.spawn → 完成通知注入创建会话回合。
-            String sessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
+            // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
+            //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
+            String sessionId = ctx != null ? ctx.sessionId() : null;
             return executeBackground(command, call.id(), sessionId);
         }
         // ── CC :717-728 — pwsh 探测 pre-flight（缺失返回 code 0 + stderr sentinel）──
@@ -646,7 +648,9 @@ public class PowerShellTool implements Tool {
             //   NFC 比对 sessionCwd → 变化时 SessionCwdHolder.set（内部 realpath+NFC，
             //   对齐 setCwdState + setCwd realpathSync）。
             // sessionId=null（dispatch 兼容路径）时跳过持久化（无会话载体，对齐 CC 无 STATE）。
-            String sessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
+            // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
+            //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
+            String sessionId = ctx != null ? ctx.sessionId() : null;
             String sessionCwd = CwdResolution.getCwd(sessionId);
             String wrappedCommand = command;
             try {
@@ -1009,7 +1013,8 @@ public class PowerShellTool implements Tool {
         String taskId = TaskIdGenerator.generate(TaskType.LOCAL_BASH);
         // 批次4 #18：outputFile 走 taskOutputPath 同源分层 {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/{taskId}.output
         // （对齐 CC getTaskOutputPath，diskOutput.ts:72-74；sessionId 防并发会话 clobber；扩展名 .output 对齐 CC）。
-        String outputFile = BackgroundTaskRunner.taskOutputPath(taskId);
+        // [批 3b-D7] 输出根所属会话 = 创建会话（executeBackground 的 createSessionId 入参，显式）
+        String outputFile = BackgroundTaskRunner.taskOutputPath(createSessionId, taskId);
 
         try {
             // 分层格式父目录不天然存在 · CC ensureOutputDir diskOutput.ts:65-67

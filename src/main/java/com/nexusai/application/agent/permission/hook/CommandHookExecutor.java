@@ -12,7 +12,6 @@ import com.nexusai.application.agent.permission.ToolPermissionGate;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.tool.AbortController;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1894,8 +1893,11 @@ public class CommandHookExecutor {
      * {@code event 顶层已有值 ＞ event.data 已有值（事件特有覆盖）＞ ctx 派生值 ＞ 省略}。
      *
      * <ul>
-     *   <li>{@code session_id}：{@code event.sessionId() ?? RequestContext.sessionId()}（MDC 回退；
-     *       两源皆 null → 省略，对齐 CC getSessionId 回退语义 hooks.ts:315/320）</li>
+     *   <li>{@code session_id}：{@code event.sessionId() ?? parentTuc.sessionId()}（<b>显式载体</b>：
+     *       事件自带 → 父 ToolUseContext.sessionId（批 2b 显式字段）→ 省略。批 3b 删除 MDC 回退：
+     *       MDC 是 ThreadLocal，本方法调用点 HookRegistry:4407 跑在 {@code executeEvent} 的<b>调用线程</b>
+     *       （可能是 WebSocketPermissionPrompter 裸池线程，无 MDC；也可能是 Tomcat 复用线程，残留别会话 id）。
+     *       两源皆 null → 省略 + WARN（缺会话态不静默），对齐 CC getSessionId 回退语义 hooks.ts:315/320）</li>
      *   <li>{@code transcript_path}：{@code event.transcriptPath() ?? SessionStorage.resolveExistingTranscript(
      *       Path.of(SessionProjectRoot.getForSession(resolvedSessionId)), resolvedSessionId)}（D3 读兼容：经
      *       resolveExistingTranscript 读 nexusai 现有 transcript；resolvedSessionId = 合并后 session_id；
@@ -1934,10 +1936,22 @@ public class CommandHookExecutor {
         if (event == null) {
             return null;
         }
-        // session_id 回退: event.sessionId() ?? RequestContext.sessionId()（MDC；虚拟线程 null → 省略）
+        // [批 3b] session_id 回退: event.sessionId() ?? parentTuc.sessionId()（显式载体链）
+        //   ⛔ 不再读 RequestContext.sessionId()（MDC/ThreadLocal）：本方法在 hook 发射线程执行，
+        //   派生线程（tool-exec 池 / WebSocketPermissionPrompter 裸池 / HOOK_EXECUTOR）读 MDC
+        //   恒 null 或读到上一任务残留的别会话 id（第三态）。缺值不静默：WARN 暴露。
         String sessionId = event.sessionId();
-        if (sessionId == null) {
-            sessionId = RequestContext.sessionId();
+        if ((sessionId == null || sessionId.isBlank())
+                && parentTuc != null && parentTuc.sessionId() != null
+                && !parentTuc.sessionId().isBlank()) {
+            sessionId = parentTuc.sessionId();
+        }
+        if (sessionId == null || sessionId.isBlank()) {
+            sessionId = null;
+            log.warn("[CommandHookExecutor] enrichBaseFields 无会话态可注入 session_id：event.type={} "
+                + "event.sessionId=null 且 parentTuc={}（thread={}）→ 事件 session_id 省略（CC 恒有 getSessionId）",
+                event.type(), parentTuc == null ? "null" : "sessionId=null",
+                Thread.currentThread().getName());
         }
         // transcript_path: event.transcriptPath() ?? SessionStorage.resolveExistingTranscript(workspaceDir, resolvedSessionId)
         // [D3 读兼容] 只读 nexusai 自有 transcript（resume 仅支持 nexusai 会话，无 claude ~/.claude/projects 回落）
@@ -2017,7 +2031,11 @@ public class CommandHookExecutor {
      *      = override(ThreadLocal) ?? sessionCwd(SessionCwdHolder, worktree 入口与 bash cd 共用)
      *        ?? boundProject(SessionProjectRoot.getForSession) ?? user.dir
      * </pre>
-     * sessionId = {@code event.sessionId() ?? RequestContext.sessionId()}（MDC 回退）。
+     * sessionId = {@code event.sessionId()}（<b>唯一源</b>；批 3b 删除 MDC 回退）。事件经
+     * {@link #enrichBaseFields} 合并后 sessionId 已由显式载体（parentTuc）注入；仍缺 → 记 WARN
+     * 并回落 {@code CwdResolution.getCwd(null)}（= user.dir，对齐 CC getOriginalCwd 兜底）。
+     * ⛔ 不再读 {@code RequestContext.sessionId()}：本方法在 HOOK_EXECUTOR 池线程求值，
+     * ThreadLocal 恒 null 或残留别会话值。
      *
      * <p><b>身份域红线 D-1</b>：CwdResolution.getCwd 不读 {@code SessionProjectRoot.resolve()}
      * （回落 CLAUDE_PROJECT_DIR env / config home 属身份域）。原 {@code AutoMemPaths.currentSessionProjectRoot()}
@@ -2036,9 +2054,14 @@ public class CommandHookExecutor {
     public static String resolveSpawnCwd(HookEvent event) {
         String cwd = event != null ? event.cwd() : null;
         if (cwd == null) {
+            // [批 3b] sessionId 唯一源 = event.sessionId()（enrichBaseFields 已从显式载体注入）。
+            //   ⛔ 不读 MDC：本方法在 HOOK_EXECUTOR 池线程求值，ThreadLocal 取不到本会话。
             String sessionId = event != null ? event.sessionId() : null;
-            if (sessionId == null) {
-                sessionId = RequestContext.sessionId();
+            if (sessionId == null || sessionId.isBlank()) {
+                sessionId = null;
+                log.warn("[CommandHookExecutor] resolveSpawnCwd 无会话态：event={} 未携带 sessionId "
+                    + "（thread={}）→ cwd 回落 user.dir（对齐 CC getOriginalCwd 兜底）",
+                    event != null ? event.type() : null, Thread.currentThread().getName());
             }
             cwd = CwdResolution.getCwd(sessionId);
         }

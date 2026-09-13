@@ -61,11 +61,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *   <li><b>端点真实驱动 AwaySummaryService.generate 走 chatWithOptions 契约</b>——捕获型
  *       provider 验证 querySource='away_summary' / skipCacheWrite=true（IMP-M-P2-3 / OPD-M-41），
  *       证明 REST 不是空壳，而是服务层契约的载体。</li>
- *   <li><b>sessionId 源 = 请求优先 + MDC 兜底</b>——ODF-B1R（2026-08-07）改造：CC 触发层在前端 REPL，
- *       会话上下文由前端持有（useAwaySummary.ts 内 messages 即前端侧），故 Web 前端 POST 时可随请求
- *       传 sessionId（body JSON {@code {"sessionId": "..."}} 或 query {@code ?sessionId=...}，请求优先）；
- *       请求未传时兜底 {@link RequestContext}（MDC），与 ToolRegistrationConfig:682 注入一致；
- *       请求与 MDC 双空 → 500 fail loud（对齐 CommandController executeResume 同语义）。</li>
+ *   <li><b>sessionId 源 = 仅请求显式源</b>——ODF-B1R（2026-08-07）改造：CC 触发层在前端 REPL，
+ *       会话上下文由前端持有（useAwaySummary.ts 内 messages 即前端侧），故 Web 前端 POST 时随请求
+ *       传 sessionId（body JSON {@code {"sessionId": "..."}} 或 query {@code ?sessionId=...}）。
+ *       <b>[批 3b] MDC 兜底已删</b>：{@code RequestContext.sessionId()} 是裸 MDC（ThreadLocal），
+ *       REST 线程复用下第三态可读到上一请求残留的别会话 id ⇒ 静默给 A 会话生成 B 会话摘要；
+ *       请求两源皆空 → 500 fail loud（对齐 CommandController executeResume 同语义）。</li>
  * </ol>
  */
 @DisplayName("[ODF-B1] AwaySummaryController POST /api/agent/away-summary")
@@ -161,11 +162,11 @@ class AwaySummaryControllerTest {
         // WHY: 前端 blur 5min 后 POST 拿 recap 文本回插 away_summary 系统消息（useAwaySummary.ts:80）。
         // 若 200 但 body 缺文本 → 前端无法回插；若契约未达 provider（querySource/skipCacheWrite）
         // → 侧信道查询可能写 API cache / 遥测丢失（OPD-M-41）。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000b");
+        // [批 3b] 会话态显式传参：旧实现靠 RequestContext.setSession(...)（MDC）兜底，MDC 兜底已删
         when(messageService.listForResume(anyString())).thenReturn(messages(3));
 
         mockMvc(capturingProvider(capturedOptions, "Building the memory system. Next: run tests.", null))
-            .perform(post("/api/agent/away-summary"))
+            .perform(post("/api/agent/away-summary?sessionId=00000000-0000-0000-0000-00000000000b"))
             .andExpect(status().isOk())
             .andExpect(content().string("Building the memory system. Next: run tests."));
 
@@ -183,11 +184,11 @@ class AwaySummaryControllerTest {
     void emptyTranscript_204() throws Exception {
         // WHY: CC messages.length===0 提前返回 null（awaySummary.ts:33-35）——无对话内容时 recap
         // 无意义；REST 用 204 表达 null，若抛 500 会污染前端 blur 回来自动请求的错误上报。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000b");
+        // [批 3b] 会话态显式传参（MDC 兜底已删）
         when(messageService.listForResume(anyString())).thenReturn(List.of());
 
         mockMvc(capturingProvider(capturedOptions, "unused", null))
-            .perform(post("/api/agent/away-summary"))
+            .perform(post("/api/agent/away-summary?sessionId=00000000-0000-0000-0000-00000000000b"))
             .andExpect(status().isNoContent());
         // 空列表不触达 LLM → provider 未收到 options
         org.assertj.core.api.Assertions.assertThat(capturedOptions.get()).isNull();
@@ -198,12 +199,12 @@ class AwaySummaryControllerTest {
     void llmFailure_204() throws Exception {
         // WHY: CC isApiErrorMessage → logForDebugging + null（awaySummary.ts:60-65）——模型/网关
         // 暂时不可用不得让前端 blur 请求炸 500；null 语义经 REST 表达为 204。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000000b");
+        // [批 3b] 会话态显式传参（MDC 兜底已删）
         when(messageService.listForResume(anyString())).thenReturn(messages(3));
 
         mockMvc(capturingProvider(capturedOptions, null,
                 new LlmApiException(429, java.util.Map.of(), "rate limited")))
-            .perform(post("/api/agent/away-summary"))
+            .perform(post("/api/agent/away-summary?sessionId=00000000-0000-0000-0000-00000000000b"))
             .andExpect(status().isNoContent());
     }
 
@@ -262,12 +263,12 @@ class AwaySummaryControllerTest {
     void sessionNotFound_404() throws Exception {
         // WHY: MessageService.listRawForTranscript 校验 session 存在（MessageService.java:46-48），
         // 不存在抛 NotFoundException → REST 404（REST 语义，区别于 CC 前端内存 messages 无此场景）。
-        RequestContext.setSession("00000000-0000-0000-0000-00000000dead");
+        // [批 3b] 会话态显式传参（MDC 兜底已删）
         when(messageService.listForResume(anyString()))
             .thenThrow(new NotFoundException("Session 00000000-0000-0000-0000-00000000dead not found"));
 
         mockMvc(capturingProvider(capturedOptions, "recap", null))
-            .perform(post("/api/agent/away-summary"))
+            .perform(post("/api/agent/away-summary?sessionId=00000000-0000-0000-0000-00000000dead"))
             .andExpect(status().isNotFound());
     }
 

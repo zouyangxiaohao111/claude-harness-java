@@ -412,7 +412,8 @@ class PartialCompactServiceTest {
         tfs.registerTask(new BackgroundTask(
             asyncAgentId.toString(), TaskType.LOCAL_AGENT, BackgroundTaskStatus.RUNNING,
             "正在整理调研报告", null, System.currentTimeMillis(), null, null,
-            com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(asyncAgentId.toString()), 0L, false,
+            com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
+                "sess-3b-compact-fixture", asyncAgentId.toString()), 0L, false,
             asyncAgentId, true));
         // plan 数据源（fake PlanProvider · CC getPlan/getPlanFilePath）· PlanProvider 非
         // 函数式接口（5 抽象方法），须匿名类

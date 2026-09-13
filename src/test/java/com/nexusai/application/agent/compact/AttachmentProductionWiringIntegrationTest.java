@@ -71,7 +71,8 @@ class AttachmentProductionWiringIntegrationTest {
         taskFrameworkService.registerTask(new BackgroundTask(
             asyncAgentId.toString(), TaskType.LOCAL_AGENT, BackgroundTaskStatus.RUNNING,
             "正在整理调研报告", null, System.currentTimeMillis(), null, null,
-            com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(asyncAgentId.toString()), 0L, false,
+            com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
+                "sess-3b-attach-fixture", asyncAgentId.toString()), 0L, false,
             asyncAgentId, true));
         // ── 数据源：plan 文件（fake PlanProvider，CC getPlan/getPlanFilePath）· 非函数式接口，匿名类 ──
         PlanProvider planProvider = new PlanProvider() {

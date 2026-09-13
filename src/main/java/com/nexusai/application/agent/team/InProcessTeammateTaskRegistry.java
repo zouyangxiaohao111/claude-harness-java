@@ -244,7 +244,10 @@ public class InProcessTeammateTaskRegistry {
             state.taskId(), TaskType.IN_PROCESS_TEAMMATE, BackgroundTaskStatus.RUNNING,
             description, toolUseId,
             System.currentTimeMillis(), null, null,
-            com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(state.taskId()), 0L, false,
+            // [批 3b-D7] 输出根所属会话 = teammate 的父会话（SpawnContext.parentSessionId 显式装入）；
+                //   ⛔ 不再由下游读 MDC（本方法可能在非会话线程构造 BackgroundTask）
+                com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
+                    state.identity().parentSessionId(), state.taskId()), 0L, false,
             null, true);
     }
 }

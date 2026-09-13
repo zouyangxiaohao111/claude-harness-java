@@ -155,7 +155,8 @@ class LocalBashTaskRunnerStreamingTest {
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             command, "tu-" + taskId, System.currentTimeMillis(), null, null,
             tempDir.resolve(taskId + ".out").toString(), 0L, false, null, false);
-        runner.spawn(task, command, null);
+        // [批 3b-D7 签名收紧] createSessionId 必填（本用例自建 outputFile，会话仅作归属）
+        runner.spawn(task, command, "sess-streaming-3b-fixture");
         try {
             awaitUntil(() -> {
                 BackgroundTaskRunner.TaskOutput out = runner.getOutput(taskId, false, 0);

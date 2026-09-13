@@ -53,6 +53,9 @@ import static org.mockito.Mockito.when;
 @DisplayName("[W9-03] MonitorMcpTaskRunner streaming 语义（CC LocalShellTask.tsx kind='monitor'）")
 class MonitorMcpTaskRunnerTest {
 
+    /** [批 3b-D7] 显式创建会话（旧实现由下游读 MDC；现所有注册入口（register… / outputFileFor）显式传）。 */
+    private static final String SESSION = "sess-monitor-3b-fixture";
+
     @TempDir
     Path tempDir;
 
@@ -131,7 +134,7 @@ class MonitorMcpTaskRunnerTest {
         TaskFrameworkService service = new TaskFrameworkService(sdk);
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
 
-        String taskId = runner.registerTask("monitor-growth", "tu-1");
+        String taskId = runner.registerTask("monitor-growth", "tu-1", null, SESSION);
         assertThat(taskId).as("monitor 任务 id 前缀 'm'（对齐 Task.ts:82 monitor_mcp:'m'）").startsWith("m");
         BackgroundTask registered = service.getTask(taskId).orElseThrow();
         assertThat(registered.status()).as("registerTask → store RUNNING").isEqualTo(BackgroundTaskStatus.RUNNING);
@@ -180,7 +183,7 @@ class MonitorMcpTaskRunnerTest {
         TaskFrameworkService service = new TaskFrameworkService(sdk);
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
 
-        String taskId = runner.registerTask("monitor-kill", "tu-2");
+        String taskId = runner.registerTask("monitor-kill", "tu-2", null, SESSION);
         Path out = tempDir.resolve(taskId + ".output");
         Thread t = new Thread(() -> runner.monitor(taskId, "monitor-kill", out.toString()), "monitor-kill");
         t.setDaemon(true);
@@ -242,7 +245,7 @@ class MonitorMcpTaskRunnerTest {
         TaskFrameworkService service = new TaskFrameworkService(sdk);
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
 
-        String taskId = runner.registerTask("monitor-end", "tu-3");
+        String taskId = runner.registerTask("monitor-end", "tu-3", null, SESSION);
         Path out = tempDir.resolve(taskId + ".output");
         Thread t = new Thread(() -> runner.monitor(taskId, "monitor-end", out.toString()), "monitor-end");
         t.setDaemon(true);
@@ -283,7 +286,7 @@ class MonitorMcpTaskRunnerTest {
         TaskFrameworkService service = new TaskFrameworkService(sdk);
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
 
-        String taskId = runner.registerTask("monitor-fail", "tu-4");
+        String taskId = runner.registerTask("monitor-fail", "tu-4", null, SESSION);
         Path out = tempDir.resolve(taskId + ".output");
 
         assertThatThrownBy(() -> runner.monitor(taskId, "monitor-fail", out.toString()))
@@ -328,10 +331,9 @@ class MonitorMcpTaskRunnerTest {
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
 
         String sessionId = "sess-monitor-y";
-        RequestContext.setSession(sessionId);
         try {
-            String taskId = runner.registerTask("monitor-unify", "tu-y");
-            String outputFile = runner.outputFileFor(taskId);
+            String taskId = runner.registerTask("monitor-unify", "tu-y", null, sessionId);
+            String outputFile = runner.outputFileFor(sessionId, taskId);
             // 五层唯一根：per-user + per-project + per-session（CC diskOutput.ts:50-55 + filesystem.ts:376-378）
             String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
             Path expected = Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
@@ -347,7 +349,7 @@ class MonitorMcpTaskRunnerTest {
 
             // 与 BackgroundTaskRunner 唯一根同源（Bash/PS/LOCAL_AGENT/monitor/remote_agent 全收统一根）
             assertThat(outputFile).as("monitor_mcp 与 taskOutputPath 唯一根同源")
-                .isEqualTo(BackgroundTaskRunner.taskOutputPath(taskId));
+                .isEqualTo(BackgroundTaskRunner.taskOutputPath(sessionId, taskId));
 
             // 流式写实际落该唯一根文件（父目录自动创建）—— 独立线程跑 monitor（阻塞轮询），
             // 首观测落盘后 stop() 中断退出（对齐既有 streaming 测试模式）

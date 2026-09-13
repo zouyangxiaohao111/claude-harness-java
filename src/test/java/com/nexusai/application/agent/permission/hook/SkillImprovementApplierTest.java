@@ -67,7 +67,7 @@ class SkillImprovementApplierTest {
                 (skillName, updates) -> {},
                 tempDir);
 
-        CompletableFuture<Void> future = hook.applySkillImprovement("my-skill",
+        CompletableFuture<Void> future = hook.applySkillImprovement("sess-test-3b", "my-skill",
                 List.of(new SkillUpdate("new step", "ask energy", "user asked")));
         future.join();
 

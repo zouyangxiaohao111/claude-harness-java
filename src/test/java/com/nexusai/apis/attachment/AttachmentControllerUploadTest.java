@@ -150,4 +150,22 @@ class AttachmentControllerUploadTest {
                 .andExpect(jsonPath("$.contentId").value("2"))
                 .andExpect(jsonPath("$.size").value(greaterThan(0)));
     }
+
+    /**
+     * [批 3b] 会话必填 fail-loud：缺 sessionId ⇒ 400（旧实现「显式 → MDC → 'unknown'」两级兜底已删）。
+     *
+     * <p>WHY（规则十二 · 显式失败）：'unknown' 是伪造会话 id（把无主附件塞进一个前端永远取不回的
+     * 会话桶）；MDC 是 ThreadLocal（REST 线程复用第三态可读到上一请求残留的别会话 id ⇒ 附件落进
+     * 别的会话目录）。两者都必须消失 —— 缺值即 400，不静默兜底。
+     */
+    @Test
+    @DisplayName("批 3b · 缺 sessionId → 400（MDC / 'unknown' 兜底已删，会话态显式必填）")
+    void upload_withoutSessionId_400() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+                "file", "no-session.pdf", MediaType.APPLICATION_PDF_VALUE, pdfBytes());
+        mvc.perform(multipart("/api/v1/attachments/upload").file(file))
+                .andExpect(status().isBadRequest());
+        mvc.perform(multipart("/api/v1/attachments/upload").file(file).param("sessionId", "   "))
+                .andExpect(status().isBadRequest());
+    }
 }

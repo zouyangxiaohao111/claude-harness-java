@@ -428,7 +428,8 @@ public class TaskOutputTool extends AbstractTaskTool {
      *
      * @param output     原始输出
      * @param taskId     任务 id
-     * @param outputFile 输出文件绝对路径（可为 null）
+     * @param outputFile 输出文件绝对路径 —— **任务自身的真实路径**（`task.outputFile()`，由创建会话
+     *                    的会话目录生成；见下方 [批 3b-D7 对 CC 的显式偏差]）。可为 null（仅历史/防御形）
      * @return 截断后内容（未超长则原样）
      */
     static String formatTaskOutput(String output, String taskId, String outputFile) {
@@ -436,8 +437,27 @@ public class TaskOutputTool extends AbstractTaskTool {
         if (output.length() <= maxLen) {
             return output;
         }
-        String filePath = outputFile != null
-            ? outputFile : com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(taskId);
+        // ═══════════════════════════════════════════════════════════════════════
+        // [批 3b-D7 · 对 CC 的**显式偏差**（用户 2026-09-13 裁定：保留 outputFile 参数 + 登记偏差）]
+        //
+        // CC 真源：`getTaskOutputPath(taskId)` **无条件**重算路径（utils/task/outputFormatting.ts:38），
+        //   其 `getTaskOutputDir() = join(getProjectTempDir(), getSessionId(), 'tasks')` 用的是
+        //   **进程级** `STATE.sessionId`（diskOutput.ts:50-55 + bootstrap/state.ts:425-427）。
+        //
+        // Java 为何不能照搬：本仓是 Web 多会话，`STATE.sessionId` 无对应物；而且——
+        //   <b>「查看者的会话 ≠ 创建者的会话」时按查看者会话重算会找错目录</b>
+        //   （TaskOutput 可查别的会话/后台/子代理创建的 task；重算只能拿到当前查看者的会话，
+        //   于是 `[Truncated. Full output: …]` 会指向一个不存在的文件）。
+        //   ⇒ Java 用**任务自身的真实路径** `task.outputFile()`（= 创建会话目录下那条，由
+        //   BackgroundTaskRunner `taskOutputPath(createSessionId, taskId)` 生成，跨会话恒正确）。
+        //
+        // 原 Java 自创的 `outputFile != null ? outputFile : taskOutputPath(taskId)` null 兜底分支
+        //   已删：它既需要会话（本层无来源），又在生产**不可达**（outputFile 恒由
+        //   BackgroundTaskRunner.getOutput 从 task.outputFile() 填充；found=false 的早退路径在
+        //   TaskOutputTool.execute 就返回了，根本到不了这里）——为它把 sessionId 塞进
+        //   TaskOutputPayload（LLM 可见契约）属不必要机械。缺值只会显示 null（显式可见，不编造目录）。
+        // ═══════════════════════════════════════════════════════════════════════
+        String filePath = outputFile;
         String header = "[Truncated. Full output: " + filePath + "]\n\n";
         int available = maxLen - header.length();
         int start = Math.max(0, output.length() - available);

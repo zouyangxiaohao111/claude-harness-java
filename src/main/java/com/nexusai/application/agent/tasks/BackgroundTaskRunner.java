@@ -4,7 +4,6 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
-import com.nexusai.common.RequestContext;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -140,19 +139,29 @@ public class BackgroundTaskRunner {
      * @param task 后台任务 (status=RUNNING)
      * @param bashCommand 要执行的 bash 命令
      * @param createSessionId 创建此后台任务的会话 sessionId（Phase 4 cron-notify：由工具体从
-     *                        {@code ToolUseContext.sessionId()} 透传，drain 3a 注入创建会话回合）；
-     *                        null = 无会话上下文 → 回落全局（CronIdleExecutor GLOBAL_SESSION_UUID）。
+     *                        {@code ToolUseContext.sessionId()} 透传，drain 3a 注入创建会话回合）。
      *                        <b>不得读 MDC</b> —— 工具体在 tool-exec 池线程执行，无 MDC
      *                        （StreamingToolExecutor 注释权威确认），ctx.sessionId() 是唯一可靠源
      *                        （MonitorTool 同模式）。task 自身已带 sessionId 时优先保留（caller 显式）。
+     *                        <p><b>[批 3b-D7 · 签名收紧] 必填</b>：该值现同时是<b>输出根所属会话</b>
+     *                        （{@code taskOutputPath(createSessionId, …)}）与完成通知的归属会话。
+     *                        生产调用方（BashTool / PowerShellTool / 子代理 / workflow）恒传
+     *                        {@code ctx.sessionId()}（ToolUseContext 契约保证非空）——
+     *                        签名不再留「可能没有」（用户裁定「不传递不能有守卫」）。
      */
-    public void spawn(BackgroundTask task, String bashCommand, @Nullable String createSessionId) {
+    public void spawn(BackgroundTask task, String bashCommand, String createSessionId) {
         // Phase 4 (cron-notify): 透传创建会话 sessionId 存在 task 上，供 executor/watchdog 通知
         // 线程入队 {@code QueueItem.sessionId}（那些线程 MDC 已丢）。
         // CC 对齐：LocalShellTask.tsx:105-171 enqueueShellNotification 注入当前会话（CC 单进程
         // ambient）；Java 多会话 → 显式携带，drain 3a 注入创建会话回合。
-        BackgroundTask sessionTask = (createSessionId != null && !createSessionId.isBlank() && task.sessionId() == null)
-            ? task.withSessionId(createSessionId) : task;
+        // [批 3b-D7 签名收紧] createSessionId 现为**必填**（用户裁定「不传递不能有守卫」：
+        //   生产调用方恒从 ToolUseContext.sessionId() 取值）。缺值不再静默回落，改 fail-loud ——
+        //   否则空白串会被写进 task.sessionId()（下游通知/输出根归属静默错），比报错更难查。
+        if (createSessionId == null || createSessionId.isBlank()) {
+            throw new IllegalArgumentException(
+                "spawn 需要显式 createSessionId（批 3b-D7：签名必填，缺值 fail-loud，不回落 MDC/全局）");
+        }
+        BackgroundTask sessionTask = task.sessionId() == null ? task.withSessionId(createSessionId) : task;
         tasks.put(sessionTask.id(), sessionTask);
         frameworkService.registerTask(sessionTask);
 
@@ -180,7 +189,10 @@ public class BackgroundTaskRunner {
 
         Future<?> future = executor.submit(() -> {
             try {
-                LocalBashTaskRunner.BashResult result = runner.execute(bashCommand, sessionTask.outputFile());
+                // [批 3b] cwd 的会话源 = 任务的创建会话（显式传入；⛔ 不再由 LocalBashTaskRunner 读 MDC ——
+                //   本 executor 线程无 MDC，旧实现恒回落 user.dir，后台命令跑错目录）
+                LocalBashTaskRunner.BashResult result = runner.execute(bashCommand, sessionTask.outputFile(),
+                    sessionTask.sessionId());
 
                 // s13-p2: cancel() 可能在 execute() 期间标记 KILLED → 不再覆盖
                 BackgroundTask current = tasks.get(sessionTask.id());
@@ -277,10 +289,14 @@ public class BackgroundTaskRunner {
      * <p>写入 stub 输出文件 → 立即标记 COMPLETED → enqueue 通知
      * <br>s14+ 将替换为各自的实际执行器 (AgentTask / WorkflowTask / etc.)
      */
-    public void spawnStub(BackgroundTask task, @Nullable String createSessionId) {
+    public void spawnStub(BackgroundTask task, String createSessionId) {
         // Phase 4 (cron-notify): 透传创建会话 sessionId（同 spawn，供通知透传）。
-        BackgroundTask sessionTask = (createSessionId != null && !createSessionId.isBlank() && task.sessionId() == null)
-            ? task.withSessionId(createSessionId) : task;
+        // [批 3b-D7 签名收紧] 与 spawn 同口径：必填 + 缺值 fail-loud（同类模式不留「可空」守卫）。
+        if (createSessionId == null || createSessionId.isBlank()) {
+            throw new IllegalArgumentException(
+                "spawnStub 需要显式 createSessionId（批 3b-D7：签名必填，缺值 fail-loud）");
+        }
+        BackgroundTask sessionTask = task.sessionId() == null ? task.withSessionId(createSessionId) : task;
         tasks.put(sessionTask.id(), sessionTask);
         frameworkService.registerTask(sessionTask);
 
@@ -517,29 +533,6 @@ public class BackgroundTaskRunner {
     //            LocalAgentTask.tsx:197-262
     // ════════════════════════════════════════════════════════════════════
 
-    /**
-     * 当前会话 ID · 对齐 CC getSessionId（diskOutput.ts:50-55 getTaskOutputDir 消费）。
-     *
-     * <p>CC 真源：{@code bootstrap/state.ts:431-433} 进程级 sessionId 恒非 null；Java 无单例
-     * 会话，以 {@link RequestContext#sessionId()}（MDC）为主源（agent 循环线程经
-     * {@code ChatService.processUserMessage} 入口设定，ChatService.java:154），回退
-     * {@code nexusai.sessionId} sysprop（对齐 TaskService.getTaskListId 优先级 5，
-     * tasks.ts:209 getSessionId() 回退），再回退 {@code "unknown"}（fail-closed 占位，
-     * 测试/无会话上下文直构场景）。
-     *
-     * @return 非 null 会话 ID 串
-     */
-    private static String resolveSessionId() {
-        String sid = RequestContext.sessionId();
-        if (sid != null && !sid.isBlank()) {
-            return sid;
-        }
-        String sysprop = System.getProperty("nexusai.sessionId");
-        if (sysprop != null && !sysprop.isBlank()) {
-            return sysprop;
-        }
-        return "unknown";
-    }
 
     /**
      * 任务输出目录 · 对齐 CC getTaskOutputDir（diskOutput.ts:50-55
@@ -564,7 +557,7 @@ public class BackgroundTaskRunner {
      *   <li><b>③ per-project</b> = {@link CwdResolution#getOriginalCwdLayer(String)} 的 CC
      *       sanitizePath（sessionStoragePortable.ts:311-319，非字母数字→'-'；filesystem.ts:376
      *       {@code sanitizePath(getOriginalCwd())}）—— 不同项目 originalCwd → 不同输出目录</li>
-     *   <li><b>④ per-session</b> = {@link #resolveSessionId()}（同源，防并发会话 clobber）</li>
+     *   <li><b>④ per-session</b> = 显式入参 {@code sessionId}（防并发会话 clobber）</li>
      *   <li><b>⑤ tasks</b> 子目录 + taskOutputPath 追加 {@code .output} 扩展名（现有）</li>
      * </ol>
      *
@@ -574,10 +567,29 @@ public class BackgroundTaskRunner {
      * （diskOutput.ts:38-41）。读方（TaskOutputTool / taskOutputFile 存储字段）存的是完整路径，自动跟随。
      * 旧 A-7 简化根 {@code {tmpdir}/nexusai-sessions} 已删除（无兼容层/双轨）。
      *
+     * <p><b>[批 3b-D7] 会话态显式入参（用户裁定）</b>：本方法此前经 {@code resolveSessionId()}
+     * 读 {@code RequestContext.sessionId()}（MDC）→ sysprop → {@code "unknown"}。三源全部删除：
+     * <ul>
+     *   <li>MDC 是 ThreadLocal —— 本方法的调用点分布在 tool-exec 池线程 / {@code bg-task-worker}
+     *       后台线程 / 轮询定时器线程，派生线程上恒 null（或残留别会话 id），CC
+     *       {@code diskOutput.ts:50-55} 的 {@code getSessionId()}(=STATE 进程单例) 在 Java 多会话
+     *       下<b>没有对应物</b>；</li>
+     *   <li>sysprop 是全局单值 —— 多会话下不同会话会撞同一目录；</li>
+     *   <li>{@code "unknown"} 是伪造会话 id —— 输出落进无人认领的桶。</li>
+     * </ul>
+     * 正确来源 = <b>发起方</b>（AI 工具调用 / 子代理 / teammate / workflow bundle）在派发那一刻
+     * 手上就有的 {@code ToolUseContext.sessionId()}，经各注册入口（register… / spawn）显式透传。
+     *
+     * @param sessionId 创建该任务的会话 id（<b>显式</b>；null/blank → 抛，缺值 fail-loud：
+     *                  任务产物必须归属某个会话目录，不编造兜底值）
      * @return 任务输出目录绝对路径（不含 taskId 文件名）
+     * @throws IllegalArgumentException sessionId 缺失
      */
-    public static String taskOutputDir() {
-        String sessionId = resolveSessionId();
+    public static String taskOutputDir(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new IllegalArgumentException(
+                "taskOutputDir 需要显式 sessionId（批 3b-D7：MDC/sysprop/\"unknown\" 三源兜底已删）");
+        }
         String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
         return Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd, sessionId, "tasks").toString();
     }
@@ -587,13 +599,14 @@ public class BackgroundTaskRunner {
      * {@code join(getTaskOutputDir(), \`${taskId}.output\`)}）。
      *
      * <p>产出 {@code {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output}
-     * （方案B 五层，见 {@link #taskOutputDir()}）。
+     * （方案B 五层，见 {@link #taskOutputDir(String)}）。
      *
-     * @param taskId 任务 id（local_agent = agentId.toString()，CC 合一）
+     * @param sessionId 创建该任务的会话 id（<b>显式</b>；见 {@link #taskOutputDir(String)}）
+     * @param taskId    任务 id（local_agent = agentId.toString()，CC 合一）
      * @return 输出文件绝对路径
      */
-    public static String taskOutputPath(String taskId) {
-        return Paths.get(taskOutputDir(), taskId + ".output").toString();
+    public static String taskOutputPath(String sessionId, String taskId) {
+        return Paths.get(taskOutputDir(sessionId), taskId + ".output").toString();
     }
 
     /**
@@ -616,7 +629,7 @@ public class BackgroundTaskRunner {
      * 保存于 {@link #taskAbortControllers}，kill 时 {@link #killAsyncAgent} 经 {@code abort()}
      * 直接中断 worker（对齐 CC LocalAgentTask.tsx:288 task.abortController?.abort()）。
      *
-     * <p><b>A-7 outputFile</b>：对齐 CC 分层格式 {@code taskOutputPath(agentId)}（CC
+     * <p><b>A-7 outputFile</b>：对齐 CC 分层格式 {@code taskOutputPath(sessionId, agentId)}（CC
      * LocalAgentTask.tsx:488 createTaskStateBase → Task.ts:121 outputFile: getTaskOutputPath(id)；
      * 旧平铺 {@code /tmp/agent-{taskId}.out} 已删除）。
      *
@@ -634,7 +647,7 @@ public class BackgroundTaskRunner {
     public BackgroundTask registerAsyncAgent(
             UUID agentId, String description, String prompt,
             String selectedAgentType, @Nullable AbortController parentAbortController,
-            @Nullable String createSessionId) {
+            String createSessionId) {
         if (agentId == null) {
             throw new IllegalArgumentException("agentId 不能为 null");
         }
@@ -642,7 +655,7 @@ public class BackgroundTaskRunner {
         String taskId = agentId.toString();
         // 方案B: outputFile 对齐 CC 五层 {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output
         //   （CC LocalAgentTask.tsx:488 createTaskStateBase → Task.ts:121 getTaskOutputPath）
-        String outputFile = taskOutputPath(taskId);
+        String outputFile = taskOutputPath(createSessionId, taskId);
         // Phase 4 (cron-notify): 透传创建会话 sessionId（SubagentTool 从父循环 TUC 提取，
         // 与 spawn 同源）——终态通知（transitionToTerminal/enqueueAgentNotification/killAsyncAgent）
         // 在 worker 线程执行，MDC 已丢，须注册时透传存在 task 上。
@@ -749,7 +762,7 @@ public class BackgroundTaskRunner {
      */
     public BackgroundTask registerAgentForeground(
             UUID agentId, String description, String prompt, String selectedAgentType,
-            @Nullable String createSessionId) {
+            String createSessionId) {
         if (agentId == null) {
             throw new IllegalArgumentException("agentId 不能为 null");
         }
@@ -757,7 +770,7 @@ public class BackgroundTaskRunner {
         String taskId = agentId.toString();
         // A-7: outputFile 对齐 CC 分层格式（CC LocalAgentTask.tsx:553 createTaskStateBase
         //   → Task.ts:121 outputFile: getTaskOutputPath(id)）
-        String outputFile = taskOutputPath(taskId);
+        String outputFile = taskOutputPath(createSessionId, taskId);
         // Phase 4 (cron-notify): 透传创建会话 sessionId（SubagentExecutor 从 executeStreaming
         // 的 agentTuc.sessionId() 提取）——若随后被 backgroundAgentTask 后台化，完成通知须注入
         // 创建会话回合。
@@ -1259,7 +1272,7 @@ public class BackgroundTaskRunner {
      *   <li>type = LOCAL_WORKFLOW / status = RUNNING / startTime = now</li>
      *   <li>description = CC opts.description（= summary ?? workflowName，ports.ts:99）</li>
      *   <li>toolUseId 透传（CC createTaskStateBase 第三参）</li>
-     *   <li>outputFile = {@link #taskOutputPath(taskId)}（CC Task.ts:121 getTaskOutputPath）</li>
+     *   <li>outputFile = {@link #taskOutputPath(String, String)}（CC Task.ts:121 getTaskOutputPath）</li>
      *   <li>isBackgrounded=true（后台任务，非前台）</li>
      * </ul>
      *
@@ -1268,15 +1281,15 @@ public class BackgroundTaskRunner {
      * @param workflowName     CC original: workflowName（meta.name，workflow 脚本名）
      * @param abortController  task-scoped AbortController（CC :79，kill 时 abort）
      * @param toolUseId        CC original: toolUseId（可空）
-     * @param createSessionId  创建会话 sessionId（cron-notify 透传，可空 → 回落全局）
+     * @param createSessionId  创建会话 sessionId（cron-notify 透传；[批 3b-D7] 必填）
      * @return 已注册的 BackgroundTask
      */
     public BackgroundTask registerWorkflowTask(
             String taskId, String description, String workflowName,
             @Nullable AbortController abortController, @Nullable String toolUseId,
-            @Nullable String createSessionId) {
+            String createSessionId) {
         // CC Task.ts:121 outputFile: getTaskOutputPath(id)
-        String outputFile = taskOutputPath(taskId);
+        String outputFile = taskOutputPath(createSessionId, taskId);
         // [IMP-G] G25① BackgroundTask 新增 exitCode/error/prompt/result 4 字段（TaskOutput 跟踪）——
         //   local_workflow 无进程 exit code / prompt（脚本已入内存），失败原因走 error（CC LocalWorkflowTaskState.error）。
         BackgroundTask task = new BackgroundTask(

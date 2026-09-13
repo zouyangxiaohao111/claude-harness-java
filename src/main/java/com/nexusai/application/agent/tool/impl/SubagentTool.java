@@ -616,8 +616,17 @@ public class SubagentTool implements Tool {
      * memoize 键（loadAgentsDir.ts:296）。
      *
      * <p>优先级：① ToolUseContext.sessionId（当前 turn 直接源）；② {@link RequestContext#sessionId()}
-     * （MDC，无 ctx 场景）；③ {@code workspaceDir} 兜底（无会话：JUnit/无 MDC 后台，生产=user.dir，
-     * 测试=注入 temp）。
+     * （MDC，无 ctx 场景 —— {@code listAgents()} / {@code agentRegistry()} / {@code prompt()} 三个
+     * <b>无会话入参</b>的公开访问器走此路）；③ {@code workspaceDir} 兜底（无会话：JUnit/后台，
+     * 生产=user.dir，测试=注入 temp）。
+     *
+     * <p><b>[批 3b 未决项 · 已登记]</b> ② 的 MDC 读点本批<b>未</b>删除：无 ctx 的三个公开访问器
+     * （{@code listAgents()} / {@code agentRegistry()} / {@code prompt()}）签名里没有会话参数，
+     * 删掉 ② 会让「按会话列 agent-defs」在这些路径退化为 workspaceDir（{@code SubagentToolPerSessionLoadTest}
+     * 6 个用例即锁该契约）。显式化需先把会话作为参数引入这三个访问器（同文件已有显式兄弟
+     * {@link #registryForSession(String)}）并改造其调用方（AgentsHandler / PostCompactAttachmentRestorer /
+     * prompt()）—— 属独立设计，见批 3b 报告「未决项」。有 ctx 的调用点（executeAsync 等）已全部
+     * 走 ① 显式源。
      *
      * <p><b>[REWORK-1] 有会话 → 冻结发现键（非动态 sessionCwd）</b>：{@link #sessionDiscoveryCwdFor} 会话
      * 首访问捕获一次（锚 L3 boundProject = CC 启动目录），此后恒定 —— 会话内 bash cd / worktree 进入
@@ -3993,9 +4002,14 @@ public class SubagentTool implements Tool {
      * @return 父完整有效 system prompt；不可重建 → 旧路径产物
      */
     private String buildForkParentFallbackSystemPrompt(ToolUseContext ctx, AgentDefinition selectedAgent) {
-        String sessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
+        // [批 3b] sessionId 唯一源 = ctx.sessionId()（显式载体）；⛔ 不再读 RequestContext.sessionId()
+        //   （本方法在工具执行线程调用，MDC 取不到本会话）。
+        String sessionId = ctx != null ? ctx.sessionId() : null;
         if (sessionId == null || sessionId.isBlank()) {
-            sessionId = RequestContext.sessionId();
+            sessionId = null;
+            log.warn("[IMP-PA-FORK-03] buildForkParentFallbackSystemPrompt 无会话态：ctx={} 未携带 sessionId "
+                    + "（thread={}）→ 无法按会话取父 AgentState，回落旧路径",
+                ctx == null ? "null" : "sessionId=null", Thread.currentThread().getName());
         }
         AgentState state = (sessionAgentStateRegistry != null && sessionId != null && !sessionId.isBlank())
             ? sessionAgentStateRegistry.get(sessionId) : null;

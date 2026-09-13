@@ -1,6 +1,5 @@
 package com.nexusai.application.agent.mcp;
 
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -8,7 +7,6 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Supplier;
 
 /**
  * 会话态 channel 白名单注册表（--channels 等价物）· 对齐 CC bootstrap/state.ts。
@@ -23,8 +21,14 @@ import java.util.function.Supplier;
  * {@link List#of()}（空表），消费方（gate 门序[3 session]）在空表下恒 SESSION skip——
  * 安全默认与 CC「server 必须显式列入 --channels 才注册 handler」一致（channelNotification.ts:247-257）。
  *
- * <p>请求上下文解析：{@link #currentRequestSupplier()} 经 {@link RequestContext#sessionId()}
- * （SLF4J MDC，RequestContext.java:52）解析当前 web 请求的会话；无会话上下文 → 空表 fail-closed。
+ * <p>会话解析：{@link #sessionLookup()} 返回 <b>sessionId → 白名单</b> 的显式查表器，
+ * 由调用方（{@link ChannelNotificationGate#gateChannelServer} 的第 4 参 sessionId）显式传入会话；
+ * 无会话（null/blank）→ 空表 fail-closed。
+ *
+ * <p><b>[批 3b]</b> 旧实现 {@code currentRequestSupplier()} 返回的 Supplier 在求值时读
+ * {@code RequestContext.sessionId()}（SLF4J MDC / ThreadLocal）——被 gate 在 connectWorker 池线程
+ * 求值，MDC 恒 null 或读到该池线程上一个任务残留的别会话 id（靠 McpToolPool 的 MDC 回放才「看起来
+ * 工作」）；用户铁律「会话态一律显式传参，回放不算合规」⇒ 改为显式 sessionId 查表。
  */
 @Component
 public class ChannelSessionAllowlist {
@@ -103,17 +107,17 @@ public class ChannelSessionAllowlist {
     }
 
     /**
-     * 当前请求会话的白名单 supplier · CC original: {@code getAllowedChannels()} 消费点
+     * 显式会话查表器 · CC original: {@code getAllowedChannels()} 消费点
      * （gate 门序[3 session]，channelNotification.ts:250）。
      *
-     * <p>经 {@link RequestContext#sessionId()}（MDC）解析当前 web 请求的会话；无会话上下文
-     * → 空表 fail-closed。{@link ChannelNotificationGate#setAllowedChannelsSupplier} 注入点
-     * 的消费语义 = CC {@code STATE.allowedChannels} 进程内可读（McpServerService.start:542 /
-     * startEnabledBatch:653 接线）。
+     * <p>返回 {@code sessionId → 白名单} 的纯函数（无隐式源、无 ThreadLocal、无回放）：
+     * 会话由调用方显式传入（{@link ChannelNotificationGate#gateChannelServer} 第 4 参）；
+     * null/blank/未写入 → 空表 fail-closed。注入点消费语义 = CC {@code STATE.allowedChannels}
+     * 进程内可读（McpServerService.start / startEnabledBatch 接线）。
      *
-     * @return 当前会话白名单；无会话/未写入 → 空表（恒非 null）
+     * @return sessionId → 该会话白名单（恒非 null 列表）
      */
-    public Supplier<List<ChannelAllowlist.ChannelEntry>> currentRequestSupplier() {
-        return () -> getForSession(RequestContext.sessionId());
+    public java.util.function.Function<String, List<ChannelAllowlist.ChannelEntry>> sessionLookup() {
+        return this::getForSession;
     }
 }

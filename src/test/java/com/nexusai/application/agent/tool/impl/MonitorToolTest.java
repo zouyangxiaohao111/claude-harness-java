@@ -142,7 +142,8 @@ class MonitorToolTest {
         assertThat(registered.agentId()).isEqualTo(agentId);
 
         // 独立线程 monitor 真正启动：outputFile 被观测行写入（streaming-only 运行期增长）
-        String outputFile = runner.outputFileFor(taskId);
+        // [批 3b-D7] 输出根所属会话 = 本工具 ctx 的会话（MonitorTool.execute 显式透传）
+        String outputFile = runner.outputFileFor(ctx.sessionId(), taskId);
         Path out = Path.of(outputFile);
         try {
             awaitUntil(() -> {
@@ -216,7 +217,9 @@ class MonitorToolTest {
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
         BackgroundTaskRunner brRunner = new BackgroundTaskRunner(nq, service, sdk);
 
-        String taskId = runner.registerTask("mcp-watch", "tu-1", null);
+// [批 3b-D7] 显式会话（本用例直调 runner，须显式给；生产经 MonitorTool 从 ctx.sessionId() 透传）
+        String runnerSession = "sess-monitor-tool-3b";
+        String taskId = runner.registerTask("mcp-watch", "tu-1", null, runnerSession);
         // monitor 任务仅在 store，不在 runner 本地 map（S4 前置确认：getTask 只查本地 map）
         assertThat(brRunner.getTask(taskId)).as("monitor 任务不落 runner 本地 map").isEmpty();
 

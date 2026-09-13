@@ -14,9 +14,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -115,7 +117,8 @@ class RemoteAgentTaskServiceTest {
         projectRoot = java.nio.file.Files.createDirectories(tempDir.resolve("proj"));
         com.nexusai.common.SessionProjectRoot.setForSession(CREATING_SESSION, projectRoot.toString());
         service = new RemoteAgentTaskService(framework, notifications, sdkEvents, api,
-            com.nexusai.common.SessionProjectRoot::getForSession, () -> tempDir.resolve("output"),
+            com.nexusai.common.SessionProjectRoot::getForSession,
+            (String sid) -> tempDir.resolve("output"),
             scheduler, 15L); // 15ms 加速轮询
     }
 
@@ -130,6 +133,107 @@ class RemoteAgentTaskServiceTest {
     /** sidecar 会话目录 = {projectRoot}/{creatingSession}（sessionDirFor 契约）。 */
     private Path sidecarDir(String creatingSessionId) {
         return projectRoot.resolve(creatingSessionId);
+    }
+
+    /**
+     * [批 3b] creatingSessionId 是本地创建会话的<b>唯一显式源</b>（旧实现在派生线程上回落
+     * {@code RequestContext.sessionId()} = MDC，恒 null 或读到池线程残留的别会话 id）。
+     * 本用例在真实派生线程上<b>故意</b>写残留 MDC（第三态），断言创建会话仍来自显式入参 ——
+     * 旧实现（读 MDC）必红：它会拿走残留会话。
+     */
+    @Test
+    @DisplayName("批 3b · 派生线程 + 残留 MDC：creatingSessionId 只认显式入参（不回落 MDC）")
+    void creatingSession_explicitOnly_notResidualMdc() throws Exception {
+        String explicit = "sess-remote-explicit-3b";
+        String stale = "sess-remote-stale-3b";
+        com.nexusai.common.SessionProjectRoot.setForSession(explicit, projectRoot.toString());
+        com.nexusai.common.SessionProjectRoot.setForSession(stale, projectRoot.toString());
+
+        AtomicReference<String> threadName = new AtomicReference<>();
+        AtomicReference<String> staleMdcSeen = new AtomicReference<>();
+        AtomicReference<RemoteAgentTaskService.RegisteredRemoteTask> reg = new AtomicReference<>();
+        ExecutorService derived = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "batch3b-remote");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            derived.submit(() -> {
+                threadName.set(Thread.currentThread().getName());
+                com.nexusai.common.RequestContext.set(stale, "msg-stale");
+                staleMdcSeen.set(com.nexusai.common.RequestContext.sessionId());
+                try {
+                    reg.set(service.registerRemoteAgentTask(
+                        new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.REMOTE_AGENT,
+                            "cse-remote-1", "部署", "claude -p 'x'", "tool-1", null, null, null, null, explicit)));
+                } finally {
+                    com.nexusai.common.RequestContext.clear();
+                }
+                return null;
+            }).get(10, java.util.concurrent.TimeUnit.SECONDS);
+        } finally {
+            derived.shutdownNow();
+        }
+
+        assertThat(threadName.get()).isNotEqualTo(Thread.currentThread().getName());
+        assertThat(staleMdcSeen.get()).as("前置条件：派生线程上有残留 MDC（第三态）").isEqualTo(stale);
+        assertThat(framework.getTask(reg.get().taskId()).orElseThrow().sessionId())
+            .as("创建会话必须来自显式 creatingSessionId；旧实现（读 MDC）会得到 %s", stale)
+            .isEqualTo(explicit);
+    }
+
+    /**
+     * [批 3b-D7 · 用户裁定「显式传参」] creatingSessionId=null ⇒ **fail-loud**（不再回落 MDC）。
+     *
+     * <p>WHY：该字段同时是<b>输出根所属会话</b>（taskOutputDirSupplier.apply(sessionId)）——
+     * 「null 回落全局」只对完成通知的路由成立，对输出目录不成立（文件必须落在某会话目录）。
+     * 旧实现读 MDC 会把任务归属到「池线程残留的别的会话」（静默串会话）。
+     * <b>已登记待裁定</b>：本入口零生产调用方（仅测试），若将来确有「无会话任务」需求需另行设计。
+     */
+    @Test
+    @DisplayName("批 3b-D7 · 输出根收到的会话 = 显式 creatingSessionId（null 也原样传；绝不回落 MDC）")
+    void creatingSession_nullForwardedAsNull_notResidualMdc() throws Exception {
+        // WHY：taskOutputDirSupplier 现是 Function<String,Path>，会话由本方法显式转发 —— 本用例在
+        //   真实派生线程上写「别的会话」的残留 MDC（第三态），断言转发给 supplier 的是**显式值**
+        //   （null 就传 null，由下游 taskOutputDir 缺值 fail-loud），而不是 MDC 里的残留会话。
+        String stale = "sess-remote-stale-3b";
+        com.nexusai.common.SessionProjectRoot.setForSession(stale, projectRoot.toString());
+        AtomicReference<String> forwardedSession = new AtomicReference<>("<未调用>");
+        RemoteAgentTaskService local = new RemoteAgentTaskService(framework, notifications, sdkEvents, api,
+            com.nexusai.common.SessionProjectRoot::getForSession,
+            (String sid) -> { forwardedSession.set(sid); return tempDir.resolve("output"); },
+            scheduler, 15L);
+
+        AtomicReference<String> threadName = new AtomicReference<>();
+        AtomicReference<String> staleMdcSeen = new AtomicReference<>();
+        ExecutorService derived = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "batch3b-remote-null");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            derived.submit(() -> {
+                threadName.set(Thread.currentThread().getName());
+                com.nexusai.common.RequestContext.set(stale, "msg-stale");
+                staleMdcSeen.set(com.nexusai.common.RequestContext.sessionId());
+                try {
+                    local.registerRemoteAgentTask(
+                        new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.REMOTE_AGENT,
+                            "cse-remote-2", "部署", "claude -p 'x'", "tool-1", null, null, null, null, null));
+                } finally {
+                    com.nexusai.common.RequestContext.clear();
+                }
+                return null;
+            }).get(10, java.util.concurrent.TimeUnit.SECONDS);
+        } finally {
+            derived.shutdownNow();
+        }
+
+        assertThat(threadName.get()).isNotEqualTo(Thread.currentThread().getName());
+        assertThat(staleMdcSeen.get()).as("前置条件：派生线程上有残留 MDC（第三态）").isEqualTo(stale);
+        assertThat(forwardedSession.get())
+            .as("输出根收到的会话必须 = 显式值（null）；旧实现（读 MDC）会收到 %s", stale)
+            .isNull();
     }
 
     private RemoteAgentTaskService.RegisterOptions options(String sessionId, String title) {
@@ -526,7 +630,7 @@ class RemoteAgentTaskServiceTest {
     @DisplayName("poll: isLongRunning 跳过 result 判完成，继续轮询（CC :610）")
     void pollSkipsResultForLongRunning() throws Exception {
         var opts = new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.REMOTE_AGENT,
-            "sess-1", "监控", "claude -p 'watch'", "tool-1", null, null, Boolean.TRUE, null, null);
+            "sess-1", "监控", "claude -p 'watch'", "tool-1", null, null, Boolean.TRUE, null, CREATING_SESSION);
         RemoteAgentTaskService.RegisteredRemoteTask reg = service.registerRemoteAgentTask(opts);
         // 返回 result(success) — isLongRunning 应跳过，不完成
         api.pollQueue.add(new RemoteSessionsApi.PollResult(
@@ -549,7 +653,7 @@ class RemoteAgentTaskServiceTest {
         try {
             var opts = new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.AUTOFIX_PR,
                 "sess-1", "PR 任务", "claude -p 'fix'", "tool-1", null, null, null,
-                new java.util.HashMap<>(Map.of("owner", "acme", "repo", "repo1", "prNumber", 7)), null);
+                new java.util.HashMap<>(Map.of("owner", "acme", "repo", "repo1", "prNumber", 7)), CREATING_SESSION);
             RemoteAgentTaskService.RegisteredRemoteTask reg = service.registerRemoteAgentTask(opts);
             // tick1: merged=false → null 继续轮询；tick2: merged=true → 完成
             api.pollQueue.add(new RemoteSessionsApi.PollResult(List.of(), "e1", "idle", null));

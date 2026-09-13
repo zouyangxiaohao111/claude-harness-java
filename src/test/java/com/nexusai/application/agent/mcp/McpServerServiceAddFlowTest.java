@@ -90,7 +90,7 @@ class McpServerServiceAddFlowTest {
         tokenService = Mockito.mock(McpOAuthTokenService.class);
         ReflectionTestUtils.setField(service, "mcpOAuthTokenService", tokenService);
         McpToolPool pool = Mockito.mock(McpToolPool.class);
-        when(pool.assembleToolPool(Mockito.anyString(), Mockito.any())).thenReturn(List.of());
+        when(pool.assembleToolPool(Mockito.anyString(), Mockito.any(), Mockito.any())).thenReturn(List.of());
         when(pool.fetchMcpSkills(Mockito.anyString())).thenReturn(List.of());
         ReflectionTestUtils.setField(service, "mcpToolPool", pool);
         ReflectionTestUtils.setField(service, "mcpTransportFactory",

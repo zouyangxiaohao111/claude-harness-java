@@ -18,6 +18,7 @@ import java.util.Locale;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -63,6 +64,9 @@ import static org.mockito.Mockito.mock;
 @DisplayName("[R-A7/方案B] BackgroundTaskRunner outputFile 路径对齐 CC 五层 getTaskOutputDir")
 class BackgroundTaskRunnerTest {
 
+    /** [批 3b-D7] workflow 任务的显式创建会话（旧实现由下游读 MDC）。 */
+    private static final String WF_SESSION = "sess-wf-3b-fixture";
+
     private final TaskFrameworkService framework = new TaskFrameworkService(null);
     private final BackgroundTaskRunner runner = new BackgroundTaskRunner(
         mock(NotificationQueue.class), framework);
@@ -94,7 +98,7 @@ class BackgroundTaskRunnerTest {
         RequestContext.setSession(sessionId);
         String taskId = "a12345678";
 
-        String path = BackgroundTaskRunner.taskOutputPath(taskId);
+        String path = BackgroundTaskRunner.taskOutputPath(sessionId, taskId);
 
         assertThat(path).as("必须为 CC 五层格式（per-user + per-project + per-session + tasks + .output）")
             .isEqualTo(expectedFiveLayerPath(sessionId, taskId));
@@ -109,7 +113,7 @@ class BackgroundTaskRunnerTest {
         // WHY（方案B 意图，规则九）：CC 唯一 diskOutput 机制 getTaskOutputDir = join(getProjectTempDir(),
         //   getSessionId(), 'tasks')（diskOutput.ts:50-55）；getProjectTempDir = join(getClaudeTempDir(),
         //   sanitizePath(getOriginalCwd()))（filesystem.ts:376-378）。所有后台任务类型共用唯一根。
-        //   Java taskOutputDir() 即唯一根锚点：MonitorMcpTaskRunner.defaultOutputFile 与
+        //   Java taskOutputDir(sessionId) 即唯一根锚点：MonitorMcpTaskRunner.defaultOutputFile 与
         //   RemoteTaskConfiguration.taskOutputDirSupplier 都收敛到它（旧 monitor flat 根 {tmpdir}/nexusai-tasks
         //   + remote 项目目录根已删）。本测试逐段锁死五层形态（temp + per-user + per-project + per-session + tasks），
         //   回归即变红。
@@ -117,7 +121,7 @@ class BackgroundTaskRunnerTest {
         RequestContext.setSession(sessionId);
         try {
             String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
-            String dir = BackgroundTaskRunner.taskOutputDir();
+            String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
             Path p = Path.of(dir);
             // 五层逐段：.../tasks(⑤) ← sessionId(④) ← sanitizedCwd(③) ← {appName}[-{uid}](②) ← tmpRoot(①)
             assertThat(p.getName(p.getNameCount() - 1).toString()).isEqualTo("tasks");
@@ -131,36 +135,46 @@ class BackgroundTaskRunnerTest {
             // 不含 taskId 文件名（目录 vs 文件语义分离，对齐 CC getTaskOutputDir 返回目录）
             assertThat(dir).doesNotEndWith(".output");
             // 与 taskOutputPath 的关系：taskOutputPath = taskOutputDir + <taskId>.output
-            assertThat(BackgroundTaskRunner.taskOutputPath("tid-b"))
-                .isEqualTo(Paths.get(BackgroundTaskRunner.taskOutputDir(), "tid-b.output").toString());
+            assertThat(BackgroundTaskRunner.taskOutputPath(sessionId, "tid-b"))
+                .isEqualTo(Paths.get(BackgroundTaskRunner.taskOutputDir(sessionId), "tid-b.output").toString());
         } finally {
             RequestContext.clear();
         }
     }
 
     @Test
-    @DisplayName("taskOutputPath sessionId 回退链：RequestContext → nexusai.sessionId sysprop → unknown")
-    void taskOutputPath_sessionIdFallbackChain() {
-        // WHY: CC getSessionId（bootstrap/state.ts:431-433）进程级 sessionId 恒非 null；Java 无单例会话，
-        //   以 MDC（RequestContext）为主源，回退 sysprop（对齐 tasks.ts:209），再回退 "unknown"（fail-closed）。
+    @DisplayName("[批 3b-D7] taskOutputPath 会话态只认显式入参；缺值 fail-loud（MDC/sysprop/unknown 三源已删）")
+    void taskOutputPath_explicitSessionOnly_failsLoudWhenAbsent() {
+        // WHY（规则十二 · 显式失败）：旧实现三源兜底 —— MDC（派生线程恒 null/残留别会话）→ sysprop
+        //   （全局单值，多会话撞车）→ "unknown"（伪造会话 id）。CC 的等价物是 STATE 进程单例
+        //   （bootstrap/state.ts:431-433），Java 多会话**没有**对应物 ⇒ 只能显式传参，缺值必须暴露。
         String taskId = "a12345678";
 
-        // 主源：MDC 优先
-        RequestContext.setSession("mdc-sess");
-        assertThat(BackgroundTaskRunner.taskOutputPath(taskId))
-            .isEqualTo(expectedFiveLayerPath("mdc-sess", taskId));
+        assertThat(BackgroundTaskRunner.taskOutputPath("explicit-sess", taskId))
+            .as("显式会话生效（五层镜像期望）")
+            .isEqualTo(expectedFiveLayerPath("explicit-sess", taskId));
 
-        // 回退 1：sysprop
-        RequestContext.clear();
-        System.setProperty("nexusai.sessionId", "sysprop-sess");
-        assertThat(BackgroundTaskRunner.taskOutputPath(taskId))
-            .isEqualTo(expectedFiveLayerPath("sysprop-sess", taskId));
+        // 反向对照：线程上有 MDC / sysprop 也不再被采用（旧实现二者都会生效）
+        RequestContext.setSession("mdc-should-not-win");
+        System.setProperty("nexusai.sessionId", "sysprop-should-not-win");
+        try {
+            assertThat(BackgroundTaskRunner.taskOutputPath("explicit-sess", taskId))
+                .as("显式入参必须胜出；旧实现（MDC 主源）会得到 mdc-should-not-win 的路径")
+                .isEqualTo(expectedFiveLayerPath("explicit-sess", taskId));
+            assertThat(BackgroundTaskRunner.taskOutputDir("explicit-sess"))
+                .as("taskOutputDir 同理只认显式会话")
+                .isEqualTo(Paths.get(expectedFiveLayerPath("explicit-sess", taskId)).getParent().toString());
 
-        // 回退 2：unknown（fail-closed 占位）
-        RequestContext.clear();
-        System.clearProperty("nexusai.sessionId");
-        assertThat(BackgroundTaskRunner.taskOutputPath(taskId))
-            .isEqualTo(expectedFiveLayerPath("unknown", taskId));
+            assertThatThrownBy(() -> BackgroundTaskRunner.taskOutputPath(null, taskId))
+                .as("null 会话 → 抛（旧实现回落 MDC/sysprop/unknown）")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("sessionId");
+            assertThatThrownBy(() -> BackgroundTaskRunner.taskOutputDir("   "))
+                .isInstanceOf(IllegalArgumentException.class);
+        } finally {
+            RequestContext.clear();
+            System.clearProperty("nexusai.sessionId");
+        }
     }
 
     @Test
@@ -178,7 +192,7 @@ class BackgroundTaskRunnerTest {
             String expectedLayer = os.contains("windows")
                 ? NexusaiPaths.getAppName()
                 : NexusaiPaths.getAppTempDirName(); // = {appName}-{uid}（uid 经现取，不硬编码）
-            String dir = BackgroundTaskRunner.taskOutputDir();
+            String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
             String perUserSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 4).toString();
             assertThat(perUserSegment).as("② per-user 段必须与 NexusaiPaths 平台分支一致").isEqualTo(expectedLayer);
         } finally {
@@ -198,9 +212,9 @@ class BackgroundTaskRunnerTest {
         SessionCwdHolder.setOriginalCwd(sessionB, "C:\\dev\\projectB");
         try {
             RequestContext.setSession(sessionA);
-            String dirA = BackgroundTaskRunner.taskOutputDir();
+            String dirA = BackgroundTaskRunner.taskOutputDir(sessionA);
             RequestContext.setSession(sessionB);
-            String dirB = BackgroundTaskRunner.taskOutputDir();
+            String dirB = BackgroundTaskRunner.taskOutputDir(sessionB);
             assertThat(dirA).as("不同项目 originalCwd 必须产出不同输出目录").isNotEqualTo(dirB);
             assertThat(Path.of(dirA).getName(Path.of(dirA).getNameCount() - 3).toString())
                 .as("③ per-project 段 = sanitizePath(originalCwd)").isEqualTo("C--dev-projectA");
@@ -221,7 +235,7 @@ class BackgroundTaskRunnerTest {
         SessionCwdHolder.setOriginalCwd(sessionId, "C:\\Users\\dev\\my project");
         RequestContext.setSession(sessionId);
         try {
-            String dir = BackgroundTaskRunner.taskOutputDir();
+            String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
             String projectSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 3).toString();
             assertThat(projectSegment)
                 .as("③ per-project 段不得含路径分隔符/冒号残留，替换为 '-'")
@@ -233,7 +247,7 @@ class BackgroundTaskRunnerTest {
     }
 
     @Test
-    @DisplayName("registerAsyncAgent outputFile = taskOutputPath(agentId)（CC LocalAgentTask.tsx:488 → Task.ts:121）")
+    @DisplayName("registerAsyncAgent outputFile = taskOutputPath(sessionId, agentId)（CC LocalAgentTask.tsx:488 → Task.ts:121）")
     void registerAsyncAgent_outputFileUsesHierarchicalPath() {
         // WHY: CC registerAsyncAgent createTaskStateBase → Task.ts:121 outputFile: getTaskOutputPath(id)，
         //   taskId===agentId 合一。旧 Java 硬编码 /tmp/agent-{taskId}.out 已删除（A-7 拍板）。
@@ -243,17 +257,17 @@ class BackgroundTaskRunnerTest {
         String taskId = agentId.toString();
 
         BackgroundTask task = runner.registerAsyncAgent(
-            agentId, "异步任务", "prompt", "general-purpose", null, null);
+            agentId, "异步任务", "prompt", "general-purpose", null, sessionId);
 
         assertThat(task.outputFile())
             .as("async agent 任务 outputFile 必须为 CC 五层格式")
-            .isEqualTo(BackgroundTaskRunner.taskOutputPath(taskId));
+            .isEqualTo(BackgroundTaskRunner.taskOutputPath(sessionId, taskId));
         assertThat(task.outputFile()).isEqualTo(expectedFiveLayerPath(sessionId, taskId));
         assertThat(task.outputFile()).doesNotContain("/tmp/agent-");
     }
 
     @Test
-    @DisplayName("registerAgentForeground outputFile = taskOutputPath(agentId)（CC LocalAgentTask.tsx:553 → Task.ts:121）")
+    @DisplayName("registerAgentForeground outputFile = taskOutputPath(sessionId, agentId)（CC LocalAgentTask.tsx:553 → Task.ts:121）")
     void registerAgentForeground_outputFileUsesHierarchicalPath() {
         // WHY: CC registerAgentForeground createTaskStateBase → Task.ts:121 outputFile: getTaskOutputPath(id)，
         //   taskId===agentId 合一。旧 Java 硬编码 /tmp/agent-{taskId}.out 已删除（A-7 拍板）。
@@ -263,11 +277,11 @@ class BackgroundTaskRunnerTest {
         String taskId = agentId.toString();
 
         BackgroundTask task = runner.registerAgentForeground(
-            agentId, "前台任务", "prompt", "general-purpose", null);
+            agentId, "前台任务", "prompt", "general-purpose", sessionId);
 
         assertThat(task.outputFile())
             .as("前台 agent 任务 outputFile 必须为 CC 五层格式")
-            .isEqualTo(BackgroundTaskRunner.taskOutputPath(taskId));
+            .isEqualTo(BackgroundTaskRunner.taskOutputPath(sessionId, taskId));
         assertThat(task.outputFile()).isEqualTo(expectedFiveLayerPath(sessionId, taskId));
         assertThat(task.outputFile()).doesNotContain("/tmp/agent-");
     }
@@ -283,7 +297,7 @@ class BackgroundTaskRunnerTest {
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
         BackgroundTask task = runner.registerAsyncAgent(
-            agentId, "写输出", "prompt", "general-purpose", null, null);
+            agentId, "写输出", "prompt", "general-purpose", null, sessionId);
 
         runner.completeAsyncAgent(taskId,
             AsyncAgentResult.success("总结文本", 3, 120L, taskId, 42L, AgentUsage.EMPTY));
@@ -305,7 +319,7 @@ class BackgroundTaskRunnerTest {
     @Test
     @DisplayName("W-4b registerWorkflowTask 注册 LOCAL_WORKFLOW 任务（对齐 LocalWorkflowTask.tsx:53-83）")
     void registerWorkflowTask_registersLocalWorkflowTask() {
-        BackgroundTask task = runner.registerWorkflowTask("w-test-1", "spec 工作流", "spec", null, null, null);
+        BackgroundTask task = runner.registerWorkflowTask("w-test-1", "spec 工作流", "spec", null, null, WF_SESSION);
 
         assertThat(task.type()).isEqualTo(TaskType.LOCAL_WORKFLOW);
         assertThat(task.status()).isEqualTo(BackgroundTaskStatus.RUNNING);
@@ -320,7 +334,7 @@ class BackgroundTaskRunnerTest {
     @Test
     @DisplayName("W-4b completeWorkflowTask 推进终态（对齐 LocalWorkflowTask.tsx:85-96 无条件覆盖）")
     void completeWorkflowTask_advancesToCompleted() {
-        runner.registerWorkflowTask("w-test-2", "spec", "spec", null, null, null);
+        runner.registerWorkflowTask("w-test-2", "spec", "spec", null, null, WF_SESSION);
         runner.completeWorkflowTask("w-test-2");
 
         BackgroundTask completed = runner.getTask("w-test-2").orElseThrow();
@@ -332,7 +346,7 @@ class BackgroundTaskRunnerTest {
     @Test
     @DisplayName("W-4b failWorkflowTask 推进失败态（对齐 LocalWorkflowTask.tsx:98-111）")
     void failWorkflowTask_advancesToFailed() {
-        runner.registerWorkflowTask("w-test-3", "spec", "spec", null, null, null);
+        runner.registerWorkflowTask("w-test-3", "spec", "spec", null, null, WF_SESSION);
         runner.failWorkflowTask("w-test-3");
 
         BackgroundTask failed = runner.getTask("w-test-3").orElseThrow();
@@ -344,7 +358,7 @@ class BackgroundTaskRunnerTest {
     @DisplayName("W-4b killWorkflowTask only-if-running 守卫 + abort 控制器（对齐 LocalWorkflowTask.tsx:117-132）")
     void killWorkflowTask_guardsRunningAndAbortsController() {
         AbortController abort = new AbortController();
-        runner.registerWorkflowTask("w-test-4", "spec", "spec", abort, null, null);
+        runner.registerWorkflowTask("w-test-4", "spec", "spec", abort, null, WF_SESSION);
 
         assertThat(runner.killWorkflowTask("w-test-4")).isTrue();
         BackgroundTask killed = runner.getTask("w-test-4").orElseThrow();
@@ -360,7 +374,7 @@ class BackgroundTaskRunnerTest {
     @Test
     @DisplayName("W-4b stopTask LOCAL_WORKFLOW 分发 kill（对齐 stopTask.ts:57-63 getTaskByType→LocalWorkflowTask.kill）")
     void stopTask_dispatchesLocalWorkflowToKill() {
-        runner.registerWorkflowTask("w-test-5", "spec", "spec", null, null, null);
+        runner.registerWorkflowTask("w-test-5", "spec", "spec", null, null, WF_SESSION);
 
         BackgroundTaskRunner.StopTaskResult result = runner.stopTask("w-test-5");
 

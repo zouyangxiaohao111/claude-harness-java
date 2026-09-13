@@ -273,7 +273,7 @@ class SkillImprovementHookTest {
                 (skillName, updates) -> {},
                 tempDir);
 
-        CompletableFuture<Void> future = hook.applySkillImprovement("my-skill",
+        CompletableFuture<Void> future = hook.applySkillImprovement("sess-test-3b", "my-skill",
                 List.of(new SkillUpdate("new step", "ask energy", "user asked")));
         future.join();
 
@@ -296,7 +296,7 @@ class SkillImprovementHookTest {
                 (skillName, updates) -> {},
                 tempDir);
 
-        hook.applySkillImprovement("my-skill", List.of(new SkillUpdate("s", "c", "r"))).join();
+        hook.applySkillImprovement("sess-test-3b", "my-skill", List.of(new SkillUpdate("s", "c", "r"))).join();
 
         assertThat(Files.readString(skillMd)).isEqualTo("# Original content");
     }
@@ -312,7 +312,7 @@ class SkillImprovementHookTest {
                 (skillName, updates) -> {},
                 tempDir);
 
-        hook.applySkillImprovement("does-not-exist", List.of(new SkillUpdate("s", "c", "r"))).join();
+        hook.applySkillImprovement("sess-test-3b", "does-not-exist", List.of(new SkillUpdate("s", "c", "r"))).join();
 
         assertThat(Files.exists(tempDir.resolve(NexusaiPaths.getProjectDirName()).resolve("skills").resolve("does-not-exist"))).isFalse();
     }
@@ -629,7 +629,7 @@ class SkillImprovementHookTest {
                     (skillName, updates) -> {},
                     tempDir);
 
-            CompletableFuture<Void> future = hook.applySkillImprovement("my-skill",
+            CompletableFuture<Void> future = hook.applySkillImprovement("sess-test-3b", "my-skill",
                     List.of(new SkillUpdate("s", "c", "r")));
             // 旧实现: 异常进 future → join 抛 CompletionException (RED); 对齐后恒正常完成
             future.join();
@@ -649,7 +649,7 @@ class SkillImprovementHookTest {
     /**
      * WHY: [IMP-HOOKS-S8 CCJ-HOOKS-T8-05] apply 路径基准调用时求值 — CC getCwd() 每次 apply
      * 动态求值 (skillImprovement.ts:198); 旧实现构造期冻结 Path 字段. 经 package-private
-     * Supplier<Path> 构造, 构造后切换基准, apply 必须写新目录.
+     * Function&lt;sessionId, Path&gt; 构造, 构造后切换基准, apply 必须写新目录.
      */
     @Test
     @DisplayName("apply 路径基准调用时求值: 构造后换 baseDir, apply 写新目录 (CCJ-HOOKS-T8-05)")
@@ -667,13 +667,13 @@ class SkillImprovementHookTest {
                 ctx -> Optional.empty(),
                 new Telemetry(),
                 (skillName, updates) -> {},
-                currentBase::get,
+                sid -> currentBase.get(),
                 null,
                 false);
 
         // 构造后切换基准 → apply 必须用调用时刻的 cwd (旧冻结字段会写 dirA)
         currentBase.set(dirB);
-        hook.applySkillImprovement("my-skill", List.of(new SkillUpdate("s", "c", "r"))).join();
+        hook.applySkillImprovement("sess-test-3b", "my-skill", List.of(new SkillUpdate("s", "c", "r"))).join();
 
         assertThat(Files.readString(skillDirB.resolve("SKILL.md"))).isEqualTo("# Rewritten");
         assertThat(Files.readString(skillDirA.resolve("SKILL.md"))).isEqualTo("# A");
@@ -740,9 +740,9 @@ class SkillImprovementHookTest {
         // join 不抛 CompletionException → 守卫生效; 同时不创建任何 .claude/skills 目录
         // P2-17 补显式空串 "": CC falsy 检查 (!skillName, skillImprovement.ts:192) 对 "" 也为真,
         // 由 Java isBlank() 覆盖; 显式断言使其成为空串回归锚点 (C2 复用现有测试, 不新建重复测试类)
-        hook.applySkillImprovement(null, List.of(new SkillUpdate("s", "c", "r"))).join();
-        hook.applySkillImprovement("", List.of(new SkillUpdate("s", "c", "r"))).join();
-        hook.applySkillImprovement("   ", List.of(new SkillUpdate("s", "c", "r"))).join();
+        hook.applySkillImprovement("sess-test-3b", null, List.of(new SkillUpdate("s", "c", "r"))).join();
+        hook.applySkillImprovement("sess-test-3b", "", List.of(new SkillUpdate("s", "c", "r"))).join();
+        hook.applySkillImprovement("sess-test-3b", "   ", List.of(new SkillUpdate("s", "c", "r"))).join();
 
         assertThat(tempDir.resolve(NexusaiPaths.getProjectDirName()).resolve("skills")).doesNotExist();
     }

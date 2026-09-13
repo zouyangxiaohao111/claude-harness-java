@@ -80,7 +80,7 @@ class TaskStopDispatchTest {
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             command, "tu-" + taskId, System.currentTimeMillis(), null, null,
             tempDir.resolve(taskId + ".out").toString(), 0L, false, null, false);
-        ctx.runner.spawn(task, command, null);
+        ctx.runner.spawn(task, command, "sess-stop-3b-fixture"); // [批 3b-D7] createSessionId 必填
 
         // 平台容错重试：Windows JVM 无法解析 /bin/sh（LocalBashTaskRunner 硬编码 /bin/sh）时任务
         //   自失败 → NOT_RUNNING → assume skip；Linux（真实部署环境）sleep 30 保证 RUNNING → 全断言。
@@ -133,7 +133,7 @@ class TaskStopDispatchTest {
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             command, "tu-" + taskId, System.currentTimeMillis(), null, null,
             tempDir.resolve(taskId + ".out").toString(), 0L, false, null, false);
-        ctx.runner.spawn(task, command, null);
+        ctx.runner.spawn(task, command, "sess-stop-3b-fixture"); // [批 3b-D7] createSessionId 必填
 
         awaitUntil(() -> Files.exists(pidFile), "bash 子进程 PID 文件写出");
         long pid = Long.parseLong(Files.readString(pidFile).trim());
@@ -157,7 +157,8 @@ class TaskStopDispatchTest {
         Ctx ctx = newCtx();
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
-        ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", "general-purpose", null, null);
+        ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", "general-purpose", null,
+            "sess-stop-3b-fixture");
 
         BackgroundTaskRunner.StopTaskResult result = ctx.runner.stopTask(taskId);
 
@@ -220,7 +221,8 @@ class TaskStopDispatchTest {
         Ctx ctx = newCtx();
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
-        ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", "general-purpose", null, null);
+        ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", "general-purpose", null,
+            "sess-stop-3b-fixture");
         ctx.runner.completeAsyncAgent(taskId, AsyncAgentResult.success("结论", 1, 10L, "agent-x"));
 
         BackgroundTaskRunner.StopTaskResult result = ctx.runner.stopTask(taskId);
@@ -283,7 +285,7 @@ class TaskStopDispatchTest {
         com.nexusai.application.agent.remote.RemoteAgentTaskService svc =
             new com.nexusai.application.agent.remote.RemoteAgentTaskService(
                 service, nq, sdk, api, com.nexusai.common.SessionProjectRoot::getForSession,
-                () -> tempDir.resolve("out"), scheduler, 50L);
+                (String sid) -> tempDir.resolve("out"), scheduler, 50L);
         runner.setRemoteAgentTaskService(svc);
         return new RemoteCtx(runner, nq, sdk, service, svc, api, scheduler);
     }
@@ -357,7 +359,7 @@ class TaskStopDispatchTest {
             taskId, TaskType.IN_PROCESS_TEAMMATE, BackgroundTaskStatus.RUNNING,
             command, null, System.currentTimeMillis(), null, null,
             tempDir.resolve(taskId + ".out").toString(), 0L, false, null, false);
-        ctx.runner.spawn(task, command, null); // spawn 不校验 type，作为 RUNNING 的非 bash/agent 任务
+        ctx.runner.spawn(task, command, "sess-stop-3b-fixture"); // [批 3b-D7] createSessionId 必填 // spawn 不校验 type，作为 RUNNING 的非 bash/agent 任务
 
         BackgroundTaskRunner.StopTaskResult result = ctx.runner.stopTask(taskId);
         assertThat(result.errorCode()).isEqualTo(BackgroundTaskRunner.StopTaskErrorCode.UNSUPPORTED_TYPE);
