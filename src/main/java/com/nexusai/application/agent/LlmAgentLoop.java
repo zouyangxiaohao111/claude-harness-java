@@ -5525,6 +5525,52 @@ public class LlmAgentLoop implements AgentLoop {
                 // 泄漏到下一 turn。构建失败返回 null → 跳过 fork 缓存共享（不阻断压缩）。
                 CacheSafeParams compactCacheSafeParams = buildCompactCacheSafeParams(params, state);
                 CacheSafeParamsHolder.save(compactCacheSafeParams);
+                // ── [auto-compact 可中断 2026-09-13] 补齐「摘要断流源 + 会话级 Esc 桥」两条 abort 通道 ──
+                // WHY（要修的缺陷）：auto 路径此前只注册了进度推送（run() :2314 register），两条 abort
+                //   通道全空 → ① 摘要 streamCompactSummary 的 abortControllerSupplier
+                //   （ToolRegistrationConfig:1107 = {@code CompactProgressState.currentAbort()}）恒取到
+                //   null → 回落 NOOP → 自动压缩不可中断；② 前端停止键/Esc 走
+                //   ChatService.cancelSession:1929 {@code abortForSession(sid)} → sessionAborts 无本会话
+                //   → false。手动 /compact（ToolRegistrationConfig:2454-2455）与 partial
+                //   （PartialCompactService:470-471）两条路径均已注册 → 本处补齐第三条，判据同源。
+                //
+                // AbortController 来源（真源核实 · <b>不新建</b>）：本 run 级控制器 ——
+                //   {@code params.toolUseContext().abortController()}（LlmAgentLoop.run 构造并
+                //   state.attachAbortController 的那个 runAbortController，:2663/:2667，经
+                //   buildBaseToolUseContext :9609 进入 base TUC），亦即在
+                //   {@code CompactConversation.buildAutoContext} :603 写进 ccCtx 的<b>同一实例</b>。
+                //   对齐 CC：compactConversation 全链读 {@code context.abortController.signal}
+                //   （claude-code-best/services/compact/compact.ts:442 pre-hooks / :757 post-hooks /
+                //   :1237 fork 子查询 / :1347 摘要流式请求），且 autoCompactIfNeeded 把同一
+                //   toolUseContext 透传进 compactConversation（services/compact/autoCompact.ts:342-344）
+                //   —— CC 侧「压缩」与「主查询」共用同一控制器。本仓 AutoCompactor 自身既不持有也不
+                //   新建 AbortController（全类 0 命中），可中断源只能取调用方 TUC。
+                //   与 manual/partial 新建 {@code new AbortController()} 的差异是有意的：那两条跑在
+                //   <b>无 run 控制器</b>的 REST 线程上（只能新建 + 会话级登记桥接），本路径在 run 内、
+                //   控制器已存在 → 直接接线（CC 语义），不新起第二套判据。
+                //
+                // NOOP 守卫（fail loud）：无 run 控制器时 base TUC 回落 AbortController.NOOP
+                //   （buildBaseToolUseContext）。NOOP 永不取消 → 注册它会让 abortForSession 恒返回
+                //   true 却什么也没 abort（假「已打断」信号）→ 显式跳过并留痕。
+                // 清理：下方 finally 按 manual 顺序 clearAbort → removeSessionAbort
+                //   （ToolRegistrationConfig:2510-2512）；进度推送槽（clear）不在本块注册，
+                //   由 run() :2314 注册 / :2326 清理成对负责。
+                com.nexusai.application.agent.tool.AbortController autoCompactAbort =
+                    params.toolUseContext() != null ? params.toolUseContext().abortController() : null;
+                boolean autoCompactAbortRegistered = autoCompactAbort != null
+                    && autoCompactAbort != com.nexusai.application.agent.tool.AbortController.NOOP;
+                if (autoCompactAbortRegistered) {
+                    com.nexusai.application.agent.compact.CompactProgressState.registerAbort(autoCompactAbort);
+                    com.nexusai.application.agent.compact.CompactProgressState
+                        .registerSessionAbort(state.sessionId(), autoCompactAbort);
+                    if (log.isDebugEnabled()) {
+                        log.debug("[auto-compact 可中断] 摘要断流源 + 会话级 Esc 桥已注册: sessionId={} abort={}",
+                            state.sessionId(), autoCompactAbort);
+                    }
+                } else if (log.isDebugEnabled()) {
+                    log.debug("[auto-compact 可中断] 无可用 AbortController（TUC 缺失或 NOOP）→ 不注册"
+                        + "（摘要不可中断 = 原行为，不回归）: sessionId={}", state.sessionId());
+                }
                 try {
                     // 结转测量源（DRIFT-12）= finalContextTokensFromLastResponse（tokens.ts:79 / Tokens.java:134），
                     // 非 beforeTurn pipeline 本地估算（beforeTurn 已随 CompactContext 删除）。
@@ -5629,6 +5675,16 @@ public class LlmAgentLoop implements AgentLoop {
                         }
                     }
                 } finally {
+                    // [auto-compact 可中断 2026-09-13] 与上方注册成对清理（顺序对齐 manual
+                    //   ToolRegistrationConfig:2510-2512 clearAbort → removeSessionAbort）。
+                    //   只在「本轮确实注册过」时清 —— 未注册（NOOP/无 TUC）时无条件 removeSessionAbort
+                    //   会把<b>另一线程</b>为同一会话注册的在飞压缩槽（如并发 manual /compact）
+                    //   误删，使那次压缩不再可中断。幂等：两处 remove 对未注册为空操作。
+                    if (autoCompactAbortRegistered) {
+                        com.nexusai.application.agent.compact.CompactProgressState.clearAbort();
+                        com.nexusai.application.agent.compact.CompactProgressState
+                            .removeSessionAbort(state.sessionId());
+                    }
                     CacheSafeParamsHolder.clear();
                 }
             }
@@ -7175,6 +7231,40 @@ public class LlmAgentLoop implements AgentLoop {
                         // 泄漏到下一 turn。构建失败返回 null → 仍传 null（缓存优化可选，不阻断压缩）。
                         CacheSafeParams reactiveCacheSafeParams = buildCompactCacheSafeParams(params, state);
                         CacheSafeParamsHolder.save(reactiveCacheSafeParams);
+                        // ── [reactive-compact 可中断 2026-09-13] 与 auto 压缩块（:5528-5569）同款补齐 ──
+                        // WHY：reactive 应急压缩与 auto 完全同构 —— 同样
+                        //   {@code buildAutoContext(params.toolUseContext(), …)}（:7219）取 ccCtx、
+                        //   同样 { 摘要回调 = StreamCompactSummary }（ReactiveCompactor.summaryProducer
+                        //   → compactCallback = 生产 bean streamCompactSummary，
+                        //   ToolRegistrationConfig:2178 装配；该 bean 的 abort supplier 即
+                        //   :1107 {@code () -> CompactProgressState.currentAbort()} ThreadLocal），
+                        //   同样跑在主循环线程（本块是 loop() 直落代码，无线程切换），
+                        //   同样<b>两条 abort 通道全空</b>。reactive 也是<b>自动</b>触发
+                        //   （PTL/media 错误恢复，非用户敲命令）→ 与 auto 属同一「自动压缩必须可被
+                        //   Esc 打断」族（用户裁定原文：「修，与手动 /compact 对齐」）。
+                        //   不补 ⇒ 摘要 supplier 取 null → NOOP；前端 Esc → abortForSession → false。
+                        // 判据/来源/NOOP 守卫/清理顺序与 auto 块逐条同源（含「只在确实注册过时才清」），
+                        //   详细 WHY 见 :5528-5558；此处不再重复。
+                        com.nexusai.application.agent.tool.AbortController reactiveCompactAbort =
+                            params.toolUseContext() != null
+                                ? params.toolUseContext().abortController() : null;
+                        boolean reactiveCompactAbortRegistered = reactiveCompactAbort != null
+                            && reactiveCompactAbort
+                                != com.nexusai.application.agent.tool.AbortController.NOOP;
+                        if (reactiveCompactAbortRegistered) {
+                            com.nexusai.application.agent.compact.CompactProgressState
+                                .registerAbort(reactiveCompactAbort);
+                            com.nexusai.application.agent.compact.CompactProgressState
+                                .registerSessionAbort(state.sessionId(), reactiveCompactAbort);
+                            if (log.isDebugEnabled()) {
+                                log.debug("[reactive-compact 可中断] 摘要断流源 + 会话级 Esc 桥已注册: "
+                                    + "sessionId={} abort={}", state.sessionId(), reactiveCompactAbort);
+                            }
+                        } else if (log.isDebugEnabled()) {
+                            log.debug("[reactive-compact 可中断] 无可用 AbortController（TUC 缺失或 NOOP）"
+                                + "→ 不注册（摘要不可中断 = 原行为，不回归）: sessionId={}",
+                                state.sessionId());
+                        }
                         try {
                         ReactiveCompactResult compacted =
                             ctx.reactiveCompactor().tryReactiveCompact(
@@ -7248,6 +7338,15 @@ public class LlmAgentLoop implements AgentLoop {
                             continue;
                         }
                         } finally {
+                            // [reactive-compact 可中断 2026-09-13] 与上方注册成对清理（顺序/条件与
+                            //   auto 块 :5675-5687 同源：clearAbort → removeSessionAbort，
+                            //   且只在确实注册过时才清 —— 未注册时无条件 remove 会误删另一线程为
+                            //   同一会话注册的在飞压缩槽）。幂等。
+                            if (reactiveCompactAbortRegistered) {
+                                com.nexusai.application.agent.compact.CompactProgressState.clearAbort();
+                                com.nexusai.application.agent.compact.CompactProgressState
+                                    .removeSessionAbort(state.sessionId());
+                            }
                             CacheSafeParamsHolder.clear();
                         }
                         // 恢复失败 → surface + STOP_FAILURE + 跳过 stop pipeline · CC query.ts:1168-1182

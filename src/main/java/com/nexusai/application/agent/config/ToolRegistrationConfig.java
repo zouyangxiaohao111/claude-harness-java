@@ -1100,9 +1100,15 @@ public class ToolRegistrationConfig {
         StreamCompactSummary summary = new StreamCompactSummary(
             suppliers.providerSupplier(), suppliers.modelSupplier(), suppliers.configSupplier(),
             cacheSafeParamsSupplier,
-            // [可中断 2026-09-04 · CC Esc] abort 源接当前压缩 AbortController：manual /compact
-            //   （handleCompactCommand registerAbort）与 auto（LlmAgentLoop）压缩期间注册 → 摘要
-            //   provider 硬断流（CC Esc 打断 compact.ts:126）。无当前压缩 → null → StreamCompactSummary
+            // [可中断 2026-09-04 · CC Esc] abort 源接当前压缩 AbortController：四条压缩路径均在压缩
+            //   期间 registerAbort —— manual /compact（本文件 :2454）/ partial
+            //   （PartialCompactService:470）/ auto（LlmAgentLoop auto 压缩块）/
+            //   reactive 应急压缩（LlmAgentLoop reactive 压缩块）——后两条 2026-09-13 补。
+            //   ⛔ 更正（2026-09-13）：本条原写作「manual 与 auto 均注册」，但 auto 侧当时<b>从未</b>
+            //   注册过（auto 路径两条 abort 通道全空 → 自动压缩实际不可中断）——是本仓「注释不可信」
+            //   的又一实例。两条自动压缩路径（auto / reactive）现已补齐，本条注释与代码一致。
+            //   取到 → 摘要 provider 硬断流（CC Esc 打断 commands/compact/compact.ts:135
+            //   'Compaction canceled.'）。无当前压缩 → null → StreamCompactSummary
             //   回落 NOOP（摘要不可中断 = 原行为，不回归）。
             () -> com.nexusai.application.agent.compact.CompactProgressState.currentAbort(),
             null,                 // sessionActivitySignalSupplier
