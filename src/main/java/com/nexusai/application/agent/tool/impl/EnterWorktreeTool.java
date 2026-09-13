@@ -413,9 +413,13 @@ public class EnterWorktreeTool implements Tool {
      * {@link #captureSessionOriginalCwd} 已捕获的前端传入目录（缺失回退 user.dir，与
      * Exit 侧 resolveOriginalCwd 回退一致）。
      *
-     * <p>transcript 定位：workspaceDir = {@code AutoMemPaths.currentSessionProjectRoot()}
-     * （会话 projectRoot 冻结 ThreadLocal，对齐 CommandHookExecutor.enrichBaseFields 的
-     * transcript_path 解析），sessionId = ctx.sessionId() UUID 串。
+     * <p>[TL-W2 P10] transcript 定位：workspaceDir = <b>会话绑定项目根</b>
+     * （{@code SessionProjectRoot.getForSession(sessionKey)}：按 sessionId 从全局冻结表现算，
+     * 未绑定 → null ⇒ 不落盘 —— 与读侧 ChatService.restoreWorktreeForResume 同一来源，读写锚
+     * 不再分裂）。旧实现取 {@code AutoMemPaths.currentSessionProjectRoot()}（ThreadLocal）：
+     * 工具体在 StreamingToolExecutor 池线程上靠回放才可见，未绑定会话回落 config home
+     * ⇒ 写错 slug 目录（读侧已不回落，两侧分裂）。
+     * sessionId = ctx.sessionId() UUID 串。
      */
     private void persistWorktreeState(ToolUseContext ctx, String sessionKey, String slug,
                                       Path worktreePath, String worktreeBranch, boolean hookBased) {
@@ -441,10 +445,18 @@ public class EnterWorktreeTool implements Tool {
         }
         session.put("sessionId", sessionKey);
         session.put("hookBased", hookBased);
-        java.nio.file.Path workspaceDir = java.nio.file.Paths.get(
-            com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
-        com.nexusai.application.agent.tool.SessionStorage.writeWorktreeState(
-            workspaceDir, sessionKey, session);
+        // [TL-W2 P10] 按 sessionKey 现算会话绑定项目根（SessionProjectRoot.getForSession：
+        //   未绑定 → null，绝不回落 config home）。null → transcript 不写（无项目 slug 可归），
+        //   但**内存 tracker 照常设**（本会话 worktree 状态继续生效）。
+        String boundProjectRoot = com.nexusai.common.SessionProjectRoot.getForSession(sessionKey);
+        if (boundProjectRoot == null || boundProjectRoot.isBlank()) {
+            log.warn("[EnterWorktreeTool] 跳过写 transcript worktree-state：会话 {} 无绑定项目根"
+                + "（不回落 config home；resume 侧同源解析也不会命中；内存 tracker 照常设）", sessionKey);
+        } else {
+            java.nio.file.Path workspaceDir = java.nio.file.Paths.get(boundProjectRoot);
+            com.nexusai.application.agent.tool.SessionStorage.writeWorktreeState(
+                workspaceDir, sessionKey, session);
+        }
         // [RESIDUAL-FIX 残留 2] 同步写 WorktreeCwdTracker 完整 worktree 会话对象
         //   （对齐 CC EnterWorktreeTool.ts:97 saveWorktreeState(worktreeSession) 同时更新
         //   currentWorktreeSession，Java 端 session 维度落 WorktreeCwdTracker.sessionWorktree）。

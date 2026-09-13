@@ -679,7 +679,8 @@ class AutoDreamConsolidatorTest {
         AtomicInteger rollbackCalls = new AtomicInteger();
         consolidator.setDreamTaskRegistry(registry);
         // setDreamTaskRegistry 已注入真实 ConsolidationLock seam；覆盖为计数 seam 以断言恰好一次
-        registry.setRollbackConsolidationLock(m -> rollbackCalls.incrementAndGet());
+        // [TL-W2 P9] seam 带 taskId（memoryDir 随任务显式携带）
+        registry.setRollbackConsolidationLock((taskId, m) -> rollbackCalls.incrementAndGet());
 
         consolidator.setForkedQuery((params) -> {
             // 模拟 TaskStop 分发：kill 刚注册的 dream 任务（abort + status=killed + rollback 一次）

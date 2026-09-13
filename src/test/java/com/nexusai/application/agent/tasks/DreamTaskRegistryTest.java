@@ -215,7 +215,8 @@ class DreamTaskRegistryTest {
         long priorMtime = 888L;
         String taskId = registry.registerDreamTask(1, priorMtime, abort);
         AtomicReference<Long> rolledBackMtime = new AtomicReference<>(-1L);
-        registry.setRollbackConsolidationLock(rolledBackMtime::set);
+        // [TL-W2 P9] seam 带 taskId（kill 线程不再现算 memoryDir）
+        registry.setRollbackConsolidationLock((killedTaskId, m) -> rolledBackMtime.set(m));
 
         boolean killed = registry.kill(taskId);
 
@@ -240,7 +241,7 @@ class DreamTaskRegistryTest {
         String taskId = registry.registerDreamTask(1, 777L, new AbortController());
         registry.completeDreamTask(taskId);
         AtomicInteger rollbackCalls = new AtomicInteger();
-        registry.setRollbackConsolidationLock(m -> rollbackCalls.incrementAndGet());
+        registry.setRollbackConsolidationLock((killedTaskId, m) -> rollbackCalls.incrementAndGet());
 
         boolean killed = registry.kill(taskId);
 

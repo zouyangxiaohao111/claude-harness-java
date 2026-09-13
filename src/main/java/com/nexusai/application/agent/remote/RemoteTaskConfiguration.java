@@ -5,7 +5,6 @@ import com.nexusai.application.agent.tasks.BackgroundTaskRunner;
 import com.nexusai.application.agent.tasks.NotificationQueue;
 import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Bean;
@@ -37,15 +36,16 @@ import java.util.function.Supplier;
  *   <li><b>红线豁免</b>：输出落点<b>不再</b>经 {@link AutoMemPaths#currentSessionProjectRoot()}
  *       （memory/身份域红线约束的是 projectRoot 解析来源，不是 task 输出落点）—— 只拆输出落点
  *       耦合，{@link AutoMemPaths#currentSessionProjectRoot()} 回落链本身不动。</li>
- *   <li><b>元数据 sidecar 留项目目录</b>（sessionDirSupplier 不变，对齐 CC sessionStorage.ts:320-328
- *       remote-agents/*.meta.json 在项目目录）—— 只迁输出文件根，不搬 sidecar。</li>
+ *   <li><b>元数据 sidecar 留项目目录</b>（{@link #sessionProjectRootResolver()}，对齐 CC
+ *       sessionStorage.ts:320-328 remote-agents/*.meta.json 在项目目录）—— 只迁输出文件根，
+ *       不搬 sidecar。</li>
  * </ul>
  *
  * <p>sessionDir 供 {@link RemoteAgentMetadataStore}（sidecar，项目目录）：sessionDir =
- * {projectRoot}/{sessionId}，projectRoot 取 {@link AutoMemPaths#currentSessionProjectRoot()}
- * （CC STATE.projectRoot 等价，会话线程 ThreadLocal，LlmAgentLoop.run() 入口注入），sessionId 取
- * {@link RequestContext#sessionId()}（MDC 线程上下文，ChatService 入口设置）。无会话上下文
- * （非会话线程）时回落 projectRoot（绝不含 java.io.tmpdir）。
+ * {projectRoot}/{sessionId}。<b>[TL-W2 P7]</b> projectRoot 按<b>任务 creatingSession 的 sessionId
+ * 现算</b>（{@link com.nexusai.common.SessionProjectRoot#getForSession}：未绑定 → null，绝不回落 config home、不读
+ * ThreadLocal；旧实现经 {@code Supplier<Path>} 在消费线程读
+ * {@link AutoMemPaths#currentSessionProjectRoot()}，REST kill 线程必空 → 落/删错目录）。
  */
 @Configuration
 public class RemoteTaskConfiguration {
@@ -84,39 +84,34 @@ public class RemoteTaskConfiguration {
             ScheduledExecutorService remotePollScheduler) {
         log.info("RemoteTaskConfiguration: creating RemoteAgentTaskService bean");
         // R1 返工：tmp 占位 → 真实会话目录（{projectRoot}/{sessionId}）
+        // [TL-W2 P7] sessionDir 解析由 Supplier<Path>（读 ThreadLocal）改 Function<sessionId, projectRoot>
         return new RemoteAgentTaskService(taskFrameworkService, notificationQueue,
             sdkEventQueue, remoteSessionsApi,
-            sessionDirSupplier(),
+            sessionProjectRootResolver(),
             taskOutputDirSupplier(),
             remotePollScheduler);
     }
 
     /**
-     * 真实会话目录 supplier（惰性求值 · 会话线程调用时解析）· <b>供元数据 sidecar</b>。
+     * [TL-W2 P7] sidecar 会话目录解析器 · <b>按 sessionId 现算</b>（不再经 ThreadLocal）。
      *
      * <p>对齐 CC sessionStorage.ts:320-329（sidecar 落 {projectDir}/{sessionId}/remote-agents）：
-     * 返回的 {@code sessionDir} = {projectRoot}/{sessionId}（本地会话目录），
-     * {@link RemoteAgentMetadataStore} 再拼 remote-agents 子目录。
+     * {@link RemoteAgentTaskService} 的 {@code sessionDirFor(sessionId)} 用本解析器取 projectRoot，
+     * 再拼 {@code /{sessionId}}（{@link RemoteAgentMetadataStore} 继续拼 remote-agents 子目录）。
      *
-     * <p><b>批次Y 红线豁免</b>：本 supplier 只承载 sidecar（元数据，留项目目录对齐 CC）；
-     * <b>输出文件根</b>已解耦到 {@link #taskOutputDirSupplier()}（temp 唯一根，不再经
-     * currentSessionProjectRoot）。AutoMemPaths.currentSessionProjectRoot() 回落链本身不动。
+     * <p><b>WHY 不再是旧 {@code sessionDirSupplier}（Supplier&lt;Path&gt;）</b>：旧实现在<b>消费线程</b>
+     * 读 {@link AutoMemPaths#currentSessionProjectRoot()}（ThreadLocal）—— kill 由 REST 线程链路调用
+     * （TaskController → BackgroundTaskRunner → {@link RemoteAgentTaskService#kill}）时 ThreadLocal
+     * 必空 ⇒ 回落 config home ⇒ remote-agents 元数据落错根/删错目录（审计 P7）。
+     * 现注入 <b>sessionId → projectRoot</b> 的纯函数（{@link com.nexusai.common.SessionProjectRoot#getForSession}：
+     * 未绑定返回 null，绝不回落 config home、不读 ThreadLocal）；未绑定 → 不落 sidecar。
      *
-     * <p>数据源（均 per-session 线程安全）：
-     * <ul>
-     *   <li>projectRoot = {@link AutoMemPaths#currentSessionProjectRoot()} — CC STATE.projectRoot
-     *       （bootstrap/state.ts:277-279）等价，会话线程 ThreadLocal，LlmAgentLoop.run() 入口注入；</li>
-     *   <li>sessionId   = {@link RequestContext#sessionId()} — MDC 线程上下文，ChatService 入口设置。</li>
-     * </ul>
-     * 无会话上下文（非会话线程：bean 构造期 / 启动线程）时回落 projectRoot，
-     * 绝不含 java.io.tmpdir 占位。
+     * <p><b>不可</b>改用 {@code SessionStorage.sessionProjectDir(sessionId)}：那是
+     * {@code {configHome}/projects/{slug}} 存储目录（transcript 锚），会把 sidecar 从项目目录搬到
+     * config home，破坏 sidecar 契约（sidecar 留项目目录）。
      */
-    private Supplier<Path> sessionDirSupplier() {
-        return () -> {
-            Path root = Path.of(AutoMemPaths.currentSessionProjectRoot());
-            String sid = RequestContext.sessionId();
-            return (sid != null && !sid.isBlank()) ? root.resolve(sid) : root;
-        };
+    private java.util.function.Function<String, String> sessionProjectRootResolver() {
+        return com.nexusai.common.SessionProjectRoot::getForSession;
     }
 
     /**
@@ -131,7 +126,8 @@ public class RemoteTaskConfiguration {
      *       projectRoot 解析来源解耦（红线豁免：projectRoot 回落链本身不动，只拆输出落点耦合）。
      *       旧 {@code {projectDir}/{sessionId}/tasks} 项目目录根 = CC 无对应的 Java 自创偏离，已删。</li>
      *   <li><b>sidecar 留项目目录</b>：本 supplier 只管输出文件根；元数据 sidecar 仍由
-     *       {@link #sessionDirSupplier()}（projectRoot，不动）承载，对齐 CC sessionStorage.ts:320-328。</li>
+     *       {@link #sessionProjectRootResolver()}（按 creatingSessionId 现算 projectRoot）承载，
+     *       对齐 CC sessionStorage.ts:320-328。</li>
      * </ul>
      */
     private Supplier<Path> taskOutputDirSupplier() {

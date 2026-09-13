@@ -239,8 +239,22 @@ public class MemoryController {
         //   env NEXUSAI_AUTO_DREAM 可选覆盖 → 默认 true（与运行时门控 AutoDreamConsolidator
         //   isAutoDreamEnabledBySettingsOrEnv 一致，前端 toggle 不再与实际 auto-dream 运行矛盾）
         boolean autoDream = isAutoDreamEnabledByRuntimeChain();
-        // CC readLastConsolidatedAt()（consolidationLock.ts:29-36）—— 锁 mtime，0 = 从未
-        long lastConsolidatedAtMs = new ConsolidationLock(storage.memoryDir()).readLastConsolidatedAt();
+        // CC readLastConsolidatedAt()（consolidationLock.ts:29-36）—— 锁 mtime，0 = 从未。
+        // [TL-W2 P9] 记忆目录按**会话 sessionId 现算**（SessionProjectRoot.getForSession：未绑定
+        //   → null，绝不回落 config home / 不读 ThreadLocal）。旧 storage.memoryDir() 无参在 Tomcat
+        //   请求线程读 AutoMemPaths ThreadLocal（恒空）→ 回落 config home → A′ null →
+        //   new ConsolidationLock(null) 构造 NPE → 本端点 500（审计 P5/P9）。
+        //   dream 锁状态是 **per-project** 数据：无会话上下文 ⇒ 无从解析 ⇒ 显式 fail-loud
+        //   （规则十二；不伪造 "never"）。REST 入口无 sessionId 参数属既有契约缺口
+        //   （前端 memory.ts getMemoryConfig 未传会话）→ 登记残差，本批不改前端契约。
+        java.nio.file.Path memDir = storage.memoryDir(com.nexusai.common.RequestContext.sessionId());
+        if (memDir == null) {
+            throw new IllegalStateException("[MemoryController] GET /memory/config 无法解析 per-project "
+                + "记忆目录（无会话上下文/会话未绑定项目）→ dream 锁状态不可得。"
+                + "dreamStatus 为 per-project 数据，需会话上下文（RequestContext.sessionId）；"
+                + "绝不回落 config home 冒充项目（TL-W2 P9）");
+        }
+        long lastConsolidatedAtMs = new ConsolidationLock(memDir).readLastConsolidatedAt();
         String dreamStatus = lastConsolidatedAtMs == 0 ? "never" : "last_ran";
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] GET /memory/config: autoMemory={} autoDream={} dreamStatus={} lastConsolidatedAtMs={}",

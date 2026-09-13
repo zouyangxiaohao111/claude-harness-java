@@ -114,17 +114,27 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
     }
 
     @Test
-    @DisplayName("resolver 未注入且未冻结 → 保持现状回落（不炸、workspaceDir 不动）")
+    @DisplayName("[TL-W2 P8] resolver 未注入且未冻结 → workspaceDir 保持 null（无有效项目，绝不回落 configHome）")
     void noResolver_noFrozen_keepsDefault() throws Exception {
+        // WHY（规则九 · 测试验证意图改写）：旧实现字段初始化器 = Path.of(currentSessionProjectRoot())
+        //   → 构造期 ThreadLocal 恒空 ⇒ 初值恒为 env ?? ~/.nexusai（configHome）⇒ 未命中分支经
+        //   buildSessionStateFromInstance 把 configHome 塞进 AgentState（审计 P8）。现默认 null：
+        //   未解析到绑定项目就保持 null，下游按「无有效项目」skip（A′）。
+        //   RED: 字段默认值改回 Path.of(AutoMemPaths.currentSessionProjectRoot()) → 首断言变红。
         LlmAgentLoop loop = new LlmAgentLoop(Mockito.mock(LlmProviderFactory.class));
         loop.setStreamContext(null, SESSION_ID, "msg-1");
-        Path before = loop.workspaceDir();
+
+        assertThat(loop.workspaceDir())
+            .as("构造期 workspaceDir 必须为 null（字段初始化器不再读 ThreadLocal）")
+            .isNull();
 
         invokeResolve(loop);
 
-        assertThat(loop.workspaceDir()).isEqualTo(before);
+        assertThat(loop.workspaceDir())
+            .as("未注入未冻结（无绑定项目）→ workspaceDir 保持 null，不得回落 configHome")
+            .isNull();
         assertThat(AutoMemPaths.currentSessionProjectRoot())
-            .as("未注入未冻结 → ThreadLocal 未被触碰，回落链（CLAUDE_PROJECT_DIR env ?? config-home）恒有值")
+            .as("未注入未冻结 → ThreadLocal 未被触碰，回落链（env ?? config-home）本身不动（P5/W3 另批）")
             .isNotNull()
             .isNotBlank();
     }

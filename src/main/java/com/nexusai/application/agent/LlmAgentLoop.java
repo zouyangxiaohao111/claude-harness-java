@@ -2740,12 +2740,15 @@ public class LlmAgentLoop implements AgentLoop {
         //      .envrc/.env 变更不触发 FileChanged hooks. 对齐 CC setup.ts 顺序:
         //      captureHooksConfigSnapshot (MultiSourceHooksConfigLoader @PostConstruct 已做) →
         //      initializeFileChangedWatcher(cwd). workspaceDir = 会话 projectRoot（ODF-A1 注入）。
-        if (fileChangedWatcher != null) {
+        // [TL-W2 P8] workspaceDir 现在可为 null（无有效绑定项目）→ 显式跳过（不靠 NPE 被 catch 吞）。
+        if (fileChangedWatcher != null && workspaceDir != null) {
             try {
                 fileChangedWatcher.initialize(workspaceDir.toString());
             } catch (Exception e) {
                 log.warn("HOOK FileChangedWatcher 初始化失败: {}", e.getMessage());
             }
+        } else if (fileChangedWatcher != null) {
+            log.debug("[LlmAgentLoop] FileChangedWatcher 跳过：无有效会话 projectRoot（workspaceDir=null）");
         }
 
         // ── [FIX-C · lsp-init] LspManager 生产接线 · 对齐 CC manager.ts:145-208 启动时初始化 ──
@@ -10780,13 +10783,21 @@ public class LlmAgentLoop implements AgentLoop {
     /**
      * Workspace dir · 对齐 CC getProjectDir(getOriginalCwd()).
      *
-     * <p>ODF-A1：默认从 {@link com.nexusai.application.agent.memory.AutoMemPaths#currentSessionProjectRoot()}
-     * 取（per-session ThreadLocal · 会话线程隔离，绝不读 JVM 进程工作目录）；run() 入口经
-     * {@link #resolveSessionProjectRoot()} 用 {@link #sessionProjectRootResolver} 冻结为
-     * 会话绑定项目路径（对齐 CC state.ts:269-279 启动冻结，会话中不更新）。测试可经 setter 覆盖。
+     * <p><b>[TL-W2 P8]</b> 默认 <b>null</b>（无有效项目）—— 唯一赋值点是
+     * {@link #resolveSessionProjectRoot()}（会话入口单点解析，成功分支才 set workspaceDir）；
+     * 未命中/未绑定 → 保持 null，下游按「无有效项目」skip（memory 域 A′ 已就绪；子代理
+     * transcript 派生 {@code SessionStorage.getAgentTranscriptPath(null, ...)} 恒返回 null）。
+     *
+     * <p>WHY 不再默认 {@code Path.of(AutoMemPaths.currentSessionProjectRoot())}：本类为
+     * {@code @Scope("prototype")}（每次 {@code loopProvider.getObject()} 新实例），<b>字段初始化器
+     * 在构造期求值</b>，而 projectRoot ThreadLocal 只在 {@link #run()} 内注入 ⇒ 构造期恒空 ⇒
+     * 初值恒为 {@code env ?? ~/.nexusai}（configHome）。run() 的未命中分支（无 streamSessionId /
+     * resolver null / resolver 空 / 目录无效 / 异常）都不覆盖该值 ⇒ configHome 经
+     * {@code buildSessionStateFromInstance → session.setWorkspaceDir} 进入 AgentState，
+     * 成为主腿读到 configHome 的真正来源（违铁律「绝不回落 configHome 冒充项目根」）。
+     * 测试可经 setter 覆盖。
      */
-    private java.nio.file.Path workspaceDir = java.nio.file.Path.of(
-        com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
+    private java.nio.file.Path workspaceDir;
 
     /**
      * DURABLE cron 回合项目身份 override · 对齐 CC fire 回合 projectRoot=创建项目。
@@ -10861,7 +10872,8 @@ public class LlmAgentLoop implements AgentLoop {
      * 注入 AutoMemPaths ThreadLocal（AutoMemPaths / AgentMemoryDirectory / MemoryPromptBuilder
      * 等单例 bean 经 supplier 惰性读取本线程 holder → 本会话线程解析出独立 memory 目录，同一
      * JVM 不同 cwd 会话互不污染 —— ODF-A1-R2 返工：ThreadLocal 取代 static volatile，多会话
-     * 并发各自隔离）。解析失败/未注入 → 保持现状。
+     * 并发各自隔离）。<b>[TL-W2 P8]</b> 解析失败/未注入 → {@link #workspaceDir} 保持 <b>null</b>
+     * （无有效项目，下游 A′ skip），<b>绝不</b>回落 configHome 冒充项目根。
      *
      * <p><b>IMP-A F1 会话级冻结</b>（D1-A/OPD-SPR-03 · CC stable projectRoot 启动冻结语义）：
      * <ol>
@@ -10870,7 +10882,8 @@ public class LlmAgentLoop implements AgentLoop {
      *       <b>直接复用，不再查 DB</b>（resolver 不被调用，会话内不重查）；</li>
      *   <li>未命中 → {@link #sessionProjectRootResolver} 解析成功 →
      *       {@code SessionProjectRoot.setForSession()} 首 run 冻结 + workspaceDir + ThreadLocal 注入；</li>
-     *   <li>resolver 未注入 / 解析失败 → 保持现状（回落当前 workspaceDir / holder 默认）。</li>
+     *   <li>resolver 未注入 / 解析失败 → {@link #workspaceDir} 保持 <b>null</b>（无有效项目；
+     *       [TL-W2 P8] 不再回落 holder/configHome 默认值）。</li>
      * </ol>
      *
      * <p><b>IMP-A F7 注入点归一</b>（M-02/M-03）：resolver 返回值落 workspaceDir 处补
@@ -10980,7 +10993,7 @@ public class LlmAgentLoop implements AgentLoop {
         }
         if (sessionProjectRootResolver == null) {
             if (log.isDebugEnabled()) {
-                log.debug("[LlmAgentLoop] sessionProjectRootResolver 未注入，workspaceDir 保持默认: {}",
+                log.debug("[LlmAgentLoop] sessionProjectRootResolver 未注入，workspaceDir 保持无项目: {}",
                     workspaceDir);
             }
             // [B′] resolver bean 未注入 → DB 兜底直查绑定项目
@@ -10994,7 +11007,7 @@ public class LlmAgentLoop implements AgentLoop {
         try {
             String projectRoot = sessionProjectRootResolver.apply(sessionIdStr);
             if (projectRoot == null || projectRoot.isBlank()) {
-                log.info("[LlmAgentLoop] 会话 {} 未绑定项目/项目无路径，workspaceDir 保持默认: {}",
+                log.info("[LlmAgentLoop] 会话 {} 未绑定项目/项目无路径，workspaceDir 保持无项目（null）: {}",
                     sessionIdStr, workspaceDir);
                 // [B′] resolver 未命中 → DB 兜底（可能 resolver 漏看 / 会话刚 bind 未走冻结）
                 if (tryResolveBoundProjectFromDb(sessionIdStr)) {

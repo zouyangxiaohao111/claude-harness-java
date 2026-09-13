@@ -112,14 +112,26 @@ public class ExtractMemoriesController {
             throw new ValidationException("auto-memory is disabled (manual /dream unavailable)");
         }
         MemoryStorage storage = resolveMemoryStorage();
-        // CC dream.ts:33 memoryRoot = getAutoMemPath()（MemoryStorage.memoryDir 同源 per-project）
-        String memoryRoot = storage.memoryDir().toString();
+        // [TL-W2 P9] memoryRoot 按**会话 sessionId 现算**（SessionProjectRoot.getForSession：未绑定
+        //   → null，绝不回落 config home / 不读 ThreadLocal）。旧 storage.memoryDir() 无参在 Tomcat
+        //   请求线程读 AutoMemPaths ThreadLocal（恒空）→ 回落 config home → A′ null →
+        //   memoryDir().toString() NPE → 500（审计 P9）。无会话上下文 ⇒ per-project 记忆目录不可得
+        //   → 显式 fail-loud（规则十二；端点文档已声明「memory 存储不可用 → 500 fail loud」）；
+        //   前端 /dream 未传会话属既有契约缺口 → 登记残差，本批不改前端契约。
+        java.nio.file.Path dreamMemDir = storage.memoryDir(com.nexusai.common.RequestContext.sessionId());
+        if (dreamMemDir == null) {
+            throw new IllegalStateException("[ExtractMemoriesController] POST /dream 无法解析 per-project "
+                + "记忆目录（无会话上下文/会话未绑定项目）—— memoryRoot 为 per-project 数据，需会话上下文"
+                + "（RequestContext.sessionId）；绝不回落 config home（TL-W2 P9）");
+        }
+        // CC dream.ts:33 memoryRoot = getAutoMemPath()（per-project）
+        String memoryRoot = dreamMemDir.toString();
         // CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd()) —— [S2] Java 等价
         //   config-home 项目 slug 目录（getOriginalCwdLayer 层做 config-home 派生）
         String transcriptDir = com.nexusai.application.agent.tool.SessionStorage
             .getProjectDir(java.nio.file.Path.of(CwdResolution.getOriginalCwdLayer())).toString();
         // CC dream.ts:36-37 await recordConsolidation() —— 手动 /dream 乐观盖章锁（best-effort）
-        new ConsolidationLock(storage.memoryDir()).recordConsolidation();
+        new ConsolidationLock(dreamMemDir).recordConsolidation();
         if (log.isDebugEnabled()) {
             log.debug("[ExtractMemoriesController] /dream 构建 prompt: memoryRoot={} transcriptDir={}"
                 + "（已乐观盖章锁 .consolidate-lock）", memoryRoot, transcriptDir);

@@ -12,7 +12,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import java.util.UUID;
 import java.nio.charset.StandardCharsets;
@@ -149,6 +151,51 @@ class CommandHookExecutorTest {
 
     private static HookEvent preToolEvent() {
         return HookEvent.toolPre("Bash", null, "s1", null);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [TL-W2 P6] enrichBaseFields · transcript_path 锚 = 会话绑定项目根（按 sessionId 现算，零 ThreadLocal）
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[TL-W2 P6] transcript_path 按 sessionId 现算绑定项目 slug；未绑定 → 省略（绝不读 ThreadLocal / 回落 config home）")
+    void enrichBaseFields_transcriptPath_resolvesBySessionBoundRoot(@org.junit.jupiter.api.io.TempDir Path tempDir)
+            throws Exception {
+        // WHY（规则九 · 审计 P6）：本方法调用点（HookRegistry.executeConfiguredHooks:4407）位于
+        //   supplyAsync(withSessionProjectRoot(...)):4444 **之前** —— 跑在 executeEvent 调用线程上、
+        //   不被回放包裹。旧实现用 Path.of(AutoMemPaths.currentSessionProjectRoot())（ThreadLocal）：
+        //   非会话线程发射的 hook（WebSocketPermissionPrompter 裸池 → permission-racer）读到 env ??
+        //   ~/.nexusai ⇒ slug 错 ⇒ resolveExistingTranscript 返回 null ⇒ transcript_path 被静默省略。
+        //   现锚 = SessionProjectRoot.getForSession(sessionId)（未绑定 → null ⇒ 省略，不回落）。
+        // RED: 回退为 currentSessionProjectRoot() → 首断言（未绑定会话不得产出 transcript_path）变红
+        //   （ThreadLocal 空时回落 config home，若该目录下恰好存在同名文件即产出错 slug 路径）。
+        String sid = "sess-p6-bound";
+        Path projectRoot = Files.createDirectories(tempDir.resolve("proj"));
+        Path cfgHome = Files.createDirectories(tempDir.resolve("cfg-home"));
+        NexusaiPaths.setConfigHomeDirOverride(cfgHome.toString());
+        com.nexusai.common.SessionProjectRoot.setForSession(sid, projectRoot.toString());
+        try {
+            // 真实 transcript 文件：{configHome}/projects/{sanitize(projectRoot)}/{sid}.jsonl
+            Path transcript = SessionStorage.getProjectDir(projectRoot).resolve(sid + ".jsonl");
+            Files.createDirectories(transcript.getParent());
+            Files.writeString(transcript, "{}");
+
+            HookEvent enriched = CommandHookExecutor.enrichBaseFields(
+                HookEvent.toolPre("Bash", null, sid, null), null);
+            assertThat(enriched.transcriptPath())
+                .as("绑定会话 → transcript_path = resolveExistingTranscript(绑定项目根, sessionId)")
+                .isEqualTo(transcript.toString());
+
+            // 未绑定会话（同名文件不存在于任何合法 slug）→ 省略（null），绝不回落 config home
+            HookEvent unbound = CommandHookExecutor.enrichBaseFields(
+                HookEvent.toolPre("Bash", null, "sess-p6-unbound", null), null);
+            assertThat(unbound.transcriptPath())
+                .as("未绑定会话 → 无有效项目 ⇒ transcript_path 省略（不回落 config home）")
+                .isNull();
+        } finally {
+            com.nexusai.common.SessionProjectRoot.clearSession(sid);
+            NexusaiPaths.setConfigHomeDirOverride(null);
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════

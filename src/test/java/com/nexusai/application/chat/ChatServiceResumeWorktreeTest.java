@@ -191,6 +191,35 @@ class ChatServiceResumeWorktreeTest {
     }
 
     @Test
+    @DisplayName("[TL-W2 P10] resolver 未命中且无会话绑定 → 不恢复（兜底腿已删：不回落 config home 锚）")
+    void unresolvedProjectRoot_doesNotFallBackToConfigHome() throws Exception {
+        // WHY（规则九 · 审计 P10）：旧实现主腿（sessionProjectRootResolver）返回空时回落
+        //   AutoMemPaths.currentSessionProjectRoot()。本调用点（ChatService.processUserMessage →
+        //   @Async chatExecutor）**早于** LlmAgentLoop.run()，请求线程 ThreadLocal 必空 ⇒ 回落
+        //   config home ⇒ 读侧锚（config home 项目 slug）与写侧锚（会话绑定项目）分裂 ⇒
+        //   静默恢复到错误项目缓存 / 静默不恢复。现契约：resolver 未命中 → 再按 sessionId 查
+        //   SessionProjectRoot.getForSession（未绑定 → null）→ 仍无 → 不恢复（绝不回落 config home）。
+        // RED: 把兜底腿改回 AutoMemPaths.currentSessionProjectRoot() → 本用例立即变红
+        //   （config home 锚下的 worktree-state 被读回 → tracker 被写入）。
+        // 造"旧回落腿会读到的" config home 锚 worktree-state：
+        String cfgHomeAnchorRoot = com.nexusai.application.agent.memory.AutoMemPaths
+            .currentSessionProjectRoot();
+        Path wt = Files.createDirectory(workspaceDir.resolve("wt-legacy"));
+        SessionStorage.writeWorktreeState(Path.of(cfgHomeAnchorRoot), sessionKey,
+            fullWorktreeSession(wt.toString(), "/home/user/orig", "wt-legacy", "feature/legacy", false));
+        // resolver 未命中（null）+ 会话未绑定
+        ReflectionTestUtils.setField(service, "sessionProjectRootResolver",
+            (Function<String, String>) id -> null);
+        com.nexusai.common.SessionProjectRoot.clearSession(sessionId);
+
+        restore();
+
+        assertNull(WorktreeCwdTracker.getCwd(sessionKey));
+        assertNull(WorktreeCwdTracker.getOriginalCwd(sessionKey));
+        assertNull(WorktreeCwdTracker.getWorktreeSession(sessionKey));
+    }
+
+    @Test
     @DisplayName("残留3 fresh 守卫：已有 fresh worktree 会话 → 跳过 transcript 恢复，保留当前状态")
     void freshSession_skipsTranscriptRestore() throws Exception {
         // WHY: CC sessionRestore.ts:336-339 getCurrentWorktreeSession() 有值 → saveWorktreeState(fresh)

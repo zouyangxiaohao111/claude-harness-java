@@ -1897,10 +1897,17 @@ public class CommandHookExecutor {
      *   <li>{@code session_id}：{@code event.sessionId() ?? RequestContext.sessionId()}（MDC 回退；
      *       两源皆 null → 省略，对齐 CC getSessionId 回退语义 hooks.ts:315/320）</li>
      *   <li>{@code transcript_path}：{@code event.transcriptPath() ?? SessionStorage.resolveExistingTranscript(
-     *       Path.of(AutoMemPaths.currentSessionProjectRoot()), resolvedSessionId)}（D3 读兼容：经
+     *       Path.of(SessionProjectRoot.getForSession(resolvedSessionId)), resolvedSessionId)}（D3 读兼容：经
      *       resolveExistingTranscript 读 nexusai 现有 transcript；resolvedSessionId = 合并后 session_id；
-     *       workspaceDir/sessionId null → null → 省略，不产出空串
-     *       REQ-03）</li>
+     *       会话未绑定项目 / sessionId null → null → 省略，不产出空串 REQ-03）。
+     *       <b>[TL-W2 P6]</b> 锚点改按 <b>sessionId 从全局冻结表现算</b>
+     *       （{@code SessionProjectRoot.getForSession}：未绑定返回 null，<b>绝不回落 config home</b>、
+     *       不读 ThreadLocal）——旧实现 {@code Path.of(AutoMemPaths.currentSessionProjectRoot())} 跑在
+     *       {@code executeEvent} 调用线程（本方法调用点 HookRegistry:4407 位于
+     *       {@code supplyAsync(withSessionProjectRoot(...))}:4444 <b>之前</b>，不被回放包裹）：
+     *       非会话线程发射的 hook（WebSocketPermissionPrompter 裸池 → permission-racer →
+     *       {@code executeEvent(permissionRequest)}）读回落值 ⇒ slug 错 ⇒
+     *       {@code resolveExistingTranscript} 返回 null ⇒ transcript_path 被静默省略。</li>
      *   <li>{@code cwd}：{@code event.cwd() ?? CwdResolution.getCwd(sessionId)}（G14 收敛统一入口，
      *       对齐 CC BaseHookInput {@code cwd: getCwd()} hooks.ts:323 —— 消除 hook 域自建
      *       effectiveCwd ?: currentSessionProjectRoot 三级链同语义两套标准 OD-4；
@@ -1936,10 +1943,18 @@ public class CommandHookExecutor {
         // [D3 读兼容] 只读 nexusai 自有 transcript（resume 仅支持 nexusai 会话，无 claude ~/.claude/projects 回落）
         String transcriptPath = event.transcriptPath();
         if (transcriptPath == null && sessionId != null) {
-            Path tp = SessionStorage.resolveExistingTranscript(
-                Path.of(AutoMemPaths.currentSessionProjectRoot()), sessionId);
-            if (tp != null) {
-                transcriptPath = tp.toString();
+            // [TL-W2 P6] 会话绑定 projectRoot 按 sessionId 现算（SessionProjectRoot.getForSession：
+            //   未绑定 → null，绝不回落 config home、不读 ThreadLocal）。绝不可传
+            //   SessionStorage.sessionProjectDir(sessionId) —— 那是 {configHome}/projects/{slug}
+            //   存储目录，而 resolveExistingTranscript 内部**又**做一次 getProjectDir(workspaceDir)
+            //   （slug 派生一次）⇒ 双重包裹读不到真实 transcript（活 bug 先例：
+            //   SessionMemoryService:1495-1517 resolveExistingTranscriptForSession javadoc）。
+            String hookProjectRoot = com.nexusai.common.SessionProjectRoot.getForSession(sessionId);
+            if (hookProjectRoot != null && !hookProjectRoot.isBlank()) {
+                Path tp = SessionStorage.resolveExistingTranscript(Path.of(hookProjectRoot), sessionId);
+                if (tp != null) {
+                    transcriptPath = tp.toString();
+                }
             }
         }
         // cwd: event.cwd() ?? CwdResolution.getCwd(sessionId)（G14 收敛统一入口，对齐 CC

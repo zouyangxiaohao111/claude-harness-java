@@ -1,6 +1,5 @@
 package com.nexusai.common;
 
-import com.nexusai.application.agent.skill.NexusaiPaths;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,15 +26,16 @@ import org.slf4j.LoggerFactory;
  * 同一 memory 目录（跨项目记忆污染），违反 CC per-session per-cwd 语义。本类提供按 sessionId 登记的
  * 会话级 projectRoot，生产链经注入 supplier 消费，不再直接读 user.dir。
  *
- * <p><b>解析顺序</b>（{@link #resolve()}）：
- * <ol>
- *   <li>当前线程显式注入（{@link #setCurrent(String)} · 对齐 CC cwd 概念，session 处理线程入口设置）</li>
- *   <li>{@code RequestContext.sessionId()} 绑定的会话 projectRoot（{@link #setForSession(String, String)}
- *       登记 · 对齐 CC 启动冻结，会话创建/绑定项目时登记）</li>
- *   <li>{@code CLAUDE_PROJECT_DIR} env 非空用之，否则 {@link NexusaiPaths#getAppConfigHomeDir()}
- *       （ODF-A1 回落链 · 对齐 AutoMemPaths:110-120；绝不读 JVM user.dir —— 同一 JVM 内不同 cwd
- *       会话不得解析到同一进程目录）</li>
- * </ol>
+ * <p><b>查询面（[TL-W2 P11] 收紧后唯一读法）</b>：{@link #getForSession(String)} ——
+ * 按 sessionId 直查全局冻结表；<b>未登记 → null</b>（绝不回落 config home / env）。调用方持
+ * sessionId 现算（REST / fork / hook / 启动线程皆可），<b>零 ThreadLocal</b>。
+ *
+ * <p><b>[TL-W2 P11] 已删除</b>：旧 {@code resolve()} / {@code setCurrent()} / {@code clearCurrent()}
+ * + {@code CURRENT ThreadLocal} 读路径 —— 生产 0 调用方（全仓仅测试引用），且 {@code resolve()}
+ * 第 3 级回落 {@code CLAUDE_PROJECT_DIR env ?? config home} 把 configHome 当「会话绑定项目」身份返回
+ * （与 cwd 身份域红线 D-1 冲突，CwdResolution:163 明写「不读 SessionProjectRoot.resolve()」）。
+ * 按死代码决策规则（CC 对应物 = 全局 state.projectRoot，本类已有 sessionId 直查主链）删除，
+ * 消除同构陷阱（与 AutoMemPaths 回落失败模式同构）。
  *
  * <p><b>冻结语义</b>（OPD-SPR-03 · CC stable identity）：{@link #setForSession(String, String)} 首写胜，
  * 会话已冻结（已登记 projectRoot）时 rebind 不覆盖；{@link #clearSession(String)} 解除冻结后可再绑定。
@@ -51,38 +51,7 @@ public final class SessionProjectRoot {
     /** sessionId → projectRoot（会话绑定登记 · CC state.ts:269-279 启动冻结语义）。 */
     private static final ConcurrentHashMap<String, String> BY_SESSION = new ConcurrentHashMap<>();
 
-    /** ODF-A1 无会话回落源 env（同 AutoMemPaths.CLAUDE_PROJECT_DIR_ENV · 避免跨层依赖仅取常量；
-     *  nexusai 命名 NEXUSAI_PROJECT_DIR，决策 D1/D6 自有根语义）。 */
-    private static final String CLAUDE_PROJECT_DIR_ENV = "NEXUSAI_PROJECT_DIR";
-
-    /** 当前线程显式注入的 projectRoot（对齐 CC cwd 概念 · session 处理线程入口设置/清除）。 */
-    private static final ThreadLocal<String> CURRENT = new ThreadLocal<>();
-
     private SessionProjectRoot() {}
-
-    /**
-     * 解析当前线程对应的会话级 projectRoot。
-     *
-     * @return 当前注入 → session 绑定 → CLAUDE_PROJECT_DIR env ?? config home（恒非 null）
-     */
-    public static String resolve() {
-        String cur = CURRENT.get();
-        if (cur != null && !cur.isEmpty()) {
-            return cur;
-        }
-        String sessionId = RequestContext.sessionId();
-        if (sessionId != null) {
-            String bound = BY_SESSION.get(sessionId);
-            if (bound != null && !bound.isEmpty()) {
-                return bound;
-            }
-        }
-        String env = System.getenv(CLAUDE_PROJECT_DIR_ENV);
-        if (env != null && !env.isBlank()) {
-            return env;
-        }
-        return NexusaiPaths.getAppConfigHomeDir();
-    }
 
     /**
      * 会话绑定 projectRoot · 首写胜（对齐 CC stable identity · OPD-SPR-03）：会话已冻结时不覆盖，
@@ -139,23 +108,8 @@ public final class SessionProjectRoot {
         }
     }
 
-    /** 当前线程显式注入 projectRoot（null 等价清除）。 */
-    public static void setCurrent(String projectRoot) {
-        if (projectRoot == null) {
-            CURRENT.remove();
-        } else {
-            CURRENT.set(projectRoot);
-        }
-    }
-
-    /** 清除当前线程注入（会话处理结束 finally）。 */
-    public static void clearCurrent() {
-        CURRENT.remove();
-    }
-
-    /** 测试钩子：清空全部登记（含 current）。 */
+    /** 测试钩子：清空全部会话登记（[TL-W2 P11] 原含 CURRENT ThreadLocal 清理，已随死代码删除）。 */
     public static void reset() {
-        CURRENT.remove();
         BY_SESSION.clear();
     }
 }

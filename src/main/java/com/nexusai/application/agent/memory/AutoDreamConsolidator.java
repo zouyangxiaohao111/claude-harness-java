@@ -22,6 +22,7 @@ import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
+import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -132,6 +133,18 @@ public class AutoDreamConsolidator {
             "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
 
     private final MemoryStorage storage;
+
+    /**
+     * [TL-W2 P9] dream 任务 → 本次合并的 memoryDir（会话线程解析值冻结）。
+     *
+     * <p>WHY：{@link com.nexusai.application.agent.tasks.DreamTaskRegistry#kill} 的锁回退 seam
+     * 可能在 REST / TaskStop 派发线程被调用（非会话线程）—— 旧实现无参现算
+     * {@code storage.memoryDir()} 会读 ThreadLocal（空）→ 回落 config home → NPE（回退从不生效）。
+     * 现按 dreamTaskId <b>显式携带</b>目录（kill 用后移除；complete/fail 亦清理，防无界累积）。
+     * key 数量受并发 dream 任务数约束（每任务一条，终态即清）。
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Path> dreamTaskMemoryDirs =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * remote mode 门控 · CC original: {@code getIsRemoteMode()}（autoDream.ts:97，
@@ -248,26 +261,14 @@ public class AutoDreamConsolidator {
     }
 
     /**
-     * 记忆目录 · CC original: {@code getAutoMemPath()}（paths.ts:223-235）。
+     * 合并锁 · 绑定显式 memoryDir（锁文件位于记忆目录内，consolidationLock.ts:21-23 lockPath）。
      *
-     * <p><b>[A1 修复 2026-09-04]</b>：由构造期冻结字段改<b>惰性现算</b>—— 每次调用
-     * {@code storage.memoryDir()}（生产 = AutoMemPaths 按当前线程 projectRoot 解析 per-project）。
-     * 旧实现构造冻结：bean 构造时无会话上下文 → 回落 config-home 自身 slug（C--Users-WIN--nexusai），
-     * 所有会话记忆/锁写错目录。调用方（StopHookPipeline runAsync 入口）须先经
-     * {@link AutoMemPaths#setCurrentProjectRoot} 注入会话 projectRoot，否则异步 fork 线程
-     * （ForkJoinPool）无 ThreadLocal 仍回落 config-home。
+     * <p><b>[TL-W2 P9]</b> 由「无参现算 storage.memoryDir()」改为<b>显式入参</b> —— 生产每个
+     * 调用点都持有会话线程解析好的 memoryDir（自动路径 = consolidateIfNeeded 5 参；手动路径 =
+     * {@link #doDream} 按 workspaceDir 现算）。绝不读 ThreadLocal（非会话线程会回落 config home）。
      */
-    private Path memoryDir() {
-        return storage.memoryDir();
-    }
-
-    /**
-     * 合并锁 · 绑定 memoryDir（锁文件位于记忆目录内，consolidationLock.ts:21-23 lockPath）。
-     * [A1 修复] 由构造期冻结字段改惰性现算 —— 随 {@link #memoryDir()} 每次现算（同一 memoryDir
-     * 派生同一锁路径，无状态泄漏；CC 每轮读锁/写锁同样按当前 memory 目录操作）。
-     */
-    private ConsolidationLock consolidationLock() {
-        return new ConsolidationLock(memoryDir());
+    private ConsolidationLock consolidationLock(Path memoryDir) {
+        return new ConsolidationLock(memoryDir);
     }
 
     /** 注入 isAutoMemoryEnabled 门控（null → false，CC paths.ts:30-56 gate 关闭）。 */
@@ -299,19 +300,36 @@ public class AutoDreamConsolidator {
     public void setDreamTaskRegistry(DreamTaskRegistry registry) {
         this.dreamTaskRegistry = registry;
         if (registry != null) {
+            // [TL-W2 P9] seam 带 taskId（记忆目录随任务显式携带，kill 线程不再现算 ThreadLocal）
             registry.setRollbackConsolidationLock(this::rollbackConsolidationLockSeam);
         }
     }
 
     /**
-     * kill 回退锁 mtime seam · CC original: {@code rollbackConsolidationLock(priorMtime)}
-     * （DreamTask.ts:153-155 + autoDream.ts:270 同路径）。
+     * kill 回退锁 mtime seam（带 taskId 版）· <b>[TL-W2 P9]</b>。
      *
-     * <p>由 {@link DreamTaskRegistry#kill} 在 running→killed 后调用（非 null 时）；
-     * priorMtime=0 → unlink，否则写空 body + utimes 回退（consolidationLock.ts:91-108）。
+     * <p><b>WHY 需要 taskId</b>：本 seam 由 {@link DreamTaskRegistry#kill} 调用，而 kill 的触发
+     * 线程通常是 REST / TaskStop 派发线程（<b>非</b>会话线程）—— 旧实现
+     * {@code consolidationLock()} 无参现算 {@code storage.memoryDir()} → 读
+     * {@code AutoMemPaths.currentSessionProjectRoot()} ThreadLocal（空）→ 回落 config home →
+     * A′ 判无效返回 null → {@code new ConsolidationLock(null)} 构造即 NPE（锁回退从不生效，
+     * 且下轮时间门被误阻断）。现按 dream 任务的 memoryDir <b>显式携带</b>（
+     * {@link #dreamTaskMemoryDirs}，register 时由会话线程解析值冻结）回退；无记录（未知任务 /
+     * 已清理）→ warn + 跳过（<b>绝不</b>现算回落）。
+     *
+     * @param taskId      dream 任务 id（{@code DreamTaskRegistry} 传入；null → 旧行为：无 memoryDir
+     *                    → 跳过，不现算）
+     * @param priorMtime  锁 mtime 快照（0 = unlink）
      */
-    void rollbackConsolidationLockSeam(long priorMtime) {
-        consolidationLock().rollbackConsolidationLock(priorMtime);
+    void rollbackConsolidationLockSeam(@Nullable String taskId, long priorMtime) {
+        Path memDir = taskId != null ? dreamTaskMemoryDirs.remove(taskId) : null;
+        if (memDir == null) {
+            log.warn("[AutoDream] kill 回退锁跳过：无该任务的 memoryDir 记录（taskId={} priorMtime={}）"
+                + " —— 绝不现算 storage.memoryDir()（非会话线程无 ThreadLocal，回落 config home 会落错目录）",
+                taskId, priorMtime);
+            return;
+        }
+        consolidationLock(memDir).rollbackConsolidationLock(priorMtime);
     }
 
     /** 注入遥测（tengu_auto_dream_* 事件 · autoDream.ts:195/252/267）。 */
@@ -745,6 +763,10 @@ public class AutoDreamConsolidator {
         if (dreamTaskRegistry != null) {
             dreamTaskId = dreamTaskRegistry.registerDreamTask(
                 sessionIds.size(), priorMtime, abortController);
+            // [TL-W2 P9] memoryDir 随任务显式携带 —— kill 回退 seam 在 REST/TaskStop 线程执行时
+            //   按 taskId 取回本会话目录（不再现算 ThreadLocal）。本行在会话线程（或已回放的
+            //   hook 线程）执行，memoryDir 为 consolidateIfNeeded 显式透传值。
+            dreamTaskMemoryDirs.put(dreamTaskId, memoryDir);
         }
         try {
             // 2. fork prompt（autoDream.ts:211-222 buildConsolidationPrompt）
@@ -818,6 +840,12 @@ public class AutoDreamConsolidator {
             }
             lock.rollbackConsolidationLock(priorMtime);
             return;
+        } finally {
+            // [TL-W2 P9] 终态清理 per-task memoryDir 记录（complete/fail/kill/异常全出口覆盖；
+            //   kill 路径已由 seam remove —— 幂等再删一次，防 CHM 无界累积）。
+            if (dreamTaskId != null) {
+                dreamTaskMemoryDirs.remove(dreamTaskId);
+            }
         }
     }
 
@@ -873,12 +901,22 @@ public class AutoDreamConsolidator {
             }
             return new DreamResult(false, List.of());
         }
+        // [TL-W2 P9] memoryDir 显式解析（workspaceDir = 调用方给的会话项目根 / CC getOriginalCwd）——
+        //   旧实现经无参 memoryDir() → storage.memoryDir() → AutoMemPaths.getAutoMemPath()（无参）
+        //   读会话 ThreadLocal：非会话线程（REST /dream 触发链）必空 → 回落 config home → A′
+        //   返回 null → 下游 toString()/ConsolidationLock(null) NPE。无有效项目 → fail-loud。
+        Path memDir = storage.memoryDirForProjectRoot(workspaceDir != null ? workspaceDir.toString() : null);
+        if (memDir == null) {
+            throw new IllegalStateException("[AutoDream] doDream 无有效 per-project auto-memory 目录"
+                + "（workspaceDir=" + workspaceDir + " 非有效项目/未绑定）—— 不回落现算"
+                + "（TL-W2 P9：非会话线程无 ThreadLocal，回落 config home 会写错目录）");
+        }
         // ② 手动乐观盖章（dream.ts:32 await recordConsolidation() · 与自动 dream 区别：
         //    不 tryAcquire/不 rollback，best-effort 静默，失败不炸断 /dream 命令）
-        consolidationLock().recordConsolidation();
+        consolidationLock(memDir).recordConsolidation();
 
         // ③ 组装手动 prompt（dream.ts:27-38）
-        String memoryRoot = memoryDir().toString();
+        String memoryRoot = memDir.toString();
         String transcriptDir = workspaceDir != null ? workspaceDir.toString() : memoryRoot;
         String basePrompt = ConsolidationPrompt.buildConsolidationPrompt(memoryRoot, transcriptDir, "");
         String prompt = DREAM_PROMPT_PREFIX + basePrompt;
@@ -896,7 +934,7 @@ public class AutoDreamConsolidator {
         List<String> touchedPaths = new ArrayList<>();
         try {
             ForkedAgentParams params = buildForkParams(prompt, null, abortController,
-                touchedPaths, forkRawMaterial, memoryDir(),
+                touchedPaths, forkRawMaterial, memDir,   // [TL-W2 P9] 显式 memDir（不再无参现算）
                 workspaceDir != null ? workspaceDir.toString() : null);   // [TL-W1 P1] projectRoot 直传
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null

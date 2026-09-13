@@ -1,6 +1,5 @@
 package com.nexusai.application.agent.remote;
 
-import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.tasks.BackgroundTask;
 import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
 import com.nexusai.application.agent.tasks.NotificationQueue;
@@ -20,6 +19,7 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -44,7 +44,9 @@ import java.util.function.Supplier;
  * <p><b>状态承载</b>: {@code remoteTasks} map 为权威状态（对齐 CC {@code state.tasks[taskId]}），
  * 其中 {@code base}（BackgroundTask）镜像进 {@link TaskFrameworkService} store
  * （SDK task_started / offset / evict 机制复用）。sidecar 目录 = sessionDir/remote-agents
- * （项目目录，对齐 CC sessionStorage.ts:320-328）。
+ * = {@code {projectRoot(creatingSessionId)}/{creatingSessionId}/remote-agents}（项目目录，对齐 CC
+ * sessionStorage.ts:320-328）—— <b>[TL-W2 P7]</b> projectRoot 按 creatingSessionId 经
+ * {@code SessionProjectRoot.getForSession} <b>现算</b>（未绑定 → 不落盘），绝不读 ThreadLocal。
  *
  * <p><b>批次Y Q3 输出根收敛</b>: 输出文件根 = {@code taskOutputDirSupplier} 注入的 temp 唯一根
  * （{@code {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks}，RemoteTaskConfiguration 已解耦
@@ -78,7 +80,16 @@ public class RemoteAgentTaskService {
     private final NotificationQueue notificationQueue;
     private final SdkEventQueue sdkEventQueue;
     private final RemoteSessionsApi sessionsApi;
-    private final Supplier<Path> sessionDirSupplier;
+    /**
+     * [TL-W2 P7] 会话 → 绑定项目根解析器（生产 = {@code SessionProjectRoot::getForSession}）。
+     *
+     * <p>WHY 不再是 {@code Supplier<Path> sessionDirSupplier}：旧 supplier 在<b>消费线程</b>读
+     * {@code AutoMemPaths.currentSessionProjectRoot()}（ThreadLocal）——
+     * kill 由 REST 线程调用（TaskController → BackgroundTaskRunner → {@link #kill}）时 ThreadLocal
+     * 必空 ⇒ 回落 config home ⇒ remote-agents 元数据落错根/删错目录。现改为<b>按 sessionId 现算</b>
+     * （call site 均持任务的 creatingSession），未绑定 → null → 不落盘（绝不回落 config home）。
+     */
+    private final Function<String, String> sessionProjectRootResolver;
     private final Supplier<Path> taskOutputDirSupplier;
     private final ScheduledExecutorService pollScheduler;
     /** 轮询间隔 · 生产默认 CC :540 POLL_INTERVAL_MS=1000；测试可注入更小值加速 */
@@ -88,11 +99,11 @@ public class RemoteAgentTaskService {
                                   NotificationQueue notificationQueue,
                                   @Nullable SdkEventQueue sdkEventQueue,
                                   RemoteSessionsApi sessionsApi,
-                                  Supplier<Path> sessionDirSupplier,
+                                  Function<String, String> sessionProjectRootResolver,
                                   Supplier<Path> taskOutputDirSupplier,
                                   ScheduledExecutorService pollScheduler) {
         this(framework, notificationQueue, sdkEventQueue, sessionsApi,
-            sessionDirSupplier, taskOutputDirSupplier, pollScheduler, POLL_INTERVAL_MS);
+            sessionProjectRootResolver, taskOutputDirSupplier, pollScheduler, POLL_INTERVAL_MS);
     }
 
     /** 测试构造 — 可注入 pollIntervalMs（默认 {@link #POLL_INTERVAL_MS}）。 */
@@ -100,7 +111,7 @@ public class RemoteAgentTaskService {
                                   NotificationQueue notificationQueue,
                                   @Nullable SdkEventQueue sdkEventQueue,
                                   RemoteSessionsApi sessionsApi,
-                                  Supplier<Path> sessionDirSupplier,
+                                  Function<String, String> sessionProjectRootResolver,
                                   Supplier<Path> taskOutputDirSupplier,
                                   ScheduledExecutorService pollScheduler,
                                   long pollIntervalMs) {
@@ -108,10 +119,39 @@ public class RemoteAgentTaskService {
         this.notificationQueue = Objects.requireNonNull(notificationQueue);
         this.sdkEventQueue = sdkEventQueue;
         this.sessionsApi = Objects.requireNonNull(sessionsApi);
-        this.sessionDirSupplier = Objects.requireNonNull(sessionDirSupplier);
+        this.sessionProjectRootResolver = Objects.requireNonNull(sessionProjectRootResolver);
         this.taskOutputDirSupplier = Objects.requireNonNull(taskOutputDirSupplier);
         this.pollScheduler = Objects.requireNonNull(pollScheduler);
         this.pollIntervalMs = pollIntervalMs > 0 ? pollIntervalMs : POLL_INTERVAL_MS;
+    }
+
+    /**
+     * [TL-W2 P7] 会话 sidecar 目录 · {@code {projectRoot(sessionId)}/{sessionId}}（{@code remote-agents}
+     * 元数据父目录，对齐 CC sessionStorage.ts:320-329）。
+     *
+     * <p><b>绝不读 ThreadLocal</b>：projectRoot 按 sessionId 经
+     * {@link #sessionProjectRootResolver}（生产 = {@code SessionProjectRoot.getForSession}）现算 ——
+     * 未绑定 → null（不回落 config home，也不含 java.io.tmpdir 占位）。
+     * <b>不可</b>改用 {@code SessionStorage.sessionProjectDir(sessionId)}：那是
+     * {@code {configHome}/projects/{slug}} 存储目录（transcript 锚），会把 sidecar 从项目目录
+     * 搬到 config home（sidecar 契约 = 留项目目录）。
+     *
+     * @param sessionId 本地创建会话 id（任务的 creatingSession）；null/未绑定 → null（调用方跳过落盘）
+     */
+    @Nullable
+    private Path sessionDirFor(@Nullable String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        String root = sessionProjectRootResolver.apply(sessionId);
+        if (root == null || root.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("RemoteAgentTaskService.sessionDirFor: 会话 {} 未绑定项目根 → 不落 sidecar"
+                    + "（绝不回落 config home；TL-W2 P7）", sessionId);
+            }
+            return null;
+        }
+        return Path.of(root).resolve(sessionId);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -217,16 +257,29 @@ public class RemoteAgentTaskService {
      * 扫描 sidecar → fetchSession 判活：404→删 sidecar；archived→删；其他→保留跳过；
      * running→重建 state(status=running, startTime=spawnedAt, pollStartedAt=now) + initOutput + polling。
      */
-    public void restoreRemoteAgentTasks() {
+    /**
+     * 恢复 remote agent 任务 · 对齐 CC restoreRemoteAgentTasks（:477-532）。
+     * 扫描 sidecar → fetchSession 判活：404→删 sidecar；archived→删；其他→保留跳过；
+     * running→重建 state(status=running, startTime=spawnedAt, pollStartedAt=now) + initOutput + polling。
+     *
+     * <p><b>[TL-W2 P7]</b> sessionId 改由调用方<b>显式传入</b>（本地创建会话）：sidecar 目录
+     * = {@code {projectRoot(creatingSessionId)}/{creatingSessionId}/remote-agents} —— 旧实现无参
+     * 经 {@code sessionDirSupplier} 在读线程取 {@code AutoMemPaths.currentSessionProjectRoot()}
+     * （ThreadLocal）：启动线程必空 ⇒ 回落 config home ⇒ 扫不到侧车（潜伏：本方法生产 0 调用方）。
+     * 未绑定项目 → {@code sessionDirFor} 返回 null → 不扫（绝不回落 config home）。
+     *
+     * @param creatingSessionId 本地创建会话 id（任务的 creatingSession）
+     */
+    public void restoreRemoteAgentTasks(String creatingSessionId) {
         try {
-            restoreRemoteAgentTasksImpl();
+            restoreRemoteAgentTasksImpl(creatingSessionId);
         } catch (Exception e) {
             log.warn("RemoteAgentTaskService.restoreRemoteAgentTasks 失败: {}", e.getMessage());
         }
     }
 
-    private void restoreRemoteAgentTasksImpl() {
-        Path sessionDir = sessionDirSupplier.get();
+    private void restoreRemoteAgentTasksImpl(String creatingSessionId) {
+        Path sessionDir = sessionDirFor(creatingSessionId);
         if (sessionDir == null) {
             return;
         }
@@ -318,7 +371,9 @@ public class RemoteAgentTaskService {
         }
         stopPolling(taskId);
         RemoteTaskOutput.evict(taskId);
-        RemoteAgentMetadataStore.delete(sessionDirSupplier.get(), taskId);
+        // [TL-W2 P7] 按任务 creatingSession 现算 sidecar 目录（kill 常在 REST/TaskStop 线程，
+        //   旧 sessionDirSupplier 读 ThreadLocal 必空 → 回落 config home → 删错目录）。
+        RemoteAgentMetadataStore.delete(sessionDirFor(s.base().sessionId()), taskId);
         log.info("RemoteAgentTaskService.kill: task {} killed, 已归档 session {}", taskId, s.sessionId());
         return true;
     }
@@ -346,7 +401,8 @@ public class RemoteAgentTaskService {
      * CC persistRemoteAgentMetadata（:92-98）— fire-and-forget，失败仅日志不阻塞注册。
      */
     private void persistRemoteAgentMetadata(RemoteAgentMetadata meta) {
-        RemoteAgentMetadataStore.write(sessionDirSupplier.get(), meta);
+        // [TL-W2 P7] 目录按 sidecar 自身的 creatingSessionId 现算（不再读取线程 ThreadLocal）
+        RemoteAgentMetadataStore.write(sessionDirFor(meta.creatingSessionId()), meta);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -384,16 +440,14 @@ public class RemoteAgentTaskService {
     private final class PollLoop {
         private final String taskId;
         /**
-         * [IMP-C D2-A/F3] 任务创建/恢复线程捕获的 projectRoot 冻结值（null = 无会话上下文，回落）。
-         *
-         * <p>WHY: tick 在 pollScheduler 定时器线程执行（{@code pollScheduler.schedule(this::tick, ...)}），
-         *   ThreadLocal 不跨线程 —— 不冻结则 tick 内 {@code sessionDirSupplier}/{@code taskOutputDirSupplier}
-         *   惰性读取解析到回落值（CLAUDE_PROJECT_DIR env ?? config home）而非任务所属会话目录 P
-         *   （T4-D8：remote_agent sidecar 写 config home 而非 P/{sessionId}）。创建任务时冻结
-         *   （registerRemoteAgentTask 会话线程）入 task 对象，任务执行时 tick 注入（set + finally
-         *   restore，对齐 LlmAgentLoop.run() capture/restore 模式）。
+         * [TL-W2 P7] 原 {@code frozenProjectRoot}（IMP-C D2-A/F3 捕获/回放 projectRoot ThreadLocal）
+         * 已删除 —— 其唯一消费方是 {@code sessionDirSupplier}（tick 内惰性读
+         * {@code AutoMemPaths.currentSessionProjectRoot()}）。sidecar 目录现改为按任务
+         * creatingSession <b>现算</b>（{@link RemoteAgentTaskService#sessionDirFor}），且
+         * {@code taskOutputDirSupplier}（{@code BackgroundTaskRunner.taskOutputDir}）只读 MDC
+         * sessionId（{@code CwdResolution.getOriginalCwdLayer}），不读 projectRoot ThreadLocal
+         * ⇒ tick 内已无 projectRoot 读点，回放无消费方（本类零 ThreadLocal 会话态读写）。
          */
-        private final String frozenProjectRoot;
         private final AtomicBoolean isRunning = new AtomicBoolean(false);
         private final AtomicBoolean started = new AtomicBoolean(false);
         private volatile String lastEventId;
@@ -403,8 +457,6 @@ public class RemoteAgentTaskService {
 
         PollLoop(String taskId) {
             this.taskId = taskId;
-            // 创建/恢复任务的调用线程（register = 会话线程 / restore = 启动线程）捕获冻结。
-            this.frozenProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
         }
 
         boolean isStarted() {
@@ -436,17 +488,12 @@ public class RemoteAgentTaskService {
             if (!isRunning.get()) {
                 return;
             }
-            // [IMP-C D2-A/F3] 定时器线程注入任务创建时冻结的会话上下文 —— projectRoot（ThreadLocal）
-            // + sessionId（MDC），使 tick 内惰性读取（sessionDirSupplier/taskOutputDirSupplier 等）
-            // 解析到任务所属会话目录（对齐 LlmAgentLoop.run() capture/restore 模式；restore 而非
-            // remove，防线程池复用串台回归）。null 冻结值（restore 场景）不 set，保持回落语义。
-            String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
+            // [TL-W2 P7] 原 projectRoot ThreadLocal 回放已删（无消费方，见 PollLoop 字段注释）。
+            //   定时器线程仍注入 MDC sessionId（task 对象创建时冻结）：taskOutputDirSupplier 经
+            //   BackgroundTaskRunner.taskOutputDir → resolveSessionId / getOriginalCwdLayer 读它。
             try {
                 try {
                     RemoteAgentTaskState task = remoteTasks.get(taskId);
-                    if (frozenProjectRoot != null && !frozenProjectRoot.isBlank()) {
-                        AutoMemPaths.setCurrentProjectRoot(frozenProjectRoot);
-                    }
                     // CC :557-563 — 任务被杀/已终态 → 静默 return（session 保留）
                     if (task == null || task.status() != BackgroundTaskStatus.RUNNING) {
                         return;
@@ -579,9 +626,8 @@ public class RemoteAgentTaskService {
                 }
             }
             } finally {
-                // 恢复外层原值（MDC + projectRoot）—— 定时器线程复用防泄漏
+                // 清 MDC（定时器线程复用防泄漏）；projectRoot ThreadLocal 已无注入点（TL-W2 P7）
                 RequestContext.clear();
-                AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
             }
             // CC :787-789 — 继续轮询
             scheduleNext();
@@ -611,7 +657,8 @@ public class RemoteAgentTaskService {
             enqueueRemoteNotification(taskId, notifyTitle, status, toolUseId);
             stopPolling(taskId);
             RemoteTaskOutput.evict(taskId);
-            RemoteAgentMetadataStore.delete(sessionDirSupplier.get(), taskId);
+            // [TL-W2 P7] 目录按任务 creatingSession 现算（tick 线程不再读 projectRoot ThreadLocal）
+            RemoteAgentMetadataStore.delete(sessionDirFor(s != null ? s.base().sessionId() : null), taskId);
         }
 
         private void completeRemoteReview(String taskId, RemoteAgentTaskState task,
@@ -649,7 +696,8 @@ public class RemoteAgentTaskService {
             enqueueRemoteReviewFailureNotification(taskId, reason);
             stopPolling(taskId);
             RemoteTaskOutput.evict(taskId);
-            RemoteAgentMetadataStore.delete(sessionDirSupplier.get(), taskId);
+            // [TL-W2 P7] 目录按任务 creatingSession 现算
+            RemoteAgentMetadataStore.delete(sessionDirFor(s != null ? s.base().sessionId() : null), taskId);
         }
 
         /**
@@ -671,7 +719,8 @@ public class RemoteAgentTaskService {
             enqueueRemoteReviewNotification(taskId, reviewContent);
             stopPolling(taskId);
             RemoteTaskOutput.evict(taskId);
-            RemoteAgentMetadataStore.delete(sessionDirSupplier.get(), taskId);
+            // [TL-W2 P7] 目录按任务 creatingSession 现算
+            RemoteAgentMetadataStore.delete(sessionDirFor(s != null ? s.base().sessionId() : null), taskId);
         }
     }
 

@@ -638,15 +638,25 @@ public class ExitWorktreeTool implements Tool {
      * resume 据此不回 cd 进 worktree（对齐 CC sessionRestore.ts:332-366 restoreWorktreeForResume
      * 对 {@code worktreeSession == null} 的短路）。
      *
-     * <p>transcript 定位同 Enter 侧 {@code persistWorktreeState}：workspaceDir =
-     * {@code AutoMemPaths.currentSessionProjectRoot()}，sessionId = ctx.sessionId() UUID 串。
+     * <p>[TL-W2 P10] transcript 定位同 Enter 侧 {@code persistWorktreeState}：workspaceDir =
+     * <b>会话绑定项目根</b>（{@code SessionProjectRoot.getForSession(sessionKey)}：按 sessionId 从
+     * 全局冻结表现算，未绑定 → null ⇒ 不写 —— 与读侧 ChatService.restoreWorktreeForResume
+     * 同一来源）。旧实现取 {@code AutoMemPaths.currentSessionProjectRoot()}（ThreadLocal）。
      */
     private void clearWorktreeState(String sessionKey) {
         if (sessionKey == null) {
             return;
         }
-        java.nio.file.Path workspaceDir = java.nio.file.Paths.get(
-            com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
+        String boundProjectRoot = com.nexusai.common.SessionProjectRoot.getForSession(sessionKey);
+        if (boundProjectRoot == null || boundProjectRoot.isBlank()) {
+            // transcript 写跳过（无绑定项目根 → 不知道写哪个 slug 目录），但**内存 tracker 仍要清**
+            //   —— 否则会话退出 worktree 后 WorktreeCwdTracker 残留（cwd 状态串台）。
+            log.warn("[ExitWorktreeTool] 跳过清 transcript worktree-state：会话 {} 无绑定项目根"
+                + "（不回落 config home；内存 tracker 照常清）", sessionKey);
+            com.nexusai.application.agent.worktree.WorktreeCwdTracker.clearWorktreeSession(sessionKey);
+            return;
+        }
+        java.nio.file.Path workspaceDir = java.nio.file.Paths.get(boundProjectRoot);
         com.nexusai.application.agent.tool.SessionStorage.writeWorktreeState(
             workspaceDir, sessionKey, null);
         // [RESIDUAL-FIX 残留 2] 同步清 WorktreeCwdTracker 完整 worktree 会话对象

@@ -3440,14 +3440,24 @@ public class ChatService {
                     + "session={} worktreePath={}", sessionId, fresh.worktreePath());
             return;
         }
-        // workspaceDir 与会话 projectRoot 一致：EnterWorktreeTool.persistWorktreeState 写 transcript
-        //   用 AutoMemPaths.currentSessionProjectRoot()（即 run() 入口 sessionProjectRootResolver 冻结结果）；
-        //   resolver 不可解析（会话未绑定项目）→ 回落 config home（与 loop 默认 workspaceDir 同源）。
+        // workspaceDir 与会话 projectRoot 一致：写侧 EnterWorktreeTool.persistWorktreeState /
+        //   ExitWorktreeTool.clearWorktreeState 用**会话绑定项目根**（[TL-W2 P10] 同批改为
+        //   SessionProjectRoot.getForSession(ctx.sessionId())，与读侧同一来源）。
+        // [TL-W2 P10] 兜底腿已移除 —— 旧实现 resolver 未命中即回落
+        //   AutoMemPaths.currentSessionProjectRoot()：本调用点（ChatService:756 @Async chatExecutor）
+        //   **早于** LlmAgentLoop.run()，请求线程 ThreadLocal 必空 → 回落 config home ⇒ 读侧 slug
+        //   与写侧锚分裂 ⇒ 静默不恢复（且违反「解析不到项目 → 绝不回落 config home」）。
+        //   现改为按 sessionId 从全局冻结表现算（SessionProjectRoot.getForSession：未绑定 → null）；
+        //   仍无 → 不恢复 worktree（对齐「无绑定项目即无项目缓存」，不读 ThreadLocal）。
         String projectRoot = (sessionProjectRootResolver != null)
                 ? sessionProjectRootResolver.apply(sessionId)
                 : null;
         if (projectRoot == null || projectRoot.isBlank()) {
-            projectRoot = AutoMemPaths.currentSessionProjectRoot();
+            projectRoot = com.nexusai.common.SessionProjectRoot.getForSession(sessionId);
+        }
+        if (projectRoot == null || projectRoot.isBlank()) {
+            log.info("[ChatService] resume 跳过 transcript 恢复：会话 {} 无绑定项目（不回落 config home）", sessionId);
+            return;
         }
         Path workspaceDir = Path.of(projectRoot);
         JsonNode worktreeSession = SessionStorage.readWorktreeState(workspaceDir, sessionKey);

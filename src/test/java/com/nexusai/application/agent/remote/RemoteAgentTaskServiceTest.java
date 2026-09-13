@@ -33,6 +33,21 @@ class RemoteAgentTaskServiceTest {
     @TempDir
     Path tempDir;
 
+    /**
+     * [TL-W2 P7] 本地创建会话 + 其绑定项目根。
+     *
+     * <p>sidecar 目录契约（RemoteAgentTaskService.sessionDirFor(sessionId)）：
+     * {@code {projectRoot(sessionId)}/{sessionId}} —— projectRoot 由注入的
+     * {@code SessionProjectRoot::getForSession}（全局冻结表）按 sessionId 现算，<b>不读 ThreadLocal</b>。
+     * 旧实现用 {@code Supplier<Path>}（消费线程读 AutoMemPaths ThreadLocal）→ kill/restore 在
+     * REST/启动线程必空 → 回落 config home。本测试注入同一解析器并把会话登记进全局表，
+     * 使 sidecar 落 {@code {projectRoot}/{creatingSession}} 且删除断言真实生效（非空跑）。
+     */
+    private static final String CREATING_SESSION = "sess-creator-1";
+
+    /** 会话绑定项目根（真实存在的目录 —— setForSession 绝对路径 + 存在校验）。 */
+    private Path projectRoot;
+
     private ScheduledExecutorService scheduler;
     private TaskFrameworkService framework;
     private NotificationQueue notifications;
@@ -85,7 +100,7 @@ class RemoteAgentTaskServiceTest {
     }
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
         scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "test-poll");
             t.setDaemon(true);
@@ -95,22 +110,32 @@ class RemoteAgentTaskServiceTest {
         framework = new TaskFrameworkService(sdkEvents);
         notifications = new NotificationQueue();
         api = new StubSessionsApi();
+        // [TL-W2 P7] sidecar 会话目录解析器：sessionId → projectRoot（生产 = SessionProjectRoot::getForSession）
+        com.nexusai.common.SessionProjectRoot.reset();
+        projectRoot = java.nio.file.Files.createDirectories(tempDir.resolve("proj"));
+        com.nexusai.common.SessionProjectRoot.setForSession(CREATING_SESSION, projectRoot.toString());
         service = new RemoteAgentTaskService(framework, notifications, sdkEvents, api,
-            () -> tempDir, () -> tempDir.resolve("output"),
+            com.nexusai.common.SessionProjectRoot::getForSession, () -> tempDir.resolve("output"),
             scheduler, 15L); // 15ms 加速轮询
     }
 
     @AfterEach
     void tearDown() {
         scheduler.shutdownNow();
+        com.nexusai.common.SessionProjectRoot.reset();
     }
 
     // ── helpers ──
 
+    /** sidecar 会话目录 = {projectRoot}/{creatingSession}（sessionDirFor 契约）。 */
+    private Path sidecarDir(String creatingSessionId) {
+        return projectRoot.resolve(creatingSessionId);
+    }
+
     private RemoteAgentTaskService.RegisterOptions options(String sessionId, String title) {
-        // 第 10 参 creatingSessionId = null（无本地会话，回落全局）—— cron-notify 前语义不变。
+        // 第 10 参 creatingSessionId = 本地创建会话（sidecar 目录锚 {projectRoot}/{creatingSession}）。
         return new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.REMOTE_AGENT,
-            sessionId, title, "claude -p 'do it'", "tool-1", null, null, null, null, null);
+            sessionId, title, "claude -p 'do it'", "tool-1", null, null, null, null, CREATING_SESSION);
     }
 
     private static void await(long timeoutMs, java.util.function.BooleanSupplier cond) throws InterruptedException {
@@ -151,10 +176,10 @@ class RemoteAgentTaskServiceTest {
 
     // ── 注册 ──
 
-    // ── 批次Y Q3：输出根收敛唯一根 + 红线豁免（输出 temp，sidecar 留项目目录） ──
+    // ── 批次Y Q3：输出根收敛唯一根 + 红线豁免（输出 temp，sidecar 留项目目录 · [TL-W2 P7] 按 sessionId 现算） ──
 
     @Test
-    @DisplayName("批次Y: 输出落 taskOutputDirSupplier(temp 唯一根)，sidecar 落 sessionDirSupplier(项目目录) —— 两根解耦（红线豁免）")
+    @DisplayName("批次Y: 输出落 taskOutputDirSupplier(temp 唯一根)，sidecar 落 {projectRoot}/{creatingSession}(项目目录) —— 两根解耦（红线豁免 + [TL-W2 P7] 按 sessionId 现算）")
     void register_outputInTempRoot_sidecarInProjectDir_decoupled() throws Exception {
         // WHY（批次Y Q3 意图，规则九）：CC RemoteAgentTask.tsx 输出走统一 diskOutput（temp，
         //   绝不在项目目录）；项目目录只有元数据 sidecar remote-agents/*.meta.json
@@ -163,19 +188,19 @@ class RemoteAgentTaskServiceTest {
         //   拆分：taskOutputDirSupplier（temp）与 sessionDirSupplier（项目目录）是<b>两个独立根</b>，
         //   输出不再经 currentSessionProjectRoot（projectRoot 回落链本身不动，只拆输出落点耦合）。
         //   若回归把输出写回项目目录（两 supplier 合并），本测试立即变红。
-        // 本测试注入：sessionDir=tempDir（项目目录），taskOutputDir=tempDir.resolve("output")（temp 根）
+        // 本测试注入：sidecar 会话目录 = {projectRoot}/{creatingSession}（项目目录侧），taskOutputDir=tempDir.resolve("output")（temp 根）
         RemoteAgentTaskService.RegisteredRemoteTask reg = service.registerRemoteAgentTask(options("sess-1", "部署"));
         try {
             // 输出文件 = taskOutputDirSupplier + <taskId>.output（init 建空文件）
             Path outputPath = tempDir.resolve("output").resolve(reg.taskId() + ".output");
             assertThat(outputPath).as("输出文件必须落 taskOutputDirSupplier（temp 根）").exists();
-            // 输出文件不在项目目录根（sessionDir=tempDir）下 —— 两根解耦，输出不再写项目目录
-            assertThat(tempDir.resolve(reg.taskId() + ".output"))
+            // 输出文件不在项目目录侧（sidecar 会话目录 = {projectRoot}/{creatingSession}）根下 —— 两根解耦
+            assertThat(projectRoot.resolve(reg.taskId() + ".output"))
                 .as("项目目录（sessionDir）下不得有输出文件（输出根与 sidecar 根解耦）").doesNotExist();
-            assertThat(tempDir.resolve("tasks").resolve(reg.taskId() + ".output"))
+            assertThat(projectRoot.resolve("tasks").resolve(reg.taskId() + ".output"))
                 .as("旧项目目录 tasks 根下不得有输出文件").doesNotExist();
-            // sidecar 留项目目录（sessionDirSupplier → remote-agents）
-            assertThat(RemoteAgentMetadataStore.getRemoteAgentMetadataPath(tempDir, reg.taskId()))
+            // sidecar 留项目目录（sessionDirFor(sessionId) → remote-agents）
+            assertThat(RemoteAgentMetadataStore.getRemoteAgentMetadataPath(sidecarDir(CREATING_SESSION), reg.taskId()))
                 .as("sidecar 留项目目录（对齐 CC sessionStorage.ts:320-328）").exists();
         } finally {
             reg.cleanup().run();
@@ -197,7 +222,7 @@ class RemoteAgentTaskServiceTest {
                 .as("store 承载 outputFile = taskOutputDirSupplier 唯一根")
                 .isEqualTo(tempDir.resolve("output").resolve(reg.taskId() + ".output").toString());
             // 旧项目目录根形态（{sessionDir}/{sessionId}/tasks 或直接 {sessionDir}/tasks）不得再产出
-            assertThat(stored.outputFile()).doesNotContain(tempDir.resolve("tasks").toString());
+            assertThat(stored.outputFile()).doesNotContain(projectRoot.resolve("tasks").toString());
             assertThat(stored.outputFile()).startsWith(tempDir.resolve("output").toString());
         } finally {
             reg.cleanup().run();
@@ -224,8 +249,8 @@ class RemoteAgentTaskServiceTest {
         String xml = items.get(0).value();
         Path expectedOutput = tempDir.resolve("output").resolve(reg.taskId() + ".output");
         assertThat(xml).as("完成通知 <output-file> 引用新唯一根").contains("<output-file>" + expectedOutput + "</output-file>");
-        assertThat(xml).as("完成通知不得引用项目目录根").doesNotContain("<output-file>" + tempDir.resolve(reg.taskId() + ".output") + "</output-file>");
-        await(1000, () -> RemoteAgentMetadataStore.read(tempDir, reg.taskId()) == null);
+        assertThat(xml).as("完成通知不得引用项目目录根").doesNotContain("<output-file>" + projectRoot.resolve(reg.taskId() + ".output") + "</output-file>");
+        await(1000, () -> RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), reg.taskId()) == null);
     }
 
     /**
@@ -241,6 +266,8 @@ class RemoteAgentTaskServiceTest {
     void terminalNotification_carriesCreatingSession() throws Exception {
         String remoteCcrSession = "cse-rem-remote1";
         String localCreateSession = "sess-rem-local1";
+        // [TL-W2 P7] 本地创建会话需绑定项目根，sidecar 才落盘（{projectRoot}/{creatingSession}）
+        com.nexusai.common.SessionProjectRoot.setForSession(localCreateSession, projectRoot.toString());
         // 第 10 参 creatingSessionId = 本地创建会话（生产 caller 从 ctx.sessionId() 透传）；
         // RegisterOptions.sessionId 仍为 remote CCR（API 轮询用）。
         RemoteAgentTaskService.RegisterOptions opts =
@@ -283,7 +310,7 @@ class RemoteAgentTaskServiceTest {
             assertThat(framework.getTask(reg.taskId())).isPresent();
             assertThat(framework.getTask(reg.taskId()).get().status()).isEqualTo(BackgroundTaskStatus.RUNNING);
             // sidecar 写入（:442-454）
-            assertThat(RemoteAgentMetadataStore.getRemoteAgentMetadataPath(tempDir, reg.taskId())).exists();
+            assertThat(RemoteAgentMetadataStore.getRemoteAgentMetadataPath(sidecarDir(CREATING_SESSION), reg.taskId())).exists();
             // poll 已启动（:460）— stub 被调用
             await(1000, () -> api.pollCalls >= 1);
             assertThat(api.pollCalls).isGreaterThanOrEqualTo(1);
@@ -297,7 +324,7 @@ class RemoteAgentTaskServiceTest {
     private void writeSidecar(String taskId, String sessionId, String remoteTaskType) {
         RemoteAgentMetadata meta = new RemoteAgentMetadata(taskId, remoteTaskType, sessionId,
             "部署", "claude -p 'x'", 5000L, "tool-1", null, null, null, null, null);
-        RemoteAgentMetadataStore.write(tempDir, meta);
+        RemoteAgentMetadataStore.write(sidecarDir(CREATING_SESSION), meta);
     }
 
     @Test
@@ -306,9 +333,9 @@ class RemoteAgentTaskServiceTest {
         writeSidecar("rdead0001", "sess-404", "remote-agent");
         api.fetchError = new RemoteSessionsApi.SessionNotFoundException("sess-404");
 
-        service.restoreRemoteAgentTasks();
+        service.restoreRemoteAgentTasks(CREATING_SESSION);
 
-        assertThat(RemoteAgentMetadataStore.read(tempDir, "rdead0001")).isNull();
+        assertThat(RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), "rdead0001")).isNull();
         assertThat(framework.getTask("rdead0001")).isEmpty();
     }
 
@@ -318,10 +345,10 @@ class RemoteAgentTaskServiceTest {
         writeSidecar("rkeep0001", "sess-401", "remote-agent");
         api.fetchError = new RemoteSessionsApi.SessionExpiredException();
 
-        service.restoreRemoteAgentTasks();
+        service.restoreRemoteAgentTasks(CREATING_SESSION);
 
         // 401 是登录可恢复错误 — 远程会话仍在运行，不删 sidecar 不复活任务
-        assertThat(RemoteAgentMetadataStore.read(tempDir, "rkeep0001")).isNotNull();
+        assertThat(RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), "rkeep0001")).isNotNull();
         assertThat(framework.getTask("rkeep0001")).isEmpty();
     }
 
@@ -331,9 +358,9 @@ class RemoteAgentTaskServiceTest {
         writeSidecar("rarch0001", "sess-arch", "remote-agent");
         api.fetchResult = new RemoteSessionsApi.SessionResource("sess-arch", "archived", Map.of());
 
-        service.restoreRemoteAgentTasks();
+        service.restoreRemoteAgentTasks(CREATING_SESSION);
 
-        assertThat(RemoteAgentMetadataStore.read(tempDir, "rarch0001")).isNull();
+        assertThat(RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), "rarch0001")).isNull();
         assertThat(framework.getTask("rarch0001")).isEmpty();
     }
 
@@ -345,7 +372,7 @@ class RemoteAgentTaskServiceTest {
         // 保留默认 poll（空增量 + 不终止）→ 轮询持续
         api.defaultPoll = RemoteSessionsApi.PollResult.eventsOnly(List.of(), null);
 
-        service.restoreRemoteAgentTasks();
+        service.restoreRemoteAgentTasks(CREATING_SESSION);
 
         var task = framework.getTask("rrun00001");
         assertThat(task).isPresent();
@@ -353,7 +380,7 @@ class RemoteAgentTaskServiceTest {
         assertThat(task.get().startTime()).isEqualTo(5000L);
         assertThat(task.get().status()).isEqualTo(BackgroundTaskStatus.RUNNING);
         // sidecar 保留
-        assertThat(RemoteAgentMetadataStore.read(tempDir, "rrun00001")).isNotNull();
+        assertThat(RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), "rrun00001")).isNotNull();
         // 恢复轮询已启动
         await(1000, () -> api.pollCalls >= 1);
         assertThat(api.pollCalls).isGreaterThanOrEqualTo(1);
@@ -366,7 +393,7 @@ class RemoteAgentTaskServiceTest {
         api.fetchResult = new RemoteSessionsApi.SessionResource("sess-dirt", "running", Map.of());
         api.defaultPoll = RemoteSessionsApi.PollResult.eventsOnly(List.of(), null);
 
-        service.restoreRemoteAgentTasks();
+        service.restoreRemoteAgentTasks(CREATING_SESSION);
 
         assertThat(framework.getTask("rdirt0001")).isPresent();
     }
@@ -391,7 +418,7 @@ class RemoteAgentTaskServiceTest {
         assertThat(items.get(0).value()).contains("Remote task \"部署\" completed successfully");
         assertThat(items.get(0).value()).contains("<task-type>remote_agent</task-type>");
         // sidecar 删除（:587）— delete 为 poll 线程最后一步，await 避免时序竞争
-        await(1000, () -> RemoteAgentMetadataStore.read(tempDir, reg.taskId()) == null);
+        await(1000, () -> RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), reg.taskId()) == null);
         // 轮询停止
         int calls = api.pollCalls;
         await(300, () -> api.pollCalls == calls);
@@ -411,7 +438,7 @@ class RemoteAgentTaskServiceTest {
         List<NotificationQueue.QueueItem> items = drainTaskNotifications();
         assertThat(items).isNotEmpty();
         assertThat(items.get(0).value()).contains("<status>failed</status>");
-        await(1000, () -> RemoteAgentMetadataStore.read(tempDir, reg.taskId()) == null);
+        await(1000, () -> RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), reg.taskId()) == null);
     }
 
     @Test
@@ -438,7 +465,7 @@ class RemoteAgentTaskServiceTest {
         //      原 FIND-1 测试用非 review 任务断言 COMPLETED 是假绿（await 静默超时 + 文件断言
         //      与状态无关）；此正向用例锁死 review 稳定完成路径。
         var opts = new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.REMOTE_AGENT,
-            "sess-1", "代码审查", "claude -p 'review'", "tool-1", Boolean.TRUE, null, null, null, null);
+            "sess-1", "代码审查", "claude -p 'review'", "tool-1", Boolean.TRUE, null, null, null, CREATING_SESSION);
         RemoteAgentTaskService.RegisteredRemoteTask reg = service.registerRemoteAgentTask(opts);
         // 先来一条 assistant 输出（hasAssistantEvents=true，无 SessionStart hook），然后连续 idle
         api.pollQueue.add(new RemoteSessionsApi.PollResult(
@@ -462,7 +489,7 @@ class RemoteAgentTaskServiceTest {
         String xml = items.get(0).value();
         assertThat(xml).contains("<summary>Remote review completed</summary>");
         assertThat(xml).contains("working...");
-        await(1000, () -> RemoteAgentMetadataStore.read(tempDir, reg.taskId()) == null);
+        await(1000, () -> RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), reg.taskId()) == null);
     }
 
     @Test
@@ -571,7 +598,7 @@ class RemoteAgentTaskServiceTest {
         assertThat(evt).isNotNull();
         assertThat(evt.status()).isEqualTo("stopped");
         // sidecar 删除（:845）
-        assertThat(RemoteAgentMetadataStore.read(tempDir, reg.taskId())).isNull();
+        assertThat(RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), reg.taskId())).isNull();
     }
 
     @Test
@@ -617,7 +644,7 @@ class RemoteAgentTaskServiceTest {
         //   间接），summary 固定 "Remote review completed"。若误走 enqueueRemoteNotification 则
         //   会带 <output-file> 引用 + "Remote task ..." 文案 —— 两条路径可观测区分。
         var opts = new RemoteAgentTaskService.RegisterOptions(RemoteTaskType.REMOTE_AGENT,
-            "sess-1", "代码审查", "claude -p 'hunt'", "tool-1", Boolean.TRUE, null, null, null, null);
+            "sess-1", "代码审查", "claude -p 'hunt'", "tool-1", Boolean.TRUE, null, null, null, CREATING_SESSION);
         RemoteAgentTaskService.RegisteredRemoteTask reg = service.registerRemoteAgentTask(opts);
         // bughunter：SessionStart hook 的 echo 落 hook_progress；tag 出现在运行末尾
         api.pollQueue.add(new RemoteSessionsApi.PollResult(
@@ -640,7 +667,7 @@ class RemoteAgentTaskServiceTest {
         assertThat(xml).as("review 完成通知 summary 固定").contains("<summary>Remote review completed</summary>");
         assertThat(xml).as("review 完成通知不应引用 output-file（CC 明确无文件间接）").doesNotContain("<output-file>");
         assertThat(xml).as("review 完成通知不应带 'Remote task' 文案（非 enqueueRemoteNotification）").doesNotContain("Remote task \"");
-        await(1000, () -> RemoteAgentMetadataStore.read(tempDir, reg.taskId()) == null);
+        await(1000, () -> RemoteAgentMetadataStore.read(sidecarDir(CREATING_SESSION), reg.taskId()) == null);
     }
 
     @Test

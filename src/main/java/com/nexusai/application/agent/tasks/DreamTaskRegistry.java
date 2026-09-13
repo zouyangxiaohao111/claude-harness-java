@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /**
  * Dream 任务注册表 · 对齐 CC tasks/DreamTask/DreamTask.ts:52-104（registerDreamTask + addDreamTurn）
@@ -64,8 +64,13 @@ public class DreamTaskRegistry {
      * <p>{@link #kill} 把 running → killed 后调用（对齐 DreamTask.kill）；由接线方注入
      * AutoDreamConsolidator 的 ConsolidationLock 等价体（ToolRegistrationConfig 装配）。
      * 可为 null（未装配时 kill 不回退锁 —— CC priorMtime undefined → 跳过等价）。
+     *
+     * <p><b>[TL-W2 P9]</b> 签名由 {@code Consumer<Long>} 改 {@code BiConsumer<String, Long>}
+     * （taskId, priorMtime）：kill 触发线程（REST / TaskStop 派发）不是会话线程，回退所需的
+     * memoryDir 必须随任务 <b>显式携带</b>（实现方按 taskId 查自己的 per-task 记录），
+     * 绝不在 kill 线程现算 {@code storage.memoryDir()}（ThreadLocal 空 → 回落 config home → NPE）。
      */
-    private volatile Consumer<Long> rollbackConsolidationLock;
+    private volatile BiConsumer<String, Long> rollbackConsolidationLock;
 
     public DreamTaskRegistry() {
         this(null);
@@ -76,7 +81,7 @@ public class DreamTaskRegistry {
     }
 
     /** 注入锁 mtime 回退 seam（kill 时回退 consolidation lock mtime · DreamTask.ts:153-155）。 */
-    public void setRollbackConsolidationLock(Consumer<Long> rollbackConsolidationLock) {
+    public void setRollbackConsolidationLock(BiConsumer<String, Long> rollbackConsolidationLock) {
         this.rollbackConsolidationLock = rollbackConsolidationLock;
     }
 
@@ -267,9 +272,10 @@ public class DreamTaskRegistry {
         }
         log.info("DreamTaskRegistry.kill: taskId={}, status=killed, endTime={}, priorMtime={}, abortController 已 abort + 清空",
             taskId, now, priorMtime);
-        Consumer<Long> rollback = rollbackConsolidationLock;
+        BiConsumer<String, Long> rollback = rollbackConsolidationLock;
         if (rollback != null) {
-            rollback.accept(priorMtime);
+            // [TL-W2 P9] 带 taskId：实现方按任务显式携带的 memoryDir 回退（不在本线程现算）
+            rollback.accept(taskId, priorMtime);
         }
         return true;
     }

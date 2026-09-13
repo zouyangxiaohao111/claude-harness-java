@@ -71,4 +71,41 @@ class MemoryStorageTest {
 
         assertThat(storage.list()).isEmpty();
     }
+
+    @Test
+    @DisplayName("[TL-W2 P9] 解析型 storage 按 sessionId/projectRoot 显式现算；未绑定 → null（无参 memoryDir() 已删，零 ThreadLocal 读）")
+    void resolverStorage_memoryDir_isSessionScoped_noThreadLocalFallback(@TempDir Path tempDir) throws Exception {
+        // WHY（规则九 · 审计 P9）：旧无参 memoryDir() 经 autoMemPaths.getAutoMemPath()（无参）在
+        //   **消费线程**读 AutoMemPaths.currentSessionProjectRoot() —— 非会话线程（REST / ForkJoinPool
+        //   fork / hook / TaskStop）ThreadLocal 必空 ⇒ 回落 config home ⇒ A′ 判无效返回 null ⇒
+        //   下游 new ConsolidationLock(null) / memoryDir().toString() NPE（静默写错目录或 500）。
+        //   现契约：解析型必须显式传会话（sessionId 或 projectRoot），未绑定 → null（A′）。
+        // RED: 把 memoryDir(sessionId) 改回忽略入参的 autoMemPaths.getAutoMemPath() → 首断言
+        //   （绑定会话必须解析出 per-project 目录）变红（测试线程 ThreadLocal 空 → config home → A′ null）。
+        Path proj = Files.createDirectories(tempDir.resolve("proj"));
+        com.nexusai.common.SessionProjectRoot.setForSession("sess-p9", proj.toString());
+        try {
+            MemoryStorage storage = new MemoryStorage(AutoMemPaths.defaultInstance());
+
+            Path resolved = storage.memoryDir("sess-p9");
+            assertThat(resolved)
+                .as("绑定会话 → per-project 记忆目录（getAutoMemPath(explicitRoot)，零 ThreadLocal）")
+                .isNotNull();
+            assertThat(resolved.toString())
+                .as("目录必须锚绑定项目 slug（非 config home 自身 slug）")
+                .contains(AutoMemPaths.sanitizePath(proj.toString()));
+
+            assertThat(storage.memoryDir("sess-p9-unbound"))
+                .as("未绑定会话 → null（A′：无有效项目，绝不回落 config home）")
+                .isNull();
+            assertThat(storage.memoryDirForProjectRoot(proj.toString()))
+                .as("显式 projectRoot 入口与 sessionId 入口同源（同一解析器）")
+                .isEqualTo(resolved);
+            assertThat(storage.memoryDirForProjectRoot(null))
+                .as("projectRoot null → null（不猜、不回落）")
+                .isNull();
+        } finally {
+            com.nexusai.common.SessionProjectRoot.clearSession("sess-p9");
+        }
+    }
 }

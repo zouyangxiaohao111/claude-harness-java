@@ -282,7 +282,8 @@ class TaskStopDispatchTest {
             });
         com.nexusai.application.agent.remote.RemoteAgentTaskService svc =
             new com.nexusai.application.agent.remote.RemoteAgentTaskService(
-                service, nq, sdk, api, () -> tempDir, () -> tempDir.resolve("out"), scheduler, 50L);
+                service, nq, sdk, api, com.nexusai.common.SessionProjectRoot::getForSession,
+                () -> tempDir.resolve("out"), scheduler, 50L);
         runner.setRemoteAgentTaskService(svc);
         return new RemoteCtx(runner, nq, sdk, service, svc, api, scheduler);
     }
