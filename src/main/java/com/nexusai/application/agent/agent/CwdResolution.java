@@ -1,6 +1,5 @@
 package com.nexusai.application.agent.agent;
 
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.common.SessionProjectRoot;
 import org.slf4j.Logger;
@@ -41,7 +40,7 @@ import java.util.function.Supplier;
  * <p><b>[CRON-D5 F2 返工] 双键解析</b>：第 2/3 层（sessionCwd/boundProject）的 Map 键形态不同——
  * sessionCwd 层以派生 UUID 串为键（BashTool/EnterWorktreeTool 经 {@code ctx.sessionId()}），
  * boundProject 层以原始键 {@code "sess-xxx"} 为键（bind / resolveSessionProjectRoot 经 streamSessionId）。
- * 传入 sessionId 可能是任一形态（cron 后台线程透传派生 UUID / HTTP MDC 为原始键），每层先试原键、
+ * 传入 sessionId 可能是任一形态（cron 后台线程透传派生 UUID / REST 入口显式传入的原始键），每层先试原键、
  * MISS 再试另一形态（{@link #alternateKeyOf}，严格超集仅补缺失路径，两形态键域不重叠无错配）。
  *
  * <p><b>[Fix-R1] 合并存储</b>：worktree 入口（{@code EnterWorktreeTool.ts:95 setCwd}）与 bash
@@ -96,7 +95,7 @@ public final class CwdResolution {
      * （BashTool/EnterWorktreeTool 以 {@code ctx.sessionId()} 登记），boundProject/
      * SessionProjectRoot 层以原始会话键 {@code "sess-xxx"} 为键（bind / resolveSessionProjectRoot 以
      * streamSessionId 登记）。传入的 sessionId 可能是任一形态（cron 后台线程经 QueueItem 透传派生 UUID；
-     * HTTP 线程 MDC 为原始键），故每层先试原键、MISS 再试另一形态（{@link #alternateKeyOf}，严格超集，
+     * REST 入口显式传入的原始键），故每层先试原键、MISS 再试另一形态（{@link #alternateKeyOf}，严格超集，
      * 仅补缺失解析路径，两形态键域不重叠无错配）。
      *
      * @param sessionId 会话 ID（null 时跳过 sessionCwd/boundProject 层，回落 override/user.dir）
@@ -139,13 +138,6 @@ public final class CwdResolution {
         // L4: user.dir 兜底（JVM 启动目录，对齐 CC 进程启动 cwd）
         String userDir = System.getProperty("user.dir");
         return normalizeCwd(userDir != null ? userDir : "");
-    }
-
-    /**
-     * 无参重载：从 {@link RequestContext#sessionId()} 取 sessionId（对齐 CC pwd() 无参取全局 STATE 语义）。
-     */
-    public static String getCwd() {
-        return getCwd(RequestContext.sessionId());
     }
 
     /**
@@ -225,13 +217,6 @@ public final class CwdResolution {
         }
         // 存量派生 UUID 串 → 原始键（boundProject 层以 "sess-xxx" 为键）；不可逆 → null
         return SessionKeys.originalKey(sessionId);
-    }
-
-    /**
-     * 无参重载：从 {@link RequestContext#sessionId()} 取 sessionId。
-     */
-    public static String getOriginalCwdLayer() {
-        return getOriginalCwdLayer(RequestContext.sessionId());
     }
 
     /**

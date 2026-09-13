@@ -757,7 +757,11 @@ public class SkillToolImpl implements Tool {
         //   → errorCode 6「Remote skill X was not discovered...」；有 meta → pass。Java 无 remote execution
         //   + 非 ant → 不实现；契约骨架见 skillsearch/SkillSearchRemoteExecution.java（接线待对接）。
         // 查找命令（P2-9: 含 MCP thread-in · CC SkillTool.ts:399-402 以 getAllCommands(context) 为搜索基座）
-        Command cmd = registry.findCommandIncludingMcp(skillName);
+        // [批 3c] 会话标识显式取自本方法形参 context（ToolUseContext.sessionId()）——技能搜索基座随
+        //   会话绑定项目变化（决定 project 级技能可见性）。生产路径 ctx 恒非 null（ToolInputValidator:493
+        //   已拒 null ctx）；此处保留与 checkPermissions 同款 null 防御。原经裸 MDC 会话槽读取，已删。
+        String sessionId = context != null ? context.sessionId() : null;
+        Command cmd = registry.findCommandIncludingMcp(skillName, sessionId);
         if (cmd == null) {
             return ValidationResult.fail("2", "Unknown skill: " + skillName);
         }
@@ -1138,7 +1142,10 @@ public class SkillToolImpl implements Tool {
 
         // ③ 命令对象（供 safe-properties 检查 + default Ask metadata.command）
         //    P2-9: 含 MCP thread-in · CC SkillTool.ts:446-447 getAllCommands(context) + findCommand
-        Command commandObj = registry.findCommandIncludingMcp(commandName);
+        //    [批 3c] 会话标识显式取自本方法形参 context（ToolUseContext.sessionId()）；context 可 null
+        //      （测试可缺省，同 ② 的 permCtx 语义）→ null 时技能清单按进程默认解析。原经裸 MDC 读取，已删。
+        Command commandObj = registry.findCommandIncludingMcp(commandName,
+                context != null ? context.sessionId() : null);
 
         // ④ deny 循环（CC SkillTool.ts:470-486）· deny 规则最高优先
         Map<String, PermissionRule> denyRules = permCtx == null
@@ -1423,7 +1430,8 @@ public class SkillToolImpl implements Tool {
                 }
             }
 
-            Command cmd = registry.findCommandIncludingMcp(skillName);
+            // [批 3c] 会话标识复用上方已解析的 ctx.sessionId()（本方法局部 sessionId，原先经裸 MDC 读取，已删）
+            Command cmd = registry.findCommandIncludingMcp(skillName, sessionId);
             if (cmd == null) {
                 return ToolResult.error(block.id(), "Unknown skill: " + skillName);
             }

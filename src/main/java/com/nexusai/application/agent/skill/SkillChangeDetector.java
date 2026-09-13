@@ -2,7 +2,6 @@ package com.nexusai.application.agent.skill;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.permission.hook.GenericHook;
 import com.nexusai.application.agent.permission.hook.HookCommand;
 import com.nexusai.application.agent.permission.hook.HookEvent;
@@ -158,11 +157,14 @@ public class SkillChangeDetector implements ApplicationRunner {
     /**
      * watcher 监听项目根 · 对齐 CC getOriginalCwd()（state.ts:509 skills 属 projectRoot 稳定锚）。
      *
-     * <p>字段初始化时经 RequestContext 取会话 originalCwd；无 sessionId（Spring 单例启动期）回落
-     * user.dir（方案 1，零行为变化）。
+     * <p>[批 3c] <b>字段初始化期无会话来源</b>（Spring 单例启动期）：静态方法体无 sessionId 形参、
+     * 唯一调用点是同文件字段初始化 {@code projectDir = Path.of(resolveWatcherProjectDir())}，
+     * 无会话上下文可穿透 → 显式传 {@code null}（无会话），CwdResolution 回落 user.dir，与旧实现
+     * （单例构造线程无 MDC）行为零变化。会话感知需调用方（{@code SkillChangeDetector} 生产装配点，
+     * 不在本批清单）改为构造期显式传入会话 projectDir。
      */
     private static String resolveWatcherProjectDir() {
-        String cwd = CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+        String cwd = CwdResolution.getOriginalCwdLayer(null);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 

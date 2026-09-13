@@ -26,7 +26,6 @@ import com.nexusai.application.agent.tasks.BackgroundTask;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.mcp.McpServerService;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
@@ -321,7 +320,7 @@ public class CommandRegistrationConfig28 {
      * 状态；reconnect/no-redirect 面板 → 披露（web 无等价）。mcpServerService 未注入 → 披露。
      */
     private void registerMcpHandler(UserInputDispatcher dispatcher, McpServerService mcpServerService) {
-        dispatcher.registerSlashCommand("mcp", args -> {
+        dispatcher.registerSlashCommand("mcp", (args, sessionId, inFlightUserMessageId) -> {
             if (mcpServerService == null) {
                 log.warn("[CommandRegistrationConfig28] /mcp 未注入 McpServerService，跳过（web 端 MCP 面板走 REST /api/mcp）");
                 return;
@@ -383,7 +382,7 @@ public class CommandRegistrationConfig28 {
                                             ProjectSettingsLoader projectSettingsLoader,
                                             LocalSettingsLoader localSettingsLoader,
                                             DenialTracker denialTracker) {
-        dispatcher.registerSlashCommand("permissions", args -> {
+        dispatcher.registerSlashCommand("permissions", (args, sessionId, inFlightUserMessageId) -> {
             List<PermissionSourceLoaderRef> loaders = permissionLoaders(
                 userSettingsLoader, projectSettingsLoader, localSettingsLoader);
             if (loaders.isEmpty()) {
@@ -438,8 +437,8 @@ public class CommandRegistrationConfig28 {
      * 活跃 AgentState（会话空闲）→ planMode 仅本次日志记录（受控差异：AgentState 生命周期内有效）。
      */
     private void registerPlanHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry) {
-        dispatcher.registerSlashCommand("plan", args -> {
-            String sessionId = RequestContext.sessionId();
+        dispatcher.registerSlashCommand("plan", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             String trimmed = args != null ? args.trim() : "";
             PlanProviderImpl planProvider;
             try {
@@ -476,7 +475,7 @@ public class CommandRegistrationConfig28 {
 
     /** /hooks handler · CC commands/hooks/hooks.tsx:6-12 call → HookRegistry 计数披露。 */
     private void registerHooksHandler(UserInputDispatcher dispatcher, HookRegistry hookRegistry) {
-        dispatcher.registerSlashCommand("hooks", args -> {
+        dispatcher.registerSlashCommand("hooks", (args, sessionId, inFlightUserMessageId) -> {
             if (hookRegistry == null) {
                 log.warn("[CommandRegistrationConfig28] /hooks 未注入 HookRegistry（web 端 hook 配置走 REST）");
                 return;
@@ -491,18 +490,21 @@ public class CommandRegistrationConfig28 {
     /**
      * /skills handler · CC commands/skills/skills.tsx:5-7 call → SkillRegistry 完整真实列表。
      *
-     * <p><b>[commands-real-exec] 计数披露 → 真实完整列表</b>：{@link SkillRegistry#getAllCommands()}
+     * <p><b>[commands-real-exec] 计数披露 → 真实完整列表</b>：{@link SkillRegistry#getAllCommands(String)}
      * 返回合并全部来源（bundled / builtinPlugin / 文件系统 / dynamic / COMMANDS）的真实命令清单，
      * handler 按 {@link CommandSource} + type 分类统计并列出（bundled/disk/plugin 等源分类）。
+     *
+     * <p>[批 3c] 会话标识显式取自 handler 形参 {@code sessionId}（由 {@link UserInputDispatcher}
+     * 分派入口显式传入；原经裸 MDC 会话槽读取，已删）——命令清单随会话绑定项目变化（项目级技能/命令）。
      */
     private void registerSkillsHandler(UserInputDispatcher dispatcher, SkillRegistry skillRegistry) {
-        dispatcher.registerSlashCommand("skills", args -> {
+        dispatcher.registerSlashCommand("skills", (args, sessionId, inFlightUserMessageId) -> {
             if (skillRegistry == null) {
                 log.warn("[CommandRegistrationConfig28] /skills 未注入 SkillRegistry（web 端技能列表走 GET /api/command）");
                 return;
             }
             try {
-                List<Command> cmds = skillRegistry.getAllCommands();
+                List<Command> cmds = skillRegistry.getAllCommands(sessionId);
                 long promptLike = cmds.stream().filter(c -> "prompt".equals(c.getType())).count();
                 long localLike = cmds.stream().filter(c -> !"prompt".equals(c.getType())).count();
                 // 按 source 分类（CC commands.ts:374-467 五源合并 + source 值面）
@@ -544,8 +546,10 @@ public class CommandRegistrationConfig28 {
     private void registerAgentsHandler(UserInputDispatcher dispatcher,
                                        SubagentTool subagentTool,
                                        AgentSummaryService agentSummaryService) {
-        dispatcher.registerSlashCommand("agents", args -> {
-            AgentDefinitionRegistry registry = subagentTool != null ? subagentTool.agentRegistry() : null;
+        dispatcher.registerSlashCommand("agents", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话显式传参：handler 形参 sessionId 即本命令所属会话（⛔ 不再经裸 MDC）
+            AgentDefinitionRegistry registry = subagentTool != null
+                ? subagentTool.agentRegistry(sessionId) : null;
             if (registry == null) {
                 log.warn("[CommandRegistrationConfig28] /agents SubagentTool 未注入（web 端 subagent 管理走 REST SubagentController，仅披露）");
                 return;
@@ -574,7 +578,7 @@ public class CommandRegistrationConfig28 {
 
     /** /tasks handler · CC commands/tasks/tasks.tsx:5-7 call → TaskFrameworkService.listAll 计数。 */
     private void registerTasksHandler(UserInputDispatcher dispatcher, TaskFrameworkService taskFrameworkService) {
-        dispatcher.registerSlashCommand("tasks", args -> {
+        dispatcher.registerSlashCommand("tasks", (args, sessionId, inFlightUserMessageId) -> {
             if (taskFrameworkService == null) {
                 log.warn("[CommandRegistrationConfig28] /tasks 未注入 TaskFrameworkService（web 端后台任务走 REST TaskController）");
                 return;
@@ -599,8 +603,8 @@ public class CommandRegistrationConfig28 {
     private void registerExportHandler(UserInputDispatcher dispatcher,
                                        SessionService sessionService,
                                        MessageService messageService) {
-        dispatcher.registerSlashCommand("export", args -> {
-            String sessionId = RequestContext.sessionId();
+        dispatcher.registerSlashCommand("export", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             if (sessionService == null || messageService == null || sessionId == null || sessionId.isBlank()) {
                 log.warn("[CommandRegistrationConfig28] /export 未注入 SessionService/MessageService 或无会话上下文"
                     + "（web 端会话导出走 REST /api/v1/export/{sessionId}，filename={}）",
@@ -638,7 +642,7 @@ public class CommandRegistrationConfig28 {
      * 未注入 → 披露。
      */
     private void registerContextHandler(UserInputDispatcher dispatcher, ContextAnalyzeService contextAnalyzeService) {
-        dispatcher.registerSlashCommand("context", args -> {
+        dispatcher.registerSlashCommand("context", (args, sessionId, inFlightUserMessageId) -> {
             if (contextAnalyzeService == null) {
                 log.warn("[CommandRegistrationConfig28] /context 未注入 ContextAnalyzeService，跳过（web 上下文可视化走 REST）");
                 return;
@@ -658,8 +662,8 @@ public class CommandRegistrationConfig28 {
 
     /** /status handler · CC commands/status/status.tsx:5-7 call → SessionService 当前会话状态。 */
     private void registerStatusHandler(UserInputDispatcher dispatcher, SessionService sessionService) {
-        dispatcher.registerSlashCommand("status", args -> {
-            String sessionId = RequestContext.sessionId();
+        dispatcher.registerSlashCommand("status", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             if (sessionService == null || sessionId == null || sessionId.isBlank()) {
                 log.warn("[CommandRegistrationConfig28] /status 未注入 SessionService 或无会话上下文（对齐 CC status.tsx Settings 面板，web 走 SessionController REST）");
                 return;
@@ -686,13 +690,13 @@ public class CommandRegistrationConfig28 {
      * 受控差异：CC toggle（同 tag 再执行移除，需读当前 tag）读侧通道未接线 → 恒 add；空参/help → 用法披露。
      */
     private void registerTagHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("tag", args -> {
+        dispatcher.registerSlashCommand("tag", (args, sessionId, inFlightUserMessageId) -> {
             String tag = args != null ? args.trim() : "";
             if (tag.isBlank() || "help".equals(tag) || "--help".equals(tag)) {
                 log.info("[CommandRegistrationConfig28] /tag 用法: /tag <tag-name>（对齐 CC tag.tsx ShowHelp；门控 USER_TYPE==='ant' 默认关）");
                 return;
             }
-            String sessionId = RequestContext.sessionId();
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             if (sessionId == null || sessionId.isBlank()) {
                 log.warn("[CommandRegistrationConfig28] /tag 无活动会话可打标（CC tag.tsx:95 'No active session to tag'）");
                 return;
@@ -713,7 +717,7 @@ public class CommandRegistrationConfig28 {
 
     /** /usage handler · CC commands/usage/usage.tsx:4-6 call → AnalyticsTracker 事件计数披露。 */
     private void registerUsageHandler(UserInputDispatcher dispatcher, AnalyticsTracker analyticsTracker) {
-        dispatcher.registerSlashCommand("usage", args -> {
+        dispatcher.registerSlashCommand("usage", (args, sessionId, inFlightUserMessageId) -> {
             if (analyticsTracker == null) {
                 log.warn("[CommandRegistrationConfig28] /usage 未注入 AnalyticsTracker（web 计划用量走 SessionController/Usage REST）");
                 return;
@@ -734,8 +738,8 @@ public class CommandRegistrationConfig28 {
      * 真实统计（turn 数 / 工具调用排行 / 时长 / 模型）。transcript 不存在 / 读失败 → 空统计（fail loud）。
      */
     private void registerStatsHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry) {
-        dispatcher.registerSlashCommand("stats", args -> {
-            String sessionId = RequestContext.sessionId();
+        dispatcher.registerSlashCommand("stats", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             String projectRoot = sessionId != null && !sessionId.isBlank()
                 ? CwdResolution.getOriginalCwdLayer(sessionId)
                 : System.getProperty("user.dir", ".");
@@ -765,8 +769,8 @@ public class CommandRegistrationConfig28 {
      * <p>构造器以会话 cwd 直构（非 Spring bean），git 状态真实读取；非 git 仓库 / 无变更 → 披露。
      */
     private void registerDiffHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("diff", args -> {
-            String sessionId = RequestContext.sessionId();
+        dispatcher.registerSlashCommand("diff", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             String cwd = CwdResolution.getCwd(sessionId);
             if (cwd == null || cwd.isBlank()) {
                 cwd = System.getProperty("user.dir", ".");

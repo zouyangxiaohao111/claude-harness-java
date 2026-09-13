@@ -29,14 +29,20 @@ class DebugSkillRegistrarTest {
     void promptContainsRealTail() {
         DebugSkillRegistrar registrar = new DebugSkillRegistrar(
             () -> false,                              // isAnt
-            () -> "/tmp/debug.log",
+            // [批 3c] debugLogPathSupplier 形参改为 sessionId → path（原无参 Supplier 已废）；
+            //   本用例注入固定路径，故忽略 sessionId
+            sessionId -> "/tmp/debug.log",
             () -> false,                              // wasAlreadyLogging=false → just-enabled 段渲染
             (path, offset, size) -> "line1\nline2\nline3\n",   // 真实 tailReader
             path -> new DebugSkillRegistrar.FileStat(1000),     // 真实 statReader
             bytes -> bytes + " B",                              // fileSizeFormatter
-            source -> "/settings/" + source + ".json");         // settingsPathProvider
+            // [批 3c] SettingsPathProvider 第二参 = sessionId（project/local 路径基需会话 originalCwd）；
+            //   本用例注入固定模板，故忽略 sessionId
+            (source, sessionId) -> "/settings/" + source + ".json");         // settingsPathProvider
 
-        List<PromptBlock> blocks = registrar.getPromptForCommand("tool X 失败");
+        // [批 3c] 无会话 → 显式 null（第 2 参 = sessionId；本用例的 log 路径与 settings 三路径
+        //   全部由上面的 stub 供应器给固定值，sessionId 不参与任何断言）
+        List<PromptBlock> blocks = registrar.getPromptForCommand("tool X 失败", null);
         String prompt = blocks.get(0).text();
 
         assertThat(prompt)
@@ -63,12 +69,14 @@ class DebugSkillRegistrarTest {
     @DisplayName("ENOENT（NoSuchFileException）→ 'No debug log exists yet — logging was just enabled.'")
     void enoentFallsBackToNoLogYet() {
         DebugSkillRegistrar registrar = new DebugSkillRegistrar(
-            () -> false, () -> "/tmp/debug.log", () -> false,
+            () -> false, sessionId -> "/tmp/debug.log", () -> false,
             (p, o, s) -> "x",
             path -> { throw new NoSuchFileException(path); },
-            b -> "" + b, source -> source);
+            b -> "" + b, (source, sessionId) -> source);
 
-        List<PromptBlock> blocks = registrar.getPromptForCommand(null);
+        // [批 3c] 无会话 → 显式 null（第 2 参 = sessionId；log 路径由 stub 供应器给固定值，
+        //   sessionId 不参与断言）
+        List<PromptBlock> blocks = registrar.getPromptForCommand(null, null);
 
         assertThat(blocks.get(0).text())
             .as("CC debug.ts:54-55 isENOENT → 'No debug log exists yet'")
@@ -79,12 +87,14 @@ class DebugSkillRegistrarTest {
     @DisplayName("其他 IOException → 'Failed to read last 20 lines...' 且 wasAlreadyLogging=true 不渲染 just-enabled")
     void otherIoErrorFallsBackWithMessage() {
         DebugSkillRegistrar registrar = new DebugSkillRegistrar(
-            () -> false, () -> "/tmp/debug.log", () -> true,   // wasAlreadyLogging=true
+            () -> false, sessionId -> "/tmp/debug.log", () -> true,   // wasAlreadyLogging=true
             (p, o, s) -> "x",
             path -> { throw new java.io.IOException("boom"); },
-            b -> "" + b, source -> source);
+            b -> "" + b, (source, sessionId) -> source);
 
-        List<PromptBlock> blocks = registrar.getPromptForCommand(null);
+        // [批 3c] 无会话 → 显式 null（第 2 参 = sessionId；log 路径由 stub 供应器给固定值，
+        //   sessionId 不参与断言）
+        List<PromptBlock> blocks = registrar.getPromptForCommand(null, null);
 
         assertThat(blocks.get(0).text())
             .as("CC debug.ts:56 isENOENT=false → 'Failed to read last 20 lines'")
@@ -97,9 +107,9 @@ class DebugSkillRegistrarTest {
     @DisplayName("register() 产出 debug skill：disableModelInvocation=true + allowedTools=[Read,Grep,Glob] + argumentHint")
     void registerProducesDebugDefinition() {
         DebugSkillRegistrar registrar = new DebugSkillRegistrar(
-            () -> false, () -> "/tmp/debug.log", () -> false,
+            () -> false, sessionId -> "/tmp/debug.log", () -> false,
             (p, o, s) -> "x", path -> new DebugSkillRegistrar.FileStat(0),
-            b -> "" + b, source -> source);
+            b -> "" + b, (source, sessionId) -> source);
 
         BundledSkillDefinition def = registrar.register();
 

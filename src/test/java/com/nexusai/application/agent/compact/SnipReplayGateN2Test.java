@@ -7,7 +7,6 @@ import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.PartialCompactRequest;
 import com.nexusai.model.session.dto.Role;
-import com.nexusai.common.RequestContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -66,7 +65,6 @@ class SnipReplayGateN2Test {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         CompactProgressState.clear();
         CompactProgressState.clearAbort();
         CompactProgressState.removeSessionAbort(SESSION);

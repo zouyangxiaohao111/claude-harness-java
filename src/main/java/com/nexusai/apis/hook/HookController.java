@@ -65,7 +65,7 @@ public class HookController {
     @GetMapping
     public List<HookItemDto> getAllHooks(
             @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
-        // 批 3a：sessionId **必填**（缺 ⇒ 400）。旧实现 query 缺值时回落 RequestContext.sessionId()
+        // 批 3a：sessionId **必填**（缺 ⇒ 400）。旧实现 query 缺值时回落 裸 MDC 的 sessionId()
         //   （裸 MDC）——MDC 第三态会读到上一请求残留的别的会话 id，使本次请求展示的是别的会话的
         //   SESSION_HOOK 合并结果（看起来完全合法，日志前缀同样来自 MDC ⇒ 无法自查）。fail loud 消除该态。
         if (sessionIdParam == null || sessionIdParam.isBlank()) {

@@ -6,7 +6,6 @@ import com.nexusai.application.agent.tool.impl.TaskGetTool;
 import com.nexusai.application.agent.tool.impl.TaskListTool;
 import com.nexusai.application.agent.tool.impl.TaskUpdateTool;
 import com.nexusai.application.agent.tool.impl.TodoWriteTool;
-import com.nexusai.common.RequestContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -17,92 +16,80 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
 /**
- * S11 默认 V1/V2 装配断言 · 对齐 CC tasks.ts:133-139 isTodoV2Enabled() + 决策 #65
+ * S11 V1/V2 装配断言 · 对齐 CC tasks.ts:133-139 isTodoV2Enabled()
  *
  * <p><b>WHY (意图验证)</b>: CC {@code isTodoV2Enabled()} = env truthy 强制 true（tasks.ts:135-136），
  * 否则 {@code !getIsNonInteractiveSession()} = {@code STATE.isInteractive}（tasks.ts:138 /
  * state.ts:1057-1059）。</p>
  *
- * <p><b>决策 #65（2026-08-23 用户拍板）</b>: Java Web 后端会话（有前端用户）应视为交互 →
- * {@code isInteractive()} 在 Web 请求路径（RequestContext 有 reqId）默认 true → todoV2 默认开；
- * cron/后台（仅 sessionId，无 reqId）→ 非交互 → V1 TodoWrite。故：
+ * <p><b>[批 3c · 2026-09-13 推翻决策 #65]</b> 本类原锁「无请求上下文 / cron/后台 → V1 TodoWrite」。
+ * 该判据读<b>裸 MDC 会话槽</b>（{@code requestId()!=null}，该工具类批 3c 已整体删除）（MDC 第三态：
+ * 可能读到上一请求残留的、别的会话的 id；且消费点 {@code Tool.isEnabled()} 无会话参数、删后无显式
+ * 来源可传）⇒ 判定提升为<b>进程级</b>（对齐 CC {@code STATE.isInteractive}），无 sysprop 时默认
+ * <b>交互（V2）</b>。故本类的 V1 默认断言<b>逐条反转</b>为 V2 默认断言（不是删 —— 旧断言会阻止
+ * 任何人把判定改回 CC 的进程级语义，正是它给那个偏离行为背了书）。</p>
+ *
+ * <p>现语义（逐条）：
  * <ul>
- *   <li><b>无请求上下文 / cron/后台</b>（RequestContext 仅 sessionId 或无 MDC）→ V1：
- *       {@code isTodoV2Enabled()==false} → TodoWrite 可注册（isEnabled=true）、Task 工具族不可注册。</li>
- *   <li><b>Web 请求上下文</b>（RequestContext 设 sessionId + reqId）→ V2：
+ *   <li><b>无 sysprop 注入</b>（无论有无会话 / 有无 MDC）→ 进程级默认交互 → V2：
  *       {@code isTodoV2Enabled()==true} → TodoWrite 不可注册、Task 工具族可注册。</li>
- *   <li>显式开启（enableTaskV2 / nexusai.tasks.enabled / nexusai.interactive=true）→ V2；
- *       显式 nexusai.interactive=false → V1。</li>
+ *   <li>显式 {@code nexusai.tasks.enabled=true} / {@code nexusai.interactive=true} → V2（不变）。</li>
+ *   <li>显式 {@code nexusai.interactive=false} → V1（<b>唯一降级通道</b>）。</li>
  * </ul>
  *
  * <p>纯单元测试（无 Spring 上下文），经 isEnabled 链断言装配语义
  * （ToolRegistrationConfig.todoTaskTools 的 V1/V2 分支即 !isTodoV2Enabled() 判定）。
+ * 进程级「不随线程变」的机制级守卫见 {@link TaskSystemConfigProcessLevelTest}。
  */
 class TaskSystemConfigDefaultV1Test {
 
     @AfterEach
     void tearDown() {
         TaskSystemConfig.clearForTest();
-        RequestContext.clear();
     }
 
     @Test
-    @DisplayName("无请求上下文（无 sysprop 注入）isTodoV2Enabled()==false → V1")
-    void noContext_noSysprop_isTodoV2Enabled_false() {
+    @DisplayName("[批 3c 反转] 无 sysprop 注入 → 进程级默认交互 → isTodoV2Enabled()==true → V2")
+    void noContext_noSysprop_isTodoV2Enabled_true() {
         TaskSystemConfig.clearForTest();
-        RequestContext.clear();
-        assertThat(TaskSystemConfig.isTodoV2Enabled()).isFalse();
+        assertThat(TaskSystemConfig.isTodoV2Enabled())
+            .as("无 sysprop → 进程级默认交互（对齐 CC STATE.isInteractive），不再按 MDC 有无判 V1")
+            .isTrue();
     }
 
     @Test
-    @DisplayName("无请求上下文（无 sysprop 注入）isInteractive()==false（对齐 CC STATE.isInteractive 非交互默认）")
-    void noContext_noSysprop_isInteractive_false() {
+    @DisplayName("[批 3c 反转] 无 sysprop 注入 → isInteractive()==true（Web UI 后端=交互进程）")
+    void noContext_noSysprop_isInteractive_true() {
         TaskSystemConfig.clearForTest();
-        RequestContext.clear();
-        assertThat(TaskSystemConfig.isInteractive()).isFalse();
-    }
-
-    @Test
-    @DisplayName("cron/后台上下文（仅 sessionId 无 reqId）→ 非交互 → V1 TodoWrite（决策#65 区分后台/cron）")
-    void cronContext_onlySessionId_nonInteractive_v1() {
-        TaskSystemConfig.clearForTest();
-        RequestContext.setSession("sess-cron");
-
-        assertThat(TaskSystemConfig.isInteractive()).isFalse();
-        assertThat(TaskSystemConfig.isTodoV2Enabled()).isFalse();
-        assertThat(new TodoWriteTool().isEnabled()).isTrue();
-        assertThat(new TaskCreateTool(mock(TaskService.class), mock(HookRegistry.class)).isEnabled()).isFalse();
-    }
-
-    @Test
-    @DisplayName("Web 请求上下文（sessionId + reqId）→ 交互 → todoV2 默认开 → V2（决策#65 Web 会话默认 V2）")
-    void webRequestContext_interactive_v2() {
-        TaskSystemConfig.clearForTest();
-        RequestContext.set("sess-web", "msg-1");
-
         assertThat(TaskSystemConfig.isInteractive()).isTrue();
+    }
+
+    @Test
+    @DisplayName("[批 3c 反转] cron/后台轮次 → 与 Web 轮次同为 V2（进程级判定，不再按 reqId 降级 V1）")
+    void cronTurn_isAlsoV2_processLevel() {
+        TaskSystemConfig.clearForTest();
+
+        assertThat(TaskSystemConfig.isInteractive())
+            .as("进程级判定不区分 Web/cron —— 对齐 CC（同一进程 STATE.isInteractive 恒同值）").isTrue();
         assertThat(TaskSystemConfig.isTodoV2Enabled()).isTrue();
+        assertThat(new TodoWriteTool().isEnabled())
+            .as("V2 模式下 TodoWrite 不注册（cron 轮次亦同）").isFalse();
+        assertThat(new TaskCreateTool(mock(TaskService.class), mock(HookRegistry.class)).isEnabled()).isTrue();
+    }
+
+    @Test
+    @DisplayName("[批 3c 反转] 无 sysprop 默认 V2 装配：TodoWrite 不可注册，Task 工具族全部可注册")
+    void noContext_v2_todoWriteNotRegistered_taskToolsRegistered() {
+        TaskSystemConfig.clearForTest();
+
+        // V2：TodoWrite 不注册（ToolRegistrationConfig.todoTaskTools 的 !isTodoV2Enabled() 分支不命中）
         assertThat(new TodoWriteTool().isEnabled()).isFalse();
+
+        // V2：Task 工具族可注册（AbstractTaskTool.isEnabled → isTodoV2Enabled()==true）
         assertThat(new TaskCreateTool(mock(TaskService.class), mock(HookRegistry.class)).isEnabled()).isTrue();
         assertThat(new TaskGetTool(mock(TaskService.class)).isEnabled()).isTrue();
         assertThat(new TaskListTool(mock(TaskService.class)).isEnabled()).isTrue();
         assertThat(new TaskUpdateTool(mock(TaskService.class), mock(HookRegistry.class)).isEnabled()).isTrue();
-    }
-
-    @Test
-    @DisplayName("无请求上下文默认 V1 装配：TodoWrite 可注册，Task 工具族不可注册")
-    void noContext_v1_todoWriteRegistered_taskToolsNotRegistered() {
-        TaskSystemConfig.clearForTest();
-        RequestContext.clear();
-
-        // V1：TodoWrite 注册（ToolRegistrationConfig.todoTaskTools 分支）
-        assertThat(new TodoWriteTool().isEnabled()).isTrue();
-
-        // V1：Task 工具族不注册（AbstractTaskTool.isEnabled → isTodoV2Enabled()==false）
-        assertThat(new TaskCreateTool(mock(TaskService.class), mock(HookRegistry.class)).isEnabled()).isFalse();
-        assertThat(new TaskGetTool(mock(TaskService.class)).isEnabled()).isFalse();
-        assertThat(new TaskListTool(mock(TaskService.class)).isEnabled()).isFalse();
-        assertThat(new TaskUpdateTool(mock(TaskService.class), mock(HookRegistry.class)).isEnabled()).isFalse();
     }
 
     @Test

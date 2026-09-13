@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.TeamHelpers;
@@ -201,11 +200,10 @@ public class TeamCreateTool implements Tool {
             // [A1-FIX] 会话级化归因键：[session-id-short] ctx.sessionId() 已 short 直键，
             //   SessionService.delete 侧传 raw 'sess-xxx' 同键，cleanupSessionTeams(sessionId)
             //   只清本会话 teams（防跨会话误删，探查 A1）。
-            //   ctx.sessionId() 为 null（无法归因）时回退 TaskService.getTaskListId() —— 工具执行线程
-            //   RequestContext MDC 有 sessionId（getTaskListId() 优先级 6），仍可归因到真实会话；
+            //   ctx.sessionId() 为 null（无法归因）时回退 TaskService.getTaskListId()（进程/任务级兜底键）；
             //   teammate 线程回退 teamName。保证归因键确定性，不落随机 UUID（否则 cleanupSessionTeams
             //   永无法匹配，孤儿 config.json/inboxes/tasks 泄漏延续，finding R2-3 行为回归）。
-            //   真正无会话（MDC 空 → 进程级 UUID 兜底）时亦确定性登记，孤儿清理交由 Batch4 A4/A5。
+            //   真正无会话（[批 3c] 会话态已无 MDC 载体 → 进程级兜底）时亦确定性登记，孤儿清理交由 Batch4 A4/A5。
             String cleanupKey = (ctx != null && ctx.sessionId() != null)
                     ? ctx.sessionId() : TaskService.getTaskListId();
             // CC :162 leadSessionId = getSessionId()（team discovery 用实际 session id）——
@@ -221,7 +219,8 @@ public class TeamCreateTool implements Tool {
 
             // 写 team 配置文件（对齐 CC writeTeamFileAsync → {configHome}/teams/{team}/config.json）
             teamHelpers.writeConfig(finalTeamName,
-                    buildConfigJson(finalTeamName, leadAgentId, description, leadAgentType, leadSessionId));
+                    buildConfigJson(finalTeamName, leadAgentId, description, leadAgentType, leadSessionId,
+                            ctx != null ? ctx.sessionId() : null));
             // CC :178-180 registerTeamForSessionCleanup —— 未显式 TeamDelete 时 session 结束清理（gh-32730）
             // [A3] 会话级化：以 ctx.sessionId() 归一入桶（SessionService.delete → cleanupSessionTeams(id) 只清本会话）
             String sessionIdStr = (ctx != null && ctx.sessionId() != null)
@@ -262,7 +261,7 @@ public class TeamCreateTool implements Tool {
     }
 
     private String buildConfigJson(String teamName, String leadAgentId, String description,
-                                   String leadAgentType, String leadSessionId) {
+                                   String leadAgentType, String leadSessionId, String sessionId) {
         ObjectNode node = JsonNodeFactory.instance.objectNode();
         // config.json 落盘结构对齐 CC TeamFile（teamHelpers.ts:64-90）+ TeamCreateTool.ts:157-175：
         // name/description/createdAt/leadAgentId/leadSessionId/members[]（lead 成员带 model/agentType）
@@ -287,7 +286,7 @@ public class TeamCreateTool implements Tool {
         lead.put("tmuxPaneId", "");
         // cwd-align-ext：team lead cwd = 会话 cwd（CC TeamCreateTool.ts:171 cwd: getCwd()）；
         //   无 sessionId 回落 user.dir（方案 1，零行为变化）。
-        lead.put("cwd", leadCwd());
+        lead.put("cwd", leadCwd(sessionId));
         lead.putArray("subscriptions");
         if (log.isDebugEnabled()) {
             log.debug("[TeamCreateTool] buildConfigJson name={} leadAgentId={} leadSessionId={} members=1 createdAt={}",
@@ -299,11 +298,14 @@ public class TeamCreateTool implements Tool {
     /**
      * team lead cwd · 对齐 CC TeamCreateTool.ts:171/:207 {@code cwd: getCwd()}。
      *
-     * <p>buildConfigJson / setTeamContext 均在工具执行线程（RequestContext MDC 有 sessionId）；
-     * 无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     * <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code execute} / {@code setTeamContext}
+     * 从 {@code ctx.sessionId()} 显式取出后传入；⛔ 不再读 MDC（原裸 MDC 读点在 tool-exec 池线程上
+     * 取不到本会话）。无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     *
+     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
      */
-    private static String leadCwd() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    private static String leadCwd(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 
@@ -423,7 +425,7 @@ public class TeamCreateTool implements Tool {
         lead.put("agentType", leadAgentType);
         // cwd-align-ext：team lead cwd = 会话 cwd（CC TeamCreateTool.ts:207 cwd: getCwd()）；
         //   无 sessionId 回落 user.dir（方案 1，零行为变化）。
-        lead.put("cwd", leadCwd());
+        lead.put("cwd", leadCwd(ctx != null ? ctx.sessionId() : null));
         teammates.put(leadAgentId, lead);
         teamContext.put("teammates", teammates);
 

@@ -7,7 +7,6 @@ import org.springframework.stereotype.Component;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
-import java.util.function.Function;
 
 /**
  * User Input Dispatcher · 对齐 CC utils/processUserInput/processUserInput.ts (605 行).
@@ -28,16 +27,40 @@ public class UserInputDispatcher {
 
     private final Map<InputKind, Consumer<String>> handlers = new ConcurrentHashMap<>();
 
-    /** 按命令名注册的 slash command handler（CC parseSlashCommand → findCommand 语义）· INV-14。 */
-    private final Map<String, Consumer<String>> slashCommandHandlers = new ConcurrentHashMap<>();
+    /**
+     * 按命令名注册的 slash command handler（CC parseSlashCommand → findCommand 语义）· INV-14。
+     *
+     * <p><b>[批 3c · 2026-09-13]</b> handler 签名由 {@code Consumer<String>} 改为
+     * {@link TriConsumer} = {@code (args, sessionId, inFlightUserMessageId)}。
+     * WHY：命令 handler 里原以裸 MDC 会话槽取会话与在途用户消息 id（/files /plan /compact …），
+     * 该读点存在第三态（可能读到上一请求残留的、别的会话的 id）且随批 3c 删除 ⇒ 二者必须<b>显式</b>
+     * 从分派入口穿进来（对齐 CC {@code command.call(args, context)} 的 context 显式携带语义）。
+     */
+    private final Map<String, TriConsumer> slashCommandHandlers = new ConcurrentHashMap<>();
 
     /**
      * 按命令名注册的 slash command <b>result</b> handler（Plan-P1 §4.3 · 镜像 CC
      * {@code mod.call(args, context) → LocalCommandResult}）。result handler 可回传执行结果
      * （text/skip），供 SlashCommandInterceptor 组装 {@code <local-command-stdout>} 结果消息。
+     *
+     * <p><b>[批 3c · 2026-09-13]</b> 签名由 {@code Function<String, LocalCommandResult>} 改为
+     * {@link TriFunction} = {@code (args, sessionId, inFlightUserMessageId)}，
+     * 同 {@link #slashCommandHandlers} 的 WHY（显式会话标识 + 显式在途消息 id，杜绝 MDC 第三态）。
      */
-    private final Map<String, Function<String, LocalCommandResult>> slashCommandResultHandlers =
+    private final Map<String, TriFunction> slashCommandResultHandlers =
         new ConcurrentHashMap<>();
+
+    /** {@code (args, sessionId, inFlightUserMessageId) → void} · JDK 无三参 Consumer，本地声明。 */
+    @FunctionalInterface
+    public interface TriConsumer {
+        void accept(String args, String sessionId, String inFlightUserMessageId);
+    }
+
+    /** {@code (args, sessionId, inFlightUserMessageId) → LocalCommandResult} · JDK 无三参 Function，本地声明。 */
+    @FunctionalInterface
+    public interface TriFunction {
+        LocalCommandResult apply(String args, String sessionId, String inFlightUserMessageId);
+    }
 
     public void register(InputKind kind, Consumer<String> handler) {
         handlers.put(kind, handler);
@@ -47,13 +70,17 @@ public class UserInputDispatcher {
      * 注册命名 slash command handler · 对齐 CC processUserInput 的
      * {@code parseSlashCommand(input) → findCommand(name) → command.call(args, ...)}。
      *
-     * <p>例如 {@code registerSlashCommand("compact", args -> ...)} 后，输入 {@code /compact x y}
-     * 会路由到该 handler，args 为 {@code "x y"}。
+     * <p>例如 {@code registerSlashCommand("compact", (args, sessionId, msgId) -> ...)} 后，输入
+     * {@code /compact x y} 会路由到该 handler，args 为 {@code "x y"}。
      *
      * @param name    slash command 名（不含前导 '/'；如 "compact"）
-     * @param handler 参数 handler（收到命令名后的参数文本，已 trim）
+     * @param handler 参数 handler：{@code (args, sessionId, inFlightUserMessageId)}。
+     *                args = 命令名后的参数文本（已 trim）；sessionId = 分派入口显式传入的会话 ID；
+     *                inFlightUserMessageId = 本轮的「在途用户消息 id」（旧 MDC {@code reqId}，
+     *                即 ChatService {@code set(sessionId, userMessageId)} 的 userMessageId）。
+     *                后两者<b>均可为 null</b>（非会话/非用户消息驱动的分派）。
      */
-    public void registerSlashCommand(String name, Consumer<String> handler) {
+    public void registerSlashCommand(String name, TriConsumer handler) {
         boolean overwrite = slashCommandHandlers.containsKey(name);
         slashCommandHandlers.put(name, handler);
         if (log.isDebugEnabled()) {
@@ -105,9 +132,10 @@ public class UserInputDispatcher {
      * void handler 作向后兼容回落（结果不可得 → skip）。两者独立 map，同名不互相覆盖。
      *
      * @param name    slash command 名（不含前导 '/'）
-     * @param handler args → LocalCommandResult
+     * @param handler {@code (args, sessionId, inFlightUserMessageId)} → LocalCommandResult；
+     *                后两者由分派入口显式传入（<b>均可为 null</b>，见 {@link #registerSlashCommand}）
      */
-    public void registerSlashCommandResult(String name, Function<String, LocalCommandResult> handler) {
+    public void registerSlashCommandResult(String name, TriFunction handler) {
         slashCommandResultHandlers.put(name, handler);
         if (log.isDebugEnabled()) {
             log.debug("注册命名 slash command result handler: name={}（对齐 CC mod.call LocalCommandResult）",
@@ -123,10 +151,13 @@ public class UserInputDispatcher {
      * ② void handler（{@link #registerSlashCommand}）→ 执行（向后兼容，结果不可得）→ {@code skip}；
      * ③ 两者均未注册 → {@code null}（调用方 fail loud）。
      *
-     * @param input 完整 slash 输入（须以 '/' 开头）
+     * @param input                  完整 slash 输入（须以 '/' 开头）
+     * @param sessionId              显式会话 ID（命令 handler 的会话标识来源；非会话来源可传 null）
+     * @param inFlightUserMessageId  本轮在途用户消息 id（旧 MDC {@code reqId}）；非用户消息驱动的
+     *                               分派（如 REST 直调）可传 null
      * @return LocalCommandResult（text/skip）；无 handler → null
      */
-    public LocalCommandResult dispatchResult(String input) {
+    public LocalCommandResult dispatchResult(String input, String sessionId, String inFlightUserMessageId) {
         if (input == null || !input.startsWith("/")) {
             return null;
         }
@@ -134,28 +165,35 @@ public class UserInputDispatcher {
         int space = rest.indexOf(' ');
         String name = space == -1 ? rest : rest.substring(0, space);
         String args = space == -1 ? "" : rest.substring(space + 1).trim();
-        Function<String, LocalCommandResult> rh = slashCommandResultHandlers.get(name);
+        TriFunction rh = slashCommandResultHandlers.get(name);
         if (rh != null) {
-            LocalCommandResult result = rh.apply(args);
+            LocalCommandResult result = rh.apply(args, sessionId, inFlightUserMessageId);
             if (log.isDebugEnabled()) {
-                log.debug("分发命名 slash command result: name={} args={} kind={}",
-                    name, args, result == null ? "null" : result.kind());
+                log.debug("分发命名 slash command result: session={} inFlightUserMessage={} name={} args={} kind={}",
+                    sessionId, inFlightUserMessageId, name, args, result == null ? "null" : result.kind());
             }
             return result;
         }
-        Consumer<String> cmd = slashCommandHandlers.get(name);
+        TriConsumer cmd = slashCommandHandlers.get(name);
         if (cmd != null) {
             if (log.isDebugEnabled()) {
-                log.debug("分发命名 slash command（void 回落，结果不可得 → skip）: name={} args={}", name, args);
+                log.debug("分发命名 slash command（void 回落，结果不可得 → skip）: session={} inFlightUserMessage={} name={} args={}",
+                    sessionId, inFlightUserMessageId, name, args);
             }
-            cmd.accept(args);
+            cmd.accept(args, sessionId, inFlightUserMessageId);
             return LocalCommandResult.skip();
         }
         return null;
     }
 
-    /** 路由 + 分发 user input. */
-    public RoutingResult dispatch(String input) {
+    /**
+     * 路由 + 分发 user input.
+     *
+     * @param input                  用户输入
+     * @param sessionId              显式会话 ID（slash 命令 handler 的会话标识来源；非会话来源可传 null）
+     * @param inFlightUserMessageId  本轮在途用户消息 id（旧 MDC {@code reqId}）；可为 null
+     */
+    public RoutingResult dispatch(String input, String sessionId, String inFlightUserMessageId) {
         if (input == null || input.isBlank()) {
             return new RoutingResult(InputKind.TEXT_PROMPT, "default", "");
         }
@@ -165,12 +203,13 @@ public class UserInputDispatcher {
             int space = rest.indexOf(' ');
             String name = space == -1 ? rest : rest.substring(0, space);
             String args = space == -1 ? "" : rest.substring(space + 1).trim();
-            Consumer<String> cmd = slashCommandHandlers.get(name);
+            TriConsumer cmd = slashCommandHandlers.get(name);
             if (cmd != null) {
                 if (log.isDebugEnabled()) {
-                    log.debug("分发命名 slash command: name={} args={}", name, args);
+                    log.debug("分发命名 slash command: session={} inFlightUserMessage={} name={} args={}",
+                        sessionId, inFlightUserMessageId, name, args);
                 }
-                cmd.accept(args);
+                cmd.accept(args, sessionId, inFlightUserMessageId);
                 return new RoutingResult(InputKind.SLASH_COMMAND, name, args);
             }
             // 未注册命名 handler → 回落通用 SLASH_COMMAND handler（向后兼容）

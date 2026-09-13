@@ -79,10 +79,11 @@ public final class AutoMemPaths {
      * 当前会话 projectRoot · CC STATE.projectRoot（bootstrap/state.ts:277-279）等价。
      *
      * <p><b>ODF-A1-R2（返工）</b>：由 static volatile 改 {@link ThreadLocal} —— 对齐
-     * {@link com.nexusai.common.RequestContext} MDC 模式。CC 单进程单会话（STATE.projectRoot
-     * 无并发）；Java Web 后端同一 JVM 多会话并发（{@code chatExecutor} 线程池），static volatile
-     * 会被后写会话覆盖 → 会话 A 的异步/后续内存读解析到会话 B 目录（跨会话污染）。ThreadLocal 使
-     * 每个会话线程持有独立 projectRoot：会话 A 线程注入 A、会话 B 线程注入 B，互不干扰。
+     * 裸 MDC 会话槽（批 3c 已删除）的线程局部模式。CC 单进程单会话
+     * （STATE.projectRoot 无并发）；Java Web 后端同一 JVM 多会话并发（{@code chatExecutor}
+     * 线程池），static volatile 会被后写会话覆盖 → 会话 A 的异步/后续内存读解析到会话 B 目录
+     * （跨会话污染）。ThreadLocal 使每个会话线程持有独立 projectRoot：会话 A 线程注入 A、
+     * 会话 B 线程注入 B，互不干扰。
      *
      * <p>读取链：memory 路径的主要消费者在<b>会话线程</b>（LlmAgentLoop.run() 所在线程：
      * AutoMemPaths/MemoryPrefetcher/MemoryPromptBuilder 直接计算；prefetch 异步任务拿到的是
@@ -97,6 +98,50 @@ public final class AutoMemPaths {
      *
      * <p>CC 真源：启动时 {@code realpath(cwd)} 冻结为 projectRoot（state.ts:271/279），会话中不更新
      * （state.ts:519-525）；Java 由 run() 入口一次注入（{@code resolveSessionProjectRoot()}）。
+     *
+     * <h2>⚠️ [批 4 待收敛] 这是本仓<b>最后一个环境态会话槽</b>（batch 3c 遗留清单）</h2>
+     * <p>批 3c（2026-09-13）已删除裸 MDC 会话槽工具类（{@code com.nexusai.common} 包，批 3c 删除）与
+     * 其请求边界清理 Filter、logback {@code %X{sessionId}} 前缀。本 ThreadLocal 是
+     * <b>同物种的第二个 ambient 槽</b>，本批<b>刻意不动</b>（用户裁定归批 4），但必须先登记清楚：</p>
+     * <ul>
+     *   <li><b>它有与 MDC 相同的「第三态」风险</b>：不是 null，而是<b>上一个任务/上一个会话残留的、
+     *       别的会话的 projectRoot</b> —— 线程池（fixed-8 / SSE / 虚拟线程）复用时读到看起来完全合法
+     *       的错值。旧 MDC 的剧毒之处（日志前缀本身从该槽取 ⇒ 错了也无法靠日志发现）在本槽同样成立：
+     *       日志/路径解析都经 {@link #currentSessionProjectRoot()}。</li>
+     *   <li><b>它现在是承重的</b>：{@code AgentMemoryDirectory.cwdSupplier}／{@code projectRootSupplier}
+     *       （{@code AgentMemoryDirectory.buildProductionDefault():143/146}）、claudemd 扫描根、
+     *       settings 读取链、tool/hook 载荷的 cwd 都经它取会话值。</li>
+     * </ul>
+     * <p><b>批 4 必须一起处理的回放点清单</b>（capture → setContextMap/set → finally restore 的
+     * 「回放」模式，与 MDC 回放同源；批 3c 删 MDC 回放时<b>保留了</b>这些 projectRoot 回放，因为它们
+     * 此时仍承重）：</p>
+     * <ol>
+     *   <li>{@code application/agent/LlmAgentLoop.java} —— {@code STREAM_EXECUTOR} 虚拟线程回放：
+     *       loop 线程 {@code captureCurrentProjectRoot()}（约 :6594）、任务体 {@code setCurrentProjectRoot}
+     *       （约 :6621）、{@code finally restoreCurrentProjectRoot}（约 :6638）</li>
+     *   <li>{@code application/agent/tool/StreamingToolExecutor.java} —— 调度线程 capture（约 :1277）、
+     *       {@code withSessionProjectRoot} 包装内 set（约 :2462-2470）/ restore（约 :2474-2476）</li>
+     *   <li>{@code application/agent/tool/impl/SubagentTool.java} —— {@code executeAsync} 父值 capture
+     *       （约 :3195）→ 子代理线程 set（约 :3210）/ restore；{@code executeResumeAsync} 同款
+     *       （约 :3745/:3752/:3843）</li>
+     *   <li>{@code application/agent/team/SpawnInProcess.java} —— teammate runner 线程 capture
+     *       （约 :368）/ set（约 :373）/ restore（约 :385-387）</li>
+     *   <li>{@code application/agent/permission/hook/HookRegistry.java} —— {@code withSessionProjectRoot}
+     *       （HOOK_EXECUTOR supplyAsync 路径）</li>
+     *   <li>{@code application/agent/tasks/RemoteAgentTaskService.java} / {@code CronIdleExecutor.java}
+     *       —— pollScheduler 定时器 tick 的注入点</li>
+     *   <li>{@code application/agent/prompt/SystemPromptSections.java} —— 静态 {@code cwdSupplier}
+     *       （测试缝 + 会话回落）</li>
+     *   <li>{@code application/agent/skill/SkillRegistry.java} —— 未注入 cwdSupplier 时的静态回落
+     *       {@link #currentSessionProjectRoot()}（批 3c 起：生产已改显式 sessionId 入参，此回落仅
+     *       POJO/测试直构路径）</li>
+     *   <li>{@code source = "replay"} 的其余消费点：{@code ClaudemdEngine}、{@code MemoryPromptBuilder}、
+     *       {@code MemoryPrefetcher}、{@code AttachmentStoreBase}、{@code EnterWorktreeTool} 等</li>
+     * </ol>
+     * <p><b>批 4 的收敛方向</b>（与批 3c 同法）：把 {@code Supplier<String>} 改成
+     * {@code Function<String,String>}（sessionId → projectRoot）或按会话查 DB，把 sessionId 从
+     * 调用入口显式穿透到每个消费点，然后删除本 ThreadLocal 与全部回放点；无显式来源处按
+     * 「本该有却没有 ⇒ 抛 / 本就不需要 ⇒ 跳过但日志 ≥ WARN」处理。</p>
      */
     private static final ThreadLocal<String> CURRENT_PROJECT_ROOT = new ThreadLocal<>();
 

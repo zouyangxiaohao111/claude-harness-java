@@ -8,9 +8,7 @@ import com.nexusai.application.agent.tasks.Task;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskType;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -71,13 +69,6 @@ class TaskControllerTest {
         mockMvc = MockMvcBuilders.standaloneSetup(controller)
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
-    }
-
-    @AfterEach
-    void tearDown() {
-        // V2 端点写 RequestContext MDC（MemoryController/TeamController 同款）——测试线程复用，
-        // 清理防 MDC sessionId 泄漏到其他用例（ThreadLocal 不自动清）
-        RequestContext.clear();
     }
 
     /** 注册一个 running 的 local_agent 后台任务（sess 会话）· taskId = agentId.toString()（CC 合一）。 */
@@ -291,8 +282,8 @@ class TaskControllerTest {
     @DisplayName("GET /api/v1/tasks/list?sessionId=sess-1 → V2 任务清单（TaskService.listTasks 文件存储，会话互斥）")
     void listV2Tasks_returnsSessionTaskList() throws Exception {
         // WHY: 用户拍板前端任务清单统一走 TaskService.listTasks——V2（TaskCreate）文件存储
-        // {configHome}/tasks/{taskListId}；一个会话 V1/V2 互斥只会有一个。sessionId 写 MDC →
-        // TaskService.getTaskListId() 解析该会话列表，他会话任务不得混入。
+        // {configHome}/tasks/{taskListId}；一个会话 V1/V2 互斥只会有一个。sessionId 显式传入 →
+        // TaskService.getTaskListId(sessionId) 解析该会话列表，他会话任务不得混入。
         String createdId = service.createTask("sess-1", Task.create("前端清单任务", "来自 TaskCreate"));
         service.createTask("sess-2", Task.create("他会话任务", "不应出现在 sess-1 清单"));
 
@@ -326,8 +317,8 @@ class TaskControllerTest {
     @DisplayName("[批 3a] GET /api/v1/tasks/list 缺 sessionId → 400（旧实现回落 MDC，第三态可串会话）")
     void listTasksMerged_missingSessionId_is400() throws Exception {
         // WHY（缺值策略 (a)）：taskListId / V1 todos 桶都按会话解析，缺会话等于「不知道列谁的清单」。
-        //   旧实现回落 RequestContext.sessionId()（裸 MDC）—— MDC 第三态会读到上一请求残留的
-        //   **别的会话** id ⇒ 返回别人的任务清单。变异点：改回 MDC 兜底 → 本用例红。
+        //   旧实现回落**裸 MDC 会话槽**（批 3c 已删除）—— 该槽第三态会读到上一请求残留的
+        //   **别的会话** id ⇒ 返回别人的任务清单。变异点：改回兜底 → 本用例红。
         mockMvc.perform(get("/api/v1/tasks/list"))
             .andExpect(status().isBadRequest());
         mockMvc.perform(get("/api/v1/tasks/list").param("sessionId", ""))

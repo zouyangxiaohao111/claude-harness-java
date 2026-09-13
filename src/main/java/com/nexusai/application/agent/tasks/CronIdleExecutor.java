@@ -9,7 +9,6 @@ import com.nexusai.application.agent.query.TokenBudgetChecker;
 import com.nexusai.application.agent.tool.config.CronEnabledGates;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.chat.SlashCommandInterceptor;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.domain.schedule.ScheduleService;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -60,7 +59,7 @@ public class CronIdleExecutor {
     /**
      * 全局会话 UUID — CRON-D5 后仅作<b>兜底</b>（sessionId=null 无会话 / 非法 UUID / DURABLE
      * 无项目锚 boundProject=null），非 SESSION/DURABLE 存活创建会话主路径。SESSION scope cron 经
-     * {@code QueueItem.sessionId} 透传创建会话 short（改3：RunRequest 真实 short + MDC 归组），
+     * {@code QueueItem.sessionId} 透传创建会话 short（改3：RunRequest 真实 short + 显式会话归组），
      * 对齐 CC 单进程 ambient"任务即属创建会话"语义。DURABLE fire（boundProject!=null）创建会话
      * 存活 → 创建会话 short；已关 → null（headless 无 transcript，见 {@link #runOneAgentLoop}）。
      * CC 单进程单主会话；Java 多会话 → cron 任务归组创建会话。
@@ -427,7 +426,7 @@ public class CronIdleExecutor {
         }
         // CC queueProcessor.ts:76-87 — 同 mode 批量 dequeueAllMatching（非 slash + 主线程 + 同 mode）
         // [3d] 追加 sessionId 归组谓词：不把不同会话的命令混进一个 batch —— executeQueuedInput 逐命令
-        // 串行 runOneAgentLoop 恢复各自创建会话 MDC，混会话批次会串台。
+        // 串行 runOneAgentLoop 按各自 QueueItem.sessionId 显式建会话上下文，混会话批次会串台。
         String targetMode = next.mode();
         List<NotificationQueue.QueueItem> commands = notificationQueue.dequeueAllMatching(
             c -> mainThreadConsumable.test(c)
@@ -595,7 +594,7 @@ public class CronIdleExecutor {
                     //     等价，属 Java 自选简化（登记差异，Fix-P2 Issue 3）；技能内容仅作 isMeta
                     //     经 run() 历史重载进模型上下文（对齐 P1 双消息语义 [metadata, isMeta]，
                     //     避免双注入）；保留全部现有 turn 编排
-                    //     （MDC 恢复 / DURABLE boundProject override / streamContext / replayAndPersist）。
+                    //     （会话上下文显式传递 / DURABLE boundProject override / streamContext / replayAndPersist）。
                     //   - local / local-jsx / 未知命令 / fork 占位（shouldQuery=false）→ 非查询型终态：
                     //     local 在 intercept 内部经 UserInputDispatcher.dispatchResult 本地执行，有结果
                     //     文本则落库 + 推会话流（真实会话可见），不起 LLM turn（CC local/local-jsx
@@ -604,11 +603,10 @@ public class CronIdleExecutor {
                     if (isSlashCommand(cmd) && slashInterceptor != null) {
                         String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
                         try {
-                            // [CRON-D5 改2] 恢复创建会话 MDC（local handler 可能依赖 RequestContext；
-                            //   finally 还原防线程池复用串台；runOneAgentLoop 内部同款 capture/restore）
-                            if (cmd.sessionId() != null && !cmd.sessionId().isBlank()) {
-                                RequestContext.setSession(cmd.sessionId());
-                            }
+                            // [CRON-D5 改2 · 批 3c] 原「恢复创建会话 MDC（local handler 依赖裸 MDC 会话槽）」
+                            //   已删：会话标识改由**显式形参**直传（intercept(cmd.sessionId(), ...)）→
+                            //   UserInputDispatcher 的 handler 形参为 (args, sessionId, inFlightUserMessageId)
+                            //   → 本地执行链不再有经 MDC 读会话的通道，也就无需线程池复用的还原装置。
                             SlashCommandInterceptor.SlashResolution slash = slashInterceptor.intercept(
                                 cmd.sessionId(), consumedUserId, cmd.value(),
                                 cmd.sessionId() != null
@@ -642,7 +640,8 @@ public class CronIdleExecutor {
                             // handled=false（文件路径疑似回落普通 prompt / 未知命令类型）→ 落下方
                             //   runOneAgentLoop 原文路径（对齐 CC processSlashCommand.tsx:362-380）
                         } finally {
-                            RequestContext.clear();
+                            // [批 3c] 原「清裸 MDC 会话槽」（与上方 setSession 成对）已删；
+                            //   projectRoot 线程槽的 capture/restore 保留（与 MDC 无关，仍是派生线程必需的还原）。
                             AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
                         }
                     }
@@ -660,14 +659,15 @@ public class CronIdleExecutor {
      * 启动一轮 agent_loop — 镜像 ChatService.processUserMessage 依赖注入
      * （tokenBudget/config/memory/recovery），主线程 agentId=null（对齐 CC 主线程契约）。
      *
-     * <p><b>[CRON-D5 改2 + 改3]</b>（cron 后台任务会话上下文对齐 CC）：cronExecutor 线程无 MDC
+     * <p><b>[CRON-D5 改2 + 改3]</b>（cron 后台任务会话上下文对齐 CC）：cronExecutor 线程无会话上下文
      * （ThreadLocal 不跨线程），cron 触发的 agent_loop 工作目录域此前全回落 user.dir（跨会话 cwd
-     * 错位）。改2 = 消费前 {@link RequestContext#setSession} 恢复创建会话 MDC（RemoteAgentTaskService.tick
-     * :409-563 同款 capture/restore：finally restore 而非 remove，防线程池复用串台）；改3 =
-     * {@link RunRequest} 用真实创建会话 UUID（非 GLOBAL 常量）→ {@code markRunning/isSessionRunning}
+     * 错位）。改2 = 消费前恢复创建会话上下文 —— <b>[批 3c] 原「写裸 MDC 会话槽」已删</b>，会话标识
+     * 改由**显式载体**直传（{@link RunRequest#session}/{@link RunRequest#sessionBatch} 的 sessionUuid、
+     * {@code loop.setStreamContext(ws, cmd.sessionId(), …)}、{@code chatService.armRealTimePersist}）；
+     * 改3 = {@link RunRequest} 用真实创建会话 UUID（非 GLOBAL 常量）→ {@code markRunning/isSessionRunning}
      * 归组创建会话 + {@code CwdResolution.getCwd(sessionId)} 解析到创建会话 boundProject/sessionCwd
-     * （对齐 CC 单进程 ambient：任务即属创建会话）。SESSION scope cron 恢复 sessionId 时 log.info
-     * 中文记录（日志自动带 [sessionId=...] 前缀）；DURABLE/无 sessionId 回落 GLOBAL（现状）。
+     * （对齐 CC 单进程 ambient：任务即属创建会话）。SESSION scope cron 时 log.info 中文记录并就地
+     * 显式打印 {@code sessionId=...}（批 3c：日志前缀不再从 MDC 取）；DURABLE/无 sessionId 回落 GLOBAL（现状）。
      *
      * <p><b>[批次X Q2 + 批 1 · 方向 C]</b>（DURABLE 项目锚 · 对齐 CC durable 文件位置锚项目）：
      * SESSION 任务走 {@code cmd.sessionId()} 恢复（会话仍存活才可命中 boundProject）；DURABLE 任务锚从
@@ -782,19 +782,22 @@ public class CronIdleExecutor {
         }
         String sessionId = cmd.sessionId();
         String boundProject = cmd.boundProject();   // 批次X Q2: DURABLE 任务项目锚（V23 列）
-        // [session-id-short] QueueItem.sessionId 已统一 short（"sess-xxx"），MDC 直写 short
+        // [session-id-short] QueueItem.sessionId 已统一 short（"sess-xxx"），直键使用
         // （原 CRON-D5 F2 originalKey 反解派生 UUID 串的键形态双形态已消除）。
-        String mdcSessionKey = sessionId;
-        // CRON-D5 改2: 恢复创建会话 MDC + 防线程池串台（capture → set → finally restore/clear）。
+        // [批 3c] 原「CRON-D5 改2：恢复创建会话 MDC（setSession）+ finally clear 防线程池串台」已删：
+        //   会话标识不再经 MDC 载体传播（载体已随本批删除）。cron run 的会话来源全部是显式载体 ——
+        //   RunRequest.session/sessionBatch(sessionUuid)（下方）、loop.setStreamContext(ws, cmd.sessionId(), …)、
+        //   chatService.armRealTimePersist(state, sessionUuid, …)：值随调用直传，无线程槽残留面。
+        //   仅保留 projectRoot 线程槽的 capture/restore（派生线程必需，与 MDC 无关）。
+        if (sessionId != null && !sessionId.isBlank()) {
+            log.info("CronIdleExecutor: cron 命令会话上下文 sessionId={} "
+                    + "（批 3c：显式载体直传 RunRequest/streamContext/落库，不再写裸 MDC）", sessionId);
+        } else if (log.isWarnEnabled()) {
+            log.warn("CronIdleExecutor: cmd 无 sessionId → 本 run 无会话锚（回落全局会话/user.dir，"
+                + "DURABLE 或兼容路径，CRON-D5）: mode={} workload={}", cmd.mode(), cmd.workload());
+        }
         String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
         try {
-            if (mdcSessionKey != null && !mdcSessionKey.isBlank()) {
-                RequestContext.setSession(mdcSessionKey);
-                log.info("CronIdleExecutor: 恢复 cron 命令会话上下文 sessionId={} mdcKey={} "
-                        + "（CRON-D5：对齐 CC 单进程 ambient，cwd/记忆归组创建会话）", sessionId, mdcSessionKey);
-            } else if (log.isDebugEnabled()) {
-                log.debug("CronIdleExecutor: cmd 无 sessionId，回落全局会话/user.dir（DURABLE 或兼容路径，CRON-D5）");
-            }
             // [cron-durable-session-fire] RunRequest 会话 ID 判定：
             //   SESSION / 无项目锚（DURABLE 无会话直建 boundProject=null）→ 既有 resolveSessionUuid
             //   （真实会话 short / null→GLOBAL_SESSION_KEY 兜底）；
@@ -994,7 +997,8 @@ public class CronIdleExecutor {
                 }
             }
         } finally {
-            RequestContext.clear();
+            // [批 3c] 原「清裸 MDC 会话槽」（与已删的 setSession 成对）已删：本 run 不再写任何
+            //   界面/日志 MDC 槽；projectRoot 线程槽的 restore 保持不变（capture/restore 语义不受影响）。
             AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
             // [批 1 · 方向 C] 原 finally 的 loop.clearCronProjectRootOverride()（per-run 项目身份
             //   override 清空）随该实例字段一并删除：项目锚改由 RunRequest 承载（req 随本 fire

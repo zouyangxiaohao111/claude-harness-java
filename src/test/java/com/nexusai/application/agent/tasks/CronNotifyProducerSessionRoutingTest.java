@@ -11,9 +11,7 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionKeys;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -62,11 +60,6 @@ class CronNotifyProducerSessionRoutingTest {
 
     @TempDir
     Path tempDir;
-
-    @AfterEach
-    void tearDown() {
-        RequestContext.clear();
-    }
 
     // ─────────────────── 1. BackgroundTaskRunner 后台任务完成通知 ───────────────────
 
@@ -168,13 +161,12 @@ class CronNotifyProducerSessionRoutingTest {
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
 
-        AtomicReference<String> mdcSeen = new AtomicReference<>();
         AtomicReference<String> threadName = new AtomicReference<>();
         AtomicReference<String> taskSessionSeen = new AtomicReference<>();
         AtomicReference<String> taskIdSeen = new AtomicReference<>();
         ExecutorService pool = Executors.newFixedThreadPool(1);
         ToolRegistry registry = new ToolRegistry().register(
-            probeTaskTool(runner, mdcSeen, threadName, taskSessionSeen, taskIdSeen));
+            probeTaskTool(runner, threadName, taskSessionSeen, taskIdSeen));
         StreamingToolExecutor exec = new StreamingToolExecutor(registry, pool, context(sessionUuid));
         try {
             exec.add(call("c1", "probe"));
@@ -183,11 +175,11 @@ class CronNotifyProducerSessionRoutingTest {
             assertThat(threadName.get())
                 .as("探针工具必须在 tool-exec 池线程执行（非测试线程）—— 验证真实生产派发路径")
                 .isNotEqualTo(Thread.currentThread().getName());
-            assertThat(mdcSeen.get())
-                .as("池线程 RequestContext.sessionId()（MDC）必须为 null —— 证明生产路径无 MDC（F1 根因）")
-                .isNull();
+            // [批 3c] 语义消失（已登记待裁定）：原此处断言「池线程的 ambient 会话读取必须为 null
+            //   —— 证明生产路径不依赖 MDC（F1 根因）」。ambient 会话槽已整类删除 ⇒ 该观察点与断言删除
+            //   （在结构上恒成立）；「任务必须携带 ctx.sessionId()（可靠源）」的断言即为其活等价物。
             assertThat(taskSessionSeen.get())
-                .as("池线程注册的任务必须携带 ctx.sessionId()（可靠源，非 MDC）")
+                .as("池线程注册的任务必须携带 ctx.sessionId()（唯一可靠源，非任何 ambient 读取）")
                 .isEqualTo(createSession);
 
             // 路由验证：创建会话 turn drain 注入（3a canonicalUuid 匹配）
@@ -200,11 +192,13 @@ class CronNotifyProducerSessionRoutingTest {
     }
 
     /**
-     * 池线程探针工具：在 tool-exec 线程记录 MDC / 线程名，然后按生产方模式
+     * 池线程探针工具：在 tool-exec 线程记录线程名，然后按生产方模式
      * （ctx.sessionId() → registerAsyncAgent）注册并完成一个后台任务。
+     *
+     * <p>[批 3c] 原还记录该池线程上的 ambient 会话读取（用于「生产路径不依赖 MDC」的反向断言）；
+     * ambient 会话槽已整类删除 ⇒ 该观察点与其参数移除。
      */
     private static Tool probeTaskTool(BackgroundTaskRunner runner,
-                                      AtomicReference<String> mdcSeen,
                                       AtomicReference<String> threadName,
                                       AtomicReference<String> taskSessionSeen,
                                       AtomicReference<String> taskIdSeen) {
@@ -218,7 +212,6 @@ class CronNotifyProducerSessionRoutingTest {
             }
             @Override public AgentToolResult execute(ToolUseBlock call, ToolUseContext ctx) {
                 threadName.set(Thread.currentThread().getName());
-                mdcSeen.set(RequestContext.sessionId());
                 String sid = ctx != null && ctx.sessionId() != null ? ctx.sessionId().toString() : null;
                 UUID agentId = UUID.randomUUID();
                 BackgroundTask task = runner.registerAsyncAgent(agentId, "探针任务", "prompt", "general-purpose", null, sid);

@@ -615,7 +615,9 @@ class ResumeServiceTest {
         AgentDefinition customDef = AgentDefinition.BuiltInAgentDefinition.create(
             "my-custom-reviewer", "Review the code and return findings",
             null, (ctx, dirs) -> "custom reviewer system prompt");
-        when(subagentTool.agentRegistry()).thenReturn(new AgentDefinitionRegistry(
+        // [批 3c] registry 改为**会话显式**：ResumeService 调 agentRegistry(sessionId)（透传主会话），
+        //   原无参 stub 不再被调用（会让本用例退回内置回退路径而误红）⇒ 按显式会话打桩。
+        when(subagentTool.agentRegistry(SESSION_UUID)).thenReturn(new AgentDefinitionRegistry(
             java.util.Map.of(), List.of(customDef)));
 
         service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
@@ -643,7 +645,8 @@ class ResumeServiceTest {
             entry("user", "go", AGENT, "u1", null),
             entry("assistant", "work", AGENT, "u2", "u1")));
         writeMetadata(AGENT, "ghost-type", null, "ghost");
-        when(subagentTool.agentRegistry()).thenReturn(new AgentDefinitionRegistry(
+        // [批 3c] registry 改为**会话显式**：按显式会话打桩（同上）。
+        when(subagentTool.agentRegistry(SESSION_UUID)).thenReturn(new AgentDefinitionRegistry(
             java.util.Map.of(), List.of()));
 
         service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);

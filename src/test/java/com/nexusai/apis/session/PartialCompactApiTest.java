@@ -3,14 +3,12 @@ package com.nexusai.apis.session;
 import com.nexusai.application.agent.compact.CompactConversation;
 import com.nexusai.application.agent.compact.PartialCompactService;
 import com.nexusai.application.agent.compact.StreamCompactSummary;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -86,11 +84,6 @@ class PartialCompactApiTest {
         return MockMvcBuilders.standaloneSetup(controller)
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
-    }
-
-    @AfterEach
-    void tearDown() {
-        RequestContext.clear();
     }
 
     @Test

@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,7 +22,7 @@ import org.junit.jupiter.api.io.TempDir;
  * <ol>
  *   <li>git 仓库内（含 cd subdir）→ 返回 git root（对齐 CC findGitRoot 回落，非 cwd 非 user.dir）</li>
  *   <li>非 git 目录 → 回落 {@code CwdResolution.getOriginalCwdLayer(sessionId)}（对齐 CC ?? getOriginalCwd()）</li>
- *   <li>无参构造器（生产路径，经 RequestContext.sessionId()）→ repoRoot 恒非 null（链恒有值）</li>
+ *   <li>无参构造器（生产路径，sessionId 由调用点显式传入；无会话时链仍恒有值）→ repoRoot 恒非 null</li>
  * </ol>
  */
 @DisplayName("[IMP-PERM-CWD-04/05] CommitAttributionTracker.getAttributionRepoRoot 完整链")
@@ -34,7 +33,6 @@ class AttributionRepoRootCwdTest {
         CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     @Test
@@ -75,14 +73,17 @@ class AttributionRepoRootCwdTest {
     }
 
     @Test
-    @DisplayName("无参构造器（RequestContext.sessionId() 生产路径）→ repoRoot 恒非 null")
+    @DisplayName("无参构造器（生产路径，sessionId 由调用点显式传入）→ repoRoot 恒非 null")
     void noArgConstructor_repoRootAlwaysNonNull() throws Exception {
         // WHY: LlmAgentLoop.registerAttributionHooks（LlmAgentLoop.java:7036-7037）走
         //   new RegisterAttributionHooks() 无参构造（COMMIT_ATTRIBUTION 门控关为 no-op，但构造即
         //   应产出可用的 repoRoot supplier）。链恒有值（getCwd 恒非 null + findGitRoot null 时
         //   originalCwdLayer 恒非 null）—— 门控开启时不至于拿到 null repoRoot。
+        // [批 3c] repoRoot 现为 repoRoot(String sessionId)；本用例只验「链恒有值」，与具体会话无关，
+        //   故取**最劣输入** null（无会话 → getCwd 回落 user.dir）—— 该输入下仍非 null 即覆盖更强。
+        // [批 3c] 无会话 → 显式 null
         CommitAttributionTracker tracker = new CommitAttributionTracker();
-        assertThat(tracker.repoRoot()).isNotNull();
+        assertThat(tracker.repoRoot(null)).isNotNull();
 
         RegisterAttributionHooks hooks = new RegisterAttributionHooks();
         assertThat(hooks.tracker()).isNotNull();

@@ -912,10 +912,30 @@ public final class ShellExecutor {
      * ENOENT）→ 回落 {@code getOriginalCwd()}（:225）；再失败 → null（调用方 G5 按 CC :234-236
      * 文案生成 ToolResult.error：{@code Working directory "<cwd>" no longer exists. ...}）。
      *
+     * <p><b>[批 3c 会话态显式化]</b>：回落层语义是<b>同一会话</b>的 originalCwd，本重载
+     * <b>无会话入参</b> ⇒ 只能按「无会话」解析（{@link CwdResolution#getOriginalCwdLayer(String)}
+     * {@code (null)} 跳过会话层 → 进程 {@code user.dir}，= 旧实现「MDC 为空」分支等价语义）。
+     * 会话态调用方须改调 {@link #resolveSpawnCwd(String, String)} 显式传 sessionId
+     * （{@code BashTool} 持 {@code ctx.sessionId()}）。
+     *
      * @param cwd 会话 cwd（null/blank → 原样返回，调用方不设置 directory）
      * @return realpath 后的 cwd；cwd 与启动目录都不可用 → null
      */
     public static String resolveSpawnCwd(String cwd) {
+        return resolveSpawnCwd(cwd, null);
+    }
+
+    /**
+     * spawn cwd 校验与回退（显式会话来源）· 语义同 {@link #resolveSpawnCwd(String)}，回落层
+     * 「启动目录」= {@link CwdResolution#getOriginalCwdLayer(String)}{@code (sessionId)}
+     * （会话 originalCwd 重锚层 ?? 绑定项目 ?? 进程 user.dir，对齐 CC
+     * {@code STATE.originalCwd} / {@code getOriginalCwd()}）。
+     *
+     * @param cwd       会话 cwd（null/blank → 原样返回，调用方不设置 directory）
+     * @param sessionId 会话 ID（回落层锚定用；null/blank = 无会话 → 进程 user.dir）
+     * @return realpath 后的 cwd；cwd 与启动目录都不可用 → null
+     */
+    public static String resolveSpawnCwd(String cwd, String sessionId) {
         if (cwd == null || cwd.isBlank()) {
             return cwd;
         }
@@ -924,9 +944,15 @@ public final class ShellExecutor {
         } catch (IOException e) {
             // cwd 被删 · 对齐 CC realpath(cwd) catch → getOriginalCwd（Shell.ts:222-228）
             if (log.isDebugEnabled()) {
-                log.debug("ShellExecutor.resolveSpawnCwd: cwd 不存在，回落启动目录: {}", cwd);
+                log.debug("ShellExecutor.resolveSpawnCwd: cwd 不存在，回落启动目录: cwd={} sessionId={}",
+                    cwd, sessionId);
             }
-            String fallback = CwdResolution.getOriginalCwdLayer();
+            if (sessionId == null || sessionId.isBlank()) {
+                log.warn("[ShellExecutor] resolveSpawnCwd 无会话入参（sessionId 空）→ 回落层按「无会话」解析"
+                    + "（进程 user.dir={}）；如需会话 originalCwd 须由调用方显式传入 sessionId"
+                    + "（BashTool 持 ctx.sessionId()）", System.getProperty("user.dir"));
+            }
+            String fallback = CwdResolution.getOriginalCwdLayer(sessionId);
             try {
                 return Path.of(fallback).toRealPath().toString();
             } catch (IOException e2) {

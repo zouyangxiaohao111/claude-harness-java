@@ -382,8 +382,8 @@ public interface LlmProvider {
             // WHY chat 也需要独立载体（用户裁定）：chat 系列不经 LlmProvider.stream，拿不到
             //   stream 的新参数；而它们同样会走到 AnthropicSdkProvider 的 per-LLM-call terminal
             //   发射点（chatWithRaw 2 + chatWithOptions 3 + chatWithOptionsMessage 2 = 7 处），
-            //   且 YoloClassifierImpl.callWithMdc/callWithOptionsMdc 还把调用派发到
-            //   CompletableFuture.supplyAsync（只回放 MDC）—— ThreadLocal 一样不可达。
+            //   且 YoloClassifierImpl.callWithAgentContext/callWithOptionsAgentContext 还把调用
+            //   派发到 CompletableFuture.supplyAsync —— ThreadLocal 一样不可达。
             // 可空 = 主线程 / 无归因上下文（对齐 CC 主线程 undefined，事件无该属性）。
             com.nexusai.application.agent.subagent.AgentContext agentContext
     ) {

@@ -151,7 +151,9 @@ class McpConfigFileWriterTest {
     @Test
     @DisplayName("projectMcpJsonPath → CwdResolution.getCwd()/.mcp.json")
     void projectMcpJsonPath_usesCurrentCwd() {
+        // [批 3c] 无会话 → 显式 null（本用例靠 CwdResolution.setCurrentOverride(tempDir) 的
+        //   ThreadLocal 测试缝取 cwd，override 是 L1 层，先于任何会话解析命中，不涉会话）
         assertThat(writer.projectMcpJsonPath())
-            .isEqualTo(Path.of(CwdResolution.getCwd(), ".mcp.json"));
+            .isEqualTo(Path.of(CwdResolution.getCwd(null), ".mcp.json"));
     }
 }

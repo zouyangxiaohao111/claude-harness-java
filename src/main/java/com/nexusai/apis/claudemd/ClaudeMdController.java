@@ -130,11 +130,18 @@ public class ClaudeMdController {
     public IncludeStatusResponse includeStatus() {
         ClaudemdEngine engine = resolveEngine();
         // 对齐 CC shouldShowClaudeMdExternalIncludesWarning（interactiveHelpers.tsx:164 + claudemd.ts:1422-1429）
-        boolean needsApproval = engine.shouldShowClaudeMdExternalIncludesWarning();
+        // [批 3c] 本端点（GET /include-status）无会话入参 → (b) 类合法跳过：显式传 null
+        //   （CwdResolution/SessionProjectRoot 均跳过会话层，回落进程 user.dir，与旧实现「MDC 为空」等价）。
+        //   影响面：仅影响 InstructionsLoaded hook 载荷的 session_id 字段（外部 include 的探测本身不依赖会话）。
+        log.warn("[ClaudeMdController] GET /include-status 无会话入参 → 记忆文件解析按进程默认（user.dir），"
+            + "InstructionsLoaded hook 载荷 session_id 为 null（批 3c：会话态显式化，不再回落 MDC）");
+        boolean needsApproval = engine.shouldShowClaudeMdExternalIncludesWarning(null);
         // 对齐 CC getExternalClaudeMdIncludes(await getMemoryFiles(true))（interactiveHelpers.tsx:165）——
         // forceIncludeExternal=true 探测外部 include，不受审批门控；getMemoryFiles(true) memoize 与
-        // shouldShow 内部调用同参共享缓存，不重复 IO
-        List<String> files = engine.getExternalClaudeMdIncludes(engine.getMemoryFiles(true))
+        // shouldShow 内部调用同参共享缓存，不重复 IO。
+        // [drop-requestcontext] 本端点无会话入参 → 扫描根/外部判定显式传 null（引擎侧一次性 WARN +
+        //   user.dir 兜底，与上面 include-status 的告警同一语义）
+        List<String> files = engine.getExternalClaudeMdIncludes(engine.getMemoryFiles(true, null), null)
             .stream().map(ClaudemdEngine.ExternalClaudeMdInclude::path).toList();
         if (log.isInfoEnabled()) {
             log.info("[ClaudeMdController] GET /include-status: needsApproval={} externalIncludeFiles={}",

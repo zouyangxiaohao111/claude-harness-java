@@ -8,7 +8,6 @@ import com.nexusai.application.agent.compact.CompactConversationContext;
 import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.Tokens;
 import com.nexusai.application.agent.tool.AgentUsage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -91,6 +90,13 @@ class CompactIdleRebuildModelWiringTest {
     private static final int ANTHROPIC_4_FIELD_SUM = 93749 + 93568 + 181 + 876; // 188374
     private static final int DEEPSEEK_INPUT_OUTPUT = 93749 + 876;               // 94625
 
+    /**
+     * 与生产同形态：/compact 行已落库（ChatController:149）且经 ChatService.processUserMessage:624
+     * 显式带下来（批 3c 起为 handler 形参 inFlightUserMessageId，不再走裸 MDC）→ 重建时按守卫
+     * 排除它在途行，压缩输入不含自身。
+     */
+    private static final String IN_FLIGHT_USER_MSG_ID = "h3";
+
     private Object savedModelMapper;
     private Object savedProviderMapper;
 
@@ -98,16 +104,12 @@ class CompactIdleRebuildModelWiringTest {
     void snapshotStaticMappers() throws Exception {
         savedModelMapper = readStaticMapper("modelMapper");
         savedProviderMapper = readStaticMapper("providerMapper");
-        // 与生产同形态：/compact 行已落库（ChatController:149）且经 requestId 带下来
-        // （ChatService.processUserMessage:624）→ 重建时按守卫排除它在途行，压缩输入不含自身
-        RequestContext.set(SESSION, "h3");
     }
 
     @AfterEach
     void restoreStaticMappersAndContext() throws Exception {
         writeStaticMapper("modelMapper", savedModelMapper);
         writeStaticMapper("providerMapper", savedProviderMapper);
-        RequestContext.clear();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -120,7 +122,7 @@ class CompactIdleRebuildModelWiringTest {
         MessageService messageService = idleMessageService();
         ToolRegistrationConfig config = configWith(sessionRecord(ANTHROPIC), null);
 
-        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, messageService);
+        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, IN_FLIGHT_USER_MSG_ID, messageService);
 
         assertThat(rebuilt).as("DB 历史非空 → 必须重建出 state（前置）").isNotNull();
         assertThat(rebuilt.currentModel())
@@ -154,7 +156,7 @@ class CompactIdleRebuildModelWiringTest {
         MessageService messageService = idleMessageService();
         ToolRegistrationConfig config = configWith(sessionRecord(DEEPSEEK), null);
 
-        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, messageService);
+        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, IN_FLIGHT_USER_MSG_ID, messageService);
         CompactConversationContext cc =
             compactContextOf(config, rebuilt, ToolRegistrationConfig.resolveManualCompactModel(rebuilt));
 
@@ -185,7 +187,7 @@ class CompactIdleRebuildModelWiringTest {
         assertThat(config.resolveSessionModelName(SESSION))
             .as("会话 override（sessions.model_name）必须胜过全局 settings.main_model_name")
             .isEqualTo(ANTHROPIC);
-        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, idleMessageService());
+        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, IN_FLIGHT_USER_MSG_ID, idleMessageService());
         assertThat(rebuilt.currentModel())
             .as("重建 state 的模型 = 会话 override（同 resolveSessionModelName）")
             .isEqualTo(ANTHROPIC);
@@ -199,7 +201,7 @@ class CompactIdleRebuildModelWiringTest {
         assertThat(config.resolveSessionModelName(SESSION))
             .as("会话无 override → 必须回落 settings.main_model_name（否则 anthropic 会话仍少计）")
             .isEqualTo(SETTINGS_ANTHROPIC);
-        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, idleMessageService());
+        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, IN_FLIGHT_USER_MSG_ID, idleMessageService());
         assertThat(rebuilt.currentModel()).isEqualTo(SETTINGS_ANTHROPIC);
     }
 
@@ -208,7 +210,7 @@ class CompactIdleRebuildModelWiringTest {
     void noModelAnywhere_fallsBackConsistentWithIsAnthropic() {
         // ① 会话行存在但 model_name=null + settings 未注入
         ToolRegistrationConfig config = configWith(sessionRecord(null), null);
-        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, idleMessageService());
+        AgentState rebuilt = config.rebuildIdleStateFromDb(SESSION, IN_FLIGHT_USER_MSG_ID, idleMessageService());
 
         assertThat(rebuilt.currentModel())
             .as("两处皆空 → null（不得臆断为 anthropic 或 deepseek 任一协议）")
@@ -262,9 +264,11 @@ class CompactIdleRebuildModelWiringTest {
         ToolRegistrationConfig config = configWith(sessionRecord(ANTHROPIC), null);
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry(); // 空 = 空闲会话
-        RequestContext.set(SESSION, "h3"); // 在途 /compact 行（ChatController:149 已落库）
+        // [批 3c] 参数序与生产 registerCompactSlashCommand lambda 一致：
+        //   (args, sessionId, inFlightUserMessageId, sessionRegistry, ...) —— 会话标识 / 在途行显式传参
         ReflectionTestUtils.invokeMethod(config, "handleCompactCommand",
-            "", registry, null, summary, null, null, null, null, null, null, messageService);
+            "", SESSION, IN_FLIGHT_USER_MSG_ID, registry, null, summary,
+            null, null, null, null, null, null, messageService);
 
         ArgumentCaptor<List<ChatMessageDto>> persisted = ArgumentCaptor.forClass(List.class);
         verify(messageService).appendPostCompactMessages(eq(SESSION), persisted.capture());
@@ -294,9 +298,10 @@ class CompactIdleRebuildModelWiringTest {
 
         ToolRegistrationConfig config = configWith(sessionRecord(DEEPSEEK), null);
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        RequestContext.set(SESSION, "h3");
+        // [批 3c] 同上：会话标识 / 在途行 id 显式传参（不再经裸 MDC）
         ReflectionTestUtils.invokeMethod(config, "handleCompactCommand",
-            "", registry, null, summary, null, null, null, null, null, null, messageService);
+            "", SESSION, IN_FLIGHT_USER_MSG_ID, registry, null, summary,
+            null, null, null, null, null, null, messageService);
 
         ArgumentCaptor<List<ChatMessageDto>> persisted = ArgumentCaptor.forClass(List.class);
         verify(messageService).appendPostCompactMessages(eq(SESSION), persisted.capture());

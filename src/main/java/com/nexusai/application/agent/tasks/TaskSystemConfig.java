@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -40,29 +39,30 @@ import java.util.function.Supplier;
  *   <tr><td>启用开关介质</td><td>env var {@code CLAUDE_CODE_ENABLE_TASKS}（tasks.ts:135）</td><td>JVM sysprop {@code nexusai.tasks.enabled}（:66）</td></tr>
  *   <tr><td>真值判定</td><td>{@code isEnvTruthy()}：接受 {@code 1/true/yes/on}，lowercase+trim（envUtils.ts:32-37）</td><td>{@link #isEnvTruthy(String)}（:310-317），接受集合一致</td></tr>
  *   <tr><td>交互式判定</td><td>{@code getIsNonInteractiveSession() = !STATE.isInteractive}（state.ts:1057-1059）</td><td>{@link #isInteractive()}（:157-163）</td></tr>
- *   <tr><td>交互式默认值</td><td>{@code STATE.isInteractive = false}（state.ts:300）→ 默认非交互 → V1 TodoWrite</td><td><b>决策 #65</b>：Web 请求路径（RequestContext 有 reqId）默认交互 → V2；cron/后台/无 MDC 默认非交互 → V1（见 {@link #isInteractive()}）</td></tr>
- *   <tr><td>交互式设置时机</td><td>进程启动一次：main.tsx:802-812 按 CLI 参数（{@code -p/--print}、{@code --init-only}、{@code --sdk-url}）与 {@code !process.stdout.isTTY} 计算</td><td>Web 请求路径（ChatService.processUserMessage 设 sessionId+reqId）判定；cron/后台仅设 sessionId</td></tr>
+ *   <tr><td>交互式默认值</td><td>{@code STATE.isInteractive = false}（state.ts:300）</td><td><b>进程级默认 {@code true}</b>（Web UI 后端 = CC 交互式 REPL 类比，见 {@link #DEFAULT_INTERACTIVE}）</td></tr>
+ *   <tr><td>交互式设置时机</td><td>进程启动一次：main.tsx:802-812 按 CLI 参数（{@code -p/--print}、{@code --init-only}、{@code --sdk-url}）与 {@code !process.stdout.isTTY} 计算</td><td>进程级一次（static final 常量）；sysprop {@code nexusai.interactive} 可覆盖</td></tr>
  * </table>
  *
- * <p><b>默认值对齐（决策 #65，2026-08-23 用户拍板）</b>：CC CLI 的 {@code STATE.isInteractive}
- * 在交互式终端默认 true（TTY），非交互（SDK/headless）默认 false；Java Web 后端以「有前端用户」为
- * 交互式判据：ChatService.processUserMessage（Web 请求路径）经 {@code RequestContext.set} 设
- * sessionId + reqId → 交互 → {@code isTodoV2Enabled()==true} → Task V2 默认开；cron/后台
- * （CronIdleExecutor/RemoteAgentTaskService/PartialCompactService 仅 {@code setSession} 设
- * sessionId）→ 非交互 → V1 TodoWrite。默认装配经 ToolRegistry.getTools / TodoWriteTool.isEnabled /
- * AbstractTaskTool.isEnabled 生效（isTodoV2Enabled upstream CRITICAL，d=1 直接调用方 3 个：
+ * <p><b>默认值对齐（[批 3c · 2026-09-13] 推翻决策 #65）</b>：CC CLI 的 {@code STATE.isInteractive}
+ * 在交互式终端默认 true（TTY），非交互（SDK/headless）默认 false。原决策 #65（2026-08-23）让 Java
+ * 按「Web 请求路径经裸 MDC 会话槽设 sessionId + reqId」逐请求判定，使 cron/后台
+ * （CronIdleExecutor/RemoteAgentTaskService/PartialCompactService）降级 V1 TodoWrite。该判据读裸 MDC
+ * （第三态：可能读到其它会话的残留 reqId），且消费点 {@code Tool.isEnabled()} 无会话参数 ⇒
+ * <b>批 3c 删除该读点，判定提升为进程级</b>（对齐 CC 语义），代价是 cron/后台轮次也走 V2。
+ * 默认装配经 ToolRegistry.getTools / TodoWriteTool.isEnabled / AbstractTaskTool.isEnabled 生效
+ * （isTodoV2Enabled upstream CRITICAL，d=1 直接调用方 3 个：
  * AbstractTaskTool.isEnabled / TodoWriteTool.isEnabled / ToolRegistrationConfig.todoTaskTools）。
- * 显式设置 {@code nexusai.tasks.enabled=true} 或 {@code nexusai.interactive=true} 时仍可强制 V2。</p>
+ * 显式设置 {@code nexusai.tasks.enabled=true} 或 {@code nexusai.interactive} 时仍可覆盖。</p>
  *
  * <p><b>跨端共享（待产品决策）</b>：CC env 名 {@code CLAUDE_CODE_ENABLE_TASKS} 与 Java sysprop
  * {@code nexusai.tasks.enabled} 介质不同。若未来要求 CLI 与后端读同一配置源，需主 agent 决策是否在
  * Java 侧额外兼容读取 CC 同名 env 变量（类似既有 {@code CLAUDE_CODE_TASK_LIST_ID} ↔
  * {@code nexusai.taskListId} 双轨，见 TaskService.java:130-144）。本项仅文档化，未落代码。</p>
  *
- * <p><b>交互式判定粒度（决策 #65 已落地）</b>：CC 的 {@code STATE.isInteractive} 是进程级、启动时
- * 一次设定（main.tsx:802-812）；Java {@link #isInteractive()} 以 RequestContext MDC 的
- * {@code reqId} 存在性区分「Web 前端用户消息在途」vs「cron/后台」，满足「Java Web 后端会话
- * （有前端用户）应视为交互 → todoV2 默认开」的用户拍板决策。</p>
+ * <p><b>交互式判定粒度（[批 3c] 已对齐 CC）</b>：CC 的 {@code STATE.isInteractive} 是进程级、启动时
+ * 一次设定（main.tsx:958-977）；Java {@link #isInteractive()} 现同样为进程级（无逐请求/逐线程分量）。
+ * 历史：曾以裸 MDC 会话槽的 {@code requestId()} 存在性区分「Web 前端用户消息在途」vs
+ * 「cron/后台」，该实现已随批 3c 删除。</p>
  */
 public class TaskSystemConfig {
 
@@ -72,6 +72,20 @@ public class TaskSystemConfig {
 
     private static final String ENABLE_TASKS_PROPERTY = "nexusai.tasks.enabled";
     private static final String INTERACTIVE_PROPERTY = "nexusai.interactive";
+
+    /**
+     * 进程级交互式默认值 · 对齐 CC {@code STATE.isInteractive}（state.ts:295 初始值 / main.tsx:958-977
+     * 启动时一次设定，之后进程内不可变）。
+     *
+     * <p>[批 3c · 2026-09-13] 原为实现决策 #65 而读裸 MDC 会话槽的 {@code requestId()} 逐请求判定
+     * （cron/后台 → V1）。该读点已删（MDC 第三态会串会话，且消费点
+     * {@code Tool.isEnabled()} 无会话参数、删后无显式来源可传）。本仓是 Web UI 后端 = CC 交互式 REPL
+     * 的直接类比 ⇒ 进程级默认 {@code true}。</p>
+     *
+     * <p><b>代价（用户批准）</b>：cron/后台轮次与 Web 轮次一样走 V2 Task 工具（不再 V1 TodoWrite），
+     * 与 CC 行为一致。可用 sysprop {@code nexusai.interactive=false} 整进程降级 V1。</p>
+     */
+    private static final boolean DEFAULT_INTERACTIVE = true;
     /** agent-swarms opt-in env 的 sysprop-override seam · CC 原名: CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS (agentSwarmsEnabled.ts:32) */
     private static final String AGENT_TEAMS_OPTIN_PROPERTY = "nexusai.experimental.agent-teams";
     /** --agent-teams flag 的 sysprop 映射 · CC 原名: process.argv 含 '--agent-teams' (agentSwarmsEnabled.ts:10-11)，Java 无 argv 解析，部署侧约定以该 sysprop 映射 */
@@ -177,11 +191,12 @@ public class TaskSystemConfig {
      * Java 读 JVM sysprop {@code nexusai.tasks.enabled}（:66）。二者 isEnvTruthy 接受集合一致
      * （{@code 1/true/yes/on}，不区分大小写）。</p>
      *
-     * <p><b>默认值对齐（决策 #65 已拍板实施）</b>：Java Web 后端会话（有前端用户）默认交互 →
-     * {@link #isInteractive()} 在 Web 请求路径（RequestContext 有 reqId）默认 {@code true} →
-     * {@code isTodoV2Enabled()==true} → Task V2 默认开；cron/后台（仅 sessionId）→ 非交互 →
-     * V1 TodoWrite。显式设置 {@code nexusai.tasks.enabled=true} 或 {@code nexusai.interactive=true}
-     * 仍可强制 V2（对齐 CC tasks.ts:135-136 env 强制分支与 STATE.isInteractive 语义）。</p>
+     * <p><b>默认值对齐（[批 3c · 2026-09-13] 推翻决策 #65）</b>：{@link #isInteractive()} 现为
+     * <b>进程级</b>判定（对齐 CC {@code STATE.isInteractive}），无 sysprop 注入时取进程级默认
+     * {@link #DEFAULT_INTERACTIVE}（true）→ {@code isTodoV2Enabled()==true} → Task V2 默认开。
+     * 原「cron/后台（仅 sessionId）→ 非交互 → V1 TodoWrite」的逐请求 MDC 判据已删除（代价：
+     * cron/后台轮次也走 V2，与 CC 一致）。显式设置 {@code nexusai.tasks.enabled=true} 或
+     * {@code nexusai.interactive} 仍可覆盖（对齐 CC tasks.ts:135-136 env 强制分支）。</p>
      *
      * @return true → 使用 TaskCreate/TaskGet/TaskUpdate/TaskList (V2)
      *         false → 使用 TodoWrite (V1)
@@ -212,36 +227,46 @@ public class TaskSystemConfig {
      * （main.tsx:802-812：{@code -p/--print}、{@code --init-only}、{@code --sdk-url} 或
      * {@code !process.stdout.isTTY} → 非交互）。</p>
      *
-     * <p><b>Java Web 后端决策 #65（tool-v4 覆盖度对齐 CC，2026-08-23 用户拍板）</b>：
-     * Web 后端会话（有前端用户）应视为<b>交互</b> → todoV2 默认开。判定源 =
-     * {@link RequestContext#requestId()}：ChatService.processUserMessage 经
-     * {@code RequestContext.set(sessionId, userMessageId)} 同时设 sessionId + reqId ——
-     * 有 reqId = 前端用户消息在途（交互）；cron/后台仅经
-     * {@code RequestContext.setSession(sessionId)}（CronIdleExecutor/RemoteAgentTaskService/
-     * PartialCompactService）→ 无 reqId → 非交互 → V1 TodoWrite。无 MDC（启动期/测试）
-     * → 默认非交互（对齐 CC state.ts:300 STATE.isInteractive=false）。</p>
+     * <p><b>[批 3c · 2026-09-13 用户裁定 · 推翻决策 #65]</b> 本方法原为<b>逐请求</b>判定：
+     * 读裸 MDC 会话槽的 {@code requestId() != null}（ChatService 设 sessionId + reqId）
+     * 区分「Web 前端用户消息在途」vs「cron/后台」，实现决策 #65 的「cron/后台 → V1 TodoWrite」。
+     * 该判定存在<b>第三态</b>：裸 MDC 可能读出上一个请求残留的、<b>别的会话</b>的 reqId（不是
+     * null，是看起来完全合法的错值）⇒ cron/后台轮次会被误判为交互而拿到 V2 工具集。
+     * 且 {@code isTodoV2Enabled()} 的消费点 {@code Tool.isEnabled()}（{@code Tool.java:514}）
+     * 是<b>无会话参数</b>的接口方法，被 {@code ToolRegistry}（{@code all()} /
+     * {@code toOpenAiToolsArray()} / {@code getToolsForDefaultPreset()}）在无会话上下文处调用
+     * ⇒ 删掉 MDC 后<b>无显式来源可传</b>，只能把判定提到进程级。</p>
      *
-     * <p><b>sysprop 覆盖优先</b>：显式设置 {@code nexusai.interactive} 时按 isEnvTruthy 判定
-     * （对齐 CC 进程级显式设定）；未注入时按上述 Web 请求路径判定。显式设置
-     * {@code nexusai.interactive=true} 或 {@code nexusai.tasks.enabled=true} 仍可强制 V2
-     * （对齐 CC tasks.ts:135-136 env 强制分支）。</p>
+     * <p><b>现语义（CC 对齐）</b>：{@code isInteractive} 是<b>进程级</b>一次解析的值，
+     * 对齐 CC {@code STATE.isInteractive}（state.ts:71/295 字段；main.tsx:958-977 启动时一次
+     * {@code setIsInteractive}；之后不可变）。CC 的交互判定<b>没有</b>任何逐请求/逐线程分量
+     * —— {@code isTodoV2Enabled()} 在同一进程内恒返回同一值。</p>
+     *
+     * <p><b>默认值 true 的由来</b>：CC 由 {@code !process.stdout.isTTY} 等 CLI 信号判非交互；
+     * 本仓是<b>Web UI 后端</b>（前端用户在浏览器里驱动会话），是 CC「交互式 REPL」的直接类比，
+     * 故进程级默认 = 交互（true）。</p>
+     *
+     * <p><b>已知代价（用户明确知悉并批准）</b>：cron/后台轮次不再降级为 V1，将与 Web 轮次
+     * 一样获得 V2 Task 工具、失去 TodoWrite。这正是 CC 的行为（CC 的 cron/后台与交互轮次
+     * 共用同一进程级 {@code STATE.isInteractive}）。</p>
+     *
+     * <p><b>sysprop 覆盖优先</b>：显式设置 {@code nexusai.interactive}（或
+     * {@code nexusai.tasks.enabled=true}）时按 isEnvTruthy 判定；未注入时用进程级默认
+     * {@link #DEFAULT_INTERACTIVE}（对齐 CC tasks.ts:135-136 env 强制分支）。</p>
      */
     public static boolean isInteractive() {
         String interactive = System.getProperty(INTERACTIVE_PROPERTY);
-        if (interactive == null) {
-            // 决策 #65：Web 请求路径（有前端用户，ChatService 设 sessionId + reqId）→ 交互 → todoV2 默认开；
-            // cron/后台（仅 setSession sessionId，无 reqId）→ 非交互 → V1 TodoWrite；无 MDC → 非交互。
-            boolean webInteractive = RequestContext.requestId() != null;
+        if (interactive != null) {
             if (log.isDebugEnabled()) {
-                log.debug("isInteractive：无 {} 注入，按 Web 请求路径判定 requestId={} → interactive={}（决策#65：Web 前端用户=交互→V2；cron/后台=非交互→V1）",
-                    INTERACTIVE_PROPERTY, RequestContext.requestId(), webInteractive);
+                log.debug("isInteractive：sysprop {}={}，判定为 {}", INTERACTIVE_PROPERTY, interactive, isEnvTruthy(interactive));
             }
-            return webInteractive;
+            return isEnvTruthy(interactive);
         }
+        // 进程级默认（无 sysprop 注入）——对齐 CC STATE.isInteractive 进程级不可变语义。
         if (log.isDebugEnabled()) {
-            log.debug("isInteractive：sysprop {}={}，判定为 {}", INTERACTIVE_PROPERTY, interactive, isEnvTruthy(interactive));
+            log.debug("isInteractive：无 {} 注入 → 进程级默认 {}", INTERACTIVE_PROPERTY, DEFAULT_INTERACTIVE);
         }
-        return isEnvTruthy(interactive);
+        return DEFAULT_INTERACTIVE;
     }
 
     // ════════════════════════════════════════════════════════════════════════

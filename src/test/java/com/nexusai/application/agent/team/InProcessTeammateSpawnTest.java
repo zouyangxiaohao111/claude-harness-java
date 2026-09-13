@@ -11,9 +11,9 @@ import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.tasks.TaskType;
-import com.nexusai.common.RequestContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -97,35 +97,55 @@ class InProcessTeammateSpawnTest {
         return out;
     }
 
-    /** 在日志线程（= teammate runner 线程）内直接读 RequestContext 的探针 appender。 */
+    /**
+     * [批 3c · 待裁定] 本用例的守护对象（决策 #65 的「每请求 MDC 会话槽」判据）已被批 3c
+     * <b>整体删除</b>：写入方（裸 MDC 会话槽的 set）与消费方（SpawnInProcess 的 MDC 捕获/回放、
+     * TaskSystemConfig 按 MDC 判 isInteractive、logback 的 %X{sessionId}/%X{reqId} 前缀）全部不存在。
+     * 断言文本原样保留（不静默删），暂只禁用；裁决建议：<b>删除</b>本用例 + 探针 appender + Recorded
+     * （机制已无对应物，属死代码决策规则范围），或改建为「进程级 isInteractive」的意图测试。
+     */
+    private static final String MDC_INHERITANCE_GONE_REASON =
+        "[批 3c 2026-09-13] 裸 MDC 会话槽已整体删除 ⇒ 决策 #65 的「父 sessionId/reqId 经 MDC 回放给 "
+        + "teammate runner 线程」机制在写入方/消费方两侧都不存在（本用例必然恒红）。断言文本保留不删，"
+        + "待用户裁定：删除或改建为进程级 isInteractive 意图测试。";
+
+    /** 在日志线程（= teammate runner 线程）内直接读裸 MDC 的探针 appender。 */
     private static final class MdcRecordingAppender extends AppenderBase<ILoggingEvent> {
         final CopyOnWriteArrayList<Recorded> records = new CopyOnWriteArrayList<>();
         @Override protected void append(ILoggingEvent event) {
             // append() 在产生日志的线程同步执行（logback 默认同步）—— teammate runner 线程日志 =
-            //   runner 线程当前 MDC（RequestContext.requestId() 直读，不依赖 event MDC 捕获语义）。
+            //   runner 线程当前 MDC。键名取原 logback 前缀所用 %X{reqId}/%X{sessionId}
+            //   （logback-spring.xml:14 注释；该前缀已随批 3c 一并移除 ⇒ 此处恒 null）。
+            java.util.Map<String, String> mdc = org.slf4j.MDC.getCopyOfContextMap();
             records.add(new Recorded(
                 Thread.currentThread().getName(),
-                RequestContext.requestId(),
-                RequestContext.sessionId()));
+                mdc == null ? null : mdc.get("reqId"),
+                mdc == null ? null : mdc.get("sessionId")));
         }
     }
 
     private record Recorded(String threadName, String reqId, String sessionId) {}
 
     @Test
+    @Disabled(MDC_INHERITANCE_GONE_REASON)
     @DisplayName("[reqId MDC 传播] teammate runner 线程继承父 sessionId+reqId（决策 #65 在 team 路径重演）")
     void spawn_teammateRunnerThread_inheritsParentRequestId() throws Exception {
-        // WHY (决策 #65 父 V2/子 V1 工具集分叉 · team 路径): runTeammateLoop 在
+        // [批 3c] 语义消失（已登记）：决策 #65 的判据「Web 请求路径经裸 MDC 会话槽设 sessionId+reqId、
+        //   逐请求判 isInteractive」已被批 3c 整体删除 —— 该判据读槽有第三态（可能读到其它会话残留
+        //   reqId），且消费点 Tool.isEnabled() 无会话参数，故批 3c 把交互判定提升为**进程级**
+        //   （TaskSystemConfig.DEFAULT_INTERACTIVE=true，对齐 CC STATE.isInteractive 语义）并删除
+        //   SpawnInProcess 侧的 MDC 捕获/回放装置。⇒ 本用例的对照装置（父线程往裸 MDC 会话槽写
+        //   "sess-parent"/"req-parent"）已不可制造，断言文本原样保留、暂 @Disabled 待裁定。
+        //
+        // WHY（原文保留 · 决策 #65 父 V2/子 V1 工具集分叉 · team 路径）: runTeammateLoop 在
         //   new Thread("teammate-*") 上执行（spawnInProcessTeammate），logback MDC 不随 new Thread
-        //   继承（实测）→ 修复前 runner 线程 RequestContext.requestId()=null → teammate 子代理
+        //   继承（实测）→ 修复前 runner 线程 requestId=null → teammate 子代理
         //   （SubagentExecutor.executeStreaming）回落 V1 TodoWrite、父 V2/子 V1 工具集分叉。
-        //   修复 = spawn 调度线程（父，经 StreamingToolExecutor 回放已含 MDC）捕获 MDC context map
-        //   → runner 线程体开头回放 + finally restore（对齐 SubagentTool async worker 同款模式）。
         //
         // <p><b>可观测 seam（规则九）</b>: runner 线程内 log.info("state ... → WORK")（transitionTo）
         //   与 log.debug("teammate 处理 prompt")(runTeammateLoop 首轮) 触发时，logback appender 在
-        //   runner 线程同步执行 → 自定义 appender 在 append() 内直接读 RequestContext（= runner 线程
-        //   MDC），据此断言 runner 线程 requestId/sessionId 已回放父值。
+        //   runner 线程同步执行 → 自定义 appender 在 append() 内直接读 runner 线程 MDC，
+        //   据此断言 runner 线程 requestId/sessionId 已回放父值。
         Logger loopLogger = (Logger) LoggerFactory.getLogger(AutonomousAgentLoop.class);
         Level prevLevel = loopLogger.getLevel();
         loopLogger.setLevel(Level.DEBUG);
@@ -133,7 +153,8 @@ class InProcessTeammateSpawnTest {
         appender.start();
         loopLogger.addAppender(appender);
         try {
-            RequestContext.set("sess-parent", "req-parent");
+            // [批 3c] 原装置：往裸 MDC 会话槽 set("sess-parent", "req-parent")（给父线程造会话上下文）
+            //   —— 该槽已整体删除，装置不可制造；断言文本保留（见方法头 [批 3c] 语义消失说明）。
             SpawnInProcess.InProcessSpawnOutput out = spawn("researcher", "research-team", "do research", false);
             assertThat(out.success()).as("spawn 必须成功").isTrue();
 
@@ -156,7 +177,6 @@ class InProcessTeammateSpawnTest {
         } finally {
             loopLogger.detachAppender(appender);
             loopLogger.setLevel(prevLevel);
-            RequestContext.clear();
         }
     }
 

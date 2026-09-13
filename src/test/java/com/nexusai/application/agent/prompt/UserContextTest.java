@@ -2,7 +2,6 @@ package com.nexusai.application.agent.prompt;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -112,14 +111,16 @@ class UserContextProviderTest {
         Files.writeString(tmp.resolve("CLAUDE.md"), "会话根指令");
         String sid = "sess-ucp-wt1";
         try {
-            RequestContext.setSession(sid);
             SessionProjectRoot.setForSession(sid, tmp.toString());
-            UserContextProvider p = new UserContextProvider(); // 无参 → getOriginalCwdLayer(sessionId)
+            // [批 3c] 语义消失：无参 UserContextProvider() 已无会话来源（构造期不再读裸 MDC 会话槽 ——
+            //   该槽已彻底删除，见 UserContextProvider 无参构造器 javadoc）⇒ 原「无参构造经会话解析
+            //   projectRoot」不可达。改为显式传入 projectRoot = 会话 originalCwd 层；断言文本不变
+            //   （仍钉死「会话绑 P → CLAUDE.md 从 P 读，非恒 user.dir」）。
+            UserContextProvider p = new UserContextProvider(Path.of(CwdResolution.getOriginalCwdLayer(sid)));
 
             assertThat(p.claudeMd()).as("会话绑 P → fallback CLAUDE.md 从会话 originalCwd 层 P 读取")
                 .isEqualTo("会话根指令");
         } finally {
-            RequestContext.clear();
             SessionProjectRoot.reset();
             SessionCwdHolder.reset();
         }
@@ -129,7 +130,7 @@ class UserContextProviderTest {
     @DisplayName("默认 projectRoot 无会话回落 user.dir（零行为变化）：projectRoot 字段 = CwdResolution.getOriginalCwdLayer(null)")
     void defaultProjectRoot_fallsBackUserDir_whenNoSession() throws Exception {
         // WHY (cwd-align-extended 零行为变化红线 · 对齐 CC getOriginalCwd 末端 user.dir):
-        // 无会话上下文（startup / 无 sessionId 通道 / 测试）构造时 RequestContext.sessionId()=null →
+        // 无会话上下文（startup / 无 sessionId 通道 / 测试）构造时无会话来源（显式 null）→
         // getOriginalCwdLayer(null) 回落 user.dir，与旧实现 Paths.get("").toAbsolutePath()（=JVM user.dir）
         // 等价 → 接线零回归。测试锁定 projectRoot 字段值 = CwdResolution.getOriginalCwdLayer(null)。
         UserContextProvider p = new UserContextProvider(); // 无会话 → 回落 user.dir

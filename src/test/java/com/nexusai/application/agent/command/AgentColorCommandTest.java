@@ -7,7 +7,6 @@ import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.cli.AgentsHandler;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -51,8 +50,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *       color=原始色名 + themeColor=CC 主题 key；general-purpose → 双 null（CC 早返）；未设置/非法色 → 双 null；
  *       subagentTool 未注入 → 双 null（不 NPE）</li>
  *   <li><b>R-B3 · B-3 /color 生产级端到端</b>（unresolved-owner-decisions.md B-3：dispatch 无生产级
- *       端到端测试 → 本期补）: MDC sessionId + 真实 SessionAgentStateRegistry + 真实 UserInputDispatcher →
- *       {@code registerSlashCommand()} → {@code dispatch("/color ...")} → 生产 Env（buildProductionEnv）全链
+ *       端到端测试 → 本期补）: 真实 SessionAgentStateRegistry + 真实 UserInputDispatcher →
+ *       {@code registerSlashCommand()} → {@code dispatch("/color ...", sessionId, null)}（<b>[批 3c]</b>
+ *       会话标识为分派入口<b>显式形参</b>，不再是 MDC）→ 生产 Env（buildProductionEnv）全链
  *       执行 —— {@code persistAgentColor}（SessionStorage.reAppendSessionMetadata 落盘 transcript
  *       agent-color entry）+ {@code setAppStateColor}（registry 中 AgentState.color 更新）</li>
  * </ol>
@@ -81,7 +81,7 @@ class AgentColorCommandTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("@PostConstruct registerSlashCommand: UserInputDispatcher 注册 /color → dispatch 路由到 execute（生产 Env，无会话 MDC 不 NPE）")
+    @DisplayName("@PostConstruct registerSlashCommand: UserInputDispatcher 注册 /color → dispatch 路由到 execute（生产 Env，无会话上下文不 NPE）")
     void registerSlashCommandRoutesColorToExecute() throws Exception {
         AgentColorCommand cmd = new AgentColorCommand();
         UserInputDispatcher dispatcher = new UserInputDispatcher();
@@ -90,9 +90,11 @@ class AgentColorCommandTest {
         f.set(cmd, dispatcher);
         cmd.registerSlashCommand();
 
-        // 生产 Env 路径：teammate=false（无上下文）、sessionId=null（MDC 未 set）→ persistAgentColor
+        // 生产 Env 路径：teammate=false（无上下文）、sessionId=null（显式传 null）→ persistAgentColor
         // 短路 completedFuture、setAppStateColor no-op → 不 NPE（D4 注册真实可达）
-        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/color blue");
+        // [批 3c] 本用例不涉会话，只验证「无会话上下文仍可路由不 NPE」→ 显式 null（旧实现里
+        //   等价于会话槽为空；会话标识改显式传参后，无会话就用 null 表达，不再靠「槽位没 set」）。
+        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/color blue", null, null);
         assertThat(r.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(r.routedTo()).isEqualTo("color");
         assertThat(r.payload()).isEqualTo("blue");
@@ -103,15 +105,14 @@ class AgentColorCommandTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("B-3 生产 E2E: MDC sessionId + registry + dispatch('/color blue') → AgentState.color=blue + transcript agent-color entry 落盘")
+    @DisplayName("B-3 生产 E2E: 显式 sessionId + registry + dispatch('/color blue', sessionId, null) → AgentState.color=blue + transcript agent-color entry 落盘")
     void productionDispatch_colorBlue_fullChain() throws Exception {
         // WHY（规则九）：B-3 决策（unresolved-owner-decisions.md:32）——/color 已注册但 dispatch 无生产级
         //   端到端测试。既有用例只断言 RoutingResult（kind/routedTo/payload），未证明生产 handler 在真实
-        //   会话上下文（MDC sessionId + SessionAgentStateRegistry）下执行完整副作用链：persistAgentColor
+        //   会话上下文（显式 sessionId + SessionAgentStateRegistry）下执行完整副作用链：persistAgentColor
         //   → transcript 落盘 + setAppStateColor → registry 中 AgentState.color。若接线只有路由无副作用，
         //   前端仍不可见颜色变化（B-1/B-3 决策目标落空）。
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        RequestContext.setSession(sessionId.toString());
         Path transcript = null;
         try {
             // 生产装配：真实 dispatcher + registry（非 mock）+ 已注册主会话 AgentState
@@ -124,7 +125,8 @@ class AgentColorCommandTest {
             injectCommandField(cmd, "sessionAgentStateRegistry", registry);
             cmd.registerSlashCommand();
 
-            UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/color blue");
+            // [批 3c] 会话标识显式传参：handler 形参 sessionId = 本用例的会话（旧实现经 MDC 隐式取同值）
+            UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/color blue", sessionId, null);
             assertThat(r.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
             assertThat(r.routedTo()).isEqualTo("color");
             assertThat(r.payload()).isEqualTo("blue");
@@ -141,7 +143,6 @@ class AgentColorCommandTest {
             assertThat(content).as("transcript 含 agent-color entry").contains("\"type\":\"agent-color\"");
             assertThat(content).as("agent-color 值为 blue").contains("\"agentColor\":\"blue\"");
         } finally {
-            RequestContext.clear();
             if (transcript != null) {
                 try {
                     Files.deleteIfExists(transcript);
@@ -160,7 +161,6 @@ class AgentColorCommandTest {
         //   若接线只 save 不清 AppState（或反过来），reset 行为与 CC 背离：transcript 有 default 但
         //   当前 AgentState.color 仍是旧值。端到端断言两个副作用同时发生。
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        RequestContext.setSession(sessionId.toString());
         Path transcript = null;
         try {
             AgentColorCommand cmd = new AgentColorCommand();
@@ -173,7 +173,8 @@ class AgentColorCommandTest {
             injectCommandField(cmd, "sessionAgentStateRegistry", registry);
             cmd.registerSlashCommand();
 
-            UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/color reset");
+            // [批 3c] 会话标识显式传参（同 colorBlue 用例语义：handler 形参即本用例会话）
+            UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/color reset", sessionId, null);
             assertThat(r.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
             assertThat(r.routedTo()).isEqualTo("color");
             assertThat(r.payload()).isEqualTo("reset");
@@ -190,7 +191,6 @@ class AgentColorCommandTest {
             assertThat(content).as("transcript 含 agent-color entry").contains("\"type\":\"agent-color\"");
             assertThat(content).as("agent-color 值为 default sentinel").contains("\"agentColor\":\"default\"");
         } finally {
-            RequestContext.clear();
             if (transcript != null) {
                 try {
                     Files.deleteIfExists(transcript);
@@ -613,9 +613,6 @@ class AgentColorCommandTest {
     void clearCwdState() {
         // 隔离每个用例的会话 cwd / 绑定项目状态，防止跨用例污染（SessionCwdHolder / SessionProjectRoot 均为 JVM 全局静态）
         SessionProjectRoot.reset();
-        if (RequestContext.sessionId() != null) {
-            RequestContext.clear();
-        }
     }
 
     @Test
@@ -628,7 +625,6 @@ class AgentColorCommandTest {
         //   与 CC 行为漂移（G8）。若业务逻辑改为走统一入口后该测试仍报错，说明接线未真正落地。
         Path projectDir = Files.createTempDirectory("wf1c-project-");
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        RequestContext.setSession(sessionId.toString());
         // 绑定会话项目根（对齐 CC getSessionProjectDir() 非空分支）
         SessionProjectRoot.setForSession(sessionId.toString(), projectDir.toString());
         Path transcriptInProject = null;
@@ -643,7 +639,8 @@ class AgentColorCommandTest {
             injectCommandField(cmd, "sessionAgentStateRegistry", registry);
             cmd.registerSlashCommand();
 
-            dispatcher.dispatch("/color blue");
+            // [批 3c] 会话标识显式传参（旧实现经 MDC 取同值）——handler/存档根/registry 全链同源本会话
+            dispatcher.dispatch("/color blue", sessionId, null);
 
             // 统一入口解析的存档根（对齐 CC getOriginalCwd 层，已 normalizeCwd=realpath+NFC）
             Path resolvedRoot = Path.of(CwdResolution.getOriginalCwdLayer(sessionId.toString()));
@@ -666,7 +663,6 @@ class AgentColorCommandTest {
             String content = Files.readString(transcriptInProject);
             assertThat(content).contains("\"type\":\"agent-color\"").contains("\"agentColor\":\"blue\"");
         } finally {
-            RequestContext.clear();
             SessionProjectRoot.clearSession(sessionId.toString());
             if (transcriptInProject != null) {
                 Files.deleteIfExists(transcriptInProject);
@@ -685,7 +681,6 @@ class AgentColorCommandTest {
         //   （Java 等价 user.dir，JVM 启动目录）。统一入口必须保证未绑定场景恒非 null、不抛异常
         //   （对齐 CC getCwd catch → getOriginalCwd 兜底语义）。若未绑定场景抛 NPE，生产 /color 即崩溃。
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        RequestContext.setSession(sessionId.toString());
         // 显式确保未绑定（隔离前置用例的 setForSession 残留）
         SessionProjectRoot.clearSession(sessionId.toString());
         Path transcript = null;
@@ -699,7 +694,8 @@ class AgentColorCommandTest {
             injectCommandField(cmd, "sessionAgentStateRegistry", registry);
             cmd.registerSlashCommand();
 
-            dispatcher.dispatch("/color green");
+            // [批 3c] 会话标识显式传参（旧实现经 MDC 取同值）
+            dispatcher.dispatch("/color green", sessionId, null);
 
             // 未绑定 → 统一入口回落 user.dir（对齐 CC getOriginalCwd 兜底，realpath 归一化后等价）
             Path resolvedRoot = Path.of(CwdResolution.getOriginalCwdLayer(sessionId.toString()));
@@ -714,7 +710,6 @@ class AgentColorCommandTest {
             assertThat(Files.isRegularFile(transcript))
                 .as("未绑定 → transcript 落 config-home projects slug（对齐 CC getProjectDir(getOriginalCwd())）").isTrue();
         } finally {
-            RequestContext.clear();
             if (transcript != null) {
                 try { Files.deleteIfExists(transcript); } catch (IOException ignored) { }
             }

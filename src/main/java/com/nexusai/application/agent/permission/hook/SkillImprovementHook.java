@@ -179,8 +179,8 @@ public class SkillImprovementHook {
      *
      * <p><b>[批 3b] 键 = 显式 sessionId</b>：apply 经
      * {@link CompletableFuture#runAsync(Runnable)} 提交到 ForkJoinPool（派生线程），
-     * 该线程上 {@code RequestContext.sessionId()}（MDC/ThreadLocal）恒为 null 或残留别会话 id；
-     * 旧 lambda {@code () -> Path.of(CwdResolution.getCwd(RequestContext.sessionId()))} 因此
+     * 该线程上「裸 MDC 会话槽」（批 3c 已连同其载体一并删除）恒为 null 或残留别会话 id；
+     * 旧 lambda {@code () -> Path.of(CwdResolution.getCwd(环境态会话槽))} 因此
      * 在生产派生线程上取不到会话 cwd（本项目级技能判定/写回落到 user.dir）。
      * 用户铁律：会话态一律显式传参、回放不算合规 ⇒ 改为 sessionId 显式入参。
      */
@@ -255,7 +255,7 @@ public class SkillImprovementHook {
                 //   boundProject ?? user.dir 兜底链），替代旧 Path.of("") 冻结 JVM user.dir
                 //   （所有会话共用同一基准的语义漂移）。
                 //   [批 3b] sessionId 由 applySkillImprovement 显式传入 —— 本 lambda 在
-                //   ForkJoinPool 派生线程求值，RequestContext.sessionId()（MDC）在那里恒 null/残留。
+                //   ForkJoinPool 派生线程求值，裸 MDC 会话槽（批 3c 已删）在那里恒 null/残留。
                 sessionId -> Path.of(CwdResolution.getCwd(sessionId)),
                 suggestionStore,
                 improvementEnabled);
@@ -601,8 +601,8 @@ public class SkillImprovementHook {
      * {@link #baseDirForSession} 求值 (CC getCwd() 动态语义), 非构造期冻结.
      *
      * <p><b>[批 3b] sessionId 显式入参</b>：apply 体在 {@link CompletableFuture#runAsync(Runnable)}
-     * 的 ForkJoinPool 派生线程执行，该线程 {@code RequestContext.sessionId()}（MDC/ThreadLocal）
-     * 恒 null 或残留别会话 id ⇒ 此前 lambda {@code () -> getCwd(RequestContext.sessionId())}
+     * 的 ForkJoinPool 派生线程执行，该线程上的裸 MDC 会话槽（批 3c 已连同其载体一并删除）
+     * 恒 null 或残留别会话 id ⇒ 此前 lambda {@code () -> getCwd(环境态会话槽)}
      * 在生产取不到会话 cwd。现由调用方（{@code SkillImprovementController.decision}，REST 线程，
      * 持有显式 sessionId）显式传入。
      *
@@ -962,7 +962,10 @@ public class SkillImprovementHook {
             projectDirs.add(additionalSkillsDir);
         }
         for (AgentState.InvokedSkillInfo info : invoked) {
-            Command cmd = skillRegistry.findCommand(info.skillName());
+            // [批 3c] 会话标识显式取自 hook 上下文的 ToolUseContext（本方法入口已守卫
+            //   ctx/toolUseContext/sessionId 三者非 null，见方法 javadoc 第 1 条）——invoked 技能名
+            //   的解析基座随会话绑定项目变化。原经裸 MDC 读取（ForkJoinPool 派生线程上恒 null/残留别会话），已删。
+            Command cmd = skillRegistry.findCommand(info.skillName(), ctx.toolUseContext().sessionId());
             if (cmd == null || cmd.getBaseDir() == null || cmd.getBaseDir().isBlank()) {
                 continue;
             }

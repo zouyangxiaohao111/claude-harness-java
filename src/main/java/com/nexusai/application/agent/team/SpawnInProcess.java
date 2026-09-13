@@ -8,7 +8,6 @@ import com.nexusai.application.agent.tool.impl.SubagentExecutor;
 import com.nexusai.infra.util.AbortControllerFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
@@ -330,7 +329,7 @@ public class SpawnInProcess {
                     boolean appended = teamHelpers.appendTeamMember(config.teamName(),
                         new TeamHelpers.TeamMemberRef(agentId, config.name(), config.agentType(),
                             config.model(), config.prompt(), config.color(), config.planModeRequired(),
-                            "in-process", resolveSpawnCwd(config), "in-process"));
+                            "in-process", resolveSpawnCwd(config, parentSessionId), "in-process"));
                     if (appended) {
                         log.info("[spawnInProcessTeammate] 已写 config.json members: agentId={} team={}",
                             agentId, config.teamName());
@@ -359,34 +358,13 @@ public class SpawnInProcess {
             //   使 runner 线程（runTeammateLoop 全程）持 teammate 上下文；
             //   工具执行线程的上下文由 StreamingToolExecutor.executeAsync 捕获传播
             //   （ThreadLocal 不跨线程，Java 需手动桥接 AsyncLocalStorage 的自动传播语义）。
-            // [reqId MDC 传播] 调度线程（工具池线程，经 StreamingToolExecutor 回放已含父 MDC）捕获
-            //   MDC context map → teammate runner 线程回放（实测：logback MDC 不随 new Thread 继承，
-            //   须显式回放）。WHY: runner 线程（runTeammateLoop→SubagentExecutor.executeStreaming）
-            //   RequestContext.requestId()=null → isTodoV2Enabled()=false → teammate 子代理回落 V1
-            //   TodoWrite、父 V2/子 V1 工具集分叉（决策 #65 在 team 路径重演）。回放后 runner 线程
-            //   同帧 requestId 可见。
-            final java.util.Map<String, String> mdcCtx = MDC.getCopyOfContextMap();
             Thread runner = new Thread(() -> {
-                    // [reqId MDC 传播] 线程体开头回放父 MDC → 任务结束 restore 线程原值（成对，防泄漏）。
-                    java.util.Map<String, String> prevRunnerMdc = MDC.getCopyOfContextMap();
-                    if (mdcCtx != null) {
-                        MDC.setContextMap(mdcCtx);
-                    }
-                    try {
-                        // void 兼容：runWithTeammateContext 返回值丢弃（Runnable 块 lambda 不可 return）。
-                        TeammateContext.runWithTeammateContext(teammateContext,
-                            () -> {
-                                loop.runTeammateLoop(prompt);
-                                return null;
-                            });
-                    } finally {
-                        // [reqId MDC 传播] 成对 restore 线程原值（null → 清理，防线程复用泄漏）。
-                        if (prevRunnerMdc != null) {
-                            MDC.setContextMap(prevRunnerMdc);
-                        } else {
-                            MDC.clear();
-                        }
-                    }
+                    // void 兼容：runWithTeammateContext 返回值丢弃（Runnable 块 lambda 不可 return）。
+                    TeammateContext.runWithTeammateContext(teammateContext,
+                        () -> {
+                            loop.runTeammateLoop(prompt);
+                            return null;
+                        });
                 },
                 "teammate-" + agentId);
             runner.setDaemon(true);
@@ -405,14 +383,20 @@ public class SpawnInProcess {
      * 解析 teammate cwd · 对齐 CC spawnMultiAgent.ts:337 {@code workingDir = cwd || getCwd()}。
      *
      * <p>config.cwd() 非 null 优先（spawn 输入显式指定）；缺省取会话 cwd（对齐
-     * TeamCreateTool.leadCwd 同款，CwdResolution.getCwd(RequestContext.sessionId())）；
+     * TeamCreateTool.leadCwd 同款，{@code CwdResolution.getCwd(sessionId)}）；
      * 无 sessionId 回落 user.dir。
+     *
+     * <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code spawnInProcessTeammate} 从
+     * {@link SpawnContext#parentSessionId()} 显式传入（= Leader 会话）；⛔ 不再读 MDC
+     * （teammate 线程为 {@code new Thread}，ThreadLocal/MDC 不跨线程）。
+     *
+     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
      */
-    private static String resolveSpawnCwd(InProcessSpawnConfig config) {
+    private static String resolveSpawnCwd(InProcessSpawnConfig config, String sessionId) {
         if (config.cwd() != null && !config.cwd().isBlank()) {
             return config.cwd();
         }
-        String cwd = com.nexusai.application.agent.agent.CwdResolution.getCwd(com.nexusai.common.RequestContext.sessionId());
+        String cwd = com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 }

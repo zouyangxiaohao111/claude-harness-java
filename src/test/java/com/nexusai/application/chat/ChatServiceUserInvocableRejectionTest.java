@@ -184,7 +184,9 @@ class ChatServiceUserInvocableRejectionTest {
     void dispatchImmediate_withHandler_dispatchesAndPushes() {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         java.util.concurrent.atomic.AtomicBoolean executed = new java.util.concurrent.atomic.AtomicBoolean(false);
-        dispatcher.registerSlashCommand("btw", args -> executed.set(true));
+        // [批 3c] handler 3 形参 (args, sessionId, inFlightUserMessageId)：本用例只验证「命中即执行」，
+        //   会话/在途消息 id 由 ChatService 生产路径显式传入，handler 侧不消费
+        dispatcher.registerSlashCommand("btw", (args, sessionId, inFlightUserMessageId) -> executed.set(true));
         ReflectionTestUtils.setField(service, "userInputDispatcher", dispatcher);
         when(messageService.createQueuedUserMessage(eq(sid), any(), eq("/btw info"))).thenReturn(
             new com.nexusai.model.session.dto.MessageCreatedResponse(

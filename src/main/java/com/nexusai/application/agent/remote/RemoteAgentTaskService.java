@@ -180,10 +180,10 @@ public class RemoteAgentTaskService {
          * Phase 4 (cron-notify): 本地创建会话 sessionId。与 {@code sessionId}（CCR remote 会话，
          * API 轮询用）不同 —— 本字段是<b>本地</b>发起该远程任务的会话，完成通知注入该本地会话回合。
          * 由生产 caller（AgentTool 远端 / /review 命令）从 {@code ToolUseContext.sessionId()} 显式
-         * 透传（tool-exec 池线程无 MDC，不可依赖 {@code RequestContext.sessionId()}）。
+         * 透传（tool-exec 池线程无 MDC，不可依赖 裸 MDC 的 {@code sessionId()}）。
          * <b>[批 3b] 删 MDC 回退</b>：本字段是本方法<b>唯一</b>会话源；null = 显式声明「无创建会话」
          * → 回落全局（CronIdleExecutor GLOBAL_SESSION_UUID），按缺值规则记 WARN（禁只 DEBUG）。
-         * 旧实现 {@code null ? RequestContext.sessionId() : …} 在派生线程（tool-exec 池）恒读到
+         * 旧实现 {@code null ? 裸 MDC 的 sessionId() : …} 在派生线程（tool-exec 池）恒读到
          * null/残留别会话 id —— 会话态一律显式传参，回放/兜底不算合规。
          */
         @Nullable String creatingSessionId
@@ -212,7 +212,7 @@ public class RemoteAgentTaskService {
         String taskId = TaskIdGenerator.generate(TaskType.REMOTE_AGENT);
         long now = System.currentTimeMillis();
         // Phase 4 (cron-notify): 本地创建会话 = 显式透传（RegisterOptions.creatingSessionId，生产
-        //   caller 从 ctx.sessionId() 取）。[批 3b] ⛔ 删除 RequestContext.sessionId()（MDC）兜底 ——
+        //   caller 从 ctx.sessionId() 取）。[批 3b] ⛔ 删除 裸 MDC 的 sessionId()（MDC）兜底 ——
         //   registerRemoteAgentTask 由 tool-exec 池线程调用（无 MDC）或 REST 线程（残留别会话 id），
         //   兜底只会静默串号。
         //   <b>绝不能把 options.sessionId()（CCR remote 会话）当创建会话</b> —— 二者语义不同，

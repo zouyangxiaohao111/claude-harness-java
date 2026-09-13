@@ -268,10 +268,13 @@ class BundledSkillDefinitionTest {
         assertThat(batch.userInvocable()).isTrue();
         assertThat(batch.disableModelInvocation()).as("CC batch.ts:109 disableModelInvocation: true").isTrue();
 
+        // [批 3c] debugLogPathSupplier → Function<String,String>（sessionId → path）、
+        //   SettingsPathProvider.pathFor → (source, sessionId)；本用例只断言 register() 产出的
+        //   定义字段（不渲染 prompt），故两处 lambda 均忽略 sessionId。
         BundledSkillDefinition debug = new DebugSkillRegistrar(
-            () -> false, () -> "/tmp/debug.log", () -> true,
+            () -> false, sessionId -> "/tmp/debug.log", () -> true,
             (path, offset, size) -> "", path -> { throw new java.nio.file.NoSuchFileException(path); },
-            Long::toString, source -> "/default/" + source + ".json").register();
+            Long::toString, (source, sessionId) -> "/default/" + source + ".json").register();
         assertThat(debug.name()).isEqualTo("debug");
         assertThat(debug.allowedTools()).containsExactly("Read", "Grep", "Glob");
         assertThat(debug.disableModelInvocation()).as("CC debug.ts:23 disableModelInvocation: true").isTrue();

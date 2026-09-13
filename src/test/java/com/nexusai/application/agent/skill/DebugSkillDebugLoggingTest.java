@@ -1,7 +1,5 @@
 package com.nexusai.application.agent.skill;
 
-import com.nexusai.common.RequestContext;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -27,11 +25,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  * </ol>
  */
 class DebugSkillDebugLoggingTest {
-
-    @AfterEach
-    void cleanup() {
-        RequestContext.clear();
-    }
 
     @Test
     @DisplayName("stat + readTail 读真实文件内容（CC debug.ts:35/:38-48）")
@@ -76,8 +69,9 @@ class DebugSkillDebugLoggingTest {
         // G5：生产默认写盘根已迁 nexusai 自有根（DebugSkillRegistrar.java:280）→ 唯一 appName 隔离
         NexusaiPaths.setAppNameOverride("nexusai-test-" + configHome.getFileName());
         try {
-            RequestContext.set("sess-abc", null);
-            String path = DebugSkillRegistrar.DebugLogging.getDebugLogPath();
+            // [批 3c] 会话标识改为显式形参（原裸 MDC 会话槽已删）—— 本用例断言的正是「按会话落
+            //   {sessionId}.txt」这一会话相关行为 → 必须传真实非空 sessionId（即断言里的 sess-abc）
+            String path = DebugSkillRegistrar.DebugLogging.getDebugLogPath("sess-abc");
             assertThat(path).isEqualTo(
                 Paths.get(NexusaiPaths.getAppConfigHomeDir(), "debug", "sess-abc.txt").toString());
         } finally {
@@ -92,11 +86,14 @@ class DebugSkillDebugLoggingTest {
         // G5：userSettings 源已迁 nexusai 自有根（DebugSkillRegistrar.java:340）→ 唯一 appName 隔离
         NexusaiPaths.setAppNameOverride("nexusai-test-" + configHome.getFileName());
         try {
-            assertThat(DebugSkillRegistrar.DebugLogging.settingsPathFor("userSettings"))
+            // [批 3c] 无会话 → 显式 null（本用例只断言路径**形状**：user 源恒 session 无关；
+            //   project/local 源基 cwd 由 sessionId 解析，null 回落 user.dir —— 与改造前 MDC 为空
+            //   时的既有行为逐字等价，断言用 endsWith 故与 cwd 无关）
+            assertThat(DebugSkillRegistrar.DebugLogging.settingsPathFor("userSettings", null))
                 .isEqualTo(Paths.get(NexusaiPaths.getAppConfigHomeDir(), "settings.json").toString());
-            assertThat(DebugSkillRegistrar.DebugLogging.settingsPathFor("projectSettings"))
+            assertThat(DebugSkillRegistrar.DebugLogging.settingsPathFor("projectSettings", null))
                 .endsWith(NexusaiPaths.getProjectDirName() + java.io.File.separator + "settings.json");
-            assertThat(DebugSkillRegistrar.DebugLogging.settingsPathFor("localSettings"))
+            assertThat(DebugSkillRegistrar.DebugLogging.settingsPathFor("localSettings", null))
                 .endsWith(NexusaiPaths.getProjectDirName() + java.io.File.separator + "settings.local.json");
         } finally {
             ClaudePaths.setConfigDirOverride(null);   // 同存复位（防御历史覆盖）

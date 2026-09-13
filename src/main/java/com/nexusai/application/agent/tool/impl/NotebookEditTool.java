@@ -62,12 +62,29 @@ public class NotebookEditTool implements Tool {
     /**
      * [IMP-D3] PathGuard · 对齐 CC {@code safeResolvePath}（filesystem.ts）。read-before-edit
      * 门禁（validateInput errorCode 9/10）经 {@link ToolUseContext#keyForReadFileState}
-     * 派生 key，与 ReadFileTool 读 notebook 写入的 key 同源（同一 PathGuard bean，
-     * {@code ToolConfig:29} 以 {@code user.dir} 为 workdir）。{@code @Autowired(required=false)}
-     * + setter 与 permissionChecker 同模式（本工具 @Component 自动收集）。
+     * 派生 key，与 ReadFileTool 读 notebook 写入的 key 同源（同一 PathGuard bean；相对路径基准
+     * 由 {@link #resolveNotebookPath} 按 {@code ctx.sessionId()} 的会话 cwd 解析）。
+     * {@code @Autowired(required=false)} + setter 与 permissionChecker 同模式（本工具 @Component 自动收集）。
      */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private PathGuard guard;
+
+    /**
+     * 会话感知 notebook 路径解析 · {@code validateInput} / {@code execute} <b>共用</b>。
+     *
+     * <p>WHY 必须共用：门禁（validateInput）与读写（execute）若用不同基准解析同一 {@code
+     * notebook_path}，相对路径会出现「校验的是 A 文件、读写的是 B 文件」的错位。
+     *
+     * @param notebookPath LLM 入参 notebook_path
+     * @param ctx          工具上下文（null ⇒ 无会话兜底，PathGuard WARN）
+     * @return 绝对路径（guard 未注入时退化为 {@code Path.of(notebookPath)}，与旧行为一致）
+     */
+    private Path resolveNotebookPath(String notebookPath, ToolUseContext ctx) {
+        if (guard == null) {
+            return Paths.get(notebookPath);
+        }
+        return guard.resolve(ctx != null ? ctx.sessionId() : null, notebookPath);
+    }
 
     /** 测试/装配用 setter。 */
     public void setGuard(PathGuard guard) {
@@ -172,15 +189,13 @@ public class NotebookEditTool implements Tool {
         // resolve 绝对路径（CC :180-182：isAbsolute ? notebook_path : resolve(cwd, notebook_path)）
         // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛；不再 toRealPath → 8.3 短名
         //   误报场景也不存在），原 catch 回退（①越狱 ②8.3 短名）死代码删除。
-        Path path;
-        String key;
-        if (guard != null) {
-            path = guard.resolve(notebookPath);
-            key = ToolUseContext.keyForReadFileState(guard, notebookPath);
-        } else {
-            path = Paths.get(notebookPath);
-            key = null;
-        }
+        // [会话 cwd] 会话感知解析：相对路径基准 = ctx.sessionId() 的当前 cwd（与 execute 同一辅助，
+        //   保证校验路径与读写路径同基准）；ctx == null 回落无会话兜底（PathGuard WARN）。
+        Path path = resolveNotebookPath(notebookPath, ctx);
+        // [key 同源] 键 = 解析后的规范化绝对路径本身（CC 端 key 即 absoluteFilePath）
+        String key = guard != null
+            ? ToolUseContext.keyForReadFileState(guard, path.toString())
+            : null;
         String fullPath = path.toAbsolutePath().normalize().toString();
         if (key == null) {
             key = fullPath;
@@ -298,7 +313,8 @@ public class NotebookEditTool implements Tool {
         String editMode = readString(input, "edit_mode");
         if (editMode == null) editMode = "replace";
 
-        Path path = Paths.get(notebookPath);
+        // [会话 cwd] 与 validateInput 同一解析（同一基准，避免门禁与读写路径错位）
+        Path path = resolveNotebookPath(notebookPath, ctx);
         try {
             com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
             com.fasterxml.jackson.databind.JsonNode notebook;
@@ -408,8 +424,9 @@ public class NotebookEditTool implements Tool {
             //   破坏 ReadFileTool dedup（Read→NotebookEdit→Read 同毫秒返回 file_unchanged stub 问题）。
             if (ctx != null) {
                 long writeMtime = Files.getLastModifiedTime(path).toMillis();
+                // [key 同源] 键 = 解析后的规范化绝对路径（与 validateInput 门禁键同源）
                 String key = guard != null
-                    ? ToolUseContext.keyForReadFileState(guard, notebookPath)
+                    ? ToolUseContext.keyForReadFileState(guard, path.toString())
                     : path.toAbsolutePath().normalize().toString();
                 ctx.readFileState().set(key,
                     ToolUseContext.ReadState.full(writeMtime, updatedContent));

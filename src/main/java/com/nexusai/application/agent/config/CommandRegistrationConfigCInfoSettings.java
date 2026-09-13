@@ -11,7 +11,6 @@ import com.nexusai.application.agent.skill.BundledSkillDefinition;
 import com.nexusai.application.agent.skill.BundledSkills;
 import com.nexusai.application.agent.skill.ParseSkillFrontmatter;
 import com.nexusai.application.agent.skill.PromptBlock;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.PromptFnContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -229,8 +228,9 @@ public class CommandRegistrationConfigCInfoSettings {
      * 缺失 → 回落 changelog 链接。受控差异：CC 外网拉取改为本地文件读（见类 JavaDoc）。
      */
     private void registerReleaseNotesHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommandResult("release-notes", args -> {
-            String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+        dispatcher.registerSlashCommandResult("release-notes", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
+            String cwd = CwdResolution.getCwd(sessionId);
             if (cwd == null || cwd.isBlank()) {
                 cwd = System.getProperty("user.dir", ".");
             }
@@ -251,7 +251,7 @@ public class CommandRegistrationConfigCInfoSettings {
      * PrivacySettingsDialog React 渲染 → 状态披露（受控差异）。
      */
     private void registerPrivacySettingsHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("privacy-settings", args -> {
+        dispatcher.registerSlashCommand("privacy-settings", (args, sessionId, inFlightUserMessageId) -> {
             if (!isConsumerSubscriber()) {
                 log.warn("[CommandRegistrationConfigCInfoSettings] /privacy-settings 被 isConsumerSubscriber 门控关闭"
                     + "（web 无 claude.ai 订阅模型，默认 false；对齐 CC privacy-settings/index.ts:8-10）");
@@ -285,13 +285,13 @@ public class CommandRegistrationConfigCInfoSettings {
      * web 无 Year-in-Review React 面板，改为思考块文本回放）。
      */
     private void registerThinkBackHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry registry) {
-        dispatcher.registerSlashCommand("think-back", args -> {
+        dispatcher.registerSlashCommand("think-back", (args, sessionId, inFlightUserMessageId) -> {
             if (!thinkBackFeatureEnabled()) {
                 log.warn("[CommandRegistrationConfigCInfoSettings] /think-back 被 tengu_thinkback 门控关闭"
                     + "（Java 无 statsig，默认 false；对齐 CC thinkback/index.ts:8-10）");
                 return;
             }
-            String sessionId = RequestContext.sessionId();
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             if (registry == null || sessionId == null || sessionId.isBlank()) {
                 log.warn("[CommandRegistrationConfigCInfoSettings] /think-back 无会话上下文或 SessionAgentStateRegistry 未注入");
                 return;

@@ -11,7 +11,6 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -137,19 +136,30 @@ final class BrowserMcpTool implements Tool {
             null);
     }
 
+    @Override
+    public AgentToolResult<?> execute(ToolUseBlock call) {
+        return execute(call, null);
+    }
+
     /**
-     * 执行：优先转发通道；通道未注入 → fail loud 返回「浏览器扩展未连接」。
+     * 执行（显式会话载体）：优先转发通道；通道未注入 → fail loud 返回「浏览器扩展未连接」。
      *
-     * <p><b>多会话并行</b>：从 {@link RequestContext#sessionId()} 取当前会话，透传给
-     * {@link BrowserChannel#send(String, String, Map)} —— 扩展按 sessionId 定位/创建该会话的
+     * <p><b>多会话并行</b>：会话 id 由 {@link ToolUseContext} <b>显式</b>传入（
+     * {@code StreamingToolExecutor} 经 {@code execute(call, ctx, onProgress)} 派发链下传），
+     * 透传给 {@link BrowserChannel#send(String, String, Map)} —— 扩展按 sessionId 定位/创建该会话的
      * tab 组（对齐 CCB tabs_context_mcp「每个会话自己的 tab 组」）；结果回传经 callId 匹配，
      * 与 sessionId 无关。
+     *
+     * <p>[批 3c] ⛔ 不再读裸 MDC（原读点）：本工具在 tool-exec 池线程执行，
+     * MDC 恒空或读到该池线程上一个任务残留的别会话 id（第三态）⇒ tab 组串会话。
+     * 无 ctx（直调 {@link #execute(ToolUseBlock)}）⇒ 无会话，透传 null（扩展侧自建默认 tab 组）。
      *
      * <p><b>fail loud（规则十二）</b>：本阶段 WS 通道未实现，模型调用浏览器工具时不得静默
      * 吞掉或假成功 —— 必须返回明确错误文案，让模型/用户知道需要先连接 NexusAI in Chrome 扩展。
      */
     @Override
-    public AgentToolResult<?> execute(ToolUseBlock call) {
+    public AgentToolResult<?> execute(ToolUseBlock call, ToolUseContext ctx) {
+        String sessionId = ctx != null ? ctx.sessionId() : null;
         BrowserChannel ch = this.channel;
         if (ch == null) {
             log.warn("BrowserMcpTool: {} 调用但浏览器扩展未连接（BrowserChannel 未注入）→ fail loud 返回「{}」",
@@ -165,7 +175,6 @@ final class BrowserMcpTool implements Tool {
             return ToolResult.error(call.id(), "浏览器工具入参解析失败: " + e.getMessage());
         }
         try {
-            String sessionId = RequestContext.sessionId();
             String result = ch.send(sessionId, toolName, args);
             // 截图类大 base64 不直接给模型（纯噪音 + 巨 token）：落盘为文件，tool_result 给指针
             result = persistScreenshotIfPresent(result, sessionId);

@@ -144,7 +144,7 @@ public class BranchController {
     /**
      * 批 3a · REST 入口会话标识必填（(a) 类 fail loud）：缺 / 空白 ⇒ 400。
      *
-     * <p>WHY：旧实现经 {@code RequestContext.sessionId()}（裸 MDC）兜底，而 MDC 存在「读到上一个
+     * <p>WHY：旧实现经 裸 MDC 的 {@code sessionId()} 兜底，而 MDC 存在「读到上一个
      * 请求残留的、别的会话的 id」第三态 —— 看起来合法却指向错误会话的 boundProject ⇒ 在错误的仓库上
      * 建/删 worktree。改为显式 query 参数，缺值即拒（不再有任何兜底读取）。
      */

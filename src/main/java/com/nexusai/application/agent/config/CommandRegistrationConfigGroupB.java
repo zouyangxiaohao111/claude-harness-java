@@ -13,7 +13,6 @@ import com.nexusai.application.agent.skill.BundledSkillDefinition;
 import com.nexusai.application.agent.skill.BundledSkills;
 import com.nexusai.application.agent.skill.PromptBlock;
 import com.nexusai.application.agent.tool.SessionStorage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -290,33 +289,34 @@ public class CommandRegistrationConfigGroupB {
     /**
      * /force-snip handler · 对齐 CC force-snip.js（编译产物）+ QueryEngine.ts:337-346（setMessages 变更消息数组）。
      *
-     * <p>会话解析：RequestContext.sessionId（MDC）→ SessionAgentStateRegistry.get；AgentState 未注册 →
+     * <p>会话解析：分派入口显式传入的 handler 形参 sessionId（批 3c：不再读裸 MDC）→
+     * SessionAgentStateRegistry.get；AgentState 未注册 →
      * log.warn fail loud。执行 {@link SnipCompactor#snipCompactIfNeeded(List, boolean)} force 变体
      * （force=true，snipCompact.ts:85 参数从未使用 + QueryEngine.ts:1281 snipReplay 同款）；
      * executed=true → {@link AgentState#replaceMessages} 物理移除被裁剪消息，boundary（含摘要）保留。
      */
     private void registerForceSnipHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry) {
-        dispatcher.registerSlashCommandResult("force-snip", args -> {
+        dispatcher.registerSlashCommandResult("force-snip", (args, sessionId, inFlightUserMessageId) -> {
             if (sessionRegistry == null) {
                 log.warn("[CommandRegistrationConfigGroupB] /force-snip 无法执行：SessionAgentStateRegistry 未注入");
                 return UserInputDispatcher.LocalCommandResult.text(
                     "/force-snip 无法执行：SessionAgentStateRegistry 未注入。");
             }
-            String rawSessionId = RequestContext.sessionId();
-            if (rawSessionId == null || rawSessionId.isBlank()) {
-                log.warn("[CommandRegistrationConfigGroupB] /force-snip 无法解析当前 session（RequestContext.sessionId 为空）");
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
+            if (sessionId == null || sessionId.isBlank()) {
+                log.warn("[CommandRegistrationConfigGroupB] /force-snip 无法解析当前 session（分派入口未传会话标识）");
                 return UserInputDispatcher.LocalCommandResult.text(
-                    "/force-snip 无法解析当前 session（无请求上下文）。");
+                    "/force-snip 无法解析当前 session（无会话标识）。");
             }
-            AgentState state = sessionRegistry.get(rawSessionId);
+            AgentState state = sessionRegistry.get(sessionId);
             if (state == null) {
-                log.warn("[CommandRegistrationConfigGroupB] /force-snip 会话未注册 AgentState: sessionId={}", rawSessionId);
+                log.warn("[CommandRegistrationConfigGroupB] /force-snip 会话未注册 AgentState: sessionId={}", sessionId);
                 return UserInputDispatcher.LocalCommandResult.text(
                     "/force-snip 会话未注册 AgentState（无进行中循环）。");
             }
             List<ChatMessageDto> messages = state.rawMessages();
             if (messages == null || messages.isEmpty()) {
-                log.warn("[CommandRegistrationConfigGroupB] /force-snip 会话消息为空: sessionId={}", rawSessionId);
+                log.warn("[CommandRegistrationConfigGroupB] /force-snip 会话消息为空: sessionId={}", sessionId);
                 return UserInputDispatcher.LocalCommandResult.text("/force-snip 会话消息为空。");
             }
             SnipCompactor.SnipReplayResult result = new SnipCompactor().snipCompactIfNeeded(messages, true);
@@ -346,7 +346,7 @@ public class CommandRegistrationConfigGroupB {
                                     SessionAgentStateRegistry sessionRegistry,
                                     LlmProviderFactory llmProviderFactory,
                                     ModelConfigResolver modelConfigResolver) {
-        dispatcher.registerSlashCommand("btw", args -> {
+        dispatcher.registerSlashCommand("btw", (args, sessionId, inFlightUserMessageId) -> {
             String question = args == null ? "" : args.trim();
             if (question.isEmpty()) {
                 log.warn("[CommandRegistrationConfigGroupB] /btw 用法: /btw <你的问题>（CC btw.tsx:232-236 Usage）");
@@ -358,7 +358,7 @@ public class CommandRegistrationConfigGroupB {
                 return;
             }
             try {
-                String model = currentModel(sessionRegistry);
+                String model = currentModel(sessionRegistry, sessionId);   // [批 3c] 会话标识取 handler 形参
                 ModelConfigResolver.ResolvedModel resolved = modelConfigResolver.resolve(model);
                 if (resolved == null || resolved.config() == null || !resolved.config().isUsable()) {
                     log.warn("[CommandRegistrationConfigGroupB] /btw 模型配置不可用（model={}），仅记录提问: {}", model, question);
@@ -385,7 +385,7 @@ public class CommandRegistrationConfigGroupB {
      * （isEnabled / auto-allow / unsandboxed / 平台 / 依赖）。
      */
     private void registerSandboxHandler(UserInputDispatcher dispatcher, SandboxManager sandboxManager) {
-        dispatcher.registerSlashCommand("sandbox", args -> {
+        dispatcher.registerSlashCommand("sandbox", (args, sessionId, inFlightUserMessageId) -> {
             if (sandboxManager == null) {
                 log.warn("[CommandRegistrationConfigGroupB] /sandbox 无法执行：SandboxManager 未注入");
                 return;
@@ -410,7 +410,7 @@ public class CommandRegistrationConfigGroupB {
      * （{@link InstalledPluginsManager#list()}）。
      */
     private void registerPluginHandler(UserInputDispatcher dispatcher, InstalledPluginsManager installedPluginsManager) {
-        dispatcher.registerSlashCommand("plugin", args -> {
+        dispatcher.registerSlashCommand("plugin", (args, sessionId, inFlightUserMessageId) -> {
             if (installedPluginsManager == null) {
                 log.warn("[CommandRegistrationConfigGroupB] /plugin 无法执行：InstalledPluginsManager 未注入");
                 return;
@@ -429,12 +429,16 @@ public class CommandRegistrationConfigGroupB {
     // 生产 env 工具方法
     // ════════════════════════════════════════════════════════════════════════
 
-    /** 当前会话 AgentState.currentModel() · 未注册/无模型 → "claude-sonnet-4-6" 兜底（同 CommandRegistrationConfig.currentModel）。 */
-    private static String currentModel(SessionAgentStateRegistry registry) {
+    /**
+     * 当前会话 AgentState.currentModel() · 未注册/无模型 → "claude-sonnet-4-6" 兜底
+     * （同 CommandRegistrationConfig.currentModel）。
+     *
+     * @param sessionId 显式会话标识（批 3c：由调用点形参穿透，不再读裸 MDC）
+     */
+    private static String currentModel(SessionAgentStateRegistry registry, String sessionId) {
         if (registry == null) {
             return "claude-sonnet-4-6";
         }
-        String sessionId = RequestContext.sessionId();
         if (sessionId == null) {
             return "claude-sonnet-4-6";
         }

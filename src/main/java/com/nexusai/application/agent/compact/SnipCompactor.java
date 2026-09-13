@@ -50,31 +50,22 @@ public class SnipCompactor {
     private static final int CHARS_PER_TOKEN = 4;
 
     /** 消息数 nudge 阈值 · CC original: SNIP_NUDGE_THRESHOLD (snipCompact.ts:11) = 30（固定值）。
-     *  仅供 {@code shouldNudgeForSnips(messages)} 单参变体（CC 原语义）+ 窗口未知（0/负）兜底；
-     *  窗口自适应路径用下方 900/600/360/180 档位（snip-nudge-scaleup 2026-09-08 ×3 + 2026-09-09 ×2）。 */
+     *  仅供 {@link #shouldNudgeForSnips(List)} 单参变体保留 CC 原语义 —— **生产已不再消费**
+     *  （2026-09-13 snip-nudge-percent：门 4 判据改为上下文剩余百分比，见
+     *  {@link #SNIP_NUDGE_DEFAULT_REMAINING_PERCENT}）。 */
     private static final int SNIP_NUDGE_THRESHOLD = 30;
 
-    // [V55 fix-transcript-nudge] 上下文窗口自适应档位（Java 扩展，CC 仅固定 30）。
-    //   effectiveWindow = CompactThresholdSystem#getEffectiveContextWindowSize(model)
-    //   （含 reserved 减法 + settings 收窄）。
-    //   [snip-nudge-scaleup 2026-09-08 用户拍板] 档位整体 ×3（1M 窗口 150→450，避免过早 nudge；其它同比例）。
-    //   [snip-nudge-scaleup 2026-09-09 用户拍板 再 ×2（沿 ×3 阶梯同比例）]：实测 831 条对话仅用 ~61% 窗口，
-    //   450 条阈值仍过早 → 整档 ×2：≥800k → 900；>600k → 600；≥400k → 360；>0 且 <400k（如 200k）→ 180；
-    //   窗口未知（0/负：阈值系统未接线/单测/无 bean）→ 仍回落 CC 默认 30（零行为变化）。
-    /** 窗口档位 A 下限（effectiveWindow ≥ 800k → 阈值 900） */
-    private static final int SNIP_NUDGE_WINDOW_800K = 800_000;
-    /** 窗口档位 B 下限（effectiveWindow &gt; 600k → 阈值 600） */
-    private static final int SNIP_NUDGE_WINDOW_600K = 600_000;
-    /** 窗口档位 C 下限（effectiveWindow ≥ 400k → 阈值 360） */
-    private static final int SNIP_NUDGE_WINDOW_400K = 400_000;
-    /** 窗口档位 A 阈值（≥800k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_900 = 900;
-    /** 窗口档位 B 阈值（>600k 且 <800k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_600 = 600;
-    /** 窗口档位 C 阈值（≥400k 且 ≤600k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_360 = 360;
-    /** 窗口档位 D 阈值（>0 且 <400k 已知小窗口，如 200k） */
-    private static final int SNIP_NUDGE_THRESHOLD_TIER_180 = 180;
+    /**
+     * [snip-nudge-percent 2026-09-13] nudge 判据默认「上下文剩余百分比」。
+     *
+     * <p><b>WHY</b>：原判据 = 「模型可见消息条数 ≥ 窗口自适应档位（900/600/360/180）」，与真实上下文
+     * 压力脱钩 —— 实测 1M 窗口下 900 条约等于「已用 40% / 剩余 60%」就开始每轮提示（当日 363 次，
+     * 用户症状「总是提示」）。改为「剩余 ≤ N%」后，百分比天然随窗口自适应，故档位机制整体删除。
+     *
+     * <p>DB settings.snip_nudge_threshold 承载该值（语义由「消息数」改为「剩余百分比」，值域 1..100）；
+     * null / 0 / 越界 → 回落本常量（见 {@link #resolveSnipNudgeRemainingPercent(Integer)}）。
+     */
+    public static final int SNIP_NUDGE_DEFAULT_REMAINING_PERCENT = 30;
 
     /**
      * nudge 提示文本 · CC original: SNIP_NUDGE_TEXT (snipCompact.ts:17-18)。
@@ -373,70 +364,38 @@ public class SnipCompactor {
      * 是否应提示模型考虑 snip · CC original: shouldNudgeForSnips (snipCompact.ts:163-165)
      *
      * <p>CC: {@code messages.length >= SNIP_NUDGE_THRESHOLD(30)}（简单消息数阈值，非昂贵 token 估算）。
-     * 单参变体 = CC 默认阈值 30（保留 CC 原语义，供未接入窗口自适应的调用方/单测）。
+     * <b>[snip-nudge-percent 2026-09-13] 生产已不再消费本方法</b> —— 门 4 判据改为「上下文剩余百分比」
+     * （见 {@link #resolveSnipNudgeRemainingPercent(Integer)}）。本方法作为 **CC 对齐导出**保留
+     * （CC 真源有对应物 snipCompact.ts:11/:163-165），仅 {@code SnipReplayVariantCcTest} 断言其 CC 语义。
      */
     public static boolean shouldNudgeForSnips(List<ChatMessageDto> messages) {
-        return shouldNudgeForSnips(messages, SNIP_NUDGE_THRESHOLD);
+        return messages != null && messages.size() >= SNIP_NUDGE_THRESHOLD;
     }
 
     /**
-     * 是否应提示模型考虑 snip（带显式阈值）· CC original: shouldNudgeForSnips (snipCompact.ts:163-165)
+     * 解析 snip nudge 生效的「上下文剩余百分比」阈值 · [snip-nudge-percent 2026-09-13]。
      *
-     * <p>显式阈值变体：nudge 触发点（AgentLoopContext.maybeInjectContextEfficiencyNudge 门 4）经
-     * {@link #resolveSnipNudgeThreshold} 计算最终阈值（DB settings.snip_nudge_threshold &gt; 0
-     * 直接覆盖；否则按 effectiveWindow 窗口自适应档位）后传入。
+     * <p><b>取值</b>：DB settings.snip_nudge_threshold（语义=上下文剩余百分比）落在 [1,100] → 直接取用；
+     * null / 0 / 越界（&lt;1 或 &gt;100）→ 回落 {@link #SNIP_NUDGE_DEFAULT_REMAINING_PERCENT}（30）
+     * 并打 WARN —— **fail-loud 不静默**。
      *
-     * @param messages 消息列表（null → false）
-     * @param threshold 生效的消息数阈值（≥1）
-     * @return messages.size() >= threshold
+     * <p><b>为何 0 算未配置而非「关闭」</b>：旧语义里 ≤0 就是「未配置 → 回落窗口档位」。若让 0 合法
+     * （= 只在剩余 0% 时提示，事实关闭），存量库里的 0 会从「回落档位」**静默翻转**成「关闭提示」。
+     * 关闭 nudge 请用既有的 {@code settings.history_snip_enabled} 开关。旧「消息数」语义的存量值
+     * （如 900）同理必然越界，必须显式暴露而非被当作 900% 使用。
+     *
+     * @param dbValue DB settings.snip_nudge_threshold（null = 未配置）
+     * @return 生效阈值（1..100）
      */
-    public static boolean shouldNudgeForSnips(List<ChatMessageDto> messages, int threshold) {
-        return messages != null && messages.size() >= threshold;
-    }
-
-    /**
-     * 解析 snip nudge 最终消息数阈值 · [V55 fix-transcript-nudge] DB settings 可配 + 窗口自适应。
-     *
-     * <p><b>优先级</b>:
-     * <ol>
-     *   <li>DB settings.snip_nudge_threshold &gt; 0 → 直接覆盖（用户显式配置优先，前端「环境配置」可配）</li>
-     *   <li>null / ≤ 0 → 按 effectiveWindow 窗口自适应档位回落（snip-nudge-scaleup 2026-09-08 用户拍板 ×3 +
-     *       2026-09-09 拍板 再 ×2，1M 窗口不再过早通知）：
-     *       ≥800k → 900；&gt;600k → 600；≥400k → 360；&gt;0 且 &lt;400k（如 200k）→ 180</li>
-     * </ol>
-     * effectiveWindow 为 0 / 负数（阈值系统未接线、单测、无 bean）→ 回落 30（CC 默认，零行为变化）。
-     *
-     * @param dbValue        DB settings.snip_nudge_threshold（null = 未配置；≤0 视为未配置）
-     * @param effectiveWindow 有效上下文窗口（CompactThresholdSystem#getEffectiveContextWindowSize）
-     * @return 最终 nudge 阈值（≥1）
-     */
-    public static int resolveSnipNudgeThreshold(Integer dbValue, int effectiveWindow) {
-        if (dbValue != null && dbValue > 0) {
-            if (log.isDebugEnabled()) {
-                log.debug("[SnipCompactor] nudge 阈值取 DB 配置: dbValue={}（直接覆盖窗口自适应）", dbValue);
+    public static int resolveSnipNudgeRemainingPercent(Integer dbValue) {
+        if (dbValue == null || dbValue < 1 || dbValue > 100) {
+            if (dbValue != null) {
+                log.warn("[SnipCompactor] settings.snip_nudge_threshold={} 越界或为 0（有效域 1..100）→ 回落默认 {}%",
+                    dbValue, SNIP_NUDGE_DEFAULT_REMAINING_PERCENT);
             }
-            return dbValue;
+            return SNIP_NUDGE_DEFAULT_REMAINING_PERCENT;
         }
-        int threshold;
-        if (effectiveWindow >= SNIP_NUDGE_WINDOW_800K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_900;
-        } else if (effectiveWindow > SNIP_NUDGE_WINDOW_600K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_600;
-        } else if (effectiveWindow >= SNIP_NUDGE_WINDOW_400K) {
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_360;
-        } else if (effectiveWindow > 0) {
-            // 已知小窗口（<400k，如 200k）→ 180（snip-nudge-scaleup 自适应档）
-            threshold = SNIP_NUDGE_THRESHOLD_TIER_180;
-        } else {
-            // 窗口未知（0/负：阈值系统未接线/单测/无 bean）→ CC 默认 30（零行为变化）
-            threshold = SNIP_NUDGE_THRESHOLD;
-        }
-        if (log.isDebugEnabled()) {
-            log.debug("[SnipCompactor] nudge 阈值窗口自适应: effectiveWindow={} → 阈值{}（DB=null 回落，"
-                + "档位 snip-nudge-scaleup；窗口未知兜底 CC 默认 {}）",
-                effectiveWindow, threshold, SNIP_NUDGE_THRESHOLD);
-        }
-        return threshold;
+        return dbValue;
     }
 
     /**

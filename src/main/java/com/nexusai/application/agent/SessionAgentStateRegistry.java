@@ -214,4 +214,26 @@ public class SessionAgentStateRegistry {
     public int size() {
         return sessions.size() + agents.size();
     }
+
+    /**
+     * 全部活跃 AgentState 快照 · 供「无会话上下文但需影响**所有**会话」的运维动作使用。
+     *
+     * <p><b>[批 3c · 2026-09-13]</b> WHY 需要它：{@code ToolRegistrationConfig} 的
+     * {@code invalidateActiveSessionSystemPromptSections} 原本用裸 MDC 取「当前会话」再清其
+     * system prompt section 缓存；该读点随批 3c 删除后，若仍要保留「工具清单变化 → sections 重算」
+     * 语义，唯一<b>不引入环境态会话槽</b>的写法是<b>按会话键遍历全部活跃会话</b>。
+     *
+     * <p>这也更贴近 CC：CC {@code clearSystemPromptSections()}（constants/systemPromptSections.ts:65）
+     * 清的是<b>进程级</b> {@code STATE.systemPromptSectionCache}（state.ts:1639
+     * {@code STATE.systemPromptSectionCache.clear()}，无 session 维度）—— 本仓把缓存下放到
+     * {@code AgentState}（per-session），故「清全部活跃会话」是 CC 进程级清空的对等翻译。
+     *
+     * <p>返回值为**快照**（副本），调用方遍历期间的新增/移除不影响本次遍历。
+     */
+    public java.util.List<AgentState> snapshot() {
+        java.util.List<AgentState> all = new java.util.ArrayList<>(sessions.size() + agents.size());
+        all.addAll(sessions.values());
+        all.addAll(agents.values());
+        return all;
+    }
 }

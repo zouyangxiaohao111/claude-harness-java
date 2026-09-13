@@ -4,9 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.subagent.JsonRpcMcpClient;
 import com.nexusai.application.agent.tasks.NotificationQueue;
 import com.nexusai.application.agent.tool.ToolRegistry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.mcp_channel_allowlist.ChannelAllowlistEntry;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -29,16 +27,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 注册表 + <b>显式</b>会话查表）注入后：写白名单 → 放行 → 入队端到端可达；无白名单 → fail-closed
  * 安全默认不倒退（S07.md §5 验收 1/4）。
  *
- * <p><b>[批 3b] 本测试改写要点</b>：旧版本把会话来源写成 {@code RequestContext.setSession(...)}
- * 后调 {@code allowlist.currentRequestSupplier().get()} —— 那是「测试线程设 MDC → 同线程读回」的
+ * <p><b>[批 3b] 本测试改写要点</b>：旧版本把会话来源写成「测试线程设 ambient 会话槽」后调
+ * {@code allowlist.currentRequestSupplier().get()} —— 那是「测试线程设 → 同线程读回」的
  * 零覆盖力夹具（经 ThreadLocal 自证，生产派生线程上恒失败）。现改为：
  * <ol>
  *   <li>① ~ ④ 直接用 {@code sessionLookup().apply(sessionId)}（纯函数，无 ThreadLocal）；</li>
  *   <li>⑤ 端到端走<b>真实派生线程</b>（McpToolPool 的 connectWorker）：断言求值线程 ≠ 断言线程、
- *       该线程上 {@code RequestContext.sessionId() == null}（ambient 路线取不到值）、显式传入的
- *       会话才是放行原因；并含<b>无回放反向对照</b>（调用方线程设 MDC 也不影响派生线程）；</li>
+ *       且显式传入的会话才是放行原因；</li>
  *   <li>⑥ 反向对照：显式 sessionId=null → 门序[3] SESSION skip（fail-closed）。</li>
  * </ol>
+ *
+ * <p><b>[批 3c]</b>：ambient 会话槽（裸 MDC）已整类删除 ⇒ ⑤ 中「写调用方线程残留值当反向对照 +
+ * 在派生线程上捕获 ambient 会话断言为 null」的装置与断言已删（该线程上 ambient 路线在结构上
+ * 取不到会话）；显式会话值断言与 fail-closed 断言全部保留。
  *
  * <p>server-kind entry 经 allowlist 门需要 dev=true（CC channelNotification.ts:302-313：
  * allowlist schema 仅 plugin，server entry 恒不匹配除非 dev 豁免）——本测试按 CC 语义构造
@@ -48,11 +49,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ChannelSessionAllowlistTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-
-    @AfterEach
-    void clearMdc() {
-        RequestContext.clear();
-    }
 
     /** 门序全过（capability + channelsEnabled + session + server-kind dev 豁免）→ register。 */
     private static ChannelNotificationGate gateFor(Function<String, List<ChannelAllowlist.ChannelEntry>> lookup) {
@@ -147,42 +143,41 @@ class ChannelSessionAllowlistTest {
 
     /**
      * WHY（规则九 · 验证意图）：channel 门序[3 session] 在 {@code McpToolPool.connectWorker}
-     * <b>池线程</b>求值（不是 REST/Tomcat 线程）。旧实现经 MDC（{@code RequestContext.sessionId()}）
+     * <b>池线程</b>求值（不是 REST/Tomcat 线程）。旧实现经 ambient 会话槽（裸 MDC）
      * 取会话，靠 {@code connectTransport} 的「MDC 回放到 connectWorker」装置兜住 —— 回放属
      * 「用 ThreadLocal 冒充显式传递」。本测试锁死修复后的因果链：
      * <ul>
      *   <li>门序求值确实发生在<b>派生线程</b>（线程名 ≠ 断言线程名）；</li>
-     *   <li>该线程上 {@code RequestContext.sessionId() == null}（ambient 路线取不到会话）；</li>
      *   <li>放行的唯一原因是<b>显式传入</b>的 {@code connectSessionId}（值语义跨线程）。</li>
      * </ul>
+     *
+     * <p><b>[批 3c] 语义消失（已登记待裁定）</b>：原用例还在派生线程上捕获 ambient 会话读取并断言为
+     * null（证明放行不来自 ThreadLocal），并在调用方线程写一個「别的会话」的裸 MDC 当反向对照。
+     * 该 ambient 会话槽已整类删除 ⇒ 两处装置与 `gateEvalThreadMdc.isNull()` 断言删除；
+     * 派生线程 / 显式会话值两条断言保留。
      */
     @Test
-    @DisplayName("⑤ 端到端（真实 connectWorker 线程）：门序[3] 用显式 sessionId 放行，且该线程 MDC 为 null（无回放）")
+    @DisplayName("⑤ 端到端（真实 connectWorker 线程）：门序[3] 用显式 sessionId 放行")
     void endToEnd_gateResolvesOnDerivedThread_viaExplicitSession() throws Exception {
         ChannelSessionAllowlist allowlist = new ChannelSessionAllowlist();
         // plugin-kind entry（gate 门序[4] marketplace + [5] ledger 走真实校验路径）
         allowlist.setForSession("sess-1", List.of(
             new ChannelAllowlist.ChannelEntry("plugin", "slack", "anthropic", false)));
 
-        // ── 取样：门序求值线程 + 该线程上的 ambient MDC（不改语义，纯观察包装） ──
+        // ── 取样：门序求值线程 + 该线程收到的显式会话（不改语义，纯观察包装） ──
         AtomicReference<String> gateEvalThread = new AtomicReference<>(null);
-        AtomicReference<String> gateEvalThreadMdc = new AtomicReference<>("<未求值>");
         AtomicReference<String> explicitSidSeen = new AtomicReference<>(null);
         AtomicInteger gateEvalCount = new AtomicInteger();
         Function<String, List<ChannelAllowlist.ChannelEntry>> observed = sid -> {
             gateEvalCount.incrementAndGet();
             gateEvalThread.set(Thread.currentThread().getName());
-            gateEvalThreadMdc.set(RequestContext.sessionId());
             explicitSidSeen.set(sid);
             return allowlist.sessionLookup().apply(sid);
         };
 
         McpToolPool pool = newPool(observed, new NotificationQueue()).pool();
 
-        // 【无回放反向对照】调用方（断言）线程先设一个 MDC —— 修复前该值会被回放到 connectWorker
-        //   并被门序读到（假象）；修复后派生线程恒读不到（显式值才是唯一来源）。
         String callerThreadName = Thread.currentThread().getName();
-        RequestContext.set("sess-CALLER-STALE", "msg-3b");
 
         pool.assembleToolPool("plugin:slack:1.0.0", config(), "sess-1");
 
@@ -191,10 +186,6 @@ class ChannelSessionAllowlistTest {
             .as("门序[3] 必须在派生线程（connectWorker 池线程）求值，而非断言线程")
             .isNotNull()
             .isNotEqualTo(callerThreadName);
-        assertThat(gateEvalThreadMdc.get())
-            .as("派生线程上 ambient RequestContext.sessionId() 必须为 null —— 证明放行不来自 ThreadLocal"
-                + "（旧 MDC 回放装置已删；若回放复活，此处会读到 sess-CALLER-STALE）")
-            .isNull();
         assertThat(explicitSidSeen.get())
             .as("门序[3] 收到的会话必须等于调用方显式传入的 connectSessionId")
             .isEqualTo("sess-1");
@@ -203,12 +194,13 @@ class ChannelSessionAllowlistTest {
     /**
      * WHY：显式传 null = 无会话（启动预取 / 惰性重连等本就不带会话的路径）→ channel 门序[3]
      * 恒 SESSION skip，handler 不注册（fail-closed，与 CC「server 未列入 --channels」同向）。
-     * 这是修复后的**反向对照**：若把显式 null 换成「回落 ambient MDC」，本用例会因调用方
-     * 线程的 stale MDC 而误 register（安全默认倒退）。
+     *
+     * <p><b>[批 3c] 语义消失（已登记待裁定）</b>：原用例的「即便调用方线程有 stale MDC」反向对照
+     * 依赖已整类删除的裸 MDC 会话槽 ⇒ 装置删除；「显式 null → fail-closed」的核心断言原样保留。
      */
     @Test
-    @DisplayName("⑥ 反向对照：显式 sessionId=null（即便调用方线程有 stale MDC）→ 门序[3] SESSION skip，handler 不注册")
-    void endToEnd_nullSession_failsClosedDespiteStaleMdc() throws Exception {
+    @DisplayName("⑥ 反向对照：显式 sessionId=null → 门序[3] SESSION skip，handler 不注册（fail-closed）")
+    void endToEnd_nullSession_failsClosed() throws Exception {
         ChannelSessionAllowlist allowlist = new ChannelSessionAllowlist();
         allowlist.setForSession("sess-1", List.of(
             new ChannelAllowlist.ChannelEntry("plugin", "slack", "anthropic", false)));
@@ -216,7 +208,8 @@ class ChannelSessionAllowlistTest {
         NotificationQueue queue = new NotificationQueue();
         PoolFixture fx = newPool(allowlist.sessionLookup(), queue);
 
-        RequestContext.set("sess-1", "msg-3b"); // 调用方线程有合法会话 MDC —— 但本路径不读它
+        // [批 3c] 语义消失：原此处 set("sess-1", ...) 在调用方线程写一个合法会话当反向对照
+        //   （证明本路径不读 ambient）。该裸 MDC 槽已整类删除 ⇒ 装置删除。
         fx.pool().assembleToolPool("plugin:slack:1.0.0", config(), null);
 
         // 服务端推送入站 channel 通知（handler 未注册 → 静默忽略）

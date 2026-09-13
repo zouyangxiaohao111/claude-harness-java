@@ -15,7 +15,6 @@ import com.nexusai.application.agent.team.TeamStatusPublisher;
 import com.nexusai.application.agent.team.TeammateMailbox;
 import com.nexusai.application.agent.tool.impl.TeamCreateTool;
 import com.nexusai.application.agent.tool.impl.TeamDeleteTool;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.eventbus.ws.TeamStatusEvent;
@@ -100,7 +99,6 @@ class TeamControllerTest {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         TaskSystemConfig.clearForTest();
     }
 

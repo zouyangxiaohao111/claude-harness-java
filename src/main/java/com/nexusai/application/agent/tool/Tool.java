@@ -483,6 +483,27 @@ public interface Tool {
     }
 
     /**
+     * [会话 cwd] 会话感知回填重载 · 与 {@link #backfillObservableInput(JsonNode)} 同语义，额外携带
+     * {@link ToolUseContext} 让路径类工具用<b>会话 cwd</b> 展开相对路径（对齐 CC
+     * {@code backfillObservableInput} 内 {@code expandPath(input.file_path)} 的
+     * {@code baseDir ?? getCwd()} 语义）。
+     *
+     * <p><b>WHY 需要本重载</b>：CC 的 {@code getCwd()} 从 AsyncLocalStorage 上下文读（隐式会话），
+     * Java 无环境态会话槽 ⇒ 会话 id 必须显式传参；CC 的 {@code (input)} 单参签名无法承载会话，
+     * 故按本仓 {@code execute(call)} / {@code execute(call, ctx)} 同款双重重载惯例补一条。
+     *
+     * <p>默认实现回退到 {@link #backfillObservableInput(JsonNode)}（等价 {@code ctx=null}，
+     * 无会话兜底），既有工具零修改仍可工作。
+     *
+     * @param input 工具输入（原始 JSON）
+     * @param ctx   工具上下文（可为 null ⇒ 无会话兜底）
+     * @return 补全后的 input
+     */
+    default JsonNode backfillObservableInput(JsonNode input, ToolUseContext ctx) {
+        return backfillObservableInput(input);
+    }
+
+    /**
      * 中断行为。对齐 CC {@code Tool.ts:416 interruptBehavior()}。
      *
      * <p>用户发新消息时工具的行为：

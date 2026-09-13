@@ -149,14 +149,14 @@ class LlmProviderRequestIdHeaderTest {
             new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
 
         assertThat(raw.requestId())
-            .as("[OpenAI-SDK] R-REQ-1 兜底（DEC-RV-14a）· SDK 0.25.0 无 withRawResponse → requestId 走请求侧兜底；测试未设 MDC → RequestContext.requestId()=null（DEC-OA-1 方案 C + DEC-RV-14a）")
+            .as("[OpenAI-SDK] R-REQ-1 · SDK 0.25.0 无 withRawResponse → 响应侧通道不可达；且 [批 3c] 请求侧兜底载体（裸 MDC 的 reqId 槽）已删 → requestId 恒 null（DEC-OA-1 方案 C）")
             .isNull();
         assertThat(raw.id()).isEqualTo("chatcmpl-test1");
         assertThat(raw.content()).isEqualTo("allow");
     }
 
     @Test
-    @DisplayName("OpenAiSdkProvider 无 request id header → requestId null（SDK 无响应头通道 + 测试无 MDC → 请求侧兜底 null，与 CC ?? undefined 语义一致）")
+    @DisplayName("OpenAiSdkProvider 无 request id header → requestId null（SDK 无响应头通道 + 无显式来源 → null，与 CC ?? undefined 语义一致）")
     void openAiProvider_missingRequestIdHeaderIsNull() throws Exception {
         baseUrl = startServer(exchange -> respond(exchange,
             openAiCompletionBody("chatcmpl-test3", "ask"), null));
@@ -167,29 +167,30 @@ class LlmProviderRequestIdHeaderTest {
             new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
 
         assertThat(raw.requestId())
-            .as("SDK 0.25.0 无响应头通道 + 无 MDC → 请求侧兜底 null（DEC-RV-14a：MDC reqId 为空时仍为 null，对齐 CC ?? undefined）")
+            .as("SDK 0.25.0 无响应头通道 + 无显式 requestId 来源 → null（对齐 CC ?? undefined）")
             .isNull();
     }
 
     @Test
-    @DisplayName("DEC-RV-14a 兜底：设置 RequestContext 后 OpenAiSdkProvider requestId = MDC reqId（请求侧自建 ID）")
-    void openAiProvider_requestIdFallsBackToRequestContext() throws Exception {
+    @DisplayName("[批 3c] 无显式 requestId 载体 → OpenAiSdkProvider requestId 恒 null（原请求侧兜底已删）")
+    void openAiProvider_requestIdIsNullWithoutExplicitSource() throws Exception {
         baseUrl = startServer(exchange -> respond(exchange,
             openAiCompletionBody("chatcmpl-fallback", "allow"), null));
 
         OpenAiSdkProvider provider = new OpenAiSdkProvider();
         provider.properties = new NexusProperties();
-        com.nexusai.common.RequestContext.set("sess-x", "msg-fallback-1");
-        try {
-            LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
-                new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
-            assertThat(raw.requestId())
-                .as("DEC-RV-14a：SDK 无响应头通道 → requestId 兜底为请求侧 MDC reqId（userMessageId）")
-                .isEqualTo("msg-fallback-1");
-            assertThat(raw.id()).isEqualTo("chatcmpl-fallback");
-        } finally {
-            com.nexusai.common.RequestContext.clear();
-        }
+        // [批 3c] 语义消失（已登记待裁定）：原用例在本线程写「裸 MDC 的 reqId 槽」（userMessageId）
+        //   当请求侧兜底来源，断言 requestId 等于该值。该槽及其整类载体已删除，
+        //   且 chatWithRaw 形参内无 requestId/userMessageId ⇒ 生产实现恒置 null（代码内登记为
+        //   「待接线：ChatRequestOptions/chatWithRaw 增显式 requestId 载体」）。故本用例的期望值由
+        //   "msg-fallback-1" 改为 null —— 这不是放宽断言，而是跟随已落地的行为；原守护的那条链路
+        //   （请求侧自建 ID）目前在主代码里**尚未实现**，需要裁定是补接线还是接受恒 null。
+        LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
+            new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
+        assertThat(raw.requestId())
+            .as("[批 3c] 无显式 requestId 载体 → requestId 恒 null（原请求侧 MDC 兜底已删 · 待接线）")
+            .isNull();
+        assertThat(raw.id()).isEqualTo("chatcmpl-fallback");
     }
 
     /** 只写响应体 (header 已在闭包内单独设置). */

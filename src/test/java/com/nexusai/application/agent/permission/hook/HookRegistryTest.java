@@ -1131,7 +1131,9 @@ class HookRegistryTest {
      */
     private static RegisterAttributionHooks attributionHooksGateOn(
             CommitAttributionTracker tracker, Path repoRoot) {
-        return new RegisterAttributionHooks(tracker, () -> true, () -> repoRoot);
+        // [批 3c] repoRootSupplier 由无参 Supplier<Path> 改为 Function<String,Path>（sessionId → repoRoot）；
+        //   本 helper 注入 @TempDir 固定根，故忽略 sessionId（形参类型不可省 → 1 参 lambda）。
+        return new RegisterAttributionHooks(tracker, () -> true, sessionId -> repoRoot);
     }
 
     /** 记录注册 hook 名的假注册中心 · 实现 SessionFileAccessHooks.PostToolUseRegistrar（复用同构接口）. */
@@ -1166,7 +1168,8 @@ class HookRegistryTest {
         //   matcher 集合为 Edit/Write；internal callback（hooks.ts:1440-1442 isInternalHook）
         //   → 走 registerPostToolUseInternal 变体。
         AttributionRecordingRegistrar registrar = new AttributionRecordingRegistrar();
-        CommitAttributionTracker tracker = new CommitAttributionTracker(() -> java.nio.file.Path.of("."));
+        // [批 3c] 构造器形参 = Function<String,Path>（sessionId → repoRoot），忽略 sessionId（. 固定根）
+        CommitAttributionTracker tracker = new CommitAttributionTracker(sessionId -> java.nio.file.Path.of("."));
 
         attributionHooksGateOn(tracker, java.nio.file.Path.of("."))
             .registerAttributionHooks(registrar);
@@ -1185,7 +1188,8 @@ class HookRegistryTest {
         //   （commitAttribution.ts:338-341 oldContent==='' → newContent.length）。
         Files.writeString(repoRoot.resolve("foo.txt"), "hello world");
 
-        CommitAttributionTracker tracker = new CommitAttributionTracker(() -> repoRoot);
+        // [批 3c] 构造器形参 = Function<String,Path>（sessionId → repoRoot）；注入 @TempDir 固定根故忽略 sessionId
+        CommitAttributionTracker tracker = new CommitAttributionTracker(sessionId -> repoRoot);
         HookRegistry registry = new HookRegistry();
         registry.registerAttributionHooks(attributionHooksGateOn(tracker, repoRoot));
 
@@ -1214,11 +1218,12 @@ class HookRegistryTest {
         //   保持空 = hook 未被接线（RED→GREEN 反证，防假接线/双轨）。
         Files.writeString(repoRoot.resolve("foo.txt"), "hello world");
 
-        CommitAttributionTracker tracker = new CommitAttributionTracker(() -> repoRoot);
+        // [批 3c] 构造器形参 = Function<String,Path>（sessionId → repoRoot）；注入 @TempDir 固定根故忽略 sessionId
+        CommitAttributionTracker tracker = new CommitAttributionTracker(sessionId -> repoRoot);
         HookRegistry registry = new HookRegistry();
         // 默认 COMMIT_ATTRIBUTION=false → gate off
         registry.registerAttributionHooks(new RegisterAttributionHooks(
-            tracker, () -> false, () -> repoRoot));
+            tracker, () -> false, sessionId -> repoRoot));
 
         JsonNode input = MAPPER.readTree("{\"file_path\":\"foo.txt\"}");
         registry.executePostToolUse(
@@ -1237,15 +1242,19 @@ class HookRegistryTest {
         // WHY: CC computeFileModificationState 把本次贡献 + 既有 claudeContribution 累加
         //   （commitAttribution.ts:369-374）—— 多轮 Edit 累计每文件 Claude 贡献，PR attribution
         //   百分比据此计算。首轮 "abc"→"abcdef" 贡献 3，次轮 "abcdef"→"abcdefgh" 贡献 2。
-        CommitAttributionTracker tracker = new CommitAttributionTracker(() -> repoRoot);
+        // [批 3c] 构造器形参 = Function<String,Path>（sessionId → repoRoot）；注入 @TempDir 固定根故忽略 sessionId
+        CommitAttributionTracker tracker = new CommitAttributionTracker(sessionId -> repoRoot);
 
         // 首轮 Edit：磁盘 post-edit 内容 "abcdef"，缓存首见 → oldContent="" → 贡献 6
         Files.writeString(repoRoot.resolve("a.txt"), "abcdef");
-        tracker.updateCachedContent("a.txt", "abcdef");
-        tracker.trackFileModification("a.txt", "", "abcdef", 1L);
+        // [批 3c] 无会话 → 显式 null（本用例断言的只是贡献累加：相对路径 "a.txt" 归一化与会话无关，
+        //   repoRoot 已由上面 lambda 注入，sessionId 不参与任何断言）
+        tracker.updateCachedContent("a.txt", "abcdef", null);
+        tracker.trackFileModification("a.txt", "", "abcdef", 1L, null);
         // 次轮 Edit：post-edit "abcdefgh"，oldContent="abcdef" → prefix/suffix diff 贡献 2
         Files.writeString(repoRoot.resolve("a.txt"), "abcdefgh");
-        tracker.trackFileModification("a.txt", "abcdef", "abcdefgh", 2L);
+        // [批 3c] 无会话 → 显式 null（同上一轮断言口径）
+        tracker.trackFileModification("a.txt", "abcdef", "abcdefgh", 2L, null);
 
         CommitAttributionTracker.FileState state = tracker.snapshotFileStates().get("a.txt");
         assertThat(state).isNotNull();
@@ -1283,14 +1292,18 @@ class HookRegistryTest {
     void commitAttributionTracker_trackCreationDeletion(@TempDir Path repoRoot) {
         // WHY: CC trackFileCreation = 空→内容全量（:446）；trackFileDeletion = 已删字符计入
         //   （:453-480）+ contentHash 置空 —— 非 Edit/Write 机制（bash rm/创建）的补偿路径。
-        CommitAttributionTracker tracker = new CommitAttributionTracker(() -> repoRoot);
+        // [批 3c] 构造器形参 = Function<String,Path>（sessionId → repoRoot）；注入 @TempDir 固定根故忽略 sessionId
+        CommitAttributionTracker tracker = new CommitAttributionTracker(sessionId -> repoRoot);
 
-        tracker.trackFileCreation("b.txt", "created content", 1L);
+        // [批 3c] 无会话 → 显式 null（本用例只断言创建/删除的字符贡献与 contentHash 置空，
+        //   相对路径 "b.txt" 归一化与会话无关，repoRoot 已由上面 lambda 注入）
+        tracker.trackFileCreation("b.txt", "created content", 1L, null);
         assertThat(tracker.snapshotFileStates().get("b.txt").claudeContribution())
             .as("创建 = 从空到内容全量（commitAttribution.ts:446）")
             .isEqualTo(15L);
 
-        tracker.trackFileDeletion("b.txt", "created content");
+        // [批 3c] 无会话 → 显式 null（同上）
+        tracker.trackFileDeletion("b.txt", "created content", null);
         assertThat(tracker.snapshotFileStates().get("b.txt").claudeContribution())
             .as("删除字符数计入既有贡献（commitAttribution.ts:463-467）")
             .isEqualTo(30L);
@@ -1305,18 +1318,22 @@ class HookRegistryTest {
         // WHY: attributionHooks 模块导出 clearAttributionCaches / sweepFileContentCache ——
         //   clear 命令 / 压缩后清扫文件内容缓存，防止长会话内容堆积（接口在 clear/caches.ts:106
         //   + postCompactCleanup.ts:73 可观测）。缓存清空后 cachedContent 返回 null（首见语义）。
-        CommitAttributionTracker tracker = new CommitAttributionTracker(() -> repoRoot);
-        tracker.updateCachedContent("a.txt", "content");
-        assertThat(tracker.cachedContent("a.txt")).isEqualTo("content");
+        // [批 3c] 构造器形参 = Function<String,Path>（sessionId → repoRoot）；注入 @TempDir 固定根故忽略 sessionId
+        CommitAttributionTracker tracker = new CommitAttributionTracker(sessionId -> repoRoot);
+        // [批 3c] 无会话 → 显式 null（本用例只断言「缓存写入/读回/清空」状态机：缓存键 =
+        //   normalizeFilePath("a.txt")，相对路径与会话无关；repoRoot 已由上面 lambda 注入）
+        tracker.updateCachedContent("a.txt", "content", null);
+        assertThat(tracker.cachedContent("a.txt", null)).isEqualTo("content");
 
         tracker.clearAttributionCaches();
-        assertThat(tracker.cachedContent("a.txt"))
+        assertThat(tracker.cachedContent("a.txt", null))
             .as("clearAttributionCaches 清空内容缓存（clear/caches.ts:106）")
             .isNull();
 
-        tracker.updateCachedContent("a.txt", "content2");
+        // [批 3c] 无会话 → 显式 null（同上）
+        tracker.updateCachedContent("a.txt", "content2", null);
         tracker.sweepFileContentCache();
-        assertThat(tracker.cachedContent("a.txt"))
+        assertThat(tracker.cachedContent("a.txt", null))
             .as("sweepFileContentCache 压缩后清扫（postCompactCleanup.ts:73）")
             .isNull();
     }

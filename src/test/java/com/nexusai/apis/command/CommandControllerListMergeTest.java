@@ -89,7 +89,9 @@ class CommandControllerListMergeTest {
         Command registryA = command("skill-a", "registry desc");
         Command registryB = command("skill-b", "B");
         Command dbGhostA = command("skill-a", "db desc");
-        when(skillRegistry.getAllCommands()).thenReturn(List.of(registryA, registryB));
+        // [批 3c] getAllCommands 新增显式 sessionId 形参；本用例请求不带 ?sessionId= → 控制器传 null，
+        //   故 stub 用 any()（anyString() 不匹配 null）
+        when(skillRegistry.getAllCommands(any())).thenReturn(List.of(registryA, registryB));
         when(commandService.listAllDomain()).thenReturn(List.of(dbGhostA));
 
         mockMvc.perform(get("/api/command"))
@@ -109,7 +111,7 @@ class CommandControllerListMergeTest {
     void clientEnvHeader_stillFiltersMergedSet() throws Exception {
         Command registryA = command("skill-a", "A");
         Command dbGhostB = command("skill-b", "B");
-        when(skillRegistry.getAllCommands()).thenReturn(List.of(registryA));
+        when(skillRegistry.getAllCommands(any())).thenReturn(List.of(registryA));
         when(commandService.listAllDomain()).thenReturn(List.of(dbGhostB));
 
         mockMvc.perform(get("/api/command").header("X-Client-Env", "react"))

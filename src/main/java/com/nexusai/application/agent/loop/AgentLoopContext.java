@@ -22,7 +22,6 @@ import com.nexusai.application.agent.AgentEvent;
 import com.nexusai.application.agent.diff.TraceEvent;
 import com.nexusai.application.agent.diff.TraceRecorder;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.api.PromptSuggestion;
 import com.nexusai.application.agent.memory.AutoDreamConsolidator;
 import com.nexusai.application.agent.memory.ExtractMemoriesAgent;
@@ -59,6 +58,7 @@ import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.AgentToolResult;
+import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ContentReplacementState;
 import com.nexusai.application.agent.tool.StreamingToolExecutor;
 import com.nexusai.application.agent.tool.Tool;
@@ -394,11 +394,16 @@ public record AgentLoopContext(
          * workspaceDir 默认解析 · 对齐 CC getOriginalCwd()（sessionStorage.ts:202-205 subagent
          * transcript 锚 getProjectDir(getOriginalCwd())）。
          *
-         * <p>LoopSessionState 创建时经 RequestContext 取会话 originalCwd；无 sessionId 回落 user.dir
-         * （方案 1，零行为变化）。
+         * <p>[批 3c] 显式传 {@code null} = <b>本处无会话来源</b>：唯一调用点是本类字段初始化
+         * （{@code private Path workspaceDir = Path.of(resolveDefaultWorkspaceDir())}，静态方法，
+         * 实例构造期）→ 无 sessionId 形参/字段可穿透。生产路径由工厂
+         * {@code AgentLoopContextFactory.freshSession(projectRoot, sessionId)}（同包，已改为显式
+         * sessionId 入参）显式 {@code setWorkspaceDir} 覆盖，本默认值只在直接 new
+         * LoopSessionState（测试/非 Spring）时生效 → CwdResolution 回落 user.dir，与旧实现
+         * （构造线程无 MDC）行为零变化。
          */
         private static String resolveDefaultWorkspaceDir() {
-            String cwd = CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+            String cwd = CwdResolution.getOriginalCwdLayer(null);
             return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
         }
 
@@ -2875,7 +2880,10 @@ public record AgentLoopContext(
      *       （不在 mainThreadAttachments），故不加 agentId 守卫。</li>
      *   <li>getContextEfficiencyAttachment 门：{@code feature('HISTORY_SNIP')}（attachments.ts:3966）</li>
      *   <li>{@code isSnipRuntimeEnabled()}（attachments.ts:3974 · 恒 true，snipCompact.ts:154-156）</li>
-     *   <li>{@code shouldNudgeForSnips(messages)}（attachments.ts:3978 · 消息数 ≥ 30，snipCompact.ts:163-165）</li>
+     *   <li>{@code shouldNudgeForSnips(messages)}（attachments.ts:3978 · 消息数 ≥ 30，snipCompact.ts:163-165）
+     *       —— <b>[snip-nudge-percent 2026-09-13] Java 侧门 4 改为「上下文剩余百分比 ≤ 阈值」，
+     *       偏离 CC 的 snip nudge（CC 用消息条数）；口径与注入形态对齐 CC 的 compaction_reminder</b>
+     *       （窗口 = DB models.max_context_tokens，已用 = 真实 API usage；缺值 → 不注入）</li>
      * </ol>
      * Java 端单一 {@code historySnip()} 门覆盖第 1/2 门（同一 CC flag）；isSnipRuntimeEnabled 保留显式调用
      * （对齐 CC 两函数引用，恒 true）。
@@ -2903,9 +2911,7 @@ public record AgentLoopContext(
      *
      * @param ctx           loop 上下文（featureFlags.historySnip 门控源）
      * @param settingsResolver 压缩配置 DB 实时读源（可 null；DB settings.history_snip_enabled 覆盖
-     *                          FeatureFlags，null 回落；snipNudgeThreshold 门 4 阈值 DB 覆盖 + 窗口自适应）
-     * @param thresholdSystem 有效上下文窗口计算源（CompactThresholdSystem#getEffectiveContextWindowSize；
-     *                        可 null → effectiveWindow=0 → 回落 CC 默认阈值 30）
+     *                          FeatureFlags，null 回落；snipNudgeThreshold 门 4 阈值 DB 覆盖）
      * @param model         当前有效模型名（窗口计算入参；可 null）
      * @param state         AgentState（仅守卫 + 诊断日志用；判据不依赖它，见上「计数源」）
      * @param messagesForLlm 当前 LLM 请求消息列表（注入目标）
@@ -2914,7 +2920,6 @@ public record AgentLoopContext(
     public static List<ChatMessageDto> maybeInjectContextEfficiencyNudge(
             AgentLoopContext ctx,
             com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
-            CompactThresholdSystem thresholdSystem,
             String model,
             AgentState state,
             List<ChatMessageDto> messagesForLlm) {
@@ -2941,27 +2946,18 @@ public record AgentLoopContext(
             }
             return messagesForLlm;
         }
-        // CC 门 4：shouldNudgeForSnips(messages)（attachments.ts:3978，消息数 ≥ 阈值）——
-        // [V55 fix-transcript-nudge] nudge 阈值入 DB + 上下文窗口自适应：DB
-        //   settings.snip_nudge_threshold > 0 直接覆盖；null → SnipCompactor.resolveSnipNudgeThreshold
-        //   按 effectiveWindow 档位（≥800k→150 / >600k→100 / ≥400k→60 / 其他→30，CC 默认
-        //   snipCompact.ts:11）。effectiveWindow = thresholdSystem.getEffectiveContextWindowSize(model)；
-        //   thresholdSystem 未接线（单测/无 bean）→ effectiveWindow=0 → 回落 30（CC 默认，零行为变化）。
-        Integer dbNudgeThreshold = settingsResolver != null ? settingsResolver.snipNudgeThreshold() : null;
-        int effectiveWindow = (thresholdSystem != null && model != null)
-            ? thresholdSystem.getEffectiveContextWindowSize(model)
-            : 0;
-        int snipNudgeThreshold = SnipCompactor.resolveSnipNudgeThreshold(dbNudgeThreshold, effectiveWindow);
-        // [snip-nudge-count] 判据 = messagesForLlm（snip 投影后模型可见消息，对齐 CCB query.ts:1894
-        //   messagesForQuery.concat(assistantMessages, toolResults)）—— 非 state.rawMessages() 全量：
-        //   Java snip 只做请求级投影（B5 d-2，state 保留被 snip 消息），数全量则模型 snip 后判据不降、
-        //   达阈值每轮重复 nudge（旧缺陷）。
-        if (!SnipCompactor.shouldNudgeForSnips(messagesForLlm, snipNudgeThreshold)) {
+        // CC 门 4：[snip-nudge-percent 2026-09-13] 判据 = 上下文剩余百分比 ≤ 阈值
+        //   （原为「模型可见消息条数 ≥ 窗口自适应档位」，与真实上下文压力脱钩：实测 1M 窗口下
+        //    900 条约等于已用 40%，远未满就开始每轮提示，当日 363 次）。
+        //   口径见 contextRemainingPercent：窗口 = DB models.max_context_tokens，已用 = 真实 API usage。
+        //   缺值（无 usage / beans 缺失 / 模型名为空）→ 不注入（宁可不提示，也不臆测）。
+        int remainingThreshold = SnipCompactor.resolveSnipNudgeRemainingPercent(
+            settingsResolver != null ? settingsResolver.snipNudgeThreshold() : null);
+        Integer remainingPct = contextRemainingPercent(ctx, model, messagesForLlm);
+        if (remainingPct == null || remainingPct > remainingThreshold) {
             if (log.isDebugEnabled()) {
-                log.debug("[LlmAgentLoop] context_efficiency nudge 跳过: 模型可见消息={} 条 < 阈值{}（db={} effectiveWindow={}, state 全量={} 诊断）· CC attachments.ts:3978/snipCompact.ts:163-165 + CCB query.ts:1894",
-                    messagesForLlm != null ? messagesForLlm.size() : 0,
-                    snipNudgeThreshold, dbNudgeThreshold, effectiveWindow,
-                    state != null && state.rawMessages() != null ? state.rawMessages().size() : 0);
+                log.debug("[LlmAgentLoop] context_efficiency nudge 跳过: 上下文剩余={}%（阈值≤{}%，null=数据缺失）· snip-nudge-percent",
+                    remainingPct, remainingThreshold);
             }
             return messagesForLlm;
         }
@@ -2971,11 +2967,110 @@ public record AgentLoopContext(
         withNudge.addAll(messagesForLlm);
         withNudge.add(metaUserMessage(text));
         if (log.isInfoEnabled()) {
-            log.info("[LlmAgentLoop] context_efficiency nudge 注入 LLM 队尾: 模型可见消息={} 条 ≥阈值{}（db={} effectiveWindow={}, state 全量={} 诊断）, isMeta=true · CC attachments.ts:929-937/:3963-3983 + messages.ts:4148-4161 + CCB query.ts:1894",
-                messagesForLlm.size(), snipNudgeThreshold, dbNudgeThreshold, effectiveWindow,
-                state != null && state.rawMessages() != null ? state.rawMessages().size() : 0);
+            log.info("[LlmAgentLoop] context_efficiency nudge 注入 LLM 队尾: 上下文剩余={}% ≤ 阈值{}%, isMeta=true · snip-nudge-percent",
+                remainingPct, remainingThreshold);
         }
         return withNudge;
+    }
+
+    /**
+     * [snip-nudge-percent 2026-09-13] 反扫「最近一条携带 usage 的 assistant 消息」并投影为 AgentUsage。
+     *
+     * <p><b>姐妹实现</b>：{@code SubagentExecutor.extractUsageFromMessages}
+     * （backend/src/main/java/com/nexusai/application/agent/tool/impl/SubagentExecutor.java:4849，
+     * 包级 static 不可跨包调用，故此处另写一份）。两者<b>刻意不同构</b>，差异全在「无数据」语义上：
+     * <ul>
+     *   <li><b>终值</b>：姐妹实现无 assistant → {@link AgentUsage#EMPTY}；本实现 → {@code null}。
+     *       WHY: EMPTY 会让 snapshot 算出 used=0 → 剩余 100%，而 null 让调用方走「不注入」——
+     *       两者在阈值=100 时行为相反，nudge 判据必须能区分「没数据」与「用量为零」。</li>
+     *   <li><b>回扫深度</b>：姐妹实现只试末条 assistant，命中即返回（内容为 EMPTY 或 0/0 也返回）；
+     *       本实现跳过「无 usage 且 input/output 双双为 null」的 assistant 继续向前找。</li>
+     *   <li><b>null 元素</b>：姐妹实现直接解引用 {@code msg.role()}；本实现跳过 null 元素。</li>
+     * </ul>
+     *
+     * <p><b>本实现独有</b>：cache 字段为 null 时用 {@link ChatMessageDto} 的
+     * {@code inputCacheReadTokens/inputCacheCreationTokens} 组件回填 —— DB 水合后的消息
+     * {@code usage().cacheXxx} 恒为 null（MessageService 经 {@link AgentUsage#fromInputOutput} 构造，
+     * cache 值只落到 DTO 组件），直接用会让 Anthropic 协议少算 cache → used 偏小 → 剩余偏大
+     * → 该提示时不提示。
+     *
+     * @param messages 消息列表（可为 null）
+     * @return 最近 assistant 消息的 usage；**无可用数据 → null**（刻意不返回 {@link AgentUsage#EMPTY}：
+     *         EMPTY 会让 snapshot 算出 used=0 → 剩余 100%，与「没有数据」在阈值=100 时行为相反）
+     */
+    public static AgentUsage extractContextUsage(List<ChatMessageDto> messages) {
+        if (messages == null) {
+            return null;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessageDto msg = messages.get(i);
+            if (msg == null || msg.role() != Role.assistant) {
+                continue;
+            }
+            AgentUsage usage = msg.usage();
+            if (usage == null) {
+                if (msg.inputTokens() == null && msg.outputTokens() == null) {
+                    continue;
+                }
+                usage = AgentUsage.fromInputOutput(msg.inputTokens(), msg.outputTokens());
+            }
+            Long cacheRead = usage.cacheReadInputTokens() != null
+                ? usage.cacheReadInputTokens()
+                : (msg.inputCacheReadTokens() != null ? msg.inputCacheReadTokens().longValue() : null);
+            Long cacheCreate = usage.cacheCreationInputTokens() != null
+                ? usage.cacheCreationInputTokens()
+                : (msg.inputCacheCreationTokens() != null ? msg.inputCacheCreationTokens().longValue() : null);
+            if (cacheRead != null || cacheCreate != null) {
+                usage = new AgentUsage(usage.inputTokens(), usage.outputTokens(),
+                    cacheCreate, cacheRead,
+                    usage.serverToolUse(), usage.serviceTier(), usage.cacheCreation(),
+                    usage.inferenceGeo(), usage.iterations(), usage.speed(),
+                    usage.cacheDeletedInputTokens());
+            }
+            return usage;
+        }
+        return null;
+    }
+
+    /**
+     * [snip-nudge-percent 2026-09-13] 取「当前上下文剩余百分比」· 口径 = {@link ContextUsageCalculator#snapshot}。
+     *
+     * <p><b>口径</b>（用户 2026-09-13 裁定）：窗口 = DB {@code models.max_context_tokens}（按当前模型名
+     * 反查；未配置回落 {@code CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT = 1_048_576}，
+     * 回落路径打 WARN）；已用 = <b>真实 API 返回的 usage token（非估算）</b>。该口径即本仓
+     * {@code ContextUsageCalculator} 类 javadoc 声明的「[P3-d] 上下文口径唯一权威」，本方法把它接到
+     * nudge 注入链上（此前 nudge 用的是「阈值口径」，两套口径对同一刻给出不同数字）。
+     *
+     * <p><b>为什么不用 CompactThresholdSystem.getEffectiveContextWindowSize</b>：那是「阈值口径」
+     * （原始窗口 − summary 预留 − settings 收窄），与展示口径非同一数；且它在非主线程 loop 里由上层
+     * 置 null → effectiveWindow=0 → 阈值回落（实测子代理路径 264/414 次落此分支）。本方法自行查 DB
+     * 窗口，**不依赖 thresholdSystem**，故子代理路径自动正确。
+     *
+     * @param ctx      loop 上下文（TokenBudgetBeans 提供 ModelMapper/ProviderMapper）
+     * @param model    当前有效模型名（窗口与协议分派的入参）
+     * @param messages 当前 LLM 请求消息列表（反扫 usage 的数据源）
+     * @return 剩余百分比（0..100）；数据源缺失（无 usage / beans 缺失 / 模型名为空）→ null
+     */
+    public static Integer contextRemainingPercent(
+            AgentLoopContext ctx, String model, List<ChatMessageDto> messages) {
+        if (ctx == null || model == null || model.isBlank()) {
+            return null;
+        }
+        AgentLoopContext.TokenBudgetBeans beans = ctx.tokenBudgetBeans();
+        if (beans == null) {
+            return null;
+        }
+        AgentUsage usage = extractContextUsage(messages);
+        if (usage == null) {
+            return null;
+        }
+        ContextUsageCalculator.Snapshot snap = ContextUsageCalculator.snapshot(
+            beans.modelMapper(), beans.providerMapper(), model, usage);
+        if (log.isDebugEnabled()) {
+            log.debug("[snip-nudge-percent] 上下文剩余={}%（window={} used={}）model={} · 口径 ContextUsageCalculator.snapshot",
+                snap.percentLeft(), snap.contextWindow(), snap.contextTokensUsed(), model);
+        }
+        return snap.percentLeft();
     }
 
     /**

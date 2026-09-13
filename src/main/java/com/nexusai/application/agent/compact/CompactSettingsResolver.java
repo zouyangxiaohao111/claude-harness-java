@@ -406,14 +406,28 @@ public class CompactSettingsResolver {
     }
 
     /**
-     * 实时读 {@code settings.snip_nudge_threshold} · CC original: SNIP_NUDGE_THRESHOLD
-     * （snipCompact.ts:11，默认 30）——DB 承载 + 上下文窗口自适应（V55）。
+     * 实时读 {@code settings.snip_nudge_threshold}（V55 列）——<b>原样透出 DB 值</b>，
+     * 本方法不做值域判定。
      *
-     * <p>null = 未配置 / 非正 → 回落窗口自适应算法
-     * （SnipCompactor.resolveSnipNudgeThreshold 按 effectiveWindow 档位：≥800k → 150；
-     * &gt;600k → 100；≥400k → 60；其他 → 30（CC 默认））；&gt;0 = DB 值直接覆盖窗口自适应。
+     * <p><b>[snip-nudge-percent 2026-09-13] 语义 = 「上下文剩余百分比」（值域 1..100）</b>，
+     * 不再是「消息条数」（旧「消息数」语义的窗口自适应档位已全部删除）。
+     * 列名的历史来源是 CC {@code SNIP_NUDGE_THRESHOLD}（snipCompact.ts:11，消息数语义），
+     * 该 CC 原判定已改由剩余百分比承担。
      *
-     * @return snip nudge 消息数阈值 = DB 有值（&gt; 0）；null = 未配置 / 非正（回落窗口自适应）
+     * <p><b>权威判定不在本方法，而在两处</b>（本方法只是配置透出面，故意保持薄）：
+     * <ul>
+     *   <li>读侧 {@code SnipCompactor.resolveSnipNudgeRemainingPercent(Integer)}：落在 1..100 取用；
+     *       null / 0 / 越界 → 回落 {@code SNIP_NUDGE_DEFAULT_REMAINING_PERCENT}（30）并打 WARN。
+     *       唯一消费点 {@code AgentLoopContext} 的 nudge 门（{@code maybeInjectContextEfficiencyNudge}）。</li>
+     *   <li>写侧 {@code SettingsService.update}：越界抛 {@code ValidationException}（400），不落库。</li>
+     * </ul>
+     * 两侧口径必须一致，否则存量越界值会出现「存得进去、用不上」的静默失败。
+     *
+     * <p><b>本方法的 {@code > 0} 判断不等于值域校验</b>：它只区分「未配置」与「有配置」
+     * （0/负/null → 返回 null → 消费点回落默认），不拦 &gt;100 —— 拦越界的职责在
+     * {@code resolveSnipNudgeRemainingPercent}，那里会打 WARN。
+     *
+     * @return DB 原值（&gt; 0）；null = 未配置 / 非正（消费点回落默认 30%）
      */
     public Integer snipNudgeThreshold() {
         SettingsRecord row = resolveSettingsRow();

@@ -51,9 +51,18 @@ public class McpConfigFileWriter {
 
     // ── 路径解析 ──
 
-    /** project scope 目标：CwdResolution.getCwd(sessionId)/.mcp.json（cwd 域既有入口，仅供路径描述）。 */
+    /** project scope 目标：{@code <cwd>/.mcp.json}（cwd 域既有入口，仅供路径描述）。
+     *
+     * <p><b>[批 3c 会话态显式化]</b>：本类为 Spring 单例、<b>无会话入参</b>（无 sessionId 来源），
+     * 故 cwd 显式按「无会话」解析（{@code getCwd(null)} → 仅 override / 进程 user.dir 层，
+     * 跳过 sessionCwd/boundProject 层）。如需会话 cwd，须由调用方显式传入
+     * （{@link #describeMcpConfigFilePath(String, String)} 的 cwd 形参即此通道）。</p>
+     */
     public Path projectMcpJsonPath() {
-        return Path.of(CwdResolution.getCwd(), ".mcp.json");
+        log.warn("[McpConfigFileWriter] projectMcpJsonPath 无会话入参 → cwd 回落进程 user.dir；本轮结果={}；"
+            + "如需会话 cwd 须由调用方显式传入（describeMcpConfigFilePath(scope, cwd) 的 cwd 形参）",
+            System.getProperty("user.dir"));
+        return Path.of(CwdResolution.getCwd(null), ".mcp.json");
     }
 
     /** user scope 目标：{@code <user.home>/.nexusai.json}（对齐 CC getGlobalClaudeFile）。 */

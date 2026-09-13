@@ -282,6 +282,12 @@ public class MemoryPrefetcher {
      * 输入含 agent @-mention → 每个 mention 查 activeAgents 找到带 memory scope 的 agent →
      * getAgentMemoryDir 单目录；命中列表为空 → {@code [getAutoMemPath()]}。
      *
+     * <p><b>[批 3c 未决项]</b> {@code agentRegistrySupplier} 无会话形参（bean 级装配）→ 经无参
+     * {@code SubagentTool.agentRegistry()} 得<b>进程默认</b>（workspaceDir）agent-defs；原会话源
+     * （裸 MDC）已按批 3c 删除。多项目部署下 @-mention 的 memory scope 查表可能与当前会话的
+     * per-session agent-defs 不一致。待决策：给 {@code startPrefetch}/{@code resolveMemoryDirs}
+     * 加 sessionId 形参（来源 {@code LlmAgentLoop} 的 {@code params.toolUseContext().sessionId()}）。
+     *
      * @param input 用户 query（CC original: input）
      * @return 检索目录列表（CC original: dirs）
      */

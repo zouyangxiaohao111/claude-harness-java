@@ -7,7 +7,6 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.team.Teammate;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
-import com.nexusai.common.RequestContext;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -78,7 +77,7 @@ public class AgentColorCommand {
      * <p>WHY（探查 GAP-3/M-3/C15）：UserInputDispatcher 生产仅注册 /compact，/color 未注册 →
      * AgentColorCommand 0 生产调用方、命令不可达。本 @PostConstruct 在 Spring 装配后把
      * "/color" 注册进 {@link UserInputDispatcher#registerSlashCommand}，handler 用生产 Env
-     * 执行（session 经 RequestContext MDC 解析，颜色落 {@link AgentState#setColor}）。
+     * 执行（session 经 handler 形参 sessionId 显式传入，颜色落 {@link AgentState#setColor}）。
      * plain JUnit（无 Spring 容器）缺省 null → 注册跳过并 log.warn（fail loud）。
      */
     @PostConstruct
@@ -87,8 +86,8 @@ public class AgentColorCommand {
             log.warn("[AgentColorCommand] UserInputDispatcher 未注入，/color 生产注册跳过");
             return;
         }
-        userInputDispatcher.registerSlashCommand("color", args -> {
-            Env env = buildProductionEnv();
+        userInputDispatcher.registerSlashCommand("color", (args, sessionId, inFlightUserMessageId) -> {
+            Env env = buildProductionEnv(sessionId);
             CommandResult r = execute(args, env);
             if (log.isDebugEnabled()) {
                 log.debug("[AgentColorCommand] /color 执行完成: handled={} message={} display={}",
@@ -105,24 +104,28 @@ public class AgentColorCommand {
      * <p>web 后端映射（Java idiom，接口 Spring）：
      * <ul>
      *   <li>{@code isTeammate} → {@link Teammate#isTeammate()}（CC utils/teammate.ts:125-137）</li>
-     *   <li>{@code sessionId} → {@link RequestContext#sessionId()}（MDC，ChatService 已 set）</li>
+     *   <li>{@code sessionId} → 分派入口显式传入的 handler 形参 {@code sessionId}（批 3c：不再读
+     *       裸 MDC）</li>
      *   <li>{@code transcriptPath} → {@link SessionStorage#resolveExistingTranscript}（工作区 + sessionId，
      *       D3 读兼容：仅 nexusai 自有 transcript）</li>
      *   <li>{@code agentColors} → {@link SubagentTool#AGENT_COLORS} 共享常量真源（探查 △-3）</li>
      *   <li>{@code saveAgentColor} → {@link SessionStorage#reAppendSessionMetadata} 持久化
      *       agent-color entry + {@link AgentState#setColor} 缓存 currentSessionAgentColor</li>
-     *   <li>{@code setAppStateColor} → 会话级 {@link AgentState#setColor}（CC standaloneAgentContext.color）</li>
+     *   <li>{@code setAppStateColor} → 会话级 {@link AgentState#setColor}（CC standaloneAgentContext.color；
+     *       会话标识同源闭包 handler 形参 sessionId）</li>
      *   <li>{@code onDone} → log（web 无 TUI，CommandResult 承载展示文本）</li>
      * </ul>
+     *
+     * @param sessionId 分派入口显式传入的会话 ID（null/空 = 无会话上下文，同旧 MDC 缺值语义）
      */
-    private Env buildProductionEnv() {
+    private Env buildProductionEnv(String sessionId) {
         return new Env(
             Teammate::isTeammate,
-            AgentColorCommand::resolveSessionUuid,
-            AgentColorCommand::resolveTranscriptPath,
+            () -> resolveSessionUuid(sessionId),
+            () -> resolveTranscriptPath(sessionId),
             () -> SubagentTool.AGENT_COLORS,
             this::persistAgentColor,
-            this::setAppStateColor,
+            color -> setAppStateColor(sessionId, color),
             msg -> {
                 if (log.isDebugEnabled()) {
                     log.debug("[AgentColorCommand] onDone: {}", msg);
@@ -130,14 +133,13 @@ public class AgentColorCommand {
             });
     }
 
-    /** 从 RequestContext（MDC）解析当前会话 UUID · null = 无会话上下文。 */
-    private static UUID resolveSessionUuid() {
-        String raw = RequestContext.sessionId();
-        if (raw == null || raw.isBlank()) {
+    /** 由显式形参 sessionId 解析当前会话 UUID · null = 无会话上下文（批 3c：不再读裸 MDC）。 */
+    private static UUID resolveSessionUuid(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
         try {
-            return UUID.fromString(raw);
+            return UUID.fromString(sessionId);
         } catch (IllegalArgumentException e) {
             return null;
         }
@@ -146,12 +148,12 @@ public class AgentColorCommand {
     /** transcript 路径（CC getTranscriptPath() · sessionStorage.ts）· 无会话 → null。
      *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
      *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。 */
-    private static String resolveTranscriptPath() {
-        UUID sid = resolveSessionUuid();
+    private static String resolveTranscriptPath(String sessionId) {
+        UUID sid = resolveSessionUuid(sessionId);
         if (sid == null) {
             return null;
         }
-        Path transcript = SessionStorage.resolveExistingTranscript(workspaceDir(), sid.toString());
+        Path transcript = SessionStorage.resolveExistingTranscript(workspaceDir(sessionId), sid.toString());
         return transcript != null ? transcript.toString() : null;
     }
 
@@ -165,14 +167,16 @@ public class AgentColorCommand {
      * D-1 裁决不读 resolve() 回落链），使存档根跟随会话绑定的项目目录。
      *
      * <p>统一入口内含 normalizeCwd（realpath+NFC），各层 safeGet 异常回 null，最终恒非 null 不抛。
+     *
+     * @param sessionId 显式会话 ID（批 3c：由调用点形参穿透，不再读裸 MDC）
      */
-    private static Path workspaceDir() {
-        return workspaceDirFor(RequestContext.sessionId());
+    private static Path workspaceDir(String sessionId) {
+        return workspaceDirFor(sessionId);
     }
 
     /**
-     * 按显式 sessionId 解析会话存档根（异步线程入口）· 同 {@link #workspaceDir()} 语义，
-     * 但不依赖 RequestContext MDC（避免 ForkJoinPool 跨线程丢失 ThreadLocal）。
+     * 按显式 sessionId 解析会话存档根（异步线程入口）· 同 {@link #workspaceDir(String)} 语义，
+     * 会话标识全程走形参（不用线程局部请求上下文，避免 ForkJoinPool 跨线程丢失）。
      *
      * @param sessionId 会话 ID（null/空 → 回落 user.dir 兜底）
      */
@@ -187,7 +191,7 @@ public class AgentColorCommand {
             return CompletableFuture.completedFuture(null);
         }
         // WF-1C: 必须在进入异步线程前解析存档根——CompletableFuture.runAsync 跑在 ForkJoinPool，
-        // 不传播 RequestContext MDC（ThreadLocal），异步内取 RequestContext.sessionId() 会得 null
+        // 不传播任何 ThreadLocal 请求上下文，异步内再取会话 id 会得 null
         // → 回落 user.dir（绑定项目场景 transcript 漂移）。sessionId 已是入参，直接据此解析统一入口，
         // 跨线程稳定（对齐 CC saveAgentColor 在异步内用模块级 getSessionId/getSessionProjectDir 而非线程局部态）。
         Path ws = workspaceDirFor(sessionId.toString());
@@ -203,13 +207,15 @@ public class AgentColorCommand {
                 log.warn("[AgentColorCommand] saveAgentColor 持久化失败: session={} error={}",
                     sessionId, e.getMessage());
             }
-            setAppStateColor(color);
+            // [批 3c] 原此处异步回调 setAppStateColor(color)：该调用无会话标识，跨 ForkJoinPool 线程
+            //   取不到会话（旧实现读裸 MDC 恒 null）→ 恒 no-op。会话级颜色状态由调用点同步写
+            //   （execute → env.setAppStateColor），此处不再重复写（避免 reset 路径 "default" 覆盖 null）。
         });
     }
 
-    /** 会话级颜色状态载体（CC standaloneAgentContext.color · color.ts:53-60/82-89）。 */
-    private void setAppStateColor(String color) {
-        UUID sid = resolveSessionUuid();
+    /** 会话级颜色状态载体（CC standaloneAgentContext.color · color.ts:53-60/82-89）· 会话标识显式传入。 */
+    private void setAppStateColor(String sessionId, String color) {
+        UUID sid = resolveSessionUuid(sessionId);
         if (sid == null || sessionAgentStateRegistry == null) {
             return;
         }

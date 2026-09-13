@@ -114,9 +114,10 @@ class McpSkillCommandsTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setMcpServerService(newMcpService(mcpSkill("mcp__s__summarize")));
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null（本类各用例只验 MCP/本地分离与清单内容，不涉会话）
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .contains("skill-a").doesNotContain("mcp__s__summarize");
-        assertThat(registry.getModelInvocableCommands()).extracting(Command::getName)
+        assertThat(registry.getModelInvocableCommands(null)).extracting(Command::getName)
             .contains("skill-a").doesNotContain("mcp__s__summarize");
     }
 
@@ -130,7 +131,8 @@ class McpSkillCommandsTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setMcpServerService(newMcpService(mcpSkill("dup"), mcpSkill("mcp__s__summarize")));
 
-        List<Command> listing = registry.getModelInvocableCommandsForListing();
+        // [批 3c] 无会话 → 显式 null
+        List<Command> listing = registry.getModelInvocableCommandsForListing(null);
         // 含 MCP 技能（thread-in）
         assertThat(listing).extracting(Command::getName).contains("mcp__s__summarize");
         // 同名冲突去重：local-first → "dup" 实例是本地 USER 源（MCP 不得覆盖本地）
@@ -138,7 +140,7 @@ class McpSkillCommandsTest {
         assertThat(dup.getSource()).isEqualTo(CommandSource.USER);
         assertThat(listing.stream().filter(c -> c.getName().equals("dup")).count()).isEqualTo(1);
         // 分离后本地视图无 "dup" 之外的 MCP（mcp__s__summarize 只经 listing 进入）
-        assertThat(registry.getModelInvocableCommands()).extracting(Command::getName)
+        assertThat(registry.getModelInvocableCommands(null)).extracting(Command::getName)
             .contains("dup").doesNotContain("mcp__s__summarize");
     }
 
@@ -152,15 +154,16 @@ class McpSkillCommandsTest {
         registry.setMcpServerService(newMcpService(mcpSkill("mcp__s__summarize")));
 
         // 本地技能两路都命中
-        assertThat(registry.findCommand("skill-a")).isNotNull();
-        assertThat(registry.findCommandIncludingMcp("skill-a")).isNotNull();
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.findCommand("skill-a", null)).isNotNull();
+        assertThat(registry.findCommandIncludingMcp("skill-a", null)).isNotNull();
         // MCP 技能仅 findCommandIncludingMcp 命中（thread-in 搜索基座 = CC getAllCommands(context)）
-        assertThat(registry.findCommand("mcp__s__summarize")).isNull();
-        Command mcp = registry.findCommandIncludingMcp("mcp__s__summarize");
+        assertThat(registry.findCommand("mcp__s__summarize", null)).isNull();
+        Command mcp = registry.findCommandIncludingMcp("mcp__s__summarize", null);
         assertThat(mcp).isNotNull();
         assertThat(mcp.getSource()).isEqualTo(CommandSource.MCP);
         // 前导 '/' 归一化同样适用
-        assertThat(registry.findCommandIncludingMcp("/mcp__s__summarize")).isNotNull();
+        assertThat(registry.findCommandIncludingMcp("/mcp__s__summarize", null)).isNotNull();
     }
 
     // ── ③b S3（R2B-DEC-9）：搜索基座含 disableModelInvocation MCP 技能（errorCode 4 后置）──
@@ -174,13 +177,14 @@ class McpSkillCommandsTest {
 
         // 搜索基座 = CC SkillTool.getAllCommands（SkillTool.ts:89，仅 type/loadedFrom 过滤）
         // → disableModelInvocation 技能保持可达，validateInput 命中后走 errorCode 4（:412-418）
-        Command hit = registry.findCommandIncludingMcp("mcp__s__off");
+        // [批 3c] 无会话 → 显式 null
+        Command hit = registry.findCommandIncludingMcp("mcp__s__off", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getDisableModelInvocation()).isTrue();
         assertThat(hit.getSource()).isEqualTo(CommandSource.MCP);
 
         // listing 视图仍过滤 disableModelInvocation（CC commands.ts:553-555 getMcpSkillCommands）
-        assertThat(registry.getModelInvocableCommandsForListing())
+        assertThat(registry.getModelInvocableCommandsForListing(null))
             .extracting(Command::getName).doesNotContain("mcp__s__off");
     }
 
@@ -197,17 +201,18 @@ class McpSkillCommandsTest {
             List.of(mcpPrompt("mcp__s__summarize"))));
 
         // 纯本地 findCommand 不命中任何 MCP（分离语义，P2-9）
-        assertThat(registry.findCommand("mcp__s__summarize")).isNull();
-        assertThat(registry.findCommand("mcp__s__skill")).isNull();
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.findCommand("mcp__s__summarize", null)).isNull();
+        assertThat(registry.findCommand("mcp__s__skill", null)).isNull();
         // findCommandIncludingMcp 同时命中 MCP skill（loadedFrom=MCP）与 MCP prompt（无 loadedFrom）
-        Command prompt = registry.findCommandIncludingMcp("mcp__s__summarize");
+        Command prompt = registry.findCommandIncludingMcp("mcp__s__summarize", null);
         assertThat(prompt).isNotNull();
         assertThat(prompt.getSource()).isEqualTo(CommandSource.MCP);
         assertThat(prompt.getLoadedFrom()).isNull();           // 无 loadedFrom = fetchCommands 产物
         assertThat(prompt.getIsMcp()).isTrue();
-        assertThat(registry.findCommandIncludingMcp("mcp__s__skill")).isNotNull();
+        assertThat(registry.findCommandIncludingMcp("mcp__s__skill", null)).isNotNull();
         // 前导 '/' 归一化同样适用
-        assertThat(registry.findCommandIncludingMcp("/mcp__s__summarize")).isNotNull();
+        assertThat(registry.findCommandIncludingMcp("/mcp__s__summarize", null)).isNotNull();
     }
 
     @Test
@@ -232,7 +237,8 @@ class McpSkillCommandsTest {
             List.of(mcpPrompt("mcp__s__summarize"))));
 
         // listing = 本地 + getMcpSkillCommands（仅 loadedFrom=MCP）→ prompt 不在其中
-        assertThat(registry.getModelInvocableCommandsForListing())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommandsForListing(null))
             .extracting(Command::getName)
             .contains("skill-a", "mcp__s__skill")
             .doesNotContain("mcp__s__summarize");
@@ -265,11 +271,12 @@ class McpSkillCommandsTest {
         registry.setMcpServerService(mcp);
 
         // MCP 技能经 thread-in 不可达（gate 关 → getMcpSkillCommands 空 → 合并退化为本地）
-        assertThat(registry.findCommandIncludingMcp("mcp__s__summarize")).isNull();
-        assertThat(registry.getModelInvocableCommandsForListing())
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.findCommandIncludingMcp("mcp__s__summarize", null)).isNull();
+        assertThat(registry.getModelInvocableCommandsForListing(null))
             .extracting(Command::getName)
             .contains("skill-a").doesNotContain("mcp__s__summarize");
         // 本地技能不受 gate 影响
-        assertThat(registry.findCommandIncludingMcp("skill-a")).isNotNull();
+        assertThat(registry.findCommandIncludingMcp("skill-a", null)).isNotNull();
     }
 }

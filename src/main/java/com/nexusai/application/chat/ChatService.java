@@ -29,7 +29,6 @@ import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.worktree.WorktreeCwdTracker;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.domain.provider.ProviderService;
 import com.nexusai.domain.schedule.ScheduleService;
@@ -93,7 +92,8 @@ import java.util.stream.Collectors;
  *
  * <p><b>日志约定（人 + AI 可读）</b>：
  * <ul>
- *   <li>每条日志自动带 {@code [s=sessionId] [r=userMessageId]} 前缀（logback MDC）</li>
+ *   <li>会话相关日志显式携带会话字段（如 {@code session=<id>}）——批 3c 起不再靠 logback MDC 自动前缀
+ *       （会话标识全链显式传参）</li>
  *   <li>每条 STOMP 推送前必打 INFO：{@code STOMP → type=... summary}</li>
  *   <li>user message / assistant message / tool result 都有单独 INFO 行</li>
  *   <li>出错用 ERROR/WARN，便于 AI 按 level 过滤</li>
@@ -254,7 +254,7 @@ public class ChatService {
 
     /**
      * 处理一条用户消息（异步）：HTTP 立刻返 202，LLM 流在后台跑。
-     * 入口设 MDC（sessionId + reqId），出口 finally 清。
+     * 会话标识（sessionId / userMessageId）由入参显式传入，全程显式传参（批 3c：原 MDC 写入点已删除）。
      */
     /**
      * [queue-first B1] turn 运行中再发消息 → 排队（对齐 CC handlePromptSubmit.ts:313，替代 cancel-first）。
@@ -377,7 +377,8 @@ public class ChatService {
      * [P5-①] userInvocable=false 拒绝消息 · 对齐 CC processSlashCommand.tsx:526-548。
      *
      * <p>判定链：输入 trim 后以 "/" 开头 → parseCommandName → {@code skillRegistry.findCommand}
-     * （三维匹配 name/userFacingName/aliases）→ {@code userInvocable === false} 命中 → 拒绝路径：
+     * （三维匹配 name/userFacingName/aliases；[批 3c] 会话标识取本方法形参 {@code sessionId} 显式传入，
+     * 不再经裸 MDC 会话槽）→ {@code userInvocable === false} 命中 → 拒绝路径：
      * <ul>
      *   <li>原 user 消息由调用方已落库（空闲：controller createUserMessage；排队：CronIdleExecutor
      *       createQueuedUserMessage）——本方法只处理<b>第二条</b> user 可见消息</li>
@@ -408,7 +409,9 @@ public class ChatService {
         }
         Command cmd;
         try {
-            cmd = skillRegistry.findCommand(commandName);
+            // [批 3c] 会话标识显式取自本方法形参 sessionId（方法入口已守卫非 null/非空白）——命令解析
+            //   基座随会话绑定项目变化（决定 userInvocable=false 的项目级技能是否被拦下）。原经裸 MDC 读取，已删。
+            cmd = skillRegistry.findCommand(commandName, sessionId);
         } catch (Exception e) {
             log.warn("rejectNonUserInvocable: findCommand 抛异常，回落正常路径: session={} command=/{} err={}",
                 sessionId, commandName, e.getMessage());
@@ -452,10 +455,36 @@ public class ChatService {
      * <p>仅 {@code type=='local-jsx' && immediate==true && isCommandEnabled()} → true；其余
      * （含未命中 / prompt 型 / 非 immediate）→ false（保持现状进 LLM/排队）。
      *
+     * <p><b>[批 3c 未决项] 本重载无会话来源</b>：签名没有 sessionId，唯一调用方
+     * {@code ChatController.send}（apis/session/ChatController.java 的 busy 分支）虽已有
+     * {@code @PathVariable String sessionId} 但其文件不在本次改造清单内 ⇒ 只能显式传 {@code null}
+     * （无会话）→ 技能清单按进程默认 projectRoot 解析（{@code SkillsLoader} 回落 {@code user.dir}），
+     * 绑定会话的 per-session 技能（项目级 immediate local-jsx 命令）可能不同 → log.warn 留痕。
+     * <b>待决策</b>：给该调用点改调 {@link #isImmediateLocalJsxCommand(String, String)}（形参穿透）
+     * 后删除本重载。原实现经裸 MDC 会话槽读取（第三态：可读到上一请求残留的别会话 id），批 3c 已删。
+     *
      * @param content 用户原始输入（可为 null）
      * @return true = immediate local-jsx 命令（应 dispatch 不走模型/队列）
      */
     public boolean isImmediateLocalJsxCommand(String content) {
+        log.warn("isImmediateLocalJsxCommand: 无会话入参（本重载签名无 sessionId，调用方 ChatController "
+            + "未迁移）→ 技能清单按进程默认解析（SkillsLoader 回落 user.dir），绑定会话的 per-session "
+            + "技能可能不同");
+        return isImmediateLocalJsxCommand(null, content);
+    }
+
+    /**
+     * [P5-②] immediate local-jsx 命令判定（**会话显式重载**）· 对齐 CC handlePromptSubmit.ts:239-252
+     * （{@code cmd.immediate && isCommandEnabled(cmd) && (name|aliases|userFacingName) 命中}）。
+     *
+     * <p>本类内部调用点（{@code processUserMessage} 两处分支）已有显式 {@code sessionId} → 直传，
+     * 命令解析基座随会话绑定项目变化（对齐 CC cwd 显式入参语义）。原经裸 MDC 读取，批 3c 已删。
+     *
+     * @param sessionId 目标会话（short）；null/空白 = 无会话（技能清单按进程默认解析）
+     * @param content   用户原始输入（可为 null）
+     * @return true = immediate local-jsx 命令（应 dispatch 不走模型/队列）
+     */
+    public boolean isImmediateLocalJsxCommand(String sessionId, String content) {
         if (skillRegistry == null) {
             return false;
         }
@@ -465,10 +494,10 @@ public class ChatService {
         }
         Command cmd;
         try {
-            cmd = skillRegistry.findCommand(commandName);
+            cmd = skillRegistry.findCommand(commandName, sessionId);
         } catch (Exception e) {
-            log.warn("isImmediateLocalJsxCommand: findCommand 抛异常，按非 immediate 处理: command=/{} err={}",
-                commandName, e.getMessage());
+            log.warn("isImmediateLocalJsxCommand: findCommand 抛异常，按非 immediate 处理: session={} command=/{} err={}",
+                sessionId, commandName, e.getMessage());
             return false;
         }
         return cmd != null
@@ -512,7 +541,8 @@ public class ChatService {
             return false;
         }
         try {
-            userInputDispatcher.dispatch(content);
+            // [批 3c] 会话标识 + 在途用户消息 id 显式随分派传入（原经 MDC 的 sessionId/reqId）
+            userInputDispatcher.dispatch(content, sessionId, userMessageId);
             if (log.isInfoEnabled()) {
                 log.info("IMMEDIATE local-jsx 命令立即执行: session={} command=/{} "
                         + "（CC handlePromptSubmit.ts:239-252 busy/空闲优先，不经模型/队列）",
@@ -623,402 +653,399 @@ public class ChatService {
                                    String userMessageId,
                                    SendMessageRequest req,
                                    SimpMessagingTemplate wsTemplate) {
-        RequestContext.set(sessionId, userMessageId);
-        try {
-            // [V-TOK 实施] 本轮耗时锚点（duration_ms 装配用 · Java 无 API 累计计时，用 turn 墙钟近似）
-            long turnStartMs = System.currentTimeMillis();
-            log.info("USER → content={}", abbreviate(req == null ? "" : req.content(), 120));
+        // [V-TOK 实施] 本轮耗时锚点（duration_ms 装配用 · Java 无 API 累计计时，用 turn 墙钟近似）
+        long turnStartMs = System.currentTimeMillis();
+        log.info("USER → content={}", abbreviate(req == null ? "" : req.content(), 120));
 
-            // [queue-first B1 防御] turn 运行中再发 → 排队（controller 已前置判定，此处兜底其他入口）
-            if (LlmAgentLoop.isSessionRunning(sessionId)) {
-                // [P5-②] immediate local-jsx 命令 busy 优先：不排队、立即 dispatch（CC
-                //   handlePromptSubmit.ts:239-252 queryGuard.isActive 优先语义）。未注册命名 handler
-                //   的 immediate 命令 → dispatchImmediateLocalJsx 返回 false（内部 log.warn fail loud）
-                //   → 回落原 busy 排队（CC dequeue 后重走 handlePromptSubmit 语义）。
-                if (isImmediateLocalJsxCommand(req != null ? req.content() : null)) {
-                    dispatchImmediateLocalJsx(sessionId, userMessageId, req != null ? req.content() : null,
-                        true, wsTemplate);
-                    return;
-                }
-                enqueueBusyPrompt(sessionId, userMessageId, req);
-                return;
-            }
-
-            // [P5-①] userInvocable=false 拒绝消息 · 对齐 CC processSlashCommand.tsx:526-548：
-            //   输入以 "/" 开头 → findCommand → userInvocable===false → 推第二条 user 可见消息
-            //   （"只能由 Claude 调用"）+ status idle，不启动 LlmAgentLoop（CC shouldQuery:false）。
-            //   命中即 return（拒绝路径终结）；未命中/userInvocable!=false → 回落正常 LLM 路径。
-            if (rejectNonUserInvocable(sessionId, req != null ? req.content() : null, userMessageId, wsTemplate)) {
-                return;
-            }
-
-            // [P5-②] 空闲 immediate local-jsx 命令 → 直接 dispatch（对齐 CC local-jsx 不走模型）；
-            //   controller 已落库 user 消息（persistAndPush=false 不重复推送），仅执行 handler + idle。
-            //   非 immediate slash 命令保持现状（进 LLM）。
-            if (isImmediateLocalJsxCommand(req != null ? req.content() : null)) {
+        // [queue-first B1 防御] turn 运行中再发 → 排队（controller 已前置判定，此处兜底其他入口）
+        if (LlmAgentLoop.isSessionRunning(sessionId)) {
+            // [P5-②] immediate local-jsx 命令 busy 优先：不排队、立即 dispatch（CC
+            //   handlePromptSubmit.ts:239-252 queryGuard.isActive 优先语义）。未注册命名 handler
+            //   的 immediate 命令 → dispatchImmediateLocalJsx 返回 false（内部 log.warn fail loud）
+            //   → 回落原 busy 排队（CC dequeue 后重走 handlePromptSubmit 语义）。
+            //   [批 3c] 会话显式直传本方法形参 sessionId（原经裸 MDC 读取，已删）
+            if (isImmediateLocalJsxCommand(sessionId, req != null ? req.content() : null)) {
                 dispatchImmediateLocalJsx(sessionId, userMessageId, req != null ? req.content() : null,
-                    false, wsTemplate);
-                sendAndLog(wsTemplate, streamTopic(sessionId),
-                    SessionStatusEvent.of(sessionId, userMessageId, "idle"),
-                    "status=idle (immediate local-jsx 已执行，不走模型)");
+                    true, wsTemplate);
                 return;
             }
+            enqueueBusyPrompt(sessionId, userMessageId, req);
+            return;
+        }
 
-            SessionRecord session = sessionMapper.selectOneById(sessionId);
-            if (session == null) {
-                log.error("Session not found");
-                return;
-            }
+        // [P5-①] userInvocable=false 拒绝消息 · 对齐 CC processSlashCommand.tsx:526-548：
+        //   输入以 "/" 开头 → findCommand → userInvocable===false → 推第二条 user 可见消息
+        //   （"只能由 Claude 调用"）+ status idle，不启动 LlmAgentLoop（CC shouldQuery:false）。
+        //   命中即 return（拒绝路径终结）；未命中/userInvocable!=false → 回落正常 LLM 路径。
+        if (rejectNonUserInvocable(sessionId, req != null ? req.content() : null, userMessageId, wsTemplate)) {
+            return;
+        }
 
-            // [P1 · slash-align] '/' 开头输入 → CC processSlashCommand 边界拦截
-            //   （对齐 CC processSlashCommand.tsx:309-921 主流程）。插入点：busy 检查 + session 校验之后、
-            //   provider 解析 / loop.run 之前。分派结果：
-            //   - shouldQuery=true（prompt 型）→ isMeta 技能内容落库 + 技能级 model 覆盖，回落正常
-            //     loop.run 流式（用户气泡已由 controller createUserMessage 落库 + 前端乐观插入）。
-            //   - shouldQuery=false（unknown / local / local-jsx / userInvocable=false）→ 非查询型终态收口
-            //     （不跑 loop.run）：推结果消息 + status=idle + inProgress.remove，STOMP 链路不漏。
-            //   userInvocable=false / immediate local-jsx 已由上方 P5 分支先行拦截（rejectNonUserInvocable /
-            //   dispatchImmediateLocalJsx），本拦截器对这两类再命中为防御性兜底（不双处理）。
-            String rawContent = req != null ? req.content() : null;
-            SlashCommandInterceptor.SlashResolution slash = null;
-            if (slashInterceptor != null && rawContent != null && rawContent.startsWith("/")) {
-                slash = slashInterceptor.intercept(sessionId, userMessageId, rawContent,
-                    streamTopic(sessionId), wsTemplate);
+        // [P5-②] 空闲 immediate local-jsx 命令 → 直接 dispatch（对齐 CC local-jsx 不走模型）；
+        //   controller 已落库 user 消息（persistAndPush=false 不重复推送），仅执行 handler + idle。
+        //   非 immediate slash 命令保持现状（进 LLM）。
+        //   [批 3c] 会话显式直传本方法形参 sessionId（原经裸 MDC 读取，已删）
+        if (isImmediateLocalJsxCommand(sessionId, req != null ? req.content() : null)) {
+            dispatchImmediateLocalJsx(sessionId, userMessageId, req != null ? req.content() : null,
+                false, wsTemplate);
+            sendAndLog(wsTemplate, streamTopic(sessionId),
+                SessionStatusEvent.of(sessionId, userMessageId, "idle"),
+                "status=idle (immediate local-jsx 已执行，不走模型)");
+            return;
+        }
+
+        SessionRecord session = sessionMapper.selectOneById(sessionId);
+        if (session == null) {
+            log.error("Session not found");
+            return;
+        }
+
+        // [P1 · slash-align] '/' 开头输入 → CC processSlashCommand 边界拦截
+        //   （对齐 CC processSlashCommand.tsx:309-921 主流程）。插入点：busy 检查 + session 校验之后、
+        //   provider 解析 / loop.run 之前。分派结果：
+        //   - shouldQuery=true（prompt 型）→ isMeta 技能内容落库 + 技能级 model 覆盖，回落正常
+        //     loop.run 流式（用户气泡已由 controller createUserMessage 落库 + 前端乐观插入）。
+        //   - shouldQuery=false（unknown / local / local-jsx / userInvocable=false）→ 非查询型终态收口
+        //     （不跑 loop.run）：推结果消息 + status=idle + inProgress.remove，STOMP 链路不漏。
+        //   userInvocable=false / immediate local-jsx 已由上方 P5 分支先行拦截（rejectNonUserInvocable /
+        //   dispatchImmediateLocalJsx），本拦截器对这两类再命中为防御性兜底（不双处理）。
+        String rawContent = req != null ? req.content() : null;
+        SlashCommandInterceptor.SlashResolution slash = null;
+        if (slashInterceptor != null && rawContent != null && rawContent.startsWith("/")) {
+            slash = slashInterceptor.intercept(sessionId, userMessageId, rawContent,
+                streamTopic(sessionId), wsTemplate);
+        }
+        // [P1 · slash-align] 技能级 model 覆盖 · 对齐 CC processSlashCommand.tsx:917（model: command.model）
+        //   在 resolveModelNameForSession 之后应用（modelName 此时已解析）；fallbackModel 在覆盖
+        //   之后 resolveEffectiveFallbackModel 执行 → 按覆盖后 model 重算（[Fix-P1] 修正旧注释
+        //   「不重算」——代码实为重算，后期待实现.md §68.6 同步修正）。
+        String slashModelOverride = (slash != null && slash.handled() && slash.shouldQuery()
+            && slash.command() != null && slash.command().getModel() != null
+            && !slash.command().getModel().isBlank())
+            ? slash.command().getModel() : null;
+        if (slash != null && slash.handled() && slash.shouldQuery()
+                && slash.metaMessageContent() != null && !slash.metaMessageContent().isEmpty()) {
+            // [P1 · slash-align] prompt 型技能内容 isMeta 落库（UI 隐藏、模型可见、DB 持久化 · 对齐 CC
+            //   processSlashCommand.tsx:915-918 createUserMessage({content: skillContent, isMeta:true})）。
+            //   resume 按 id 排除当前 user，metaId 为独立 id 会被载入历史 → 模型上下文 =
+            //   [历史..., user(isMeta 技能内容), user(/command args)]。CC 对应 [metadata, user(isMeta
+            //   技能内容)]（无原始 /command args、无 metadata XML 标签，web 以原始 /command args 气泡
+            //   等价，见 后期待实现.md §68.7）。[Fix-P1] SessionResumeDeserializer.spliceNoResponseRequested
+            //   已增「末条 user isMeta → 不注入」→ 不产生幽灵 'No response requested.' sentinel（修复
+            //   反思报告上下文序列不实）。best-effort：落库失败不阻断主链（对齐 cron isMeta 先例）。
+            String slashMetaId = "msg-slash-meta-" + UUID.randomUUID().toString().substring(0, 8);
+            try {
+                if (messageService != null) {
+                    messageService.createQueuedUserMessage(sessionId, slashMetaId,
+                        slash.metaMessageContent(), OffsetDateTime.now(), true);
+                    log.info("[slash] prompt 型技能内容 isMeta 落库: session={} id={} chars={}"
+                        + "（对齐 CC :915-918）", sessionId, slashMetaId, slash.metaMessageContent().length());
+                }
+            } catch (Exception e) {
+                log.warn("[slash] isMeta 技能内容落库失败（best-effort 不阻断主链）: session={} id={}: {}",
+                    sessionId, slashMetaId, e.getMessage());
             }
-            // [P1 · slash-align] 技能级 model 覆盖 · 对齐 CC processSlashCommand.tsx:917（model: command.model）
-            //   在 resolveModelNameForSession 之后应用（modelName 此时已解析）；fallbackModel 在覆盖
-            //   之后 resolveEffectiveFallbackModel 执行 → 按覆盖后 model 重算（[Fix-P1] 修正旧注释
-            //   「不重算」——代码实为重算，后期待实现.md §68.6 同步修正）。
-            String slashModelOverride = (slash != null && slash.handled() && slash.shouldQuery()
-                && slash.command() != null && slash.command().getModel() != null
-                && !slash.command().getModel().isBlank())
-                ? slash.command().getModel() : null;
-            if (slash != null && slash.handled() && slash.shouldQuery()
-                    && slash.metaMessageContent() != null && !slash.metaMessageContent().isEmpty()) {
-                // [P1 · slash-align] prompt 型技能内容 isMeta 落库（UI 隐藏、模型可见、DB 持久化 · 对齐 CC
-                //   processSlashCommand.tsx:915-918 createUserMessage({content: skillContent, isMeta:true})）。
-                //   resume 按 id 排除当前 user，metaId 为独立 id 会被载入历史 → 模型上下文 =
-                //   [历史..., user(isMeta 技能内容), user(/command args)]。CC 对应 [metadata, user(isMeta
-                //   技能内容)]（无原始 /command args、无 metadata XML 标签，web 以原始 /command args 气泡
-                //   等价，见 后期待实现.md §68.7）。[Fix-P1] SessionResumeDeserializer.spliceNoResponseRequested
-                //   已增「末条 user isMeta → 不注入」→ 不产生幽灵 'No response requested.' sentinel（修复
-                //   反思报告上下文序列不实）。best-effort：落库失败不阻断主链（对齐 cron isMeta 先例）。
-                String slashMetaId = "msg-slash-meta-" + UUID.randomUUID().toString().substring(0, 8);
+        }
+        if (slash != null && slash.handled() && !slash.shouldQuery()) {
+            // [P1 · slash-align] 非查询型终态收口（不跑 loop.run）· 对齐 CC shouldQuery=false 语义
+            //   （Unknown skill / local-command-stdout / userInvocable-false / fork 占位）。
+            //   显式推 结果 MessageUserEvent（新 id msg-slash-xxx）+ status=idle + inProgress.remove，
+            //   确保 status 终态不漏、inProgress 不残留（防 cancelSession 幽灵任务）。
+            String slashResultId = slash.resultMessageId() != null ? slash.resultMessageId()
+                : "msg-slash-" + UUID.randomUUID().toString().substring(0, 8);
+            if (slash.resultText() != null) {
                 try {
                     if (messageService != null) {
-                        messageService.createQueuedUserMessage(sessionId, slashMetaId,
-                            slash.metaMessageContent(), OffsetDateTime.now(), true);
-                        log.info("[slash] prompt 型技能内容 isMeta 落库: session={} id={} chars={}"
-                            + "（对齐 CC :915-918）", sessionId, slashMetaId, slash.metaMessageContent().length());
+                        messageService.createQueuedUserMessage(sessionId, slashResultId,
+                            slash.resultText(), OffsetDateTime.now(), false);
                     }
                 } catch (Exception e) {
-                    log.warn("[slash] isMeta 技能内容落库失败（best-effort 不阻断主链）: session={} id={}: {}",
-                        sessionId, slashMetaId, e.getMessage());
+                    log.warn("[slash] 非查询型结果落库失败（best-effort 仅推送）: session={} id={}: {}",
+                        sessionId, slashResultId, e.getMessage());
+                }
+                publishUserMessageEvent(sessionId, slashResultId, slash.resultText(), false,
+                    streamTopic(sessionId), wsTemplate);
+            }
+            sendAndLog(wsTemplate, streamTopic(sessionId),
+                SessionStatusEvent.of(sessionId, userMessageId, "idle"),
+                "status=idle (slash non-querying)");
+            inProgress.remove(sessionId);
+            log.info("[slash] 非查询型命令终态收口: cmd={} shouldQuery=false",
+                slash.command() != null ? slash.command().getName() : "?");
+            return;
+        }
+
+        // [IMP-G] G26③ AskUserQuestion previewFormat 会话建立接线：读 CLAUDE_CODE_QUESTION_PREVIEW_FORMAT
+        // env，仅当配置值合法（'markdown'|'html'）才 set（CC main.tsx:835-843 合法值分支；Java Web
+        // 后端非 CC CLI 客户端，不套用 CLI 默认 markdown 分支）。幂等：静态值与会话无关，多会话
+        // 建立时重复覆盖同值。
+        AskUserQuestionTool.applyQuestionPreviewFormatFromConfig();
+
+        // [WF-4] resume 恢复：从 transcript 读回 worktree-state → WorktreeCwdTracker
+        //   （对齐 CC sessionRestore.ts:332-366 restoreWorktreeForResume）
+        restoreWorktreeForResume(sessionId);
+
+        String modelName = resolveModelNameForSession(session, req != null ? req.modelName() : null);
+        // [P1 · slash-align] 技能级 model 覆盖（prompt 型命令 command.model，CC :917）
+        if (slashModelOverride != null) {
+            log.info("[slash] 技能级 model 覆盖: {} → {}（CC processSlashCommand.tsx:917）",
+                modelName, slashModelOverride);
+            modelName = slashModelOverride;
+        }
+        log.info("MODEL → 已解析 model 来源: request/session/settings/default, present={}",
+            modelName != null && !modelName.isBlank());
+        // [F4] 降级模型：请求体 fallbackModel 优先，空则回落 settings.fallbackModelName（前端设置页可配）
+        String fallbackModel = resolveEffectiveFallbackModel(modelName, req != null ? req.fallbackModel() : null);
+
+        // [streamTopic-session-level] 会话级单 topic：消息归属走事件字段，topic 不再编码消息 id
+        String streamTopic = streamTopic(sessionId);
+
+        // 1) session.status=thinking
+        sendAndLog(wsTemplate, streamTopic,
+            SessionStatusEvent.of(sessionId, userMessageId, "thinking"),
+            "status=thinking");
+
+        // 2) cancel task 注册（[queue-first B1] 删 previous.cancel —— 对齐 CC 不再打断旧 turn；
+        //   inProgress.put 保留，供 cancelSession 定位在飞 turn；用户主动 /cancel 仍走 task.cancel）
+        ChatTask task = new ChatTask(sessionId, userMessageId,
+            "msg-pending-" + UUID.randomUUID().toString().substring(0, 8));
+        inProgress.put(sessionId, task);
+
+        // 3) 解析 provider
+        ProviderConfig config;
+        String providerType;
+        try {
+            config = buildConfigForModel(modelName);
+            providerType = providerTypeForModel(modelName);
+        } catch (Exception e) {
+            log.warn("Provider resolve failed → fallback mock: {}", e.toString());
+            config = ProviderConfig.empty();
+            providerType = "openai_compatible";
+        }
+        LlmProvider provider = llmProviderFactory.getProvider(config, providerType);
+        log.info("PROVIDER → type={} baseUrl={}", provider.type(),
+            config == null ? "(mock)" : abbreviate(config.baseUrl(), 60));
+
+        // 4) 调 LlmAgentLoop
+        AgentState state = null;
+        // [mid-turn-align] loop 实例在 try 前声明：error 分支（run() 抛异常时 state 赋值未完成、恒 null）
+        //   经 loop.injectedQueuedMessages() 逃生门重新 enqueue 回队列（见 error 分支）。
+        LlmAgentLoop loop = null;
+        try {
+            // Phase 6·s02.6: 注入 wsTemplate + session + userMessageId,
+            //   让 LlmAgentLoop 在 OpenAiSdkProvider 解析 chunk 时**立即推 STOMP** (真流式).
+            loop = loopProvider.getObject();
+            loop.setStreamContext(wsTemplate, sessionId, userMessageId);
+            // STREAM-P1-FIX: 真实注入 token budget / query config
+            //   不再是 setXxx 死代码 - 实际进 LlmAgentLoop.run() 的 loop() 内每轮 check
+            if (tokenBudgetChecker != null) loop.setTokenBudgetChecker(tokenBudgetChecker);
+            if (queryConfig != null) loop.setQueryConfig(queryConfig);
+            // FIX-R2-1 + FIX-R12-1: 真实注入 memory / recovery 依赖
+            if (memoryStorage != null) loop.setMemoryStorage(memoryStorage);
+            if (memoryPrefetcher != null) loop.setMemoryPrefetcher(memoryPrefetcher);
+            if (claudemdEngine != null) loop.setClaudemdEngine(claudemdEngine);
+            if (maxTokensHandler != null) loop.setMaxTokensHandler(maxTokensHandler);
+            if (transientErrorHandler != null) loop.setTransientErrorHandler(transientErrorHandler);
+            log.info("AGENT stream wired: budget={} config={} mem={} memPref={} maxTok={} transient={}",
+                tokenBudgetChecker != null, queryConfig != null,
+                memoryStorage != null, memoryPrefetcher != null,
+                maxTokensHandler != null, transientErrorHandler != null);
+            String userPrompt = req != null ? req.content() : null;
+            if (userPrompt == null || userPrompt.isBlank()) {
+                userPrompt = lastUserContent(loadRecentHistory(sessionId, HISTORY_LIMIT));
+            }
+            // [Phase3 @引用文件] 从 content 里的 @token（@path / @"path with space" · 用户 @ 提及字面）解析
+            //   绑定项目内相对路径 → 读全文拼进本轮 user 文本（对齐 CC @file 上下文注入；
+            //   越界/缺失/超限 skip + warn fail loud，不阻断发送；@token 原文已含在 content 里，气泡展示/落库不变）
+            userPrompt = appendReferencedFiles(userPrompt, sessionId);
+            log.info("AGENT start: prompt={}chars tools={}",
+                userPrompt == null ? 0 : userPrompt.length(),
+                toolRegistry == null ? 0 : toolRegistry.all().size());
+            // [attachments-v2 Step2] 单次请求附件上限 50（对齐前端契约；防超大请求体）
+            if (req != null && req.attachments() != null
+                    && req.attachments().size() > MAX_ATTACHMENTS_PER_REQUEST) {
+                throw new ValidationException("一次最多发送 " + MAX_ATTACHMENTS_PER_REQUEST + " 个附件");
+            }
+            // [A1 · attachment-multimodal] 消费请求附件：contentId → ImageAttachmentStore
+            //   读缓存补全 base64/mediaType（直传 base64 原样保留），组装可消费附件列表透传 LlmAgentLoop。
+            List<AttachmentRequest> attachments = resolveAttachments(sessionId,
+                req != null ? req.attachments() : null);
+            // [A5 · 限额闸门] 媒体限额校验：5MB base64 硬校验（超限压缩，失败拒绝）+ 100 项/请求裁剪（保最新）
+            //   对齐 CC apiLimits.ts:19/94 + imageValidation.ts:90-102 + claude.ts:956 stripExcessMediaItems。
+            //   校验入口：ChatService 消费附件处（A1 resolveAttachments 补全 base64 后、透传 LlmAgentLoop 前）。
+            attachments = MediaLimitGuard.guard(attachments);
+            // [附件双模式 · 统一附件表 contentId] 回写 user_attachments：resolveAttachments 已把 path/upload
+            //   大文件附件注册附件表并分配 contentId（createUserMessage 落库时 path 附件 contentId 未知 →
+            //   当时快照 contentId=null）→ 此处把<b>已解析附件快照（含新 contentId）</b>全量覆盖回写
+            //   user_attachments（对齐 updateUserImagePasteIds 回写范式：消息本体已由 controller createUserMessage
+            //   落库，本回写仅 UPDATE user_attachments 列）。≤5MB base64 图无 contentId 保持 null（imagePasteIds
+            //   链路不变）；url 为出站投影不落库。messageService 为 @Autowired(required=false) 必须判 null。
+            if (messageService != null && !attachments.isEmpty()) {
+                try {
+                    messageService.updateUserAttachments(userMessageId, userAttachmentSnapshotOf(attachments));
+                } catch (Exception e) {
+                    log.warn("[attachments] 回写 user 消息 user_attachments 失败: userMessageId={} err={}",
+                        userMessageId, e.toString());
                 }
             }
-            if (slash != null && slash.handled() && !slash.shouldQuery()) {
-                // [P1 · slash-align] 非查询型终态收口（不跑 loop.run）· 对齐 CC shouldQuery=false 语义
-                //   （Unknown skill / local-command-stdout / userInvocable-false / fork 占位）。
-                //   显式推 结果 MessageUserEvent（新 id msg-slash-xxx）+ status=idle + inProgress.remove，
-                //   确保 status 终态不漏、inProgress 不残留（防 cancelSession 幽灵任务）。
-                String slashResultId = slash.resultMessageId() != null ? slash.resultMessageId()
-                    : "msg-slash-" + UUID.randomUUID().toString().substring(0, 8);
-                if (slash.resultText() != null) {
-                    try {
-                        if (messageService != null) {
-                            messageService.createQueuedUserMessage(sessionId, slashResultId,
-                                slash.resultText(), OffsetDateTime.now(), false);
-                        }
-                    } catch (Exception e) {
-                        log.warn("[slash] 非查询型结果落库失败（best-effort 仅推送）: session={} id={}: {}",
-                            sessionId, slashResultId, e.getMessage());
-                    }
-                    publishUserMessageEvent(sessionId, slashResultId, slash.resultText(), false,
-                        streamTopic(sessionId), wsTemplate);
-                }
-                sendAndLog(wsTemplate, streamTopic(sessionId),
-                    SessionStatusEvent.of(sessionId, userMessageId, "idle"),
-                    "status=idle (slash non-querying)");
-                inProgress.remove(sessionId);
-                log.info("[slash] 非查询型命令终态收口: cmd={} shouldQuery=false",
-                    slash.command() != null ? slash.command().getName() : "?");
-                return;
+            // [ER-IMP-02 · R-TOK] 主线程 agentId 传 null 对齐 CC 主线程语义：
+            // CC query.ts:1311 checkTokenBudget(budgetTracker!, toolUseContext.agentId, ...)
+            // 主线程 toolUseContext.agentId=undefined（query.ts:342 if (!toolUseContext.agentId)
+            // 主线程专属 gate）→ 走续跑逻辑；恒传 sessionUuid 会使 checkTokenBudget 首行
+            // if (agentId || ...) 命中 → 主线程首迭代 StopDecision → MAX_OUTPUT_TOKENS break。
+            // 主会话（agentId==null）注册 gate（LlmAgentLoop:1556 sessionAgentStateRegistry）、
+            // tool_use_summary（:3655-3661 gate agentId==null）、skill dedup agentKey
+            // （:2482 主线程 agentKey=""）随之激活 —— 均为 CC 对齐休眠路径。
+            // [session-id-short] sessionId 已 short 直传 RunRequest.session（不再 parseSessionUuid）
+            // [V44] 有效初始权限模式 = per-call ?? 会话 override（session.permission_mode 列）：
+            //   per-call（HTTP 请求体 SendMessageRequest.permissionMode）恒胜会话 override；两者共享
+            //   CLI 槽（resolver 链第 2 优先级，恒胜 settings 槽）——实现「会话初始化传 permissionModeCli」。
+            String perCallPermissionMode = req != null ? req.permissionMode() : null;
+            String effectivePermissionMode =
+                resolveEffectivePermissionMode(session, perCallPermissionMode);
+            if (log.isInfoEnabled()) {
+                log.info("PERMISSION MODE → 有效初始权限模式: per-call={} session.override={} → effective={}"
+                        + "（per-call 恒胜会话 override；null 回落全局 settings/permissions.defaultMode）",
+                    perCallPermissionMode, session.getPermissionMode(), effectivePermissionMode);
             }
-
-            // [IMP-G] G26③ AskUserQuestion previewFormat 会话建立接线：读 CLAUDE_CODE_QUESTION_PREVIEW_FORMAT
-            // env，仅当配置值合法（'markdown'|'html'）才 set（CC main.tsx:835-843 合法值分支；Java Web
-            // 后端非 CC CLI 客户端，不套用 CLI 默认 markdown 分支）。幂等：静态值与会话无关，多会话
-            // 建立时重复覆盖同值。
-            AskUserQuestionTool.applyQuestionPreviewFormatFromConfig();
-
-            // [WF-4] resume 恢复：从 transcript 读回 worktree-state → WorktreeCwdTracker
-            //   （对齐 CC sessionRestore.ts:332-366 restoreWorktreeForResume）
-            restoreWorktreeForResume(sessionId);
-
-            String modelName = resolveModelNameForSession(session, req != null ? req.modelName() : null);
-            // [P1 · slash-align] 技能级 model 覆盖（prompt 型命令 command.model，CC :917）
-            if (slashModelOverride != null) {
-                log.info("[slash] 技能级 model 覆盖: {} → {}（CC processSlashCommand.tsx:917）",
-                    modelName, slashModelOverride);
-                modelName = slashModelOverride;
+            // [实时落库 2026-09-03] run 前武装实时落库 SPI：装配了落库能力（messageService != null）才
+            //   武装（非 Spring 单测不武装 → loop mock 不消费 enabler，零行为变化）。doRun 历史注入完成、
+            //   prePersistedMessageIds 已登记后回调 → armRealTimePersist setAppendListener，其后每条
+            //   新 append（=消息完整产出）即实时落 DB（对齐 CC recordTranscript）。传该轮 userMessageId
+            //   作 DB user_message_id 归属根（对齐原 replayAndPersist lastUserMessageId 初值语义）。
+            if (messageService != null) {
+                loop.setPostHistoryPersistEnabler(state2 ->
+                    armRealTimePersist(state2, sessionId, streamTopic, wsTemplate, userMessageId));
             }
-            log.info("MODEL → 已解析 model 来源: request/session/settings/default, present={}",
-                modelName != null && !modelName.isBlank());
-            // [F4] 降级模型：请求体 fallbackModel 优先，空则回落 settings.fallbackModelName（前端设置页可配）
-            String fallbackModel = resolveEffectiveFallbackModel(modelName, req != null ? req.fallbackModel() : null);
-
-            // [streamTopic-session-level] 会话级单 topic：消息归属走事件字段，topic 不再编码消息 id
-            String streamTopic = streamTopic(sessionId);
-
-            // 1) session.status=thinking
-            sendAndLog(wsTemplate, streamTopic,
-                SessionStatusEvent.of(sessionId, userMessageId, "thinking"),
-                "status=thinking");
-
-            // 2) cancel task 注册（[queue-first B1] 删 previous.cancel —— 对齐 CC 不再打断旧 turn；
-            //   inProgress.put 保留，供 cancelSession 定位在飞 turn；用户主动 /cancel 仍走 task.cancel）
-            ChatTask task = new ChatTask(sessionId, userMessageId,
-                "msg-pending-" + UUID.randomUUID().toString().substring(0, 8));
-            inProgress.put(sessionId, task);
-
-            // 3) 解析 provider
-            ProviderConfig config;
-            String providerType;
-            try {
-                config = buildConfigForModel(modelName);
-                providerType = providerTypeForModel(modelName);
-            } catch (Exception e) {
-                log.warn("Provider resolve failed → fallback mock: {}", e.toString());
-                config = ProviderConfig.empty();
-                providerType = "openai_compatible";
+            state = loop.run(RunRequest.session(
+                userPrompt, sessionId, null, config, modelName, null,
+                req != null ? req.appendSystemPrompt() : null,   // [RES-SP31] 接线：HTTP 请求体追加指令
+                fallbackModel,                                     // [DEC-RV-02 · FIX-16] per-call 降级模型（请求体 → settings.fallbackModelName → RunRequest.fallbackModel → QueryParams → RetryOptions）
+                effectivePermissionMode,                           // [V44] 有效初始权限模式（per-call ?? 会话 override → RunRequest.permissionModeCli → InitialPermissionModeResolver.Input CLI 槽）
+                req != null && Boolean.TRUE.equals(req.dangerouslySkipPermissions()), // [RV-11 · REV-FIX-2] dangerouslySkip（HTTP 请求体 → RunRequest.dangerouslySkipPermissions）
+                taskBudgetOf(),                                  // [IMP2-10 · MISS-2] taskBudget 生产注入（OD-13: 配置→默认值）
+                req != null ? req.jsonSchema() : null,           // [IMP-HR-08 · OPD-WF6-01-06-?-3] 主循环 structured output jsonSchema 透传（HTTP 请求体 → RunRequest.jsonSchema → LlmAgentLoop 注册 enforcement）
+                attachments));                                   // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
+        } catch (Exception e) {
+            log.error("AGENT failed: model={}", modelName, e);
+            // [实时落库 2026-09-03] error 分支删除 reenqueueInjectedQueuedMessages（对齐 CC
+            //   messageQueueManager.ts：无 requeue API，消费即移除；query 崩溃已消费命令不自动回队）。
+            //   已注入命令若已 append 已实时落库留痕（DB + 前端气泡）；未注入仍在队列由 CronIdleExecutor
+            //   自然消费——规则十二显式失败：不再静默重放。
+            String errorCode = (e instanceof InterruptedException) ? "cancelled" : "llm_error";
+            String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            // [reflect-blocker] 终态事件同源（error 分支）：run() 抛异常 → state 恒 null（赋值未完成），
+            //   无法经 state 取末条 assistant id；sessionAgentStateRegistry 持当前轮在飞 state
+            //   （LlmAgentLoop:2013-2017 run() 流式开始前注册），currentAssistantMessageId() =
+            //   prepareAssistantMessageId() 结果（LlmAgentLoop:4209），正是流式 chunk 事件同源 id →
+            //   优先取在飞 id，回落 task 占位（罕见：run() 在注册前即抛的 setup 失败仍幽灵气泡，可接受）。
+            String realErrorAssistantId = task.assistantMessageId;
+            if (sessionAgentStateRegistry != null) {
+                AgentState inFlight = sessionAgentStateRegistry.get(sessionId);
+                String inFlightId = inFlight != null ? inFlight.currentAssistantMessageId() : null;
+                if (inFlightId != null) {
+                    realErrorAssistantId = inFlightId;
+                }
             }
-            LlmProvider provider = llmProviderFactory.getProvider(config, providerType);
-            log.info("PROVIDER → type={} baseUrl={}", provider.type(),
-                config == null ? "(mock)" : abbreviate(config.baseUrl(), 60));
-
-            // 4) 调 LlmAgentLoop
-            AgentState state = null;
-            // [mid-turn-align] loop 实例在 try 前声明：error 分支（run() 抛异常时 state 赋值未完成、恒 null）
-            //   经 loop.injectedQueuedMessages() 逃生门重新 enqueue 回队列（见 error 分支）。
-            LlmAgentLoop loop = null;
-            try {
-                // Phase 6·s02.6: 注入 wsTemplate + session + userMessageId,
-                //   让 LlmAgentLoop 在 OpenAiSdkProvider 解析 chunk 时**立即推 STOMP** (真流式).
-                loop = loopProvider.getObject();
-                loop.setStreamContext(wsTemplate, sessionId, userMessageId);
-                // STREAM-P1-FIX: 真实注入 token budget / query config
-                //   不再是 setXxx 死代码 - 实际进 LlmAgentLoop.run() 的 loop() 内每轮 check
-                if (tokenBudgetChecker != null) loop.setTokenBudgetChecker(tokenBudgetChecker);
-                if (queryConfig != null) loop.setQueryConfig(queryConfig);
-                // FIX-R2-1 + FIX-R12-1: 真实注入 memory / recovery 依赖
-                if (memoryStorage != null) loop.setMemoryStorage(memoryStorage);
-                if (memoryPrefetcher != null) loop.setMemoryPrefetcher(memoryPrefetcher);
-                if (claudemdEngine != null) loop.setClaudemdEngine(claudemdEngine);
-                if (maxTokensHandler != null) loop.setMaxTokensHandler(maxTokensHandler);
-                if (transientErrorHandler != null) loop.setTransientErrorHandler(transientErrorHandler);
-                log.info("AGENT stream wired: budget={} config={} mem={} memPref={} maxTok={} transient={}",
-                    tokenBudgetChecker != null, queryConfig != null,
-                    memoryStorage != null, memoryPrefetcher != null,
-                    maxTokensHandler != null, transientErrorHandler != null);
-                String userPrompt = req != null ? req.content() : null;
-                if (userPrompt == null || userPrompt.isBlank()) {
-                    userPrompt = lastUserContent(loadRecentHistory(sessionId, HISTORY_LIMIT));
-                }
-                // [Phase3 @引用文件] 从 content 里的 @token（@path / @"path with space" · 用户 @ 提及字面）解析
-                //   绑定项目内相对路径 → 读全文拼进本轮 user 文本（对齐 CC @file 上下文注入；
-                //   越界/缺失/超限 skip + warn fail loud，不阻断发送；@token 原文已含在 content 里，气泡展示/落库不变）
-                userPrompt = appendReferencedFiles(userPrompt, sessionId);
-                log.info("AGENT start: prompt={}chars tools={}",
-                    userPrompt == null ? 0 : userPrompt.length(),
-                    toolRegistry == null ? 0 : toolRegistry.all().size());
-                // [attachments-v2 Step2] 单次请求附件上限 50（对齐前端契约；防超大请求体）
-                if (req != null && req.attachments() != null
-                        && req.attachments().size() > MAX_ATTACHMENTS_PER_REQUEST) {
-                    throw new ValidationException("一次最多发送 " + MAX_ATTACHMENTS_PER_REQUEST + " 个附件");
-                }
-                // [A1 · attachment-multimodal] 消费请求附件：contentId → ImageAttachmentStore
-                //   读缓存补全 base64/mediaType（直传 base64 原样保留），组装可消费附件列表透传 LlmAgentLoop。
-                List<AttachmentRequest> attachments = resolveAttachments(sessionId,
-                    req != null ? req.attachments() : null);
-                // [A5 · 限额闸门] 媒体限额校验：5MB base64 硬校验（超限压缩，失败拒绝）+ 100 项/请求裁剪（保最新）
-                //   对齐 CC apiLimits.ts:19/94 + imageValidation.ts:90-102 + claude.ts:956 stripExcessMediaItems。
-                //   校验入口：ChatService 消费附件处（A1 resolveAttachments 补全 base64 后、透传 LlmAgentLoop 前）。
-                attachments = MediaLimitGuard.guard(attachments);
-                // [附件双模式 · 统一附件表 contentId] 回写 user_attachments：resolveAttachments 已把 path/upload
-                //   大文件附件注册附件表并分配 contentId（createUserMessage 落库时 path 附件 contentId 未知 →
-                //   当时快照 contentId=null）→ 此处把<b>已解析附件快照（含新 contentId）</b>全量覆盖回写
-                //   user_attachments（对齐 updateUserImagePasteIds 回写范式：消息本体已由 controller createUserMessage
-                //   落库，本回写仅 UPDATE user_attachments 列）。≤5MB base64 图无 contentId 保持 null（imagePasteIds
-                //   链路不变）；url 为出站投影不落库。messageService 为 @Autowired(required=false) 必须判 null。
-                if (messageService != null && !attachments.isEmpty()) {
-                    try {
-                        messageService.updateUserAttachments(userMessageId, userAttachmentSnapshotOf(attachments));
-                    } catch (Exception e) {
-                        log.warn("[attachments] 回写 user 消息 user_attachments 失败: userMessageId={} err={}",
-                            userMessageId, e.toString());
-                    }
-                }
-                // [ER-IMP-02 · R-TOK] 主线程 agentId 传 null 对齐 CC 主线程语义：
-                // CC query.ts:1311 checkTokenBudget(budgetTracker!, toolUseContext.agentId, ...)
-                // 主线程 toolUseContext.agentId=undefined（query.ts:342 if (!toolUseContext.agentId)
-                // 主线程专属 gate）→ 走续跑逻辑；恒传 sessionUuid 会使 checkTokenBudget 首行
-                // if (agentId || ...) 命中 → 主线程首迭代 StopDecision → MAX_OUTPUT_TOKENS break。
-                // 主会话（agentId==null）注册 gate（LlmAgentLoop:1556 sessionAgentStateRegistry）、
-                // tool_use_summary（:3655-3661 gate agentId==null）、skill dedup agentKey
-                // （:2482 主线程 agentKey=""）随之激活 —— 均为 CC 对齐休眠路径。
-                // [session-id-short] sessionId 已 short 直传 RunRequest.session（不再 parseSessionUuid）
-                // [V44] 有效初始权限模式 = per-call ?? 会话 override（session.permission_mode 列）：
-                //   per-call（HTTP 请求体 SendMessageRequest.permissionMode）恒胜会话 override；两者共享
-                //   CLI 槽（resolver 链第 2 优先级，恒胜 settings 槽）——实现「会话初始化传 permissionModeCli」。
-                String perCallPermissionMode = req != null ? req.permissionMode() : null;
-                String effectivePermissionMode =
-                    resolveEffectivePermissionMode(session, perCallPermissionMode);
-                if (log.isInfoEnabled()) {
-                    log.info("PERMISSION MODE → 有效初始权限模式: per-call={} session.override={} → effective={}"
-                            + "（per-call 恒胜会话 override；null 回落全局 settings/permissions.defaultMode）",
-                        perCallPermissionMode, session.getPermissionMode(), effectivePermissionMode);
-                }
-                // [实时落库 2026-09-03] run 前武装实时落库 SPI：装配了落库能力（messageService != null）才
-                //   武装（非 Spring 单测不武装 → loop mock 不消费 enabler，零行为变化）。doRun 历史注入完成、
-                //   prePersistedMessageIds 已登记后回调 → armRealTimePersist setAppendListener，其后每条
-                //   新 append（=消息完整产出）即实时落 DB（对齐 CC recordTranscript）。传该轮 userMessageId
-                //   作 DB user_message_id 归属根（对齐原 replayAndPersist lastUserMessageId 初值语义）。
-                if (messageService != null) {
-                    loop.setPostHistoryPersistEnabler(state2 ->
-                        armRealTimePersist(state2, sessionId, streamTopic, wsTemplate, userMessageId));
-                }
-                state = loop.run(RunRequest.session(
-                    userPrompt, sessionId, null, config, modelName, null,
-                    req != null ? req.appendSystemPrompt() : null,   // [RES-SP31] 接线：HTTP 请求体追加指令
-                    fallbackModel,                                     // [DEC-RV-02 · FIX-16] per-call 降级模型（请求体 → settings.fallbackModelName → RunRequest.fallbackModel → QueryParams → RetryOptions）
-                    effectivePermissionMode,                           // [V44] 有效初始权限模式（per-call ?? 会话 override → RunRequest.permissionModeCli → InitialPermissionModeResolver.Input CLI 槽）
-                    req != null && Boolean.TRUE.equals(req.dangerouslySkipPermissions()), // [RV-11 · REV-FIX-2] dangerouslySkip（HTTP 请求体 → RunRequest.dangerouslySkipPermissions）
-                    taskBudgetOf(),                                  // [IMP2-10 · MISS-2] taskBudget 生产注入（OD-13: 配置→默认值）
-                    req != null ? req.jsonSchema() : null,           // [IMP-HR-08 · OPD-WF6-01-06-?-3] 主循环 structured output jsonSchema 透传（HTTP 请求体 → RunRequest.jsonSchema → LlmAgentLoop 注册 enforcement）
-                    attachments));                                   // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
-            } catch (Exception e) {
-                log.error("AGENT failed: model={}", modelName, e);
-                // [实时落库 2026-09-03] error 分支删除 reenqueueInjectedQueuedMessages（对齐 CC
-                //   messageQueueManager.ts：无 requeue API，消费即移除；query 崩溃已消费命令不自动回队）。
-                //   已注入命令若已 append 已实时落库留痕（DB + 前端气泡）；未注入仍在队列由 CronIdleExecutor
-                //   自然消费——规则十二显式失败：不再静默重放。
-                String errorCode = (e instanceof InterruptedException) ? "cancelled" : "llm_error";
-                String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
-                // [reflect-blocker] 终态事件同源（error 分支）：run() 抛异常 → state 恒 null（赋值未完成），
-                //   无法经 state 取末条 assistant id；sessionAgentStateRegistry 持当前轮在飞 state
-                //   （LlmAgentLoop:2013-2017 run() 流式开始前注册），currentAssistantMessageId() =
-                //   prepareAssistantMessageId() 结果（LlmAgentLoop:4209），正是流式 chunk 事件同源 id →
-                //   优先取在飞 id，回落 task 占位（罕见：run() 在注册前即抛的 setup 失败仍幽灵气泡，可接受）。
-                String realErrorAssistantId = task.assistantMessageId;
-                if (sessionAgentStateRegistry != null) {
-                    AgentState inFlight = sessionAgentStateRegistry.get(sessionId);
-                    String inFlightId = inFlight != null ? inFlight.currentAssistantMessageId() : null;
-                    if (inFlightId != null) {
-                        realErrorAssistantId = inFlightId;
-                    }
-                }
-                if (log.isDebugEnabled()) {
-                    log.debug("ChatService: error 分支终态事件 assistantId 同源解析 real={} placeholder={} source={}",
-                        realErrorAssistantId, task.assistantMessageId,
-                        realErrorAssistantId.equals(task.assistantMessageId) ? "task-placeholder" : "registry-inflight");
-                }
-                sendAndLog(wsTemplate, streamTopic,
-                    MessageErrorEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realErrorAssistantId,
-                        errorCode, errorMsg),
-                    "error code=" + errorCode + " msg=" + abbreviate(errorMsg, 200));
-                sendAndLog(wsTemplate, streamTopic,
-                    SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
-                    "status=idle (after error)");
-                inProgress.remove(sessionId, task);
-                return;
-            }
-
-            // [reflect-blocker] 终态事件同源改造：流式 chunk/tool_call 携带真实 turnAssistantId 建气泡
-            //   （LlmAgentLoop:4741 chunk / :4841 tool_call），message.complete/cancelled/replay_error
-            //   必须同源——否则前端 assistantGroups.get(占位)=undefined 静默 no-op（气泡永不 locked、
-            //   streaming 光标不停）、message.error 走 assistantGroupFor(占位) 建幽灵气泡。
-            //   ChatTask.assistantMessageId 是 final 占位（构造 'msg-pending-xxx' 后不可改，ChatTask:1568
-            //   final 字段）→ 不能用 task 变异，改用局部变量：末条 assistant 真实 id（=turnAssistantId，
-            //   lastAssistantMessage 末向前扫描，:869）优先，无 assistant（取消过早未产出）回落占位。
-            //   与 replayAndPersist final 落库同源契约（LlmAgentLoop:6055-6058 三处同源）。
-            ChatMessageDto lastAsst = lastAssistantMessage(state);
-            String realAssistantId = (lastAsst != null && lastAsst.id() != null)
-                ? lastAsst.id() : task.assistantMessageId;
             if (log.isDebugEnabled()) {
-                log.debug("ChatService: 终态事件 assistantId 同源解析 real={} placeholder={} source={}",
-                    realAssistantId, task.assistantMessageId,
-                    (lastAsst != null && lastAsst.id() != null) ? "lastAssistantMessage" : "task-placeholder");
+                log.debug("ChatService: error 分支终态事件 assistantId 同源解析 real={} placeholder={} source={}",
+                    realErrorAssistantId, task.assistantMessageId,
+                    realErrorAssistantId.equals(task.assistantMessageId) ? "task-placeholder" : "registry-inflight");
             }
-
-            // [实时落库 2026-09-03] run() 返回后收口：解除 appendListener（防泄漏/下轮误触发）+ queued-user
-            //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
-            //   批量已删——消息已实时落库，此处不再遍历 state.rawMessages()。
-            if (state != null) {
-                // [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks / getRemainingResults 收尾]
-                //   非 NORMAL 终态(用户停止 ABORTED / STREAM_ERROR / MAX_TURNS 等)时，为"有 tool_use 但
-                //   无对应 tool_result"的孤儿工具补 synthetic is_error（content 以 "Error" 开头 → 落库 isError=true）
-                //   ——此刻 appendListener 仍武装，append 即持久化补写 DB tool_call.result + STOMP 推 tool_result，
-                //   根治"被取消/中断的工具卡永久执行中"(历史 F5 复现)。正常 NORMAL 收尾工具必已由执行器补结果，跳过。
-                if (state.exitReason() != AgentState.ExitReason.NORMAL) {
-                    repairOrphanToolResults(state, sessionId);
-                }
-                state.clearAppendListener();
-                // [SM/compact 对齐 CC] 同步解除压缩落库监听（防陈旧 PersistCtx/sessionId 泄漏到下轮）
-                state.clearCompactPersistListener();
-                persistInjectedQueuedMessages(state, sessionId);
-            }
-
-            // 5) cancel 检查
-            if (task.cancel.get()) {
-                log.info("AGENT cancelled by user");
-                // [mid-turn-align] cancel 分支 queued-user 已由上方收口 persistInjectedQueuedMessages
-                //   幂等补落（run 返回后即执行，先于本 cancel 检查），此处不再重复调用。
-                sendAndLog(wsTemplate, streamTopic,
-                    MessageCancelledEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realAssistantId),
-                    "cancelled");
-                sendAndLog(wsTemplate, streamTopic,
-                    SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
-                    "status=idle (cancelled)");
-                inProgress.remove(sessionId, task);
-                return;
-            }
-
-            log.info("AGENT done: turns={} exit={} totalChars={}",
-                state.turnCount(), state.exitReason(),
-                state.rawMessages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
-
-            // 6) 消息已实时落库（appendListener → persistAppendedMessage，run 全程逐条落），无 run 末批量。
-            //   原 replayAndPersist 已删：本处仅收口（clearAppendListener + persistInjectedQueuedMessages
-            //   幂等兜底）已在上方执行。queued-user 原位顺序 = append 即落（对齐 CC messages.ts:3782 消费时落库）。
-
-            // 7) message.complete · [V-TOK 实施] 照抄 CC result 事件结构（真实 usage/cost/上下文，
-            //    替代 mock 42）——usage = 末条 assistant 的 provider usage；total_cost_usd/modelUsage =
-            //    state 会话累计（LlmAgentLoop 每轮累加）；上下文三字段常驻每轮推（对齐 CC StatusLine）。
-            //   [cron-complete] 装配提取到 publishCompleteEvent（cron 触发链路复用，单点防漂移）
-            String finalContent = state.lastAssistant() == null ? "" : state.lastAssistant();
-            publishCompleteEvent(sessionId, userMessageId, state, streamTopic, wsTemplate,
-                turnStartMs, realAssistantId);
-
-            // 7.1) [V-TOK 实施] 会话累计持久化 save（写 sessions 表 total_cost_yuan + model_usage_json，
-            //     跨 turn 权威；restore 在 LlmAgentLoop 会话启动时做 —— save/restore 分属两处各一）。
-            if (costTracker != null) {
-                costTracker.saveCurrentSessionCosts(sessionId, state);
-            }
-
-            // 8) status=idle
+            sendAndLog(wsTemplate, streamTopic,
+                MessageErrorEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realErrorAssistantId,
+                    errorCode, errorMsg),
+                "error code=" + errorCode + " msg=" + abbreviate(errorMsg, 200));
             sendAndLog(wsTemplate, streamTopic,
                 SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
-                "status=idle");
-
+                "status=idle (after error)");
             inProgress.remove(sessionId, task);
-
-            // 9) 标题生成（首条）
-            maybeGenerateTitle(session, userMessageId, finalContent, wsTemplate);
-
-            log.info("DONE: turns={} exit={}", state.turnCount(), state.exitReason());
-        } finally {
-            RequestContext.clear();
+            return;
         }
+
+        // [reflect-blocker] 终态事件同源改造：流式 chunk/tool_call 携带真实 turnAssistantId 建气泡
+        //   （LlmAgentLoop:4741 chunk / :4841 tool_call），message.complete/cancelled/replay_error
+        //   必须同源——否则前端 assistantGroups.get(占位)=undefined 静默 no-op（气泡永不 locked、
+        //   streaming 光标不停）、message.error 走 assistantGroupFor(占位) 建幽灵气泡。
+        //   ChatTask.assistantMessageId 是 final 占位（构造 'msg-pending-xxx' 后不可改，ChatTask:1568
+        //   final 字段）→ 不能用 task 变异，改用局部变量：末条 assistant 真实 id（=turnAssistantId，
+        //   lastAssistantMessage 末向前扫描，:869）优先，无 assistant（取消过早未产出）回落占位。
+        //   与 replayAndPersist final 落库同源契约（LlmAgentLoop:6055-6058 三处同源）。
+        ChatMessageDto lastAsst = lastAssistantMessage(state);
+        String realAssistantId = (lastAsst != null && lastAsst.id() != null)
+            ? lastAsst.id() : task.assistantMessageId;
+        if (log.isDebugEnabled()) {
+            log.debug("ChatService: 终态事件 assistantId 同源解析 real={} placeholder={} source={}",
+                realAssistantId, task.assistantMessageId,
+                (lastAsst != null && lastAsst.id() != null) ? "lastAssistantMessage" : "task-placeholder");
+        }
+
+        // [实时落库 2026-09-03] run() 返回后收口：解除 appendListener（防泄漏/下轮误触发）+ queued-user
+        //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
+        //   批量已删——消息已实时落库，此处不再遍历 state.rawMessages()。
+        if (state != null) {
+            // [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks / getRemainingResults 收尾]
+            //   非 NORMAL 终态(用户停止 ABORTED / STREAM_ERROR / MAX_TURNS 等)时，为"有 tool_use 但
+            //   无对应 tool_result"的孤儿工具补 synthetic is_error（content 以 "Error" 开头 → 落库 isError=true）
+            //   ——此刻 appendListener 仍武装，append 即持久化补写 DB tool_call.result + STOMP 推 tool_result，
+            //   根治"被取消/中断的工具卡永久执行中"(历史 F5 复现)。正常 NORMAL 收尾工具必已由执行器补结果，跳过。
+            if (state.exitReason() != AgentState.ExitReason.NORMAL) {
+                repairOrphanToolResults(state, sessionId);
+            }
+            state.clearAppendListener();
+            // [SM/compact 对齐 CC] 同步解除压缩落库监听（防陈旧 PersistCtx/sessionId 泄漏到下轮）
+            state.clearCompactPersistListener();
+            persistInjectedQueuedMessages(state, sessionId);
+        }
+
+        // 5) cancel 检查
+        if (task.cancel.get()) {
+            log.info("AGENT cancelled by user");
+            // [mid-turn-align] cancel 分支 queued-user 已由上方收口 persistInjectedQueuedMessages
+            //   幂等补落（run 返回后即执行，先于本 cancel 检查），此处不再重复调用。
+            sendAndLog(wsTemplate, streamTopic,
+                MessageCancelledEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realAssistantId),
+                "cancelled");
+            sendAndLog(wsTemplate, streamTopic,
+                SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
+                "status=idle (cancelled)");
+            inProgress.remove(sessionId, task);
+            return;
+        }
+
+        log.info("AGENT done: turns={} exit={} totalChars={}",
+            state.turnCount(), state.exitReason(),
+            state.rawMessages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
+
+        // 6) 消息已实时落库（appendListener → persistAppendedMessage，run 全程逐条落），无 run 末批量。
+        //   原 replayAndPersist 已删：本处仅收口（clearAppendListener + persistInjectedQueuedMessages
+        //   幂等兜底）已在上方执行。queued-user 原位顺序 = append 即落（对齐 CC messages.ts:3782 消费时落库）。
+
+        // 7) message.complete · [V-TOK 实施] 照抄 CC result 事件结构（真实 usage/cost/上下文，
+        //    替代 mock 42）——usage = 末条 assistant 的 provider usage；total_cost_usd/modelUsage =
+        //    state 会话累计（LlmAgentLoop 每轮累加）；上下文三字段常驻每轮推（对齐 CC StatusLine）。
+        //   [cron-complete] 装配提取到 publishCompleteEvent（cron 触发链路复用，单点防漂移）
+        String finalContent = state.lastAssistant() == null ? "" : state.lastAssistant();
+        publishCompleteEvent(sessionId, userMessageId, state, streamTopic, wsTemplate,
+            turnStartMs, realAssistantId);
+
+        // 7.1) [V-TOK 实施] 会话累计持久化 save（写 sessions 表 total_cost_yuan + model_usage_json，
+        //     跨 turn 权威；restore 在 LlmAgentLoop 会话启动时做 —— save/restore 分属两处各一）。
+        if (costTracker != null) {
+            costTracker.saveCurrentSessionCosts(sessionId, state);
+        }
+
+        // 8) status=idle
+        sendAndLog(wsTemplate, streamTopic,
+            SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
+            "status=idle");
+
+        inProgress.remove(sessionId, task);
+
+        // 9) 标题生成（首条）
+        maybeGenerateTitle(session, userMessageId, finalContent, wsTemplate);
+
+        log.info("DONE: turns={} exit={}", state.turnCount(), state.exitReason());
     }
 
     /**

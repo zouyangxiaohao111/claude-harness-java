@@ -89,7 +89,8 @@ class SkillRegistryDbEnabledIntegrationTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null（本类各用例只验 DB enabled 主控覆盖，不涉会话）
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("真实 DB enabled=0 覆盖 SKILL.md 默认 enabled=true → isCommandEnabled=false → 排除（禁用真实生效）")
             .doesNotContain("db-disabled-integration");
     }
@@ -104,7 +105,8 @@ class SkillRegistryDbEnabledIntegrationTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        Command hit = registry.getAllCommands().stream()
+        // [批 3c] 无会话 → 显式 null
+        Command hit = registry.getAllCommands(null).stream()
             .filter(c -> "db-id-integration".equals(c.getName()))
             .findFirst().orElseThrow();
         assertThat(hit.getEnabled()).as("真实 DB enabled=1 覆盖保留").isTrue();

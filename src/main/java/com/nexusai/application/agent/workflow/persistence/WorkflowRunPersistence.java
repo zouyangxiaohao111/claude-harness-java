@@ -45,7 +45,8 @@ import java.util.function.Supplier;
  *
  * <p><b>runsDir 单一源</b>（persistence.ts:27-34 getRunsDir）：与 ports.ts journalStore 同根
  * （{@code <projectRoot>/<WORKFLOW_RUNS_DIR>} = {@code <projectRoot>/.{appName}/workflow-runs}）。本类实例持有 {@code runsDirProvider}
- * —— 生产 = {@code WorkflowPortsImpl.defaultRunsDir} 等价（会话绑定项目根）；测试注入 tmpdir。
+ * —— 生产 = {@code WorkflowPortsImpl::defaultRunsDir} 等价（会话绑定项目根；批 3c 因本类无会话来源
+ * 由 {@code WorkflowServiceImpl} 显式传 {@code null} → 进程默认）；测试注入 tmpdir。
  *
  * <p><b>Java 侧 on-disk 格式说明（显式决策）</b>：{@code run.status} 枚举按 Jackson 默认序列化
  * （{@code COMPLETED} 大写）；Java 自写自读同一 mapper 内部一致，与 CC 的小写 status 字符串
@@ -77,7 +78,14 @@ public final class WorkflowRunPersistence {
         return m;
     }
 
-    /** runsDir 单一源 · 生产 = WorkflowPortsImpl.defaultRunsDir 等价；测试注入 tmpdir。 */
+    /** runsDir 单一源 · 生产 = {@code WorkflowPortsImpl::defaultRunsDir}（经 {@code WorkflowServiceImpl}
+     *  显式传 {@code null} 会话 → 进程默认）；测试注入 tmpdir。
+     *
+     *  <p><b>[批 3c 已知边界] 无会话形参</b>：本类 runsDir 的<b>唯一</b>消费点是
+     *  {@link #attachRunStatePersistence} 的 run_done 总线订阅者（{@code bus.subscribe(...)} 回调，
+     *  跑在发事件线程，手上只有 {@code runId}，没有任何会话来源）。改接缝为会话感知在本类<b>无消费者</b>
+     *  —— {@code WorkflowServiceImpl} 侧已把会话感知解析器收拢为显式 {@code null}，本类保持无参
+     *  Supplier（也避免破坏 {@code WorkflowRunPersistenceTest} 的既有构造调用）。 */
     private final Supplier<String> runsDirProvider;
 
     /**

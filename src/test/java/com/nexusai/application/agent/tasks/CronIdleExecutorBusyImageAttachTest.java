@@ -4,7 +4,6 @@ import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.RunRequest;
 import com.nexusai.application.agent.tasks.NotificationQueue.Priority;
 import com.nexusai.application.agent.tasks.NotificationQueue.QueueItem;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.session.dto.AttachmentRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -52,7 +51,6 @@ class CronIdleExecutorBusyImageAttachTest {
     @AfterEach
     void tearDown() {
         LlmAgentLoop.markIdle(CronIdleExecutor.GLOBAL_SESSION_KEY);
-        RequestContext.clear();
     }
 
     @Test

@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.attachment;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,7 +37,7 @@ import java.util.stream.Stream;
  *   <li>id 每会话独立自增从 1（CC {@code PastedContent.id} 顺序数字 id，config.ts:55）</li>
  *   <li>写盘 {@code FileChannel.force} 刷盘（data-sync 语义，防「上传成功但字节未落盘」静默丢数据）</li>
  *   <li>失败返回 null 不抛异常（CC storeImage catch → null，imageStore.ts:75-78）</li>
- *   <li>会话解析 显式 sessionId → MDC（{@link RequestContext#sessionId()}）→ 'unknown' 兜底</li>
+ *   <li>会话解析 显式 sessionId → 'unknown' 兜底（[批 3c] 已删原 MDC 第二源）</li>
  * </ul>
  *
  * <p>非 Spring 组件（抽象基类不注册）；子类 {@code @Component} 继承。锁为实例级
@@ -53,7 +52,7 @@ public abstract class AttachmentStoreBase<T> {
     /** 每会话内存索引上限 · 对齐 CC imageStore.ts:10 {@code MAX_STORED_IMAGE_PATHS=200}。 */
     protected static final int MAX_STORED_PATHS = 200;
 
-    /** 无会话兜底桶名（cron/后台无 MDC 时，等价 CC STATE.sessionId 恒存在）。 */
+    /** 无会话兜底桶名（cron/后台调用方未显式传会话时，等价 CC STATE.sessionId 恒存在）。 */
     protected static final String UNKNOWN_SESSION = "unknown";
 
     /** 锁：保护 sessions 与 nextIds 的复合操作（evict + put、取桶 + 增删）。 */
@@ -85,7 +84,7 @@ public abstract class AttachmentStoreBase<T> {
     /**
      * 存储目录 · {@code {configHome}/{cacheDirName}/{sessionId}}。
      *
-     * @param sessionId 会话 id（null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      */
     protected Path storeDir(String sessionId) {
         return Paths.get(NexusaiPaths.getAppConfigHomeDir(), cacheDirName(), resolveSessionId(sessionId));
@@ -216,16 +215,18 @@ public abstract class AttachmentStoreBase<T> {
     }
 
     /**
-     * 会话解析：显式参数 → MDC（{@link RequestContext#sessionId()}）→ 'unknown' 兜底。
-     * CC 恒有会话（STATE.sessionId），Java 后端 cron/后台线程可能无 MDC，归入 'unknown' 桶。
+     * 会话解析：显式参数 → 'unknown' 兜底。
+     * CC 恒有会话（STATE.sessionId），Java 后端 cron/后台线程可能无会话，归入 'unknown' 桶。
+     *
+     * <p>[批 3c] 会话来源显式化：唯一源 = 形参 {@code sessionId}；⛔ 已删原第二源裸 MDC 读点 ——
+     * 该读点在附件 REST / 后台线程上恒空或读到线程复用的残留会话 id（第三态），显式传参才可归因。
+     * 调用方缺会话即归 'unknown' 桶（既有兜底语义）。
+     *
+     * @param sessionId 会话 id（null/blank → {@link #UNKNOWN_SESSION}）
      */
     protected String resolveSessionId(String sessionId) {
         if (sessionId != null && !sessionId.isBlank()) {
             return sessionId;
-        }
-        String fromMdc = RequestContext.sessionId();
-        if (fromMdc != null && !fromMdc.isBlank()) {
-            return fromMdc;
         }
         return UNKNOWN_SESSION;
     }

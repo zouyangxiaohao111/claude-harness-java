@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.attachment;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
-import com.nexusai.common.RequestContext;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -138,7 +137,7 @@ public final class ImageAttachmentStore extends AttachmentStoreBase<ImageAttachm
      * {@code join(getClaudeConfigHomeDir(), 'image-cache', getSessionId())}；Java 写入基址
      * 经 {@link NexusaiPaths#getAppConfigHomeDir()}（决策 D1 自有根，见基类 {@code storeDir}）。
      *
-     * @param sessionId 会话 id（null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      * @return {@code {nexusaiConfigHome}/image-cache/{sessionId}}
      */
     public Path getImageStoreDir(String sessionId) {
@@ -176,7 +175,7 @@ public final class ImageAttachmentStore extends AttachmentStoreBase<ImageAttachm
     /**
      * 落盘单张图片（自动分配 id，显式会话）· {@link #store(String, String)} 的显式 sessionId 重载。
      *
-     * @param sessionId 会话 id（null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      * @param base64    base64 图片内容
      * @param mediaType MIME 类型
      * @return 落盘结果；失败返回 null
@@ -195,7 +194,7 @@ public final class ImageAttachmentStore extends AttachmentStoreBase<ImageAttachm
      * （对齐 CC imageStore.ts:64-68 {@code fh.writeFile(...,{encoding:'base64'})}），故先读全字节转
      * base64 再走既有 base64 落盘路径，不引入第二条写盘通道（行为对齐，接口同构）。
      *
-     * @param sessionId 会话 id（null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      * @param in        上传文件输入流（本方法内读取全部字节；调用方负责关闭）
      * @param size      声明大小（字节）；-1 表示未知，≥0 时读后核对，不一致 warn（fail loud，不静默）
      * @param filename  客户端原始文件名（仅日志使用；StoredImage 无此字段）
@@ -244,7 +243,7 @@ public final class ImageAttachmentStore extends AttachmentStoreBase<ImageAttachm
      * 写入 base64 解码字节到 {@code {storeDir}/{id}.{ext}}，data-sync，随后逐出 + 登记内存索引。
      * 失败不抛出，返回 null（CC imageStore.ts:75-78 {@code catch { logForDebugging; return null }}）。
      *
-     * @param sessionId 会话 id（null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      * @param id        图片 id（CC PastedContent.id）
      * @param base64    base64 图片内容
      * @param mediaType MIME 类型
@@ -331,7 +330,7 @@ public final class ImageAttachmentStore extends AttachmentStoreBase<ImageAttachm
      * 经本方法登记为「待注入」，由 LlmAgentLoop A4 在首个 user 消息构造时消费。
      * 幂等追加：同会话可多次登记（多 prompt 排队），drain 一次性取走并清空。
      *
-     * @param sessionId 会话 id（null/blank → MDC → 'unknown' 兜底）
+     * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      * @param images    本 prompt 附带的图片列表（含 id/base64/mediaType）；null/空 → no-op
      */
     public void registerPendingPromptImages(String sessionId, List<PastedImage> images) {

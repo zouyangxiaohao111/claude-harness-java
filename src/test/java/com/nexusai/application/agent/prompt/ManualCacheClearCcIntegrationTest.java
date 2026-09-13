@@ -143,7 +143,6 @@ class ManualCacheClearCcIntegrationTest {
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
         CacheSafeParamsHolder.clear();
-        com.nexusai.common.RequestContext.clear();
     }
 
     /** 注入全部 spy 协作器（main-thread 操作可观察）。 */
@@ -411,9 +410,9 @@ class ManualCacheClearCcIntegrationTest {
         //（CC caches.ts:84：clearSessionCaches 非压缩事件，覆盖 'compact' 为 'session_start'）
         ReflectionTestUtils.setField(controller, "claudemdEngine", CLAUDEMD_SPY);
         // 会话存在（clearInvokedSkills 路径可达；注册表内无 state → 各清理 debug skip 不抛）
-        com.nexusai.common.RequestContext.setSession("00000000-0000-0000-0000-00000000000c");
-
-        Object dto = controller.executeBuiltin("clear", null, null);
+        // [批 3c] 会话标识经**第 2 形参**显式传入（原经裸 MDC 会话槽，该槽已删）
+        //   ⚠ 形参序：executeBuiltin(String name, String sessionIdParam, ResumeExecuteRequest request)
+        Object dto = controller.executeBuiltin("clear", "00000000-0000-0000-0000-00000000000c", null);
 
         assertThat(dto).isNotNull();
         assertThat(COLLAPSE_RESETS.get())
@@ -444,7 +443,6 @@ class ManualCacheClearCcIntegrationTest {
         com.nexusai.application.agent.tasks.TaskFrameworkService tasks = mock(com.nexusai.application.agent.tasks.TaskFrameworkService.class);
         java.util.UUID bgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000aa");
         String sessionUuid = "00000000-0000-0000-0000-00000000000c";
-        com.nexusai.common.RequestContext.setSession(sessionUuid.toString());
         AgentState state = new AgentState("test-system-prompt");
         registry.register(sessionUuid, state);
         when(tasks.listAll()).thenReturn(List.of(new com.nexusai.application.agent.tasks.BackgroundTask(
@@ -456,7 +454,9 @@ class ManualCacheClearCcIntegrationTest {
         state.addInvokedSkill("bg-skill", "/s/bg.md", "c", bgAgent);
         state.addInvokedSkill("main-skill", "/s/main.md", "c", null);
 
-        controller.executeBuiltin("clear", null, null);
+        // [批 3c] 会话标识经**第 2 形参**显式传入（原经裸 MDC 会话槽，该槽已删）；
+        //   ⚠ 形参序：executeBuiltin(String name, String sessionIdParam, ResumeExecuteRequest request)
+        controller.executeBuiltin("clear", sessionUuid, null);
 
         assertThat(state.getInvokedSkillsForAgent(bgAgent)).hasSize(1);
         assertThat(state.getInvokedSkillsForAgent(null)).isEmpty();

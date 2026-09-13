@@ -77,11 +77,21 @@ public class GitStatusProvider {
     private volatile boolean gitStatusComputed = false;
 
     /**
-     * @param cwd    工作目录（null → 走 {@link CwdResolution#getCwd()} 统一入口；测试可注入临时目录）
+     * @param cwd    工作目录（null → 显式按「无会话」解析 {@link CwdResolution#getCwd(String)}；
+     *               测试可注入临时目录）
      * @param runner git 命令 runner（测试注入假实现）
      */
     public GitStatusProvider(Path cwd, GitRunner runner) {
-        this.cwd = cwd != null ? cwd : Path.of(CwdResolution.getCwd());
+        if (cwd != null) {
+            this.cwd = cwd;
+        } else {
+            // [批 3c 会话态显式化] 本类无会话入参 → 显式按「无会话」解析（跳过 sessionCwd/
+            //   boundProject 会话层，仅 override / 进程 user.dir 层）。
+            log.warn("[GitStatusProvider] 构造无 cwd 入参（无会话）→ git 锚定回落进程 user.dir={}；"
+                + "如需会话 cwd 须由调用方显式传入（new GitStatusProvider(Path.of(getCwd(sessionId)))）",
+                System.getProperty("user.dir"));
+            this.cwd = Path.of(CwdResolution.getCwd(null));
+        }
         this.runner = runner != null ? runner : DEFAULT_RUNNER;
     }
 
@@ -91,15 +101,21 @@ public class GitStatusProvider {
     }
 
     /**
-     * 便捷构造：默认 cwd + 真实 GitCommandRunner。
+     * 便捷构造：无 cwd 入参 + 真实 GitCommandRunner（显式按「无会话」解析 cwd）。
      *
      * <p><b>WF-1B / G6 / DEL-03</b>：对齐 CC {@code findGitRoot(getCwd())}（git.ts:222）——
-     * git 状态锚定从 {@link CwdResolution#getCwd()} 统一入口取 cwd（override ?? sessionCwd ??
-     * 绑定项目 ?? user.dir），替代旧 {@code Paths.get("").toAbsolutePath()}=user.dir 直读。
-     * 绑定项目/worktree 场景取对仓库；无会话上下文时回落 user.dir（与进程启动 cwd 等价）。
+     * git 状态锚定取 cwd 统一入口解析值，替代旧
+     * {@code Paths.get("").toAbsolutePath()}=user.dir 直读。
+     *
+     * <p><b>[批 3c 会话态显式化]</b>：本重载<b>无会话入参</b>（{@code GitStatusProvider} 不持
+     * sessionId），故显式按「无会话」解析（{@code getCwd(null)}：跳过 sessionCwd/boundProject
+     * 会话层，仅 override / 进程 user.dir 层）= 旧实现「MDC 为空」分支等价语义。会话 cwd 须由
+     * 调用方显式传入 {@link #GitStatusProvider(Path)}（会话态调用方
+     * {@code SessionGitStatusRegistry}/{@code LlmAgentLoop} 应取
+     * {@code CwdResolution.getCwd(sessionId)} 后传入）。
      */
     public GitStatusProvider() {
-        this(Path.of(CwdResolution.getCwd()), DEFAULT_RUNNER);
+        this(null, DEFAULT_RUNNER);
     }
 
     /**

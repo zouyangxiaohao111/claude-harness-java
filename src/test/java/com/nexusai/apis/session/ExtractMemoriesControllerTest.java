@@ -4,7 +4,6 @@ import com.nexusai.application.agent.memory.ConsolidationLock;
 import com.nexusai.application.agent.memory.ConsolidationPrompt;
 import com.nexusai.application.agent.memory.MemoryStorage;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -59,12 +58,6 @@ class ExtractMemoriesControllerTest {
         memoryStorage = new MemoryStorage(tempDir);
     }
 
-    @AfterEach
-    void tearDown() {
-        // 批 3a：会话标识走显式 query（不再依赖 MDC）；仍清理 MDC 防个别反向实验用例残留
-        com.nexusai.common.RequestContext.clear();
-    }
-
     /**
      * 构造端点全链：真实 MemoryStorage（记忆目录=tempDir）+ 真实 CwdResolution 回落 user.dir。
      *
@@ -101,8 +94,8 @@ class ExtractMemoriesControllerTest {
         //   transcriptDir, '') —— 前端 POST 拿到完整手动 dream prompt 注入会话运行。若 200 但缺前缀头/
         //   缺 4 阶段指引 → 注入的是残缺 prompt，dream 无法按 CC 语义执行。
         String memoryRoot = tempDir.toString();
-        // [S2] transcriptDir = getProjectDir(getOriginalCwd()) —— config-home 项目 slug 目录
-        //   （测试无 MDC sessionId → CwdResolution 回落 user.dir，与端点同源派生）
+        // [S2] transcriptDir = getProjectDir(getOriginalCwd(sessionId)) —— config-home 项目 slug 目录
+        //   （sess-dream-test 未绑 boundProject → CwdResolution 回落 user.dir，与端点同源派生）
         String transcriptDir = com.nexusai.application.agent.tool.SessionStorage
             .getProjectDir(java.nio.file.Path.of(System.getProperty("user.dir", "."))).toString();
 
@@ -163,9 +156,9 @@ class ExtractMemoriesControllerTest {
     @Test
     @DisplayName("[批 3a] POST /dream 缺 sessionId → 400（memoryRoot/transcriptDir 均 per-project，必须显式锚定）")
     void missingSessionId_400() throws Exception {
-        // WHY（缺值策略 (a)）：旧实现无 sessionId 入参 → 读 RequestContext.sessionId()（裸 MDC），
-        //   MDC 第三态 = 上一请求残留的**别的会话** id ⇒ dream 锁会盖到别的项目的记忆目录上。
-        //   变异点：把 requireSessionId 改回 MDC 兜底 → 本用例红（200）。
+        // WHY（缺值策略 (a)）：旧实现无 sessionId 入参 → 读**裸 MDC 会话槽**（批 3c 已删除），
+        //   该槽第三态 = 上一请求残留的**别的会话** id ⇒ dream 锁会盖到别的项目的记忆目录上。
+        //   变异点：把 requireSessionId 改回兜底 → 本用例红（200）。
         mockMvc().perform(post("/api/agent/dream"))
             .andExpect(status().isBadRequest());
         mockMvc().perform(post("/api/agent/dream").param("sessionId", ""))
@@ -173,16 +166,17 @@ class ExtractMemoriesControllerTest {
     }
 
     @Test
-    @DisplayName("[批 3a 反向实验] transcriptDir 取显式 sessionId 的 boundProject，MDC 残留别的会话不生效")
+    @DisplayName("[批 3a 反向实验 · 批 3c 诱饵已删] transcriptDir 取显式 sessionId 的 boundProject（不得回落 user.dir）")
     void transcriptDir_usesExplicitSessionId_notMdc() throws Exception {
         // WHY（规则九）：CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd())。旧实现从
-        //   裸 MDC 取会话 ⇒ MDC 第三态（上一请求残留的别的会话）会让 dream 去读**别的项目**的转录。
-        //   装置：给显式 sessionId 绑一个与 user.dir 不同的 boundProject，同时把 MDC 设成无关会话。
-        //   若实现回退读 MDC（或无参 getOriginalCwdLayer()），transcriptDir 会变成 user.dir 派生值 → 红。
+        //   裸 MDC 会话槽取会话 ⇒ 该槽第三态（上一请求残留的别的会话）会让 dream 去读**别的项目**的转录。
+        //   装置：给显式 sessionId 绑一个与 user.dir 不同的 boundProject。
+        //   若实现不用显式 sessionId（或回落 user.dir），transcriptDir 会变成 user.dir 派生值 → 红。
+        //   [批 3c] 语义消失：原装置中的「残留别的会话」诱饵随裸 MDC 会话槽删除而不可制造；
+        //   本用例现只剩「显式 sessionId 的 boundProject 生效、不得回落 user.dir」这一侧，仍具鉴别力。
         java.nio.file.Path explicitProject = tempDir.resolve("explicit-project");
         java.nio.file.Files.createDirectories(explicitProject);
         com.nexusai.common.SessionProjectRoot.setForSession("sess-dream-test", explicitProject.toString());
-        com.nexusai.common.RequestContext.setSession("sess-someone-else");   // MDC 残留（诱饵）
         try {
             String expectedTranscriptDir = com.nexusai.application.agent.tool.SessionStorage
                 .getProjectDir(explicitProject).toString();
@@ -196,7 +190,6 @@ class ExtractMemoriesControllerTest {
                     .getProjectDir(java.nio.file.Path.of(System.getProperty("user.dir", "."))).toString());
         } finally {
             com.nexusai.common.SessionProjectRoot.clearSession("sess-dream-test");
-            com.nexusai.common.RequestContext.clear();
         }
     }
 

@@ -458,11 +458,14 @@ class ContextAnalyzeServiceTest {
     @Test
     @DisplayName("IMP-CM-16: 生产构造接 ClaudemdEngine+ToolRegistry → memory/tools 真实计数（不再恒 0）")
     void productionConstructor_wiredToClaudemdEngineAndToolRegistry_memoryAndToolsNonEmpty() {
-        // memory 源：真实 ClaudemdEngine（getMemoryFiles(false) + filterInjectedMemoryFiles，mothCopse 关 → 原样返回）
+        // memory 源：真实 ClaudemdEngine（getMemoryFiles(false, sessionId) + filterInjectedMemoryFiles，
+        //   mothCopse 关 → 原样返回）
         MemoryFileInfo mem = MemoryFileInfo.of("/repo/CLAUDE.md", ClaudemdMemoryType.PROJECT,
             "## project\ncontent", null);
         ClaudemdEngine engine = mock(ClaudemdEngine.class);
-        when(engine.getMemoryFiles(false)).thenReturn(List.of(mem));
+        // [批 3c] 无会话 → 显式 null：生产 ContextAnalyzeService.resolveMemoryFiles 调
+        //   getMemoryFiles(false, null)（analyze 端点无会话入参），stub 必须同参
+        when(engine.getMemoryFiles(false, null)).thenReturn(List.of(mem));
         when(engine.filterInjectedMemoryFiles(any())).thenAnswer(inv -> inv.getArgument(0));
 
         // tools 源：真实 ToolRegistry（注册 built-in + MCP 工具各一，经 getTools(null) 投影）。

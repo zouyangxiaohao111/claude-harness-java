@@ -243,7 +243,9 @@ public final class CompactCommand {
                     // → resetContextCollapse + clearUserOnlyProviderCaches + resetGetMemoryFilesCache('compact')
                     // 全执行（merge 冲突解决时误改为 effectiveQuerySource()="compact" → gate=false
                     // → P0 缓存残留回归；IMP2-02 修复被覆盖）。
-                    PostCompactCleanup.runPostCompactCleanup();
+                    // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
+                    //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
+                    PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
                     // [SM-10] notifyCompaction 按 PROMPT_CACHE_BREAK_DETECTION 门控（DRIFT-9）·
                     //   CC compact.ts:67-72 `if (feature('PROMPT_CACHE_BREAK_DETECTION'))`
                     //   —— feature 关闭时不动 cache-read 基线（旧实现无条件调用）。
@@ -292,7 +294,9 @@ public final class CompactCommand {
                 ctx.clearUserContextCache().run();
                 // [IMP2-02] 无参门：runPostCompactCleanup()（compact.ts:118 无参调用）
                 // → gate=TRUE 全执行（旧实现传 "compact" → gate=false → 缓存残留）。
-                PostCompactCleanup.runPostCompactCleanup();
+                // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
+                    //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
+                    PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
                 log.info("[CompactCommand] 传统压缩成功: preTokens={} postTokens={} summary={}",
                     result.preCompactTokenCount(), result.postCompactTokenCount(),
                     result.summaryMessages() != null ? result.summaryMessages().size() : 0);
@@ -539,7 +543,9 @@ public final class CompactCommand {
             SessionMemoryService.setLastSummarizedMessageId(ctx.sessionId(), null);
             // [IMP2-02] 无参门：runPostCompactCleanup()（compact.ts:201 无参调用）
             // → gate=TRUE 全执行（旧实现传 "compact" → gate=false → 缓存残留）。
-            PostCompactCleanup.runPostCompactCleanup();
+            // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
+                    //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
+                    PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
             CompactWarningState.suppressCompactWarning();
             ctx.clearUserContextCache().run();
 
@@ -653,8 +659,9 @@ public final class CompactCommand {
         // [IMP2-11 V2-S4] 对齐 CC compact.ts:98（无 querySource 传参 → undefined）：
         // 传 null 而非 effectiveQuerySource()（"compact" 字符串）——isMainThreadSource(null)=true，
         // cached 门控可进；time-based 不触发（microCompact.ts:427-433）。
+        // [批 3c] 会话键 = ctx.sessionId() 显式传入（本类已有显式会话；不读任何环境态会话槽）。
         return ctx.microCompactor()
-            .microcompactMessages(messages, null)
+            .microcompactMessages(messages, null, ctx.sessionId())
             .messages();
     }
 
@@ -740,7 +747,7 @@ public final class CompactCommand {
      *
      * <p>[IMP-A3-4 · OPD-CM5-A-17] upgradeMessage 已对齐实施：getUpgradeMessage('tip')
      * （compact.ts:234 + contextWindowUpgradeCheck.ts:35-47）→ {@link #getUpgradeMessageTip}，
-     * 当前模型设置读取自 {@link MicroCompactor#getMainLoopModel()}（getUserSpecifiedModelSetting
+     * 当前模型设置读取自 {@link MicroCompactor#getMainLoopModel(String)}（getUserSpecifiedModelSetting
      * 等价，LlmAgentLoop 每轮 turn 注入）+ 1M 访问判定（CLAUDE_CODE_DISABLE_1M_CONTEXT 门，
      * check1mAccess 等价；Java 后端恒 API/PAYG → 非订阅者恒有访问）。expandShortcut
      * （compact.ts:235-239）= {@link #getShortcutDisplay} 动态解析（'app:toggleTranscript' /
@@ -751,7 +758,7 @@ public final class CompactCommand {
      * @return "Compacted " + dimmed.join("\n")（compact.ts:247）
      */
     public static String buildDisplayText(CompactCommandContext ctx, String userDisplayMessage) {
-        return buildDisplayText(ctx.verbose(), userDisplayMessage);
+        return buildDisplayText(ctx.verbose(), userDisplayMessage, ctx.sessionId());
     }
 
     /**
@@ -759,16 +766,22 @@ public final class CompactCommand {
      *
      * <p>绑定源：{@link #DEFAULT_BINDINGS}（CC loadKeybindingsSync = 默认绑定 + 用户 keybindings.json
      * 覆盖；Java 后端无用户键位读取链路，KeybindingsCommand 仅生成模板 → 生产源仅默认绑定）。
-     * 模型源：[IMP-A3-4] {@link MicroCompactor#getMainLoopModel()}（当前 turn 有效模型 =
+     * 模型源：[IMP-A3-4] {@link MicroCompactor#getMainLoopModel(String)}（当前 turn 有效模型 =
      * getUserSpecifiedModelSetting 等价）+ env CLAUDE_CODE_DISABLE_1M_CONTEXT（1M 访问禁用门）。
+     *
+     * <p>[批 3c] {@code sessionId} 为<b>显式会话键</b>（读该会话桶的主循环模型；不读任何环境态
+     * 会话槽）。生产经 {@link #buildDisplayText(CompactCommandContext, String)} 传
+     * {@code ctx.sessionId()}；无会话上下文（测试缝）传 null → MicroCompactor 侧一次性 WARN 回落
+     * 默认桶。
      *
      * @param verbose           是否 verbose
      * @param userDisplayMessage CC userDisplayMessage（可选）
+     * @param sessionId         显式会话 ID（读该会话桶的主循环模型）
      * @return "Compacted " + dimmed.join("\n")
      */
-    public static String buildDisplayText(boolean verbose, String userDisplayMessage) {
+    public static String buildDisplayText(boolean verbose, String userDisplayMessage, String sessionId) {
         return buildDisplayText(verbose, userDisplayMessage, DEFAULT_BINDINGS,
-            MicroCompactor.getMainLoopModel(), is1mContextDisabled());
+            MicroCompactor.getMainLoopModel(sessionId), is1mContextDisabled());
     }
 
     /**

@@ -126,8 +126,8 @@ public class SkillCatalog {
      *
      * @return registry 过滤后的 model-invocable 命令列表（buildCatalog 同源）
      */
-    public List<Command> getModelInvocableCommands() {
-        return registry.getModelInvocableCommands();
+    public List<Command> getModelInvocableCommands(String sessionId) {
+        return registry.getModelInvocableCommands(sessionId);
     }
 
     /**
@@ -138,13 +138,13 @@ public class SkillCatalog {
      * <p><b>WHY</b>: SkillListingSentRegistry.decide 的 skill_listing 注入源（LlmAgentLoop.injectSkillListingForRun）——
      * CC 本地命令经 getSkillToolCommands（commands.ts:563-581），MCP 技能经 getMcpSkillCommands
      * （commands.ts:547-559）thread-in 合并（MCP live outside getCommands）。旧实现只注入
-     * {@link #getModelInvocableCommands()}（纯本地，MCP 缺失，偏离 CC attachments.ts:2680-2683）。
+     * {@link #getModelInvocableCommands(String)}（纯本地，MCP 缺失，偏离 CC attachments.ts:2680-2683）。
      *
      * @return 本地模型可调用命令 + MCP 技能的合并列表（本地优先，按 name 去重）；MCP 未注入
      *         （mcpServerService null / gate 关）时退回纯本地视图
      */
-    public List<Command> getModelInvocableCommandsForListing() {
-        return registry.getModelInvocableCommandsForListing();
+    public List<Command> getModelInvocableCommandsForListing(String sessionId) {
+        return registry.getModelInvocableCommandsForListing(sessionId);
     }
 
     /**
@@ -157,8 +157,8 @@ public class SkillCatalog {
      *
      * @return 格式化的目录文本（不超过字符预算）
      */
-    public String buildCatalog() {
-        return buildCatalog(getCharBudget(null));
+    public String buildCatalog(String sessionId) {
+        return buildCatalog(null, sessionId);
     }
 
     /**
@@ -167,8 +167,8 @@ public class SkillCatalog {
      *
      * @param contextWindowTokens 模型上下文窗口 tokens（可 null；null → 回落 DEFAULT_CHAR_BUDGET）
      */
-    public String buildCatalog(Integer contextWindowTokens) {
-        return formatListing(registry.getModelInvocableCommands(), getCharBudget(contextWindowTokens));
+    public String buildCatalog(Integer contextWindowTokens, String sessionId) {
+        return formatListing(registry.getModelInvocableCommands(sessionId), getCharBudget(contextWindowTokens));
     }
 
     /**

@@ -10,7 +10,6 @@ import com.nexusai.application.agent.tasks.BackgroundTaskRunner;
 import com.nexusai.application.agent.tasks.TaskType;
 import com.nexusai.application.agent.workflow.registry.WorkflowRegistry;
 import com.nexusai.application.agent.workflow.worktree.AgentWorktreeManager;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,7 +21,6 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.Supplier;
 
 /**
  * WorkflowPorts Spring 实现 · CC original: {@code createWorkflowPorts}
@@ -56,7 +54,18 @@ public class WorkflowPortsImpl implements WorkflowPorts {
     private final ProgressBus bus;
     private final AnalyticsTracker analytics;
     private final ObjectMapper objectMapper;
-    private final Supplier<String> runsDirProvider;
+
+    /**
+     * runsDir 解析器（<b>会话感知</b>）· 入参 = 会话 ID（可 null），出参 = 该会话的
+     * {@code <projectRoot>/<WORKFLOW_RUNS_DIR>}。
+     *
+     * <p><b>[批 3c]</b> 原为无参 {@code Supplier<String>}：会话经裸 MDC 解析（已删）。改为显式
+     * sessionId 入参 —— 调用方必须把<b>自己手上的</b>会话传进来；确实没有会话的消费链
+     * （{@code journalStore()} 端口无会话形参 / {@code WorkflowServiceImpl.getRunAsync} /
+     * {@code loadPersistedRuns} / persistence 的 run_done 订阅者）显式传 {@code null}
+     * → {@link #defaultRunsDir(String)} 回落 {@code user.dir}（进程默认，= 原无 MDC 时的兜底值）。
+     */
+    private final java.util.function.Function<String, String> runsDirResolver;
 
     /** W-2a 真注册表（claude-code default）· 对齐 CC buildRegistry() 产物 */
     private final AgentAdapterRegistry agentAdapterRegistry;
@@ -70,7 +79,9 @@ public class WorkflowPortsImpl implements WorkflowPorts {
     private final WorkflowLogger logger = new Slf4jWorkflowLogger();
     private final HostFactory hostFactory = this::createHostContext;
 
-    /** journalStore 惰性缓存（对齐 CC createWorkflowPorts 时创建一次；runsDir 按会话首访解析） */
+    /** journalStore 惰性缓存（对齐 CC createWorkflowPorts 时创建一次）。
+     *  <p>[批 3c 已知边界] 本端口无会话形参 → 首访时按<b>进程默认</b>（{@code null} 会话）解析 runsDir 并
+     *  固化（此后不再解析）；见 {@link #journalStore()} javadoc。 */
     private volatile JournalStore journalStore;
 
     /**
@@ -84,8 +95,9 @@ public class WorkflowPortsImpl implements WorkflowPorts {
     private final BackgroundTaskRunner backgroundTaskRunner;
 
     /**
-     * Spring 注入构造（默认 runsDirProvider = 会话绑定项目根 + {@link WorkflowConstants#WORKFLOW_RUNS_DIR}
-     * = .{appName}/workflow-runs，appName 默认 nexusai → .nexusai/workflow-runs，决策 D6/D7 迁移自有根）。
+     * Spring 注入构造（默认 runsDirResolver = {@link #defaultRunsDir(String)}：会话绑定项目根 +
+     * {@link WorkflowConstants#WORKFLOW_RUNS_DIR} = .{appName}/workflow-runs，appName 默认 nexusai
+     * → .nexusai/workflow-runs，决策 D6/D7 迁移自有根）。
      *
      * <p>W-2a 新增 {@code SubagentExecutor} 注入：经 {@link WorkflowRegistry#buildRegistry}
      * 装配 claude-code default adapter（对齐 CC buildRegistry()，registry.ts:9-13）。
@@ -111,24 +123,25 @@ public class WorkflowPortsImpl implements WorkflowPorts {
     }
 
     /**
-     * 测试构造：固定 runsDir（脱离会话解析，单测可复现）。
+     * 测试构造：固定 runsDir（脱离会话解析，单测可复现 · 任何 sessionId 入参都返回同一目录）。
      */
     WorkflowPortsImpl(ProgressBus bus, AnalyticsTracker analytics, ObjectMapper objectMapper, String runsDir,
                       SubagentExecutor subagentExecutor, AgentWorktreeManager worktreeManager,
                       BackgroundTaskRunner backgroundTaskRunner) {
-        this(bus, analytics, objectMapper, () -> runsDir, subagentExecutor, worktreeManager, backgroundTaskRunner);
+        this(bus, analytics, objectMapper, sessionId -> runsDir, subagentExecutor, worktreeManager,
+                backgroundTaskRunner);
     }
 
     /**
-     * 全量构造：自定义 runsDirProvider（生产按会话解析；测试注入固定值）。
+     * 全量构造：自定义 runsDirResolver（生产按会话解析；测试注入固定值）。
      */
     WorkflowPortsImpl(ProgressBus bus, AnalyticsTracker analytics, ObjectMapper objectMapper,
-                      Supplier<String> runsDirProvider, SubagentExecutor subagentExecutor,
+                      java.util.function.Function<String, String> runsDirResolver, SubagentExecutor subagentExecutor,
                       AgentWorktreeManager worktreeManager, BackgroundTaskRunner backgroundTaskRunner) {
         this.bus = bus;
         this.analytics = analytics;
         this.objectMapper = objectMapper;
-        this.runsDirProvider = runsDirProvider;
+        this.runsDirResolver = runsDirResolver;
         this.backgroundTaskRunner = backgroundTaskRunner;
         // W-2a 装配真注册表（claude-code default）· 对齐 CC buildRegistry()；D-1 注入 worktreeManager
         //（isolation:'worktree' fail-closed 建树，见 ClaudeCodeBackendAdapter）
@@ -138,19 +151,25 @@ public class WorkflowPortsImpl implements WorkflowPorts {
         log.info("WorkflowPorts 装配完成：bindings Map 空表、agentAdapterRegistry 注册 claude-code default（W-2a），telemetry 订阅就绪");
     }
 
-    /**
-     * 默认 runsDir · 对齐 CC {@code getRunsDir() = join(getProjectRoot(), '.claude', 'workflow-runs')}
+    /** 默认 runsDir · 对齐 CC {@code getRunsDir() = join(getProjectRoot(), '.claude', 'workflow-runs')}
      * (persistence.ts:32-34)。决策 D6/D7：目录迁至 nexusai 自有
      * {@code <projectRoot>/<WORKFLOW_RUNS_DIR>}（appName=nexusai → {@code .nexusai/workflow-runs}）。
      * projectRoot = 会话绑定启动目录（boundProject/originalCwd 层，非可变 getCwd——防 worktree/
      * 子目录 desync，ports.ts:55-59 注释）。
-     */
-    /** 包可见：WorkflowServiceImpl 生产 runsDirProvider 复用（W-3c 持久化同根）。 */
-    static String defaultRunsDir() {
-        String projectRoot = CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+     *
+     *  <p>包可见：WorkflowServiceImpl 生产 runsDirResolver 复用（W-3c 持久化同根）。
+     *
+     *  <p><b>[批 3c] 会话显式化</b>：会话 ID 由调用方作为<b>形参</b>传入（原经裸 MDC 会话槽读取，已删除）。
+     *  {@code sessionId} 为 null/空白 → {@link CwdResolution#getOriginalCwdLayer(String)}
+     *  逐层回落至 {@code user.dir}（进程默认，= 原「无 MDC」时的兜底值，语义不变）。
+     *
+     *  @param sessionId 会话 ID（消费链手上有会话就传；确实没有 → null = 进程默认）
+     *  @return 该会话的 runsDir（恒非 null） */
+    static String defaultRunsDir(String sessionId) {
+        String projectRoot = CwdResolution.getOriginalCwdLayer(sessionId);
         if (log.isDebugEnabled()) {
-            log.debug("WorkflowPorts.defaultRunsDir: projectRoot={} runsDir={}/{}",
-                    projectRoot, projectRoot, WorkflowConstants.WORKFLOW_RUNS_DIR);
+            log.debug("WorkflowPorts.defaultRunsDir: sessionId={} projectRoot={} runsDir={}/{}",
+                    sessionId, projectRoot, projectRoot, WorkflowConstants.WORKFLOW_RUNS_DIR);
         }
         return projectRoot + "/" + WorkflowConstants.WORKFLOW_RUNS_DIR;
     }
@@ -208,6 +227,22 @@ public class WorkflowPortsImpl implements WorkflowPorts {
         return taskRegistrar;
     }
 
+    /**
+     * journal 持久化端口 · CC original: {@code journalStore} (ports.ts:143)。
+     *
+     * <p><b>[批 3c 已知边界] 无会话来源</b>：本端口是 {@link WorkflowPorts} 接口上的<b>无参</b>方法
+     * （CC 同形），消费点 {@code WorkflowRunEngine}（run 起始 journal 读/截断）与
+     * {@code WorkflowHooksImpl}（运行期 append/truncate）都<b>拿不到会话</b> —— 改接口签名会波及
+     * 3 个测试 fake（{@code WorkflowRunEngineTest.FakePorts} / {@code WorkflowE2EDeepseekTest.E2ePorts} /
+     * {@code RestrictedScriptExecutorTest}），超出批 3c 授权。故此处显式传 {@code null} →
+     * 进程默认（{@code user.dir}）runsDir，并在首次创建时 {@code log.warn} 留痕（不静默、不用占位符
+     * 顶替会话 id）。
+     *
+     * <p><b>已知代价</b>：会话绑定项目 ≠ 进程启动目录时，journal 落到进程默认根；且本 store 为
+     * <b>进程单例惰性缓存</b>（首访定根，此后不再解析）—— 与 runsDir 解析的「会话感知」目标不一致。
+     * 待决策：把端口改为会话感知（如 {@code journalStore(String sessionId)}）或按会话缓存
+     * （{@code Map<String, JournalStore>}）。
+     */
     @Override
     public JournalStore journalStore() {
         JournalStore local = this.journalStore;
@@ -215,12 +250,13 @@ public class WorkflowPortsImpl implements WorkflowPorts {
             synchronized (this) {
                 local = this.journalStore;
                 if (local == null) {
-                    local = new FileJournalStore(runsDirProvider.get(), objectMapper);
+                    String runsDir = runsDirResolver.apply(null);
+                    local = new FileJournalStore(runsDir, objectMapper);
                     this.journalStore = local;
-                    if (log.isDebugEnabled()) {
-                        log.debug("WorkflowPorts.journalStore: 创建 FileJournalStore（首次访问）runsDir={}",
-                                runsDirProvider.get());
-                    }
+                    log.warn("WorkflowPorts.journalStore: 创建 FileJournalStore（首次访问）runsDir={} "
+                            + "—— 本端口无会话形参（ports.ts:143 同形）→ sessionId=null，runsDir 按进程默认"
+                            + "（user.dir）解析；若会话绑定项目 ≠ 进程启动目录，journal 落点与 run 的会话项目不一致",
+                            runsDir);
                 }
             }
         }
@@ -272,7 +308,9 @@ public class WorkflowPortsImpl implements WorkflowPorts {
                 toolUseContext, args.canUseTool(), args.parentMessage());
         HostHandle handle = HostHandle.create(bundle);
         // cwd 用 projectRoot 而非 getCwd()：与 journalStore 的 runsDir 同根（ports.ts:55-59）
-        String cwd = CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+        // [批 3c] 会话来源显式化：hostFactory 的 context 即本会话 ToolUseContext → sessionId 从它直取
+        //   （优先级 (2) 显式载体）；⛔ 不再读 MDC。
+        String cwd = CwdResolution.getOriginalCwdLayer(toolUseContext.sessionId());
         String toolUseId = toolUseContext.toolUseId();
         if (log.isDebugEnabled()) {
             log.debug("WorkflowPorts.hostFactory: cwd={} toolUseId={} agentId={}",

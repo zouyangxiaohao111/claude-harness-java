@@ -13,18 +13,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * [provider-custom-headers 任务 6 · 步骤 6b + 任务 7 补 OpenAI 侧] <b>接线级护栏</b>：
- * 两个 SDK provider 解析 {@code sessionId} 的方法体内不得出现 MDC 兜底
- * {@code RequestContext.sessionId()}，且必须「显式传参 + 经共享判据 + 用共享注入器」。
+ * 两个 SDK provider 解析 {@code sessionId} 的方法体内不得读取<b>任何环境态会话槽</b>
+ * （见 {@link #FORBIDDEN_AMBIENT_SESSION_SLOTS}），且必须「显式传参 + 经共享判据 + 用共享注入器」。
  *
  * <h2>WHY 必须单独存在（类内守卫管不到调用点）</h2>
  * {@link SessionIdResolver} 类自身「刻意不读 MDC」有回归测试守着，但那守卫是<b>方法局部的</b>。
  * 它管不到<b>调用点</b>：接线者若「以同文件最近的先例为准」，就会照抄
- * {@code AnthropicSdkProvider.consumePostCompactionAtApiSuccess} 里紧邻的一句
- *
- * <pre>{@code
- * String sessionId = SessionIdResolver.fromHistory(history);
- * if (sessionId == null) { sessionId = RequestContext.sessionId(); }   // ← 属 consumePostCompaction 链路，勿照抄
- * }</pre>
+ * {@code AnthropicSdkProvider.consumePostCompactionAtApiSuccess} 里曾经紧邻的那句环境态兜底
+ * （形式为「{@code SessionIdResolver} 取不到就用当前线程的会话槽」，该句批 3b/3c 已删）
  *
  * 此时 {@link SessionIdResolverTest} <b>全绿</b>（它只测类自身），而规范 §6.3 的
  * 「静默把 A 会话的亲和 id 发给 B 请求」原样复发 —— 残留 MDC 是真实的
@@ -56,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （见 {@link #legacyConsumePostCompactionMethod_isOutsideClientBuildScope()}）；
  * ③ 两个 provider 的新调用点自动纳入。
  *
- * <p><b>硬中断线按「字面量」判，不剥注释</b>（刻意从严）：连<b>注释里</b>的照抄模板都不许留在注入链上 ——
+ * <p><b>硬中断线按「精确字面量」判，不剥注释</b>（刻意从严）：连<b>注释里</b>的照抄模板都不许留在注入链上 ——
  * 它就是被「以同文件最近的先例为准」照抄的来源，留在方法体内即隐患。代价是注释里提该调用形态也会
  * 转红，此时把注释改写成 {@code MDC（RequestContext.sessionId）}（去括号）即可，不需要放松本护栏。
  *
@@ -87,13 +83,33 @@ class ProviderSessionIdWiringGuardTest {
     /** 共享注入器（两个 provider 必须调它，不得内联各写一份合并/过滤）。 */
     private static final String INJECTOR_APPLY = "ProviderHeaderInjector.apply(";
 
-    /** 硬中断线：header 注入链上出现这个串即「照抄了 MDC 兜底」。 */
-    private static final String FORBIDDEN_MDC = "RequestContext.sessionId()";
+    /**
+     * 硬中断线：header 注入链上出现下列任一串即「会话标识取自<b>环境态会话槽</b>」。
+     *
+     * <p><b>[批 3c · 2026-09-13 重新表达]</b> 原为单一字面量 {@code RequestContext.sessionId()}。
+     * 该类已随批 3c 整体删除 ⇒ 只留那一个串会让本护栏<b>空泛通过恒真</b>（源码里再也不会出现它）。
+     * 判据改为**「注入链上不得出现任何环境态会话槽的读取」** —— 这既是原判据的推广（原判据只是它的
+     * 一个实例），也让护栏<b>对未来新增的 ambient 槽同样有效</b>（本仓还有
+     * {@code AutoMemPaths.CURRENT_PROJECT_ROOT}，登记为批 4 收敛）。
+     *
+     * <ul>
+     *   <li>{@code RequestContext} —— 已删类的<b>回归守卫</b>（有人重新引入即红）；</li>
+     *   <li>{@code MDC.get} —— 任何直接的裸 MDC 读（精确：注释里不会写这个形态）；</li>
+     *   <li>{@code AutoMemPaths.currentSessionProjectRoot} —— 本仓现存第二个 ambient 会话槽
+     *       （批 4 待删；注入链上用它与用 MDC 同罪）。</li>
+     * </ul>
+     * <p>刻意<b>不</b>用 `"MDC"` 这个宽串：本文件的注释里合法地解释「为什么不兜底 MDC」，
+     * 用宽串会当场误红。失败时把注释改写成不含该**精确形态**的措辞即可，不需要放松护栏。
+     */
+    private static final List<String> FORBIDDEN_AMBIENT_SESSION_SLOTS = List.of(
+        "RequestContext",
+        "MDC.get",
+        "AutoMemPaths.currentSessionProjectRoot");
 
     // ─────────────────────── Anthropic（任务 6 交付的 5 个调用点） ───────────────────────
 
     @Test
-    @DisplayName("接线级护栏：Anthropic 侧 buildClient 调用点所在方法内不得出现 RequestContext.sessionId()（MDC 兜底勿照抄）")
+    @DisplayName("接线级护栏：Anthropic 侧 buildClient 调用点所在方法内不得读取任何环境态会话槽（勿照抄）")
     void anthropic_clientBuildCallSites_haveNoMdcFallback() throws IOException {
         String source = readSource(ANTHROPIC_PATH);
         List<String> windows = clientBuildWindows(source);
@@ -106,10 +122,12 @@ class ProviderSessionIdWiringGuardTest {
             .hasSize(6);
 
         for (String window : windows) {
-            assertThat(window)
-                .as("header 注入链上的方法体内不得出现 MDC 兜底 RequestContext.sessionId()"
-                    + "（残留 MDC 是别会话的 id → 静默串号；见 SessionIdResolver 类 javadoc）")
-                .doesNotContain(FORBIDDEN_MDC);
+            for (String forbidden : FORBIDDEN_AMBIENT_SESSION_SLOTS) {
+                assertThat(window)
+                    .as("header 注入链上的方法体内不得读取任何环境态会话槽 [%s]"
+                        + "（槽里可能是别会话的 id → 静默串号；见 SessionIdResolver 类 javadoc）", forbidden)
+                    .doesNotContain(forbidden);
+            }
         }
     }
 
@@ -132,11 +150,13 @@ class ProviderSessionIdWiringGuardTest {
     // ─────────────────────── OpenAI（任务 7 交付的 4 个调用点） ───────────────────────
 
     @Test
-    @DisplayName("接线级护栏：OpenAI 侧 buildClient 调用点所在方法内不得出现 RequestContext.sessionId()")
+    @DisplayName("接线级护栏：OpenAI 侧 buildClient 调用点所在方法内不得读取任何环境态会话槽")
     void openAi_clientBuildCallSites_haveNoMdcFallback() throws IOException {
-        // 注意：OpenAI 窗口内**合法存在** RequestContext.requestId()（非 sessionId 语义，见
-        // OpenAiSdkProvider 的 requestId 兜底链路），故硬中断线必须是 RequestContext.sessionId()
-        // 而非 RequestContext —— 用后者会当场误红。
+        // 注意：本护栏现在对两个 provider 用**同一组** needle（见 FORBIDDEN_AMBIENT_SESSION_SLOTS），
+        // 不再像初版那样只禁 `RequestContext.sessionId()` 而放过 `RequestContext.requestId()`——
+        // 批 3c 已删除该类（含其 requestId 链），且「按精确字面量判」的宽严差异正是 R7「同一能力
+        // 两套判据」的温床。若将来 OpenAI 侧合法需要某种环境态归因上下文，应显式扩类
+        // （如专用参数），而不是把 needle 放松回子串形式。
         String source = readSource(OPENAI_PATH);
         List<String> windows = clientBuildWindows(source);
         assertWindowsSelfCheck(windows);
@@ -146,10 +166,12 @@ class ProviderSessionIdWiringGuardTest {
             .hasSize(5);
 
         for (String window : windows) {
-            assertThat(window)
-                .as("OpenAI 侧 header 注入链上的方法体内同样不得出现 MDC 兜底"
-                    + "（两个 provider 共守一条判据，不允许只有 Anthropic 侧干净）")
-                .doesNotContain(FORBIDDEN_MDC);
+            for (String forbidden : FORBIDDEN_AMBIENT_SESSION_SLOTS) {
+                assertThat(window)
+                    .as("OpenAI 侧 header 注入链上的方法体内同样不得读取环境态会话槽 [%s]"
+                        + "（两个 provider 共守一条判据，不允许只有 Anthropic 侧干净）", forbidden)
+                    .doesNotContain(forbidden);
+            }
         }
     }
 

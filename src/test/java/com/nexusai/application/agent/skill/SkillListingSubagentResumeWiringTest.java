@@ -162,8 +162,10 @@ class SkillListingSubagentResumeWiringTest {
 
             SkillCatalog catalog = mock(SkillCatalog.class);
             List<Command> commands = List.of(cmd("commit"), cmd("review"));
-            when(catalog.getModelInvocableCommandsForListing()).thenReturn(commands);
-            when(catalog.getModelInvocableCommands()).thenReturn(commands);
+            // [批 3c] SkillCatalog 的两个取数方法新增显式 sessionId 形参 → stub 用 anyString() 匹配；
+            //   本 harness 恒传真实非空会话（SESSION_KEY = sess-subresume）
+            when(catalog.getModelInvocableCommandsForListing(anyString())).thenReturn(commands);
+            when(catalog.getModelInvocableCommands(anyString())).thenReturn(commands);
             when(catalog.getCharBudget(any())).thenReturn(1000);
             when(catalog.formatListing(anyList(), any())).thenAnswer(inv -> {
                 List<Command> passed = inv.getArgument(0);

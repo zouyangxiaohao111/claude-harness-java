@@ -1274,13 +1274,6 @@ public class StreamingToolExecutor {
         //   finally restore 外层原值（对齐 LlmAgentLoop.run() :1637/:1645 capture/restore 语义；
         //   restore 而非 remove —— 线程池复用防泄漏，null 捕获值不 set 保持回落）。
         final String scheduledProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-        // [reqId MDC 传播] 调度线程（会话线程）捕获 MDC context map → 任务体线程回放
-        //   （对齐 LlmAgentLoop STREAM_EXECUTOR mdcCtx 先例 + withSessionProjectRoot 同款成对模式）。
-        //   WHY: 工具执行在 fixed-8 池线程（CompletableFuture.runAsync(..., executor)），ThreadLocal 不跨
-        //   线程 → 池线程 RequestContext.requestId()=null → isTodoV2Enabled()=false → 子代理（SubagentTool）
-        //   回落 V1 TodoWrite、父 V2/子 V1 工具集分叉（决策 #65）。MDC 回放后池线程同帧 requestId 可见
-        //   → 工具（含 sync 子代理）判交互正确，且 async 子代理线程捕获父 MDC 时非 null。
-        final java.util.Map<String, String> mdcCtx = org.slf4j.MDC.getCopyOfContextMap();
         t.status = Status.EXECUTING;
         // [R32-b8 #3 P0-2 校正] 在 executeAsync() 入口 (执行真正开始时) 触发 in-progress 标记 ·
         //   对齐 CC StreamingToolExecutor.ts:267 executeTool 入口 + toolOrchestration.ts:127/160
@@ -1293,7 +1286,7 @@ public class StreamingToolExecutor {
         //   → setHasInterruptibleToolInProgress(false); 若全为 cancel → setHasInterruptibleToolInProgress(true).
         //   入口先设 false (默认保守), 然后单独处理"全 cancel"路径.
         updateInterruptibleStateOnStart(t);
-        t.promise = CompletableFuture.runAsync(withSessionProjectRoot(scheduledProjectRoot, mdcCtx, () -> {
+        t.promise = CompletableFuture.runAsync(withSessionProjectRoot(scheduledProjectRoot, () -> {
             long t0 = System.currentTimeMillis();
             log.info("TOOL exec: name={} id={} input={}",
                 t.call.name(), abbreviate(t.call.id(), 24), abbreviate(t.call.input().toString(), 200));
@@ -1372,7 +1365,9 @@ public class StreamingToolExecutor {
                 JsonNode backfilledInput = strippedInput;
                 if (inputSanitizer != null && t.tool != null
                         && strippedInput != null && strippedInput.isObject()) {
-                    backfilledInput = inputSanitizer.backfill(t.tool, strippedInput);
+                    //   [会话 cwd] 传本执行器 ctx：路径类工具的相对路径按本会话 cwd 展开
+                    //   （对齐 CC backfill 内 expandPath 的 baseDir=getCwd()）。
+                    backfilledInput = inputSanitizer.backfill(t.tool, strippedInput, ctx);
                     if (log.isDebugEnabled()) {
                         log.debug("TOOL backfill: callId={} tool={} file_path 绝对化",
                             abbreviate(t.call.id(), 24), t.call.name());
@@ -1496,7 +1491,10 @@ public class StreamingToolExecutor {
                     // CC toolExecution.ts:746-750 四参: (command, appState.toolPermissionContext,
                     //   abortController.signal, isNonInteractiveSession). Java 等价:
                     //   ctx.permissionContext() / ctx.abortController() / ctx.isNonInteractiveSession().
+                    //   [批 3c] 首参 sessionId = 显式 ToolUseContext.sessionId()（原该类经裸 MDC 会话槽
+                    //   取会话；该槽已删 ⇒ 由调用方显式传入，与 ctx 的其它三项同源）。
                     boolean started = SpeculativeClassifier.startSpeculativeClassifierCheck(
+                        ctx != null ? ctx.sessionId() : null,
                         bashCommand,
                         ctx != null ? ctx.permissionContext() : null,
                         ctx != null ? ctx.abortController() : null,
@@ -2438,7 +2436,7 @@ public class StreamingToolExecutor {
     }
 
     /**
-     * [IMP-C D2-A/F3 + reqId MDC 传播] 跨线程 projectRoot + MDC 传播载体 —— 调度线程捕获值注入任务体线程。
+     * [IMP-C D2-A/F3] 跨线程 projectRoot 传播载体 —— 调度线程捕获值注入任务体线程。
      *
      * <p>WHY projectRoot: 工具执行在 fixed-8 池线程（{@code runAsync(..., executor)}），ThreadLocal 不跨线程；
      *   不传播则工具体内 {@link AutoMemPaths#currentSessionProjectRoot()} 读回落值
@@ -2447,34 +2445,17 @@ public class StreamingToolExecutor {
      *   capture/restore（:1637/:1645）：调度线程（会话线程）捕获一次，任务体开头 set，
      *   finally restore 外层原值（restore 而非 remove —— 线程池复用防泄漏，null 捕获值
      *   不 set，保持回落语义）。
-     *
-     * <p>WHY MDC: 与 projectRoot 同因（池线程 ThreadLocal 不跨线程）。不传播则池线程
-     *   {@link com.nexusai.common.RequestContext#requestId()}=null → {@link com.nexusai.application.agent.tasks.TaskSystemConfig#isTodoV2Enabled()}
-     *   =false → 子代理回落 V1 TodoWrite、父 V2/子 V1 工具集分叉（决策 #65）。对齐
-     *   LlmAgentLoop STREAM_EXECUTOR mdcCtx 先例（:4697/:4723-4724/:4743）：调度线程捕获
-     *   MDC context map，任务体开头 {@code setContextMap}，finally restore 外层原值
-     *   （restore 而非 clear —— 线程池复用防泄漏；null 捕获值不 set）。
      */
-    private static Runnable withSessionProjectRoot(String scheduledProjectRoot,
-            java.util.Map<String, String> mdcCtx, Runnable task) {
+    private static Runnable withSessionProjectRoot(String scheduledProjectRoot, Runnable task) {
         return () -> {
             String prevProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-            java.util.Map<String, String> prevMdc = org.slf4j.MDC.getCopyOfContextMap();
             try {
                 if (scheduledProjectRoot != null && !scheduledProjectRoot.isBlank()) {
                     AutoMemPaths.setCurrentProjectRoot(scheduledProjectRoot);
                 }
-                if (mdcCtx != null) {
-                    org.slf4j.MDC.setContextMap(mdcCtx);
-                }
                 task.run();
             } finally {
                 AutoMemPaths.restoreCurrentProjectRoot(prevProjectRoot);
-                if (prevMdc != null) {
-                    org.slf4j.MDC.setContextMap(prevMdc);
-                } else {
-                    org.slf4j.MDC.clear();
-                }
             }
         };
     }

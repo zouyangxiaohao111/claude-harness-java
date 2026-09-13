@@ -3,7 +3,6 @@ package com.nexusai.application.agent.tasks;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.team.TeamHelpers;
 import com.nexusai.application.agent.team.TeammateContext;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -101,21 +100,26 @@ public class TaskService {
     /**
      * [team-cc-align fixPlan2] 会话级 leader team name · 对齐 CC tasks.ts:25 进程级 {@code let
      * leaderTeamName}（CC 单会话）→ Java 多会话按 sessionId 分桶（multi-session-vs-cc-single-session
-     * 铁律；键 = RequestContext MDC 会话 short，对齐 session-id-short 统一 sess-xxx）。
+     * 铁律；键 = **显式会话标识**，对齐 session-id-short 统一 sess-xxx）。
      * 原 ThreadLocal 跨线程丢失 → leader 建 team（线程 A set）后 TaskCreate（线程 B）读不到 →
      * getTaskListId 兜底成 sessionId/UUID，任务落错目录。
      */
     private static final Map<String, String> leaderTeamNames = new ConcurrentHashMap<>();
 
     /**
-     * 设置当前会话的 leader team name · 对齐 CC tasks.ts:31-37 setLeaderTeamName()
-     * 无当前会话上下文 → warn 跳过（Java 需会话键防跨会话污染，CC 进程级无需）。
+     * 设置指定会话的 leader team name · 对齐 CC tasks.ts:31-37 setLeaderTeamName()
+     *
+     * <p>[批 3c] 会话标识改为**显式形参**（原读裸 MDC 的会话槽），单键分桶语义不变；
+     * 调用方须传自己的会话（工具侧 {@code ctx.sessionId()} / REST 侧 query {@code ?sessionId=}）。
+     *
+     * @param teamName  团队名（= taskListId 同名，CC Team = Project = TaskList）
+     * @param sessionId 显式会话标识；null/空白 ⇒ WARN 跳过（Java 需会话键防跨会话污染，CC 进程级无需）
      */
-    public static void setLeaderTeamName(String teamName) {
+    public static void setLeaderTeamName(String teamName, String sessionId) {
         if (teamName == null || teamName.isBlank()) return;
-        String sessionId = RequestContext.sessionId();
         if (sessionId == null || sessionId.isBlank()) {
-            log.warn("[TaskService] setLeaderTeamName: 无当前会话上下文, 跳过 team={}（Java 需会话键，对齐 multi-session）", teamName);
+            log.warn("[TaskService] setLeaderTeamName: 无**显式**会话标识（调用方未传 sessionId），跳过 "
+                + "team={}（Java 需会话键防跨会话污染；调用方应从 ctx.sessionId() 显式传入）", teamName);
             return;
         }
         String old = leaderTeamNames.get(sessionId);
@@ -125,19 +129,42 @@ public class TaskService {
     }
 
     /**
-     * 清除当前会话的 leader team name · 对齐 CC tasks.ts:43-47 clearLeaderTeamName()
+     * 无会话形参的历史入口 · [批 3c] 收敛为显式重载的空会话转发（会话态不再经 MDC 载体传播）。
+     *
+     * <p><b>⚠ 调用方待接线</b>：本入口无会话来源 ⇒ 直接 WARN 跳过（不是静默），
+     * 请改用 {@link #setLeaderTeamName(String, String)} 显式传入 {@code ctx.sessionId()}。
      */
-    public static void clearLeaderTeamName() {
-        String sessionId = RequestContext.sessionId();
-        if (sessionId == null || sessionId.isBlank()) return;
+    public static void setLeaderTeamName(String teamName) {
+        setLeaderTeamName(teamName, null);
+    }
+
+    /**
+     * 清除指定会话的 leader team name · 对齐 CC tasks.ts:43-47 clearLeaderTeamName()
+     *
+     * @param sessionId 显式会话标识；null/空白 ⇒ no-op（无键可清）
+     */
+    public static void clearLeaderTeamName(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
         if (leaderTeamNames.remove(sessionId) != null) {
             notifyTasksUpdated();
         }
     }
 
-    /** 当前会话的 leader team name · getTaskListId 优先级 4 读取（per-session，防跨会话污染）。 */
-    private static String leaderTeamNameForCurrentSession() {
-        String sessionId = RequestContext.sessionId();
+    /**
+     * 无会话形参的历史入口 · [批 3c] 收敛为显式重载的空会话转发。
+     *
+     * <p><b>⚠ 调用方待接线</b>：请改用 {@link #clearLeaderTeamName(String)} 显式传入会话
+     * （工具侧 {@code ctx.sessionId()}）；无会话时本入口恒 no-op（不清任何会话的键）。
+     */
+    public static void clearLeaderTeamName() {
+        clearLeaderTeamName(null);
+    }
+
+    /** 指定会话的 leader team name · getTaskListId 优先级 4 读取（per-session，防跨会话污染）。
+     *  [批 3c] 会话键 = 显式形参（原读裸 MDC 的会话槽）；null/空白 → null（无该会话的登记）。 */
+    private static String leaderTeamNameForSession(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
@@ -182,8 +209,9 @@ public class TaskService {
      *       无任何写入点，grep 实证属脏 key）</li>
      *   <li>ThreadLocal {@link #leaderTeamNameHolder}（对齐 CC tasks.ts:25/209 leaderTeamName）</li>
      *   <li>sysprop <b>nexusai.sessionId</b>（CC tasks.ts:209 getSessionId() 的部署注入会话 ID）</li>
-     *   <li>RequestContext MDC <b>sessionId</b>（CC tasks.ts:209 getSessionId() 的当前会话，
-     *       ChatService:154 请求入口注入）</li>
+     *   <li><b>显式形参 sessionId</b>（CC tasks.ts:209 getSessionId() 的当前会话 · [批 3c] 原为
+     *       裸 MDC 会话槽，现由调用方显式传入 —— REST 侧 query {@code ?sessionId=}、
+     *       工具侧 {@code ctx.sessionId()}）</li>
      *   <li>进程级稳定会话 UUID（对齐 CC STATE.sessionId = randomUUID()，state.ts:331；
      *       无任何会话上下文时的兜底）</li>
      * </ol>
@@ -207,16 +235,17 @@ public class TaskService {
      * 'tasklist'（最后回退 getSessionId()，会话 UUID，state.ts:331 randomUUID），
      * 'tasklist' 是 CC 真实常量 {@code DEFAULT_TASKS_MODE_TASK_LIST_ID}（tasks.ts:862，
      * watcher/main.tsx UI 用，getTaskListId 永不返回它）。Java 静态方法无 state/ToolUseContext
-     * 直接访问，以 {@link RequestContext#sessionId()}（MDC 当前会话）+ 进程级稳定 UUID 兜底
+     * 直接访问，以 <b>显式形参 sessionId</b>（[批 3c] 原读裸 MDC 的会话槽）+ 进程级稳定 UUID 兜底
      * （U-3 对齐 CC：弃硬编码 'tasklist'）。
      *
      * <p>WHY 单一解析点：消除工具构造器 @Value 注入的第二个 taskListId key，同一应用内所有
      * 任务读写（工具 + 提醒 + hook + watcher）经本方法解析同一列表 ID（对齐 CC 工具
      * call() 内逐次 getTaskListId()）。
      *
+     * @param sessionId 显式会话标识（调用方传入；null/空白 ⇒ 优先级 6 不可用 → WARN 后回退进程级 UUID）
      * @return 任务列表 ID
      */
-    public static String getTaskListId() {
+    public static String getTaskListId(String sessionId) {
         // 优先级 1（CC tasks.ts:200-204）：env CLAUDE_CODE_TASK_LIST_ID → sysprop nexusai.taskListId
         String explicit = resolveTaskListIdFromEnvOrProperty();
         if (explicit != null) {
@@ -250,8 +279,8 @@ public class TaskService {
         }
 
         // 优先级 4（CC tasks.ts:25/209 leaderTeamName）：会话级 leader team name
-        //   [team-cc-align fixPlan2] 原 ThreadLocal 跨线程丢失 → 按当前会话 short 分桶读取。
-        String leaderName = leaderTeamNameForCurrentSession();
+        //   [team-cc-align fixPlan2] 原 ThreadLocal 跨线程丢失 → 按**显式会话标识**分桶读取（批 3c）。
+        String leaderName = leaderTeamNameForSession(sessionId);
         if (leaderName != null && !leaderName.isBlank()) {
             if (log.isDebugEnabled()) {
                 log.debug("getTaskListId: 优先级4（leaderTeamName 会话级）解析列表 ID {}", leaderName);
@@ -260,24 +289,24 @@ public class TaskService {
         }
 
         // 优先级 5（CC tasks.ts:209 getSessionId()）：sysprop nexusai.sessionId（部署注入会话 ID）
-        String sessionId = System.getProperty("nexusai.sessionId");
-        if (sessionId != null && !sessionId.isBlank()) {
+        String sysPropSessionId = System.getProperty("nexusai.sessionId");
+        if (sysPropSessionId != null && !sysPropSessionId.isBlank()) {
             if (log.isDebugEnabled()) {
-                log.debug("getTaskListId: 优先级5（sessionId nexusai.sessionId）解析列表 ID {}", sessionId);
+                log.debug("getTaskListId: 优先级5（sessionId nexusai.sessionId）解析列表 ID {}", sysPropSessionId);
             }
-            return sessionId;
+            return sysPropSessionId;
         }
 
-        // 优先级 6（CC tasks.ts:209 getSessionId() 的当前会话）：RequestContext MDC 会话 ID。
+        // 优先级 6（CC tasks.ts:209 getSessionId() 的当前会话）：**显式形参** sessionId。
         // CC getSessionId() 返回 STATE.sessionId（当前请求会话 UUID，state.ts:431-432）；Java 静态方法
-        // 无法访问 state/ToolUseContext，以 RequestContext MDC 会话 ID（ChatService:154 入口注入）为
-        // getSessionId() 等价物——请求流中 getTaskListId() 调用均处于会话线程，MDC 已注入。
-        String requestSessionId = RequestContext.sessionId();
-        if (requestSessionId != null && !requestSessionId.isBlank()) {
+        // 无法访问 state/ToolUseContext，会话由调用方显式传入（REST query ?sessionId= / 工具 ctx.sessionId()）。
+        // [批 3c] 原读裸 MDC 的会话槽（ChatService 请求入口注入）已删：MDC 第三态会读到上一请求残留的
+        //   **别的会话** id ⇒ 任务落到别的会话的列表目录（静默串会话），且载体本身已随本批删除。
+        if (sessionId != null && !sessionId.isBlank()) {
             if (log.isDebugEnabled()) {
-                log.debug("getTaskListId: 优先级6（当前会话 RequestContext MDC）解析列表 ID {}", requestSessionId);
+                log.debug("getTaskListId: 优先级6（显式会话形参）解析列表 ID {}", sessionId);
             }
-            return requestSessionId;
+            return sessionId;
         }
 
         // 最终回退：进程级稳定会话 UUID（对齐 CC STATE.sessionId = randomUUID()，state.ts:331）。
@@ -286,14 +315,40 @@ public class TaskService {
         // sanitizePathComponent(taskListId) 非 null，DC-4 后 null 会 NPE），且永不返回 'tasklist'
         // （CC DEFAULT_TASKS_MODE_TASK_LIST_ID tasks.ts:862 仅供 watcher/main.tsx UI 使用，
         // getTaskListId 本身永不返回它，对齐 CC tasks.ts:199-210）。
-        if (log.isDebugEnabled()) {
-            log.debug("getTaskListId: 无任何配置与会话上下文，回退进程级会话 UUID {}", PROCESS_SESSION_ID);
+        // ⚠ 多会话 JVM 下本兜底桶是**全进程共享**的：仅当调用方确实无会话（cron 无会话 / 测试 /
+        //   非请求线程）时才可接受。因此改 WARN 留痕（禁只 DEBUG）——无参 getTaskListId() 的调用方
+        //   应改传显式会话（REST: query ?sessionId=；工具: ctx.sessionId()）。
+        //   本方法在热路径（每轮 computeTaskReminderAttachments + 每个 Task* 工具调用）⇒ 首次回落
+        //   WARN 披露，后续降 debug（同一个闸，避免每轮刷屏）。
+        if (NO_EXPLICIT_SESSION_WARNED.compareAndSet(false, true)) {
+            log.warn("getTaskListId: 无显式会话标识（调用方未传 sessionId 且 1-5 级均未命中）→ 回退进程级"
+                + "共享列表 UUID {}；该桶在 Web 多会话下为全进程共享，调用方应显式传会话"
+                + "（无参 getTaskListId() 已收敛为 getTaskListId(null)；工具侧应传 ctx.sessionId()，"
+                + "REST 侧已传 query ?sessionId=）—— 本条为首次告警，后续同类回落降为 debug",
+                PROCESS_SESSION_ID);
+        } else if (log.isDebugEnabled()) {
+            log.debug("getTaskListId: 继续回落进程级共享列表 UUID {}（首次告警已发出）", PROCESS_SESSION_ID);
         }
         return PROCESS_SESSION_ID;
     }
 
+    /**
+     * 无会话形参的历史入口 · [批 3c] 收敛为显式重载的空会话转发（会话态不再经 MDC 载体传播）。
+     *
+     * <p><b>⚠ 调用方待接线</b>：本入口无会话来源 ⇒ 优先级 6 不可用 → WARN 后回退<b>全进程共享</b>的
+     * 进程级列表 UUID（多会话 JVM 下会串会话）。工具侧应改用
+     * {@link #getTaskListId(String)} 显式传入 {@code ctx.sessionId()}。
+     */
+    public static String getTaskListId() {
+        return getTaskListId(null);
+    }
+
     /** 进程级稳定会话 UUID · 对齐 CC STATE.sessionId = randomUUID()（state.ts:331），懒初始化进程内稳定 */
     private static final String PROCESS_SESSION_ID = java.util.UUID.randomUUID().toString();
+
+    /** [批 3c] 「无显式会话 → 回退进程级共享列表」首次告警闸（防热路径 WARN 刷屏；false→true 只发一次）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean NO_EXPLICIT_SESSION_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * 解析显式 task list ID · 对齐 CC tasks.ts:200-204 getTaskListId() 优先级 1

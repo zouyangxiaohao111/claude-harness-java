@@ -44,6 +44,12 @@ import org.slf4j.LoggerFactory;
  * （见该 record 的 {@code thresholdRelativePercentLeft} 命名）。同理
  * {@code getEffectiveContextWindowSize}（减 summary 预留 + settings 收窄）只是阈值口径窗口，
  * 对外显示的窗口恒为 {@link #snapshot} 的原始窗口。
+ *
+ * <p>[snip-nudge-percent 2026-09-13] 消费点扩展：snip nudge 门（AgentLoopContext
+ * maybeInjectContextEfficiencyNudge）也改用本口径 —— 此前它取 {@code getEffectiveContextWindowSize}
+ * 的「阈值口径窗口」（原始窗口 − summary 预留 − settings 收窄）作为分母，与展示口径的**原始窗口**
+ * 对同一刻判出不同余量（本机实测 992000 vs 1048567）。本口径是唯一权威，
+ * nudge 的接入是**收敛**而非新增第二套。
  */
 public final class ContextUsageCalculator {
 

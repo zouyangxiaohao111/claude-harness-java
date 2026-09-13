@@ -183,8 +183,9 @@ class SlashCommandInterceptorTest {
         registry.setWorkflowCommandProvider(cwd -> List.of(local));
 
         UserInputDispatcher dispatcher = new UserInputDispatcher();
+        // [批 3c] result handler 3 形参 (args, sessionId, inFlightUserMessageId)：本用例只验证 args → stdout 组装
         dispatcher.registerSlashCommandResult("localtest",
-            args -> UserInputDispatcher.LocalCommandResult.text("echo: " + args));
+            (args, s, m) -> UserInputDispatcher.LocalCommandResult.text("echo: " + args));
 
         SlashCommandInterceptor.SlashResolution r =
             interceptor(registry, dispatcher).intercept(SESSION, "msg-user-1", "/localtest hello", null, null);
@@ -208,7 +209,8 @@ class SlashCommandInterceptorTest {
         registry.setWorkflowCommandProvider(cwd -> List.of(local));
 
         UserInputDispatcher dispatcher = new UserInputDispatcher();
-        dispatcher.registerSlashCommandResult("skipcmd", args -> UserInputDispatcher.LocalCommandResult.skip());
+        // [批 3c] 3 形参：本用例只验证 skip 分支不产消息
+        dispatcher.registerSlashCommandResult("skipcmd", (args, s, m) -> UserInputDispatcher.LocalCommandResult.skip());
 
         SlashCommandInterceptor.SlashResolution r =
             interceptor(registry, dispatcher).intercept(SESSION, "msg-user-1", "/skipcmd", null, null);

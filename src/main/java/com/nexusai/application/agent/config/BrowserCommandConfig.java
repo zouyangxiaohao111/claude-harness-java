@@ -3,7 +3,6 @@ package com.nexusai.application.agent.config;
 import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.browser.BrowserWsChannel;
 import com.nexusai.application.agent.skill.BundledSkills;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.command.Command;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,7 +92,7 @@ public class BrowserCommandConfig {
             log.warn("[BrowserCommandConfig] UserInputDispatcher 未注入，/chrome 执行 handler 注册跳过");
             return new ChromeSlashRegistration();
         }
-        dispatcher.registerSlashCommand("chrome", args -> {
+        dispatcher.registerSlashCommand("chrome", (args, sessionId, inFlightUserMessageId) -> {
             // 全局连接语义：一个扩展连接服务所有会话，hasSessionConnection() 有连接即「已连接」
             boolean connected = browserWsChannel != null && browserWsChannel.hasSessionConnection();
             if (browserWsChannel == null) {
@@ -101,7 +100,7 @@ public class BrowserCommandConfig {
             }
             if (log.isInfoEnabled()) {
                 log.info("[BrowserCommandConfig] /chrome 执行完成: sessionId={} 全局连接状态:\n{}",
-                    RequestContext.sessionId(), formatChromeStatus(connected));
+                    sessionId, formatChromeStatus(connected));
             }
         });
         log.info("[BrowserCommandConfig] /chrome 已注册为生产 slash command（对齐 CC commands/chrome/index.ts + chrome.tsx call）");

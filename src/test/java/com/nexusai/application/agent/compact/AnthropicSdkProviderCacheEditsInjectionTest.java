@@ -39,16 +39,23 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
 
     private static final String MODEL = "claude-opus-4-1";
 
+    /**
+     * 本文件统一会话键 · 批 3c：会话 = 显式 sessionId。fixture 消息显式承载该会话，
+     * 使 {@code AnthropicSdkProvider.buildMessageParams} 经 {@code SessionIdResolver.fromHistory}
+     * 解析出的桶与测试直接调用 {@code microcompactMessages} 写入的桶一致。
+     */
+    private static final String SESSION = "s3";
+
     @BeforeEach
     void setUp() {
         MicroCompactor.setCachedMicrocompactEnabled(false);
-        MicroCompactor.resetMicrocompactState();
+        MicroCompactor.resetMicrocompactState(SESSION);
     }
 
     @AfterEach
     void tearDown() {
         MicroCompactor.setCachedMicrocompactEnabled(false);
-        MicroCompactor.resetMicrocompactState();
+        MicroCompactor.resetMicrocompactState(SESSION);
     }
 
     @Test
@@ -70,7 +77,7 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
         assertThat(blocks.get(2).asText().text()).isEqualTo(".");
 
         // pin 已生效：pinnedEdits 含该位置块
-        List<PinnedCacheEdits> pinned = MicroCompactor.getPinnedCacheEdits();
+        List<PinnedCacheEdits> pinned = MicroCompactor.getPinnedCacheEdits(SESSION);
         assertThat(pinned).hasSize(1);
         assertThat(pinned.get(0).userMessageIndex()).isEqualTo(lastUserMessageIndex(params));
         assertThat(pinned.get(0).block().edits()).isNotEmpty();
@@ -110,7 +117,7 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
         enqueueCacheEditsBlock(history);
         MessageCreateParams first = buildParams(history);
         int pinnedIdx = lastUserMessageIndex(first);
-        assertThat(MicroCompactor.getPinnedCacheEdits()).hasSize(1);
+        assertThat(MicroCompactor.getPinnedCacheEdits(SESSION)).hasSize(1);
 
         // 第二次请求：不 enqueue 新块 → 仅重插 pinned
         MessageCreateParams second = buildParams(history);
@@ -128,7 +135,7 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
         // 第一次请求：注入 + pin（8 个删除，tool ids t0..t7）
         enqueueCacheEditsBlock(history);
         buildParams(history);
-        assertThat(MicroCompactor.getPinnedCacheEdits()).hasSize(1);
+        assertThat(MicroCompactor.getPinnedCacheEdits(SESSION)).hasSize(1);
 
         // 第二次请求：enqueue 相同删除集 → 新块与 pinned 完全去重 → 仅 pinned 重插，无重复块
         enqueueCacheEditsBlock(history);
@@ -143,14 +150,14 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
     void gateOff_noConsumeNoInject() {
         // setCachedMicrocompactEnabled(false) 由 setUp 保证
         List<ChatMessageDto> history = buildInjectionHistory();
-        MicroCompactor.resetMicrocompactState();
+        MicroCompactor.resetMicrocompactState(SESSION);
         // 通过完整路径尝试入队（门关 → cached 路径不触发 → 块不入队）
-        new MicroCompactor().microcompactMessages(history, "repl_main_thread");
+        new MicroCompactor().microcompactMessages(history, "repl_main_thread", SESSION);
 
         MessageCreateParams params = buildParams(history);
-        assertThat(MicroCompactor.consumePendingCacheEditsBlock())
+        assertThat(MicroCompactor.consumePendingCacheEditsBlock(SESSION))
             .as("门关 → pendingCacheEditsBlock 未入队，consume 仍为 null").isNull();
-        assertThat(MicroCompactor.getPinnedCacheEdits()).isEmpty();
+        assertThat(MicroCompactor.getPinnedCacheEdits(SESSION)).isEmpty();
 
         MessageParam lastUser = params.messages().get(lastUserMessageIndex(params));
         assertThat(countCacheEditsBlocks(lastUser.content().asBlockParams()))
@@ -187,11 +194,11 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
     private static void enqueueCacheEditsBlock(List<ChatMessageDto> history) {
         // 13 个可压缩工具 → active(13) > triggerThreshold(10) → cached 路径删除 → 入队 block（8 个删除）
         List<ChatMessageDto> trigger = buildThirteenToolMessages();
-        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread");
-        CacheEditsBlock queued = MicroCompactor.consumePendingCacheEditsBlock();
+        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread", SESSION);
+        CacheEditsBlock queued = MicroCompactor.consumePendingCacheEditsBlock(SESSION);
         assertThat(queued).as("前置：cached 路径触发删除 → pendingCacheEditsBlock 已入队").isNotNull();
         // 重新触发入队，供 buildMessageParams 消费
-        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread");
+        new MicroCompactor().microcompactMessages(trigger, "repl_main_thread", SESSION);
     }
 
     private static MessageCreateParams buildParams(List<ChatMessageDto> history) {
@@ -278,14 +285,14 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
     }
 
     private static ChatMessageDto userMsg(String text) {
-        return new ChatMessageDto(null, null, Role.user, null, text,
+        return new ChatMessageDto(null, SESSION, Role.user, null, text,
             null, null, null, null, null, null, null, null, null,
             null, List.of(), List.of());
     }
 
     private static ChatMessageDto assistantWithToolCall(String id, String name, String toolCallId) {
         return new ChatMessageDto(
-            id, null, Role.assistant, "assistant", "thinking", null,
+            id, SESSION, Role.assistant, "assistant", "thinking", null,
             List.of(new ToolCallDto(toolCallId, name, "{}", null, false)),
             com.nexusai.model.session.dto.FinishReason.tool_calls, null, null, "刚刚", OffsetDateTime.now(),
             null, null, null, List.of(), List.of());
@@ -293,7 +300,7 @@ class AnthropicSdkProviderCacheEditsInjectionTest {
 
     private static ChatMessageDto toolMsg(String id, String content, String toolCallId) {
         return new ChatMessageDto(
-            id, null, Role.tool, "tool", content, null,
+            id, SESSION, Role.tool, "tool", content, null,
             List.of(), com.nexusai.model.session.dto.FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(),
             toolCallId, null, null, List.of(), List.of());
     }

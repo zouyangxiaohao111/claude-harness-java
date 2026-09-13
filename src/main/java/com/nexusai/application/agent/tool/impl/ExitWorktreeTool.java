@@ -8,7 +8,6 @@ import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.context.ClaudemdEngine;
 import com.nexusai.application.agent.memory.AutoMemPaths;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
@@ -367,7 +366,7 @@ public class ExitWorktreeTool implements Tool {
         }
         String slug = session.worktreeName();
         boolean discardChanges = readBool(call, "discard_changes", false);
-        Path gitRoot = currentGitRoot();
+        Path gitRoot = currentGitRoot(sessionKey);
         // gap1-originalCwd: CC ExitWorktreeTool.ts:47-58 outputSchema originalCwd 必填。
         //   Java 端退出时回显用户真实目录（前端传入），缺失回退 getOriginalCwdLayer
         //   （对齐 CC session.originalCwd，零行为变化——不再用 gitRoot，见 resolveOriginalCwd）。
@@ -590,9 +589,14 @@ public class ExitWorktreeTool implements Tool {
 
     /** 当前 git 仓库根目录 · 对齐 CC worktree.ts findCanonicalGitRoot(getCwd()).
      *  cwd-align-ext：user.dir 硬编码 → 会话 cwd + 复用 {@link AutoMemPaths#findCanonicalGitRoot}；
-     *  无 sessionId 回落 user.dir（方案 1，零行为变化）。 */
-    private Path currentGitRoot() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+     *  无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     *
+     *  <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code execute} 显式传入（= {@code ctx.sessionId()}，
+     *  无 ctx ⇒ null）；⛔ 不再读裸 MDC。
+     *
+     *  @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir） */
+    private Path currentGitRoot(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         if (cwd == null || cwd.isBlank()) {
             cwd = System.getProperty("user.dir", ".");
         }

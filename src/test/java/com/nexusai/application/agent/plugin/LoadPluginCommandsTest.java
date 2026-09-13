@@ -194,7 +194,8 @@ class LoadPluginCommandsTest {
         SkillRegistry registry = new SkillRegistry(tempDir.resolve(".claude/skills").toString());
         registry.setPluginLoader(loader);
 
-        List<Command> all = registry.getAllCommands();
+        // [批 3c] 无会话 → 显式 null（本用例只验 plugin 命令/技能合并面，不涉会话）
+        List<Command> all = registry.getAllCommands(null);
         List<String> names = all.stream().map(Command::getName).toList();
         assertThat(names)
             .as("getAllCommands 必须含 plugin 命令 + plugin 技能（CC commands.ts:465-466）")
@@ -207,7 +208,7 @@ class LoadPluginCommandsTest {
         Command toolz = all.stream().filter(c -> c.getName().equals("merge-plugin:toolz")).findFirst().orElseThrow();
         assertThat(toolz.getLoadedFrom()).isEqualTo(CommandLoadedFrom.PLUGIN);
         // POJO 未注入 pluginLoader → 无 plugin 源（兼容既有直构）
-        assertThat(new SkillRegistry("x").getAllCommands().stream()
+        assertThat(new SkillRegistry("x").getAllCommands(null).stream()
             .map(Command::getName)).doesNotContain("merge-plugin:ship");
     }
 

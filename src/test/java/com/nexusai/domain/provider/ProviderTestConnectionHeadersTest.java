@@ -1,6 +1,5 @@
 package com.nexusai.domain.provider;
 
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.llm.DynamicHeaderExpander;
 import com.nexusai.infra.llm.ProviderHeaderInjector;
 import com.nexusai.infra.util.CryptoUtil;
@@ -57,13 +56,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>两条关键语义（规范 §6.7 定案，本类负责钉住）</b>：
  * <ol>
- *   <li><b>sessionId 恒传 {@code null}</b>（不读 {@code RequestContext.sessionId()}）：该线程的 MDC 可能
- *       是<b>上一个请求残留的、别的会话的 sessionId</b>（Tomcat 线程复用；本仓
+ *   <li><b>sessionId 恒传 {@code null}</b>（绝不从任何 ambient 会话槽读取）：原隐患是「该线程的
+ *       会话载体可能是<b>上一个请求残留的、别的会话的 sessionId</b>（Tomcat 线程复用；本仓
  *       {@code MemoryController:143} / {@code TaskController:145} / {@code TeamController:95} 三处
- *       {@code setSession} 均无 {@code clear}），而 {@code ProviderController.test(:38)} 的签名是
+ *       连 ambient 写点均无清理）」，而 {@code ProviderController.test(:38)} 的签名是
  *       {@code test(@PathVariable String id)}——<b>无 sessionId 入参</b>。读它 = 把 <b>A 会话的亲和 id
  *       发给 B 会话的测试连接请求</b>。故占位符一律落
- *       {@link DynamicHeaderExpander#STATIC_FALLBACK}（{@code nexusai-static}），零损失零风险。</li>
+ *       {@link DynamicHeaderExpander#STATIC_FALLBACK}（{@code nexusai-static}），零损失零风险。
+ *       <b>[批 3c]</b>：ambient 会话载体（裸 MDC 会话槽）已整类删除 ⇒ 「残留」这一诱饵已无法构造，
+ *       但「必须落兜底常量」的断言仍钉住 {@code apply} 第三参恒为 {@code null} 这个接缝。</li>
  *   <li><b>保留头冲突以内置为准</b>：内置 {@code Authorization} 不得被用户配置顶掉。</li>
  * </ol>
  *
@@ -71,11 +72,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ul>
  *   <li><b>【有效·单点】删掉 {@code ProviderHeaderInjector.apply(...)} 整段</b> →
  *       {@link #customHeadersAreSentOnTestConnection} 与
- *       {@link #residualMdcSessionIdMustNotLeakIntoTestConnection} <b>红</b>。</li>
- *   <li><b>【有效·单点】把 {@code apply} 的第三参从 {@code null} 改成 {@code RequestContext.sessionId()}</b>
- *       → {@link #residualMdcSessionIdMustNotLeakIntoTestConnection} <b>红</b>（该用例预置了残留 MDC；
- *       {@link #customHeadersAreSentOnTestConnection} 因不预置残留、且用例间 {@code clear}，仍绿——
- *       这正是为什么两条用例都要有）。</li>
+ *       {@link #sessionIdMustAlwaysFallBackToStaticConstant} <b>红</b>。</li>
+ *   <li><b>【有效·单点】把 {@code apply} 的第三参从 {@code null} 改成任一 ambient 会话读取</b>
+ *       → {@link #sessionIdMustAlwaysFallBackToStaticConstant} <b>红</b>（该用例断言占位符落兜底常量；
+ *       {@link #customHeadersAreSentOnTestConnection} 在同样的读取下也会一致通过 ⇒ 需两条用例并存以
+ *       分别钉住「静态头照发」与「占位符落常量」两件事）。
+ *       <br><b>[批 3c] 补偿说明</b>：批 3c 删除了 ambient 会话载体 ⇒ 「残留值被采纳」这一形态在结构上
+ *       已不可能；本用例当前钉的是「第三参恒 null」这个接缝本身，鉴别力来自「若有人把接缝改成任何
+ *       非 null 来源（显式或 ambient），断言即红」。</li>
  *   <li><b>【有效·必须多点】{@code Authorization} 冲突</b>：<b>只反转设置顺序 → 恒绿，这是预期不是缺口</b>
  *       ——因为 {@code authorization} 在 {@code DynamicHeaderExpander} 的禁止清单里，脏数据在
  *       {@code apply} 内部就被过滤掉，<b>冲突方压根没进来</b>，顺序成了空操作。按本批已立的 §9.6.1
@@ -100,9 +104,6 @@ class ProviderTestConnectionHeadersTest {
     private static final String PROVIDER_ID = "prov-hdr-1";
     private static final String ENCRYPTED_KEY = "enc-key";
     private static final String PLAIN_KEY = "k";
-
-    /** 模拟「上一个请求留在 Tomcat 工作线程上的、别的会话的 sessionId」。 */
-    private static final String STALE_MDC_SESSION_ID = "sess-STALE-FROM-PREVIOUS-REQUEST";
 
     /** 存量脏数据里的假凭据（用于验证内置 Authorization 不被顶掉）。 */
     private static final String HIJACKED_AUTH = "Bearer HIJACKED-STALE-DATA";
@@ -135,7 +136,6 @@ class ProviderTestConnectionHeadersTest {
         }
         // 复位静态读源，避免泄漏到其它测试类（与 ProviderHeaderInjectorTest.resetGateSource 同款）。
         ProviderHeaderInjector.installGateSource(null);
-        RequestContext.clear();
     }
 
     /** 起桩：{@code GET /models} → 200 + 空 JSON 体；同时把请求头快照进 {@link #capturedHeaders}。 */
@@ -295,32 +295,31 @@ class ProviderTestConnectionHeadersTest {
 
 
     /**
-     * 模拟 Tomcat 线程复用：本线程先服务过别的会话的请求（{@code setSession} 无 {@code clear}），
-     * 残留了<b>别的会话</b>的 sessionId，随后被复用来跑「测试连接」。
+     * 占位符 {@code ${session_id}} 必须<b>恒落</b>兜底常量（{@code apply} 第三参恒传 {@code null}）。
      *
-     * <p>若实现读 {@code RequestContext.sessionId()}，用户会把 <b>A 会话的亲和 id 发给 B 会话的请求</b>
-     * ——不报错、不落常量，静默串话。本用例钉住「恒传 {@code null}」。
+     * <p>原用例模拟 Tomcat 线程复用：本线程先服务过别的会话的请求，残留了<b>别的会话</b>的 sessionId，
+     * 随后被复用来跑「测试连接」；若实现读该残留值，用户会把 <b>A 会话的亲和 id 发给 B 会话的请求</b>
+     * ——不报错、不落常量，静默串话。
+     *
+     * <p><b>[批 3c] 语义消失（已登记待裁定）</b>：ambient 会话载体（裸 MDC 会话槽）已整类删除
+     * ⇒ 「写残留值」的装置与本用例的「前置条件」断言（断言残留值确实存在）已无法构造并已删除。
+     * <b>下面的断言文本原样保留、未改弱</b>：它仍钉住「测试连接的 sessionId 恒为 null → 占位符恒落
+     * {@code STATIC_FALLBACK}」这条真实契约；如果将来有人把该接缝改成任何非 null 来源（实测注入的
+     * 会话或新 ambient 槽），本用例会立刻变红。
      */
     @Test
-    @DisplayName("线程残留的 MDC sessionId 绝不得泄漏进测试连接（必须落兜底常量）")
-    void residualMdcSessionIdMustNotLeakIntoTestConnection() throws IOException {
+    @DisplayName("测试连接的 sessionId 恒传 null → ${session_id} 必须落兜底常量（不得泄漏任何会话 id）")
+    void sessionIdMustAlwaysFallBackToStaticConstant() throws IOException {
         ProviderService svc = newService(startStub(), Map.of(
             "x-opencode-session", DynamicHeaderExpander.SESSION_ID_TOKEN));
 
-        RequestContext.setSession(STALE_MDC_SESSION_ID);
-        try {
-            assertThat(RequestContext.sessionId())
-                .as("前置条件：本线程上确实存在「上一个请求残留的、别的会话的 sessionId」")
-                .isEqualTo(STALE_MDC_SESSION_ID);
+        // [批 3c] 语义消失：原此处 setSession("sess-STALE-FROM-PREVIOUS-REQUEST") 造「别的会话残留」诱饵
+        //   并断言诱饵存在；该 ambient 会话槽（连同其写点）已整类删除 ⇒ 装置与前置条件断言删除。
+        TestConnectionResponse resp = svc.test(PROVIDER_ID);
 
-            TestConnectionResponse resp = svc.test(PROVIDER_ID);
-
-            assertThat(resp.ok()).as("桩返回 200 → 必须成功").isTrue();
-            assertThat(capturedHeaders.get().get("x-opencode-session"))
-                .as("必须落兜底常量：把残留的别人的会话 id 发出去 = 静默串话，比 null 更坏")
-                .containsExactly(DynamicHeaderExpander.STATIC_FALLBACK);
-        } finally {
-            RequestContext.clear();
-        }
+        assertThat(resp.ok()).as("桩返回 200 → 必须成功").isTrue();
+        assertThat(capturedHeaders.get().get("x-opencode-session"))
+            .as("必须落兜底常量：把任何会话 id 发出去 = 静默串话/无谓泄漏，比 null 更坏")
+            .containsExactly(DynamicHeaderExpander.STATIC_FALLBACK);
     }
 }

@@ -5,9 +5,7 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.compact.PostCompactCleanup;
 import com.nexusai.application.agent.config.ToolRegistrationConfig;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.command.dto.BuiltInCommandDto;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -95,11 +93,6 @@ class CacheInvalidationTest {
         }
     }
 
-    @AfterEach
-    void tearDown() {
-        RequestContext.clear();
-    }
-
     @Test
     @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("/clear 触发: executeBuiltin(clear) 清缓存 → 同 name 重算，返回 DTO 不变")
@@ -109,18 +102,15 @@ class CacheInvalidationTest {
 
         CommandController controller = new CommandController();
         ReflectionTestUtils.setField(controller, "sessionAgentStateRegistry", fx.registry);
-        RequestContext.set(fx.sessionId.toString(), "req-clear");
-        try {
-            // [RES-④] executeBuiltin 新增可选 @RequestBody 参数（resume 分支消费），非 resume 传 null；
-            //   返回类型 Object（resume → ResumeAgentResult，其余 → BuiltInCommandDto），此处强转
-            BuiltInCommandDto dto = (BuiltInCommandDto) controller.executeBuiltin("clear", null, null);
-            assertThat(dto.name()).as("DEC-9 返回 DTO 不变").isEqualTo("clear");
-            assertThat(fx.resolveAfterClear())
-                .as("/clear 后缓存已清 → resolveAll 重新 compute（CC clearSystemPromptSections）")
-                .isEqualTo(2);
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 会话标识经**第 2 形参**显式传入（原经裸 MDC 会话槽，该槽已删）
+        // [RES-④] executeBuiltin 另有可选 @RequestBody 参数（resume 分支消费），非 resume 传 null；
+        //   返回类型 Object（resume → ResumeAgentResult，其余 → BuiltInCommandDto），此处强转
+        //   ⚠ 形参序：executeBuiltin(String name, String sessionIdParam, ResumeExecuteRequest request)
+        BuiltInCommandDto dto = (BuiltInCommandDto) controller.executeBuiltin("clear", fx.sessionId, null);
+        assertThat(dto.name()).as("DEC-9 返回 DTO 不变").isEqualTo("clear");
+        assertThat(fx.resolveAfterClear())
+            .as("/clear 后缓存已清 → resolveAll 重新 compute（CC clearSystemPromptSections）")
+            .isEqualTo(2);
     }
 
     @Test
@@ -132,7 +122,7 @@ class CacheInvalidationTest {
 
         CommandController controller = new CommandController();
         ReflectionTestUtils.setField(controller, "sessionAgentStateRegistry", fx.registry);
-        // MDC 未设置 → sessionId null → debug skip
+        // 无会话（第三形参 sessionId=null）→ 失效跳过
         controller.executeBuiltin("clear", null, null);
         assertThat(fx.computeCount.get()).as("无会话上下文 → 失效跳过 → 缓存未清").isEqualTo(1);
     }
@@ -146,15 +136,11 @@ class CacheInvalidationTest {
         // 构造即把 STATIC_SESSION_REGISTRY 覆盖为当前用例 registry（跨用例静态隔离：每用例新建覆盖；
         //   FIX-CL 新增 ClaudemdEngine 位传 null → STATIC_CLAUDE_MD 空 → resetGetMemoryFilesCache 跳过）
         new PostCompactCleanup(null, fx.registry, null);
-        RequestContext.set(fx.sessionId.toString(), "req-compact");
-        try {
-            PostCompactCleanup.runPostCompactCleanup("compact");
-            assertThat(fx.resolveAfterClear())
-                .as("compact 后不命中旧缓存（CC postCompactCleanup.ts:62 / REQ-SP-11）")
-                .isEqualTo(2);
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 会话标识显式传入（原经裸 MDC 会话槽定位会话级 section 缓存，该槽已删）
+        PostCompactCleanup.runPostCompactCleanup("compact", fx.sessionId);
+        assertThat(fx.resolveAfterClear())
+            .as("compact 后不命中旧缓存（CC postCompactCleanup.ts:62 / REQ-SP-11）")
+            .isEqualTo(2);
     }
 
     @Test
@@ -233,20 +219,16 @@ class CacheInvalidationTest {
         Fixture fx = new Fixture();
         fx.primeCache();
         new PostCompactCleanup(null, fx.registry, null);
-        RequestContext.set(fx.sessionId.toString(), "req-compact");
-        try {
-            // main-thread querySource（CC isMainThreadCompact: repl_main_thread* 前缀）——只有 main-thread
-            // 压缩才重置模块级状态（postCompactCleanup.ts:36-39），subagent/compact 命令不触达
-            PostCompactCleanup.runPostCompactCleanup("repl_main_thread:test");
-            assertThat(hookFired.get())
-                .as("clearUserOnlyProviderCaches 触发注册的 user-only 缓存清空回调（CC getUserContext.cache.clear 等价）")
-                .isGreaterThan(0);
-            assertThat(fx.resolveAfterClear())
-                .as("compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
-                .isEqualTo(2);
-        } finally {
-            RequestContext.clear();
-        }
+        // main-thread querySource（CC isMainThreadCompact: repl_main_thread* 前缀）——只有 main-thread
+        // 压缩才重置模块级状态（postCompactCleanup.ts:36-39），subagent/compact 命令不触达
+        // [批 3c] 会话标识显式传入（原经裸 MDC 会话槽定位会话级 section 缓存，该槽已删）
+        PostCompactCleanup.runPostCompactCleanup("repl_main_thread:test", fx.sessionId);
+        assertThat(hookFired.get())
+            .as("clearUserOnlyProviderCaches 触发注册的 user-only 缓存清空回调（CC getUserContext.cache.clear 等价）")
+            .isGreaterThan(0);
+        assertThat(fx.resolveAfterClear())
+            .as("compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
+            .isEqualTo(2);
     }
 
     @Test
@@ -265,18 +247,14 @@ class CacheInvalidationTest {
         Fixture fx = new Fixture();
         fx.primeCache();
         new PostCompactCleanup(null, fx.registry, null);
-        RequestContext.set(fx.sessionId.toString(), "req-compact");
-        try {
-            PostCompactCleanup.runPostCompactCleanup("REPL_MAIN_THREAD:test");
-            assertThat(hookFired.get())
-                .as("大写枚举名（生产真实值）必须触发 clearUserOnlyProviderCaches 回调（CC postCompactCleanup.ts:36-39）")
-                .isGreaterThan(0);
-            assertThat(fx.resolveAfterClear())
-                .as("compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
-                .isEqualTo(2);
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 会话标识显式传入（原经裸 MDC 会话槽定位会话级 section 缓存，该槽已删）
+        PostCompactCleanup.runPostCompactCleanup("REPL_MAIN_THREAD:test", fx.sessionId);
+        assertThat(hookFired.get())
+            .as("大写枚举名（生产真实值）必须触发 clearUserOnlyProviderCaches 回调（CC postCompactCleanup.ts:36-39）")
+            .isGreaterThan(0);
+        assertThat(fx.resolveAfterClear())
+            .as("compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
+            .isEqualTo(2);
     }
 
     @Test
@@ -287,15 +265,11 @@ class CacheInvalidationTest {
 
         ToolRegistrationConfig config = new ToolRegistrationConfig();
         ReflectionTestUtils.setField(config, "sessionAgentStateRegistry", fx.registry);
-        RequestContext.set(fx.sessionId.toString(), "req-tools");
-        try {
-            ReflectionTestUtils.invokeMethod(
-                config, "invalidateActiveSessionSystemPromptSections", "工具注册测试");
-            assertThat(fx.resolveAfterClear())
-                .as("工具注册后缓存清 → resolveAll 重算（CC clearSystemPromptSections 工具注册）")
-                .isEqualTo(2);
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 失效接线改为遍历全部活跃会话（不再读裸 MDC 取「当前会话」，该槽已删）
+        ReflectionTestUtils.invokeMethod(
+            config, "invalidateActiveSessionSystemPromptSections", "工具注册测试");
+        assertThat(fx.resolveAfterClear())
+            .as("工具注册后缓存清 → resolveAll 重算（CC clearSystemPromptSections 工具注册）")
+            .isEqualTo(2);
     }
 }

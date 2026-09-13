@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.skill;
 
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -11,7 +10,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.Supplier;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
@@ -44,8 +43,9 @@ import org.slf4j.LoggerFactory;
  *   <li><b>A5</b>: 真实场景 — Java Spring Boot 项目 → java detected → 加载 java/claude-api/* + shared/* + reading guide 替换 {lang}=java.</li>
  * </ul>
  *
- * <p>L3 (Java idiom): TS async readdir → 注入式 Supplier&lt;List&lt;String&gt;&gt; (entries, 测试确定性)
- *                    + {@link #detectLanguage(String)} 运行时 cwd 真实 readdir（生产主路径,
+ * <p>L3 (Java idiom): TS async readdir → 注入式 {@code Function&lt;String,List&lt;String&gt;&gt;}
+ *                    （sessionId → entries，测试确定性；[批 3c] 原 {@code Supplier<List<String>>} 无会话形参已废）
+ *                    + {@link #detectLanguage(String, String)} 运行时 cwd 真实 readdir（生产主路径,
  *                    promptFn cwd = ctx.effectiveCwd = CC getCwd 等价；ALIGN-BUNDLED-2）；
  *                    TS dynamic import('./claudeApiContent.js') → 注入式 SkillContentSupplier (懒加载);
  *                    TS `as const` LANGUAGE_INDICATORS → Java Map&lt;DetectedLanguage, List&lt;String&gt;&gt;.
@@ -129,10 +129,15 @@ public final class ClaudeApiSkillRegistrar {
         **Latest docs via WebFetch:**
         → Refer to `shared/live-sources.md` for URLs""";
 
-    private final Supplier<List<String>> cwdEntriesSupplier;       // 注入式 readdir
+    /**
+     * 注入式 readdir · [批 3c] 形参 = sessionId（{@code sessionId -> entries}；原
+     * {@code Supplier<List<String>>} 的会话读点藏在实现里，已改为调用点显式传入）。
+     * sessionId 为 null（无会话）→ 实现侧回落 user.dir（见 {@link #listCwdEntries(String)}）。
+     */
+    private final Function<String, List<String>> cwdEntriesSupplier;
     private final SkillContentSupplier contentSupplier;             // 注入式 dynamic import
 
-    public ClaudeApiSkillRegistrar(Supplier<List<String>> cwdEntriesSupplier,
+    public ClaudeApiSkillRegistrar(Function<String, List<String>> cwdEntriesSupplier,
                                     SkillContentSupplier contentSupplier) {
         this.cwdEntriesSupplier = Objects.requireNonNull(cwdEntriesSupplier);
         this.contentSupplier = Objects.requireNonNull(contentSupplier);
@@ -153,9 +158,12 @@ public final class ClaudeApiSkillRegistrar {
 
     /**
      * CC detectLanguage（claudeApi.ts:35-53）· 无 cwd（测试注入）→ 用注入 supplier 的 entries。
+     *
+     * <p>[批 3c] 本无参重载无调用方（测试缝）；无 sessionId 可传 → 显式 {@code null}
+     * （无会话，回落 user.dir）。生产路径请走 {@link #detectLanguage(String, String)}。
      */
     public DetectedLanguage detectLanguage() {
-        return detectLanguage(null);
+        return detectLanguage(null, null);
     }
 
     /**
@@ -163,9 +171,13 @@ public final class ClaudeApiSkillRegistrar {
      *
      * <p>cwd != null（生产：promptFn 运行时 cwd = ctx.effectiveCwd，CC getCwd 等价）→ 真实
      * readdir（claudeApi.ts:37-39）；readdir 失败 → null（CC :38-40 catch → null → 全文档分支）。
-     * cwd == null → 注入 supplier（测试确定性 / 无会话 cwd 时回落进程 cwd 由 Bootstrapper 供应）。
+     * cwd == null → 注入 supplier（测试确定性 / 无会话 cwd 时回落会话 cwd 由 Bootstrapper 供应）。
+     *
+     * @param cwd       运行时工作目录（CC getCwd() 等价；null → 走 entries 供应通道）
+     * @param sessionId 会话 ID（[批 3c] 显式会话来源；cwd == null 时经 entries 供应通道解析会话 cwd，
+     *                  null = 无会话 → 回落 user.dir）
      */
-    public DetectedLanguage detectLanguage(String cwd) {
+    public DetectedLanguage detectLanguage(String cwd, String sessionId) {
         List<String> entries;
         if (cwd != null) {
             try (java.util.stream.Stream<Path> stream = Files.list(Paths.get(cwd))) {
@@ -177,7 +189,7 @@ public final class ClaudeApiSkillRegistrar {
             }
         } else {
             try {
-                entries = cwdEntriesSupplier.get();
+                entries = cwdEntriesSupplier.apply(sessionId);
             } catch (Exception e) {
                 log.debug("[ClaudeApiSkill] cwd readdir failed: {}", e.getMessage());
                 return null;
@@ -317,7 +329,9 @@ public final class ClaudeApiSkillRegistrar {
                 // ALIGN-BUNDLED-2：生产检测用运行时 cwd（ctx.effectiveCwd，CC getCwd 等价），
                 // 旧实现恒用构造期 supplier（Bootstrapper 传 List::of → detectLanguage 恒 null → 恒全文档分支）。
                 // [拍板#9 part2] 第二参升级 PromptFnContext：cwd 取 context.cwd()（会话通道，见 PromptFnContext）。
-                DetectedLanguage lang = detectLanguage(context.cwd());
+                // [批 3c] sessionId 取 context.sessionId()（消费点自己已有的显式会话来源）——
+                //   cwd 缺席时 entries 供应通道按会话解析 cwd，不再回退任何 ambient 会话槽。
+                DetectedLanguage lang = detectLanguage(context.cwd(), context.sessionId());
                 String prompt = buildPrompt(lang, args);
                 return List.of(PromptBlock.text(prompt));
             }
@@ -328,13 +342,17 @@ public final class ClaudeApiSkillRegistrar {
      * 进程 cwd entries · CC getCwd()（utils/cwd.js = process.cwd()）→ readdir（claudeApi.ts:37-39）。
      *
      * <p>无会话 cwd（promptFn cwd == null）时的回落供应；IO 失败 → 空列表（与 CC readdir catch
-     * → null → 全文档分支同可观测结果）。生产主路径经 {@link #detectLanguage(String)} 用运行时 cwd。
+     * → null → 全文档分支同可观测结果）。生产主路径经 {@link #detectLanguage(String, String)}
+     * 用运行时 cwd。
      *
-     * <p>cwd-align-ext：兜底通道改走会话 cwd（CC claudeApi.ts:31 {@code const cwd = getCwd()} →
-     * :34 {@code readdir(cwd)}）；无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     * <p>cwd-align-ext：兜底通道走会话 cwd（CC claudeApi.ts:31 {@code const cwd = getCwd()} →
+     * :34 {@code readdir(cwd)}）；[批 3c] sessionId 由调用点显式传入（原为裸 MDC 读点），
+     * null（无会话）回落 user.dir（零行为变化）。
+     *
+     * @param sessionId 会话 ID（null = 无会话 → 回落 user.dir）
      */
-    public static List<String> listCwdEntries() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    public static List<String> listCwdEntries(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         Path base = Path.of(cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", "."));
         try (java.util.stream.Stream<Path> stream = Files.list(base)) {
             return stream.map(p -> p.getFileName().toString())

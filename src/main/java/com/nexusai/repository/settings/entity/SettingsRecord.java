@@ -174,12 +174,14 @@ public class SettingsRecord {
     private Integer maxConsecutiveAutocompactFailures;
     private Integer maxPtlRetries;
     private Integer maxCompactStreamingRetries;
-    // [V55 fix-transcript-nudge] snip_nudge_threshold ↔ snipNudgeThreshold：snip nudge
-    //   消息数阈值（CC original: SNIP_NUDGE_THRESHOLD = 30, snipCompact.ts:11）。
-    //   null = 回落窗口自适应算法（SnipCompactor.resolveSnipNudgeThreshold 按
-    //   effectiveWindow 档位，snip-nudge-scaleup 2026-09-08 ×3 + 2026-09-09 再 ×2：
-    //   ≥800k → 900；>600k → 600；≥400k → 360；>0 且 <400k → 180；窗口未知 0/负 → 30 CC 默认）；
-    //   >0 = DB 值直接覆盖。命名：snipNudgeThreshold 大写 T 映射 snip_nudge_threshold
+    // [V55 fix-transcript-nudge · snip-nudge-percent 2026-09-13] snip_nudge_threshold ↔
+    //   snipNudgeThreshold：snip nudge 阈值，语义 = 「上下文剩余百分比」，值域 1..100
+    //   （旧「消息数」语义及其窗口自适应档位已删除；列名的历史来源是 CC
+    //   SNIP_NUDGE_THRESHOLD（snipCompact.ts:11，消息数语义），该 CC 原判定已改由剩余百分比承担）。
+    //   null = 未配置 → 消费点回落默认 30%（SnipCompactor.SNIP_NUDGE_DEFAULT_REMAINING_PERCENT）；
+    //   越界（0/负/>100，含旧语义存量值）→ 读侧回落 30% + WARN，写侧 ValidationException（400）。
+    //   关闭 nudge 请用 history_snip_enabled（0 按非法处理，防旧语义静默翻转行为）。
+    //   命名：snipNudgeThreshold 大写 T 映射 snip_nudge_threshold
     //   （MyBatis-Flex camelCase→snake 精确映射，同 V45 classifierModel 大写 M 反向先例）。
     private Integer snipNudgeThreshold;
     // [prompt-align G0-02 V56] 提示词对齐门控 12 列（settings 单行多列；全部可空，

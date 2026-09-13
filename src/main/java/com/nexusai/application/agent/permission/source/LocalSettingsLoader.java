@@ -77,7 +77,7 @@ public class LocalSettingsLoader implements PermissionSourceLoader {
      */
     @Autowired
     public LocalSettingsLoader(SettingsJsonParser parser) {
-        this(parser, CwdResolution::getOriginalCwdLayer);
+        this(parser, () -> CwdResolution.getOriginalCwdLayer(null));
     }
 
     /**

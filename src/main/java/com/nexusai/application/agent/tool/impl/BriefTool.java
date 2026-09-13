@@ -6,7 +6,6 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.AttachmentResolver;
 import com.nexusai.application.agent.tool.BriefAttachmentUploader;
@@ -519,12 +518,15 @@ public class BriefTool implements Tool {
     /** 当前会话 cwd（validate ENOENT 消息用；CC getCwd()）。
      *
      *  <p>cwd-align-ext：兜底改走会话 cwd（CC attachments.ts:29 {@code const cwd = getCwd()}）；
-     *  保留 {@code ctx.effectiveCwd()} 优先层；无 sessionId 回落 user.dir（方案 1，零行为变化）。 */
+     *  保留 {@code ctx.effectiveCwd()} 优先层；无 ctx / 无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     *
+     *  <p>[批 3c] 会话来源显式化：唯一源 = {@code ctx.sessionId()}（无 ctx ⇒ 无会话）；⛔ 不再读 MDC
+     *  （原裸 MDC 读点在 StreamingToolExecutor 池线程上取不到本会话）。 */
     private static String cwd(ToolUseContext ctx) {
         if (ctx != null && ctx.effectiveCwd() != null) {
             return ctx.effectiveCwd().toString();
         }
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+        String cwd = CwdResolution.getCwd(ctx != null ? ctx.sessionId() : null);
         return Path.of(cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".")).toString();
     }
 

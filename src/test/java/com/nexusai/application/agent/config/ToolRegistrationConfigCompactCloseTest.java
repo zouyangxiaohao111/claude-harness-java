@@ -3,8 +3,6 @@ package com.nexusai.application.agent.config;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.prompt.SystemPromptInjection;
-import com.nexusai.common.RequestContext;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -32,11 +30,6 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ToolRegistrationConfigCompactCloseTest {
 
-    @AfterEach
-    void tearDown() {
-        RequestContext.clear();
-    }
-
     /** 反射读静态表当前大小 · 断言表有界性（SystemPromptInjectionTest 同款观察点）。 */
     private static int tableSize() throws Exception {
         Field field = SystemPromptInjection.class.getDeclaredField("CACHE_CLEAR_HOOKS");
@@ -55,19 +48,14 @@ class ToolRegistrationConfigCompactCloseTest {
         registry.register(sessionId, state);
 
         ToolRegistrationConfig config = new ToolRegistrationConfig();
-        RequestContext.set(sessionId.toString(), "req-compact");
-        try {
-            int before = tableSize();
-            for (int i = 0; i < 3; i++) {
-                invokeHandleCompact(config, registry);
-            }
-            assertThat(tableSize())
-                .as("3 次 /compact 后 CACHE_CLEAR_HOOKS 回到基线（每次 new provider → finally close，"
-                    + "旧实现此处每次 +1 永久泄漏）")
-                .isEqualTo(before);
-        } finally {
-            RequestContext.clear();
+        int before = tableSize();
+        for (int i = 0; i < 3; i++) {
+            invokeHandleCompact(config, registry, sessionId);
         }
+        assertThat(tableSize())
+            .as("3 次 /compact 后 CACHE_CLEAR_HOOKS 回到基线（每次 new provider → finally close，"
+                + "旧实现此处每次 +1 永久泄漏）")
+            .isEqualTo(before);
     }
 
     /**
@@ -81,10 +69,14 @@ class ToolRegistrationConfigCompactCloseTest {
      * handler → <local-command-stdout> 落库），空消息失败路径返回业务错误文案（非 null）。
      */
     private static void invokeHandleCompact(ToolRegistrationConfig config,
-                                            SessionAgentStateRegistry registry) {
+                                            SessionAgentStateRegistry registry,
+                                            String sessionId) {
+        // [批 3c] 参数序与生产 registerCompactSlashCommand lambda 一致：
+        //   (args, sessionId, inFlightUserMessageId, sessionRegistry, ...) —— 会话标识显式传参
+        //   inFlightUserMessageId 沿用原装置里的 requestId 值（"req-compact"），取值不变
         Object result = ReflectionTestUtils.invokeMethod(
             config, "handleCompactCommand",
-            "", registry, null, null, null, null, null, null, null, null, null);
+            "", sessionId, "req-compact", registry, null, null, null, null, null, null, null, null, null);
         assertThat(result).as("handleCompactCommand 失败路径返回业务错误文案（非 null）")
             .isInstanceOf(String.class).isNotNull();
     }

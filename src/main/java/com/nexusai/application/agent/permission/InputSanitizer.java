@@ -101,6 +101,21 @@ public class InputSanitizer {
      * @return 补全后的 input（防御性 deepCopy，原引用不被改动）
      */
     public JsonNode backfill(Tool tool, JsonNode input) {
+        return backfill(tool, input, null);
+    }
+
+    /**
+     * [会话 cwd] 会话感知回填 · 多传 {@link com.nexusai.application.agent.tool.ToolUseContext}
+     * 让路径类工具用<b>会话 cwd</b> 展开相对路径（对齐 CC {@code expandPath} 的
+     * {@code baseDir ?? getCwd()} 语义）；{@code ctx == null} ⇒ 回落无会话兜底（工具侧 WARN）。
+     *
+     * @param tool  工具实例（null → 直接返回 input）
+     * @param input LLM 输出的原始 input（或 stripInternalFields 后的 input）
+     * @param ctx   工具上下文（可为 null）
+     * @return 补全后的 input（防御性 deepCopy，原引用不被改动）
+     */
+    public JsonNode backfill(Tool tool, JsonNode input,
+                            com.nexusai.application.agent.tool.ToolUseContext ctx) {
         if (tool == null || input == null) {
             return input;
         }
@@ -108,7 +123,7 @@ public class InputSanitizer {
         // backfillObservableInput 的 in-place 改动（若某 override 复刻 CC mutate 语义）
         // 不污染原始 input。
         JsonNode copy = input.deepCopy();
-        JsonNode backfilled = tool.backfillObservableInput(copy);
+        JsonNode backfilled = tool.backfillObservableInput(copy, ctx);
         if (log.isDebugEnabled()) {
             log.debug("InputSanitizer.backfill: tool={} backfilled={} (CC toolExecution.ts:784-793 浅克隆回填)",
                 tool.name(), backfilled != null && backfilled != copy);

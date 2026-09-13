@@ -68,7 +68,7 @@ public class ProjectSettingsLoader implements PermissionSourceLoader {
      */
     @Autowired
     public ProjectSettingsLoader(SettingsJsonParser parser) {
-        this(parser, CwdResolution::getOriginalCwdLayer);
+        this(parser, () -> CwdResolution.getOriginalCwdLayer(null));
     }
 
     /**

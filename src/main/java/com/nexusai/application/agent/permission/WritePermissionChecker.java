@@ -493,10 +493,11 @@ public class WritePermissionChecker {
      * </ul>
      *
      * @param filePath 原始 input 路径（可含 ~ / 相对，内部 expandPath 展开）
-     * @param cwd      校验基准 cwd（project base 用）
+     * @param cwd       校验基准 cwd（project base 用；null/空 → 走 sessionId 显式解析）
+     * @param sessionId 会话 ID（[批 3c] cwd 缺省时的显式来源；null = 无会话 → 进程 user.dir）
      * @return SkillScope 或 null（不在 skill 目录 / 不合法 skillName）
      */
-    private static SkillScope getClaudeSkillScope(String filePath, String cwd) {
+    private static SkillScope getClaudeSkillScope(String filePath, String cwd, String sessionId) {
         if (filePath == null) {
             return null;
         }
@@ -506,7 +507,10 @@ public class WritePermissionChecker {
             return null;
         }
         String absolutePathLower = absolutePath.toLowerCase();
-        String cwdPosix = toPosix(cwd != null && !cwd.isEmpty() ? cwd : CwdResolution.getCwd());
+        // [批 3c] cwd 缺省 → 显式 sessionId 解析（原经裸 MDC 的无参重载已删）；sessionId 亦空
+        //   → 进程 user.dir（调用方 cwdOf(ctx) 恒非 null，此分支仅显式传空 cwd 的调用方命中）。
+        String cwdPosix = toPosix(cwd != null && !cwd.isEmpty()
+            ? cwd : CwdResolution.getCwd(sessionId));
         String homePosix = toPosix(System.getProperty("user.home", ""));
         // 决策 D1/D6 全动态：用户级 nexusai 自有根 = NexusaiPaths.getAppConfigHomeDir()（~/.{appName}），
         // 其 skills 目录与 ~/.claude/skills 等价，加入 global base（nexusai 复刻版 .claude 改造）。
@@ -551,7 +555,8 @@ public class WritePermissionChecker {
      */
     private static List<PermissionUpdate> skillScopeSuggestions(String rawPath, ToolUseContext ctx) {
         String cwd = cwdOf(ctx);
-        SkillScope scope = getClaudeSkillScope(rawPath, cwd);
+        // [批 3c] sessionId 显式穿透（cwd 缺省时不再经裸 MDC 解析）
+        SkillScope scope = getClaudeSkillScope(rawPath, cwd, ctx != null ? ctx.sessionId() : null);
         if (scope == null) {
             return List.of();
         }

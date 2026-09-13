@@ -75,13 +75,15 @@ class SkillRegistryMemoizeTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
         // 第 1 次：supplier 第 1 次求值 true → 含 toggle-t；skill-a 恒在（raw memoize）
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null（本类各用例只验 memoize/缓存键/过滤新鲜，不涉会话；仅
+        //   cacheKey* 两例经 ThreadLocal 测试缝模拟会话 cwd，亦不使用 sessionId 形参）
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .contains("skill-a").contains("toggle-t");
         // 第 2 次：supplier 第 2 次求值 false → toggle-t 被过滤（fresh，不冻结进缓存）
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .contains("skill-a").doesNotContain("toggle-t");
         // 第 3 次：同第 2 次（supplier 继续每调用重求值）
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .contains("skill-a").doesNotContain("toggle-t");
         // supplier 求值次数 = getAllCommands 调用次数（3），证明过滤新鲜而非注册期冻结
         assertThat(gate.get()).isGreaterThanOrEqualTo(3);
@@ -92,15 +94,16 @@ class SkillRegistryMemoizeTest {
     void diskChange_invisibleUntilRefresh(@TempDir Path tempDir) throws Exception {
         writeSkill(tempDir, "skill-a", "skill-a");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
-        assertThat(registry.getAllCommands()).extracting(Command::getName).contains("skill-a");
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("skill-a");
 
         // 追加写 skill-b：未 refresh 前不可见（RED 于现状——现状每次调用重扫返回 2）
         writeSkill(tempDir, "skill-b", "skill-b");
-        assertThat(registry.getAllCommands()).extracting(Command::getName).doesNotContain("skill-b");
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).doesNotContain("skill-b");
 
         // refresh() 是唯一失效入口 → 之后可见（GREEN）
         registry.refresh();
-        assertThat(registry.getAllCommands()).extracting(Command::getName).contains("skill-b");
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("skill-b");
     }
 
     @Test
@@ -133,7 +136,8 @@ class SkillRegistryMemoizeTest {
         registry.refresh();
 
         // 走到这里即证明 no-op 不抛，且缓存清理语义不受影响
-        assertThat(registry.getAllCommands()).extracting(Command::getName).contains("skill-a");
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("skill-a");
     }
 
     @Test
@@ -143,17 +147,18 @@ class SkillRegistryMemoizeTest {
         writeSkill(tempDir, "skill-b", "skill-b", "disable-model-invocation: true");      // 模型不可调用
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        List<Command> invocable = registry.getModelInvocableCommands();
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        List<Command> invocable = registry.getModelInvocableCommands(null);
         assertThat(invocable).extracting(Command::getName).contains("skill-a");
         assertThat(invocable).extracting(Command::getName).doesNotContain("skill-b");
         // 独立 memoize：同一过滤结果实例
-        assertThat(registry.getModelInvocableCommands()).isSameAs(invocable);
+        assertThat(registry.getModelInvocableCommands(null)).isSameAs(invocable);
 
         // 新增可调用 skill-c：refresh() 前不可见、后可见（对齐 CC getSkillToolCommands memoize）
         writeSkill(tempDir, "skill-c", "skill-c");
-        assertThat(registry.getModelInvocableCommands()).extracting(Command::getName).doesNotContain("skill-c");
+        assertThat(registry.getModelInvocableCommands(null)).extracting(Command::getName).doesNotContain("skill-c");
         registry.refresh();
-        assertThat(registry.getModelInvocableCommands()).extracting(Command::getName).contains("skill-c");
+        assertThat(registry.getModelInvocableCommands(null)).extracting(Command::getName).contains("skill-c");
     }
 
     @Test
@@ -166,11 +171,12 @@ class SkillRegistryMemoizeTest {
         registry.setMcpServerService(new ThrowingMcpServerService());
 
         // 不抛（MCP 源从未被触碰）
-        List<Command> all = registry.getAllCommands();
+        // [批 3c] 无会话 → 显式 null（下述 findCommandIncludingMcp 断言同理）
+        List<Command> all = registry.getAllCommands(null);
         assertThat(all).extracting(Command::getName).contains("skill-a");
         assertThat(all).extracting(Command::getName).doesNotContain("mcp-exploded");
         // 抛异常服务下 findCommandIncludingMcp 会真实触碰 MCP（thread-in 语义）→ 抛 = 证明分离与 thread-in 并存
-        org.assertj.core.api.Assertions.assertThatThrownBy(() -> registry.findCommandIncludingMcp("mcp-exploded"))
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> registry.findCommandIncludingMcp("mcp-exploded", null))
             .isInstanceOf(RuntimeException.class)
             .hasMessageContaining("mcp exploded");
     }
@@ -184,10 +190,11 @@ class SkillRegistryMemoizeTest {
         writeSkill(rootB, "skill-b", "skill-b");
 
         SkillRegistry registry = new SkillRegistry(rootA.toString());
-        assertThat(registry.getAllCommands()).extracting(Command::getName).contains("skill-a");
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("skill-a");
 
         registry.setSkillsRoot(rootB.toString());
-        assertThat(registry.getAllCommands()).extracting(Command::getName).contains("skill-b");
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("skill-b");
     }
 
     @Test
@@ -200,25 +207,28 @@ class SkillRegistryMemoizeTest {
         writeSkill(pb, ".claude/skills/pb-only", "pb-only");
         BundledSkills.clear(); // 隔离跨测试泄漏的 bundled 注册集
 
-        // 生产接线语义：cwdSupplier = AutoMemPaths::currentSessionProjectRoot（ToolRegistrationConfig:393）
+        // 生产接线语义：cwdSupplier = sessionId -> 会话 projectRoot（ToolRegistrationConfig:393）
+        // [批 3c] setCwdSupplier 形参由 Supplier<String> 改 Function<String,String>（会话 cwd 供应通道）；
+        //   本用例仍以「当前线程注入的 projectRoot」模拟会话 cwd（ThreadLocal 测试缝，见下），
+        //   故忽略 sessionId 形参 → 各 getAllCommands 调用一律显式 null。
         SkillRegistry registry = new SkillRegistry(tempDir.resolve("shared-root").toString());
-        registry.setCwdSupplier(AutoMemPaths::currentSessionProjectRoot);
+        registry.setCwdSupplier(sessionId -> AutoMemPaths.currentSessionProjectRoot());
 
         // 会话 A：当前线程注入 Pa → 键含 Pa → 加载 Pa/.claude/skills
         String prev = AutoMemPaths.captureCurrentProjectRoot();
         try {
             AutoMemPaths.setCurrentProjectRoot(pa.toString());
-            assertThat(registry.getAllCommands()).extracting(Command::getName).contains("pa-only");
+            assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("pa-only");
 
             // 会话 B：同一 registry 实例、同 skillsRoot，仅 projectRoot 切换 → 键含 Pb → 新缓存槽。
             // RED 于现状（键 = skillsRoot）：B 阶段命中 A 的缓存槽 → 仍含 pa-only → doesNotContain 失败。
             AutoMemPaths.setCurrentProjectRoot(pb.toString());
-            assertThat(registry.getAllCommands()).extracting(Command::getName)
+            assertThat(registry.getAllCommands(null)).extracting(Command::getName)
                 .contains("pb-only").doesNotContain("pa-only");
 
             // 切回会话 A：A 槽位仍完好（不被 B 的加载污染）
             AutoMemPaths.setCurrentProjectRoot(pa.toString());
-            assertThat(registry.getAllCommands()).extracting(Command::getName).contains("pa-only");
+            assertThat(registry.getAllCommands(null)).extracting(Command::getName).contains("pa-only");
         } finally {
             AutoMemPaths.restoreCurrentProjectRoot(prev); // capture/restore 成对，restore 外层原值
         }
@@ -234,7 +244,7 @@ class SkillRegistryMemoizeTest {
         BundledSkills.clear();
 
         SkillRegistry registry = new SkillRegistry(tempDir.resolve("shared-root").toString());
-        registry.setCwdSupplier(AutoMemPaths::currentSessionProjectRoot);
+        registry.setCwdSupplier(sessionId -> AutoMemPaths.currentSessionProjectRoot());
 
         // 两个工具线程（fixed-8 池语义，非会话线程）：IMP-C 捕获-回放传播在任务体开头注入会话
         // projectRoot（StreamingToolExecutor.executeAsync 模式），finally reset 防线程复用泄漏。
@@ -242,8 +252,9 @@ class SkillRegistryMemoizeTest {
         try {
             Future<List<String>> fA = pool.submit(() -> {
                 AutoMemPaths.setCurrentProjectRoot(pa.toString());
+                // [批 3c] 无会话 → 显式 null（会话 cwd 经 ThreadLocal 注入，非 sessionId 形参）
                 try {
-                    return registry.getAllCommands().stream().map(Command::getName).toList();
+                    return registry.getAllCommands(null).stream().map(Command::getName).toList();
                 } finally {
                     AutoMemPaths.resetCurrentProjectRoot();
                 }
@@ -251,7 +262,7 @@ class SkillRegistryMemoizeTest {
             Future<List<String>> fB = pool.submit(() -> {
                 AutoMemPaths.setCurrentProjectRoot(pb.toString());
                 try {
-                    return registry.getAllCommands().stream().map(Command::getName).toList();
+                    return registry.getAllCommands(null).stream().map(Command::getName).toList();
                 } finally {
                     AutoMemPaths.resetCurrentProjectRoot();
                 }
@@ -307,7 +318,8 @@ class SkillRegistryMemoizeTest {
         //   getWorkflowCommands(cwd) : Promise.resolve([])，:464 ...workflowCommands spread）。Java 旧实现
         //   无该合并路径（✗-1/GAP-PC-4），feature WORKFLOW_SCRIPTS 关时 CC 产出 []（provider null 等价）。
         // 未注入 provider 的独立注册中心 → 无 workflow 命令（对齐 CC feature 关 Promise.resolve([])）
-        assertThat(new SkillRegistry(tempDir.toString()).getAllCommands().stream().map(Command::getName))
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(new SkillRegistry(tempDir.toString()).getAllCommands(null).stream().map(Command::getName))
             .doesNotContain("workflow-cmd");
 
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
@@ -318,7 +330,7 @@ class SkillRegistryMemoizeTest {
         //   注入后需 refresh() 才可见，对齐 CC 磁盘变更 refresh() 前不可见）
         registry.setWorkflowCommandProvider(cwd -> List.of(wf));
 
-        assertThat(registry.getAllCommands().stream().map(Command::getName))
+        assertThat(registry.getAllCommands(null).stream().map(Command::getName))
             .as("P1-3: workflowCommandProvider 注入 → workflow 命令入 getAllCommands（CC commands.ts:464 ...workflowCommands）")
             .contains("workflow-cmd");
     }
@@ -333,21 +345,23 @@ class SkillRegistryMemoizeTest {
         //   绑定项目的 workflow 命令在前端**静默消失**（无报错）。现由 registry 在加载时按会话
         //   sessionId 现算解析一次并作**实参**传入（对齐 CC getWorkflowCommands(cwd) commands.ts:457）。
         SkillRegistry registry = new SkillRegistry(tempDir.resolve("shared-root").toString());
-        registry.setCwdSupplier(() -> "/session/proj-a");
+        registry.setCwdSupplier(sessionId -> "/session/proj-a");
         java.util.concurrent.atomic.AtomicReference<String> seen =
             new java.util.concurrent.atomic.AtomicReference<>("UNSET");
         registry.setWorkflowCommandProvider(cwd -> { seen.set(cwd); return List.of(); });
 
-        registry.getAllCommands();
+        // [批 3c] 无会话 → 显式 null（本用例模拟 per-session projectRoot 走 cwdSupplier 的固定
+        //   lambda，不使用 sessionId 形参；下述各断言同理）
+        registry.getAllCommands(null);
         assertThat(seen.get())
             .as("provider 必须收到 cwdSupplier 现算的会话 cwd（旧实现是消费线程内现读 ThreadLocal）")
             .isEqualTo("/session/proj-a");
 
         // 未绑定会话（REST 线程无 sessionId 绑定 → SessionProjectRoot.getForSession 返回 null）
         //   → provider 收 null（空列表），**绝不**回落 config home 伪造目录
-        registry.setCwdSupplier(() -> null);
+        registry.setCwdSupplier(sessionId -> null);
         seen.set("UNSET");
-        registry.getAllCommands();
+        registry.getAllCommands(null);
         assertThat(seen.get())
             .as("未绑定会话 → 显式 cwd 为 null（不回落 config home）")
             .isNull();
@@ -424,17 +438,19 @@ class SkillRegistryMemoizeTest {
 
             SkillRegistry registry = new SkillRegistry(tempDir.toString());
             // 双 cwd 交替注入（模拟两个 per-session projectRoot）
-            registry.setCwdSupplier(() -> currentCwd.get());
+            registry.setCwdSupplier(sessionId -> currentCwd.get());
             currentCwd.set(projA.toString());
-            assertThat(registry.getAllCommands()).extracting(Command::getName)
+            // [批 3c] 无会话 → 显式 null（本用例以 ThreadLocal 测试缝模拟 per-session cwd，
+            //   cwdSupplier 忽略 sessionId；下述各断言同理）
+            assertThat(registry.getAllCommands(null)).extracting(Command::getName)
                 .contains("skill-a").doesNotContain("skill-b");
             currentCwd.set(projB.toString());
             // 会话 B 不得命中 A 的缓存槽（旧实现按 skillsRoot 缓存 → 恒返回 skill-a）
-            assertThat(registry.getAllCommands()).extracting(Command::getName)
+            assertThat(registry.getAllCommands(null)).extracting(Command::getName)
                 .contains("skill-b").doesNotContain("skill-a");
             // 切回 A：槽位隔离，仍只含 skill-a
             currentCwd.set(projA.toString());
-            assertThat(registry.getAllCommands()).extracting(Command::getName)
+            assertThat(registry.getAllCommands(null)).extracting(Command::getName)
                 .contains("skill-a").doesNotContain("skill-b");
         } finally {
             ClaudePaths.setConfigDirOverride(null);

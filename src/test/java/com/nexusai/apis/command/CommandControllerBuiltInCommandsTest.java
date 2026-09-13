@@ -11,7 +11,6 @@ import com.nexusai.application.agent.tasks.BackgroundTask;
 import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskType;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.command.CommandService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
@@ -33,6 +32,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -107,8 +108,6 @@ class CommandControllerBuiltInCommandsTest {
 
     @AfterEach
     void tearDown() {
-        // [RES-④] resume 测试设置了 MDC sessionId，清理避免线程复用泄漏
-        RequestContext.clear();
         // [finding-2] skill_listing sent 注册表是进程级静态 → 测试间复位防串扰
         com.nexusai.application.agent.skill.SkillListingSentRegistry.reset();
     }
@@ -493,8 +492,8 @@ class CommandControllerBuiltInCommandsTest {
     @DisplayName("[批 3a] POST /builtins/{name}/execute 缺 sessionId → 400（不再读 MDC）")
     void executeBuiltin_missingSessionId_is400() throws Exception {
         // WHY（缺值策略 (a)）：通用入口是 /clear 等会话级内置命令的实际落点（DEC-9 薄触发），
-        //   旧实现缺 query 时回落 RequestContext.sessionId()（裸 MDC）—— MDC 第三态会读到上一请求
-        //   残留的**别的会话** id ⇒ /clear 的会话级清理作用到别的会话上。变异点：改回 MDC 兜底 → 红。
+        //   旧实现缺 query 时回落**裸 MDC 会话槽**（批 3c 已删除）—— 该槽第三态会读到上一请求
+        //   残留的**别的会话** id ⇒ /clear 的会话级清理作用到别的会话上。变异点：改回兜底 → 红。
         mockMvc.perform(post("/api/command/builtins/continue/execute"))
             .andExpect(status().isBadRequest());
         mockMvc.perform(post("/api/command/builtins/continue/execute").param("sessionId", ""))
@@ -502,17 +501,13 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
-    @DisplayName("[批 3a 反向实验] MDC 残留别的会话 id 时不串写：explicit=null 仍 400（回退 MDC 则红）")
+    @DisplayName("[批 3a 反向实验 · 批 3c 装置已删] 无 sessionId 仍 400（原 MDC 残留对照无法再构造）")
     void executeBuiltin_staleMdcDoesNotLeak() throws Exception {
-        // 装置：MDC 设成一个**合法**会话（模拟「上一请求残留」），请求不带 ?sessionId=。
-        //   若实现回退读 MDC，请求会 200 且按 sess-someone-else 执行会话级副作用 → 用例红。
-        RequestContext.setSession("sess-someone-else");
-        try {
-            mockMvc.perform(post("/api/command/builtins/continue/execute"))
-                .andExpect(status().isBadRequest());
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 语义消失：裸 MDC 会话槽已整体删除 ⇒ 「残留合法会话 id」的对照装置无法再制造
+        //   （不存在可回落的第三源）。断言文本原样保留，现与 executeBuiltin_missingSessionId_is400
+        //   等价，仅作反向实验的历史留痕。
+        mockMvc.perform(post("/api/command/builtins/continue/execute"))
+            .andExpect(status().isBadRequest());
     }
 
     @Test
@@ -554,7 +549,9 @@ class CommandControllerBuiltInCommandsTest {
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        when(dispatcher.dispatchResult("/compact"))
+        // [批 3c] 3 参形态：第 2 形参 = 显式会话（= 请求 ?sessionId=sess-compact1，非 MDC）；
+        //   第 3 形参 = 在途用户消息 id，REST /compact 端无在途消息 → 显式 null（断言锁住该契约）。
+        when(dispatcher.dispatchResult(eq("/compact"), eq("sess-compact1"), isNull()))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 5 messages"));
 
@@ -562,7 +559,7 @@ class CommandControllerBuiltInCommandsTest {
             .andExpect(status().isOk())
             .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.content()
                 .string(org.hamcrest.Matchers.containsString("Compacted 5 messages")));
-        verify(dispatcher).dispatchResult("/compact");
+        verify(dispatcher).dispatchResult(eq("/compact"), eq("sess-compact1"), isNull());
     }
 
     @Test
@@ -579,8 +576,8 @@ class CommandControllerBuiltInCommandsTest {
             .andExpect(status().isBadRequest());
         mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", ""))
             .andExpect(status().isBadRequest());
-        // fail loud：不得进入 dispatch（不压缩任何会话）
-        verify(dispatcher, org.mockito.Mockito.never()).dispatchResult(anyString());
+        // fail loud：不得进入 dispatch（不压缩任何会话）· [批 3c] 3 参形态（会话未通过校验前不得分派）
+        verify(dispatcher, org.mockito.Mockito.never()).dispatchResult(anyString(), any(), any());
     }
 
     @Test
@@ -590,7 +587,7 @@ class CommandControllerBuiltInCommandsTest {
         //   → 明确告知而非假装压缩成功。
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
-        when(dispatcher.dispatchResult("/compact")).thenReturn(null);
+        when(dispatcher.dispatchResult(eq("/compact"), eq("sess-compact2"), isNull())).thenReturn(null);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
 
         String body = mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact2"))
@@ -623,7 +620,7 @@ class CommandControllerBuiltInCommandsTest {
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        when(dispatcher.dispatchResult("/compact 用中文总结"))
+        when(dispatcher.dispatchResult(eq("/compact 用中文总结"), eq("sess-compact-args"), isNull()))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 5 messages"));
 
@@ -633,7 +630,7 @@ class CommandControllerBuiltInCommandsTest {
             .andExpect(status().isOk())
             .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.content()
                 .string(org.hamcrest.Matchers.containsString("Compacted 5 messages")));
-        verify(dispatcher).dispatchResult("/compact 用中文总结");
+        verify(dispatcher).dispatchResult(eq("/compact 用中文总结"), eq("sess-compact-args"), isNull());
     }
 
     @Test
@@ -645,13 +642,13 @@ class CommandControllerBuiltInCommandsTest {
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        when(dispatcher.dispatchResult("/compact"))
+        when(dispatcher.dispatchResult(eq("/compact"), eq("sess-compact-blank"), isNull()))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 1 messages"));
 
         mockMvc.perform(post("/api/command/builtins/compact/execute").param("sessionId", "sess-compact-blank"))
             .andExpect(status().isOk());
-        verify(dispatcher).dispatchResult("/compact");
+        verify(dispatcher).dispatchResult(eq("/compact"), eq("sess-compact-blank"), isNull());
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -669,7 +666,8 @@ class CommandControllerBuiltInCommandsTest {
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        when(dispatcher.dispatchResult(any()))
+        // [批 3c] input 不入断言（any）但**会话必须显式命中**本请求的 ?sessionId=sess-compact-p218
+        when(dispatcher.dispatchResult(any(), eq("sess-compact-p218"), isNull()))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted 7 messages"));
 
@@ -691,7 +689,7 @@ class CommandControllerBuiltInCommandsTest {
         com.nexusai.application.agent.UserInputDispatcher dispatcher =
             mock(com.nexusai.application.agent.UserInputDispatcher.class);
         ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
-        when(dispatcher.dispatchResult("/compact"))
+        when(dispatcher.dispatchResult(eq("/compact"), eq("sess-compact-p218b"), isNull()))
             .thenReturn(com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult
                 .text("Compacted generic"));
 
@@ -699,7 +697,7 @@ class CommandControllerBuiltInCommandsTest {
         Object result = ReflectionTestUtils.invokeMethod(
             controller, "executeBuiltinInternal", "compact", null, "sess-compact-p218b");
 
-        verify(dispatcher).dispatchResult("/compact");
+        verify(dispatcher).dispatchResult(eq("/compact"), eq("sess-compact-p218b"), isNull());
         assertThat(result).as("通用分支对 compact 必须真实执行（displayText），而非返回 BuiltInCommandDto 元数据")
             .isEqualTo("Compacted generic");
     }

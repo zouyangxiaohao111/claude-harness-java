@@ -3,7 +3,6 @@ package com.nexusai.application.agent.plugin;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,8 +68,14 @@ public class PluginInstaller {
     /** org policy 守卫 · CC pluginPolicy.ts:17 isPluginBlockedByPolicy（policySettings.enabledPlugins[id]===false）。 */
     private Predicate<String> policyGate;
 
-    /** cwd 提供者（project/local scope 需 projectPath= getCwd，CC pluginInstallationHelpers.ts:447）。 */
-    private Function<Void, String> cwdProvider;
+    /**
+     * cwd 提供者（project/local scope 需 projectPath= getCwd，CC pluginInstallationHelpers.ts:447）。
+     *
+     * <p>[批 3c] 形参 = **sessionId**（{@code Function<String,String>}，原 {@code Function<Void,String>}
+     * 的忽略形参已废）：调用点显式传入自己的会话来源，经 {@link CwdResolution#getCwd(String)} 解析
+     * （override ?? sessionCwd ?? boundProject ?? user.dir）。传 {@code null} = 无会话 → 回落 user.dir。
+     */
+    private Function<String, String> cwdProvider;
 
     /** 依赖闭包解析器（MPL9-UNIFY：统一走 PluginDependencyResolver 实例方法，消除 :830 static 双实现）。 */
     private PluginDependencyResolver dependencyResolver = new PluginDependencyResolver();
@@ -149,11 +154,11 @@ public class PluginInstaller {
         this.gitRunner = new GitProcessRunner();
         this.npmRunner = new ProcessBuilderNpmRunner();
         this.policyGate = id -> false;
-        // 方案1 接线：安装 projectPath 写入用会话当前 cwd（对齐 CC pluginInstallationHelpers.ts:447
+        // [批 3c] 安装 projectPath 写入用会话当前 cwd（对齐 CC pluginInstallationHelpers.ts:447
         //   installResolvedPlugin projectPath = scope !== 'user' ? getCwd() : undefined）。
-        //   经 CwdResolution.getCwd(RequestContext.sessionId())（override ?? sessionCwd ?? boundProject
-        //   ?? user.dir），无会话回落 user.dir 零变化。
-        this.cwdProvider = v -> CwdResolution.getCwd(RequestContext.sessionId());
+        //   默认层 = sessionId -> CwdResolution.getCwd(sessionId)（override ?? sessionCwd ??
+        //   boundProject ?? user.dir）；sessionId 为 null（无会话）→ 回落 user.dir 零变化。
+        this.cwdProvider = sessionId -> CwdResolution.getCwd(sessionId);
     }
 
     public PluginInstaller(GitProcessRunner gitRunner, MarketplaceManager marketplaceManager,
@@ -165,8 +170,8 @@ public class PluginInstaller {
         this.cacheUtils = cacheUtils;
         this.npmRunner = npmRunner != null ? npmRunner : new ProcessBuilderNpmRunner();
         this.policyGate = policyGate != null ? policyGate : id -> false;
-        // 方案1 接线：同无参构造（CC getCwd，pluginInstallationHelpers.ts:447）。
-        this.cwdProvider = v -> CwdResolution.getCwd(RequestContext.sessionId());
+        // [批 3c] 同无参构造（CC getCwd，pluginInstallationHelpers.ts:447）· sessionId -> getCwd(sessionId)。
+        this.cwdProvider = sessionId -> CwdResolution.getCwd(sessionId);
     }
 
     // ── 测试 setter ──────────────────────────────────────────────────────
@@ -195,7 +200,8 @@ public class PluginInstaller {
         this.policyGate = policyGate;
     }
 
-    public void setCwdProvider(Function<Void, String> cwdProvider) {
+    /** 测试 setter · [批 3c] 形参 sessionId（{@code Function<String,String>}）。 */
+    public void setCwdProvider(Function<String, String> cwdProvider) {
         this.cwdProvider = cwdProvider;
     }
 
@@ -300,6 +306,15 @@ public class PluginInstaller {
         }
 
         // ── 逐成员 cacheAndRegisterPlugin ──
+        // [批 3c] 显式传 null = 本调用点无会话来源（见下）。cwdProvider 形参已是 sessionId。
+        //
+        // WHY null（不改签名）：本方法消费链为 CLI 链
+        //   CliHandlersPlugins.handleInstall → PluginCliCommands.installPlugin → PluginOps.install
+        //   → PluginOperations.installPlugin → 本方法 —— 全链只有 (scope, name)，
+        //   **无 sessionId 形参/字段**（且该链非 web 会话入口）。
+        // 待办（跨批）：若要让 project/local scope 落在会话项目根，需
+        //   ① 本方法增 sessionId 形参；② PluginOperations.installPlugin(:121) 与其 PluginOps
+        //   实现、CliHandlersPlugins、命令注册点同步穿透。①② 均不在本批清单。
         String projectPath = !"user".equals(scope) ? cwdProvider.apply(null) : null;
         for (String id : resolution.closure()) {
             PluginMarketplace.LookupResult info = depInfo.get(id);

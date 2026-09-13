@@ -1442,7 +1442,7 @@ public class McpToolPool {
      * 本就不需要会话态的路径）→ channel 门序[3] 恒 SESSION skip（fail-closed）。
      *
      * <p>⛔ 旧实现靠 {@link #connectTransport} 向 connectWorker 回放 MDC 让
-     * {@code RequestContext.sessionId()} 可读 —— 回放装置违反「会话态一律显式传参」铁律，已删。
+     * 裸 MDC 会话槽的 {@code sessionId()} 可读 —— 回放装置违反「会话态一律显式传参」铁律，已删。
      */
     public McpTransport ensureConnectedClient(String serverName, McpTransport.TransportConfig config,
                                               @jakarta.annotation.Nullable String connectSessionId) {
@@ -1530,7 +1530,7 @@ public class McpToolPool {
         // close 已注册 transport + remove（防悬挂——任何连接路径不悬挂，I-2）。
         // [批 3b] ⛔ 此处原有「MDC 会话回放到连接 worker」装置已删：它的唯一消费方是
         //   ChannelSessionAllowlist.currentRequestSupplier()（gate 门序[3 session] 在 connectWorker
-        //   线程读 RequestContext.sessionId()）。回放属「用 ThreadLocal 冒充显式传递」，违反用户
+        //   线程读裸 MDC 会话槽）。回放属「用 ThreadLocal 冒充显式传递」，违反用户
         //   铁律；现 sessionId 经本方法参数**显式**跨线程传给 doConnectTransport（值语义，无 ThreadLocal）。
         CompletableFuture<McpTransport> connectFuture = CompletableFuture.supplyAsync(
             () -> doConnectTransport(serverName, config, timedOut, connectSessionId),
@@ -1706,7 +1706,7 @@ public class McpToolPool {
                 if ("register".equals(gateResult.action())) {
                     // Phase 4 (cron-notify): channel 关联会话 sessionId —— [批 3b] 由
                     //   {@link #connectTransport} 参数显式跨线程传入（值语义），
-                    //   ⛔ 不再读 RequestContext.sessionId()（connectWorker 池线程上 MDC 恒 null /
+                    //   ⛔ 不再读裸 MDC 会话槽（connectWorker 池线程上 MDC 恒 null /
                     //   残留别会话 id，旧实现靠已删除的 MDC 回放装置才「看起来工作」）。
                     //   CC useManageMCPConnections :523-530 channel 消息 enqueue 注入当前会话队列
                     //   （CC 单进程 ambient）——Java 多会话须显式携带。

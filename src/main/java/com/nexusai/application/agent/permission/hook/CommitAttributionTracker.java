@@ -2,7 +2,6 @@ package com.nexusai.application.agent.permission.hook;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
-import com.nexusai.common.RequestContext;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +13,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * Commit attribution 追踪器 · 对齐 CC {@code commitAttribution.ts}
@@ -33,7 +32,7 @@ import java.util.function.Supplier;
  *       {@link #trackFileModification}（CC :402-433）+ {@link #trackFileCreation}（CC :439-447）
  *       + {@link #trackFileDeletion}（CC :453-480）+ {@link #computeFileModificationContribution}
  *       （CC {@code computeFileModificationState} :325-380 claudeContribution 计算）+ {@link #sha256}
- *       （CC :244-246）+ {@link #normalizeFilePath}（CC :252-291）</li>
+ *       （CC :244-246）+ {@link #normalizeFilePath(String, String)}（CC :252-291）</li>
  *   <li><b>A2 Golden Trace</b>: 首次 Edit "abc"→"abcdef" → contribution=3（新增 3 字符）→
  *       fileStates[file]=claudeContribution:3；二次 Edit 追加 → 累加</li>
  *   <li><b>A3</b>: 纯内存状态 + 内容缓存（CC attributionHooks 模块的 file content cache，由
@@ -48,7 +47,8 @@ import java.util.function.Supplier;
  * <p><b>L3（Java idiom）</b>: TS Map/对象字面量 → Java {@code Map<String, FileState>}；
  * TS {@code createHash('sha256')} → Java {@link MessageDigest}；TS {@code Date.now()} →
  * {@link System#currentTimeMillis()}；TS {@code relative(cwd, path)} → Java
- * {@link Path#relativize}。repoRoot 以 {@link Supplier} 注入（测试可注入 @TempDir）。
+ * {@link Path#relativize}。repoRoot 以 {@code Function<String,Path>}（sessionId → repoRoot）注入
+ * （测试可注入 @TempDir；[批 3c] 会话标识由调用点显式传入）。
  *
  * <p><b>已知限制（fail-loud）</b>: CC attributionHooks 模块（注册 PostToolUse hook 的具体
  * 接线）在 CC 源码仓库缺失（setup.ts:355 动态 import './utils/attributionHooks.js'，
@@ -80,7 +80,12 @@ public final class CommitAttributionTracker {
      */
     private final Map<String, String> contentCache = new HashMap<>();
 
-    private final Supplier<Path> repoRootSupplier;
+    /**
+     * repoRoot 供应 · [批 3c] 形参 = sessionId（{@code sessionId -> repoRoot}，原无会话形参
+     * {@code Supplier<Path>} 已废）——repoRoot 依赖会话 cwd（{@link #getAttributionRepoRoot(String)}），
+     * 会话标识必须由调用点显式穿透。null = 无会话 → 回落 user.dir。
+     */
+    private final Function<String, Path> repoRootSupplier;
 
     /**
      * CC original: {@code getAttributionRepoRoot}（commitAttribution.ts:83-85）——
@@ -102,14 +107,20 @@ public final class CommitAttributionTracker {
     }
 
     /** 默认：repoRoot = CC getAttributionRepoRoot 完整链（{@link #getAttributionRepoRoot(String)}
-     *  findGitRoot(getCwd()) ?? getOriginalCwd()，commitAttribution.ts:83-85；经
-     *  RequestContext.sessionId() 取会话 cwd，findGitRoot 处理 cd subdir 场景）。 */
+     *  findGitRoot(getCwd()) ?? getOriginalCwd()，commitAttribution.ts:83-85；[批 3c] sessionId 由
+     *  调用点显式传入（{@code sessionId -> ...}），findGitRoot 处理 cd subdir 场景）。 */
     public CommitAttributionTracker() {
-        this(() -> Path.of(getAttributionRepoRoot(RequestContext.sessionId())));
+        this(sessionId -> Path.of(getAttributionRepoRoot(sessionId)));
     }
 
-    /** 完整构造器（测试注入 repoRoot · @TempDir 隔离，镜像 SessionFileAccessHooks 注入式构造器）. */
-    public CommitAttributionTracker(Supplier<Path> repoRootSupplier) {
+    /**
+     * 完整构造器（测试注入 repoRoot · @TempDir 隔离，镜像 SessionFileAccessHooks 注入式构造器）.
+     *
+     * <p>[批 3c] 形参为 {@code Function<String,Path>}（sessionId → repoRoot）：原 {@code Supplier<Path>}
+     * 的会话读点藏在实现内部，已改为调用点（PostToolUse hook 的 {@code ToolUseContext.sessionId()}）
+     * 显式传入。
+     */
+    public CommitAttributionTracker(Function<String, Path> repoRootSupplier) {
         this.repoRootSupplier = repoRootSupplier;
     }
 
@@ -127,10 +138,12 @@ public final class CommitAttributionTracker {
      * @param oldContent 修改前完整文件内容（空 = 新建/未知，按全量计入）
      * @param newContent 修改后完整文件内容
      * @param mtime      修改时间（ms）· CC default Date.now()
+     * @param sessionId  会话 ID（[批 3c] 显式来源 = 调用点 {@code ToolUseContext.sessionId()}；
+     *                   用于 repoRoot 解析 → 路径归一化键；null = 无会话 → 回落 user.dir）
      */
     public synchronized void trackFileModification(
-            String filePath, String oldContent, String newContent, long mtime) {
-        String normalized = normalizeFilePath(filePath);
+            String filePath, String oldContent, String newContent, long mtime, String sessionId) {
+        String normalized = normalizeFilePath(filePath, sessionId);
         long contribution = computeFileModificationContribution(
             oldContent == null ? "" : oldContent, newContent == null ? "" : newContent);
         FileState existing = fileStates.get(normalized);
@@ -147,17 +160,21 @@ public final class CommitAttributionTracker {
     /**
      * 追踪文件创建 · CC {@code trackFileCreation} (commitAttribution.ts:439-447) —— 等价
      * trackFileModification(state, path, '', content, false, mtime)（从空到新内容）。
+     *
+     * @param sessionId 会话 ID（[批 3c] 显式透传给 {@link #trackFileModification}）
      */
-    public synchronized void trackFileCreation(String filePath, String content, long mtime) {
-        trackFileModification(filePath, "", content == null ? "" : content, mtime);
+    public synchronized void trackFileCreation(String filePath, String content, long mtime, String sessionId) {
+        trackFileModification(filePath, "", content == null ? "" : content, mtime, sessionId);
     }
 
     /**
      * 追踪文件删除 · CC {@code trackFileDeletion} (commitAttribution.ts:453-480) ——
      * 已删字符数计入贡献（contentHash 置空），保留 fileStates 条目供删除净变化计算。
+     *
+     * @param sessionId 会话 ID（[批 3c] 显式来源；null = 无会话 → repoRoot 回落 user.dir）
      */
-    public synchronized void trackFileDeletion(String filePath, String oldContent) {
-        String normalized = normalizeFilePath(filePath);
+    public synchronized void trackFileDeletion(String filePath, String oldContent, String sessionId) {
+        String normalized = normalizeFilePath(filePath, sessionId);
         FileState existing = fileStates.get(normalized);
         long existingContribution = existing != null ? existing.claudeContribution() : 0L;
         long deletedChars = oldContent == null ? 0L : oldContent.length();
@@ -212,14 +229,26 @@ public final class CommitAttributionTracker {
     // 3. 内容缓存管理 · CC attributionHooks 模块接口
     // ════════════════════════════════════════════════════════════════
 
-    /** 缓存某路径当前内容（供下次 diff 取 oldContent）· 归一化键. */
-    public synchronized void updateCachedContent(String filePath, String content) {
-        contentCache.put(normalizeFilePath(filePath), content);
+    /**
+     * 缓存某路径当前内容（供下次 diff 取 oldContent）· 归一化键.
+     *
+     * <p>[批 3c] 归一化键依赖会话 repoRoot（{@code normalizeFilePath}）——sessionId 必须与
+     * {@link #trackFileModification} 同一来源（同一 hook 的 {@code ToolUseContext.sessionId()}），
+     * 否则缓存键与 fileStates 键不同源 → oldContent 恒 miss（每次按全量计入的静默偏差）。
+     *
+     * @param sessionId 会话 ID（null = 无会话 → repoRoot 回落 user.dir）
+     */
+    public synchronized void updateCachedContent(String filePath, String content, String sessionId) {
+        contentCache.put(normalizeFilePath(filePath, sessionId), content);
     }
 
-    /** 取缓存内容（无 → null = 首次见到，按空 oldContent 全量计入）. */
-    public synchronized String cachedContent(String filePath) {
-        return contentCache.get(normalizeFilePath(filePath));
+    /**
+     * 取缓存内容（无 → null = 首次见到，按空 oldContent 全量计入）.
+     *
+     * @param sessionId 会话 ID（[批 3c] 须与 {@link #updateCachedContent} 同源；null = 无会话）
+     */
+    public synchronized String cachedContent(String filePath, String sessionId) {
+        return contentCache.get(normalizeFilePath(filePath, sessionId));
     }
 
     /** CC original: {@code clearAttributionCaches()}（clear/caches.ts:106）—— 清空内容缓存. */
@@ -296,14 +325,22 @@ public final class CommitAttributionTracker {
         return forward;
     }
 
-    /** 实例版（注入 repoRoot）· 供 hook 链调用. */
-    public String normalizeFilePath(String filePath) {
-        return normalizeFilePath(filePath, repoRootSupplier.get());
+    /**
+     * 实例版（注入 repoRoot）· 供 hook 链调用.
+     *
+     * @param sessionId 会话 ID（[批 3c] 显式来源；null = 无会话 → repoRoot 回落 user.dir）
+     */
+    public String normalizeFilePath(String filePath, String sessionId) {
+        return normalizeFilePath(filePath, repoRootSupplier.apply(sessionId));
     }
 
-    /** 当前 repoRoot（hook 读文件用）· 测试可注入 @TempDir. */
-    public Path repoRoot() {
-        Path root = repoRootSupplier.get();
+    /**
+     * 当前 repoRoot（hook 读文件用）· 测试可注入 @TempDir.
+     *
+     * @param sessionId 会话 ID（[批 3c] 显式来源；null = 无会话 → 回落 user.dir）
+     */
+    public Path repoRoot(String sessionId) {
+        Path root = repoRootSupplier.apply(sessionId);
         return root != null ? root : Path.of(".");
     }
 

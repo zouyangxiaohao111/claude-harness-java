@@ -2,7 +2,6 @@ package com.nexusai.application.agent.loop;
 
 import com.nexusai.application.agent.CommandLifecycleNotifier;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.api.PromptSuggestion;
 import com.nexusai.application.agent.api.SpeculationEngine;
 import com.nexusai.application.agent.compact.CompactConstants;
@@ -360,11 +359,15 @@ public class AgentLoopContextFactory {
      * （与 forSession 3 参同构，非 Spring 测试场景保持旧行为）。
      */
     public AgentLoopContext shared(String projectRoot) {
-        return build(null, null, null, freshSession(projectRoot), null);
+        // [批 3c] sessionId 传 null：本重载无会话形参（其会话值由调用方以 projectRoot 显式承载；
+        //   projectRoot 非空时根本不走会话回落分支，见 freshSession）。
+        return build(null, null, null, freshSession(projectRoot, null), null);
     }
 
     public AgentLoopContext forSession(String streamTopic, String streamSessionId, String streamUserMessageId) {
-        return build(streamTopic, streamSessionId, streamUserMessageId, freshSession(null), null);
+        // [批 3c] 会话标识取本方法已有的显式形参 streamSessionId（原经裸 MDC 会话槽在
+        //   freshSession → resolveFallbackWorkspaceDir 内取，已改为形参穿透）。
+        return build(streamTopic, streamSessionId, streamUserMessageId, freshSession(null, streamSessionId), null);
     }
     /**
      * 会话 ctx · 主循环 run() 专用 5 参重载。
@@ -386,7 +389,8 @@ public class AgentLoopContextFactory {
     private AgentLoopContext build(String streamTopic, String streamSessionId, String streamUserMessageId,
             AgentLoopContext.LoopSessionState session, ApplicationEventPublisher overridePublisher) {
         if (session == null) {
-            session = freshSession(null);
+            // [批 3c] sessionId = streamSessionId（build 调用链上已有的显式会话来源）。
+            session = freshSession(null, streamSessionId);
         }
         // [FIX-B3 SU-△-1] 生产接线（拍板#5）：注册 per-run sentSkillNames / suppressNextSkillListing
         // 到 SkillChangeDetector 静态注册表，使 skill 文件变更时 resetSentSkillNames()（reload() →
@@ -425,8 +429,14 @@ public class AgentLoopContextFactory {
             modelCostCalculator);
     }
 
-    /** 全新会话级状态 · taskService / workspaceDir 注入（对齐 LlmAgentLoop 实例字段）。 */
-    private AgentLoopContext.LoopSessionState freshSession(String projectRoot) {
+    /**
+     * 全新会话级状态 · taskService / workspaceDir 注入（对齐 LlmAgentLoop 实例字段）。
+     *
+     * @param projectRoot 会话 projectRoot（非空 → 直接作为 workspaceDir；null/空白 → 走末级兜底）
+     * @param sessionId   会话 ID（[批 3c] 显式会话来源；仅末级兜底分支消费，null = 无会话 →
+     *                    兜底回落 user.dir）
+     */
+    private AgentLoopContext.LoopSessionState freshSession(String projectRoot, String sessionId) {
         AgentLoopContext.LoopSessionState session = new AgentLoopContext.LoopSessionState();
         session.setTaskService(taskService);
         if (projectRoot != null && !projectRoot.isBlank()) {
@@ -435,9 +445,10 @@ public class AgentLoopContextFactory {
             session.setWorkspaceDir(Path.of(projectRoot));
         } else {
             // cwd-align-ext：末级兜底改走会话 originalCwd（CC getOriginalCwd() subagent transcript 锚）；
-            //   无 sessionId 回落 user.dir（方案 1，零行为变化）。
+            //   [批 3c] sessionId 由本方法形参显式传入（原裸 MDC 会话槽读点已废），
+            //   null（无会话）回落 user.dir（零行为变化）。
             session.setWorkspaceDir(workspaceDir != null ? workspaceDir
-                : Path.of(resolveFallbackWorkspaceDir()));
+                : Path.of(resolveFallbackWorkspaceDir(sessionId)));
         }
         return session;
     }
@@ -445,11 +456,14 @@ public class AgentLoopContextFactory {
     /**
      * workspaceDir 末级兜底 · 对齐 CC getOriginalCwd()（subagent/hook transcript 锚）。
      *
-     * <p>freshSession 运行期经 RequestContext 取会话 originalCwd；无 sessionId 回落 user.dir
-     * （方案 1，零行为变化）。
+     * <p>[批 3c] sessionId 由 {@link #freshSession(String, String)} 调用点显式传入（build 链上的
+     * {@code streamSessionId} / forSession 形参；shared() 无会话 → null）——原裸 MDC 会话槽读点已废，
+     * 无 sessionId 回落 user.dir（零行为变化）。
+     *
+     * @param sessionId 会话 ID（null = 无会话 → 回落 user.dir）
      */
-    private static String resolveFallbackWorkspaceDir() {
-        String cwd = CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+    private static String resolveFallbackWorkspaceDir(String sessionId) {
+        String cwd = CwdResolution.getOriginalCwdLayer(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 }

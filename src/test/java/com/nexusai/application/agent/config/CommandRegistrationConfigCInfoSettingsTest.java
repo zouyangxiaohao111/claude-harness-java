@@ -120,13 +120,14 @@ class CommandRegistrationConfigCInfoSettingsTest {
         SkillRegistry registry = new SkillRegistry("");
         registry.refresh();
 
-        List<String> invocable = registry.getModelInvocableCommands().stream()
+        // [批 3c] 无会话 → 显式 null（本用例只验命令注册面过滤，不涉会话）
+        List<String> invocable = registry.getModelInvocableCommands(null).stream()
             .map(Command::getName).toList();
         assertThat(invocable).contains("security-review");
         assertThat(invocable).doesNotContain("release-notes", "privacy-settings", "think-back");
 
         // getAllCommands（web GET /api/command 数据源）含无 gate 的 local 命令
-        List<String> all = registry.getAllCommands().stream().map(Command::getName).toList();
+        List<String> all = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(all).contains("security-review", "release-notes");
         // 门控关的 local-jsx → 从 getAllCommands 过滤（对齐 CC commands.ts:484 isCommandEnabled）
         assertThat(all).doesNotContain("privacy-settings", "think-back");
@@ -140,12 +141,14 @@ class CommandRegistrationConfigCInfoSettingsTest {
 
         // /release-notes → result handler（[Fix-P1] type=local 迁移 registerSlashCommandResult →
         //   dispatchResult 回传 text；拦截器 local 分支组装 <local-command-stdout> 用户可见）
-        UserInputDispatcher.LocalCommandResult rn = dispatcher.dispatchResult("/release-notes");
+        // [批 3c] 本用例只验证「handler 注册面 → 结果/路由」，不涉会话 → 显式 null（旧实现里等价于
+        //   MDC 为空；会话相关执行（cwd 解析等）由 SlashCommandInterceptor 侧传真实 sessionId 覆盖）
+        UserInputDispatcher.LocalCommandResult rn = dispatcher.dispatchResult("/release-notes", null, null);
         assertThat(rn).isNotNull();
         assertThat(rn.kind()).as("/release-notes text 结果回传").isEqualTo("text");
         // /privacy-settings、/think-back → void handler（local-jsx 未迁移，仍走 dispatch）
-        assertThat(dispatcher.dispatch("/privacy-settings").routedTo()).isEqualTo("privacy-settings");
-        assertThat(dispatcher.dispatch("/think-back").routedTo()).isEqualTo("think-back");
+        assertThat(dispatcher.dispatch("/privacy-settings", null, null).routedTo()).isEqualTo("privacy-settings");
+        assertThat(dispatcher.dispatch("/think-back", null, null).routedTo()).isEqualTo("think-back");
     }
 
     @Test

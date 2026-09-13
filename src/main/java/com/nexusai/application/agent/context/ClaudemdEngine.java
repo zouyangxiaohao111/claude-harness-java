@@ -118,7 +118,18 @@ public class ClaudemdEngine {
 
     private final AutoMemPaths autoMemPaths;
     private final MemoryFileDetection memoryFileDetection;
-    private final Supplier<String> originalCwdSupplier;
+    /**
+     * 扫描根解析器 · {@code sessionId -> originalCwd}（对齐 CC {@code getOriginalCwd()}
+     * claudemd.ts:851）。<b>按显式 sessionId 解析</b>（批 3c 起会话标识不再经裸 MDC 槽传播）；
+     * 无会话入参 → 由 {@link #resolveOriginalCwd(String)} 一次性 WARN 后兜底
+     * {@code apply(null)}（= 进程 {@code user.dir}）。
+     */
+    private final java.util.function.Function<String, String> originalCwdResolver;
+
+    /** 无会话扫描根 WARN 一次性闸（防热路径刷屏）· {@link #resolveOriginalCwd(String)}。 */
+    private final java.util.concurrent.atomic.AtomicBoolean noSessionScanRootWarned =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private final Supplier<Boolean> userSettingsEnabled;
     private final Supplier<Boolean> projectSettingsEnabled;
     private final Supplier<Boolean> localSettingsEnabled;
@@ -175,8 +186,10 @@ public class ClaudemdEngine {
      */
     private volatile java.util.concurrent.ExecutorService hookExecutor;
 
-    /** 当前会话 ID · CC original: executeInstructionsLoadedHooks 的 sessionId 参数（claudemd.ts:1059-1068）。 */
-    private volatile Supplier<String> sessionIdSupplier = () -> com.nexusai.common.RequestContext.sessionId();
+    // [批 3c · 2026-09-13] 原在此处的 `sessionIdSupplier`（默认读裸 MDC 会话槽）已**删除**：
+    //   会话标识现由 getMemoryFiles(boolean, String sessionId) 的**显式形参**穿透到
+    //   fireInstructionsLoaded(...)（该字段的 setter 全仓 0 调用方，删除零行为变化；
+    //   MDC 默认值本身是缺陷 —— 第三态可读到别的会话 id）。
 
     /** 下一次 eager 加载要上报的 reason · CC claudemd.ts:1093 {@code nextEagerLoadReason}（one-shot，读后复位）。 */
     private volatile String nextEagerLoadReason = "session_start";
@@ -192,15 +205,21 @@ public class ClaudemdEngine {
      * {@link BundledSkillEnabledGates}；team memory 默认 false（CC feature('TEAMMEM')），
      * 生产经 {@link #setTeamMemoryEnabled} 接 FeatureFlags.teamMem()（探查 F-02/△-5）。
      *
-     * <p><b>WF-1B / G7 / DEL-04</b>：{@code originalCwdSupplier} 走
-     * {@link CwdResolution#getOriginalCwdLayer()}（对齐 CC {@code getOriginalCwd()}
+     * <p><b>WF-1B / G7 / DEL-04</b>：{@code originalCwdResolver} 为
+     * {@code sessionId -> CwdResolution.getOriginalCwdLayer(sessionId)}（对齐 CC {@code getOriginalCwd()}
      * claudemd.ts:851 —— STATE.originalCwd 启动 cwd，随 worktree/resume 重锚），
      * 替代旧 {@code () -> System.getProperty("user.dir")} 直读。CLAUDE.md 扫描根
-     * （Project/Local 向上遍历起点）= 绑定项目层覆盖 user.dir 时取对扫描根。
+     * （Project/Local 向上遍历起点）= 会话绑定项目层覆盖 user.dir 时取对扫描根。
+     *
+     * <p><b>[drop-requestcontext] 回归修复</b>：批 3c 曾把本构造器写成<b>无参解析</b>
+     * （扫描根恒回落进程 {@code user.dir}，会话绑定项目层不可达 ⇒ CLAUDE.md 扫描根退化，回归测试
+     * ClaudemdEngineTest「生产 2 参构造器扫描根」用例红）。
+     * 现恢复<b>会话感知</b>解析：扫描根按调用方传入的显式 sessionId 现算；
+     * 调用方确无会话（如 REST 端点无会话入参）→ {@link #resolveOriginalCwd(String)} 兜底 user.dir。
      */
     public ClaudemdEngine(AutoMemPaths autoMemPaths, MemoryFileDetection memoryFileDetection) {
         this(autoMemPaths, memoryFileDetection,
-            CwdResolution::getOriginalCwdLayer,
+            sessionId -> CwdResolution.getOriginalCwdLayer(sessionId),
             () -> true, () -> true, () -> true,
             () -> false,
             () -> List.of());
@@ -209,7 +228,8 @@ public class ClaudemdEngine {
     /**
      * 注入式构造器（测试隔离）。
      *
-     * @param originalCwdSupplier CC getOriginalCwd()（bootstrap/state.ts）等价
+     * @param originalCwdResolver {@code sessionId -> originalCwd}，CC getOriginalCwd()（bootstrap/state.ts）等价；
+     *                            入参为 null/空白时实现方应回落到「无会话」扫描根（进程 user.dir）
      * @param userSettingsEnabled     CC isSettingSourceEnabled('userSettings')
      * @param projectSettingsEnabled  CC isSettingSourceEnabled('projectSettings')
      * @param localSettingsEnabled    CC isSettingSourceEnabled('localSettings')
@@ -218,7 +238,7 @@ public class ClaudemdEngine {
      */
     public ClaudemdEngine(AutoMemPaths autoMemPaths,
                           MemoryFileDetection memoryFileDetection,
-                          Supplier<String> originalCwdSupplier,
+                          java.util.function.Function<String, String> originalCwdResolver,
                           Supplier<Boolean> userSettingsEnabled,
                           Supplier<Boolean> projectSettingsEnabled,
                           Supplier<Boolean> localSettingsEnabled,
@@ -226,12 +246,35 @@ public class ClaudemdEngine {
                           Supplier<List<String>> claudeMdExcludesSupplier) {
         this.autoMemPaths = autoMemPaths;
         this.memoryFileDetection = memoryFileDetection;
-        this.originalCwdSupplier = originalCwdSupplier;
+        this.originalCwdResolver = originalCwdResolver;
         this.userSettingsEnabled = userSettingsEnabled;
         this.projectSettingsEnabled = projectSettingsEnabled;
         this.localSettingsEnabled = localSettingsEnabled;
         this.teamMemoryEnabled = teamMemoryEnabled;
         this.claudeMdExcludesSupplier = claudeMdExcludesSupplier;
+    }
+
+    /**
+     * 扫描根单点解析 · {@code sessionId -> originalCwd}（CC {@code getOriginalCwd()} claudemd.ts:851）。
+     *
+     * <p><b>会话显式</b>（批 3c + drop-requestcontext）：只吃调用方显式传入的 sessionId，
+     * <b>绝不读 MDC / ThreadLocal / 任何环境态会话槽</b>。传入 null/空白 ⇒ 该路径确实无会话：
+     * <ul>
+     *   <li>一次性 {@code log.warn}（{@link #noSessionScanRootWarned} 闸，防热路径刷屏；不静默、不降 DEBUG）</li>
+     *   <li>返回值取 {@code originalCwdResolver.apply(null)} —— 生产实现
+     *       {@link CwdResolution#getOriginalCwdLayer(String)}(null) 回落进程 {@code user.dir}，
+     *       与旧「无会话」行为等价</li>
+     * </ul>
+     */
+    private String resolveOriginalCwd(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            if (noSessionScanRootWarned.compareAndSet(false, true)) {
+                log.warn("[ClaudemdEngine] 扫描根解析无会话入参（sessionId=null/空白）→ 回落进程 user.dir"
+                    + "（本进程仅提示一次；会话绑定项目场景调用方须显式传 sessionId，禁经 MDC/ThreadLocal）");
+            }
+            return originalCwdResolver.apply(null);
+        }
+        return originalCwdResolver.apply(sessionId);
     }
 
     /** 注入遥测（tengu_claude_md_permission_error / tengu_claude_rules_md_permission_error /
@@ -320,11 +363,6 @@ public class ClaudemdEngine {
         this.hookRegistry = hookRegistry;
     }
 
-    /** 注入当前会话 ID 供应器 · 默认 {@link com.nexusai.common.RequestContext#sessionId()}（MDC）。 */
-    public void setSessionIdSupplier(java.util.function.Supplier<String> sessionIdSupplier) {
-        this.sessionIdSupplier = sessionIdSupplier;
-    }
-
     /** 注入 InstructionsLoaded hook 独立执行器 · 测试可注入受控 executor（覆写懒建默认）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     public void setHookExecutor(java.util.concurrent.ExecutorService hookExecutor) {
@@ -380,8 +418,11 @@ public class ClaudemdEngine {
      *                             （CC claudemd.ts:798-801）
      * @return 有序 MemoryFileInfo 列表（父在前，@include 子在后）
      */
-    public List<MemoryFileInfo> getMemoryFiles(boolean forceIncludeExternal) {
-        return memoryFilesCache.computeIfAbsent(forceIncludeExternal, this::computeMemoryFiles);
+    public List<MemoryFileInfo> getMemoryFiles(boolean forceIncludeExternal, String sessionId) {
+        // [批 3c] sessionId 为**显式入参**（原经裸 MDC 会话槽取，该槽已删）：仅用于 InstructionsLoaded
+        //   hook 载荷的 session_id 字段，不参与缓存键（缓存键仍为 forceIncludeExternal，与旧行为一致）。
+        return memoryFilesCache.computeIfAbsent(forceIncludeExternal,
+            key -> computeMemoryFiles(key, sessionId));
     }
 
     /**
@@ -389,7 +430,7 @@ public class ClaudemdEngine {
      * （CLD-01）。one-shot 标志（{@link #consumeNextEagerLoadReason}/{@link #hasLoggedInitialLoad}）
      * 在单飞语义下每次缓存 miss 仅消费一次。
      */
-    private List<MemoryFileInfo> computeMemoryFiles(boolean forceIncludeExternal) {
+    private List<MemoryFileInfo> computeMemoryFiles(boolean forceIncludeExternal, String sessionId) {
         long startTime = System.currentTimeMillis();
         if (log.isDebugEnabled()) {
             log.debug("[ClaudemdEngine] getMemoryFiles 开始: forceIncludeExternal={}", forceIncludeExternal);
@@ -402,28 +443,29 @@ public class ClaudemdEngine {
             hasClaudeMdExternalIncludesApproved != null ? hasClaudeMdExternalIncludesApproved.get() : null);
 
         // 1. Managed file（恒加载 - policy settings）
-        processMemoryFileInto(result, getMemoryPath(ClaudemdMemoryType.MANAGED),
-            ClaudemdMemoryType.MANAGED, processedPaths, includeExternal, 0, null);
+        processMemoryFileInto(result, getMemoryPath(ClaudemdMemoryType.MANAGED, sessionId),
+            ClaudemdMemoryType.MANAGED, processedPaths, includeExternal, 0, null, sessionId);
 
         // 2. Managed rules
         processMdRulesInto(result, getManagedClaudeRulesDir(), ClaudemdMemoryType.MANAGED,
-            processedPaths, includeExternal, false, new LinkedHashSet<>());
+            processedPaths, includeExternal, false, new LinkedHashSet<>(), sessionId);
 
         // 3. User file（userSettings 门控）· 决策 D1/D3：getMemoryPath(USER) 已 nexusai 自有根
         //    优先 + claude 回落；User rules 双目录加载（nexusai 自有根 + claude 只读兼容回落，
         //    rules 为多文件按路径加载两目录无 name 冲突）
         if (bool(userSettingsEnabled)) {
-            processMemoryFileInto(result, getMemoryPath(ClaudemdMemoryType.USER),
-                ClaudemdMemoryType.USER, processedPaths, true, 0, null);
+            processMemoryFileInto(result, getMemoryPath(ClaudemdMemoryType.USER, sessionId),
+                ClaudemdMemoryType.USER, processedPaths, true, 0, null, sessionId);
             processMdRulesInto(result, getUserClaudeRulesDir(), ClaudemdMemoryType.USER,
-                processedPaths, true, false, new LinkedHashSet<>());
+                processedPaths, true, false, new LinkedHashSet<>(), sessionId);
             processMdRulesInto(result, getClaudeUserClaudeRulesDir(), ClaudemdMemoryType.USER,
-                processedPaths, true, false, new LinkedHashSet<>());
+                processedPaths, true, false, new LinkedHashSet<>(), sessionId);
         }
 
         // 4. Project + Local：从 originalCwd 向上遍历到 root（到 root 前停止，root 不入 dirs ·
         //    CC claudemd.ts:854-857 while(currentDir !== parse(currentDir).root)）
-        String originalCwd = originalCwdSupplier.get();
+        //    扫描根 = 本会话绑定项目（显式 sessionId 解析；无会话 → user.dir + 一次性 WARN）
+        String originalCwd = resolveOriginalCwd(sessionId);
         List<String> dirs = new ArrayList<>();
         Path currentPath = Paths.get(originalCwd);
         Path root = currentPath.getRoot();
@@ -453,24 +495,24 @@ public class ClaudemdEngine {
                 && !pathInWorkingPath(dir, gitRoot);
             if (bool(projectSettingsEnabled) && !skipProject) {
                 processMemoryFileInto(result, Paths.get(dir, "CLAUDE.md").toString(),
-                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null);
+                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null, sessionId);
                 // 决策 D1/D6（T4 补充）：项目级 .claude/CLAUDE.md 内容一次性导入 .nexusai/ 后
                 //   nexusai 优先 + claude 回落（resolveFirstExisting，未导入/用户手建 .claude 时兼容）
                 processMemoryFileInto(result, resolveFirstExisting(
                     Paths.get(dir, NexusaiPaths.getProjectDirName(), "CLAUDE.md"),
                     Paths.get(dir, ".claude", "CLAUDE.md")),
-                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null);
+                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null, sessionId);
                 // rules 双目录加载（nexusai + claude，按路径无 name 冲突，D1 同 User rules 双目录模式）
                 processMdRulesInto(result, Paths.get(dir, NexusaiPaths.getProjectDirName(), "rules").toString(),
                     ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, false,
-                    new LinkedHashSet<>());
+                    new LinkedHashSet<>(), sessionId);
                 processMdRulesInto(result, Paths.get(dir, ".claude", "rules").toString(),
                     ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, false,
-                    new LinkedHashSet<>());
+                    new LinkedHashSet<>(), sessionId);
             }
             if (bool(localSettingsEnabled)) {
                 processMemoryFileInto(result, Paths.get(dir, "CLAUDE.local.md").toString(),
-                    ClaudemdMemoryType.LOCAL, processedPaths, includeExternal, 0, null);
+                    ClaudemdMemoryType.LOCAL, processedPaths, includeExternal, 0, null, sessionId);
             }
         }
 
@@ -478,17 +520,17 @@ public class ClaudemdEngine {
         if (isEnvTruthy(System.getenv("CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"))) {
             for (String dir : getAdditionalDirectoriesForClaudeMd()) {
                 processMemoryFileInto(result, Paths.get(dir, "CLAUDE.md").toString(),
-                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null);
+                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null, sessionId);
                 processMemoryFileInto(result, resolveFirstExisting(
                     Paths.get(dir, NexusaiPaths.getProjectDirName(), "CLAUDE.md"),
                     Paths.get(dir, ".claude", "CLAUDE.md")),
-                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null);
+                    ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, 0, null, sessionId);
                 processMdRulesInto(result, Paths.get(dir, NexusaiPaths.getProjectDirName(), "rules").toString(),
                     ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, false,
-                    new LinkedHashSet<>());
+                    new LinkedHashSet<>(), sessionId);
                 processMdRulesInto(result, Paths.get(dir, ".claude", "rules").toString(),
                     ClaudemdMemoryType.PROJECT, processedPaths, includeExternal, false,
-                    new LinkedHashSet<>());
+                    new LinkedHashSet<>(), sessionId);
             }
         }
 
@@ -567,7 +609,7 @@ public class ClaudemdEngine {
                         continue;
                     }
                     String loadReason = file.parent() != null ? "include" : eagerLoadReason;
-                    fireInstructionsLoaded(file, loadReason);
+                    fireInstructionsLoaded(file, loadReason, sessionId);
                 }
             }
         }
@@ -603,9 +645,9 @@ public class ClaudemdEngine {
      * executeInstructionsLoadedHooks(...)}（claudemd.ts:1059-1069）—— 主路径不 await；
      * hook 在独立 executor 异步跑完（对齐 CC executeHooksOutsideREPL，hooks.ts:4335/4364）。
      *
-     * <p><b>事件参数先快照</b>（session §8）：{@code sessionIdSupplier} 依赖 RequestContext/MDC，
-     * 异步线程已切换上下文 —— 必须在调用线程同步调 {@code sessionIdSupplier.get()} 并构建
-     * {@code HookEvent}，lambda 仅捕获 per-iteration 不可变 event（无循环变量复用）。
+     * <p><b>事件参数由调用方显式传入</b>（批 3c）：{@code sessionId} 是 {@link #getMemoryFiles(boolean, String)}
+     * 的显式形参一路穿透下来的 —— 不再有任何环境态会话槽、也不在异步线程回读。
+     * {@code HookEvent} 在调用线程同步构建，lambda 仅捕获 per-iteration 不可变 event（无循环变量复用）。
      *
      * <p><b>降级不崩溃</b>（验收 §5.4）：executor 不可用/已关闭/提交被拒 → warn 并跳过，
      * 不静默丢任务、不阻断 getMemoryFiles 主路径。
@@ -613,9 +655,9 @@ public class ClaudemdEngine {
      * @param file       记忆文件（path/type/globs/parent 在调用线程快照）
      * @param loadReason load_reason（'session_start'/'compact'/'include'）
      */
-    private void fireInstructionsLoaded(MemoryFileInfo file, String loadReason) {
+    private void fireInstructionsLoaded(MemoryFileInfo file, String loadReason, String sessionId) {
         // eager 主路径：triggerFilePath=null（CC getMemoryFiles 主路径不传 triggerFilePath）
-        fireInstructionsLoaded(file, loadReason, null);
+        fireInstructionsLoaded(file, loadReason, null, sessionId);
     }
 
     /**
@@ -628,9 +670,8 @@ public class ClaudemdEngine {
      * @param loadReason      load_reason（'path_glob_match'/'include'/'nested_traversal'）
      * @param triggerFilePath 触发文件路径（nested 加载语义，CC triggerFilePath；无 → null）
      */
-    private void fireInstructionsLoaded(MemoryFileInfo file, String loadReason, String triggerFilePath) {
-        // 调用线程同步快照事件参数（sessionIdSupplier 不得延迟到异步线程调，MDC 已切换）
-        String sessionId = sessionIdSupplier != null ? sessionIdSupplier.get() : null;
+    private void fireInstructionsLoaded(MemoryFileInfo file, String loadReason, String triggerFilePath,
+                                        String sessionId) {
         HookEvent event = HookEvent.instructionsLoaded(
             file.path(), file.type().ccName(), loadReason,
             sessionId, file.globs(), triggerFilePath, file.parent());
@@ -711,8 +752,10 @@ public class ClaudemdEngine {
      */
     private void processMemoryFileInto(List<MemoryFileInfo> result, String filePath,
                                        ClaudemdMemoryType type, Set<String> processedPaths,
-                                       boolean includeExternal, int depth, String parent) {
-        result.addAll(processMemoryFile(filePath, type, processedPaths, includeExternal, depth, parent));
+                                       boolean includeExternal, int depth, String parent,
+                                       String sessionId) {
+        result.addAll(processMemoryFile(filePath, type, processedPaths, includeExternal, depth, parent,
+            sessionId));
     }
 
     /**
@@ -731,11 +774,12 @@ public class ClaudemdEngine {
      *       （claudemd.ts:667-671）</li>
      * </ul>
      *
+     * @param sessionId 显式会话 id（扫描根解析来源；null/空白 = 该路径确实无会话 → user.dir + 一次性 WARN）
      * @return 有序 MemoryFileInfo（父在前，includes 在后）
      */
     public List<MemoryFileInfo> processMemoryFile(String filePath, ClaudemdMemoryType type,
                                                   Set<String> processedPaths, boolean includeExternal,
-                                                  int depth, String parent) {
+                                                  int depth, String parent, String sessionId) {
         // 已处理 / 超深（claudemd.ts:629-632）
         String normalizedPath = normalizeForComparison(filePath);
         if (processedPaths.contains(normalizedPath) || depth >= MAX_INCLUDE_DEPTH) {
@@ -774,12 +818,12 @@ public class ClaudemdEngine {
         // @include 解析（includeBasePath = resolvedPath）
         List<String> includePaths = extractIncludes(resolvedPath, type, memoryFile);
         for (String includePath : includePaths) {
-            boolean isExternal = !pathInWorkingPath(includePath, originalCwdSupplier.get());
+            boolean isExternal = !pathInWorkingPath(includePath, resolveOriginalCwd(sessionId));
             if (isExternal && !includeExternal) {
                 continue;
             }
             result.addAll(processMemoryFile(includePath, type, processedPaths, includeExternal,
-                depth + 1, filePath));
+                depth + 1, filePath, sessionId));
         }
         return result;
     }
@@ -1111,9 +1155,9 @@ public class ClaudemdEngine {
     /** processMdRules 内联处理器（并入 result）· 环检测 visitedDirs 每规则目录独立。 */
     private void processMdRulesInto(List<MemoryFileInfo> result, String rulesDir, ClaudemdMemoryType type,
                                     Set<String> processedPaths, boolean includeExternal,
-                                    boolean conditionalRule, Set<String> visitedDirs) {
+                                    boolean conditionalRule, Set<String> visitedDirs, String sessionId) {
         result.addAll(processMdRules(rulesDir, type, processedPaths, includeExternal,
-            conditionalRule, visitedDirs));
+            conditionalRule, visitedDirs, sessionId));
     }
 
     /**
@@ -1133,10 +1177,13 @@ public class ClaudemdEngine {
      *
      * @param conditionalRule true=条件规则（有 frontmatter paths）；false=无条件规则
      * @param visitedDirs     已访问目录集合（环检测；跨调用传同一集合可合并）
+     * @param sessionId       显式会话 id（透传给 {@link #processMemoryFile} 的扫描根解析；
+     *                        null/空白 = 该路径确实无会话 → user.dir + 一次性 WARN）
      */
     public List<MemoryFileInfo> processMdRules(String rulesDir, ClaudemdMemoryType type,
                                                Set<String> processedPaths, boolean includeExternal,
-                                               boolean conditionalRule, Set<String> visitedDirs) {
+                                               boolean conditionalRule, Set<String> visitedDirs,
+                                               String sessionId) {
         if (visitedDirs.contains(rulesDir)) {
             return List.of();
         }
@@ -1182,10 +1229,10 @@ public class ClaudemdEngine {
             String resolvedEntryPath = resolveSymlink(entry.getAbsolutePath());
             if (new java.io.File(resolvedEntryPath).isDirectory()) {
                 result.addAll(processMdRules(resolvedEntryPath, type, processedPaths,
-                    includeExternal, conditionalRule, visitedDirs));
+                    includeExternal, conditionalRule, visitedDirs, sessionId));
             } else if (new java.io.File(resolvedEntryPath).isFile() && entry.getName().endsWith(".md")) {
                 List<MemoryFileInfo> files = processMemoryFile(resolvedEntryPath, type,
-                    processedPaths, includeExternal, 0, null);
+                    processedPaths, includeExternal, 0, null, sessionId);
                 for (MemoryFileInfo f : files) {
                     if (conditionalRule ? f.globs() != null : f.globs() == null) {
                         result.add(f);
@@ -1211,17 +1258,20 @@ public class ClaudemdEngine {
      * </ul>
      *
      * @param targetPath 目标文件路径（glob 匹配对象）
+     * @param sessionId  显式会话 id（Managed/User 分支基准 = 本会话扫描根；null/空白 = 无会话
+     *                   → user.dir + 一次性 WARN）
      */
     public List<MemoryFileInfo> processConditionedMdRules(String targetPath, String rulesDir,
                                                           ClaudemdMemoryType type,
                                                           Set<String> processedPaths,
-                                                          boolean includeExternal) {
+                                                          boolean includeExternal,
+                                                          String sessionId) {
         List<MemoryFileInfo> conditioned = processMdRules(rulesDir, type, processedPaths,
-            includeExternal, true, new LinkedHashSet<>());
+            includeExternal, true, new LinkedHashSet<>(), sessionId);
         List<MemoryFileInfo> matched = new ArrayList<>();
         String baseDir = (type == ClaudemdMemoryType.PROJECT)
             ? Paths.get(rulesDir).getParent() == null ? null : Paths.get(rulesDir).getParent().getParent().toString()
-            : originalCwdSupplier.get();
+            : resolveOriginalCwd(sessionId);
         for (MemoryFileInfo file : conditioned) {
             if (file.globs() == null || file.globs().isEmpty()) {
                 continue;
@@ -1258,18 +1308,21 @@ public class ClaudemdEngine {
      *
      * @param targetPath     匹配 glob 的目标文件路径
      * @param processedPaths 已处理路径集合（会被修改）
+     * @param sessionId      显式会话 id（透传扫描根解析；null/空白 = 无会话 → user.dir + 一次性 WARN）
      * @return 匹配的 Managed + User 条件规则（有 globs 且 glob 命中 targetPath）
      */
-    public List<MemoryFileInfo> getManagedAndUserConditionalRules(String targetPath, Set<String> processedPaths) {
+    public List<MemoryFileInfo> getManagedAndUserConditionalRules(String targetPath,
+                                                                  Set<String> processedPaths,
+                                                                  String sessionId) {
         List<MemoryFileInfo> result = new ArrayList<>();
         result.addAll(processConditionedMdRules(targetPath, getManagedClaudeRulesDir(),
-            ClaudemdMemoryType.MANAGED, processedPaths, false));
+            ClaudemdMemoryType.MANAGED, processedPaths, false, sessionId));
         if (bool(userSettingsEnabled)) {
             // 决策 D1/D3：User 条件规则双目录（nexusai 自有根 + claude 只读兼容回落）
             result.addAll(processConditionedMdRules(targetPath, getUserClaudeRulesDir(),
-                ClaudemdMemoryType.USER, processedPaths, true));
+                ClaudemdMemoryType.USER, processedPaths, true, sessionId));
             result.addAll(processConditionedMdRules(targetPath, getClaudeUserClaudeRulesDir(),
-                ClaudemdMemoryType.USER, processedPaths, true));
+                ClaudemdMemoryType.USER, processedPaths, true, sessionId));
         }
         return result;
     }
@@ -1285,23 +1338,25 @@ public class ClaudemdEngine {
      * @param dir            待处理目录
      * @param targetPath     目标文件路径（条件规则匹配）
      * @param processedPaths 已处理路径集合（会被修改）
+     * @param sessionId      显式会话 id（透传扫描根解析；null/空白 = 无会话 → user.dir + 一次性 WARN）
      * @return 该目录的记忆文件列表
      */
     public List<MemoryFileInfo> getMemoryFilesForNestedDirectory(String dir, String targetPath,
-                                                                 Set<String> processedPaths) {
+                                                                 Set<String> processedPaths,
+                                                                 String sessionId) {
         List<MemoryFileInfo> result = new ArrayList<>();
         if (bool(projectSettingsEnabled)) {
             result.addAll(processMemoryFile(Paths.get(dir, "CLAUDE.md").toString(),
-                ClaudemdMemoryType.PROJECT, processedPaths, false, 0, null));
+                ClaudemdMemoryType.PROJECT, processedPaths, false, 0, null, sessionId));
             // 决策 D1/D6（T4 补充）：项目级 CLAUDE.md nexusai 优先 + claude 回落
             result.addAll(processMemoryFile(resolveFirstExisting(
                 Paths.get(dir, NexusaiPaths.getProjectDirName(), "CLAUDE.md"),
                 Paths.get(dir, ".claude", "CLAUDE.md")),
-                ClaudemdMemoryType.PROJECT, processedPaths, false, 0, null));
+                ClaudemdMemoryType.PROJECT, processedPaths, false, 0, null, sessionId));
         }
         if (bool(localSettingsEnabled)) {
             result.addAll(processMemoryFile(Paths.get(dir, "CLAUDE.local.md").toString(),
-                ClaudemdMemoryType.LOCAL, processedPaths, false, 0, null));
+                ClaudemdMemoryType.LOCAL, processedPaths, false, 0, null, sessionId));
         }
         // 决策 D1/D6：rules 双目录（nexusai + claude）
         String rulesDir = Paths.get(dir, NexusaiPaths.getProjectDirName(), "rules").toString();
@@ -1309,14 +1364,14 @@ public class ClaudemdEngine {
         // 无条件 rules（未 eager 加载）· 独立 processedPaths 副本避免把条件规则文件标为已处理
         Set<String> unconditionalProcessedPaths = new LinkedHashSet<>(processedPaths);
         result.addAll(processMdRules(rulesDir, ClaudemdMemoryType.PROJECT, unconditionalProcessedPaths,
-            false, false, new LinkedHashSet<>()));
+            false, false, new LinkedHashSet<>(), sessionId));
         result.addAll(processMdRules(claudeRulesDir, ClaudemdMemoryType.PROJECT, unconditionalProcessedPaths,
-            false, false, new LinkedHashSet<>()));
+            false, false, new LinkedHashSet<>(), sessionId));
         // 条件 rules（glob 匹配 targetPath）· 双目录
         result.addAll(processConditionedMdRules(targetPath, rulesDir, ClaudemdMemoryType.PROJECT,
-            processedPaths, false));
+            processedPaths, false, sessionId));
         result.addAll(processConditionedMdRules(targetPath, claudeRulesDir, ClaudemdMemoryType.PROJECT,
-            processedPaths, false));
+            processedPaths, false, sessionId));
         // 无条件路径种子回 processedPaths（供后续目录去重，claudemd.ts:1312-1315）
         processedPaths.addAll(unconditionalProcessedPaths);
         return result;
@@ -1331,17 +1386,19 @@ public class ClaudemdEngine {
      * @param dir            待处理目录
      * @param targetPath     目标文件路径（条件规则匹配）
      * @param processedPaths 已处理路径集合（会被修改）
+     * @param sessionId      显式会话 id（透传扫描根解析；null/空白 = 无会话 → user.dir + 一次性 WARN）
      * @return 匹配的条件规则列表
      */
     public List<MemoryFileInfo> getConditionalRulesForCwdLevelDirectory(String dir, String targetPath,
-                                                                        Set<String> processedPaths) {
+                                                                        Set<String> processedPaths,
+                                                                        String sessionId) {
         // 决策 D1/D6：条件 rules 双目录（nexusai + claude，glob 匹配）
         String rulesDir = Paths.get(dir, NexusaiPaths.getProjectDirName(), "rules").toString();
         String claudeRulesDir = Paths.get(dir, ".claude", "rules").toString();
         List<MemoryFileInfo> nexusaiRules = processConditionedMdRules(targetPath, rulesDir,
-            ClaudemdMemoryType.PROJECT, processedPaths, false);
+            ClaudemdMemoryType.PROJECT, processedPaths, false, sessionId);
         List<MemoryFileInfo> claudeRules = processConditionedMdRules(targetPath, claudeRulesDir,
-            ClaudemdMemoryType.PROJECT, processedPaths, false);
+            ClaudemdMemoryType.PROJECT, processedPaths, false, sessionId);
         nexusaiRules.addAll(claudeRules);
         return nexusaiRules;
     }
@@ -1384,7 +1441,8 @@ public class ClaudemdEngine {
     public List<MemoryFileInfo> memoryFilesToAttachments(List<MemoryFileInfo> memoryFiles,
                                                          Set<String> loadedNestedMemoryPaths,
                                                          com.nexusai.application.agent.tool.FileStateCache readFileState,
-                                                         String triggerFilePath) {
+                                                         String triggerFilePath,
+                                                         String sessionId) {
         List<MemoryFileInfo> newlyLoaded = new ArrayList<>();
         boolean shouldFireHook = hookRegistry != null;   // CC hasInstructionsLoadedHook() 空判定
         for (MemoryFileInfo memoryFile : memoryFiles) {
@@ -1411,7 +1469,7 @@ public class ClaudemdEngine {
                 String loadReason = (memoryFile.globs() != null && !memoryFile.globs().isEmpty())
                     ? "path_glob_match"
                     : memoryFile.parent() != null ? "include" : "nested_traversal";
-                fireInstructionsLoaded(memoryFile, loadReason, triggerFilePath);
+                fireInstructionsLoaded(memoryFile, loadReason, triggerFilePath, sessionId);
             }
         }
         return newlyLoaded;
@@ -1443,49 +1501,54 @@ public class ClaudemdEngine {
      * @param filePath                触发文件路径
      * @param loadedNestedMemoryPaths 会话级已加载路径集合（会被修改）
      * @param readFileState           会话级 readFileState 缓存（注入后注册 + 双源去重，CLD-02）
+     * @param sessionId               显式会话 id（扫描根来源：allowed working path 判定 + 目录遍历基准；
+     *                                null/空白 = 该路径确实无会话 → user.dir + 一次性 WARN）
      * @return 新加载的记忆文件列表
      */
     public List<MemoryFileInfo> getNestedMemoryAttachmentsForFile(String filePath,
                                                                   Set<String> loadedNestedMemoryPaths,
-                                                                  com.nexusai.application.agent.tool.FileStateCache readFileState) {
+                                                                  com.nexusai.application.agent.tool.FileStateCache readFileState,
+                                                                  String sessionId) {
         List<MemoryFileInfo> attachments = new ArrayList<>();
         try {
             // 早期返回：路径不在 allowed working paths 内（CC pathInAllowedWorkingPath → Java 等价判定，
             // 探查 △-14 / T-6 / OPD-CM5-F-07：原 pathInWorkingPath(originalCwd) 仅 cwd 包含，权限面弱于 CC）
-            if (!pathInAllowedWorkingPath(filePath)) {
+            if (!pathInAllowedWorkingPath(filePath, sessionId)) {
                 return attachments;
             }
             Set<String> processedPaths = new LinkedHashSet<>();
-            String originalCwd = originalCwdSupplier.get();
+            String originalCwd = resolveOriginalCwd(sessionId);
             // tengu_paper_halyard · CC getFeatureValue_CACHED_MAY_BE_STALE('tengu_paper_halyard', false)（attachments.ts:1823-1826）
             boolean skipProjectLevel = paperHalyardGate != null && Boolean.TRUE.equals(paperHalyardGate.get());
 
             // Phase 1: Managed/User 条件规则（匹配 targetPath）
             attachments.addAll(memoryFilesToAttachments(
-                getManagedAndUserConditionalRules(filePath, processedPaths),
-                loadedNestedMemoryPaths, readFileState, filePath));
+                getManagedAndUserConditionalRules(filePath, processedPaths, sessionId),
+                loadedNestedMemoryPaths, readFileState, filePath, sessionId));
 
             // Phase 2: 目录计算（CWD→target 与 root→CWD）
             DirectoriesToProcess dirs = getDirectoriesToProcess(filePath, originalCwd);
 
             // Phase 3: nested 目录（CWD→target）：CLAUDE.md + 无条件 + 条件 rules
             for (String dir : dirs.nestedDirs()) {
-                List<MemoryFileInfo> memoryFiles = getMemoryFilesForNestedDirectory(dir, filePath, processedPaths)
+                List<MemoryFileInfo> memoryFiles = getMemoryFilesForNestedDirectory(dir, filePath, processedPaths,
+                    sessionId)
                     .stream()
                     .filter(f -> !skipProjectLevel
                         || (f.type() != ClaudemdMemoryType.PROJECT && f.type() != ClaudemdMemoryType.LOCAL))
                     .toList();
-                attachments.addAll(memoryFilesToAttachments(memoryFiles, loadedNestedMemoryPaths, readFileState, filePath));
+                attachments.addAll(memoryFilesToAttachments(memoryFiles, loadedNestedMemoryPaths, readFileState, filePath, sessionId));
             }
 
             // Phase 4: CWD 级目录（root→CWD）：仅条件 rules
             for (String dir : dirs.cwdLevelDirs()) {
-                List<MemoryFileInfo> conditionalRules = getConditionalRulesForCwdLevelDirectory(dir, filePath, processedPaths)
+                List<MemoryFileInfo> conditionalRules = getConditionalRulesForCwdLevelDirectory(dir, filePath, processedPaths,
+                    sessionId)
                     .stream()
                     .filter(f -> !skipProjectLevel
                         || (f.type() != ClaudemdMemoryType.PROJECT && f.type() != ClaudemdMemoryType.LOCAL))
                     .toList();
-                attachments.addAll(memoryFilesToAttachments(conditionalRules, loadedNestedMemoryPaths, readFileState, filePath));
+                attachments.addAll(memoryFilesToAttachments(conditionalRules, loadedNestedMemoryPaths, readFileState, filePath, sessionId));
             }
         } catch (Exception e) {
             log.warn("[ClaudemdEngine] nested memory 加载失败（不阻断主路径，对齐 CC logError）: path={} err={}",
@@ -1508,13 +1571,14 @@ public class ClaudemdEngine {
      */
     public List<MemoryFileInfo> getNestedMemoryAttachments(Set<String> triggers,
                                                            Set<String> loadedNestedMemoryPaths,
-                                                           com.nexusai.application.agent.tool.FileStateCache readFileState) {
+                                                           com.nexusai.application.agent.tool.FileStateCache readFileState,
+                                                           String sessionId) {
         if (triggers == null || triggers.isEmpty()) {
             return List.of();
         }
         List<MemoryFileInfo> attachments = new ArrayList<>();
         for (String filePath : triggers) {
-            attachments.addAll(getNestedMemoryAttachmentsForFile(filePath, loadedNestedMemoryPaths, readFileState));
+            attachments.addAll(getNestedMemoryAttachmentsForFile(filePath, loadedNestedMemoryPaths, readFileState, sessionId));
         }
         triggers.clear();
         return attachments;
@@ -1590,16 +1654,32 @@ public class ClaudemdEngine {
      * </pre>
      * 注：Project/Local 的 {@code cwd} 参数在 getMemoryFiles 中逐目录传 dir，本方法仅供
      * Managed/User/AutoMem 用（CC 亦如此 —— getMemoryPath('Project') 只在单目录场景使用）。
+     *
+     * <p><b>[drop-requestcontext] 无会话重载</b>：本重载委托 {@code (type, null)} —— USER/MANAGED/
+     * AUTO_MEM/TEAM_MEM 分支不用扫描根（computeMemoryFiles 的调用点亦仅这两类），仅 LOCAL/PROJECT 会经
+     * {@link #resolveOriginalCwd(String)} 的一次性 WARN 闸回落 user.dir。会话场景请用
+     * {@link #getMemoryPath(ClaudemdMemoryType, String)} 显式传 sessionId。
      */
     public String getMemoryPath(ClaudemdMemoryType type) {
+        return getMemoryPath(type, null);
+    }
+
+    /**
+     * 会话显式版 getMemoryPath · LOCAL/PROJECT 的扫描根按显式 sessionId 解析
+     * （CC {@code getMemoryPath} 的 {@code cwd} 形参，config.ts:1779-1799）。
+     *
+     * @param sessionId 显式会话 id；null/空白 = 该路径确实无会话 →
+     *                  {@link #resolveOriginalCwd(String)} 一次性 WARN + user.dir 兜底
+     */
+    public String getMemoryPath(ClaudemdMemoryType type, String sessionId) {
         return switch (type) {
             // 决策 D1/D3：User memory 改 NexusaiPaths 自有根优先；nexusai 文件缺失时读取链
             //   claude 回落（读 ~/.claude/CLAUDE.md，CC 只读兼容）。
             case USER -> resolveFirstExisting(
                 Paths.get(NexusaiPaths.getAppConfigHomeDir(), "CLAUDE.md"),
                 Paths.get(ClaudePaths.getClaudeConfigHomeDir(), "CLAUDE.md"));
-            case LOCAL -> Paths.get(originalCwdSupplier.get(), "CLAUDE.local.md").toString();
-            case PROJECT -> Paths.get(originalCwdSupplier.get(), "CLAUDE.md").toString();
+            case LOCAL -> Paths.get(resolveOriginalCwd(sessionId), "CLAUDE.local.md").toString();
+            case PROJECT -> Paths.get(resolveOriginalCwd(sessionId), "CLAUDE.md").toString();
             case MANAGED -> Paths.get(ClaudePaths.getManagedFilePath(), "CLAUDE.md").toString();
             case AUTO_MEM -> autoMemPaths.getAutoMemEntrypoint();   // A′: 无有效项目 → null
             case TEAM_MEM -> {
@@ -1683,13 +1763,16 @@ public class ClaudemdEngine {
      * <p><b>WHY 存在</b>（探查 △-14 / T-6 / OPD-CM5-F-07）：CC 在 {@code getNestedMemoryAttachmentsForFile}
      * 早期返回用 {@code pathInAllowedWorkingPath(filePath, appState.toolPermissionContext)}（permission context
      * 全量判定：所有工作目录 = originalCwd + additionalWorkingDirectories），Java 原仅
-     * {@code pathInWorkingPath(filePath, originalCwdSupplier.get())}（仅 cwd 包含判定）——cwd 内但不在允许路径
+     * {@code pathInWorkingPath(filePath, originalCwd)}（仅 cwd 包含判定）——cwd 内但不在允许路径
      * 的文件会被放行，权限面弱于 CC。web 无 toolPermissionContext 通道 → 以 originalCwd + 附加目录
      * （{@link #getAdditionalDirectoriesForClaudeMd()}，--add-dir env 门控）为 allowed working paths 全集；
      * filePath 命中任一工作目录即判定通过（对齐 CC every/some 语义，单路径场景归约为 some）。
+     *
+     * @param sessionId 显式会话 id（originalCwd 工作目录来源；null/空白 = 无会话 →
+     *                  {@link #resolveOriginalCwd(String)} 一次性 WARN + user.dir 兜底）
      */
-    boolean pathInAllowedWorkingPath(String filePath) {
-        if (pathInWorkingPath(filePath, originalCwdSupplier.get())) {
+    boolean pathInAllowedWorkingPath(String filePath, String sessionId) {
+        if (pathInWorkingPath(filePath, resolveOriginalCwd(sessionId))) {
             return true;
         }
         for (String dir : getAdditionalDirectoriesForClaudeMd()) {
@@ -1755,22 +1838,29 @@ public class ClaudemdEngine {
      * User 类型排除：User memory 恒可 include 外部文件（claudemd.ts:833），不属"外部"审批范畴。
      *
      * @param files getMemoryFiles() 结果（含 @include 子文件）
+     * @param sessionId 显式会话 id（originalCwd 来源；null/空白 = 该路径确实无会话 →
+     *                  {@link #resolveOriginalCwd(String)} 一次性 WARN + user.dir 兜底）
      * @return 外部 include 列表
      */
-    public List<ExternalClaudeMdInclude> getExternalClaudeMdIncludes(List<MemoryFileInfo> files) {
+    public List<ExternalClaudeMdInclude> getExternalClaudeMdIncludes(List<MemoryFileInfo> files, String sessionId) {
         List<ExternalClaudeMdInclude> externals = new ArrayList<>();
+        String originalCwd = resolveOriginalCwd(sessionId);
         for (MemoryFileInfo file : files) {
             if (file.type() != ClaudemdMemoryType.USER && file.parent() != null
-                && !pathInWorkingPath(file.path(), originalCwdSupplier.get())) {
+                && !pathInWorkingPath(file.path(), originalCwd)) {
                 externals.add(new ExternalClaudeMdInclude(file.path(), file.parent()));
             }
         }
         return externals;
     }
 
-    /** 是否存在外部 @include · CC original: {@code hasExternalClaudeMdIncludes}（claudemd.ts:1416-1418）。 */
-    public boolean hasExternalClaudeMdIncludes(List<MemoryFileInfo> files) {
-        return !getExternalClaudeMdIncludes(files).isEmpty();
+    /**
+     * 是否存在外部 @include · CC original: {@code hasExternalClaudeMdIncludes}（claudemd.ts:1416-1418）。
+     *
+     * @param sessionId 显式会话 id（透传给 {@link #getExternalClaudeMdIncludes}）
+     */
+    public boolean hasExternalClaudeMdIncludes(List<MemoryFileInfo> files, String sessionId) {
+        return !getExternalClaudeMdIncludes(files, sessionId).isEmpty();
     }
 
     /**
@@ -1786,7 +1876,7 @@ public class ClaudemdEngine {
      *
      * @return true = 存在外部 include 且既未审批也未显示过警告
      */
-    public boolean shouldShowClaudeMdExternalIncludesWarning() {
+    public boolean shouldShowClaudeMdExternalIncludesWarning(String sessionId) {
         boolean approved = hasClaudeMdExternalIncludesApproved != null
             && Boolean.TRUE.equals(hasClaudeMdExternalIncludesApproved.get());
         boolean warningShown = hasClaudeMdExternalIncludesWarningShown != null
@@ -1794,7 +1884,7 @@ public class ClaudemdEngine {
         if (approved || warningShown) {
             return false;
         }
-        return hasExternalClaudeMdIncludes(getMemoryFiles(true));
+        return hasExternalClaudeMdIncludes(getMemoryFiles(true, sessionId), sessionId);
     }
 
     /**

@@ -81,7 +81,7 @@ class CommandLoadedFromTest {
 
         // RED 于旧实现（loadedFrom 折叠进 CommandSource.USER → source==USER∈{USER,PLUGIN,BUNDLED} 放行）；
         // GREEN：COMMANDS_DEPRECATED ∉ {SKILLS,PLUGIN,BUNDLED} → 排除（commands.ts:595-597）
-        assertThat(new FixtureRegistry(List.of(legacy)).getSlashCommandToolSkills())
+        assertThat(new FixtureRegistry(List.of(legacy)).getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .doesNotContain("legacy-cmd");
     }
@@ -96,7 +96,8 @@ class CommandLoadedFromTest {
         legacy.setLoadedFrom(CommandLoadedFrom.COMMANDS_DEPRECATED);
 
         // CC :574-576 loadedFrom∈{bundled,skills,commands_DEPRECATED} 免显式描述自动放行
-        assertThat(new FixtureRegistry(List.of(legacy)).getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(new FixtureRegistry(List.of(legacy)).getModelInvocableCommands(null))
             .extracting(Command::getName)
             .contains("legacy-cmd");
     }
@@ -111,7 +112,7 @@ class CommandLoadedFromTest {
 
         // 新实现：loadedFrom=null ∉ {BUNDLED,SKILLS,COMMANDS_DEPRECATED} 且无 hasUserSpecifiedDescription /
         // whenToUse → 排除（CC :574-578 无 null 分支）——测试构造/DB 路径命令不再凭默认 source 自动进模型清单
-        assertThat(new FixtureRegistry(List.of(noLoadedFrom)).getModelInvocableCommands())
+        assertThat(new FixtureRegistry(List.of(noLoadedFrom)).getModelInvocableCommands(null))
             .extracting(Command::getName)
             .doesNotContain("plain");
     }
@@ -177,8 +178,10 @@ class CommandLoadedFromTest {
             this.cmds = cmds;
         }
 
+        // [批 3c] 基类 getAllCommands 新增显式 sessionId 形参 → 子类覆写同步；本夹具恒返固定集合，
+        //   与调用方会话无关，故忽略 sessionId
         @Override
-        public List<Command> getAllCommands() {
+        public List<Command> getAllCommands(String sessionId) {
             return cmds;
         }
     }

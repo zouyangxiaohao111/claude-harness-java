@@ -5,7 +5,6 @@ import com.nexusai.application.agent.permission.hook.HookEventType;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.permission.hook.MatchedHook;
 import com.nexusai.apis.command.CommandController;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.command.CommandService;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.infra.llm.AssistantMessage;
@@ -87,7 +86,6 @@ class LlmAgentLoopSessionStartSourceCcTest {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         // [C 级 2026-09-07] 进程级 sessionStartSeen 清空：多用例共享 SESSION_KEY（sess-ab12cd34），
         //   每用例须从 cold 起算（否则前例已注册 → 本例热 → §14 跳过 → 断言误绿/误红）。
         SessionStartSeenRegistry.reset();
@@ -288,16 +286,16 @@ class LlmAgentLoopSessionStartSourceCcTest {
         ReflectionTestUtils.setField(controller, "commandService", mock(CommandService.class));
         ReflectionTestUtils.setField(controller, "skillRegistry", mock(com.nexusai.application.agent.skill.SkillRegistry.class));
         ReflectionTestUtils.setField(controller, "hookRegistry", capturingRegistry(captured));
-        com.nexusai.common.RequestContext.setSession("00000000-0000-0000-0000-00000000000c");
-
-        Object dto = controller.executeBuiltin("clear", null, null);
+        // [批 3c] 会话标识经**第 2 形参**显式传入（原经裸 MDC 会话槽，该槽已删）；
+        //   ⚠ 形参序：executeBuiltin(String name, String sessionIdParam, ResumeExecuteRequest request)
+        Object dto = controller.executeBuiltin("clear", "00000000-0000-0000-0000-00000000000c", null);
 
         assertThat(dto).isNotNull();
         assertThat(captured.stream().filter(e -> e.type() == HookEventType.SESSION_START)).hasSize(1);
         assertThat(sourceOfSessionStart(captured))
             .as("/clear 必须发射 SessionStart(source='clear')（CC conversation.ts:245 processSessionStartHooks('clear')）")
             .isEqualTo("clear");
-        // 载荷对齐 CC createBaseHookInput：sessionId=当前 MDC 会话；agent_type 未传（主线程 null）
+        // 载荷对齐 CC createBaseHookInput：sessionId=显式传入的会话；agent_type 未传（主线程 null）
         HookEvent clearEvent = captured.stream().filter(e -> e.type() == HookEventType.SESSION_START).findFirst().orElseThrow();
         assertThat(clearEvent.sessionId()).isEqualTo("00000000-0000-0000-0000-00000000000c");
     }
@@ -319,9 +317,9 @@ class LlmAgentLoopSessionStartSourceCcTest {
         ReflectionTestUtils.setField(controller, "commandService", mock(CommandService.class));
         ReflectionTestUtils.setField(controller, "skillRegistry", mock(com.nexusai.application.agent.skill.SkillRegistry.class));
         ReflectionTestUtils.setField(controller, "hookRegistry", capturingRegistry(captured));
-        com.nexusai.common.RequestContext.setSession("00000000-0000-0000-0000-00000000000d");
-
-        Object dto = controller.executeBuiltin("clear", null, null);
+        // [批 3c] 会话标识经**第 2 形参**显式传入（原经裸 MDC 会话槽，该槽已删）；
+        //   ⚠ 形参序：executeBuiltin(String name, String sessionIdParam, ResumeExecuteRequest request)
+        Object dto = controller.executeBuiltin("clear", "00000000-0000-0000-0000-00000000000d", null);
 
         assertThat(dto).isNotNull();
         // SESSION_END 必须发射且 reason='clear'（CC conversation.ts:69 executeSessionEndHooks('clear')）

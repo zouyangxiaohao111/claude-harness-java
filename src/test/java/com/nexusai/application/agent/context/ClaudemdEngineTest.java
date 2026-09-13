@@ -109,7 +109,7 @@ class ClaudemdEngineTest {
             () -> teamMemoryEnabled, () -> true);
 
         engine = new ClaudemdEngine(autoMemPaths, detection,
-            () -> workspace.toString(),       // CC getOriginalCwd()
+            sessionId -> workspace.toString(),       // CC getOriginalCwd()（忽略会话的定值注入）
             () -> true, () -> true, () -> true,   // userSettings/projectSettings/localSettings 恒启用
             () -> teamMemoryEnabled,          // feature('TEAMMEM')
             () -> List.of());                 // claudeMdExcludes（无 settings 源 → 空）
@@ -166,7 +166,8 @@ class ClaudemdEngineTest {
         Files.createDirectories(autoMemDir);
         Files.writeString(autoMemDir.resolve("MEMORY.md"), "# AutoMem entry\n");
 
-        List<MemoryFileInfo> files = engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言加载序/文件集合，不涉会话）
+        List<MemoryFileInfo> files = engine.getMemoryFiles(false, null);
 
         // 类型序列断言：Managed 文件 + Managed rules → User 文件 + User rules →
         // Project CLAUDE.md + .claude/CLAUDE.md + rules → Local → AutoMem
@@ -203,7 +204,8 @@ class ClaudemdEngineTest {
         ClaudemdEngine prodEngine = new ClaudemdEngine(autoMemPaths, detection);
         prodEngine.setTeamMemoryEnabled(() -> true);   // 等价 () -> featureFlags != null && featureFlags.teamMem()
 
-        List<MemoryFileInfo> files = prodEngine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言 TeamMem 注入/加载序，不涉会话）
+        List<MemoryFileInfo> files = prodEngine.getMemoryFiles(false, null);
         List<String> typeSeq = files.stream().map(f -> f.type().ccName()).toList();
         assertThat(typeSeq).as("F-02：teamMemoryEnabled 开启 → TeamMem 入口注入")
             .contains("TeamMem");
@@ -222,7 +224,8 @@ class ClaudemdEngineTest {
 
         ClaudemdEngine prodEngine = new ClaudemdEngine(autoMemPaths, detection);
 
-        List<MemoryFileInfo> files = prodEngine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言 TeamMem 不注入，不涉会话）
+        List<MemoryFileInfo> files = prodEngine.getMemoryFiles(false, null);
         List<String> typeSeq = files.stream().map(f -> f.type().ccName()).toList();
         assertThat(typeSeq).as("F-02：teamMemoryEnabled 默认 false → 不注入 TeamMem")
             .doesNotContain("TeamMem");
@@ -242,9 +245,10 @@ class ClaudemdEngineTest {
         engine.setTelemetry(telemetry);
         engine.clearMemoryFileCaches();   // 清 memoize，确保走真实加载
 
-        engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言一次性 telemetry 事件，不涉会话）
+        engine.getMemoryFiles(false, null);
         // 二次调用命中 memoize 缓存 → 不再发 initial_load（且各缓存键独立：forceIncludeExternal=true 也走缓存）
-        engine.getMemoryFiles(false);
+        engine.getMemoryFiles(false, null);
 
         assertThat(telemetry.events)
             .as("首次加载必须发射 tengu_claudemd__initial_load（一次性）")
@@ -261,16 +265,17 @@ class ClaudemdEngineTest {
         //       clearMemoryFileCaches（claudemd.ts:1119-1122）供 compact/设置同步失效缓存。
         setUp(false);
         Files.writeString(workspace.resolve("CLAUDE.md"), "# v1\n");
-        List<MemoryFileInfo> first = engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言 memoize 缓存身份与失效，不涉会话）
+        List<MemoryFileInfo> first = engine.getMemoryFiles(false, null);
 
         // 文件变更后不清缓存 → 返回旧结果
         Files.writeString(workspace.resolve("CLAUDE.md"), "# v2 changed\n");
-        List<MemoryFileInfo> cached = engine.getMemoryFiles(false);
+        List<MemoryFileInfo> cached = engine.getMemoryFiles(false, null);
         assertThat(cached).as("memoize 命中：内容不变").isSameAs(first);
 
         // clearMemoryFileCaches → 下次重新加载
         engine.clearMemoryFileCaches();
-        List<MemoryFileInfo> reloaded = engine.getMemoryFiles(false);
+        List<MemoryFileInfo> reloaded = engine.getMemoryFiles(false, null);
         assertThat(reloaded).as("clear 后重载：内容更新").isNotSameAs(first);
         assertThat(reloaded.stream().map(MemoryFileInfo::content).toList())
             .as("重载内容含 v2").anyMatch(c -> c.contains("v2 changed"));
@@ -324,7 +329,7 @@ class ClaudemdEngineTest {
         java.util.Set<String> processed = new java.util.HashSet<>();
         List<MemoryFileInfo> files = engine.processMemoryFile(
             root.resolve("CLAUDE.md").toString(), ClaudemdMemoryType.PROJECT,
-            processed, true, 0, null);
+            processed, true, 0, null, null);   // 无会话（扫描根取注入定值 = workspace）
 
         assertThat(files).as("主文件 + 1 个 @include 子文件").hasSize(2);
         assertThat(files.get(0).content()).as("主文件注释被剥离")
@@ -354,7 +359,7 @@ class ClaudemdEngineTest {
 
         java.util.Set<String> processed = new java.util.HashSet<>();
         List<MemoryFileInfo> files = engine.processMemoryFile(
-            root.resolve("a.md").toString(), ClaudemdMemoryType.PROJECT, processed, true, 0, null);
+            root.resolve("a.md").toString(), ClaudemdMemoryType.PROJECT, processed, true, 0, null, null);
 
         // depth 0=a,1=b,2=c,3=d,4=e 加载；f 在 depth=5 被截断
         List<String> paths = files.stream().map(MemoryFileInfo::path).toList();
@@ -388,7 +393,7 @@ class ClaudemdEngineTest {
 
         java.util.Set<String> processed = new java.util.HashSet<>();
         List<MemoryFileInfo> files = engine.processMemoryFile(
-            root.resolve("CLAUDE.md").toString(), ClaudemdMemoryType.PROJECT, processed, true, 0, null);
+            root.resolve("CLAUDE.md").toString(), ClaudemdMemoryType.PROJECT, processed, true, 0, null, null);
 
         List<String> paths = files.stream().map(MemoryFileInfo::path).toList();
         assertThat(files).as("主文件 + 1 个真实 @include（注释内假引用不加载）").hasSize(2);
@@ -416,7 +421,7 @@ class ClaudemdEngineTest {
 
         java.util.Set<String> processed = new java.util.HashSet<>();
         List<MemoryFileInfo> files = engine.processMemoryFile(
-            root.resolve("CLAUDE.md").toString(), ClaudemdMemoryType.PROJECT, processed, true, 0, null);
+            root.resolve("CLAUDE.md").toString(), ClaudemdMemoryType.PROJECT, processed, true, 0, null, null);
 
         assertThat(files).as("目录不作为记忆文件加载，仅主文件").hasSize(1);
         assertThat(telemetry.getCounter("tengu_claude_md_permission_error"))
@@ -445,7 +450,7 @@ class ClaudemdEngineTest {
 
         List<MemoryFileInfo> matched = engine.processConditionedMdRules(
             projectRoot.resolve("src/main/App.java").toString(), rulesDir,
-            ClaudemdMemoryType.PROJECT, processed, false);
+            ClaudemdMemoryType.PROJECT, processed, false, null);
 
         assertThat(matched).as("src/**/*.java 匹配 cond.md，排除无 globs 的 plain.md")
             .extracting(MemoryFileInfo::path)
@@ -469,7 +474,7 @@ class ClaudemdEngineTest {
         // ../outside 逃逸基准 → 拒绝
         List<MemoryFileInfo> matched = engine.processConditionedMdRules(
             projectRoot.resolve("../outside/x.md").toString(), rulesDir,
-            ClaudemdMemoryType.PROJECT, processed, false);
+            ClaudemdMemoryType.PROJECT, processed, false, null);
         assertThat(matched).as("../ 相对路径被拒绝").isEmpty();
     }
 
@@ -572,9 +577,10 @@ class ClaudemdEngineTest {
         String target = nested.resolve("src/main/App.java").toString();
 
         // 默认（未注入 gate）→ Project/Local 均注入（feature 关 = CC GB flag 缺省）
+        // [批 3c] 无会话 → 显式 null（本用例只断言 paper_halyard 门控下 nested 注入面，不涉会话）
         List<MemoryFileInfo> off = engine.getNestedMemoryAttachmentsForFile(target,
             java.util.concurrent.ConcurrentHashMap.newKeySet(),
-            ToolUseContext.createFileStateCache());
+            ToolUseContext.createFileStateCache(), null);
         assertThat(off)
             .as("feature 关（默认）→ nested CLAUDE.md(Project) 注入")
             .anyMatch(f -> f.path().equals(nested.resolve("CLAUDE.md").toString()))
@@ -585,7 +591,7 @@ class ClaudemdEngineTest {
         engine.setPaperHalyardGate(() -> true);
         List<MemoryFileInfo> on = engine.getNestedMemoryAttachmentsForFile(target,
             java.util.concurrent.ConcurrentHashMap.newKeySet(),
-            ToolUseContext.createFileStateCache());
+            ToolUseContext.createFileStateCache(), null);
         assertThat(on)
             .as("feature 开 → nested CLAUDE.md(Project) 跳过")
             .noneMatch(f -> f.path().equals(nested.resolve("CLAUDE.md").toString()))
@@ -616,14 +622,15 @@ class ClaudemdEngineTest {
         engine.setHookRegistry(registry);
 
         // 初始态（shouldFireHook=true, nextEagerLoadReason='session_start'）→ 首次 miss 发射 session_start
-        engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言 load_reason 三态，不涉会话）
+        engine.getMemoryFiles(false, null);
         awaitTrue(() -> captured.stream().anyMatch(e -> "session_start".equals(e.data().get("load_reason"))), 3000);
         assertThat(captured).as("首次加载发射 session_start")
             .anyMatch(e -> "session_start".equals(e.data().get("load_reason")));
 
         captured.clear();
         engine.resetGetMemoryFilesCache("compact");
-        engine.getMemoryFiles(false);
+        engine.getMemoryFiles(false, null);
         awaitTrue(() -> captured.stream().anyMatch(e -> "compact".equals(e.data().get("load_reason"))), 3000);
         assertThat(captured)
             .as("reset 后缓存 miss → 发射 compact（load_reason=compact, path 含 Project CLAUDE.md）")
@@ -631,7 +638,7 @@ class ClaudemdEngineTest {
             .anyMatch(e -> ((String) e.data().get("file_path")).endsWith("CLAUDE.md"));
 
         captured.clear();
-        engine.getMemoryFiles(false);
+        engine.getMemoryFiles(false, null);
         assertThat(captured).as("缓存命中 + one-shot 已消费 → 不再发射").isEmpty();
     }
 
@@ -654,12 +661,13 @@ class ClaudemdEngineTest {
         setUp(false);
         Files.createDirectories(workspace);
         Files.writeString(workspace.resolve("CLAUDE.md"), "# V1\n");
-        List<MemoryFileInfo> first = engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言缓存失效后重算，不涉会话）
+        List<MemoryFileInfo> first = engine.getMemoryFiles(false, null);
         Files.writeString(workspace.resolve("CLAUDE.md"), "# V1\n# V2\n");
 
-        assertThat(engine.getMemoryFiles(false)).as("缓存未失效 → 仍为 V1").isEqualTo(first);
+        assertThat(engine.getMemoryFiles(false, null)).as("缓存未失效 → 仍为 V1").isEqualTo(first);
         engine.resetGetMemoryFilesCache("compact");
-        List<MemoryFileInfo> reloaded = engine.getMemoryFiles(false);
+        List<MemoryFileInfo> reloaded = engine.getMemoryFiles(false, null);
         assertThat(reloaded.get(reloaded.size() - 1).content())
             .as("reset 后重算 → 反映磁盘 V2")
             .contains("# V2");
@@ -697,7 +705,8 @@ class ClaudemdEngineTest {
         engine.setHookRegistry(registry);
 
         long start = System.nanoTime();
-        List<MemoryFileInfo> files = engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言主路径不被 hook 阻塞，不涉会话）
+        List<MemoryFileInfo> files = engine.getMemoryFiles(false, null);
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
 
         assertThat(files).as("getMemoryFiles 正常返回记忆文件").isNotEmpty();
@@ -733,7 +742,8 @@ class ClaudemdEngineTest {
         dead.shutdown();
         engine.setHookExecutor(dead);
 
-        assertThatCode(() -> engine.getMemoryFiles(false))
+        // [批 3c] 无会话 → 显式 null（本用例只断言 executor 降级不崩溃，不涉会话）
+        assertThatCode(() -> engine.getMemoryFiles(false, null))
             .as("executor 已关闭 → 主路径不崩溃")
             .doesNotThrowAnyException();
         assertThat(captured).as("executor 已关闭 → hook 不执行（warn 降级，不静默丢任务）").isEmpty();
@@ -760,7 +770,8 @@ class ClaudemdEngineTest {
             }
         });
 
-        assertThatCode(() -> engine.getMemoryFiles(false))
+        // [批 3c] 无会话 → 显式 null（本用例只断言 executor 拒绝时降级不崩溃，不涉会话）
+        assertThatCode(() -> engine.getMemoryFiles(false, null))
             .as("executor 提交被拒 → 主路径不崩溃")
             .doesNotThrowAnyException();
     }
@@ -797,11 +808,11 @@ class ClaudemdEngineTest {
         MemoryFileInfo externalUser = new MemoryFileInfo("/out/CLAUDE.md", ClaudemdMemoryType.USER,
             "x", "/u/CLAUDE.md", null, false, null);
 
-        assertThat(engine.hasExternalClaudeMdIncludes(List.of(externalProject)))
+        assertThat(engine.hasExternalClaudeMdIncludes(List.of(externalProject), null))
             .as("cwd 外 + parent → 外部 include").isTrue();
-        assertThat(engine.hasExternalClaudeMdIncludes(List.of(internalProject)))
+        assertThat(engine.hasExternalClaudeMdIncludes(List.of(internalProject), null))
             .as("cwd 内 → 非外部").isFalse();
-        assertThat(engine.hasExternalClaudeMdIncludes(List.of(externalUser)))
+        assertThat(engine.hasExternalClaudeMdIncludes(List.of(externalUser), null))
             .as("User 类型恒可 include 外部 → 不属审批范畴").isFalse();
     }
 
@@ -825,16 +836,17 @@ class ClaudemdEngineTest {
             "# Managed\n@" + externalPath + "\n");
 
         // 未审批（approval supplier 未注入 → 恒 false）→ 外部 include 不含
-        List<MemoryFileInfo> notApproved = engine.getMemoryFiles(false);
+        // [批 3c] 无会话 → 显式 null（本用例只断言外部 @include 审批门控，不涉会话）
+        List<MemoryFileInfo> notApproved = engine.getMemoryFiles(false, null);
         assertThat(notApproved)
             .as("未审批 → getMemoryFiles(false) 不含外部 @include（claudemd.ts:798-801）")
             .noneMatch(f -> f.path().equals(externalMd.toAbsolutePath().toString()));
 
         // 审批（fresh engine 注入 approval supplier=true）→ 外部 include 含
         ClaudemdEngine approvedEngine = new ClaudemdEngine(autoMemPaths, detection,
-            () -> workspace.toString(), () -> true, () -> true, () -> true, () -> false, () -> List.of());
+            sessionId -> workspace.toString(), () -> true, () -> true, () -> true, () -> false, () -> List.of());
         approvedEngine.setHasClaudeMdExternalIncludesApproved(() -> true);
-        List<MemoryFileInfo> approved = approvedEngine.getMemoryFiles(false);
+        List<MemoryFileInfo> approved = approvedEngine.getMemoryFiles(false, null);
         assertThat(approved)
             .as("审批后 → getMemoryFiles(false) 含外部 @include（forceIncludeExternal=false 也加载）")
             .anyMatch(f -> f.path().equals(externalMd.toAbsolutePath().toString()));
@@ -858,18 +870,19 @@ class ClaudemdEngineTest {
             "# Managed\n@" + externalPath + "\n");
 
         // 未审批 + 未显示 → true（存在外部 include）
-        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning())
+        // [批 3c] 无会话 → 显式 null（本用例只断言审批/警告门控，不涉会话）
+        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning(null))
             .as("未审批且未显示过警告 → 应显示（claudemd.ts:1423-1428）").isTrue();
 
         // 审批 → false
         engine.setHasClaudeMdExternalIncludesApproved(() -> true);
-        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning())
+        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning(null))
             .as("已审批 → 不再弹窗（claudemd.ts:1423-1424）").isFalse();
 
         // 拒绝（approved=false 但 warningShown=true）→ false
         engine.setHasClaudeMdExternalIncludesApproved(() -> false);
         engine.setHasClaudeMdExternalIncludesWarningShown(() -> true);
-        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning())
+        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning(null))
             .as("已拒绝但显示过警告 → 不再弹窗（claudemd.ts:1425-1426）").isFalse();
     }
 
@@ -880,13 +893,14 @@ class ClaudemdEngineTest {
         //       时 dirs 空 → 不加载任何 Project/Local（FIX-CL 删 Java 额外 root push 的对齐证据）。
         String root = Paths.get(workspace.toString()).getRoot().toString();
         engine = new ClaudemdEngine(autoMemPaths, detection,
-            () -> root, () -> true, () -> true, () -> true, () -> false, () -> List.of());
+            sessionId -> root, () -> true, () -> true, () -> true, () -> false, () -> List.of());
         Files.createDirectories(managedPath);
         Files.writeString(managedPath.resolve("CLAUDE.md"), "# Managed root\n");
         Files.createDirectories(configHome);
         Files.writeString(configHome.resolve("CLAUDE.md"), "# User root\n");
 
-        List<String> typeSeq = engine.getMemoryFiles(false).stream()
+        // [批 3c] 无会话 → 显式 null（本用例只断言 cwd=root 时目录遍历为空，不涉会话）
+        List<String> typeSeq = engine.getMemoryFiles(false, null).stream()
             .map(f -> f.type().ccName()).toList();
         assertThat(typeSeq)
             .as("cwd=root → 仅 Managed+User，无 Project/Local")
@@ -910,7 +924,7 @@ class ClaudemdEngineTest {
         Set<String> processed = new LinkedHashSet<>();
         // 目标路径必须在嵌套目录内（条件规则 glob 相对 .claude 父目录 = nested）
         List<MemoryFileInfo> files = engine.getMemoryFilesForNestedDirectory(
-            nested.toString(), nested.resolve("src/main/App.java").toString(), processed);
+            nested.toString(), nested.resolve("src/main/App.java").toString(), processed, null);
 
         assertThat(files.stream().map(MemoryFileInfo::path).toList())
             .as("CLAUDE.md + .claude/CLAUDE.md + 条件规则命中 src/**/*.java")
@@ -992,8 +1006,9 @@ class ClaudemdEngineTest {
             new MemoryFileInfo("/d/auto.md", ClaudemdMemoryType.AUTO_MEM, "a",
                 null, null, false, null));                 // 非 instructions → 不发射
 
+        // [批 3c] 无会话 → 显式 null（本用例只断言三态 load_reason 发射，不涉会话）
         List<MemoryFileInfo> newly = engine.memoryFilesToAttachments(files, loaded,
-            ToolUseContext.createFileStateCache(), "/trigger/App.java");
+            ToolUseContext.createFileStateCache(), "/trigger/App.java", null);
         awaitTrue(() -> captured.size() >= 3, 5000);
 
         assertThat(newly).as("全部文件均新加载（无重复）").hasSize(4);
@@ -1028,8 +1043,9 @@ class ClaudemdEngineTest {
         Set<String> loaded = java.util.concurrent.ConcurrentHashMap.newKeySet();
         com.nexusai.application.agent.tool.FileStateCache cache = ToolUseContext.createFileStateCache();
         MemoryFileInfo f = MemoryFileInfo.of("/p/CLAUDE.md", ClaudemdMemoryType.PROJECT, "x", null);
-        engine.memoryFilesToAttachments(List.of(f), loaded, cache, "/t/App.java");
-        engine.memoryFilesToAttachments(List.of(f), loaded, cache, "/t/App.java");   // 第二次：已加载
+        // [批 3c] 无会话 → 显式 null（本用例只断言 loadedNestedMemoryPaths 去重，不涉会话）
+        engine.memoryFilesToAttachments(List.of(f), loaded, cache, "/t/App.java", null);
+        engine.memoryFilesToAttachments(List.of(f), loaded, cache, "/t/App.java", null);   // 第二次：已加载
         awaitTrue(() -> captured.size() >= 1, 5000);
 
         assertThat(captured).as("同一文件二次出现不重复发射（去重）").hasSize(1);
@@ -1075,8 +1091,9 @@ class ClaudemdEngineTest {
         triggers.add(target);
         Set<String> loaded = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+        // [批 3c] 无会话 → 显式 null（本用例只断言三孤儿子函数接线 + triggers 清空，不涉会话）
         List<MemoryFileInfo> newly = engine.getNestedMemoryAttachments(triggers, loaded,
-            ToolUseContext.createFileStateCache());
+            ToolUseContext.createFileStateCache(), null);
         awaitTrue(() -> captured.size() >= 5, 5000);
 
         assertThat(triggers).as("触发集消费后清空（CC :2186 clear）").isEmpty();
@@ -1100,11 +1117,12 @@ class ClaudemdEngineTest {
         //   文件系统（孤儿消费方空跑安全）。
         Set<String> triggers = java.util.concurrent.ConcurrentHashMap.newKeySet();
         Set<String> loaded = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        // [批 3c] 无会话 → 显式 null（本用例只断言空/null 触发集快速返回，不涉会话）
         assertThat(engine.getNestedMemoryAttachments(triggers, loaded,
-            ToolUseContext.createFileStateCache()))
+            ToolUseContext.createFileStateCache(), null))
             .as("空触发集 → 空列表").isEmpty();
         assertThat(engine.getNestedMemoryAttachments(null, loaded,
-            ToolUseContext.createFileStateCache()))
+            ToolUseContext.createFileStateCache(), null))
             .as("null 触发集 → 空列表（不 NPE）").isEmpty();
     }
 
@@ -1122,7 +1140,7 @@ class ClaudemdEngineTest {
         // 附加目录注入（CLAUDE_CODE_ADDITIONAL_DIRECTORIES 无法进程内改 env → 覆写包私有
         // getAdditionalDirectoriesForClaudeMd，与 SkillChangeDetectorTest:319 注入模式一致）
         ClaudemdEngine engineWithAddDir = new ClaudemdEngine(autoMemPaths, detection,
-            () -> workspace.toString(), () -> true, () -> true, () -> true, () -> false, () -> List.of()) {
+            sessionId -> workspace.toString(), () -> true, () -> true, () -> true, () -> false, () -> List.of()) {
             @Override
             List<String> getAdditionalDirectoriesForClaudeMd() {
                 return List.of(addDir.toString());
@@ -1130,21 +1148,22 @@ class ClaudemdEngineTest {
         };
 
         // 1. originalCwd 内 → 通过
-        assertThat(engineWithAddDir.pathInAllowedWorkingPath(workspace.resolve("src/App.java").toString()))
+        assertThat(engineWithAddDir.pathInAllowedWorkingPath(workspace.resolve("src/App.java").toString(), null))
             .as("originalCwd 内路径判定通过").isTrue();
         // 2. 附加目录内 → 通过（CC allWorkingDirectories = originalCwd + additionalWorkingDirectories）
-        assertThat(engineWithAddDir.pathInAllowedWorkingPath(addDir.resolve("App.java").toString()))
+        assertThat(engineWithAddDir.pathInAllowedWorkingPath(addDir.resolve("App.java").toString(), null))
             .as("附加目录内路径判定通过（对齐 CC additionalWorkingDirectories）").isTrue();
         // 3. 两者之外 → 拒绝
         Path outside = Files.createTempDirectory("outside");
-        assertThat(engineWithAddDir.pathInAllowedWorkingPath(outside.resolve("x.md").toString()))
+        assertThat(engineWithAddDir.pathInAllowedWorkingPath(outside.resolve("x.md").toString(), null))
             .as("工作目录外路径判定拒绝").isFalse();
 
         // 4. getNestedMemoryAttachmentsForFile 早期返回联动：allowed working path 外触发文件 → 空
         Path outsideFile = Files.writeString(outside.resolve("target.md"), "# t\n");
         Set<String> loaded = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        // [批 3c] 无会话 → 显式 null（本用例只断言 allowed working path 早期返回，不涉会话）
         assertThat(engineWithAddDir.getNestedMemoryAttachmentsForFile(outsideFile.toString(), loaded,
-            ToolUseContext.createFileStateCache()))
+            ToolUseContext.createFileStateCache(), null))
             .as("allowed working path 外触发文件 → 早期返回空（对齐 CC attachments.ts:1801-1803）").isEmpty();
     }
 
@@ -1155,8 +1174,9 @@ class ClaudemdEngineTest {
         //   engine.getNestedMemoryAttachments，绕过生产接线，无法发现"触发集无生产者 + 接线副本隔离"
         //   → lazy-load 生产链路死代码。本测试走真实生产路径：ReadFileTool（CC FileReadTool.ts:848/870/1038
         //   生产者）经 per-turn TUC 写触发集（与 base 共享同一 KeySetView 实例，keepOrCopyMutableSet 修复）
-        //   → loop 消费表达式（LlmAgentLoop:3126-3130 原样 getNestedMemoryAttachments(baseTuc
-        //   .nestedMemoryAttachmentTriggers(), baseTuc.loadedNestedMemoryPaths(), baseTuc.readFileState())）
+        //   → loop 消费表达式（LlmAgentLoop:5959-5965 原样 getNestedMemoryAttachments(baseTuc
+        //   .nestedMemoryAttachmentTriggers(), baseTuc.loadedNestedMemoryPaths(), baseTuc.readFileState(),
+        //   baseTuc.sessionId())）
         //   → InstructionsLoaded 发射 + 三孤儿子函数生产调用。
         setUp(false);
         // [CLD-06 环境修复] ReadFileTool 触发路径经 PathGuard.resolve → toRealPath（Windows 8.3
@@ -1164,7 +1184,7 @@ class ClaudemdEngineTest {
         //   判定失败 → lazy 加载空跑（hooks 0 发射）→ 本机（8.3 短名生效）E2E 恒失败。
         Path realWorkspace = workspace.toRealPath();
         engine = new ClaudemdEngine(autoMemPaths, detection,
-            () -> realWorkspace.toString(), () -> true, () -> true, () -> true,
+            sessionId -> realWorkspace.toString(), () -> true, () -> true, () -> true,
             () -> false, () -> List.of());
         // fixtures（同 getNestedMemoryAttachments_consumesTriggersFiresHooks）：Phase1 managed/user 条件
         //   规则 + Phase3 nested CLAUDE.md/cond + Phase4 cwd 级条件规则
@@ -1221,9 +1241,10 @@ class ClaudemdEngineTest {
             .contains(expectedTrigger);
 
         // ④ loop 消费表达式（LlmAgentLoop:3126-3130 原样）
+        // [批 3c] 会话标识与生产 LlmAgentLoop 同源：显式取自本轮 ToolUseContext（baseTuc.sessionId()）
         List<MemoryFileInfo> newly = engine.getNestedMemoryAttachments(
             baseTuc.nestedMemoryAttachmentTriggers(), baseTuc.loadedNestedMemoryPaths(),
-            baseTuc.readFileState());
+            baseTuc.readFileState(), baseTuc.sessionId());
         awaitTrue(() -> captured.size() >= 5, 5000);
 
         assertThat(baseTuc.nestedMemoryAttachmentTriggers())
@@ -1273,7 +1294,8 @@ class ClaudemdEngineTest {
             for (int i = 0; i < n; i++) {
                 futures.add(pool.submit(() -> {
                     start.await();
-                    return engine.getMemoryFiles(false);
+                    // [批 3c] 无会话 → 显式 null（本用例只断言并发首调单飞，不涉会话）
+                    return engine.getMemoryFiles(false, null);
                 }));
             }
             start.countDown();
@@ -1308,8 +1330,9 @@ class ClaudemdEngineTest {
         // ① 内容与磁盘不一致（strip 后 differs）→ 注册 rawContent + isPartialView=true
         MemoryFileInfo partial = new MemoryFileInfo("/p/CLAUDE.md", ClaudemdMemoryType.PROJECT,
             "injected", null, null, true, "raw\ncontent");
+        // [批 3c] 无会话 → 显式 null（本用例只断言双源去重 + readFileState 注册，不涉会话）
         List<MemoryFileInfo> injected = engine.memoryFilesToAttachments(
-            List.of(partial), loaded, cache, "/t/App.java");
+            List.of(partial), loaded, cache, "/t/App.java", null);
         assertThat(injected).as("内容不一致文件正常注入").hasSize(1);
         String key = java.nio.file.Paths.get("/p/CLAUDE.md").toAbsolutePath().normalize().toString();
         assertThat(cache.has(key)).as("注入后必须注册 readFileState（CC :1742）").isTrue();
@@ -1321,14 +1344,14 @@ class ClaudemdEngineTest {
 
         // ② 已注册（=本会话已 Read/注入）→ readFileState.has 去重跳过（CC :1725）
         List<MemoryFileInfo> second = engine.memoryFilesToAttachments(
-            List.of(partial), loaded, cache, "/t/App.java");
+            List.of(partial), loaded, cache, "/t/App.java", null);
         assertThat(second).as("readFileState 命中 → 跳过注入（双源去重）").isEmpty();
 
         // ③ 内容与磁盘一致 → isPartialView=false + content=处理内容
         MemoryFileInfo exact = new MemoryFileInfo("/q/CLAUDE.local.md", ClaudemdMemoryType.LOCAL,
             "body", null, null, false, null);
         List<MemoryFileInfo> injected2 = engine.memoryFilesToAttachments(
-            List.of(exact), loaded, cache, "/t/App.java");
+            List.of(exact), loaded, cache, "/t/App.java", null);
         assertThat(injected2).hasSize(1);
         ToolUseContext.ReadState exactState = cache.get(
             java.nio.file.Paths.get("/q/CLAUDE.local.md").toAbsolutePath().normalize().toString());
@@ -1371,7 +1394,7 @@ class ClaudemdEngineTest {
             "---\npaths: [src/**.java, src/**.kt]\n---\nInline array rule\n");
         Set<String> processed = new LinkedHashSet<>();
         List<MemoryFileInfo> files = engine.getMemoryFilesForNestedDirectory(
-            nested.toString(), nested.resolve("src/main/App.java").toString(), processed);
+            nested.toString(), nested.resolve("src/main/App.java").toString(), processed, null);
 
         assertThat(files.stream().map(MemoryFileInfo::path).toList())
             .as("内联数组 paths 解析为独立 glob → 条件规则命中（旧实现带方括号永不命中）")
@@ -1666,8 +1689,8 @@ class ClaudemdEngineTest {
     }
 
     // ════════════════════════════════════════════════════════════════
-    // WF-1B / G7 / DEL-04：生产构造器 originalCwdSupplier 走 CwdResolution.getOriginalCwdLayer
-    // （对齐 CC claudemd.ts:851 getOriginalCwd()）
+    // WF-1B / G7 / DEL-04：生产构造器扫描根解析器走 CwdResolution.getOriginalCwdLayer
+    // （对齐 CC claudemd.ts:851 getOriginalCwd()；[drop-requestcontext] 按显式 sessionId 解析）
     // ════════════════════════════════════════════════════════════════
 
     /**
@@ -1675,8 +1698,9 @@ class ClaudemdEngineTest {
      * {@code getOriginalCwd()} 作为 Project/Local CLAUDE.md 向上遍历的扫描根 ——
      * {@code getOriginalCwd()} 返回 STATE.originalCwd（启动 cwd，随 worktree/resume 重锚）。
      * Java 生产 2 参构造器旧实现 {@code () -> System.getProperty("user.dir")} 固定 JVM 启动目录，
-     * 在会话绑定项目场景扫描根错位（G7）。须走 {@code CwdResolution.getOriginalCwdLayer()} ——
-     * 绑定项目层覆盖 user.dir 时取对扫描根。本测试钉死"生产构造器扫描根锚定绑定项目"语义。
+     * 在会话绑定项目场景扫描根错位（G7）。须走 {@code CwdResolution.getOriginalCwdLayer(sessionId)} ——
+     * 绑定项目层覆盖 user.dir 时取对扫描根。本测试钉死"生产构造器扫描根锚定绑定项目"语义
+     * （[drop-requestcontext] 起由调用方显式传 sessionId，不再有无参会话槽）。
      */
     // ════════════════════════════════════════════════════════════════
     // IMP-F1-2 resolveExcludePatterns 完整实现（OPD-CM5-F-03 / claudemd.ts:547-612）
@@ -1685,7 +1709,7 @@ class ClaudemdEngineTest {
     /** 构造带 claudeMdExcludes 的引擎（8 参注入式构造器）；TeamMem 默认关（exclude 不涉）。 */
     private ClaudemdEngine engineWithExcludes(List<String> excludes) {
         return new ClaudemdEngine(autoMemPaths, detection,
-            () -> workspace.toString(), () -> true, () -> true, () -> true,
+            sessionId -> workspace.toString(), () -> true, () -> true, () -> true,
             () -> false, () -> excludes);
     }
 
@@ -1823,26 +1847,31 @@ class ClaudemdEngineTest {
     }
 
     @Test
-    @DisplayName("生产 2 参构造器 → originalCwdSupplier 走 CwdResolution.getOriginalCwdLayer（对齐 CC claudemd.ts:851 getOriginalCwd）")
+    @DisplayName("生产 2 参构造器 → 扫描根走 CwdResolution.getOriginalCwdLayer（对齐 CC claudemd.ts:851 getOriginalCwd）")
     void productionConstructor_originalCwdSupplier_walksCwdResolutionBoundProject() throws Exception {
-        // 复用 setUp 已建的 autoMemPaths/detection（其 base=workspace，但 originalCwdSupplier
+        // 复用 setUp 已建的 autoMemPaths/detection（其 base=workspace，但扫描根解析器
         // 由生产构造器自决 → 不再硬编码 workspace）
+        //
+        // [drop-requestcontext] 已按 (a) 修复：生产 2 参构造器
+        //   （ClaudemdEngine 生产构造器，与 ToolRegistrationConfig claudemdEngine @Bean 同款）
+        //   现注入会话感知解析器 {@code sessionId -> CwdResolution.getOriginalCwdLayer(sessionId)}，
+        //   扫描根按调用方传入的**显式 sessionId** 现算（不再固定传无参 → 不再恒回落 user.dir）。
+        //   本用例显式传 sessionId 覆盖该路径：绑定项目层可达 → 扫描根 = 会话绑定项目。
+        //   断言值与「预期 RED」版本逐字相同，未改弱。
         String sessionId = "wf-1b-claudemd-" + java.util.UUID.randomUUID();
-        com.nexusai.common.RequestContext.setSession(sessionId);
         com.nexusai.common.SessionProjectRoot.setForSession(sessionId, workspace.toString());
         try {
             ClaudemdEngine prodEngine = new ClaudemdEngine(autoMemPaths, detection);
 
-            // getMemoryPath(PROJECT/LOCAL) 用 originalCwdSupplier.get() 作为根
-            assertThat(prodEngine.getMemoryPath(ClaudemdMemoryType.PROJECT))
+            // getMemoryPath(PROJECT/LOCAL, sessionId) 用 resolveOriginalCwd(sessionId) 作为根
+            assertThat(prodEngine.getMemoryPath(ClaudemdMemoryType.PROJECT, sessionId))
                 .as("Project CLAUDE.md 扫描根=绑定项目（CwdResolution.getOriginalCwdLayer）")
                 .isEqualTo(Paths.get(workspace.toRealPath().toString(), "CLAUDE.md").toString());
-            assertThat(prodEngine.getMemoryPath(ClaudemdMemoryType.LOCAL))
+            assertThat(prodEngine.getMemoryPath(ClaudemdMemoryType.LOCAL, sessionId))
                 .as("Local CLAUDE.local.md 扫描根=绑定项目")
                 .isEqualTo(Paths.get(workspace.toRealPath().toString(), "CLAUDE.local.md").toString());
         } finally {
             com.nexusai.common.SessionProjectRoot.clearSession(sessionId);
-            com.nexusai.common.RequestContext.clear();
         }
     }
 }

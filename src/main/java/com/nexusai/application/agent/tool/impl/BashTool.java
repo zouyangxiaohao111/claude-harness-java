@@ -6,7 +6,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.bash.BashCommandClassification;
 import com.nexusai.application.agent.bash.BashCommandOperatorPermissions;
 import com.nexusai.application.agent.bash.BashRuleMatcher;
@@ -2725,8 +2724,8 @@ public class BashTool implements Tool {
      * 以 getCwd 为越界基准）。cwd-align-ext：user.dir 兜底 → 会话 cwd；无 sessionId 回落 user.dir
      * （方案 1，零行为变化）。
      *
-     * <p><b>[批 3b]</b> sessionId 由调用方的 {@link ToolUseContext} <b>显式</b>传入（ctx 为 null
-     * → 无会话 → user.dir）。⛔ 不再读 {@code RequestContext.sessionId()}（MDC）：本方法在
+     * <p><b>[批 3b / 批 3c]</b> sessionId 由调用方的 {@link ToolUseContext} <b>显式</b>传入（ctx 为 null
+     * → 无会话 → user.dir）。⛔ 不再读裸 MDC：本方法在
      * tool-exec 池线程执行，MDC 恒 null 或残留该池线程上一个任务的别会话 id —— 而它与
      * {@link #gitReadOnlyGuardBlocked} 的 originalCwd <b>成对</b>构成 RO-17c 的
      * 「cwd ≠ orig-cwd」判定（readOnlyValidation.ts:1956-1966）；单侧读 MDC 会让两侧取自不同
@@ -4074,7 +4073,7 @@ public class BashTool implements Tool {
         }
         // RO-17c：沙箱启用且 cwd≠orig-cwd（readOnlyValidation.ts:1956-1966）
         // 批次4 #17：sessionId 取自 ctx.sessionId（显式载体），getOriginalCwdLayer 对齐 CC getOriginalCwd。
-        // [批 3b] ⛔ 删除 ctx 为 null / 无 sessionId 时的 RequestContext.sessionId()（MDC）兜底：
+        // [批 3b / 批 3c] ⛔ 已删除 ctx 为 null / 无 sessionId 时的裸 MDC 兜底：
         //   本方法在 tool-exec 池线程执行（无 MDC）→ 兜底恒 null 或读到该池线程上一个任务残留的
         //   别会话 id（第三态）⇒ 用错会话的 originalCwd 比对，可能让越界命令通过（安全守卫失真）。
         //   缺会话 → null → getOriginalCwdLayer(null) 回落 user.dir（本仓既有 Java 兜底语义，

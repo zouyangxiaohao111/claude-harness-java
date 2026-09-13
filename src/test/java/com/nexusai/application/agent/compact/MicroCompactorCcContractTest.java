@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.compact;
 
 import com.nexusai.application.agent.tool.AgentUsage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
@@ -44,10 +43,8 @@ class MicroCompactorCcContractTest {
     void resetStaticState() {
         MicroCompactor.setCachedMicrocompactEnabled(false);
         MicroCompactor.setNowForTest(0L);
-        MicroCompactor.resetMicrocompactState();
+        MicroCompactor.resetMicrocompactState(SESSION);
         CompactWarningState.clearCompactWarningSuppression();
-        // OPD-CM5-A-10 会话级隔离：清 MDC 防止会话键泄漏到后续测试
-        RequestContext.clear();
     }
 
     // ─────────────────────── 消息构造 ───────────────────────
@@ -115,7 +112,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildMessagesWithTools();
         MicroCompactor mc = new MicroCompactor();
 
-        MicroCompactResult result = mc.microcompactMessages(messages, null);
+        MicroCompactResult result = mc.microcompactMessages(messages, null, SESSION);
 
         assertThat(result.messages()).as("no-op 返回原列表引用（microCompact.ts:292）").isSameAs(messages);
         assertThat(result.compactionInfo()).as("no-op 无 compactionInfo").isNull();
@@ -129,7 +126,7 @@ class MicroCompactorCcContractTest {
         assertThat(CompactWarningState.isCompactWarningSuppressed())
             .as("前置：压缩后处于抑制态").isTrue();
 
-        new MicroCompactor().microcompactMessages(List.of(), null);
+        new MicroCompactor().microcompactMessages(List.of(), null, SESSION);
 
         assertThat(CompactWarningState.isCompactWarningSuppressed())
             .as("新 microcompact 尝试开始必须复位抑制").isFalse();
@@ -144,7 +141,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
-        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread");
+        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
 
         assertThat(clearedCount(result.messages()))
             .as("time-based 触发后内容被清除（cached 被跳过）").isEqualTo(2);
@@ -158,12 +155,12 @@ class MicroCompactorCcContractTest {
         MicroCompactor mc = new MicroCompactor();
 
         // main-thread → cached 路径进入，内部算法 OD-01 "?" → 无编辑产出，返回原消息
-        MicroCompactResult main = mc.microcompactMessages(messages, "repl_main_thread");
+        MicroCompactResult main = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
         assertThat(main.messages()).as("cached 路径（OD-01）无编辑产出返回原列表").isSameAs(messages);
         assertThat(main.compactionInfo()).as("无编辑产出 → compactionInfo null").isNull();
 
         // 非 main-thread（/compact 等）→ cached 门控不过，默认 no-op
-        MicroCompactResult sub = mc.microcompactMessages(messages, "compact");
+        MicroCompactResult sub = mc.microcompactMessages(messages, "compact", SESSION);
         assertThat(sub.messages()).as("非 main-thread 走默认 no-op").isSameAs(messages);
     }
 
@@ -179,7 +176,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildTimeBasedMessages(now); // 3 个可压缩工具
 
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 0));
-        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread");
+        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
 
         assertThat(clearedCount(result.messages()))
             .as("keepRecent floor 1 → 3 个工具清 2 留 1").isEqualTo(2);
@@ -193,7 +190,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 2));
-        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread");
+        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
 
         assertThat(clearedCount(result.messages())).as("3 个工具清 1 留 2").isEqualTo(1);
     }
@@ -210,7 +207,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
 
-        mc.microcompactMessages(messages, "repl_main_thread");
+        mc.microcompactMessages(messages, "repl_main_thread", SESSION);
 
         // CC 口径（microCompact.ts:481）：tokensSaved += calculateToolResultTokens(block) —— 无 ×4/3 padding
         // 被清除两条工具消息（tool-1: 40 chars → rough=10，tool-2: 8 chars → rough=2）→ 真实合计 = 12
@@ -237,16 +234,16 @@ class MicroCompactorCcContractTest {
         long now = System.currentTimeMillis();
         MicroCompactor.setNowForTest(now);
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
-        MicroCompactor.setPendingCacheEditsForTest(new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 0));
+        MicroCompactor.setPendingCacheEditsForTest(new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 0), SESSION);
         AtomicReference<String> notified = new AtomicReference<>("__unset__");
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
         mc.setNotifyCacheDeletion((qs, aid) -> notified.set(qs));
 
-        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread");
+        MicroCompactResult result = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
 
         assertThat(clearedCount(result.messages())).isEqualTo(2);
         // resetMicrocompactState 内部清空 pendingCacheEdits（microCompact.ts:513-517）
-        assertThat(MicroCompactor.consumePendingCacheEdits())
+        assertThat(MicroCompactor.consumePendingCacheEdits(SESSION))
             .as("time-based 后 resetMicrocompactState 已清空 pendingCacheEdits").isNull();
         // notifyCacheDeletion 接线：以实际 querySource 通知（microCompact.ts:520-527，cache break 误报防护）
         assertThat(notified.get()).as("notifyCacheDeletion 必须以 querySource 通知").isEqualTo("repl_main_thread");
@@ -259,22 +256,22 @@ class MicroCompactorCcContractTest {
     @Test
     @DisplayName("cached-MC 引用面：consumePendingCacheEdits 返回并清空；resetMicrocompactState 复位")
     void cachedMC_referenceSurface_consumeAndReset() {
-        assertThat(MicroCompactor.consumePendingCacheEdits()).as("未捕获时返回 null").isNull();
+        assertThat(MicroCompactor.consumePendingCacheEdits(SESSION)).as("未捕获时返回 null").isNull();
 
         MicroCompactor.setPendingCacheEditsForTest(
-            new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 123L));
-        MicroCompactResult.PendingCacheEdits edits = MicroCompactor.consumePendingCacheEdits();
+            new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 123L), SESSION);
+        MicroCompactResult.PendingCacheEdits edits = MicroCompactor.consumePendingCacheEdits(SESSION);
         assertThat(edits).isNotNull();
         assertThat(edits.trigger()).as("CC trigger 恒 'auto'").isEqualTo("auto");
         assertThat(edits.deletedToolIds()).containsExactly("t1");
         assertThat(edits.baselineCacheDeletedTokens()).isEqualTo(123L);
-        assertThat(MicroCompactor.consumePendingCacheEdits())
+        assertThat(MicroCompactor.consumePendingCacheEdits(SESSION))
             .as("consume 后 pendingCacheEdits 已清空").isNull();
 
         MicroCompactor.setPendingCacheEditsForTest(
-            new MicroCompactResult.PendingCacheEdits("auto", List.of("t2"), 0));
-        MicroCompactor.resetMicrocompactState();
-        assertThat(MicroCompactor.consumePendingCacheEdits())
+            new MicroCompactResult.PendingCacheEdits("auto", List.of("t2"), 0), SESSION);
+        MicroCompactor.resetMicrocompactState(SESSION);
+        assertThat(MicroCompactor.consumePendingCacheEdits(SESSION))
             .as("resetMicrocompactState 复位 pendingCacheEdits").isNull();
     }
 
@@ -283,19 +280,19 @@ class MicroCompactorCcContractTest {
     void resetMicrocompactState_scope_clearsState_keepsGateConfig() {
         MicroCompactor.setCachedMicrocompactEnabled(true);
         MicroCompactor.setPendingCacheEditsForTest(
-            new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 7L));
+            new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 7L), SESSION);
 
-        MicroCompactor.resetMicrocompactState();
+        MicroCompactor.resetMicrocompactState(SESSION);
 
         // CC 语义 1/2：pendingCacheEdits = null（microCompact.ts:134）——引用面内唯一状态
-        assertThat(MicroCompactor.consumePendingCacheEdits())
+        assertThat(MicroCompactor.consumePendingCacheEdits(SESSION))
             .as("reset 必须清空 pendingCacheEdits（microCompact.ts:134）").isNull();
         // CC 语义 2/2：cachedMCState.resetCachedMCState（microCompact.ts:131-133）属缺失模块
         // cachedMicrocompact.js 内部算法（OD-01 "?"），Java 无镜像态可复位——引用面内 reset 范围 = pendingCacheEdits
         // 范围外：reset 不得复位 cached 门控配置（feature/module/model 模块态，CC reset 不触碰模块配置）
         MicroCompactor.setPendingCacheEditsForTest(
-            new MicroCompactResult.PendingCacheEdits("auto", List.of("t2"), 5L));
-        CompactBoundaryMessage boundary = MicroCompactor.maybeCreateMicrocompactBoundaryMessage(10L);
+            new MicroCompactResult.PendingCacheEdits("auto", List.of("t2"), 5L), SESSION);
+        CompactBoundaryMessage boundary = MicroCompactor.maybeCreateMicrocompactBoundaryMessage(10L, SESSION);
         assertThat(boundary).as("reset 后 feature 门仍开启 → pendingCacheEdits 可消费并 yield boundary（配置未被 reset 复位）")
             .isNotNull();
         assertThat(boundary.content()).isNotNull();
@@ -340,7 +337,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildTimeBasedMessages(now);
 
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
-        MicroCompactResult result = mc.microcompactMessages(messages, "compact");
+        MicroCompactResult result = mc.microcompactMessages(messages, "compact", SESSION);
 
         assertThat(clearedCount(result.messages())).as("/compact 源不触发 time-based").isZero();
         assertThat(result.messages()).isSameAs(messages);
@@ -367,9 +364,9 @@ class MicroCompactorCcContractTest {
             lastAsst.withUsage(new AgentUsage(100L, 50L, 30L, 20L,
                 null, null, null, "", List.of(), "standard", 500L)));
 
-        new MicroCompactor().microcompactMessages(messages, "repl_main_thread");
+        new MicroCompactor().microcompactMessages(messages, "repl_main_thread", SESSION);
 
-        MicroCompactResult.PendingCacheEdits edits = MicroCompactor.consumePendingCacheEdits();
+        MicroCompactResult.PendingCacheEdits edits = MicroCompactor.consumePendingCacheEdits(SESSION);
         assertThat(edits).as("active=13 > triggerThreshold=10 → 删除触发，compactionInfo.pendingCacheEdits 入队")
             .isNotNull();
         assertThat(edits.baselineCacheDeletedTokens())
@@ -390,7 +387,7 @@ class MicroCompactorCcContractTest {
 
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
         // 生产主循环传 params.querySource().name() = "REPL_MAIN_THREAD"（大写枚举名）
-        MicroCompactResult result = mc.microcompactMessages(messages, "REPL_MAIN_THREAD");
+        MicroCompactResult result = mc.microcompactMessages(messages, "REPL_MAIN_THREAD", SESSION);
 
         assertThat(clearedCount(result.messages()))
             .as("生产大写 name() 必须触发 time-based 清除（canonical 归一消费）").isEqualTo(2);
@@ -403,7 +400,7 @@ class MicroCompactorCcContractTest {
         List<ChatMessageDto> messages = buildMessagesWithTools();
         MicroCompactor mc = new MicroCompactor();
 
-        MicroCompactResult result = mc.microcompactMessages(messages, "SDK");
+        MicroCompactResult result = mc.microcompactMessages(messages, "SDK", SESSION);
 
         assertThat(result.messages()).as("SDK 大写归一后视为 main-thread → cached 路径（OD-01 无编辑产出）返回原列表").isSameAs(messages);
     }
@@ -418,7 +415,7 @@ class MicroCompactorCcContractTest {
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
         mc.setNotifyCacheDeletion((qs, aid) -> notified.set(qs));
 
-        MicroCompactResult result = mc.microcompactMessages(messages, "REPL_MAIN_THREAD");
+        MicroCompactResult result = mc.microcompactMessages(messages, "REPL_MAIN_THREAD", SESSION);
 
         assertThat(clearedCount(result.messages())).isEqualTo(2);
         assertThat(notified.get()).as("notifyCacheDeletion 必须以传入 querySource 原值通知（CC microCompact.ts:526 透传）")
@@ -434,11 +431,11 @@ class MicroCompactorCcContractTest {
         MicroCompactor mc = new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1));
 
         // 小写（测试既有值域）仍触发
-        MicroCompactResult lower = mc.microcompactMessages(messages, "repl_main_thread");
+        MicroCompactResult lower = mc.microcompactMessages(messages, "repl_main_thread", SESSION);
         assertThat(clearedCount(lower.messages())).as("小写 repl_main_thread 保持触发").isEqualTo(2);
 
         // 大写 COMPACT 仍不触发（非 main-thread 语义保持，microCompact.ts:429-433）
-        MicroCompactResult compact = mc.microcompactMessages(messages, "COMPACT");
+        MicroCompactResult compact = mc.microcompactMessages(messages, "COMPACT", SESSION);
         assertThat(clearedCount(compact.messages())).as("COMPACT 大写归一 'compact' 非 main-thread → 不触发").isZero();
     }
 
@@ -447,50 +444,45 @@ class MicroCompactorCcContractTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("OPD-CM5-A-10 会话级隔离：cached-MC 状态按会话键（MDC sessionId）隔离，会话 A/B 互不污染")
+    @DisplayName("OPD-CM5-A-10 会话级隔离：cached-MC 状态按会话键（显式 sessionId）隔离，会话 A/B 互不污染")
     void cachedMCState_sessionIsolation() {
         MicroCompactor.setCachedMicrocompactEnabled(true);
         try {
             // 会话 A：注册 13 个工具（t0..t12）→ active=13 > threshold=10 → 删除最旧 8 个（保留最近 5 个）
             List<ChatMessageDto> chainA = buildToolChain(13, "t");
-            RequestContext.setSession("sess-A");
-            new MicroCompactor().microcompactMessages(chainA, "repl_main_thread");
-            MicroCompactResult.PendingCacheEdits editsA = MicroCompactor.consumePendingCacheEdits();
+            new MicroCompactor().microcompactMessages(chainA, "repl_main_thread", "sess-A");
+            MicroCompactResult.PendingCacheEdits editsA = MicroCompactor.consumePendingCacheEdits("sess-A");
             assertThat(editsA).as("会话 A active=13>10 → 删除触发，compactionInfo.pendingCacheEdits 入队").isNotNull();
             assertThat(editsA.deletedToolIds())
                 .as("会话 A 删除最旧 8 个 t0..t7（slice(0, 13-5)，CC cachedMicrocompact.ts:87-94）")
                 .containsExactly("t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7");
 
             // 会话 B：全新桶，未受 A 污染——A 已写入的 pendingCacheEdits / cache_edits 块 / pinnedEdits 均不可见
-            RequestContext.setSession("sess-B");
-            assertThat(MicroCompactor.consumePendingCacheEdits())
+            assertThat(MicroCompactor.consumePendingCacheEdits("sess-B"))
                 .as("会话 B 桶初始为空，不消费到 A 的 pendingCacheEdits").isNull();
-            assertThat(MicroCompactor.consumePendingCacheEditsBlock())
+            assertThat(MicroCompactor.consumePendingCacheEditsBlock("sess-B"))
                 .as("会话 B 桶初始为空，不消费到 A 的 cache_edits 块").isNull();
-            assertThat(MicroCompactor.getPinnedCacheEdits())
+            assertThat(MicroCompactor.getPinnedCacheEdits("sess-B"))
                 .as("会话 B 桶初始为空，无 A 的 pinnedEdits").isEmpty();
 
             // 会话 B：注册自己的 13 个工具（u0..u12）→ 触发自己的删除（u0..u7），与 A 完全隔离
             List<ChatMessageDto> chainB = buildToolChain(13, "u");
-            new MicroCompactor().microcompactMessages(chainB, "repl_main_thread");
-            MicroCompactResult.PendingCacheEdits editsB = MicroCompactor.consumePendingCacheEdits();
+            new MicroCompactor().microcompactMessages(chainB, "repl_main_thread", "sess-B");
+            MicroCompactResult.PendingCacheEdits editsB = MicroCompactor.consumePendingCacheEdits("sess-B");
             assertThat(editsB).as("会话 B active=13>10 → 删除触发").isNotNull();
             assertThat(editsB.deletedToolIds())
                 .as("会话 B 删除的是自己的 u0..u7，不含 A 的 t 前缀（状态机完全隔离）")
                 .containsExactly("u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7");
 
             // 回到会话 A：A 的 pendingCacheEdits 已被自身 consume 清空，且不受 B 影响
-            RequestContext.setSession("sess-A");
-            assertThat(MicroCompactor.consumePendingCacheEdits())
+            assertThat(MicroCompactor.consumePendingCacheEdits("sess-A"))
                 .as("回到 A：A 的 pendingCacheEdits 已消费清空，B 未污染 A").isNull();
 
             // 主循环模型同样按会话隔离（microCompact.ts:278 门控 model 谓词入参）
-            MicroCompactor.setMainLoopModel("claude-opus-4-20250514");
-            RequestContext.setSession("sess-B");
-            assertThat(MicroCompactor.getMainLoopModel())
+            MicroCompactor.setMainLoopModel("claude-opus-4-20250514", "sess-A");
+            assertThat(MicroCompactor.getMainLoopModel("sess-B"))
                 .as("会话 B 的 mainLoopModel 不受 A 注入影响（仍为 null）").isNull();
         } finally {
-            RequestContext.clear();
             // 清理测试会话桶，防跨用例内存积累
             MicroCompactor.removeSessionState("sess-A");
             MicroCompactor.removeSessionState("sess-B");
@@ -504,11 +496,10 @@ class MicroCompactorCcContractTest {
     @Test
     @DisplayName("MG-6 A2-4 removeSessionState：会话结束钩子（/clear、会话删除）移除桶 → 下轮懒建新桶，旧态不残留（防 SESSION_STATES 内存累积）")
     void removeSessionState_releasesSessionBucketOnSessionEnd() {
-        RequestContext.setSession("sess-MG6");
         try {
             // 会话 A 注入主循环模型（桶内 mainLoopModel 持久化，模拟 cached-MC 会话态已建立）
-            MicroCompactor.setMainLoopModel("claude-opus-4-20250514");
-            assertThat(MicroCompactor.getMainLoopModel())
+            MicroCompactor.setMainLoopModel("claude-opus-4-20250514", "sess-MG6");
+            assertThat(MicroCompactor.getMainLoopModel("sess-MG6"))
                 .as("会话态建立后 mainLoopModel 可读（桶已存在）").isEqualTo("claude-opus-4-20250514");
 
             // 会话结束钩子（/clear、会话删除）：removeSessionState 移除整桶 → SESSION_STATES 不累积
@@ -518,11 +509,10 @@ class MicroCompactorCcContractTest {
 
             // 下轮 currentSessionState() computeIfAbsent 懒建新桶 → 旧桶状态（mainLoopModel）不残留
             //   （语义等价 CC reset 后新 turn）
-            assertThat(MicroCompactor.getMainLoopModel())
+            assertThat(MicroCompactor.getMainLoopModel("sess-MG6"))
                 .as("removeSessionState 后会话桶已移除，下轮懒建新桶，旧 mainLoopModel 不残留")
                 .isNull();
         } finally {
-            RequestContext.clear();
             MicroCompactor.removeSessionState("sess-MG6");
         }
     }

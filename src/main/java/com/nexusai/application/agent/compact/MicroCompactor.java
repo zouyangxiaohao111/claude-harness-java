@@ -51,7 +51,7 @@ import java.util.regex.Pattern;
  *
  * <h2>cached-MC 状态机（cachedMicrocompact.ts 112 行真源全量对齐）</h2>
  * <p>cachedMicrocompactPath 内部算法已按 CC 真源 {@code cachedMicrocompact.ts}（112 行）实现：
- * {@link #ensureCachedMCState()}（懒初始化模块态单例，microCompact.ts:71-81）→
+ * {@link #ensureCachedMCState(String)}（懒初始化会话桶，microCompact.ts:71-81）→
  * {@link #registerToolResult} / {@link #registerToolMessage}（:313-330 分组注册）→
  * {@link #getToolResultsToDelete}（:332 超阈值触发）→ {@link #createCacheEditsBlock}
  * （:336-339 构建 cache_edits 块并入队模块态）→ 返回
@@ -72,9 +72,16 @@ import java.util.regex.Pattern;
  * {@code /claude-[a-z]+-4[-\d]/}，cachedMicrocompact.ts:33-35）/ {@link #isMainThreadSource(String)}。
  * CC 的 model 来自 {@code toolUseContext?.options.mainLoopModel ?? getMainLoopModel()}
  * （microCompact.ts:278），Java 以当前会话桶 {@link MicroCompactSessionState#mainLoopModel}
- * 承载——生产由 LlmAgentLoop 主循环每轮 turn 起始经 {@link #setMainLoopModel(String)}
+ * 承载——生产由 LlmAgentLoop 主循环每轮 turn 起始经 {@link #setMainLoopModel(String, String)}
  * 注入（OD-01 已闭环；OPD-CM5-A-10 会话级隔离，会话间不互串），
- * 签名保持 {@code microcompactMessages(messages, querySource)} 二参。
+ * 签名 {@code microcompactMessages(messages, querySource, sessionId)} 三参。
+ *
+ * <h2>会话键（批 3c）</h2>
+ * <p>本类<b>不读任何环境态会话槽</b>（裸 MDC 会话槽已随批 3c 删除）。会话桶键 =
+ * <b>调用方显式传入的 sessionId</b>，经各公开静态方法的<b>最后一个形参</b>下传。
+ * 调用方未传（null/空白）→ {@link #DEFAULT_SESSION_KEY} 默认桶 + 一次性 WARN
+ * （见 {@link #currentSessionState(String)}）——那是「该调用点确实无会话」的合法兜底，
+ * 不是会话键来源。
  */
 public class MicroCompactor {
 
@@ -130,18 +137,18 @@ public class MicroCompactor {
      *
      * <p><b>WHY 从静态单例改会话级</b>: CC 为单进程每查询（module-level 单例，microCompact.ts:57），
      * 进程即会话，天然隔离；Java 后端多会话共享 JVM，静态单例使会话 A 注册的工具 / 待下发块 /
-     * 主循环模型泄漏到会话 B（v5 探查风险 §10）。改为按 {@code RequestContext.sessionId()}（MDC）
-     * 键控的会话级状态表：每会话独立 {@link MicroCompactSessionState}，跨 turn 存活，
-     * {@link #resetMicrocompactState()} 只复位当前会话。
+     * 主循环模型泄漏到会话 B（v5 探查风险 §10）。改为按<b>会话标识</b>键控的会话级状态表：
+     * 每会话独立 {@link MicroCompactSessionState}，跨 turn 存活，
+     * {@link #resetMicrocompactState(String)} 只复位当前会话。
      *
-     * <p><b>会话键来源</b>: {@link com.nexusai.common.RequestContext#sessionId()}（MDC，ChatService/
-     * CommandController 请求入口已设；STREAM_EXECUTOR 虚拟线程 MDC 已由 LlmAgentLoop:4619-4621
-     * 回放）。MDC null（测试 / 非请求线程）→ {@link #DEFAULT_SESSION_KEY} 默认桶（fail-loud debug）。
+     * <p><b>会话键来源</b>（[批 3c 已收敛]）: <b>调用方显式传入的 sessionId</b>——本类已无任何
+     * 环境态会话槽读取（裸 MDC 会话槽随批 3c 删除）。调用方未传（null/空白）→
+     * {@link #DEFAULT_SESSION_KEY} 默认桶 + 一次性 WARN（见 {@link #currentSessionState(String)}）。
      */
     private static final ConcurrentHashMap<String, MicroCompactSessionState> SESSION_STATES =
         new ConcurrentHashMap<>();
 
-    /** 无会话上下文（MDC null）时的默认桶键（测试 / 非请求线程路径，fail-loud debug 日志披露）。 */
+    /** 调用方未传会话（{@code sessionId} 为 null/空白）时的默认桶键（一次性 WARN 披露 · 批 3c）。 */
     private static final String DEFAULT_SESSION_KEY = "<default-session>";
 
     /**
@@ -150,7 +157,7 @@ public class MicroCompactor {
      * <p><b>成员对应原模块态字段</b>（均从静态单例迁移为会话键控）：
      * <ul>
      *   <li>{@code cachedMCState} —— 原 {@code static volatile CachedMCState cachedMCState}，
-     *       {@link #ensureCachedMCState()} 懒初始化（会话桶内创建，跨 turn 存活）</li>
+     *       {@link #ensureCachedMCState(String)} 懒初始化（会话桶内创建，跨 turn 存活）</li>
      *   <li>{@code pendingCacheEditsBlock} —— 原 {@code static volatile CacheEditsBlock}
      *       （microCompact.ts:58-60，provider 层取走注入 API 请求）</li>
      *   <li>{@code pendingCacheEdits} —— 原 {@code static volatile PendingCacheEdits}
@@ -167,25 +174,38 @@ public class MicroCompactor {
     }
 
     /**
-     * 解析当前会话的 cached-MC 状态桶 · OPD-CM5-A-10 会话级隔离。
+     * 解析指定会话的 cached-MC 状态桶 · OPD-CM5-A-10 会话级隔离。
      *
-     * <p>会话键 = {@link com.nexusai.common.RequestContext#sessionId()}（MDC 原始 'sess-xxx' 键，
-     * 与 ChatService/CommandController 入口同一会话标识）。MDC null（测试 / 非请求线程路径）
-     * → {@link #DEFAULT_SESSION_KEY} 默认桶（fail-loud：debug 日志披露，生产正常路径 MDC 恒非 null）。
+     * <p>会话键 = <b>调用方显式传入的 sessionId</b>（原始 'sess-xxx' 键，与请求入口同一会话标识）。
+     * 本类<b>不读任何环境态会话槽</b>：裸 MDC 会话槽已随批 3c 删除，会话键一律经形参下传。
      *
-     * @return 当前会话状态桶（非空，computeIfAbsent 懒建）
+     * <p>{@code sessionId} 为 null/空白（该调用点确实无会话：无 history 的测试路径 / 非会话上下文）
+     * → {@link #DEFAULT_SESSION_KEY} 默认桶 + <b>一次性 WARN</b>。注意该兜底意味着「调用方未传会话」
+     * 的全部路径共用一个桶 —— 生产调用点必须传真实会话，否则 OPD-CM5-A-10 会话级隔离退化为单桶
+     * （A 会话的 pendingCacheEdits 被注入 B 会话请求）。
+     *
+     * @param sessionId 显式会话 ID（null/空白 → 默认桶 + 一次性 WARN）
+     * @return 该会话状态桶（非空，computeIfAbsent 懒建）
      */
-    private static MicroCompactSessionState currentSessionState() {
-        String sessionId = com.nexusai.common.RequestContext.sessionId();
-        if (sessionId == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[MicroCompactor] RequestContext.sessionId()=null（测试 / 非请求线程路径），"
-                    + "回落默认桶 {} · OPD-CM5-A-10 会话级隔离", DEFAULT_SESSION_KEY);
+    private static MicroCompactSessionState currentSessionState(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            // [批 3c] 调用方未传会话 → 默认桶。本方法在热路径（每次流式请求/压缩都调）⇒ 告警只发
+            //   **一次**（首次 WARN，后续 debug 同伴留痕），既满足「禁只 DEBUG」，又不刷屏。
+            if (DEGRADED_SESSION_KEY_WARNED.compareAndSet(false, true)) {
+                log.warn("[MicroCompactor] 调用方未传会话（sessionId 为 null/空白），回落默认桶 {} · "
+                    + "OPD-CM5-A-10 会话级隔离退化为单桶（调用方须显式传入 sessionId）"
+                    + "—— 本条为该状态首次告警，后续同类回落降为 debug", DEFAULT_SESSION_KEY);
+            } else if (log.isDebugEnabled()) {
+                log.debug("[MicroCompactor] 调用方未传会话，继续回落默认桶 {}（首次告警已发出）", DEFAULT_SESSION_KEY);
             }
             sessionId = DEFAULT_SESSION_KEY;
         }
         return SESSION_STATES.computeIfAbsent(sessionId, k -> new MicroCompactSessionState());
     }
+
+    /** [批 3c] 「调用方未传会话 → 默认桶」首次告警闸（防热路径 WARN 刷屏；false→true 只发一次）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean DEGRADED_SESSION_KEY_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
      * 移除某会话的 cached-MC 状态桶 · OPD-CM5-A-10 会话级隔离（会话结束清理入口）。
@@ -193,7 +213,7 @@ public class MicroCompactor {
      * <p>CC 进程随会话结束退出，无泄漏；Java 多会话常驻 JVM，会话结束时由外层（/clear、
      * 会话删除）调用以释放桶内存。null / 未知会话为 no-op。
      *
-     * @param sessionId 会话 ID（MDC 原始 'sess-xxx' 键；null → no-op）
+     * @param sessionId 会话 ID（显式传入的原始 'sess-xxx' 键；null → no-op）
      */
     public static void removeSessionState(String sessionId) {
         if (sessionId != null) {
@@ -293,21 +313,27 @@ public class MicroCompactor {
      * （registerToolResult/createCacheEditsBlock 等，见 {@link #cachedMicrocompactPath}）。
      * <p><b>provider 接线已闭环（OD-01 leftover）</b>:
      * <ol>
-     *   <li>{@link #markToolsSentToAPIState()} 由 LlmAgentLoop 流结束点经
+     *   <li>{@link #markToolsSentToAPIState(String)} 由 LlmAgentLoop 流结束点经
      *       {@link #cachedMicrocompactEnabledForModel(String)} 门控调用（claude.ts:2834-2836）</li>
-     *   <li>{@link #consumePendingCacheEditsBlock()} 由 AnthropicSdkProvider 请求构造点
+     *   <li>{@link #consumePendingCacheEditsBlock(String)} 由 AnthropicSdkProvider 请求构造点
      *       经 {@link #cachedMicrocompactEnabledForModel(String)} 门控消费一次（claude.ts:1528-1535；
      *       SDK cache_edits 内容块序列化受 SDK 结构限制，见 leftover）</li>
-     *   <li>{@link #setMainLoopModel(String)} 由 LlmAgentLoop 主循环每轮 turn 起始注入
+     *   <li>{@link #setMainLoopModel(String, String)} 由 LlmAgentLoop 主循环每轮 turn 起始注入
      *       （microCompact.ts:278 toolUseContext.options.mainLoopModel 等价）</li>
      * </ol>
+     *
+     * <p><b>会话键（批 3c）</b>: 本入口的会话桶键 = {@code sessionId} 形参，经
+     * {@link #maybeTimeBasedMicrocompact} / {@link #cachedMicrocompactPath} 原值下传（同一次调用
+     * 全程同一会话，绝不在中途重新解析）。{@code null}/空白 → 默认桶 + 一次性 WARN。
      *
      * @param messages   待处理消息列表（非空）
      * @param querySource CC QuerySource（主循环传 "repl_main_thread:..."；/compact 传 null
      *                    = CC undefined，V2-S4 对齐 compact.ts:98；null = 无源）
+     * @param sessionId   显式会话 ID（会话桶键；见类 javadoc「会话键」）
      * @return microcompact 结果（{@code {messages, compactionInfo?}}）
      */
-    public MicroCompactResult microcompactMessages(List<ChatMessageDto> messages, String querySource) {
+    public MicroCompactResult microcompactMessages(List<ChatMessageDto> messages, String querySource,
+                                                   String sessionId) {
         if (messages == null) {
             throw new IllegalArgumentException("MicroCompactor.microcompactMessages: messages is null");
         }
@@ -316,7 +342,7 @@ public class MicroCompactor {
         CompactWarningState.clearCompactWarningSuppression();
 
         // ── 2. time-based 短路（microCompact.ts:267-270 maybeTimeBasedMicrocompact）──
-        MicroCompactResult timeBased = maybeTimeBasedMicrocompact(messages, querySource);
+        MicroCompactResult timeBased = maybeTimeBasedMicrocompact(messages, querySource, sessionId);
         if (timeBased != null) {
             if (log.isDebugEnabled()) {
                 log.debug("[MicroCompactor] microcompactMessages: time-based 触发短路，返回清除结果");
@@ -330,9 +356,9 @@ public class MicroCompactor {
         //     model = toolUseContext?.options.mainLoopModel ?? getMainLoopModel()（microCompact.ts:278）
         if (isCachedMicrocompactFeatureEnabled()
                 && isCachedMicrocompactEnabled()
-                && isModelSupportedForCacheEditing(currentSessionState().mainLoopModel)
+                && isModelSupportedForCacheEditing(currentSessionState(sessionId).mainLoopModel)
                 && isMainThreadSource(querySource)) {
-            return cachedMicrocompactPath(messages, querySource);
+            return cachedMicrocompactPath(messages, querySource, sessionId);
         }
 
         // ── 4. 默认 no-op（legacy 路径已移除，microCompact.ts:288-292，INV-10）──
@@ -398,9 +424,12 @@ public class MicroCompactor {
      *
      * @param messages    消息列表
      * @param querySource CC QuerySource（触发时必为 main-thread）
+     * @param sessionId   显式会话 ID（经 {@link #resetMicrocompactState(String)} 原值下传，
+     *                    只复位本会话桶）
      * @return 触发并清除后返回 {@code {messages}}；未触发返回 null
      */
-    private MicroCompactResult maybeTimeBasedMicrocompact(List<ChatMessageDto> messages, String querySource) {
+    private MicroCompactResult maybeTimeBasedMicrocompact(List<ChatMessageDto> messages, String querySource,
+                                                          String sessionId) {
         TimeBasedTriggerResult trigger = evaluateTimeBasedTrigger(messages, querySource);
         if (trigger == null) {
             return null;
@@ -477,7 +506,7 @@ public class MicroCompactor {
         CompactWarningState.suppressCompactWarning();
         // 刚内容清除 + 服务端缓存失效 → 若 next turn cached-MC 带陈旧 state 运行会删不存在的工具
         // → 重置（microCompact.ts:513-517 resetMicrocompactState）
-        resetMicrocompactState();
+        resetMicrocompactState(sessionId);
         // 刚改了 prompt 内容 → 下一次响应 cache read 会低，但那是我们，不是 break →
         // 通知检测器预期下降（microCompact.ts:520-527 notifyCacheDeletion）
         if (querySource != null) {
@@ -497,7 +526,7 @@ public class MicroCompactor {
      *
      * <p><b>数据流（microCompact.ts:305-399）</b>:
      * <ol>
-     *   <li>{@link #ensureCachedMCState()} 取当前会话状态桶 + {@link #getCachedMCConfig()}（:310-311）</li>
+     *   <li>{@link #ensureCachedMCState(String)} 取当前会话状态桶 + {@link #getCachedMCConfig()}（:310-311）</li>
      *   <li>collectCompactableToolIds → compactableToolIds（:313）</li>
      *   <li>二次遍历按 user 消息分组注册（:315-330）——Java 结构映射：tool_result 为
      *       {@code Role.tool} 独立消息（等价 CC 内嵌于 user 消息 content 的块），以「连续
@@ -512,14 +541,17 @@ public class MicroCompactor {
      *
      * @param messages    消息列表
      * @param querySource CC QuerySource（门控已保证 main-thread）
+     * @param sessionId   显式会话 ID（状态机读写全程同一会话桶；由
+     *                    {@link #microcompactMessages} 原值下传）
      * @return 无删除时 {@code {messages}}；删除时带 compactionInfo
      */
-    private MicroCompactResult cachedMicrocompactPath(List<ChatMessageDto> messages, String querySource) {
+    private MicroCompactResult cachedMicrocompactPath(List<ChatMessageDto> messages, String querySource,
+                                                      String sessionId) {
         if (log.isDebugEnabled()) {
             log.debug("[MicroCompactor] cached-MC 路径进入（CC cachedMicrocompactPath，microCompact.ts:305-399）· source={}",
                 querySource);
         }
-        CachedMCState state = ensureCachedMCState();
+        CachedMCState state = ensureCachedMCState(sessionId);
         MicroCompactResult.CachedMCConfig config = getCachedMCConfig();
 
         // ── ① compactable 工具集（microCompact.ts:313 collectCompactableToolIds）──
@@ -561,7 +593,7 @@ public class MicroCompactor {
         // ── ④ 构建 cache_edits 块并入队模块态（microCompact.ts:334-339）──
         MicroCompactResult.CacheEditsBlock cacheEdits = createCacheEditsBlock(state, toolsToDelete);
         if (cacheEdits != null) {
-            currentSessionState().pendingCacheEditsBlock = cacheEdits;
+            currentSessionState(sessionId).pendingCacheEditsBlock = cacheEdits;
             if (log.isDebugEnabled()) {
                 log.debug("[MicroCompactor] cached-MC：cache_edits 块已入队当前会话（type={}, edits={}）"
                         + "· CC microCompact.ts:336-339", cacheEdits.type(), cacheEdits.edits().size());
@@ -572,7 +604,7 @@ public class MicroCompactor {
         long baseline = baselineCacheDeletedTokens(messages);
 
         // ── ⑥ boundary 消费引用面入队（microCompact.ts:385-394 compactionInfo.pendingCacheEdits）──
-        currentSessionState().pendingCacheEdits =
+        currentSessionState(sessionId).pendingCacheEdits =
             new MicroCompactResult.PendingCacheEdits("auto", toolsToDelete, baseline);
 
         log.info("[MicroCompactor] cached-MC：删除 {} 个工具（{}），activeToolCount={}, triggerType=auto,"
@@ -691,7 +723,7 @@ public class MicroCompactor {
     /**
      * 标记工具已下发 API · 对齐 CC {@code markToolsSentToAPI(state)}
      * （cachedMicrocompact.ts:54-56）：{@code state.toolsSentToAPI = true}。
-     * API 层在成功响应后经 {@link #markToolsSentToAPIState()} 调用（对齐 claude.ts:2835）。
+     * API 层在成功响应后经 {@link #markToolsSentToAPIState(String)} 调用（对齐 claude.ts:2835）。
      *
      * @param state 模块态（非空）
      */
@@ -702,7 +734,7 @@ public class MicroCompactor {
     /**
      * 复位 cached-MC 状态 · 对齐 CC {@code resetCachedMCState(state)}
      * （cachedMicrocompact.ts:58-64）：清空全部 5 字段。
-     * 由 {@link #resetMicrocompactState()}（microCompact.ts:131-133）调用。
+     * 由 {@link #resetMicrocompactState(String)}（microCompact.ts:131-133）调用。
      *
      * @param state 模块态（非空）
      */
@@ -801,10 +833,11 @@ public class MicroCompactor {
      * （会话内跨 turn 存活，resetMicrocompactState 复位）。OPD-CM5-A-10：每会话独立桶，
      * 不同会话互不污染（原静态单例跨会话泄漏）。
      *
-     * @return 当前会话 cachedMCState（非空）
+     * @param sessionId 显式会话 ID（会话桶键；null/空白 → 默认桶 + 一次性 WARN）
+     * @return 该会话 cachedMCState（非空）
      */
-    private static CachedMCState ensureCachedMCState() {
-        MicroCompactSessionState ss = currentSessionState();
+    private static CachedMCState ensureCachedMCState(String sessionId) {
+        MicroCompactSessionState ss = currentSessionState(sessionId);
         if (ss.cachedMCState == null) {
             ss.cachedMCState = createCachedMCState();
         }
@@ -854,9 +887,11 @@ public class MicroCompactor {
     /**
      * 标记已注册工具全部下发 API · 对齐 CC {@code markToolsSentToAPIState()}
      * （microCompact.ts:124-128）。成功响应后调用（claude.ts:2835）；生产接线为受控残留。
+     *
+     * @param sessionId 显式会话 ID（写该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      */
-    public static void markToolsSentToAPIState() {
-        CachedMCState state = currentSessionState().cachedMCState;
+    public static void markToolsSentToAPIState(String sessionId) {
+        CachedMCState state = currentSessionState(sessionId).cachedMCState;
         if (state != null) {
             markToolsSentToAPI(state);
             if (log.isDebugEnabled()) {
@@ -870,10 +905,11 @@ public class MicroCompactor {
      * （microCompact.ts:96-105）：返回 {@code cachedMCState.pinnedEdits}（未初始化时空）。
      * API 层在构造请求时重发原始位置块（claude.ts:1532）。
      *
+     * @param sessionId 显式会话 ID（读该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      * @return 已钉住块列表（不可变快照语义）
      */
-    public static List<MicroCompactResult.PinnedCacheEdits> getPinnedCacheEdits() {
-        CachedMCState state = currentSessionState().cachedMCState;
+    public static List<MicroCompactResult.PinnedCacheEdits> getPinnedCacheEdits(String sessionId) {
+        CachedMCState state = currentSessionState(sessionId).cachedMCState;
         if (state == null) {
             return List.of();
         }
@@ -886,9 +922,11 @@ public class MicroCompactor {
      *
      * @param userMessageIndex 块插入的用户消息下标
      * @param block            cache_edits 块（非空）
+     * @param sessionId        显式会话 ID（写该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      */
-    public static void pinCacheEdits(int userMessageIndex, MicroCompactResult.CacheEditsBlock block) {
-        CachedMCState state = currentSessionState().cachedMCState;
+    public static void pinCacheEdits(int userMessageIndex, MicroCompactResult.CacheEditsBlock block,
+                                     String sessionId) {
+        CachedMCState state = currentSessionState(sessionId).cachedMCState;
         if (state != null && block != null) {
             state.pinnedEdits.add(
                 new MicroCompactResult.PinnedCacheEdits(userMessageIndex, block));
@@ -904,10 +942,11 @@ public class MicroCompactor {
      * （microCompact.ts:88-94）返回 {@code CacheEditsBlock}。API 层构造请求时取走注入
      * cache_edits（claude.ts:1528-1535）；Java provider 接线为受控残留。
      *
+     * @param sessionId 显式会话 ID（消费该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      * @return 未捕获时 null；否则返回待下发块并清空
      */
-    public static MicroCompactResult.CacheEditsBlock consumePendingCacheEditsBlock() {
-        MicroCompactSessionState ss = currentSessionState();
+    public static MicroCompactResult.CacheEditsBlock consumePendingCacheEditsBlock(String sessionId) {
+        MicroCompactSessionState ss = currentSessionState(sessionId);
         MicroCompactResult.CacheEditsBlock block = ss.pendingCacheEditsBlock;
         ss.pendingCacheEditsBlock = null;
         return block;
@@ -925,13 +964,14 @@ public class MicroCompactor {
      * （provider 注入请求用，microCompact.ts:58-60/336-339），经
      * {@link #consumePendingCacheEditsBlock()} 取走；本函数消费的是 compactionInfo 形状
      * {@code {trigger,deletedToolIds,baselineCacheDeletedTokens}}（boundary yield 用，
-     * 供 {@link #maybeCreateMicrocompactBoundaryMessage(long)}）。cachedMicrocompactPath 删除
+     * 供 {@link #maybeCreateMicrocompactBoundaryMessage(long, String)}）。cachedMicrocompactPath 删除
      * 触发时写入，测试缝也可注入。本函数保证消费契约（返回 + 清空）。
      *
+     * @param sessionId 显式会话 ID（消费该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      * @return 未捕获时 null；否则返回待下发 edits 并清空
      */
-    public static MicroCompactResult.PendingCacheEdits consumePendingCacheEdits() {
-        MicroCompactSessionState ss = currentSessionState();
+    public static MicroCompactResult.PendingCacheEdits consumePendingCacheEdits(String sessionId) {
+        MicroCompactSessionState ss = currentSessionState(sessionId);
         MicroCompactResult.PendingCacheEdits edits = ss.pendingCacheEdits;
         ss.pendingCacheEdits = null;
         return edits;
@@ -950,7 +990,7 @@ public class MicroCompactor {
      * <p><b>数据流（query.ts:870-890）</b>:
      * <ol>
      *   <li>feature('CACHED_MICROCOMPACT') 门（:870）——关 → 不消费直接返回 null（外部构建等价）</li>
-     *   <li>{@link #consumePendingCacheEdits()} 取走模块态 pendingCacheEdits（microCompact.ts:88-94）</li>
+     *   <li>{@link #consumePendingCacheEdits(String)} 取走模块态 pendingCacheEdits（microCompact.ts:88-94）</li>
      *   <li>delta = max(0, cumulative − baseline)（:879-882 —— API 字段 sticky/cumulative，
      *       减基线得本次操作增量）</li>
      *   <li>delta &gt; 0 → {@code createMicrocompactBoundaryMessage(trigger, 0, deletedTokens,
@@ -963,9 +1003,12 @@ public class MicroCompactor {
      *     message_start 与 message 双源），LlmAgentLoop 经 cumulativeCacheDeletedTokens
      *     （LlmAgentLoop:2915-2930）在流结束点（:5070）传入真实值；OpenAI/Mock 无等价 → 0
      *     （等价 CC ?? 0）。TODO[OD-01] 已闭环。
+     * @param sessionId 显式会话 ID（消费该会话桶的 pendingCacheEdits；null/空白 → 默认桶
+     *                  + 一次性 WARN）
      * @return delta &gt; 0 时 microcompact_boundary 消息；否则 null
      */
-    public static CompactBoundaryMessage maybeCreateMicrocompactBoundaryMessage(long cumulativeCacheDeletedTokens) {
+    public static CompactBoundaryMessage maybeCreateMicrocompactBoundaryMessage(
+            long cumulativeCacheDeletedTokens, String sessionId) {
         // feature 门（query.ts:870）：关 → 不消费（外部构建等价，字符串被消除）
         if (!isCachedMicrocompactFeatureEnabled()) {
             if (log.isDebugEnabled()) {
@@ -973,7 +1016,7 @@ public class MicroCompactor {
             }
             return null;
         }
-        MicroCompactResult.PendingCacheEdits edits = consumePendingCacheEdits();
+        MicroCompactResult.PendingCacheEdits edits = consumePendingCacheEdits(sessionId);
         if (edits == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[MicroCompactor] 流结束: 无 pendingCacheEdits（cached-MC 未产出 cache_edits），跳过 boundary yield · CC query.ts:870");
@@ -1003,14 +1046,17 @@ public class MicroCompactor {
      * <p><b>CC 重置范围</b>: ① cachedMCState.resetCachedMCState（microCompact.ts:131-133 →
      * cachedMicrocompact.ts:58-64 清 5 字段）；② {@code pendingCacheEdits = null}（:134）。
      * 范围<b>外</b>：cached 门控配置（feature/module override 全局态）非 reset 对象
-     * （CC reset 不触碰模块配置）。OPD-CM5-A-10：只复位当前会话桶（MDC 解析），不波及他会话。
+     * （CC reset 不触碰模块配置）。OPD-CM5-A-10：只复位 {@code sessionId} 形参指定的会话桶，
+     * 不波及他会话。
      *
      * <p><b>WHY 存在</b>: time-based MC 内容清除 + 服务端缓存失效后，若 next turn cached-MC 带陈旧
      * 工具注册态运行，会尝试 cache_edit 已不存在的工具（microCompact.ts:513-517）；同时压缩后
      * （IMP-19 PostCompactCleanup 固定操作序列第一步）也需要复位。
+     *
+     * @param sessionId 显式会话 ID（复位该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      */
-    public static void resetMicrocompactState() {
-        MicroCompactSessionState ss = currentSessionState();
+    public static void resetMicrocompactState(String sessionId) {
+        MicroCompactSessionState ss = currentSessionState(sessionId);
         if (ss.cachedMCState != null) {
             resetCachedMCState(ss.cachedMCState);
         }
@@ -1217,13 +1263,14 @@ public class MicroCompactor {
     /**
      * 注入主循环模型 · CC {@code toolUseContext?.options.mainLoopModel ?? getMainLoopModel()}
      * （microCompact.ts:278）——门控 model 谓词入参。生产由 LlmAgentLoop 注入（受控残留）；
-     * null 重置为默认（regex 不匹配 → cached 门控不进入）。OPD-CM5-A-10：写入当前会话桶，
-     * 会话间互不覆盖。
+     * null 重置为默认（regex 不匹配 → cached 门控不进入）。OPD-CM5-A-10：写入 {@code sessionId}
+     * 形参指定的会话桶，会话间互不覆盖。
      *
-     * @param model 主循环模型名（如 "claude-opus-4-20250514"）
+     * @param model     主循环模型名（如 "claude-opus-4-20250514"）
+     * @param sessionId 显式会话 ID（写该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      */
-    public static void setMainLoopModel(String model) {
-        currentSessionState().mainLoopModel = model;
+    public static void setMainLoopModel(String model, String sessionId) {
+        currentSessionState(sessionId).mainLoopModel = model;
     }
 
     /**
@@ -1232,12 +1279,13 @@ public class MicroCompactor {
      *
      * <p>[IMP-A3-4] 读取侧：CompactCommand.buildDisplayText 生产默认取当前模型设置
      * （upgradeMessage 判定入参）；null = 未注入（非主循环场景）→ 升级提示不产生。
-     * OPD-CM5-A-10：读取当前会话桶（MDC 解析），与会话 A 的模型注入互不串扰。
+     * OPD-CM5-A-10：读取 {@code sessionId} 形参指定的会话桶，与会话 A 的模型注入互不串扰。
      *
+     * @param sessionId 显式会话 ID（读该会话桶；null/空白 → 默认桶 + 一次性 WARN）
      * @return 最近一轮注入的主循环模型（可能 null）
      */
-    public static String getMainLoopModel() {
-        return currentSessionState().mainLoopModel;
+    public static String getMainLoopModel(String sessionId) {
+        return currentSessionState(sessionId).mainLoopModel;
     }
 
     /** 测试钩子：固定时钟（对齐 CC Date.now()），0 = 系统时钟。 */
@@ -1250,9 +1298,17 @@ public class MicroCompactor {
         return fixedNowMs > 0 ? fixedNowMs : System.currentTimeMillis();
     }
 
-    /** 测试缝：注入当前会话的 boundary 引用面 pendingCacheEdits（compactionInfo 形状；生产由 cachedMicrocompactPath 写入）。 */
-    static void setPendingCacheEditsForTest(MicroCompactResult.PendingCacheEdits edits) {
-        currentSessionState().pendingCacheEdits = edits;
+    /**
+     * 测试缝：注入指定会话的 boundary 引用面 pendingCacheEdits（compactionInfo 形状；生产由
+     * {@link #cachedMicrocompactPath} 写入）。
+     *
+     * @param edits     待注入的 edits（compactionInfo 形状）
+     * @param sessionId 显式会话 ID（写该会话桶；null/空白 → 默认桶 + 一次性 WARN）。
+     *                  消费侧须传同一 sessionId（{@link #maybeCreateMicrocompactBoundaryMessage(long, String)}
+     *                  / {@link #consumePendingCacheEdits(String)}），否则命中不同桶读不到。
+     */
+    static void setPendingCacheEditsForTest(MicroCompactResult.PendingCacheEdits edits, String sessionId) {
+        currentSessionState(sessionId).pendingCacheEdits = edits;
     }
 
     /**

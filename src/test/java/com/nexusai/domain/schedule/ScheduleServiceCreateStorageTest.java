@@ -197,7 +197,8 @@ class ScheduleServiceCreateStorageTest {
     @DisplayName("批次X Q2: create(SESSION + boundProject) → bound_project 列留 null（SESSION 项目锚走 sessionId 恢复路径）")
     void createSessionDoesNotPersistBoundProject() {
         // WHY（规则九）：SESSION 任务的项目锚由 sessionId 恢复路径承载（CronIdleExecutor SESSION 分支
-        // RequestContext.setSession → CwdResolution 命中 boundProject 层），不写 bound_project 列
+        // 显式透传 QueueItem.sessionId → CwdResolution 命中 boundProject 层；批 3c 前那口裸 MDC
+        // 会话槽已删除），不写 bound_project 列
         // （两路径清晰分离，B 探查 §7.3）。即便请求透传 boundProject（防御性断言），列必须为 null。
         ScheduleDto created = createSessionJob("q2-session", "sess-q2-001", null);
         assertThat(created.boundProject())

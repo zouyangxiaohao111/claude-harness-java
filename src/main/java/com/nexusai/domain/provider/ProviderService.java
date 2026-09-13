@@ -250,9 +250,9 @@ public class ProviderService {
             // 也正是靠 ① 的封装，本类**无需触碰** gateEnabled()——它是 infra 包的 package-private
             // （ProviderHeaderInjector.java:73），而本类在 domain 包，跨包取不到；由 apply 内部读即可。
             //
-            // ⚠️ 第三参 sessionId **恒传 null，不要改成读 RequestContext.sessionId()**（规范 §6.7 / T3 实测）：
+            // ⚠️ 第三参 sessionId **恒传 null，不要改成读 裸 MDC 的 sessionId()**（规范 §6.7 / T3 实测）：
             //   · ProviderController.test(:38) 的签名是 test(@PathVariable String id)，**无 sessionId 入参**；
-            //   · 而 RequestContext.sessionId() 读的是裸 MDC，本仓没有 Filter 写 MDC，该线程上它可能是
+            //   · 而 裸 MDC 的 sessionId() 读的就是线程局部 MDC，本仓没有 Filter 写 MDC，该线程上它可能是
             //     **上一个请求残留的、别的会话的 sessionId**（MemoryController:143 / TaskController:145 /
             //     TeamController:95 三处 setSession 均无 clear，Tomcat 线程复用下真实存在）。
             //   · 读它会把 **A 会话的亲和 id 发给 B 会话的测试连接请求**；而本方法打的是 {baseUrl}/models 的

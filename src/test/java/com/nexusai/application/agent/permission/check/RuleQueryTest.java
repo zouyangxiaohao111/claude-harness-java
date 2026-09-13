@@ -14,7 +14,6 @@ import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.EditFileTool;
 import com.nexusai.application.agent.tool.impl.PowerShellTool;
 import com.nexusai.application.agent.tool.impl.ReadFileTool;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -407,34 +406,38 @@ class RuleQueryTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // WF-1D · DEL-06 · getEditRuleByContentsForPath cwd=null 兜底走统一入口
+    // WF-1D · DEL-06 · getEditRuleByContentsForPath 的 root-relative 匹配基准 cwd
     // 对齐 CC resolve(cwd, path) cwd=getCwd()（bashPermissions.ts:1114 传 getCwd()）。
-    // WHY：3 参重载（cwd=null）被 PathValidation.editDenyRule/editAllowRule 调用，原 Java
-    //   兜底 System.getProperty("user.dir")，绑定项目场景 root-relative 匹配锚错根 →
-    //   相对路径 edit 规则在该会话内永不命中（权限判定错位，G9）。改走 CwdResolution.getCwd()
-    //   后 root=boundProject，相对路径规则正确锚定。
+    // WHY：root-relative 匹配的根锚定错根 → 相对路径 edit 规则在该会话内永不命中（权限判定错位，G9）。
+    //
+    // [批 3c] 语义已变（已登记待裁定）：{@code RuleQuery} 是**静态工具、无会话入参** ⇒ 3 参重载
+    //   （cwd=null）现显式按「无会话」解析 {@code CwdResolution.getCwd(null)}（= override / 进程
+    //   user.dir），主代码 RuleQuery:590-600 有注释 + 首次 WARN 留痕，并明写「需要会话 cwd 的 3 参
+    //   调用方须改传显式 cwd（工具侧 ctx.effectiveCwd()）」。
+    //   ⇒ 原「绑定项目经 3 参重载 + MDC 会话 取到 boundProject」已不可构造；会话感知改用
+    //   **4 参显式 cwd** 覆盖（下方 cwdExplicit_* 用例），3 参重载的新契约（回落 user.dir）单列钉住。
     // ════════════════════════════════════════════════════════════════════
     @Nested
-    @DisplayName("WF-1D · DEL-06 · cwd=null 兜底走 CwdResolution（绑定项目 baseDir 取对）")
+    @DisplayName("WF-1D · DEL-06 · getEditRuleByContentsForPath 的 root 锚定（显式 cwd vs 无会话回落）")
     class Wf1dBaseDirFallbackTests {
 
         @AfterEach
         void clearCwdState() {
             CwdResolution.clearCurrentOverride();
             SessionProjectRoot.reset();
-            RequestContext.clear();
         }
 
         @Test
-        @DisplayName("绑定项目 + cwd=null → root-relative 相对规则锚定 boundProject 命中（非 user.dir）")
-        void cwdNull_usesBoundProjectAsRoot(@TempDir Path projectDir) throws Exception {
+        @DisplayName("绑定项目 + 显式 cwd（= ctx.effectiveCwd 等价）→ root-relative 相对规则锚定 boundProject 命中（非 user.dir）")
+        void cwdExplicit_usesBoundProjectAsRoot(@TempDir Path projectDir) throws Exception {
             // WHY: CC matchingRuleForInput 的 patternWithRoot 对无前缀规则 root=cwd=getCwd()。
-            //   绑定项目场景 cwd 必须取 boundProject，否则相对规则 "sub/file.txt" 锚 user.dir
+            //   绑定项目场景 cwd 必须取会话项目的 cwd，否则相对规则 "sub/file.txt" 锚 user.dir
             //   而 target=boundProject/sub/file.txt 在 user.dir 之外 → rel=null → 不匹配 →
             //   edit allow 规则失效（应放行的写入被误 ask/deny）。
+            // [批 3c] 会话来源 = **显式 cwd 形参**（调用方持 ctx.effectiveCwd() / 本测试持
+            //   CwdResolution.getCwd(sessionId)）—— 原「经 ambient 会话槽解析」的装置已删。
             String sessionId = "wf1d-ruleq-sess";
             SessionProjectRoot.setForSession(sessionId, projectDir.toString());
-            RequestContext.setSession(sessionId);
 
             // session allow 规则：Edit 相对路径 sub/file.txt（无 // ~/ / 前缀 → root=cwd）
             PermissionRule allowRule = new PermissionRule(
@@ -448,26 +451,55 @@ class RuleQueryTest {
             // 待匹配绝对路径（在 boundProject 下）
             String targetPath = projectDir.resolve("sub/file.txt").toString();
 
-            // cwd=null → 走 :604 兜底。修复前 root=user.dir → 不命中返回 null；
-            // 修复后 root=boundProject（CwdResolution.getCwd）→ 命中返回 allowRule。
+            String sessionCwd = CwdResolution.getCwd(sessionId);
             PermissionRule hit = RuleQuery.getEditRuleByContentsForPath(
-                permCtx, targetPath, PermissionBehavior.ALLOW, null);
+                permCtx, targetPath, PermissionBehavior.ALLOW, sessionCwd);
 
             assertThat(hit)
-                .as("绑定项目场景 cwd=null 兜底必须取 boundProject，相对规则才能锚定命中")
+                .as("会话项目 cwd 显式传入时，相对规则必须锚定它才能命中（G9 不得复现）")
                 .isNotNull()
                 .isEqualTo(allowRule);
-            assertThat(CwdResolution.getCwd())
-                .as("CwdResolution.getCwd 解析为 boundProject（统一入口）")
+            assertThat(sessionCwd)
+                .as("CwdResolution.getCwd(sessionId) 解析为 boundProject（统一入口）")
                 .isEqualTo(projectDir.toRealPath().toString());
         }
 
         @Test
-        @DisplayName("未绑定 + cwd=null → 回落 user.dir（经统一入口，INV-4/INV-6）不抛")
-        void cwdNull_unboundFallsBackToUserDir(@TempDir Path projectDir) throws Exception {
-            // WHY: 未绑定会话 boundProject=null → getCwd 回落 user.dir（INV-4），不抛异常。
+        @DisplayName("[批 3c] 3 参重载（cwd=null）→ 按「无会话」解析回落 user.dir：绑定项目不可达，路径在 user.dir 外即不命中")
+        void cwdNull_fallsBackToUserDir_noSession(@TempDir Path projectDir) throws Exception {
+            // WHY（新契约）：{@code RuleQuery} 无会话入参 ⇒ 3 参重载只能按「无会话」解析。
+            //   本用例钉住该回落（并作为「有人把会话接回静态工具」的反向鉴别器：若 boundProject
+            //   被重新读到，下面 hit 会变非 null ⇒ 红）。
+            String sessionId = "wf1d-ruleq-nosession";
+            SessionProjectRoot.setForSession(sessionId, projectDir.toString());
+
+            PermissionRule allowRule = new PermissionRule(
+                PermissionRuleSource.SESSION, PermissionBehavior.ALLOW,
+                PermissionRuleValue.withContent("Edit", "sub/file.txt"));
+            Map<PermissionRuleSource, Set<PermissionRule>> allow = new EnumMap<>(PermissionRuleSource.class);
+            allow.put(PermissionRuleSource.SESSION, Set.of(allowRule));
+            ToolPermissionContext permCtx = ToolPermissionContext.of(
+                PermissionMode.DEFAULT, allow, Map.of(), Map.of(), Map.of());
+
+            // projectDir 不在 user.dir 下 → rel=null → 不匹配
+            String targetPath = projectDir.resolve("sub/file.txt").toString();
+            PermissionRule hit = RuleQuery.getEditRuleByContentsForPath(
+                permCtx, targetPath, PermissionBehavior.ALLOW, null);
+
+            assertThat(hit)
+                .as("无会话（cwd=null）→ 基准回落 user.dir + 路径在 user.dir 之外 → 不命中")
+                .isNull();
+            assertThat(CwdResolution.getCwd(null))
+                .as("无会话（null）回落 user.dir（经统一入口）")
+                .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
+        }
+
+        @Test
+        @DisplayName("未绑定 + 显式 cwd → 与 user.dir 一致时可命中（统一入口无会话语义）")
+        void cwdExplicit_unboundFallsBackToUserDir(@TempDir Path projectDir) throws Exception {
+            // WHY: 未绑定会话 boundProject=null → CwdResolution.getCwd(sessionId) 回落 user.dir（INV-4），
+            //   不抛异常；该 cwd 作为 root 时，user.dir 之外的路径仍不命中（行为不变，无回归）。
             String sessionId = "wf1d-ruleq-unbound";
-            RequestContext.setSession(sessionId);
             // 不绑定 SessionProjectRoot
 
             PermissionRule allowRule = new PermissionRule(
@@ -478,15 +510,14 @@ class RuleQueryTest {
             ToolPermissionContext permCtx = ToolPermissionContext.of(
                 PermissionMode.DEFAULT, allow, Map.of(), Map.of(), Map.of());
 
-            // projectDir 不在 user.dir 下 → rel=null → 不匹配（无回归：未绑定时行为不变）
             String targetPath = projectDir.resolve("sub/file.txt").toString();
             PermissionRule hit = RuleQuery.getEditRuleByContentsForPath(
-                permCtx, targetPath, PermissionBehavior.ALLOW, null);
+                permCtx, targetPath, PermissionBehavior.ALLOW, CwdResolution.getCwd(sessionId));
 
             assertThat(hit)
                 .as("未绑定 + 路径在 user.dir 之外 → 不命中（行为不变，无回归）")
                 .isNull();
-            assertThat(CwdResolution.getCwd())
+            assertThat(CwdResolution.getCwd(sessionId))
                 .as("未绑定回落 user.dir（经统一入口）")
                 .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
         }

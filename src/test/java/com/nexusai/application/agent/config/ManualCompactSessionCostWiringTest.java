@@ -9,7 +9,6 @@ import com.nexusai.application.agent.compact.StreamCompactSummary;
 import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.application.agent.cost.ModelCostCalculator;
 import com.nexusai.application.agent.tool.AgentUsage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -98,7 +97,6 @@ class ManualCompactSessionCostWiringTest {
     void tearDown() throws Exception {
         writeStaticMapper("modelMapper", savedModelMapper);
         writeStaticMapper("providerMapper", savedProviderMapper);
-        RequestContext.clear();
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
     }
@@ -231,9 +229,10 @@ class ManualCompactSessionCostWiringTest {
         MessageService messageService = mock(MessageService.class);
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        RequestContext.set(SESSION, null);
+        // [批 3c] 参数序与生产 registerCompactSlashCommand lambda 一致：
+        //   (args, sessionId, inFlightUserMessageId, sessionRegistry, ...) —— 会话标识显式传参
         Object out = ReflectionTestUtils.invokeMethod(config, "handleCompactCommand",
-            "", registry, null, summary, null, null, null, null, null, null, messageService);
+            "", SESSION, null, registry, null, summary, null, null, null, null, null, null, messageService);
         assertThat(out).isInstanceOf(String.class);
         return (String) out;
     }

@@ -30,8 +30,17 @@ import java.util.List;
  * </ul>
  *
  * <p>数据源映射：{@code getSkillToolCommands(cwd)}（commands.ts:563）→ Java
- * {@link SkillRegistry#getModelInvocableCommands()}（P1-1 已 memoize）；{@code getSlashCommandToolSkills}
- * （commands.ts:586）→ {@link SkillRegistry#getSlashCommandToolSkills()}（本项 P2-3 新增）。
+ * {@link SkillRegistry#getModelInvocableCommands(String)}（P1-1 已 memoize）；{@code getSlashCommandToolSkills}
+ * （commands.ts:586）→ {@link SkillRegistry#getSlashCommandToolSkills(String)}（本项 P2-3 新增）。
+ *
+ * <p><b>[批 3c] 会话来源</b>：CC 的 cwd 由调用方显式传入（{@code getSkillToolCommands(cwd)}）；Java 侧
+ * 等价物是 {@code sessionId}。本类三个统计方法（{@link #getSkillToolInfo} /
+ * {@link #getLimitedSkillToolCommands} / {@link #getSkillInfo}）自身的签名<b>无会话入参</b>，
+ * 且生产唯一调用链（{@link com.nexusai.application.agent.context.ContextAnalyzeService} ←
+ * {@code ContextAnalyzeController} / /context 命令）同样无会话概念（{@code analyze(...)} 形参只有
+ * systemPrompt 覆盖项）⇒ 显式传 {@code null}（无会话），由 SkillRegistry 回落进程默认 projectRoot
+ * （{@code SkillsLoader} 自身 cwdSupplier → {@code user.dir}）。<b>不再读裸 MDC 会话槽</b>（批 3c 已删
+ * 该载体；原实现经 MDC 读到的可能是上一请求残留的别会话 id）。三个方法各自 log.warn 留痕。
  */
 public final class SkillToolPrompt {
 
@@ -121,13 +130,19 @@ public final class SkillToolPrompt {
      *
      * <p>CC：{@code totalCommands === includedCommands === getSkillToolCommands(cwd).length}
      * （所有命令恒被包含，仅描述可能截断）；Java 数据源 =
-     * {@link SkillRegistry#getModelInvocableCommands()}（对齐 CC getSkillToolCommands commands.ts:563）。
+     * {@link SkillRegistry#getModelInvocableCommands(String)}（对齐 CC getSkillToolCommands commands.ts:563）。
+     *
+     * <p><b>[批 3c] 本入口无会话入参</b>（签名无 sessionId，生产调用方为 POJO/测试面）⇒ 显式传
+     * {@code null}（无会话）→ SkillRegistry 回落进程默认 projectRoot（{@code user.dir}）。
+     * 绑定会话的 per-session 技能可能不同 → log.warn 留痕。原经裸 MDC 读取，已删。
      *
      * @param registry 技能注册中心（getModelInvocableCommands 数据源）
      * @return totalCommands = includedCommands = 模型可调用命令数
      */
     public static SkillToolInfo getSkillToolInfo(SkillRegistry registry) {
-        int count = registry.getModelInvocableCommands().size();
+        log.warn("[SkillToolPrompt] getSkillToolInfo 无会话入参（本方法签名无 sessionId）→ 技能清单按进程默认"
+            + "解析（SkillsLoader 回落 user.dir），绑定会话的 per-session 技能可能不同");
+        int count = registry.getModelInvocableCommands(null).size();
         if (log.isDebugEnabled()) {
             log.debug("[SkillToolPrompt] getSkillToolInfo: totalCommands=includedCommands={} (CC prompt.ts:198-208)",
                 count);
@@ -140,13 +155,22 @@ public final class SkillToolPrompt {
      *
      * <p>CC 直接返回 {@code getSkillToolCommands(cwd)}（所有命令恒被包含，仅描述可截断）；
      * P2-18 analyzeContext 用它统计 skill token 消耗。Java 数据源 =
-     * {@link SkillRegistry#getModelInvocableCommands()}。
+     * {@link SkillRegistry#getModelInvocableCommands(String)}。
+     *
+     * <p><b>[批 3c] 本入口无会话入参</b>：生产唯一调用方
+     * {@code ContextAnalyzeService.resolveSkillSource()}（← {@code analyze(customSystemPrompt,
+     * appendSystemPrompt)} ← {@code ContextAnalyzeController} / /context 命令）整条链<b>都没有会话入参</b>
+     * ⇒ 显式传 {@code null}（无会话）→ SkillRegistry 回落进程默认 projectRoot（{@code user.dir}）。
+     * 绑定会话的 per-session 技能可能不同 → log.warn 留痕（禁只 DEBUG）。原经裸 MDC 读取，已删。
      *
      * @param registry 技能注册中心
      * @return 模型可调用命令清单（CC getSkillToolCommands 等价物）
      */
     public static List<Command> getLimitedSkillToolCommands(SkillRegistry registry) {
-        List<Command> commands = registry.getModelInvocableCommands();
+        log.warn("[SkillToolPrompt] getLimitedSkillToolCommands 无会话入参（本方法签名无 sessionId，调用链"
+            + " ContextAnalyzeService.analyze 亦无会话概念）→ 技能清单按进程默认解析（SkillsLoader 回落"
+            + " user.dir），绑定会话的 per-session 技能可能不同");
+        List<Command> commands = registry.getModelInvocableCommands(null);
         if (log.isDebugEnabled()) {
             log.debug("[SkillToolPrompt] getLimitedSkillToolCommands: {} 个命令 (CC prompt.ts:213-215)",
                 commands.size());
@@ -161,16 +185,22 @@ public final class SkillToolPrompt {
      * {@code totalSkills === includedSkills === skills.length}；try/catch →
      * {totalSkills:0, includedSkills:0}（prompt.ts:232-240，加载失败不中断调用方）。
      *
-     * <p>Java 数据源 = {@link SkillRegistry#getSlashCommandToolSkills()}（本项新增，对齐
+     * <p>Java 数据源 = {@link SkillRegistry#getSlashCommandToolSkills(String)}（本项新增，对齐
      * commands.ts:586 第二套过滤）；SkillRegistry 每源 try-catch 隔离（loadAllCommands）使其恒不抛，
      * 本 catch 为防御性冗余（行为与 CC 等价）。
+     *
+     * <p><b>[批 3c] 本入口无会话入参</b>（签名无 sessionId，生产调用方为 POJO/测试面）⇒ 显式传
+     * {@code null}（无会话）→ SkillRegistry 回落进程默认 projectRoot（{@code user.dir}）。
+     * 绑定会话的 per-session 技能可能不同 → log.warn 留痕。原经裸 MDC 读取，已删。
      *
      * @param registry 技能注册中心
      * @return totalSkills = includedSkills = 斜杠命令技能数；异常时 {0,0}
      */
     public static SkillInfo getSkillInfo(SkillRegistry registry) {
+        log.warn("[SkillToolPrompt] getSkillInfo 无会话入参（本方法签名无 sessionId）→ 技能清单按进程默认"
+            + "解析（SkillsLoader 回落 user.dir），绑定会话的 per-session 技能可能不同");
         try {
-            int count = registry.getSlashCommandToolSkills().size();
+            int count = registry.getSlashCommandToolSkills(null).size();
             if (log.isDebugEnabled()) {
                 log.debug("[SkillToolPrompt] getSkillInfo: totalSkills=includedSkills={} (CC prompt.ts:221-241)",
                     count);

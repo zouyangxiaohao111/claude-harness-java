@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （{@code CommandService.toggleEnabled/update} → {@code commandMapper.update}），磁盘 SKILL.md 的
  * frontmatter 不含 enabled 字段（默认 enabled=true）。若 {@link SkillRegistry#loadAllCommands()} 合并
  * 五源后不读 DB 覆盖 enabled，则前端禁用/启用永不生效——列表合并以本 registry 为权威
- * （{@link #getAllCommands()} 全消费面唯一入口），DB 覆盖后前端 toggle 真实生效。本测试验证：
+ * （{@link #getAllCommands(String)} 全消费面唯一入口），DB 覆盖后前端 toggle 真实生效。本测试验证：
  * <ol>
  *   <li>DB 行 enabled=0（禁用）→ getAllCommands 排除该 skill（{@code isCommandEnabled()=false} 过滤）</li>
  *   <li>DB 行 enabled=1（启用）→ 保留</li>
@@ -70,7 +70,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null（本类各用例只验 DB enabled 主控覆盖，不涉会话）
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("DB enabled=0 覆盖文件默认 enabled=true → isCommandEnabled=false → getAllCommands 排除（前端禁用生效）")
             .doesNotContain("db-disabled-skill");
     }
@@ -87,7 +88,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("DB enabled=1 覆盖为 true → isCommandEnabled=true → 保留（前端启用生效）")
             .contains("db-enabled-skill");
     }
@@ -104,7 +106,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("DB 无该 skill 行 → 不覆盖（文件默认 enabled=true 保留）")
             .contains("db-absent-skill");
     }
@@ -122,7 +125,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("DB 仅含他名行（enabled=0 也不得覆盖本 skill）→ 文件默认 enabled=true 保留")
             .contains("db-absent-skill");
     }
@@ -139,7 +143,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("DB 行 enabled=null → rec.getEnabled()!=null 检查跳过 → 不覆盖，文件默认 enabled=true 保留")
             .contains("db-null-skill");
     }
@@ -166,7 +171,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        assertThat(registry.getAllCommands()).extracting(Command::getName)
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null)).extracting(Command::getName)
             .as("isEnabled supplier 非 null 优先于 enabled 字段 → DB enabled=0 覆盖无效 → supplier=true 保留")
             .contains("bundled-gate");
     }
@@ -187,7 +193,8 @@ class SkillRegistryDbEnabledOverrideTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
         registry.setCommandMapper(mapper);
 
-        Command hit = registry.getAllCommands().stream()
+        // [批 3c] 无会话 → 显式 null
+        Command hit = registry.getAllCommands(null).stream()
             .filter(c -> "db-id-skill".equals(c.getName())).findFirst().orElseThrow();
         assertThat(hit.getId())
             .as("DB 行同名命中 → SkillRegistry 从 DB 拷贝 id（补 id 供前端 PATCH /{id}/toggle 走通 DB 写）")

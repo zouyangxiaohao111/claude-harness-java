@@ -3,7 +3,6 @@ package com.nexusai.apis.session;
 import com.nexusai.application.agent.memory.AwaySummaryService;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.tool.AbortController;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
 import com.nexusai.infra.exception.NotFoundException;
@@ -14,7 +13,6 @@ import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -64,8 +62,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *   <li><b>sessionId 源 = 仅请求显式源</b>——ODF-B1R（2026-08-07）改造：CC 触发层在前端 REPL，
  *       会话上下文由前端持有（useAwaySummary.ts 内 messages 即前端侧），故 Web 前端 POST 时随请求
  *       传 sessionId（body JSON {@code {"sessionId": "..."}} 或 query {@code ?sessionId=...}）。
- *       <b>[批 3b] MDC 兜底已删</b>：{@code RequestContext.sessionId()} 是裸 MDC（ThreadLocal），
- *       REST 线程复用下第三态可读到上一请求残留的别会话 id ⇒ 静默给 A 会话生成 B 会话摘要；
+ *       <b>[批 3b] MDC 兜底已删、[批 3c] 裸 MDC 会话槽已整体删除</b>（原先读的那口 ThreadLocal
+ *       槽位已不存在），REST 线程复用下第三态可读到上一请求残留的别会话 id ⇒ 静默给 A 会话生成
+ *       B 会话摘要的风险随之消失；
  *       请求两源皆空 → 500 fail loud（对齐 CommandController executeResume 同语义）。</li>
  * </ol>
  */
@@ -135,14 +134,8 @@ class AwaySummaryControllerTest {
         capturedOptions = new AtomicReference<>();
     }
 
-    @AfterEach
-    void tearDown() {
-        // 测试设置了 MDC sessionId，清理避免线程复用泄漏（对齐 CommandControllerBuiltInCommandsTest）
-        RequestContext.clear();
-    }
-
     /**
-     * 构造端点全链：真实 AwaySummaryService（对齐生产 bean：sessionId=MDC + smallFast=haiku）
+     * 构造端点全链：真实 AwaySummaryService（对齐生产 bean：sessionId 由调用方显式传入 + smallFast=haiku）
      * + stub provider + mock MessageService —— 证明端点驱动服务层走真实 chatWithOptions 契约。
      */
     private MockMvc mockMvc(LlmProvider provider) {
@@ -162,7 +155,7 @@ class AwaySummaryControllerTest {
         // WHY: 前端 blur 5min 后 POST 拿 recap 文本回插 away_summary 系统消息（useAwaySummary.ts:80）。
         // 若 200 但 body 缺文本 → 前端无法回插；若契约未达 provider（querySource/skipCacheWrite）
         // → 侧信道查询可能写 API cache / 遥测丢失（OPD-M-41）。
-        // [批 3b] 会话态显式传参：旧实现靠 RequestContext.setSession(...)（MDC）兜底，MDC 兜底已删
+        // [批 3b] 会话态显式传参：旧实现靠往裸 MDC 会话槽写 sessionId 兜底（批 3c 该槽已整体删除）
         when(messageService.listForResume(anyString())).thenReturn(messages(3));
 
         mockMvc(capturingProvider(capturedOptions, "Building the memory system. Next: run tests.", null))
@@ -211,10 +204,11 @@ class AwaySummaryControllerTest {
     @Test
     @DisplayName("请求与 MDC 双空（无 body/query sessionId + 无 MDC）→ 500 fail loud（对齐 CommandController executeResume）")
     void noSession_500() throws Exception {
-        // WHY: ODF-B1R sessionId 源 = 请求优先 + MDC 兜底；请求未传 sessionId 且 MDC 无会话上下文 →
-        // 双空显式失败暴露（规则十二），与 CommandController executeResume 无 sessionId →
+        // WHY: ODF-B1R sessionId 源 = 请求显式源（批 3b 删 MDC 兜底 / 批 3c 删槽）；请求未传 sessionId
+        // → 显式失败暴露（规则十二），与 CommandController executeResume 无 sessionId →
         // IllegalStateException → 500 同语义。
-        RequestContext.clear();
+        // [批 3c] 语义消失：原「双空」对照中的「MDC 无会话上下文」一侧随槽删除并入「无第三源」，
+        //   断言文本原样保留（缺 sessionId ⇒ 500）。
         when(messageService.listForResume(anyString())).thenReturn(messages(3));
 
         mockMvc(capturingProvider(capturedOptions, "recap", null))
@@ -229,7 +223,6 @@ class AwaySummaryControllerTest {
         // POST 必须能随请求携带 sessionId（后端 MDC 仅在请求处于会话链路内时可用）。若 body 传入被忽略
         // → 前端无 MDC 会话时 away-summary 不可用。
         String reqSessionId = "00000000-0000-0000-0000-0000000000aa";
-        RequestContext.clear();
         when(messageService.listForResume(reqSessionId)).thenReturn(messages(3));
 
         mockMvc(capturingProvider(capturedOptions, "recap-body", null))
@@ -248,7 +241,6 @@ class AwaySummaryControllerTest {
         // WHY (ODF-B1R): 与 body 等价的前端传参通道（§8 契约 body/query 二选一）；纯 query 无
         // Content-Type/body 场景也必须命中请求 sessionId。
         String reqSessionId = "00000000-0000-0000-0000-0000000000bb";
-        RequestContext.clear();
         when(messageService.listForResume(reqSessionId)).thenReturn(messages(3));
 
         mockMvc(capturingProvider(capturedOptions, "recap-query", null))
@@ -280,7 +272,6 @@ class AwaySummaryControllerTest {
         // rev2 改 generate 显式 sessionId 参数：body sessionId 必须同时驱动 memory 读（单轨），
         // 对齐 CC 无参读当前会话经调用方注入。
         String reqSessionId = "00000000-0000-0000-0000-0000000000cc";
-        RequestContext.clear();
         when(messageService.listForResume(reqSessionId)).thenReturn(messages(3));
 
         // 写入请求 sessionId 的 memory 文件（SessionMemoryService 路径：{sessionId}/session-memory/summary.md）

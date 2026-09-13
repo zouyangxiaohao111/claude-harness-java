@@ -3,7 +3,6 @@ package com.nexusai.application.agent.compact;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.tool.AgentUsage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.model.provider.dto.ModelTag;
@@ -93,7 +92,6 @@ class PartialCompactModelWiringTest {
     void restore() throws Exception {
         writeStaticMapper("modelMapper", savedModelMapper);
         writeStaticMapper("providerMapper", savedProviderMapper);
-        RequestContext.clear();
         CompactProgressState.clear();
         CompactProgressState.clearAbort();
         CompactProgressState.removeSessionAbort(SESSION);

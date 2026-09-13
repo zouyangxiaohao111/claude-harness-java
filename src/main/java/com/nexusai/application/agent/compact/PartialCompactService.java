@@ -13,7 +13,6 @@ import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.infra.exception.NotFoundException;
@@ -260,7 +259,11 @@ public class PartialCompactService {
      * @return 重组后消息列表 + 新 conversationId（前端 setMessages + setConversationId）
      */
     public PartialCompactResponse partialCompact(String sessionId, PartialCompactRequest request) {
-        RequestContext.setSession(sessionId);
+        // [批 3c] 原「把会话写进裸 MDC 会话槽（供下游无参读回）」的 setSession 已删：
+        //   本方法内所有会话态消费点均已有**显式形参**（messageService.listForResume(sessionId) /
+        //   registerProgressChannel(sessionId, …) / resolveCompactModel(sessionId) /
+        //   persistCompactedMessages(sessionId, …) / PostCompactCleanup.runPostCompactCleanup("compact", sessionId)），
+        //   不再有经 MDC 读会话的通道；与之成对的 finally「清 MDC 会话槽」调用同步删除。
         CompactConversationContext ctx = null;
         // [partial-compact-progress 2026-09-11] 统一压缩进度通道注册（+ 压缩可中断）。
         //
@@ -411,7 +414,9 @@ public class PartialCompactService {
             // [SQLITE_BUSY_SNAPSHOT 修复] 移到落库短事务提交之后 —— 5 项清理全是内存态复位
             // （resetMicrocompactState / clearSystemPromptSections / clearClassifierApprovals …），
             // 不需要事务语义；放在事务外反而保证「清理只在落库成功后发生」。
-            PostCompactCleanup.runPostCompactCleanup("compact");
+            //   [批 3c] 显式传本会话 sessionId：runPostCompactCleanup 的 clearSystemPromptSections
+            //   分支需要会话标识定位 AgentState（原由上方 setSession 写入的裸 MDC 供其读回）。
+            PostCompactCleanup.runPostCompactCleanup("compact", sessionId);
 
             return new PartialCompactResponse(normalized, newConversationId);
         } finally {
@@ -430,7 +435,9 @@ public class PartialCompactService {
             if (ctx != null && ctx.getSysPromptCtxProvider() != null) {
                 ctx.getSysPromptCtxProvider().close();
             }
-            RequestContext.clear();
+            // [批 3c] 原「清 MDC 会话槽」（与入口 setSession 成对）已删 —— 本次调用不再写任何
+            //   MDC 槽，故无需还原（finally 其余语义不变：进度通道清理 + sysPromptCtxProvider 注销
+            //   仍三路必达；上面两个 if 为 no-op 安全，控制流与旧实现一致）。
         }
     }
 
@@ -835,7 +842,8 @@ public class PartialCompactService {
     private SystemPromptContextProvider buildPartialSystemPromptCtxProvider(AgentState state) {
         return new SystemPromptContextProvider(
             state.sessionStartDate(),
-            new UserContextProvider(claudemdEngine),
+            // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析
+            new UserContextProvider(claudemdEngine, state != null ? state.sessionId() : null),
             new GitStatusProvider());
     }
 
@@ -860,9 +868,12 @@ public class PartialCompactService {
         final Set<String> enabledTools = (tuc != null && tuc.availableTools() != null)
             ? tuc.availableTools().stream().map(Tool::name).collect(Collectors.toSet())
             : Set.of();
+        // [批 3c] 技能查询改为**显式会话入参**（SkillCatalog/SkillRegistry 的技能源按会话 cwd 解析）；
+        //   会话标识取自本方法的显式入参 state（partial compact 恒持有会话 AgentState），不读 MDC。
+        final String skillSessionId = state != null ? state.sessionId() : null;
         final List<String> skillCommands;
-        if (skillCatalog != null && skillCatalog.getModelInvocableCommands() != null) {
-            skillCommands = skillCatalog.getModelInvocableCommands().stream()
+        if (skillCatalog != null && skillCatalog.getModelInvocableCommands(skillSessionId) != null) {
+            skillCommands = skillCatalog.getModelInvocableCommands(skillSessionId).stream()
                 .map(Command::getName)
                 .collect(Collectors.toList());
         } else {

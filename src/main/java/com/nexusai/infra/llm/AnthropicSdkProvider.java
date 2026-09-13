@@ -346,9 +346,8 @@ public class AnthropicSdkProvider implements LlmProvider {
 
         try {
             // [provider-custom-headers 任务 6] 主链 sessionId 来源 = history（DB 真值，必中）。
-            //   ⚠️ 刻意**不**在此处兜底 MDC（RequestContext.sessionId）；MDC 可能是残留的别会话 id，
-            //   详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
-            //   （护栏按**字面量**判，故连注释里都不留该调用形态 —— 它正是被照抄的来源。）
+            //   ⚠️ 刻意**不**在此处兜底任何环境态会话槽（原为裸 MDC，批 3c 已删该类）；残留槽可能给出
+            //   别会话的 id，详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
             String sessionId = SessionIdResolver.resolve(history, null);
             AnthropicClient client = buildClient(config, sessionId);
             // [C] skipCacheWrite 透传（原硬编码 null → 流式路径 marker 移位永不触发）·
@@ -1626,6 +1625,11 @@ public class AnthropicSdkProvider implements LlmProvider {
                                                          Boolean enablePromptCaching,
                                                          boolean firstParty,
                                                          ProviderConfig config) {
+        // [批 3c] 会话键解析（单点判据，与 header 注入链同源）——本次请求构造全程复用这一份，
+        //   绝不读环境态会话槽（裸 MDC 会话槽已随批 3c 删除）。可能为 null（history 无会话
+        //   标识）→ MicroCompactor 侧走一次性 WARN 兜底，不在此处发明。
+        String sessionId = SessionIdResolver.fromHistory(history);
+
         // [OD-01 provider 接线] 请求构造前 consume 一次待下发 cache_edits 块 · 对齐 CC claude.ts:1528-1535
         //   （"Consume pending cache edits ONCE before paramsFromContext is defined"——CC 在 params 构造
         //   前 consume，避免 paramsFromContext 多轮调用（logging/retries）重复取走）。
@@ -1635,7 +1639,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         //   b.messages 前执行（injectCacheEditsBlocks，见下）。
         boolean cachedMcEnabled = MicroCompactor.cachedMicrocompactEnabledForModel(modelName);
         MicroCompactResult.CacheEditsBlock consumedCacheEdits =
-            cachedMcEnabled ? MicroCompactor.consumePendingCacheEditsBlock() : null;
+            cachedMcEnabled ? MicroCompactor.consumePendingCacheEditsBlock(sessionId) : null;
 
         MessageCreateParams.Builder b = MessageCreateParams.builder()
             .model(modelName == null ? "" : modelName)
@@ -1707,7 +1711,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         // 位置必须在 cache_control marker 之后、b.messages 之前——CC 顺序 = 先 marker（:3090-3106）
         // 后 cache_edits（:3127-3162）；注入读已附 marker 的 MessageParam content 再重建，marker 保留。
         if (cachedMcEnabled) {
-            injectCacheEditsBlocks(msgs, consumedCacheEdits);
+            injectCacheEditsBlocks(msgs, consumedCacheEdits, sessionId);
             // [cache_reference] marker 之前 user 消息的 tool_result 块附 cache_reference · 对齐 CC
             // claude.ts:3164-3208（"Must be done AFTER cache_edits insertion since that modifies
             // content arrays"）。门控双重：外层 cachedMcEnabled = CC useCachedMC（:3108 早期 return
@@ -1846,18 +1850,22 @@ public class AnthropicSdkProvider implements LlmProvider {
      *       （钉住<b>原始</b>块，非 deduped，CC claude.ts:3153）</li>
      * </ol>
      *
-     * @param msgs     SDK MessageParam 列表（目标消息原地重建并 set 回，等效 CC 原地 mutate msg.content）
-     * @param newBlock 新待下发块（可 null = 仅重插 pinned，对齐 CC newCacheEdits undefined）
+     * @param msgs      SDK MessageParam 列表（目标消息原地重建并 set 回，等效 CC 原地 mutate msg.content）
+     * @param newBlock  新待下发块（可 null = 仅重插 pinned，对齐 CC newCacheEdits undefined）
+     * @param sessionId 显式会话 ID（cached-MC 状态桶键；由 {@link #buildMessageParams} 同一次解析
+     *                  下传，见 {@code SessionIdResolver.fromHistory(history)}；可 null →
+     *                  MicroCompactor 侧一次性 WARN 兜底）
      */
     private static void injectCacheEditsBlocks(List<MessageParam> msgs,
-                                               MicroCompactResult.CacheEditsBlock newBlock) {
+                                               MicroCompactResult.CacheEditsBlock newBlock,
+                                               String sessionId) {
         if (msgs == null || msgs.isEmpty()) {
             return;
         }
         // 跨块去重：同一 tool_use_id 不得被多个 cache_edits 块重复删除（CC claude.ts:3112-3125）
         Set<String> seenDeleteRefs = new HashSet<>();
         // ① 重插已钉住块（CC :3127-3140）
-        for (MicroCompactResult.PinnedCacheEdits pinned : MicroCompactor.getPinnedCacheEdits()) {
+        for (MicroCompactResult.PinnedCacheEdits pinned : MicroCompactor.getPinnedCacheEdits(sessionId)) {
             int idx = pinned.userMessageIndex();
             if (idx < 0 || idx >= msgs.size()) {
                 continue;
@@ -1881,7 +1889,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                         msgs.set(i, injectBlockIntoUserMessage(msg, dedupedNew));
                         // CC 钉住原始块（claude.ts:3153 pinCacheEdits(i, newCacheEdits)——非 deduped，
                         // 下一请求重插时再行去重）
-                        MicroCompactor.pinCacheEdits(i, newBlock);
+                        MicroCompactor.pinCacheEdits(i, newBlock, sessionId);
                         log.info("AnthropicSdkProvider: 已注入 cache_edits 块（{} 个删除）到 messages[{}]"
                                 + " · CC claude.ts:3141-3157",
                             dedupedNew.edits().size(), i);
@@ -2818,7 +2826,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         // header 的 ${session_id} 展开与这里同为「history 取第一条非空 sessionId」，
         // 本仓有「同一能力两套判据」的 R7 前科，故收敛到单点）。行为逐字等价。
         //
-        // [批 3b] ⛔ 删除 RequestContext.sessionId()（MDC）兜底：本方法跑在
+        // [批 3b] ⛔ 删除裸 MDC（会话槽，批 3c 已删该类）兜底：本方法跑在
         //   LlmAgentLoop.STREAM_EXECUTOR 虚拟线程（doStream 尾部）——虚拟线程不继承创建线程的
         //   ThreadLocal，MDC 要么 null（旧实现靠 LlmAgentLoop:6477 的显式回放兜住），要么是
         //   该虚拟线程上一个任务残留的别会话 id；回放装置本身违反「会话态一律显式传参」铁律。

@@ -52,7 +52,11 @@ public class SessionGitStatusRegistry {
         if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
-        return providers.computeIfAbsent(sessionId, id -> new GitStatusProvider());
+        // [批 3c] 会话 cwd 显式取自本方法的 sessionId（原 GitStatusProvider 无参构造经裸 MDC 会话槽取，
+        //   该槽已删 ⇒ 无参构造只能回落进程 user.dir，会让会话 git 状态锚错仓库）。
+        return providers.computeIfAbsent(sessionId,
+            id -> new GitStatusProvider(java.nio.file.Path.of(
+                com.nexusai.application.agent.agent.CwdResolution.getCwd(id))));
     }
 
     /**

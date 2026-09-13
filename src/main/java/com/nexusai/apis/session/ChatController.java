@@ -123,7 +123,9 @@ public class ChatController {
             //   直接 dispatch 立即执行 + 推 message.user（web 无 TUI，显式推送；CC setToolJSX 展示）。
             //   未注册命名 handler → dispatchImmediateLocalJsx 返回 false（内部 log.warn fail loud）
             //   → 回落原 busy 排队（CC dequeue 后重走 handlePromptSubmit）。
-            if (chatService.isImmediateLocalJsxCommand(req != null ? req.content() : null)) {
+            // [批 3c] 显式传本请求的 sessionId（旧实现靠 HTTP 入口写入的裸 MDC 让下游按会话解析技能；
+            //   该槽已删 ⇒ 若走 1 参无会话重载，项目级 immediate 命令会被漏判而退化为排队）。
+            if (chatService.isImmediateLocalJsxCommand(sessionId, req != null ? req.content() : null)) {
                 // 同一 msgId 贯穿 dispatch 落库/推送 与 响应（前端按 message.user.id 幂等去重）
                 String immediateMsgId = "msg-immediate-" + UUID.randomUUID().toString().substring(0, 8);
                 if (chatService.dispatchImmediateLocalJsx(

@@ -55,6 +55,10 @@ public final class RuleQuery {
     /** SLF4J 日志器 · 内容规则提取与 PowerShell 匹配的数据流日志（中文）。 */
     private static final Logger log = LoggerFactory.getLogger(RuleQuery.class);
 
+    /** [批 3c] 「cwd 缺省回落」只 WARN 一次（权限链每工具调用都会求值，不得刷屏）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean CWD_FALLBACK_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean();
+
     /** 通配符转义占位符 · 对齐 CC shellRuleMatching.ts:14-15 ESCAPED_STAR_PLACEHOLDER。 */
     private static final String ESCAPED_STAR_PLACEHOLDER = "\u0000ESCAPED_STAR\u0000";
     /** 反斜杠转义占位符 · 对齐 CC shellRuleMatching.ts:14-15 ESCAPED_BACKSLASH_PLACEHOLDER。 */
@@ -583,15 +587,21 @@ public final class RuleQuery {
      * 带 cwd 的写权限链路径规则查询 · 与 {@link #getEditRuleByContentsForPath(ToolPermissionContext, String, PermissionBehavior)}
      * 同语义，额外透传校验基准 cwd（root-relative 匹配的根锚定）。
      *
-     * <p>调用方 {@code BashPathValidator}（有 cwd 参数）与 {@code WritePermissionChecker}
-     * （有 ctx.effectiveCwd()）传显式 cwd；其余调用方（PathValidation / EditFileTool /
-     * PowerShellPathValidator）走 3 参重载，cwd=null → 统一入口 {@link CwdResolution#getCwd}
-     * （[WF-1D · DEL-06] 原 user.dir 直读兜底改走统一入口，对齐 CC resolve(cwd, path) cwd=getCwd()）。
+     * <p><b>生产调用方全部显式传 cwd</b>（root-relative 匹配根锚 = 会话 cwd）：
+     * {@code BashPathValidator} / {@code PowerShellPathValidator}（自有 cwd 参数）、
+     * {@code WritePermissionChecker}（{@code ctx.effectiveCwd()}）、
+     * {@code PathValidation.editDenyRule/editAllowRule}（由 {@code validatePath} /
+     * {@code validateGlobPattern} / {@code isPathAllowed} 的 cwd 形参逐层下传 → 上层持
+     * {@code ToolUseContext}）、{@code EditFileTool} / {@code WriteFileTool} 的 validateInput
+     * （{@code ctx.effectiveCwd()}，[G9] 本次接通）。
+     * <p>仅当该路径<b>确实无会话</b>时才传 null → {@link CwdResolution#getCwd(String)}{@code (null)}
+     * （[批 3c] 本类为静态工具、<b>无会话入参</b> ⇒ 只能按「无会话」解析：override / 进程 user.dir，
+     * = 旧实现「MDC 为空」分支等价语义），并由下方一次性 WARN 留痕。
      *
      * @param permCtx  权限上下文
      * @param path     待匹配路径（input.file_path / input.path 提取值）
      * @param behavior 规则行为桶（ALLOW / DENY / ASK）
-     * @param cwd      校验基准 cwd（null → {@link CwdResolution#getCwd} 统一入口解析）
+     * @param cwd      校验基准 cwd（null → 按「无会话」解析：进程 user.dir）
      * @return         第一个 content 匹配的 edit 组规则；无匹配返回 null
      */
     public static PermissionRule getEditRuleByContentsForPath(
@@ -602,8 +612,13 @@ public final class RuleQuery {
         if (permCtx == null || path == null) {
             return null;
         }
+        if ((cwd == null || cwd.isEmpty()) && CWD_FALLBACK_WARNED.compareAndSet(false, true)) {
+            log.warn("[RuleQuery] getEditRuleByContentsForPath 无 cwd 入参（无会话）→ root-relative 规则匹配"
+                + "基准回落进程 user.dir={}；如需会话 cwd 须由调用方显式传入 cwd（工具侧 ctx.effectiveCwd()）",
+                System.getProperty("user.dir"));
+        }
         String effectiveCwd = cwd != null && !cwd.isEmpty()
-            ? cwd : CwdResolution.getCwd();
+            ? cwd : CwdResolution.getCwd(null);
         Map<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> bucket =
             switch (behavior) {
                 case ALLOW -> permCtx.alwaysAllowRules();

@@ -4,7 +4,6 @@ import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.subagent.AgentDefinition;
 import com.nexusai.application.agent.subagent.loadAgentsDir;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -37,8 +36,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>隔离：ClaudePaths configDir/managedFilePath override 到临时目录（避免读真实 ~/.claude/agents，
  * 环境依赖 → 非可重复硬断言）；SessionProjectRoot.setForSession 绑定会话→项目（CwdResolution L3
- * boundProject 层）；RequestContext.setSession 写 MDC。断言用 contains（project 祖先路径理论上
- * 可能有额外 agent，contains 不受影响）。
+ * boundProject 层）。断言用 contains（project 祖先路径理论上可能有额外 agent，contains 不受影响）。
+ *
+ * <p><b>[批 3c]</b>：会话不再经 ambient 槽（裸 MDC）传递 —— 原 {@code setSession(...)} 造上下文的装置
+ * 已删，改为把会话变量**显式传进** {@code SubagentTool.listAgents(String sessionId)} /
+ * {@code agentRegistry(String sessionId)}。
  */
 @DisplayName("C-方案3 · SubagentTool per-session agent-defs 惰性载入（DEC-C-01/02/03）")
 class SubagentToolPerSessionLoadTest {
@@ -57,14 +59,12 @@ class SubagentToolPerSessionLoadTest {
         loadAgentsDir.clearCache(); // 清 MarkdownConfigLoader memoize，避免跨用例陈旧
         SessionProjectRoot.reset();
         SessionCwdHolder.reset(); // 清 L2 会话 cwd + originalCwd 槽，避免 cd/worktree 用例跨测残留
-        RequestContext.clear();
     }
 
     @AfterEach
     void tearDown() {
         SessionProjectRoot.reset();
         SessionCwdHolder.reset();
-        RequestContext.clear();
         loadAgentsDir.clearCache();
         com.nexusai.application.agent.skill.ClaudePaths.setConfigDirOverride(null);
         com.nexusai.application.agent.skill.ClaudePaths.setManagedFilePathOverride(null);
@@ -94,8 +94,9 @@ class SubagentToolPerSessionLoadTest {
         return (java.util.Map<String, ?>) f.get(tool);
     }
 
-    private static List<String> types(SubagentTool tool) {
-        return tool.listAgents().stream().map(AgentDefinition::agentType).toList();
+    /** [批 3c] 会话来源 = **显式形参**（原 0 参 {@code listAgents()} 的内部 ambient 会话槽已删）。 */
+    private static List<String> types(SubagentTool tool, String sessionId) {
+        return tool.listAgents(sessionId).stream().map(AgentDefinition::agentType).toList();
     }
 
     @Test
@@ -107,10 +108,9 @@ class SubagentToolPerSessionLoadTest {
         Path p1 = Files.createTempDirectory("c3-p1");
         writeProjectAgent(p1, "alpha-agent", "alpha from P1");
         SubagentTool tool = newTool();
-        RequestContext.setSession("sessA");
         SessionProjectRoot.setForSession("sessA", p1.toString());
 
-        List<String> types = types(tool);
+        List<String> types = types(tool, "sessA");
 
         assertThat(types)
             .as("会话 A 绑 P1 → agent-defs 必须含 P1/.claude/agents 的 alpha-agent（project 源 per-cwd）")
@@ -124,8 +124,8 @@ class SubagentToolPerSessionLoadTest {
     @Test
     @DisplayName("同一 tool 两会话绑不同项目 → 各自从各自项目载入，互不可见（per-session 隔离）")
     void twoSessions_boundToDifferentProjects_getDifferentAgentDefs() throws Exception {
-        // WHY: 多项目部署下各会话 project agent-defs 应不同（DEC-C-01）。同 tool 实例经 MDC sessionId
-        //   切换 → registryFor(会话 cwd) 各自载入 P1/P2 的 project agent —— 会话 A 看不到 P2 的
+        // WHY: 多项目部署下各会话 project agent-defs 应不同（DEC-C-01）。同 tool 实例按**显式会话形参**
+        //   取 registryFor(会话 cwd) 各自载入 P1/P2 的 project agent —— 会话 A 看不到 P2 的
         //   beta-agent，会话 B 看不到 P1 的 alpha-agent（project 源 per-cwd 语义）。
         Path p1 = Files.createTempDirectory("c3-p1a");
         Path p2 = Files.createTempDirectory("c3-p2");
@@ -133,13 +133,11 @@ class SubagentToolPerSessionLoadTest {
         writeProjectAgent(p2, "beta-agent", "beta from P2");
         SubagentTool tool = newTool();
 
-        RequestContext.setSession("sessA");
         SessionProjectRoot.setForSession("sessA", p1.toString());
-        List<String> typesA = types(tool);
+        List<String> typesA = types(tool, "sessA");
 
-        RequestContext.setSession("sessB");
         SessionProjectRoot.setForSession("sessB", p2.toString());
-        List<String> typesB = types(tool);
+        List<String> typesB = types(tool, "sessB");
 
         assertThat(typesA)
             .as("会话 A 绑 P1 → 含 alpha-agent 且不含 P2 的 beta-agent（per-session 隔离）")
@@ -164,25 +162,24 @@ class SubagentToolPerSessionLoadTest {
         Path p1 = Files.createTempDirectory("c3-p1c");
         writeProjectAgent(p1, "alpha-agent", "alpha v1");
         SubagentTool tool = newTool();
-        RequestContext.setSession("sessA");
         SessionProjectRoot.setForSession("sessA", p1.toString());
 
-        List<String> first = types(tool);
+        List<String> first = types(tool, "sessA");
         assertThat(first).contains("alpha-agent");
 
         // 二次调用 → 缓存命中（不重建）：registriesByCwd 仍 1 条
         assertThat(registriesByCwd(tool)).as("会话首调一次载入 → 缓存视图 1 条").hasSize(1);
-        List<String> second = types(tool);
+        List<String> second = types(tool, "sessA");
         assertThat(registriesByCwd(tool)).as("二次调用缓存命中（非 per-call 重建）→ 仍 1 条").hasSize(1);
 
         // 磁盘 agent 变更（description 改 v2）在未清缓存时不可见 → 证明读的是缓存 registry 而非重读盘
         Files.writeString(p1.resolve(".claude").resolve("agents").resolve("alpha-agent.md"),
             "---\nname: alpha-agent\ndescription: alpha v2\n---\n\nbody");
-        List<String> third = types(tool);
+        List<String> third = types(tool, "sessA");
         assertThat(third)
             .as("未清缓存 → 磁盘变更不可见（复用首调 registry，非 per-call 重建）")
             .contains("alpha-agent");
-        AgentDefinition alpha = tool.listAgents().stream()
+        AgentDefinition alpha = tool.listAgents("sessA").stream()
             .filter(a -> a.agentType().equals("alpha-agent")).findFirst().orElseThrow();
         assertThat(alpha.whenToUse()).as("复用缓存 registry → description 仍是 v1（未重读盘）")
             .isEqualTo("alpha v1");
@@ -198,14 +195,13 @@ class SubagentToolPerSessionLoadTest {
         Path p1 = Files.createTempDirectory("c3-p1d");
         writeProjectAgent(p1, "alpha-agent", "alpha");
         SubagentTool tool = newTool();
-        RequestContext.setSession("sessA");
         SessionProjectRoot.setForSession("sessA", p1.toString());
 
-        assertThat(types(tool)).as("首调载入 alpha-agent").contains("alpha-agent");
+        assertThat(types(tool, "sessA")).as("首调载入 alpha-agent").contains("alpha-agent");
 
         // 新增 gamma-agent → 未清缓存不可见
         writeProjectAgent(p1, "gamma-agent", "gamma new");
-        assertThat(types(tool)).as("未清缓存 → 新增 gamma-agent 不可见（复用首调 registry）")
+        assertThat(types(tool, "sessA")).as("未清缓存 → 新增 gamma-agent 不可见（复用首调 registry）")
             .doesNotContain("gamma-agent");
 
         // 成对清（对齐 /clear + 插件刷新触发点：loadAgentsDir.clearCache + clearRegistryCache）
@@ -213,7 +209,7 @@ class SubagentToolPerSessionLoadTest {
         tool.clearRegistryCache();
         assertThat(registriesByCwd(tool)).as("clearRegistryCache 清空 per-cwd 视图").isEmpty();
 
-        List<String> after = types(tool);
+        List<String> after = types(tool, "sessA");
         assertThat(after)
             .as("成对清后下次访问惰性重建 → gamma-agent 可见")
             .contains("gamma-agent");
@@ -233,10 +229,9 @@ class SubagentToolPerSessionLoadTest {
         writeProjectAgent(p1, "alpha-agent", "alpha from P1");
         writeProjectAgent(cdDir, "beta-agent", "beta from cd dir");
         SubagentTool tool = newTool();
-        RequestContext.setSession("sessA");
         SessionProjectRoot.setForSession("sessA", p1.toString());
 
-        List<String> beforeCd = types(tool);
+        List<String> beforeCd = types(tool, "sessA");
         assertThat(beforeCd)
             .as("会话绑定 P1 → 首调（启动目录=P1）载入 P1 的 alpha-agent")
             .contains("alpha-agent");
@@ -244,7 +239,7 @@ class SubagentToolPerSessionLoadTest {
         // 模拟 bash 前台命令 cd（BashTool.java:967 读回 newCwd → SessionCwdHolder.set(sessionId, newCwd)）
         SessionCwdHolder.set("sessA", cdDir.toString());
 
-        List<String> afterCd = types(tool);
+        List<String> afterCd = types(tool, "sessA");
         assertThat(afterCd)
             .as("会话内 cd 到 cdDir → agent-defs 复用原 registry 不重载（对齐 CC startup-cwd-fixed：仍 P1 表，不载入 cdDir 的 beta-agent）")
             .contains("alpha-agent")
@@ -267,10 +262,9 @@ class SubagentToolPerSessionLoadTest {
         writeProjectAgent(p1, "alpha-agent", "alpha from P1");
         writeProjectAgent(worktree, "wt-agent", "agent from worktree");
         SubagentTool tool = newTool();
-        RequestContext.setSession("sessA");
         SessionProjectRoot.setForSession("sessA", p1.toString());
 
-        assertThat(types(tool))
+        assertThat(types(tool, "sessA"))
             .as("首调（启动目录=P1）→ 载入 P1 的 alpha-agent")
             .contains("alpha-agent");
 
@@ -278,7 +272,7 @@ class SubagentToolPerSessionLoadTest {
         SessionCwdHolder.set("sessA", worktree.toString());
         SessionCwdHolder.setOriginalCwd("sessA", worktree.toString());
 
-        List<String> inWorktree = types(tool);
+        List<String> inWorktree = types(tool, "sessA");
         assertThat(inWorktree)
             .as("worktree 进入 → agent-defs 不重载（仍 P1 启动表，不载入 worktree 的 wt-agent，对齐 CC startup-cwd-fixed）")
             .contains("alpha-agent")

@@ -807,17 +807,16 @@ public class VisionAnalyzeTool implements Tool {
     );
 
     /**
-     * 会话解析 · 三源：① ToolUseContext.sessionId（当前 turn 直接源）；②
-     * {@link com.nexusai.common.RequestContext#sessionId()}（MDC）；③ null →
-     * {@link ImageAttachmentStore} 内部 'unknown' 兜底（cron/后台无 MDC 场景）。
+     * 会话解析 · 两源：① ToolUseContext.sessionId（当前 turn 直接源）；② null →
+     * {@link ImageAttachmentStore} 内部 'unknown' 兜底（cron/后台无会话场景）。
+     *
+     * <p>[批 3c] 会话来源显式化：唯一源 = {@code ctx.sessionId()}；⛔ 已删原第二源 MDC
+     * （裸 MDC）—— 该读点在 tool-exec 池线程上恒空或读到线程复用的
+     * 残留会话 id（第三态）。
      */
     private static String resolveSessionId(ToolUseContext ctx) {
         if (ctx != null && ctx.sessionId() != null) {
             return ctx.sessionId();
-        }
-        String fromMdc = com.nexusai.common.RequestContext.sessionId();
-        if (fromMdc != null && !fromMdc.isBlank()) {
-            return fromMdc;
         }
         return null;
     }

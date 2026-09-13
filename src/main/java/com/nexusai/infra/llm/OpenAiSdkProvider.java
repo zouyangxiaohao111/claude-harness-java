@@ -9,7 +9,6 @@ import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.properties.NexusProperties;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
@@ -61,7 +60,9 @@ import java.util.function.Consumer;
  *   <li>R-REQ-1：SDK 0.25.0 无 {@code withRawResponse}（Anthropic 有），
  *       {@code OpenAIOkHttpClient$Builder} 亦无 {@code httpClient} 注入点（OkHttp 拦截器方案不可用，
  *       DEC-OA-1 方案 C）→ 响应侧 requestId 无法提取。DEC-RV-14a 兜底：响应 requestId 恒 null 时
- *       用请求侧自建 ID（{@link RequestContext#requestId()}，MDC reqId = userMessageId）。</li>
+ *       用请求侧自建 ID（原 = 裸 MDC 的 reqId 槽 = userMessageId；<b>[批 3c] 该载体已随批删除 ⇒ 本类
+ *       现无可用的显式 requestId 来源，两处兜底改为 null（CC「无归因上下文」语义），待
+ *       {@code LlmProvider.stream} / {@link #chatWithRaw} 增显式 requestId 载体后接线</b>）。</li>
  * </ul>
  *
  * <h2>推理字段</h2>
@@ -72,6 +73,17 @@ public class OpenAiSdkProvider implements LlmProvider {
 
     private static final Logger log = LoggerFactory.getLogger(OpenAiSdkProvider.class);
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /**
+     * [批 3c] requestId 兜底「无显式来源 → 置 null」的首次告警闸（两个调用点各一）。
+     *
+     * <p>WHY：两条兜底路径都在热路径（每次流式 / 每次 chatWithRaw 调用）⇒ 逐调用 WARN 会刷屏；
+     * 用一次性闸保证「禁只 DEBUG」（首次 WARN 披露，后续降 debug）。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean STREAM_REQUEST_ID_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final java.util.concurrent.atomic.AtomicBoolean CHAT_RAW_REQUEST_ID_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @Resource NexusProperties properties;
 
@@ -247,7 +259,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         }
         try {
             // [provider-custom-headers 任务 7] 主链 sessionId 来源 = history（DB 真值，必中）。
-            //   ⚠️ 刻意**不**在此处兜底 MDC（RequestContext.sessionId）；MDC 可能是残留的别会话 id，
+            //   ⚠️ 刻意**不**在此处兜底环境态会话槽（裸 MDC，已随批 3c 删除）；该类槽可能残留别会话 id，
             //   详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
             //   （护栏按**字面量**判，故连注释里都不留该调用形态 —— 它正是被照抄的来源。）
             String sessionId = SessionIdResolver.resolve(history, null);
@@ -273,9 +285,23 @@ public class OpenAiSdkProvider implements LlmProvider {
 
             OpenAiStreamState state = new OpenAiStreamState();
             // [D-4] requestId 兜底（DEC-RV-14a）· openai-java 0.25.0 无 withRawResponse（R-REQ-1），
-            //   响应侧 x-request-id 头不可达 → 与非流式 chatWithRaw 一致走请求侧自建 ID（MDC reqId =
-            //   userMessageId）· 子 agent invokingRequestId 归因值源（AgentTool.tsx:723/:778）。
-            state.requestId = RequestContext.requestId();
+            //   响应侧 x-request-id 头不可达 → 与非流式 chatWithRaw 一致走请求侧自建 ID
+            //   （旧实现 = 裸 MDC 的 reqId 槽，值源为 ChatService 入口写入的 userMessageId）
+            //   · 子 agent invokingRequestId 归因值源（AgentTool.tsx:723/:778）。
+            // [批 3c] 该 MDC 槽与载体已删，且 doStream 签名内**没有** requestId / userMessageId 形参或
+            //   字段（上游 LlmProvider.stream 亦无）⇒ 按批规则「无显式来源不自行发明」置 null ——
+            //   null 即 CC 的「无归因上下文」合法语义（同 AnthropicSdkProvider 无 request-id 头时的
+            //   同一语义，见 AnthropicSdkProviderStreamRequestIdTest「无头 → null 对齐 ?? undefined」）。
+            //   ⚠ 待接线（批 3c 登记项）：LlmProvider.stream 增显式 requestId 载体后由上游传入
+            //   （源值 = state.lastUserMessageId()，与旧 MDC reqId 同源）。故本处 WARN 披露（禁只 DEBUG）。
+            state.requestId = null;
+            if (STREAM_REQUEST_ID_WARNED.compareAndSet(false, true)) {
+                log.warn("OpenAiSdkProvider 流式 requestId 无显式来源（批 3c：裸 MDC 的 reqId 槽已删，"
+                    + "doStream 无 requestId/userMessageId 形参）→ 置 null（CC 无归因上下文语义）；"
+                    + "待 LlmProvider.stream 增显式载体后接线 —— 本条为首次告警，后续降为 debug");
+            } else if (log.isDebugEnabled()) {
+                log.debug("OpenAiSdkProvider 流式 requestId 仍置 null（首次告警已发出）");
+            }
             if (log.isDebugEnabled()) {
                 log.debug("OpenAiSdkProvider 流式 requestId 兜底={} · DEC-RV-14a 请求侧自建 ID（SDK 无 withRawResponse）",
                     state.requestId);
@@ -348,7 +374,8 @@ public class OpenAiSdkProvider implements LlmProvider {
      *       {@link NexusProperties#getOpenaiReasoningField()} 优先级匹配（DeepSeek R1 reasoning_content）</li>
      *   <li>{@link LlmRawResponse#requestId()} ← 请求侧自建 ID 兜底（[OpenAI-SDK] R-REQ-1 ·
      *       openai-java 0.25.0 无 withRawResponse / OkHttp 拦截器注入不可用 · DEC-OA-1 方案 C +
-     *       DEC-RV-14a：{@link RequestContext#requestId()}，MDC reqId = userMessageId）</li>
+     *       DEC-RV-14a：请求侧自建 ID；<b>[批 3c] 原值源（裸 MDC 的 reqId 槽）已随批删除 ⇒ 本方法现无
+     *       显式来源，按批规则置 null（CC「无归因上下文」语义），待形参增显式 requestId 载体</b>）</li>
      * </ul>
      */
     @Override
@@ -377,10 +404,22 @@ public class OpenAiSdkProvider implements LlmProvider {
             String responseId = resp.id() == null || resp.id().isBlank() ? null : resp.id();
             String thinking = extractThinking(resp);
             // [OpenAI-SDK] R-REQ-1 兜底（DEC-RV-14a）· SDK 0.25.0 无法提取 x-request-id →
-            // 响应 requestId 恒 null，改用请求侧自建 ID（RequestContext.requestId() = MDC reqId =
-            // ChatService 的 userMessageId）作兜底 · 对齐 CC extractRequestId 语义（请求侧追踪 ID，
-            // 非 message id；响应 id 已进 LlmRawResponse.id = stageMsgId）
-            String fallbackReqId = RequestContext.requestId();
+            // 响应 requestId 恒 null，原改用请求侧自建 ID（裸 MDC 的 reqId 槽 = ChatService 的
+            // userMessageId）作兜底 · 对齐 CC extractRequestId 语义（请求侧追踪 ID，非 message id；
+            // 响应 id 已进 LlmRawResponse.id = stageMsgId）。
+            // [批 3c] 该 MDC 槽与载体已删，且 chatWithRaw 的形参（config/model/systemPrompt/userMessage/
+            //   agentContext）里没有 requestId / userMessageId；`agentContext.invokingRequestId` 是
+            //   **调用方**（spawn/resume 方）的 request_id，与「本请求 userMessageId」不是同一值 ⇒
+            //   按批规则「无显式来源不自行发明」置 null（CC 无归因上下文语义）。
+            //   ⚠ 待接线（批 3c 登记项）：ChatRequestOptions / chatWithRaw 增显式 requestId 载体。
+            String fallbackReqId = null;
+            if (CHAT_RAW_REQUEST_ID_WARNED.compareAndSet(false, true)) {
+                log.warn("OpenAiSdkProvider.chatWithRaw requestId 无显式来源（批 3c：裸 MDC 的 reqId 槽已删，"
+                    + "形参无 requestId/userMessageId）→ 置 null（CC 无归因上下文语义）"
+                    + "—— 本条为首次告警，后续降为 debug");
+            } else if (log.isDebugEnabled()) {
+                log.debug("OpenAiSdkProvider.chatWithRaw requestId 仍置 null（首次告警已发出）");
+            }
             if (log.isInfoEnabled()) {
                 log.info("[OpenAiSdkProvider] chatWithRaw 提取: responseId={} requestId={}(SDK-0.25.0无withRawResponse→请求侧兜底) contentLen={} thinkingLen={}",
                     responseId, fallbackReqId, content.length(),

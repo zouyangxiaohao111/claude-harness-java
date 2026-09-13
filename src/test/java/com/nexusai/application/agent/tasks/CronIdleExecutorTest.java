@@ -13,7 +13,6 @@ import com.nexusai.application.agent.tasks.NotificationQueue.QueueItem;
 import com.nexusai.application.agent.tool.config.CronEnabledGates;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.chat.SlashCommandInterceptor;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.domain.schedule.ScheduleService;
 import com.nexusai.repository.session.mapper.SessionMapper;
@@ -74,8 +73,7 @@ class CronIdleExecutorTest {
     @AfterEach
     void tearDown() {
         LlmAgentLoop.markIdle(CronIdleExecutor.GLOBAL_SESSION_KEY);
-        // CRON-D5 改2 测试会注入 MDC sessionId —— 清空防跨测试线程污染
-        RequestContext.clear();
+        // [批 3c] 原此处 clear() 清「CRON-D5 改2 注入的 ambient 会话槽」已删：该槽与写点已随本批移除。
     }
 
     @Test
@@ -327,30 +325,20 @@ class CronIdleExecutorTest {
     // ============ CRON-D5: 会话上下文归组（改2 MDC 恢复 + 改3 真实 UUID + poll gate 目标会话） ============
 
     @Test
-    @DisplayName("CRON-D5 改2+改3+F2: 工具路径（派生 UUID 串）→ run 期间 MDC=原始键 sess-xxx + RunRequest=派生 UUID + finally 清理")
+    @DisplayName("CRON-D5 改3: 工具路径（派生 UUID 串）→ RunRequest.sessionId = 创建会话（唯一会话来源）")
     void runOneAgentLoopRestoresSessionContext() throws Exception {
-        // WHY: cronExecutor 线程无 MDC（ThreadLocal 不跨线程）→ cron 触发的 agent_loop 工作目录域
-        // 全回落 user.dir（跨会话 cwd 错位）。CRON-D5 消费线程 setSession 恢复 → CwdResolution 解析到
-        // 创建会话 boundProject；RunRequest.sessionId 用真实 UUID → markRunning/isSessionRunning 归组
-        // 创建会话（对齐 CC 单进程 ambient"任务即属创建会话"）。finally 清理防 cronExecutor 线程串台。
-        // F2 返工: CronCreateTool 落库的是 ToolUseContext.sessionId().toString()=派生 UUID，而
-        // SessionProjectRoot（boundProject 层）以原始键 "sess-xxx" 为键 —— MDC 必须反解回原始键，
-        // 否则 L3 boundProject 恒 MISS 回落 user.dir。旧 fixture 用随机 UUID 断言 MDC==UUID 恰固化了
-        // 该错误行为（规则 9），本轮改用真实派生 UUID 断言 MDC==原始键。
-        String originalKey = "sess-a1b2c3d4";
-        String sessionId = originalKey;
+        // WHY: cronExecutor 线程无任何 ambient 会话态 → cron 触发的 agent_loop 工作目录域若按
+        // ambient 解析会全回落 user.dir（跨会话 cwd 错位）。CRON-D5 消费线程恢复创建会话上下文 →
+        // CwdResolution.getCwd(sessionId) 解析到创建会话 boundProject；RunRequest.sessionId 用真实
+        // UUID → markRunning/isSessionRunning 归组创建会话（对齐 CC 单进程 ambient"任务即属创建会话"）。
+        // [批 3c] 该「恢复」的载体已从裸 MDC 会话槽改为**显式载体**（RunRequest.sessionId /
+        //   setStreamContext(cmd.sessionId())），本用例只保留对显式载体的断言。
+        String sessionId = "sess-a1b2c3d4";
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
         ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
         when(provider.getObject()).thenReturn(loop);
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
-
-        // 捕获 loop.run(req) 调用时刻的 MDC sessionId（run 内 doRun 才会消费，此处只验调用前已注入）
-        AtomicReference<String> mdcDuringRun = new AtomicReference<>();
-        doAnswer(inv -> {
-            mdcDuringRun.set(RequestContext.sessionId());
-            return null;
-        }).when(loop).run(any(RunRequest.class));
 
         QueueItem cmd = new QueueItem("运行项目测试", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, sessionId);
@@ -362,17 +350,17 @@ class CronIdleExecutorTest {
         RunRequest req = captor.getValue();
         // 改3: SESSION scope cron → 创建会话真实 UUID（非 GLOBAL 常量）
         assertThat(req.sessionId()).isEqualTo(sessionId);
-        // F2: run() 调用期间 MDC 已恢复为原始键（boundProject/SessionProjectRoot 层可命中）
-        assertThat(mdcDuringRun.get()).isEqualTo(originalKey);
-        // 改2 finally: run 返回后 MDC 已清理（cronExecutor 线程复用防串台）
-        assertThat(RequestContext.sessionId()).isNull();
+        // [批 3c] 语义消失（已登记待裁定）：原此处还断言「run 期间 ambient 会话槽已恢复为原始键
+        //   originalKey」与「run 返回后该槽已清理（防线程池串台）」——两处装置（setSession/clear）
+        //   与被观察的槽已随本批整类删除，故两条断言删除。会话标识现由 RunRequest.sessionId()
+        //   显式承载（上面那条断言即为其唯一来源证明）。
     }
 
     @Test
-    @DisplayName("CRON-D5 F2 零回归: 不可反解 UUID（随机 UUID）→ MDC 原值兜底（不改写既有行为）")
+    @DisplayName("CRON-D5 F2 零回归: 非 \"sess-xxx\" 形态的会话串 → RunRequest.sessionId 原值透传（不改写既有行为）")
     void runOneAgentLoopFallsBackToRawWhenUuidNotReversible() throws Exception {
-        // WHY: 非 "sess-xxx" 派生 UUID（测试/DB 脏行/兼容路径）无法反解回原始键 → MDC 用原值兜底，
-        // 保证既有行为不变（不凭空注入 "sess-" 也不丢 MDC）。F2 只修复可反解的真实会话场景。
+        // WHY: 非 "sess-xxx" 派生 UUID（测试/DB 脏行/兼容路径）不参与双键反解 → 显式会话值原样透传，
+        // 保证既有行为不变（不凭空注入 "sess-" 也不丢值）。
         String sessionId = UUID.randomUUID().toString();
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
         @SuppressWarnings("unchecked")
@@ -380,19 +368,13 @@ class CronIdleExecutorTest {
         when(provider.getObject()).thenReturn(loop);
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
 
-        AtomicReference<String> mdcDuringRun = new AtomicReference<>();
-        doAnswer(inv -> {
-            mdcDuringRun.set(RequestContext.sessionId());
-            return null;
-        }).when(loop).run(any(RunRequest.class));
-
         QueueItem cmd = new QueueItem("运行项目测试", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, sessionId);
 
         ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-        // 不可反解 → MDC 原值兜底（等于传入的随机 UUID 串），RunRequest 仍是该 UUID
-        assertThat(mdcDuringRun.get()).isEqualTo(sessionId);
+        // [批 3c] 语义消失：原此处还断言「run 期间 ambient 会话槽 == 传入的随机 UUID 串」——
+        //   该槽与其写点（消费前恢复）已随本批整类删除，断言删除。显式载体断言保留。
         ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
         verify(loop).run(captor.capture());
         assertThat(captor.getValue().sessionId()).isEqualTo(sessionId);
@@ -412,12 +394,6 @@ class CronIdleExecutorTest {
         when(provider.getObject()).thenReturn(loop);
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
 
-        AtomicReference<String> mdcDuringRun = new AtomicReference<>();
-        doAnswer(inv -> {
-            mdcDuringRun.set(RequestContext.sessionId());
-            return null;
-        }).when(loop).run(any(RunRequest.class));
-
         QueueItem cmd = new QueueItem("HTTP 创建任务", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, originalKey);
 
@@ -428,18 +404,18 @@ class CronIdleExecutorTest {
         // F2: "sess-xxx" 归一为派生 UUID（非 GLOBAL_SESSION_UUID 兜底）→ RUNNING_SESSIONS 归组创建会话
         assertThat(captor.getValue().sessionId()).isEqualTo(originalKey);
         assertThat(captor.getValue().sessionId()).isNotEqualTo(CronIdleExecutor.GLOBAL_SESSION_KEY);
-        // MDC 已是原始键，原样透传
-        assertThat(mdcDuringRun.get()).isEqualTo(originalKey);
+        // [批 3c] 语义消失：原此处还断言「ambient 会话槽已是原始键（原样透传）」——该槽与其写点
+        //   已随本批整类删除，断言删除；显式 RunRequest.sessionId 断言（上面两条）保留。
     }
 
     @Test
     @DisplayName("CRON-D5 F2: 仅绑定项目（未 cd）→ cron 消费 cwd 解析到创建会话 boundProject（非 user.dir）")
     void cronCwdResolvesBoundProjectForOnlyBoundSession() throws Exception {
-        // WHY（规则九）: F2 核心 —— CronCreateTool 落库派生 UUID，SessionProjectRoot 以 "sess-xxx" 为键，
-        // 旧消费 MDC=UUID → L3 boundProject 恒 MISS → 回落 user.dir（跨会话 cwd 错位）。F2 返工后：
-        // ① runOneAgentLoop 把 MDC 反解回原始键 → CwdResolution.getCwd()（无参，MDC 基准）命中 boundProject；
-        // ② CwdResolution.getCwd(派生 UUID)（BashTool 显式 ctx.sessionId().toString() 基准）经双键解析
-        //    同样命中 boundProject —— 两条消费路径都归组创建会话 boundProject。
+        // WHY（规则九）: F2 核心 —— 消费线程按**显式会话**解析 cwd：
+        // CwdResolution.getCwd(会话串) 经双键解析命中创建会话的 boundProject（非回落 user.dir）。
+        // [批 3c] 语义消失：原用例的另一条臂是「runOneAgentLoop 把 ambient 会话槽反解回原始键 →
+        //   CwdResolution.getCwd()（无参，该槽基准）也命中 boundProject」。该 ambient 槽与写点已随本批
+        //   整类删除 ⇒ 该臂（含 cwdByMdc 捕获与断言）删除；显式会话臂原样保留。
         String originalKey = "sess-abcd5678";
         String derivedUuid = originalKey;
         java.nio.file.Path tmp = Files.createTempDirectory("cron-d5-bound");
@@ -453,11 +429,9 @@ class CronIdleExecutorTest {
             when(provider.getObject()).thenReturn(loop);
             ReflectionTestUtils.setField(executor, "loopProvider", provider);
 
-            AtomicReference<String> cwdByMdc = new AtomicReference<>();
             AtomicReference<String> cwdByUuid = new AtomicReference<>();
             doAnswer(inv -> {
-                // 消费线程（无 override）经 MDC 解析 + BashTool 显式 UUID 解析两条路径
-                cwdByMdc.set(CwdResolution.getCwd());
+                // BashTool 显式 ctx.sessionId().toString() 基准
                 cwdByUuid.set(CwdResolution.getCwd(derivedUuid));
                 return null;
             }).when(loop).run(any(RunRequest.class));
@@ -467,15 +441,11 @@ class CronIdleExecutorTest {
 
             ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
 
-            assertThat(cwdByMdc.get())
-                .as("MDC 基准：run 期间 CwdResolution.getCwd() 应解析到创建会话 boundProject（非 user.dir）")
-                .isEqualTo(boundProject);
             assertThat(cwdByUuid.get())
                 .as("BashTool 基准：CwdResolution.getCwd(派生 UUID) 应经双键解析命中 boundProject")
                 .isEqualTo(boundProject);
         } finally {
             SessionProjectRoot.clearSession(originalKey);
-            RequestContext.clear();
             Files.deleteIfExists(tmp);
         }
     }
@@ -508,11 +478,9 @@ class CronIdleExecutorTest {
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
 
         AtomicReference<String> cwdDuringRun = new AtomicReference<>();
-        AtomicReference<String> mdcDuringRun = new AtomicReference<>();
         AtomicReference<String> anchorDuringRun = new AtomicReference<>();
         doAnswer(inv -> {
-            cwdDuringRun.set(CwdResolution.getCwd());
-            mdcDuringRun.set(RequestContext.sessionId());
+            cwdDuringRun.set(CwdResolution.getCwd(null));
             anchorDuringRun.set(((RunRequest) inv.getArgument(0)).boundProject());
             return null;
         }).when(loop).run(any(RunRequest.class));
@@ -527,18 +495,15 @@ class CronIdleExecutorTest {
             .as("① DURABLE 任务的项目锚必须显式随 RunRequest 传进 run（值传递，非 ThreadLocal）")
             .isEqualTo(boundProject);
         assertThat(cwdDuringRun.get())
-            .as("② 执行线程 CwdResolution.getCwd() 必须是 user.dir —— 无 ThreadLocal cwd 劫持"
+            .as("② 执行线程 CwdResolution.getCwd(null) 必须是 user.dir —— 无 ThreadLocal cwd 劫持"
                 + "（恢复 runWithCwdOverride 会把它变成 boundProject ⇒ 变红）")
             .isEqualTo(userDir);
-        assertThat(CwdResolution.getCwd())
+        assertThat(CwdResolution.getCwd(null))
             .as("② run 结束后 cwd 无残留（无线程池复用串台）")
             .isEqualTo(userDir);
-        assertThat(mdcDuringRun.get())
-            .as("DURABLE 任务 sessionId=null → MDC 不注入（锚走 RunRequest，不走 sessionId）")
-            .isNull();
-        assertThat(RequestContext.sessionId())
-            .as("finally 清理后 MDC 仍为 null（防 cronExecutor 线程串台）")
-            .isNull();
+        // [批 3c] 语义消失：原此处还断言「DURABLE（sessionId=null）→ ambient 会话槽不注入」与
+        //   「finally 清理后该槽仍为 null（防 cronExecutor 线程串台）」——该槽与其写点已随本批
+        //   整类删除，两条断言删除；上面 ② 的「无 ThreadLocal 劫持 + 无残留」仍是同一意图的活断言。
         Files.deleteIfExists(tmp);
     }
 
@@ -557,7 +522,7 @@ class CronIdleExecutorTest {
 
         AtomicReference<String> cwdDuringRun = new AtomicReference<>();
         doAnswer(inv -> {
-            cwdDuringRun.set(CwdResolution.getCwd());
+            cwdDuringRun.set(CwdResolution.getCwd(null));
             return null;
         }).when(loop).run(any(RunRequest.class));
 
@@ -575,11 +540,11 @@ class CronIdleExecutorTest {
     }
 
     @Test
-    @DisplayName("CRON-D5 改3: DURABLE 无项目锚直建（sessionId=null + boundProject=null）→ RunRequest 回落 GLOBAL_SESSION_UUID + MDC 不注入（零回归）")
+    @DisplayName("CRON-D5 改3: DURABLE 无项目锚直建（sessionId=null + boundProject=null）→ RunRequest 回落 GLOBAL_SESSION_UUID（零回归）")
     void runOneAgentLoopPersistentFallsBackToGlobalUuid() throws Exception {
         // WHY: DURABLE 无项目锚直建（REST 直建 sessionId=null + boundProject=null，无创建会话可归）→
         // 保持现状回落全局会话/user.dir（GLOBAL 兜底，CRON-D5 只解决 SESSION scope 归组）。改3 必须
-        // 保证这条兼容路径不崩、不误注入 MDC。注意 [cron-durable-session-fire]：DURABLE 有项目锚
+        // 保证这条兼容路径不崩、不误注入会话。注意 [cron-durable-session-fire]：DURABLE 有项目锚
         // （boundProject!=null）时已关/无会话 → RunRequest.sessionId=null（headless 无 transcript），
         // 不经本 GLOBAL 兜底（见 runOneAgentLoopDurableCreatingSessionClosed_headlessNoTranscript）。
         LlmAgentLoop loop = mock(LlmAgentLoop.class);
@@ -587,12 +552,6 @@ class CronIdleExecutorTest {
         ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
         when(provider.getObject()).thenReturn(loop);
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
-
-        AtomicReference<String> mdcDuringRun = new AtomicReference<>();
-        doAnswer(inv -> {
-            mdcDuringRun.set(RequestContext.sessionId());
-            return null;
-        }).when(loop).run(any(RunRequest.class));
 
         QueueItem cmd = new QueueItem("持久化任务", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, null);
@@ -602,7 +561,8 @@ class CronIdleExecutorTest {
         ArgumentCaptor<RunRequest> captor = ArgumentCaptor.forClass(RunRequest.class);
         verify(loop).run(captor.capture());
         assertThat(captor.getValue().sessionId()).isEqualTo(CronIdleExecutor.GLOBAL_SESSION_KEY);
-        assertThat(mdcDuringRun.get()).isNull();
+        // [批 3c] 语义消失：原此处还断言「ambient 会话槽不注入（mdcDuringRun == null）」——该槽与其
+        //   写点已随本批整类删除，断言删除；上面 RunRequest 回落 GLOBAL 的断言（核心契约）保留。
     }
 
     @Test

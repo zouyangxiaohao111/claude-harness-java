@@ -1,6 +1,5 @@
 package com.nexusai.application.agent.agent;
 
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -36,7 +35,6 @@ class CwdResolutionTest {
         CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     @Test

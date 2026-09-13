@@ -5,7 +5,6 @@ import com.nexusai.application.agent.permission.hook.HookEvent;
 import com.nexusai.application.agent.permission.hook.HookEventType;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.chat.ChatService;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
@@ -107,7 +106,6 @@ class LlmAgentLoopHookAdditionalContextPersistChainTest {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         SessionStartSeenRegistry.reset();
     }
 
@@ -435,7 +433,7 @@ class LlmAgentLoopHookAdditionalContextPersistChainTest {
         ChatService realTime = realTimeChat(db);   // 覆盖式：删旧 + 新份注入即落库
         // 先热（前 run 已发生）再 /clear 移除 key → 下 run 恢复冷
         SessionStartSeenRegistry.markSeen(SESSION_KEY);
-        SessionStartSeenRegistry.remove(SESSION_KEY);   // = CommandController /clear remove(RequestContext.sessionId)
+        SessionStartSeenRegistry.remove(SESSION_KEY);   // = CommandController /clear remove(sessionId)（显式传参；裸 MDC 会话槽已删）
 
         AtomicReference<List<ChatMessageDto>> history = new AtomicReference<>();
         AtomicInteger sessionStartCalls = new AtomicInteger();

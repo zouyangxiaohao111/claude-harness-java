@@ -54,14 +54,14 @@ import java.util.function.Supplier;
  * <h2>memoize 缓存（P1-1 · 对齐 CC loadAllCommands / getSkillToolCommands）</h2>
  * <p>CC 用 {@code memoize(by cwd)} 对命令加载做缓存（commands.ts:449 {@code loadAllCommands}、
  * commands.ts:563 {@code getSkillToolCommands}、commands.ts:586 {@code getSlashCommandToolSkills}）。
- * IMP-E 起缓存键 = projectRoot + skillsRoot 复合（{@link #currentCacheKey()}）：projectRoot 分量经
- * {@link #cwdSupplier}（生产 = {@code AutoMemPaths::currentSessionProjectRoot}，per-session ThreadLocal）
+ * IMP-E 起缓存键 = projectRoot + skillsRoot 复合（{@link #currentCacheKey(String)}）：projectRoot 分量经
+ * {@link #cwdSupplier}（生产 = 显式 sessionId → {@code SessionProjectRoot.getForSession(sessionId)}）
  * 取值 → 会话 A(Pa)/B(Pb) 各自独立缓存槽，M-09 不可逆污染消除（CC memoize-by-cwd 的 Java 等价物）。
  * <ul>
- *   <li>{@link #getAllCommands()} → {@link #allCommandsCache}（对齐 CC {@code loadAllCommands}）</li>
- *   <li>{@link #getModelInvocableCommands()} → {@link #modelInvocableCache}（对齐 CC
+ *   <li>{@link #getAllCommands(String)} → {@link #allCommandsCache}（对齐 CC {@code loadAllCommands}）</li>
+ *   <li>{@link #getModelInvocableCommands(String)} → {@link #modelInvocableCache}（对齐 CC
  *       {@code getSkillToolCommands} 独立 memoize 层）</li>
- *   <li>{@link #getSlashCommandToolSkills()} → {@link #slashCommandToolSkillsCache}（P2-3 · 对齐 CC
+ *   <li>{@link #getSlashCommandToolSkills(String)} → {@link #slashCommandToolSkillsCache}（P2-3 · 对齐 CC
  *       {@code getSlashCommandToolSkills} commands.ts:586 第二套过滤，getSkillInfo 数据源）</li>
  *   <li>{@link #refresh()} 为唯一显式失效入口（对齐 CC {@code clearCommandMemoizationCaches}
  *       commands.ts:523-531 + {@code clearSkillCaches} loadSkillsDir.ts:806-811）：磁盘变更
@@ -72,18 +72,18 @@ import java.util.function.Supplier;
  *
  * <h2>每源错误隔离（P1-1 · 对齐 CC getSkills commands.ts:360-373）</h2>
  * <p>CC {@code getSkills} 对 skillDirCommands/pluginSkills 每源独立 {@code .catch(err => logError + return [])}，
- * 外层兜底全空。Java 等价：{@link #loadAllCommands()} 4 源各自 try-catch → log.warn + 该源跳过，
+ * 外层兜底全空。Java 等价：{@link #loadAllCommands(String)} 4 源各自 try-catch → log.warn + 该源跳过，
  * 任一源异常不再中断整体。
  */
 public class SkillRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(SkillRegistry.class);
 
-    /** 命令聚合缓存 · 对齐 CC {@code loadAllCommands} memoize（commands.ts:449）· 键 = projectRoot+skillsRoot 复合（{@link #currentCacheKey()}） */
+    /** 命令聚合缓存 · 对齐 CC {@code loadAllCommands} memoize（commands.ts:449）· 键 = projectRoot+skillsRoot 复合（{@link #currentCacheKey(String)}） */
     private final ConcurrentHashMap<String, List<Command>> allCommandsCache = new ConcurrentHashMap<>();
-    /** 模型可调用命令过滤缓存 · 对齐 CC {@code getSkillToolCommands} 独立 memoize（commands.ts:563）· 键 = projectRoot+skillsRoot 复合（{@link #currentCacheKey()}） */
+    /** 模型可调用命令过滤缓存 · 对齐 CC {@code getSkillToolCommands} 独立 memoize（commands.ts:563）· 键 = projectRoot+skillsRoot 复合（{@link #currentCacheKey(String)}） */
     private final ConcurrentHashMap<String, List<Command>> modelInvocableCache = new ConcurrentHashMap<>();
-    /** 斜杠命令技能过滤缓存 · 对齐 CC {@code getSlashCommandToolSkills} 独立 memoize（commands.ts:586）· 键 = projectRoot+skillsRoot 复合（{@link #currentCacheKey()}） */
+    /** 斜杠命令技能过滤缓存 · 对齐 CC {@code getSlashCommandToolSkills} 独立 memoize（commands.ts:586）· 键 = projectRoot+skillsRoot 复合（{@link #currentCacheKey(String)}） */
     private final ConcurrentHashMap<String, List<Command>> slashCommandToolSkillsCache = new ConcurrentHashMap<>();
 
     private final SkillsLoader loader = new SkillsLoader();
@@ -94,7 +94,7 @@ public class SkillRegistry {
      * MPL6: plugin 加载器 · 对齐 CC getPluginCommands/getPluginSkills（loadPluginCommands.ts:414-942）
      * 经 loadAllPluginsCacheOnly 产出的 enabled plugins。
      *
-     * <p>由 {@link #setPluginLoader} 注入；null 时 {@link #getAllCommands()} 无 plugin 命令/技能源
+     * <p>由 {@link #setPluginLoader} 注入；null 时 {@link #getAllCommands(String)} 无 plugin 命令/技能源
      * （POJO 兼容，现有测试不破）。生产装配点：ToolRegistrationConfig.skillRegistry()（MPL6 允许
      * 修改清单外，登记为 follow-up）。
      */
@@ -103,8 +103,14 @@ public class SkillRegistry {
      * P2-20: cwd 供应 · 非 null 时文件系统源走五源 {@link SkillsLoader#getSkillDirCommands(String)}
      * （生产对齐 CC getCommands → getSkillDirCommands(cwd)，commands.ts:361-367）；null → 单目录回退
      * {@link SkillsLoader#loadFromDirectory}（POJO/测试，SkillRegistry(String) 直构不变）。
+     *
+     * <p>[批 3c · 2026-09-13] 类型由 {@code Supplier<String>} 改为 {@code Function<String, String>}
+     * = {@code sessionId -> cwd}。WHY：原生产接线把会话标识取自<b>裸 MDC</b>（第三态：可能读到上一
+     * 请求残留的、别的会话的 id），该读点随批 3c 删除 ⇒ 会话标识必须由<b>调用方显式传入</b>
+     * （对齐 CC {@code getSkillDirCommands(cwd)} 的 cwd 显式入参语义）。未注入（POJO/测试直构）时回落
+     * {@link AutoMemPaths#currentSessionProjectRoot()}（行为不变）。
      */
-    private Supplier<String> cwdSupplier;
+    private Function<String, String> cwdSupplier;
     /**
      * P1-3: workflow 命令源 · 对齐 CC getWorkflowCommands（commands.ts:401-406 + :457/:464）。
      *
@@ -115,7 +121,7 @@ public class SkillRegistry {
      *
      * <p>Java 等价：可注入 {@link Supplier}{@code <List<Command>>}，null 默认 = feature 关（无 workflow 命令）；
      * 由 {@link #setWorkflowCommandProvider} 注入（生产装配点 ToolRegistrationConfig 按
-     * {@code FeatureFlags.workflowScripts()} 门控接线）。未注入时 {@link #getAllCommands()} 输出不变
+     * {@code FeatureFlags.workflowScripts()} 门控接线）。未注入时 {@link #getAllCommands(String)} 输出不变
      * （POJO 兼容，现有测试不破）。
      *
      * <p><b>[TL-W1 P4] 入参改为显式 projectRoot（{@code Function<String, List<Command>>}）</b>：
@@ -123,14 +129,14 @@ public class SkillRegistry {
      * {@code AutoMemPaths.currentSessionProjectRoot()}（ThreadLocal）—— 消费方含 REST 线程
      * （SkillController/CommandController/CommandRegistrationConfig28 的 /skills handler），
      * ThreadLocal 必空 → 回落 config home → 去 {@code ~/.nexusai/.nexusai/workflows} 扫描 →
-     * 绑定项目的 workflow 命令在前端消失（审计 P4-b）。现由 {@link #loadAllCommands()} 在
+     * 绑定项目的 workflow 命令在前端消失（审计 P4-b）。现由 {@link #loadAllCommands(String)} 在
      * <b>同一次加载</b>中解析一次 cwd（与 {@code getSkillDirCommands(cwd)} 同源，对齐 CC
      * {@code getWorkflowCommands(cwd)} commands.ts:457）并作实参传入，provider 内零 ThreadLocal 读。
      */
     private Function<String, List<Command>> workflowCommandProvider;
     /**
      * P1-2: 动态技能管理器 · 对齐 CC getDynamicSkills（loadSkillsDir.ts:981-983）。
-     * <p>由 {@link #setDynamicSkillsManager} 注入；null 时 {@link #getAllCommands()} 输出不变
+     * <p>由 {@link #setDynamicSkillsManager} 注入；null 时 {@link #getAllCommands(String)} 输出不变
      * （POJO 兼容，现有测试不破）。
      */
     private DynamicSkillsManager dynamicSkillsManager;
@@ -138,7 +144,7 @@ public class SkillRegistry {
     /**
      * 方案1（用户拍板）: DB enabled 主控源 · 用户 skill 启用/禁用写 DB（前端 PATCH
      * {@code /api/command/{id}/toggle} / update enabled → CommandService 写
-     * {@code commandMapper.update}）。{@link #loadAllCommands()} 合并五源后，若本字段注入
+     * {@code commandMapper.update}）。{@link #loadAllCommands(String)} 合并五源后，若本字段注入
      * （生产装配点 ToolRegistrationConfig.skillRegistry()），一次性
      * {@code commandMapper.selectAll()} 建 name→enabled 映射，覆盖同名命令的 <b>enabled</b>
      * 字段（其余字段文件权威）—— 列表合并以本 registry 为权威（getAllCommands /
@@ -149,7 +155,7 @@ public class SkillRegistry {
      * 优先语义，types/command.ts:214-215 {@code isEnabled?.() ?? true}）—— 如 GB/autoMemory
      * 运行时 gate 命令不受 DB toggle 影响。
      *
-     * <p>未注入时 {@link #getAllCommands()} 行为不变（POJO 测试兼容）。
+     * <p>未注入时 {@link #getAllCommands(String)} 行为不变（POJO 测试兼容）。
      */
     private CommandMapper commandMapper;
 
@@ -198,7 +204,7 @@ public class SkillRegistry {
     /**
      * 注入内置插件注册中心（POJO 兼容 · 不改构造器）· 对齐 CC builtinPlugins.
      *
-     * <p>未注入时 {@link #getAllCommands()} 行为不变（POJO 测试兼容）.
+     * <p>未注入时 {@link #getAllCommands(String)} 行为不变（POJO 测试兼容）.
      */
     public void setBuiltinPluginRegistry(BuiltinPluginRegistry builtinPluginRegistry) {
         this.builtinPluginRegistry = builtinPluginRegistry;
@@ -208,10 +214,10 @@ public class SkillRegistry {
      * MPL6: 注入 plugin 加载器（POJO 兼容 · setter）· 对齐 CC getPluginCommands/getPluginSkills
      * 源（loadPluginCommands.ts:414-942）。由 {@link PluginLoader#loadAllEnabledCommands()} /
      * {@link PluginLoader#loadAllEnabledSkills()} 产出 plugin 命令/技能，经
-     * {@link #loadAllCommands()} 按 CC 合并序（bundled→builtinPlugin→FS→pluginCommands→pluginSkills→
+     * {@link #loadAllCommands(String)} 按 CC 合并序（bundled→builtinPlugin→FS→pluginCommands→pluginSkills→
      * dynamic→COMMANDS，commands.ts:460-468）并入。
      *
-     * <p>未注入时 {@link #getAllCommands()} 无 plugin 源，行为不变（POJO 测试兼容）。
+     * <p>未注入时 {@link #getAllCommands(String)} 无 plugin 源，行为不变（POJO 测试兼容）。
      */
     public void setPluginLoader(PluginLoader pluginLoader) {
         this.pluginLoader = pluginLoader;
@@ -229,7 +235,7 @@ public class SkillRegistry {
      * 按 {@code FeatureFlags.workflowScripts()} 门控接线；workflow 域提供真实加载器
      * （createWorkflowCommand 等价物）后注入。
      *
-     * <p>未注入时 {@link #getAllCommands()} 无 workflow 源，行为不变（POJO 测试兼容）。
+     * <p>未注入时 {@link #getAllCommands(String)} 无 workflow 源，行为不变（POJO 测试兼容）。
      *
      * <p><b>[TL-W1 P4]</b>: 入参 = {@code Function<String, List<Command>>}（cwd → workflow 命令）——
      * 显式 projectRoot 由本类加载时解析后传入，provider 内<b>绝不</b>读 ThreadLocal（消费线程含
@@ -247,7 +253,7 @@ public class SkillRegistry {
      * P2-9: 注入 MCP 服务器服务（POJO 兼容 · setter）· CC original: {@code getMcpSkillCommands}
      * commands.ts:547-559 thread-in 源。
      *
-     * <p>MCP 技能不并入 {@link #getAllCommands()}（CC commands.ts:541-546「live outside getCommands」），
+     * <p>MCP 技能不并入 {@link #getAllCommands(String)}（CC commands.ts:541-546「live outside getCommands」），
      * 本字段职责为<b>thread-in 源</b>：{@link #findCommandIncludingMcp} 经
      * {@code mcpServerService.getMcpSkillCommandsForSearch()}（S3 搜索视图，SkillTool.ts:81-94）、
      * {@link #getModelInvocableCommandsForListing} 经 {@code mcpServerService.getMcpSkillCommands()}
@@ -266,7 +272,7 @@ public class SkillRegistry {
      * onChange 回调 → {@link #refresh()}（对齐 CC onDynamicSkillsLoaded → clearCommandMemoizationCaches；
      * 回调方式避免 DynamicSkillsManager → SkillRegistry → DynamicSkillsManager 循环依赖）。
      *
-     * <p>未注入时 {@link #getAllCommands()} 行为不变（POJO 测试兼容）。
+     * <p>未注入时 {@link #getAllCommands(String)} 行为不变（POJO 测试兼容）。
      */
     public void setDynamicSkillsManager(DynamicSkillsManager dynamicSkillsManager) {
         this.dynamicSkillsManager = dynamicSkillsManager;
@@ -290,7 +296,7 @@ public class SkillRegistry {
      * 方案1: 注入 DB enabled 主控源（POJO 兼容 · setter · null 安全）· CommandMapper 是
      * MyBatis-Flex mapper（由 MyBatis 扫描注册为 bean）。
      *
-     * <p>未注入时 {@link #getAllCommands()} 行为不变（POJO 测试兼容，DB 覆盖跳过）。
+     * <p>未注入时 {@link #getAllCommands(String)} 行为不变（POJO 测试兼容，DB 覆盖跳过）。
      */
     public void setCommandMapper(CommandMapper commandMapper) {
         this.commandMapper = commandMapper;
@@ -426,12 +432,12 @@ public class SkillRegistry {
     /**
      * P2-20: 注入 cwd 供应（POJO 兼容 · setter）· 激活文件系统源五源加载。
      *
-     * <p>非 null → {@link #loadAllCommands()} 文件系统块改走 {@link SkillsLoader#getSkillDirCommands(cwd)}
+     * <p>非 null → {@link #loadAllCommands(String)} 文件系统块改走 {@link SkillsLoader#getSkillDirCommands(cwd)}
      * （对齐 CC getCommands → getSkillDirCommands(cwd)，commands.ts:361-367：managed/user/project-up-to-home/
      * additional/legacy 五源 + per-source 门控）；null → 单目录回退 {@link SkillsLoader#loadFromDirectory}
      * （POJO/测试，SkillRegistry(String) 直构不变）。
      */
-    public void setCwdSupplier(Supplier<String> cwdSupplier) {
+    public void setCwdSupplier(Function<String, String> cwdSupplier) {
         if (cwdSupplier != null) {
             this.cwdSupplier = cwdSupplier;
             if (log.isDebugEnabled()) {
@@ -476,36 +482,38 @@ public class SkillRegistry {
      *   <li><b>skillsRoot 分量</b>：构造器注入的固定根，与 projectRoot 组合避免两维度输入串槽。</li>
      * </ul>
      *
-     * <p>与加载 cwd 同源（{@link #loadAllCommands()} 亦取 {@link #cwdSupplier}），杜绝
+     * <p>与加载 cwd 同源（{@link #loadAllCommands(String)} 亦取 {@link #cwdSupplier}），杜绝
      * "键用 cwd A、加载用 cwd B" 双轨（SkillsLoader 内部 cwdSupplier 仅为 cwd 入参为空时的回退，
      * 本方法恒传非空 → 不生效）。
      *
      * @return 当前缓存键（同一实例内同一 (projectRoot, skillsRoot) 组合稳定）
      */
-    private String currentCacheKey() {
-        return resolveSessionCwd() + "|" + skillsRoot;
+    private String currentCacheKey(String sessionId) {
+        return resolveSessionCwd(sessionId) + "|" + skillsRoot;
     }
 
     /**
      * [TL-W1 P4] 会话 cwd 单点解析（键 + 两个加载来源共用）。
      *
-     * <p><b>生产</b>（{@link #setCwdSupplier} 已注入）＝ 注入的 supplier ——
-     * {@code ToolRegistrationConfig} 接线为
-     * {@code () -> SessionProjectRoot.getForSession(RequestContext.sessionId())}
-     * （按会话 sessionId 查全局表现算，<b>不读 ThreadLocal</b>、<b>不回落 config home</b>；
-     * 未绑定会话返回 null）。旧接线为 {@code AutoMemPaths::currentSessionProjectRoot}（ThreadLocal），
-     * 在 REST/异步消费线程上必空 → 回落 {@code ~/.nexusai}（config home）⇒
-     * (a) 扫描不到绑定项目的 project 级技能（前端列表缺条目）；(b) workflow 从
-     * {@code ~/.nexusai/.nexusai/workflows} 扫描（命令消失）；(c) 缓存槽与 loop 线程分裂（重复加载）。
+     * <p><b>生产</b>（{@link #setCwdSupplier} 已注入）＝ 注入的 {@code Function<String,String>} 应用
+     * 显式传入的 {@code sessionId}。{@code ToolRegistrationConfig} 接线为
+     * {@code sessionId -> SessionProjectRoot.getForSession(sessionId)}
+     * （按会话 sessionId 查全局表现算，<b>不读 MDC / 不读 ThreadLocal</b>、<b>不回落 config home</b>；
+     * 未绑定会话返回 null）。历史旧接线为「无参 supplier 内部读裸 MDC 的会话槽」
+     * （第三态可读到别的会话的 id，批 3c 已删）。更早的接线为
+     * {@code AutoMemPaths::currentSessionProjectRoot}（ThreadLocal），在 REST/异步消费线程上必空 →
+     * 回落 {@code ~/.nexusai}（config home）⇒ (a) 扫描不到绑定项目的 project 级技能（前端列表缺条目）；
+     * (b) workflow 从 {@code ~/.nexusai/.nexusai/workflows} 扫描（命令消失）；
+     * (c) 缓存槽与 loop 线程分裂（重复加载）。
      *
      * <p><b>未注入</b>（POJO/测试直构）＝ 维持既有静态回落
      * {@link AutoMemPaths#currentSessionProjectRoot()}（确定性非 null，行为不变）。
      *
-     * @return 会话 cwd；未绑定会话（REST 线程无 sessionId 绑定）→ null（下游 SkillsLoader 自身
-     *         cwdSupplier 回落会话 cwd，非 config home）
+     * @param sessionId 显式会话 ID（调用方传入；非会话来源可传 null）
+     * @return 会话 cwd；未绑定会话 → null（下游 SkillsLoader 自身 cwdSupplier 回落会话 cwd，非 config home）
      */
-    private String resolveSessionCwd() {
-        return cwdSupplier != null ? cwdSupplier.get() : AutoMemPaths.currentSessionProjectRoot();
+    private String resolveSessionCwd(String sessionId) {
+        return cwdSupplier != null ? cwdSupplier.apply(sessionId) : AutoMemPaths.currentSessionProjectRoot();
     }
 
     /**
@@ -527,7 +535,7 @@ public class SkillRegistry {
      *
      * <p>去重规则：同名以首次出现为准（bundled > builtin plugin > filesystem）。
      *
-     * <p>P1-1 memoize（raw）：按 (projectRoot, skillsRoot) 复合键缓存（{@link #currentCacheKey()}，
+     * <p>P1-1 memoize（raw）：按 (projectRoot, skillsRoot) 复合键缓存（{@link #currentCacheKey(String)}，
      * 对齐 CC {@code loadAllCommands = memoize(cwd)} commands.ts:449），磁盘变更仅在 {@link #refresh()}
      * 后可见（MCP 分离 thread-in，不落缓存）。
      *
@@ -535,7 +543,7 @@ public class SkillRegistry {
      * 「The expensive loading is memoized, but availability and isEnabled checks run fresh every call」+
      * commands.ts:484 {@code meetsAvailabilityRequirement(_) && isCommandEnabled(_)}）。
      * <ul>
-     *   <li><b>raw 仍 memoize</b>：{@link #loadAllCommands()} 结果缓存于 {@link #allCommandsCache}，
+     *   <li><b>raw 仍 memoize</b>：{@link #loadAllCommands(String)} 结果缓存于 {@link #allCommandsCache}，
      *       过滤结果不缓存（不把 gate 冻结进缓存）。</li>
      *   <li><b>过滤语义</b>：{@code Command.isCommandEnabled()} = isEnabled supplier（惰性）非 null 求值，
      *       否则回退 enabled 字段（CC {@code isEnabled?.() ?? true}，types/command.ts:214-215）。
@@ -545,11 +553,12 @@ public class SkillRegistry {
      *       raw memoize 保证（磁盘变更 refresh() 前不可见），与 CC 一致。</li>
      * </ul>
      */
-    public List<Command> getAllCommands() {
+    public List<Command> getAllCommands(String sessionId) {
         // CC original: loadAllCommands = memoize(async (cwd) => {...})（commands.ts:449）
         // Java 等价：by-(projectRoot, skillsRoot) 复合键缓存（currentCacheKey()，IMP-E）。computeIfAbsent
         // 单键单飞（ConcurrentHashMap 无同 map 递归：loadAllCommands 不回调 getAllCommands）。
-        List<Command> raw = allCommandsCache.computeIfAbsent(currentCacheKey(), k -> loadAllCommands());
+        List<Command> raw = allCommandsCache.computeIfAbsent(currentCacheKey(sessionId),
+            k -> loadAllCommands(sessionId));
         // P3-3: availability 先于 isEnabled 求值（CC commands.ts:484 filter
         // `meetsAvailabilityRequirement(_) && isCommandEnabled(_)` + :411-416 注释「This runs before
         // isEnabled()… provider-gated commands are hidden regardless of feature-flag state」）。
@@ -622,7 +631,7 @@ public class SkillRegistry {
      *
      * <p><b>双门控共存（非双实现漂移，concern DEC-8）</b>：
      * <ul>
-     *   <li><b>内部链</b> {@link #getAllCommands()} 认证门控（{@link #meetsAvailabilityRequirement}
+     *   <li><b>内部链</b> {@link #getAllCommands(String)} 认证门控（{@link #meetsAvailabilityRequirement}
      *       :377-401）——信号源 = {@link AvailabilityAuthState} auth 态（isClaudeAISubscriber /
      *       isUsing3PServices / isFirstPartyAnthropicBaseUrl），agent 循环<b>无请求上下文</b>，
      *       不可注入请求头，维持 CC commands.ts:484 对齐。</li>
@@ -718,7 +727,7 @@ public class SkillRegistry {
      *
      * @return 合并后不可变命令列表（纯本地/bundled/builtinPlugin/dynamic/COMMANDS 五源 + DB enabled 主控覆盖，不含 MCP）
      */
-    private List<Command> loadAllCommands() {
+    private List<Command> loadAllCommands(String sessionId) {
         Map<String, Command> byName = new LinkedHashMap<>();
 
         // 1. 捆绑技能（最高优先级）· 对齐 CC bundledSkills（commands.ts:374-375 同步源，外层防御兜底）
@@ -751,11 +760,11 @@ public class SkillRegistry {
         //   P2-20：cwdSupplier 注入（生产）→ 五源 getSkillDirCommands(cwd)（managed/user/project/additional/legacy）；
         //   null（POJO/测试）→ 单目录 loadFromDirectory(skillsRoot) 回退。
         // [TL-W1 P4] 本次加载的会话 cwd 解析**一次**（键与两个来源同源，杜绝「键用 A、加载用 B」）——
-        //   cwdSupplier（生产 = SessionProjectRoot.getForSession(RequestContext.sessionId())，按会话
-        //   sessionId 现算、未绑定返回 null，不回读 ThreadLocal、不回落 config home）优先；
+        //   cwdSupplier（生产 = SessionProjectRoot.getForSession(显式 sessionId 形参)，按会话
+        //   sessionId 现算、未绑定返回 null，不回读 MDC/ThreadLocal、不回落 config home）优先；
         //   未注入（POJO/测试直构）→ 维持既有静态回落 AutoMemPaths.currentSessionProjectRoot()。
         //   null（REST 线程无会话绑定）→ 交由 SkillsLoader 自身默认 cwdSupplier 回落会话 cwd。
-        String sessionCwd = resolveSessionCwd();
+        String sessionCwd = resolveSessionCwd(sessionId);
         try {
             List<Command> fsSkills = cwdSupplier != null
                 ? loader.getSkillDirCommands(sessionCwd)
@@ -939,7 +948,7 @@ public class SkillRegistry {
 
         if (log.isDebugEnabled()) {
             log.debug("[SkillRegistry] loadAllCommands 汇总 {} 个命令 (五源+DB 主控，缓存键={})",
-                byName.size(), currentCacheKey());
+                byName.size(), currentCacheKey(sessionId));
         }
         return Collections.unmodifiableList(new ArrayList<>(byName.values()));
     }
@@ -1015,15 +1024,15 @@ public class SkillRegistry {
      * 对齐 CC attachments.ts:2677-2682 {@code uniqBy([...localCommands, ...mcpSkills], 'name')}）。
      * loadedFrom∈{BUNDLED,SKILLS,COMMANDS_DEPRECATED} 在 allowlist 免显式描述自动放行（CC :574-576）。
      *
-     * <p>P1-1 memoize：结果按 (projectRoot, skillsRoot) 复合键独立缓存（{@link #currentCacheKey()}，
+     * <p>P1-1 memoize：结果按 (projectRoot, skillsRoot) 复合键独立缓存（{@link #currentCacheKey(String)}，
      * 对齐 CC {@code getSkillToolCommands} 独立 memoize 层 commands.ts:563）；实现用 get-then-putIfAbsent
      * （非对同一 map 递归 computeIfAbsent，规避 ConcurrentHashMap 'Recursive update'）。
      */
-    public List<Command> getModelInvocableCommands() {
-        String key = currentCacheKey();
+    public List<Command> getModelInvocableCommands(String sessionId) {
+        String key = currentCacheKey(sessionId);
         List<Command> cached = modelInvocableCache.get(key);
         if (cached == null) {
-            List<Command> all = getAllCommands();
+            List<Command> all = getAllCommands(sessionId);
             List<Command> computed = all.stream()
                 .filter(c -> "prompt".equals(c.getType()))
                 .filter(c -> !Boolean.TRUE.equals(c.getDisableModelInvocation()))
@@ -1051,7 +1060,7 @@ public class SkillRegistry {
      *
      * <p>MCP 技能 live outside getCommands（commands.ts:541-546），SkillTool 的 validateInput/
      * checkPermissions/call 三处搜索基座均为 getAllCommands(context) = {@code uniqBy([...localCommands,
-     * ...mcpSkills], 'name')}（SkillTool.ts:86/:93）。Java 等价：本地 {@link #getAllCommands()} +
+     * ...mcpSkills], 'name')}（SkillTool.ts:86/:93）。Java 等价：本地 {@link #getAllCommands(String)} +
      * {@code mcpServerService.getMcpSkillCommandsForSearch()} 按 name 去重（local-first，同名本地胜）
      * 后复用三维匹配（name/userFacingName/aliases）。
      *
@@ -1074,10 +1083,10 @@ public class SkillRegistry {
      * @param name 命令名（前导 '/' 自动剥除）
      * @return 命中命令；未命中返回 null
      */
-    public Command findCommandIncludingMcp(String name) {
+    public Command findCommandIncludingMcp(String name, String sessionId) {
         if (name == null || name.isBlank()) return null;
         String normalized = name.startsWith("/") ? name.substring(1) : name;
-        List<Command> local = getAllCommands();
+        List<Command> local = getAllCommands(sessionId);
         if (mcpServerService == null) {
             return findCommandIn(normalized, local);
         }
@@ -1101,7 +1110,7 @@ public class SkillRegistry {
      * {@code localCommands = getSkillToolCommands(cwd)} + {@code mcpSkills = getMcpSkillCommands(...)}
      * → {@code uniqBy([...localCommands, ...mcpSkills], 'name')}。
      *
-     * <p>skill_listing attachment 的数据源（LlmAgentLoop 注入侧）：本地视图 = {@link #getModelInvocableCommands()}
+     * <p>skill_listing attachment 的数据源（LlmAgentLoop 注入侧）：本地视图 = {@link #getModelInvocableCommands(String)}
      * （对齐 CC getSkillToolCommands commands.ts:563-581），MCP 视图 = getMcpSkillCommands
      * （对齐 CC commands.ts:547-559），按 name 去重 local-first。
      *
@@ -1109,8 +1118,8 @@ public class SkillRegistry {
      *
      * @return 模型可调用命令 + MCP 技能的合并列表（本地优先，按 name 去重）
      */
-    public List<Command> getModelInvocableCommandsForListing() {
-        List<Command> local = getModelInvocableCommands();
+    public List<Command> getModelInvocableCommandsForListing(String sessionId) {
+        List<Command> local = getModelInvocableCommands(sessionId);
         if (mcpServerService == null) {
             return local;
         }
@@ -1177,26 +1186,26 @@ public class SkillRegistry {
      * 本过滤从数据源上就不含 MCP）。builtinPlugin 技能 source/loadedFrom=BUNDLED（builtinPlugins.ts:149-150）
      * 在集合内。
      *
-     * <p>P2-3 memoize：按 (projectRoot, skillsRoot) 复合键独立缓存（{@link #currentCacheKey()}，对齐
+     * <p>P2-3 memoize：按 (projectRoot, skillsRoot) 复合键独立缓存（{@link #currentCacheKey(String)}，对齐
      * CC {@code getSlashCommandToolSkills = memoize}
      * commands.ts:586）；get-then-putIfAbsent（非 computeIfAbsent，规避 ConcurrentHashMap
      * 'Recursive update'）；{@link #refresh()} / {@link #setSkillsRoot} 显式清空。
      *
-     * <p>P3-2 恒不抛契约（CC commands.ts:600-605）：compute 块（{@link #getAllCommands()} + 过滤链）
+     * <p>P3-2 恒不抛契约（CC commands.ts:600-605）：compute 块（{@link #getAllCommands(String)} + 过滤链）
      * 包入 try-catch；加载失败（如 isCommandEnabled 门控 BooleanSupplier 抛错，Command.java:362-364
      * 惰性求值传播）→ log.warn（对齐 CC logError）+ log.debug（对齐 CC logForDebugging 'Returning empty
      * skills array due to load failure'）+ 缓存空列表（对齐 CC memoize 缓存失败解析值 []）+ 返回空列表。
      * 方法对外恒不抛 —— 技能加载失败不得拖垮 getSkillInfo/调用方（CC :602 注释「skills are non-critical」）；
      * 错误结果经 {@link #refresh()} 失效（与既有 refresh 清空三层缓存语义一致）。
      */
-    public List<Command> getSlashCommandToolSkills() {
-        String key = currentCacheKey();
+    public List<Command> getSlashCommandToolSkills(String sessionId) {
+        String key = currentCacheKey(sessionId);
         List<Command> cached = slashCommandToolSkillsCache.get(key);
         if (cached == null) {
             // 对齐 CC commands.ts:588-599 try 块（getCommands + filter）——加载失败不抛，缓存空列表并
             // 返回 []（CC commands.ts:600-605 恒不抛契约，技能加载失败不得拖垮 getSkillInfo/调用方）。
             try {
-                List<Command> all = getAllCommands();
+                List<Command> all = getAllCommands(sessionId);
                 List<Command> computed = all.stream()
                     .filter(c -> "prompt".equals(c.getType()))
                     .filter(c -> c.getSource() != CommandSource.BUILTIN)
@@ -1237,7 +1246,7 @@ public class SkillRegistry {
      * {@code getCommandName(_) === commandName}（:695）③ {@code _.aliases?.includes(commandName)}（:696）。
      * {@code getCommandName} = {@code cmd.userFacingName?.() ?? cmd.name}（types/command.ts:209-211），
      * Java 侧等价物为 {@link Command#userFacingName()}（displayName 空回退 name）。
-     * CC {@code Array.find} → 首个命中者胜，命中顺序 = {@link #getAllCommands()} 加载序
+     * CC {@code Array.find} → 首个命中者胜，命中顺序 = {@link #getAllCommands(String)} 加载序
      * （bundled→builtinPlugin→FS→dynamic→COMMANDS，与 CC 合并序一致；P2-9 分离后 MCP 不在此序，
      * 含 MCP 的搜索基座走 {@link #findCommandIncludingMcp}）。DEC-9：内置命令经本方法可
      * findCommand('clear') 命中（source=BUILTIN 仍进 findCommand 消费面，仅模型/斜杠过滤排除）。
@@ -1245,11 +1254,11 @@ public class SkillRegistry {
      * <p>前导 '/' 归一化保留 Java 内部（CC 在调用方剥 —— SkillTool.ts:437-438
      * {@code trimmed.startsWith('/') ? trimmed.substring(1) : trimmed}），净行为等价，不做本项迁移。
      */
-    public Command findCommand(String name) {
+    public Command findCommand(String name, String sessionId) {
         if (name == null || name.isBlank()) return null;
         // 去掉前导 /
         String normalized = name.startsWith("/") ? name.substring(1) : name;
-        List<Command> all = getAllCommands();
+        List<Command> all = getAllCommands(sessionId);
         Command hit = findCommandIn(normalized, all);
         if (hit == null && log.isDebugEnabled()) {
             log.debug("[SkillRegistry] findCommand({}) 未命中: 已扫描 {} 个命令 (三维匹配 name/userFacingName/aliases 均未命中)",
@@ -1261,8 +1270,8 @@ public class SkillRegistry {
     /**
      * 检查命令是否存在 · 对齐 CC hasCommand()
      */
-    public boolean hasCommand(String name) {
-        return findCommand(name) != null;
+    public boolean hasCommand(String name, String sessionId) {
+        return findCommand(name, sessionId) != null;
     }
 
     /**

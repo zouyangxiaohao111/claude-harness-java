@@ -5,7 +5,6 @@ import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.application.agent.cost.ModelCostCalculator;
 import com.nexusai.application.agent.tool.AgentUsage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -73,7 +72,6 @@ class PartialCompactSessionCostWiringTest {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         CompactProgressState.clear();
         CompactProgressState.clearAbort();
         CompactProgressState.removeSessionAbort(SESSION);

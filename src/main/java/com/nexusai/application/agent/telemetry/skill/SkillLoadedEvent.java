@@ -32,8 +32,9 @@ import java.util.Map;
  *
  * <p><b>Java 等价物</b>：
  * <ul>
- *   <li>{@code getSkillToolCommands(cwd)} → {@code SkillRegistry.getModelInvocableCommands()}
- *       （P1-9，commands.ts:563-581 等价，纯本地模型可调用命令，MCP 在 getCommands 之外）</li>
+ *   <li>{@code getSkillToolCommands(cwd)} → {@code SkillRegistry.getModelInvocableCommands(sessionId)}
+ *       （P1-9，commands.ts:563-581 等价，纯本地模型可调用命令，MCP 在 getCommands 之外；[批 3c]
+ *       会话标识由调用方显式传入 —— CC 侧即 cwd 显式入参，取代已删的裸 MDC 会话槽）</li>
  *   <li>{@code getCharBudget(contextWindowTokens)} → {@code SkillCatalog.getCharBudget(Integer)}
  *       （P2-19 动态预算）</li>
  *   <li>枚举 → CC camelCase 字符串：{@link #skillSourceCcValue}（P2-19 拆分后
@@ -61,7 +62,8 @@ public final class SkillLoadedEvent {
      *
      * @param telemetry  遥测适配层（可为 null → 跳过）
      * @param skills     模型可调用命令列表（CC getSkillToolCommands 产物；等价
-     *                   {@code SkillRegistry.getModelInvocableCommands()}）
+     *                   {@code SkillRegistry.getModelInvocableCommands(sessionId)}，会话标识由调用方
+     *                   显式传入 —— 本类只消费结果，不解析会话）
      * @param skillBudget 技能清单字符预算（CC getCharBudget 产物；等价
      *                   {@code SkillCatalog.getCharBudget(contextWindowTokens)}）
      */

@@ -70,7 +70,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("universal-skill", null));
 
         // 默认 AvailabilityAuthState（subscriber=false / using3P=false / firstParty=true）
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null（本类各用例只验 availability 门控，不涉会话）
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .contains("universal-skill");
     }
@@ -81,12 +82,13 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("claude-skill", List.of(CommandAvailability.CLAUDE_AI)));
 
         setAuthState(true, false, true);
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .contains("claude-skill");
 
         setAuthState(false, false, true);
-        assertThat(registry.getAllCommands())
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("claude-skill");
     }
@@ -97,7 +99,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("console-skill", List.of(CommandAvailability.CONSOLE)));
 
         setAuthState(false, false, true);
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .contains("console-skill");
     }
@@ -108,7 +111,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("console-3p", List.of(CommandAvailability.CONSOLE)));
 
         setAuthState(false, true, true);
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("console-3p");
     }
@@ -119,7 +123,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("console-proxy", List.of(CommandAvailability.CONSOLE)));
 
         setAuthState(false, false, false);
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("console-proxy");
     }
@@ -130,7 +135,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("console-sub", List.of(CommandAvailability.CONSOLE)));
 
         setAuthState(true, false, true);
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("console-sub");
     }
@@ -141,7 +147,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("dyn-claude", List.of(CommandAvailability.CLAUDE_AI)));
 
         // 默认 auth state（subscriber=false）→ claude-ai 门控排除（对齐 CC dynamicSkills 独立过滤）
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("dyn-claude");
     }
@@ -152,7 +159,8 @@ class SkillRegistryAvailabilityGateTest {
         injectDynamicSkill(command("empty-avail", List.of()));
 
         setAuthState(false, false, true);
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("empty-avail");
     }

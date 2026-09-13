@@ -60,7 +60,8 @@ class SkillRegistryTest {
 
         SkillRegistry registry = config.skillRegistry();
 
-        List<String> names = registry.getAllCommands().stream().map(Command::getName).toList();
+        // [批 3c] 无会话 → 显式 null（本用例只验 pluginLoader feed 合并面，不涉会话）
+        List<String> names = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(names)
             .as("生产 getAllCommands 含 plugin 命令 + 技能（CC getPluginCommands/getPluginSkills feed）")
             .contains("plugin:acme:hello", "plugin:acme:skill-x");
@@ -71,7 +72,8 @@ class SkillRegistryTest {
     void unwiredSkillRegistry_keepsBehaviorUnchanged() {
         SkillRegistry registry = config.skillRegistry();
 
-        List<String> names = registry.getAllCommands().stream().map(Command::getName).toList();
+        // [批 3c] 无会话 → 显式 null
+        List<String> names = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(names)
             .as("未注入 pluginLoader 时行为不变：getAllCommands 不含 plugin 源")
             .doesNotContain("plugin:acme:hello", "plugin:acme:skill-x");

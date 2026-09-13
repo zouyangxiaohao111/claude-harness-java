@@ -60,7 +60,6 @@ import com.nexusai.application.agent.tool.impl.SnipTool;
 import com.nexusai.application.agent.tool.impl.TestingPermissionTool;
 import com.nexusai.application.agent.workflow.command.WorkflowCommandLoader;
 import com.nexusai.application.agent.workflow.wiring.WorkflowToolWiring;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.mcp.McpServerService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -381,29 +380,31 @@ public class ToolRegistrationConfig {
      */
     private void invalidateActiveSessionSystemPromptSections(String trigger) {
         if (sessionAgentStateRegistry == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[ToolRegistrationConfig] {} 失效接线：SessionAgentStateRegistry 未接线 → 跳过", trigger);
-            }
+            log.warn("[ToolRegistrationConfig] {} 失效接线：SessionAgentStateRegistry 未接线 → 跳过"
+                + "（工具清单变化后 sections 可能保持陈旧，对齐 CC clearSystemPromptSections 语义未生效）", trigger);
             return;
         }
-        String sessionIdStr = com.nexusai.common.RequestContext.sessionId();
-        if (sessionIdStr == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[ToolRegistrationConfig] {} 失效接线：启动期无会话（MDC 无 sessionId）→ no-op（CC 语义：工具清单变化后 sections 重算）", trigger);
-            }
+        // [批 3c · 2026-09-13] 原实现用裸 MDC 取「当前会话」再清其 section 缓存；该读点已随批 3c
+        //   删除（MDC 第三态可能读到别的会话的 id）。现改为**按会话键遍历全部活跃会话**——不引入
+        //   任何环境态会话槽，且更贴近 CC：CC clearSystemPromptSections()（systemPromptSections.ts:65）
+        //   清的是进程级 STATE.systemPromptSectionCache（state.ts:1639，无 session 维度），本仓缓存
+        //   下放到 AgentState（per-session）⇒「清全部活跃会话」是 CC 进程级清空的对等翻译。
+        List<AgentState> active = sessionAgentStateRegistry.snapshot();
+        if (active.isEmpty()) {
+            log.info("[ToolRegistrationConfig] {} 失效接线：当前无活跃会话 → 无需清空"
+                + "（启动期注册表为空，运行中工具集变化时按活跃会话清；对齐 CC clearSystemPromptSections）", trigger);
             return;
         }
-        // [session-id-short] MDC sessionId 已 short 直键 registry（不再 UUID.fromString）
-        AgentState state = sessionAgentStateRegistry.get(sessionIdStr);
-        if (state == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[ToolRegistrationConfig] {} 失效接线：会话 {} 无活跃 AgentState → 跳过", trigger, sessionIdStr);
+        int cleared = 0;
+        for (AgentState state : active) {
+            if (state != null) {
+                state.systemPromptSectionCache().clear();
+                cleared++;
             }
-            return;
         }
-        state.systemPromptSectionCache().clear();
-        log.info("[ToolRegistrationConfig] {} 失效接线：会话 {} 的 system prompt section 缓存已清空（工具清单变化 → sections 重算）",
-            trigger, sessionIdStr);
+        log.info("[ToolRegistrationConfig] {} 失效接线：已清空 {} 个活跃会话的 system prompt section 缓存"
+            + "（工具清单变化 → sections 重算；批 3c 起为全活跃会话，对齐 CC 进程级 clearSystemPromptSections）",
+            trigger, cleared);
     }
 
     /**
@@ -536,16 +537,18 @@ public class ToolRegistrationConfig {
         //   additionalDirectoriesSupplier 等价 CC getAdditionalDirectoriesForClaudeMd（--add-dir，state.ts:206-207），
         //   Java 无 CLI 会话态 → env CLAUDE_CODE_ADDITIONAL_DIRECTORIES 供源（concern #1 option A）。
         // ODF-A1: 技能加载 cwd = 会话 projectRoot（CC getSkillDirCommands(cwd) · per-session）
-        // [TL-W1 P4] 改按**会话 sessionId 现算**（SessionProjectRoot.getForSession：未绑定返回 null，
-        //   不读 ThreadLocal、不回落 config home）——旧接线 AutoMemPaths::currentSessionProjectRoot 是
-        //   ThreadLocal，消费线程（REST：SkillController/CommandController/CommandRegistrationConfig28
+        // [TL-W1 P4] 按**会话 sessionId 现算**（SessionProjectRoot.getForSession：未绑定返回 null，
+        //   不读 MDC/ThreadLocal、不回落 config home）——旧接线 AutoMemPaths::currentSessionProjectRoot
+        //   是 ThreadLocal，消费线程（REST：SkillController/CommandController/CommandRegistrationConfig28
         //   /skills handler）必空 ⇒ 回落 ~/.nexusai：扫描不到绑定项目的 project 级技能（前端列表缺条目）、
         //   workflow 从 ~/.nexusai/.nexusai/workflows 扫描（命令消失）、缓存槽与 loop 线程分裂（重复加载）。
-        //   REST 入口经可选 sessionId 查询参数写入 RequestContext（SkillController/CommandController
-        //   的 list 端点，CommandController:352-363 既有先例）；无绑定 → null → SkillsLoader 自身
-        //   cwdSupplier 回落会话 cwd（user.dir 兜底），非 config home。
-        registry.setCwdSupplier(() -> com.nexusai.common.SessionProjectRoot
-            .getForSession(com.nexusai.common.RequestContext.sessionId()));
+        //  [批 3c · 2026-09-13] 上一版接线为 `() -> SessionProjectRoot.getForSession(MDC 的 sessionId)`
+        //   —— 会话标识取自**裸 MDC**（第三态可读到别的会话的 id），该读点已删。现签名改
+        //   `Function<String,String>`：sessionId 由**调用方显式传入**（SkillRegistry 各查询方法新增的
+        //   sessionId 形参，从 REST 端点的必填 sessionId / 循环的 AgentState.sessionId() 穿透）。
+        //   无绑定 → null → SkillsLoader 自身 cwdSupplier 回落进程 user.dir，非 config home。
+        registry.setCwdSupplier(sessionId -> com.nexusai.common.SessionProjectRoot
+            .getForSession(sessionId));
         registry.setAdditionalDirectoriesSupplier(com.nexusai.application.agent.skill.ClaudePaths::getAdditionalDirectoriesFromEnv);
         // P2-2: user/project 技能源加载开关接线（CC isSettingSourceEnabled，settings/constants.ts:174-177；
         //   Java Web 无 CLI --settings，concern #2 补开关，yml nexusai.skill.sources.* 默认 true 对齐 CC 全源启用）
@@ -569,7 +572,7 @@ public class ToolRegistrationConfig {
             // [TL-W1 P4] 原为 AutoMemPaths.currentSessionProjectRoot()（构造期即时求值 → bean 启动
             //   线程无 ThreadLocal → 恒打印 ~/.nexusai，且标签写 cwdSupplier 却与真实会话解析值不等）。
             //   现打印解析策略（惰性、按会话 sessionId 现算），不再造 ThreadLocal 读点。
-            "SessionProjectRoot.getForSession(RequestContext.sessionId())（惰性·按会话现算，不读 ThreadLocal）",
+            "SessionProjectRoot.getForSession(显式 sessionId 形参)（惰性·按会话现算，不读 MDC/ThreadLocal）",
             skillDiscoveryPrefetch != null,
             commandMapper != null);
         return registry;
@@ -1316,7 +1319,10 @@ public class ToolRegistrationConfig {
         //   双门控开启，但 getMemoryFiles 入口恒不注入 TeamMem（△-5/T-1 根因）——本接线闭环。
         com.nexusai.application.agent.context.ClaudemdEngine engine =
             new com.nexusai.application.agent.context.ClaudemdEngine(autoMemPaths, memoryFileDetection,
-                com.nexusai.application.agent.agent.CwdResolution::getOriginalCwdLayer,
+                // [drop-requestcontext] 扫描根按**显式 sessionId** 现算（批 3c 曾固定传无参解析 →
+                //   CLAUDE.md 扫描根退化为进程 user.dir，会话绑定项目不可达）。无会话入参由
+                //   ClaudemdEngine.resolveOriginalCwd 一次性 WARN 后兜底 user.dir。
+                sessionId -> com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayer(sessionId),
                 () -> true, () -> true, () -> true,
                 () -> featureFlags != null && featureFlags.teamMem(),
                 () -> List.of());
@@ -1485,6 +1491,12 @@ public class ToolRegistrationConfig {
             () -> featureFlags != null && featureFlags.tenguMothCopse(),   // FIX-FR 真实门控（nexusai.feature.tengu-moth-copse 属性）
             // 惰性 supplier：bean 装配期不得强制解析 subagentTool（@Lazy 代理 + AgentLoopContextFactory
             // 循环依赖防护）—— 预取运行时（bean 已就绪）才经代理取 registry
+            // [批 3c 未决项] 本 supplier 与 MemoryPrefetcher 均无会话形参（bean 级装配，装配期/预取调用
+            //   点都拿不到会话）→ 经无参 SubagentTool.agentRegistry() 得<b>进程默认</b>（workspaceDir）
+            //   agent-defs；原会话源（裸 MDC）已按批 3c 删除。待决策：给
+            //   MemoryPrefetcher.startPrefetch(...) 加 sessionId 形参（来源 = LlmAgentLoop 的
+            //   params.toolUseContext().sessionId()）并把本 supplier 改成 Function<String,Registry> ——
+            //   会触及 MemoryPrefetcherTest 的 13 处调用点，超出批 3c 文件授权，故保持原样。
             () -> subagentTool != null ? subagentTool.agentRegistry() : null,
             agentMemoryDirectory);
     }
@@ -2277,9 +2289,15 @@ public class ToolRegistrationConfig {
         // [Fix-P1 HIGH] /compact 迁移到 result handler：type=local 经拦截器 local 分支 →
         //   dispatchResult 回传 text（compact 的 displayText），ChatService 落库 + 推 <local-command-stdout>，
         //   修复 void handler 下 /compact 对用户静默（用户只见气泡 + 状态 idle、零输出）。
-        dispatcher.registerSlashCommandResult("compact", args ->
+        // [批 3c · 2026-09-13] handler 形参由 `args` 扩为 `(args, sessionId, inFlightUserMessageId)`：
+        //   会话标识原经裸 MDC 读取（`handleCompactCommand` 的 sessionId / `rebuildIdleStateFromDb`
+        //   的在途用户消息 id，二者原经已删的 MDC 会话槽取得）⇒ 现由分派入口显式传入
+        //   （SlashCommandInterceptor 有 sessionId + userMessageId；REST 直调 CommandController 传
+        //   sessionId + null）。对齐 CC `mod.call(args, context)` 的 context 显式携带语义。
+        dispatcher.registerSlashCommandResult("compact", (args, sessionId, inFlightUserMessageId) ->
             UserInputDispatcher.LocalCommandResult.text(
-                handleCompactCommand(args, sessionRegistry, reactiveCompactor, streamCompactSummary,
+                handleCompactCommand(args, sessionId, inFlightUserMessageId,
+                    sessionRegistry, reactiveCompactor, streamCompactSummary,
                     sessionMemoryService, claudemdEngine, skillCatalog, configSupplier, telemetry,
                     settingsResolver, messageService)));
         log.info("[R1] /compact 已注册为生产 slash command · "
@@ -2297,7 +2315,7 @@ public class ToolRegistrationConfig {
      *
      * <p>CC context 构造（Java 等价）：
      * <ol>
-     *   <li>session 解析：RequestContext.sessionId（ChatService 已 set MDC，short 直键）
+     *   <li>session 解析：分派入口显式传入的 sessionId（short 直键；批 3c 起不再读 MDC）
      *       → SessionAgentStateRegistry.get（[session-id-short] 不再 parseSessionUuid）</li>
      *   <li>AgentState 未注册 → log.warn fail loud，不静默当压缩成功</li>
      *   <li>构造 {@link CompactCommandContext}：messages=state.rawMessages()，SM=sessionMemoryService
@@ -2324,6 +2342,8 @@ public class ToolRegistrationConfig {
      *                         维持「会话未注册 AgentState」fail-loud）
      */
     private String handleCompactCommand(String args,
+                                        String sessionId,
+                                        String inFlightUserMessageId,
                                         SessionAgentStateRegistry sessionRegistry,
                                         ReactiveCompactor reactiveCompactor,
                                         StreamCompactSummary streamCompactSummary,
@@ -2347,10 +2367,14 @@ public class ToolRegistrationConfig {
                 + isEnvTruthy(System.getenv("DISABLE_COMPACT"))
                 + ", db=" + (settingsResolver != null ? settingsResolver.disableCompact() : "null") + "）。";
         }
-        // ── 2. session 解析（RequestContext MDC，ChatService 已 set）──
-        String rawSessionId = RequestContext.sessionId();
+        // ── 2. session 解析（[批 3c] 由分派入口**显式传入**的会话标识）──
+        //   原为裸 MDC 会话槽（ChatService 已 set）—— 第三态可读到别的会话 id，
+        //   已随批 3c 删除。现由 UserInputDispatcher 分派时显式传入（SlashCommandInterceptor 取本轮
+        //   sessionId；CommandController REST 取必填 ?sessionId=）。
+        String rawSessionId = sessionId;
         if (rawSessionId == null || rawSessionId.isBlank()) {
-            log.warn("[R1] /compact 无法解析当前 session（RequestContext.sessionId 为空），跳过压缩");
+            log.warn("[R1] /compact 无法解析当前 session（分派入口未传 sessionId），跳过压缩"
+                + "（会话态显式化：批 3c 起不再回落 MDC）");
             return "/compact 无法解析当前 session（无请求上下文）。";
         }
         // [session-id-short] rawSessionId 已 short 直键 registry（不再 parseSessionUuid）
@@ -2366,7 +2390,7 @@ public class ToolRegistrationConfig {
         // 生命周期所有者，注册后既会与在飞主循环的 live state 互相覆盖，又无回收点（会话删除才清）。
         boolean stateRebuiltFromDb = false;
         if (state == null) {
-            state = rebuildIdleStateFromDb(rawSessionId, messageService);
+            state = rebuildIdleStateFromDb(rawSessionId, inFlightUserMessageId, messageService);
             stateRebuiltFromDb = state != null;
         }
         if (state == null) {
@@ -2376,10 +2400,11 @@ public class ToolRegistrationConfig {
             return "/compact 会话未注册 AgentState（无进行中循环），且无法从历史重建"
                 + "（messageService 未注入或会话不存在）。";
         }
-        String sessionId = state.sessionId() != null ? state.sessionId() : rawSessionId;
+        // [批 3c] 局部名与新增形参 sessionId 区分：优先用 state 的会话（重建的临时 state 亦带 rawSessionId）
+        String effectiveSessionId = state.sessionId() != null ? state.sessionId() : rawSessionId;
         String agentId = state.agentId() != null ? state.agentId().toString() : null;
         if (state.rawMessages() == null) {
-            log.warn("[R1] /compact 会话消息为空（state.rawMessages()=null）: sessionId={}，跳过压缩", sessionId);
+            log.warn("[R1] /compact 会话消息为空（state.rawMessages()=null）: sessionId={}，跳过压缩", effectiveSessionId);
             return "/compact 会话消息为空。";
         }
         // ── 3. 构造 CompactCommandContext + 调用（compact.ts:40 call）──
@@ -2548,7 +2573,8 @@ public class ToolRegistrationConfig {
      * <h2>在途命令行的排除（CC 对齐）</h2>
      * {@code ChatController.send → MessageService.createUserMessage}（{@code ChatController:149}）在命令
      * dispatch <b>之前</b>已把 {@code /compact} 这行 user 消息落库，并经
-     * {@code ChatService.processUserMessage:624} 把它作为 {@code RequestContext.requestId()} 带下来。
+     * {@code ChatService.processUserMessage} 把它作为<b>在途用户消息 id</b> 一路显式带下来
+     * （批 3c 前经已删的 MDC reqId 槽，现经 UserInputDispatcher 的 handler 形参）。
      * CC 侧 {@code /compact} 的 userMessage 是在<b>压缩完成之后</b>才拼进 {@code messagesToKeep}
      * （{@code processSlashCommand.tsx:859} 创建、{@code :883-895} 追加）→ 压缩输入不含自身。故此处
      * 同样排除它（连同其触发的 INTERRUPTED_PROMPT "Continue" sentinel 一起消失）。
@@ -2579,6 +2605,7 @@ public class ToolRegistrationConfig {
      *         读取失败 / 通道缺失 → null（调用方 fail-loud 报「无法从历史重建」）
      */
     AgentState rebuildIdleStateFromDb(String rawSessionId,
+                                      String inFlightUserMessageId,
                                       com.nexusai.domain.session.MessageService messageService) {
         if (messageService == null || rawSessionId == null || rawSessionId.isBlank()) {
             return null;
@@ -2596,11 +2623,13 @@ public class ToolRegistrationConfig {
         if (raw == null) {
             raw = List.of();
         }
-        // 在途 /compact 行排除（守卫：仅当 requestId 就是本转录末条消息 id —— 见 javadoc）
+        // 在途 /compact 行排除（守卫：仅当 in-flight user message id 就是本转录末条消息 id —— 见 javadoc）
+        // [批 3c] 原读裸 MDC 的 reqId 槽（= ChatService set 的 userMessageId），该槽已删；
+        //   现由分派入口显式传入。null = 非用户消息驱动的分派（如 REST 直调 /compact）→ 守卫不生效，
+        //   属**合法缺值**（该路径本就不存在「在途用户气泡」），已在调用点 log.warn 留痕。
         String excludeId = null;
         if (!raw.isEmpty()) {
             com.nexusai.model.session.dto.ChatMessageDto tail = raw.get(raw.size() - 1);
-            String inFlightUserMessageId = RequestContext.requestId();
             if (tail != null && inFlightUserMessageId != null
                     && inFlightUserMessageId.equals(tail.id())) {
                 excludeId = inFlightUserMessageId;
@@ -2873,7 +2902,8 @@ public class ToolRegistrationConfig {
             com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine) {
         return new SystemPromptContextProvider(
             state.sessionStartDate(),
-            new UserContextProvider(claudemdEngine),
+            // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析（见 UserContextProvider javadoc）
+            new UserContextProvider(claudemdEngine, state != null ? state.sessionId() : null),
             new GitStatusProvider());
     }
 
@@ -2902,9 +2932,12 @@ public class ToolRegistrationConfig {
         final java.util.Set<String> enabledTools = (tuc != null && tuc.availableTools() != null)
             ? tuc.availableTools().stream().map(Tool::name).collect(java.util.stream.Collectors.toSet())
             : java.util.Set.of();
+        // [批 3c] 技能查询改为**显式会话入参**（SkillCatalog/SkillRegistry 的 skill 源按会话 cwd 解析）；
+        //   会话标识取自本方法的显式入参 state（manual 压缩恒持有会话 AgentState），不读 MDC。
+        final String skillSessionId = state != null ? state.sessionId() : null;
         final java.util.List<String> skillCommands;
-        if (skillCatalog != null && skillCatalog.getModelInvocableCommands() != null) {
-            skillCommands = skillCatalog.getModelInvocableCommands().stream()
+        if (skillCatalog != null && skillCatalog.getModelInvocableCommands(skillSessionId) != null) {
+            skillCommands = skillCatalog.getModelInvocableCommands(skillSessionId).stream()
                 .map(com.nexusai.model.command.Command::getName)
                 .collect(java.util.stream.Collectors.toList());
         } else {

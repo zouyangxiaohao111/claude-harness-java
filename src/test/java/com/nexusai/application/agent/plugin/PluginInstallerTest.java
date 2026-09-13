@@ -169,7 +169,8 @@ class PluginInstallerTest {
             pi.setNpmRunner(npmEx);
         }
         pi.setInstalledPluginsManager(installedManager);
-        pi.setCwdProvider(v -> tempDir.toString());
+        // [批 3c] setCwdProvider 形参已由 Function<Void,String> 改为 Function<String,String>（sessionId）
+        pi.setCwdProvider(sessionId -> tempDir.toString());
         return pi;
     }
 

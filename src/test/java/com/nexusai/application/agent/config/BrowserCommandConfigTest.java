@@ -6,7 +6,6 @@ import com.nexusai.application.agent.skill.BundledSkillFeatureFlags;
 import com.nexusai.application.agent.skill.BundledSkillFeatureFlagsConfig;
 import com.nexusai.application.agent.skill.BundledSkills;
 import com.nexusai.application.agent.skill.BundledSkillsBootstrapper;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.command.Command;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -59,7 +58,6 @@ class BrowserCommandConfigTest {
     @AfterEach
     void clearRegistryAndMdc() {
         BundledSkills.clear();
-        RequestContext.clear();
     }
 
     private Map<String, Command> byName() {
@@ -101,7 +99,8 @@ class BrowserCommandConfigTest {
         com.nexusai.application.agent.skill.SkillRegistry registry =
             new com.nexusai.application.agent.skill.SkillRegistry("");
         registry.refresh();
-        List<String> invocable = registry.getModelInvocableCommands().stream()
+        // [批 3c] 无会话 → 显式 null（本用例只验命令类型过滤，与具体会话无关）
+        List<String> invocable = registry.getModelInvocableCommands(null).stream()
             .map(Command::getName).toList();
         assertThat(invocable).doesNotContain("chrome");
     }
@@ -116,11 +115,12 @@ class BrowserCommandConfigTest {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         BrowserWsChannel mockChannel = mock(BrowserWsChannel.class);
         when(mockChannel.hasSessionConnection()).thenReturn(true);
-        RequestContext.setSession("sess-chrome");
 
         config.chromeSlashRegistration(dispatcher, mockChannel);
 
-        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/chrome");
+        // [批 3c] 会话标识显式传参（旧实现 handler 经裸 MDC 会话槽取会话 —— 该读点已删，
+        //   本用例原「给 MDC 造 sess-chrome」的装置随之成为死装置，已移除）
+        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/chrome", "sess-chrome", null);
         assertThat(r.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(r.routedTo()).as("/chrome 命中命名 handler").isEqualTo("chrome");
         // handler 必须读取连接状态（对齐 CC chrome.tsx:56 isConnected 判定）
@@ -131,11 +131,11 @@ class BrowserCommandConfigTest {
     @DisplayName("/chrome handler 无连接：BrowserWsChannel 未注入 → 空安全回退（不抛，仍可路由）")
     void chromeHandlerNullChannelIsNullSafe() {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
-        RequestContext.setSession("sess-chrome");
 
         config.chromeSlashRegistration(dispatcher, null);
 
-        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/chrome");
+        // [批 3c] 会话标识显式传参（同上：MDC 装置已死，改显式传同值）
+        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/chrome", "sess-chrome", null);
         assertThat(r.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(r.routedTo()).isEqualTo("chrome");
     }
@@ -167,19 +167,16 @@ class BrowserCommandConfigTest {
         when(ws.isOpen()).thenReturn(true);
         channel.register(ws);
 
-        RequestContext.setSession("sess-x");
         assertThat(channel.hasSessionConnection())
             .as("全局有 open 连接 → true").isTrue();
         assertThat(channel.isSessionConnected("sess-x")).isTrue();
 
         // 全局连接：一个扩展服务所有会话 → 其他会话/无会话上下文均 true
-        RequestContext.setSession("sess-y");
         assertThat(channel.hasSessionConnection())
             .as("其他会话 → 仍 true（全局连接，不按会话路由）").isTrue();
 
-        RequestContext.clear();
         assertThat(channel.hasSessionConnection())
-            .as("无会话上下文 → 仍 true（全局连接，不读 RequestContext）").isTrue();
+            .as("无会话上下文 → 仍 true（全局连接，不读会话槽）").isTrue();
         assertThat(channel.isSessionConnected(null)).isTrue();
         assertThat(channel.isSessionConnected("  ")).isTrue();
 

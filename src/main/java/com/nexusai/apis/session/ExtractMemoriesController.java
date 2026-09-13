@@ -110,7 +110,7 @@ public class ExtractMemoriesController {
     public ResponseEntity<String> dream(
             @RequestParam(value = "sessionId", required = false) String sessionIdParam,
             @RequestBody(required = false) DreamRequest body) {
-        // [批 3a] sessionId 显式必填：缺 / 空白 ⇒ 400。旧实现无入参 → 读 RequestContext.sessionId()
+        // [批 3a] sessionId 显式必填：缺 / 空白 ⇒ 400。旧实现无入参 → 读 裸 MDC 的 sessionId()
         //   （裸 MDC，第三态可读到上一请求残留的**别的会话** id）→ 把 dream 锁盖到别的项目的记忆目录上。
         if (sessionIdParam == null || sessionIdParam.isBlank()) {
             log.warn("[ExtractMemoriesController] POST /dream 缺少会话标识 ?sessionId= → 400"
@@ -129,7 +129,7 @@ public class ExtractMemoriesController {
         //   请求线程读 AutoMemPaths ThreadLocal（恒空）→ 回落 config home → A′ null →
         //   memoryDir().toString() NPE → 500（审计 P9）。会话未绑定项目 ⇒ per-project 记忆目录不可得
         //   → 显式 fail-loud（规则十二；端点文档已声明「memory 存储不可用 → 500 fail loud」）。
-        // [批 3a] sessionId 由 query 显式传入（见方法头校验），不再读 RequestContext.sessionId()。
+        // [批 3a] sessionId 由 query 显式传入（见方法头校验），不再读 裸 MDC 的 sessionId()。
         java.nio.file.Path dreamMemDir = storage.memoryDir(sessionIdParam);
         if (dreamMemDir == null) {
             throw new IllegalStateException("[ExtractMemoriesController] POST /dream 无法解析 per-project "

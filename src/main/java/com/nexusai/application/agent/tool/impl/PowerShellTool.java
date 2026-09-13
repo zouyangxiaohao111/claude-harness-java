@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.bash.BashOutputUtils;
 import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.permission.PermissionResult;
@@ -683,7 +682,7 @@ public class PowerShellTool implements Tool {
             //   sessionCwd 此处 = CwdResolution.getCwd(sessionId) 实时解析（cd 读回后 SessionCwdHolder
             //   已更新 → 下一条命令取到新 cwd）。effectiveCwd 快照仅供技能发现/权限 baseDir 等消费
             //   （INV-6 注释），不应用于 spawn 目录。
-            Path cwd = Path.of(sessionCwd != null && !sessionCwd.isBlank() ? sessionCwd : fallbackCwd());
+            Path cwd = Path.of(sessionCwd != null && !sessionCwd.isBlank() ? sessionCwd : fallbackCwd(sessionId));
             pb.directory(cwd.toFile());
 
             // CC :698 — timeoutMs = Math.min(timeout || getDefaultTimeoutMs(), getMaxTimeoutMs())
@@ -1096,9 +1095,15 @@ public class PowerShellTool implements Tool {
     /**
      * effectiveCwd 缺失时的兜底 cwd · 对齐 CC getCwd()（Shell.ts:218 pwd()）。
      * cwd-align-ext：user.dir 兜底 → 会话 cwd；无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     *
+     * <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code execute} 显式传入（= {@code ctx.sessionId()}，
+     * 无 ctx ⇒ null）；⛔ 已删原裸 MDC 读点（该读点在 tool-exec 池线程上取不到本会话，
+     * 且会读到该池线程上一个任务残留的别会话 id）。
+     *
+     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
      */
-    private static String fallbackCwd() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    private static String fallbackCwd(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 

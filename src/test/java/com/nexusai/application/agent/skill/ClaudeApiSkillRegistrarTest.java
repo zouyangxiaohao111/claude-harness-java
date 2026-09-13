@@ -38,9 +38,15 @@ class ClaudeApiSkillRegistrarTest {
     @TempDir
     Path tempDir;
 
-    /** 构造注册器：测试注入空 entries supplier（无会话 cwd 回落路径）。 */
+    /**
+     * 构造注册器：测试注入空 entries supplier（无会话 cwd 回落路径）。
+     *
+     * <p>[批 3c] entries supplier 形参由 {@code Supplier<List<String>>} 改 {@code Function<String,
+     * List<String>>}（会话 cwd 供应通道）——本夹具恒返空列表，故忽略 sessionId 形参（<b>不可</b>写
+     * {@code List::of}：方法引用会解析成「单参 of(E)」把 sessionId 当元素塞进列表）。
+     */
     private ClaudeApiSkillRegistrar registrarWith(ClaudeApiSkillRegistrar.SkillContent content) {
-        return new ClaudeApiSkillRegistrar(List::of, () -> content);
+        return new ClaudeApiSkillRegistrar(sessionId -> List.of(), () -> content);
     }
 
     @Test
@@ -52,7 +58,8 @@ class ClaudeApiSkillRegistrarTest {
 
         ClaudeApiSkillRegistrar registrar = registrarWith(ClaudeApiSkillContent.getInstance());
 
-        assertThat(registrar.detectLanguage(tempDir.toString()))
+        // [批 3c] 本用例给的是真实 cwd → 走 readdir 分支，不涉会话 → 显式 null
+        assertThat(registrar.detectLanguage(tempDir.toString(), null))
             .as("pom.xml 在 cwd → java（CC LANGUAGE_INDICATORS java: ['.java','pom.xml','build.gradle']）")
             .isEqualTo(ClaudeApiSkillRegistrar.DetectedLanguage.JAVA);
     }
@@ -61,15 +68,18 @@ class ClaudeApiSkillRegistrarTest {
     @DisplayName("detectLanguage(cwd) readdir 失败 → null（CC claudeApi.ts:38-40 catch → 全文档分支）")
     void detectLanguageMissingCwdReturnsNull() {
         ClaudeApiSkillRegistrar registrar = registrarWith(ClaudeApiSkillContent.getInstance());
-        assertThat(registrar.detectLanguage(tempDir.resolve("not-exist").toString())).isNull();
+        // [批 3c] cwd 非 null → readdir 分支，不涉会话 → 显式 null
+        assertThat(registrar.detectLanguage(tempDir.resolve("not-exist").toString(), null)).isNull();
     }
 
     @Test
     @DisplayName("detectLanguage(null) 回落注入 supplier（测试确定性契约不破坏）")
     void detectLanguageNullCwdFallsBackToInjectedSupplier() {
+        // [批 3c] entries supplier 现有 sessionId 形参（本夹具忽略之，恒返 go.mod）
         ClaudeApiSkillRegistrar registrar = new ClaudeApiSkillRegistrar(
-            () -> List.of("go.mod"), () -> ClaudeApiSkillContent.getInstance());
-        assertThat(registrar.detectLanguage(null))
+            sessionId -> List.of("go.mod"), () -> ClaudeApiSkillContent.getInstance());
+        // [批 3c] 无会话（cwd 与 sessionId 均无）→ 显式 null 双传
+        assertThat(registrar.detectLanguage(null, null))
             .isEqualTo(ClaudeApiSkillRegistrar.DetectedLanguage.GO);
     }
 

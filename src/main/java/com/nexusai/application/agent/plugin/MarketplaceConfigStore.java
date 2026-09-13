@@ -5,7 +5,6 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.plugin.PluginSchemas.KnownMarketplace;
 import com.nexusai.application.agent.plugin.PluginSchemas.MarketplaceSource;
 import com.nexusai.application.agent.settings.storage.ConfigStorage;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -50,11 +49,16 @@ public class MarketplaceConfigStore {
                                   Supplier<String> cwdSupplier) {
         this.manager = manager;
         this.configStorage = configStorage;
-        // 方案1 接线：经 CwdResolution.getOriginalCwdLayer(RequestContext.sessionId()) 取会话 original cwd
-        //   （对齐 CC getOriginalCwd · addMarketplaceSource resolve(source.path)=process.cwd()=启动 cwd 语义，
-        //    marketplaceManager.ts:1792-1793）。startup 无会话时回落 user.dir，与旧行为零变化。
+        // [批 3c] 默认层取进程级 original cwd（对齐 CC getOriginalCwd · addMarketplaceSource
+        //   resolve(source.path)=process.cwd()=启动 cwd 语义，marketplaceManager.ts:1792-1793）。
+        //   **本类消费链无会话**：getOriginalCwd() → MarketplaceReconciler.normalizeSource/resolveLocalPath
+        //   ← reconcile ← PluginInstallationManager.performBackgroundPluginInstallations（启动后台链，
+        //   OfficialMarketplace/PluginAutoupdate 亦为启动期）——全链无 sessionId 形参/字段可穿透，
+        //   故显式传 null（无会话），CwdResolution 逐层回落 user.dir：与旧实现（启动线程 MDC 恒空）
+        //   行为零变化。会话感知需 PluginStartupAssembler / PerformStartupChecks 穿透 sessionId
+        //   （两者均不在本批清单）。
         this.cwdSupplier = cwdSupplier != null ? cwdSupplier
-            : () -> CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+            : () -> CwdResolution.getOriginalCwdLayer(null);
     }
 
     /** 简化构造：不接线 settings（declared 空）与 cwd（默认 user.dir）。 */

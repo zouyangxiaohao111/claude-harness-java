@@ -508,7 +508,13 @@ public class ContextAnalyzeService {
      */
     private List<MemoryFileEntry> resolveMemoryFiles() {
         if (claudemdEngine != null) {
-            List<MemoryFileInfo> files = claudemdEngine.filterInjectedMemoryFiles(claudemdEngine.getMemoryFiles(false));
+            // [批 3c] 本方法无会话入参 → (b) 类合法跳过：显式传 null（回落进程 user.dir，与旧实现「MDC 为空」等价）；
+            //   仅影响 InstructionsLoaded hook 载荷 session_id，memory 段计数本身与会话无关。
+            if (log.isWarnEnabled()) {
+                log.warn("[ContextAnalyzeService] resolveMemoryFiles 无会话入参 → 记忆文件解析按进程默认（user.dir），"
+                    + "InstructionsLoaded hook 载荷 session_id 为 null（批 3c：会话态显式化，不再回落 MDC）");
+            }
+            List<MemoryFileInfo> files = claudemdEngine.filterInjectedMemoryFiles(claudemdEngine.getMemoryFiles(false, null));
             if (log.isDebugEnabled()) {
                 log.debug("[ContextAnalyzeService] resolveMemoryFiles: 生产 claudemdEngine 解析 {} 个 memory 文件（CC analyzeContext.ts:329 filterInjectedMemoryFiles(getMemoryFiles())）",
                     files.size());

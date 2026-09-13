@@ -108,8 +108,9 @@ class PostCompactionStateTest {
      * <p><b>WHY（规则九 · 测试验证意图）</b>：生产 sessionId 是 {@code "sess-"} + UUID 前 8 位
      * （SessionService.generateId，<b>非合法 UUID</b>）。mark 侧（LlmAgentLoop:1550 创建 AgentState
      * 时 ChatService:199 parseSessionUuid 已归一化）用<b>解析后 UUID 串</b>注册并 markPostCompaction；
-     * consume 侧（AnthropicSdkProvider.consumePostCompactionAtApiSuccess）从 MDC 拿到<b>原始
-     * {@code "sess-xxx"}</b>。旧实现
+     * consume 侧（AnthropicSdkProvider.consumePostCompactionAtApiSuccess）持有<b>原始
+     * {@code "sess-xxx"}</b>（批 3b 起经 SessionIdResolver.fromHistory 从 history 首条非空
+     * sessionId 取，裸 MDC 会话槽兜底已删）。旧实现
      * {@code UUID.fromString("sess-xxx")} 抛 IllegalArgumentException → 回落进程级默认布尔
      * （mark 从未写进程级）→ isPostCompaction 永不触发（反射确认 49/49 + Provider 33/33 全绿仍断）。
      * 本用例用<b>生产真实值</b>（mark=解析 UUID 串 / consume=原始 "sess-xxx"）钉死归一化闭环，
@@ -127,7 +128,7 @@ class PostCompactionStateTest {
         // mark 侧生产真实值：short 直键（mark 站点 CompactCommand:224 / AutoCompactor:573 等）
         PostCompactionState.markPostCompaction(rawSessionId);
 
-        // consume 侧生产真实值：同 short 直键（MDC RequestContext.sessionId，ChatService:120）
+        // consume 侧生产真实值：同 short 直键（ChatService:120 落库的 raw 会话键）
         assertThat(PostCompactionState.isPostCompactionPending(rawSessionId)).isTrue();
         assertThat(PostCompactionState.consumePostCompaction(rawSessionId)).isTrue();
         assertThat(prodState.pendingPostCompaction()).isFalse(); // 消费后自动复位

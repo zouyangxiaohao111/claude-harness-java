@@ -119,13 +119,14 @@ class CommandRegistrationConfigGroupAGitDirTest {
         SkillRegistry registry = new SkillRegistry("");
         registry.refresh(); // 清缓存，确保 fresh 视图
 
-        List<String> invocable = registry.getModelInvocableCommands().stream()
+        // [批 3c] 无会话 → 显式 null（本用例只验命令注册面过滤，不涉会话）
+        List<String> invocable = registry.getModelInvocableCommands(null).stream()
             .map(Command::getName).toList();
         assertThat(invocable).contains("pr-comments");
         assertThat(invocable).doesNotContain("branch", "diff", "rewind", "add-dir");
 
         // getAllCommands（web GET /api/command 数据源）含 local 命令（无 gate 的）
-        List<String> all = registry.getAllCommands().stream().map(Command::getName).toList();
+        List<String> all = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(all).contains("pr-comments", "branch", "diff", "rewind", "add-dir");
     }
 
@@ -135,30 +136,33 @@ class CommandRegistrationConfigGroupAGitDirTest {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandLocalSlashRegistrationGroupA(dispatcher, null, null);
 
+        // [批 3c] 本用例只验证「handler 注册面 → 命名路由/结果种类」，不涉会话 → 以下分派一律显式
+        //   传 null（旧实现里等价于 MDC 为空；会话驱动的真实执行由带 sessionId 的用例覆盖）
+
         // /branch <title> → 命名 handler（CC branch.ts:222-296 call）
-        UserInputDispatcher.RoutingResult branch = dispatcher.dispatch("/branch fix login bug");
+        UserInputDispatcher.RoutingResult branch = dispatcher.dispatch("/branch fix login bug", null, null);
         assertThat(branch.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(branch.routedTo()).isEqualTo("branch");
 
         // /diff → 命名 handler（CC diff.tsx:3-8 call）
-        UserInputDispatcher.RoutingResult diff = dispatcher.dispatch("/diff");
+        UserInputDispatcher.RoutingResult diff = dispatcher.dispatch("/diff", null, null);
         assertThat(diff.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(diff.routedTo()).isEqualTo("diff");
 
         // /rewind → result handler（[Fix-P1] type=local 迁移 registerSlashCommandResult；
         //   CC rewind.ts:11-12 恒 return {type:'skip'} → dispatchResult 回传 skip，无 stdout）
-        UserInputDispatcher.LocalCommandResult rewind = dispatcher.dispatchResult("/rewind");
+        UserInputDispatcher.LocalCommandResult rewind = dispatcher.dispatchResult("/rewind", null, null);
         assertThat(rewind).isNotNull();
         assertThat(rewind.kind()).as("/rewind 对齐 CC {type:'skip'}（openMessageSelector UI 属前端，受控差异）")
             .isEqualTo("skip");
 
         // /add-dir /tmp/newcode → 命名 handler（CC add-dir.tsx:65-125 call）
-        UserInputDispatcher.RoutingResult addDir = dispatcher.dispatch("/add-dir /tmp/newcode");
+        UserInputDispatcher.RoutingResult addDir = dispatcher.dispatch("/add-dir /tmp/newcode", null, null);
         assertThat(addDir.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(addDir.routedTo()).isEqualTo("add-dir");
 
         // 未注册的 /nope → 回落通用 SLASH_COMMAND handler（向后兼容）
-        UserInputDispatcher.RoutingResult nope = dispatcher.dispatch("/nope");
+        UserInputDispatcher.RoutingResult nope = dispatcher.dispatch("/nope", null, null);
         assertThat(nope.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(nope.routedTo()).isEqualTo("command-router");
     }

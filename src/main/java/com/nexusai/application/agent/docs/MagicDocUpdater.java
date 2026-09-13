@@ -441,8 +441,10 @@ public class MagicDocUpdater {
     /**
      * [L+ round 4] 构造最小 ctx 并播种 readFileState.
      *
-     * <p>WHY 必须用 editTool.pathGuard() 派生 key: 不同 workspace (测试 TempDir vs 生产)
-     * 的 guard.resolve() 解析出的绝对路径不同, 错位会让 read-before-write 门禁永远不命中.
+     * <p>WHY 必须用 editTool.pathGuard() + 本方法生成的 sessionId 派生 key: 不同 workspace
+     * (测试 TempDir vs 生产) 的 guard 解析出的绝对路径不同, 且相对路径基准随会话 cwd
+     * 变化 —— 任一处错位都会让 read-before-write 门禁永远不命中. key 与 mtime 取自同一个
+     * {@code guard.resolve(sessionId, relPath)} 结果, 与 EditFileTool 内部门禁键同源.
      *
      * <p>content 必须 CRLF 归一化为 LF-only · 对齐 ReadFileTool / EditFileTool
      * 写入 cache 的归一化形式 (L+ round 3), 否则 CRLF 文件的 stale-write 内容兜底比对
@@ -461,13 +463,17 @@ public class MagicDocUpdater {
         UUID agentId = UUID.randomUUID();
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
 
-        // 派生 key: 必须用 editTool.pathGuard() 让 key 与 EditFileTool.execute 内部派生一致
-        String key = ToolUseContext.keyForReadFileState(editTool.pathGuard(), relPath);
+        // [会话 cwd 同源] 用「EditFileTool 即将用的同一对 (guard, sessionId)」解析目标路径：
+        //   EditFileTool.execute 内部走 guard.resolve(ctx.sessionId() == 本方法生成的 sessionId, relPath)
+        //   并在同一 path 上派生门禁 key，故此处必须用同一基准解析 —— key 与 mtime 都取自这一个
+        //   绝对路径，与门禁键严格一致（相对路径基准错位会让门禁永远不命中）。
+        Path resolved = editTool.pathGuard().resolve(sessionId, relPath);
+        String key = ToolUseContext.keyForReadFileState(editTool.pathGuard(), resolved.toString());
 
         // 取 mtime; 失败兜底 0 (stale-write 门禁会拒, MagicDocUpdater 写回失败回滚原文)
         long mtime;
         try {
-            mtime = Files.getLastModifiedTime(editTool.pathGuard().workdir().resolve(relPath)).toMillis();
+            mtime = Files.getLastModifiedTime(resolved).toMillis();
         } catch (Exception e) {
             mtime = 0L;
         }

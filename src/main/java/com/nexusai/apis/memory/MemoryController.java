@@ -11,7 +11,6 @@ import com.nexusai.application.agent.skill.ClaudePaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.telemetry.Telemetry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.exception.ForbiddenException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -91,12 +90,24 @@ public class MemoryController {
     private Telemetry telemetry;
 
     /** 工作目录 · CC original: getOriginalCwd()（MemoryFileSelector.tsx:52 projectMemoryPath）。
-     *  经统一入口 {@link CwdResolution#getOriginalCwdLayer()}（REST 无 MDC sessionId → 回落
-     *  user.dir，对齐 CC 进程启动 cwd；与 ClaudemdEngine originalCwdSupplier 同源，ClaudemdEngine:163-171）。 */
-    private String originalCwd() {
-        String resolved = CwdResolution.getOriginalCwdLayer();
+     *  经统一入口 {@link CwdResolution#getOriginalCwdLayer(String)}（显式会话形参；无会话 ⇒ null
+     *  → 回落 user.dir，对齐 CC 进程启动 cwd；与 ClaudemdEngine 扫描根解析（originalCwdResolver
+     *  {@code sessionId -> originalCwd}，ClaudemdEngine.resolveOriginalCwd）同源）。
+     *
+     *  <p><b>[批 3c 会话态显式化]</b> 本方法只被 POST /files 的创建面白名单消费
+     *  （{@link #isCreatableMemoryPath}），而 POST /files 的请求契约（{@code {path}}）与 query
+     *  <b>都没有会话入参</b> ⇒ 传 {@code null} 表达「本端点无会话上下文」（{@code getOriginalCwdLayer(null)}
+     *  跳过 sessionCwd/boundProject 层 → user.dir 兜底），<b>不再读 MDC</b>（旧实现的裸 MDC 读在本端点
+     *  从未被本端点写过 → 读到的是上一请求残留在 Tomcat 线程上的**别的会话**的 id，第三态）。
+     *  该兜底对创建面白名单的影响：project 槽位按 JVM 启动目录计算（User/Managed 槽位与
+     *  「现有记忆文件」两条放行路径不受影响）；详见报告登记。
+     *
+     *  @param sessionId 显式会话 ID；本控制器唯一无会话入参的端点为 POST /files → 传 null
+     */
+    private String originalCwd(String sessionId) {
+        String resolved = CwdResolution.getOriginalCwdLayer(sessionId);
         if (log.isDebugEnabled()) {
-            log.debug("[MemoryController] originalCwd 解析: {}", resolved);
+            log.debug("[MemoryController] originalCwd 解析: session={} resolved={}", sessionId, resolved);
         }
         return resolved;
     }
@@ -120,11 +131,12 @@ public class MemoryController {
      * </ol>
      * 顺序：Managed → User → Project。path 字段=绝对路径（仅展示，前端不回传）。
      *
-     * <p><b>会话机制（批 3a 改）</b>：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400）——
+     * <p><b>会话机制（批 3a 改 / 批 3c 显式化）</b>：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400）——
      * 不再回落 MDC（旧实现「无 sessionId → 空列表，读宽容不 400」对「本该有却没有」的调用方是静默
-     * 降级：前端传空串即静默丢 Project 档）。收到后写 MDC（单向传播）→
-     * {@code CwdResolution.getOriginalCwdLayer()} 自动走 boundProject
-     * （SessionProjectRoot.getForSession）。GET/PUT 的 Project 档都先
+     * 降级：前端传空串即静默丢 Project 档）。收到的会话<b>显式</b>传给
+     * {@code CwdResolution.getOriginalCwdLayer(sessionId)} 走 boundProject 层
+     * （SessionProjectRoot.getForSession）；批 3c 起会话态不再经 MDC 载体传播（裸 MDC 会话槽已删）。
+     * GET/PUT 的 Project 档都先
      * {@code clearMemoryFileCaches()} 再 {@code getMemoryFiles(false)}（防 memoize 跨会话污染）。
      *
      * @param sessionIdParam query {@code ?sessionId=}（<b>必填</b>；Project 档会话锚定）
@@ -137,20 +149,22 @@ public class MemoryController {
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] GET /memory/files 查看记忆开始（缓存预热 + 加载）");
         }
-        // 批 3a：sessionId **必填**（缺 / 空白 ⇒ 400）。旧实现 query 缺值时回落 RequestContext.sessionId()
-        //   （裸 MDC）——MDC 第三态会读到上一请求残留的**别的会话**的 id ⇒ Project 档列出别的项目的
+        // 批 3a：sessionId **必填**（缺 / 空白 ⇒ 400）。旧实现 query 缺值时回落裸 MDC 会话槽
+        //   ——MDC 第三态会读到上一请求残留的**别的会话**的 id ⇒ Project 档列出别的项目的
         //   记忆文件、editable 白名单按错的 boundProject 计算（静默跨项目）。fail loud 消除该态。
-        //   非空写 MDC：驱动 CwdResolution.getOriginalCwdLayer() 的 boundProject 层（单向传播，不读回）。
+        //   [批 3c] 会话态不再经 MDC 传播：收到的 sessionId **显式**传给下方
+        //   CwdResolution.getOriginalCwdLayer(sessionId) 解析 boundProject（等值替换：旧实现
+        //   先 setSession 再由无参重载读回同一值）。
         String sessionId = sessionIdParam;
         if (sessionId == null || sessionId.isBlank()) {
             log.warn("[MemoryController] GET /memory/files 缺少会话标识 ?sessionId= → 400"
                 + "（会话态显式化，不再回落 MDC）");
             throw new ValidationException("sessionId is required (GET /api/v1/memory/files)");
         }
-        RequestContext.setSession(sessionId);
+
         // memory.tsx:86-87 缓存预热：clear + get（CC call 在渲染前预热）
         engine.clearMemoryFileCaches();
-        List<MemoryFileInfo> existing = engine.getMemoryFiles(false);
+        List<MemoryFileInfo> existing = engine.getMemoryFiles(false, sessionId);
 
         List<MemoryFileView> views = new ArrayList<>();
 
@@ -167,7 +181,8 @@ public class MemoryController {
             null, Files.isRegularFile(userPath), "CLAUDE.md", true));
 
         // 3. Project（会话级可写）：getMemoryFiles 中 type==PROJECT 的文件，file=相对 boundProject
-        String boundProject = CwdResolution.getOriginalCwdLayer();
+        //   [批 3c] 显式会话形参（旧实现靠上行 setSession 写 MDC 再由无参重载读回，等值）
+        String boundProject = CwdResolution.getOriginalCwdLayer(sessionId);
         Path boundProjectAbs = Paths.get(boundProject).toAbsolutePath().normalize();
         for (MemoryFileInfo file : existing) {
             if (file.type() == ClaudemdMemoryType.PROJECT) {
@@ -252,9 +267,10 @@ public class MemoryController {
         //   new ConsolidationLock(null) 构造 NPE → 本端点 500（审计 P5/P9）。
         //   dream 锁状态是 **per-project** 数据：无会话上下文 ⇒ 无从解析 ⇒ 显式 fail-loud
         //   （规则十二；不伪造 "never"）。
-        // [批 3a] 旧实现无 sessionId 入参 → 只能读 RequestContext.sessionId()（裸 MDC，第三态可读到
-        //   上一请求残留的**别的会话** id → 报别的项目的 dream 状态）。现改为显式 query 必填：
+        // [批 3a] 旧实现无 sessionId 入参 → 只能读裸 MDC 会话槽（第三态可读到上一请求残留的
+        //   **别的会话** id → 报别的项目的 dream 状态）。现改为显式 query 必填：
         //   缺 / 空白 ⇒ 400（(a) 类 fail loud），不再有 MDC 读取。
+        //   [批 3c] 会话态载体（裸 MDC 会话槽）已删；本端点会话来源只有 query 显式形参。
         if (sessionIdParam == null || sessionIdParam.isBlank()) {
             log.warn("[MemoryController] GET /memory/config 缺少会话标识 ?sessionId= → 400"
                 + "（dreamStatus 为 per-project 数据；会话态显式化，不再回落 MDC）");
@@ -400,7 +416,7 @@ public class MemoryController {
         //   固化 400 语义。
         // IMP-MV2-17 路径面收敛：创建目标白名单（user/project 槽位 + 现有记忆文件），
         // 拒绝任意绝对路径逃逸（CC 创建面 = 选择器可达路径，无自由路径输入）
-        if (!isCreatableMemoryPath(path)) {
+        if (!isCreatableMemoryPath(path, null)) {
             log.warn("[MemoryController] POST /memory/files: path 不在记忆文件创建面内 → 400: {}", path);
             throw new ValidationException(
                 "memory file path must be the user/project memory slot or an existing memory file");
@@ -435,7 +451,14 @@ public class MemoryController {
             throw new RuntimeException("Failed to read memory file content: " + e.getMessage(), e);
         }
         // B5 锚点修正：CC getRelativeMemoryPath 用 getCwd()（MemoryUpdateNotification.tsx:9-10），非 getOriginalCwd
-        String relativePath = getRelativeMemoryPath(path, System.getProperty("user.home"), CwdResolution.getCwd());
+        // [批 3c] 本端点（POST /files）请求契约无会话入参 ⇒ 显式传 null = 明确「无会话上下文」语义
+        //   （getCwd(null) 跳过 sessionCwd/boundProject 层 → override/user.dir 兜底），**不再读 MDC**：
+        //   旧实现的裸 MDC 读在本端点从未被写过 → 读到上一请求残留在 Tomcat 线程上的别会话 id（第三态）。
+        //   WARN 留痕（禁只 DEBUG）：相对路径显示基准由 JVM 启动目录兜底。
+        log.warn("[MemoryController] POST /memory/files 无会话入参（本端点契约不含 sessionId）→ "
+            + "会话态解析基准显式传 null（回落 override/user.dir），不再读 MDC 残留: path={}", path);
+        String relativePath = getRelativeMemoryPath(path, System.getProperty("user.home"),
+            CwdResolution.getCwd(null));
         String message = "Opened memory file at " + relativePath;
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] POST /memory/files 完成: path={} created={} contentLen={}",
@@ -461,9 +484,10 @@ public class MemoryController {
      *   <tr><td>项目</td><td>{@code Project}</td><td>会话 boundProject 下多文件</td><td>✅ sessionId</td><td>✅</td></tr>
      * </table>
      *
-     * <p><b>会话机制（批 3a 改）</b>：解析 sessionId <b>两源</b>（body.sessionId → query {@code ?sessionId=}；
-     * MDC 兜底已删），非 null 写 MDC（单向传播）。Project 档必须最终有 sessionId，
-     * 否则 400。boundProject 取 {@code CwdResolution.getOriginalCwdLayer()}（MDC 已 setSession）。
+     * <p><b>会话机制（批 3a 改 / 批 3c 显式化）</b>：解析 sessionId <b>两源</b>（body.sessionId →
+     * query {@code ?sessionId=}；MDC 兜底已删）。Project 档必须最终有 sessionId，
+     * 否则 400。boundProject 取 {@code CwdResolution.getOriginalCwdLayer(sessionId)}（<b>显式形参</b>；
+     * 批 3c 起会话态不再经 MDC 载体传播 —— 裸 MDC 会话槽已删）。
      *
      * <p><b>Project 白名单（IMP-MV2-17 扩展）</b>：{@code clearMemoryFileCaches()} +
      * {@code getMemoryFiles(false)} 过滤 PROJECT 得白名单 path 集合（归一化
@@ -495,14 +519,13 @@ public class MemoryController {
         // 解析 sessionId 两源：body.sessionId → query ?sessionId=（[批 3a] 删掉第三源 MDC 兜底 ——
         //   MDC 第三态会读到上一请求残留的**别的会话** id ⇒ Project 档白名单按错的 boundProject 计算、
         //   覆盖写落到别的项目的记忆文件上）。User/Managed 档本就不需要会话（(b) 类），故仍可 null。
+        // [批 3c] 会话态不再经 MDC 传播：sessionId 直接显式传给 CwdResolution.getOriginalCwdLayer /
+        //   getCwd（等值替换：旧实现先 setSession 写 MDC、再由无参重载读回同一值）。
         String sessionId = null;
         if (request != null && request.sessionId() != null && !request.sessionId().isBlank()) {
             sessionId = request.sessionId();
         } else if (sessionIdParam != null && !sessionIdParam.isBlank()) {
             sessionId = sessionIdParam;
-        }
-        if (sessionId != null) {
-            RequestContext.setSession(sessionId);   // 单向传播：驱动 CwdResolution boundProject 层
         }
         // type 校验：null/blank → 400；非法 → 400（值域仅 Managed/User/Project）
         if (type == null || type.isBlank()) {
@@ -541,7 +564,7 @@ public class MemoryController {
             }
             ClaudemdEngine engine = resolveEngine();
             engine.clearMemoryFileCaches();
-            List<MemoryFileInfo> existing = engine.getMemoryFiles(false);
+            List<MemoryFileInfo> existing = engine.getMemoryFiles(false, sessionId);
             Set<Path> whitelist = new HashSet<>();
             for (MemoryFileInfo f : existing) {
                 if (f.type() == ClaudemdMemoryType.PROJECT) {
@@ -554,7 +577,7 @@ public class MemoryController {
                     whitelist.add(fileAbs);
                 }
             }
-            String boundProject = CwdResolution.getOriginalCwdLayer();
+            String boundProject = CwdResolution.getOriginalCwdLayer(sessionId);
             // resolve（非 Paths.get(first, more) 拼接——后者把绝对 file 当段拼进 boundProject 会抛
             // InvalidPathException，Windows 盘符冒号即触发）：绝对 file 返回自身（归一化后必不在白名单 → 400），
             // 相对 file 拼 boundProject 后归一化（.. 逃逸同样归一化后不在白名单 → 400）
@@ -586,7 +609,7 @@ public class MemoryController {
         // 记忆改动立即生效：写后缓存失效（对齐 GET /files 预热语义 memory.tsx:86-87）
         resolveEngine().clearMemoryFileCaches();
         String relativePath = getRelativeMemoryPath(targetPath.toString(),
-            System.getProperty("user.home"), CwdResolution.getCwd());
+            System.getProperty("user.home"), CwdResolution.getCwd(sessionId));
         String message = "Updated memory file at " + relativePath;
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] PUT /memory/files 完成: type={} file={} path={} contentLen={}",
@@ -631,6 +654,7 @@ public class MemoryController {
      * 比较前双方 {@code toAbsolutePath().normalize()}（防 {@code ..} 归一化逃逸）；白名单外 → 400。
      *
      * @param path 请求路径（可为相对路径——按 JVM cwd 归一化后与绝对槽位比较）
+     * @param sessionId 显式会话 ID（project 槽位解析用；POST /files 无会话入参 → null）
      * @return 是否在记忆文件创建面内
      */
     /** mkdir configHome（memory.tsx:24-28 幂等 · recursive:true）。 */
@@ -643,7 +667,7 @@ public class MemoryController {
         }
     }
 
-    private boolean isCreatableMemoryPath(String path) {
+    private boolean isCreatableMemoryPath(String path, String sessionId) {
         Path target = Paths.get(path).toAbsolutePath().normalize();
         // [D6 严格化] .claude 段路径一律不可创建（放循环前：.claude 恒不进入记忆创建面，
         //   CC 只读兼容源不可被 nexusai 创建空文件）
@@ -654,11 +678,11 @@ public class MemoryController {
             return false;
         }
         Path userSlot = userMemoryPath().toAbsolutePath().normalize();
-        Path projectSlot = Paths.get(originalCwd(), "CLAUDE.md").toAbsolutePath().normalize();
+        Path projectSlot = Paths.get(originalCwd(sessionId), "CLAUDE.md").toAbsolutePath().normalize();
         if (target.equals(userSlot) || target.equals(projectSlot)) {
             return true;
         }
-        for (MemoryFileInfo file : resolveEngine().getMemoryFiles(false)) {
+        for (MemoryFileInfo file : resolveEngine().getMemoryFiles(false, sessionId)) {
             if (target.equals(Paths.get(file.path()).toAbsolutePath().normalize())) {
                 return true;
             }

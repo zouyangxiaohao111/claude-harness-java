@@ -3,7 +3,6 @@ package com.nexusai.application.agent.tool.powershell;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.agent.AgentMemoryDirectory;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
@@ -933,15 +932,20 @@ public class PowerShellPermissionChain {
     private static Path effectiveCwd(ToolUseContext ctx) {
         return ctx != null && ctx.effectiveCwd() != null
             ? ctx.effectiveCwd()
-            : Path.of(fallbackCwd());
+            : Path.of(fallbackCwd(ctx != null ? ctx.sessionId() : null));
     }
 
     /**
      * effectiveCwd 缺失时的兜底 cwd · 对齐 CC getCwd()（pathValidation.ts:1574）。
      * 无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     *
+     * <p>[批 3c] 会话来源显式化：sessionId 由 {@link #effectiveCwd} 从 {@code ctx.sessionId()}
+     * 显式取出后传入；⛔ 已删原裸 MDC 读点（该读点在 tool-exec 池线程上取不到本会话）。
+     *
+     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
      */
-    private static String fallbackCwd() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    private static String fallbackCwd(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 

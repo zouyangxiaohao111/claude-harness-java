@@ -26,7 +26,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * 无会话（null/blank）→ 空表 fail-closed。
  *
  * <p><b>[批 3b]</b> 旧实现 {@code currentRequestSupplier()} 返回的 Supplier 在求值时读
- * {@code RequestContext.sessionId()}（SLF4J MDC / ThreadLocal）——被 gate 在 connectWorker 池线程
+ * 裸 MDC 的 {@code sessionId()}（SLF4J MDC / ThreadLocal）——被 gate 在 connectWorker 池线程
  * 求值，MDC 恒 null 或读到该池线程上一个任务残留的别会话 id（靠 McpToolPool 的 MDC 回放才「看起来
  * 工作」）；用户铁律「会话态一律显式传参，回放不算合规」⇒ 改为显式 sessionId 查表。
  */

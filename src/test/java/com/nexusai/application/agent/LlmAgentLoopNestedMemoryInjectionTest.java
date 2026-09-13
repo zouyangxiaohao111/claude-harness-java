@@ -89,7 +89,7 @@ class LlmAgentLoopNestedMemoryInjectionTest {
         // toRealPath 对齐 ReadFileTool 触发路径（Windows 8.3 短名 vs toRealPath 长名不一致会破坏 pathInWorkingPath）
         Path realWorkspace = workspace.toRealPath();
         engine = new ClaudemdEngine(autoMemPaths, detection,
-            () -> realWorkspace.toString(),   // CC getOriginalCwd()
+            sessionId -> realWorkspace.toString(),   // CC getOriginalCwd()（忽略会话的定值注入）
             () -> true, () -> true, () -> true,
             () -> false,                      // feature('TEAMMEM')
             () -> List.of());                 // claudeMdExcludes（无 settings 源 → 空）

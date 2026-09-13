@@ -54,7 +54,8 @@ class SkillRegistryFindCommandTest {
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
         // RED 于现状（二维 name+aliases，displayName 维度缺失 → null）；GREEN 于 P1-12
-        Command hit = registry.findCommand("网页搜索");
+        // [批 3c] 无会话 → 显式 null（本类各用例只验三维命中判定，不涉会话）
+        Command hit = registry.findCommand("网页搜索", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("skill-a");
     }
@@ -65,7 +66,7 @@ class SkillRegistryFindCommandTest {
         writeSkill(tempDir, "skill-a", "skill-a", null);
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        Command hit = registry.findCommand("skill-a");
+        Command hit = registry.findCommand("skill-a", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("skill-a");
     }
@@ -78,7 +79,7 @@ class SkillRegistryFindCommandTest {
         // frontmatter aliases 解析）。三维匹配的 aliases 维度（CC :696）须仍可命中。
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        Command hit = registry.findCommand("reset");
+        Command hit = registry.findCommand("reset", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("clear");
     }
@@ -89,8 +90,8 @@ class SkillRegistryFindCommandTest {
         writeSkill(tempDir, "skill-a", "skill-a", null);
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.findCommand("/skill-a")).isNotNull();
-        assertThat(registry.findCommand("/skill-a").getName()).isEqualTo("skill-a");
+        assertThat(registry.findCommand("/skill-a", null)).isNotNull();
+        assertThat(registry.findCommand("/skill-a", null).getName()).isEqualTo("skill-a");
     }
 
     @Test
@@ -102,7 +103,7 @@ class SkillRegistryFindCommandTest {
         Files.writeString(skillDir.resolve("SKILL.md"), "---\n---\n# skill-a\n");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        Command hit = registry.findCommand("skill-a");
+        Command hit = registry.findCommand("skill-a", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("skill-a");
         // userFacingName() 回退语义自验（loadSkillsDir.ts:337-339）
@@ -115,8 +116,9 @@ class SkillRegistryFindCommandTest {
         writeSkill(tempDir, "skill-a", "skill-a", null);
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.findCommand("not-exist")).isNull();
-        assertThat(registry.findCommand("")).isNull();
-        assertThat(registry.findCommand(null)).isNull();
+        // [批 3c] 无会话 → 显式 null（第二个实参；下述各断言同理）
+        assertThat(registry.findCommand("not-exist", null)).isNull();
+        assertThat(registry.findCommand("", null)).isNull();
+        assertThat(registry.findCommand(null, null)).isNull();
     }
 }

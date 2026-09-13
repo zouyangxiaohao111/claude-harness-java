@@ -89,7 +89,7 @@ public record BackgroundTask(
      * 后台任务完成通知入队 NotificationQueue 时透传 {@code QueueItem.sessionId}（cron-notify），
      * drain 时 3a 过滤注入<b>创建会话</b>回合（会话活跃时），会话空闲由 CronIdleExecutor 代跑。
      * null = 无会话上下文（main-thread spawn 无 MDC / 测试直构），回落全局（CronIdleExecutor
-     * GLOBAL_SESSION_UUID）。取值 = {@code RequestContext.sessionId()}（MDC，agent loop 线程注册时）。
+     * GLOBAL_SESSION_UUID）。取值 = 裸 MDC 的 {@code sessionId()}（MDC，agent loop 线程注册时）。
      */
     @Nullable String sessionId,
     /**

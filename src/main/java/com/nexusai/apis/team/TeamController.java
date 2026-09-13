@@ -15,7 +15,6 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.TeamCreateTool;
 import com.nexusai.application.agent.tool.impl.TeamDeleteTool;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -87,12 +86,14 @@ public class TeamController {
     /**
      * [批 3a] 会话标识解析 · REST 入口**必填**（(a) 类 fail loud）：缺 / 空白 ⇒ 400。
      *
-     * <p>旧实现（query {@code ?sessionId=} → {@code RequestContext.sessionId()} 裸 MDC 兜底 → 仍可
-     * null）有两个缺陷：<b>①</b> MDC 第三态会读到上一请求残留的**别的会话** id ⇒ 以别的会话身份
-     * 建/查/删 team；<b>②</b> 返回 null 被下游当「无会话上下文」静默降级（{@code list} 更因此跳过
+     * <p>旧实现（query {@code ?sessionId=} → 裸 MDC 会话槽兜底 → 仍可 null）有两个缺陷：
+     * <b>①</b> MDC 第三态会读到上一请求残留的**别的会话** id ⇒ 以别的会话身份建/查/删 team；
+     * <b>②</b> 返回 null 被下游当「无会话上下文」静默降级（{@code list} 更因此跳过
      * 会话过滤返回**全部会话**的 team = 跨会话名册泄漏，见 {@link #list}）。
      *
-     * <p>解析成功写 MDC（单向传播，喂会话级下游；绝不读回）。
+     * <p>[批 3c] 会话标识由本方法<b>显式返回</b>给各端点（{@code ctx.sessionId()} / 工具形参 /
+     * {@code SpawnContext.leadSessionId} 均为显式载体）；原「写 MDC 单向传播」已删 —— 下游不再有
+     * 任何经 MDC 读会话的通道。
      */
     private String requireSessionId(String sessionIdParam, String endpoint) {
         if (sessionIdParam == null || sessionIdParam.isBlank()) {
@@ -100,7 +101,6 @@ public class TeamController {
                 endpoint);
             throw new ValidationException("sessionId is required (" + endpoint + ")");
         }
-        RequestContext.setSession(sessionIdParam);
         return sessionIdParam;
     }
 

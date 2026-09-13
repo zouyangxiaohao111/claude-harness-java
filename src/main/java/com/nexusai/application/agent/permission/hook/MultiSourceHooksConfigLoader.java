@@ -122,7 +122,7 @@ public class MultiSourceHooksConfigLoader {
                                         ManagedPolicySettingsSupplier policySettingsSupplier,
                                         @Value("${user.home}") String userHome) {
         this(objectMapper, hooksSettings, hooksConfigSnapshot, policySettingsSupplier,
-            CwdResolution::getOriginalCwdLayer, userHome);
+            () -> CwdResolution.getOriginalCwdLayer(null), userHome);
     }
 
     /**

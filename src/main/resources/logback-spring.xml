@@ -11,13 +11,17 @@
     <springProperty scope="context" name="log-rolling-clean-history-on-start" source="logging.logback.rollingpolicy.clean-history-on-start" defaultValue="false"/>
 
     <!-- 控制台格式：%highlight 颜色（INFO 绿/WARN 黄/ERROR 红，logback 自带，不依赖 SkyWalking）
-         + MDC sessionId/reqId（当前项目链路追踪，对齐现有 logback-spring.xml 的 s=/r= 约定） -->
+         [批 3c · 2026-09-13] 已移除 MDC 前缀 [s=%X{sessionId}] [r=%X{reqId}]：
+         WHY —— 会话标识改由调用点**就地显式打印**（log.info("[session={}] ...", sessionId, ...)）。
+         原 MDC 前缀从裸 MDC 取会话 id，存在「第三态」（读到上一请求残留的、别的会话的 id），
+         且**日志前缀本身就是取值处** ⇒ 它错了也无法靠日志发现它错了（自证失效）。
+         requestId 同理（不再有 %X{reqId}；需要时在对应日志行显式打印）。 -->
     <property name="PATTERN_CONSOLE"
-              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) [s=%X{sessionId:-SYSTEM}] [r=%X{reqId:-}] %boldYellow(%thread) %boldGreen(%logger{30}) - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%wEx}"/>
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) %boldYellow(%thread) %boldGreen(%logger{30}) - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%wEx}"/>
 
-    <!-- 文件格式：无 ANSI 颜色（文件不含转义字符），MDC 保留 -->
+    <!-- 文件格式：无 ANSI 颜色（文件不含转义字符）；MDC 前缀同控制台已移除（见上 WHY） -->
     <property name="PATTERN_FILE"
-              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [s=%X{sessionId:-SYSTEM}] [r=%X{reqId:-}] [%thread] %logger{40} - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%ex}"/>
+              value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{40} - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%ex}"/>
 
     <!-- 控制台 Appender（人类 + AI 友好，带颜色） -->
     <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">

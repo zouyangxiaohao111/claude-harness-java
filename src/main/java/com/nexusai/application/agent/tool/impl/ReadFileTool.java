@@ -509,9 +509,25 @@ public class ReadFileTool implements Tool {
      * 字段 → 返回原引用；null 字节/非法输入 → 返回原引用。调用方
      * {@link com.nexusai.application.agent.permission.InputSanitizer#backfill} 已做防御性
      * deepCopy，原 input 永不被 in-place 改动。
+     *
+     * <p>[会话 cwd] 无会话重载 → 委托 {@link #backfillObservableInput(JsonNode, ToolUseContext)}
+     * （{@code ctx=null}），会话 cwd 不可得时基准回落无会话兜底（PathGuard WARN）。
      */
     @Override
     public JsonNode backfillObservableInput(JsonNode input) {
+        return backfillObservableInput(input, null);
+    }
+
+    /**
+     * [会话 cwd] 会话感知回填重载 · 相对路径基准 = {@code ctx.sessionId()} 的当前会话 cwd
+     * （对齐 CC {@code expandPath(file_path)} 内部 {@code baseDir ?? getCwd()}）。
+     *
+     * @param input 工具输入（原始 JSON）
+     * @param ctx   工具上下文（可为 null ⇒ 无会话兜底，PathGuard WARN）
+     * @return 展开后的 input（幂等，见 {@link #backfillObservableInput(JsonNode)}）
+     */
+    @Override
+    public JsonNode backfillObservableInput(JsonNode input, ToolUseContext ctx) {
         if (input == null || !input.isObject()) {
             return input;
         }
@@ -522,7 +538,8 @@ public class ReadFileTool implements Tool {
         String raw = pathNode.asText();
         String expanded;
         try {
-            expanded = PathGuard.expandPath(raw, guard.workdir().toString());
+            expanded = PathGuard.expandPath(raw,
+                guard.workdir(ctx != null ? ctx.sessionId() : null).toString());
         } catch (IllegalArgumentException e) {
             // null 字节等非法输入 → 返回原引用（backfill 阶段不阻断工具）
             if (log.isDebugEnabled()) {
@@ -880,7 +897,9 @@ public class ReadFileTool implements Tool {
         // [CC 对齐 2026-09-03 用户拍板] PathGuard 逃逸拦截已删除（resolve 纯展开，绝对/相对路径都不拦）——
         //   附件（Desktop/pdf-cache/子代理 output）等任意绝对路径直接可读，原附件表 path 豁免机制
         //   （pdf-attachment-allowlist）整体失效删除。生产安全边界由 ReadPermissionChecker.isInWorkingDir 承担。
-        Path file = guard.resolve(relPath);
+        // [会话 cwd] 会话感知解析：相对路径基准 = 本会话当前 cwd（对齐 CC expandPath(baseDir=getCwd())）；
+        //   ctx == null（execute(call) 无 ctx 直达）才回落无会话兜底（PathGuard WARN）。
+        Path file = guard.resolve(ctx != null ? ctx.sessionId() : null, relPath);
 
         // ── dedup: 同 path + offset/limit + mtime 未变 → file_unchanged（CC :536-573）──
         // [L+ R1 收尾] 无 ctx → 完全跳过 dedup (既不读也不写); 有 ctx → 走 ctx.readFileState().
@@ -912,7 +931,10 @@ public class ReadFileTool implements Tool {
         if (dedupEnabled && dedupCache != null) {
             // [L+ round 3] 用与 dispatchText put 一致的归一化 key, 避免
             //   "Edit 用 raw 写 → Read 用归一化查不到" 的死循环.
-            String keyForCache = ToolUseContext.keyForReadFileState(guard, relPath);
+            // [key 同源] 键 = 本工具按会话 cwd 解析出的规范化绝对路径本身（CC 端 key 即
+            //   absoluteFilePath，FileReadTool.ts:1032-1037）；用 `file` 而非裸 relPath，
+            //   保证「解析基准 = 缓存键基准」同源，相对 Read → 绝对 Edit 亦命中同键。
+            String keyForCache = ToolUseContext.keyForReadFileState(guard, file.toString());
             ReadState prevState = dedupCache.get(keyForCache);
             // [L+ R3] 严格守卫: isPartialView=true (memory 注入/内容与磁盘不一致) → 不参与 dedup.
             // CC FileReadTool.ts:549 `!existingState.isPartialView` 等价.
@@ -1166,7 +1188,8 @@ public class ReadFileTool implements Tool {
         // [RV-06] cache 存 raw（无行号）: CC readFileState 缓存干净 content (FileReadTool.ts:1032-1037),
         //   formatFileLines 只在渲染层 (:697-701) 加行号 — Edit/Write stale-write 比对不能带行号偏移.
         if (ctx != null) {
-            String keyForCache = ToolUseContext.keyForReadFileState(guard, relPath);
+            // [key 同源] 键 = 按会话 cwd 解析的规范化绝对路径（与 Edit/Write 门禁键同源）
+            String keyForCache = ToolUseContext.keyForReadFileState(guard, file.toString());
             ctx.readFileState().set(keyForCache,
                 new ReadState(mtime, offset, limit, false, rawContent));
         }
@@ -1771,14 +1794,14 @@ public class ReadFileTool implements Tool {
      * PDF 页图输出目录 · 对齐 CC pdf.ts:218 {@code join(getToolResultsDir(), 'pdf-{uuid}')}
      * （getToolResultsDir = projectDir/sessionId/tool-results，toolResultStorage.ts:97-105）。
      *
-     * <p>Java 映射：{@code ToolResultStorage.getToolResultsDir(guard.workdir(), sessionId)} +
+     * <p>Java 映射：{@code ToolResultStorage.getToolResultsDir(guard.workdir(sessionId), sessionId)} +
      * {@code pdf-{uuid}}；ctx == null（纯测试直调，生产恒有 ctx）回落系统临时目录，
      * 不污染 workspace。
      */
     private Path pdfOutputDir(ToolUseContext ctx) {
         Path base = ctx != null
             ? com.nexusai.application.agent.tool.ToolResultStorage.getToolResultsDir(
-                guard.workdir(), ctx.sessionId())
+                guard.workdir(ctx.sessionId()), ctx.sessionId())
             : java.nio.file.Path.of(System.getProperty("java.io.tmpdir", "."));
         return base.resolve("pdf-" + UUID.randomUUID());
     }
@@ -2041,7 +2064,8 @@ public class ReadFileTool implements Tool {
                         relPath, e.toString());
                 }
             }
-            String keyForCache = ToolUseContext.keyForReadFileState(guard, relPath);
+            // [key 同源] 键 = 按会话 cwd 解析的规范化绝对路径（与 NotebookEditTool 门禁键同源）
+            String keyForCache = ToolUseContext.keyForReadFileState(guard, file.toString());
             ctx.readFileState().set(keyForCache,
                 new ReadState(notebookMtime, offset, limit, false, cellsJson));
         }

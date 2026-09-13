@@ -4,7 +4,6 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tasks.BackgroundTaskRunner;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.mcp.McpServerService;
 import com.nexusai.model.mcp.dto.McpServerDto;
 import com.nexusai.model.mcp.dto.McpStatus;
@@ -53,7 +52,7 @@ import static org.mockito.Mockito.when;
 @DisplayName("[W9-03] MonitorMcpTaskRunner streaming 语义（CC LocalShellTask.tsx kind='monitor'）")
 class MonitorMcpTaskRunnerTest {
 
-    /** [批 3b-D7] 显式创建会话（旧实现由下游读 MDC；现所有注册入口（register… / outputFileFor）显式传）。 */
+    /** [批 3b-D7] 显式创建会话（旧实现由下游读裸 MDC 会话槽；现所有注册入口（register… / outputFileFor）显式传）。 */
     private static final String SESSION = "sess-monitor-3b-fixture";
 
     @TempDir
@@ -331,42 +330,38 @@ class MonitorMcpTaskRunnerTest {
         MonitorMcpTaskRunner runner = newRunner(mcp, service, sdk, nq);
 
         String sessionId = "sess-monitor-y";
+        String taskId = runner.registerTask("monitor-unify", "tu-y", null, sessionId);
+        String outputFile = runner.outputFileFor(sessionId, taskId);
+        // 五层唯一根：per-user + per-project + per-session（CC diskOutput.ts:50-55 + filesystem.ts:376-378）
+        String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
+        Path expected = Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
+            sessionId, "tasks", taskId + ".output");
+        assertThat(outputFile).as("monitor_mcp 输出必须落五层唯一根（per-user + per-project + sessionId 层）")
+            .isEqualTo(expected.toString());
+        assertThat(Paths.get(outputFile).getParent().toString())
+            .as("根目录 = {appName}[-{uid}]/{sanitizedCwd}/{sessionId}/tasks（CC getTaskOutputDir 语义）")
+            .isEqualTo(Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
+                sessionId, "tasks").toString());
+        // 旧 flat 独立根不得再产出（CC 无对应偏离已删）
+        assertThat(outputFile).doesNotContain("nexusai-tasks");
+
+        // 与 BackgroundTaskRunner 唯一根同源（Bash/PS/LOCAL_AGENT/monitor/remote_agent 全收统一根）
+        assertThat(outputFile).as("monitor_mcp 与 taskOutputPath 唯一根同源")
+            .isEqualTo(BackgroundTaskRunner.taskOutputPath(sessionId, taskId));
+
+        // 流式写实际落该唯一根文件（父目录自动创建）—— 独立线程跑 monitor（阻塞轮询），
+        // 首观测落盘后 stop() 中断退出（对齐既有 streaming 测试模式）
+        Thread t = new Thread(() -> runner.monitor(taskId, "monitor-unify", null), "monitor-unify");
+        t.setDaemon(true);
+        t.start();
         try {
-            String taskId = runner.registerTask("monitor-unify", "tu-y", null, sessionId);
-            String outputFile = runner.outputFileFor(sessionId, taskId);
-            // 五层唯一根：per-user + per-project + per-session（CC diskOutput.ts:50-55 + filesystem.ts:376-378）
-            String sanitizedCwd = AutoMemPaths.sanitizePath(CwdResolution.getOriginalCwdLayer(sessionId));
-            Path expected = Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
-                sessionId, "tasks", taskId + ".output");
-            assertThat(outputFile).as("monitor_mcp 输出必须落五层唯一根（per-user + per-project + sessionId 层）")
-                .isEqualTo(expected.toString());
-            assertThat(Paths.get(outputFile).getParent().toString())
-                .as("根目录 = {appName}[-{uid}]/{sanitizedCwd}/{sessionId}/tasks（CC getTaskOutputDir 语义）")
-                .isEqualTo(Paths.get(NexusaiPaths.getAppTempDir(), sanitizedCwd,
-                    sessionId, "tasks").toString());
-            // 旧 flat 独立根不得再产出（CC 无对应偏离已删）
-            assertThat(outputFile).doesNotContain("nexusai-tasks");
-
-            // 与 BackgroundTaskRunner 唯一根同源（Bash/PS/LOCAL_AGENT/monitor/remote_agent 全收统一根）
-            assertThat(outputFile).as("monitor_mcp 与 taskOutputPath 唯一根同源")
-                .isEqualTo(BackgroundTaskRunner.taskOutputPath(sessionId, taskId));
-
-            // 流式写实际落该唯一根文件（父目录自动创建）—— 独立线程跑 monitor（阻塞轮询），
-            // 首观测落盘后 stop() 中断退出（对齐既有 streaming 测试模式）
-            Thread t = new Thread(() -> runner.monitor(taskId, "monitor-unify", null), "monitor-unify");
-            t.setDaemon(true);
-            t.start();
-            try {
-                awaitUntil(() -> fileLineCount(Paths.get(outputFile)) >= 1,
-                    "monitor 输出实际写入唯一根文件（父目录自动创建）");
-                assertThat(Paths.get(outputFile).getParent()).exists();
-                assertThat(Paths.get(outputFile)).exists();
-            } finally {
-                runner.stop();
-                t.join(3000);
-            }
+            awaitUntil(() -> fileLineCount(Paths.get(outputFile)) >= 1,
+                "monitor 输出实际写入唯一根文件（父目录自动创建）");
+            assertThat(Paths.get(outputFile).getParent()).exists();
+            assertThat(Paths.get(outputFile)).exists();
         } finally {
-            RequestContext.clear();
+            runner.stop();
+            t.join(3000);
         }
     }
 }

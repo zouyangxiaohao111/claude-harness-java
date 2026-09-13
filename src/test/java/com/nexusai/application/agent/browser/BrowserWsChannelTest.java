@@ -3,7 +3,6 @@ package com.nexusai.application.agent.browser;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.socket.CloseStatus;
@@ -47,11 +46,6 @@ import static org.mockito.Mockito.when;
 class BrowserWsChannelTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-
-    @AfterEach
-    void clearMdc() {
-        com.nexusai.common.RequestContext.clear();
-    }
 
     @Test
     @DisplayName("send：转发 tool_call（type/id/sessionId/tool/args 正确）并返回 tool_result.result 文本")

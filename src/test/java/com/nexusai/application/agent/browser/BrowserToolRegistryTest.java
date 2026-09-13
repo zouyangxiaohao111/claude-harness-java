@@ -3,13 +3,18 @@ package com.nexusai.application.agent.browser;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
+import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.permission.PermissionMode;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -134,25 +139,28 @@ class BrowserToolRegistryTest {
     @Test
     @DisplayName("通道注入 → execute 真实转发（多会话 sessionId 透传，工具面契约先行闭环）")
     void forwardsWhenChannelInjected() {
-        // 多会话并行：send 三参 (sessionId, tool, args)——sessionId 由 execute 读 RequestContext 透传
+        // 多会话并行：send 三参 (sessionId, tool, args)——sessionId 由 execute 从 ToolUseContext 显式读取
+        // [批 3c] 会话标识不再经裸 MDC 取，改由 ToolUseContext（显式会话载体）传入 → 传真实会话
         BrowserChannel channel = (sessionId, tool, args) -> "ok:" + tool + ":session=" + sessionId + ":action=" + args.get("action");
         List<Tool> tools = BrowserToolRegistry.createTools(channel);
         Tool tool = byName(tools, "mcp__nexusai-in-chrome__javascript_tool");
 
-        com.nexusai.common.RequestContext.setSession("sess-cc");
-        try {
-            ObjectNode input = JSON.createObjectNode();
-            input.put("action", "javascript_exec");
-            input.put("text", "1+1");
-            input.put("tabId", 1);
-            ToolResult<String> r = executeAsString(tool, new ToolUseBlock("b2", tool.name(), input));
+        ObjectNode input = JSON.createObjectNode();
+        input.put("action", "javascript_exec");
+        input.put("text", "1+1");
+        input.put("tabId", 1);
+        ToolResult<String> r = executeAsString(tool, new ToolUseBlock("b2", tool.name(), input),
+            toolUseContext("sess-cc"));
 
-            assertThat(r.data())
-                .as("execute 必须把当前会话 sessionId 透传给 channel.send（扩展按它定位 tab 组）")
-                .isEqualTo("ok:javascript_tool:session=sess-cc:action=javascript_exec");
-        } finally {
-            com.nexusai.common.RequestContext.clear();
-        }
+        assertThat(r.data())
+            .as("execute 必须把本次工具调用的 sessionId（ToolUseContext）透传给 channel.send（扩展按它定位 tab 组）")
+            .isEqualTo("ok:javascript_tool:session=sess-cc:action=javascript_exec");
+    }
+
+    /** 显式会话载体（sessionId 必填）· 对齐 StreamingToolExecutor 经 execute(call, ctx) 的派发形态。 */
+    private static ToolUseContext toolUseContext(String sessionId) {
+        return new ToolUseContext(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            Map.of(), List.of(), "", new AbortController(), List.of());
     }
 
     @Test
@@ -201,6 +209,11 @@ class BrowserToolRegistryTest {
     @SuppressWarnings("unchecked")
     private static ToolResult<String> executeAsString(Tool tool, ToolUseBlock call) {
         return (ToolResult<String>) tool.execute(call);
+    }
+
+    /** [批 3c] 带显式会话载体执行（工具据此透传 sessionId，不读任何 ambient/裸 MDC）。 */
+    private static ToolResult<String> executeAsString(Tool tool, ToolUseBlock call, ToolUseContext ctx) {
+        return (ToolResult<String>) tool.execute(call, ctx);
     }
 
     private static JsonNode schemaOf(List<Tool> tools, String name) {

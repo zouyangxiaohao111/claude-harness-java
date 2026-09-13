@@ -14,7 +14,6 @@ import com.nexusai.application.agent.skill.BundledSkillDefinition;
 import com.nexusai.application.agent.skill.BundledSkills;
 import com.nexusai.application.agent.skill.PromptBlock;
 import com.nexusai.application.agent.tool.SessionStorage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.PromptFnContext;
 import org.slf4j.Logger;
@@ -310,8 +309,8 @@ public class CommandRegistrationConfigGroupAGitDir {
      * CC context.resume 切入新会话未接线（branch.ts:279-281），fork 文件已生成但不切换当前会话。
      */
     private void registerBranchHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("branch", args -> {
-            String sessionId = RequestContext.sessionId();
+        dispatcher.registerSlashCommand("branch", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             if (sessionId == null || sessionId.isBlank()) {
                 log.warn("[CommandRegistrationConfigGroupAGitDir] /branch 无会话上下文，无法读取 transcript（CC branch.ts:69 getSessionId + :78-87 读文件失败报 'No conversation to branch'）");
                 return;
@@ -350,8 +349,9 @@ public class CommandRegistrationConfigGroupAGitDir {
      * && tengu_quartz_lantern），此处不强行触发。交互 UI 属前端组件，受控差异。
      */
     private void registerDiffHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("diff", args -> {
-            String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+        dispatcher.registerSlashCommand("diff", (args, sessionId, inFlightUserMessageId) -> {
+            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
+            String cwd = CwdResolution.getCwd(sessionId);
             if (cwd == null || cwd.isBlank()) {
                 cwd = System.getProperty("user.dir", ".");
             }
@@ -371,7 +371,7 @@ public class CommandRegistrationConfigGroupAGitDir {
      * → handler 仅披露触发（前端负责消息选择 UI），不追加消息（对齐 skip 语义，受控差异）。
      */
     private void registerRewindHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommandResult("rewind", args -> {
+        dispatcher.registerSlashCommandResult("rewind", (args, sessionId, inFlightUserMessageId) -> {
             log.info("[CommandRegistrationConfigGroupAGitDir] /rewind 已触发：消息选择器 UI 属前端组件（CC rewind.ts:8-13 openMessageSelector + return {type:'skip'}），后端不追加消息（受控差异）");
             // CC rewind.ts:11-12 恒 return {type:'skip'}（不追加消息）→ 无 stdout，回传 skip 对齐
             return UserInputDispatcher.LocalCommandResult.skip();
@@ -391,7 +391,7 @@ public class CommandRegistrationConfigGroupAGitDir {
     private void registerAddDirHandler(UserInputDispatcher dispatcher,
                                        PermissionUpdatePersister persister,
                                        PermissionUpdateApplier applier) {
-        dispatcher.registerSlashCommand("add-dir", args -> {
+        dispatcher.registerSlashCommand("add-dir", (args, sessionId, inFlightUserMessageId) -> {
             String directoryPath = args != null ? args.trim() : "";
             if (directoryPath.isEmpty()) {
                 log.warn("[CommandRegistrationConfigGroupAGitDir] /add-dir 缺少路径参数（CC add-dir.tsx:112-116 无路径显示 AddWorkspaceDirectory 输入表单，web 需前端弹表单，受控差异）");

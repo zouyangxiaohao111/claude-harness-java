@@ -1937,7 +1937,7 @@ public class CommandHookExecutor {
             return null;
         }
         // [批 3b] session_id 回退: event.sessionId() ?? parentTuc.sessionId()（显式载体链）
-        //   ⛔ 不再读 RequestContext.sessionId()（MDC/ThreadLocal）：本方法在 hook 发射线程执行，
+        //   ⛔ 不再读 裸 MDC 的 sessionId()（MDC/ThreadLocal）：本方法在 hook 发射线程执行，
         //   派生线程（tool-exec 池 / WebSocketPermissionPrompter 裸池 / HOOK_EXECUTOR）读 MDC
         //   恒 null 或读到上一任务残留的别会话 id（第三态）。缺值不静默：WARN 暴露。
         String sessionId = event.sessionId();
@@ -2034,7 +2034,7 @@ public class CommandHookExecutor {
      * sessionId = {@code event.sessionId()}（<b>唯一源</b>；批 3b 删除 MDC 回退）。事件经
      * {@link #enrichBaseFields} 合并后 sessionId 已由显式载体（parentTuc）注入；仍缺 → 记 WARN
      * 并回落 {@code CwdResolution.getCwd(null)}（= user.dir，对齐 CC getOriginalCwd 兜底）。
-     * ⛔ 不再读 {@code RequestContext.sessionId()}：本方法在 HOOK_EXECUTOR 池线程求值，
+     * ⛔ 不再读 裸 MDC 的 {@code sessionId()}：本方法在 HOOK_EXECUTOR 池线程求值，
      * ThreadLocal 恒 null 或残留别会话值。
      *
      * <p><b>身份域红线 D-1</b>：CwdResolution.getCwd 不读 {@code SessionProjectRoot.resolve()}

@@ -25,7 +25,8 @@ public interface BrowserChannel {
      * 扩展侧 action）。Java 端等价：把本次工具入参原样转发，返回扩展执行结果文本。
      *
      * <p><b>多会话并行（browser-mcp-align）</b>：一个扩展连接服务所有会话。{@code sessionId}
-     * 由调用方（{@link BrowserMcpTool} 读 {@link com.nexusai.common.RequestContext#sessionId()}）
+     * 由调用方（{@link BrowserMcpTool#execute} 从本次工具调用的
+     * {@link com.nexusai.application.agent.tool.ToolUseContext#sessionId()} 读取）
      * 传入，透传在 {@code tool_call} 消息里 —— 扩展按它定位/创建该会话的 tab 组（对齐 CCB
      * tabs_context_mcp「每个对话创建自己的新 tab」）。结果回传仍按 {@code callId} 匹配，与
      * {@code sessionId} 无关。

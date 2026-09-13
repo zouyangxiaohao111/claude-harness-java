@@ -2,7 +2,6 @@ package com.nexusai.application.agent.command;
 
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import org.junit.jupiter.api.AfterEach;
@@ -42,10 +41,10 @@ import static org.mockito.Mockito.when;
  * <p>env 经 {@link EffortCommand#envProvider} 接缝覆写（JDK 9+ System.getenv 只读），
  * finally 还原（同包访问 package-private 字段）。SessionMapper 为 mock。
  *
- * <p><b>[批 3a] 会话标识改为显式传参</b>：{@link EffortCommand#handle(String, String)} 的第二个
- * 参数就是当前会话 —— 不再经 {@code RequestContext.sessionId()}（裸 MDC）解析。本测试随之改为
- * <b>显式传 {@link #SESSION}</b>，不再在 setUp 里写 MDC；并有专门用例证明「MDC 里残留别的会话时
- * 不会串写」（见 {@code explicitSessionId_ignoresStaleMdc}）。
+ * <p><b>[批 3a/3c] 会话标识改为显式传参</b>：{@link EffortCommand#handle(String, String)} 的第二个
+ * 参数就是当前会话 —— 不再经裸 MDC 会话槽解析（该槽批 3c 已彻底删除）。本测试随之改为
+ * <b>显式传 {@link #SESSION}</b>，不再在 setUp 里写 MDC；并有专门用例钉死「写入恒落显式
+ * sessionId」（见 {@code explicitSessionId_ignoresStaleMdc}）。
  */
 class EffortCommandTest {
 
@@ -76,7 +75,6 @@ class EffortCommandTest {
     @AfterEach
     void tearDown() {
         EffortCommand.envProvider = originalEnvProvider;
-        RequestContext.clear();
     }
 
     @Test
@@ -226,22 +224,18 @@ class EffortCommandTest {
     }
 
     @Test
-    @DisplayName("[批 3a] 会话态显式传参：MDC 残留别的会话 id 时不串写（写入恒落显式 sessionId）")
+    @DisplayName("[批 3c] 会话态显式传参：写入恒落显式 sessionId（不再有任何 ambient 会话槽）")
     void explicitSessionId_ignoresStaleMdc() {
-        // WHY（规则九）：删除 RequestContext 的第一阶段目标就是「REST 入口不再依赖 MDC」。MDC 的
-        //   sessionId 有第三态 —— 不是 null，而是**上一个请求残留的、别的会话的 id**（看起来完全
-        //   合法）。旧实现读 MDC ⇒ 用户 A 的 /effort 会写到用户 B 的会话行上且无人发现。
-        //   本用例故意把 MDC 设成**另一个**会话：若实现回退读 MDC，verify(SESSION) 立刻红。
-        RequestContext.setSession("sess-someone-else");
-        try {
-            EffortCommand.EffortCommandResult r = command.handle("low", SESSION);
-            assertThat(r.effortValue()).isEqualTo("low");
-            // 会话主键解析 = 显式 sessionId（MDC 值从未参与）
-            verify(sessionMapper).selectOneById(SESSION);
-            verify(sessionMapper, never()).selectOneById("sess-someone-else");
-            assertThat(session.getEffortLevel()).isEqualTo("low");
-        } finally {
-            RequestContext.clear();
-        }
+        // WHY（规则九）：REST 入口不得依赖任何 ambient 会话态，会话标识一律显式传参。
+        // [批 3c] 语义消失：旧实现读裸 MDC，故可构造「MDC 残留了**别的**会话 id」这一第三态诱饵
+        //   （不是 null，而是上一请求残留、看起来完全合法的 id）——用户 A 的 /effort 会写到用户 B
+        //   的会话行上。裸 MDC 会话槽已删除 ⇒ 该诱饵无法再构造，本用例退化为「写入恒落显式
+        //   sessionId」：selectOneById 只可能收到显式 SESSION。
+        EffortCommand.EffortCommandResult r = command.handle("low", SESSION);
+        assertThat(r.effortValue()).isEqualTo("low");
+        // 会话主键解析 = 显式 sessionId
+        verify(sessionMapper).selectOneById(SESSION);
+        verify(sessionMapper, never()).selectOneById("sess-someone-else");
+        assertThat(session.getEffortLevel()).isEqualTo("low");
     }
 }

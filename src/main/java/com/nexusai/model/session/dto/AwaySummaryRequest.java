@@ -11,7 +11,7 @@ package com.nexusai.model.session.dto;
  * 对齐 {@code 待前端对接.md} §8.2 契约。
  *
  * @param sessionId 目标会话 UUID（body JSON {@code {"sessionId": "..."}}；空/缺省时控制器兜底 query
- *                  参数与 {@code RequestContext} MDC）
+ *                  参数与 裸 MDC 会话槽（批 3c 已删））
  */
 public record AwaySummaryRequest(
         String sessionId

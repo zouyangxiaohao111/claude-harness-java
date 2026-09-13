@@ -217,9 +217,21 @@ public class SettingsService {
         if (req.maxConsecutiveAutocompactFailures() != null) s.setMaxConsecutiveAutocompactFailures(req.maxConsecutiveAutocompactFailures());
         if (req.maxPtlRetries() != null) s.setMaxPtlRetries(req.maxPtlRetries());
         if (req.maxCompactStreamingRetries() != null) s.setMaxCompactStreamingRetries(req.maxCompactStreamingRetries());
-        // [V55 fix-transcript-nudge] snip nudge 消息数阈值 merge（null = 不覆盖；V55 列
+        // [V55 fix-transcript-nudge] snip nudge 阈值 merge（null = 不覆盖；V55 列
         //   snip_nudge_threshold，前端「环境配置」可配；消费点 CompactSettingsResolver 实时读，写库即生效）
-        if (req.snipNudgeThreshold() != null) s.setSnipNudgeThreshold(req.snipNudgeThreshold());
+        // [snip-nudge-percent 2026-09-13] 语义由「消息数」改为「上下文剩余百分比」，值域 1..100。
+        //   越界 fail-loud（ValidationException → 400）而非静默回落 —— 否则用户看到 900 存进去了、
+        //   系统实际用默认 30，属静默失败（规则十二）。
+        //   0 亦按非法处理：旧语义里 ≤0 = 未配置，若让 0 合法（= 只在剩余 0% 时提示）会静默翻转行为；
+        //   关闭 nudge 请用 settings.history_snip_enabled。
+        if (req.snipNudgeThreshold() != null) {
+            Integer v = req.snipNudgeThreshold();
+            if (v < 1 || v > 100) {
+                throw new ValidationException(
+                    "snipNudgeThreshold 非法（有效域 1..100，单位=上下文剩余百分比；关闭 nudge 请用 history_snip_enabled）");
+            }
+            s.setSnipNudgeThreshold(v);
+        }
         // [prompt-align G0-02 V56] 提示词对齐门控 12 列 merge（null = 不覆盖，对齐既有 merge；
         //   DB 列承载，前端「环境配置」可配；消费点经 PromptAlignSettingsResolver 实时读，写库即生效）
         if (req.taskReminderEnabled() != null) s.setTaskReminderEnabled(req.taskReminderEnabled());
@@ -435,8 +447,9 @@ public class SettingsService {
             s.getMaxConsecutiveAutocompactFailures(),
             s.getMaxPtlRetries(),
             s.getMaxCompactStreamingRetries(),
-            // [V55 fix-transcript-nudge] snip nudge 消息数阈值透出（V55 列 snip_nudge_threshold；
-            //   null = 未配置 → 消费点回落窗口自适应算法 SnipCompactor.resolveSnipNudgeThreshold）
+            // [V55 fix-transcript-nudge · snip-nudge-percent 2026-09-13] snip nudge 阈值透出
+            //   （V55 列 snip_nudge_threshold；语义 = 上下文剩余百分比，值域 1..100）。
+            //   null = 未配置 → 消费点回落默认 30%（SnipCompactor.SNIP_NUDGE_DEFAULT_REMAINING_PERCENT）
             s.getSnipNudgeThreshold(),
             // [prompt-align G0-02 V56] 提示词对齐门控 12 列透出（V56 列；null = 未配置 →
             //   消费点回落 CC 原判定链 env/FeatureFlags/硬编码默认/既有判定类）

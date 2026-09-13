@@ -220,7 +220,7 @@ public class AutoCompactor {
      * 透传本压缩器的 querySource（main-thread gate · postCompactCleanup.ts:36-39）。
      */
     private Runnable runPostCompactCleanup =
-        () -> PostCompactCleanup.runPostCompactCleanup(this.querySource);
+        () -> PostCompactCleanup.runPostCompactCleanup(this.querySource, this.sessionId);
 
     /**
      * SM 成功链 notifyCompaction · CC original: notifyCompaction(querySource ?? 'compact', agentId)
@@ -442,7 +442,7 @@ public class AutoCompactor {
     public void setRunPostCompactCleanup(Runnable runPostCompactCleanup) {
         this.runPostCompactCleanup = runPostCompactCleanup != null
             ? runPostCompactCleanup
-            : () -> PostCompactCleanup.runPostCompactCleanup(this.querySource);
+            : () -> PostCompactCleanup.runPostCompactCleanup(this.querySource, this.sessionId);
     }
 
     /** 注入 SM 成功链 notifyCompaction 执行器。 */

@@ -12,7 +12,6 @@ import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
 import com.nexusai.application.agent.skill.ClaudePaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.telemetry.Telemetry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
 import com.nexusai.domain.oauth_account.AccountOAuthTokenService;
@@ -80,7 +79,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class MemoryControllerTest {
 
     private static final String NEXUSAI_AUTO_DREAM_PROP = "NEXUSAI_AUTO_DREAM";
-    /** 测试会话 ID（MDC 注入 + SessionProjectRoot.setForSession，驱动 CwdResolution boundProject 层）。 */
+    /** 测试会话 ID（SessionProjectRoot.setForSession 绑定 + 显式传给 CwdResolution boundProject 层）。 */
     private static final String TEST_SESSION = "memory-controller-test-session";
 
     /** G5：nexusai 自有根唯一 appName（claude-config 固定名会跨用例碰撞 → 静态自增）。 */
@@ -125,8 +124,8 @@ class MemoryControllerTest {
         // dream 锁目录 = tempDir/memory（ConsolidationLock 锁 mtime 读取面）
         memoryStorage = new MemoryStorage(Paths.get(tempDir.toString(), "memory"));
         ReflectionTestUtils.setField(controller, "memoryStorage", memoryStorage);
-        // 工作目录覆写：MDC sessionId + setForSession → CwdResolution boundProject 层（方案 b）。
-        RequestContext.setSession(TEST_SESSION);
+        // 工作目录覆写：显式 sessionId + setForSession → CwdResolution boundProject 层（方案 b）。
+        // [批 3c] 会话态不再经裸 MDC 会话槽传播（该槽已删）——测试与控制器同源地显式传 TEST_SESSION。
         SessionProjectRoot.setForSession(TEST_SESSION, projectDir.toString());
         // setControllerAdvice：GlobalExceptionHandler 将 ValidationException → 400 / ForbiddenException →
         // 403 / NotFoundException → 404（无 advice 则 500 传播为 ServletException）
@@ -152,7 +151,6 @@ class MemoryControllerTest {
             originalUserHome = null;
         }
         SessionProjectRoot.clearSession(TEST_SESSION);
-        RequestContext.clear();
         if (previousAutoDreamProp != null) {
             System.setProperty(NEXUSAI_AUTO_DREAM_PROP, previousAutoDreamProp);
         } else {
@@ -162,9 +160,9 @@ class MemoryControllerTest {
         BundledSkillEnabledGates.bridgeSettingsMapper(null);
     }
 
-    /** 会话绑定 boundProject（CwdResolution.getOriginalCwdLayer() 经 MDC TEST_SESSION 解析；与控制器同源）。 */
+    /** 会话绑定 boundProject（CwdResolution.getOriginalCwdLayer(TEST_SESSION) 显式会话解析；与控制器同源）。 */
     private String boundProject() {
-        return CwdResolution.getOriginalCwdLayer();
+        return CwdResolution.getOriginalCwdLayer(TEST_SESSION);
     }
 
     @Test
@@ -179,7 +177,8 @@ class MemoryControllerTest {
         String managedMemoryPath = Paths.get(tempDir.toString(), "managed", "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(userMemoryPath).getParent());
         Files.writeString(Paths.get(userMemoryPath), "# user disk");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 档按 boundProject 装配）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# existing project claude.md", List.of()),
             MemoryFileInfo.of(claudeReadonlyPath, ClaudemdMemoryType.PROJECT, "# claude read-only", List.of())));
 
@@ -226,7 +225,7 @@ class MemoryControllerTest {
 
         // MISS-1 缓存预热（memory.tsx:86-87）：clearMemoryFileCaches + getMemoryFiles 均被调用
         verify(claudemdEngine).clearMemoryFileCaches();
-        verify(claudemdEngine).getMemoryFiles(false);
+        verify(claudemdEngine).getMemoryFiles(false, TEST_SESSION);
     }
 
     @Test
@@ -243,22 +242,26 @@ class MemoryControllerTest {
     }
 
     @Test
-    @DisplayName("[批 3a 反向实验] MDC 残留别的会话 id 时不读 MDC：无 query 仍 400（若回退 MDC 则本用例红）")
+    @DisplayName("[批 3a/3c] 无 ?sessionId= 且无任何隐式会话源 → 400（会话态显式化后不存在可回落的隐式会话）")
     void listFiles_mdcIsIgnored_is400() throws Exception {
-        // WHY（规则九）：MDC 第三态 = 上一请求残留的**别的会话** id（看起来完全合法）⇒ 旧实现会把 B
+        // WHY（规则九）：反例是「进程内存在合法会话，但请求没带 ?sessionId=」时静默用上别的会话 ——
+        //   旧实现经裸 MDC 会话槽读上一请求残留的**别的会话** id（第三态，看起来完全合法）⇒ 会把 B
         //   会话的 boundProject 当作 A 的返回 Project 档记忆文件（跨项目泄漏）而无人发现。
-        //   本例 setUp 已把 MDC 设成 TEST_SESSION（合法会话），若实现回退读 MDC 则请求 200。
+        // [批 3c] 语义消失：裸 MDC 会话槽已删 → 无法在测试里制造「隐式会话存在」的前置条件
+        //   （原 setUp 的 setSession(TEST_SESSION) 已删），本用例退化为「无 sessionId ⇒ 400」的
+        //   第二种编码（与 listFiles_noSessionId_is400 同断言）。断言文本按原样保留，待裁定：
+        //   保留（作为显式化后的回归护栏）或删除（与 listFiles_noSessionId_is400 重复）。
         mockMvc.perform(get("/api/v1/memory/files"))
             .andExpect(status().isBadRequest());
     }
 
     @Test
-    @DisplayName("GET /api/v1/memory/files → query ?sessionId= 驱动 Project 档（无 MDC 时 query 生效）")
+    @DisplayName("GET /api/v1/memory/files → query ?sessionId= 驱动 Project 档（会话态显式化后 query 是唯一会话源）")
     void listFiles_querySessionId_drivesProjectTier() throws Exception {
-        RequestContext.clear(); // 清 MDC → 仅靠 query ?sessionId=
-        // 用 projectDir 直接（boundProject() 依赖 MDC，已清 → 会回落 user.dir 跨盘，relativize 抛异常）
+        // [批 3c] 原「清裸 MDC 会话槽 → 仅靠 query ?sessionId=」的语句已删（该槽已删，无隐式会话可清）。
+        // 用 projectDir 直接（boundProject 由显式 query sessionId=TEST_SESSION 解析 = projectDir）
         String existingPath = Paths.get(projectDir.toString(), ".claude", "CLAUDE.md").toString();
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# project", List.of())));
 
         mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
@@ -277,7 +280,8 @@ class MemoryControllerTest {
         String teamMemPath = Paths.get(configHome.toString(), "team", "MEMORY.md").toString();
         Files.createDirectories(Paths.get(userMemoryPath).getParent());
         Files.writeString(Paths.get(userMemoryPath), "# user");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言 → 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(userMemoryPath, ClaudemdMemoryType.USER, "# user", List.of()),
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# project", List.of()),
             MemoryFileInfo.of(autoMemPath, ClaudemdMemoryType.AUTO_MEM, "# auto mem", List.of()),
@@ -301,7 +305,8 @@ class MemoryControllerTest {
     void listFiles_onlyAutoMemAndTeamMemReturnsOnlySlots() throws Exception {
         String autoMemPath = Paths.get(configHome.toString(), "MEMORY.md").toString();
         String teamMemPath = Paths.get(configHome.toString(), "team", "MEMORY.md").toString();
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言 → 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(autoMemPath, ClaudemdMemoryType.AUTO_MEM, "# auto mem", List.of()),
             MemoryFileInfo.of(teamMemPath, ClaudemdMemoryType.TEAM_MEM, "# team mem", List.of())));
 
@@ -413,7 +418,8 @@ class MemoryControllerTest {
         String existingPath = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(existingPath).getParent());
         Files.writeString(Paths.get(existingPath), "# managed content");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 无会话 → 显式 null（POST /files 无会话入参；控制器按 null 调 getMemoryFiles）
+        when(claudemdEngine.getMemoryFiles(false, null)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# managed content", List.of())));
 
         mockMvc.perform(post("/api/v1/memory/files")
@@ -457,7 +463,8 @@ class MemoryControllerTest {
         String path = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(path).getParent());
         Files.writeString(Paths.get(path), "# old project");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 白名单按 boundProject 计算）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(path, ClaudemdMemoryType.PROJECT, "# old project", List.of())));
 
         // file = 相对 boundProject 的 .nexusai 路径（D6 白名单仅 nexusai 可写面）
@@ -488,8 +495,8 @@ class MemoryControllerTest {
     @Test
     @DisplayName("PUT /api/v1/memory/files → Project 缺 sessionId（三源全空）→ 400")
     void updateFile_projectMissingSessionId400() throws Exception {
-        RequestContext.clear(); // body/query/MDC 三源全空
-
+        // [批 3c] 原「清裸 MDC 会话槽（body/query/MDC 三源全空）」的语句已删（该槽已删）——
+        //   body 与 query 均无 sessionId ⇒ 显式 null ⇒ Project 档 400（会话态显式化后的同一语义）
         mockMvc.perform(put("/api/v1/memory/files")
                 .contentType(APPLICATION_JSON)
                 .content("{\"type\":\"Project\",\"file\":\".claude/CLAUDE.md\",\"content\":\"# x\"}"))
@@ -506,7 +513,8 @@ class MemoryControllerTest {
         String existingPath = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(existingPath).getParent());
         Files.writeString(Paths.get(existingPath), "# old");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 白名单按 boundProject 计算）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# old", List.of())));
 
         mockMvc.perform(put("/api/v1/memory/files")
@@ -528,7 +536,8 @@ class MemoryControllerTest {
         String existingPath = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(existingPath).getParent());
         Files.writeString(Paths.get(existingPath), "# old");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 白名单按 boundProject 计算）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# old", List.of())));
         String absPath = Paths.get(tempDir.toString(), "other", "CLAUDE.md").toString();
 
@@ -550,7 +559,8 @@ class MemoryControllerTest {
         String existingPath = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(existingPath).getParent());
         Files.writeString(Paths.get(existingPath), "# old");
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 白名单按 boundProject 计算）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# old", List.of())));
 
         mockMvc.perform(put("/api/v1/memory/files")
@@ -567,7 +577,8 @@ class MemoryControllerTest {
         // （创建仍走 POST /files 'wx'）——若实现 upsert 创建，前端误删可被静默重建，违背「创建走 POST」。
         String existingPath = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         // 不创建磁盘文件
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 白名单按 boundProject 计算）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(existingPath, ClaudemdMemoryType.PROJECT, "# old", List.of())));
 
         mockMvc.perform(put("/api/v1/memory/files")
@@ -614,7 +625,8 @@ class MemoryControllerTest {
         // [D6] 项目级目录 = nexusai 自有（.nexusai）；.claude 段不参与白名单 → 用 .nexusai 才达 symlink 检查层
         String linkPath = Paths.get(boundProject(), NexusaiPaths.getProjectDirName(), "CLAUDE.md").toString();
         Files.createDirectories(Paths.get(linkPath).getParent());
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of(
+        // [批 3c] 会话相关断言（Project 白名单按 boundProject 计算）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of(
             MemoryFileInfo.of(linkPath, ClaudemdMemoryType.PROJECT, "# old", List.of())));
 
         boolean symlinkCreated;
@@ -682,7 +694,8 @@ class MemoryControllerTest {
         valid.setAccessToken("valid-token");
         valid.setExpiresAt(System.currentTimeMillis() + 10 * 60 * 1000L);
         when(tokenService.readByAccessToken("valid-token")).thenReturn(valid);
-        when(claudemdEngine.getMemoryFiles(false)).thenReturn(List.of());
+        // [批 3c] 会话相关断言（GET /files 传 sessionId 驱动 Project 档）→ 显式传真实会话 TEST_SESSION
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenReturn(List.of());
 
         MockMvc authMvc = MockMvcBuilders.standaloneSetup(controller)
             .setControllerAdvice(new GlobalExceptionHandler())
@@ -713,7 +726,7 @@ class MemoryControllerTest {
     @Test
     @DisplayName("GET /api/v1/memory/files → 引擎 getMemoryFiles 抛异常 → 500（CC getMemoryFiles 失败即命令失败）")
     void listFiles_engineFailureIs500() throws Exception {
-        when(claudemdEngine.getMemoryFiles(false)).thenThrow(new RuntimeException("disk unavailable"));
+        when(claudemdEngine.getMemoryFiles(false, TEST_SESSION)).thenThrow(new RuntimeException("disk unavailable"));
 
         mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
             .andExpect(status().isInternalServerError());

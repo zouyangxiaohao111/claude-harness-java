@@ -127,9 +127,12 @@ class CompactCommandCcContractTest {
     void userInputDispatcherRoutesCompactSlashCommand() {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         AtomicReference<String> invokedArgs = new AtomicReference<>("__unset__");
-        dispatcher.registerSlashCommand("compact", invokedArgs::set);
+        // [批 3c] handler 3 形参 (args, sessionId, inFlightUserMessageId)：本用例只验证 args 路由，
+        //   不涉会话 → 后两形参弃用（dispatch 端显式传 null）。
+        dispatcher.registerSlashCommand("compact", (args, sessionId, inFlightUserMessageId) -> invokedArgs.set(args));
 
-        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/compact summarize the whole conversation");
+        // 本用例不涉会话 → 显式 null（旧实现里等价于 MDC 为空）
+        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/compact summarize the whole conversation", null, null);
 
         assertThat(r.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(r.routedTo()).isEqualTo("compact");
@@ -142,9 +145,10 @@ class CompactCommandCcContractTest {
     void userInputDispatcherRoutesCompactWithoutArgs() {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         AtomicReference<String> invokedArgs = new AtomicReference<>("__unset__");
-        dispatcher.registerSlashCommand("compact", invokedArgs::set);
+        // [批 3c] 3 形参 handler；本用例不涉会话 → dispatch 端显式 null（旧实现里等价于 MDC 为空）
+        dispatcher.registerSlashCommand("compact", (args, sessionId, inFlightUserMessageId) -> invokedArgs.set(args));
 
-        dispatcher.dispatch("/compact");
+        dispatcher.dispatch("/compact", null, null);
 
         assertThat(invokedArgs.get()).isEqualTo("");
     }
@@ -273,7 +277,10 @@ class CompactCommandCcContractTest {
     @Test
     @DisplayName("buildDisplayText: 非 verbose 无 userDisplayMessage → 基础文本（默认绑定 ctrl+o，CC chordToString 归一化小写）")
     void displayTextBaseNonVerbose() {
-        assertThat(CompactCommand.buildDisplayText(false, null))
+        // [批 3c] `buildDisplayText(boolean, String)` 已删：模型源改为按**显式会话**读
+        //   `MicroCompactor.getMainLoopModel(sessionId)`（原读环境态会话槽）⇒ 补第 3 参本用例会话。
+        //   本用例未注入会话模型（该会话桶 mainLoopModel=null）⇒ 不产生 upgradeMessage 段，断言不变。
+        assertThat(CompactCommand.buildDisplayText(false, null, SESSION))
             .isEqualTo("Compacted (ctrl+o to see full summary)");
     }
 
@@ -321,14 +328,15 @@ class CompactCommandCcContractTest {
     @Test
     @DisplayName("buildDisplayText: 非 verbose + userDisplayMessage → 追加换行")
     void displayTextWithUserMessage() {
-        assertThat(CompactCommand.buildDisplayText(false, "summary detail"))
+        // [批 3c] 同上：补显式会话第 3 参（未注入会话模型 ⇒ 无 upgradeMessage 段，断言不变）。
+        assertThat(CompactCommand.buildDisplayText(false, "summary detail", SESSION))
             .isEqualTo("Compacted (ctrl+o to see full summary)\nsummary detail");
     }
 
     @Test
     @DisplayName("buildDisplayText: verbose → 省略 shortcut 提示")
     void displayTextVerbose() {
-        assertThat(CompactCommand.buildDisplayText(true, "detail"))
+        assertThat(CompactCommand.buildDisplayText(true, "detail", SESSION))
             .isEqualTo("Compacted detail");
     }
 

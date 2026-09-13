@@ -8,7 +8,6 @@ import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.context.ClaudemdEngine;
 import com.nexusai.application.agent.memory.AutoMemPaths;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
@@ -277,7 +276,7 @@ public class EnterWorktreeTool implements Tool {
                     "Already in a worktree session: this session is already in a worktree. "
                             + "Exit the current worktree with ExitWorktree before entering another one.");
         }
-        Path gitRoot = currentGitRoot();
+        Path gitRoot = currentGitRoot(sessionKey);
         try {
             // CC worktree.ts:716-719 — validateWorktreeSlug 先行（hook 分支与 git 分支共用；
             //   hooks 收到的是原始 slug，分支名由 git 路径从 slug 推导）
@@ -431,7 +430,7 @@ public class EnterWorktreeTool implements Tool {
         if (originalCwd == null || originalCwd.isBlank()) {
             // cwd-align-ext：兜底 = 会话 cwd（CC EnterWorktreeTool.ts:96 setOriginalCwd(getCwd()) 就地捕获）；
             //   无 sessionId 回落 user.dir（方案 1，零行为变化）。
-            originalCwd = CwdResolution.getCwd(RequestContext.sessionId());
+            originalCwd = CwdResolution.getCwd(sessionKey);
             if (originalCwd == null || originalCwd.isBlank()) {
                 originalCwd = System.getProperty("user.dir", ".");
             }
@@ -571,9 +570,14 @@ public class EnterWorktreeTool implements Tool {
      * 当前 git 仓库根目录 — 对齐 CC findCanonicalGitRoot(getCwd())（EnterWorktreeTool.ts:84）。
      * cwd-align-ext：user.dir 硬编码 → 会话 cwd + 复用 {@link AutoMemPaths#findCanonicalGitRoot}
      * （worktree/submodule .git 文件解析）；无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     *
+     * <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code execute} 显式传入（= {@code ctx.sessionId()}，
+     * 无 ctx ⇒ null）；⛔ 不再读裸 MDC。
+     *
+     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
      */
-    private Path currentGitRoot() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    private Path currentGitRoot(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         if (cwd == null || cwd.isBlank()) {
             cwd = System.getProperty("user.dir", ".");
         }

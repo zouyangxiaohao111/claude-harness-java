@@ -101,20 +101,21 @@ class LoopRememberParamsTest {
 
         SkillRegistry registry = new SkillRegistry("C:/nonexistent-skills-root-p26");
 
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null（本类各用例只验 enabled 过滤链/惰性求值，不涉会话）
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .as("CC commands.ts:484 isCommandEnabled 过滤：禁用命令不出现在聚合结果")
             .contains("enabled-x")
             .doesNotContain("disabled-y");
 
-        assertThat(registry.findCommand("disabled-y"))
+        assertThat(registry.findCommand("disabled-y", null))
             .as("CC SkillTool.getAllCommands→findCommand：禁用 skill 不可经 SkillTool 调用（disabled→null）")
             .isNull();
-        assertThat(registry.findCommand("enabled-x"))
+        assertThat(registry.findCommand("enabled-x", null))
             .as("启用命令仍可查找")
             .isNotNull();
 
-        assertThat(registry.getModelInvocableCommands())
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .as("CC getSkillToolCommands 消费已 enabled 过滤的 getCommands：禁用命令不入模型可调用清单")
             .doesNotContain("disabled-y");
@@ -157,9 +158,10 @@ class LoopRememberParamsTest {
         BundledSkills.register(fresh);
 
         SkillRegistry registry = new SkillRegistry("C:/nonexistent-skills-root-p26-fresh");
-        registry.getAllCommands();
-        registry.getAllCommands();
-        registry.getAllCommands();
+        // [批 3c] 无会话 → 显式 null
+        registry.getAllCommands(null);
+        registry.getAllCommands(null);
+        registry.getAllCommands(null);
         assertThat(evaluations.get())
             .as("CC isEnabled checks run fresh every call（commands.ts:478 注释）：3 次 getAllCommands → supplier 求值 ≥3 次（raw 仍 memoize，过滤新鲜）")
             .isGreaterThanOrEqualTo(3);

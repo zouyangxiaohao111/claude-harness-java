@@ -6,7 +6,6 @@ import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
-import com.nexusai.common.RequestContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -64,7 +63,7 @@ import static org.mockito.Mockito.mock;
 @DisplayName("[R-A7/方案B] BackgroundTaskRunner outputFile 路径对齐 CC 五层 getTaskOutputDir")
 class BackgroundTaskRunnerTest {
 
-    /** [批 3b-D7] workflow 任务的显式创建会话（旧实现由下游读 MDC）。 */
+    /** [批 3b-D7] workflow 任务的显式创建会话（旧实现由下游读 ambient 会话槽）。 */
     private static final String WF_SESSION = "sess-wf-3b-fixture";
 
     private final TaskFrameworkService framework = new TaskFrameworkService(null);
@@ -73,9 +72,8 @@ class BackgroundTaskRunnerTest {
 
     @AfterEach
     void tearDown() {
-        // MDC ThreadLocal + sysprop + SessionCwdHolder（originalCwd 登记）均须清理，
-        // 避免跨测试线程复用泄漏（RequestContext 铁律 + originalCwd 槽防串扰）
-        RequestContext.clear();
+        // sysprop + SessionCwdHolder（originalCwd 登记）须清理，避免跨测试线程复用泄漏。
+        // [批 3c] 原此处还清「裸 MDC 会话槽」——该槽已整类删除，语句删除。
         System.clearProperty("nexusai.sessionId");
         SessionCwdHolder.reset();
     }
@@ -94,8 +92,8 @@ class BackgroundTaskRunnerTest {
         //   getTaskOutputDir = join(getProjectTempDir(), getSessionId(), 'tasks')（diskOutput.ts:50-55/72-74），
         //   getProjectTempDir = join(getClaudeTempDir(), sanitizePath(getOriginalCwd()))（filesystem.ts:376-378）。
         //   sessionId 纳入路径防止并发会话 clobber（diskOutput.ts:38-41）。旧平铺 /tmp/agent-*.out 已删除。
+        // [批 3c] 原此处 setSession 造 ambient 会话当「同源」装置；API 已显式传入 sessionId ⇒ 装置删除。
         String sessionId = "sess-r-b";
-        RequestContext.setSession(sessionId);
         String taskId = "a12345678";
 
         String path = BackgroundTaskRunner.taskOutputPath(sessionId, taskId);
@@ -117,29 +115,25 @@ class BackgroundTaskRunnerTest {
         //   RemoteTaskConfiguration.taskOutputDirSupplier 都收敛到它（旧 monitor flat 根 {tmpdir}/nexusai-tasks
         //   + remote 项目目录根已删）。本测试逐段锁死五层形态（temp + per-user + per-project + per-session + tasks），
         //   回归即变红。
+        // [批 3c] 原此处 setSession + try/finally(clear) 造/清 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-dir-b";
-        RequestContext.setSession(sessionId);
-        try {
-            String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
-            String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
-            Path p = Path.of(dir);
-            // 五层逐段：.../tasks(⑤) ← sessionId(④) ← sanitizedCwd(③) ← {appName}[-{uid}](②) ← tmpRoot(①)
-            assertThat(p.getName(p.getNameCount() - 1).toString()).isEqualTo("tasks");
-            assertThat(p.getName(p.getNameCount() - 2).toString()).isEqualTo(sessionId);
-            assertThat(p.getName(p.getNameCount() - 4).toString())
-                .as("per-user 层 = NexusaiPaths.getAppTempDirName()（Windows={appName} / Unix={appName}-{uid}，CC filesystem.ts:307-315 结构）")
-                .isEqualTo(NexusaiPaths.getAppTempDirName());
-            assertThat(dir).startsWith(Paths.get(tmpDir).toString());
-            // 旧 A-7 简化根不得再产出（无兼容层/双轨，单轨五层）
-            assertThat(dir).doesNotContain("nexusai-sessions");
-            // 不含 taskId 文件名（目录 vs 文件语义分离，对齐 CC getTaskOutputDir 返回目录）
-            assertThat(dir).doesNotEndWith(".output");
-            // 与 taskOutputPath 的关系：taskOutputPath = taskOutputDir + <taskId>.output
-            assertThat(BackgroundTaskRunner.taskOutputPath(sessionId, "tid-b"))
-                .isEqualTo(Paths.get(BackgroundTaskRunner.taskOutputDir(sessionId), "tid-b.output").toString());
-        } finally {
-            RequestContext.clear();
-        }
+        String tmpDir = System.getProperty("java.io.tmpdir", "/tmp");
+        String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
+        Path p = Path.of(dir);
+        // 五层逐段：.../tasks(⑤) ← sessionId(④) ← sanitizedCwd(③) ← {appName}[-{uid}](②) ← tmpRoot(①)
+        assertThat(p.getName(p.getNameCount() - 1).toString()).isEqualTo("tasks");
+        assertThat(p.getName(p.getNameCount() - 2).toString()).isEqualTo(sessionId);
+        assertThat(p.getName(p.getNameCount() - 4).toString())
+            .as("per-user 层 = NexusaiPaths.getAppTempDirName()（Windows={appName} / Unix={appName}-{uid}，CC filesystem.ts:307-315 结构）")
+            .isEqualTo(NexusaiPaths.getAppTempDirName());
+        assertThat(dir).startsWith(Paths.get(tmpDir).toString());
+        // 旧 A-7 简化根不得再产出（无兼容层/双轨，单轨五层）
+        assertThat(dir).doesNotContain("nexusai-sessions");
+        // 不含 taskId 文件名（目录 vs 文件语义分离，对齐 CC getTaskOutputDir 返回目录）
+        assertThat(dir).doesNotEndWith(".output");
+        // 与 taskOutputPath 的关系：taskOutputPath = taskOutputDir + <taskId>.output
+        assertThat(BackgroundTaskRunner.taskOutputPath(sessionId, "tid-b"))
+            .isEqualTo(Paths.get(BackgroundTaskRunner.taskOutputDir(sessionId), "tid-b.output").toString());
     }
 
     @Test
@@ -154,25 +148,24 @@ class BackgroundTaskRunnerTest {
             .as("显式会话生效（五层镜像期望）")
             .isEqualTo(expectedFiveLayerPath("explicit-sess", taskId));
 
-        // 反向对照：线程上有 MDC / sysprop 也不再被采用（旧实现二者都会生效）
-        RequestContext.setSession("mdc-should-not-win");
+        // 反向对照：线程上有 sysprop 也不再被采用（旧实现会生效）
+        // [批 3c] 原此处还写「别的会话」的裸 MDC 值当第一主源诱饵 —— 该槽已整类删除，装置删除。
         System.setProperty("nexusai.sessionId", "sysprop-should-not-win");
         try {
             assertThat(BackgroundTaskRunner.taskOutputPath("explicit-sess", taskId))
-                .as("显式入参必须胜出；旧实现（MDC 主源）会得到 mdc-should-not-win 的路径")
+                .as("显式入参必须胜出；旧实现（sysprop 兜底）会得到 sysprop-should-not-win 的路径")
                 .isEqualTo(expectedFiveLayerPath("explicit-sess", taskId));
             assertThat(BackgroundTaskRunner.taskOutputDir("explicit-sess"))
                 .as("taskOutputDir 同理只认显式会话")
                 .isEqualTo(Paths.get(expectedFiveLayerPath("explicit-sess", taskId)).getParent().toString());
 
             assertThatThrownBy(() -> BackgroundTaskRunner.taskOutputPath(null, taskId))
-                .as("null 会话 → 抛（旧实现回落 MDC/sysprop/unknown）")
+                .as("null 会话 → 抛（旧实现回落 sysprop/unknown）")
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("sessionId");
             assertThatThrownBy(() -> BackgroundTaskRunner.taskOutputDir("   "))
                 .isInstanceOf(IllegalArgumentException.class);
         } finally {
-            RequestContext.clear();
             System.clearProperty("nexusai.sessionId");
         }
     }
@@ -185,19 +178,15 @@ class BackgroundTaskRunnerTest {
         //   \AppData\Local\Temp），CC 用 'claude' 即可（:305/308-310）。Java 等价 = NexusaiPaths
         //   getAppTempDirName() 平台分支（per-user 层品牌名动态 appName；uid 数字经 UnixSystem，不硬编码）。
         //   测试独立按 os.name 计算期望层（win 无 uid 段），断言 taskOutputDir 的 ② per-user 段一致。
+        // [批 3c] 原此处 setSession + try/finally(clear) 造/清 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-uid-b";
-        RequestContext.setSession(sessionId);
-        try {
-            String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
-            String expectedLayer = os.contains("windows")
-                ? NexusaiPaths.getAppName()
-                : NexusaiPaths.getAppTempDirName(); // = {appName}-{uid}（uid 经现取，不硬编码）
-            String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
-            String perUserSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 4).toString();
-            assertThat(perUserSegment).as("② per-user 段必须与 NexusaiPaths 平台分支一致").isEqualTo(expectedLayer);
-        } finally {
-            RequestContext.clear();
-        }
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String expectedLayer = os.contains("windows")
+            ? NexusaiPaths.getAppName()
+            : NexusaiPaths.getAppTempDirName(); // = {appName}-{uid}（uid 经现取，不硬编码）
+        String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
+        String perUserSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 4).toString();
+        assertThat(perUserSegment).as("② per-user 段必须与 NexusaiPaths 平台分支一致").isEqualTo(expectedLayer);
     }
 
     @Test
@@ -210,19 +199,14 @@ class BackgroundTaskRunnerTest {
         String sessionB = "sess-proj-b";
         SessionCwdHolder.setOriginalCwd(sessionA, "C:\\dev\\projectA");
         SessionCwdHolder.setOriginalCwd(sessionB, "C:\\dev\\projectB");
-        try {
-            RequestContext.setSession(sessionA);
-            String dirA = BackgroundTaskRunner.taskOutputDir(sessionA);
-            RequestContext.setSession(sessionB);
-            String dirB = BackgroundTaskRunner.taskOutputDir(sessionB);
-            assertThat(dirA).as("不同项目 originalCwd 必须产出不同输出目录").isNotEqualTo(dirB);
-            assertThat(Path.of(dirA).getName(Path.of(dirA).getNameCount() - 3).toString())
-                .as("③ per-project 段 = sanitizePath(originalCwd)").isEqualTo("C--dev-projectA");
-            assertThat(Path.of(dirB).getName(Path.of(dirB).getNameCount() - 3).toString())
-                .isEqualTo("C--dev-projectB");
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 原此处两次 setSession 切换 ambient 会话；API 已按会话显式入参 ⇒ 装置删除。
+        String dirA = BackgroundTaskRunner.taskOutputDir(sessionA);
+        String dirB = BackgroundTaskRunner.taskOutputDir(sessionB);
+        assertThat(dirA).as("不同项目 originalCwd 必须产出不同输出目录").isNotEqualTo(dirB);
+        assertThat(Path.of(dirA).getName(Path.of(dirA).getNameCount() - 3).toString())
+            .as("③ per-project 段 = sanitizePath(originalCwd)").isEqualTo("C--dev-projectA");
+        assertThat(Path.of(dirB).getName(Path.of(dirB).getNameCount() - 3).toString())
+            .isEqualTo("C--dev-projectB");
     }
 
     @Test
@@ -231,19 +215,15 @@ class BackgroundTaskRunnerTest {
         // WHY（规则九）：CC sanitizePath（sessionStoragePortable.ts:311-319）替换所有非字母数字字符
         //   （含 Windows 反斜杠/冒号）为 '-'，保证跨平台目录名安全（Windows 冒号保留字符会破坏路径）。
         //   Java 复验 AutoMemPaths.sanitizePath 镜像：C:\Users\dev\my project → C--Users-dev-my-project。
+        // [批 3c] 原此处 setSession + try/finally(clear) 造/清 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-sanitize-b";
         SessionCwdHolder.setOriginalCwd(sessionId, "C:\\Users\\dev\\my project");
-        RequestContext.setSession(sessionId);
-        try {
-            String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
-            String projectSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 3).toString();
-            assertThat(projectSegment)
-                .as("③ per-project 段不得含路径分隔符/冒号残留，替换为 '-'")
-                .isEqualTo("C--Users-dev-my-project");
-            assertThat(projectSegment).doesNotContain("\\").doesNotContain(":").doesNotContain("/");
-        } finally {
-            RequestContext.clear();
-        }
+        String dir = BackgroundTaskRunner.taskOutputDir(sessionId);
+        String projectSegment = Path.of(dir).getName(Path.of(dir).getNameCount() - 3).toString();
+        assertThat(projectSegment)
+            .as("③ per-project 段不得含路径分隔符/冒号残留，替换为 '-'")
+            .isEqualTo("C--Users-dev-my-project");
+        assertThat(projectSegment).doesNotContain("\\").doesNotContain(":").doesNotContain("/");
     }
 
     @Test
@@ -251,8 +231,8 @@ class BackgroundTaskRunnerTest {
     void registerAsyncAgent_outputFileUsesHierarchicalPath() {
         // WHY: CC registerAsyncAgent createTaskStateBase → Task.ts:121 outputFile: getTaskOutputPath(id)，
         //   taskId===agentId 合一。旧 Java 硬编码 /tmp/agent-{taskId}.out 已删除（A-7 拍板）。
+        // [批 3c] 原此处 setSession 造 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-async";
-        RequestContext.setSession(sessionId);
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
 
@@ -271,8 +251,8 @@ class BackgroundTaskRunnerTest {
     void registerAgentForeground_outputFileUsesHierarchicalPath() {
         // WHY: CC registerAgentForeground createTaskStateBase → Task.ts:121 outputFile: getTaskOutputPath(id)，
         //   taskId===agentId 合一。旧 Java 硬编码 /tmp/agent-{taskId}.out 已删除（A-7 拍板）。
+        // [批 3c] 原此处 setSession 造 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-fg";
-        RequestContext.setSession(sessionId);
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
 
@@ -292,8 +272,8 @@ class BackgroundTaskRunnerTest {
         // WHY: CC ensureOutputDir mkdir recursive（diskOutput.ts:65-67）——五层格式父目录
         //   .../{sessionId}/tasks 不再天然存在，Java appendToOutputFile 必须写前建父目录。
         //   否则 completeAsyncAgent 写 summary 时 ENOENT（旧平铺 /tmp 父目录恒在无需此步）。
+        // [批 3c] 原此处 setSession 造 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-write-" + UUID.randomUUID().toString().substring(0, 8);
-        RequestContext.setSession(sessionId);
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
         BackgroundTask task = runner.registerAsyncAgent(

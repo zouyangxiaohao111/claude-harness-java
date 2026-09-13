@@ -133,10 +133,13 @@ public record SettingsDto(
     Integer maxConsecutiveAutocompactFailures,
     Integer maxPtlRetries,
     Integer maxCompactStreamingRetries,
-    // [V55 fix-transcript-nudge] snip nudge 消息数阈值（V55 列 snip_nudge_threshold，DB 承载；
-    //   前端「环境配置」可配；null = 回落窗口自适应算法——SnipCompactor.resolveSnipNudgeThreshold
-    //   按 effectiveWindow 档位：≥800k → 150；>600k → 100；≥400k → 60；其他 → 30（CC 默认））·
-    //   CC original: SNIP_NUDGE_THRESHOLD（snipCompact.ts:11，默认 30）。>0 = DB 值直接覆盖窗口自适应。
+    // [V55 fix-transcript-nudge · snip-nudge-percent 2026-09-13] snip nudge 阈值
+    //   （V55 列 snip_nudge_threshold，DB 承载；前端「环境配置」可配）。
+    //   语义 = 「上下文剩余百分比」，值域 1..100（旧「消息数」语义及其窗口自适应档位已删除）。
+    //   null = 未配置 → 回落默认 30%；越界值显式暴露而非静默取用：
+    //     读侧 SnipCompactor.resolveSnipNudgeRemainingPercent 回落 30% + WARN，
+    //     写侧 SettingsService.update 抛 ValidationException（400，不落库）。
+    //   关闭 nudge 请用 history_snip_enabled，不要用 0（0 按非法处理，防旧语义静默翻转行为）。
     //   消费点：CompactSettingsResolver.snipNudgeThreshold() 实时读 + AgentLoopContext nudge 门。
     Integer snipNudgeThreshold,
     // [prompt-align G0-02 V56] 提示词对齐门控 12 列（V56 建列，DB 承载，前端「环境配置」可配；

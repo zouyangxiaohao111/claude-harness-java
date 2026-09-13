@@ -25,45 +25,62 @@ import java.util.concurrent.CompletableFuture;
 public final class SystemPromptSections {
 
     private static final Logger log = LoggerFactory.getLogger(SystemPromptSections.class);
+    /** [批 3c] 「无会话 cwd 回落」只 WARN 一次（env 段每次组装都会求值，不得刷屏）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean PROCESS_CWD_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean();
+
     /**
-     * 可注入 cwd 读取缝（测试注入临时目录控制 git/worktree 用例；默认走统一入口）。
+     * 可注入 cwd 读取缝（测试注入临时目录控制 git/worktree 用例；默认走进程级「无会话」解析）。
      *
      * <p>对齐 CC {@code getCwd()}（cwd.ts，per-async-context override）的测试可控性；
      * null 语义：{@link #setCwdSupplier} 传 null → 复位默认（防跨用例污染）。
      *
-     * <p><b>WF-1B</b>：默认从 {@link CwdResolution#getCwd()} 取（对齐 CC env 段
-     * {@code findGitRoot(getCwd())} git.ts:222 / isWorktree 同源），替代旧
-     * {@code Path.of(System.getProperty("user.dir"))} 直读——绑定项目/worktree 场景取对仓库。
+     * <p><b>[批 3c 会话态显式化]</b>：本类为<b>静态工具</b>，<b>无会话入参</b> ⇒ 默认 supplier
+     * 显式按「无会话」解析 {@link CwdResolution#getCwd(String)}{@code (null)}（跳过
+     * sessionCwd/boundProject 会话层，仅 override / 进程 {@code user.dir} 层）= 旧实现
+     * 「MDC 为空」分支的等价语义。对齐 CC env 段 {@code findGitRoot(getCwd())}（git.ts:222）/
+     * isWorktree 同源。<b>需要会话 cwd 的调用方必须走 {@link #cwd(String)}（显式 sessionId），
+     * 不得依赖本默认值</b>。
      */
-    private static volatile java.util.function.Supplier<Path> cwdSupplier =
-        () -> Path.of(CwdResolution.getCwd());
+    private static volatile java.util.function.Supplier<Path> cwdSupplier = defaultProcessCwdSupplier();
+
+    /** 默认（进程级「无会话」）cwd supplier · 首次求值 WARN 一次，说明回落 user.dir 及穿参通道。 */
+    private static java.util.function.Supplier<Path> defaultProcessCwdSupplier() {
+        return () -> {
+            if (PROCESS_CWD_WARNED.compareAndSet(false, true)) {
+                log.warn("[SystemPromptSections] cwdSupplier 未注入且无会话入参 → cwd 回落进程 user.dir={}；"
+                    + "如需会话 cwd 须由调用方显式传入（cwd(sessionId)）", System.getProperty("user.dir"));
+            }
+            return Path.of(CwdResolution.getCwd(null));
+        };
+    }
 
     /**
-     * 测试缝：覆盖 cwd 来源。null → 复位默认（走 {@link CwdResolution#getCwd()}）。
+     * 测试缝：覆盖 cwd 来源。null → 复位默认（进程级「无会话」解析 → 进程 user.dir）。
      *
      * @param supplier cwd 提供者（null = 默认）
      */
     static void setCwdSupplier(java.util.function.Supplier<Path> supplier) {
-        cwdSupplier = supplier != null ? supplier : () -> Path.of(CwdResolution.getCwd());
+        cwdSupplier = supplier != null ? supplier : defaultProcessCwdSupplier();
     }
 
-    /** cwd 读取 · 经 {@link #cwdSupplier}（默认走 {@link CwdResolution#getCwd()}，反斜杠归一）。 */
+    /** cwd 读取 · 经 {@link #cwdSupplier}（默认按「无会话」解析 → 进程 user.dir，反斜杠归一）。 */
     private static Path cwd() {
         return cwdSupplier.get();
     }
 
     /**
-     * 会话 cwd 读取 · 显式传 sessionId（绕过 MDC）· [cwd-session 2026-08-25 修复]。
+     * 会话 cwd 读取 · 显式传 sessionId（不经任何隐式会话槽）· [cwd-session 2026-08-25 修复]。
      *
      * <p><b>WHY</b>：env_info_simple 渲染在 ForkJoinPool.commonPool 线程（SystemPromptSectionRegistry
-     * resolveAll 的 supplyAsync），该线程 MDC sessionId=null → {@code cwd()} 走无参
-     * {@code CwdResolution.getCwd()}（读 MDC）回落 user.dir（后端启动目录）→ 系统提示
-     * {@code Primary working directory} 注入错误项目（用户实测答 nexusai-backend 应为绑定项目）。
+     * resolveAll 的 supplyAsync），该线程<b>读不到会话态</b>（批 3c 前经裸 MDC 读 sessionId）→
+     * {@code cwd()} 回落 user.dir（后端启动目录）→ 系统提示 {@code Primary working directory}
+     * 注入错误项目（用户实测答 nexusai-backend 应为绑定项目）。
      *
      * <p>sessionId 非空 → {@code CwdResolution.getCwd(sessionId)}（override ?? sessionCwd ??
-     * boundProject ?? user.dir 四层，CwdResolution.java:105-142，直接用参数不读 MDC）→ 绑定项目
+     * boundProject ?? user.dir 四层，CwdResolution.java:105-142，直接用参数）→ 绑定项目
      * 场景取对目录。sessionId null（web analyze 等无会话上下文）→ 回落 {@link #cwd()}（既有
-     * cwdSupplier 测试缝 / MDC 兜底，保留 EnvSectionTest setCwdSupplier 用例）。
+     * cwdSupplier 测试缝 / 进程 user.dir 兜底，保留 EnvSectionTest setCwdSupplier 用例）。
      *
      * @param sessionId 会话 ID（可空；null → 回落 {@link #cwd()}）
      * @return 会话 cwd（sessionId 非空）或兜底 cwd

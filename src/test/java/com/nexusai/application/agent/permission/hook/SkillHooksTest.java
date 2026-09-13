@@ -336,7 +336,9 @@ class SkillHooksTest {
         // policy array 形式只锁 hooks 面 (CC pluginOnlyPolicy.ts:23)
         tool.setPluginOnlySettingsSupplier(() -> Map.of("strictPluginOnlyCustomization", List.of("hooks")));
         // 磁盘 skill 默认 source=USER → 改标 BUNDLED (admin-trusted, CC 'bundled' ∈ ADMIN_TRUSTED_SOURCES)
-        registry.findCommand("skill-a").setSource(CommandSource.BUNDLED);
+        // [批 3c] findCommand 新增显式 sessionId 形参；此处仅做「取出命令对象改源」的准备动作，命令
+        //   查找只依赖 registry 的 cwd（本用例未注入 cwdSupplier），与会话无关 → 显式 null
+        registry.findCommand("skill-a", null).setSource(CommandSource.BUNDLED);
 
         ObjectMapper mapper = new ObjectMapper();
         ToolUseBlock block = new ToolUseBlock("tb-1", "Skill", mapper.readTree("{\"skill\":\"skill-a\"}"));
@@ -379,7 +381,8 @@ class SkillHooksTest {
         // policy=true 锁全部 customization 面 (CC pluginOnlyPolicy.ts:19-20)
         tool.setPluginOnlySettingsSupplier(() -> Map.of("strictPluginOnlyCustomization", true));
         // 磁盘 skill 默认 source=USER → 改标 POLICY_SETTINGS（managed 源，CC 'policySettings' ∈ ADMIN_TRUSTED_SOURCES）
-        registry.findCommand("skill-a").setSource(CommandSource.POLICY_SETTINGS);
+        // [批 3c] 同上一用例：准备动作与会话无关 → 显式 null
+        registry.findCommand("skill-a", null).setSource(CommandSource.POLICY_SETTINGS);
 
         ObjectMapper mapper = new ObjectMapper();
         ToolUseBlock block = new ToolUseBlock("tb-1", "Skill", mapper.readTree("{\"skill\":\"skill-a\"}"));

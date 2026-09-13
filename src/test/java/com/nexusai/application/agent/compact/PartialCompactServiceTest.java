@@ -13,7 +13,6 @@ import com.nexusai.application.agent.tasks.BackgroundTask;
 import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskType;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.infra.exception.NotFoundException;
@@ -101,7 +100,6 @@ class PartialCompactServiceTest {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         // [partial-progress] 统一通道静态槽位复位（用例失败/中断时防跨用例串台）· 幂等
         CompactProgressState.clear();
         CompactProgressState.clearAbort();
@@ -362,12 +360,8 @@ class PartialCompactServiceTest {
             messageService, sessionService, summary, registry, null, null);
 
         int before = hookTableSize();
-        try {
-            svc.partialCompact(sessionId,
-                new PartialCompactRequest("a1", PartialCompactRequest.Direction.UP_TO, null));
-        } finally {
-            RequestContext.clear();
-        }
+        svc.partialCompact(sessionId,
+            new PartialCompactRequest("a1", PartialCompactRequest.Direction.UP_TO, null));
         // buildContext 新建 SystemPromptContextProvider（构造注册缓存清理回调）→ partialCompact finally close()
         // 注销 → 静态表回到基线（RES-C2 契约；若删掉 finally close → 每次 partial +1 有界累积 → 红）
         assertThat(hookTableSize()).as("partialCompact 结束后 provider finally close → CACHE_CLEAR_HOOKS 回到基线")

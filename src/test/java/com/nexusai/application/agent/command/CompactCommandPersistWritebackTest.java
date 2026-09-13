@@ -14,7 +14,6 @@ import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.config.ToolRegistrationConfig;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.tool.AbortController;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -76,7 +75,6 @@ class CompactCommandPersistWritebackTest {
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
         CacheSafeParamsHolder.clear();
-        RequestContext.clear();
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {
@@ -308,7 +306,6 @@ class CompactCommandPersistWritebackTest {
         AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
         state.replaceMessages(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")));
         registry.register(SESSION, state);
-        RequestContext.set(SESSION, "req-persist");
 
         String out = invokeHandleCompact(registry, sm, messageService);
 
@@ -344,7 +341,6 @@ class CompactCommandPersistWritebackTest {
         AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
         state.replaceMessages(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")));
         registry.register(SESSION, state);
-        RequestContext.set(SESSION, "req-nochannel");
 
         String out = invokeHandleCompact(registry, sm, null);
 
@@ -372,7 +368,6 @@ class CompactCommandPersistWritebackTest {
     @DisplayName("[端到端] handleCompactCommand 会话未注册 AgentState → 明确失败文案（不谎报压缩成功）")
     void handleCompactCommandFailsLoudWhenStateMissing() {
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry(); // 空注册表
-        RequestContext.set(SESSION, "req-nostate");
 
         String out = invokeHandleCompact(registry, null, null);
 
@@ -387,8 +382,10 @@ class CompactCommandPersistWritebackTest {
                                               SessionMemoryService sm,
                                               MessageService messageService) {
         ToolRegistrationConfig config = new ToolRegistrationConfig();
+        // [批 3c] 参数序与生产 registerCompactSlashCommand lambda 一致：
+        //   (args, sessionId, inFlightUserMessageId, sessionRegistry, ...) —— 会话标识显式传参
         Object out = ReflectionTestUtils.invokeMethod(config, "handleCompactCommand",
-            "", registry, null, null, sm, null, null, null, null, null, messageService);
+            "", SESSION, null, registry, null, null, sm, null, null, null, null, null, messageService);
         assertThat(out).isInstanceOf(String.class);
         return (String) out;
     }

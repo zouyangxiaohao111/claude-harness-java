@@ -61,14 +61,12 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Autowired;
 
 import java.nio.file.Path;
@@ -601,10 +599,28 @@ public class SubagentTool implements Tool {
      * CC resumeAgent.ts:106-109）、PostCompactAttachmentRestorer（compact 后 agent list delta）、
      * MemoryPrefetcher（agent-memory 预取）消费 —— 均随当前会话冻结启动目录得到各自 project 的 agent 表。
      *
-     * @return 当前会话的 Agent 定义注册中心（恒非 null）
+     * <p><b>[批 3c]</b> 本无参重载的会话源（裸 MDC 槽）已删除 → 恒为<b>进程默认</b>
+     * （workspaceDir）agent-defs。有显式会话的调用方必须改用
+     * {@link #agentRegistry(String)}（否则会把 per-session agent 表静默换成进程默认表）。
+     *
+     * @return 进程默认（workspaceDir）的 Agent 定义注册中心（恒非 null）
      */
     public AgentDefinitionRegistry agentRegistry() {
         return currentRegistry();
+    }
+
+    /**
+     * 按会话取 Agent 定义注册中心 · {@link #registryForSession(String)} 的语义等价重载。
+     *
+     * <p><b>WHY 存在</b>：{@link #agentRegistry()} 无会话形参（原经裸 MDC 解析，批 3c 已删）——
+     * 有会话的调用方必须显式传会话，否则静默退化为进程默认 agent-defs。本重载把「会话从哪来」
+     * 钉在签名上（禁 MDC/禁回放）。
+     *
+     * @param sessionId 会话 ID（可 null/空白 → 进程默认兜底，与 {@link #agentRegistry()} 同）
+     * @return 该会话的 Agent 定义注册中心（恒非 null）
+     */
+    public AgentDefinitionRegistry agentRegistry(String sessionId) {
+        return registryForSession(sessionId);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -615,33 +631,26 @@ public class SubagentTool implements Tool {
      * 解析当前会话的 agent-defs 发现 cwd（<b>冻结</b>）· 对齐 CC {@code getAgentDefinitionsWithOverrides(cwd)}
      * memoize 键（loadAgentsDir.ts:296）。
      *
-     * <p>优先级：① ToolUseContext.sessionId（当前 turn 直接源）；② {@link RequestContext#sessionId()}
-     * （MDC，无 ctx 场景 —— {@code listAgents()} / {@code agentRegistry()} / {@code prompt()} 三个
-     * <b>无会话入参</b>的公开访问器走此路）；③ {@code workspaceDir} 兜底（无会话：JUnit/后台，
-     * 生产=user.dir，测试=注入 temp）。
+     * <p>优先级：① ToolUseContext.sessionId（当前 turn 直接源）；② {@code workspaceDir} 兜底
+     * （无 ctx：JUnit/后台装配，生产=user.dir，测试=注入 temp）。
      *
-     * <p><b>[批 3b 未决项 · 已登记]</b> ② 的 MDC 读点本批<b>未</b>删除：无 ctx 的三个公开访问器
-     * （{@code listAgents()} / {@code agentRegistry()} / {@code prompt()}）签名里没有会话参数，
-     * 删掉 ② 会让「按会话列 agent-defs」在这些路径退化为 workspaceDir（{@code SubagentToolPerSessionLoadTest}
-     * 6 个用例即锁该契约）。显式化需先把会话作为参数引入这三个访问器（同文件已有显式兄弟
-     * {@link #registryForSession(String)}）并改造其调用方（AgentsHandler / PostCompactAttachmentRestorer /
-     * prompt()）—— 属独立设计，见批 3b 报告「未决项」。有 ctx 的调用点（executeAsync 等）已全部
-     * 走 ① 显式源。
+     * <p><b>[批 3c 已完成：MDC 读点删除]</b> 原 ② 的裸 MDC 会话槽已删除 —— 会话态一律显式传参，
+     * 禁读 MDC/禁回放。无 ctx 的<b>有会话形参</b>访问器走
+     * {@link #registryForSession(String)} / {@link #agentRegistry(String)} / {@link #listAgents(String)}；
+     * 仍无会话形参的访问器（{@link #prompt()} 因 {@code Tool.prompt()} 接口无参、{@link #listAgents()} /
+     * {@link #agentRegistry()} 保留给无会话调用方）走 ② workspaceDir 兜底（进程默认 agent-defs）。
      *
      * <p><b>[REWORK-1] 有会话 → 冻结发现键（非动态 sessionCwd）</b>：{@link #sessionDiscoveryCwdFor} 会话
      * 首访问捕获一次（锚 L3 boundProject = CC 启动目录），此后恒定 —— 会话内 bash cd / worktree 进入
      * 不改 agent-defs 表（对齐 CC startup-cwd-fixed；不用 {@link CwdResolution#getCwd(String)} 因含
      * 动态 L2 SessionCwdHolder，会触发 cd 重载）。
      *
-     * @param ctx 当前 turn 的 ToolUseContext（可为 null → 回落 MDC/workspaceDir）
+     * @param ctx 当前 turn 的 ToolUseContext（可为 null → 回落 workspaceDir）
      * @return 归一化发现 cwd（恒非 null，首访问后冻结）
      */
     private String sessionCwdFor(ToolUseContext ctx) {
         String sessionId = ctx != null && ctx.sessionId() != null
             ? ctx.sessionId() : null;
-        if (sessionId == null || sessionId.isBlank()) {
-            sessionId = RequestContext.sessionId();
-        }
         if (sessionId != null && !sessionId.isBlank()) {
             return sessionDiscoveryCwdFor(sessionId);
         }
@@ -686,8 +695,11 @@ public class SubagentTool implements Tool {
     }
 
     /**
-     * 当前会话 registry · {@link #registryFor(String)} 的便捷重载（无 ctx 场景，
-     * 会话从 MDC 解析；无 MDC → workspaceDir 兜底）。
+     * 无会话 registry · {@link #registryFor(String)} 的便捷重载（{@code sessionCwdFor(null)} →
+     * workspaceDir 兜底，即<b>进程默认</b> agent-defs）。
+     *
+     * <p><b>[批 3c]</b> 原经裸 MDC 槽解析会话，已删除 —— 无显式会话的调用方一律得进程默认视图。
+     * 有会话时应用 {@link #registryForSession(String)}（会话形参显式）。
      */
     private AgentDefinitionRegistry currentRegistry() {
         return registryFor(sessionCwdFor(null));
@@ -702,9 +714,9 @@ public class SubagentTool implements Tool {
      *
      * <p>sessionId 非空 → 该会话<b>冻结发现 cwd</b> 的 per-session registry
      * （{@link #sessionDiscoveryCwdFor}，首访问冻结锚 L3 boundProject = CC 启动目录）；
-     * sessionId 空/null → 当前会话兜底（{@link #currentRegistry()}：MDC 会话 → workspaceDir）。
+     * sessionId 空/null → 进程默认兜底（{@link #currentRegistry()}：workspaceDir）。
      *
-     * @param sessionId 会话 ID（可 null/空白 → 兜底当前会话）
+     * @param sessionId 会话 ID（可 null/空白 → 兜底进程默认 registry）
      * @return 该会话的 Agent 定义注册中心（恒非 null）
      */
     public AgentDefinitionRegistry registryForSession(String sessionId) {
@@ -1321,9 +1333,28 @@ public class SubagentTool implements Tool {
      * <p>验证/装配用访问器（含 flag/plugin 来源，占位 N/A 移除后的可见性）。
      * <p>[C-方案3][DEC-C-02] 从单例 registry 改为 per-session 视图（按 sessionCwd 惰性载入，
      *   对齐 CC memoize(cwd)）；无会话 → workspaceDir 兜底。
+     *
+     * <p><b>[批 3c]</b> 本无参重载的会话源（裸 MDC 槽）已删除 → 恒为<b>进程默认</b>
+     * （workspaceDir）agent-defs。有显式会话的调用方用 {@link #listAgents(String)}。
+     *
+     * @return 进程默认（workspaceDir）视图的 agent 定义列表
      */
     public List<AgentDefinition> listAgents() {
         return currentRegistry().listAgents();
+    }
+
+    /**
+     * 按会话列出 agent 定义 · {@link #listAgents()} 的会话显式重载。
+     *
+     * <p><b>WHY 存在</b>：无参 {@link #listAgents()} 已无会话源（批 3c 删裸 MDC 槽）→ 恒进程默认；
+     * 有会话的调用方（如 {@code AgentsHandler} /agents 面板）应改用本方法，否则会把 per-session
+     * agent 表静默换成进程默认表。
+     *
+     * @param sessionId 会话 ID（可 null/空白 → 进程默认兜底，与 {@link #listAgents()} 同）
+     * @return 该会话冻结发现 cwd 视图下的 agent 定义列表
+     */
+    public List<AgentDefinition> listAgents(String sessionId) {
+        return registryForSession(sessionId).listAgents();
     }
 
     /**
@@ -1525,7 +1556,8 @@ public class SubagentTool implements Tool {
      * （agent 列表 / fork 语义 / when NOT to use / usage notes / examples）→ 在不该 spawn 时 spawn
      * / 不知道有哪些 agent 可用（探查 §8.3 第 1 条）。本方法从注入字段拉取上下文：
      * <ul>
-     *   <li>agents = {@code currentRegistry().listAgents()}（per-session 视图，C-方案3）— CC prompt() 入参 agents</li>
+     *   <li>agents = {@code currentRegistry().listAgents()}（<b>进程默认</b> workspaceDir 视图 ——
+     *       prompt() 无会话入参，批 3c 已删裸 MDC 槽；见方法 javadoc「未决项」）— CC prompt() 入参 agents</li>
      *   <li>MCP filter = {@code loadAgentsDir.filterAgentsByMcpRequirements} — CC AgentTool.tsx:218</li>
      *   <li>permission filter = {@link #filterDeniedAgents} — CC AgentTool.tsx:219</li>
      *   <li>isCoordinator = {@link #isCoordinatorMode()}（[D6] 单一 CoordinatorMode bean 源）— CC AgentTool.tsx:223</li>
@@ -1534,9 +1566,20 @@ public class SubagentTool implements Tool {
      *
      * <p>S2-2 决策: 不改 Tool.prompt() 签名（改则破坏所有 Tool 实现），SubagentTool 从注入字段拉取
      * （CC buildTool 注入 4 参是 TS 框架特性，Java 用 DI 字段等价）。
+     *
+     * <p><b>[批 3c 未决项] 无会话入参</b>：{@code Tool.prompt()} 是无参接口方法，签名里没有会话，
+     * 且原会话源（裸 MDC 槽）已按批 3c 要求删除 → 本方法只能按<b>进程默认</b>（{@code workspaceDir}，
+     * 生产 = {@code user.dir}）的 agent-defs 渲染 Agent 工具描述。绑定会话的 per-session agent-defs
+     * （{@link #registryForSession(String)}）可能与之不同 → 工具描述里的 agent 清单在多项目部署下
+     * 可能与本会话实际可选 agent 不一致（列多/列少）。方法体首行有 {@code log.warn} 留痕。
      */
     @Override
     public String prompt() {
+        // [批 3c] Tool.prompt() 无会话形参（接口约束，不可加）→ 会话源不可得 → 进程默认视图。
+        //   WHY warn：绑定会话的 per-session agent-defs 可能与本描述不符（未决项，见 javadoc）。
+        log.warn("[SubagentTool] Tool.prompt() 无会话入参 → Agent 工具描述按进程默认（workspaceDir={}）"
+                + "的 agent-defs 渲染；绑定会话的 per-session agent-defs 可能不同（批 3c 未决项）",
+            workspaceDir.toAbsolutePath().normalize());
         // [C-方案3][DEC-C-02] per-session 视图：一会话一项目 → agent-defs 从会话项目载入
         //   （对齐 CC AgentTool.tsx:197-225 prompt({agents: options.agentDefinitions.activeAgents})）
         List<AgentDefinition> agents = currentRegistry().listAgents();
@@ -3192,17 +3235,12 @@ public class SubagentTool implements Tool {
                 //   transcript / userContext 读会话值而非回落（修 M-05/M-06/M-12）。restore 线程原值
                 //   成对，多嵌套子代理不串台。
                 final String parentProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-                // [reqId MDC 传播] 调度线程（工具池线程，经 StreamingToolExecutor 回放已含父 MDC）捕获
-                //   MDC context map → 子代理异步线程回放（实测：logback MDC 不随 new Thread 继承，须显式回放）。
-                //   WHY: 子代理线程 RequestContext.requestId()=null → isTodoV2Enabled()=false → 子代理回落
-                //   V1 TodoWrite、父 V2/子 V1 工具集分叉（决策 #65）。回放后子代理线程同帧 requestId 可见。
-                final java.util.Map<String, String> mdcCtx = MDC.getCopyOfContextMap();
+                // [批 3c] 原此处有 [reqId MDC 传播] 回放块（调度线程捕获 MDC context map → 异步线程
+                //   setContextMap → finally restore），已**删除**：其唯一消费者是 (a) logback
+                //   %X{sessionId}/%X{reqId} 前缀（本批已移除）与 (b) TaskSystemConfig.isTodoV2Enabled()
+                //   读 MDC reqId（本批已改为**进程级**判定）。会话标识改由各调用点**显式传参**。
+                //   ⚠ 下方 AutoMemPaths projectRoot 回放**仍然承重**（归批 4 收敛），保留不动。
                 Thread asyncWorker = new Thread(() -> {
-                    // [reqId MDC 传播] 线程体开头回放父 MDC → 任务结束 restore 线程原值（成对，防泄漏）。
-                    java.util.Map<String, String> prevAsyncMdc = MDC.getCopyOfContextMap();
-                    if (mdcCtx != null) {
-                        MDC.setContextMap(mdcCtx);
-                    }
                     // [IMP-D F4/M-05] 线程体注入：capture 线程原值 → set 父值 → finally restore（成对）。
                     String prevAsyncProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
                     try {
@@ -3319,12 +3357,6 @@ public class SubagentTool implements Tool {
                     } finally {
                         // [IMP-D F4/M-05] 成对 restore 线程原值（null → 移除回落生效）。
                         AutoMemPaths.restoreCurrentProjectRoot(prevAsyncProjectRoot);
-                        // [reqId MDC 传播] 成对 restore 线程原值（null → 清理，防线程复用泄漏）。
-                        if (prevAsyncMdc != null) {
-                            MDC.setContextMap(prevAsyncMdc);
-                        } else {
-                            MDC.clear();
-                        }
                     }
                 }, "async-subagent-" + ag);
                 asyncWorker.setDaemon(true);
@@ -3740,17 +3772,10 @@ public class SubagentTool implements Tool {
         // [IMP-D F4/M-05] resume 调度线程（调用线程）捕获父会话 projectRoot → 注入
         //   asyncWorker 新线程（ThreadLocal 不跨线程 · 修 M-05/M-06）。restore 成对。
         final String parentResumeProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
-        // [reqId MDC 传播] 调度线程（工具池线程，经 StreamingToolExecutor 回放已含父 MDC）捕获
-        //   MDC context map → resume 子代理异步线程回放（实测：logback MDC 不随 new Thread 继承，须显式回放）。
-        //   WHY: 同 executeAsync —— 子代理线程 RequestContext.requestId()=null → isTodoV2Enabled()=false
-        //   → 子代理回落 V1 TodoWrite、父 V2/子 V1 工具集分叉（决策 #65）。
-        final java.util.Map<String, String> mdcCtx = MDC.getCopyOfContextMap();
+        // [批 3c] 原 [reqId MDC 传播] 回放块已删（同 executeAsync 的 WHY：logback 前缀已移除 +
+        //   isTodoV2Enabled 判定已进程级；会话标识一律显式传参）。
+        //   ⚠ 下方 AutoMemPaths projectRoot 回放仍承重（归批 4），保留不动。
         Thread asyncWorker = new Thread(() -> {
-            // [reqId MDC 传播] 线程体开头回放父 MDC → 任务结束 restore 线程原值（成对，防泄漏）。
-            java.util.Map<String, String> prevResumeMdc = MDC.getCopyOfContextMap();
-            if (mdcCtx != null) {
-                MDC.setContextMap(mdcCtx);
-            }
             // [IMP-D F4/M-05] 线程体注入：capture 线程原值 → set 父值 → finally restore（成对）。
             String prevResumeProjectRoot = AutoMemPaths.captureCurrentProjectRoot();
             try {
@@ -3838,12 +3863,6 @@ public class SubagentTool implements Tool {
             } finally {
                 // [IMP-D F4/M-05] 成对 restore 线程原值（null → 移除回落生效）。
                 AutoMemPaths.restoreCurrentProjectRoot(prevResumeProjectRoot);
-                // [reqId MDC 传播] 成对 restore 线程原值（null → 清理，防线程复用泄漏）。
-                if (prevResumeMdc != null) {
-                    MDC.setContextMap(prevResumeMdc);
-                } else {
-                    MDC.clear();
-                }
             }
         }, "resume-subagent-" + ag);
         asyncWorker.setDaemon(true);
@@ -4002,7 +4021,7 @@ public class SubagentTool implements Tool {
      * @return 父完整有效 system prompt；不可重建 → 旧路径产物
      */
     private String buildForkParentFallbackSystemPrompt(ToolUseContext ctx, AgentDefinition selectedAgent) {
-        // [批 3b] sessionId 唯一源 = ctx.sessionId()（显式载体）；⛔ 不再读 RequestContext.sessionId()
+        // [批 3b / 批 3c] sessionId 唯一源 = ctx.sessionId()（显式载体）；⛔ 不再读裸 MDC
         //   （本方法在工具执行线程调用，MDC 取不到本会话）。
         String sessionId = ctx != null ? ctx.sessionId() : null;
         if (sessionId == null || sessionId.isBlank()) {

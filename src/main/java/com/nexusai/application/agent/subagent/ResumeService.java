@@ -225,7 +225,7 @@ public class ResumeService {
         // ── 6. agent 解析（CC :100-112）──
         boolean isResumedFork = meta != null
             && ForkSubagent.FORK_SUBAGENT_TYPE.equals(meta.agentType());
-        AgentDefinition selectedAgent = resolveSelectedAgent(meta, isResumedFork);
+        AgentDefinition selectedAgent = resolveSelectedAgent(meta, isResumedFork, sessionId);
         if (log.isDebugEnabled()) {
             log.debug("[ResumeService] agent 解析: meta.agentType={}, isResumedFork={}, selectedAgent={} "
                     + "(CC resumeAgent.ts:100-112)",
@@ -319,18 +319,24 @@ public class ResumeService {
      * （plain JUnit 未注入）→ 回退 {@link BuiltInAgents#get}（内置 + fork）；未命中 →
      * GENERAL_PURPOSE_AGENT（CC :109 {@code found ?? GENERAL_PURPOSE_AGENT}）。
      *
+     * <p><b>[批 3c]</b> registry 改为<b>会话显式</b>：{@link SubagentTool#agentRegistry(String)} 由调用方
+     * （{@link #resumeAgentBackground}）透传主会话 sessionId —— 原无参 {@code agentRegistry()} 的裸 MDC
+     * 会话源已删除，若继续用无参重载会静默退化为进程默认 agent-defs（resume 自定义 agent 命中率变化）。
+     *
      * @param meta         agent 元数据（可为 null）
      * @param isResumedFork 是否 fork resume
+     * @param sessionId    主会话 ID（{@link #resumeAgentBackground} 形参直传；可为 null → 进程默认兜底）
      * @return 解析后的 AgentDefinition（恒非 null）
      */
-    AgentDefinition resolveSelectedAgent(AgentTranscript.AgentMetadata meta, boolean isResumedFork) {
+    AgentDefinition resolveSelectedAgent(AgentTranscript.AgentMetadata meta, boolean isResumedFork,
+                                        String sessionId) {
         if (isResumedFork) {
             return ForkSubagentAgentDefinition.create();
         }
         if (meta != null && meta.agentType() != null && !meta.agentType().isBlank()) {
             AgentDefinition found = null;
-            if (subagentTool != null && subagentTool.agentRegistry() != null) {
-                found = subagentTool.agentRegistry().findAgent(meta.agentType());
+            if (subagentTool != null && subagentTool.agentRegistry(sessionId) != null) {
+                found = subagentTool.agentRegistry(sessionId).findAgent(meta.agentType());
             }
             if (found == null) {
                 found = BuiltInAgents.get(meta.agentType());

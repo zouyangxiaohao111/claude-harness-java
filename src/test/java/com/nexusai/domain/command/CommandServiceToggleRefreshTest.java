@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图）</b>：前端 PATCH toggle / update 只写 DB enabled
  * （{@code commandMapper.update}），磁盘 SKILL.md 无 enabled frontmatter。若 DB 变更后不清
- * {@link SkillRegistry#refreshCommandsOnly()} 命令缓存，则 {@link SkillRegistry#getAllCommands()}
+ * {@link SkillRegistry#refreshCommandsOnly()} 命令缓存，则 {@link SkillRegistry#getAllCommands(String)}
  * 的 memoize（raw loadAllCommands 缓存在 allCommandsCache 内）不重载 → DB enabled 覆盖不生效
  * （前端禁用/启用仍不真实生效）。方案2 = DB 变更后清缓存 → 下次 getAllCommands 重载读 DB enabled
  * （方案1 覆盖）。本测试验证：

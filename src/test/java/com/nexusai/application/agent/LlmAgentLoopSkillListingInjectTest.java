@@ -112,10 +112,12 @@ class LlmAgentLoopSkillListingInjectTest {
         when(messageService.listRawForTranscript(SESSION_KEY)).thenReturn(List.of(currentUserMsg));
 
         // SkillCatalog：全量 = [commit, review]，formatListing(子集) → 固定文本
+        // [批 3c] SkillCatalog 取数方法新增显式 sessionId 形参 → stub 用 anyString() 匹配
+        //   （本类生产路径恒传真实非空会话，见 new AgentState(..., sessionUuid, ...)）
         SkillCatalog catalog = mock(SkillCatalog.class);
         List<Command> commands = List.of(cmd("commit"), cmd("review"));
-        when(catalog.getModelInvocableCommandsForListing()).thenReturn(commands);
-        when(catalog.getModelInvocableCommands()).thenReturn(commands);
+        when(catalog.getModelInvocableCommandsForListing(anyString())).thenReturn(commands);
+        when(catalog.getModelInvocableCommands(anyString())).thenReturn(commands);
         when(catalog.getCharBudget(any())).thenReturn(1000);
         when(catalog.formatListing(anyList(), any())).thenReturn("- commit: 提交代码\n- review: 审查代码");
 
@@ -207,10 +209,10 @@ class LlmAgentLoopSkillListingInjectTest {
         // SkillCatalog：run1 全量=[commit,review]；run2 全量=[commit,review,new-skill]。
         //   formatListing 文本由「传入的 Command 子集」派生 → 全量 vs 增量在消息内容上可区分。
         SkillCatalog catalog = mock(SkillCatalog.class);
-        when(catalog.getModelInvocableCommandsForListing())
+        when(catalog.getModelInvocableCommandsForListing(anyString()))
             .thenReturn(List.of(cmd("commit"), cmd("review")))
             .thenReturn(List.of(cmd("commit"), cmd("review"), cmd("new-skill")));
-        when(catalog.getModelInvocableCommands()).thenReturn(List.of(cmd("commit"), cmd("review"), cmd("new-skill")));
+        when(catalog.getModelInvocableCommands(anyString())).thenReturn(List.of(cmd("commit"), cmd("review"), cmd("new-skill")));
         when(catalog.getCharBudget(any())).thenReturn(1000);
         when(catalog.formatListing(anyList(), any())).thenAnswer(inv -> {
             List<Command> passed = inv.getArgument(0);
@@ -275,8 +277,8 @@ class LlmAgentLoopSkillListingInjectTest {
 
         SkillCatalog catalog = mock(SkillCatalog.class);
         List<Command> commands = List.of(cmd("commit"), cmd("review"));
-        when(catalog.getModelInvocableCommandsForListing()).thenReturn(commands);
-        when(catalog.getModelInvocableCommands()).thenReturn(commands);
+        when(catalog.getModelInvocableCommandsForListing(anyString())).thenReturn(commands);
+        when(catalog.getModelInvocableCommands(anyString())).thenReturn(commands);
         when(catalog.getCharBudget(any())).thenReturn(1000);
         when(catalog.formatListing(anyList(), any())).thenAnswer(inv -> {
             List<Command> passed = inv.getArgument(0);
@@ -343,10 +345,10 @@ class LlmAgentLoopSkillListingInjectTest {
 
         // run1：零技能（空候选）；run2：技能出现（late-skill）。
         SkillCatalog catalog = mock(SkillCatalog.class);
-        when(catalog.getModelInvocableCommandsForListing())
+        when(catalog.getModelInvocableCommandsForListing(anyString()))
             .thenReturn(List.of())
             .thenReturn(List.of(cmd("late-skill")));
-        when(catalog.getModelInvocableCommands()).thenReturn(List.of(cmd("late-skill")));
+        when(catalog.getModelInvocableCommands(anyString())).thenReturn(List.of(cmd("late-skill")));
         when(catalog.getCharBudget(any())).thenReturn(1000);
         when(catalog.formatListing(anyList(), any())).thenAnswer(inv -> {
             List<Command> passed = inv.getArgument(0);
@@ -473,8 +475,8 @@ class LlmAgentLoopSkillListingInjectTest {
     /** formatListing 文本由入参子集派生 → 全量 vs 增量在注入消息内容上可区分。 */
     private static SkillCatalog catalogFor(List<Command> commands) {
         SkillCatalog catalog = mock(SkillCatalog.class);
-        when(catalog.getModelInvocableCommandsForListing()).thenReturn(commands);
-        when(catalog.getModelInvocableCommands()).thenReturn(commands);
+        when(catalog.getModelInvocableCommandsForListing(anyString())).thenReturn(commands);
+        when(catalog.getModelInvocableCommands(anyString())).thenReturn(commands);
         when(catalog.getCharBudget(any())).thenReturn(1000);
         when(catalog.formatListing(anyList(), any())).thenAnswer(inv -> {
             List<Command> passed = inv.getArgument(0);

@@ -1471,7 +1471,8 @@ public final class PostCompactAttachmentRestorer {
      *
      * <p>Gate：shouldInjectAgentListInMessages（env CLAUDE_CODE_AGENT_LIST_IN_MESSAGES 优先，
      * feature tengu_agent_list_attach 默认关；Java 静态面无 Spring 配置通道 → 默认关登记）+
-     * AgentTool 在工具池。内容：agentDefinitions（SubagentTool.agentRegistry().listAgents()）经
+     * AgentTool 在工具池。内容：agentDefinitions（{@code SubagentTool.agentRegistry(tuc.sessionId()).listAgents()}，
+     * 批 3c 会话显式传参）经
      * MCP 需求过滤（loadAgentsDir.filterAgentsByMcpRequirements，mcpServers 取 TUC 已连接
      * server 名）+ SESSION deny 规则过滤（PermissionBubbleService 同款语义，attachments.ts:1513-1518）
      * → 对已 announce 集合的 diff → addedTypes/addedLines（formatAgentLine，prompt.ts:43-46）
@@ -1506,7 +1507,8 @@ public final class PostCompactAttachmentRestorer {
         if (!agentToolInPool || subagentTool == null) {
             return null;
         }
-        List<AgentDefinition> activeAgents = subagentTool.agentRegistry().listAgents();
+        // [批 3c] 会话显式传参：tuc 即本 turn 的工具上下文 → sessionId 直取（⛔ 不再经裸 MDC）
+        List<AgentDefinition> activeAgents = subagentTool.agentRegistry(tuc.sessionId()).listAgents();
         if (activeAgents.isEmpty()) {
             return null;
         }

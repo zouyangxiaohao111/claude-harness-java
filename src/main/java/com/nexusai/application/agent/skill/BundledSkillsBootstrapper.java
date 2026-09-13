@@ -4,7 +4,6 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.GitRemoteResolver;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.prompt.GitStatusProvider;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.util.ChromePrompt;
 import com.nexusai.application.agent.tool.ContentBlockParam;
 import com.nexusai.model.command.Command;
@@ -55,7 +54,7 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
      * 即运行时存在扩展连接（一个扩展连接服务所有会话）。
      *
      * <p><b>启动时序限制（fail loud 登记）</b>：本 gate 在 {@link #run(ApplicationArguments)} 启动期
-     * 求值一次，此时无会话上下文（{@code RequestContext.sessionId()}=null）→ 生产启动时若扩展尚未
+     * 求值一次，此时无会话上下文（[批 3c] 启动期不存在会话来源，原裸 MDC 会话槽恒空）→ 生产启动时若扩展尚未
      * 连接，技能不注册（等价 CC 非 Chrome 环境默认关）。有会话连接后需重跑注册（或未来改惰性注册）
      * 才会进命令列表 —— 与 CC 机器级「启动时扩展已安装」判定在 web 多会话模型下的映射差异。
      *
@@ -417,20 +416,37 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
             () -> java.time.ZoneId.systemDefault().getId(),
             List::of,
             // P2-10：真实 git remote https URL · CC getCurrentRepoHttpsUrl（scheduleRemoteAgents.ts:123-133）
-            // cwd-align-ext：git 解析基准 = 会话运行时 cwd（CC getCurrentRepoHttpsUrl → resolveGitDir → resolve(getCwd())，
-            //   gitFilesystem.ts:40-43）；无 sessionId 回落 user.dir（方案 1，零行为变化）。
+            // cwd-align-ext：git 解析基准 = 运行时 cwd（CC getCurrentRepoHttpsUrl → resolveGitDir →
+            //   resolve(getCwd())，gitFilesystem.ts:40-43）。
+            // [批 3c] 显式 null = 本 lambda 无会话来源（见 resolveCwdForGitRemote 说明）——
+            //   CwdResolution 回落 user.dir，与旧实现（本启动期 lambdas 所在线程 MDC 恒空）行为零变化。
+            //   需同步改的消费点：ScheduleRemoteAgentsSkillRegistrar.currentGitRepoUrl（见下方 javadoc）。
             () -> GitRemoteResolver.getRemoteHttpsUrl(
-                java.nio.file.Path.of(resolveCwdForGitRemote()))).register()));
+                java.nio.file.Path.of(resolveCwdForGitRemote(null)))).register()));
     }
 
     /**
      * schedule 远程 agent 的 git remote 解析基准 cwd · 对齐 CC getCwd()（scheduleRemoteAgents.ts:123-133
      * → gitFilesystem.ts:40-43 resolve(startPath ?? getCwd())）。
      *
-     * <p>supplier 运行期求值，经 RequestContext 取会话 cwd；无 sessionId 回落 user.dir（零行为变化）。
+     * <p>[批 3c] sessionId 由调用点显式传入（原裸 MDC 会话槽读点已废）。
+     *
+     * <p><b>本调用点传 {@code null}</b>（无会话）：本 lambda 被
+     * {@code ScheduleRemoteAgentsSkillRegistrar}（**不在本批清单**）以
+     * {@code Supplier<String> currentGitRepoUrl} 形参接收 → 消费点该接口无 sessionId 通道，
+     * 本文件无法凭空取得会话（本类为启动期注册的 skill 注册器，无会话字段）。
+     * <b>需同步改的消费点</b>：
+     * {@code skill/ScheduleRemoteAgentsSkillRegistrar.java:61/71}（形参改
+     * {@code Function<String,String>}）、{@code :244}
+     * （{@code currentGitRepoUrl.get()} → {@code apply(sessionId)}）、
+     * {@code :207}（promptFn 第二参即 {@code PromptFnContext}，可取其 {@code sessionId()}）与其
+     * {@code buildPromptForCommand(String)}（:213）逐级下传。改完后本处即可改为
+     * {@code sessionId -> ...resolveCwdForGitRemote(sessionId)} 并还原会话 cwd 语义。
+     *
+     * @param sessionId 会话 ID（null = 无会话 → 回落 user.dir）
      */
-    private static String resolveCwdForGitRemote() {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+    private static String resolveCwdForGitRemote(String sessionId) {
+        String cwd = CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 

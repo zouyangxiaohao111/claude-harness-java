@@ -1018,7 +1018,12 @@ public class McpServerService {
         Map<String, String> headers = remote ? headersFromConfig(config) : null;
         Map<String, Object> oauth = config.get("oauth") instanceof Map<?, ?> om
             ? toStringObjectMap(om) : null;
-        String filePath = configFileWriter.describeMcpConfigFilePath(scope, CwdResolution.getCwd());
+        // [批 3c 会话态显式化] create/update 无会话入参（REST 域方法签名不含 sessionId），且 filePath
+        //   仅作展示（.mcp.json 仅 import 入口）→ cwd 显式按「无会话」解析（进程 user.dir，= 旧无参
+        //   重载「MDC 为空」分支等价语义）。如需会话 cwd 须由调用方显式传入（本方法加 sessionId 形参）。
+        log.warn("[McpServerService] withAddMeta 无会话入参 → describeMcpConfigFilePath cwd 回落进程 user.dir={}；"
+            + "如需会话 cwd 须由调用方显式传入 sessionId", System.getProperty("user.dir"));
+        String filePath = configFileWriter.describeMcpConfigFilePath(scope, CwdResolution.getCwd(null));
         return new McpServerDto(base.id(), base.name(), base.command(), base.args(), base.env(),
             base.status(), base.lastError(), base.enabled(), base.createdAt(), base.type(),
             base.approvalStatus(), base.userFacingName(), base.channelPermissions(),
@@ -1143,7 +1148,7 @@ public class McpServerService {
      * → connectWorker → {@code gateChannelServer}）。
      *
      * <p>⛔ 旧实现由 {@code ChannelSessionAllowlist.currentRequestSupplier()} 在 connectWorker
-     * 线程读 {@code RequestContext.sessionId()}（MDC），靠 McpToolPool 的 MDC 回放才可见 ——
+     * 线程读 裸 MDC 的 {@code sessionId()}（MDC），靠 McpToolPool 的 MDC 回放才可见 ——
      * 回放装置已随本批删除。
      *
      * <p>null = 无会话（启动预取 {@link #startEnabledBatch()}、PATCH enabled=true 自动重连等

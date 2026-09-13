@@ -695,17 +695,28 @@ public class SseMcpTransport implements McpTransport {
      * [S02] server→client JSON-RPC 请求处理（SSE 流到达）· 对齐 CC {@code client.setRequestHandler}：
      * roots/list → {@code {roots:[{uri:"file://"+cwd}]}}（CC client.ts:1009-1018 ListRootsRequestSchema
      * handler → uri=file://${getOriginalCwd()}，CC 真源自验 client.ts:1014：roots 用 STATE.originalCwd
-     * =会话项目根，非 pwd/getCwd 动态 cwd）。Java 兜底走统一入口 CwdResolution.getOriginalCwdLayer()
-     * （绑定项目层 ?? user.dir，对齐 CC getOriginalCwd）；config.cwd() 优先保留（非破坏）。
-     * DEL-07：移除 System.getProperty("user.dir") 直读，经统一入口兜底。未知 → -32601（不悬挂）。响应经 POST 回传。
+     * =会话项目根，非 pwd/getCwd 动态 cwd）。Java 兜底走统一入口按「无会话」解析
+     * {@code CwdResolution.getOriginalCwdLayer(null)}。
+     *
+     * <p><b>[批 3c 会话态显式化]</b>：transport 为 per-server 对象、<b>无会话入参</b>（同一 MCP
+     * server 可服务多会话）⇒ 兜底层只能按「无会话」解析（进程 user.dir，= 旧实现「MDC 为空」
+     * 分支等价语义），与 CC client.ts:1014 的「进程全局 STATE.originalCwd」同构；config.cwd()
+     * 优先保留（server 可配 cwd，非破坏）。DEL-07：移除 System.getProperty("user.dir") 直读，
+     * 经统一入口兜底。未知 → -32601（不悬挂）。响应经 POST 回传。
      */
     private void handleServerRequest(JsonNode idNode, String method, JsonNode params) {
         Map<String, Object> response = new LinkedHashMap<>();
         response.put("jsonrpc", "2.0");
         response.put("id", idNode);
         if ("roots/list".equals(method)) {
+            // [批 3c] 本 transport 无会话入参 → 兜底显式按「无会话」解析（进程 user.dir）
+            if (config == null || config.cwd() == null || config.cwd().isBlank()) {
+                log.warn("[SseMcpTransport] {} roots/list 无 config.cwd 且本 transport 无会话入参 → "
+                    + "cwd 回落进程 user.dir={}；如需会话 cwd 须由调用方显式传入（config.cwd()）",
+                    serverName(), System.getProperty("user.dir"));
+            }
             String cwd = config != null && config.cwd() != null && !config.cwd().isBlank()
-                ? config.cwd() : CwdResolution.getOriginalCwdLayer();
+                ? config.cwd() : CwdResolution.getOriginalCwdLayer(null);
             response.put("result", Map.of("roots", List.of(Map.of("uri", "file://" + cwd))));
             log.info("[SseMcpTransport] {} roots/list 响应: uri=file://{}", serverName(), cwd);
         } else {

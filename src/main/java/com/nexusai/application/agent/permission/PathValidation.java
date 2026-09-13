@@ -863,11 +863,16 @@ public final class PathValidation {
      * @param env                     路径校验环境（内部路径白名单 / 工作目录）
      * @param sandboxConfig           沙箱写白名单配置（null = 无沙箱 allowlist）
      * @param precomputedPathsToCheck 调用方已展开路径（可选；null = 本方法自算）
+     * @param cwd                     <b>会话 cwd</b>（root-relative {@code Edit(...)} 规则匹配的根锚，
+     *                                与 CC {@code matchingRuleForInput} 的 cwd 同源；由调用方显式传入，
+     *                                见 {@link #validatePath}/{@link #validateGlobPattern} 的 cwd 形参）。
+     *                                null/空 = 该路径确实无会话 ⇒ 回落 {@link RuleQuery} 的
+     *                                「无会话」解析（进程 user.dir）+ 一次性 WARN，语义与传 null 前逐字一致。
      * @return 路径校验结果
      */
     public static PathCheckResult isPathAllowed(String resolvedPath, ToolPermissionContext permCtx,
             PermissionUpdates.OperationType operationType, PathValidationEnv env,
-            SandboxWriteConfig sandboxConfig, List<String> precomputedPathsToCheck) {
+            SandboxWriteConfig sandboxConfig, List<String> precomputedPathsToCheck, String cwd) {
         String normalized = normalizePath(resolvedPath);
         if (normalized == null) {
             return PathCheckResult.blocked(resolvedPath,
@@ -879,8 +884,8 @@ public final class PathValidation {
             ? precomputedPathsToCheck
             : List.of(normalized);
 
-        // 1. deny 规则优先（CC :151-162）
-        PermissionRule deny = editDenyRule(normalized, permCtx);
+        // 1. deny 规则优先（CC :151-162；root-relative 规则以会话 cwd 为根锚）
+        PermissionRule deny = editDenyRule(normalized, permCtx, cwd);
         if (deny != null) {
             return PathCheckResult.blocked(normalized, null,
                 new PermissionDecisionReason.Rule(deny));
@@ -925,8 +930,8 @@ public final class PathValidation {
                 new PermissionDecisionReason.Other("Path is in sandbox write allowlist"));
         }
 
-        // 4. allow 规则（CC :248-259）
-        PermissionRule allow = editAllowRule(normalized, permCtx);
+        // 4. allow 规则（CC :248-259；root-relative 规则以会话 cwd 为根锚）
+        PermissionRule allow = editAllowRule(normalized, permCtx, cwd);
         if (allow != null) {
             return PathCheckResult.allowed(normalized, new PermissionDecisionReason.Rule(allow));
         }
@@ -982,18 +987,32 @@ public final class PathValidation {
         return true;
     }
 
-    private static PermissionRule editDenyRule(String path, ToolPermissionContext permCtx) {
+    /**
+     * edit deny 规则查询（root-relative 根锚 = 会话 cwd）。
+     *
+     * @param path    已归一化路径
+     * @param permCtx 权限上下文（null → 无规则）
+     * @param cwd     会话 cwd（null/空 = 无会话 → {@link RuleQuery} 回落进程 user.dir + WARN）
+     */
+    private static PermissionRule editDenyRule(String path, ToolPermissionContext permCtx, String cwd) {
         if (permCtx == null) {
             return null;
         }
-        return RuleQuery.getEditRuleByContentsForPath(permCtx, path, PermissionBehavior.DENY);
+        return RuleQuery.getEditRuleByContentsForPath(permCtx, path, PermissionBehavior.DENY, cwd);
     }
 
-    private static PermissionRule editAllowRule(String path, ToolPermissionContext permCtx) {
+    /**
+     * edit allow 规则查询（root-relative 根锚 = 会话 cwd）。
+     *
+     * @param path    已归一化路径
+     * @param permCtx 权限上下文（null → 无规则）
+     * @param cwd     会话 cwd（null/空 = 无会话 → {@link RuleQuery} 回落进程 user.dir + WARN）
+     */
+    private static PermissionRule editAllowRule(String path, ToolPermissionContext permCtx, String cwd) {
         if (permCtx == null) {
             return null;
         }
-        return RuleQuery.getEditRuleByContentsForPath(permCtx, path, PermissionBehavior.ALLOW);
+        return RuleQuery.getEditRuleByContentsForPath(permCtx, path, PermissionBehavior.ALLOW, cwd);
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -1005,7 +1024,8 @@ public final class PathValidation {
      * UNC 阻断 → tilde 变体阻断 → shell 展开阻断 → glob（写阻断/读 base 校验）→ 解析 + isPathAllowed。
      *
      * @param path        原始路径（LLM 入参）
-     * @param cwd         解析基座 cwd
+     * @param cwd         解析基座 cwd（<b>同时是 root-relative edit 规则匹配根锚</b>；
+     *                    调用方持 {@code ToolUseContext} 时应传会话 cwd，null/空 = 无会话）
      * @param permCtx     权限上下文
      * @param operationType 操作类型
      * @param env         路径校验环境
@@ -1053,8 +1073,10 @@ public final class PathValidation {
             return validateGlobPattern(cleanPath, cwd, permCtx, operationType, env, sandboxConfig);
         }
         // 常规解析 + isPathAllowed（CC :465-485）
+        // 本方法拿到的 cwd 就是「会话 cwd」（调用方显式传），同时是相对路径解析基座与
+        // root-relative 规则根锚 ⇒ 原样下传（不做二次解析、不回落）。
         String abs = resolveAgainstCwd(cleanPath, cwd);
-        return isPathAllowed(abs, permCtx, operationType, env, sandboxConfig, null);
+        return isPathAllowed(abs, permCtx, operationType, env, sandboxConfig, null, cwd);
     }
 
     /** glob 模式校验（base 目录）· CC {@code validateGlobPattern}（pathValidation.ts:269-316）。 */
@@ -1063,11 +1085,11 @@ public final class PathValidation {
             PathValidationEnv env, SandboxWriteConfig sandboxConfig) {
         if (containsPathTraversal(cleanPath)) {
             String abs = resolveAgainstCwd(cleanPath, cwd);
-            return isPathAllowed(abs, permCtx, operationType, env, sandboxConfig, null);
+            return isPathAllowed(abs, permCtx, operationType, env, sandboxConfig, null, cwd);
         }
         String basePath = getGlobBaseDirectory(cleanPath);
         String absBase = resolveAgainstCwd(basePath, cwd);
-        return isPathAllowed(absBase, permCtx, operationType, env, sandboxConfig, null);
+        return isPathAllowed(absBase, permCtx, operationType, env, sandboxConfig, null, cwd);
     }
 
     /** 相对路径解析基座（absoluteLike → normalize；否则 resolve(cwd, path).normalize）。 */

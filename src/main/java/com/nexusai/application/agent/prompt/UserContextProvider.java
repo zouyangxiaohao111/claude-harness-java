@@ -7,7 +7,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
-import com.nexusai.common.RequestContext;
 
 /**
  * User 通道上下文提供者 · 对齐 CC {@code getUserContext} 的 claudeMd 生产侧
@@ -78,9 +77,18 @@ public class UserContextProvider {
     private final com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine;
 
     /**
-     * @param projectRoot 项目根目录（默认 {@code Path.of(CwdResolution.getOriginalCwdLayer(
-     *      RequestContext.sessionId()))} · 对齐 CC {@code getOriginalCwd}（claudemd.ts:851），
-     *      无会话回落 user.dir；测试注入临时目录）
+     * [批 3c] 会话标识 · 供 {@link #claudeMd()} 走引擎链时解析 **CLAUDE.md 扫描根**。
+     *
+     * <p>WHY 需要它：{@code ClaudemdEngine} 的扫描根按**显式 sessionId** 解析
+     * （{@code originalCwdResolver = sessionId -> CwdResolution.getOriginalCwdLayer(sessionId)}）。
+     * 若此处不传会话，引擎会把扫描根回落进程 {@code user.dir} ⇒ <b>会话绑定项目的 CLAUDE.md
+     * 进不了 system prompt</b>（用户可见回归）。null = 无会话（回落 user.dir），仅限确实无会话的调用方。
+     */
+    private final String sessionId;
+
+    /**
+     * @param projectRoot 项目根目录（默认 {@code Path.of(CwdResolution.getOriginalCwdLayer(null))} ·
+     *      对齐 CC {@code getOriginalCwd}（claudemd.ts:851），无会话回落 user.dir；测试注入临时目录）
      */
     public UserContextProvider(Path projectRoot) {
         this(projectRoot, System::getenv, null);
@@ -96,9 +104,19 @@ public class UserContextProvider {
         this(projectRoot, environment, null);
     }
 
-    /** 便捷构造：默认会话 originalCwd 层（无会话回落 user.dir）。 */
+    /**
+     * 便捷构造：默认进程级 originalCwd 层（无会话回落 user.dir）。
+     *
+     * <p>[批 3c] <b>构造期无会话来源</b>：本构造器无 projectRoot 形参、类内无 sessionId 字段，
+     * 构造线程亦无可穿透的会话上下文 → 显式传 {@code null}（无会话），CwdResolution 逐层回落
+     * user.dir，与旧实现（构造线程 MDC 恒空）行为零变化。
+     * <p><b>需同步改的消费点</b>（均不在本批清单，需改为显式传入 projectRoot，对齐
+     * {@code LlmAgentLoop.java:4397-4404} 已完成的会话化改造）：
+     * {@code PartialCompactService.java:838} / {@code ToolRegistrationConfig.java:2876} /
+     * {@code ContextAnalyzeService.java:805}（以及测试 {@code CompactCommandCcContractTest} 等）。
+     */
     public UserContextProvider() {
-        this(Path.of(CwdResolution.getOriginalCwdLayer(RequestContext.sessionId())), System::getenv, null);
+        this(Path.of(CwdResolution.getOriginalCwdLayer(null)), System::getenv, null);
     }
 
     /**
@@ -107,7 +125,24 @@ public class UserContextProvider {
      * @param claudemdEngine claudemd 引擎（可 null → 回退单文件子集）
      */
     public UserContextProvider(com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine) {
-        this(Path.of(CwdResolution.getOriginalCwdLayer(RequestContext.sessionId())), System::getenv, claudemdEngine);
+        // [批 3c] 无会话来源 → 显式 null（回落 user.dir）。**有会话的调用方应改用
+        //   {@link #UserContextProvider(ClaudemdEngine, String)}**，否则引擎扫描根落到 user.dir。
+        this(Path.of(CwdResolution.getOriginalCwdLayer(null)), System::getenv, claudemdEngine, null);
+    }
+
+    /**
+     * [批 3c] 会话感知构造 · 与 {@link #UserContextProvider(ClaudemdEngine)} 同语义，但把会话标识
+     * 显式带入，使 {@link #claudeMd()} 的引擎链按本会话解析 CLAUDE.md 扫描根。
+     *
+     * @param claudemdEngine claudemd 引擎（可 null → 回退单文件子集）
+     * @param sessionId      会话 ID（null → 无会话，回落进程 user.dir）
+     */
+    public UserContextProvider(com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine,
+                               String sessionId) {
+        this(sessionId != null && !sessionId.isBlank()
+                ? Path.of(CwdResolution.getOriginalCwdLayer(sessionId))
+                : Path.of(CwdResolution.getOriginalCwdLayer(null)),
+            System::getenv, claudemdEngine, sessionId);
     }
 
     /**
@@ -119,11 +154,27 @@ public class UserContextProvider {
      */
     public UserContextProvider(Path projectRoot, Environment environment,
                                com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine) {
+        this(projectRoot, environment, claudemdEngine, null);
+    }
+
+    /**
+     * [批 3c] 全参数构造 · 会话感知。
+     *
+     * @param projectRoot    项目根目录（null → 按 sessionId 解析；sessionId 亦空 → 进程 user.dir）
+     * @param environment    环境变量查询
+     * @param claudemdEngine claudemd 引擎（可 null）
+     * @param sessionId      会话 ID（null → 无会话）
+     */
+    public UserContextProvider(Path projectRoot, Environment environment,
+                               com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine,
+                               String sessionId) {
         this.projectRoot = projectRoot != null
             ? projectRoot
-            : Path.of(CwdResolution.getOriginalCwdLayer(RequestContext.sessionId()));
+            : Path.of(CwdResolution.getOriginalCwdLayer(
+                sessionId != null && !sessionId.isBlank() ? sessionId : null));
         this.environment = environment != null ? environment : System::getenv;
         this.claudemdEngine = claudemdEngine;
+        this.sessionId = sessionId;
     }
 
     /**
@@ -162,7 +213,10 @@ public class UserContextProvider {
         if (claudemdEngine != null) {
             try {
                 java.util.List<com.nexusai.application.agent.context.MemoryFileInfo> files =
-                    claudemdEngine.filterInjectedMemoryFiles(claudemdEngine.getMemoryFiles(false));
+                    claudemdEngine.filterInjectedMemoryFiles(
+                        // [批 3c] 本类无会话来源 → (b) 类合法跳过：显式传 null（回落进程 user.dir）。
+                        //   仅影响 InstructionsLoaded hook 载荷 session_id，CLAUDE.md 内容本身由 projectRoot 决定。
+                        claudemdEngine.getMemoryFiles(false, sessionId));
                 String full = claudemdEngine.getClaudeMds(files, null);
                 if (full == null || full.isEmpty()) {
                     return null;

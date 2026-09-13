@@ -120,13 +120,14 @@ class CommandRegistrationConfigTest {
         SkillRegistry registry = new SkillRegistry("");
         registry.refresh(); // 清缓存，确保 fresh 视图
 
-        List<String> invocable = registry.getModelInvocableCommands().stream()
+        // [批 3c] 无会话 → 显式 null（本用例只验命令注册面过滤，不涉会话）
+        List<String> invocable = registry.getModelInvocableCommands(null).stream()
             .map(Command::getName).toList();
         assertThat(invocable).contains("commit", "commit-push-pr", "statusline", "review");
         assertThat(invocable).doesNotContain("advisor", "cost", "rename", "brief", "ultrareview");
 
         // getAllCommands（web GET /api/command 数据源）含 local 命令（无 gate 的）
-        List<String> all = registry.getAllCommands().stream().map(Command::getName).toList();
+        List<String> all = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(all).contains("commit", "advisor", "cost", "rename");
         // brief 门控关 → 从 getAllCommands 过滤（对齐 CC commands.ts:484 isCommandEnabled）
         assertThat(all).doesNotContain("brief");
@@ -138,25 +139,28 @@ class CommandRegistrationConfigTest {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandLocalSlashRegistration(dispatcher, null, null);
 
+        // [批 3c] 本用例只验证「handler 注册面 → 结果种类/命名路由」，不涉会话 → 以下分派一律显式
+        //   传 null（旧实现里等价于 MDC 为空）
+
         // /cost → result handler（CC cost.ts:6-24 call）· [Fix-P1] type=local 迁移 registerSlashCommandResult
         //   （拦截器 local 分支经 dispatchResult 回传 text → <local-command-stdout> 可见）
-        UserInputDispatcher.LocalCommandResult cost = dispatcher.dispatchResult("/cost");
+        UserInputDispatcher.LocalCommandResult cost = dispatcher.dispatchResult("/cost", null, null);
         assertThat(cost).isNotNull();
         assertThat(cost.kind()).as("/cost text 结果回传（对齐 CC local text 分支）").isEqualTo("text");
 
         // /rename <name> → void handler（CC rename.ts:21-87 call，local-jsx 未迁移，仍走 dispatch）
-        UserInputDispatcher.RoutingResult rename = dispatcher.dispatch("/rename fix login bug");
+        UserInputDispatcher.RoutingResult rename = dispatcher.dispatch("/rename fix login bug", null, null);
         assertThat(rename.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(rename.routedTo()).isEqualTo("rename");
 
         // /advisor → result handler（CC advisor.ts:16-94 call）
-        UserInputDispatcher.LocalCommandResult advisor = dispatcher.dispatchResult("/advisor opus");
+        UserInputDispatcher.LocalCommandResult advisor = dispatcher.dispatchResult("/advisor opus", null, null);
         assertThat(advisor).isNotNull();
         assertThat(advisor.kind()).as("/advisor text 结果回传").isEqualTo("text");
 
         // 未注册的 /nope → dispatchResult 无 handler → null（拦截器 fail loud）；dispatch() 回落通用 handler
-        assertThat(dispatcher.dispatchResult("/nope")).isNull();
-        UserInputDispatcher.RoutingResult nope = dispatcher.dispatch("/nope");
+        assertThat(dispatcher.dispatchResult("/nope", null, null)).isNull();
+        UserInputDispatcher.RoutingResult nope = dispatcher.dispatch("/nope", null, null);
         assertThat(nope.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(nope.routedTo()).isEqualTo("command-router");
     }

@@ -5,7 +5,6 @@ import com.nexusai.application.agent.compact.CompactWarningState;
 import com.nexusai.application.agent.compact.PostCompactionState;
 import com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder;
 import com.nexusai.application.agent.memory.SessionMemoryService;
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -71,7 +70,6 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
         CompactWarningState.clearCompactWarningSuppression();
         PostCompactionState.clear(SESSION);
         CacheSafeParamsHolder.clear();
-        RequestContext.clear();
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {
@@ -94,13 +92,20 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
         return sm;
     }
 
-    /** 反射驱动私有 handleCompactCommand（参数序与生产 registerCompactSlashCommand lambda 一致）。 */
+    /**
+     * 反射驱动私有 handleCompactCommand（参数序与生产 registerCompactSlashCommand lambda 一致）。
+     *
+     * <p>[批 3c] 会话标识 {@code sessionId} 与在途用户消息 id {@code inFlightUserMessageId} 由分派
+     * 入口显式传入（原经裸 MDC 会话槽读取，该槽已删）—— 本 helper 显式透传，保持原断言取值不变。
+     */
     private static String invokeHandleCompact(SessionAgentStateRegistry registry,
                                               SessionMemoryService sm,
-                                              MessageService messageService) {
+                                              MessageService messageService,
+                                              String inFlightUserMessageId) {
         ToolRegistrationConfig config = new ToolRegistrationConfig();
         Object out = ReflectionTestUtils.invokeMethod(config, "handleCompactCommand",
-            "", registry, null, null, sm, null, null, null, null, null, messageService);
+            "", SESSION, inFlightUserMessageId, registry, null, null, sm,
+            null, null, null, null, null, messageService);
         assertThat(out).isInstanceOf(String.class);
         return (String) out;
     }
@@ -138,9 +143,9 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
             .thenAnswer(inv -> inv.getArgument(1));
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry(); // 空 = 空闲进程，无 live state
-        RequestContext.set(SESSION, "h3"); // = ChatService:624 set(sessionId, userMessageId)
 
-        String out = invokeHandleCompact(registry, sm, messageService);
+        // 在途 /compact 行 id（= ChatService:624 显式带下来的 userMessageId）· 批 3c 后不再经裸 MDC
+        String out = invokeHandleCompact(registry, sm, messageService, "h3");
 
         // ① 不再拒绝：既不报「未注册」，也不谎报；成功且显式说明「已从历史重建」
         assertThat(out)
@@ -196,9 +201,8 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
             .thenAnswer(inv -> inv.getArgument(1));
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        RequestContext.set(SESSION, "req-idle-2");
 
-        invokeHandleCompact(registry, sm, messageService);
+        invokeHandleCompact(registry, sm, messageService, "req-idle-2");
 
         assertThat(registry.get(SESSION))
             .as("registry 只登记「主循环在跑」的 live state，重建的临时 state 不登记（无所有者 → 泄漏；"
@@ -231,9 +235,8 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
         live.replaceMessages(List.of(
             msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")));
         registry.register(SESSION, live);
-        RequestContext.set(SESSION, "req-live");
 
-        String out = invokeHandleCompact(registry, sm, messageService);
+        String out = invokeHandleCompact(registry, sm, messageService, "req-live");
 
         assertThat(out)
             .as("live 路径不追加「已从历史重建」说明（否则用户被误导为重建过）")
@@ -268,9 +271,8 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
             .thenReturn(List.of());
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        RequestContext.set(SESSION, "req-empty");
 
-        String out = invokeHandleCompact(registry, sm, messageService);
+        String out = invokeHandleCompact(registry, sm, messageService, "req-empty");
 
         assertThat(out)
             .as("空会话 = CC compact.ts:48-50 `if (messages.length === 0) throw new Error('No messages to compact')` "
@@ -306,9 +308,9 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
             .thenAnswer(inv -> inv.getArgument(1));
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        RequestContext.set(SESSION, "msg-stale-from-other-request"); // 不属于本转录
 
-        invokeHandleCompact(registry, sm, messageService);
+        // 不属于本转录的跨请求残留 id（显式传入 → 守卫应拒绝排除）
+        invokeHandleCompact(registry, sm, messageService, "msg-stale-from-other-request");
 
         ArgumentCaptor<String> excludeId = ArgumentCaptor.forClass(String.class);
         verify(messageService).listForResumeExcluding(anyList(), excludeId.capture());
@@ -332,9 +334,8 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
     @DisplayName("[降级] 未注册 + messageService 未注入 → 显式报「无法从历史重建」，不谎报成功")
     void unregisteredWithoutRebuildChannelFailsLoud() {
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        RequestContext.set(SESSION, "req-nochannel");
 
-        String out = invokeHandleCompact(registry, null, null);
+        String out = invokeHandleCompact(registry, null, null, "req-nochannel");
 
         assertThat(out)
             .as("无重建通道（messageService=null）→ 无法取历史 → 必须显式失败并说明理由")

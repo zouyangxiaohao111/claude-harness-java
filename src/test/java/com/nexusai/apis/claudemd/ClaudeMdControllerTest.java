@@ -150,9 +150,11 @@ class ClaudeMdControllerTest {
     /** 无外部 include → needsApproval=false + files 空数组；verify 探测链被调（shouldShow + getExternalClaudeMdIncludes）。 */
     @Test
     void includeStatus_noExternalIncludes() throws Exception {
-        when(engine.shouldShowClaudeMdExternalIncludesWarning()).thenReturn(false);
-        when(engine.getMemoryFiles(true)).thenReturn(List.of());
-        when(engine.getExternalClaudeMdIncludes(any())).thenReturn(List.of());
+        // [批 3c] 无会话 → 显式 null（GET /include-status 无会话入参，控制器按 null 调引擎；
+        //   stub 必须与真实调用同参，否则 Mockito 收不到 stub → 用例失败）
+        when(engine.shouldShowClaudeMdExternalIncludesWarning(null)).thenReturn(false);
+        when(engine.getMemoryFiles(true, null)).thenReturn(List.of());
+        when(engine.getExternalClaudeMdIncludes(any(), any())).thenReturn(List.of());
 
         mockMvc.perform(get("/api/v1/claude-md/include-status"))
                 .andExpect(status().isOk())
@@ -160,16 +162,17 @@ class ClaudeMdControllerTest {
                 .andExpect(jsonPath("$.files").isArray())
                 .andExpect(jsonPath("$.files").isEmpty());
 
-        verify(engine).shouldShowClaudeMdExternalIncludesWarning();
-        verify(engine).getExternalClaudeMdIncludes(any());
+        verify(engine).shouldShowClaudeMdExternalIncludesWarning(null);
+        verify(engine).getExternalClaudeMdIncludes(any(), any());
     }
 
     /** 存在外部 include 且未审批 → needsApproval=true + files 列出外部文件绝对路径（不受审批门控探测）。 */
     @Test
     void includeStatus_hasExternalUnapproved() throws Exception {
-        when(engine.shouldShowClaudeMdExternalIncludesWarning()).thenReturn(true);
-        when(engine.getMemoryFiles(true)).thenReturn(List.of());
-        when(engine.getExternalClaudeMdIncludes(any()))
+        // [批 3c] 无会话 → 显式 null（同 includeStatus_noExternalIncludes）
+        when(engine.shouldShowClaudeMdExternalIncludesWarning(null)).thenReturn(true);
+        when(engine.getMemoryFiles(true, null)).thenReturn(List.of());
+        when(engine.getExternalClaudeMdIncludes(any(), any()))
                 .thenReturn(List.of(new ClaudemdEngine.ExternalClaudeMdInclude("D:/external/team.md", "CLAUDE.md")));
 
         mockMvc.perform(get("/api/v1/claude-md/include-status"))
@@ -185,9 +188,10 @@ class ClaudeMdControllerTest {
                         .contentType(APPLICATION_JSON).content("{\"approved\": true}"))
                 .andExpect(status().isOk());
 
-        when(engine.shouldShowClaudeMdExternalIncludesWarning()).thenReturn(false);
-        when(engine.getMemoryFiles(true)).thenReturn(List.of());
-        when(engine.getExternalClaudeMdIncludes(any())).thenReturn(List.of());
+        // [批 3c] 无会话 → 显式 null（同 includeStatus_noExternalIncludes）
+        when(engine.shouldShowClaudeMdExternalIncludesWarning(null)).thenReturn(false);
+        when(engine.getMemoryFiles(true, null)).thenReturn(List.of());
+        when(engine.getExternalClaudeMdIncludes(any(), any())).thenReturn(List.of());
 
         mockMvc.perform(get("/api/v1/claude-md/include-status"))
                 .andExpect(status().isOk())

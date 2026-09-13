@@ -12,7 +12,6 @@ import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.ResumeAgentResult;
 import com.nexusai.application.agent.subagent.ResumeService;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -71,7 +70,7 @@ public class CommandController {
     @Autowired private SkillRegistry skillRegistry;
 
     /**
-     * [IMP-SP-07] 会话级主 AgentState 注册表 · /clear 失效接线：按 MDC sessionId 解析主会话
+     * [IMP-SP-07] 会话级主 AgentState 注册表 · /clear 失效接线：按显式传入的 sessionId 解析主会话
      * AgentState → {@code systemPromptSectionCache().clear()}（对齐 CC clearSystemPromptSections
      * systemPromptSections.ts:65-68 的 /clear 触发）。
      * {@code @Autowired(required=false)}：plain JUnit（无 Spring 容器）缺省 null → 失效 debug skip
@@ -211,27 +210,22 @@ public class CommandController {
         @RequestParam(value = "reload", defaultValue = "false") boolean reload,
         @RequestHeader(value = "X-Client-Env", required = false) String clientEnvHeader,
         @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
-        // [TL-W1 P4] 可选 sessionId → 注入 RequestContext（MDC），使 SkillRegistry 的 cwdSupplier
-        //   （SessionProjectRoot.getForSession(RequestContext.sessionId())）在 REST 线程上解析出会话
-        //   绑定项目 ⇒ 扫到该项目的 project 级技能 + workflow 命令（旧接线读 ThreadLocal，REST 线程
-        //   必空 → 回落 config home → 前端列表缺绑定项目的条目）。
-        //   不传 sessionId → 保持旧行为。同款先例：本类 executeBuiltin 的 ?sessionId= 包装。
-        if (sessionIdParam == null || sessionIdParam.isBlank()) {
-            return listInternal(reload, clientEnvHeader);
-        }
-        com.nexusai.common.RequestContext.setSession(sessionIdParam);
-        try {
-            return listInternal(reload, clientEnvHeader);
-        } finally {
-            com.nexusai.common.RequestContext.clear(); // 防 Tomcat 线程复用残留（REST 入口无 Filter 写 MDC）
-        }
+        // [批 3c] 旧实现把可选 sessionId 写进请求线程 MDC，供 SkillRegistry 的 cwdSupplier
+        //   （SessionProjectRoot.getForSession(...)）在 REST 线程上解析出会话绑定项目 ⇒ 扫到该项目的
+        //   project 级技能 + workflow 命令。
+        //   现改为**显式传参**：sessionIdParam 经 listInternal → mergedSkillCommands →
+        //   SkillRegistry.getAllCommands(sessionId) → cwdSupplier.apply(sessionId) 解析会话 cwd，
+        //   语义与旧 MDC 路等价但不再经任何环境态会话槽（MDC 第三态可读到别会话 id）。
+        //   缺参（null/空白）→ 未绑定会话 → SessionProjectRoot.getForSession 返回 null →
+        //   SkillsLoader 回落进程 user.dir（与旧实现「无 MDC」时一致）。
+        return listInternal(reload, clientEnvHeader, sessionIdParam);
     }
 
-    /** {@link #list(boolean, String, String)} 主体 · 会话上下文已在包装层注入。 */
-    private List<CommandDto> listInternal(boolean reload, String clientEnvHeader) {
+    /** {@link #list(boolean, String, String)} 主体 · 会话标识**显式透传**至技能源解析。 */
+    private List<CommandDto> listInternal(boolean reload, String clientEnvHeader, String sessionId) {
         if (reload) commandService.rescanFromFilesystem();
         ClientEnv clientEnv = ClientEnv.fromHeader(clientEnvHeader);
-        List<Command> domain = mergedSkillCommands();
+        List<Command> domain = mergedSkillCommands(sessionId);
         List<Command> filtered = skillRegistry.filterByClientEnv(domain, clientEnv);
         if (log.isDebugEnabled()) {
             log.debug("[CommandController] list: 环境声明={} (X-Client-Env header='{}')，过滤前 {} 个 → 过滤后 {} 个 (DEC-8 client-env 门控，CC commands.ts:417-443)",
@@ -253,8 +247,8 @@ public class CommandController {
      *
      * @return 按 name 去重后的领域命令列表（SkillRegistry 优先）
      */
-    private List<Command> mergedSkillCommands() {
-        List<Command> registryCommands = skillRegistry.getAllCommands();
+    private List<Command> mergedSkillCommands(String sessionId) {
+        List<Command> registryCommands = skillRegistry.getAllCommands(sessionId);
         Map<String, Command> byName = new LinkedHashMap<>();
         for (Command c : registryCommands) {
             byName.putIfAbsent(c.getName(), c);
@@ -367,25 +361,19 @@ public class CommandController {
                                  @RequestBody(required = false) ResumeExecuteRequest request) {
         // [finding-2 修复 2026-09-10] 会话标识解析。前端 runBuiltin 恒透传 activeSessionId（App.tsx）。
         // [批 3a] query ?sessionId= 改为**必填**（缺 / 空白 ⇒ 400）：旧实现「缺值 → 走
-        //   executeBuiltinInternal 读 RequestContext.sessionId()（裸 MDC）」——MDC 第三态会读到上一
+        //   executeBuiltinInternal 读请求线程 MDC 的会话 id」——MDC 第三态会读到上一
         //   请求残留的**别的会话** id ⇒ /clear 会话级清理 / /compact 压缩作用到别的会话上。fail loud。
         if (sessionIdParam == null || sessionIdParam.isBlank()) {
             log.warn("[CommandController] executeBuiltin({}) 缺少会话标识 ?sessionId= → 400"
                 + "（会话态显式化，不再回落 MDC）", name);
             throw new ValidationException("sessionId is required (POST /api/command/builtins/{name}/execute)");
         }
-        // 单向传播：仍把**显式收到的会话**写回 MDC，喂下游 session-thread 消费者
-        // （UserInputDispatcher 已注册的 slash handler：/status、/tag、/compact… 仍读 MDC）。
-        // 绝不读回；收敛为全链显式传参属批 3c。异常路径也清（防 Tomcat 线程复用残留）。
-        RequestContext.setSession(sessionIdParam);
-        try {
-            return executeBuiltinInternal(name, request, sessionIdParam);
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 显式会话全链传参：会话标识直接透传给 executeBuiltinInternal（原「写回 MDC 喂下游
+        //   slash handler」的中转已删除——handler 侧改为经 registerSlashCommand 的 sessionId 形参取会话）。
+        return executeBuiltinInternal(name, request, sessionIdParam);
     }
 
-    /** {@link #executeBuiltin} 主体 · 会话标识由包装层显式传入（不再读 RequestContext.sessionId()）。 */
+    /** {@link #executeBuiltin} 主体 · 会话标识由包装层显式传入（不再读请求线程 MDC）。 */
     private Object executeBuiltinInternal(String name, ResumeExecuteRequest request, String sessionIdParam) {
         Command hit = BuiltInCommands.findByName(name);
         if (hit == null) {
@@ -466,7 +454,8 @@ public class CommandController {
             // resetGetMemoryFilesCache('compact') + clearSystemPromptSections +
             // clearClassifierApprovals + clearSpeculativeChecks（postCompactCleanup.ts:31-77）。
             // 既有 invalidateSystemPromptSections 保留（序列内 :62 同操作，幂等双清，未入删除清单）。
-            PostCompactCleanup.runPostCompactCleanup();
+            // [批 3c] 显式传本会话（原无参入口无会话来源，第 4 项 clearSystemPromptSections 会 WARN 跳过）
+            PostCompactCleanup.runPostCompactCleanup(null, sessionIdParam);
             // [MG-6 · A2-4 补充登记 6] removeSessionState 接线 · /clear 会话结束钩子 → 释放 SESSION_STATES 桶
             //   （决策登记 6 A2-4：CC 进程随会话结束退出无泄漏；Java 多会话常驻 JVM，/clear 清空会话时点
             //   由外层调 removeSessionState 移除该会话 cached-MC 桶，防 SESSION_STATES 内存累积。
@@ -523,7 +512,7 @@ public class CommandController {
             //   覆盖「该 key 从未初始化就遇 /clear」的场景。
             //   ② 回收该会话槽位（防多会话常驻 JVM 内存累积）。
             //   [finding-2 修复] sessionId 来自包装层 executeBuiltin 的 query ?sessionId=（前端 runBuiltin
-            //   透传 activeSessionId）→ 此处 RequestContext.sessionId() 已非 null，removeSession 不再 no-op。
+            //   透传 activeSessionId）→ 此处 sessionIdParam 恒非 null，removeSession 不再 no-op。
             //   [2026-09-10 rebase 轮 · 已对齐 CC（原登记为「有意偏离」，现收敛）] nexusai 的 /clear 不删 DB
             //   消息行（web 转录保留，见上 SessionStartSeenRegistry 注释），而 skill_listing 自本批起是
             //   <b>真实落库消息</b>：若只 CLEARED/清 sent 重发整份，重放转录时旧的一份仍在 → 同会话出现两份
@@ -536,7 +525,7 @@ public class CommandController {
             // [IMP-E4-06 · E4-XP-W67-01] /clear 前端触发 → 先 SESSION_END(reason='clear') hook
             //   · 对齐 CC conversation.ts:69 executeSessionEndHooks('clear')（清空会话时点，SessionEnd
             //     先于 SessionStart 发射；CC :245 processSessionStartHooks('clear') 在后）。
-            //   sessionId 取 MDC（RequestContext）；SESSION_END 在 CC_APP_STATE_PRESENT_EVENTS
+            //   sessionId 取包装层显式传入的 sessionIdParam（批 3c：不再读 MDC）；SESSION_END 在 CC_APP_STATE_PRESENT_EVENTS
             //   （IMP-HR-07 R-2）→ 会话运行中 session function/command hooks 参与；配置 matcher='clear'
             //   的 SessionEnd hook 按 reason 匹配真实触发（HookMatcherEngine:333）。
             if (hookRegistry != null) {
@@ -555,7 +544,8 @@ public class CommandController {
             }
             // [IMP-LL-02 · OPD-WF4-LC-03] /clear 前端触发 → SessionStart(source='clear') hook
             //   · 对齐 CC conversation.ts:245 processSessionStartHooks('clear')（清空会话时点发射）。
-            //   sessionId 取 MDC（RequestContext），agentId=null（主线程，CC agent_type 未传），
+            //   sessionId 取包装层显式传入的 sessionIdParam（批 3c：不再读 MDC），
+            //   agentId=null（主线程，CC agent_type 未传），
             //   source='clear' → HookMatcherEngine SESSION_START 按 data.source 匹配
             //   （HookMatcherEngine:235），配置 matcher='clear' 的 SessionStart hook 真实触发。
             //   返回 hook 消息通道为 CC setMessages 的 UI 语义，web 端无法回填前端消息列表 →
@@ -607,7 +597,7 @@ public class CommandController {
             log.error("[CommandController] executeEffortBuiltin: EffortCommand 未接线 → 拒绝执行（fail loud）");
             throw new IllegalStateException("EffortCommand not wired into CommandController");
         }
-        // [批 3a] 旧实现本端点**无 sessionId 入参**，EffortCommand 只能读 RequestContext.sessionId()
+        // [批 3a] 旧实现本端点**无 sessionId 入参**，EffortCommand 只能读请求线程 MDC 的会话 id
         //   （裸 MDC）→ 前端纵使带 ?sessionId= 也是「死参」（C 类），且 MDC 第三态会写到别的会话。
         //   现显式必填 + 显式透传给 handle(args, sessionId)，全链零 MDC 读取。
         if (sessionIdParam == null || sessionIdParam.isBlank()) {
@@ -630,8 +620,8 @@ public class CommandController {
      * 不适用——CC 语义 /compact 必在「当前会话」执行。web 端用户输入 /compact 由前端统一走
      * {@code builtins/{name}/execute}（日志实证 POST /api/command/builtins/compact/execute 无会话、
      * 后端只回元数据 → 压缩从未执行、前端无 CC 式反应）。本字面端点（Spring literal &gt; {name}
-     * 路径变量，同 effort 模式）真实执行：解析会话（query ?sessionId= → MDC 兜底，
-     * MemoryController:124-127 同款）→ 写 MDC → {@code UserInputDispatcher.dispatchResult} 复用已注册
+     * 路径变量，同 effort 模式）真实执行：解析会话（query ?sessionId= **必填**，批 3a）→
+     * {@code UserInputDispatcher.dispatchResult(input, sessionId, null)} 复用已注册
      * compact handler（registerCompactSlashCommand → handleCompactCommand：DISABLE_COMPACT 门控 →
      * 会话 AgentState → SM 优先 / microcompact+compactConversation 传统压缩 → displayText + STOMP
      * token-warning 推送）→ 返回 displayText（{@code "Compacted …"}）。压缩替换会话
@@ -681,37 +671,36 @@ public class CommandController {
             throw new ValidationException(
                 "sessionId is required (POST /api/command/builtins/compact/execute)");
         }
-        // 单向传播：下游 compact handler（ToolRegistrationConfig.handleCompactCommand:2351）仍读
-        //   RequestContext.sessionId()，故把**显式收到的会话**写回 MDC（绝不读回；3c 收敛为显式传参）。
-        RequestContext.setSession(sessionId);
-        try {
-            String args = request != null ? request.args() : null;
-            // 复用已注册 compact handler：/compact [args]（无自定义指令 → SM 优先 / 传统压缩；
-            //   有指令 → 跳过 SM 优先直压，对齐 CC compact.ts:44-48）
-            String input = (args == null || args.isBlank()) ? "/compact" : "/compact " + args;
-            if (log.isDebugEnabled()) {
-                log.debug("[CommandController] executeCompactBuiltin: dispatch input='{}'（args 透传自定义指令）",
-                    input);
-            }
-            com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult r =
-                userInputDispatcher.dispatchResult(input);
-            if (r == null) {
-                log.error("[CommandController] executeCompactBuiltin: /compact handler 未注册"
-                    + "（dispatchResult null；ToolRegistrationConfig.registerCompactSlashCommand 未执行？）");
-                return "/compact 无法执行：/compact 命令未注册。";
-            }
-            if (log.isInfoEnabled()) {
-                log.info("[CommandController] executeCompactBuiltin: /compact 执行完成 session={} kind={} resultLen={} customInstructions={}",
-                    sessionId, r.kind(), r.value() == null ? 0 : r.value().length(),
-                    args != null && !args.isBlank());
-            }
-            if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
-                return "/compact 压缩完成（无文本结果）。";
-            }
-            return r.value();
-        } finally {
-            RequestContext.clear();
+        // [批 3c] 会话标识显式随分派传入（dispatchResult(input, sessionId, null)）——compact handler 经
+        //   registerSlashCommandResult 的 sessionId 形参取得会话，不再经 MDC 单向传播。
+        String args = request != null ? request.args() : null;
+        // 复用已注册 compact handler：/compact [args]（无自定义指令 → SM 优先 / 传统压缩；
+        //   有指令 → 跳过 SM 优先直压，对齐 CC compact.ts:44-48）
+        String input = (args == null || args.isBlank()) ? "/compact" : "/compact " + args;
+        if (log.isDebugEnabled()) {
+            log.debug("[CommandController] executeCompactBuiltin: dispatch input='{}' session={}（args 透传自定义指令）",
+                input, sessionId);
         }
+        // [批 3c] 第 3 形参 = 在途用户消息 id：本 REST 端点不在某条用户消息的处理上下文内（用户直接
+        //   调 /compact），故传合法缺值 null；下游依赖该值的守卫本次不生效 → fail loud 记录。
+        log.warn("[CommandController] executeCompactBuiltin: REST /compact 无在途用户消息 id"
+            + "（inFlightUserMessageId=null），依赖该值的在途消息守卫本次不生效: session={}", sessionId);
+        com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult r =
+            userInputDispatcher.dispatchResult(input, sessionId, null);
+        if (r == null) {
+            log.error("[CommandController] executeCompactBuiltin: /compact handler 未注册"
+                + "（dispatchResult null；ToolRegistrationConfig.registerCompactSlashCommand 未执行？）");
+            return "/compact 无法执行：/compact 命令未注册。";
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[CommandController] executeCompactBuiltin: /compact 执行完成 session={} kind={} resultLen={} customInstructions={}",
+                sessionId, r.kind(), r.value() == null ? 0 : r.value().length(),
+                args != null && !args.isBlank());
+        }
+        if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
+            return "/compact 压缩完成（无文本结果）。";
+        }
+        return r.value();
     }
 
     /**
@@ -721,7 +710,7 @@ public class CommandController {
      * 三层过滤 → agent 解析/fork 父提示继承 → 异步续跑 → 返回 {agentId, description, outputFile}。
      *
      * <p>校验：resumeService 未接线 → IllegalStateException（fail loud）；agentId 缺失/空白 →
-     * {@link ValidationException}（400）；MDC 无 sessionId → IllegalStateException（无会话上下文）。
+     * {@link ValidationException}（400）；sessionId 缺失 → IllegalStateException（无会话上下文）。
      *
      * <p><b>[R-A] agentId 不拒收语义</b>（对齐 CC asAgentId，ids.ts:31-33 纯 cast）：agentId 即 string，
      * 非 UUID 不拒收 —— a+16hex（{@link AgentContext#createAgentId} 产物）经 S-12 pack 桥接受，任意
@@ -751,7 +740,7 @@ public class CommandController {
             log.warn("[CommandController] executeResume: 无会话上下文（sessionId 为空）");
             throw new IllegalStateException("无会话上下文 (sessionId)");
         }
-        // [session-id-short] MDC sessionId 已 short，直传 String（UUID.fromString 对 sess-xxx 抛 IAE 硬边界删除）
+        // [session-id-short] 会话标识已 short，直传 String（UUID.fromString 对 sess-xxx 抛 IAE 硬边界删除）
         String sessionId = sessionIdStr;
         String prompt = request.prompt() != null ? request.prompt() : "";
         if (log.isDebugEnabled()) {
@@ -828,7 +817,7 @@ public class CommandController {
      * [IMP-SP-07] /clear 失效接线 · 对齐 CC {@code clearSystemPromptSections} 的 /clear 触发点
      * （systemPromptSections.ts:65-68，经 clearConversation → clearSessionCaches → runPostCompactCleanup）。
      *
-     * <p>会话标识由调用方**显式传入**（批 3a：不再读 {@code RequestContext.sessionId()} 的裸 MDC）
+     * <p>会话标识由调用方**显式传入**（批 3a：不再读裸 MDC 的会话 id）
      * → {@link SessionAgentStateRegistry#get} → {@link AgentState#systemPromptSectionCache()#clear()}。
      * 会话缺失 / 解析失败 → debug skip（保测试兼容）；registry 未接线（plain JUnit）→ debug skip。
      *

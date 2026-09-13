@@ -7,7 +7,6 @@ import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.impl.ReadFileTool;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -40,15 +39,17 @@ class PathGuardCwdResolutionTest {
         CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     /**
-     * 生产 bean 形态的 PathGuard：supplier = {@code () -> Path.of(CwdResolution.getCwd())}。
+     * 生产 bean 形态的 PathGuard：supplier = {@code () -> Path.of(CwdResolution.getCwd(sessionId))}。
      * 对齐 {@link com.nexusai.infra.config.ToolConfig#workspacePathGuard()} 生产 bean。
+     *
+     * <p>[批 3c] {@code CwdResolution.getCwd} 已从 0 参改为**显式 sessionId 形参**（原 0 参内部读
+     * 裸 MDC 会话槽，该槽已整类删除）⇒ 测试须把本用例自己的会话变量显式传进 supplier。
      */
-    private static PathGuard productionLikeGuard() {
-        return new PathGuard(() -> Path.of(CwdResolution.getCwd()));
+    private static PathGuard productionLikeGuard(String sessionId) {
+        return new PathGuard(() -> Path.of(CwdResolution.getCwd(sessionId)));
     }
 
     @Test
@@ -56,7 +57,7 @@ class PathGuardCwdResolutionTest {
     void overrideLayerDrivesWorkdir(@TempDir Path overrideDir) throws Exception {
         // WHY: CC pwd() 优先取 override（cwd.ts:19-21）。文件工具 workdir 必须随 override 变，
         // 否则并发 agent 各自的 cwd 隔离失效。
-        PathGuard guard = productionLikeGuard();
+        PathGuard guard = productionLikeGuard("sess-wf1a-1");
         Path expected = overrideDir.toRealPath();
 
         Path workdir = CwdResolution.runWithCwdOverride(overrideDir.toString(), guard::workdir);
@@ -69,12 +70,11 @@ class PathGuardCwdResolutionTest {
     void sessionCwdLayerDrivesResolve(@TempDir Path sessionDir) throws Exception {
         // WHY: bash cd / worktree 入口写 SessionCwdHolder（合并存储 [Fix-R1]）。
         // 文件工具相对路径必须解析到 sessionCwd 下，而非恒 user.dir。
-        // 生产链路：guard supplier 调 CwdResolution.getCwd() 无参重载 → 读 RequestContext.sessionId()
-        // → 据此取 SessionCwdHolder 槽。故测试须 setSession 镜像生产（ChatService/LlmAgentLoop 入口设置）。
+        // 生产链路：guard supplier 调 CwdResolution.getCwd(sessionId) 取 SessionCwdHolder 槽。
+        // [批 3c] 会话不再经 ambient 槽传递 ⇒ 测试把会话变量显式传进 supplier（原 setSession 装置已删）。
         String sid = "sess-wf1a-2";
-        RequestContext.setSession(sid);
         SessionCwdHolder.set(sid, sessionDir.toString());
-        PathGuard guard = productionLikeGuard();
+        PathGuard guard = productionLikeGuard(sid);
         Path expected = sessionDir.toRealPath().resolve("rel.txt").normalize();
 
         // 无 override → 走 sessionCwd 层
@@ -89,12 +89,11 @@ class PathGuardCwdResolutionTest {
         // WHY: CC STATE.cwd 单一可变，bash cd 后 setCwd 写新值，下一次 pwd() 取新值。
         // 若 PathGuard 把 workdir 冻结为构造时快照，cd 后仍返回旧值 → 违反 INV-2。
         // 本测试用同一 PathGuard 实例（单例 bean 形态）在两次 sessionCwd 变更间复用。
-        PathGuard guard = productionLikeGuard();
         Path d1 = dir1.toRealPath();
         Path d2 = dir2.toRealPath();
 
         String sid = "sess-wf1a-3";
-        RequestContext.setSession(sid);
+        PathGuard guard = productionLikeGuard(sid);
         SessionCwdHolder.set(sid, d1.toString());
         Path first = guard.workdir();
 
@@ -108,20 +107,21 @@ class PathGuardCwdResolutionTest {
     }
 
     @Test
-    @DisplayName("场景④: expandPath(raw, null) baseDir 缺省走统一入口 → 解析到 sessionCwd 子路径（非 user.dir · INV-6）")
+    @DisplayName("场景④: expandPath(raw, null) baseDir 缺省走统一入口 → 尊重 cwd override（非直读 user.dir · INV-6）")
     void expandPathFallbackUsesCwdResolution(@TempDir Path sessionDir) throws Exception {
         // WHY: CC expandPath baseDir ?? getCwd()。旧 Java 直读 user.dir（PathGuard.expandPath:119），
-        // 会话 cwd 变化时 expandPath 兜底仍解析到 user.dir 下。本测试锁定兜底走统一入口。
-        // expandPath 静态兜底调 CwdResolution.getCwd() 无参 → 读 RequestContext.sessionId()，
-        // 须 setSession 镜像生产。
-        String sid = "sess-wf1a-4";
-        RequestContext.setSession(sid);
-        SessionCwdHolder.set(sid, sessionDir.toString());
-
-        String expanded = PathGuard.expandPath("rel.txt", null);
+        // override/会话 cwd 变化时兜底仍解析到 user.dir 下。本测试锁定兜底走统一入口。
+        //
+        // [批 3c] 语义已变（已登记待裁定）：{@code expandPath(raw, null)} 是**静态**入口，没有 sessionId
+        //   形参，新实现显式按「无会话」解析 {@code CwdResolution.getCwd(null)}（仅 override / 进程
+        //   user.dir 层）—— 即「静态兜底不再能解析到某个会话的 sessionCwd」这一前提本身随会话显式化
+        //   而消失。故本用例改用 override 层来证明「兜底确实经统一入口（而非直读 user.dir）」这一
+        //   原意图；原「解析到 sessionCwd 子路径」的断言形态已无法构造。
+        String expanded = CwdResolution.runWithCwdOverride(
+            sessionDir.toString(), () -> PathGuard.expandPath("rel.txt", null));
 
         assertThat(expanded)
-            .as("expandPath baseDir 缺省必须经 CwdResolution 解析到 sessionCwd 子路径")
+            .as("expandPath baseDir 缺省必须经 CwdResolution 统一入口（override 生效，而非直读 user.dir）")
             .isEqualTo(sessionDir.toRealPath().resolve("rel.txt").normalize().toString());
     }
 
@@ -137,13 +137,12 @@ class PathGuardCwdResolutionTest {
         // 「文件工具用动态 cwd 读到会话目录下文件」这一端到端不变量：若有人把 ReadFileTool 注入退回
         // 固定 user.dir 的 PathGuard，或 PathGuard 退回构造时冻结，execute 会返回 File-not-found → 测试报错。
         String sid = "sess-wf1a-5";
-        RequestContext.setSession(sid);
         SessionCwdHolder.set(sid, sessionDir.toString());
         Path rel = sessionDir.resolve("in-session-cwd.txt");
         Files.writeString(rel, "hello from session cwd\n");
 
         // 同一动态 guard 实例注入 ReadFileTool（镜像生产 bean ToolConfig.workspacePathGuard）
-        PathGuard guard = productionLikeGuard();
+        PathGuard guard = productionLikeGuard(sid);
         ReadFileTool tool = new ReadFileTool(guard);
 
         // 构造 read 调用（file_path 为相对路径 → 必须经 guard.resolve 解析到 sessionCwd）

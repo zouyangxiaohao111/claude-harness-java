@@ -1,6 +1,5 @@
 package com.nexusai.domain.provider;
 
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.util.CryptoUtil;
 import com.nexusai.model.provider.dto.TestConnectionResponse;
 import com.nexusai.repository.provider.entity.ProviderRecord;
@@ -24,36 +23,33 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * [T3 前置实测探针] {@code ProviderService.test(id)} 所在线程上
- * {@code RequestContext.sessionId()}（= MDC）是 null 还是有值？
+ * [T3 前置实测探针 · 残留] {@code ProviderService.test(id)} 的会话来源。
  *
  * <p><b>WHY（规则九·验证意图）</b>：设计
  * {@code docs/zjkycode/specs/2026-09-12-provider-custom-headers-design.md §6.7} 要求
  * 「测试连接」也带上 provider 的 {@code extraHeaders}，其中 {@code ${session_id}} 占位符需要一个
- * sessionId。若该线程上 MDC **有值**，则「测试连接」能发出真实的会话亲和头；若是 null，
- * 只能落 {@code STATIC_FALLBACK}（D4 语义，天然安全）。**本探针只回答这个问题**，
- * 不改变设计。
+ * sessionId。T3 探针当年的结论是：该线程上的 ambient 会话槽**可能读到上个请求残留的、别的会话的
+ * id** ⇒ 定案「测试连接**恒传 null**」→ 占位符落 {@code STATIC_FALLBACK}（D4 语义，天然安全）。
+ *
+ * <p><b>[批 3c] 语义消失（已登记待裁定）</b>：原 T3 探针用它来测「调用线程上 ambient 会话原值」的
+ * 那个载体（裸 MDC 会话槽）已随本批<b>整类删除</b>：本仓再无任何 ambient 会话写点，探针问题
+ * 「该线程上有没有残留会话」因此<b>在结构上恒为「没有」</b>。于是：
+ * <ul>
+ *   <li>T3-A（干净线程 → 值必须为 null）：观察装置与断言删除，只保留「test() 真的跑到桩」的端到端断言。</li>
+ *   <li>T3-B（线程预置残留值 → test() 会原样读到它）：<b>整条用例删除</b>（装置与断言均无法构造；
+ *       该危害的落地防线现由 {@code ProviderTestConnectionHeadersTest#sessionIdMustAlwaysFallBackToStaticConstant}
+ *       以「占位符恒落兜底常量」的可执行断言守住）。</li>
+ *   <li>T3-C（静态取证）：保留并<b>加强</b>——原「源码不得出现 ambient 会话写点」已随载体删除成为空断言，
+ *       改为「ProviderController 全文不得出现 sessionId」。</li>
+ * </ul>
  *
  * <p><b>取证方式与限制</b>：本类直接调用真实的 {@code providerService.test(id)}（mock 掉
  * {@link ProviderMapper} 与 {@link CryptoUtil}，用 JDK {@link HttpServer} 桩充当
- * {@code GET {baseUrl}/models}），因此测的是**调用线程**上的 MDC 原值。
- *
- * <p>两种情形：
- * <ol>
- *   <li><b>clean</b>：调用线程不带任何 MDC → 模拟「全新 Tomcat 工作线程」。</li>
- *   <li><b>leaked</b>：调用线程预置一个「上一个请求留下的 sessionId」→ 模拟 Tomcat 线程复用
- *       残留（本仓 {@code MemoryController:143} / {@code TaskController:145} /
- *       {@code TeamController:95} 都调 {@code RequestContext.setSession(...)} 但**均无
- *       {@code RequestContext.clear()}**，而 {@code CommandController:363} 的注释自证
- *       「防 Tomcat 线程复用残留（无 Filter 写 MDC）」——即该残留机制在本仓是被承认存在的）。</li>
- * </ol>
- *
- * <p><b>未覆盖</b>：未启动真实 Tomcat 观察生产线程复用。生产上的取值 = 「通常是 null，
- * 但可能是上一个请求残留的**别的会话**的 sessionId」。见测试报告。
+ * {@code GET {baseUrl}/models}），故断言的是真实调用链走到底。
  *
  * @since 2026-09-12 provider-custom-headers 前置实测
  */
-@DisplayName("[T3 探针] ProviderService.test 线程的 MDC")
+@DisplayName("[T3 探针 · 残留] ProviderService.test 的会话来源")
 class ProviderTestSessionIdProbeTest {
 
     private static final Logger log = LoggerFactory.getLogger(ProviderTestSessionIdProbeTest.class);
@@ -66,7 +62,6 @@ class ProviderTestSessionIdProbeTest {
             server.stop(0);
             server = null;
         }
-        RequestContext.clear();
     }
 
     /** 起桩：{@code GET /models} → 200 + 空 JSON 体。 */
@@ -108,66 +103,43 @@ class ProviderTestSessionIdProbeTest {
     }
 
     @Test
-    @DisplayName("T3-A · 干净线程（无 MDC）：test() 内 RequestContext.sessionId() == null")
-    void t3a_cleanThread_mdcIsNull() throws IOException {
+    @DisplayName("T3-A · 测试连接端到端跑到底（会话来源不参与；[批 3c] ambient 观察装置已删）")
+    void t3a_testConnectionReachesStub() throws IOException {
         String baseUrl = startStub();
         ProviderService svc = newService(baseUrl);
 
-        RequestContext.clear(); // 模拟全新 Tomcat 工作线程（无任何残留）
-        String beforeCall = RequestContext.sessionId();
-
+        // [批 3c] 语义消失：原此处 clear() + 读 ambient 会话值并断言为 null（证明「全新线程无残留」）。
+        //   ambient 会话槽已整类删除 ⇒ 观察装置与断言删除；本用例保留端到端断言。
         TestConnectionResponse resp = svc.test("prov-probe-1");
 
         System.out.println("[T3 探针] T3-A 线程=" + Thread.currentThread().getName()
-            + " 调用前 sessionId=" + beforeCall
             + " → test() 返回 ok=" + resp.ok() + " message=" + resp.message());
-        log.info("[T3 探针] T3-A 线程={} 调用前 sessionId={} test() 返回 ok={} message={}",
-            Thread.currentThread().getName(), beforeCall, resp.ok(), resp.message());
+        log.info("[T3 探针] T3-A 线程={} test() 返回 ok={} message={}",
+            Thread.currentThread().getName(), resp.ok(), resp.message());
 
         assertThat(resp.ok()).as("桩返回 200 → 测试连接应成功（证明 test() 真的跑到了底）").isTrue();
-        assertThat(RequestContext.sessionId()).as("干净线程上 MDC 必须为空").isNull();
     }
 
-    @Test
-    @DisplayName("T3-B · 线程残留 MDC（模拟复用）：test() 读到的是【上一个请求的】sessionId")
-    void t3b_leakedThread_mdcCarriesStaleSessionId() throws IOException {
-        String baseUrl = startStub();
-        ProviderService svc = newService(baseUrl);
-
-        // 模拟「同一个 Tomcat 工作线程先服务过 /memory/files?sessionId=sess-STALE，
-        //        该端点 setSession 但从不 clear」→ 线程残留别的会话 id
-        RequestContext.setSession("sess-STALE-FROM-PREVIOUS-REQUEST");
-
-        TestConnectionResponse resp = svc.test("prov-probe-1");
-
-        String observed = RequestContext.sessionId();
-        System.out.println("[T3 探针] T3-B 线程=" + Thread.currentThread().getName()
-            + " test() 执行时 sessionId=" + observed + "（应为上个请求残留值，非本次请求）"
-            + " test() 返回 ok=" + resp.ok());
-        log.info("[T3 探针] T3-B 线程={} test() 执行时 sessionId={}（残留，非本请求）",
-            Thread.currentThread().getName(), observed);
-
-        assertThat(resp.ok()).as("桩返回 200 → test() 真的跑到了底").isTrue();
-        assertThat(observed)
-            .as("线程残留的 sessionId 会被 test() 原样读到（无 clear 机制）——这正是危害所在")
-            .isEqualTo("sess-STALE-FROM-PREVIOUS-REQUEST");
-    }
+    // [批 3c] T3-B（线程预置残留会话 → test() 原样读到）整条删除：其装置（写 ambient 会话槽）
+    //   与断言（读回该值）都依赖已被整类删除的载体，无法构造。该危害的现行防线 =
+    //   ProviderTestConnectionHeadersTest#sessionIdMustAlwaysFallBackToStaticConstant
+    //   （断言 ${session_id} 恒落 STATIC_FALLBACK）。已登记在批报告里待裁定。
 
     @Test
-    @DisplayName("T3-C · 静态证据：ProviderController.test 无 sessionId 入参、无 Filter/Interceptor 写 MDC")
+    @DisplayName("T3-C · 静态证据：ProviderController.test 无 sessionId 入参、全文无 sessionId")
     void t3c_staticEvidence_noMdcSourceOnProviderTestPath() {
-        // 本用例是「静态取证」：把源码事实写成断言，防止未来有人加了 Filter 而本结论悄悄失效。
+        // 本用例是「静态取证」：把源码事实写成断言，防止未来有人给测试连接加回会话来源而本结论悄悄失效。
         String controllerSrc = readSource(
             "src/main/java/com/nexusai/apis/provider/ProviderController.java");
         assertThat(controllerSrc)
             .as("ProviderController.test 只有 @PathVariable String id —— 不接收 sessionId")
             .contains("public TestConnectionResponse test(@PathVariable String id)");
         assertThat(controllerSrc)
-            .as("ProviderController 全文不得出现 RequestContext.setSession（本探针结论的前提之一）")
-            .doesNotContain("RequestContext.setSession");
+            .as("ProviderController 全文不得出现 sessionId（T3 结论：测试连接无会话源 ⇒ ${session_id} 恒落兜底常量）")
+            .doesNotContain("sessionId");
 
-        System.out.println("[T3 探针] T3-C 静态取证通过：ProviderController 无 sessionId 入参、无 MDC 写点");
-        log.info("[T3 探针] T3-C 静态取证通过：ProviderController 无 sessionId 入参、无 MDC 写点");
+        System.out.println("[T3 探针] T3-C 静态取证通过：ProviderController 无 sessionId 入参、无会话来源");
+        log.info("[T3 探针] T3-C 静态取证通过：ProviderController 无 sessionId 入参、无会话来源");
     }
 
     /** 读源码文件（相对 backend 模块根，即 surefire 默认 user.dir）。 */

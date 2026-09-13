@@ -2,7 +2,6 @@ package com.nexusai.application.agent.plugin;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.settings.storage.ConfigStorage;
-import com.nexusai.common.RequestContext;
 import jakarta.annotation.PostConstruct;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -150,8 +149,12 @@ public class PluginStartupAssembler {
             return;
         }
         try {
+            // [批 3c] 显式 null = 无会话：本方法由启动期 {@code runStartupChecksAsync} 调用
+            //   （Spring 单例 @PostConstruct 提交的后台任务），线程上不存在任何会话来源
+            //   （无 sessionId 形参/字段/调用链）→ CwdResolution 回落 user.dir，与旧实现（启动线程
+            //   MDC 恒空）行为零变化。会话感知需启动链引入会话通道（不在本批清单）。
             MarketplaceConfigStore store = new MarketplaceConfigStore(marketplaceManager, configStorage,
-                () -> CwdResolution.getOriginalCwdLayer(RequestContext.sessionId()));
+                () -> CwdResolution.getOriginalCwdLayer(null));
             MarketplaceReconciler reconciler = new MarketplaceReconciler(store);
             // 1) 官方 marketplace 首次启动自动安装（幂等跳过已装）· CC officialMarketplaceStartupCheck.ts:147
             OfficialMarketplace.wire(marketplaceManager, reconciler).checkAndInstallOfficialMarketplace();
@@ -186,8 +189,9 @@ public class PluginStartupAssembler {
         if (log.isInfoEnabled()) {
             log.info("[PluginStartupAssembler] 启动插件检查：触发 marketplace reconcile（对齐 CC performStartupChecks.tsx:24-69 / REPL.tsx:799）");
         }
+        // [批 3c] 显式 null = 无会话（同 {@link #runL9BackgroundHousekeeping()}：启动期无会话通道）。
         PerformStartupChecks.wire(marketplaceManager, configStorage, pluginLoader,
-                () -> CwdResolution.getOriginalCwdLayer(RequestContext.sessionId()))
+                () -> CwdResolution.getOriginalCwdLayer(null))
             .performStartupChecks(setAppState);
     }
 

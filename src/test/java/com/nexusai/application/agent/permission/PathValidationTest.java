@@ -3,7 +3,6 @@ package com.nexusai.application.agent.permission;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -11,8 +10,10 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -357,13 +358,73 @@ class PathValidationTest {
         PathValidationEnv env = new PathValidationEnv(
             "s1", null, "C:/proj", "C:/proj", "C:/Users/u/.claude", "C:/Users/u/.claude",
             false, "C:/tmp/claude", false, null, null);
+        // 末位 cwd = 会话 cwd（root-relative edit 规则匹配根锚）；本用例 permCtx=null（无规则桶）
+        // ⇒ cwd 不参与判定，取本场景会话 cwd "C:/proj"（与 env.effectiveCwd 同源）。
         assertThat(PathValidation.isPathAllowed("C:/proj/a.txt", null,
-            PermissionUpdates.OperationType.READ, env, null, null).allowed()).isTrue();
+            PermissionUpdates.OperationType.READ, env, null, null, "C:/proj").allowed()).isTrue();
         assertThat(PathValidation.isPathAllowed("C:/etc/passwd", null,
-            PermissionUpdates.OperationType.READ, env, null, null).allowed()).isFalse();
+            PermissionUpdates.OperationType.READ, env, null, null, "C:/proj").allowed()).isFalse();
         // 写 + 非 acceptEdits → 目录内也不 auto-allow（CC :207-209）
         assertThat(PathValidation.isPathAllowed("C:/proj/a.txt", null,
-            PermissionUpdates.OperationType.WRITE, env, null, null).allowed()).isFalse();
+            PermissionUpdates.OperationType.WRITE, env, null, null, "C:/proj").allowed()).isFalse();
+    }
+
+    @Test
+    @DisplayName("[G9] 会话 cwd 显式下传：同一 root-relative deny 规则 + 同一路径，传会话 cwd 命中 deny，传 null 不命中")
+    void sessionCwd_anchorsRootRelativeEditDenyRule(@TempDir Path projectDir) throws Exception {
+        // WHY（规则九 · G9）：批 3c 删 MDC 会话槽后，root-relative {@code Edit(...)} 规则
+        //   （项目/本地 settings 里以 {@code ./} 或无前缀写的 deny/allow）若拿不到会话 cwd，
+        //   匹配根锚回落进程 user.dir；会话绑定项目 ≠ 进程启动目录时锚错根 ⇒ 相对规则永不命中
+        //   ⇒ 应被 deny 的写入被放行（权限判定错位）。
+        //   本用例用**真实临时目录**（非 mock、非 "C:/proj" 常量）作会话 cwd，钉住两侧：
+        //   ① cwd = 会话 cwd → 相对规则锚定会话项目根 → deny 命中（cwd 若未下传/被丢 ⇒ 变红）；
+        //   ② cwd = null（无会话）→ 根锚回落 user.dir、会话项目在其外 → 不命中
+        //      （回落契约与改动前逐字一致）。
+        Path projectRoot = projectDir.toRealPath();
+        String sessionCwd = projectRoot.toString();
+        String target = projectRoot.resolve("sub/secret.txt").toString();
+        // 前置（鉴别力）：临时目录与 user.dir 必须互不包含，否则两侧锚同根 ⇒ 用例失去鉴别力。
+        //   用 assertThat 而非 assumeTrue —— 前提不成立必须**响亮失败**（规则十二），不得静默跳过。
+        Path userDir = Path.of(System.getProperty("user.dir")).toRealPath();
+        assertThat(sessionCwd.startsWith(userDir.toString())
+                || userDir.toString().startsWith(sessionCwd))
+            .as("临时目录 %s 与 user.dir %s 必须互不包含，否则两侧同根、用例无鉴别力", sessionCwd, userDir)
+            .isFalse();
+
+        // 同一 root-relative deny 规则：Edit("sub/secret.txt")（无 //、~/、/ 前缀 → root = cwd）
+        PermissionRule denyRule = new PermissionRule(
+            PermissionRuleSource.SESSION, PermissionBehavior.DENY,
+            PermissionRuleValue.withContent("Edit", "sub/secret.txt"));
+        Map<PermissionRuleSource, Set<PermissionRule>> deny = new EnumMap<>(PermissionRuleSource.class);
+        deny.put(PermissionRuleSource.SESSION, Set.of(denyRule));
+        ToolPermissionContext permCtx = ToolPermissionContext.of(
+            PermissionMode.DEFAULT, Map.of(), deny, Map.of(), Map.of());
+
+        // env 工作目录锚会话项目根（让 ② 确定性地走到 step3「工作目录内 read → allowed」收尾，
+        //   不依赖 deny 以外的偶发分支）
+        PathValidationEnv env = new PathValidationEnv(
+            "s1", null, sessionCwd, sessionCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
+            false, "C:/tmp/claude", false, null, null);
+
+        // ① 传会话 cwd → deny 命中（step1 deny 优先于其余各步）
+        PathValidation.PathCheckResult withSession = PathValidation.isPathAllowed(target, permCtx,
+            PermissionUpdates.OperationType.READ, env, null, null, sessionCwd);
+        assertThat(withSession.allowed())
+            .as("会话 cwd 显式下传 ⇒ root-relative deny 规则锚定会话项目根 ⇒ 必须命中 deny（G9 不得复现）")
+            .isFalse();
+        assertThat(withSession.decisionReason())
+            .as("命中来源必须是该 deny 规则本体（step1 deny 优先级）")
+            .isInstanceOf(PermissionDecisionReason.Rule.class);
+        assertThat(((PermissionDecisionReason.Rule) withSession.decisionReason()).rule())
+            .as("decisionReason 携带的规则 = 传入的 root-relative deny 规则")
+            .isEqualTo(denyRule);
+
+        // ② 传 null（无会话）→ 同一路径、同一规则不命中（根锚回落 user.dir）
+        PathValidation.PathCheckResult noSession = PathValidation.isPathAllowed(target, permCtx,
+            PermissionUpdates.OperationType.READ, env, null, null, null);
+        assertThat(noSession.allowed())
+            .as("无会话（cwd=null）⇒ 根锚回落 user.dir、会话项目在其外 ⇒ 相对规则不命中（回落契约不变）")
+            .isTrue();
     }
 
     @Test
@@ -470,7 +531,6 @@ class PathValidationTest {
     void clearCwdState() {
         CwdResolution.clearCurrentOverride();
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     /** 13 参最小 ToolUseContext 工厂（sessionId 固定，便于绑定 SessionProjectRoot）。 */

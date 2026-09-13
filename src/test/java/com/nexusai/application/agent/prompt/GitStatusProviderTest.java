@@ -3,7 +3,6 @@ package com.nexusai.application.agent.prompt;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.worktree.GitCommandRunner;
 import com.nexusai.application.agent.config.GitInstructionConfig;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -289,39 +288,41 @@ class GitStatusProviderTest {
 
     /**
      * WHY（规则九 · 测试验证意图）：CC {@code getIsGit}（git.ts:222）调用 {@code findGitRoot(getCwd())}
-     * —— {@code getCwd()} 无参取全局 STATE.cwd（cwd.ts:26-32）。Java 端无参构造旧实现固定
-     * {@code Paths.get("").toAbsolutePath()=user.dir}（JVM 启动目录），在绑定项目/worktree 场景会
-     * 锚定错仓库（G6）。无参构造必须走 {@link CwdResolution#getCwd()} —— 绑定项目层覆盖 user.dir
-     * 时取对仓库。本测试钉死"无参构造锚定绑定项目根"语义，防回归到 user.dir 直读。
+     * —— {@code getCwd()} 无参取全局 STATE.cwd（cwd.ts:26-32）。Java 端绑定项目/worktree 场景若
+     * 锚定 user.dir（JVM 启动目录）会取错仓库（G6）。会话态调用方必须走
+     * {@link CwdResolution#getCwd(String)} —— 绑定项目层覆盖 user.dir 时取对仓库。本测试钉死
+     * "cwd 统一入口锚定绑定项目根"语义，防回归到 user.dir 直读。
      */
     @Test
-    @DisplayName("无参构造 → findGitRoot 锚定 SessionProjectRoot 绑定项目（对齐 CC findGitRoot(getCwd()) git.ts:222）")
+    @DisplayName("会话 cwd 入口 → findGitRoot 锚定 SessionProjectRoot 绑定项目（对齐 CC findGitRoot(getCwd()) git.ts:222）")
     void noArgConstructor_walksCwdResolution_boundProjectOverridesUserDir() throws Exception {
         Path boundProject = tmp.resolve("bound-project");
         mkdirGit(boundProject);
         String sessionId = "wf-1b-git-" + UUID.randomUUID();
-        RequestContext.setSession(sessionId);
         SessionProjectRoot.setForSession(sessionId, boundProject.toString());
         try {
-            GitStatusProvider p = new GitStatusProvider(); // 无参
+            // [批 3c] 语义消失：GitStatusProvider 不持 sessionId，无参构造已显式按「无会话」解析
+            //   （getCwd(null) 跳过 sessionCwd/boundProject 会话层；裸 MDC 会话槽已彻底删除）⇒ 原
+            //   「无参构造经裸 MDC 取会话 cwd 锚定绑定项目」不可达。改为会话态调用方按 javadoc 显式
+            //   传入 Path.of(getCwd(sessionId))；断言文本不变（仍钉死「锚定绑定项目根而非 user.dir」）。
+            GitStatusProvider p = new GitStatusProvider(Path.of(CwdResolution.getCwd(sessionId)));
 
-            assertThat(p.isGit()).as("绑定项目含 .git → 无参构造走 CwdResolution → isGit=true").isTrue();
+            assertThat(p.isGit()).as("绑定项目含 .git → cwd 统一入口 → isGit=true").isTrue();
             assertThat(p.findGitRoot()).as("findGitRoot 锚定绑定项目根（非 user.dir）")
                 .isEqualTo(boundProject.toRealPath());
         } finally {
             SessionProjectRoot.clearSession(sessionId);
-            RequestContext.clear();
         }
     }
 
     @Test
-    @DisplayName("无参构造 cwd 与 CwdResolution.getCwd() 一致（无绑定回落 user.dir，对齐 CC getOriginalCwd 进程启动兜底）")
+    @DisplayName("无参构造 cwd 与 CwdResolution.getCwd(null) 一致（无绑定回落 user.dir，对齐 CC getOriginalCwd 进程启动兜底）")
     void noArgConstructor_cwdEqualsCwdResolution() {
-        // 无 sessionId/无绑定 → CwdResolution.getCwd() 回落 user.dir；无参构造须与之一致
+        // 无 sessionId/无绑定 → CwdResolution.getCwd(null) 回落 user.dir；无参构造须与之一致
         GitStatusProvider noArg = new GitStatusProvider();
-        GitStatusProvider viaResolution = new GitStatusProvider(Path.of(CwdResolution.getCwd()));
+        GitStatusProvider viaResolution = new GitStatusProvider(Path.of(CwdResolution.getCwd(null)));
 
-        assertThat(noArg.findGitRoot()).as("无参构造 findGitRoot 与 CwdResolution.getCwd() 派生一致")
+        assertThat(noArg.findGitRoot()).as("无参构造 findGitRoot 与 CwdResolution.getCwd(null) 派生一致")
             .isEqualTo(viaResolution.findGitRoot());
     }
 }

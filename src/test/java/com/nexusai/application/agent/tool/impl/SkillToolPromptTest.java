@@ -189,8 +189,9 @@ class SkillToolPromptTest {
         SkillToolPrompt.SkillToolInfo info = SkillToolPrompt.getSkillToolInfo(registry);
 
         // totalCommands === includedCommands === getModelInvocableCommands().size()（CC: 两值恒相等）
-        assertThat(info.totalCommands()).isEqualTo(registry.getModelInvocableCommands().size());
-        assertThat(info.includedCommands()).isEqualTo(registry.getModelInvocableCommands().size());
+        // [批 3c] 无会话 → 显式 null（SkillToolPrompt.getSkillToolInfo 签名无会话入参，内部即传 null）
+        assertThat(info.totalCommands()).isEqualTo(registry.getModelInvocableCommands(null).size());
+        assertThat(info.includedCommands()).isEqualTo(registry.getModelInvocableCommands(null).size());
         // 只统计模型可调用技能（skill-b 被 exclude，只剩 skill-a）
         assertThat(info.totalCommands()).isEqualTo(1);
     }
@@ -207,7 +208,8 @@ class SkillToolPromptTest {
 
         List<Command> limited = SkillToolPrompt.getLimitedSkillToolCommands(registry);
 
-        assertThat(limited).isEqualTo(registry.getModelInvocableCommands());
+        // [批 3c] 无会话 → 显式 null（getLimitedSkillToolCommands 签名无会话入参，内部即传 null）
+        assertThat(limited).isEqualTo(registry.getModelInvocableCommands(null));
         assertThat(limited).extracting(Command::getName).contains("skill-a");
     }
 
@@ -224,8 +226,9 @@ class SkillToolPromptTest {
 
         SkillToolPrompt.SkillInfo info = SkillToolPrompt.getSkillInfo(registry);
 
-        assertThat(info.totalSkills()).isEqualTo(registry.getSlashCommandToolSkills().size());
-        assertThat(info.includedSkills()).isEqualTo(registry.getSlashCommandToolSkills().size());
+        // [批 3c] 无会话 → 显式 null（getSkillInfo 签名无会话入参，内部即传 null）
+        assertThat(info.totalSkills()).isEqualTo(registry.getSlashCommandToolSkills(null).size());
+        assertThat(info.includedSkills()).isEqualTo(registry.getSlashCommandToolSkills(null).size());
         // 第二套过滤：无 hasUserSpecifiedDescription 且无 whenToUse 的 USER 技能被排除
         assertThat(info.totalSkills()).isEqualTo(1);
     }

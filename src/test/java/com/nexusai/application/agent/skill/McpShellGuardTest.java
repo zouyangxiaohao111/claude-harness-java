@@ -53,8 +53,10 @@ class McpShellGuardTest {
             this.cmds = cmds;
         }
 
+        // [批 3c] 基类 getAllCommands 新增显式 sessionId 形参 → 子类覆写同步；本夹具恒返固定集合，
+        //   与调用方会话无关，故忽略 sessionId
         @Override
-        public List<Command> getAllCommands() {
+        public List<Command> getAllCommands(String sessionId) {
             return cmds;
         }
     }

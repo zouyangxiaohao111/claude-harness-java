@@ -24,7 +24,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Supplier;
 
 /**
  * WorkflowService 实现（makeService 等价 + Spring 进程单例）· CC original: {@code makeService}
@@ -61,13 +60,14 @@ public final class WorkflowServiceImpl implements WorkflowService {
     private final ProgressStore store;
     /** 测试注入：覆盖 projectRoot（makeService 用，service.ts:119-121）。 */
     private final String cwdOverride;
-    /** runsDir 单一源 · 生产 = WorkflowPortsImpl.defaultRunsDir 等价；测试注入 tmp（service.ts:126）。 */
-    private final Supplier<String> runsDirProvider;
+    /** runsDir 单一源（<b>会话感知</b>：入参 sessionId）· 生产 = {@link WorkflowPortsImpl#defaultRunsDir(String)}；
+     * 测试注入 tmp（service.ts:126）。 */
+    private final java.util.function.Function<String, String> runsDirResolver;
     /** 进度总线（run_done 持久化订阅用）· 测试 makeService 路径为 null（不接线，对齐 CC makeService）。 */
     private final ProgressBus bus;
     /** 通知队列（终态通知出站）· 测试 makeService 路径为 null（不接线）。 */
     private final NotificationQueue notificationQueue;
-    /** 磁盘持久化（W-3c）· 持 runsDirProvider 单例。 */
+    /** 磁盘持久化（W-3c）· 持 runsDir 解析单例。 */
     private final WorkflowRunPersistence persistence;
 
     /** 编译期校验 parser（W-1b）。 */
@@ -85,7 +85,7 @@ public final class WorkflowServiceImpl implements WorkflowService {
      * Spring 注入（进程单例）· CC original: getWorkflowService (service.ts:98-111)。
      *
      * <p>bus + notificationQueue 为构造后接线提供（run_done 持久化 + 终态通知），
-     * runsDirProvider 生产默认 = {@code WorkflowPortsImpl.defaultRunsDir}（会话绑定项目根）。
+     * runsDirResolver 生产默认 = {@code WorkflowPortsImpl::defaultRunsDir}（会话绑定项目根）。
      */
     @Autowired
     public WorkflowServiceImpl(WorkflowPorts ports, ProgressStore store, ProgressBus bus,
@@ -109,19 +109,23 @@ public final class WorkflowServiceImpl implements WorkflowService {
      * @param ports             注入的 ports
      * @param store             注入的 store（ProgressStore 构造时已订阅 bus）
      * @param cwdOverride       测试注入的临时目录（覆盖 projectRoot）
-     * @param runsDirProvider   runsDir 单一源（生产默认 / 测试注入 tmp）
+     * @param runsDirResolver   runsDir 单一源（<b>会话感知</b>：入参 sessionId；生产默认 / 测试注入 tmp）
      * @param bus               进度总线（null = 测试 makeService 不接线）
      * @param notificationQueue 通知队列（null = 测试 makeService 不接线）
      */
     WorkflowServiceImpl(WorkflowPorts ports, ProgressStore store, String cwdOverride,
-                        Supplier<String> runsDirProvider, ProgressBus bus, NotificationQueue notificationQueue) {
+                        java.util.function.Function<String, String> runsDirResolver, ProgressBus bus,
+                        NotificationQueue notificationQueue) {
         this.ports = Objects.requireNonNull(ports, "ports");
         this.store = Objects.requireNonNull(store, "store");
         this.cwdOverride = cwdOverride;
-        this.runsDirProvider = Objects.requireNonNull(runsDirProvider, "runsDirProvider");
+        this.runsDirResolver = Objects.requireNonNull(runsDirResolver, "runsDirResolver");
         this.bus = bus;
         this.notificationQueue = notificationQueue;
-        this.persistence = new WorkflowRunPersistence(runsDirProvider);
+        // [批 3c] WorkflowRunPersistence 仍持无参 Supplier：其唯一 runsDir 消费点是
+        //   attachRunStatePersistence 的 run_done 总线订阅者（任意线程，手上无会话）→ 显式 null
+        //   → 进程默认。见该类 javadoc「已知边界」。
+        this.persistence = new WorkflowRunPersistence(() -> runsDirResolver.apply(null));
         this.parser = new WorkflowScriptParser();
         this.runEngine = new WorkflowRunEngine();
         // 构造后接线（service.ts:103-109）：仅生产路径（bus/queue 非 null）
@@ -175,13 +179,26 @@ public final class WorkflowServiceImpl implements WorkflowService {
         return ports;
     }
 
+    /**
+     * 面板/工具启动 workflow · CC original: {@code launch(input, toolUseContext, canUseTool)}
+     * (service.ts:53-67 / 实现 :188-257)。
+     *
+     * <p><b>[批 3c 会话透传说明]</b> 本方法是 runsDir 消费链上<b>唯一</b>手上有会话的入口
+     * （{@link ToolUseContext#sessionId()}）：会话已显式用于 host bundle 与
+     * {@link #resolveProjectRoot}（{@code cwd}）。但 runsDir 的两条消费链在<b>下游且无会话形参</b>——
+     * ① {@code WorkflowPorts.journalStore()}（接口无参，引擎/hooks 调用，batch 3c 不动接口）；
+     * ② {@code WorkflowRunPersistence} 的 run_done 总线订阅者（任意线程）。故无法从本方法一路透传，
+     * 见 {@link #getRunAsync} 与 {@link WorkflowPortsImpl#journalStore()} 的「已知边界」。
+     */
     @Override
     public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool) {
         if (input == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("LaunchInput 不能为 null"));
         }
-        log.info("WorkflowService.launch 入口：name={} scriptPath={} resumeFromRunId={} maxConcurrency={}（CC service.ts:188-257）",
-                input.name(), input.scriptPath(), input.resumeFromRunId(), input.maxConcurrency());
+        log.info("WorkflowService.launch 入口：name={} scriptPath={} resumeFromRunId={} maxConcurrency={} "
+                + "sessionId={}（CC service.ts:188-257）",
+                input.name(), input.scriptPath(), input.resumeFromRunId(), input.maxConcurrency(),
+                ctx != null ? ctx.sessionId() : null);
         try {
             ResolvedSource src = resolveSource(input, ctx);
 
@@ -317,6 +334,11 @@ public final class WorkflowServiceImpl implements WorkflowService {
      * <p>内存命中返回；miss 从磁盘 state.json 读（不注入内存）。Java 磁盘读为同步 IO，
      * 以 completedFuture 承载（与 resolveSource 的 Files.readString 同款同步风格）。
      *
+     * <p><b>[批 3c 已知边界] 无会话来源</b>：本方法签名（CC {@code getRunAsync(runId)} 同形）只有
+     * runId，没有会话；调用方 {@code WorkflowController} 的两个端点也无 sessionId 形参 →
+     * 显式传 {@code null} = 进程默认（{@code user.dir}）runsDir，与原「无 MDC」时的兜底一致。
+     * 待决策：端点补可选 {@code sessionId} 查询参数（或 runId→sessionId 登记）后再透传。
+     *
      * @param runId 目标 run id
      * @return RunProgress 或 null（内存 + 磁盘双 miss）
      */
@@ -330,11 +352,11 @@ public final class WorkflowServiceImpl implements WorkflowService {
             return CompletableFuture.completedFuture(mem);
         }
         // service.ts:288 miss → 磁盘 readRunState ?? null
-        String runsDir = WorkflowRunPersistence.getRunsDir(runsDirProvider.get());
+        String runsDir = WorkflowRunPersistence.getRunsDir(runsDirResolver.apply(null));
         RunProgress fromDisk = persistence.readRunState(runsDir, runId);
         if (fromDisk != null && log.isDebugEnabled()) {
-            log.debug("getRunAsync 磁盘命中：runId={} status={}（service.ts:288，不注入内存）",
-                    runId, fromDisk.status());
+            log.debug("getRunAsync 磁盘命中：runId={} status={} runsDir={}（service.ts:288，不注入内存）",
+                    runId, fromDisk.status(), runsDir);
         }
         return CompletableFuture.completedFuture(fromDisk);
     }
@@ -354,7 +376,9 @@ public final class WorkflowServiceImpl implements WorkflowService {
         }
         persistedLoaded = true;
         try {
-            String runsDir = runsDirProvider.get();
+            // [批 3c 已知边界] 本方法无会话形参（CC loadPersistedRuns 同形；面板进程级水合）→ 显式 null
+            //   = 进程默认（user.dir）runsDir；见 getRunAsync javadoc「无会话来源」。
+            String runsDir = runsDirResolver.apply(null);
             List<RunProgress> runs = persistence.listPersistedRuns(runsDir, LOAD_PERSISTED_LIMIT);
             for (RunProgress run : runs) {
                 store.hydrate(run);

@@ -48,7 +48,8 @@ class SkillRegistryBuiltInCommandsTest {
     @Test
     @DisplayName("getAllCommands 含内置命令 clear/compact/init（第 5 源并入，CC commands.ts:467 ...COMMANDS()）")
     void getAllCommands_containsBuiltin() {
-        List<Command> all = registry.getAllCommands();
+        // [批 3c] 无会话 → 显式 null（本类各用例只验内置命令源并入/排除，不涉会话）
+        List<Command> all = registry.getAllCommands(null);
 
         assertThat(all).extracting(Command::getName).contains("clear", "compact", "init");
         assertThat(all).extracting(Command::getName).containsAll(BUILTIN_NAMES);
@@ -57,7 +58,8 @@ class SkillRegistryBuiltInCommandsTest {
     @Test
     @DisplayName("getModelInvocableCommands 不含任何内置命令（CC commands.ts:570 source!=='builtin'，Java :628 现成过滤）")
     void getModelInvocableCommands_excludesBuiltin() {
-        List<Command> invocable = registry.getModelInvocableCommands();
+        // [批 3c] 无会话 → 显式 null
+        List<Command> invocable = registry.getModelInvocableCommands(null);
 
         assertThat(invocable).extracting(Command::getName).doesNotContainAnyElementsOf(BUILTIN_NAMES);
     }
@@ -65,7 +67,8 @@ class SkillRegistryBuiltInCommandsTest {
     @Test
     @DisplayName("getSlashCommandToolSkills 不含内置命令（CC commands.ts:593 source!=='builtin'，Java :780 现成过滤）")
     void getSlashCommandToolSkills_excludesBuiltin() {
-        List<Command> slash = registry.getSlashCommandToolSkills();
+        // [批 3c] 无会话 → 显式 null
+        List<Command> slash = registry.getSlashCommandToolSkills(null);
 
         assertThat(slash).extracting(Command::getName).doesNotContainAnyElementsOf(BUILTIN_NAMES);
     }
@@ -73,7 +76,8 @@ class SkillRegistryBuiltInCommandsTest {
     @Test
     @DisplayName("findCommand('clear') 精确名命中内置命令（findCommand 消费面含 BUILTIN）")
     void findCommand_clear() {
-        Command hit = registry.findCommand("clear");
+        // [批 3c] 无会话 → 显式 null（下述 findCommand 各断言同理）
+        Command hit = registry.findCommand("clear", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("clear");
         assertThat(hit.getSource().name()).isEqualTo("BUILTIN");
@@ -82,7 +86,7 @@ class SkillRegistryBuiltInCommandsTest {
     @Test
     @DisplayName("findCommand('continue') 经 alias 命中 resume（内置命令 alias 三维匹配）")
     void findCommand_alias_continue_to_resume() {
-        Command hit = registry.findCommand("continue");
+        Command hit = registry.findCommand("continue", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("resume");
     }
@@ -90,7 +94,7 @@ class SkillRegistryBuiltInCommandsTest {
     @Test
     @DisplayName("findCommand('/clear') 前导 '/' 剥除命中内置命令")
     void findCommand_stripsLeadingSlash() {
-        Command hit = registry.findCommand("/clear");
+        Command hit = registry.findCommand("/clear", null);
         assertThat(hit).isNotNull();
         assertThat(hit.getName()).isEqualTo("clear");
     }

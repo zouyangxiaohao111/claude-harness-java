@@ -60,7 +60,7 @@ import java.util.UUID;
  * </ol>
  *
  * <p><b>消费侧 key 优先级</b>（AnthropicSdkProvider.consumePostCompactionAtApiSuccess）：
- * history 有 sessionId 优先 → 否则 {@code RequestContext.sessionId()}（MDC，ChatService 已设
+ * history 有 sessionId 优先 → 否则 裸 MDC 的 {@code sessionId()}（MDC，ChatService 已设
  * {@code "sess-xxx"} 原始串）→ 仍无则 null → 本类回落进程级单布尔。
  *
  * <p>⚠ <b>mark 侧 key 均为解析后 UUID 串</b>（grep 自验）：ToolRegistrationConfig:1232

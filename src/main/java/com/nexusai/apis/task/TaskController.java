@@ -7,7 +7,6 @@ import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
 import com.nexusai.application.agent.tasks.Task;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskService;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -141,9 +140,9 @@ public class TaskController {
      * <b>不同源</b>——本端点返回 TaskCreate 创建的任务（TaskService.listTasks → List&lt;Task&gt;），
      * 映射为 {@link TaskItemDto}（CC TaskSchema tasks.ts:76-88 全量投影）。
      *
-     * <p>会话机制（批 3a 改）：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400，不再回落 MDC）
-     * → 写回 MDC（单向传播，喂 {@link TaskService#getTaskListId()} 的会话级槽）→
-     * {@code getTaskListId()} 按 CC 优先级链（tasks.ts:199-210）解析 taskListId：
+     * <p>会话机制（批 3a 改 / 批 3c 显式化）：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400，
+     * 不再回落 MDC）→ <b>显式</b>传入 {@link TaskService#getTaskListId(String)} 的会话位（批 3c 起不再
+     * 经 MDC 载体回放）→ 按 CC 优先级链（tasks.ts:199-210）解析 taskListId：
      * env CLAUDE_CODE_TASK_LIST_ID / in-process teammate teamName / team.name / 会话级
      * leaderTeamName / 当前会话。任务读取无锁（CC listTasks 无锁 readdir，tasks.ts:443-456）。
      *
@@ -152,8 +151,8 @@ public class TaskController {
      */
     @GetMapping("/list")
     public TaskListSnapshotDto listTasksMerged(@RequestParam(value = "sessionId", required = false) String sessionId) {
-        // 批 3a：sessionId **必填**（缺 ⇒ 400）。旧实现 query 缺值时回落 RequestContext.sessionId()
-        //   （裸 MDC）——MDC 第三态会读到上一请求残留的别的会话 id ⇒ 返回别的会话的任务清单
+        // 批 3a：sessionId **必填**（缺 ⇒ 400）。旧实现 query 缺值时回落裸 MDC 会话槽
+        //   ——MDC 第三态会读到上一请求残留的别的会话 id ⇒ 返回别的会话的任务清单
         //   （taskListId / V1 todos 桶都按 sid 解析，静默串会话）。fail loud 消除该态。
         if (sessionId == null || sessionId.isBlank()) {
             log.warn("[TaskController] GET /api/v1/tasks/list 缺少会话标识 ?sessionId= → 400"
@@ -161,10 +160,9 @@ public class TaskController {
             throw new ValidationException("sessionId is required (GET /api/v1/tasks/list)");
         }
         String sid = sessionId;
-        // taskListId 解析链（TaskService.getTaskListId）内部读 MDC 的会话级 leaderTeamName / 当前会话槽，
-        //   故这里仍把**显式收到的会话**写回 MDC（单向传播，绝不读回；3c 收敛为显式传参）。
-        RequestContext.setSession(sid);
-        String taskListId = TaskService.getTaskListId();
+        // taskListId 解析链（TaskService.getTaskListId(sessionId)）的会话级 leaderTeamName / 当前会话位
+        //   由**显式形参**承载（批 3c：不再写回裸 MDC；旧实现 setSession+无参 getTaskListId() 读回同一值）。
+        String taskListId = TaskService.getTaskListId(sid);
         // [task-v2-merge] V1 V2 都查合并（用户拍板 2026-08-25：会话 V1（TodoWrite）/V2（TaskCreate）
         //   互斥只会有一个；端点两者都查返回，前端按非空方显示）：
         //   V2 = TaskService 文件（{configHome}/tasks/{taskListId}），V1 = sessions.todos 列（DB-first）。

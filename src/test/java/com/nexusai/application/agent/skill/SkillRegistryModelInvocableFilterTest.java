@@ -63,7 +63,8 @@ class SkillRegistryModelInvocableFilterTest {
         writeSkill(tempDir, "user-desc", "user-desc", "description: 显式描述");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null（本类各用例只验过滤/清单内容，不涉会话）
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .contains("user-desc");
     }
@@ -74,7 +75,8 @@ class SkillRegistryModelInvocableFilterTest {
         writeSkill(tempDir, "user-nodesc", "user-nodesc", null);
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .contains("user-nodesc");
     }
@@ -90,7 +92,8 @@ class SkillRegistryModelInvocableFilterTest {
         registerPluginSkill(registry, new BuiltinPluginRegistry.SkillDefinition(
             "plugin-cmd", "plugin desc", List.of(), null, null, false, true, "prompt text"));
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .contains("plugin-cmd");
     }
@@ -111,7 +114,8 @@ class SkillRegistryModelInvocableFilterTest {
             "prompt text", "claude-3-5", "{\"PreToolUse\":\"cmd\"}", "fork", "agent-x",
             () -> gate.incrementAndGet() == 1));
 
-        Command c = registry.findCommandIncludingMcp("plugin-full");
+        // [批 3c] 无会话 → 显式 null
+        Command c = registry.findCommandIncludingMcp("plugin-full", null);
         assertThat(c).isNotNull();
         assertThat(c.getHasUserSpecifiedDescription())
             .as("P2-15: hasUserSpecifiedDescription=true（CC builtinPlugins.ts:137）")
@@ -156,7 +160,8 @@ class SkillRegistryModelInvocableFilterTest {
         plugin.setLoadedFrom(CommandLoadedFrom.PLUGIN); // CC loadedFrom: 'plugin'（loadSkillsDir.ts:70）
         SkillRegistry registry = new FixtureRegistry(List.of(plugin));
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .doesNotContain("plugin-loaded-cmd");
     }
@@ -172,7 +177,8 @@ class SkillRegistryModelInvocableFilterTest {
         plugin.setLoadedFrom(CommandLoadedFrom.PLUGIN);
         SkillRegistry registry = new FixtureRegistry(List.of(plugin));
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .contains("plugin-when");
     }
@@ -188,7 +194,8 @@ class SkillRegistryModelInvocableFilterTest {
         plugin.setHasUserSpecifiedDescription(Boolean.TRUE);
         SkillRegistry registry = new FixtureRegistry(List.of(plugin));
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .contains("plugin-hud");
     }
@@ -202,8 +209,10 @@ class SkillRegistryModelInvocableFilterTest {
             this.cmds = cmds;
         }
 
+        // [批 3c] 基类 getAllCommands 新增显式 sessionId 形参 → 子类覆写同步；本夹具恒返固定集合，
+        //   与调用方会话无关，故忽略 sessionId
         @Override
-        public List<Command> getAllCommands() {
+        public List<Command> getAllCommands(String sessionId) {
             return cmds;
         }
     }
@@ -220,15 +229,16 @@ class SkillRegistryModelInvocableFilterTest {
 
         // 分离：getModelInvocableCommands（纯本地，对齐 CC getSkillToolCommands commands.ts:563-581）
         // 从数据源上不含 MCP（MCP live outside getCommands commands.ts:541-546）
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .doesNotContain("mcp-cmd");
-        assertThat(registry.getAllCommands())
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("mcp-cmd");
         // thread-in：getModelInvocableCommandsForListing 合并本地 + MCP（对齐 CC attachments.ts:2677-2682
         // localCommands=getSkillToolCommands + mcpSkills=getMcpSkillCommands → uniqBy name）→ MCP 技能进 listing
-        assertThat(registry.getModelInvocableCommandsForListing())
+        assertThat(registry.getModelInvocableCommandsForListing(null))
             .extracting(Command::getName)
             .contains("mcp-cmd");
     }
@@ -239,7 +249,8 @@ class SkillRegistryModelInvocableFilterTest {
         writeSkill(tempDir, "skill-disabled", "skill-disabled", "disable-model-invocation: true");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.getModelInvocableCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .doesNotContain("skill-disabled");
     }

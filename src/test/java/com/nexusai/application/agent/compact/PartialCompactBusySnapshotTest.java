@@ -1,6 +1,5 @@
 package com.nexusai.application.agent.compact;
 
-import com.nexusai.common.RequestContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -8,7 +7,6 @@ import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.PartialCompactRequest;
 import com.nexusai.model.session.dto.PartialCompactResponse;
 import com.nexusai.model.session.dto.Role;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -87,11 +85,6 @@ class PartialCompactBusySnapshotTest {
         list.add(msg("u1", Role.user));
         list.add(msg("a1", Role.assistant));
         return list;
-    }
-
-    @AfterEach
-    void tearDown() {
-        RequestContext.clear();
     }
 
     // ── 假事务管理器：只记录「事务起止」事件，不接触真实 DB ──────────────────────

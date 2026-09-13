@@ -33,7 +33,8 @@ import java.util.concurrent.atomic.AtomicReference;
  * <h2>多会话并行模型（对齐 CCB tabs_context_mcp「每个对话创建自己的新 tab」）</h2>
  * <p><b>一个扩展连接服务所有会话</b>：扩展 popup 一次连接（{@code hello}），后端把该连接
  * 视为全局连接（{@link AtomicReference}），不再按 {@code sessionId} 路由连接。每次工具调用的
- * {@code sessionId} 由调用方（{@link BrowserMcpTool} 读 {@link com.nexusai.common.RequestContext}）
+ * {@code sessionId} 由调用方（{@link BrowserMcpTool#execute} 从本次工具调用的
+ * {@link com.nexusai.application.agent.tool.ToolUseContext#sessionId()} 读取）
  * 传入，透传在 {@code tool_call} 消息里 —— 扩展按 {@code sessionId} 定位/创建对应的 tab 组
  * （对齐 CCB tabs_context_mcp 语义：每个会话自己的 tab 组，互不干扰）。
  *
@@ -139,7 +140,8 @@ public class BrowserWsChannel implements BrowserChannel {
      * <p><b>sessionId 语义</b>：仅透传给扩展定位 tab 组（对齐 CCB tabs_context_mcp「每个会话
      * 自己的 tab 组」）；结果回传经 callId 匹配（{@link #resolve}），与 sessionId 无关。
      *
-     * @param sessionId 当前会话 ID（调用方 {@link BrowserMcpTool} 读 {@code RequestContext.sessionId()}；
+     * @param sessionId 当前会话 ID（调用方 {@link BrowserMcpTool#execute} 从本次工具调用的
+     *                  {@link com.nexusai.application.agent.tool.ToolUseContext#sessionId()} 读取；
      *                  扩展按它定位/创建该会话的 tab 组）
      * @param tool      工具原名（无 {@code mcp__nexusai-in-chrome__} 前缀，如 {@code "read_page"}）
      * @param args      工具入参（CCB inputSchema 语义的扁平 Map）
@@ -346,7 +348,7 @@ public class BrowserWsChannel implements BrowserChannel {
      * 全局是否有已连接的 Chrome 扩展 · /chrome 命令 + nexusai-in-chrome skill 门控共用。
      *
      * <p><b>全局语义</b>：扩展 popup 一次连接服务所有会话 —— 有连接即 true，与当前会话无关
-     * （不再按 {@link com.nexusai.common.RequestContext#sessionId()} 查连接注册表）。
+     * （不再按会话 ID 查连接注册表；会话只随工具调用入参透传给扩展，见类 javadoc）。
      *
      * @return true = 存在 open 的全局扩展连接
      */

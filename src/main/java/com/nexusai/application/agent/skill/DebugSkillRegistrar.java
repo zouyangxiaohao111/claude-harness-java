@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.skill;
 
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.common.RequestContext;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -9,7 +8,7 @@ import java.nio.file.Paths;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
-import java.util.function.Supplier;
+import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,7 +37,8 @@ import org.slf4j.LoggerFactory;
  *   <li><b>A5</b>: 真实场景 — 用户 /debug "tool X 失败" → 启用 logging → 读 tail → 给出排查指引.</li>
  * </ul>
  *
- * <p>L3 (Java idiom): TS async fs/promises → 注入式 Supplier&lt;String&gt; (logPath) + FileTailReader (path,offset,size) → tail string;
+ * <p>L3 (Java idiom): TS async fs/promises → 注入式 {@code Function<String,String>} (sessionId → logPath,
+ *                    [批 3c] 原无会话形参 Supplier 已废) + FileTailReader (path,offset,size) → tail string;
  *                    TS `process.env.USER_TYPE` → 注入式 BooleanSupplier (isAnt);
  *                    TS `registerBundledSkill({...})` → 直接返回 BundledSkillDefinition record (上层 register).
  */
@@ -50,7 +50,8 @@ public final class DebugSkillRegistrar {
     public static final int TAIL_READ_BYTES = 64 * 1024;
 
     private final BooleanSupplier isAnt;                   // process.env.USER_TYPE === 'ant'
-    private final Supplier<String> debugLogPathSupplier;
+    /** debug log 路径供应 · [批 3c] 形参 = sessionId（{@code sessionId -> path}）。 */
+    private final Function<String, String> debugLogPathSupplier;
     private final BooleanSupplier debugLoggingEnabler;     // returns wasAlreadyLogging
     private final FileTailReader tailReader;               // (path, size) → tail string
     private final FileStatReader statReader;               // path → FileStat (size)
@@ -58,7 +59,7 @@ public final class DebugSkillRegistrar {
     private final SettingsPathProvider settingsPathProvider; // source → path
 
     public DebugSkillRegistrar(BooleanSupplier isAnt,
-                                Supplier<String> debugLogPathSupplier,
+                                Function<String, String> debugLogPathSupplier,
                                 BooleanSupplier debugLoggingEnabler,
                                 FileTailReader tailReader,
                                 FileStatReader statReader,
@@ -93,10 +94,15 @@ public final class DebugSkillRegistrar {
         String format(long bytes);
     }
 
-    /** 注入 — settings file path 解析. */
+    /**
+     * 注入 — settings file path 解析.
+     *
+     * <p>[批 3c] 第二参 = sessionId（project/local 路径基需会话 originalCwd；原无会话形参 +
+     * 内层裸 MDC 读点已废）。null = 无会话 → 回落 user.dir。
+     */
     @FunctionalInterface
     public interface SettingsPathProvider {
-        String pathFor(String source);  // 'userSettings' / 'projectSettings' / 'localSettings'
+        String pathFor(String source, String sessionId);  // 'userSettings' / 'projectSettings' / 'localSettings'
     }
 
     /** CC registerDebugSkill — 统一产出 BundledSkillDefinition（P1-4）. */
@@ -118,14 +124,23 @@ public final class DebugSkillRegistrar {
             null,   // context
             null,   // agent
             null,   // files
-            (args, cwd) -> getPromptForCommand(args)
+            // [批 3c] 消费点自己的显式会话来源 = PromptFnContext.sessionId()（原 args 单参版本
+            //   依赖 DebugLogging 内部裸 MDC 读点，已改为逐调用显式下传）。
+            (args, ctx) -> getPromptForCommand(args, ctx.sessionId())
         );
     }
 
-    /** CC getPromptForCommand — 主链. */
-    public java.util.List<PromptBlock> getPromptForCommand(String args) {
+    /**
+     * CC getPromptForCommand — 主链.
+     *
+     * @param args     用户参数（CC args）
+     * @param sessionId 会话 ID（[批 3c] 显式来源 = {@code PromptFnContext.sessionId()}）·
+     *                  用于 debug log 路径（{@code {configHome}/debug/{sessionId}.txt}）+
+     *                  project/local settings 路径基；null = 无会话 → 回落 user.dir
+     */
+    public java.util.List<PromptBlock> getPromptForCommand(String args, String sessionId) {
         boolean wasAlreadyLogging = debugLoggingEnabler.getAsBoolean();
-        String debugLogPath = debugLogPathSupplier.get();
+        String debugLogPath = debugLogPathSupplier.apply(sessionId);
 
         String logInfo = readLogTail(debugLogPath);
 
@@ -151,9 +166,9 @@ public final class DebugSkillRegistrar {
             + issueSection + "\n\n"
             + "## Settings\n\n"
             + "Remember that settings are in:\n"
-            + "* user - " + settingsPathProvider.pathFor("userSettings") + "\n"
-            + "* project - " + settingsPathProvider.pathFor("projectSettings") + "\n"
-            + "* local - " + settingsPathProvider.pathFor("localSettings") + "\n\n"
+            + "* user - " + settingsPathProvider.pathFor("userSettings", sessionId) + "\n"
+            + "* project - " + settingsPathProvider.pathFor("projectSettings", sessionId) + "\n"
+            + "* local - " + settingsPathProvider.pathFor("localSettings", sessionId) + "\n\n"
             + "## Instructions\n\n"
             + "1. Review the user's issue description\n"
             + "2. The last " + DEFAULT_DEBUG_LINES_READ + " lines show the debug file format. Look for [ERROR] and [WARN] entries, stack traces, and failure patterns across the file\n"
@@ -206,7 +221,7 @@ public final class DebugSkillRegistrar {
      * tail=空 / stat=抛 NoSuchFile / formatter=Long::toString / settingsPath=桩 —— NG-CDB-1）。本嵌套类提供
      * CC debug.ts 生产可观测行为所需的全部真实数据源：
      * <ul>
-     *   <li>{@link #getDebugLogPath()} — CC {@code getDebugLogPath}（utils/debug.ts:230-236）
+     *   <li>{@link #getDebugLogPath(String)} — CC {@code getDebugLogPath}（utils/debug.ts:230-236）
      *       {@code getDebugFilePath() ?? process.env.CLAUDE_CODE_DEBUG_LOGS_DIR ?? join(configHome,'debug',`${getSessionId()}.txt`)}
      *       （[决策 D1/D2] configHome 用 nexusai 自有根 {user.home}/.{appName}，不再写 ~/.claude）</li>
      *   <li>{@link #enableDebugLogging()} — CC {@code enableDebugLogging}（utils/debug.ts:64-69）
@@ -214,12 +229,14 @@ public final class DebugSkillRegistrar {
      *   <li>{@link #isDebugMode()} — CC {@code isDebugMode}（utils/debug.ts:44-57）</li>
      *   <li>{@link #stat(String)} / {@link #readTail(String,long,long)} — CC debug.ts:35/:38-48 真实文件读取</li>
      *   <li>{@link #formatFileSize(long)} — CC {@code formatFileSize}（utils/format.ts:9-24）</li>
-     *   <li>{@link #settingsPathFor(String)} — CC {@code getSettingsFilePathForSource}（settings.ts:274-296）</li>
+     *   <li>{@link #settingsPathFor(String, String)} — CC {@code getSettingsFilePathForSource}（settings.ts:274-296）</li>
      * </ul>
      *
      * <p>L3 (Java idiom)：CC {@code process.argv} → Java {@code System.getProperty("claude.debugFile")}
      * （--debug-file= 等价，Java 后端经 -D 注入）；CC {@code getSessionId()}（bootstrap/state.js 进程级）→
-     * Java {@link RequestContext#sessionId()}（请求级，web 后端每会话 MDC 携带）。真源读 CC 实际 TS 源码。
+     * Java 以 <b>显式 sessionId 形参</b>承载（[批 3c] 原裸 MDC 会话槽读点已废，
+     * web 后端多会话下会话标识必须逐调用穿透，见 {@link #getPromptForCommand(String, String)} 的
+     * {@code PromptFnContext.sessionId()} 来源）。真源读 CC 实际 TS 源码。
      */
     public static final class DebugLogging {
 
@@ -265,8 +282,13 @@ public final class DebugSkillRegistrar {
          * 三优先级：claude.debugFile 属性 → CLAUDE_CODE_DEBUG_LOGS_DIR env → {configHome}/debug/{sessionId}.txt。
          * <b>[T · 决策 D1/D2]</b> 默认写盘根改 nexusai 自有根（{@link NexusaiPaths#getAppConfigHomeDir()}
          * ={user.home}/.{appName}）→ {nexusaiHome}/debug/{sessionId}.txt，不再写 ~/.claude/debug。
+         *
+         * <p>[批 3c] CC {@code getSessionId()} 是进程级；Java web 多会话下会话标识必为形参
+         * （原裸 MDC 读点已废）—— 调用方显式传入（生产 = {@code PromptFnContext.sessionId()}）。
+         *
+         * @param sessionId 会话 ID（null/空白 → 文件名回落 {@code "unknown"}，与旧 MDC 空值同文案）
          */
-        public static String getDebugLogPath() {
+        public static String getDebugLogPath(String sessionId) {
             String debugFile = getDebugFilePath();
             if (debugFile != null) {
                 return debugFile;
@@ -275,7 +297,6 @@ public final class DebugSkillRegistrar {
             if (logsDir != null && !logsDir.isBlank()) {
                 return logsDir;
             }
-            String sessionId = RequestContext.sessionId();
             String file = (sessionId == null || sessionId.isBlank()) ? "unknown" : sessionId;
             return Paths.get(NexusaiPaths.getAppConfigHomeDir(), "debug", file + ".txt").toString();
         }
@@ -334,15 +355,19 @@ public final class DebugSkillRegistrar {
          *   <li>localSettings → {cwd}/.nexusai/settings.local.json（settings.ts:284-287 + :305-306 ·
          *       <b>[T2 · 决策 D2/D6]</b> 项目级改读 nexusai 目录 .nexusai，.claude settings.local.json 一律不读）</li>
          * </ul>
+         *
+         * @param source    settings 来源（'userSettings' / 'projectSettings' / 'localSettings'）
+         * @param sessionId 会话 ID（[批 3c] 显式来源；project/local 路径基 = 会话 originalCwd，
+         *                  null = 无会话 → 回落 user.dir）
          */
-        public static String settingsPathFor(String source) {
+        public static String settingsPathFor(String source, String sessionId) {
             return switch (source) {
                 case "userSettings" -> Paths.get(NexusaiPaths.getAppConfigHomeDir(), "settings.json").toString();
                 // cwd-align-ext：project/local settings 基 = 会话 originalCwd（CC settings.ts:246
                 //   case projectSettings/localSettings → resolve(getOriginalCwd())）；无 sessionId 回落
                 //   user.dir（方案 1，零行为变化）。R3-5（决策 D2/D6）目录 .claude → .nexusai。
-                case "projectSettings" -> Paths.get(settingsBaseCwd(), NexusaiPaths.getProjectDirName(), "settings.json").toString();
-                case "localSettings" -> Paths.get(settingsBaseCwd(), NexusaiPaths.getProjectDirName(), "settings.local.json").toString();
+                case "projectSettings" -> Paths.get(settingsBaseCwd(sessionId), NexusaiPaths.getProjectDirName(), "settings.json").toString();
+                case "localSettings" -> Paths.get(settingsBaseCwd(sessionId), NexusaiPaths.getProjectDirName(), "settings.local.json").toString();
                 default -> null;
             };
         }
@@ -350,10 +375,13 @@ public final class DebugSkillRegistrar {
         /**
          * project/local settings 文件路径基 · 对齐 CC getOriginalCwd()（settings.ts:246）。
          *
-         * <p>静态方法经 RequestContext 取会话 originalCwd；无 sessionId 回落 user.dir（零行为变化）。
+         * <p>[批 3c] sessionId 由调用点显式传入（原裸 MDC 读点已废，静态方法不持有会话态）；
+         * null（无会话）回落 user.dir（零行为变化）。
+         *
+         * @param sessionId 会话 ID（null = 无会话 → 回落 user.dir）
          */
-        private static String settingsBaseCwd() {
-            String cwd = CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+        private static String settingsBaseCwd(String sessionId) {
+            String cwd = CwdResolution.getOriginalCwdLayer(sessionId);
             return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
         }
 

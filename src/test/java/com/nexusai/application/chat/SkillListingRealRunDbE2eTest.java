@@ -379,8 +379,10 @@ class SkillListingRealRunDbE2eTest {
     /** SkillCatalog stub：全量由 {@link #catalogCommands} 受控；formatListing 文本由入参子集派生（区分整份 vs 增量）。 */
     private SkillCatalog mockCatalog() {
         SkillCatalog catalog = mock(SkillCatalog.class);
-        when(catalog.getModelInvocableCommandsForListing()).thenAnswer(inv -> catalogCommands.get());
-        when(catalog.getModelInvocableCommands()).thenAnswer(inv -> catalogCommands.get());
+        // [批 3c] SkillCatalog 取数方法新增显式 sessionId 形参 → stub 用 anyString() 匹配
+        //   （本类每用例用唯一真实 sessionId，非 null）
+        when(catalog.getModelInvocableCommandsForListing(anyString())).thenAnswer(inv -> catalogCommands.get());
+        when(catalog.getModelInvocableCommands(anyString())).thenAnswer(inv -> catalogCommands.get());
         when(catalog.getCharBudget(any())).thenReturn(1000);
         when(catalog.formatListing(anyList(), any())).thenAnswer(inv -> {
             // 文本由「传入的 Command 子集」派生 → 整份 vs 增量在注入消息内容上可区分

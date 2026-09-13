@@ -2283,9 +2283,9 @@ public class LlmAgentLoop implements AgentLoop {
     @Override
     public AgentState run(RunRequest params) {
         // ODF-A1-R2: 会话 projectRoot ThreadLocal push/pop —— run() 是会话线程执行边界。
-        // 入口捕获外层原值（嵌套 run/subagent 场景），出口 finally 恢复（对齐
-        // RequestContext MDC 模式 + EVENT_BUFFER 先例：ThreadLocal 线程隔离 + 会话结束复位，
-        // 消除会话结束残留继承，使无项目绑定会话回落 config-home 真正生效）。
+        // 入口捕获外层原值（嵌套 run/subagent 场景），出口 finally 恢复（对齐 EVENT_BUFFER 先例：
+        // ThreadLocal 线程隔离 + 会话结束复位，消除会话结束残留继承，使无项目绑定会话回落 config-home
+        // 真正生效）。[批 3c] 原此处引用的「裸 MDC 会话槽模式」已随该槽一并删除（会话一律显式传参）。
         String prevProjectRoot = com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
         // CRON-D2: 会话运行态登记（对齐 CC isQueryActive）—— 入口计数 +1，finally 计数 -1。
         // CronIdleExecutor 据此判空闲才轮询启动 cron 队列，活动 turn 不打断。
@@ -4386,7 +4386,11 @@ public class LlmAgentLoop implements AgentLoop {
         com.nexusai.application.agent.prompt.GitStatusProvider gp =
             (ctx.sessionState() != null && ctx.sessionState().gitStatusProvider() != null)
                 ? ctx.sessionState().gitStatusProvider()
-                : new com.nexusai.application.agent.prompt.GitStatusProvider();
+                // [批 3c] 无会话级 provider 时显式按本会话 id 解析 cwd（原无参构造经裸 MDC 会话槽取，
+                //   该槽已删 ⇒ 只能回落进程 user.dir，会让 git 段锚错仓库）。
+                : new com.nexusai.application.agent.prompt.GitStatusProvider(java.nio.file.Path.of(
+                    com.nexusai.application.agent.agent.CwdResolution.getCwd(
+                        state != null ? state.sessionId() : null)));
         // [RES-C2] R5-4 注销通道（Java 内部卫生，非 CC 对齐项）：本方法创建的 provider 在 finally
         //   close() 注销（register/unregister 成对，CACHE_CLEAR_HOOKS 不随会话有界累积）。CC 参考：
         //   getSystemContext 进程级 memoize（context.ts:116）不销毁 —— close 不改变任何缓存清理语义。
@@ -4394,7 +4398,7 @@ public class LlmAgentLoop implements AgentLoop {
             new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
                 state.sessionStartDate(),
                 // [cwd-fix 2026-08-25] 显式传会话绑定 projectRoot（sessionState.workspaceDir，CC 启动冻结）——
-                //   旧构造 new UserContextProvider(claudemdEngine) 依赖 RequestContext.sessionId() 内部查，
+                //   旧构造 new UserContextProvider(claudemdEngine) 依赖隐式会话解析（裸 MDC 槽，批 3c 已删），
                 //   system prompt 构建线程可能无会话 → getOriginalCwdLayer 落 user.dir（nexusai-backend），
                 //   LLM 误报工作目录（会话绑定 DingDing 实测）。workspaceDir 缺失 → 回退 getOriginalCwdLayer。
                 new com.nexusai.application.agent.prompt.UserContextProvider(
@@ -4403,7 +4407,10 @@ public class LlmAgentLoop implements AgentLoop {
                         : java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
                             .getOriginalCwdLayer(state != null ? state.sessionId() : null)),
                     System::getenv,
-                    ctx.claudemdEngine()),
+                    ctx.claudemdEngine(),
+                    // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析（否则回落 user.dir，
+                    //   会话绑定项目的 CLAUDE.md 进不了 system prompt）
+                    state != null ? state.sessionId() : null),
                 gp);
         try {
             // 0. memoryMechanicsPrompt（G-11 插入位）：custom 非空 && hasAutoMemPathOverride() →
@@ -4567,7 +4574,9 @@ public class LlmAgentLoop implements AgentLoop {
                 com.nexusai.application.agent.tool.impl.SubagentTool subagentTool = findSubagentTool();
                 com.nexusai.application.agent.subagent.AgentDefinition foundDef = null;
                 if (subagentTool != null) {
-                    foundDef = subagentTool.agentRegistry().findAgent(sessionAgentType);
+                    // [批 3c] 会话显式传参：本处 sessionId 即上面解析出的会话（turnSessionId 直源）
+                    //   → per-session agent-defs 视图；⛔ 不再经裸 MDC（原 agentRegistry() 无参会退化）
+                    foundDef = subagentTool.agentRegistry(sessionId).findAgent(sessionAgentType);
                 }
                 if (foundDef != null) {
                     final com.nexusai.application.agent.subagent.AgentDefinition sessionAgentDef = foundDef;
@@ -4596,7 +4605,8 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * 静态桥 SubagentTool · [SP-03] static loop 上下文经 SubagentTool.agentRegistry() 做会话主线程
+     * 静态桥 SubagentTool · [SP-03] static loop 上下文经
+     * {@code SubagentTool.agentRegistry(sessionId)}（批 3c 会话显式传参）做会话主线程
      * agent lookup（CC appState.agent → activeAgents.find）。run() 启动时从 toolRegistry 定位注入
      * （见 :2340 块）；null → registry 不可达（agent 分支休眠，回落 resolver 门控）。
      */
@@ -4726,7 +4736,11 @@ public class LlmAgentLoop implements AgentLoop {
             : java.util.Set.of();
         java.util.List<String> skillCommands = java.util.List.of();
         if (ctx.skillCatalog() != null) {
-            java.util.List<com.nexusai.model.command.Command> commands = ctx.skillCatalog().getModelInvocableCommands();
+            // [批 3c] 会话标识复用本类静态单点 turnSessionId(ctx, perTurnTuc)（perTurnTuc.sessionId()
+            //   优先，perTurnTuc null → ctx.streamSessionId() 兜底）——技能清单随会话绑定项目变化。
+            //   原经裸 MDC 会话槽读取（流/ForkJoinPool 线程上恒 null 或残留别会话 id），已删。
+            java.util.List<com.nexusai.model.command.Command> commands =
+                ctx.skillCatalog().getModelInvocableCommands(turnSessionId(ctx, perTurnTuc));
             if (commands != null) {
                 skillCommands = commands.stream()
                     .map(com.nexusai.model.command.Command::getName)
@@ -4816,9 +4830,9 @@ public class LlmAgentLoop implements AgentLoop {
         com.nexusai.application.agent.prompt.OutputStyleConfig outputStyleConfig = null;
         if (resolver != null) {
             String styleName = resolver.outputStyle();
-            String cwd = sessionId != null
-                ? com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId)
-                : com.nexusai.application.agent.agent.CwdResolution.getCwd();
+            // [批 3c] cwd 一律显式走会话来源（sessionId 为空 → getCwd(null) 按「无会话」解析
+            //   → 进程 user.dir，= 旧无参重载「MDC 为空」分支等价语义），不再经任何隐式会话槽。
+            String cwd = com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId);
             outputStyleConfig = com.nexusai.application.agent.prompt.PromptOutputStyleResolver.resolve(styleName, cwd);
         }
         com.nexusai.repository.session.entity.SessionRecord sessionRow = sessionRowOrNull(sessionId);
@@ -5239,7 +5253,10 @@ public class LlmAgentLoop implements AgentLoop {
             //   microcompactMessages（:3506）之前设置，否则首轮 cached 门控的 model 谓词不进入；
             //   autocompact 阈值（:3556）与 provider 调用（:3931）同源（resolveTurnEffectiveModel，
             //   对齐 CC mainLoopModel 语义）。
-            MicroCompactor.setMainLoopModel(resolveTurnEffectiveModel(params, recoveryState));
+            //   [批 3c] 会话键显式传入（本 loop 会话 = state.sessionId()；构造期即 = params.sessionId()）——
+            //   不读任何环境态会话槽（裸 MDC 会话槽已删）。
+            MicroCompactor.setMainLoopModel(resolveTurnEffectiveModel(params, recoveryState),
+                state.sessionId());
 
             // ── [IMP-HR-08 R2] MAX_STRUCTURED_OUTPUT_RETRIES 安全阀 · 对齐 CC QueryEngine.ts:1005-1035 ──
             // 结构化输出（jsonSchema）模式下，本 query 内 StructuredOutput 调用数 >= 上限 → 终止
@@ -5530,7 +5547,8 @@ public class LlmAgentLoop implements AgentLoop {
             if (microCompactor != null) {
                 List<ChatMessageDto> beforeMicro = messagesForQuery;
                 MicroCompactResult mc =
-                    microCompactor.microcompactMessages(beforeMicro, params.querySource().canonical());
+                    microCompactor.microcompactMessages(beforeMicro, params.querySource().canonical(),
+                        state.sessionId());
                 if (mc.messages() != null && mc.messages() != beforeMicro) {
                     messagesForQuery = mc.messages();
                     log.info("[LlmAgentLoop] turn={} microcompact 完成: {} → {} messages（请求级投影）· CC query.ts:414-426",
@@ -5946,7 +5964,9 @@ public class LlmAgentLoop implements AgentLoop {
                 java.util.List<com.nexusai.application.agent.context.MemoryFileInfo> nestedMemory =
                     lazyEngine.getNestedMemoryAttachments(
                         baseTuc.nestedMemoryAttachmentTriggers(), baseTuc.loadedNestedMemoryPaths(),
-                        baseTuc.readFileState());
+                        baseTuc.readFileState(),
+                        // [批 3c] 会话标识显式取自本轮 ToolUseContext（原由引擎内经裸 MDC 会话槽取，该槽已删）
+                        baseTuc.sessionId());
                 if (!nestedMemory.isEmpty()) {
                     java.util.List<ChatMessageDto> nestedMessages = new java.util.ArrayList<>();
                     for (com.nexusai.application.agent.context.MemoryFileInfo f : nestedMemory) {
@@ -6007,22 +6027,25 @@ public class LlmAgentLoop implements AgentLoop {
             // ── [snip nudge] context_efficiency nudge 注入（对齐 CC attachments.ts:929-937
             //    getAttachments maybe('context_efficiency', ...) + attachments.ts:3963-3983
             //    getContextEfficiencyAttachment + messages.ts:4148-4161 渲染）──
-            // WHY: Java 端 SnipCompactor.shouldNudgeForSnips/isSnipRuntimeEnabled/SNIP_NUDGE_TEXT 已实现
-            //    （CC 真源语义）但无消费方 —— CC 在会话足够长（≥30 条）时经 context_efficiency attachment
-            //    注入「提示模型考虑 /force-snip」的 isMeta user 消息（nudge 给模型看，isMeta=true 不污染
-            //    用户转录）。四门 AND：historySnip() → isSnipRuntimeEnabled() → shouldNudgeForSnips(≥30)
+            // WHY: Java 端 SnipCompactor.isSnipRuntimeEnabled/SNIP_NUDGE_TEXT 已实现（CC 真源语义）——
+            //    CC 在会话足够长（≥30 条）时经 context_efficiency attachment 注入「提示模型考虑
+            //    /force-snip」的 isMeta user 消息（nudge 给模型看，isMeta=true 不污染
+            //    用户转录）。四门 AND：historySnip() → isSnipRuntimeEnabled() → 第 4 门判据
+            //    （[snip-nudge-percent] 已改为「上下文剩余百分比 ≤ 阈值」，原为 shouldNudgeForSnips(≥30)）
             //    → 构造 <system-reminder> 包裹的 SNIP_NUDGE_TEXT isMeta 消息注入队尾。非 mainThread 也评估
             //    （CC allThreadAttachments 共享数组，非 mainThreadAttachments），不加 agentId 守卫。
             //    动态生成不持久化（CC 纯函数每迭代重算，同 output_token_usage）。
             // [V52 X1-3] 传 settingsResolver → nudge 门 DB-aware（DB settings.history_snip_enabled 覆盖）
-            // [V55 fix-transcript-nudge] 门 4 阈值入 DB + 上下文窗口自适应：传 thresholdSystem（经
-            //   autoCompactor 承载）+ 有效模型（resolveTurnEffectiveModel 纯解析，与 s11.x :4638 同源，
-            //   仅本行先行取用；无自动压缩器/单测 → null → 回落 CC 默认 30）。DB
-            //   settings.snip_nudge_threshold > 0 直接覆盖，否则按 effectiveWindow 档位（详见
-            //   SnipCompactor.resolveSnipNudgeThreshold）。
+            // [snip-nudge-percent 2026-09-13] 门 4 判据换为「上下文剩余百分比 ≤ 阈值」：
+            //   阈值 = DB settings.snip_nudge_threshold（值域 1..100，null/0/越界 → 回落默认 30，
+            //   见 SnipCompactor.resolveSnipNudgeRemainingPercent）；剩余百分比口径 =
+            //   ContextUsageCalculator.snapshot（窗口 = DB models.max_context_tokens，已用 = 真实 API
+            //   usage），由方法内 contextRemainingPercent 经 ctx.tokenBudgetBeans 自算 ——
+            //   **不再经 thresholdSystem**，故子代理 effectiveWindow=0 对 nudge 无影响（旧机制下
+            //   子代理路径 264/414 次落「窗口未知」分支）。缺值（无 usage / beans 缺失 / 模型名为空）
+            //   → 不注入（宁可不提示，也不臆测）。
             messagesForLlm = AgentLoopContext.maybeInjectContextEfficiencyNudge(
                 ctx, settingsResolver,
-                (autoCompactor != null) ? autoCompactor.getThresholdSystem() : null,
                 resolveTurnEffectiveModel(params, recoveryState),
                 state, messagesForLlm);
 
@@ -6581,16 +6604,8 @@ public class LlmAgentLoop implements AgentLoop {
             // [H7-arch Phase 5-2 P3-④] 提交 LLM call（loop 不再直接 provider.stream）。
             // [对抗核验 H13-GAP-4 v3] 后台线程执行 callModel → loop 线程空闲执行 abort 感知轮询
             //（同步 provider 不阻塞 loop 线程; abort 后 ≤500ms 退出等待, 对齐 CC 硬中断）。
-            // [OD-17 再思考·线程断点修复] STREAM_EXECUTOR 是虚拟线程池（LlmAgentLoop:177-178），
-            //   虚拟线程不继承创建线程的 ThreadLocal → 流线程 RequestContext.sessionId()=null
-            //   （consumePostCompaction 所在 AnthropicSdkProvider 在 doStream SSE 解析完成后取值）。
-            //   在 loop 线程（ChatService:120 已设 MDC，raw "sess-xxx" 可用）捕获 MDC context map，
-            //   回放到虚拟线程 → consume 归一化后能命中会话级 AgentState；顺带修复流线程
-            //   logback [s=sessionId] 前缀丢失。impact 确认 STREAM_EXECUTOR 仅此一处 execute
-            //   （blast radius 可控）。finally MDC.clear() 防止虚拟线程回放污染下个任务。
-            final java.util.Map<String, String> mdcCtx = org.slf4j.MDC.getCopyOfContextMap();
             // [IMP-A · F3 · OPD-SPR-11] 同帧捕获会话 projectRoot → 回放到 STREAM_EXECUTOR 虚拟
-            //   线程（与 MDC 同模式：虚拟线程不继承创建线程的 ThreadLocal）。WHY: 流式路径在
+            //   线程（虚拟线程不继承创建线程的 ThreadLocal）。WHY: 流式路径在
             //   虚拟线程执行的消费链（post-compaction consume / StreamingToolExecutor.add 捕获
             //   等）读 AutoMemPaths.currentSessionProjectRoot()，不回放则读到回落值
             //   （CLAUDE_PROJECT_DIR env ?? config-home）而非会话绑定 P。null 捕获值不注入
@@ -6604,7 +6619,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   WHY: 流式 toolCall 回调（:3306 → StreamingToolExecutor.add:563 捕获）在虚拟线程执行，
             //   虚拟线程不继承创建线程的 plain ThreadLocal → add() 捕获 null → t.capturedTeammateContext
             //   =null → 工具 execute 跳过 runWithTeammateContext → SubagentTool.isTeammate() 恒 false →
-            //   CC AgentTool.tsx:272/278 守卫生产不触发。与上方 MDC 回放同模式（loop 线程捕获、虚拟线程内恢复）。
+            //   CC AgentTool.tsx:272/278 守卫生产不触发。与上方 projectRoot 回放同模式（loop 线程捕获、虚拟线程内恢复）。
             //   null = 主会话/普通 subagent → 不包装，行为零变化（impact 确认仅 teammate 场景生效）。
             final com.nexusai.application.agent.team.TeammateContext teammateStreamCtx =
                 com.nexusai.application.agent.team.TeammateContext.getTeammateContext();
@@ -6614,9 +6629,6 @@ public class LlmAgentLoop implements AgentLoop {
                     teammateStreamCtx.getData().agentId());
             }
             STREAM_EXECUTOR.execute(() -> {
-                if (mdcCtx != null) {
-                    org.slf4j.MDC.setContextMap(mdcCtx);
-                }
                 // [IMP-A · F3] 任务体先捕获虚拟线程原值（池复用可能残留）→ set 回放值 → finally restore
                 String prevStreamProjectRoot =
                     com.nexusai.application.agent.memory.AutoMemPaths.captureCurrentProjectRoot();
@@ -6634,7 +6646,6 @@ public class LlmAgentLoop implements AgentLoop {
                         params.deps().callModel(request);
                     }
                 } finally {
-                    org.slf4j.MDC.clear();
                     com.nexusai.application.agent.memory.AutoMemPaths.restoreCurrentProjectRoot(prevStreamProjectRoot);
                 }
             });
@@ -7523,12 +7534,13 @@ public class LlmAgentLoop implements AgentLoop {
             // 位置在 boundary yield 前：CC 的 markToolsSentToAPIState 在 API 响应成功返回时调用
             // （claude.ts:2833），query loop 随后才做延迟 boundary（query.ts:866）——顺序一致。
             if (MicroCompactor.cachedMicrocompactEnabledForModel(effectiveModel)) {
-                MicroCompactor.markToolsSentToAPIState();
+                MicroCompactor.markToolsSentToAPIState(state.sessionId());
             }
 
             com.nexusai.application.agent.compact.CompactBoundaryMessage microBoundary =
                 com.nexusai.application.agent.compact.MicroCompactor
-                    .maybeCreateMicrocompactBoundaryMessage(cumulativeCacheDeletedTokens(capturedMsg[0]));
+                    .maybeCreateMicrocompactBoundaryMessage(
+                        cumulativeCacheDeletedTokens(capturedMsg[0]), state.sessionId());
             if (microBoundary != null) {
                 AgentLoopContext.publishEvent(ctx,
                     new com.nexusai.application.agent.event.AgentBoundaryMessageEvent(
@@ -9577,7 +9589,9 @@ public class LlmAgentLoop implements AgentLoop {
         }
         // [P2-9] listing 合并视图（本地 + MCP thread-in）· 对齐 CC attachments.ts:2677-2682
         //   getMcpSkillCommands(commands) + uniqBy([...local, ...mcp], 'name')。
-        java.util.List<Command> commands = ctx.skillCatalog().getModelInvocableCommandsForListing();
+        // [批 3c] 会话标识显式取本方法形参 state.sessionId()（本方法入口已守卫 state 非 null，且下方
+        //   SkillListingSentRegistry.decide(state.sessionId(), ...) 同源）——原经裸 MDC 读取，已删。
+        java.util.List<Command> commands = ctx.skillCatalog().getModelInvocableCommandsForListing(state.sessionId());
         // [P3-5] EXPERIMENTAL_SKILL_SEARCH 门控过滤 · 对齐 CC attachments.ts:2692-2697（默认 flag 关 → 零变化）。
         if (ctx.featureFlags().skillPrefetch()
                 && ctx.skillDiscoveryPrefetch() != null
@@ -9622,7 +9636,8 @@ public class LlmAgentLoop implements AgentLoop {
         //   主会话（MainSessionBackgroundService）为同一会话续跑不重复发射（CC 同会话不重发）。
         if (decision.isInitial() && state.agentId() == null) {
             try {
-                java.util.List<Command> loadedSkills = ctx.skillCatalog().getModelInvocableCommands();
+                // [批 3c] 会话标识显式取本方法形参 state.sessionId()（同上方 listing 数据源，原经裸 MDC 读取）
+                java.util.List<Command> loadedSkills = ctx.skillCatalog().getModelInvocableCommands(state.sessionId());
                 int skillBudget = ctx.skillCatalog().getCharBudget(
                     resolveContextWindowTokens(modelName, autoCompactor));
                 com.nexusai.application.agent.telemetry.Telemetry tel =

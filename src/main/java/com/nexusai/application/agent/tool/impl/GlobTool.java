@@ -213,6 +213,15 @@ public class GlobTool implements Tool {
 
     @Override
     public ToolResult execute(ToolUseBlock call) {
+        // 无 ctx 调用（旧 API / 单测）→ 会话 cwd 不可得 ⇒ 回落无会话兜底（PathGuard WARN）
+        return execute(call, null);
+    }
+
+    @Override
+    public ToolResult execute(ToolUseBlock call, ToolUseContext ctx) {
+        // [会话 cwd] 会话感知：相对路径 / 无 path 时的基准 = ctx.sessionId() 的当前 cwd
+        //   （对齐 CC GlobTool.ts 相对路径基于 getCwd() 解析）；ctx == null 回落无会话兜底（PathGuard WARN）
+        String sessionId = ctx != null ? ctx.sessionId() : null;
         String pattern = call.input().path("pattern").asText("");
         String pathArg = call.input().path("path").asText("");
         if (pattern.isBlank()) return ToolResult.error(call.id(), "pattern is empty");
@@ -221,9 +230,9 @@ public class GlobTool implements Tool {
         // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），catch 逃逸拒绝删除；
         //   越界搜索（pathArg 在 workspace 外）由权限层 isInWorkingDir 兜底
         if (pathArg.isBlank()) {
-            root = guard.workdir();
+            root = guard.workdir(sessionId);
         } else {
-            root = guard.resolve(pathArg);
+            root = guard.resolve(sessionId, pathArg);
             if (!Files.isDirectory(root)) {
                 return ToolResult.error(call.id(),
                     "path is not a directory: " + pathArg);
@@ -244,7 +253,8 @@ public class GlobTool implements Tool {
             truncated = all.size() > DEFAULT_LIMIT;
             // CC glob.ts:126-127 truncated = len > offset+limit；files = slice(offset, offset+limit)
             List<Path> limited = all.size() > DEFAULT_LIMIT ? all.subList(0, DEFAULT_LIMIT) : all;
-            Path workdir = guard.workdir();
+            // [会话 cwd] 相对化基准 = 本会话当前 cwd（与 root 解析同一基准）
+            Path workdir = guard.workdir(sessionId);
             for (Path p : limited) {
                 matches.add(workdir.relativize(p).toString());
             }

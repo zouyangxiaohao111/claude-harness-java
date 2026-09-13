@@ -25,7 +25,6 @@ import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.skill.PromptBlock;
 import com.nexusai.application.agent.team.Teammate;
 import com.nexusai.application.agent.tool.SessionStorage;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.util.UndercoverCheck;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.PromptFnContext;
@@ -339,25 +338,27 @@ public class CommandRegistrationConfig {
      * 无持久化通道（AgentState 无 advisorModel 字段）→ log.warn 披露。
      */
     private void registerAdvisorHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry registry) {
-        AdvisorCommand advisor = new AdvisorCommand(
-            () -> true,       // canUserConfigureAdvisor（web 默认允许）
-            s -> s,           // normalizeModel（identity；无 API-string normalize 等价，登记差异）
-            s -> s,           // parseUserSpecifiedModel（identity）
-            s -> new AdvisorCommand.ModelValidation(true, null), // validateModel（恒通过；无真实模型库校验）
-            s -> true,        // isValidAdvisorModel
-            s -> true,        // modelSupportsAdvisor
-            () -> currentModel(registry),   // defaultMainLoopModel（CC getDefaultMainLoopModelSetting）
-            () -> advisorAppState(registry),// stateReader（CC context.getAppState()）
-            s -> {
-                // CC context.setAppState(...)：AgentState 无 advisorModel 字段 → 仅披露
-                log.warn("[CommandRegistrationConfig] /advisor 状态写入未持久化（AgentState 无 advisorModel 字段，受控差异）");
-            },
-            (source, key, value) -> {
-                // CC updateSettingsForSource('userSettings', ...)：Java 无 userSettings 写通道 → 仅披露
-                log.warn("[CommandRegistrationConfig] /advisor settings 更新未持久化（source={} key={}，受控差异）",
-                    source, key);
-            });
-        dispatcher.registerSlashCommandResult("advisor", args -> {
+        dispatcher.registerSlashCommandResult("advisor", (args, sessionId, inFlightUserMessageId) -> {
+            // 会话标识来自 handler 形参 sessionId（批 3c：不再读裸 MDC）→ AdvisorCommand 的两个
+            //   会话作用域闭包（defaultMainLoopModel / stateReader）同源解析，逐次调用现算。
+            AdvisorCommand advisor = new AdvisorCommand(
+                () -> true,       // canUserConfigureAdvisor（web 默认允许）
+                s -> s,           // normalizeModel（identity；无 API-string normalize 等价，登记差异）
+                s -> s,           // parseUserSpecifiedModel（identity）
+                s -> new AdvisorCommand.ModelValidation(true, null), // validateModel（恒通过；无真实模型库校验）
+                s -> true,        // isValidAdvisorModel
+                s -> true,        // modelSupportsAdvisor
+                () -> currentModel(registry, sessionId),   // defaultMainLoopModel（CC getDefaultMainLoopModelSetting）
+                () -> advisorAppState(registry, sessionId),// stateReader（CC context.getAppState()）
+                s -> {
+                    // CC context.setAppState(...)：AgentState 无 advisorModel 字段 → 仅披露
+                    log.warn("[CommandRegistrationConfig] /advisor 状态写入未持久化（AgentState 无 advisorModel 字段，受控差异）");
+                },
+                (source, key, value) -> {
+                    // CC updateSettingsForSource('userSettings', ...)：Java 无 userSettings 写通道 → 仅披露
+                    log.warn("[CommandRegistrationConfig] /advisor settings 更新未持久化（source={} key={}，受控差异）",
+                        source, key);
+                });
             if (!advisor.isEnabled()) {
                 log.warn("[CommandRegistrationConfig] /advisor 被 isEnabled 门控关闭，返回说明（fail loud）");
                 return UserInputDispatcher.LocalCommandResult.text(
@@ -378,7 +379,7 @@ public class CommandRegistrationConfig {
      * 故开启后也无法真实切换 brief 模式 —— 受控差异（fail loud）。
      */
     private void registerBriefHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand(BriefCommand.NAME, args -> {
+        dispatcher.registerSlashCommand(BriefCommand.NAME, (args, sessionId, inFlightUserMessageId) -> {
             log.warn("[CommandRegistrationConfig] /brief 被门控关闭（KAIROS feature + enable_slash_command 默认 false，"
                 + "对齐 CC brief.ts:51-56）；isBriefOnly/userMsgOptIn 会话状态未接线（受控差异）");
         });
@@ -394,7 +395,7 @@ public class CommandRegistrationConfig {
      */
     private void registerCostHandler(UserInputDispatcher dispatcher, CostTracker costTracker) {
         CostCommand costCommand = new CostCommand();
-        dispatcher.registerSlashCommandResult("cost", args -> {
+        dispatcher.registerSlashCommandResult("cost", (args, sessionId, inFlightUserMessageId) -> {
             boolean isAnt = isAnt();
             CostCommand.SubscriptionEnv env = new CostCommand.SubscriptionEnv(
                 false,                       // isClaudeAISubscriber（web 无 claude.ai 订阅）
@@ -417,8 +418,8 @@ public class CommandRegistrationConfig {
      * （CC getCwd()）；readFileState cache 无 Java 等价 → 恒空列表（输出 "No files in context"，受控差异）。
      */
     private void registerFilesHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommandResult("files", args -> {
-            String cwd = CwdResolution.getCwd(RequestContext.sessionId());
+        dispatcher.registerSlashCommandResult("files", (args, sessionId, inFlightUserMessageId) -> {
+            String cwd = CwdResolution.getCwd(sessionId);   // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             if (cwd == null || cwd.isBlank()) {
                 cwd = System.getProperty("user.dir", ".");
             }
@@ -437,7 +438,7 @@ public class CommandRegistrationConfig {
      * 缺失）→ 返回失败文案（受控差异，fail loud 不伪造）。
      */
     private void registerHeapDumpHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommandResult("heapdump", args -> {
+        dispatcher.registerSlashCommandResult("heapdump", (args, sessionId, inFlightUserMessageId) -> {
             HeapDumpCommand.CommandResult result = HeapDumpCommand.execute(() ->
                 HeapDumpCommand.HeapDumpResult.fail("Java web 后端无 JS 堆转储服务（对齐 CC performHeapDump 不可用路径，受控差异）"));
             log.info("[CommandRegistrationConfig] /heapdump 执行完成: {}", result.value());
@@ -456,7 +457,7 @@ public class CommandRegistrationConfig {
      */
     private void registerKeybindingsHandler(UserInputDispatcher dispatcher) {
         KeybindingsCommand keybindingsCommand = new KeybindingsCommand();
-        dispatcher.registerSlashCommandResult("keybindings", args -> {
+        dispatcher.registerSlashCommandResult("keybindings", (args, sessionId, inFlightUserMessageId) -> {
             KeybindingsCommand.Environment env = new KeybindingsCommand.Environment(
                 KeybindingsSkill.isKeybindingCustomizationEnabled(),
                 keybindingsPath().toString(),
@@ -478,11 +479,12 @@ public class CommandRegistrationConfig {
      */
     private void registerRenameHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry registry) {
         RenameCommand renameCommand = new RenameCommand();
-        dispatcher.registerSlashCommand("rename", args -> {
+        dispatcher.registerSlashCommand("rename", (args, sessionId, inFlightUserMessageId) -> {
             RenameCommand.Env env = new RenameCommand.Env(
                 Teammate::isTeammate,                       // CC isTeammate()
-                CommandRegistrationConfig::resolveSessionUuid,
-                CommandRegistrationConfig::resolveTranscriptPath,
+                // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
+                () -> resolveSessionUuid(sessionId),
+                () -> resolveTranscriptPath(sessionId),
                 (messages, signal) -> CompletableFuture.completedFuture(null), // CC generateSessionName 未接线
                 (sid, name) -> { persistSessionMetadata(sid, name, true); return CompletableFuture.completedFuture(null); },
                 (sid, name) -> { persistSessionMetadata(sid, name, false); return CompletableFuture.completedFuture(null); },
@@ -512,7 +514,7 @@ public class CommandRegistrationConfig {
         UltrareviewVisibilityChecker checker = new UltrareviewVisibilityChecker(
             CommandRegistrationConfig::ultrareviewFeature);
         ReviewRemoteService reviewRemoteService = new ReviewRemoteService();
-        dispatcher.registerSlashCommand("ultrareview", args -> {
+        dispatcher.registerSlashCommand("ultrareview", (args, sessionId, inFlightUserMessageId) -> {
             if (!checker.isUltrareviewEnabled()) {
                 log.warn("[CommandRegistrationConfig] /ultrareview 被 isUltrareviewEnabled 门控关闭（无 GrowthBook，默认 false）");
                 return;
@@ -546,12 +548,15 @@ public class CommandRegistrationConfig {
         return "ant".equalsIgnoreCase(System.getenv("USER_TYPE"));
     }
 
-    /** 当前会话 AgentState.currentModel()（CC getMainLoopModelSetting）· 未注册/无模型 → "claude-sonnet-4-6" 兜底。 */
-    private static String currentModel(SessionAgentStateRegistry registry) {
+    /**
+     * 当前会话 AgentState.currentModel()（CC getMainLoopModelSetting）· 未注册/无模型 → "claude-sonnet-4-6" 兜底。
+     *
+     * @param sessionId 显式会话标识（批 3c：由调用点形参穿透，不再读裸 MDC）
+     */
+    private static String currentModel(SessionAgentStateRegistry registry, String sessionId) {
         if (registry == null) {
             return "claude-sonnet-4-6";
         }
-        String sessionId = RequestContext.sessionId();
         if (sessionId == null) {
             return "claude-sonnet-4-6";
         }
@@ -560,19 +565,18 @@ public class CommandRegistrationConfig {
         return model != null && !model.isBlank() ? model : "claude-sonnet-4-6";
     }
 
-    /** advisor stateReader · 读会话 AgentState.currentModel()；advisorModel 恒 null（AgentState 无该字段）。 */
-    private static AdvisorCommand.AppState advisorAppState(SessionAgentStateRegistry registry) {
-        return new AdvisorCommand.AppState(currentModel(registry), null);
+    /** advisor stateReader · 读会话 AgentState.currentModel()；advisorModel 恒 null（AgentState 无该字段）· 会话标识显式传入。 */
+    private static AdvisorCommand.AppState advisorAppState(SessionAgentStateRegistry registry, String sessionId) {
+        return new AdvisorCommand.AppState(currentModel(registry, sessionId), null);
     }
 
-    /** 从 RequestContext（MDC）解析当前会话 UUID · null = 无会话上下文（同 AgentColorCommand 模式）。 */
-    private static UUID resolveSessionUuid() {
-        String raw = RequestContext.sessionId();
-        if (raw == null || raw.isBlank()) {
+    /** 由显式形参 sessionId 解析当前会话 UUID · null = 无会话上下文（批 3c：不再读裸 MDC）。 */
+    private static UUID resolveSessionUuid(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
         try {
-            return UUID.fromString(raw);
+            return UUID.fromString(sessionId);
         } catch (IllegalArgumentException e) {
             return null;
         }
@@ -581,8 +585,8 @@ public class CommandRegistrationConfig {
     /** transcript 路径（CC getTranscriptPath · sessionStorage.ts）· 无会话 → null。
      *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
      *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。 */
-    private static String resolveTranscriptPath() {
-        UUID sid = resolveSessionUuid();
+    private static String resolveTranscriptPath(String sessionId) {
+        UUID sid = resolveSessionUuid(sessionId);
         if (sid == null) {
             return null;
         }

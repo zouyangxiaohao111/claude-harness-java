@@ -10,7 +10,6 @@ import com.nexusai.application.agent.plugin.PluginInstallationManager.ReconcileE
 import com.nexusai.application.agent.plugin.PluginInstallationManager.ReconcileResult;
 import com.nexusai.application.agent.plugin.PluginSchemas.KnownMarketplace;
 import com.nexusai.application.agent.plugin.PluginSchemas.MarketplaceSource;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,11 +74,14 @@ public class MarketplaceReconciler implements PluginInstallationManager.Marketpl
                                  Supplier<String> projectRoot, Predicate<ReconcileSkipKey> skipFilter) {
         this.store = Objects.requireNonNull(store);
         this.sync = sync != null ? sync : new MarketplaceSyncService();
-        // 方案1 接线：经 CwdResolution.getOriginalCwdLayer(RequestContext.sessionId()) 取会话 original cwd
-        //   （对齐 CC reconciler.ts:131 diffMarketplaces 传 projectRoot: getOriginalCwd() + :257
-        //    normalizeSource 的 base = projectRoot ?? getOriginalCwd()）。startup 无会话回落 user.dir 零变化。
+        // [批 3c] 默认 projectRoot 取进程级 original cwd（对齐 CC reconciler.ts:131 diffMarketplaces
+        //   传 projectRoot: getOriginalCwd() + :257 normalizeSource 的 base = projectRoot ?? getOriginalCwd()）。
+        //   **消费链无会话**：normalizeSource ← diff/reconcile ← diffMarketplaces/reconcileMarketplaces
+        //   （PluginInstallationManager 启动后台链）——无 sessionId 可穿透，显式传 null（无会话），
+        //   CwdResolution 回落 user.dir：与旧实现（启动线程 MDC 恒空）行为零变化。会话感知需
+        //   PluginStartupAssembler / PerformStartupChecks 穿透 sessionId（不在本批清单）。
         this.projectRoot = projectRoot != null ? projectRoot
-            : () -> CwdResolution.getOriginalCwdLayer(RequestContext.sessionId());
+            : () -> CwdResolution.getOriginalCwdLayer(null);
         this.skipFilter = skipFilter;
     }
 

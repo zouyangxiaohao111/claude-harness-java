@@ -2,7 +2,7 @@ package com.nexusai.application.agent.permission.hook;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.tool.ToolNameConstants;
-import com.nexusai.common.RequestContext;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -12,7 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.function.BooleanSupplier;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * Commit attribution tracking hooks · 对齐 CC {@code registerAttributionHooks}
@@ -83,7 +83,8 @@ public final class RegisterAttributionHooks {
 
     private final CommitAttributionTracker tracker;
     private final BooleanSupplier commitAttributionEnabled;  // feature('COMMIT_ATTRIBUTION')（可注入）
-    private final Supplier<Path> repoRootSupplier;           // 读文件 repoRoot（可注入 @TempDir）
+    /** 读文件 repoRoot · [批 3c] 形参 = sessionId（{@code sessionId -> repoRoot}，可注入 @TempDir）。 */
+    private final Function<String, Path> repoRootSupplier;
 
     /**
      * 默认构造：tracker 新实例 + COMMIT_ATTRIBUTION 恒关（编译期宏 false 等价）+
@@ -95,19 +96,25 @@ public final class RegisterAttributionHooks {
     public RegisterAttributionHooks() {
         this(new CommitAttributionTracker(),
             () -> COMMIT_ATTRIBUTION_ENABLED,
-            () -> Path.of(CommitAttributionTracker.getAttributionRepoRoot(RequestContext.sessionId())));
+            sessionId -> Path.of(CommitAttributionTracker.getAttributionRepoRoot(sessionId)));
     }
 
-    /** 完整构造器（测试注入门控 + tracker + repoRoot · 镜像 SessionFileAccessHooks 注入式构造器）. */
+    /**
+     * 完整构造器（测试注入门控 + tracker + repoRoot · 镜像 SessionFileAccessHooks 注入式构造器）.
+     *
+     * <p>[批 3c] repoRootSupplier 形参 = {@code Function<String,Path>}（sessionId → repoRoot）：
+     * 会话标识由 PostToolUse 回调的 {@code ToolUseContext.sessionId()} 显式传入（见
+     * {@link #registerAttributionHooks}），不再读任何 ambient 会话槽。
+     */
     public RegisterAttributionHooks(CommitAttributionTracker tracker,
                                     BooleanSupplier commitAttributionEnabled,
-                                    Supplier<Path> repoRootSupplier) {
+                                    Function<String, Path> repoRootSupplier) {
         this.tracker = tracker != null ? tracker : new CommitAttributionTracker();
         this.commitAttributionEnabled = commitAttributionEnabled != null
             ? commitAttributionEnabled : () -> COMMIT_ATTRIBUTION_ENABLED;
         this.repoRootSupplier = repoRootSupplier != null
             ? repoRootSupplier
-            : () -> Path.of(CommitAttributionTracker.getAttributionRepoRoot(RequestContext.sessionId()));
+            : sessionId -> Path.of(CommitAttributionTracker.getAttributionRepoRoot(sessionId));
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -151,7 +158,9 @@ public final class RegisterAttributionHooks {
         for (String tool : REGISTERED_TOOLS) {
             registrar.registerPostToolUseInternal("attribution:" + tool, (toolName, input, result, ctx, stopHookActive) -> {
                 if (toolName != null && toolName.equals(tool)) {
-                    handleFileTool(toolName, input);
+                    // [批 3c] 会话标识取本回调形参 ctx（ToolUseContext）——消费点自己已有的显式来源，
+                    //   逐级下传到 tracker/repoRoot（原为 DebugSkill/attribution 链内的裸 MDC 读点）。
+                    handleFileTool(toolName, input, sessionIdOf(ctx));
                 }
                 return GenericHook.HookResult.proceed();
             });
@@ -171,27 +180,41 @@ public final class RegisterAttributionHooks {
      * 接收 updateAttributionState 上下文更新 AppState.attribution —— Java 端等价为更新
      * {@link CommitAttributionTracker}（AppState.attribution.fileStates 的承载物）。
      * 文件读取失败 → 跳过本次追踪（不阻断工具链，CC 同 best-effort）。
+     *
+     * @param sessionId 会话 ID（[批 3c] 显式来源 = 回调形参 {@code ToolUseContext.sessionId()}，
+     *                  见 {@link #sessionIdOf}；逐级下传到 repoRoot / tracker 归一化键）
      */
-    private void handleFileTool(String toolName, JsonNode input) {
+    private void handleFileTool(String toolName, JsonNode input, String sessionId) {
         String filePath = extractFilePath(toolName, input);
         if (filePath == null || filePath.isBlank()) {
             return;
         }
-        String newContent = readContent(filePath);
+        String newContent = readContent(filePath, sessionId);
         if (newContent == null) {
             if (log.isDebugEnabled()) {
-                log.debug("[RegisterAttributionHooks] 读取文件失败跳过追踪: tool={} path={}", toolName, filePath);
+                log.debug("[RegisterAttributionHooks] 读取文件失败跳过追踪: tool={} path={} session={}",
+                    toolName, filePath, sessionId);
             }
             return;
         }
-        String oldContent = tracker.cachedContent(filePath);
-        tracker.updateCachedContent(filePath, newContent);
+        String oldContent = tracker.cachedContent(filePath, sessionId);
+        tracker.updateCachedContent(filePath, newContent, sessionId);
         tracker.trackFileModification(filePath,
-            oldContent != null ? oldContent : "", newContent, System.currentTimeMillis());
+            oldContent != null ? oldContent : "", newContent, System.currentTimeMillis(), sessionId);
         if (log.isDebugEnabled()) {
-            log.debug("[RegisterAttributionHooks] Edit/Write 追踪: tool={} path={}",
-                toolName, tracker.normalizeFilePath(filePath));
+            log.debug("[RegisterAttributionHooks] Edit/Write 追踪: tool={} path={} session={}",
+                toolName, tracker.normalizeFilePath(filePath, sessionId), sessionId);
         }
+    }
+
+    /**
+     * 回调上下文 → 会话 ID · [批 3c] 显式来源（{@code ToolUseContext.sessionId()}）。
+     *
+     * <p>ctx 缺席（非会话调用方 / 测试桩）→ 返回 {@code null} = 无会话，下游 CwdResolution
+     * 逐层回落 user.dir（与旧实现无 MDC 时同语义）。
+     */
+    private static String sessionIdOf(ToolUseContext ctx) {
+        return ctx != null ? ctx.sessionId() : null;
     }
 
     /** 从工具输入提取 file_path · 仅 Edit/Write（CC file_path 字段）· 其余工具 → null. */
@@ -209,11 +232,15 @@ public final class RegisterAttributionHooks {
         }
     }
 
-    /** 读文件内容（绝对路径原样，相对路径基于 repoRoot 解析）· 失败 → null. */
-    private String readContent(String filePath) {
+    /**
+     * 读文件内容（绝对路径原样，相对路径基于 repoRoot 解析）· 失败 → null.
+     *
+     * @param sessionId 会话 ID（[批 3c] 显式来源；null = 无会话 → repoRoot 回落 user.dir）
+     */
+    private String readContent(String filePath, String sessionId) {
         try {
             Path p = Path.of(filePath);
-            Path abs = p.isAbsolute() ? p : repoRootSupplier.get().resolve(p);
+            Path abs = p.isAbsolute() ? p : repoRootSupplier.apply(sessionId).resolve(p);
             return Files.readString(abs, StandardCharsets.UTF_8);
         } catch (IOException | RuntimeException e) {
             if (log.isDebugEnabled()) {

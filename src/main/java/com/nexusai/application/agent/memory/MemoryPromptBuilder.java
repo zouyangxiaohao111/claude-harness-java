@@ -2,7 +2,6 @@ package com.nexusai.application.agent.memory;
 
 import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
 import com.nexusai.application.agent.telemetry.Telemetry;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -1115,10 +1114,17 @@ public final class MemoryPromptBuilder {
                 //   查不到绑定 / override/settings 显式路径均缺席）→ log.error，仍返回 null 不注入
                 //   任何假目录（保留 override/settings 显式路径可用：它们存在时 getAutoMemPath 直接
                 //   返回该路径，不会走进本分支）。
+                // [批 3c] 本日志原含 sessionId={}（取自裸 MDC 会话槽）。本方法 loadMemoryPrompt()
+                //   **无显式会话来源**：无 sessionId 形参、类内无会话字段、消费链未穿透会话标识
+                //   （LoadMemoryPrompt.loadMemoryPrompt() ← LlmAgentLoop:4439，均不在本批清单）→
+                //   按「无显式来源不发明」规则移除该字段（不填 null/常量冒充），保留 rawRoot+thread 定位。
+                //   需同步改的消费点：memory/LoadMemoryPrompt.java:49 与其调用方
+                //   LlmAgentLoop.java:4439 需增 sessionId 形参并逐级下传，届时本行以
+                //   log.error("... session={} rawRoot={} thread={}", sessionId, ...) 恢复会话字段。
                 log.error("[MemoryPromptBuilder] loadMemoryPrompt KAIROS 分支无有效项目（auto-memory per-project "
                     + "目录不存在 = 会话未绑定项目，DB 主路径解析为空），跳过 daily-log 注入，拒绝以 config-home "
-                    + "假目录充当项目; sessionId={} rawRoot={} thread={}",
-                    RequestContext.sessionId(), autoMemPaths.projectRoot(), Thread.currentThread().getName());
+                    + "假目录充当项目; rawRoot={} thread={}",
+                    autoMemPaths.projectRoot(), Thread.currentThread().getName());
                 return null;
             }
             // CC memdir.ts:433-436 logMemoryDirCounts(getAutoMemPath(), {memory_type: 'auto'})
@@ -1143,10 +1149,11 @@ public final class MemoryPromptBuilder {
             if (autoDir == null) {
                 // [决策 2026-09-08] 出现即错误（fail loud）——见 KAIROS 分支注释：autoDir==null = DB 主路径
                 //   无绑定项目且无 override/settings 显式路径。log.error + 仍返回 null 不注入假目录。
+                // [批 3c] sessionId={} 字段移除原因同 KAIROS 分支（无显式会话来源 · 不发明）。
                 log.error("[MemoryPromptBuilder] loadMemoryPrompt TEAMMEM 分支无有效项目（auto-memory per-project "
                     + "目录不存在 = 会话未绑定项目，DB 主路径解析为空），跳过 team 记忆注入，拒绝以 config-home "
-                    + "假目录充当项目; sessionId={} rawRoot={} thread={}",
-                    RequestContext.sessionId(), autoMemPaths.projectRoot(), Thread.currentThread().getName());
+                    + "假目录充当项目; rawRoot={} thread={}",
+                    autoMemPaths.projectRoot(), Thread.currentThread().getName());
                 return null;
             }
             String teamDir = Paths.get(autoDir, "team").toString();
@@ -1169,10 +1176,11 @@ public final class MemoryPromptBuilder {
             //   模型拿不到假目录（不把 ~/.nexusai 当项目）；LlmAgentLoop 守卫在更上游已 throw+catch，
             //   本分支是未走守卫的直接消费方（agent-memory / 子代理等）的 fail-loud 兜底。
             if (autoDir == null) {
+                // [批 3c] sessionId={} 字段移除原因同 KAIROS 分支（无显式会话来源 · 不发明）。
                 log.error("[MemoryPromptBuilder] loadMemoryPrompt auto-only 分支无有效项目（auto-memory per-project "
                     + "目录不存在 = 会话未绑定项目，DB 主路径解析为空），跳过 auto 记忆注入，拒绝以 config-home "
-                    + "假目录充当项目; sessionId={} rawRoot={} thread={}",
-                    RequestContext.sessionId(), autoMemPaths.projectRoot(), Thread.currentThread().getName());
+                    + "假目录充当项目; rawRoot={} thread={}",
+                    autoMemPaths.projectRoot(), Thread.currentThread().getName());
                 return null;
             }
             ensureMemoryDirExists(autoDir);

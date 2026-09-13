@@ -49,6 +49,15 @@ class SpeculativeClassifierTest {
 
     private static final String CMD = "git status";
 
+    /**
+     * [批 3c] 无会话 → 显式 null。
+     *
+     * <p>{@code startSpeculativeClassifierCheck} 现首参为 {@code String sessionId}（原读裸 MDC 会话槽，
+     * 该槽已整类删除）。本类只验 guard 1-4 的短路返回（任一门命中即 {@code return false}），
+     * 只有全门通过才会走到 {@code CwdResolution.getCwd(sessionId)} —— 故会话值与所有断言无关。
+     */
+    private static final String NO_SESSION = null;
+
     @BeforeEach
     void resetFlags() {
         // WHY: 静态 flag 会跨测试泄漏 —— 翻转测试后必须复位，否则后续"默认 false"断言红。
@@ -74,7 +83,7 @@ class SpeculativeClassifierTest {
         // WHY: start 首闸 isClassifierPermissionsEnabled() 默认 false → return false 且不 speculativeChecks.set。
         //      若 start 错误地填充 Map（接 YoloClassifier 异步分类），peek 会返回非 null 并污染 gate 竞速。
         boolean started = SpeculativeClassifier.startSpeculativeClassifierCheck(
-            CMD, promptRuleContext("Run npm build"), AbortController.NOOP, false);
+            NO_SESSION, CMD, promptRuleContext("Run npm build"), AbortController.NOOP, false);
         assertThat(started)
             .as("startSpeculativeClassifierCheck 首闸默认 false → 恒 return false（bashPermissions.ts:1504）")
             .isFalse();
@@ -96,7 +105,7 @@ class SpeculativeClassifierTest {
         SpeculativeClassifier.setClassifierPermissionsEnabled(true);
 
         boolean started = SpeculativeClassifier.startSpeculativeClassifierCheck(
-            CMD, promptRuleContext("Run npm build"), AbortController.NOOP, false);
+            NO_SESSION, CMD, promptRuleContext("Run npm build"), AbortController.NOOP, false);
         assertThat(started)
             .as("allowDescriptions 恒空（CC stub）→ guard4 返回 false（bashPermissions.ts:1511）")
             .isFalse();
@@ -117,7 +126,7 @@ class SpeculativeClassifierTest {
         ToolPermissionContext autoCtx = ToolPermissionContext.of(
             PermissionMode.AUTO, Map.of(), Map.of(), Map.of(), Map.of());
         boolean started = SpeculativeClassifier.startSpeculativeClassifierCheck(
-            CMD, autoCtx, AbortController.NOOP, false);
+            NO_SESSION, CMD, autoCtx, AbortController.NOOP, false);
         assertThat(started)
             .as("auto mode + transcript flag → guard2 返回 false（bashPermissions.ts:1505-1506）")
             .isFalse();
@@ -135,7 +144,7 @@ class SpeculativeClassifierTest {
         ToolPermissionContext autoCtx = ToolPermissionContext.of(
             PermissionMode.AUTO, Map.of(), Map.of(), Map.of(), Map.of());
         boolean started = SpeculativeClassifier.startSpeculativeClassifierCheck(
-            CMD, autoCtx, AbortController.NOOP, false);
+            NO_SESSION, CMD, autoCtx, AbortController.NOOP, false);
         assertThat(started)
             .as("transcriptClassifierEnabled=false 跳过 guard2 → guard4（allowDescriptions 恒空）返回 false")
             .isFalse();
@@ -151,7 +160,7 @@ class SpeculativeClassifierTest {
         ToolPermissionContext bypassCtx = ToolPermissionContext.of(
             PermissionMode.BYPASS_PERMISSIONS, Map.of(), Map.of(), Map.of(), Map.of());
         boolean started = SpeculativeClassifier.startSpeculativeClassifierCheck(
-            CMD, bypassCtx, AbortController.NOOP, false);
+            NO_SESSION, CMD, bypassCtx, AbortController.NOOP, false);
         assertThat(started)
             .as("bypassPermissions mode → guard3 返回 false（bashPermissions.ts:1507）")
             .isFalse();

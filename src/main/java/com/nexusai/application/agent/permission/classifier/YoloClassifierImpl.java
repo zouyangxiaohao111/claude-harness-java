@@ -1094,7 +1094,7 @@ public class YoloClassifierImpl implements YoloClassifier {
     private LlmProvider.LlmRawResponse callWithRetry(
             LlmProvider provider, ProviderConfig config, String modelName,
             String systemPrompt, String userMessage, ToolUseContext ctx) throws Exception {
-        return callWithRetryGeneric(() -> callWithMdc(provider, config, modelName, systemPrompt, userMessage), ctx);
+        return callWithRetryGeneric(() -> callWithAgentContext(provider, config, modelName, systemPrompt, userMessage), ctx);
     }
 
     /**
@@ -1110,7 +1110,7 @@ public class YoloClassifierImpl implements YoloClassifier {
             String systemPrompt, String userMessage,
             LlmProvider.ChatRequestOptions options, ToolUseContext ctx) throws Exception {
         return callWithRetryGeneric(() ->
-            callWithOptionsMdc(provider, config, modelName, systemPrompt, userMessage, options), ctx);
+            callWithOptionsAgentContext(provider, config, modelName, systemPrompt, userMessage, options), ctx);
     }
 
     /**
@@ -1151,58 +1151,43 @@ public class YoloClassifierImpl implements YoloClassifier {
     }
 
     /**
-     * chatWithRaw 调用 · supplyAsync 虚拟线程不继承创建线程 ThreadLocal → 捕获 MDC context
-     * map 回放（对齐 LlmAgentLoop 既有 STREAM_EXECUTOR 回放模式）；finally clear 防污染。
+     * chatWithRaw 调用 · supplyAsync 虚拟线程不继承创建线程 ThreadLocal → 显式传 agentContext
+     * （不跨线程回放任何环境态）；超时 get(...) 兜底。
      */
-    private LlmProvider.LlmRawResponse callWithMdc(
+    private LlmProvider.LlmRawResponse callWithAgentContext(
             LlmProvider provider, ProviderConfig config, String modelName,
             String systemPrompt, String userMessage) throws Exception {
-        final java.util.Map<String, String> mdcCtx = org.slf4j.MDC.getCopyOfContextMap();
         // [A#3 tuc-invoking-req] 在**派发线程**（调用方线程）取显式归因上下文，
         //   随 lambda 显式传入 supplyAsync —— 本方法的调用链与 LlmAgentLoop:6604 同型：
-        //   CompletableFuture.supplyAsync 的线程不继承 ThreadLocal（此处只回放 MDC），
-        //   在 supplier 内读 AgentContext 恒 null ⇒ invokingRequestId 丢失。
+        //   CompletableFuture.supplyAsync 的线程不继承 ThreadLocal，在 supplier 内读
+        //   AgentContext 恒 null ⇒ invokingRequestId 丢失。
         //   注意：不是「回放」（不 set ThreadLocal 再读），而是显式传对象。
         final com.nexusai.application.agent.subagent.AgentContext agentContext =
             com.nexusai.application.agent.subagent.AgentContext.getAgentContext();
         if (log.isDebugEnabled()) {
             log.debug("YoloClassifier: stage 调用 {} (agentContext={})", modelName, agentContext != null);
         }
-        return CompletableFuture.supplyAsync(() -> {
-            if (mdcCtx != null) {
-                org.slf4j.MDC.setContextMap(mdcCtx);
-            }
-            try {
-                return provider.chatWithRaw(config, modelName, systemPrompt, userMessage, agentContext);
-            } finally {
-                org.slf4j.MDC.clear();
-            }
-        }).get(timeoutSeconds, TimeUnit.SECONDS);
+        return CompletableFuture.supplyAsync(() ->
+            provider.chatWithRaw(config, modelName, systemPrompt, userMessage, agentContext)
+        ).get(timeoutSeconds, TimeUnit.SECONDS);
     }
 
     /**
-     * [IMP-6] chatWithOptionsMessage 调用 · 与 {@link #callWithMdc} 同构（MDC 回放 + 超时）。
+     * [IMP-6] chatWithOptionsMessage 调用 · 与 {@link #callWithAgentContext} 同构
+     * （显式传 agentContext + 超时）。
      *
      * <p>1-stage classify_result 工具协议的唯一发送通道（tools + tool_choice 仅本方法支持）。
      */
-    private AssistantMessage callWithOptionsMdc(
+    private AssistantMessage callWithOptionsAgentContext(
             LlmProvider provider, ProviderConfig config, String modelName,
             String systemPrompt, String userMessage,
             LlmProvider.ChatRequestOptions options) throws Exception {
-        final java.util.Map<String, String> mdcCtx = org.slf4j.MDC.getCopyOfContextMap();
         if (log.isDebugEnabled()) {
             log.debug("YoloClassifier: 1-stage classify_result 调用 {}", modelName);
         }
-        return CompletableFuture.supplyAsync(() -> {
-            if (mdcCtx != null) {
-                org.slf4j.MDC.setContextMap(mdcCtx);
-            }
-            try {
-                return provider.chatWithOptionsMessage(config, modelName, systemPrompt, userMessage, options);
-            } finally {
-                org.slf4j.MDC.clear();
-            }
-        }).get(timeoutSeconds, TimeUnit.SECONDS);
+        return CompletableFuture.supplyAsync(() ->
+            provider.chatWithOptionsMessage(config, modelName, systemPrompt, userMessage, options)
+        ).get(timeoutSeconds, TimeUnit.SECONDS);
     }
 
     /**

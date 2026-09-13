@@ -310,11 +310,15 @@ public class GrepTool implements Tool {
         String glob = input.has("glob") ? input.get("glob").asText() : null;
         String type = input.has("type") ? input.get("type").asText() : null;
 
+        // [会话 cwd] 会话感知：搜索根 / 相对化基准 = ctx.sessionId() 的当前 cwd
+        //   （对齐 CC GrepTool.ts 相对路径基于 getCwd() 解析）；ctx == null（execute(call) 旧 API）
+        //   回落无会话兜底（PathGuard WARN）。
+        String sessionId = ctx != null ? ctx.sessionId() : null;
         Path root;
         try {
             String pathArg = input.has("path") && !input.get("path").asText().isEmpty()
                 ? input.get("path").asText() : ".";
-            root = pathArg.equals(".") ? guard.workdir() : guard.resolve(pathArg);
+            root = pathArg.equals(".") ? guard.workdir(sessionId) : guard.resolve(sessionId, pathArg);
         } catch (Exception e) {
             return ToolResult.error(call.id(), "GrepTool: invalid path: " + e.getMessage());
         }
@@ -431,21 +435,26 @@ public class GrepTool implements Tool {
         }
 
         if ("content".equals(outputMode)) {
-            return contentMode(call.id(), results, headLimit, offset);
+            return contentMode(call.id(), results, headLimit, offset, sessionId);
         }
         if ("count".equals(outputMode)) {
-            return countMode(call.id(), results, headLimit, offset);
+            return countMode(call.id(), results, headLimit, offset, sessionId);
         }
-        return filesWithMatchesMode(call.id(), results, headLimit, offset);
+        return filesWithMatchesMode(call.id(), results, headLimit, offset, sessionId);
     }
 
     // ───────────────────────── 三模式执行（基于 rg stdout） ─────────────────────────
 
-    /** content 模式 · CC :443-476：applyHeadLimit → relativize 前缀 → 拼 content。 */
-    private ToolResult contentMode(String id, List<String> results, int headLimit, int offset) {
+    /**
+     * content 模式 · CC :443-476：applyHeadLimit → relativize 前缀 → 拼 content。
+     *
+     * @param sessionId 会话 ID（相对化基准 = 该会话当前 cwd；null ⇒ 无会话兜底，PathGuard WARN）
+     */
+    private ToolResult contentMode(String id, List<String> results, int headLimit, int offset, String sessionId) {
         // CC :450-454 先 head_limit 再 relativize（逐行廉价操作，避免处理被丢弃的行）
         List<String> limited = applyHeadLimit(results, headLimit, offset);
-        Path workdir = guard.workdir();
+        // [会话 cwd] 相对化基准 = 本会话当前 cwd（与 root 解析同一基准）
+        Path workdir = guard.workdir(sessionId);
         List<String> finalLines = new ArrayList<>();
         for (String line : limited) {
             // CC :457-465 行格式 /abs/path:content 或 /abs/path:num:content → 前缀相对化。
@@ -473,11 +482,16 @@ public class GrepTool implements Tool {
         return ToolResult.success(id, content);
     }
 
-    /** count 模式 · CC :478-524：lastIndexOf(':') 拆分文件名:count → 摘要统计。 */
-    private ToolResult countMode(String id, List<String> results, int headLimit, int offset) {
+    /**
+     * count 模式 · CC :478-524：lastIndexOf(':') 拆分文件名:count → 摘要统计。
+     *
+     * @param sessionId 会话 ID（相对化基准 = 该会话当前 cwd；null ⇒ 无会话兜底，PathGuard WARN）
+     */
+    private ToolResult countMode(String id, List<String> results, int headLimit, int offset, String sessionId) {
         // CC :481-485 applyHeadLimit 后再 parse（对齐有限集口径）
         List<String> limited = applyHeadLimit(results, headLimit, offset);
-        Path workdir = guard.workdir();
+        // [会话 cwd] 相对化基准 = 本会话当前 cwd（与 root 解析同一基准）
+        Path workdir = guard.workdir(sessionId);
         List<String> finalCountLines = new ArrayList<>();
         for (String line : limited) {
             // CC :490-497 行格式 /abs/path:count → lastIndexOf(':') 拆分（Windows 盘符路径安全）
@@ -519,8 +533,13 @@ public class GrepTool implements Tool {
         return ToolResult.success(id, rawContent + summary);
     }
 
-    /** files_with_matches 模式（默认）· CC :526-576：mtime 降序 → applyHeadLimit → relativize。 */
-    private ToolResult filesWithMatchesMode(String id, List<String> results, int headLimit, int offset) {
+    /**
+     * files_with_matches 模式（默认）· CC :526-576：mtime 降序 → applyHeadLimit → relativize。
+     *
+     * @param sessionId 会话 ID（相对化基准 = 该会话当前 cwd；null ⇒ 无会话兜底，PathGuard WARN）
+     */
+    private ToolResult filesWithMatchesMode(String id, List<String> results, int headLimit, int offset,
+                                            String sessionId) {
         // CC :529-553 stat allSettled → mtime 降序（tiebreak 文件名升序，确定性）
         List<String> sorted = new ArrayList<>(results);
         sorted.sort((a, b) -> {
@@ -532,7 +551,8 @@ public class GrepTool implements Tool {
         });
         // CC :556-563 applyHeadLimit → relativize
         List<String> limited = applyHeadLimit(sorted, headLimit, offset);
-        Path workdir = guard.workdir();
+        // [会话 cwd] 相对化基准 = 本会话当前 cwd（与 root 解析同一基准）
+        Path workdir = guard.workdir(sessionId);
         List<String> filenames = new ArrayList<>();
         for (String p : limited) {
             filenames.add(toRelativePath(workdir, p));

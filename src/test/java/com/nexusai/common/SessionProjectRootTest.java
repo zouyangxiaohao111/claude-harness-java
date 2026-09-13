@@ -40,7 +40,6 @@ class SessionProjectRootTest {
     @AfterEach
     void cleanup() {
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     /** 创建绑定目录并返回绝对路径（满足 setForSession 绝对+目录存在校验）。 */
@@ -55,7 +54,7 @@ class SessionProjectRootTest {
     void sessionBound_projectRootsIsolated() throws IOException {
         // WHY: CC 每会话冻结自己的 projectRoot（state.ts:45-50/:269-279），会话间不得互相覆盖。
         //       按 sessionId 直查后，不同会话必须各自解析到自己的 projectRoot
-        //       （[TL-W2 P11] 不再经 RequestContext/MDC 间接解析 —— 消费方持 sessionId 现算）。
+        //       （[TL-W2 P11] 不再经裸 MDC 会话槽（批 3c 已删除）间接解析 —— 消费方持 sessionId 现算）。
         String pa = bindDir("project-a");
         String pb = bindDir("project-b");
         SessionProjectRoot.setForSession("sess-a", pa);

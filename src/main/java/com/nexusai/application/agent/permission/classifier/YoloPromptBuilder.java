@@ -97,7 +97,7 @@ public class YoloPromptBuilder {
      *  无会话回落 {@code user.dir}）。localSettings 源 = {@code <projectRoot>/.nexusai/settings.local.json}
      *  （项目级，对齐 LocalSettingsLoader 既有语义）；nexusai.home 已废弃（第二轮拍板），不再经
      *  {@code @Value("${nexusai.home}")} 注入。 */
-    private final Supplier<String> projectRootSupplier = CwdResolution::getOriginalCwdLayer;
+    private final Supplier<String> projectRootSupplier = () -> CwdResolution.getOriginalCwdLayer(null);
 
     /** [prompt-align TOOLS-02] 托管策略文件路径 · policySettings 源
      *  （PolicySettingsLoader:61-66 先例，nexusai.policy.path 配置）。未配置/blank → 跳过。 */

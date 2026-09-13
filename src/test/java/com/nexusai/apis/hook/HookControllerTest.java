@@ -7,8 +7,6 @@ import com.nexusai.application.agent.permission.hook.HookSource;
 import com.nexusai.application.agent.permission.hook.HooksSettings;
 import com.nexusai.application.agent.permission.hook.HttpHook;
 import com.nexusai.application.agent.permission.hook.IndividualHookConfig;
-import com.nexusai.common.RequestContext;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -38,8 +36,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *       决策 4-3『运行时会话』）。旧契约（缺省 → settings-only / MDC 兜底）已删除。</li>
  *   <li><b>返回 shape 对齐前端 HookItem</b>（types.ts:855-865）——event/config.type/config.command|url/source
  *       字段齐全、null 子类型字段省略（前端 TS 可解析）。</li>
- *   <li><b>MDC 不再被读取（反向实验）</b>——MDC 里残留别的会话 id 时请求仍 400：若实现回退读 MDC，
- *       该用例立刻红（旧 {@code mdcSessionId_fallback} 用例已按新契约反转）。</li>
+ *   <li><b>[批 3c] 裸 MDC 会话槽已整体删除</b>——原「残留别的会话 id 不被读取」的反向实验失去对照
+ *       装置（装置本身已不存在）；断言仍保留，见 {@link #mdcSessionId_isIgnored_is400()} 内注释。</li>
  * </ol>
  */
 class HookControllerTest {
@@ -62,12 +60,6 @@ class HookControllerTest {
         mockMvc = MockMvcBuilders.standaloneSetup(controller)
             .setControllerAdvice(new com.nexusai.infra.exception.GlobalExceptionHandler())
             .build();
-    }
-
-    @AfterEach
-    void tearDown() {
-        // MDC sessionId 清理，避免线程复用泄漏
-        RequestContext.clear();
     }
 
     private static IndividualHookConfig sampleCommandHook() {
@@ -112,13 +104,13 @@ class HookControllerTest {
     }
 
     @Test
-    @DisplayName("[批 3a 反向实验] MDC 残留别的会话 id 时不读 MDC：无 query 仍 400（若回退 MDC 则本用例红）")
+    @DisplayName("[批 3a 反向实验 · 批 3c 装置已删] 无 query 仍 400（原 MDC 残留对照无法再构造，见方法内注释）")
     void mdcSessionId_isIgnored_is400() throws Exception {
-        // WHY（规则九）：MDC 的 sessionId 第三态 = 上一个请求残留的**别的会话** id（看起来完全合法）
-        //   ⇒ 旧实现会把 B 会话的 hook 列表当成 A 会话的返回，且日志前缀同样取自 MDC ⇒ 无法自查。
-        //   本用例故意把 MDC 设成一个合法会话：若实现回退读 MDC，请求会 200 且
-        //   verify(never()).getAllHooks("sess-mdc") 立刻失败。
-        RequestContext.setSession("sess-mdc");
+        // WHY（规则九）：裸 MDC 会话槽（批 3c 已删除）的 sessionId 第三态 = 上一个请求残留的
+        //   **别的会话** id（看起来完全合法）⇒ 旧实现会把 B 会话的 hook 列表当成 A 会话的返回，
+        //   且日志前缀同样取自该槽 ⇒ 无法自查。
+        // [批 3c] 语义消失：该槽已整体删除，无法再把「残留合法会话 id」装进装置（缺 sessionId 时
+        //   已无第三源可回落）。下方 stub 与 verify 文本原样保留，仅作反向实验的历史留痕。
         when(hooksSettings.getAllHooks("sess-mdc")).thenReturn(List.of(sampleCommandHook()));
 
         mockMvc.perform(get("/api/v1/hooks"))

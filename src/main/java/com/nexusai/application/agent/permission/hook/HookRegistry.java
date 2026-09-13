@@ -4400,7 +4400,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         }
         // [fix-ts04 IMPL-01 OD-TS04-01 方案 B] 批级 base 字段合并 · 对齐 CC createBaseHookInput
         //   恒备字段单点计算 (hooks.ts:301-328)。enrich 在序列化前完成, 全批共享同一副本:
-        //   session_id 回退 (RequestContext MDC) / transcript_path / cwd / permission_mode /
+        //   session_id 回退 (裸 MDC 会话槽) / transcript_path / cwd / permission_mode /
         //   agent_id / agent_type(ctx) 单值合并 (REQ-06, 无双轨)。副本同步传给
         //   executeOneConfiguredHook → executeConfiguredAgent (event.transcriptPath() 消费,
         //   ExecAgentHook transcript 读取能力, PROBE-01 关键事实 4)。

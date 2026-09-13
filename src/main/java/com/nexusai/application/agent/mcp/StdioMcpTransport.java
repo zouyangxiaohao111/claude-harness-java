@@ -60,7 +60,7 @@ public class StdioMcpTransport implements McpTransport {
     private volatile Thread stderrReaderThread;
     /**
      * [S02 X-9] 保存的 transport 配置 · start(config) 时保存，供 server→client roots/list
-     * 请求回传 cwd（config.cwd() ?? CwdResolution.getOriginalCwdLayer()，CC client.ts:1009-1018 getOriginalCwd 语义）。
+     * 请求回传 cwd（config.cwd() ?? CwdResolution.getOriginalCwdLayer(null)，CC client.ts:1009-1018 getOriginalCwd 语义）。
      */
     private volatile TransportConfig config;
     private Process process;
@@ -455,11 +455,18 @@ public class StdioMcpTransport implements McpTransport {
             // [S02 X-9] server→client roots/list 请求 → {roots:[{uri:"file://"+cwd}]}
             // （对齐 CC client.ts:1009-1018 ListRootsRequestSchema handler → uri=file://${getOriginalCwd()}；
             // CC 真源自验 client.ts:1014：roots 用 STATE.originalCwd=会话项目根，非 pwd/getCwd 动态 cwd。
-            // Java 兜底走统一入口 CwdResolution.getOriginalCwdLayer()（绑定项目层 ?? user.dir，
-            // 对齐 CC getOriginalCwd）；config.cwd() 优先保留（server 可配沙箱 cwd，非破坏）。
+            // Java 兜底走统一入口按「无会话」解析 getOriginalCwdLayer(null)（[批 3c] transport 为
+            // per-server 对象、无会话入参 ⇒ 跳过会话层 → 进程 user.dir，= 旧实现「MDC 为空」分支
+            // 等价语义；与 CC client.ts:1014 的进程全局 STATE.originalCwd 同构）。
+            // config.cwd() 优先保留（server 可配沙箱 cwd，非破坏）。
             // DEL-07：移除 System.getProperty("user.dir") 直读，经统一入口兜底。）
+            if (config == null || config.cwd() == null || config.cwd().isBlank()) {
+                log.warn("[StdioMcpTransport] {} roots/list 无 config.cwd 且本 transport 无会话入参 → "
+                    + "cwd 回落进程 user.dir={}；如需会话 cwd 须由调用方显式传入（config.cwd()）",
+                    serverName, System.getProperty("user.dir"));
+            }
             String cwd = config != null && config.cwd() != null && !config.cwd().isBlank()
-                ? config.cwd() : CwdResolution.getOriginalCwdLayer();
+                ? config.cwd() : CwdResolution.getOriginalCwdLayer(null);
             Map<String, Object> response = new java.util.LinkedHashMap<>();
             response.put("jsonrpc", "2.0");
             response.put("id", idNode);

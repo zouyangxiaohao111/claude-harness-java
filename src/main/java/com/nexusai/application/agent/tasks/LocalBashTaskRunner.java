@@ -129,7 +129,7 @@ public class LocalBashTaskRunner {
      * [批 3b] 显式会话重载 · {@code sessionId} = 创建该后台任务的会话，用于解析后台进程 cwd
      * （{@code CwdResolution.getCwd(sessionId)}，对齐 CC {@code Shell.ts:218 pwd() → spawn {cwd}}）。
      *
-     * <p>⛔ 旧实现读 {@code RequestContext.sessionId()}（MDC）：本方法在
+     * <p>⛔ 旧实现读 裸 MDC 的 {@code sessionId()}（MDC）：本方法在
      * {@code BackgroundTaskRunner} 的 executor 线程执行（提交前无 MDC 回放）⇒ 恒 null ⇒
      * <b>后台命令永远跑在 user.dir 而不是会话 cwd</b>；若该池线程恰好残留别会话 MDC，更会跑在
      * 别的会话 cwd 上。会话态一律显式传参。
@@ -172,7 +172,7 @@ public class LocalBashTaskRunner {
         //   wrapForBackground（仅 source 快照，无 pwd -P >| track，与前台 wrapForExec 的差别）。
         //   快照生成失败/超时 → resolveBackgroundSnapshot 返回 null → 三参 bash 加 -l login shell
         //   （bashProvider.ts:93-103 同款），不阻塞后台启动、不破坏既有行为。
-        // [批 3b] cwd 的会话源 = 显式入参（⛔ 不再读 RequestContext.sessionId()：本方法在
+        // [批 3b] cwd 的会话源 = 显式入参（⛔ 不再读 裸 MDC 的 sessionId()：本方法在
         //   BackgroundTaskRunner executor 线程执行，MDC 恒 null（→ 恒 user.dir）或残留别会话 id）。
         String cwd = CwdResolution.getCwd(sessionId);
         Path snapshot = resolveBackgroundSnapshot();

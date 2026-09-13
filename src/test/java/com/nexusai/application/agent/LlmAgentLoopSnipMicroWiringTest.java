@@ -7,6 +7,7 @@ import com.nexusai.application.agent.compact.CompactThresholdSystem;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.MicroCompactResult;
 import com.nexusai.application.agent.compact.SnipCompactor;
+import com.nexusai.application.agent.compact.TokenEstimator;
 import com.nexusai.application.agent.event.AgentBoundaryMessageEvent;
 import com.nexusai.application.agent.loop.AgentLoopContext;
 import com.nexusai.application.agent.loop.FeatureFlags;
@@ -21,6 +22,10 @@ import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.repository.provider.entity.ModelRecord;
+import com.nexusai.repository.provider.entity.ProviderRecord;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import org.springframework.context.ApplicationEventPublisher;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -43,6 +48,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -365,14 +371,14 @@ class LlmAgentLoopSnipMicroWiringTest {
 
         MicroCompactor micro = Mockito.mock(MicroCompactor.class);
         List<ChatMessageDto> reduced = List.of(singleMessage("m1", "first"));
-        when(micro.microcompactMessages(anyList(), anyString()))
+        when(micro.microcompactMessages(anyList(), anyString(), anyString()))
             .thenReturn(new MicroCompactResult(reduced, null));
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
         QueryParams params = forLoopParams(ctx, QuerySource.USER, state);
         LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(params.deps().context(), params, state), state, new ArrayList<>(), null, micro);
 
-        verify(micro).microcompactMessages(anyList(), anyString());
+        verify(micro).microcompactMessages(anyList(), anyString(), anyString());
         assertThat(histories)
             .as("LLM 至少被调用一次（history 被捕获）")
             .isNotEmpty();
@@ -506,19 +512,27 @@ class LlmAgentLoopSnipMicroWiringTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("nudge: HISTORY_SNIP=true + 会话 ≥30 条 → context_efficiency nudge 注入 LLM 消息流（CC attachments.ts:929-937/:3978）")
+    @DisplayName("nudge: HISTORY_SNIP=true + 上下文剩余 ≤ 阈值 → context_efficiency nudge 注入 LLM 消息流（snip-nudge-percent 2026-09-13）")
     void nudgeGateOn_injectsContextEfficiencyNudge() {
-        // WHY: Java SnipCompactor.shouldNudgeForSnips/SNIP_NUDGE_TEXT 已实现但无消费方；CC 会话足够长
-        //   （≥30 条，snipCompact.ts:163-165）时经 getContextEfficiencyAttachment（attachments.ts:3963-3983）
-        //   注入「提示模型考虑 /force-snip」的 isMeta user 消息（messages.ts:4148-4161）。
+        // WHY: [snip-nudge-percent] 门 4 判据已从「模型可见消息条数 ≥ 窗口自适应档位」换成
+        //   「上下文剩余百分比 ≤ 阈值」（AgentLoopContext.maybeInjectContextEfficiencyNudge）：
+        //   剩余% = round((1 - used/window) * 100)，window 取 DB models.max_context_tokens、
+        //   used 取窗口内最后一条带 usage 的 assistant 的真实 API token；阈值默认 30
+        //   （本类 drive 走 3 参 queryLoop → settingsResolver 恒 null → 回落
+        //   SnipCompactor.SNIP_NUDGE_DEFAULT_REMAINING_PERCENT = 30）。
+        //   旧判据「数条数」与真实上下文压力脱钩（1M 窗口下 900 条 ≈ 已用 40% 就开始每轮提示）；
+        //   新判据只看「还剩多少窗口」，与消息条数解耦。
         //   本测试验证消费方接线端到端：nudge 必须到达 provider.stream 的 history。
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         for (ChatMessageDto m : snipTriggerMessages()) {
             state.appendMessage(m);
         }
+        // [snip-nudge-percent] 追加一条携带真实 API usage 的 assistant：
+        // 窗口 100_000 / used 80_000 → 剩余 20% ≤ 阈值 30% → 必须注入
+        state.appendMessage(hydratedAssistant("a1", 80_000, 100));
         List<List<ChatMessageDto>> histories = new ArrayList<>();
         LlmProviderFactory factory = capturingProviderFactory(histories);
-        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null, snipOnFlags());
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, beansForWindow(100_000L), snipOnFlags());
         LoopResult result = drive(ctx, state);
 
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
@@ -531,7 +545,7 @@ class LlmAgentLoopSnipMicroWiringTest {
             m.isMeta() && Role.user == m.role()
                 && ("<system-reminder>\n" + SnipCompactor.SNIP_NUDGE_TEXT + "\n</system-reminder>")
                     .equals(m.content())))
-            .as("[snip-nudge-count] 判据=模型可见消息: state 61 条 → snip 投影(剔除 u0..u9)后可见 51 条仍 ≥30 → 必须注入 isMeta user nudge（对齐 CCB query.ts:1894 messagesForQuery 投影后计数 + CC messages.ts:4148-4161 wrapInSystemReminder）")
+            .as("[snip-nudge-percent] 判据=上下文剩余%: window 100_000 / used 80_000 → 剩余 20% ≤ 阈值 30% → 必须注入 isMeta user nudge（WrapInSystemReminder: messages.ts:4148-4161）")
             .isTrue();
     }
 
@@ -544,63 +558,14 @@ class LlmAgentLoopSnipMicroWiringTest {
         for (ChatMessageDto m : snipTriggerMessages()) {
             state.appendMessage(m);
         }
+        // ★RED TEETH 必需：消息集必须**本来就满足门 4**（剩余 20% ≤ 阈值 30%），否则本用例变成恒真 ——
+        //   无 usage 时 remainingPct 恒为 null → 恒不注入 → 无论门 1 开还是关它都绿，零鉴别力。
+        //   补上带 usage 的 assistant 后，唯一能阻止注入的就是门 1；把门 1 短掉它必红（已用变异坐实）。
+        state.appendMessage(hydratedAssistant("a1", 80_000, 100));   // 窗口 100_000 → 剩余 20%
         List<List<ChatMessageDto>> histories = new ArrayList<>();
         LlmProviderFactory factory = capturingProviderFactory(histories);
-        // 默认 feature flags（historySnip=false）
-        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null);
-        LoopResult result = drive(ctx, state);
-
-        assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
-        assertThat(histories).isNotEmpty();
-        List<ChatMessageDto> sent = histories.get(histories.size() - 1);
-        assertThat(sent.stream().anyMatch(m ->
-            m.isMeta() && SnipCompactor.SNIP_NUDGE_TEXT.equals(m.content())))
-            .as("HISTORY_SNIP=false → 不得出现 SNIP_NUDGE_TEXT nudge（CC attachments.ts:934/:3966）")
-            .isFalse();
-    }
-
-    @Test
-    @DisplayName("nudge 阈值: HISTORY_SNIP=true 但消息 <30 → 不注入（snipCompact.ts:163-165）")
-    void nudgeShortConversation_skipsNudge() {
-        // WHY: shouldNudgeForSnips = messages.length >= 30（snipCompact.ts:163-165）；10 条短会话
-        //   不应触发 nudge，避免短会话被无关提示污染。
-        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
-        for (ChatMessageDto m : largeMessages(10)) {
-            state.appendMessage(m);
-        }
-        List<List<ChatMessageDto>> histories = new ArrayList<>();
-        LlmProviderFactory factory = capturingProviderFactory(histories);
-        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null, snipOnFlags());
-        LoopResult result = drive(ctx, state);
-
-        assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
-        assertThat(histories).isNotEmpty();
-        List<ChatMessageDto> sent = histories.get(histories.size() - 1);
-        assertThat(sent.stream().anyMatch(m ->
-            m.isMeta() && SnipCompactor.SNIP_NUDGE_TEXT.equals(m.content())))
-            .as("消息 10 条 < 30 → shouldNudgeForSnips=false，不注入 nudge（snipCompact.ts:163-165）")
-            .isFalse();
-    }
-
-    @Test
-    @DisplayName("nudge 判据对齐 CCB: snip 大幅剔除后模型可见 <阈值 → 不注入（state 全量仍 ≥阈值 · CCB query.ts:1894）")
-    void nudgeAfterLargeSnip_skipsWhenVisibleBelowThreshold() {
-        // WHY: [snip-nudge-count 修复] CCB 真源 query.ts:1894 nudge 判据 = messagesForQuery(已 snip 投影)
-        //   .concat(assistantMessages, toolResults) —— 数「模型可见」消息；Java 旧判据数 state.rawMessages()
-        //   全量（B5 d-2 起 snip 只做请求级投影、state 保留被 snip 消息不删）→ 模型越 snip 判据不降、
-        //   达阈值后每轮重复注入 nudge（用户实测「一直提示」缺陷）。
-        //   本测试构造 state=31 条（30 "hi" user u0..u29 + boundary removedUuids=u0..u19）≥ 阈值 30 →
-        //   旧判据会注入；但 snip 投影后模型可见 = boundary+u20..u29 = 11 条 < 30 → 新判据（对齐 CCB）
-        //   必须不注入。RED teeth: 判据改回 state.rawMessages() → 本测试 fail。
-        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
-        List<ChatMessageDto> msgs = new ArrayList<>(largeMessages(30));
-        msgs.add(snipBoundary("snip-boundary-nudge", removedUuids(0, 20)));
-        for (ChatMessageDto m : msgs) {
-            state.appendMessage(m);
-        }
-        List<List<ChatMessageDto>> histories = new ArrayList<>();
-        LlmProviderFactory factory = capturingProviderFactory(histories);
-        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, null, snipOnFlags());
+        // 默认 feature flags（historySnip=false）—— 唯一阻止本用例注入的是门 1
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, beansForWindow(100_000L));
         LoopResult result = drive(ctx, state);
 
         assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
@@ -610,7 +575,68 @@ class LlmAgentLoopSnipMicroWiringTest {
             m.isMeta() && Role.user == m.role()
                 && ("<system-reminder>\n" + SnipCompactor.SNIP_NUDGE_TEXT + "\n</system-reminder>")
                     .equals(m.content())))
-            .as("snip 剔除 u0..u19 后模型可见 11 条 < 阈值 30（state 全量 31 仍 ≥30）→ 不注入 nudge（对齐 CCB query.ts:1894 投影后计数）")
+            .as("HISTORY_SNIP=false → 不得出现 SNIP_NUDGE_TEXT nudge（CC attachments.ts:934/:3966）")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("nudge 阈值: 短会话但上下文剩余充足 → 不注入（snip-nudge-percent）")
+    void nudgeShortConversation_skipsNudge() {
+        // WHY: [snip-nudge-percent] 判据不再是消息条数：10 条消息但上下文仅用 20%（剩余 80%）
+        //   远超阈值 30% → 短会话不该被无关提示污染。（旧「条数」判据下 10 < 30 也不注入，
+        //   但那时不注入的原因是条数；现在不注入的原因是「窗口还很空」——RED teeth 见反向实验。）
+        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
+        for (ChatMessageDto m : largeMessages(10)) {
+            state.appendMessage(m);
+        }
+        // 窗口 100_000 / used 20_000 → 剩余 80% > 阈值 30% → 不注入
+        state.appendMessage(hydratedAssistant("a1", 20_000, 100));
+        List<List<ChatMessageDto>> histories = new ArrayList<>();
+        LlmProviderFactory factory = capturingProviderFactory(histories);
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, beansForWindow(100_000L), snipOnFlags());
+        LoopResult result = drive(ctx, state);
+
+        assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
+        assertThat(histories).isNotEmpty();
+        List<ChatMessageDto> sent = histories.get(histories.size() - 1);
+        assertThat(sent.stream().anyMatch(m ->
+            m.isMeta() && Role.user == m.role()
+                && ("<system-reminder>\n" + SnipCompactor.SNIP_NUDGE_TEXT + "\n</system-reminder>")
+                    .equals(m.content())))
+            .as("窗口 100_000 / used 20_000 → 剩余 80% > 阈值 30% → 不注入 nudge（判据与消息条数无关）")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("nudge 判据对齐新口径: snip 大幅剔除后上下文剩余充足 → 不注入（剩余% 与消息条数解耦）")
+    void nudgeAfterLargeSnip_countsTokensNotMessages() {
+        // WHY: [snip-nudge-percent] 判据 = 上下文剩余百分比，与「数多少条消息」完全解耦 ——
+        //   无论数 state 全量（31 条）还是数 snip 投影后的模型可见（11 条），都不再是判据。
+        //   本测试构造 state=31 条（30 "hi" user u0..u29 + boundary removedUuids=u0..u19）+
+        //   一条 usage=20_000 的 assistant：窗口 100_000 → 剩余 80% 远超阈值 30% → 不注入。
+        //   （旧「条数」判据的两次修复都曾在此用例上打转：数全量 31 ≥ 30 会注入 → 修成数投影 11 < 30
+        //    才不注入；新口径下这两条路径都被绕过，判据只剩「窗口还剩多少」。）
+        //   RED teeth: 把门 4 改成恒注入（`if (false)`）→ 本测试 fail。
+        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
+        List<ChatMessageDto> msgs = new ArrayList<>(largeMessages(30));
+        msgs.add(snipBoundary("snip-boundary-nudge", removedUuids(0, 20)));
+        for (ChatMessageDto m : msgs) {
+            state.appendMessage(m);
+        }
+        state.appendMessage(hydratedAssistant("a1", 20_000, 100));   // → 剩余 80%
+        List<List<ChatMessageDto>> histories = new ArrayList<>();
+        LlmProviderFactory factory = capturingProviderFactory(histories);
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, factory, null, null, beansForWindow(100_000L), snipOnFlags());
+        LoopResult result = drive(ctx, state);
+
+        assertThat(result.aborted()).as("正常完成不应 aborted").isFalse();
+        assertThat(histories).isNotEmpty();
+        List<ChatMessageDto> sent = histories.get(histories.size() - 1);
+        assertThat(sent.stream().anyMatch(m ->
+            m.isMeta() && Role.user == m.role()
+                && ("<system-reminder>\n" + SnipCompactor.SNIP_NUDGE_TEXT + "\n</system-reminder>")
+                    .equals(m.content())))
+            .as("state 31 条、投影后 11 条 —— 无论数哪个，新判据都不看条数；剩余 80% > 阈值 30% → 不注入")
             .isFalse();
     }
 
@@ -621,6 +647,41 @@ class LlmAgentLoopSnipMicroWiringTest {
     private static FeatureFlags snipOnFlags() {
         // 17 参 = 融合后 FeatureFlags record 全字段：仅 historySnip(pos6)=true，其余全 false
         return new FeatureFlags(false, false, false, false, false, true, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false);
+    }
+
+    /** DB 水合形态：usage()==null，仅 inputTokens/outputTokens 有值。 */
+    private static ChatMessageDto hydratedAssistant(String id, Integer in, Integer out) {
+        return new ChatMessageDto(
+            id, null, Role.assistant, "assistant", "reply", null, List.of(),
+            FinishReason.stop, in, out, "刚刚", OffsetDateTime.now(),
+            null, null, null, List.of(), List.of());
+    }
+
+    /**
+     * Mockito 打桩两个 mapper，使 ContextUsageCalculator.snapshot 解析到 window。
+     * **逐字抄 LlmAgentLoopNudgePercentGateTest.beansForWindow**；
+     * 注意 providerId 必须写字面量 "p1"（isAnthropic 走精确串匹配），且 provider.setType 必须设。
+     */
+    private static AgentLoopContext.TokenBudgetBeans beansForWindow(long window) {
+        ModelRecord model = new ModelRecord();
+        model.setId("m1");
+        model.setProviderId("p1");
+        model.setName("deepseek-v4-flash");
+        model.setEnabled(true);
+        model.setMaxContextTokens((int) window);
+        ModelMapper modelMapper = mock(ModelMapper.class);
+        when(modelMapper.selectOneByQuery(any())).thenReturn(model);
+        when(modelMapper.selectListByQuery(any())).thenReturn(List.of(model));
+
+        ProviderRecord provider = new ProviderRecord();
+        provider.setId("p1");
+        provider.setType("openai_compatible");
+        ProviderMapper providerMapper = mock(ProviderMapper.class);
+        when(providerMapper.selectOneById("p1")).thenReturn(provider);
+        when(providerMapper.selectOneByQuery(any())).thenReturn(provider);
+
+        return new AgentLoopContext.TokenBudgetBeans(
+            mock(TokenEstimator.class), modelMapper, providerMapper);
     }
 
     private static LoopResult drive(AgentLoopContext ctx, AgentState state) {

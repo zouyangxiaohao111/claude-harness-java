@@ -70,7 +70,7 @@ public final class SubagentEnvInfo {
      * <p><b>sessionId 显式传参（cwd-align-extended 方案2）</b>：CC {@code getCwd()}（prompts.ts:642）
      * 读 per-async-context override；Java 以 {@code CwdResolution.getCwd(sessionId)}（override ??
      * sessionCwd ?? boundProject ?? user.dir）对齐，sessionId 由调用方（BuiltInAgents 等）传
-     * {@code RequestContext.sessionId()}。无会话（null）回落 user.dir，零行为变化。
+     * 裸 MDC 的 {@code sessionId()}。无会话（null）回落 user.dir，零行为变化。
      *
      * @param sessionId                  会话 ID（可 null；null → 回落 user.dir，对齐 CC getOriginalCwd 末端兜底）
      * @param modelId                    完整 model id（可 null；null → 抑制模型描述行）

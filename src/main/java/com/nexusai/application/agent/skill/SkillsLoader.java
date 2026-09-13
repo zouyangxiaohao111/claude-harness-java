@@ -2,7 +2,6 @@ package com.nexusai.application.agent.skill;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.infra.util.PluginOnlyPolicy;
@@ -138,16 +137,18 @@ public class SkillsLoader {
     private Supplier<List<String>> additionalDirectoriesSupplier = List::of;
 
     /**
-     * 当前工作目录供应 · 默认会话 cwd（无 sessionId 回落 user.dir）。
+     * 当前工作目录供应 · <b>进程级兜底</b>（JVM 启动目录）。
      * {@link #getSkillDirCommands(String)} 的 cwd 入参为空时回退本供应。
      *
-     * <p>cwd-align-ext：兜底 supplier 改走会话 cwd（CC loadSkillsDir.ts:638-642 getSkillDirCommands(cwd)
-     * 的 cwd 顶传 getCwd()）；无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     * <p>[批 3c · 2026-09-13] 原兜底读<b>裸 MDC</b>会话槽
+     * （{@code CwdResolution.getCwd(裸 MDC 会话槽)}）—— 该读点随批 3c 删除。
+     * WHY 直接回落 {@code user.dir} 而不引入新的会话来源：对齐 CC
+     * {@code getSkillDirCommands(cwd)}（loadSkillsDir.ts:638-642）—— <b>cwd 由调用方显式传入</b>，
+     * 本供应只在该入参为空时兜底，属「本就不需要会话」分支。会话 cwd 现由
+     * {@link SkillRegistry#resolveSessionCwd(String)} 按显式 sessionId 解析后传入。
+     * 行为等价：旧路径在无会话时 {@code CwdResolution.getCwd(null)} 亦恒回落 {@code user.dir}。
      */
-    private Supplier<String> cwdSupplier = () -> {
-        String cwd = CwdResolution.getCwd(RequestContext.sessionId());
-        return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
-    };
+    private Supplier<String> cwdSupplier = () -> System.getProperty("user.dir", ".");
 
     /**
      * bare 模式判定（可注入）· CC original: {@code isBareMode()}（envUtils.ts:60-65）

@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.team.TeammateContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.infra.util.AbortControllerFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
@@ -27,8 +26,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ol>
  *   <li><b>无 context 回退链无回归</b>：不设 teammate ctx 时，解析链保持改动前行为
  *       （nexusai.taskListId → nexusai.team.name → leaderTeamName → nexusai.sessionId →
- *       RequestContext 会话 → 进程级 UUID），回归护栏。U-3 弃硬编码 'tasklist'（CC getTaskListId
- *       永不返回 'tasklist'，最终回退 getSessionId() 会话 UUID，tasks.ts:209）。</li>
+ *       显式会话形参 → 进程级 UUID），回归护栏。U-3 弃硬编码 'tasklist'（CC getTaskListId
+ *       永不返回 'tasklist'，最终回退 getSessionId() 会话 UUID，tasks.ts:209）。
+ *       [批 3c] 原优先级 6 读裸 MDC 的会话槽（该类已删除）⇒ 现为**显式 sessionId 形参**，
+ *       本测试按新形态显式传会话变量。</li>
  *   <li><b>teammate ctx 优先级第 2</b>：runWithTeammateContext 设 ctx 后，getTaskListId()
  *       返回 ctx.teamName，且高于 nexusai.team.name（对齐 CC 优先级 2 &gt; 3）。</li>
  *   <li><b>ThreadLocal 无泄漏</b>：runWithTeammateContext 退出后 ctx 已 restore，
@@ -48,6 +49,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * </ul>
  */
 class TaskServiceGetTaskListIdTest {
+
+    /** [批 3c] 显式会话（原优先级 6 读裸 MDC 会话槽，该槽已删 ⇒ 改为显式形参传入）。 */
+    private static final String SESSION = "sess-explicit-1";
 
     @TempDir
     Path tempDir;
@@ -78,7 +82,7 @@ class TaskServiceGetTaskListIdTest {
     }
 
     @Test
-    @DisplayName("无 context 回退链无回归：taskListId → teamName → leaderTeamName → sessionId → RequestContext 会话 → 进程级 UUID")
+    @DisplayName("无 context 回退链无回归：taskListId → teamName → leaderTeamName → sessionId → 显式会话形参 → 进程级 UUID")
     void fallbackChainWithoutTeammateContext() {
         TaskService service = newService();
 
@@ -94,34 +98,26 @@ class TaskServiceGetTaskListIdTest {
         assertThat(fallback).isNotBlank().isNotEqualTo("tasklist");
         assertThat(service.getTaskListId()).as("进程级会话 UUID 应进程内稳定").isEqualTo(fallback);
 
-        // RequestContext MDC 会话（优先级 6，getSessionId() 当前会话等价物）> 进程级 UUID
-        RequestContext.setSession("sess-request-1");
-        try {
-            assertThat(service.getTaskListId()).isEqualTo("sess-request-1");
-        } finally {
-            RequestContext.clear();
-        }
+        // 显式会话形参（优先级 6，getSessionId() 当前会话等价物）> 进程级 UUID
+        // [批 3c] 该级原读裸 MDC 的会话槽（已删除）⇒ 现按形参显式传入本测试的会话变量。
+        assertThat(service.getTaskListId(SESSION)).isEqualTo(SESSION);
 
-        // sysprop nexusai.sessionId（优先级 5）> RequestContext 会话
-        RequestContext.setSession("sess-request-2");
+        // sysprop nexusai.sessionId（优先级 5）> 显式会话形参
         System.setProperty("nexusai.sessionId", "sess-1");
-        try {
-            assertThat(service.getTaskListId()).isEqualTo("sess-1");
-        } finally {
-            RequestContext.clear();
-        }
+        assertThat(service.getTaskListId(SESSION)).isEqualTo("sess-1");
 
-        // ThreadLocal leaderTeamName（优先级 4）> sessionId
-        TaskService.setLeaderTeamName("leader-1");
-        assertThat(service.getTaskListId()).isEqualTo("leader-1");
+        // 会话级 leaderTeamName（优先级 4）> sessionId
+        // [批 3c] leaderTeamName 由 ThreadLocal 改为**按会话分桶**（写读均须显式会话）。
+        TaskService.setLeaderTeamName("leader-1", SESSION);
+        assertThat(service.getTaskListId(SESSION)).isEqualTo("leader-1");
 
         // sysprop nexusai.team.name（优先级 3）> leaderTeamName
         System.setProperty("nexusai.team.name", "team-1");
-        assertThat(service.getTaskListId()).isEqualTo("team-1");
+        assertThat(service.getTaskListId(SESSION)).isEqualTo("team-1");
 
         // sysprop nexusai.taskListId（优先级 1）> 一切
         System.setProperty("nexusai.taskListId", "explicit-1");
-        assertThat(service.getTaskListId()).isEqualTo("explicit-1");
+        assertThat(service.getTaskListId(SESSION)).isEqualTo("explicit-1");
     }
 
     @Test

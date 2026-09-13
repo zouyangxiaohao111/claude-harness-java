@@ -117,24 +117,27 @@ class CommandRegistrationConfigGroupBTest {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandGroupBLocalSlashRegistration(dispatcher, null, null, null, null, null);
 
+        // [批 3c] 本用例只验证「handler 注册面 → 结果种类/命名路由」，不涉会话 → 以下分派一律显式
+        //   传 null（旧实现里等价于 MDC 为空）
+
         // /force-snip → result handler（[Fix-P1] type=local 迁移 registerSlashCommandResult →
         //   dispatchResult 回传 text；未注入 registry → fail-loud text，不抛）
-        UserInputDispatcher.LocalCommandResult forceSnip = dispatcher.dispatchResult("/force-snip");
+        UserInputDispatcher.LocalCommandResult forceSnip = dispatcher.dispatchResult("/force-snip", null, null);
         assertThat(forceSnip).isNotNull();
         assertThat(forceSnip.kind()).as("/force-snip text 结果回传").isEqualTo("text");
 
         // /btw <question> → 命名 handler（CC btw/btw.tsx call；未注入 LLM → 仅记录提问）
-        UserInputDispatcher.RoutingResult btw = dispatcher.dispatch("/btw what does this code do");
+        UserInputDispatcher.RoutingResult btw = dispatcher.dispatch("/btw what does this code do", null, null);
         assertThat(btw.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(btw.routedTo()).isEqualTo("btw");
 
         // /sandbox → 命名 handler（CC sandbox-toggle；未注入 SandboxManager → fail loud warn）
-        UserInputDispatcher.RoutingResult sandbox = dispatcher.dispatch("/sandbox");
+        UserInputDispatcher.RoutingResult sandbox = dispatcher.dispatch("/sandbox", null, null);
         assertThat(sandbox.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(sandbox.routedTo()).isEqualTo("sandbox");
 
         // /plugin → 命名 handler（CC plugin；未注入 InstalledPluginsManager → fail loud warn）
-        UserInputDispatcher.RoutingResult plugin = dispatcher.dispatch("/plugin");
+        UserInputDispatcher.RoutingResult plugin = dispatcher.dispatch("/plugin", null, null);
         assertThat(plugin.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(plugin.routedTo()).isEqualTo("plugin");
     }
@@ -147,8 +150,8 @@ class CommandRegistrationConfigGroupBTest {
         //   入口改为 dispatchResult）。
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandGroupBLocalSlashRegistration(dispatcher, null, null, null, null, null);
-        // registry=null → 不抛（fail loud 由 text 结果披露）
-        UserInputDispatcher.LocalCommandResult r = dispatcher.dispatchResult("/force-snip");
+        // registry=null → 不抛（fail loud 由 text 结果披露）· [批 3c] 不涉会话 → 显式 null
+        UserInputDispatcher.LocalCommandResult r = dispatcher.dispatchResult("/force-snip", null, null);
         assertThat(r).isNotNull();
         assertThat(r.kind()).isEqualTo("text");
         assertThat(r.value()).contains("SessionAgentStateRegistry 未注入");
@@ -160,7 +163,7 @@ class CommandRegistrationConfigGroupBTest {
         SandboxManager sandboxManager = new SandboxManager(true, true);
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandGroupBLocalSlashRegistration(dispatcher, null, sandboxManager, null, null, null);
-        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/sandbox");
+        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/sandbox", null, null);
         assertThat(r.routedTo()).isEqualTo("sandbox");
     }
 
@@ -170,7 +173,7 @@ class CommandRegistrationConfigGroupBTest {
         InstalledPluginsManager manager = new InstalledPluginsManager();
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandGroupBLocalSlashRegistration(dispatcher, null, null, manager, null, null);
-        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/plugin");
+        UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/plugin", null, null);
         assertThat(r.routedTo()).isEqualTo("plugin");
     }
 

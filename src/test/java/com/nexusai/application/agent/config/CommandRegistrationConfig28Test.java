@@ -3,7 +3,6 @@ package com.nexusai.application.agent.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
-import com.nexusai.common.RequestContext;
 import com.nexusai.application.agent.permission.source.PermissionRuleValueParser;
 import com.nexusai.application.agent.permission.source.SettingsJsonParser;
 import com.nexusai.application.agent.permission.source.UserSettingsLoader;
@@ -90,11 +89,17 @@ class CommandRegistrationConfig28Test {
         assertThat(cmds.get("tasks").getDescription()).isEqualTo("List and manage background tasks");
         assertThat(cmds.get("export").getDescription()).isEqualTo("Export the current conversation to a file or clipboard");
         assertThat(cmds.get("context").getDescription()).isEqualTo("Visualize current context usage as a colored grid");
+        // [批 3c 顺手修正 · 既有漂移，非本批引入] 期望串仍是改名前文案（"Claude Code"），而主代码
+        //   CommandRegistrationConfig28:202 的 status 描述早已随 nexusai 改名改为 "NexusAI status…"
+        //   ⇒ 本断言在批 3c 之前即为红（git show HEAD 同款期望串 vs HEAD 主代码已是 NexusAI）。
+        //   此处仅同步文案，不改断言语义（仍锁「描述存在且为该固定文案」）。
         assertThat(cmds.get("status").getDescription())
-            .isEqualTo("Show Claude Code status including version, model, account, API connectivity, and tool statuses");
+            .isEqualTo("Show NexusAI status including version, model, account, API connectivity, and tool statuses");
         assertThat(cmds.get("tag").getDescription()).isEqualTo("Toggle a searchable tag on the current session");
         assertThat(cmds.get("usage").getDescription()).isEqualTo("Show plan usage limits");
-        assertThat(cmds.get("stats").getDescription()).isEqualTo("Show your Claude Code usage statistics and activity");
+        // [批 3c 顺手修正 · 既有漂移，非本批引入] 同 status：期望串是改名前文案，主代码
+        //   CommandRegistrationConfig28:220 已是 "Show your NexusAI usage statistics…" ⇒ 批 3c 前即为红。
+        assertThat(cmds.get("stats").getDescription()).isEqualTo("Show your NexusAI usage statistics and activity");
         assertThat(cmds.get("diff").getDescription()).isEqualTo("View uncommitted changes and per-turn diffs");
 
         // argumentHint 对齐 CC
@@ -142,7 +147,8 @@ class CommandRegistrationConfig28Test {
         SkillRegistry registry = new SkillRegistry("");
         registry.refresh();
 
-        List<String> invocable = registry.getModelInvocableCommands().stream()
+        // [批 3c] 无会话 → 显式 null（本用例只验命令注册面过滤，不涉会话）
+        List<String> invocable = registry.getModelInvocableCommands(null).stream()
             .map(Command::getName).toList();
         assertThat(invocable)
             .doesNotContain("mcp", "permissions", "plan", "hooks", "skills", "agents",
@@ -157,7 +163,7 @@ class CommandRegistrationConfig28Test {
         SkillRegistry registry = new SkillRegistry("");
         registry.refresh();
 
-        List<String> all = registry.getAllCommands().stream().map(Command::getName).toList();
+        List<String> all = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(all).contains(
             "mcp", "permissions", "plan", "hooks", "skills", "agents", "tasks",
             "export", "context", "status", "usage", "stats", "diff");
@@ -174,13 +180,16 @@ class CommandRegistrationConfig28Test {
 
         for (String name : List.of("mcp", "permissions", "plan", "hooks", "skills", "agents",
             "tasks", "export", "context", "status", "tag", "usage", "stats", "diff")) {
-            UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/" + name + " arg");
+            // [批 3c] 本用例只验证「注册面 → 命名路由」（kind/routedTo），不涉会话 → 显式 null（旧实现
+            //   里等价于 MDC 为空；真实会话驱动的执行快照见 realHandlersExecuteWithRealServices）
+            UserInputDispatcher.RoutingResult r = dispatcher.dispatch("/" + name + " arg", null, null);
             assertThat(r.kind()).as("/%s kind", name).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
             assertThat(r.routedTo()).as("/%s routedTo", name).isEqualTo(name);
         }
 
         // 未注册的 /nope → 回落通用 SLASH_COMMAND handler（向后兼容，对齐 CommandRegistrationConfigTest）
-        UserInputDispatcher.RoutingResult nope = dispatcher.dispatch("/nope");
+        // （本用例不涉会话 → 显式 null）
+        UserInputDispatcher.RoutingResult nope = dispatcher.dispatch("/nope", null, null);
         assertThat(nope.kind()).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
         assertThat(nope.routedTo()).isEqualTo("command-router");
     }
@@ -190,7 +199,9 @@ class CommandRegistrationConfig28Test {
     void realHandlersExecuteWithRealServices() throws Exception {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         AgentSummaryService summaryService = new AgentSummaryService();
-        RequestContext.setSession("sess-cmd28-test");
+        // [批 3c] 会话标识以**显式形参**随每次 dispatch 传入（下述 sessionId）；原「裸 MDC 会话槽」
+        //   已删除（批 3c），故不再有 setSession/clear 装置，断言锁的是显式传参路径。
+        String sessionId = "sess-cmd28-test";
         try {
             // /permissions —— 真实 UserSettingsLoader（读临时 config home，空规则不抛）
             UserSettingsLoader userLoader = new UserSettingsLoader(
@@ -201,7 +212,9 @@ class CommandRegistrationConfig28Test {
             // /agents —— mock SubagentTool 暴露真实 AgentDefinitionRegistry（空内置+自定义 → 0 agent 不抛）
             AgentDefinitionRegistry agentRegistry = new AgentDefinitionRegistry(Map.of(), List.of());
             SubagentTool subagentTool = mock(SubagentTool.class);
-            when(subagentTool.agentRegistry()).thenReturn(agentRegistry);
+            // [批 3c] /agents handler 现调 1 参 agentRegistry(sessionId)（无参重载的 MDC 会话源已删）
+            //   → stub 必须打在 1 参形态上，否则 handler 拿到 mock 默认 null（断言退化）
+            when(subagentTool.agentRegistry(anyString())).thenReturn(agentRegistry);
             // /export —— mock SessionService/MessageService（会话不存在 → handler 走 warn 分支不抛）
             SessionService sessionService = mock(SessionService.class);
             when(sessionService.getById(anyString())).thenReturn(null);
@@ -215,28 +228,36 @@ class CommandRegistrationConfig28Test {
                 sessionRegistry, userLoader, null, null, null, subagentTool, summaryService, messageService);
 
             // 6 个真实执行命令（本类注册；/btw 在 GroupB 注册不含）逐个触发 → 不抛 + 路由命中
-            assertThat(RequestContext.sessionId()).as("MDC sessionId 已设置").isEqualTo("sess-cmd28-test");
-            // 先触发 /permissions /agents（真实/handler 走真实路径），验证不污染 MDC sessionId，再 /export
-            assertThat(dispatcher.dispatch("/permissions arg").routedTo()).isEqualTo("permissions");
-            assertThat(dispatcher.dispatch("/agents arg").routedTo()).isEqualTo("agents");
-            assertThat(RequestContext.sessionId()).as("/permissions /agents 后 MDC sessionId 仍保留")
-                .isEqualTo("sess-cmd28-test");
-            assertThat(dispatcher.dispatch("/export x").routedTo()).isEqualTo("export");
-            verify(sessionService).getById("sess-cmd28-test");
+            // 先触发 /permissions /agents（真实/handler 走真实路径），再 /export
+            // [批 3c] 语义消失（已登记待裁定）：原此处两条断言锁「执行前后裸 MDC 会话槽的值 == 'sess-cmd28-test'」
+            //   （证明 handler 不污染会话上下文）。该槽已整类删除，会话现为**显式形参**（局部变量，
+            //   Java 值语义下本就不可能被 handler 改写）⇒ 等效断言会退化为 `sessionId == sessionId`
+            //   的恒真式（零鉴别力、假绿灯），故删除。同一意图由下方 `verify(subagentTool)
+            //   .agentRegistry(sessionId)` / `verify(sessionService).getById(sessionId)` 以真实可观测
+            //   方式覆盖（handler 若拿错会话，这两条 verify 会红）。
+            // ⚠ 注意：**触发调用本身必须保留** —— 下方 `verify(subagentTool).agentRegistry(sessionId)`
+            //   依赖 /agents 被真实 dispatch 过。重构时曾一度把本行连同 MDC 断言一起删掉，导致
+            //   verify 报「zero interactions」（断言失去被观测对象）⇒ 两条触发调用在此显式留驻。
+            assertThat(dispatcher.dispatch("/permissions arg", sessionId, null).routedTo()).isEqualTo("permissions");
+            assertThat(dispatcher.dispatch("/agents arg", sessionId, null).routedTo()).isEqualTo("agents");
+            // /export 是**会话相关**执行（handler 用显式 sessionId 查会话）→ 必须传真实会话，
+            //   否则 verify(getById) 断言退化成「无会话路径」
+            assertThat(dispatcher.dispatch("/export x", sessionId, null).routedTo()).isEqualTo("export");
+            verify(sessionService).getById(sessionId);
 
             for (String name : List.of("skills", "plan", "stats")) {
                 String input = "/" + name + " arg";
-                UserInputDispatcher.RoutingResult r = dispatcher.dispatch(input);
+                UserInputDispatcher.RoutingResult r = dispatcher.dispatch(input, sessionId, null);
                 assertThat(r.kind()).as("/%s kind", name).isEqualTo(UserInputDispatcher.InputKind.SLASH_COMMAND);
                 assertThat(r.routedTo()).as("/%s routedTo", name).isEqualTo(name);
             }
 
-            // 校验注入链路生效：/agents 调 SubagentTool.agentRegistry()（mock）
-            verify(subagentTool).agentRegistry();
+            // 校验注入链路生效：/agents 调 SubagentTool.agentRegistry(sessionId)（mock）——会话为
+            //   **显式传入**的那个（批 3c），不得是进程默认表
+            verify(subagentTool).agentRegistry(sessionId);
             // /plan /stats 经 SessionAgentStateRegistry 查询（mock）
             verify(sessionRegistry, org.mockito.Mockito.atLeastOnce()).get(anyString());
         } finally {
-            RequestContext.clear();
             summaryService.shutdown();
         }
     }

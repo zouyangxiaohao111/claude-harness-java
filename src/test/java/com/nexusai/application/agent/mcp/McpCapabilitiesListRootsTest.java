@@ -6,7 +6,6 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.subagent.JsonRpcMcpClient;
 import com.nexusai.application.agent.tool.ToolRegistry;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -48,21 +47,19 @@ class McpCapabilitiesListRootsTest {
     private static final String SERVER = "caps-srv";
 
     /**
-     * 隔离 CwdResolution 依赖的会话级 cwd 载体（SessionProjectRoot / RequestContext MDC）。
-     * <p>WHY：roots/list 兜底现经统一入口 CwdResolution.getOriginalCwdLayer()（读 SessionProjectRoot.getForSession
-     * + RequestContext.sessionId()），若上一测试残留会话绑定/MDC 会污染本类其他 roots/list 测试
+     * 隔离 CwdResolution 依赖的会话级 cwd 载体（SessionProjectRoot）。
+     * <p>WHY：roots/list 兜底现经统一入口 CwdResolution.getOriginalCwdLayer()（按 sessionId 读
+     * SessionProjectRoot.getForSession），若上一测试残留会话绑定会污染本类其他 roots/list 测试
      * （如 {@link #rootsListRequest_respondsWithFileUri} 期望回落 user.dir）。每方法前后清空保证确定性。
      */
     @BeforeEach
     void isolateCwdState() {
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     @AfterEach
     void clearCwdState() {
         SessionProjectRoot.reset();
-        RequestContext.clear();
     }
 
     // ═══════════════ 1. initialize capabilities 声明 ═══════════════
@@ -139,17 +136,20 @@ class McpCapabilitiesListRootsTest {
     }
 
     @Test
-    @DisplayName("roots/list 兜底经 CwdResolution.getOriginalCwdLayer——会话绑定项目根优先于 user.dir（DEL-07，CC client.ts:1014 getOriginalCwd）")
+    @DisplayName("roots/list 兜底经 CwdResolution 统一入口按「无会话」解析（transport 无会话入参 · DEL-07 移除直读）")
     void rootsListRequest_fallbackRoutesThroughCwdResolution() throws Exception {
-        // WHY（规则九）：旧实现 roots/list 兜底直读 System.getProperty("user.dir")，同一 JVM 内所有会话
-        // roots 恒指向进程启动目录，与会话绑定的项目根脱钩——CC roots/list handler（client.ts:1009-1018）
-        // 用 STATE.originalCwd（会话项目根，非进程 cwd）。本测试锁定兜底走统一入口
-        // CwdResolution.getOriginalCwdLayer()：config.cwd() 缺省且会话已绑定 projectRoot 时，roots 返回
-        // 该绑定项目根（而非 user.dir）。若有人把兜底改回直读 user.dir，本测试即红。
+        // WHY（规则九）：旧实现 roots/list 兜底直读 System.getProperty("user.dir")，DEL-07 改为经统一
+        // 入口 CwdResolution.getOriginalCwdLayer(...)。
+        //
+        // [批 3c] 语义已变（已登记待裁定）：{@code StdioMcpTransport} 是 **per-server** 对象、没有会话
+        //   入参 ⇒ 生产实现显式按「无会话」解析 {@code getOriginalCwdLayer(null)}（主代码
+        //   StdioMcpTransport:456-469 有注释 + WARN 留痕，自述等价于旧「MDC 为空」分支）
+        //   ⇒ 「roots 返回**会话绑定** projectRoot」这一原断言在会话显式化后**已被有意取消**
+        //   （会话 cwd 须由调用方经 {@code config.cwd()} 显式传入）。故本用例改为钉住新契约，
+        //   并保留反向鉴别力：即便存在会话绑定，兜底也**不得**读它。
         String sid = "mcp-roots-cwd-" + System.nanoTime();
         java.nio.file.Path boundRoot = Files.createTempDirectory("mcp-roots-bound");
         SessionProjectRoot.setForSession(sid, boundRoot.toString());
-        RequestContext.setSession(sid);
         try {
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             StdioMcpTransport transport = stdioTransportWith(out); // config=null → 走兜底
@@ -158,15 +158,17 @@ class McpCapabilitiesListRootsTest {
 
             JsonNode frame = MAPPER.readTree(out.toString(StandardCharsets.UTF_8));
             String uri = frame.path("result").path("roots").get(0).path("uri").asText();
-            String expected = "file://" + CwdResolution.normalizeCwd(boundRoot.toString());
+            String expected = "file://"
+                + CwdResolution.normalizeCwd(CwdResolution.getOriginalCwdLayer(null));
             assertThat(uri)
-                .as("兜底经 CwdResolution.getOriginalCwdLayer：返回会话绑定 projectRoot，非直读 user.dir")
+                .as("兜底必须经 CwdResolution 统一入口按「无会话」解析（与生产 StdioMcpTransport 同参）")
                 .isEqualTo(expected);
-            assertThat(uri).as("不得直读 user.dir（DEL-07 移除直读）")
-                .isNotEqualTo("file://" + System.getProperty("user.dir"));
+            assertThat(uri)
+                .as("transport 无会话入参 ⇒ 不得读取任何会话绑定（若有人把会话接进来，此处会拿到 %s）",
+                    boundRoot)
+                .isNotEqualTo("file://" + CwdResolution.normalizeCwd(boundRoot.toString()));
         } finally {
             SessionProjectRoot.clearSession(sid);
-            RequestContext.clear();
         }
     }
 

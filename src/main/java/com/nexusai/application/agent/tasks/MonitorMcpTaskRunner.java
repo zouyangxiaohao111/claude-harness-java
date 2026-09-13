@@ -366,7 +366,7 @@ public class MonitorMcpTaskRunner {
      * （Bash/PS/monitor/agent/remote_agent）共用唯一 diskOutput 根（diskOutput.ts:50-55），
      * monitor_mcp 旧独立 flat 根 {@code {tmpdir}/nexusai-tasks}（无 per-session 层）为 Java 自创
      * 偏离，已收敛。sessionId 现为**显式入参**（批 3b-D7 · 用户裁定「一律显式传参」）；
-     * 旧三源（{@code RequestContext.sessionId()}（MDC）→ {@code nexusai.sessionId} sysprop →
+     * 旧三源（裸 MDC 的 {@code sessionId()}（MDC）→ {@code nexusai.sessionId} sysprop →
      * {@code "unknown"}）已随 {@code BackgroundTaskRunner.resolveSessionId()} 一并删除。
      * 父目录由 {@link #appendLine} 写前 createDirectories（对齐 CC ensureOutputDir，
      * diskOutput.ts:65-67 mkdir recursive）。

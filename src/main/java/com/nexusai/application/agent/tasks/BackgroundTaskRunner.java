@@ -568,7 +568,7 @@ public class BackgroundTaskRunner {
      * 旧 A-7 简化根 {@code {tmpdir}/nexusai-sessions} 已删除（无兼容层/双轨）。
      *
      * <p><b>[批 3b-D7] 会话态显式入参（用户裁定）</b>：本方法此前经 {@code resolveSessionId()}
-     * 读 {@code RequestContext.sessionId()}（MDC）→ sysprop → {@code "unknown"}。三源全部删除：
+     * 读 裸 MDC 的 {@code sessionId()}（MDC）→ sysprop → {@code "unknown"}。三源全部删除：
      * <ul>
      *   <li>MDC 是 ThreadLocal —— 本方法的调用点分布在 tool-exec 池线程 / {@code bg-task-worker}
      *       后台线程 / 轮询定时器线程，派生线程上恒 null（或残留别会话 id），CC

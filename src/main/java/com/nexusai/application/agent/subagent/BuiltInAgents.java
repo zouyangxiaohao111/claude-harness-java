@@ -4,7 +4,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
-import com.nexusai.common.RequestContext;
 
 import java.util.List;
 
@@ -448,8 +447,17 @@ public class BuiltInAgents {
         // env 详情：收敛为单实现 SubagentEnvInfo.computeEnvInfo（对齐 CC prompts.ts:606-649），
         //   无第二处 env 渲染（RES-SP18 收敛 OPD-SP-18）。modelId + dirs 显式传参（R2-ENVINFO/R32-04 去静态槽 + 接线）。
         sb.append(AGENT_NOTES);
-        // cwd-align-extended 方案2：sessionId 显式传参（对齐 CC getCwd() prompts.ts:642；无会话回落 user.dir 零变化）
-        sb.append("\n\n").append(SubagentEnvInfo.computeEnvInfo(RequestContext.sessionId(), modelId, additionalWorkingDirectories));
+        // cwd-align-extended 方案2：sessionId 显式传参（对齐 CC getCwd() prompts.ts:642；无会话回落 user.dir）。
+        // [批 3c] 显式传 null = 本调用链**无会话来源**：systemPromptFn 的类型是
+        //   AgentDefinition 的 {@code BiFunction<String,List<String>,String>}（modelId, dirs）——
+        //   无 sessionId 通道；本类为静态内置 agent 定义（无实例会话字段）。原实现经裸 MDC 会话槽取会话
+        //   cwd（子代理线程曾回放 MDC）→ 现显式 null，CwdResolution 回落 user.dir。
+        //   需同步改的消费点（均不在本批清单）：AgentDefinition.systemPromptFn 需扩为三参
+        //   （modelId, dirs, sessionId），消费点 AgentDefinition.java:116
+        //   （{@code systemPromptFn.apply(modelId, additionalWorkingDirectories)}）的调用方
+        //   tool/impl/SubagentExecutor.java（:1576/:3223 附近，持有子代理 ctx.sessionId()）需同步穿透；
+        //   届时本处恢复 computeEnvInfo(sessionId, modelId, dirs) 的会话 cwd 语义。
+        sb.append("\n\n").append(SubagentEnvInfo.computeEnvInfo(null, modelId, additionalWorkingDirectories));
         if (log.isDebugEnabled()) {
             log.debug("[BuiltInAgents] assembleAgentSystemPrompt 渲染 env 块: withDefaultPrefix={} modelId={} additionalWorkingDirectories={}",
                 basePrompt != null, modelId, additionalWorkingDirectories);

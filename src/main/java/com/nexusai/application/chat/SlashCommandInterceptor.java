@@ -138,9 +138,11 @@ public class SlashCommandInterceptor {
         }
 
         // ── 2) findCommand（isMcp → 含 MCP thread-in 搜索基座；否则纯本地三维匹配）──
+        //   [批 3c] 会话标识显式取自本方法形参 sessionId——命令搜索基座随会话绑定项目变化
+        //   （决定项目级技能/命令是否可达）。原经裸 MDC 会话槽读取（Tomcat 线程可能残留别会话 id），已删。
         Command command = parsed.isMcp()
-            ? skillRegistry.findCommandIncludingMcp(commandName)
-            : skillRegistry.findCommand(commandName);
+            ? skillRegistry.findCommandIncludingMcp(commandName, sessionId)
+            : skillRegistry.findCommand(commandName, sessionId);
 
         // ── 3) 未知命令（!hasCommand）──
         if (command == null) {
@@ -151,7 +153,7 @@ public class SlashCommandInterceptor {
             if (userInputDispatcher != null && userInputDispatcher.hasSlashCommandHandler(commandName)) {
                 // dispatchResult 内部：result handler 优先 → void handler 执行（副作用，结果不可得 → skip）。
                 // web 无可渲染 UI，返回「已执行」提示消息（shouldQuery=false，不起 LLM turn）。
-                userInputDispatcher.dispatchResult(rawContent);
+                userInputDispatcher.dispatchResult(rawContent, sessionId, userMessageId);
                 String doneMessage = "Command /" + commandName + " executed.";
                 log.info("[slash] UserInputDispatcher 命名 handler 本地执行: cmd={} → '{}'（shouldQuery=false，对齐 CC local 命令）",
                     commandName, doneMessage);
@@ -210,7 +212,7 @@ public class SlashCommandInterceptor {
                 return new SlashResolution(true, true, skillContent, null, command, skillContent, null);
             }
             case "local": {
-                UserInputDispatcher.LocalCommandResult lr = userInputDispatcher.dispatchResult(rawContent);
+                UserInputDispatcher.LocalCommandResult lr = userInputDispatcher.dispatchResult(rawContent, sessionId, userMessageId);
                 if (lr == null) {
                     log.warn("[slash] local 命令无已注册执行 handler: cmd={}（fail loud，对齐 CC "
                         + "mod.call 缺失语义降级）", commandName);

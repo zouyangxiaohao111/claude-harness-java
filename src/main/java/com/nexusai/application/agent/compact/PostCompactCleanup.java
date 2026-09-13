@@ -7,7 +7,6 @@ import com.nexusai.application.agent.loop.ContextCollapse;
 import com.nexusai.application.agent.permission.ClassifierApprovals;
 import com.nexusai.application.agent.permission.classifier.SpeculativeClassifier;
 import com.nexusai.application.agent.prompt.SystemPromptInjection;
-import com.nexusai.common.RequestContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -52,7 +51,7 @@ import java.util.UUID;
  * <p>CC 的 {@code runPostCompactCleanup} 是模块级函数，直接调用各模块的清理函数。
  * Java 端对应状态宿主为：
  * <ul>
- *   <li>{@link MicroCompactor#resetMicrocompactState()} —— 静态（module 态 pendingCacheEdits）</li>
+ *   <li>{@link MicroCompactor#resetMicrocompactState(String)} —— 静态（会话桶 pendingCacheEdits）</li>
  *   <li>{@link ContextCollapse#resetContextCollapse()} —— CONTEXT_COLLAPSE feature 门控 + main-thread gate</li>
  *   <li>{@link ClassifierApprovals#clearClassifierApprovals()} —— 静态</li>
  *   <li>{@link ClaudemdEngine} —— Spring bean（FIX-CL 接线，{@code STATIC_CLAUDE_MD}）</li>
@@ -158,7 +157,22 @@ public class PostCompactCleanup {
      * 现按 CC 无参调用语义修复。
      */
     public static void runPostCompactCleanup() {
-        runPostCompactCleanup(null);
+        runPostCompactCleanup(null, null);
+    }
+
+    /**
+     * 有源入口（无会话形参）· 等价 {@code runPostCompactCleanup(querySource, null)}。
+     *
+     * <p><b>⚠ 调用方待接线</b>：本入口不携带会话标识 ⇒ 第 4 项 {@code clearSystemPromptSections}
+     * 会 WARN 跳过（无法定位会话级 AgentState）。调用方（{@code CompactCommand} /
+     * {@code AutoCompactor} / {@code CommandController}）应改用
+     * {@link #runPostCompactCleanup(String, String)} 显式传入会话；本批（3c）内
+     * {@code PartialCompactService} 已切换为显式会话。
+     *
+     * @param querySource 压缩 query 的来源（见 {@link #runPostCompactCleanup(String, String)}）
+     */
+    public static void runPostCompactCleanup(String querySource) {
+        runPostCompactCleanup(querySource, null);
     }
 
     /**
@@ -179,14 +193,19 @@ public class PostCompactCleanup {
      *
      * @param querySource 压缩 query 的来源（/compact 等传 "compact"；主循环传 "repl_main_thread:…"；
      *                    subagent 传 "agent:…"；null = 无源视为 main-thread，对齐 CC undefined 语义）
+     * @param sessionId   显式会话标识（[批 3c] 供第 4 项 clearSystemPromptSections 定位会话级
+     *                    AgentState；原由裸 MDC 会话槽承载。null/空白 ⇒ 该项 WARN 跳过，见
+     *                    {@link #clearActiveSessionSystemPromptSections(String)}）
      */
-    public static void runPostCompactCleanup(String querySource) {
+    public static void runPostCompactCleanup(String querySource, String sessionId) {
         boolean isMainThread = isMainThreadCompact(querySource);
         log.info("[PostCompactCleanup] runPostCompactCleanup: querySource={} isMainThreadCompact={} · CC postCompactCleanup.ts:31-77",
             querySource, isMainThread);
 
         // 1. resetMicrocompactState（:41）—— 无条件
-        MicroCompactor.resetMicrocompactState();
+        //    [批 3c] 会话键 = 本方法显式形参 sessionId（只复位该会话桶；null/空白 → MicroCompactor
+        //    侧一次性 WARN 回落默认桶，见 MicroCompactor.currentSessionState）。
+        MicroCompactor.resetMicrocompactState(sessionId);
 
         // 2. CONTEXT_COLLAPSE feature && main-thread → resetContextCollapse（:42-49）
         ContextCollapse cc = STATIC_COLLAPSE;
@@ -214,8 +233,9 @@ public class PostCompactCleanup {
             }
         }
 
-        // 4. clearSystemPromptSections（:62）—— [IMP-SP-07] 真实失效接线：清当前会话 section 缓存
-        clearActiveSessionSystemPromptSections();
+        // 4. clearSystemPromptSections（:62）—— [IMP-SP-07] 真实失效接线：清本会话 section 缓存
+        //    [批 3c] 会话标识由**显式形参**传入（原读裸 MDC 的会话槽；载体已随本批删除）。
+        clearActiveSessionSystemPromptSections(sessionId);
         // 5. clearClassifierApprovals（:63）—— 审批只对当前会话有效，compact 后失效
         ClassifierApprovals.clearClassifierApprovals();
         log.info("[PostCompactCleanup] clearClassifierApprovals: 分类器审批缓存已清空 · CC postCompactCleanup.ts:63");
@@ -253,11 +273,17 @@ public class PostCompactCleanup {
      * [IMP-SP-07] clearSystemPromptSections 失效接线 · 对齐 CC {@code clearSystemPromptSections}
      * （postCompactCleanup.ts:62 → systemPromptSections.ts:65-68）。
      *
-     * <p>经 {@link RequestContext#sessionId()}（MDC）解析当前会话 UUID → {@link SessionAgentStateRegistry#get}
+     * <p>经**显式会话形参** {@code sessionId} → {@link SessionAgentStateRegistry#get}
      * → {@link AgentState#systemPromptSectionCache()#clear()}。会话缺失 / 解析失败 / 无活跃状态 → warn 显式登记
      * （不静默跳过）；registry 未接线（无 @Component bean 的测试场景）→ debug skip。
+     *
+     * <p>[批 3c] 会话标识由调用方显式传入（原读裸 MDC 的会话槽 —— 该槽的第三态会读到上一请求残留的
+     * <b>别的会话</b> id ⇒ 清掉别的会话的 section 缓存）。无来源时必须 ≥WARN（禁只 DEBUG）。
+     *
+     * @param sessionId 显式会话标识（{@link #runPostCompactCleanup(String, String)} 透传）；
+     *                  null/空白 ⇒ WARN 跳过本项（其余清理项照常执行）
      */
-    private static void clearActiveSessionSystemPromptSections() {
+    private static void clearActiveSessionSystemPromptSections(String sessionId) {
         SessionAgentStateRegistry registry = STATIC_SESSION_REGISTRY;
         if (registry == null) {
             if (log.isDebugEnabled()) {
@@ -265,20 +291,21 @@ public class PostCompactCleanup {
             }
             return;
         }
-        String sessionIdStr = RequestContext.sessionId();
-        if (sessionIdStr == null) {
-            log.warn("[PostCompactCleanup] clearSystemPromptSections 跳过：MDC 无 sessionId，无法定位会话级 section 缓存 · CC postCompactCleanup.ts:62");
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[PostCompactCleanup] clearSystemPromptSections 跳过：调用方未传会话标识"
+                + "（无参 runPostCompactCleanup() 入口，无会话来源）→ 无法定位会话级 section 缓存 · "
+                + "CC postCompactCleanup.ts:62；调用方应改用 runPostCompactCleanup(querySource, sessionId)");
             return;
         }
-        // [session-id-short] MDC sessionId 已 short 直键 registry（UUID.fromString 硬边界删除）
-        AgentState state = registry.get(sessionIdStr);
+        // [session-id-short] sessionId 已 short 直键 registry（UUID.fromString 硬边界删除）
+        AgentState state = registry.get(sessionId);
         if (state == null) {
-            log.warn("[PostCompactCleanup] clearSystemPromptSections 跳过：会话 {} 无活跃 AgentState（注册表未注册？）", sessionIdStr);
+            log.warn("[PostCompactCleanup] clearSystemPromptSections 跳过：会话 {} 无活跃 AgentState（注册表未注册？）", sessionId);
             return;
         }
         state.systemPromptSectionCache().clear();
         log.info("[PostCompactCleanup] clearSystemPromptSections: 会话 {} 的 system prompt section 缓存已清空 · CC postCompactCleanup.ts:62",
-            sessionIdStr);
+            sessionId);
     }
 
     /**

@@ -125,6 +125,12 @@ public final class AgentsHandler {
      * <p>WHY（探查 GAP-1/M-1）：Java 侧各组件上游存在但 agentsHandler 入口 0 生产调用方 → 端点
      * 缺失使 `claude agents` 等价命令后端不可达。本端点补上生产入口。
      *
+     * <p><b>[批 3c 未决项] 无会话来源</b>：本 {@code @GetMapping} 无 sessionId 查询参数
+     * （同类 {@link #list(String)} 有 {@code @RequestParam(required=false) String sessionId}）→
+     * {@link SubagentTool#listAgents()} 只能给<b>进程默认</b>（workspaceDir）agent-defs。原会话源
+     * （裸 MDC）已按批 3c 删除。待决策：给本端点补可选 {@code sessionId} 查询参数并改调
+     * {@link SubagentTool#listAgents(String)}（对齐 {@link #list(String)} 手法）。
+     *
      * @return 对齐 CC agents.ts 文本（"{count} active agents\n\n{lines}" / "No agents found."）
      */
     @GetMapping
@@ -133,6 +139,7 @@ public final class AgentsHandler {
             log.warn("[AgentsHandler] SubagentTool 未注入，agents 端点返回空（plain JUnit 无 Spring 容器）");
             return "No agents found.";
         }
+        // [批 3c 未决项] 本端点无 sessionId 形参 → 进程默认视图（禁发明会话 id；见方法 javadoc）
         List<AgentDefinition> allAgents = subagentTool.listAgents();
         if (allAgents == null || allAgents.isEmpty()) {
             return "No agents found.";
@@ -175,7 +182,7 @@ public final class AgentsHandler {
      * <p><b>跳过 deny 过滤</b>（对齐 CC：用户侧 agent 选择器不过滤，区别于 Agent tool 的
      * filterDeniedAgents）——直接返回 registry 全量 active winners。
      *
-     * @param sessionId 会话 ID（可选 · null → 当前会话/MDC 兜底）
+     * @param sessionId 会话 ID（可选 · null → 进程默认 workspaceDir 视图兜底；批 3c 已删裸 MDC 槽）
      * @return agent 列表（AgentListItemDto 记录，camelCase 字段 Spring 序列化 OK）
      */
     @GetMapping("/list")

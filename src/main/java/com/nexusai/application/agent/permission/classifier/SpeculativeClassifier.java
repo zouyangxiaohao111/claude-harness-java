@@ -9,7 +9,6 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.tool.AbortController;
-import com.nexusai.common.RequestContext;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -159,6 +158,13 @@ public final class SpeculativeClassifier {
      *       → {@code return true}（:1513-1526）</li>
      * </ol>
      *
+     * <p><b>[批 3c] sessionId 为首个显式形参</b>（非 CC 原有参数，CC 的 4 参 = command /
+     * toolPermissionContext / signal / isNonInteractiveSession 依次后移）：原实现经裸 MDC 会话槽取
+     * 会话 cwd，现由调用点显式传入（生产 = {@code ToolUseContext.sessionId()}，同
+     * {@code SubagentEnvInfo.computeEnvInfo(String sessionId, ...)} 的会话显式化先例）。
+     *
+     * @param sessionId               会话 ID（显式会话来源；null = 无会话 →
+     *                                {@link #getCwd(String)} 回落 user.dir）
      * @param command                 bash 命令（Map key）· CC original: {@code command}
      * @param toolPermissionContext   权限上下文 · CC original: {@code toolPermissionContext}
      * @param signal                  取消信号（Java 等价 AbortController，可 null）· CC original: {@code signal}（AbortSignal）
@@ -166,6 +172,7 @@ public final class SpeculativeClassifier {
      * @return {@code true} 投机已启动并存入 Map；{@code false} 任一 guard 拦截
      */
     public static boolean startSpeculativeClassifierCheck(
+            String sessionId,
             String command,
             ToolPermissionContext toolPermissionContext,
             AbortController signal,
@@ -202,9 +209,10 @@ public final class SpeculativeClassifier {
             }
             return false;
         }
-        // cwd 经 RequestContext.sessionId() 解析会话当前 cwd（对齐 CC bashPermissions.ts:1513 getCwd()，
-        //     Java CwdResolution.getCwd 含 override ?? sessionCwd ?? boundProject ?? user.dir 兜底链）
-        String cwd = getCwd(RequestContext.sessionId());
+        // cwd 由调用点显式传入的 sessionId 解析（对齐 CC bashPermissions.ts:1513 getCwd()；
+        //     Java CwdResolution.getCwd 含 override ?? sessionCwd ?? boundProject ?? user.dir 兜底链）。
+        //     [批 3c] 原读点 = 裸 MDC 会话槽（派生线程回放），已改为形参 sessionId 显式来源。
+        String cwd = getCwd(sessionId);
         CompletableFuture<SpeculativeClassifierResult> promise = classifyBashCommand(
             command, cwd, allowDescriptions, "allow", signal, isNonInteractiveSession);
         // 防 unhandled rejection: 等价 CC promise.catch(() => {}) (bashPermissions.ts:1522-1524)

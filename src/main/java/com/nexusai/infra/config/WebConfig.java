@@ -2,7 +2,6 @@ package com.nexusai.infra.config;
 
 import com.nexusai.infra.filter.ApiAccessLogInterceptor;
 import com.nexusai.infra.filter.CacheRequestBodyFilter;
-import com.nexusai.infra.filter.RequestContextCleanupFilter;
 import jakarta.servlet.Filter;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -53,24 +52,6 @@ public class WebConfig implements WebMvcConfigurer {
     @Bean
     public FilterRegistrationBean<CacheRequestBodyFilter> requestBodyCacheFilter() {
         return createFilterBean(new CacheRequestBodyFilter(), Integer.MIN_VALUE + 500);
-    }
-
-    /**
-     * [TL-W3] 入站 MDC 统一清理 Filter（最外层）· 修「Tomcat 线程复用跨会话残留」。
-     *
-     * <p><b>WHY</b>：全仓无任何 Filter/Interceptor 清 {@link com.nexusai.common.RequestContext}，
-     * 4 个 REST 入口只 {@code setSession} 不 {@code clear}（TeamController/TaskController/
-     * MemoryController×2）⇒ 线程归还池后 {@code sessionId} 残留，下游按「query 缺参 → MDC 兜底」
-     * 读取就会静默串到上一会话（team 名册 / 任务清单 / 记忆文件列表 / hook 载荷的
-     * session_id+cwd+transcript_path）。本 Filter 放最外层（{@code Integer.MIN_VALUE}），
-     * 其 {@code finally} 在全部 Filter/Interceptor 之后执行 ⇒ 请求边界单点清理，不依赖控制器自觉。
-     *
-     * <p><b>与 {@code MemoryController:143} / {@code TaskController:145} / {@code TeamController:95}
-     * 等漏 clear 点的关系</b>：本 Filter 是兜底保证；各控制器内既有成对 clear 保留（提前释放）。
-     */
-    @Bean
-    public FilterRegistrationBean<RequestContextCleanupFilter> requestContextCleanupFilter() {
-        return createFilterBean(new RequestContextCleanupFilter(), Integer.MIN_VALUE);
     }
 
     public static <T extends Filter> FilterRegistrationBean<T> createFilterBean(T filter, Integer order) {

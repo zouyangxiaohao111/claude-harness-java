@@ -67,8 +67,10 @@ class SkillRegistrySlashCommandToolSkillsTest {
             this.cmds = cmds;
         }
 
+        // [批 3c] 基类 getAllCommands 新增显式 sessionId 形参 → 子类覆写同步；本夹具恒返固定集合，
+        //   与调用方会话无关，故忽略 sessionId（不改 @Override 语义）
         @Override
-        public List<Command> getAllCommands() {
+        public List<Command> getAllCommands(String sessionId) {
             return cmds;
         }
     }
@@ -83,8 +85,9 @@ class SkillRegistrySlashCommandToolSkillsTest {
             super(".claude/skills");
         }
 
+        // [批 3c] 基类 getAllCommands 新增显式 sessionId 形参 → 子类覆写同步（抛错语义不变）
         @Override
-        public List<Command> getAllCommands() {
+        public List<Command> getAllCommands(String sessionId) {
             throw new RuntimeException("模拟技能加载失败 (getAllCommands isCommandEnabled 门控抛错)");
         }
     }
@@ -100,7 +103,8 @@ class SkillRegistrySlashCommandToolSkillsTest {
         writeSkill(tempDir, "user-desc", "user-desc", "description: 显式描述");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null（本类各用例只验过滤/清单内容，不涉会话）
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .contains("user-desc");
     }
@@ -111,7 +115,8 @@ class SkillRegistrySlashCommandToolSkillsTest {
         writeSkill(tempDir, "user-when", "user-when", "when_to_use: 当用户请求该能力时使用");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .contains("user-when");
     }
@@ -122,7 +127,8 @@ class SkillRegistrySlashCommandToolSkillsTest {
         writeSkill(tempDir, "user-nodesc", "user-nodesc", null);
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .doesNotContain("user-nodesc");
     }
@@ -138,7 +144,8 @@ class SkillRegistrySlashCommandToolSkillsTest {
         // P2-9 后 MCP 通道不再并入 getAllCommands；PLUGIN 命令经 FixtureRegistry 直接进命令集合
         SkillRegistry registry = new FixtureRegistry(List.of(plugin));
 
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .contains("plugin-when");
     }
@@ -153,7 +160,8 @@ class SkillRegistrySlashCommandToolSkillsTest {
         bundled.setLoadedFrom(CommandLoadedFrom.BUNDLED); // P2-21: 独立 loadedFrom 字段判别（CC :595-597）
         SkillRegistry registry = new FixtureRegistry(List.of(bundled));
 
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .contains("bundled-skill");
     }
@@ -169,11 +177,12 @@ class SkillRegistrySlashCommandToolSkillsTest {
         SkillRegistry registry = new FixtureRegistry(List.of(builtin));
 
         // 先证 builtin-cmd 确实在命令集合（过滤输入真实存在，避免 doesNotContain '看起来绿'失去意图）
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .contains("builtin-cmd");
         // 若仅按 whenToUse/disableModelInvocation 过滤会入选；source==BUILTIN 强制排除
-        assertThat(registry.getSlashCommandToolSkills())
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .doesNotContain("builtin-cmd");
     }
@@ -198,22 +207,24 @@ class SkillRegistrySlashCommandToolSkillsTest {
         injectMcpCommand(registry, mcpDisabled);
 
         // 部分 A：USER disableModelInvocation 技能入选斜杠命令技能（CC :598）
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null（下述各断言同理）
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .contains("user-only");
         // 部分 A：被 getModelInvocableCommands 排除（CC :569）
-        assertThat(registry.getModelInvocableCommands())
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .doesNotContain("user-only");
         // 部分 B：MCP 源分离后排除（getAllCommands 不含 MCP，第二套过滤无 MCP 可滤）
-        assertThat(registry.getSlashCommandToolSkills())
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .doesNotContain("mcp-user-only");
-        assertThat(registry.getModelInvocableCommands())
+        assertThat(registry.getModelInvocableCommands(null))
             .extracting(Command::getName)
             .doesNotContain("mcp-user-only");
         // 部分 B：getAllCommands 分离实证 —— MCP 命令不入本地聚合
-        assertThat(registry.getAllCommands())
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getAllCommands(null))
             .extracting(Command::getName)
             .doesNotContain("mcp-user-only");
     }
@@ -224,19 +235,20 @@ class SkillRegistrySlashCommandToolSkillsTest {
         writeSkill(tempDir, "skill-a", "skill-a", "when_to_use: 场景A");
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
 
-        List<Command> first = registry.getSlashCommandToolSkills();
+        // [批 3c] 无会话 → 显式 null
+        List<Command> first = registry.getSlashCommandToolSkills(null);
         assertThat(first).extracting(Command::getName).contains("skill-a");
         // 独立 memoize：同一次过滤结果实例
-        assertThat(registry.getSlashCommandToolSkills()).isSameAs(first);
+        assertThat(registry.getSlashCommandToolSkills(null)).isSameAs(first);
 
         // 追加带 whenToUse 的 skill-b：refresh() 前不可见、后可见（对齐 CC :586 memoize + 显式 clear）
         writeSkill(tempDir, "skill-b", "skill-b", "when_to_use: 场景B");
-        assertThat(registry.getSlashCommandToolSkills())
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .doesNotContain("skill-b");
 
         registry.refresh();
-        assertThat(registry.getSlashCommandToolSkills())
+        assertThat(registry.getSlashCommandToolSkills(null))
             .extracting(Command::getName)
             .contains("skill-b");
     }
@@ -254,9 +266,10 @@ class SkillRegistrySlashCommandToolSkillsTest {
 
         // 改造前（RED 基线）：异常经 getAllCommands 传播 → 本行抛 RuntimeException → 用例 FAIL；
         // 改造后：try-catch 捕获 → log.warn + 缓存 [] + 返回空列表 → 用例 GREEN。
-        assertThat(registry.getSlashCommandToolSkills()).isEmpty();
+        // [批 3c] 无会话 → 显式 null
+        assertThat(registry.getSlashCommandToolSkills(null)).isEmpty();
         // memoize 语义：失败解析值 [] 已缓存（对齐 CC memoize），二次调用仍空不抛
-        assertThat(registry.getSlashCommandToolSkills()).isEmpty();
+        assertThat(registry.getSlashCommandToolSkills(null)).isEmpty();
     }
 
     /** 静态 MCP 命令注入（隔离 MCP 源验证）· McpServerService 为具体类，子类覆写即可。 */

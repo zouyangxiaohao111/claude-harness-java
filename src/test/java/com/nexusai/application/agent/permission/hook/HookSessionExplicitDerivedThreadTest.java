@@ -6,7 +6,6 @@ import com.nexusai.application.agent.permission.source.PermissionRuleValueParser
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -28,31 +27,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * [批 3b] hook 域会话态<b>显式传参</b>在<b>真实派生线程</b>上的实证（含反向对照）。
+ * [批 3b] hook 域会话态<b>显式传参</b>在<b>真实派生线程</b>上的实证。
  *
- * <p><b>WHY（规则九 · 测试验证意图）</b>：批 3b 删除了三处「派生线程内读 {@code RequestContext.sessionId()}
- * （MDC / ThreadLocal）」：
+ * <p><b>WHY（规则九 · 测试验证意图）</b>：批 3b 删除了三处「派生线程内读 ambient 会话态
+ * （ThreadLocal / 线程局部 MDC）」：
  * <ol>
- *   <li>{@link CommandHookExecutor#enrichBaseFields} —— session_id 回退源由 MDC 改为显式载体链
+ *   <li>{@link CommandHookExecutor#enrichBaseFields} —— session_id 回退源由 ambient 改为显式载体链
  *       {@code event.sessionId() ?? parentTuc.sessionId()}；</li>
  *   <li>{@link CommandHookExecutor#resolveSpawnCwd} —— 唯一源 = {@code event.sessionId()}；</li>
  *   <li>{@code SkillImprovementHook.applySkillImprovement} —— baseDir 由
- *       {@code () -> getCwd(RequestContext.sessionId())} 改为显式 sessionId 入参
+ *       「无参 supplier（只能读 ambient 会话）」改为显式 sessionId 入参
  *       （方法体在 {@code CompletableFuture.runAsync} 的 ForkJoinPool 派生线程执行）。</li>
  * </ol>
- * 本测试的关键不是「传了参数」，而是证明 <b>ambient 路线在该线程上取不到值</b>：
+ * 本测试的关键不是「传了参数」，而是证明 <b>结果只来自显式传入值</b>：
  * <ul>
  *   <li>断言求值线程 ≠ 断言线程（真派生线程）；</li>
- *   <li>在该线程上 <b>故意设置</b>「上一个任务残留的、别的会话的」MDC（第三态）⇒ 断言结果
- *       <b>不</b>来自它 —— 这是旧实现必红的反向对照（旧实现读 MDC 会拿到残留会话）；</li>
- *   <li>断言结果 == 显式传入值。</li>
+ *   <li>断言结果 == 显式传入值 / 显式载体；</li>
+ *   <li>无显式源时省略而非伪造（不回落任何 ambient 值）。</li>
  * </ul>
  *
- * <p>注意：本测试<b>不</b>设置「调用方线程」的 MDC 就断言派生线程读不到（那只证明 ThreadLocal
- * 不传播，是 JDK 常识）；真正有鉴别力的是<b>在派生线程本身上写残留值</b>（模拟池化线程复用），
- * 旧实现会据此串会话。
+ * <p><b>[批 3c] 语义消失（已登记待裁定）</b>：原用例的「反向对照」装置是<b>在被调线程本身上写
+ * 「上一个任务残留的、别的会话的」裸 MDC 值</b>（模拟池化线程复用），据此断言结果不来自它。
+ * 批 3c 把该 ambient 会话槽<b>整类删除</b> ⇒ 诱饵无法再构造，「前置条件：派生线程上确实存在残留值」
+ * 的断言与写入装置一并删除（各处均留 `[批 3c]` 注释）。剩余断言全部保留、未改弱。
  */
-@DisplayName("批 3b · hook 域会话态显式传参（真实派生线程 + 残留 MDC 反向对照）")
+@DisplayName("批 3b · hook 域会话态显式传参（真实派生线程）")
 class HookSessionExplicitDerivedThreadTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -65,7 +64,6 @@ class HookSessionExplicitDerivedThreadTest {
 
     @AfterEach
     void tearDown() {
-        RequestContext.clear();
         SessionProjectRoot.reset();
     }
 
@@ -101,60 +99,47 @@ class HookSessionExplicitDerivedThreadTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("① enrichBaseFields 在派生线程求值：注入的 session_id 来自 parentTuc，派生线程上的残留 MDC 不参与")
+    @DisplayName("① enrichBaseFields 在派生线程求值：注入的 session_id 来自 parentTuc")
     void enrichBaseFields_usesExplicitTucSession_notResidualMdc() throws Exception {
         // event 自带 sessionId=null（hook 发射线程没带上下文）→ 唯一显式源 = parentTuc.sessionId()
         HookEvent event = HookEvent.toolPre("Bash", JSON.createObjectNode(), null, null);
         ToolUseContext tuc = ctxOf("sess-EXPLICIT");
 
         AtomicReference<String> threadName = new AtomicReference<>();
-        AtomicReference<String> mdcOnThreadBefore = new AtomicReference<>();
         HookEvent enriched = onDerivedThread(() -> {
             threadName.set(Thread.currentThread().getName());
-            // 反向对照：在该<b>池化派生线程</b>上写「上一个任务残留的、别的会话的」sessionId
-            //   （MDC 第三态）。旧实现读 MDC → 会把它当成本次 hook 的 session_id（静默串会话）。
-            RequestContext.set("sess-STALE-THIRD-STATE", "msg-stale");
-            mdcOnThreadBefore.set(RequestContext.sessionId());
-            try {
-                return CommandHookExecutor.enrichBaseFields(event, tuc);
-            } finally {
-                RequestContext.clear();
-            }
+            // [批 3c] 语义消失：原此处在该池化派生线程上写「上一个任务残留的、别的会话的」裸 MDC
+            //   值当反向对照（第三态），并断言该诱饵确实存在。该 ambient 会话槽已整类删除 ⇒ 装置与
+            //   前置条件断言删除；`enriched.sessionId()` 的预期值断言原样保留。
+            return CommandHookExecutor.enrichBaseFields(event, tuc);
         });
 
         assertThat(threadName.get())
             .as("必须在派生线程（池线程）求值，而非断言线程")
             .isNotEqualTo(Thread.currentThread().getName());
-        assertThat(mdcOnThreadBefore.get())
-            .as("前置条件：派生线程上确实存在残留 MDC（第三态），本用例的鉴别力来自它")
-            .isEqualTo("sess-STALE-THIRD-STATE");
         assertThat(enriched.sessionId())
-            .as("session_id 必须来自显式载体 parentTuc.sessionId()；旧实现（读 MDC）会得到 sess-STALE-THIRD-STATE")
+            .as("session_id 必须来自显式载体 parentTuc.sessionId()（不来自任何 ambient 会话读取）")
             .isEqualTo("sess-EXPLICIT");
     }
 
     @Test
-    @DisplayName("①b enrichBaseFields：event.sessionId() 优先于 parentTuc；无显式源时即便当前线程有 MDC 也省略")
+    @DisplayName("①b enrichBaseFields：event.sessionId() 优先于 parentTuc；无显式源时省略（不伪造）")
     void enrichBaseFields_eventSessionWins_overTuc() {
         HookEvent event = HookEvent.toolPre("Bash", JSON.createObjectNode(), "sess-EVENT", null);
         HookEvent enriched = CommandHookExecutor.enrichBaseFields(event, ctxOf("sess-TUC"));
         assertThat(enriched.sessionId())
-            .as("event 顶层已有值优先（REQ-06 单值约束），不读 MDC")
+            .as("event 顶层已有值优先（REQ-06 单值约束），不读任何 ambient 会话")
             .isEqualTo("sess-EVENT");
 
-        // 无任何显式源（parentTuc=null）→ 省略。反向对照：本线程**有** MDC，
-        //   旧实现 `if (sessionId == null) sessionId = RequestContext.sessionId();` 会产出该值。
+        // 无任何显式源（parentTuc=null）→ 省略。
+        // [批 3c] 语义消失：原此处先在本线程写一个 ambient 会话值当反向对照（旧实现
+        //   `if (sessionId == null) sessionId = <ambient 会话>()` 会产出该值）。该 ambient 会话槽
+        //   已整类删除 ⇒ 装置删除；「无显式源 → 省略」的断言原样保留。
         HookEvent bare = HookEvent.toolPre("Bash", JSON.createObjectNode(), null, null);
-        RequestContext.set("sess-MDC-ONLY", "msg-mdc-only");
-        try {
-            HookEvent noneEnriched = CommandHookExecutor.enrichBaseFields(bare, null);
-            assertThat(noneEnriched.sessionId())
-                .as("无显式源 → session_id 省略（旧实现会回落 MDC 得到 sess-MDC-ONLY）；"
-                    + "缺值不伪造，仅记 WARN")
-                .isNull();
-        } finally {
-            RequestContext.clear();
-        }
+        HookEvent noneEnriched = CommandHookExecutor.enrichBaseFields(bare, null);
+        assertThat(noneEnriched.sessionId())
+            .as("无显式源 → session_id 省略（缺值不伪造，仅记 WARN）")
+            .isNull();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -162,7 +147,7 @@ class HookSessionExplicitDerivedThreadTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("② resolveSpawnCwd 在派生线程求值：cwd 取自 event.sessionId() 的会话绑定项目，残留 MDC 的会话不参与")
+    @DisplayName("② resolveSpawnCwd 在派生线程求值：cwd 取自 event.sessionId() 的会话绑定项目")
     void resolveSpawnCwd_usesEventSession_notResidualMdc(@TempDir Path tmp) throws Exception {
         Path explicitProject = Files.createDirectories(tmp.resolve("explicit-project"));
         Path staleProject = Files.createDirectories(tmp.resolve("stale-project"));
@@ -173,19 +158,18 @@ class HookSessionExplicitDerivedThreadTest {
             AtomicReference<String> threadName = new AtomicReference<>();
             String resolved = onDerivedThread(() -> {
                 threadName.set(Thread.currentThread().getName());
-                RequestContext.set("sess-STALE-THIRD-STATE", "msg-stale"); // 残留第三态
-                try {
-                    return CommandHookExecutor.resolveSpawnCwd(event);
-                } finally {
-                    RequestContext.clear();
-                }
+                // [批 3c] 语义消失：原此处在该派生线程上写「别的会话」的裸 MDC 值当反向对照
+                //   （旧实现 MDC 回退会解析到残留会话的 %s）。该 ambient 会话槽已整类删除 ⇒ 装置删除；
+                //   注意「残留会话持有自己的 boundProject」这一诱饵本身（SessionProjectRoot 按会话分桶）
+                //   仍保留，故结果断言仍能证明 cwd 只取自 event.sessionId()。
+                return CommandHookExecutor.resolveSpawnCwd(event);
             });
 
             assertThat(threadName.get())
                 .as("resolveSpawnCwd 实际跑在 HOOK_EXECUTOR 类池线程上（此处用等价派生线程复现）")
                 .isNotEqualTo(Thread.currentThread().getName());
             assertThat(resolved)
-                .as("spawn cwd 必须来自 event.sessionId() 的绑定项目；旧实现（MDC 回退）会得到残留会话的 %s",
+                .as("spawn cwd 必须来自 event.sessionId() 的绑定项目（不得解析到残留会话的 %s）",
                     staleProject)
                 .isEqualTo(CwdResolution.normalizeCwd(explicitProject.toString()));
         } finally {
@@ -199,7 +183,7 @@ class HookSessionExplicitDerivedThreadTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("③ 生产链：configured hook 的 stdin session_id 与 spawn cwd 均取自显式 TUC 会话（调用线程残留 MDC 不参与）")
+    @DisplayName("③ 生产链：configured hook 的 stdin session_id 与 spawn cwd 均取自显式 TUC 会话")
     void configuredHook_endToEnd_explicitSessionReachesStdinAndCwd(@TempDir Path tmp) throws Exception {
         Path project = Files.createDirectories(tmp.resolve("proj"));
         SessionProjectRoot.setForSession("sess-PROD", project.toString());
@@ -208,16 +192,13 @@ class HookSessionExplicitDerivedThreadTest {
             HookRegistry registry = registryWithConfiguredHook(stub);
             ToolUseContext tuc = ctxOf("sess-PROD");
 
-            // 调用线程写残留 MDC（别的会话）—— 生产链上不读取（反向对照）
-            RequestContext.set("sess-CALLER-STALE", "msg-stale");
-            try {
-                registry.executePreToolUse("Bash", JSON.createObjectNode(), tuc, "tu-3b");
-            } finally {
-                RequestContext.clear();
-            }
+            // [批 3c] 语义消失：原此处先在调用线程写「别的会话」的裸 MDC 值当反向对照（断言 stdin
+            //   不得含该值）。该 ambient 会话槽已整类删除 ⇒ 装置删除；`doesNotContain` 负向断言与
+            //   正向 `contains(session_id=sess-PROD)` 断言原样保留（后者依旧证明显式 TUC 会话贯通）。
+            registry.executePreToolUse("Bash", JSON.createObjectNode(), tuc, "tu-3b");
 
             assertThat(stub.capturedJsonInput.get())
-                .as("hook stdin 的 session_id 必须来自显式 TUC 会话（批 3b：MDC 回退已删）")
+                .as("hook stdin 的 session_id 必须来自显式 TUC 会话（批 3b：ambient 回退已删）")
                 .isNotNull()
                 .contains("\"session_id\":\"sess-PROD\"")
                 .doesNotContain("sess-CALLER-STALE");
@@ -283,7 +264,7 @@ class HookSessionExplicitDerivedThreadTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("④ applySkillImprovement：baseDir 求值发生在 ForkJoinPool 派生线程，键 = 显式 sessionId（残留 MDC 不参与）")
+    @DisplayName("④ applySkillImprovement：baseDir 求值发生在 ForkJoinPool 派生线程，键 = 显式 sessionId")
     void skillImprovement_baseDirFromExplicitSession_onForkJoinThread(@TempDir Path tmp) throws Exception {
         Path project = Files.createDirectories(tmp.resolve("skill-proj"));
         Path skillDir = project.resolve(NexusaiPaths.getProjectDirName()).resolve("skills").resolve("my-skill");
@@ -291,7 +272,6 @@ class HookSessionExplicitDerivedThreadTest {
         Files.writeString(skillDir.resolve("SKILL.md"), "# original");
 
         AtomicReference<String> evalThread = new AtomicReference<>();
-        AtomicReference<String> mdcOnEvalThread = new AtomicReference<>("<未求值>");
         AtomicReference<String> sessionSeen = new AtomicReference<>();
         SkillImprovementHook hook = new SkillImprovementHook(
             (systemPrompt, llm, options) -> "<updated_file># rewritten</updated_file>",
@@ -300,31 +280,26 @@ class HookSessionExplicitDerivedThreadTest {
             (skillName, updates) -> {},
             sid -> {
                 evalThread.set(Thread.currentThread().getName());
-                mdcOnEvalThread.set(RequestContext.sessionId());
                 sessionSeen.set(sid);
                 return project;
             },
             null,
             false);
 
-        RequestContext.set("sess-STALE-THIRD-STATE", "msg-stale"); // 调用线程残留（不传播到 ForkJoinPool）
-        try {
-            hook.applySkillImprovement("sess-EXPLICIT", "my-skill",
-                List.of(new SkillImprovementHook.SkillUpdate("s", "c", "r"))).join();
-        } finally {
-            RequestContext.clear();
-        }
+        // [批 3c] 语义消失：原此处先在调用线程写「别的会话」的裸 MDC 值，并在求值回调里捕获派生
+        //   线程上的 ambient 会话读取，断言其为 null（证明 baseDir 不来自 ambient 路线）。该 ambient
+        //   会话槽已整类删除 ⇒ 装置与 `mdcOnEvalThread.isNull()` 断言删除；`sessionSeen` /
+        //   `evalThread` / 真实写回 三条断言原样保留（仍证明显式 sessionId 贯通 + 派生线程求值）。
+        hook.applySkillImprovement("sess-EXPLICIT", "my-skill",
+            List.of(new SkillImprovementHook.SkillUpdate("s", "c", "r"))).join();
 
         assertThat(sessionSeen.get())
-            .as("baseDir 求值必须收到显式传入的 sessionId（旧实现是无参 supplier，只能读 MDC）")
+            .as("baseDir 求值必须收到显式传入的 sessionId（旧实现是无参 supplier，只能读 ambient 会话）")
             .isEqualTo("sess-EXPLICIT");
         assertThat(evalThread.get())
             .as("apply 体在 ForkJoinPool 派生线程执行（非断言线程）")
             .isNotNull()
             .isNotEqualTo(Thread.currentThread().getName());
-        assertThat(mdcOnEvalThread.get())
-            .as("派生线程上 RequestContext.sessionId() 必须为 null —— 证明 baseDir 不来自 ambient 路线")
-            .isNull();
         assertThat(Files.readString(skillDir.resolve("SKILL.md")))
             .as("写回落在显式会话对应的项目目录（证明 baseDir 真的用了显式 sessionId）")
             .isEqualTo("# rewritten");

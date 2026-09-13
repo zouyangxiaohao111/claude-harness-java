@@ -85,7 +85,7 @@ public class InitialPermissionModeSource {
      */
     @Autowired
     public InitialPermissionModeSource(SettingsJsonParser parser) {
-        this(parser, CwdResolution::getOriginalCwdLayer, null);
+        this(parser, () -> CwdResolution.getOriginalCwdLayer(null), null);
     }
 
     /**

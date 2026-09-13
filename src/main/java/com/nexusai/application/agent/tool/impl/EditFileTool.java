@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionRule;
@@ -150,7 +151,9 @@ public class EditFileTool implements Tool {
             if (!relPath.isBlank()) {
                 // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开），原 try-catch 逃逸跳过删除。
                 {
-                    Path file = guard.resolve(relPath);
+                    // [会话 cwd] 会话感知解析：基准 = ctx.sessionId() 的当前 cwd（对齐 CC
+                    //   expandPath(baseDir=getCwd())）；ctx == null 才回落无会话兜底（PathGuard WARN）。
+                    Path file = guard.resolve(ctx != null ? ctx.sessionId() : null, relPath);
                     String absolute = file.toAbsolutePath().normalize().toString();
                     // IMP-M-P2-2b: agent-memory 写 carve-out（对齐 CC filesystem.ts:1554-1562
                     //   checkWritePermissionForTool 的 isAgentMemoryPath 预检查）：
@@ -197,6 +200,10 @@ public class EditFileTool implements Tool {
      * 用同一 guard 派生 readFileState key. WHY 必须用同一 guard: 不同 workspace
      * (eg 测试 TempDir vs 生产) 的 guard.resolve(relPath) 会得到不同绝对路径 → readFileState
      * key 错位 → read-before-write 门禁永远不命中.
+     *
+     * <p>[会话 cwd] 消费者还须用<b>同一 sessionId</b> 解析（{@code guard.resolve(sessionId, relPath)}）：
+     * 相对路径基准 = 该会话当前 cwd，基准不同则 key 亦不同；key 一律取「解析后的规范化绝对路径」
+     * （见 {@link #validateInput} 门禁 1）。
      */
     public PathGuard pathGuard() {
         return guard;
@@ -287,9 +294,25 @@ public class EditFileTool implements Tool {
      * 路径字段 → 返回原引用；null 字节/非法输入 → 返回原引用（不阻断工具执行）。
      * 调用方 {@link com.nexusai.application.agent.permission.InputSanitizer#backfill}
      * 已做防御性 deepCopy，原 input 永不被 in-place 改动。
+     *
+     * <p>[会话 cwd] 无会话重载 → 委托 {@link #backfillObservableInput(JsonNode, ToolUseContext)}
+     * （{@code ctx=null}），会话 cwd 不可得时基准回落无会话兜底（PathGuard WARN）。
      */
     @Override
     public JsonNode backfillObservableInput(JsonNode input) {
+        return backfillObservableInput(input, null);
+    }
+
+    /**
+     * [会话 cwd] 会话感知回填重载 · 相对路径基准 = {@code ctx.sessionId()} 的当前会话 cwd
+     * （对齐 CC {@code expandPath(file_path)} 内部 {@code baseDir ?? getCwd()}）。
+     *
+     * @param input 工具输入（原始 JSON）
+     * @param ctx   工具上下文（可为 null ⇒ 无会话兜底，PathGuard WARN）
+     * @return 展开后的 input（幂等，见 {@link #backfillObservableInput(JsonNode)}）
+     */
+    @Override
+    public JsonNode backfillObservableInput(JsonNode input, ToolUseContext ctx) {
         if (input == null || !input.isObject()) {
             return input;
         }
@@ -300,7 +323,8 @@ public class EditFileTool implements Tool {
         String raw = pathNode.asText();
         String expanded;
         try {
-            expanded = PathGuard.expandPath(raw, guard.workdir().toString());
+            expanded = PathGuard.expandPath(raw,
+                guard.workdir(ctx != null ? ctx.sessionId() : null).toString());
         } catch (IllegalArgumentException e) {
             // null 字节等非法输入 → 返回原引用（backfill 阶段不阻断工具）
             if (log.isDebugEnabled()) {
@@ -486,7 +510,8 @@ public class EditFileTool implements Tool {
         }
 
         // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），越狱 defer 逻辑删除
-        Path file = guard.resolve(relPath);
+        // [会话 cwd] 会话感知解析（基准 = 本会话当前 cwd；ctx 此处已非 null，见上方 ctx==null 拒绝）
+        Path file = guard.resolve(ctx.sessionId(), relPath);
         // UNC 路径提前 pass (CC :179-181 防 NTLM 凭据泄露).
         String fullFilePathStr = file.toString();
         if (fullFilePathStr.startsWith("\\\\") || fullFilePathStr.startsWith("//")) {
@@ -514,15 +539,19 @@ public class EditFileTool implements Tool {
         // errorCode 2: deny 规则检查 · 对齐 CC FileEditTool.ts:158-174
         //   `matchingRuleForInput(fullFilePath, appState.toolPermissionContext, 'edit', 'deny')`
         //   命中非 null → errorCode=2 + 逐字文案 "File is in a directory that is denied by your permission settings."。
-        //   Java 端用 RuleQuery.getEditRuleByContentsForPath(permCtx, absoluteNormalizedPath, DENY)
-        //   （与 WritePermissionChecker:162-177 同源 content-glob 匹配）；路径用 checkPermissions 同款
+        //   Java 端用 RuleQuery.getEditRuleByContentsForPath(permCtx, absoluteNormalizedPath, DENY, cwd)
+        //   （与 WritePermissionChecker:162-177 同源）；路径用 checkPermissions 同款
         //   file.toAbsolutePath().normalize().toString()。null-safe：permCtx==null（ctxFor 等 POJO 测试
         //   用 ToolUseContext.of 未注入 permissionContext）跳过不 NPE。
+        //   [G9] 第 4 参 cwd = 会话 cwd（root-relative 规则根锚），见下方 sessionCwd(ctx)。
         ToolPermissionContext permCtx = ctx.permissionContext();
         if (permCtx != null) {
             String absoluteNormalizedPath = file.toAbsolutePath().normalize().toString();
+            // [G9] root-relative edit 规则的匹配根锚 = 会话 cwd（显式下传）。
+            //   批 3c 删 MDC 会话槽后，本处原走 3 参重载（cwd=null）→ root 回落进程 user.dir，
+            //   会话绑定项目 ≠ 进程启动目录时 deny 规则锚错根 → 相对路径规则永不命中（判定错位）。
             PermissionRule denyRule = RuleQuery.getEditRuleByContentsForPath(
-                permCtx, absoluteNormalizedPath, PermissionBehavior.DENY);
+                permCtx, absoluteNormalizedPath, PermissionBehavior.DENY, sessionCwd(ctx));
             if (denyRule != null) {
                 if (log.isInfoEnabled()) {
                     log.info("EditFileTool: edit deny 规则命中 → errorCode=2 拒绝: rule={} path={}",
@@ -594,7 +623,12 @@ public class EditFileTool implements Tool {
         }
 
         // 门禁 1: read-before-write · 对齐 CC FileEditTool.ts:264-273 errorCode=6
-        ReadState readState = ctx.readFileState().get(ToolUseContext.keyForReadFileState(guard, relPath));
+        // [key 同源] 缓存键 = 本工具解析出的规范化绝对路径本身（`file` 已按会话 cwd 解析）。
+        //   CC 端 key 即 absoluteFilePath（FileEditTool.ts:520 readFileState.set(absoluteFilePath,…)）；
+        //   用 `file` 而非裸 relPath 可保证「解析基准 = 缓存键基准」同源（相对/绝对两种入参写法
+        //   都收敛到同一绝对路径键），否则相对 Read + 绝对 Edit 会 key 错位致门禁永不命中。
+        ReadState readState = ctx.readFileState().get(
+            ToolUseContext.keyForReadFileState(guard, file.toString()));
         if (readState == null || readState.isPartialView()) {
             return Tool.ValidationResult.fail("6",
                 "File has not been read yet. Read it first before writing to it.");
@@ -675,6 +709,24 @@ public class EditFileTool implements Tool {
                 actualOldString.length());
         }
         return Tool.ValidationResult.pass();
+    }
+
+    /**
+     * 会话 cwd 字符串（root-relative {@code Edit(...)} 规则匹配的根锚）· [G9]。
+     *
+     * <p>与 {@code WritePermissionChecker.cwdOf} 同源：{@link ToolUseContext#effectiveCwd()}
+     * （TUC 构造期经 {@code CwdResolution.getCwd(sessionId)} 解析的会话 cwd 快照）优先，
+     * 缺失时回落 {@code CwdResolution.getCwd(ctx.sessionId())}（动态解析，与
+     * {@code guard.resolve(ctx.sessionId(), relPath)} 的解析基座同源）。
+     *
+     * <p>无 ctx / 无 sessionId ⇒ {@code getCwd(null)} 按「无会话」回落进程 user.dir，
+     * 由 {@link RuleQuery} 侧一次性 WARN 留痕（不放宽任何判定）。
+     */
+    private static String sessionCwd(ToolUseContext ctx) {
+        if (ctx != null && ctx.effectiveCwd() != null) {
+            return ctx.effectiveCwd().toString();
+        }
+        return CwdResolution.getCwd(ctx != null ? ctx.sessionId() : null);
     }
 
     /**
@@ -886,13 +938,15 @@ public class EditFileTool implements Tool {
         if (!com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(result.data()) && ctx != null) {
             String relPath = call.input().path("file_path").asText("");
             try {
-                Path file = guard.resolve(relPath);
+                // [会话 cwd] 会话感知解析（与 executeInternal 同一基准 = ctx.sessionId() 当前 cwd）
+                Path file = guard.resolve(ctx.sessionId(), relPath);
                 long mtime = Files.getLastModifiedTime(file).toMillis();
                 // [L+ round 3] CRLF 归一化: 写入 cache 的 content 必须 LF-only, 与 Read 侧一致.
                 // [IMP-D2] 编码感知读: utf16le 文件写回后不能 Files.readString（UTF-8 乱码）,
                 //   用 FileEncodingReader.readFileMetadata 按 BOM 解码（对齐 CC readFileForEdit 语义）。
                 String updatedContent = FileEncodingReader.readFileMetadata(file).content();
-                String keyForCache = ToolUseContext.keyForReadFileState(guard, relPath);
+                // [key 同源] 键 = 已按会话 cwd 解析的规范化绝对路径（与 validateInput 门禁键同源）
+                String keyForCache = ToolUseContext.keyForReadFileState(guard, file.toString());
                 // offset=null / limit=null: 让 ReadFileTool dedup 守卫拒绝命中 (CC FileEditTool.ts:520 对齐)
                 ctx.readFileState().set(keyForCache, ReadState.full(mtime, updatedContent));
                 if (log.isInfoEnabled()) {
@@ -919,7 +973,9 @@ public class EditFileTool implements Tool {
         if (relPath.isBlank()) return ToolResult.error(call.id(), "path is empty");
 
         // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），逃逸拒绝删除
-        Path file = guard.resolve(relPath);
+        // [会话 cwd] 会话感知解析：相对路径基准 = 本会话当前 cwd（对齐 CC expandPath(baseDir=getCwd())）；
+        //   ctx == null（execute(call) 无 ctx 直达）才回落无会话兜底（PathGuard WARN）。
+        Path file = guard.resolve(ctx != null ? ctx.sessionId() : null, relPath);
 
         // P1-2: 动态技能发现 + 条件技能激活 · 对齐 CC FileEditTool.ts:404-423
         //   （在 call() 开头、编辑前触发；fire-and-forget 不阻塞工具调用链）
@@ -966,8 +1022,9 @@ public class EditFileTool implements Tool {
                     lastWriteTime = -1L;  // stat 失败不阻断写（CC getFileModificationTime 抛错会向上传，
                     //   Java 兜底为不判 stale，避免一次 stat 失败锁死编辑）
                 }
+                // [key 同源] 键 = 已按会话 cwd 解析的 `file`（与 validateInput 门禁键 / 写回 key 同源）
                 ReadState lastRead = ctx != null
-                    ? ctx.readFileState().get(ToolUseContext.keyForReadFileState(guard, relPath))
+                    ? ctx.readFileState().get(ToolUseContext.keyForReadFileState(guard, file.toString()))
                     : null;
                 if (lastRead == null || lastWriteTime > lastRead.mtimeMillis()) {
                     boolean isFullRead = lastRead != null

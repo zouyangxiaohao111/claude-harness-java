@@ -7,7 +7,6 @@ import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.source.PermissionRuleValueParser;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.common.RequestContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -32,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>PreToolUse 事件（subagent ctx，经 executeEvent 3 参）→ jsonInput 含
  *       transcript_path（{workspaceDir}/{sessionId}.jsonl）/ cwd / agent_type / permission_mode</li>
  *   <li>主线程 ctx（agentType=null）→ jsonInput 无 agent_type key（省略语义，对齐 CC 无 --agent）</li>
- *   <li>sessionId=null 事件 + RequestContext（MDC）有值 → session_id 回退</li>
+ *   <li>sessionId=null 事件 → session_id 回退到显式载体 parentTuc.sessionId()</li>
  *   <li>Stop 事件 data 已有 agent_type → 不双写（单值 REQ-06）</li>
  *   <li>permissionRequest 7 参顶层 permission_mode 已有 → 不覆盖</li>
  *   <li>SessionStart（无 ctx）→ transcript_path/cwd 仍恒备（REQ-01）</li>
@@ -135,7 +134,6 @@ class FixTs04BuildJsonInputAlignTest {
     @AfterEach
     void tearDown() {
         AutoMemPaths.resetCurrentProjectRoot();
-        RequestContext.clear();
     }
 
     @Test
@@ -207,29 +205,31 @@ class FixTs04BuildJsonInputAlignTest {
     }
 
     @Test
-    @DisplayName("3. 事件 sessionId=null + RequestContext(MDC) 有值 → session_id 回退")
-    void sessionIdNullEvent_fallsBackToRequestContextMdc() throws Exception {
+    @DisplayName("3. 事件 sessionId=null → session_id 回退到显式载体 parentTuc.sessionId()（REQ-01）")
+    void sessionIdNullEvent_fallsBackToParentTucSession() throws Exception {
         AutoMemPaths.setCurrentProjectRoot("C:/proj");
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
 
-        RequestContext.setSession("mdc-sess-1");
         String agentId = UUID.randomUUID().toString();
         // toolPre 5 参 sessionId=null（对齐 ElicitationHandler 等无会话调用点）
         HookEvent event = HookEvent.toolPre("Bash", JSON.createObjectNode(), null, agentId, "tu-1");
-        ToolUseContext ctx = subagentCtx("explore-agent", agentId, "00000000-0000-0000-0000-000000000001",
-            Path.of("C:/wt"));
+        String tucSessionId = "00000000-0000-0000-0000-000000000001";
+        ToolUseContext ctx = subagentCtx("explore-agent", agentId, tucSessionId, Path.of("C:/wt"));
 
         registry.executeEvent(event, null, ctx);
 
         JsonNode node = readJson(stub.capturedJsonInput.get());
         assertThat(node.has("session_id"))
-            .as("事件 sessionId=null → RequestContext.sessionId()（MDC）回退（REQ-01）")
+            .as("事件 sessionId=null → 显式载体 parentTuc.sessionId() 回退（REQ-01）")
             .isTrue();
-        assertThat(node.get("session_id").asText()).isEqualTo("mdc-sess-1");
+        // [批 3c] 语义已变（已登记待裁定）：原回退源是「裸 MDC 会话槽」（调用方线程 setSession）。
+        //   该槽已整类删除，回退链现为 **event.sessionId() ?? parentTuc.sessionId()**
+        //   （CommandHookExecutor.enrichBaseFields 显式载体链）—— 故期望值由 MDC 值改为 TUC 会话值。
+        assertThat(node.get("session_id").asText()).isEqualTo(tucSessionId);
         assertThat(node.get("transcript_path").asText())
             .as("transcript_path 用回退后 session_id 计算")
-            .isEqualTo(Path.of("C:/proj").resolve("mdc-sess-1.jsonl").toString());
+            .isEqualTo(Path.of("C:/proj").resolve(tucSessionId + ".jsonl").toString());
     }
 
     @Test

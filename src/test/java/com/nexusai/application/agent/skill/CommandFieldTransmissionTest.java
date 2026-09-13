@@ -171,7 +171,8 @@ class CommandFieldTransmissionTest {
         BundledSkills.register(cmd);
 
         SkillRegistry registry = new SkillRegistry(tempDir.toString());
-        assertThat(registry.getSlashCommandToolSkills())
+        // [批 3c] 无会话 → 显式 null（本用例只验 bundled skill 入选斜杠技能集，不涉会话）
+        assertThat(registry.getSlashCommandToolSkills(null))
             .as("whenToUse=null 但 hasUserSpecifiedDescription=true 的 bundled skill 必须入选斜杠技能集")
             .extracting(Command::getName)
             .contains("stuck");

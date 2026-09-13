@@ -5390,8 +5390,10 @@ public class SubagentExecutor {
         if (p == null) {
             p = new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
                 java.time.LocalDate.now().toString(),
+                // [批 3c] 此处引擎恒 null（回退单文件子集）且无会话来源 → 显式无会话（回落 user.dir）；
+                //   有会话的子代理上下文由上游注入 engine/provider，不经本兜底。
                 new com.nexusai.application.agent.prompt.UserContextProvider(
-                    (com.nexusai.application.agent.context.ClaudemdEngine) null),
+                    (com.nexusai.application.agent.context.ClaudemdEngine) null, null),
                 new com.nexusai.application.agent.prompt.GitStatusProvider());
             systemPromptContextProvider = p;
             if (log.isDebugEnabled()) {

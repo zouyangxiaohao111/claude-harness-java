@@ -49,7 +49,7 @@ class SessionStartSeenRegistryTest {
     void remove_resetsSingleKey_resetClearsAll() {
         SessionStartSeenRegistry.markSeen("sess-clear");
         assertThat(SessionStartSeenRegistry.markSeen("sess-clear")).isFalse();
-        // = CommandController /clear remove(RequestContext.sessionId)
+        // = CommandController /clear remove(sessionId)（会话标识由分派入口显式传入；裸 MDC 会话槽已删）
         SessionStartSeenRegistry.remove("sess-clear");
         assertThat(SessionStartSeenRegistry.markSeen("sess-clear"))
             .as("/clear 移除该会话 key → 下 run 恢复 cold（副作用重跑）").isTrue();

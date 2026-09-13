@@ -42,11 +42,14 @@ class PromptCacheBreakDetectionCanonicalKeyTest {
 
     private static final AtomicInteger BREAK_EVENTS = new AtomicInteger();
 
+    /** 本文件统一会话键 · 批 3c：会话 = 显式 sessionId。 */
+    private static final String SESSION = "s1";
+
     @BeforeEach
     @AfterEach
     void resetSharedState() {
         BREAK_EVENTS.set(0);
-        MicroCompactor.resetMicrocompactState();
+        MicroCompactor.resetMicrocompactState(SESSION);
         MicroCompactor.setNowForTest(0L);
         MicroCompactor.setCachedMicrocompactEnabled(false);
         MicroCompactor.setFeatureFlags(FeatureFlags.ALL_DISABLED);
@@ -164,7 +167,7 @@ class PromptCacheBreakDetectionCanonicalKeyTest {
 
         // 生产值域触发 time-based MC → 默认 notifier（gatedBy 开启）→ cacheDeletionsPending
         new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1))
-            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD");
+            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD", SESSION);
 
         detector.checkResponseForCacheBreak("REPL_MAIN_THREAD", 1000, 0, System.currentTimeMillis(), null, "r2");
         assertThat(BREAK_EVENTS.get()).as("feature 开时默认 notifier 必须生效（抑制误报）").isZero();
@@ -179,7 +182,7 @@ class PromptCacheBreakDetectionCanonicalKeyTest {
         PromptCacheBreakDetection detector = new PromptCacheBreakDetection(r -> BREAK_EVENTS.incrementAndGet(), true);
 
         new MicroCompactor(() -> new MicroCompactor.TimeBasedMCConfig(true, 60, 1))
-            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD");
+            .microcompactMessages(timeBasedMessages(now), "REPL_MAIN_THREAD", SESSION);
 
         assertThat(detector.getTrackedSourceCount())
             .as("feature 关时默认 notifier no-op，不产生任何跟踪状态").isZero();

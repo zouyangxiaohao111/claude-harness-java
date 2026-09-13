@@ -132,6 +132,11 @@ public class SkillPreloader {
      * @return 预加载结果
      */
     public PreloadResult preload(List<String> skillsToPreload) {
+        // [批 3c] 无会话入口：本兼容重载签名无 sessionId（测试 / 旧调用方）⇒ 技能名解析基座按进程
+        //   默认 projectRoot（SkillsLoader 回落 user.dir）；绑定会话的 per-session 技能可能不同。
+        //   原经裸 MDC 读取，已删。生产调用方走 3 参重载（SubagentExecutor 显式传 preloadSessionId）。
+        log.warn("[SkillPreloader] preload(List) 无会话入参 → 技能清单按进程默认解析（SkillsLoader 回落 "
+            + "user.dir），绑定会话的 per-session 技能可能不同: skills={}", skillsToPreload);
         return preload(skillsToPreload, null, null);
     }
 
@@ -177,7 +182,9 @@ public class SkillPreloader {
         List<Skill> validSkills = new ArrayList<>();
 
         for (String skillName : skillsToPreload) {
-            Command cmd = registry.findCommand(skillName);
+            // [批 3c] 会话标识显式取自本方法形参 sessionId（生产调用方 SubagentExecutor:1751 传
+            //   preloadSessionId）——技能名解析基座随会话绑定项目变化。原经裸 MDC 读取，已删。
+            Command cmd = registry.findCommand(skillName, sessionId);
             if (cmd == null) {
                 log.warn("[SkillPreloader] Skill '{}' 在共享 registry 中未找到 (bundled + file system + MCP + dynamic)",
                         skillName);

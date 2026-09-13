@@ -85,7 +85,7 @@ public class EffortCommand {
      *
      * @param args      斜杠命令参数字符串（可为 null/空）
      * @param sessionId 当前会话标识（<b>由 REST 入口显式传入</b>，批 3a：不再读
-     *                  {@code RequestContext.sessionId()} 的裸 MDC —— MDC 第三态会读到上一请求
+     *                  裸 MDC 的 {@code sessionId()} 的裸 MDC —— MDC 第三态会读到上一请求
      *                  残留的**别的会话** id ⇒ 把 effort 档位写到别的会话上）
      */
     public EffortCommandResult handle(String args, String sessionId) {
@@ -279,7 +279,7 @@ public class EffortCommand {
 
     /**
      * 解析当前会话 DB 主键 · 由调用方<b>显式传入</b> sessionId（批 3a：不再读
-     * {@code RequestContext.sessionId()} 的裸 MDC —— MDC 第三态可读到上一请求残留的别的会话 id，
+     * 裸 MDC 的 {@code sessionId()} 的裸 MDC —— MDC 第三态可读到上一请求残留的别的会话 id，
      * 使 effort 写入落到别的会话行上）。
      *
      * <p>[session-id-short] sessionId 已统一 short（sess-xxx）→ 直返；存量旧 DB 行
@@ -403,7 +403,7 @@ public class EffortCommand {
 
     /** 按<b>显式传入</b>的 sessionId 解析主会话 AgentState（P1-6 注册表），不可得 → null。
      *  [session-id-short] sessionId 已 short 直键 registry（不再 UUID.fromString）。
-     *  [批 3a] 不再读 RequestContext.sessionId()（裸 MDC，第三态可跨会话串值）。 */
+     *  [批 3a] 不再读 裸 MDC 的 sessionId()（裸 MDC，第三态可跨会话串值）。 */
     private AgentState resolveSessionState(String sessionId) {
         if (sessionAgentStateRegistry == null) {
             return null;

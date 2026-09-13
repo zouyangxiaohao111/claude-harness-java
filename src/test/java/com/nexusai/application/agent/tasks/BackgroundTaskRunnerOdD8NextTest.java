@@ -43,8 +43,8 @@ class BackgroundTaskRunnerOdD8NextTest {
 
     @AfterEach
     void tearDown() {
-        // 与既有 runner 测试同款清理：MDC + sysprop 防跨测试线程泄漏
-        com.nexusai.common.RequestContext.clear();
+        // 与既有 runner 测试同款清理：sysprop + 会话 cwd 槽防跨测试线程泄漏
+        //（批 3c 已删除的裸 MDC 会话槽不再需要清理）
         System.clearProperty("nexusai.sessionId");
         com.nexusai.application.agent.agent.SessionCwdHolder.reset();
     }

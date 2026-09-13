@@ -83,7 +83,9 @@ class SkillControllerListMergeTest {
     @Test
     @DisplayName("mock getAllCommands() 2 技能 + listAllDomain() 空 → GET /api/v1/skills 返回 2 项（修复恒空根因）")
     void registrySkills_areReturned_whenDomainEmpty() throws Exception {
-        when(skillRegistry.getAllCommands()).thenReturn(List.of(
+        // [批 3c] getAllCommands 新增显式 sessionId 形参；本用例请求不带 ?sessionId= → 控制器传 null，
+        //   故 stub 用 any()（anyString() 不匹配 null）
+        when(skillRegistry.getAllCommands(any())).thenReturn(List.of(
             command("skill-a", "A"), command("skill-b", "B")));
         when(commandService.listAllDomain()).thenReturn(List.of());
 
@@ -104,7 +106,7 @@ class SkillControllerListMergeTest {
     void sameName_deduped_registryWins() throws Exception {
         Command registryVersion = command("skill-a", "registry desc");
         Command dbGhost = command("skill-a", "db desc");
-        when(skillRegistry.getAllCommands()).thenReturn(List.of(registryVersion));
+        when(skillRegistry.getAllCommands(any())).thenReturn(List.of(registryVersion));
         when(commandService.listAllDomain()).thenReturn(List.of(dbGhost));
 
         mockMvc.perform(get("/api/v1/skills"))
