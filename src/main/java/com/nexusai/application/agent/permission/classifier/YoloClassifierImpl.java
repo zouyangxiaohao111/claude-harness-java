@@ -578,7 +578,14 @@ public class YoloClassifierImpl implements YoloClassifier {
                 null, null, null, null, null,
                 isAnthropicProtocol
                     ? LlmProvider.ChatRequestOptions.ToolChoice.tool(YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME)
-                    : null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                    : null,
+                // [批 5b-1] agent 归因上下文改取**显式载体 ctx.agentContext()**（原读
+                //   AgentContext.getAgentContext() ThreadLocal）：本方法整体运行在 classify()/
+                //   classifyTextAction() 的无 executor supplyAsync 闭包内（commonPool worker），
+                //   plain ThreadLocal 不跨线程 ⇒ 原读恒 null ⇒ invokingRequestId/invocationKind
+                //   归因边静默丢失。TUC 上的值由 SubagentExecutor（子代理）/
+                //   buildBaseToolUseContext（主·后台 loop）在各自线程显式盖章后随 TUC 下传。
+                ctx != null ? ctx.agentContext() : null);
             AssistantMessage msg = callWithOptionsRetry(provider, resolved.config(), modelName,
                 systemPrompt, userMessage, options, ctx);
             long durationMs = System.currentTimeMillis() - overallStart;
@@ -1094,7 +1101,7 @@ public class YoloClassifierImpl implements YoloClassifier {
     private LlmProvider.LlmRawResponse callWithRetry(
             LlmProvider provider, ProviderConfig config, String modelName,
             String systemPrompt, String userMessage, ToolUseContext ctx) throws Exception {
-        return callWithRetryGeneric(() -> callWithAgentContext(provider, config, modelName, systemPrompt, userMessage), ctx);
+        return callWithRetryGeneric(() -> callWithAgentContext(provider, config, modelName, systemPrompt, userMessage, ctx), ctx);
     }
 
     /**
@@ -1156,14 +1163,16 @@ public class YoloClassifierImpl implements YoloClassifier {
      */
     private LlmProvider.LlmRawResponse callWithAgentContext(
             LlmProvider provider, ProviderConfig config, String modelName,
-            String systemPrompt, String userMessage) throws Exception {
-        // [A#3 tuc-invoking-req] 在**派发线程**（调用方线程）取显式归因上下文，
-        //   随 lambda 显式传入 supplyAsync —— 本方法的调用链与 LlmAgentLoop:6604 同型：
-        //   CompletableFuture.supplyAsync 的线程不继承 ThreadLocal，在 supplier 内读
-        //   AgentContext 恒 null ⇒ invokingRequestId 丢失。
+            String systemPrompt, String userMessage, ToolUseContext ctx) throws Exception {
+        // [批 5b-1] 归因上下文的**唯一来源 = 显式载体 ctx.agentContext()**：
+        //   本方法被 callWithRetry 在 classify()/classifyTextAction() 的 commonPool worker 上调用，
+        //   原实现在此处读 AgentContext.getAgentContext() ThreadLocal —— 该线程不继承提交线程的
+        //   ThreadLocal（plain ThreadLocal 不跨线程）⇒ 恒 null ⇒ invokingRequestId/invocationKind
+        //   归因边静默丢失（CC 的 AsyncLocalStorage 自动跨异步传播，无此问题）。
+        //   TUC 上的值由显式盖章点写入（SubagentExecutor / buildBaseToolUseContext），跨线程可见。
         //   注意：不是「回放」（不 set ThreadLocal 再读），而是显式传对象。
         final com.nexusai.application.agent.subagent.AgentContext agentContext =
-            com.nexusai.application.agent.subagent.AgentContext.getAgentContext();
+            ctx != null ? ctx.agentContext() : null;
         if (log.isDebugEnabled()) {
             log.debug("YoloClassifier: stage 调用 {} (agentContext={})", modelName, agentContext != null);
         }

@@ -358,7 +358,7 @@ class CancellationSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(JSON);
         PromptHook cfg = new PromptHook(PROMPT, null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            real, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            real, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
         AbortController parentAbort = new AbortController();
         parentAbort.abort("user_cancelled");
 
@@ -409,7 +409,7 @@ class CancellationSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(JSON);
         PromptHook cfg = new PromptHook(PROMPT, null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            slow, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            slow, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
         AbortController parentAbort = new AbortController();
 
         long start = System.currentTimeMillis();

@@ -88,8 +88,70 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook(prompt, null, timeout, null, null, null);
         ExecPromptHook.PromptLlmContext ctx =
-            new ExecPromptHook.PromptLlmContext(echoProvider(response), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            new ExecPromptHook.PromptLlmContext(echoProvider(response), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
         return hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}", ctx, null);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [批 5b-1] agent 归因上下文：显式载体 PromptLlmContext.agentContext()
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[批 5b-1] PromptLlmContext.agentContext() 跨 commonPool 线程到达 provider（不再读 ThreadLocal）")
+    void execPromptHook_agentContext_crossesCommonPoolWorker() {
+        // WHY（意图验证）: hook 的 LLM 调用在 CompletableFuture.supplyAsync（无 executor → commonPool）
+        //   闭包内；CC 的 AsyncLocalStorage 跨 await 自动传播 agentContext，Java 的 plain ThreadLocal
+        //   不跨线程 ⇒ 原实现在闭包内读 AgentContext.getAgentContext() 恒 null
+        //   ⇒ invokingRequestId/invocationKind 归因边静默丢失。值必须来自显式载体（PromptLlmContext）。
+        AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
+        AtomicReference<String> workerThread = new AtomicReference<>();
+        com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", "sess-parent", "Explore", true, "req_hook_1", "spawn");
+        LlmProvider provider = new LlmProvider() {
+            @Override public String type() { return "test"; }
+            @Override public void stream(ProviderConfig c, String m,
+                List<com.nexusai.application.agent.prompt.SystemPromptBlock> blocks,
+                List<com.nexusai.model.session.dto.ChatMessageDto> h,
+                com.fasterxml.jackson.databind.node.ArrayNode t,
+                Integer maxOutputTokensOverride,
+                com.nexusai.infra.llm.TaskBudgetParam taskBudget,
+                String effortValue, String querySource,
+                java.util.function.Consumer<String> oc,
+                java.util.function.Consumer<AssistantMessage> oam,
+                java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
+                java.util.function.Consumer<String> orc, Runnable osf,
+                com.nexusai.application.agent.tool.AbortController ac,
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                throw new UnsupportedOperationException();
+            }
+            @Override public String chat(ProviderConfig c, String m, String s, String u) {
+                throw new UnsupportedOperationException("本用例只走 chatWithOptions");
+            }
+            @Override public String chatWithOptions(ProviderConfig c, String m, String s, String u,
+                                                    LlmProvider.ChatRequestOptions options) {
+                captured.set(options);
+                workerThread.set(Thread.currentThread().getName());
+                return "{\"ok\": true}";
+            }
+        };
+        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        PromptHook cfg = new PromptHook("allow if safe", null, null, null, null, null);
+        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
+            provider, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, subCtx);
+
+        String testThread = Thread.currentThread().getName();
+        HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"ls\"}", ctx, null);
+
+        assertThat(r.outcome()).isEqualTo(HookOutcome.SUCCESS);
+        assertThat(captured.get()).as("hook 必须走 chatWithOptions").isNotNull();
+        assertThat(workerThread.get())
+            .as("LLM 调用在派生线程（commonPool）执行——证明值确实跨线程携带")
+            .isNotEqualTo(testThread);
+        assertThat(captured.get().agentContext())
+            .as("provider 收到 PromptLlmContext 上显式携带的同一实例（sparse-edge 语义要求同实例）")
+            .isSameAs(subCtx);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -106,7 +168,7 @@ class ExecPromptHookSemanticsTest {
         PromptHook cfg = new PromptHook(prompt, null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx =
             new ExecPromptHook.PromptLlmContext(echoProvider("{\"ok\": false, \"reason\": \"dangerous\"}"),
-                ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+                ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"rm\"}", ctx, null);
 
@@ -238,7 +300,7 @@ class ExecPromptHookSemanticsTest {
             }
         };
         HookResult cancelled = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}",
-            new ExecPromptHook.PromptLlmContext(slow, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null), null);
+            new ExecPromptHook.PromptLlmContext(slow, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */), null);
         assertThat(cancelled.outcome()).isEqualTo(HookOutcome.CANCELLED);
     }
 
@@ -249,7 +311,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("eval input: $ARGUMENTS", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            echoProviderWithCapture(capturedUser, "{\"ok\": true}"), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            echoProviderWithCapture(capturedUser, "{\"ok\": true}"), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}", ctx, null);
 
@@ -297,7 +359,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}", ctx, null);
 
@@ -362,7 +424,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, parentTools);
+            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, parentTools, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null);
 
@@ -415,7 +477,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);  // hook.model = null
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), "", null);   // defaultFastModel = 空串
+            capturing, ProviderConfig.empty(), "", null, null /* [批 5b-1] agentContext */);   // defaultFastModel = 空串
 
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null);
 
@@ -477,7 +539,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("eval: $ARGUMENTS", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
         List<com.nexusai.model.session.dto.ChatMessageDto> prior =
             List.of(userMsg("prior-1"), userMsg("prior-2"));
 
@@ -524,7 +586,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null, null);   // 6 参入口等价 null
 
@@ -591,7 +653,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null);
 
@@ -610,7 +672,7 @@ class ExecPromptHookSemanticsTest {
         ExecPromptHook hook = new ExecPromptHook(objectMapper);
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            echoProvider("{\"ok\": true}"), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+            echoProvider("{\"ok\": true}"), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, parent);
 

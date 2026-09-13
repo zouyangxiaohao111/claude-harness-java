@@ -897,4 +897,39 @@ class SkillImprovementHookTest {
         // （原 00000000-0000-0000-0000-abc123450000 反解逻辑失去前提）。
         assertThat("sess-abc12345").isEqualTo("sess-abc12345");
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [批 5b-1] (b) 类缺值出口：REST 触发路径无 agent 上下文 → 显式 null + ≥WARN
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[批 5b-1] applyQueryOptions：无 agent 上下文 → 显式 null + ≥WARN（禁只 DEBUG）")
+    void applyQueryOptions_noAgentContext_explicitNullAndWarnAtLeastWarn() throws Exception {
+        // WHY: 该侧信道 LLM 查询跑在无 executor 的 CompletableFuture（commonPool）线程，
+        //   原实现读 AgentContext ThreadLocal 恒 null（且值来源不可控）；本路径由 REST
+        //   （skill improvement survey）触发 ⇒ 本就不存在 agent 上下文（(b) 类，等价 CC 该路径
+        //   ambient context undefined）。按用户裁定 1：可跳过，但日志级别必须 ≥WARN，
+        //   否则 invokingRequestId 归因缺失会无人察觉（静默失效）。
+        java.lang.reflect.Field flag = SkillImprovementHook.class.getDeclaredField("NO_AGENT_CONTEXT_WARNED");
+        flag.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean) flag.get(null)).set(false);   // 重置一次性闸（静态跨用例共享）
+
+        Logger logger = (Logger) org.slf4j.LoggerFactory.getLogger(SkillImprovementHook.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            LlmProvider.ChatRequestOptions options = SkillImprovementHook.applyQueryOptions();
+
+            assertThat(options.agentContext())
+                .as("(b) 类：显式无 agent 上下文（不再读 AgentContext ThreadLocal）")
+                .isNull();
+            assertThat(appender.list)
+                .as("≥WARN 可观测（用户裁定 1：禁只 DEBUG）")
+                .anyMatch(e -> e.getLevel().isGreaterOrEqual(Level.WARN)
+                    && e.getFormattedMessage().contains("无 agent 归因上下文"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
 }

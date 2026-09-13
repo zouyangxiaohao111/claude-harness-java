@@ -491,7 +491,10 @@ public class SubagentExecutor {
             //   wither（「派生视图」语义），非身份来源；不透传会把 Step 20 盖的身份清掉。
             //   真正的值由 Step 20 withSubagentIdentity 从 agentDefinition 单点写入。
             source.subagentName(),
-            source.isBuiltIn()
+            source.isBuiltIn(),
+            // [批 5b-1] agentContext 透传 — 同 subagentName/isBuiltIn：本方法是 TUC 的 record-copy
+            //   wither（「派生视图」语义），非身份来源；不透传会把盖章点（withAgentContext）的值清掉。
+            source.agentContext()
         );
     }
 
@@ -2004,12 +2007,24 @@ public class SubagentExecutor {
             //   hook 侧消费者：SessionFileAccessHooks.subagentProps(ctx)（PostToolUse 回调经
             //   HookRegistry:2596 supplyAsync(HOOK_EXECUTOR) 派发，ThreadLocal 不可达 → 必须显式载体）。
             final SubagentIdentity identityForLoop = SubagentIdentity.of(defForLoop);
-            final ToolUseContext ctxForLoop = subagentCtx.withSubagentIdentity(
-                identityForLoop.subagentName(), identityForLoop.isBuiltIn());
             AgentContext.SubagentContext agentContext = buildSubagentAgentContext(
                 agentId, identityForLoop.subagentName(), identityForLoop.isBuiltIn(),
                 this.invokingRequestId,
                 invocationKind);
+            // [批 5b-1] TUC 定稿步**同时**盖两个显式载体：① 子代理身份（subagentName/isBuiltIn，
+            //   hook 侧归因）② agent 归因上下文（agentContext，classifier / exec-prompt hook /
+            //   tool-use summary 侧归因）。WHY 在此点：本步是「TUC 定稿、进入 query loop 前」，
+            //   而 Step 18 的 withEffectiveCwd 派生链只做 record-copy 透传（不清值），故此处盖章
+            //   可覆盖整条 query loop 及其派生 TUC。
+            //   WHY 必须显式盖（而不是让消费点读 AgentContext ThreadLocal）：消费点
+            //   （YoloClassifierImpl / ExecPromptHook / HaikuToolUseSummaryGenerator）跑在无 executor 的
+            //   CompletableFuture(commonPool) 线程上，plain ThreadLocal 不跨线程 ⇒ 读恒 null
+            //   ⇒ invokingRequestId/invocationKind 归因边静默丢失（CC 的 AsyncLocalStorage 自动传播，无此问题）。
+            final ToolUseContext ctxForLoop = subagentCtx.withSubagentIdentity(
+                identityForLoop.subagentName(), identityForLoop.isBuiltIn()).withAgentContext(agentContext);
+            log.info("[SubagentExecutor] [批 5b-1] 子代理 TUC 已盖 agent 归因上下文: agentId={} "
+                    + "invokingRequestId={} invocationKind={}（commonPool 派生线程经显式载体可读）",
+                agentId, this.invokingRequestId, invocationKind);
             log.info("[SubagentExecutor] [R2-CTX] subagent 执行进入 AgentContext 作用域: agentId={} (a+16hex={}) "
                     + "subagentName={} invocationKind={} (analytics 归因)",
                 agentId, agentIdHex, defForLoop.agentType(), invocationKind);

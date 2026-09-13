@@ -104,7 +104,8 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
             List<ToolUseBlock> toolUseBlocks,
             List<ChatMessageDto> messagesWithToolResults,
             String lastAssistantText,
-            boolean isNonInteractiveSession) {
+            boolean isNonInteractiveSession,
+            com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // 对齐 CC toolUseSummaryGenerator.ts:51-53 tools.length === 0 → null
         if (toolUseBlocks == null || toolUseBlocks.isEmpty()) {
             return CompletableFuture.completedFuture(null);
@@ -112,7 +113,11 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
         return CompletableFuture.supplyAsync(() -> {
             try {
                 String summary = callHaiku(toolUseBlocks, messagesWithToolResults, lastAssistantText,
-                    isNonInteractiveSession);
+                    isNonInteractiveSession,
+                    // [批 5b-1] agent 归因上下文**显式传入**（本 lambda 跑在无 executor 的
+                    //   commonPool worker 上，闭包内读 AgentContext ThreadLocal 恒 null
+                    //   → invokingRequestId/invocationKind 归因边静默丢失；CC 的 ALS 无此问题）。
+                    agentContext);
                 if (summary == null || summary.isBlank()) {
                     return null;
                 }
@@ -144,7 +149,8 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
     private String callHaiku(List<ToolUseBlock> toolUseBlocks,
                              List<ChatMessageDto> messagesWithToolResults,
                              String lastAssistantText,
-                             boolean isNonInteractiveSession) {
+                             boolean isNonInteractiveSession,
+                             com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (llmProviderFactory == null) {
             return null;
         }
@@ -194,7 +200,12 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
                 List.of(),   // CC :76 agents: []
                 Boolean.FALSE, // CC :78 hasAppendSystemPrompt: false
                 List.of(),   // CC :79 mcpTools: []
-                isNonInteractiveSession, com.nexusai.application.agent.subagent.AgentContext.getAgentContext()); // CC :77 isNonInteractiveSession 透传
+                // [批 5b-1] agent 归因上下文改取**显式形参**（原读 AgentContext.getAgentContext()
+                //   ThreadLocal：本方法在 commonPool worker 上运行 ⇒ 读恒 null ⇒
+                //   invokingRequestId/invocationKind 归因边静默丢失；CC 的 ALS 无此问题）。
+                //   本路径由调用方（LlmAgentLoop tool_use_summary 生产点）从 TUC 显式下传；
+                //   主循环语义 = null（对齐 CC 主线程 undefined，见 CC query.ts:1469 !agentId 门）。
+                isNonInteractiveSession, agentContext); // CC :77 isNonInteractiveSession 透传
             return llmProviderFactory.getProvider(resolved.config(), resolved.providerType()).chatWithOptions(
                 resolved.config(),
                 modelName,

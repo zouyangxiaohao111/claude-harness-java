@@ -42,6 +42,16 @@ public interface ToolUseSummaryGenerator {
      * @param lastAssistantText       最后 assistant 文本（CC {@code lastAssistantText}）
      * @param isNonInteractiveSession CC {@code isNonInteractiveSession} 透传
      *                                （toolUseSummaryGenerator.ts:77；Java 直呼路径仅携带对齐）
+     * @param agentContext            agent 归因上下文（显式载体）· CC original: queryHaiku 经 ALS
+     *                                读 ambient agentContext（logging.ts:294/:461）。
+     *                                <p><b>[批 5b-1]</b>：本参数替代「生成器闭包内读
+     *                                {@code AgentContext.getAgentContext()} ThreadLocal」——
+     *                                生成器跑在无 executor 的 {@code CompletableFuture}（commonPool）
+     *                                线程上，plain ThreadLocal 不跨线程 ⇒ 原读恒 null ⇒
+     *                                {@code invokingRequestId}/{@code invocationKind} 归因边静默丢失
+     *                                （CC 的 AsyncLocalStorage 自动跨 await 传播，无此问题）。
+     *                                调用方从 ToolUseContext 显式取（{@code ctx.agentContext()}）。
+     *                                null = 无 agent 上下文（主线程，等价 CC undefined）。
      * @return 摘要 attachment（type='tool_use_summary'，含 precedingToolUseIds）；
      *         生成失败/空工具返回 completedFuture(null)
      */
@@ -50,5 +60,6 @@ public interface ToolUseSummaryGenerator {
         List<ToolUseBlock> toolUseBlocks,
         List<ChatMessageDto> messagesWithToolResults,
         String lastAssistantText,
-        boolean isNonInteractiveSession);
+        boolean isNonInteractiveSession,
+        com.nexusai.application.agent.subagent.AgentContext agentContext);
 }

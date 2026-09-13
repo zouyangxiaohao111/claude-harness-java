@@ -1874,4 +1874,51 @@ class ClaudemdEngineTest {
             com.nexusai.common.SessionProjectRoot.clearSession(sessionId);
         }
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // [批 5b-1] memoize 键含会话身份（跨会话冻结修复）
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[批 5b-1] getMemoryFiles 缓存键含会话身份：会话 B 不得复用会话 A 的列表（跨会话冻结）")
+    void getMemoryFiles_cacheKeyIncludesSessionIdentity() throws Exception {
+        // WHY（意图验证）: CC 的 lodash memoize 只按 forceIncludeExternal 建键是**安全的**
+        //   （CC 单进程单会话，扫描根 = 进程级 getOriginalCwd）；本仓一 JVM 多会话，
+        //   扫描根随 sessionId 解析 ⇒ 单布尔键会让「会话 A 的 CLAUDE.md 列表被会话 B 复用」
+        //   —— 静默读到看起来合法的错值（正是本次改造要杀的一类病）。
+        //   本用例两个会话指向**不同项目目录**，断言各自只看到自己的 CLAUDE.md。
+        setUp(false);
+        Path wsA = Files.createTempDirectory("5b1-ws-a");
+        Path wsB = Files.createTempDirectory("5b1-ws-b");
+        Files.writeString(wsA.resolve("CLAUDE.md"), "# PROJECT-A-RULES\n");
+        Files.writeString(wsB.resolve("CLAUDE.md"), "# PROJECT-B-RULES\n");
+
+        // 扫描根按显式 sessionId 分流（生产 = CwdResolution.getOriginalCwdLayer(sessionId)）
+        ClaudemdEngine twoRoots = new ClaudemdEngine(autoMemPaths, detection,
+            sessionId -> "sess-A".equals(sessionId) ? wsA.toString() : wsB.toString(),
+            () -> true, () -> true, () -> true,
+            () -> false, () -> List.of());
+
+        List<MemoryFileInfo> a = twoRoots.getMemoryFiles(false, "sess-A");
+        List<MemoryFileInfo> b = twoRoots.getMemoryFiles(false, "sess-B");
+
+        assertThat(a.stream().map(MemoryFileInfo::content).toList())
+            .as("会话 A：拿到 A 项目的 CLAUDE.md")
+            .anyMatch(c -> c.contains("PROJECT-A-RULES"));
+        assertThat(b.stream().map(MemoryFileInfo::content).toList())
+            .as("会话 B：拿到 B 项目的 CLAUDE.md")
+            .anyMatch(c -> c.contains("PROJECT-B-RULES"));
+        assertThat(b.stream().map(MemoryFileInfo::content).toList())
+            .as("反向断言（关键）：B 的列表里**不得**出现 A 项目的内容"
+                + "（单布尔键的旧实现会返回 A 的缓存列表 ⇒ 本条变红）")
+            .noneMatch(c -> c.contains("PROJECT-A-RULES"));
+        assertThat(a.stream().map(MemoryFileInfo::content).toList())
+            .as("反向断言：A 的列表里不得出现 B 项目的内容")
+            .noneMatch(c -> c.contains("PROJECT-B-RULES"));
+
+        // 同会话重复调用仍 memoize（键含会话身份不等于取消缓存）
+        assertThat(twoRoots.getMemoryFiles(false, "sess-A"))
+            .as("同一 (force, 扫描根, projectRoot) ⇒ 缓存命中，仍返回同一实例")
+            .isSameAs(a);
+    }
 }

@@ -101,7 +101,7 @@ class R33H2_ExecPromptHookTest {
 
     private ExecPromptHook.PromptLlmContext ctx(LlmProvider provider) {
         // 4 参构造（DEL-EX-04 收敛: 3 参兼容构造器已删除, 无工具 → 显式传 null）
-        return new ExecPromptHook.PromptLlmContext(provider, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null);
+        return new ExecPromptHook.PromptLlmContext(provider, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
     }
 
     private LlmProvider echoProvider(AtomicReference<String> capturedUser, String response) {

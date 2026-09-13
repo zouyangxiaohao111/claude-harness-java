@@ -92,7 +92,7 @@ class ToolUseSummaryGeneratorTest {
         List<ToolUseBlock> tools = List.of(new ToolUseBlock("toolu_1", "Bash", JSON.createObjectNode()));
 
         AttachmentMessageDto result = gen.generateToolUseSummaryAsync(
-            state, tools, List.of(), "check files", true).join();
+            state, tools, List.of(), "check files", true, null /* [批 5b-1] agentContext（测试=无 agent 上下文） */).join();
 
         assertThat(result)
             .as("Haiku 成功 → 必须返回 tool_use_summary attachment")
@@ -121,7 +121,7 @@ class ToolUseSummaryGeneratorTest {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         List<ToolUseBlock> tools = List.of(new ToolUseBlock("toolu_9", "Bash", JSON.createObjectNode()));
 
-        gen.generateToolUseSummaryAsync(state, tools, List.of(), "debug the crash", true).join();
+        gen.generateToolUseSummaryAsync(state, tools, List.of(), "debug the crash", true, null /* [批 5b-1] agentContext */).join();
 
         ArgumentCaptor<String> sysPromptCaptor = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<LlmProvider.ChatRequestOptions> optionsCaptor =
@@ -160,11 +160,88 @@ class ToolUseSummaryGeneratorTest {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
 
         AttachmentMessageDto result = gen.generateToolUseSummaryAsync(
-            state, List.of(), List.of(), null, false).join();
+            state, List.of(), List.of(), null, false, null /* [批 5b-1] agentContext */).join();
 
         assertThat(result)
             .as("tools.length==0 → 必须返回 null（CC generateToolUseSummary 早返）")
             .isNull();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // 1b. [批 5b-1] agent 归因上下文：显式传递（真实 commonPool 线程）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[批 5b-1] 组件: 显式 agentContext 跨 commonPool 线程送达 provider（同实例）")
+    void haikuGenerator_forwardsExplicitAgentContextOnPoolWorker() {
+        // WHY（意图验证）: 生成器的 Haiku 调用在无 executor 的 CompletableFuture（commonPool worker）
+        //   闭包内；原实现闭包内读 AgentContext.getAgentContext() 恒 null（plain ThreadLocal 不跨线程）
+        //   ⇒ invokingRequestId/invocationKind 归因边静默丢失。值必须来自显式形参。
+        java.util.concurrent.atomic.AtomicReference<LlmProvider.ChatRequestOptions> capturedOptions =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<String> workerThread =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        LlmProvider provider = Mockito.mock(LlmProvider.class);
+        when(provider.chatWithOptions(any(), anyString(), anyString(), anyString(), any()))
+            .thenAnswer(inv -> {
+                capturedOptions.set(inv.getArgument(4));
+                workerThread.set(Thread.currentThread().getName());
+                return "Used Bash 3 times";
+            });
+        LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
+        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
+        ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
+        when(resolver.resolve(anyString())).thenReturn(
+            new ModelConfigResolver.ResolvedModel(
+                new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
+        HaikuToolUseSummaryGenerator gen = new HaikuToolUseSummaryGenerator(factory, resolver);
+        AgentState state = new AgentState("sys",
+            "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
+        List<ToolUseBlock> tools =
+            List.of(new ToolUseBlock("toolu_ctx", "Bash", JSON.createObjectNode()));
+        com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", "sess-parent", "Explore", true, "req_sum_1", "spawn");
+
+        String testThread = Thread.currentThread().getName();
+        gen.generateToolUseSummaryAsync(state, tools, List.of(), "check files", true, subCtx).join();
+
+        assertThat(capturedOptions.get()).as("生成器必须走 chatWithOptions").isNotNull();
+        assertThat(workerThread.get())
+            .as("Haiku 生成在派生线程（commonPool worker）而非测试线程")
+            .isNotEqualTo(testThread);
+        assertThat(capturedOptions.get().agentContext())
+            .as("provider 收到显式形参的**同一实例**（改前读 ThreadLocal ⇒ worker 上恒 null）")
+            .isSameAs(subCtx);
+    }
+
+    @Test
+    @DisplayName("[批 5b-1] loop 生产点: per-turn TUC 的 agentContext 透传给生成器（写入端断言）")
+    void loop_passesPerTurnTucAgentContextToGenerator() {
+        // WHY（写入端）: 「A 写入 → B 读取」两侧都要有断言；本用例钉 loop 侧
+        //   （LlmAgentLoop tool_use_summary 生产点）确实从 per-turn TUC 取值下传。
+        com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", "sess-parent", "Explore", true, "req_loop_1", "spawn");
+        com.nexusai.application.agent.tool.ToolUseContext stampedTuc =
+            com.nexusai.application.agent.tool.ToolUseContext.of(
+                    java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                .withAvailableTools(java.util.List.of(
+                    com.nexusai.application.agent.TestContexts.dummyTool("Bash")))
+                .withAgentContext(subCtx);
+
+        ToolUseSummaryGenerator generator = Mockito.mock(ToolUseSummaryGenerator.class);
+        when(generator.generateToolUseSummaryAsync(any(), anyList(), anyList(), any(), anyBoolean(), any()))
+            .thenReturn(java.util.concurrent.CompletableFuture.completedFuture(null));
+        runLoopWithToolTurn(true, generator, stampedTuc);
+
+        org.mockito.ArgumentCaptor<com.nexusai.application.agent.subagent.AgentContext> ctxCaptor =
+            org.mockito.ArgumentCaptor.forClass(com.nexusai.application.agent.subagent.AgentContext.class);
+        verify(generator).generateToolUseSummaryAsync(any(), anyList(), anyList(), any(), anyBoolean(),
+            ctxCaptor.capture());
+        assertThat(ctxCaptor.getValue())
+            .as("loop 生产点必须把 per-turn TUC 的 agentContext 下传（写入端）")
+            .isSameAs(subCtx);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -177,7 +254,7 @@ class ToolUseSummaryGeneratorTest {
         AttachmentMessageDto summaryAttachment = new AttachmentMessageDto(
             null, "attachment", "tool_use_summary", "tools did X", null, null, null);
         ToolUseSummaryGenerator generator = Mockito.mock(ToolUseSummaryGenerator.class);
-        when(generator.generateToolUseSummaryAsync(any(), anyList(), anyList(), any(), anyBoolean()))
+        when(generator.generateToolUseSummaryAsync(any(), anyList(), anyList(), any(), anyBoolean(), any()))
             .thenReturn(CompletableFuture.completedFuture(summaryAttachment));
 
         AgentState state = runLoopWithToolTurn(true, generator);
@@ -193,7 +270,7 @@ class ToolUseSummaryGeneratorTest {
         ToolUseSummaryGenerator generator = Mockito.mock(ToolUseSummaryGenerator.class);
         AgentState state = runLoopWithToolTurn(false, generator);
 
-        verify(generator, never()).generateToolUseSummaryAsync(any(), anyList(), anyList(), any(), anyBoolean());
+        verify(generator, never()).generateToolUseSummaryAsync(any(), anyList(), anyList(), any(), anyBoolean(), any());
         assertThat(state.attachments().stream().anyMatch(a -> "tool_use_summary".equals(a.type())))
             .as("gate=off → 不得注入 tool_use_summary attachment")
             .isFalse();
@@ -311,6 +388,11 @@ class ToolUseSummaryGeneratorTest {
      * 不真正执行工具。
      */
     private static AgentState runLoopWithToolTurn(boolean gateOn, ToolUseSummaryGenerator generator) {
+        return runLoopWithToolTurn(gateOn, generator, null);
+    }
+
+    private static AgentState runLoopWithToolTurn(boolean gateOn, ToolUseSummaryGenerator generator,
+                                                  com.nexusai.application.agent.tool.ToolUseContext callerTuc) {
         // [H7-arch Phase 5-2 P3-⑤] 重方法已 static 化（真实 handleToolCallsTurn + 真实 executor，
         // 由 per-turn TUC availableTools 的 dummy "Bash" 驱动；Bash 返回固定 success result → "continue"）：
         //   getModelForCall → deps.resolveModel() null → 回落 recoveryState=params.modelName()="test-model"；
@@ -364,10 +446,11 @@ class ToolUseSummaryGeneratorTest {
 
         com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(
-                    java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
-                    .withAvailableTools(java.util.List.of(
-                        com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
+                callerTuc != null ? callerTuc
+                    : com.nexusai.application.agent.tool.ToolUseContext.of(
+                        java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                        .withAvailableTools(java.util.List.of(
+                            com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());
         LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),

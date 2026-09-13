@@ -346,7 +346,9 @@ public class ExecPromptHook {
             combinedAbort,  // [IMPL-06 OD-EX-02] abortController — CC execPromptHook.ts:73 signal: combinedSignal
                           //   （combined = 父 abort ∪ timeout；provider 预检 + onCancel 硬中断，combinedAbortSignal.ts:15-47）
             null    // [IMP-M-P1-2] maxTokens — CC execPromptHook.ts 未设 max_tokens（缺省 1024）
-        , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+        , llmContext.agentContext());   // [批 5b-1] agent 归因上下文改取显式载体
+                                        //   （原读 AgentContext ThreadLocal：本方法在 supplyAsync
+                                        //   闭包内运行 → 恒 null → invokingRequestId 归因边静默丢失）
     }
 
     /** Tool 列表 → OpenAI function-calling 格式（无工具 → null）. */
@@ -522,7 +524,16 @@ public class ExecPromptHook {
         LlmProvider provider,
         ProviderConfig config,
         String defaultFastModel,
-        List<com.nexusai.application.agent.tool.Tool> tools
+        List<com.nexusai.application.agent.tool.Tool> tools,
+        // [批 5b-1] agent 归因上下文（显式载体）· CC original: execPromptHook.ts 经 ALS 读 ambient
+        //   agentContext（logging.ts:294/:461 consumeInvokingRequestId）。Java 的
+        //   AgentContext.STORAGE 是 plain ThreadLocal，而本 hook 的 LLM 调用跑在
+        //   supplierAsync 闭包（commonPool worker）⇒ 闭包内读 ThreadLocal 恒 null
+        //   ⇒ invokingRequestId/invocationKind 归因边静默丢失。
+        //   值由 HookRegistry 从父 TUC 取（该 TUC 在 SubagentExecutor / buildBaseToolUseContext
+        //   显式盖章），随本 record 显式下传。null = 主线程/无 agent 上下文
+        //   （等价 CC context?.invokingRequestId undefined）。
+        com.nexusai.application.agent.subagent.AgentContext agentContext
     ) {
         public PromptLlmContext {
             if (provider == null) {

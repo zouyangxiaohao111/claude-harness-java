@@ -5386,7 +5386,12 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             parentTuc != null && parentTuc.availableTools() != null
                 ? parentTuc.availableTools() : List.of();
         ExecPromptHook.PromptLlmContext llmContext = new ExecPromptHook.PromptLlmContext(
-            resolution.provider(), resolution.config(), modelName, parentTools);
+            resolution.provider(), resolution.config(), modelName, parentTools,
+            // [批 5b-1] agent 归因上下文从**父 TUC 显式取**（不再让 hook 闭包读 AgentContext
+            //   ThreadLocal：hook 的 LLM 调用跑在 supplyAsync(commonPool) 线程，读恒 null
+            //   → invokingRequestId/invocationKind 归因边静默丢失；CC 的 ALS 无此问题）。
+            //   父 TUC 的值由 SubagentExecutor / buildBaseToolUseContext 在各自线程盖章。
+            parentTuc != null ? parentTuc.agentContext() : null);
         // [IMPL-06 D5-1/OD-EX-02] 父 abort 透传 · 对齐 CC hooks.ts:2235 abortSignal（父 per-turn TUC
         //   abortController；null = 无父上下文 → 无父取消，与 CC signal 缺省语义一致）。
         com.nexusai.application.agent.tool.AbortController parentAbort =

@@ -7949,7 +7949,14 @@ public class LlmAgentLoop implements AgentLoop {
                     // [D10 双视图] 选边 = modelView()（模型面）：第 3 参 = 「含 tool 结果的消息链」，
                     //   摘要提示词会把它喂给 Haiku → 与改造前 state（入口写回后 = 投影面）逐条一致。
                     pendingToolUseSummary = ctx.toolUseSummaryGenerator().generateToolUseSummaryAsync(
-                        state, msg.toolCalls(), state.modelView(), lastAssistantText, isNonInteractiveSession);
+                        state, msg.toolCalls(), state.modelView(), lastAssistantText, isNonInteractiveSession,
+                        // [批 5b-1] agent 归因上下文从 per-turn TUC 显式下传（生成器跑在 commonPool
+                        //   worker，闭包内读 AgentContext ThreadLocal 恒 null）。
+                        //   本生产点带 !agentId 门（见上方 state.agentId() == null，对齐 CC
+                        //   query.ts:1469）⇒ 主循环语义 = null（等价 CC 主线程 undefined）；
+                        //   后台 loop（MainSessionBackgroundService）则由 buildBaseToolUseContext
+                        //   捕获到该后台任务自己的 SubagentContext 并随 TUC 下传。
+                        perTurnTuc != null ? perTurnTuc.agentContext() : null);
                     log.info("[LlmAgentLoop] turn={} tool_use_summary 生产 (toolCalls={}, agentId=null, isNonInteractiveSession={}) · CC query.ts:1469-1481",
                         state.turnCount(), msg.toolCalls().size(), isNonInteractiveSession);
                 }
@@ -9851,7 +9858,15 @@ public class LlmAgentLoop implements AgentLoop {
             null,                             // toolUseId
             null,                             // criticalSystemReminder_EXPERIMENTAL
             null,                             // [L+ R1] readFileState (compact ctor 兜底新 cache)
-            buildBaseMcpServerConnections());  // [Q-09-R2-1] 主链 base TUC 注入活跃池连接包装（对齐 CC runAgent.ts:653-656 parentClients 来源=主链活跃池；修复前恒空 List.of()）
+            buildBaseMcpServerConnections())   // [Q-09-R2-1] 主链 base TUC 注入活跃池连接包装（对齐 CC runAgent.ts:653-656 parentClients 来源=主链活跃池；修复前恒空 List.of()）
+            // [批 5b-1] agent 归因上下文**在此（loop 线程）捕获一次**，随 TUC 显式下传：
+            //   消费点（YoloClassifierImpl / ExecPromptHook / HaikuToolUseSummaryGenerator）跑在无 executor 的
+            //   CompletableFuture(commonPool) 线程上，plain ThreadLocal 不跨线程 ⇒ 闭包内读恒 null。
+            //   捕获值语义与 CC 一致：主循环线程 ambient = null（等价 CC 主线程 undefined）；
+            //   后台任务（MainSessionBackgroundService 在 runWithAgentContext 内跑本 loop）则捕获到
+            //   该后台任务自己的 SubagentContext（对齐 CC 的 ALS 传播）。
+            //   ⛔ 派生线程内不得回放 ThreadLocal 再读（用户铁律：回放不算合规）。
+            .withAgentContext(com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
     }
 
 

@@ -229,7 +229,37 @@ public class AwaySummaryService {
             "away_summary",                            // CC :54 querySource: 'away_summary'
             signal,                                    // CC :45 signal → provider abort 预检（claude.ts:744-745）
             null,                                      // maxTokens — CC 未设
-            Boolean.TRUE, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());                             // CC :56 skipCacheWrite: true
+            Boolean.TRUE, // CC :56 skipCacheWrite: true
+            // [批 5b-1] agent 归因上下文 = (b) 类显式无值（原读 AgentContext.getAgentContext()
+            //   ThreadLocal：本 options 在无 executor 的 CompletableFuture(commonPool) 闭包内构造，
+            //   读恒 null，且值来源不可控）。away_summary 由 REST（AwaySummaryController）触发 ——
+            //   非子代理 query loop、无 runWithAgentContext 作用域 ⇒ 本就不存在 agent 上下文
+            //   （等价 CC 该路径 ambient context undefined）。
+            //   按「不许静默失效」红线：(b) 类可跳过但必须 ≥WARN 可观测（见 helper）。
+            noAgentContextForRestPath());
+    }
+
+    /** [批 5b-1] (b) 类缺值出口 · ≥WARN 可观测（一次性，避免空闲轮询刷屏）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean NO_AGENT_CONTEXT_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * [批 5b-1] 「本路径本就无 agent 上下文」的显式出口。
+     *
+     * <p>WHY 不是返回 null 就完事：按用户裁定 1（缺值守卫）——「本就不需要」可跳过，但日志级别
+     * <b>必须 ≥ WARN，禁止只写 DEBUG</b>，否则归因边缺失会无人察觉。一次性提示（同
+     * {@code CwdResolution} 的 warnNullSession / warnUnknownSession 惯例）。
+     *
+     * @return 恒 null（等价 CC {@code context?.invokingRequestId} undefined）
+     */
+    private static com.nexusai.application.agent.subagent.AgentContext noAgentContextForRestPath() {
+        if (NO_AGENT_CONTEXT_WARNED.compareAndSet(false, true)) {
+            log.warn("[AwaySummary] [批 5b-1] away_summary 路径无 agent 归因上下文：本服务由 REST"
+                    + "（AwaySummaryController）触发，非子代理 query loop、无 runWithAgentContext 作用域"
+                    + " ⇒ invokingRequestId/invocationKind 归因边不发射（(b) 类：本路径本就不需要）。"
+                    + "如需归因，须从会话侧显式传 AgentContext。仅提示一次。");
+        }
+        return null;
     }
 
     /** CC buildAwaySummaryPrompt（awaySummary.ts:18-23）· 逐字对齐，含 memory 前缀。 */

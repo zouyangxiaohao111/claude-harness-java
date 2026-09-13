@@ -136,8 +136,45 @@ public class ClaudemdEngine {
     private volatile Supplier<Boolean> teamMemoryEnabled;
     private final Supplier<List<String>> claudeMdExcludesSupplier;
 
-    /** getMemoryFiles memoize 缓存（CC lodash memoize keyed on forceIncludeExternal）。 */
-    private final Map<Boolean, List<MemoryFileInfo>> memoryFilesCache = new ConcurrentHashMap<>();
+    /**
+     * getMemoryFiles memoize 缓存（CC lodash memoize）· <b>[批 5b-1] 键含会话/项目身份</b>。
+     *
+     * <p><b>WHY 键必须含会话身份（本批修复的跨会话缺陷）</b>：CC 的 lodash memoize 只按
+     * {@code forceIncludeExternal} 建键（claudemd.ts:790-1075），<b>在 CC 里是安全的</b> ——
+     * CC 单进程单会话，扫描根 = 进程级 {@code getOriginalCwd()}（bootstrap/state.ts），故「键 = 全部输入」。
+     * 而本仓是 **一 JVM 多会话**：扫描根来自 {@code sessionId → originalCwd}（resolveOriginalCwd），
+     * projectRoot 来自显式入参 ⇒ 同一布尔键下 <b>会话 A 的 CLAUDE.md 列表会被会话 B 复用</b>
+     * （代码旧注释自陈「首个调用者的会话上下文胜出」）—— 正是「静默读到一个看起来合法的错值」。
+     *
+     * <p><b>键 = 计算体的完整输入</b>：{@code forceIncludeExternal} + 扫描根（originalCwd）+
+     * {@code sessionProjectRoot}。这三者恰是 computeMemoryFiles 里能被外部改变的输入
+     * （其余 isManaged/isUser 等为进程级策略，变更经 clearMemoryFileCaches 失效）。
+     *
+     * <p><b>淘汰策略</b>：条目数 = 不同 (扫描根, projectRoot) 组合数（≈ 项目数 + worktree 数），
+     * <b>不随会话数增长</b>；失效沿用既有 {@link #clearMemoryFileCaches()} 调用面
+     * （Enter/ExitWorktree 切换、PostCompact、memory REST 变更、TeamMemorySyncService）。
+     * ⛔ 本批**未**引入容量上限/LRU（属新策略，需用户裁定，见报告「未决」）。
+     */
+    private final Map<String, List<MemoryFileInfo>> memoryFilesCache = new ConcurrentHashMap<>();
+
+    /**
+     * [批 5b-1] 构造 memoryFilesCache 键 · 三输入 = computeMemoryFiles 的全部会话态输入。
+     *
+     * <p>分隔符用 NUL（{@code \0}）：路径 / sessionId / projectRoot 中不可能出现，故三段拼接无歧义
+     * （避免 {@code "a|b"} 与 {@code "a"} + {@code "|b"} 之类碰撞）。
+     *
+     * @param forceIncludeExternal 外部 include 强制位（CC 原键，唯一原成分）
+     * @param scanRoot             扫描根 = {@link #resolveOriginalCwd(String)}(sessionId)
+     *                             （PROJECT/LOCAL 向上遍历的起点）
+     * @param sessionProjectRoot   会话绑定项目根（AutoMem/TeamMem 用；null = 无显式根）
+     * @return 缓存键
+     */
+    private static String memoryFilesCacheKey(boolean forceIncludeExternal, String scanRoot,
+                                             String sessionProjectRoot) {
+        return forceIncludeExternal + "\0"
+            + (scanRoot == null ? "" : scanRoot) + "\0"
+            + (sessionProjectRoot == null ? "" : sessionProjectRoot);
+    }
 
     /** 遥测注入 · null → 不发射（对齐 CC logEvent 可空上下文）。 */
     private volatile com.nexusai.application.agent.telemetry.Telemetry telemetry;
@@ -434,12 +471,16 @@ public class ClaudemdEngine {
      */
     public List<MemoryFileInfo> getMemoryFiles(boolean forceIncludeExternal, String sessionId,
                                                String sessionProjectRoot) {
-        // [批 3c] sessionId 为**显式入参**（原经裸 MDC 会话槽取，该槽已删）：仅用于 InstructionsLoaded
-        //   hook 载荷的 session_id 字段，不参与缓存键（缓存键仍为 forceIncludeExternal，与旧行为一致）。
-        // [批 4b-1] sessionProjectRoot 同为显式入参（原经 AutoMemPaths ThreadLocal 取），亦不参与缓存键
-        //   —— 与 sessionId 同款既有语义（缓存按 forceIncludeExternal 单飞，首个调用者的会话上下文胜出）。
-        return memoryFilesCache.computeIfAbsent(forceIncludeExternal,
-            key -> computeMemoryFiles(key, sessionId, sessionProjectRoot));
+        // [批 3c] sessionId 为**显式入参**（原经裸 MDC 会话槽取，该槽已删）：用于 ① InstructionsLoaded
+        //   hook 载荷的 session_id 字段 ② **扫描根解析**（PROJECT/LOCAL 向上遍历起点）—— 两者都按本入参。
+        // [批 4b-1] sessionProjectRoot 同为显式入参（原经 AutoMemPaths ThreadLocal 取）。
+        // [批 5b-1] ⭐ 二者**均纳入缓存键**（原键仅 forceIncludeExternal ⇒ 跨会话冻结）：
+        //   本仓一 JVM 多会话，扫描根随 sessionId 解析、projectRoot 为显式入参 ⇒ 单布尔键会让
+        //   会话 A 的 CLAUDE.md 列表被会话 B 复用（静默错值）。键 = 计算体的完整会话态输入。
+        String scanRoot = resolveOriginalCwd(sessionId);
+        String cacheKey = memoryFilesCacheKey(forceIncludeExternal, scanRoot, sessionProjectRoot);
+        return memoryFilesCache.computeIfAbsent(cacheKey,
+            key -> computeMemoryFiles(forceIncludeExternal, sessionId, sessionProjectRoot, scanRoot));
     }
 
     /**
@@ -448,7 +489,7 @@ public class ClaudemdEngine {
      * 在单飞语义下每次缓存 miss 仅消费一次。
      */
     private List<MemoryFileInfo> computeMemoryFiles(boolean forceIncludeExternal, String sessionId,
-                                                    String sessionProjectRoot) {
+                                                    String sessionProjectRoot, String scanRoot) {
         long startTime = System.currentTimeMillis();
         if (log.isDebugEnabled()) {
             log.debug("[ClaudemdEngine] getMemoryFiles 开始: forceIncludeExternal={}", forceIncludeExternal);
@@ -483,7 +524,9 @@ public class ClaudemdEngine {
         // 4. Project + Local：从 originalCwd 向上遍历到 root（到 root 前停止，root 不入 dirs ·
         //    CC claudemd.ts:854-857 while(currentDir !== parse(currentDir).root)）
         //    扫描根 = 本会话绑定项目（显式 sessionId 解析；无会话 → user.dir + 一次性 WARN）
-        String originalCwd = resolveOriginalCwd(sessionId);
+        //    [批 5b-1] 扫描根改由调用方（getMemoryFiles）解析后传入 —— 缓存键与本行走同一个值，
+        //    避免同一次调用内两次解析（realpath 属 FS IO），也保证「键 = 计算体输入」不是巧合。
+        String originalCwd = scanRoot;
         List<String> dirs = new ArrayList<>();
         Path currentPath = Paths.get(originalCwd);
         Path root = currentPath.getRoot();

@@ -10,6 +10,10 @@ import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -522,5 +526,43 @@ class AwaySummaryServiceTest {
         ChatMessageDto promptMsg2 = history2.get(history2.size() - 1);
         assertThat(promptMsg2.content()).contains("Session memory (broader context):\nOTHER SESSION MEMORY\n\n");
     }
-}
 
+    // ════════════════════════════════════════════════════════════════════════
+    // [批 5b-1] (b) 类缺值出口：REST 触发路径无 agent 上下文 → 显式 null + ≥WARN
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[批 5b-1] away_summary：无 agent 上下文 → 显式 null + ≥WARN（禁只 DEBUG）")
+    void generate_noAgentContext_explicitNullAndWarnAtLeastWarn(@TempDir Path tempDir) throws Exception {
+        // WHY: options 在无 executor 的 CompletableFuture（commonPool worker）闭包内构造，
+        //   原实现读 AgentContext ThreadLocal 恒 null（值来源不可控）；away_summary 由 REST
+        //   （AwaySummaryController）触发 ⇒ 本就不存在 agent 上下文（(b) 类）。按用户裁定 1：
+        //   可跳过但必须 ≥WARN 可观测。
+        java.lang.reflect.Field flag = AwaySummaryService.class.getDeclaredField("NO_AGENT_CONTEXT_WARNED");
+        flag.setAccessible(true);
+        ((java.util.concurrent.atomic.AtomicBoolean) flag.get(null)).set(false);   // 重置一次性闸
+
+        Logger logger = (Logger) org.slf4j.LoggerFactory.getLogger(AwaySummaryService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
+            AwaySummaryService s = service(
+                capturingProvider(captured, new AtomicReference<>(), "recap text", null), emptySms(tempDir));
+
+            s.generate(messages(3), new AbortController(), "sess-away-5b1").get(10, java.util.concurrent.TimeUnit.SECONDS);
+
+            assertThat(captured.get()).as("必须走 chatWithOptions").isNotNull();
+            assertThat(captured.get().agentContext())
+                .as("(b) 类：显式无 agent 上下文（不再读 AgentContext ThreadLocal）")
+                .isNull();
+            assertThat(appender.list)
+                .as("≥WARN 可观测（用户裁定 1：禁只 DEBUG）")
+                .anyMatch(e -> e.getLevel().isGreaterOrEqual(Level.WARN)
+                    && e.getFormattedMessage().contains("无 agent 归因上下文"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+}

@@ -208,7 +208,35 @@ public record ToolUseContext(
         // @JsonIgnore: analytics 归因用身份，不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 effectiveModelName / readFileState / mcpServerConnections local-only 约束）。
         @JsonIgnore String subagentName,
-        @JsonIgnore boolean isBuiltIn
+        @JsonIgnore boolean isBuiltIn,
+        // ═══════ 52 [批 5b-1] agent 归因上下文（commonPool 派生线程的显式载体）═══════
+        // CC 真源：{@code utils/agentContext.ts:93} {@code const agentContextStorage =
+        //   new AsyncLocalStorage<AgentContext>()} —— CC 的 ALS 跨 await/异步自动传播，
+        //   主循环、hook、以及 fire-and-forget 的 classifier/summary 都能读到同一 context。
+        //
+        // WHY 需要本字段（本批根因·实测）：Java 的 {@code AgentContext.STORAGE} 是 plain ThreadLocal，
+        //   下列消费点全部跑在 **无 executor 的 CompletableFuture（ForkJoinPool.commonPool）** 线程上：
+        //     · YoloClassifierImpl（classify/classifyTextAction 的 supplyAsync 闭包 → callWithAgentContext）
+        //     · ExecPromptHook（配置驱动 prompt hook 的 supplyAsync 闭包 → buildRequestOptions）
+        //     · HaikuToolUseSummaryGenerator（tool_use_summary 的 supplyAsync 闭包 → callHaiku）
+        //   闭包内读 ThreadLocal 恒 null ⇒ invokingRequestId / invocationKind 归因边静默丢失
+        //   （非报错、非崩溃，只是事件少了两个键）。CC 无此问题（ALS 自动传播）。
+        //
+        // WHY 承载「同一 AgentContext 实例」而不是拷一份标量字段副本：
+        //   {@code consumeInvokingRequestId} 的 sparse-edge 语义（agentContext.ts:159-161）靠
+        //   context 上的可变标记 {@code invocationEmitted}（本例 AtomicBoolean）保证「每个 invocation
+        //   只在第一个 terminal API event 出现一次」。若在各消费点按标量重建实例，则每个消费点都持有
+        //   一个 emitted=false 的新实例 ⇒ 同一次 invocation 会发射 **N 条**归因边（N = 消费点数），
+        //   偏离 CC。承载同一实例 ⇒ 与 CC 逐字一致（先到者消费，后到者读到已消费 → null）。
+        //
+        // 传递链：SubagentExecutor 在本 agent 进入 query loop 前显式盖章（与 subagentName/isBuiltIn
+        //   同点，见 {@code #withAgentContext}）；主/后台 loop 由 buildBaseToolUseContext 在
+        //   loop 线程捕获。之后所有 with*/copyWith 派生原样透传，不重新捕获。
+        // ⛔ 禁止在派生线程里回放/重设 {@code AgentContext.STORAGE} 再读（用户铁律：回放不算合规）。
+        //
+        // @JsonIgnore: analytics 归因用身份，不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 subagentName / effectiveModelName / readFileState local-only 约束）。
+        @JsonIgnore com.nexusai.application.agent.subagent.AgentContext agentContext
         // [Session J 方案 A] 撤回 E session 加的 querySource + assistantMessage 顶层字段:
         //   - CC 真源 (主 agent grep 实证 Pattern #9):
         //     · querySource: toolUseContext.options.querySource (Tool.ts:176), Java 端对齐
@@ -635,7 +663,8 @@ public record ToolUseContext(
              null,     // [openai-lazy] effectiveModelName 缺省 → null
              null,     // [openai-lazy] effectiveProviderType 缺省 → null（判不出 → tool search 关闭，全量 schema 内联）
              null,     // [tuc-subagent-identity] subagentName 缺省 → null（非子代理上下文；唯一产出点盖章）
-             false);   // [tuc-subagent-identity] isBuiltIn 缺省 → false
+             false,    // [tuc-subagent-identity] isBuiltIn 缺省 → false
+             null);    // [批 5b-1] agentContext 缺省 → null（非 agent 上下文；唯一盖章入口 withAgentContext）
     }
 
     /** Stage 3.1 4 参兼容构造器. */
@@ -1378,7 +1407,8 @@ public record ToolUseContext(
             List.copyOf(conns),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留 · CC Tool.ts:251 optional)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn(),
+            agentContext());  // [批 5b-1] 透传 (null 保留)
     }
 
     /** 覆写 messages 快照。null 参数 → 保留现有。 */
@@ -1414,7 +1444,8 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn(),
+            agentContext());  // [批 5b-1] 透传 (null 保留)
     }
 
     /**
@@ -1448,7 +1479,8 @@ public record ToolUseContext(
             mcpServerConnections(),
             limits,
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn(),
+            agentContext());  // [批 5b-1] 透传 (null 保留)
     }
 
     /**
@@ -1479,7 +1511,8 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),
             modelName,
-            effectiveProviderType(), subagentName(), isBuiltIn());
+            effectiveProviderType(), subagentName(), isBuiltIn(),
+            agentContext());  // [批 5b-1] 透传
     }
 
     /**
@@ -1526,7 +1559,8 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),
             effectiveModelName(),
-            providerType, subagentName(), isBuiltIn());
+            providerType, subagentName(), isBuiltIn(),
+            agentContext());  // [批 5b-1] 透传
     }
 
     /**
@@ -1572,7 +1606,59 @@ public record ToolUseContext(
             effectiveModelName(),
             effectiveProviderType(),
             subagentName,
-            isBuiltIn);
+            isBuiltIn,
+            // [批 5b-1] 身份盖章时**不**动 agentContext：agent 归因上下文由独立的
+            //   {@link #withAgentContext} 单点盖章（两者盖章时机同在 SubagentExecutor TUC 定稿步，
+            //   但语义不同 —— 一个是「本 agent 是谁」，一个是「本 invocation 的归因边载荷」）。
+            agentContext());
+    }
+
+    /**
+     * <b>[批 5b-1] agent 归因上下文显式载体 · 唯一生产盖章入口</b>。
+     *
+     * <p><b>WHY</b>：{@link com.nexusai.application.agent.subagent.AgentContext#STORAGE} 是 plain
+     * ThreadLocal，不跨线程继承；而 consumer（YoloClassifierImpl / ExecPromptHook /
+     * HaikuToolUseSummaryGenerator）全部跑在**无 executor 的 CompletableFuture（commonPool）** 线程上
+     * ⇒ 闭包内读 ThreadLocal 恒 null ⇒ {@code invokingRequestId}/{@code invocationKind} 归因边静默丢失。
+     * CC 无此问题（{@code agentContext.ts:93} AsyncLocalStorage 跨 await 自动传播）。
+     * （用户铁律：会话态一律显式传参，禁止在派生线程回放 ThreadLocal 再读。）
+     *
+     * <p><b>⛔ 必须传「同一实例」而不是标量副本</b>：{@code consumeInvokingRequestId} 的 sparse-edge
+     * 语义（agentContext.ts:159-161）靠 context 上的可变标记 {@code invocationEmitted} 保证「每个
+     * invocation 只在第一个 terminal API event 出现一次」；标量重建会让每个消费点各自持有
+     * emitted=false 的新实例 ⇒ 同一次 invocation 发射 N 条边（偏离 CC）。
+     *
+     * @param agentContext 本 agent 的归因上下文（null = 非 agent 上下文，等价 CC
+     *                     {@code context?.invokingRequestId} undefined —— 主线程 / 无 agent 的调用点）
+     * @return 带该上下文的新 TUC（其余字段原样透传）
+     */
+    public ToolUseContext withAgentContext(com.nexusai.application.agent.subagent.AgentContext agentContext) {
+        if (agentContext == this.agentContext()) {
+            return this;
+        }
+        return new ToolUseContext(
+            agentId(), sessionId(), mode(), additionalWorkingDirectories(),
+            availableTools(), taskListId(), abortController(),
+            messages(), permissionContext(), permissionMode(),
+            mcpClients(),
+            isNonInteractiveSession(), renderedSystemPrompt(), effectiveCwd(),
+            inProgressToolUseIDs(), toolDecisions(), onCompactProgress(),
+            getAppState(), setAppState(), setStreamMode(), setSDKStatus(),
+            addNotification(), appendSystemMessage(), sendOSNotification(),
+            setResponseLength(), setHasInterruptibleToolInProgress(), updateFileHistoryState(),
+            updateAttributionState(), setConversationId(), setToolJSX(), openMessageSelector(),
+            userModified(), nestedMemoryAttachmentTriggers(), loadedNestedMemoryPaths(),
+            dynamicSkillDirTriggers(), discoveredSkillNames(), agentType(), requireCanUseTool(),
+            preserveToolUseResults(), localDenialTracking(), contentReplacementState(),
+            queryTracking(), toolUseId(), criticalSystemReminder_EXPERIMENTAL(),
+            readFileState(),
+            mcpServerConnections(),
+            fileReadingLimits(),
+            effectiveModelName(),
+            effectiveProviderType(),
+            subagentName(),
+            isBuiltIn(),
+            agentContext);
     }
 
     /** 覆写 permissionContext + permissionMode（每轮经 ctx.permissionContextBuilder() 重建）。 */
@@ -1614,7 +1700,8 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn(),
+            agentContext());  // [批 5b-1] 透传 (null 保留)
     }
 
     public ToolUseContext with(SubagentContextOverrides overrides) {
@@ -1814,7 +1901,13 @@ public record ToolUseContext(
             this.effectiveProviderType(), // [openai-lazy] 继承父 · 子代理共享父 turn 目标 provider（主循环门控 toolReferenceUsable 用）
             // [tuc-subagent-identity] 不继承父（对齐 CC forkedAgent.ts:449 agentType 仅取 override，
             //   「子代理身份不是父的身份」）；由唯一产出点 SubagentExecutor 装配后 withSubagentIdentity 盖章。
-            null, false);
+            null, false,
+            // [批 5b-1] agentContext 不继承父（同 subagentName/isBuiltIn 语义）：本方法是「新 agent 的
+            //   TUC」构造点，新 agent 的归因上下文由唯一盖章点 {@link #withAgentContext} 装配
+            //   （SubagentExecutor TUC 定稿步 / buildBaseToolUseContext 捕获）。
+            //   取 null 而非继承父 = 失败方向取「属性缺失」而不是「属性归到错 agent」（同 CC
+            //   forkedAgent.ts:449 agentType 仅取 override 的取舍）。
+            null);
     }
 
     /**

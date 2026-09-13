@@ -785,7 +785,38 @@ public class SkillImprovementHook {
                 0d,
                 "skill_improvement_apply",
                 new AbortController(),
-                null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());   // [IMP-M-P1-2] maxTokens — CC skillImprovement.ts 未设 max_tokens
+                null, // [IMP-M-P1-2] maxTokens — CC skillImprovement.ts 未设 max_tokens
+                // [批 5b-1] agent 归因上下文 = (b) 类显式无值（原读 AgentContext.getAgentContext()
+                //   ThreadLocal：apply 体跑在无 executor 的 CompletableFuture(commonPool) 线程上，
+                //   读恒 null —— 且该 ThreadLocal 值来源不可控）。本路径由 REST
+                //   （SkillImprovementController）触发，无子代理 query loop / 无 runWithAgentContext
+                //   作用域 ⇒ 本就不存在 agent 上下文（等价 CC 该路径 ambient context undefined）。
+                //   按「不许静默失效」红线：(b) 类可跳过但必须 ≥WARN 可观测（见 helper）。
+                noAgentContextForRestPath("skill_improvement_apply"));
+    }
+
+    /** [批 5b-1] (b) 类缺值出口 · ≥WARN 可观测（一次性，避免高频刷屏）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean NO_AGENT_CONTEXT_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * [批 5b-1] 「本路径本就无 agent 上下文」的显式出口。
+     *
+     * <p>WHY 不是返回 null 就完事：按用户裁定 1（缺值守卫）——「本就不需要」可跳过，但日志级别
+     * <b>必须 ≥ WARN，禁止只写 DEBUG</b>，否则归因边缺失会无人察觉。一次性提示（同
+     * {@code CwdResolution} 的 warnNullSession / warnUnknownSession 惯例），首次即暴露该缺口。
+     *
+     * @param site 调用点标识（日志可定位）
+     * @return 恒 null（等价 CC {@code context?.invokingRequestId} undefined）
+     */
+    private static com.nexusai.application.agent.subagent.AgentContext noAgentContextForRestPath(String site) {
+        if (NO_AGENT_CONTEXT_WARNED.compareAndSet(false, true)) {
+            log.warn("[SkillImprovementHook] [批 5b-1] {} 路径无 agent 归因上下文：本 hook 由 REST"
+                    + "（skill improvement survey）触发，非子代理 query loop、无 runWithAgentContext 作用域"
+                    + " ⇒ invokingRequestId/invocationKind 归因边不发射（(b) 类：本路径本就不需要）。"
+                    + "如需归因，须从会话侧显式传 AgentContext。仅提示一次。", site);
+        }
+        return null;
     }
 
 
@@ -846,7 +877,10 @@ public class SkillImprovementHook {
                     options != null ? options.temperature() : null,
                     options != null ? options.querySource() : null,
                     options != null ? options.abortController() : null,
-                    options != null ? options.maxTokens() : null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());   // [IMP-M-P1-2] maxTokens 透传
+                    options != null ? options.maxTokens() : null, // [IMP-M-P1-2] maxTokens 透传
+                    // [批 5b-1] 同 applyQueryOptions：(b) 类显式无值 + ≥WARN 一次性提示
+                    //   （原读 AgentContext ThreadLocal；本侧信道查询跑在 commonPool 线程上读恒 null）
+                    noAgentContextForRestPath("skill_improvement_model_query"));
             String content = providerRef.get().chatWithOptions(
                     configRef.get(), getSmallFastModel(), systemPrompt, prompt, chatOptions);
             if (log.isDebugEnabled()) {

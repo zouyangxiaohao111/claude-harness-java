@@ -601,6 +601,162 @@ class YoloClassifierTelemetryTest {
             .containsKeys("toolName", "toolUseID", "isMcp");
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // [批 5b-1] agent 归因上下文：TUC 显式载体 → commonPool worker → provider
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * [批 5b-1] 1-stage 读点（{@code YoloClassifierImpl} 构造 {@code ChatRequestOptions} 处）·
+     * <b>真实类 + 真实 commonPool 线程</b>。
+     *
+     * <p><b>WHY（意图验证）</b>：classifier 的 1-stage 调用跑在 {@code classify()} 内
+     * <b>无 executor 的 {@code CompletableFuture.supplyAsync}（commonPool）</b> 闭包内；CC 那边
+     * agentContext 由 AsyncLocalStorage 跨 await 自动传播，Java 的 plain ThreadLocal 不跨线程 ⇒
+     * 原实现在闭包内读 {@code AgentContext.getAgentContext()} 恒 null
+     * ⇒ {@code invokingRequestId}/{@code invocationKind} 归因边静默丢失。
+     * 本用例钉「值只来自显式载体（TUC），且确实跨线程到达 provider」。
+     */
+    @Test
+    @DisplayName("[批 5b-1] classify 1-stage: TUC.agentContext() 跨 commonPool 线程到达 provider（同实例）")
+    void classifyOneStage_agentContext_crossesCommonPoolWorker() throws Exception {
+        AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
+        AtomicReference<String> threadName = new AtomicReference<>();
+        AtomicReference<com.nexusai.application.agent.subagent.AgentContext> onWorkerThread =
+            new AtomicReference<>();
+        LlmProvider fake = new FakeLlmProvider() {
+            @Override
+            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
+                                                           String systemPrompt, String userMessage,
+                                                           LlmProvider.ChatRequestOptions options) {
+                captured.set(options);
+                threadName.set(Thread.currentThread().getName());
+                // worker 线程上 ambient AgentContext 必须为 null（值只来自显式载体）
+                onWorkerThread.set(
+                    com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                JsonNode input = new ObjectMapper().createObjectNode()
+                    .put("thinking", "read-only")
+                    .put("shouldBlock", false)
+                    .put("reason", "read-only ls");
+                return new AssistantMessage("", "tool_calls",
+                    List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
+                    "", null, new AgentUsage(1L, 1L, 0L, 0L, null, null, null), null);
+            }
+        };
+        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+
+        // ── 写入端：TUC 显式盖章（生产由 SubagentExecutor / buildBaseToolUseContext 执行）──
+        com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_1", "spawn");
+        ToolUseContext stampedTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x")
+            .withAgentContext(subCtx);
+        assertThat(com.nexusai.application.agent.subagent.AgentContext.getAgentContext())
+            .as("前置：测试线程 ambient 无 AgentContext（否则本条无鉴别力）")
+            .isNull();
+
+        // ── 读取端：真实 classify 内部经 commonPool worker 读显式载体 ──
+        String testThread = Thread.currentThread().getName();
+        classifier.classify("Bash", new ObjectMapper().createObjectNode().put("command", "ls -la"),
+            List.of(), stampedTuc).get(10, TimeUnit.SECONDS);
+
+        assertThat(captured.get()).as("1-stage 必须走 chatWithOptionsMessage").isNotNull();
+        assertThat(threadName.get())
+            .as("读取发生在**派生线程**（commonPool）而非测试线程——证明跨线程携带")
+            .isNotEqualTo(testThread);
+        assertThat(onWorkerThread.get())
+            .as("worker 线程 ambient AgentContext 恒 null（plain ThreadLocal 不跨线程，本改造的根因）")
+            .isNull();
+        assertThat(captured.get().agentContext())
+            .as("provider 收到的是 TUC 上盖的**同一实例**（sparse-edge 语义要求共享 emitted 标记）")
+            .isSameAs(subCtx);
+    }
+
+    /**
+     * [批 5b-1] 正向对照：TUC <b>未</b>盖章 ⇒ provider 收到 null（证明上一条不是恒真断言）。
+     *
+     * <p>并同时钉住「显式传参」语义：即使提交线程 ambient 有 AgentContext，也不得被闭包读到。
+     */
+    @Test
+    @DisplayName("[批 5b-1] 正向对照：TUC 未盖章 → provider 收到 null（即使提交线程 ambient 有值）")
+    void classifyOneStage_noStampOnTuc_providerGetsNull() throws Exception {
+        AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
+        LlmProvider fake = new FakeLlmProvider() {
+            @Override
+            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
+                                                           String systemPrompt, String userMessage,
+                                                           LlmProvider.ChatRequestOptions options) {
+                captured.set(options);
+                JsonNode input = new ObjectMapper().createObjectNode()
+                    .put("thinking", "read-only").put("shouldBlock", false).put("reason", "ok");
+                return new AssistantMessage("", "tool_calls",
+                    List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
+                    "", null, new AgentUsage(1L, 1L, 0L, 0L, null, null, null), null);
+            }
+        };
+        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+        com.nexusai.application.agent.subagent.AgentContext.SubagentContext ambient =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_1", "spawn");
+        ToolUseContext plainTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x");   // 未盖章
+
+        // 提交线程 ambient 有值 → 旧实现（闭包内读 ThreadLocal）会读到它；新实现必须读不到。
+        com.nexusai.application.agent.subagent.AgentContext.runWithAgentContext(ambient, () -> {
+            try {
+                classifier.classify("Bash",
+                    new ObjectMapper().createObjectNode().put("command", "ls -la"),
+                    List.of(), plainTuc).get(10, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+            return null;
+        });
+
+        assertThat(captured.get()).isNotNull();
+        assertThat(captured.get().agentContext())
+            .as("未盖章 ⇒ null（值只来自显式载体；不读提交线程 ambient ThreadLocal）")
+            .isNull();
+    }
+
+    /**
+     * [批 5b-1] 2-stage 读点（{@code callWithAgentContext} → {@code chatWithRaw}）·
+     * 同样经真实 commonPool worker 验证显式载体。
+     */
+    @Test
+    @DisplayName("[批 5b-1] classify 2-stage: TUC.agentContext() 跨 commonPool 线程到达 chatWithRaw（同实例）")
+    void classifyTwoStage_agentContext_crossesCommonPoolWorker() throws Exception {
+        AtomicReference<com.nexusai.application.agent.subagent.AgentContext> seen = new AtomicReference<>();
+        AtomicReference<String> threadName = new AtomicReference<>();
+        LlmProvider fake = new FakeLlmProvider() {
+            @Override
+            public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
+                                              String systemPrompt, String userMessage,
+                                              com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                if (seen.get() == null) {   // 只记第一次（stage 1）
+                    seen.set(agentContext);
+                    threadName.set(Thread.currentThread().getName());
+                }
+                return new LlmRawResponse("<block>no</block>", "msg_s1", null, "req_s1");
+            }
+        };
+        YoloClassifierImpl classifier = newClassifier(fake);   // two-stage
+        com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_2", "resume");
+        ToolUseContext stampedTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x")
+            .withAgentContext(subCtx);
+
+        String testThread = Thread.currentThread().getName();
+        classifier.classify("Bash", new ObjectMapper().createObjectNode().put("command", "rm -rf /"),
+            List.of(), stampedTuc).get(10, TimeUnit.SECONDS);
+
+        assertThat(threadName.get())
+            .as("读取发生在派生线程（commonPool）而非测试线程")
+            .isNotEqualTo(testThread);
+        assertThat(seen.get())
+            .as("chatWithRaw 收到 TUC 上盖的同一实例")
+            .isSameAs(subCtx);
+    }
+
     /**
      * 最小 fake LlmProvider: chat/stream 抛错, 仅 chatWithRaw 可用
      * (YoloClassifier 唯一调用通道, M3.2 对齐 CC sideQuery).
