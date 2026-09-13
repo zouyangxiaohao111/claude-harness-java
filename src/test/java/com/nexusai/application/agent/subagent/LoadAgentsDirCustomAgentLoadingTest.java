@@ -569,30 +569,38 @@ class LoadAgentsDirCustomAgentLoadingTest {
     }
 
     @Test
-    @DisplayName("AM-01/G-75：快照 cwdSupplier 用 per-session projectRoot（对齐 ODF-A1，loadAgentsDir.java:125）")
-    void initialize_uses_session_project_root_as_snapshot_cwd() throws Exception {
-        // WHY: 旧实现 cwd=System.getProperty("user.dir") 进程级 → session root ≠ user.dir 时
-        //   快照目录错位（?-1/OPD-R2-AM-01）。快照目录必须按 per-session projectRoot 解析。
+    @DisplayName("[TL-W3 Phase A] 快照 cwd = 调用方直传项目 cwd（零 ThreadLocal 读 · 对齐 CC loadAgentsDir.ts:262-294）")
+    void initialize_uses_explicitly_passed_cwd_as_snapshot_cwd() throws Exception {
+        // WHY（规则九 · 验证意图）：快照目录 <cwd>/.nexusai/agent-memory-snapshots 是**项目级**路径，
+        //   cwd 的权威来源是调用方持有的项目根（CC getAgentDefinitionsWithOverrides(cwd) 入参），
+        //   **不是**进程态/线程态。旧实现经 supplier AutoMemPaths::currentSessionProjectRoot 现读
+        //   ThreadLocal → 未注入线程（REST registryForSession / 工具线程）回落 ~/.nexusai ⇒ 快照写读
+        //   假目录。故本用例：把 ThreadLocal 设成 decoy，断言结果只认**入参** —— 若实现回读 ThreadLocal
+        //   则拷贝会去找 decoy 目录 → topic.md 缺失 → RED。
         Path cfgHome = tempDir.resolve("cfg-home");
         Files.createDirectories(cfgHome);
         Path sessionRoot = tempDir.resolve("session-root");
+        Path decoyRoot = tempDir.resolve("decoy-root");
         try {
             ClaudePaths.setConfigDirOverride(cfgHome.toString());
             // G5：agent-memory user scope 已迁 nexusai 自有根（AgentMemoryDirectory）→ 唯一 appName 隔离
             NexusaiPaths.setAppNameOverride("nexusai-test-" + tempDir.getFileName());
-            // R9-2：快照源目录随 appName 动态（getSnapshotDirForAgent = <sessionRoot>/<getProjectDirName()>/agent-memory-snapshots）
+            // R9-2：快照源目录随 appName 动态（getSnapshotDirForAgent = <cwd>/<getProjectDirName()>/agent-memory-snapshots）
             //   → 夹具必须在 override 后用动态目录名创建
             Path snapDir = sessionRoot.resolve(NexusaiPaths.getProjectDirName())
                 .resolve("agent-memory-snapshots").resolve("user-agent");
             Files.createDirectories(snapDir);
             Files.writeString(snapDir.resolve("snapshot.json"), "{\"updatedAt\":\"2026-08-05T10:00:00Z\"}");
             Files.writeString(snapDir.resolve("topic.md"), "session shared");
-            AutoMemPaths.setCurrentProjectRoot(sessionRoot.toString());
+            // decoy：ThreadLocal 指向另一个根（其下**没有**快照）。实现若回读 ThreadLocal 则拷不到
+            //   topic.md → 本用例 RED（这正是本次收紧要防的回归）。
+            Files.createDirectories(decoyRoot);
+            AutoMemPaths.setCurrentProjectRoot(decoyRoot.toString());
             AgentDefinition agent = AgentDefinition.CustomAgentDefinition.builder(
                 "user-agent", "desc", "userSettings", "prompt").memory("user").build();
             Map<String, AgentDefinition> agents = new java.util.HashMap<>(Map.of("user-agent", agent));
-            loadAgentsDir.initializeAgentMemorySnapshots(agents);
-            // 快照目录按 sessionRoot 解析 → 拷贝到 nexusai home/agent-memory/<type>（决策 D1）
+            loadAgentsDir.initializeAgentMemorySnapshots(agents, sessionRoot.toString());
+            // 快照目录按**入参 sessionRoot** 解析 → 拷贝到 nexusai home/agent-memory/<type>（决策 D1）
             Path userMem = Path.of(NexusaiPaths.getAppConfigHomeDir(), "agent-memory", "user-agent");
             assertThat(Files.readString(userMem.resolve("topic.md"))).isEqualTo("session shared");
             assertThat(Files.readString(userMem.resolve(".snapshot-synced.json")))
@@ -623,17 +631,17 @@ class LoadAgentsDirCustomAgentLoadingTest {
                 .resolve("agent-memory-snapshots").resolve("mem-agent");
             Files.createDirectories(snapDir);
             Files.writeString(snapDir.resolve("snapshot.json"), "{\"updatedAt\":\"2026-08-05T10:00:00Z\"}");
-            AutoMemPaths.setCurrentProjectRoot(sessionRoot.toString());
+            // [TL-W3 Phase A] 快照 cwd 由 load(..., projectCwd) 直传（旧实现读 ThreadLocal）
             // agent-memory 以普通文件存在 → createDirectories 失败（确定性）
             // T1/D1：user.home 已隔离到 tempDir，需先建 NexusaiPaths 根再以文件覆盖 agent-memory 路径
             Files.createDirectories(Path.of(NexusaiPaths.getAppConfigHomeDir()));
             Files.writeString(Path.of(NexusaiPaths.getAppConfigHomeDir(), "agent-memory"), "blocking");
             Path base = tempDir.resolve("base");
             writeAgent(base, "mem-agent.md", "name: mem-agent\ndescription: mem agent\nmemory: user\n");
-            Map<String, AgentDefinition> agents = loadAgentsDir.load(base, "userSettings");
+            Map<String, AgentDefinition> agents =
+                loadAgentsDir.load(base, "userSettings", sessionRoot.toString());
             assertThat(agents).isEmpty();
         } finally {
-            AutoMemPaths.resetCurrentProjectRoot();
             ClaudePaths.setConfigDirOverride(null);
             NexusaiPaths.setAppNameOverride(null);
         }
@@ -729,6 +737,57 @@ class LoadAgentsDirCustomAgentLoadingTest {
             ClaudePaths.setConfigDirOverride(null);
             ClaudePaths.setManagedFilePathOverride(null);
             NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
+            loadAgentsDir.clearCache();
+        }
+    }
+
+    @Test
+    @DisplayName("[TL-W3 Phase A] loadAllSources 快照 cwd 取入参（不再读会话 ThreadLocal → 不再落 config home）")
+    void loadAllSources_snapshot_cwd_from_explicit_param() throws Exception {
+        // WHY（规则九 · 验证意图）：生产快照入口是 loadAllSources(cwd)（SubagentTool.buildRegistry ←
+        //   REST registryForSession / 工具线程），这些消费线程**不保证**持会话 projectRoot ThreadLocal。
+        //   旧实现快照 supplier 现读 ThreadLocal → 未注入线程回落 ~/.nexusai ⇒ 快照写/读
+        //   <configHome>/.nexusai/agent-memory-snapshots 假目录（生产端「REST 拉 agent 列表把快照
+        //   拷到配置主目录」）。本用例：ThreadLocal 设 decoy，断言快照源 = **入参 cwd** ——
+        //   若实现回读 ThreadLocal，拷贝源变 decoy（无快照）→ topic.md 缺失 → RED。
+        Path managedRoot = tempDir.resolve("managed-root-snap");
+        Path cfgRoot = tempDir.resolve("cfg-root-snap");
+        Path projRoot = tempDir.resolve("proj-root-snap");
+        Path decoyRoot = tempDir.resolve("decoy-root-snap");
+        Files.createDirectories(managedRoot.resolve(".claude").resolve("agents"));
+        Files.createDirectories(cfgRoot.resolve("agents"));
+        // project 源 agent（memory=user → 触发快照初始化）
+        Files.createDirectories(projRoot.resolve(".claude").resolve("agents"));
+        Files.writeString(projRoot.resolve(".claude").resolve("agents").resolve("live-agent.md"),
+            "---\nname: live-agent\ndescription: live agent\nmemory: user\n---\n\nbody");
+        Files.createDirectories(decoyRoot);
+        try {
+            ClaudePaths.setConfigDirOverride(cfgRoot.toString());
+            ClaudePaths.setManagedFilePathOverride(managedRoot.toString());
+            NexusaiPaths.setAppNameOverride("nexusai-test-" + tempDir.getFileName());
+            // 项目快照：<projRoot>/<getProjectDirName()>/agent-memory-snapshots/live-agent/
+            //   （必须在 setAppNameOverride 之后建 —— 目录名 = "." + appName 动态）
+            Path snapDir = projRoot.resolve(NexusaiPaths.getProjectDirName())
+                .resolve("agent-memory-snapshots").resolve("live-agent");
+            Files.createDirectories(snapDir);
+            Files.writeString(snapDir.resolve("snapshot.json"), "{\"updatedAt\":\"2026-08-05T10:00:00Z\"}");
+            Files.writeString(snapDir.resolve("topic.md"), "project shared");
+            AutoMemPaths.setCurrentProjectRoot(decoyRoot.toString());   // decoy：实现不得消费
+            loadAgentsDir.clearCache();
+
+            List<AgentDefinition> agents = loadAgentsDir.loadAllSources(projRoot);
+
+            assertThat(agents.stream().map(AgentDefinition::agentType))
+                .as("project 源 live-agent 必须被加载").contains("live-agent");
+            Path userMem = Path.of(NexusaiPaths.getAppConfigHomeDir(), "agent-memory", "live-agent");
+            assertThat(Files.readString(userMem.resolve("topic.md")))
+                .as("快照必须取自入参 projRoot（decoy ThreadLocal 不得被消费）")
+                .isEqualTo("project shared");
+        } finally {
+            AutoMemPaths.resetCurrentProjectRoot();
+            ClaudePaths.setConfigDirOverride(null);
+            ClaudePaths.setManagedFilePathOverride(null);
+            NexusaiPaths.setAppNameOverride(null);
             loadAgentsDir.clearCache();
         }
     }

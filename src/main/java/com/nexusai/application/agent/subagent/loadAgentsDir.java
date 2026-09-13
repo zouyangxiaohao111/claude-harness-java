@@ -108,6 +108,24 @@ public class loadAgentsDir {
      * @return agentType -> AgentDefinition 映射; 目录不存在时返回空 Map
      */
     public static Map<String, AgentDefinition> load(Path baseDir, String source) {
+        // [TL-W3 Phase A] 显式 projectRoot 缺省 = null（快照初始化按「无项目上下文」跳过，见
+        //   initializeAgentMemorySnapshots(Map,String)）。生产快照路径走 loadAllSources(Path cwd)。
+        return load(baseDir, source, null);
+    }
+
+    /**
+     * [TL-W3 Phase A] 显式 projectRoot 贯穿版 · 语义同 {@link #load(Path, String)}，额外把
+     * {@code projectCwd} 直传给 agent-memory 快照初始化（<b>不再读会话 ThreadLocal</b>）。
+     *
+     * <p><b>WHY</b>：快照目录 = {@code <cwd>/.nexusai/agent-memory-snapshots/<agentType>/} 是
+     * <b>项目级</b>路径。旧实现由 supplier {@code AutoMemPaths::currentSessionProjectRoot} 在消费
+     * 线程现读 ThreadLocal，未注入线程回落 {@code ~/.nexusai} ⇒ 快照写/读错目录。CC 真源
+     * （loadAgentsDir.ts:262-294）的 cwd 来自 {@code getAgentDefinitionsWithOverrides(cwd)} 入参，
+     * 非进程态 ⇒ 本重载即该入参的 1:1 直传。
+     *
+     * @param projectCwd 项目遍历起始目录（快照根）；null/blank → 跳过快照初始化（不伪造项目根）
+     */
+    public static Map<String, AgentDefinition> load(Path baseDir, String source, String projectCwd) {
         // T3: 内容读兼容（nexusai 复刻版 .claude 改造）—— 用户源双目录：nexusai 自有根优先 + claude 回落。
         //   baseDir 为任一用户配置根时加载双目录；否则保持单目录加载语义（测试临时目录等）。
         if ("userSettings".equals(source) && baseDir != null) {
@@ -116,11 +134,11 @@ public class loadAgentsDir {
             if (pathEqualsNormalized(baseDir, nexusaiBase) || pathEqualsNormalized(baseDir, claudeBase)) {
                 Map<String, AgentDefinition> merged = new HashMap<>();
                 // 先 nexusai（高优先，putIfAbsent 保留已注册 agentType）
-                for (Map.Entry<String, AgentDefinition> e : loadSingle(nexusaiBase, source).entrySet()) {
+                for (Map.Entry<String, AgentDefinition> e : loadSingle(nexusaiBase, source, projectCwd).entrySet()) {
                     merged.putIfAbsent(e.getKey(), e.getValue());
                 }
                 // 再 claude（回落，同 agentType 时 nexusai 已注册 → 丢弃；nexusai 无同名则 claude 加载）
-                for (Map.Entry<String, AgentDefinition> e : loadSingle(claudeBase, source).entrySet()) {
+                for (Map.Entry<String, AgentDefinition> e : loadSingle(claudeBase, source, projectCwd).entrySet()) {
                     merged.putIfAbsent(e.getKey(), e.getValue());
                 }
                 if (log.isDebugEnabled()) {
@@ -130,7 +148,7 @@ public class loadAgentsDir {
                 return merged;
             }
         }
-        return loadSingle(baseDir, source);
+        return loadSingle(baseDir, source, projectCwd);
     }
 
     /**
@@ -138,7 +156,7 @@ public class loadAgentsDir {
      * （如 {@code ~/.claude} 或 {@code ~/.{appName}}），递归发现 agents/*.md。缓存（CC memoize:296）、
      * 快照初始化、失败回退语义与原单源 load 一致。
      */
-    private static Map<String, AgentDefinition> loadSingle(Path baseDir, String source) {
+    private static Map<String, AgentDefinition> loadSingle(Path baseDir, String source, String projectCwd) {
         // [FIX-AM REQ-M-19] per-baseDir 一致性缓存（CC memoize:296）· 命中直接返回防御性 copy
         String cacheKey = (baseDir != null ? baseDir.toAbsolutePath().normalize().toString() : "<null>")
             + "|" + (source != null ? source : "<null>");
@@ -182,7 +200,7 @@ public class loadAgentsDir {
         if (isAgentMemorySnapshotEnabled()
                 && com.nexusai.application.agent.skill.BundledSkillEnabledGates.isAutoMemoryEnabled()) {
             try {
-                initializeAgentMemorySnapshots(agents);
+                initializeAgentMemorySnapshots(agents, projectCwd);
             } catch (Exception e) {
                 // [AM-03/OPD-R2-AM-03] CC getAgentDefinitionsWithOverrides 外层 catch（:379-391）：
                 //   快照初始化失败 → 整体回退 built-ins（Java 表达：custom agents 空 map，built-ins
@@ -282,7 +300,9 @@ public class loadAgentsDir {
                 for (AgentDefinition a : loadAgentsDir.getActiveAgentsFromList(agents)) {
                     byType.put(a.agentType(), a);
                 }
-                initializeAgentMemorySnapshots(byType);
+                // [TL-W3 Phase A] cwd 直传（本方法入参 cwdStr）——旧实现读会话 ThreadLocal，
+                //   REST/工具线程未注入时回落 config home ⇒ 快照目录错位。
+                initializeAgentMemorySnapshots(byType, cwdStr);
                 if (log.isDebugEnabled()) {
                     log.debug("[loadAgentsDir] loadAllSources: 快照初始化完成，{} 个 agent", byType.size());
                 }
@@ -302,20 +322,38 @@ public class loadAgentsDir {
      *
      * <p>仅 memory=='user' 的 agent：无本地 .md → initializeFromSnapshot（首次从项目快照拷贝）；
      * 快照比 syncedFrom 新 → 设 pendingSnapshotUpdate（prompt-update 状态，前端 dialog 消费 N/A）。
-     * 生产默认 AgentMemoryDirectory + AgentMemorySnapshot（cwd = per-session projectRoot）。
+     * 生产默认 AgentMemoryDirectory + AgentMemorySnapshot（cwd = <b>显式传入的项目 cwd</b>）。
      *
-     * @param agents agentType → AgentDefinition 映射（可变，prompt-update 时原地替换为携带
-     *               pendingSnapshotUpdate 的新实例）
+     * <p><b>[TL-W3 Phase A] cwd 直传</b>：旧实现快照 cwd 由 supplier
+     * {@code AutoMemPaths::currentSessionProjectRoot} 在<b>消费线程</b>现读 ThreadLocal ——
+     * 本方法的生产调用链（{@code SubagentTool.buildRegistry → loadAllSources}，可来自 REST
+     * {@code registryForSession} / 工具线程）不保证持会话态，未注入时回落 {@code ~/.nexusai}
+     * ⇒ 快照写/读 {@code <configHome>/.nexusai/agent-memory-snapshots} 假目录。CC 真源
+     * （loadAgentsDir.ts:262-294）的 cwd 是 {@code getAgentDefinitionsWithOverrides(cwd)} 入参
+     * ⇒ 改为直传参数，零 ThreadLocal 读。
+     *
+     * @param agents     agentType → AgentDefinition 映射（可变，prompt-update 时原地替换为携带
+     *                   pendingSnapshotUpdate 的新实例）
+     * @param projectCwd 项目 cwd（快照根 {@code <cwd>/.nexusai/agent-memory-snapshots/<agentType>/}）·
+     *                   null/blank → 跳过（无项目上下文，不伪造项目根）
      */
-    public static void initializeAgentMemorySnapshots(Map<String, AgentDefinition> agents) throws IOException {
+    public static void initializeAgentMemorySnapshots(Map<String, AgentDefinition> agents,
+                                                      String projectCwd) throws IOException {
+        if (projectCwd == null || projectCwd.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[loadAgentsDir] initializeAgentMemorySnapshots 无显式项目 cwd → 跳过快照初始化"
+                    + "（快照目录是项目级路径，无 cwd 不伪造 config home）");
+            }
+            return;
+        }
         com.nexusai.application.agent.agent.AgentMemoryDirectory dir =
             com.nexusai.application.agent.agent.AgentMemoryDirectory.productionDefault();
         com.nexusai.application.agent.agent.AgentMemorySnapshot snapshot =
             new com.nexusai.application.agent.agent.AgentMemorySnapshot(
-                // [AM-01/OPD-R2-AM-01] 快照 cwd 基改 per-session projectRoot（对齐 ODF-A1：
-                //   与 AgentMemoryDirectory.productionDefault 同源）。旧实现 System.getProperty
-                //   ("user.dir") 进程级 → session root ≠ user.dir 时快照目录错位（?-1）。
-                com.nexusai.application.agent.memory.AutoMemPaths::currentSessionProjectRoot, dir);
+                // [AM-01/OPD-R2-AM-01] 快照 cwd = 显式项目 cwd（对齐 ODF-A1 per-session projectRoot：
+                //   由调用方解析后直传）。旧实现 System.getProperty("user.dir") 进程级 → session root
+                //   ≠ user.dir 时快照目录错位（?-1）；其后的 ThreadLocal 现读版同病（见方法 javadoc）。
+                () -> projectCwd, dir);
         initializeAgentMemorySnapshots(agents, dir, snapshot);
     }
 

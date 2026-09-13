@@ -4144,7 +4144,13 @@ public class SubagentExecutor {
                         // [IMP-D F4/M-07] 子代理 LoopSessionState.workspaceDir 注入会话 projectRoot
                         //   （修 M-07 user.dir 兜底链：STOP hook transcript_path → P/<session>/subagents/...）。
                         //   本线程已由 spawn 作用域注入（Step 20），读 holder 即会话值。
-                        contextFactory.shared(AutoMemPaths.currentSessionProjectRoot()));
+                        // [TL-W3 Phase A] 上游回放核验：sync/async/fallback/resume 四条 SubagentTool 入口
+                        //   与 SkillToolImpl fork 入口均在工具线程（StreamingToolExecutor 已回放）——
+                        //   但 teammate 路径（SpawnInProcess 的 teammate-<id> 裸线程，只回放 MDC 不回放
+                        //   projectRoot）不经上述入口，读 currentSessionProjectRoot() 会回落 config home
+                        //   ⇒ 子代理 workspaceDir 指向配置主目录。改 orNull：无会话上下文即 null →
+                        //   shared(null) 走既有「无会话上下文」分支（workspaceDir 回落 bean ?? user.dir）。
+                        contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull()));
                 // [RES-R6] resume 重建的 ContentReplacementState 注入 query loop session state
                 // （对齐 CC resumeAgent.ts:194 runAgentParams.contentReplacementState → query.ts:372-389
                 //   applyToolResultBudget 消费同一实例）。null（父 live state 不可得 / 非 resume）→
@@ -5144,12 +5150,24 @@ public class SubagentExecutor {
      *
      * <p>[IMP-D F4/M-12] 根 = 会话 projectRoot（修 M-12：原 {@code Paths.get("")} = JVM user.dir，
      * 会话绑 P≠user.dir 时子代理收不到 P/CLAUDE.md）。spawn 入口（IMP-D Step 20）/ 工具线程
-     * （IMP-C 传播）注入后，本线程读 holder 即会话值；无会话上下文 → 回落 CLAUDE_PROJECT_DIR
-     * env ?? config home（ODF-A1「绝不读 user.dir」约束）。
+     * （IMP-C 传播）注入后，本线程读 holder 即会话值。
+     *
+     * <p>[TL-W3 Phase A] 无会话上下文（teammate 裸线程 SpawnInProcess / HOOK_EXECUTOR 上由
+     * 无回放线程调度者）原回落 CLAUDE_PROJECT_DIR env ?? config home ⇒ 加载**配置主目录的
+     * CLAUDE.md** 注入子代理 userContext（读错项目上下文，且静默）。改 orNull：无会话上下文
+     * → 返回空串（不注入 userContext），绝不拿 config home 冒充项目根。
      */
     private String resolveUserContext() {
         try {
-            Path projectRoot = Path.of(AutoMemPaths.currentSessionProjectRoot());
+            String sessionProjectRoot = AutoMemPaths.currentSessionProjectRootOrNull();
+            if (sessionProjectRoot == null || sessionProjectRoot.isBlank()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[SubagentExecutor] resolveUserContext 无会话 projectRoot（无会话上下文线程）"
+                        + " → 不注入 userContext（不回落 config home）");
+                }
+                return "";
+            }
+            Path projectRoot = Path.of(sessionProjectRoot);
             Path claudeMd = projectRoot.resolve("CLAUDE.md");
             if (Files.isRegularFile(claudeMd)) {
                 String content = Files.readString(claudeMd);

@@ -834,6 +834,38 @@ class ExecAgentHookSemanticsTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // [TL-W3 Phase A] hook agent workspaceDir 根（源码接线闸）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * hook agent workspaceDir/CLAUDE.md 根 = {@code currentSessionProjectRootOrNull()}（零 config-home 伪造）。
+     *
+     * <p><b>WHY（规则九 · 验证意图）</b>：本接线决定 hook agent 的 workspaceDir 与「项目 CLAUDE.md」根。
+     * 回放包裹（{@code HookRegistry.withSessionProjectRoot}）只在<b>调度线程已持会话值</b>时有效
+     * （capture null → 不 set），而本方法上游存在多条无回放调度线程 —— WebSocketPermissionPrompter 的
+     * RACERS 裸池（PermissionRequest race）、STOMP 入站（PermissionDenied）、
+     * SettingsFileChangeWatcher / SkillChangeDetector watcher（ConfigChange）、
+     * ElicitationHandler 的 MCP 通知线程（Notification/Elicitation）、SpawnInProcess 的
+     * {@code teammate-<id>} 裸线程（只回放 MDC 不回放 projectRoot → SubagentStart）。
+     * 旧 {@code currentSessionProjectRoot()} 在这些线程回落 config home ⇒ hook agent 的 workspaceDir /
+     * CLAUDE.md 根指向**配置主目录**（读错项目、静默）。故断言源码必须用 orNull 变体
+     * （null → {@code shared(null)} 走既有「无会话上下文」分支，不伪造项目根）。
+     *
+     * <p>RED 条件：把实现回退为 {@code currentSessionProjectRoot()} → 本用例红。
+     */
+    @Test
+    @DisplayName("[TL-W3] hook agent ctx 根用 currentSessionProjectRootOrNull()（无会话上下文不伪造 config home）")
+    void execAgentHook_workspaceRootUsesOrNullVariant() throws Exception {
+        String source = java.nio.file.Files.readString(java.nio.file.Path.of(
+            "src/main/java/com/nexusai/application/agent/permission/hook/ExecAgentHook.java"));
+        org.assertj.core.api.Assertions.assertThat(source)
+            .as("ExecAgentHook 必须经 contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull()) 注入根"
+                + "（旧 currentSessionProjectRoot() 在无回放调度线程回落 config home → workspaceDir/CLAUDE.md 指错目录）")
+            .contains("contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull())")
+            .doesNotContain("contextFactory.shared(AutoMemPaths.currentSessionProjectRoot())");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // 夹具 helper
     // ════════════════════════════════════════════════════════════════════════
 

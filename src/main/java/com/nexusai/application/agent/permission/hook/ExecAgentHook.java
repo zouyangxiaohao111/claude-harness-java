@@ -372,7 +372,17 @@ public class ExecAgentHook {
             //   与 timeout/parent abort 既有竞态一致（CC 顺序执行工具，Java 流式并行 —— 既有架构差异）。
             // [IMP-D F4/M-07] hook agent workspaceDir 注入会话 projectRoot（修 M-07 user.dir 兜底链）。
             //   HOOK_EXECUTOR 线程经 IMP-C withSessionProjectRoot 回放后读 holder 即会话值。
-            AgentLoopContext sharedCtx = contextFactory.shared(AutoMemPaths.currentSessionProjectRoot());
+            // [TL-W3 Phase A] 回放覆盖**不全**：withSessionProjectRoot 只在调度线程已持会话值时有效
+            //   （capture null → 不 set），而本方法的上游存在多条无回放调度线程 ——
+            //   WebSocketPermissionPrompter 的 RACERS 裸池（PermissionRequest race）、STOMP 入站
+            //   （PermissionDenied）、SettingsFileChangeWatcher / SkillChangeDetector 的 watcher 线程
+            //   （ConfigChange）、ElicitationHandler 的 MCP 通知线程（Notification/Elicitation）、
+            //   SpawnInProcess 的 teammate-<id> 裸线程（只回放 MDC，不回放 projectRoot；SubagentStart）。
+            //   这些线程读 currentSessionProjectRoot() 会回落 config home ⇒ hook agent 的 workspaceDir /
+            //   CLAUDE.md 根指向配置主目录（读错项目、写错记忆），且**静默**。改 orNull：无会话上下文
+            //   即 null → shared(null) 走既有「无会话上下文」分支（LoopSessionState.workspaceDir 回落
+            //   bean ?? user.dir），不再伪造 config home。
+            AgentLoopContext sharedCtx = contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull());
             AtomicInteger assistantMessageCounter = new AtomicInteger(0);
             AtomicBoolean maxTurnsBreakerFired = new AtomicBoolean(false);
             LoopDeps deps = new LoopDeps() {

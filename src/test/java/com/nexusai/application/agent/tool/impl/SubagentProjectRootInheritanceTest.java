@@ -147,6 +147,31 @@ class SubagentProjectRootInheritanceTest {
     }
 
     @Test
+    @DisplayName("[TL-W3 Phase A] 无会话上下文：不注入 config home 的 CLAUDE.md（不伪造项目根）")
+    void userContext_noSessionContext_doesNotInjectConfigHomeClaudeMd(@TempDir Path configHome) throws Exception {
+        // WHY（规则九 · 验证意图）：resolveUserContext 的根 = 会话 projectRoot。无会话上下文的线程
+        //   （teammate 裸线程 SpawnInProcess / HOOK_EXECUTOR 上由无回放线程调度者：RACERS 池、STOMP、
+        //   ConfigChange watcher）旧实现回落 config home ⇒ 把 ~/.nexusai/CLAUDE.md 当成「项目指令」
+        //   注入子代理 userContext（读错项目上下文，且静默）。本用例：config home 放一份 CLAUDE.md，
+        //   无会话上下文时**必须不注入**（旧 currentSessionProjectRoot() → 注入 → 本断言红）。
+        NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+        Files.writeString(configHome.resolve("CLAUDE.md"), "# config-home 指令（不得作为项目 CLAUDE.md 注入）");
+        AutoMemPaths.setCurrentProjectRoot(null);
+        try {
+            SubagentExecutor executor = new SubagentExecutor(null, null, null, null, null, "model", "system-prompt");
+            AgentDefinition def = AgentDefinition.BuiltInAgentDefinition.builder(
+                "test-agent", "when to use", (ctx, dirs) -> "sys").build();
+
+            assertThat(executor.userContextFor(def))
+                .as("无会话上下文 ⇒ 不注入 userContext（绝不拿 config home 的 CLAUDE.md 冒充项目指令）")
+                .isEmpty();
+        } finally {
+            AutoMemPaths.resetCurrentProjectRoot();
+            NexusaiPaths.setConfigHomeDirOverride(null);
+        }
+    }
+
+    @Test
     @DisplayName("worktree 隔离 agent-memory 根改绑 effectiveCwd；非 worktree 保持 projectRoot（M-08）")
     void withEffectiveCwd_overridesProjectScopeRoot(@TempDir Path project, @TempDir Path worktree) {
         AutoMemPaths.setCurrentProjectRoot(project.toString());

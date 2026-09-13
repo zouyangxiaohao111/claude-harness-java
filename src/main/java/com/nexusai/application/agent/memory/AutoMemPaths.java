@@ -150,6 +150,39 @@ public final class AutoMemPaths {
         return NexusaiPaths.getAppConfigHomeDir();
     }
 
+    /**
+     * [TL-W3 Phase B] 读取当前线程的会话 projectRoot · <b>无 config-home 回落</b>（memory 路径层专用）。
+     *
+     * <p><b>WHY</b>：{@link #currentSessionProjectRoot()} 第 3 级回落把 {@link NexusaiPaths#getAppConfigHomeDir()}
+     * （{@code ~/.nexusai}，<b>配置主目录</b>）当作「项目根」返回 —— 与 cwd 语义红线冲突
+     * （CC {@code getOriginalCwd()} 只是 {@code STATE.originalCwd}，无 config-home 回落）。无会话上下文的
+     * 线程（bean 构造期 / REST / HOOK_EXECUTOR / 定时器 / teammate 裸线程）读它就等于拿 config home
+     * 冒充项目身份：memory per-project 派生会产出
+     * {@code <memoryBase>/projects/<configHome slug>/memory} 假目录、agent-memory 落
+     * {@code <configHome>/.nexusai/agent-memory} 假目录、子代理 userContext 读到 config home 的
+     * CLAUDE.md。本方法把这些调用点收口到 <b>null</b> 语义，由各消费方的 A′ 判定（
+     * {@link #isEligibleProjectRoot(String)}）与既有 null 守卫承担 skip，<b>绝不伪造项目根</b>。
+     *
+     * <p><b>与 {@link #currentSessionProjectRoot()} 的唯一差别</b>：env 也缺失时返回 null 而非 config home。
+     * env（{@code NEXUSAI_PROJECT_DIR}/{@code CLAUDE_PROJECT_DIR}）属身份域显式配置，两台阶共用。
+     *
+     * <p><b>不改 {@link #currentSessionProjectRoot()} 契约</b>：它仍有大量调用方（身份域 +
+     * 未收口的读取点），本方法只供 memory 路径层逐步迁移。
+     *
+     * @return 会话/身份 projectRoot；无会话上下文且无 env → null（不回落 config home）
+     */
+    public static String currentSessionProjectRootOrNull() {
+        String pr = CURRENT_PROJECT_ROOT.get();
+        if (pr != null && !pr.isBlank()) {
+            return pr;
+        }
+        String env = System.getenv(CLAUDE_PROJECT_DIR_ENV);
+        if (env != null && !env.isBlank()) {
+            return env;
+        }
+        return null;
+    }
+
     private static final String SEP = java.io.File.separator;
     private static final char BACKSLASH = '\\';
     /** A′: Windows 路径比较大小写不敏感（config-home 回落值恒为同源生成，跨盘符不涉及）。 */
@@ -250,7 +283,13 @@ public final class AutoMemPaths {
      */
     public static AutoMemPaths defaultInstance() {
         return new AutoMemPaths(
-            AutoMemPaths::currentSessionProjectRoot,
+            // [TL-W3 Phase B] 原接线 AutoMemPaths::currentSessionProjectRoot —— 无会话上下文的线程
+            //   （bean 构造期 / REST / HOOK_EXECUTOR / 定时器 / teammate 裸线程）会拿到 config home
+            //   冒充项目根（P5 根源）。本实例是「全仓 memory 路径解析的根供应器」，其消费方（
+            //   getAutoMemPath/getAutoMemBase/projectRoot）全部经 isEligibleProjectRoot 拒绝 config home
+            //   ⇒ 换 orNull 后**结果等价**（同样 skip）但不再伪造；projectRoot() 由此在无会话线程返回
+            //   null（消费方 MemoryPromptBuilder 已 null-safe 并回落 "."）。
+            AutoMemPaths::currentSessionProjectRootOrNull,
             () -> System.getenv(REMOTE_MEMORY_DIR_ENV),
             () -> overrideEnvSeam != null ? overrideEnvSeam : System.getenv(COWORK_OVERRIDE_ENV),
             AutoMemPaths::readAutoMemoryDirectorySetting,
@@ -1015,7 +1054,11 @@ public final class AutoMemPaths {
     private static String readAutoMemoryDirectorySetting() {
         // [TL-W1 P3] 无参重载 = 唯一允许读会话 ThreadLocal 的路径（会话线程语义）；
         //   显式重载走 readAutoMemoryDirectorySetting(String)（projectRoot 贯穿，零 ThreadLocal）。
-        return readAutoMemoryDirectorySetting(currentSessionProjectRoot());
+        // [TL-W3 Phase B] 原传 currentSessionProjectRoot() —— 无会话线程拿 config home 派生
+        //   localSettings 源 {@code <configHome>/.nexusai/settings.local.json}（把配置主目录当项目，
+        //   与 A′「config-home 永不作为项目身份」冲突）。改 orNull → 无项目即跳过 localSettings 源，
+        //   只读 DB + user 源（readAutoMemoryDirectorySetting(null) 的既有分支）。
+        return readAutoMemoryDirectorySetting(currentSessionProjectRootOrNull());
     }
 
     /**

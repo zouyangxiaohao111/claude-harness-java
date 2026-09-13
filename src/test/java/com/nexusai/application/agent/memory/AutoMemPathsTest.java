@@ -119,6 +119,50 @@ class AutoMemPathsTest {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // 1b. [TL-W3 Phase B] defaultInstance 无 config-home 伪造（P5 根源收口）
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[TL-W3 Phase B] 无会话上下文：defaultInstance 不回落 config home（projectRoot=null + config home 的 "
+        + ".nexusai/settings.local.json 不得被当作项目 localSettings 源）")
+    void defaultInstance_noSessionContext_noConfigHomeFabrication(@TempDir Path configHome) throws Exception {
+        // WHY（规则九 · 验证意图）：defaultInstance 是全仓 memory 路径解析的**根供应器**。旧实现
+        //   projectRootSupplier = AutoMemPaths::currentSessionProjectRoot，第 3 级回落
+        //   NexusaiPaths.getAppConfigHomeDir() —— 把**配置主目录**当「项目根」返回：
+        //   (a) projectRoot() 在 bean 构造期 / REST / HOOK_EXECUTOR / 定时器 / teammate 裸线程 上返回
+        //       ~/.nexusai（冒充项目身份，pathOps 消费方据此派生假目录）；
+        //   (b) 无参 settings 链以 configHome 为「项目」拼 localSettings 源
+        //       {configHome}/.nexusai/settings.local.json ⇒ 配置主目录里的文件被当作项目配置读入。
+        //   本用例钉住「无会话上下文 ⇒ 三级皆不伪造」：若回退到 currentSessionProjectRoot()
+        //   （任一断言都会红：projectRoot 非 null / settings 命中 config-home 的 localSettings）。
+        NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+        BundledSkillEnabledGates.bridgeSettingsMapper(null);   // 清 DB 桥接泄漏（否则 DB 列优先）
+        AutoMemPaths.setCurrentProjectRoot(null);               // 无会话上下文（无 ThreadLocal）
+        AutoMemPaths paths = AutoMemPaths.defaultInstance();
+        // 夹具：config home 自身被当「项目」时才会命中的 localSettings 源
+        Path fakeProjectLocal = Files.createDirectories(
+            configHome.resolve(NexusaiPaths.getProjectDirName()));
+        Path fakeMemDir = Files.createDirectories(configHome.resolve("cfg-home-local-mem"));
+        Files.writeString(fakeProjectLocal.resolve("settings.local.json"),
+            "{\"autoMemoryDirectory\": \"" + fakeMemDir.toString().replace("\\", "\\\\") + "\"}");
+        try {
+            assertThat(paths.projectRoot())
+                .as("无会话上下文不得回落 config home 冒充项目根（P5 根源：projectRootSupplier 应为 orNull 变体）")
+                .isNull();
+            assertThat(paths.getAutoMemPathSetting())
+                .as("config home 不是项目根 ⇒ 其 .nexusai/settings.local.json 不得作为项目 localSettings 源")
+                .isNull();
+            assertThat(paths.getAutoMemPath())
+                .as("无有效项目 ⇒ per-project auto-memory 目录不存在（A′）")
+                .isNull();
+        } finally {
+            AutoMemPaths.setCurrentProjectRoot(null);
+            NexusaiPaths.setConfigHomeDirOverride(null);
+            paths.clearCache();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // 2. override / settings 链
     // ════════════════════════════════════════════════════════════════
 

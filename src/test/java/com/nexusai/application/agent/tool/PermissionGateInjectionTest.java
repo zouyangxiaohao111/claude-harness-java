@@ -473,7 +473,11 @@ class PermissionGateInjectionTest {
         assertThat(source)
             .as("SubagentExecutor 必须构造 SubagentLoopDeps（isMainLoop=false）· P3-③ 持 AgentLoopContext（factory.shared(会话 projectRoot)）")
             .contains("new com.nexusai.application.agent.loop.SubagentLoopDeps(")
-            .contains("contextFactory.shared(AutoMemPaths.currentSessionProjectRoot())");
+            // [TL-W3 Phase A] 断言随实现收口更新：原 currentSessionProjectRoot() —— 上游回放核验后
+            //   确认 not covered（teammate 裸线程 / HOOK_EXECUTOR 无回放调度线程）⇒ 改 orNull 变体：
+            //   无会话上下文返回 null（shared(null) 走既有「无会话上下文」分支），绝不回落 config home
+            //   冒充项目根。断言意图（factory.shared 传会话 projectRoot · 非自建 carrier）不变。
+            .contains("contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull())");
         assertThat(source)
             .as("SubagentExecutor 必须用 base TUC withAvailableTools(effectiveTools)（D7 工具隔离）")
             // IMP-SUB-19 #23: create() 直接返回 ToolUseContext，不再经 toolUseContext() 解包装。
