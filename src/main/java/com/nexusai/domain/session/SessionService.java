@@ -252,6 +252,18 @@ public class SessionService {
         s.setUpdatedAt(OffsetDateTime.now().toString());
 
         sessionMapper.update(s);
+        // [批 4a · 用户裁定 #12] PATCH 改绑项目（mainProjectId）后必须让旧冻结值失效：
+        //   SessionProjectRoot.setForSession 是 putIfAbsent 首写胜 ⇒ 不清缓存则改绑后
+        //   CwdResolution/memory/transcript 仍解析到<b>旧项目根</b>（本条曾漏 clearSession，
+        //   对照 ProjectSessionBindingService.bind/unbind 两条路径）。
+        //   失效后由 getForSession「miss ⇒ 回源 DB ⇒ 回填」自动取回新绑定。
+        if (req.mainProjectId() != null) {
+            com.nexusai.common.SessionProjectRoot.clearSession(id);
+            if (log.isInfoEnabled()) {
+                log.info("[SessionService] update: session={} mainProjectId 改绑 → 已失效 SessionProjectRoot 冻结值"
+                    + "（下次读取回源 DB 回填）", id);
+            }
+        }
         return toDto(s);
     }
 
@@ -361,9 +373,25 @@ public class SessionService {
             //   user.dir（后端启动目录）→ deleteSessionFiles 打错 slug（实测 sess-4b06118b boundProject=
             //   桌面报告目录，却删到 D--code-ai-project-nexusai-backend slug），真正 transcript/session-memory
             //   残留未清。先取值 → 再 clear → 再删（顺序关键）。
-            java.nio.file.Path projectRoot = java.nio.file.Path.of(
-                com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayer(id));
-            com.nexusai.common.SessionProjectRoot.clearSession(id);
+            // [批 4a] getOriginalCwdLayer 已 fail-loud（有 sessionId 却解析不出 ⇒ 抛）。原写法把取值与
+            //   clearSession 同放一个 try ⇒ 取值抛异常时 clearSession 被跳过 → 冻结值永久残留（泄漏）。
+            //   故取值与失效拆开：取值失败仍必须失效缓存（finally），再删文件（取值失败 → 跳过文件清理）。
+            java.nio.file.Path projectRoot = null;
+            try {
+                projectRoot = java.nio.file.Path.of(
+                    com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayer(id));
+            } catch (RuntimeException e) {
+                // [批 4a] 会话层解析不出（未绑定项目 / DB 无此会话）⇒ fail-loud 抛出。该会话的文件侧
+                //   产物只可能落在「无会话」根下 ⇒ 用命名无会话出口锚定（⛔ 不得回落会话层 user.dir
+                //   冒充：历史误删根因正是「已绑定会话的冻结值丢失后回落 user.dir → 打错 slug → 删错目录」。
+                //   本分支只处理「会话层确实解析不出」的情况，方向与误删相反：它删的是该会话真正写入的根）。
+                log.warn("[SessionService] delete: 会话 {} 项目根解析不出（{}）→ 文件侧清理按「无会话」根锚定",
+                    id, e.getMessage());
+                projectRoot = java.nio.file.Path.of(
+                    com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayerForNonSession());
+            } finally {
+                com.nexusai.common.SessionProjectRoot.clearSession(id);
+            }
             SessionStorage.deleteSessionFiles(projectRoot, id);
         } catch (Exception e) {
             log.warn("[SessionService] delete 文件侧清理失败（best-effort）: session={} err={}", id, e.getMessage());

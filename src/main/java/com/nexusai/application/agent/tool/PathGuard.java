@@ -43,7 +43,7 @@ import java.util.function.Supplier;
  *       fixed workdir）。</li>
  *   <li>{@link #PathGuard(Supplier)}（动态 workdir）—— 生产 bean
  *       {@link com.nexusai.infra.config.ToolConfig#workspacePathGuard()} 注入
- *       {@code () -> Path.of(CwdResolution.getCwd(null))}。供应器签名 {@code Supplier<Path>}
+ *       {@code () -> Path.of(CwdResolution.getCwdForNonSession())}。供应器签名 {@code Supplier<Path>}
  *       <b>不承载 sessionId</b> ⇒ 该形态的无会话调用只能按「无会话」解析（override / 进程 user.dir），
  *       仅作兜底；<b>会话</b>基准走 {@link #sessionWorkdirResolver}（默认
  *       {@code CwdResolution.getCwd(sessionId)}）。</li>
@@ -83,7 +83,7 @@ public class PathGuard {
      * 工作目录供应器 · 每调用取（对齐 CC getCwd() per-call · INV-1）· <b>无会话兜底</b>。
      * <ul>
      *   <li>固定形态：{@code () -> normalizedRealPath}（构造时冻结，测试 / 固定 workspace）</li>
-     *   <li>动态形态：{@code () -> Path.of(CwdResolution.getCwd(null))}（生产 bean；
+     *   <li>动态形态：{@code () -> Path.of(CwdResolution.getCwdForNonSession())}（生产 bean；
      *       供应器<b>无 sessionId 形参</b> ⇒ 恒按「无会话」解析，仅兜底）</li>
      * </ul>
      */
@@ -134,7 +134,7 @@ public class PathGuard {
      * 动态 workdir 构造 · 生产 bean 用 · 对齐 CC expandPath baseDir=getCwd() 每调用取（INV-1）。
      *
      * <p>supplier 应返回经 {@link CwdResolution#normalizeCwd} 归一化的 cwd（生产 bean 传
-     * {@code () -> Path.of(CwdResolution.getCwd(null))}，{@code getCwd} 内部已 realpath+NFC
+     * {@code () -> Path.of(CwdResolution.getCwdForNonSession())}，{@code getCwd} 内部已 realpath+NFC
      * 归一化）。supplier 返回 null 时兜底按「无会话」解析 → 进程 {@code user.dir}
      * （对齐 CC getCwd catch 兜底，不抛）。
      *
@@ -300,7 +300,7 @@ public class PathGuard {
             log.warn("[PathGuard] workdirSupplier 返回 null（无会话 cwd 来源）→ workdir 回落进程 user.dir={}；"
                 + "如需会话 cwd 须由注入方在 supplier 内显式解析（CwdResolution.getCwd(sessionId)）",
                 System.getProperty("user.dir"));
-            wd = Path.of(CwdResolution.getCwd(null));
+            wd = Path.of(CwdResolution.getCwdForNonSession());
         }
         return wd.toAbsolutePath().normalize();
     }
@@ -346,7 +346,7 @@ public class PathGuard {
                 + "如需会话 cwd 须由调用方显式传入 baseDir（guard.workdir(ctx.sessionId()).toString()）",
                 System.getProperty("user.dir"));
         }
-        String actualBaseDir = baseDir != null ? baseDir : CwdResolution.getCwd(null);
+        String actualBaseDir = baseDir != null ? baseDir : CwdResolution.getCwdForNonSession();
         if (raw == null) {
             // 镜像 CC path.ts:40-42: typeof path !== 'string' → TypeError
             throw new IllegalArgumentException("Path must be a string, received null");

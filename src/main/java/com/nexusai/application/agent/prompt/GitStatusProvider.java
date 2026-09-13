@@ -90,7 +90,7 @@ public class GitStatusProvider {
             log.warn("[GitStatusProvider] 构造无 cwd 入参（无会话）→ git 锚定回落进程 user.dir={}；"
                 + "如需会话 cwd 须由调用方显式传入（new GitStatusProvider(Path.of(getCwd(sessionId)))）",
                 System.getProperty("user.dir"));
-            this.cwd = Path.of(CwdResolution.getCwd(null));
+            this.cwd = Path.of(CwdResolution.getCwdForNonSession());
         }
         this.runner = runner != null ? runner : DEFAULT_RUNNER;
     }

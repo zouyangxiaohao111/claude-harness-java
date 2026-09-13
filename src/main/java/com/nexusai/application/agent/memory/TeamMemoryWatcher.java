@@ -158,7 +158,7 @@ public class TeamMemoryWatcher implements ApplicationRunner {
             return;
         }
         // B9 接线：CC watcher.ts:259 getGithubRepo() → resolveGitDir(getCwd())；进程级无会话 → sessionId=null
-        String repoSlug = GitRemoteResolver.getGithubRepo(Paths.get(CwdResolution.getCwd(null)));
+        String repoSlug = GitRemoteResolver.getGithubRepo(Paths.get(CwdResolution.getCwdForNonSession()));
         if (repoSlug == null) {
             if (log.isDebugEnabled()) {
                 log.debug("team-memory-watcher: no github.com remote, skipping sync");

@@ -1198,31 +1198,51 @@ public class ToolRegistrationConfig {
      * per-session 项目目录概念（CC per-project per-cwd 的 projectRoot 等价物）。
      * 会话未绑定项目 / 项目无 path → null（LlmAgentLoop 回落默认 workspaceDir）。
      * 由 LlmAgentLoop（prototype）{@code @Autowired(required=false)} 注入，run() 入口冻结。
+     *
+     * <p><b>[批 4a · 用户裁定 #9] 同一实现同时注册为 {@code SessionProjectRoot} 的 DB 回源解析器</b>：
+     * 内存冻结表 miss（后端重启后首条消息前必然如此）⇒ 回源本方法 → 回填冻结表。
+     * 全仓<b>只有这一处</b> DB 查询实现（sessionId → main_project_id → projects.path），
+     * 消除「同一能力两套判据」。
      */
     @Bean
     public java.util.function.Function<String, String> sessionProjectRootResolver(
             com.nexusai.repository.session.mapper.SessionMapper sessionMapper,
             com.nexusai.repository.project.mapper.ProjectMapper projectMapper) {
-        return sessionId -> {
+        // 三态回源查询（[批 4a]）：sessionKnown 区分「会话存在但未绑定」（数据链路异常 ⇒ cwd 域 fail-loud）
+        // 与「DB 无此会话」（合成/伪造 id ⇒ 无会话出口），二者都返回 projectRoot=null。
+        java.util.function.Function<String, com.nexusai.common.SessionProjectRoot.Lookup> lookupResolver = sessionId -> {
             if (sessionId == null || sessionId.isBlank()) {
-                return null;
+                return com.nexusai.common.SessionProjectRoot.Lookup.unknown();
             }
             com.nexusai.repository.session.entity.SessionRecord session;
             try {
                 session = sessionMapper.selectOneById(sessionId);
             } catch (Exception e) {
                 log.warn("[ToolRegistrationConfig] 解析会话 projectRoot 查询失败: {} - {}", sessionId, e.getMessage());
-                return null;
+                return com.nexusai.common.SessionProjectRoot.Lookup.unknown();
             }
-            if (session == null || session.getMainProjectId() == null) {
-                return null;
+            if (session == null) {
+                // DB 无此会话 ⇒ 「确无会话」（合成/伪造/已删 id）
+                return com.nexusai.common.SessionProjectRoot.Lookup.unknown();
             }
-            com.nexusai.repository.project.entity.ProjectRecord project = projectMapper.selectOneById(session.getMainProjectId());
+            if (session.getMainProjectId() == null || session.getMainProjectId().isBlank()) {
+                // 会话存在但未绑定项目 ⇒ 数据链路异常判据（web 会话必须绑定项目才能进行）
+                return com.nexusai.common.SessionProjectRoot.Lookup.unbound();
+            }
+            com.nexusai.repository.project.entity.ProjectRecord project =
+                projectMapper.selectOneById(session.getMainProjectId());
             if (project == null || project.getPath() == null || project.getPath().isBlank()) {
-                return null;
+                // 有绑定但项目无 path（脏绑定）⇒ 同属数据链路异常
+                return com.nexusai.common.SessionProjectRoot.Lookup.unbound();
             }
-            return project.getPath();
+            return com.nexusai.common.SessionProjectRoot.Lookup.bound(project.getPath());
         };
+        // [批 4a #9] 冻结表 miss ⇒ 回源本解析器（Redis miss → 回源 → 回填）。
+        com.nexusai.common.SessionProjectRoot.setDbResolver(lookupResolver::apply);
+        log.info("[ToolRegistrationConfig] SessionProjectRoot DB 回源解析器已注册（冻结表 miss ⇒ 回查 DB 并回填；"
+            + "三态：绑定 / 有会话未绑定 / 无此会话）");
+        // 既有消费方（LlmAgentLoop / RemoteAgentTaskService / ChatService）签名不变：String（无绑定 → null）
+        return sessionId -> lookupResolver.apply(sessionId).projectRoot();
     }
 
     /**

@@ -164,7 +164,7 @@ public class SkillChangeDetector implements ApplicationRunner {
      * 不在本批清单）改为构造期显式传入会话 projectDir。
      */
     private static String resolveWatcherProjectDir() {
-        String cwd = CwdResolution.getOriginalCwdLayer(null);
+        String cwd = CwdResolution.getOriginalCwdLayerForNonSession();
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 

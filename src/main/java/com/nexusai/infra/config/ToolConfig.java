@@ -26,7 +26,7 @@ import java.nio.file.Path;
  *
  * <p><b>本 bean 的 supplier 仅是无会话兜底</b>：{@link PathGuard} 的动态 supplier 是
  * {@code Supplier<Path>}（无 sessionId 形参），且本 bean 为进程级单例（所有会话共享同一实例），
- * 故它只能提供「无会话」基准（{@code CwdResolution.getCwd(null)} → 仅 override / 进程 user.dir 层）；
+ * 故它只能提供「无会话」基准（{@code CwdResolution.getCwdForNonSession()} → 仅 override / 进程 user.dir 层）；
  * 无会话调用方（测试 / 静态工具）才命中它。此处<b>不再</b>启动期 WARN —— 缺会话是调用方的事
  * （{@link PathGuard} 在无会话入参时按需 WARN 一次）。
  *
@@ -45,6 +45,6 @@ public class ToolConfig {
     public PathGuard workspacePathGuard() {
         // 无会话兜底：仅当调用方未传 sessionId（测试 / 静态工具）时命中。
         // 会话 cwd 的解析器是 PathGuard 内置默认（CwdResolution.getCwd(sessionId)），无需在此注入。
-        return new PathGuard(() -> Path.of(CwdResolution.getCwd(null)));
+        return new PathGuard(() -> Path.of(CwdResolution.getCwdForNonSession()));
     }
 }

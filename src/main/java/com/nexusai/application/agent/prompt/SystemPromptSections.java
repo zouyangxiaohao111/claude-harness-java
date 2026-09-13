@@ -51,7 +51,7 @@ public final class SystemPromptSections {
                 log.warn("[SystemPromptSections] cwdSupplier 未注入且无会话入参 → cwd 回落进程 user.dir={}；"
                     + "如需会话 cwd 须由调用方显式传入（cwd(sessionId)）", System.getProperty("user.dir"));
             }
-            return Path.of(CwdResolution.getCwd(null));
+            return Path.of(CwdResolution.getCwdForNonSession());
         };
     }
 

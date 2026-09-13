@@ -72,7 +72,11 @@ public class ProjectSessionBindingService {
         // [IMPL-10] DEL-CCE-04: CwdChanged 伪事件发射已删除 — old_cwd 取自已覆盖为 projectId
         //   的 mainProjectId，恒自等值（EV-CCE-032）；CC CwdChanged 仅真实 cwd 切换触发。
 
-        // [IMP-B] OPD-SPR-03: 绑定成功 → 冻结会话级 projectRoot（首写胜，rebind 不覆盖已冻结值）
+        // [IMP-B] OPD-SPR-03: 绑定成功 → 冻结会话级 projectRoot（首写胜）。
+        // [批 4a · 用户裁定 #12] 改绑（A 项目 → B 项目）必须让旧冻结值失效：setForSession 是
+        //   putIfAbsent 首写胜，不清缓存则改绑后 CwdResolution/memory 仍解析到<b>旧项目根</b>。
+        //   失效后按「Redis 失效 → 回源 DB → 回填」由 getForSession 自动取回新绑定。
+        SessionProjectRoot.clearSession(sessionId);
         SessionProjectRoot.setForSession(sessionId, p.getPath());
 
         // [T8/D6] 首个绑定会话 → 项目级 .claude 白名单一次性导入 .nexusai/（幂等不覆盖；@Async 不阻塞绑定响应）

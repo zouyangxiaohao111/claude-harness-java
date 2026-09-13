@@ -11,9 +11,11 @@ import com.nexusai.repository.session.mapper.SessionMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -54,6 +56,61 @@ class SessionServiceTest {
         // create/update/getById 不触达 message/sessionFile/chatService/suggestionStore
         ReflectionTestUtils.setField(service, "messageMapper", mock(com.nexusai.repository.session.mapper.MessageMapper.class));
         ReflectionTestUtils.setField(service, "sessionFileMapper", mock(com.nexusai.repository.session.mapper.SessionFileMapper.class));
+    }
+
+    @Test
+    @DisplayName("[批 4a #12] PATCH 改绑 mainProjectId → 失效旧冻结值（下次读取回源取到新项目根）")
+    void update_rebindProject_invalidatesFrozenRoot(@TempDir Path oldRoot, @TempDir Path newRoot) {
+        // WHY（规则九 · 用户 2026-09-14 裁定 #12）：SessionProjectRoot.setForSession 是 putIfAbsent
+        //   首写胜 ⇒ PATCH 改绑（A 项目 → B 项目）若不清缓存，CwdResolution/memory/transcript 仍解析到
+        //   <b>旧项目根</b>（跨项目污染）。本用例锁定「改绑 ⇒ 冻结值失效」这条接线。
+        // RED: 删掉 SessionService.update 里的 clearSession ⇒ 读到旧冻结值 oldRoot ⇒ 断言红。
+        final String id = "sess-rebind-proj";
+        SessionRecord rec = new SessionRecord();
+        rec.setId(id);
+        when(sessionMapper.selectOneById(id)).thenReturn(rec);
+
+        com.nexusai.common.SessionProjectRoot.setForSession(id, oldRoot.toString());
+        com.nexusai.common.SessionProjectRoot.setDbResolver(
+            sid -> com.nexusai.common.SessionProjectRoot.Lookup.bound(newRoot.toString()));
+        try {
+            assertThat(com.nexusai.common.SessionProjectRoot.getForSession(id))
+                .as("前置：改绑前解析到旧冻结值")
+                .isEqualTo(oldRoot.toString());
+
+            service.update(id, new SessionUpdateRequest(null, null, null, "proj-new", null, null, null));
+
+            assertThat(com.nexusai.common.SessionProjectRoot.getForSession(id))
+                .as("改绑后必须失效旧冻结值并回源取到新项目根（否则仍写坏目录）")
+                .isEqualTo(newRoot.toString())
+                .isNotEqualTo(oldRoot.toString());
+        } finally {
+            com.nexusai.common.SessionProjectRoot.reset();
+            com.nexusai.common.SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    @Test
+    @DisplayName("[批 4a #12] PATCH 不带 mainProjectId（PATCH 语义 null=不改动）→ 不动冻结值")
+    void update_withoutProjectId_keepsFrozenRoot(@TempDir Path root) {
+        // WHY: PATCH 语义 null = 不改动 ⇒ 不得误失效（否则每次改标题/模型都会丢掉冻结绑定，
+        //   使同会话内的 cwd 身份被重建 —— 与「会话内冻结不更新」（CC stable identity）冲突）。
+        // RED: 把 update 里的 `if (req.mainProjectId() != null)` 门去掉（无条件 clearSession）⇒ 本用例红。
+        final String id = "sess-no-rebind";
+        SessionRecord rec = new SessionRecord();
+        rec.setId(id);
+        when(sessionMapper.selectOneById(id)).thenReturn(rec);
+
+        com.nexusai.common.SessionProjectRoot.setForSession(id, root.toString());
+        try {
+            service.update(id, new SessionUpdateRequest("改名", null, null, null, null, null, null));
+
+            assertThat(com.nexusai.common.SessionProjectRoot.getForSession(id))
+                .as("未改绑 ⇒ 冻结值必须原样保留")
+                .isEqualTo(root.toString());
+        } finally {
+            com.nexusai.common.SessionProjectRoot.reset();
+        }
     }
 
     @Test

@@ -154,7 +154,7 @@ public class PluginStartupAssembler {
             //   （无 sessionId 形参/字段/调用链）→ CwdResolution 回落 user.dir，与旧实现（启动线程
             //   MDC 恒空）行为零变化。会话感知需启动链引入会话通道（不在本批清单）。
             MarketplaceConfigStore store = new MarketplaceConfigStore(marketplaceManager, configStorage,
-                () -> CwdResolution.getOriginalCwdLayer(null));
+                () -> CwdResolution.getOriginalCwdLayerForNonSession());
             MarketplaceReconciler reconciler = new MarketplaceReconciler(store);
             // 1) 官方 marketplace 首次启动自动安装（幂等跳过已装）· CC officialMarketplaceStartupCheck.ts:147
             OfficialMarketplace.wire(marketplaceManager, reconciler).checkAndInstallOfficialMarketplace();
@@ -191,7 +191,7 @@ public class PluginStartupAssembler {
         }
         // [批 3c] 显式 null = 无会话（同 {@link #runL9BackgroundHousekeeping()}：启动期无会话通道）。
         PerformStartupChecks.wire(marketplaceManager, configStorage, pluginLoader,
-                () -> CwdResolution.getOriginalCwdLayer(null))
+                () -> CwdResolution.getOriginalCwdLayerForNonSession())
             .performStartupChecks(setAppState);
     }
 

@@ -1023,7 +1023,7 @@ public class McpServerService {
         //   重载「MDC 为空」分支等价语义）。如需会话 cwd 须由调用方显式传入（本方法加 sessionId 形参）。
         log.warn("[McpServerService] withAddMeta 无会话入参 → describeMcpConfigFilePath cwd 回落进程 user.dir={}；"
             + "如需会话 cwd 须由调用方显式传入 sessionId", System.getProperty("user.dir"));
-        String filePath = configFileWriter.describeMcpConfigFilePath(scope, CwdResolution.getCwd(null));
+        String filePath = configFileWriter.describeMcpConfigFilePath(scope, CwdResolution.getCwdForNonSession());
         return new McpServerDto(base.id(), base.name(), base.command(), base.args(), base.env(),
             base.status(), base.lastError(), base.enabled(), base.createdAt(), base.type(),
             base.approvalStatus(), base.userFacingName(), base.channelPermissions(),

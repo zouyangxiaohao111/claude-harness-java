@@ -122,7 +122,7 @@ public class TeamMemorySyncService {
      *  resolveGitDir(getCwd())，起点 = getCwd()）。进程级后台线程无会话上下文 → sessionId=null →
      *  {@link CwdResolution#getCwd} 回落 user.dir（测试 System.setProperty user.dir 缝仍生效）。 */
     private Path cwd() {
-        return Paths.get(CwdResolution.getCwd(null));
+        return Paths.get(CwdResolution.getCwdForNonSession());
     }
 
     // ─── Pull · CC pullTeamMemory（index.ts:770-867）────────────────

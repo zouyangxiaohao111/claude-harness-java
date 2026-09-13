@@ -60,7 +60,7 @@ public class StdioMcpTransport implements McpTransport {
     private volatile Thread stderrReaderThread;
     /**
      * [S02 X-9] 保存的 transport 配置 · start(config) 时保存，供 server→client roots/list
-     * 请求回传 cwd（config.cwd() ?? CwdResolution.getOriginalCwdLayer(null)，CC client.ts:1009-1018 getOriginalCwd 语义）。
+     * 请求回传 cwd（config.cwd() ?? CwdResolution.getOriginalCwdLayerForNonSession()，CC client.ts:1009-1018 getOriginalCwd 语义）。
      */
     private volatile TransportConfig config;
     private Process process;
@@ -466,7 +466,7 @@ public class StdioMcpTransport implements McpTransport {
                     serverName, System.getProperty("user.dir"));
             }
             String cwd = config != null && config.cwd() != null && !config.cwd().isBlank()
-                ? config.cwd() : CwdResolution.getOriginalCwdLayer(null);
+                ? config.cwd() : CwdResolution.getOriginalCwdLayerForNonSession();
             Map<String, Object> response = new java.util.LinkedHashMap<>();
             response.put("jsonrpc", "2.0");
             response.put("id", idNode);

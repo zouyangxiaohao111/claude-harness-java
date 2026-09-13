@@ -696,7 +696,7 @@ public class SseMcpTransport implements McpTransport {
      * roots/list → {@code {roots:[{uri:"file://"+cwd}]}}（CC client.ts:1009-1018 ListRootsRequestSchema
      * handler → uri=file://${getOriginalCwd()}，CC 真源自验 client.ts:1014：roots 用 STATE.originalCwd
      * =会话项目根，非 pwd/getCwd 动态 cwd）。Java 兜底走统一入口按「无会话」解析
-     * {@code CwdResolution.getOriginalCwdLayer(null)}。
+     * {@code CwdResolution.getOriginalCwdLayerForNonSession()}。
      *
      * <p><b>[批 3c 会话态显式化]</b>：transport 为 per-server 对象、<b>无会话入参</b>（同一 MCP
      * server 可服务多会话）⇒ 兜底层只能按「无会话」解析（进程 user.dir，= 旧实现「MDC 为空」
@@ -716,7 +716,7 @@ public class SseMcpTransport implements McpTransport {
                     serverName(), System.getProperty("user.dir"));
             }
             String cwd = config != null && config.cwd() != null && !config.cwd().isBlank()
-                ? config.cwd() : CwdResolution.getOriginalCwdLayer(null);
+                ? config.cwd() : CwdResolution.getOriginalCwdLayerForNonSession();
             response.put("result", Map.of("roots", List.of(Map.of("uri", "file://" + cwd))));
             log.info("[SseMcpTransport] {} roots/list 响应: uri=file://{}", serverName(), cwd);
         } else {

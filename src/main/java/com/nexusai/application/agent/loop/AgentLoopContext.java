@@ -403,7 +403,7 @@ public record AgentLoopContext(
          * （构造线程无 MDC）行为零变化。
          */
         private static String resolveDefaultWorkspaceDir() {
-            String cwd = CwdResolution.getOriginalCwdLayer(null);
+            String cwd = CwdResolution.getOriginalCwdLayerForNonSession();
             return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
         }
 

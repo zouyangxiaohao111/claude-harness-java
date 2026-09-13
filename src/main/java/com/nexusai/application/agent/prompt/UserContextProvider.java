@@ -87,7 +87,7 @@ public class UserContextProvider {
     private final String sessionId;
 
     /**
-     * @param projectRoot 项目根目录（默认 {@code Path.of(CwdResolution.getOriginalCwdLayer(null))} ·
+     * @param projectRoot 项目根目录（默认 {@code Path.of(CwdResolution.getOriginalCwdLayerForNonSession())} ·
      *      对齐 CC {@code getOriginalCwd}（claudemd.ts:851），无会话回落 user.dir；测试注入临时目录）
      */
     public UserContextProvider(Path projectRoot) {
@@ -116,7 +116,7 @@ public class UserContextProvider {
      * {@code ContextAnalyzeService.java:805}（以及测试 {@code CompactCommandCcContractTest} 等）。
      */
     public UserContextProvider() {
-        this(Path.of(CwdResolution.getOriginalCwdLayer(null)), System::getenv, null);
+        this(Path.of(CwdResolution.getOriginalCwdLayerForNonSession()), System::getenv, null);
     }
 
     /**
@@ -127,7 +127,7 @@ public class UserContextProvider {
     public UserContextProvider(com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine) {
         // [批 3c] 无会话来源 → 显式 null（回落 user.dir）。**有会话的调用方应改用
         //   {@link #UserContextProvider(ClaudemdEngine, String)}**，否则引擎扫描根落到 user.dir。
-        this(Path.of(CwdResolution.getOriginalCwdLayer(null)), System::getenv, claudemdEngine, null);
+        this(Path.of(CwdResolution.getOriginalCwdLayerForNonSession()), System::getenv, claudemdEngine, null);
     }
 
     /**
@@ -141,7 +141,7 @@ public class UserContextProvider {
                                String sessionId) {
         this(sessionId != null && !sessionId.isBlank()
                 ? Path.of(CwdResolution.getOriginalCwdLayer(sessionId))
-                : Path.of(CwdResolution.getOriginalCwdLayer(null)),
+                : Path.of(CwdResolution.getOriginalCwdLayerForNonSession()),
             System::getenv, claudemdEngine, sessionId);
     }
 

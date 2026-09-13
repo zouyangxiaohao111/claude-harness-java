@@ -62,7 +62,7 @@ public class McpConfigFileWriter {
         log.warn("[McpConfigFileWriter] projectMcpJsonPath 无会话入参 → cwd 回落进程 user.dir；本轮结果={}；"
             + "如需会话 cwd 须由调用方显式传入（describeMcpConfigFilePath(scope, cwd) 的 cwd 形参）",
             System.getProperty("user.dir"));
-        return Path.of(CwdResolution.getCwd(null), ".mcp.json");
+        return Path.of(CwdResolution.getCwdForNonSession(), ".mcp.json");
     }
 
     /** user scope 目标：{@code <user.home>/.nexusai.json}（对齐 CC getGlobalClaudeFile）。 */
