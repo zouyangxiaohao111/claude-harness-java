@@ -128,7 +128,7 @@ class SessionFileAccessHooksTest {
         SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry);
         String path = Path.of(System.getProperty("user.home"), ".claude", "session-memory", "abc.md").toString();
 
-        hooks.handleSessionFileAccess("Read", inputWithPath(path));
+        hooks.handleSessionFileAccess("Read", inputWithPath(path), com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
 
         assertThat(telemetry.events)
             .as("session_memory 命中必须发射 tengu_session_memory_accessed")
@@ -150,7 +150,7 @@ class SessionFileAccessHooksTest {
         SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry, autoMemPaths);
         String path = autoMemPaths.getAutoMemPath() + "MEMORY.md";
 
-        hooks.handleSessionFileAccess("Read", inputWithPath(path));
+        hooks.handleSessionFileAccess("Read", inputWithPath(path), com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
 
         assertThat(telemetry.events).contains("tengu_memdir_accessed");
         assertThat(telemetry.events).contains("tengu_memdir_file_read");
@@ -177,7 +177,7 @@ class SessionFileAccessHooksTest {
         CountingWatcher watcher = new CountingWatcher();
         hooks.setTeamMemoryWatcher(watcher);
 
-        hooks.handleSessionFileAccess("Edit", inputWithPath(teamFile));
+        hooks.handleSessionFileAccess("Edit", inputWithPath(teamFile), com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
 
         assertThat(telemetry.events)
             .as("feature 关 → tengu_team_mem_accessed 不得发射")
@@ -242,22 +242,24 @@ class SessionFileAccessHooksTest {
     void subagentContext_emitsSubagentName() {
         // WHY: CC sessionFileAccessHooks.ts:158-159 只在 subagent 上下文携带 subagent_name 事件
         //      属性（getSubagentLogName 非 subagent → undefined → 无该属性）。analytics 归因需要
-        //      区分"哪个 subagent 访问了会话记忆"（OPD-M-50）。Java 端用 AgentContext.runWithAgentContext
-        //      模拟 subagent 线程上下文（ThreadLocal 等价 CC AsyncLocalStorage）。
+        //      区分"哪个 subagent 访问了会话记忆"（OPD-M-50）。
+        // [A#1 tuc-invoking-req] 载体已从 AgentContext ThreadLocal 改为**显式 ToolUseContext**
+        //      （CC Tool.ts:245-246 即把 TUC 定为 hook 侧子代理判别载体）：hook 在 HOOK_EXECUTOR
+        //      线程执行，ThreadLocal 不跨线程 ⇒ 旧夹具的 runWithAgentContext 在生产等价路径上
+        //      读不到值。真线程 + 无 ThreadLocal 的强夹具见
+        //      {@code SubagentNameExplicitCarrierTest}。
         RecordingTelemetry telemetry = new RecordingTelemetry();
         SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry);
         String path = Path.of(System.getProperty("user.home"), ".claude", "session-memory", "abc.md").toString();
         ObjectNode input = inputWithPath(path);
         AtomicInteger subagentNameSeen = new AtomicInteger(0);
 
-        // subagent 上下文：内置 agent（如 "Explore"）→ subagent_name=agent 名
-        com.nexusai.application.agent.subagent.AgentContext.SubagentContext subagent =
-            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
-                "agent-1", "parent-session", "Explore", true, "req-1", "spawn");
-        com.nexusai.application.agent.subagent.AgentContext.runWithAgentContext(subagent, () -> {
-            hooks.handleSessionFileAccess("Read", input);
-            return null;
-        });
+        // subagent 载体：内置 agent（如 "Explore"）→ subagent_name=agent 名
+        // （生产者 = SubagentExecutor.withSubagentIdentity，isBuiltIn = instanceof BuiltInAgentDefinition）
+        com.nexusai.application.agent.tool.ToolUseContext subagentTuc =
+            com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test")
+                .withSubagentIdentity("Explore", true);
+        hooks.handleSessionFileAccess("Read", input, subagentTuc);
 
         // 事件名 + 属性都必须携带 subagent_name
         assertThat(telemetry.records)
@@ -273,14 +275,15 @@ class SessionFileAccessHooksTest {
     @Test
     @DisplayName("主线程读取 session-memory → 事件无 subagent_name 属性 (CC :158-159)")
     void mainThread_emitsNoSubagentName() {
-        // WHY: 主线程无 subagent context → getSubagentLogName() 返回 null → subagentProps 空 →
-        //      事件不带 subagent_name（CC :159 主线程无 subagentName → 无该属性）。与 subagent 场景
+        // WHY: 主线程 TUC 无 subagentName（未盖身份）→ subagentProps 空 → 事件不带 subagent_name
+        //      （CC :145-146 非子代理上下文 getSubagentLogName 返回 undefined）。与 subagent 场景
         //      对照验证"仅在 subagent 上下文才携带"的归因语义（OPD-M-50 验收口径）。
         RecordingTelemetry telemetry = new RecordingTelemetry();
         SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry);
         String path = Path.of(System.getProperty("user.home"), ".claude", "session-memory", "abc.md").toString();
 
-        hooks.handleSessionFileAccess("Read", inputWithPath(path));
+        hooks.handleSessionFileAccess("Read", inputWithPath(path),
+            com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
 
         assertThat(telemetry.records)
             .as("主线程事件不得带 subagent_name 属性")

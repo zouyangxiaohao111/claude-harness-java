@@ -257,7 +257,7 @@ public final class ApiQueryHookHelper {
                     List.of(),                         // mcpTools — CC :105 []
                     hookCtx.toolUseContext() != null
                         ? hookCtx.toolUseContext().isNonInteractiveSession() : null  // :98-99
-                );
+                , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
 
                 LlmProvider.LlmRawResponse response = executor.query(systemPrompt, userMessage, model, useTools, options);
                 String content = response.content().trim();

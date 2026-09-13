@@ -92,6 +92,24 @@ public record ModelRequest(
     Consumer<Throwable> onError,                            // 错误回调；只触发一次
     Runnable onComplete,                                    // 正常完成回调；只触发一次，与 onError 互斥
     AbortController abortController,                        // [H13-GAP-4 v3] 取消信号（可 null）
-    Boolean skipCacheWrite                                  // [C] fork/side-query 不写 prompt cache（null = 未设置）· CC original: options.skipCacheWrite (claude.ts:711 → :3243)
+    Boolean skipCacheWrite,                                 // [C] fork/side-query 不写 prompt cache（null = 未设置）· CC original: options.skipCacheWrite (claude.ts:711 → :3243)
+    // ═══════════════════ 20 [A#3 tuc-invoking-req] agentContext ═══════════════════
+    // 显式携带的 agent 归因上下文 · CC original: 无入参（CC 经 AsyncLocalStorage 自动传播，
+    //   services/api/logging.ts:294/:461 {@code consumeInvokingRequestId()} 读 ambient context）。
+    //
+    // WHY 必须显式（本批根因）：CC 的 ALS 跨异步自动传播 invokingRequestId 到 terminal API event；
+    //   Java 的 AgentContext.STORAGE 是 plain ThreadLocal，而 provider 的 emitApiTerminalEvent
+    //   跑在 LlmAgentLoop.STREAM_EXECUTOR 虚拟线程（LlmAgentLoop:6604）→ 恒读不到 →
+    //   invokingRequestId 生产恒空（12 个发射点全中）。修法 = 在上下文仍有效的线程（子代理
+    //   query loop 线程，SubagentExecutor:2003 runWithAgentContext 作用域内）取出实例，
+    //   经本字段 → ModelCaller → LlmProvider.stream 显式下传。
+    //
+    // 稀疏边语义（agentContext.ts:159-161）：本实例携带的 AtomicBoolean invocationEmitted
+    //   保证「每个 invocation 只有第一个 terminal event 带 invokingRequestId」，物理上由
+    //   同一实例跨调用共享实现（见 AgentContext.consumeInvokingRequestId(AgentContext)）。
+    //
+    // 取值规则：主线程 / 无归因上下文 → null（对齐 CC 主线程 undefined，事件无该属性）；
+    //   子代理 → SubagentExecutor 装入的 SubagentContext 实例。
+    com.nexusai.application.agent.subagent.AgentContext agentContext
 ) {
 }

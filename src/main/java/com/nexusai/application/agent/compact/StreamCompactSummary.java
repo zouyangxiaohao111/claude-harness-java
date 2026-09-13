@@ -934,7 +934,8 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                     //   maxOutputTokensOverride since it doesn't share cache with the main thread"
                     //   —— skipCacheWrite 只在 fork 分支（compact.ts:1229）设置；本路径对齐传 null
                     //   （不设 = false = marker 落最后一条）。
-                    null);
+                    null,
+                    com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             } else {
                 provider.stream(
                     config, model, blocks, history, tools, null, null, null, null,
@@ -946,7 +947,8 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                     abortController,
                     onError,
                     onComplete,
-                    null); // [C] 同上：流式 fallback 非 fork → 不设 skipCacheWrite（CC compact.ts:1229 仅 fork 分支）
+                    null, // [C] 同上：流式 fallback 非 fork → 不设 skipCacheWrite（CC compact.ts:1229 仅 fork 分支）
+                    com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             }
             // [IMP2-15 △-15] CC 无 300s 级硬超时（compact.ts 全程：靠 abortController + SDK
             //   状态，流一直持续则等待）→ future.get() 无超时等待；取消路径仍经

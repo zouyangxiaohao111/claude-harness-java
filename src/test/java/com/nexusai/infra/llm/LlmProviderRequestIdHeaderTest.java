@@ -96,7 +96,7 @@ class LlmProviderRequestIdHeaderTest {
 
         AnthropicSdkProvider provider = new AnthropicSdkProvider();
         LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
-            new ProviderConfig(baseUrl, "fake-key"), "claude-test", "sys", "user");
+            new ProviderConfig(baseUrl, "fake-key"), "claude-test", "sys", "user", null);
 
         assertThat(raw.requestId())
             .as("Anthropic request-id header 必须提取为 requestId (CC yoloClassifier.ts:798)")
@@ -114,7 +114,7 @@ class LlmProviderRequestIdHeaderTest {
 
         AnthropicSdkProvider provider = new AnthropicSdkProvider();
         LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
-            new ProviderConfig(baseUrl, "fake-key"), "claude-test", "sys", "user");
+            new ProviderConfig(baseUrl, "fake-key"), "claude-test", "sys", "user", null);
 
         assertThat(raw.requestId())
             .as("无 request-id header 时 requestId 必须为 null (对齐 CC ?? undefined)")
@@ -146,7 +146,7 @@ class LlmProviderRequestIdHeaderTest {
         OpenAiSdkProvider provider = new OpenAiSdkProvider();
         provider.properties = new NexusProperties();
         LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
-            new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user");
+            new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
 
         assertThat(raw.requestId())
             .as("[OpenAI-SDK] R-REQ-1 兜底（DEC-RV-14a）· SDK 0.25.0 无 withRawResponse → requestId 走请求侧兜底；测试未设 MDC → RequestContext.requestId()=null（DEC-OA-1 方案 C + DEC-RV-14a）")
@@ -164,7 +164,7 @@ class LlmProviderRequestIdHeaderTest {
         OpenAiSdkProvider provider = new OpenAiSdkProvider();
         provider.properties = new NexusProperties();
         LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
-            new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user");
+            new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
 
         assertThat(raw.requestId())
             .as("SDK 0.25.0 无响应头通道 + 无 MDC → 请求侧兜底 null（DEC-RV-14a：MDC reqId 为空时仍为 null，对齐 CC ?? undefined）")
@@ -182,7 +182,7 @@ class LlmProviderRequestIdHeaderTest {
         com.nexusai.common.RequestContext.set("sess-x", "msg-fallback-1");
         try {
             LlmProvider.LlmRawResponse raw = provider.chatWithRaw(
-                new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user");
+                new ProviderConfig(baseUrl, "fake-key"), "gpt-test", "sys", "user", null);
             assertThat(raw.requestId())
                 .as("DEC-RV-14a：SDK 无响应头通道 → requestId 兜底为请求侧 MDC reqId（userMessageId）")
                 .isEqualTo("msg-fallback-1");

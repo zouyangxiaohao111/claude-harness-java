@@ -761,7 +761,7 @@ public class SkillImprovementHook {
                 0d,
                 "skill_improvement_apply",
                 new AbortController(),
-                null);   // [IMP-M-P1-2] maxTokens — CC skillImprovement.ts 未设 max_tokens
+                null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());   // [IMP-M-P1-2] maxTokens — CC skillImprovement.ts 未设 max_tokens
     }
 
 
@@ -822,7 +822,7 @@ public class SkillImprovementHook {
                     options != null ? options.temperature() : null,
                     options != null ? options.querySource() : null,
                     options != null ? options.abortController() : null,
-                    options != null ? options.maxTokens() : null);   // [IMP-M-P1-2] maxTokens 透传
+                    options != null ? options.maxTokens() : null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());   // [IMP-M-P1-2] maxTokens 透传
             String content = providerRef.get().chatWithOptions(
                     configRef.get(), getSmallFastModel(), systemPrompt, prompt, chatOptions);
             if (log.isDebugEnabled()) {

@@ -393,7 +393,8 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
                                Consumer<String> onChunk, Consumer<AssistantMessage> onAssistant,
                                Consumer<ToolUseBlock> onToolCallComplete, Consumer<String> onReasoningChunk,
                                Runnable onStreamingFallback, AbortController abortController,
-                               Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                               Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 int call = ++streamCalls;
                 captures.add(new StreamCapture(List.copyOf(history),
                     blocks == null ? null : List.copyOf(blocks), tools, maxOutputTokensOverride,

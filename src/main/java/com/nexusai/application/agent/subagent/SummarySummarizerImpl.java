@@ -129,7 +129,7 @@ public class SummarySummarizerImpl implements SummarySummarizer {
             // CC querySource: 'agent_summary' (agentSummary.ts:115) — 侧信道来源标记
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 history, null, null, null, null,
-                "agent_summary", abortController, null);
+                "agent_summary", abortController, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             if (log.isDebugEnabled()) {
                 log.debug("[SummarySummarizerImpl] agent {} fork 摘要, {} 条 clean 上下文, abort={}",
                     agentId, history.size(), abortController != null);

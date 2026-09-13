@@ -88,7 +88,8 @@ class CancellationSemanticsTest {
                            Runnable onStreamingFallback,
                            AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             int idx = callCount.getAndIncrement();
             AssistantMessage am = responses.get(Math.min(idx, responses.size() - 1));
             onAssistantMessage.accept(am);
@@ -165,7 +166,8 @@ class CancellationSemanticsTest {
             java.util.function.Consumer<ToolUseBlock> otc,
             java.util.function.Consumer<String> orc, Runnable osf,
             AbortController ac,
-            java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) {
+            java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             throw new UnsupportedOperationException();
         }
 
@@ -388,7 +390,8 @@ class CancellationSemanticsTest {
                 java.util.function.Consumer<ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) {
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) { return ""; }

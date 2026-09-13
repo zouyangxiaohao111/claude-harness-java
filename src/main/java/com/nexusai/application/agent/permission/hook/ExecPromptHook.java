@@ -346,7 +346,7 @@ public class ExecPromptHook {
             combinedAbort,  // [IMPL-06 OD-EX-02] abortController — CC execPromptHook.ts:73 signal: combinedSignal
                           //   （combined = 父 abort ∪ timeout；provider 预检 + onCancel 硬中断，combinedAbortSignal.ts:15-47）
             null    // [IMP-M-P1-2] maxTokens — CC execPromptHook.ts 未设 max_tokens（缺省 1024）
-        );
+        , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
     }
 
     /** Tool 列表 → OpenAI function-calling 格式（无工具 → null）. */

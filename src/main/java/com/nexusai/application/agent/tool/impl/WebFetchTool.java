@@ -638,7 +638,7 @@ public class WebFetchTool implements Tool {
                 List.of(),    // agents — []
                 Boolean.FALSE, // hasAppendSystemPrompt — false
                 List.of(),    // mcpTools — []
-                isNonInteractiveSession); // isNonInteractiveSession 透传
+                isNonInteractiveSession, com.nexusai.application.agent.subagent.AgentContext.getAgentContext()); // isNonInteractiveSession 透传
     }
 
     /** CC makeSecondaryModelPrompt · WebFetchTool/prompt.ts:23-46（guidelines 按预批准域分支）。 */

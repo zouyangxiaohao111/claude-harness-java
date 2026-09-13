@@ -221,7 +221,7 @@ public class FindRelevantMemories {
                 "memdir_relevance",   // CC querySource: 'memdir_relevance' (:121)
                 signal,               // MEM-03：CC signal 透传（:117）→ provider 请求前 abort 预检
                 256                   // CC max_tokens: 256 (:108)
-            );
+            , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             // MEM-02/G-22：sideQuery.ts:115-128 maxRetries=2 —— SDK 客户端级重试
             // （408/409/429/5xx + 连接错误；claude.ts:1781 主链 maxRetries:0 的 Java provider 无
             // 客户端重试 → 本处调用点手工重试等价）。abort 优先：取消后不发起/不重试。

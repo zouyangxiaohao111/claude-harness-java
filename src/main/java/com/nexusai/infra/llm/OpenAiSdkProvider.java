@@ -119,7 +119,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                        AbortController abortController,
                        Consumer<Throwable> onError,
                        Runnable onComplete,
-                       Boolean skipCacheWrite) {
+                       Boolean skipCacheWrite,
+                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // [C] skipCacheWrite 签名跟随（wire 无 marker 语义 · openai-compatible 端点无 prompt cache
         //   条目写入移位的对应物 → 忽略，行为零改动）。CC 侧本参数只在 Anthropic 通道
         //   claude.ts:3243 markerIndex 消费。
@@ -168,7 +169,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                        AbortController abortController,
                        Consumer<Throwable> onError,
                        Runnable onComplete,
-                       Boolean skipCacheWrite) {
+                       Boolean skipCacheWrite,
+                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
@@ -209,7 +211,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                        AbortController abortController,
                        Consumer<Throwable> onError,
                        Runnable onComplete,
-                       Boolean skipCacheWrite) {
+                       Boolean skipCacheWrite,
+                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         String joined = systemPromptBlocks == null ? null : systemPromptBlocks.stream()
             .filter(java.util.Objects::nonNull)
@@ -219,7 +222,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         stream(config, modelName, joined, history, tools, maxOutputTokensOverride, taskBudget,
             effortValue, thinkingConfig, onChunk, onAssistantMessage, onToolCallComplete,
             onReasoningChunk, onStreamingFallback, abortController, onError, onComplete,
-            skipCacheWrite);
+            skipCacheWrite, agentContext);   // [A#3] 显式归因上下文透传（OpenAI 侧不发射该边，签名跟随）
     }
 
     /** 流式核心 · SDK createStreaming + 迭代器消费（[H13-GAP-4 v3] chunk 边界检查 aborted）. */
@@ -328,7 +331,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                        String modelName,
                        String systemPrompt,
                        String userMessage) {
-        LlmRawResponse raw = chatWithRaw(config, modelName, systemPrompt, userMessage);
+        // [A#3] chat() 入口不携带归因上下文（本批 12 个 terminal 发射点在 chatWithRaw /
+        //   chatWithOptions / chatWithOptionsMessage），内部委托显式传 null。
+        LlmRawResponse raw = chatWithRaw(config, modelName, systemPrompt, userMessage, null);
         return raw.content();
     }
 
@@ -350,7 +355,8 @@ public class OpenAiSdkProvider implements LlmProvider {
     public LlmRawResponse chatWithRaw(ProviderConfig config,
                                       String modelName,
                                       String systemPrompt,
-                                      String userMessage) {
+                                      String userMessage,
+                                      com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (config == null || !config.isUsable()) {
             throw new IllegalStateException(
                 "OpenAiSdkProvider.chatWithRaw 调用时 ProviderConfig 不可用");

@@ -58,7 +58,7 @@ class LlmProviderRawResponseTest {
     // ─────────── 2. LlmProvider.chatWithRaw 接口方法声明 ───────────
 
     @Test
-    @DisplayName("M3.2-2 LlmProvider 接口声明 chatWithRaw 4 参 (cfg/sys/user/model) · 对齐 CC sideQuery")
+    @DisplayName("M3.2-2 LlmProvider 接口声明 chatWithRaw (cfg/sys/user/model + [A#3] agentContext) · 对齐 CC sideQuery")
     void llmProviderDeclaresChatWithRaw() {
         Method chatWithRaw = Arrays.stream(LlmProvider.class.getDeclaredMethods())
             .filter(m -> m.getName().equals("chatWithRaw")
@@ -68,12 +68,20 @@ class LlmProviderRawResponseTest {
                 "LlmProvider must declare chatWithRaw returning LlmRawResponse"));
 
         Class<?>[] params = chatWithRaw.getParameterTypes();
+        // [A#3 tuc-invoking-req] 末位新增 agentContext：CC sideQuery 无此参数（CC 经
+        //   AsyncLocalStorage 自动传播 invokingRequestId），Java 以 plain ThreadLocal 无法跨
+        //   STREAM_EXECUTOR 虚拟线程边界 ⇒ 必须显式载体（用户裁定：chat 家族也要覆盖）。
+        //   前 4 参保持 CC sideQuery 顺序 (cfg/sys/user/model) 不变。
         assertThat(params)
-            .as("chatWithRaw must accept (ProviderConfig, String, String, String) — order cfg,sys,user,model")
-            .hasSize(4);
+            .as("chatWithRaw must accept (ProviderConfig, String, String, String, AgentContext)"
+                + " — 前 4 参顺序 cfg,sys,user,model 不变")
+            .hasSize(5);
         assertThat(params[0].getSimpleName())
             .as("param 0 must be ProviderConfig")
             .isEqualTo("ProviderConfig");
+        assertThat(params[4].getSimpleName())
+            .as("[A#3] param 4 must be AgentContext（显式归因载体）")
+            .isEqualTo("AgentContext");
     }
 
     // ─────────── 3. AnthropicSdkProvider 实现 chatWithRaw (反射 · [DEC-RV-07] SDK 实现) ───────────

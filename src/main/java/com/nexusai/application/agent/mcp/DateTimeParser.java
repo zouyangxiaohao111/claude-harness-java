@@ -205,7 +205,7 @@ public class DateTimeParser {
             "mcp_datetime_parse",
             new AbortController(),
             null,
-            null);
+            null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
     }
 
     /**

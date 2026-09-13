@@ -259,7 +259,7 @@ class AnthropicSdkProviderSystemBlocksTest {
                 null, null, null, null, null,
                 c -> {}, m -> {}, t -> {}, r -> {}, () -> {},
                 null, e -> {}, done::countDown,
-                skipCacheWrite);
+                skipCacheWrite, null);
             assertThat(done.await(10, java.util.concurrent.TimeUnit.SECONDS))
                 .as("provider.stream 必须正常收尾（onComplete）").isTrue();
             assertThat(got.await(10, java.util.concurrent.TimeUnit.SECONDS))

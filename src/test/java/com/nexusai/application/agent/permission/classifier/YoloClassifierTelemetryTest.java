@@ -170,7 +170,8 @@ class YoloClassifierTelemetryTest {
         LlmProvider fakeProvider = new FakeLlmProvider() {
             @Override
             public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage) {
+                                              String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 if (userMessage.contains("Err on the side of blocking")) {
                     // stage 1 (fast): block → 触发 stage 2
                     return new LlmRawResponse(
@@ -225,7 +226,8 @@ class YoloClassifierTelemetryTest {
         LlmProvider fakeProvider = new FakeLlmProvider() {
             @Override
             public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage) {
+                                              String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 return new LlmRawResponse(
                     "<block>no</block>",
                     "msg_stage1_hi", null, "req_stage1");
@@ -454,7 +456,8 @@ class YoloClassifierTelemetryTest {
         LlmProvider fake = new FakeLlmProvider() {
             @Override
             public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage) {
+                                              String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 if (userMessage.contains("Err on the side of blocking")) {
                     // stage1 <block>yes</block> + usage (100, 20, 5, 3)
                     return new LlmRawResponse("<block>yes</block>", "msg_s1_usage", "th1", "req_s1_usage",
@@ -618,7 +621,8 @@ class YoloClassifierTelemetryTest {
                                      Consumer<ToolUseBlock> onToolCallComplete,
                                      Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                      com.nexusai.application.agent.tool.AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite) {
+                                     Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             throw new UnsupportedOperationException("YoloClassifier 路径不使用 stream");
         }
     }

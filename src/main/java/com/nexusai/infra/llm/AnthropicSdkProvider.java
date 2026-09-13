@@ -274,7 +274,11 @@ public class AnthropicSdkProvider implements LlmProvider {
                        com.nexusai.application.agent.tool.AbortController abortController,
                        Consumer<Throwable> onError,
                        Runnable onComplete,
-                       Boolean skipCacheWrite) {
+                       Boolean skipCacheWrite,
+                       // [A#3 tuc-invoking-req] 显式 agent 归因上下文（null = 主线程 / 无归因）·
+                       //   本方法跑在 STREAM_EXECUTOR 虚拟线程（LlmAgentLoop:6604），AgentContext
+                       //   ThreadLocal 不可达 ⇒ 必须由调用方（ModelCaller，上下文有效线程）显式下传。
+                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
             abortController.onCancel(ac -> {
@@ -287,7 +291,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         doStream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite);
+            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite, agentContext);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -331,7 +335,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                           AtomicBoolean aborted,
                           Consumer<Throwable> onError,
                           Runnable onComplete,
-                          Boolean skipCacheWrite) {
+                          Boolean skipCacheWrite,
+                          com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (config == null || !config.isUsable()) {
             onError.accept(new IllegalStateException(
                 "AnthropicSdkProvider.stream called without usable ProviderConfig"));
@@ -416,7 +421,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName,
                     history == null ? 0 : history.size(),
                     new java.util.concurrent.CancellationException("stream aborted"),
-                    querySource, streamStartMs));
+                    querySource, streamStartMs), agentContext);
                 log.info("AnthropicSdkProvider stream aborted: SDK 流消费已中断, 跳过 onComplete");
                 return;
             }
@@ -438,14 +443,14 @@ public class AnthropicSdkProvider implements LlmProvider {
             finished.set(true);
             // [A-13] per-LLM-call 流式成功事件 · CC claude.ts:2858 logAPISuccessAndDuration
             emitApiTerminalEvent("tengu_api_success", apiSuccessAttrs(modelName,
-                history == null ? 0 : history.size(), state, querySource, streamStartMs));
+                history == null ? 0 : history.size(), state, querySource, streamStartMs), agentContext);
             onComplete.run();
         } catch (Exception e) {
             RuntimeException translated = translateSdkError(e);
             // [A-13] per-LLM-call 流式错误事件 · CC claude.ts:2720/:2776 logAPIError
             //   （翻译后 error/status 面可用；abort 也先记录再返回）
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName,
-                history == null ? 0 : history.size(), translated, querySource, streamStartMs));
+                history == null ? 0 : history.size(), translated, querySource, streamStartMs), agentContext);
             if (aborted != null && aborted.get()) {
                 return;
             }
@@ -464,7 +469,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 && shouldUseNonStreamingFallback(translated, aborted, streamingFallbackDisabled())) {
                 if (nonStreamingFallback(config, modelName, systemPromptBlocks, history, tools,
                     maxOutputTokensOverride, taskBudget, effortValue, translated, aborted,
-                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite)) {
+                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, agentContext)) {
                     return;
                 }
                 log.warn("[AnthropicSdkProvider] 非流式回退失败，走原始流式错误 · CC claude.ts:2562");
@@ -559,7 +564,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                                          AtomicBoolean aborted, Runnable onStreamingFallback,
                                          Consumer<AssistantMessage> onAssistantMessage,
                                          Runnable onComplete,
-                                         Boolean skipCacheWrite) {
+                                         Boolean skipCacheWrite,
+                                         com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (onStreamingFallback != null) {
             try {
                 onStreamingFallback.run();
@@ -585,7 +591,7 @@ public class AnthropicSdkProvider implements LlmProvider {
             try {
                 AssistantMessage msg = nonStreamingSend(config, modelName, systemPromptBlocks,
                     history, tools, maxOutputTokensOverride, taskBudget, effortValue, attemptStartMs,
-                    skipCacheWrite);
+                    skipCacheWrite, agentContext);
                 if (onAssistantMessage != null) {
                     onAssistantMessage.accept(msg);
                 }
@@ -609,7 +615,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 e2 = translateSdkError(e2);
                 // [A-13] per-LLM-call 非流式尝试错误事件（每次尝试 = 一次真实 LLM 调用）· CC logAPIError
                 emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName,
-                    history == null ? 0 : history.size(), e2, null, attemptStartMs));
+                    history == null ? 0 : history.size(), e2, null, attemptStartMs), agentContext);
                 if (ErrorClassifier.is529Error(e2)) {
                     if (TransientErrorHandler.isEligibleFor529Fallback(modelName)) {
                         consecutive529Errors++;
@@ -662,7 +668,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                                               List<ChatMessageDto> history, ArrayNode tools,
                                               Integer maxOutputTokensOverride, TaskBudgetParam taskBudget,
                                               String effortValue, long startMs,
-                                              Boolean skipCacheWrite) {
+                                              Boolean skipCacheWrite,
+                                              com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // [provider-custom-headers 任务 6] 流式失败回退路径同样解析 sessionId（history 是形参，必中）
         //   —— 不接则回退链的自定义 header 占位符只能落常量，与流式链语义不一致。
         String sessionId = SessionIdResolver.resolve(history, null);
@@ -680,7 +687,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         Map<String, Object> attrs = nonStreamApiSuccessAttrs(modelName,
             history == null ? 0 : history.size(), msg.usage(), msg.finishReason(), null, startMs);
         attrs.put("didFallBackToNonStreaming", true); // 本路径恒为回退链（CC claude.ts:2593/:2686 fallbackMessage）
-        emitApiTerminalEvent("tengu_api_success", attrs);
+        emitApiTerminalEvent("tengu_api_success", attrs, agentContext);
         return msg;
     }
 
@@ -943,7 +950,11 @@ public class AnthropicSdkProvider implements LlmProvider {
                        String modelName,
                        String systemPrompt,
                        String userMessage) {
-        LlmRawResponse raw = chatWithRaw(config, modelName, systemPrompt, userMessage);
+        // [A#3] chat() 不在本批 12 个 terminal 发射点之列（那些点只在 chatWithRaw /
+        //   chatWithOptions / chatWithOptionsMessage），但内部委托到 chatWithRaw，故显式传
+        //   null —— 本入口不携带归因上下文（残差登记于批 2b 报告）。改走 chatWithRaw 的调用方
+        //   才能携带。
+        LlmRawResponse raw = chatWithRaw(config, modelName, systemPrompt, userMessage, null);
         return raw.content();
     }
 
@@ -951,7 +962,8 @@ public class AnthropicSdkProvider implements LlmProvider {
     public LlmRawResponse chatWithRaw(ProviderConfig config,
                                       String modelName,
                                       String systemPrompt,
-                                      String userMessage) {
+                                      String userMessage,
+                                      AgentContext agentContext) {
         if (config == null || !config.isUsable()) {
             throw new IllegalStateException(
                 "AnthropicSdkProvider.chatWithRaw called without usable ProviderConfig");
@@ -1008,7 +1020,7 @@ public class AnthropicSdkProvider implements LlmProvider {
             consumePostCompactionAtApiSuccess(null);
             // [A-13] per-LLM-call 非流式成功事件（chat 系列）· CC claude.ts:2858 logAPISuccessAndDuration
             emitApiTerminalEvent("tengu_api_success", nonStreamApiSuccessAttrs(modelName,
-                userMessage == null ? 0 : 1, null, null, null, chatStartMs));
+                userMessage == null ? 0 : 1, null, null, null, chatStartMs), agentContext);
             // [IMP-6 OPD-WF6-02-RV] usage 提取 · 对齐 CC extractUsage（yoloClassifier.ts:609-618）
             //   从 API 响应 message.usage 提取 4 token 字段（缺省 ?? 0，同 line 613-616）。
             //   SDK usage() 为 required accessor：响应缺 usage（网关/测试响应）时抛
@@ -1031,7 +1043,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         } catch (Exception e) {
             log.error("AnthropicSdkProvider.chatWithRaw failed: {}", e.toString());
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName,
-                userMessage == null ? 0 : 1, e, null, chatStartMs));
+                userMessage == null ? 0 : 1, e, null, chatStartMs), agentContext);
             throw new RuntimeException("Anthropic chatWithRaw failed: " + e.getMessage(), e);
         }
     }
@@ -1044,6 +1056,9 @@ public class AnthropicSdkProvider implements LlmProvider {
                 "AnthropicSdkProvider.chatWithOptions called without usable ProviderConfig");
         }
         long chatStartMs = System.currentTimeMillis(); // [A-13] per-LLM-call durationMs 起点
+        // [A#3 tuc-invoking-req] chat 家族显式归因载体：从 request 对象取，供本方法 terminal
+        //   发射点（success/error）消费。null = 主线程 / 无归因（等价 CC undefined）。
+        AgentContext agentContext = options != null ? options.agentContext() : null;
         List<ChatMessageDto> history = new ArrayList<>(); // [A-13] catch 需 messageCount → 提升到 try 外作用域
         try {
             if (options != null && options.history() != null) {
@@ -1114,7 +1129,7 @@ public class AnthropicSdkProvider implements LlmProvider {
             consumePostCompactionAtApiSuccess(history);
             // [A-13] per-LLM-call 非流式成功事件（chat 系列）· CC claude.ts:2858 logAPISuccessAndDuration
             emitApiTerminalEvent("tengu_api_success", nonStreamApiSuccessAttrs(modelName, history.size(),
-                null, null, options != null ? options.querySource() : null, chatStartMs));
+                null, null, options != null ? options.querySource() : null, chatStartMs), agentContext);
             return textBuf.toString();
         } catch (java.util.concurrent.CancellationException e) {
             // AS-04（rev2）：abort 预检 CancellationException 原样透传（不包装）——对齐 CC
@@ -1133,12 +1148,12 @@ public class AnthropicSdkProvider implements LlmProvider {
             RuntimeException translated = translateSdkError(e);
             // [A-13] per-LLM-call 错误事件 · CC claude.ts:2720/:2776 logAPIError
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName, history.size(), translated,
-                options != null ? options.querySource() : null, chatStartMs));
+                options != null ? options.querySource() : null, chatStartMs), agentContext);
             throw translated;
         } catch (Exception e) {
             log.error("AnthropicSdkProvider.chatWithOptions failed: {}", e.toString());
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName, history.size(), e,
-                options != null ? options.querySource() : null, chatStartMs));
+                options != null ? options.querySource() : null, chatStartMs), agentContext);
             throw new RuntimeException("Anthropic chatWithOptions failed: " + e.getMessage(), e);
         }
     }
@@ -1185,6 +1200,9 @@ public class AnthropicSdkProvider implements LlmProvider {
                 "AnthropicSdkProvider.chatWithOptionsMessage called without usable ProviderConfig");
         }
         long chatStartMs = System.currentTimeMillis(); // [A-13] per-LLM-call durationMs 起点
+        // [A#3 tuc-invoking-req] chat 家族显式归因载体：从 request 对象取，供本方法 terminal
+        //   发射点（success/error）消费。null = 主线程 / 无归因（等价 CC undefined）。
+        AgentContext agentContext = options != null ? options.agentContext() : null;
         List<ChatMessageDto> history = new ArrayList<>(); // [A-13] catch 需 messageCount → 提升到 try 外作用域
         try {
             if (options != null && options.history() != null) {
@@ -1236,12 +1254,12 @@ public class AnthropicSdkProvider implements LlmProvider {
             consumePostCompactionAtApiSuccess(history);
             // [A-13] per-LLM-call 非流式成功事件（chat 系列，带 usage 全字段）· CC claude.ts:2858
             emitApiTerminalEvent("tengu_api_success", nonStreamApiSuccessAttrs(modelName, history.size(),
-                msg.usage(), msg.finishReason(), options != null ? options.querySource() : null, chatStartMs));
+                msg.usage(), msg.finishReason(), options != null ? options.querySource() : null, chatStartMs), agentContext);
             return msg;
         } catch (Exception e) {
             log.error("AnthropicSdkProvider.chatWithOptionsMessage failed: {}", e.toString());
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName, history.size(), e,
-                options != null ? options.querySource() : null, chatStartMs));
+                options != null ? options.querySource() : null, chatStartMs), agentContext);
             throw new RuntimeException("Anthropic chatWithOptionsMessage failed: " + e.getMessage(), e);
         }
     }
@@ -1314,12 +1332,22 @@ public class AnthropicSdkProvider implements LlmProvider {
      *
      * <p>telemetry 未注入（null）→ 静默跳过 + debug 日志（测试/未接线零行为变化）。
      *
-     * @param eventName 事件名（tengu_api_success / tengu_api_error）
-     * @param attrs     事件属性（调用方构建；本方法经 attachInvokingRequestEdge 写入
-     *                  invokingRequestId/invocationKind 后发射）
+     * <p><b>[A#3 tuc-invoking-req] 稀疏边上下文改为显式传参</b>：本方法跑在
+     * {@code STREAM_EXECUTOR} 虚拟线程（{@code LlmAgentLoop:6604}），{@code AgentContext.STORAGE}
+     * 是 plain ThreadLocal、不在回放白名单 ⇒ 旧实现 {@code attachInvokingRequestEdge(attrs)}
+     * （读 ThreadLocal）恒得 null ⇒ {@code invokingRequestId} 生产恒空。现由调用方把
+     * {@code agentContext} 显式带到本方法，经
+     * {@link AgentContext#attachInvokingRequestEdge(Map, AgentContext)} 消费。
+     *
+     * @param eventName    事件名（tengu_api_success / tengu_api_error）
+     * @param attrs        事件属性（调用方构建；本方法经 attachInvokingRequestEdge 写入
+     *                     invokingRequestId/invocationKind 后发射）
+     * @param agentContext 显式 agent 归因上下文（null = 主线程 → 事件不带该属性，
+     *                     等价 CC {@code context?.invokingRequestId} undefined）
      */
-    private void emitApiTerminalEvent(String eventName, Map<String, Object> attrs) {
-        AgentContext.InvokingRequestEdge edge = AgentContext.attachInvokingRequestEdge(attrs);
+    private void emitApiTerminalEvent(String eventName, Map<String, Object> attrs,
+                                      AgentContext agentContext) {
+        AgentContext.InvokingRequestEdge edge = AgentContext.attachInvokingRequestEdge(attrs, agentContext);
         Telemetry t = this.telemetry;
         if (t == null) {
             if (log.isDebugEnabled()) {

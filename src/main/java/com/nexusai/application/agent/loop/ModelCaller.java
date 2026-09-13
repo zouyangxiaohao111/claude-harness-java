@@ -109,7 +109,9 @@ public final class ModelCaller {
                 request.abortController(),
                 request.onError(),
                 request.onComplete(),
-                request.skipCacheWrite());
+                request.skipCacheWrite(),
+                request.agentContext());   // [A#3] 显式归因上下文透传（本方法在 STREAM_EXECUTOR
+                                           //   虚拟线程执行，AgentContext ThreadLocal 不可达）
             return ModelResponse.SUBMITTED;
         }
         // [IMP-SP-08] blocks 发送边界：splitSysPromptPrefix 产物直达 blocks 重载（system 为
@@ -139,7 +141,8 @@ public final class ModelCaller {
             request.abortController(),
             request.onError(),
             request.onComplete(),
-            request.skipCacheWrite());
+            request.skipCacheWrite(),
+            request.agentContext());   // [A#3] 显式归因上下文透传（STREAM_EXECUTOR 虚拟线程边界）
         return ModelResponse.SUBMITTED;
     }
 }

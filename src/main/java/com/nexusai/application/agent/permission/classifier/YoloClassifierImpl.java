@@ -578,7 +578,7 @@ public class YoloClassifierImpl implements YoloClassifier {
                 null, null, null, null, null,
                 isAnthropicProtocol
                     ? LlmProvider.ChatRequestOptions.ToolChoice.tool(YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME)
-                    : null);
+                    : null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             AssistantMessage msg = callWithOptionsRetry(provider, resolved.config(), modelName,
                 systemPrompt, userMessage, options, ctx);
             long durationMs = System.currentTimeMillis() - overallStart;
@@ -1158,15 +1158,22 @@ public class YoloClassifierImpl implements YoloClassifier {
             LlmProvider provider, ProviderConfig config, String modelName,
             String systemPrompt, String userMessage) throws Exception {
         final java.util.Map<String, String> mdcCtx = org.slf4j.MDC.getCopyOfContextMap();
+        // [A#3 tuc-invoking-req] 在**派发线程**（调用方线程）取显式归因上下文，
+        //   随 lambda 显式传入 supplyAsync —— 本方法的调用链与 LlmAgentLoop:6604 同型：
+        //   CompletableFuture.supplyAsync 的线程不继承 ThreadLocal（此处只回放 MDC），
+        //   在 supplier 内读 AgentContext 恒 null ⇒ invokingRequestId 丢失。
+        //   注意：不是「回放」（不 set ThreadLocal 再读），而是显式传对象。
+        final com.nexusai.application.agent.subagent.AgentContext agentContext =
+            com.nexusai.application.agent.subagent.AgentContext.getAgentContext();
         if (log.isDebugEnabled()) {
-            log.debug("YoloClassifier: stage 调用 {}", modelName);
+            log.debug("YoloClassifier: stage 调用 {} (agentContext={})", modelName, agentContext != null);
         }
         return CompletableFuture.supplyAsync(() -> {
             if (mdcCtx != null) {
                 org.slf4j.MDC.setContextMap(mdcCtx);
             }
             try {
-                return provider.chatWithRaw(config, modelName, systemPrompt, userMessage);
+                return provider.chatWithRaw(config, modelName, systemPrompt, userMessage, agentContext);
             } finally {
                 org.slf4j.MDC.clear();
             }

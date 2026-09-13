@@ -485,13 +485,13 @@ public class VisionAnalyzeTool implements Tool {
                 ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
                         Role.user, prompt, null, null, blocks, List.of(), true);
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                        List.of(user), null, null, null, null, "vision_analyze", null, null);
+                        List.of(user), null, null, null, null, "vision_analyze", null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
                 // ⚠️ userMessage 必须传 null：图片+prompt 已在 history 的 contentBlocks 里；
                 //    再传 userMessage 会导致连续两条 user 消息（AnthropicSdkProvider:1013-1017）
                 resultText = provider.chatWithOptions(resolved.config(), modelName, null, null, options);
             } else {
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                        List.of(), null, null, null, null, "vision_analyze", null, null);
+                        List.of(), null, null, null, null, "vision_analyze", null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
                 resultText = provider.chatWithOptions(resolved.config(), modelName, null, prompt, options);
             }
         } catch (Exception e) {
@@ -576,7 +576,7 @@ public class VisionAnalyzeTool implements Tool {
             ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
                 Role.user, prompt, null, null, blocks, List.of(), true);
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                List.of(user), null, null, null, null, "vision_analyze", null, null);
+                List.of(user), null, null, null, null, "vision_analyze", null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             if (log.isDebugEnabled()) {
                 log.debug("VisionAnalyzeTool PDF 页图已组装: path={} pages={} 页图={}（送视觉模型）",
                     pdfFilePath, selected, imgBlocks.size());

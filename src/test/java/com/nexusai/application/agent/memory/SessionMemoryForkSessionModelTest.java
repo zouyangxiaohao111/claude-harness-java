@@ -307,7 +307,8 @@ class SessionMemoryForkSessionModelTest {
                                          Consumer<AssistantMessage> onAssistant,
                                          Consumer<com.nexusai.application.agent.tool.ToolUseBlock> onToolCall,
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
-                                         AbortController abort, Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                                         AbortController abort, Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 called.set(true);
                 modelRef.set(m);
                 onAssistant.accept(new AssistantMessage("done", "stop", List.of()));

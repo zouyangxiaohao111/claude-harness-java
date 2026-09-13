@@ -169,7 +169,8 @@ class StreamCompactSummaryForkUserContextTest {
                                          Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                                          Consumer<String> orc, Runnable osf,
                                          AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 captured[0] = h;
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
@@ -225,7 +226,8 @@ class StreamCompactSummaryForkUserContextTest {
                                          Consumer<com.nexusai.application.agent.tool.ToolUseBlock> onToolCall,
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
                                          com.nexusai.application.agent.tool.AbortController abort,
-                                         Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 capturedBlocks[0] = blocks;
                 onChunk.accept("summary text");
                 onAssistant.accept(new AssistantMessage("summary text", "stop", List.of()));
@@ -322,7 +324,8 @@ class StreamCompactSummaryForkUserContextTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
             }

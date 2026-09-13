@@ -334,7 +334,8 @@ class ForkConvergenceCcContractTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 oa.accept(new AssistantMessage(text, "stop", List.of()));
                 ocp.run();
             }
@@ -397,7 +398,8 @@ class ForkConvergenceCcContractTest {
                            Runnable onStreamingFallback,
                            AbortController abortController,
                            Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             // 快照（runningMessages 在 provider 返回后仍会被追加 assistant/tool 消息）
             this.lastHistory = List.copyOf(history);
             this.lastSystemBlocks = systemPromptBlocks == null ? null : List.copyOf(systemPromptBlocks);

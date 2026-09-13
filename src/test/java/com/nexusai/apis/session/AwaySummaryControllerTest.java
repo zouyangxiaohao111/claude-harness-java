@@ -105,7 +105,8 @@ class AwaySummaryControllerTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) {
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {

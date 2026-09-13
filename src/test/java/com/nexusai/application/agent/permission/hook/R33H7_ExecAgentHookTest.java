@@ -118,7 +118,8 @@ class R33H7_ExecAgentHookTest {
                            Runnable onStreamingFallback,
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             if (delayMs > 0) {
                 try { Thread.sleep(delayMs); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); return;
@@ -157,7 +158,8 @@ class R33H7_ExecAgentHookTest {
                                Runnable onStreamingFallback,
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
-                               Runnable onComplete, Boolean skipCacheWrite) {
+                               Runnable onComplete, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 onError.accept(new RuntimeException("provider exploded"));
             }
         };

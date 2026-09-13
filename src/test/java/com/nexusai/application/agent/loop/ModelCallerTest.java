@@ -61,13 +61,13 @@ class ModelCallerTest {
         // messages/tools + override/taskBudget/effort + onChunk/onAssistantMessage/onToolCallComplete/
         // onReasoningChunk/onStreamingFallback/abortController/onError/onComplete）。
         Mockito.doAnswer(inv -> {
-            for (int i = 0; i < 17; i++) {
+            for (int i = 0; i < 19; i++) {   // [A#3] 19 参（…skipCacheWrite + agentContext）
                 captured.add(inv.getArgument(i));
             }
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any());
+            any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -84,14 +84,18 @@ class ModelCallerTest {
         Consumer<Throwable> onError = e -> {};
         Runnable onComplete = () -> {};
 
+        // [A#3 tuc-invoking-req] agentContext 必须是同一实例透传到 provider（显式载体，不重新读 ambient）
+        com.nexusai.application.agent.subagent.AgentContext subagentCtx =
+            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
+                "a0123456789abcdef", null, "Explore", true, "req-delegate", "spawn");
         ModelRequest request = new ModelRequest(config, "m1", null, null, messages, tools,
             null, null, null, null,
-            onChunk, onMsg, onTool, onReasoning, onFallback, onError, onComplete, null, null);
+            onChunk, onMsg, onTool, onReasoning, onFallback, onError, onComplete, null, null, subagentCtx);
 
         ModelResponse resp = ModelCaller.call(ctx, request);
 
         assertThat(resp).isEqualTo(ModelResponse.SUBMITTED);
-        assertThat(captured).hasSize(17);
+        assertThat(captured).hasSize(19);
         assertThat(captured.get(0)).isSameAs(config);
         assertThat(captured.get(1)).isEqualTo("m1");
         assertThat(captured.get(2)).as("blocks null/空 = 无 system 字段（⊕C-1 后无 String 兼容路径）").isNull();
@@ -109,6 +113,11 @@ class ModelCallerTest {
         assertThat(captured.get(14)).isNull();
         assertThat(captured.get(15)).isSameAs(onError);
         assertThat(captured.get(16)).isSameAs(onComplete);
+        // [A#3 tuc-invoking-req] 索引 18 = agentContext：必须 isSameAs（同一实例 → provider 侧
+        //   attachInvokingRequestEdge 消费的正是 loop 线程装入的那份稀疏边状态）
+        assertThat(captured.get(18))
+            .as("[A#3] agentContext 必须逐字段透传（显式载体，越过 STREAM_EXECUTOR 线程边界）")
+            .isSameAs(subagentCtx);
     }
 
     @Test
@@ -123,7 +132,7 @@ class ModelCallerTest {
             captured[0] = inv.getArgument(6);
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -132,7 +141,7 @@ class ModelCallerTest {
         ProviderConfig config = new ProviderConfig("http://base", "k");
         ModelRequest request = new ModelRequest(config, "m1", null, null, List.of(), null,
             null, new com.nexusai.infra.llm.TaskBudgetParam(200_000, 165_000), null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null);
 
         ModelResponse resp = ModelCaller.call(ctx, request);
 
@@ -151,7 +160,7 @@ class ModelCallerTest {
             streamCalled[0] = true;
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(), any(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -162,7 +171,7 @@ class ModelCallerTest {
         };
         ModelRequest request = new ModelRequest(ProviderConfig.empty(), "m1", null, null, List.of(),
             null, null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null);
 
         deps.callModel(request);
 
@@ -180,7 +189,7 @@ class ModelCallerTest {
         Mockito.doThrow(new IllegalStateException("must not call provider.stream directly"))
             .when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
                 any(), any(), any(), any(), any(), any(), any(), any(), any(),
-                any(), any(), any(), any());
+                any(), any(), any(), any(),any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -238,7 +247,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any());
+            any(), any(), any(), any(),any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -254,7 +263,7 @@ class ModelCallerTest {
         ModelRequest request = new ModelRequest(new ProviderConfig("http://deepseek", "k"),
             "deepseek/deepseek-v4-flash", null, null, List.of(), null,
             null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null);
 
         ModelCaller.call(ctx, request);
 
@@ -273,7 +282,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), nullable(List.class), anyList(), any(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any());
+            any(), any(), any(), any(),any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -285,7 +294,7 @@ class ModelCallerTest {
         ModelRequest request = new ModelRequest(new ProviderConfig("http://base", "k"),
             "deepseek/deepseek-v4-flash", null, null, List.of(), null,
             null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null);
 
         ModelCaller.call(ctx, request);
 
@@ -310,7 +319,7 @@ class ModelCallerTest {
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(),
-            any(), any(), any(), any());
+            any(), any(), any(), any(),any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         AgentLoopContext ctx = TestContexts.agentLoopContext(
@@ -324,7 +333,7 @@ class ModelCallerTest {
                 com.nexusai.application.agent.prompt.CacheScope.NULL));
         ModelRequest request = new ModelRequest(config, "m1", blocks, "repl_main_thread",
             List.of(), null, null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null);
         ModelResponse resp = ModelCaller.call(ctx, request);
 
         assertThat(resp).isEqualTo(ModelResponse.SUBMITTED);

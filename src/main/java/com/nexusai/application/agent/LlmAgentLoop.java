@@ -6564,7 +6564,19 @@ public class LlmAgentLoop implements AgentLoop {
                 //   本仓生产恒 null（所有 RunRequest 工厂第 11 实参传 null = CC 未设置语义，主线程写 cache）；
                 //   fork 路径不经本构造点（走 ProductionForkedQuery，自带 skipCacheWrite=true）。
                 //   本字段是「QueryParams.skipCacheWrite 0 读点」断点的闭合点（原 0 读点 → 唯一读点）。
-                params.skipCacheWrite()
+                params.skipCacheWrite(),
+                // ═══════════════════ [A#3 tuc-invoking-req] 显式 agent 归因上下文 ═══════════════════
+                // CC original: 无入参（CC 的 AsyncLocalStorage 跨异步自动传播，logging.ts:294/:461
+                //   consumeInvokingRequestId 读 ambient context）。
+                // WHY 在此处取：本构造点跑在 **query loop 线程**——子代理经
+                //   SubagentExecutor:2003 runWithAgentContext 把 SubagentContext 装在该线程上，
+                //   主线程则为 null（→ 事件不带 invokingRequestId，等价 CC 主线程 undefined）。
+                //   取出实例后经 modelRequest → ModelCaller → provider.stream **显式下传**，
+                //   越过 STREAM_EXECUTOR 虚拟线程边界（虚拟线程不继承 ThreadLocal，
+                //   AgentContext 不在回放白名单 → 旧实现 provider 侧读 ambient 恒 null）。
+                // 禁止事项：不得在 STREAM_EXECUTOR 任务体里回放/重设该 ThreadLocal 再读
+                //   （用户铁律：会话态一律显式传参，回放不算合规）。
+                com.nexusai.application.agent.subagent.AgentContext.getAgentContext()
             );
             // [H7-arch Phase 5-2 P3-④] 提交 LLM call（loop 不再直接 provider.stream）。
             // [对抗核验 H13-GAP-4 v3] 后台线程执行 callModel → loop 线程空闲执行 abort 感知轮询

@@ -412,7 +412,11 @@ public class ExecAgentHook {
                         request.onStreamingFallback(), request.onError(), request.onComplete(),
                         request.abortController(),
                         // [C] skipCacheWrite 逐字段拷贝透传（hook agent 请求与主循环同源 params）
-                        request.skipCacheWrite());
+                        request.skipCacheWrite(),
+                        // [A#3 tuc-invoking-req] agentContext 逐字段拷贝透传 —— hook agent 的
+                        //   ModelRequest 由主循环请求派生，归因上下文同样必须原样带过（漏拷贝会让
+                        //   hook 触发的 LLM 调用在 provider 侧丢 invokingRequestId）。
+                        request.agentContext());
                     return ModelCaller.call(context(), countingRequest);
                 }
             };

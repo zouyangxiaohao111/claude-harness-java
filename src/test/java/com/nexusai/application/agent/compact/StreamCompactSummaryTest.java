@@ -138,7 +138,8 @@ class StreamCompactSummaryTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 capturedTools[0] = t;
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
@@ -188,7 +189,8 @@ class StreamCompactSummaryTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 oa.accept(new AssistantMessage("summary text", "stop", List.of(), "", null,
                     new com.nexusai.application.agent.tool.AgentUsage(
                         1000L, 500L, 300L, 200L, null, null, null)));
@@ -346,7 +348,8 @@ class StreamCompactSummaryTest {
                                              Consumer<String> oc, Consumer<AssistantMessage> oa,
                                              Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                              Runnable osf, AbortController ac,
-                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
                     oa.accept(new AssistantMessage("fallback summary", "stop", List.of()));
                     ocp.run();
                 }
@@ -399,7 +402,8 @@ class StreamCompactSummaryTest {
                                              Consumer<String> oc, Consumer<AssistantMessage> oa,
                                              Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                              Runnable osf, AbortController ac,
-                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
                     oa.accept(new AssistantMessage("fallback summary", "stop", List.of()));
                     ocp.run();
                 }
@@ -445,7 +449,8 @@ class StreamCompactSummaryTest {
                                              Consumer<String> oc, Consumer<AssistantMessage> oa,
                                              Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                              Runnable osf, AbortController ac,
-                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
                     if (calls[0]++ == 0) {
                         ocp.run(); // 无 assistant 消息 → 无响应
                     } else {
@@ -496,7 +501,8 @@ class StreamCompactSummaryTest {
                                              Consumer<String> oc, Consumer<AssistantMessage> oa,
                                              Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                              Runnable osf, AbortController ac,
-                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                             Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
                     oc.accept("partial text"); // 首个文本块 → hasStartedStreaming=true
                     ocp.run();                 // 流结束但无 assistant → 无响应
                 }
@@ -569,7 +575,8 @@ class StreamCompactSummaryTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 oc.accept("first chunk");
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
@@ -605,7 +612,8 @@ class StreamCompactSummaryTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 oc.accept("ab");
                 oc.accept("cd");
                 oc.accept("ef");
@@ -698,7 +706,8 @@ class StreamCompactSummaryTest {
                                          Consumer<String> oc, Consumer<AssistantMessage> oa,
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 try {
                     Thread.sleep(500);
                 } catch (InterruptedException e) {

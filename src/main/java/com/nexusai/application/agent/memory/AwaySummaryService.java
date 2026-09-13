@@ -229,7 +229,7 @@ public class AwaySummaryService {
             "away_summary",                            // CC :54 querySource: 'away_summary'
             signal,                                    // CC :45 signal → provider abort 预检（claude.ts:744-745）
             null,                                      // maxTokens — CC 未设
-            Boolean.TRUE);                             // CC :56 skipCacheWrite: true
+            Boolean.TRUE, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());                             // CC :56 skipCacheWrite: true
     }
 
     /** CC buildAwaySummaryPrompt（awaySummary.ts:18-23）· 逐字对齐，含 memory 前缀。 */

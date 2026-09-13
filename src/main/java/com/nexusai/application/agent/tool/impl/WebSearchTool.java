@@ -816,7 +816,7 @@ public class WebSearchTool implements Tool {
                     List.of(),   // agents — []
                     Boolean.FALSE, // hasAppendSystemPrompt — false
                     List.of(),   // mcpTools — []
-                    isNonInteractive); // isNonInteractiveSession 透传
+                    isNonInteractive, com.nexusai.application.agent.subagent.AgentContext.getAgentContext()); // isNonInteractiveSession 透传
             String summary = llmProviderFactory.getProvider(resolved.config(), resolved.providerType())
                     .chatWithOptions(resolved.config(), modelName, SUMMARY_SYSTEM_PROMPT,
                             buildSummaryUserPrompt(query, hits), options);

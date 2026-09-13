@@ -213,7 +213,8 @@ class ProductionForkedQueryUsageCcContractTest {
                            Runnable onStreamingFallback,
                            AbortController abortController,
                            Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             int idx = Math.min(callCount.getAndIncrement(), script.size() - 1);
             onAssistantMessage.accept(script.get(idx));
             onComplete.run();

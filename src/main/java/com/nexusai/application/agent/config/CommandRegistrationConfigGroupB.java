@@ -366,7 +366,7 @@ public class CommandRegistrationConfigGroupB {
                 }
                 LlmProvider provider = llmProviderFactory.getProvider(resolved.config(), resolved.providerType());
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                    List.of(), null, null, null, null, "btw", null, 1024);
+                    List.of(), null, null, null, null, "btw", null, 1024, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
                 String answer = provider.chatWithOptions(resolved.config(), model,
                     "You are a helpful assistant answering a quick side question.", question, options);
                 log.info("[CommandRegistrationConfigGroupB] /btw 旁路提问回答: model={} question={} answer={}",

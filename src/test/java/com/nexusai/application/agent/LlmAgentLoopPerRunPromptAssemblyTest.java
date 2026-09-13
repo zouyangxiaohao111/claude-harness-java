@@ -279,7 +279,7 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             return null;
         };
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
@@ -395,7 +395,7 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
         };
         // blocks 重载（18 参 · anyList() 在 index 2 → 只可能绑定 blocks 变体）
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
         // blocks+thinkingConfig 重载（19 参 · 全 any() + 19 个实参 → 只可能绑定该变体）
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());

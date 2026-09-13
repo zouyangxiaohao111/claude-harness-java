@@ -1277,22 +1277,22 @@ class TeamMemorySyncTest {
         ObjectMapper mapper = new ObjectMapper();
 
         JsonNode editInput = mapper.createObjectNode().put("file_path", teamFile);
-        hooks.handleSessionFileAccess("Edit", editInput);
+        hooks.handleSessionFileAccess("Edit", editInput, com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
         assertThat(watcher.notifyCalls).isEqualTo(1);
 
         JsonNode writeInput = mapper.createObjectNode().put("file_path", teamFile);
-        hooks.handleSessionFileAccess("Write", writeInput);
+        hooks.handleSessionFileAccess("Write", writeInput, com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
         assertThat(watcher.notifyCalls).isEqualTo(2);
 
         // Read 只发统计事件，不 notify（CC :196-198）
         JsonNode readInput = mapper.createObjectNode().put("file_path", teamFile);
-        hooks.handleSessionFileAccess("Read", readInput);
+        hooks.handleSessionFileAccess("Read", readInput, com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
         assertThat(watcher.notifyCalls).isEqualTo(2);
 
         // 非 team 文件 → 不 notify
         JsonNode otherInput = mapper.createObjectNode()
             .put("file_path", gitRepo.resolve("other.md").toString());
-        hooks.handleSessionFileAccess("Edit", otherInput);
+        hooks.handleSessionFileAccess("Edit", otherInput, com.nexusai.application.agent.tool.ToolUseContext.of(null, "sess-test"));
         assertThat(watcher.notifyCalls).isEqualTo(2);
     }
 

@@ -126,7 +126,8 @@ class AgentTurnBoundaryDifferentialTest {
                            Runnable onStreamingFallback,
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             int idx = callCount.getAndIncrement();
             AssistantMessage am = responses.get(Math.min(idx, responses.size() - 1));
             onAssistantMessage.accept(am);

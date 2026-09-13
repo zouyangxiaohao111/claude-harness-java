@@ -198,7 +198,7 @@ public class PermissionExplainer {
                 isAnthropicProtocol
                     ? LlmProvider.ChatRequestOptions.ToolChoice.tool(ExplainCommandToolSchema.TOOL_NAME)
                     : null
-            );
+            , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
 
             final AssistantMessage msg = provider.chatWithOptionsMessage(
                 resolved.config(), modelName, SYSTEM_PROMPT, userPrompt, options);

@@ -629,7 +629,11 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                 abortController,
                 onError,
                 onComplete,
-                skipCacheWrite);
+                skipCacheWrite,
+                // [A#3 tuc-invoking-req] 显式归因上下文（在调用方线程取，直传越过 provider 内部
+                //   线程边界；禁「回放 ThreadLocal 再读」）。fork 在子代理 loop 内触发时即子代理
+                //   上下文（CC 语义：fork 的 API 调用归因到发起它的 agent），主线程触发则 null。
+                com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             // [IMP-GAP04 △-15] §7-10 默认裁决对齐 CC（CC 无 300s 硬超时，forkedAgent.ts query()
             //   靠 abortController + SDK 状态，流一直持续则等待）→ future.get() 无超时等待；
             //   取消路径保留：abortController → provider abort → CancellationException →

@@ -486,7 +486,12 @@ public class SubagentExecutor {
             // [openai-lazy 乙-1] effectiveProviderType 透传 — 子代理共享父 turn 目标 provider
             //   （主循环门控 toolReferenceUsable 用；漏补则子代理侧回落 null → 判不支持 → 子代理
             //   tool search 被关闭、全量 schema 内联，与父不一致）
-            source.effectiveProviderType()
+            source.effectiveProviderType(),
+            // [tuc-subagent-identity] subagentName / isBuiltIn 透传 — 本方法是 TUC 的 record-copy
+            //   wither（「派生视图」语义），非身份来源；不透传会把 Step 20 盖的身份清掉。
+            //   真正的值由 Step 20 withSubagentIdentity 从 agentDefinition 单点写入。
+            source.subagentName(),
+            source.isBuiltIn()
         );
     }
 
@@ -1990,11 +1995,21 @@ public class SubagentExecutor {
             String invocationKind = subagentResume ? "resume" : "spawn";
             // lambda 捕获需 effectively final：subagentCtx（Step 18 rebuild）/ agentDefinition（Step 1
             //   effort merge）均被重赋值，取 final 引用供 runWithAgentContext 包裹体使用。
-            final ToolUseContext ctxForLoop = subagentCtx;
             final AgentDefinition defForLoop = agentDefinition;
+            // [tuc-subagent-identity] 唯一产出点：把子代理身份（subagentName + isBuiltIn）盖到子代理 TUC。
+            //   WHY 在这里（而不是 createSubagentContext.create）：Step 18 的 withEffectiveCwd 派生链
+            //   会把身份字段清成 null，必须在本步（TUC 定稿、进入 query loop 前）盖章；
+            //   WHY 用 identityForLoop（SubagentIdentity.of(defForLoop) 单派生点）：LLM 侧
+            //   AgentContext.subagentName 与 hook 侧 ToolUseContext.subagentName 必须同源，否则两侧
+            //   归因漂移（原实现把 agentType()/instanceof 两个表达式在本处与下方 buildSubagentAgentContext
+            //   各写一遍 = 漂移面）。
+            //   hook 侧消费者：SessionFileAccessHooks.subagentProps(ctx)（PostToolUse 回调经
+            //   HookRegistry:2596 supplyAsync(HOOK_EXECUTOR) 派发，ThreadLocal 不可达 → 必须显式载体）。
+            final SubagentIdentity identityForLoop = SubagentIdentity.of(defForLoop);
+            final ToolUseContext ctxForLoop = subagentCtx.withSubagentIdentity(
+                identityForLoop.subagentName(), identityForLoop.isBuiltIn());
             AgentContext.SubagentContext agentContext = buildSubagentAgentContext(
-                agentId, defForLoop.agentType(),
-                defForLoop instanceof AgentDefinition.BuiltInAgentDefinition,
+                agentId, identityForLoop.subagentName(), identityForLoop.isBuiltIn(),
                 this.invokingRequestId,
                 invocationKind);
             log.info("[SubagentExecutor] [R2-CTX] subagent 执行进入 AgentContext 作用域: agentId={} (a+16hex={}) "
@@ -3028,6 +3043,49 @@ public class SubagentExecutor {
      * @param invocationKind   "spawn" | "resume"（CC AgentTool.tsx:725）
      * @return 不可变 SubagentContext（每次 spawn 新建，invocationEmitted=AtomicBoolean(false)）
      */
+    /**
+     * 子代理身份对（subagentName + isBuiltIn）· <b>单派生点</b>（[tuc-subagent-identity]）。
+     *
+     * <p><b>CC 真源</b>（AgentTool.tsx:721-723，逐字）：
+     * <pre>{@code
+     *   subagentName: selectedAgent.agentType,
+     *   isBuiltIn: isBuiltInAgent(selectedAgent),   // loadAgentsDir.ts:168-172 = agent.source === 'built-in'
+     * }</pre>
+     * Java 等价：{@code isBuiltIn = def instanceof AgentDefinition.BuiltInAgentDefinition}
+     * （{@code BuiltInAgentDefinition.source()} 恒 {@code "built-in"}，AgentDefinition.java:106）。
+     *
+     * <p><b>WHY 单派生点（而不是两处各写一遍表达式）</b>：这对值有<b>两个消费者</b>——
+     * <ol>
+     *   <li>LLM 侧归因：{@link #buildSubagentAgentContext} 装入 {@code AgentContext.SubagentContext}
+     *       （→ telemetry invokingRequestId / agent_id 归因）；</li>
+     *   <li>hook 侧归因：{@link ToolUseContext#withSubagentIdentity} 盖到子代理 TUC
+     *       （→ {@code SessionFileAccessHooks.subagentProps} 的 {@code subagent_name}）。</li>
+     * </ol>
+     * 两侧必须是同一份值，否则同一个子代理在两条归因通道上会显示不同的身份。原实现把
+     * {@code defForLoop.agentType()} / {@code defForLoop instanceof BuiltInAgentDefinition} 在两个
+     * 消费点各写一遍 —— 任一处单独演化即静默漂移；收敛为本单点后，一致性由构造保证。
+     *
+     * <p><b>static seam 说明（Pattern #14 RED-GREEN 双证）</b>：{@code executeStreaming} 全流程依赖
+     * LLM 循环重依赖，单测无法起全流程（同 {@link #buildSubagentAgentContext} javadoc）；本方法为
+     * package-private static，供 {@code SubagentIdentityProducerTest} 用真实 {@link AgentDefinition}
+     * 直测派生语义 = 验证生产逻辑。
+     *
+     * @param def 已解析的子代理定义（Step 1 {@code resolveAgentDefinition} 产物）
+     * @return 身份对（不可变；def 为 null 时 {@code subagentName=null, isBuiltIn=false}）
+     */
+    record SubagentIdentity(String subagentName, boolean isBuiltIn) {
+
+        /** CC original: {@code {subagentName: selectedAgent.agentType, isBuiltIn: isBuiltInAgent(selectedAgent)}}. */
+        static SubagentIdentity of(AgentDefinition def) {
+            if (def == null) {
+                return new SubagentIdentity(null, false);
+            }
+            return new SubagentIdentity(
+                def.agentType(),
+                def instanceof AgentDefinition.BuiltInAgentDefinition);
+        }
+    }
+
     static AgentContext.SubagentContext buildSubagentAgentContext(
             UUID agentId, String subagentName, boolean isBuiltIn, String invokingRequestId, String invocationKind) {
         // [R3-WF-F IMP-SUB-12 返工] SubagentContext.agentId 输出 a+16hex（对齐 CC agentContext.ts:34

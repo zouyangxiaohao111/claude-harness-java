@@ -192,7 +192,31 @@ public sealed interface AgentContext {
      * @return 首次调用返回 {@link InvokingRequestEdge}; 已消费或无 invokingRequestId 返回 null
      */
     static InvokingRequestEdge consumeInvokingRequestId() {
-        AgentContext context = getAgentContext();
+        return consumeInvokingRequestId(getAgentContext());
+    }
+
+    /**
+     * 一次消费 invokingRequestId · <b>显式上下文重载</b>（会话态显式传参，禁 ThreadLocal 回读）。
+     *
+     * <p><b>WHY 需要显式重载（本批根因）</b>：CC 的 {@code consumeInvokingRequestId()}（agentContext.ts:163-178）
+     * 读 {@code AsyncLocalStorage} —— Node 的 ALS 跨 await/异步自动传播；Java 的
+     * {@link #STORAGE} 是 plain {@link ThreadLocal}，<b>不跨线程继承</b>。
+     * {@code AnthropicSdkProvider.emitApiTerminalEvent} 跑在 {@code LlmAgentLoop.STREAM_EXECUTOR}
+     * 虚拟线程（{@code LlmAgentLoop:6604}），AgentContext 不在回放白名单（只有 MDC / projectRoot /
+     * teammateContext 被回放）⇒ {@code getAgentContext()} 恒 null ⇒ {@code invokingRequestId}
+     * 生产恒空。
+     *
+     * <p><b>修法 = 显式载体</b>：调用方在<b>上下文仍有效的线程</b>（子代理 query loop 线程，
+     * {@code SubagentExecutor:2003 runWithAgentContext} 作用域内）取出 {@link AgentContext} 实例，
+     * 经 {@code ModelRequest.agentContext} → {@code ModelCaller} → {@code LlmProvider.stream} /
+     * {@code ChatRequestOptions.agentContext} 显式下传，provider 在本方法消费。
+     * 稀疏语义（{@code invocationEmitted} 一次翻转）由共享的同一 {@link SubagentContext} 实例承载，
+     * 与 CC 逐字一致（CC 也是原地翻 {@code context.invocationEmitted}）。
+     *
+     * @param context 显式上下文（可 null = 主线程 / 无归因上下文，与 CC {@code context?.invokingRequestId} 等价）
+     * @return 首次调用返回 {@link InvokingRequestEdge}; 已消费 / 无 invokingRequestId / context null 返回 null
+     */
+    static InvokingRequestEdge consumeInvokingRequestId(AgentContext context) {
         if (context == null) {
             return null;
         }
@@ -244,7 +268,24 @@ public sealed interface AgentContext {
      *         null = 无 invokingRequestId / 已消费 / 无 context，CC :170 guard）
      */
     static InvokingRequestEdge attachInvokingRequestEdge(Map<String, Object> eventAttrs) {
-        InvokingRequestEdge edge = consumeInvokingRequestId();
+        return attachInvokingRequestEdge(eventAttrs, getAgentContext());
+    }
+
+    /**
+     * 消费稀疏边并接入遥测事件属性 · <b>显式上下文重载</b>（provider 侧唯一入口）。
+     *
+     * <p>与 {@link #attachInvokingRequestEdge(Map)} 语义逐字相同，唯一差别是上下文来源
+     * —— 显式参数而非 {@link #STORAGE} ThreadLocal（理由见
+     * {@link #consumeInvokingRequestId(AgentContext)}）。{@code AnthropicSdkProvider} 的 12 个
+     * per-LLM-call terminal 发射点全部走本重载，上下文经 {@code LlmProvider.stream} /
+     * {@code ChatRequestOptions} 显式携带到 {@code STREAM_EXECUTOR} 虚拟线程。
+     *
+     * @param eventAttrs   事件属性 Map（null → 仅消费不写属性）
+     * @param context      显式上下文（null → 主线程，等价 CC {@code context?.invokingRequestId} undefined）
+     * @return 本次消费的 {@link InvokingRequestEdge}（null = 无 / 已消费 / context null）
+     */
+    static InvokingRequestEdge attachInvokingRequestEdge(Map<String, Object> eventAttrs, AgentContext context) {
+        InvokingRequestEdge edge = consumeInvokingRequestId(context);
         if (edge == null || eventAttrs == null) {
             return edge;
         }

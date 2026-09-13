@@ -93,7 +93,21 @@ public interface LlmProvider {
                 AbortController abortController,
                 Consumer<Throwable> onError,
                 Runnable onComplete,
-                Boolean skipCacheWrite);
+                Boolean skipCacheWrite,
+                // ═══════════════════ [A#3 tuc-invoking-req] agentContext ═══════════════════
+                // 显式 agent 归因上下文（可 null = 主线程 / 无归因）· CC original: 无入参
+                //   （CC 经 AsyncLocalStorage 自动传播，services/api/logging.ts:294/:461
+                //   consumeInvokingRequestId 读 ambient context）。
+                // WHY 显式：Java AgentContext.STORAGE 是 plain ThreadLocal，不跨线程继承，而
+                //   provider 的 per-LLM-call terminal 事件发射跑在 LlmAgentLoop.STREAM_EXECUTOR
+                //   虚拟线程（LlmAgentLoop:6604）→ 恒读不到 → invokingRequestId 生产恒空。
+                // 消费点：AnthropicSdkProvider.emitApiTerminalEvent → AgentContext
+                //   .attachInvokingRequestEdge(attrs, agentContext)（稀疏边语义由该实例的
+                //   AtomicBoolean invocationEmitted 承载，AGENT_CONTEXT_PARAM 见下）。
+                // [参数位置] 追加在参数表末尾 —— 本接口 3 个重载在测试树被 Mockito 以纯 positional
+                //   索引消费（inv.getArgument(9/10/16) 等），中部插入会静默漂移既有索引；
+                //   末尾追加与之逐位兼容（同 skipCacheWrite 的既有取舍）。
+                com.nexusai.application.agent.subagent.AgentContext agentContext);
 
     /**
      * [CCJ-EXEC-08] 18-arg 流式 · <b>带 thinkingConfig 透传</b>（含 effortValue）。
@@ -129,7 +143,8 @@ public interface LlmProvider {
                         AbortController abortController,
                         Consumer<Throwable> onError,
                         Runnable onComplete,
-                        Boolean skipCacheWrite) {
+                        Boolean skipCacheWrite,
+                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // [merge-fix] ⊕C-1 blocks 唯一发送契约：String 兼容链已删（16-arg String 委托目标不在
         //   合并接口），默认实现把 systemPrompt 折为单 block（CacheScope.NULL = 不缓存，join 恒等）
         //   路由到 blocks 抽象重载；thinkingConfig 忽略（与原有默认语义一致）。
@@ -137,7 +152,8 @@ public interface LlmProvider {
             systemPrompt == null ? null : List.of(new SystemPromptBlock(systemPrompt, CacheScope.NULL)),
             history, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite);
+            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
+            agentContext);   // [A#3] 显式归因上下文透传（virtual-thread 边界不可丢）
     }
 
     /**
@@ -170,11 +186,13 @@ public interface LlmProvider {
                         AbortController abortController,
                         Consumer<Throwable> onError,
                         Runnable onComplete,
-                        Boolean skipCacheWrite) {
+                        Boolean skipCacheWrite,
+                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
         stream(config, modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite);
+            onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
+            agentContext);   // [A#3] 显式归因上下文透传
     }
 
     /**
@@ -219,7 +237,11 @@ public interface LlmProvider {
     default LlmRawResponse chatWithRaw(ProviderConfig config,
                                        String modelName,
                                        String systemPrompt,
-                                       String userMessage) {
+                                       String userMessage,
+                                       // [A#3 tuc-invoking-req] 显式 agent 归因上下文（null = 主线程 / 无归因）。
+                                       //   chat 家族无 stream 的新参数，故自带载体（用户裁定：chat 也要覆盖）。
+                                       //   消费点 = AnthropicSdkProvider.chatWithRaw 的两个 terminal 发射点。
+                                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // 默认委托给 chat — 保持向后兼容 (MockLlmProvider / 老 Provider)
         String content = chat(config, modelName, systemPrompt, userMessage);
         // [D P1-7] 默认实现无 request id 通道 → null (对齐 CC ?? undefined 兜底)
@@ -353,16 +375,30 @@ public interface LlmProvider {
             // [WF3-04 explainer] CC original: options.tool_choice（permissionExplainer.ts:183
             //   {type:'tool', name:'explain_command'}）— 强制结构化输出（强制 LLM 调用指定工具）。
             //   可空 = 不发送 tool_choice（模型自由选择）。
-            ToolChoice toolChoice
+            ToolChoice toolChoice,
+            // ═══════════════════ [A#3 tuc-invoking-req] agentContext ═══════════════════
+            // chat 家族的显式归因载体 · CC original: 无（CC 经 AsyncLocalStorage 自动传播，
+            //   services/api/logging.ts:294/:461 consumeInvokingRequestId 读 ambient context）。
+            // WHY chat 也需要独立载体（用户裁定）：chat 系列不经 LlmProvider.stream，拿不到
+            //   stream 的新参数；而它们同样会走到 AnthropicSdkProvider 的 per-LLM-call terminal
+            //   发射点（chatWithRaw 2 + chatWithOptions 3 + chatWithOptionsMessage 2 = 7 处），
+            //   且 YoloClassifierImpl.callWithMdc/callWithOptionsMdc 还把调用派发到
+            //   CompletableFuture.supplyAsync（只回放 MDC）—— ThreadLocal 一样不可达。
+            // 可空 = 主线程 / 无归因上下文（对齐 CC 主线程 undefined，事件无该属性）。
+            com.nexusai.application.agent.subagent.AgentContext agentContext
     ) {
         public ChatRequestOptions {
             history = history == null ? List.of() : List.copyOf(history);
         }
 
         /**
-         * [W9-01] 9-arg 便捷构造器 · 既有 9 参调用方（AwaySummaryService）零改动；末 5 项
-         * （enablePromptCaching/agents/hasAppendSystemPrompt/mcpTools/isNonInteractiveSession）
+         * [W9-01 + A#3] 10-arg 便捷构造器 · 既有 9 参调用方（AwaySummaryService）零改动语义；
+         * 末 5 项（enablePromptCaching/agents/hasAppendSystemPrompt/mcpTools/isNonInteractiveSession）
          * 默认 null（未显式设置，等价 CC undefined）。
+         *
+         * <p>[A#3 tuc-invoking-req] 末位新增 {@code agentContext} — 便捷构造器不再把归因上下文
+         * 隐式留空：调用方必须显式传值（回归「会话态一律显式传参」铁律；传 null = 明确宣告
+         * 本调用无归因上下文，等价 CC 主线程 undefined）。
          */
         public ChatRequestOptions(
                 List<ChatMessageDto> history,
@@ -373,14 +409,16 @@ public interface LlmProvider {
                 String querySource,
                 AbortController abortController,
                 Integer maxTokens,
-                Boolean skipCacheWrite) {
+                Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             this(history, tools, outputFormat, thinkingConfig, temperature, querySource, abortController,
-                maxTokens, skipCacheWrite, null, null, null, null, null, null);
+                maxTokens, skipCacheWrite, null, null, null, null, null, null,
+                agentContext);
         }
 
         /**
-         * 8-arg 便捷构造器 · 现有调用方（FindRelevantMemories/ExecPromptHook/SkillImprovementHook）
-         * 零改动（skipCacheWrite 默认 null = 未显式设置，等价 CC undefined）。
+         * [A#3] 9-arg 便捷构造器 · 原 8 参形态 + 末位 agentContext
+         * （skipCacheWrite 默认 null = 未显式设置，等价 CC undefined）。
          */
         public ChatRequestOptions(
                 List<ChatMessageDto> history,
@@ -390,14 +428,15 @@ public interface LlmProvider {
                 Double temperature,
                 String querySource,
                 AbortController abortController,
-                Integer maxTokens) {
-            this(history, tools, outputFormat, thinkingConfig, temperature, querySource, abortController, maxTokens, null);
+                Integer maxTokens,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+            this(history, tools, outputFormat, thinkingConfig, temperature, querySource, abortController,
+                maxTokens, null, agentContext);
         }
 
         /**
-         * [WF3-04 explainer] 14-arg 便捷构造器 · 保留新增 {@code toolChoice} 前的 canonical
-         * 14 参形状（HaikuToolUseSummaryGenerator 等 canonical 调用方零改动），
-         * toolChoice 默认 null（未显式设置 = 不发送，等价 CC undefined）。
+         * [WF3-04 explainer + A#3] 15-arg 便捷构造器 · 原 14 参形态（HaikuToolUseSummaryGenerator 等）
+         * + 末位 agentContext；toolChoice 默认 null（未显式设置 = 不发送，等价 CC undefined）。
          */
         public ChatRequestOptions(
                 List<ChatMessageDto> history,
@@ -413,10 +452,11 @@ public interface LlmProvider {
                 List<String> agents,
                 Boolean hasAppendSystemPrompt,
                 List<String> mcpTools,
-                Boolean isNonInteractiveSession) {
+                Boolean isNonInteractiveSession,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             this(history, tools, outputFormat, thinkingConfig, temperature, querySource, abortController,
                 maxTokens, skipCacheWrite, enablePromptCaching, agents, hasAppendSystemPrompt, mcpTools,
-                isNonInteractiveSession, null);
+                isNonInteractiveSession, null, agentContext);   // 末二参 = toolChoice, agentContext
         }
 
         /** 结构化输出约束 · 对齐 CC API outputFormat. */

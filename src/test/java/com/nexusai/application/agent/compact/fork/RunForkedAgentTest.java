@@ -732,7 +732,8 @@ class RunForkedAgentTest {
                            Runnable onStreamingFallback,
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             this.lastSystemPromptBlocks = systemPromptBlocks;
             this.lastSkipCacheWrite = skipCacheWrite;
             // 兼容既有 String 断言：blocks → join("\\n\\n") 与 splitSysPromptPrefix 语义一致

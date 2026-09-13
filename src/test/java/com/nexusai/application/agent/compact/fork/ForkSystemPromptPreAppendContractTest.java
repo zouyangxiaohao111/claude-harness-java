@@ -221,7 +221,8 @@ class ForkSystemPromptPreAppendContractTest {
                            Runnable onStreamingFallback,
                            AbortController abortController,
                            Consumer<Throwable> onError,
-                           Runnable onComplete, Boolean skipCacheWrite) {
+                           Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             this.blocks = systemPromptBlocks == null ? null : List.copyOf(systemPromptBlocks);
             onAssistantMessage.accept(new AssistantMessage("summary text", "stop", List.of()));
             onComplete.run();

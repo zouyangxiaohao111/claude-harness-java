@@ -290,7 +290,7 @@ class E1aForkShieldGateTest {
             return null;
         };
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         return provider;

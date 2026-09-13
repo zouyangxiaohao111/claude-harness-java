@@ -177,7 +177,38 @@ public record ToolUseContext(
         //   （静态单一来源 MAINCHAIN-01）解析后盖章；producer 只读 ctx 比较，无 DB 依赖。
         // @JsonIgnore: 会话运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 effectiveModelName / readFileState / mcpServerConnections / fileReadingLimits local-only 约束）。
-        @JsonIgnore String effectiveProviderType
+        @JsonIgnore String effectiveProviderType,
+        // ═══════════════════ 50-51 [tuc-subagent-identity] 子代理身份（hook 侧载体）═══════════════════
+        // CC 真源：{@code Tool.ts:245-246}
+        //   {@code agentId?: AgentId // Only set for subagents; use getSessionId() for session ID.
+        //     Hooks use this to distinguish subagent calls.}
+        //   {@code agentType?: string // Subagent type name.}
+        // ⇒ CC 自己就把 ToolUseContext 定为「hook 侧的子代理判别载体」。
+        //
+        // WHY 这两个字段（而不是让 hook 读 AgentContext ThreadLocal）：
+        //   SessionFileAccessHooks 的 PostToolUse 回调经 HookRegistry:2595
+        //   {@code supplyAsync(withSessionProjectRoot(...), HOOK_EXECUTOR)} 派发 ——
+        //   AgentContext 不在回放白名单 ⇒ {@code AgentContext.getSubagentLogName()} 在 hook 线程恒 null
+        //   ⇒ {@code subagent_name} 生产恒空。CC 的 AsyncLocalStorage 自动跨异步传播，
+        //   Java 侧必须以「显式传参」等价（用户铁律：会话态一律显式传参，禁止回放）。
+        //
+        // subagentName — CC original: {@code AgentContext.subagentName}
+        //   （agentContext.ts:40；CC AgentTool.tsx:721 {@code subagentName: selectedAgent.agentType}）
+        //   = 子代理类型名（如 "Explore" / "code-reviewer"）。null = 非子代理上下文（主线程）→ 事件无该属性。
+        //   不复用既有 {@link #agentType()} 的原因：{@code SubagentExecutor.withEffectiveCwd}（:441-489）
+        //   把 Stage 3.4 session 组统一传 null（含 agentType），子代理 TUC 的 agentType 会在此派生点丢失。
+        // isBuiltIn  — CC original: {@code AgentContext.isBuiltIn}
+        //   （agentContext.ts:42；CC 判定 {@code isBuiltInAgent(agent)} = {@code agent.source === 'built-in'}
+        //   loadAgentsDir.ts:168-172）。Java 等价 = {@code def instanceof
+        //   AgentDefinition.BuiltInAgentDefinition}（AgentDefinition.BuiltInAgentDefinition.source() 恒
+        //   "built-in"，与 CC 字面量一致）。
+        //   隐私语义（CC agentContext.ts:141-151）：{@code isBuiltIn ? subagentName : 'user-defined'}
+        //   —— 自定义 agent 名是用户数据，绝不进 analytics，恒映射为字面量 "user-defined"。
+        //
+        // @JsonIgnore: analytics 归因用身份，不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 effectiveModelName / readFileState / mcpServerConnections local-only 约束）。
+        @JsonIgnore String subagentName,
+        @JsonIgnore boolean isBuiltIn
         // [Session J 方案 A] 撤回 E session 加的 querySource + assistantMessage 顶层字段:
         //   - CC 真源 (主 agent grep 实证 Pattern #9):
         //     · querySource: toolUseContext.options.querySource (Tool.ts:176), Java 端对齐
@@ -602,7 +633,9 @@ public record ToolUseContext(
              mcpServerConnections,
              null,     // [OPD-D1-01] fileReadingLimits 缺省 → compact ctor 兜底 null (CC optional)
              null,     // [openai-lazy] effectiveModelName 缺省 → null
-             null);    // [openai-lazy] effectiveProviderType 缺省 → null（判不出 → tool search 关闭，全量 schema 内联）
+             null,     // [openai-lazy] effectiveProviderType 缺省 → null（判不出 → tool search 关闭，全量 schema 内联）
+             null,     // [tuc-subagent-identity] subagentName 缺省 → null（非子代理上下文；唯一产出点盖章）
+             false);   // [tuc-subagent-identity] isBuiltIn 缺省 → false
     }
 
     /** Stage 3.1 4 参兼容构造器. */
@@ -1345,7 +1378,7 @@ public record ToolUseContext(
             List.copyOf(conns),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留 · CC Tool.ts:251 optional)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
     }
 
     /** 覆写 messages 快照。null 参数 → 保留现有。 */
@@ -1381,7 +1414,7 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
     }
 
     /**
@@ -1415,7 +1448,7 @@ public record ToolUseContext(
             mcpServerConnections(),
             limits,
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
     }
 
     /**
@@ -1446,7 +1479,7 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),
             modelName,
-            effectiveProviderType());
+            effectiveProviderType(), subagentName(), isBuiltIn());
     }
 
     /**
@@ -1493,7 +1526,53 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),
             effectiveModelName(),
-            providerType);
+            providerType, subagentName(), isBuiltIn());
+    }
+
+    /**
+     * [tuc-subagent-identity] 覆写子代理身份（subagentName + isBuiltIn）· 唯一产出点入口。
+     *
+     * <p><b>WHY 需要本 wither</b>：子代理身份的权威来源只有 SubagentExecutor Step 20
+     * （{@code agentDefinition.agentType()} + {@code agentDefinition instanceof
+     * AgentDefinition.BuiltInAgentDefinition}），而承载它的子代理 TUC 在 Step 18 已经由
+     * {@code createSubagentContext.create} + {@code withEffectiveCwd} 派生完成（那条链是 46 参兼容
+     * 构造器，不携带本字段）。故在 Step 20 以本 wither 单点盖章 —— 与同处
+     * {@link SubagentExecutor#buildSubagentAgentContext} 用同一份 {@code agentDefinition} 取值，
+     * 保证 {@code AgentContext.subagentName}（LLM 侧归因）与 TUC 侧（hook 侧归因）永不漂移。
+     *
+     * <p><b>不回退到「读 AgentContext ThreadLocal」</b>：hook 派发经
+     * {@code HookRegistry:2595 supplyAsync(..., HOOK_EXECUTOR)}，AgentContext 不在回放白名单，
+     * 回读恒 null（用户铁律：会话态一律显式传参，禁止回放）。
+     *
+     * @param subagentName 子代理类型名（CC original: agentContext.ts:40 subagentName；
+     *                     CC 取值 AgentTool.tsx:721 {@code selectedAgent.agentType}）
+     * @param isBuiltIn    是否内置 agent（CC original: loadAgentsDir.ts:168-172
+     *                     {@code agent.source === 'built-in'}）
+     * @return 新 ToolUseContext（仅这两个字段覆写，其余字段透传）
+     */
+    public ToolUseContext withSubagentIdentity(String subagentName, boolean isBuiltIn) {
+        return new ToolUseContext(
+            agentId(), sessionId(), mode(), additionalWorkingDirectories(),
+            availableTools(), taskListId(), abortController(),
+            messages(), permissionContext(), permissionMode(),
+            mcpClients(),
+            isNonInteractiveSession(), renderedSystemPrompt(), effectiveCwd(),
+            inProgressToolUseIDs(), toolDecisions(), onCompactProgress(),
+            getAppState(), setAppState(), setStreamMode(), setSDKStatus(),
+            addNotification(), appendSystemMessage(), sendOSNotification(),
+            setResponseLength(), setHasInterruptibleToolInProgress(), updateFileHistoryState(),
+            updateAttributionState(), setConversationId(), setToolJSX(), openMessageSelector(),
+            userModified(), nestedMemoryAttachmentTriggers(), loadedNestedMemoryPaths(),
+            dynamicSkillDirTriggers(), discoveredSkillNames(), agentType(), requireCanUseTool(),
+            preserveToolUseResults(), localDenialTracking(), contentReplacementState(),
+            queryTracking(), toolUseId(), criticalSystemReminder_EXPERIMENTAL(),
+            readFileState(),
+            mcpServerConnections(),
+            fileReadingLimits(),
+            effectiveModelName(),
+            effectiveProviderType(),
+            subagentName,
+            isBuiltIn);
     }
 
     /** 覆写 permissionContext + permissionMode（每轮经 ctx.permissionContextBuilder() 重建）。 */
@@ -1535,7 +1614,7 @@ public record ToolUseContext(
             mcpServerConnections(),
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
-            effectiveProviderType());  // [openai-lazy] 透传 (null 保留)
+            effectiveProviderType(), subagentName(), isBuiltIn());  // [openai-lazy] 透传 (null 保留)
     }
 
     public ToolUseContext with(SubagentContextOverrides overrides) {
@@ -1732,8 +1811,10 @@ public record ToolUseContext(
             this.mcpServerConnections(),   // [MCP-I-9 Q-30] 连接继承 · 继承父 (with 不覆写)
             this.fileReadingLimits(),  // [OPD-D1-01] 继承父 · 对齐 CC forkedAgent.ts:456 fileReadingLimits: parentContext.fileReadingLimits
             this.effectiveModelName(),   // [openai-lazy] 继承父 · 子代理共享父 turn 模型名
-            this.effectiveProviderType() // [openai-lazy] 继承父 · 子代理共享父 turn 目标 provider（主循环门控 toolReferenceUsable 用）
-    );
+            this.effectiveProviderType(), // [openai-lazy] 继承父 · 子代理共享父 turn 目标 provider（主循环门控 toolReferenceUsable 用）
+            // [tuc-subagent-identity] 不继承父（对齐 CC forkedAgent.ts:449 agentType 仅取 override，
+            //   「子代理身份不是父的身份」）；由唯一产出点 SubagentExecutor 装配后 withSubagentIdentity 盖章。
+            null, false);
     }
 
     /**

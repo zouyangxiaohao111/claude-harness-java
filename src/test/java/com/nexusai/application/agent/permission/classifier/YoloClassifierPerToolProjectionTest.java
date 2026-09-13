@@ -65,7 +65,8 @@ class YoloClassifierPerToolProjectionTest {
         LlmProvider fake = new FakeLlm() {
             @Override
             public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage) {
+                                              String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 llmCalled.set(true);
                 capturedUserMessage.set(userMessage);
                 // [S06] CC 2-stage XML：stage1 <block>no</block> → fast allow（yoloClassifier.ts:807-823）
@@ -107,7 +108,8 @@ class YoloClassifierPerToolProjectionTest {
         LlmProvider fake = new FakeLlm() {
             @Override
             public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage) {
+                                              String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 llmCalled.set(true);
                 return new LlmRawResponse("<block>no</block>", "msg_stage1_never", null, "req_stage1");
             }
@@ -409,7 +411,8 @@ class YoloClassifierPerToolProjectionTest {
                                      Consumer<ToolUseBlock> onToolCallComplete,
                                      Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                      AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             throw new UnsupportedOperationException("YoloClassifier 路径不使用 stream");
         }
     }

@@ -2341,7 +2341,7 @@ public class ChatService {
             titleSchema.putArray("required").add("title");
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 List.of(), null, LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(titleSchema),
-                null, null, "auto_title", null, null, null, null, null, null, null, null, null);
+                null, null, "auto_title", null, null, null, null, null, null, null, null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
             String titleJson = titleProvider.chatWithOptions(config, fastModelName, titlePrompt, prompt, options);
             newTitle = (titleJson != null && !titleJson.isBlank())
                 ? JSON.readTree(titleJson).path("title").asText(null) : null;

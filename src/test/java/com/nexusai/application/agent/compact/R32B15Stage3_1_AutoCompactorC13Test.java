@@ -129,7 +129,8 @@ class R32B15Stage3_1_AutoCompactorC13Test {
                                          Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                                          Consumer<String> orc,
                                          Runnable osf, com.nexusai.application.agent.tool.AbortController ac,
-                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 oa.accept(new AssistantMessage(text, "stop", List.of()));
                 ocp.run();
             }

@@ -72,7 +72,8 @@ class AgentSummaryServiceIntegrationTest {
                                      Consumer<String> onReasoningChunk,
                                      Runnable onStreamingFallback,
                                      com.nexusai.application.agent.tool.AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(new AssistantMessage("Reading runAgent.ts", "stop", List.of()));
@@ -109,7 +110,8 @@ class AgentSummaryServiceIntegrationTest {
                                      Consumer<String> onReasoningChunk,
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(new AssistantMessage("Reading runAgent.ts", "stop", List.of()));
@@ -152,7 +154,8 @@ class AgentSummaryServiceIntegrationTest {
                                      Consumer<String> onReasoningChunk,
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite) {
+                                     Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(new AssistantMessage("Reading runAgent.ts", "stop", List.of()));

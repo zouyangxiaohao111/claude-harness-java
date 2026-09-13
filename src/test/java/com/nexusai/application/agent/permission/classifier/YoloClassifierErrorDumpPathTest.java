@@ -173,7 +173,8 @@ class YoloClassifierErrorDumpPathTest {
                 throw new UnsupportedOperationException("应走 chatWithRaw");
             }
             @Override public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                                        String systemPrompt, String userMessage) {
+                                                        String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 throw new CancellationException("aborted mid-call");
             }
             @Override public AssistantMessage chatWithOptionsMessage(ProviderConfig config,
@@ -193,7 +194,8 @@ class YoloClassifierErrorDumpPathTest {
                                          Consumer<ToolUseBlock> onToolCallComplete,
                                          Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                          AbortController abortController,
-                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 throw new UnsupportedOperationException("YoloClassifier 不使用 stream");
             }
         };
@@ -208,7 +210,8 @@ class YoloClassifierErrorDumpPathTest {
                 throw new UnsupportedOperationException("应走 chatWithRaw");
             }
             @Override public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                                        String systemPrompt, String userMessage) {
+                                                        String systemPrompt, String userMessage,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 throw new RuntimeException("classifier api exploded");
             }
             @Override public void stream(ProviderConfig config, String modelName,
@@ -221,7 +224,8 @@ class YoloClassifierErrorDumpPathTest {
                                          Consumer<ToolUseBlock> onToolCallComplete,
                                          Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
                                          AbortController abortController,
-                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite) {
+                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
                 throw new UnsupportedOperationException("YoloClassifier 不使用 stream");
             }
         };

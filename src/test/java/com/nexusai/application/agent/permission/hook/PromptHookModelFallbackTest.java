@@ -88,7 +88,8 @@ class PromptHookModelFallbackTest {
             java.util.function.Consumer<String> orc, Runnable osf,
             AbortController ac,
             java.util.function.Consumer<Throwable> oe,
-            Runnable onC, Boolean skipCacheWrite) {
+            Runnable onC, Boolean skipCacheWrite,
+                com.nexusai.application.agent.subagent.AgentContext agentContext) {
             throw new UnsupportedOperationException();
         }
 

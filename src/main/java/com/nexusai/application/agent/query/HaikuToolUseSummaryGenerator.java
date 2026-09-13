@@ -194,7 +194,7 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
                 List.of(),   // CC :76 agents: []
                 Boolean.FALSE, // CC :78 hasAppendSystemPrompt: false
                 List.of(),   // CC :79 mcpTools: []
-                isNonInteractiveSession); // CC :77 isNonInteractiveSession 透传
+                isNonInteractiveSession, com.nexusai.application.agent.subagent.AgentContext.getAgentContext()); // CC :77 isNonInteractiveSession 透传
             return llmProviderFactory.getProvider(resolved.config(), resolved.providerType()).chatWithOptions(
                 resolved.config(),
                 modelName,

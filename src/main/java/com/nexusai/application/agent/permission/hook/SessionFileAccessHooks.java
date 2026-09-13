@@ -261,7 +261,8 @@ public final class SessionFileAccessHooks {
      * @param toolName 工具名 (已由 matcher 过滤为 5 工具之一)
      * @param input    工具输入
      */
-    public void handleSessionFileAccess(String toolName, JsonNode input) {
+    public void handleSessionFileAccess(String toolName, JsonNode input,
+                                        com.nexusai.application.agent.tool.ToolUseContext ctx) {
         if (telemetry == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[SessionFileAccessHooks] telemetry 未注入, 跳过埋点: tool={}", toolName);
@@ -269,7 +270,7 @@ public final class SessionFileAccessHooks {
             return;
         }
         // CC :158-159 subagentName = getSubagentLogName()；subagentProps = subagentName ? {subagent_name} : {}
-        java.util.Map<String, Object> subagentProps = subagentProps();
+        java.util.Map<String, Object> subagentProps = subagentProps(ctx);
         FileType fileType = getSessionFileTypeFromInput(toolName, input);
         if (fileType == FileType.SESSION_MEMORY) {
             log.info("[SessionFileAccessHooks] 会话记忆文件被访问: tool={} subagent_name={}",
@@ -331,14 +332,46 @@ public final class SessionFileAccessHooks {
      * （sessionFileAccessHooks.ts:158-159，getSubagentLogName 见 agentContext.ts:141-151）。
      *
      * <p>仅 subagent 上下文携带该属性（主线程无 subagentName → 空 map → 事件无 subagent_name）。
-     * Java 端调 {@link com.nexusai.application.agent.subagent.AgentContext#getSubagentLogName()}
-     * （interface static 方法隐式 public，跨包可用）。
      *
+     * <p><b>[tuc-subagent-identity] WHY 从 ctx 取而不是 {@code AgentContext.getSubagentLogName()}</b>：
+     * 本 hook 的 PostToolUse 回调由 {@code HookRegistry:2595
+     * supplyAsync(withSessionProjectRoot(...), HOOK_EXECUTOR)} 派发到 HOOK_EXECUTOR 线程，
+     * {@code AgentContext.STORAGE}（ThreadLocal）不在回放白名单 ⇒ {@code getSubagentLogName()}
+     * 在该线程恒返回 null ⇒ {@code subagent_name} 生产恒空（本批修复的根因）。
+     * 显式载体 = 回调第 4 参 {@code ctx}（{@code ToolUseContext}，CC 自己就把
+     * {@code Tool.ts:245-246 agentId/agentType} 定为「hook 侧子代理判别载体」）。
+     *
+     * <p>隐私映射与 CC {@code agentContext.ts:145-151} 逐字一致：
+     * {@code isBuiltIn ? subagentName : 'user-defined'}（自定义 agent 名是用户数据，不进 analytics）。
+     *
+     * @param ctx PostToolUse 回调携带的工具上下文（CC original: ToolUseContext）；
+     *            null 或 subagentName 为 null → 空 map（= CC 非 subagent 上下文 undefined）
      * @return {@code {subagent_name: <name>}} 或空 map（非 subagent 上下文）
      */
-    private static java.util.Map<String, Object> subagentProps() {
-        String name = com.nexusai.application.agent.subagent.AgentContext.getSubagentLogName();
-        return name != null ? java.util.Map.of("subagent_name", name) : java.util.Map.of();
+    private static java.util.Map<String, Object> subagentProps(
+            com.nexusai.application.agent.tool.ToolUseContext ctx) {
+        if (ctx == null) {
+            // 本该有却没有（HookRegistry 调度恒传 ctx）→ 显式暴露，不静默降级为「无属性」
+            log.warn("[SessionFileAccessHooks] ToolUseContext 为 null, 无法解析 subagent_name 归因 "
+                    + "(CC agentContext.ts:141-151 getSubagentLogName)");
+            return java.util.Map.of();
+        }
+        String name = ctx.subagentName();
+        if (name == null || name.isBlank()) {
+            // 本就不需要（主线程 / 非子代理上下文）→ CC getSubagentLogName 亦返回 undefined
+            if (log.isDebugEnabled()) {
+                log.debug("[SessionFileAccessHooks] 非子代理上下文 (subagentName=null), 事件不带 subagent_name "
+                        + "· CC agentContext.ts:145-146");
+            }
+            return java.util.Map.of();
+        }
+        // CC :148-150 隐私映射：isBuiltIn ? subagentName : 'user-defined'
+        String logName = ctx.isBuiltIn() ? name : "user-defined";
+        if (log.isDebugEnabled()) {
+            log.debug("[SessionFileAccessHooks] subagent_name 归因: subagentName={} isBuiltIn={} → logName={} "
+                    + "· CC agentContext.ts:145-151", name, ctx.isBuiltIn(), logName);
+        }
+        return java.util.Map.of("subagent_name", logName);
     }
 
     /** 合并基础属性与 subagent_name 属性（base 不含 subagent_name 时返回 base 原 map）。 */
@@ -421,7 +454,9 @@ public final class SessionFileAccessHooks {
                         com.nexusai.application.agent.tool.ToolUseContext ctx, boolean stopHookActive) {
                     // matcher 过滤: 仅处理本 hook 对应工具 (CC matcher 等价)
                     if (toolName != null && toolName.equals(tool)) {
-                        handleSessionFileAccess(toolName, input);
+                        // [tuc-subagent-identity] ctx 是本回调唯一的子代理身份载体
+                        //   （本方法在 HOOK_EXECUTOR 线程执行，AgentContext ThreadLocal 不可达）
+                        handleSessionFileAccess(toolName, input, ctx);
                     }
                     return GenericHook.HookResult.proceed();
                 }

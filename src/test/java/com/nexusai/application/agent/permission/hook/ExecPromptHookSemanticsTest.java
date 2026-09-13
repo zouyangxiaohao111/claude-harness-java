@@ -51,7 +51,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (response == null) throw new RuntimeException("provider exploded");
                 return response;
@@ -74,7 +75,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (capturedUser != null) capturedUser.set(u);
                 return response;
@@ -226,7 +228,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 try { Thread.sleep(2000); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); throw new RuntimeException(e);
@@ -279,7 +282,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -328,7 +332,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -395,7 +400,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -455,7 +461,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -502,7 +509,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -568,7 +576,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
-                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite) { throw new UnsupportedOperationException(); }
+                java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
+                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
