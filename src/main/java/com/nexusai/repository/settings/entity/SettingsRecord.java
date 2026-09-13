@@ -244,6 +244,20 @@ public class SettingsRecord {
     private String enabledPlugins;
     private Boolean pluginClaudeFallback;
 
+    // [provider-custom-headers V72] 自定义请求 header 的运行时占位符总开关（V72 建列
+    //   allow_dynamic_header_values INTEGER 0/1；规范 §6.6 D6）。
+    //   语义：true = provider 自定义 header 值里的 ${session_id} 按请求展开为真会话 ID；
+    //   false = 不展开，占位符落兜底常量 DynamicHeaderExpander.STATIC_FALLBACK（nexusai-static）。
+    //   默认开（null 也视为开）：provider 表单里配完 ${session_id} 即刻生效，无需再进设置；
+    //   关闭时也不丢弃该 header（nexusai 有约 20 条辅助 LLM 调用拿不到 sessionId，
+    //   丢弃会让它们对 opencode 静默 400 → 标题/摘要/视觉等功能无声失效）。
+    //   与参考实现 qwen-code 的 outboundCorrelation.allowDynamicHeaderValues 对齐，但
+    //   **有意分歧：本仓默认开、它默认关** —— gate-off 在本仓只可能是用户主动关闭，
+    //   故默认值取「开」才符合「配了就生效」的预期。
+    //   命名：MyBatis-Flex camelCase→snake 精确映射（allowDynamicHeaderValues →
+    //   allow_dynamic_header_values；同 autoDreamEnabled → auto_dream_enabled 先例）。
+    private Boolean allowDynamicHeaderValues;
+
     public Integer getId() { return id; }
     public void setId(Integer id) { this.id = id; }
     public String getTheme() { return theme; }
@@ -391,4 +405,8 @@ public class SettingsRecord {
     // [V61] plugin_claude_fallback ↔ pluginClaudeFallback（MyBatis-Flex snake↔camel 映射）
     public Boolean getPluginClaudeFallback() { return pluginClaudeFallback; }
     public void setPluginClaudeFallback(Boolean pluginClaudeFallback) { this.pluginClaudeFallback = pluginClaudeFallback; }
+    // [V72 provider-custom-headers] allow_dynamic_header_values ↔ allowDynamicHeaderValues
+    // （MyBatis-Flex snake↔camel 映射；null = 未配置 → 调用方按默认开处理）
+    public Boolean getAllowDynamicHeaderValues() { return allowDynamicHeaderValues; }
+    public void setAllowDynamicHeaderValues(Boolean allowDynamicHeaderValues) { this.allowDynamicHeaderValues = allowDynamicHeaderValues; }
 }

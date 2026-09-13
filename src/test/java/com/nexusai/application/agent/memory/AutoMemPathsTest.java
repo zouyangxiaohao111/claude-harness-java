@@ -656,6 +656,45 @@ class AutoMemPathsTest {
     }
 
     @Test
+    @DisplayName("[TL-W1 P3] 显式重载不读 ThreadLocal：CURRENT_PROJECT_ROOT 项目的 localSettings 不得泄漏到 getAutoMemPath(其他项目)")
+    void getAutoMemPath_explicitOverloadIgnoresThreadLocalProjectRoot(
+            @TempDir Path threadLocalRoot, @TempDir Path otherRoot, @TempDir Path configHome) throws Exception {
+        // WHY（规则九 · 审计 P3）: getAutoMemPath(String) 自称「不依赖 supplier/ThreadLocal」，但其
+        //   settings 源旧经无参 getAutoMemPathSetting() → readAutoMemoryDirectorySetting() →
+        //   currentSessionProjectRoot() **回读 ThreadLocal**（DB 列 auto_memory_directory 生产默认为
+        //   NULL → 必走该分支）⇒ 显式重载的「零 ThreadLocal」定案被推翻：异步 fork 线程无 ThreadLocal
+        //   → 该值回落 config home。本测试钉住：ThreadLocal = P 时，getAutoMemPath(其他项目) **只**用
+        //   入参解析（不得命中 P 的 localSettings）；无参重载仍走 P（会话线程语义，允许读 ThreadLocal）。
+        // 时序同 OPD-R2-02 用例：setAppNameOverride/configDirOverride 必须先于夹具路径解析。
+        AutoMemPaths paths = AutoMemPaths.defaultInstance();
+        ClaudePaths.setConfigDirOverride(configHome.toString());
+        NexusaiPaths.setAppNameOverride("nexusai-test-" + configHome.getFileName());
+        BundledSkillEnabledGates.bridgeSettingsMapper(null);
+        try {
+            Path nexusaiDir = Files.createDirectories(threadLocalRoot.resolve(NexusaiPaths.getProjectDirName()));
+            Path memDir = Files.createDirectories(threadLocalRoot.resolve("threadlocal-mem"));
+            Files.writeString(nexusaiDir.resolve("settings.local.json"),
+                "{\"autoMemoryDirectory\": " + SETTINGS_JSON.writeValueAsString(memDir.toString()) + "}");
+
+            AutoMemPaths.setCurrentProjectRoot(threadLocalRoot.toString());
+            // 对照支：无参重载（会话线程语义）→ 读 ThreadLocal 项目 P 的 localSettings（既有定案）
+            assertThat(paths.getAutoMemPath())
+                .as("无参重载 = 唯一允许读 ThreadLocal 的路径（会话线程语义）")
+                .isEqualTo(memDir.toString() + java.io.File.separator);
+            // 主张支：显式重载传**其他**项目 → 绝不命中 P 的 localSettings
+            //   （旧实现内部调无参 getAutoMemPathSetting() → ThreadLocal=P → 命中 → 本断言红）
+            assertThat(paths.getAutoMemPath(otherRoot.toString()))
+                .as("显式重载必须只用入参 projectRoot 解析 settings 链（旧实现回读 ThreadLocal → 命中 P 的 localSettings）")
+                .doesNotContain("threadlocal-mem");
+        } finally {
+            AutoMemPaths.setCurrentProjectRoot(null);
+            ClaudePaths.setConfigDirOverride(null);
+            NexusaiPaths.setAppNameOverride(null);
+            paths.clearCache();
+        }
+    }
+
+    @Test
     @DisplayName("G-03: nexusai user settings autoMemoryEnabled=false → 全局关闭（D2 · 弃 claude settings 档）")
     void autoMemoryEnabled_projectOptOut(@TempDir Path projectRoot, @TempDir Path configHome) throws Exception {
         // WHY: D2 复刻版 gate 仅读 DB + nexusai user settings（BundledSkillEnabledGates.java:188-189）；

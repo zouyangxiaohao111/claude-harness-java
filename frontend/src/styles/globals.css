@@ -5582,6 +5582,15 @@ html {
   border-color: var(--error);
   background: var(--surface-1);
 }
+/* 单行输入的行内校验标红（KvEditor 等）—— 与 .fm-textarea.invalid 同形 */
+.fm-input.invalid {
+  border-color: var(--error);
+  background: rgba(217, 75, 75, 0.04);
+}
+.fm-input.invalid:focus {
+  border-color: var(--error);
+  background: var(--surface-1);
+}
 
 /* Locked (read-only) display for fields that can't be changed in this context */
 .fm-locked-tag {

@@ -426,10 +426,22 @@ public class AutoDreamConsolidator {
     public void consolidateIfNeeded(Path workspaceDir, String sessionId,
                                     Consumer<SystemMessage> appendSystemMessage,
                                     ForkRawMaterial forkRawMaterial) {
-        // 4 参便捷重载 · 无显式 memoryDir（非主循环调用方：测试/直构 storage Path 冻结安全；
-        //   生产 StopHookPipeline 必须走 5 参带会话线程解析的 memoryDir —— 本重载现算
-        //   storage.memoryDir()，fork 线程下调会回落 config-home，故生产禁用）。
-        consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, memoryDir());
+        // 4 参便捷重载 · 无显式 memoryDir（非主循环调用方：测试/直构 storage Path 冻结安全）。
+        // [TL-W1 P2] memoryDir 只取**冻结**值 —— 旧实现 `memoryDir()` → storage.memoryDir() →
+        //   AutoMemPaths.getAutoMemPath()（无参，读会话 ThreadLocal）；本重载由 StopHookPipeline
+        //   在 CompletableFuture.runAsync（ForkJoinPool worker，无 ThreadLocal）上调用 → 回落
+        //   config home → A′ 判无效返回 null → new ConsolidationLock(null) → 锁文件路径 resolve
+        //   抛 NPE → 被 StopHookPipeline catch(Exception) 吞成 log.warn ⇒ autoDream 合并**从不执行
+        //   且无用户可见失败**（违规则十二）。现解析型 storage（生产 AutoMemPaths）→ fail-loud，
+        //   生产唯一入口 = 5 参（StopHookPipeline 传会话线程解析的 memoryDir）。
+        java.nio.file.Path frozen = storage.frozenMemoryDir();
+        if (frozen == null) {
+            throw new IllegalStateException("[AutoDream] 4 参 consolidateIfNeeded 要求冻结 memoryDir"
+                + "（new MemoryStorage(Path) · 测试/直构）；生产必须走 5 参（StopHookPipeline 会话线程"
+                + "解析后直传）。绝不惰性现算：非会话线程无 ThreadLocal → 回落 config home → A′ null → "
+                + "ConsolidationLock(null).resolve NPE 被吞（审计 P2）");
+        }
+        consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, frozen);
     }
 
     /**
@@ -743,7 +755,8 @@ public class AutoDreamConsolidator {
 
             // 3. fork 直接写文件（autoDream.ts:224-233 · overrides.abortController + onMessage）
             ForkedAgentParams params = buildForkParams(prompt, dreamTaskId, abortController,
-                touchedPaths, forkRawMaterial, memoryDir);
+                touchedPaths, forkRawMaterial, memoryDir,
+                workspaceDir != null ? workspaceDir.toString() : null);   // [TL-W1 P1] projectRoot 直传
 
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null
@@ -883,7 +896,8 @@ public class AutoDreamConsolidator {
         List<String> touchedPaths = new ArrayList<>();
         try {
             ForkedAgentParams params = buildForkParams(prompt, null, abortController,
-                touchedPaths, forkRawMaterial, memoryDir());
+                touchedPaths, forkRawMaterial, memoryDir(),
+                workspaceDir != null ? workspaceDir.toString() : null);   // [TL-W1 P1] projectRoot 直传
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null
                 ? result.totalUsage() : ForkedAgentResult.ForkUsage.empty();
@@ -927,13 +941,18 @@ public class AutoDreamConsolidator {
      * @param forkRawMaterial fork 原料（主线程 systemPrompt 等 · forkedAgent.ts:131-141；null = 兜底）
      * @param memoryDir       本会话 auto-memory 目录（[A1 重做] 显式传入 —— doConsolidate 从
      *                        consolidateIfNeeded 5 参透传；doDream 内部现算 storage.memoryDir()）
+     * @param projectRoot     [TL-W1 P1] 会话绑定 projectRoot（= 调用方 workspaceDir，CC getOriginalCwd
+     *                        语义）· 随 fork 参数透传给 QueryLoopForkedQuery 构造 fork 隔离 ctx；
+     *                        fork 线程不再现算 ThreadLocal（runAsync 无 ThreadLocal → config home）。
+     *                        null → 不造字段（shared(null) 走 CwdResolution originalCwd 回落）
      * @return ForkedAgentParams（promptMessages + cacheSafeParams + canUseTool + 接线）
      */
     private ForkedAgentParams buildForkParams(String prompt, String dreamTaskId,
                                               AbortController abortController,
                                               List<String> touchedPaths,
                                               ForkRawMaterial forkRawMaterial,
-                                              Path memoryDir) {
+                                              Path memoryDir,
+                                              String projectRoot) {
         String memoryRoot = memoryDir.toString();
         List<ChatMessageDto> promptMessages = List.of(userMessage(prompt));
 
@@ -994,7 +1013,9 @@ public class AutoDreamConsolidator {
             /*skipTranscript*/ true,
             /*skipCacheWrite*/ false,
             abortController,
-            makeDreamProgressWatcher(dreamTaskId, touchedPaths));
+            makeDreamProgressWatcher(dreamTaskId, touchedPaths))
+            // [TL-W1 P1] 会话 projectRoot 直传（调用方 workspaceDir = boundProject，会话线程解析）
+            .withProjectRoot(projectRoot);
     }
 
     /**

@@ -921,7 +921,10 @@ public class ExecAgentHook {
                     continue;
                 }
                 String providerType = p.type() != null ? p.type().name() : "openai_compatible";
-                ProviderConfig cfg = new ProviderConfig(p.baseUrl(), rawKey);
+                // [provider-custom-headers 任务 6] 此处 p 是 **ProviderDto**（不是 Provider 实体），
+                //   ProviderDto.extraHeaders() 已经是 Map<String,String>（ProviderService.toProviderDto
+                //   内已过 deserializeHeaders），故**不再**调 deserializeHeaders（那会类型不符）。
+                ProviderConfig cfg = new ProviderConfig(p.baseUrl(), rawKey, p.extraHeaders());
                 // 工厂 2-arg 路由校验（对齐 HookRegistry.resolvePromptProvider 的
                 //   factory.getProvider(config, providerType) 模式）+ provider type 日志
                 LlmProvider routed = llmProviderFactory.getProvider(cfg, providerType);

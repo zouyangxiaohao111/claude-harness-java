@@ -9,6 +9,7 @@
  *   { type: 'toggle', name, label, hint? }
  *   { type: 'number', name, label, min?, max?, hint? }
  *   { type: 'locked', label, render: () => ReactNode }   // read-only display, no value tracked
+ *   { type: 'custom', name, label, hint?, render: (value: unknown, set) => ReactNode }  // 受控自定义控件
  *
  * Each section can either declare `fields` (1-per-row default) or `rows`
  * (FormField[][] for explicit side-by-side layout).
@@ -32,6 +33,10 @@ export type FormField =
   | { type: 'toggle'; name: string; label: string; hint?: string }
   | { type: 'number'; name: string; label: string; placeholder?: string; min?: number; max?: number; hint?: string; nullable?: boolean }
   | { type: 'locked'; label: string; render: () => ReactNode }
+  // 受控自定义控件：值仍走表单 state（name 键），渲染交给调用方 —— 供 KvEditor 这类复合控件使用。
+  // 刻意用 unknown 而非 any：调用方必须显式把 value 收窄成自己的类型，避免「忽略入参、自己拿外部
+  // state」那种写法静默通过编译 —— 值一旦不在表单 state 里，保存时 payload 就会静默丢字段。
+  | { type: 'custom'; name: string; label: string; hint?: string; render: (value: unknown, set: (v: unknown) => void) => ReactNode }
 
 export interface FormSection {
   title: string
@@ -247,6 +252,11 @@ function renderField(
           {field.render()}
         </>
       )
+    }
+    case 'custom': {
+      // 受控自定义控件：值存在表单 state 的 field.name 键下，渲染完全交给调用方。
+      // label/hint 由外层渲染（本类型不在 isFullRender 里），与普通字段观感一致。
+      return field.render(value, (v) => set(field.name, v))
     }
   }
 }

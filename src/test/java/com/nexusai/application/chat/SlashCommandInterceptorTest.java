@@ -154,7 +154,7 @@ class SlashCommandInterceptorTest {
         bundled.setPromptFn((args, ctx) -> List.of(
             new ContentBlockParam.TextBlockParam("Part one"),
             new ContentBlockParam.TextBlockParam("Part two " + args)));
-        registry.setWorkflowCommandProvider(() -> List.of(bundled));
+        registry.setWorkflowCommandProvider(cwd -> List.of(bundled));
 
         UserInputDispatcher dispatcher = new UserInputDispatcher();
 
@@ -180,7 +180,7 @@ class SlashCommandInterceptorTest {
         Command local = new Command();
         local.setName("localtest");
         local.setType("local");
-        registry.setWorkflowCommandProvider(() -> List.of(local));
+        registry.setWorkflowCommandProvider(cwd -> List.of(local));
 
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         dispatcher.registerSlashCommandResult("localtest",
@@ -205,7 +205,7 @@ class SlashCommandInterceptorTest {
         Command local = new Command();
         local.setName("skipcmd");
         local.setType("local");
-        registry.setWorkflowCommandProvider(() -> List.of(local));
+        registry.setWorkflowCommandProvider(cwd -> List.of(local));
 
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         dispatcher.registerSlashCommandResult("skipcmd", args -> UserInputDispatcher.LocalCommandResult.skip());
@@ -234,7 +234,7 @@ class SlashCommandInterceptorTest {
         internal.setName("internal");
         internal.setType("prompt");
         internal.setUserInvocable(false);
-        registry.setWorkflowCommandProvider(() -> List.of(internal));
+        registry.setWorkflowCommandProvider(cwd -> List.of(internal));
 
         UserInputDispatcher dispatcher = new UserInputDispatcher();
 

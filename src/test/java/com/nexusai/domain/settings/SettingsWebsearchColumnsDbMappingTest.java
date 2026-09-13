@@ -11,8 +11,14 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.sqlite.SQLiteDataSource;
 
+import javax.sql.DataSource;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.Statement;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -53,6 +59,15 @@ class SettingsWebsearchColumnsDbMappingTest {
 
     private static SettingsMapper mapper;
 
+    /**
+     * 同一份迁移后库的裸连接源（**只**用于 {@code PRAGMA table_info} 读列定义）。
+     *
+     * <p>为什么需要：{@code PRAGMA} 不是 DML，MyBatis-Flex 的 BaseMapper 无对应通道；
+     * 而「V72 列名真的存在」这件事必须在<b>真实 DDL 产物</b>上验（不是读 {@code SettingsRecord}
+     * 的字段名——那正是本仓出过两次错的 {@code webSearchUseSmallModel} 类问题的盲区）。
+     */
+    private static DataSource dataSource;
+
     @BeforeAll
     static void setUpDatabase() throws Exception {
         // 专属文件启动即删：保证迁移后 5 列初始为 null（历史残留列值会导致"初始 null"断言假失败）
@@ -62,6 +77,7 @@ class SettingsWebsearchColumnsDbMappingTest {
         Files.createDirectories(DB_PATH.getParent());
         SQLiteDataSource ds = new SQLiteDataSource();
         ds.setUrl("jdbc:sqlite:" + DB_PATH.toAbsolutePath());
+        dataSource = ds;
         // Flyway V1..V39 全量迁移（V1 建 settings + INSERT id=1；V37 ADD 4 个 WebSearch 列；V38 ADD websearch_base_url；V39 ADD websearch_domain_check_url）
         Flyway.configure()
             .dataSource(ds)
@@ -86,6 +102,10 @@ class SettingsWebsearchColumnsDbMappingTest {
             s.setWebsearchUseSmallModel(null);
             s.setWebsearchBaseUrl(null);
             s.setWebsearchDomainCheckUrl(null);
+            // [V72 provider-custom-headers] allow_dynamic_header_values 是 **NOT NULL DEFAULT 1** ——
+            //   恢复值只能是 true（写 null 会撞 NOT NULL 约束，且 V72 的语义就是「默认开」，
+            //   恢复成 true 与「全新建库后的初值」一致，对其它用例零影响）。
+            s.setAllowDynamicHeaderValues(Boolean.TRUE);
             mapper.update(s, false);
         }
     }
@@ -190,5 +210,73 @@ class SettingsWebsearchColumnsDbMappingTest {
         assertThat(reloaded.getApiKey()).isEqualTo("ddg-key");
         assertThat(reloaded.getProxy()).isEqualTo("127.0.0.1:7890");
         assertThat(reloaded.getWebsearchUseSmallModel()).isTrue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════
+    // [V72 provider-custom-headers] allow_dynamic_header_values ↔ allowDynamicHeaderValues
+    //
+    // 缺口来源：任务 5 给 SettingsRecord 加了 allowDynamicHeaderValues 字段 + V72 加了列，但**当时
+    // 没有任何自动化测试**验证这个 camelCase ↔ snake_case 映射真的对得上。本仓有同类前科
+    // （websearchUseSmallModel 因大小写不匹配出过两次问题，见本类顶部 JavaDoc），而这条映射一旦错位，
+    // 症状是「前端开关点了等于没点」—— 不报错、不抛异常，只是 ${session_id} 永远落兜底常量。
+    // 故在此补两条：① 列真的存在（读真实 DDL 产物，不是读字段名）② 读写往返一致。
+    // ════════════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("V72 迁移后 settings 的列集合含 allow_dynamic_header_values，且 NOT NULL DEFAULT 1（默认开）")
+    void v72Migration_addsAllowDynamicHeaderValuesColumn() throws Exception {
+        Set<String> columns = new HashSet<>();
+        boolean found = false;
+        try (Connection c = dataSource.getConnection();
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(settings)")) {
+            while (rs.next()) {
+                String name = rs.getString("name");
+                columns.add(name);
+                if ("allow_dynamic_header_values".equals(name)) {
+                    found = true;
+                    // D6「默认开」必须在 DDL 层成立：NOT NULL + DEFAULT 1。
+                    //   若有人把 DEFAULT 去掉或改成 0，存量行/新库的语义会静默反转（gate 默认关）。
+                    assertThat(rs.getInt("notnull"))
+                        .as("V72 列必须 NOT NULL（settings 是 singleton，允许 NULL 会让读侧多一种未定义态）")
+                        .isEqualTo(1);
+                    assertThat(rs.getString("dflt_value"))
+                        .as("V72 列默认值必须是 1（用户决策 D6：默认开）")
+                        .isEqualTo("1");
+                }
+            }
+        }
+        // 前置自证（fail loud · 规则十二）：pragma 确实读到了 settings 的列（查询本身有效）。
+        assertThat(columns).as("PRAGMA table_info(settings) 应返回真实列集合，而非空集").isNotEmpty();
+        assertThat(found)
+            .as("settings 列集合必须含 allow_dynamic_header_values（V72）；实际列集合=" + columns)
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("allowDynamicHeaderValues 写入 false 读回 false（初值 true = V72 DEFAULT 1）· 映射错位即硬失败")
+    void updateThenSelect_roundTripsAllowDynamicHeaderValues() {
+        // WHY（规则九）：字段名若映射到不存在的列（如 allow_dynamic_header_value 少了复数 s），
+        //   MyBatis-Flex 的 update/select 会直接抛错或读到错误列 —— 本用例把它变成硬失败，
+        //   而不是「开关点了没反应」这种无异常、无日志的静默失效。
+        SettingsRecord fresh = mapper.selectOneById(1);
+        assertThat(fresh).isNotNull();
+        assertThat(fresh.getAllowDynamicHeaderValues())
+            .as("全新建库后应为 true（V72 NOT NULL DEFAULT 1 · D6 默认开）")
+            .isTrue();
+
+        fresh.setAllowDynamicHeaderValues(false);
+        mapper.update(fresh);
+        assertThat(mapper.selectOneById(1).getAllowDynamicHeaderValues())
+            .as("写入 false 必须读回 false（Boolean→INTEGER 0/1 往返）")
+            .isFalse();
+
+        // 再写回 true：排除「列恒为 0 / 读侧恒 false」这类假绿（只测单向的话，硬编码 false 也能过）。
+        SettingsRecord back = mapper.selectOneById(1);
+        back.setAllowDynamicHeaderValues(true);
+        mapper.update(back);
+        assertThat(mapper.selectOneById(1).getAllowDynamicHeaderValues())
+            .as("写回 true 必须读回 true（证明往返的两端都真的接了列）")
+            .isTrue();
     }
 }

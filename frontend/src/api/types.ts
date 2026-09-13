@@ -433,6 +433,11 @@ export interface AppSettings {
   /** 工具延迟加载公告方式（settings.deferred_tools_delta_enabled · null/未配置 = 默认关闭）：
    *  开 = 只公告变化的工具清单（增量附件，省 token）；关 = 每轮在消息队首发送完整清单。 */
   deferredToolsDeltaEnabled?: boolean | null
+  // V72 契约（2026-09-12 provider-custom-headers D6）：提供商自定义请求头的运行时占位符总开关
+  /** 按会话展开请求头占位符（settings.allow_dynamic_header_values · 后端列 NOT NULL DEFAULT 1，
+   *  即默认**开**）：开 = 值里的会话 ID 占位符替换成当前会话 ID；关 = 统一发固定值 nexusai-static。
+   *  null/undefined = 未见该字段（后端 DTO 尚未透出时即为该态），前端按默认开处理。 */
+  allowDynamicHeaderValues?: boolean | null
 }
 
 /** PUT /api/v1/settings 部分更新请求 · 后端 merge 策略：仅覆盖非 null 字段 */

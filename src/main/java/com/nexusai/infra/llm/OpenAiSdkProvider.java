@@ -243,7 +243,12 @@ public class OpenAiSdkProvider implements LlmProvider {
             return;
         }
         try {
-            OpenAIClient client = buildClient(config);
+            // [provider-custom-headers 任务 7] 主链 sessionId 来源 = history（DB 真值，必中）。
+            //   ⚠️ 刻意**不**在此处兜底 MDC（RequestContext.sessionId）；MDC 可能是残留的别会话 id，
+            //   详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
+            //   （护栏按**字面量**判，故连注释里都不留该调用形态 —— 它正是被照抄的来源。）
+            String sessionId = SessionIdResolver.resolve(history, null);
+            OpenAIClient client = buildClient(config, sessionId);
             // [DEC-04] 流式请求开启 stream_options.include_usage=true → final chunk 携带 usage
             // （OpenAI streaming 默认不返回 usage；对齐 CC Anthropic 流式 always-on usage）
             ChatCompletionCreateParams params = buildRequestParams(
@@ -351,7 +356,11 @@ public class OpenAiSdkProvider implements LlmProvider {
                 "OpenAiSdkProvider.chatWithRaw 调用时 ProviderConfig 不可用");
         }
         try {
-            OpenAIClient client = buildClient(config);
+            // [provider-custom-headers 任务 7] chatWithRaw **既没有 history 也没有 options**
+            //   （自造历史里 sessionId 恒 null）→ resolve(null, null) 恒 null → 占位符落兜底常量。
+            //   ⚠️ 不要为了"好看"去翻 MDC —— 见 SessionIdResolver 类 javadoc。
+            String sessionId = SessionIdResolver.resolve(null, null);
+            OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt,
                 userMessage == null ? List.of() : List.of(newUserMessage(userMessage)),
@@ -423,7 +432,12 @@ public class OpenAiSdkProvider implements LlmProvider {
             // [W2-3] maxTokens 未显式传入 → DB models.max_tokens 默认（前端可配，DB 未命中回落模型缺省）
             maxTokens = resolveDefaultMaxTokens(modelName, maxTokens);
 
-            OpenAIClient client = buildClient(config);
+            // [provider-custom-headers 任务 7] chatWithOptions 系列：签名里没有 history 形参，
+            //   ② 级来源 = options.history()（第 ① 级结构上不可达）。options 为 null → null → 落常量。
+            //   ⚠️ 不读 MDC（见 SessionIdResolver 类 javadoc）。
+            String sessionId = SessionIdResolver.resolve(null,
+                options != null ? options.history() : null);
+            OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
                 outputFormatSchema, thinkingDisabled, temperature, null, maxTokens);
@@ -485,7 +499,12 @@ public class OpenAiSdkProvider implements LlmProvider {
             // [W2-3] maxTokens 未显式传入 → DB models.max_tokens 默认（前端可配，DB 未命中回落模型缺省）
             maxTokens = resolveDefaultMaxTokens(modelName, maxTokens);
 
-            OpenAIClient client = buildClient(config);
+            // [provider-custom-headers 任务 7] chatWithOptions 系列：签名里没有 history 形参，
+            //   ② 级来源 = options.history()（第 ① 级结构上不可达）。options 为 null → null → 落常量。
+            //   ⚠️ 不读 MDC（见 SessionIdResolver 类 javadoc）。
+            String sessionId = SessionIdResolver.resolve(null,
+                options != null ? options.history() : null);
+            OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
                 outputFormatSchema, thinkingDisabled, temperature, null, maxTokens);
@@ -593,12 +612,33 @@ public class OpenAiSdkProvider implements LlmProvider {
     // ════════════════════════════════════════════════════════════════════
 
     /**
+     * 单参重载：会话上下文缺失时用（OpenAI 侧目前无外部调用点，保留作降级安全网）。
+     *
+     * <p>仍会带上 {@code extraHeaders}（占位符落兜底常量）——<b>有意的降级安全网</b>：
+     * 即便某调用点漏接 sessionId，自定义 header 也不会整体丢失。但 4 个真实调用点必须逐个显式
+     * 传入解析出的 sessionId（见 {@link #buildClient(ProviderConfig, String)}），否则主链白白丢失缓存亲和。
+     */
+    static OpenAIClient buildClient(ProviderConfig config) {
+        return buildClient(config, null);
+    }
+
+    /**
      * 构建 OpenAI SDK client · 对齐 CC {@code maxRetries: 0}（claude.ts:1781，
      * "Disabled auto-retry in favor of manual implementation"）+ Anthropic 先例。
      *
      * <p>每次请求按 {@link ProviderConfig} 构建（与 AnthropicSdkProvider 先例同构）。
+     *
+     * <p>[provider-custom-headers 任务 7] 按 provider 的 {@code extraHeaders} 注入自定义请求头 ——
+     * 展开/敏感头过滤统一走 {@link ProviderHeaderInjector}（与 AnthropicSdkProvider 共用同一判据，
+     * 不是两套；本仓有「同一能力两套判据」的 R7 前科）。
+     * 加在 {@code .apiKey()} 之后只是可读性顺序：D5 已在写侧禁止撞名凭据头，顺序无安全语义
+     * （T2 实测 {@code putHeader} 恒胜过 {@code .apiKey()}，且与调用顺序无关）。
+     *
+     * @param config    运行时配置（apiKey + 可选 baseUrl + extraHeaders）
+     * @param sessionId 本次请求的会话 ID（见 {@link SessionIdResolver}）；
+     *                  null → 占位符落 {@link DynamicHeaderExpander#STATIC_FALLBACK}
      */
-    static OpenAIClient buildClient(ProviderConfig config) {
+    static OpenAIClient buildClient(ProviderConfig config, String sessionId) {
         OpenAIOkHttpClient.Builder builder = OpenAIOkHttpClient.builder()
             .apiKey(config.apiKey())
             // [CC claude.ts:1781] Disabled auto-retry in favor of manual implementation
@@ -606,6 +646,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
             builder.baseUrl(normalizeBaseUrl(config.baseUrl()));
         }
+        ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();
     }
 

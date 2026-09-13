@@ -213,15 +213,33 @@ public class AnthropicSdkProvider implements LlmProvider {
     // ════════════════════════════════════════════════════════════════════
 
     /**
+     * 单参重载：会话上下文缺失时用（现存唯一外部调用点 = {@code AnthropicSdkProviderTest:40}）。
+     *
+     * <p>仍会带上 {@code extraHeaders}（占位符落兜底常量）——<b>有意的降级安全网</b>：
+     * 即便某调用点漏接 sessionId，自定义 header 也不会整体丢失。但 5 个真实调用点必须逐个显式
+     * 传入解析出的 sessionId（见 {@link #buildClient(ProviderConfig, String)}），否则主链白白丢失缓存亲和。
+     */
+    static AnthropicClient buildClient(ProviderConfig config) {
+        return buildClient(config, null);
+    }
+
+    /**
      * 构建 Anthropic SDK client · 对齐 CC {@code maxRetries: 0}（claude.ts:1781，
      * "Disabled auto-retry in favor of manual implementation"）。
      *
      * <p>每次请求按 {@link ProviderConfig} 构建（与 OpenAiSdkProvider 先例同构）；SDK
      * 内部 okhttp，baseUrl 非空时覆盖（默认 https://api.anthropic.com）。
      *
-     * @param config 解密后的运行时配置（apiKey + 可选 baseUrl）
+     * <p>[provider-custom-headers 任务 6] 按 provider 的 {@code extraHeaders} 注入自定义请求头 ——
+     * 展开/敏感头过滤统一走 {@link ProviderHeaderInjector}（两个 provider 共用同一判据，不是两套）。
+     * 加在 {@code .apiKey()} 之后只是可读性顺序：D5 已在写侧禁止撞名凭据头，顺序无安全语义
+     * （T2 实测 {@code putHeader} 恒胜过 {@code .apiKey()}，且与调用顺序无关）。
+     *
+     * @param config    运行时配置（apiKey + 可选 baseUrl + extraHeaders）
+     * @param sessionId 本次请求的会话 ID（见 {@link SessionIdResolver}）；
+     *                  null → 占位符落 {@link DynamicHeaderExpander#STATIC_FALLBACK}
      */
-    static AnthropicClient buildClient(ProviderConfig config) {
+    static AnthropicClient buildClient(ProviderConfig config, String sessionId) {
         AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder()
             .apiKey(config.apiKey())
             // [CC claude.ts:1781] Disabled auto-retry in favor of manual implementation
@@ -229,6 +247,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
             builder.baseUrl(normalizeBaseUrl(config.baseUrl()));
         }
+        ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();
     }
 
@@ -322,7 +341,12 @@ public class AnthropicSdkProvider implements LlmProvider {
         long streamStartMs = System.currentTimeMillis(); // [A-13] per-LLM-call durationMs 起点 · CC logging.ts start
 
         try {
-            AnthropicClient client = buildClient(config);
+            // [provider-custom-headers 任务 6] 主链 sessionId 来源 = history（DB 真值，必中）。
+            //   ⚠️ 刻意**不**在此处兜底 MDC（RequestContext.sessionId）；MDC 可能是残留的别会话 id，
+            //   详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
+            //   （护栏按**字面量**判，故连注释里都不留该调用形态 —— 它正是被照抄的来源。）
+            String sessionId = SessionIdResolver.resolve(history, null);
+            AnthropicClient client = buildClient(config, sessionId);
             // [C] skipCacheWrite 透传（原硬编码 null → 流式路径 marker 移位永不触发）·
             //   CC claude.ts:3224/:3243 markerIndex = skipCacheWrite ? len-2 : len-1
             MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
@@ -639,7 +663,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                                               Integer maxOutputTokensOverride, TaskBudgetParam taskBudget,
                                               String effortValue, long startMs,
                                               Boolean skipCacheWrite) {
-        AnthropicClient client = buildClient(config);
+        // [provider-custom-headers 任务 6] 流式失败回退路径同样解析 sessionId（history 是形参，必中）
+        //   —— 不接则回退链的自定义 header 占位符只能落常量，与流式链语义不一致。
+        String sessionId = SessionIdResolver.resolve(history, null);
+        AnthropicClient client = buildClient(config, sessionId);
         // [C] 流式失败回退路径同样透传 skipCacheWrite（原硬编码 null）——回退链与流式链 marker 语义一致
         MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, null, skipCacheWrite, null,
@@ -931,7 +958,11 @@ public class AnthropicSdkProvider implements LlmProvider {
         }
         long chatStartMs = System.currentTimeMillis(); // [A-13] per-LLM-call durationMs 起点
         try {
-            AnthropicClient client = buildClient(config);
+            // [provider-custom-headers 任务 6] chatWithRaw **既没有 history 也没有 options**
+            //   （自造历史里 sessionId 恒 null）→ resolve(null, null) 恒 null → 占位符落兜底常量。
+            //   ⚠️ 不要为了"好看"去翻 MDC —— 见 SessionIdResolver 类 javadoc。
+            String sessionId = SessionIdResolver.resolve(null, null);
+            AnthropicClient client = buildClient(config, sessionId);
             MessageCreateParams params = buildMessageParams(modelName, toSingleOrgBlock(systemPrompt),
                 userMessage == null ? List.of() : List.of(
                     new ChatMessageDto(null, null, Role.user, null, userMessage,
@@ -1036,7 +1067,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                 options != null ? options.outputFormat() : null;
             Boolean skipCacheWrite = options != null ? options.skipCacheWrite() : null;
 
-            AnthropicClient client = buildClient(config);
+            // [provider-custom-headers 任务 6] chatWithOptions 系列：签名里没有 history 形参，
+            //   ② 级来源 = options.history()（第 ① 级结构上不可达）。options 为 null → null → 落常量。
+            //   ⚠️ 不读 MDC（见 SessionIdResolver 类 javadoc）。
+            String sessionId = SessionIdResolver.resolve(null,
+                options != null ? options.history() : null);
+            AnthropicClient client = buildClient(config, sessionId);
             MessageCreateParams params = buildMessageParams(modelName, toSingleOrgBlock(systemPrompt), history, tools,
                 maxTokens, null, null, outputFormat, skipCacheWrite,
                 options != null ? options.enablePromptCaching() : null,
@@ -1172,7 +1208,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                 options != null ? options.outputFormat() : null;
             Boolean skipCacheWrite = options != null ? options.skipCacheWrite() : null;
 
-            AnthropicClient client = buildClient(config);
+            // [provider-custom-headers 任务 6] chatWithOptions 系列：签名里没有 history 形参，
+            //   ② 级来源 = options.history()（第 ① 级结构上不可达）。options 为 null → null → 落常量。
+            //   ⚠️ 不读 MDC（见 SessionIdResolver 类 javadoc）。
+            String sessionId = SessionIdResolver.resolve(null,
+                options != null ? options.history() : null);
+            AnthropicClient client = buildClient(config, sessionId);
             MessageCreateParams params = buildMessageParams(modelName, toSingleOrgBlock(systemPrompt), history, tools,
                 maxTokens, null, null, outputFormat, skipCacheWrite,
                 options != null ? options.enablePromptCaching() : null,
@@ -2746,7 +2787,13 @@ public class AnthropicSdkProvider implements LlmProvider {
     // ════════════════════════════════════════════════════════════════════
 
     private static void consumePostCompactionAtApiSuccess(List<ChatMessageDto> history) {
-        String sessionId = resolveSessionId(history);
+        // 原私有 resolveSessionId 已提升为共享判据 SessionIdResolver.fromHistory（provider 自定义
+        // header 的 ${session_id} 展开与这里同为「history 取第一条非空 sessionId」，
+        // 本仓有「同一能力两套判据」的 R7 前科，故收敛到单点）。行为逐字等价。
+        //
+        // ⚠️ 注意：下方 RequestContext.sessionId() 兜底属 consumePostCompaction 链路（本仓既有语义），
+        // 与 header 展开链路无关 —— SessionIdResolver 刻意不读 MDC（规范 §6.3），两条链路不复用兜底。
+        String sessionId = SessionIdResolver.fromHistory(history);
         if (sessionId == null) {
             sessionId = RequestContext.sessionId();
         }
@@ -2758,17 +2805,6 @@ public class AnthropicSdkProvider implements LlmProvider {
                     sessionId);
             }
         }
-    }
-
-    private static String resolveSessionId(List<ChatMessageDto> history) {
-        if (history != null) {
-            for (ChatMessageDto m : history) {
-                if (m != null && m.sessionId() != null && !m.sessionId().isBlank()) {
-                    return m.sessionId();
-                }
-            }
-        }
-        return null;
     }
 
     private com.nexusai.application.agent.lsp.PromptCacheBreakDetection promptCacheBreakDetector() {

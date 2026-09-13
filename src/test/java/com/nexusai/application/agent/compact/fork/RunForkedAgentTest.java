@@ -1,6 +1,8 @@
 package com.nexusai.application.agent.compact.fork;
 
 import com.nexusai.application.agent.QuerySource;
+import com.nexusai.application.agent.loop.AgentLoopContext;
+import com.nexusai.application.agent.loop.AgentLoopContextFactory;
 import com.nexusai.application.agent.compact.CompactConstants;
 import com.nexusai.application.agent.compact.StreamCompactSummary;
 import com.nexusai.application.agent.permission.PermissionMode;
@@ -297,6 +299,39 @@ class RunForkedAgentTest {
         assertThat(background.querySource()).isEqualTo(QuerySource.EXTRACT_MEMORIES);
     }
 
+    @Test
+    @DisplayName("[TL-W1 P1] ForkedAgentParams.projectRoot 直传到 query seam —— fork 线程零 ThreadLocal 读")
+    void forkParams_carriesSessionProjectRootToQuerySeam() {
+        // WHY（规则九 · 验证意图）: 后台 fork 跑在 CompletableFuture.runAsync（ForkJoinPool worker）
+        // 上，plain ThreadLocal 不继承 ⇒ fork 内现算 AutoMemPaths.currentSessionProjectRoot() 会
+        // **静默回落** ~/.nexusai（config home），AgentLoopContextFactory.freshSession 把它当项目根
+        // ⇒ fork 的 loop ctx.workspaceDir 错（skill/memory/transcript 归属全错，且无任何报错）。
+        // 故会话线程解析出的 projectRoot **必须**经参数直传到 query seam（QueryLoopForkedQuery 用它
+        // 构造隔离 ctx）。本测试钉住该直传契约：未传 → null（不伪造），传了 → 逐字节透传。
+        CacheSafeParams cs = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), baseContext(),
+            List.of(userMessage("f1", "ctx1")));
+        ForkedAgentParams params = new ForkedAgentParams(
+            List.of(userMessage("sr", "prompt")), cs, RunForkedAgent.createCompactCanUseTool(),
+            QuerySource.EXTRACT_MEMORIES, "extract_memories", null, 5,
+            /*skipTranscript*/ true, /*skipCacheWrite*/ false, new AbortController(), null);
+        // 未接线（compact/session-memory 链现状）→ null（fork 端不造字段，走 originalCwd 回落）
+        assertThat(params.projectRoot()).isNull();
+        assertThat(params.withProjectRoot(null).projectRoot()).isNull();
+
+        RecordingQuery query = new RecordingQuery();
+        RunForkedAgent.run(params.withProjectRoot("C:/proj/demo"), query);
+        assertThat(query.lastParams().projectRoot())
+            .as("会话线程解析的 projectRoot 必须随 fork 参数直达到 query seam")
+            .isEqualTo("C:/proj/demo");
+
+        // withProjectRoot 不改动其余字段（逐字节等价）
+        ForkedAgentParams p2 = params.withProjectRoot("C:/proj/demo");
+        assertThat(p2.cacheSafeParams()).isSameAs(params.cacheSafeParams());
+        assertThat(p2.querySource()).isEqualTo(params.querySource());
+        assertThat(p2.maxTurns()).isEqualTo(params.maxTurns());
+        assertThat(p2.skipTranscript()).isEqualTo(params.skipTranscript());
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // RES-R4-2 · 通用 fork boundary 剥离数组语义（对齐 CC systemPrompt 数组贯穿）
     // ════════════════════════════════════════════════════════════════════
@@ -571,6 +606,47 @@ class RunForkedAgentTest {
             List.of(userMessage("sr", "fork prompt")), List.of("sys"), Map.of(), Map.of(),
             canUseTool, ctx, QuerySource.EXTRACT_MEMORIES, null, maxTurns, skipCacheWrite,
             /*useGlobalCacheScope*/ false, /*onMessage*/ null);
+    }
+
+    @Test
+    @DisplayName("[TL-W1 P1] QueryLoopForkedQuery 用 param.projectRoot 造隔离 ctx（fork 线程零 ThreadLocal 读）")
+    void queryLoopForkedQuery_usesExplicitProjectRootForForkCtx() {
+        // WHY（规则九）：fork 线程（ForkJoinPool worker）无 ThreadLocal ⇒ 若在 fork 内现算
+        // AutoMemPaths.currentSessionProjectRoot()，会静默回落 config home 并**被当作项目根**写进
+        // fork 的 AgentLoopContext（下游按「无有效项目」或错误目录派生，无任何报错）。本测试钉住
+        // 「ctx 的 projectRoot 只能来自入参」：显式传 P → 传 P；未传 → 传 null（绝不伪造 config home）。
+        AgentLoopContextFactory factory = org.mockito.Mockito.mock(AgentLoopContextFactory.class);
+        AgentLoopContext stubCtx = org.mockito.Mockito.mock(AgentLoopContext.class);
+        java.util.concurrent.atomic.AtomicReference<String> seenProjectRoot =
+            new java.util.concurrent.atomic.AtomicReference<>("UNSET");
+        org.mockito.Mockito.when(factory.shared(org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> { seenProjectRoot.set(inv.getArgument(0)); return stubCtx; });
+        QueryLoopForkedQuery q = new QueryLoopForkedQuery(null, () -> null, () -> null, factory);
+
+        try {
+            q.run(forkParamsWithProjectRoot("C:/proj/demo"));
+        } catch (Throwable ignored) {
+            // stub ctx 的下游（LlmAgentLoop.queryLoop）必然失败 —— 本测试只观测 ctx 构造入参
+        }
+        assertThat(seenProjectRoot.get())
+            .as("fork ctx 的 projectRoot 必须来自 param.projectRoot（会话线程解析值）")
+            .isEqualTo("C:/proj/demo");
+
+        try {
+            q.run(forkParamsWithProjectRoot(null));
+        } catch (Throwable ignored) {
+        }
+        assertThat(seenProjectRoot.get())
+            .as("未提供 projectRoot → 传 null（绝不回落 config home 冒充项目根）")
+            .isNull();
+    }
+
+    /** [TL-W1 P1] 带显式 projectRoot 的 ForkQueryParams。 */
+    private static RunForkedAgent.ForkQueryParams forkParamsWithProjectRoot(String projectRoot) {
+        return new RunForkedAgent.ForkQueryParams(
+            List.of(userMessage("sr", "fork prompt")), List.of("sys"), Map.of(), Map.of(),
+            allowAll(), forkCtxWith(), QuerySource.EXTRACT_MEMORIES, null, 1, false,
+            /*useGlobalCacheScope*/ false, /*onMessage*/ null, projectRoot);
     }
 
     /** 放行任意工具的 canUseTool。 */

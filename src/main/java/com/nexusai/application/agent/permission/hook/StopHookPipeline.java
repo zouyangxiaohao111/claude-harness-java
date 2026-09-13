@@ -334,7 +334,21 @@ public final class StopHookPipeline {
                     if (dreamMemDir != null) {
                         dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, dreamMemDir);
                     } else {
-                        dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial);
+                        // [TL-W1 P2] 旧实现委托 4 参重载 → AutoDreamConsolidator.memoryDir() →
+                        //   storage.memoryDir() → AutoMemPaths.getAutoMemPath()（无参，读会话
+                        //   ThreadLocal）→ **本线程是 ForkJoinPool worker（ThreadLocal 空）** →
+                        //   回落 config home → A′ 判无效返回 null → new ConsolidationLock(null)
+                        //   → ConsolidationLock:57 memoryDir.resolve(...) 抛 NPE → 被下方
+                        //   catch(Exception) 吞成一条 log.warn ⇒ autoDream 合并**从不执行且无用户
+                        //   可见失败**（违规则十二 fail-loud）。
+                        //   修法（对齐用户定案「会话态一律直传，绝不读 ThreadLocal」）：显式跳过 +
+                        //   warn（memoryDir == null = 上游「无有效 per-project auto-memory 目录」，
+                        //   LlmAgentLoop A′ 分支合法传 null，故不抛异常 —— 但绝不静默回落现算）。
+                        log.warn("[StopHookPipeline] autoDream 跳过：memoryDir 为空（会话线程未解析到有效 "
+                            + "per-project auto-memory 目录 · 上游 A′ 或调用方未传）—— 不回落现算重载"
+                            + "（fork 线程无 ThreadLocal，回落 config home 会在 ConsolidationLock 抛 NPE 被吞，"
+                            + "旧实现即如此静默永不合并）。sessionId={} workspaceDir={}",
+                            sessionId, workspaceDir);
                     }
                 } catch (Exception e) {
                     log.warn("LlmAgentLoop autoDream failed: {}", e.getMessage());

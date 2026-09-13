@@ -91,6 +91,25 @@ public class SettingsService {
         }
     }
 
+    /**
+     * [provider-custom-headers D6] 装配 settings.allow_dynamic_header_values 实时 DB 读源到
+     * {@link ProviderHeaderInjector}（全局开关，前端「设置 · 高级」改完下一个请求即生效）。
+     *
+     * <p><b>位置照抄</b>上一方法 {@link #bridgeAgentSwarmsSettingsSource}（同为「static 代码要读
+     * DB settings」的既有范式）：安装点在 @PostConstruct，读源是本类自己的
+     * {@link #readDbAllowDynamicHeaderValues()}。
+     *
+     * <p>POJO 单测不触发 Spring → 读源不安装 → {@code ProviderHeaderInjector.gateEnabled()} 回落
+     * 默认 true（V72 列默认值，D6 默认开，零行为变化）。
+     */
+    @PostConstruct
+    void bridgeAllowDynamicHeaderValuesSource() {
+        com.nexusai.infra.llm.ProviderHeaderInjector.installGateSource(this::readDbAllowDynamicHeaderValues);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] allowDynamicHeaderValues 实时 DB 读源注入完成（全局配置，换会话无需 get/update 即生效）");
+        }
+    }
+
     public SettingsDto get() {
         SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
         if (s == null) throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
@@ -222,6 +241,13 @@ public class SettingsService {
         //   plugin_claude_fallback 列（原 yml nexusai.feature.plugin-claude-fallback 迁移 DB）。
         if (req.enabledPlugins() != null) s.setEnabledPlugins(toJson(req.enabledPlugins()));
         if (req.pluginClaudeFallback() != null) s.setPluginClaudeFallback(req.pluginClaudeFallback());
+        // [V72 provider-custom-headers D6 · 2026-09-13 补] allowDynamicHeaderValues merge
+        //   （null = 不覆盖，对齐既有 merge 的 PATCH 语义；V72 列 allow_dynamic_header_values，
+        //   前端「设置 · 高级」可配。消费点：ProviderHeaderInjector.gateEnabled 经
+        //   SettingsService.readDbAllowDynamicHeaderValues 实时读 —— 写库即生效，无需重启）。
+        //   ⚠️ 缺这一分支 = PUT 的新值被静默丢弃（Spring Boot 默认 FAIL_ON_UNKNOWN_PROPERTIES=false，
+        //   前端传了也不报错）——「点了等于没点」的另一半。
+        if (req.allowDynamicHeaderValues() != null) s.setAllowDynamicHeaderValues(req.allowDynamicHeaderValues());
 
         // [IMP-MV2-16 + V56] auto-memory/auto-dream 开关写链：
         //   autoMemoryEnabled → DB 列（V34 auto_memory_enabled）+ settings.json 双写（[C-05] DB 为主，
@@ -281,6 +307,49 @@ public class SettingsService {
                 log.warn("[SettingsService] 实时读 settings.agentSwarmsEnabled 失败，回落 null（不覆盖 CC 原判定链）: {}", e.toString());
             }
             return null;
+        }
+    }
+
+    /**
+     * [provider-custom-headers D6] {@code allow_dynamic_header_values} 实时读源
+     * （与 {@link #readDbAgentSwarmsEnabled} 同款：<b>不缓存</b>，前端 PUT 后下一轮即生效）。
+     *
+     * <p>被 {@code DynamicHeaderExpander.expand(..., gateEnabled)} 的 gate 消费：true → 值里的
+     * {@code ${session_id}} 按请求展开为真会话 ID；false → 落兜底常量
+     * {@link com.nexusai.infra.llm.DynamicHeaderExpander#STATIC_FALLBACK}（不丢弃该 header）。
+     *
+     * <p><b>默认开（D6）</b>：行缺失、列 NULL 都视为 <b>true</b> —— provider 表单里配完占位符
+     * 即刻生效，无需再进设置。gate-off 在本仓只可能是用户主动关闭。
+     *
+     * <p><b>异常也回落 true（fail-open）</b>：读不到配置时按默认值走，不让一次 DB 抖动把本该
+     * 展开的亲和 header 静默改成常量（规则十二：默认值即语义，异常不得反转它）。
+     * 这一点与 {@code readDbAgentSwarmsEnabled} 回落 null 的形状不同 —— 那边 null 是
+     * 「不覆盖 CC 原判定链」的有效值，这边没有覆盖链，gate 只能是布尔。
+     *
+     * <p><b>已接线</b>：读源由本类 {@code @PostConstruct}
+     * {@link #bridgeAllowDynamicHeaderValuesSource()} 安装到
+     * {@link com.nexusai.infra.llm.ProviderHeaderInjector} 的 {@code installGateSource(...)}
+     * （本仓「static 代码要读 DB settings」的既有范式）。消费链：
+     * {@code ProviderHeaderInjector.apply(...)} 内调 {@code gateEnabled()} 读本方法，而 {@code apply}
+     * 由 {@code AnthropicSdkProvider.buildClient} / {@code OpenAiSdkProvider.buildClient} 调用 ——
+     * 即 buildClient 路径上每请求实时读（该 provider 未配 extraHeaders 时 {@code apply} 空值早返回，
+     * 不会读到 gate）。不缓存 —— 与 {@link #readDbAgentSwarmsEnabled} 同款，前端 PUT 后下一轮即生效。
+     *
+     * @return true = 按会话展开占位符（默认）；false = 用户显式关闭
+     */
+    public boolean readDbAllowDynamicHeaderValues() {
+        try {
+            SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+            // 行缺失 / 列 NULL → 默认开（D6）。注意顺序：先判 null 再拆箱，避免 NPE。
+            if (s == null || s.getAllowDynamicHeaderValues() == null) {
+                return true;
+            }
+            return s.getAllowDynamicHeaderValues();
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[SettingsService] 实时读 settings.allowDynamicHeaderValues 失败，回落默认 true（默认开，不因读失败而关闭）: {}", e.toString());
+            }
+            return true;
         }
     }
 
@@ -389,7 +458,11 @@ public class SettingsService {
             parseEnabledPlugins(s.getEnabledPlugins()),
             // [V61] pluginClaudeFallback DB 列透出（V61 列 plugin_claude_fallback；
             //   null = 未配置 → 插件双读回落默认 true，原 yml nexusai.feature.plugin-claude-fallback:true）
-            s.getPluginClaudeFallback()
+            s.getPluginClaudeFallback(),
+            // [V72 provider-custom-headers D6 · 2026-09-13 补] allowDynamicHeaderValues DB 列透出
+            //   （V72 列 allow_dynamic_header_values；null = 未配置 → 默认开）。
+            //   不透出这一行，前端开关会**恒显示默认开**（GET 拿不到真实值）——「点了等于没点」的一半。
+            s.getAllowDynamicHeaderValues()
         );
     }
 

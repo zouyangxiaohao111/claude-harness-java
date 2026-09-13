@@ -209,7 +209,26 @@ public class CommandController {
     @GetMapping
     public List<CommandDto> list(
         @RequestParam(value = "reload", defaultValue = "false") boolean reload,
-        @RequestHeader(value = "X-Client-Env", required = false) String clientEnvHeader) {
+        @RequestHeader(value = "X-Client-Env", required = false) String clientEnvHeader,
+        @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
+        // [TL-W1 P4] 可选 sessionId → 注入 RequestContext（MDC），使 SkillRegistry 的 cwdSupplier
+        //   （SessionProjectRoot.getForSession(RequestContext.sessionId())）在 REST 线程上解析出会话
+        //   绑定项目 ⇒ 扫到该项目的 project 级技能 + workflow 命令（旧接线读 ThreadLocal，REST 线程
+        //   必空 → 回落 config home → 前端列表缺绑定项目的条目）。
+        //   不传 sessionId → 保持旧行为。同款先例：本类 executeBuiltin 的 ?sessionId= 包装。
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            return listInternal(reload, clientEnvHeader);
+        }
+        com.nexusai.common.RequestContext.setSession(sessionIdParam);
+        try {
+            return listInternal(reload, clientEnvHeader);
+        } finally {
+            com.nexusai.common.RequestContext.clear(); // 防 Tomcat 线程复用残留（REST 入口无 Filter 写 MDC）
+        }
+    }
+
+    /** {@link #list(boolean, String, String)} 主体 · 会话上下文已在包装层注入。 */
+    private List<CommandDto> listInternal(boolean reload, String clientEnvHeader) {
         if (reload) commandService.rescanFromFilesystem();
         ClientEnv clientEnv = ClientEnv.fromHeader(clientEnvHeader);
         List<Command> domain = mergedSkillCommands();

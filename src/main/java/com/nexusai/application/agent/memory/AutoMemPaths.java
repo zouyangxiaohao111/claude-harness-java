@@ -162,6 +162,23 @@ public final class AutoMemPaths {
     private final Supplier<String> settingsDirSupplier;
 
     /**
+     * [TL-W1 P3] 显式 projectRoot 贯穿的 settings 读取器（{@code explicitRoot → autoMemoryDirectory}）。
+     *
+     * <p><b>WHY</b>：{@link #getAutoMemPath(String)} / {@link #getAutoMemBase(String)} 自称「不依赖
+     * supplier/ThreadLocal」，但其 settings 源（localSettings = {@code {projectRoot}/.nexusai/settings.local.json}）
+     * 若经无参 {@link #getAutoMemPathSetting()} → {@link #readAutoMemoryDirectorySetting()} 解析，
+     * 会回读 {@code currentSessionProjectRoot()} ThreadLocal —— 异步 fork 线程读不到 → 回落 config home
+     * ⇒ 显式重载的「零 ThreadLocal」定案被推翻（审计 P3）。现把 projectRoot 作为入参贯穿整条 settings 链：
+     * 本字段非 null 时，显式重载只用入参拼 localSettings 源；<b>仅无参重载路径</b>
+     * （{@code getAutoMemPath()}/{@code getAutoMemBase()}/{@code getAutoMemPathSetting()}）才允许读
+     * ThreadLocal（会话线程语义）。
+     *
+     * <p>生产 {@link #defaultInstance()} 用 5 参构造注入 {@code AutoMemPaths::readAutoMemoryDirectorySetting}；
+     * 4 参构造（测试/P0JO）保持 {@code null} → 显式重载回落 {@link #settingsDirSupplier}（行为不变）。
+     */
+    private final java.util.function.Function<String, String> settingsDirResolver;
+
+    /**
      * getAutoMemPath memoize 等价（CC paths.ts:223-235 · OPD-R2-12）。
      *
      * <p>v1.2 复验（EV-036）：旧实现为单槽 volatile 双字段（cachedProjectRoot/cachedAutoMemPath），
@@ -184,10 +201,30 @@ public final class AutoMemPaths {
                         Supplier<String> memoryBaseDirSupplier,
                         Supplier<String> overrideSupplier,
                         Supplier<String> settingsDirSupplier) {
+        this(projectRootSupplier, memoryBaseDirSupplier, overrideSupplier, settingsDirSupplier, null);
+    }
+
+    /**
+     * 注入式构造器（[TL-W1 P3] 显式 projectRoot 贯穿版）。
+     *
+     * @param projectRootSupplier   CC getProjectRoot()（bootstrap/state.ts:511-513）等价
+     * @param memoryBaseDirSupplier CC getMemoryBaseDir() 的 memoryBase 供应（env CLAUDE_CODE_REMOTE_MEMORY_DIR 或 null）
+     * @param overrideSupplier      CC getAutoMemPathOverride() 的 env 供应（CLAUDE_COWORK_MEMORY_PATH_OVERRIDE）
+     * @param settingsDirSupplier   CC getAutoMemPathSetting() 的 settings 供应（<b>仅无参重载路径</b>消费；
+     *                              生产 = {@link #readAutoMemoryDirectorySetting()}，会读会话 ThreadLocal）
+     * @param settingsDirResolver   显式 projectRoot 贯穿的 settings 读取器（{@code explicitRoot → autoMemoryDirectory}）·
+     *                              null → 显式重载回落 {@code settingsDirSupplier}（测试/P0JO 行为不变）
+     */
+    public AutoMemPaths(Supplier<String> projectRootSupplier,
+                        Supplier<String> memoryBaseDirSupplier,
+                        Supplier<String> overrideSupplier,
+                        Supplier<String> settingsDirSupplier,
+                        java.util.function.Function<String, String> settingsDirResolver) {
         this.projectRootSupplier = Objects.requireNonNull(projectRootSupplier);
         this.memoryBaseDirSupplier = Objects.requireNonNull(memoryBaseDirSupplier);
         this.overrideSupplier = Objects.requireNonNull(overrideSupplier);
         this.settingsDirSupplier = Objects.requireNonNull(settingsDirSupplier);
+        this.settingsDirResolver = settingsDirResolver;
     }
 
     /**
@@ -216,6 +253,8 @@ public final class AutoMemPaths {
             AutoMemPaths::currentSessionProjectRoot,
             () -> System.getenv(REMOTE_MEMORY_DIR_ENV),
             () -> overrideEnvSeam != null ? overrideEnvSeam : System.getenv(COWORK_OVERRIDE_ENV),
+            AutoMemPaths::readAutoMemoryDirectorySetting,
+            // [TL-W1 P3] 显式重载贯穿：入参 projectRoot 进 settings 读取链，绝不回读 ThreadLocal。
             AutoMemPaths::readAutoMemoryDirectorySetting);
     }
 
@@ -378,6 +417,23 @@ public final class AutoMemPaths {
      */
     public String getAutoMemPathSetting() {
         return validateMemoryPath(settingsDirSupplier.get(), true);
+    }
+
+    /**
+     * [TL-W1 P3] 显式 projectRoot 贯穿的 settings 读取 · CC original: {@code getAutoMemPathSetting}
+     * （paths.ts:179-186）—— 与无参重载同语义，但 localSettings 源（{@code {explicitProjectRoot}/.nexusai/
+     * settings.local.json}）只用入参拼路径，<b>零 ThreadLocal 读</b>（异步 fork 线程安全）。
+     *
+     * <p>resolver 未注入（4 参构造 = 测试/P0JO）→ 回落 {@link #getAutoMemPathSetting()}（行为不变）。
+     *
+     * @param explicitProjectRoot 会话绑定 projectRoot（null → resolver 按「无 localSettings 源」处理）
+     * @return 校验通过的 autoMemoryDirectory 或 null
+     */
+    public String getAutoMemPathSetting(String explicitProjectRoot) {
+        if (settingsDirResolver == null) {
+            return getAutoMemPathSetting();
+        }
+        return validateMemoryPath(settingsDirResolver.apply(explicitProjectRoot), true);
     }
 
     /**
@@ -557,7 +613,11 @@ public final class AutoMemPaths {
         }
         String override = getAutoMemPathOverride();
         if (override == null) {
-            override = getAutoMemPathSetting();
+            // [TL-W1 P3] 显式重载把 projectRoot 贯穿到 settings 读取链（localSettings 源只用入参拼路径）——
+            //   旧写法调无参 getAutoMemPathSetting() → readAutoMemoryDirectorySetting() → 回读
+            //   currentSessionProjectRoot() ThreadLocal，异步 fork 线程读不到 → config home，
+            //   推翻「显式重载不读 ThreadLocal」定案（审计 P3）。
+            override = getAutoMemPathSetting(projectRoot);
         }
         if (override != null) {
             if (log.isDebugEnabled()) {
@@ -953,15 +1013,30 @@ public final class AutoMemPaths {
      * @return autoMemoryDirectory 值或 null
      */
     private static String readAutoMemoryDirectorySetting() {
+        // [TL-W1 P3] 无参重载 = 唯一允许读会话 ThreadLocal 的路径（会话线程语义）；
+        //   显式重载走 readAutoMemoryDirectorySetting(String)（projectRoot 贯穿，零 ThreadLocal）。
+        return readAutoMemoryDirectorySetting(currentSessionProjectRoot());
+    }
+
+    /**
+     * [TL-W1 P3] 显式 projectRoot 贯穿的 settings 读取实现 · localSettings 源 =
+     * {@code {explicitProjectRoot}/.nexusai/settings.local.json}（**只用入参拼路径**），
+     * userSettings 源恒为 config home（与 projectRoot 无关）。零 ThreadLocal 读。
+     *
+     * @param explicitProjectRoot 会话绑定 projectRoot（null/blank → 跳过 localSettings 源，仅 DB + user 源）
+     * @return autoMemoryDirectory 值或 null
+     */
+    static String readAutoMemoryDirectorySetting(String explicitProjectRoot) {
         String fromDb = readAutoMemoryDirectoryFromDb();
         if (fromDb != null) {
             return fromDb;
         }
-        String projectRoot = currentSessionProjectRoot();
-        String fromLocal = readAutoMemoryDirectoryFromFile(
-            Paths.get(projectRoot, NexusaiPaths.getProjectDirName(), "settings.local.json"));
-        if (fromLocal != null) {
-            return fromLocal;
+        if (explicitProjectRoot != null && !explicitProjectRoot.isBlank()) {
+            String fromLocal = readAutoMemoryDirectoryFromFile(
+                Paths.get(explicitProjectRoot, NexusaiPaths.getProjectDirName(), "settings.local.json"));
+            if (fromLocal != null) {
+                return fromLocal;
+            }
         }
         return readAutoMemoryDirectoryFromFile(
             Paths.get(NexusaiPaths.getAppConfigHomeDir(), "settings.json"));

@@ -172,5 +172,12 @@ public record SettingsDto(
     //   pluginClaudeFallback：插件双读开关（settings.plugin_claude_fallback 0/1；null = 未配置 →
     //     插件双读回落默认 true，原 yml nexusai.feature.plugin-claude-fallback:true 语义迁移 DB）。
     Map<String, Boolean> enabledPlugins,
-    Boolean pluginClaudeFallback
+    Boolean pluginClaudeFallback,
+    // [V72 provider-custom-headers D6 · 2026-09-13 补] 提供商自定义 header 的占位符展开开关
+    //   （settings.allow_dynamic_header_values 0/1，默认开；null = 未配置 → 默认开）。
+    //   true → header 值里的 ${session_id} 按会话展开；false → 统一落 DynamicHeaderExpander
+    //   .STATIC_FALLBACK（nexusai-static）。
+    //   ⚠️ 三处必须同步，缺一处 = 前端开关「点了等于没点」（GET 恒显默认、PUT 被静默丢弃）：
+    //     ① 本字段 ② SettingsService.toDto 透出 ③ SettingsService.update 的 null-skip merge 分支。
+    Boolean allowDynamicHeaderValues
 ) {}

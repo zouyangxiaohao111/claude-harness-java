@@ -254,8 +254,33 @@ public class ExtractMemoriesAgent {
      * 用户否决该隐式线程依赖，改参数直传）。</p>
      */
     private String memoryDir() {
-        String dir = storage.memoryDir().toString();
+        String dir = frozenMemoryDirOrFail();
         return (dir.endsWith("/") || dir.endsWith("\\")) ? dir : dir + java.io.File.separator;
+    }
+
+    /**
+     * [TL-W1 P2] 便捷重载（2/3/4 参）的 memoryDir 来源 —— <b>只取冻结值</b>
+     * （{@code new MemoryStorage(Path)} 直构 · 测试/POJO）。
+     *
+     * <p><b>WHY（审计 P2）</b>：旧实现经 {@code storage.memoryDir()} 惰性现算 —— 解析型 storage
+     * （生产 {@code new MemoryStorage(AutoMemPaths)}）会读 {@code AutoMemPaths.getAutoMemPath()} 无参
+     * 重载的会话 ThreadLocal；调用线程无 ThreadLocal（fork / hook / ForkJoinPool worker）即回落
+     * config home → A′ 判无效返回 null → 下游 {@code ConsolidationLock(null).resolve(...)} NPE 被吞。
+     * 生产唯一入口是 6 参 {@code executeExtractMemories(..., memoryDir)}（LlmAgentLoop 会话线程
+     * 用 boundProject 经 {@code AutoMemPaths.getAutoMemPath(String)} 显式解析后直传）—— 便捷重载
+     * 拿到解析型 storage 即**编程错误**，fail-loud（绝不再惰性现算）。
+     *
+     * @return 冻结 memoryDir（恒非 null）；解析型 storage → 抛 IllegalStateException
+     */
+    private String frozenMemoryDirOrFail() {
+        java.nio.file.Path frozen = storage.frozenMemoryDir();
+        if (frozen == null) {
+            throw new IllegalStateException("[ExtractMemories] 便捷重载要求冻结 memoryDir"
+                + "（new MemoryStorage(Path) · 测试/直构）；生产必须走 6 参 "
+                + "executeExtractMemories(..., memoryDir)（会话线程 getAutoMemPath(boundProject) 解析后直传）。"
+                + "绝不惰性现算：非会话线程无 ThreadLocal → 回落 config home → A′ null → NPE 被吞（审计 P2）");
+        }
+        return frozen.toString();
     }
 
     public void setForkedQuery(RunForkedAgent.ForkedQuery query) {
@@ -499,6 +524,11 @@ public class ExtractMemoriesAgent {
                                        ForkRawMaterial forkRawMaterial,
                                        String agentId,
                                        String sessionId) {
+        // [TL-W1 P2] memoryDir 来源改为 frozenMemoryDirOrFail()（私有 helper `memoryDir()`）——
+        //   只取冻结值（测试/直构 Path storage）；解析型 storage（生产 AutoMemPaths）**fail-loud**，
+        //   绝不再惰性现算（旧实现经 storage.memoryDir() → getAutoMemPath() 读会话 ThreadLocal，
+        //   非会话线程回落 config home → A′ null → 下游 NPE 被吞）。生产唯一入口 = 6 参
+        //   （StopHookPipeline:312 传会话线程解析的 memoryDir）。
         executeExtractMemories(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId, memoryDir());
     }
 
@@ -534,7 +564,17 @@ public class ExtractMemoriesAgent {
                                        String memoryDir) {
         // [A1 重做] memoryDir null（测试/非主循环调用方走 5 参委托）→ storage.memoryDir() 兜底
         //   （测试 storage Path 冻结安全）；生产 StopHookPipeline 传会话线程解析的 memoryDir。
-        String memDir = memoryDir != null ? memoryDir : memoryDir();
+        // [TL-W1 P2] 兜底改为**显式跳过 + warn**（不再调 storage.memoryDir() 惰性现算）：
+        //   本方法可能在 fork/hook 线程上被调用，惰性现算会读 ThreadLocal → 回落 config home →
+        //   A′ null → 下游 NPE 被吞（静默永不提取，违规则十二）。null = 上游「无有效 per-project
+        //   auto-memory 目录」（LlmAgentLoop A′ 分支合法传 null）→ 明确跳过，不伪造目录。
+        if (memoryDir == null) {
+            log.warn("[ExtractMemories] 提取跳过：memoryDir 为空（会话线程未解析到有效 per-project "
+                + "auto-memory 目录 · 上游 A′ 或调用方未传），sessionId={} —— 不回落现算"
+                + "（非会话线程无 ThreadLocal，回落 config home 会误导写入）", sessionId);
+            return;
+        }
+        String memDir = memoryDir;
         // extractor（CC :569-577）：把 promise 登记进 inFlightExtractions，await 后移除。
         // 覆盖完整 trailing-run 链（runExtraction 递归 finally），故 drain 等待它即覆盖尾随轮。
         CompletableFuture<Void> p = CompletableFuture.runAsync(() -> {
@@ -860,7 +900,12 @@ public class ExtractMemoriesAgent {
                 /*skipTranscript*/ true,
                 /*skipCacheWrite*/ false,
                 /*abortController*/ null,
-                /*onMessage*/ null);
+                /*onMessage*/ null)
+                // [TL-W1 P1] 会话 projectRoot 直传（fork 原料捕获点 LlmAgentLoop stop-hook 传入 ·
+                //   会话线程解析）→ QueryLoopForkedQuery 用它构造 fork 隔离 ctx；fork 线程不再现算
+                //   AutoMemPaths.currentSessionProjectRoot()（runAsync 无 ThreadLocal → config home）。
+                //   null（测试/直构原料）→ 不造字段。
+                .withProjectRoot(forkRawMaterial != null ? forkRawMaterial.projectRoot() : null);
             // [sm-cursor-sessionize] 观察点按会话键控（多会话并发 fork 各会话留档）
             this.lastForkParamsBySession.put(key, params);
 

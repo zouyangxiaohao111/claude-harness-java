@@ -49,7 +49,28 @@ public class SkillController {
      * @return 合并去重后的技能 DTO 列表
      */
     @GetMapping
-    public List<CommandDto> list(@RequestParam(value = "reload", defaultValue = "false") boolean reload) {
+    public List<CommandDto> list(@RequestParam(value = "reload", defaultValue = "false") boolean reload,
+                                 @RequestParam(value = "sessionId", required = false) String sessionId) {
+        // [TL-W1 P4] 可选 sessionId → 注入 RequestContext（MDC），使 SkillRegistry 的 cwdSupplier
+        //   （SessionProjectRoot.getForSession(RequestContext.sessionId())）能在 REST 线程上解析出
+        //   会话绑定项目 ⇒ 扫到该项目的 project 级技能/workflow 命令（旧接线读 ThreadLocal，REST 线程
+        //   必空 → 回落 config home → 前端列表缺绑定项目的条目）。
+        //   不传 sessionId → 保持旧行为（无会话上下文，SkillsLoader 回落会话 cwd）。
+        //   同款先例：CommandController.executeBuiltin 的 ?sessionId= → RequestContext.setSession +
+        //   finally clear（防 Tomcat 线程复用残留；REST 入口无 Filter 写 MDC）。
+        if (sessionId == null || sessionId.isBlank()) {
+            return listInternal(reload);
+        }
+        com.nexusai.common.RequestContext.setSession(sessionId);
+        try {
+            return listInternal(reload);
+        } finally {
+            com.nexusai.common.RequestContext.clear();
+        }
+    }
+
+    /** {@link #list(boolean, String)} 主体 · 会话上下文已在包装层注入（本方法内 RequestContext.sessionId() 可见）。 */
+    private List<CommandDto> listInternal(boolean reload) {
         if (reload) commandService.rescanFromFilesystem();
         List<Command> registryCommands = skillRegistry.getAllCommands();
         Map<String, Command> byName = new LinkedHashMap<>();

@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import type { Model, Provider } from '@/api/types'
-import { FormModal } from '@/components/ui/FormModal'
+import { FormModal, type FormSection } from '@/components/ui/FormModal'
 import { ModelFormModal } from '@/components/ui/ModelFormModal'
+import { KvEditor } from '@/components/common/KvEditor'
 import { tagToClass } from '@/data'
 import type { UseProviders } from '@/hooks/useProviders'
 import { ApiError } from '@/api/rest'
@@ -54,6 +55,26 @@ const EditIcon = () => (
     <path d="M9 2L12 5L5 12H2V9L9 2Z" />
   </svg>
 )
+
+/**
+ * 「自定义请求头」section（新建 / 编辑共用）。
+ *
+ * <p>值挂在 FormModal 的 `custom` 字段上（键名对齐 `Provider.extraHeaders`），由 KvEditor 维护；
+ * 两个请求构造器再把 `p.extraHeaders` 发出去 —— 少任何一环，用户就改不动这个字段。
+ */
+const headersSection = (): FormSection => ({
+  title: '自定义请求头',
+  fields: [
+    {
+      type: 'custom',
+      name: 'extraHeaders',
+      label: '请求头',
+      hint: '随请求一并发送的额外 HTTP 请求头；值里可写 ${session_id} 表示当前会话 ID',
+      // value 是 unknown（FormModal 刻意不用 any 逼出显式收窄）；KvEditor 全空产出 {}
+      render: (v, set) => <KvEditor value={v as Record<string, string> | null} onChange={set} />,
+    },
+  ],
+})
 
 /**
  * ProvidersPanel · Phase 7 联调版
@@ -112,6 +133,10 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       // 避免把掩码字符串当明文存库导致 API 401（后端 req.apiKey null 时不更新）
       apiKey: p.apiKeyMasked === editingProvider?.apiKeyMasked ? undefined : p.apiKeyMasked,
       enabled: p.enabled,
+      // 自定义请求头：与上面的 apiKey 取舍**无关**（掩码特例只针对 key，不能波及 header）。
+      // 清空契约：{} = 显式清空（后端写 NULL）、null/缺字段 = 不触碰。KvEditor 全空产出 {}，
+      // 故「删光所有 header」可表达；unset（表单未初始化出该键）仍传 undefined → 不触碰。
+      extraHeaders: p.extraHeaders,
     }
     void wrap(async () => {
       await updateProvider(p.id, req)
@@ -128,6 +153,8 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       baseUrl: p.baseUrl,
       apiKey: p.apiKeyMasked,    // raw key
       enabled: p.enabled ?? true,
+      // 自定义请求头（CreateProviderRequest.extraHeaders 不收 null，全空 → 不发该字段）
+      extraHeaders: p.extraHeaders ?? undefined,
     }
     void wrap(async () => {
       const created = await createProvider(req)
@@ -282,6 +309,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
                 { type: 'toggle', name: 'enabled', label: '启用', hint: '关闭后该提供商不出现在选择器中' },
               ],
             },
+            headersSection(),
           ]}
           onSave={onSaveProvider}
           onCancel={() => setEditingProvider(null)}
@@ -314,6 +342,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
                 { type: 'toggle', name: 'enabled', label: '立即启用' },
               ],
             },
+            headersSection(),
           ]}
           onSave={onAddProvider}
           onCancel={() => setAddingProvider(false)}

@@ -508,11 +508,24 @@ public class ToolRegistrationConfig {
         //   每调用新鲜解析（与 getSkillDirCommands 的 cwdSupplier 同源 —— 会话绑定项目根，
         //   memory：session-bound-dir-is-cc-startup-dir；CC getWorkflowCommands(cwd=getProjectRoot())）。
         if (featureFlags != null && featureFlags.workflowScripts()) {
-            registry.setWorkflowCommandProvider(() ->
-                new WorkflowCommandLoader(
-                    com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot()).load());
-            log.info("P1-3: WORKFLOW_SCRIPTS feature 开启 → workflow 命令源已注入（WorkflowCommandLoader，"
-                + "对齐 CC getWorkflowCommands namedWorkflowCommands.ts:10-34 + commands.ts:464 ...workflowCommands）");
+            // [TL-W1 P4] provider 接收**显式 projectRoot**（由 SkillRegistry.loadAllCommands 解析一次
+            //   后传入，与 getSkillDirCommands(cwd) 同源 · 对齐 CC getWorkflowCommands(cwd)
+            //   commands.ts:457）—— 旧 lambda 在消费线程读 AutoMemPaths.currentSessionProjectRoot()
+            //   （ThreadLocal）：消费方含 REST 线程（SkillController/CommandController/.../skills handler），
+            //   ThreadLocal 必空 → 回落 config home → 去 ~/.nexusai/.nexusai/workflows 扫描 ⇒
+            //   绑定项目的 workflow 命令在前端消失（审计 P4-b）。
+            //   显式 projectRoot 为 null（REST 线程无会话绑定）→ 空列表（不伪造目录）。
+            registry.setWorkflowCommandProvider(cwd -> {
+                if (cwd == null || cwd.isBlank()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("P1-3: workflow 命令源跳过（本次加载无会话 projectRoot，REST 线程无 sessionId 绑定）");
+                    }
+                    return List.of();
+                }
+                return new WorkflowCommandLoader(cwd).load();
+            });
+            log.info("P1-3: WORKFLOW_SCRIPTS feature 开启 → workflow 命令源已注入（WorkflowCommandLoader 接收显式 "
+                + "projectRoot，对齐 CC getWorkflowCommands(cwd) namedWorkflowCommands.ts:10-34 + commands.ts:464 ...workflowCommands）");
         } else if (log.isDebugEnabled()) {
             log.debug("P1-3: WORKFLOW_SCRIPTS feature 关闭 → workflow 命令源不注入（对齐 CC commands.ts:457 空）");
         }
@@ -523,7 +536,16 @@ public class ToolRegistrationConfig {
         //   additionalDirectoriesSupplier 等价 CC getAdditionalDirectoriesForClaudeMd（--add-dir，state.ts:206-207），
         //   Java 无 CLI 会话态 → env CLAUDE_CODE_ADDITIONAL_DIRECTORIES 供源（concern #1 option A）。
         // ODF-A1: 技能加载 cwd = 会话 projectRoot（CC getSkillDirCommands(cwd) · per-session）
-        registry.setCwdSupplier(com.nexusai.application.agent.memory.AutoMemPaths::currentSessionProjectRoot);
+        // [TL-W1 P4] 改按**会话 sessionId 现算**（SessionProjectRoot.getForSession：未绑定返回 null，
+        //   不读 ThreadLocal、不回落 config home）——旧接线 AutoMemPaths::currentSessionProjectRoot 是
+        //   ThreadLocal，消费线程（REST：SkillController/CommandController/CommandRegistrationConfig28
+        //   /skills handler）必空 ⇒ 回落 ~/.nexusai：扫描不到绑定项目的 project 级技能（前端列表缺条目）、
+        //   workflow 从 ~/.nexusai/.nexusai/workflows 扫描（命令消失）、缓存槽与 loop 线程分裂（重复加载）。
+        //   REST 入口经可选 sessionId 查询参数写入 RequestContext（SkillController/CommandController
+        //   的 list 端点，CommandController:352-363 既有先例）；无绑定 → null → SkillsLoader 自身
+        //   cwdSupplier 回落会话 cwd（user.dir 兜底），非 config home。
+        registry.setCwdSupplier(() -> com.nexusai.common.SessionProjectRoot
+            .getForSession(com.nexusai.common.RequestContext.sessionId()));
         registry.setAdditionalDirectoriesSupplier(com.nexusai.application.agent.skill.ClaudePaths::getAdditionalDirectoriesFromEnv);
         // P2-2: user/project 技能源加载开关接线（CC isSettingSourceEnabled，settings/constants.ts:174-177；
         //   Java Web 无 CLI --settings，concern #2 补开关，yml nexusai.skill.sources.* 默认 true 对齐 CC 全源启用）
@@ -544,7 +566,11 @@ public class ToolRegistrationConfig {
             NexusaiPaths.getProjectDirName() + "/skills",
             mcpServerService != null, builtinPluginRegistry != null, pluginLoader != null, dynamicSkillsManager != null,
             bundledSkillFeatureFlags != null ? bundledSkillFeatureFlags.mcpSkills() : false,
-            com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot(), skillDiscoveryPrefetch != null,
+            // [TL-W1 P4] 原为 AutoMemPaths.currentSessionProjectRoot()（构造期即时求值 → bean 启动
+            //   线程无 ThreadLocal → 恒打印 ~/.nexusai，且标签写 cwdSupplier 却与真实会话解析值不等）。
+            //   现打印解析策略（惰性、按会话 sessionId 现算），不再造 ThreadLocal 读点。
+            "SessionProjectRoot.getForSession(RequestContext.sessionId())（惰性·按会话现算，不读 ThreadLocal）",
+            skillDiscoveryPrefetch != null,
             commandMapper != null);
         return registry;
     }

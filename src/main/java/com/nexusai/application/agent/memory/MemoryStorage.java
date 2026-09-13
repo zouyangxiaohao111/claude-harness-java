@@ -122,4 +122,19 @@ public class MemoryStorage {
         // A′: 无有效项目（config-home 回落）→ per-project auto 记忆目录不存在 → null（调用方跳过）
         return autoMem == null ? null : Paths.get(autoMem);
     }
+
+    /**
+     * [TL-W1 P2] 冻结记忆目录（仅 {@code new MemoryStorage(Path)} 直构 · 测试/POJO）。
+     *
+     * <p><b>WHY</b>：ExtractMemoriesAgent 的便捷重载（2/3/4 参）需要 memoryDir 却无会话参数
+     * —— 旧实现经 {@link #memoryDir()} 惰性现算，在解析型 storage（生产 {@code new MemoryStorage(
+     * AutoMemPaths)}）下会读会话 ThreadLocal；调用线程若是 fork/hook 线程（ThreadLocal 空）即回落
+     * config home → A′ 判无效 → null → 下游 NPE 被吞（审计 P2/P9）。现便捷重载只允许消费**冻结**
+     * 值：解析型 storage 返回 null → 调用方 fail-loud（生产必须走显式 memoryDir 参数）。
+     *
+     * @return 冻结的 memoryDir；解析型（AutoMemPaths 构造）→ null
+     */
+    public Path frozenMemoryDir() {
+        return autoMemPaths == null ? memoryDir : null;
+    }
 }

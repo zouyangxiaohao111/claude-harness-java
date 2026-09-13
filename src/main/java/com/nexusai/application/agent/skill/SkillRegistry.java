@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -116,8 +117,17 @@ public class SkillRegistry {
      * 由 {@link #setWorkflowCommandProvider} 注入（生产装配点 ToolRegistrationConfig 按
      * {@code FeatureFlags.workflowScripts()} 门控接线）。未注入时 {@link #getAllCommands()} 输出不变
      * （POJO 兼容，现有测试不破）。
+     *
+     * <p><b>[TL-W1 P4] 入参改为显式 projectRoot（{@code Function<String, List<Command>>}）</b>：
+     * 旧形态 {@code Supplier} 的生产 lambda 在<b>消费线程</b>内读
+     * {@code AutoMemPaths.currentSessionProjectRoot()}（ThreadLocal）—— 消费方含 REST 线程
+     * （SkillController/CommandController/CommandRegistrationConfig28 的 /skills handler），
+     * ThreadLocal 必空 → 回落 config home → 去 {@code ~/.nexusai/.nexusai/workflows} 扫描 →
+     * 绑定项目的 workflow 命令在前端消失（审计 P4-b）。现由 {@link #loadAllCommands()} 在
+     * <b>同一次加载</b>中解析一次 cwd（与 {@code getSkillDirCommands(cwd)} 同源，对齐 CC
+     * {@code getWorkflowCommands(cwd)} commands.ts:457）并作实参传入，provider 内零 ThreadLocal 读。
      */
-    private Supplier<List<Command>> workflowCommandProvider;
+    private Function<String, List<Command>> workflowCommandProvider;
     /**
      * P1-2: 动态技能管理器 · 对齐 CC getDynamicSkills（loadSkillsDir.ts:981-983）。
      * <p>由 {@link #setDynamicSkillsManager} 注入；null 时 {@link #getAllCommands()} 输出不变
@@ -220,8 +230,13 @@ public class SkillRegistry {
      * （createWorkflowCommand 等价物）后注入。
      *
      * <p>未注入时 {@link #getAllCommands()} 无 workflow 源，行为不变（POJO 测试兼容）。
+     *
+     * <p><b>[TL-W1 P4]</b>: 入参 = {@code Function<String, List<Command>>}（cwd → workflow 命令）——
+     * 显式 projectRoot 由本类加载时解析后传入，provider 内<b>绝不</b>读 ThreadLocal（消费线程含
+     * REST 线程，ThreadLocal 必空 → 回落 config home → 绑定项目 workflow 命令消失）。
+     * 对齐 CC {@code getWorkflowCommands(cwd)}（commands.ts:457，cwd 与 getSkillDirCommands 同源）。
      */
-    public void setWorkflowCommandProvider(Supplier<List<Command>> workflowCommandProvider) {
+    public void setWorkflowCommandProvider(Function<String, List<Command>> workflowCommandProvider) {
         this.workflowCommandProvider = workflowCommandProvider;
         if (log.isDebugEnabled()) {
             log.debug("[SkillRegistry] 注入 workflow 命令源 (对齐 CC getWorkflowCommands commands.ts:401-406/:457/:464)");
@@ -468,10 +483,29 @@ public class SkillRegistry {
      * @return 当前缓存键（同一实例内同一 (projectRoot, skillsRoot) 组合稳定）
      */
     private String currentCacheKey() {
-        String projectRoot = cwdSupplier != null
-            ? cwdSupplier.get()
-            : AutoMemPaths.currentSessionProjectRoot();
-        return projectRoot + "|" + skillsRoot;
+        return resolveSessionCwd() + "|" + skillsRoot;
+    }
+
+    /**
+     * [TL-W1 P4] 会话 cwd 单点解析（键 + 两个加载来源共用）。
+     *
+     * <p><b>生产</b>（{@link #setCwdSupplier} 已注入）＝ 注入的 supplier ——
+     * {@code ToolRegistrationConfig} 接线为
+     * {@code () -> SessionProjectRoot.getForSession(RequestContext.sessionId())}
+     * （按会话 sessionId 查全局表现算，<b>不读 ThreadLocal</b>、<b>不回落 config home</b>；
+     * 未绑定会话返回 null）。旧接线为 {@code AutoMemPaths::currentSessionProjectRoot}（ThreadLocal），
+     * 在 REST/异步消费线程上必空 → 回落 {@code ~/.nexusai}（config home）⇒
+     * (a) 扫描不到绑定项目的 project 级技能（前端列表缺条目）；(b) workflow 从
+     * {@code ~/.nexusai/.nexusai/workflows} 扫描（命令消失）；(c) 缓存槽与 loop 线程分裂（重复加载）。
+     *
+     * <p><b>未注入</b>（POJO/测试直构）＝ 维持既有静态回落
+     * {@link AutoMemPaths#currentSessionProjectRoot()}（确定性非 null，行为不变）。
+     *
+     * @return 会话 cwd；未绑定会话（REST 线程无 sessionId 绑定）→ null（下游 SkillsLoader 自身
+     *         cwdSupplier 回落会话 cwd，非 config home）
+     */
+    private String resolveSessionCwd() {
+        return cwdSupplier != null ? cwdSupplier.get() : AutoMemPaths.currentSessionProjectRoot();
     }
 
     /**
@@ -716,9 +750,15 @@ public class SkillRegistry {
         // 3. 文件系统技能 · 对齐 CC skillDirCommands（commands.ts:361-367 每源 catch → 该源返回空）
         //   P2-20：cwdSupplier 注入（生产）→ 五源 getSkillDirCommands(cwd)（managed/user/project/additional/legacy）；
         //   null（POJO/测试）→ 单目录 loadFromDirectory(skillsRoot) 回退。
+        // [TL-W1 P4] 本次加载的会话 cwd 解析**一次**（键与两个来源同源，杜绝「键用 A、加载用 B」）——
+        //   cwdSupplier（生产 = SessionProjectRoot.getForSession(RequestContext.sessionId())，按会话
+        //   sessionId 现算、未绑定返回 null，不回读 ThreadLocal、不回落 config home）优先；
+        //   未注入（POJO/测试直构）→ 维持既有静态回落 AutoMemPaths.currentSessionProjectRoot()。
+        //   null（REST 线程无会话绑定）→ 交由 SkillsLoader 自身默认 cwdSupplier 回落会话 cwd。
+        String sessionCwd = resolveSessionCwd();
         try {
             List<Command> fsSkills = cwdSupplier != null
-                ? loader.getSkillDirCommands(cwdSupplier.get())
+                ? loader.getSkillDirCommands(sessionCwd)
                 : loader.loadFromDirectory(skillsRoot);
             for (Command c : fsSkills) {
                 byName.putIfAbsent(c.getName(), c);
@@ -733,7 +773,11 @@ public class SkillRegistry {
         //    feature 关时 Promise.resolve([])）。每源独立 try-catch（CC :360-373 每源 catch 语义）。
         if (workflowCommandProvider != null) {
             try {
-                List<Command> workflowCommands = workflowCommandProvider.get();
+                // [TL-W1 P4] 显式 projectRoot 传入（= 本次加载解析的 sessionCwd，与 getSkillDirCommands
+                //   同源 · 对齐 CC getWorkflowCommands(cwd) commands.ts:457）—— provider 内零 ThreadLocal 读
+                //   （旧 lambda 在消费线程读 currentSessionProjectRoot()，REST 线程必空 → config home →
+                //   从 ~/.nexusai/.nexusai/workflows 扫描 → 绑定项目 workflow 命令消失）。
+                List<Command> workflowCommands = workflowCommandProvider.apply(sessionCwd);
                 int added = 0;
                 if (workflowCommands != null) {
                     for (Command c : workflowCommands) {

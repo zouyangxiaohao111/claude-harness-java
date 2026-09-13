@@ -53,7 +53,7 @@ class SettingsServiceTest {
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
-            null, null, null, null, enabledPlugins, pluginClaudeFallback);
+            null, null, null, null, enabledPlugins, pluginClaudeFallback, null);   // 末位 [V72] allowDynamicHeaderValues 本 helper 未设 → null
     }
 
     /** 含 WebSearch 6 字段的 DB 行（autoMemoryEnabled 设值避免 toDto 回落 settings.json 文件读）。 */
@@ -115,7 +115,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         service.update(req);
 
@@ -153,7 +153,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         service.update(req);
 
@@ -189,7 +189,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         SettingsDto dto = service.update(req);
 
@@ -252,7 +252,7 @@ class SettingsServiceTest {
                     // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode（V44 全局默认，本测试未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
             service.update(req);
 
@@ -316,7 +316,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         SettingsDto dto = service.update(req);
 
@@ -346,7 +346,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode null → 不覆盖 · [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // permissionMode null → 不覆盖 · [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         service.update(req);
 
@@ -374,7 +374,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         assertThatThrownBy(() -> service.update(req))
             .as("BUBBLE 不可由 UI 设置——写侧 fail-loud（V44 双防）")
@@ -403,7 +403,7 @@ class SettingsServiceTest {
                 // [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);   // [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         assertThatThrownBy(() -> service.update(req))
             .as("枚举 name ACCEPT_EDITS 不被 isSettable 接受——防误存导致设置不生效")

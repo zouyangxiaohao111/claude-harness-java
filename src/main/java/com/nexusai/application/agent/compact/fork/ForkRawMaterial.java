@@ -48,7 +48,30 @@ public record ForkRawMaterial(
         //   effectiveModelName 缺省 null → ProductionForkedQuery 会话模型直传解析取不到模型 →
         //   model=null → provider 回落 MockLlmProvider（假回复 / 永不 Edit）。null = 未捕获
         //   （非主循环入口/测试直构）→ 不造字段，回落既有全局 supplier 语义。
-        String effectiveModelName) {
+        String effectiveModelName,
+        // [TL-W1 P1] 会话绑定 projectRoot（= LlmAgentLoop ctx.sessionState().workspaceDir() /
+        //   boundProject；CC {@code getOriginalCwd()} 语义）—— 与 effectiveModelName 同款理由：
+        //   后台 fork 跑在 CompletableFuture.runAsync（ForkJoinPool worker）/ StopHookPipeline
+        //   runAsync 上，plain ThreadLocal 不继承 ⇒ fork 内现算 AutoMemPaths.currentSessionProjectRoot()
+        //   会回落 ~/.nexusai（config home）⇒ AgentLoopContextFactory.freshSession 把它当 projectRoot
+        //   ⇒ fork 的 loop ctx.workspaceDir 恒为 config home 而非 boundProject（下游 A′ 判无有效项目
+        //   → 派生被跳过）。故由**会话线程**捕获后随 fork 原料透传，fork 内零 ThreadLocal 读。
+        //   null = 未捕获（非主循环入口/测试直构）→ fork 端不造字段（下游 shared(null) 走
+        //   CwdResolution originalCwd 回落，非 config home）。
+        String projectRoot) {
+
+    /**
+     * 5 参兼容构造器（无 projectRoot）· 既有调用方（测试/直构 + 未接线路径）语义不变
+     * （projectRoot=null → 不造字段）。
+     */
+    public ForkRawMaterial(
+            List<String> systemPrompt,
+            Map<String, String> userContext,
+            Map<String, String> systemContext,
+            List<ChatMessageDto> forkContextMessages,
+            String effectiveModelName) {
+        this(systemPrompt, userContext, systemContext, forkContextMessages, effectiveModelName, null);
+    }
 
     /** 紧凑构造器 · null 兜底（对齐 CacheSafeParams 同款防御；CC createCacheSafeParams 从不产 null）。 */
     public ForkRawMaterial {

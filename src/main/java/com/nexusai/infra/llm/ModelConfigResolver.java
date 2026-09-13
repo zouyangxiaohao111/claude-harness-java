@@ -111,7 +111,11 @@ public class ModelConfigResolver {
             log.info("[ModelConfigResolver] 解析成功 modelName={} providerType={} baseUrl={}",
                 modelName, providerType, provider.getBaseUrl());
         }
-        return new ResolvedModel(new ProviderConfig(provider.getBaseUrl(), rawKey), providerType);
+        // [provider-custom-headers 任务 6] extraHeaders 随 ProviderConfig 一起流动（配置期已知，
+        //   与 baseUrl/apiKey 同源）。DB 列是 JSON 字符串 → 过 deserializeHeaders 转 Map；未配置 → null。
+        //   注入侧由 ProviderHeaderInjector 单点展开/过滤（本处不做校验）。
+        return new ResolvedModel(new ProviderConfig(provider.getBaseUrl(), rawKey,
+            ProviderService.deserializeHeaders(provider.getExtraHeaders())), providerType);
     }
 
     /**

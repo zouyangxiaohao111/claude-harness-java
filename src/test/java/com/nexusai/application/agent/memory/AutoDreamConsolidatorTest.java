@@ -125,6 +125,26 @@ class AutoDreamConsolidatorTest {
     }
 
     @Test
+    @DisplayName("[TL-W1 P2] 4 参便捷重载对解析型 storage fail-loud（不再惰性现算回落 config home → NPE 被吞）")
+    void consolidateIfNeeded_fourArg_overResolverStorage_failsLoud() {
+        // WHY（规则九 · 审计 P2）: 4 参重载旧经 memoryDir() → storage.memoryDir() → 无参
+        //   getAutoMemPath() 读会话 ThreadLocal。生产调用点在 CompletableFuture.runAsync
+        //   （ForkJoinPool worker，无 ThreadLocal）→ 回落 config home → A′ 判无效返回 null →
+        //   new ConsolidationLock(null) → 锁文件路径 resolve 抛 NPE → 被 StopHookPipeline
+        //   catch(Exception) 吞成一条 log.warn ⇒ autoDream 合并**从不执行且无用户可见失败**
+        //   （违规则十二）。现 4 参重载只接受冻结 memoryDir（测试/直构 Path storage）；
+        //   解析型 storage（生产 AutoMemPaths）＝ 编程错误 → fail-loud。
+        MemoryStorage resolverStorage = new MemoryStorage(AutoMemPaths.defaultInstance());
+        AutoDreamConsolidator c = new AutoDreamConsolidator(resolverStorage);
+        try {
+            c.consolidateIfNeeded(ws, null, null);
+            org.junit.jupiter.api.Assertions.fail("解析型 storage 走 4 参重载必须 fail-loud（生产唯一入口 = 5 参显式 memoryDir）");
+        } catch (IllegalStateException expected) {
+            assertThat(expected.getMessage()).contains("memoryDir");
+        }
+    }
+
+    @Test
     @DisplayName("门控全过 → 走 fork（skipTranscript + querySource=auto_dream + 受限 canUseTool）+ 遥测 fired/completed")
     void consolidateIfNeeded_enabledRunsFork_withTelemetry() throws IOException {
         writeSessions(ws, 5);

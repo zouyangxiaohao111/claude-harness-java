@@ -316,11 +316,41 @@ class SkillRegistryMemoizeTest {
         wf.setDescription("a workflow command");
         // provider 须在首次 getAllCommands 前注入（memoize-by-skillsRoot：raw 缓存含 provider 结果；
         //   注入后需 refresh() 才可见，对齐 CC 磁盘变更 refresh() 前不可见）
-        registry.setWorkflowCommandProvider(() -> List.of(wf));
+        registry.setWorkflowCommandProvider(cwd -> List.of(wf));
 
         assertThat(registry.getAllCommands().stream().map(Command::getName))
             .as("P1-3: workflowCommandProvider 注入 → workflow 命令入 getAllCommands（CC commands.ts:464 ...workflowCommands）")
             .contains("workflow-cmd");
+    }
+
+    @Test
+    @DisplayName("[TL-W1 P4] workflow provider 接收 registry 现算的显式 cwd（消费线程零 ThreadLocal 读）")
+    void workflowCommandProvider_receivesExplicitCwdFromRegistry(@TempDir Path tempDir) {
+        // WHY（规则九 · 审计 P4-b）: 旧 provider 是 Supplier，其生产 lambda 在**消费线程**内读
+        //   AutoMemPaths.currentSessionProjectRoot()（ThreadLocal）——消费方含 REST 线程
+        //   （SkillController/CommandController/CommandRegistrationConfig28 的 /skills handler），
+        //   ThreadLocal 必空 → 回落 config home ⇒ 去 ~/.nexusai/.nexusai/workflows 扫描 ⇒
+        //   绑定项目的 workflow 命令在前端**静默消失**（无报错）。现由 registry 在加载时按会话
+        //   sessionId 现算解析一次并作**实参**传入（对齐 CC getWorkflowCommands(cwd) commands.ts:457）。
+        SkillRegistry registry = new SkillRegistry(tempDir.resolve("shared-root").toString());
+        registry.setCwdSupplier(() -> "/session/proj-a");
+        java.util.concurrent.atomic.AtomicReference<String> seen =
+            new java.util.concurrent.atomic.AtomicReference<>("UNSET");
+        registry.setWorkflowCommandProvider(cwd -> { seen.set(cwd); return List.of(); });
+
+        registry.getAllCommands();
+        assertThat(seen.get())
+            .as("provider 必须收到 cwdSupplier 现算的会话 cwd（旧实现是消费线程内现读 ThreadLocal）")
+            .isEqualTo("/session/proj-a");
+
+        // 未绑定会话（REST 线程无 sessionId 绑定 → SessionProjectRoot.getForSession 返回 null）
+        //   → provider 收 null（空列表），**绝不**回落 config home 伪造目录
+        registry.setCwdSupplier(() -> null);
+        seen.set("UNSET");
+        registry.getAllCommands();
+        assertThat(seen.get())
+            .as("未绑定会话 → 显式 cwd 为 null（不回落 config home）")
+            .isNull();
     }
 
     @Test

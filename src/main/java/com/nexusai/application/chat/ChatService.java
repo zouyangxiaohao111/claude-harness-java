@@ -2023,7 +2023,10 @@ public class ChatService {
             log.warn("Provider {} no apiKey → mock fallback", provider.getId());
             return ProviderConfig.empty();
         }
-        return new ProviderConfig(provider.getBaseUrl(), rawKey);
+        // [provider-custom-headers 任务 6] extraHeaders 随 ProviderConfig 一起流动（DB JSON 字符串 → Map；
+        //   未配置 → null）。展开/敏感头过滤由注入侧 ProviderHeaderInjector 单点负责。
+        return new ProviderConfig(provider.getBaseUrl(), rawKey,
+            ProviderService.deserializeHeaders(provider.getExtraHeaders()));
     }
 
     String providerTypeForModel(String modelName) {

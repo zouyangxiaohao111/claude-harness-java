@@ -7965,11 +7965,12 @@ public class LlmAgentLoop implements AgentLoop {
                     //   合并过；旁证：~/.nexusai/projects 下无任何 .consolidate-lock）。
                     //   同文件 :8360 getAgentTranscriptPath(sessionState().workspaceDir(), ...) 是同款
                     //   正确范式（传项目根，helper 内派生一次）。
+                    // [TL-W1 P12] 单一取值点 workspaceDir（会话线程 · CC getOriginalCwd 锚）——
+                    //   旧三元兜底支 Path.of(AutoMemPaths.currentSessionProjectRoot()) 已删（零 ThreadLocal 读）。
+                    //   无 sessionState / 无 workspaceDir → null（下游 extract/dream 按「无有效项目」处理，
+                    //   AutoDreamConsolidator.scanSessionTranscripts 对 null 走会话门阻断）。
                     java.nio.file.Path inLoopDreamWs =
-                        (ctx.sessionState() != null && ctx.sessionState().workspaceDir() != null)
-                            ? ctx.sessionState().workspaceDir()
-                            : java.nio.file.Path.of(
-                                com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
+                        ctx.sessionState() != null ? ctx.sessionState().workspaceDir() : null;
                     // [IMP-MV2-09 T9 + E-1a pre-append] fork 原料捕获：当轮主线程 systemPrompt 的
                     //   **pre-append** 形态（= params.systemPrompt()，组装段数组含 boundary 段）/
                     //   userContext / systemContext / 消息快照 —— 对齐 CC createCacheSafeParams(context)
@@ -8010,22 +8011,31 @@ public class LlmAgentLoop implements AgentLoop {
                             //   否则 ProductionForkedQuery 直传分支取不到模型 → provider 回落
                             //   MockLlmProvider（假回复/永不 Write 记忆）。源 = state.currentModel()
                             //   （与 post-sampling hook toolUseContext 的 hookToolUseContext 同源）。
-                            state.currentModel());
+                            state.currentModel(),
+                            // [TL-W1 P1] 会话绑定 projectRoot 随 fork 原料直传（= 本行上方
+                            //   inLoopDreamWs，即 ctx.sessionState().workspaceDir() = boundProject /
+                            //   CC getOriginalCwd 语义）。WHY: extract/dream fork 跑在
+                            //   CompletableFuture.runAsync / StopHookPipeline runAsync（ForkJoinPool
+                            //   worker，plain ThreadLocal 不继承）⇒ fork 内现算
+                            //   AutoMemPaths.currentSessionProjectRoot() 会回落 config home ⇒ fork 的
+                            //   loop ctx.workspaceDir 错（审计 P1）。此处**会话线程**解析一次 → 闭包
+                            //   贯穿 fork 全链（对齐 :8019-8028 memoryDir 既有直传样板）。
+                            inLoopDreamWs != null ? inLoopDreamWs.toString() : null);
                     // [A1 重做] memoryDir 会话线程解析：boundProject（= sessionState().workspaceDir()，
                     //   原始路径非 slug）经 AutoMemPaths.getAutoMemPath(boundProject) 显式解析 →
                     //   传 StopHookPipeline → extract/dream fork 消费。解析发生在会话线程（本行），
                     //   不依赖 fork 线程 ThreadLocal —— 对齐 CC runExtraction 先 getAutoMemPath 后 fork
                     //   （extractMemories.ts:339）。workspaceDir null 时回落 currentSessionProjectRoot。
-                    java.nio.file.Path inLoopMemBase = ctx.sessionState() != null
-                            && ctx.sessionState().workspaceDir() != null
-                        ? ctx.sessionState().workspaceDir()
-                        : java.nio.file.Path.of(
-                            com.nexusai.application.agent.memory.AutoMemPaths.currentSessionProjectRoot());
-                    // A′: getAutoMemPath 无有效项目（config-home 回落）→ null → 传 null 给
+                    // [TL-W1 P12] 单一取值点 workspaceDir —— 旧三元兜底支
+                    //   Path.of(AutoMemPaths.currentSessionProjectRoot()) 已删（零 ThreadLocal 读）。
+                    java.nio.file.Path inLoopMemBase =
+                        ctx.sessionState() != null ? ctx.sessionState().workspaceDir() : null;
+                    // A′: getAutoMemPath 无有效项目（null/blank/config-home 回落）→ null → 传 null 给
                     //   StopHookPipeline（其内部对 memoryDir null 走 agent storage.memoryDir() 兜底 /
                     //   normalizeMemDir null 归一）—— extract/dream fork 不再拿到 config-home 假目录。
-                    String inLoopMemStr = com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()
-                        .getAutoMemPath(inLoopMemBase.toString());
+                    String inLoopMemStr = inLoopMemBase == null ? null
+                        : com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()
+                            .getAutoMemPath(inLoopMemBase.toString());
                     if (inLoopMemStr == null) {
                         log.warn("[LlmAgentLoop] extract/dream memoryDir 无有效项目（auto-memory per-project "
                             + "目录不存在，memBase={}），跳过 per-project 记忆提取/合并（A′）", inLoopMemBase);

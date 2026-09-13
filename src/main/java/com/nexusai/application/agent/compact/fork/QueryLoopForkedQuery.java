@@ -7,7 +7,6 @@ import com.nexusai.application.agent.loop.AgentLoopContextFactory;
 import com.nexusai.application.agent.loop.LoopResult;
 import com.nexusai.application.agent.loop.QueryParams;
 import com.nexusai.application.agent.loop.SubagentLoopDeps;
-import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseContext;
@@ -216,7 +215,16 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
 
         // ── 4. 隔离 deps（主循环上下文工厂 · 不共享主会话 LoopSessionState）──
         //   与 SubagentExecutor.runSubagentQueryLoop 同一构造法（contextFactory.shared + SubagentLoopDeps）。
-        AgentLoopContext ctx = contextFactory.shared(AutoMemPaths.currentSessionProjectRoot());
+        // [TL-W1 P1] projectRoot 由**会话线程**解析后随 fork 参数直传（p.projectRoot()）——
+        //   旧实现此处现算 AutoMemPaths.currentSessionProjectRoot()：本方法由 RunForkedAgent.run
+        //   在 fork 线程内同步调用（extract 腿 = ExtractMemoriesAgent 的 CompletableFuture.runAsync、
+        //   dream 腿 = StopHookPipeline 的 runAsync），plain ThreadLocal 不继承 ⇒ 回落
+        //   NEXUSAI_PROJECT_DIR env ?? ~/.nexusai（config home）⇒ AgentLoopContextFactory.freshSession
+        //   因该值非空白恒 setWorkspaceDir(...) ⇒ fork 的 ctx.workspaceDir 恒为 config home 而非
+        //   boundProject（下游 A′ 判「无有效项目」→ 派生被跳过）。
+        //   对齐 CC forkedAgent 参数透传；null（调用方未接线）= 不造字段 → freshSession 走会话
+        //   originalCwd 回落（非 config home）。
+        AgentLoopContext ctx = contextFactory.shared(p.projectRoot());
         SubagentLoopDeps deps = new SubagentLoopDeps(ctx);
 
         // ── 5. QueryParams（pre-append systemPrompt + userContext/systemContext/canUseTool/onMessage）──

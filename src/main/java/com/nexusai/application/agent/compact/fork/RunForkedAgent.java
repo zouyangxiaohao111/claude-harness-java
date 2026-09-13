@@ -113,6 +113,10 @@ public final class RunForkedAgent {
      * @param onMessage            每条产出消息到达即回调（G-79 流式 · CC forkedAgent.ts:578
      *                             {@code onMessage?.(message)} —— query loop 产出一条回调一条，
      *                             非完成后回放；null → 紧凑构造器兜底 no-op）
+     * @param projectRoot          [TL-W1 P1] 会话绑定 projectRoot（会话线程解析 · 随
+     *                             {@link ForkedAgentParams#projectRoot()} 透传）；QueryLoopForkedQuery
+     *                             用它构造 fork 隔离 ctx（{@code contextFactory.shared(projectRoot)}）。
+     *                             null = 未提供 → {@code shared(null)} 回落 CwdResolution originalCwd。
      */
     public record ForkQueryParams(
             List<ChatMessageDto> messages,
@@ -126,7 +130,34 @@ public final class RunForkedAgent {
             Integer maxTurns,
             boolean skipCacheWrite,
             boolean useGlobalCacheScope,
-            Consumer<ChatMessageDto> onMessage) {
+            Consumer<ChatMessageDto> onMessage,
+            // [TL-W1 P1] 会话绑定 projectRoot（会话线程解析 → 直传）· fork loop ctx 构造用
+            //   （QueryLoopForkedQuery: contextFactory.shared(param.projectRoot())）。
+            //   见 {@link ForkedAgentParams#projectRoot()}；null = 未提供（shared(null) 回落到
+            //   CwdResolution originalCwd，非 config home）。
+            String projectRoot) {
+        /**
+         * 12 参兼容构造器（无 projectRoot）· 既有直构调用方（测试 RecordingQuery 抓参）语义不变
+         * （projectRoot=null → fork 端 {@code shared(null)} 走 originalCwd 回落）。
+         */
+        public ForkQueryParams(
+                List<ChatMessageDto> messages,
+                List<String> systemPrompt,
+                Map<String, String> userContext,
+                Map<String, String> systemContext,
+                HookPermissionResolver.CanUseTool canUseTool,
+                ToolUseContext toolUseContext,
+                QuerySource querySource,
+                Integer maxOutputTokensOverride,
+                Integer maxTurns,
+                boolean skipCacheWrite,
+                boolean useGlobalCacheScope,
+                Consumer<ChatMessageDto> onMessage) {
+            this(messages, systemPrompt, userContext, systemContext, canUseTool, toolUseContext,
+                querySource, maxOutputTokensOverride, maxTurns, skipCacheWrite, useGlobalCacheScope,
+                onMessage, null);
+        }
+
         public ForkQueryParams {
             if (messages == null) {
                 messages = List.of();
@@ -218,7 +249,10 @@ public final class RunForkedAgent {
             params.maxTurns(),
             params.skipCacheWrite(),
             cs.useGlobalCacheScope(),  // gate 透传：fork 发送边界与主线程同一判定
-            params.onMessage());       // G-79 流式透传：query loop 产出一条回调一条（forkedAgent.ts:578）
+            params.onMessage(),        // G-79 流式透传：query loop 产出一条回调一条（forkedAgent.ts:578）
+            // [TL-W1 P1] 会话 projectRoot 透传（会话线程解析 → fork loop ctx 构造）——
+            //   fork 线程零 ThreadLocal 读（QueryLoopForkedQuery 不再调 currentSessionProjectRoot()）。
+            params.projectRoot());
 
         if (log.isDebugEnabled()) {
             log.debug("[RunForkedAgent] fork 查询发起: forkLabel={} querySource={} maxTurns={} "

@@ -1,0 +1,12 @@
+-- 自定义请求 header 的运行时占位符总开关（对齐 qwen-code outboundCorrelation.allowDynamicHeaderValues）。
+-- 默认 1 = 开（用户决策 D6）：配完 session_id 占位符即刻生效，无需再进设置。
+-- 关闭时该占位符落兜底常量 nexusai-static（不丢弃 header —— nexusai 有约 20 条辅助 LLM 调用
+-- 拿不到 sessionId，丢弃会让它们对 opencode 静默 400）。详见
+-- docs/zjkycode/specs/2026-09-12-provider-custom-headers-design.md §6.1 D4。
+--
+-- ⚠️ 本文件的注释里**不得**出现「美元符 + 左大括号」的 Flyway 占位符字面量（连 session_id 一起写）：
+--    application.yml 未改 flyway.placeholder-replacement，默认开启占位符替换，SQL 注释也在替换范围内
+--    → Flyway 会把该写法当成「未配置的占位符」并在解析语句时直接 fail（实测报错：
+--    Unable to parse statement ... No value provided for placeholder）。
+--    实测还发现：即使将来要写占位符文档，也只能用文字描述（如本段），不能写完整字面量。
+ALTER TABLE settings ADD COLUMN allow_dynamic_header_values INTEGER NOT NULL DEFAULT 1;

@@ -134,6 +134,14 @@ export function SettingsModal({
   // 语言选择弹窗开关（通用 tab「语言」行 · 选中即 onSaveSettings 写回 settings.language）
   const [langOpen, setLangOpen] = useState(false)
 
+  // 按会话展开请求头占位符（高级 tab · settings.allowDynamicHeaderValues）。
+  // 默认**开**：后端 V72 列是 NOT NULL DEFAULT 1，SettingsService 的实时读源在列值缺失时
+  // 也回落 true（「默认开，不因读失败而关闭」），故未拿到字段时按开处理，避免显示与后端实际行为相反。
+  const [dynamicHeaderValues, setDynamicHeaderValues] = useState(appSettings?.allowDynamicHeaderValues ?? true)
+  useEffect(() => {
+    setDynamicHeaderValues(appSettings?.allowDynamicHeaderValues ?? true)
+  }, [appSettings?.allowDynamicHeaderValues])
+
   return (
     <>
     <div className="settings-backdrop" onClick={close}>
@@ -280,6 +288,30 @@ export function SettingsModal({
             {settingsTab === 'business' && <BusinessPanel showToast={showToast} />}
             {settingsTab === 'advanced' && (
               <>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">按会话展开请求头占位符</div>
+                    <div className="settings-row-desc">
+                      {/* 用字符串表达式承载：JSX 文本里的 `{...}` 会被当成表达式，占位符必须整体转义 */}
+                      {'打开后，提供商自定义请求头里的 ${session_id} 会替换成当前会话 ID；关闭时统一使用固定值 nexusai-static。'}
+                    </div>
+                  </div>
+                  <label className="settings-switch">
+                    <input
+                      type="checkbox"
+                      checked={dynamicHeaderValues}
+                      onChange={(e) => {
+                        setDynamicHeaderValues(e.target.checked)
+                        // 必须走 onSaveSettings：App 侧 setAppSettings(updated) 是 appSettings 的唯一正常
+                        // 写入路径（App.tsx:290）。若改用 persistSettings（直接 settingsApi.update 且丢弃返回值），
+                        // appSettings 会保持陈旧 —— 而本弹窗「关闭即卸载」（App.tsx 的 {showSettings && …}），
+                        // 重开时以陈旧值为初值 → 开关显示与后端相反。失败提示由 App 的 onSaveSettings 兜住。
+                        void onSaveSettings({ allowDynamicHeaderValues: e.target.checked })
+                      }}
+                    />
+                    <span></span>
+                  </label>
+                </div>
                 <div className="settings-row">
                   <div>
                     <div className="settings-row-label">开发者模式</div>

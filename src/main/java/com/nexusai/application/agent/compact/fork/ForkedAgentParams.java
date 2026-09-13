@@ -64,6 +64,14 @@ import java.util.function.Consumer;
  *                        sessionMemory.ts:324）：fork 与 setup 上下文共享同一缓存，
  *                        Edit read-before-write 门禁放行；compact/extract 老调用不传=null
  *                        （with() 内部从父 clone，行为不变）
+ * @param projectRoot     [TL-W1 P1] 会话绑定 projectRoot（= 会话线程 {@code ctx.sessionState()
+ *                        .workspaceDir()} / boundProject · CC {@code getOriginalCwd()} 语义）·
+ *                        由**会话线程**解析后随 fork 参数透传；fork 内走
+ *                        {@code contextFactory.shared(param.projectRoot())} —— 已删除 fork 内的
+ *                        {@code AutoMemPaths.currentSessionProjectRoot()} 现算（runAsync/ForkJoinPool
+ *                        worker 不继承 ThreadLocal → 回落 config home → fork loop ctx.workspaceDir 错）。
+ *                        null = 调用方未提供（compact/session-memory 链未接线）→ fork 端
+ *                        {@code shared(null)} 走 CwdResolution originalCwd 回落（非 config home）。
  */
 public record ForkedAgentParams(
         List<ChatMessageDto> promptMessages,
@@ -77,7 +85,10 @@ public record ForkedAgentParams(
         boolean skipCacheWrite,
         AbortController abortController,
         Consumer<ChatMessageDto> onMessage,
-        FileStateCache readFileState) {
+        FileStateCache readFileState,
+        // [TL-W1 P1] 会话绑定 projectRoot（显式直传 · 会话线程解析后随 fork 参数透传）——
+        //   见 {@link #projectRoot()}。null = 调用方未提供（fork 端不造字段，走 shared(null)）。
+        String projectRoot) {
 
     /**
      * 11 参便利构造器 · 向后兼容（compact/extract-memories 老调用不传 readFileState=null，
@@ -97,7 +108,43 @@ public record ForkedAgentParams(
             Consumer<ChatMessageDto> onMessage) {
         this(promptMessages, cacheSafeParams, canUseTool, querySource, forkLabel,
             maxOutputTokens, maxTurns, skipTranscript, skipCacheWrite, abortController,
-            onMessage, null);
+            onMessage, null, null);
+    }
+
+    /**
+     * 12 参构造器（无 projectRoot）· 兼容既有调用方（compact/session-memory 不传 projectRoot →
+     * null，行为不变）。
+     */
+    public ForkedAgentParams(
+            List<ChatMessageDto> promptMessages,
+            CacheSafeParams cacheSafeParams,
+            HookPermissionResolver.CanUseTool canUseTool,
+            QuerySource querySource,
+            String forkLabel,
+            Integer maxOutputTokens,
+            Integer maxTurns,
+            boolean skipTranscript,
+            boolean skipCacheWrite,
+            AbortController abortController,
+            Consumer<ChatMessageDto> onMessage,
+            FileStateCache readFileState) {
+        this(promptMessages, cacheSafeParams, canUseTool, querySource, forkLabel,
+            maxOutputTokens, maxTurns, skipTranscript, skipCacheWrite, abortController,
+            onMessage, readFileState, null);
+    }
+
+    /**
+     * [TL-W1 P1] 带显式会话 projectRoot 的副本 —— 会话线程解析后随 fork 参数透传
+     * （禁止 fork 线程读 AutoMemPaths.currentSessionProjectRoot()：runAsync/ForkJoinPool
+     * worker 不继承 ThreadLocal → 回落 config home → fork 的 loop ctx.workspaceDir 错）。
+     *
+     * @param projectRoot 会话绑定项目根（CC getOriginalCwd 语义）；null → 落回 null（不造字段）
+     * @return 带 projectRoot 的新参数（其余字段逐字节不变）
+     */
+    public ForkedAgentParams withProjectRoot(String projectRoot) {
+        return new ForkedAgentParams(promptMessages, cacheSafeParams, canUseTool, querySource, forkLabel,
+            maxOutputTokens, maxTurns, skipTranscript, skipCacheWrite, abortController,
+            onMessage, readFileState, projectRoot);
     }
 
     /** 紧凑构造器 · 校验必传 + null 兜底。 */
