@@ -31,11 +31,11 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  *   <li>{@link #systemMessage_mapsToSystemMessage} — CC hooks.ts:545-548 systemMessage</li>
  *   <li>{@link #preToolUse_askDecision_asksWithUpdatedInput} — CC hooks.ts:550-578 + :592-623 PreToolUse</li>
  *   <li>{@link #asyncOutput_unionDetection} — CC types/hooks.ts:182-193 isAsyncHookJSONOutput</li>
- *   <li>{@link #nonJsonOutput_degradesToProceed} — CC hooks.ts:404-408 不以 { 开头 → plainText</li>
- *   <li>{@link #emptyStdout_degradesToProceed} — 空 stdout → proceed</li>
+ *   <li>{@link #nonJsonOutput_plainTextHookSuccess} — CC hooks.ts:404-408 不以 { 开头 → plainText</li>
+ *   <li>{@link #emptyStdout_hookSuccess} — 空 stdout → proceed</li>
  *   <li>{@link #hookField_wiredFromCommandHook} — toHookResult(CommandHook) 后 hook() 携带</li>
  *   <li>{@link #hookSpecificOutput_15subtypes_deserialize} — 15 子类型可反序列化 (≥5 代表类型)</li>
- *   <li>{@link #additionalContext_singleStringValue} — additionalContext 单值 String</li>
+ *   <li>{@link #additionalContext_listValue} — additionalContext List&lt;String&gt;（H-WF5a-02）</li>
  * </ol>
  */
 class HookOutputParserTest {

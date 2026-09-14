@@ -871,7 +871,12 @@ class ExecAgentHookSemanticsTest {
      * CLAUDE.md 根指向**配置主目录**（读错项目、静默）。故断言源码必须用 orNull 变体
      * （null → {@code shared(null)} 走既有「无会话上下文」分支，不伪造项目根）。
      *
-     * <p>RED 条件：把实现回退为 {@code currentSessionProjectRoot()} → 本用例红。
+     * <p>RED 条件（[批 4b-1] 已不可构造）：原靶「把实现回退为 {@code currentSessionProjectRoot()}」
+     * 随 ThreadLocal 载体删除而消失；且本项源码字面守卫亦已退役（见下方注记）⇒ <b>本条无用例承载</b>。
+     * 等价的现存可执行变异 = 让解析器在无绑定时回退 config home
+     * （{@code NexusaiPaths.getAppConfigHomeDir()}）→ hook agent 的 workspaceDir 指向配置主目录。
+     * 行为正向锚现落在 {@code AutoMemoryExplicitRootPlumbingTest} 与
+     * {@code SubagentProjectRootInheritanceTest#shared_withProjectRoot}。
      */
     // [批 4b-1 已退役] 原「hook agent ctx 根用 currentSessionProjectRootOrNull()」**源码字面守卫**：
     //   它 readString(ExecAgentHook.java) 后断言 contains/doesNotContain 某段源代码文本 —— 属「源级

@@ -174,7 +174,8 @@ class AutoMemPathsTest {
         //       ~/.nexusai（冒充项目身份，pathOps 消费方据此派生假目录）；
         //   (b) 无参 settings 链以 configHome 为「项目」拼 localSettings 源
         //       {configHome}/.nexusai/settings.local.json ⇒ 配置主目录里的文件被当作项目配置读入。
-        //   本用例钉住「无会话上下文 ⇒ 三级皆不伪造」：若回退到 currentSessionProjectRoot()
+        //   本用例钉住「无会话上下文 ⇒ 三级皆不伪造」：若三级回落重新引入 config-home 分支
+        //   （{@code NexusaiPaths.getAppConfigHomeDir()}，= 已删的 currentSessionProjectRoot() 第 3 级）
         //   （任一断言都会红：projectRoot 非 null / settings 命中 config-home 的 localSettings）。
         NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
         BundledSkillEnabledGates.bridgeSettingsMapper(null);   // 清 DB 桥接泄漏（否则 DB 列优先）

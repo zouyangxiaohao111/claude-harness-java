@@ -117,10 +117,11 @@ public final class AgentMemoryDirectory {
      * 关闭 ⊕-4（CM-F4）「@Bean 与生产注入实例分离」的接线不一致（DC-V5-10，选"统一"非"删除"）。
      * CC 端 agentMemory.ts 为模块级纯函数（无实例状态），Java 侧以"共享单例 + 惰性 supplier"等价建模。
      *
-     * <p>ODF-A1：cwd/projectRoot 从 {@link AutoMemPaths#currentSessionProjectRoot()} 惰性读取
-     * （per-session 注入 holder，绝不读 JVM 进程工作目录）——同一 JVM 不同 cwd 会话
+     * <p>ODF-A1：cwd/projectRoot 经 {@code cwdSupplier}（生产 = {@code SessionProjectRoot.getForSession}）显式读取 ——
+     * [批 4b-1] 原经 {@code AutoMemPaths.currentSessionProjectRoot()} ThreadLocal 载体传播，载体已删，
+     * 现为显式 supplier（⛔ 绝不读 JVM 进程工作目录）——同一 JVM 不同 cwd 会话
      * 解析出各自独立的 agent-memory 目录。单例共享安全：实例不可变（final supplier 组合），
-     * 会话相关值全部经 ThreadLocal/env 惰性读取（构造期不读），{@link #withEffectiveCwd} 返回
+     * 会话相关值全部经显式 supplier 惰性读取（构造期不读；[批 4b-1] 已无 ThreadLocal 载体），{@link #withEffectiveCwd} 返回
      * 派生副本不污染共享实例。
      *
      * @return 生产默认共享单例（@Bean 同实例）
@@ -169,7 +170,7 @@ public final class AgentMemoryDirectory {
      * <p><b>WHY</b>（T5-D5）：CC agent-memory 的 project/local scope 根 = {@code getCwd()}
      * （agentMemory.ts:43/59），worktree 隔离子代理运行时 getCwd() = worktree 路径（CC
      * AgentTool.tsx:640-641 {@code runWithCwdOverride(cwdOverridePath, fn)} 包住整个 runAgent）。
-     * Java 端 project scope 根原绑 {@link AutoMemPaths#currentSessionProjectRoot()} —— worktree
+     * Java 端 project scope 根原绑 {@code AutoMemPaths.currentSessionProjectRoot()}（批 4b-1 已删）—— worktree
      * 隔离子代理场景错位为 projectRoot。本方法以 worktree 路径覆盖 cwdSupplier（对齐 CC getCwd
      * 语义）；非 worktree 场景保持 projectRoot 绑定（T5 C3：非 worktree 的 effectiveCwd=user.dir
      * 不是 projectRoot 替身，不可作覆盖值）。

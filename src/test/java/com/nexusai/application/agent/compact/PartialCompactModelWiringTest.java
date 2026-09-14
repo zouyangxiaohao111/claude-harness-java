@@ -59,8 +59,9 @@ import static org.mockito.Mockito.when;
  *       （188374 → 94625，少计）；{@link #deepseekSession_ctxCarriesModel_inputOnly} 仍绿
  *       —— 正是「只有 anthropic 侧少计」的实证。</li>
  *   <li>把 {@code resolveCompactModel} 的 DB 回落链去掉（只读 live state）→
- *       {@link #unregisteredSession_fallsBackToSessionRecord} 与
- *       {@link #fallsBackToSettingsMainModel} 红。</li>
+ *       {@link #anthropicSession_ctxCarriesModel_fourFieldSum}（未注册会话 · DB 会话记录取模型）与
+ *       {@link #fallsBackToSettingsMainModel} 红 —— [S4 反向实验实测] 该单点变异实际红 3 条
+ *       （{@link #deepseekSession_ctxCarriesModel_inputOnly} 亦红，三处同源回落）。</li>
  *   <li>把「会话记录缺失/模型为空」改成臆断 anthropic → {@link #noModelAnywhere_fallsBackAsNonAnthropic} 红。</li>
  * </ol>
  *

@@ -18,13 +18,16 @@ import java.util.function.Consumer; // [批 5a] 仅 javadoc 引用（载体已�
  * emit（单流程恰 5 事件）。本类承担「把进度事件推出当前线程到 STOMP + 让压缩可被会话级打断」：
  *
  * <ol>
- *   <li><b>进度推送</b>：{@link #register}（manual handleCompactCommand / auto LlmAgentLoop
- *       压缩期间）→ {@link CompactConversationContext#getOnCompactProgress()} 未显式设时委托本
- *       注册表 → 推前端 topic。{@link #toFrontendJson} 对齐 CC union + Java 扩展
+ *   <li><b>进度推送</b>：sink 由调用方经 {@code CompactConversationContext.setOnCompactProgress}
+ *       显式装箱（{@code buildAutoContext} 从 ToolUseContext 透传；manual handleCompactCommand /
+ *       auto LlmAgentLoop 压缩期间）—— [批 5a] 本类原 {@code register} 静态注册表已删，
+ *       不再有「未显式设时委托本注册表」的回落。本类只提供 {@link #topic} 与
+ *       {@link #toFrontendJson}：后者对齐 CC union + Java 扩展
  *       {@code {type:'compact_progress', chars}}（摘要流式真进度，前端进度条蠕动源）。</li>
- *   <li><b>可中断（CC Esc）</b>：manual /compact 摘要段耗时最长且 CC 中可 Esc 打断。压缩线程
- *       {@link #registerAbort}（当前压缩 AbortController，StreamCompactSummary abort 源经
- *       ToolRegistrationConfig abortControllerSupplier 取）→ {@link #registerSessionAbort}
+ *   <li><b>可中断（CC Esc）</b>：manual /compact 摘要段耗时最长且 CC 中可 Esc 打断。摘要中断源
+ *       由调用方经 {@code CompactConversationContext.setAbortController} 显式携带
+ *       （[批 5a] 原 {@code registerAbort} ThreadLocal 槽位已删；CC 对应物 =
+ *       {@code context.abortController}）→ {@link #registerSessionAbort}
  *       （会话级登记，供跨线程前端 cancel abort）；{@link #abortForSession} 由 cancelSession
  *       （前端停止/Esc → POST /api/v1/sessions/{sid}/cancel）调用 → abort 会话在飞压缩 →
  *       摘要 provider 硬断流 → 压缩 catch 返回 "Compaction canceled."（对齐 CC compact.ts:126）。</li>

@@ -183,8 +183,11 @@ class CommandHookExecutorTest {
         //   非会话线程发射的 hook（WebSocketPermissionPrompter 裸池 → permission-racer）读到 env ??
         //   ~/.nexusai ⇒ slug 错 ⇒ resolveExistingTranscript 返回 null ⇒ transcript_path 被静默省略。
         //   现锚 = SessionProjectRoot.getForSession(sessionId)（未绑定 → null ⇒ 省略，不回落）。
-        // RED: 回退为 currentSessionProjectRoot() → 首断言（未绑定会话不得产出 transcript_path）变红
-        //   （ThreadLocal 空时回落 config home，若该目录下恰好存在同名文件即产出错 slug 路径）。
+        // RED（[批 4b-1] 重锚到现存可执行变异）：把本方法的锚源从
+        //   {@code SessionProjectRoot.getForSession(sessionId)} 改成 config-home 回落
+        //   （{@code NexusaiPaths.getAppConfigHomeDir()}，= 已删的 currentSessionProjectRoot() 第 3 级）
+        //   → 首断言（未绑定会话不得产出 transcript_path）变红：config home 被冒充项目根 ⇒ 恒产出
+        //   transcript_path（与同名文件是否存在无关）。
         String sid = "sess-p6-bound";
         Path projectRoot = Files.createDirectories(tempDir.resolve("proj"));
         Path cfgHome = Files.createDirectories(tempDir.resolve("cfg-home"));

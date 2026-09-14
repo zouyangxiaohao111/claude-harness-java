@@ -23,7 +23,8 @@ import java.util.concurrent.CompletableFuture;
  * (services/toolUseSummary/toolUseSummaryGenerator.ts:45-97)。
  *
  * <p><b>WHY</b>: CC 用 {@code queryHaiku} 快模型生成工具使用总结（fire-and-forget，
- * 主链不等）。Java 端复用 {@link LlmProviderFactory#chatWithOptions}（与
+ * 主链不等）。Java 端复用 {@code LlmProviderFactory#chatWithOptions}（Provider 级可选负载，
+ * 无对应时回落 {@code getProvider(...)} 基础接口；与
  * {@code LlmAgentLoop.triggerSkillCatalogHaikuSummaryAsync} 同模式）。失败/无 provider →
  * 返回 completedFuture(null)，绝不阻塞主链。
  *

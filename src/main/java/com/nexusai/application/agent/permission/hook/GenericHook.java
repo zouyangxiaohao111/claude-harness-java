@@ -56,7 +56,7 @@ public interface GenericHook {
      * <table>
      *   <tr><th>CC 字段</th><th>Java 字段</th><th>用途</th></tr>
      *   <tr><td>{@code message}</td><td>{@link #message}</td><td>user-visible message</td></tr>
-     *   <tr><td>{@code systemMessage}</td><td>{@link #systemMessage}</td><td>系统级消息</td></tr>
+     *   <tr><td>{@code systemMessage}</td><td>{@link #systemMessages} (List&lt;String&gt;, H-WF5a-02 折叠 N 结果)</td><td>系统级消息</td></tr>
      *   <tr><td>{@code blockingError}</td><td>{@link #blockingError} ({@link HookBlockingError})</td>
      *     <td>结构化阻塞错误 (CC types/hooks.ts:243-246)</td></tr>
      *   <tr><td>{@code outcome}</td><td>{@link #outcome} (enum)</td><td>success/blocking/...</td></tr>
@@ -64,7 +64,7 @@ public interface GenericHook {
      *   <tr><td>{@code stopReason}</td><td>{@link #stopReason}</td><td>阻止原因</td></tr>
      *   <tr><td>{@code permissionBehavior}</td><td>{@link #permissionBehavior}</td><td>权限决议 (ask/deny/...)</td></tr>
      *   <tr><td>{@code hookPermissionDecisionReason}</td><td>{@link #hookPermissionDecisionReason}</td><td>hook 决策原因</td></tr>
-     *   <tr><td>{@code additionalContext}</td><td>{@link #additionalContext} (String, H3 改单值)</td><td>附加上下文</td></tr>
+     *   <tr><td>{@code additionalContext}</td><td>{@link #additionalContexts} (List&lt;String&gt;, H-WF5a-02 折叠 N 结果)</td><td>附加上下文</td></tr>
      *   <tr><td>{@code updatedInput}</td><td>{@link #updatedInput}</td><td>修改后 input</td></tr>
      *   <tr><td>{@code updatedMCPToolOutput}</td><td>{@link #updatedMCPToolOutput}</td><td>MCP output 替换</td></tr>
      *   <tr><td>{@code retry}</td><td>{@link #retry}</td><td>允许重试</td></tr>

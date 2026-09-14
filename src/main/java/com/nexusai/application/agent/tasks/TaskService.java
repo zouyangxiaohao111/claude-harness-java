@@ -203,7 +203,8 @@ public class TaskService {
      *   <li><b>nexusai.team.name</b>（CC 优先级 3 的 getTeamName() Java 近似，对齐
      *       teammate.ts:111-119 实际行为；修复原遗留错误 teamName key——该 key 全仓库
      *       无任何写入点，grep 实证属脏 key）</li>
-     *   <li>ThreadLocal {@link #leaderTeamNameHolder}（对齐 CC tasks.ts:25/209 leaderTeamName）</li>
+     *   <li>（已删）ThreadLocal {@code leaderTeamNameHolder}（对齐 CC tasks.ts:25/209 leaderTeamName）
+     *       —— 「ThreadLocal 载体一律不得读」铁律下令删除，其位由上一项的显式形参 {@code identity} 承载</li>
      *   <li>sysprop <b>nexusai.sessionId</b>（CC tasks.ts:209 getSessionId() 的部署注入会话 ID）</li>
      *   <li><b>显式形参 sessionId</b>（CC tasks.ts:209 getSessionId() 的当前会话 · [批 3c] 原为
      *       裸 MDC 会话槽，现由调用方显式传入 —— REST 侧 query {@code ?sessionId=}、

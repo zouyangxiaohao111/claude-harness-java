@@ -917,7 +917,7 @@ public class WriteFileTool implements Tool {
      * [G2] tool_result 块 · 对齐 CC {@code FileWriteTool.ts:418-433 mapToolResultToToolResultBlockParam}
      * （成功路径被调 toolExecution.ts:1292）。
      *
-     * <p>Java 端结构化字段在 {@link ToolResult#structuredOutput}（type/filePath，
+     * <p>Java 端结构化字段在 {@code ToolResult#structuredOutput}（已删；现折入 {@code presentationMeta}）（type/filePath，
      * WriteFileTool.java:414-431 对齐 CC FileWriteTool.ts:369-401 data），本 mapper 读该 map
      * 重建 CC 同款 content（CC :420-432）:
      * <ul>

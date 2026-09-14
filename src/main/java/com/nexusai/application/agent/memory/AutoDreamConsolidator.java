@@ -232,7 +232,6 @@ public class AutoDreamConsolidator {
     /** fork 查询 seam · 测试注入 RecordingQuery；生产接 ProductionForkedQuery */
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
 
-    /** cache-safe params 供应 · null → createMinimalCacheSafeParams 兜底 */
     /**
      * [批 7] cache-safe params 供应 · <b>形参 = 发起本次 fork 的真实会话 id</b>
      * （同 SessionMemoryService/ExtractMemoriesAgent；见其字段 javadoc）。
@@ -240,6 +239,8 @@ public class AutoDreamConsolidator {
      * {@code buildForkParams} 作用域内无会话（自动路径的真实会话 id 存在但只用于「排除自身」，
      * 未下传到 buildForkParams；手动 /dream 的入参只有 workspaceDir）⇒ 供应器侧置
      * 「确无会话」哨兵 + ≥WARN（(b) 合法跳过）。⛔ 不现造会话键。
+     *
+     * <p>null → {@code RunForkedAgent.createMinimalCacheSafeParams} 兜底（不 fail-loud）。
      */
     private volatile java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams>
         cacheSafeParamsSupplier;

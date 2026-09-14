@@ -29,7 +29,7 @@ import java.util.stream.Collectors;
  *   <li>{@code forkExamples} (prompt.ts:115-154) → {@link #forkExamples()}</li>
  *   <li>{@code currentExamples} (prompt.ts:156-188) → {@link #currentExamples()}
  *       （Pattern #12: CC 命名反直觉，Java 端同名保留 + JavaDoc 标 CC 原名）</li>
- *   <li>{@code agentListSection} (prompt.ts:196-199) → {@link #agentListSection}</li>
+ *   <li>{@code agentListSection} (prompt.ts:196-199) → {@code agentListSection} 局部变量</li>
  *   <li>{@code shared} (prompt.ts:202-212) → {@link #sharedSection}</li>
  *   <li>{@code whenNotToUseSection} (prompt.ts:232-240) → {@link #whenNotToUseSection()}</li>
  *   <li>{@code concurrencyNote} (prompt.ts:245-249) → concurrencyNote 局部</li>

@@ -42,7 +42,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>批 4b-2 的闭口 = 把锚显式穿到解析器（{@code RunRequest.boundProject} →
  * {@code LlmAgentLoop.explicitProjectAnchor} → {@code LoopSessionState.explicitProjectAnchor}
  * → {@code resolveAutoMemoryProjectRoot} 在 sessionId 判空<b>之前</b>读它）。
- * 本类守护这条承重链的两条腿：
+ *
+ * <p><b>⚠️ [F-18] 覆盖边界（本类守护哪一段）</b>：本类用例经<b>反射直接调</b>
+ * {@code resolveSessionProjectRoot(String)} / {@code buildSessionStateFromInstance()}，因此只覆盖
+ * <b>被调用方内部</b>；{@code doRun} 里那一行调用点
+ * （{@code resolveSessionProjectRoot(params.boundProject())}）<b>本类不覆盖</b> —— 实证：把该行实参
+ * 改成 {@code null}，本类 6 条<b>仍全绿</b>。<b>调用点覆盖见</b>
+ * {@link LlmAgentLoopRunBoundProjectWiringTest}（以 {@code run(RunRequest)} 为唯一入口）。
+ *
+ * <p>本类守护这条承重链的两条腿：
  * <ol>
  *   <li><b>解析腿</b>：{@code collectRunMaterial} 组装出的系统提示里，auto 记忆段确实指向
  *       <b>锚</b>所指的项目目录（用<b>两个不同锚</b>判别 —— 各自命中各自的，且互不串；

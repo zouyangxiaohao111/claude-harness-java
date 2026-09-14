@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>WHY（整合版 F4 + OPD-M-38 + subagent-reverify #10）：子代理 spawn 入口把**会话项目根**
  * 交给子代理（agent-memory 注入 / loop workspaceDir / userContext / worktree 隔离根）。
- * 批 4b-1 前该值经 {@link AutoMemPaths#CURRENT_PROJECT_ROOT} ThreadLocal 捕获-回放传播；
+ * 批 4b-1 前该值经 {@code AutoMemPaths#CURRENT_PROJECT_ROOT} ThreadLocal 捕获-回放传播（已删）；
  * 载体删除后一律**显式传参**（用户铁律：会话态一律显式传参，回放不算合规）——
  * 生产来源 = {@code ToolUseContext.effectiveCwd()} / {@code shared(projectRoot)} 参数。
  *

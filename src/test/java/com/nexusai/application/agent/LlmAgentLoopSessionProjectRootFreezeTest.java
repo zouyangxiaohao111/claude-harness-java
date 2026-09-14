@@ -40,6 +40,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 直传的项目锚）：原「调用方 {@code setCronProjectRootOverride} 写实例字段 → 消费端读字段并在
  * 同一线程写 AutoMemPaths ThreadLocal」的隐式通道已删，改为值随参数进入。本节两个 cron 用例的
  * 断言目标（workspaceDir / AutoMemPaths / 不冻结 SessionProjectRoot）原样保留，仅载体改锚。
+ *
+ * <p><b>⚠️ [F-18] 覆盖边界（本类守护哪一段）</b>：本类用例经<b>反射直接调</b>
+ * {@code resolveSessionProjectRoot(String)}，因此只覆盖<b>被调用方内部</b>；{@code doRun} 里那一行
+ * 调用点（{@code resolveSessionProjectRoot(params.boundProject())}）<b>本类不覆盖</b> —— 实证：
+ * 把该行实参改成 {@code null}，本类 9 条<b>仍全绿</b>。<b>调用点覆盖见</b>
+ * {@link LlmAgentLoopRunBoundProjectWiringTest}（以 {@code run(RunRequest)} 为唯一入口）。
  */
 @DisplayName("[IMP-A F1] resolveSessionProjectRoot 会话级冻结：首 run 冻结、会话内不重查 DB")
 class LlmAgentLoopSessionProjectRootFreezeTest {
@@ -134,7 +140,10 @@ class LlmAgentLoopSessionProjectRootFreezeTest {
         //   → 构造期 ThreadLocal 恒空 ⇒ 初值恒为 env ?? ~/.nexusai（configHome）⇒ 未命中分支经
         //   buildSessionStateFromInstance 把 configHome 塞进 AgentState（审计 P8）。现默认 null：
         //   未解析到绑定项目就保持 null，下游按「无有效项目」skip（A′）。
-        //   RED: 字段默认值改回 Path.of(AutoMemPaths.currentSessionProjectRoot()) → 首断言变红。
+        //   RED（[S4-residual] 重锚到现存可执行变异）：把字段初始化器改回「构造期读环境态」
+        //   —— 即 {@code workspaceDir = Path.of(NexusaiPaths.getAppConfigHomeDir())}
+        //   （= 已删的 AutoMemPaths.currentSessionProjectRoot() 的 config-home 第 3 级）
+        //   → 首断言（构造期 workspaceDir 必须为 null）变红；漏到 resolve 后仍非 null 则第二断言亦红。
         LlmAgentLoop loop = new LlmAgentLoop(Mockito.mock(LlmProviderFactory.class));
         loop.setStreamContext(null, SESSION_ID, "msg-1");
 

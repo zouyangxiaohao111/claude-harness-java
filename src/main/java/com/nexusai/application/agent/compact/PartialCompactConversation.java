@@ -675,8 +675,10 @@ public final class PartialCompactConversation {
      * fallback。本方法复用会话 ToolUseContext（ctx.getToolUseContext()）与会话级 system prompt
      * 组装链（ctx.getSysPromptCtxProvider() + ctx.getDefaultSysPromptAssemble() +
      * ctx.getCustomSystemPrompt() + ctx.getAppendSystemPrompt()）构建 6 字段 CacheSafeParams
-     * （forkedAgent.ts:57-68 + betas.ts:227-233），产物交给 {@link CacheSafeParamsHolder#save}
-     * （summarize 前 save → finally clear，与 R1 CompactCommand / LlmAgentLoop 同一契约）。
+     * （forkedAgent.ts:57-68 + betas.ts:227-233），产物交给
+     * {@link CompactConversationContext#setCacheSafeParams} 显式携带（[批 5a] 原
+     * CacheSafeParamsHolder#save 槽位已删；summarize 前设进 ctx → 随本次压缩 ctx 回收，
+     * 与 R1 CompactCommand / LlmAgentLoop 同一契约）。
      *
      * <p><b>forkContextMessages</b>: CC up_to 直发前缀命中缓存（:855-858）→
      * {@code forkContextMessages = apiMessages}（up_to = messagesToSummarize / from = allMessages），

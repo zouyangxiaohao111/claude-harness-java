@@ -245,7 +245,7 @@ public class SessionMemoryService {
      * {@code let}</b> —— CC 单进程单会话 ⇒ 「once per session」由模块态天然成立。本仓是
      * <b>一 JVM 多会话</b>，原实现的单份 {@code static volatile boolean} 会让<b>会话 A 发射后
      * 会话 B 的同一事件永不发射</b> ⇒ 「≥WARN / 可观测」在多会话下<b>结构性地退化为「每 JVM 一行」</b>。
-     * 兄弟实现 {@link ExtractMemoriesAgent#hasLoggedGateFailure}/{@code hasLoggedGateFailureBySession}
+     * 兄弟实现 {@code ExtractMemoriesAgent#hasLoggedGateFailure} / {@code ExtractMemoriesAgent.hasLoggedGateFailureBySession}
      * （同批 [sm-cursor-sessionize]）已按会话键控 —— 同一概念两套判据是缺陷，此处收敛到会话键控。
      *
      * <p><b>⛔ 与 {@code ClaudemdEngine.hasLoggedInitialLoad} 的判据差别（为何此可会话化、彼不可）</b>：

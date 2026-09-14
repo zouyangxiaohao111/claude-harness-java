@@ -46,7 +46,7 @@ import java.util.function.Supplier;
  * 流式压缩摘要生产 · 对齐 CC compact.ts:1136-1396 {@code streamCompactSummary}。
  *
  * <p><b>WHY 存在（全域根因）</b>: L4 摘要此前是 no-op 假可用
- * （ToolRegistrationConfig no-op CompactCallback 返回 null → {@link CompactSummary#isValid}
+ * （ToolRegistrationConfig no-op CompactCallback 返回 null → {@code CompactSummary#isValid}（已删）
  * 失败 → recordFailure）。本类重建为 CC {@code streamCompactSummary} 全量语义：
  * <ol>
  *   <li><b>fork 缓存共享</b>（compact.ts:1155-1248）——复用主线程 prompt cache 前缀：
@@ -146,10 +146,13 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      *  toolUseContext/forkContextMessages · forkedAgent.ts:57-68；null → 跳过 fork 路径）。
      *  [IMP-SP-08 DEL-SP-26] 由嵌套 3 字段 record 改引 CC 对齐的 fork.CacheSafeParams（消除双 record 漂移）。
      *  [批 5a] 原为 {@code Supplier<CacheSafeParams>} 字段（读 {@code CacheSafeParamsHolder} 的
-     *  ThreadLocal 槽位 = 进程内隐式通道）；CC 在同处是<b>显式函数参数</b>
-     *  （{@code compactConversation(…, cacheSafeParams, …)} compact.ts:414 /
-     *  {@code streamCompactSummary({… cacheSafeParams})} compact.ts:1176/:1183）⇒ 改为经
-     *  {@code summarize(…, ctx)} 传入的 {@link CompactConversationContext#getCacheSafeParams()} 显式携带。 */
+     *  ThreadLocal 槽位 = 进程内隐式通道）⇒ 改为经 {@code summarize(…, ctx)} 传入的
+     *  {@link CompactConversationContext#getCacheSafeParams()} 显式携带。
+     *  <b>CC 的两半</b>（不是「处处显式参数」）：{@code compactConversation(…, cacheSafeParams, …)}
+     *  走<b>显式函数参数</b>（compact.ts:414 / {@code streamCompactSummary({… cacheSafeParams})}
+     *  compact.ts:1176/:1183）；而 post-turn fork 仍走<b>进程级槽</b>
+     *  cacheSafeParamsSlot.ts:22-37（save 记 sessionId，读时比对，不匹配则置 null）。
+     *  本仓因一 JVM 多会话，统一收敛为 ctx 显式携带（⛔ 不用进程级/线程级槽）。 */
 
     /** abortController（对齐 CC context.abortController.signal）。
      *  [批 5a] 原为 {@code Supplier<AbortController>} 字段（读 {@code CompactProgressState.currentAbort()}
@@ -376,7 +379,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      *
      * <p>构建 summaryRequest（user 消息，content=prompt）+ 调用全量
      * {@link #streamCompactSummary}，返回含 usage 的摘要结果（text 含 &lt;analysis&gt;/&lt;summary&gt;
-     * 标签，供 {@link CompactSummary#isValid} 与 {@link CompactSummary#buildUserMessage}；
+     * 标签，供 {@code CompactSummary#isValid}（已删）与 {@link CompactSummary#buildUserMessage}；
      * usage 供 metrics/tengu_compact 事件消费，对齐 CC compact.ts:630-645
      * {@code compactionUsage = getTokenUsage(summaryResponse)}）。
      *

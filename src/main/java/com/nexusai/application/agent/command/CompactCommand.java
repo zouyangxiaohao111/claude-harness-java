@@ -647,7 +647,7 @@ public final class CompactCommand {
      * microcompactMessages 参考调用 · 对齐 CC {@code microcompactMessages(messages, context)}
      * （compact.ts:98，microCompact.ts:253 链式入口，IMP-09 重建）。
      *
-     * <p><b>IMP-09（D-12）</b>: 旧实现委托 {@link MicroCompactor#compact(List)}（L3 内容清除主路径，
+     * <p><b>IMP-09（D-12）</b>: 旧实现委托 {@code MicroCompactor#compact(List)}（L3 内容清除主路径，
      * 已删）；新实现调用链式入口 {@code microcompactMessages(messages, querySource)}。
      *
      * <p><b>[IMP2-11 V2-S4] /compact 入口 source 语义</b>: CC compact.ts:98 调用不传 querySource
@@ -718,7 +718,7 @@ public final class CompactCommand {
      * （tools=null）。本方法复用会话 ToolUseContext（ctx.toolUseContext()，主线程 per-turn
      * TUC）与会话级 system prompt 组装链（ctx.sysPromptCtxProvider() + ctx.defaultSysPromptAssemble()
      * + ctx.customSystemPrompt()）构建 6 字段 CacheSafeParams（forkedAgent.ts:57-68 +
-     * betas.ts:227-233），产物交给 {@link CacheSafeParamsHolder#save}（call 传统路径 → finally clear）。
+     * betas.ts:227-233），产物交给 {@link CompactConversationContext#setCacheSafeParams} 显式携带（[批 5a] 原 CacheSafeParamsHolder#save 槽位已删 → 改 ctx 显式携带 → summarize 侧读、本次压缩结束即随 ctx 回收）。
      *
      * <p><b>[RES-R4-1]</b>: gate 传 ctx.useGlobalCacheScope()（ToolRegistrationConfig 从
      * configSupplier 经 {@link com.nexusai.application.agent.compact.fork.GlobalCacheScope}

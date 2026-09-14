@@ -108,7 +108,7 @@ public class SkillRegistry {
      * = {@code sessionId -> cwd}。WHY：原生产接线把会话标识取自<b>裸 MDC</b>（第三态：可能读到上一
      * 请求残留的、别的会话的 id），该读点随批 3c 删除 ⇒ 会话标识必须由<b>调用方显式传入</b>
      * （对齐 CC {@code getSkillDirCommands(cwd)} 的 cwd 显式入参语义）。未注入（POJO/测试直构）时回落
-     * {@link AutoMemPaths#currentSessionProjectRoot()}（行为不变）。
+     * {@link AutoMemPaths#currentSessionProjectRootOrNull()}（批 4b-1 后 = 显式 env 或 null，行为已变，非「行为不变」）。
      */
     private Function<String, String> cwdSupplier;
     /**
@@ -463,7 +463,6 @@ public class SkillRegistry {
     }
 
     /**
-    /**
      * IMP-E: 统一缓存键入口 · 对齐 CC memoize-by-cwd（commands.ts:449 {@code loadAllCommands} /
      * commands.ts:563 {@code getSkillToolCommands} / commands.ts:586 {@code getSlashCommandToolSkills}
      * —— 三层 memoize 均按 cwd 建槽）。
@@ -471,12 +470,13 @@ public class SkillRegistry {
      * <p>键 = projectRoot + skillsRoot 复合（M-09 不可逆污染消除）：
      * <ul>
      *   <li><b>projectRoot 分量</b>：{@link #cwdSupplier} 注入（生产 =
-     *       {@code AutoMemPaths::currentSessionProjectRoot}，ToolRegistrationConfig:393，per-session
-     *       ThreadLocal）时取其值 —— 同一 JVM 多会话并发各自独立缓存槽；首触发线程为工具线程
-     *       （IMP-C 捕获-回放传播已在任务体开头注入会话值）时仍解析到会话绑定 P，不会把会话 A 的
+     *       {@code sessionId -> SessionProjectRoot.getForSession(sessionId)}，ToolRegistrationConfig
+     *       接线，按会话 sessionId 查全局冻结表现算、<b>零 ThreadLocal</b>）时取其值 ——
+     *       同一 JVM 多会话并发各自独立缓存槽；首触发线程为工具线程（会话值由调用方显式传入）
+     *       时仍解析到会话绑定 P，不会把会话 A 的
      *       cwd 数据冻结进全 JVM 共享槽（M-09）。</li>
      *   <li><b>cwdSupplier 未注入（POJO/测试直构）</b>：静态回落
-     *       {@link AutoMemPaths#currentSessionProjectRoot()}（CLAUDE_PROJECT_DIR env ?? config home，
+     *       {@link AutoMemPaths#currentSessionProjectRootOrNull()}（CLAUDE_PROJECT_DIR env ?? null；
      *       确定性非 null，绝不读 JVM user.dir）—— 与单目录回退 {@link SkillsLoader#loadFromDirectory}
      *       同源，实例内键稳定。</li>
      *   <li><b>skillsRoot 分量</b>：构造器注入的固定根，与 projectRoot 组合避免两维度输入串槽。</li>
@@ -765,7 +765,7 @@ public class SkillRegistry {
         // [TL-W1 P4] 本次加载的会话 cwd 解析**一次**（键与两个来源同源，杜绝「键用 A、加载用 B」）——
         //   cwdSupplier（生产 = SessionProjectRoot.getForSession(显式 sessionId 形参)，按会话
         //   sessionId 现算、未绑定返回 null，不回读 MDC/ThreadLocal、不回落 config home）优先；
-        //   未注入（POJO/测试直构）→ 维持既有静态回落 AutoMemPaths.currentSessionProjectRoot()。
+        //   未注入（POJO/测试直构）→ 静态回落 AutoMemPaths.currentSessionProjectRootOrNull()（批 4b-1 后已无 currentSessionProjectRoot 载体版）。
         //   null（REST 线程无会话绑定）→ 交由 SkillsLoader 自身默认 cwdSupplier 回落会话 cwd。
         String sessionCwd = resolveSessionCwd(sessionId);
         try {

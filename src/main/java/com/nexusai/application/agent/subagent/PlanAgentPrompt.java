@@ -10,7 +10,7 @@ import java.util.List;
  *
  * <p>L2 契约 (5 Release Gate):
  * <ul>
- *   <li><b>A1</b>: {@link #render(String, String, String, String, boolean)} 5 参 + {@link #whenToUse()}</li>
+ *   <li><b>A1</b>: {@link #render(String, String, String, String, boolean)} 5 参 + {@code whenToUse()}（本类无该方法，CC planAgent.ts 侧概念）</li>
  *   <li><b>A2 Golden Trace</b>: 4 段 (Process/Understanding Requirements/Explore/Design/Detail Plan/Required Output) + READ-ONLY 警告 + critical files 段</li>
  *   <li><b>A3 纯函数</b>: 无副作用;同 input → 同 output</li>
  *   <li><b>A4 边界</b>: embedded=true → search tools hint 用 find/grep</li>

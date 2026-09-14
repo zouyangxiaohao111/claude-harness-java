@@ -67,9 +67,9 @@ import java.util.stream.Collectors;
  * </ul>
  *
  * <p><b>并发注记</b>: partial 在 REST 线程运行。PartialCompactConversation 经
- * {@code CacheSafeParamsHolder}（ThreadLocal，save→summarize→finally clear，RES-OPD-SP33
- * 契约）承载 partial fork 缓存共享槽位；ThreadLocal 隔离 REST 线程与主 loop 线程，无静态槽位
- * 冲突。PostCompactionState.markPostCompaction(sessionId) 会话级安全。会话在跑 LLM turn 时
+ * {@code ctx.setCacheSafeParams}（RES-OPD-SP33 契约；[批 5a] 原 {@code CacheSafeParamsHolder}
+ * ThreadLocal 槽位已删）承载 partial fork 缓存共享，随本次压缩的 ccCtx 回收（无跨线程共享态，
+ * 无静态槽位冲突）。PostCompactionState.markPostCompaction(sessionId) 会话级安全。会话在跑 LLM turn 时
  * 并发 partial 会与内存 AgentState.replaceMessages 分叉（ChatService.inProgress 持有会话）
  * —— 需前端确保非 loading 时调用（对齐 CC MessageSelector 仅非 isLoading 可开），未加 409
  * guard（D-1 最小变更，登记 concerns）。
@@ -286,12 +286,10 @@ public class PartialCompactService {
         //
         // <p><b>线程安全（partial 跑 REST 线程的关键核实）</b>：
         // <ul>
-        //   <li>{@code CompactConversationContext.getOnCompactProgress()} 在<b>事件 accept 时</b>
-        //       读 {@code CompactProgressState.current()}（ThreadLocal），{@code StreamCompactSummary}
-        //       的 abort supplier（{@code () -> CompactProgressState.currentAbort()}）与
-        //       {@code SummaryProgress} 推送同样在<b>调用线程</b>读 ThreadLocal。partial 全程
-        //       （含 {@code StreamCompactSummary.summarize} / {@code PartialCompactConversation}）
-        //       在 REST 线程同步执行、无线程切换 → 注册/读取同线程，ThreadLocal 命中。</li>
+        //   <li>[批 5a] 进度 sink 与摘要 abort 源均改为 {@code ccCtx} <b>显式携带</b>（原
+        //       {@code CompactProgressState.push} / {@code currentAbort} 两个 ThreadLocal 已删）——
+        //       partial 全程（含 {@code StreamCompactSummary.summarize} / {@code PartialCompactConversation}）
+        //       在 REST 线程同步执行、无线程切换，读写的是同一个局部 ccCtx 实例。</li>
         //   <li>abort 是<b>会话级</b>（{@code CompactProgressState.sessionAborts} 为
         //       ConcurrentHashMap，非 ThreadLocal）→ 前端「停止」→ {@code ChatService.cancelSession}
         //       （{@code :1855 abortForSession(sessionId)}）在<b>另一线程</b>也能命中本 REST 线程
@@ -459,17 +457,18 @@ public class PartialCompactService {
      *       → 前端 {@code /topic/sessions/{sid}/compact-progress} 横幅（CompactProgressBar）。
      *       wsTemplate 缺失（非 STOMP 路径/直构测试）→ 不注册，fail loud 记 warn（规则十二），
      *       压缩照常完成。</li>
-     *   <li><b>线程级 abort</b>：{@code registerAbort(compactAbort)}（ThreadLocal）→
-     *       {@code StreamCompactSummary} 的 abort supplier（{@code ToolRegistrationConfig:1061}）
-     *       取到 → 前端取消 → 摘要 provider 硬断流 → 'Compaction canceled.'（对齐 CC
-     *       compact.ts:126）。</li>
+     *   <li><b>线程级 abort</b>：{@code cc.setAbortController(compactAbort)}（:634 显式设进 ccCtx；
+     *       [批 5a] 原 {@code registerAbort} ThreadLocal 载体已删）→ {@code StreamCompactSummary}
+     *       经 {@code ctx.getAbortController()} 取到 → 前端取消 → 摘要 provider 硬断流 →
+     *       'Compaction canceled.'（对齐 CC compact.ts:126）。</li>
      *   <li><b>会话级 abort</b>：{@code registerSessionAbort(sid, compactAbort)}（ConcurrentHashMap，
      *       跨线程）→ 前端停止/Esc → {@code ChatService.cancelSession:1855 abortForSession(sid)}
      *       可达本 REST 线程在飞 partial 压缩。</li>
      * </ol>
      *
-     * <p><b>成对性</b>：调用方 {@link #partialCompact} 在 finally 内调用 {@code clear()} /
-     * {@code clearAbort()} / {@code removeSessionAbort(sessionId)}（三路必达，幂等）。
+     * <p><b>成对性</b>：调用方 {@link #partialCompact} 在 finally 内调用
+     * {@code removeSessionAbort(sessionId)}（三路必达，幂等；[批 5a] 原 {@code clear()} /
+     * {@code clearAbort()} 随两个 ThreadLocal 载体一并删除）。
      *
      * @param sessionId   会话 ID（short 直键 · 与 topic 拼装/会话级 abort 同源）
      * @param compactAbort 本次 partial 压缩的 AbortController（同时设进 ctx.abortController，
@@ -630,7 +629,7 @@ public class PartialCompactService {
         //   非 STOMP 路径 → 回落字段默认 no-op（与 auto/manual 同款降级，不再自建第二套 sink）。
         // [可中断 2026-09-04 · CC Esc] partial 压缩的 AbortController 与统一通道同一实例：
         //   CompactHooks 的 hook batch abort（CompactHooks:73/234 读 ctx.getAbortController()）
-        //   与 StreamCompactSummary 摘要断流（经 CompactProgressState.currentAbort()）同源 ——
+        //   与 StreamCompactSummary 摘要断流（经 {@code ctx.getAbortController()}）同源 ——
         //   前端停止 → 摘要/hook 一并断（对齐 manual ctx.abortController 语义）。
         cc.setAbortController(compactAbort);
         // [批 5a] 进度 sink 显式装箱（CC context.onCompactProgress Tool.ts:239）——取代原

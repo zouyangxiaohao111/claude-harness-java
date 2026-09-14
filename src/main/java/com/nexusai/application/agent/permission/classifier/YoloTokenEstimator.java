@@ -21,7 +21,7 @@ import java.util.regex.Pattern;
  *       错误文本，判定 transcript 超出分类器上下文窗口（确定性错误，重试无效）。</li>
  * </ul>
  *
- * <p>[S06 重构] {@link #wouldOverflow} 已删除（⊕-04 / OPD-WF6-02）：CC 无 128000 预检、
+ * <p>[S06 重构] {@code wouldOverflow} 已删除（⊕-04 / OPD-WF6-02）：CC 无 128000 预检、
  * 无 90% 阈值常量（依赖 API 'prompt is too long' 错误承载），超长检测能力统一到
  * {@link #detectPromptTooLong}，避免两套并存。</p>
  *

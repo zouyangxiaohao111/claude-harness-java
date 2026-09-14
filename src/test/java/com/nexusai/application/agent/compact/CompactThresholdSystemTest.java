@@ -29,7 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （编译失败）→ 目标 API 未实现；且 fixed 200k 窗口下 effectiveWindow=200_000−20_000 断言不可能成立。
  *
  * <p><b>env 注入方式</b>: 逻辑单测直接构造 {@link CompactEnvProperties}（override 值），
- * env 绑定单测用 {@link ApplicationContextRunner#withEnvironment} 真实注入环境变量
+ * env 绑定单测用 {@code ApplicationContextRunner#withEnvironment}（Spring Boot 3.5 已移除该方法）真实注入环境变量
  * （CLAUDE_CODE_AUTO_COMPACT_WINDOW 等），经 Spring 宽松绑定到 {@code claude.*} 属性。
  */
 class CompactThresholdSystemTest {

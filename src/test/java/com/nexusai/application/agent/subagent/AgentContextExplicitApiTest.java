@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.within;
  * agentId 编码桥、fork 事件属性、cleanup 键。
  */
 @DisplayName("AgentContext 显式实参 API（类型守卫 / sparse-edge / 遥测属性接入 / agentId 编码）")
-class AgentContextThreadLocalTest {
+class AgentContextExplicitApiTest {
 
     @Test
     @DisplayName("consumeInvokingRequestId 一次消费后清空（CC agentContext.ts:163-178 sparse edge）")

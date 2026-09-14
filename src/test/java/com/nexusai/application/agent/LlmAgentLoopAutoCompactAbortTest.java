@@ -48,10 +48,10 @@ import static org.mockito.Mockito.when;
  * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图，非 WHAT）</b>：{@link CompactProgressState} 有两条
  * abort 通道，auto 压缩此前<b>两条全空</b>：
  * <ol>
- *   <li><b>线程级（摘要断流源）</b>：{@code StreamCompactSummary} 的 abort supplier 是
- *       {@code () -> CompactProgressState.currentAbort()}（ToolRegistrationConfig:1107，ThreadLocal）。
- *       auto 路径从未 {@code registerAbort} → supplier 恒取 null → 回落 {@code AbortController.NOOP}
- *       → 摘要流永不被打断（用户按 Esc 时压缩照跑到底）。</li>
+ *   <li><b>线程级（摘要断流源）</b>：{@code StreamCompactSummary} 的 abort 源 = ccCtx 的
+ *       {@code ctx.getAbortController()}（显式载体；由 {@code CompactConversation.buildAutoContext} :607
+ *       从 {@code tuc.abortController()} 设入）。auto 路径此前 ccCtx 未被设 → 读回默认
+ *       {@code AbortController.NOOP} → 摘要流永不被打断（用户按 Esc 时压缩照跑到底）。</li>
  *   <li><b>会话级（跨线程前端 Esc 桥）</b>：前端停止键/Esc → {@code ChatService.cancelSession}
  *       → {@code CompactProgressState.abortForSession(sessionId)}（ConcurrentHashMap）。
  *       auto 路径从未 {@code registerSessionAbort} → 无此会话 → 返回 false → 前端「停止」
@@ -65,15 +65,18 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>RED tooth（删掉生产代码哪一行 → 本类哪条断言红）</b>：
  * <ul>
- *   <li>删 {@code LlmAgentLoop} auto 压缩块的 {@code registerSessionAbort(...)} →
+ *   <li>删 {@code LlmAgentLoop} auto 压缩块的 {@code registerSessionAbort(...)}（:5689）→
  *       {@link #autoCompactInFlight_abortForSessionFromAnotherThread_isTrue_andCancelsSummarizerAbortSource}
  *       的「跨线程 abortForSession 必须 true」断言红（false）；</li>
- *   <li>删 {@code registerAbort(...)} → 同条测试的
- *       {@code abortReadBySummarizer}（摘要侧读到 null）与 {@code summarizerSawCancelled}（未取消）断言红；</li>
- *   <li>删 finally 的 {@code clearAbort} → {@link #autoCompactFinished_releasesBothAbortChannels}
- *       的 {@code currentAbort()} 非 null 断言红；删 {@code removeSessionAbort} → 同条
- *       {@code abortForSession} 断言红（该用例的控制器<b>未取消</b>，故能区分「已移除」与
- *       「已取消」—— 第一版把清理断言挂在已取消的控制器上，删掉 finally 仍全绿 = 假守卫，已改）。</li>
+ *   <li>把 {@code CompactConversation.java:607 ctx.setAbortController(tuc.abortController())} 删掉
+ *       或改成 NOOP → 同条测试的 {@code abortReadBySummarizer}（摘要侧读到 NOOP）与
+ *       {@code summarizerSawCancelled}（未取消）断言红；</li>
+ *   <li>删 finally 的 {@code removeSessionAbort}（:5817）→
+ *       {@link #autoCompactFinished_releasesBothAbortChannels} 的 {@code abortForSession} 断言红
+ *       （该用例的控制器<b>未取消</b>，故能区分「已移除」与「已取消」—— 第一版把清理断言挂在
+ *       已取消的控制器上，删掉 finally 仍全绿 = 假守卫，已改）。<b>[批 5a] 原「删 finally 的
+ *       {@code clearAbort}」这一 RED tooth 已随之删除</b>：ThreadLocal 出栈载体不存在了，
+ *       该变异点已无法构造（写出它就是不可证伪的伪守卫）。</li>
  *   <li>去掉 NOOP 守卫（无条件注册 TUC 的 abortController）→
  *       {@link #autoCompact_withNoopAbortController_doesNotFakeAbortedSignal} 红。</li>
  * </ul>
@@ -85,9 +88,9 @@ import static org.mockito.Mockito.when;
  * 透传进去（{@code services/compact/autoCompact.ts:342-344}）→ 用户 Esc 中断的是同一个控制器，
  * 由 {@code commands/compact/compact.ts:135} 翻译为 {@code 'Compaction canceled.'}。
  * 本仓 auto 路径的等价物 = {@code params.toolUseContext().abortController()}
- * （= runAbortController，亦即 {@code CompactConversation.buildAutoContext:603} 写进 ccCtx 的同一实例）。
+ * （= runAbortController，亦即 {@code CompactConversation.buildAutoContext:607} 写进 ccCtx 的同一实例）。
  */
-@DisplayName("[批1b] auto-compact 可中断：registerAbort + registerSessionAbort（跨线程 Esc 真线程可达）")
+@DisplayName("[批1b] auto-compact 可中断：ccCtx.setAbortController + registerSessionAbort（跨线程 Esc 真线程可达）")
 class LlmAgentLoopAutoCompactAbortTest {
 
     /** 测试 1 会话（独立 key，避免与其它用例的静态槽位串台）。 */
@@ -154,14 +157,15 @@ class LlmAgentLoopAutoCompactAbortTest {
 
         assertThat(loopThread.isAlive()).as("压缩放行后循环线程必须结束（不挂起）").isFalse();
         assertThat(abortReadBySummarizer.get())
-            .as("摘要侧 abort 源（生产 supplier () -> CompactProgressState.currentAbort() 的同一 ThreadLocal）"
-                + "必须 = TUC 上的 run 级控制器（CC context.abortController 同源，不新建第二套）")
+            .as("摘要侧 abort 源（生产 = CompactConversation.buildAutoContext 从 tuc.abortController() "
+                + "显式设进 ccCtx 的同一实例）必须 = TUC 上的 run 级控制器"
+                + "（CC context.abortController 同源，不新建第二套）")
             .isSameAs(runAbort);
         assertThat(summarizerSawCancelled.get())
             .as("跨线程 abort 必须落到摘要真正消费的那个控制器（isCancelled=true → provider 硬断流 →"
                 + " 压缩中止，CC 'Compaction canceled.'）")
             .isTrue();
-        // ⛔ 清理（clearAbort / removeSessionAbort）不在此断言：本测试里 runAbort 已被上面那次
+        // ⛔ 清理（removeSessionAbort）不在此断言：本测试里 runAbort 已被上面那次
         //   abortForSession 置为取消 → 即使 finally 完全缺失，abortForSession 也会因 isCancelled()
         //   返回 false 而「看起来通过」（第一版断言正是如此：删掉 finally 仍然全绿 —— 假守卫）。
         //   清理由 {@link #autoCompactFinished_releasesBothAbortChannels()} 用<b>未取消</b>的控制器
@@ -214,7 +218,7 @@ class LlmAgentLoopAutoCompactAbortTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("压缩结束 → clearAbort（ThreadLocal 出栈）+ removeSessionAbort（会话槽位移除）成对释放")
+    @DisplayName("压缩结束 → 新建 ccCtx 不携带上次控制器 + removeSessionAbort（会话槽位移除）成对释放")
     void autoCompactFinished_releasesBothAbortChannels() {
         AgentState state = new AgentState("sys", SESSION_FINISHED, null);
         state.replaceMessages(List.of(
@@ -233,8 +237,8 @@ class LlmAgentLoopAutoCompactAbortTest {
 
         AgentLoopContext ctx = agentLoopContext(plainReplyProvider());
         QueryParams p = params(state, ctx, runAbort);
-        // 同步在本测试线程驱动 —— 这样压缩结束后可直接观察压缩线程的 ThreadLocal
-        // （异步线程一结束 ThreadLocal 随线程消亡，clearAbort 就再也测不到）。
+        // 同步在本测试线程驱动 —— 这样压缩结束后可直接观察（新 ccCtx 不携带上次控制器）。
+        // [批 5a] 原理由「异步线程一结束 ThreadLocal 随线程消亡，clearAbort 测不到」随载体删除失效。
         LlmAgentLoop.queryLoop(
             LlmAgentLoop.collectRunMaterial(p.deps().context(), p, state),
             state, new ArrayList<>(), autoCompactor);
@@ -262,9 +266,9 @@ class LlmAgentLoopAutoCompactAbortTest {
     /**
      * 在摘要回调内<b>阻塞</b>的 AutoCompactor —— 制造「压缩在飞」窗口，供另一线程断言。
      *
-     * <p>回调全程跑在压缩线程（生产会话线程）上：{@code abortRead} 读的是生产 supplier 的
-     * <b>同一表达式</b> {@code CompactProgressState.currentAbort()}（ThreadLocal），
-     * 故它不是「测试自己设置自己读」，而是对生产注册动作的观察。
+     * <p>回调全程跑在压缩线程（生产会话线程）上：{@code abortRead} 读的是生产同一表达式
+     * {@code ctx.getAbortController()}（显式载体，由 {@code buildAutoContext} 从 {@code tuc}
+     * 设入 ccCtx），故它不是「测试自己设置自己读」，而是对生产装配动作的观察。
      */
     private static AutoCompactor blockingAutoCompactor(
             CountDownLatch inside, CountDownLatch release,

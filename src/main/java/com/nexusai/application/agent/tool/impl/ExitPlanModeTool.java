@@ -546,7 +546,7 @@ public class ExitPlanModeTool implements Tool {
 
     /**
      * mapToolResult → tool_result 块 · 对齐 CC ExitPlanModeV2Tool.ts:419-491.
-     * 从 {@link ToolResult#structuredOutput} 读 V2 契约字段，重建 content（Approved Plan 回显）。
+     * 从 {@code ToolResult#structuredOutput}（已删；现折入 {@code presentationMeta}）读 V2 契约字段，重建 content（Approved Plan 回显）。
      */
     @Override
     public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result, String toolUseId, boolean isError) {

@@ -46,7 +46,7 @@ import java.util.UUID;
  * <h2>resolve 优先级（sessionId → AgentState）</h2>
  * <ol>
  *   <li><b>归一化解析</b>：sessionId（合规 UUID 直解 / 原始 {@code "sess-xxx"} 8 位拼接 /
- *       hash 兜底）经 {@link ChatService#parseSessionUuid} 归一化成<b>与 mark 侧一致的解析 UUID</b>
+ *       hash 兜底）经 {@code ChatService#parseSessionUuid}（已删）归一化成<b>与 mark 侧一致的解析 UUID</b>
  *       → {@link SessionAgentStateRegistry#get} 命中注册会话则读写该 AgentState 的
  *       {@code pendingPostCompaction}（会话级）。生产 sessionId 是 {@code "sess-xxxxxxxx"} 格式
  *       （SessionService.generateId 非合法 UUID），mark 侧（LlmAgentLoop:1550 创建

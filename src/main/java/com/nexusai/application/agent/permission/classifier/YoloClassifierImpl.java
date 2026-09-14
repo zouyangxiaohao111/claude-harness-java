@@ -831,10 +831,10 @@ public class YoloClassifierImpl implements YoloClassifier {
             toIntUsage(u.cacheReadInputTokens()), toIntUsage(u.cacheCreationInputTokens()));
     }
 
-    /** long token 计数 → int（超上限截断，实际 token 计数远小于 2^31）。 */
     /** AgentUsage 4 token 字段为 Long（nullable，CC agentToolUtils.ts:241-242 nullable）·
      *  DeepSeek 不返回 cache_creation_input_tokens → null → 0（对齐 CC extractUsage `?? 0`，
-     *  2026-08-25 联调实测 NPE）。 */
+     *  2026-08-25 联调实测 NPE）。超上限截断到 {@code Integer.MAX_VALUE}
+     *  （实际 token 计数远小于 2^31）。 */
     private static int toIntUsage(Long v) {
         if (v == null) {
             return 0;

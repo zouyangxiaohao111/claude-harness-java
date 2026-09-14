@@ -44,7 +44,7 @@ import java.util.function.Consumer;
  *       registerAgentAbort）+ {@code :329-353}（catch AbortError → {@link WorkflowAbortedError} +
  *       finally unregister/cleanup）：
  *       <ul>
- *         <li>{@link AbortBridge#create} 建子 AbortController，父 {@code ctx.signal()} 取消时级联
+ *         <li>{@link #createAbortBridge} 建子 AbortController，父 {@code ctx.signal()} 取消时级联
  *             abort（Java {@link AbortController#onCancel} 等价 addEventListener），并注入
  *             {@code ctx.registerAgentAbort(agentId, agentAbort)} 供
  *             {@code service.kill(runId, agentId)} 精确 abort 单个 agent（CC 注释 :244-245 根因：
@@ -61,7 +61,7 @@ import java.util.function.Consumer;
  * <pre>
  * IsolationResult iso = manager.createIsolation(params, ctx.runId(), coreAgentId, gitRoot);
  * if (iso instanceof IsolationFailed failed) return manager.toWorktreeFailed(failed);
- * try (AbortBridge bridge = AbortBridge.create(ctx)) {
+ * try (AbortBridge bridge = manager.createAbortBridge(ctx)) {
  *     ... // runInCwd(worktreePath, () -> runAgent(...)); override.abortController = bridge.agentAbort()
  * } catch (Exception e) {
  *     rethrowIfAborted(bridge, e);               // abort → 抛 WorkflowAbortedError

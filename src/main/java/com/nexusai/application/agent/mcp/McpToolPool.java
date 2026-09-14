@@ -956,7 +956,7 @@ public class McpToolPool {
      * + 伪工具替换 client.ts:2318）。
      *
      * <p>由 {@link McpServerTool#execute} 捕获 transport 401（{@link McpAuthError}）后调用，
-     * 与连接期 401（{@link #processBatchServer} / {@link #assembleSingleServer}）共用三件套：
+     * 与连接期 401（{@link #processBatchServer} / {@link #assembleToolPool}）共用三件套：
      * <ol>
      *   <li><b>needs-auth 缓存标记</b> — {@link McpNeedsAuthCache#setCached}（15min TTL，
      *       对齐 CC setMcpAuthCacheEntry client.ts:293-309）</li>

@@ -9,7 +9,7 @@ package com.nexusai.application.agent.tool;
  * </pre>
  *
  * <p><b>[IMP-C5] FileReadEvent 退役</b>：Java 原把 {@code (filePath, content)} 扩成
- * {@link FileReadEvent}（带 mtime / callId 追踪字段）——CC 无此事件对象，删除扩展字段并
+ * {@code FileReadEvent}（带 mtime / callId 追踪字段；**已退役**）——CC 无此事件对象，删除扩展字段并
  * 直接对齐 CC 二元签名 {@code (filePath, content)}（TR-D1-⊕-2 拍板）。listener 收到的
  * {@code content} 为 <b>本次读取的 range 内容</b>（对齐 CC FileReadTool.ts:1040-1044
  * {@code listener(resolvedFilePath, content)}，content 为 readFileInRange 返回的窗口内容，

@@ -22,7 +22,7 @@ import static org.mockito.Mockito.when;
  * 的配置文件路径）。本测试锁定路径描述语义：
  * <ul>
  *   <li><b>describeMcpConfigFilePath 各 scope</b>：project → {@code <cwd>/.mcp.json}；
- *       user → {@link #globalConfigFilePath()}；local → {@code globalConfigFilePath() +
+ *       user → {@link FileConfigStorage#globalFilePath()}；local → {@code globalConfigFilePath() +
  *       " [project: <cwd>]"}；dynamic → "Dynamically configured"；enterprise →
  *       {@link McpEnterpriseConfig#getEnterpriseMcpFilePath()}（缺省 managed-mcp.json）；
  *       claudeai → "claude.ai"；default → 原样返回 scope（CC utils.ts:254-271）。</li>

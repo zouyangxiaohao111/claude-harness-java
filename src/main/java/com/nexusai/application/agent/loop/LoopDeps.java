@@ -16,9 +16,10 @@ import java.util.UUID;
  * {@link #context()}（返回基础设施容器）。<b>接口不再暴露 {@code LlmAgentLoop} 类型</b>——
  * 主/Subagent/Hook 三路 deps 均只暴露 {@link AgentLoopContext}，达成接口层"删 carrier 模型"。
  *
- * <p><b>过渡说明</b>: 行为方法（applyPerMessageBudget/handleToolCallsTurn 等 19 个）当前经
- * {@link AgentLoopContext#behaviors()} 门面委托 LlmAgentLoop 实例（P1 过渡态）。Behaviors
- * static 化（方法签名加 ctx、loop 内直接调用）后彻底脱离 LlmAgentLoop 实例——后续会话推进。
+ * <p><b>过渡说明（已完成）</b>: 行为方法（applyPerMessageBudget/handleToolCallsTurn 等 19 个）
+ * 曾（P1 过渡态）经 {@code AgentLoopContext.behaviors()} 门面委托 LlmAgentLoop 实例；现已
+ * <b>static 化</b>（方法签名加 ctx，如 {@code AgentLoopContext.handleToolCallsTurn(ctx, …)}），
+ * 彻底脱离 LlmAgentLoop 实例。
  *
  * <p><b>CC 对齐</b>: CC {@code query.ts:181-199} 的 deps 是 4 窄 IO（callModel/microcompact/
  * autocompact/uuid）。Java 三载体把 IO 行为（callModel 等）+ context 工厂收敛在本接口，

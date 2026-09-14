@@ -283,8 +283,9 @@ public class ReactiveCompactor {
      * </ol>
      *
      * <p>Java 映射：{@code CompactConversationContext}（ccCtx）= CC {@code params.toolUseContext}
-     * 依赖面；fork 缓存共享经 {@link com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder}
-     * 槽位（调用方 save → compactConversation 内 StreamCompactSummary 读取 → finally clear）。
+     * 依赖面；fork 缓存共享经 {@code CompactConversationContext}（ccCtx）显式携带 ——
+     * 调用方 setCacheSafeParams → compactConversation 内 StreamCompactSummary 经 ctx 读取
+     * （[批 5a] 原 CacheSafeParamsHolder 槽位已删）。
      * 返回 {@link ReactiveCompactOutcome}（{@code {ok, reason, result}} 信封，CC 同形）。
      *
      * @param messages           待压缩消息（boundary 剥离后）
@@ -341,8 +342,9 @@ public class ReactiveCompactor {
      *
      * <p><b>cacheSafeParams</b>: CC 传入 systemPrompt/userContext/systemContext/toolUseContext/
      * forkContextMessages 供压缩时做缓存安全消息替换；Java 端 fork 缓存共享经
-     * {@link com.nexusai.application.agent.compact.fork.CacheSafeParamsHolder} 槽位
-     * （LlmAgentLoop reactive 路径当前未接线，保留字段供 CC 签名对齐）。
+     * {@code CompactConversationContext}（ccCtx）显式携带（[批 5a] 原 CacheSafeParamsHolder
+     * 槽位已删）—— LlmAgentLoop reactive 路径已接线（{@code reactiveCcCtx.setCacheSafeParams}，
+     * LlmAgentLoop.java:7345）。
      *
      * @param params 调用参数（hasAttempted 单次守卫 / querySource / aborted / messages /
      *               cacheSafeParams / ccCtx）

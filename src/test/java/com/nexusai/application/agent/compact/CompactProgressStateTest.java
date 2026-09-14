@@ -92,7 +92,7 @@ class CompactProgressStateTest {
     @Test
     @DisplayName("[批 5a] 可中断：会话级 abortForSession（前端停止/Esc → cancelSession 打断压缩）· 跨线程可达")
     void abortChannel_sessionLevelAbortsCrossThread() throws InterruptedException {
-        // 原用例前 3 行断言 registerAbort/currentAbort（已删除的 ThreadLocal）。语义重表达：
+        // 原用例前 3 行断言 registerAbort/currentAbort（已删除的 ThreadLocal 载体）—— 现由 ccCtx.setAbortController 显式携带。语义重表达：
         // 摘要中断源现随 ctx 显式携带（见 CompactConversationContext.getAbortController ，
         // 消费点 StreamCompactSummary 经 ctx 读取）——本用例保留**跨线程**可达的会话级通道断言
         // （这才是「前端停止键能打断 REST 线程压缩」的承重部分）。

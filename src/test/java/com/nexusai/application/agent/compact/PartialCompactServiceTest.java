@@ -646,7 +646,7 @@ class PartialCompactServiceTest {
      * HTTP 请求线程执行（{@code ChatService:1855 abortForSession(sessionId)}）。若 abort 只登记在
      * ThreadLocal，前端将永远打不断 REST 线程的 partial 压缩（用户按停止无效）。本用例用一个
      * <b>真实的新线程</b>调用 {@code abortForSession}，证明会话级 ConcurrentHashMap 通道可达；
-     * 并证明 REST 线程内 {@code CompactProgressState.currentAbort()}（StreamCompactSummary 摘要
+     * 并证明 REST 线程内 {@code ctx.getAbortController()}（StreamCompactSummary 摘要
      * 断流 supplier 的读取点）是<b>同一实例</b>且已被置位 → 摘要 provider 会硬断流。
      *
      * <p><b>RED 条件</b>：删去 {@code registerProgressChannel} 内

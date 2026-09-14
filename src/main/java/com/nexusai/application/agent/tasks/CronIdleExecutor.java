@@ -80,8 +80,9 @@ public class CronIdleExecutor {
      *   assistant 已落库 → DB 顺序正确）。 */
     @Autowired(required = false) private com.nexusai.domain.session.MessageService messageService;
     /**
-     * [cron-fire-visible] 结果落库 · cron 触发 run 结束后复用 {@link ChatService#replayAndPersist}
-     *   （主链路同款回放持久化：落库 assistant/tool/final，user 已落库跳过，注入历史经
+     * [cron-fire-visible] 结果落库 · cron 触发 run 结束后复用 {@code ChatService#replayAndPersist}
+     *   （**已删**；[实时落库 2026-09-03] 后主链路改为 appendListener 逐条实时落库，cron 同 SPI。
+     *   原语义：落库 assistant/tool/final，user 已落库跳过，注入历史经
      *   prePersistedMessageIds 跳过防重）→ 转录落 DB + tool_call/tool_result STOMP 推前端。
      *   对齐 CC onFireTask（useScheduledTasks.ts:110-113）：cron 结果落 transcript，用户可见回复。
      *   null（未注入，非 Spring 单测）→ 跳过落库（headless/测试不阻断 loop）。

@@ -1063,8 +1063,8 @@ public class AutoCompactor {
      *
      * <p><b>[P1a F-08]</b> {@code querySource} 由调用方显式传入（对齐同文件 {@code model} 的
      * 显式入参手法 · P2-7）：旧实现读实例字段 {@code this.querySource}（由 autoCompactIfNeeded
-     * 写回，单例多会话串台）。便捷重载 {@link #tryAutoCompact(List, int)} 仍传字段值作为回落
-     * （见 {@link #querySource} 字段注释）。
+     * 写回，单例多会话串台）——该字段已随 [S1 轨 III · T9 2026-09-14] 删除。便捷重载
+     * {@link #tryAutoCompact(List, int)} 改传字面量 {@code "user"}（见本文件 :164）。
      *
      * <p><b>会话字段（S-route 残差）</b>：{@code sessionId}/{@code agentId} 仍回落实例字段
      * <p><b>[S1 轨 III · T9 2026-09-14] 本方法不再填 sessionId/agentId/toolUseContext</b>：

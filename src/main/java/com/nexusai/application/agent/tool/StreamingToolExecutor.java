@@ -65,7 +65,7 @@ import java.util.function.Function;
  * <p><b>[R32-#15] 架构对齐源修正</b>: Java 端实际对齐 CC
  * {@code Open-ClaudeCode/src/services/tools/StreamingToolExecutor.ts}(完整 530 行),
  * 而非 {@code query.ts:561}(旧文档误引用)。批次 6 修订 JavaDoc 与所有内部行号引用。
- * 同时 {@link ToolCallPartitioner} 对齐 {@code toolOrchestration.ts:88-125 partitionToolCalls},
+ * 同时 {@code ToolCallPartitioner}（本体文件已不存在）对齐 {@code toolOrchestration.ts:88-125 partitionToolCalls},
  * 两者职责独立 (Partitioner 是 batch 分配, StreamingToolExecutor 是流式执行)。
  *
  * <h2>核心设计</h2>
@@ -322,7 +322,7 @@ public class StreamingToolExecutor {
      * <ul>
      *   <li>MCP 工具 + {@link GenericHook.HookResult#updatedMCPToolOutput()} != null → 替换 toolOutput</li>
      *   <li>non-MCP + {@link GenericHook.HookResult#blockingError()} != null → 作为 feedback 追加到 result</li>
-     *   <li>non-MCP + {@link GenericHook.HookResult#additionalContext()} != null → 追加 metadata</li>
+     *   <li>non-MCP + {@link GenericHook.HookResult#additionalContexts()} != null → 追加 metadata</li>
      * </ul>
      *
      * <p>null → 退化为不串联 hook (向后兼容批次 1 之前的行为).
@@ -2453,7 +2453,7 @@ public class StreamingToolExecutor {
      *
      * <p><b>[P2-2 审计判定] putPOJO 分支可达性</b>: 当前 hook 唯一调用方是
      * {@code preOutcome.updatedInput()} (AHR.updatedInput, CC 唯一通道), 该字段来源于
-     * {@link com.nexusai.application.agent.permission.hook.HookRegistry.JsonNodeToMap}
+     * {@code HookRegistry} 的 JsonNodeToMap 辅助方法
      * (HookRegistry.java:445-456), 后者只产出 {@code Map<String, JsonNode>}.
      * 因此 else 分支 (putPOJO) 在实际生产路径上<b>不可达</b>.
      *
@@ -3495,7 +3495,7 @@ public class StreamingToolExecutor {
      *   <li>CC {@code getAbortReason(tool: TrackedTool)} 是 <b>per-tool</b> 参数 (StreamingToolExecutor.ts:210);
      *       interrupt 判定用 {@code getToolInterruptBehavior(tool)} (ts:233-241) 查<b>该工具</b>定义
      *       (findToolByName + definition.interruptBehavior()), 而非"第一个 EXECUTING 工具".</li>
-     *   <li>旧 Java 实现 {@link #interruptBehaviorCancel()} 取首 EXECUTING 工具, 多工具并发
+     *   <li>旧 Java 实现 {@code interruptBehaviorCancel()}（已删）取首 EXECUTING 工具, 多工具并发
      *       (Bash=cancel, FileRead=block) 时无法 per-tool 区分 — 已删除, 由 per-tool 判定替代.</li>
      * </ul>
      *

@@ -255,7 +255,7 @@ class AlignComp1ResumeRestorePartialInjectTest {
      * 前缀格式），buildContext 未归一化时 step 13 populate 的 {@code UUID.fromString} 必抛
      * IllegalArgumentException → catch → 跳过，partial 压缩生产恒不注入 invoked_skills
      * （M-33 缺口未闭合）。本测试走 {@link PartialCompactService#partialCompact} 全链路
-     * （真实 buildContext 归一化），registry 键 = {@link ChatService#parseSessionUuid}
+     * （真实 buildContext 归一化），registry 键 = {@code ChatService#parseSessionUuid}（已删）
      * 归一 UUID（与 LlmAgentLoop 主会话注册键同函数一致），断言重组消息含 invoked_skills
      * 附件 —— 裸 UUID 无法通过本用例。
      */

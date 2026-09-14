@@ -19,7 +19,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ol>
  *   <li><b>getRemoteHttpsUrl 是 /schedule 的 gitRepoUrl 真实接线源</b>（BundledSkillsBootstrapper
  *       registerScheduleSkill :369，P2-10 △-9 关闭）——CC 语义为<b>任意 host</b>（GHE/GitLab 等非
- *       github.com 也返回 https URL），与 {@link #getGithubRepo}（仅 github.com）不同。若实现被误改成
+ *       github.com 也返回 https URL），与 {@link GitRemoteResolver#getGithubRepo}（仅 github.com）不同。若实现被误改成
  *       仅 github.com 或仅 SSH 格式，/schedule 的 repo 拼接会对 GHE/GitLab 仓库返回 null → prompt 落
  *       默认 github.com/ORG/REPO 占位 → 运营人员创建远程 agent 时 git repo 错误，静默不可见。</li>
  *   <li><b>SSH→https 拼装 + .git/config 读取是接线契约</b>——CC parseGitRemote 支持

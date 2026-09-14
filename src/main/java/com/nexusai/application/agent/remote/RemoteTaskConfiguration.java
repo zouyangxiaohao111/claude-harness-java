@@ -33,9 +33,9 @@ import java.util.function.Supplier;
  *       迁 <b>temp 唯一根</b> {@code {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks} —— 与
  *       {@link BackgroundTaskRunner#taskOutputDir(String)} 同源（CC diskOutput.ts:50-55 唯一机制）。
  *       旧项目目录根 = CC 无对应的 Java 自创偏离，已消除。</li>
- *   <li><b>红线豁免</b>：输出落点<b>不再</b>经 {@link AutoMemPaths#currentSessionProjectRoot()}
+ *   <li><b>红线豁免</b>：输出落点<b>不再</b>经 {@code AutoMemPaths#currentSessionProjectRoot()}（批 4b-1 已删，旧三级回落版）
  *       （memory/身份域红线约束的是 projectRoot 解析来源，不是 task 输出落点）—— 只拆输出落点
- *       耦合，{@link AutoMemPaths#currentSessionProjectRoot()} 回落链本身不动。</li>
+ *       耦合，{@code AutoMemPaths#currentSessionProjectRoot()}（批 4b-1 已删，旧三级回落版） 回落链本身不动。</li>
  *   <li><b>元数据 sidecar 留项目目录</b>（{@link #sessionProjectRootResolver()}，对齐 CC
  *       sessionStorage.ts:320-328 remote-agents/*.meta.json 在项目目录）—— 只迁输出文件根，
  *       不搬 sidecar。</li>
@@ -45,7 +45,7 @@ import java.util.function.Supplier;
  * {projectRoot}/{sessionId}。<b>[TL-W2 P7]</b> projectRoot 按<b>任务 creatingSession 的 sessionId
  * 现算</b>（{@link com.nexusai.common.SessionProjectRoot#getForSession}：未绑定 → null，绝不回落 config home、不读
  * ThreadLocal；旧实现经 {@code Supplier<Path>} 在消费线程读
- * {@link AutoMemPaths#currentSessionProjectRoot()}，REST kill 线程必空 → 落/删错目录）。
+ * {@code AutoMemPaths#currentSessionProjectRoot()}（批 4b-1 已删，旧三级回落版），REST kill 线程必空 → 落/删错目录）。
  */
 @Configuration
 public class RemoteTaskConfiguration {
@@ -100,7 +100,7 @@ public class RemoteTaskConfiguration {
      * 再拼 {@code /{sessionId}}（{@link RemoteAgentMetadataStore} 继续拼 remote-agents 子目录）。
      *
      * <p><b>WHY 不再是旧 {@code sessionDirSupplier}（Supplier&lt;Path&gt;）</b>：旧实现在<b>消费线程</b>
-     * 读 {@link AutoMemPaths#currentSessionProjectRoot()}（ThreadLocal）—— kill 由 REST 线程链路调用
+     * 读 {@code AutoMemPaths#currentSessionProjectRoot()}（批 4b-1 已删，旧三级回落版）（ThreadLocal）—— kill 由 REST 线程链路调用
      * （TaskController → BackgroundTaskRunner → {@link RemoteAgentTaskService#kill}）时 ThreadLocal
      * 必空 ⇒ 回落 config home ⇒ remote-agents 元数据落错根/删错目录（审计 P7）。
      * 现注入 <b>sessionId → projectRoot</b> 的纯函数（{@link com.nexusai.common.SessionProjectRoot#getForSession}：
@@ -122,7 +122,7 @@ public class RemoteTaskConfiguration {
      * {@code {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks}，与 {@link BackgroundTaskRunner#taskOutputPath}
      * 同源（Bash/PS/LOCAL_AGENT/monitor_mcp/remote_agent 全收统一根，CC 唯一 diskOutput 机制）。
      * <ul>
-     *   <li><b>不再经 {@link AutoMemPaths#currentSessionProjectRoot()}</b> —— 输出落点与
+     *   <li><b>不再经 {@code AutoMemPaths#currentSessionProjectRoot()}（批 4b-1 已删，旧三级回落版）</b> —— 输出落点与
      *       projectRoot 解析来源解耦（红线豁免：projectRoot 回落链本身不动，只拆输出落点耦合）。
      *       旧 {@code {projectDir}/{sessionId}/tasks} 项目目录根 = CC 无对应的 Java 自创偏离，已删。</li>
      *   <li><b>sidecar 留项目目录</b>：本 supplier 只管输出文件根；元数据 sidecar 仍由

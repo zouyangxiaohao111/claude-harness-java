@@ -1156,7 +1156,6 @@ public class LlmAgentLoop implements AgentLoop {
         this.skillDiscoveryPrefetch = sp;
     }
 
-    /** P4 C7：设置 tool-use summary 生成器（emitToolUseSummaries gate）。null = 空值保护（跳过生产）。 */
     /** [RV14B-WIRE-04] 注入共享配置解析器（Spring @Autowired(required=false) 自动注入；无 bean 时 null → 站点 warn+skip）。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     public void setModelConfigResolver(com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver) {
@@ -1193,6 +1192,7 @@ public class LlmAgentLoop implements AgentLoop {
         }
     }
 
+    /** P4 C7：设置 tool-use summary 生成器（emitToolUseSummaries gate）。null = 空值保护（跳过生产）。 */
     public void setToolUseSummaryGenerator(com.nexusai.application.agent.query.ToolUseSummaryGenerator g) {
         this.toolUseSummaryGenerator = g;
     }
@@ -1542,7 +1542,7 @@ public class LlmAgentLoop implements AgentLoop {
      * [A4] 图片附件缓存存储 · 主 user 消息图片注入的数据源（CC imageStore.ts 等价）。
      *
      * <p>发送侧（A1）把本次用户消息附带的图片落盘缓存 + {@code registerPendingPromptImages}
-     * 登记；主 user 消息构造（{@link #buildMainUserMessage}）经
+     * 登记；主 user 消息构造（{@link #buildUserMessageWithImages}）经
      * {@code drainPendingPromptImages} 消费：模型 supportsImage → 直接注入 image content block；
      * 不支持 → 注入多模态提示（描述附件 + contentId），模型可调 VisionAnalyzeTool 代理视觉模型分析。
      * {@code @Autowired(required=false)}：非 Spring 场景（单测 new）为 null → 无图片可注入，
@@ -5639,25 +5639,29 @@ public class LlmAgentLoop implements AgentLoop {
                 // deps.autocompact(..., {systemPrompt, userContext, systemContext, ...})）：
                 // 压缩**收参数** —— 直接用调用方已收集的 params 三通道 +
                 // params.toolUseContext() + state.modelView()（压缩前快照）装箱 CacheSafeParams →
-                // CacheSafeParamsHolder.save（forkedAgent.ts:70-74 saveCacheSafeParams 等价）。
-                // autoCompactIfNeeded 同步调用 compactCallback.summarize → StreamCompactSummary 经
-                // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
-                // 泄漏到下一 turn。构建失败返回 null → 跳过 fork 缓存共享（不阻断压缩）。
+                // {@code ccCtx.setCacheSafeParams(...)}（:5713 显式装箱；forkedAgent.ts:70-74
+                // saveCacheSafeParams 等价。[批 5a] 原 CacheSafeParamsHolder.save 的 ThreadLocal
+                // 槽位已删）。autoCompactIfNeeded 同步调用 compactCallback.summarize →
+                // StreamCompactSummary 经 {@code summarize(…, ctx)} 读 {@code ctx.getCacheSafeParams()}；
+                // 随本次压缩的 ccCtx 回收（无跨 turn 残留）。构建失败返回 null → 跳过 fork 缓存
+                // 共享（不阻断压缩）。
                 CacheSafeParams compactCacheSafeParams = buildCompactCacheSafeParams(params, state);
                 // ── [auto-compact 可中断 2026-09-13] 补齐「摘要断流源 + 会话级 Esc 桥」两条 abort 通道 ──
                 // WHY（要修的缺陷）：auto 路径此前只注册了进度推送（run() :2314 register），两条 abort
                 //   通道全空 → ① 摘要 streamCompactSummary 的 abortControllerSupplier
-                //   （ToolRegistrationConfig:1107 = {@code CompactProgressState.currentAbort()}）恒取到
-                //   null → 回落 NOOP → 自动压缩不可中断；② 前端停止键/Esc 走
+                //   （原读 ToolRegistrationConfig:1107 的 {@code CompactProgressState.currentAbort()}
+                //   ThreadLocal；该载体已随批 5a 删除）恒取到 null → 回落 NOOP → 自动压缩不可中断；
+                //   ② 前端停止键/Esc 走
                 //   ChatService.cancelSession:1929 {@code abortForSession(sid)} → sessionAborts 无本会话
-                //   → false。手动 /compact（ToolRegistrationConfig:2454-2455）与 partial
-                //   （PartialCompactService:470-471）两条路径均已注册 → 本处补齐第三条，判据同源。
+                //   → false。手动 /compact（ToolRegistrationConfig.java:3092
+                //   {@code cc.setAbortController(compactAbort)}）与 partial
+                //   （PartialCompactService.java:634 同款）两条路径均已设 → 本处补齐第三条，判据同源。
                 //
                 // AbortController 来源（真源核实 · <b>不新建</b>）：本 run 级控制器 ——
                 //   {@code params.toolUseContext().abortController()}（LlmAgentLoop.run 构造并
                 //   state.attachAbortController 的那个 runAbortController，:2663/:2667，经
                 //   buildBaseToolUseContext :9609 进入 base TUC），亦即在
-                //   {@code CompactConversation.buildAutoContext} :603 写进 ccCtx 的<b>同一实例</b>。
+                //   {@code CompactConversation.buildAutoContext} :607 写进 ccCtx 的<b>同一实例</b>。
                 //   对齐 CC：compactConversation 全链读 {@code context.abortController.signal}
                 //   （claude-code-best/services/compact/compact.ts:442 pre-hooks / :757 post-hooks /
                 //   :1237 fork 子查询 / :1347 摘要流式请求），且 autoCompactIfNeeded 把同一
@@ -7330,10 +7334,11 @@ public class LlmAgentLoop implements AgentLoop {
                         // [S4-L5/prompt-assembly-B] fork 缓存共享参数生产（CC query.ts:653-660）：
                         // reactive 路径与 auto 路径同构——压缩**收参数**，直接用调用方已收集的
                         // params 三通道 + params.toolUseContext() + state.modelView()（压缩前快照）
-                        // 装箱 CacheSafeParams → CacheSafeParamsHolder.save（forkedAgent.ts:70-74
-                        // saveCacheSafeParams 等价）。tryReactiveCompact 经 compactCallback.summarize →
-                        // cacheSafeParamsSupplier(=CacheSafeParamsHolder.get()) 读取；finally 清槽防串台/
-                        // 泄漏到下一 turn。构建失败返回 null → 仍传 null（缓存优化可选，不阻断压缩）。
+                        // 装箱 CacheSafeParams → {@code ccCtx.setCacheSafeParams(...)}（:7345 显式装箱，
+                        // forkedAgent.ts:70-74 saveCacheSafeParams 等价；[批 5a] 原 CacheSafeParamsHolder.save
+                        // 的 ThreadLocal 槽位已删）。tryReactiveCompact 经 compactCallback.summarize →
+                        // {@code ctx.getCacheSafeParams()} 读取；随本次压缩的 ccCtx 回收。构建失败
+                        // 返回 null → 仍传 null（缓存优化可选，不阻断压缩）。
                         CacheSafeParams reactiveCacheSafeParams = buildCompactCacheSafeParams(params, state);
                         // [批 5a] 显式装箱（原 CacheSafeParamsHolder.save 的 ThreadLocal 槽位）——
                         //   ccCtx 在 :7330 已构建，直接 set。
@@ -7343,8 +7348,8 @@ public class LlmAgentLoop implements AgentLoop {
                         //   {@code buildAutoContext(params.toolUseContext(), …)}（:7219）取 ccCtx、
                         //   同样 { 摘要回调 = StreamCompactSummary }（ReactiveCompactor.summaryProducer
                         //   → compactCallback = 生产 bean streamCompactSummary，
-                        //   ToolRegistrationConfig:2178 装配；该 bean 的 abort supplier 即
-                        //   :1107 {@code () -> CompactProgressState.currentAbort()} ThreadLocal），
+                        //   ToolRegistrationConfig 装配；该 bean 的 abort 源 = ccCtx 的
+                        //   {@code ctx.getAbortController()}（buildAutoContext 从 tuc 显式设入，:607）），
                         //   同样跑在主循环线程（本块是 loop() 直落代码，无线程切换），
                         //   同样<b>两条 abort 通道全空</b>。reactive 也是<b>自动</b>触发
                         //   （PTL/media 错误恢复，非用户敲命令）→ 与 auto 属同一「自动压缩必须可被
@@ -7446,9 +7451,9 @@ public class LlmAgentLoop implements AgentLoop {
                         }
                         } finally {
                             // [reactive-compact 可中断 2026-09-13] 与上方注册成对清理（顺序/条件与
-                            //   auto 块 :5675-5687 同源：clearAbort → removeSessionAbort，
-                            //   且只在确实注册过时才清 —— 未注册时无条件 remove 会误删另一线程为
-                            //   同一会话注册的在飞压缩槽）。幂等。
+                            //   auto 块 :5809-5819 同源：removeSessionAbort —— [批 5a] 原 clearAbort
+                            //   已随 ThreadLocal 载体删除；且只在确实注册过时才清 —— 未注册时无条件
+                            //   remove 会误删另一线程为同一会话注册的在飞压缩槽）。幂等。
                             if (reactiveCompactAbortRegistered) {
                                 com.nexusai.application.agent.compact.CompactProgressState
                                     .removeSessionAbort(state.sessionId());
@@ -10420,7 +10425,7 @@ public class LlmAgentLoop implements AgentLoop {
      *       P-27 已删 model_fallback_warning attachment 双轨）</li>
      * </ol>
      *
-     * <p>注意: {@link #toolResultMessage} / {@link #buildSubagentAgentOptions} / {@link ExtendedToolResultApplier}
+     * <p>注意: {@link #toolResultMessage} / {@link #buildSubagentAgentOptions}
      * 均为 LlmAgentLoop 内部私有 static，本方法同为 private static 可直接调用。
      *
      * @return 无。fallbackModel 为空时 no-op（调用方随后走原错误路径）。
@@ -11121,34 +11126,6 @@ public class LlmAgentLoop implements AgentLoop {
     public java.nio.file.Path workspaceDir() { return workspaceDir; }
 
     /**
-     * 会话级 projectRoot 注入 · 对齐 CC state.ts:269-279（启动 realpath(cwd) 冻结）与
-     * paths.ts:203-205（getAutoMemBase=findCanonicalGitRoot(projectRoot)）。
-     *
-     * <p>run() 入口调用：解析 {@link #streamSessionId} 绑定项目路径 → 冻结进 workspaceDir +
-     * 注入 AutoMemPaths ThreadLocal（AutoMemPaths / AgentMemoryDirectory / MemoryPromptBuilder
-     * 等单例 bean 经 supplier 惰性读取本线程 holder → 本会话线程解析出独立 memory 目录，同一
-     * JVM 不同 cwd 会话互不污染 —— ODF-A1-R2 返工：ThreadLocal 取代 static volatile，多会话
-     * 并发各自隔离）。<b>[TL-W2 P8]</b> 解析失败/未注入 → {@link #workspaceDir} 保持 <b>null</b>
-     * （无有效项目，下游 A′ skip），<b>绝不</b>回落 configHome 冒充项目根。
-     *
-     * <p><b>IMP-A F1 会话级冻结</b>（D1-A/OPD-SPR-03 · CC stable projectRoot 启动冻结语义）：
-     * <ol>
-     *   <li>先查 {@link com.nexusai.common.SessionProjectRoot#getForSession(String)} —— 首 run
-     *       已冻结（本方法 resolver 成功登记，或 ProjectSessionBindingService.bind() 登记）→
-     *       <b>直接复用，不再查 DB</b>（resolver 不被调用，会话内不重查）；</li>
-     *   <li>未命中 → {@link #sessionProjectRootResolver} 解析成功 →
-     *       {@code SessionProjectRoot.setForSession()} 首 run 冻结 + workspaceDir + ThreadLocal 注入；</li>
-     *   <li>resolver 未注入 / 解析失败 → {@link #workspaceDir} 保持 <b>null</b>（无有效项目；
-     *       [TL-W2 P8] 不再回落 holder/configHome 默认值）。</li>
-     * </ol>
-     *
-     * <p><b>IMP-A F7 注入点归一</b>（M-02/M-03）：resolver 返回值落 workspaceDir 处补
-     * realpath + NFC（{@link #normalizeSessionProjectRoot}）——产出字节必须 NFC+realpath，
-     * 对齐 CC {@code realpathSync(rawCwd).normalize('NFC')}（state.ts:270-275）；realpath 失败
-     * 回退原文 NFC（对齐 state.ts:271 EPERM 回退）。命中冻结路径同样归一（冻结值可能来自
-     * bind() 的未归一 DB 值，幂等归一保证两次 run 产出一致）。
-     */
-    /**
      * [B′] resolveSessionProjectRoot 失败出口的 DB 兜底 —— 直接用 streamSessionId 查
      * {@code sessions.main_project_id → projects.path}（单一来源 DB，不依赖
      * {@code sessionProjectRootResolver} bean 是否注入）。与成功分支一致：normalize
@@ -11196,6 +11173,46 @@ public class LlmAgentLoop implements AgentLoop {
 
     /**
      * 会话/回合 projectRoot 单点解析 · run() 入口调用（{@code doRun} 首段）。
+     *
+     * <p><b>本方法 = 会话 projectRoot 单点解析</b>（含 B′ DB 兜底委派
+     * {@link #tryResolveBoundProjectFromDb(String)} —— 冻结无效 / resolver 未注入 / resolver 未命中 /
+     * resolver 抛异常四条出口都委派它直查 sessions.main_project_id → projects.path）。
+     *
+     * <p><b>双载体（零 ThreadLocal）</b>：解析成功 → ①
+     * {@code SessionProjectRoot.setForSession(显式 sessionId, normalized)}（全局冻结表，按 sessionId
+     * 显式键，跨线程安全）；② {@code this.workspaceDir}（本会话 LlmAgentLoop 实例字段）。
+     * ⛔ 不注入任何 ThreadLocal holder —— AutoMemPaths / AgentMemoryDirectory / MemoryPromptBuilder
+     * 等单例 bean 的 projectRoot 一律经<b>显式 supplier</b> 读取。
+     * <b>与 CC 是有意的架构分岔</b>：CC 的 getProjectRoot 是<b>进程级单例</b>
+     * （claude-code-best/src/bootstrap/state.ts:505-507，启动 realpathSync 冻结 state.ts:266-273）；
+     * 本仓一 JVM 多会话 ⇒ 既不能进程全局、也不能 ThreadLocal（子线程读不到）⇒ 只能
+     * 「按 sessionId 解析 + 全局冻结表」+「按会话实例字段」。
+     *
+     * <p><b>ODF-A1-R2 返工留痕（历史，勿再复活）</b>：原设计注入 AutoMemPaths ThreadLocal、
+     * 以 ThreadLocal 取代 static volatile，以求多会话并发各自隔离。该载体已随批 4b-1 <b>整体删除</b>
+     * （用户铁律：会话态一律显式传参，回放不算合规）⇒ 现为上面的双载体。
+     * CC 溯源：{@code realpathSync(rawCwd).normalize('NFC')}（state.ts:270-275）+
+     * {@code getAutoMemBase = findCanonicalGitRoot(getProjectRoot())}
+     * （claude-code-best/src/<b>memdir</b>/paths.ts:203-204）。
+     *
+     * <p><b>IMP-A F1 会话级冻结</b>（D1-A/OPD-SPR-03 · CC stable projectRoot 启动冻结语义）：
+     * <ol>
+     *   <li>先查 {@link com.nexusai.common.SessionProjectRoot#getForSession(String)} —— 首 run
+     *       已冻结（本方法 resolver 成功登记，或 ProjectSessionBindingService.bind() 登记）→
+     *       <b>直接复用，不再查 DB</b>（resolver 不被调用，会话内不重查）；</li>
+     *   <li>未命中 → {@link #sessionProjectRootResolver} 解析成功 →
+     *       {@code SessionProjectRoot.setForSession()} 首 run 冻结 + 落 {@link #workspaceDir}；</li>
+     *   <li>resolver 未注入 / 解析失败 / 结果目录无效 → 委派 B′ DB 兜底
+     *       {@link #tryResolveBoundProjectFromDb(String)}；仍取不到 → {@link #workspaceDir} 保持
+     *       <b>null</b>（无有效项目，memory 域由 A′ skip；<b>[TL-W2 P8]</b> 不回落
+     *       holder/configHome 默认值，⛔ 绝不回落 configHome 冒充项目根）。</li>
+     * </ol>
+     *
+     * <p><b>IMP-A F7 注入点归一</b>（M-02/M-03）：resolver 返回值落 workspaceDir 处补
+     * realpath + NFC（{@link #normalizeSessionProjectRoot}）——产出字节必须 NFC+realpath，
+     * 对齐 CC {@code realpathSync(rawCwd).normalize('NFC')}（state.ts:270-275）；realpath 失败
+     * 回退原文 NFC（对齐 state.ts:271 EPERM 回退）。命中冻结路径同样归一（冻结值可能来自
+     * bind() 的未归一 DB 值，幂等归一保证两次 run 产出一致）。
      *
      * @param projectRootOverride [批 1 · 方向 C] <b>显式项目锚</b>（该 run 携带的项目根，
      *        非会话键）—— 唯一生产来源 = {@code RunRequest.boundProject()}（CronIdleExecutor

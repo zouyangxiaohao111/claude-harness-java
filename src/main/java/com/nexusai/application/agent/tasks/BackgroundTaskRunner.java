@@ -934,7 +934,7 @@ public class BackgroundTaskRunner {
      * {@code shellCommand.background} status==='running' 守卫）→ 翻转 isBackgrounded=true
      * （本地 + store 双写）→ 启动 {@link StallWatchdog} → executor 提交完成 watcher
      * （{@link LocalBashTaskRunner#awaitCompletion()} 等待前台进程结束 → 终态 + 通知）。不重复
-     * {@link #registerTask}（无 task_started）。
+     * {@code frameworkService.registerTask}（无 task_started；该方法声明在 TaskFrameworkService，非本类）。
      *
      * @param taskId 前台 bash 任务 id（registerForeground 返回值）
      * @return true 成功转后台；false 任务不存在 / 非 local_bash / 已后台化 / 进程已结束

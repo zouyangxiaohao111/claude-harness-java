@@ -1072,9 +1072,11 @@ public class ToolRegistrationConfig {
      *       （对齐 ChatService.buildConfigForModel）；无 → ProviderConfig.empty()（mock）</li>
      * </ul>
      *
-     * <p>[RES-②] fork 缓存共享已接线：cacheSafeParamsSupplier = {@code () -> CacheSafeParamsHolder.get()}
-     * （LlmAgentLoop autoCompact 触发点经 CacheSharingParamsBuilder 构建 + Holder 保存，见
-     * compact/fork/CacheSharingParamsBuilder.java）；promptCacheSharingEnabled=true。
+     * <p>[RES-②] fork 缓存共享已接线：[批 5a] 原 
+     * {@code cacheSafeParamsSupplier = () -> CacheSafeParamsHolder.get()} 的 ThreadLocal 槽位已删除，
+     * 现经 ccCtx 显式携带（LlmAgentLoop autoCompact 触发点经 CacheSharingParamsBuilder 构建 +
+     * {@code ccCtx.setCacheSafeParams} 保存，summarize 侧经 {@code ctx.getCacheSafeParams()} 读，
+     * 见 compact/fork/CacheSharingParamsBuilder.java）；promptCacheSharingEnabled=true。
      * 流式重试默认关闭（CC tengu_compact_streaming_retry 默认 false）。
      */
     @Bean
@@ -1170,7 +1172,9 @@ public class ToolRegistrationConfig {
      *
      * <p>ODF-A1 per-session：bean 单例，但 projectRoot 经
      * {@link AutoMemPaths#defaultInstance()} 的 supplier 惰性读取
-     * {@link AutoMemPaths#currentSessionProjectRoot()}（LlmAgentLoop.run() 入口按会话注入）——
+     * {@link AutoMemPaths#currentSessionProjectRootOrNull()}（run() 入口经
+     * {@code SessionProjectRoot.setForSession(显式 sessionId, …)} 冻结；批 4b-1 后零 ThreadLocal，
+     * 该出口仅剩显式 env 或 null）——
      * 同一 JVM 不同 cwd 会话解析出各自独立 memory 目录（对齐 CC per-project per-cwd）。
      */
     @Bean

@@ -19,8 +19,10 @@ import java.util.function.Supplier;
  * <p><b>WHY 存在（RES-②）</b>: Anthropic API 的 prompt cache key 由 system prompt / tools /
  * model / messages(prefix) / thinking config 组成。fork（压缩摘要）要与主线程共享缓存，
  * 必须用与主线程完全一致的 5 项构建 {@link CacheSafeParams}。本类复刻 CC
- * {@code getCacheSharingParams} 的组装链，产物交给 {@link CacheSafeParamsHolder} 槽位
- * （LlmAgentLoop autoCompact 触发点）→ StreamCompactSummary cacheSafeParamsSupplier 消费。
+ * {@code getCacheSharingParams} 的组装链，产物交给
+ * {@link com.nexusai.application.agent.compact.CompactConversationContext} 显式携带
+ * （LlmAgentLoop autoCompact 触发点 set 进 ccCtx）→ StreamCompactSummary 经
+ * {@code summarize(…, ctx)} 消费（[批 5a] 原 CacheSafeParamsHolder 槽位已删）。
  *
  * <p><b>CC 组装链复刻</b>（compact.ts:250-287）:
  * <ol>

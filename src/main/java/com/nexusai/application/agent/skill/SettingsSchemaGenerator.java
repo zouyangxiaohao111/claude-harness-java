@@ -21,7 +21,7 @@ import java.util.Map;
  * （类加载 compute-once，语义对齐 CC 每次调用的同步效果）。
  *
  * <p>字段定义与旧静态串逐字段等价（全部来自 CC types.ts SettingsSchema 手抄，键序 = CC 字面量序）；
- * 特征说明见 {@link #REAL_SETTINGS_SCHEMA} 的已知 △（feature-gated 字段省略、$schema const 等价表达）。
+ * 特征说明见 {@code REAL_SETTINGS_SCHEMA}（已删）的已知 △（feature-gated 字段省略、$schema const 等价表达）。
  */
 public final class SettingsSchemaGenerator {
 

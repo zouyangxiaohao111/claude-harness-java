@@ -22,7 +22,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （{@code CommandService.toggleEnabled/update} → {@code commandMapper.update}），磁盘 SKILL.md 的
  * frontmatter 不含 enabled 字段（默认 enabled=true）。若 {@link SkillRegistry#loadAllCommands()} 合并
  * 五源后不读 DB 覆盖 enabled，则前端禁用/启用永不生效——列表合并以本 registry 为权威
- * （{@link #getAllCommands(String)} 全消费面唯一入口），DB 覆盖后前端 toggle 真实生效。本测试验证：
+ * （{@link SkillRegistry#getAllCommands(String)} 全消费面唯一入口），DB 覆盖后前端 toggle 真实生效。本测试验证：
  * <ol>
  *   <li>DB 行 enabled=0（禁用）→ getAllCommands 排除该 skill（{@code isCommandEnabled()=false} 过滤）</li>
  *   <li>DB 行 enabled=1（启用）→ 保留</li>

@@ -483,7 +483,7 @@ public class SkillCatalog {
      *
      * <p>对齐 CC prompt.ts:56-60 判定：{@code cmd.name !== displayName && cmd.type === 'prompt' &&
      * cmd.source === 'plugin'}。抽为 package-private static 便于 RED→GREEN 单测直接断言
-     * （镜像 {@link SkillCatalogBudgetTest#parseEnvBudget} 的抽纯函数测试模式）。
+     * （镜像 {@code SkillCatalogBudgetTest#parseEnvBudget_resolution} 的抽纯函数测试模式）。
      *
      * @param cmd 待判定的命令
      * @return plugin 源 + prompt 类型 + userFacingName != name 时为 true

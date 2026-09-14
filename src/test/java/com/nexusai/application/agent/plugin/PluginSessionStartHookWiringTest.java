@@ -35,7 +35,7 @@ import static org.mockito.Mockito.when;
  *
  * <p>验证意图（规则九 · 测试验证意图而非行为）：CC 在 setup.ts:326 启动预热 loadPluginHooks +
  * sessionStart.ts:59-65 于 SessionStart hooks 执行前 await loadPluginHooks，保证插件 hooks
- * 真实注册后才会触发（memoize 幂等）。Java 端 {@link LlmAgentLoop#loadPluginHooks()} 接线前
+ * 真实注册后才会触发（memoize 幂等）。Java 端 {@link PluginLoader#loadPluginHooks()}（声明在 PluginLoader，LlmAgentLoop 是调用方）接线前
  * 零生产引用 → 插件 hooks 永不触发，即使 PluginLoaderFeedTest 已验证 feed 层正确。
  * 本测试钉死<b>生产装配</b>：真实 {@link LlmAgentLoop} + 真实 {@link PluginLoader} + 真实
  * {@link HookRegistry}/{@link HooksSettings}，经 {@code run(RunRequest.forTest)} 驱动一次真实

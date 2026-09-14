@@ -77,13 +77,34 @@ class LlmAgentLoopMainThreadToolsReachableTest {
 
     /**
      * [G1 主线程可达性 · 修复验收] 主线程（agentId=null + sessionId 非 null）工具 schema 必须发往 LLM，
-     * 且 base TUC 的 agentId 以 sessionId 兜底（agentId==sessionId → TodoWriteTool.isMainThread 判 true）。
+     * 且 base TUC 的 agentId <b>保持 null</b>（= 生产的主线程判据 {@code !context.agentId}）。
      *
      * <p>修复前：守卫 agentId==null → null base TUC → per-turn TUC null → llmToolsArray null →
-     * tools=null → 断言 RED。修复后：effectiveAgentId=sessionId → 完整 base TUC → tools 含 Bash → GREEN。
+     * tools=null → 断言 RED。修复后：守卫只看 sessionId → 完整 base TUC → tools 含 Bash → GREEN。
+     *
+     * <p><b>⚠️ [F-19 裁决 · 2026-09-14] 本用例的 agentId 期望曾被写错（已改）</b>：原文断言
+     * {@code tucRef.get().agentId()).isEqualTo(sessionUuid)} + {@code agentId.equals(sessionId) isTrue()}
+     * —— 那正是<b>生产已删除的「恒 false 死分支」</b>（{@code UUID.equals(String)} 结构上恒 false，
+     * 该断言永远不可能成立）。生产侧主线程判据是 <b>{@code agentId == null}</b>，与 CC
+     * {@code !context.agentId} 同义，见 {@code TodoWriteTool.java:1232-1234} 与
+     * {@code TaskUpdateTool.java:927-931}（后者注释逐字记录了「原 agentId.equals(sessionId) UUID/String
+     * 恒 false 死分支，会把主线程误判为子 Agent」）。若按旧断言的方向（agentId==sessionId）成立，
+     * {@code !context.agentId} 会变 <b>false</b> ⇒ <b>把主线程误判为子 Agent</b> —— 与本用例名
+     * （{@code mainThreadAgentIdNull}）及 CC 语义都相反。
+     *
+     * <p><b>RED 条件（两个变异，实测各一条）</b>
+     * <ol>
+     *   <li>把 {@code buildBaseToolUseContext} 里 TUC 首参改回「主线程时以 sessionId 派生 UUID
+     *       （复活 effectiveAgentId 兜底）」⇒ 下面的 {@code isNull()} 断言<b>实测变红</b>
+     *       （assertj 首个失败即中止，故同一执行里反射 {@code isMainThread} 断言不被求值）。</li>
+     *   <li>把 {@code TodoWriteTool.isMainThread} 判据改回死分支
+     *       {@code ctx.agentId().equals(ctx.sessionId())} ⇒ 反射正向断言<b>实测变红</b>
+     *       （经 {@code InvocationTargetException}，因死分支对 null agentId 自身即 NPE）——
+     *       这一条单独证明「正向断言」有独立鉴别力，不是 {@code isNull()} 的复述。</li>
+     * </ol>
      */
     @Test
-    @DisplayName("[G1] 主线程 agentId=null + sessionId 非 null → 工具 schema 发往 LLM 且 TUC agentId==sessionId")
+    @DisplayName("[G1] 主线程 agentId=null + sessionId 非 null → 工具 schema 发往 LLM 且 TUC.agentId 保持 null")
     void mainThreadAgentIdNull_sessionIdNonNull_toolsReachable() {
         ToolRegistry registry = new ToolRegistry();
         registry.register(TestContexts.dummyTool("Bash"));
@@ -110,12 +131,15 @@ class LlmAgentLoopMainThreadToolsReachableTest {
         assertThat(tucRef.get())
             .as("[G1] per-turn TUC 必须非 null（base TUC 主线程不再返回 null）").isNotNull();
         assertThat(tucRef.get().agentId())
-            .as("[G1] 主线程 base TUC.agentId 必须由 sessionId 兜底（effectiveAgentId）——"
-                + "TodoWriteTool.isMainThread 的 ctx.agentId().equals(ctx.sessionId()) 因此判 true，"
-                + "对齐 CC TodoWriteTool.ts:80 !context.agentId 主线程语义")
-            .isEqualTo(sessionUuid);
-        assertThat(tucRef.get().agentId().equals(tucRef.get().sessionId()))
-            .as("[G1] 主线程 TUC agentId==sessionId → isMainThread 判 true")
+            .as("[F-19 裁决] 主线程 base TUC.agentId 必须<b>保持 null</b> —— 主线程判据是"
+                + " agentId==null（对齐 CC !context.agentId；effectiveAgentId 的 sessionId 兜底已删）。"
+                + "⛔ 旧断言 isEqualTo(sessionUuid) 是生产已删除的死分支（UUID.equals(String) 恒 false）")
+            .isNull();
+        assertThat(isMainThreadByProductionPredicate(tucRef.get()))
+            .as("[F-19 裁决 · 正向断言] 主线程 TUC 必须被生产判据（TodoWriteTool.isMainThread，"
+                + "实现 = ctx.agentId() == null）判定为<b>主线程</b>。⛔ 若把判据退回"
+                + " ctx.agentId().equals(ctx.sessionId())（UUID/String 恒 false）⇒ 本断言红"
+                + "（会把主线程误判成子 Agent，verification nudge 被错误跳过）")
             .isTrue();
     }
 
@@ -145,12 +169,12 @@ class LlmAgentLoopMainThreadToolsReachableTest {
     }
 
     /**
-     * [G1 子 Agent 无回归] agentId!=null（真子 Agent）→ effectiveAgentId 必须保持自身 agentId
-     * （非 sessionId 兜底），TUC.agentId != sessionId → TodoWriteTool.isMainThread 判 false（nudge 跳过），
+     * [G1 子 Agent 无回归] agentId!=null（真子 Agent）→ TUC.agentId 必须保持自身 agentId
+     * （非 sessionId 兜底），主线程判据 {@code !context.agentId} 因此为 false（nudge 跳过），
      * 工具 schema 仍完整发往 LLM。
      */
     @Test
-    @DisplayName("[G1] 子 Agent agentId!=null → TUC agentId 保持自身（非 sessionId 兜底），工具仍可达")
+    @DisplayName("[G1] 子 Agent agentId!=null → TUC agentId 保持自身，主线程判据为 false，工具仍可达")
     void subAgent_agentIdDistinct_toolsReachableAndAgentIdPreserved() {
         ToolRegistry registry = new ToolRegistry();
         registry.register(TestContexts.dummyTool("Bash"));
@@ -170,11 +194,35 @@ class LlmAgentLoopMainThreadToolsReachableTest {
             .as("[G1] 子 Agent 工具 schema 必须照常发往 LLM（修复不影响 agentId!=null 路径）")
             .isNotNull();
         assertThat(tucRef.get().agentId())
-            .as("[G1] 子 Agent 的 TUC.agentId 必须保持自身 agentId（effectiveAgentId=agentId，"
-                + "不得以 sessionId 兜底覆盖子 Agent 身份）")
+            .as("[G1] 子 Agent 的 TUC.agentId 必须保持自身 agentId（不得以 sessionId 兜底覆盖子 Agent 身份）")
             .isEqualTo(subAgentUuid);
-        assertThat(tucRef.get().agentId().equals(tucRef.get().sessionId()))
-            .as("[G1] 子 Agent agentId != sessionId → isMainThread 判 false（nudge 跳过）")
+        assertThat(isMainThreadByProductionPredicate(tucRef.get()))
+            .as("[F-19 裁决] 子 Agent（agentId != null）必须被生产判据判定为<b>非</b>主线程"
+                + "（nudge 跳过）。⛔ 旧断言 agentId().equals(sessionId()).isFalse() 是恒真死断言"
+                + "（UUID 与 String 类型不同，equals 结构上恒 false）⇒ 零鉴别力，已换为真实判据")
             .isFalse();
+    }
+
+    /**
+     * [F-19 裁决] 反射调用<b>生产</b>主线程判据 {@code TodoWriteTool.isMainThread(ToolUseContext)}。
+     *
+     * <p><b>WHY 不用 {@code agentId == null} 直接重写一遍</b>：那样只是把测试的期望抄成断言，
+     * 判据一旦被改回 {@code agentId.equals(sessionId)}（恒 false 死分支），测试仍绿。反射真实谓词
+     * 才让「主线程 ⇒ isMainThread 判 true」这句话<b>可被证伪</b>。
+     *
+     * <p>生产实现 = {@code TodoWriteTool.java:1232-1234}（{@code ctx.agentId() == null}，对齐 CC
+     * {@code !context.agentId}）；{@code TaskUpdateTool.java:927-931} 是同义的第二处。
+     */
+    private static boolean isMainThreadByProductionPredicate(ToolUseContext tuc) {
+        try {
+            java.lang.reflect.Method m = com.nexusai.application.agent.tool.impl.TodoWriteTool.class
+                .getDeclaredMethod("isMainThread", ToolUseContext.class);
+            m.setAccessible(true);
+            return (Boolean) m.invoke(
+                com.nexusai.application.agent.tool.impl.TodoWriteTool.class.getDeclaredConstructor().newInstance(),
+                tuc);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("反射调用 TodoWriteTool.isMainThread 失败（判据被改名/改签名？）", e);
+        }
     }
 }

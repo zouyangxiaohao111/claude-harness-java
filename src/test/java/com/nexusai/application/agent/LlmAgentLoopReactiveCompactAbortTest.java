@@ -56,12 +56,12 @@ import static org.mockito.Mockito.when;
  *   <li><b>同一摘要 abort 源</b>：{@code reactiveCcCtx.setSummaryProducer(ctx.reactiveCompactor().summaryProducer())}
  *       → {@code ReactiveCompactor.summaryProducer()} 委托 {@code compactCallback.summarize}
  *       （ReactiveCompactor:255-262）→ 生产装配 = {@code streamCompactSummary} bean
- *       （ToolRegistrationConfig:2178 {@code new ReactiveCompactor(tokenCounter, streamCompactSummary)}）
- *       → 该 bean 的 abort supplier 即 {@code () -> CompactProgressState.currentAbort()}
- *       （ToolRegistrationConfig:1107，ThreadLocal）。⇒ {@code registerAbort} 可达摘要流。</li>
+ *       （ToolRegistrationConfig 装配）。整条链的 abort 源 = ccCtx 的
+ *       {@code ctx.getAbortController()}（显式载体；由 {@code CompactConversation.buildAutoContext}
+ *       :607 从 {@code tuc.abortController()} 设入）。⇒ 该通道可达摘要流。</li>
  *   <li><b>同一线程</b>：reactive 块是 {@code loop()} 直落代码（无 lambda / 无 executor，
  *       以 {@code continue}/{@code break} 回到 do-while），与 auto 块同在主循环线程
- *       ⇒ ThreadLocal 注册/读取同线程命中。</li>
+ *       ⇒ 读写的是同一个局部 ccCtx 实例（[批 5a] 已无 ThreadLocal 载体）。</li>
  *   <li><b>同一「自动触发」属性</b>：reactive 由 PTL(413)/media 错误恢复触发（非用户敲命令）。</li>
  * </ol>
  * ⇒ 同构成立，补同款（不做任何 reactive 特有分支）。
@@ -70,9 +70,9 @@ import static org.mockito.Mockito.when;
  * {@link LlmAgentLoopAutoCompactAbortTest} 同款四条；本类逐条对应 reactive 块。
  * <p><b>⛔ 已避开的假守卫</b>：清理断言<b>不</b>挂在「已被 abort 的控制器」上（那样删掉 finally
  * 仍全绿）—— 见 {@link #reactiveCompactFinished_releasesBothAbortChannels()} 用<b>未取消</b>
- * 的控制器 + 同线程观察 ThreadLocal。
+ * 的控制器 + 同线程观察 ccCtx 上的 abort 源。
  */
-@DisplayName("[批1b 追加] reactive 应急压缩可中断：registerAbort + registerSessionAbort（真线程跨线程可达）")
+@DisplayName("[批1b 追加] reactive 应急压缩可中断：ccCtx.setAbortController + registerSessionAbort（真线程跨线程可达）")
 class LlmAgentLoopReactiveCompactAbortTest {
 
     /** 测试 1 会话（独立 key，避免与其它用例的静态槽位串台）。 */
@@ -137,8 +137,9 @@ class LlmAgentLoopReactiveCompactAbortTest {
 
         assertThat(loopThread.isAlive()).as("压缩放行后循环线程必须结束（不挂起）").isFalse();
         assertThat(abortReadBySummarizer.get())
-            .as("摘要侧 abort 源（生产 supplier () -> CompactProgressState.currentAbort() 的同一 ThreadLocal）"
-                + "必须 = TUC 上的 run 级控制器（CC context.abortController 同源，不新建第二套）")
+            .as("摘要侧 abort 源（生产 = CompactConversation.buildAutoContext 从 tuc.abortController() "
+                + "显式设进 ccCtx 的同一实例）必须 = TUC 上的 run 级控制器"
+                + "（CC context.abortController 同源，不新建第二套）")
             .isSameAs(runAbort);
         assertThat(summarizerSawCancelled.get())
             .as("跨线程 abort 必须落到摘要真正消费的那个控制器（isCancelled=true → provider 硬断流 →"
@@ -192,7 +193,7 @@ class LlmAgentLoopReactiveCompactAbortTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("压缩结束 → clearAbort（ThreadLocal 出栈）+ removeSessionAbort（会话槽位移除）成对释放")
+    @DisplayName("压缩结束 → 新建 ccCtx 不携带上次控制器 + removeSessionAbort（会话槽位移除）成对释放")
     void reactiveCompactFinished_releasesBothAbortChannels() {
         AgentState state = new AgentState("sys", SESSION_FINISHED, null);
         preCompactMessages().forEach(state::appendMessage);
@@ -211,8 +212,8 @@ class LlmAgentLoopReactiveCompactAbortTest {
 
         AgentLoopContext ctx = agentLoopContext(ptlOnceThenStopProvider(), rc);
         QueryParams p = params(state, ctx, runAbort);
-        // 同步在本测试线程驱动 —— 这样压缩结束后可直接观察压缩线程的 ThreadLocal
-        // （异步线程一结束 ThreadLocal 随线程消亡，clearAbort 就再也测不到）。
+        // 同步在本测试线程驱动 —— 这样压缩结束后可直接观察（新 ccCtx 不携带上次控制器）。
+        // [批 5a] 原理由「异步线程一结束 ThreadLocal 随线程消亡，clearAbort 测不到」随载体删除失效。
         LlmAgentLoop.queryLoop(
             LlmAgentLoop.collectRunMaterial(p.deps().context(), p, state),
             state, new ArrayList<>());
@@ -243,9 +244,9 @@ class LlmAgentLoopReactiveCompactAbortTest {
     /**
      * 在摘要回调内<b>阻塞</b>的 ReactiveCompactor —— 制造「压缩在飞」窗口，供另一线程断言。
      *
-     * <p>回调跑在压缩线程（生产会话线程）上：{@code abortRead} 读的是生产 supplier 的
-     * <b>同一表达式</b> {@code CompactProgressState.currentAbort()}（ThreadLocal），
-     * 故不是「测试自己设置自己读」，而是对生产注册动作的观察。
+     * <p>回调跑在压缩线程（生产会话线程）上：{@code abortRead} 读的是生产同一表达式
+     * {@code ctx.getAbortController()}（显式载体，由 {@code buildAutoContext} 从 {@code tuc}
+     * 设入 ccCtx），故不是「测试自己设置自己读」，而是对生产装配动作的观察。
      */
     private static ReactiveCompactor blockingReactiveCompactor(
             CountDownLatch inside, CountDownLatch release,

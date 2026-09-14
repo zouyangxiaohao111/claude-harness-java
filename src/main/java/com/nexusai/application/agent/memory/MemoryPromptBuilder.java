@@ -260,7 +260,6 @@ public final class MemoryPromptBuilder {
     }
 
     /**
-    /**
      * 生产装配入口（IMP-MV2-19 teamMemoryEnabled 接线）· 显式注入 kairosActive + teamMemoryEnabled。
      * {@link #productionDefault(Telemetry, BooleanSupplier)} 以 team 默认关委托本重载；LlmAgentLoop
      * 生产接线传 {@code feature('TEAMMEM') && tengu_herring_clock} 组合（FeatureFlags

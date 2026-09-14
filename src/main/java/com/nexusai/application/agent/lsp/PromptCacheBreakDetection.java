@@ -318,7 +318,8 @@ public final class PromptCacheBreakDetection {
      *   <li>tracked prefix 且 {@code agentId} 非空 ⇒ 返回 <b>{@code agentId} 本身</b>
      *       —— 与 {@code cleanupAgentTracking(agentId)} 的删键<b>一致</b>（唯一生产调用点
      *       {@code SubagentExecutor:2275} 传 packed UUID，见该处 {@code [R3-WF-F REWORK-1]} 修正注释；
-     *       {@code AgentContextThreadLocalTest:457-489} 双向锁死「packed UUID 命中 / a+16hex miss」）；</li>
+     *       {@code AgentContextExplicitApiTest:457-489}（[S4] 由 AgentContextThreadLocalTest 改名，
+     *       测的是显式实参 API）双向锁死「packed UUID 命中 / a+16hex miss」）；</li>
      *   <li>{@code querySource==='compact'} ⇒ 返回常量 {@code "repl_main_thread"}；</li>
      *   <li>tracked prefix 但 {@code agentId} 为 null/空 ⇒ 返回 <b>{@code canonical}（querySource 归一值）</b>。</li>
      * </ol>

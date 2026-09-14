@@ -25,7 +25,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *   <li>{@link #ssrf_allowsLoopbackV6__1()} — CC ssrfGuard.ts:92 允许 ::1, Java 当前拒绝</li>
  *   <li>{@link #ssrf_doesNotBlockMulticast224()} — CC 不拦截 224.0.0.0/4 multicast</li>
  *   <li>{@link #ssrf_doesNotBlockReserved240()} — CC 不拦截 240.0.0.0/4 reserved</li>
- *   <li>{@link #ssrfGuardedLookup_rejectsPrivateResolution()} — DNS rebinding 防御: 解析到 private 即拒绝</li>
+ *   <li>{@link #ssrf_blockedLiteral_throwsSsrfBlockedExceptionWithCcContract} — private/link-local 目标拒绝（169.254.169.254 字面量；SsrfBlockedException 携带 CC code + hostname/address）</li>
  * </ol>
  *
  * @since Session H1 (P0)

@@ -466,7 +466,7 @@ public class SkillChangeDetector implements ApplicationRunner {
      * </ul>
      *
      * <p>调用面（P3-33）：directory-watcher 每个 CREATE/MODIFY/DELETE 事件直接进入本方法；
-     * 写稳定等待（awaitWriteFinish）由 {@link #onIdle(int)} 空闲窗口承载（替代旧
+     * 写稳定等待（awaitWriteFinish）由 {@code DirectoryChangeListener.onIdle} 空闲窗口承载（替代旧
      * {@code handleChangeAfterAwaitWriteFinish} mtime/size 轮询）。
      */
     void handleChange(Path path) {

@@ -80,8 +80,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>{@link #executeAsync_preToolUseHookPermissionBehaviorAllow} — AHR.permissionBehavior=Allow 直接放行</li>
  *   <li>{@link #executeAsync_preToolUseHookPermissionBehaviorDenyBlocks} —
  *       AHR.permissionBehavior=Deny 阻断 (CC case 2)</li>
- *   <li>{@link #executeAsync_preToolUseHookPreventContinuationStopsTool} —
- *       AHR.preventContinuation=true 阻断 (CC case 4)</li>
+ *   <li>{@link #executeAsync_preToolUseHookPreventContinuationRunsTool} —
+ *       AHR.preventContinuation=true 且无 deny → 工具照跑 + hook_stopped_continuation
+ *       (OD-06；CC toolExecution.ts:1571-1582)</li>
  *   <li>{@link #executeAsync_preToolUseHookStopReasonShortcut} —
  *       AHR.preventContinuation+stopReason 翻译为 stop 消息 (CC case 7)</li>
  *   <li>{@link #executeAsync_preToolUseHookAbortExceptionStopsTool} —

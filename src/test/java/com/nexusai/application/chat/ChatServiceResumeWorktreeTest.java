@@ -199,7 +199,9 @@ class ChatServiceResumeWorktreeTest {
         //   config home ⇒ 读侧锚（config home 项目 slug）与写侧锚（会话绑定项目）分裂 ⇒
         //   静默恢复到错误项目缓存 / 静默不恢复。现契约：resolver 未命中 → 再按 sessionId 查
         //   SessionProjectRoot.getForSession（未绑定 → null）→ 仍无 → 不恢复（绝不回落 config home）。
-        // RED: 把兜底腿改回 AutoMemPaths.currentSessionProjectRoot() → 本用例立即变红
+        // RED（[批 4b-1] 重锚到现存可执行变异）：把兜底腿改成 config-home 回落
+        //   （{@code NexusaiPaths.getAppConfigHomeDir()}，= 已删的 AutoMemPaths.currentSessionProjectRoot()
+        //   三重回落的第 3 级）→ 本用例立即变红
         //   （config home 锚下的 worktree-state 被读回 → tracker 被写入）。
         // 造"旧回落腿会读到的" config home 锚 worktree-state：
         // [批 4b-1] 原取 AutoMemPaths.currentSessionProjectRoot()（＝旧三级回落的 config home 分支）——

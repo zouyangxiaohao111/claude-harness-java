@@ -12,8 +12,8 @@ import java.util.Map;
  *
  * <p>L2 契约:
  * <ul>
- *   <li>{@link #checkFileSize} 超过 max → 返回 {@link LimitResult.Denied} 含 actualBytes + maxBytes</li>
- *   <li>{@link #checkEntryCount} 超过 max → 返回 Denied 含 actualEntries + maxEntries</li>
+ *   <li>{@link #checkFileSize} 超过 max → 返回 {@link LimitResult.DeniedFileSize} 含 actualBytes + maxBytes</li>
+ *   <li>{@link #checkEntryCount} 超过 max → 返回 {@link LimitResult.DeniedEntryCount} 含 actualEntries + maxEntries</li>
  *   <li>在限制内 → 返回 {@link LimitResult.Allowed}</li>
  *   <li>单条 entry 内容大小另由调用方用 {@link #checkFileSize} 校验</li>
  * </ul>

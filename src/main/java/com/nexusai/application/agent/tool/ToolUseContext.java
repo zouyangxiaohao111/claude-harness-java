@@ -1648,7 +1648,7 @@ public record ToolUseContext(
     /**
      * <b>[批 5b-1] agent 归因上下文显式载体 · 唯一生产盖章入口</b>。
      *
-     * <p><b>WHY</b>：{@link com.nexusai.application.agent.subagent.AgentContext#ambient 归因 ThreadLocal（已删）} 是 plain
+     * <p><b>WHY</b>：{@code AgentContext.ambient} 归因 ThreadLocal（已删）是 plain
      * ThreadLocal，不跨线程继承；而 consumer（YoloClassifierImpl / ExecPromptHook /
      * HaikuToolUseSummaryGenerator）全部跑在**无 executor 的 CompletableFuture（commonPool）** 线程上
      * ⇒ 闭包内读 ThreadLocal 恒 null ⇒ {@code invokingRequestId}/{@code invocationKind} 归因边静默丢失。
