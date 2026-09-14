@@ -12,25 +12,33 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
- * {@link SessionIdResolver} 单测：3 级优先级 + 拒绝任何 ambient 会话来源的回归守护。
+ * {@link SessionIdResolver} 单测：3 级优先级（history → options.history → null）。
  *
  * <p>设计见 docs/zjkycode/specs/2026-09-12-provider-custom-headers-design.md §6.3。
  *
- * <p><b>本类守护的核心不变量</b>：解析结果**只**能来自显式穿线的 history / options.history，
- * 绝不来自进程/线程级的 ambient 会话状态。理由见
- * {@link #ignoresAmbientSessionStateWhenPresent()}。
+ * <p><b>本类守护的不变量</b>：解析结果只能来自显式穿线的 history / options.history。
  *
- * <p>[批 3c] 原守护的 ambient 载体是「裸 MDC 会话槽」，该载体已随本批<b>整类删除</b> ⇒
- * 本测试不再能构造「MDC 有值」的诱饵，其鉴别力降为「resolve 只认两个显式来源」。
+ * <p><b>⚠ 关于「拒绝 ambient 会话来源」的边界（[欠账清理批] 更正原 javadoc 的假声明）</b>：
+ * 原类 javadoc 曾写「resolve 里加回任一 ambient 会话读取兜底 ⇒ {@code ignoresAmbientSessionStateWhenPresent}
+ * 红（本类的存在意义）」，并据此保留了一个「ambient 诱饵」用例。**该声明不成立**：该用例没有
+ * 任何装置能把值装进一个尚未存在的 ambient 载体（无 setter 可调）⇒ 有人新加 `static ThreadLocal`
+ * 兜底时它**仍全绿**（"声称守护 X 实际守不住"，本仓第 N 次）。该用例已删（见文件内去重记录）。
+ * 「不得有 ambient 会话来源」的真实守卫在三处，均不在本类：
+ * <ol>
+ *   <li><b>结构性</b>：ambient 载体（`RequestContext` / 裸 MDC 会话槽）已从 main 全量删除
+ *       （批 3c 收口核对 {@code TOTAL_CODE_HITS=0}）；</li>
+ *   <li><b>接线级</b>：{@code ProviderSessionIdWiringGuardTest} 以源码声明锚扫描两个 SDK provider
+ *       的 {@code buildClient(config} 调用点所在成员，禁止出现环境态会话槽读取（含
+ *       {@code RequestContext} / {@code MDC.get} 的回归守卫）—— 已由变异实验证实会精确变红；</li>
+ *   <li><b>入口级</b>：REST 端点缺 {@code ?sessionId=} ⇒ 400（各 ControllerTest 覆盖）。</li>
+ * </ol>
  *
  * <p><b>变异自证（反向实验，已实跑确认变红后还原）</b>：
- * ① {@code resolve} 里加回任一 ambient 会话读取兜底 ⇒
- * {@link #ignoresAmbientSessionStateWhenPresent()} 红（本类的存在意义）；
- * ② {@code fromHistory} 里「取第一条」改成「取最后一条」⇒
+ * ① {@code fromHistory} 里「取第一条」改成「取最后一条」⇒
  * {@link #prefersFirstNonBlankSessionIdFromHistory()} 红；
- * ③ {@code resolve} 里删掉 {@code fromMain} 提前返回 ⇒
+ * ② {@code resolve} 里删掉 {@code fromMain} 提前返回 ⇒
  * {@link #historyTakesPrecedenceOverOptionsHistory()} 红；
- * ④ {@code fromHistory} 里删掉 {@code m != null &&}（解引用前的唯一守卫）⇒
+ * ③ {@code fromHistory} 里删掉 {@code m != null &&}（解引用前的唯一守卫）⇒
  * {@link #skipsNullElementsInHistory()} 红（NPE）。<b>单点变异即有效</b>——
  * 这里不是「冗余守卫」情形。
  */
@@ -89,6 +97,11 @@ class SessionIdResolverTest {
             "history 空时应回落 options.history");
         assertEquals("sess-O", SessionIdResolver.resolve(null, List.of(msg("sess-O"))),
             "history 为 null 时应回落 options.history");
+        // [欠账清理批] 从已删用例 `ignoresAmbientSessionStateWhenPresent` 迁入 —— 该断言是它唯一
+        //   未被本类其他用例覆盖的一条（options.history 形参为 null 的支路）。迁入后原用例整体
+        //   去重（见文件末尾去重记录），覆盖面无损失。
+        assertEquals("sess-H", SessionIdResolver.resolve(List.of(msg("sess-H")), null),
+            "options.history 为 null 时不得崩，且不得影响 history 取值");
     }
 
     // ---- ③ null ----
@@ -100,41 +113,28 @@ class SessionIdResolverTest {
         assertNull(SessionIdResolver.resolve(List.of(), List.of()));
     }
 
-    // ---- 回归守护：拒绝任何 ambient 会话来源 ----
+    // ---- [欠账清理批] 去重记录：原「拒绝任何 ambient 会话来源」用例已删 ----
 
-    /**
-     * 【关键回归守护】任何 ambient（进程/线程级）会话状态都**绝不能**被采纳。
+    /*
+     * 原 `ignoresAmbientSessionStateWhenPresent`（T3 时代的「有诱饵」鉴别性守护）已删，理由三条：
      *
-     * <p>T3 实测：原实现读裸 MDC 的会话槽。全仓无 Filter / Interceptor /
-     * ChannelInterceptor 写 MDC，但 MDC 另有<b>两类</b>写点：{@code MDC.put}（原会话槽一处）
-     * 与 <b>{@code MDC.setContextMap} 整表覆盖 12 处</b>（含 {@code LlmAgentLoop:6477} —— 跑在
-     * {@code STREAM_EXECUTOR} 虚拟线程内，正是流式链路所在线程）。两类都能写 {@code SESSION_ID}，
-     * 详见 {@link SessionIdResolver} 类 javadoc 的普查。
-     * 叠加 {@code MemoryController:143} / {@code TaskController:145} /
-     * {@code TeamController:95} 三处原 {@code setSession} 均无 {@code clear}
-     * → Tomcat 线程复用时 MDC 会残留**别的会话**的 sessionId。
-     *
-     * <p>采纳残留值比返回 null 更坏：它会**静默把 A 会话的亲和 id 发给 B 会话的请求**，
-     * 不报错、也不落兜底常量。若这条断言变红，说明有人把 ambient 会话读取加回来了 ——
-     * 那是降级，不是改进（规范 §6.3）。
-     *
-     * <p><b>[批 3c] 语义消失（已登记待裁定）</b>：原用例靠「在本线程写入一个『别的会话』的
-     * 裸 MDC 残留值」当诱饵，再断言 resolve 不采纳它。批 3c 把该裸 MDC
-     * 会话槽<b>整类删除</b> ⇒ 诱饵无法再构造，本用例从「有诱饵的鉴别性守护」降为
-     * 「无诱饵时 resolve 仍只认两个显式来源」。下面两条断言文本<b>原样保留</b>（未改弱），
-     * 但它们现在只能守住「resolve 的取值来自入参」，守不住「有人新加一个 ambient 读取」
-     * —— 后者已由「ambient 载体本身不存在」在结构上保证。
+     * ① **诱饵载体已不存在**：它靠「在本线程写入一个『别的会话』的裸 MDC 残留值」当诱饵，再断言
+     *    resolve 不采纳。批 3c 把裸 MDC 会话槽整类删除 ⇒ 诱饵无法构造，用例只剩
+     *    `resolve(null,null)==null` + `resolve(history,null)==history` 两条断言。
+     * ② **两条断言均已由兄弟用例覆盖**：前者 = `returnsNullWhenNeitherSourceHasSessionId` 的第一条
+     *    （逐字相同）；后者 = `historyTakesPrecedenceOverOptionsHistory` 中「history 有值即赢」的
+     *    null-options 支路 —— 该条**已迁入** `historyTakesPrecedenceOverOptionsHistory`，覆盖面无损失。
+     * ③ ⭐ **它对自己鉴别力的声明是假的**（"声称守护 X 实际守不住" 模式）：原类 javadoc 写「resolve
+     *    里加回任一 ambient 会话读取兜底 ⇒ 本用例红」。实测不成立 —— 本用例**无法把任何值装进**
+     *    一个尚未存在的 ambient 载体（没有 setter 可调）⇒ 即便有人新加 `static ThreadLocal`
+     *    兜底，本用例<b>仍全绿</b>。真正的守卫在别处且更强：
+     *    (a) **结构性**：ambient 载体（`RequestContext`/裸 MDC 会话槽）已从 main 全量删除
+     *        （批 3c 收口核对 `TOTAL_CODE_HITS=0`）；
+     *    (b) **接线级**：`ProviderSessionIdWiringGuardTest` 以源码声明锚扫描两个 SDK provider 的
+     *        `buildClient(config` 调用点所在成员，禁止出现任何环境态会话槽读取
+     *        （含 `RequestContext` / `MDC.get` 的回归守卫）—— 那条才是「调用点照抄 ambient 兜底」
+     *        的自动化守卫，且已由变异实验（注入 `MDC.get`）证实会精确变红。
      */
-    @Test
-    @DisplayName("任何 ambient 会话状态都不得被采纳（T3 回归守护；[批 3c] 诱饵载体已删，断言文本保留）")
-    void ignoresAmbientSessionStateWhenPresent() {
-        // [批 3c] 语义消失：原此处 setSession("sess-STALE-FROM-ANOTHER-SESSION") 造「别的会话」残留诱饵，
-        //   该裸 MDC 会话槽已随本批删除 ⇒ 无处可造。断言本身保留，未改弱。
-        assertNull(SessionIdResolver.resolve(null, null),
-            "ambient 残留值被采纳了 —— 会把别的会话的亲和 id 发出去");
-        assertEquals("sess-H", SessionIdResolver.resolve(List.of(msg("sess-H")), null),
-            "history 有真值时也不得受 ambient 会话影响");
-    }
 
     /** 测试夹具：仅第 1 参 id（恒 null）与第 2 参 sessionId 有意义，其余占位。 */
     private static ChatMessageDto msg(String sid) {

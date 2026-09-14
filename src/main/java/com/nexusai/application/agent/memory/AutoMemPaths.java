@@ -430,6 +430,16 @@ public final class AutoMemPaths {
      *   <li>normalize 后与 {@link NexusaiPaths#getAppConfigHomeDir()}（config home）相等 → 无效。</li>
      * </ul>
      *
+     * <p><b>⚠ 两个子句的关系（[欠账清理批] 核实结论，替代原「configHome 子句实际冗余」的登记）</b>：
+     * 第 1 子句比 {@link #getMemoryBaseDir()}，第 2 子句比 {@link NexusaiPaths#getAppConfigHomeDir()}。
+     * 而 {@code getMemoryBaseDir()} 的实现是「{@code NEXUSAI_CODE_REMOTE_MEMORY_DIR} env ?? configHome」
+     * ⇒ <b>env 未设时两子句恒等</b>（本仓全仓 grep 该 env 名只有常量定义处一处 ⇒ 生产默认恒未设，
+     * 故「实际冗余」的观察成立）；<b>但 env 一旦被外部设置</b>（CC 的
+     * {@code CLAUDE_CODE_REMOTE_MEMORY_DIR} 对等物）两子句即分离，此时第 2 子句是**唯一**仍在拒绝
+     * config-home 的门 ⇒ <b>不得按「冗余」删除</b>（删了会让 config-home 在该形态下重新冒充项目根，
+     * 正是本方法立项要治的缺陷 A）。反向鉴别器见
+     * {@code AutoMemPathsTest.eligibleProjectRoot_configHomeIsAlwaysRejected_whenMemoryBaseDiffers()}。
+     *
      * <p><b>[决策 2026-09-08] DB 主路径解析在上游完成</b>：auto-memory 目录的主路径 = 会话绑定项目
      * （LlmAgentLoop.run() 入口 resolveSessionProjectRoot → tryResolveBoundProjectFromDb：
      * {@code sessions.main_project_id → projects.path}，批 4b-1 起经<b>显式入参</b>传给消费方）。本方法是路径层

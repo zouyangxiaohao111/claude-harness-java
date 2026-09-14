@@ -36,8 +36,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *       决策 4-3『运行时会话』）。旧契约（缺省 → settings-only / MDC 兜底）已删除。</li>
  *   <li><b>返回 shape 对齐前端 HookItem</b>（types.ts:855-865）——event/config.type/config.command|url/source
  *       字段齐全、null 子类型字段省略（前端 TS 可解析）。</li>
- *   <li><b>[批 3c] 裸 MDC 会话槽已整体删除</b>——原「残留别的会话 id 不被读取」的反向实验失去对照
- *       装置（装置本身已不存在）；断言仍保留，见 {@link #mdcSessionId_isIgnored_is400()} 内注释。</li>
+ *   <li><b>[欠账清理批] 原「残留别的会话 id 不被读取」的反向实验用例已删（去重）</b>——其断言与
+ *       {@code noParam_is400} 逐条重合，且该风险在批 3c 删除裸 MDC 会话槽后已结构性不可能
+ *       （无载体可携带残留值）。</li>
  * </ol>
  */
 class HookControllerTest {
@@ -103,22 +104,11 @@ class HookControllerTest {
         verify(hooksSettings, never()).getAllHooks();
     }
 
-    @Test
-    @DisplayName("[批 3a 反向实验 · 批 3c 装置已删] 无 query 仍 400（原 MDC 残留对照无法再构造，见方法内注释）")
-    void mdcSessionId_isIgnored_is400() throws Exception {
-        // WHY（规则九）：裸 MDC 会话槽（批 3c 已删除）的 sessionId 第三态 = 上一个请求残留的
-        //   **别的会话** id（看起来完全合法）⇒ 旧实现会把 B 会话的 hook 列表当成 A 会话的返回，
-        //   且日志前缀同样取自该槽 ⇒ 无法自查。
-        // [批 3c] 语义消失：该槽已整体删除，无法再把「残留合法会话 id」装进装置（缺 sessionId 时
-        //   已无第三源可回落）。下方 stub 与 verify 文本原样保留，仅作反向实验的历史留痕。
-        when(hooksSettings.getAllHooks("sess-mdc")).thenReturn(List.of(sampleCommandHook()));
-
-        mockMvc.perform(get("/api/v1/hooks"))
-            .andExpect(status().isBadRequest());
-
-        verify(hooksSettings, never()).getAllHooks("sess-mdc");
-        verify(hooksSettings, never()).getAllHooks();
-    }
+    // [欠账清理批 · 去重记录] 原 `mdcSessionId_isIgnored_is400` 已删：它断言「GET /hooks 无
+    //   sessionId ⇒ 400 + verify(never()).getAllHooks()/getAllHooks(anyString())」——
+    //   与上面 `noParam_is400`（同一 400 + 同两条 verify）逐条重合，另有 `verify(never())
+    //   .getAllHooks("sess-mdc")` 命中一个**代码不可能产出**的常量（纯否定断言恒绿）。
+    //   它守护的「残留（别的会话）sessionId 被采用」在批 3c 删除裸 MDC 会话槽后已结构性不可能。
 
     @Test
     @DisplayName("返回 shape 对齐前端 HookItem（types.ts:855-865）：config.type/command|url 齐全、null 子类型字段省略")

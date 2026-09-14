@@ -119,6 +119,45 @@ class AutoMemPathsTest {
     }
 
     // ════════════════════════════════════════════════════════════════
+    // A′-2: [欠账清理批] isEligibleProjectRoot 两子句的**各自**鉴别器
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("A′-2: memoryBase ≠ config-home 时，projectRoot == config-home 仍必须 null（第 2 子句非冗余）")
+    void eligibleProjectRoot_configHomeIsAlwaysRejected_whenMemoryBaseDiffers(@TempDir Path memoryBase) {
+        // WHY（登记项「isEligibleProjectRoot 两子句同值 ⇒ configHome 子句实际冗余」的核实与反向鉴别）：
+        //   getMemoryBaseDir() = env(NEXUSAI_CODE_REMOTE_MEMORY_DIR) ?? configHome ⇒ **env 未设时两子句
+        //   恒等**（本仓全仓 grep 该 env 名只有常量定义一处 ⇒ 生产默认恒未设），故「实际冗余」的观察
+        //   成立；**但 env 被外部设置后两子句分离**，此时第 2 子句是唯一拒绝 config-home 的门。
+        //   本用例用注入构造器模拟「memoryBase 已设为别的目录」（= env 形态）：
+        //     projectRoot = configHome、memoryBase = 另一目录 ⇒ 第 1 子句放行、**只有第 2 子句能拦**。
+        //   ⇒ 若有人按「冗余」删掉第 2 子句，本用例红（config-home 重新冒充项目根，缺陷 A 复发）。
+        String configHome = NexusaiPaths.getAppConfigHomeDir();
+        AutoMemPaths paths = paths(configHome, memoryBase.toString(), null, null);
+
+        assertThat(paths.getAutoMemBase())
+            .as("memoryBase≠configHome 时，config-home 子句是唯一拦截者"
+                + "（删掉它 → 这里会派生出 projects/<sanitize(configHome)>/memory 假目录）")
+            .isNull();
+        assertThat(paths.getAutoMemPath())
+            .as("同上（getAutoMemPath 经同一 isEligibleProjectRoot 判定）")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("A′-2 正向对照：projectRoot 既非 memoryBase 也非 config-home → 放行（判定不是恒 null）")
+    void eligibleProjectRoot_neitherMemoryBaseNorConfigHome_isAccepted(@TempDir Path memoryBase,
+                                                                        @TempDir Path project) {
+        // WHY（规则九）：上一条是**否定**断言（isNull）。没有本条，一个「恒返回 null」的实现也能让它过
+        //   —— 那会把 auto-memory 整个打死而测试全绿。本条正向对照证明判定确实按路径值分流。
+        AutoMemPaths paths = paths(project.toString(), memoryBase.toString(), null, null);
+
+        assertThat(paths.getAutoMemBase())
+            .as("既非 memoryBase 也非 config-home 的项目根必须被接受（否则 auto-memory 静默消失）")
+            .isNotNull();
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // 1b. [TL-W3 Phase B] defaultInstance 无 config-home 伪造（P5 根源收口）
     // ════════════════════════════════════════════════════════════════
 

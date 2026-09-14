@@ -571,21 +571,11 @@ public final class RuleQuery {
      * 匹配（见 {@link #matchesEditPathRuleRootRelative}）。旧 content glob 直比（matchesGlob
      * 对绝对路径字符串做 glob）为近似，拍板重构对齐 CC。
      *
-     * @param permCtx  权限上下文
-     * @param path     待匹配路径（input.file_path / input.path 提取值）
-     * @param behavior 规则行为桶（ALLOW / DENY / ASK）
-     * @return         第一个 content 匹配的 edit 组规则；无匹配返回 null
-     */
-    public static PermissionRule getEditRuleByContentsForPath(
-            ToolPermissionContext permCtx,
-            String path,
-            PermissionBehavior behavior) {
-        return getEditRuleByContentsForPath(permCtx, path, behavior, null);
-    }
-
-    /**
-     * 带 cwd 的写权限链路径规则查询 · 与 {@link #getEditRuleByContentsForPath(ToolPermissionContext, String, PermissionBehavior)}
-     * 同语义，额外透传校验基准 cwd（root-relative 匹配的根锚定）。
+     * <p><b>[欠账清理批 · 3 参重载已删]</b> 原 {@code getEditRuleByContentsForPath(permCtx, path, behavior)}
+     * 3 参重载（内部以 {@code cwd=null} 委托本方法 = 静默走「无会话」回落 user.dir）<b>全仓零调用方</b>
+     * （生产 12 处 + 测试 3 处全部显式传 cwd），且 <b>CC 无对应物</b>（CC {@code matchingRuleForInput}
+     * 的 cwd 来自 {@code ctx}，不存在「不带 cwd」的变体）⇒ 按 {@code dead-code-decision-rule} 删除，
+     * 让编译器强制每个调用方<b>显式声明</b>自己的校验基准（含显式传 {@code null} 表达「确无会话」）。
      *
      * <p><b>生产调用方全部显式传 cwd</b>（root-relative 匹配根锚 = 会话 cwd）：
      * {@code BashPathValidator} / {@code PowerShellPathValidator}（自有 cwd 参数）、

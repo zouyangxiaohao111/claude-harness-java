@@ -22,12 +22,14 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * 不是 null，而是**上一个请求残留的、别的会话的 id**（看起来完全合法）。后果：用户 A 的分支面板
  * 会对**用户 B 的仓库**建/删 worktree，且日志前缀同样取自该槽 ⇒ 从日志上也看不出错。
  *
- * <p>本类锁死两件事：
- * <ol>
- *   <li>缺 / 空白 {@code ?sessionId=} ⇒ <b>400</b>（(a) 类 fail loud），四个端点一致；</li>
- *   <li>[批 3c] 裸 MDC 会话槽已整体删除 ⇒ 原「残留会话 id 不被读取」的反向实验失去对照装置
- *       （装置本身已不存在），断言仍保留，见 {@link #staleMdc_isNotRead_is400()} 内注释。</li>
- * </ol>
+ * <p>本类锁死一件事：缺 / 空白 {@code ?sessionId=} ⇒ <b>400</b>（(a) 类 fail loud），四个端点一致。
+ *
+ * <p><b>[欠账清理批 · 去重记录]</b> 原 {@code staleMdc_isNotRead_is400} 已删：它的两条断言
+ * （GET /branches、POST /{slug}/keep 无 sessionId ⇒ 400）是上面 {@code list_missingSessionId_is400}
+ * 与 {@code keep_missingSessionId_is400} 的<b>严格子集</b>。该用例守护的「残留（别的会话）sessionId
+ * 不被读取」在批 3c 删除裸 MDC 会话槽后已<b>结构性不可能</b>（无载体可携带残留值），
+ * 断言本身退化为「无 sessionId ⇒ 400」的第二种编码（零鉴别力 @DisplayName）。
+ * 保留兄弟用例即可覆盖同一行为；「不得重新引入 ambient 会话源」由载体不存在结构性保证。
  * 不断言 200 路径：{@code listWorktrees} 会真跑 {@code git worktree list}，断言结果强依赖执行环境
  * （工作区本身就在 git 仓库内），故只锁 http 契约层。
  */
@@ -69,16 +71,6 @@ class BranchControllerTest {
     @Test
     @DisplayName("[批 3a] POST /api/v1/branches/{slug}/keep 缺 sessionId → 400")
     void keep_missingSessionId_is400() throws Exception {
-        mockMvc.perform(post("/api/v1/branches/some-slug/keep")).andExpect(status().isBadRequest());
-    }
-
-    @Test
-    @DisplayName("[批 3a 反向实验 · 批 3c 装置已删] 无 query 仍 400（原「残留别的会话 id」对照无法再构造）")
-    void staleMdc_isNotRead_is400() throws Exception {
-        // [批 3c] 语义消失：裸 MDC 会话槽已整体删除 ⇒ 无法再制造「残留别的会话 id」这一对照装置
-        //   （缺口即缺口，请求缺失 sessionId 不再有可回落的第三源）。断言文本原样保留，
-        //   本用例现与 list_missingSessionId_is400 等价，仅作反向实验的历史留痕。
-        mockMvc.perform(get("/api/v1/branches")).andExpect(status().isBadRequest());
         mockMvc.perform(post("/api/v1/branches/some-slug/keep")).andExpect(status().isBadRequest());
     }
 }

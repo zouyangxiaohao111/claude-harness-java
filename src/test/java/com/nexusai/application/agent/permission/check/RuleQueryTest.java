@@ -410,12 +410,13 @@ class RuleQueryTest {
     // 对齐 CC resolve(cwd, path) cwd=getCwd()（bashPermissions.ts:1114 传 getCwd()）。
     // WHY：root-relative 匹配的根锚定错根 → 相对路径 edit 规则在该会话内永不命中（权限判定错位，G9）。
     //
-    // [批 3c] 语义已变（已登记待裁定）：{@code RuleQuery} 是**静态工具、无会话入参** ⇒ 3 参重载
-    //   （cwd=null）现显式按「无会话」解析 {@code CwdResolution.getCwd(null)}（= override / 进程
-    //   user.dir），主代码 RuleQuery:590-600 有注释 + 首次 WARN 留痕，并明写「需要会话 cwd 的 3 参
-    //   调用方须改传显式 cwd（工具侧 ctx.effectiveCwd()）」。
-    //   ⇒ 原「绑定项目经 3 参重载 + MDC 会话 取到 boundProject」已不可构造；会话感知改用
-    //   **4 参显式 cwd** 覆盖（下方 cwdExplicit_* 用例），3 参重载的新契约（回落 user.dir）单列钉住。
+    // [批 3c] 语义已变：{@code RuleQuery} 是**静态工具、无会话入参** ⇒ 传 {@code cwd=null} 时显式按
+    //   「无会话」解析 {@code CwdResolution.getCwd(null)}（= override / 进程 user.dir），主代码有注释
+    //   + 首次 WARN 留痕，并明写「需要会话 cwd 的调用方须显式传 cwd（工具侧 ctx.effectiveCwd()）」。
+    //   ⇒ 原「绑定项目经 ambient 会话槽解析」已不可构造；会话感知一律走**显式 cwd 形参**
+    //   （下方 cwdExplicit_* 用例），「确无会话」走**显式 null**（下方 cwdNull_* 用例）。
+    // [欠账清理批] 原 3 参重载（隐式 cwd=null）已删（全仓零调用方 + CC 无对应物）⇒ 每个调用方
+    //   必须显式声明自己的校验基准；下面 cwdNull_* 用例改由 4 参 + 显式 null 表达同一契约。
     // ════════════════════════════════════════════════════════════════════
     @Nested
     @DisplayName("WF-1D · DEL-06 · getEditRuleByContentsForPath 的 root 锚定（显式 cwd vs 无会话回落）")
@@ -465,9 +466,9 @@ class RuleQueryTest {
         }
 
         @Test
-        @DisplayName("[批 3c] 3 参重载（cwd=null）→ 按「无会话」解析回落 user.dir：绑定项目不可达，路径在 user.dir 外即不命中")
+        @DisplayName("[批 3c] 显式 cwd=null → 按「无会话」解析回落 user.dir：绑定项目不可达，路径在 user.dir 外即不命中")
         void cwdNull_fallsBackToUserDir_noSession(@TempDir Path projectDir) throws Exception {
-            // WHY（新契约）：{@code RuleQuery} 无会话入参 ⇒ 3 参重载只能按「无会话」解析。
+            // WHY（新契约）：{@code RuleQuery} 无会话入参 ⇒ 显式传 cwd=null 时只能按「无会话」解析。
             //   本用例钉住该回落（并作为「有人把会话接回静态工具」的反向鉴别器：若 boundProject
             //   被重新读到，下面 hit 会变非 null ⇒ 红）。
             String sessionId = "wf1d-ruleq-nosession";

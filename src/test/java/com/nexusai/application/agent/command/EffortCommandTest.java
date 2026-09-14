@@ -17,6 +17,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -43,8 +44,8 @@ import static org.mockito.Mockito.when;
  *
  * <p><b>[批 3a/3c] 会话标识改为显式传参</b>：{@link EffortCommand#handle(String, String)} 的第二个
  * 参数就是当前会话 —— 不再经裸 MDC 会话槽解析（该槽批 3c 已彻底删除）。本测试随之改为
- * <b>显式传 {@link #SESSION}</b>，不再在 setUp 里写 MDC；并有专门用例钉死「写入恒落显式
- * sessionId」（见 {@code explicitSessionId_ignoresStaleMdc}）。
+ * <b>显式传 {@link #SESSION}</b>，不再在 setUp 里写 MDC；并有专门用例钉死「会话写入的主键
+ * = 显式传入的 sessionId」（见 {@code sessionWriteKeysOnExplicitSessionId_only}）。
  */
 class EffortCommandTest {
 
@@ -224,18 +225,28 @@ class EffortCommandTest {
     }
 
     @Test
-    @DisplayName("[批 3c] 会话态显式传参：写入恒落显式 sessionId（不再有任何 ambient 会话槽）")
-    void explicitSessionId_ignoresStaleMdc() {
-        // WHY（规则九）：REST 入口不得依赖任何 ambient 会话态，会话标识一律显式传参。
-        // [批 3c] 语义消失：旧实现读裸 MDC，故可构造「MDC 残留了**别的**会话 id」这一第三态诱饵
-        //   （不是 null，而是上一请求残留、看起来完全合法的 id）——用户 A 的 /effort 会写到用户 B
-        //   的会话行上。裸 MDC 会话槽已删除 ⇒ 该诱饵无法再构造，本用例退化为「写入恒落显式
-        //   sessionId」：selectOneById 只可能收到显式 SESSION。
+    @DisplayName("[批 3c/欠账清理批] 会话写入的主键 = 显式传入的 sessionId（别的键取不到行 ⇒ 写入不发生）")
+    void sessionWriteKeysOnExplicitSessionId_only() {
+        // WHY（规则九）：REST 入口不得依赖任何 ambient 会话态，会话标识一律显式传参。失效模式 =
+        //   「拿别的会话的 id 去 load-modify-update」⇒ 用户 A 的 /effort 写到用户 B 的会话行上，
+        //   不报错、看不出。旧实现经裸 MDC 会话槽（有「上一请求残留的别的会话 id」第三态）。
+        //
+        // [欠账清理批] 原两条断言中有鉴别力的是**正向**那条：`verify(sessionMapper).selectOneById(SESSION)`
+        //   —— 若实现改用别的键，本断言即红。原配套的 `verify(never()).selectOneById("sess-someone-else")`
+        //   是**纯否定断言且入参是代码不可能产出的常量**（恒绿，零鉴别力），已删。
+        //   替代它的是一条**真能失败的正向对照**：把桩收紧成「只有 SESSION 这个键能取到行」
+        //   （其它键 ⇒ null ⇒ 命令按「会话不存在」跳过写入）⇒ 任何「用错键」的实现都会让
+        //   下面的写入断言变红，而不是靠一句恒真的 never() 自我安慰。
+        reset(sessionMapper);
+        when(sessionMapper.selectOneById(SESSION)).thenReturn(session);
+
         EffortCommand.EffortCommandResult r = command.handle("low", SESSION);
+
         assertThat(r.effortValue()).isEqualTo("low");
-        // 会话主键解析 = 显式 sessionId
         verify(sessionMapper).selectOneById(SESSION);
-        verify(sessionMapper, never()).selectOneById("sess-someone-else");
-        assertThat(session.getEffortLevel()).isEqualTo("low");
+        assertThat(session.getEffortLevel())
+            .as("键错 ⇒ selectOneById 返回 null ⇒ 命令跳过写入 ⇒ 本断言红（这是本用例的鉴别力所在）")
+            .isEqualTo("low");
+        verify(sessionMapper).update(session);
     }
 }

@@ -499,6 +499,40 @@ public class SubagentExecutor {
     }
 
     /**
+     * [批 5b-1 · Pattern #14 测试缝] 子代理 <b>TUC 定稿步</b>：一次盖齐两个显式归因载体。
+     *
+     * <p>WHY static seam（本类既有惯例，见 {@link #withEffectiveCwd}）：TUC 定稿步内联在
+     * {@code executeStreaming} 中，其上游是 LLM 循环重依赖（provider / sessionDir / mcpCleanup …）
+     * ⇒ 直接单测「盖章行」需要整套 {@code execute()} 夹具。抽成纯函数后同包单测可直达，
+     * 且<b>写入端的断言不再缺失</b>（[批 5b-1 未决 ①] 诚实申报的覆盖缺口：原「删掉那行不会有
+     * 测试变红」）。调用点删掉本方法调用会<b>编译不过</b>（{@code ctxForLoop} 在下方 lambda 中被使用）
+     * ⇒ 接线本身由编译器保证，本缝负责保证「盖的是哪两个值」。
+     *
+     * <p>两个载体的分工（缺一即静默丢失，且都不可用 ThreadLocal 回放）：
+     * <ul>
+     *   <li>{@code subagentName}/{@code isBuiltIn} —— hook 侧归因
+     *       （{@code SessionFileAccessHooks.subagentProps} 经 {@code HOOK_EXECUTOR} 取用）；</li>
+     *   <li>{@link ToolUseContext#agentContext()} —— classifier / exec-prompt hook / tool-use summary
+     *       侧归因（这些消费点跑在 <b>commonPool</b> worker 上，读 {@code AgentContext.STORAGE}
+     *       plain ThreadLocal 恒 null）。</li>
+     * </ul>
+     *
+     * @param subagentCtx   Step 18 派生的子代理 TUC（{@code withEffectiveCwd} 之后、进 query loop 之前）
+     * @param agentContext  本子代理的归因上下文（{@code SubagentContext} 实例；null = 非 agent 上下文）
+     * @param subagentName  子代理类型名（{@code SubagentIdentity.of(def)} 单一派生点，与 LLM 侧同源）
+     * @param isBuiltIn     是否内置 agent（CC {@code agent.source === 'built-in'}）
+     * @return 盖章后的 TUC（record-copy 语义，null 入参按 {@code ToolUseContext} 契约处理）
+     */
+    static ToolUseContext stampSubagentLoopContext(
+            ToolUseContext subagentCtx,
+            AgentContext.SubagentContext agentContext,
+            String subagentName,
+            boolean isBuiltIn) {
+        return subagentCtx.withSubagentIdentity(subagentName, isBuiltIn)
+            .withAgentContext(agentContext);
+    }
+
+    /**
      * 父 Agent 的 ToolUseContext（可选）· 用于 createSubagentContext.create() 时的
      * readFileState clone / setAppState 隔离 / additionalWorkingDirectories 继承。
      * null = standalone 模式（无父 Agent 上下文可继承）。
@@ -2020,8 +2054,10 @@ public class SubagentExecutor {
             //   （YoloClassifierImpl / ExecPromptHook / HaikuToolUseSummaryGenerator）跑在无 executor 的
             //   CompletableFuture(commonPool) 线程上，plain ThreadLocal 不跨线程 ⇒ 读恒 null
             //   ⇒ invokingRequestId/invocationKind 归因边静默丢失（CC 的 AsyncLocalStorage 自动传播，无此问题）。
-            final ToolUseContext ctxForLoop = subagentCtx.withSubagentIdentity(
-                identityForLoop.subagentName(), identityForLoop.isBuiltIn()).withAgentContext(agentContext);
+            //   [欠账清理批] 盖章动作抽成 {@link #stampSubagentLoopContext} 静态缝（Pattern #14）
+            //   ⇒ 写入端有直接单测（见 {@code SubagentLoopContextStampTest}）。
+            final ToolUseContext ctxForLoop = stampSubagentLoopContext(
+                subagentCtx, agentContext, identityForLoop.subagentName(), identityForLoop.isBuiltIn());
             log.info("[SubagentExecutor] [批 5b-1] 子代理 TUC 已盖 agent 归因上下文: agentId={} "
                     + "invokingRequestId={} invocationKind={}（commonPool 派生线程经显式载体可读）",
                 agentId, this.invokingRequestId, invocationKind);

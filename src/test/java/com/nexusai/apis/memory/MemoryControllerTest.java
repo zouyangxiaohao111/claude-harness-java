@@ -241,19 +241,12 @@ class MemoryControllerTest {
             .andExpect(status().isBadRequest());
     }
 
-    @Test
-    @DisplayName("[批 3a/3c] 无 ?sessionId= 且无任何隐式会话源 → 400（会话态显式化后不存在可回落的隐式会话）")
-    void listFiles_mdcIsIgnored_is400() throws Exception {
-        // WHY（规则九）：反例是「进程内存在合法会话，但请求没带 ?sessionId=」时静默用上别的会话 ——
-        //   旧实现经裸 MDC 会话槽读上一请求残留的**别的会话** id（第三态，看起来完全合法）⇒ 会把 B
-        //   会话的 boundProject 当作 A 的返回 Project 档记忆文件（跨项目泄漏）而无人发现。
-        // [批 3c] 语义消失：裸 MDC 会话槽已删 → 无法在测试里制造「隐式会话存在」的前置条件
-        //   （原 setUp 的 setSession(TEST_SESSION) 已删），本用例退化为「无 sessionId ⇒ 400」的
-        //   第二种编码（与 listFiles_noSessionId_is400 同断言）。断言文本按原样保留，待裁定：
-        //   保留（作为显式化后的回归护栏）或删除（与 listFiles_noSessionId_is400 重复）。
-        mockMvc.perform(get("/api/v1/memory/files"))
-            .andExpect(status().isBadRequest());
-    }
+    // [欠账清理批 · 去重裁定] 原 `listFiles_mdcIsIgnored_is400` 已删（该用例自身 javadoc 就登记
+    //   「待裁定：保留或删除（与 listFiles_noSessionId_is400 重复）」）：唯一断言
+    //   （GET /memory/files 无 sessionId ⇒ 400）是 `listFiles_noSessionId_is400` 的**严格子集**。
+    //   它守护的「进程内存在合法会话时静默用上别的会话的 boundProject（跨项目泄漏）」在批 3c
+    //   删除裸 MDC 会话槽后已**结构性不可能**（无载体可携带残留 id），断言退化为同一行为的
+    //   第二种编码（零鉴别力 @DisplayName）。保留兄弟用例覆盖同一行为。
 
     @Test
     @DisplayName("GET /api/v1/memory/files → query ?sessionId= 驱动 Project 档（会话态显式化后 query 是唯一会话源）")

@@ -1124,8 +1124,12 @@ public class BashTool implements Tool {
             // getOriginalCwd()；启动目录也不存在 → null → 按 CC :234-236 文案生成错误）。
             // null/blank 会话 cwd（dispatch 兼容路径无会话绑定）→ 原样透传（bash 三参不设 directory
             // → 子进程回落 user.dir，对齐旧行为），不触发"目录不存在"错误。
+            // [欠账清理批 · c3 漏传修复] 回落层「启动目录」= **同一会话**的 originalCwd
+            //   （CC Shell.ts:225 getOriginalCwd()）⇒ 必须显式传 sessionId；原实现走 1 参重载
+            //   （sessionId=null）会把回落层解析成**进程 user.dir**（后端 JVM 启动目录），
+            //   cwd 被删的会话会 spawn 到别的目录。sessionId 此处已在作用域（:1120）。
             String resolvedCwd = (sessionCwd != null && !sessionCwd.isBlank())
-                ? ShellExecutor.resolveSpawnCwd(sessionCwd)
+                ? ShellExecutor.resolveSpawnCwd(sessionCwd, sessionId)
                 : sessionCwd;
             if (sessionCwd != null && !sessionCwd.isBlank() && resolvedCwd == null) {
                 return ToolResult.error(call.id(),

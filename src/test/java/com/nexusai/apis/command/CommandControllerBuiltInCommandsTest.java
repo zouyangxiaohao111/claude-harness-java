@@ -500,15 +500,11 @@ class CommandControllerBuiltInCommandsTest {
             .andExpect(status().isBadRequest());
     }
 
-    @Test
-    @DisplayName("[批 3a 反向实验 · 批 3c 装置已删] 无 sessionId 仍 400（原 MDC 残留对照无法再构造）")
-    void executeBuiltin_staleMdcDoesNotLeak() throws Exception {
-        // [批 3c] 语义消失：裸 MDC 会话槽已整体删除 ⇒ 「残留合法会话 id」的对照装置无法再制造
-        //   （不存在可回落的第三源）。断言文本原样保留，现与 executeBuiltin_missingSessionId_is400
-        //   等价，仅作反向实验的历史留痕。
-        mockMvc.perform(post("/api/command/builtins/continue/execute"))
-            .andExpect(status().isBadRequest());
-    }
+    // [欠账清理批 · 去重记录] 原 `executeBuiltin_staleMdcDoesNotLeak` 已删：其唯一断言
+    //   （POST /builtins/continue/execute 无 sessionId ⇒ 400）是上面
+    //   `executeBuiltin_missingSessionId_is400` 的**严格子集**。它守护的「残留（别的会话）
+    //   sessionId 被静默采用」在批 3c 删除裸 MDC 会话槽后已**结构性不可能**（无载体），
+    //   断言退化为同一行为的第二种编码（零鉴别力 @DisplayName）。
 
     @Test
     @DisplayName("[批 3a] POST /builtins/effort/execute 缺 sessionId → 400（C 类死参：端点此前根本无此入参）")
