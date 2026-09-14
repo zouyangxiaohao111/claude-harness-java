@@ -69,7 +69,7 @@ import { UsageCostModal } from '@/components/modals/UsageCostModal'
 import { MemoryEditorModal } from '@/components/modals/MemoryEditorModal'
 import { SkillMarketModal } from '@/components/modals/SkillMarketModal'
 import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
-import { getIncludeStatus } from '@/api/claudeMd'
+import { describeIncludeStatusProbeFailure, getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
 import { UpdateCenter } from '@/components/updater/UpdateCenter'
 
@@ -177,12 +177,29 @@ function App() {
   const [showIncludeApproval, setShowIncludeApproval] = useState(false)
   const [includeApprovalFiles, setIncludeApprovalFiles] = useState<string[]>([])
 
-  // 挂载后探测外部 @import 审批态（后端 GET /claude-md/include-status，2026-08-24 实现）：
+  // 会话激活后探测外部 @import 审批态（后端 GET /claude-md/include-status?sessionId=，2026-08-24 实现）：
   // needsApproval=true（存在外部 include && 未审批 && 未示警）→ 弹 IncludeApprovalModal。
-  // 失败静默（无外部 include / 后端未就绪不阻塞启动）。
+  // [T15-3 2026-09-14] 后端审批态已按**项目**分区（由 sessionId 解析项目根；CC 的两个标志宿主
+  //   都是 project config，claudemd.ts:796 / :1420）⇒ 探测必须带会话，且**触发时机从「挂载一次」
+  //   改为「会话激活时」**：activeSession 初值恒为 ''（reducers.ts:34，会话列表是异步 list() 之后
+  //   才 SWITCH 到第一个），旧 deps=[] 必然在零态发请求 ⇒ 后端 400（缺 sessionId）⇒ 被 catch 静默
+  //   吞掉 ⇒ 弹窗永不出现（功能死）。零态**不发请求** = 客户端的 (b) 类「本就不需要」；
+  //   ⚠️ 服务端仍按 (a) 类走 400，⛔ 不因客户端不发而放宽。
+  // 切会话时先关闭弹窗：弹窗携带的是**上一个项目**的待审批文件，留着会让用户对 B 项目批准 A 的文件。
+  // 失败**按响应分流**（⛔ 不一律静默，见下）：
+  //   ① 网络异常（ApiError.status === 0，见 api/rest.ts 的 fetch catch 分支）⇒ 静默 —— 后端未就绪
+  //      不应阻塞启动，属 (b) 类「本就不需要」；
+  //   ② HTTP ≥400 ⇒ **≥console.warn** —— 本端点按用户裁定「每个会话一定有绑定目录，查不到就是严重
+  //      bug」⇒ 400（缺 sessionId / 解析不到项目根）属 (a) 类「本该有却没有」；一律静默会让该缺陷
+  //      **结构性不可见**（既不弹窗、也无 toast、更无日志），正是本改造要消灭的失败模式；
+  //   ③ 非 ApiError 异常 ⇒ 同样 ≥warn（不静默）。
+  // [TL-W1 P4] 用 sessionR.activeSession（= 下方 activeSessionId，此处尚未解构故直接用同一源）
   useEffect(() => {
+    const sid = sessionR.activeSession
+    setShowIncludeApproval(false)
+    if (!sid) return
     let cancelled = false
-    getIncludeStatus()
+    getIncludeStatus(sid)
       .then((st) => {
         if (cancelled) return
         if (st.needsApproval) {
@@ -190,9 +207,14 @@ function App() {
           setShowIncludeApproval(true)
         }
       })
-      .catch(() => { /* 静默：无外部 include 或后端未就绪 */ })
+      .catch((e: unknown) => {
+        if (cancelled) return
+        // 分流判据单点 = describeIncludeStatusProbeFailure（见该函数 javadoc + 其单测）
+        const warning = describeIncludeStatusProbeFailure(e, sid)
+        if (warning !== null) console.warn(warning, e)
+      })
     return () => { cancelled = true }
-  }, [])
+  }, [sessionR.activeSession])
   /** 活跃流式会话 → streamTopic（多会话并行订阅：sendMessage 登记 / complete 移除） */
   const [activeStreams, setActiveStreams] = useState<Record<string, string>>({})
   // 合并「对话操作」弹窗（双击 Esc → 压缩 tab；消息 hover「↺ 回退到此」→ 裁剪 tab）
@@ -1899,10 +1921,12 @@ function App() {
       {showMemoryEditor && (
         <MemoryEditorModal onClose={() => setShowMemoryEditor(false)} showToast={showToast} sessionId={activeSessionId} />
       )}
-      {/* CLAUDE.md 外部 include 审批（功能3）· 触发待接：后端补事件通知 或 前端检测 CLAUDE.md @import 后置位 */}
-      {showIncludeApproval && (
+      {/* CLAUDE.md 外部 include 审批（功能3）· [T15-3] 零态（无会话）不渲染：后端审批态按项目分区，
+          sessionId 为空时提交必然 400（弹窗会卡在报错里无法完成），故必须挂 `!!activeSessionId` 门 */}
+      {showIncludeApproval && !!activeSessionId && (
         <IncludeApprovalModal
           files={includeApprovalFiles}
+          sessionId={activeSessionId}
           onApprove={(approved) => {
             setShowIncludeApproval(false)
             showToast(approved ? '已允许加载外部文件' : '已拒绝加载外部文件', 'success')

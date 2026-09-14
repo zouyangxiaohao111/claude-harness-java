@@ -464,13 +464,15 @@ public final class AutoMemPaths {
      * {@code AutoMemPathsTest.eligibleProjectRoot_configHomeIsAlwaysRejected_whenMemoryBaseDiffers()}。
      *
      * <p><b>[决策 2026-09-08] DB 主路径解析在上游完成</b>：auto-memory 目录的主路径 = 会话绑定项目
-     * （LlmAgentLoop.run() 入口 resolveSessionProjectRoot → tryResolveBoundProjectFromDb：
+     * （LlmAgentLoop.run() 入口 resolveSessionProjectRoot → [F-24 Step 3 后]<b>唯一</b>链
+     * {@code SessionProjectRoot.lookup} → 冻结表回源器 {@code ToolRegistrationConfig#sessionProjectRootResolver}：
      * {@code sessions.main_project_id → projects.path}，批 4b-1 起经<b>显式入参</b>传给消费方）。本方法是路径层
      * 纯防御（null/blank/config-home/memoryBase 永不拼接）——走到 null 只表示「上游无有效项目」，
      * 不是本方法负责去查 DB。调用方（MemoryPromptBuilder/LlmAgentLoop 守卫）据此 fail loud。
-     * <!-- [S2 · F-24 2026-09-14] ⚠️ 上游的 {@code tryResolveBoundProjectFromDb} 是「B′ 兜底第二链」，
-     *      与 SessionProjectRoot 的冻结表回源解析器是<b>两条独立实现</b>（差异 A/B）——
-     *      ⛔ 勿声称「全仓只有这一处 DB 查询实现」。未合并原因与代价见 SessionProjectRoot 类 javadoc 的「残差 R-DB」段。 -->
+     * <!-- [F-24 Step 3 2026-09-14 · 用户裁定「删，合并成一个」] 上游原「B′ 兜底第二链」
+     *      （{@code LlmAgentLoop.tryResolveBoundProjectFromDb}）已删除 ⇒ 「全仓只有这一处
+     *      DB 查询实现（sessionId → main_project_id → projects.path）」<b>现在为真</b>。
+     *      收口读数/行为差见 SessionProjectRoot 类 javadoc 的 R-DB 段 + BoundProjectResolutionMatrixTest。 -->
      *
      * @param projectRoot 候选项目根（可能来自回落链的 config-home）
      * @return false = 无有效项目（getAutoMemPath/getAutoMemBase 应返回 null，禁止拼 config-home）

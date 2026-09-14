@@ -1371,13 +1371,6 @@ public class LlmAgentLoop implements AgentLoop {
     private com.nexusai.repository.session.mapper.SessionMapper sessionMapper;
 
     /**
-     * B′: ProjectMapper 注入 · resolveSessionProjectRoot 失败兜底用 streamSessionId 直查
-     * sessions.main_project_id → projects.path（单一来源 DB，不绕 resolver bean）。可空
-     * （POJO 单测 / 无 Spring）→ DB 兜底 no-op（保持无项目）。
-     */
-    private com.nexusai.repository.project.mapper.ProjectMapper projectMapper;
-
-    /**
      * 静态桥 SessionMapper · [SP-01/SP-10] static loop 上下文读取会话列
      * （loop_mode_override / non_interactive_session）。setSessionMapper 同步桥接
      * （SessionToolDisableConfig 先例，gap29）。null 注入保持 null（读侧回落）。
@@ -1395,11 +1388,8 @@ public class LlmAgentLoop implements AgentLoop {
         SessionToolDisableConfig.setSessionMapper(sessionMapper);
     }
 
-    /** [B′] setter 注入 ProjectMapper（@Autowired(required=false)，同 R3 SessionMapper 方案 C 模式）。 */
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
-    public void setProjectMapper(com.nexusai.repository.project.mapper.ProjectMapper projectMapper) {
-        this.projectMapper = projectMapper;
-    }
+    /** [F-24 Step 3] 原 B′ 兜底链的 ProjectMapper 注入点已随该链删除（唯一 DB 查询实现 =
+     *  {@code ToolRegistrationConfig#sessionProjectRootResolver}）—— ⛔ 不得复活本 setter。 */
 
     /**
      * [backend-sendmsg-inbox 2026-09-08] 会话级 name→agentId 注册表（C7）· 对齐 CC
@@ -4701,13 +4691,12 @@ public class LlmAgentLoop implements AgentLoop {
      *   <li>无锚且当前 {@code streamSessionId} 为空白（真无会话：headless 无锚代）→ 无项目可锚，
      *       ≥WARN 后返回 {@code null}（⛔ 不回落 user.dir / config home）。</li>
      *   <li>有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
-     *       冻结值（{@code run()} 入口 DB 兜底 {@code tryResolveBoundProjectFromDb}
-     *       {@code sessions.main_project_id → projects.path} 成功后的产物 = DB 主路径结果；
-     *       不重复查 DB，符合 F1 会话内不重查语义）。
-     *       <!-- [S2 · F-24 2026-09-14] ⚠️ 本条描述的 tryResolveBoundProjectFromDb 是「B′ 兜底第二链」，
-     *            与 SessionProjectRoot 的冻结表回源解析器（ToolRegistrationConfig#sessionProjectRootResolver）
-     *            是<b>两条独立实现</b>（差异 A/B）——⛔ 勿再声称「全仓只有这一处 DB 查询实现」。
-     *            未合并原因与代价见残差 R-DB（见 SessionProjectRoot 类 javadoc 的「残差 R-DB」段）。 --></li>
+     *       冻结值（{@code run()} 入口唯一链 {@code SessionProjectRoot.lookup} —— 冻结表 / DB 回源
+     *       {@code sessions.main_project_id → projects.path} —— 成功后的产物 = DB 主路径结果；
+     *       ⛔ <b>[F-24 Step 3 2026-09-14]</b> 原「B′ 兜底第二链
+     *       {@code tryResolveBoundProjectFromDb}」已删 ⇒ 全仓<b>只有一处</b> DB 查询实现
+     *       （{@code ToolRegistrationConfig#sessionProjectRootResolver} 的 {@code @Bean} 体）。
+     *       本步不重复查 DB，符合 F1 会话内不重查语义）。</li>
      *   <li>仍解析不到（DB 确实无绑定）→ 抛 {@link AutoMemoryNoBoundProjectException}，由调用方
      *       <b>当场 catch</b>：fail loud 记 error，本轮不注入 auto 记忆段，不让整个 turn 崩溃。</li>
      * </ol>
@@ -11126,57 +11115,63 @@ public class LlmAgentLoop implements AgentLoop {
     public java.nio.file.Path workspaceDir() { return workspaceDir; }
 
     /**
-     * [B′] resolveSessionProjectRoot 失败出口的 DB 兜底 —— 直接用 streamSessionId 查
-     * {@code sessions.main_project_id → projects.path}（单一来源 DB，不依赖
-     * {@code sessionProjectRootResolver} bean 是否注入）。与成功分支一致：normalize
-     * （realpath+NFC）+ {@code isValidDirectory} 校验 + setCurrentProjectRoot + workspaceDir
-     * + SessionProjectRoot 冻结。取到有效绝对目录 → true（调用方继续/返回）；
-     * 仍取不到 → false（调用方保持"无项目"，memory 域由 A′ skip —— 不再把 config-home
-     * 当"默认项目"塞进 ThreadLocal/workspaceDir）。
+     * [F-24 Step 3 · 用户裁定「删，合并成一个」] 会话绑定项目根 → {@link #workspaceDir} 的<b>唯一</b>出口
+     * （run() 入口 {@link #resolveSessionProjectRoot(String)} 的各失败出口统一走它）。
+     *
+     * <p><b>为什么只有一个实现</b>：{@code sessionId → sessions.main_project_id → projects.path}
+     * 的查询逻辑全仓<b>只剩一处</b> —— {@link com.nexusai.common.SessionProjectRoot} 的冻结表
+     * 回源解析器（生产体 = {@code ToolRegistrationConfig#sessionProjectRootResolver}，其 {@code @Bean}
+     * 体同时经 {@code setDbResolver} 把它注册为冻结表的回源器）。本方法只做「取结果 + 落本实例字段」，
+     * ⛔ <b>不自带任何 DB 查询</b> —— 原 B′ 兜底第二链 {@code tryResolveBoundProjectFromDb}
+     * （自带 sessionMapper/projectMapper 直查，冻结表与它并存两条实现）已删除。
+     *
+     * <p><b>失败语义 = memory 域 fail-soft</b>：{@code lookup(...).projectRoot() == null} 含三态
+     * ——「有会话但未绑定」/「确无会话」/「无法判定（回源器未接线 / 抛错 / 违约返回 null）」
+     * ⇒ <b>保持无项目</b>（{@link #workspaceDir} 不被触碰、⛔ 不抛）。cwd 域的 fail-loud 判据在
+     * {@code CwdResolution.getCwd} 侧（它自行用 {@code Lookup.sessionKnown()} /
+     * {@code resolutionFailed()} 分流），与本出口互不影响。
+     *
+     * <p><b>为什么不再做一次有效性校验</b>（⛔ 勿误加「防御」）：本方法的每个调用点进入时
+     * {@link com.nexusai.common.SessionProjectRoot} 的冻结表<b>必为空</b>（调用点 1 先
+     * {@code clearSession} 解除陈旧冻结；调用点 2-5 的前置就是「冻结表未命中」）⇒ {@code lookup}
+     * 必然走 {@code refillFromDb}，而回源值经 {@link com.nexusai.common.SessionProjectRoot#isValidProjectRoot}
+     * （唯一判据，与 {@code CwdResolution.isValidDirectory} 同源）校验后才 {@code bound}。
+     * 即：能到这里非 null ⇒ 已是「绝对路径且目录存在」。
+     *
+     * <p>⚠️ <b>与已删 B′ 的行为差（有意 · 已在判定矩阵 {@code BoundProjectResolutionMatrixTest} 登记）</b>：
+     * B′ 自带 DB 直查 ⇒ 回源器<b>不可用</b>（未接线 / 违约返回 null）时它仍能取到绑定；合并后唯一链
+     * 取不到 ⇒ 保持无项目（fail-soft，不抛）。生产里二者同源（同一个 {@code @Bean}），故该差只在
+     * 装配异常 / 夹具分叉形态可见。</p>
      */
-    private boolean tryResolveBoundProjectFromDb(String sessionIdStr) {
+    private boolean applyBoundProjectFromLookup(String sessionIdStr) {
         if (sessionIdStr == null || sessionIdStr.isBlank()) {
             return false;
         }
-        String path = null;
-        try {
-            com.nexusai.repository.session.entity.SessionRecord session =
-                sessionMapper != null ? sessionMapper.selectOneById(sessionIdStr) : null;
-            if (session != null && session.getMainProjectId() != null
-                    && !session.getMainProjectId().isBlank()) {
-                com.nexusai.repository.project.entity.ProjectRecord project =
-                    projectMapper != null ? projectMapper.selectOneById(session.getMainProjectId()) : null;
-                if (project != null && project.getPath() != null && !project.getPath().isBlank()) {
-                    path = project.getPath();
-                }
+        com.nexusai.common.SessionProjectRoot.Lookup lk =
+            com.nexusai.common.SessionProjectRoot.lookup(sessionIdStr);
+        String resolved = lk.projectRoot();
+        if (resolved == null || resolved.isBlank()) {
+            if (lk.resolutionFailed()) {
+                // ⛔ resolutionFailure 严格区别于「确无会话」：指配异常（未接线 / 抛错 / 违约）本不该静默，
+                //    但也⛔不得因它把 memory 域打崩 ⇒ 保持无项目 + ≥WARN（SessionProjectRoot 内部同时已打一条）。
+                log.warn("[LlmAgentLoop] 会话 {} 项目根「无法判定」（DB 回源解析器未接线 / 抛错 / 违约）⇒ "
+                    + "保持无项目（memory 域 fail-soft；⛔ 不回落 config home / user.dir）", sessionIdStr);
             }
-        } catch (Exception e) {
-            log.warn("[LlmAgentLoop] 会话 projectRoot DB 兜底查询失败，保持无项目: {} - {}",
-                sessionIdStr, e.getMessage());
             return false;
         }
-        if (path == null || path.isBlank()) {
-            return false;
-        }
-        String normalized = normalizeSessionProjectRoot(path);
-        if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
-            log.warn("[LlmAgentLoop] 会话 {} DB 兜底解析 projectRoot 目录无效（非绝对/不存在），保持无项目: {}",
-                sessionIdStr, normalized);
-            return false;
-        }
-        this.workspaceDir = java.nio.file.Path.of(normalized);
-        com.nexusai.common.SessionProjectRoot.setForSession(sessionIdStr, normalized);
-        log.info("[LlmAgentLoop] 会话 projectRoot DB 兜底注入（resolve 失败出口）: session={} projectRoot={}",
-            sessionIdStr, normalized);
+        this.workspaceDir = java.nio.file.Path.of(resolved);
+        log.info("[LlmAgentLoop] 会话 projectRoot 注入（唯一链 SessionProjectRoot.lookup）: "
+            + "session={} projectRoot={}", sessionIdStr, resolved);
         return true;
     }
 
     /**
      * 会话/回合 projectRoot 单点解析 · run() 入口调用（{@code doRun} 首段）。
      *
-     * <p><b>本方法 = 会话 projectRoot 单点解析</b>（含 B′ DB 兜底委派
-     * {@link #tryResolveBoundProjectFromDb(String)} —— 冻结无效 / resolver 未注入 / resolver 未命中 /
-     * resolver 抛异常四条出口都委派它直查 sessions.main_project_id → projects.path）。
+     * <p><b>本方法 = 会话 projectRoot 单点解析</b>（[F-24 Step 3] 各失败出口统一委派
+     * {@link #applyBoundProjectFromLookup(String)} —— 即 {@link com.nexusai.common.SessionProjectRoot#lookup(String)}
+     * 这一条<b>唯一</b>的「sessionId → main_project_id → projects.path」链；
+     * ⛔ 原 B′ 兜底第二链 {@code tryResolveBoundProjectFromDb}（自带 mapper 直查）已删）。
      *
      * <p><b>双载体（零 ThreadLocal）</b>：解析成功 → ①
      * {@code SessionProjectRoot.setForSession(显式 sessionId, normalized)}（全局冻结表，按 sessionId
@@ -11202,10 +11197,15 @@ public class LlmAgentLoop implements AgentLoop {
      *       <b>直接复用，不再查 DB</b>（resolver 不被调用，会话内不重查）；</li>
      *   <li>未命中 → {@link #sessionProjectRootResolver} 解析成功 →
      *       {@code SessionProjectRoot.setForSession()} 首 run 冻结 + 落 {@link #workspaceDir}；</li>
-     *   <li>resolver 未注入 / 解析失败 / 结果目录无效 → 委派 B′ DB 兜底
-     *       {@link #tryResolveBoundProjectFromDb(String)}；仍取不到 → {@link #workspaceDir} 保持
+     *   <li>resolver 未注入 / 解析失败 / 结果目录无效 → 委派 {@link #applyBoundProjectFromLookup(String)}
+     *       （唯一链 lookup：冻结表 + DB 回源）；仍取不到 → {@link #workspaceDir} 保持
      *       <b>null</b>（无有效项目，memory 域由 A′ skip；<b>[TL-W2 P8]</b> 不回落
      *       holder/configHome 默认值，⛔ 绝不回落 configHome 冒充项目根）。</li>
+     *   <li><b>[F-24 Step 3 新增]</b> 冻结值<b>目录已失效</b>（冻结后又消失 —— {@code bind()} 直写
+     *       未归一值 / 目录被删）→ 先 {@code SessionProjectRoot.clearSession(显式 id)} 解除陈旧冻结，
+     *       再走唯一链回源重解析。⛔ 不清缓存会踩两个坑：lookup 的 cache hit 把无效值原样返回
+     *       （落进 workspaceDir = cwd 污染），且 {@code setForSession} 首写胜会拒绝回源回填
+     *       （原 B′ 链即栽在此）。判据与读数见 {@code BoundProjectResolutionMatrixTest}。</li>
      * </ol>
      *
      * <p><b>IMP-A F7 注入点归一</b>（M-02/M-03）：resolver 返回值落 workspaceDir 处补
@@ -11260,13 +11260,16 @@ public class LlmAgentLoop implements AgentLoop {
             //   user.dir——避免 system prompt 冻结无效路径与 Bash 工具 getCwd 回落打架（LLM 感知
             //   「抓包流程」但工具实际在 nexusai-backend）。根因在前端绑定 path 需绝对路径。
             if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
-                log.warn("[LlmAgentLoop] 会话 {} 冻结 projectRoot 目录无效（非绝对/不存在），DB 兜底取回真实绑定项目: {}",
+                log.warn("[LlmAgentLoop] 会话 {} 冻结 projectRoot 目录无效（非绝对/不存在），解除冻结并回源 DB 重解析: {}",
                     sessionIdStr, normalized);
-                // [B′] 冻结值无效 → 直查 DB 兜底；仍无 → 保持无项目（memory 域 A′ skip）
-                if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                // [F-24 Step 3] 陈旧/失效的冻结值必须先显式解除，否则唯一链（SessionProjectRoot.lookup）
+                //   会 cache hit 把这个无效值原样返回（落进 workspaceDir = cwd 污染），且 setForSession
+                //   首写胜会拒绝回源回填（原 B′ 链正是栽在此：查到新鲜值却写不进冻结表）。
+                com.nexusai.common.SessionProjectRoot.clearSession(sessionIdStr);
+                if (applyBoundProjectFromLookup(sessionIdStr)) {
                     return;
                 }
-                log.warn("[LlmAgentLoop] 会话 {} DB 兜底未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
+                log.warn("[LlmAgentLoop] 会话 {} 唯一链未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
                     sessionIdStr);
                 return;
             }
@@ -11280,12 +11283,15 @@ public class LlmAgentLoop implements AgentLoop {
                 log.debug("[LlmAgentLoop] sessionProjectRootResolver 未注入，workspaceDir 保持无项目: {}",
                     workspaceDir);
             }
-            // [B′] resolver bean 未注入 → DB 兜底直查绑定项目
-            if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+            // [F-24 Step 3] 单一链：resolver bean 未注入 ⟺ SessionProjectRoot 的 DB 回源器同未接线
+            //   （同一个 @Bean —— 它的方法体就是 setDbResolver 的注册者）⇒ lookup 必然判「无法判定」。
+            //   保留本调用是为了让**所有失败出口都走同一个出口**（resolutionFailure 的可观测性由
+            //   applyBoundProjectFromLookup 内的 ≥WARN 分支负责）；⛔ 不再有 B′ 式 loop 自有 mapper 直查。
+            if (applyBoundProjectFromLookup(sessionIdStr)) {
                 return;
             }
-            log.warn("[LlmAgentLoop] 会话 {} 无 sessionProjectRootResolver 且 DB 兜底无绑定项目，"
-                + "保持无项目（memory 域 A′ skip）", sessionIdStr);
+            log.warn("[LlmAgentLoop] 会话 {} 无 sessionProjectRootResolver（= DB 回源器未接线），"
+                + "唯一链无法判定会话项目根，保持无项目（memory 域 A′ skip）", sessionIdStr);
             return;
         }
         try {
@@ -11293,8 +11299,9 @@ public class LlmAgentLoop implements AgentLoop {
             if (projectRoot == null || projectRoot.isBlank()) {
                 log.info("[LlmAgentLoop] 会话 {} 未绑定项目/项目无路径，workspaceDir 保持无项目（null）: {}",
                     sessionIdStr, workspaceDir);
-                // [B′] resolver 未命中 → DB 兜底（可能 resolver 漏看 / 会话刚 bind 未走冻结）
-                if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                // [F-24 Step 3] resolver 未命中 → 唯一链兜底（回源器 = 同一份查询；覆盖「会话刚 bind
+                //   未走冻结」等冻结表未命中的正常形态）
+                if (applyBoundProjectFromLookup(sessionIdStr)) {
                     return;
                 }
                 // 仍无 → 真无绑定：保持无项目（memory 域 A′ skip；不额外 warn，普通未绑定会话属常态）
@@ -11305,13 +11312,13 @@ public class LlmAgentLoop implements AgentLoop {
             // [cwd-consistency 2026-08-25] 同冻结命中校验：resolver 解析结果目录无效 → 不冻结不注入
             //   （与 getCwd L3 回落一致，防 system prompt 与工具 cwd 不一致）。
             if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
-                log.warn("[LlmAgentLoop] 会话 {} 解析 projectRoot 目录无效（非绝对/不存在），DB 兜底取回真实绑定项目: {}",
+                log.warn("[LlmAgentLoop] 会话 {} 解析 projectRoot 目录无效（非绝对/不存在），唯一链回源 DB 重解析: {}",
                     sessionIdStr, normalized);
-                // [B′] resolver 结果无效 → DB 兜底；仍无 → 保持无项目（memory 域 A′ skip）
-                if (tryResolveBoundProjectFromDb(sessionIdStr)) {
+                // [F-24 Step 3] 唯一链兜底（回源器用同一判据校验，无效即判「有会话但绑定失效」⇒ 取不到）
+                if (applyBoundProjectFromLookup(sessionIdStr)) {
                     return;
                 }
-                log.warn("[LlmAgentLoop] 会话 {} DB 兜底未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
+                log.warn("[LlmAgentLoop] 会话 {} 唯一链未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
                     sessionIdStr);
                 return;
             }
@@ -11321,10 +11328,10 @@ public class LlmAgentLoop implements AgentLoop {
             log.info("[LlmAgentLoop] 会话 projectRoot 注入（CC 启动冻结）: session={} projectRoot={}",
                 sessionIdStr, normalized);
         } catch (Exception e) {
-            log.warn("[LlmAgentLoop] 解析会话 projectRoot 失败，DB 兜底取回真实绑定项目: {} - {}", sessionIdStr, e.getMessage());
-            // [B′] resolver 异常 → DB 兜底；仍无 → 保持无项目（memory 域 A′ skip）
-            if (!tryResolveBoundProjectFromDb(sessionIdStr)) {
-                log.warn("[LlmAgentLoop] 会话 {} resolver 异常且 DB 兜底未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
+            log.warn("[LlmAgentLoop] 解析会话 projectRoot 失败，唯一链回源 DB 重解析: {} - {}", sessionIdStr, e.getMessage());
+            // [F-24 Step 3] 唯一链兜底（回源器异常会被 SessionProjectRoot 记为「解析失败」⇒ 取不到）
+            if (!applyBoundProjectFromLookup(sessionIdStr)) {
+                log.warn("[LlmAgentLoop] 会话 {} resolver 异常且唯一链未取到有效绑定项目，保持无项目（memory 域 A′ skip）",
                     sessionIdStr);
             }
         }

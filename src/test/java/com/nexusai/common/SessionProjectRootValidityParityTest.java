@@ -14,26 +14,36 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * [S2 · F-24 验证 ③ · 2026-09-14] <b>差异 A 门</b>：两份「项目根有效性判据」对同一输入必须<b>全等</b>。
  *
- * <p><b>WHY（规则九 · 验证意图）</b>：本仓有<b>两份</b>独立实现与同一 sessionId → projectRoot 链路
+ * <p><b>WHY（规则九 · 验证意图）</b>：本仓曾有<b>两份</b>独立实现与同一 sessionId → projectRoot 链路
  * 相关（{@link SessionProjectRoot} 的冻结表回源解析器 = {@code ToolRegistrationConfig
- * #sessionProjectRootResolver}，与 {@code LlmAgentLoop.tryResolveBoundProjectFromDb} = B′ 兜底第二链，
- * 见 {@link SessionProjectRoot} 类 javadoc「残差 R-DB」）。两条链各带一份「无效项目根不得冒充项目根」
- * 判据：
+ * #sessionProjectRootResolver}，与 {@code LlmAgentLoop.tryResolveBoundProjectFromDb} = B′ 兜底第二链）。
+ * <b>[F-24 Step 1]</b> 判据已收成一份：{@code isValidProjectRoot} 为唯一实现，本类即它的<b>同步门</b>；
+ * <b>[F-24 Step 3]</b> B′ 链本体已删 ⇒ 本类现守的是「唯一判据不得被改窄」（两个公共行为面必须同判）：
  * <ul>
- *   <li>{@code SessionProjectRoot.isValidProjectRoot}（private static，{@code common}）</li>
- *   <li>{@link CwdResolution#isValidDirectory(String)}（public static，{@code application}）</li>
+ *   <li>{@code SessionProjectRoot.isValidProjectRoot}（public static，{@code common}）</li>
+ *   <li>{@link CwdResolution#isValidDirectory(String)}（public static，{@code application}，
+ *       已改为<b>委托</b>前者）</li>
  * </ul>
- * 「同一能力两套判据」是本仓反复复发的病（backend/CLAUDE.md 规则七）。本用例把「两份拷贝必须同步」
- * 永久钉住：<b>一旦有人只改其中一处，本用例必红</b>。
+ * 「同一能力两套判据」是本仓反复复发的病（backend/CLAUDE.md 规则七）。本用例把「两个面判据一致」
+ * 永久钉住：<b>一旦有人把委托改回拷贝并只改其中一处，本用例必红</b>。
  *
  * <p><b>⛔ 本用例不用源码字符串扫描</b>（{@code source.indexOf} 类字面断言）——本仓已多次栽在
  * 「声称守护 X、实际守不住」的假守卫上；此处改为<b>经公共行为面</b>对照：
  * {@code setForSession}（接受 ⇔ 通过内部有效性判据）↔ {@code CwdResolution.isValidDirectory}。
  *
- * <p><b>RED（反向实验 · 有鉴别力）</b>：把 {@code SessionProjectRoot.isValidProjectRoot} 的
- * {@code p.isAbsolute() && Files.isDirectory(p)} 改成只判 {@code p.isAbsolute()} ⇒ 本用例在
- * 「相对路径」与「绝对但目录不存在」两格红；把 {@code CwdResolution.isValidDirectory} 同样放宽 ⇒
- * 同样红。
+ * <p><b>RED（反向实验 · 有鉴别力 · ⚠️ 配方已按实测更正）</b>：
+ * <b>把委托改回<b>拷贝</b></b>（在 {@code CwdResolution.isValidDirectory} 里重写判据体）并<b>只放宽
+ * 拷贝那一份</b>（如只判 {@code isAbsolute()}）⇒ 两个公共行为面分叉 ⇒ 本用例在「相对路径」与
+ * 「绝对但目录不存在」两格红。
+ *
+ * <p>⚠️ <b>已被实测证伪的旧配方（留痕，⛔ 勿再写成有效配方）</b>：原 javadoc 声称「把
+ * {@code SessionProjectRoot.isValidProjectRoot} 改成只判 {@code isAbsolute()} ⇒ 本用例红」——
+ * <b>实测不红</b>（2026-09-14 F-24 Step 3：该变异下本类 2/2 仍绿，同一个矩阵装置里
+ * {@code BoundProjectResolutionMatrixTest.g7} 红）。根因：Step 1 已把 {@code isValidDirectory}
+ * 改成<b>委托</b> ⇒ 改 {@code isValidProjectRoot} 会<b>同时</b>改掉两面，「两面是否一致」这个判据
+ * 自然还是成立。⇒ 本类守的是「<b>一致性</b>」（委托/拷贝不得单边漂移），
+ * ⛔ <b>不是</b>「判据本身是否正确」——后者由上面那条「改回拷贝 + 单边放宽」配方与
+ * {@code BoundProjectResolutionMatrixTest} 的 g7 格承接。
  */
 @DisplayName("[S2 F-24] 差异 A 门：SessionProjectRoot 有效性判据 ≡ CwdResolution.isValidDirectory")
 class SessionProjectRootValidityParityTest {

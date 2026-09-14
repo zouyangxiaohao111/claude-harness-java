@@ -613,7 +613,12 @@ public final class PowerShellPathValidator {
         return s.replace('\\', '/');
     }
 
-    /** 解析路径：绝对路径（盘符/斜杠开头）直接使用，否则相对 cwd（CC resolve(cwd, path)）。 */
+    /** 解析路径：绝对路径（盘符/斜杠开头）直接使用，否则相对 cwd（CC resolve(cwd, path)）。
+     *
+     *  <p>[裁定 #15] {@code cwd == null}（会话态基准缺失）= 相对路径<b>无法解析</b>：原样返回该相对路径，
+     *  ⛔ <b>不</b>回落进程 {@code user.dir}（那是服务器启动目录，会把「越界」错判成「工作目录内」）。
+     *  下游 {@link #isInWorkingDir} 对 {@code cwd == null} 恒 false ⇒ 该路径落「工作目录之外/无法校验」
+     *  ⇒ ask（fail-closed）；绝对路径分支不受影响（无需基准即可校验，行为不变）。 */
     private static String resolveAgainstCwd(String path, Path cwd) {
         // Windows 陷阱：Paths.get("/etc/hosts").isAbsolute() 为 false（drive-relative），
         // 而 CC path.isAbsolute('/etc/hosts') 为 true。按 CC 语义：前导分隔符或盘符即绝对。
@@ -625,6 +630,10 @@ public final class PowerShellPathValidator {
             }
         } catch (Exception ignored) {
             // 非法路径字符（如 Windows 盘符嵌在相对段）→ 交给 isPathAllowed 失败
+        }
+        if (cwd == null) {
+            // [裁定 #15] 无基准 ⇒ 相对路径原样返回（下游 isInWorkingDir(cwd=null)=false ⇒ ask）
+            return path;
         }
         return Paths.get(cwd.toString(), path).normalize().toString();
     }

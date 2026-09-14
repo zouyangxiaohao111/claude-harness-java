@@ -1195,17 +1195,23 @@ public class ToolRegistrationConfig {
      * <p><b>[批 4a · 用户裁定 #9] 同一实现同时注册为 {@code SessionProjectRoot} 的 DB 回源解析器</b>：
      * 内存冻结表 miss（后端重启后首条消息前必然如此）⇒ 回源本方法 → 回填冻结表。
      *
-     * <p><b>[S2 · F-24 2026-09-14 文案更正]</b> ⛔ 原文「全仓<b>只有这一处</b> DB 查询实现
-     * （sessionId → main_project_id → projects.path），消除「同一能力两套判据」」<b>为假</b>：
-     * 实测有<b>两条</b>独立实现 —— 本方法（冻结表回源解析器）与
-     * {@code LlmAgentLoop.tryResolveBoundProjectFromDb}（run() 入口的 B′ 兜底第二链，
-     * 同一 sessionId → {@code main_project_id} → {@code projects.path} 链路）。两者判据形态分叉
-     * （{@code boolean} vs 三态 {@code Lookup}；后者不区分 unbound/unknown）⇒ <b>差异 A</b>；
-     * 且本方法的回源值经 {@link com.nexusai.common.SessionProjectRoot} 冻结的是<b>未归一</b>值，
-     * 而 B′ 链是先 {@code normalizeSessionProjectRoot} 再赋 ⇒ <b>差异 B</b>。
-     * 二者的可观测性未坐实，已登记为残差 <b>R-DB</b>（见 {@link com.nexusai.common.SessionProjectRoot} 类 javadoc 的「残差 R-DB」段）。
-     * 合并方案（F-24-merge 方案 A）需先裁定「归一化下沉属行为变更」，故本批只做文案 + 残差 +
-     * 「两份判据必须同步」的相同断言（见 {@code SessionProjectRootValidityParityTest}）。
+     * <p><b>[F-24 Step 3 · 2026-09-14 · 用户裁定「删，合并成一个」]</b> 本 {@code @Bean} 是
+     * {@code sessionId → sessions.main_project_id → projects.path} 的<b>唯一</b>查询实现
+     * （「同一能力两套判据」在此能力上终结）。
+     * <ul>
+     *   <li>原「B′ 兜底第二链」{@code LlmAgentLoop.tryResolveBoundProjectFromDb}（自带
+     *       sessionMapper/projectMapper 直查）<b>已删除</b>；{@code LlmAgentLoop} 的 5 个失败出口
+     *       现统一走 {@code SessionProjectRoot.lookup}（= 本方法注册进来的
+     *       {@link com.nexusai.common.SessionProjectRoot#setDbResolver} 回源器）。</li>
+     *   <li>差异 A（判据形态）由 Step 1 消除：{@link com.nexusai.common.SessionProjectRoot#isValidProjectRoot}
+     *       为唯一实现，{@code CwdResolution.isValidDirectory} 委托它；差异 B（归一化落点）由 Step 2
+     *       消除：归一化唯一落点 = 本方法（见下）。</li>
+     *   <li>⚠️ 残留（有意 · 已登记）：{@code LlmAgentLoop} 侧判定矩阵
+     *       {@code BoundProjectResolutionMatrixTest} 记录了一格行为差 —— B′ 自带 DB 直查 ⇒
+     *       回源器「未接线 / 违约返回 null」时它仍能取到绑定；合并后唯一链取不到 ⇒ memory 域
+     *       保持无项目（fail-soft，不抛）。生产里二者同源（同一个 {@code @Bean}），该差只在装配
+     *       异常 / 夹具分叉形态可见。</li>
+     * </ul>
      */
     @Bean
     public java.util.function.Function<String, String> sessionProjectRootResolver(
@@ -1241,17 +1247,19 @@ public class ToolRegistrationConfig {
             // ⭐ [S2 · F-24-merge Step 2 2026-09-14] 归一化落点 = 本回源器（差异 B 消除）。
             //   背景（实测读数，见 ProjectRootNormalizationDivergenceExperimentTest）：
             //   DB 存储形态 = ProjectService.normalizeProjectPath（toAbsolutePath+normalize+正斜杠）
-            //   ⇒ **不 realpath、不 NFC**；而 B′ 链（LlmAgentLoop.normalizeSessionProjectRoot）
-            //   冻结的是 realpath+NFC ⇒ 同一 DB 值被两条链冻结成**不同字符串**，实测可观测且会错：
+            //   ⇒ **不 realpath、不 NFC**；Step 2 前另有一条链（已删的 B′ 兜底，
+            //   LlmAgentLoop.normalizeSessionProjectRoot）冻结的是 realpath+NFC ⇒ 同一 DB 值被
+            //   两条链冻结成**不同字符串**，实测可观测且会错：
             //     · 斜杠方向（Windows 恒差）→ 仅字符串/缓存键差异；
             //     · symlink/junction → slug 完全不同（projects/<slug> 落到不同目录）；
-            //     · non-NFC 名 → slug 不同，且 B′ 链直接判「项目无效」（同一 DB 行两条链给相反结论）。
+            //     · non-NFC 名 → slug 不同，且校验侧直接判「项目无效」（同一 DB 行给出相反结论）。
             //   现本解析器返回前统一 `normalizeCwd`（realpath + NFC）并用**同一判据**校验 ⇒
-            //   两条链冻结同一值；⛔ 这不是「多一层防御」而是**单一归一化点**，勿在别处再加归一化。
+            //   冻结值恒为归一值（F-24 Step 3 后 B′ 链已删 ⇒ 本处是**唯一**归一化点，
+            //   全仓冻结值/消费值同源）；⛔ 这不是「多一层防御」而是**单一归一化点**，勿在别处再加归一化。
             String normalized = com.nexusai.application.agent.agent.CwdResolution.normalizeCwd(project.getPath());
             if (!com.nexusai.application.agent.agent.CwdResolution.isValidDirectory(normalized)) {
                 // 归一化后目录无效（项目目录被删 / 归一化形态在本文件系统不存在）⇒
-                //   「有会话但绑定失效」= cwd 域 fail-loud 判据（与 B′ 链的 isValidDirectory(normalized) 同一判据）
+                //   「有会话但绑定失效」= cwd 域 fail-loud 判据（判据 = 唯一实现 isValidProjectRoot）
                 log.warn("[ToolRegistrationConfig] 会话 {} 绑定项目目录无效（归一化后不存在），按「有会话但绑定失效」"
                     + "处理: raw={} normalized={}", sessionId, project.getPath(), normalized);
                 return com.nexusai.common.SessionProjectRoot.Lookup.unbound();
@@ -1259,9 +1267,11 @@ public class ToolRegistrationConfig {
             return com.nexusai.common.SessionProjectRoot.Lookup.bound(normalized);
         };
         // [批 4a #9] 冻结表 miss ⇒ 回源本解析器（Redis miss → 回源 → 回填）。
+        // [F-24 Step 3] 本注册行同时是「全仓唯一 DB 查询实现」的接线点：LlmAgentLoop 的 5 个失败出口
+        //   已改走 SessionProjectRoot.lookup（本回源器），不再有第二条直查链。
         com.nexusai.common.SessionProjectRoot.setDbResolver(lookupResolver::apply);
         log.info("[ToolRegistrationConfig] SessionProjectRoot DB 回源解析器已注册（冻结表 miss ⇒ 回查 DB 并回填；"
-            + "三态：绑定 / 有会话未绑定 / 无此会话）");
+            + "三态：绑定 / 有会话未绑定 / 无此会话；F-24 Step 3 起为唯一链）");
         // 既有消费方（LlmAgentLoop / RemoteAgentTaskService / ChatService）签名不变：String（无绑定 → null）
         return sessionId -> lookupResolver.apply(sessionId).projectRoot();
     }

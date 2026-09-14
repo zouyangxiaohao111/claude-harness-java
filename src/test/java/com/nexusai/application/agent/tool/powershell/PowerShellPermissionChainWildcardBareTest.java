@@ -120,11 +120,8 @@ class PowerShellPermissionChainWildcardBareTest {
             null, null, null, null, null);
     }
 
-    private static ToolUseContext ctxWithCwd(Path cwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
-            List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
-            java.util.Map.of(), false, "", cwd);
-    }
+    // [裁定 #15] ctxWithCwd 已删：isCurrentDirectoryBareGitRepo 改收 Path（不再收 ctx）⇒
+    //   裸仓库用例直接传 @TempDir 路径（与 BashToolPermissionTest 的 Path 形态一致）。
 
     // ════════════════════════════════════════════════════════════════════════
     // wildcard 算法 · matchWildcardPattern 直接单测（对齐 shellRuleMatching.ts:90-154）
@@ -274,7 +271,7 @@ class PowerShellPermissionChainWildcardBareTest {
     @DisplayName(".git 为文件（worktree/submodule gitdir 引用）→ 非裸仓库（短路 false）")
     void bareGitWorktreeDotGitFileIsFalse(@TempDir Path tmp) throws Exception {
         Files.writeString(tmp.resolve(".git"), "gitdir: ../.git/worktrees/task");
-        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             ".git 是文件时 Git 跟随 gitdir 引用，不属裸仓库（git.ts:882-886）");
     }
 
@@ -283,7 +280,7 @@ class PowerShellPermissionChainWildcardBareTest {
     void bareGitNormalRepoHeadIsFalse(@TempDir Path tmp) throws Exception {
         Files.createDirectories(tmp.resolve(".git"));
         Files.writeString(tmp.resolve(".git/HEAD"), "ref: refs/heads/main");
-        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             "有效 .git/HEAD 时 Git 不会回退 cwd 发现（git.ts:887-896）");
     }
 
@@ -291,7 +288,7 @@ class PowerShellPermissionChainWildcardBareTest {
     @DisplayName("仅 objects/ 目录 → 裸仓库（true）：OR 语义非 AND")
     void bareGitObjectsOnlyIsTrue(@TempDir Path tmp) throws Exception {
         Files.createDirectories(tmp.resolve("objects"));
-        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             "无 .git 但 cwd 含 objects/ 指示 → true（git.ts:914-916 flag if ANY exist）");
     }
 
@@ -299,7 +296,7 @@ class PowerShellPermissionChainWildcardBareTest {
     @DisplayName("仅 refs/ 目录 → 裸仓库（true）")
     void bareGitRefsOnlyIsTrue(@TempDir Path tmp) throws Exception {
         Files.createDirectories(tmp.resolve("refs"));
-        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             "仅 refs/ 指示即 true（OR 语义）");
     }
 
@@ -307,14 +304,14 @@ class PowerShellPermissionChainWildcardBareTest {
     @DisplayName("仅 HEAD 文件 → 裸仓库（true）")
     void bareGitHeadFileOnlyIsTrue(@TempDir Path tmp) throws Exception {
         Files.writeString(tmp.resolve("HEAD"), "ref: refs/heads/main");
-        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             "仅 HEAD 文件指示即 true（git.ts:909-912）");
     }
 
     @Test
     @DisplayName("无任何指示 → 非裸仓库（false）")
     void bareGitNoIndicatorsIsFalse(@TempDir Path tmp) throws Exception {
-        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             "空目录无 HEAD/objects/refs 指示 → false");
     }
 
@@ -324,7 +321,7 @@ class PowerShellPermissionChainWildcardBareTest {
         // 攻击者建 .git/ 目录（无 HEAD 文件）使 Git 回退 cwd 发现，cwd 又含 objects/ → 裸仓库
         Files.createDirectories(tmp.resolve(".git"));
         Files.createDirectories(tmp.resolve("objects"));
-        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertTrue(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             ".git 目录无有效 HEAD + cwd objects/ → Git 回退 cwd 发现（git.ts:897-900 + :914-916）");
     }
 
@@ -332,7 +329,7 @@ class PowerShellPermissionChainWildcardBareTest {
     @DisplayName("空 .git/ 目录仅自身，无 HEAD/objects/refs → 非裸仓库（false）")
     void bareGitEmptyDotGitDirIsFalse(@TempDir Path tmp) throws Exception {
         Files.createDirectories(tmp.resolve(".git"));
-        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(ctxWithCwd(tmp)),
+        assertFalse(PowerShellPermissionChain.isCurrentDirectoryBareGitRepo(tmp),
             ".git 目录存在但无 HEAD，且 cwd 无任何裸仓库指示 → false");
     }
 }

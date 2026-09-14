@@ -1,6 +1,8 @@
 package com.nexusai.apis.claudemd;
 
 import com.nexusai.application.agent.context.ClaudemdEngine;
+import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.infra.exception.ValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,31 +13,72 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * claude-md 记忆引擎 Web 等价 REST 载体 · 对齐 CC {@code utils/claudemd.ts}（OPD-CM5-F-09 /
  * IMP-F1-7 · FR-7 前端审批通道）。
  *
- * <p><b>CC 真源</b>：CC 无 REPL 审批 REST 通道——审批态直接落 {@code config.hasClaudeMdExternalIncludesApproved}
- * （config.ts:115，缺省 false :146），由 {@code getMemoryFiles} 消费：
+ * <p><b>CC 真源</b>：CC 无 REPL 审批 REST 通道——审批态直接落 <b>project config</b>
+ * （{@code config.hasClaudeMdExternalIncludesApproved}，字段声明 config.ts:115 / :116，默认
+ * config.ts:146 / :147），由 {@code getMemoryFiles} 消费：
  * {@code includeExternal = forceIncludeExternal || config.hasClaudeMdExternalIncludesApproved || false}
- * （claudemd.ts:798-801）。Java 无 getCurrentProjectConfig 概念 → ClaudemdEngine 以注入式
- * Supplier 装配缝承接（ClaudemdEngine:144-154/:281-288）。<b>本控制器即生产注入点</b>（F1-7
- * 缺口「hasClaudeMdExternalIncludesApproved/WarningShown 无生产注入」闭环）——前端审批对话框
- * 接受/拒绝后 POST 本端点置位。
+ * （claudemd.ts:798-801）。Java 无 getCurrentProjectConfig → ClaudemdEngine 以注入式
+ * {@code Function<String sessionId, Boolean>} 装配缝承接（{@code ClaudemdEngine}
+ * 的 {@code setHasClaudeMdExternalIncludesApproved} / {@code setHasClaudeMdExternalIncludesWarningShown}）。
+ * <b>本控制器即生产注入点</b>（F1-7 缺口「hasClaudeMdExternalIncludesApproved/WarningShown 无生产注入」闭环）
+ * ——前端审批对话框接受/拒绝后 POST 本端点置位。
  *
- * <p><b>缓存失效</b>：{@code getMemoryFiles} memoize 缓存 keyed on {@code forceIncludeExternal}
- * （ClaudemdEngine:382-384，CC lodash memoize claudemd.ts:790）——审批态翻转后若不失效，
- * 主路径 {@code getMemoryFiles(false)} 仍返回旧列表（不含新批准的外部 @include）。对齐 CC
+ * <p>⭐ <b>[T15-3 2026-09-14] 键 = 项目根（已修「进程级单例」的跨项目泄漏）</b>：
+ * <p><b>原来的偏离</b>：本控制器曾把两份态存成<b>进程级单例 volatile（无任何键）</b>。而 CC 侧这两个标志的
+ * 宿主是 <b>project config</b>（消费点 {@code const config = getCurrentProjectConfig()}，
+ * claudemd.ts:796 / :1420）⇒ <b>CC 语义 = 每个项目一份审批态</b>（同项目的另一个会话「本来就该」受影响，
+ * 不同项目互不影响）。进程级单例比 CC 的键 <b>更宽</b> ⇒ <b>A 项目点过「允许」会静默影响 B 项目</b>。
+ * <p><b>现修法</b>：存储键 = 由请求显式传入的 {@code sessionId} 解析出的 <b>项目键</b>
+ * （{@link #resolveProjectKey(String, String)}），两条 REST 端点各加显式 {@code sessionId} 入参。
+ * ⛔ <b>刻意不按 sessionId 存</b>：那会让「同项目跨会话不再共享」，是<b>发明 CC 没有的判据</b>。
+ * <p><b>键的三级推导（与 CC 对齐）</b>：
+ * <ol>
+ *   <li>{@code sessionId} → {@link SessionProjectRoot#lookup(String)}（会话冻结表 / miss 回源 DB）
+ *       → 会话绑定项目根。CC 对照物 = {@code State.projectRoot}（state.ts:45-50「stable project root …
+ *       use for project identity」+ state.ts:261-279 启动冻结 realpath+NFC），
+ *       ⛔ <b>不用</b> {@code CwdResolution.getOriginalCwdLayer}：后者 L1 是 worktree 重锚层
+ *       （{@code EnterWorktreeTool} 写 worktreePath），会把同一个项目按 worktree <b>分叉成多个键</b>，
+ *       而 CC 恰恰是<b>折叠</b>的（见下条）；</li>
+ *   <li>项目根 → {@link AutoMemPaths#findCanonicalGitRoot(String)}
+ *       （CC {@code findCanonicalGitRoot}，git.ts:195 / :197-210 → resolveCanonicalRoot git.ts:123-183：
+ *       worktree 经 {@code .git} 的 {@code gitdir:} + {@code commondir} 解析到<b>主仓库根</b>）；
+ *       <b>非 git ⇒ null ⇒ 回落项目根本身</b>——该回落是 CC 的<b>显式语义</b>而非静默兜底
+ *       （{@code getAutoMemBase() = findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot()}，
+ *       memdir/paths.ts:204；approval 侧同构：{@code getProjectPathForConfig} 非 git 回落
+ *       {@code resolve(originalCwd)}，config.ts:1596-1607）。
+ *       <p>⚠️ 折叠导致「同一 git 仓的不同子目录 / worktree 共享一份审批态」——<b>CC 本就如此</b>
+ *       （同两条 CC 源码），不是本仓引入的新行为。</li>
+ * </ol>
+ *
+ * <p><b>缓存失效</b>：{@code getMemoryFiles} memoize（CC lodash memoize claudemd.ts:790）——
+ * 审批态翻转后若不失效，主路径仍返回旧列表（不含新批准的外部 @include）。对齐 CC
  * {@code clearMemoryFileCaches}「purely for correctness … settings sync」（claudemd.ts:1110-1122）
  * 语义：置位后调用 {@link ClaudemdEngine#clearMemoryFileCaches()} 失效（不触发 InstructionsLoaded
- * hook，纯正确性失效）。
+ * hook，纯正确性失效）。<b>另有第二道保障</b>：{@link ClaudemdEngine} 的 memoize 键已纳入审批态
+ * （否则不同项目会共用同键 → 跨项目串值）。
  *
- * <p><b>失败语义</b>：请求体缺失 / {@code approved} 缺失 → 400（ValidationException，审批态
- * 二值契约，拒绝隐式缺省）；claudemd 引擎未接线 → 500 fail loud（无静默降级，对齐
+ * <p><b>缺值策略</b>（[T15-3] 按改造铁律）：
+ * <ul>
+ *   <li>请求体缺失 / {@code approved} 缺失 → <b>400</b>（审批态二值契约，拒绝隐式缺省）；</li>
+ *   <li>{@code sessionId} 缺失 / 空白 → <b>400</b>（(a) 类「本该有却没有」）；</li>
+ *   <li>解析不到项目根（会话存在但未绑定 / 无此会话 / <b>解析失败</b>）→ <b>400</b>（同上；
+ *       先例 = {@code SessionMemoryExportController} 的四个失败出口全 400）。⛔ 绝不回落
+ *       config home / user.dir 冒充项目根。</li>
+ * </ul>
+ *
+ * <p><b>失败语义</b>：claudemd 引擎未接线 → 500 fail loud（无静默降级，对齐
  * ExtractMemoriesController.resolveMemoryStorage 同语义）。
  *
  * <p><b>鉴权说明</b>：与同级只读载体 {@code /api/v1/context/analyze} 一致，未纳入
@@ -54,46 +97,55 @@ public class ClaudeMdController {
     private ClaudemdEngine claudemdEngine;
 
     /**
-     * 外部 include 审批态 · CC original: {@code config.hasClaudeMdExternalIncludesApproved}
-     * （config.ts:115，缺省 false :146）。本控制器持有 + 以 {@code () -> this.externalIncludesApproved}
-     * Supplier 注册进引擎（ClaudemdEngine:286），生产注入点。
+     * 外部 include 审批态 · <b>按项目键分区</b> · CC original: {@code config.hasClaudeMdExternalIncludesApproved}
+     * （config.ts:115，缺省 false :146）。
      *
-     * <p><b>⛔ 已知偏离 · 正确的键是「项目根」而不是「进程」也不是「会话」（2026-09-14 裁定）</b>：
-     * CC 侧这两个标志的宿主是 <b>project config</b> —— {@code claudemd.ts:796} 与
-     * {@code claudemd.ts:1420} 都是 {@code const config = getCurrentProjectConfig()}，字段声明在
-     * {@code ProjectConfig}（{@code config.ts:115}/{@code :116}，默认 {@code :146}/{@code :147}）
-     * ⇒ <b>语义 = 每个项目一份审批态</b>（同项目的另一个会话「本来就该」受影响）。
-     * <p>本仓实现是<b>进程级单例 volatile（无任何键）</b> ⇒ 比 CC 的键<b>更宽</b>：
-     * <b>跨项目的会话会互相影响</b>（A 项目点过「允许」会静默影响 B 项目）—— 这是<b>已知偏离</b>，
-     * 不是「会话级 vs 进程级」的问题。
-     * <p><b>为什么不按 sessionId 会话化</b>：那会引入一个与 CC 不同的新语义（同项目跨会话不再共享），
-     * 属「发明 CC 没有的判据」。<b>正确修法 = 改键为项目根 + 给 REST 契约加项目维度</b>
-     * （{@code POST /api/v1/claude-md/include-approval} 当前入参只有 {@code {approved:boolean}}，
-     * 无项目/会话维度）⇒ <b>属契约决策，已登记交用户裁定</b>，未在本批实现。
+     * <p>键 = {@link #resolveProjectKey(String, String)}（项目根 → canonical 键）；缺键视为
+     * {@code false}（CC {@code DEFAULT_PROJECT_CONFIG}，config.ts:146）。
+     * <p>⛔ <b>不是 sessionId 键</b>（那会发明 CC 没有的判据）；⛔ <b>不是进程级单例</b>（那会跨项目泄漏
+     * ——本批要治的正是这个）。
      */
-    private volatile boolean externalIncludesApproved = false;
+    private final Map<String, Boolean> externalIncludesApprovedByProject = new ConcurrentHashMap<>();
 
     /**
-     * 外部 include 警告已示标志 · CC original: {@code config.hasClaudeMdExternalIncludesWarningShown}
-     * （config.ts:116，缺省 false :147）。本控制器持有 + 以 {@code () -> this.externalIncludesWarningShown}
-     * Supplier 注册进引擎（ClaudemdEngine:296）。CC Dialog onDone 批准/拒绝**均**置 true
-     * （config.ts:123-131）——拒绝后 {@code shouldShowClaudeMdExternalIncludesWarning} 返回 false（不再弹窗）。
-     *
-     * <p><b>⛔ 同 {@link #externalIncludesApproved} 的已知偏离</b>：CC 侧宿主是 project config
-     * （{@code config.ts:116} + {@code claudemd.ts:1420} 的 {@code getCurrentProjectConfig()}）
-     * ⇒ 正确键 = <b>项目根</b>；本仓现为进程级 ⇒ 跨项目互相影响，登记为契约决策。
+     * 外部 include 警告已示态 · <b>按项目键分区</b> · CC original: {@code config.hasClaudeMdExternalIncludesWarningShown}
+     * （config.ts:116，缺省 false :147）。CC Dialog onDone 批准/拒绝**均**置 true（config.ts:123-131）
+     * ——拒绝后 {@code shouldShowClaudeMdExternalIncludesWarning} 返回 false（不再弹窗）。键同
+     * {@link #externalIncludesApprovedByProject}。
      */
-    private volatile boolean externalIncludesWarningShown = false;
+    private final Map<String, Boolean> externalIncludesWarningShownByProject = new ConcurrentHashMap<>();
+
+    /**
+     * 引擎侧接缝读到「解析不出项目键」时的告警闸 · <b>按原因分键（三类各一道）</b>。
+     *
+     * <p>WHY 一次性：agent 真实加载路径每次 {@code getMemoryFiles} 都会读接缝，逐次 WARN 会刷屏
+     * （本仓既有惯例 = {@code SessionProjectRoot.NULL_SESSION_LOOKUP_WARNED}）。
+     *
+     * <p>⛔ <b>为什么不共用一个闸</b>：三个原因是<b>三种不同缺陷</b>，共用一个 {@code AtomicBoolean}
+     * 会让「先到者」把「后到者」的可观测性<b>结构性抹掉</b> —— 例如 JVM 早期只要出现过一次
+     * 「sessionId 为空」，此后「会话存在但无绑定项目根」（= 数据链路异常，按用户裁定「每个会话一定有
+     * 绑定目录」属<b>真缺陷</b>）在日志里<b>永不出现</b>。这类「一次性闸把『≥WARN 可观测』变成
+     * 『每 JVM 一行』，缺陷越普遍可观测性越差」已被本改造计划 §九.C.3 点名，且 P1a 批实证过
+     * 「全进程一个 AtomicBoolean 会让消费侧告警结构上不可达」⇒ 理由不共享，闸也不共享。
+     * <p>⚠️ 三闸<b>只覆盖 (b) 类</b>（「本就不需要」⇒ 返回 false + WARN）；对 (a) 类「本该有却没有」
+     * （解析失败）是<b>抛</b>，不在此闸内。
+     */
+    private final AtomicBoolean blankSessionIdWarned = new AtomicBoolean(false);
+    /** 见 {@link #blankSessionIdWarned}（「会话存在但无绑定项目根」独立一道）。 */
+    private final AtomicBoolean unboundSessionWarned = new AtomicBoolean(false);
+    /** 见 {@link #blankSessionIdWarned}（「无此会话」独立一道）。 */
+    private final AtomicBoolean unknownSessionWarned = new AtomicBoolean(false);
 
     /**
      * 前端审批对话框审批外部 @include · POST /api/v1/claude-md/include-approval。
      *
-     * <p>流程: 校验 {@code approved} 二值 → 更新本控制器持有态 → 以 {@code () -> approved}
-     * Supplier 注入引擎（CC claudemd.ts:798-801 includeExternal 门控）→
-     * {@link ClaudemdEngine#clearMemoryFileCaches()} 失效 memoize 缓存（CC settings-sync 正确性
-     * 失效，claudemd.ts:1110-1122）→ 回显 {@code {approved}}。
+     * <p>流程: 校验 {@code approved} 二值 + 解析项目键（失败 → 400）→ 更新本项目键下的两份态 →
+     * 以 {@code sessionId -> 项目键查表} 闭包注入引擎（CC claudemd.ts:798-801 includeExternal 门控，
+     * 引擎侧 {@code getMemoryFiles} / {@code shouldShowClaudeMdExternalIncludesWarning} <b>两侧同一个闭包
+     * 同一个键</b>）→ {@link ClaudemdEngine#clearMemoryFileCaches()} 失效 memoize 缓存（CC settings-sync
+     * 正确性失效，claudemd.ts:1110-1122）→ 回显 {@code {approved}}。
      *
-     * @param request POST JSON 请求体（{@code { "approved": boolean }}，必填）
+     * @param request POST JSON 请求体（{@code { "approved": boolean, "sessionId": string }}，均必填）
      * @return 200 回显审批态 {@code {approved: boolean}}
      */
     @PostMapping(value = "/include-approval", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -104,31 +156,30 @@ public class ClaudeMdController {
                 + "拒绝隐式缺省）→ 400");
             throw new ValidationException("approved is required (include-approval)");
         }
-        boolean approved = request.approved();
         ClaudemdEngine engine = resolveEngine();
-        this.externalIncludesApproved = approved;
-        // CC claudemd.ts:798-801 includeExternal = forceIncludeExternal || config.hasClaudeMdExternalIncludesApproved
-        engine.setHasClaudeMdExternalIncludesApproved(() -> this.externalIncludesApproved);
+        String projectKey = resolveProjectKey(request.sessionId(), "/include-approval");
+        boolean approved = request.approved();
+        this.externalIncludesApprovedByProject.put(projectKey, approved);
         // CC Dialog onDone 批准/拒绝均置 WarningShown=true（config.ts:123-131）——拒绝后不再弹窗；
         // shouldShowClaudeMdExternalIncludesWarning 因 warningShown=true 返回 false（claudemd.ts:1423-1426）
-        this.externalIncludesWarningShown = true;
-        engine.setHasClaudeMdExternalIncludesWarningShown(() -> this.externalIncludesWarningShown);
+        this.externalIncludesWarningShownByProject.put(projectKey, true);
+        wireEngine(engine);
         // CC claudemd.ts:1119-1122 clearMemoryFileCaches（settings sync 纯正确性失效）——
-        // 否则 memoize 的 getMemoryFiles(false) 缓存不含新批准的外部 @include
+        // 否则 memoize 的 getMemoryFiles(false, ...) 缓存不含新批准的外部 @include
         engine.clearMemoryFileCaches();
         if (log.isInfoEnabled()) {
-            log.info("[ClaudeMdController] /include-approval 审批态更新: approved={}（CC config.ts:115 "
-                + "hasClaudeMdExternalIncludesApproved，claudemd.ts:798-801 includeExternal 门控；"
-                + "WarningShown=true 置位对齐 CC Dialog onDone config.ts:123-131；getMemoryFiles 缓存已失效）",
-                approved);
+            log.info("[ClaudeMdController] /include-approval 审批态更新: approved={} sessionId={} projectKey={}"
+                + "（CC config.ts:115 hasClaudeMdExternalIncludesApproved，claudemd.ts:798-801 includeExternal "
+                + "门控；WarningShown=true 置位对齐 CC Dialog onDone config.ts:123-131；getMemoryFiles 缓存已失效）",
+                approved, request.sessionId(), projectKey);
         }
         return ResponseEntity.ok(new IncludeApprovalResponse(approved));
     }
 
     /**
-     * 查询 CLAUDE.md 外部 @import 审批状态 · GET /api/v1/claude-md/include-status。
+     * 查询 CLAUDE.md 外部 @import 审批状态 · GET /api/v1/claude-md/include-status?sessionId=…
      *
-     * <p>前端启动/加载上下文时主动 GET 查询（用户拍板仅 GET，不用 STOMP 推送），判断
+     * <p>前端在<b>会话激活后</b>主动 GET 查询（用户拍板仅 GET，不用 STOMP 推送），判断
      * 「CLAUDE.md 外部 @import 是否待审批并弹窗」。对齐 CC 启动时同步检测
      * {@code shouldShowClaudeMdExternalIncludesWarning()}（interactiveHelpers.tsx:164 →
      * ClaudeMdExternalIncludesDialog）+ {@code getExternalClaudeMdIncludes(await getMemoryFiles(true))}
@@ -136,39 +187,185 @@ public class ClaudeMdController {
      *
      * <p><b>语义</b>：
      * <ul>
-     *   <li>{@code needsApproval} = 引擎 {@code shouldShowClaudeMdExternalIncludesWarning()}——
-     *       未审批 && 未示警 && 有外部 include → true（claudemd.ts:1420-1430）。</li>
-     *   <li>{@code files} = 引擎 {@code getExternalClaudeMdIncludes(getMemoryFiles(true))}——forceIncludeExternal=true
-     *       探测外部 include（不受审批门控）；{@code getMemoryFiles(true)} 与 shouldShow 内部调用同参共享
-     *       memoize 缓存，不重复 IO。</li>
+     *   <li>{@code needsApproval} = 引擎 {@code shouldShowClaudeMdExternalIncludesWarning(sessionId)}
+     *       —— 本会话<b>项目键</b>下未审批 && 未示警 && 有外部 include → true（claudemd.ts:1420-1430）。</li>
+     *   <li>{@code files} = 引擎 {@code getExternalClaudeMdIncludes(getMemoryFiles(true, sessionId), sessionId)}
+     *       —— forceIncludeExternal=true 探测外部 include（不受审批门控）。</li>
      * </ul>
      *
-     * <p><b>失败语义</b>：claudemd 引擎未接线 → 500 fail loud（与 include-approval 一致，无静默降级）。
+     * <p><b>失败语义</b>：{@code sessionId} 缺失/解析不到项目键 → <b>400</b>（[T15-3]：本端点的答案
+     * <b>按项目定义</b>，无项目 ⇒ 无法判定 —— ⛔ 不再沿用旧「无会话入参 ⇒ 传 null 跳过」的 (b) 分类，
+     * 该分类的前提「审批态与会话无关」已被本批推翻）；claudemd 引擎未接线 → 500 fail loud。
      *
+     * @param sessionId 会话标识（必填；{@code ?sessionId=}）
      * @return 200 {@link IncludeStatusResponse}
      */
     @GetMapping(value = "/include-status", produces = MediaType.APPLICATION_JSON_VALUE)
-    public IncludeStatusResponse includeStatus() {
+    public IncludeStatusResponse includeStatus(
+            @RequestParam(value = "sessionId", required = false) String sessionId) {
         ClaudemdEngine engine = resolveEngine();
+        // 400 门禁 + 数据流日志（键由引擎侧闭包再解析一次：同一 helper、同一语义；命中为内存查表，
+        // miss 为一次 PK 回源，代价可忽略）
+        String projectKey = resolveProjectKey(sessionId, "/include-status");
+        wireEngine(engine);
         // 对齐 CC shouldShowClaudeMdExternalIncludesWarning（interactiveHelpers.tsx:164 + claudemd.ts:1422-1429）
-        // [批 3c] 本端点（GET /include-status）无会话入参 → (b) 类合法跳过：显式传 null
-        //   （CwdResolution/SessionProjectRoot 均跳过会话层，回落进程 user.dir，与旧实现「MDC 为空」等价）。
-        //   影响面：仅影响 InstructionsLoaded hook 载荷的 session_id 字段（外部 include 的探测本身不依赖会话）。
-        log.warn("[ClaudeMdController] GET /include-status 无会话入参 → 记忆文件解析按进程默认（user.dir），"
-            + "InstructionsLoaded hook 载荷 session_id 为 null（批 3c：会话态显式化，不再回落 MDC）");
-        boolean needsApproval = engine.shouldShowClaudeMdExternalIncludesWarning(null);
+        boolean needsApproval = engine.shouldShowClaudeMdExternalIncludesWarning(sessionId);
         // 对齐 CC getExternalClaudeMdIncludes(await getMemoryFiles(true))（interactiveHelpers.tsx:165）——
-        // forceIncludeExternal=true 探测外部 include，不受审批门控；getMemoryFiles(true) memoize 与
-        // shouldShow 内部调用同参共享缓存，不重复 IO。
-        // [drop-requestcontext] 本端点无会话入参 → 扫描根/外部判定显式传 null（引擎侧一次性 WARN +
-        //   user.dir 兜底，与上面 include-status 的告警同一语义）
-        List<String> files = engine.getExternalClaudeMdIncludes(engine.getMemoryFiles(true, null), null)
+        // forceIncludeExternal=true 探测外部 include，不受审批门控
+        List<String> files = engine.getExternalClaudeMdIncludes(engine.getMemoryFiles(true, sessionId), sessionId)
             .stream().map(ClaudemdEngine.ExternalClaudeMdInclude::path).toList();
         if (log.isInfoEnabled()) {
-            log.info("[ClaudeMdController] GET /include-status: needsApproval={} externalIncludeFiles={}",
-                needsApproval, files.size());
+            log.info("[ClaudeMdController] GET /include-status: sessionId={} projectKey={} needsApproval={} "
+                + "externalIncludeFiles={}", sessionId, projectKey, needsApproval, files.size());
         }
         return new IncludeStatusResponse(needsApproval, files);
+    }
+
+    /**
+     * [T15-3] 解析请求显式传入的 {@code sessionId} → <b>项目键</b>（三级推导见类 javadoc）。
+     *
+     * <p><b>失败出口全部 400（⛔ 无一处静默、⛔ 绝不回落 user.dir）</b>：
+     * <ol>
+     *   <li>sessionId 缺失/空白 ⇒ (a)「本该有却没有」⇒ 400；</li>
+     *   <li>会话存在但无绑定项目根 / 绑定失效 ⇒ 数据链路异常 ⇒ 400；</li>
+     *   <li>无此会话（合成/伪造/已删 id）⇒ 400（⛔ 刻意不走「无会话出口」——那会返回与请求方无关的
+     *       进程 user.dir，正是本批要消灭的「冒充项目根」）；</li>
+     *   <li>解析失败 / 无法判定（回源解析器未接线 / 回源抛错 / 违约返回 null）⇒ 400，且文案与上一条
+     *       <b>可辨识</b>（⛔ 不把装配异常混报成「无此会话」）。</li>
+     * </ol>
+     *
+     * @param sessionId 请求显式传入的会话标识
+     * @param endpoint  端点字面量（仅用于日志/错误消息）
+     * @return 项目键（恒非空 —— 否则抛）
+     * @throws ValidationException 上述任一失败出口（REST → 400）
+     */
+    private String resolveProjectKey(String sessionId, String endpoint) {
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[ClaudeMdController] {} 需要项目键，但缺少 sessionId → 400"
+                + "（⛔ 不回落 config home / user.dir 冒充项目根）", endpoint);
+            throw new ValidationException("sessionId is required (" + endpoint + ")");
+        }
+        SessionProjectRoot.Lookup lookup = SessionProjectRoot.lookup(sessionId);
+        String projectRoot = lookup.projectRoot();
+        if (projectRoot == null || projectRoot.isBlank()) {
+            log.warn("[ClaudeMdController] {} 需要项目键，但 sessionId={} 解析不到（sessionKnown={} "
+                + "resolutionFailed={}：{}）→ 400（⛔ 不回落 config home / user.dir 冒充项目根）",
+                endpoint, sessionId, lookup.sessionKnown(), lookup.resolutionFailed(),
+                lookup.resolutionFailed()
+                    ? "项目根**无法判定**（回源解析器未接线 / 回源抛错 / 违约返回 null）"
+                    : lookup.sessionKnown() ? "会话存在但无绑定项目根/绑定失效" : "无此会话（合成/伪造/已删 id）");
+            throw new ValidationException("sessionId has no bound project root (" + endpoint + ")");
+        }
+        String canonical = AutoMemPaths.findCanonicalGitRoot(projectRoot);
+        // CC memdir/paths.ts:204 `findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot()`：
+        //   非 git 目录 ⇒ 回落项目根本身（CC 显式语义，非静默兜底）
+        String projectKey = canonical != null ? canonical : projectRoot;
+        if (log.isDebugEnabled()) {
+            log.debug("[ClaudeMdController] {} 项目键解析: sessionId={} projectRoot={} canonicalGitRoot={} "
+                + "projectKey={}", endpoint, sessionId, projectRoot, canonical, projectKey);
+        }
+        return projectKey;
+    }
+
+    /**
+     * [T15-3] 把「{@code sessionId → 本项目键下的审批态}」闭包注入引擎（幂等）。
+     *
+     * <p><b>WHY 在两端点都注入</b>：引擎的两个消费点（{@code getMemoryFiles} 与
+     * {@code shouldShowClaudeMdExternalIncludesWarning}）读的是<b>同一个闭包</b>；只由 POST 注入会让
+     * 「进程内从未 POST 过」时接缝为 null（虽然结果同为默认 false，但「两侧同一个闭包」这一性质
+     * 依赖调用顺序 —— 本方法把它变成<b>与顺序无关</b>）。
+     *
+     * <p><b>闭包缺值策略</b>（[T15-3] 按改造铁律，⛔ 与 REST 侧 400 不同：agent 真实加载路径<u>不抛</u>）：
+     * <ul>
+     *   <li>会话存在但未绑定 / 无此会话 ⇒ (b)「本就不需要」⇒ <b>返回 false + 一次性 ≥WARN</b>
+     *       （= CC 缺省 false，config.ts:146）；</li>
+     *   <li>解析失败 / 无法判定 ⇒ (a)「本该有却没有」⇒ <b>抛</b>。WHY 不静默返回 false：同一引擎同一
+     *       sessionId 上，{@code resolveOriginalCwd}（CwdResolution:280-284）对该态本来就抛，
+     *       此处若吞掉就新造「一处抛一处吞」的不一致（正是本改造要消灭的东西）。</li>
+     * </ul>
+     */
+    private void wireEngine(ClaudemdEngine engine) {
+        engine.setHasClaudeMdExternalIncludesApproved(this::approvedForSession);
+        engine.setHasClaudeMdExternalIncludesWarningShown(this::warningShownForSession);
+    }
+
+    /** 见 {@link #wireEngine} 的契约（(b) 类返回 false + 一次性 WARN；(a) 类抛）。 */
+    private boolean approvedForSession(String sessionId) {
+        String projectKey = projectKeyForEngineRead(sessionId);
+        return projectKey != null
+            && Boolean.TRUE.equals(this.externalIncludesApprovedByProject.get(projectKey));
+    }
+
+    /** 见 {@link #wireEngine} 的契约（同 {@link #approvedForSession}）。 */
+    private boolean warningShownForSession(String sessionId) {
+        String projectKey = projectKeyForEngineRead(sessionId);
+        return projectKey != null
+            && Boolean.TRUE.equals(this.externalIncludesWarningShownByProject.get(projectKey));
+    }
+
+    /**
+     * 引擎侧读路径的项目键解析（[T15-3] 与 {@link #resolveProjectKey} 的差别：<b>不抛 400，按四态分流</b>）。
+     *
+     * @return 项目键；null = 解析不出且属 (b) 类（调用方按「未审批 / 未示警」处理）
+     * @throws IllegalStateException 解析失败 / 无法判定（(a) 类，fail loud）
+     */
+    private String projectKeyForEngineRead(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            warnBlankSessionIdOnce();
+            return null;
+        }
+        SessionProjectRoot.Lookup lookup = SessionProjectRoot.lookup(sessionId);
+        if (lookup.resolutionFailed()) {
+            // (a) 本该有却没有 ⇒ fail loud（⛔ 不降级为 false —— 同一输入上 resolveOriginalCwd 已抛，
+            //     此处吞掉会造出「一处抛一处吞」的不一致）
+            log.error("[ClaudeMdController] 引擎读审批态时项目根**无法判定**（回源解析器未接线 / 回源抛错 / "
+                + "违约返回 null）⇒ fail loud（⛔ 不得当作『未审批』静默返回 false）： sessionId={}", sessionId);
+            throw new IllegalStateException("claude-md include approval state unresolvable: sessionId="
+                + sessionId + " (project root resolution failed)");
+        }
+        String projectRoot = lookup.projectRoot();
+        if (projectRoot == null || projectRoot.isBlank()) {
+            if (lookup.sessionKnown()) {
+                warnUnboundSessionOnce(sessionId);
+            } else {
+                warnUnknownSessionOnce(sessionId);
+            }
+            return null;
+        }
+        String canonical = AutoMemPaths.findCanonicalGitRoot(projectRoot);
+        return canonical != null ? canonical : projectRoot;
+    }
+
+    /** (b)-1 原因：sessionId 为空/空白 ⇒ 一次性 ≥WARN（独立闸，见 {@link #blankSessionIdWarned}）。 */
+    private void warnBlankSessionIdOnce() {
+        if (blankSessionIdWarned.compareAndSet(false, true)) {
+            log.warn("[ClaudeMdController] 引擎读外部 include 审批态时 sessionId 为空/空白 ⇒ 解析不出项目键，"
+                + "按 CC 缺省返回 false（config.ts:146）—— 即视为「未审批 / 未示警」。⛔ 绝不回落 config home / "
+                + "user.dir 冒充项目根；本原因只打印一次（agent 加载路径逐次调用）");
+        }
+    }
+
+    /**
+     * (b)-2 原因：会话存在但无绑定项目根 / 绑定失效 ⇒ 一次性 ≥WARN（<b>独立闸</b>）。
+     *
+     * <p>按用户裁定「每个会话一定有绑定目录，查不到就是严重 bug」⇒ 本原因属<b>真缺陷线索</b>，
+     * ⛔ 不得与「无此会话」等无害态共用一道闸（否则它会被先到者抹掉、永不可见）。
+     */
+    private void warnUnboundSessionOnce(String sessionId) {
+        if (unboundSessionWarned.compareAndSet(false, true)) {
+            log.warn("[ClaudeMdController] 引擎读外部 include 审批态时**会话存在但无绑定项目根/绑定失效**"
+                + "（数据链路异常 ⇒ 按用户裁定属严重 bug 线索）⇒ 解析不出项目键，按 CC 缺省返回 false"
+                + "（config.ts:146）。sessionId={}；本原因只打印一次（agent 加载路径逐次调用）", sessionId);
+        }
+    }
+
+    /** (b)-3 原因：无此会话（合成 / 伪造 / 已删 id）⇒ 一次性 ≥WARN（<b>独立闸</b>）。 */
+    private void warnUnknownSessionOnce(String sessionId) {
+        if (unknownSessionWarned.compareAndSet(false, true)) {
+            log.warn("[ClaudeMdController] 引擎读外部 include 审批态时**无此会话**（合成/伪造/已删 id）"
+                + "⇒ 解析不出项目键，按 CC 缺省返回 false（config.ts:146）。sessionId={}；"
+                + "本原因只打印一次（agent 加载路径逐次调用）", sessionId);
+        }
     }
 
     /**
@@ -188,21 +385,25 @@ public class ClaudeMdController {
      * /include-approval 请求体 · CC original: {@code config.hasClaudeMdExternalIncludesApproved}
      * （config.ts:115 布尔审批态）。前端审批对话框接受 → true，拒绝 → false。
      *
-     * @param approved 外部 @include 是否获准（必填；null → 400）
+     * <p>[T15-3] 加 {@code sessionId}：CC 的审批态宿主是 <b>project config</b>（claudemd.ts:796/:1420）
+     * ⇒ 服务端必须知道「哪个项目」，而唯一合法入口是请求显式传入的会话标识（⛔ 不读任何隐式通道）。
+     *
+     * @param approved  外部 @include 是否获准（必填；null → 400）
+     * @param sessionId 会话标识（必填；解析不出项目键 → 400）
      */
-    public record IncludeApprovalRequest(Boolean approved) {}
+    public record IncludeApprovalRequest(Boolean approved, String sessionId) {}
 
     /**
      * /include-approval 响应 · 回显已落地的审批态（前端确认对话框关闭后刷新门控展示）。
      *
-     * @param approved 已注册进引擎的审批态
+     * @param approved 已登记到本项目键下的审批态
      */
     public record IncludeApprovalResponse(boolean approved) {}
 
     /**
      * /include-status 响应 · 前端判断「CLAUDE.md 外部 @import 是否待审批并弹窗」。
      *
-     * @param needsApproval 是否需审批（存在外部 include 且未审批且未示警；CC shouldShowClaudeMdExternalIncludesWarning）
+     * @param needsApproval 是否需审批（本会话项目键下：存在外部 include 且未审批且未示警；CC shouldShowClaudeMdExternalIncludesWarning）
      * @param files         外部 @import 文件绝对路径列表（CC getExternalClaudeMdIncludes，不受审批门控）
      */
     public record IncludeStatusResponse(boolean needsApproval, List<String> files) {}

@@ -5,6 +5,11 @@ import { ApiError } from '@/api/rest'
 interface IncludeApprovalModalProps {
   /** 待审批的外部 @import 文件路径列表 */
   files: string[]
+  /**
+   * [T15-3] 当前激活会话 id · **必传**（后端审批态按项目分区）。
+   * ⛔ 不得传空串：调用方须保证会话已就绪（零态不渲染本弹窗）。
+   */
+  sessionId: string
   /** 审批结果回传（true=确认允许 / false=拒绝）· 仅 API 成功后调用 */
   onApprove: (approved: boolean) => void
   onClose: () => void
@@ -35,7 +40,7 @@ function CloseIcon() {
  * 底部按钮：拒绝灰底、确认允许橙渐变 #FF7A3D。
  * 提交走 POST /api/v1/claude-md/include-approval；失败 fail loud（ApiError.userMessage() 内联展示，弹窗不关闭）。
  */
-export function IncludeApprovalModal({ files, onApprove, onClose }: IncludeApprovalModalProps) {
+export function IncludeApprovalModal({ files, sessionId, onApprove, onClose }: IncludeApprovalModalProps) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
 
@@ -44,7 +49,7 @@ export function IncludeApprovalModal({ files, onApprove, onClose }: IncludeAppro
     setSubmitting(true)
     setError('')
     try {
-      await approveInclude(approved)
+      await approveInclude(sessionId, approved)
       onApprove(approved)
       onClose()
     } catch (e) {

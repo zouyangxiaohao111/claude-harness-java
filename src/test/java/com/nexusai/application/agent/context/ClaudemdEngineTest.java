@@ -861,7 +861,7 @@ class ClaudemdEngineTest {
         // 审批（fresh engine 注入 approval supplier=true）→ 外部 include 含
         ClaudemdEngine approvedEngine = new ClaudemdEngine(autoMemPaths, detection,
             sessionId -> workspace.toString(), () -> true, () -> true, () -> true, () -> false, () -> List.of());
-        approvedEngine.setHasClaudeMdExternalIncludesApproved(() -> true);
+        approvedEngine.setHasClaudeMdExternalIncludesApproved(sessionId -> true);
         List<MemoryFileInfo> approved = approvedEngine.getMemoryFiles(false, null);
         assertThat(approved)
             .as("审批后 → getMemoryFiles(false) 含外部 @include（forceIncludeExternal=false 也加载）")
@@ -891,15 +891,128 @@ class ClaudemdEngineTest {
             .as("未审批且未显示过警告 → 应显示（claudemd.ts:1423-1428）").isTrue();
 
         // 审批 → false
-        engine.setHasClaudeMdExternalIncludesApproved(() -> true);
+        // [T15-3] 接缝带维度：入参 = sessionId（本用例恒 null，闭包忽略之）
+        engine.setHasClaudeMdExternalIncludesApproved(sessionId -> true);
         assertThat(engine.shouldShowClaudeMdExternalIncludesWarning(null))
             .as("已审批 → 不再弹窗（claudemd.ts:1423-1424）").isFalse();
 
         // 拒绝（approved=false 但 warningShown=true）→ false
-        engine.setHasClaudeMdExternalIncludesApproved(() -> false);
-        engine.setHasClaudeMdExternalIncludesWarningShown(() -> true);
+        engine.setHasClaudeMdExternalIncludesApproved(sessionId -> false);
+        engine.setHasClaudeMdExternalIncludesWarningShown(sessionId -> true);
         assertThat(engine.shouldShowClaudeMdExternalIncludesWarning(null))
             .as("已拒绝但显示过警告 → 不再弹窗（claudemd.ts:1425-1426）").isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // [T15-3] 审批态维度 = 项目（引擎侧两个消费点 + memoize 键）
+    // ════════════════════════════════════════════════════════════════
+
+    /**
+     * 造「Managed CLAUDE.md @include 库外绝对路径」夹具 · [T15-3] 两个会话维度用例共用。
+     *
+     * @return 外部被 include 文件的绝对路径（断言靶）
+     */
+    private String setUpExternalIncludeFixture() throws Exception {
+        Path externalDir = Files.createTempDirectory("t153-external-include-dir");
+        Path externalMd = externalDir.resolve("external.md");
+        Files.writeString(externalMd, "# External include\n");
+        // 用正斜杠：Java 端 @include 解析器对反斜杠按转义处理（Windows 盘符路径会错）
+        String externalPath = externalMd.toAbsolutePath().toString().replace('\\', '/');
+        Files.createDirectories(managedPath);
+        Files.writeString(managedPath.resolve("CLAUDE.md"), "# Managed\n@" + externalPath + "\n");
+        return externalMd.toAbsolutePath().toString();
+    }
+
+    /**
+     * [T15-3] 消费点 1（agent 真实加载路径 {@code getMemoryFiles}）+ memoize 键：审批态按会话维度生效。
+     *
+     * <p><b>WHY（规则九）</b>：CC 的审批态宿主是 project config（{@code claudemd.ts:796} /
+     * {@code :1420}）⇒ <b>语义 = 每个项目一份</b>。旧 Java 实现是 <b>0 参 {@code Supplier} 全局槽</b>
+     * ⇒ 同一 JVM 内 A 项目批准后 B 项目也被放行 —— 这正是 T15-3 要消灭的<b>跨项目泄漏</b>。
+     *
+     * <p><b>两件事同时被锁</b>：
+     * <ol>
+     *   <li>接缝带维度（{@code Function<String,Boolean>}）：批准<b>只</b>对闭包认定「已批准」的会话生效；</li>
+     *   <li><b>memoize 键含审批态</b>：本夹具的 {@code originalCwdResolver} 是
+     *       {@code sessionId -> workspace} 的<b>定值</b>（无视会话），且此处不传 sessionProjectRoot
+     *       ⇒ sess-A / sess-B 的 {@code (forceIncludeExternal, scanRoot, sessionProjectRoot)}
+     *       三元<b>完全相同</b>，唯一差别就是审批位 ⇒ <b>去掉第 4 键成分，B 会命中 A 的缓存条目</b>
+     *       （第二条断言翻红）。这就是第 4 成分的反向实验靶。</li>
+     * </ol>
+     */
+    @Test
+    @DisplayName("[T15-3] 审批态按会话维度生效 + memoize 不跨项目复用 · agent 加载路径 (claudemd.ts:798-801)")
+    void getMemoryFiles_approvalState_isSessionScoped() throws Exception {
+        setUp(false);
+        String externalAbs = setUpExternalIncludeFixture();
+        // 只在 sess-A「项目」批准（闭包按 sessionId 分流 —— 生产上 = Controller 的项目键查表）
+        engine.setHasClaudeMdExternalIncludesApproved(sessionId -> "sess-A".equals(sessionId));
+
+        assertThat(engine.getMemoryFiles(false, "sess-A"))
+            .as("A 会话所在项目已批准 → agent 加载路径（forceIncludeExternal=false）包含外部 @include")
+            .anyMatch(f -> f.path().equals(externalAbs));
+        assertThat(engine.getMemoryFiles(false, "sess-B"))
+            .as("B 会话所在项目未批准 → 必须不含（⛔ 既不得因全局槽放行，也不得命中 A 的 memoize 条目）")
+            .noneMatch(f -> f.path().equals(externalAbs));
+
+        // 反向顺序：B 先入缓存 → A 仍须读到自己已批准的条目（防「先写胜」式的缓存串值）
+        engine.clearMemoryFileCaches();
+        assertThat(engine.getMemoryFiles(false, "sess-B"))
+            .as("B 先入缓存 → 仍不含外部 @include")
+            .noneMatch(f -> f.path().equals(externalAbs));
+        assertThat(engine.getMemoryFiles(false, "sess-A"))
+            .as("B 已入缓存后 A 仍含外部 @include（两键必须不同）")
+            .anyMatch(f -> f.path().equals(externalAbs));
+    }
+
+    /**
+     * [T15-3] 门控接缝<b>未注入</b> ⇒ <b>WARN 一次</b> + 按 CC 缺省 {@code false}（⛔ 不得静默）。
+     *
+     * <p><b>WHY（规则十二 · 显式失败）</b>：原实现的 {@code resolver == null ⇒ return false} <b>一行日志
+     * 都没有</b>（连 DEBUG 都无）—— 违反「不许静默失效」（(b) 类也要求 ≥WARN）。方向（返回 false）
+     * 本身正确（= CC {@code DEFAULT_PROJECT_CONFIG}，config.ts:146），缺的是<b>可观测性</b>。
+     *
+     * <p><b>为什么是 WARN 而不是抛</b>：见 {@code ClaudemdEngine#resolveGate} 的 javadoc ——
+     * 接缝可缺席是既有设计（{@code @Autowired(required=false)}），且「从未收过 /claude-md 请求」⇒
+     * 从未有人批准过 ⇒ {@code false} 是正确答案；抛会打断 {@code MemoryController}/{@code ContextAnalyze}
+     * /agent/compact 等<b>正常</b>记忆读取路径。
+     *
+     * <p><b>反向实验</b>：删掉 {@code resolveGate} 里的 {@code log.warn}（保留 return false）⇒ 本用例翻红。
+     */
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    @DisplayName("[T15-3] ⭐接缝未注入 ⇒ WARN 一次 + CC 缺省 false（⛔ 不静默）")
+    void gateSeamUnwired_warnsOnceAndDefaultsFalse(CapturedOutput output) throws Exception {
+        setUp(false);
+        String externalAbs = setUpExternalIncludeFixture();
+        // setUp 不注入接缝 ⇒ resolver == null（模拟「本进程从未访问 /claude-md」）
+        assertThat(engine.getMemoryFiles(false, "sess-unwired"))
+            .as("接缝未注入 ⇒ 按 CC 缺省 false（config.ts:146）⇒ 不含外部 @include")
+            .noneMatch(f -> f.path().equals(externalAbs));
+
+        assertThat(output)
+            .as("⭐ 未注入必须 ≥WARN（原实现此处一行日志都没有）")
+            .contains("引擎审批接缝未注入");
+    }
+
+    /**
+     * [T15-3] 消费点 2（{@code shouldShowClaudeMdExternalIncludesWarning}）：审批/示警态按会话维度。
+     *
+     * <p><b>WHY</b>：该方法在 CC 里读的也是 project config（{@code claudemd.ts:1420-1426}）⇒ 同项目
+     * 另一会话不再弹窗、别的项目照旧弹。⛔ 旧实现两个 {@code get()} 无参 ⇒ 一处批准全进程静默。
+     */
+    @Test
+    @DisplayName("[T15-3] shouldShowClaudeMdExternalIncludesWarning 按会话维度 (claudemd.ts:1420-1426)")
+    void shouldShowClaudeMdExternalIncludesWarning_isSessionScoped() throws Exception {
+        setUp(false);
+        setUpExternalIncludeFixture();
+        engine.setHasClaudeMdExternalIncludesApproved(sessionId -> "sess-A".equals(sessionId));
+        engine.setHasClaudeMdExternalIncludesWarningShown(sessionId -> "sess-A".equals(sessionId));
+
+        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning("sess-B"))
+            .as("B 会话所在项目未审批未示警 → 应弹窗").isTrue();
+        assertThat(engine.shouldShowClaudeMdExternalIncludesWarning("sess-A"))
+            .as("A 会话所在项目已审批 → 不再弹窗").isFalse();
     }
 
     @Test

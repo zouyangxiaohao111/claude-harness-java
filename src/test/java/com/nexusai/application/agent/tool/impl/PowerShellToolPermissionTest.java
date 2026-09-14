@@ -167,8 +167,11 @@ class PowerShellToolPermissionTest {
         FakeAstService ast = new FakeAstService();
         ast.stub(single(cmd("Get-Content", "cmdlet", "-Path", "file.txt", "-ErrorAction", "SilentlyContinue")));
         PowerShellTool tool = new PowerShellTool(new PowerShellPermissionChain(ast));
+        // [裁定 #15] 夹具显式给会话基准 cwd：本用例验的是「-ErrorAction 合并不得误拒」，而
+        //   路径校验必须有基准才能判「工作目录内」；原 ctx=null 夹具依赖已删除的进程 user.dir 兜底
+        //   （那正是「拿服务器启动目录冒充会话项目根」）⇒ 基准缺失时路径校验按宁问不放 ask。
         PermissionResult result = tool.checkPermissions(
-            input("Get-Content -Path file.txt -ErrorAction SilentlyContinue"), null);
+            input("Get-Content -Path file.txt -ErrorAction SilentlyContinue"), ctxWithCwd(Path.of("C:\\work\\project")));
         assertInstanceOf(PermissionResult.Allow.class, result,
             "公共取值参数 -ErrorAction 必须经 safeFlags 公共参数合并放行（CC :1503）");
     }
@@ -181,7 +184,10 @@ class PowerShellToolPermissionTest {
         FakeAstService ast = new FakeAstService();
         ast.stub(single(cmd("Get-ChildItem", "cmdlet", "-Recurse", "-Verbose")));
         PowerShellTool tool = new PowerShellTool(new PowerShellPermissionChain(ast));
-        PermissionResult result = tool.checkPermissions(input("Get-ChildItem -Recurse -Verbose"), null);
+        // [裁定 #15] 同 commonValueParamAllowed：夹具显式给会话基准 cwd（原 ctx=null 夹具依赖已删除的
+        //   进程 user.dir 兜底）；本用例验的是 -Verbose 合并，不是「无会话时的基准行为」。
+        PermissionResult result = tool.checkPermissions(input("Get-ChildItem -Recurse -Verbose"),
+            ctxWithCwd(Path.of("C:\\work\\project")));
         assertInstanceOf(PermissionResult.Allow.class, result,
             "公共 switch -Verbose 必须经 safeFlags 公共参数合并放行（CC :1503）");
     }
@@ -473,6 +479,16 @@ class PowerShellToolPermissionTest {
         }
         return new ToolPermissionContext(PermissionMode.DEFAULT, allow, java.util.Map.of(), java.util.Map.of(),
             java.util.Map.of(), false, false, java.util.Map.of(), false, false, null);
+    }
+
+    /**
+     * 显式会话基准 cwd 的 ctx · [裁定 #15]：需要按 cwd 校验路径 / 走 git 写守卫的用例必须显式给基准
+     * （⛔ 不得再依赖已删除的进程 {@code user.dir} 兜底 —— 那是服务器启动目录，不是会话项目根）。
+     */
+    private static ToolUseContext ctxWithCwd(Path cwd) {
+        return ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+            PermissionMode.DEFAULT, List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
+            java.util.Map.of(), false, "", cwd);
     }
 
     private static ToolUseContext ctxWith(ToolPermissionContext permCtx) {

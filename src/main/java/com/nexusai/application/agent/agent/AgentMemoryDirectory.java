@@ -175,6 +175,13 @@ public final class AgentMemoryDirectory {
      * 语义）；非 worktree 场景保持 projectRoot 绑定（T5 C3：非 worktree 的 effectiveCwd=user.dir
      * 不是 projectRoot 替身，不可作覆盖值）。
      *
+     * <p>⚠️ <b>该 {@code user.dir} 的来源（[裁定 #15] 2026-09-14 复核，⛔ 不是已删的 PowerShell
+     * 权限链兜底）</b>：{@code SubagentExecutor:1886} {@code String worktreePath =
+     * System.getProperty("user.dir")} 作初值，非 worktree 隔离（或 worktree 创建失败）时不再改写，
+     * 随后 :1954 {@code withEffectiveCwd(subagentCtx, Path.of(worktreePath))} <b>无条件</b>生效 ⇒
+     * 非 worktree 子代理的 TUC {@code effectiveCwd} 就是进程启动目录（:1969 的
+     * {@code !worktreePath.equals(user.dir)} 门与本句同一判据）。
+     *
      * <p>不可变：返回新实例（仅替换 cwdSupplier），原实例与共享 @Bean 不受影响（无跨子代理
      * 污染）。consumer 复制引用，多线程安全。
      *

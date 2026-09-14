@@ -212,6 +212,13 @@ public class PowerShellPermissionChain {
         "tar", "tar.exe", "bsdtar", "bsdtar.exe", "unzip", "unzip.exe", "7z", "7z.exe",
         "7za", "7za.exe", "gzip", "gzip.exe", "gunzip", "gunzip.exe", "expand-archive");
 
+    /**
+     * [裁定 #15] 权限越界基准 cwd 缺失时的 ask 文案（宁问不放）· 见 {@link #effectiveCwd}。
+     * 单一文案点：裸仓库 / git-internal 写 / .git 写三守卫共用（三者在基准缺失时都无法判定）。
+     */
+    private static final String CWD_BASE_MISSING_ASK =
+        "无法确定会话工作目录（cwd 基准缺失），无法判定当前目录是否裸仓库 / 命令是否写入 git 内部路径，按保守策略需审批";
+
     private static final Pattern WINDOWS_DRIVE_ROOT = Pattern.compile("^[A-Za-z]:/?$");
     /** 驱动器子级（C:/Windows 危险，C:/Windows/System32 不危险）· 对齐 CC pathValidation.ts:319 WINDOWS_DRIVE_CHILD_REGEX。 */
     private static final Pattern WINDOWS_DRIVE_CHILD = Pattern.compile("^[A-Za-z]:/[^/]+$");
@@ -332,13 +339,22 @@ public class PowerShellPermissionChain {
         if (hasCdSubCommand && hasGit) {
             decisions.add(ask("cd/Set-Location 与 git 组合命令需审批，防止裸仓库攻击", input));
         }
+        // ── 权限越界基准 cwd（会话态）· 见 {@link #effectiveCwd} ──
+        // [裁定 #15] 基准缺失 ⇒ 宁问不放：裸仓库 / git-internal 写 / .git 写三守卫都以 cwd 为解析基准，
+        // 基准缺失时它们**全部**无法判定（⛔ 不得因「判不出来」返回「不危险」⇒ 触发 ask）。
+        // ⚠️ ask 范围收在「三守卫的输入与基准相关」的命令上（{@link #gitGuardsDependOnCwd}）：两者皆空的
+        // 命令（如只读 Get-Process）在任何基准下三守卫都返回 false，对它们 ask 属误 ask（产品行为变更）。
+        java.nio.file.Path cwd = effectiveCwd(ctx);
         // 裸仓库守卫 → ask（CC :1155-1166）
-        if (hasGit && isCurrentDirectoryBareGitRepo(ctx)) {
+        if (cwd == null) {
+            if (hasGit || gitGuardsDependOnCwd(allSub)) {
+                decisions.add(ask(CWD_BASE_MISSING_ASK, input));
+            }
+        } else if (hasGit && isCurrentDirectoryBareGitRepo(cwd)) {
             decisions.add(ask("当前目录存在裸仓库指示（无 .git/HEAD 的 HEAD/objects/refs），git 可能从 cwd 执行钩子", input));
         }
-        java.nio.file.Path cwd = effectiveCwd(ctx);
         // git-internal 写守卫 → ask（CC :1168-1234）
-        if (hasGit && writesToGitInternal(parsed, allSub, cwd)) {
+        if (cwd != null && hasGit && writesToGitInternal(parsed, allSub, cwd)) {
             decisions.add(ask("命令写入 git 内部路径（HEAD/objects/refs/hooks/.git）并运行 git，可能植入恶意钩子", input));
         }
         // 归档解压 + git → ask（CC :1219-1233）
@@ -347,7 +363,7 @@ public class PowerShellPermissionChain {
             decisions.add(ask("命令解压归档并运行 git，归档内容可能植入裸仓库指示", input));
         }
         // .git/ 写守卫（无 git 子命令也生效）· CC :1240-1257
-        if (writesToDotGit(parsed, allSub, cwd)) {
+        if (cwd != null && writesToDotGit(parsed, allSub, cwd)) {
             decisions.add(ask("命令写入 .git/ —— 植入的钩子或配置将在下次 git 操作时执行", input));
         }
         // 决策：路径约束 checkPathConstraints（CC :1259-1279，deny-capable）。危险删除 deny /
@@ -477,16 +493,13 @@ public class PowerShellPermissionChain {
     static List<PowerShellAstService.Redirection> getFileRedirections(PowerShellAstService.ParsedResult parsed) {
         List<PowerShellAstService.Redirection> out = new ArrayList<>();
         for (PowerShellAstService.Redirection r : parsed.redirections()) {
-            if (r.isMerging()) continue;
-            if (r.target() == null || r.target().isEmpty()) continue;
-            if (isNullRedirectionTarget(r.target())) continue;
+            if (!isFileWritingRedirection(r)) continue;
             out.add(r);
         }
         for (PowerShellAstService.Statement st : parsed.statements()) {
             for (PowerShellAstService.CommandElement c : st.nestedCommands()) {
                 for (String target : c.redirections()) {
-                    if (target == null || target.isEmpty()) continue;
-                    if (isNullRedirectionTarget(target)) continue;
+                    if (!isFileWritingRedirectionTarget(target)) continue;
                     out.add(new PowerShellAstService.Redirection(target, false));
                 }
             }
@@ -513,7 +526,8 @@ public class PowerShellPermissionChain {
      * @param command          整条命令（deny 消息用）
      * @param input            工具输入
      * @param parsed           AST 解析结果
-     * @param ctx              工具调用上下文（effectiveCwd）
+     * @param ctx              工具调用上下文（effectiveCwd；基准缺失 ⇒ {@link #effectiveCwd} 返回 null，
+     *                         cd-to-CWD 过滤不生效 ⇒ 该子命令留在待审批列表 · 裁定 #15）
      * @param tool             工具实例（规则桶查询）
      * @param permCtx          权限上下文
      * @param hasCdSubCommand  复合含 cd 类 cmdlet（:1127-1129）
@@ -545,7 +559,9 @@ public class PowerShellPermissionChain {
                 String target = element.args().stream()
                     .filter(a -> a.isEmpty() || !isPowerShellDashChar(a.charAt(0)))
                     .findFirst().orElse(null);
-                if (target != null && resolveCwd(cwd, target).equals(cwd)) {
+                // [裁定 #15] 基准缺失（cwd == null）⇒ 恒 false ⇒ 该 cd 子命令<b>留在待审批列表</b>
+                //（⛔ 不得把「判不出来」当「无操作」过滤掉）· 见 {@link #isCwdToSameCwdNoOp}
+                if (isCwdToSameCwdNoOp(cwd, target)) {
                     continue;
                 }
             }
@@ -688,6 +704,23 @@ public class PowerShellPermissionChain {
         } catch (Exception e) {
             return cwd;
         }
+    }
+
+    /**
+     * step5「cd-to-CWD 无操作」过滤判定 · 对齐 CC {@code powershellPermissions.ts:1403-1404}
+     * （{@code resolve(cwd, target) === cwd} ⇒ {@code Set-Location} 到当前目录 = 无操作，不独立审批）。
+     *
+     * <p>[裁定 #15] 基准缺失（{@code cwd == null}）⇒ 返回 {@code false} = <b>不过滤</b>：该判定必须依赖
+     * cwd 才能成立，判不出就让子命令<b>留在待审批列表</b>（保守方向 = 不放宽审批面）。
+     * ⛔ 不得返回 {@code true}（那等于把「判不出来」当「无操作」放行）；且 {@code cwd == null} 下进入
+     * {@link #resolveCwd} 会在 {@code .equals(cwd)} 上 NPE（其 catch 分支返回的正是 null）。
+     *
+     * @param cwd    权限越界基准（会话态；null = 基准缺失）
+     * @param target Set-Location 的首个非 dash 位置参数（null = 无位置参数）
+     * @return true = 判定为「cd 到当前目录」的无操作子命令，可跳过独立审批
+     */
+    static boolean isCwdToSameCwdNoOp(java.nio.file.Path cwd, String target) {
+        return cwd != null && target != null && resolveCwd(cwd, target).equals(cwd);
     }
 
     /**
@@ -888,9 +921,24 @@ public class PowerShellPermissionChain {
         return detectWindows() && (canonical.equals("ndr") || canonical.equals("mount"));
     }
 
-    /** 当前目录是否裸 git 仓库（无有效 .git 引用时的 HEAD/objects/refs 指示）· 对齐 CC git.ts:876-925 isCurrentDirectoryBareGitRepo。 */
-    static boolean isCurrentDirectoryBareGitRepo(ToolUseContext ctx) {
-        Path cwd = effectiveCwd(ctx);
+    /**
+     * 当前目录是否裸 git 仓库（无有效 .git 引用时的 HEAD/objects/refs 指示）· 对齐 CC
+     * {@code git.ts:876-925 isCurrentDirectoryBareGitRepo}。
+     *
+     * <p>[裁定 #15] 基准缺失（{@code cwd == null}）= <b>无法判定</b> ⇒ 返回 {@code true}（宁问不放：
+     * 调用点据此触发 ask）。⛔ 不得返回 {@code false} —— 那等于把「判不出来」说成「不危险」，正是
+     * 静默放行的形状。调用点 {@code check(...)} 已在基准缺失时单独分流（{@link #CWD_BASE_MISSING_ASK}），
+     * 本分支是<b>防御性</b>兜底：将来新增调用点漏分流时方向仍在安全侧。
+     *
+     * @param cwd 权限越界基准（会话态 cwd；{@code null} = 基准缺失）
+     * @return true = 裸仓库（或基准缺失无法判定 ⇒ 按裸仓库处理）
+     */
+    static boolean isCurrentDirectoryBareGitRepo(Path cwd) {
+        if (cwd == null) {
+            log.warn("PowerShellPermissionChain: 裸仓库判定基准 cwd 缺失 ⇒ 按「存在裸仓库指示」处理"
+                + "（宁问不放 · 裁定 #15 · CC git.ts:876-925）");
+            return true;
+        }
         Path gitPath = cwd.resolve(".git");
         try {
             if (Files.isRegularFile(gitPath)) {
@@ -946,27 +994,111 @@ public class PowerShellPermissionChain {
         return false;
     }
 
-    /** 解析有效 cwd（ctx.effectiveCwd 优先，无则会话 cwd / user.dir 兜底）· 对齐 CC getCwd()。
-     *  cwd-align-ext：user.dir 兜底 → 会话 cwd（CC pathValidation.ts:1574 checkPathConstraintsForStatement
-     *  用 getCwd 做越界基准）；无 sessionId 回落 user.dir（方案 1，零行为变化）。 */
-    private static Path effectiveCwd(ToolUseContext ctx) {
-        return ctx != null && ctx.effectiveCwd() != null
-            ? ctx.effectiveCwd()
-            : Path.of(fallbackCwd(ctx != null ? ctx.sessionId() : null));
+    /**
+     * 解析权限越界基准 cwd（<b>只接受会话态来源</b>）。
+     *
+     * <p><b>CC 真源与其不可搬用之处</b>：CC {@code pathValidation.ts:1574}（PowerShell
+     * {@code checkPathConstraintsForStatement}）取 {@code const cwd = getCwd()} 作越界基准；
+     * CC 的 {@code getCwd()}（{@code utils/cwd.ts:26-32}）读 {@code bootstrap/state.ts} 的
+     * {@code STATE.cwd}（进程<b>全局单一</b>可变，启动即冻结）⇒ CC 是<b>单进程单会话</b>
+     * （{@code state.ts:278-279} 启动时 {@code originalCwd/projectRoot = resolvedCwd}），
+     * 所以 CC 的「进程 cwd」<b>就是</b>当前会话目录。
+     * 本仓是<b>一 JVM 多会话 Web</b>（memory {@code multi-session-vs-cc-single-session}）
+     * ⇒ 进程 {@code user.dir} 是<b>服务器启动目录</b>，<b>不是任何会话的项目根</b>。
+     * 形态像、语义反 ⇒ ⛔ 不得照搬「对齐 CC getCwd()」当进程级兜底。
+     *
+     * <p>[裁定 #15 2026-09-14] 取不到会话态基准 ⇒ 返回 {@code null} + ≥WARN（⛔ 不造一个假基址）。
+     * 两档来源：
+     * <ol>
+     *   <li>{@code ctx.effectiveCwd()}（TUC 会话快照；{@code ToolUseContext} 紧凑构造器已用
+     *       {@code CwdResolution} 回填，故正常构造的 ctx 此值非 null）</li>
+     *   <li>{@code CwdResolution.getCwd(sessionId)}（会话 cwd / 绑定项目；其 fail-loud 语义
+     *       <b>原样保留</b> —— 「有会话却解析不出项目根」仍抛，不在此吞掉）</li>
+     * </ol>
+     * ⛔ 已删两档「进程级冒充会话态」的旧通路：
+     * <ul>
+     *   <li>{@code System.getProperty("user.dir")}（原 {@code fallbackCwd} 的第三档）</li>
+     *   <li>{@code ctx == null} 时经 {@code CwdResolution.getCwd(null)} 落回其「无会话出口」
+     *       （该出口恒等于进程 {@code user.dir}，见 {@code CwdResolution.getCwdForNonSession()}）
+     *       —— 形态是「会话态解析」实为进程级兜底，同样删除</li>
+     * </ul>
+     *
+     * <p><b>消费点方向（⛔ 均非「静默跳过」）</b>：调用方拿到的 {@code null} 一律按<b>安全方向</b>分流 ——
+     * git 三守卫 ⇒ ask（{@link #CWD_BASE_MISSING_ASK}）；step5 cd-to-CWD 过滤 ⇒ 不过滤（留在待审批列表）。
+     *
+     * <p>⚠️ <b>本改造不是「关掉了真洞」（⛔ 不得如此声称，已实测）</b>：原第三档
+     * {@code System.getProperty("user.dir")} 是<b>死代码</b>（{@code ctx.effectiveCwd()} 在
+     * {@code ToolUseContext} 紧凑构造器回填下恒非空，故删它不改变任何生产路径判定）。本改造的产出是
+     * ① 删掉一条会被后人照抄的「进程级值冒充会话态」范式；② 把「基准缺失 ⇒ 宁问不放」这条<b>不变量</b>
+     * 落到各消费点的显式分支上（当前仅在 {@code ctx == null} 生效）。真正的「服务器启动目录冒充会话项目根」
+     * 源头在<b>上游产出侧（非本类）</b>：{@code SubagentExecutor:1886} 以 {@code user.dir} 作 worktreePath
+     * 初值 + {@code :1954} 无条件 {@code withEffectiveCwd(...)}；以及 TUC 回填经 {@code CwdResolution} 的
+     * 「无会话出口」。⛔ 本类不声称已修上述任一处。
+     *
+     * @param ctx 工具调用上下文（可为 null —— 无会话态可取，同属基准缺失）
+     * @return 会话态基准 cwd；<b>取不到 ⇒ null</b>（调用方负责按宁问不放分流）
+     */
+    static Path effectiveCwd(ToolUseContext ctx) {
+        if (ctx != null) {
+            Path snapshot = ctx.effectiveCwd();
+            if (snapshot != null) {
+                return snapshot;
+            }
+            String sessionId = ctx.sessionId();
+            if (sessionId != null && !sessionId.isBlank()) {
+                String resolved = CwdResolution.getCwd(sessionId);
+                if (resolved != null && !resolved.isBlank()) {
+                    return Path.of(resolved);
+                }
+            }
+            log.warn("PowerShellPermissionChain: 权限越界基准 cwd 缺失（ctx.effectiveCwd 为 null 且会话态解析无果）"
+                + " sessionId={} ⇒ 返回 null（消费点按「宁问不放」处理，⛔ 不回落进程 user.dir）", sessionId);
+            return null;
+        }
+        log.warn("PowerShellPermissionChain: 权限越界基准 cwd 缺失（ToolUseContext 为 null，无会话态可取）"
+            + " ⇒ 返回 null（消费点按「宁问不放」处理，⛔ 不回落进程 user.dir）");
+        return null;
     }
 
     /**
-     * effectiveCwd 缺失时的兜底 cwd · 对齐 CC getCwd()（pathValidation.ts:1574）。
-     * 无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     * git 三守卫（裸仓库 / git-internal 写 / .git 写）的输入是否<b>与 cwd 基准相关</b>。
      *
-     * <p>[批 3c] 会话来源显式化：sessionId 由 {@link #effectiveCwd} 从 {@code ctx.sessionId()}
-     * 显式取出后传入；⛔ 已删原裸 MDC 读点（该读点在 tool-exec 池线程上取不到本会话）。
+     * <p>WHY：基准缺失时要判「ask 还是不问」。三守卫只扫描两类输入 —— 子命令的重定向目标
+     * （{@link PowerShellAstService.CommandElement#redirections()}）与 {@link #GIT_SAFETY_WRITE_CMDLETS}
+     * 的路径参数（见 {@link #writesToGitInternal} / {@link #writesToDotGit}）。两类输入都空 ⇒ 三守卫在
+     * <b>任何</b>基准下都返回 false ⇒ 对这类命令（如只读 {@code Get-Process}）不必因基准缺失而 ask
+     * （那会把与基准无关的只读命令变成 ask = 误 ask）。
      *
-     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
+     * @param allSub 全部子命令
+     * @return true = 存在需要按 cwd 解析的输入 ⇒ 基准缺失时宁问不放
      */
-    private static String fallbackCwd(String sessionId) {
-        String cwd = CwdResolution.getCwd(sessionId);
-        return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
+    private static boolean gitGuardsDependOnCwd(List<PowerShellSubCommandInfo> allSub) {
+        for (PowerShellSubCommandInfo info : allSub) {
+            PowerShellAstService.CommandElement c = info.element();
+            for (String target : c.redirections()) {
+                // 与 {@link #getFileRedirections} 同一判据：空目标 / $null 目标不写文件 ⇒ 与基准无关
+                if (isFileWritingRedirectionTarget(target)) {
+                    return true;
+                }
+            }
+            if (!c.args().isEmpty()
+                && GIT_SAFETY_WRITE_CMDLETS.contains(ReadOnlyCommandTable.resolveToCanonical(c.name()))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** redirection 目标是否<b>会产生文件写入</b>（⛔ 空目标 / {@code $null} 目标不写文件）。
+     *  单一判据点：{@link #getFileRedirections} 与 {@link #gitGuardsDependOnCwd} 必须同判据，
+     *  否则「哪些输入需按 cwd 解析」与真实写入面会错位。 */
+    static boolean isFileWritingRedirectionTarget(String target) {
+        return target != null && !target.isEmpty() && !isNullRedirectionTarget(target);
+    }
+
+    /** {@link #isFileWritingRedirectionTarget} 的 record 版（含 merging 短路）。 */
+    static boolean isFileWritingRedirection(PowerShellAstService.Redirection r) {
+        return !r.isMerging() && isFileWritingRedirectionTarget(r.target());
     }
 
     /** 命令是否写入 git-internal 路径（HEAD/objects/refs/hooks/.git）· 对齐 CC gitSafety.ts isGitInternalPathPS。 */

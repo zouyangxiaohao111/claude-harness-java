@@ -199,7 +199,8 @@ class SessionProjectRootTest {
     @Test
     @DisplayName("[批 4a #9] 回源值无效（目录不存在）⇒ 按「有会话但绑定失效」处理且<b>不回填</b>")
     void dbResolver_invalidRootNotCached() throws Exception {
-        // WHY: 与 LlmAgentLoop.tryResolveBoundProjectFromDb 同一判据：无效绑定目录不得冒充项目根，
+        // WHY: 与唯一链（SessionProjectRoot 回源器，F-24 Step 3 前还有 B′ 兜底链）同一判据：
+        //   无效绑定目录不得冒充项目根，
         //   否则 memory 域会按无效路径建目录（跨项目污染）。且不得回填 —— 否则「先无效后修复」永不生效。
         String ghost = tempDir.resolve("does-not-exist").toString();
         java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();

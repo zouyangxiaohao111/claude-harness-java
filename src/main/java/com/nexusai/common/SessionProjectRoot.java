@@ -45,44 +45,49 @@ import org.slf4j.LoggerFactory;
  * {@link #setForSession(String, String)}（session.mainProjectId → ProjectRecord.path）；
  * unbind() → {@link #clearSession(String)}。
  *
- * <h2>残差 R-DB · 会话 projectRoot DB 查询两链并存（[S2 · F-24 2026-09-14] 部分消除，Step 3 待立项）</h2>
- * <p>同一能力（sessionId → {@code sessions.main_project_id} → {@code projects.path}）现有
- * <b>两条独立实现</b>：
+ * <h2>R-DB · 会话 projectRoot DB 查询<b>已收口为一份</b>（[S2 · F-24] Step 1/2/3，2026-09-14）</h2>
+ * <p>同一能力（sessionId → {@code sessions.main_project_id} → {@code projects.path}）此前有
+ * <b>两条独立实现</b>，现只剩<b>一条</b>：
  * <ol>
- *   <li><b>本类的冻结表回源解析器</b> —— 实现体 = {@code ToolRegistrationConfig#sessionProjectRootResolver}
- *       （{@code @Bean}，启动期经 {@link #setDbResolver} 注入）；</li>
- *   <li><b>B′ 兜底第二链</b> —— {@code LlmAgentLoop.tryResolveBoundProjectFromDb}
- *       （run() 入口，5 处调用）。</li>
+ *   <li>✅ <b>本类的冻结表回源解析器（唯一留存）</b> —— 实现体 =
+ *       {@code ToolRegistrationConfig#sessionProjectRootResolver}（{@code @Bean}，启动期经
+ *       {@link #setDbResolver} 注入）。</li>
+ *   <li>⛔ <b>B′ 兜底第二链已删除</b>（{@code LlmAgentLoop.tryResolveBoundProjectFromDb}，
+ *       原 run() 入口 5 处调用；用户 2026-09-14 裁定「删，合并成一个」）。5 个调用点改走
+ *       {@link #lookup(String)} 的封装出口（{@code LlmAgentLoop.applyBoundProjectFromLookup}）。</li>
  * </ol>
  *
- * <p><b>✅ 已消除的差异（Step 1 + Step 2，2026-09-14）</b>：
+ * <p><b>✅ 已消除的差异（Step 1 + Step 2 + Step 3，2026-09-14）</b>：
  * <ul>
  *   <li><b>差异 A（判据形态）已消除</b>：原「两份有效性判据拷贝」—— 现
  *       {@link #isValidProjectRoot} 为<b>唯一实现</b>（public），{@code CwdResolution.isValidDirectory}
  *       改为<b>委托</b>（application→common 既有方向，不成环）。由
  *       {@code SessionProjectRootValidityParityTest} 的相同断言反向守住（含 Path.of 抛
- *       InvalidPathException 的异常分支）。⚠️ 残留差异（B′ 链只有 {@code boolean}，不区分
- *       unbound/unknown）随 Step 3 消除。</li>
+ *       InvalidPathException 的异常分支）。⚠️ 原残留「B′ 链只有 {@code boolean}，不区分
+ *       unbound/unknown」<b>已随 Step 3 消除</b>（B′ 链本体删除，失败语义只剩本类的四态
+ *       {@link Lookup}）。</li>
  *   <li><b>差异 B（归一化落点）已消除</b>：原「本类冻结 DB 原值（不 realpath/不 NFC）vs B′ 链冻结
  *       realpath+NFC」⇒ 实测可观测且会错（symlink ⇒ {@code projects/<slug>} 落不同目录；non-NFC ⇒
  *       slug 不同且 B′ 链直接判项目无效；首写胜 ⇒ 谁先冻结决定 slug）。现归一化责任<b>由回源器承担</b>
- *       （见 {@link DbResolver} 契约要求），两条链冻结<b>同一</b>归一值。由
+ *       （见 {@link DbResolver} 契约要求），且 Step 3 后回源器是<b>唯一</b>冻结来源。由
  *       {@code ProjectRootNormalizationDivergenceExperimentTest} 的<b>相等断言</b>守住
  *       （去掉回源器里的 {@code normalizeCwd} ⇒ 该断言翻红）。</li>
+ *   <li><b>差异 C（两链并存本体）已消除（Step 3）</b>：原「同一份『查 session → main_project_id →
+ *       projects.path』查询逻辑写了两遍 + B′ 链失败语义与本类四态不同（{@code boolean} vs
+ *       {@link Lookup}）」⇒ 现全仓<b>只有本类回源器一处实现</b>；{@code LlmAgentLoop} 的 5 个失败
+ *       出口统一经 {@link #lookup(String)}（memory 域保持 fail-soft：{@code projectRoot()==null ⇒
+ *       保持无项目}，⛔ 不抛）。</li>
  * </ul>
  *
- * <p><b>⛔ 仍未消除（= 残差 R-DB 本体，F-24-merge Step 3，单独立项）</b>：两条链<b>并存</b>——
- * 同一份「查 session → main_project_id → projects.path」查询逻辑写了两遍，B′ 链的失败语义仍与
- * 本类的四态不同（{@code boolean} vs {@link Lookup}）。收口需：
- * <ol>
- *   <li>删 {@code LlmAgentLoop.tryResolveBoundProjectFromDb}，5 个调用点改走
- *       {@link #lookup(String)}（memory 域保持 fail-soft：{@code projectRoot()==null ⇒ 保持无项目}，
- *       ⛔ 不抛）；</li>
- *   <li>⚠️ <b>必须先跑「判定矩阵」基线</b>（(sessionId, DB 状态) 组合下改前 {@code boolean} 与改后
- *       {@code lookup(...).projectRoot()!=null} 逐格一致）—— 否则「改完还绿」无法区分「等价」与
- *       「矩阵没覆盖」；</li>
- *   <li>波及约 20 个测试类，须与基线差分。</li>
- * </ol>
+ * <p><b>⚠️ Step 3 收口的唯一行为差（有意 · 有读数）</b>：B′ 链自带 DB 直查 ⇒ 回源器<b>不可用</b>
+ * （未接线 / 违约返回 null）时它仍能取到绑定；合并后唯一链取不到 ⇒ memory 域保持无项目
+ * （fail-soft，⛔ 不抛）。生产里二者同源（{@code sessionProjectRootResolver} 的 {@code @Bean} 体
+ * 就是 {@link #setDbResolver} 的注册者）⇒ 该差只在「装配异常 / 夹具分叉」形态可见。
+ * 逐格读数与判据见 {@code BoundProjectResolutionMatrixTest}。
+ * <p>另：Step 3 顺带修掉 B′ 链的一个<b>静默失效</b> —— 陈旧冻结条目（冻结后目录被删）下
+ * B′ 查到了新鲜值却因 {@link #setForSession} <b>首写胜</b>写不进冻结表（无效值继续被
+ * {@code getForSession} 返回给 memory 域）；收口后调用点 1 先 {@link #clearSession(String)}
+ * 解除陈旧冻结再回源，冻结表终态 = 回源值（或无条目）。
  */
 public final class SessionProjectRoot {
 
@@ -160,18 +165,19 @@ public final class SessionProjectRoot {
          * {@code CwdResolution.normalizeCwd} 的职责，而 {@code common} 不能反向依赖
          * {@code application}（会成包依赖循环）。故归一化责任<b>由回源器承担</b>。
          *
-         * <p>⛔ <b>违反本契约的后果（且是静默的）</b>：本类会冻结<b>未归一</b>值，而
-         * {@code LlmAgentLoop.tryResolveBoundProjectFromDb}（B′ 兜底链）冻结的是归一值 ⇒
-         * 两条链对同一 DB 值冻结出不同字符串，实测可观测且会错：
+         * <p>⛔ <b>违反本契约的后果（且是静默的）</b>：本类会冻结<b>未归一</b>值，而消费侧会把同一
+         * DB 值另行归一 —— 两边产出不同字符串，实测可观测且会错：
          * <ul>
          *   <li>斜杠方向（Windows）：字符串/缓存键差异；</li>
          *   <li>symlink/junction：{@code AutoMemPaths.sanitizePath} 派生出的 {@code projects/<slug>}
          *       落到<b>不同目录</b>；</li>
-         *   <li>non-NFC 名：slug 不同，且 B′ 链直接判「项目无效」⇒ 同一 DB 行两条链给出<b>相反结论</b>。</li>
+         *   <li>non-NFC 名：slug 不同，且校验侧（{@code normalizeCwd} 后判目录存在）会直接判
+         *       「项目无效」⇒ 同一 DB 行给出<b>相反结论</b>。</li>
          * </ul>
          * 另：{@code setForSession} 是<b>首写胜</b> ⇒ 谁先冻结决定终态 ⇒ slug 不确定。
-         * 取证装置 = {@code ProjectRootNormalizationDivergenceExperimentTest}（Step 2 后其断言为
-         * 「两条链冻结同一归一值」，去掉回源器里的 {@code normalizeCwd} 即翻红）。
+         * <p>[F-24 Step 3 后] 本契约成为<b>唯一</b>归一化点的落点（B′ 链已删 ⇒ 无第二条写入本类的
+         * 路径）。取证装置 = {@code ProjectRootNormalizationDivergenceExperimentTest}
+         * （断言「回源器冻结值 = realpath 归一值」，去掉回源器里的 {@code normalizeCwd} 即翻红）。
          */
         Lookup resolve(String sessionId);
     }
@@ -326,10 +332,10 @@ public final class SessionProjectRoot {
      *       {@code CwdResolution.isValidDirectory} 改为委托（由
      *       {@code SessionProjectRootValidityParityTest} 反向守住）。</li>
      *   <li><b>差异 B 已消除</b>：回源器（{@code ToolRegistrationConfig#sessionProjectRootResolver}）
-     *       返回 {@code bound} 前统一 {@code normalizeCwd} + 用同一判据校验 ⇒ 本类与 B′ 链
-     *       （{@code LlmAgentLoop.tryResolveBoundProjectFromDb}）冻结<b>同一</b>归一值（由
-     *       {@code ProjectRootNormalizationDivergenceExperimentTest} 的相等断言守住）。</li>
-     *   <li><b>仍未消除</b>：两条链<b>并存</b>本身（同一查询逻辑两遍）—— 收口见残差 R-DB。</li>
+     *       返回 {@code bound} 前统一 {@code normalizeCwd} + 用同一判据校验 ⇒ 冻结值恒为归一值
+     *       （由 {@code ProjectRootNormalizationDivergenceExperimentTest} 的相等断言守住）。</li>
+     *   <li><b>差异 C 已消除（Step 3）</b>：B′ 兜底第二链本体已删 ⇒ 本方法 + 回源器是<b>唯一</b>
+     *       「sessionId → main_project_id → projects.path」实现（见类 javadoc 的 R-DB 段）。</li>
      * </ul>
      *
      * <p><b>[S2 · F-09/F-20 2026-09-14 · 用户裁定 (A)] 三类「无法判定」不再静默投给「确无会话」</b>：

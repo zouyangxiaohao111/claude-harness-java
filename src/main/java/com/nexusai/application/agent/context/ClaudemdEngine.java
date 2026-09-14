@@ -22,6 +22,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -158,22 +159,35 @@ public class ClaudemdEngine {
     private final Map<String, List<MemoryFileInfo>> memoryFilesCache = new ConcurrentHashMap<>();
 
     /**
-     * [批 5b-1] 构造 memoryFilesCache 键 · 三输入 = computeMemoryFiles 的全部会话态输入。
+     * [批 5b-1] 构造 memoryFilesCache 键 · <b>四输入</b> = computeMemoryFiles 的全部会话态输入。
      *
-     * <p>分隔符用 NUL（{@code \0}）：路径 / sessionId / projectRoot 中不可能出现，故三段拼接无歧义
+     * <p>分隔符用 NUL（{@code \0}）：路径 / sessionId / projectRoot 中不可能出现，故各段拼接无歧义
      * （避免 {@code "a|b"} 与 {@code "a"} + {@code "|b"} 之类碰撞）。
      *
-     * @param forceIncludeExternal 外部 include 强制位（CC 原键，唯一原成分）
-     * @param scanRoot             扫描根 = {@link #resolveOriginalCwd(String)}(sessionId)
-     *                             （PROJECT/LOCAL 向上遍历的起点）
-     * @param sessionProjectRoot   会话绑定项目根（AutoMem/TeamMem 用；null = 无显式根）
+     * <p>⭐ <b>[T15-3 2026-09-14] 第 4 成分 = 审批态（外部 include 审批位）。</b>
+     * <p><b>WHY（不加会跨项目串值）</b>：审批态直接决定计算体产物
+     * （{@code includeExternal = forceIncludeExternal || approved}，claudemd.ts:798-801 的 Java 等价）⇒
+     * 「同扫描根 + 同 projectRoot + forceIncludeExternal=false，但审批态不同」的两次调用
+     * <b>产物不同却共用同一键</b>：A 项目批准后，若 B 项目恰落到同键，就会读到 A 的 memoize 结果
+     * （静默错值 = 跨项目泄漏本体）。纳入键后，审批翻转只影响本项目的条目。
+     * <p>⚠️ 与 {@link #clearMemoryFileCaches()} 的关系：REST 审批端点仍会调它（CC settings-sync
+     * 纯正确性失效 claudemd.ts:1110-1122）；本键成分是<b>第二道</b>保障 —— 二者都需要
+     * （clear 覆盖「同键内容已变」，本成分覆盖「不同审批态共用键」）。
+     *
+     * @param forceIncludeExternal      外部 include 强制位（CC 原键，唯一原成分）
+     * @param scanRoot                  扫描根 = {@link #resolveOriginalCwd(String)}(sessionId)
+     *                                  （PROJECT/LOCAL 向上遍历的起点）
+     * @param sessionProjectRoot        会话绑定项目根（AutoMem/TeamMem 用；null = 无显式根）
+     * @param externalIncludesApproved  本会话项目键下的外部 include 审批位
+     *                                  （注入接缝 {@link #setHasClaudeMdExternalIncludesApproved} 的解析结果）
      * @return 缓存键
      */
     private static String memoryFilesCacheKey(boolean forceIncludeExternal, String scanRoot,
-                                             String sessionProjectRoot) {
+                                             String sessionProjectRoot, boolean externalIncludesApproved) {
         return forceIncludeExternal + "\0"
             + (scanRoot == null ? "" : scanRoot) + "\0"
-            + (sessionProjectRoot == null ? "" : sessionProjectRoot);
+            + (sessionProjectRoot == null ? "" : sessionProjectRoot) + "\0"
+            + externalIncludesApproved;
     }
 
     /** 遥测注入 · null → 不发射（对齐 CC logEvent 可空上下文）。 */
@@ -196,11 +210,22 @@ public class ClaudemdEngine {
      *
      * <p>接入审批态（OPD-CM5-F-09 / 探查 △-15 / T-9 / R11）：CC getMemoryFiles includeExternal =
      * {@code forceIncludeExternal || config.hasClaudeMdExternalIncludesApproved || false}
-     * （claudemd.ts:798-801）。Java 无 getCurrentProjectConfig 概念 → 注入式 Supplier 装配缝
+     * （claudemd.ts:798-801）。Java 无 getCurrentProjectConfig 概念 → 注入式装配缝
      * （对齐 mothCopseGate 先例），默认 false（CC config 缺省）。审批对话框接受 → true。
      * 未注入 → null → 恒 false。
+     *
+     * <p>⭐ <b>[T15-3 2026-09-14] 接缝带维度：{@code Function<String, Boolean>}（入参 = sessionId），
+     * ⛔ 不再是 0 参 {@code Supplier}。</b>
+     * <p><b>WHY（不改成带维度就修不掉跨项目泄漏）</b>：CC 侧该标志的宿主是 <b>project config</b>
+     * （{@code const config = getCurrentProjectConfig()}，claudemd.ts:796 / :1420；字段声明
+     * config.ts:115 / :116，默认 config.ts:146 / :147）⇒ <b>语义 = 每个项目一份审批态</b>
+     * （同项目的另一个会话「本来就该」受影响，不同项目互不影响）。而 0 参 Supplier
+     * <b>结构上问不出「哪个项目」</b> —— 两个消费点手上有的只有 sessionId
+     * （{@link #computeMemoryFiles} 与 {@link #shouldShowClaudeMdExternalIncludesWarning(String)}），
+     * 故维度取 <b>sessionId</b>；<b>项目键的解析由注入方负责</b>
+     * （{@code ClaudeMdController} 本就是注入方 —— ⛔ 不在引擎内各自现算项目根，避免「每层现算」）。
      */
-    private volatile Supplier<Boolean> hasClaudeMdExternalIncludesApproved;
+    private volatile Function<String, Boolean> hasClaudeMdExternalIncludesApproved;
 
     /**
      * 外部 include 警告已示态 · CC original: {@code hasClaudeMdExternalIncludesWarningShown}
@@ -209,8 +234,12 @@ public class ClaudemdEngine {
      * <p>接入审批态（OPD-CM5-F-09）：shouldShowClaudeMdExternalIncludesWarning 先查
      * approved/warningShown，任一 true → false（claudemd.ts:1423-1426）。审批对话框无论
      * 接受/拒绝均置 true。未注入 → null → 恒 false。
+     *
+     * <p>⭐ <b>[T15-3 2026-09-14] 同 {@link #hasClaudeMdExternalIncludesApproved}：接缝带维度
+     * （{@code Function<String, Boolean>}，入参 = sessionId）。</b>CC 宿主导出同上
+     * （config.ts:116 + claudemd.ts:1420 的 {@code getCurrentProjectConfig()}）。
      */
-    private volatile Supplier<Boolean> hasClaudeMdExternalIncludesWarningShown;
+    private volatile Function<String, Boolean> hasClaudeMdExternalIncludesWarningShown;
 
     /** InstructionsLoaded hook 发射器 · null → 不发射（对齐 CC hasInstructionsLoadedHook 空判定）。 */
     private volatile HookRegistry hookRegistry;
@@ -397,9 +426,24 @@ public class ClaudemdEngine {
      * 注入外部 include 审批态 · CC original: {@code hasClaudeMdExternalIncludesApproved}
      * （config.ts:115，claudemd.ts:798-801 消费）。装配缝（OPD-CM5-F-09）：前端审批对话框
      * 接受后置 true。未注入 → null → 恒 false（CC config 缺省）。
+     *
+     * <p>⭐ <b>[T15-3] 入参 = {@code Function<String sessionId, Boolean>}（原 0 参 Supplier）。</b>
+     * <b>契约要求（注入方必守）</b>：
+     * <ul>
+     *   <li>入参 sessionId 恒非 null（两个消费点均传手上已有的显式 sessionId）；
+     *       ⛔ 实现<b>不得</b>回落任何隐式会话载体（MDC/ThreadLocal 已删）；</li>
+     *   <li>项目键的解析（sessionId → 项目根 → canonical 键）<b>由注入方完成</b>，
+     *       引擎不解析、不缓存项目根；</li>
+     *   <li><b>缺值策略</b>（改造铁律）：会话存在但未绑定项目根 / 无此会话 ⇒
+     *       <b>返回 false + ≥WARN</b>（(b) 类「本就不需要」，= CC 缺省 false config.ts:146）；
+     *       <b>解析失败</b>（回源器未接线 / 回源抛错 / 违约返回 null）⇒ <b>抛</b>
+     *       （(a) 类「本该有却没有」）—— ⛔ 不得静默返回 false：同一引擎同一 sessionId 上，
+     *       {@code resolveOriginalCwd}（CwdResolution:280-284）对该态本来就抛，
+     *       此处静默吞会新造「一处抛一处吞」的不一致。</li>
+     * </ul>
      */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
-    public void setHasClaudeMdExternalIncludesApproved(java.util.function.Supplier<Boolean> hasClaudeMdExternalIncludesApproved) {
+    public void setHasClaudeMdExternalIncludesApproved(java.util.function.Function<String, Boolean> hasClaudeMdExternalIncludesApproved) {
         this.hasClaudeMdExternalIncludesApproved = hasClaudeMdExternalIncludesApproved;
     }
 
@@ -407,9 +451,12 @@ public class ClaudemdEngine {
      * 注入外部 include 警告已示态 · CC original: {@code hasClaudeMdExternalIncludesWarningShown}
      * （config.ts:116，claudemd.ts:1423-1426 消费）。装配缝（OPD-CM5-F-09）：前端审批对话框
      * 显示后（无论接受/拒绝）置 true。未注入 → null → 恒 false。
+     *
+     * <p>⭐ <b>[T15-3] 入参 = {@code Function<String sessionId, Boolean>}（原 0 参 Supplier）</b>；
+     * 契约要求同 {@link #setHasClaudeMdExternalIncludesApproved}（含缺值策略四态分流）。
      */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
-    public void setHasClaudeMdExternalIncludesWarningShown(java.util.function.Supplier<Boolean> hasClaudeMdExternalIncludesWarningShown) {
+    public void setHasClaudeMdExternalIncludesWarningShown(java.util.function.Function<String, Boolean> hasClaudeMdExternalIncludesWarningShown) {
         this.hasClaudeMdExternalIncludesWarningShown = hasClaudeMdExternalIncludesWarningShown;
     }
 
@@ -512,10 +559,91 @@ public class ClaudemdEngine {
         // [批 5b-1] ⭐ 二者**均纳入缓存键**（原键仅 forceIncludeExternal ⇒ 跨会话冻结）：
         //   本仓一 JVM 多会话，扫描根随 sessionId 解析、projectRoot 为显式入参 ⇒ 单布尔键会让
         //   会话 A 的 CLAUDE.md 列表被会话 B 复用（静默错值）。键 = 计算体的完整会话态输入。
+        // [T15-3] ⭐ 第 4 成分 = 审批态（见 memoryFilesCacheKey javadoc：不加会跨项目串值）。
         String scanRoot = resolveOriginalCwd(sessionId);
-        String cacheKey = memoryFilesCacheKey(forceIncludeExternal, scanRoot, sessionProjectRoot);
+        // [T15-3] 审批态是本方法的**会话态输入之一**（决定 includeExternal，见 computeMemoryFiles）
+        //   ⇒ 必须在**键计算前**解析一次，并把同一值传进计算体（⛔ 不读两遍：注入方闭包非纯函数时
+        //   两遍读可能不一致，且键与计算体必须同源）。
+        boolean approved = resolveExternalIncludesApproved(sessionId);
+        String cacheKey = memoryFilesCacheKey(forceIncludeExternal, scanRoot, sessionProjectRoot, approved);
         return memoryFilesCache.computeIfAbsent(cacheKey,
-            key -> computeMemoryFiles(forceIncludeExternal, sessionId, sessionProjectRoot, scanRoot));
+            key -> computeMemoryFiles(forceIncludeExternal, sessionId, sessionProjectRoot, scanRoot, approved));
+    }
+
+    /** 审批接缝未注入时的告警闸（本引擎实例一次）· 见 {@link #resolveGate}。 */
+    private final java.util.concurrent.atomic.AtomicBoolean approvalSeamUnwiredWarned =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** 示警接缝未注入时的告警闸（本引擎实例一次）· 见 {@link #resolveGate}（⛔ 与审批闸分开，理由不共享）。 */
+    private final java.util.concurrent.atomic.AtomicBoolean warningShownSeamUnwiredWarned =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 解析本会话项目键下的外部 include 审批位 · [T15-3] 接缝
+     * {@link #setHasClaudeMdExternalIncludesApproved} 的唯一读取点。
+     *
+     * <p><b>数据流</b>：{@code sessionId} → 注入的 {@code Function<String,Boolean>}
+     * （生产 = {@code ClaudeMdController} 的项目键查表）→ 布尔。⛔ 引擎不做项目键解析。
+     * <p><b>接缝未注入的处置（WARN 一次 + false）见 {@link #resolveGate}。</b>
+     */
+    private boolean resolveExternalIncludesApproved(String sessionId) {
+        return resolveGate(hasClaudeMdExternalIncludesApproved, approvalSeamUnwiredWarned,
+            "hasClaudeMdExternalIncludesApproved", "config.ts:146", sessionId);
+    }
+
+    /**
+     * 解析本会话项目键下的外部 include <b>警告已示</b>位 · 接缝
+     * {@link #setHasClaudeMdExternalIncludesWarningShown} 的唯一读取点。
+     *
+     * <p>⛔ 与 {@link #resolveExternalIncludesApproved} <b>分开一道闸</b>：两者是不同接缝、
+     * 不同失效含义（审批位缺失 ⇒ 外部 @include 不加载；示警位缺失 ⇒ 弹窗可能重复出现），
+     * 共用一闸会让先到者把后到者的可观测性结构性抹掉（同 P1a 批实证模式）。
+     */
+    private boolean resolveExternalIncludesWarningShown(String sessionId) {
+        return resolveGate(hasClaudeMdExternalIncludesWarningShown, warningShownSeamUnwiredWarned,
+            "hasClaudeMdExternalIncludesWarningShown", "config.ts:147", sessionId);
+    }
+
+    /**
+     * 门控接缝通用读取 · <b>未注入（{@code null}）⇒ WARN 一次 + {@code false}</b>。
+     *
+     * <p><b>选 (b) 类（WARN，而非 fail-loud 抛）的依据（⛔ 非默认静默，逐条核过）</b>：
+     * <ol>
+     *   <li><b>该缺省在语义上就是正确答案，不是回落</b>：注入方 = {@code ClaudeMdController}，它在两个
+     *       REST 处理器里调 {@code wireEngine}（<b>无 {@code @PostConstruct} / 无启动期接线</b>）。
+     *       ⇒ 接缝为 null ⟺ <b>本进程从未收过 /claude-md 端点请求</b> ⟺ 本进程从未有人批准/示警过
+     *       ⇒ 对<b>任何</b>项目正确答案都是 {@code false}
+     *       （CC {@code DEFAULT_PROJECT_CONFIG}，config.ts:146/:147）。</li>
+     *   <li><b>接缝「可缺席」是既有设计</b>：两个 setter 均标 {@code @Autowired(required=false)}（Spring
+     *       明确容忍无候选 bean），且旧实现（0 参 Supplier）同样以「未注入 → null → 恒 false」为契约
+     *       ⇒ 缺席是<b>设计内的可选态</b>，不是 fix-junit 批所谓「生产 = 装配异常 ⇒ fail-loud」。</li>
+     *   <li><b>反证（抛会打断正常路径，代价远大于少一行日志）</b>：{@code getMemoryFiles} 的生产调用方
+     *       不止审批弹窗链路 —— {@code MemoryController}(×3)、{@code ContextAnalyzeService}、以及
+     *       agent/compact 链（{@code UserContextProvider}/{@code PartialCompactService}）都会在从未访问
+     *       /claude-md 的进程里读记忆 ⇒ 一抛即打断这些<b>正常</b>路径；且本仓测试有 60+ 处直接构造
+     *       未接线引擎的 {@code getMemoryFiles} 调用，一抛即全红。</li>
+     * </ol>
+     * ⇒ 结论：**WARN 足够**（⛔ 但<b>不得静默</b> —— 原实现此处一行日志都没有，违反「不许静默失效」）。
+     *
+     * @param gateName     接缝方法名（日志用）
+     * @param ccDefaultRef CC 缺省出处（日志用）
+     * @param resolver     注入的门控闭包（{@code null} = 未注入）
+     * @param warnedOnce   本闸的「已告警」一次性标记（⛔ 按接缝分开传，不共用）
+     * @param sessionId    会话标识（日志用；原样透传给闭包）
+     */
+    private boolean resolveGate(Function<String, Boolean> resolver,
+                                java.util.concurrent.atomic.AtomicBoolean warnedOnce,
+                                String gateName, String ccDefaultRef, String sessionId) {
+        if (resolver == null) {
+            if (warnedOnce.compareAndSet(false, true)) {
+                log.warn("[ClaudemdEngine] 引擎审批接缝未注入（{} 未被调用）⇒ 按 CC 缺省取 false"
+                    + "（DEFAULT_PROJECT_CONFIG，{}）。语义前提：本进程未收过 /claude-md 端点请求 ⇒ "
+                    + "从未有人批准/示警过，故 false 恒为正确答案；⛔ 绝不回落 config home / user.dir。"
+                    + "sessionId={}；本闸每引擎实例只打印一次", gateName, ccDefaultRef, sessionId);
+            }
+            return false;
+        }
+        return Boolean.TRUE.equals(resolver.apply(sessionId));
     }
 
     /**
@@ -524,7 +652,8 @@ public class ClaudemdEngine {
      * 在单飞语义下每次缓存 miss 仅消费一次。
      */
     private List<MemoryFileInfo> computeMemoryFiles(boolean forceIncludeExternal, String sessionId,
-                                                    String sessionProjectRoot, String scanRoot) {
+                                                    String sessionProjectRoot, String scanRoot,
+                                                    boolean externalIncludesApproved) {
         long startTime = System.currentTimeMillis();
         if (log.isDebugEnabled()) {
             log.debug("[ClaudemdEngine] getMemoryFiles 开始: forceIncludeExternal={}", forceIncludeExternal);
@@ -533,8 +662,8 @@ public class ClaudemdEngine {
         List<MemoryFileInfo> result = new ArrayList<>();
         Set<String> processedPaths = new LinkedHashSet<>();
         // CC claudemd.ts:798-801：includeExternal = forceIncludeExternal || config.hasClaudeMdExternalIncludesApproved || false
-        boolean includeExternal = forceIncludeExternal || Boolean.TRUE.equals(
-            hasClaudeMdExternalIncludesApproved != null ? hasClaudeMdExternalIncludesApproved.get() : null);
+        // [T15-3] 审批位由 getMemoryFiles 在**键计算前**解析一次并传入（= 键与计算体同源，⛔ 不在此重读接缝）
+        boolean includeExternal = forceIncludeExternal || externalIncludesApproved;
 
         // 1. Managed file（恒加载 - policy settings）
         processMemoryFileInto(result, getMemoryPath(ClaudemdMemoryType.MANAGED, sessionId),
@@ -2025,10 +2154,10 @@ public class ClaudemdEngine {
      * @return true = 存在外部 include 且既未审批也未显示过警告
      */
     public boolean shouldShowClaudeMdExternalIncludesWarning(String sessionId) {
-        boolean approved = hasClaudeMdExternalIncludesApproved != null
-            && Boolean.TRUE.equals(hasClaudeMdExternalIncludesApproved.get());
-        boolean warningShown = hasClaudeMdExternalIncludesWarningShown != null
-            && Boolean.TRUE.equals(hasClaudeMdExternalIncludesWarningShown.get());
+        // [T15-3] 接缝带维度：两个闭包均以**本方法已有的 sessionId** 为入参（⛔ 不再 0 参全局槽）；
+        //   读取统一走 resolveGate ⇒ 未注入时 WARN 一次 + CC 缺省 false（⛔ 不再各写一份静默 null 守卫）
+        boolean approved = resolveExternalIncludesApproved(sessionId);
+        boolean warningShown = resolveExternalIncludesWarningShown(sessionId);
         if (approved || warningShown) {
             return false;
         }
