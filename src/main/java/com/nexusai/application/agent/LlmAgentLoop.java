@@ -8285,7 +8285,12 @@ public class LlmAgentLoop implements AgentLoop {
                         inLoopDreamWs,                  // D5-A：会话 transcript 扫描根 · CC getProjectDir(cwd) consolidationLock.ts:121
                         state.sessionId(), // 排除自身 · CC autoDream.ts:164
                         forkRawMaterial,               // T9：fork 原料（主线程 systemPrompt/userContext/systemContext/消息快照 · forkedAgent.ts:131-141）
-                        inLoopMemoryDir);              // A1：会话线程解析的 memoryDir（getAutoMemPath(boundProject)）
+                        inLoopMemoryDir,               // A1：会话线程解析的 memoryDir（getAutoMemPath(boundProject)）
+                        // [批 7] 会话已解析 cwd 快照（per-turn TUC 的 effectiveCwd）——会话线程算好直传，
+                        //   fork 侧供应器据此建 base TUC ⇒ 构造器不重跑 CwdResolution.getCwd（避免
+                        //   对「cron 显式锚 + 未绑定会话」这条本来能跑的路径新引入一次 fail-loud 抛）。
+                        params.toolUseContext() != null
+                            ? params.toolUseContext().effectiveCwd() : null);
                     // [IMP-HOOKS-S5 D-11 ①] executeEvent 折叠单条 → executeStopHooksCollecting
                     //   逐 result 消费（CC stopHooks.ts:200-295 for-await 循环：:257-267 全部
                     //   blockingError 逐个 push → 全部注入；:269-280 preventContinuation；

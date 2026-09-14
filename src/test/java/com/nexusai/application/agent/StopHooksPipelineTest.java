@@ -205,13 +205,13 @@ class StopHooksPipelineTest {
             // [TL-W1 P2] 改用 11 参生产形态（显式 memoryDir）—— 会话线程解析的 memoryDir 是
             //   dream 的**唯一**生产入口；9 参（memoryDir=null）现走「显式跳过 + warn」不再触发 dream。
             java.nio.file.Path memDir = java.nio.file.Path.of("C:/proj/.nexusai/projects/demo/memory");
-            assertThat(StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, msgs, false, null, false, null, null, null, memDir)).isTrue();
+            assertThat(StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, msgs, false, null, false, null, null, null, memDir, null)).isTrue();
             // [IMP-M-P0-3b] 阶段4 改为 fire-and-forget 调 executeExtractMemories（CC stopHooks.ts:149-152
             //   void executeExtractMemories），不再 CompletableFuture.runAsync+extract 直调
-            verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), any(), isNull(), isNull(), isNull(), any());
+            verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), any(), isNull(), isNull(), isNull(), any(), isNull());
             // [TL-W1 P2] 5 参（显式 memoryDir）—— 4 参现算重载已不再被生产调用（它会在 fork 线程
             //   回落 config home → ConsolidationLock(null) NPE 被吞 ⇒ autoDream 静默永不执行）。
-            verify(dreamer, Mockito.timeout(2000)).consolidateIfNeeded(any(), any(), any(), isNull(), eq(memDir));
+            verify(dreamer, Mockito.timeout(2000)).consolidateIfNeeded(any(), any(), any(), isNull(), eq(memDir), isNull());
             Mockito.clearInvocations(dreamer);
 
             // [TL-W1 P2 新意图] memoryDir=null（无有效 per-project auto-memory 目录）→ dream **显式跳过**
@@ -244,7 +244,7 @@ class StopHooksPipelineTest {
         System.setProperty("NEXUSAI_EXTRACT_MEMORIES", "true");
         try {
             StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, List.of(), false, append, false, null, null);
-            verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), eq(append), isNull(), isNull(), isNull(), isNull());
+            verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), eq(append), isNull(), isNull(), isNull(), isNull(), isNull());
         } finally {
             System.clearProperty("NEXUSAI_EXTRACT_MEMORIES");
         }
@@ -290,7 +290,7 @@ class StopHooksPipelineTest {
             System.setProperty(runtimeKey, "true");
             StopHookPipeline.executeExtractMemoriesAndAutoDream(
                 null, extractAgent, dreamer, List.of(), false, null, false, null, null);
-            Mockito.verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), any(), isNull(), isNull(), isNull(), isNull());
+            Mockito.verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), any(), isNull(), isNull(), isNull(), isNull(), isNull());
         } finally {
             System.clearProperty(moduleKey);
             System.clearProperty(runtimeKey);
@@ -398,9 +398,9 @@ class StopHooksPipelineTest {
         // autoDream 仍触发（dreamer 非 null + agentId=null 无条件）
         // [TL-W1 P2] 11 参生产形态（显式 memoryDir）—— dream 的唯一生产入口。
         java.nio.file.Path memDir = java.nio.file.Path.of("C:/proj/.nexusai/projects/demo/memory");
-        assertThat(StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, List.of(), true, null, false, null, null, null, memDir)).isTrue();
+        assertThat(StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, List.of(), true, null, false, null, null, null, memDir, null)).isTrue();
         Mockito.verifyNoInteractions(extractAgent);
-        verify(dreamer, Mockito.timeout(2000)).consolidateIfNeeded(any(), any(), any(), isNull(), eq(memDir));
+        verify(dreamer, Mockito.timeout(2000)).consolidateIfNeeded(any(), any(), any(), isNull(), eq(memDir), isNull());
     }
 
     @Test
@@ -431,10 +431,10 @@ class StopHooksPipelineTest {
                     null, null, null, List.of(), List.of()));
             // [TL-W1 P2] 用 11 参生产形态（显式 memoryDir = 会话线程解析值 · 本例 storage 冻结 tempDir）——
             //   dream 的唯一生产入口；9 参（memoryDir=null）现为「显式跳过 + warn」。
-            assertThat(StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, msgs, false, null, false, null, null, null, tempDir)).isTrue();
+            assertThat(StopHookPipeline.executeExtractMemoriesAndAutoDream(null, extractAgent, dreamer, msgs, false, null, false, null, null, null, tempDir, null)).isTrue();
             // [IMP-M-P0-3b] 阶段4 触发 executeExtractMemories（fire-and-forget · CC stopHooks.ts:149-152）
-            verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), any(), isNull(), isNull(), isNull(), any());
-            verify(dreamer, Mockito.timeout(2000)).consolidateIfNeeded(any(), any(), any(), isNull(), eq(tempDir));
+            verify(extractAgent, Mockito.timeout(2000)).executeExtractMemories(any(), any(), isNull(), isNull(), isNull(), any(), isNull());
+            verify(dreamer, Mockito.timeout(2000)).consolidateIfNeeded(any(), any(), any(), isNull(), eq(tempDir), isNull());
             // extract fork 真实发起（recording query 被调用 → lastForkParams 非空）
             // verify(timeout) 在 extract 进入时即返回，poll 等 fork 完成设置 lastForkParams（sessionId=null → "unknown" 键）
             long deadline = System.currentTimeMillis() + 3000;

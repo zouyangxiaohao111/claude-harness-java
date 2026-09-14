@@ -174,8 +174,23 @@ public class SessionMemoryService {
     /** fork 查询 seam · 生产注入 ProductionForkedQuery（ToolRegistrationConfig）。 */
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
 
-    /** cache-safe params 供应器 · fork 消息前缀 + 主线程工具集。 */
-    private volatile Supplier<CacheSafeParams> cacheSafeParamsSupplier;
+    /**
+     * cache-safe params 供应器 · <b>形参 = 发起本次 fork 的真实会话 id</b>（fork 消息前缀 +
+     * 主线程工具集）。
+     *
+     * <p><b>[批 7 2026-09-14] 为什么形参带会话 id</b>：供应商求值的时刻就在<b>持有会话的调用点</b>
+     * 内（本类两个提取入口），而生产载荷
+     * {@code ToolRegistrationConfig.buildProductionCacheSafeParams} 会把该 id 写进
+     * {@code CacheSafeParams.toolUseContext.sessionId()} —— 该 TUC 是 fork 隔离上下文的 parent
+     * （{@code RunForkedAgent.createIsolatedContext}），其 sessionId 经 {@code ToolUseContext.with(...)}
+     * 的 {@code this.sessionId()} 流遍 fork 内整个工具执行链（file-history 备份目录 /
+     * SessionFilesRecorder 归属 / effectiveCwd 构造期推导）。
+     * 旧形态 {@code Supplier<CacheSafeParams>} 无会话通道 ⇒ 生产 fork 的 TUC sessionId 恒为
+     * 「确无会话」哨兵（e2e 实证：`file-history/no-session/…`）。
+     * ⛔ 调用点必须传真实值；确无会话时传 {@code null}（由供应器侧置哨兵 + ≥WARN）。
+     */
+    private volatile java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams>
+        cacheSafeParamsSupplier;
 
     /**
      * firstParty fork 缓存共享 gate 供应 · 兜底（RES-C5）CacheSafeParams 的
@@ -448,8 +463,12 @@ public class SessionMemoryService {
         this.forkedQuery = query;
     }
 
-    /** 注入 cache-safe params 供应器（fork 消息前缀 + 主线程工具集）。 */
-    public void setCacheSafeParamsSupplier(Supplier<CacheSafeParams> supplier) {
+    /**
+     * 注入 cache-safe params 供应器（fork 消息前缀 + 主线程工具集）·
+     * <b>[批 7] 形参 = 真实会话 id</b>（见 {@link #cacheSafeParamsSupplier} 字段 javadoc）。
+     */
+    public void setCacheSafeParamsSupplier(
+            java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams> supplier) {
         this.cacheSafeParamsSupplier = supplier;
     }
 
@@ -757,7 +776,21 @@ public class SessionMemoryService {
             List<ChatMessageDto> promptMessages = List.of(userMessage(userPrompt));
 
             // ── cache-safe params + fork（CC :318-325）──
-            CacheSafeParams supplied = cacheSafeParamsSupplier != null ? cacheSafeParamsSupplier.get() : null;
+            // [批 7] fork 基础上下文的真实会话 id：来源 = post-sampling 上下文携带的会话 TUC
+            //   （psContext.toolUseContext() 的 sessionId 与 :735 resolvePath(sessionId) 同源 ⇒
+            //   就是 `…/sess-xxx/session-memory/summary.md` 里的那个会话）。供应器在**构造期**
+            //   用它建 fork base TUC（⛔ 不做 post-hoc 改写：effectiveCwd 由 sessionId 构造期推出）。
+            //   null ⇒ 供应器侧置「确无会话」哨兵 + ≥WARN（⛔ 不用 "unknown" 占位）。
+            String forkSessionId = psContext.toolUseContext() != null
+                ? psContext.toolUseContext().sessionId() : null;
+            // [批 7] 会话**已解析的 cwd 快照**（会话 TUC 的 effectiveCwd，非 null）一并显式传：
+            //   供应商侧据此建 fork base TUC ⇒ 构造器不再重跑 CwdResolution.getCwd(sessionId)
+            //   （该入口对「会话存在但无绑定项目」fail-loud 抛 —— 不能因本批的载体变更而对
+            //   「cron 显式锚 + 未绑定会话」这条本来能跑的路径新引入一次抛）。
+            java.nio.file.Path forkSessionCwd = psContext.toolUseContext() != null
+                ? psContext.toolUseContext().effectiveCwd() : null;
+            CacheSafeParams supplied = cacheSafeParamsSupplier != null
+                ? cacheSafeParamsSupplier.apply(forkSessionId, forkSessionCwd) : null;
             CacheSafeParams cacheSafeParams = supplied != null
                 ? new CacheSafeParams(
                     // [RES-C5 rework] 生产 supplier（ToolRegistrationConfig.buildProductionCacheSafeParams）
@@ -791,7 +824,8 @@ public class SessionMemoryService {
                     useGlobalCacheScopeSupplier.get(), // [RES-C5] gate 透传（GlobalCacheScope 单实现 · betas.ts:227-233）
                     // [批 6 · 路线 (ii)] 真实会话 id 取自 post-sampling 上下文携带的 TUC
                     //   （⛔ 不用 sessionIdFrom 的 "unknown" 兜底 —— 那是占位、非会话键）
-                    psContext.toolUseContext() != null ? psContext.toolUseContext().sessionId() : null);
+                    // [批 7] 与供应器分支同一来源（上方 forkSessionId）—— 一个表达式一个来源。
+                    forkSessionId);
 
             HookPermissionResolver.CanUseTool canUseTool = createMemoryFileCanUseTool(memoryPath.toString());
             // skipTranscript/skipCacheWrite 不设（false）· CC sessionMemory.ts:318-325 未传，
@@ -919,7 +953,14 @@ public class SessionMemoryService {
             //   恒空）且无 extract 路径的 mergeSystemPrompt/mergeContext 补偿 → 生产 manual fork
             //   systemPrompt 恒空（NOT_ALIGNED）。现与 extract 路径对称：supplied 非空保留原值，
             //   空 → 用 {@link #assembleManualSystemPrompt} 组装（getSystemPrompt 等价）。
-            CacheSafeParams supplied = cacheSafeParamsSupplier != null ? cacheSafeParamsSupplier.get() : null;
+            // [批 7] fork 基础上下文的真实会话 id（来源 = 本方法形参 TUC；manual 提取入口恒有会话）。
+            //   与 extract 路径同款：供应器在构造期用它建 fork base TUC。
+            String forkSessionId = toolUseContext != null ? toolUseContext.sessionId() : null;
+            // [批 7] 已解析 cwd 快照一并显式传（同 extract 路径理由）
+            java.nio.file.Path forkSessionCwd = toolUseContext != null
+                ? toolUseContext.effectiveCwd() : null;
+            CacheSafeParams supplied = cacheSafeParamsSupplier != null
+                ? cacheSafeParamsSupplier.apply(forkSessionId, forkSessionCwd) : null;
             List<String> manualSystemPrompt = assembleManualSystemPrompt(toolUseContext);
             CacheSafeParams cacheSafeParams = supplied != null
                 ? new CacheSafeParams(
@@ -938,8 +979,8 @@ public class SessionMemoryService {
                     Map.of(),                         // systemContext 降级
                     useGlobalCacheScopeSupplier.get(), // [RES-C5] gate 透传（GlobalCacheScope 单实现 · betas.ts:227-233）
                     // [批 6 · 路线 (ii)] 真实会话 id 取自本方法形参 TUC（manual 提取入口恒有会话；
-                    //   ⛔ 不用 sessionIdFrom 的 "unknown" 兜底）
-                    toolUseContext != null ? toolUseContext.sessionId() : null);
+                    //   ⛔ 不用 sessionIdFrom 的 "unknown" 兜底）· [批 7] 与供应器分支同源。
+                    forkSessionId);
 
             HookPermissionResolver.CanUseTool canUseTool = createMemoryFileCanUseTool(memoryPath.toString());
             ForkedAgentParams params = new ForkedAgentParams(

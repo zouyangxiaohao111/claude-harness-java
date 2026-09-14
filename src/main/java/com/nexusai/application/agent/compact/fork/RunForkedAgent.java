@@ -62,6 +62,39 @@ public final class RunForkedAgent {
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /**
+     * fork 基础上下文的<b>会话 id 归一化</b>（唯一实现）· [批 7 2026-09-14]。
+     *
+     * <p><b>WHY 抽成单一入口</b>：fork 基础 {@code ToolUseContext} 有<b>两个</b>构造点 ——
+     * 本类 {@link #createMinimalCacheSafeParams}（无主线程工具集兜底）与
+     * {@code ToolRegistrationConfig.buildProductionCacheSafeParams}（生产 supplier，
+     * 携带 {@code toolRegistry.all()} 工具集）。两处都必须把「真实会话 id / 确无会话哨兵」
+     * 判成同一种形态，否则会出现「同一能力两套判据」（批 6 起本仓已多次栽在该模式上）。
+     *
+     * <p><b>判据</b>：只采信**真实**会话 id；null/空白 ⇒ 显式「确无会话」哨兵
+     * {@link com.nexusai.common.SessionKeys#NO_SESSION} + ≥WARN（一次性）。
+     * ⛔ 绝不现造 {@code "sess-"+UUID} 假键 —— 该键会经 {@code CacheSafeParams.toolUseContext}
+     * 成为 {@link #createIsolatedContext} 的 parent ctx，经 {@code ToolUseContext.with(...)}
+     * 的 {@code this.sessionId()} 流遍 fork 内整个工具执行链（file-history 备份目录 /
+     * SessionFilesRecorder 归属）；⛔ 也不得用 {@code "unknown"} 之类占位（那同样会被下游当会话键消费）。
+     *
+     * @param sessionId 调用方持有的会话 id（供应商/兜底构造点显式传参；可为 null）
+     * @param caller    调用点标签（仅用于告警文本定位）
+     * @return 真实会话 id；或 {@link com.nexusai.common.SessionKeys#NO_SESSION} 哨兵
+     */
+    public static String resolveForkSessionId(String sessionId, String caller) {
+        if (sessionId != null && !sessionId.isBlank()) {
+            return sessionId;
+        }
+        if (NO_SESSION_WARNED.compareAndSet(false, true)) {
+            log.warn("[RunForkedAgent] {}: 调用方未提供会话 id ⇒ 置确无会话显式哨兵 {}"
+                + "（⛔ 不再现造 \"sess-\"+UUID 假会话键）。本路径确无会话可取"
+                + "（如 AutoDreamConsolidator.buildForkParams 作用域内无会话）或调用方漏传"
+                + "（本告警仅打印一次）", caller, com.nexusai.common.SessionKeys.NO_SESSION);
+        }
+        return com.nexusai.common.SessionKeys.NO_SESSION;
+    }
+
+    /**
      * 遥测实例（静态注入 · Spring 装配时经 {@link #setTelemetry} 设置一次；测试/未装配 →
      * null → {@code tengu_fork_agent_query} 发射静默跳过，零行为变化）。
      *
@@ -408,18 +441,9 @@ public final class RunForkedAgent {
         //   —— 该键会经 CacheSafeParams.toolUseContext 成为 RunForkedAgent.createIsolatedContext
         //   的 parent ctx ⇒ fork 内工具执行 / file-history 备份目录 / SessionFilesRecorder
         //   全程带一次性假键（每次 fork 泄一个新键）。调用方传值规则见 @param sessionId。
-        String forkSessionId;
-        if (sessionId != null && !sessionId.isBlank()) {
-            forkSessionId = sessionId;
-        } else {
-            forkSessionId = com.nexusai.common.SessionKeys.NO_SESSION;
-            if (NO_SESSION_WARNED.compareAndSet(false, true)) {
-                log.warn("[RunForkedAgent] createMinimalCacheSafeParams: 调用方未提供会话 id ⇒ 置显式哨兵 {}"
-                    + "（⛔ 不再现造 \"sess-\"+UUID 假会话键）。本路径确无会话可取（如 "
-                    + "AutoDreamConsolidator.buildForkParams 作用域内无会话）或调用方漏传（本告警仅打印一次）",
-                    forkSessionId);
-            }
-        }
+        // [批 7] 判据收敛到唯一实现 {@link #resolveForkSessionId}（与生产 supplier
+        //   buildProductionCacheSafeParams 共用，防「同一能力两套判据」）。
+        String forkSessionId = resolveForkSessionId(sessionId, "createMinimalCacheSafeParams");
         ToolUseContext standalone = new ToolUseContext(
             UUID.randomUUID(), forkSessionId,
             PermissionMode.DEFAULT,

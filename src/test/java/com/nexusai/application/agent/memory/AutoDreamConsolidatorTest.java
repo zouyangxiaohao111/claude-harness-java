@@ -178,6 +178,66 @@ class AutoDreamConsolidatorTest {
 
     }
     @Test
+    @DisplayName("[批 7] 自动路径：供应商必须收到**真实会话 id**（形参下传）与**已解析 cwd 快照**")
+    void consolidateIfNeeded_autoPath_passesRealSessionIdAndCwd() throws IOException {
+        // WHY（规则九 + 用户 2026-09-14 裁定）：批 6 把 auto-dream 的 fork 会话身份定为「确无会话」
+        //   哨兵，理由是 buildForkParams 作用域内无 sessionId —— 实测该理由**不成立**：自动路径的真实
+        //   会话 id 就在上层形参里（consolidateIfNeeded(…, sessionId, …)，本用于「排除自身」），
+        //   只是没下传 ⇒ fork 的 file-history / SessionFilesRecorder 归属落 `no-session` 桶。
+        //   批 7 下传真实值；同时必须带上**会话已解析 cwd 快照**（否则 ToolUseContext 紧凑构造器会对
+        //   真实 sessionId 重跑 CwdResolution.getCwd ⇒ 对「会话存在但无绑定项目」抛）。
+        //   RED: 把 buildForkParams 的 sessionId/sessionCwd 实参改回 null ⇒ 本用例红。
+        writeSessions(ws, 5);
+        consolidator.setAutoDreamEnabled(() -> true);
+        AtomicReference<String> sidSeen = new AtomicReference<>("<供应器未被调用>");
+        AtomicReference<Path> cwdSeen = new AtomicReference<>();
+        ToolUseContext supplierCtx = new ToolUseContext(
+            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            PermissionMode.DEFAULT, Map.of(), List.of(), "", new AbortController(), List.of());
+        consolidator.setCacheSafeParamsSupplier((sid, cwd) -> {
+            sidSeen.set(sid);
+            cwdSeen.set(cwd);
+            return new CacheSafeParams(List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false);
+        });
+        Path sessionCwd = ws.resolve("session-cwd-snapshot");
+
+        consolidator.consolidateIfNeeded(ws, "sess-autodream-real", null, null, mem, sessionCwd);
+
+        assertThat(query.called()).as("fork 必须真的发起（否则下面断言无意义）").isTrue();
+        assertThat(sidSeen.get())
+            .as("自动路径的真实会话 id 必须下传到供应器（= 排除自身用的那个 sessionId）")
+            .isEqualTo("sess-autodream-real");
+        assertThat(cwdSeen.get())
+            .as("会话已解析 cwd 快照必须一起下传（避免构造期重跑 CwdResolution）")
+            .isEqualTo(sessionCwd);
+    }
+
+    @Test
+    @DisplayName("[批 7] 手动 /dream：**确无会话** ⇒ 供应商收到 (null, null)（显式声明，非漏传）")
+    void doDream_manualPath_passesNoSessionExplicitly() {
+        // WHY：「不许静默失效」的另一半 —— 手动 /dream 的入参只有 workspaceDir（无 sessionId、
+        //   无会话 TUC），属 (b) 类「设计上不属于任何会话」⇒ 必须**显式**传 null 让供应商置
+        //   「确无会话」哨兵 + ≥WARN，⛔ 不得现造会话键。（该腿结构性无会话 ⇒ 不参与批 7 的真实值下传。）
+        consolidator.setAutoDreamEnabled(() -> true);
+        AtomicReference<String> sidSeen = new AtomicReference<>("<供应器未被调用>");
+        AtomicReference<Path> cwdSeen = new AtomicReference<>();
+        ToolUseContext supplierCtx = new ToolUseContext(
+            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            PermissionMode.DEFAULT, Map.of(), List.of(), "", new AbortController(), List.of());
+        consolidator.setCacheSafeParamsSupplier((sid, cwd) -> {
+            sidSeen.set(sid);
+            cwdSeen.set(cwd);
+            return new CacheSafeParams(List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false);
+        });
+
+        consolidator.doDream(ws, "手动整合", null);
+
+        assertThat(query.called()).as("手动 /dream 必须真的发起 fork").isTrue();
+        assertThat(sidSeen.get()).as("手动路径确无会话 ⇒ 显式 null（不是编造值）").isNull();
+        assertThat(cwdSeen.get()).as("同步无 cwd 快照 ⇒ 显式 null").isNull();
+    }
+
+    @Test
     @DisplayName("[IMP-MV2-09 T9] fork 原料注入：dream fork 载荷三段原料与主线程同值 + forkContextMessages 带回消息快照（CC createCacheSafeParams · autoDream.ts:226）")
     void consolidateIfNeeded_forkRawMaterial_payloadMatchesMainThread() throws IOException {
         // WHY: △-1（域级唯一 HIGH）—— ToolRegistrationConfig.buildProductionCacheSafeParams 空载荷
@@ -190,7 +250,7 @@ class AutoDreamConsolidatorTest {
         ToolUseContext supplierCtx = new ToolUseContext(
             UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
-        consolidator.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        consolidator.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false));
         List<ChatMessageDto> mainMsgs = List.of(
             new ChatMessageDto("u0", null, Role.user, "user", "turn1", null,

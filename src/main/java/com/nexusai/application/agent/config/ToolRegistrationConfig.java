@@ -1619,7 +1619,8 @@ public class ToolRegistrationConfig {
         // cache-safe params supplier：fork 消息前缀 + 主线程工具集（buildProductionCacheSafeParams
         //   唯一有效载荷 toolUseContext，SystemPrompt/Context 由 SessionMemoryService.mergeSystemPrompt/
         //   mergeContext 用会话原料补全 —— doExtractSessionMemory:537-562）
-        svc.setCacheSafeParamsSupplier(() -> buildProductionCacheSafeParams(toolRegistry));
+        svc.setCacheSafeParamsSupplier(
+            (sessionId, sessionCwd) -> buildProductionCacheSafeParams(toolRegistry, sessionId, sessionCwd));
         // OPD-CM5-B-01: firstParty fork 缓存共享 gate 生产求值注入 —— 对齐 CC shouldUseGlobalCacheScope()
         //   （betas.ts:227-233）单实现 GlobalCacheScope，config 与 compact 同源（buildForkSuppliers →
         //   productionForkedQuery.configSupplier()）。此前 SM bean 未接线（默认 () -> false = 3P），
@@ -1692,7 +1693,8 @@ public class ToolRegistrationConfig {
         agent.setForkedQuery(queryLoopForkedQuery);
         // cache-safe params supplier：toolUseContext 携带主线程工具集（fork 需要真实工具数组
         //   Read/Write/Edit/Bash 等 + abort/权限继承；createMinimalCacheSafeParams 无工具集 → 空 tools）
-        agent.setCacheSafeParamsSupplier(() -> buildProductionCacheSafeParams(toolRegistry));
+        agent.setCacheSafeParamsSupplier(
+            (sessionId, sessionCwd) -> buildProductionCacheSafeParams(toolRegistry, sessionId, sessionCwd));
         // IMP-M-C-1: 遥测（tengu_extract_memories_* / tengu_auto_mem_tool_denied ·
         //   extractMemories.ts:356/473/500/156）
         agent.setTelemetry(telemetry);
@@ -1751,7 +1753,8 @@ public class ToolRegistrationConfig {
         // [E-1b-2] fork 生产 seam = 主循环 queryLoop（QueryLoopForkedQuery）。回退：改回
         //   productionForkedQuery（旧实现与 seam 均保留）。
         consolidator.setForkedQuery(queryLoopForkedQuery);
-        consolidator.setCacheSafeParamsSupplier(() -> buildProductionCacheSafeParams(toolRegistry));
+        consolidator.setCacheSafeParamsSupplier(
+            (sessionId, sessionCwd) -> buildProductionCacheSafeParams(toolRegistry, sessionId, sessionCwd));
         // IMP-M-P2-1: 遥测（tengu_auto_dream_fired/completed/failed · autoDream.ts:195/252/267）
         consolidator.setTelemetry(telemetry);
         // IMP-M-P2-1/D5-A (M-11): 会话门控数据源参数化 —— workspaceDir/sessionId 不再经
@@ -2127,27 +2130,61 @@ public class ToolRegistrationConfig {
      * userContext/systemContext/消息快照）。null 原料（非主循环入口）→ 消费者侧既有兜底。
      *
      * @param toolRegistry 主线程工具注册表（@Lazy；null → 空工具集兜底）
+     * @param sessionId   [批 7] 发起本 fork 的**真实会话 id**（调用点显式传参 —— 供应商的求值
+     *                    时刻就在持有会话的调用点内：SM/提取传会话 TUC 的 sessionId，auto-dream
+     *                    由 {@code consolidateIfNeeded} 形参下传）。
+     *                    ⛔ 不得传 {@code "unknown"} 之类占位（会当会话键进下游）
+     * @param sessionCwd  [批 7] 会话**已解析的 cwd 快照**（= 会话 TUC 的
+     *                    {@code effectiveCwd()}；auto-dream 传其 {@code projectRoot}）；
+     *                    {@code null} = 调用点无该值（如手动 /dream / 无 TUC 的直构），
+     *                    此时退回 {@code ToolUseContext} 构造器既有推导。
+     *                    <p><b>WHY 必须显式传</b>：`ToolUseContext` 紧凑构造器在
+     *                    {@code effectiveCwd == null} 时会调 {@code CwdResolution.getCwd(sessionId)}
+     *                    推导（ToolUseContext.java:426-428），而该入口对「会话存在但无绑定项目」
+     *                    是 **fail-loud 抛异常**（批 4a #7/#13 有意设计）。批 7 起本构造点开始携带
+     *                    **真实** sessionId，若不同时带上已解析 cwd，就会对「cron 显式锚 + 未绑定会话」
+     *                    这条**本来能跑**的路径**新引入一次抛**（未登记的行为变更）⇒ 显式传入已解析值，
+     *                    使构造器不再重跑 {@code CwdResolution}。
      * @return CacheSafeParams（forkContextMessages 由 ExtractMemoriesAgent/AutoDreamConsolidator
      *         在构造 fork 参数时用实际消息覆写；三段原料由 ForkRawMaterial 合并注入）
      */
     private static com.nexusai.application.agent.compact.fork.CacheSafeParams buildProductionCacheSafeParams(
-            ToolRegistry toolRegistry) {
-        // [批 6 2026-09-14 · 用户裁定 #3 路线 (ii) 的「其余」腿] forkBaseCtx 的 sessionId 用显式
-        //   「确无会话」哨兵，⛔ 不再现造 `"sess-"+UUID`：本方法是 `Supplier<CacheSafeParams>`
-        //   （三处接线：:1622 svc / :1695 agent / :1754 consolidator），**形参只有 toolRegistry**
-        //   ⇒ 求值时刻结构上拿不到会话（且求值发生在后台 fork 线程）。旧假键会经
-        //   CacheSafeParams.toolUseContext → RunForkedAgent.createIsolatedContext 的 parent 进入
-        //   fork 的整个工具执行链。
-        //   ⚠️ 本载荷的**唯一有效成分是工具集**（toolRegistry.all()）；会话相关维度（模型 /
-        //   projectRoot）由 ForkRawMaterial.forkToolUseContext / CacheSafeParams.projectRoot
-        //   另行显式注入。给本处补真实会话（改 supplier 形参）已**登记给后续批**。
+            ToolRegistry toolRegistry, String sessionId, java.nio.file.Path sessionCwd) {
+        // [批 6 2026-09-14 · 用户裁定 #3 路线 (ii) 的「其余」腿] ⛔ 不再现造 `"sess-"+UUID`：
+        //   旧假键会经 CacheSafeParams.toolUseContext → RunForkedAgent.createIsolatedContext
+        //   的 parent 进入 fork 的整个工具执行链。
+        //
+        // [批 7 2026-09-14 · 补真实会话] 批 6 在此处只能填「确无会话」哨兵，因为当时供应商
+        //   形参没有会话通道（形参只有 toolRegistry）⇒ **生产 SM/提取 fork 的 TUC sessionId
+        //   恒为 no-session**（e2e 实证：fork 内 Edit 的 file-history 备份落
+        //   `{configHome}/file-history/no-session/…`，SessionFilesRecorder 记 sessionId=no-session，
+        //   而目标文件路径明明是 `…/sess-0b86aab3/session-memory/summary.md`）。
+        //   根因不是下游，而是**本构造点拿不到会话**；现由调用点（持有会话者）显式传参补齐：
+        //   supplier 形参已从 `Supplier<CacheSafeParams>` 改为
+        //   `Function<String, CacheSafeParams>`（会话 id → 载荷）。
+        //   ⭐ 必须**在构造期**带上真实 sessionId：`ToolUseContext` 紧凑构造器会用
+        //   {@code CwdResolution.getCwd(sessionId)} 推出 `effectiveCwd`（ToolUseContext.java:426-428），
+        //   ⛔ 事后 `with*` 改写 sessionId 会留下过期 cwd（批 6 已论证），故不做 post-hoc 改写。
+        //   ⚠️ 本载荷的**其余成分仍是合成最小上下文**（PermissionMode.DEFAULT + 新 AbortController
+        //   + 空 messages）；会话相关其余维度（模型 / projectRoot）继续由
+        //   ForkRawMaterial.forkToolUseContext / CacheSafeParams.projectRoot 显式注入。
+        //   [批 7 补充] effectiveCwd 一并显式传入 `sessionCwd`（会话已解析快照）：
+        //   ⛔ 不传会让构造器对真实 sessionId 重跑 CwdResolution.getCwd ⇒ 对「会话存在但无绑定项目」
+        //   抛（批 4a 设计），把「cron 显式锚 + 未绑定会话」这条本来能跑的路径变成 500
+        //   （未登记的行为变更）。传 null 时才退回构造器既有推导（会话 TUC 已解析成功过 ⇒ 不会新抛）。
+        //   使用 15 参构造器（含 effectiveCwd + inProgressToolUseIDs 槽）—— TUC 无 withEffectiveCwd
+        //   之类后置 wither（批 6 已论证：after-the-fact 改写会留过期 cwd）。
         com.nexusai.application.agent.tool.ToolUseContext forkBaseCtx =
             new com.nexusai.application.agent.tool.ToolUseContext(
-                UUID.randomUUID(), com.nexusai.common.SessionKeys.NO_SESSION,
+                UUID.randomUUID(),
+                com.nexusai.application.agent.compact.fork.RunForkedAgent
+                    .resolveForkSessionId(sessionId, "buildProductionCacheSafeParams"),
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
                 java.util.Map.of(),
                 toolRegistry != null ? toolRegistry.all() : List.of(),
-                "", new AbortController(), List.of());
+                "", new AbortController(), List.of(),
+                null, com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
+                java.util.Map.of(), false, "", sessionCwd, null);
         return new com.nexusai.application.agent.compact.fork.CacheSafeParams(
             List.of(), java.util.Map.of(), java.util.Map.of(), forkBaseCtx, List.of());
     }

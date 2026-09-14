@@ -103,7 +103,7 @@ class SessionMemoryForkSessionModelTest {
         Tool editTool = Mockito.mock(Tool.class);
         Mockito.when(editTool.name()).thenReturn("Edit");
         ToolUseContext supplierCtx = ctx(List.of(editTool), null);
-        svc.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false));
 
         // 会话上下文（LlmAgentLoop hookToolUseContext 等价）: 带本轮真实模型
@@ -135,7 +135,7 @@ class SessionMemoryForkSessionModelTest {
         svc.setReadFileTool(readFileTool());
 
         ToolUseContext supplierCtx = ctx(List.of(), null);
-        svc.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false));
 
         svc.extractSessionMemory(new PostSamplingContext(
@@ -177,7 +177,7 @@ class SessionMemoryForkSessionModelTest {
             () -> supplierProvider, () -> "global-model",
             () -> new ProviderConfig("https://api.ark.volces.com", "sk-global"),
             null, null, resolver));
-        svc.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), ctx(List.of(), null), List.of(), false));
 
         svc.extractSessionMemory(new PostSamplingContext(

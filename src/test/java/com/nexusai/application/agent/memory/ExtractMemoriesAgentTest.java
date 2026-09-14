@@ -766,7 +766,7 @@ class ExtractMemoriesAgentTest {
         agent.setForkedQuery(query);
         // 生产 supplier 形态：三段恒空，仅 toolUseContext 载荷（buildProductionCacheSafeParams）
         ToolUseContext supplierCtx = ctx();
-        agent.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        agent.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false));
         List<ChatMessageDto> messages = List.of(userMsg("m1", "a"), userMsg("m2", "b"));
         ForkRawMaterial raw = new ForkRawMaterial(
@@ -806,7 +806,7 @@ class ExtractMemoriesAgentTest {
         RecordingQuery query = new RecordingQuery();
         agent.setForkedQuery(query);
         ToolUseContext supplierCtx = ctx();
-        agent.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        agent.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of("REAL-ASSEMBLED-PROMPT"),
             Map.of("userKey", "userVal"),
             Map.of("sysKey", "sysVal"),
@@ -842,7 +842,7 @@ class ExtractMemoriesAgentTest {
         ExtractMemoriesAgent agent = new ExtractMemoriesAgent(storage);
         RecordingQuery query = new RecordingQuery();
         agent.setForkedQuery(query);
-        agent.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        agent.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), ctx(), List.of(), false));
         List<ChatMessageDto> messages = List.of(userMsg("m1", "a"), userMsg("m2", "b"));
         ForkRawMaterial raw = new ForkRawMaterial(

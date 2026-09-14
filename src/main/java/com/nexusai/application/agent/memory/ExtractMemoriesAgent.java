@@ -151,15 +151,25 @@ public class ExtractMemoriesAgent {
      */
     private record PendingContext(List<ChatMessageDto> messages,
                                   Consumer<SystemMessage> appendSystemMessage,
-                                  ForkRawMaterial forkRawMaterial) {}
+                                  ForkRawMaterial forkRawMaterial,
+                                  java.nio.file.Path sessionCwd) {}
 
     private final MemoryStorage storage;
 
     // ── 注入 seam ──
     /** fork 查询 seam · 测试注入 RecordingQuery；生产接 LlmAgentLoop queryLoop（R9/IMP-18） */
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
-    /** cache-safe params 供应 · null → createMinimalCacheSafeParams 5 参兜底（RES-C5：systemPrompt/gate 原料由调用方注入） */
-    private volatile Supplier<CacheSafeParams> cacheSafeParamsSupplier;
+    /**
+     * cache-safe params 供应 · <b>[批 7] 形参 = 发起本次 fork 的真实会话 id</b>；
+     * null → createMinimalCacheSafeParams 兜底（RES-C5：systemPrompt/gate 原料由调用方注入）。
+     * 供应器在构造期用该 id 建 {@code CacheSafeParams.toolUseContext}（fork 隔离上下文的 parent，
+     * sessionId 经 {@code ToolUseContext.with(...)} 流遍 fork 工具执行链：file-history 备份目录 /
+     * SessionFilesRecorder 归属 / effectiveCwd 推导）。⛔ 不传 {@code "unknown"} 之类占位；
+     * 确无会话传 {@code null}（供应器侧置哨兵 + ≥WARN）。旧 {@code Supplier} 形态无会话通道
+     * ⇒ 生产 fork 的 TUC sessionId 恒为哨兵（e2e 实证 `file-history/no-session/…`）。
+     */
+    private volatile java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams>
+        cacheSafeParamsSupplier;
     /**
      * firstParty fork 缓存共享 gate 供应 · 兜底（RES-C5）CacheSafeParams 的
      * {@code useGlobalCacheScope} 来源 · CC original: {@code shouldUseGlobalCacheScope()}
@@ -292,7 +302,9 @@ public class ExtractMemoriesAgent {
         this.telemetry = telemetry;
     }
 
-    public void setCacheSafeParamsSupplier(Supplier<CacheSafeParams> supplier) {
+    /** 注入 cache-safe params 供应 · <b>[批 7] 形参 = 真实会话 id</b>（见字段 javadoc）。 */
+    public void setCacheSafeParamsSupplier(
+            java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams> supplier) {
         this.cacheSafeParamsSupplier = supplier;
     }
 
@@ -562,6 +574,31 @@ public class ExtractMemoriesAgent {
                                        String agentId,
                                        String sessionId,
                                        String memoryDir) {
+        // sessionCwd 缺省 null（测试/直构调用方）→ 委托 7 参（供应商侧退回构造器既有推导）
+        executeExtractMemories(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId, memoryDir, null);
+    }
+
+    /**
+     * 异步提取入口 · <b>[批 7] 带「会话已解析 cwd 快照」的生产重载</b>。
+     *
+     * <p><b>WHY 需要 sessionCwd</b>：cache-safe params 供应商（生产
+     * {@code ToolRegistrationConfig.buildProductionCacheSafeParams}）用
+     * {@code (sessionId, sessionCwd)} 在构造期建 fork base {@code ToolUseContext}；
+     * {@code sessionCwd} 必须由**会话线程**算好传下来（同 memoryDir 的理由 —— fork 线程不读
+     * ThreadLocal）。若只传 sessionId 不传 cwd，{@code ToolUseContext} 紧凑构造器会重跑
+     * {@code CwdResolution.getCwd(sessionId)}，而该入口对「会话存在但无绑定项目」fail-loud 抛
+     * （批 4a #7/#13 有意设计）⇒ 会把「cron 显式锚 + 未绑定会话」这条本来能跑的路径变成异常。
+     *
+     * @param sessionCwd 会话已解析 cwd 快照（= 会话 TUC 的 {@code effectiveCwd}）；
+     *                   null = 调用点无该值（测试/直构）⇒ 退回构造器既有推导
+     */
+    public void executeExtractMemories(List<ChatMessageDto> messages,
+                                       Consumer<SystemMessage> appendSystemMessage,
+                                       ForkRawMaterial forkRawMaterial,
+                                       String agentId,
+                                       String sessionId,
+                                       String memoryDir,
+                                       java.nio.file.Path sessionCwd) {
         // [A1 重做] memoryDir null（测试/非主循环调用方走 5 参委托）→ storage.memoryDir() 兜底
         //   （测试 storage Path 冻结安全）；生产 StopHookPipeline 传会话线程解析的 memoryDir。
         // [TL-W1 P2] 兜底改为**显式跳过 + warn**（不再调 storage.memoryDir() 惰性现算）：
@@ -578,7 +615,8 @@ public class ExtractMemoriesAgent {
         // extractor（CC :569-577）：把 promise 登记进 inFlightExtractions，await 后移除。
         // 覆盖完整 trailing-run 链（runExtraction 递归 finally），故 drain 等待它即覆盖尾随轮。
         CompletableFuture<Void> p = CompletableFuture.runAsync(() -> {
-            executeExtractMemoriesImpl(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId, memDir);
+            executeExtractMemoriesImpl(messages, appendSystemMessage, forkRawMaterial, agentId, sessionId, memDir,
+                sessionCwd);
         });
         inFlightExtractions.add(p);
         p.whenComplete((v, e) -> inFlightExtractions.remove(p));
@@ -670,7 +708,8 @@ public class ExtractMemoriesAgent {
                                             ForkRawMaterial forkRawMaterial,
                                             String agentId,
                                             String sessionId,
-                                            String memoryDir) {
+                                            String memoryDir,
+                                            java.nio.file.Path sessionCwd) {
         // 双层防御第二层 · CC extractMemories.ts:531-533 executeExtractMemoriesImpl 入口首个检查
         //   `if (context.toolUseContext.agentId) return` —— 主线程 agentId==null 才执行提取；
         //   未来非 StopHookPipeline 调用方若误传子代理片段，在此拦截不写主会话记忆（[IMP-E-2]）。
@@ -720,13 +759,14 @@ public class ExtractMemoriesAgent {
         // 在跑时 stash 上下文（CC :557-564）· 覆盖旧值，仅最新有用（含最多消息）
         //   [sm-cursor-sessionize] 按会话键控（A 会话 stash 不得被 B 会话尾随轮消费）
         if (Boolean.TRUE.equals(inProgressBySession.get(key))) {
-            pendingContextBySession.put(key, new PendingContext(messages, appendSystemMessage, forkRawMaterial));
+            pendingContextBySession.put(key,
+                new PendingContext(messages, appendSystemMessage, forkRawMaterial, sessionCwd));
             // CC :561 tengu_extract_memories_coalesced（真源行号，任务文本 :156-157 有误）
             emitTelemetry("tengu_extract_memories_coalesced", Map.of());
             log.info("[ExtractMemories] 提取进行中，stash 上下文待尾随轮（coalesced）· CC extractMemories.ts:557-564");
             return;
         }
-        runExtraction(messages, appendSystemMessage, forkRawMaterial, false, sessionId, memoryDir);
+        runExtraction(messages, appendSystemMessage, forkRawMaterial, false, sessionId, memoryDir, sessionCwd);
     }
 
     // ── 核心 · 对齐 CC runExtraction（extractMemories.ts:329-523）──
@@ -763,7 +803,8 @@ public class ExtractMemoriesAgent {
                                         ForkRawMaterial forkRawMaterial,
                                         boolean isTrailingRun,
                                         String sessionId,
-                                        String memoryDir) {
+                                        String memoryDir,
+                                        java.nio.file.Path sessionCwd) {
         String key = cursorKey(sessionId);
         if (messages == null || messages.isEmpty()) {
             if (log.isDebugEnabled()) {
@@ -850,7 +891,11 @@ public class ExtractMemoriesAgent {
             //   forkContextMessages = 本轮消息快照（messages · CC context.messages）。T9 修复
             //   空载荷（ToolRegistrationConfig:1468-1469）→ fork 恢复主系统提示 + prompt-cache
             //   key 与主线程一致（cache 共享恢复）。null 原料（非主循环调用方）→ 既有兜底不变。
-            CacheSafeParams supplied = cacheSafeParamsSupplier != null ? cacheSafeParamsSupplier.get() : null;
+            // [批 7] `sessionId`（本方法形参，源自会话线程 → StopHookPipeline:312 透传）
+            //   在供应器**构造期**建 fork base TUC（真的会话 id；null ⇒ 哨兵 + ≥WARN）。
+            //   ⛔ 不传 cursorKey(sessionId) 的 "unknown" —— 那是游标键占位、不是会话键。
+            CacheSafeParams supplied = cacheSafeParamsSupplier != null
+                ? cacheSafeParamsSupplier.apply(sessionId, sessionCwd) : null;
             CacheSafeParams cacheSafeParams = supplied != null
                 ? new CacheSafeParams(
                     ForkRawMaterial.mergeSystemPrompt(supplied.systemPrompt(),
@@ -1015,7 +1060,7 @@ public class ExtractMemoriesAgent {
             if (trailing != null) {
                 log.info("[ExtractMemories] 运行尾随提取（stashed 上下文）· CC extractMemories.ts:510-521");
                 runExtraction(trailing.messages(), trailing.appendSystemMessage(),
-                    trailing.forkRawMaterial(), true, sessionId, memoryDir);
+                    trailing.forkRawMaterial(), true, sessionId, memoryDir, trailing.sessionCwd());
             }
         }
     }

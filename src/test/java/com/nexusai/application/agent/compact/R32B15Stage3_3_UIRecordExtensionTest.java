@@ -13,6 +13,7 @@ import com.nexusai.application.agent.tool.SystemMessage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.lang.reflect.Constructor;
 import java.time.Instant;
@@ -37,7 +38,8 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  *   <li>MessageSelector defensive copy (null options → 空不可变 List)</li>
  *   <li>10 UI callback 默认 non-null + noop (compact ctor 兜底)</li>
  *   <li>45 参 canonical 注入 10 UI callback</li>
- *   <li>4/5/6/8/10/11/12/13/15/17/21/31 参数构造器 delegation 全部存在</li>
+ *   <li>4/5/6/8/10/11/12/13/15/17/18/21/31/45/46 参数构造器 delegation 全部存在
+ *       （[批 7 结构性锁重锚] sessionId 形参类型按实测 = {@code String} 校正，旧写 {@code UUID} 恒红）</li>
  *   <li>17 参 canonical 构造器保留 (C2 字段默认 null)</li>
  *   <li>21 参 canonical 构造器保留 (UI 字段默认 null)</li>
  *   <li>Jackson 序列化不暴露 10 UI callback</li>
@@ -240,49 +242,53 @@ class R32B15Stage3_3_UIRecordExtensionTest {
     // ═══════════════════ 旧构造器 delegation 全部存在 ═══════════════════
 
     @Test
-    @DisplayName("旧构造器 delegation: 4/5/6/8/10/11/12/13/15/17/21/31 参数构造器全部存在")
+    @DisplayName("旧构造器 delegation: 4/5/6/8/10/11/12/13/15/17/18/21/31/45/46 参数构造器全部存在")
     void testOld4Through32ParamConstructors() throws Exception {
+        // ⚠️ [批 7 结构性锁重锚 2026-09-14] 第 2 个形参是 **sessionId**（{@code String}），
+        //   旧断言写 {@code UUID.class} ⇒ {@code getConstructor} 精确匹配失败 ⇒ 基线即红
+        //   （实测 NoSuchMethodException: <init>(UUID, UUID, PermissionMode, Map)；
+        //   javap 实测签名 = (UUID, String, PermissionMode, Map)）。此处按**实测签名**校正。
         // 4 参 (Stage 3.1 早期)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class)).isNotNull();
+            UUID.class, String.class, PermissionMode.class, Map.class)).isNotNull();
         // 5 参 (s12 方案 C availableTools)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class)).isNotNull();
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class)).isNotNull();
         // 6 参 (s12-2.3 taskListId)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class)).isNotNull();
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class)).isNotNull();
         // 8 参 (Phase 2 PR 1 messages + abortController)
         Class<?> abortControllerCls = Class.forName("com.nexusai.application.agent.tool.AbortController");
         Class<?> permissionCtxCls = Class.forName("com.nexusai.application.agent.permission.ToolPermissionContext");
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class)).isNotNull();
         // 10 参 (Phase 2 PR 1 permissionContext + permissionMode)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class)).isNotNull();
         // 11 参 (Stage 3.1 P1.3 mcpClients)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class)).isNotNull();
         // 12 参 (P1.3 isNonInteractiveSession)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class)).isNotNull();
         // 13 参 (P1.3 renderedSystemPrompt)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class, String.class)).isNotNull();
         // 15 参 (Phase A + R32-b8 #3 effectiveCwd + inProgressToolUseIDs)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class, String.class,
@@ -290,7 +296,7 @@ class R32B15Stage3_3_UIRecordExtensionTest {
             Class.forName("java.util.function.Function"))).isNotNull();
         // 17 参 (Stage 3.1 C13 toolDecisions + onCompactProgress)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class, List.class, String.class,
+            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class, String.class,
@@ -298,12 +304,18 @@ class R32B15Stage3_3_UIRecordExtensionTest {
             Class.forName("java.util.function.Function"),
             Map.class,
             Class.forName("java.util.function.Consumer"))).isNotNull();
+        // 18 参 (L+ R1 readFileState 兼容构造器 · 缺 fileReadingLimits 等后续字段)
+        assertThat(findConstructorWithCount(ToolUseContext.class, 18))
+            .as("18-param constructor (L+ R1 readFileState) must exist").isNotNull();
         // 21 参 (Stage 3.2 C2 4 字段)
         Constructor<?> c21 = findConstructorWithCount(ToolUseContext.class, 21);
         assertThat(c21).as("21-param constructor (Stage 3.2 C2) must exist").isNotNull();
         // 31 参 (Stage 3.3 UI 10 字段)
         Constructor<?> c31 = findConstructorWithCount(ToolUseContext.class, 31);
         assertThat(c31).as("31-param constructor (Stage 3.3 UI) must exist").isNotNull();
+        // 45 参 (MCP-I-9 Q-30 兼容构造器 · 缺 mcpServerConnections)
+        assertThat(findConstructorWithCount(ToolUseContext.class, 45))
+            .as("45-param constructor (MCP-I-9 Q-30) must exist").isNotNull();
         // 46 参 (Stage 3.4 session 13 + L+ R1 readFileState 1)
         // [Session J 方案 A] querySource / assistantMessage 已从 ToolUseContext 顶层撤回.
         Constructor<?> c46 = findConstructorWithCount(ToolUseContext.class, 46);
@@ -448,7 +460,7 @@ class R32B15Stage3_3_UIRecordExtensionTest {
         java.util.function.Consumer<SpinnerMode> setStreamMode = m -> {};
         java.util.function.Consumer<SDKStatus> setSDKStatus = s -> {};
 
-        // 32 参构造器重建: C2 + UI 都透传
+        // 31 参构造器重建: C2 + UI 都透传（[批 7] 实测形参个数 = 17 头 + 4 C2 + 10 UI = 31）
         ToolUseContext ctx = new ToolUseContext(
             AGENT_ID, SESSION_ID, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", null, List.of(),
@@ -472,65 +484,53 @@ class R32B15Stage3_3_UIRecordExtensionTest {
     }
 
     @Test
-    @DisplayName("关键修复验证: base TUC 装配必须保留 4 C2 callback (不能传 null, 修复 7ca bug)")
+    @DisplayName("关键修复验证: base TUC 装配必须保留 4 C2 callback（**功能接线**真跑 · 7ca bug 不回归）")
     void testToolUseContextWithUiPreservesC2Callbacks() throws Exception {
-        // 关键回归测试: 验证 7ca43ab commit 修复的 null C2 bug 不再回归
+        // 关键回归测试: 验证 7ca43ab commit 修复的 null C2 bug 不再回归。
         // [H7-arch Phase 5-2 P3-⑤] toolUseContextWithUi 已 static 化/删除；C2 4 callback 注入
-        // 移至 LlmAgentLoop.buildBaseToolUseContext（base TUC 装配，run() 入口一次）。经源码扫描
-        // 验证 buildBaseToolUseContext 显式注入 4 C2 lambda 而非传 null。
+        // 移至 LlmAgentLoop.buildBaseToolUseContext（base TUC 装配，run() 入口一次）。
+        //
+        // ⭐ [批 7 重锚 2026-09-14] 旧实现对本文件做**源码字面扫描**
+        //   （new FileReader("src/main/java/…LlmAgentLoop.java") + contains("getAppStateSnapshot")）
+        //   —— 零鉴别力：实现被改成 noop / 字符串留在注释里 / 断言串出现在别处，都照样绿。
+        //   现改为**真跑**：构造真实 LlmAgentLoop，反射调用真实 buildBaseToolUseContext(state)，
+        //   再对 4 个 C2 回调做 **功能往返断言**（写进 loop 状态 ⇒ 从 TUC 读回来）。
+        //   ⛔ 只断言「非 null」鉴别不出 7ca bug —— TUC 紧凑构造器对 null 回调会兜底成 noop
+        //   （见本类 test17ParamCanonicalConstructor: ctx.getAppState() isNotNull），故必须功能断言。
+        com.nexusai.application.agent.LlmAgentLoop loop =
+            new com.nexusai.application.agent.LlmAgentLoop(
+                Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class));
+        com.nexusai.application.agent.AgentState state =
+            new com.nexusai.application.agent.AgentState("sys", SESSION_ID, null);
         java.lang.reflect.Method method = com.nexusai.application.agent.LlmAgentLoop.class
             .getDeclaredMethod("buildBaseToolUseContext", com.nexusai.application.agent.AgentState.class);
-        assertThat(method)
-            .as("buildBaseToolUseContext 必须存在（base TUC 装配 · P3-⑤ 替代 toolUseContextWithUi）")
-            .isNotNull();
-        java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(
-            "src/main/java/com/nexusai/application/agent/LlmAgentLoop.java"));
-        StringBuilder content = new StringBuilder();
-        String line;
-        boolean inMethod = false;
-        while ((line = reader.readLine()) != null) {
-            if (line.contains("private ToolUseContext buildBaseToolUseContext(AgentState state)")) {
-                inMethod = true;
-            }
-            if (inMethod) {
-                content.append(line).append("\n");
-                if (line.contains("return new ToolUseContext(") && content.toString().contains("getAppStateSnapshot")) {
-                    break;
-                }
-            }
-        }
-        reader.close();
-        String methodBody = content.toString();
-        // 关键不变量: 4 个 C2 callback 必须显式注入, 不能传 null
-        assertThat(methodBody)
-            .as("buildBaseToolUseContext must preserve 4 C2 callbacks via explicit lambda, not null")
-            .contains("getAppStateSnapshot");
-        assertThat(methodBody).contains("setAppState(updater)");
-        assertThat(methodBody).contains("setStreamMode(sm)");
-        assertThat(methodBody).contains("setSDKStatus(sdk)");
-        // 验证 4 个 null 没有出现在 C2 位置 (注释除外)
-        // 截取 "return new ToolUseContext(" 之后到 "openMessageSelector" 之间的字段
-        int startIdx = methodBody.indexOf("return new ToolUseContext(");
-        int endIdx = methodBody.indexOf("openMessageSelector");
-        if (startIdx >= 0 && endIdx > startIdx) {
-            String c2Region = methodBody.substring(startIdx, endIdx);
-            // C2 4 字段必须以 lambda 形式出现, 不能 4 个连续 null
-            int nullC2Count = 0;
-            // 数 "null, null, null, null" 模式 - 4 个连续 null 是 7ca 历史 bug 的标志
-            int lastNullEnd = 0;
-            while ((lastNullEnd = c2Region.indexOf("null, null, null, null", lastNullEnd)) >= 0) {
-                // 排除出现在注释中的 (前面有 // 注释行)
-                int lineStart = c2Region.lastIndexOf("\n", lastNullEnd);
-                String lineBefore = c2Region.substring(lineStart, lastNullEnd);
-                if (!lineBefore.contains("//") && !lineBefore.contains("*")) {
-                    nullC2Count++;
-                }
-                lastNullEnd += 1;
-            }
-            assertThat(nullC2Count)
-                .as("4 consecutive null in C2 region indicates the 7ca bug regression")
-                .isZero();
-        }
+        method.setAccessible(true);
+        ToolUseContext base = (ToolUseContext) method.invoke(loop, state);
+        assertThat(base)
+            .as("base TUC 必须可装配（非空 sessionId ⇒ 非 null）").isNotNull();
+
+        // ① getAppState / setAppState：写进 loop 的 appState ⇒ 从 TUC 读回（noop 兜底则读不到）
+        base.setAppState().accept(prev -> {
+            java.util.Map<String, Object> next = new java.util.HashMap<>(prev);
+            next.put("c2Probe", "wired");
+            return next;
+        });
+        assertThat(loop.getAppStateSnapshot())
+            .as("C2 setAppState 必须真的写入 loop 状态（传 null ⇒ 兜底 noop ⇒ 本断言红）")
+            .containsEntry("c2Probe", "wired");
+        assertThat(base.getAppState().apply(java.util.Map.of()))
+            .as("C2 getAppState 必须真的读 loop 状态快照（而非 noop 恒空 Map）")
+            .containsEntry("c2Probe", "wired");
+
+        // ② setStreamMode：默认 RESPONDING ⇒ 接受 REQUESTING 必须落地到 loop 字段
+        base.setStreamMode().accept(SpinnerMode.REQUESTING);
+        assertThat(loop.getStreamMode())
+            .as("C2 setStreamMode 必须真的写入 loop 字段").isEqualTo(SpinnerMode.REQUESTING);
+
+        // ③ setSDKStatus：默认 NULL ⇒ 接受 COMPACTING 必须落地到 loop 字段
+        base.setSDKStatus().accept(SDKStatus.COMPACTING);
+        assertThat(loop.getSDKStatus())
+            .as("C2 setSDKStatus 必须真的写入 loop 字段").isEqualTo(SDKStatus.COMPACTING);
     }
 
     // ═══════════════════ 额外 1 测试: callback 触发不写 outbound DTO ═══════════════════

@@ -24,6 +24,8 @@ import java.lang.reflect.Field;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * IMP-M-P0-3 · 三组件 @Bean 生产接线测试（DEL-M-48 @Autowired(required=false) 恒 null 消除）。
@@ -43,6 +45,20 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ToolRegistrationConfigMemoryBeansTest {
 
     private final ToolRegistrationConfig config = new ToolRegistrationConfig();
+
+    /** [批 7] 供应器形参（真实会话 id）测试夹具 —— 形态同生产会话键（{@code sess-} + 8hex）。 */
+    private static final String MEM_BEANS_SESSION = "sess-abcdef12";
+
+    /** [批 7] 供应器第二形参夹具（会话已解析 cwd 快照）。 */
+    private static final java.nio.file.Path MEM_BEANS_CWD =
+        java.nio.file.Path.of("C:/probe/session-cwd");
+
+    /** [批 7] **DB 认得但无绑定项目**的会话 id（fail-loud 判据三态之 unbound）。 */
+    private static final String KNOWN_UNBOUND = "sess-known-unbound";
+
+    /** [批 7] **DB 不认得**的会话 id（走 CwdResolution unknown 出口 / 或触发 fail-loud）——
+     *  用于证明「构造期显式 cwd ⇒ 不重跑解析」。 */
+    private static final String UNBOUND_SESSION = "sess-unbound99";
 
     @Test
     @DisplayName("SessionMemoryService/ExtractMemoriesAgent/AutoDreamConsolidator @Bean 存在且可构造 + 生产 fork seam 注入")
@@ -108,17 +124,36 @@ class ToolRegistrationConfigMemoryBeansTest {
         assertThat(readField(sm, "forkedQuery")).isSameAs(queryLoopFork);
         assertThat(readField(sm, "cacheSafeParamsSupplier")).isNotNull();
         @SuppressWarnings("unchecked")
-        java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams> smSup =
-            (java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams>)
+        java.util.function.BiFunction<String, java.nio.file.Path,
+                com.nexusai.application.agent.compact.fork.CacheSafeParams> smSup =
+            (java.util.function.BiFunction<String, java.nio.file.Path,
+                com.nexusai.application.agent.compact.fork.CacheSafeParams>)
                 readField(sm, "cacheSafeParamsSupplier");
-        assertThat(smSup.get().toolUseContext()).as("SM 生产 cacheSafeParamsSupplier 携带主线程工具集").isNotNull();
-        // [批 6] 生产 supplier 载荷（buildProductionCacheSafeParams）求值时刻**结构上拿不到会话**
-        //   （形参只有 ToolRegistry）⇒ sessionId 必须是显式「确无会话」哨兵，
-        //   ⛔ 不得是旧实现的 "sess-"+UUID 假会话键（它会成为 fork 的 parent ctx 会话身份）。
-        assertThat(smSup.get().toolUseContext().sessionId())
-            .as("生产 supplier 的 fork 上下文必须用哨兵，⛔ 不得伪造会话键")
+        assertThat(smSup.apply(MEM_BEANS_SESSION, MEM_BEANS_CWD).toolUseContext())
+            .as("SM 生产 cacheSafeParamsSupplier 携带主线程工具集").isNotNull();
+        // [批 7 2026-09-14 · 修掉批 6 遗留的会话丢失] 供应器形参 = 真实会话 id，且必须**在构造期**
+        //   进入 fork 基础上下文（该 TUC 是 fork 隔离上下文的 parent；sessionId 经
+        //   ToolUseContext.with(...) 流遍 fork 工具执行链 → file-history 备份目录 /
+        //   SessionFilesRecorder 归属；effectiveCwd 也由它构造期推出）。
+        //   批 6 形态（Supplier 无形参）⇒ 生产 fork 的 TUC sessionId 恒为哨兵，
+        //   e2e 实证 `{configHome}/file-history/no-session/…`。
+        assertThat(smSup.apply(MEM_BEANS_SESSION, MEM_BEANS_CWD).toolUseContext().sessionId())
+            .as("生产 supplier 的 fork 上下文必须带**传入的真实会话 id**")
+            .isEqualTo(MEM_BEANS_SESSION);
+        // ⛔ 不得伪造：确无会话（传 null）时只允许显式哨兵，绝不允许 "sess-"+UUID 假会话键。
+        assertThat(smSup.apply(null, null).toolUseContext().sessionId())
+            .as("确无会话（null）⇒ 显式哨兵，⛔ 不得伪造会话键")
             .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION)
             .doesNotStartWith("sess-");
+        // [批 7 · 第二形参] 会话**已解析 cwd 快照**必须**在构造期**写入 fork base TUC：
+        //   ⛔ 不传的话 ToolUseContext 紧凑构造器会重跑 CwdResolution.getCwd(sessionId)，
+        //   而该入口对「会话存在但无绑定项目」是 fail-loud 抛（批 4a 有意设计）⇒ 会把
+        //   「cron 显式锚 + 未绑定会话」这条本来能跑的路径变成异常（未登记的行为变更）。
+        //   ⭐ 本断言用**未注册的会话 id**做正向对照：若构造器改回自行推导，就会抛
+        //   IllegalStateException/或落 user.dir —— 两者都让本断言变红。
+        assertThat(smSup.apply(UNBOUND_SESSION, MEM_BEANS_CWD).toolUseContext().effectiveCwd())
+            .as("已解析 cwd 必须在构造期生效（不重跑 CwdResolution）")
+            .isEqualTo(MEM_BEANS_CWD);
 
         // OPD-TP-09: dream task registry 接线（register/addDreamTurn/complete/fail/kill）——
         //   @Bean 注入必须真实生效（非假接线），且 kill 的锁回退 seam 已注入 registry
@@ -130,10 +165,12 @@ class ToolRegistrationConfigMemoryBeansTest {
         // cacheSafeParamsSupplier 携带主线程工具集（fork 需真实工具数组，createMinimalCacheSafeParams
         //   兜底是空工具集 → 模型无法调工具）。断言 supplier 求值后 toolUseContext.availableTools 非空。
         assertThat(readField(extract, "cacheSafeParamsSupplier")).isNotNull();
-        java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams> sup =
-            (java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams>)
+        java.util.function.BiFunction<String, java.nio.file.Path,
+                com.nexusai.application.agent.compact.fork.CacheSafeParams> sup =
+            (java.util.function.BiFunction<String, java.nio.file.Path,
+                com.nexusai.application.agent.compact.fork.CacheSafeParams>)
                 readField(extract, "cacheSafeParamsSupplier");
-        assertThat(sup.get().toolUseContext()).isNotNull();
+        assertThat(sup.apply(MEM_BEANS_SESSION, MEM_BEANS_CWD).toolUseContext()).isNotNull();
     }
 
     @Test
@@ -189,12 +226,66 @@ class ToolRegistrationConfigMemoryBeansTest {
             new com.nexusai.application.agent.telemetry.Telemetry(),
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED);
         @SuppressWarnings("unchecked")
-        java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams> sup =
-            (java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams>)
+        java.util.function.BiFunction<String, java.nio.file.Path,
+                com.nexusai.application.agent.compact.fork.CacheSafeParams> sup =
+            (java.util.function.BiFunction<String, java.nio.file.Path,
+                com.nexusai.application.agent.compact.fork.CacheSafeParams>)
                 readField(extract, "cacheSafeParamsSupplier");
-        ToolUseContext ctx = sup.get().toolUseContext();
+        ToolUseContext ctx = sup.apply(MEM_BEANS_SESSION, MEM_BEANS_CWD).toolUseContext();
         assertThat(ctx).isNotNull();
         assertThat(ctx.availableTools()).isNotEmpty();
+    }
+
+    @Test
+    @DisplayName("[批 7] cron 显式锚 + 未绑定会话：供应商带已解析 cwd ⇒ **不重跑 CwdResolution** ⇒ 不抛")
+    void productionCacheSafeParams_explicitCwd_avoidsCwdResolutionThrow() {
+        // WHY（规则九 + 用户 2026-09-14 裁定）：批 4a 把「DB 认得该会话但无绑定项目」定为 fail-loud
+        //   （有意设计）。但本批起 fork base TUC 开始携带**真实 sessionId** ⇒ 若不同时显式传入
+        //   会话已解析 cwd，ToolUseContext 紧凑构造器会对该 id 重跑 CwdResolution.getCwd ⇒ 抛 ⇒
+        //   「cron 显式锚（LlmAgentLoop:9824 → 构造期 effectiveCwd 直传） + 未绑定会话」这条
+        //   **本来能跑**的路径变成异常，属**未登记的行为变更**。本用例把该场景钉死。
+        // 构造「会话存在但无绑定项目」的 DB 回源三态（判据同 CwdResolutionTest:knownSessionWithoutBinding_failsLoud）
+        com.nexusai.common.SessionProjectRoot.setDbResolver(
+            sid -> com.nexusai.common.SessionProjectRoot.Lookup.unbound());
+        try {
+            ToolRegistry populated = ToolRegistry.from(java.util.List.of(new NoOpTool("Read")));
+            ExtractMemoriesAgent extract = config.extractMemoriesAgent(
+                config.memoryStorage(com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()),
+                populated,
+                config.productionForkedQuery(
+                    Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
+                    populated, null, null, null, null),
+                queryLoopForkBean(),
+                new com.nexusai.application.agent.telemetry.Telemetry(),
+                com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED);
+            @SuppressWarnings("unchecked")
+            java.util.function.BiFunction<String, java.nio.file.Path,
+                    com.nexusai.application.agent.compact.fork.CacheSafeParams> sup =
+                (java.util.function.BiFunction<String, java.nio.file.Path,
+                    com.nexusai.application.agent.compact.fork.CacheSafeParams>)
+                    readField(extract, "cacheSafeParamsSupplier");
+
+            // ① 场景成立性（正向对照）：该会话状态下解析入口**必抛** —— 证明「不抛」不是恒真
+            assertThatThrownBy(() -> com.nexusai.application.agent.agent.CwdResolution.getCwd(KNOWN_UNBOUND))
+                .as("该会话状态下 CwdResolution.getCwd 必抛（批 4a fail-loud 设计）")
+                .isInstanceOf(IllegalStateException.class);
+
+            // ② 被测腿：带已解析 cwd（= 会话 TUC 快照）⇒ 构造期不再解析 ⇒ 不抛，且 cwd 与 sessionId 均生效
+            assertThatCode(() -> sup.apply(KNOWN_UNBOUND, MEM_BEANS_CWD))
+                .as("显式 cwd ⇒ 供应商不重跑 CwdResolution ⇒ 不抛")
+                .doesNotThrowAnyException();
+            assertThat(sup.apply(KNOWN_UNBOUND, MEM_BEANS_CWD).toolUseContext().effectiveCwd())
+                .as("构造期显式 cwd 必须生效").isEqualTo(MEM_BEANS_CWD);
+            assertThat(sup.apply(KNOWN_UNBOUND, MEM_BEANS_CWD).toolUseContext().sessionId())
+                .as("同一 TUC 的会话身份仍是真实 id").isEqualTo(KNOWN_UNBOUND);
+
+            // ③ 反向对照：cwd=null（漏传 / 旧形态）⇒ 退回推导 ⇒ 抛（= 若不传 cwd 会引入的回归）
+            assertThatThrownBy(() -> sup.apply(KNOWN_UNBOUND, null))
+                .as("cwd=null ⇒ 退回 CwdResolution 推导 ⇒ 抛（本用例的区分力来源）")
+                .isInstanceOf(IllegalStateException.class);
+        } finally {
+            com.nexusai.common.SessionProjectRoot.setDbResolver(null);
+        }
     }
 
     /** 简单测试工具 · 仅验证工具集透传，不执行。 */

@@ -23,7 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>覆盖范围:
  * <ul>
- *   <li>reflection 验证 45 字段顺序 (canonical 顺序表)</li>
+ *   <li>reflection 验证 record components <b>存在性 + 相对顺序</b>（canonical 顺序不变量，
+ *       [批 7 结构性锁重锚] 取代旧「总数 == 46」数字锁；见 {@link #recordComponentOrder()})</li>
  *   <li>所有新增 callback/session 字段均 {@code @JsonIgnore} (BudgetTracker local-only 约束)</li>
  *   <li>4 个 Set 默认空可变 (CC 工具可 .add()/.clear())</li>
  *   <li>Jackson 序列化不暴露 27 个新字段 (4 C2 + 10 UI + 13 session)</li>
@@ -35,18 +36,76 @@ class R32B15Stage3_4_SessionDimensionTest {
     private static final UUID AGENT_ID = UUID.randomUUID();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
+    /**
+     * [批 7 结构性锁重锚 2026-09-14] canonical record components 顺序表
+     * （= 2026-09-14 实测 `getRecordComponents()` 输出，52 项）。
+     *
+     * <p>⛔ 本表是「顺序基线」，不是「字段总数锁」—— 断言用 {@code containsSubsequence}
+     * （存在性 + 相对顺序），**新增字段不会让本锁变红**；只有
+     * <b>改名 / 删除 / 重排</b>既有组件才会红。
+     * 新增字段时请把新名按实际位置插进本表（保持表与实测一致）。
+     */
+    private static final List<String> EXPECTED_CANONICAL_ORDER = List.of(
+        // 1-17 既有字段
+        "agentId", "sessionId", "mode", "additionalWorkingDirectories", "availableTools",
+        "taskListId", "abortController", "messages", "permissionContext", "permissionMode",
+        "mcpClients", "isNonInteractiveSession", "renderedSystemPrompt", "effectiveCwd",
+        "inProgressToolUseIDs", "toolDecisions", "onCompactProgress",
+        // 18-21 Stage 3.2 C2 4 字段
+        "getAppState", "setAppState", "setStreamMode", "setSDKStatus",
+        // 22-31 Stage 3.3 UI 10 字段
+        "addNotification", "appendSystemMessage", "sendOSNotification", "setResponseLength",
+        "setHasInterruptibleToolInProgress", "updateFileHistoryState", "updateAttributionState",
+        "setConversationId", "setToolJSX", "openMessageSelector",
+        // 32-44 Stage 3.4 session 13 字段
+        "userModified", "nestedMemoryAttachmentTriggers", "loadedNestedMemoryPaths",
+        "dynamicSkillDirTriggers", "discoveredSkillNames", "agentType", "requireCanUseTool",
+        "preserveToolUseResults", "localDenialTracking", "contentReplacementState",
+        "queryTracking", "toolUseId", "criticalSystemReminder_EXPERIMENTAL",
+        // 45 [Session L+ R1] readFileState
+        "readFileState",
+        // 46 [MCP-I-9 Q-30] mcpServerConnections
+        "mcpServerConnections",
+        // 47 [OPD-D1-01] fileReadingLimits
+        "fileReadingLimits",
+        // 48-49 [openai-lazy] effectiveModelName / effectiveProviderType
+        "effectiveModelName", "effectiveProviderType",
+        // 50-51 [tuc-subagent-identity] subagentName / isBuiltIn
+        "subagentName", "isBuiltIn",
+        // 52 [批 5b-1] agentContext
+        "agentContext");
+
+    /** record components 名（canonical 顺序 · {@code getRecordComponents()} 规范保证顺序）。 */
+    private static List<String> componentNames() {
+        return java.util.Arrays.stream(ToolUseContext.class.getRecordComponents())
+            .map(java.lang.reflect.RecordComponent::getName)
+            .toList();
+    }
+
+    /**
+     * [批 7 结构性锁重锚] 存在性 + 相对顺序锁 —— 取代旧「非 static 字段数 == 46」数字锁。
+     *
+     * <p><b>WHY 不再数总数</b>：ToolUseContext 是 per-turn 装配的会话载体，字段<b>持续增长</b>
+     * （Stage 3.2 C2 4 / Stage 3.3 UI 10 / Stage 3.4 session 13 / L+ R1 readFileState /
+     * MCP-I-9 mcpServerConnections / OPD-D1-01 fileReadingLimits / openai-lazy 2 /
+     * tuc-subagent-identity 2 / 批 5b-1 agentContext）。旧断言每加一个字段必红 ⇒
+     * <b>基线即红、永远不可能绿</b>（2026-09-14 实测：期望 46 / 实测 52），
+     * 红是噪音而非信号 ⇒ 锁失去守护意义（这正是它被重锚的原因）。
+     *
+     * <p><b>WHY 仍必须锁顺序</b>：canonical 构造器是<b>位置参数</b>的（52 参），而组件中存在
+     * <b>相邻同型</b>组 —— 3 个 {@code Map}（{@code localDenialTracking} /
+     * {@code contentReplacementState} / {@code queryTracking}）、2 个 {@code boolean}
+     * （{@code requireCanUseTool} / {@code preserveToolUseResults}）—— 重排/互换时
+     * <b>编译器不报错</b>（位置参数类型仍匹配）而语义静默互换。故本锁守的是
+     * 「既有组件名都在，且相对顺序不变」；<b>新增</b>组件（追加或插段）不应使锁变红。
+     */
     @Test
-    @DisplayName("46 record components 顺序 reflection 验证: 45 既有 + 1 MCP-I-9 mcpServerConnections")
+    @DisplayName("record components 存在性 + 相对顺序锁（canonical 顺序不变量 · 新增字段不误报）")
     void recordComponentOrder() {
-        Field[] fields = ToolUseContext.class.getDeclaredFields();
-        // record components 数量必须 = 46 (排除 2 个 static final 常量: READ_FILE_STATE_CACHE_SIZE + DEFAULT_MAX_CACHE_SIZE_BYTES)
-        // [Session J 方案 A] 撤回 E session 错加的 querySource + assistantMessage 顶层字段, 对齐 CC 真源.
-        // [Session L+ R1 readFileState: 1 field, 严格对齐 CC QueryEngine.ts:191 + runAgent.ts:705]
-        // [MCP-I-9 Q-30] mcpServerConnections: 1 field（子代理连接继承，CC runAgent.ts:653-685）
-        long recordComponentCount = java.util.Arrays.stream(fields)
-            .filter(f -> !java.lang.reflect.Modifier.isStatic(f.getModifiers()))
-            .count();
-        assertThat(recordComponentCount).isEqualTo(46L);
+        assertThat(componentNames())
+            .as("record components 必须包含既有全部组件且相对顺序不变"
+                + "（改名/删除/重排 ⇒ 红；纯新增 ⇒ 绿）")
+            .containsSubsequence(EXPECTED_CANONICAL_ORDER);
     }
 
     @Test

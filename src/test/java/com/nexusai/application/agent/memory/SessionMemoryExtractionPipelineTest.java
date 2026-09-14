@@ -271,7 +271,7 @@ class SessionMemoryExtractionPipelineTest {
             UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
-        svc.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierCtx, List.of()));
         // firstParty gate 注入（GlobalCacheScope 单实现消费方）
         svc.setUseGlobalCacheScopeSupplier(() -> true);
@@ -301,6 +301,105 @@ class SessionMemoryExtractionPipelineTest {
     }
 
     @Test
+    @DisplayName("[批 7] 生产 supplier 分支：fork 基础上下文必须带**发起会话的真实 sessionId**（不再 no-session 哨兵）")
+    void extractSessionMemory_suppliedBranch_carriesRealSessionId() {
+        // WHY (规则九): 批 6 加了「确无会话」哨兵后，e2e 暴露出生产 fork 的会话身份是
+        //   `no-session` —— 现象：fork 内 Edit 写的 `…/sess-0b86aab3/session-memory/summary.md`
+        //   其 file-history 备份落 `{configHome}/file-history/no-session/…`、
+        //   SessionFilesRecorder 记 `sessionId=no-session`。根因不在下游，而在**生产 supplier
+        //   的构造点拿不到会话**（形参只有 ToolRegistry ⇒ 恒填哨兵），fork 基础上下文经
+        //   RunForkedAgent.createIsolatedContext → ToolUseContext.with(...) 的 this.sessionId()
+        //   把该身份流遍 fork 工具执行链（备份目录 / 改动文件归属 / effectiveCwd 构造期推导）。
+        //   本用例锁定改后契约：**消费方把发起会话的真实 id 交给供应器**，且该 id 在构造期
+        //   进入 fork 基础上下文 —— 即「fork 的工具执行链拿到的会话身份 = 发起会话」。
+        RecordingQuery query = new RecordingQuery();
+        SessionMemoryService svc = new SessionMemoryService(baseDir);
+        svc.setForkedQuery(query);
+        svc.setSessionMemoryFeatureEnabled(true);
+        svc.setReadFileTool(readFileTool());
+        java.util.concurrent.atomic.AtomicReference<String> sidSeenBySupplier =
+            new java.util.concurrent.atomic.AtomicReference<>("<供应器未被调用>");
+        java.util.concurrent.atomic.AtomicReference<java.nio.file.Path> cwdSeenBySupplier =
+            new java.util.concurrent.atomic.AtomicReference<>();
+        // 生产等价 supplier（ToolRegistrationConfig.buildProductionCacheSafeParams 新形态）：
+        // 用**收到的**会话 id + 已解析 cwd 在构造期建 fork base 上下文（构造参数，非事后改写）。
+        svc.setCacheSafeParamsSupplier((sessionId, cwd) -> {
+            sidSeenBySupplier.set(sessionId);
+            cwdSeenBySupplier.set(cwd);
+            return new CacheSafeParams(List.of(), Map.of(), Map.of(),
+                new ToolUseContext(UUID.randomUUID(),
+                    RunForkedAgent.resolveForkSessionId(sessionId, "pipeline-test-supplier"),
+                    com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
+                    Map.of(), List.of(), "", AbortController.NOOP, List.of()),
+                List.of());
+        });
+        ToolUseContext tuc = baseContext();   // 会话 TUC（真实 sessionId 在它身上）
+        PostSamplingContext ctx = new PostSamplingContext(
+            List.of(asst("a1", 12000, List.of())), List.of("SYS"), Map.of(), Map.of(),
+            tuc, QuerySource.REPL_MAIN_THREAD);
+
+        svc.extractSessionMemory(ctx);
+
+        assertThat(query.captured).isNotNull();
+        // 正向对照 (1)：消费方交给供应器的 id = 会话 TUC 的 sessionId（不是 null、不是 "unknown"）
+        assertThat(sidSeenBySupplier.get())
+            .as("供应器必须收到发起会话的真实 id（来源 = psContext.toolUseContext().sessionId()）")
+            .isEqualTo(tuc.sessionId());
+        // 正向对照 (2)：该 id 穿过隔离 clone 到达 fork（即 fork 工具执行链的会话身份）
+        assertThat(query.captured.toolUseContext().sessionId())
+            .as("fork 基础上下文的会话身份必须是发起会话")
+            .isEqualTo(tuc.sessionId());
+        // 正向对照 (3)：会话**已解析 cwd 快照**必须一起传给供应器（= 会话 TUC 的 effectiveCwd）；
+        //   ⛔ 漏传 ⇒ 构造器会重跑 CwdResolution.getCwd ⇒ 对「会话存在但无绑定项目」抛。
+        assertThat(cwdSeenBySupplier.get())
+            .as("供应器必须收到会话已解析 cwd 快照（来源 = 会话 TUC 的 effectiveCwd）")
+            .isNotNull()
+            .isEqualTo(tuc.effectiveCwd());
+        // 反向对照：不是「确无会话」哨兵（批 6 形态的实际观测值）
+        assertThat(query.captured.toolUseContext().sessionId())
+            .as("⛔ 不得是 no-session 哨兵（旧形态：生产 supplier 形参无会话通道）")
+            .isNotEqualTo(com.nexusai.common.SessionKeys.NO_SESSION);
+    }
+
+    @Test
+    @DisplayName("[批 7] 反向对照：会话 id 缺失（psContext 无 TUC）⇒ 显式哨兵 + 不伪造会话键")
+    void extractSessionMemory_suppliedBranch_sessionMissing_usesSentinel() {
+        // WHY: 「不许静默失效」的另一半 —— 真取不到会话时只能是**显式哨兵**，
+        //   ⛔ 不得现造 `"sess-"+UUID`（看起来合法、实为一次性假键，下游当会话键消费）。
+        RecordingQuery query = new RecordingQuery();
+        SessionMemoryService svc = new SessionMemoryService(baseDir);
+        svc.setForkedQuery(query);
+        svc.setSessionMemoryFeatureEnabled(true);
+        svc.setReadFileTool(readFileTool());
+        java.util.concurrent.atomic.AtomicReference<String> sidSeenBySupplier =
+            new java.util.concurrent.atomic.AtomicReference<>("<供应器未被调用>");
+        svc.setCacheSafeParamsSupplier((sessionId, cwd) -> {
+            sidSeenBySupplier.set(sessionId);
+            return new CacheSafeParams(List.of(), Map.of(), Map.of(),
+                new ToolUseContext(UUID.randomUUID(),
+                    RunForkedAgent.resolveForkSessionId(sessionId, "pipeline-test-supplier"),
+                    com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
+                    Map.of(), List.of(), "", AbortController.NOOP, List.of()),
+                List.of());
+        });
+        // psContext 的 TUC 为 null（无会话上下文）—— 消费方必须传 null 而非编造
+        PostSamplingContext ctx = new PostSamplingContext(
+            List.of(asst("a1", 12000, List.of())), List.of("SYS"), Map.of(), Map.of(),
+            null, QuerySource.REPL_MAIN_THREAD);
+
+        svc.extractSessionMemory(ctx);
+
+        assertThat(sidSeenBySupplier.get())
+            .as("TUC 缺失 ⇒ 供应器收到的必须是 null（消费方不得编造会话键）")
+            .isNull();
+        assertThat(query.captured).isNotNull();
+        assertThat(query.captured.toolUseContext().sessionId())
+            .as("确无会话 ⇒ 显式哨兵（可被下游识别），⛔ 不得是 \"sess-\"+UUID 假键")
+            .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION)
+            .doesNotStartWith("sess-");
+    }
+
+    @Test
     @DisplayName("RES-C5 rework: supplier 存在且 systemPrompt 非空 → 保留 supplied 原值（不覆写）")
     void extractSessionMemory_suppliedNonEmptySystemPrompt_keepsSupplied() {
         // WHY: 未来 C2/C10 接线方可能注入完整组装数组到 supplier —— supplied.systemPrompt() 非空时
@@ -316,7 +415,7 @@ class SessionMemoryExtractionPipelineTest {
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
         // supplier 已携带真实 systemPrompt + systemContext（组装链注入 · 未来状态）；
         // userContext 留空 → 应合并 psContext 会话原料
-        svc.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of("REAL-ASSEMBLED-PROMPT"), Map.of(), Map.of("sk", "sv"), supplierCtx, List.of()));
 
         PostSamplingContext ctx = new PostSamplingContext(

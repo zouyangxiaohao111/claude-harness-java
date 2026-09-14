@@ -244,7 +244,7 @@ public final class StopHookPipeline {
         // extract/dream 侧保持既有兜底（supplier / createMinimalCacheSafeParams，不 fail-loud；
         //   agents 被 mock 的测试不触发 fork）。生产 LlmAgentLoop 必须走 11 参带会话线程解析 memoryDir。
         return executeExtractMemoriesAndAutoDream(agentId, extractAgent, dreamer, messages,
-            isNonInteractiveSession, appendSystemMessage, bareMode, workspaceDir, sessionId, null, null);
+            isNonInteractiveSession, appendSystemMessage, bareMode, workspaceDir, sessionId, null, null, null);
     }
 
     /**
@@ -274,7 +274,8 @@ public final class StopHookPipeline {
                                                              Path workspaceDir,
                                                              String sessionId,
                                                              com.nexusai.application.agent.compact.fork.ForkRawMaterial forkRawMaterial,
-                                                             Path memoryDir) {
+                                                             Path memoryDir,
+                                                             Path sessionCwd) {
         // CC stopHooks.ts:136 if (!isBareMode()) —— bare/SIMPLE 脚本 -p 调用跳过后台 bookkeeping
         if (bareMode) {
             if (log.isDebugEnabled()) {
@@ -310,7 +311,7 @@ public final class StopHookPipeline {
             //   memoryDir null（测试/非主循环调用方）→ agent 内部 storage.memoryDir() 兜底。
             String extractMemDir = normalizeMemDir(memoryDir);
             extractAgent.executeExtractMemories(snapshot, appendSystemMessage, forkRawMaterial, agentId, sessionId,
-                extractMemDir);
+                extractMemDir, sessionCwd);
             log.info("STOP_HOOK extractMemories 已异步触发 (agentId=null, extractAgent 非空, "
                     + "EXTRACT_MEMORIES 模块开关={}, isExtractModeActive, appendSystemMessage={}, bareMode={}, forkRawMaterial={}) · CC stopHooks.ts:136-153",
                 isExtractMemoriesModuleEnabled(),
@@ -332,7 +333,8 @@ public final class StopHookPipeline {
                     // [IMP-MV2-09 T9] fork 原料透传（autoDream.ts:226 createCacheSafeParams(context)
                     //   全量载荷 · forkedAgent.ts:131-141；null = 无捕获兜底）
                     if (dreamMemDir != null) {
-                        dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, dreamMemDir);
+                        dreamer.consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial,
+                            dreamMemDir, sessionCwd);
                     } else {
                         // [TL-W1 P2] 旧实现委托 4 参重载 → AutoDreamConsolidator.memoryDir() →
                         //   storage.memoryDir() → AutoMemPaths.getAutoMemPath()（无参，读会话

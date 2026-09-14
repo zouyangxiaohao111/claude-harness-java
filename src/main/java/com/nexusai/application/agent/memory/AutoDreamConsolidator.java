@@ -233,7 +233,16 @@ public class AutoDreamConsolidator {
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
 
     /** cache-safe params 供应 · null → createMinimalCacheSafeParams 兜底 */
-    private volatile Supplier<CacheSafeParams> cacheSafeParamsSupplier;
+    /**
+     * [批 7] cache-safe params 供应 · <b>形参 = 发起本次 fork 的真实会话 id</b>
+     * （同 SessionMemoryService/ExtractMemoriesAgent；见其字段 javadoc）。
+     * ⚠️ 本类两个 fork 入口（自动 consolidateIfNeeded / 手动 doDream）都<b>传 {@code null}</b>：
+     * {@code buildForkParams} 作用域内无会话（自动路径的真实会话 id 存在但只用于「排除自身」，
+     * 未下传到 buildForkParams；手动 /dream 的入参只有 workspaceDir）⇒ 供应器侧置
+     * 「确无会话」哨兵 + ≥WARN（(b) 合法跳过）。⛔ 不现造会话键。
+     */
+    private volatile java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams>
+        cacheSafeParamsSupplier;
 
     /**
      * firstParty fork 缓存共享 gate 供应 · 兜底（RES-C5）CacheSafeParams 的
@@ -342,8 +351,9 @@ public class AutoDreamConsolidator {
         this.forkedQuery = query;
     }
 
-    /** 注入 cache-safe params 供应。 */
-    public void setCacheSafeParamsSupplier(Supplier<CacheSafeParams> supplier) {
+    /** 注入 cache-safe params 供应 · <b>[批 7] 形参 = 真实会话 id</b>（见字段 javadoc）。 */
+    public void setCacheSafeParamsSupplier(
+            java.util.function.BiFunction<String, java.nio.file.Path, CacheSafeParams> supplier) {
         this.cacheSafeParamsSupplier = supplier;
     }
 
@@ -504,6 +514,27 @@ public class AutoDreamConsolidator {
                                     Consumer<SystemMessage> appendSystemMessage,
                                     ForkRawMaterial forkRawMaterial,
                                     Path memoryDir) {
+        // sessionCwd 缺省 null（测试/直构调用方）→ 委托 6 参（供应商侧退回构造器既有推导）
+        consolidateIfNeeded(workspaceDir, sessionId, appendSystemMessage, forkRawMaterial, memoryDir, null);
+    }
+
+    /**
+     * [批 7] 生产入口 · <b>额外携带「会话已解析 cwd 快照」</b>（= 会话 TUC 的
+     * {@code effectiveCwd}，由会话线程经 StopHookPipeline 透传）。
+     *
+     * <p><b>WHY</b>：本路径的 fork base {@code ToolUseContext} 现按**真实会话 id** 构造
+     * （{@code sessionId} 形参 —— 自动路径的真实值，仅此前未下传）；若不同时给出已解析 cwd，
+     * {@code ToolUseContext} 紧凑构造器会重跑 {@code CwdResolution.getCwd(sessionId)}，
+     * 而该入口对「会话存在但无绑定项目」是 fail-loud 抛（批 4a #7/#13）⇒ 会对「cron 显式锚 +
+     * 未绑定会话」这条本来能跑的路径新引入一次抛（未登记的行为变更）。
+     *
+     * @param sessionCwd 会话已解析 cwd 快照；null = 调用点无该值（测试/直构）⇒ 退回既有推导
+     */
+    public void consolidateIfNeeded(Path workspaceDir, String sessionId,
+                                    Consumer<SystemMessage> appendSystemMessage,
+                                    ForkRawMaterial forkRawMaterial,
+                                    Path memoryDir,
+                                    Path sessionCwd) {
         // 动态阈值（autoDream.ts:126 每轮 getConfig · FIX-AD 替代硬编码 24/5）
         AutoDreamConfig cfg = effectiveConfig();
         ConsolidationLock lock = new ConsolidationLock(memoryDir);
@@ -553,7 +584,8 @@ public class AutoDreamConsolidator {
         if (priorMtime == null) {
             return;
         }
-        doConsolidate(workspaceDir, priorMtime, sessionIds, hoursSince, appendSystemMessage, forkRawMaterial, memoryDir, lock);
+        doConsolidate(workspaceDir, priorMtime, sessionIds, hoursSince, appendSystemMessage, forkRawMaterial,
+            memoryDir, lock, sessionId, sessionCwd);
     }
 
     /**
@@ -748,7 +780,8 @@ public class AutoDreamConsolidator {
      */
     private void doConsolidate(Path workspaceDir, long priorMtime, List<String> sessionIds,
                                double hoursSince, Consumer<SystemMessage> appendSystemMessage,
-                               ForkRawMaterial forkRawMaterial, Path memoryDir, ConsolidationLock lock) {
+                               ForkRawMaterial forkRawMaterial, Path memoryDir, ConsolidationLock lock,
+                               String sessionId, Path sessionCwd) {
         emitTelemetry("tengu_auto_dream_fired", Map.of(
             "hours_since", Math.round(hoursSince),
             "sessions_since", sessionIds.size()));
@@ -778,7 +811,8 @@ public class AutoDreamConsolidator {
             // 3. fork 直接写文件（autoDream.ts:224-233 · overrides.abortController + onMessage）
             ForkedAgentParams params = buildForkParams(prompt, dreamTaskId, abortController,
                 touchedPaths, forkRawMaterial, memoryDir,
-                workspaceDir != null ? workspaceDir.toString() : null);   // [TL-W1 P1] projectRoot 直传
+                workspaceDir != null ? workspaceDir.toString() : null,   // [TL-W1 P1] projectRoot 直传
+                sessionId, sessionCwd);   // [批 7] 真实会话 id（排除自身那个）+ 会话已解析 cwd 快照
 
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null
@@ -935,7 +969,11 @@ public class AutoDreamConsolidator {
         try {
             ForkedAgentParams params = buildForkParams(prompt, null, abortController,
                 touchedPaths, forkRawMaterial, memDir,   // [TL-W2 P9] 显式 memDir（不再无参现算）
-                workspaceDir != null ? workspaceDir.toString() : null);   // [TL-W1 P1] projectRoot 直传
+                workspaceDir != null ? workspaceDir.toString() : null,   // [TL-W1 P1] projectRoot 直传
+                // [批 7] 手动 /dream **确无会话**：入参只有 workspaceDir（无 sessionId / 无会话 TUC）
+                //   ⇒ 显式传 null,null（供应商侧置「确无会话」哨兵 + 一次性 ≥WARN，
+                //   且哨兵走 CwdResolution 命名出口 ⇒ 不会触发「无绑定会话」抛）。
+                null, null);
             ForkedAgentResult result = RunForkedAgent.run(params, forkedQuery);
             ForkedAgentResult.ForkUsage usage = result.totalUsage() != null
                 ? result.totalUsage() : ForkedAgentResult.ForkUsage.empty();
@@ -990,7 +1028,9 @@ public class AutoDreamConsolidator {
                                               List<String> touchedPaths,
                                               ForkRawMaterial forkRawMaterial,
                                               Path memoryDir,
-                                              String projectRoot) {
+                                              String projectRoot,
+                                              String sessionId,
+                                              Path sessionCwd) {
         String memoryRoot = memoryDir.toString();
         List<ChatMessageDto> promptMessages = List.of(userMessage(prompt));
 
@@ -1000,7 +1040,12 @@ public class AutoDreamConsolidator {
         //   （"supplied 优先" · 同 SessionMemoryService RES-C5 语义）。forkContextMessages =
         //   主线程消息快照（raw.forkContextMessages · CC context.messages —— 修复旧 List.of()：
         //   dream fork 无消息前缀 → cache key 与主线程不一致）。null 原料 → 既有兜底不变。
-        CacheSafeParams supplied = cacheSafeParamsSupplier != null ? cacheSafeParamsSupplier.get() : null;
+        // [批 7] 供应器形参 = **显式 null**（「本作用域确无会话」）—— 见字段 javadoc：
+        //   auto 路径真实会话 id 只用于「排除自身」未下传 buildForkParams；手动 /dream 入参无会话。
+        //   null ⇒ RunForkedAgent.resolveForkSessionId 置「确无会话」哨兵 + 一次性 ≥WARN
+        //   （⛔ 不现造会话键；补真实来源已登记后续批）。
+        CacheSafeParams supplied = cacheSafeParamsSupplier != null
+            ? cacheSafeParamsSupplier.apply(sessionId, sessionCwd) : null;
         CacheSafeParams cs = supplied != null
             ? new CacheSafeParams(
                 ForkRawMaterial.mergeSystemPrompt(supplied.systemPrompt(),

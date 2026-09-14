@@ -87,7 +87,7 @@ class SessionMemoryDbReproTest {
         ToolUseContext supplierTuc = new ToolUseContext(
             UUID.randomUUID(), "sess-supplier", PermissionMode.DEFAULT,
             Map.of(), List.of(editTool, readTool), "", AbortController.NOOP, List.of());
-        svc.setCacheSafeParamsSupplier(() -> new CacheSafeParams(
+        svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierTuc, List.of()));
 
         // ── psContext：messages = DB 会话；systemPrompt = 完整主提示（多段）──
