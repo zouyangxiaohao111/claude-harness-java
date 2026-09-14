@@ -39,8 +39,14 @@ import java.util.UUID;
  * <p><b>OD-5 缺失字段承载标注（CC 10 字段中未在本类出现的 4 个）</b>：
  * <ul>
  *   <li>{@code autoCompactTracking} —— 承载于 {@link com.nexusai.application.agent.compact.AutoCompactor#getTracking()}
- *       （{@code AutoCompactTrackingState} 实例），由 Spring bean per-session 宿主。
- *       不硬塞 AgentState：Java AutoCompactor 非 singleton（per-session），tracking 随实例生命周期自然隔离。</li>
+ *       （{@code AutoCompactTrackingState} 实例）+ 每调用显式传入的 {@code tracking} 形参
+ *       （{@code autoCompactIfNeeded(..., AutoCompactTrackingState)}）。
+ *       ⛔ <b>[S1 轨 III · T9 2026-09-14 更正]</b> 原注释写「Java AutoCompactor 非 singleton（per-session）」
+ *       —— <b>该声明是错的（实测）</b>：AutoCompactor 经 {@code ToolRegistrationConfig:923-934} 的
+ *       {@code @Bean} 注册，全仓无 {@code @Scope} ⇒ <b>单例</b>。正因如此，它曾经的
+ *       {@code sessionId}/{@code agentId}/{@code toolUseContext} 三个实例字段才是跨会话 landmine
+ *       （生产 0 写入方 ⇒ 恒 null，已在本批删除）。tracking 的会话隔离靠<b>形参显式传递</b>，
+ *       <b>不是</b>靠「per-session 实例」—— 见 {@code AutoCompactTrackingState} 的跨实例语义。</li>
  *   <li>{@code pendingToolUseSummary} —— 承载于 {@code LlmAgentLoop.loop()} 递归局部变量
  *       （LlmAgentLoop.java:2267），每个 loop 帧独立，无需挂 state。
  *       CC 挂 State 因其单进程单会话；Java 多会话同 JVM，局部变量天然会话隔离。</li>

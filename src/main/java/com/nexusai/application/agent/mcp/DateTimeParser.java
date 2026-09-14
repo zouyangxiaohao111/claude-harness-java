@@ -198,6 +198,15 @@ public class DateTimeParser {
 
     /** CC 查询选项（dateTimeParser.ts:72-79）· thinkingConfig disabled + temperature 0 + querySource 'mcp_datetime_parse'。 */
     private static LlmProvider.ChatRequestOptions queryOptions() {
+        // [S1-T7] agent 归因上下文 = **显式 null（(b) 类「本就不需要」）**，原读
+        //   ambient 归因上下文（宿 ThreadLocal，已删载体）已删（会话态不得经 ThreadLocal 读）。
+        //   判据（读 CC 真源 + 本仓调用链）：本解析器是 **MCP elicitation 的日期时间输入助手**
+        //   （CC dateTimeParser.ts，由 MCP server 的 elicitation 请求触发），不处于任何 agent 的
+        //   执行链内 ⇒ 归因上下文在本路径**结构上不存在**；显式 null 保留 CC
+        //   agentContext.ts:170「无 invokingRequestId」语义。
+        //   ⚠️ 每次调用都发 WARN（非一次性闸）——一次性闸会让多会话下第 2 个会话的缺值不可观测。
+        log.warn("DateTimeParser agent 归因上下文显式为空 (null)"
+            + "（MCP elicitation 日期解析无 agent 执行链 · (b) 类本就不需要）");
         return new LlmProvider.ChatRequestOptions(
             List.of(), null, null,
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
@@ -205,7 +214,7 @@ public class DateTimeParser {
             "mcp_datetime_parse",
             new AbortController(),
             null,
-            null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+            null, null);
     }
 
     /**

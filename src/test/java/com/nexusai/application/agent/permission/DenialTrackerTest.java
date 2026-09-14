@@ -84,10 +84,10 @@ class DenialTrackerTest {
         PermissionResult r = check(subCtx, PermissionMode.AUTO);
 
         assertThat(r).isInstanceOf(PermissionResult.Deny.class);
-        assertThat(globalDenialTracker.getConsecutiveDenials())
+        assertThat(globalDenialTracker.getConsecutiveDenials(subCtx.sessionId()))
             .as("子代理拒绝必须隔离在 localDenialTracking（per-agent），不得污染全局 bean（appState 等价）")
             .isZero();
-        assertThat(globalDenialTracker.getTotalDenials())
+        assertThat(globalDenialTracker.getTotalDenials(subCtx.sessionId()))
             .as("全局 total 同样不得被子代理污染")
             .isZero();
     }
@@ -101,8 +101,9 @@ class DenialTrackerTest {
         PermissionResult r = check(mainCtx, PermissionMode.AUTO);
 
         assertThat(r).isInstanceOf(PermissionResult.Deny.class);
-        assertThat(globalDenialTracker.getConsecutiveDenials())
-            .as("主 agent 无 localDenialTracking → 回落全局 bean（CC appState.denialTracking 语义）")
+        assertThat(globalDenialTracker.getConsecutiveDenials(mainCtx.sessionId()))
+            .as("主 agent 无 localDenialTracking → 回落全局 bean（CC appState.denialTracking 语义）"
+                + "；T16 后计数按 sessionId 键控 ⇒ 读侧必须用同一 ctx 的会话键")
             .isEqualTo(1);
     }
 
@@ -114,15 +115,15 @@ class DenialTrackerTest {
         Map<String, Object> local = new HashMap<>();
         DenialTracker tracker = DenialTracker.forLocalState(local);
 
-        tracker.recordDenial();
-        tracker.recordDenial();
+        tracker.recordDenial(null);
+        tracker.recordDenial(null);
 
         assertThat(local.get("consecutiveDenials"))
             .as("recordDenial 双计数就地写回 localDenialTracking（CC permissions.ts:967-968 Object.assign）")
             .isEqualTo(2);
         assertThat(local.get("totalDenials")).isEqualTo(2);
 
-        tracker.recordSuccess();
+        tracker.recordSuccess(null);
 
         assertThat(local.get("consecutiveDenials"))
             .as("recordSuccess 只清 consecutive 并就地写回（CC denialTracking.ts:32-38）")
@@ -141,9 +142,9 @@ class DenialTrackerTest {
 
         DenialTracker tracker = DenialTracker.forLocalState(local);
 
-        assertThat(tracker.getConsecutiveDenials()).isEqualTo(2);
-        assertThat(tracker.getTotalDenials()).isEqualTo(5);
-        assertThat(tracker.shouldFallbackToPrompting()).isFalse();
+        assertThat(tracker.getConsecutiveDenials(null)).isEqualTo(2);
+        assertThat(tracker.getTotalDenials(null)).isEqualTo(5);
+        assertThat(tracker.shouldFallbackToPrompting(null)).isFalse();
     }
 
     @Test
@@ -151,11 +152,11 @@ class DenialTrackerTest {
     void forLocalState_immutableMap_noThrow() {
         DenialTracker tracker = DenialTracker.forLocalState(Map.of());
 
-        DenialTracker.FallbackSnapshot snapshot = tracker.recordDenial();
+        DenialTracker.FallbackSnapshot snapshot = tracker.recordDenial(null);
 
         assertThat(snapshot.fallback()).isFalse();
-        assertThat(tracker.getConsecutiveDenials()).isEqualTo(1);
-        assertThat(tracker.getTotalDenials()).isEqualTo(1);
+        assertThat(tracker.getConsecutiveDenials(null)).isEqualTo(1);
+        assertThat(tracker.getTotalDenials(null)).isEqualTo(1);
     }
 
     @Test
@@ -165,19 +166,19 @@ class DenialTrackerTest {
         DenialTracker agentA = DenialTracker.forLocalState(new HashMap<>());
         DenialTracker agentB = DenialTracker.forLocalState(new HashMap<>());
 
-        agentA.recordDenial();
-        agentA.recordDenial();
+        agentA.recordDenial(null);
+        agentA.recordDenial(null);
 
-        assertThat(agentA.getConsecutiveDenials()).isEqualTo(2);
-        assertThat(agentB.getConsecutiveDenials())
+        assertThat(agentA.getConsecutiveDenials(null)).isEqualTo(2);
+        assertThat(agentB.getConsecutiveDenials(null))
             .as("另一个子代理的计数不受 agentA 影响（forkedAgent.ts:420-422 每子代理独立 createDenialTrackingState）")
             .isZero();
-        assertThat(global.getConsecutiveDenials())
+        assertThat(global.getConsecutiveDenials(null))
             .as("全局 bean 不受任一子代理影响")
             .isZero();
 
-        global.recordDenial();
-        assertThat(agentA.getConsecutiveDenials())
+        global.recordDenial(null);
+        assertThat(agentA.getConsecutiveDenials(null))
             .as("全局拒绝也不回灌子代理本地态")
             .isEqualTo(2);
     }
@@ -187,16 +188,16 @@ class DenialTrackerTest {
     void perAgent_accumulatesToFallback_independent() {
         DenialTracker agent = DenialTracker.forLocalState(new HashMap<>());
 
-        agent.recordDenial();
-        agent.recordDenial();
-        assertThat(agent.shouldFallbackToPrompting()).isFalse();
+        agent.recordDenial(null);
+        agent.recordDenial(null);
+        assertThat(agent.shouldFallbackToPrompting(null)).isFalse();
 
-        agent.recordDenial();
-        assertThat(agent.shouldFallbackToPrompting())
+        agent.recordDenial(null);
+        assertThat(agent.shouldFallbackToPrompting(null))
             .as("连续 3 次拒绝 → per-agent 本地态派生 fallback（CC denialTracking.ts:40-45）")
             .isTrue();
         // 全局 bean 完全不受影响
-        assertThat(globalDenialTracker.shouldFallbackToPrompting()).isFalse();
+        assertThat(globalDenialTracker.shouldFallbackToPrompting(null)).isFalse();
     }
 
     // ─────────────────── ToolCheckCache 生产接入（OPD-WF3-DC-v4-02） ───────────────────

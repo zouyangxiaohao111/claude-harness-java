@@ -23,7 +23,6 @@ import com.nexusai.application.agent.skill.KeybindingsSkill;
 import com.nexusai.application.agent.skill.LocalReviewPrompt;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.skill.PromptBlock;
-import com.nexusai.application.agent.team.Teammate;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.infra.util.UndercoverCheck;
 import com.nexusai.model.command.Command;
@@ -481,12 +480,13 @@ public class CommandRegistrationConfig {
         RenameCommand renameCommand = new RenameCommand();
         dispatcher.registerSlashCommand("rename", (args, sessionId, inFlightUserMessageId) -> {
             RenameCommand.Env env = new RenameCommand.Env(
-                // [S1-T5 编译强制] Teammate.isTeammate 已改为显式首参（TeammateIdentity）。
-                //   handler 线程无 teammate 身份载体 ⇒ 显式传 null = 与旧无参调用**同值**
-                //   （旧无参在 handler 线程读 ThreadLocal 恒 null，只剩 dynamicTeamContext 分支）。
-                //   ⚠️ 本条不是 T12 的真实修复（T12/轨 IV 负责按 handler 形参 sessionId 解析会话身份）；
-                //   本处仅保持「旧行为逐字等价」，登记为待 T12 收敛。
-                () -> Teammate.isTeammate(null),            // CC isTeammate()
+                // [S1-T12] teammate 守卫真实修复：按 handler 形参 sessionId 解析**会话级身份**
+                //   （唯一入口 SessionAgentStateRegistry#teammateIdentityForSession）。
+                //   WHY 不是方法引用：CC `isTeammate()`（teammate.ts:125-131）读的是**本进程内**
+                //   的 AsyncLocalStorage / dynamicTeamContext；Java 的分派线程上不存在任何 teammate
+                //   载体，方法引用在此求值恒 false ⇒ 守卫静默失效（/rename 对 teammate 会话恒放行）。
+                //   改为查会话身份后，求值结果只依赖 sessionId，与求值线程无关。
+                () -> resolveIsTeammateSession(registry, sessionId),   // CC isTeammate()
                 // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
                 () -> resolveSessionUuid(sessionId),
                 () -> resolveTranscriptPath(sessionId),
@@ -573,6 +573,17 @@ public class CommandRegistrationConfig {
     /** advisor stateReader · 读会话 AgentState.currentModel()；advisorModel 恒 null（AgentState 无该字段）· 会话标识显式传入。 */
     private static AdvisorCommand.AppState advisorAppState(SessionAgentStateRegistry registry, String sessionId) {
         return new AdvisorCommand.AppState(currentModel(registry, sessionId), null);
+    }
+
+    /** [S1-T12] 会话身份解析（/rename 守卫）· 会话级唯一入口，见 {@link SessionAgentStateRegistry#teammateIdentityForSession(String)}。 */
+    private static boolean resolveIsTeammateSession(SessionAgentStateRegistry registry, String sessionId) {
+        if (registry == null) {
+            // (b) 类：plain JUnit / 非 Spring 装配下无会话注册表 ⇒ 无法判定 → 非 teammate（放行）。
+            log.warn("[S1-T12] /rename teammate 守卫：SessionAgentStateRegistry 未注入 ⇒ 无法判定会话"
+                + "身份，按非 teammate 放行（sessionId={}）", sessionId);
+            return false;
+        }
+        return registry.teammateIdentityForSession(sessionId) != null;
     }
 
     /** 由显式形参 sessionId 解析当前会话 UUID · null = 无会话上下文（批 3c：不再读裸 MDC）。 */

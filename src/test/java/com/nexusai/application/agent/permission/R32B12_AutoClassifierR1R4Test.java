@@ -255,7 +255,7 @@ class R32B12_AutoClassifierR1R4Test {
             .contains("is temporarily unavailable");
         assertThat(deny.reason()).isInstanceOf(PermissionDecisionReason.Classifier.class);
         // unavailable 不记录 denial（CC :843-876 不调 recordDenial）
-        assertThat(denialTracker.getConsecutiveDenials()).isZero();
+        assertThat(denialTracker.getConsecutiveDenials(sid())).isZero();
     }
 
     @Test
@@ -270,7 +270,7 @@ class R32B12_AutoClassifierR1R4Test {
         assertThat(deny.message())
             .as("异常兜底消息含 The auto mode classifier 占位")
             .contains("The auto mode classifier is temporarily unavailable");
-        assertThat(denialTracker.getConsecutiveDenials()).isZero();
+        assertThat(denialTracker.getConsecutiveDenials(sid())).isZero();
     }
 
     @Test
@@ -294,7 +294,7 @@ class R32B12_AutoClassifierR1R4Test {
         assertThat(reason.reason())
             .as("decisionReason.reason = classifierResult.reason（CC :907-909）")
             .isEqualTo("Invalid classifier response - blocking for safety");
-        assertThat(denialTracker.getConsecutiveDenials())
+        assertThat(denialTracker.getConsecutiveDenials(sid()))
             .as("普通 block 必须 recordDenial")
             .isEqualTo(1);
     }
@@ -312,7 +312,7 @@ class R32B12_AutoClassifierR1R4Test {
         assertThat(result)
             .as("transcriptTooLong → 回退 prompting（保留原 Ask）")
             .isInstanceOf(PermissionResult.Ask.class);
-        assertThat(denialTracker.getConsecutiveDenials()).isZero();
+        assertThat(denialTracker.getConsecutiveDenials(sid())).isZero();
     }
 
     // ─────────────────── R4 熔断恢复 ───────────────────
@@ -340,7 +340,7 @@ class R32B12_AutoClassifierR1R4Test {
         assertThat(((PermissionDecisionReason.Classifier) ask3.reason()).reason())
             .contains("3 consecutive actions were blocked")
             .contains("Latest blocked action: blocked 2");
-        assertThat(denialTracker.shouldFallbackToPrompting())
+        assertThat(denialTracker.shouldFallbackToPrompting(sid()))
             .as("连续熔断 → 派生查询 fallback=true（回退 prompting 门控，CC denialTracking.ts:40-45）")
             .isTrue();
     }
@@ -354,7 +354,7 @@ class R32B12_AutoClassifierR1R4Test {
                 "blocked " + i, "fake-model", 1));
             check(permCtx(PermissionMode.AUTO), tool(TOOL_CUSTOM, false));
         }
-        assertThat(denialTracker.shouldFallbackToPrompting()).isTrue();
+        assertThat(denialTracker.shouldFallbackToPrompting(sid())).isTrue();
 
         // 任意 allow 事件（1c 工具自决 allow）→ recordSuccess → 断连拒链
         PermissionResult allowed = check(permCtx(PermissionMode.AUTO),
@@ -362,10 +362,10 @@ class R32B12_AutoClassifierR1R4Test {
                 JSON.createObjectNode(), new PermissionDecisionReason.Other("tool allow"),
                 null, false, null, List.of())));
         assertThat(allowed).isInstanceOf(PermissionResult.Allow.class);
-        assertThat(denialTracker.shouldFallbackToPrompting())
+        assertThat(denialTracker.shouldFallbackToPrompting(sid()))
             .as("allow 事件 recordSuccess → 派生查询不再 fallback（熔断恢复）")
             .isFalse();
-        assertThat(denialTracker.getConsecutiveDenials()).isZero();
+        assertThat(denialTracker.getConsecutiveDenials(sid())).isZero();
 
         // 恢复后下一个 Ask 重新进分类器
         fakeClassifier.queueResult(YoloClassifierResult.allowed(
@@ -380,20 +380,20 @@ class R32B12_AutoClassifierR1R4Test {
     @Test
     @DisplayName("R4: recordSuccess 只清 consecutive、total 保留（CC denialTracking.ts:32-38）")
     void recordSuccess_clearsConsecutiveOnly() {
-        denialTracker.recordDenial();
-        denialTracker.recordDenial();
-        assertThat(denialTracker.getConsecutiveDenials()).isEqualTo(2);
-        assertThat(denialTracker.getTotalDenials()).isEqualTo(2);
+        denialTracker.recordDenial(sid());
+        denialTracker.recordDenial(sid());
+        assertThat(denialTracker.getConsecutiveDenials(sid())).isEqualTo(2);
+        assertThat(denialTracker.getTotalDenials(sid())).isEqualTo(2);
 
-        denialTracker.recordSuccess();
+        denialTracker.recordSuccess(sid());
 
-        assertThat(denialTracker.getConsecutiveDenials())
+        assertThat(denialTracker.getConsecutiveDenials(sid()))
             .as("recordSuccess 只清零 consecutive（CC :36-37）")
             .isZero();
-        assertThat(denialTracker.getTotalDenials())
+        assertThat(denialTracker.getTotalDenials(sid()))
             .as("recordSuccess 不清 total（CC recordSuccess 语义）")
             .isEqualTo(2);
-        assertThat(denialTracker.shouldFallbackToPrompting()).isFalse();
+        assertThat(denialTracker.shouldFallbackToPrompting(sid())).isFalse();
     }
 
     @Test
@@ -402,7 +402,7 @@ class R32B12_AutoClassifierR1R4Test {
         DenialTracker tracker = new DenialTracker(100, 20); // 抬高 consecutive 阈值，单独测 total 路径
         DenialTracker.FallbackSnapshot last = null;
         for (int i = 0; i < 20; i++) {
-            last = tracker.recordDenial();
+            last = tracker.recordDenial(null);
         }
         assertThat(last.fallback())
             .as("第 20 次拒绝（total 达上限）必须触发回退")
@@ -410,11 +410,11 @@ class R32B12_AutoClassifierR1R4Test {
         assertThat(last.totalDenials())
             .as("回退快照携带清零前 total（warning 文案用，CC :1003-1007）")
             .isEqualTo(20);
-        assertThat(tracker.getTotalDenials())
+        assertThat(tracker.getTotalDenials(null))
             .as("hitTotalLimit → 双计数清零（CC :1034-1040）")
             .isZero();
-        assertThat(tracker.getConsecutiveDenials()).isZero();
-        assertThat(tracker.shouldFallbackToPrompting())
+        assertThat(tracker.getConsecutiveDenials(null)).isZero();
+        assertThat(tracker.shouldFallbackToPrompting(null))
             .as("total 清零后派生查询不再 fallback")
             .isFalse();
     }
@@ -499,5 +499,10 @@ class R32B12_AutoClassifierR1R4Test {
 
         @Override
         public boolean isAvailable() { return true; }
+    }
+
+    /** T16：DenialTracker 计数按 sessionId 键控 —— 直读直写的键必须与 pipeline 的 ctx 同键。 */
+    private String sid() {
+        return ctx.sessionId();
     }
 }

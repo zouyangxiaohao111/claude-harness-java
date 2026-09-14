@@ -265,6 +265,21 @@ public final class RunForkedAgent {
         //    setupContext.readFileState 共享缓存，Edit read-before-write 门禁放行）
         ToolUseContext isolatedCtx = createIsolatedContext(
             cs.toolUseContext(), params.abortController(), params.readFileState());
+        // [S1-T18] 归因上下文**显式盖章**（判定 = 「本该有」，见类 javadoc / 施工单 T18）：
+        //   CC 真源（claude-code-best/src/utils/forkedAgent.ts）**零** AgentContext / runWithAgentContext 引用
+        //   ⇒ fork 自身不建
+        //   归因上下文，其 API 调用归因到**发起它的 agent**（Node 的 AsyncLocalStorage 跨 await
+        //   自动传播到 fork 内的 query()）。Java 的 plain ThreadLocal 不跨线程（且 fork 的发送点
+        //   可能已不在发起线程上）⇒ 必须以**值**承载。
+        //   来源 = 父 cache-safe 上下文的显式字段（cs.toolUseContext().agentContext()），
+        //   ⛔ 不读 ambient 归因上下文（宿 ThreadLocal，原 ProductionForkedQuery 的 ambient 读已删）。
+        //   ToolUseContext.with(SubagentContextOverrides) 对 agentContext 取 null（「新 agent 不继承父」
+        //   语义 —— 对 createSubagentContext 的真子代理正确，由 SubagentExecutor stampSubagentLoopContext
+        //   盖章）；fork 不是新 agent，故在此按同一「显式盖章」手法补上发起者的上下文。
+        //   同值短路：父为 null（主线程 fork）→ withAgentContext 返回同一实例，零行为变化。
+        AgentContext forkAgentContext = cs.toolUseContext() != null
+            ? cs.toolUseContext().agentContext() : null;
+        isolatedCtx = isolatedCtx.withAgentContext(forkAgentContext);
 
         // ── 3. query loop 透传 cache-safe 参数（forkedAgent.ts:545-556）──
         // [RES-R4-2] CacheSafeParams.systemPrompt 数组语义直接透传（forkedAgent.ts:59 + :545-556

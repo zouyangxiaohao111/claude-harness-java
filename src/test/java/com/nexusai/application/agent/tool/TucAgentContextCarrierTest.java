@@ -20,6 +20,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>WHY（意图验证，不只验证行为）</b>：本批把「classifier / exec-prompt hook / tool-use summary
  * 在 commonPool worker 上读 {@code AgentContext.STORAGE} ThreadLocal（恒 null，sparse-edge 归因静默丢失）」
+ * （该载体已于 S1-T7-2 整体删除）
  * 改为「读 TUC 上显式盖章的 {@link AgentContext} 实例」。这条改造的失效模式有<b>三种</b>，
  * 每种都必须有断言，否则就是「声称守护 X 实际守不住」：
  * <ol>

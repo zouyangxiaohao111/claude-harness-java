@@ -476,7 +476,8 @@ public class VisionAnalyzeTool implements Tool {
             // 8-arg ChatRequestOptions: history/tools/outputFormat/thinkingConfig/temperature/querySource/abort/maxTokens
             if ("analyze".equals(type) && isPdf) {
                 // [v2 pdf] 懒渲染 pages → 页图 image blocks → 视觉模型（单条 user 消息 text+N image）
-                resultText = chatWithPdfPages(provider, resolved, modelName, prompt, pdfFilePath, pages, contentId);
+                resultText = chatWithPdfPages(provider, resolved, modelName, prompt, pdfFilePath, pages, contentId,
+                    ctx != null ? ctx.agentContext() : null);
             } else if ("analyze".equals(type)) {
                 // image 单图：contentBlocks=[text, image]（text 块在前，对齐 CC prompt 数组 attachments.ts:1065-1071）
                 List<JsonNode> blocks = new ArrayList<>(2);
@@ -485,13 +486,17 @@ public class VisionAnalyzeTool implements Tool {
                 ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
                         Role.user, prompt, null, null, blocks, List.of(), true);
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                        List.of(user), null, null, null, null, "vision_analyze", null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                        List.of(user), null, null, null, null, "vision_analyze", null, null,
+                        // [S1-T7] agent 归因上下文 = **工具形参 ctx 的显式字段**（两套载体收口
+                        //   到 TUC 单一来源；工具线程上 ThreadLocal 不可达）。
+                        ctx != null ? ctx.agentContext() : null);
                 // ⚠️ userMessage 必须传 null：图片+prompt 已在 history 的 contentBlocks 里；
                 //    再传 userMessage 会导致连续两条 user 消息（AnthropicSdkProvider:1013-1017）
                 resultText = provider.chatWithOptions(resolved.config(), modelName, null, null, options);
             } else {
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                        List.of(), null, null, null, null, "vision_analyze", null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                        List.of(), null, null, null, null, "vision_analyze", null, null,
+                        ctx != null ? ctx.agentContext() : null);
                 resultText = provider.chatWithOptions(resolved.config(), modelName, null, prompt, options);
             }
         } catch (Exception e) {
@@ -524,11 +529,15 @@ public class VisionAnalyzeTool implements Tool {
      * @param pdfFilePath  PDF 本地绝对路径（resolvePdfSourceFile 已 exists 校验）
      * @param pages        显式页号（1-based；null/空 → ≤10 页全渲染，>10 报错要求 pages）
      * @param contentId    源 contentId（日志；path 源为 -1）
+     * @param agentContext [S1-T7] agent 归因上下文（调用方 execute(call, ctx) 从 ctx.agentContext()
+     *                     显式传入；null = 无归因上下文，等价 CC agentContext.ts:170 无 invokingRequestId）
      * @return 视觉模型纯文本响应
      */
     private String chatWithPdfPages(LlmProvider provider, ModelConfigResolver.ResolvedModel resolved,
                                     String modelName, String prompt, String pdfFilePath,
-                                    List<Integer> pages, long contentId) throws Exception {
+                                    List<Integer> pages, long contentId,
+                                    com.nexusai.application.agent.subagent.AgentContext agentContext)
+            throws Exception {
         Path file = Path.of(pdfFilePath);
         Integer pageCount = PdfSupport.getPDFPageCount(file);
         if (pageCount == null || pageCount <= 0) {
@@ -576,7 +585,11 @@ public class VisionAnalyzeTool implements Tool {
             ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
                 Role.user, prompt, null, null, blocks, List.of(), true);
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                List.of(user), null, null, null, null, "vision_analyze", null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                List.of(user), null, null, null, null, "vision_analyze", null, null,
+                // [S1-T7] agent 归因上下文 = **本方法新增形参**（原读 ambient 归因上下文
+                //   ambient，已删）。本方法（chatWithPdfPages）自身无 ToolUseContext ⇒ 由调用方
+                //   execute(call, ctx) 从 ctx.agentContext() 显式传入。
+                agentContext);
             if (log.isDebugEnabled()) {
                 log.debug("VisionAnalyzeTool PDF 页图已组装: path={} pages={} 页图={}（送视觉模型）",
                     pdfFilePath, selected, imgBlocks.size());

@@ -9,29 +9,32 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * R2-CTX · subagent spawn 包裹 runWithAgentContext（analytics 归因）RED-GREEN 双证测试.
+ * R2-CTX · {@link SubagentExecutor#buildSubagentAgentContext} 的<b>字段映射</b>测试
+ * （CC AgentTool.tsx:719-727 object literal → {@link AgentContext.SubagentContext}）。
  *
- * <p><b>WHY（规则九 · 测试验证意图而非行为）</b>：CC 每次 spawn 都把整个 agent 执行包进
- * {@code runWithAgentContext(context, ...)}（AgentTool.tsx:733 async / :785 sync / :911 background），
- * 使 query loop 内事件能经 {@code getSubagentLogName()}（→ {@code subagent_name}）与
- * {@code getAgentContext()}（→ parent_agent_id）正确归因到子 agent。Java 现状（S-13 / DISC-SUB-03
- * EV-FK-015）：SubagentTool → SubagentExecutor 无包裹，query loop 内 {@code getSubagentLogName()}
- * 恒 null → {@code SessionFileAccessHooks.subagentProps()} 空 map → 事件缺 {@code subagent_name}。
+ * <p><b>本测试覆盖</b>（只此一项）：agentId / subagentName / isBuiltIn / invocationKind
+ * spawn|resume / parentSessionId null / invokingRequestId null 的逐字段映射。
  *
- * <p>本测试覆盖：
- * <ol>
- *   <li>{@link SubagentExecutor#buildSubagentAgentContext} 字段映射（CC AgentTool.tsx:719-727
- *       object literal → SubagentContext）：agentId / subagentName / isBuiltIn / invocationKind
- *       spawn|resume / parentSessionId null / invokingRequestId null</li>
- *   <li>归因组合语义：{@code runWithAgentContext(buildSubagentAgentContext(...))} 块内
- *       {@code getSubagentLogName()} 返回内置名（built-in）/ "user-defined"（自定义），块外 null（不泄漏）</li>
- * </ol>
+ * <p><b>历史（S1-T7-2 之后的现状）</b>：本类原先还覆盖「归因组合语义」——即 CC 每次 spawn 把
+ * agent 执行包进 {@code runWithAgentContext(context, ...)}（CC AgentTool.tsx:733 async /
+ * :785 sync / :911 background）后，query loop 内可经 CC 侧的 {@code getSubagentLogName()} /
+ * {@code getAgentContext()}（CC agentContext.ts:141-151 / :100-102）读回归因上下文。
+ * <b>Java 侧该 ambient 载体（ThreadLocal + 同名读取方法 + 线程包裹）已于 S1-T7-2 整体删除，
+ * 两条相应用例随之删除</b>；等价语义现由「显式载体」两处承载：
+ * <ul>
+ *   <li>hook 侧 {@code subagent_name}：{@code SessionFileAccessHooks.subagentProps(ToolUseContext)}
+ *       （读 TUC 的 {@code subagentName/isBuiltIn}，含 CC agentContext.ts:145-151 的
+ *       {@code isBuiltIn ? name : 'user-defined'} 隐私映射），由
+ *       {@code SubagentNameExplicitCarrierTest} 在真 {@code HOOK_EXECUTOR} 线程上守。</li>
+ *   <li>provider 侧 {@code invokingRequestId}：{@code AgentContext.attachInvokingRequestEdge(Map, AgentContext)}
+ *       的显式实参版，由 {@code InvokingRequestIdExplicitCarrierTest} 守。</li>
+ * </ul>
  *
- * <p>RED 依据：本测试引用的 {@code SubagentExecutor.buildSubagentAgentContext} 在 R2-CTX 实施前不存在
- * （编译即失败）；executeStreaming Step 20 未包裹 runWithAgentContext → 归因组合语义（subagent_name）
- * 无从产生。回退任一 → 测试红。
+ * <p><b>RED 依据</b>：本测试引用的 {@code SubagentExecutor.buildSubagentAgentContext} 在 R2-CTX
+ * 实施前不存在（编译即失败）；映射表达式回退（如 isBuiltIn 恒 true / invocationKind 恒 "spawn"）
+ * ⇒ 对应用例红。
  */
-@DisplayName("[R2-CTX] subagent spawn 包裹 runWithAgentContext（analytics 归因 subagent_name / parent_agent_id）")
+@DisplayName("[R2-CTX] buildSubagentAgentContext 字段映射（CC AgentTool.tsx:719-727 object literal → SubagentContext）")
 class SubagentAgentContextWiringTest {
 
     // ────────────────────────────────────────────────────────────────────────
@@ -119,10 +122,12 @@ class SubagentAgentContextWiringTest {
     }
 
     @Test
-    @DisplayName("自定义 agent: isBuiltIn=false → getSubagentLogName 返回 'user-defined'（CC agentContext.ts:150）")
+    @DisplayName("自定义 agent: isBuiltIn=false（CC :723 isBuiltInAgent；隐私映射的前置）")
     void customAgent_shouldMapIsBuiltInFalse() {
-        // WHY: CC agentContext.ts:145-150 getSubagentLogName 对非内置 agent 恒返回 'user-defined'，
-        //   自定义 agent 名不泄入 analytics。isBuiltIn=false 是这条路径的前置（CC :723 isBuiltInAgent）。
+        // WHY: CC agentContext.ts:145-150 的隐私映射（非内置 agent 恒映射为 'user-defined'，
+        //   自定义名不泄入 analytics）以 <b>isBuiltIn=false</b> 为前置（CC :723 isBuiltInAgent）。
+        //   该映射本身现由 {@code SessionFileAccessHooks.subagentProps} 承载、由
+        //   {@code SubagentNameExplicitCarrierTest} 守；本用例只钉「映射的输入字段被正确派生」。
         AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
             UUID.randomUUID(), "my-custom-agent", false, null, "spawn");
 
@@ -132,39 +137,8 @@ class SubagentAgentContextWiringTest {
     }
 
     // ────────────────────────────────────────────────────────────────────────
-    // 归因组合语义（runWithAgentContext + getSubagentLogName，对齐 CC agentContext.ts:141-151）
+    // [S1-T7-2] 原「归因组合语义」小节（ambient 载体 + 已删的 Java 侧同名读取方法）
+    // 随载体整体删除而移除；等价语义的守卫落点见类 javadoc 的「历史」段。
     // ────────────────────────────────────────────────────────────────────────
 
-    @Test
-    @DisplayName("归因组合: 内置 agent 块内 getSubagentLogName()=类型名，块外 null（不泄漏到调用方线程）")
-    void builtInAgent_shouldExposeSubagentName_insideAndNullOutside() {
-        // WHY: SessionFileAccessHooks.subagentProps() 在 query loop 内调 getSubagentLogName()，
-        //   包裹后必须返回内置名 "Explore"（CC agentContext.ts:148-149 isBuiltIn → subagentName）。
-        //   块外必须 null（runWithAgentContext finally restore/remove，S-15 ThreadLocal 不泄漏）。
-        AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
-            UUID.randomUUID(), "Explore", true, null, "spawn");
-
-        String nameInside = AgentContext.runWithAgentContext(ctx, AgentContext::getSubagentLogName);
-
-        assertThat(nameInside)
-            .as("内置 agent 块内 getSubagentLogName 必须 = 类型名（CC agentContext.ts:148）")
-            .isEqualTo("Explore");
-        assertThat(AgentContext.getAgentContext())
-            .as("块外 getAgentContext 必须 null（runWithAgentContext finally remove，无 ThreadLocal 泄漏）")
-            .isNull();
-    }
-
-    @Test
-    @DisplayName("归因组合: 自定义 agent 块内 getSubagentLogName()='user-defined'（自定义名不泄入 analytics）")
-    void customAgent_shouldExposeUserDefinedLogName() {
-        // WHY: CC agentContext.ts:150 非内置 agent 恒返回 "user-defined"（自定义名安全边界）。
-        AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
-            UUID.randomUUID(), "my-secret-custom-agent", false, null, "spawn");
-
-        String nameInside = AgentContext.runWithAgentContext(ctx, AgentContext::getSubagentLogName);
-
-        assertThat(nameInside)
-            .as("自定义 agent getSubagentLogName 必须恒为 'user-defined'（CC agentContext.ts:150）")
-            .isEqualTo("user-defined");
-    }
 }

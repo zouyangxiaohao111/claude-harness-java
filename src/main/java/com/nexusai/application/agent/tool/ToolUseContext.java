@@ -188,7 +188,7 @@ public record ToolUseContext(
         // WHY 这两个字段（而不是让 hook 读 AgentContext ThreadLocal）：
         //   SessionFileAccessHooks 的 PostToolUse 回调经 HookRegistry:2595
         //   {@code supplyAsync(withSessionProjectRoot(...), HOOK_EXECUTOR)} 派发 ——
-        //   AgentContext 不在回放白名单 ⇒ {@code AgentContext.getSubagentLogName()} 在 hook 线程恒 null
+        //   归因载体不在回放白名单 ⇒ {@code ambient subagent 名派生} 在 hook 线程恒 null
         //   ⇒ {@code subagent_name} 生产恒空。CC 的 AsyncLocalStorage 自动跨异步传播，
         //   Java 侧必须以「显式传参」等价（用户铁律：会话态一律显式传参，禁止回放）。
         //
@@ -214,7 +214,7 @@ public record ToolUseContext(
         //   new AsyncLocalStorage<AgentContext>()} —— CC 的 ALS 跨 await/异步自动传播，
         //   主循环、hook、以及 fire-and-forget 的 classifier/summary 都能读到同一 context。
         //
-        // WHY 需要本字段（本批根因·实测）：Java 的 {@code AgentContext.STORAGE} 是 plain ThreadLocal，
+        // WHY 需要本字段（本批根因·实测）：Java 侧归因上下文曾是 plain ThreadLocal，
         //   下列消费点全部跑在 **无 executor 的 CompletableFuture（ForkJoinPool.commonPool）** 线程上：
         //     · YoloClassifierImpl（classify/classifyTextAction 的 supplyAsync 闭包 → callWithAgentContext）
         //     · ExecPromptHook（配置驱动 prompt hook 的 supplyAsync 闭包 → buildRequestOptions）
@@ -232,7 +232,7 @@ public record ToolUseContext(
         // 传递链：SubagentExecutor 在本 agent 进入 query loop 前显式盖章（与 subagentName/isBuiltIn
         //   同点，见 {@code #withAgentContext}）；主/后台 loop 由 buildBaseToolUseContext 在
         //   loop 线程捕获。之后所有 with*/copyWith 派生原样透传，不重新捕获。
-        // ⛔ 禁止在派生线程里回放/重设 {@code AgentContext.STORAGE} 再读（用户铁律：回放不算合规）。
+        // ⛔ 禁止在派生线程里回放/重设该 ThreadLocal 再读（用户铁律：回放不算合规）。
         //
         // @JsonIgnore: analytics 归因用身份，不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 subagentName / effectiveModelName / readFileState local-only 约束）。
@@ -1648,7 +1648,7 @@ public record ToolUseContext(
     /**
      * <b>[批 5b-1] agent 归因上下文显式载体 · 唯一生产盖章入口</b>。
      *
-     * <p><b>WHY</b>：{@link com.nexusai.application.agent.subagent.AgentContext#STORAGE} 是 plain
+     * <p><b>WHY</b>：{@link com.nexusai.application.agent.subagent.AgentContext#ambient 归因 ThreadLocal（已删）} 是 plain
      * ThreadLocal，不跨线程继承；而 consumer（YoloClassifierImpl / ExecPromptHook /
      * HaikuToolUseSummaryGenerator）全部跑在**无 executor 的 CompletableFuture（commonPool）** 线程上
      * ⇒ 闭包内读 ThreadLocal 恒 null ⇒ {@code invokingRequestId}/{@code invocationKind} 归因边静默丢失。

@@ -301,6 +301,17 @@ public class TaskListTool extends AbstractTaskTool {
     // ════════════════════════════════════════════════════════════════════════
 
     /**
+     * 单参执行 · 委托 2 参版本（无 ctx ⇒ 会话/身份来源为 null，场景如直接调用/测试）。
+     *
+     * <p>[S1-T11] 与 {@link TaskCreateTool}/{@link TaskUpdateTool} 同款双重重载惯例：真实逻辑在
+     * {@link #execute(ToolUseBlock, ToolUseContext)}，会话/teammate 身份由 ToolUseContext 形参显式承载。
+     */
+    @Override
+    public ToolResult execute(ToolUseBlock call) {
+        return execute(call, null);
+    }
+
+    /**
      * 执行 TaskList · 对齐 CC TaskListTool.ts:65-115 call() + mapToolResultToToolResultBlockParam()
      *
      * <p>核心流程（CC TaskListTool.ts:65-115）：
@@ -310,13 +321,23 @@ public class TaskListTool extends AbstractTaskTool {
      *   <li>构建已解决任务 ID 集合，过滤 blockedBy 引用</li>
      *   <li>格式化输出（每行：#ID [status] subject (owner) [blocked by #X]）</li>
      * </ol>
+     *
+     * <p>[S1-T11] 由单参 {@link #execute(ToolUseBlock)} 委托升级到 {@code execute(call, ctx)}：
+     * 任务列表 ID 的「当前会话」与「teammate 身份」两个来源改由<b>显式形参 ctx</b>承载
+     * （原无参 {@code TaskService.getTaskListId()} 已删除 —— 它无会话来源，只能回退全进程共享 UUID）。
+     *
+     * @param call 工具调用块
+     * @param ctx  工具调用上下文（可为 null：无会话/无身份来源，此时两来源均按 null 参与解析）
      */
     @Override
-    public ToolResult execute(ToolUseBlock call) {
+    public ToolResult execute(ToolUseBlock call, ToolUseContext ctx) {
         // Step 1: 获取任务列表（对齐 CC TaskListTool.ts:66-70）
         // CC: const taskListId = getTaskListId(); const allTasks = (await listTasks(taskListId)).filter(t => !t.metadata?._internal)
         // 逐次动态解析列表 ID（对齐 CC TaskListTool.ts:66 getTaskListId()）
-        String listId = TaskService.getTaskListId();
+        // [S1-T11] 会话/身份**显式**取自 ctx 形参。
+        String listId = TaskService.getTaskListId(
+            ctx != null ? ctx.sessionId() : null,
+            ctx != null ? ctx.teammateIdentity() : null);
         if (log.isDebugEnabled()) {
             log.debug("TaskList 解析列表 ID {}，列出任务", listId);
         }

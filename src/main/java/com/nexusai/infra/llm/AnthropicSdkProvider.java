@@ -1331,7 +1331,7 @@ public class AnthropicSdkProvider implements LlmProvider {
      * <p>telemetry 未注入（null）→ 静默跳过 + debug 日志（测试/未接线零行为变化）。
      *
      * <p><b>[A#3 tuc-invoking-req] 稀疏边上下文改为显式传参</b>：本方法跑在
-     * {@code STREAM_EXECUTOR} 虚拟线程（{@code LlmAgentLoop:6604}），{@code AgentContext.STORAGE}
+     * {@code STREAM_EXECUTOR} 虚拟线程（{@code LlmAgentLoop:6604}），{@code 已删的 ambient 归因 ThreadLocal}
      * 是 plain ThreadLocal、不在回放白名单 ⇒ 旧实现 {@code attachInvokingRequestEdge(attrs)}
      * （读 ThreadLocal）恒得 null ⇒ {@code invokingRequestId} 生产恒空。现由调用方把
      * {@code agentContext} 显式带到本方法，经

@@ -439,7 +439,10 @@ public class WebFetchTool implements Tool {
             }
             WebFetchSecurity.FetchedContent fc = (WebFetchSecurity.FetchedContent) outcome;
             boolean isNonInteractive = ctx != null && ctx.isNonInteractiveSession();
-            return handleFetched(call, url, prompt, fc, start, isNonInteractive);
+            // [S1-T7] agent 归因上下文 = **工具形参 ctx 的显式字段**（两套载体收口到 TUC 单一来源；
+            //   工具线程上 ThreadLocal 不可达）。null → 等价 CC agentContext.ts:170 无 invokingRequestId。
+            return handleFetched(call, url, prompt, fc, start, isNonInteractive,
+                ctx != null ? ctx.agentContext() : null);
         } catch (WebFetchSecurity.DomainBlockedException e) {
             log.warn("[WebFetchTool] 域预检阻断: url={} reason={}", url, e.getMessage());
             return ToolResult.error(call.id(), e.getMessage());
@@ -500,14 +503,16 @@ public class WebFetchTool implements Tool {
      */
     private AgentToolResult handleFetched(ToolUseBlock call, String url, String prompt,
                                           WebFetchSecurity.FetchedContent fc, long start,
-                                          boolean isNonInteractiveSession) {
+                                          boolean isNonInteractiveSession,
+                                          com.nexusai.application.agent.subagent.AgentContext agentContext) {
         boolean isPreapproved = WebFetchPreapprovedHosts.isPreapprovedUrl(url);
         String result;
         if (isPreapproved && fc.contentType().contains("text/markdown")
                 && fc.content().length() < WebFetchSecurity.MAX_MARKDOWN_LENGTH) {
             result = fc.content();
         } else {
-            result = applyPromptToMarkdown(prompt, fc.content(), isPreapproved, isNonInteractiveSession);
+            result = applyPromptToMarkdown(prompt, fc.content(), isPreapproved, isNonInteractiveSession,
+                agentContext);
         }
 
         // [G20③] 二进制内容落盘备注 · 对齐 CC WebFetchTool.ts:280-285（persistedPath 已由
@@ -542,14 +547,17 @@ public class WebFetchTool implements Tool {
      * @param content           markdown 内容（可能超长）
      * @param isPreapprovedDomain 是否预批准域（决定 guidelines 分支，prompt.ts:28-34）
      * @param isNonInteractiveSession 是否非交互会话（透传二次模型调用 options，对齐 CC isNonInteractiveSession）
+     * @param agentContext [S1-T7] agent 归因上下文（工具形参 ctx.agentContext() 显式传入；
+     *                     null = 无归因上下文，等价 CC agentContext.ts:170 无 invokingRequestId）
      * @return 模型摘要文本或截断内容
      */
     private String applyPromptToMarkdown(String prompt, String content, boolean isPreapprovedDomain,
-                                         boolean isNonInteractiveSession) {
+                                         boolean isNonInteractiveSession,
+                                         com.nexusai.application.agent.subagent.AgentContext agentContext) {
         String truncated = content == null ? "" : truncateToMaxMarkdown(content);
         java.util.function.Function<String, String> prompter = secondaryModelPrompter;
         if (prompter == null) {
-            prompter = buildFastModelPrompter(isNonInteractiveSession);
+            prompter = buildFastModelPrompter(isNonInteractiveSession, agentContext);
         }
         if (prompter == null) {
             if (log.isDebugEnabled()) {
@@ -585,9 +593,12 @@ public class WebFetchTool implements Tool {
      * （调用方回退截断，抓取不中断）。
      *
      * @param isNonInteractiveSession 是否非交互会话（透传二次模型调用 options，对齐 CC isNonInteractiveSession）
+     * @param agentContext [S1-T7] agent 归因上下文（显式形参透传，见 {@link #applyPromptToMarkdown}）
      * @return fast 模型 prompter；不可用 → null
      */
-    private java.util.function.Function<String, String> buildFastModelPrompter(boolean isNonInteractiveSession) {
+    private java.util.function.Function<String, String> buildFastModelPrompter(
+            boolean isNonInteractiveSession,
+            com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (llmProviderFactory == null || modelConfigResolver == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[WebFetchTool] 二次模型依赖未注入（llmProviderFactory/modelConfigResolver 为空），回退截断");
@@ -610,7 +621,8 @@ public class WebFetchTool implements Tool {
                 return null;
             }
             LlmProvider provider = llmProviderFactory.getProvider(resolved.config(), resolved.providerType());
-            LlmProvider.ChatRequestOptions options = buildSecondaryModelOptions(isNonInteractiveSession);
+            LlmProvider.ChatRequestOptions options =
+                buildSecondaryModelOptions(isNonInteractiveSession, agentContext);
             return modelPrompt -> provider.chatWithOptions(resolved.config(), modelName,
                     null /* 空 systemPrompt = CC asSystemPrompt([])，toSingleOrgBlock(null) → 无 system 字段 */,
                     modelPrompt, options);
@@ -622,8 +634,15 @@ public class WebFetchTool implements Tool {
         }
     }
 
-    /** 弱模型摘要 chat options · 对齐 CC queryHaiku options（WebFetchTool/utils.ts:507-513）。 */
-    private static LlmProvider.ChatRequestOptions buildSecondaryModelOptions(boolean isNonInteractiveSession) {
+    /**
+     * 弱模型摘要 chat options · 对齐 CC queryHaiku options（WebFetchTool/utils.ts:507-513）。
+     *
+     * @param agentContext [S1-T7] agent 归因上下文（显式形参；原实现读
+     *                     {@code 宿主 ThreadLocal 的 ambient 归因上下文}，已删 —— 两套载体收口到 TUC 单一来源）
+     */
+    private static LlmProvider.ChatRequestOptions buildSecondaryModelOptions(
+            boolean isNonInteractiveSession,
+            com.nexusai.application.agent.subagent.AgentContext agentContext) {
         return new LlmProvider.ChatRequestOptions(
                 List.of(),    // history — 单条 modelPrompt（对齐 CC queryHaiku messages=[userMessage]）
                 null,         // tools — []
@@ -638,7 +657,7 @@ public class WebFetchTool implements Tool {
                 List.of(),    // agents — []
                 Boolean.FALSE, // hasAppendSystemPrompt — false
                 List.of(),    // mcpTools — []
-                isNonInteractiveSession, com.nexusai.application.agent.subagent.AgentContext.getAgentContext()); // isNonInteractiveSession 透传
+                isNonInteractiveSession, agentContext); // isNonInteractiveSession 透传
     }
 
     /** CC makeSecondaryModelPrompt · WebFetchTool/prompt.ts:23-46（guidelines 按预批准域分支）。 */

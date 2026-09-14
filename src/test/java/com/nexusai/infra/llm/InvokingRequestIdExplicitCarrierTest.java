@@ -31,8 +31,8 @@ import static org.mockito.Mockito.mock;
  *
  * <h2>WHY（本批根因 · CLAUDE.md 规则九「测试验证意图」）</h2>
  * CC 的 {@code consumeInvokingRequestId()}（agentContext.ts:163-178）读 AsyncLocalStorage
- * —— Node 的 ALS 跨 await/异步自动传播；Java 的 {@code AgentContext.STORAGE} 是 plain
- * {@link ThreadLocal}，<b>不跨线程继承</b>。而 {@code AnthropicSdkProvider} 的 12 个
+ * —— Node 的 ALS 跨 await/异步自动传播；Java 侧曾以 plain {@link ThreadLocal} 等价之，但
+ * <b>不跨线程继承</b>（该载体已于 S1-T7-2 整体删除）。而 {@code AnthropicSdkProvider} 的 12 个
  * per-LLM-call terminal 发射点跑在 {@code LlmAgentLoop.STREAM_EXECUTOR}（虚拟线程池，
  * {@code LlmAgentLoop:6604}；Java 虚拟线程不继承创建线程的 ThreadLocal）⇒ 旧实现
  * {@code attachInvokingRequestEdge(attrs)}（读 ambient ThreadLocal）恒得 null ⇒
@@ -52,24 +52,30 @@ import static org.mockito.Mockito.mock;
  *       chat 路径提交到独立虚拟线程（镜像
  *       {@code YoloClassifierImpl.callWithMdc} 的 {@code CompletableFuture.supplyAsync} 边界）；</li>
  *   <li>断言事件发射线程 ≠ 测试线程；</li>
- *   <li>断言发射线程上 {@code AgentContext.getAgentContext() == null}（证明 ambient 路线
- *       在本路径上根本读不到值 —— 值只可能来自显式载体）；</li>
+ *   <li>[S1-T7-2] 原第 3 条「断言发射线程上 ambient 归因上下文为 null」<b>已随该载体整体删除
+ *       而移除</b>：该维度现由<b>编译期</b>保证（无 ambient 读取 API 可调）+
+ *       {@code AgentContextAmbientReadInventoryTest} 守卫；运行期已无可断言对象。</li>
  *   <li>断言<b>稀疏化</b>：同一 invocation 的后续 terminal event 不再携带（CC
  *       agentContext.ts:159-161 {@code invocationEmitted} 一次翻转）。</li>
  * </ol>
  *
- * <p><b>反向实验（已实测）</b>：把 {@code emitApiTerminalEvent} 改回
- * {@code AgentContext.attachInvokingRequestEdge(attrs)}（读 ThreadLocal）⇒ 本类全红。
+ * <p><b>反向实验（已实测）</b>：把 {@code emitApiTerminalEvent} 改回读线程环境变量（ambient）⇒ 本类全红。
+ * 该 ambient 读取入口已随 [S1-T7-2] 整体删除 ⇒ 现在回退会直接<b>编译失败</b>。
  */
 class InvokingRequestIdExplicitCarrierTest {
 
     private static final String MODEL = "claude-sonnet-4-6";
 
-    /** 观测点：事件属性 + 发射线程 + 发射线程上的 ambient AgentContext。 */
+    /**
+     * 观测点：事件属性 + 发射线程。
+     *
+     * <p>[S1-T7-2] 原还有一项「发射线程上的 ambient AgentContext」——随 ambient 归因载体整体删除而移除：
+     * 该维度现由<b>编译期</b>保证（无 ambient 读取 API 可调）+ {@code AgentContextAmbientReadInventoryTest}
+     * 守卫（断言载体在 {@code src/main} 彻底不存在）。运行期已无可断言对象。
+     */
     private static final class Observations {
         final List<Map<String, Object>> successAttrs = new CopyOnWriteArrayList<>();
         final List<String> emittingThreads = new CopyOnWriteArrayList<>();
-        final List<Object> ambientAgentContextOnEmitter = new CopyOnWriteArrayList<>();
     }
 
     private static Observations wire(Telemetry telemetry) {
@@ -77,7 +83,6 @@ class InvokingRequestIdExplicitCarrierTest {
         doAnswer(inv -> {
             obs.successAttrs.add(inv.getArgument(1));
             obs.emittingThreads.add(Thread.currentThread().getName());
-            obs.ambientAgentContextOnEmitter.add(AgentContext.getAgentContext());
             return null;
         }).when(telemetry).recordEvent(eq("tengu_api_success"), any());
         return obs;
@@ -128,10 +133,6 @@ class InvokingRequestIdExplicitCarrierTest {
             AgentContext.SubagentContext ctx = subagentCtx("req-from-subagent");
             CountDownLatch done = new CountDownLatch(1);
 
-            assertThat(AgentContext.getAgentContext())
-                .as("前置：测试线程无 AgentContext（值不可能来自 ambient ThreadLocal）")
-                .isNull();
-
             // 真 STREAM_EXECUTOR 提交（生产同一点：LlmAgentLoop:6604 STREAM_EXECUTOR.execute）
             realStreamExecutor().submit(() -> provider.stream(
                 config(server), MODEL,
@@ -154,10 +155,6 @@ class InvokingRequestIdExplicitCarrierTest {
             assertThat(obs.emittingThreads)
                 .as("夹具有效性：事件在非测试线程（真 STREAM_EXECUTOR 虚拟线程）发射")
                 .allSatisfy(t -> assertThat(t).isNotEqualTo(Thread.currentThread().getName()));
-            assertThat(obs.ambientAgentContextOnEmitter)
-                .as("夹具有效性：发射线程上 ambient AgentContext 恒 null —— 证明值只来自显式载体"
-                    + "（旧实现读 ambient 必得 null）")
-                .allMatch(java.util.Objects::isNull);
         } finally {
             server.stop(0);
         }
@@ -193,9 +190,6 @@ class InvokingRequestIdExplicitCarrierTest {
             assertThat(obs.emittingThreads)
                 .as("夹具有效性：发射线程 = 派发线程而非测试线程")
                 .allSatisfy(name -> assertThat(name).isEqualTo("chat-side-query-thread"));
-            assertThat(obs.ambientAgentContextOnEmitter)
-                .as("夹具有效性：该线程 ambient AgentContext 为 null（值只来自显式载体）")
-                .allMatch(java.util.Objects::isNull);
         } finally {
             server.stop(0);
         }

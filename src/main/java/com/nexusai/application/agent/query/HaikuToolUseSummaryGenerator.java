@@ -200,7 +200,7 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
                 List.of(),   // CC :76 agents: []
                 Boolean.FALSE, // CC :78 hasAppendSystemPrompt: false
                 List.of(),   // CC :79 mcpTools: []
-                // [批 5b-1] agent 归因上下文改取**显式形参**（原读 AgentContext.getAgentContext()
+                // [批 5b-1] agent 归因上下文改取**显式形参**（原读 ambient 归因上下文
                 //   ThreadLocal：本方法在 commonPool worker 上运行 ⇒ 读恒 null ⇒
                 //   invokingRequestId/invocationKind 归因边静默丢失；CC 的 ALS 无此问题）。
                 //   本路径由调用方（LlmAgentLoop tool_use_summary 生产点）从 TUC 显式下传；

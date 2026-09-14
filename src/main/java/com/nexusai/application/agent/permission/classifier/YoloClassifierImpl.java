@@ -580,7 +580,7 @@ public class YoloClassifierImpl implements YoloClassifier {
                     ? LlmProvider.ChatRequestOptions.ToolChoice.tool(YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME)
                     : null,
                 // [批 5b-1] agent 归因上下文改取**显式载体 ctx.agentContext()**（原读
-                //   AgentContext.getAgentContext() ThreadLocal）：本方法整体运行在 classify()/
+                //   ambient 归因上下文（宿 ThreadLocal，已删载体））：本方法整体运行在 classify()/
                 //   classifyTextAction() 的无 executor supplyAsync 闭包内（commonPool worker），
                 //   plain ThreadLocal 不跨线程 ⇒ 原读恒 null ⇒ invokingRequestId/invocationKind
                 //   归因边静默丢失。TUC 上的值由 SubagentExecutor（子代理）/
@@ -1166,7 +1166,7 @@ public class YoloClassifierImpl implements YoloClassifier {
             String systemPrompt, String userMessage, ToolUseContext ctx) throws Exception {
         // [批 5b-1] 归因上下文的**唯一来源 = 显式载体 ctx.agentContext()**：
         //   本方法被 callWithRetry 在 classify()/classifyTextAction() 的 commonPool worker 上调用，
-        //   原实现在此处读 AgentContext.getAgentContext() ThreadLocal —— 该线程不继承提交线程的
+        //   原实现在此处读 ambient 归因上下文（宿 ThreadLocal）—— 该线程不继承提交线程的
         //   ThreadLocal（plain ThreadLocal 不跨线程）⇒ 恒 null ⇒ invokingRequestId/invocationKind
         //   归因边静默丢失（CC 的 AsyncLocalStorage 自动跨异步传播，无此问题）。
         //   TUC 上的值由显式盖章点写入（SubagentExecutor / buildBaseToolUseContext），跨线程可见。

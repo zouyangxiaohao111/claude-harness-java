@@ -527,7 +527,7 @@ public class ExecPromptHook {
         List<com.nexusai.application.agent.tool.Tool> tools,
         // [批 5b-1] agent 归因上下文（显式载体）· CC original: execPromptHook.ts 经 ALS 读 ambient
         //   agentContext（logging.ts:294/:461 consumeInvokingRequestId）。Java 的
-        //   AgentContext.STORAGE 是 plain ThreadLocal，而本 hook 的 LLM 调用跑在
+        //   Java 侧归因上下文曾是 plain ThreadLocal 载体，而本 hook 的 LLM 调用跑在
         //   supplierAsync 闭包（commonPool worker）⇒ 闭包内读 ThreadLocal 恒 null
         //   ⇒ invokingRequestId/invocationKind 归因边静默丢失。
         //   值由 HookRegistry 从父 TUC 取（该 TUC 在 SubagentExecutor / buildBaseToolUseContext

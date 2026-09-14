@@ -132,8 +132,8 @@ class LlmAgentLoopSessionPushContextTest {
             // (b) 类：跳过推送但**不抛**（压缩照常），且 ≥WARN 可观测由 CompactWarningState 承担。
             //   触发点 3（publishTokenWarning）本身不改 store；触发点 1（suppress）才推进 store。
             CompactWarningState.publishTokenWarning(pushCtx, true, 1L, 1L, 1);
-            CompactWarningState.suppressCompactWarning(pushCtx);
-            assertThat(CompactWarningState.isCompactWarningSuppressed())
+            CompactWarningState.suppressCompactWarning(state.sessionId(), pushCtx);
+            assertThat(CompactWarningState.isCompactWarningSuppressed(state.sessionId()))
                 .as("store 状态仍被推进（跳过的是推送，不是状态机）").isTrue();
         });
     }

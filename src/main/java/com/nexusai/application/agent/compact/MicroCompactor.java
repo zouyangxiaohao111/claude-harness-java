@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
  * + CompactResult(MICRO) 边界产出，[IMP2-23 D-19] 过渡面已删）——全部与 CC 语义偏移
  * （探查 03 ⊕1..⊕8）。本类重建为 CC {@code microcompactMessages} 链式入口：
  * <ol>
- *   <li>{@link CompactWarningState#clearCompactWarningSuppression()} —— 压缩开始复位警告抑制
+ *   <li>{@link CompactWarningState#clearCompactWarningSuppression(String, CompactWarningState.SessionPushContext)} —— 压缩开始复位本会话警告抑制
  *       （microCompact.ts:259）</li>
  *   <li>time-based 短路 —— gap 超阈值则内容清除后返回（microCompact.ts:267-270，
  *       {@code maybeTimeBasedMicrocompact}:446）</li>
@@ -346,7 +346,7 @@ public class MicroCompactor {
 
         // ── 1. 压缩开始复位警告抑制（microCompact.ts:259 clearCompactWarningSuppression）──
         //   [批 5a-2] push 上下文显式下传（原 ThreadLocal 载体已删）
-        CompactWarningState.clearCompactWarningSuppression(warningPushContext);
+        CompactWarningState.clearCompactWarningSuppression(sessionId, warningPushContext);
 
         // ── 2. time-based 短路（microCompact.ts:267-270 maybeTimeBasedMicrocompact）──
         MicroCompactResult timeBased = maybeTimeBasedMicrocompact(messages, querySource, sessionId,
@@ -512,7 +512,7 @@ public class MicroCompactor {
             "tokensSaved", tokensSaved));
 
         // 压缩成功抑制警告（microCompact.ts:511 suppressCompactWarning）
-        CompactWarningState.suppressCompactWarning(warningPushContext);
+        CompactWarningState.suppressCompactWarning(sessionId, warningPushContext);
         // 刚内容清除 + 服务端缓存失效 → 若 next turn cached-MC 带陈旧 state 运行会删不存在的工具
         // → 重置（microCompact.ts:513-517 resetMicrocompactState）
         resetMicrocompactState(sessionId);
@@ -634,7 +634,7 @@ public class MicroCompactor {
             "keepRecent", config.keepRecent()));
 
         // ── ⑦ 压缩成功抑制警告（microCompact.ts:359 suppressCompactWarning）──
-        CompactWarningState.suppressCompactWarning(warningPushContext);
+        CompactWarningState.suppressCompactWarning(sessionId, warningPushContext);
 
         // ── ⑧ 通知 cache break 检测预期下降（microCompact.ts:361-367，feature 门在 notifier 内 gatedBy）──
         notifyCacheDeletion.accept(querySource != null ? querySource : "repl_main_thread", null);

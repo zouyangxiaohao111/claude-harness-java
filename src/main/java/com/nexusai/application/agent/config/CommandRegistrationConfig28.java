@@ -408,8 +408,8 @@ public class CommandRegistrationConfig28 {
                 }
                 String denial = denialTracker != null
                     ? String.format("（分类器拒绝: consecutive=%d total=%d，熔断=%s）",
-                        denialTracker.getConsecutiveDenials(), denialTracker.getTotalDenials(),
-                        denialTracker.shouldFallbackToPrompting())
+                        denialTracker.getConsecutiveDenials(sessionId), denialTracker.getTotalDenials(sessionId),
+                        denialTracker.shouldFallbackToPrompting(sessionId))
                     : "";
                 log.info("[CommandRegistrationConfig28] /permissions 执行完成: 共 {} 条可编辑规则"
                     + "（allow={} deny={} ask={}）%n{}{}（对齐 CC permissions.tsx PermissionRuleList）",

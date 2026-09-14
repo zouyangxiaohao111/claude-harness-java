@@ -93,7 +93,7 @@ class SubagentLoopContextStampTest {
             .as("必须在派生线程（commonPool worker）上执行，否则本用例不覆盖真实缺陷路径")
             .isNotEqualTo(testThread);
         assertThat(seen[1])
-            .as("盖章值跨线程可读（改前读 AgentContext.STORAGE ThreadLocal 恒 null）")
+            .as("盖章值跨线程可读（改前读线程环境变量（ambient）恒 null）")
             .isEqualTo("req_stamp_worker");
     }
 

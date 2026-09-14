@@ -227,8 +227,12 @@ public class SpawnInProcess {
             AbortControllerFactory.AbortControllerRef abortController = AbortControllerFactory.create();
 
             // parentSessionId = Leader's session（CC :125 getSessionId）
+            // [S1-T11] 兜底分支显式化（原无参 TaskService.getTaskListId() 已删除）。本分支的前提是
+            //   「SpawnContext 未携带 leader session」⇒ 此刻**尚无**任何会话/身份来源可取（identity
+            //   正是下面才由 config+parentSessionId 构造出来，二者互为输入）⇒ 两来源显式传 null，
+            //   语义与旧无参重载逐字一致（走 1-5 级 sysprop，最终回退进程级共享 UUID 并留 WARN）。
             String parentSessionId = context != null && context.parentSessionId() != null
-                ? context.parentSessionId() : TaskService.getTaskListId();
+                ? context.parentSessionId() : TaskService.getTaskListId(null, null);
 
             // identity（纯数据载体）
             TeammateIdentity identity = new TeammateIdentity(

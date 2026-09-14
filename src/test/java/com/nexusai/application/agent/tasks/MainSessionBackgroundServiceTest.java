@@ -35,8 +35,10 @@ import static org.mockito.Mockito.when;
  *   <li><b>'s' 前缀 + symlink 隔离</b>（OPD-TP-13/17）——CC 用独立 taskId + 按 task 隔离 transcript
  *       （LocalMainSessionTask.ts:75-82 + :107-110），使后台任务输出不写主会话 transcript
  *       （/clear 后损坏防护）；若 Java 侧复用主查询 topic/transcript，后台与前台会串流/互污染。</li>
- *   <li><b>runWithAgentContext 隔离</b>（CC :368-375）——后台查询的 agent 上下文必须是 taskId 绑定的
- *       SubagentContext，否则 skill 作用域归到主线程（agentId=null）。</li>
+ *   <li><b>归因上下文隔离</b>（CC :368-375 的 {@code runWithAgentContext} 语义）——后台查询的
+ *       agent 上下文必须是 taskId 绑定的 SubagentContext，否则 skill 作用域归到主线程（agentId=null）。
+ *       [S1-T7] 承载方式 = 显式 `RunRequest.withAgentContext(...)`（**不是** CC 那个 ThreadLocal 外壳；
+ *       后者在 Java 侧整体删除 —— 见 {@code MainSessionBackgroundService} 类注释）。</li>
  *   <li><b>任务级 streamTopic</b>（w5-01 隔离设计 1）——后台派生查询必须走 {@code /topic/tasks/{taskId}/stream}，
  *       不复用 {@code /topic/sessions/{S}/stream}（会话级单 topic），否则与前台同 topic 串流。</li>
  *   <li><b>abort 中断</b>（CC :387-401）——中断后置 notified + emitTaskTerminatedSdk('stopped')，
@@ -202,13 +204,18 @@ class MainSessionBackgroundServiceTest {
     }
 
     @Test
-    @DisplayName("startBackgroundSession：runWithAgentContext 隔离 + 任务级 streamTopic + 独立 loop.run")
+    @DisplayName("startBackgroundSession：agentContext 显式随 RunRequest 下传 + 任务级 streamTopic + 独立 loop.run")
     void startBackgroundSession_runsLoopWithTaskContextAndTopic() {
         // WHY: CC :368-375 runWithAgentContext(SubagentContext{agentId:taskId, subagentName:'main-session'})
         //   隔离 skill 作用域；:107-110 任务级 topic/transcript 防与前台串流。
-        final AgentContext[] seenContext = new AgentContext[1];
+        // [S1-T7] 承载方式已改：不再是 runWithAgentContext（ThreadLocal 回放）外壳，
+        //   而是把**同一个实例**作为值经 RunRequest.withAgentContext(...) 随 run 下传
+        //   （用户铁律：会话态一律显式传参，回放不算合规）⇒ 断言从「ambient 读回」改为
+        //   「RunRequest 携带的值」—— 断言对象从载体换成值本身，语义更强（不依赖线程）。
+        final com.nexusai.application.agent.RunRequest[] seenRequest =
+            new com.nexusai.application.agent.RunRequest[1];
         doAnswer(inv -> {
-            seenContext[0] = AgentContext.getAgentContext();
+            seenRequest[0] = inv.getArgument(0);
             return null;
         }).when(loop).run(any());
 
@@ -216,9 +223,10 @@ class MainSessionBackgroundServiceTest {
             "sess-x", "bg", List.of(Map.of("role", "user", "content", "hi")),
             null, "hi", "mock-fast", ProviderConfig.empty(), null);
 
-        // loop 在 SubagentContext（agentId=taskId, subagentName=main-session）内执行
-        assertThat(seenContext[0]).isInstanceOf(AgentContext.SubagentContext.class);
-        AgentContext.SubagentContext sc = (AgentContext.SubagentContext) seenContext[0];
+        // loop 拿到的 RunRequest 携带 SubagentContext（agentId=taskId, subagentName=main-session）
+        assertThat(seenRequest[0]).as("loop.run 必须被调用并带上 RunRequest").isNotNull();
+        assertThat(seenRequest[0].agentContext()).isInstanceOf(AgentContext.SubagentContext.class);
+        AgentContext.SubagentContext sc = (AgentContext.SubagentContext) seenRequest[0].agentContext();
         assertThat(sc.agentId()).isEqualTo(taskId);
         assertThat(sc.subagentName()).isEqualTo("main-session");
         assertThat(sc.isBuiltIn()).isTrue();

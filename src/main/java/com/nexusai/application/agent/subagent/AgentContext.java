@@ -13,15 +13,24 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Supplier;
 
 /**
  * Agent 上下文（analytics 归因）· 对齐 CC {@code utils/agentContext.ts:1-178} (AsyncLocalStorage).
  *
  * <p><b>WHY (CLAUDE.md 规则一 · CC :16-21 注释真源)</b>：
  * CC 用 {@code AsyncLocalStorage} 隔离每条异步执行链的 agent 身份，避免并发 agent 的
- * analytics 事件归因串台（agent A 的 event 归到 agent B）。Java 端以 {@link ThreadLocal}
- * 等价 AsyncLocalStorage（concern S7-1: ThreadLocal 最贴近 CC enter/exit 语义）。
+ * analytics 事件归因串台（agent A 的 event 归到 agent B）。
+ *
+ * <p><b>⛔ [S1-T7-2 终态] Java 端<b>没有</b> ambient 存储</b>：本接口曾以 plain
+ * {@code ThreadLocal} 等价 CC 的 AsyncLocalStorage，<b>已整体删除</b>（载体 + 全部读写方法
+ * + 线程包裹）。根因：plain ThreadLocal <b>不跨线程继承</b>，而本仓归因消费点大量跑在
+ * commonPool / tool-exec 池 / STREAM_EXECUTOR 虚拟线程上 ⇒ ambient 读在那些线程上恒 null
+ * （归因边静默丢失）；「一 JVM 多会话」下还会退化为跨会话串扰。
+ *
+ * <p>现行契约 = <b>显式值传递</b>（用户铁律：会话态一律不得经 ThreadLocal/MDC 读，回放不算合规）：
+ * {@code RunRequest.agentContext} → {@code ToolUseContext.agentContext()} → 工具
+ * {@code execute} 形参 / {@code ModelRequest.agentContext} → provider 显式形参。
+ * 本接口只保留<b>接收显式实参</b>的类型守卫与纯函数。
  *
  * <p><b>两种 context (discriminated union · CC :91)</b>:
  * <ul>
@@ -39,12 +48,6 @@ import java.util.function.Supplier;
 public sealed interface AgentContext {
 
     Logger log = LoggerFactory.getLogger(AgentContext.class);
-
-    /**
-     * 当前执行链的 agent context 存储 · 等价 CC {@code agentContextStorage} (agentContext.ts:93
-     * {@code const agentContextStorage = new AsyncLocalStorage<AgentContext>()}).
-     */
-    ThreadLocal<AgentContext> STORAGE = new ThreadLocal<>();
 
     // ────────────────────────────────────────────────────────────────────────────
     // Context 类型
@@ -137,79 +140,22 @@ public sealed interface AgentContext {
     // ────────────────────────────────────────────────────────────────────────────
 
     /**
-     * 获取当前 agent context · 等价 CC {@code getAgentContext()} (agentContext.ts:100-102).
+     * 一次消费 invokingRequestId · <b>本接口唯一入口（显式实参）</b>。
      *
-     * <p>未在 {@link #runWithAgentContext} 块内执行时返回 {@code null} (CC :101 returns undefined)。
+     * <p><b>Sparse edge 语义 (CC agentContext.ts:159-161 注释真源)</b>: invokingRequestId 只在每个
+     * invocation 的第一个 terminal API event 出现一次, 消费后 {@code invocationEmitted=true}
+     * 阻止后续重复返回。调用方在收到非 null 返回值时标记一个 spawn/resume 边界。
      *
-     * @return 当前线程的 AgentContext，无则 null
-     */
-    static AgentContext getAgentContext() {
-        return STORAGE.get();
-    }
-
-    /**
-     * 在指定 agent context 下运行 {@code fn} · 等价 CC {@code runWithAgentContext()} (agentContext.ts:108-110).
+     * <p><b>WHY 只保留显式实参版（本仓根因）</b>：CC 的 {@code consumeInvokingRequestId()}
+     * （agentContext.ts:163-178）读 {@code AsyncLocalStorage} —— Node 的 ALS 跨 await/异步自动传播；
+     * Java 的 plain {@code ThreadLocal} <b>不跨线程继承</b>，而本方法的调用点
+     * （{@code AnthropicSdkProvider.emitApiTerminalEvent}）跑在
+     * {@code LlmAgentLoop.STREAM_EXECUTOR} 虚拟线程上 ⇒ ambient 读恒 null ⇒
+     * {@code invokingRequestId} 生产恒空。故 ambient 版已删除，只留显式版。
      *
-     * <p><b>WHY (CC :104-107 注释)</b>：所有异步操作在函数内都可访问该 context。
-     * Java ThreadLocal try-finally set/remove; 嵌套 run 时恢复 previous (对齐
-     * AsyncLocalStorage.run 的 enter/exit 语义, 嵌套链不串台)。
-     *
-     * @param context 要设置的 AgentContext (不可为 null)
-     * @param fn      要运行的函数
-     * @return fn 的返回值
-     */
-    static <T> T runWithAgentContext(AgentContext context, Supplier<T> fn) {
-        AgentContext previous = STORAGE.get();
-        STORAGE.set(context);
-        try {
-            return fn.get();
-        } finally {
-            if (previous == null) {
-                STORAGE.remove();
-            } else {
-                STORAGE.set(previous);
-            }
-        }
-    }
-
-    /**
-     * 在指定 agent context 下运行 {@code fn} (Runnable 重载) · 等价 CC runWithAgentContext.
-     */
-    static void runWithAgentContext(AgentContext context, Runnable fn) {
-        runWithAgentContext(context, () -> {
-            fn.run();
-            return null;
-        });
-    }
-
-    /**
-     * 一次消费 invokingRequestId · 等价 CC {@code consumeInvokingRequestId()} (agentContext.ts:163-178).
-     *
-     * <p><b>Sparse edge 语义 (CC :159-161 注释真源)</b>: invokingRequestId 只在每个 invocation 的
-     * 第一个 terminal API event 出现一次, 消费后 {@code invocationEmitted=true} 阻止后续重复返回。
-     * 调用方在收到非 null 返回值时标记一个 spawn/resume 边界。
-     *
-     * @return 首次调用返回 {@link InvokingRequestEdge}; 已消费或无 invokingRequestId 返回 null
-     */
-    static InvokingRequestEdge consumeInvokingRequestId() {
-        return consumeInvokingRequestId(getAgentContext());
-    }
-
-    /**
-     * 一次消费 invokingRequestId · <b>显式上下文重载</b>（会话态显式传参，禁 ThreadLocal 回读）。
-     *
-     * <p><b>WHY 需要显式重载（本批根因）</b>：CC 的 {@code consumeInvokingRequestId()}（agentContext.ts:163-178）
-     * 读 {@code AsyncLocalStorage} —— Node 的 ALS 跨 await/异步自动传播；Java 的
-     * {@link #STORAGE} 是 plain {@link ThreadLocal}，<b>不跨线程继承</b>。
-     * {@code AnthropicSdkProvider.emitApiTerminalEvent} 跑在 {@code LlmAgentLoop.STREAM_EXECUTOR}
-     * 虚拟线程（{@code LlmAgentLoop:6604}），AgentContext 不在回放白名单（只有 MDC / projectRoot /
-     * teammateContext 被回放）⇒ {@code getAgentContext()} 恒 null ⇒ {@code invokingRequestId}
-     * 生产恒空。
-     *
-     * <p><b>修法 = 显式载体</b>：调用方在<b>上下文仍有效的线程</b>（子代理 query loop 线程，
-     * {@code SubagentExecutor:2003 runWithAgentContext} 作用域内）取出 {@link AgentContext} 实例，
-     * 经 {@code ModelRequest.agentContext} → {@code ModelCaller} → {@code LlmProvider.stream} /
-     * {@code ChatRequestOptions.agentContext} 显式下传，provider 在本方法消费。
+     * <p><b>载体链（显式值传递）</b>：调用方在<b>上下文仍有效的线程</b>（子代理 query loop 线程）
+     * 取出 {@link AgentContext} 实例，经 {@code ModelRequest.agentContext} → {@code ModelCaller}
+     * → {@code LlmProvider.stream} / {@code ChatRequestOptions.agentContext} 显式下传，provider 在本方法消费。
      * 稀疏语义（{@code invocationEmitted} 一次翻转）由共享的同一 {@link SubagentContext} 实例承载，
      * 与 CC 逐字一致（CC 也是原地翻 {@code context.invocationEmitted}）。
      *
@@ -222,18 +168,39 @@ public sealed interface AgentContext {
         }
         String invokingRequestId = null;
         String invocationKind = null;
+        String agentId = null;
         AtomicBoolean emitted = null;
         if (context instanceof SubagentContext sc) {
             invokingRequestId = sc.invokingRequestId();
             invocationKind = sc.invocationKind();
+            agentId = sc.agentId();
             emitted = sc.invocationEmitted();
         } else if (context instanceof TeammateAgentContext tc) {
             invokingRequestId = tc.invokingRequestId();
             invocationKind = tc.invocationKind();
+            agentId = tc.agentId();
             emitted = tc.invocationEmitted();
         }
-        // CC :170: if (!context?.invokingRequestId || context.invocationEmitted) return undefined
-        if (invokingRequestId == null || emitted == null || emitted.get()) {
+        // CC :170 前半: if (!context?.invokingRequestId) return undefined
+        // [S1-T14 缺值策略 (b)] 「上下文存在但 invokingRequestId 缺值」= 本 run 的所有 terminal
+        //   API event 都不带归因边（结构性缺失，不是偶发）。记 ≥WARN（禁只 DEBUG）披露该事实。
+        //   ⚠️ 该分支在热路径（每次 terminal API event 都会走到）⇒ 用**每实例一次性**闩锁防刷屏：
+        //      claim 该实例的 invocationEmitted 作闩锁（invokingRequestId 是 record 的 final 组件，
+        //      为 null 即永远为 null ⇒ 翻转 emitted 对本方法语义完全惰性）。
+        //      ⛔ 不使用进程级 AtomicBoolean 单次闸——那会把「≥WARN 可观测」结构性地降级成
+        //      「每 JVM 一行」（本仓裁定-8 的实证）。
+        if (invokingRequestId == null) {
+            if (emitted != null && emitted.compareAndSet(false, true)) {
+                log.warn("[AgentContext 缺值策略(b)] 归因上下文存在但缺 invokingRequestId"
+                    + "（agentId={}, contextType={}）⇒ 本 run 的全部 terminal API event 均不带"
+                    + " invokingRequestId/invocationKind 归因边（『缺值 ⇒ 无属性』，绝不归因到 ambient）"
+                    + "；本条为该上下文实例的一次性披露，不是每调用告警",
+                    agentId, context.getClass().getSimpleName());
+            }
+            return null;
+        }
+        // CC :170 后半: || context.invocationEmitted → return undefined（sparse edge 已消费）
+        if (emitted == null || emitted.get()) {
             return null;
         }
         // CC :173: context.invocationEmitted = true (一次消费后清空)
@@ -245,40 +212,19 @@ public sealed interface AgentContext {
     }
 
     /**
-     * 消费当前 invocation 稀疏边并接入遥测事件属性（D19/A3 接入遥测链路）·
-     * 对齐 CC {@code services/api/logging.ts:294/:461}（error/success 两个 terminal API event
-     * 发射点调用 {@code consumeInvokingRequestId()}）+ {@code :320-327/:493-500}
-     * （edge 非 null 时把 invokingRequestId/invocationKind 展开进 tengu_api_error/tengu_api_success 事件负载）。
+     * 消费稀疏边并接入遥测事件属性 · <b>唯一入口（provider 侧唯一调用点）</b>。
      *
-     * <p><b>接入遥测链路 (D19 · open-decisions §F1)</b>: CC 的 sparse-edge 归因激活点不在
-     * agentContext.ts 自身，而在 API 遥测链路 —— 每个 invocation 的第一个 terminal API event
-     * 携带 invokingRequestId（spawn/resume 边界标记，agentContext.ts:159-161）。Java API
-     * 遥测链路的 terminal 事件属性构建点调用本方法即完成等价接入：edge 非 null 时事件 attrs
-     * 写入 {@code invokingRequestId}/{@code invocationKind} 两键（CC logging.ts:322-325/:495-498 spread）。
+     * <p><b>CC 锚点真源（logging.ts，grep -n 自验）</b>：error 路径 :294
+     * {@code const invocation = consumeInvokingRequestId()} + :320-327 spread；success 路径 :461 同款
+     * + :493-500 spread —— edge 非 null 时把 invokingRequestId/invocationKind 展开进
+     * tengu_api_error/tengu_api_success 事件负载（CC 的 sparse-edge 激活点不在 agentContext.ts
+     * 自身，而在 API 遥测链路）。Java 侧本方法即该接入点：edge 非 null 时事件 attrs 写入
+     * {@code invokingRequestId}/{@code invocationKind} 两键（CC logging.ts:322-325/:495-498 spread）。
      *
-     * <p><b>CC 消费点真源（logging.ts，grep -n 自验）</b>：
-     * <ul>
-     *   <li>error 路径 :294 {@code const invocation = consumeInvokingRequestId()} + :320-327 spread</li>
-     *   <li>success 路径 :461 {@code const invocation = consumeInvokingRequestId()} + :493-500 spread</li>
-     * </ul>
-     *
-     * @param eventAttrs 事件属性 Map（事件发射前填充，等价 CC logEvent payload 对象；
-     *                   null → 仅消费稀疏边不写属性，返回 edge 仍可判定本次消费）
-     * @return 本次消费的 {@link InvokingRequestEdge}（非 null = 当前事件携带稀疏边；
-     *         null = 无 invokingRequestId / 已消费 / 无 context，CC :170 guard）
-     */
-    static InvokingRequestEdge attachInvokingRequestEdge(Map<String, Object> eventAttrs) {
-        return attachInvokingRequestEdge(eventAttrs, getAgentContext());
-    }
-
-    /**
-     * 消费稀疏边并接入遥测事件属性 · <b>显式上下文重载</b>（provider 侧唯一入口）。
-     *
-     * <p>与 {@link #attachInvokingRequestEdge(Map)} 语义逐字相同，唯一差别是上下文来源
-     * —— 显式参数而非 {@link #STORAGE} ThreadLocal（理由见
-     * {@link #consumeInvokingRequestId(AgentContext)}）。{@code AnthropicSdkProvider} 的 12 个
-     * per-LLM-call terminal 发射点全部走本重载，上下文经 {@code LlmProvider.stream} /
-     * {@code ChatRequestOptions} 显式携带到 {@code STREAM_EXECUTOR} 虚拟线程。
+     * <p><b>WHY 上下文是显式实参（本仓根因）</b>：{@code AnthropicSdkProvider} 的 12 个
+     * per-LLM-call terminal 发射点全部走本方法，上下文经 {@code LlmProvider.stream} /
+     * {@code ChatRequestOptions} 显式携带到 {@code STREAM_EXECUTOR} 虚拟线程（理由见
+     * {@link #consumeInvokingRequestId(AgentContext)}）。ambient 版已删除。
      *
      * @param eventAttrs   事件属性 Map（null → 仅消费不写属性）
      * @param context      显式上下文（null → 主线程，等价 CC {@code context?.invokingRequestId} undefined）
@@ -323,23 +269,6 @@ public sealed interface AgentContext {
             return false;
         }
         return context instanceof TeammateAgentContext;
-    }
-
-    /**
-     * 获取 analytics 日志用的 subagent 名 · 等价 CC {@code getSubagentLogName()} (agentContext.ts:141-151).
-     *
-     * <p><b>CC :145-150 逻辑</b>: 非 subagent context 或无 subagentName → undefined;
-     * isBuiltIn → subagentName (内置名是代码常量, analytics 安全);
-     * 非内置 (用户自定义) → 恒返回 "user-defined" (自定义名不泄入 analytics)。
-     *
-     * @return subagentName (内置) 或 "user-defined" (自定义); 非 subagent context 返回 null
-     */
-    static String getSubagentLogName() {
-        AgentContext context = getAgentContext();
-        if (!(context instanceof SubagentContext sc) || sc.subagentName() == null) {
-            return null;
-        }
-        return Boolean.TRUE.equals(sc.isBuiltIn()) ? sc.subagentName() : "user-defined";
     }
 
     // ────────────────────────────────────────────────────────────────────────────

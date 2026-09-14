@@ -316,40 +316,45 @@ public class TaskService {
         // （CC DEFAULT_TASKS_MODE_TASK_LIST_ID tasks.ts:862 仅供 watcher/main.tsx UI 使用，
         // getTaskListId 本身永不返回它，对齐 CC tasks.ts:199-210）。
         // ⚠ 多会话 JVM 下本兜底桶是**全进程共享**的：仅当调用方确实无会话（cron 无会话 / 测试 /
-        //   非请求线程）时才可接受。因此改 WARN 留痕（禁只 DEBUG）——无参 getTaskListId() 的调用方
-        //   应改传显式会话（REST: query ?sessionId=；工具: ctx.sessionId()）。
-        //   本方法在热路径（每轮 computeTaskReminderAttachments + 每个 Task* 工具调用）⇒ 首次回落
-        //   WARN 披露，后续降 debug（同一个闸，避免每轮刷屏）。
-        if (NO_EXPLICIT_SESSION_WARNED.compareAndSet(false, true)) {
-            log.warn("getTaskListId: 无显式会话标识（调用方未传 sessionId 且 1-5 级均未命中）→ 回退进程级"
-                + "共享列表 UUID {}；该桶在 Web 多会话下为全进程共享，调用方应显式传会话"
-                + "（无参 getTaskListId() 已收敛为 getTaskListId(null)；工具侧应传 ctx.sessionId()，"
-                + "REST 侧已传 query ?sessionId=）—— 本条为首次告警，后续同类回落降为 debug",
-                PROCESS_SESSION_ID);
-        } else if (log.isDebugEnabled()) {
-            log.debug("getTaskListId: 继续回落进程级共享列表 UUID {}（首次告警已发出）", PROCESS_SESSION_ID);
-        }
+        //   非请求线程）时才可接受。因此改 WARN 留痕（禁只 DEBUG）——[S1-T11] 无参重载已整体删除，
+        //   调用方必须显式传会话（REST: query ?sessionId=；工具/loop: ctx.sessionId()）。
+        //   [S1-T11/T14] **每次**回落都 WARN（不再是一 JVM 一次）：能走到本级的充要条件是优先级 6
+        //   也 miss（sessionId 必为 null/空白），而全部生产调用点已显式传会话 ⇒ 本路径只剩
+        //   「确实无会话」的形态，不会刷屏；反过来，一次性闸会让第 2 次及以后的回落**完全不可见**。
+        long fallbackNo = NO_EXPLICIT_SESSION_FALLBACK_COUNT.incrementAndGet();
+        log.warn("[getTaskListId 缺值策略(a)] 无显式会话标识（调用方未传 sessionId 且 1-5 级均未命中）"
+            + "→ 回退进程级共享列表 UUID {}；该桶在 Web 多会话下为全进程共享，调用方应显式传会话"
+            + "（工具侧应传 ctx.sessionId()，REST 侧已传 query ?sessionId=）。本次为进程内第 {} 次回落"
+            + "（判据：每调用一条，非每 JVM 一条）",
+            PROCESS_SESSION_ID, fallbackNo);
         return PROCESS_SESSION_ID;
-    }
-
-    /**
-     * 无会话形参的历史入口 · [批 3c] 收敛为显式重载的空会话转发（会话态不再经 MDC 载体传播）。
-     *
-     * <p><b>⚠ 调用方待接线</b>：本入口无会话来源 ⇒ 优先级 6 不可用 → WARN 后回退<b>全进程共享</b>的
-     * 进程级列表 UUID（多会话 JVM 下会串会话）。工具侧应改用
-     * {@link #getTaskListId(String)} 显式传入 {@code ctx.sessionId()}。
-     */
-    public static String getTaskListId() {
-        // [S1-T6] 无会话 / 无身份来源的兼容入口（T11/轨 IV 将整体删除本重载）。
-        return getTaskListId(null, null);
     }
 
     /** 进程级稳定会话 UUID · 对齐 CC STATE.sessionId = randomUUID()（state.ts:331），懒初始化进程内稳定 */
     private static final String PROCESS_SESSION_ID = java.util.UUID.randomUUID().toString();
 
-    /** [批 3c] 「无显式会话 → 回退进程级共享列表」首次告警闸（防热路径 WARN 刷屏；false→true 只发一次）。 */
-    private static final java.util.concurrent.atomic.AtomicBoolean NO_EXPLICIT_SESSION_WARNED =
-        new java.util.concurrent.atomic.AtomicBoolean(false);
+    /**
+     * [S1-T11] 「无显式会话 → 回退进程级共享列表」的<b>回落次数</b>（仅用于 WARN 文本里的序号）。
+     *
+     * <p><b>WHY 不再用一次性闸（本仓裁定-8）</b>：原实现是进程级单次闸
+     * （{@code AtomicBoolean NO_EXPLICIT_SESSION_WARNED}：首次 WARN 后续 debug），它把
+     * 「≥WARN 可观测」<b>结构性降级</b>成「每 JVM 一行」——第 2 次（乃至第 N 次）回落完全不可见。
+     * ⚠️ 曾尝试「按 sessionId 分桶」，实测该桶<b>不可达</b>：能走到最终回落的充要条件是优先级 6
+     * （显式会话形参）也 miss，即 {@code sessionId} 必为 null/空白 ⇒ 分桶键恒为同一个。
+     *
+     * <p><b>WHY 现在可以无条件 WARN（不是刷屏）</b>：正因为「带会话的调用在优先级 6 就返回、
+     * 永远到不了本级」，本路径只剩「调用方确实无会话」的形态（无 leader 会话的 spawn、纯单测）。
+     * T11 已把全部生产调用点显式化（工具侧 {@code ctx.sessionId()}、loop 侧
+     * {@code state.sessionId()}、REST 侧 {@code ?sessionId=}）⇒ 无条件 WARN 既不刷屏，
+     * 又保证<b>每一次</b>回落都可观测。
+     */
+    private static final java.util.concurrent.atomic.AtomicLong NO_EXPLICIT_SESSION_FALLBACK_COUNT =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    /** [测试可见] 复位回落计数器（跨用例隔离；生产无调用方）。 */
+    static void resetFallbackWarnCounterForTesting() {
+        NO_EXPLICIT_SESSION_FALLBACK_COUNT.set(0L);
+    }
 
     /**
      * 解析显式 task list ID · 对齐 CC tasks.ts:200-204 getTaskListId() 优先级 1

@@ -236,4 +236,54 @@ public class SessionAgentStateRegistry {
         all.addAll(agents.values());
         return all;
     }
+
+    /**
+     * [S1-T12] <b>会话身份解析唯一入口</b>：按显式 {@code sessionId} 解析「该会话当前是否以
+     * teammate 身份运行」，返回该身份的完整载体（非 teammate ⇒ null）。
+     *
+     * <p><b>WHY（本仓根因，用户铁律「会话态一律显式传参 / 回放不算合规」）</b>：
+     * {@code /rename} 与 {@code /color} 的 teammate 守卫原实现是 {@code Teammate::isTeammate}
+     * <b>方法引用</b>——它在<b>分派线程</b>（HTTP/WS handler）求值，而该线程上不存在任何
+     * teammate 身份载体 ⇒ 守卫<b>恒不触发</b>（静默失效）。修复 = 把求值从「线程态」改为
+     * 「按 handler 已持有的 {@code sessionId} 查会话级身份」。
+     *
+     * <p><b>身份来源（会话级，符合「会话级状态存会话键下」的既有约定）</b>：
+     * {@code sessionId → AgentState → currentToolUseContext().teammateIdentity()}。
+     * teammate 身份本就是沿 {@code ToolUseContext} 显式下传的会话级载体
+     * （见 {@code ToolUseContext#teammateIdentity()} 组件说明），本方法只是把
+     * 「handler 手里的 sessionId」接到同一载体上，不引入任何新的进程级槽 / ThreadLocal。
+     *
+     * <p><b>求值线程无关性</b>：返回值只依赖传入的 {@code sessionId}，与调用线程无关
+     * （本方法可在任意线程调用，含 tool-exec 池 / HTTP handler 线程）。
+     *
+     * @param sessionId 显式会话标识（short 形态 sess-xxx；null/空白 ⇒ 无法解析 → null）
+     * @return 该会话的 teammate 身份；非 teammate / 会话未注册 / 无 per-turn 上下文 → null
+     */
+    public com.nexusai.application.agent.team.TeammateIdentity teammateIdentityForSession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[S1-T12] 会话身份解析：sessionId 缺失（null/空白）⇒ 无法判定 teammate 身份，"
+                + "按非 teammate 处理（缺值策略 (b)：调用方本就不该在无会话时求值会话身份）");
+            return null;
+        }
+        AgentState state = sessions.get(sessionId);
+        if (state == null) {
+            // (b) 类：该会话在本进程没有活跃主 AgentState（例如命令在其 run 之外到达）。
+            // 记 ≥WARN（禁只 DEBUG）——「无法判定」与「判定为非 teammate」必须可区分。
+            log.warn("[S1-T12] 会话身份解析：sessionId={} 未注册主 AgentState ⇒ 无法判定 teammate 身份，"
+                + "按非 teammate 处理（缺值策略 (b)）", sessionId);
+            return null;
+        }
+        com.nexusai.application.agent.tool.ToolUseContext tuc = state.currentToolUseContext();
+        if (tuc == null) {
+            log.warn("[S1-T12] 会话身份解析：sessionId={} 无 per-turn ToolUseContext ⇒ 无法判定"
+                + " teammate 身份，按非 teammate 处理（缺值策略 (b)）", sessionId);
+            return null;
+        }
+        com.nexusai.application.agent.team.TeammateIdentity identity = tuc.teammateIdentity();
+        if (log.isDebugEnabled()) {
+            log.debug("[S1-T12] 会话身份解析：sessionId={} → teammateIdentity={}", sessionId,
+                identity != null ? identity.agentId() : null);
+        }
+        return identity;
+    }
 }

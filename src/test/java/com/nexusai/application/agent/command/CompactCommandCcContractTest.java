@@ -65,7 +65,7 @@ class CompactCommandCcContractTest {
     void resetStaticState() {
         // [sm-cursor-sessionize] 清本会话游标（SESSION="s1"）
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
         // SESSION="s1" 非 UUID → 方案 1b 走回落进程级单布尔（clear 复位之）；会话级隔离由
         // PostCompactionStateTest 覆盖，本测试仅清回落布尔防跨用例污染。
         PostCompactionState.clear(SESSION);
@@ -460,7 +460,7 @@ class CompactCommandCcContractTest {
         smService.setSmSessionMemoryEnabled(true);
         smService.setSmCompactEnabled(true);
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
 
         List<String> notifyCalls = new ArrayList<>();
         CompactCommandContext c = ctx(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
@@ -478,7 +478,7 @@ class CompactCommandCcContractTest {
         // 确被调用（mark 成功链），会话级隔离语义由 PostCompactionStateTest 覆盖（规则 9：意图在专属测试钉死）。
         assertThat(PostCompactionState.isPostCompactionPending(SESSION)).isTrue();
         assertThat(SessionMemoryService.getLastSummarizedMessageId(SESSION)).isNull();
-        assertThat(CompactWarningState.isCompactWarningSuppressed()).isTrue();
+        assertThat(CompactWarningState.isCompactWarningSuppressed(SESSION)).isTrue();
         // displayText（SM 路径 buildDisplayText(context)，无 userDisplayMessage）
         assertThat(result.displayText()).isEqualTo("Compacted (ctrl+o to see full summary)");
     }

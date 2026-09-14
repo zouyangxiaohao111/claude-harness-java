@@ -91,7 +91,7 @@ class SubagentSummaryGatePathTest {
             path, summaryTaskId,
             svc, coordinator, sdkOn, agentId, tmpDir, "session-1",
             new LlmProviderFactory(), ProviderConfig.empty(), "test-model",
-            null, null);
+            null, null, null);
     }
 
     // ── ASYNC 路径（AgentTool.tsx:750 · 三 flag 或）────────────────────────

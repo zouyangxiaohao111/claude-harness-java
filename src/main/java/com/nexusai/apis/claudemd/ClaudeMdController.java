@@ -53,15 +53,36 @@ public class ClaudeMdController {
     @Autowired(required = false)
     private ClaudemdEngine claudemdEngine;
 
-    /** 外部 include 审批态 · CC original: {@code config.hasClaudeMdExternalIncludesApproved}
-     *  （config.ts:115，缺省 false :146）。本控制器持有 + 以 {@code () -> this.externalIncludesApproved}
-     *  Supplier 注册进引擎（ClaudemdEngine:286），生产注入点。 */
+    /**
+     * 外部 include 审批态 · CC original: {@code config.hasClaudeMdExternalIncludesApproved}
+     * （config.ts:115，缺省 false :146）。本控制器持有 + 以 {@code () -> this.externalIncludesApproved}
+     * Supplier 注册进引擎（ClaudemdEngine:286），生产注入点。
+     *
+     * <p><b>⛔ 已知偏离 · 正确的键是「项目根」而不是「进程」也不是「会话」（2026-09-14 裁定）</b>：
+     * CC 侧这两个标志的宿主是 <b>project config</b> —— {@code claudemd.ts:796} 与
+     * {@code claudemd.ts:1420} 都是 {@code const config = getCurrentProjectConfig()}，字段声明在
+     * {@code ProjectConfig}（{@code config.ts:115}/{@code :116}，默认 {@code :146}/{@code :147}）
+     * ⇒ <b>语义 = 每个项目一份审批态</b>（同项目的另一个会话「本来就该」受影响）。
+     * <p>本仓实现是<b>进程级单例 volatile（无任何键）</b> ⇒ 比 CC 的键<b>更宽</b>：
+     * <b>跨项目的会话会互相影响</b>（A 项目点过「允许」会静默影响 B 项目）—— 这是<b>已知偏离</b>，
+     * 不是「会话级 vs 进程级」的问题。
+     * <p><b>为什么不按 sessionId 会话化</b>：那会引入一个与 CC 不同的新语义（同项目跨会话不再共享），
+     * 属「发明 CC 没有的判据」。<b>正确修法 = 改键为项目根 + 给 REST 契约加项目维度</b>
+     * （{@code POST /api/v1/claude-md/include-approval} 当前入参只有 {@code {approved:boolean}}，
+     * 无项目/会话维度）⇒ <b>属契约决策，已登记交用户裁定</b>，未在本批实现。
+     */
     private volatile boolean externalIncludesApproved = false;
 
-    /** 外部 include 警告已示标志 · CC original: {@code config.hasClaudeMdExternalIncludesWarningShown}
-     *  （config.ts:116，缺省 false :147）。本控制器持有 + 以 {@code () -> this.externalIncludesWarningShown}
-     *  Supplier 注册进引擎（ClaudemdEngine:296）。CC Dialog onDone 批准/拒绝**均**置 true
-     *  （config.ts:123-131）——拒绝后 {@code shouldShowClaudeMdExternalIncludesWarning} 返回 false（不再弹窗）。 */
+    /**
+     * 外部 include 警告已示标志 · CC original: {@code config.hasClaudeMdExternalIncludesWarningShown}
+     * （config.ts:116，缺省 false :147）。本控制器持有 + 以 {@code () -> this.externalIncludesWarningShown}
+     * Supplier 注册进引擎（ClaudemdEngine:296）。CC Dialog onDone 批准/拒绝**均**置 true
+     * （config.ts:123-131）——拒绝后 {@code shouldShowClaudeMdExternalIncludesWarning} 返回 false（不再弹窗）。
+     *
+     * <p><b>⛔ 同 {@link #externalIncludesApproved} 的已知偏离</b>：CC 侧宿主是 project config
+     * （{@code config.ts:116} + {@code claudemd.ts:1420} 的 {@code getCurrentProjectConfig()}）
+     * ⇒ 正确键 = <b>项目根</b>；本仓现为进程级 ⇒ 跨项目互相影响，登记为契约决策。
+     */
     private volatile boolean externalIncludesWarningShown = false;
 
     /**

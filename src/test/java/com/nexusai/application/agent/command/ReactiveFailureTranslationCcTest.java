@@ -60,7 +60,7 @@ class ReactiveFailureTranslationCcTest {
 
     @AfterEach
     void resetStaticState() {
-        com.nexusai.application.agent.compact.CompactWarningState.clearCompactWarningSuppression(null);
+        com.nexusai.application.agent.compact.CompactWarningState.clearCompactWarningSuppression(null, null);
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {

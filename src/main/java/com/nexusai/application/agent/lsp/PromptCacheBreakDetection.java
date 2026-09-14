@@ -308,7 +308,29 @@ public final class PromptCacheBreakDetection {
         }
     }
 
-    /** CC cleanupAgentTracking. */
+    /**
+     * CC cleanupAgentTracking（promptCacheBreakDetection.ts:699-701
+     * {@code export function cleanupAgentTracking(agentId: AgentId): void { previousStateBySource.delete(agentId) }}）。
+     *
+     * <p><b>⛔ 已知边界（已裁定「只登记、不改签名」，2026-09-14）</b>：{@code getTrackingKey}
+     * （{@link #getTrackingKey(String, String)}，:143-156）有<b>三种</b>返回形态：
+     * <ol>
+     *   <li>tracked prefix 且 {@code agentId} 非空 ⇒ 返回 <b>{@code agentId} 本身</b>
+     *       —— 与 {@code cleanupAgentTracking(agentId)} 的删键<b>一致</b>（唯一生产调用点
+     *       {@code SubagentExecutor:2275} 传 packed UUID，见该处 {@code [R3-WF-F REWORK-1]} 修正注释；
+     *       {@code AgentContextThreadLocalTest:457-489} 双向锁死「packed UUID 命中 / a+16hex miss」）；</li>
+     *   <li>{@code querySource==='compact'} ⇒ 返回常量 {@code "repl_main_thread"}；</li>
+     *   <li>tracked prefix 但 {@code agentId} 为 null/空 ⇒ 返回 <b>{@code canonical}（querySource 归一值）</b>。</li>
+     * </ol>
+     * <b>残留</b>：形态 ②/③ 写下的桶键<b>不是任何 agentId</b> ⇒ 本方法结构上删不到，只能等
+     * {@link #MAX_TRACKED_SOURCES}（=10）的随机淘汰兜底（有界，不无界增长）。
+     *
+     * <p><b>为什么不改</b>：CC 真源同样是<b>只按 agentId 删</b>（同一函数体），且 CC 全仓
+     * {@code cleanupAgentTracking} <b>只有定义、无调用点</b> —— 本仓的调用点（SubagentExecutor）
+     * 是 CC 没有的接线。按「不自行发明 CC 没有的守卫」原则，改签名（如
+     * {@code cleanupAgentTracking(querySource, agentId)} 让删键与写键同源反解）属<b>契约变更</b>，
+     * 需先裁定，不在本批内做；且那样会打红上面那个锁死正确契约的既有测试。
+     */
     public void cleanupAgentTracking(String agentId) {
         if (agentId != null) PREVIOUS.remove(agentId);
     }

@@ -71,7 +71,7 @@ class BlockingMeasurementSourceCcTest {
 
         // memoryPrefetcher 返回 null 句柄 → 无注入（CC 无相关记忆场景）
         MemoryPrefetcher prefetcher = Mockito.mock(MemoryPrefetcher.class);
-        when(prefetcher.startPrefetch(any(), any(), any())).thenReturn(null);
+        when(prefetcher.startPrefetch(any(), any(), any(), any(), any())).thenReturn(null);
 
         AgentLoopContext ctx = buildContext(prefetcher, provider, measured);
         LoopDeps deps = loopDeps(ctx);
@@ -108,7 +108,7 @@ class BlockingMeasurementSourceCcTest {
             CompletableFuture.completedFuture(List.of(memoryAttachment())),
             com.nexusai.application.agent.tool.AbortController.NOOP);
         handle.settledAt = 1L;   // 已 settle → consume 分支触发（settledAt != 0）
-        when(prefetcher.startPrefetch(any(), any(), any())).thenReturn(handle);
+        when(prefetcher.startPrefetch(any(), any(), any(), any(), any())).thenReturn(handle);
         when(prefetcher.filterDuplicateMemoryAttachments(anyList(), any()))
             .thenReturn(List.of(memoryAttachment()));
 

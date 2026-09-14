@@ -40,10 +40,10 @@ import static org.mockito.Mockito.when;
  *       输出中不得再出现 status/cancelled 字段（C18 删除回归保护）。</li>
  * </ul>
  *
- * <p><b>风险登记</b>: {@code ScheduleDto.agentId} 由 WF-B 填充（当前生产恒 null），
- * 且 TeammateContext 生产端 0 设定 → errorCode 2 分支生产不可达；本测试用
- * {@code TeammateContext.runWithTeammateContext} 注入 teammate 上下文直接驱动分支，
- * 验证结构对齐（CRON-A3 concerns 登记）。
+ * <p><b>风险登记</b>: {@code ScheduleDto.agentId} 由 WF-B 填充（当前生产恒 null）。
+ * [S1-T6] 身份载体已由 {@code TeammateContext} ThreadLocal 收敛为
+ * {@code ToolUseContext.teammateIdentity()} 显式组件（原载体类已删除）⇒ 本测试用带
+ * teammate 身份的 TUC 直接驱动分支，验证结构对齐（CRON-A3 concerns 登记）。
  */
 class CronDeleteToolCcContractTest {
 

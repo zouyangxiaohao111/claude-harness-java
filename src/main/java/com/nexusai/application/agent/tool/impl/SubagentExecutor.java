@@ -516,7 +516,7 @@ public class SubagentExecutor {
      *   <li>{@code subagentName}/{@code isBuiltIn} —— hook 侧归因
      *       （{@code SessionFileAccessHooks.subagentProps} 经 {@code HOOK_EXECUTOR} 取用）；</li>
      *   <li>{@link ToolUseContext#agentContext()} —— classifier / exec-prompt hook / tool-use summary
-     *       侧归因（这些消费点跑在 <b>commonPool</b> worker 上，读 {@code AgentContext.STORAGE}
+     *       侧归因（这些消费点跑在 <b>commonPool</b> worker 上，读线程环境变量
      *       plain ThreadLocal 恒 null）。</li>
      * </ul>
      *
@@ -2037,12 +2037,39 @@ public class SubagentExecutor {
         //   task_progress SDK 事件。
         AgentProgressTracker progressTracker = new AgentProgressTracker(
             agentIdHex, summaryToolUseId, startMs);
+        // [S1-T7] 归因上下文构造**上提到摘要服务启动之前**（原在 Step 20 的 try 内）：
+        //   AgentSummaryService 是**异步周期摘要**（scheduler 池线程），其 LLM side-query 的
+        //   归因上下文必须作为**值**在 start 时捕获并随状态下传（池线程读不到 ThreadLocal）。
+        //   本块只是位置前移，取值来源与构造语义不变（defForLoop 仍取 agentDefinition 的 final 快照；
+        //   agentDefinition 仅 :1476 一处重赋值，早于本点）。
+        final boolean subagentResume = forkParams != null && forkParams.resumedMessages() != null;
+        String invocationKind = subagentResume ? "resume" : "spawn";
+        // lambda 捕获需 effectively final：subagentCtx（Step 18 rebuild）/ agentDefinition（Step 1
+        //   effort merge）均被重赋值，取 final 引用供下方盖章/循环体使用。
+        final AgentDefinition defForLoop = agentDefinition;
+        // [tuc-subagent-identity] 唯一产出点：把子代理身份（subagentName + isBuiltIn）盖到子代理 TUC。
+        //   WHY 在这里（而不是 createSubagentContext.create）：Step 18 的 withEffectiveCwd 派生链
+        //   会把身份字段清成 null，必须在本步（TUC 定稿、进入 query loop 前）盖章；
+        //   WHY 用 identityForLoop（SubagentIdentity.of(defForLoop) 单派生点）：LLM 侧
+        //   AgentContext.subagentName 与 hook 侧 ToolUseContext.subagentName 必须同源，否则两侧
+        //   归因漂移（原实现把 agentType()/instanceof 两个表达式在本处与下方 buildSubagentAgentContext
+        //   各写一遍 = 漂移面）。
+        //   hook 侧消费者：SessionFileAccessHooks.subagentProps(ctx)（PostToolUse 回调经
+        //   HookRegistry:2596 supplyAsync(HOOK_EXECUTOR) 派发，ThreadLocal 不可达 → 必须显式载体）。
+        final SubagentIdentity identityForLoop = SubagentIdentity.of(defForLoop);
+        AgentContext.SubagentContext agentContext = buildSubagentAgentContext(
+            agentId, identityForLoop.subagentName(), identityForLoop.isBuiltIn(),
+            this.invokingRequestId,
+            invocationKind);
+
         AgentSummaryHandle summaryHandle = maybeStartSummary(
             summarySpawnPath, summaryTaskId,
             summaryService, coordinatorMode, sdkAgentProgressSummariesEnabled,
             agentIdHex, sessionDir, sessionId.toString(),
             llmProviderFactory, providerConfig, effectiveModel,
-            progressTracker, sdkEventQueue);
+            progressTracker, sdkEventQueue,
+            // [S1-T7] 本子代理的归因上下文（Step 19.8 之前已构造 · 见上方上提块）。
+            agentContext);
         // ── Step 20: query 主循环（内联，不委托 LlmAgentLoop.run）──
         // [批 2 · B 类清理] 原此处为
         //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
@@ -2053,40 +2080,22 @@ public class SubagentExecutor {
         //   线程复用串台的载体本身不复存在。
         SubagentResult loopResult = null;
         try {
-            // [R2-CTX] subagent spawn 包裹 runWithAgentContext（analytics 归因 · CC AgentTool.tsx:733/:785/:911）。
-            //   每次 spawn 新建 SubagentContext 并包住 runSubagentQueryLoop，使 query loop 内事件
-            //   （getSubagentLogName → subagent_name / getAgentContext → parent_agent_id）可归因到该子 agent。
-            //   异步边界：executeStreaming 同步运行（sync 在工具线程 / async 在 asyncWorker 线程），
-            //   runWithAgentContext 的 ThreadLocal set/remove 与 query loop 同线程（S-15 跨线程不串台）。
+            // [S1-T7-2] ⛔ 原 R2-CTX 的 runWithAgentContext 线程包裹（CC AgentTool.tsx:733/:785/:911，ambient
+            //   ThreadLocal 归因作用域）已整体删除：该载体在本仓无读点（消费点全部跑在
+            //   commonPool / tool-exec 池 / STREAM_EXECUTOR 虚拟线程上，plain ThreadLocal 不跨线程），
+            //   保留它只会让人误以为「归因靠回放成立」。现行 = 下方 stampSubagentLoopContext
+            //   把 agentContext 作为**值**盖到子代理 TUC，随 TUC 链显式下传（用户铁律：会话态
+            //   一律不得经 ThreadLocal/MDC 读，回放不算合规）。query loop 直接内联调用，无包裹。
             // [P2-23 · 2026-09-11] resume 判据提升为局部变量（原只用于 analytics invocationKind）：
             //   同一判据同时驱动子代理 skill_listing 的续跑语义（透传 queryLoop skillListingResume）。
             //   resume = 复用原 agentId 续写 transcript（resumeAgent.ts:166-171 promptMessages =
             //   [...resumedMessages, ...]）——该 agentKey 在本进程已发过一次清单。
-            final boolean subagentResume = forkParams != null && forkParams.resumedMessages() != null;
-            String invocationKind = subagentResume ? "resume" : "spawn";
-            // lambda 捕获需 effectively final：subagentCtx（Step 18 rebuild）/ agentDefinition（Step 1
-            //   effort merge）均被重赋值，取 final 引用供 runWithAgentContext 包裹体使用。
-            final AgentDefinition defForLoop = agentDefinition;
-            // [tuc-subagent-identity] 唯一产出点：把子代理身份（subagentName + isBuiltIn）盖到子代理 TUC。
-            //   WHY 在这里（而不是 createSubagentContext.create）：Step 18 的 withEffectiveCwd 派生链
-            //   会把身份字段清成 null，必须在本步（TUC 定稿、进入 query loop 前）盖章；
-            //   WHY 用 identityForLoop（SubagentIdentity.of(defForLoop) 单派生点）：LLM 侧
-            //   AgentContext.subagentName 与 hook 侧 ToolUseContext.subagentName 必须同源，否则两侧
-            //   归因漂移（原实现把 agentType()/instanceof 两个表达式在本处与下方 buildSubagentAgentContext
-            //   各写一遍 = 漂移面）。
-            //   hook 侧消费者：SessionFileAccessHooks.subagentProps(ctx)（PostToolUse 回调经
-            //   HookRegistry:2596 supplyAsync(HOOK_EXECUTOR) 派发，ThreadLocal 不可达 → 必须显式载体）。
-            final SubagentIdentity identityForLoop = SubagentIdentity.of(defForLoop);
-            AgentContext.SubagentContext agentContext = buildSubagentAgentContext(
-                agentId, identityForLoop.subagentName(), identityForLoop.isBuiltIn(),
-                this.invokingRequestId,
-                invocationKind);
             // [批 5b-1] TUC 定稿步**同时**盖两个显式载体：① 子代理身份（subagentName/isBuiltIn，
             //   hook 侧归因）② agent 归因上下文（agentContext，classifier / exec-prompt hook /
             //   tool-use summary 侧归因）。WHY 在此点：本步是「TUC 定稿、进入 query loop 前」，
             //   而 Step 18 的 withEffectiveCwd 派生链只做 record-copy 透传（不清值），故此处盖章
             //   可覆盖整条 query loop 及其派生 TUC。
-            //   WHY 必须显式盖（而不是让消费点读 AgentContext ThreadLocal）：消费点
+            //   WHY 必须显式盖（而不是让消费点读线程环境变量）：消费点
             //   （YoloClassifierImpl / ExecPromptHook / HaikuToolUseSummaryGenerator）跑在无 executor 的
             //   CompletableFuture(commonPool) 线程上，plain ThreadLocal 不跨线程 ⇒ 读恒 null
             //   ⇒ invokingRequestId/invocationKind 归因边静默丢失（CC 的 AsyncLocalStorage 自动传播，无此问题）。
@@ -2098,24 +2107,21 @@ public class SubagentExecutor {
             log.info("[SubagentExecutor] [批 5b-1] 子代理 TUC 已盖 agent 归因上下文: agentId={} "
                     + "invokingRequestId={} invocationKind={}（commonPool 派生线程经显式载体可读）",
                 agentId, this.invokingRequestId, invocationKind);
-            log.info("[SubagentExecutor] [R2-CTX] subagent 执行进入 AgentContext 作用域: agentId={} (a+16hex={}) "
-                    + "subagentName={} invocationKind={} (analytics 归因)",
+            log.info("[SubagentExecutor] [S1-T7-2] subagent 归因上下文已显式盖章（无线程包裹）: "
+                    + "agentId={} (a+16hex={}) subagentName={} invocationKind={} (analytics 归因)",
                 agentId, agentIdHex, defForLoop.agentType(), invocationKind);
-            loopResult = AgentContext.runWithAgentContext(agentContext, () -> {
-                SubagentResult innerResult = runSubagentQueryLoop(
-                    ctxForLoop, defForLoop, initialMessages,
-                    agentSystemPrompt, agentOptions, allTools,
-                    effectiveModel, effectiveType, isForkPath, isAsync, permissionMode, shouldAvoidPermissionPrompts,
-                    sessionDir, lastRecordedUuid, messageSink,
-                    // [RES-R6] resume 专属: 重建的 ContentReplacementState（CC resumeAgent.ts:194）
-                    //   经 ForkPathParams 直带, null → loop 默认 create（非 resume / 父 live state 不可得）
-                    forkParams != null ? forkParams.contentReplacementState() : null,
-                    // [D-6] progressTracker 逐 assistant message 累积接入（CC updateProgressFromMessage）
-                    progressTracker,
-                    // [P2-23] 子代理 resume 判据 → skill_listing 续跑语义（见 runSubagentQueryLoop 尾参 javadoc）
-                    subagentResume);
-                return innerResult;
-            });
+            loopResult = runSubagentQueryLoop(
+                ctxForLoop, defForLoop, initialMessages,
+                agentSystemPrompt, agentOptions, allTools,
+                effectiveModel, effectiveType, isForkPath, isAsync, permissionMode, shouldAvoidPermissionPrompts,
+                sessionDir, lastRecordedUuid, messageSink,
+                // [RES-R6] resume 专属: 重建的 ContentReplacementState（CC resumeAgent.ts:194）
+                //   经 ForkPathParams 直带, null → loop 默认 create（非 resume / 父 live state 不可得）
+                forkParams != null ? forkParams.contentReplacementState() : null,
+                // [D-6] progressTracker 逐 assistant message 累积接入（CC updateProgressFromMessage）
+                progressTracker,
+                // [P2-23] 子代理 resume 判据 → skill_listing 续跑语义（见 runSubagentQueryLoop 尾参 javadoc）
+                subagentResume);
         } finally {
             // ── Step 21: finally cleanup (9 项) ──
             // 对齐 CC runAgent.ts:816-859: mcpCleanup → clearSessionHooks → clearAgentTranscriptSubdir →
@@ -3090,14 +3096,12 @@ public class SubagentExecutor {
      * [R2-CTX] 构造 subagent spawn 的 AgentContext（analytics 归因）· 对齐 CC AgentTool.tsx:719-727/:772-780
      * {@code asyncAgentContext / syncAgentContext} object literal（每次 spawn 新建 context）。
      *
-     * <p><b>WHY</b>: CC 每次 spawn 都把整个 agent 执行包进 {@code runWithAgentContext(context, ...)}
-     * （AgentTool.tsx:733 async / :785 sync / :911 background 三处），使 query loop 内的事件
-     * （{@code getSubagentLogName()} → {@code subagent_name} 属性、{@code getAgentContext()} →
-     * parent_agent_id）能正确归因到该子 agent。Java 现状（S-13 / DISC-SUB-03 EV-FK-015）：SubagentTool
-     * → SubagentExecutor 无包裹，{@link AgentContext#getSubagentLogName()} 在 query loop 内恒 null
-     * → {@code SessionFileAccessHooks.subagentProps()} 空 map → 事件缺 {@code subagent_name}。
-     * 本方法把 CC object literal 的字段映射为 {@link AgentContext.SubagentContext}，executeStreaming
-     * Step 20 用 {@link AgentContext#runWithAgentContext} 包裹 {@code runSubagentQueryLoop}。
+     * <p><b>WHY</b>: CC 每次 spawn 都把整个 agent 执行包进 {@code runWithAgentContext(context, ...)}（CC AgentTool.tsx:733 async
+     * / :785 sync / :911 background 三处），使 query loop 内的事件能正确
+     * 归因到该子 agent。本方法把 CC object literal 的字段映射为
+     * {@link AgentContext.SubagentContext}；executeStreaming Step 20 经
+     * {@code stampSubagentLoopContext} 把它作为**值**盖到子代理 TUC（⛔ 不做任何线程包裹 ——
+     * 归因消费点跑在 commonPool / tool-exec 池上，plain ThreadLocal 不跨线程，回放不算合规）。
      *
      * <p>字段映射（CC AgentTool.tsx:719-727）:
      * <ul>
@@ -3853,7 +3857,8 @@ public class SubagentExecutor {
             ProviderConfig providerConfig,
             String modelName,
             AgentProgressTracker progressTracker,
-            SdkEventQueue sdkEventQueue) {
+            SdkEventQueue sdkEventQueue,
+            com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (summaryService == null || coordinatorMode == null) {
             return null;
         }
@@ -3887,7 +3892,9 @@ public class SubagentExecutor {
                 if (progressTracker != null) {
                     progressTracker.applySummary(summary, sdk, sdkEventQueue);
                 }
-            });
+            },
+            // [S1-T7] 归因上下文以值捕获后随摘要状态下传到 scheduler 池线程（见 maybeStartSummary javadoc）。
+            agentContext);
         log.info("[SubagentExecutor] [S5 P1] summary 已接通: spawnPath={} agent={} session={} "
             + "(coordinator={} fork={} sdk={} summaryTaskId={})",
             spawnPath, agentId, sessionId, coordinator, fork, sdk, summaryTaskId);

@@ -45,7 +45,7 @@ public interface ToolUseSummaryGenerator {
      * @param agentContext            agent 归因上下文（显式载体）· CC original: queryHaiku 经 ALS
      *                                读 ambient agentContext（logging.ts:294/:461）。
      *                                <p><b>[批 5b-1]</b>：本参数替代「生成器闭包内读
-     *                                {@code AgentContext.getAgentContext()} ThreadLocal」——
+     *                                {@code 宿 ThreadLocal 的 ambient 归因上下文} ThreadLocal」——
      *                                生成器跑在无 executor 的 {@code CompletableFuture}（commonPool）
      *                                线程上，plain ThreadLocal 不跨线程 ⇒ 原读恒 null ⇒
      *                                {@code invokingRequestId}/{@code invocationKind} 归因边静默丢失

@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,7 +17,7 @@ import java.util.function.Supplier;
  * <table>
  *   <tr><th>CC 函数</th><th>CC 文件</th><th>Java 方法</th></tr>
  *   <tr><td>{@code isTodoV2Enabled()}</td><td>tasks.ts:133-139</td><td>{@link #isTodoV2Enabled()}</td></tr>
- *   <tr><td>{@code getTaskListId()}</td><td>tasks.ts:199-210</td><td>{@link #getDefaultTaskListId()}</td></tr>
+ *   <tr><td>{@code getTaskListId()}</td><td>tasks.ts:199-210</td><td>{@link #getDefaultTaskListId(String, TeammateIdentity)}</td></tr>
  *   <tr><td>{@code getClaudeConfigHomeDir()}</td><td>envUtils.ts:7-14</td><td>{@link #getClaudeConfigHomeDir()}</td></tr>
  *   <tr><td>{@code isAgentSwarmsEnabled()}</td><td>utils/agentSwarmsEnabled.ts</td><td>{@link #isAgentSwarmsEnabled()}</td></tr>
  *   <tr><td>{@code getAgentName()}</td><td>utils/teammate.ts</td><td>{@link #getAgentName()}</td></tr>
@@ -434,12 +435,17 @@ public class TaskSystemConfig {
     /**
      * 获取默认 TaskListId · 对齐 CC tasks.ts:199-210 getTaskListId()
      *
-     * <p>委托给 {@link TaskService#getTaskListId()}。
+     * <p>委托给 {@link TaskService#getTaskListId(String, TeammateIdentity)}。
      *
+     * <p>[S1-T11] 原无会话形参版本已删除（它无任何会话/身份来源，只能回退<b>全进程共享</b>的
+     * 列表 UUID）。会话与 teammate 身份由调用方显式传入。
+     *
+     * @param sessionId 显式会话标识（调用方传入；null/空白 ⇒ 优先级 6 不可用 → WARN 后回退进程级 UUID）
+     * @param identity  本 agent 的 teammate 身份（来源 = {@code ToolUseContext.teammateIdentity()}；null = 非 teammate）
      * @return 任务列表 ID
      */
-    public static String getDefaultTaskListId() {
-        return TaskService.getTaskListId();
+    public static String getDefaultTaskListId(String sessionId, TeammateIdentity identity) {
+        return TaskService.getTaskListId(sessionId, identity);
     }
 
     // ════════════════════════════════════════════════════════════════════════

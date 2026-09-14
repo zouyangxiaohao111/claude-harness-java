@@ -2798,7 +2798,8 @@ public class SubagentTool implements Tool {
      *
      * <p>[S1-T6] 判据 = <b>显式形参</b> {@code identity != null}。原实现委托
      * {@code Teammate.isTeammate()}（ThreadLocal + 进程级 dynamicTeamContext 双源）——
-     * 两个源都是「非显式」载体（前者跨线程读不到、后者跨会话串台），本批统一收敛到 TUC 载体。
+     * 两个源都是「非显式」载体（前者跨线程读不到、后者跨会话串台），本批统一收敛到 TUC 载体；
+     * [S1-T13] 后两个旧载体<b>均已删除</b>，TUC 载体即唯一来源（与本方法同判据）。
      *
      * @param identity 本 agent 的 teammate 身份
      */

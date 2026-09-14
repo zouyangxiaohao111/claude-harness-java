@@ -54,14 +54,14 @@ import java.util.UUID;
  *       consume 侧 MDC 拿到原始 {@code "sess-xxx"} —— 归一化使两侧命中同一注册 AgentState
  *       （修正 0.2.35 首次实施"consume 读进程级默认布尔"的主路径接线断裂）。</li>
  *   <li>sessionId 为 null / blank / registry 未接线（@Component 缺失或 {@code required=false}
- *       注入 null）→ 回落<b>进程级单布尔</b> {@link #defaultPendingPostCompaction}
+ *       注入 null）→ 回落<b>会话级回落 Map</b> {@link #fallbackPendingBySession}（无会话/未注册桶）
  *       （CC STATE 等价，日志显式标注每次回落）。归一化后未注册会话（测试 "s1" / "session-1"
  *       hash 兜底 UUID 未注册）与无 MDC 场景均走此回落路径。</li>
  * </ol>
  *
  * <p><b>消费侧 key 优先级</b>（AnthropicSdkProvider.consumePostCompactionAtApiSuccess）：
  * history 有 sessionId 优先 → 否则 裸 MDC 的 {@code sessionId()}（MDC，ChatService 已设
- * {@code "sess-xxx"} 原始串）→ 仍无则 null → 本类回落进程级单布尔。
+ * {@code "sess-xxx"} 原始串）→ 仍无则 null → 本类回落到 {@link #fallbackPendingBySession} 的对应会话桶（无会话 → 无会话桶，≥WARN）。
  *
  * <p>⚠ <b>mark 侧 key 均为解析后 UUID 串</b>（grep 自验）：ToolRegistrationConfig:1232
  * {@code state.sessionId()}（manual /compact）、CompactConversation:377
@@ -87,38 +87,56 @@ public final class PostCompactionState {
     private static volatile SessionAgentStateRegistry STATIC_SESSION_REGISTRY;
 
     /**
-     * 进程级回落单布尔 · CC {@code STATE.pendingPostCompaction} 等价（sessionId 无法解析时用）。
+     * 会话级回落标记 · CC {@code STATE.pendingPostCompaction} 等价（sessionId 无法解析到已注册
+     * AgentState 时用）。
      *
-     * <p>多个无法解析会话的消费共享（CC 单进程语义等价）；并发未解析会话可能串扰
-     * isPostCompaction 归因 —— 每次回落使用均以中文日志显式标注，不静默掩盖。
+     * <p><b>WHY 必须是按 sessionId 键控的 Map（本批修复的跨会话缺陷）</b>：CC 的
+     * {@code STATE.pendingPostCompaction}（bootstrap/state.ts:771/:777-781）是<b>进程级单布尔</b>
+     * —— 在 CC 里安全（单进程单会话）。本仓是<b>一 JVM 多会话</b> ⇒ 原实现的单份布尔会让
+     * <b>A 会话的 mark 被 B 会话的下个 API success 消费</b>：① B 拿到假的 {@code isPostCompaction=true}
+     * 归因；② A 自己的首个 API success 事件因布尔已被置回 false 而丢失该元数据。
+     * 可观测单元 = 该会话首个 API success 事件的 {@code isPostCompaction} 元数据 ⇒ 键 = sessionId。
+     *
+     * <p><b>键缺失语义</b>：sessionId 为 null/blank（无 MDC / history 无 sessionId）→ 归入
+     * <b>无会话桶</b>（键 {@code ""}）。该桶只与同为无会话的调用共享，⛔ 不与任何真实会话互窃；
+     * 落入该桶时日志 <b>≥WARN</b>（禁只 DEBUG）。
+     *
+     * <p><b>容量</b>：条目在 {@link #consumePostCompaction(String)} 时<b>移除</b> ⇒ 常态下
+     * 条目仅在 mark→consume 窗口内存在；仅「mark 后从未消费」的会话留条目（≤ 会话数）。
      */
-    private static volatile boolean defaultPendingPostCompaction = false;
+    private static final java.util.Map<String, Boolean> fallbackPendingBySession =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 回落桶键归一 · null/blank → 无会话桶（{@code ""}）。 */
+    private static String fallbackKey(String sessionId) {
+        return sessionId == null || sessionId.isBlank() ? "" : sessionId;
+    }
 
     /**
      * Spring 装配入口 · 把会话注册表 bean 写入静态字段，供静态入口
      * {@link #markPostCompaction(String)} / {@link #consumePostCompaction(String)} 解析会话级
      * AgentState。
      *
-     * <p>{@code required=false}：单测/无 bean 上下文下允许 null（回落进程级单布尔）。
+     * <p>{@code required=false}：单测/无 bean 上下文下允许 null（回落 → 会话级回落 Map）。
      */
     public PostCompactionState(@Autowired(required = false) SessionAgentStateRegistry sessionAgentStateRegistry) {
         STATIC_SESSION_REGISTRY = sessionAgentStateRegistry;
         log.info("[PostCompactionState] SessionAgentStateRegistry 装配: {}",
-            sessionAgentStateRegistry != null ? "已注入" : "null（回落进程级单布尔）");
+            sessionAgentStateRegistry != null ? "已注入" : "null（回落 → 会话级回落 Map）");
     }
 
     /**
      * 注入/复位会话注册表（幂等）· 镜像 CompactConversation.java:84-88 静态注入面。
      *
      * <p>AutoCompactor 经 @Autowired 在 autoCompactIfNeeded 调用压缩前写入；测试可经此
-     * 显式注入 / 传 null 复位。null → 所有调用回落进程级单布尔。
+     * 显式注入 / 传 null 复位。null → 所有调用回落到 {@link #fallbackPendingBySession}。
      *
      * @param registry 会话 AgentState 注册表（null → 会话级解析关闭，回落默认布尔）
      */
     public static void setSessionAgentStateRegistry(SessionAgentStateRegistry registry) {
         STATIC_SESSION_REGISTRY = registry;
         log.info("[PostCompactionState] SessionAgentStateRegistry 注入: {}",
-            registry != null ? "已注入" : "null（回落进程级单布尔）");
+            registry != null ? "已注入" : "null（回落 → 会话级回落 Map）");
     }
 
     /**
@@ -127,7 +145,7 @@ public final class PostCompactionState {
      * <p>[session-id-short] mark 侧（LlmAgentLoop）与 consume 侧（MDC）sessionId 已统一 short
      * （sess-xxx），registry 键同 short → 直键命中（原 parseSessionUuid 归一化的格式错位根因消除）。
      *
-     * <p>回落路径（返回 null → 调用方走进程级单布尔，中文日志显式标注）：
+     * <p>回落路径（返回 null → 调用方走 {@link #fallbackPendingBySession} 的对应会话桶，中文日志 ≥WARN 显式标注）：
      * <ol>
      *   <li>registry 未接线（@Autowired(required=false) 注入 null / 测试未 setSessionAgentStateRegistry）</li>
      *   <li>sessionId 为 null / blank</li>
@@ -137,20 +155,20 @@ public final class PostCompactionState {
     private static AgentState resolveAgentState(String sessionId) {
         SessionAgentStateRegistry registry = STATIC_SESSION_REGISTRY;
         if (registry == null) {
-            log.info("[PostCompactionState] resolveAgentState 回落进程级单布尔: "
+            log.warn("[PostCompactionState] resolveAgentState 回落会话级 Map（无会话/未注册桶）: "
                     + "SessionAgentStateRegistry 未接线（registry=null）· sessionId={}",
                 sessionId);
             return null;
         }
         if (sessionId == null || sessionId.isBlank()) {
-            log.info("[PostCompactionState] resolveAgentState 回落进程级单布尔: "
+            log.warn("[PostCompactionState] resolveAgentState 回落会话级 Map（无会话/未注册桶）: "
                     + "sessionId 为 null/blank（无 MDC 或 history 无 sessionId）· 返回 null",
                 new Object[0]);
             return null;
         }
         AgentState state = registry.get(sessionId);
         if (state == null) {
-            log.info("[PostCompactionState] resolveAgentState 回落进程级单布尔: "
+            log.warn("[PostCompactionState] resolveAgentState 回落会话级 Map（无会话/未注册桶）: "
                     + "sessionId={} 直键未注册会话 · 返回 null", sessionId);
             return null;
         }
@@ -164,7 +182,7 @@ public final class PostCompactionState {
      * {@code isPostCompaction=true}，然后自动复位。
      *
      * @param sessionId 会话 ID（null / blank / registry 未接线 / 归一化后未注册 →
-     *                  回落进程级单布尔；任一格式经 ChatService.parseSessionUuid 归一化命中注册会话）
+     *                  回落 {@link #fallbackPendingBySession} 的对应会话桶（无会话 → 无会话桶）；任一格式经 ChatService.parseSessionUuid 归一化命中注册会话）
      */
     public static void markPostCompaction(String sessionId) {
         AgentState state = resolveAgentState(sessionId);
@@ -176,10 +194,10 @@ public final class PostCompactionState {
                 sessionId);
             return;
         }
-        defaultPendingPostCompaction = true;
-        log.info("[PostCompactionState] markPostCompaction: sessionId={} "
-                + "pendingPostCompaction=true（回落进程级单布尔 · sessionId 无法解析）· CC bootstrap/state.ts:771",
-            sessionId);
+        fallbackPendingBySession.put(fallbackKey(sessionId), Boolean.TRUE);
+        log.warn("[PostCompactionState] markPostCompaction: sessionId={} "
+                + "pendingPostCompaction=true（回落会话级 Map 的无会话/未注册桶 · sessionId 无法解析到 "
+                + "AgentState）· CC bootstrap/state.ts:771", sessionId);
     }
 
     /**
@@ -189,7 +207,7 @@ public final class PostCompactionState {
      * 后复位）。直到下次压缩前恒为 false。
      *
      * @param sessionId 会话 ID（null / blank / registry 未接线 / 归一化后未注册 →
-     *                  回落进程级单布尔；任一格式经 ChatService.parseSessionUuid 归一化命中注册会话）
+     *                  回落 {@link #fallbackPendingBySession} 的对应会话桶（无会话 → 无会话桶）；任一格式经 ChatService.parseSessionUuid 归一化命中注册会话）
      * @return was —— 是否为压缩后首个 API success 事件（isPostCompaction）
      */
     public static boolean consumePostCompaction(String sessionId) {
@@ -205,12 +223,11 @@ public final class PostCompactionState {
             }
             return was;
         }
-        boolean was = defaultPendingPostCompaction;
-        defaultPendingPostCompaction = false;
-        if (was && log.isInfoEnabled()) {
-            log.info("[PostCompactionState] consumePostCompaction: sessionId={} "
-                    + "isPostCompaction=true（回落进程级单布尔 · sessionId 无法解析）· 压缩后首个 "
-                    + "API success 事件元数据 · CC bootstrap/state.ts:777",
+        boolean was = Boolean.TRUE.equals(fallbackPendingBySession.remove(fallbackKey(sessionId)));
+        if (was) {
+            log.warn("[PostCompactionState] consumePostCompaction: sessionId={} "
+                    + "isPostCompaction=true（回落会话级 Map 的无会话/未注册桶 · sessionId 无法解析到 "
+                    + "AgentState）· 压缩后首个 API success 事件元数据 · CC bootstrap/state.ts:777",
                 sessionId);
         }
         return was;
@@ -224,13 +241,17 @@ public final class PostCompactionState {
         if (state != null) {
             return state.pendingPostCompaction();
         }
-        return defaultPendingPostCompaction;
+        return Boolean.TRUE.equals(fallbackPendingBySession.get(fallbackKey(sessionId)));
     }
 
     /**
      * 清理单个会话的标记（会话结束 / 测试）。
+     *
+     * <p>两条路径<b>都</b>清：注册会话 → 复位其 AgentState 布尔；同时<b>无条件</b>移除回落 Map
+     * 的对应会话桶（防「先 mark 后注册」留下的陈旧桶；桶键与会话一一对应，误删风险为零）。
      */
     public static void clear(String sessionId) {
+        fallbackPendingBySession.remove(fallbackKey(sessionId));
         AgentState state = resolveAgentState(sessionId);
         if (state != null) {
             state.setPendingPostCompaction(false);
@@ -239,16 +260,16 @@ public final class PostCompactionState {
             }
             return;
         }
-        defaultPendingPostCompaction = false;
+        fallbackPendingBySession.remove(fallbackKey(sessionId));
     }
 
     /**
-     * 复位进程级回落单布尔（测试用）· 对齐 CC resetSessionMemoryState 的测试清理模式。
+     * 复位全部回落标记（测试用）· 对齐 CC resetSessionMemoryState 的测试清理模式。
      *
-     * <p>仅复位回落布尔；已注册 AgentState 上的布尔按会话经 {@link #clear(String)} 复位
+     * <p>仅复位回落 Map；已注册 AgentState 上的布尔按会话经 {@link #clear(String)} 复位
      * （registry 无遍历接口，测试用 @AfterEach 逐个 clear）。
      */
     public static void reset() {
-        defaultPendingPostCompaction = false;
+        fallbackPendingBySession.clear();
     }
 }

@@ -57,23 +57,28 @@ class PlanModeCompactContextWiringTest {
     }
 
     @Test
-    @DisplayName("auto 回落: AutoCompactor.setToolUseContext → buildDefaultCompactConversationContext().isInPlanMode()==true")
-    void autoCompactorFallback_wiresToolUseContext() {
+    @DisplayName("[T9 改锚] auto 回落 ctx **不**携带 toolUseContext（AutoCompactor.toolUseContext 字段已删）—— plan mode 读侧唯一来源 = buildAutoContext")
+    void autoCompactorFallback_doesNotCarryToolUseContext() {
+        // ── 改锚说明（S1 轨 III · T9 2026-09-14）──────────────────────────────
+        //   原用例断言「auto.setToolUseContext(tuc) → 回落 ctx 的 isInPlanMode()==true」。
+        //   AutoCompactor.toolUseContext 字段与 setToolUseContext 已**删除**（生产 0 写入方；
+        //   唯一调用点就是本用例）⇒ 该行为**已不存在**。新契约（本用例锁的）：
+        //   ①回落 ctx 的 toolUseContext 恒 null（⇒ isInPlanMode 恒 false，不会误注入 plan_mode 附件）；
+        //   ②plan mode 读侧的唯一合法来源是主路径 buildAutoContext（见本文件上一个用例）。
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
             (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>x</summary>", null));
-        auto.setToolUseContext(planModeTuc(PermissionMode.PLAN));
 
-        // [P2-7] 回落上下文构建现接收 model 显式入参（原读 AutoCompactor.model 实例字段）
-        // [P1a F-08] 并接收 querySource 显式入参（原读 AutoCompactor.querySource 实例字段）；
-        //   本用例未调 setQuerySource ⇒ 字段恒默认 'user'，传字面量与原行为逐字等价。
         CompactConversationContext ctx = auto.buildDefaultCompactConversationContext(null, "user");
 
         assertThat(ctx.getToolUseContext())
-            .as("auto 回落路径（ccContext==null）必须把 toolUseContext 接线进 ctx")
-            .isNotNull();
+            .as("回落 ctx 不得携带 toolUseContext（字段已删；携带 ⇒ 说明有人把身份/上下文塞回了单例）")
+            .isNull();
         assertThat(ctx.isInPlanMode())
-            .as("plan 模式 TUC → 回落上下文 isInPlanMode 必须 true")
-            .isTrue();
+            .as("无 toolUseContext ⇒ isInPlanMode 必须 false（守卫：不误注入 plan_mode 附件）")
+            .isFalse();
+        assertThat(auto.getClass().getDeclaredMethods())
+            .as("AutoCompactor.setToolUseContext 必须已不存在（T9 删除终态）")
+            .noneMatch(m -> "setToolUseContext".equals(m.getName()));
     }
 
     @Test

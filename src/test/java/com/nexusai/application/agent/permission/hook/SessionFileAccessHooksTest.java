@@ -265,12 +265,12 @@ class SessionFileAccessHooksTest {
     @DisplayName("subagent 上下文读取 session-memory → 事件附带 subagent_name (CC :158-159)")
     void subagentContext_emitsSubagentName() {
         // WHY: CC sessionFileAccessHooks.ts:158-159 只在 subagent 上下文携带 subagent_name 事件
-        //      属性（getSubagentLogName 非 subagent → undefined → 无该属性）。analytics 归因需要
-        //      区分"哪个 subagent 访问了会话记忆"（OPD-M-50）。
-        // [A#1 tuc-invoking-req] 载体已从 AgentContext ThreadLocal 改为**显式 ToolUseContext**
-        //      （CC Tool.ts:245-246 即把 TUC 定为 hook 侧子代理判别载体）：hook 在 HOOK_EXECUTOR
-        //      线程执行，ThreadLocal 不跨线程 ⇒ 旧夹具的 runWithAgentContext 在生产等价路径上
-        //      读不到值。真线程 + 无 ThreadLocal 的强夹具见
+        //      属性（CC agentContext.ts:141-151 的 getSubagentLogName 对非 subagent 上下文返回
+        //      undefined → 无该属性）。analytics 归因需要区分"哪个 subagent 访问了会话记忆"（OPD-M-50）。
+        // [A#1 tuc-invoking-req] 载体已从 ambient（AgentContext ThreadLocal，**该载体已于
+        //      S1-T7-2 整体删除**）改为**显式 ToolUseContext**（CC Tool.ts:245-246 即把 TUC 定为
+        //      hook 侧子代理判别载体）：hook 在 HOOK_EXECUTOR 线程执行，ThreadLocal 不跨线程 ⇒
+        //      旧夹具（也已删除）的线程包裹在生产等价路径上读不到值。真线程 + 无 ThreadLocal 的强夹具见
         //      {@code SubagentNameExplicitCarrierTest}。
         RecordingTelemetry telemetry = new RecordingTelemetry();
         SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry);

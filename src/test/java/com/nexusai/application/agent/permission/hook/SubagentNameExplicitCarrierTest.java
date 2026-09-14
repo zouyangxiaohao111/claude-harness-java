@@ -48,13 +48,15 @@ import static org.mockito.Mockito.mock;
  * （它天然读得到值，删掉修复代码照样绿）。本测试因此：
  * <ol>
  *   <li>用 <b>真 {@link HookRegistry#executePostToolUse} 派发</b>（= 真 HOOK_EXECUTOR 线程）；</li>
- *   <li>断言事件发射线程 ≠ 测试线程（排除同线程零覆盖夹具）；</li>
- *   <li>断言发射线程上 {@code AgentContext.getAgentContext() == null}（证明 ThreadLocal 路线
- *       在本路径上根本取不到值 —— 值只可能来自显式载体）。</li>
+ *   <li>断言事件发射线程 ≠ 测试线程（排除同线程零覆盖夹具）。</li>
  * </ol>
+ * <p>[S1-T7-2] 原还有第 3 条「断言发射线程上 ambient 归因上下文为 null」—— 随该载体整体删除而移除：
+ * 该维度现由<b>编译期</b>保证（无 ambient 读取 API 可调）+ {@code AgentContextAmbientReadInventoryTest}
+ * 守卫（断言载体在 {@code src/main} 彻底不存在）；运行期已无可断言对象。
  *
- * <p><b>反向实验（已实测）</b>：把 {@code subagentProps} 改回读
- * {@code AgentContext.getSubagentLogName()} ⇒ 本类两测试全红（见批 2b 报告）。
+ * <p><b>反向实验（已实测）</b>：把 {@code subagentProps} 改回读线程环境变量（即批 2b 当时的
+ * ambient 读取路线）⇒ 本类用例全红（见批 2b 报告）。
+ * <p>[S1-T7-2] 该 ambient 读取入口已整体删除 ⇒ 现在这条回退会<b>直接编译失败</b>（比红灯更强的保证）。
  */
 class SubagentNameExplicitCarrierTest {
 
@@ -80,7 +82,8 @@ class SubagentNameExplicitCarrierTest {
     private static final class Observations {
         final List<Map<String, Object>> sessionMemoryAttrs = new CopyOnWriteArrayList<>();
         final List<String> emittingThreads = new CopyOnWriteArrayList<>();
-        final List<Object> ambientAgentContextOnEmitter = new CopyOnWriteArrayList<>();
+        // [S1-T7-2] 原还有「发射线程上的 ambient AgentContext」观测项 —— 随载体整体删除而移除：
+        //   该维度现由编译期（无 ambient API）+ AgentContextAmbientReadInventoryTest 守卫保证。
     }
 
     private static Observations wire(Telemetry telemetry) {
@@ -88,8 +91,6 @@ class SubagentNameExplicitCarrierTest {
         doAnswer(inv -> {
             obs.sessionMemoryAttrs.add(inv.getArgument(1));
             obs.emittingThreads.add(Thread.currentThread().getName());
-            // 发射线程（= HOOK_EXECUTOR 线程）上的 ambient AgentContext：本路径恒 null
-            obs.ambientAgentContextOnEmitter.add(AgentContext.getAgentContext());
             return null;
         }).when(telemetry).recordEvent(eq("tengu_session_memory_accessed"), any());
         return obs;
@@ -117,10 +118,6 @@ class SubagentNameExplicitCarrierTest {
         ToolUseContext subagentTuc = ToolUseContext.of(null, "sess-test")
             .withSubagentIdentity("Explore", true);
 
-        assertThat(AgentContext.getAgentContext())
-            .as("前置：测试线程不得有 AgentContext —— 值只可能来自显式 TUC 载体")
-            .isNull();
-
         registry.executePostToolUse("Read", sessionMemoryInput(),
             ToolResult.success("tu-1", "ok"), subagentTuc);
 
@@ -134,10 +131,6 @@ class SubagentNameExplicitCarrierTest {
         assertThat(obs.emittingThreads)
             .as("夹具有效性：事件必须在非测试线程（真 HOOK_EXECUTOR）发射 —— 排除同线程零覆盖夹具")
             .allSatisfy(t -> assertThat(t).isNotEqualTo(Thread.currentThread().getName()));
-        assertThat(obs.ambientAgentContextOnEmitter)
-            .as("夹具有效性：发射线程上 ambient AgentContext 恒 null（ThreadLocal 路线取不到值，"
-                + "值只来自显式载体）")
-            .allMatch(java.util.Objects::isNull);
     }
 
     @Test
@@ -192,33 +185,4 @@ class SubagentNameExplicitCarrierTest {
             .doesNotContainKey("subagent_name");
     }
 
-    @Test
-    @DisplayName("显式载体不依赖 AgentContext：hooK 线程上 ambient ThreadLocal 全程为 null")
-    void explicitCarrier_doesNotDependOnAmbientThreadLocal() {
-        // WHY: 本测试锁「修法的本质」——即使把整个测试包在 runWithAgentContext 里，
-        //   hook 线程也读不到（ThreadLocal 不跨线程）；值只来自 TUC 显式载体。
-        Telemetry telemetry = mock(Telemetry.class);
-        Observations obs = wire(telemetry);
-        SessionFileAccessHooks hooks = new SessionFileAccessHooks(telemetry);
-        HookRegistry registry = new HookRegistry();
-        hooks.registerSessionFileAccessHooks(registry);
-
-        AgentContext.SubagentContext threadLocalCtx = new AgentContext.SubagentContext(
-            "agent-x", null, "ThreadLocalOnlyName", true, "req-x", "spawn");
-        ToolUseContext tuc = ToolUseContext.of(null, "sess-test")
-            .withSubagentIdentity("TucName", true);
-
-        // 在「有 ThreadLocal 上下文」的线程里派发 —— hook 仍在 HOOK_EXECUTOR 执行
-        AgentContext.runWithAgentContext(threadLocalCtx, () -> {
-            registry.executePostToolUse("Read", sessionMemoryInput(),
-                ToolResult.success("tu-4", "ok"), tuc);
-            return null;
-        });
-
-        assertThat(obs.sessionMemoryAttrs).isNotEmpty();
-        assertThat(obs.sessionMemoryAttrs.get(0))
-            .as("hook 必须用显式 TUC 载体（TucName），而不是派发线程的 ThreadLocal（ThreadLocalOnlyName）")
-            .containsEntry("subagent_name", "TucName")
-            .doesNotContainValue("ThreadLocalOnlyName");
-    }
 }

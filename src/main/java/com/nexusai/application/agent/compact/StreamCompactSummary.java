@@ -956,7 +956,11 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                     //   —— skipCacheWrite 只在 fork 分支（compact.ts:1229）设置；本路径对齐传 null
                     //   （不设 = false = marker 落最后一条）。
                     null,
-                    com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                    // [S1-T7] agent 归因上下文 = **本方法形参 ctx 携带的 ToolUseContext 显式字段**
+                    //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
+                    //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
+                    //   等价 CC agentContext.ts:170 无 invokingRequestId。
+                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null));
             } else {
                 provider.stream(
                     config, model, blocks, history, tools, null, null, null, null,
@@ -969,7 +973,11 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                     onError,
                     onComplete,
                     null, // [C] 同上：流式 fallback 非 fork → 不设 skipCacheWrite（CC compact.ts:1229 仅 fork 分支）
-                    com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                    // [S1-T7] agent 归因上下文 = **本方法形参 ctx 携带的 ToolUseContext 显式字段**
+                    //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
+                    //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
+                    //   等价 CC agentContext.ts:170 无 invokingRequestId。
+                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null));
             }
             // [IMP2-15 △-15] CC 无 300s 级硬超时（compact.ts 全程：靠 abortController + SDK
             //   状态，流一直持续则等待）→ future.get() 无超时等待；取消路径仍经

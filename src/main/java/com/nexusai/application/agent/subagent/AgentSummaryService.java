@@ -75,12 +75,18 @@ public class AgentSummaryService {
      * @param agentId         fork 目标 agent id
      * @param summarizer      摘要委托 (LLM + transcript 副作用)
      * @param updateCallback  摘要更新回调 (通常注入 AgentProgress / setAppState)
+     * @param agentContext    [S1-T7] agent 归因上下文（**在 start 时以值捕获**）：摘要 LLM side-query
+     *                        跑在 scheduler 池线程上，读不到 agent 执行线程的 ThreadLocal ⇒ 必须显式
+     *                        随状态下传（原实现读 {@code 宿主 ambient 归因上下文} 在该池线程
+     *                        恒 null = 归因边静默丢失）。null = 无归因上下文。
      * @return 句柄; 调 stop() 取消定时器 + 终止 in-flight
      */
     public AgentSummaryHandle start(String taskId, String agentId,
                                     SummarySummarizer summarizer,
-                                    Consumer<String> updateCallback) {
-        AgentSummaryState state = new AgentSummaryState(taskId, agentId, summarizer, updateCallback);
+                                    Consumer<String> updateCallback,
+                                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+        AgentSummaryState state = new AgentSummaryState(taskId, agentId, summarizer, updateCallback,
+            agentContext);
         states.put(agentId, state);
         log.info("[AgentSummary] 启动摘要 task={} agent={} intervalMs={}",
             taskId, agentId, summaryIntervalMs);
@@ -105,6 +111,8 @@ public class AgentSummaryService {
         final String agentId;
         final SummarySummarizer summarizer;
         final Consumer<String> updateCallback;
+        /** [S1-T7] 归因上下文（构造期以值捕获 · 池线程读不到 ThreadLocal）。 */
+        final com.nexusai.application.agent.subagent.AgentContext agentContext;
         final AtomicBoolean stopped = new AtomicBoolean(false);
         volatile ScheduledFuture<?> scheduledTask;
         volatile String previousSummary;
@@ -113,11 +121,13 @@ public class AgentSummaryService {
 
         AgentSummaryState(String taskId, String agentId,
                           SummarySummarizer summarizer,
-                          Consumer<String> updateCallback) {
+                          Consumer<String> updateCallback,
+                          com.nexusai.application.agent.subagent.AgentContext agentContext) {
             this.taskId = taskId;
             this.agentId = agentId;
             this.summarizer = summarizer;
             this.updateCallback = updateCallback;
+            this.agentContext = agentContext;
         }
 
         void scheduleNext() {
@@ -152,7 +162,7 @@ public class AgentSummaryService {
                 String summary;
                 if (summarizer instanceof SummarySummarizerImpl impl) {
                     // 透传 clean 上下文 + per-run AbortController (A6/A7)
-                    summary = impl.summarize(agentId, prompt, clean, abortController);
+                    summary = impl.summarize(agentId, prompt, clean, abortController, agentContext);
                 } else {
                     // 非本实现注入方: 走接口契约 (impl 内部自读自滤, 无 abort)
                     summary = summarizer.summarize(agentId, prompt);

@@ -3213,7 +3213,8 @@ public class LlmAgentLoop implements AgentLoop {
         //   若未来 teammate 走本循环，承载体须随 RunRequest 显式加组件（与 T7 的 agentContext 同法），
         //   ⛔ 不得在此读 ThreadLocal。
         ToolUseContext baseTuc = buildBaseToolUseContext(
-            state, initialModeInput, initialModeConfig, runExplicitCwd, null);
+            state, initialModeInput, initialModeConfig, runExplicitCwd, null,
+            params.agentContext());
         com.nexusai.application.agent.loop.AgentLoopContext mainCtx;
         if (contextFactory != null) {
             // [P3-③] 生产：factory.forSession 构造 ctx + 会话级可变状态（实例引用共享）+ override 事件通道
@@ -5147,8 +5148,11 @@ public class LlmAgentLoop implements AgentLoop {
                 String prefetchProjectRoot = (params.toolUseContext() != null
                         && params.toolUseContext().effectiveCwd() != null)
                     ? params.toolUseContext().effectiveCwd().toString() : null;
+                // [S1-T7] agent 归因上下文以**值**下传（见 startPrefetch javadoc）：本点跑在 query loop
+                //   线程，池线程读不到 ThreadLocal ⇒ 必须显式传；来源 = base TUC 的显式字段（单一来源）。
                 pendingMemoryPrefetch = ctx.memoryPrefetcher().startPrefetch(
-                    state.rawMessages(), readFileState, turnAbort, prefetchProjectRoot);
+                    state.rawMessages(), readFileState, turnAbort, prefetchProjectRoot,
+                    params.toolUseContext() != null ? params.toolUseContext().agentContext() : null);
             } catch (Exception e) {
                 log.debug("[LlmAgentLoop] turn={} relevant-memories prefetch 启动失败（跳过预取）: {}",
                     state.turnCount(), e.getMessage());
@@ -6282,7 +6286,8 @@ public class LlmAgentLoop implements AgentLoop {
                     if (warningState.isAboveWarningThreshold()) {
                         com.nexusai.application.agent.compact.CompactWarningState.publishTokenWarning(
                             compactWarningPushContext(ctx, state),
-                            com.nexusai.application.agent.compact.CompactWarningState.isCompactWarningSuppressed(),
+                            com.nexusai.application.agent.compact.CompactWarningState.isCompactWarningSuppressed(
+                                state.sessionId()),
                             tokenUsage,
                             thresholdSystem.getEffectiveContextWindowSize(effectiveModel),
                             warningState.percentLeft());
@@ -6644,15 +6649,19 @@ public class LlmAgentLoop implements AgentLoop {
                 // ═══════════════════ [A#3 tuc-invoking-req] 显式 agent 归因上下文 ═══════════════════
                 // CC original: 无入参（CC 的 AsyncLocalStorage 跨异步自动传播，logging.ts:294/:461
                 //   consumeInvokingRequestId 读 ambient context）。
-                // WHY 在此处取：本构造点跑在 **query loop 线程**——子代理经
-                //   SubagentExecutor:2003 runWithAgentContext 把 SubagentContext 装在该线程上，
-                //   主线程则为 null（→ 事件不带 invokingRequestId，等价 CC 主线程 undefined）。
-                //   取出实例后经 modelRequest → ModelCaller → provider.stream **显式下传**，
-                //   越过 STREAM_EXECUTOR 虚拟线程边界（虚拟线程不继承 ThreadLocal，
-                //   AgentContext 不在回放白名单 → 旧实现 provider 侧读 ambient 恒 null）。
-                // 禁止事项：不得在 STREAM_EXECUTOR 任务体里回放/重设该 ThreadLocal 再读
+                // [S1-T7 收口] 取值来源改为 **base TUC 的显式字段**（单一来源）：
+                //   本方法（static loop(AgentLoopContext, QueryParams, ...)）由主链与子代理链**共用**
+                //   ⇒ 不存在「doRun 局部变量」；而 QueryParams.toolUseContext() 就是 base TUC
+                //   （doRun :3513 QueryParams.forLoop(..., baseTuc, ...)），其 agentContext 由
+                //   buildBaseToolUseContext 处按 RunRequest.agentContext() 显式盖章 —— 全程显式传参。
+                //   ⛔ 原实现在此读 ambient 归因上下文（宿 ThreadLocal / 第二套平行载体），已删
+                //   （用户铁律：会话态一律不得经 ThreadLocal/MDC 读；两套判据必须收口到单一来源）。
+                // 取出实例后经 modelRequest → ModelCaller → provider.stream **显式下传**，
+                //   越过 STREAM_EXECUTOR 虚拟线程边界（虚拟线程不继承 ThreadLocal）。
+                // 禁止事项：不得在 STREAM_EXECUTOR 任务体里回放/重设 ThreadLocal 再读
                 //   （用户铁律：会话态一律显式传参，回放不算合规）。
-                com.nexusai.application.agent.subagent.AgentContext.getAgentContext()
+                (params.toolUseContext() != null
+                    ? params.toolUseContext().agentContext() : null)
             );
             // [H7-arch Phase 5-2 P3-④] 提交 LLM call（loop 不再直接 provider.stream）。
             // [对抗核验 H13-GAP-4 v3] 后台线程执行 callModel → loop 线程空闲执行 abort 感知轮询
@@ -8749,8 +8758,9 @@ public class LlmAgentLoop implements AgentLoop {
         // [S1-T2] 身份来源改为 TUC 显式载体：原 `Teammate.isTeammate()/getAgentName()/getTeamName()`
         //   是间接读（已删的 ThreadLocal 载体优先，其次进程级 dynamicTeamContext），
         //   与「会话态一律显式传参」冲突 ⇒ 统一读 {@code params.toolUseContext().teammateIdentity()}。
-        //   ⚠️ 语义收窄（本批登记）：原 dynamicTeamContext 分支（CLI/tmux sysprop 进程级身份槽）
-        //   不再使本门控为真 —— 该进程级槽由 T13（轨 IV）整体删除，两处收敛方向一致。
+        //   [S1-T13 已落地] 原 dynamicTeamContext 分支（CLI/tmux sysprop 进程级身份槽）已**整体删除**
+        //   （单 JVM 多会话下该进程级槽会把 A 会话身份带给 B 会话）⇒ 本门控判据单点化：只认
+        //   params.toolUseContext().teammateIdentity() != null。
         com.nexusai.application.agent.team.TeammateIdentity teammateIdentity =
             params.toolUseContext() != null ? params.toolUseContext().teammateIdentity() : null;
         if (ctx.hookRegistry() != null
@@ -9761,9 +9771,11 @@ public class LlmAgentLoop implements AgentLoop {
      */
     private ToolUseContext buildBaseToolUseContext(AgentState state) {
         // [S1-T2] 便捷重载：无 teammate 身份承载体 → 显式 null（非 teammate 上下文）。
+        // [S1-T7] 无 agent 归因上下文承载体 → 显式 null（非 agent 上下文）。
         return buildBaseToolUseContext(state,
             InitialPermissionModeResolver.Input.empty(),
             InitialPermissionModeResolver.Config.defaults(),
+            null,
             null,
             null);
     }
@@ -9786,12 +9798,19 @@ public class LlmAgentLoop implements AgentLoop {
      *
      * @param teammateIdentity 本 agent 的 teammate 身份；null = 非 teammate（主会话 / cron /
      *                         后台主会话循环 —— 本函数的全部生产调用方都在此列，见 doRun）
+     * @param agentContext     [S1-T7] <b>agent 归因上下文的显式入口</b>：base TUC 是归因上下文
+     *                         沿 TUC 传递链（base → per-turn → 工具 execute 形参 / provider
+     *                         显式载荷）到达每个消费点的唯一源头，本形参即该源头的显式载体。
+     *                         来源 = {@code doRun} 的 {@code params.agentContext()}（RunRequest 组件）
+     *                         ⇒ 全程显式传参，⛔ 不再从 {@code AgentContext} 的 ambient ThreadLocal
+     *                         捕获（用户铁律：会话态一律不得经 ThreadLocal/MDC 读；回放不算合规）。
      */
     private ToolUseContext buildBaseToolUseContext(AgentState state,
             InitialPermissionModeResolver.Input initialModeInput,
             InitialPermissionModeResolver.Config initialModeConfig,
             java.nio.file.Path runExplicitCwd,
-            com.nexusai.application.agent.team.TeammateIdentity teammateIdentity) {
+            com.nexusai.application.agent.team.TeammateIdentity teammateIdentity,
+            com.nexusai.application.agent.subagent.AgentContext agentContext) {
         if (state.sessionId() == null) {
             return null;
         }
@@ -9883,14 +9902,16 @@ public class LlmAgentLoop implements AgentLoop {
             null,                             // criticalSystemReminder_EXPERIMENTAL
             null,                             // [L+ R1] readFileState (compact ctor 兜底新 cache)
             buildBaseMcpServerConnections())   // [Q-09-R2-1] 主链 base TUC 注入活跃池连接包装（对齐 CC runAgent.ts:653-656 parentClients 来源=主链活跃池；修复前恒空 List.of()）
-            // [批 5b-1] agent 归因上下文**在此（loop 线程）捕获一次**，随 TUC 显式下传：
+            // [S1-T7] agent 归因上下文**由调用方显式传入**（形参 agentContext，来源 =
+            //   RunRequest.agentContext() 组件），随 TUC 显式下传：
             //   消费点（YoloClassifierImpl / ExecPromptHook / HaikuToolUseSummaryGenerator）跑在无 executor 的
             //   CompletableFuture(commonPool) 线程上，plain ThreadLocal 不跨线程 ⇒ 闭包内读恒 null。
-            //   捕获值语义与 CC 一致：主循环线程 ambient = null（等价 CC 主线程 undefined）；
-            //   后台任务（MainSessionBackgroundService 在 runWithAgentContext 内跑本 loop）则捕获到
-            //   该后台任务自己的 SubagentContext（对齐 CC 的 ALS 传播）。
-            //   ⛔ 派生线程内不得回放 ThreadLocal 再读（用户铁律：回放不算合规）。
-            .withAgentContext(com.nexusai.application.agent.subagent.AgentContext.getAgentContext())
+            //   语义与 CC 一致：主线程 / cron / 验证入口传 null（等价 CC 主线程 undefined）；
+            //   主会话后台化（MainSessionBackgroundService）传该后台任务自己的 SubagentContext
+            //   （对齐 CC 的 ALS 传播，但以**显式值**而非回放承载）。
+            //   ⛔ 原先此处读 ambient 归因上下文（宿 ThreadLocal）—— 已删（用户铁律：
+            //   会话态一律不得经 ThreadLocal/MDC 读；回放不算合规；两套载体必须收口到单一来源）。
+            .withAgentContext(agentContext)
             // [S1-T2] teammate 身份盖章（唯一生产盖章点）：身份不再由 ThreadLocal 在派生线程回放，
             //   而是随 base TUC 显式下传整条链（per-turn TUC / 工具 execute / stop hook）。
             //   同值短路（withTeammateIdentity 内 equals 判定）：null→null 时返回同一实例，
@@ -14315,7 +14336,14 @@ public class LlmAgentLoop implements AgentLoop {
             || counts.turnsSinceReminder() < taskReminderConfig.turnsBetweenReminders()) {
             return List.of();
         }
-        List<Task> tasks = listTasks(TaskSystemConfig.getDefaultTaskListId());
+        // [S1-T11] 会话/身份**显式**取自 state（原无会话形参版本已删除）：
+        //   sessionId = state.sessionId()（会话级任务列表，不再回退全进程共享 UUID）；
+        //   teammate 身份 = 本会话最后一次 per-turn TUC 的显式字段（主会话/cron 路径恒 null，
+        //   见 buildBaseToolUseContext 的形参说明）。
+        List<Task> tasks = listTasks(TaskSystemConfig.getDefaultTaskListId(
+            state.sessionId(),
+            state.currentToolUseContext() != null
+                ? state.currentToolUseContext().teammateIdentity() : null));
         if (tasks == null || tasks.isEmpty()) {
             return List.of();
         }

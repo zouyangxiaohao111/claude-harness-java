@@ -44,7 +44,7 @@ import static org.mockito.Mockito.mock;
  *       {@code registerAgentForeground}（任务落入 TaskFrameworkService 统一 store）并写回
  *       {@code summaryTaskId}</li>
  *   <li><b>Link C（gate）</b>：写回的非 null {@code summaryTaskId} 使
- *       {@code maybeStartSummary(SYNC, summaryTaskId, ..., sdk=true)} 返回非 null handle</li>
+ *       {@code maybeStartSummary(SYNC, summaryTaskId, ..., sdk=true, null)} 返回非 null handle</li>
  * </ul>
  */
 @DisplayName("[RF-2 返工] SubagentExecutor sync 前台登记生产接线链路")
@@ -119,7 +119,7 @@ class SubagentSyncForegroundRegistrationTest {
             svc, coordinator, true,
             agentId.toString(), tmpDir, "session-1",
             new LlmProviderFactory(), ProviderConfig.empty(), "test-model",
-            null, null);
+            null, null, null);
         try {
             assertThat(handle)
                 .as("sync 摘要门必须在 summaryTaskId 非 null 且 sdk=true 时命中（生产接线打通后 summaryTaskId 不再恒 null）")

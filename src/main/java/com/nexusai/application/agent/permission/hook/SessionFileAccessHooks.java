@@ -255,7 +255,7 @@ public final class SessionFileAccessHooks {
      *   <li>team memory 文件 → {@code tengu_team_mem_accessed} + file_read/edit/write +
      *       Edit/Write 后 notifyTeamMemoryWrite (CC :189-208)</li>
      *   <li>全事件附带 {@code subagent_name} 属性（CC :158-159）—— 仅 subagent 上下文才携带
-     *       （{@code getSubagentLogName()} 非 subagent → undefined → 无该属性）</li>
+     *       （CC agentContext.ts:141-151 {@code getSubagentLogName()}；本仓 Java 侧同名方法已随载体删除 → 无该属性）</li>
      * </ul>
      *
      * @param toolName 工具名 (已由 matcher 过滤为 5 工具之一)
@@ -337,11 +337,11 @@ public final class SessionFileAccessHooks {
      *
      * <p>仅 subagent 上下文携带该属性（主线程无 subagentName → 空 map → 事件无 subagent_name）。
      *
-     * <p><b>[tuc-subagent-identity] WHY 从 ctx 取而不是 {@code AgentContext.getSubagentLogName()}</b>：
+     * <p><b>[tuc-subagent-identity] WHY 从 ctx 取而不是走 ambient subagent 名派生</b>：
      * 本 hook 的 PostToolUse 回调由 {@code HookRegistry:2595
      * supplyAsync(withSessionProjectRoot(...), HOOK_EXECUTOR)} 派发到 HOOK_EXECUTOR 线程，
-     * {@code AgentContext.STORAGE}（ThreadLocal）不在回放白名单 ⇒ {@code getSubagentLogName()}
-     * 在该线程恒返回 null ⇒ {@code subagent_name} 生产恒空（本批修复的根因）。
+     * ambient 归因 ThreadLocal（已删载体）不在回放白名单 ⇒ 该派生读在 hook 线程恒 null
+     * ⇒ {@code subagent_name} 生产恒空（本批修复的根因）。
      * 显式载体 = 回调第 4 参 {@code ctx}（{@code ToolUseContext}，CC 自己就把
      * {@code Tool.ts:245-246 agentId/agentType} 定为「hook 侧子代理判别载体」）。
      *
@@ -362,7 +362,7 @@ public final class SessionFileAccessHooks {
         }
         String name = ctx.subagentName();
         if (name == null || name.isBlank()) {
-            // 本就不需要（主线程 / 非子代理上下文）→ CC getSubagentLogName 亦返回 undefined
+            // 本就不需要（主线程 / 非子代理上下文）→ CC agentContext.ts:141-151 的 getSubagentLogName 亦返回 undefined
             if (log.isDebugEnabled()) {
                 log.debug("[SessionFileAccessHooks] 非子代理上下文 (subagentName=null), 事件不带 subagent_name "
                         + "· CC agentContext.ts:145-146");

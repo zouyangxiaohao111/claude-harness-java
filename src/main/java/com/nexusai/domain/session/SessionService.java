@@ -82,6 +82,12 @@ public class SessionService {
     @Autowired(required = false) private com.nexusai.application.agent.SessionAgentStateRegistry sessionAgentStateRegistry;
     // [Phase2 · session-file-panel-collapse-atfile] 会话删除 → 释放该会话改动文件记录（内存 + 快照落盘）
     @Autowired(required = false) private com.nexusai.application.session.SessionFilesRecorder sessionFilesRecorder;
+    // [S1 轨 III] 会话删除 → 回收按 sessionId 键控的两处 agent 层表（DenialTracker 计数槽 /
+    //   ClaudemdEngine eager-load one-shot 态）。best-effort，required=false（null → 跳过）。
+    @Autowired(required = false)
+    private com.nexusai.application.agent.permission.classifier.DenialTracker denialTracker;
+    @Autowired(required = false)
+    private com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine;
     // [B3] 注入 SubagentTool — mainThreadAgent 写侧校验数据源（registryForSession → findAgent）。
     //   best-effort，required=false：plain JUnit 无容器 → null → 走原逻辑不校验（fail-open）；
     //   生产注入 → 未命中 agentType fail-loud 400（对齐 permissionMode isSettable 范式）。
@@ -320,6 +326,21 @@ public class SessionService {
         //   best-effort：null（未接线）→ 跳过；未知会话 evict no-op，不阻塞删除主流程。
         if (sessionGitStatusRegistry != null) {
             sessionGitStatusRegistry.evict(id);
+        }
+        // [S1 轨 III · 会话键控残留] 会话删除 → 回收三处「按 sessionId 键控」的进程内表
+        //   （均与上面 MicroCompactor.removeSessionState / SessionGitStatusRegistry.evict 同一口径：
+        //    CC 一进程一会话，随进程退出释放；Java 常驻 JVM 必须显式回收，否则随「会话数」无界累积）。
+        //   best-effort：未接线（null）→ 跳过；未知会话 no-op，不阻塞删除主流程。
+        try {
+            if (denialTracker != null) {
+                denialTracker.removeSession(id);
+            }
+            if (claudemdEngine != null) {
+                claudemdEngine.removeSession(id);
+            }
+            com.nexusai.application.agent.compact.PostCompactionState.clear(id);
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: 会话键控表回收失败 session={}: {}", id, e.toString());
         }
         // [skill-listing-cc-align 2026-09-10] 会话删除 → 释放该会话「已发技能集合」注册表条目（防无界增长）。
         //   best-effort：本类是 final + 私有构造的<b>静态工具表</b>（非 Spring bean，无实例可注入），故直呼静态

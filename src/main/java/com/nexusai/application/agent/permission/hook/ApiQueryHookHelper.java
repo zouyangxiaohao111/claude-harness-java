@@ -256,8 +256,13 @@ public final class ApiQueryHookHelper {
                     null,                              // hasAppendSystemPrompt — CC :100-101, Java 无通道 → null
                     List.of(),                         // mcpTools — CC :105 []
                     hookCtx.toolUseContext() != null
-                        ? hookCtx.toolUseContext().isNonInteractiveSession() : null  // :98-99
-                , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                        ? hookCtx.toolUseContext().isNonInteractiveSession() : null, // :98-99
+                    // [S1-T7] agent 归因上下文 = **工具上下文的显式字段**（hook 执行线程上
+                    //   ThreadLocal 不可达；两套载体收口到 TUC 单一来源）。
+                    //   null（非 agent 上下文，如主会话 / cron）→ 事件不带 invokingRequestId，
+                    //   等价 CC agentContext.ts:170 {@code !context?.invokingRequestId}。
+                    hookCtx.toolUseContext() != null
+                        ? hookCtx.toolUseContext().agentContext() : null);
 
                 LlmProvider.LlmRawResponse response = executor.query(systemPrompt, userMessage, model, useTools, options);
                 String content = response.content().trim();

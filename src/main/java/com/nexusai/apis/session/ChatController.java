@@ -275,7 +275,7 @@ public class ChatController {
      *
      * @param sessionId 会话 ID（路径变量）
      * @param req       可选请求体（null = 用会话历史派生）
-     * @return 200 {@code {taskId}} · 后台查询在 runWithAgentContext 隔离下异步运行
+     * @return 200 {@code {taskId}} · 后台查询在携带显式归因上下文的隔离作用域下异步运行
      */
     @PostMapping("/background")
     @ResponseStatus(HttpStatus.ACCEPTED)

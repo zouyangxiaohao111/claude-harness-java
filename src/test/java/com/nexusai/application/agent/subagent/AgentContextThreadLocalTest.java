@@ -16,40 +16,22 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
 /**
- * Session S7 · AgentContext (ThreadLocal 等价 AsyncLocalStorage) RED→GREEN 验证 ·
- * 对齐 CC utils/agentContext.ts:1-178.
+ * {@code AgentContext}（analytics 归因上下文的类型/纯函数/显式实参 API）RED→GREEN 验证 ·
+ * 对齐 CC utils/agentContext.ts:1-178。
  *
  * <p><b>WHY (CLAUDE.md 规则九 · 测试验证意图)</b>: CC 用 AsyncLocalStorage 隔离每条异步
  * 执行链的 agent 身份 (agentContext.ts:16-21), 避免并发 agent 的 analytics 归因串台
- * (agent A 的 event 归到 agent B)。Java 无等价物, S7 以 ThreadLocal 实现
- * getAgentContext / runWithAgentContext / consumeInvokingRequestId。
+ * (agent A 的 event 归到 agent B)。
+ *
+ * <p><b>历史（S1-T7-2 之后的现状）</b>: Java 侧曾以 plain ThreadLocal 等价 AsyncLocalStorage，
+ * 并由本类覆盖其 set/read 配对与「作用域外为 null」。该载体（ThreadLocal + 读取方法 + 线程包裹）
+ * <b>已于 S1-T7-2 整体删除</b>（删因：只写不读 + plain ThreadLocal 不跨线程 ⇒ ambient 读恒 null），
+ * <b>两条相应用例随之删除</b>。本类现只覆盖<b>仍然存在</b>的部分：类型守卫、sparse-edge
+ * 消费（{@code consumeInvokingRequestId} / {@code attachInvokingRequestEdge}，均收**显式实参**）、
+ * agentId 编码桥、fork 事件属性、cleanup 键。
  */
-@DisplayName("Session S7 · AgentContext ThreadLocal 等价 AsyncLocalStorage")
+@DisplayName("AgentContext 显式实参 API（类型守卫 / sparse-edge / 遥测属性接入 / agentId 编码）")
 class AgentContextThreadLocalTest {
-
-    @Test
-    @DisplayName("runWithAgentContext 设置 context, getAgentContext 可读（CC agentContext.ts:108/100）")
-    void runWithAgentContext_setsContext_readableByGetAgentContext() {
-        // WHY: CC :108 runWithAgentContext 用 AsyncLocalStorage.run(context, fn) 隔离执行链,
-        //   链内 getAgentContext() (:100) 必须能读到该 context.
-        AgentContext.SubagentContext ctx =
-            new AgentContext.SubagentContext("a-123", null, "Explore", true, "req-1", "spawn");
-
-        AgentContext returned = AgentContext.runWithAgentContext(ctx, AgentContext::getAgentContext);
-
-        assertThat(returned)
-            .as("runWithAgentContext 块内 getAgentContext 必须返回该 ctx (CC :108-110)")
-            .isSameAs(ctx);
-    }
-
-    @Test
-    @DisplayName("runWithAgentContext 块外 getAgentContext 返回 null（CC agentContext.ts:101 undefined）")
-    void getAgentContext_returnsNull_outsideRunBlock() {
-        // WHY: CC :100-102 未在 agent context 内执行时返回 undefined; Java ThreadLocal 未 set 时返回 null.
-        assertThat(AgentContext.getAgentContext())
-            .as("无 context 时必须返回 null (不抛异常)")
-            .isNull();
-    }
 
     @Test
     @DisplayName("consumeInvokingRequestId 一次消费后清空（CC agentContext.ts:163-178 sparse edge）")
@@ -59,19 +41,21 @@ class AgentContextThreadLocalTest {
         AgentContext.SubagentContext ctx =
             new AgentContext.SubagentContext("a-123", null, "Explore", true, "req-1", "spawn");
 
-        AgentContext.runWithAgentContext(ctx, () -> {
-            AgentContext.InvokingRequestEdge first = AgentContext.consumeInvokingRequestId();
-            AgentContext.InvokingRequestEdge second = AgentContext.consumeInvokingRequestId();
+        // [S1-T7-2] 改锚显式实参版（ambient 版已随载体整体删除）—— 语义（sparse edge 一次消费）不变。
+        AgentContext.InvokingRequestEdge first = AgentContext.consumeInvokingRequestId(ctx);
+        AgentContext.InvokingRequestEdge second = AgentContext.consumeInvokingRequestId(ctx);
 
-            assertThat(first)
-                .as("首次 consume 必须返回 edge (CC :174-177)")
-                .isNotNull();
-            assertThat(first.invokingRequestId()).isEqualTo("req-1");
-            assertThat(first.invocationKind()).isEqualTo("spawn");
-            assertThat(second)
-                .as("二次 consume 必须 null (invocationEmitted=true 已消费)")
-                .isNull();
-        });
+        assertThat(first)
+            .as("首次 consume 必须返回 edge (CC :174-177)")
+            .isNotNull();
+        assertThat(first.invokingRequestId()).isEqualTo("req-1");
+        assertThat(first.invocationKind()).isEqualTo("spawn");
+        assertThat(second)
+            .as("二次 consume 必须 null (invocationEmitted=true 已消费)")
+            .isNull();
+        assertThat(AgentContext.consumeInvokingRequestId((AgentContext) null))
+            .as("显式 null context ⇒ 恒 null（等价 CC 主线程 undefined，CC :170 guard）")
+            .isNull();
     }
 
     @Test
@@ -85,8 +69,7 @@ class AgentContextThreadLocalTest {
             new AgentContext.SubagentContext("a-123", null, "Explore", true, "req-1", "resume");
         Map<String, Object> attrs = new HashMap<>();
 
-        AgentContext.InvokingRequestEdge edge = AgentContext.runWithAgentContext(ctx,
-            () -> AgentContext.attachInvokingRequestEdge(attrs));
+        AgentContext.InvokingRequestEdge edge = AgentContext.attachInvokingRequestEdge(attrs, ctx);
 
         assertThat(edge)
             .as("首次 attach 必须消费并返回 edge（非 null = 当前事件携带稀疏边）")
@@ -101,12 +84,10 @@ class AgentContextThreadLocalTest {
             .containsEntry("invocationKind", "resume");
 
         // sparse-edge: 同 invocation 二次 attach 必须 null 且不重复写属性（CC :170 invocationEmitted）
-        AgentContext.runWithAgentContext(ctx, () -> {
-            AgentContext.InvokingRequestEdge second = AgentContext.attachInvokingRequestEdge(attrs);
-            assertThat(second)
-                .as("sparse-edge: 二次 attach 必须 null（已消费）")
-                .isNull();
-        });
+        AgentContext.InvokingRequestEdge second = AgentContext.attachInvokingRequestEdge(attrs, ctx);
+        assertThat(second)
+            .as("sparse-edge: 二次 attach 必须 null（已消费）")
+            .isNull();
         assertThat(attrs)
             .as("已消费后不重复写/不覆盖 invokingRequestId")
             .containsEntry("invokingRequestId", "req-1");
@@ -122,8 +103,7 @@ class AgentContextThreadLocalTest {
             new AgentContext.SubagentContext("a-123", null, "Explore", true, null, null);
         Map<String, Object> attrs = new HashMap<>();
 
-        AgentContext.InvokingRequestEdge edge = AgentContext.runWithAgentContext(ctx,
-            () -> AgentContext.attachInvokingRequestEdge(attrs));
+        AgentContext.InvokingRequestEdge edge = AgentContext.attachInvokingRequestEdge(attrs, ctx);
 
         assertThat(edge)
             .as("无 invokingRequestId 时 consume 返回 null (CC :170)")
@@ -141,46 +121,39 @@ class AgentContextThreadLocalTest {
         AgentContext.SubagentContext ctx =
             new AgentContext.SubagentContext("a-123", null, "Explore", true, "req-1", "spawn");
 
-        AgentContext.InvokingRequestEdge edge = AgentContext.runWithAgentContext(ctx,
-            () -> AgentContext.attachInvokingRequestEdge(null));
+        AgentContext.InvokingRequestEdge edge = AgentContext.attachInvokingRequestEdge(null, ctx);
 
         assertThat(edge)
             .as("eventAttrs=null 仍消费并返回 edge")
             .isNotNull();
-        AgentContext.runWithAgentContext(ctx, () -> {
-            AgentContext.InvokingRequestEdge second = AgentContext.attachInvokingRequestEdge(null);
-            assertThat(second)
-                .as("eventAttrs=null 消费副作用仍生效：二次必须 null")
-                .isNull();
-        });
+        AgentContext.InvokingRequestEdge second = AgentContext.attachInvokingRequestEdge(null, ctx);
+        assertThat(second)
+            .as("eventAttrs=null 消费副作用仍生效：二次必须 null")
+            .isNull();
     }
 
     @Test
-    @DisplayName("getAgentContext 区分 subagent vs teammate（CC :38 agentType='subagent' vs :76 'teammate'）")
-    void getAgentContext_distinguishesSubagentVsTeammate() {
+    @DisplayName("类型守卫按 agentType 区分 subagent vs teammate（CC :38 'subagent' vs :76 'teammate'）")
+    void typeGuards_distinguishSubagentVsTeammate() {
         // WHY: CC discriminated union (:91) 需按 agentType 区分 subagent/teammate 两类归因.
+        // [S1-T7-2] 改锚：守卫收显式实参（ambient 读取已随载体删除）。
         AgentContext.SubagentContext sub =
             new AgentContext.SubagentContext("a-1", null, "Explore", true, null, null);
         AgentContext.TeammateAgentContext team =
             new AgentContext.TeammateAgentContext("researcher@my-team", "researcher", "my-team",
                 "blue", false, "sess-1", false, null, null);
 
-        AgentContext.runWithAgentContext(sub, () -> {
-            assertThat(AgentContext.getAgentContext())
-                .as("subagent context 必须是 SubagentContext 实例")
-                .isInstanceOf(AgentContext.SubagentContext.class);
-            assertThat(AgentContext.isSubagentContext(AgentContext.getAgentContext()))
-                .as("isSubagentContext 必须 true (CC :115-119)")
-                .isTrue();
-        });
-        AgentContext.runWithAgentContext(team, () -> {
-            assertThat(AgentContext.getAgentContext())
-                .as("teammate context 必须是 TeammateAgentContext 实例")
-                .isInstanceOf(AgentContext.TeammateAgentContext.class);
-            assertThat(AgentContext.isSubagentContext(AgentContext.getAgentContext()))
-                .as("teammate context isSubagentContext 必须 false")
-                .isFalse();
-        });
+        assertThat((Object) sub).as("subagent context 必须是 SubagentContext").isInstanceOf(AgentContext.SubagentContext.class);
+        assertThat(AgentContext.isSubagentContext(sub))
+            .as("isSubagentContext(sub) 必须 true (CC :115-119)")
+            .isTrue();
+        assertThat((Object) team).as("teammate context 必须是 TeammateAgentContext").isInstanceOf(AgentContext.TeammateAgentContext.class);
+        assertThat(AgentContext.isSubagentContext(team))
+            .as("isSubagentContext(teammate) 必须 false")
+            .isFalse();
+        assertThat(AgentContext.isSubagentContext(null))
+            .as("isSubagentContext(null) 必须 false（CC :116 context 可为 undefined）")
+            .isFalse();
     }
 
     @Test
@@ -357,61 +330,63 @@ class AgentContextThreadLocalTest {
     @Test
     @DisplayName("terminal 事件在 context 活跃时首个携带 edge、二次事件不带（sparse-edge · REWORK-1 生产路径）")
     void terminalEvent_insideContext_firstCarriesEdge_secondSparse() {
-        // WHY: REWORK-1 假接线根因 —— 原 emitSubagentApiTerminalEvent 在 runWithAgentContext 块外
-        //   （Step 22，finally restore/remove ThreadLocal 之后）调用 attachInvokingRequestEdge，
-        //   consumeInvokingRequestId 读到 STORAGE=null（顶层）或外层 subagent 的 edge（嵌套）→
-        //   子代理自身 invokingRequestId 永不消费。修复后发射点在作用域内（loop 返回后、context
-        //   退出前）：context 活跃时首个 terminal 事件必须带 edge（attrs 写入 invokingRequestId/
-        //   invocationKind），二次事件（同 invocation）必须不带（sparse-edge，agentContext.ts:170）。
+        // WHY: sparse-edge 语义（CC agentContext.ts:159-173）—— 同一 invocation 的第一个
+        //   terminal API event 携带 invokingRequestId/invocationKind，后续事件不带
+        //   （{@code invocationEmitted} 一次翻转）。
+        //   [S1-T7-2] 原 WHY 讲的是 REWORK-1 的 ambient 作用域竞态（发射点在作用域外 ⇒ 读不到
+        //   ambient ⇒ 子代理 invokingRequestId 永不消费）。载体删除后该失效模式已不可表达：
+        //   上下文现在是**显式实参**，判据收敛为「有上下文 ⇒ 首个带边；显式 null ⇒ 不带边」
+        //   （后者见 {@link #terminalEvent_nullContext_edgeAlwaysNull()}）。
         AgentContext.SubagentContext ctx =
             new AgentContext.SubagentContext("a-123", null, "Explore", true, "req-1", "spawn");
         Map<String, Object> firstAttrs = new HashMap<>();
         Map<String, Object> secondAttrs = new HashMap<>();
 
-        AgentContext.runWithAgentContext(ctx, () -> {
-            // 首个 terminal 事件（context 活跃）：edge 非 null + attrs 展开
-            AgentContext.InvokingRequestEdge first = AgentContext.attachInvokingRequestEdge(firstAttrs);
-            assertThat(first)
-                .as("context 活跃时首个 terminal 事件必须携带 edge（CC logging.ts:461/:294 consume 点）")
-                .isNotNull();
-            assertThat(firstAttrs)
-                .as("首个事件 attrs 必须 spread invokingRequestId（CC logging.ts:493-500）")
-                .containsEntry("invokingRequestId", "req-1");
-            assertThat(firstAttrs)
-                .as("首个事件 attrs 必须 spread invocationKind（CC logging.ts:495-498）")
-                .containsEntry("invocationKind", "spawn");
+        // [S1-T7-2] 改锚：上下文以显式实参传入（ambient 载体已整体删除）—— 语义不变。
+        // 首个 terminal 事件：edge 非 null + attrs 展开
+        AgentContext.InvokingRequestEdge first = AgentContext.attachInvokingRequestEdge(firstAttrs, ctx);
+        assertThat(first)
+            .as("有上下文时首个 terminal 事件必须携带 edge（CC logging.ts:461/:294 consume 点）")
+            .isNotNull();
+        assertThat(firstAttrs)
+            .as("首个事件 attrs 必须 spread invokingRequestId（CC logging.ts:493-500）")
+            .containsEntry("invokingRequestId", "req-1");
+        assertThat(firstAttrs)
+            .as("首个事件 attrs 必须 spread invocationKind（CC logging.ts:495-498）")
+            .containsEntry("invocationKind", "spawn");
 
-            // 二次 terminal 事件（同 invocation）：sparse-edge，edge 已消费 → null 且不写属性
-            AgentContext.InvokingRequestEdge second = AgentContext.attachInvokingRequestEdge(secondAttrs);
-            assertThat(second)
-                .as("二次 terminal 事件必须 null（invocationEmitted=true，CC :170 guard）")
-                .isNull();
-            assertThat(secondAttrs)
-                .as("二次事件不得重复写 invokingRequestId（sparse-edge）")
-                .doesNotContainKey("invokingRequestId");
-        });
+        // 二次 terminal 事件（同 invocation）：sparse-edge，edge 已消费 → null 且不写属性
+        AgentContext.InvokingRequestEdge second = AgentContext.attachInvokingRequestEdge(secondAttrs, ctx);
+        assertThat(second)
+            .as("二次 terminal 事件必须 null（invocationEmitted=true，CC :170 guard）")
+            .isNull();
+        assertThat(secondAttrs)
+            .as("二次事件不得重复写 invokingRequestId（sparse-edge）")
+            .doesNotContainKey("invokingRequestId");
     }
 
     @Test
-    @DisplayName("terminal 事件在 context 作用域外发射 edge 恒 null（REWORK-1 假接线回归守卫）")
-    void terminalEvent_outsideContext_edgeAlwaysNull() {
-        // WHY: 该测试锁定修复的必要性 —— 若 emitSubagentApiTerminalEvent 被移回 runWithAgentContext
-        //   作用域外（原 Step 22 位置），consumeInvokingRequestId 读 STORAGE=null → edge 恒 null，
-        //   子代理 invokingRequestId 永不进入 tengu_api_success/error。作用域外调用必须返回 null
-        //   才符合 CC agentContext.ts:101（无 context → undefined）。
+    @DisplayName("terminal 事件传入显式 null context ⇒ edge 恒 null（不落任何归因边）")
+    void terminalEvent_nullContext_edgeAlwaysNull() {
+        // WHY: [S1-T7-2] 改锚 —— 原用例锁定「作用域外发射 ⇒ 读不到 ambient ⇒ edge 恒 null」。
+        //   载体删除后等价的可证伪维度是「显式传 null ⇒ 不落边」：主线程 / cron / 非 agent 路径
+        //   传 null 时不得写 invokingRequestId 键（CC agentContext.ts:101 无 context → undefined），
+        //   否则事件会带上假的 spawn/resume 边界。
         AgentContext.SubagentContext ctx =
             new AgentContext.SubagentContext("a-123", null, "Explore", true, "req-1", "spawn");
-        // 先让 context 进入作用域一次以建立 invokingRequestId（等价生产：query loop 在作用域内跑）
-        AgentContext.runWithAgentContext(ctx, () -> { });
+        // 前置：该 ctx 本身是「有边」的（同一实例显式传入时首消费必得 edge）—— 证明本用例不是恒真
+        assertThat(AgentContext.consumeInvokingRequestId(ctx))
+            .as("前置：ctx 携带 invokingRequestId ⇒ 显式传入时首消费必得 edge")
+            .isNotNull();
 
         Map<String, Object> attrs = new HashMap<>();
-        AgentContext.InvokingRequestEdge outside = AgentContext.attachInvokingRequestEdge(attrs);
+        AgentContext.InvokingRequestEdge outside = AgentContext.attachInvokingRequestEdge(attrs, null);
 
         assertThat(outside)
-            .as("runWithAgentContext 作用域外 attach 必须 null（CC :101 无 context → undefined）")
+            .as("显式 null context ⇒ attach 必须 null（CC :101 无 context → undefined）")
             .isNull();
         assertThat(attrs)
-            .as("作用域外不得写 invokingRequestId 键（edge 恒 null → 事件不携带边界）")
+            .as("null context 不得写 invokingRequestId 键（edge 恒 null → 事件不携带边界）")
             .doesNotContainKey("invokingRequestId");
     }
 

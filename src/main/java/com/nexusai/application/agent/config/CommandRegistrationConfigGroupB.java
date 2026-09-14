@@ -365,8 +365,18 @@ public class CommandRegistrationConfigGroupB {
                     return;
                 }
                 LlmProvider provider = llmProviderFactory.getProvider(resolved.config(), resolved.providerType());
+                // [S1-T7] agent 归因上下文 = **显式 null（(b) 类「本就不需要」）**，原读
+                //   ambient 归因上下文（宿 ThreadLocal，已删载体）已删（会话态不得经 ThreadLocal 读）。
+                //   判据（读 CC 真源 + 本仓调用链）：/btw = 用户在主线程发起的**旁路单轮提问**
+                //   （CC commands/btw/btw.tsx call → runSideQuestion），不处于任何 agent 的
+                //   执行链内 ⇒ 归因上下文在本路径**结构上不存在**；显式 null 保留 CC
+                //   agentContext.ts:170「无 invokingRequestId」语义。
+                //   ⚠️ 每秒调用都发 WARN（非一次性闸）——一次性闸会让多会话下第 2 个会话的
+                //   缺值在结构上不可观测（本仓裁定-8）。
+                log.warn("[CommandRegistrationConfigGroupB] /btw 旁路提问 agent 归因上下文显式为空 (null)"
+                    + "（旁路单轮查询无 agent 执行链 · (b) 类本就不需要）: sessionId={}", sessionId);
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                    List.of(), null, null, null, null, "btw", null, 1024, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                    List.of(), null, null, null, null, "btw", null, 1024, null);
                 String answer = provider.chatWithOptions(resolved.config(), model,
                     "You are a helpful assistant answering a quick side question.", question, options);
                 log.info("[CommandRegistrationConfigGroupB] /btw 旁路提问回答: model={} question={} answer={}",

@@ -78,7 +78,8 @@ class AcceptEditsFastPathTest {
     void acceptEditsAllows_allowFastPath() {
         fakeClassifier.queueResult(YoloClassifierResult.allowed(
             "should not be reached", "fake-model"));
-        denialTracker.recordDenial(); // 制造连续拒绝，验证 fast-path recordSuccess 断链
+        // T16：计数按 sessionId 键控 ⇒ 直接读写的键必须与 pipeline 收到的 ctx 同键
+        denialTracker.recordDenial(sid()); // 制造连续拒绝，验证 fast-path recordSuccess 断链
 
         JsonNode input = JSON.createObjectNode().put("file_path", "/tmp/x.txt");
         JsonNode modified = JSON.createObjectNode().put("file_path", "/tmp/x.txt").put("extra", "edited");
@@ -99,8 +100,8 @@ class AcceptEditsFastPathTest {
         assertThat(fakeClassifier.classifyCallCount)
             .as("acceptEdits fast-path 命中 → 不调分类器（CC :620-640）")
             .isZero();
-        assertThat(denialTracker.getConsecutiveDenials())
-            .as("CC :620-622 recordSuccess 断连拒链")
+        assertThat(denialTracker.getConsecutiveDenials(sid()))
+            .as("CC :620-622 recordSuccess 断连拒链（T16：按 sessionId 键控，读侧同键）")
             .isZero();
     }
 
@@ -305,5 +306,10 @@ class AcceptEditsFastPathTest {
             return CompletableFuture.completedFuture(YoloClassifierResult.allowed(
                 "fake-text-action-not-used", "fake-model"));
         }
+    }
+
+    /** T16：DenialTracker 计数按 sessionId 键控 —— 直读直写的键必须与 pipeline 的 ctx 同键。 */
+    private String sid() {
+        return ctx.sessionId();
     }
 }

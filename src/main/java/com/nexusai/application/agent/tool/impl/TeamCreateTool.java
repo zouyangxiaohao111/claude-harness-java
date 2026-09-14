@@ -204,8 +204,12 @@ public class TeamCreateTool implements Tool {
             //   teammate 线程回退 teamName。保证归因键确定性，不落随机 UUID（否则 cleanupSessionTeams
             //   永无法匹配，孤儿 config.json/inboxes/tasks 泄漏延续，finding R2-3 行为回归）。
             //   真正无会话（[批 3c] 会话态已无 MDC 载体 → 进程级兜底）时亦确定性登记，孤儿清理交由 Batch4 A4/A5。
+            //   [S1-T11] 兜底分支同批显式化（原无参 getTaskListId() 已删除）：sessionId 位仍传 null
+            //   （本分支的前提就是 ctx.sessionId() == null ⇒ 传 null 与旧行为逐字一致），
+            //   teammate 身份改由 ctx 显式承载（原无参重载在该分支读不到任何线程态）。
             String cleanupKey = (ctx != null && ctx.sessionId() != null)
-                    ? ctx.sessionId() : TaskService.getTaskListId();
+                    ? ctx.sessionId()
+                    : TaskService.getTaskListId(null, ctx != null ? ctx.teammateIdentity() : null);
             // CC :162 leadSessionId = getSessionId()（team discovery 用实际 session id）——
             //   与清理归因键同源，避免 config.json 落随机 UUID 与清理侧键不一致。
             //   [merge-align F1/F2 修正] 原回退 UUID.randomUUID() 违反注释「不落随机 UUID」：

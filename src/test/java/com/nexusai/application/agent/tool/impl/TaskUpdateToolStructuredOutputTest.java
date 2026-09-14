@@ -9,7 +9,7 @@ import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.tasks.Task;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
-import com.nexusai.application.agent.team.Teammate;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
@@ -332,22 +332,23 @@ class TaskUpdateToolStructuredOutputTest {
     void mapper_appendsCompletedReminder() {
         // WHY: CC TaskUpdateTool.ts:388-394 statusChange.to==='completed' && getAgentId() && isAgentSwarmsEnabled()
         // → 追加提醒。[IMP-G3] OD-G2-1 拍板：getAgentId()（teammate.ts:88-92）改由 Java Teammate.getAgentId()
-        // 对等表达（in-process TeammateContext ThreadLocal > dynamicTeamContext），不再用 nexusai.agent.name
-        // sysprop 代理——测试以 dynamicTeamContext 模拟 running-as-teammate。
+        // 对等表达，不再用 nexusai.agent.name sysprop 代理。
+        // [S1-T13] 身份载体已收敛为**显式形参**（进程级 dynamicTeamContext 槽已删）⇒ 本用例改用
+        // 生产同款 2 参 mapper（{@code mapToolResultToToolResultBlockParam(out, identity)}），
+        // identity 即生产 {@code ToolUseContext.teammateIdentity()} 的值。
         System.setProperty("nexusai.experimental.agent-teams", "true");
-        Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
-            "teammateA@t", "teammateA", "t", null, false, null));
         try {
             TaskUpdateTool.StatusChange sc =
                 new TaskUpdateTool.StatusChange("in_progress", "completed");
             TaskUpdateTool.TaskUpdateOutput out =
                 new TaskUpdateTool.TaskUpdateOutput(true, "t-1", List.of("status"), null, sc, false);
-            assertThat(TaskUpdateTool.mapToolResultToToolResultBlockParam(out))
+            TeammateIdentity identity = new TeammateIdentity(
+                "teammateA@t", "teammateA", "t", null, false, null);
+            assertThat(TaskUpdateTool.mapToolResultToToolResultBlockParam(out, identity))
                 .isEqualTo("Updated task #t-1 status"
                     + "\n\nTask completed. Call TaskList now to find your next available task or see if your work unblocked others.");
         } finally {
             TaskSystemConfig.clearForTest();
-            Teammate.clearDynamicTeamContext();
         }
     }
 

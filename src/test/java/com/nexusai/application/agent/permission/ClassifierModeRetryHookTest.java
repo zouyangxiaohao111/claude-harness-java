@@ -171,7 +171,7 @@ class ClassifierModeRetryHookTest {
             .startsWith("Permission for this action has been denied. Reason: dangerous rm -rf");
 
         // 防御性断言: classifier deny 路径必须调 denialTracker.recordDenial()（1 次拒绝不熔断）
-        assertThat(pipeline.denialTracker.shouldFallbackToPrompting())
+        assertThat(pipeline.denialTracker.shouldFallbackToPrompting(ctx.sessionId()))
             .as("[防御性] classifier deny 路径必须调 denialTracker.recordDenial()")
             .isFalse();
     }
@@ -270,5 +270,10 @@ class ClassifierModeRetryHookTest {
             return new PermissionResult.Passthrough(
                 "stub passthrough", null, List.of(), null,null);
         }
+    }
+
+    /** T16：DenialTracker 计数按 sessionId 键控 —— 读侧必须与 pipeline 的 ctx 同键。 */
+    private String sid() {
+        return ctx.sessionId();
     }
 }

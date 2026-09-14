@@ -191,8 +191,11 @@ public class CronDeleteTool implements Tool {
      * </ol>
      *
      * <p><b>风险登记 (CRON-A3 / IMP-F2 修正)</b>: {@code ScheduleDto.agentId} 由 WF-B 填充
-     * （当前生产恒 null）；[S1-T6] 身份改读 {@code ctx.teammateIdentity()} 后判据已显式化
-     * （缺值策略见 T14/轨 IV）；本实现按 CC {@code task.agentId !== ctx.agentId} 严格不等式结构对齐
+     * （当前生产恒 null）；[S1-T6] 身份改读 {@code ctx.teammateIdentity()} 后判据已显式化；
+     * [S1-T14] 缺值策略 (a) 落定：<b>teammate 身份存在但 {@code agentId} 缺失</b> ⇒ 所有权不可判定
+     * ⇒ fail loud（拒绝 + ≥WARN），不静默落到 {@code Objects.equals(null, owner)}；非 teammate
+     * （identity == null）仍按 CC 原样放行（CC {@code if (ctx && ...)} 的 ctx 短路）。
+     * 本实现按 CC {@code task.agentId !== ctx.agentId} 严格不等式结构对齐
      * （IMP-F2 / △-14：{@link Objects#equals} 语义，任一为 null 另一端非 null → 拒绝）。
      *
      * @param input 工具输入 {@code {id: string}}
@@ -219,12 +222,27 @@ public class CronDeleteTool implements Tool {
         //   所有权分支生产不可达）。null = 非 teammate ⇒ 与旧「ThreadLocal 为 null」逐条等价。
         TeammateIdentity teammateIdentity = ctx != null ? ctx.teammateIdentity() : null;
         if (teammateIdentity != null) {
+            // [S1-T14 缺值策略 (a)] 「身份缺失 ⇒ fail loud」：teammate 身份存在但 agentId 缺失
+            //   = 载体缺陷（CC TeammateIdentity.agentId 是**非可选** string，types.ts:14
+            //   {@code agentId: string}），此时所有权**不可判定**。
+            //   ⛔ 不得静默落到 Objects.equals(null, owner)：若任务 owner 也为 null 则两端"相等"
+            //   ⇒ 放行，等于让一个身份残缺的 teammate 删掉任意 cron（静默失效）。
+            //   本仓铁律：本该有却没有 ⇒ 拒绝并留痕（禁静默降级）。
+            String ctxAgentId = teammateIdentity.agentId();
+            if (ctxAgentId == null || ctxAgentId.isBlank()) {
+                log.warn("[CronDeleteTool 缺值策略(a)] teammate 身份缺 agentId（agentName={} teamName={}）"
+                    + "⇒ cron 所有权不可判定，fail loud 拒绝删除 id={}（CC TeammateIdentity.agentId "
+                    + "为非可选字段 types.ts:14；缺值视为载体缺陷，合法路径由调用方补齐显式身份）",
+                    teammateIdentity.agentName(), teammateIdentity.teamName(), id);
+                return ValidationResult.fail("2",
+                    "Cannot delete cron job '" + id + "': teammate identity is incomplete "
+                        + "(missing agentId), ownership cannot be verified");
+            }
             // CC original: task.agentId !== ctx.agentId (CronDeleteTool.ts:73) — teammate 只能删自己的任务。
             // IMP-F2（组 5-3 / △-14 修正）：严格不等式语义——两端均 null 视为相等（CC undefined !== undefined → pass）；
             // 任一为 null 另一端非 null → 拒绝（CC undefined !== 'A' / 'A' !== undefined → reject）。
             // 旧实现 ownerAgentId != null 守卫在任务 agentId=null 时放行，偏离 CC（agentId null 边界）。
             String ownerAgentId = task.agentId();
-            String ctxAgentId = teammateIdentity.agentId();
             if (!Objects.equals(ownerAgentId, ctxAgentId)) {
                 return ValidationResult.fail("2",
                     "Cannot delete cron job '" + id + "': owned by another agent");

@@ -101,7 +101,7 @@ class FindRelevantMemoriesTest {
         StubProvider stub = new StubProvider();
         FindRelevantMemories fr = build(stub);
 
-        fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+        fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
         assertThat(stub.captured).as("一次检索必须恰好一次 side-query 调用").hasSize(1);
     }
@@ -115,7 +115,7 @@ class FindRelevantMemoriesTest {
         StubProvider stub = new StubProvider();
         FindRelevantMemories fr = build(stub);
 
-        fr.findRelevantMemories("configure alpha", memoryDir, List.of("Bash", "Read"), Set.of(), null);
+        fr.findRelevantMemories("configure alpha", memoryDir, List.of("Bash", "Read"), Set.of(), null, null);
 
         LlmProvider.ChatRequestOptions opts = stub.captured.get(0);
         assertThat(opts.outputFormat()).as("output_format 必须是 json_schema").isNotNull();
@@ -139,7 +139,7 @@ class FindRelevantMemoriesTest {
         FindRelevantMemories fr = build(stub);
         Path aPath = memoryDir.resolve("a.md").toAbsolutePath();
 
-        fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(aPath.toString()), null);
+        fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(aPath.toString()), null, null);
 
         assertThat(stub.captured).hasSize(1);
         // 已展示文件不应出现在发送给 selector 的 manifest 中
@@ -157,7 +157,7 @@ class FindRelevantMemoriesTest {
         FindRelevantMemories fr = build(stub);
 
         List<FindRelevantMemories.RelevantMemory> result =
-            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
         assertThat(result).as("失败必须返回空列表，由下轮重试").isEmpty();
     }
@@ -170,7 +170,7 @@ class FindRelevantMemoriesTest {
         FindRelevantMemories fr = build(stub);
 
         List<FindRelevantMemories.RelevantMemory> result =
-            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
         assertThat(result).isEmpty();
         assertThat(stub.captured).as("无候选不得发 side-query").isEmpty();
@@ -374,7 +374,7 @@ class FindRelevantMemoriesTest {
             FindRelevantMemories fr = buildWith(stub);
 
             List<FindRelevantMemories.RelevantMemory> result =
-                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("1 次失败 + 1 次重试 = 2 次调用").hasSize(2);
             assertThat(result).as("重试成功必须返回选中记忆").hasSize(1);
@@ -396,7 +396,7 @@ class FindRelevantMemoriesTest {
             FindRelevantMemories fr = buildWith(stub);
 
             List<FindRelevantMemories.RelevantMemory> result =
-                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("maxRetries=2 → 恰好 3 次尝试").hasSize(3);
             assertThat(result).as("重试耗尽返回空（CC 失败返回空、下轮重试）").isEmpty();
@@ -417,7 +417,7 @@ class FindRelevantMemoriesTest {
             stub.status = 400;
             FindRelevantMemories fr = buildWith(stub);
 
-            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("400 不可重试 → 单次调用").hasSize(1);
         } finally {
@@ -438,7 +438,7 @@ class FindRelevantMemoriesTest {
             FindRelevantMemories fr = buildWith(stub);
 
             List<FindRelevantMemories.RelevantMemory> result =
-                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("包装 429 亦须重试（1 次失败 + 1 次重试 = 2 次调用）").hasSize(2);
             assertThat(result).as("重试成功必须返回选中记忆").hasSize(1);
@@ -460,7 +460,7 @@ class FindRelevantMemoriesTest {
             FindRelevantMemories fr = buildWith(stub);
 
             List<FindRelevantMemories.RelevantMemory> result =
-                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("包装 429 耗尽 → 恰好 3 次尝试").hasSize(3);
             assertThat(result).as("重试耗尽返回空（CC 失败返回空、下轮重试）").isEmpty();
@@ -481,7 +481,7 @@ class FindRelevantMemoriesTest {
             FindRelevantMemories fr = buildWith(stub);
 
             List<FindRelevantMemories.RelevantMemory> result =
-                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("连接错误须重试（1 次失败 + 1 次重试 = 2 次调用）").hasSize(2);
             assertThat(result).as("重试成功必须返回选中记忆").hasSize(1);
@@ -503,7 +503,7 @@ class FindRelevantMemoriesTest {
             FindRelevantMemories fr = buildWith(stub);
 
             List<FindRelevantMemories.RelevantMemory> result =
-                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+                fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("SDK 可重试标记 → 重试（2 次调用）").hasSize(2);
             assertThat(result).as("重试成功必须返回选中记忆").hasSize(1);
@@ -523,7 +523,7 @@ class FindRelevantMemoriesTest {
             stub.failCount = 99;
             FindRelevantMemories fr = buildWith(stub);
 
-            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null);
+            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), null, null);
 
             assertThat(stub.captured).as("非 API/连接错误不重试 → 单次调用").hasSize(1);
         } finally {
@@ -542,7 +542,7 @@ class FindRelevantMemoriesTest {
         com.nexusai.application.agent.tool.AbortController signal =
             new com.nexusai.application.agent.tool.AbortController();
 
-        fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), signal);
+        fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), signal, null);
 
         assertThat(stub.captured).hasSize(1);
         assertThat(stub.captured.get(0).abortController())
@@ -561,7 +561,7 @@ class FindRelevantMemoriesTest {
         signal.abort();
 
         List<FindRelevantMemories.RelevantMemory> result =
-            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), signal);
+            fr.findRelevantMemories("configure alpha", memoryDir, List.of(), Set.of(), signal, null);
 
         assertThat(stub.captured).as("abort 后不得发起调用（scan 亦被取消 → 无候选）").isEmpty();
         assertThat(result).isEmpty();

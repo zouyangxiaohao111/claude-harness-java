@@ -645,7 +645,7 @@ class ClaudemdEngineTest {
             .anyMatch(e -> "session_start".equals(e.data().get("load_reason")));
 
         captured.clear();
-        engine.resetGetMemoryFilesCache("compact");
+        engine.resetGetMemoryFilesCache("compact", null);
         engine.getMemoryFiles(false, null);
         awaitTrue(() -> captured.stream().anyMatch(e -> "compact".equals(e.data().get("load_reason"))), 3000);
         assertThat(captured)
@@ -682,7 +682,7 @@ class ClaudemdEngineTest {
         Files.writeString(workspace.resolve("CLAUDE.md"), "# V1\n# V2\n");
 
         assertThat(engine.getMemoryFiles(false, null)).as("缓存未失效 → 仍为 V1").isEqualTo(first);
-        engine.resetGetMemoryFilesCache("compact");
+        engine.resetGetMemoryFilesCache("compact", null);
         List<MemoryFileInfo> reloaded = engine.getMemoryFiles(false, null);
         assertThat(reloaded.get(reloaded.size() - 1).content())
             .as("reset 后重算 → 反映磁盘 V2")

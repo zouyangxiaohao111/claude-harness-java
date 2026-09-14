@@ -228,13 +228,48 @@ public class ClaudemdEngine {
     //   fireInstructionsLoaded(...)（该字段的 setter 全仓 0 调用方，删除零行为变化；
     //   MDC 默认值本身是缺陷 —— 第三态可读到别的会话 id）。
 
-    /** 下一次 eager 加载要上报的 reason · CC claudemd.ts:1093 {@code nextEagerLoadReason}（one-shot，读后复位）。 */
-    private volatile String nextEagerLoadReason = "session_start";
+    /**
+     * 会话级 one-shot eager 加载发射态 · CC claudemd.ts:1092/:1099
+     * {@code let nextEagerLoadReason} + {@code let shouldFireHook} 的**按会话键控**等价物。
+     *
+     * <p><b>WHY 必须按会话键控（本批修复的跨会话缺陷）</b>：CC 的两个持有者是 <b>module-level
+     * {@code let}</b>（claudemd.ts:1092/:1099）—— 在 CC 里安全（单进程单会话）。本仓是
+     * <b>一 JVM 多会话</b>，而本引擎是 {@code @Bean} 单例 ⇒ 原实现的单份 {@code volatile} 会让
+     * <b>A 会话压缩置的 'compact' 被 B 会话的下一次缓存 miss 消费</b>（B 的 InstructionsLoaded
+     * hook 以 {@code load_reason='compact'} 误发，且 B 自己本该发的 'session_start' 被
+     * {@code shouldFireHook=false} 吞掉）。可观测单元 = 该会话的 InstructionsLoaded hook 事件
+     * ⇒ 键 = 显式 sessionId。
+     *
+     * <p><b>键缺失语义</b>：sessionId 为 null/blank 时归入<b>无会话桶</b>（键 {@code ""}）——
+     * 该桶只与同为无会话的调用共享，⛔ 不会与任何真实会话互窃（真实会话键恒非空）。写入侧
+     * （{@link #resetGetMemoryFilesCache(String, String)}）对无会话键写 <b>≥WARN</b>。
+     *
+     * <p><b>容量</b>：每会话 1 个条目（{@link EagerLoadOneShot}），条目数 ≈ 已加载过记忆文件的
+     * 会话数，不随请求数增长；沿用既有失效面（reset/clear）。⛔ 本批未引入淘汰上限（属新策略，
+     * 与 {@link #memoryFilesCache} 同款待裁定，见报告「未决」）。
+     */
+    private final Map<String, EagerLoadOneShot> eagerLoadOneShotBySession = new ConcurrentHashMap<>();
 
-    /** InstructionsLoaded hook 是否应在下次缓存 miss 时发射 · CC claudemd.ts:1100 {@code shouldFireHook}。 */
-    private volatile boolean shouldFireHook = true;
+    /** 会话级 one-shot 载具：{@code fired} = 是否已消费（CC {@code shouldFireHook} 的反相）。 */
+    private static final class EagerLoadOneShot {
+        private boolean fired;
+        private String reason = "session_start";
+    }
 
-    /** tengu_claudemd__initial_load 一次性标记 · CC original: hasLoggedInitialLoad（claudemd.ts:87）。 */
+    /** 会话键归一 · null/blank → 无会话桶（{@code ""}）。 */
+    private static String eagerLoadSessionKey(String sessionId) {
+        return sessionId == null || sessionId.isBlank() ? "" : sessionId;
+    }
+
+    /**
+     * tengu_claudemd__initial_load 一次性标记 · CC original: hasLoggedInitialLoad（claudemd.ts:86）。
+     *
+     * <p><b>⛔ 按「可观测语义 / 指标基数」判据<u>不</u>会话化</b>：CC 侧是 module-level
+     * {@code let}（claudemd.ts:86，进程级一次性），事件 {@code tengu_claudemd__initial_load}
+     * 的语义就是「本进程首次加载记忆文件」。会话化会把「每 JVM 一条」变成「每会话一条」
+     * ⇒ <b>指标基数被改变</b>（与分析口径冲突）。故本字段保持进程级（单例上单份）。
+     * T10 闸门白名单已显式登记本项（理由 = 本 javadoc）。
+     */
     private volatile boolean hasLoggedInitialLoad = false;
 
     /**
@@ -666,7 +701,7 @@ public class ClaudemdEngine {
         // 直接 cache.clear 会以陈旧 'session_start' reason 误发）。
         // AutoMem/TeamMem 排除：独立 memory 系统，非 CLAUDE.md/rules 意义下的 instructions（claudemd.ts:1044-1045）。
         if (!forceIncludeExternal) {
-            String eagerLoadReason = consumeNextEagerLoadReason();
+            String eagerLoadReason = consumeNextEagerLoadReason(sessionId);
             if (eagerLoadReason != null && hookRegistry != null) {
                 for (MemoryFileInfo file : result) {
                     if (!isInstructionsMemoryType(file.type())) {
@@ -685,15 +720,24 @@ public class ClaudemdEngine {
      * 消费下一次 eager 加载 reason · CC original: {@code consumeNextEagerLoadReason}
      * （claudemd.ts:1102-1108）。{@code shouldFireHook=false} → 返回 null（不发射）；读后复位为
      * {@code 'session_start'}（one-shot）。
+     *
+     * <p>[会话级键控] 状态按<b>显式 sessionId</b> 取（{@link #eagerLoadOneShotBySession}）：
+     * A 会话的 one-shot 不被 B 会话消费/吞掉。同一会话的并发 miss 由载具内 synchronized 串行。
+     *
+     * @param sessionId 显式会话标识（null/blank → 无会话桶，见字段 javadoc）
      */
-    private String consumeNextEagerLoadReason() {
-        if (!shouldFireHook) {
-            return null;
+    private String consumeNextEagerLoadReason(String sessionId) {
+        EagerLoadOneShot oneShot =
+            eagerLoadOneShotBySession.computeIfAbsent(eagerLoadSessionKey(sessionId), k -> new EagerLoadOneShot());
+        synchronized (oneShot) {
+            if (oneShot.fired) {
+                return null;
+            }
+            oneShot.fired = true;
+            String reason = oneShot.reason;
+            oneShot.reason = "session_start";
+            return reason;
         }
-        shouldFireHook = false;
-        String reason = nextEagerLoadReason;
-        nextEagerLoadReason = "session_start";
-        return reason;
     }
 
     /** 指令类型判定 · CC original: {@code isInstructionsMemoryType}（claudemd.ts:1077-1086）。 */
@@ -788,18 +832,48 @@ public class ClaudemdEngine {
      * 清缓存并重置 one-shot InstructionsLoaded 发射态 · CC original: {@code resetGetMemoryFilesCache}
      * （claudemd.ts:1124-1130）。
      *
-     * <p>设置 {@code nextEagerLoadReason} + {@code shouldFireHook=true}（下次缓存 miss 发射 hook 上报
+     * <p>设置该会话的 one-shot reason + 复位其 {@code fired} 闸（下次缓存 miss 发射 hook 上报
      * 真实 reason，如 'compact' 而非误报 'session_start'）+ 清缓存。压缩（PostCompactCleanup main-thread
      * 分支）与代表"instructions 真正重载入 context"的事件调用。
      *
-     * @param reason 下一次 eager 加载要上报的 reason（null → 默认 'session_start'，对齐 CC 缺省参数）
+     * @param reason    下一次 eager 加载要上报的 reason（null → 默认 'session_start'，对齐 CC 缺省参数）
+     * @param sessionId 显式会话标识（**必传**：one-shot 态按会话键控，见
+     *                  {@link #eagerLoadOneShotBySession}；null/blank → 无会话桶并 ≥WARN 可观测）
      */
-    public void resetGetMemoryFilesCache(String reason) {
-        nextEagerLoadReason = reason == null ? "session_start" : reason;
-        shouldFireHook = true;
+    public void resetGetMemoryFilesCache(String reason, String sessionId) {
+        String resolvedReason = reason == null ? "session_start" : reason;
+        EagerLoadOneShot oneShot =
+            eagerLoadOneShotBySession.computeIfAbsent(eagerLoadSessionKey(sessionId), k -> new EagerLoadOneShot());
+        synchronized (oneShot) {
+            oneShot.reason = resolvedReason;
+            oneShot.fired = false;
+        }
         clearMemoryFileCaches();
-        log.info("[ClaudemdEngine] resetGetMemoryFilesCache: reason={} 已置 one-shot 发射态并清空缓存（对齐 CC claudemd.ts:1124-1130）",
-            nextEagerLoadReason);
+        if (sessionId == null || sessionId.isBlank()) {
+            // (b) 类：本就不需要会话 —— 跳过会话级归属但必须 ≥WARN（禁只 DEBUG）。
+            log.warn("[ClaudemdEngine] resetGetMemoryFilesCache: sessionId 为 null/blank → one-shot 发射态"
+                    + "记入无会话桶（reason={}）· 该桶不与任何真实会话共享，清缓存照常执行"
+                    + "（对齐 CC claudemd.ts:1124-1130）", resolvedReason);
+        }
+        log.info("[ClaudemdEngine] resetGetMemoryFilesCache: sessionId={} reason={} 已置 one-shot 发射态并清空缓存（对齐 CC claudemd.ts:1124-1130）",
+            sessionId, resolvedReason);
+    }
+
+    /**
+     * 回收某会话的 one-shot 发射态（会话删除时调用）· 防「每会话一条」无界累积。
+     *
+     * <p>调用点：{@code SessionService.delete} 的会话级注册表回收块（与
+     * {@code MicroCompactor.removeSessionState} / {@code SessionGitStatusRegistry.evict}
+     * 同一口径：CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无对应动作；
+     * Java 常驻 JVM 必须显式回收）。未知/已删会话 → no-op，不抛。
+     *
+     * @param sessionId 会话标识（null/blank → 清无会话桶）
+     */
+    public void removeSession(String sessionId) {
+        EagerLoadOneShot removed = eagerLoadOneShotBySession.remove(eagerLoadSessionKey(sessionId));
+        if (removed != null && log.isDebugEnabled()) {
+            log.debug("[ClaudemdEngine] removeSession: sessionId={} one-shot 发射态已回收", sessionId);
+        }
     }
 
     private static boolean bool(Supplier<Boolean> s) {

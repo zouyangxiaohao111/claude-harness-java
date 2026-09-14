@@ -76,17 +76,6 @@ import static org.mockito.Mockito.when;
  */
 class LlmAgentLoopWiringOrderTest {
 
-    /**
-     * [S2 F-09/F-20 · 合并收口] 本类用**合成 sessionId**（{@code "sess-" + UUID}）驱动 {@code LlmAgentLoop}，
-     * 但从不注册 DB 回源解析器 ⇒ S2 引入的第 4 态「无法判定」会 fail-loud 抛出。
-     * 声明「本夹具无 DB」= 让解析器**明确回答「无此会话」**（而非「无法判定」）—— 语义是
-     * 「DB 答没有这个会话」，**不是**「解析失败」。
-     */
-    @org.junit.jupiter.api.BeforeEach
-    void declareNoDatabaseForSessionProjectRoot() {
-        com.nexusai.test.support.SessionProjectRootTestSupport.declareNoDatabase();
-    }
-
     private static final String LLM_LOOP_PATH =
         "src/main/java/com/nexusai/application/agent/LlmAgentLoop.java";
 

@@ -2370,9 +2370,19 @@ public class ChatService {
             titleSchema.put("type", "object");
             titleSchema.putObject("properties").putObject("title").put("type", "string");
             titleSchema.putArray("required").add("title");
+            // [S1-T7] agent 归因上下文 = **显式 null（(b) 类「本就不需要」）**，原读
+            //   已删的 ambient 归因读 ambient 已删（会话态不得经 ThreadLocal 读）。
+            //   判据（读 CC 真源 + 本仓调用链）：auto_title 是**会话标题生成**的辅助侧信道调用，
+            //   在 ChatService 的 HTTP/命令线程上发起，不处于任何 agent 执行链内 ⇒ 归因上下文
+            //   在本路径**结构上不存在**（CC 侧同处亦无 subagent ALS 作用域）；显式 null 保留
+            //   CC agentContext.ts:170「无 invokingRequestId」语义。
+            //   ⚠️ 每次调用都发 WARN（非一次性闸）——一次性闸会让多会话下第 2 个会话的缺值不可观测。
+            //   （本方法 generateTitleText 无 sessionId 形参 —— 侧信道调用不需要会话键，故日志不携带）
+            log.warn("ChatService auto_title agent 归因上下文显式为空 (null)"
+                + "（会话标题生成无 agent 执行链 · (b) 类本就不需要）");
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 List.of(), null, LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(titleSchema),
-                null, null, "auto_title", null, null, null, null, null, null, null, null, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                null, null, "auto_title", null, null, null, null, null, null, null, null, null, null);
             String titleJson = titleProvider.chatWithOptions(config, fastModelName, titlePrompt, prompt, options);
             newTitle = (titleJson != null && !titleJson.isBlank())
                 ? JSON.readTree(titleJson).path("title").asText(null) : null;

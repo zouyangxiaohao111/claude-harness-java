@@ -199,7 +199,7 @@ public class MemoryPrefetcher {
      */
     public MemoryPrefetch startPrefetch(List<ChatMessageDto> messages, FileStateCache readFileState,
                                         AbortController turnAbortController) {
-        return startPrefetch(messages, readFileState, turnAbortController, null);
+        return startPrefetch(messages, readFileState, turnAbortController, null, null);
     }
 
     /**
@@ -210,9 +210,13 @@ public class MemoryPrefetcher {
      * 否则目录解析不出（auto-memory 静默不预取 = 功能退化）。
      *
      * @param sessionProjectRoot 会话绑定项目根（{@code ToolUseContext.effectiveCwd()} / 会话绑定项目）；null → 无显式根
+     * @param agentContext [S1-T7] agent 归因上下文（来源 {@code ToolUseContext.agentContext()}）·
+     *                     作为**值**下传到固定池线程（见 {@link FindRelevantMemories#findRelevantMemories}）；
+     *                     null → 无归因上下文
      */
     public MemoryPrefetch startPrefetch(List<ChatMessageDto> messages, FileStateCache readFileState,
-                                        AbortController turnAbortController, String sessionProjectRoot) {
+                                        AbortController turnAbortController, String sessionProjectRoot,
+                                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // 门控 1：isAutoMemoryEnabled · 门控 2：tengu_moth_copse（GB flag）
         if (!autoMemoryEnabled.getAsBoolean() || !mothCopseFlag.getAsBoolean()) {
             if (log.isDebugEnabled()) {
@@ -271,7 +275,7 @@ public class MemoryPrefetcher {
         // promise 恒正常完成（catch → []）· CC :2392-2404
         CompletableFuture<List<RelevantMemoryAttachment>> promise = CompletableFuture.supplyAsync(
             () -> getRelevantMemoryAttachments(input, memoryDirs, readFileState, recentTools,
-                surfaced.paths(), childController),
+                surfaced.paths(), childController, agentContext),
             executor
         ).exceptionally(e -> {
             if (!(e instanceof java.util.concurrent.CancellationException)) {
@@ -410,7 +414,8 @@ public class MemoryPrefetcher {
         FileStateCache readFileState,
         List<String> recentTools,
         Set<String> alreadySurfaced,
-        AbortController signal
+        AbortController signal,
+        com.nexusai.application.agent.subagent.AgentContext agentContext
     ) {
         // CC :2215-2225 Promise.all(dirs.map(dir => findRelevantMemories(...).catch(() => [])))——
         // 多目录并行 + 每目录独立 catch（A24）；复用本类 executor（CC Promise.all 语义等价）。
@@ -419,7 +424,8 @@ public class MemoryPrefetcher {
         for (Path dir : memoryDirs) {
             futures.add(CompletableFuture.supplyAsync(() -> {
                 try {
-                    return findRelevant.findRelevantMemories(input, dir, recentTools, alreadySurfaced, signal);
+                    return findRelevant.findRelevantMemories(input, dir, recentTools, alreadySurfaced, signal,
+                        agentContext);
                 } catch (Exception e) {
                     log.warn("[MemoryPrefetcher] findRelevantMemories 失败，跳过该目录（CC catch → []）: 目录={} err={}",
                         dir, e.getMessage());

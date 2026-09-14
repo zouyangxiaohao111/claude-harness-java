@@ -227,7 +227,7 @@ public class PostCompactCleanup {
             SystemPromptInjection.clearUserOnlyProviderCaches();
             ClaudemdEngine claudemd = STATIC_CLAUDE_MD;
             if (claudemd != null) {
-                claudemd.resetGetMemoryFilesCache("compact");
+                claudemd.resetGetMemoryFilesCache("compact", sessionId);
             } else if (log.isDebugEnabled()) {
                 log.debug("[PostCompactCleanup] resetGetMemoryFilesCache('compact') 跳过：ClaudemdEngine 未接线 · CC postCompactCleanup.ts:52-59");
             }

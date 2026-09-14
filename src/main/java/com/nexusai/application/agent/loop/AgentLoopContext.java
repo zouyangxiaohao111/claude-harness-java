@@ -1246,7 +1246,14 @@ public record AgentLoopContext(
             || counts.turnsSinceReminder() < ctx.sessionState().taskReminderConfig().turnsBetweenReminders()) {
             return List.of();
         }
-        List<Task> tasks = listTasks(ctx.sessionState().taskService(), TaskSystemConfig.getDefaultTaskListId());
+        // [S1-T11] 会话/身份**显式**取自 state（原无会话形参版本已删除）：
+        //   sessionId = state.sessionId()（会话级任务列表，不再回退全进程共享 UUID）；
+        //   teammate 身份 = 本会话最后一次 per-turn TUC 的显式字段（主会话/cron 路径恒 null）。
+        List<Task> tasks = listTasks(ctx.sessionState().taskService(),
+            TaskSystemConfig.getDefaultTaskListId(
+                state.sessionId(),
+                state.currentToolUseContext() != null
+                    ? state.currentToolUseContext().teammateIdentity() : null));
         if (tasks == null || tasks.isEmpty()) {
             return List.of();
         }

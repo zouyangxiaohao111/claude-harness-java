@@ -197,8 +197,38 @@ public class PermissionExplainer {
                 null,
                 isAnthropicProtocol
                     ? LlmProvider.ChatRequestOptions.ToolChoice.tool(ExplainCommandToolSchema.TOOL_NAME)
-                    : null
-            , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                    : null,
+                // ══════════════════════════════════════════════════════════════════════
+                // [S1-T7 / S1-T7-2] agent 归因上下文 = **显式 null**。
+                //
+                // 【为什么这是 (b) 类「本就不需要」，而不是妥协 —— 三条结构性论证】
+                //  1) 调用链上不存在任何承载体（grep 复验，非注释转述）。本方法唯一生产调用链 =
+                //     STOMP inbound `/app/sessions/{id}/permission-explain`
+                //     → WebSocketPermissionPrompter 的 RACERS daemon 线程 → 本方法。
+                //     该链的形参只有 sessionId / requestId / toolName（+ toolInput / toolDescription /
+                //     messages / signal），**没有** ToolUseContext，也没有 AgentContext。
+                //  2) 「权限弹窗 → 前端 → 用户点击『解释』」是一次**跨 WebSocket 的往返**：发起该权限
+                //     请求的 agent 上下文（子代理 TUC 的 agentContext）在 HTTP/STOMP 边界上被丢弃，
+                //     前端只回传 sessionId + 待解释的工具名/入参 ⇒ 该上下文在解释时刻**结构上不可达**，
+                //     不是「忘了传」而是「无线可传」。若强行在服务端按 sessionId 反查一个「当前 agent」，
+                //     反而会造出**跨会话串扰**（把 A 会话的 agent 归因到 B 会话的解释请求上）——
+                //     那正是本批要消灭的缺陷形态。
+                //  3) 语义上该 side-query 本就**不是**某次 agent invocation 的一部分：它是 UI 触发的
+                //     辅助说明调用，不应携带 spawn/resume 稀疏边（CC agentContext.ts:159-161 的边
+                //     标记的是「本次 invocation 的第一个 terminal API event」）。显式 null 精确保留
+                //     CC agentContext.ts:170「无 context ⇒ 无 invokingRequestId」语义。
+                //
+                // 【若将来该链引入 TUC 引用 → 必须改为 (a)】
+                //   一旦 `/permission-explain` 的请求体或 WebSocketPermissionPrompter 侧开始携带
+                //   发起权限请求的 ToolUseContext（或等价显式归因载体），本处**必须**改为
+                //   `tuc.agentContext()`，并把缺值策略从 (b) 升为 (a)（该有却没有 ⇒ 抛/400，
+                //   ⛔ 不得静默回落 null）。判据同上：能拿到就必须传，拿不到才允许 (b)。
+                //
+                // ⚠️ 归因空值的告警是**逐次**的（见 warnAgentContextExplicitlyNull 的 javadoc）：
+                //   进程级一次性闸会把「≥WARN 可观测」退化成「每 JVM 一行」，第二个会话的缺值
+                //   在结构上不可观测（本仓裁定-8 的关键技术点）。
+                null);
+            warnAgentContextExplicitlyNull(sessionId);
 
             final AssistantMessage msg = provider.chatWithOptionsMessage(
                 resolved.config(), modelName, SYSTEM_PROMPT, userPrompt, options);
@@ -278,6 +308,19 @@ public class PermissionExplainer {
      * @return 会话主循环模型名；registry 未注入 / state 未注册 / currentModel 为空
      *         → null（对齐 CC 无降级语义）
      */
+    /**
+     * [S1-T7] 「(b) 类本就不需要」的显式空值告警（**逐次**，非一次性闸）。
+     *
+     * <p>WHY 逐次：本仓裁定-8 的关键技术点 —— 进程级一次性闸（{@code AtomicBoolean}）会让
+     * 「≥WARN 可观测」结构性地退化为「每 JVM 一行」，第二个会话的缺值不再可观测。
+     *
+     * @param sessionId 触发本次解释的会话（仅用于日志定位）
+     */
+    private static void warnAgentContextExplicitlyNull(String sessionId) {
+        log.warn("权限解释器 agent 归因上下文显式为空 (null)"
+            + "（STOMP explain 往返链上无 agent 执行链 · (b) 类本就不需要）: sessionId={}", sessionId);
+    }
+
     private String resolveMainLoopModelName(String sessionId) {
         if (sessionAgentStateRegistry == null) {
             log.warn("权限解释器: SessionAgentStateRegistry 未注入，无法解析会话主循环模型（返回 null，对齐 CC 无降级）");

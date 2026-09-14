@@ -118,6 +118,13 @@ public class FindRelevantMemories {
      * @param alreadySurfaced 历史已展示路径集合（CC original: alreadySurfaced，:44）
      * @param signal          取消信号（CC original: signal，:47 —— scan + side-query 全链透传，
      *                        MEM-03/G-14；可 null = 无取消）
+     * @param agentContext    [S1-T7] agent 归因上下文（**显式形参**）。WHY 必须传：本方法经
+     *                        {@code CompletableFuture.supplyAsync(..., executor)} 跑在**固定池线程**上，
+     *                        而其调用方（LlmAgentLoop 的 memory-prefetch 启动点）跑在 query loop 线程
+     *                        —— plain ThreadLocal 不跨线程 ⇒ 原实现读 {@code 宿主 ambient 归因上下文}
+     *                        在该池线程上**恒 null**（真缺陷：归因边静默丢失）。
+     *                        调用方从 {@code params.toolUseContext().agentContext()} 显式传入。
+     *                        null = 无归因上下文（等价 CC agentContext.ts:170 无 invokingRequestId）。
      * @return 相关记忆（最多 5）；无候选 / 无匹配 → 空列表
      */
     public List<RelevantMemory> findRelevantMemories(
@@ -125,7 +132,8 @@ public class FindRelevantMemories {
         Path memoryDir,
         List<String> recentTools,
         Set<String> alreadySurfaced,
-        AbortController signal
+        AbortController signal,
+        com.nexusai.application.agent.subagent.AgentContext agentContext
     ) {
         // CC :46-48 scanMemoryFiles(memoryDir, signal) → filter(!alreadySurfaced.has(filePath))
         List<MemoryEntry> memories = scanner.scan(memoryDir, signal);
@@ -140,7 +148,7 @@ public class FindRelevantMemories {
             return List.of();
         }
 
-        List<String> selectedFilenames = selectRelevantMemories(query, fresh, recentTools, signal);
+        List<String> selectedFilenames = selectRelevantMemories(query, fresh, recentTools, signal, agentContext);
         // CC :59-62 byFilename map + filter(undefined)
         Map<String, MemoryEntry> byFilename = fresh.stream()
             .collect(Collectors.toMap(MemoryEntry::filename, e -> e, (a, b) -> a));
@@ -174,10 +182,14 @@ public class FindRelevantMemories {
      * <p>失败/中止 → []（CC :131-140 catch），无关键词降级（DEL-M-33）。
      *
      * @param signal 取消信号（可 null = 无取消；abort 后不发起/不重试调用）
+     * @param agentContext [S1-T7] agent 归因上下文（显式形参；由 {@link #findRelevantMemories}
+     *                     从调用方（LlmAgentLoop query loop 线程 · {@code ToolUseContext.agentContext()}）
+     *                     以值透传 —— 本方法跑在固定池线程，读不到 ThreadLocal）
      * @return 选中文件名列表（已按 validFilenames 过滤）
      */
     List<String> selectRelevantMemories(String query, List<MemoryEntry> memories, List<String> recentTools,
-                                        AbortController signal) {
+                                        AbortController signal,
+                                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // CC :83 validFilenames = Set(memories.map(m => m.filename))
         Set<String> validFilenames = memories.stream()
             .map(MemoryEntry::filename)
@@ -220,8 +232,9 @@ public class FindRelevantMemories {
                 null,
                 "memdir_relevance",   // CC querySource: 'memdir_relevance' (:121)
                 signal,               // MEM-03：CC signal 透传（:117）→ provider 请求前 abort 预检
-                256                   // CC max_tokens: 256 (:108)
-            , com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                256,                  // CC max_tokens: 256 (:108)
+                // [S1-T7] agent 归因上下文 = **本方法形参**（原读 ambient，在本池线程上恒 null）。
+                agentContext);
             // MEM-02/G-22：sideQuery.ts:115-128 maxRetries=2 —— SDK 客户端级重试
             // （408/409/429/5xx + 连接错误；claude.ts:1781 主链 maxRetries:0 的 Java provider 无
             // 客户端重试 → 本处调用点手工重试等价）。abort 优先：取消后不发起/不重试。

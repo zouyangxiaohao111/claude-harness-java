@@ -474,7 +474,7 @@ public class CommandController {
             // HookMatcherEngine 按 load_reason 匹配 hook 使偏差可见）。
             ClaudemdEngine claudemd = claudemdEngine;
             if (claudemd != null) {
-                claudemd.resetGetMemoryFilesCache("session_start");
+                claudemd.resetGetMemoryFilesCache("session_start", sessionIdParam);
             } else if (log.isDebugEnabled()) {
                 log.debug("[CommandController] executeBuiltin(/clear): resetGetMemoryFilesCache('session_start') "
                     + "跳过：ClaudemdEngine 未接线（对齐 CC caches.ts:84，保测试兼容）");

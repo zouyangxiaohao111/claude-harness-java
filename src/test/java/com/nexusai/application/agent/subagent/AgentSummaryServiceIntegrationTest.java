@@ -224,7 +224,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-1", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null);
+            ProviderConfig.empty(), "test-model", null, null, null);
         try {
             assertThat(handle).isNotNull();
             assertThat(svc.activeAgents()).contains("agent-1");
@@ -249,7 +249,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-2", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null);
+            ProviderConfig.empty(), "test-model", null, null, null);
         try {
             assertThat(handle).isNull();
             assertThat(svc.activeAgents()).doesNotContain("agent-2");
@@ -274,7 +274,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.BACKGROUNDED, null,
             svc, coordinator, true, "agent-sdk", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null);
+            ProviderConfig.empty(), "test-model", null, null, null);
         try {
             assertThat(handle).isNotNull();
             assertThat(svc.activeAgents()).contains("agent-sdk");
@@ -300,7 +300,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-fork", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null);
+            ProviderConfig.empty(), "test-model", null, null, null);
         try {
             assertThat(handle).isNotNull();
             assertThat(svc.activeAgents()).contains("agent-fork");
@@ -375,7 +375,7 @@ class AgentSummaryServiceIntegrationTest {
             new AgentMessage("assistant", "working on runAgent.ts", false, "agent-x", true, "u2", "u1",
                 List.of(), null),
             AgentMessage.of("system", "system instruction"));
-        String summary = summarizer.summarize("agent-x", "prompt", clean, null);
+        String summary = summarizer.summarize("agent-x", "prompt", clean, null, null);
         assertThat(summary).isEqualTo("Reading runAgent.ts");
         assertThat(provider.lastHistory).extracting(ChatMessageDto::role)
             .containsExactly(Role.user, Role.assistant, Role.system);
@@ -395,7 +395,7 @@ class AgentSummaryServiceIntegrationTest {
                 List.of(new AgentMessage.ToolCallInfo("t1", "Bash", "{}")), null),
             new AgentMessage("tool", "result ok", false, "agent-x", true, "u3", "u2", List.of(), "t1"),
             AgentMessage.of("user", "next step"));
-        String summary = summarizer.summarize("agent-x", "prompt", clean, null);
+        String summary = summarizer.summarize("agent-x", "prompt", clean, null, null);
         assertThat(summary).isEqualTo("Reading runAgent.ts");
         // 条数 = 输入 clean 条数 (无丢弃)
         assertThat(provider.lastHistory).hasSize(4);
@@ -435,7 +435,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryService svc = new AgentSummaryService(10, scheduler);
         AtomicInteger callbackCount = new AtomicInteger();
         AgentSummaryHandle handle = svc.start("task-abort", "agent-abort", summarizer,
-            s -> callbackCount.incrementAndGet());
+            s -> callbackCount.incrementAndGet(), null);
         try {
             // 等 runSummary 进入 provider (in-flight 已建立, entered 在 chatWithOptions 内 countDown)
             assertThat(provider.entered.await(5, TimeUnit.SECONDS)).isTrue();
@@ -474,7 +474,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryService svc = new AgentSummaryService(10, scheduler);
         AtomicInteger callbackCount = new AtomicInteger();
         AgentSummaryHandle handle = svc.start("task-late", "agent-late", summarizer,
-            s -> callbackCount.incrementAndGet());
+            s -> callbackCount.incrementAndGet(), null);
         try {
             assertThat(provider.entered.await(5, TimeUnit.SECONDS)).isTrue();
             handle.stop();

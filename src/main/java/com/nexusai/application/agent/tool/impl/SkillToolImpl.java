@@ -805,7 +805,7 @@ public class SkillToolImpl implements Tool {
      *   <li>{@code execution_context} — 'inline' / 'fork'（CC :161/:684）</li>
      *   <li>{@code invocation_trigger} — queryDepth&gt;0 ? 'nested-skill' : 'claude-proactive'（CC :162-164/:685-687）</li>
      *   <li>{@code query_depth} — ctx.queryTracking() Map 的 depth 键，缺省 0（CC :150/:673）</li>
-     *   <li>{@code parent_agent_id} — 显式传参 ctx.agentId()（对齐 CC getAgentContext()?.agentId；
+     *   <li>{@code parent_agent_id} — 显式传参 ctx.agentId()（对齐 CC getAgentContext()?.agentId，agentContext.ts:151；
      *       CC 语义 :151/:166-169/:674/:689-692），null 省略（[批 2] 取值源改显式，见 resolveParentAgentId javadoc）</li>
      *   <li>{@code was_discovered} — EXPERIMENTAL_SKILL_SEARCH 门控发射；ctx.discoveredSkillNames()
      *       含 commandName（CC :139-146/:661-668；feature-off 时整字段省略，见 △-2 注记）</li>
@@ -1055,11 +1055,11 @@ public class SkillToolImpl implements Tool {
     }
 
     /**
-     * 解析当前 agent 的 agentId · 对齐 CC {@code getAgentContext()?.agentId}
+     * 解析当前 agent 的 agentId · 对齐 CC {@code getAgentContext()?.agentId}（agentContext.ts:151）
      * （SkillTool.ts:151/:674）。
      *
      * <p><b>[批 2 · AgentContext 显式化] 取值源 = 显式传入的 {@link ToolUseContext#agentId()}，
-     * 不再读 {@link AgentContext#getAgentContext()} ThreadLocal。</b>
+     * 不再读已删除的 ambient 归因载体（宿 ThreadLocal）。</b>
      *
      * <p><b>WHY</b>：本工具在 {@code StreamingToolExecutor.executeAsync} 的 fixed-8 池线程执行
      * （该文件 {@code grep -c AgentContext} = 0，池只回放 MDC/projectRoot，不回放 AgentContext）
@@ -1691,7 +1691,7 @@ public class SkillToolImpl implements Tool {
             // CC 真源（processSlashCommand.tsx:883-885，Read 实证）：
             //   const skillPath = command.source ? `${command.source}:${command.name}` : command.name;
             //   const skillContent = result.filter(text block).map(b=>b.text).join('\n\n');  // getPromptForCommand 输出
-            //   addInvokedSkill(command.name, skillPath, skillContent, getAgentContext()?.agentId ?? null);
+            //   CC agentContext.ts:166-169: addInvokedSkill(command.name, skillPath, skillContent, getAgentContext()?.agentId ?? null);
             //
             // <ul>
             //   <li>仅 inline 路径写入：fork 分支 :714-758 提前 return，天然满足 CC SkillTool.ts:622-632
@@ -1704,7 +1704,7 @@ public class SkillToolImpl implements Tool {
             //   <li>skillPath = `${source}:${name}`（source 小写对齐 CC 'bundled'/'user'/'mcp'，Java CommandSource
             //       enum name 大写 → name().toLowerCase(Locale.ROOT)）；source 为 null 时回退裸 name（CC :883 三目）。</li>
             //   <li>agentId = 当前 agent context 的 agentId（CC processSlashCommand.tsx:885
-            //       {@code getAgentContext()?.agentId ?? null} 的 Java 等价，落共享会话 AgentState）：
+            //       {@code getAgentContext()?.agentId ?? null}（agentContext.ts:166-169）的 Java 等价，落共享会话 AgentState）：
             //       后台化主会话任务以 agentId=agentUuid 注册进 registry（LlmAgentLoop:1650-1657 EVD-B
             //       改造按 agentId 注册分支；CC LocalMainSessionTask.ts:368-375 runWithAgentContext
             //       {agentId:taskId}），写入侧以 ctx.agentId()（工具线程上恒为后台 loop 的真实 agentUuid）
@@ -1721,7 +1721,7 @@ public class SkillToolImpl implements Tool {
                             ? cmd.getSource().name().toLowerCase(Locale.ROOT) + ":" + skillName
                             : skillName;
                     // EVD-B: skill 归属 agentId = 当前 agent context 的 agentId（CC processSlashCommand.tsx:885
-                    //   {@code getAgentContext()?.agentId ?? null}）。后台化主会话任务以 agentId=agentUuid
+                    //   {@code getAgentContext()?.agentId ?? null}，agentContext.ts:166-169）。后台化主会话任务以 agentId=agentUuid
                     //   注册进 registry（LlmAgentLoop:1650-1657 按 agentId 注册分支）；此处以 ctx.agentId()
                     //   （工具线程上恒为该后台 loop 的真实 agentUuid，ToolUseContext 透传 state.agentId()）
                     //   命中已注册后台 AgentState 即判定为后台 agent → 归因 agentUuid，条目落共享会话

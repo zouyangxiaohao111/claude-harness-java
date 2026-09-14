@@ -98,7 +98,7 @@ public interface LlmProvider {
                 // 显式 agent 归因上下文（可 null = 主线程 / 无归因）· CC original: 无入参
                 //   （CC 经 AsyncLocalStorage 自动传播，services/api/logging.ts:294/:461
                 //   consumeInvokingRequestId 读 ambient context）。
-                // WHY 显式：Java AgentContext.STORAGE 是 plain ThreadLocal，不跨线程继承，而
+                // WHY 显式：Java 已删的 ambient 归因 ThreadLocal 是 plain ThreadLocal，不跨线程继承，而
                 //   provider 的 per-LLM-call terminal 事件发射跑在 LlmAgentLoop.STREAM_EXECUTOR
                 //   虚拟线程（LlmAgentLoop:6604）→ 恒读不到 → invokingRequestId 生产恒空。
                 // 消费点：AnthropicSdkProvider.emitApiTerminalEvent → AgentContext

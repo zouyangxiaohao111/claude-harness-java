@@ -97,7 +97,7 @@ class ManualCompactSessionCostWiringTest {
     void tearDown() throws Exception {
         writeStaticMapper("modelMapper", savedModelMapper);
         writeStaticMapper("providerMapper", savedProviderMapper);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
         PostCompactionState.clear(SESSION);
     }
 

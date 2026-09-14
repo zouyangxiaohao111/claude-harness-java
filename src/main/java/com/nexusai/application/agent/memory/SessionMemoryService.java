@@ -237,10 +237,28 @@ public class SessionMemoryService {
     private static final ReentrantLock EXTRACTION_LOCK = new ReentrantLock(true);
 
     /**
-     * [SM-08] gate_disabled 一次性守卫 · CC original: {@code hasLoggedGateFailure}
-     * （sessionMemory.ts:286-288，ant-only 且每 session 一次）。
+     * [SM-08] gate_disabled <b>每会话</b>一次性守卫 · CC original: {@code hasLoggedGateFailure}
+     * （sessionMemory.ts:271 {@code let hasLoggedGateFailure = false} + :292-296
+     * <b>{@code // Log gate failure once per session (ant-only)}</b>）。
+     *
+     * <p><b>WHY 必须按 sessionId 键控（[sm-cursor-sessionize] 同族修复）</b>：CC 侧是<b>模块级
+     * {@code let}</b> —— CC 单进程单会话 ⇒ 「once per session」由模块态天然成立。本仓是
+     * <b>一 JVM 多会话</b>，原实现的单份 {@code static volatile boolean} 会让<b>会话 A 发射后
+     * 会话 B 的同一事件永不发射</b> ⇒ 「≥WARN / 可观测」在多会话下<b>结构性地退化为「每 JVM 一行」</b>。
+     * 兄弟实现 {@link ExtractMemoriesAgent#hasLoggedGateFailure}/{@code hasLoggedGateFailureBySession}
+     * （同批 [sm-cursor-sessionize]）已按会话键控 —— 同一概念两套判据是缺陷，此处收敛到会话键控。
+     *
+     * <p><b>⛔ 与 {@code ClaudemdEngine.hasLoggedInitialLoad} 的判据差别（为何此可会话化、彼不可）</b>：
+     * 后者承载 {@code tengu_claudemd__initial_load}，语义是「<b>本进程</b>首次加载记忆文件」——
+     * 会话化会把「每 JVM 一条」变成「每会话一条」，<b>指标基数被改变</b> ⇒ 按裁定-9 的
+     * 「可观测语义 / 指标基数」判据<b>不</b>会话化。本项则相反：CC 注释明写 <b>per session</b>，
+     * 可观测单元本就是「每个会话的一次 gate 失败」⇒ 键控才是 CC 语义。
+     *
+     * <p><b>键缺失语义</b>：{@code sessionIdFrom} 的 null 兜底为 {@code "unknown"}（与
+     * {@link ExtractMemoriesAgent} 同兜底），只与同为无会话的调用共享。
      */
-    private static volatile boolean hasLoggedGateFailure = false;
+    private static final java.util.Map<String, Boolean> gateDisabledLoggedBySession =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * [G-41] 读取通道 · CC original: {@code FileReadTool.call}（sessionMemory.ts:217-226）——
@@ -556,9 +574,9 @@ public class SessionMemoryService {
         this.userTypeIsAnt = ant != null ? ant : () -> false;
     }
 
-    /** [SM-08] 测试辅助：重置 gate_disabled 一次性守卫（防跨测试污染）。 */
+    /** [SM-08] 测试辅助：重置 gate_disabled 每会话一次性守卫（防跨测试污染）。 */
     static void resetGateDisabledLogging() {
-        hasLoggedGateFailure = false;
+        gateDisabledLoggedBySession.clear();
     }
 
     /** 发射遥测事件（recordEvent in-memory + logOTelEvent）· null telemetry → 静默跳过。 */
@@ -723,6 +741,10 @@ public class SessionMemoryService {
             return;
         }
 
+        // [sm-cursor-sessionize] sessionId 前置解析（markExtractionStarted/shouldExtractMemory
+        //   会话态游标读写均需本会话键，不能在 try 内才解析）+ [SM-08] gate_disabled 每会话守卫亦需本键
+        String sessionId = sessionIdFrom(psContext.toolUseContext());
+
         // ── 门控 2: feature gate（sessionMemory.ts:284 tengu_session_memory）──
         // [SM-DB-gate] DB settings.sm_session_memory_enabled 有值覆盖注入 flag（前端入口），
         //   null 回落 sessionMemoryFeatureEnabled（env/feature 链）。CC 提取/压缩读同一 flag。
@@ -732,20 +754,20 @@ public class SessionMemoryService {
                     + "（DB sm_session_memory_enabled 未置 true，回落 sessionMemoryFeatureEnabled={}）",
                     sessionMemoryFeatureEnabled);
             }
-            // [SM-08] gate_disabled ant-only + 每 session 一次（DRIFT-5）· CC sessionMemory.ts:286-288
-            //   `if (process.env.USER_TYPE === 'ant' && !hasLoggedGateFailure)` —— 非 ant 不发射、
+            // [SM-08] gate_disabled ant-only + **每 session 一次**（DRIFT-5）· CC sessionMemory.ts:271/:292-296
+            //   `if (process.env.USER_TYPE === 'ant' && !hasLoggedGateFailure)` +
+            //   CC 注释原文 `// Log gate failure once per session (ant-only)` —— 非 ant 不发射、
             //   同 session 仅发射一次（旧实现每次 hook 触发都发，NOT_ALIGNED）。
-            if (userTypeIsAnt.getAsBoolean() && !hasLoggedGateFailure) {
-                hasLoggedGateFailure = true;
+            //   [sm-cursor-sessionize] 守卫按 sessionId 键控（putIfAbsent = 原子 CAS）：
+            //   A 会话发射后 B 会话仍须发射（否则「≥WARN 可观测」退化为「每 JVM 一行」）。
+            if (userTypeIsAnt.getAsBoolean()
+                    && gateDisabledLoggedBySession.putIfAbsent(sessionId, Boolean.TRUE) == null) {
                 emitTelemetry("tengu_session_memory_gate_disabled", java.util.Map.of());
             }
             return;
         }
 
         // ── 门控 3: shouldExtractMemory（sessionMemory.ts:296-298）──
-        // [sm-cursor-sessionize] sessionId 前置解析（markExtractionStarted/shouldExtractMemory
-        //   会话态游标读写均需本会话键，不能在 try 内才解析）
-        String sessionId = sessionIdFrom(psContext.toolUseContext());
         if (!shouldExtractMemory(sessionId, messages)) {
             return;
         }

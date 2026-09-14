@@ -119,7 +119,7 @@ class ManualCacheClearCcIntegrationTest {
         AutoMemPaths.defaultInstance(),
         new MemoryFileDetection(AutoMemPaths.defaultInstance(), () -> true, () -> true)) {
         @Override
-        public void resetGetMemoryFilesCache(String reason) {
+        public void resetGetMemoryFilesCache(String reason, String sessionId) {
             MEMFILES_RESETS.incrementAndGet();
             MEMFILES_RESET_REASONS.add(reason);
         }
@@ -139,7 +139,7 @@ class ManualCacheClearCcIntegrationTest {
         // 复位 PromptCacheBreakDetection 静态 PREVIOUS 表（notifyCompaction 接线测试用）
         new PromptCacheBreakDetection(r -> {}).resetPromptCacheBreakDetection();
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
         PostCompactionState.clear(SESSION);
     }
 

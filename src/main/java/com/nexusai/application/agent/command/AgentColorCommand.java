@@ -4,7 +4,6 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.agent.CwdResolution;
-import com.nexusai.application.agent.team.Teammate;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
 import jakarta.annotation.PostConstruct;
@@ -103,7 +102,10 @@ public class AgentColorCommand {
      *
      * <p>web 后端映射（Java idiom，接口 Spring）：
      * <ul>
-     *   <li>{@code isTeammate} → {@link Teammate#isTeammate()}（CC utils/teammate.ts:125-137）</li>
+     *   <li>{@code isTeammate} → [S1-T12] 按 handler 形参 {@code sessionId} 经
+     *       {@link SessionAgentStateRegistry#teammateIdentityForSession(String)} 解析会话级身份
+     *       （CC utils/teammate.ts:125-137 的 Java 等价；⛔ 不再用 {@code Teammate::isTeammate}
+     *       方法引用——分派线程上无 teammate 载体 ⇒ 恒 false = 守卫静默失效）</li>
      *   <li>{@code sessionId} → 分派入口显式传入的 handler 形参 {@code sessionId}（批 3c：不再读
      *       裸 MDC）</li>
      *   <li>{@code transcriptPath} → {@link SessionStorage#resolveExistingTranscript}（工作区 + sessionId，
@@ -120,10 +122,11 @@ public class AgentColorCommand {
      */
     private Env buildProductionEnv(String sessionId) {
         return new Env(
-            // [S1-T5 编译强制] 同 CommandRegistrationConfig /rename：显式 null 保持旧无参语义等价
-            //   （旧无参在 handler 线程读 ThreadLocal 恒 null）。真实修复（按 sessionId 解析会话身份）
-            //   属 T12/轨 IV，登记为待收敛。
-            () -> Teammate.isTeammate(null),
+            // [S1-T12] teammate 守卫真实修复（同 CommandRegistrationConfig /rename 的第二处同型缺陷）：
+            //   按 handler 形参 sessionId 解析**会话级身份**（唯一入口
+            //   SessionAgentStateRegistry#teammateIdentityForSession）。
+            //   WHY 不是方法引用：分派线程上不存在任何 teammate 载体 ⇒ 方法引用恒 false ⇒ 守卫静默失效。
+            () -> resolveIsTeammateSession(sessionAgentStateRegistry, sessionId),
             () -> resolveSessionUuid(sessionId),
             () -> resolveTranscriptPath(sessionId),
             () -> SubagentTool.AGENT_COLORS,
@@ -134,6 +137,17 @@ public class AgentColorCommand {
                     log.debug("[AgentColorCommand] onDone: {}", msg);
                 }
             });
+    }
+
+    /** [S1-T12] 会话身份解析（/color 守卫）· 会话级唯一入口，见 {@link SessionAgentStateRegistry#teammateIdentityForSession(String)}。 */
+    private static boolean resolveIsTeammateSession(SessionAgentStateRegistry registry, String sessionId) {
+        if (registry == null) {
+            // (b) 类：plain JUnit / 非 Spring 装配下无会话注册表 ⇒ 无法判定 → 非 teammate（放行）。
+            log.warn("[S1-T12] /color teammate 守卫：SessionAgentStateRegistry 未注入 ⇒ 无法判定会话"
+                + "身份，按非 teammate 放行（sessionId={}）", sessionId);
+            return false;
+        }
+        return registry.teammateIdentityForSession(sessionId) != null;
     }
 
     /** 由显式形参 sessionId 解析当前会话 UUID · null = 无会话上下文（批 3c：不再读裸 MDC）。 */

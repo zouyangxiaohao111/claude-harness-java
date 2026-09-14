@@ -44,7 +44,7 @@ class MicroCompactorCcContractTest {
         MicroCompactor.setCachedMicrocompactEnabled(false);
         MicroCompactor.setNowForTest(0L);
         MicroCompactor.resetMicrocompactState(SESSION);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
     }
 
     // ─────────────────────── 消息构造 ───────────────────────
@@ -122,13 +122,13 @@ class MicroCompactorCcContractTest {
     @Test
     @DisplayName("链式入口第 1 步：入口先复位警告抑制（microCompact.ts:259 clearCompactWarningSuppression）")
     void entry_clearsCompactWarningSuppression_first() {
-        CompactWarningState.suppressCompactWarning(null);
-        assertThat(CompactWarningState.isCompactWarningSuppressed())
+        CompactWarningState.suppressCompactWarning(SESSION, null);
+        assertThat(CompactWarningState.isCompactWarningSuppressed(SESSION))
             .as("前置：压缩后处于抑制态").isTrue();
 
         new MicroCompactor().microcompactMessages(List.of(), null, SESSION, null);
 
-        assertThat(CompactWarningState.isCompactWarningSuppressed())
+        assertThat(CompactWarningState.isCompactWarningSuppressed(SESSION))
             .as("新 microcompact 尝试开始必须复位抑制").isFalse();
     }
 

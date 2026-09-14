@@ -12,7 +12,7 @@ import com.nexusai.application.agent.query.QueryConfig;
 import com.nexusai.application.agent.query.TokenBudgetChecker;
 import com.nexusai.application.agent.tasks.Task;
 import com.nexusai.application.agent.tasks.TaskService;
-import com.nexusai.application.agent.team.Teammate;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.Notification;
 import com.nexusai.application.agent.tool.ToolRegistry;
@@ -86,9 +86,14 @@ class LlmAgentLoopTeammateHookIsMetaTest {
      */
     private AgentState LAST_RUN_STATE;
 
-    @AfterEach
-    void clearTeammateContext() {
-        Teammate.clearDynamicTeamContext();
+    /**
+     * [S1-T13] teammate 身份的**唯一**载体 = ToolUseContext 的显式组件（进程级 dynamicTeamContext
+     * 槽已删除）⇒ 用例经此把身份挂到 TUC 上，与生产
+     * {@code params.toolUseContext().teammateIdentity()} 的读点同源。
+     */
+    private static ToolUseContext withTeammateIdentity(ToolUseContext tuc) {
+        return tuc.withTeammateIdentity(new TeammateIdentity(
+            "a1", TEAMMATE_NAME, "team1", "blue", false, "p1"));
     }
 
     @Test
@@ -146,8 +151,6 @@ class LlmAgentLoopTeammateHookIsMetaTest {
     private List<ChatMessageDto> runTeammateTurnEnd(HookEventType firedHook) {
         boolean taskCompletedArmed = firedHook == HookEventType.TASK_COMPLETED;
         AtomicBoolean served = new AtomicBoolean(false);
-        Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
-            "a1", TEAMMATE_NAME, "team1", "blue", false, "p1"));
 
         // ── provider：单文本帧 1000 tokens → 触发 budget stop，loop 收敛到 stop hooks ──
         LlmProvider provider = Mockito.mock(LlmProvider.class);
@@ -229,7 +232,8 @@ class LlmAgentLoopTeammateHookIsMetaTest {
         com.nexusai.application.agent.loop.QueryParams rawParams =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                tucWithNotification(null).withAvailableTools(List.of(
+                // [S1-T13] teammate 身份挂 TUC 显式组件（生产读点 params.toolUseContext().teammateIdentity()）
+                withTeammateIdentity(tucWithNotification(null)).withAvailableTools(List.of(
                     TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());

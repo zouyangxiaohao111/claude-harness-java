@@ -377,7 +377,7 @@ public class PermissionPipeline {
                         && isStrictAutoMode(permCtx)) {
                     DenialTracker tracker = resolveDenialTracker(ctx);
                     if (tracker != null) {
-                        tracker.recordSuccess();
+                        tracker.recordSuccess(sessionId(ctx));
                         if (log.isDebugEnabled()) {
                             log.debug("AUTO MODE: allow 事件断连拒链 recordSuccess (tool={})", tool.name());
                         }
@@ -506,14 +506,14 @@ public class PermissionPipeline {
                     //   resolveDenialTracker null-safe，测试/手动构造无 tracker）
                     DenialTracker tracker = resolveDenialTracker(ctx);
                     if (tracker != null) {
-                        tracker.recordSuccess();
+                        tracker.recordSuccess(sessionId(ctx));
                     }
                     if (log.isInfoEnabled()) {
                         log.info("AUTO MODE: acceptEdits fast-path allow tool={}（跳过分类器）",
                             tool.name());
                     }
                     // [OPD-WF3-01-05] 补发 tengu_auto_mode_decision（CC :626-640）
-                    emitAutoModeDecision(tool.name(), "allowed", "acceptEdits", null, null);
+                    emitAutoModeDecision(tool.name(), "allowed", "acceptEdits", null, null, sessionId(ctx));
                     // CC :641-648 —— allow + updatedInput（acceptEditsResult.updatedInput ?? input，
                     //   Java Allow.updatedInput 非空）+ decisionReason = Mode(auto)
                     return new PermissionResult.Allow(
@@ -545,7 +545,7 @@ public class PermissionPipeline {
                 log.info("AUTO MODE: 安全工具 {} → allow (allowlist)", tool.name());
             }
             // [OPD-WF3-01-05] 补发 tengu_auto_mode_decision（CC :666-677）
-            emitAutoModeDecision(tool.name(), "allowed", "allowlist", null, null);
+            emitAutoModeDecision(tool.name(), "allowed", "allowlist", null, null, sessionId(ctx));
             return new PermissionResult.Allow(
                 input,
                 new PermissionDecisionReason.Mode(PermissionMode.AUTO),
@@ -607,7 +607,7 @@ public class PermissionPipeline {
                     || Boolean.TRUE.equals(classifierResult.transcriptTooLong())
                     ? "blocked" : "allowed");
             emitAutoModeDecision(tool.name(), yoloDecision, null, classifierResult,
-                resolveDenialTracker(ctx));
+                resolveDenialTracker(ctx), sessionId(ctx));
             // [OPD-WF3-01-16] 补耗时遥测 · 对齐 CC permissions.ts:814-816
             //   `if (classifierResult.durationMs !== undefined) { addToTurnClassifierDuration(classifierResult.durationMs) }`
             //   —— 每次 auto-mode 分类器调用后累计到会话回合级耗时（CC state.ts:627-630）。
@@ -670,7 +670,7 @@ public class PermissionPipeline {
             //   [IMP-9] 子代理经 localDenialTracking 独立计数（CC :556-558 local 优先）
             DenialTracker tracker = resolveDenialTracker(ctx);
             if (tracker != null) {
-                DenialTracker.FallbackSnapshot snapshot = tracker.recordDenial();
+                DenialTracker.FallbackSnapshot snapshot = tracker.recordDenial(sessionId(ctx));
                 if (snapshot.fallback()) {
                     // CC handleDenialLimitExceeded（permissions.ts:984-1058）→ 回退 prompting
                     boolean hitTotal = snapshot.totalDenials() >= tracker.getMaxTotal();
@@ -830,9 +830,11 @@ public class PermissionPipeline {
      * @param classifierResult 分类器结果（fast-path 传 null；主路径传真实结果）
      * @param tracker          当前调用的拒绝追踪器（resolveDenialTracker 解析结果；
      *                         fast-path 传 null；主路径传 resolved per-agent/global tracker）
+     * @param sessionId        显式会话标识（tracker 计数按会话键控 ⇒ 读侧必须同键；
+     *                         null = 无会话（ctx==null 的测试/手动构造路径）→ 无会话桶）
      */
     private void emitAutoModeDecision(String toolName, String decision, String fastPath,
-            YoloClassifierResult classifierResult, DenialTracker tracker) {
+            YoloClassifierResult classifierResult, DenialTracker tracker, String sessionId) {
         if (telemetry == null) {
             return;
         }
@@ -855,9 +857,9 @@ public class PermissionPipeline {
             if (tracker != null) {
                 boolean blocked = Boolean.TRUE.equals(classifierResult.shouldBlock());
                 attrs.put("consecutiveDenials", blocked
-                    ? tracker.getConsecutiveDenials() + 1 : 0);
+                    ? tracker.getConsecutiveDenials(sessionId) + 1 : 0);
                 attrs.put("totalDenials", blocked
-                    ? tracker.getTotalDenials() + 1 : tracker.getTotalDenials());
+                    ? tracker.getTotalDenials(sessionId) + 1 : tracker.getTotalDenials(sessionId));
             }
             // usage 4 字段（CC :751-756）
             putClassifierUsage(attrs, "classifier", classifierResult.usage());

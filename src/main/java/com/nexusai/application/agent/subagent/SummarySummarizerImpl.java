@@ -98,7 +98,9 @@ public class SummarySummarizerImpl implements SummarySummarizer {
         // 无显式 clean 上下文时自读自滤 (CC agentSummary.ts:68-84: runSummary 读 transcript →
         // filterIncompleteToolCalls → forkContextMessages). 兼容非 SummarySummarizerImpl 的注入方.
         List<AgentMessage> clean = filterIncompleteToolCalls(readTranscript(agentId));
-        return summarize(agentId, prompt, clean, null);
+        // [S1-T7] 接口兼容路径（非本实现的注入方走 {@code summarize(agentId,prompt)}）：
+        //   无显式归因上下文承载体 ⇒ 显式 null（与同路径旧 ambient 读等价：调用方线程上恒 null）。
+        return summarize(agentId, prompt, clean, null, null);
     }
 
     /**
@@ -112,10 +114,16 @@ public class SummarySummarizerImpl implements SummarySummarizer {
      * @param prompt          含历史摘要 + 模板的 prompt (CC buildSummaryPrompt)
      * @param context         clean transcript 消息 (forkContextMessages 等价)
      * @param abortController 本轮 fork 的取消信号 (CC overrides.abortController; 可 null = 无中断能力)
+     * @param agentContext    [S1-T7] agent 归因上下文（**显式形参**；由 {@link AgentSummaryService}
+     *                        在 start 时以值捕获后经状态透传）。WHY 必须传：本方法跑在 scheduler
+     *                        池线程上，plain ThreadLocal 不跨线程 ⇒ 原实现读
+     *                        {@code 宿主 ambient 归因上下文} 恒 null（真缺陷：归因边静默丢失）。
+     *                        null = 无归因上下文（等价 CC agentContext.ts:170 无 invokingRequestId）。
      * @return 摘要文本 (trim 后非空); 失败 / LLM 返回空 / 被 abort → null
      */
     public String summarize(String agentId, String prompt,
-                            List<AgentMessage> context, AbortController abortController) {
+                            List<AgentMessage> context, AbortController abortController,
+                            com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // CC agentSummary.ts:109-119 runForkedAgent — 简化为 chatWithOptions 非工具调用
         try {
             LlmProvider provider = llmProviderFactory != null
@@ -129,7 +137,9 @@ public class SummarySummarizerImpl implements SummarySummarizer {
             // CC querySource: 'agent_summary' (agentSummary.ts:115) — 侧信道来源标记
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 history, null, null, null, null,
-                "agent_summary", abortController, null, com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                "agent_summary", abortController, null,
+                // [S1-T7] agent 归因上下文 = **本方法形参**（原读 ambient，在本 scheduler 池线程上恒 null）。
+                agentContext);
             if (log.isDebugEnabled()) {
                 log.debug("[SummarySummarizerImpl] agent {} fork 摘要, {} 条 clean 上下文, abort={}",
                     agentId, history.size(), abortController != null);

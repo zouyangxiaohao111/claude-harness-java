@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 主会话后台化派生查询服务 · 对齐 CC {@code LocalMainSessionTask.ts:338-479} {@code startBackgroundSession}.
  *
  * <p><b>职责（WF5-03，OPD-TP-13/17）</b>：从当前会话消息<b>派生一条独立 LlmAgentLoop 查询</b>
- * （不复用前台查询的 streamTopic，走任务级独立 topic），并在 runWithAgentContext 隔离下运行。
+ * （不复用前台查询的 streamTopic，走任务级独立 topic），并在显式携带的 SubagentContext 归因上下文下运行。
  * 实现三块 CC 真源语义：
  * <ol>
  *   <li>{@link #startBackgroundSession} —— 独立派生查询入口（CC :338-479 完整循环语义）</li>
@@ -282,8 +282,10 @@ public class MainSessionBackgroundService {
      *   <li>异步派发 —— 查询循环体经 {@code backgroundExecutor}（chatExecutor 池）fire-and-forget 执行
      *       （对齐 CC :375 {@code void runWithAgentContext(...)} 不 await）；注册 + transcript 在调用线程
      *       同步完成，本方法立即返回 taskId（CC :478），HTTP 线程不等待查询结束</li>
-     *   <li>{@code runWithAgentContext(SubagentContext{agentId:taskId, agentType:'subagent',
-     *       subagentName:'main-session', isBuiltIn:true})} 隔离 skill 作用域（:368-375）</li>
+     *   <li>[S1-T7] {@code SubagentContext{agentId:taskId, agentType:'subagent',
+     *       subagentName:'main-session', isBuiltIn:true}} 作为<b>值</b>经
+     *       {@code RunRequest.withAgentContext(...)} 挂到本 run（CC :368-375 在 Java 端不再是
+     *       ThreadLocal 外壳，而是显式值 —— 用户铁律：回放不算合规）</li>
      *   <li>独立 {@code LlmAgentLoop.run(...)}（Java 版 query 循环）：任务级 streamTopic 注入
      *       （w5-01 隔离设计 1）、逐消息 recordSidechainTranscript、assistant 内容 tokenCount +
      *       toolCount + recentActivities（≤5）统计（:383-468）</li>
@@ -330,11 +332,13 @@ public class MainSessionBackgroundService {
 
     /**
      * 在 backgroundExecutor 线程执行后台派生查询 · 对齐 CC {@code LocalMainSessionTask.ts:375-476}
-     * {@code void runWithAgentContext(agentContext, async () => {...})}（fire-and-forget 的查询循环体）。
+     * {@code void runWithAgentContext(agentContext, async () => {...})}（CC :375，fire-and-forget 的查询循环体）。
      *
-     * <p>runWithAgentContext 为 ThreadLocal try-finally（AgentContext:154-166），必须在 executor 线程内
-     * 设置 context，使 loop.run 全程处于 SubagentContext{agentId:taskId, subagentName:'main-session'} 作用域
-     * （对齐 CC AsyncLocalStorage :104-107 语义）。查询正常/异常均收敛到 completeMainSessionTask（CC :471/:474）。
+     * <p><b>[S1-T7] 归因上下文承载方式</b>：不再是 ambient 归因作用域（ThreadLocal 外壳，
+     * 该载体已整体删除），而是把同一 {@code SubagentContext} 实例经
+     * {@code RunRequest.withAgentContext(...)} 作为**值**下传（对齐 CC AsyncLocalStorage :104-107 的
+     * <b>传播效果</b>，但不依赖 ThreadLocal —— 用户铁律：会话态一律显式传参，回放不算合规）。
+     * 查询正常/异常均收敛到 completeMainSessionTask（CC :471/:474）。
      *
      * @param taskId      主会话后台化任务 id
      * @param sessionId   会话 ID
@@ -351,73 +355,82 @@ public class MainSessionBackgroundService {
                                     @Nullable ProviderConfig config,
                                     @Nullable AtomicBoolean abortFlag) {
         // CC :368-375 runWithAgentContext(SubagentContext{agentId:taskId, subagentName:'main-session', isBuiltIn:true})
+        // [S1-T7] 本实例经 RunRequest.withAgentContext(...) 显式下传（唯一生产非 null 来源）
         AgentContext.SubagentContext agentContext = new AgentContext.SubagentContext(
             taskId, sessionId, "main-session", true, null, null);
-        AgentContext.runWithAgentContext(agentContext, () -> {
-            try {
-                LlmAgentLoop loop = loopProvider.getObject();
-                // w5-01 隔离设计 1：任务级独立 topic /topic/tasks/{taskId}/stream
-                // [IMP-A · F6] 透传真实 sessionId —— 后台 loop 经 streamSessionId 解析会话
-                //   projectRoot（F1 冻结：resolveSessionProjectRoot 先查 SessionProjectRoot
-                //   冻结值，未命中走 resolver → 首 run 冻结，与前台同享会话级注入）
-                loop.setTaskStreamContext(wsTemplate, taskId, sessionId);
-                // [session-id-short] sessionId 已 short 直传；agentUuid 由 taskId（合规 UUID）解析
-                String sessionUuid = sessionId;
-                UUID agentUuid = taskAgentId(taskId); // CC agentId=taskId（:132）
-                ProviderConfig cfg = (config != null) ? config : ProviderConfig.empty();
-                // [IMP2-10 · MISS-2 · OD-13] taskBudget 生产注入：本入口无请求参数通道
-                //   （后台派生查询），来源链 = 配置 nexusai.agent.task-budget.total → 默认值；恒非 null。
-                com.nexusai.application.agent.TaskBudget taskBudget =
-                    com.nexusai.application.agent.RunRequest.resolveTaskBudget(null, taskBudgetTotalConfigured);
-                if (log.isDebugEnabled()) {
-                    log.debug("[IMP2-10 taskBudget] 主会话后台化入口注入: source=配置/默认值 total={}", taskBudget.total());
-                }
-                // [SM/compact 对齐 CC · 消除未武装通道] 本入口此前无任何持久化监听武装 → append 不落库、
-                //   compact 结果不落库。run 前经 postHistoryPersistEnabler 回调（doRun 历史注入完成、
-                //   prePersistedMessageIds 登记后触发）武装「仅落库」通道：append 逐条实时落 DB（对齐 CC
-                //   recordTranscript）+ compact 结果 append-only 落库（对齐 CC transcript append-only）。
-                //   流式推送仍走任务级 topic（loop.setTaskStreamContext），本武装不推 STOMP。
-                // [seq 排序键 核对] 本入口落库的目标就是「主会话」messages（sessionId = 真实会话 id，
-                //   后台派生查询复用同一会话，非独立库）——经 ChatService.persistAppendedMessage 走既有
-                //   append 实时落库通道，created_at（时间）与 seq（V70 位置键）均经 MessageService 的
-                //   per-session 单点取号，与前台 writer 同域单调 → 无需本入口单独处理（行为不变）。
-                if (chatService != null) {
-                    loop.setPostHistoryPersistEnabler(state2 ->
-                        chatService.armPersistenceListeners(state2, sessionId));
-                    if (log.isInfoEnabled()) {
-                        log.info("主会话后台化派生查询: 落库监听已武装 session={}（append 实时落库 + compact append-only）",
-                            sessionId);
-                    }
-                }
-                AgentState runState = loop.run(RunRequest.session(userPrompt, sessionUuid, agentUuid, cfg, modelName,
-                    null, null, null, taskBudget));
-
-                // run 收口：解除监听（防 PersistCtx/sessionId 泄漏到下轮 / 下个 task 复用本 loop 实例）
-                if (runState != null) {
-                    runState.clearAppendListener();
-                    runState.clearCompactPersistListener();
-                }
-
-                // CC :387-401 abort 中断 → notified 短路 + emitTaskTerminatedSdk('stopped')
-                if (abortFlag != null && abortFlag.get()) {
-                    log.warn("主会话后台化派生查询被中断: taskId={}", taskId);
-                    // CC :391-399 原子 check-and-set —— 仅当此前未 notified 才发 task_terminated('stopped')
-                    //   （chat:killAgents 路径已 notified+emitted 则不重发；stopTask 路径必须发 bookend）
-                    boolean alreadyNotified = markNotified(taskId);
-                    if (!alreadyNotified) {
-                        sdkEventQueue.emitTaskTerminatedSdk(taskId, "stopped",
-                            new SdkEventQueue.TaskTerminatedOpts(null, description, null, null));
-                    }
-                    return;
-                }
-                // 正常完成 → completeMainSessionTask（CC :471）
-                completeMainSessionTask(taskId, true);
-            } catch (Exception e) {
-                log.error("主会话后台化派生查询失败: taskId={}", taskId, e);
-                // CC :474 completeMainSessionTask(taskId, false)
-                completeMainSessionTask(taskId, false);
+        // [S1-T7] ⛔ 原此处为 AgentContext.runWithAgentContext(agentContext, () -> {...}) 外壳（CC :368-375）：
+        //   把归因上下文「回放」到 executor 线程再读 —— 用户铁律：
+        //   会话态一律显式传参，回放不算合规。现改为把同一 SubagentContext 实例作为**值**经
+        //   RunRequest.withAgentContext(...) 挂到本 run 上（LlmAgentLoop 侧唯一的显式入口），
+        //   与 ToolUseContext 其他字段同一通道，不再依赖任何 ThreadLocal。
+        try {
+            LlmAgentLoop loop = loopProvider.getObject();
+            // w5-01 隔离设计 1：任务级独立 topic /topic/tasks/{taskId}/stream
+            // [IMP-A · F6] 透传真实 sessionId —— 后台 loop 经 streamSessionId 解析会话
+            //   projectRoot（F1 冻结：resolveSessionProjectRoot 先查 SessionProjectRoot
+            //   冻结值，未命中走 resolver → 首 run 冻结，与前台同享会话级注入）
+            loop.setTaskStreamContext(wsTemplate, taskId, sessionId);
+            // [session-id-short] sessionId 已 short 直传；agentUuid 由 taskId（合规 UUID）解析
+            String sessionUuid = sessionId;
+            UUID agentUuid = taskAgentId(taskId); // CC agentId=taskId（:132）
+            ProviderConfig cfg = (config != null) ? config : ProviderConfig.empty();
+            // [IMP2-10 · MISS-2 · OD-13] taskBudget 生产注入：本入口无请求参数通道
+            //   （后台派生查询），来源链 = 配置 nexusai.agent.task-budget.total → 默认值；恒非 null。
+            com.nexusai.application.agent.TaskBudget taskBudget =
+                com.nexusai.application.agent.RunRequest.resolveTaskBudget(null, taskBudgetTotalConfigured);
+            if (log.isDebugEnabled()) {
+                log.debug("[IMP2-10 taskBudget] 主会话后台化入口注入: source=配置/默认值 total={}", taskBudget.total());
             }
-        });
+            // [SM/compact 对齐 CC · 消除未武装通道] 本入口此前无任何持久化监听武装 → append 不落库、
+            //   compact 结果不落库。run 前经 postHistoryPersistEnabler 回调（doRun 历史注入完成、
+            //   prePersistedMessageIds 登记后触发）武装「仅落库」通道：append 逐条实时落 DB（对齐 CC
+            //   recordTranscript）+ compact 结果 append-only 落库（对齐 CC transcript append-only）。
+            //   流式推送仍走任务级 topic（loop.setTaskStreamContext），本武装不推 STOMP。
+            // [seq 排序键 核对] 本入口落库的目标就是「主会话」messages（sessionId = 真实会话 id，
+            //   后台派生查询复用同一会话，非独立库）——经 ChatService.persistAppendedMessage 走既有
+            //   append 实时落库通道，created_at（时间）与 seq（V70 位置键）均经 MessageService 的
+            //   per-session 单点取号，与前台 writer 同域单调 → 无需本入口单独处理（行为不变）。
+            if (chatService != null) {
+                loop.setPostHistoryPersistEnabler(state2 ->
+                    chatService.armPersistenceListeners(state2, sessionId));
+                if (log.isInfoEnabled()) {
+                    log.info("主会话后台化派生查询: 落库监听已武装 session={}（append 实时落库 + compact append-only）",
+                        sessionId);
+                }
+            }
+            // [S1-T7] agent 归因上下文 = 本后台任务的 SubagentContext **实例**（与旧 runWithAgentContext（CC :368-375）
+            //   承载时传入的是**同一实例**——sparse-edge 语义 `invocationEmitted` 靠同一 AtomicBoolean，
+            //   ⛔ 任何消费点都不许 new SubagentContext(...) 重建）：
+            //   经 RunRequest.withAgentContext(...) 显式下传 → buildBaseToolUseContext 形参 →
+            //   base TUC.withAgentContext(...) → loop() / provider 侧单一来源。
+            AgentState runState = loop.run(RunRequest.session(userPrompt, sessionUuid, agentUuid, cfg, modelName,
+                null, null, null, taskBudget).withAgentContext(agentContext));
+
+            // run 收口：解除监听（防 PersistCtx/sessionId 泄漏到下轮 / 下个 task 复用本 loop 实例）
+            if (runState != null) {
+                runState.clearAppendListener();
+                runState.clearCompactPersistListener();
+            }
+
+            // CC :387-401 abort 中断 → notified 短路 + emitTaskTerminatedSdk('stopped')
+            if (abortFlag != null && abortFlag.get()) {
+                log.warn("主会话后台化派生查询被中断: taskId={}", taskId);
+                // CC :391-399 原子 check-and-set —— 仅当此前未 notified 才发 task_terminated('stopped')
+                //   （chat:killAgents 路径已 notified+emitted 则不重发；stopTask 路径必须发 bookend）
+                boolean alreadyNotified = markNotified(taskId);
+                if (!alreadyNotified) {
+                    sdkEventQueue.emitTaskTerminatedSdk(taskId, "stopped",
+                        new SdkEventQueue.TaskTerminatedOpts(null, description, null, null));
+                }
+                return;
+            }
+            // 正常完成 → completeMainSessionTask（CC :471）
+            completeMainSessionTask(taskId, true);
+        } catch (Exception e) {
+            log.error("主会话后台化派生查询失败: taskId={}", taskId, e);
+            // CC :474 completeMainSessionTask(taskId, false)
+            completeMainSessionTask(taskId, false);
+        }
     }
 
     /**

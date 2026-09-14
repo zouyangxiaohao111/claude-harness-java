@@ -261,8 +261,6 @@ class AutoCompactorCcContractTest {
 
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
         auto.setSessionMemoryService(smService);
-        auto.setSessionId("s1");
-        auto.setAgentId("agent-1");
         // 未设置 lastSummarizedMessageId → resumed session 分支（保留全部非 boundary 消息）
         SessionMemoryService.setLastSummarizedMessageId("s1", null);
 
@@ -282,7 +280,7 @@ class AutoCompactorCcContractTest {
         // [SM-07] PROMPT_CACHE_BREAK_DETECTION 门控开启 → notifyCompaction 可达（CC feature on 语义）
         auto.setPromptCacheBreakDetectionGate(() -> true);
 
-        AutoCompactor.AutoCompactResult result = auto.tryAutoCompact(largeMessages(20));
+        AutoCompactor.AutoCompactResult result = auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx());
 
         // SM 压缩成功
         assertThat(result.wasCompacted()).isTrue();
@@ -291,12 +289,17 @@ class AutoCompactorCcContractTest {
         assertThat(cleanupCalls.get()).isEqualTo(1);
         assertThat(cleanupQs.get())
             .as("清理器必须收到本调用的 querySource（便捷路径 = 字段归一值 'user'）").isEqualTo("user");
+        // ── [S1 轨 III · T9 2026-09-14 改锚] 断言值不变，**身份来源变了**： ──
+        //   原实现靠 auto.setSessionId("s1")/setAgentId("agent-1")（单例字段，生产 0 写入方，
+        //   已删除）；现由 ccContext 携带（生产 = LlmAgentLoop buildAutoContext 注入）。
+        //   即：本用例从「测单例字段 seam」升级为「测生产契约」——身份只能来自上下文。
         assertThat(cleanupSid.get())
-            .as("清理器必须收到会话标识（setSessionId('s1') → effSessionId），旧实现此处恒 null")
+            .as("清理器收到的会话标识来自 ccContext.getSessionId()")
             .isEqualTo("s1");
-        assertThat(notifyCalls).contains("user:agent-1");
-        // setSessionId("s1") 非 UUID → 方案 1b 走回落进程级单布尔；本断言验证 INV-8
-        // markPostCompaction 确被调用（mark 成功链），会话级隔离语义由 PostCompactionStateTest 覆盖。
+        assertThat(notifyCalls)
+            .as("notifyCompaction 的 (querySource, agentId) 同源 ccContext")
+            .contains("user:agent-1");
+        // 会话级隔离语义由 PostCompactionStateCrossSessionTest 覆盖（本用例只验值传递）
         assertThat(PostCompactionState.isPostCompactionPending("s1")).isTrue();
         // setLastSummarizedMessageId 复位（autoCompact.ts:296）
         assertThat(SessionMemoryService.getLastSummarizedMessageId("s1")).isNull();
@@ -316,15 +319,13 @@ class AutoCompactorCcContractTest {
 
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
         auto.setSessionMemoryService(smService);
-        auto.setSessionId("s1");
-        auto.setAgentId("agent-1");
         SessionMemoryService.setLastSummarizedMessageId("s1", null);
         // 门控不设置 → 默认 false（feature('PROMPT_CACHE_BREAK_DETECTION') 默认关）
 
         List<String> notifyCalls = new ArrayList<>();
         auto.setNotifyCompaction((qs, aid) -> notifyCalls.add(qs + ":" + aid));
 
-        AutoCompactor.AutoCompactResult result = auto.tryAutoCompact(largeMessages(20));
+        AutoCompactor.AutoCompactResult result = auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx());
 
         // SM 压缩仍成功（门控只影响 notifyCompaction，不影响压缩本身）
         assertThat(result.wasCompacted()).isTrue();
@@ -344,8 +345,6 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
             (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setSessionMemoryService(smService);
-        auto.setSessionId("s1");
-        auto.setAgentId("agent-1");
         List<String> notifyCalls = new ArrayList<>();
         auto.setNotifyCompaction((qs, aid) -> notifyCalls.add(qs + ":" + aid));
         // [IMP-CM-12] f4 全量路径门控开启 → notifyCompaction 可达（CC compact.ts:698-699 feature on 语义）
@@ -355,7 +354,52 @@ class AutoCompactorCcContractTest {
 
         assertThat(result.wasCompacted()).isTrue();
         assertThat(result.source()).isEqualTo("AUTO");
-        assertThat(notifyCalls).contains("user:agent-1");
+        assertThat(notifyCalls)
+            .as("[T9 改锚] agentId 唯一来源 = ccContext；便捷重载无 ccContext ⇒ null")
+            .contains("user:null");
+    }
+
+    @Test
+    @DisplayName("[T9 改锚] 压缩身份权威来源 = ccContext：agentId/sessionId 只能由上下文携带（字段已删）")
+    void identityComesFromCcContext_notFromSingletonFields(@TempDir Path baseDir) {
+        // WHY（规则九）：AutoCompactor 的 sessionId/agentId/toolUseContext 三个单例字段已删除
+        //   （生产 0 写入方）。本用例把「身份来自哪里」这件事钉死在**唯一合法来源**上：
+        //   ccContext（生产 = LlmAgentLoop buildAutoContext 注入的 per-session 上下文）。
+        //   反向：若有人把身份改回从单例字段读，本用例的 agentId 断言会红（字段不存在 ⇒ 编译红；
+        //   若以别的方式塞回单例状态，则载荷不再是 ctx 的值 ⇒ 断言红）。
+        SessionMemoryService smService = new SessionMemoryService(baseDir);
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
+        // 精确断言 T9 删除终态（4 字段 + 4 setter）：⛔ 不用「名字含 session/agent」的宽判据
+        //   —— 那会误伤装配依赖 sessionMemoryService / sessionAgentStateRegistry（非 final 但不承载会话态）。
+        //   通用判据由 T10 闸门（BeanSingletonSessionStateAuditTest 的装配字段排除）承担。
+        java.util.Set<String> fieldNames = java.util.Arrays.stream(auto.getClass().getDeclaredFields())
+            .map(java.lang.reflect.Field::getName).collect(java.util.stream.Collectors.toSet());
+        assertThat(fieldNames)
+            .as("T9：sessionId/agentId/toolUseContext/querySource 四字段必须已删（生产 0 写入方的 landmine）")
+            .doesNotContain("sessionId", "agentId", "toolUseContext", "querySource");
+        java.util.Set<String> methodNames = java.util.Arrays.stream(auto.getClass().getDeclaredMethods())
+            .map(java.lang.reflect.Method::getName).collect(java.util.stream.Collectors.toSet());
+        assertThat(methodNames)
+            .as("T9：四个 setter 必须已删（唯二调用点 / 只服务已死字段）")
+            .doesNotContain("setSessionId", "setAgentId", "setToolUseContext", "setQuerySource");
+
+        List<String> notifyCalls = new ArrayList<>();
+        auto.setNotifyCompaction((qs, aid) -> notifyCalls.add(qs + ":" + aid));
+        auto.setPromptCacheBreakDetectionGate(() -> true);
+        CompactConversationContext ccCtx = new CompactConversationContext()
+            .setModel("m")
+            .setQuerySource("user")
+            .setSessionId("sess-from-ctx")
+            .setAgentId("agent-from-ctx")
+            .setReadFileState(new java.util.LinkedHashMap<>())
+            .setNotifyCompaction(() -> { });
+        // querySource 传 "user"：'compact' 会命中 shouldAutoCompact 的递归守卫（fork 死锁防护）⇒ 不压缩
+        auto.autoCompactIfNeeded(largeMessages(20), 0, "user", ccCtx);
+
+        assertThat(notifyCalls)
+            .as("身份取自 ccCtx（生产契约）：qs/agentId 逐字来自上下文，与任何单例状态无关")
+            .contains("user:agent-from-ctx");
     }
 
     @Test
@@ -365,8 +409,6 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
             (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setSessionMemoryService(smService);
-        auto.setSessionId("s1");
-        auto.setAgentId("agent-1");
         List<String> notifyCalls = new ArrayList<>();
         auto.setNotifyCompaction((qs, aid) -> notifyCalls.add(qs + ":" + aid));
         // 门控不设置 → 默认 false（feature('PROMPT_CACHE_BREAK_DETECTION') 默认关）
@@ -387,7 +429,6 @@ class AutoCompactorCcContractTest {
         // SM feature 未启用 → shouldUseSessionMemoryCompaction=false
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
         auto.setSessionMemoryService(smService);
-        auto.setSessionId("s1");
 
         AutoCompactor.AutoCompactResult result = auto.tryAutoCompact(largeMessages(20));
 
@@ -410,8 +451,6 @@ class AutoCompactorCcContractTest {
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
             (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
         auto.setSessionMemoryService(smService);
-        auto.setSessionId("s1");
-        auto.setAgentId("agent-1");
         SessionMemoryService.setLastSummarizedMessageId("s1", null);
 
         // 前置：模拟此前 2 次压缩失败（熔断计数=2，未达阈值 3）——D-1 缺陷下 SM 成功不清零，
@@ -426,7 +465,7 @@ class AutoCompactorCcContractTest {
         String preTurnId = auto.getTracking().getTurnId();
         assertThat(auto.getTracking().getConsecutiveFailures()).isEqualTo(2);
 
-        AutoCompactor.AutoCompactResult result = auto.tryAutoCompact(largeMessages(20));
+        AutoCompactor.AutoCompactResult result = auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx());
 
         // SM 压缩仍成功（熔断复位不影响压缩本身）
         assertThat(result.wasCompacted()).isTrue();
@@ -845,5 +884,20 @@ class AutoCompactorCcContractTest {
                 null, "asst-" + i, null, List.of(), List.of(), null, false, false));
         }
         return list;
+    }
+
+    /**
+     * [T9 改锚] SM 路径的会话身份唯一来源 = ccContext（生产 = LlmAgentLoop buildAutoContext）。
+     *
+     * <p>原用例用 {@code auto.setSessionId("s1")} 作 seam（该字段已删除）→ 现把身份放进上下文，
+     * 同时这一改动把用例从「测单例字段」升级为「测生产契约」：{@code effSessionId} 取自
+     * {@code ccContext.getSessionId()} 才能让 SM 定位到 {@code <baseDir>/s1/session-memory/summary.md}。
+     */
+    private CompactConversationContext smCcCtx() {
+        return new CompactConversationContext()
+            .setSessionId("s1")
+            .setAgentId("agent-1")
+            .setQuerySource("user")
+            .setReadFileState(new java.util.LinkedHashMap<>());
     }
 }

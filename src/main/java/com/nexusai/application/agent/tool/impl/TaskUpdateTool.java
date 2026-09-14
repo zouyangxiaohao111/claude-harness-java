@@ -410,7 +410,11 @@ public class TaskUpdateTool extends AbstractTaskTool {
         // Step 2: 检查任务是否存在（对齐 CC TaskUpdateTool.ts:146-156）
         // CC: const taskListId = getTaskListId(); const existingTask = await getTask(taskListId, taskId)
         // 逐次动态解析列表 ID（对齐 CC TaskUpdateTool.ts:137 getTaskListId()）
-        String listId = TaskService.getTaskListId();
+        // [S1-T11] 会话/身份**显式**取自本工具形参 ctx（原无参重载已删除——它无会话来源，
+        //   只能回退全进程共享 UUID，多会话 JVM 下会操作别的会话的列表）。
+        String listId = TaskService.getTaskListId(
+            ctx != null ? ctx.sessionId() : null,
+            ctx != null ? ctx.teammateIdentity() : null);
         if (log.isDebugEnabled()) {
             log.debug("TaskUpdate 解析列表 ID {}，处理任务 {}", listId, taskId);
         }
@@ -1039,7 +1043,8 @@ public class TaskUpdateTool extends AbstractTaskTool {
         // statusChange 为 null，不触发提醒（修复旧实现 newStatus==COMPLETED 无条件触发的误报）。
         // [IMP-G3] OD-G2-1 拍板：getAgentId()（teammate.ts:88-92，仅 running-as-teammate 返回
         // agentId，主线程 undefined）改由 Java Teammate.getAgentId(identity) 对等表达
-        // （[S1-T6] 身份为显式形参 > dynamicTeamContext，与 CC 同优先级）；不再用 sysprop 代理。
+        // （[S1-T6] 身份为显式形参；[S1-T13] 进程级 dynamicTeamContext 槽已整体删除 ⇒ 唯一来源）；
+        // 不再用 sysprop 代理。
         boolean reminderRealMigrationToCompleted = content.statusChange() != null
             && "completed".equals(content.statusChange().to());
         if (reminderRealMigrationToCompleted

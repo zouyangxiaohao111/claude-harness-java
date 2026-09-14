@@ -91,9 +91,11 @@ class TaskServiceGetTaskListIdTest {
         // 全空 → 回退进程级稳定会话 UUID（U-3 弃硬编码 'tasklist'；CC getTaskListId 永不返回 'tasklist'，
         // 最终回退 getSessionId()=STATE.sessionId 会话 UUID，state.ts:331/431-432；Java 静态方法无会话
         // 上下文时以进程级稳定 UUID 兜底，保证非 null——DC-4 后 sanitizePathComponent(null) 会 NPE）。
-        String fallback = service.getTaskListId();
+        // [S1-T11] 无参重载已删除 ⇒ 此处的「无会话上下文」改为显式传 null
+        //   （该分支前提本就是「调用方确实无会话」，与旧无参重载逐字等价）。
+        String fallback = service.getTaskListId(null, null);
         assertThat(fallback).isNotBlank().isNotEqualTo("tasklist");
-        assertThat(service.getTaskListId()).as("进程级会话 UUID 应进程内稳定").isEqualTo(fallback);
+        assertThat(service.getTaskListId(null, null)).as("进程级会话 UUID 应进程内稳定").isEqualTo(fallback);
 
         // 显式会话形参（优先级 6，getSessionId() 当前会话等价物）> 进程级 UUID
         // [批 3c] 该级原读裸 MDC 的会话槽（已删除）⇒ 现按形参显式传入本测试的会话变量。

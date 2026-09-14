@@ -816,7 +816,11 @@ public class WebSearchTool implements Tool {
                     List.of(),   // agents — []
                     Boolean.FALSE, // hasAppendSystemPrompt — false
                     List.of(),   // mcpTools — []
-                    isNonInteractive, com.nexusai.application.agent.subagent.AgentContext.getAgentContext()); // isNonInteractiveSession 透传
+                    isNonInteractive,
+                    // [S1-T7] agent 归因上下文 = **本工具形参 ctx 的显式字段**（工具执行线程上
+                    //   ThreadLocal 不可达；两套载体收口到 TUC 单一来源）。null → 等价 CC
+                    //   agentContext.ts:170 无 invokingRequestId。
+                    ctx != null ? ctx.agentContext() : null);
             String summary = llmProviderFactory.getProvider(resolved.config(), resolved.providerType())
                     .chatWithOptions(resolved.config(), modelName, SUMMARY_SYSTEM_PROMPT,
                             buildSummaryUserPrompt(query, hits), options);

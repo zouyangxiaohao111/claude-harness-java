@@ -98,10 +98,10 @@ public record ModelRequest(
     //   services/api/logging.ts:294/:461 {@code consumeInvokingRequestId()} 读 ambient context）。
     //
     // WHY 必须显式（本批根因）：CC 的 ALS 跨异步自动传播 invokingRequestId 到 terminal API event；
-    //   Java 的 AgentContext.STORAGE 是 plain ThreadLocal，而 provider 的 emitApiTerminalEvent
+    //   Java 侧归因上下文曾是 plain ThreadLocal 载体，而 provider 的 emitApiTerminalEvent
     //   跑在 LlmAgentLoop.STREAM_EXECUTOR 虚拟线程（LlmAgentLoop:6604）→ 恒读不到 →
     //   invokingRequestId 生产恒空（12 个发射点全中）。修法 = 在上下文仍有效的线程（子代理
-    //   query loop 线程，SubagentExecutor:2003 runWithAgentContext 作用域内）取出实例，
+    //   query loop 线程，即归因上下文仍有效的线程）取出实例，
     //   经本字段 → ModelCaller → LlmProvider.stream 显式下传。
     //
     // 稀疏边语义（agentContext.ts:159-161）：本实例携带的 AtomicBoolean invocationEmitted

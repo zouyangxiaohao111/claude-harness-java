@@ -396,7 +396,11 @@ public class TaskCreateTool extends AbstractTaskTool {
         String taskId;
         try {
             // 逐次动态解析列表 ID（对齐 CC TaskCreateTool.ts:81 createTask(getTaskListId(), ...)）
-            String listId = TaskService.getTaskListId();
+            // [S1-T11] 会话/身份**显式**取自本工具形参 ctx（原无参重载已删除——它无会话来源，
+            //   只能回退全进程共享 UUID，多会话 JVM 下任务会落到别的会话的列表目录）。
+            String listId = TaskService.getTaskListId(
+                ctx != null ? ctx.sessionId() : null,
+                ctx != null ? ctx.teammateIdentity() : null);
             if (log.isDebugEnabled()) {
                 log.debug("TaskCreate 解析列表 ID {}，创建任务", listId);
             }
@@ -479,7 +483,10 @@ public class TaskCreateTool extends AbstractTaskTool {
             // CC: await deleteTask(getTaskListId(), taskId); throw new Error(blockingErrors.join('\n'))
             // Java 用 ToolResult.error 通道承载 CC throw（isError=true）。
             // 逐次动态解析列表 ID（对齐 CC TaskCreateTool.ts:111 deleteTask(getTaskListId(), taskId)）
-            taskPersistence.deleteTask(TaskService.getTaskListId(), taskId);
+            // [S1-T11] 同 :399：会话/身份显式取自 ctx（无参重载已删除）。
+            taskPersistence.deleteTask(TaskService.getTaskListId(
+                ctx != null ? ctx.sessionId() : null,
+                ctx != null ? ctx.teammateIdentity() : null), taskId);
             return ToolResult.error(call.id(), String.join("\n", blockingErrors));
         }
 

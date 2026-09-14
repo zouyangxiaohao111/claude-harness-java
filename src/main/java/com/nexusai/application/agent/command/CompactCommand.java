@@ -262,7 +262,7 @@ public final class CompactCommand {
                         ctx.notifyCompaction().run();
                     }
                     PostCompactionState.markPostCompaction(ctx.sessionId());
-                    CompactWarningState.suppressCompactWarning(ctx.warningPushContext());
+                    CompactWarningState.suppressCompactWarning(ctx.sessionId(), ctx.warningPushContext());
                     log.info("[CompactCommand] SM 优先压缩成功: session={} agent={} preTokens={}",
                         ctx.sessionId(), ctx.agentId(), smResult.preCompactTokenCount());
                     return new CompactCommandResult(smResult, buildDisplayText(ctx, null));
@@ -301,7 +301,7 @@ public final class CompactCommand {
                 // getUserContext.cache.clear + runPostCompactCleanup。
                 // [sm-cursor-sessionize P0-2] 只清本会话游标（旧 static volatile 语义跨会话清空）
                 SessionMemoryService.setLastSummarizedMessageId(ctx.sessionId(), null);
-                CompactWarningState.suppressCompactWarning(ctx.warningPushContext());
+                CompactWarningState.suppressCompactWarning(ctx.sessionId(), ctx.warningPushContext());
                 ctx.clearUserContextCache().run();
                 // [IMP2-02] 无参门：runPostCompactCleanup()（compact.ts:118 无参调用）
                 // → gate=TRUE 全执行（旧实现传 "compact" → gate=false → 缓存残留）。
@@ -556,7 +556,7 @@ public final class CompactCommand {
             // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
                     //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
                     PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
-            CompactWarningState.suppressCompactWarning(ctx.warningPushContext());
+            CompactWarningState.suppressCompactWarning(ctx.sessionId(), ctx.warningPushContext());
             ctx.clearUserContextCache().run();
 
             // combinedMessage（compact.ts:209-212）

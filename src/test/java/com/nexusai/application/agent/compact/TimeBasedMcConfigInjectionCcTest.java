@@ -45,7 +45,7 @@ class TimeBasedMcConfigInjectionCcTest {
         MicroCompactor.setCachedMicrocompactEnabled(false);
         MicroCompactor.setNowForTest(0L);
         MicroCompactor.resetMicrocompactState(SESSION);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
     }
 
     // ─────────────────────── 消息构造 ───────────────────────

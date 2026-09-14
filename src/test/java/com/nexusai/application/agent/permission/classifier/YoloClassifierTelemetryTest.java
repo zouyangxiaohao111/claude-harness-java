@@ -621,8 +621,6 @@ class YoloClassifierTelemetryTest {
     void classifyOneStage_agentContext_crossesCommonPoolWorker() throws Exception {
         AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
         AtomicReference<String> threadName = new AtomicReference<>();
-        AtomicReference<com.nexusai.application.agent.subagent.AgentContext> onWorkerThread =
-            new AtomicReference<>();
         LlmProvider fake = new FakeLlmProvider() {
             @Override
             public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
@@ -630,9 +628,8 @@ class YoloClassifierTelemetryTest {
                                                            LlmProvider.ChatRequestOptions options) {
                 captured.set(options);
                 threadName.set(Thread.currentThread().getName());
-                // worker 线程上 ambient AgentContext 必须为 null（值只来自显式载体）
-                onWorkerThread.set(
-                    com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+                // [S1-T7-2] ambient 归因载体已整体删除 ⇒ 「worker 线程读不到 ambient」由**编译期**保证
+                //   （无该 API 可调）+ T19 守卫（断言载体在 main 彻底不存在），无需也无法在运行期断言。
                 JsonNode input = new ObjectMapper().createObjectNode()
                     .put("thinking", "read-only")
                     .put("shouldBlock", false)
@@ -650,10 +647,6 @@ class YoloClassifierTelemetryTest {
                 "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_1", "spawn");
         ToolUseContext stampedTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x")
             .withAgentContext(subCtx);
-        assertThat(com.nexusai.application.agent.subagent.AgentContext.getAgentContext())
-            .as("前置：测试线程 ambient 无 AgentContext（否则本条无鉴别力）")
-            .isNull();
-
         // ── 读取端：真实 classify 内部经 commonPool worker 读显式载体 ──
         String testThread = Thread.currentThread().getName();
         classifier.classify("Bash", new ObjectMapper().createObjectNode().put("command", "ls -la"),
@@ -663,9 +656,6 @@ class YoloClassifierTelemetryTest {
         assertThat(threadName.get())
             .as("读取发生在**派生线程**（commonPool）而非测试线程——证明跨线程携带")
             .isNotEqualTo(testThread);
-        assertThat(onWorkerThread.get())
-            .as("worker 线程 ambient AgentContext 恒 null（plain ThreadLocal 不跨线程，本改造的根因）")
-            .isNull();
         assertThat(captured.get().agentContext())
             .as("provider 收到的是 TUC 上盖的**同一实例**（sparse-edge 语义要求共享 emitted 标记）")
             .isSameAs(subCtx);
@@ -694,26 +684,17 @@ class YoloClassifierTelemetryTest {
             }
         };
         YoloClassifierImpl classifier = newClassifierOneStage(fake);
-        com.nexusai.application.agent.subagent.AgentContext.SubagentContext ambient =
-            new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
-                "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_1", "spawn");
         ToolUseContext plainTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x");   // 未盖章
 
-        // 提交线程 ambient 有值 → 旧实现（闭包内读 ThreadLocal）会读到它；新实现必须读不到。
-        com.nexusai.application.agent.subagent.AgentContext.runWithAgentContext(ambient, () -> {
-            try {
-                classifier.classify("Bash",
-                    new ObjectMapper().createObjectNode().put("command", "ls -la"),
-                    List.of(), plainTuc).get(10, TimeUnit.SECONDS);
-            } catch (Exception e) {
-                throw new AssertionError(e);
-            }
-            return null;
-        });
+        // [S1-T7-2] 改锚：原用「提交线程 ambient 有值」构造负向对照，但 ambient 载体已整体删除
+        //   ⇒ 该场景不可构造（无 API 可设）。保留仍然可证伪的核心断言：TUC 未盖章 ⇒ provider 收到 null。
+        classifier.classify("Bash",
+            new ObjectMapper().createObjectNode().put("command", "ls -la"),
+            List.of(), plainTuc).get(10, TimeUnit.SECONDS);
 
         assertThat(captured.get()).isNotNull();
         assertThat(captured.get().agentContext())
-            .as("未盖章 ⇒ null（值只来自显式载体；不读提交线程 ambient ThreadLocal）")
+            .as("未盖章 ⇒ null（值只来自 TUC 显式载体，不存在其他来源）")
             .isNull();
     }
 

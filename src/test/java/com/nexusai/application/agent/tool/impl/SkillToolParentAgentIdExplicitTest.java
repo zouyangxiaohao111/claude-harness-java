@@ -33,7 +33,7 @@ import static org.mockito.Mockito.verify;
  *
  * <p><b>缺陷（R2 实证）</b>：本工具经 {@code StreamingToolExecutor:1296} 的 tool-exec
  * fixed-8 池执行（该执行器只回放 MDC + projectRoot，<b>不</b>回放 {@code AgentContext}），
- * 而旧实现 {@code resolveParentAgentId()} 读 {@link AgentContext#getAgentContext()} ThreadLocal
+ * 而旧实现 {@code resolveParentAgentId()} 读已删除的 ambient 归因 ThreadLocal
  * ⇒ 池线程恒 null ⇒ {@code parent_agent_id} <b>生产永不下发</b>。
  *
  * <p><b>修法</b>：取值源改显式参数 {@link ToolUseContext#agentId()}（工具执行闭包
@@ -70,8 +70,8 @@ class SkillToolParentAgentIdExplicitTest {
         if (pool != null) {
             pool.shutdownNow();
         }
-        // 防 ThreadLocal 串台：本测试仅在诱饵用例内注册 AgentContext（runWithAgentContext 作用域自动还原）
-        assertThat(AgentContext.getAgentContext()).as("测试线程不得残留 AgentContext").isNull();
+        // [S1-T7-2] 原「测试线程不得残留 AgentContext」断言随 ambient 归因载体整体删除而移除
+        //   （编译期保证：已无 ambient 读取 API，无残留可言）。
     }
 
     /** 真实池线程（模拟 tool-exec fixed-8 池）· 单线程便于断言线程身份。 */
@@ -166,55 +166,18 @@ class SkillToolParentAgentIdExplicitTest {
 
         ToolUseContext tuc = ToolUseContext.of(
             AgentContext.packAgentId(EXPLICIT_AGENT_HEX), newSessionId());
-        AtomicReference<AgentContext> seen = new AtomicReference<>();
 
-        runOnPoolThread(newToolExecPool(), () -> {
-            seen.set(AgentContext.getAgentContext());   // 无回放 → 期望 null
-            tool.execute(skillBlock("explicit-skill"), tuc);
-        });
+        runOnPoolThread(newToolExecPool(), () -> tool.execute(skillBlock("explicit-skill"), tuc));
 
-        assertThat(seen.get()).as("池线程上不得存在 AgentContext（无回放）").isNull();
+        // [S1-T7-2] 原「池线程上不得存在 AgentContext（无回放）」断言随载体整体删除而移除
+        //   （编译期保证：无 ambient 读取 API）。
         var captor = invocationCaptor();
         verify(telemetry).recordEvent(eq("tengu_skill_tool_invocation"), captor.capture());
         assertThat(captured(captor))
-            .as("显式传参生效：ThreadLocal 为空但 parent_agent_id 非空")
+            .as("显式传参生效：无 ambient 载体可读，但 parent_agent_id 由显式 ctx 下发")
             .containsEntry("parent_agent_id", EXPLICIT_AGENT_HEX);
     }
 
-    // ══════════════════════════════════════════════════════════════════════
-    // #2 诱饵 AgentContext → 显式参数胜出（证明取值源不是 ThreadLocal）
-    // ══════════════════════════════════════════════════════════════════════
-
-    @Test
-    @DisplayName("池线程存在诱饵 AgentContext → parent_agent_id 取显式 ctx（≠ 诱饵 · 证明非 ThreadLocal 源）")
-    void poolThreadWithDecoyAgentContext_explicitCtxWins() throws Exception {
-        // WHY: 反向对照 · 若实现退回「读当前线程 AgentContext」，本用例会取到诱饵 id 而变红。
-        //   该断言同时排除「ThreadLocal 读」与「恒空/硬编码」两种假绿。
-        SkillToolImpl tool = new SkillToolImpl(new SingleCommandRegistry(List.of(skill("explicit-skill"))));
-        Telemetry telemetry = spy(new Telemetry());
-        tool.setTelemetry(telemetry);
-
-        ToolUseContext tuc = ToolUseContext.of(
-            AgentContext.packAgentId(EXPLICIT_AGENT_HEX), newSessionId());
-        AgentContext decoy = new AgentContext.SubagentContext(
-            DECOY_AGENT_HEX, null, "DecoyAgent", true, null, null);
-        AtomicReference<AgentContext> seen = new AtomicReference<>();
-
-        runOnPoolThread(newToolExecPool(), () ->
-            AgentContext.runWithAgentContext(decoy, () -> {
-                seen.set(AgentContext.getAgentContext());   // 诱饵在本线程可见 → 旧实现会读到它
-                tool.execute(skillBlock("explicit-skill"), tuc);
-            }));
-
-        assertThat(seen.get()).as("诱饵已生效（同线程可见）").isSameAs(decoy);
-        var captor = invocationCaptor();
-        verify(telemetry).recordEvent(eq("tengu_skill_tool_invocation"), captor.capture());
-        Map<String, Object> attrs = captured(captor);
-        assertThat(attrs)
-            .as("显式参数胜出（= ctx.agentId()），而非诱饵（ThreadLocal 值）")
-            .containsEntry("parent_agent_id", EXPLICIT_AGENT_HEX);
-        assertThat(attrs).doesNotContainValue(DECOY_AGENT_HEX);
-    }
 
     // ══════════════════════════════════════════════════════════════════════
     // #3 主线程语义（ctx.agentId()==null）→ 字段省略

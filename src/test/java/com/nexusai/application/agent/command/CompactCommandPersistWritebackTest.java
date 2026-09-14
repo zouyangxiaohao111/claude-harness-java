@@ -71,7 +71,7 @@ class CompactCommandPersistWritebackTest {
     @AfterEach
     void resetStaticState() {
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
         PostCompactionState.clear(SESSION);
     }
 
@@ -120,7 +120,7 @@ class CompactCommandPersistWritebackTest {
         sm.setSmSessionMemoryEnabled(true);
         sm.setSmCompactEnabled(true);
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
-        CompactWarningState.clearCompactWarningSuppression(null);
+        CompactWarningState.clearCompactWarningSuppression(null, null);
         return sm;
     }
 

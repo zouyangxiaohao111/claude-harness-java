@@ -158,15 +158,13 @@ public class AutoCompactor {
      * {@link com.nexusai.application.agent.QuerySource#isBackgroundForkSource}
      * （+ extract_memories / auto_dream）—— 后两者今天不走主循环（E-1b 才收敛），现网行为零变化。
      *
-     * <p><b>[P1a F-08 · 单例可变会话字段]</b>本字段<b>只服务便捷重载</b>
-     * （{@link #tryAutoCompact(List, int)} → {@link #buildDefaultCompactConversationContext}）；
-     * 生产路径（LlmAgentLoop → {@link #autoCompactIfNeeded(List, int, String, CompactConversationContext, AutoCompactTrackingState)}）
-     * 的 querySource 已在调用内归一为局部变量 {@code effQuerySource}，<b>不再写回本字段</b>
-     * （旧实现在该处 {@code this.querySource = …}，是单例实例字段承载调用级会话态 ⇒
-     * A 会话的调用会把 querySource 留在字段上供 B 会话的回落路径误读）。默认 'user'（主线程）。
+     * <p><b>[S1 轨 III · T9 2026-09-14] 原 {@code private String querySource = "user"} 字段与
+     * {@code setQuerySource} 已删除</b>：生产 0 写入方（grep 全仓：仅测试文案命中；同文件
+     * {@code autoCompactIfNeeded} 的 querySource 早已是调用内局部变量 {@code effQuerySource}），
+     * 唯一读取点是便捷重载 {@link #tryAutoCompact(List, int)} 的回落实参 ⇒ 改传字面量 "user"
+     * （与字段默认值逐字等价，零行为变化）。CC 侧 querySource 是<b>函数形参</b>、无 per-instance
+     * 状态 ⇒ 无「保留对应物」可留。
      */
-    private String querySource = "user";
-
     /** SessionMemoryService · SM 优先路径消费方（D-11 SESSION_MEMORY 接线）。null = 无 SM 优先。 */
     private SessionMemoryService sessionMemoryService;
 
@@ -219,11 +217,11 @@ public class AutoCompactor {
     /** env 读取器 · 可注入便于测试（默认 System::getenv）。 */
     private Function<String, String> envProvider = System::getenv;
 
-    /** 会话 ID · SM 成功链 markPostCompaction 用（可 null → PostCompactionState 默认 key）。 */
-    private String sessionId;
-
-    /** agent ID · SM 成功链 notifyCompaction 用。 */
-    private String agentId;
+    // [S1 轨 III · T9 2026-09-14] 原 `private String sessionId` / `private String agentId` 已删除：
+    //   生产 0 写入方（grep 全仓：AutoCompactor.setSessionId/setAgentId 无生产调用点，仅测试调），
+    //   唯一读取点是 buildDefaultCompactConversationContext 的回落分支 ⇒ 两字段生产恒 null
+    //   （该分支代码自陈「SM 压缩生产不可达」）。删除后回落分支不再填这两项 ⇒ 与删除前**逐字等价**
+    //   （删除前填的也是 null）。生产 sessionId/agentId 由 LlmAgentLoop 的 ccContext 显式携带。
 
     /**
      * SM 成功链 runPostCompactCleanup 执行器 · CC original: runPostCompactCleanup(querySource)
@@ -290,14 +288,12 @@ public class AutoCompactor {
      * （concern B N/A）；测试可注入假实现。
      */
     private PlanProvider planProvider;
-    /**
-     * [RV-E-01 GAP-03 兜底] 会话工具使用上下文 · CC original: {@code context}
-     * （compact.ts:285）。auto 路径 ccContext==null 回落
-     * {@link #buildDefaultCompactConversationContext(String, String)} 时，经 {@link #prepareAutoContext}
-     * 把本字段接线进 ctx.toolUseContext，使 isInPlanMode() 读真实 plan mode →
-     * populatePlanModeAttachment 生产可达（与 buildAutoContext 主路径对称）。
-     */
-    private ToolUseContext toolUseContext;
+    // [S1 轨 III · T9 2026-09-14] 原 `private ToolUseContext toolUseContext` 与 setToolUseContext
+    //   已删除：生产 0 写入方（唯一调用点是测试 PlanModeCompactContextWiringTest）。
+    //   生产 plan mode 读侧的**唯一**来源是主路径
+    //   （{@code ccCtx.setToolUseContext(params.toolUseContext())}，LlmAgentLoop:5723 —— 该调用写的是
+    //   CompactConversationContext，**不是**本类字段；本类字段此前被误当成它的接线点，
+    //   是「注释与代码不一致」的又一例）。删除后回落分支不再有 plan mode 读侧（原本也恒 null）。
 
     /**
      * [MF2-3] 设置会话 AgentState 注册表（幂等）· 供测试/手动接线显式注入。
@@ -329,18 +325,6 @@ public class AutoCompactor {
     }
 
     /**
-     * [RV-E-01 GAP-03 兜底] 设置会话工具使用上下文（幂等）· 供 tryAutoCompact（ccContext==null）
-     * 回落路径把 plan mode 读侧接线进默认上下文。
-     *
-     * @param toolUseContext 会话工具使用上下文（null → plan mode 读侧跳过，安全降级）
-     */
-    public void setToolUseContext(ToolUseContext toolUseContext) {
-        this.toolUseContext = toolUseContext;
-        log.info("[AutoCompactor] ToolUseContext 注入状态: {}",
-            toolUseContext != null ? "已注入" : "未注入");
-    }
-
-    /**
      * 构造自动压缩器
      *
      * @param tokenCounter    Token 计数器
@@ -362,11 +346,6 @@ public class AutoCompactor {
     // ════════════════════════════════════════════════════════════════════
     // IMP-07 新增 CC 对齐 setter
     // ════════════════════════════════════════════════════════════════════
-
-    /** 设置递归守卫 querySource（CC autoCompact.ts:163）。 */
-    public void setQuerySource(String querySource) {
-        this.querySource = querySource != null ? querySource : "user";
-    }
 
     /** 注入 SessionMemoryService · SM 优先路径（D-11 SESSION_MEMORY 接线）。 */
     public void setSessionMemoryService(SessionMemoryService sessionMemoryService) {
@@ -450,16 +429,6 @@ public class AutoCompactor {
     /** 注入 env 读取器（测试可注入 mock）。 */
     public void setEnvProvider(Function<String, String> envProvider) {
         this.envProvider = envProvider != null ? envProvider : System::getenv;
-    }
-
-    /** 设置会话 ID（SM 成功链 markPostCompaction 用）。 */
-    public void setSessionId(String sessionId) {
-        this.sessionId = sessionId;
-    }
-
-    /** 设置 agent ID（SM 成功链 notifyCompaction 用）。 */
-    public void setAgentId(String agentId) {
-        this.agentId = agentId;
     }
 
     /**
@@ -837,14 +806,12 @@ public class AutoCompactor {
         //   fallbackModel 改写 query.ts:922）；ccContext 为 null（便捷重载）→ null = 默认窗口。
         String model = ccContext != null ? ccContext.getModel() : null;
         // [FIX-SM] SM 压缩生产 sessionId/agentId 必须从 ccContext 取（LlmAgentLoop:2500-2501
-        //   buildAutoContext 已把 params.toolUseContext() 的 sessionId/agentId 注入上下文）——
-        //   此前 AutoCompactor 实例字段恒 null（生产无 setter 调用），SM 读 null 文件回落 legacy，
-        //   SM 压缩生产不可达。ccContext 缺值回落实例字段（测试 setSessionId/setAgentId 依赖，
-        //   AutoCompactorCcContractTest:202-203/233）。
-        String effSessionId = ccContext != null && ccContext.getSessionId() != null
-            ? ccContext.getSessionId() : this.sessionId;
-        String effAgentId = ccContext != null && ccContext.getAgentId() != null
-            ? ccContext.getAgentId() : this.agentId;
+        //   buildAutoContext 已把 params.toolUseContext() 的 sessionId/agentId 注入上下文）。
+        // [S1 轨 III · T9 2026-09-14] 原「ccContext 缺值回落实例字段」已删——那两字段生产 0 写入方
+        //   （恒 null）⇒ 回落分支等价于直接 null；现显式写 null ⇒ ccContext 缺值时 SM 读 null 文件
+        //   回落 legacy（与删除前逐字等价），且调用方已在 :928 一带收到 ≥WARN。
+        String effSessionId = ccContext != null ? ccContext.getSessionId() : null;
+        String effAgentId = ccContext != null ? ccContext.getAgentId() : null;
 
         // ── 1. DISABLE_COMPACT 早退（autoCompact.ts:253-255）──
         // [DB 主控] DB settings.disable_compact 有值直接生效（true=早退；false=放行覆盖 env）；
@@ -927,6 +894,16 @@ public class AutoCompactor {
 
         try {
             // ── 5. [GR-1] CC 单函数 compactConversation（autoCompact.ts:313-321，消除双轨）──
+            // [S1 轨 III · T9] ccContext 缺值 ⇒ 回落默认上下文并 **≥WARN**（禁静默 null）：
+            //   回落 ctx 不再携带 sessionId/agentId/toolUseContext（原 AutoCompactor 单例字段已删）
+            //   ⇒ 调用方若走此路径必须接受「无会话标识的压缩」。生产路径恒有 ccContext
+            //   （LlmAgentLoop:5713 buildAutoContext）。
+            if (ccContext == null) {
+                log.warn("[AutoCompactor] autoCompactIfNeeded: ccContext 缺值 → 回落"
+                    + " buildDefaultCompactConversationContext（该 ctx 无 sessionId/agentId/toolUseContext；"
+                    + "生产路径恒有 ccContext，本路径仅便捷重载/测试可达）model={} querySource={}",
+                    model, effQuerySource);
+            }
             CompactConversationContext ctx = ccContext != null ? ccContext
                 : buildDefaultCompactConversationContext(model, effQuerySource);
             prepareAutoContext(ctx);
@@ -1033,7 +1010,8 @@ public class AutoCompactor {
      * @return 压缩结果
      */
     public AutoCompactResult tryAutoCompact(List<ChatMessageDto> messages, int snipTokensFreed) {
-        AutoCompactResult result = autoCompactIfNeeded(messages, snipTokensFreed, this.querySource, null);
+        // [T9] 原传 this.querySource（字段已删）→ 传其默认值字面量（逐字等价）
+        AutoCompactResult result = autoCompactIfNeeded(messages, snipTokensFreed, "user", null);
         // [IMP-A4-3 · OPD-CM5-A-31] Java 便捷重载承担 CC 调用方写回职责（query.ts:536-542）：
         //   autoCompactIfNeeded 失败路径经返回值承载 nextFailures，由本方法（作为该路径的调用方）
         //   写回 tracking——保证便捷路径（测试/手动接线）熔断计数持续累计，与生产 LlmAgentLoop
@@ -1089,26 +1067,20 @@ public class AutoCompactor {
      * （见 {@link #querySource} 字段注释）。
      *
      * <p><b>会话字段（S-route 残差）</b>：{@code sessionId}/{@code agentId} 仍回落实例字段
-     * （S 路线保留 · 测试 seam 依赖）；本方法仅便捷路径可达，生产路径恒有 ccContext
-     * （LlmAgentLoop:5713 传 {@code buildAutoContext} 构建的上下文）⇒ 该回落不参与生产。
+     * <p><b>[S1 轨 III · T9 2026-09-14] 本方法不再填 sessionId/agentId/toolUseContext</b>：
+     * 那三项原读 AutoCompactor 的单例字段（生产 0 写入方 ⇒ 恒 null）。删除后本回落 ctx 的这三项
+     * 保持 CompactConversationContext 默认（null），与删除前**逐字等价**。调用方（仅便捷重载 /
+     * 测试）如需这三项，只能走 {@code ccContext}（LlmAgentLoop:5713 {@code buildAutoContext}）显式接线。
      *
      * @param model       有效模型名（null → 默认窗口）
      * @param querySource 本调用的查询来源（调用内已归一，非 null）
      */
     CompactConversationContext buildDefaultCompactConversationContext(String model, String querySource) {
         CompactConversationContext ctx = new CompactConversationContext()
-            .setSessionId(this.sessionId)
-            .setAgentId(this.agentId)
             .setModel(model)
             .setQuerySource(querySource)
             .setReadFileState(new LinkedHashMap<>());
         wireAutoNotifyCompaction(ctx);
-        // [RV-E-01 GAP-03 兜底] ccContext==null 回落路径接线 plan mode 读侧（对齐 CC compact.ts:285
-        //   context 持有 toolUseContext），使 isInPlanMode() 读真实 plan mode → populatePlanModeAttachment
-        //   生产可达（此前回落路径 toolUseContext 恒 null → isInPlanMode 恒 false）。
-        if (this.toolUseContext != null) {
-            ctx.setToolUseContext(this.toolUseContext);
-        }
         return ctx;
     }
 
@@ -1134,12 +1106,9 @@ public class AutoCompactor {
                 }
             });
         }
-        // [RV-E-01 GAP-03 兜底] ccContext==null（tryAutoCompact 回落）时，若 ctx 未显式接线
-        //   toolUseContext，用本压缩器注入的 toolUseContext 兜底（对齐 CC compact.ts:285 context
-        //   持有 toolUseContext）。buildAutoContext 主路径已显式接线时此处 no-op（幂等）。
-        if (ctx.getToolUseContext() == null && this.toolUseContext != null) {
-            ctx.setToolUseContext(this.toolUseContext);
-        }
+        // [S1 轨 III · T9 2026-09-14] 原「用本压缩器注入的 toolUseContext 兜底」已删除：
+        //   兜底源（AutoCompactor.toolUseContext 字段）生产 0 写入方 ⇒ 恒 null ⇒ 该兜底此前永远 no-op。
+        //   toolUseContext 的唯一生产来源是主路径（LlmAgentLoop:5723 对 ccContext 显式接线）。
         // [IMP-CM-12] f4 全量路径 notifyCompaction 接线（CC compact.ts:698-699 feature 门控）·
         //   buildAutoContext（生产 per-session ctx，CompactConversation.java:423）不接线
         //   notifyCompaction → 生产全量路径恒 no-op（全局报告 §5 #1）。auto 路径统一在此接线

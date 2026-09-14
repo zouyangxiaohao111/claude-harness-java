@@ -9,7 +9,7 @@ import com.nexusai.application.agent.permission.hook.HookEvent;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.query.QueryConfig;
 import com.nexusai.application.agent.query.TokenBudgetChecker;
-import com.nexusai.application.agent.team.Teammate;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.Notification;
 import com.nexusai.application.agent.tool.ToolRegistry;
@@ -65,9 +65,14 @@ import static org.mockito.Mockito.when;
  */
 class LlmAgentLoopStopHookFailureCatchTest {
 
-    @AfterEach
-    void clearTeammateContext() {
-        Teammate.clearDynamicTeamContext();
+    /**
+     * [S1-T13] teammate 身份的**唯一**载体 = ToolUseContext 的显式组件（进程级 dynamicTeamContext
+     * 槽已删除）⇒ 用例经此把身份挂到 TUC 上，与生产
+     * {@code params.toolUseContext().teammateIdentity()} 的读点同源。
+     */
+    private static ToolUseContext withTeammateIdentity(ToolUseContext tuc) {
+        return tuc.withTeammateIdentity(new TeammateIdentity(
+            "a1", "alice", "team1", "blue", false, "p1"));
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -166,10 +171,9 @@ class LlmAgentLoopStopHookFailureCatchTest {
     @Test
     @DisplayName("teammate 段 TeammateIdle hook 抛异常 → catch 兜底，不抛穿 queryLoop，正常退出（NORMAL），用户可见 notification")
     void teammateSectionThrows_isCaughtAtLoopBoundaryAndExitsGracefully() {
-        Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
-            "a1", "alice", "team1", "blue", false, "p1"));
         AtomicReference<Notification> captured = new AtomicReference<>();
-        ToolUseContext baseTuc = tucWithNotification(captured::set);
+        // [S1-T13] teammate 身份挂在 TUC 显式组件上（生产读点 params.toolUseContext().teammateIdentity()）。
+        ToolUseContext baseTuc = withTeammateIdentity(tucWithNotification(captured::set));
 
         LlmProvider provider = Mockito.mock(LlmProvider.class);
         Mockito.doAnswer(inv -> {

@@ -64,7 +64,7 @@ class PostCompactCleanupCcContractTest {
         AutoMemPaths.defaultInstance(),
         new MemoryFileDetection(AutoMemPaths.defaultInstance(), () -> true, () -> true)) {
         @Override
-        public void resetGetMemoryFilesCache(String reason) {
+        public void resetGetMemoryFilesCache(String reason, String sessionId) {
             MEMFILES_RESETS.incrementAndGet();
         }
     };
