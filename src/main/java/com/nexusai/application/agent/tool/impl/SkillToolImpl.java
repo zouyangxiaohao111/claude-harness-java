@@ -1627,10 +1627,22 @@ public class SkillToolImpl implements Tool {
                 // 对齐 CC SkillTool.ts:226-229: runAgent toolUseContext = {...context, getAppState: modifiedGetAppState}
                 //   fork 子代理继承父 ctx (agentId/sessionId/availableTools), 供隔离与工具池;
                 //   不再用随机 UUID 丢弃父 ctx (旧 :338). getAppState 授权链为 P1-18 独立 P-item.
-                ToolUseContext effectiveCtx = ctx != null
-                        ? ctx
-                        // [session-id-short] 兜底 ctx 的 sessionId 统一 short 形态（sess-xxx）
-                        : ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8));
+                // [批 6 伪造 sessionId] 原 `ctx == null ⇒ ToolUseContext.of(randomUUID, "sess-"+random8)` 兜底
+                //   已删除 —— 实测该分支**不可达**（批 6 探查，证据）：
+                //   - `ctx == null` 只可能来自 1 参 `execute(ToolUseBlock)`（:1374-1377 显式传 null），
+                //     而全仓 `src/main` 唯一的单参 `Tool.execute(block)` 调用点是
+                //     `PromptShellExecutor:287`（只解析 powerShell/bash 工具，永远到不了 SkillToolImpl）；
+                //   - 生产 fork 分派必经 `StreamingToolExecutor:2008` 3 参 或 `ToolRegistry:813` 2 参，
+                //     两者均传非 null ctx；`src/test` 亦 0 个单参调用点。
+                //   ⛔ 不得回落伪造会话键（它会让 fork 子代理继承一个「看起来合法」的假 sessionId）：
+                //      真走到这里说明上下文通道断了 ⇒ fail-loud（与下方 :1611 subagentExecutor==null 同款）。
+                if (ctx == null) {
+                    throw new IllegalStateException(
+                        "SkillTool fork 模式需要 ToolUseContext（fork 子代理需继承父 agentId/sessionId/"
+                            + "availableTools，CC SkillTool.ts:226-229）: skill='" + skillName + "'。"
+                            + "⛔ 不得回落伪造 sessionId。");
+                }
+                ToolUseContext effectiveCtx = ctx;
                 // 对齐 CC forkedAgent.ts:224: promptMessages = [createUserMessage({content: skillContent})]
                 //   fork 子代理收到的用户消息 = 技能内容 (untagged, getPromptForCommand 输出), 非用户 args
                 //   (旧 :340 传 args 是 BUG). content 变量 = :307 withBaseDirPrefix+substituteArguments 后的

@@ -32,6 +32,7 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * IMP-18 · RunForkedAgent/CacheSafeParams 单测 · 对齐 CC
@@ -52,6 +53,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 class RunForkedAgentTest {
 
     private static final String MODEL = "claude-sonnet-4-20250514";
+
+    /** [批 6] 测试用真实形态会话键（带 sess- 前缀，模拟生产会话 id）。 */
+    private static final String TEST_FORK_SESSION_ID = "sess-b6fork01";
 
     /** boundary 标记 · CC original: {@code SYSTEM_PROMPT_DYNAMIC_BOUNDARY}
      *  (Open-ClaudeCode/src/constants/prompts.ts:114-115,573)。 */
@@ -156,6 +160,35 @@ class RunForkedAgentTest {
         assertThat(cs.forkContextMessages()).isEmpty();
     }
 
+    /**
+     * [批 6 伪造 sessionId] 无父上下文 ⇒ fail-loud，⛔ 不再伪造 {@code "sess-"+UUID}。
+     *
+     * <p><b>WHY（第一红线 · 不许静默失效）</b>：原实现 {@code parent == null} 时现造
+     * {@code ToolUseContext.of(UUID.randomUUID(), "sess-"+random8)}。该分支**不可达**
+     * （{@code CacheSafeParams} 紧凑构造器 :101-104 对 {@code toolUseContext==null} 直接抛
+     * ⇒ 唯一调用点 :229-230 传 {@code cs.toolUseContext()} 恒非 null；CC 真源
+     * {@code forkedAgent.ts:342-345 createSubagentContext(parentContext, overrides)} 亦**无**
+     * null-parent 分支，直接解引用 parentContext）。改为显式抛：将来契约若被破坏，
+     * 立即暴露，而不是静默喂出一个「看起来合法」的假会话键。
+     *
+     * <p><b>正向对照</b>：非 null 父 ⇒ 正常返回并**继承父会话 ID**（证明上面的 throw
+     * 不是「方法整体坏了」造成的恒红）。
+     */
+    @Test
+    @DisplayName("[批 6] createIsolatedContext: parent=null ⇒ 抛（不伪造 sessionId）；有父 ⇒ 继承父会话")
+    void createIsolatedContext_nullParent_failsLoudInsteadOfFabricating() {
+        assertThatThrownBy(() -> RunForkedAgent.createIsolatedContext(null, new AbortController(), null))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("parent ToolUseContext is null");
+
+        ToolUseContext parent = baseContext();
+        ToolUseContext isolated =
+            RunForkedAgent.createIsolatedContext(parent, new AbortController(), null);
+        assertThat(isolated.sessionId())
+            .as("隔离 fork 上下文必须继承父会话 ID（而非现造随机键）")
+            .isEqualTo(parent.sessionId());
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // RES-C5 · createMinimalCacheSafeParams 兜底填真实 systemPrompt + gate
     // ════════════════════════════════════════════════════════════════════
@@ -173,13 +206,16 @@ class RunForkedAgentTest {
             "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", "dynamic-suffix");
 
         CacheSafeParams cs = RunForkedAgent.createMinimalCacheSafeParams(
-            forkMsgs, sysPrompt, Map.of("uk", "uv"), Map.of("sk", "sv"), true);
+            forkMsgs, sysPrompt, Map.of("uk", "uv"), Map.of("sk", "sv"), true,
+            TEST_FORK_SESSION_ID);   // [批 6] 新增第 6 参 = 真实会话 id
 
         assertThat(cs.systemPrompt()).containsExactlyElementsOf(sysPrompt);
         assertThat(cs.userContext()).containsEntry("uk", "uv");
         assertThat(cs.systemContext()).containsEntry("sk", "sv");
         assertThat(cs.forkContextMessages()).isEqualTo(forkMsgs);
         assertThat(cs.useGlobalCacheScope()).isTrue();
+        // [批 6] fork 上下文必须携带**真实**会话 id（不再现造 "sess-"+UUID 假键）
+        assertThat(cs.toolUseContext().sessionId()).isEqualTo(TEST_FORK_SESSION_ID);
     }
 
     @Test
@@ -188,12 +224,41 @@ class RunForkedAgentTest {
         // WHY (规则九): 消费方无主会话 cache-safe 原料时仍兜底 —— null/空 → 原 List.of()
         // 行为保留为异常降级（RES-C5 验收 2），不抛错（CacheSafeParams 紧凑构造 null 兜底）。
         CacheSafeParams cs = RunForkedAgent.createMinimalCacheSafeParams(
-            null, null, null, null, false);
+            null, null, null, null, false, TEST_FORK_SESSION_ID);
         assertThat(cs.systemPrompt()).isEmpty();
         assertThat(cs.userContext()).isEmpty();
         assertThat(cs.systemContext()).isEmpty();
         assertThat(cs.forkContextMessages()).isEmpty();
         assertThat(cs.useGlobalCacheScope()).isFalse();
+    }
+
+    /**
+     * [批 6] 未提供会话 id ⇒ 置显式「确无会话」哨兵，⛔ 不再现造 {@code "sess-"+UUID} 假键。
+     *
+     * <p><b>WHY（第一红线 · 不许静默失效）</b>：旧实现无条件现造假键，该键会经
+     * {@code CacheSafeParams.toolUseContext} 成为 {@code createIsolatedContext} 的 parent ctx
+     * ⇒ fork 的整个工具执行链（cwd 解析 / file-history 备份目录 / SessionFilesRecorder）
+     * 都带一次性假会话键。
+     *
+     * <p><b>正反对照（同一测试内两臂）</b>：负向臂（sessionId=null）⇒ 哨兵且**不是** {@code sess-} 形态；
+     * 正向臂（同方法带真实 id）⇒ 原样透传 —— 证明负向臂不是「方法整体坏了」而绿。
+     */
+    @Test
+    @DisplayName("[批 6] 无会话 ⇒ 哨兵（非 sess- 形态）；有会话 ⇒ 原样透传")
+    void createMinimalCacheSafeParams_noSession_usesSentinelNotFabricatedKey() {
+        CacheSafeParams noSession = RunForkedAgent.createMinimalCacheSafeParams(
+            List.of(), List.of(), Map.of(), Map.of(), false, null);
+        assertThat(noSession.toolUseContext().sessionId())
+            .as("无会话必须用显式哨兵，⛔ 不得是 \"sess-\"+UUID 随机形态")
+            .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION)
+            .doesNotStartWith("sess-");
+        assertThat(com.nexusai.common.SessionKeys.isNoSession(noSession.toolUseContext().sessionId()))
+            .isTrue();
+
+        // 正向对照
+        CacheSafeParams withSession = RunForkedAgent.createMinimalCacheSafeParams(
+            List.of(), List.of(), Map.of(), Map.of(), false, TEST_FORK_SESSION_ID);
+        assertThat(withSession.toolUseContext().sessionId()).isEqualTo(TEST_FORK_SESSION_ID);
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -96,6 +96,7 @@ class InboundMcpToolProviderPermissionTest {
         public AgentToolResult<?> execute(ToolUseBlock call, ToolUseContext ctx) {
             executeCount++;
             executedInput = call.input();
+            lastCtx = ctx;   // [批 6] 捕获入站工具上下文，供哨兵断言
             JsonNode msg = call.input() == null ? null : call.input().get("msg");
             return ToolResult.success(call.id(), "exec:" + (msg == null ? "" : msg.asText()));
         }
@@ -106,6 +107,12 @@ class InboundMcpToolProviderPermissionTest {
 
         JsonNode executedInput() {
             return executedInput;
+        }
+
+        private ToolUseContext lastCtx;
+
+        ToolUseContext lastCtx() {
+            return lastCtx;
         }
     }
 
@@ -259,5 +266,37 @@ class InboundMcpToolProviderPermissionTest {
         ObjectNode node = JSON.createObjectNode();
         node.put("msg", msg);
         return node;
+    }
+
+    /**
+     * [批 6 · 用户裁定 #1] 入站 MCP 的 ToolUseContext.sessionId 必须是显式「确无会话」哨兵，
+     * ⛔ 不再是每次调用现造的 {@code "sess-"+UUID}（形态上「看起来合法」的假会话键）。
+     *
+     * <p><b>WHY（规则九 · 外部系统天然无会话）</b>：入站 MCP 调用由外部 MCP client 发起
+     * （本仓端点是 Spring AI 服务端 {@code protocol=streamable}），结构上不属于任何 nexusai 会话；
+     * CC 真源同构（{@code claude mcp serve} 是独立 stdio 进程，其 TUC 无 sessionId 字段且
+     * {@code getAppState} 返回不含 sessionId 的默认 AppState）。旧假键的代价：被
+     * {@code AutoDreamConsolidator:667} 包含式形态校验当合法会话键、{@code SessionFilesRecorder}
+     * 每次调用新增永不回收的键、file-history 备份目录每次调用新增目录。
+     */
+    @Test
+    @DisplayName("[批 6] 入站 MCP 工具上下文 sessionId = 显式「确无会话」哨兵（非 sess- 形态）")
+    void inboundToolContext_usesNoSessionSentinel() {
+        ProbeTool tool = new ProbeTool("sentinel_probe", allowResult(json("hi")));
+        InboundMcpToolProvider p = provider(tool);
+
+        p.call("{\"msg\":\"hi\"}");
+
+        assertThat(tool.executeCount()).as("allow 规则生效 ⇒ 工具被执行").isEqualTo(1);
+        ToolUseContext ctx = tool.lastCtx();
+        assertThat(ctx).as("execute 必须收到工具上下文").isNotNull();
+        assertThat(ctx.sessionId())
+            .as("入站 MCP 无会话 ⇒ 必须用显式哨兵，⛔ 不得是 \"sess-\"+UUID 随机形态")
+            .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION)
+            .doesNotStartWith("sess-");
+        assertThat(com.nexusai.common.SessionKeys.isNoSession(ctx.sessionId())).isTrue();
+        assertThat(ctx.isNonInteractiveSession())
+            .as("入站保持非交互语义（对齐 CC mcp.ts:112-134）")
+            .isTrue();
     }
 }

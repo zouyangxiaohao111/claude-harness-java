@@ -34,6 +34,9 @@ public class createSubagentContext {
 
     private static final Logger log = LoggerFactory.getLogger(createSubagentContext.class);
 
+    /** [批 6] standalone「确无会话」告警一次性开关（只打印一次，避免子代理风暴淹没日志）。 */
+    private static final AtomicBoolean NO_SESSION_WARNED = new AtomicBoolean(false);
+
     /**
      * Agent 上下文选项 · 对齐 CC runAgent.ts:700-714 agentOptions
      */
@@ -212,12 +215,32 @@ public class createSubagentContext {
         UUID agentId = (overrides != null && overrides.agentId() != null)
             ? overrides.agentId()
             : AgentContext.packAgentId(AgentContext.createAgentId());
-        // sessionId: 父继承或独立生成
-        // [session-id-short] standalone 子代理会话键统一 short 形态（sess-xxx）；该键用作 cwd/
-        // worktree 隔离桶键（非 DB 会话），随机 short 语义合适。子代理 TUC agentId 保持 packed a+16hex。
-        String sessionId = hasParent
-            ? parentToolUseContext.sessionId()
-            : "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        // sessionId: 父继承，或（真无父）显式「确无会话」哨兵
+        // [批 6 2026-09-14 · 用户裁定 #2] 原 standalone 分支现造 `"sess-" + UUID.randomUUID()...` 已删：
+        //   ① 该分支是 **Java 自造**，CC 无对应物 —— CC `createSubagentContext(parentContext, overrides)`
+        //      （forkedAgent.ts:342-351）直接解引用 parentContext，**无 null-parent 分支**；
+        //   ② 实测该分支**只在「确实拿不到会话」时才可达**（证据）：唯一入口 SubagentExecutor:1591，
+        //      其条件 `effectiveParentTuc == null`（:1497）= `parentTucOverride == null && parentToolUseContext == null`；
+        //      而 4 处 SubagentTool 构造点（:2939/:3237/:3374/:3760）的 `parentToolUseContext = parentTUC
+        //      = parentCtx != null ? parentCtx : mainLoop.getCurrentToolUseContext()`
+        //      （:2927-2929；代码注释自述 parentCtx「恒可用且含 sessionId」）⇒ **分支被走 ⟺ parentCtx == null**，
+        //      此刻不存在任何可取的真实会话 id；另两条入口（AutonomousAgentLoop:1159 /
+        //      ClaudeCodeBackendAdapter:290，共用 7 参 ctor = parentToolUseContext 硬编码 null）同样无会话。
+        //   ⇒ 无可显式传参的真实来源 ⇒ 走命名「确无会话」出口（SessionKeys.NO_SESSION）+ ≥WARN，
+        //      ⛔ 不再伪造一个「看起来合法」的会话键（旧值会让 resolveSessionDir / file-history /
+        //      SessionFilesRecorder 把它当真实会话键消费）。
+        String sessionId;
+        if (hasParent) {
+            sessionId = parentToolUseContext.sessionId();
+        } else {
+            sessionId = com.nexusai.common.SessionKeys.NO_SESSION;
+            if (NO_SESSION_WARNED.compareAndSet(false, true)) {
+                log.warn("createSubagentContext.create: 无父上下文（standalone）⇒ sessionId 置显式哨兵 {}"
+                    + "（⛔ 不再现造 \"sess-\"+UUID 假会话键）。本路径确无会话可取：见本段注释的三条入口证据。"
+                    + "下游按无会话语义解析（cwd = 进程 user.dir）（本告警仅打印一次）",
+                    sessionId);
+            }
+        }
 
         // [IMP-SUB-19 #23] IsolationLevel 枚举已删（CC 无隔离枚举，FULL/SHARED 由
         //   shareSetAppState/shareSetResponseLength 标志派生，由 with() 应用）。

@@ -112,6 +112,13 @@ class ToolRegistrationConfigMemoryBeansTest {
             (java.util.function.Supplier<com.nexusai.application.agent.compact.fork.CacheSafeParams>)
                 readField(sm, "cacheSafeParamsSupplier");
         assertThat(smSup.get().toolUseContext()).as("SM 生产 cacheSafeParamsSupplier 携带主线程工具集").isNotNull();
+        // [批 6] 生产 supplier 载荷（buildProductionCacheSafeParams）求值时刻**结构上拿不到会话**
+        //   （形参只有 ToolRegistry）⇒ sessionId 必须是显式「确无会话」哨兵，
+        //   ⛔ 不得是旧实现的 "sess-"+UUID 假会话键（它会成为 fork 的 parent ctx 会话身份）。
+        assertThat(smSup.get().toolUseContext().sessionId())
+            .as("生产 supplier 的 fork 上下文必须用哨兵，⛔ 不得伪造会话键")
+            .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION)
+            .doesNotStartWith("sess-");
 
         // OPD-TP-09: dream task registry 接线（register/addDreamTurn/complete/fail/kill）——
         //   @Bean 注入必须真实生效（非假接线），且 kill 的锁回退 seam 已注入 registry

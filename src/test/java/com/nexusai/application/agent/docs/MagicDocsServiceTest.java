@@ -7,6 +7,7 @@ import com.nexusai.application.agent.tool.FileReadListenerRegistry;
 import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.EditFileTool;
 import com.nexusai.application.agent.tool.impl.ReadFileTool;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -78,7 +79,7 @@ class MagicDocsServiceTest {
         updater = mock(MagicDocUpdater.class);
         // mock updater.updateWithContent 默认返回 SUCCESS+updated 让 service.updateTrackedDocs 不 NPE
         when(updater.updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class)))
+            any(Path.class), any(EditFileTool.class), any(String.class), any()))
             .thenReturn(new MagicDocUpdater.UpdateResult(true, Optional.empty(),
                 MagicDocUpdater.RunState.SUCCESS));
         registry = new FileReadListenerRegistry();
@@ -109,10 +110,28 @@ class MagicDocsServiceTest {
         PostSamplingHookRegistry.clearAll();
     }
 
-    /** 空闲主线程 hook 上下文（无消息）· 门控应全部放行. */
+    /**
+     * [批 6] 测试会话键 · 与生产一致：{@code PostSamplingContext.toolUseContext()} 携带会话
+     * （生产 {@code LlmAgentLoop:7612-7615} 恒传非 null TUC）。
+     *
+     * <p>⭐ 原夹具传的是 {@code null} TUC —— 属「测试夹具掩盖生产契约」：生产永远有工具上下文，
+     * 而 MagicDocUpdater 原先正是靠「拿不到上下文」为理由现造 {@code "sess-"+UUID} 伪造键。
+     * 现按生产形态构造非 null TUC，使「真实会话 ID 显式透传」这条链在测试里可见。
+     */
+    private static final String TEST_SESSION_ID = "sess-b6test01";
+
+    /** 空闲主线程 hook 上下文（无消息，携带测试会话）· 门控应全部放行. */
     private static PostSamplingContext idleMainThreadContext() {
+        return mainThreadContextWithSession(TEST_SESSION_ID);
+    }
+
+    /** 构造带指定会话的工具上下文的 post-sampling 上下文（null → 显式「无会话」用例）。 */
+    private static PostSamplingContext mainThreadContextWithSession(String sessionId) {
+        ToolUseContext tuc = sessionId == null
+            ? null
+            : ToolUseContext.of(java.util.UUID.randomUUID(), sessionId);
         return new PostSamplingContext(List.of(), List.of("systemPrompt"), Map.of(), Map.of(),
-            null, QuerySource.REPL_MAIN_THREAD);
+            tuc, QuerySource.REPL_MAIN_THREAD);
     }
 
     @Test
@@ -150,8 +169,47 @@ class MagicDocsServiceTest {
         service.updateTrackedDocs(idleMainThreadContext());
 
         // updater.updateWithContent 应被调 1 次，参数含 trackedPath 与已读内容
+        // [批 6] 末参 = 真实会话 ID（从 PostSamplingContext.toolUseContext() 显式透传，
+        //   不再是下游现造的 "sess-"+UUID 伪造键）
+        ArgumentCaptor<String> sessionCaptor = ArgumentCaptor.forClass(String.class);
         verify(updater, times(1)).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), sessionCaptor.capture());
+        assertThat(sessionCaptor.getValue()).isEqualTo(TEST_SESSION_ID);
+    }
+
+    /**
+     * [批 6 第一红线] 无会话 ⇒ (b) 显式跳过 + 可观测，⛔ 绝不伪造。
+     *
+     * <p><b>正反对照（同一测试内两臂）</b>：
+     * <ul>
+     *   <li>负向：{@code toolUseContext == null} ⇒ updater 完全不被调用（不产生伪造键、不写盘）</li>
+     *   <li>正向：同夹具换上带会话的 TUC ⇒ updater 被调用且末参 = 会话 ID（证明负向臂不是因为
+     *       「链路整体坏了」而绿）</li>
+     * </ul>
+     */
+    @Test
+    @DisplayName("[批 6] 无会话标识 ⇒ 跳过更新且不伪造 sessionId（正反对照：带会话则正常调用）")
+    void updateTrackedDocsSkipsWithoutSession_andDoesNotFabricate(@TempDir Path workspace)
+            throws IOException {
+        Path docPath = workspace.resolve("docs.md").toAbsolutePath();
+        Files.writeString(docPath, "# MAGIC DOC: hello\n_instructions_\nbody");
+        service = newServiceWithRealReadFileTool(workspace);
+        service.onFileRead(docPath.toString(), Files.readString(docPath));
+        assertThat(service.trackedCount()).isEqualTo(1);
+
+        // ── 负向臂：toolUseContext == null（无会话载体）⇒ 不调用 updater ──
+        MagicDocsService.UpdateSummary skipped =
+            service.updateTrackedDocs(mainThreadContextWithSession(null));
+        assertThat(skipped.updated()).isZero();
+        verify(updater, never()).updateWithContent(any(Path.class), any(String.class),
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
+        // doc 仍被追踪（跳过 ≠ 移除追踪）
+        assertThat(service.trackedCount()).isEqualTo(1);
+
+        // ── 正向臂：同夹具换带会话 TUC ⇒ 真的调用（证明上方 never 有鉴别力）──
+        service.updateTrackedDocs(mainThreadContextWithSession(TEST_SESSION_ID));
+        verify(updater, times(1)).updateWithContent(any(Path.class), any(String.class),
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
     }
 
     @Test
@@ -171,7 +229,7 @@ class MagicDocsServiceTest {
 
         // 验证：updater.updateWithContent 没被调（header 不命中），且 tracked 已移除
         verify(updater, never()).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
         assertThat(service.trackedCount()).isEqualTo(0);
     }
 
@@ -200,7 +258,7 @@ class MagicDocsServiceTest {
         // 步骤 3: 调 updateTrackedDocs — enabled=false 拦截, updater 不该被调
         service.updateTrackedDocs(idleMainThreadContext());
         verify(updater, never()).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
 
         // 步骤 4: 再调 onFileRead — enabled=false 也拦截登记
         service.onFileRead("ignored2.md",
@@ -232,7 +290,7 @@ class MagicDocsServiceTest {
         PostSamplingHookRegistry.executeAll(ctx, null).join();
 
         verify(updater, never()).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
     }
 
     @Test
@@ -245,7 +303,7 @@ class MagicDocsServiceTest {
         PostSamplingHookRegistry.executeAll(ctx, null).join();
 
         verify(updater, never()).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
     }
 
     @Test
@@ -256,7 +314,7 @@ class MagicDocsServiceTest {
         PostSamplingHookRegistry.executeAll(idleMainThreadContext(), null).join();
 
         verify(updater, times(1)).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
     }
 
     @Test
@@ -275,7 +333,7 @@ class MagicDocsServiceTest {
 
         ArgumentCaptor<String> contentCaptor = ArgumentCaptor.forClass(String.class);
         verify(updater, times(1)).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), contentCaptor.capture());
+            any(Path.class), any(EditFileTool.class), contentCaptor.capture(), any(String.class));
         assertThat(contentCaptor.getValue())
             .as("updateSingle 必须经 ReadFileTool 读到最新内容（而非旧缓存/旧快照）")
             .contains("v2 body updated externally");
@@ -295,7 +353,7 @@ class MagicDocsServiceTest {
         // PathGuard 拒（SecurityException → ToolResult.error）→ 对齐 CC 读失败移除追踪
         assertThat(service.trackedCount()).isEqualTo(0);
         verify(updater, never()).updateWithContent(any(Path.class), any(String.class),
-            any(Path.class), any(EditFileTool.class), any(String.class));
+            any(Path.class), any(EditFileTool.class), any(String.class), any(String.class));
     }
 
     /** 构造带真实 ReadFileTool（PathGuard=workspace）的已启用 service. */

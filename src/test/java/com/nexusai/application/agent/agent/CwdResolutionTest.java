@@ -328,4 +328,69 @@ class CwdResolutionTest {
         assertThat(CwdResolution.getOriginalCwdLayer(null)).isEqualTo(expected);
         assertThat(CwdResolution.getOriginalCwdLayer("   ")).isEqualTo(expected);
     }
+
+    /**
+     * [批 6] 显式「确无会话」哨兵（{@code SessionKeys.NO_SESSION}）⇒ 命名无会话出口，不查 DB、不抛。
+     *
+     * <p><b>WHY（规则九）</b>：哨兵是「有意声明确无会话」（MCP 入站 / standalone fork·子代理 /
+     * 无会话 plan provider），与「DB 查无此会话」的 {@code unknown} 分支**语义不同**（后者是
+     * 来源不明信号）。若哨兵落进 {@code unknown} 分支 ⇒ 打误导性「伪造 id」告警 + 多一次 DB 查询。
+     *
+     * <p><b>正反对照（同一测试内两臂）</b>：哨兵 ⇒ 无会话出口；同一时刻真实绑定会话 ⇒ 返回其
+     * boundProject（证明哨兵臂不是「解析整体坏了」而绿）。
+     */
+    @Test
+    @DisplayName("[批 6] NO_SESSION 哨兵 → 命名无会话出口（不抛）；真实绑定会话 → boundProject（正反对照）")
+    void noSessionSentinel_goesToNamedNonSessionExit(@TempDir Path projectDir) throws Exception {
+        SessionProjectRoot.setForSession("sess-real-b6", projectDir.toString());
+
+        String expectedUserDir = Path.of(System.getProperty("user.dir")).toRealPath().toString();
+        // 负向臂：哨兵 ⇒ 无会话出口（= getCwdForNonSession()），且**不**命中会话绑定
+        assertThat(CwdResolution.getCwd(com.nexusai.common.SessionKeys.NO_SESSION))
+            .as("哨兵必须走命名无会话出口（进程 user.dir），而不是会话绑定")
+            .isEqualTo(expectedUserDir)
+            .isEqualTo(CwdResolution.getCwdForNonSession());
+        assertThat(CwdResolution.getOriginalCwdLayer(com.nexusai.common.SessionKeys.NO_SESSION))
+            .isEqualTo(CwdResolution.getOriginalCwdLayerForNonSession());
+
+        // 正向对照：真实绑定会话照常解析出 boundProject（证明上方不是「解析整体坏了」）
+        assertThat(CwdResolution.getCwd("sess-real-b6"))
+            .as("真实绑定会话仍按其 boundProject 解析")
+            .isEqualTo(projectDir.toRealPath().toString());
+    }
+
+    /**
+     * [批 6] 哨兵必须**短路**，不得落进「DB 查无此会话」分支（否则每次 MCP 调用白查一次 DB
+     * 且打误导性「伪造 id」告警）。
+     *
+     * <p>⚠️ <b>本用例是「零鉴别力」修复的产物</b>：哨兵分支与 {@code unknown} 分支<b>返回值相同</b>
+     * （都是 {@code getCwdForNonSession()}）⇒ 只断言返回值<b>永远绿</b>。真正的鉴别点是「是否查询了
+     * DB」——故经 {@link SessionProjectRoot#setDbResolver} 计数。
+     *
+     * <p><b>正反对照（同一测试内两臂）</b>：哨兵 ⇒ 回源计数 0；非哨兵的来源不明 id ⇒ 回源计数 &gt; 0。
+     * <br><b>RED</b>：删掉 {@code getCwd} 里的 {@code SessionKeys.isNoSession} 短路 ⇒ 哨兵臂计数变 1 ⇒ 红。
+     */
+    @Test
+    @DisplayName("[批 6] 哨兵短路：不查 DB（计数 0）；来源不明 id 则回源（正反对照）")
+    void noSessionSentinel_shortCircuitsWithoutDbLookup() {
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        SessionProjectRoot.setDbResolver(sid -> {
+            calls.incrementAndGet();
+            return SessionProjectRoot.Lookup.unknown();
+        });
+        try {
+            CwdResolution.getCwd(com.nexusai.common.SessionKeys.NO_SESSION);
+            assertThat(calls.get())
+                .as("哨兵是「有意声明无会话」⇒ 不得触发 DB 回源（0 次）")
+                .isZero();
+
+            // 正向对照：来源不明 id 走 unknown 分支 ⇒ 确实回源（证明计数装置有效，非恒 0）
+            CwdResolution.getCwd("sess-not-in-db-b6");
+            assertThat(calls.get())
+                .as("非哨兵的 DB-miss id 必须回源（证明上面的 0 不是「解析器没生效」）")
+                .isGreaterThan(0);
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
 }

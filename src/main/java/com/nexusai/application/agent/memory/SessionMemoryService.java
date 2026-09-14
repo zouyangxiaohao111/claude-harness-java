@@ -788,7 +788,10 @@ public class SessionMemoryService {
                     sessionSystemPrompt(psContext),
                     psContext.userContext(),          // [RES-C5] userContext 透传（forkedAgent.ts:132）
                     psContext.systemContext(),        // [RES-C5] systemContext 透传（forkedAgent.ts:133）
-                    useGlobalCacheScopeSupplier.get()); // [RES-C5] gate 透传（GlobalCacheScope 单实现 · betas.ts:227-233）
+                    useGlobalCacheScopeSupplier.get(), // [RES-C5] gate 透传（GlobalCacheScope 单实现 · betas.ts:227-233）
+                    // [批 6 · 路线 (ii)] 真实会话 id 取自 post-sampling 上下文携带的 TUC
+                    //   （⛔ 不用 sessionIdFrom 的 "unknown" 兜底 —— 那是占位、非会话键）
+                    psContext.toolUseContext() != null ? psContext.toolUseContext().sessionId() : null);
 
             HookPermissionResolver.CanUseTool canUseTool = createMemoryFileCanUseTool(memoryPath.toString());
             // skipTranscript/skipCacheWrite 不设（false）· CC sessionMemory.ts:318-325 未传，
@@ -933,7 +936,10 @@ public class SessionMemoryService {
                     manualSystemPrompt,               // [SM-11] getSystemPrompt(tools, mainLoopModel) 等价
                     Map.of(),                         // userContext 降级（manual 无会话上下文通道）
                     Map.of(),                         // systemContext 降级
-                    useGlobalCacheScopeSupplier.get()); // [RES-C5] gate 透传（GlobalCacheScope 单实现 · betas.ts:227-233）
+                    useGlobalCacheScopeSupplier.get(), // [RES-C5] gate 透传（GlobalCacheScope 单实现 · betas.ts:227-233）
+                    // [批 6 · 路线 (ii)] 真实会话 id 取自本方法形参 TUC（manual 提取入口恒有会话；
+                    //   ⛔ 不用 sessionIdFrom 的 "unknown" 兜底）
+                    toolUseContext != null ? toolUseContext.sessionId() : null);
 
             HookPermissionResolver.CanUseTool canUseTool = createMemoryFileCanUseTool(memoryPath.toString());
             ForkedAgentParams params = new ForkedAgentParams(

@@ -38,6 +38,34 @@ public final class SessionKeys {
     private SessionKeys() {}
 
     /**
+     * <b>[批 6 2026-09-14] 「确无会话」哨兵值</b> —— 供「结构上拿不到会话标识」的合法路径
+     * 填充 {@code ToolUseContext.sessionId} 这类<b>必填非 null</b> 的槽位（用户裁定 #13 的分类 (1)：
+     * 设计上不属于任何会话 —— 入站 MCP 子进程 / standalone fork·子代理 / 无会话 plan provider）。
+     *
+     * <p><b>形态上明确「不是会话键」</b>（这是本值存在的全部意义）：
+     * <ul>
+     *   <li>⛔ 不带 {@code "sess-"} 前缀、⛔ 不是 UUID ⇒ 不会被
+     *       {@code AutoDreamConsolidator:667} 的<b>包含式</b>形态校验
+     *       （{@code !isUuid(c) && !startsWith("sess-")}）当合法会话键纳入；</li>
+     *   <li>经 {@link #canonicalUuid(String)} 走 hash 兜底（不抛）；经 {@link #originalKey(String)}
+     *       返回 {@code null}（诚实降级，不抛）。</li>
+     * </ul>
+     *
+     * <p>⭐ <b>与批 4a 的命名无会话出口配对</b>：值落进 {@code CwdResolution.getCwd(sessionId)}
+     * 时被<b>显式识别</b>（不再走「DB 查无此会话」的 {@code unknown} 分支 + 误导性告警），
+     * 直接走 {@code getCwdForNonSession()}。
+     *
+     * <p>⛔ <b>不得用它冒充真实会话</b>：有会话可取的调用方必须显式传真实 id
+     * （批 6 用户裁定：不许静默伪造一个「看起来合法」的值）。
+     */
+    public static final String NO_SESSION = "no-session";
+
+    /** 是否为 {@link #NO_SESSION} 哨兵（⚠️ 不做 trim/大小写宽松匹配 —— 会话键须精确）。 */
+    public static boolean isNoSession(String sessionId) {
+        return NO_SESSION.equals(sessionId);
+    }
+
+    /**
      * 归一化会话 UUID（正向）· <b>@Deprecated 兼容层：仅存量读取</b>。
      *
      * <p>[session-id-short] 新代码一律 short 直键，不调用本方法。存量场景：QueueItem 历史项

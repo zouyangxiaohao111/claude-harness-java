@@ -28,6 +28,8 @@ import java.util.function.Supplier;
  * <p><b>分层解析</b>（{@link #getCwd(String)}，对齐 CC pwd/getCwd 三层）：
  * <pre>
  * getCwd(sessionId)  // sessionId 必填（null/空白 ⇒ 走 getCwdForNonSession()，见下）
+ *   0. [批 6] sessionId == SessionKeys.NO_SESSION（显式「确无会话」哨兵）⇒ 直接走命名出口
+ *      getCwdForNonSession() + ≥WARN（不查 DB、不打「伪造 id」告警）
  *   1. override = ThreadLocal CURRENT_OVERRIDE（对齐 CC cwdOverrideStorage AsyncLocalStorage；
  *      runWithCwdOverride 设置，退出 clear）→ 非空返回 normalizeCwd(override)
  *   2. sessionCwd = SessionCwdHolder.get(sessionId)（对齐 CC 单一 STATE.cwd；
@@ -118,6 +120,10 @@ public final class CwdResolution {
     private static final java.util.concurrent.atomic.AtomicBoolean UNKNOWN_SESSION_WARNED =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
+    /** [批 6] 显式「确无会话」哨兵路径的告警一次性开关（warnNoSessionSentinel）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean NO_SESSION_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private CwdResolution() {}
 
     /**
@@ -141,6 +147,13 @@ public final class CwdResolution {
     public static String getCwd(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             warnNullSession("getCwd", "getCwdForNonSession");
+            return getCwdForNonSession();
+        }
+        // [批 6] 显式「确无会话」哨兵（SessionKeys.NO_SESSION）⇒ 直接走命名出口：
+        //   ⛔ 不落进下方「DB 查无此会话（合成/伪造/已删 id）」的 unknown 分支 —— 那条会打
+        //   「伪造 sessionId」告警并多一次 DB 查询，而本值恰恰是**有意声明无会话**，非伪造。
+        if (SessionKeys.isNoSession(sessionId)) {
+            warnNoSessionSentinel("getCwd", "getCwdForNonSession");
             return getCwdForNonSession();
         }
         // L1: override（对齐 CC cwdOverrideStorage.getStore()）
@@ -207,6 +220,11 @@ public final class CwdResolution {
     public static String getOriginalCwdLayer(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             warnNullSession("getOriginalCwdLayer", "getOriginalCwdLayerForNonSession");
+            return getOriginalCwdLayerForNonSession();
+        }
+        // [批 6] 显式「确无会话」哨兵 ⇒ 命名出口（同 getCwd，见上）
+        if (SessionKeys.isNoSession(sessionId)) {
+            warnNoSessionSentinel("getOriginalCwdLayer", "getOriginalCwdLayerForNonSession");
             return getOriginalCwdLayerForNonSession();
         }
         // [INV-3] L1: originalCwd 重锚层（worktree 入口 setOriginalCwd(worktreePath)，Exit clear 回落 ·
@@ -473,17 +491,37 @@ public final class CwdResolution {
     }
 
     /**
-     * 「会话不存在」（合成/伪造/已删 sessionId）的 ≥WARN 留痕（只打印一次）。
+     * 「会话不存在」（已删 / 未登记 / 来源不明的 sessionId）的 ≥WARN 留痕（只打印一次）。
      *
-     * <p>该路径按「确无会话」解析（进程 user.dir，= 批 4a 前行为）—— DB 无此会话即无项目身份可言，
-     * 且合成 id 的合法来源（MCP 入站 / standalone fork / subagent / 文档更新器）就靠这条路径存活。
-     * ⛔ 不得把它改成 fail-loud（那是批 6「伪造 sessionId」的靶点，届时给它们真实来源）。
+     * <p>该路径按「确无会话」解析（进程 user.dir，= 批 4a 前行为）—— DB 无此会话即无项目身份可言。
+     *
+     * <p><b>[批 6 收口]</b> 上述「合法来源」已全部改为<b>显式传参或 {@link SessionKeys#NO_SESSION}
+     * 哨兵</b>（MCP 入站 / standalone fork·子代理 / plan provider）⇒ 走到本分支<b>只可能是</b>
+     * 已删会话或真正的来源不明 id（属数据链路异常信号）。哨兵走
+     * {@link #warnNoSessionSentinel}，不落此处。
+     * ⛔ 仍不得改成 fail-loud：已删会话的历史调用点会成批炸（批 4a 实测）。
      */
     private static void warnUnknownSession(String method, String sessionId) {
         if (UNKNOWN_SESSION_WARNED.compareAndSet(false, true)) {
-            log.warn("[CwdResolution] {} 的 sessionId={} 在 DB 中不存在（合成/伪造/已删 id）⇒ 按「确无会话」"
-                + "解析（进程 user.dir）。这属批 6「伪造 sessionId」待治项；有真实会话的调用方不应走到此路径"
-                + "（本告警仅打印一次）", method, sessionId);
+            log.warn("[CwdResolution] {} 的 sessionId={} 在 DB 中不存在（已删 / 未登记 / 来源不明 id）⇒ 按"
+                + "「确无会话」解析（进程 user.dir）。⚠️ 批 6 后合法无会话路径应改用 SessionKeys.NO_SESSION"
+                + "哨兵或显式传参 ⇒ 命中本告警请查是否存在漏传 / 陈旧 id（本告警仅打印一次）",
+                method, sessionId);
+        }
+    }
+
+    /**
+     * [批 6] 显式「确无会话」哨兵（{@link SessionKeys#NO_SESSION}）的 ≥WARN 留痕（只打印一次）。
+     *
+     * <p>本分支是**有意声明**「确无会话」（用户裁定 #13 分类 (1)），不是缺陷 ⇒ 告警只作可观测性，
+     * 不指向任何待治项（与 {@link #warnUnknownSession} 的指向不同）。
+     */
+    private static void warnNoSessionSentinel(String method, String namedExit) {
+        if (NO_SESSION_WARNED.compareAndSet(false, true)) {
+            log.warn("[CwdResolution] {} 收到显式「确无会话」哨兵 {} ⇒ 按无会话解析（进程 user.dir，"
+                + "与 {}() 同义）。本路径为有意声明（批 6：MCP 入站 / standalone fork·子代理 / "
+                + "无会话 plan provider），非缺陷（本告警仅打印一次）",
+                method, SessionKeys.NO_SESSION, namedExit);
         }
     }
 }

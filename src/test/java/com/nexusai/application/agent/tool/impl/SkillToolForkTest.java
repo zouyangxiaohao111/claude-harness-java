@@ -26,6 +26,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 /**
@@ -128,6 +129,34 @@ class SkillToolForkTest {
                 tool.execute(forkBlock("user-args"), ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Fork mode 需要 SubagentExecutor bean");
+    }
+
+    /**
+     * [批 6 伪造 sessionId] fork 分支缺 ToolUseContext ⇒ fail-loud，⛔ 不再现造
+     * {@code ToolUseContext.of(UUID.randomUUID(), "sess-"+random8)} 兜底。
+     *
+     * <p><b>WHY（第一红线 · 不许静默失效）</b>：那个兜底会让 fork 子代理继承一个
+     * 「看起来合法」的假会话键（下游 {@code resolveSessionDir} / file-history /
+     * SessionFilesRecorder 都以它为键）。实测该分支不可达：{@code ctx == null} 只可能来自
+     * 1 参 {@code execute(ToolUseBlock)}，而 {@code src/main} 唯一的单参 {@code Tool.execute(block)}
+     * 调用点是 {@code PromptShellExecutor:287}（只解析 powerShell/bash），生产 fork 分派必经
+     * {@code StreamingToolExecutor:2008} 3 参 / {@code ToolRegistry:813} 2 参（均传 ctx）。
+     *
+     * <p><b>正向对照</b>：同夹具改传真实 ctx（见 {@code forkSkill_firstArgShouldBeSkillContentNotArgs}）
+     * ⇒ {@code executeForkedSkill} 确实被调用，证明本用例的 {@code never()} 有鉴别力。
+     */
+    @Test
+    @DisplayName("[批 6] fork skill + ctx=null → 抛 IllegalStateException（不再伪造 sessionId 兜底 ctx）")
+    void forkSkill_withNullCtx_shouldFailLoudInsteadOfFabricatingSession(@TempDir Path tempDir) throws Exception {
+        SkillToolImpl tool = new SkillToolImpl(newForkRegistry(tempDir));
+        SubagentExecutor executor = mock(SubagentExecutor.class);
+        tool.setSubagentExecutor(executor);
+
+        assertThatThrownBy(() -> tool.execute(forkBlock("user-args"), (ToolUseContext) null))
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("需要 ToolUseContext");
+        verify(executor, never()).executeForkedSkill(
+            anyString(), any(Command.class), anyString(), any(ToolUseContext.class), any());
     }
 
     @Test

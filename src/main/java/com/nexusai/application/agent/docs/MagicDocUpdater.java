@@ -172,10 +172,14 @@ public class MagicDocUpdater {
      * @param editFileTool   EditFileTool 实例（<b>必填</b>，CC canUseTool 仅 Edit；
      *                       构造期字段已 requireNonNull，此处 null 也会显式失败）
      * @param currentContent 调用方已读取的最新文件内容（不可为 null）
+     * @param sessionId      发起本次更新的<b>真实会话 ID</b>（[批 6] 由
+     *                       {@code MagicDocsService} 从 {@code PostSamplingContext.toolUseContext().sessionId()}
+     *                       显式透传；原实现此处无载体 ⇒ 下游 {@code buildSeededContext} 现造
+     *                       {@code "sess-"+UUID} 伪造键。null/空白 ⇒ 显式失败，⛔ 绝不伪造）
      */
     public UpdateResult updateWithContent(Path filePath, String context,
                                           Path trackedDocPath, EditFileTool editFileTool,
-                                          String currentContent) {
+                                          String currentContent, String sessionId) {
         if (currentContent == null) {
             return UpdateResult.failed("currentContent is null: " + filePath);
         }
@@ -234,7 +238,7 @@ public class MagicDocUpdater {
         // 原 writeDirect Files.writeString 降级路径已删除。优先用入参（MagicDocsService 注入），
         // 回退到构造期强制 requireNonNull 注入的字段，null → 显式失败（规则十二）.
         EditFileTool tool = editFileTool != null ? editFileTool : this.editFileTool;
-        return writeViaEditTool(requireEditFile(tool), filePath, tracked, currentContent, updated);
+        return writeViaEditTool(requireEditFile(tool), filePath, tracked, currentContent, updated, sessionId);
     }
 
     /**
@@ -245,9 +249,14 @@ public class MagicDocUpdater {
      * <p>WHY 保留自身读取：updater 是 Spring bean，文件读取的单一职责在
      * ReadFileTool；但独立调用方（非 hook 链路）没有已读内容可传，保留此入口
      * 自读自更（Files.readString 仅此入口使用）。
+     *
+     * <p>[批 6] 新增 {@code sessionId} 形参（本入口无 {@code PostSamplingContext} 可继承）：
+     * 调用方必须显式提供真实会话 ID；null/空白 ⇒ {@link #writeViaEditTool} 显式失败，
+     * ⛔ 不再伪造 {@code "sess-"+UUID}。
      */
     public UpdateResult update(Path filePath, String context,
-                               Path trackedDocPath, EditFileTool editFileTool) {
+                               Path trackedDocPath, EditFileTool editFileTool,
+                               String sessionId) {
         if (!Files.isRegularFile(filePath)) {
             return UpdateResult.failed("not a regular file: " + filePath);
         }
@@ -257,15 +266,15 @@ public class MagicDocUpdater {
         } catch (IOException e) {
             return UpdateResult.failed("read failed: " + e.getMessage());
         }
-        return updateWithContent(filePath, context, trackedDocPath, editFileTool, original);
+        return updateWithContent(filePath, context, trackedDocPath, editFileTool, original, sessionId);
     }
 
     /**
      * [Session L] EditFileTool 显式守卫 · CC canUseTool 仅允许 Edit 工具，零降级直写.
      *
-     * <p>WHY 既校验入参又校验字段：MagicDocsService.java:220 仍按 4 参 update() 契约传参，
-     * 测试也可以只通过构造期强制注入（不传参）。两路汇聚到 {@link #writeViaEditTool} 前
-     * 必须确保非 null——否则将走进 writeViaEditTool 内部 NPE，违反规则十二。
+     * <p>WHY 既校验入参又校验字段：{@code MagicDocsService.updateSingle} 走 {@code updateWithContent}
+     * 显式传入驻入的 EditFileTool；测试也可以只通过构造期强制注入（不传参）。两路汇聚到
+     * {@link #writeViaEditTool} 前必须确保非 null——否则将走进 writeViaEditTool 内部 NPE，违反规则十二。
      *
      * @param tool 待校验 EditFileTool
      * @return 非 null 的 tool（链式表达）
@@ -385,15 +394,36 @@ public class MagicDocUpdater {
      * 门禁拒绝). 构造一个最小 ToolUseContext, 把"已经读过文件"的事实播种进
      * readFileState, 让 EditFileTool 的 read-before-write + stale-write 门禁
      * 真实生效且不误拒. WHY 关键: CC 端 readFileState 是会话级 (QueryEngine.ts:191)
-     * 且 parent→child 透传; Java 端 MagicDocUpdater 拿不到父 ctx (hook 链路只透传
-     * PostSamplingContext 的折算摘要给 buildPrompt, 不含 ToolUseContext), 所以必须现场构造.
+     * 且 parent→child 透传.
+     *
+     * <p>⚠️ <b>[批 6 实测纠正原注释]</b> 本段原写「Java 端 MagicDocUpdater 拿不到父 ctx
+     * (hook 链路只透传 PostSamplingContext 的折算摘要给 buildPrompt, <b>不含 ToolUseContext</b>)」
+     * —— <b>不成立</b>：{@code PostSamplingContext} 的 record 组件本就含 {@code toolUseContext}
+     * （{@code hook/PostSamplingContext.java} 第 5 组件；生产 {@code LlmAgentLoop:7612-7615} 恒传
+     * 非 null，且 {@code hookToolUseContext} 保 sessionId）。真正缺的只是
+     * {@code MagicDocsService.updateTrackedDocs} 在取折算摘要时把会话 ID 丢掉了 —— 已按
+     * 「已有显式载体直接透传」修复，<b>不再现场构造会话身份</b>；只保留一次性 agentId 与
+     * 现场构造的 readFileState（两者都不参与会话/项目身份解析）。
      *
      * <p>语义不变: 调用方 (MagicDocsService.updateSingle 经 ReadFileTool / 兼容入口
      * 自身 Files.readString) 已经在写回前拿到 original, 等价于 CC 端
      * "先 Read 再 Edit". 播种 readFileState 就是把这个事实告诉门禁.
+     *
+     * <p>[批 6] 会话 ID 由调用方**显式传入**（真实会话，非伪造）——原实现此处现造
+     * {@code "sess-"+UUID.substring(0,8)}，会让本次写回的 file-history 备份目录
+     * ({@code {configHome}/file-history/{sessionId}})、SessionFilesRecorder 会话键
+     * 全部落在一次性随机键上（每次更新泄一个新目录 / 新 Map 条目）。
      */
     private UpdateResult writeViaEditTool(EditFileTool editTool, Path filePath,
-                                          String tracked, String original, String updated) {
+                                          String tracked, String original, String updated,
+                                          String sessionId) {
+        // [批 6 第一红线] 缺会话 ⇒ 显式失败（≥WARN 可观测），⛔ 绝不伪造「看起来合法」的会话键。
+        //   生产链路 MagicDocsService.updateTrackedDocs 已在入口跳过缺会话；此处是第二道（兼容入口 update()）。
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[MagicDocUpdater] 缺少会话 ID ⇒ 拒绝写回（⛔ 不伪造 sessionId）: file={} tracked={}",
+                filePath, tracked);
+            return UpdateResult.failed("sessionId is required for magic-doc write-back: " + filePath);
+        }
         try {
             String relPath = tracked != null ? tracked : filePath.toString();
             // 构造 EditFileTool input：file_path/old_string/new_string/replace_all
@@ -414,7 +444,7 @@ public class MagicDocUpdater {
             // relPath 用于 keyForReadFileState: 必须与 EditFileTool.execute
             // 内部所用的 relPath 一致 (L+ round 3 已共用 keyForReadFileState,
             // 这里再次走同一函数保证 key 派生零漂移).
-            ToolUseContext ctx = buildSeededContext(editTool, relPath, original);
+            ToolUseContext ctx = buildSeededContext(editTool, relPath, original, sessionId);
             ToolResult result = editTool.execute(call, ctx);
             if (com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(result.data())) {
                 // [A1·退役 metadata] content() 已退役改 data(): ToolResult<String> cast 取 String
@@ -456,12 +486,14 @@ public class MagicDocUpdater {
      * <p>offset/limit=null · 对齐 CC FileEditTool.ts:520 写回后 ReadState 形态
      * (即所谓"full read"语义). isPartialView=false, 让 read-before-write 门禁通过.
      */
-    private ToolUseContext buildSeededContext(EditFileTool editTool, String relPath, String original) {
-        // 派生 session/agent id: MagicDocUpdater 自身没持有 ctx, 构造随机 id.
-        // (跨调用不复用, 每个 magic doc 写回独立 ctx — 走单文件原子写语义.)
-        // [session-id-short] sessionId 统一 short 形态（sess-xxx）。
+    private ToolUseContext buildSeededContext(EditFileTool editTool, String relPath, String original,
+                                              String sessionId) {
+        // [批 6 伪造 sessionId] 原实现此处现造 `"sess-" + UUID.randomUUID().substring(0,8)` 作会话键
+        //   —— 已删除。会话 ID 现由调用方显式透传（生产 = PostSamplingContext.toolUseContext().sessionId()，
+        //   见 MagicDocsService.updateTrackedDocs）。子代理/工具身份（agentId）仍为本地一次性值：
+        //   它只用于 EditFileTool 的 read-before-write 门禁键派生，不参与任何会话/项目身份解析。
+        //   ⛔ sessionId 的 null 由 writeViaEditTool 入口守卫拦截（不会到达此处）。
         UUID agentId = UUID.randomUUID();
-        String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
 
         // [会话 cwd 同源] 用「EditFileTool 即将用的同一对 (guard, sessionId)」解析目标路径：
         //   EditFileTool.execute 内部走 guard.resolve(ctx.sessionId() == 本方法生成的 sessionId, relPath)

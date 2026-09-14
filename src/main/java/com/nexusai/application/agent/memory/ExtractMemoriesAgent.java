@@ -874,7 +874,12 @@ public class ExtractMemoriesAgent {
                         forkRawMaterial.systemPrompt(),       // T9：主线程原料（forkedAgent.ts:131）
                         forkRawMaterial.userContext(),        // T9：主线程 userContext
                         forkRawMaterial.systemContext(),      // T9：主线程 systemContext
-                        useGlobalCacheScopeSupplier.get())
+                        useGlobalCacheScopeSupplier.get(),
+                        // [批 6 · 用户裁定 #3 路线 (ii)] 真实会话 id（本方法形参，源自
+                        //   LlmAgentLoop state.sessionId() → StopHookPipeline:312 透传）；
+                        //   只传真实值 —— cursorKey 的 "unknown" 是**游标键**占位、非会话键，
+                        //   不在此列。null ⇒ 下游置「确无会话」哨兵 + WARN。
+                        sessionId)
                     : RunForkedAgent.createMinimalCacheSafeParams(
                         messages,
                         // [RES-C5] extract-memories 无 post-sampling 上下文（stop-hook 触发）→
@@ -882,7 +887,8 @@ public class ExtractMemoriesAgent {
                         List.of(),
                         Map.of(),
                         Map.of(),
-                        useGlobalCacheScopeSupplier.get());
+                        useGlobalCacheScopeSupplier.get(),
+                        sessionId);
 
             // deny 分支发 tengu_auto_mem_tool_denied（CC denyAutoMemTool extractMemories.ts:154-164）
             HookPermissionResolver.CanUseTool canUseTool = createAutoMemCanUseTool(memoryDir,

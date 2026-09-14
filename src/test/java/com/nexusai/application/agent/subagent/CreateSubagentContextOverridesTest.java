@@ -302,4 +302,37 @@ class CreateSubagentContextOverridesTest {
             .as("clone 后 child 必须能看到父 cache 的所有 entry")
             .isNotNull();
     }
+
+    /**
+     * [批 6] standalone（无父）⇒ sessionId 置显式「确无会话」哨兵，⛔ 不再现造 {@code "sess-"+UUID}。
+     *
+     * <p><b>WHY（规则九 · 第一红线）</b>：旧 standalone 分支现造随机 {@code "sess-"+8hex}，该键会被
+     * 下游 {@code SubagentExecutor:1608 resolveSessionDir} / file-history 备份目录 /
+     * SessionFilesRecorder 当**真实会话键**消费（每次 standalone 泄一个新键，且形态上「看起来合法」）。
+     * 该分支亦是 <b>Java 自造</b>：CC {@code forkedAgent.ts:342-351 createSubagentContext(parentContext,
+     * overrides)} 直接解引用 parentContext，**无 null-parent 分支**。
+     *
+     * <p><b>正反对照（同一测试内两臂）</b>：无父 ⇒ 哨兵且非 {@code sess-} 形态；有父 ⇒ 原样继承父会话
+     * （证明哨兵臂不是「create 整体坏了」而绿）。
+     */
+    @Test
+    @DisplayName("[批 6] standalone ⇒ sessionId = 哨兵（非 sess- 形态）；有父 ⇒ 继承父会话（正反对照）")
+    void standalone_usesNoSessionSentinel_insteadOfFabricatedSession() {
+        ToolUseContext.SubagentContextOverrides noOverrides =
+            new ToolUseContext.SubagentContextOverrides(
+                null, CHILD_AGENT_TYPE, null, null, null, null, null, null, null, null,
+                null, null, null, null);
+
+        ToolUseContext standalone = createSubagentContext.create(null, noOverrides);
+        assertThat(standalone.sessionId())
+            .as("无父 ⇒ 必须用显式哨兵，⛔ 不得是 \"sess-\"+UUID 随机形态")
+            .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION)
+            .doesNotStartWith("sess-");
+
+        // 正向对照：有父 ⇒ 继承父会话（不落哨兵）
+        ToolUseContext child = createSubagentContext.create(buildParentContext(), noOverrides);
+        assertThat(child.sessionId())
+            .as("有父 ⇒ 继承父会话 id（哨兵只用于真无父路径）")
+            .isEqualTo(PARENT_SESSION_ID);
+    }
 }

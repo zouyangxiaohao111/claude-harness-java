@@ -289,11 +289,24 @@ public class MagicDocsService implements FileReadListener {
             return new UpdateSummary(0, 0, 0, List.of());
         }
         String context = renderConversationContext(psContext);
+        // [批 6 伪造 sessionId] 会话 ID 从此**已在上下文里**的显式载体取（不是新增通道）：
+        //   PostSamplingContext.toolUseContext()（LlmAgentLoop:7612-7615 构造，:7613 经
+        //   hookToolUseContext 保 sessionId，与 CC REPLHookContext.toolUseContext 同源）。
+        //   原实现只在 :291 取折算摘要字符串，把真实会话 ID 丢掉 ⇒ 下游 MagicDocUpdater
+        //   现造 "sess-"+UUID 伪造键（每次更新泄一个 file-history 目录 / SessionFilesRecorder 条目）。
+        // 缺会话（非主循环入口 / null psContext）⇒ (b) 显式跳过 + ≥WARN，⛔ 不伪造。
+        String sessionId = psContext != null && psContext.toolUseContext() != null
+            ? psContext.toolUseContext().sessionId() : null;
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[MagicDocsService] 无会话标识（PostSamplingContext.toolUseContext 缺失）⇒ 跳过本轮"
+                + " magic doc 更新（⛔ 不伪造 sessionId）: tracked={}", trackedMagicDocs.size());
+            return new UpdateSummary(0, trackedMagicDocs.size(), 0, List.of());
+        }
         int updated = 0, skipped = 0, failed = 0;
         List<String> failures = new ArrayList<>();
         // 串行（sequential）· 对齐 CC magicDocs.ts:217 sequential(...)
         for (TrackedDoc doc : List.copyOf(trackedMagicDocs.values())) {
-            MagicDocUpdater.UpdateResult result = updateSingle(doc, context);
+            MagicDocUpdater.UpdateResult result = updateSingle(doc, context, sessionId);
             switch (result.state()) {
                 case SUCCESS -> {
                     if (result.updated()) updated++;
@@ -356,7 +369,7 @@ public class MagicDocsService implements FileReadListener {
      *   <li>委派 updater.updateWithContent（已读内容直传，避免双读；路径白名单守卫由 updater 负责）</li>
      * </ol>
      */
-    private MagicDocUpdater.UpdateResult updateSingle(TrackedDoc doc, String context) {
+    private MagicDocUpdater.UpdateResult updateSingle(TrackedDoc doc, String context, String sessionId) {
         // 步骤 1: 经 ReadFileTool 重读（对齐 CC magicDocs.ts:134-137 FileReadTool.call）。
         //   WHY 不用 Files.readString: CC 走 FileReadTool.call 复用同一套 validateInput /
         //   PathGuard / 截断语义；无 ctx 路径天然 full read（ReadFileTool.java:441-446
@@ -439,7 +452,8 @@ public class MagicDocsService implements FileReadListener {
         }
         // 步骤 3: 委派 updater（已读内容直传，路径白名单守卫由 updater 负责）
         Path filePath = Paths.get(doc.path());
-        return updater.updateWithContent(filePath, context, filePath, editFileTool, currentDoc);
+        // [批 6] 真实会话 ID 显式透传（原实现此参数缺失 ⇒ 下游现造 "sess-"+UUID 伪造键）
+        return updater.updateWithContent(filePath, context, filePath, editFileTool, currentDoc, sessionId);
     }
 
     /** 更新汇总 · 给调用方做 telemetry / 日志用. */

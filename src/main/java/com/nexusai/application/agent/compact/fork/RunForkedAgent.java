@@ -57,6 +57,10 @@ public final class RunForkedAgent {
 
     private static final Logger log = LoggerFactory.getLogger(RunForkedAgent.class);
 
+    /** [批 6] 「调用方未提供会话 id」告警一次性开关（后台 fork 触发频繁，逐次打印会淹没日志）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean NO_SESSION_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     /**
      * 遥测实例（静态注入 · Spring 装配时经 {@link #setTelemetry} 设置一次；测试/未装配 →
      * null → {@code tengu_fork_agent_query} 发射静默跳过，零行为变化）。
@@ -325,25 +329,30 @@ public final class RunForkedAgent {
      *                      share/createChild）
      * @param readFileState 共享 readFileState 缓存（sessionMemory.ts:324；null = 父 clone）
      */
-    private static ToolUseContext createIsolatedContext(
+    static ToolUseContext createIsolatedContext(
             ToolUseContext parent, AbortController abortOverride,
             FileStateCache readFileState) {
         ToolUseContext.SubagentContextOverrides overrides =
             new ToolUseContext.SubagentContextOverrides(
                 null, null, null, abortOverride, null, readFileState, null, null, null, null,
                 null, null, null, null);
-        if (parent != null) {
-            return parent.with(overrides);
+        // [批 6 伪造 sessionId] 原「无父（standalone）⇒ 现造 UUID + "sess-"+random8」分支已删除：
+        //   该分支**不可达**，且伪造形态会让下游把一次性随机键当合法会话键消费。证据（实测）：
+        //   - 唯一调用点 RunForkedAgent:229-230 传 cs.toolUseContext()；
+        //   - CacheSafeParams 紧凑构造器 :101-104 对 toolUseContext==null **直接抛**
+        //     ⇒ cs.toolUseContext() 恒非 null；RunForkedAgent.run :207-209 亦拒 null cacheSafeParams。
+        //   - CC 真源 forkedAgent.ts:342-345 createSubagentContext(parentContext, overrides) 的
+        //     parentContext **无 null 分支**（直接解引用 parentContext.abortController）
+        //     ⇒ 本仓原 standalone 分支无 CC 对应物。
+        //   ⛔ 不得再引入伪造会话键：真走到这里说明上游契约被破坏，必须 fail-loud 而非静默伪造。
+        if (parent == null) {
+            throw new IllegalStateException(
+                "RunForkedAgent.createIsolatedContext: parent ToolUseContext is null —— fork 必须有父"
+                    + "上下文（CacheSafeParams.toolUseContext 非空契约；对齐 CC forkedAgent.ts:342"
+                    + " createSubagentContext(parentContext, ...)，CC 无无父分支）。"
+                    + "⛔ 不得回落伪造 sessionId：请检查 cacheSafeParams 构造点。");
         }
-        // 无父（standalone）→ 最小独立上下文（对齐 CC createSubagentContext(null, overrides)）
-        // [session-id-short] sessionId 统一 short 形态（sess-xxx）
-        ToolUseContext standalone = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
-            PermissionMode.DEFAULT,
-            Map.of(), List.of(), "",
-            abortOverride != null ? abortOverride : AbortController.NOOP,
-            List.of());
-        return standalone.with(overrides);
+        return parent.with(overrides);
     }
 
     /**
@@ -379,6 +388,11 @@ public final class RunForkedAgent {
      *                            {@code systemContext} (forkedAgent.ts:133)
      * @param useGlobalCacheScope boundary/gate 判定值（fork 与主线程一致）· CC original:
      *                            {@code shouldUseGlobalCacheScope()} (utils/betas.ts:227-233)
+     * @param sessionId           <b>[批 6]</b> 发起本 fork 的<b>真实会话 id</b>（只传真实值：
+     *                            {@code ToolUseContext.sessionId()} / 会话线程已解析的键；
+     *                            ⛔ 不得传 {@code "unknown"} 之类占位）。null/空白 ⇒ 置显式
+     *                            「确无会话」哨兵 {@link com.nexusai.common.SessionKeys#NO_SESSION}
+     *                            + ≥WARN（⛔ 不再现造 {@code "sess-"+UUID} 假键）
      * @return 最小 CacheSafeParams（toolUseContext 恒非 null；systemPrompt/userContext/
      *         systemContext 由原料填充，null 降级空）
      */
@@ -387,10 +401,27 @@ public final class RunForkedAgent {
             List<String> systemPrompt,
             Map<String, String> userContext,
             Map<String, String> systemContext,
-            boolean useGlobalCacheScope) {
-        // [session-id-short] sessionId 统一 short 形态（sess-xxx）
+            boolean useGlobalCacheScope,
+            String sessionId) {
+        // [批 6 2026-09-14 · 用户裁定 #3 路线 (ii)] 只采信**真实**会话 id；null/空白 ⇒ 显式
+        //   「确无会话」哨兵 + ≥WARN。⛔ 原实现无条件现造 `"sess-"+UUID.substring(0,8)`
+        //   —— 该键会经 CacheSafeParams.toolUseContext 成为 RunForkedAgent.createIsolatedContext
+        //   的 parent ctx ⇒ fork 内工具执行 / file-history 备份目录 / SessionFilesRecorder
+        //   全程带一次性假键（每次 fork 泄一个新键）。调用方传值规则见 @param sessionId。
+        String forkSessionId;
+        if (sessionId != null && !sessionId.isBlank()) {
+            forkSessionId = sessionId;
+        } else {
+            forkSessionId = com.nexusai.common.SessionKeys.NO_SESSION;
+            if (NO_SESSION_WARNED.compareAndSet(false, true)) {
+                log.warn("[RunForkedAgent] createMinimalCacheSafeParams: 调用方未提供会话 id ⇒ 置显式哨兵 {}"
+                    + "（⛔ 不再现造 \"sess-\"+UUID 假会话键）。本路径确无会话可取（如 "
+                    + "AutoDreamConsolidator.buildForkParams 作用域内无会话）或调用方漏传（本告警仅打印一次）",
+                    forkSessionId);
+            }
+        }
         ToolUseContext standalone = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+            UUID.randomUUID(), forkSessionId,
             PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
         // CacheSafeParams 紧凑构造对 null 兜底（systemPrompt/userContext/systemContext/

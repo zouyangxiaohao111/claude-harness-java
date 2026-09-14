@@ -289,10 +289,34 @@ public class InboundMcpToolProvider implements ToolCallback {
         }
     }
 
+    /** [批 6] 「本路径确无会话」告警一次性开关（每 MCP 调用都打会淹没日志）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean NO_SESSION_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     /**
      * ToolUseContext 构造 · 对齐 CC mcp.ts:112-134（isNonInteractiveSession=true、
      * mcpClients 空、abortController 新建、availableTools=getTools(空权限上下文)、
      * readFileState=双限 LRU）。
+     *
+     * <p><b>[批 6 2026-09-14 · 用户裁定] sessionId 用显式「确无会话」哨兵，不再现造会话键</b>：
+     * 入站 MCP 调用是<b>外部系统发起</b>，结构上不属于任何 nexusai 会话（用户假设，本轮四条证据证实）：
+     * <ol>
+     *   <li>CC 真源：{@code claude mcp serve} 是<b>独立 stdio 进程</b>
+     *       （{@code cli/handlers/mcp.tsx:57-77 → entrypoints/mcp.ts:35 startMCPServer}），
+     *       其 ToolUseContext <b>无 sessionId 字段</b>（{@code Tool.ts:149-183}），
+     *       {@code getAppState: () => getDefaultAppState()}（{@code mcp.ts:112-134}），
+     *       而 {@code AppState} 全类型无 sessionId（{@code AppStateStore.ts:91-461}）；
+     *   <li>本仓 MCP 端点是 Spring AI <b>服务端</b>（{@code spring.ai.mcp.server.protocol=streamable}），
+     *       由外部 MCP client 发起，MCP 协议无 nexusai 会话字段；
+     *   <li>前端不消费该协议端点（{@code front/src} 的 {@code /mcp} 全是 REST 管理面）；
+     *   <li>⛔ 不值 (a) 抛：那会关掉整个入站 MCP 功能。
+     * </ol>
+     * ⇒ 用 {@link SessionKeys#NO_SESSION}（进程内稳定、形态上明确非会话键）+ ≥WARN 声明。
+     * 相对旧实现（每次调用现造 {@code "sess-"+UUID}）消除：①「看起来合法」的假会话键；
+     * ② {@code SessionFilesRecorder.bySession} 每次调用新增永不回收的键；
+     * ③ file-history 备份目录 {@code {configHome}/file-history/{假键}} 每次调用新增目录。
+     * cwd 语义不变（仍经 {@code CwdResolution.getCwdForNonSession()} = 进程 user.dir，
+     * 与 CC {@code setCwd(providedCwd)} 对等）。
      */
     private ToolUseContext buildToolUseContext() {
         List<Tool> availableTools = (toolRegistry != null)
@@ -302,9 +326,15 @@ public class InboundMcpToolProvider implements ToolCallback {
         // shouldAvoidPermissionPrompts=false，v4 空上下文契约 OPD-WF8-02-GS-01；
         // 非交互 ask→deny 由下方 isNonInteractiveSession=true 承载）
         ToolPermissionContext permissionContext = permissionContextFactory.build();
+        if (NO_SESSION_WARNED.compareAndSet(false, true)) {
+            log.warn("[InboundMcpToolProvider] 入站 MCP 调用无会话上下文（外部系统发起，结构上不属于任何"
+                + " nexusai 会话）⇒ 工具上下文 sessionId 置显式哨兵 {}（⛔ 不再现造 \"sess-\"+UUID 假会话键）。"
+                + "工具将以无会话语义执行：cwd = 进程 user.dir，file-history/SessionFilesRecorder 用同一哨兵键"
+                + "（本告警仅打印一次）", com.nexusai.common.SessionKeys.NO_SESSION);
+        }
         return new ToolUseContext(
-            UUID.randomUUID(),            // agentId（CC 无，兜底）
-            "sess-" + UUID.randomUUID().toString().substring(0, 8),  // sessionId（CC 无，MCP 每调用独立；short 形态）
+            UUID.randomUUID(),            // agentId（非会话身份：CC TUC 无 agentId，仅本仓必填槽位）
+            com.nexusai.common.SessionKeys.NO_SESSION,  // sessionId（显式「确无会话」哨兵，见方法 javadoc）
             PermissionMode.DEFAULT,
             Map.of(),                     // additionalWorkingDirectories
             availableTools,               // availableTools = getTools(空权限上下文)

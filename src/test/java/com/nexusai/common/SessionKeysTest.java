@@ -84,4 +84,58 @@ class SessionKeysTest {
         assertThat(SessionKeys.canonicalUuid(key).toString())
             .isEqualTo("00000000-0000-0000-0000-abcdef010000");
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [批 6] 「确无会话」哨兵 —— 形态上必须「明确不是会话键」+ 承重消费方零抛
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[批 6] NO_SESSION: 无 \"sess-\" 前缀、非 UUID、稳定；isNoSession 精确匹配")
+    void noSessionSentinel_hasNoSessionKeyShape() {
+        assertThat(SessionKeys.NO_SESSION)
+            .as("哨兵必须明确不是会话键：⛔ 不带 sess- 前缀")
+            .doesNotStartWith("sess-");
+        assertThat(org.assertj.core.api.Assertions.catchThrowable(
+            () -> UUID.fromString(SessionKeys.NO_SESSION)))
+            .as("哨兵不得是合法 UUID 形态")
+            .isInstanceOf(IllegalArgumentException.class);
+
+        assertThat(SessionKeys.isNoSession(SessionKeys.NO_SESSION)).isTrue();
+        assertThat(SessionKeys.isNoSession("sess-a1b2c3d4")).isFalse();
+        assertThat(SessionKeys.isNoSession(null)).isFalse();
+        assertThat(SessionKeys.isNoSession("")).isFalse();
+    }
+
+    /**
+     * ⭐ [批 6] 承重消费方复核（用户裁定 #1 明确要求改后**再核一次**）。
+     * 这三个消费方是「{@code "sess-"} 前缀在本仓语义承重」的全部落点（全仓 grep 实测）：
+     * {@code AutoDreamConsolidator:667}（包含式形态校验）· {@code SessionKeys} 自身两个方法 ·
+     * {@code CwdResolution:306 alternateKeyOf}。哨兵换形态后必须**逐个不抛且行为可预期**。
+     */
+    @Test
+    @DisplayName("[批 6] 哨兵经 3 个承重消费方：canonicalUuid 走 hash 兜底不抛 / originalKey 诚实降级 null")
+    void noSessionSentinel_survivesLoadBearingConsumers() {
+        // 消费者 1: canonicalUuid —— 旧实现在「8 位」与「sess- 前缀」上的特判都不命中 ⇒ hash 兜底
+        UUID hashUuid = SessionKeys.canonicalUuid(SessionKeys.NO_SESSION);
+        assertThat(hashUuid).isNotNull();
+        // 兜底必须稳定（同输入同输出），否则权限 requestId 关联会漂
+        assertThat(SessionKeys.canonicalUuid(SessionKeys.NO_SESSION)).isEqualTo(hashUuid);
+        // 且必须**不是** sess- 派生形态（否则会被当合法会话 UUID）
+        assertThat(hashUuid.toString()).doesNotStartWith("00000000-0000-0000-0000-");
+
+        // 消费者 2: originalKey(String) —— 非 sess- ⇒ 走 canonicalUuid 反解 ⇒ 不可逆 ⇒ null（诚实降级）
+        assertThat(SessionKeys.originalKey(SessionKeys.NO_SESSION)).isNull();
+        assertThat(SessionKeys.originalKey(hashUuid)).isNull();
+
+        // 消费者 3: AutoDreamConsolidator:667 的包含式守卫语义（!isUuid && !startsWith("sess-") ⇒ 排除）
+        //   此处以「等价判据」锁定哨兵会被排除（该类该行为包内静态，无法直调；用同一表达式表达意图）
+        java.util.regex.Pattern uuidRe = java.util.regex.Pattern.compile(
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            java.util.regex.Pattern.CASE_INSENSITIVE);
+        boolean looksLikeUuid = uuidRe.matcher(SessionKeys.NO_SESSION).matches();
+        boolean hasSessPrefix = SessionKeys.NO_SESSION.startsWith("sess-");
+        assertThat(looksLikeUuid || hasSessPrefix)
+            .as("哨兵不得被 AutoDreamConsolidator:667 当合法会话键纳入（两个纳入条件均须为假）")
+            .isFalse();
+    }
 }

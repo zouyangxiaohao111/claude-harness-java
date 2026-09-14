@@ -1024,12 +1024,19 @@ public class AutoDreamConsolidator {
                     forkRawMaterial.systemPrompt(),     // T9：主线程原料（forkedAgent.ts:131）
                     forkRawMaterial.userContext(),      // T9：主线程 userContext
                     forkRawMaterial.systemContext(),    // T9：主线程 systemContext
-                    useGlobalCacheScopeSupplier.get())
+                    useGlobalCacheScopeSupplier.get(),
+                    // [批 6 · 路线 (ii) 的「其余」腿] buildForkParams 作用域内**无会话可取**
+                    //   （7 个形参里无 sessionId；doConsolidate 的 sessionIds 是「被审阅会话清单」
+                    //   而非当前会话）⇒ 显式传 null，由 createMinimalCacheSafeParams 置
+                    //   「确无会话」哨兵 + ≥WARN。⛔ 不在此现造假键；给本处补真实来源
+                    //   （ForkRawMaterial 增 sessionId 组件）已**登记给后续批**（用户裁定 #3）。
+                    null)
                 : RunForkedAgent.createMinimalCacheSafeParams(
                     // [RES-C5] auto-dream 无 post-sampling 上下文（stop-hook 触发）→
                     // systemPrompt 降级（验收 2）；gate 仍透传（GlobalCacheScope 单实现 · betas.ts:227-233）
                     List.of(), List.of(), Map.of(), Map.of(),
-                    useGlobalCacheScopeSupplier.get());
+                    useGlobalCacheScopeSupplier.get(),
+                    null);   // [批 6] 同上：本作用域无会话 ⇒ 哨兵 + WARN
 
         String memDirWithSep = memoryRoot.endsWith("/") || memoryRoot.endsWith("\\")
             ? memoryRoot : memoryRoot + java.io.File.separator;

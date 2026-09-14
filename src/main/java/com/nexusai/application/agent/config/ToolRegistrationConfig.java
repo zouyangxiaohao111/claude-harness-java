@@ -2132,10 +2132,18 @@ public class ToolRegistrationConfig {
      */
     private static com.nexusai.application.agent.compact.fork.CacheSafeParams buildProductionCacheSafeParams(
             ToolRegistry toolRegistry) {
-        // [session-id-short] 兜底 forkBaseCtx sessionId 统一 short 形态（sess-xxx）
+        // [批 6 2026-09-14 · 用户裁定 #3 路线 (ii) 的「其余」腿] forkBaseCtx 的 sessionId 用显式
+        //   「确无会话」哨兵，⛔ 不再现造 `"sess-"+UUID`：本方法是 `Supplier<CacheSafeParams>`
+        //   （三处接线：:1622 svc / :1695 agent / :1754 consolidator），**形参只有 toolRegistry**
+        //   ⇒ 求值时刻结构上拿不到会话（且求值发生在后台 fork 线程）。旧假键会经
+        //   CacheSafeParams.toolUseContext → RunForkedAgent.createIsolatedContext 的 parent 进入
+        //   fork 的整个工具执行链。
+        //   ⚠️ 本载荷的**唯一有效成分是工具集**（toolRegistry.all()）；会话相关维度（模型 /
+        //   projectRoot）由 ForkRawMaterial.forkToolUseContext / CacheSafeParams.projectRoot
+        //   另行显式注入。给本处补真实会话（改 supplier 形参）已**登记给后续批**。
         com.nexusai.application.agent.tool.ToolUseContext forkBaseCtx =
             new com.nexusai.application.agent.tool.ToolUseContext(
-                UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+                UUID.randomUUID(), com.nexusai.common.SessionKeys.NO_SESSION,
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
                 java.util.Map.of(),
                 toolRegistry != null ? toolRegistry.all() : List.of(),

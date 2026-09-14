@@ -29,6 +29,15 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @DisplayName("Session L · MagicDocUpdater 走 EditFileTool + 路径白名单 + CC 对齐 prompt + 构造期强制注入")
 class MagicDocUpdaterTest {
 
+    /**
+     * [批 6] 显式测试会话键 · {@code update(...)} 现要求调用方提供真实会话 ID
+     * （原实现缺此载体 ⇒ 下游现造 {@code "sess-"+UUID} 伪造键，已删）。
+     * 本键在测试内不被 DB 识别 ⇒ {@code CwdResolution} 走「无会话出口」（进程 user.dir）；
+     * 且本类用的 {@code PathGuard(Path)} 固定形态**忽略 sessionId**（PathGuard.java:130），
+     * 故路径基准恒为 {@code @TempDir} workspace，与改造前一致。
+     */
+    private static final String TEST_SESSION_ID = "sess-b6test01";
+
     @Test
     @DisplayName("写回经 EditFileTool：路径白名单通过 → EditFileTool.execute 被调且文件被改写")
     void writeViaEditToolSuccess(@TempDir Path workspace) throws Exception {
@@ -44,11 +53,51 @@ class MagicDocUpdaterTest {
         String newBody = "# MAGIC DOC: hello\n_instructions_\nupdated body";
         updater.setLlmCallback(prompt -> newBody);
 
-        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
 
         assertThat(result.state()).isEqualTo(MagicDocUpdater.RunState.SUCCESS);
         assertThat(result.updated()).isTrue();
         // 文件应被改写为 LLM 输出
+        assertThat(Files.readString(doc)).isEqualTo(newBody);
+    }
+
+    /**
+     * [批 6 伪造 sessionId] 缺会话 ID ⇒ 显式失败且**不写盘**，⛔ 不再现造 {@code "sess-"+UUID}。
+     *
+     * <p><b>WHY（第一红线 · 不许静默失效）</b>：原实现 {@code buildSeededContext} 现造随机会话键，
+     * 该键会流到 file-history 备份目录（{@code {configHome}/file-history/{sessionId}}）与
+     * SessionFilesRecorder 会话表 —— 每次更新泄一个新目录 / 新条目，且让「伪造键通过形态校验」。
+     *
+     * <p><b>正反对照（同一测试内两臂）</b>：负向臂（sessionId=null）拒写 + 文件不变；
+     * 正向臂（同一夹具带真实会话）写回成功 —— 证明负向臂不是「链路整体坏了」而绿。
+     */
+    @Test
+    @DisplayName("[批 6] 缺会话 ID ⇒ 拒绝写回（不伪造 sessionId）；带会话 ⇒ 正常写回")
+    void missingSessionId_refusesWriteBack_withoutFabricating(@TempDir Path workspace) throws Exception {
+        Path doc = workspace.resolve("doc.md");
+        String original = "# MAGIC DOC: hello\n_instructions_\nbody";
+        Files.writeString(doc, original);
+
+        EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
+        MagicDocUpdater updater = new MagicDocUpdater(new MagicDocDetector(), editTool);
+        String newBody = "# MAGIC DOC: hello\n_instructions_\nupdated body";
+        updater.setLlmCallback(p -> newBody);
+
+        // ── 负向臂：无会话 ⇒ failed + 文件保持原文 ──
+        MagicDocUpdater.UpdateResult refused =
+            updater.updateWithContent(doc, "ctx", doc, editTool, original, null);
+        assertThat(refused.state()).isEqualTo(MagicDocUpdater.RunState.FAILED);
+        assertThat(refused.error()).hasValueSatisfying(
+            // 断言**本守卫自己的**文案（唯一串 "magic-doc write-back"）——不可只断言
+            // "sessionId is required"：ToolUseContext 构造器的 "ToolUseContext.sessionId is
+            // required" 也含该子串，会让断言在「守卫被删、退回构造器抛」时仍绿（零鉴别力）。
+            msg -> assertThat(msg).contains("magic-doc write-back"));
+        assertThat(Files.readString(doc)).isEqualTo(original);
+
+        // ── 正向臂：同夹具带会话 ⇒ 真的写回 ──
+        MagicDocUpdater.UpdateResult wrote =
+            updater.updateWithContent(doc, "ctx", doc, editTool, original, TEST_SESSION_ID);
+        assertThat(wrote.state()).isEqualTo(MagicDocUpdater.RunState.SUCCESS);
         assertThat(Files.readString(doc)).isEqualTo(newBody);
     }
 
@@ -64,7 +113,7 @@ class MagicDocUpdaterTest {
 
         // trackedDocPath 与 filePath 不同 → 应被白名单拒绝
         Path fakeTracked = workspace.resolve("other-tracked.md");
-        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", fakeTracked, editTool);
+        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", fakeTracked, editTool, TEST_SESSION_ID);
 
         assertThat(result.state()).isEqualTo(MagicDocUpdater.RunState.FAILED);
         assertThat(result.error()).isPresent();
@@ -82,7 +131,7 @@ class MagicDocUpdaterTest {
         // [Session L] 构造期仍需 EditFileTool，但 update 短路在 detectEmpty → 不调用 writeViaEditTool
         EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
         MagicDocUpdater updater = new MagicDocUpdater(new MagicDocDetector(), editTool);
-        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
 
         assertThat(result.state()).isEqualTo(MagicDocUpdater.RunState.SUCCESS);
         assertThat(result.updated()).isFalse(); // skipped
@@ -102,7 +151,7 @@ class MagicDocUpdaterTest {
             return "should not be called";
         });
 
-        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
 
         assertThat(llmCalled[0]).isFalse();
         assertThat(result.updated()).isFalse();
@@ -118,7 +167,7 @@ class MagicDocUpdaterTest {
         MagicDocUpdater updater = new MagicDocUpdater(new MagicDocDetector(), editTool);
         updater.setLlmCallback(p -> "   ");
 
-        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
 
         assertThat(result.state()).isEqualTo(MagicDocUpdater.RunState.FAILED);
     }
@@ -164,13 +213,13 @@ class MagicDocUpdaterTest {
         updater.setLlmCallback(p -> "# MAGIC DOC: hello\nupdated body 1");
 
         // 第一次 update
-        MagicDocUpdater.UpdateResult r1 = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult r1 = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
         assertThat(r1.state()).isEqualTo(MagicDocUpdater.RunState.SUCCESS);
         assertThat(Files.readString(doc)).contains("updated body 1");
 
         // 第二次 update — 写回路径必须复用同一 MAPPER, 行为一致
         updater.setLlmCallback(p -> "# MAGIC DOC: hello\nupdated body 2");
-        MagicDocUpdater.UpdateResult r2 = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult r2 = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
         assertThat(r2.state()).isEqualTo(MagicDocUpdater.RunState.SUCCESS);
         assertThat(Files.readString(doc)).contains("updated body 2");
 
@@ -213,7 +262,7 @@ class MagicDocUpdaterTest {
         String newBody = "# MAGIC DOC: hello\n_instructions_\nctx_path_updated_body";
         updater.setLlmCallback(prompt -> newBody);
 
-        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool);
+        MagicDocUpdater.UpdateResult result = updater.update(doc, "ctx", doc, editTool, TEST_SESSION_ID);
 
         // 端到端成功 — 文件被改写
         assertThat(result.state()).isEqualTo(MagicDocUpdater.RunState.SUCCESS);
