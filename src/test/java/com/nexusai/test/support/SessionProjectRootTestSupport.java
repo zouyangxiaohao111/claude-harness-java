@@ -17,12 +17,17 @@ import com.nexusai.common.SessionProjectRoot;
  * 表达出来，而不是让 {@code CwdResolution} 去猜。
  *
  * <h2>语义（⛔ 不是「测试自己重写判据」）</h2>
- * <p>本声明注入的解析器答 {@link SessionProjectRoot.Lookup#unknown()}（= <b>DB 明确答「无此会话」</b>），
- * 而不是 {@code resolutionFailure()}：
+ * <p>本声明注入的解析器答 {@link SessionProjectRoot.Lookup#sessionlessEnvironment()}
+ * （= <b>本环境确无会话</b>），而不是 {@code resolutionFailure()}（无法判定），
+ * <b>[cwd3 步骤 2] 也不再是</b> {@code unknown()}（= DB 明确答「无此会话」）：
  * <ul>
  *   <li>未接线 = <b>装配异常</b>（本该有却没有）⇒ 生产必须 fail-loud；
  *       <b>测试夹具没有 DB 则是正常状态</b>（夹具的 sessionId 本就是合成的）。</li>
- *   <li>两者必须分开表达，否则「装配故障」与「夹具无 DB」就再次混为一谈 —— 而那正是本批要治的病。</li>
+ *   <li>三者必须分开表达，否则「装配故障」/「夹具无 DB」/「会话已删」就再次混为一谈 ——
+ *       而那正是本批要治的病。</li>
+ *   <li>⚠️ <b>切换理由（步骤 2 单点）</b>：步骤 2 把 cwd 域的 {@code unknown} 分支从「回落进程
+ *       user.dir」改成 <b>fail-loud 抛</b>。夹具「本 JVM 不连 DB」不是「DB 说没有这一行」，
+ *       必须落到语义正确的 sessionless 态，否则纯 JUnit 夹具会集体撞 fail-loud。</li>
  * </ul>
  * <p>⚠️ <b>不得</b>在「断言未接线必须 fail-loud」的用例里调用本方法（那会把被测态抹掉）；
  * 该类用例请用 {@link SessionProjectRoot#setDbResolver} 自行装置（先例：{@code CwdResolutionTest}
@@ -49,7 +54,7 @@ public final class SessionProjectRootTestSupport {
      * <p>效果 = 还原本批之前的 cwd 域行为（合成 id ⇒ 命名无会话出口返回进程 {@code user.dir}）。
      */
     public static void declareNoDatabase() {
-        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
     }
 
     /** 注销上一行声明（{@code @AfterEach} 必调；static 槽跨类污染）。 */

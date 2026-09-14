@@ -608,8 +608,16 @@ public class MemoryController {
         }
         // 记忆改动立即生效：写后缓存失效（对齐 GET /files 预热语义 memory.tsx:86-87）
         resolveEngine().clearMemoryFileCaches();
+        // [cwd3 步骤 2 · S2.5] User 档 = 全局记忆文件（{@code nexusaiHome/CLAUDE.md}），与会话无关
+        //   ⇒ 显式走**命名无会话出口**，⛔ 不经 {@code getCwd(sessionId)}：
+        //   1) 语义正确（本档本就不需要会话项目根）；2) 避免「客户端对 User 档传了一个 stale/未知
+        //   sessionId」把一次合法保存变成 400 —— 步骤 2 起 cwd 的「DB 明确答无此会话」是 fail-loud 抛。
+        //   Project 档仍在 :580 用 getOriginalCwdLayer(sessionId)（那里 sessionId 已被强制非空）。
+        String cwdForRelativePath = "User".equals(type)
+            ? CwdResolution.getCwdForNonSession()
+            : CwdResolution.getCwd(sessionId);
         String relativePath = getRelativeMemoryPath(targetPath.toString(),
-            System.getProperty("user.home"), CwdResolution.getCwd(sessionId));
+            System.getProperty("user.home"), cwdForRelativePath);
         String message = "Updated memory file at " + relativePath;
         if (log.isInfoEnabled()) {
             log.info("[MemoryController] PUT /memory/files 完成: type={} file={} path={} contentLen={}",

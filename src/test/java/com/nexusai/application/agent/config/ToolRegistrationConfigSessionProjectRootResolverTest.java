@@ -1,9 +1,12 @@
 package com.nexusai.application.agent.config;
 
+import com.nexusai.common.SessionKeys;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.repository.project.entity.ProjectRecord;
 import com.nexusai.repository.project.mapper.ProjectMapper;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.SessionMapper;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -198,5 +201,89 @@ class ToolRegistrationConfigSessionProjectRootResolverTest {
         assertThat(fn.apply("  ")).isNull();
         verify(sessionMapper, never()).selectOneById(any());
         verify(projectMapper, never()).selectOneById(any());
+    }
+
+    // ═════════ [cwd3 步骤 2] Lookup 四态产出（「两处旁路」拆分）═════════
+    //
+    // WHY（规则九 · 意图）：上面的用例只看 String 面（旧消费方契约，仍必须恒 null），
+    //   **看不到** Lookup 面 —— 而步骤 2 起 cwd 域的 fail-loud 判据全在 Lookup 的第 3/4/5 个
+    //   标记上。⇒ 必须把「DB 答了什么」与「没查 DB」两种「null」在 Lookup 面上分开钉住。
+    //
+    // ⚠️ 照实声明（规则十二）：回源器里的**哨兵分支**经公开路径当前**不可达** ——
+    //   SessionProjectRoot.lookup 自己就把哨兵短路了（见该类方法注释）⇒ 该分支没有任何测试
+    //   鉴别力，只是「若将来有人绕过 lookup 直接用 DbResolver」的防御。⛔ 不得声称它被守护；
+    //   下面最后一条用例把「不可达」这个事实本身钉住，防止将来被误当成已覆盖。
+
+    @AfterEach
+    void clearResolverSlot() {
+        SessionProjectRoot.setDbResolver(null);
+        SessionProjectRoot.reset();
+    }
+
+    @Test
+    @DisplayName("[cwd3 2a-3] 空白 sessionId ⇒ sessionless（⛔ 不是 unknown：本支没查过 DB）且不查 DB")
+    void blankSessionId_isSessionlessWithoutDbQuery() {
+        // RED（RE-2a-2）：把回源器首支改回 Lookup.unknown() ⇒ 本用例红。
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ProjectMapper projectMapper = mock(ProjectMapper.class);
+        resolver(sessionMapper, projectMapper);   // 注册进 SessionProjectRoot（@Bean 的副作用）
+
+        SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("   ");
+        assertThat(lk.sessionless())
+            .as("[2a-3] 空白 = 本环境确无会话（⛔ 不是 unknown —— 本支没查过 DB）").isTrue();
+        assertThat(lk)
+            .as("与 unknown() 严格可分（这是加第 5 态的全部理由）")
+            .isNotEqualTo(SessionProjectRoot.Lookup.unknown());
+        verify(sessionMapper, never()).selectOneById(any());
+    }
+
+    @Test
+    @DisplayName("[cwd3 2a-5] DB 查询抛错 ⇒ resolutionFailure（『没答』≠『答了没有』）")
+    void dbThrowing_isResolutionFailure() {
+        // RED（RE-2a-3）：把 catch 分支改回 Lookup.unknown() ⇒ 本用例红。
+        // ⚠️ 此支是**可用性变化**：一次瞬时 DB 抖动 ⇒ cwd 域全线 fail-loud（不再静默回落 user.dir）。
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ProjectMapper projectMapper = mock(ProjectMapper.class);
+        when(sessionMapper.selectOneById(any())).thenThrow(new RuntimeException("db down"));
+        resolver(sessionMapper, projectMapper);
+
+        SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("sess-db-down");
+        assertThat(lk.resolutionFailed())
+            .as("[2a-5] DB 抛错 = 无法判定 ⇒ cwd 域 fail-loud").isTrue();
+        assertThat(lk)
+            .as("必须与 unknown() / sessionless() 都可分（resolutionFailure 独立字段的全部理由）")
+            .isNotEqualTo(SessionProjectRoot.Lookup.unknown())
+            .isNotEqualTo(SessionProjectRoot.Lookup.sessionlessEnvironment());
+    }
+
+    @Test
+    @DisplayName("[cwd3 2a-4] DB 明确答「无此会话」⇒ 保持 unknown（⛔ 不得改成 sessionless）")
+    void dbAnsweredNoRow_isUnknown() {
+        // RED：把本支改成 sessionless ⇒ 本用例红（「本该有会话却没有」的信号被重新抹平）。
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ProjectMapper projectMapper = mock(ProjectMapper.class);
+        when(sessionMapper.selectOneById(any())).thenReturn(null);
+        resolver(sessionMapper, projectMapper);
+
+        SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("sess-real-missing");
+        assertThat(lk.sessionless())
+            .as("[2a-4] DB 答了「没有这一行」⇒ ⛔ 不是 sessionless（那是『本来就不该有会话』）").isFalse();
+        assertThat(lk.sessionKnown()).isFalse();
+        assertThat(lk.resolutionFailed()).isFalse();
+        assertThat(lk).as("[2a-4] 保持 unknown()").isEqualTo(SessionProjectRoot.Lookup.unknown());
+    }
+
+    @Test
+    @DisplayName("[cwd3 2a-3 覆盖声明] 回源器的哨兵分支经公开路径不可达 ⇒ 无鉴别力，照实登记")
+    void sentinelArmIsUnreachableThroughPublicApi() {
+        // WHY 本用例存在：防止将来有人声称「哨兵分支有测试守护」。这里把事实钉住 ——
+        //   lookup(NO_SESSION) 走的是 SessionProjectRoot 自己的短路，**根本不会**调到回源器。
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ProjectMapper projectMapper = mock(ProjectMapper.class);
+        when(sessionMapper.selectOneById(any())).thenReturn(null);
+        resolver(sessionMapper, projectMapper);
+
+        assertThat(SessionProjectRoot.lookup(SessionKeys.NO_SESSION).sessionless()).isTrue();
+        verify(sessionMapper, never()).selectOneById(any());   // 短路在 lookup 内，不在回源器内
     }
 }

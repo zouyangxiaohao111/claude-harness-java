@@ -192,8 +192,13 @@ public class PromptShellExecutor {
             return text;
         }
 
+        // [批 subcwd] 默认 runner 必须把 ctx **显式**传给 shell 工具：原实现 `cmd -> runShellCommand(
+        //   shellToolName, cmd)` 丢掉 ctx（走到 :287 的单参 execute(block) ⇒ ctx=null），而本方法
+        //   上文已保证 ctx != null（:186 ctx==null 直接跳过注入）。丢 ctx 的代价 = shell 工具内部
+        //   只能按「无会话」处理工作目录 ⇒ skill 内联 shell 命令在后端**服务器启动目录**里跑
+        //   （相对路径读写全锚错；PowerShellTool 现按 fail-loud 拒绝执行）。用户铁律：会话态一律显式传入。
         ShellCommandRunner runner = commandRunner != null
-                ? commandRunner : cmd -> runShellCommand(shellToolName, cmd);
+                ? commandRunner : cmd -> runShellCommand(shellToolName, cmd, ctx);
         ShellPermissionChecker checker = permissionChecker != null
                 ? permissionChecker : (tn, cmd, c, at) -> checkPermission(tn, cmd, c, at);
 
@@ -275,7 +280,7 @@ public class PromptShellExecutor {
      * {@code ToolResult.error}（非抛异常），由 {@link #executeShellCommandsInPrompt} (c) 转
      * {@link ShellCommandFailedException}。
      */
-    private ToolResult<String> runShellCommand(String shellToolName, String command) {
+    private ToolResult<String> runShellCommand(String shellToolName, String command, ToolUseContext ctx) {
         Tool tool = resolveTool(shellToolName);
         if (tool == null) {
             throw new IllegalStateException("Shell tool not configured: " + shellToolName);
@@ -284,7 +289,9 @@ public class PromptShellExecutor {
         input.put("command", command);
         input.put("description", "Execute skill-inline shell command");
         ToolUseBlock block = new ToolUseBlock(UUID.randomUUID().toString(), tool.name(), input);
-        AgentToolResult<?> ar = tool.execute(block);
+        // [批 subcwd] 2 参 dispatch（显式 ctx）：对齐 CC :115 `shellTool.call({command}, context)`。
+        //   ⛔ 不回退单参 execute(block) —— 那会让 shell 工具按「无会话」处理工作目录。
+        AgentToolResult<?> ar = tool.execute(block, ctx);
         if (!(ar instanceof ToolResult<?> tr)) {
             return ToolResult.error(block.id(), "shell tool returned non-ToolResult result");
         }

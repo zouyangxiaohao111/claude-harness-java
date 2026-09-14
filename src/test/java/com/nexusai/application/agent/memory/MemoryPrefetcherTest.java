@@ -182,7 +182,60 @@ class MemoryPrefetcherTest {
             new MemoryAge(),
             () -> true,
             () -> true,
-            () -> registry,
+            // [acc7/D1] 入参 = sessionId（原 0 参 Supplier 装不下会话）；本 stub 不区分会话，
+            //   会话键透传的断言见 sessionIdIsThreadedToAgentRegistrySupplier。
+            sessionId -> registry,
+            agentMemoryDir);
+    }
+
+    /**
+     * [acc7/D1] 带「会话键捕获」的构造 · 供 sessionId 透传断言用。
+     *
+     * <p>WHY: 契约核心是「registry 供应器的<b>入参</b> = 调用方显式传入的 sessionId」——
+     * 只有把实参记下来才能判别（stub 返回什么与入参无关，无法证明透传）。
+     */
+    private MemoryPrefetcher buildWithAgentsCapturingSession(
+            Path memDir, Path cwd,
+            com.nexusai.application.agent.subagent.AgentDefinitionRegistry registry,
+            java.util.concurrent.atomic.AtomicReference<String> seenSessionId) {
+        AutoMemPaths paths = new AutoMemPaths(
+            () -> memDir.toString(),
+            () -> memDir.toString(),
+            () -> memDir.toString(),
+            () -> null);
+        com.nexusai.application.agent.agent.AgentMemoryDirectory agentMemoryDir =
+            new com.nexusai.application.agent.agent.AgentMemoryDirectory(
+                () -> cwd.toString(),
+                () -> java.nio.file.Paths.get(System.getProperty("user.home"), ".claude"),
+                () -> null,
+                () -> cwd,
+                null,
+                null,
+                null,
+                () -> true,
+                com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault());
+        return new MemoryPrefetcher(
+            new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
+                new ModelConfigResolver() {
+                    @Override
+                    public String resolveFastModelName(String fallbackModelName) {
+                        return "claude-sonnet";
+                    }
+
+                    @Override
+                    public com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolve(String modelName) {
+                        return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
+                            new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
+                    }
+                }),
+            paths,
+            new MemoryAge(),
+            () -> true,
+            () -> true,
+            sessionId -> {
+                seenSessionId.set(sessionId);
+                return registry;
+            },
             agentMemoryDir);
     }
 
@@ -224,7 +277,7 @@ class MemoryPrefetcherTest {
         appender.start();
         logger.addAppender(appender);
         try {
-            assertThat(prefetcher.resolveMemoryDirs("hello world", null))
+            assertThat(prefetcher.resolveMemoryDirs("hello world", null, null))
                 .as("无有效项目根 ⇒ 空检索目录（预测取跳过，不伪造目录）")
                 .isEmpty();
             assertThat(appender.list.stream()
@@ -457,7 +510,9 @@ class MemoryPrefetcherTest {
 
         // [批 4b-1] 显式传会话项目根（mention 的 agent memory scope=project 需要它；原经
         //   AutoMemPaths ThreadLocal 隐式解析，载体已删）
-        List<Path> dirs = prefetcher.resolveMemoryDirs("help me @agent-code-x refactor this", cwd.toString());
+        // [acc7/D1] 同时显式传会话键（@-mention 查 agent-defs 表的会话维度，原 0 参 Supplier 缺失）
+        List<Path> dirs = prefetcher.resolveMemoryDirs(
+            "help me @agent-code-x refactor this", cwd.toString(), "sess-acc7-mention");
 
         assertThat(dirs).as("agent @-mention → 仅 agent memory 目录（project scope）")
             .containsExactly(cwd.resolve(NexusaiPaths.getProjectDirName()).resolve("agent-memory").resolve("code-x"));
@@ -472,11 +527,91 @@ class MemoryPrefetcherTest {
         Path cwd = Files.createTempDirectory("cwd-agent");
         MemoryPrefetcher prefetcher = buildWithAgents(memDir, cwd, registry);
 
-        // [批 4b-1] 同上：显式传会话项目根
-        List<Path> dirs = prefetcher.resolveMemoryDirs("please @\"reviewer (agent)\" check this", cwd.toString());
+        // [批 4b-1] 同上：显式传会话项目根 · [acc7/D1] 同时显式传会话键
+        List<Path> dirs = prefetcher.resolveMemoryDirs(
+            "please @\"reviewer (agent)\" check this", cwd.toString(), "sess-acc7-mention");
 
         assertThat(dirs).as("引号形态 mention 必须识别（attachments.ts:2812-2818）")
             .containsExactly(cwd.resolve(NexusaiPaths.getProjectDirName()).resolve("agent-memory").resolve("reviewer"));
+    }
+
+    /**
+     * <b>[acc7/D1] 会话键必须真的抵达 registry 供应器</b> —— 原 0 参
+     * {@code Supplier<AgentDefinitionRegistry>} 结构上装不下会话 ⇒ @-mention 恒查<b>进程默认</b>
+     * （workspaceDir）agent-defs ⇒ 多项目部署下跨会话取错表（静默）。
+     *
+     * <p>WHY（规则九）: 只有「供应器收到的入参 == 调用方显式传入的 sessionId」这一条能证明会话维度
+     * 真的接通；stub 返回什么与入参无关，不构成证明。
+     */
+    @Test
+    @DisplayName("[acc7/D1] sessionId 显式透传至 agent-registry 供应器（@-mention 按会话查表）")
+    void sessionIdIsThreadedToAgentRegistrySupplier(@TempDir Path memDir) throws Exception {
+        com.nexusai.application.agent.subagent.AgentDefinitionRegistry registry =
+            new com.nexusai.application.agent.subagent.AgentDefinitionRegistry(
+                java.util.Map.of(), java.util.List.of(agentDef("code-x", "project")));
+        Path cwd = Files.createTempDirectory("cwd-agent");
+        java.util.concurrent.atomic.AtomicReference<String> seenSessionId =
+            new java.util.concurrent.atomic.AtomicReference<>("__NOT_CALLED__");
+        MemoryPrefetcher prefetcher = buildWithAgentsCapturingSession(memDir, cwd, registry, seenSessionId);
+
+        List<Path> dirs = prefetcher.resolveMemoryDirs(
+            "help me @agent-code-x refactor this", cwd.toString(), "sess-acc7-42");
+
+        assertThat(seenSessionId.get())
+            .as("registry 供应器的入参必须是调用方显式传入的 sessionId（原 0 参 Supplier 恒进程默认）")
+            .isEqualTo("sess-acc7-42");
+        assertThat(dirs).as("会话键正确时 @-mention 仍解析出 agent memory 目录")
+            .containsExactly(cwd.resolve(NexusaiPaths.getProjectDirName()).resolve("agent-memory").resolve("code-x"));
+    }
+
+    /**
+     * <b>[acc7/D3] 会话源缺失时 @-mention 查表必须 ≥WARN</b>（⛔ 禁只 DEBUG、禁静默跨会话取表）。
+     *
+     * <p>两侧都断言：无 sessionId ⇒ 有 WARN；有 sessionId ⇒ 无该 WARN。只断言一侧的守卫是空守卫
+     * （任何实现都会绿）。
+     */
+    @Test
+    @DisplayName("[acc7/D3] @-mention 但 sessionId 缺失 → 进程默认查表 + ≥WARN（有 sessionId 则无此告警）")
+    void missingSessionId_warnsOnMentionLookup(@TempDir Path memDir) throws Exception {
+        com.nexusai.application.agent.subagent.AgentDefinitionRegistry registry =
+            new com.nexusai.application.agent.subagent.AgentDefinitionRegistry(
+                java.util.Map.of(), java.util.List.of(agentDef("code-x", "project")));
+        Path cwd = Files.createTempDirectory("cwd-agent");
+        MemoryPrefetcher prefetcher = buildWithAgents(memDir, cwd, registry);
+
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(MemoryPrefetcher.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            prefetcher.resolveMemoryDirs("help me @agent-code-x refactor this", cwd.toString(), null);
+            assertThat(messages(appender))
+                .as("sessionId 缺失 + 存在 @-mention（真的会查表）⇒ 必须留下 ≥WARN")
+                .anyMatch(m -> m.contains("sessionId 未显式传入"));
+
+            appender.list.clear();
+            prefetcher.resolveMemoryDirs("help me @agent-code-x refactor this", cwd.toString(), "sess-acc7-42");
+            assertThat(messages(appender))
+                .as("显式传入 sessionId ⇒ 不得出现该 WARN（反向：证明告警由缺失触发而非恒发）")
+                .noneMatch(m -> m.contains("sessionId 未显式传入"));
+
+            appender.list.clear();
+            prefetcher.resolveMemoryDirs("no mention at all", cwd.toString(), null);
+            assertThat(messages(appender))
+                .as("无 @-mention ⇒ 不查表 ⇒ 不得告警（避免每轮刷屏）")
+                .noneMatch(m -> m.contains("sessionId 未显式传入"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
+    private static java.util.List<String> messages(
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender) {
+        return appender.list.stream()
+            .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+            .toList();
     }
 
     @Test

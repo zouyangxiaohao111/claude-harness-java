@@ -148,7 +148,7 @@ public class MemoryPrefetcher {
     private final MemoryAge memoryAge;
     private final BooleanSupplier autoMemoryEnabled;
     private final BooleanSupplier mothCopseFlag;
-    private final java.util.function.Supplier<AgentDefinitionRegistry> agentRegistrySupplier;
+    private final java.util.function.Function<String, AgentDefinitionRegistry> agentRegistryForSession;
     private final AgentMemoryDirectory agentMemoryDirectory;
 
     private final ExecutorService executor = Executors.newFixedThreadPool(2, r -> {
@@ -162,10 +162,17 @@ public class MemoryPrefetcher {
      * @param autoMemPaths          自动记忆路径解析（CC getAutoMemPath 等价）
      * @param memoryAge             memoryAge 4 函数（CC memoryAge.ts 等价，注入头新鲜度）
      * @param autoMemoryEnabled     CC isAutoMemoryEnabled 门控（生产 BundledSkillEnabledGates::isAutoMemoryEnabled）
-     * @param agentRegistrySupplier agent 定义注册中心供应器（G-19/G-69 @-mention 检索隔离 · CC
-     *                              toolUseContext.options.agentDefinitions.activeAgents 等价；
+     * @param agentRegistryForSession agent 定义注册中心供应器（G-19/G-69 @-mention 检索隔离 · CC
+     *                              toolUseContext.options.agentDefinitions.activeAgents 等价）。
+     *                              <p><b>[acc7/D1] 入参 = sessionId（原 {@code Supplier<Registry>} 0 参
+     *                              装不下会话 ⇒ 恒进程默认）</b>：生产实现
+     *                              {@code sessionId -> SubagentTool.agentRegistry(sessionId)}
+     *                              （ToolRegistrationConfig），sessionId 由 {@link #startPrefetch} 从
+     *                              {@code ToolUseContext.sessionId()} 显式透传。
      *                              惰性求值（bean 装配期不得强制解析 —— Spring @Lazy 代理 + 循环
-     *                              依赖防护）；可 null = 无 agent 定义 → 兜底 autoMemPath）
+     *                              依赖防护）；可 null = 无 agent 定义 → 兜底 autoMemPath。
+     *                              入参 sessionId 可为 null/空白（无会话）⇒ 实现方按进程默认兜底，
+     *                              消费侧 {@link #resolveMemoryDirs} 在 @-mention 实际查表时 ≥WARN。
      * @param agentMemoryDirectory  agent memory 目录解析（CC getAgentMemoryDir 等价；可 null =
      *                              @-mention 隔离不可用 → 兜底 autoMemPath）
      */
@@ -174,14 +181,14 @@ public class MemoryPrefetcher {
                             MemoryAge memoryAge,
                             BooleanSupplier autoMemoryEnabled,
                             BooleanSupplier mothCopseFlag,
-                            java.util.function.Supplier<AgentDefinitionRegistry> agentRegistrySupplier,
+                            java.util.function.Function<String, AgentDefinitionRegistry> agentRegistryForSession,
                             AgentMemoryDirectory agentMemoryDirectory) {
         this.findRelevant = Objects.requireNonNull(findRelevant);
         this.autoMemPaths = Objects.requireNonNull(autoMemPaths);
         this.memoryAge = Objects.requireNonNull(memoryAge);
         this.autoMemoryEnabled = Objects.requireNonNull(autoMemoryEnabled);
         this.mothCopseFlag = Objects.requireNonNull(mothCopseFlag);
-        this.agentRegistrySupplier = agentRegistrySupplier;
+        this.agentRegistryForSession = agentRegistryForSession;
         this.agentMemoryDirectory = agentMemoryDirectory;
     }
 
@@ -199,23 +206,32 @@ public class MemoryPrefetcher {
      */
     public MemoryPrefetch startPrefetch(List<ChatMessageDto> messages, FileStateCache readFileState,
                                         AbortController turnAbortController) {
-        return startPrefetch(messages, readFileState, turnAbortController, null, null);
+        return startPrefetch(messages, readFileState, turnAbortController, null, null, null);
     }
 
     /**
-     * [批 4b-1] 显式会话项目根版本 · 见 {@link #startPrefetch(List, FileStateCache, AbortController)}。
+     * [批 4b-1][acc7/D1] 显式会话版本 · 见 {@link #startPrefetch(List, FileStateCache, AbortController)}。
      *
      * <p>WHY 需要：预取的检索目录（agent-memory PROJECT/LOCAL scope、auto-memory per-project）原先经
      * {@code AutoMemPaths.CURRENT_PROJECT_ROOT} ThreadLocal 隐式解析，载体已删 ⇒ 会话线程必须显式传入，
      * 否则目录解析不出（auto-memory 静默不预取 = 功能退化）。
      *
+     * <p><b>[acc7/D1] sessionId 同为本方法显式形参</b>：@-mention 查 agent-defs 表（
+     * {@link #resolveMemoryDirs(String, String, String)}）原先经 0 参
+     * {@code Supplier<AgentDefinitionRegistry>} 得<b>进程默认</b>表 —— 0 参装不下会话。现随
+     * sessionProjectRoot 一并从当前 turn 的 {@code ToolUseContext} 显式透传（生产调用点
+     * {@code LlmAgentLoop}），不读 MDC/不回落。
+     *
      * @param sessionProjectRoot 会话绑定项目根（{@code ToolUseContext.effectiveCwd()} / 会话绑定项目）；null → 无显式根
+     * @param sessionId 会话 ID（{@code ToolUseContext.sessionId()}）· @-mention 查 agent-defs 表的会话键；
+     *                  null/空白 → 经 registry 进程默认兜底 + 消费侧 ≥WARN（{@code resolveMemoryDirs}）
      * @param agentContext [S1-T7] agent 归因上下文（来源 {@code ToolUseContext.agentContext()}）·
      *                     作为**值**下传到固定池线程（见 {@link FindRelevantMemories#findRelevantMemories}）；
      *                     null → 无归因上下文
      */
     public MemoryPrefetch startPrefetch(List<ChatMessageDto> messages, FileStateCache readFileState,
                                         AbortController turnAbortController, String sessionProjectRoot,
+                                        String sessionId,
                                         com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // 门控 1：isAutoMemoryEnabled · 门控 2：tengu_moth_copse（GB flag）
         if (!autoMemoryEnabled.getAsBoolean() || !mothCopseFlag.getAsBoolean()) {
@@ -270,7 +286,7 @@ public class MemoryPrefetcher {
             : new AbortController();
         // G-19/G-69（F3 补登）：@-mention 检索隔离 —— 输入含 agent @-mention → 仅搜索匹配
         // agent 的 memory 目录；否则 [getAutoMemPath()]（attachments.ts:2204-2213）。
-        List<Path> memoryDirs = resolveMemoryDirs(input, sessionProjectRoot);
+        List<Path> memoryDirs = resolveMemoryDirs(input, sessionProjectRoot, sessionId);
 
         // promise 恒正常完成（catch → []）· CC :2392-2404
         CompletableFuture<List<RelevantMemoryAttachment>> promise = CompletableFuture.supplyAsync(
@@ -300,30 +316,43 @@ public class MemoryPrefetcher {
      * 输入含 agent @-mention → 每个 mention 查 activeAgents 找到带 memory scope 的 agent →
      * getAgentMemoryDir 单目录；命中列表为空 → {@code [getAutoMemPath()]}。
      *
-     * <p><b>[批 3c 未决项]</b> {@code agentRegistrySupplier} 无会话形参（bean 级装配）→ 经无参
-     * {@code SubagentTool.agentRegistry()} 得<b>进程默认</b>（workspaceDir）agent-defs；原会话源
-     * （裸 MDC）已按批 3c 删除。多项目部署下 @-mention 的 memory scope 查表可能与当前会话的
-     * per-session agent-defs 不一致。待决策：给 {@code startPrefetch}/{@code resolveMemoryDirs}
-     * 加 sessionId 形参（来源 {@code LlmAgentLoop} 的 {@code params.toolUseContext().sessionId()}）。
+     * <p><b>[acc7/D1/D3 已收口]</b> {@code agentRegistryForSession} 入参 = sessionId（会话显式）——
+     * 原 0 参 {@code Supplier} 装不下会话 ⇒ 恒<b>进程默认</b>（workspaceDir）agent-defs。现
+     * sessionId 由 {@link #startPrefetch} 从 {@code ToolUseContext.sessionId()} 显式透传；
+     * 传 null/空白（无会话源）时实现方按进程默认兜底，本方法在 @-mention <b>实际查表</b>时 ≥WARN
+     * （⛔ 禁只 DEBUG、禁静默跨会话取表）。
      *
      * @param input 用户 query（CC original: input）
      * @return 检索目录列表（CC original: dirs）
      */
     List<Path> resolveMemoryDirs(String input) {
-        return resolveMemoryDirs(input, null);
+        return resolveMemoryDirs(input, null, null);
     }
 
     /**
-     * [批 4b-1] 显式会话项目根版本 · 见 {@link #resolveMemoryDirs(String)}。
+     * [批 4b-1][acc7/D1] 显式会话版本 · 见 {@link #resolveMemoryDirs(String)}。
      *
      * @param sessionProjectRoot 会话绑定项目根；null → USER scope 仍可用，PROJECT/LOCAL 检索目录
      *                           按 (b) 跳过 + ≥WARN（⛔ 不回落 config home 拼假目录）
+     * @param sessionId          会话 ID · @-mention 查 agent-defs 表的会话键（CC
+     *                           {@code toolUseContext.options.agentDefinitions} 等价）；null/空白 →
+     *                           进程默认兜底 + @-mention 查表时 ≥WARN
      */
-    List<Path> resolveMemoryDirs(String input, String sessionProjectRoot) {
+    List<Path> resolveMemoryDirs(String input, String sessionProjectRoot, String sessionId) {
         List<Path> dirs = new ArrayList<>();
-        AgentDefinitionRegistry registry = agentRegistrySupplier != null ? agentRegistrySupplier.get() : null;
+        AgentDefinitionRegistry registry =
+            agentRegistryForSession != null ? agentRegistryForSession.apply(sessionId) : null;
         if (input != null && registry != null && agentMemoryDirectory != null) {
-            for (String mention : extractAgentMentions(input)) {
+            List<String> mentions = extractAgentMentions(input);
+            // [acc7/D3] 会话源缺失 ⇒ apply(null) 得**进程默认**（workspaceDir）agent-defs —
+            //   多项目部署下 @-mention 的 memory scope 查表会跨会话取错表（静默退化）。
+            //   本仓铁律：会话态不得静默回落 ⇒ ≥WARN（⛔ 禁只 DEBUG；仅在实际查表时告警，不刷屏）。
+            if (!mentions.isEmpty() && (sessionId == null || sessionId.isBlank())) {
+                log.warn("[MemoryPrefetcher] @-mention 需按会话查 agent-defs 但 sessionId 未显式传入"
+                    + " → 按进程默认（workspaceDir）registry 查表，多项目部署下可能与当前会话不一致"
+                    + "（mentions={}，CC 等价源 toolUseContext.options.agentDefinitions）", mentions);
+            }
+            for (String mention : mentions) {
                 // CC :2207-2211 mention.replace('agent-', '') → agents.find(def.agentType === type)
                 String agentType = mention.replace("agent-", "");
                 AgentDefinition def = registry.findAgent(agentType);

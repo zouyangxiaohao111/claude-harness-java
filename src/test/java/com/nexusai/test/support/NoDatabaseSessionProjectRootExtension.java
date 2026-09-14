@@ -27,8 +27,9 @@ import org.slf4j.LoggerFactory;
  * {@code @BeforeEach} 后装同一个语义的解析器，净效果相同）。
  *
  * <h2>语义（⛔ 本扩展<b>不放宽生产侧的 fail-loud</b>）</h2>
- * <p>本扩展注入的解析器答 {@link SessionProjectRoot.Lookup#unknown()}（= <b>DB 明确答「无此会话」</b>），
- * <b>不是</b> {@link SessionProjectRoot.Lookup#resolutionFailure()}：
+ * <p>本扩展注入的解析器答 {@link SessionProjectRoot.Lookup#sessionlessEnvironment()}（= <b>本环境
+ * 确无会话</b>），<b>不是</b> {@link SessionProjectRoot.Lookup#resolutionFailure()}（无法判定）
+ * 也<b>不是</b> {@link SessionProjectRoot.Lookup#unknown()}（DB 明确答无此会话）：
  * <table border="1">
  *   <caption>同一状态在两个环境里的正确语义</caption>
  *   <tr><th>环境</th><th>「没有回源解析器」意味着</th><th>正确行为</th></tr>
@@ -36,9 +37,16 @@ import org.slf4j.LoggerFactory;
  *       <td>🔴 fail-loud（{@link SessionProjectRoot.Lookup#resolutionFailure()}）——
  *           ⛔ <b>用户裁定 F-09/F-20 (A) 保持不变，本扩展不触碰</b></td></tr>
  *   <tr><td><b>测试</b></td><td>常态（纯 JUnit 夹具不接 DB）</td>
- *       <td>⚪ 默认答「无此会话」（{@code unknown()}）⇒ cwd 域走命名无会话出口，行为等于改造前</td></tr>
+ *       <td>⚪ 默认答「本环境确无会话」（{@code sessionless()}）⇒ cwd 域走命名无会话出口
+ *           （进程 user.dir），行为等于改造前</td></tr>
  * </table>
- * <p>⛔ 两者必须分开表达，否则「装配故障」与「夹具无 DB」再次混为一谈 —— 而那正是 S2 要治的病。
+ * <p>⛔ 三者必须分开表达，否则「装配故障」/「夹具无 DB」/「会话已删」再次混为一谈 —— 而那正是
+ * S2 要治的病。
+ * <p><b>[cwd3 步骤 2] 为什么从 {@code unknown()} 切到 {@code sessionless()}（⛔ 不是笔误）</b>：
+ * 步骤 2 把 cwd 域的 {@code unknown} 分支从「回落进程 user.dir」改成 <b>fail-loud 抛</b>。夹具的
+ * 「本 JVM 不连 DB」<b>不是</b>「DB 说没有这一行」—— 后者是数据链路异常，前者是夹具的常态 ⇒ 必须
+ * 换到语义正确的那一态，否则每个用合成 sessionId 的纯 JUnit 夹具都会撞 fail-loud（改前实测
+ * 66 个 {@code LlmAgentLoop*} 类就是撞在这个错位上）。
  * 本扩展<b>只在测试类路径生效</b>（{@code src/test/java} + {@code src/test/resources}），生产代码
  * 里没有任何引用点。
  *
@@ -92,11 +100,13 @@ public final class NoDatabaseSessionProjectRootExtension implements BeforeEachCa
     private static final String INSTALLED_KEY = "installedNoDatabaseResolver";
 
     /**
-     * 测试环境默认解析器：<b>答「无此会话」</b>（⛔ 不是 {@code resolutionFailure()}）。
+     * 测试环境默认解析器：<b>答「本环境确无会话」</b>
+     * （{@code Lookup.sessionlessEnvironment()}；⛔ 既不是 {@code resolutionFailure()}，
+     * 也<b>不再是</b> {@code unknown()} —— 见下「[cwd3 步骤 2] 为什么从 unknown 切到 sessionless」）。
      * <p>无状态、幂等 ⇒ 全局复用同一实例（不每用例新建）。
      */
     private static final SessionProjectRoot.DbResolver NO_DATABASE_RESOLVER =
-        sessionId -> SessionProjectRoot.Lookup.unknown();
+        sessionId -> SessionProjectRoot.Lookup.sessionlessEnvironment();
 
     /** ServiceLoader 需要（public 无参构造；显式声明以便「为什么是 public」可检索）。 */
     public NoDatabaseSessionProjectRootExtension() {}
@@ -118,7 +128,8 @@ public final class NoDatabaseSessionProjectRootExtension implements BeforeEachCa
         SessionProjectRoot.setDbResolver(NO_DATABASE_RESOLVER);
         context.getStore(NAMESPACE).put(INSTALLED_KEY, Boolean.TRUE);
         if (log.isDebugEnabled()) {
-            log.debug("[fix-junit] 已装「测试环境无 DB」默认解析器（答 unknown，⛔ 非 resolutionFailure）: "
+            log.debug("[fix-junit] 已装「测试环境无 DB」默认解析器（答 sessionless，"
+                + "⛔ 非 resolutionFailure 也非 unknown）: "
                 + "测试类={} 用例={}", context.getRequiredTestClass().getSimpleName(),
                 context.getDisplayName());
         }

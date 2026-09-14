@@ -125,11 +125,12 @@ public final class AgentsHandler {
      * <p>WHY（探查 GAP-1/M-1）：Java 侧各组件上游存在但 agentsHandler 入口 0 生产调用方 → 端点
      * 缺失使 `claude agents` 等价命令后端不可达。本端点补上生产入口。
      *
-     * <p><b>[批 3c 未决项] 无会话来源</b>：本 {@code @GetMapping} 无 sessionId 查询参数
-     * （同类 {@link #list(String)} 有 {@code @RequestParam(required=false) String sessionId}）→
-     * {@link SubagentTool#listAgents()} 只能给<b>进程默认</b>（workspaceDir）agent-defs。原会话源
-     * （裸 MDC）已按批 3c 删除。待决策：给本端点补可选 {@code sessionId} 查询参数并改调
-     * {@link SubagentTool#listAgents(String)}（对齐 {@link #list(String)} 手法）。
+     * <p><b>[acc7/D4 已裁定：无会话源，保持 0 参 + ≥WARN]</b>：本 {@code @GetMapping} 无 sessionId
+     * 查询参数（同类 {@link #list(String)} 有 {@code @RequestParam(required=false) String sessionId}），
+     * 且 MDC/RequestContext 已按本仓铁律禁为会话源（threadlocal-session-state-global-ban）⇒
+     * {@link SubagentTool#listAgents()} 只能给<b>进程默认</b>（workspaceDir）agent-defs。
+     * 详见 {@link #agents()} 内注释。根治选项（补可选 {@code sessionId} 查询参数并改调
+     * {@link SubagentTool#listAgents(String)}，对齐 {@link #list(String)} 手法）需用户决策后另行施工。
      *
      * @return 对齐 CC agents.ts 文本（"{count} active agents\n\n{lines}" / "No agents found."）
      */
@@ -139,7 +140,18 @@ public final class AgentsHandler {
             log.warn("[AgentsHandler] SubagentTool 未注入，agents 端点返回空（plain JUnit 无 Spring 容器）");
             return "No agents found.";
         }
-        // [批 3c 未决项] 本端点无 sessionId 形参 → 进程默认视图（禁发明会话 id；见方法 javadoc）
+        // [acc7/D4 已裁定：本端点<b>确实无</b>会话源] 两层判据：
+        //   ① 本 @GetMapping 签名无任何请求参数（既无 sessionId 形参，也无 HTTP 会话域）；
+        //   ② 进程内唯一「隐式会话源」RequestContext（MDC）已被本仓铁律禁读
+        //      （threadlocal-session-state-global-ban：「会话态一律不得经 ThreadLocal/MDC 读」，
+        //       且 RequestContext.sessionId() 存在「上一请求残留会话 id」第三态，比 null 更坏）
+        //   ⇒ 会话源不可得。⛔ 禁发明会话 id、禁静默退化 ⇒ 走 0 参 listAgents()（进程默认
+        //   workspaceDir agent-defs）并 ≥WARN（对齐 T15-3 F2/F3 治法）。
+        //   根治选项（需用户决策，本批未做）：给本端点补可选 @RequestParam sessionId 改调
+        //   listAgents(String)，手法同同类 {@link #list(String)}（:189）—— 会新增前端契约面，
+        //   超出本批授权（见派单书 D4「⛔ 不要为了改而改硬塞假 sessionId」）。
+        log.warn("[AgentsHandler] agents 端点无会话源（无 sessionId 请求参数；MDC/RequestContext 已禁读）"
+            + " → agent 列表按进程默认（workspaceDir）agent-defs，多项目部署下可能与当前会话不一致");
         List<AgentDefinition> allAgents = subagentTool.listAgents();
         if (allAgents == null || allAgents.isEmpty()) {
             return "No agents found.";

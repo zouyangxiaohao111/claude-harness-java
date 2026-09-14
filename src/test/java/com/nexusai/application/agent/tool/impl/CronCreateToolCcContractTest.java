@@ -177,6 +177,33 @@ class CronCreateToolCcContractTest {
             .isNull();
     }
 
+    @Test
+    @DisplayName("[cwd3 步骤1a] DURABLE + 无 ctx ⇒ sessionId = NO_SESSION 哨兵（显式声明无会话，⛔ 不是 null）")
+    void executePersistentWithoutCtx_usesNoSessionSentinel() {
+        // WHY（规则九 · 意图）：本分支（ctx==null 或 ctx.sessionId()==null）结构上确无会话 ⇒ 必须
+        //   **显式**声明（SessionKeys.NO_SESSION），而不是用 null 冒充。区别是致命的：null 会在下游
+        //   被 resolveSessionUuid 兜成内部占位键并在 cwd 域落「DB 查无此会话」分支，而哨兵在
+        //   CwdResolution 顶部被显式识别 ⇒ 走命名无会话出口（且步骤 2 起 unknown 分支 fail-loud 抛）。
+        // RED：把 CronCreateTool 该分支改回 `sessionId = null` ⇒ 本断言红。
+        ScheduleService svc = mock(ScheduleService.class);
+        stubNoNameCollision(svc);
+        when(svc.create(any(ScheduleCreateRequest.class))).thenReturn(created("job-no-ctx", ScheduleScope.DURABLE));
+        CronCreateTool tool = new CronCreateTool(svc, CronEnabledGates.DEFAULTS);
+
+        ToolResult<?> r = (ToolResult<?>) tool.execute(
+            call("c1", input("0 9 * * *", "run smoke test", true, true)), null);
+
+        assertThat(r.data()).as("无 ctx 的 DURABLE 创建必须仍成功（不是 error）").isNotNull();
+        ArgumentCaptor<ScheduleCreateRequest> cap = ArgumentCaptor.forClass(ScheduleCreateRequest.class);
+        verify(svc).create(cap.capture());
+        assertThat(cap.getValue().sessionId())
+            .as("无 ctx ⇒ 必须显式传「确无会话」哨兵，而非 null")
+            .isEqualTo(com.nexusai.common.SessionKeys.NO_SESSION);
+        assertThat(cap.getValue().boundProject())
+            .as("无会话 ⇒ 无锚")
+            .isNull();
+    }
+
     // ═════════════ validateInput 四错误码（CC :82-116，顺序 1→2→3→4 固定）═════════════
 
     @Test

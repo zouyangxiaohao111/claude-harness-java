@@ -1,5 +1,7 @@
 package com.nexusai.domain.schedule;
 
+import com.nexusai.common.SessionKeys;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.model.schedule.dto.RunNowResponse;
 import com.nexusai.model.schedule.dto.ScheduleCreateRequest;
 import com.nexusai.model.schedule.dto.ScheduleDto;
@@ -9,6 +11,7 @@ import com.nexusai.model.schedule.dto.ScheduleUpdateRequest;
 import com.nexusai.repository.schedule.entity.ScheduleRecord;
 import com.nexusai.infra.exception.MaxJobsExceededException;
 import com.nexusai.infra.exception.NotFoundException;
+import com.nexusai.infra.exception.UnresolvedProjectRootException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.repository.schedule.mapper.ScheduleMapper;
 import com.nexusai.application.agent.telemetry.Telemetry;
@@ -212,6 +215,14 @@ public class ScheduleService {
         if (scope == ScheduleScope.SESSION && (sessionId == null || sessionId.isBlank())) {
             throw new ValidationException("scope=SESSION requires non-empty 'sessionId'");
         }
+        // [cwd3 · 用户裁定 2026-09-15 步骤 1a] DURABLE 的 sessionId 语义已从「可空」改为
+        //   「必须为真实会话或显式哨兵」：
+        //     · REST 直建（POST /api/v1/schedules）—— 缺 id / 假 id(哨兵) / 解析不到绑定项目根
+        //       三种情况在 **ScheduleController.create** 就被拒（400），见该方法 javadoc；
+        //     · 工具路径（CronCreateTool）无 ctx ⇒ 传 SessionKeys.NO_SESSION 哨兵（显式声明无会话）；
+        //     · 本方法只负责「锚的唯一来源」：见下方 DURABLE 分支的归一取值。
+        //   ⛔ 不把 REST 的 400 判据下沉到本方法 —— 工具路径无 HTTP，且 8 处直调本方法的单测
+        //      依赖 blank 放行语义。
 
         ScheduleRecord s = new ScheduleRecord();
         // CRON-F1: req.id() 为 CronCreateTool one-shot 预生成 id（jitter taskId 依赖，见
@@ -248,18 +259,37 @@ public class ScheduleService {
         s.setAgentId(req.agentId());
         // 批次X Q2: DURABLE 任务存 boundProject（创建会话绑定项目）· CC original: 无字段
         // （CC durable 项目锚=文件位置 cronTasks.ts:74-83；Java 全局单表须显式落列 V23）。
-        // 仅 DURABLE scope 透传 req.boundProject()（CronCreateTool 填创建会话绑定项目）；
+        // [cwd3 · 步骤 1a] 锚的**唯一来源 = sessionId 解析结果**（见下方 DURABLE 分支），
+        // ⛔ 不再透传 req.boundProject()（那让调用方可任意指定项目锚）。
         // SESSION 恒 null（其项目锚由 sessionId 恢复路径承载，两路径清晰分离）。
-        // 无会话 REST 直建 DURABLE（boundProject=null）→ 列留 null，fire 兜底 user.dir
-        // （已知差异：CC 所有 durable 任务都在会话里创建）。
         //
         // [cron-durable-session-fire] DURABLE 的 session_id 语义 = 归属对话/注入目标（非 SESSION 的
         // 生命周期绑定）：CronCreateTool DURABLE 分支现在也存创建会话 sessionId（有会话时），
         // fire 时 CronIdleExecutor 据此判定创建会话存活 → transcript 归创建会话文件；已关 →
         // headless 无 transcript。cleanupBySession 只按 scope=SESSION 过滤（ScheduleService:941），
         // DURABLE 行带 sessionId 不会被误删（生命周期绑定仍归 SESSION）。
+        // [cwd3 · 步骤 1a] DURABLE 项目锚归一取值（sentinel-aware）：
+        //   · 真实会话 id ⇒ 必须能从它解析出绑定项目根，否则抛（锚绝不来自请求体）；
+        //   · null/空白/**哨兵** ⇒ 无锚（bound_project 恒 NULL）—— 这是工具路径
+        //     「无 ctx ⇒ SessionKeys.NO_SESSION」（CronCreateTool）与既有单测的合法形态；
+        //     经 REST 的「无会话 DURABLE」已被 ScheduleController.create 拒掉 ⇒ 不会由此产生。
+        //   ⛔ 不得回写成 s.setBoundProject(req.boundProject())：那正是本批要堵的「客户端伪造锚」。
+        //   RED（RE-1a-3）：把 else 分支改回 req.boundProject() ⇒ 「DURABLE+null ⇒ bound_project
+        //   恒 NULL」断言翻红（该断言是「无会话 ⇒ 无锚」不变量的守护，不是「不抛」）。
         if (scope == ScheduleScope.DURABLE) {
-            s.setBoundProject(req.boundProject());
+            if (sessionId != null && !sessionId.isBlank() && !SessionKeys.isNoSession(sessionId)) {
+                SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup(sessionId);
+                if (lk.resolutionFailed() || lk.projectRoot() == null || lk.projectRoot().isBlank()) {
+                    log.warn("[Schedule] create() DURABLE 锚解析失败: sessionId={} sessionKnown={} "
+                        + "resolutionFailed={}", sessionId, lk.sessionKnown(), lk.resolutionFailed());
+                    throw new UnresolvedProjectRootException(
+                        "scope=DURABLE: sessionId=" + sessionId + " 解析不到绑定项目根（sessionKnown="
+                            + lk.sessionKnown() + " resolutionFailed=" + lk.resolutionFailed() + "）");
+                }
+                s.setBoundProject(lk.projectRoot());
+            } else {
+                s.setBoundProject(null);
+            }
         }
         // CRON-B2: permanent 默认 false · CC original: CronTask.permanent
         // (cronTasks.ts:57 工具不可设，缺省 false=不豁免 7 天过期)。
@@ -319,7 +349,8 @@ public class ScheduleService {
      * <ol>
      *   <li>按 id 读既有记录（不存在 → {@link NotFoundException}）；</li>
      *   <li>仅覆盖请求体中非 null 字段（name/kind/cron/intervalSeconds/runAt/command/
-     *       description/scope/sessionId/agentId）；</li>
+     *       description/agentId）；<b>[cwd3 · D6] {@code scope}/{@code sessionId} 创建后不可变</b>
+     *       —— 带值即 400，理由见方法体内注释（堵「建完再改绕过强制会话锚」的旁路）；</li>
      *   <li><b>createdAt 保留</b>（不触碰，对齐 CC CronTask.createdAt 创建即锚定不可漂移）；
      *       lastRunAt/lastRunStatus/permanent 亦保留（不随 update 重置）；</li>
      *   <li>写回 DB（{@code scheduleMapper.update} 整行写，与 {@link #runNow} 同模式）；</li>
@@ -335,7 +366,22 @@ public class ScheduleService {
         ScheduleRecord s = scheduleMapper.selectOneById(id);
         if (s == null) throw new NotFoundException("Schedule " + id + " not found");
 
-        // partial update：仅覆盖非 null 字段（全字段可选）
+        // [cwd3 · 步骤 1a · D6 堵旁路] scope/sessionId **创建后不可变** ⇒ 显式拒绝（400）。
+        //   WHY（不堵会怎样）：ScheduleUpdateRequest 带这两个字段且原实现零校验地覆盖 ⇒
+        //   「先建任意任务，再 POST /{id} 改成 DURABLE + session_id=null」即可绕过
+        //   ScheduleController.create 的强制会话锚（也会把 SESSION 任务改成无生命周期绑定的孤儿行）。
+        //   ⛔ 不采用「静默忽略该两字段」：那会让调用方以为改动生效（本仓规则十二：不许静默失效）。
+        //   影响面：前端 SchedulesPanel.buildRequest 从不发送 scope/sessionId（已核 2026-09-15）
+        //   ⇒ 对既有调用方零影响。
+        if (req.scope() != null || req.sessionId() != null) {
+            log.warn("[Schedule] update() 拒绝修改不可变字段 id={} scope={} sessionId={}",
+                id, req.scope(), req.sessionId());
+            throw new ValidationException(
+                "scope/sessionId are immutable after creation (create-time anchor): "
+                    + "delete and re-create the schedule instead");
+        }
+
+        // partial update：仅覆盖非 null 字段（全字段可选；scope/sessionId 见上，不可变）
         if (req.name() != null) s.setName(req.name());
         if (req.kind() != null) s.setKind(req.kind().name());
         if (req.cron() != null) s.setCron(req.cron());
@@ -343,8 +389,6 @@ public class ScheduleService {
         if (req.runAt() != null) s.setRunAt(req.runAt());
         if (req.command() != null) s.setCommand(req.command());
         if (req.description() != null) s.setDescription(req.description());
-        if (req.scope() != null) s.setScope(req.scope().name());
-        if (req.sessionId() != null) s.setSessionId(req.sessionId());
         if (req.agentId() != null) s.setAgentId(req.agentId());
         // 批次X Q2: boundProject 为创建时项目锚（对齐 CC STATE.projectRoot 启动冻结语义，
         // B 探查 §7.3：锚来源=创建会话绑定项目，fire 恢复=写回执行线程项目上下文），

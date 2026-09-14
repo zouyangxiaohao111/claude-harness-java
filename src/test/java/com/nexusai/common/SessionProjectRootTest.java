@@ -196,6 +196,53 @@ class SessionProjectRootTest {
         assertThat(lk.sessionKnown()).as("DB 无此会话 ⇒ sessionKnown=false").isFalse();
     }
 
+    /**
+     * [cwd3 步骤 2 · S2-P2] ⭐ 回源器答 {@code sessionless} 必须<b>原样上浮</b>（pass-through）。
+     *
+     * <p><b>WHY（这是整个测试面修法的承重点）</b>：{@code sessionless} 与 {@code unknown} 的
+     * {@code (projectRoot, sessionKnown, resolutionFailed)} 逐字段相同（都是 null/false/false），
+     * 差别只在第 4 个标记。{@code refillFromDb} 的 {@code path == null/blank} 分支会把结果
+     * <b>重算</b>成 {@code sessionKnown() ? unbound() : unknown()} ⇒ <b>不加 pass-through 这一行，
+     * sessionless 一律被压成 unknown</b> ⇒ cwd 域把它当「DB 明确答无此会话」fail-loud 抛 ⇒
+     * 全部「确无会话」的合法路径（MCP 入站 / standalone 子代理 / 无 ctx 工具调用 / 纯 JUnit 夹具）
+     * 一起被打死，而所有夹具切 sessionless 的改动变成<b>空操作</b>。
+     *
+     * <p>RED（反向实验）：删掉 {@code refillFromDb} 里 `if (fromDb.sessionless()) return fromDb;`
+     * 那一行 ⇒ 本用例红（返回 unknown 而非 sessionless）。
+     */
+    @Test
+    @DisplayName("[cwd3 S2-P2] 回源器答 sessionless ⇒ 原样上浮（⛔ 不得被压成 unknown）")
+    void resolverSessionless_survivesRefill() {
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
+
+        SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("sess-any-1");
+        assertThat(lk.sessionless())
+            .as("[S2-P2] sessionless 必须原样上浮；被压成 unknown ⇒ cwd 域会 fail-loud 抛")
+            .isTrue();
+        assertThat(lk)
+            .as("与 unknown() 严格可分（这正是加第 5 态的全部理由）")
+            .isNotEqualTo(SessionProjectRoot.Lookup.unknown());
+        assertThat(lk.sessionKnown()).isFalse();
+        assertThat(lk.resolutionFailed()).isFalse();
+        assertThat(SessionProjectRoot.getForSession("sess-any-1"))
+            .as("既有读法（memory 域）仍返回 null")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("[cwd3 步骤 2] lookup(null) 与 lookup(NO_SESSION 哨兵) ⇒ sessionless（⛔ 不是 unknown）")
+    void lookupNullAndSentinel_areSessionless() {
+        // WHY：两者都表示「本条路径结构上确无会话」（铁律出口 (b)）。⛔ 若返回 unknown，步骤 2 后
+        //   cwd 域/直调方会把「没传 sessionId」与「哨兵」报成「DB 说没有这一行」——一次 DB 都没查过。
+        assertThat(SessionProjectRoot.lookup(null).sessionless())
+            .as("null sessionId ⇒ sessionless").isTrue();
+        assertThat(SessionProjectRoot.lookup(com.nexusai.common.SessionKeys.NO_SESSION).sessionless())
+            .as("哨兵 ⇒ sessionless").isTrue();
+        assertThat(SessionProjectRoot.lookup(null))
+            .as("⛔ lookup(null) 不得返回 unknown（那会把「没问过 DB」说成「DB 答了没有」）")
+            .isNotEqualTo(SessionProjectRoot.Lookup.unknown());
+    }
+
     @Test
     @DisplayName("[批 4a #9] 回源值无效（目录不存在）⇒ 按「有会话但绑定失效」处理且<b>不回填</b>")
     void dbResolver_invalidRootNotCached() throws Exception {

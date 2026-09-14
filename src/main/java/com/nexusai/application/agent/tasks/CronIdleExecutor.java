@@ -63,10 +63,29 @@ public class CronIdleExecutor {
      * 存活 → 创建会话 short；已关 → null（headless 无 transcript，见 {@link #runOneAgentLoop}）。
      * CC 单进程单主会话；Java 多会话 → cron 任务归组创建会话。
      *
-     * <p>[session-id-short] GLOBAL 占位键由 UUID(0,0)c001 → {@code "global"}：保持非 null 以维持
-     * markRunning 计数语义（markRunning(null) 早退漏计数）；真实会话恒 "sess-" 前缀不冲突。
+     * <p>[session-id-short] GLOBAL 占位键由 UUID(0,0)c001 → {@code "global"} → <b>[cwd3 2026-09-15]
+     * {@link SessionKeys#NO_SESSION}</b>：保持非 null 以维持 markRunning 计数语义（markRunning(null)
+     * 早退漏计数）；真实会话恒 "sess-" 前缀不冲突。
+     *
+     * <p><b>[cwd3 · 用户裁定 2026-09-15 步骤 1b] 为什么必须换成哨兵（⛔ 不是防御性改动）</b>：
+     * 本键是「结构上确无会话」的合法路径在<b>唯一会话槽位</b>上的占位 —— 它经
+     * {@link #resolveSessionUuid(String)} 流进 {@code RunRequest.sessionId}，下游
+     * {@code CwdResolution.getCwd} 会拿它解析 cwd。步骤 2 把 cwd 域的「DB 明确答『无此会话』」
+     * 从「回落进程 user.dir」改成 <b>fail-loud 抛</b>后，若本键仍是 {@code "global"}，它就是一个
+     * DB 查不到的普通串 ⇒ 会撞 fail-loud <b>直接抛崩</b>。改用 {@link SessionKeys#NO_SESSION} 后，
+     * {@link SessionKeys#isNoSession(String)} 在 {@code CwdResolution} 顶部<b>短路</b>到命名无会话
+     * 出口（不查 DB、不打「伪造 id」告警、不打「DB 无此会话」告警，改打
+     * {@code warnNoSessionSentinel}）。
+     *
+     * <p><b>产出点穷举（1b 覆盖面，2026-09-15 grep 实测）</b>：① {@link #resolveSessionUuid}
+     * （{@code :1177}，null/空白 ⇒ 本键）—— 覆盖 cron 命令（{@link #poll}）与
+     * {@code MODE_TASK_NOTIFICATION} 的 2 参 task-notification（{@link com.nexusai.application.agent.tasks.ChannelNotification}
+     * / {@code CommandHookExecutor}，见 D8）；② <b>不经本方法</b>的
+     * {@link #surfaceMissedOneShots}（{@code :216-218}）—— 它用 6 参 {@code QueueItem} 硬编码
+     * {@code sessionId=null}，与 {@code schedules} 行无关（启动期 missed 通知，行已删、N 条聚合无单一
+     * 会话），故 1a「REST 强制会话锚」改不动它，只能靠换键覆盖（D7）。
      */
-    public static final String GLOBAL_SESSION_KEY = "global";
+    public static final String GLOBAL_SESSION_KEY = SessionKeys.NO_SESSION;
 
     private static final int SETTINGS_SINGLETON_ID = 1;
 
@@ -415,7 +434,8 @@ public class CronIdleExecutor {
         NotificationQueue.QueueItem next = nextOpt.get();
         // [3d] 批量归组键：[session-id-short] QueueItem.sessionId 已 short 裸 equals 直键
         // （原 canonicalUuid 归一化铁律失去前提 —— CRON-D5 F2 双形态根因消除）。
-        // sessionId==null 全局命令归组到 GLOBAL_SESSION_KEY 占位键，同组不混会话。
+        // sessionId==null 全局命令归组到 GLOBAL_SESSION_KEY（= SessionKeys.NO_SESSION 哨兵键，
+        // [cwd3 步骤 1b]），同组不混会话。
         String targetSessionKey = next.sessionId() != null ? next.sessionId() : GLOBAL_SESSION_KEY;
         // CC queueProcessor.ts:70-74 — slash/bash 单条 dequeue
         if (isSlashCommand(next) || "bash".equals(next.mode())) {
@@ -1168,6 +1188,11 @@ public class CronIdleExecutor {
      * 不再 parseSessionUuid 归一化 —— F2 双形态根因消除）；null/空白（SESSION 无会话 / DURABLE
      * 无项目锚 / 普通 prompt）→ {@link #GLOBAL_SESSION_KEY} 兜底（保持非 null 占位以维持
      * markRunning 计数语义；边界 §7.1 safeGet 兜底不崩）。
+     *
+     * <p>[cwd3 · 步骤 1b] {@link #GLOBAL_SESSION_KEY} 的值现在是 {@link SessionKeys#NO_SESSION}
+     * 哨兵 ⇒ 返回值在 cwd 域被 {@code CwdResolution} 顶部的 {@code SessionKeys.isNoSession} 短路
+     * <b>显式识别</b>，走命名无会话出口 {@code getCwdForNonSession()}（不查 DB、不打「伪造 id」
+     * 告警）—— 而不再是「DB 查无此会话」的 unknown 分支（步骤 2 起该分支 fail-loud 抛）。
      * [cron-durable-session-fire] DURABLE 命令现在携带创建会话 sessionId → 本方法原样透传；
      * 创建会话存活判定（{@link #isSessionAlive}）在 {@link #runOneAgentLoop} 内做，
      * 已关则直接传 null（headless 无 transcript），不经本方法 GLOBAL 兜底。

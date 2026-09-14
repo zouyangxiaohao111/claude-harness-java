@@ -453,7 +453,9 @@ public class SubagentTool implements Tool {
 
     /**
      * [Phase A 任务 4] isolation/cwd 解析器 · 决定子 Agent 有效工作目录.
-     * <p>Spring setter 注入 (可选, 未注入时回退到无 WorktreeService 的 stub, 命中 isolation=worktree 时降级到 user.dir).
+     * <p>Spring setter 注入 (可选, 未注入时回退到无 WorktreeService 的 stub；stub 只做 explicitCwd
+     * 优先解析，isolation=worktree 的**真实建树在 SubagentExecutor Step 18**).
+     * [批 subcwd D7] 其 {@code userDir} 兜底实参由调用方传**父会话 cwd**（⛔ 不再是进程 user.dir）.
      * <p>手动创建 (测试) 时也用 setter 注入, 避免污染现有 9 参构造签名.
      */
     private IsolationResolver isolationResolver;
@@ -2129,9 +2131,14 @@ public class SubagentTool implements Tool {
             //   isolation 来自 input.isolation (CC AgentTool.tsx:431 effectiveIsolation).
             if (isolation != null && "worktree".equals(isolation)) {
                 Path explicitCwd = cwd == null ? null : Paths.get(cwd);
+                // [批 subcwd D7] 兜底实参由「进程 user.dir」改为**父会话 cwd**：CC 同位置取
+                //   getCwd()（= 会话 cwd，AgentTool.tsx:751 buildWorktreeNotice(getCwd(), ...)）；
+                //   本仓 user.dir = 后端服务器启动目录，不是任何会话的项目根（一 JVM 多会话）。
+                //   sessionCwdFor(ctx) = 会话绑定项目根（冻结锚，会话态来源，恒非 null）。
+                String sessionCwdForWorktree = sessionCwdFor(ctx);
                 Path worktreePath = isolationResolver.resolve(isolation, explicitCwd, selectedAgent,
-                    Paths.get(System.getProperty("user.dir")));
-                currentCwd = System.getProperty("user.dir", ".");
+                    Path.of(sessionCwdForWorktree));
+                currentCwd = sessionCwdForWorktree;
                 if (log.isDebugEnabled()) {
                     log.debug("[SubagentTool] M1.3 fork path 派生: forkParentSystemPrompt.length={}, "
                             + "worktreePath={}, currentCwd={}",
@@ -2184,8 +2191,9 @@ public class SubagentTool implements Tool {
         //     本处 setCwd 仅作 session 维度可观测性写入 (监控 / 调试), 不在生产路径消费.
         if (isolation != null || cwd != null) {
             Path explicitCwd = cwd == null ? null : Paths.get(cwd);
+            // [批 subcwd D7] 兜底实参同 :2133 —— 父会话 cwd（会话态），⛔ 不用进程 user.dir。
             Path effective = isolationResolver.resolve(isolation, explicitCwd, selectedAgent,
-                    Paths.get(System.getProperty("user.dir")));
+                    Path.of(sessionCwdFor(ctx)));
             String trackerKey = "tool-" + call.id();
             WorktreeCwdTracker.setCwd(trackerKey, effective);
             log.info("[SubagentTool] [Phase A 任务 4] effectiveCwd={} (isolation={}, cwd={}, agent={}, trackerKey={})",

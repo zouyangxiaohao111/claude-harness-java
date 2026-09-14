@@ -81,7 +81,6 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -499,6 +498,61 @@ public class SubagentExecutor {
             //   wither 只做派生视图，非身份来源；不透传会把盖章点（withTeammateIdentity）的值清掉。
             source.teammateIdentity()
         );
+    }
+
+    /**
+     * 父会话项目根（Step 18 的 <b>worktree 创建基准</b> / worktree notice 的 parentCwd）·
+     * <b>只接受会话态来源</b>。
+     *
+     * <p><b>为什么不能是 {@code System.getProperty("user.dir")}</b>：CC 用
+     * {@code findCanonicalGitRoot(getCwd())}（worktree.ts:926）与 {@code buildWorktreeNotice(getCwd(), …)}
+     * （AgentTool.tsx:751），其 {@code getCwd()} 读 {@code STATE.cwd} —— CC 一进程一会话，进程 cwd
+     * 就是会话 cwd。本仓是<b>一 JVM 多会话 Web</b>（memory multi-session-vs-cc-single-session），
+     * {@code user.dir} = <b>后端启动目录</b>，不是任何会话的项目根 ⇒ 形态像、语义反。
+     *
+     * <p>两档会话态来源（与 Step 8/9 的 userContext / agent-memory 取值同源）：
+     * <ol>
+     *   <li>{@code agentTuc.effectiveCwd()}（:1630 —— Step 18 之前的父会话 TUC 快照；
+     *       {@code createSubagentContext.create} 已把父 effectiveCwd 继承给它）</li>
+     *   <li>{@code CwdResolution.getCwd(sessionId)}（会话 cwd / 绑定项目；其 fail-loud 语义
+     *       <b>原样保留</b>，不在此吞）—— ⛔ 只对<b>真 sessionId</b> 走：空白 / {@code NO_SESSION}
+     *       哨兵一律不查（那会命中 CwdResolution 的「无会话出口」= 进程 user.dir，正是本批要清的
+     *       隐形兜底）</li>
+     * </ol>
+     *
+     * @param agentTuc  父会话 TUC 快照（Step 18 之前派生；可为 null）
+     * @param sessionId 会话 id（可为 null/空白/哨兵）
+     * @return 父会话项目根；两档皆取不到 ⇒ <b>null</b>（调用方决定 fail-loud 还是降级）
+     */
+    private static Path parentSessionCwdOrNull(ToolUseContext agentTuc, String sessionId) {
+        if (agentTuc != null && agentTuc.effectiveCwd() != null) {
+            return agentTuc.effectiveCwd();
+        }
+        if (sessionId != null && !sessionId.isBlank()
+                && !com.nexusai.common.SessionKeys.isNoSession(sessionId)) {
+            String resolved = com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId);
+            if (resolved != null && !resolved.isBlank()) {
+                return Path.of(resolved);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * {@link #parentSessionCwdOrNull} 的<b>必需值</b>形态（worktree 创建基准）·
+     * 取不到 ⇒ 抛（⛔ 不以进程 user.dir 冒充会话态）。
+     *
+     * @throws IllegalStateException 父 TUC effectiveCwd 为空且 sessionId 解析不出项目根
+     *         —— 无基准建 tree，属数据链路异常（fail-loud，对齐 CC worktree.ts:925-932 throw）
+     */
+    private static Path parentSessionCwdForWorktree(ToolUseContext agentTuc, String sessionId) {
+        Path resolved = parentSessionCwdOrNull(agentTuc, sessionId);
+        if (resolved != null) {
+            return resolved;
+        }
+        throw new IllegalStateException("[SubagentExecutor] isolation=worktree 需要父会话项目根作 worktree "
+            + "创建基准（CC worktree.ts:926 findCanonicalGitRoot(getCwd())），但父 TUC effectiveCwd 为空且 "
+            + "sessionId='" + sessionId + "' 解析不出项目根。⛔ 不以进程 user.dir 冒充会话态。");
     }
 
     /**
@@ -1883,7 +1937,12 @@ public class SubagentExecutor {
         String effectiveIsolation = effectiveIsolationOverride != null
             ? effectiveIsolationOverride
             : agentDefinition.isolation().orElse("");
-        String worktreePath = System.getProperty("user.dir");
+        // [批 subcwd D1] 初值 = **显式「未设置」**（null），⛔ 不再以 `System.getProperty("user.dir")`
+        //   作初值。user.dir 是**进程级值**（后端 JVM 启动目录），不是任何会话的项目根，且无法与
+        //   「用户真的把会话设成了 user.dir」区分（[批 subcwd] 实测探针：非 worktree 子代理经下方
+        //   withEffectiveCwd 无条件改写后 effectiveCwd = 服务器启动目录，**覆盖掉**从
+        //   createSubagentContext.create 继承来的父会话项目根）。null = 未被改写 ⇒ 保留父继承值。
+        String worktreePath = null;
         String agentWorktreeSlug = null;
         // [FORK-02] 保留 worktree 登记（对齐 CC getWorktreeResult — cleanupWorktreeIfNeeded
         //   AgentTool.tsx:644-685 仅在保留时返回 {worktreePath, worktreeBranch}）· Step 21.0
@@ -1923,23 +1982,36 @@ public class SubagentExecutor {
                 //   CC earlyAgentId 等价, :1387) 前 8 位 = 'a'+7 hex → 首字符恒 'a' (CC 同源)。
                 //   旧实现 (packed UUID 前 8 位, 随机 hex 首字符 ≠ CC 'a') 已删除。
                 agentWorktreeSlug = ForkWorktreePaths.buildWorktreeSlug(agentIdHex);
+                // [批 subcwd] worktree 创建基准 = **父会话项目根**（对齐 CC worktree.ts:926
+                //   `findCanonicalGitRoot(getCwd())` —— CC 的 getCwd() 是**会话 cwd**，不是进程 user.dir）。
+                //   原实现传 `Paths.get(user.dir)` = 后端启动目录（[批 subcwd] 实测探针读数：
+                //   worktreeBase = D:\...\nexusai\.claude\worktrees\subcwd\backend）。
+                Path worktreeBase = parentSessionCwdForWorktree(agentTuc, sessionId);
                 try {
                     WorktreeCreateResult wtResult = worktreeService.createAgentWorktree(
-                            Paths.get(worktreePath), agentWorktreeSlug);
+                            worktreeBase, agentWorktreeSlug);
                     worktreePath = wtResult.worktreePath().toString();
                     // [FORK-02] 捕获创建结果 → Step 21.0 keep 判定后登记 worktree 到 task
                     createdAgentWorktree = wtResult;
                     log.info("[SubagentExecutor] Step 18: 已创建 agent worktree 于 {} (slug={}, branch={})",
                             worktreePath, agentWorktreeSlug, wtResult.worktreeBranch());
                 } catch (Exception e) {
-                    log.warn("[SubagentExecutor] Step 18: createAgentWorktree 失败, 回退 user.dir: {}",
-                            e.getMessage());
-                    agentWorktreeSlug = null;
+                    // [批 subcwd D4] fail-loud（对齐 CC AgentTool.tsx:741-743 外层无 try/catch +
+                    //   worktree.ts:925-932 `throw`）。原实现在此吞异常并**回落 user.dir** ⇒ 声明了
+                    //   isolation=worktree 的子代理静默地「无隔离」运行，且 cwd 落到**后端启动目录**
+                    //   （并发子代理写互踩 + 产物落错仓），只有一条 WARN。⛔ 不得改回 fail-open。
+                    log.error("[SubagentExecutor] Step 18: createAgentWorktree 失败（fail-loud，⛔ 不回落 user.dir）"
+                            + " base={} slug={}: {}", worktreeBase, agentWorktreeSlug, e.getMessage());
+                    throw new IllegalStateException("[SubagentExecutor] 子代理 worktree 隔离创建失败"
+                            + "（effectiveIsolation=worktree, base=" + worktreeBase
+                            + ", slug=" + agentWorktreeSlug + "）: " + e.getMessage()
+                            + "。⛔ 不回落进程 user.dir 冒充会话项目根（CC AgentTool.tsx:741-743 fail-loud）。", e);
                 }
             } else {
-                if (log.isDebugEnabled()) {
-                    log.debug("[SubagentExecutor] Step 18: isolation=worktree 但 worktreeService 未注入, 回退 user.dir stub");
-                }
+                // [批 subcwd D10] 装配异常 ⇒ ≥WARN（原 debug）：无 worktreeService 时**不再回落
+                //   user.dir**，保留父会话继承的 effectiveCwd（无隔离），并可观测。
+                log.warn("[SubagentExecutor] Step 18: isolation=worktree 但 worktreeService 未注入"
+                        + " ⇒ 无隔离（保留父会话继承的 effectiveCwd；⛔ 不再回落进程 user.dir stub）");
             }
         }
         String description = agentDefinition.whenToUse();
@@ -1951,21 +2023,32 @@ public class SubagentExecutor {
         //   [MCP-I-9 Q-30] 派生时把 mergedClients（父+agent）写入子 base TUC → 嵌套第 2 层
         //   经 parentTUC.mcpServerConnections() 继承（连接对象传递）。对齐 CC runAgent.ts:685
         //   agentOptions.mcpClients = mergedMcpClients。
-        subagentCtx = withEffectiveCwd(subagentCtx, Path.of(worktreePath))
+        // [批 subcwd D2] **仅当 worktreePath 真被改写**（override / resume 复用 / worktree 创建成功）
+        //   才调 withEffectiveCwd；否则**不调用**，保留 createSubagentContext.create 继承的父会话
+        //   项目根。对齐 CC AgentTool.tsx:793-794 `const cwdOverridePath = cwd ?? worktreeInfo?.worktreePath;
+        //   wrapWithCwd = fn => cwdOverridePath ? runWithCwdOverride(cwdOverridePath, fn) : fn()`
+        //   —— CC 没有 override 就是**继承环境值**（一进程一会话使其天然正确；本仓一 JVM 多会话，
+        //   该继承必须显式落在 TUC 快照上，故「不调用」= 保留 create() 已继承的父 effectiveCwd）。
+        subagentCtx = (worktreePath != null
+                ? withEffectiveCwd(subagentCtx, Path.of(worktreePath))
+                : subagentCtx)
             .withMcpServerConnections(mcpInitResult.clients());
-        log.info("[SubagentExecutor] [Phase A 任务 4] effectiveCwd={} 透传到子 ToolUseContext (agent={})"
-                + " · mcpServerConnections={}（Q-30 连接继承）",
-                worktreePath, agentDefinition.agentType(),
+        log.info("[SubagentExecutor] [Phase A 任务 4] effectiveCwd={} 透传到子 ToolUseContext (agent={},"
+                + " worktreePathOverridden={}) · mcpServerConnections={}（Q-30 连接继承）",
+                subagentCtx.effectiveCwd() != null ? subagentCtx.effectiveCwd().toString() : "<null>",
+                agentDefinition.agentType(), worktreePath != null,
                 mcpInitResult.clients() != null ? mcpInitResult.clients().size() : 0);
 
         // [IMP-D F4/M-08] worktree 隔离子代理：agent-memory project/local scope 根改绑
         // effectiveCwd（worktree 路径 · CC agentMemory.ts:43/59 getCwd 语义）；非 worktree
-        // （回退 user.dir）保持 projectRoot 绑定（T5 C3 约束：user.dir 不是 projectRoot 替身）。
+        // （保留父会话继承值）保持 projectRoot 绑定（T5 C3 约束：user.dir 不是 projectRoot 替身）。
         // 注：Step 9 的 prompt 注入早于 Step 18 worktree 创建（CC 在 spawn 层创建 worktree、
         //   Java 在 executeStreaming 内创建 —— 既有结构差异），本覆盖作用于 worktree 创建后
         //   的一切 agent-memory 根判定（CC runWithCwdOverride 等价面）。
-        if (agentMemoryDirectory != null && worktreePath != null
-                && !worktreePath.equals(System.getProperty("user.dir"))) {
+        // [批 subcwd D5] 判据由「worktreePath != 进程 user.dir」改为**显式「cwd 已被改写」**
+        //   （worktreePath != null）：原判据以进程 user.dir 为参照系，D1 之后失效；且
+        //   override / resume 两条支路本就该改绑（它们是 runWithCwdOverride 等价面）。
+        if (agentMemoryDirectory != null && worktreePath != null) {
             agentMemoryDirectory = agentMemoryDirectory.withEffectiveCwd(worktreePath);
             if (log.isDebugEnabled()) {
                 log.debug("[SubagentExecutor] [IMP-D F4/M-08] agent-memory 根改绑 effectiveCwd={} "
@@ -1995,10 +2078,15 @@ public class SubagentExecutor {
         // 对齐 CC AgentTool.tsx:598-602: fork path + worktree 实际创建成功 → 追加
         //   buildWorktreeNotice(parentCwd, worktreeCwd) user 消息 (追加在 fork directive
         //   之后, 作为子 agent 看到的最新指引: 翻译路径 + 重读可能过期的文件).
-        //   worktreePath != user.dir 即创建成功 (createAgentWorktree 失败时已回退 user.dir, 不注入).
+        // [批 subcwd D5] 判据由「worktreePath != 进程 user.dir」改为**显式布尔** createdAgentWorktree
+        //   != null（= Step 18 内部真创建成功）。对齐 CC AgentTool.tsx:747 `if (isForkPath && worktreeInfo)`
+        //   —— CC 的 worktreeInfo 仅由内部 createAgentWorktree 赋值（override/resume 不设它）。
+        // [批 subcwd D7] parentCwd 由进程 user.dir 改为**父会话 cwd**：CC AgentTool.tsx:751 传
+        //   `getCwd()`（= 会话 cwd，此处 = Step 18 之前的父会话快照 agentTuc.effectiveCwd()）。
         if (isForkAgentType(effectiveType)
-                && !worktreePath.equals(System.getProperty("user.dir"))) {
-            String parentCwd = System.getProperty("user.dir");
+                && createdAgentWorktree != null) {
+            Path parentCwdPath = parentSessionCwdOrNull(agentTuc, sessionId);
+            String parentCwd = parentCwdPath != null ? parentCwdPath.toString() : null;
             String notice = ForkWorktreePaths.buildWorktreeNotice(parentCwd, worktreePath);
             Map<String, Object> noticeMsg = new LinkedHashMap<>();
             noticeMsg.put("role", "user");
@@ -2197,7 +2285,14 @@ public class SubagentExecutor {
             //   无变更 → removeAgentWorktree (discardChanges=true, 安全删除空 worktree).
             if (agentWorktreeSlug != null && worktreeService != null) {
                 try {
-                    Path gitRoot = Paths.get(System.getProperty("user.dir"));
+                    // [批 subcwd D6] gitRoot 由「进程 user.dir」改为**创建时同一个基准**
+                    //   （createdAgentWorktree.gitRoot()）= Step 18 传入 parentSessionCwdForWorktree 的值。
+                    //   WHY 必须同源：createWorktree(gitRoot, slug) 把树建在 <gitRoot>/.claude/worktrees/<slug>，
+                    //   countChanges/keep/removeAgentWorktree(gitRoot, slug) 也从同一 gitRoot 定位它；
+                    //   两侧用不同基准 ⇒ 清理找错仓（原实现以 user.dir 探测，与创建基准不一致）。
+                    //   本分支内 agentWorktreeSlug != null ⟹ createdAgentWorktree != null（同一 try 赋值，
+                    //   catch 分支已把 slug 置 null）。
+                    Path gitRoot = createdAgentWorktree.gitRoot();
                     WorktreeService.WorktreeChanges changes =
                         worktreeService.countChanges(gitRoot, agentWorktreeSlug);
                     if (changes.hasAny()) {

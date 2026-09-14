@@ -140,11 +140,13 @@ class CwdResolutionTest {
             .isInstanceOf(IllegalStateException.class)
             .hasMessageContaining("无法判定");
 
-        // 正向对照：接线后，同一个 id 走「确无会话」命名出口（批 4a 该半条裁定保持不变）
-        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        // 正向对照：接线 + 「本环境确无会话」⇒ 同一个 id 走命名出口（⛔ 注意：步骤 2 起这里
+        //   **必须**是 sessionless —— DB 明确答「无此会话」已改为 fail-loud 抛，见
+        //   {@link #dbAnsweredNoSuchSession_failsLoud}）。
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
         try {
             assertThat(CwdResolution.getCwd("sess-not-in-db"))
-                .as("接线 + DB 明确答「无此会话」⇒ 无会话出口（进程 user.dir），仍不抛")
+                .as("接线 + 本环境确无会话（sessionless）⇒ 无会话出口（进程 user.dir），不抛")
                 .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
         } finally {
             SessionProjectRoot.setDbResolver(null);
@@ -413,11 +415,56 @@ class CwdResolutionTest {
             SessionProjectRoot.setDbResolver(null);
         }
 
-        // 正向对照：同一 id，DB 明确答「无此会话」⇒ 无会话出口，仍不抛
-        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        // 正向对照：同一 id，接线正常 + 「本环境确无会话」⇒ 无会话出口，不抛
+        //   （⛔ 步骤 2 起必须用 sessionless：`unknown` = DB 明确答无此会话 ⇒ fail-loud，见
+        //   {@link #dbAnsweredNoSuchSession_failsLoud}）
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
         try {
             assertThat(CwdResolution.getCwd("sess-db-down"))
-                .as("接线正常且 DB 答无此会话 ⇒ 无会话出口（进程 user.dir），不抛")
+                .as("接线正常且本环境确无会话 ⇒ 无会话出口（进程 user.dir），不抛")
+                .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [cwd3 步骤 2 · RE-2a-1] <b>DB 明确答「无此会话」⇒ fail-loud 抛</b>（⛔ 不再回落进程 user.dir）。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：{@code unknown} 现在只剩「查了 DB、DB 说没有这一行」一个含义
+     * ⇒ 属数据链路异常（会话已删 / id 来源不明）。回落 {@code user.dir} 会把工具/权限/transcript
+     * 全锚到后端启动目录 —— 本仓已因此造成过真实误删。确无会话的调用方必须显式传
+     * {@code SessionKeys.NO_SESSION} 哨兵或走命名出口。
+     *
+     * <p><b>RED（反向实验）</b>：把 {@code CwdResolution.getCwd} 的 unknown 分支改回
+     * {@code warnUnknownSession(...); return getCwdForNonSession();} ⇒ 本用例红（返回 user.dir 而不抛）。
+     *
+     * <p><b>正反对照（同一用例两臂）</b>：{@code unknown} ⇒ 抛；同一刻 {@code sessionless} ⇒ 走
+     * 无会话出口且不抛 —— 证明红的是「DB 答了没有」这一态，不是「解析整体坏了」。
+     */
+    @Test
+    @DisplayName("[cwd3 步骤2 RE-2a-1] DB 明确答「无此会话」⇒ fail-loud 抛（⛔ 不回落 user.dir）")
+    void dbAnsweredNoSuchSession_failsLoud() throws Exception {
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        try {
+            assertThatThrownBy(() -> CwdResolution.getCwd("sess-ghost-cwd3"))
+                .as("DB 明确答无此会话 = 数据链路异常 ⇒ 必须抛（原实现静默回落进程 user.dir）")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sess-ghost-cwd3")
+                .hasMessageContaining("DB 明确答「无此会话」");
+            assertThatThrownBy(() -> CwdResolution.getOriginalCwdLayer("sess-ghost-cwd3"))
+                .as("getOriginalCwdLayer 同判据（同一 flip）")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("DB 明确答「无此会话」");
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+
+        // 正向对照：同一 id，同一刻换成 sessionless ⇒ 无会话出口，不抛
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
+        try {
+            assertThat(CwdResolution.getCwd("sess-ghost-cwd3"))
+                .as("sessionless（本环境确无会话）⇒ 命名出口，不抛 —— 证明红的是 unknown 这一态")
                 .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
         } finally {
             SessionProjectRoot.setDbResolver(null);
@@ -493,7 +540,9 @@ class CwdResolutionTest {
         final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
         SessionProjectRoot.setDbResolver(sid -> {
             calls.incrementAndGet();
-            return SessionProjectRoot.Lookup.unknown();
+            // [cwd3 步骤 2] 这里必须是 **sessionless**（不是 unknown）：unknown 自步骤 2 起
+            //   fail-loud 抛，会打断「计数」这一被测点本身（本用例守的是「是否查了 DB」，不是返回值）。
+            return SessionProjectRoot.Lookup.sessionlessEnvironment();
         });
         try {
             CwdResolution.getCwd(com.nexusai.common.SessionKeys.NO_SESSION);
@@ -501,12 +550,57 @@ class CwdResolutionTest {
                 .as("哨兵是「有意声明无会话」⇒ 不得触发 DB 回源（0 次）")
                 .isZero();
 
-            // 正向对照：来源不明 id 走 unknown 分支 ⇒ 确实回源（证明计数装置有效，非恒 0）
+            // 正向对照：非哨兵 id 必回源（证明计数装置有效，非恒 0）
             CwdResolution.getCwd("sess-not-in-db-b6");
             assertThat(calls.get())
                 .as("非哨兵的 DB-miss id 必须回源（证明上面的 0 不是「解析器没生效」）")
                 .isGreaterThan(0);
         } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [cwd3 步骤 2 · S2.6] 两个入口的 ≥WARN 闸必须<b>各自独立</b>。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：原实现两个入口共用<b>同一个</b>一次性 AtomicBoolean ⇒
+     * 可见度上限 1 行日志/进程：先触发的入口会把另一入口的告警吃掉，后者永远不打印
+     * （「静默失效」的一种）。判据 = 让 {@link CwdResolution#getCwd(String)} 先触发 ⇒
+     * {@link CwdResolution#getOriginalCwdLayer(String)} <b>仍须有自己的 WARN</b>。
+     *
+     * <p>RED（反向实验）：把两个 {@code SESSIONLESS_WARNED_*} 合并回单个 static 闸 ⇒ 本用例红
+     * （第二个断言的 anyMatch 找不到）。
+     *
+     * <p>装置说明：用 <b>sessionless</b> 路径（不抛）以便连续调两个入口；若用 {@code unknown}
+     * （抛）则第二个入口之前的语句就中断了。⚠️ 必须先复位一次性闸 —— 否则先跑的用例用掉闸，
+     * 本用例假红（故有 {@code resetWarnGatesForTesting}）。
+     */
+    @Test
+    @DisplayName("[cwd3 S2.6] 两入口告警闸独立：getCwd 先触发 ⇒ getOriginalCwdLayer 仍有 WARN")
+    void warnGatesAreIndependentPerEntry() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(CwdResolution.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        CwdResolution.resetWarnGatesForTesting();
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
+        try {
+            CwdResolution.getCwd("sess-warn-entry-a");
+            CwdResolution.getOriginalCwdLayer("sess-warn-entry-b");
+
+            java.util.List<String> msgs = app.list.stream()
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+            assertThat(msgs)
+                .as("getCwd 入口必须有「确无会话」WARN")
+                .anyMatch(m -> m.contains("getCwd 判定「本环境确无会话」"));
+            assertThat(msgs)
+                .as("⭐ 第二个入口必须**仍有**自己的 WARN —— 单闸实现下这一条会被第一条吃掉")
+                .anyMatch(m -> m.contains("getOriginalCwdLayer 判定「本环境确无会话」"));
+        } finally {
+            logger.detachAppender(app);
+            app.stop();
             SessionProjectRoot.setDbResolver(null);
         }
     }

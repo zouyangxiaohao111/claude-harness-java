@@ -1,8 +1,13 @@
 package com.nexusai.apis.schedule;
 
+import com.nexusai.common.SessionKeys;
+import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.infra.exception.UnresolvedProjectRootException;
+import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.model.schedule.dto.RunNowResponse;
 import com.nexusai.model.schedule.dto.ScheduleCreateRequest;
 import com.nexusai.model.schedule.dto.ScheduleDto;
+import com.nexusai.model.schedule.dto.ScheduleScope;
 import com.nexusai.model.schedule.dto.ScheduleUpdateRequest;
 import com.nexusai.domain.schedule.ScheduleService;
 import jakarta.validation.Valid;
@@ -49,6 +54,9 @@ import java.util.List;
 @RequestMapping("/api/v1/schedules")
 public class ScheduleController {
 
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(ScheduleController.class);
+
     @Autowired private ScheduleService scheduleService;
 
     @GetMapping
@@ -61,10 +69,75 @@ public class ScheduleController {
         return scheduleService.getById(id);
     }
 
+    /**
+     * POST /api/v1/schedules · 创建。
+     *
+     * <p><b>[cwd3 · 用户裁定 2026-09-15 步骤 1a] REST 直建 DURABLE 必须带 sessionId，且必须能从它
+     * 解析出 boundProject</b>（用户原话：「REST 直建 DURABLE 时 必须带上 sessionId 没有 id 不允许
+     * 建立」+「有 sessionId ⇒ 必须能从它解析出 boundProject，解析不到 ⇒ 400」）。
+     *
+     * <p><b>三段判据（全在 REST 边界，⛔ 不下沉进 {@link SessionProjectRoot}/{@code CwdResolution}）</b>：
+     * <ol>
+     *   <li><b>(a) 缺 id</b>：{@code DURABLE} 且 {@code sessionId} 为 null/空白 ⇒
+     *       {@link ValidationException} ⇒ 400 {@code Validation Failed}；</li>
+     *   <li><b>(b) 假 id</b>：{@code DURABLE} 且 {@code sessionId == SessionKeys.NO_SESSION} ⇒ 同抛
+     *       —— 裁定说的是「必须带 id」，<b>哨兵不是一个 id</b>，否则「显式传哨兵」即可绕过 (a)；</li>
+     *   <li><b>(c) 解析不到</b>：{@code DURABLE} 且 id 非空非哨兵 ⇒
+     *       {@link SessionProjectRoot#lookup(String)} 必须给出绑定项目根，否则
+     *       {@link UnresolvedProjectRootException} ⇒ 400 {@code Unresolved Project Root}。
+     *       ⚠️ 用 {@code lookup} 而非 {@code getForSession}（后者把「绑定 / 未绑定 / 无此会话 /
+     *       解析失败」四态压成 null ⇒ 无法给出可辨识错误文案）；也⛔ 不用
+     *       {@code CwdResolution.getCwd}（它还会读 sessionCwd 层，而本处要的是<b>启动锚</b>）。</li>
+     * </ol>
+     *
+     * <p><b>⭐ 防伪造 boundProject</b>：判据 (c) 通过后用 {@code lk.projectRoot()} <b>重建请求体</b>
+     * 再交给 service ⇒ 客户端在请求体里塞的 {@code boundProject} 一律被<b>解析值覆盖</b>
+     * （原实现把 {@code req.boundProject()} 直接落库 ⇒ 调用方可把任意路径写成任务的项目锚）。
+     *
+     * <p><b>为什么落点在 Controller 而不是 service</b>：用户裁定原文限定「REST 直建」；且工具路径
+     * （{@code CronCreateTool}）与 8 处直调 service 的单测各有自己的语义（工具路径无 HTTP ⇒ 用
+     * {@link SessionKeys#NO_SESSION} 哨兵声明无会话），把 REST 的 400 语义塞进 service 会让两边
+     * 互相污染。service 侧另做<b>sentinel-aware 归一取值</b>（见
+     * {@link com.nexusai.domain.schedule.ScheduleService#create}）保证「锚只能来自 sessionId 解析」。
+     */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public ScheduleDto create(@Valid @RequestBody ScheduleCreateRequest req) {
-        return scheduleService.create(req);
+        ScheduleScope scope = req.scope() == null ? ScheduleScope.DURABLE : req.scope();
+        if (scope != ScheduleScope.DURABLE) {
+            return scheduleService.create(req);
+        }
+        String sessionId = req.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[ScheduleController] POST /schedules 拒绝：DURABLE 缺 sessionId（用户裁定 1a：没有 id 不允许建立）");
+            throw new ValidationException(
+                "scope=DURABLE requires non-empty 'sessionId' (REST create)");
+        }
+        if (SessionKeys.isNoSession(sessionId)) {
+            log.warn("[ScheduleController] POST /schedules 拒绝：DURABLE 的 sessionId 为「确无会话」哨兵 {} "
+                + "（哨兵不是会话 id，不得用于直建任务）", SessionKeys.NO_SESSION);
+            throw new ValidationException(
+                "scope=DURABLE requires a real sessionId, not the no-session sentinel");
+        }
+        SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup(sessionId);
+        if (lk.resolutionFailed() || lk.projectRoot() == null || lk.projectRoot().isBlank()) {
+            log.warn("[ScheduleController] POST /schedules 拒绝：DURABLE sessionId={} 解析不到绑定项目根 "
+                + "(sessionKnown={} resolutionFailed={})", sessionId, lk.sessionKnown(), lk.resolutionFailed());
+            throw new UnresolvedProjectRootException(
+                "scope=DURABLE: sessionId=" + sessionId + " 解析不到绑定项目根（sessionKnown="
+                    + lk.sessionKnown() + " resolutionFailed=" + lk.resolutionFailed()
+                    + "）—— 请确认该会话存在且已绑定项目（sessions.main_project_id → projects.path）");
+        }
+        // 用解析值重建请求（只换 boundProject）⇒ 客户端伪造的 boundProject 被覆盖
+        ScheduleCreateRequest normalized = new ScheduleCreateRequest(
+            req.name(), req.kind(), req.cron(), req.intervalSeconds(), req.runAt(), req.command(),
+            req.description(), scope, sessionId, req.agentId(), lk.projectRoot(), req.id());
+        if (log.isInfoEnabled()) {
+            log.info("[ScheduleController] POST /schedules DURABLE 会话锚已由 sessionId 解析并覆盖请求体: "
+                + "sessionId={} boundProject={}（客户端传入的 boundProject={} 被丢弃）",
+                sessionId, lk.projectRoot(), req.boundProject());
+        }
+        return scheduleService.create(normalized);
     }
 
     /**

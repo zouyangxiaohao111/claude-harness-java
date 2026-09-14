@@ -97,52 +97,85 @@ public final class SessionProjectRoot {
     private static final ConcurrentHashMap<String, String> BY_SESSION = new ConcurrentHashMap<>();
 
     /**
-     * 会话绑定查询结果 · <b>四态</b>（[批 4a] 用户裁定 #7/#13 的判据载体 + [S2 F-09/F-20] 新增解析失败态）：
+     * 会话绑定查询结果 · <b>五态</b>（[批 4a] 用户裁定 #7/#13 的判据载体 + [S2 F-09/F-20] 解析失败态
+     * + <b>[cwd3 2026-09-15 步骤 2] 拆出「本环境确无会话」态</b>）。
+     *
+     * <p><b>⚠️ [cwd3 步骤 2] {@code unknown} 的语义已反转，本轮重新表述（旧文案曾是语义地雷）</b>：
+     * 步骤 2 之前，cwd 域把「DB 明确答无此会话」与「确无会话」当成同一件事（都走命名无会话出口 +
+     * 回落进程 {@code user.dir}）。步骤 2 起，铁律出口 (b)「本环境确无会话」由
+     * {@link #sessionless()} 独占表达，{@link #unknown()} 只剩「DB 明确答『无此会话』」一个含义
+     * ⇒ <b>cwd 域对该态 fail-loud 抛</b>（⛔ 不再回落 user.dir —— 那会把工具/权限/transcript 锚到
+     * 后端启动目录，已造成过真实误删）。
+     *
+     * <p>五态一览（判据互斥，各自有唯一可辨识标记）：
      * <ul>
-     *   <li>{@link #bound(String)} —— 会话有绑定项目根（且回源校验通过）</li>
+     *   <li>{@link #bound(String)} —— 会话有绑定项目根（且回源校验通过）。</li>
      *   <li>{@link #unbound()} —— <b>会话存在</b>（DB 有行）但无绑定项目根 / 绑定失效
-     *       ⇒ <b>「数据链路异常」</b>，cwd 域 fail-loud（web 会话必须绑定项目才能进行）</li>
-     *   <li>{@link #unknown()} —— <b>无此会话</b>（合成 / 伪造 / 已删 id：MCP 入站调用、standalone
-     *       fork / subagent、文档更新器等现造 id）⇒ 属「确无会话」，cwd 域走命名无会话出口
-     *       （对齐批 4a 前 user.dir 行为，⛔ 不得对它 fail-loud：那会打死合成 id 的合法路径）</li>
+     *       ⇒ <b>「数据链路异常」</b>，cwd 域 fail-loud（web 会话必须绑定项目才能进行）。</li>
+     *   <li>{@link #unknown()} —— <b>DB 明确答「无此会话」</b>（查了 DB，DB 说没有这行）。
+     *       cwd 域 fail-loud 抛 —— ⛔ 「确无会话」的调用方<b>不得</b>靠它兜底，必须显式传
+     *       {@link SessionKeys#NO_SESSION} 哨兵（那是 {@link #sessionless()} 的入口）。</li>
      *   <li>{@link #resolutionFailure()} —— <b>无法判定</b>（[S2 F-09/F-20 2026-09-14 · 用户裁定 (A)]）：
      *       回源解析器<b>未接线</b>（{@link #setDbResolver} 未被调用 = 装配异常）或回源查询<b>抛错 /
-     *       违约返回 null</b>。⛔ 与 {@link #unknown()} 严格区分：这一态<b>不是</b>「确无会话」，
-     *       cwd 域必须 fail-loud（原实现把它静默投给 unknown ⇒ 用户裁定 #7 的 fail-loud 会因装配
-     *       异常而全进程静默失效且零日志 —— 正是本批要治的失败模式）。</li>
+     *       违约返回 null</b>。⛔ 与 {@link #unknown()} 严格区分：这一态<b>不是</b>「DB 答了没有这行，
+     *       而是 DB 根本没答」。cwd 域同样 fail-loud，但纠错文案不同（冲突时优先于 sessionless）。</li>
+     *   <li>{@link #sessionless()} —— ⭐ <b>[cwd3 步骤 2] 铁律出口 (b)「本环境确无会话」</b>：
+     *       <b>结构上不存在会话</b>（{@code sessionId} 为 null/空白，或显式传
+     *       {@link SessionKeys#NO_SESSION} 哨兵——见 {@link #lookup(String)} 与回源器
+     *       {@link DbResolver} 的判据）。cwd 域走命名无会话出口（{@code getCwdForNonSession()} =
+     *       进程 {@code user.dir}）+ ≥WARN。⛔ <b>与 {@link #unknown()} 严格区分</b>：后者是
+     *       「本该有会话、DB 却说没有」= 数据链路异常；本态是「本来就不该有会话」= 合法形态。</li>
      * </ul>
      *
-     * <p>⚠️ {@code resolutionFailed} 必须是<b>独立字段</b>：三态记录（{@code projectRoot},
-     * {@code sessionKnown}）下「解析失败」只能是 {@code (null, false)}，与 {@code unknown()} 逐字段
-     * 相同 ⇒ 无法区分。故本 record 保持 {@code projectRoot}/{@code sessionKnown} 两个既有访问器
-     * （兼容既有消费点）+ 新增第三字段。
+     * <p>⚠️ {@code resolutionFailed} / {@code sessionless} 必须是<b>独立字段</b>：三态记录
+     * （{@code projectRoot}, {@code sessionKnown}）下「解析失败」「确无会话」都只能是
+     * {@code (null, false)}，与 {@code unknown()} 逐字段相同 ⇒ 无法区分。故本 record 保持
+     * {@code projectRoot}/{@code sessionKnown} 两个既有访问器（兼容既有消费点）+ 独占标记字段。
      */
-    public record Lookup(String projectRoot, boolean sessionKnown, boolean resolutionFailed) {
+    public record Lookup(String projectRoot, boolean sessionKnown, boolean resolutionFailed,
+                         boolean sessionless) {
         /** 绑定命中。 */
         public static Lookup bound(String projectRoot) {
-            return new Lookup(projectRoot, true, false);
+            return new Lookup(projectRoot, true, false, false);
         }
 
         /** 会话存在但无绑定（数据链路异常判据）。 */
         public static Lookup unbound() {
-            return new Lookup(null, true, false);
-        }
-
-        /** 无此会话（确无会话判据）。 */
-        public static Lookup unknown() {
-            return new Lookup(null, false, false);
+            return new Lookup(null, true, false, false);
         }
 
         /**
-         * 解析失败 / 无法判定（[S2 F-09/F-20] 新增第 4 态）· ⛔ 绝不与 {@link #unbound()} /
-         * {@link #unknown()} 混同（访问器 {@link #resolutionFailed()} 为 {@code true} 是唯一可辨识标记）。
+         * DB 明确答「无此会话」· <b>[cwd3 步骤 2] cwd 域对该态 fail-loud</b>（语义见 record javadoc）。
+         * ⛔ 「确无会话」请用 {@link #sessionless()}。
+         */
+        public static Lookup unknown() {
+            return new Lookup(null, false, false, false);
+        }
+
+        /**
+         * 解析失败 / 无法判定（[S2 F-09/F-20] 第 4 态）· ⛔ 绝不与 {@link #unbound()} /
+         * {@link #unknown()} / {@link #sessionless()} 混同
+         * （访问器 {@link #resolutionFailed()} 为 {@code true} 是唯一可辨识标记）。
          *
          * <p>⚠️ 命名说明：工厂方法名<b>不能</b>叫 {@code resolutionFailed()} —— 会与 record 组件
          * 自动生成的同名访问器冲突（javac：records 中存取方法无效）。故工厂为 {@code resolutionFailure()}，
-         * 访问器保持组件名 {@code resolutionFailed()}。
+         * 访问器保持组件名 {@code resolutionFailed()}。同款约束适用于 {@link #sessionless()}。
          */
         public static Lookup resolutionFailure() {
-            return new Lookup(null, false, true);
+            return new Lookup(null, false, true, false);
+        }
+
+        /**
+         * ⭐ <b>本环境确无会话</b>（[cwd3 步骤 2] 铁律出口 (b)）· 严格区别于 {@link #unknown()}
+         * （后者 = DB 明确答无此会话 ⇒ cwd 域 fail-loud）。
+         *
+         * <p>谁该返回它：{@code sessionId} 为 null/空白，或为 {@link SessionKeys#NO_SESSION} 哨兵
+         * （两者都表示「本条路径结构上不属于任何会话」）。生产出口 = 回源器
+         * {@code ToolRegistrationConfig#sessionProjectRootResolver} 的 null/空白/哨兵分支 +
+         * 本类 {@link #lookup(String)} 的 null 分支。
+         */
+        public static Lookup sessionlessEnvironment() {
+            return new Lookup(null, false, false, true);
         }
     }
 
@@ -297,15 +330,29 @@ public final class SessionProjectRoot {
     public static Lookup lookup(String sessionId) {
         if (sessionId == null) {
             // [S2 F-09/F-20 · 铁律「不许静默失效」] 原实现零日志返回 unknown()（= 静默把「漏传」当成
-            //   「确无会话」）。null sessionId 无法判定 ⇒ 打一次性 ≥WARN（沿用本仓 AtomicBoolean 惯例，
-            //   避免 130 个调用点刷屏）。⚠️ 不改返回值为 resolutionFailed()：那会让 CwdResolution 侧
-            //   的 null 路由（getCwd(null) ⇒ 无会话出口）从「兼容路由」变成 fail-loud，违反批 4a
-            //   裁定 #13 的零行为变化承诺；此处只做可观测性补强。
+            //   「无此会话」）。null sessionId 无法判定 ⇒ 打一次性 ≥WARN（沿用本仓 AtomicBoolean 惯例，
+            //   避免 130 个调用点刷屏）。
+            // [cwd3 步骤 2] 返回值由 unknown() 改为 **sessionless()**：没有传 sessionId = 「本环境
+            //   确无会话」（铁律出口 (b)），不是「DB 明确答无此会话」（本方法根本<b>没有</b>查 DB，
+            //   把「没问过 DB」说成「DB 答了没有」是伪造判据）。⚠️ 与 CwdResolution 的 null 路由
+            //   一致（它本就把 null 当「无会话」处理，见 CwdResolution:178-181）。
+            //   ⛔ 不得改成 resolutionFailed()：那与「本该有却没有」的装配异常混同。
             if (NULL_SESSION_LOOKUP_WARNED.compareAndSet(false, true)) {
-                log.warn("[SessionProjectRoot] lookup/getForSession 收到 null sessionId ⇒ 无法判定会话"
-                    + "项目根，按「无此会话」返回（⛔ 此处本该有会话 ⇒ 属漏传，请修调用方；本告警只打印一次）");
+                log.warn("[SessionProjectRoot] lookup/getForSession 收到 null sessionId ⇒ 按「本环境确无"
+                    + "会话」处理（⛔ 不是「DB 答无此会话」—— 本路径未查 DB；此处本该有会话 ⇒ 属漏传，"
+                    + "请修调用方；本告警只打印一次）");
             }
-            return Lookup.unknown();
+            return Lookup.sessionlessEnvironment();
+        }
+        // [cwd3 步骤 2] 显式哨兵 = 「确无会话」（与 null 同等语义，⛔ 不落 DB 查询）：
+        //   否则会拿 "no-session" 去 selectOneById ⇒ null ⇒ unknown ⇒ cwd 域 fail-loud，
+        //   把一个哨兵报成「伪造 id」—— 正是本改造要消灭的东西。
+        if (SessionKeys.isNoSession(sessionId)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SessionProjectRoot] lookup 收到「确无会话」哨兵 {} ⇒ 按 sessionless 返回"
+                    + "（不查 DB）", SessionKeys.NO_SESSION);
+            }
+            return Lookup.sessionlessEnvironment();
         }
         String cached = BY_SESSION.get(sessionId);
         if (cached != null) {
@@ -378,6 +425,15 @@ public final class SessionProjectRoot {
             // 解析器自身已判定「无法判定」⇒ 原样上浮（保留其可辨识语义，不降级成 unknown）
             log.warn("[SessionProjectRoot] DB 回源解析器自行判定「解析失败」⇒ 原样上浮: sessionId={}",
                 sessionId);
+            return fromDb;
+        }
+        // ⭐ [cwd3 步骤 2 · 2a-1 关键 pass-through] 「本环境确无会话」必须**原样上浮**。
+        //   ⛔ 不加这一行，「sessionless」会被下方 `path == null/blank` 分支压成 unknown/unbound
+        //   （它与 unknown 的 (projectRoot, sessionKnown) 逐字段相同）⇒ cwd 域会把它当「DB 明确答
+        //   无此会话」而 fail-loud 抛 ⇒ 整个测试夹具修法（NoDatabaseSessionProjectRootExtension /
+        //   SessionProjectRootTestSupport 切 sessionless）变成空操作，且所有「确无会话」的合法路径
+        //   全被打死。守护测试：SessionProjectRootTest#resolverSessionless_survivesRefill。
+        if (fromDb.sessionless()) {
             return fromDb;
         }
         String path = fromDb.projectRoot();

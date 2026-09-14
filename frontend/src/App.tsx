@@ -128,7 +128,10 @@ function App() {
   const skillsApi = useSkills(sessionR.activeSession)
   const mcpApi = useMcp()
   const databasesApi = useDatabases()
-  const schedulesApi = useSchedules()
+  // [cwd3] 传当前会话 id（与 :348 的 activeSessionId 同源 = sessionR.activeSession）：定时任务的
+  //   创建必须带会话锚（后端据它解析任务的项目锚并覆盖请求体里的 boundProject）。
+  //   此处直接传 sessionR.activeSession（不提升 :348 的 const，避免改动无关代码）。
+  const schedulesApi = useSchedules(sessionR.activeSession)
 
   // ---- all sessions：来自后端（chatStore.sessions，挂载时 sessionApi.list() 拉取）----
   const storeSessions = useChatStore((s) => s.sessions)

@@ -36,7 +36,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p><b>WHY（规则九 · 测试验证意图）</b>：RO-17c（readOnlyValidation.ts:1956-1966）是一个
  * <b>成对</b>判定，两侧必须同源：
  * <pre>
- *   cwd        = ctx.effectiveCwd() ?? CwdResolution.getCwd(sessionId)   ← BashTool.fallbackCwd
+ *   cwd        = ctx.effectiveCwd() ?? CwdResolution.getCwd(sessionId)   ← BashTool.effectiveCwd
+ *                （⛔ 无第三档「进程 user.dir」—— 批 subcwd 已删）
  *   originalCwd= CwdResolution.getOriginalCwdLayer(sessionId)            ← BashTool.gitReadOnlyGuardBlocked
  * </pre>
  * 批 3b 之前两处都读「当前线程的 ambient 会话槽」（裸 MDC）——该判定在 tool-exec 池线程执行，
@@ -97,10 +98,15 @@ class BashToolReadOnlySessionExplicitTest {
         return (Boolean) m.invoke(tool, "git status", ctx);
     }
 
-    private static String cwdBasis(BashTool tool, ToolUseContext ctx) throws Exception {
-        Method m = BashTool.class.getDeclaredMethod("fallbackCwd", ToolUseContext.class);
+    /**
+     * [批 subcwd] 反射目标由 {@code fallbackCwd(ToolUseContext)→String} 改为
+     * {@code effectiveCwd(ToolUseContext)→Path}（可空）：原方法名/返回值承载的是「兜底 cwd = 进程
+     * user.dir」的旧语义，那正是本批要清掉的范式（见 BashTool.effectiveCwd javadoc）。
+     */
+    private static Path cwdBasis(BashTool tool, ToolUseContext ctx) throws Exception {
+        Method m = BashTool.class.getDeclaredMethod("effectiveCwd", ToolUseContext.class);
         m.setAccessible(true);
-        return (String) m.invoke(tool, ctx);
+        return (Path) m.invoke(null, ctx);
     }
 
     /**
@@ -136,8 +142,8 @@ class BashToolReadOnlySessionExplicitTest {
     }
 
     @Test
-    @DisplayName("① fallbackCwd：cwd 取自显式 ctx 会话（不读任何 ambient 会话）—— 另一会话的 L2 cwd 不得被采用")
-    void fallbackCwd_explicitCtxSession_notResidualMdc(@TempDir Path tmp) throws Exception {
+    @DisplayName("① effectiveCwd：cwd 取自显式 ctx 会话（不读任何 ambient 会话）—— 另一会话的 L2 cwd 不得被采用")
+    void effectiveCwd_explicitCtxSession_notResidualMdc(@TempDir Path tmp) throws Exception {
         Path explicitProject = Files.createDirectories(tmp.resolve("explicit-project"));
         Path staleL2Cwd = Files.createDirectories(tmp.resolve("stale-l2-cwd"));
         SessionProjectRoot.setForSession(EXPLICIT_SESSION, explicitProject.toString());
@@ -151,7 +157,7 @@ class BashToolReadOnlySessionExplicitTest {
         // [批 3c] 语义消失：原此处在该派生线程上写「别的会话」的裸 MDC 值当反向对照，并断言该诱饵
         //   确实存在（前置条件）。ambient 会话槽已整类删除 ⇒ 装置与前置条件断言删除；
         //   「另一会话持有自己的 L2 cwd」这一诱饵仍保留，故下面的结果断言仍有鉴别力。
-        String cwd = onDerivedThread(derived, threadName,
+        Path cwd = onDerivedThread(derived, threadName,
             () -> {
                 try {
                     return cwdBasis(tool, ctx);
@@ -166,12 +172,12 @@ class BashToolReadOnlySessionExplicitTest {
         assertThat(cwd)
             .as("兜底 cwd 必须来自显式 ctx 会话（boundProject=%s）；不得采用另一会话的 L2 cwd %s",
                 explicitProject, staleL2Cwd)
-            .isEqualTo(CwdResolution.normalizeCwd(explicitProject.toString()));
+            .isEqualTo(Path.of(CwdResolution.normalizeCwd(explicitProject.toString())));
     }
 
     @Test
-    @DisplayName("② RO-17c 判定（ctx=null，即 isReadOnly 真实路径）：无会话 ⇒ cwd/originalCwd 同源 ⇒ 不触发守卫")
-    void ro17c_ctxNull_verdictWithNoSession(@TempDir Path tmp) throws Exception {
+    @DisplayName("② RO-17c 判定（ctx=null，即 isReadOnly 真实调用形态）：基准缺失 ⇒ 守卫命中（宁问不放）")
+    void ro17c_ctxNull_cwdBaseMissing_guardFires(@TempDir Path tmp) throws Exception {
         Path staleL2Cwd = Files.createDirectories(tmp.resolve("stale-l2-cwd"));
         // 另一会话只有 CwdResolution 的 L2 层（SessionCwdHolder）——它不得影响无会话路径的判定。
         SessionCwdHolder.set(STALE_SESSION, staleL2Cwd.toString());
@@ -179,10 +185,14 @@ class BashToolReadOnlySessionExplicitTest {
         BashTool tool = toolWithSandboxEnabled();
 
         AtomicReference<String> tA = new AtomicReference<>();
-        // [批 3c] 语义消失：原用例是「对照臂（无残留 MDC）vs 实验臂（有残留 MDC）」两条臂，
-        //   断言残留值不得把守卫误触发为 true。ambient 会话槽已整类删除 ⇒ 两条臂在结构上完全等价，
-        //   实验臂与「前置条件：有残留 MDC」断言删除；保留臂仍钉住「ctx=null ⇒ cwd 与 originalCwd
-        //   同源（同为 user.dir）⇒ 守卫不触发」这一实质契约。
+        // [批 subcwd] 语义变更（原断言 isFalse：「ctx=null ⇒ cwd/originalCwd 同为 user.dir ⇒ 不触发守卫」）。
+        //   WHY 必须改：该断言的前提正是本批要清的「进程 user.dir 冒充会话态」——批 subcwd 起
+        //   ctx=null ⇒ 无会话态基准（effectiveCwd 返回 null，实测不再回落 user.dir）。
+        //   RO-17a「cwd 是否被利用的 bare git repo」判定必须依赖 cwd，判不出就不能声称「安全」
+        //   ⇒ 安全方向 = 守卫命中（不只读放行，交权限链 ask）。git 命令本就不在只读白名单
+        //   （BashParser.parseForReadOnly 恒 false）⇒ 生产 verdict 不变，本条钉的是方向契约。
+        //   反向实验：把 BashTool.gitReadOnlyGuardBlocked 的 `if (cwd == null) return true;` 改成
+        //   `return false;` ⇒ 本断言变红（实测，见交付报告）。
         Boolean fired = onDerivedThread(derived, tA, () -> {
             try {
                 return guardFired(tool, null);   // ctx=null：isReadOnly 的真实调用形态
@@ -195,8 +205,8 @@ class BashToolReadOnlySessionExplicitTest {
             .as("必须在派生线程（tool-exec 池线程等价物）求值")
             .isNotEqualTo(Thread.currentThread().getName());
         assertThat(fired)
-            .as("无会话（ctx=null）⇒ cwd/originalCwd 同为 user.dir ⇒ 不触发 RO-17c"
-                + "（另一会话的 L2 cwd=%s 不得参与）", staleL2Cwd)
-            .isFalse();
+            .as("无会话（ctx=null）⇒ 基准 cwd 缺失 ⇒ RO-17a 无法判定 ⇒ 守卫命中（宁问不放；"
+                + "另一会话的 L2 cwd=%s 不得参与）", staleL2Cwd)
+            .isTrue();
     }
 }

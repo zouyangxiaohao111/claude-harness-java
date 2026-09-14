@@ -1,6 +1,8 @@
 package com.nexusai.domain.schedule;
 
 import com.mybatisflex.core.MybatisFlexBootstrap;
+import com.nexusai.common.SessionKeys;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.test.support.MybatisFlexDbTestSupport;
 import com.nexusai.application.schedule.QuartzScheduleService;
 import com.nexusai.infra.exception.MaxJobsExceededException;
@@ -11,6 +13,7 @@ import com.nexusai.model.schedule.dto.ScheduleScope;
 import com.nexusai.repository.schedule.entity.ScheduleRecord;
 import com.nexusai.repository.schedule.mapper.ScheduleMapper;
 import org.flywaydb.core.Flyway;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -89,6 +92,13 @@ class ScheduleServiceCreateStorageTest {
         if (!rows.isEmpty()) {
             mapper.deleteBatchByIds(rows.stream().map(ScheduleRecord::getId).toList());
         }
+        // [cwd3 步骤 1a] 冻结表（会话 → 项目根）是进程级 static，跨用例/跨类必须清
+        SessionProjectRoot.reset();
+    }
+
+    @AfterEach
+    void clearFrozenSessionBindings() {
+        SessionProjectRoot.reset();
     }
 
     private ScheduleDto createSessionJob(String name, String sessionId) {
@@ -101,10 +111,21 @@ class ScheduleServiceCreateStorageTest {
             "echo " + name, "b2 desc", ScheduleScope.SESSION, sessionId, agentId, null, null));
     }
 
-    private ScheduleDto createPersistentJob(String name, String boundProject, String sessionId) {
+    /**
+     * DURABLE 任务创建 · <b>[cwd3 步骤 1a] DURABLE 的 {@code bound_project} 现由 {@code sessionId}
+     * 解析得出</b>，⛔ 不再透传 {@code req.boundProject()} ⇒ 夹具必须先把「会话 → 项目根」绑定进
+     * {@link SessionProjectRoot} 冻结表（等价生产里 DB 回源器给出的结果），否则
+     * {@code ScheduleService.create} 解析不到锚会抛 {@link com.nexusai.infra.exception.UnresolvedProjectRootException}。
+     *
+     * <p>{@code projectRoot} 必须是<b>存在</b>的绝对目录（{@code setForSession} 用
+     * {@code isValidProjectRoot} 校验，无效绑定会被静默拒绝）。
+     */
+    private ScheduleDto createPersistentJob(String name, String projectRoot, String sessionId) {
+        SessionProjectRoot.setForSession(sessionId, projectRoot);
         return service.create(new ScheduleCreateRequest(
             name, ScheduleKind.cron, "0 9 * * *", null, null,
-            "echo " + name, "q2 desc", ScheduleScope.DURABLE, sessionId, null, boundProject, null));
+            "echo " + name, "q2 desc", ScheduleScope.DURABLE, sessionId, null,
+            "客户端伪造的锚（必须被 sessionId 解析值覆盖）", null));
     }
 
     @Test
@@ -145,20 +166,22 @@ class ScheduleServiceCreateStorageTest {
     }
 
     @Test
-    @DisplayName("批次X Q2: create(DURABLE + boundProject) → DB bound_project 列非 null + dto.boundProject() 回填（V23 迁移生效）")
-    void createPersistsBoundProjectToDbAndDto() {
+    @DisplayName("批次X Q2: create(DURABLE + 会话锚) → DB bound_project 列非 null + dto.boundProject() 回填（V23 迁移生效）")
+    void createPersistsBoundProjectToDbAndDto(@TempDir Path projectDir) throws Exception {
         // WHY（规则九）：CC durable 任务的项目锚=文件位置 <projectRoot>/.claude/scheduled_tasks.json
         // （cronTasks.ts:74-83），一个项目一个文件=项目级作用域；Java 全局单表无法从存储位置推断
         // 项目锚，必须每任务一列显式存（V23 bound_project 列），fire 时（CronIdleExecutor）据此
         // 恢复项目上下文。若列未落库 → 重启后 selectAll 读不到锚 → DURABLE fire 回落 user.dir
         // （跨项目 cwd 错位）。
-        String boundProject = "C:/proj/durable-cron-a";
+        // [cwd3 步骤 1a] 锚的来源已收口为 **sessionId 解析结果** ⇒ 这里的 boundProject =
+        //   夹具冻结进 SessionProjectRoot 的目录（等价生产 DB 回源值），而 helper 里塞的
+        //   「客户端伪造的锚」必须被覆盖 —— 这正是本用例下半段的断言。
+        String boundProject = projectDir.toRealPath().toString();
         String creatingSessionId = "00000000-0000-0000-0000-aaaaaaa10000";  // 派生 UUID（工具路径形态）
         ScheduleDto created = createPersistentJob("q2-persist", boundProject, creatingSessionId);
 
-        // create() 返回的 toDto 已透传 boundProject（CC durable 文件位置锚的 Java 列锚等价）
         assertThat(created.boundProject())
-            .as("create 返回 dto.boundProject() 必须等于传入值（批次X Q2 列锚透传）")
+            .as("create 返回 dto.boundProject() 必须等于 sessionId 解析出的锚（批次X Q2 列锚 + 步骤1a 锚来源收口）")
             .isEqualTo(boundProject);
 
         // 直接读 DB（绕过 sessionJobs 反查）→ bound_project 列已落库（V23 迁移）
@@ -167,6 +190,9 @@ class ScheduleServiceCreateStorageTest {
         ScheduleRecord r = rows.get(0);
         assertThat(r.getBoundProject()).as("DB bound_project 列必须非 null（V23 迁移 + create 填充）")
             .isEqualTo(boundProject);
+        assertThat(r.getBoundProject())
+            .as("[步骤1a RE] 客户端在请求体塞的伪造锚必须被解析值覆盖（不得落库）")
+            .doesNotContain("伪造");
         assertThat(r.getSessionId())
             .as("[cron-durable-session-fire] DURABLE 存创建会话 sessionId（归属对话/注入目标，"
                 + "fire 存活时 transcript 归创建会话）——非 SESSION 生命周期绑定，cleanupBySession 按 scope 过滤不误删")
@@ -175,13 +201,13 @@ class ScheduleServiceCreateStorageTest {
 
     @Test
     @DisplayName("[cron-durable-session-fire] cleanupBySession 只删 SESSION-scope 行，DURABLE（带同 sessionId）不误删")
-    void cleanupBySession_doesNotDeleteDurableRows_withSameSessionId() {
+    void cleanupBySession_doesNotDeleteDurableRows_withSameSessionId(@TempDir Path projectDir) throws Exception {
         // WHY（规则九）: DURABLE 现在也存创建会话 sessionId（归属对话/注入目标，非 SESSION 生命周期
         // 绑定）。若 cleanupBySession 按 session_id 无 scope 过滤，会误删跨会话持久化的 DURABLE 任务。
         // cleanupBySession 以 scope=SESSION && session_id=? 为权威（ScheduleService:941）→ DURABLE
         // 行带同 sessionId 必须存活（RED: 移除 scope 过滤 → 本测试 DURABLE 行消失 → 变红）。
         String sessionId = "sess-cleanup-dup";
-        createPersistentJob("q2-cleanup-durable", "C:/proj/durable-cleanup", sessionId);
+        createPersistentJob("q2-cleanup-durable", projectDir.toRealPath().toString(), sessionId);
         createSessionJob("b2-cleanup-session", sessionId);
 
         int deleted = service.cleanupBySession(sessionId);
@@ -214,11 +240,11 @@ class ScheduleServiceCreateStorageTest {
 
     @Test
     @DisplayName("批次X Q2: 模拟重启（清空 sessionJobs 内存索引）后 listAll 仍由 DB bound_project 列回填（V23 列重启存活）")
-    void listAllReadsBoundProjectFromDbAfterRestart() {
+    void listAllReadsBoundProjectFromDbAfterRestart(@TempDir Path projectDir) throws Exception {
         // WHY（规则九）：DURABLE 任务的项目锚必须持久化在 DB 列（非进程内存），重启后
         // listAll → toDto 由 DB 列回填，CronIdleExecutor fire 才拿得到锚（否则重启后 DURABLE
         // fire 回落 user.dir，项目 A 的 durable cron 跑在 JVM 启动目录）。
-        String boundProject = "C:/proj/durable-cron-b";
+        String boundProject = projectDir.toRealPath().toString();
         createPersistentJob("q2-restart", boundProject, "00000000-0000-0000-0000-aaaaaab20000");
 
         // 模拟重启：sessionJobs 是进程内存索引，重启即清空
@@ -295,6 +321,46 @@ class ScheduleServiceCreateStorageTest {
             .isEqualTo(agentId);
     }
 
+    @Test
+    @DisplayName("[cwd3 步骤1a] DURABLE + NO_SESSION 哨兵 ⇒ 不解析锚、不抛、bound_project 恒 NULL（工具路径无 ctx 形态）")
+    void durableWithNoSessionSentinel_leavesBoundProjectNull() {
+        // WHY（规则九 · 意图）：工具路径结构上拿不到会话（CronCreateTool 无 ctx）⇒ 传
+        //   SessionKeys.NO_SESSION **显式声明**无会话。若不把哨兵排除在「解析锚」之外，
+        //   service 会拿 "no-session" 去查 DB ⇒ 查不到 ⇒ 抛 ⇒ 工具路径直接崩。
+        // RED（RE-1a-4）：删掉 ScheduleService.create DURABLE 分支里的 `&& !SessionKeys.isNoSession(sessionId)`
+        //   ⇒ 本用例抛 UnresolvedProjectRootException ⇒ 红。
+        // ⚠️ 请求体里 deliberately 塞一个**伪造锚**：否则「bound_project 为 NULL」这条断言在两个
+        //   实现下都成立（请求体本来就是 null）⇒ 断言无鉴别力（实测踩过，见 RE-1a-3 记录）。
+        ScheduleDto created = service.create(new ScheduleCreateRequest(
+            "q-no-session-sentinel", ScheduleKind.cron, "0 9 * * *", null, null,
+            "echo x", "d", ScheduleScope.DURABLE, SessionKeys.NO_SESSION, null,
+            "/etc/forged-anchor", null));
+
+        assertThat(created.boundProject())
+            .as("哨兵 = 确无会话 ⇒ 无锚（⛔ 不查 DB、不抛、不回落请求体锚）")
+            .isNull();
+        List<ScheduleRecord> rows = mapper.selectAll();
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).getBoundProject()).as("DB bound_project 必须为 NULL").isNull();
+    }
+
+    @Test
+    @DisplayName("[cwd3 步骤1a · RE-1a-3] DURABLE + 空白 sessionId ⇒ 客户端伪造的 boundProject 被丢弃（列恒 NULL）")
+    void durableWithBlankSessionId_discardsForgedBoundProject() {
+        // RED（RE-1a-3）：把 ScheduleService.create DURABLE 分支的 `else { s.setBoundProject(null); }`
+        //   改回 `else { s.setBoundProject(req.boundProject()); }` ⇒ 本断言红（列变成 "/etc/forged"）。
+        //   这条守护的是「**无会话 ⇒ 无锚**」不变量（⛔ 不是「不抛」）。
+        service.create(new ScheduleCreateRequest(
+            "q-blank-session", ScheduleKind.cron, "0 9 * * *", null, null,
+            "echo x", "d", ScheduleScope.DURABLE, "   ", null, "/etc/forged", null));
+
+        List<ScheduleRecord> rows = mapper.selectAll();
+        assertThat(rows).hasSize(1);
+        assertThat(rows.get(0).getBoundProject())
+            .as("[RE-1a-3] 无会话 DURABLE ⇒ bound_project 必须为 NULL（⛔ 客户端伪造值不得落库）")
+            .isNull();
+    }
+
     /** 直插 DB 行（绕过 create 的 Quartz 注册），供 nextAvailableName 占用集构造。 */
     private void insertRow(String name, ScheduleKind kind) {
         ScheduleRecord r = new ScheduleRecord();
@@ -322,6 +388,18 @@ class ScheduleServiceCreateStorageTest {
 
         ScheduleDto first = service.create(req);
         ScheduleDto second = service.create(req);
+
+        // [cwd3 步骤 1a · RE-1a-3 锚点] DURABLE + sessionId=null 走「无会话 ⇒ 无锚」分支 ⇒
+        //   bound_project 必须恒 NULL。**这条守护的是「无会话 ⇒ 无锚」不变量，不是「不抛」**：
+        //   把 ScheduleService.create 的 `else { s.setBoundProject(null); }` 改回透传
+        //   `req.boundProject()` ⇒ 本断言翻红（客户端可伪造锚）。
+        List<ScheduleRecord> rowsAfterDurableNullSession = mapper.selectAll();
+        assertThat(rowsAfterDurableNullSession)
+            .as("两个 DURABLE+null sessionId 行均落库").hasSize(2);
+        assertThat(rowsAfterDurableNullSession)
+            .extracting(ScheduleRecord::getBoundProject)
+            .as("[RE-1a-3] DURABLE + 无会话 ⇒ bound_project 恒 NULL（⛔ 不得回落请求体值）")
+            .containsOnlyNulls();
 
         assertThat(first.id()).as("同 name 双插必须生成不同 id（身份语义 = id，对齐 CC）")
             .isNotEqualTo(second.id());

@@ -295,6 +295,18 @@ export interface CreateScheduleRequest {
   runAt?: string
   command?: string              // hidden from UI but accepted in API
   description?: string
+  /**
+   * 任务归属会话（[cwd3]）。`scope=DURABLE`（默认）时**必填**：后端从它解析任务的项目锚
+   * （boundProject），并**忽略**请求体里的 boundProject（防客户端伪造锚）。缺 id / 传 "no-session"
+   * 哨兵 / 解析不到绑定项目根 ⇒ 400。
+   * ⚠️ `scope=SESSION` 也用它（生命周期随会话清理）。
+   */
+  sessionId?: string
+  /**
+   * 生命周期：DURABLE（默认，落库跨重启）| SESSION（随会话结束清理）。
+   * ⚠️ [cwd3] **创建后不可变** —— update 请求带 scope/sessionId 会被后端 400 拒绝。
+   */
+  scope?: 'DURABLE' | 'SESSION'
 }
 export interface UpdateScheduleRequest extends Partial<CreateScheduleRequest> {}
 

@@ -3,6 +3,7 @@ package com.nexusai.apis.claudemd;
 import com.nexusai.application.agent.context.ClaudemdEngine;
 import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.domain.project.ClaudeMdIncludeApprovalStore;
 import com.nexusai.infra.exception.ValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,6 +63,18 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       （同两条 CC 源码），不是本仓引入的新行为。</li>
  * </ol>
  *
+ * <p>⭐ <b>[acc2 2026-09-15] 审批态已<b>持久化</b>（跨重启存活）</b>：
+ * <p><b>原来的偏离</b>：两份态仅存进程内 {@code ConcurrentHashMap} ⇒ <b>进程重启即丢</b> ⇒ 用户每次
+ * 重启都被重复弹一次审批。而 CC 的宿主是 <b>project config</b>（config.ts:115-116，跨进程存盘）。
+ * <p><b>现修法</b>：内存 map 降为 L1 写穿镜像，事实源 = {@code claude_md_include_approval} 表（V74，
+ * 经 {@link ClaudeMdIncludeApprovalStore}）。POST 写内存 + 写穿 DB（两列一次 upsert）；读路径内存 miss
+ * ⇒ 回源 DB 并回填（{@link #refillFromStore}）。⛔ <b>不引入 TTL</b>：本仓单 JVM、无第二写入方 ⇒
+ * 写穿 + 回源即一致。
+ * <p>⚠️ <b>DB 键 ≠ 内存键</b>：DB 侧 = 归一化键（{@code ProjectService.normalizePathKey}，折叠斜杠方向
+ * + 大小写，<b>在 store 内单点执行</b>）；内存侧 = canonical 原样（Windows 上含反斜杠）。
+ * 归一是本批的命门 —— 不做则「写侧 {@code D:\x\y}、读侧 {@code D:/x/y}」查不到 ⇒
+ * <b>「批准了但不加载」的静默失效</b>。
+ *
  * <p><b>缓存失效</b>：{@code getMemoryFiles} memoize（CC lodash memoize claudemd.ts:790）——
  * 审批态翻转后若不失效，主路径仍返回旧列表（不含新批准的外部 @include）。对齐 CC
  * {@code clearMemoryFileCaches}「purely for correctness … settings sync」（claudemd.ts:1110-1122）
@@ -97,6 +110,25 @@ public class ClaudeMdController {
     private ClaudemdEngine claudemdEngine;
 
     /**
+     * 审批态持久化 store（DB，跨重启存活）· Spring 注入；测试 {@code new} 实例 / 未接线 → null
+     * → 回落纯内存行为（改造前语义，不抛）。
+     *
+     * <p><b>WHY 落库</b>：CC 的两个标志宿主是 <b>project config</b>（config.ts:115-116，跨进程存盘）
+     * ⇒ 重启后不重复弹审批；纯内存 {@code ConcurrentHashMap} 进程重启即丢 ⇒ 每次重启重复弹窗。
+     *
+     * <p><b>键归一的唯一落点</b>：归一在 {@link ClaudeMdIncludeApprovalStore} 内<b>单点</b>执行
+     * （{@code ProjectService.normalizePathKey}，全仓只此一份），故本控制器传入的键可以是
+     * canonical 原样（Windows 上含反斜杠）—— ⛔ 本类不另写第二份归一。
+     */
+    @Autowired(required = false)
+    private ClaudeMdIncludeApprovalStore store;
+
+    /** 测试/自定义接线入口（Spring 之外注入持久化 store）。 */
+    public void setStore(ClaudeMdIncludeApprovalStore store) {
+        this.store = store;
+    }
+
+    /**
      * 外部 include 审批态 · <b>按项目键分区</b> · CC original: {@code config.hasClaudeMdExternalIncludesApproved}
      * （config.ts:115，缺省 false :146）。
      *
@@ -104,6 +136,10 @@ public class ClaudeMdController {
      * {@code false}（CC {@code DEFAULT_PROJECT_CONFIG}，config.ts:146）。
      * <p>⛔ <b>不是 sessionId 键</b>（那会发明 CC 没有的判据）；⛔ <b>不是进程级单例</b>（那会跨项目泄漏
      * ——本批要治的正是这个）。
+     * <p><b>[acc2] 本 map 只是写穿镜像 / 读路径的 L1 快路径</b>：POST 写内存 + 写穿 DB；
+     * 读 miss ⇒ 回源 {@link #store} 并回填（见 {@link #refillFromStore}）。
+     * ⚠️ 本 map 的键是 <b>canonical 原样</b>（Windows 上含反斜杠），与 DB 侧的<b>归一化键</b>不同 ——
+     * 归一被钉在 store 内单点（⛔ 本类不另写第二份归一）；两条路径各自自洽，故不影响正确性。
      */
     private final Map<String, Boolean> externalIncludesApprovedByProject = new ConcurrentHashMap<>();
 
@@ -139,7 +175,8 @@ public class ClaudeMdController {
     /**
      * 前端审批对话框审批外部 @include · POST /api/v1/claude-md/include-approval。
      *
-     * <p>流程: 校验 {@code approved} 二值 + 解析项目键（失败 → 400）→ 更新本项目键下的两份态 →
+     * <p>流程: 校验 {@code approved} 二值 + 解析项目键（失败 → 400）→ 更新本项目键下的两份态
+     * <b>+ 写穿 DB（[acc2] 两列一次 upsert，跨重启存活）</b> →
      * 以 {@code sessionId -> 项目键查表} 闭包注入引擎（CC claudemd.ts:798-801 includeExternal 门控，
      * 引擎侧 {@code getMemoryFiles} / {@code shouldShowClaudeMdExternalIncludesWarning} <b>两侧同一个闭包
      * 同一个键</b>）→ {@link ClaudemdEngine#clearMemoryFileCaches()} 失效 memoize 缓存（CC settings-sync
@@ -163,6 +200,8 @@ public class ClaudeMdController {
         // CC Dialog onDone 批准/拒绝均置 WarningShown=true（config.ts:123-131）——拒绝后不再弹窗；
         // shouldShowClaudeMdExternalIncludesWarning 因 warningShown=true 返回 false（claudemd.ts:1423-1426）
         this.externalIncludesWarningShownByProject.put(projectKey, true);
+        // [acc2] 写穿 DB（两列一次 upsert）——CC 宿主是 project config（跨进程存盘）⇒ 重启后不重复弹审批
+        persistIncludeApproval(projectKey, approved);
         wireEngine(engine);
         // CC claudemd.ts:1119-1122 clearMemoryFileCaches（settings sync 纯正确性失效）——
         // 否则 memoize 的 getMemoryFiles(false, ...) 缓存不含新批准的外部 @include
@@ -289,18 +328,97 @@ public class ClaudeMdController {
         engine.setHasClaudeMdExternalIncludesWarningShown(this::warningShownForSession);
     }
 
-    /** 见 {@link #wireEngine} 的契约（(b) 类返回 false + 一次性 WARN；(a) 类抛）。 */
+    /**
+     * 见 {@link #wireEngine} 的契约（(b) 类返回 false + 一次性 WARN；(a) 类抛）。
+     *
+     * <p>[acc2] 内存命中即返回；miss ⇒ 回源 store 并回填（{@link #refillFromStore}）。
+     */
     private boolean approvedForSession(String sessionId) {
         String projectKey = projectKeyForEngineRead(sessionId);
-        return projectKey != null
-            && Boolean.TRUE.equals(this.externalIncludesApprovedByProject.get(projectKey));
+        if (projectKey == null) {
+            return false;
+        }
+        Boolean cached = this.externalIncludesApprovedByProject.get(projectKey);
+        if (cached != null) {
+            return cached;
+        }
+        ClaudeMdIncludeApprovalStore.State state = refillFromStore(projectKey);
+        return state != null && state.approved();
     }
 
     /** 见 {@link #wireEngine} 的契约（同 {@link #approvedForSession}）。 */
     private boolean warningShownForSession(String sessionId) {
         String projectKey = projectKeyForEngineRead(sessionId);
-        return projectKey != null
-            && Boolean.TRUE.equals(this.externalIncludesWarningShownByProject.get(projectKey));
+        if (projectKey == null) {
+            return false;
+        }
+        Boolean cached = this.externalIncludesWarningShownByProject.get(projectKey);
+        if (cached != null) {
+            return cached;
+        }
+        ClaudeMdIncludeApprovalStore.State state = refillFromStore(projectKey);
+        return state != null && state.warningShown();
+    }
+
+    /**
+     * [acc2] 内存 miss ⇒ <b>回源 DB 并回填两份内存镜像</b>（等价
+     * {@code SessionProjectRoot.lookup:310-314} + {@code McpNeedsAuthCache.isCached:77-100} 范式）。
+     *
+     * <p><b>WHY 不加 TTL</b>：本仓<b>单 JVM</b> ⇒ 写穿 + miss 回源即足够一致（无第二个写入方），
+     * 与 {@code McpNeedsAuthCacheStore} 需要 TTL 的多实例场景不同。
+     *
+     * <p><b>一行两列 ⇒ 一次查询</b>：两个访问器都走本方法，先到者回填<b>两份</b>镜像 ⇒ 后到者内存命中，
+     * 故一次读路径最多一次 PK 查询。
+     *
+     * <p><b>失败语义</b>：store 缺席（测试 {@code new} 实例 / 未接线）⇒ 返回 null（回落纯内存，
+     * 改造前语义不变）；无行 ⇒ 返回 null（⛔ <b>不把 false 写进内存</b> —— 负缓存会钉死「先读 miss
+     * → 后 POST」）；DB 读失败 ⇒ fail-open 返回 null（按 CC 缺省 false，config.ts:146，不阻断
+     * agent 加载路径）+ WARN。
+     */
+    private ClaudeMdIncludeApprovalStore.State refillFromStore(String projectKey) {
+        ClaudeMdIncludeApprovalStore s = this.store;
+        if (s == null) {
+            return null;
+        }
+        try {
+            ClaudeMdIncludeApprovalStore.State state = s.read(projectKey);
+            if (state == null) {
+                return null;
+            }
+            this.externalIncludesApprovedByProject.put(projectKey, state.approved());
+            this.externalIncludesWarningShownByProject.put(projectKey, state.warningShown());
+            if (log.isDebugEnabled()) {
+                log.debug("[ClaudeMdController] 审批态内存 miss → 回源 DB 并回填: projectKey={} "
+                    + "approved={} warningShown={}", projectKey, state.approved(), state.warningShown());
+            }
+            return state;
+        } catch (Exception e) {
+            log.warn("[ClaudeMdController] 审批态回源 DB 失败 projectKey={}（fail-open 按 CC 缺省 false，"
+                + "config.ts:146，不阻断加载路径）: {}", projectKey, e.toString());
+            return null;
+        }
+    }
+
+    /**
+     * [acc2] POST 后写穿 DB（<b>两列一次 upsert</b>，⛔ 不做两次 DB 往返）。
+     *
+     * <p><b>调用顺序 = 先内存后 DB</b>：DB 写失败仅 WARN 并降级纯内存（改造前语义），不阻断审批
+     * 端点（对齐 {@code McpNeedsAuthCache.setCached} 的 best-effort 吞错；
+     * CC 侧 setMcpAuthCacheEntry 的 {@code .catch} 同义，client.ts:306-308）。
+     *
+     * <p>store 缺席（测试 {@code new} 实例 / 未接线）⇒ 静默 no-op（不抛）。
+     */
+    private void persistIncludeApproval(String projectKey, boolean approved) {
+        ClaudeMdIncludeApprovalStore s = this.store;
+        if (s == null) {
+            return;
+        }
+        try {
+            s.save(projectKey, approved, true);
+        } catch (Exception e) {
+            log.warn("[ClaudeMdController] 审批态写穿 DB 失败 projectKey={}（降级纯内存，重启后丢）: {}",
+                projectKey, e.toString());
+        }
     }
 
     /**

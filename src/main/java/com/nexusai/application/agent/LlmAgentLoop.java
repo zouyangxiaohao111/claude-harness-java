@@ -208,7 +208,8 @@ public class LlmAgentLoop implements AgentLoop {
      * 计数器语义保证嵌套 run/subagent 同 sessionId 幂等（put 计数 +1 / finally 计数 -1，归零移除）。
      *
      * <p>[session-id-short] 键型 UUID→String（short 形态 sess-xxx）；GLOBAL 占位见 CronIdleExecutor
-     * {@code GLOBAL_SESSION_KEY}（"global" 非 null 保持 markRunning 计数语义）。
+     * {@code GLOBAL_SESSION_KEY}（= {@link com.nexusai.common.SessionKeys#NO_SESSION}，非 null 保持
+     * markRunning 计数语义 —— ⛔ {@code markRunning(null)} 会早退漏计数）。
      */
     private static final ConcurrentHashMap<String, AtomicInteger> RUNNING_SESSIONS = new ConcurrentHashMap<>();
 
@@ -5137,10 +5138,15 @@ public class LlmAgentLoop implements AgentLoop {
                 String prefetchProjectRoot = (params.toolUseContext() != null
                         && params.toolUseContext().effectiveCwd() != null)
                     ? params.toolUseContext().effectiveCwd().toString() : null;
+                // [acc7/D1] @-mention 查 agent-defs 表的会话键（显式）—— 原 0 参 registry Supplier
+                //   恒进程默认；来源 = ToolUseContext.sessionId()（本点唯一会话真源，禁读 MDC/禁回落）。
+                String prefetchSessionId = params.toolUseContext() != null
+                    ? params.toolUseContext().sessionId() : null;
                 // [S1-T7] agent 归因上下文以**值**下传（见 startPrefetch javadoc）：本点跑在 query loop
                 //   线程，池线程读不到 ThreadLocal ⇒ 必须显式传；来源 = base TUC 的显式字段（单一来源）。
                 pendingMemoryPrefetch = ctx.memoryPrefetcher().startPrefetch(
                     state.rawMessages(), readFileState, turnAbort, prefetchProjectRoot,
+                    prefetchSessionId,
                     params.toolUseContext() != null ? params.toolUseContext().agentContext() : null);
             } catch (Exception e) {
                 log.debug("[LlmAgentLoop] turn={} relevant-memories prefetch 启动失败（跳过预取）: {}",

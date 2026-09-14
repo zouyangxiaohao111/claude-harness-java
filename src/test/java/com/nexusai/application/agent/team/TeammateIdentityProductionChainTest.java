@@ -88,8 +88,10 @@ class TeammateIdentityProductionChainTest {
     void setUp() {
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
         System.setProperty("nexusai.experimental.agent-teams", "true");
-        // 无 DB 的合成会话：与全局 JUnit 扩展同语义（「确无会话」，非「无法判定」）
-        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        // 无 DB 的合成会话：与全局 JUnit 扩展同语义（「确无会话」，非「无法判定」）。
+        // [cwd3 步骤 2] ⛔ 必须是 sessionlessEnvironment 而不是 unknown —— 后者语义是「DB 明确答
+        //   无此会话」，cwd 域自步骤 2 起对该态 fail-loud 抛（本类经 ToolUseContext 构造链触发）。
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
     }
 
     @AfterEach

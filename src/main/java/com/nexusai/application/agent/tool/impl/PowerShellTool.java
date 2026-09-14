@@ -650,7 +650,23 @@ public class PowerShellTool implements Tool {
             // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
             //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
             String sessionId = ctx != null ? ctx.sessionId() : null;
-            String sessionCwd = CwdResolution.getCwd(sessionId);
+            // [批 subcwd D9] ⛔ 不再无条件调 CwdResolution.getCwd(sessionId)：sessionId 为 null/空白
+            //   （以及显式「确无会话」哨兵）时会命中 CwdResolution 的**无会话出口**，其值恒等于
+            //   进程 user.dir = **后端启动目录** —— 而本处结果是 pwsh 子进程的真实工作目录
+            //   （下方 pb.directory），「进程级值冒充会话态」在这里的代价是整条命令在服务器目录里跑
+            //   （相对路径读写全锚错）。会话态来源只接受**真 sessionId**；其余 ⇒ 下方 fail-loud。
+            String sessionCwd = (sessionId != null && !sessionId.isBlank()
+                    && !com.nexusai.common.SessionKeys.isNoSession(sessionId))
+                ? CwdResolution.getCwd(sessionId)
+                : null;
+            if (sessionCwd == null || sessionCwd.isBlank()) {
+                log.warn("[PowerShellTool] 会话工作目录缺失（ctx={}，sessionId='{}'）⇒ 拒绝执行"
+                    + "（⛔ 不回落进程 user.dir 作 pwsh 子进程工作目录）command={}",
+                    ctx == null ? "null" : "非 null", sessionId, abbreviate(command, 80));
+                return ToolResult.error(call.id(),
+                    "Cannot determine the session working directory (sessionId='" + sessionId + "'). "
+                    + "Refusing to run PowerShell with the server startup directory as its working directory.");
+            }
             String wrappedCommand = command;
             try {
                 cwdTrackFile = Files.createTempFile("ps-cwd-", ".tmp");
@@ -682,7 +698,9 @@ public class PowerShellTool implements Tool {
             //   sessionCwd 此处 = CwdResolution.getCwd(sessionId) 实时解析（cd 读回后 SessionCwdHolder
             //   已更新 → 下一条命令取到新 cwd）。effectiveCwd 快照仅供技能发现/权限 baseDir 等消费
             //   （INV-6 注释），不应用于 spawn 目录。
-            Path cwd = Path.of(sessionCwd != null && !sessionCwd.isBlank() ? sessionCwd : fallbackCwd(sessionId));
+            // [批 subcwd D8] 直接消费上面解析出的会话态 cwd（原实现在此**又**走一次 fallbackCwd，
+            //   即「同一函数被调用两次」；fallbackCwd 已删）。
+            Path cwd = Path.of(sessionCwd);
             pb.directory(cwd.toFile());
 
             // CC :698 — timeoutMs = Math.min(timeout || getDefaultTimeoutMs(), getMaxTimeoutMs())
@@ -1099,21 +1117,6 @@ public class PowerShellTool implements Tool {
 
     private static String abbreviate(String s, int max) {
         return s == null ? "" : (s.length() > max ? s.substring(0, max) + "..." : s);
-    }
-
-    /**
-     * effectiveCwd 缺失时的兜底 cwd · 对齐 CC getCwd()（Shell.ts:218 pwd()）。
-     * cwd-align-ext：user.dir 兜底 → 会话 cwd；无 sessionId 回落 user.dir（方案 1，零行为变化）。
-     *
-     * <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code execute} 显式传入（= {@code ctx.sessionId()}，
-     * 无 ctx ⇒ null）；⛔ 已删原裸 MDC 读点（该读点在 tool-exec 池线程上取不到本会话，
-     * 且会读到该池线程上一个任务残留的别会话 id）。
-     *
-     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
-     */
-    private static String fallbackCwd(String sessionId) {
-        String cwd = CwdResolution.getCwd(sessionId);
-        return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
     }
 
     // ── PowerShell 完整输出捕获 · CC ShellCommand outputFilePath 的 Java 等价（DEC-1 BashTool 同款）──

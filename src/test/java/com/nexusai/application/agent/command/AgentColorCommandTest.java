@@ -490,6 +490,52 @@ class AgentColorCommandTest {
         assertThat(h.format(List.of(), PRODUCTION_GROUPS)).isEqualTo("No agents found.");
     }
 
+    /**
+     * <b>[acc7/D4] {@code GET /api/agents} 无会话源 ⇒ 0 参 {@code listAgents()} + ≥WARN</b>。
+     *
+     * <p>WHY（规则九 / 本仓铁律 threadlocal-session-state-global-ban）: 本端点签名无 sessionId 参数，
+     * MDC/RequestContext 又被禁为会话源 ⇒ 会话源<b>确实不可得</b>。两个后果都必须被钉住：
+     * <ol>
+     *   <li>⛔ <b>不得发明会话 id</b>（禁 {@code registryForSession(假 id)} 硬塞）—— 否则会把
+     *       「进程默认」伪装成「某会话视图」，比 null 更坏（RequestContext 第三态前车之鉴）；</li>
+     *   <li>静默退化不可接受 ⇒ 必须 ≥WARN（对齐 T15-3 F2/F3 治法）。</li>
+     * </ol>
+     */
+    @Test
+    @DisplayName("[acc7/D4] agents 端点无会话源 → 0 参 listAgents() + ≥WARN，且不发明会话 id")
+    void agentsEndpoint_noSessionSource_warnsAndDoesNotInventSessionId() throws Exception {
+        AgentsHandler h = new AgentsHandler();
+        SubagentTool tool = org.mockito.Mockito.mock(SubagentTool.class);
+        org.mockito.Mockito.when(tool.listAgents()).thenReturn(List.<com.nexusai.application.agent.subagent.AgentDefinition>of());
+        Field field = AgentsHandler.class.getDeclaredField("subagentTool");
+        field.setAccessible(true);
+        field.set(h, tool);
+
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(AgentsHandler.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            assertThat(h.agents()).isEqualTo("No agents found.");
+
+            // ① 走 0 参（进程默认）访问器
+            org.mockito.Mockito.verify(tool).listAgents();
+            // ② ⛔ 绝不经会话显式重载 —— 本端点无会话源，任何 registryForSession(x) 都是发明会话 id
+            org.mockito.Mockito.verify(tool, org.mockito.Mockito.never())
+                .registryForSession(org.mockito.ArgumentMatchers.any());
+
+            assertThat(appender.list.stream()
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                    .toList())
+                .as("无会话源 ⇒ 必须留下 ≥WARN（静默退化不可接受）")
+                .anyMatch(m -> m.contains("agents 端点无会话源"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
     @Test
     @DisplayName("format: 按 AGENT_SOURCE_GROUPS 顺序分组 + 组内按名排序 + active 计数头")
     void format_groupsAndSorts() {

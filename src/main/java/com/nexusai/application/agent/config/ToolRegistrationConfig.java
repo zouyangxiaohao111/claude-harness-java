@@ -1220,18 +1220,34 @@ public class ToolRegistrationConfig {
         // 三态回源查询（[批 4a]）：sessionKnown 区分「会话存在但未绑定」（数据链路异常 ⇒ cwd 域 fail-loud）
         // 与「DB 无此会话」（合成/伪造 id ⇒ 无会话出口），二者都返回 projectRoot=null。
         java.util.function.Function<String, com.nexusai.common.SessionProjectRoot.Lookup> lookupResolver = sessionId -> {
-            if (sessionId == null || sessionId.isBlank()) {
-                return com.nexusai.common.SessionProjectRoot.Lookup.unknown();
+            // [cwd3 步骤 2 · 2a-3「两处旁路」之一] null/空白/哨兵 ⇒ **本环境确无会话**
+            //   （⛔ 不是「DB 明确答无此会话」—— 这一支根本没查 DB，没说 DB 答了什么）。
+            //   哨兵也要算进来：`SessionProjectRoot.lookup` 是公开 API，可被直接调用
+            //   （先例：ClaudeMdController.resolveProjectKey）；若这里只认 null/空白，则直调
+            //   lookup(NO_SESSION) 会走到 selectOneById("no-session") ⇒ null ⇒ unknown ⇒
+            //   cwd 域 fail-loud，把一个哨兵报成「伪造 id」—— 正是本改造要消灭的东西。
+            // RED（RE-2a-2）：本支改回 Lookup.unknown() ⇒
+            //   ToolRegistrationConfigSessionProjectRootResolverTest#blankSessionId_isSessionlessWithoutDbQuery 红。
+            if (sessionId == null || sessionId.isBlank()
+                    || com.nexusai.common.SessionKeys.isNoSession(sessionId)) {
+                return com.nexusai.common.SessionProjectRoot.Lookup.sessionlessEnvironment();
             }
             com.nexusai.repository.session.entity.SessionRecord session;
             try {
                 session = sessionMapper.selectOneById(sessionId);
             } catch (Exception e) {
+                // [cwd3 步骤 2 · 2a-5] DB 查询**抛错** = 无法判定（不是「答无此会话」）⇒ resolutionFailure。
+                //   ⚠️ 这是**可用性变化**：一次瞬时 DB 抖动会让 cwd 域全线 fail-loud（而非静默回落
+                //   user.dir）。有意为之 —— 「本该有却没有」必须暴露，⛔ 不得回落进程 user.dir 冒充项目根。
+                // RED（RE-2a-3）：本行改回 Lookup.unknown() ⇒
+                //   SessionProjectRootTest#dbResolverThrowing_reportsResolutionFailureWithWarn 红。
                 log.warn("[ToolRegistrationConfig] 解析会话 projectRoot 查询失败: {} - {}", sessionId, e.getMessage());
-                return com.nexusai.common.SessionProjectRoot.Lookup.unknown();
+                return com.nexusai.common.SessionProjectRoot.Lookup.resolutionFailure();
             }
             if (session == null) {
-                // DB 无此会话 ⇒ 「确无会话」（合成/伪造/已删 id）
+                // [cwd3 步骤 2 · 2a-4「两处旁路」之二] DB 查了、DB 明确答「没有这一行」⇒
+                //   **unknown()**（⛔ 不得改成 sessionless —— 那会把「本该有会话却没有」这个
+                //   数据链路异常信号重新抹平成本次要消灭的静默回落）。
                 return com.nexusai.common.SessionProjectRoot.Lookup.unknown();
             }
             if (session.getMainProjectId() == null || session.getMainProjectId().isBlank()) {
@@ -1540,15 +1556,13 @@ public class ToolRegistrationConfig {
             findRelevant, autoMemPaths, memoryAge,
             com.nexusai.application.agent.skill.BundledSkillEnabledGates::isAutoMemoryEnabled,
             () -> featureFlags != null && featureFlags.tenguMothCopse(),   // FIX-FR 真实门控（nexusai.feature.tengu-moth-copse 属性）
-            // 惰性 supplier：bean 装配期不得强制解析 subagentTool（@Lazy 代理 + AgentLoopContextFactory
+            // 惰性 function：bean 装配期不得强制解析 subagentTool（@Lazy 代理 + AgentLoopContextFactory
             // 循环依赖防护）—— 预取运行时（bean 已就绪）才经代理取 registry
-            // [批 3c 未决项] 本 supplier 与 MemoryPrefetcher 均无会话形参（bean 级装配，装配期/预取调用
-            //   点都拿不到会话）→ 经无参 SubagentTool.agentRegistry() 得<b>进程默认</b>（workspaceDir）
-            //   agent-defs；原会话源（裸 MDC）已按批 3c 删除。待决策：给
-            //   MemoryPrefetcher.startPrefetch(...) 加 sessionId 形参（来源 = LlmAgentLoop 的
-            //   params.toolUseContext().sessionId()）并把本 supplier 改成 Function<String,Registry> ——
-            //   会触及 MemoryPrefetcherTest 的 13 处调用点，超出批 3c 文件授权，故保持原样。
-            () -> subagentTool != null ? subagentTool.agentRegistry() : null,
+            // [acc7/D1/D3 已收口] 会话显式：入参 = sessionId，由 MemoryPrefetcher.startPrefetch 从
+            //   ToolUseContext.sessionId() 显式透传（生产调用点 LlmAgentLoop）。原为 0 参
+            //   Supplier<Registry>（装不下会话）⇒ 恒进程默认（workspaceDir）agent-defs ——
+            //   形态与治法同 T15-3 的 Supplier<Boolean> → Function<String,Boolean>。
+            sessionId -> subagentTool != null ? subagentTool.agentRegistry(sessionId) : null,
             agentMemoryDirectory);
     }
 

@@ -186,6 +186,33 @@ class BackgroundTaskRunnerTest {
         }
     }
 
+    /**
+     * [cwd3 步骤 2 · S2.5] {@code taskOutputDir} <b>保持 fail-loud，⛔ 不加哨兵</b>。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：任务产物目录在<b>注册期</b>就已写进任务记录。若会话在任务运行
+     * 期间被删，收尾时按「无会话」回落 {@code user.dir} 会把产物写到<b>与注册期不同的目录</b>
+     * （注册期是原 boundProject，收尾变成后端启动目录）⇒ 产物丢失/串目录。⇒ 该路径**有意**让
+     * 「DB 明确答无此会话」继续抛，靠调用方修复（删任务 / 补会话），而非静默换目录。
+     *
+     * <p>RED（反向实验）：把 {@code taskOutputDir} 里的
+     * {@code CwdResolution.getOriginalCwdLayer(sessionId)} 换成
+     * {@code getOriginalCwdLayerForNonSession()}（或给 unknown 分支加哨兵/回落）⇒ 本用例红。
+     */
+    @Test
+    @DisplayName("[cwd3 S2.5] taskOutputDir：DB 明确答无此会话 ⇒ 仍 fail-loud（⛔ 不加哨兵/不回落 user.dir）")
+    void taskOutputDir_unknownSessionStaysFailLoud() {
+        com.nexusai.common.SessionProjectRoot.setDbResolver(
+            sid -> com.nexusai.common.SessionProjectRoot.Lookup.unknown());
+        try {
+            assertThatThrownBy(() -> BackgroundTaskRunner.taskOutputDir("sess-deleted-cwd3"))
+                .as("会话已删 ⇒ 收尾时不得改写到别的目录（有意 fail-loud，防产物落到与注册期不同的目录）")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sess-deleted-cwd3");
+        } finally {
+            SessionProjectRootTestSupport.declareNoDatabase();
+        }
+    }
+
     @Test
     @DisplayName("per-user 层：NexusaiPaths.getAppTempDirName()（Windows={appName} / Unix={appName}-{uid}，CC filesystem.ts:307-315 结构）")
     void taskOutputDir_perUserLayerAppTempDirName() {

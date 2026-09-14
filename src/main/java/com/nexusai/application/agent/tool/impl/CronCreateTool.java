@@ -584,8 +584,17 @@ public class CronCreateTool implements Tool {
             // 创建会话已关 → fire 照常执行（headless）但不产生会话 transcript。CC durable 落盘 shape
             // 无 sessionId（cronTasks.ts:175/190-218 写盘仅 {id,cron,prompt,createdAt,lastFiredAt?,recurring?,
             // permanent?}），但 Java 多会话 web 服务队列跨线程边界必须显式携带创建会话
-            // （对齐 CRON-D5 会话归组）；无会话（REST 直建 / 无 ctx）→ null → fire headless 无 transcript。
-            sessionId = null;
+            // （对齐 CRON-D5 会话归组）；无会话（无 ctx / ctx 无 sessionId）⇒
+            // [cwd3 · 用户裁定 2026-09-15 步骤 1a] **显式「确无会话」哨兵 SessionKeys.NO_SESSION**
+            //   —— ⛔ 不再用 null。理由：null 会在下游被 resolveSessionUuid 兜成 GLOBAL_SESSION_KEY
+            //   并经 CwdResolution 落「DB 查无此会话」的 unknown 分支（步骤 2 起该分支 fail-loud 抛）；
+            //   哨兵则在 CwdResolution 顶部被显式识别 ⇒ 走命名无会话出口，语义正确（铁律出口 (b)：
+            //   本条路径结构上确无会话）。
+            //   可达性自证：本分支要求 ctx==null 或 ctx.sessionId()==null。生产工具调用链
+            //   （StreamingToolExecutor → ToolUseContext）恒带非 null sessionId（会话链上取不到时
+            //   createSubagentContext:236 / RunForkedAgent:94 / InboundMcpToolProvider:337 传的也是
+            //   哨兵）⇒ **生产近乎不可达**，主要覆盖非 Spring 夹具的直调（见 CronCreateTool 测试）。
+            sessionId = SessionKeys.NO_SESSION;
             if (ctx != null && ctx.sessionId() != null) {
                 // [session-id-short] DURABLE cron 落库 short 直键，与 HTTP 路径 ScheduleService.create
                 // 形态统一（消除 F2 双形态根因之一；存量 DB 行读取侧 originalKey 兜底见 SessionKeys）。

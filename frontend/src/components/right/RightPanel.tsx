@@ -436,7 +436,8 @@ export function RightPanel({
   // 「文件」tab 数据 = 本会话 agent 改动文件（chatStore.changedFiles · files.changed 事件/GET /files 写入 · 无=[]零态）
   const files = useChatStore((s) => s.changedFiles[activeSessionId ?? ''] ?? EMPTY_FILES)
   // 任务 tab 数据：定时任务（真实后端）+ 子代理身份（/topic/tasks 事件登记）
-  const schedules = useSchedules()
+  // [cwd3] 传本面板的 activeSessionId：定时任务创建必须带会话锚（见 useSchedules javadoc）。
+  const schedules = useSchedules(activeSessionId)
   const subagentIdentities = useSubagentStore((s) => s.bySession[activeSessionId ?? ''] ?? EMPTY_IDENTITY_MAP)
   const tasksCount = schedules.list.length + Object.keys(subagentIdentities).length
 

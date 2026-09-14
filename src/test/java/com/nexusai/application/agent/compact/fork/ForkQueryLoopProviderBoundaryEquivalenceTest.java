@@ -479,7 +479,7 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
             prefetch.settledAt = 1L;
             // [S1-T7] 生产调用点改为 5 参重载（新增 agentContext 显式载体） ⇒ 桩必须匹配新签名，
             //   否则 Mockito 返回 null（默认）→ 预取不启动 → 断言假红（实测踩过）。
-            when(prefetcher.startPrefetch(any(), any(), any(), any(), any())).thenReturn(prefetch);
+            when(prefetcher.startPrefetch(any(), any(), any(), any(), any(), any())).thenReturn(prefetch);
             when(prefetcher.filterDuplicateMemoryAttachments(any(), any())).thenReturn(List.of(attachment));
             setField(contextFactory, "memoryPrefetcher", prefetcher);
         }

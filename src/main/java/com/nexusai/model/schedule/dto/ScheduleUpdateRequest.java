@@ -23,8 +23,9 @@ package com.nexusai.model.schedule.dto;
  * @param runAt           kind=once 的 ISO 8601 执行时间（可空 = 不改）
  * @param command         执行命令（可空 = 不改）
  * @param description     描述（可空 = 不改）
- * @param scope           DURABLE|SESSION（可空 = 不改）
- * @param sessionId       scope=SESSION 的绑定会话（可空 = 不改）
+ * @param scope           DURABLE|SESSION（⚠️ [cwd3 · D6] <b>创建后不可变</b>：非 null ⇒
+ *                        {@code ValidationException} ⇒ 400，见 {@code ScheduleService#update}）
+ * @param sessionId       创建时绑定的会话（⚠️ [cwd3 · D6] <b>创建后不可变</b>：非 null ⇒ 400）
  * @param agentId         teammate agentId（可空 = 不改）
  */
 public record ScheduleUpdateRequest(

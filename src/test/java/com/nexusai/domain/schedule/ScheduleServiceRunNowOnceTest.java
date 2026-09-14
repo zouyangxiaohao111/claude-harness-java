@@ -130,7 +130,9 @@ class ScheduleServiceRunNowOnceTest {
         String id = service.create(new ScheduleCreateRequest(
             "run-now-cron", ScheduleKind.cron, "0 9 * * *", null, null,
             "echo cron", "b4-4 desc",
-            ScheduleScope.DURABLE, null, null, null, null)).id();
+            // [cwd3 步骤 1a · RE-1a-3] 请求体塞**伪造锚**：无会话 DURABLE 的 bound_project 必须
+            //   恒 NULL ⇒ 若实现回落 req.boundProject() 本用例即红（不塞伪造值则断言无鉴别力）。
+            ScheduleScope.DURABLE, null, null, "/etc/forged-anchor", null)).id();
         when(quartz.triggerNow(id)).thenReturn(true);
 
         RunNowResponse resp = service.runNow(id);
@@ -138,6 +140,11 @@ class ScheduleServiceRunNowOnceTest {
         assertThat(resp.executed()).as("recurring triggerNow 成功 → executed=true").isTrue();
         assertThat(resp.deleted()).as("recurring 必须保留（CC cronScheduler.ts:315）").isFalse();
         assertThat(mapper.selectOneById(id)).as("recurring 行必须保留").isNotNull();
+        // [cwd3 步骤 1a · RE-1a-3 锚点] DURABLE + sessionId=null ⇒ 「无会话 ⇒ 无锚」⇒
+        //   bound_project 恒 NULL。改回透传 req.boundProject() ⇒ 本断言翻红。
+        assertThat(mapper.selectOneById(id).getBoundProject())
+            .as("[RE-1a-3] DURABLE + 无会话 ⇒ bound_project 恒 NULL（⛔ 不得回落请求体值）")
+            .isNull();
         verify(quartz).triggerNow(id);
     }
 

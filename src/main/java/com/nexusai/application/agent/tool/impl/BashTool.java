@@ -1911,6 +1911,12 @@ public class BashTool implements Tool {
     private ToolResult applySimulatedSedEdit(String toolUseId, String filePath, String newContent,
             ToolUseContext ctx) {
         Path absPath = resolveSedEditPath(filePath, ctx);
+        if (absPath == null) {
+            // [批 subcwd D11] 基准缺失 ⇒ fail-loud（⛔ 不以进程 user.dir 解析相对路径去写文件）
+            return ToolResult.error(toolUseId,
+                "Cannot resolve sed edit target \"" + filePath + "\": session working directory"
+                + " is unavailable. Refusing to write against the server startup directory.");
+        }
         String original;
         try {
             original = Files.readString(absPath, StandardCharsets.UTF_8);
@@ -1947,16 +1953,29 @@ public class BashTool implements Tool {
 
     /**
      * 解析 sed 编辑目标绝对路径 · 对齐 CC {@code expandPath(filePath)}（基于 cwd 的相对路径展开）。
+     *
+     * <p>[批 subcwd D11] 基准 cwd 改为**读会话态**（{@link #effectiveCwd}：TUC 快照优先，
+     * 其次按 sessionId 走会话态解析）。原实现 {@code ctx != null ? CwdResolution.getCwd(ctx.sessionId())
+     * : System.getProperty("user.dir", ".")} 有两个缺陷：① {@code ctx == null} / 空白 sessionId 时
+     * 落回**进程 user.dir**（服务器启动目录）—— 而本方法的结果被 {@link #applySimulatedSedEdit}
+     * 用来**直接写文件**，写错基准 = 写到后端启动目录；② 每层各自现算一遍（裁定 #10 的切片）。
+     *
+     * @param filePath 目标路径（相对路径基于会话 cwd 展开）
+     * @param ctx      工具调用上下文
+     * @return 绝对化并 normalize 后的目标路径；<b>基准取不到 ⇒ null</b>（调用方 fail-loud）
      */
     private static Path resolveSedEditPath(String filePath, ToolUseContext ctx) {
         Path p = Path.of(filePath);
         if (p.isAbsolute()) {
             return p.normalize();
         }
-        String cwd = ctx != null
-            ? CwdResolution.getCwd(ctx.sessionId())
-            : System.getProperty("user.dir", ".");
-        return Path.of(cwd).resolve(p).normalize();
+        Path cwd = effectiveCwd(ctx);
+        if (cwd == null) {
+            log.warn("[BashTool] _simulatedSedEdit 相对路径基准 cwd 缺失（无会话态）⇒ 不解析"
+                + "（⛔ 不以进程 user.dir 解析相对路径去写文件）filePath={}", filePath);
+            return null;
+        }
+        return cwd.resolve(p).normalize();
     }
 
     /** 行尾检测 · 对齐 CC detectLineEndings（utils/file.ts，CRLF vs LF）。 */
@@ -2735,24 +2754,65 @@ public class BashTool implements Tool {
     }
 
     /**
-     * effectiveCwd 缺失时的兜底 cwd · 对齐 CC getCwd()（bashPermissions.ts checkPathConstraints
-     * 以 getCwd 为越界基准）。cwd-align-ext：user.dir 兜底 → 会话 cwd；无 sessionId 回落 user.dir
-     * （方案 1，零行为变化）。
-     *
-     * <p><b>[批 3b / 批 3c]</b> sessionId 由调用方的 {@link ToolUseContext} <b>显式</b>传入（ctx 为 null
-     * → 无会话 → user.dir）。⛔ 不再读裸 MDC：本方法在
-     * tool-exec 池线程执行，MDC 恒 null 或残留该池线程上一个任务的别会话 id —— 而它与
-     * {@link #gitReadOnlyGuardBlocked} 的 originalCwd <b>成对</b>构成 RO-17c 的
-     * 「cwd ≠ orig-cwd」判定（readOnlyValidation.ts:1956-1966）；单侧读 MDC 会让两侧取自不同
-     * 会话 ⇒ 安全守卫失真（本批「凡 A 写 B 读的改动两侧都要覆」原则）。
+     * [批 subcwd] 基准缺失时的 ask 文案（宁问不放）· 路径约束 / 操作符重检两处共用（单一文案点）。
      */
-    private static String fallbackCwd(ToolUseContext ctx) {
-        String sessionId = ctx != null ? ctx.sessionId() : null;
-        if (sessionId != null && sessionId.isBlank()) {
-            sessionId = null;
+    static final String CWD_BASE_MISSING_ASK =
+        "无法确定会话工作目录（cwd 基准缺失），无法判定命令中的路径是否越界，按保守策略需审批";
+
+    /**
+     * 会话态基准 cwd（路径约束 / 分类器 / git 只读守卫的越界基准）· <b>只接受会话态来源</b>。
+     *
+     * <p><b>CC 真源与其不可搬用之处</b>：CC {@code bashPermissions.ts:1112 checkPathConstraints} 与
+     * {@code readOnlyValidation.ts:1930-1966} 用 {@code getCwd()} 作越界基准；CC 的 {@code getCwd()}
+     * （{@code utils/cwd.ts:26-32}）读 {@code bootstrap/state.ts} 的 {@code STATE.cwd} —— CC
+     * 一进程一会话，**进程 cwd 就是会话 cwd**。本仓是**一 JVM 多会话 Web**
+     * （memory multi-session-vs-cc-single-session）⇒ 进程 {@code user.dir} 是**服务器启动目录**，
+     * 不是任何会话的项目根。形态像、语义反 ⇒ ⛔ 不得照搬「对齐 CC getCwd()」当进程级兜底。
+     *
+     * <p>两档会话态来源（手法与 {@code PowerShellPermissionChain.effectiveCwd} 一致，见 p15 批）：
+     * <ol>
+     *   <li>{@code ctx.effectiveCwd()}（TUC 会话快照）</li>
+     *   <li>{@code CwdResolution.getCwd(ctx.sessionId())}（会话 cwd / 绑定项目；fail-loud 语义
+     *       <b>原样保留</b>）—— ⛔ {@code ctx == null} / 空白 sessionId 一律<b>不查</b>：那会命中
+     *       {@code CwdResolution} 的「无会话出口」（恒等于进程 {@code user.dir}），正是本批要清的
+     *       「进程级值冒充会话态」隐形兜底</li>
+     * </ol>
+     *
+     * <p>[批 subcwd D8] ⛔ 已删旧 {@code fallbackCwd} 的第三档
+     * {@code System.getProperty("user.dir", ".")}。<b>前置自证（实测）</b>：该档是<b>死代码</b> ——
+     * {@code CwdResolution.getCwd} 逐分支只抛（会话存在却解析不出项目根）或只返回非空白
+     * （sessionCwd / boundProject / 无会话出口），故「cwd 为 null/blank」只可能来自
+     * {@code user.dir} 本身为空；实测把 {@code user.dir} 置空串后该档返回空串（与第二档同值）、
+     * 置为 absent 时返回 {@code "."}（仅此一种），无论哪种都无生产差异。删它的产出是
+     * ① 去掉一条会被照抄的坏范式；② 把「基准缺失 ⇒ 安全方向」落到各消费点的显式分支上。
+     *
+     * <p><b>消费点方向（⛔ 均非「静默跳过」）</b>：拿不到基准时按<b>安全方向</b>分流 ——
+     * 路径约束 / 操作符重检 ⇒ ask（{@link #CWD_BASE_MISSING_ASK}）；git 只读守卫 ⇒ 命中（不只读
+     * 放行）；cd-to-cwd 前缀过滤 ⇒ 不过滤（子命令留在计数与规则匹配里）；分类器 / pending 分类器
+     * 检查 ⇒ 不采用其结论（该两处本就恒不触发，见各调用点注释）。
+     *
+     * @param ctx 工具调用上下文（可为 null ⇒ 无会话态可取）
+     * @return 会话态基准 cwd；<b>取不到 ⇒ null</b>（调用方负责按安全方向分流）
+     */
+    private static Path effectiveCwd(ToolUseContext ctx) {
+        if (ctx != null) {
+            if (ctx.effectiveCwd() != null) {
+                return ctx.effectiveCwd();
+            }
+            String sessionId = ctx.sessionId();
+            if (sessionId != null && !sessionId.isBlank()) {
+                String resolved = CwdResolution.getCwd(sessionId);
+                if (resolved != null && !resolved.isBlank()) {
+                    return Path.of(resolved);
+                }
+            }
+            log.warn("[BashTool] 会话态基准 cwd 缺失（ctx.effectiveCwd 为 null 且会话态解析无果）"
+                + "sessionId={} ⇒ 返回 null（消费点按安全方向分流，⛔ 不回落进程 user.dir）", sessionId);
+            return null;
         }
-        String cwd = CwdResolution.getCwd(sessionId);
-        return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
+        log.warn("[BashTool] 会话态基准 cwd 缺失（ToolUseContext 为 null，无会话态可取）"
+            + " ⇒ 返回 null（消费点按安全方向分流，⛔ 不回落进程 user.dir）");
+        return null;
     }
 
     private static String truncate(String s, int max) {
@@ -3118,12 +3178,20 @@ public class BashTool implements Tool {
             boolean hasDeny = !denyDescriptions.isEmpty();
             boolean hasAsk = !askDescriptions.isEmpty();
             if (hasDeny || hasAsk) {
-                String cwdStr = ctx != null && ctx.effectiveCwd() != null
-                    ? ctx.effectiveCwd().toString()
-                    : fallbackCwd(ctx);
-                DenyAskClassification denyAsk = classifyDenyAskParallel(
-                    command, cwdStr, denyDescriptions, askDescriptions);
-                if (log.isDebugEnabled()) {
+                // [批 subcwd D8] 会话态基准 cwd（分类器的越界基准）。基准缺失（无会话态）⇒
+                //   denyAsk = null = **不采用分类器结论**：分类器以 cwd 为越界基准，基准缺失时
+                //   其对 deny/ask 的判读不可信。⛔ 不回落进程 user.dir；也⛔ 不以「判不出来」直接
+                //   放行 —— 落到下方常规权限链（3.4 路径约束 / R1 规则桶 / 末尾 Ask(Other) 兜底），
+                //   该链在无 allow 命中时恒 ask，属安全方向。
+                Path classifierCwd = effectiveCwd(ctx);
+                if (classifierCwd == null) {
+                    log.warn("[BashTool] deny/ask 分类器基准 cwd 缺失（无会话态）⇒ 跳过分类器判读，"
+                        + "命令继续走常规权限链（ask 兜底，不静默放行）command={}", abbreviate(command, 80));
+                }
+                DenyAskClassification denyAsk = classifierCwd == null ? null
+                    : classifyDenyAskParallel(command, classifierCwd.toString(),
+                        denyDescriptions, askDescriptions);
+                if (denyAsk != null && log.isDebugEnabled()) {
                     log.debug("BashTool deny/ask 分类块：hasDeny={} hasAsk={} denyMatches={} askMatches={} command={}",
                         hasDeny, hasAsk,
                         denyAsk.deny() != null && denyAsk.deny().matches(),
@@ -3131,7 +3199,7 @@ public class BashTool implements Tool {
                         abbreviate(command, 80));
                 }
                 // deny 优先（CC :1920 "Deny takes precedence"）
-                if (denyAsk.deny() != null && denyAsk.deny().matches()
+                if (denyAsk != null && denyAsk.deny() != null && denyAsk.deny().matches()
                         && "high".equals(denyAsk.deny().confidence())) {
                     String msg = "Denied by Bash prompt rule: \"" + denyAsk.deny().matchedDescription() + "\"";
                     return new PermissionResult.Deny(
@@ -3141,7 +3209,7 @@ public class BashTool implements Tool {
                 }
                 // ask 次之（CC :1932）· suggestions 走 suggestionForExactCommand（CC :1941），
                 // pendingClassifierCheck 走 buildPendingClassifierCheck（CC :1960-1963）
-                if (denyAsk.ask() != null && denyAsk.ask().matches()
+                if (denyAsk != null && denyAsk.ask() != null && denyAsk.ask().matches()
                         && "high".equals(denyAsk.ask().confidence())) {
                     List<PermissionUpdate> suggestions =
                         BashRuleMatcher.suggestionForExactCommand(command);
@@ -3292,11 +3360,12 @@ public class BashTool implements Tool {
         //     对齐 CC checkSandboxAutoAllow 早于扇出上限的时序。
         //     [G33②] 先经 filterCdCwdSubcommands 过滤 `cd ${cwd}` 前缀子命令（CC :2152 同款，
         //     模型常预置的无操作 cd 不占扇出计数）。
+        // [批 subcwd D8] 基准缺失（无会话态）⇒ cwd 传 null ⇒ {@link #filterCdCwdSubcommands}
+        //   **不过滤**（安全方向：子命令留在扇出计数与规则匹配里，绝不把「判不出来」当「无操作」）。
+        Path fanoutCwd = effectiveCwd(ctx);
         List<String> fanoutSubcommands = filterCdCwdSubcommands(
             BashRuleMatcher.splitCommandSegments(command),
-            ctx != null && ctx.effectiveCwd() != null
-                ? ctx.effectiveCwd().toString()
-                : fallbackCwd(ctx));
+            fanoutCwd != null ? fanoutCwd.toString() : null);
         if (fanoutSubcommands.size() > BashRuleMatcher.MAX_SUBCOMMANDS_FOR_SECURITY_CHECK) {
             int fanoutCount = fanoutSubcommands.size();
             if (log.isDebugEnabled()) {
@@ -3354,10 +3423,20 @@ public class BashTool implements Tool {
         //     安全防护。deny=Edit-deny 规则；ask=越界/不可静态校验。ctx/permCtx 缺失时跳过
         //     （管线外直调场景无规则集/工作目录上下文）。原探查 D-03 登记 "path 约束未实现" 已补齐。
         if (ctx != null && ctx.permissionContext() != null) {
-            // cwd-align-ext：path 约束越界基准兜底 = 会话 cwd（CC bashPermissions.ts:1112 checkPathConstraints 用 getCwd）
-            Path cwd = ctx.effectiveCwd() != null
-                ? ctx.effectiveCwd()
-                : Path.of(fallbackCwd(ctx));
+            // cwd-align-ext：path 约束越界基准 = 会话态 cwd（CC bashPermissions.ts:1112 checkPathConstraints 用 getCwd）
+            Path cwd = effectiveCwd(ctx);
+            if (cwd == null) {
+                // [批 subcwd D8] 基准缺失 ⇒ **宁问不放**：越界判定（ls /etc、cat ~/.ssh、
+                //   cd+write、危险删除、sed 写文件）整体以 cwd 为解析基准，缺基准时无法静态判定。
+                //   ⛔ 不回落进程 user.dir（那是服务器启动目录，不是会话项目根）；⛔ 不静默放行。
+                log.warn("[BashTool] path 约束基准 cwd 缺失（无会话态）⇒ ask（宁问不放）command={}",
+                    abbreviate(command, 120));
+                return new PermissionResult.Ask(
+                    CWD_BASE_MISSING_ASK,
+                    new PermissionDecisionReason.Other(CWD_BASE_MISSING_ASK),
+                    java.util.List.of(),
+                    null, null, null, false, null, null);
+            }
             PermissionResult pathResult = BashPathValidator.check(command, cwd, ctx.permissionContext());
             if (!(pathResult instanceof PermissionResult.Passthrough)) {
                 if (log.isDebugEnabled()) {
@@ -3546,9 +3625,18 @@ public class BashTool implements Tool {
         }
         // 2. 原命令 path 约束重检（CC :2045-2055 checkPathConstraints with commandHasAnyCd）
         if (ctx != null && ctx.permissionContext() != null) {
-            Path cwd = ctx.effectiveCwd() != null
-                ? ctx.effectiveCwd()
-                : Path.of(fallbackCwd(ctx));
+            Path cwd = effectiveCwd(ctx);
+            if (cwd == null) {
+                // [批 subcwd D8] 基准缺失 ⇒ 宁问不放（同 3.4 主链；operator all-allow 之后的重检
+                //   若不能判定越界，不得以「原来放行过」为由继续放行）。⛔ 不回落进程 user.dir。
+                log.warn("[BashTool] operator all-allow path 重检基准 cwd 缺失（无会话态）⇒ ask（宁问不放）"
+                    + "command={}", abbreviate(command, 80));
+                return new PermissionResult.Ask(
+                    CWD_BASE_MISSING_ASK,
+                    new PermissionDecisionReason.Other(CWD_BASE_MISSING_ASK),
+                    java.util.List.of(),
+                    null, null, null, false, null, null);
+            }
             PermissionResult pathResult = BashPathValidator.check(command, cwd, ctx.permissionContext());
             if (!(pathResult instanceof PermissionResult.Passthrough)) {
                 if (log.isDebugEnabled()) {
@@ -3910,11 +3998,18 @@ public class BashTool implements Tool {
         if (allowDescriptions.isEmpty()) {
             return null;
         }
-        // 5. cwd = effectiveCwd (对齐 CC getCwd) (CC :1474)
-        String cwd = ctx != null && ctx.effectiveCwd() != null
-            ? ctx.effectiveCwd().toString()
-            : fallbackCwd(ctx);
-        return new PermissionResult.PendingClassifierCheck(command, cwd, allowDescriptions);
+        // 5. cwd = 会话态基准 cwd (对齐 CC getCwd) (CC :1474)
+        //    [批 subcwd D8] 基准缺失（无会话态）⇒ **不构造** pending 检查：该通道把 cwd 交给
+        //      异步 bash 分类器做越界/激进行为判读，基准缺失时判读不可信 ⇒ 返回 null =
+        //      不参与「分类器投机放行」竞速（安全方向：分类器不自动批准 ⇒ 命令仍需人工审批）。
+        //      ⛔ 不回落进程 user.dir；⛔ 不构造一个假基准。
+        Path cwdPath = effectiveCwd(ctx);
+        if (cwdPath == null) {
+            log.warn("[BashTool] pending 分类器检查基准 cwd 缺失（无会话态）⇒ 不构造检查结构体"
+                + "（不参与分类器投机放行）command={}", abbreviate(command, 80));
+            return null;
+        }
+        return new PermissionResult.PendingClassifierCheck(command, cwdPath.toString(), allowDescriptions);
     }
 
     /** [Q-BS-4] deny/ask 二元分类结果载体（CC Promise.all([deny, ask]) 的解构产物）。 */
@@ -4076,9 +4171,15 @@ public class BashTool implements Tool {
             return true;
         }
         // RO-17a：bare/被利用 git repo cwd（readOnlyValidation.ts:1930-1936）
-        Path cwd = ctx != null && ctx.effectiveCwd() != null
-            ? ctx.effectiveCwd()
-            : Path.of(fallbackCwd(ctx));
+        // [批 subcwd D8] 基准缺失（无会话态）⇒ **守卫命中**（宁问不放：RO-17a/17c 的判定必须
+        //   依赖 cwd，判不出就不能声称「不是被利用的 git 仓库」）。⛔ 不回落进程 user.dir；
+        //   ⛔ 不返回 false（那等于把「判不出来」当「安全」）。当前路径 = 交权限链 ask。
+        Path cwd = effectiveCwd(ctx);
+        if (cwd == null) {
+            log.warn("[BashTool] git 只读守卫基准 cwd 缺失（无会话态）⇒ 守卫命中（宁问不放，"
+                + "⛔ 不回落进程 user.dir）command={}", abbreviate(command, 80));
+            return true;
+        }
         if (isCurrentDirectoryBareGitRepo(cwd)) {
             return true;
         }

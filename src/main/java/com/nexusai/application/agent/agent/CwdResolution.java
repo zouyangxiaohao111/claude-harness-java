@@ -36,17 +36,20 @@ import java.util.function.Supplier;
  *   2. boundProject = SessionProjectRoot.getForSession(sessionId)（D-1 裁决：仅绑定，
  *      不读 resolve() 回落链——身份域红线；miss 时该方法自身回源 DB 并回填）→ 非空返回 normalizeCwd
  *   3. 两层全 MISS ⇒ 按 <b>DB 给出的是哪种答案</b> 分流（[批 4a] 裁定 #7/#13 的判据载体 +
- *      [S2 F-09/F-20] 新增第 4 态）：
+ *      [S2 F-09/F-20] 第 4 态 + <b>[cwd3 步骤 2] 第 5 态 sessionless</b>）：
  *      <ul>
  *        <li><b>解析失败 / 无法判定</b>（回源解析器未接线 · 回源抛错 · 违约返回 null）⇒
- *            <b>抛 IllegalStateException（fail-loud）</b>，文案与「未绑定」<b>可辨识</b>（[S2 F-09/F-20]
- *            用户裁定 (A)：仍 fail-loud，但保留语义与纠错文案）</li>
- *        <li><b>会话存在（DB 有行）但无绑定项目根</b> ⇒ <b>抛 IllegalStateException（fail-loud）</b>
+ *            <b>抛（fail-loud）</b>，文案与「未绑定」<b>可辨识</b>（[S2 F-09/F-20] 用户裁定 (A)：
+ *            仍 fail-loud，但保留语义与纠错文案）</li>
+ *        <li><b>会话存在（DB 有行）但无绑定项目根</b> ⇒ <b>抛（fail-loud）</b>
  *            —— 数据链路异常，⛔ 不得回落进程 user.dir 冒充会话项目根</li>
- *        <li><b>DB 无此会话</b>（合成/伪造/已删 id：MCP 入站调用 / standalone fork / subagent /
- *            文档更新器现造 id）⇒ 属「确无会话」⇒ 走命名出口 {@link #getCwdForNonSession()}
- *            （≥WARN 留痕）。⛔ 不得对它 fail-loud：那会打死合成 id 的合法路径（实测：5 处生产
- *            合成 id 生产点 + 100+ 测试类）</li>
+ *        <li><b>本环境确无会话</b>（{@link SessionProjectRoot.Lookup#sessionlessEnvironment()}：sessionId
+ *            为 null/空白，或显式 {@link SessionKeys#NO_SESSION} 哨兵，或夹具声明本环境无 DB）⇒
+ *            走命名出口 {@link #getCwdForNonSession()}（≥WARN 留痕）。这是<b>合法形态</b>
+ *            （铁律出口 (b)：「本条路径结构上不属于任何会话」）</li>
+ *        <li><b>DB 明确答「无此会话」</b>（{@link SessionProjectRoot.Lookup#unknown()}：查了 DB、
+ *            DB 说没有这一行 —— 已删 / 未登记 / 来源不明 id）⇒ <b>[cwd3 步骤 2] 抛（fail-loud）</b>。
+ *            ⛔ 旧行为（回落进程 user.dir）已删：确无会话的调用方必须走上一档的命名出口/哨兵</li>
  *      </ul>
  * </pre>
  *
@@ -96,8 +99,15 @@ import java.util.function.Supplier;
  * （{@code sessionStorage.ts:203-205 getSessionProjectDir() ?? getProjectDir(getOriginalCwd())}）；
  * 用户裁定的理由是「web 会话<b>必须</b>绑定项目才能进行，没有就代表数据链路异常」。
  * ⛔ 不得因「对齐 CC」把「会话存在却无项目根」的 fail-loud 改回回落。
- * 但「DB 无此会话」仍走无会话出口 —— 原因是实测（批 4a）：合成 sessionId 的生产路径多且合法
- * （MCP 入站 / standalone fork/subagent / 文档更新器），一刀切 fail-loud 会把它们打死。
+ *
+ * <p><b>[cwd3 步骤 2 2026-09-15 · 已删除的历史反证，⛔ 勿再回填]</b> 本段原文写着
+ * 「但『DB 无此会话』仍走无会话出口 —— 原因是实测（批 4a）：合成 sessionId 的生产路径多且合法
+ * （MCP 入站 / standalone fork/subagent / 文档更新器），一刀切 fail-loud 会把它们打死」。
+ * <b>该反证已被本批实测证伪</b>：批 4a 把两类混为一谈 —— ①「本环境确无会话」（真正合法的合成 id，
+ * 已在批 6 全部改为显式 {@link SessionKeys#NO_SESSION} 哨兵或显式传参 ⇒ 现在由
+ * {@code sessionless} 态独占表达，仍走无会话出口）与 ②「DB 明确答无此会话」（本该有会话却没有
+ * = 数据链路异常）。现在 ② fail-loud，① 不变 ⇒ 「一刀切打死合法路径」不成立。判据见
+ * {@link SessionProjectRoot.Lookup} 的 javadoc 与交付报告的门禁读数。
  *
  * <p><b>[CRON-D5 F2 返工] 双键解析</b>：第 2/3 层（sessionCwd/boundProject）的 Map 键形态不同——
  * sessionCwd 层以派生 UUID 串为键（BashTool/EnterWorktreeTool 经 {@code ctx.sessionId()}），
@@ -127,10 +137,11 @@ import java.util.function.Supplier;
  * <p><b>归一化</b>（{@link #normalizeCwd(String)}，对齐 CC setCwdState NFC + Shell.ts setCwd realpathSync）：
  * realpath 解符号链接 + NFC 归一化；realpath 失败（目录被删/不存在）回原值 + NFC（不抛，对齐 CC catch 兜底）。
  *
- * <p><b>失败语义</b>（[批 4a] 由「恒非 null」改为 fail-loud）：{@link #getCwd(String)} 各层 safeGet
- * （层内异常回 null）逐层回落；<b>DB 认得该会话却两层全 MISS（含绑定失效）⇒ 抛</b>（不再回落 user.dir）；
- * <b>DB 无此会话</b>（合成/伪造 id）⇒ 无会话出口。只有 {@link #getCwdForNonSession()} 恒非 null
- * （进程 user.dir）。
+ * <p><b>失败语义</b>（[批 4a] 由「恒非 null」改为 fail-loud；[cwd3 步骤 2] 再收一类）：{@link #getCwd(String)}
+ * 各层 safeGet（层内异常回 null）逐层回落；<b>DB 认得该会话却两层全 MISS（含绑定失效）⇒ 抛</b>；
+ * <b>DB 明确答「无此会话」⇒ 抛</b>（[cwd3 步骤 2] 原为回落 user.dir，已删）；
+ * <b>解析失败 / 无法判定 ⇒ 抛</b>；<b>本环境确无会话（sessionless）⇒ 无会话出口</b>
+ * （≥WARN）。只有 {@link #getCwdForNonSession()} 恒非 null（进程 user.dir）。
  *
  * <p><b>OD-1 决策</b>：{@code CwdOverride}（0 生产调用）已<b>合并入本类并删除</b>，无别名/双轨。
  *
@@ -145,8 +156,30 @@ public final class CwdResolution {
     private static final java.util.concurrent.atomic.AtomicBoolean NULL_SESSION_WARNED =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
-    /** 「DB 无此会话」路径的告警一次性开关（warnUnknownSession，见该方法 javadoc）。 */
-    private static final java.util.concurrent.atomic.AtomicBoolean UNKNOWN_SESSION_WARNED =
+    /**
+     * 「DB 明确答无此会话」路径的告警一次性开关（warnUnknownSession，见该方法 javadoc）。
+     *
+     * <p>[cwd3 · S2.6] <b>按入口拆成两闸</b>（原为单闸跨 {@link #getCwd(String)} 与
+     * {@link #getOriginalCwdLayer(String)} 共用 ⇒ 可见度上限 = <b>1 行日志/进程</b>，先触发的那个
+     * 入口会把另一入口的告警吃掉）。反向实验：令 {@code getCwd} 先触发 ⇒
+     * {@code getOriginalCwdLayer} 仍须有自己的 WARN。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean UNKNOWN_SESSION_WARNED_GET_CWD =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** 同上，{@link #getOriginalCwdLayer(String)} 入口专属闸（[cwd3 S2.6] 拆闸）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean UNKNOWN_SESSION_WARNED_GET_ORIGINAL_CWD =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * [cwd3 S2.6] 「本环境确无会话」（{@link SessionProjectRoot.Lookup#sessionlessEnvironment()}）路径的
+     * ≥WARN 一次性开关 · <b>同样按入口拆两闸</b>（同 {@link #UNKNOWN_SESSION_WARNED_GET_CWD} 的理由）。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean SESSIONLESS_WARNED_GET_CWD =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** 同上，{@link #getOriginalCwdLayer(String)} 入口专属闸。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean SESSIONLESS_WARNED_GET_ORIGINAL_CWD =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /** [批 6] 显式「确无会话」哨兵路径的告警一次性开关（warnNoSessionSentinel）。 */
@@ -154,6 +187,23 @@ public final class CwdResolution {
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private CwdResolution() {}
+
+    /**
+     * 测试钩子：复位全部一次性告警闸（⛔ 生产路径不得调用）。
+     *
+     * <p><b>WHY 必须存在</b>：这些闸是「每进程一次」，而断言「哪个入口打了哪条 WARN」的用例
+     * （{@code CwdResolutionTest#warnGatesAreIndependentPerEntry}）必须从确定状态出发 ——
+     * 否则先跑的用例把闸用掉，后跑的必然假红/假绿（本仓已登记该类测试顺序依赖风险，
+     * 先例 = {@code SessionProjectRoot.reset()}）。
+     */
+    public static void resetWarnGatesForTesting() {
+        NULL_SESSION_WARNED.set(false);
+        UNKNOWN_SESSION_WARNED_GET_CWD.set(false);
+        UNKNOWN_SESSION_WARNED_GET_ORIGINAL_CWD.set(false);
+        SESSIONLESS_WARNED_GET_CWD.set(false);
+        SESSIONLESS_WARNED_GET_ORIGINAL_CWD.set(false);
+        NO_SESSION_WARNED.set(false);
+    }
 
     /**
      * 统一入口：解析 sessionId 对应的当前工作目录（对齐 CC pwd/getCwd）。
@@ -169,10 +219,12 @@ public final class CwdResolution {
      * 仅补缺失解析路径，两形态键域不重叠无错配）。
      *
      * @param sessionId 会话 ID（必填 —— null/空白 ⇒ 交由 {@link #getCwdForNonSession()} 按无会话解析）
-     * @return 归一化 cwd；<b>DB 认得该会话却解析不出项目根 ⇒ 抛 IllegalStateException</b>；
-     *         DB 无此会话 ⇒ 无会话出口值（进程 user.dir）
-     * @throws IllegalStateException 会话存在（DB 有行）但 sessionCwd/boundProject（含 DB 回源）
-     *         全 MISS，或 boundProject 无效（非绝对路径/目录不存在）—— 数据链路异常，fail-loud
+     * @return 归一化 cwd；<b>会话存在却解析不出项目根 / DB 明确答无此会话 / 无法判定 ⇒ 抛</b>；
+     *         本环境确无会话（sessionless）⇒ 无会话出口值（进程 user.dir）
+     * @throws IllegalStateException 三种数据链路异常之一：① 会话存在（DB 有行）但
+     *         sessionCwd/boundProject（含 DB 回源）全 MISS，或 boundProject 无效（非绝对路径/目录不存在）；
+     *         ② [cwd3 步骤 2] DB 明确答「无此会话」（{@link SessionProjectRoot.Lookup#unknown()}）；
+     *         ③ 解析失败 / 无法判定（回源器未接线 · 回源抛错 · 违约返回 null）
      */
     public static String getCwd(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
@@ -221,9 +273,24 @@ public final class CwdResolution {
             throw unresolvedProjectRoot(sessionId,
                 "会话存在但无绑定项目根（sessions.main_project_id 为空 / projects.path 失效）");
         }
-        // 无此会话（合成/伪造/已删 id）⇒ 确无会话 ⇒ 命名出口（行为与批 4a 前一致：进程 user.dir）
-        warnUnknownSession("getCwd", sessionId);
-        return getCwdForNonSession();
+        // ⭐ [cwd3 步骤 2 第 5 态] 「本环境确无会话」（sessionId 为 null/空白，或回源器/本类
+        //   lookup 判定为哨兵/无会话形态）⇒ 命名无会话出口（进程 user.dir）+ ≥WARN。
+        //   ⛔ 与本块**下方**「DB 明确答无此会话」严格区分：本态是「本来就不该有会话」= 合法；
+        //   下方是「本该有会话、DB 却说没有」= 数据链路异常 ⇒ fail-loud。
+        if (bound.sessionless()) {
+            warnSessionlessEnvironment("getCwd", "getCwdForNonSession", SESSIONLESS_WARNED_GET_CWD);
+            return getCwdForNonSession();
+        }
+        // [cwd3 步骤 2 · flip] **DB 明确答「无此会话」⇒ fail-loud 抛**（⛔ 不再回落进程 user.dir）。
+        //   WHY：`unknown` 现在只剩「查过 DB 且 DB 说没有这一行」一个含义 ⇒ 属数据链路异常。
+        //   确无会话的调用方必须显式传 {@link SessionKeys#NO_SESSION} 哨兵（走上方 sessionless 出口）。
+        //   旧行为（回落 user.dir）会把工具/权限/transcript 全锚到后端启动目录（已造成过真实误删）。
+        //   RED（RE-2a-1）：本段改回 `warnUnknownSession + return getCwdForNonSession()` ⇒
+        //   CwdResolutionTest#dbAnsweredNoSuchSession_failsLoud 红。
+        warnUnknownSession("getCwd", sessionId, UNKNOWN_SESSION_WARNED_GET_CWD);
+        throw unresolvedProjectRoot(sessionId,
+            "DB 明确答「无此会话」（已删 / 未登记 / 来源不明 id）—— 数据链路异常，⛔ 不回落进程 user.dir；"
+                + "若本调用确无会话，必须显式传 SessionKeys." + SessionKeys.NO_SESSION + " 哨兵");
     }
 
     /**
@@ -247,9 +314,9 @@ public final class CwdResolution {
      *
      * @param sessionId 会话 ID（必填 —— null/空白 ⇒ 交由 {@link #getOriginalCwdLayerForNonSession()}
      *                  按无会话解析）
-     * @return 归一化原始 cwd；<b>有 sessionId 却两层全 MISS ⇒ 抛 IllegalStateException</b>
-     * @throws IllegalStateException 有 sessionId 但 originalCwd/boundProject（含 DB 回源）全 MISS，
-     *         或 boundProject 无效 —— 数据链路异常，fail-loud
+     * @return 归一化原始 cwd；<b>有 sessionId 却两层全 MISS / DB 明确答无此会话 / 无法判定 ⇒ 抛</b>；
+     *         本环境确无会话（sessionless）⇒ 无会话出口值（进程 user.dir）
+     * @throws IllegalStateException 同 {@link #getCwd(String)} 的三类数据链路异常（fail-loud）
      */
     public static String getOriginalCwdLayer(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
@@ -296,9 +363,17 @@ public final class CwdResolution {
             throw unresolvedProjectRoot(sessionId,
                 "会话存在但无绑定项目根（sessions.main_project_id 为空 / projects.path 失效）");
         }
-        // 无此会话（合成/伪造/已删 id）⇒ 确无会话 ⇒ 命名出口（行为与批 4a 前一致：进程 user.dir）
-        warnUnknownSession("getOriginalCwdLayer", sessionId);
-        return getOriginalCwdLayerForNonSession();
+        // ⭐ [cwd3 步骤 2 第 5 态] 「本环境确无会话」⇒ 命名出口 + ≥WARN（见 getCwd 同段注释）。
+        if (bound.sessionless()) {
+            warnSessionlessEnvironment("getOriginalCwdLayer", "getOriginalCwdLayerForNonSession",
+                SESSIONLESS_WARNED_GET_ORIGINAL_CWD);
+            return getOriginalCwdLayerForNonSession();
+        }
+        // [cwd3 步骤 2 · flip] DB 明确答「无此会话」⇒ fail-loud（见 getCwd 同段注释与 RED 配方）。
+        warnUnknownSession("getOriginalCwdLayer", sessionId, UNKNOWN_SESSION_WARNED_GET_ORIGINAL_CWD);
+        throw unresolvedProjectRoot(sessionId,
+            "DB 明确答「无此会话」（已删 / 未登记 / 来源不明 id）—— 数据链路异常，⛔ 不回落进程 user.dir；"
+                + "若本调用确无会话，必须显式传 SessionKeys." + SessionKeys.NO_SESSION + " 哨兵");
     }
 
     /**
@@ -489,6 +564,16 @@ public final class CwdResolution {
         if (altLookup != null && altLookup.resolutionFailed()) {
             return altLookup;
         }
+        // [cwd3 步骤 2] 「本环境确无会话」（sessionless）也必须浮出（优先于 unknown）：
+        //   任一键给出 sessionless ⇒ 本环境确无会话。⛔ 不浮出会被压成 unknown ⇒ cwd 域
+        //   fail-loud 抛 ⇒ 夹具/哨兵路径全被打死。
+        //   优先级：原键的 sessionless 胜过另一形态键的 sessionless（原键是调用方真正传的那个）。
+        if (bound.sessionless()) {
+            return bound;
+        }
+        if (altLookup != null && altLookup.sessionless()) {
+            return altLookup;
+        }
         return bound;
     }
 
@@ -557,22 +642,48 @@ public final class CwdResolution {
     }
 
     /**
-     * 「会话不存在」（已删 / 未登记 / 来源不明的 sessionId）的 ≥WARN 留痕（只打印一次）。
+     * 「DB 明确答无此会话」（已删 / 未登记 / 来源不明的 sessionId）的 ≥WARN 留痕 · <b>抛前告警</b>
+     * （[cwd3 步骤 2] 起本分支 <b>fail-loud 抛</b>，见 {@link #getCwd(String)} 同段注释）。
      *
-     * <p>该路径按「确无会话」解析（进程 user.dir，= 批 4a 前行为）—— DB 无此会话即无项目身份可言。
+     * <p><b>[cwd3 步骤 2 已删除的历史反证，⛔ 勿再回填]</b> 旧 javadoc 写着
+     * 「仍不得改成 fail-loud：已删会话的历史调用点会成批炸（批 4a 实测）」。
+     * <b>该反证在本批被实测证伪</b>：批 4a 当时把「已删会话」与「本环境确无会话」（MCP 入站 /
+     * standalone fork·子代理 / 文档更新器等合成 id）混为一谈，而后者已在批 6 全部改为显式
+     * {@link SessionKeys#NO_SESSION} 哨兵或显式传参 ⇒ 「已删会话」不再有合法的历史调用点。
+     * 逐条读数见交付报告的门禁记录。
      *
-     * <p><b>[批 6 收口]</b> 上述「合法来源」已全部改为<b>显式传参或 {@link SessionKeys#NO_SESSION}
-     * 哨兵</b>（MCP 入站 / standalone fork·子代理 / plan provider）⇒ 走到本分支<b>只可能是</b>
-     * 已删会话或真正的来源不明 id（属数据链路异常信号）。哨兵走
-     * {@link #warnNoSessionSentinel}，不落此处。
-     * ⛔ 仍不得改成 fail-loud：已删会话的历史调用点会成批炸（批 4a 实测）。
+     * <p>⚠️ 可见度：本 WARN 是<b>一次性</b>闸（按入口各一），但失败本身<b>每次</b>都会经
+     * {@link #unresolvedProjectRoot} 打 ERROR（含 sessionId）⇒ 不存在「只报一次就静默」的问题。
      */
-    private static void warnUnknownSession(String method, String sessionId) {
-        if (UNKNOWN_SESSION_WARNED.compareAndSet(false, true)) {
-            log.warn("[CwdResolution] {} 的 sessionId={} 在 DB 中不存在（已删 / 未登记 / 来源不明 id）⇒ 按"
-                + "「确无会话」解析（进程 user.dir）。⚠️ 批 6 后合法无会话路径应改用 SessionKeys.NO_SESSION"
-                + "哨兵或显式传参 ⇒ 命中本告警请查是否存在漏传 / 陈旧 id（本告警仅打印一次）",
+    private static void warnUnknownSession(String method, String sessionId,
+                                           java.util.concurrent.atomic.AtomicBoolean gate) {
+        if (gate.compareAndSet(false, true)) {
+            log.warn("[CwdResolution] {} 的 sessionId={} 在 DB 中不存在（已删 / 未登记 / 来源不明 id）⇒ "
+                + "**fail-loud 抛**（[cwd3 步骤 2] ⛔ 不再回落进程 user.dir）。⚠️ 确无会话的调用方必须显式传"
+                + " SessionKeys.NO_SESSION 哨兵或显式传参；命中本告警请查是否存在漏传 / 陈旧 id"
+                + "（本告警按入口各打印一次；失败本身每次都打 ERROR）",
                 method, sessionId);
+        }
+    }
+
+    /**
+     * [cwd3 步骤 2] 「<b>本环境确无会话</b>」（{@link SessionProjectRoot.Lookup#sessionlessEnvironment()}）路径的
+     * ≥WARN 留痕（按入口各一闸）。
+     *
+     * <p><b>为什么这一态也要 ≥WARN</b>（规则十二「缺值策略 (b)：跳过但 ≥WARN」）：它不是错误
+     * （「本来就不该有会话」是合法形态），但它是<b>信息缺失</b> —— 调用方拿不到会话项目根，
+     * 只能退回进程 {@code user.dir}（后端启动目录）。必须可观测，否则「本该有会话却走了无会话出口」
+     * 的漏传会静默。
+     *
+     * <p>与 {@link #warnUnknownSession} 的指向不同：本 WARN 指向「这里是否本该有会话」，
+     * 后者指向「会话已删 / id 来源不明」。
+     */
+    private static void warnSessionlessEnvironment(String method, String namedExit,
+                                                   java.util.concurrent.atomic.AtomicBoolean gate) {
+        if (gate.compareAndSet(false, true)) {
+            log.warn("[CwdResolution] {} 判定「本环境确无会话」（sessionless）⇒ 按无会话解析（进程 "
+                + "user.dir，与 {}() 同义）。⚠️ 若此处本该有会话，属数据链路异常（请查调用方是否漏传 / "
+                + "传了陈旧 id；本告警按入口各打印一次）", method, namedExit);
         }
     }
 
