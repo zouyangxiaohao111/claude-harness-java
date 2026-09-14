@@ -25,7 +25,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p>Java 映射：
  * <ul>
- *   <li>AsyncLocalStorage → {@link TeammateContext}（ThreadLocal 载体）；</li>
+ *   <li>AsyncLocalStorage → {@link TeammateIdentity} 显式形参（[S1-T5] 由 ToolUseContext
+ *       {@code teammateIdentity} 沿链显式下传；原 ThreadLocal 载体已随 S1-T4 删除）；</li>
  *   <li>{@code dynamicTeamContext} → 本类模块级 {@link #dynamicTeamContext} 状态（{@link DynamicTeamContext} record）；</li>
  *   <li>CC main.tsx 由 CLI 参数填充 dynamicTeamContext → Java 无 CLI，部署侧以 sysprop
  *       {@code nexusai.agent.name}/{@code nexusai.team.name}/{@code nexusai.agent.color} 代理
@@ -96,82 +97,76 @@ public final class Teammate {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // 身份解析 · 优先级 in-process (TeammateContext ThreadLocal) > dynamicTeamContext
+    // 身份解析 · 优先级 显式形参 identity（TUC 载体）> dynamicTeamContext
+    //   [S1-T5] 原优先级 1「in-process ThreadLocal 载体」改为**显式首参**：ThreadLocal 不跨线程
+    //   （工具执行池线程 / hook 池线程读恒 null），且用户铁律「会话态一律显式传参，回放不算合规」
+    //   ⇒ 身份由 ToolUseContext.teammateIdentity() 沿链显式下传，本类不再读任何 ThreadLocal。
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * 返回当前 teammate 的 parent session ID（in-process 为 team lead 的 session ID）。
-     * 优先级：in-process &gt; dynamicTeamContext。对齐 CC teammate.ts:34-38。
-     */
-    public static String getParentSessionId() {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().parentSessionId();
-        }
-        return dynamicTeamContext != null ? dynamicTeamContext.parentSessionId() : null;
-    }
-
-    /**
      * 返回 agent ID（running-as-teammate 时），standalone 会话返回 null。
-     * 优先级：in-process &gt; dynamicTeamContext。对齐 CC teammate.ts:88-92。
+     * 优先级：显式 identity &gt; dynamicTeamContext。对齐 CC teammate.ts:88-92。
+     *
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate；⛔ 不回落 ThreadLocal）
      */
-    public static String getAgentId() {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().agentId();
+    public static String getAgentId(TeammateIdentity identity) {
+        if (identity != null) {
+            return identity.agentId();
         }
         return dynamicTeamContext != null ? dynamicTeamContext.agentId() : null;
     }
 
     /**
      * 返回 agent 名（无 @ 后缀）。
-     * 优先级：in-process &gt; dynamicTeamContext（无 sysprop 回退）。
+     * 优先级：显式 identity &gt; dynamicTeamContext（无 sysprop 回退）。
      * 对齐 CC teammate.ts:98-102。
+     *
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate）
      */
-    public static String getAgentName() {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().agentName();
+    public static String getAgentName(TeammateIdentity identity) {
+        if (identity != null) {
+            return identity.agentName();
         }
         if (dynamicTeamContext != null && dynamicTeamContext.agentName() != null) {
             return dynamicTeamContext.agentName();
         }
         if (log.isDebugEnabled()) {
-            log.debug("[Teammate] getAgentName：无 in-process 上下文与 dynamicTeamContext，返回 null（对齐 CC teammate.ts:98-102，无 sysprop 尾回退）");
+            log.debug("[Teammate] getAgentName：显式 identity 为 null 且无 dynamicTeamContext，返回 null（对齐 CC teammate.ts:98-102，无 sysprop 尾回退）");
         }
         return null;
     }
 
     /**
      * 返回 team 名。
-     * 优先级：in-process &gt; dynamicTeamContext（无 sysprop 回退）。
+     * 优先级：显式 identity &gt; dynamicTeamContext（无 sysprop 回退）。
      * 对齐 CC teammate.ts:111-118。
+     *
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate）
      */
-    public static String getTeamName() {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().teamName();
+    public static String getTeamName(TeammateIdentity identity) {
+        if (identity != null) {
+            return identity.teamName();
         }
         if (dynamicTeamContext != null && dynamicTeamContext.teamName() != null) {
             return dynamicTeamContext.teamName();
         }
         if (log.isDebugEnabled()) {
-            log.debug("[Teammate] getTeamName：无 in-process 上下文与 dynamicTeamContext，返回 null（对齐 CC teammate.ts:111-118，无 sysprop 尾回退）");
+            log.debug("[Teammate] getTeamName：显式 identity 为 null 且无 dynamicTeamContext，返回 null（对齐 CC teammate.ts:111-118，无 sysprop 尾回退）");
         }
         return null;
     }
 
     /**
      * 返回 team 名（带 teamContext 回退——leader 无 dynamicTeamContext 时经 AppState 传入）。
-     * 优先级：in-process &gt; dynamicTeamContext &gt; {@code teamContextTeamName}（无 sysprop 回退）。
+     * 优先级：显式 identity &gt; dynamicTeamContext &gt; {@code teamContextTeamName}（无 sysprop 回退）。
      * 对齐 CC teammate.ts:111-118（{@code teamContext?.teamName} 为第 3 优先级）。
      *
+     * @param identity            本 agent 的 teammate 身份（null = 非 teammate）
      * @param teamContextTeamName 可选 team 名（CC 参数 teamContext.teamName，来自 AppState）
      */
-    public static String getTeamName(String teamContextTeamName) {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().teamName();
+    public static String getTeamName(TeammateIdentity identity, String teamContextTeamName) {
+        if (identity != null) {
+            return identity.teamName();
         }
         if (dynamicTeamContext != null && dynamicTeamContext.teamName() != null) {
             return dynamicTeamContext.teamName();
@@ -180,20 +175,22 @@ public final class Teammate {
             return teamContextTeamName;
         }
         if (log.isDebugEnabled()) {
-            log.debug("[Teammate] getTeamName(String)：无 in-process/dynamic/teamContext，返回 null（对齐 CC teammate.ts:111-118，无 sysprop 尾回退）");
+            log.debug("[Teammate] getTeamName(String)：显式 identity/dynamic/teamContext 全空，返回 null（对齐 CC teammate.ts:111-118，无 sysprop 尾回退）");
         }
         return null;
     }
 
     /**
      * 返回 true 当本会话作为 swarm 中的 teammate 运行。
-     * in-process → true；否则需同时有 agentId 与 teamName（dynamicTeamContext）。
+     * 显式 identity 非 null → true；否则需同时有 agentId 与 teamName（dynamicTeamContext）。
      * 对齐 CC teammate.ts:125-131（无 env/sysprop 逐次回退——dynamicTeamContext 由
      * {@link TeammateContextBootstrap} 启动阶段一次性填充）。
+     *
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate）
      */
-    public static boolean isTeammate() {
-        // in-process teammate 在同一进程内运行
-        if (TeammateContext.getTeammateContext() != null) {
+    public static boolean isTeammate(TeammateIdentity identity) {
+        // 显式身份载体优先（原 ThreadLocal 载体：工具执行池线程读不到）
+        if (identity != null) {
             return true;
         }
         // dynamic team context：需同时有 agentId 与 teamName（CC :130）
@@ -204,32 +201,34 @@ public final class Teammate {
 
     /**
      * 返回 teammate 分配的颜色；非 teammate 或无颜色返回 null。
-     * 优先级：in-process &gt; dynamicTeamContext（无 sysprop 回退）。
+     * 优先级：显式 identity &gt; dynamicTeamContext（无 sysprop 回退）。
      * 对齐 CC teammate.ts:138-145。
+     *
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate）
      */
-    public static String getTeammateColor() {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().color();
+    public static String getTeammateColor(TeammateIdentity identity) {
+        if (identity != null) {
+            return identity.color();
         }
         if (dynamicTeamContext != null && dynamicTeamContext.color() != null) {
             return dynamicTeamContext.color();
         }
         if (log.isDebugEnabled()) {
-            log.debug("[Teammate] getTeammateColor：无 in-process 上下文与 dynamicTeamContext，返回 null（对齐 CC teammate.ts:138-145，无 sysprop 尾回退）");
+            log.debug("[Teammate] getTeammateColor：显式 identity 为 null 且无 dynamicTeamContext，返回 null（对齐 CC teammate.ts:138-145，无 sysprop 尾回退）");
         }
         return null;
     }
 
     /**
      * 返回 true 当该 teammate 实施前必须先进入 plan 模式并获批准。
-     * 优先级：in-process &gt; dynamicTeamContext &gt; env CLAUDE_CODE_PLAN_MODE_REQUIRED。
+     * 优先级：显式 identity &gt; dynamicTeamContext &gt; env CLAUDE_CODE_PLAN_MODE_REQUIRED。
      * 对齐 CC teammate.ts:149-156。
+     *
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate）
      */
-    public static boolean isPlanModeRequired() {
-        TeammateContext inProcess = TeammateContext.getTeammateContext();
-        if (inProcess != null) {
-            return inProcess.getData().planModeRequired();
+    public static boolean isPlanModeRequired(TeammateIdentity identity) {
+        if (identity != null) {
+            return identity.planModeRequired();
         }
         if (dynamicTeamContext != null) {
             return dynamicTeamContext.planModeRequired();
@@ -252,14 +251,15 @@ public final class Teammate {
      *   <li>否则 {@code false}（:197）——teammate，agent id != leadAgentId。</li>
      * </ol>
      *
+     * @param identity    本 agent 的 teammate 身份（[S1-T5] 显式首参，替代原 ThreadLocal 读）
      * @param leadAgentId team 配置的 lead agent ID（CC 参数 teamContext.leadAgentId），null 恒非 lead
      * @return true=team lead；false=非 lead
      */
-    public static boolean isTeamLead(String leadAgentId) {
+    public static boolean isTeamLead(TeammateIdentity identity, String leadAgentId) {
         if (leadAgentId == null) {
             return false; // CC :178-180: !teamContext?.leadAgentId → false
         }
-        String myAgentId = getAgentId();
+        String myAgentId = getAgentId(identity);
         if (myAgentId != null && myAgentId.equals(leadAgentId)) {
             return true; // CC :187-189: myAgentId === leadAgentId → true
         }

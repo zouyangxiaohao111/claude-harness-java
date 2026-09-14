@@ -1920,8 +1920,12 @@ public class ChatService {
             Path workspaceDir = Path.of(CwdResolution.getOriginalCwdLayer(sessionId));
             SessionStorage.appendReasoningDuration(workspaceDir, sessionId, messageId, reasoningDurationMs);
         } catch (Exception e) {
-            log.warn("[ChatService] appendReasoningDurationToTranscript 失败（不阻断主流程）: sessionId={} messageId={} err={}",
-                sessionId, messageId, e.getMessage());
+            // [S2 · F-10 2026-09-14 · 用户裁定 #6] 日志提为 ERROR（原 WARN）：本 catch 覆盖了
+            //   :1920 的 CwdResolution.getOriginalCwdLayer(sessionId) 的 fail-loud ⇒ 「项目根解析
+            //   失败」会被降级成一条 WARN 且继续走「本 turn 不写 transcript」。分类 = (b) 跳过，
+            //   故保留 best-effort 语义（不阻断主流程），但必须 ≥WARN 且如实反映严重度（ERROR）。
+            log.error("[ChatService] appendReasoningDurationToTranscript 失败（best-effort 跳过，不阻断主流程）: "
+                + "sessionId={} messageId={}", sessionId, messageId, e);
         }
     }
 

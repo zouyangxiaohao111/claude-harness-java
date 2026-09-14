@@ -16,6 +16,7 @@ import com.nexusai.application.agent.tool.AgentToolConstants;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.team.Teammate;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.team.TeammateMailbox;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
@@ -456,6 +457,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
             // structuredOutput=结构化 JSON 给消费方。'Task not found' 文案精确对齐 CC（无 taskId 后缀）。
             log.info("TaskUpdate 未找到任务: taskId={} success=false updatedFields=[] error='Task not found'", taskId);
             return successWithOutput(call.id(),
+                ctx != null ? ctx.teammateIdentity() : null,
                 new TaskUpdateOutput(false, taskId, List.of(), "Task not found", null, null));
         }
         Task existingTask = taskOpt.get();
@@ -552,7 +554,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
                 taskId, deleted,
                 deleted ? List.of("deleted") : List.of(),
                 deleted ? null : "Failed to delete task");
-            return successWithOutput(call.id(), new TaskUpdateOutput(
+            return successWithOutput(call.id(), ctx != null ? ctx.teammateIdentity() : null, new TaskUpdateOutput(
                 deleted, taskId,
                 deleted ? List.of("deleted") : List.of(),
                 deleted ? null : "Failed to delete task",
@@ -637,7 +639,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
                         // structuredOutput=结构化 spread（TaskUpdateToolStructuredOutputTest 定向断言）。
                         log.info("TaskUpdate TaskCompleted hook 阻塞: taskId={} success=false updatedFields=[] error={}",
                             taskId, String.join("\n", blockingErrors));
-                        return successWithOutput(call.id(), new TaskUpdateOutput(
+                        return successWithOutput(call.id(), ctx != null ? ctx.teammateIdentity() : null, new TaskUpdateOutput(
                             false, taskId, List.of(), String.join("\n", blockingErrors), null, null));
                     }
                 }
@@ -818,7 +820,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
         boolean statusChanged = partialUpdates.containsKey("status");
         log.info("TaskUpdate 更新成功: taskId={} success=true updatedFields={} statusChanged={} verificationNudgeNeeded={}",
             taskId, updatedFields, statusChanged, verificationNudgeNeeded);
-        return successWithOutput(call.id(), new TaskUpdateOutput(
+        return successWithOutput(call.id(), ctx != null ? ctx.teammateIdentity() : null, new TaskUpdateOutput(
             true, taskId, updatedFields, null,
             statusChanged ? new StatusChange(oldStatus.toValue(), newStatus.toValue()) : null,
             verificationNudgeNeeded));
@@ -999,6 +1001,21 @@ public class TaskUpdateTool extends AbstractTaskTool {
      * @return CC mapper content 文本（LLM 可见 tool_result content）
      */
     static String mapToolResultToToolResultBlockParam(TaskUpdateOutput content) {
+        // 兼容入口（{@code TaskUpdateOutput.toString()} 无 ctx 可用）→ 显式 null（非 teammate）。
+        // 生产路径走 {@link #mapToolResultToToolResultBlockParam(TaskUpdateOutput, TeammateIdentity)}。
+        return mapToolResultToToolResultBlockParam(content, null);
+    }
+
+    /**
+     * [S1-T6] mapper 主入口 · teammate 身份为 <b>显式形参</b>（原读 ThreadLocal：本方法多在
+     * 工具结果渲染链上，且 {@code toString()} 路径线程不定 ⇒ 读恒 null）。
+     *
+     * @param content  结构化输出
+     * @param identity 本 agent 的 teammate 身份（null = 非 teammate）
+     * @return CC mapper content 文本
+     */
+    static String mapToolResultToToolResultBlockParam(TaskUpdateOutput content,
+            TeammateIdentity identity) {
         if (!content.success()) {
             // 对齐 CC TaskUpdateTool.ts:373-381: !success → content = error || `Task #${taskId} not found`
             // 非 error（良性条件，如任务列表已清理），避免触发 sibling tool 取消（CC 注释明示）。
@@ -1021,18 +1038,18 @@ public class TaskUpdateTool extends AbstractTaskTool {
         // ⟺ 真实迁移；'已 completed 仅改 subject/owner' 场景（无 status 输入或 status==现有值）
         // statusChange 为 null，不触发提醒（修复旧实现 newStatus==COMPLETED 无条件触发的误报）。
         // [IMP-G3] OD-G2-1 拍板：getAgentId()（teammate.ts:88-92，仅 running-as-teammate 返回
-        // agentId，主线程 undefined）改由 Java Teammate.getAgentId() 对等表达（in-process TeammateContext
-        // ThreadLocal > dynamicTeamContext，与 CC 同优先级）；不再用 nexusai.agent.name sysprop 代理。
+        // agentId，主线程 undefined）改由 Java Teammate.getAgentId(identity) 对等表达
+        // （[S1-T6] 身份为显式形参 > dynamicTeamContext，与 CC 同优先级）；不再用 sysprop 代理。
         boolean reminderRealMigrationToCompleted = content.statusChange() != null
             && "completed".equals(content.statusChange().to());
         if (reminderRealMigrationToCompleted
             && TaskSystemConfig.isAgentSwarmsEnabled()
-            && Teammate.getAgentId() != null) {
+            && Teammate.getAgentId(identity) != null) {
             if (log.isDebugEnabled()) {
                 log.debug("TaskUpdate completed 提醒已追加: taskId={} statusChange={}->{} "
                         + "swarmsEnabled=true agentId={}（对齐 CC TaskUpdateTool.ts:392-394）",
                     content.taskId(), content.statusChange().from(), content.statusChange().to(),
-                    Teammate.getAgentId());
+                    Teammate.getAgentId(identity));
             }
             resultContent +=
                 "\n\nTask completed. Call TaskList now to find your next available task or see if your work unblocked others.";
@@ -1042,7 +1059,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
             log.debug("TaskUpdate completed 提醒被拦截: taskId={} statusChange={}->{} "
                     + "swarmsEnabled={} agentId={}（CC:389 getAgentId()/390 isAgentSwarmsEnabled() 门未全过）",
                 content.taskId(), content.statusChange().from(), content.statusChange().to(),
-                TaskSystemConfig.isAgentSwarmsEnabled(), Teammate.getAgentId());
+                TaskSystemConfig.isAgentSwarmsEnabled(), Teammate.getAgentId(identity));
         }
 
         // 对齐 CC TaskUpdateTool.ts:396-398: verificationNudgeNeeded → NOTE 提示
@@ -1100,8 +1117,9 @@ public class TaskUpdateTool extends AbstractTaskTool {
      * @param output    结构化输出（TaskUpdateOutput）
      * @return ToolResult：data=渲染文本（非空），structuredOutput=结构化 Map
      */
-    private static ToolResult<java.util.Map<String, Object>> successWithOutput(String toolUseId, TaskUpdateOutput output) {
+    private static ToolResult<java.util.Map<String, Object>> successWithOutput(String toolUseId,
+            TeammateIdentity identity, TaskUpdateOutput output) {
         return ToolResult.successWithStructuredOutput(toolUseId,
-            mapToolResultToToolResultBlockParam(output), toStructuredOutput(output));
+            mapToolResultToToolResultBlockParam(output, identity), toStructuredOutput(output));
     }
 }

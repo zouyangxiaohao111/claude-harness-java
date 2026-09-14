@@ -38,7 +38,7 @@ import com.nexusai.application.agent.mcp.McpServerScope;
 import com.nexusai.application.agent.mcp.McpAuthError;
 import com.nexusai.application.agent.subagent.ForkSubagentMessages;
 import com.nexusai.application.agent.subagent.createSubagentContext.AgentOptions;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import org.slf4j.Logger;
@@ -682,9 +682,13 @@ public class StreamingToolExecutor {
         t.call = call;
         t.parent = parent;
         t.onProgress = onProgress;
-        // [GAP-R1] 调度线程（runner，已被 runWithTeammateContext 包）捕获 teammate 上下文，
-        // 传播到工具执行线程（对齐 CC AsyncLocalStorage 跨异步传播；Java ThreadLocal 不跨线程）。
-        t.capturedTeammateContext = TeammateContext.getTeammateContext();
+        // [S1-T3] teammate 身份从**显式 ctx** 取（不再是「调度线程捕获 ThreadLocal」）：
+        //   本 add() 的流式调用点在 SSE 回调内，跑在 STREAM_EXECUTOR 虚拟线程上
+        //   （原注释写「调度线程（runner）」与代码矛盾：该线程不是 teammate runner 线程，
+        //   虚拟线程不继承 runner 的 plain ThreadLocal ⇒ 原捕获在生产 teammate 路径恒 null）。
+        //   身份现由 base TUC 盖章（withTeammateIdentity）后沿 TUC 显式下传 ⇒ 直接读 ctx。
+        //   null = 非 teammate（主会话 / 普通 subagent）；ctx 本身可为 null（见字段 javadoc）。
+        t.capturedTeammateIdentity = ctx != null ? ctx.teammateIdentity() : null;
         Tool tool = registry.get(call.name()).orElse(null);
         // [IMP-C4 R1 rework] isEnabled 守卫：已注册但 disabled 的工具与未知工具同路径报
         //   "No such tool available"，不得真实执行（对齐 CC tools.ts:325 getTools isEnabled
@@ -1983,30 +1987,28 @@ public class StreamingToolExecutor {
                                         List.of(new ForkSubagentMessages.BetaToolUseBlock(
                                             effectiveCall.id(), effectiveCall.name(), effectiveCall.input())));
                                 }
-                                // [GAP-R1] 工具执行线程恢复调度侧捕获的 teammate 上下文
-                                // （对齐 CC AsyncLocalStorage 跨异步传播；null=主会话不包装）。
+                                // [S1-T3] teammate 身份作为**显式第 6 形参**交给 SubagentTool：
+                                //   原「工具执行线程恢复调度侧捕获的 ThreadLocal」分支已删
+                                //   （用户铁律：回放不算合规）。null = 非 teammate，对端守卫按
+                                //   「非 teammate」判定（行为与主会话路径一致）。
                                 // 注: effectiveCall/assistantMessage 为可重赋值局部 → 先取 final 副本供 lambda 捕获。
                                 ToolUseBlock effectiveCallForExecute = effectiveCall;
                                 ForkSubagentMessages.Message assistantMessageForExecute = assistantMessage;
-                                t.result = t.capturedTeammateContext != null
-                                    ? TeammateContext.runWithTeammateContext(t.capturedTeammateContext,
-                                        () -> subagentTool.execute(
-                                            effectiveCallForExecute, ctx, wrappedCallback,
-                                            subagentAgentOptions, assistantMessageForExecute))
-                                    : subagentTool.execute(
-                                        effectiveCallForExecute, ctx, wrappedCallback,
-                                        subagentAgentOptions, assistantMessageForExecute);
+                                t.result = subagentTool.execute(
+                                    effectiveCallForExecute, ctx, wrappedCallback,
+                                    subagentAgentOptions, assistantMessageForExecute,
+                                    t.capturedTeammateIdentity);
                                 if (log.isDebugEnabled()) {
-                                    log.debug("TOOL Subagent 五参特化分发: name={} id={} querySource={}",
+                                    log.debug("TOOL Subagent 六参特化分发: name={} id={} querySource={} teammate={}",
                                         effectiveCall.name(), abbreviate(effectiveCall.id(), 24),
-                                        subagentAgentOptions.querySource());
+                                        subagentAgentOptions.querySource(),
+                                        t.capturedTeammateIdentity != null);
                                 }
                             } else {
                                 ToolUseBlock effectiveCallForExecute = effectiveCall;
-                                t.result = t.capturedTeammateContext != null
-                                    ? TeammateContext.runWithTeammateContext(t.capturedTeammateContext,
-                                        () -> t.tool.execute(effectiveCallForExecute, ctx, wrappedCallback))
-                                    : t.tool.execute(effectiveCallForExecute, ctx, wrappedCallback);
+                                // 普通工具不需要 teammate 身份（无需 ThreadLocal 包装；原 GAP-R1 的
+                                // teammate 回放分支一并删除）。
+                                t.result = t.tool.execute(effectiveCallForExecute, ctx, wrappedCallback);
                             }
                         } finally {
                             t.toolDurationMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
@@ -3368,18 +3370,18 @@ public class StreamingToolExecutor {
         CompletableFuture<Void> promise;
         AgentToolResult result;
         /**
-         * [GAP-R1] 调度侧捕获的 in-process teammate 上下文 · 对齐 CC AsyncLocalStorage
-         * 跨异步延续自动传播（inProcessRunner.ts:1160 runWithTeammateContext 包 runAgent）。
+         * [S1-T3] 本工具的 teammate 身份（从显式 ctx 取值，非 ThreadLocal 捕获）·
+         * 对齐 CC AsyncLocalStorage 跨异步延续自动传播（inProcessRunner.ts:1160）。
          *
-         * <p>WHY: {@link TeammateContext} 是 ThreadLocal-backed，而工具体在
-         * {@link #executeAsync} 的 {@code CompletableFuture.runAsync(..., executor)} 回调
-         * （池线程）执行 —— ThreadLocal 不跨线程，需在 <b>add() 调度线程</b>（runner 线程，
-         * 已被 SpawnInProcess 包 runWithTeammateContext）捕获，再在工具执行线程恢复，
-         * SubagentTool.isTeammate/isInProcessTeammate 守卫才在 teammate 场景命中。
+         * <p>WHY: 工具体在 {@link #executeAsync} 的
+         * {@code CompletableFuture.runAsync(..., executor)} 回调（池线程）执行，plain ThreadLocal
+         * 不跨线程 ⇒ 身份若走 ThreadLocal 就只能在调度线程捕获、执行线程回放（旧 GAP-R1 做法，
+         * 已删）。现由 base TUC 显式盖章并沿 TUC 传递链下传，本字段只是 add() 时的快照，
+         * 传给 {@link com.nexusai.application.agent.tool.impl.SubagentTool#execute} 的第 6 形参。
          *
-         * <p>null = 主会话/普通 subagent 路径，不包装 → 行为零变化（不破坏主会话）。
+         * <p>null = 主会话 / 普通 subagent（无 teammate 身份）；非 SubagentTool 的工具不消费它。
          */
-        TeammateContext capturedTeammateContext;
+        TeammateIdentity capturedTeammateIdentity;
         /**
          * [R32-b15 Stage 2 C5] 父 assistant message lineage 句柄 · 由
          * {@link #add(ToolUseBlock, ToolParent, Consumer)} 注入, executeAsync 完成后

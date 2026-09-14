@@ -2,6 +2,7 @@ package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -31,6 +32,21 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 @DisplayName("批 3b-D7 · 后台任务输出根 = 显式会话（真实 bg-task-worker 线程）")
 class BackgroundTaskOutputSessionExplicitTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution / PathGuard
+    //   fail-loud 抛（F-10 起 PathGuard 消费侧也不再吞）。见 SessionProjectRootTestSupport 类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     private static final String EXPLICIT = "sess-d7-explicit";
     private static final String STALE = "sess-d7-stale-third-state";

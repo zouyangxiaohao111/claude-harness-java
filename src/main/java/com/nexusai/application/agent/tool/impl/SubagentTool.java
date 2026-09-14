@@ -42,7 +42,7 @@ import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.SpawnInProcess;
 import com.nexusai.application.agent.team.Teammate;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.prompt.AgentToolSection;
 import com.nexusai.application.agent.prompt.EffectiveSystemPromptBuilder;
@@ -1905,7 +1905,26 @@ public class SubagentTool implements Tool {
                               java.util.function.Consumer<Tool.ToolProgress> onProgress,
                               AgentOptions agentOptions,
                               ForkSubagentMessages.Message assistantMessage) {
-        return doExecute(call, ctx, onProgress, agentOptions, assistantMessage);
+        // [S1-T3] 五参兼容重载：teammate 身份取自 ctx 显式载体（不再经 ThreadLocal）。
+        return execute(call, ctx, onProgress, agentOptions, assistantMessage,
+            ctx != null ? ctx.teammateIdentity() : null);
+    }
+
+    /**
+     * [S1-T3] <b>六参主路径</b>（StreamingToolExecutor 特化分发）· 对齐 CC AgentTool.tsx:250 call 签名。
+     *
+     * <p>第 6 形参 = teammate 身份<b>显式载体</b>：由 {@code StreamingToolExecutor.add} 在
+     * 流式回调线程从同一 TUC 的 {@code teammateIdentity()} 取值后原样传入。⛔ 不走
+     * ThreadLocal（回放不算合规，用户铁律）；null = 非 teammate（主会话 / 普通 subagent）。
+     *
+     * @param teammateIdentity 本 agent 的 teammate 身份；驱动 CC AgentTool.tsx:272/278 两个守卫
+     */
+    public ToolResult execute(ToolUseBlock call, ToolUseContext ctx,
+                              java.util.function.Consumer<Tool.ToolProgress> onProgress,
+                              AgentOptions agentOptions,
+                              ForkSubagentMessages.Message assistantMessage,
+                              com.nexusai.application.agent.team.TeammateIdentity teammateIdentity) {
+        return doExecute(call, ctx, onProgress, agentOptions, assistantMessage, teammateIdentity);
     }
 
     /** [Session J 方案 A] 四参兼容壳: 未提供 assistantMessage 时传 null. */
@@ -1953,7 +1972,8 @@ public class SubagentTool implements Tool {
     private ToolResult doExecute(ToolUseBlock call, ToolUseContext ctx,
                                  java.util.function.Consumer<Tool.ToolProgress> onProgress,
                                  AgentOptions agentOptions,
-                                 ForkSubagentMessages.Message assistantMessage) {
+                                 ForkSubagentMessages.Message assistantMessage,
+                                 com.nexusai.application.agent.team.TeammateIdentity teammateIdentity) {
         // [Session M1.3] fork path 派生 forkParentSystemPrompt (CC AgentTool.tsx:493-511)
         //   fork path 必须复用父 ctx.renderedSystemPrompt (或 fallback recompute),
         //   保证 prompt cache prefix byte-identical. 此处派生后透传到 executeSync/Async.
@@ -2013,7 +2033,7 @@ public class SubagentTool implements Tool {
         // CC :272-276: isTeammate() && teamName && name → teammate 不能 spawn teammate
         //   （独立顶层守卫；CC 同序 :272 先于 :278 — 带 name 的 in-process teammate 后台
         //     spawn 先抛此消息，逐字对齐 CC AgentTool.tsx:272-273）
-        if (isTeammate() && resolvedTeamName != null && name != null) {
+        if (isTeammate(teammateIdentity) && resolvedTeamName != null && name != null) {
             return ToolResult.error(call.id(),
                 "Teammates cannot spawn other teammates — the team roster is flat. "
                 + "To spawn a subagent instead, omit the `name` parameter.");
@@ -2023,12 +2043,14 @@ public class SubagentTool implements Tool {
         //     in-process teammate」亦触发；GAP-R3: 原实现嵌套于 name 分支(:1189)且被
         //     isTeammate ⊇ isInProcessTeammate 遮蔽，结构不可达 → 移出为独立守卫）
         //   teamName 对齐 CC resolveTeamName :1396 = input.team_name || appState.teamContext?.teamName：
-        //     Java appState.teamContext 等价 = TeammateContext.teamName（SpawnInProcess.java:211
-        //     以 config.teamName() 构造；R1 线程传播后工具执行线程同线程可见）。
-        if (isInProcessTeammate() && guardTeammateTeamName(resolvedTeamName) != null && runInBackground) {
+        //     Java appState.teamContext 等价 = 显式 teammateIdentity.teamName()（[S1-T6] 原读
+        //     ThreadLocal ⇒ 工具执行池线程恒 null，守卫漏判）。
+        if (isInProcessTeammate(teammateIdentity)
+                && guardTeammateTeamName(teammateIdentity, resolvedTeamName) != null
+                && runInBackground) {
             log.warn("[SubagentTool] in-process teammate 后台 spawn 被守卫拒绝: team={} name={} "
                     + "run_in_background=true（对齐 CC AgentTool.tsx:278-280）",
-                guardTeammateTeamName(resolvedTeamName), name);
+                guardTeammateTeamName(teammateIdentity, resolvedTeamName), name);
             return ToolResult.error(call.id(),
                 "In-process teammates cannot spawn background agents. "
                 + "Use run_in_background=false for synchronous subagents.");
@@ -2232,7 +2254,7 @@ public class SubagentTool implements Tool {
 
         // §14.3.5: isInProcessTeammate + isTeammate 检查（对齐 CC AgentTool.tsx:274-282）
         // Team spawn 特性未启用（isAgentSwarmsEnabled = false），仅做进程内检查
-        if (isInProcessTeammate()) {
+        if (isInProcessTeammate(teammateIdentity)) {
             if (selectedAgent.background().isPresent() && Boolean.TRUE.equals(selectedAgent.background().get())) {
                 return ToolResult.error(call.id(),
                     "In-process teammates cannot spawn background agents. Agent '"
@@ -2758,27 +2780,30 @@ public class SubagentTool implements Tool {
     }
 
     /**
-     * 是否为进程内队友 · 对齐 CC utils/teammateContext.ts:70-74 isInProcessTeammate
+     * 是否运行在进程内队友上下文 · 对齐 CC utils/teammateContext.ts:70-74 isInProcessTeammate
      * （{@code teammateContextStorage.getStore() !== undefined}）。
      *
-     * <p>Java 等价：{@link TeammateContext#isInProcessTeammate()}（ThreadLocal CURRENT 非空）。
-     * leader（主会话）线程 CURRENT 未设 → false；teammate 线程由 runWithTeammateContext
-     * 设置（GAP-02 接线后生效，CC :279/:361 守卫自动就位）。
+     * <p>[S1-T6] 判据 = <b>显式形参</b> {@code identity != null}（原实现读 ThreadLocal
+     * CURRENT，工具执行池线程恒 null ⇒ 守卫生产不触发）。主会话 / 普通 subagent → false。
+     *
+     * @param identity 本 agent 的 teammate 身份（StreamingToolExecutor 从 TUC 显式传入）
      */
-    private boolean isInProcessTeammate() {
-        return TeammateContext.isInProcessTeammate();
+    private boolean isInProcessTeammate(
+            com.nexusai.application.agent.team.TeammateIdentity identity) {
+        return identity != null;
     }
 
     /**
      * 是否运行在 teammate 上下文 · 对齐 CC utils/teammate.ts:125-137 isTeammate。
      *
-     * <p>RF-3 ② 双实现统一：本方法此前自行复制 {@link Teammate#isTeammate()} 逻辑（in-process
-     * ThreadLocal + sysprop 双条件），与 {@link Teammate} 存在双实现漂移（sysprop 回退在
-     * {@link Teammate#isTeammate()} 已随启动接线移除，此处若不同步会造成身份判定分叉）。
-     * 现统一委托 {@link Teammate#isTeammate()}（单一真源，CC teammate.ts:125-131）。
+     * <p>[S1-T6] 判据 = <b>显式形参</b> {@code identity != null}。原实现委托
+     * {@code Teammate.isTeammate()}（ThreadLocal + 进程级 dynamicTeamContext 双源）——
+     * 两个源都是「非显式」载体（前者跨线程读不到、后者跨会话串台），本批统一收敛到 TUC 载体。
+     *
+     * @param identity 本 agent 的 teammate 身份
      */
-    private boolean isTeammate() {
-        return Teammate.isTeammate();
+    private boolean isTeammate(com.nexusai.application.agent.team.TeammateIdentity identity) {
+        return identity != null;
     }
 
     /**
@@ -2786,20 +2811,21 @@ public class SubagentTool implements Tool {
      * {@code input.team_name || appState.teamContext?.teamName}。
      *
      * <p>input.team_name 由调用方 {@code resolvedTeamName}（swarms 启用时的 team_name）承载；
-     * appState.teamContext?.teamName 的 Java 等价 = {@link TeammateContext} 的 teamName
-     * （SpawnInProcess.java:211 以 config.teamName() 构造；R1 线程传播后工具执行线程
-     * 同线程可见）。team_name 缺省但处于 in-process teammate 上下文时，从 teammate
-     * 上下文取 teamName — 使无 name 后台 spawn（CC:279 真触发场景）也能命中守卫。
+     * {@code appState.teamContext?.teamName} 的 Java 等价 = <b>显式 identity.teamName()</b>
+     * （[S1-T6] 原读 ThreadLocal；工具执行池线程恒 null ⇒ 无 name 后台 spawn 的守卫漏判）。
+     * team_name 缺省但 identity 非 null 时，从 identity 取 teamName —— 使无 name 后台 spawn
+     * （CC:279 真触发场景）也能命中守卫。
      *
+     * @param identity         本 agent 的 teammate 身份（null = 非 teammate）
      * @param resolvedTeamName input.team_name 解析结果（swarms 关闭时恒 null）
      * @return 守卫用 teamName（null = 无 teamName，守卫不触发）
      */
-    private String guardTeammateTeamName(String resolvedTeamName) {
+    private String guardTeammateTeamName(
+            com.nexusai.application.agent.team.TeammateIdentity identity, String resolvedTeamName) {
         if (resolvedTeamName != null) {
             return resolvedTeamName;
         }
-        TeammateContext teammateCtx = TeammateContext.getTeammateContext();
-        return teammateCtx != null ? teammateCtx.getData().teamName() : null;
+        return identity != null ? identity.teamName() : null;
     }
 
     /**

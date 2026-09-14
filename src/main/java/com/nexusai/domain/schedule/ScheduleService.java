@@ -243,7 +243,7 @@ public class ScheduleService {
         // 已关 headless 无 transcript）——两语义共用一列，生命周期判定始终以 scope 列为权威。
         s.setSessionId(sessionId);
         // CRON-D4: teammate agentId 落库 · CC original: CronTask.agentId (cronTasks.ts:69)。
-        // create 由 CronCreateTool 从 TeammateContext 填充（CronCreateTool.ts:126），
+        // create 由 CronCreateTool 从 teammate 身份载体填充（CronCreateTool.ts:126），
         // DURABLE/主线程 为 null。V9 agent_id 列（OPD-D4-GAP-5 方案 A）。
         s.setAgentId(req.agentId());
         // 批次X Q2: DURABLE 任务存 boundProject（创建会话绑定项目）· CC original: 无字段

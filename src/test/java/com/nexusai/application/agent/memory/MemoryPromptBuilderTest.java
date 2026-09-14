@@ -240,6 +240,62 @@ class MemoryPromptBuilderTest {
         assertThat(prompt).doesNotContain("## Searching past context");
     }
 
+    /**
+     * [P1a F-05] 无会话项目根 ⇒ 不产出 transcript 搜索段 + ≥WARN；有根时两段齐全（正向对照）。
+     *
+     * <p><b>WHY</b>（规则九 · 规则十二）：旧实现把 null/blank 的 {@code sessionProjectRoot} 静默换成
+     * 字面 {@code "."}，经 {@code SessionStorage.getProjectDir(Path.of("."))} +
+     * {@code AutoMemPaths.sanitizePath('.')='-'} 产出 <b>{@code {configHome}/projects/-} 幽灵目录</b>
+     * ——模型拿到的是指向不存在目录的假指令，而且零日志。CC 侧不存在该态：
+     * {@code getProjectDir(getOriginalCwd())} 的 {@code getOriginalCwd()} 是进程单例恒非空
+     * （claude-code-best/src/bootstrap/state.ts:494-496 {@code return STATE.originalCwd}），
+     * 故 CC 恒两段（claude-code-best/src/memdir/memdir.ts:379 + :392-406）。
+     */
+    @Test
+    @DisplayName("[P1a F-05] 无会话项目根 -> 无 transcript 段（不产 projects/- 幽灵目录）+ ≥WARN；有根 -> 两段齐全")
+    void noSessionProjectRoot_omitsTranscriptSearch_withWarn(@TempDir Path dir) {
+        MemoryPromptBuilder b = builder(dir, true, false, false, true, false, false, () -> null, p -> "");
+        String autoMemDir = dir.resolve("memory").toString();
+        String projectRoot = dir.resolve("proj").toString();
+
+        // ① 正向对照：显式会话项目根 → 两段齐全（transcript 段真的存在，不是被永久删掉）
+        String withRoot = String.join("\n",
+            b.buildSearchingPastContextSection(autoMemDir, projectRoot));
+        assertThat(withRoot)
+            .as("夹具自检：显式项目根必须产出 transcript 搜索段（否则本用例零鉴别力）")
+            .contains("1. Search topic files in your memory directory:")
+            .contains("2. Session transcript logs (last resort — large files, slow):")
+            .contains("*.jsonl");
+
+        // ② 主断言：无会话项目根 → 保留 memory 段、去掉 transcript 段（裁定 (B)）+ ≥WARN
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(MemoryPromptBuilder.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            String noRoot = String.join("\n",
+                b.buildSearchingPastContextSection(autoMemDir, null));
+
+            assertThat(noRoot)
+                .as("无根仍保留与项目根无关的 memory 目录搜索段（不该整段消失）")
+                .contains("## Searching past context")
+                .contains("1. Search topic files in your memory directory:");
+            assertThat(noRoot)
+                .as("无根必须去掉 transcript 搜索段 —— 旧实现静默回落 \".\" 会产出 projects/- 幽灵目录，"
+                    + "模型据此 grep 一个不存在的目录（且零日志）")
+                .doesNotContain("2. Session transcript logs")
+                .doesNotContain("*.jsonl");
+            assertThat(appender.list.stream()
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage))
+                .as("跳过 transcript 段必须 ≥WARN（规则十二：不得静默）")
+                .anyMatch(m -> m.contains("无会话项目根"));
+        } finally {
+            logger.detachAppender(appender);
+        }
+    }
+
     @Test
     @DisplayName("[A1 读取侧回归] 真实 AutoMemPaths：会话线程 projectRoot → loadMemoryPrompt 解析到该项目的 per-project 记忆目录（不回落 config-home）")
     void autoOnly_realAutoMemPaths_resolvesSessionProjectMemoryDir(@TempDir Path configHome) throws Exception {

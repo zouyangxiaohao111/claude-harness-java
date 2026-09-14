@@ -4,7 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.LlmAgentLoop;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.permission.ToolInputValidator;
 import com.nexusai.application.agent.tool.ToolErrorFormatter;
 import com.nexusai.application.agent.tool.ToolResult;
@@ -168,13 +169,11 @@ class CronListToolCcContractTest {
             dto("job-a", ScheduleKind.cron, ScheduleScope.DURABLE, "agent-A"),
             dto("job-b", ScheduleKind.cron, ScheduleScope.DURABLE, "agent-B")));
         CronListTool tool = new CronListTool(svc, CronEnabledGates.DEFAULTS);
-        TeammateContext teammate = new TeammateContext(
-            "agent-A", "peer", "team", null, false, null,
-            AbortControllerFactory.create());
+        // [S1-T6] 身份改为 TUC 显式载体（原 ThreadLocal 注入手法已随载体删除）。
+        ToolUseContext tuc = teammateTuc(
+            new TeammateIdentity("agent-A", "peer", "team", null, false, null));
 
-        ToolResult<?> r = TeammateContext.runWithTeammateContext(
-            teammate,
-            () -> (ToolResult<?>) tool.execute(call("c1")));
+        ToolResult<?> r = (ToolResult<?>) tool.execute(call("c1"), tuc);
 
         // [REWORK-7] ToolResult.isError() 已删 (IMP-C2) → isError 由 data 文案推导。
         assertThat(LlmAgentLoop.isToolErrorData(r.data())).isFalse();
@@ -287,5 +286,15 @@ class CronListToolCcContractTest {
         assertThat(result.issues().get(0).path()).isEqualTo(List.of("extra"));
         assertThat(result.issues().get(0).message())
             .isEqualTo("An unexpected parameter `extra` was provided");
+    }
+
+    /**
+     * [S1-T6] 构造带 teammate 身份的 ToolUseContext（替代已删的 ThreadLocal 注入手法）·
+     * 身份经 {@code withTeammateIdentity}（= 生产唯一盖章入口）显式盖章。
+     */
+    private static ToolUseContext teammateTuc(TeammateIdentity identity) {
+        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-cron-list",
+            com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
+            .withTeammateIdentity(identity);
     }
 }

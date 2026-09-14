@@ -7,7 +7,6 @@ import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.common.SessionProjectRoot;
-import com.nexusai.application.agent.team.TeammateContext;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
@@ -51,9 +50,9 @@ import java.util.UUID;
  *       注入 ctx.sessionId)</li>
  *   <li>CC {@code agentId} (teammate 创建者, runtime-only, cronTasks.ts:69) → Java
  *       {@code ScheduleCreateRequest.agentId}：SESSION 分支读
- *       {@code TeammateContext.getTeammateContext()?.getData().agentId()}（对齐 CC
- *       CronCreateTool.ts:126 getTeammateContext()?.agentId 作 addCronTask 实参；主线程 ctx
- *       恒 null → agentId=null）。DURABLE 分支恒 null（CC durable 路径 push task 不含
+ *       {@code ctx.teammateIdentity().agentId()}（[S1-T6] 改读显式 TUC 载体；对齐 CC
+ *       CronCreateTool.ts:126 getTeammateContext()?.agentId 作 addCronTask 实参；主线程无身份
+ *       → agentId=null）。DURABLE 分支恒 null（CC durable 路径 push task 不含
  *       agentId，cronTasks.ts:215-217）</li>
  * </ul>
  *
@@ -331,11 +330,11 @@ public class CronCreateTool implements Tool {
      * 6 段值越界 → 'Field values out of range (...)'。旧文案恒为 'Expected 6 fields ... Use '?'
      * for the unused ... field.'，在字段数本来就正确时误导模型数字段（cron-6field-contract 修复）。
      * 错误码 4 的 teammate predicate 用
-     * {@link TeammateContext#getTeammateContext()}（对齐 CC 真源 :107 + CronDeleteTool:195 既有
+     * {@code ctx.teammateIdentity()}（[S1-T6] 显式 TUC 载体；对齐 CC 真源 :107 + CronDeleteTool:195 既有
      * 约定；Java 当前无 teammate agentId 字段，WF-B/D 补 → 登记 WF-A-OD-11）。
      *
      * @param input 工具输入 {@code {cron, prompt, recurring?, durable?}}
-     * @param ctx   工具调用上下文（本实现不消费；teammate 判定用全局 TeammateContext，对齐 CC :107）
+     * @param ctx   工具调用上下文（teammate 判定用 {@code ctx.teammateIdentity()}，对齐 CC :107）
      * @return {@link ValidationResult#pass()} 或 fail("1".."4", CC 精确消息)
      */
     @Override
@@ -383,8 +382,9 @@ public class CronCreateTool implements Tool {
                 "Too many scheduled jobs (max " + ScheduleService.MAX_JOBS + "). Cancel one first.");
         }
         // errorCode 4 · CC :105-114 input.durable && getTeammateContext()
+        // [S1-T6] 判据改读**显式 TUC 载体**（原读 ThreadLocal：工具执行池线程恒 null ⇒ 规则失效）。
         boolean durable = input != null && input.path("durable").asBoolean(false);
-        if (durable && TeammateContext.getTeammateContext() != null) {
+        if (durable && ctx != null && ctx.teammateIdentity() != null) {
             return ValidationResult.fail("4",
                 "durable crons are not supported for teammates (teammates do not persist across sessions)");
         }
@@ -551,8 +551,8 @@ public class CronCreateTool implements Tool {
         String sessionId;
         // CC original: CronTask.agentId (CronCreateTool.ts:126 getTeammateContext()?.agentId)。
         // teammate 创建者 agentId 仅在 SESSION（durable=false）路径有值；主线程恒 null。
-        // 复用 CronDeleteTool.java:195-199 既有取值模式。TeammateContext 生产端 0 设定
-        // （@deprecated stub）→ 生产当前恒 null，待 teammate 运行时接线后非空（OPD-D4-GAP-5 方案 A 边界）。
+        // 复用 CronDeleteTool.java:195-199 既有取值模式（[S1-T6] 改读显式 TUC 载体）。
+        // 非 teammate 路径恒 null（OPD-D4-GAP-5 方案 A 边界）。
         String agentId = null;
         // 批次X Q2: DURABLE 任务存 boundProject（创建会话绑定项目）· CC original: 无字段
         // （CC durable 项目锚=文件位置 <projectRoot>/.claude/scheduled_tasks.json，cronTasks.ts:74-83）。
@@ -570,9 +570,9 @@ public class CronCreateTool implements Tool {
                     + "no ToolUseContext provided.");
             }
             sessionId = ctx.sessionId();
-            TeammateContext teammate = TeammateContext.getTeammateContext();
-            if (teammate != null && teammate.getData().agentId() != null) {
-                agentId = teammate.getData().agentId();
+            // [S1-T6] 创建者 agentId 改读显式 TUC 载体（原读 ThreadLocal，池线程恒 null）。
+            if (ctx.teammateIdentity() != null && ctx.teammateIdentity().agentId() != null) {
+                agentId = ctx.teammateIdentity().agentId();
             }
         } else {
             // DURABLE: 存创建会话 sessionId（归属对话/注入目标，非 SESSION 生命周期绑定）· [PROBE-DUR

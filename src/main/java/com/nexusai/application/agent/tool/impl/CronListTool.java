@@ -6,7 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -49,7 +49,7 @@ import java.util.List;
  *   <li>{@code recurring} 由 {@code kind != ONCE} 派生（ScheduleDto 无真实布尔，risk R3）；</li>
  *   <li>{@code durable===false} 由 {@code scope == SESSION} 派生（SESSION=session-only 非持久，
  *       risk R3）；</li>
- *   <li>{@code getTeammateContext()} → {@link TeammateContext#getTeammateContext()}（与
+ *   <li>{@code getTeammateContext()} → [S1-T6] {@code ToolUseContext.teammateIdentity()}（与
  *       CronDeleteTool 同源），agentId 由 WF-B 填充（当前恒 null，risk R2，结构对齐）</li>
  *   <li>{@code truncate(prompt,80,true)} 复刻 CC truncate.ts:134-158（单行 + 宽度感知 '…'），
  *       宽度计算用 {@link StringWidth}（对齐 CC stringWidth）。</li>
@@ -230,7 +230,9 @@ public class CronListTool implements Tool {
         // CAND-3: 无 catch —— 异常直接抛框架层 StreamingToolExecutor 统一错误面
         // （对齐 CC CronListTool.ts:63-79 call() 无 try/catch；E1 原则 CronDeleteTool.java:251-252）。
         List<ScheduleDto> all = scheduleService.listAll();
-        List<ScheduleDto> filtered = filterByContext(all);
+        // [S1-T6] 身份改读显式 TUC 载体（原读 ThreadLocal：工具执行池线程恒 null）。
+        List<ScheduleDto> filtered = filterByContext(
+            ctx != null ? ctx.teammateIdentity() : null, all);
         String text = renderListResultText(filtered);
         if (log.isDebugEnabled()) {
             log.debug("CronListTool: 已渲染列表文本，任务 {} 条 → 过滤后 {} 条，tool_result 文本长度 {}",
@@ -246,18 +248,19 @@ public class CronListTool implements Tool {
      * const ctx = getTeammateContext()
      * const tasks = ctx ? allTasks.filter(t => t.agentId === ctx.agentId) : allTasks
      * </pre>
-     * Java 映射: {@link TeammateContext#getTeammateContext()} 非 null → 只保留
+     * Java 映射: [S1-T6] 显式形参 {@code identity} 非 null → 只保留
      * {@code task.agentId} 等于 teammate agentId 的任务（同 CronDeleteTool:195-203 结构）。
-     * {@code ScheduleDto.agentId} 由 WF-B 填充（当前生产恒 null）、TeammateContext 生产端
-     * 0 设定 → 本分支生产不可达，仅结构对齐（risk R2，登记 WF-B/WF-D）。
+     * {@code ScheduleDto.agentId} 由 WF-B 填充（当前生产恒 null）→ 无匹配时结果为空列表
+     * （CC 同构；risk R2，登记 WF-B/WF-D）。
      */
-    private static List<ScheduleDto> filterByContext(List<ScheduleDto> all) {
-        TeammateContext teammate = TeammateContext.getTeammateContext();
-        if (teammate == null) {
+    private static List<ScheduleDto> filterByContext(TeammateIdentity identity,
+            List<ScheduleDto> all) {
+        // [S1-T6] 显式形参载体（原读 ThreadLocal，池线程恒 null）；null = 非 teammate（= team lead 视角）。
+        if (identity == null) {
             return all;   // team lead 视角: 看全部（CC :67）
         }
         // CC original: t.agentId === ctx.agentId (CronListTool.ts:68)
-        String ctxAgentId = teammate.getData().agentId();
+        String ctxAgentId = identity.agentId();
         return all.stream()
             .filter(d -> ctxAgentId != null && ctxAgentId.equals(d.agentId()))
             .toList();

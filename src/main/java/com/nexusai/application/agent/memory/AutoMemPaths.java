@@ -195,6 +195,29 @@ public final class AutoMemPaths {
     }
 
     /**
+     * [P1a F-06] 「无有效项目根」告警闸 · <b>按调用点各自一次性</b>（决策 #20 (B) 的落地形态）。
+     *
+     * <p><b>WHY 一次性</b>：消费点（MemoryPrefetcher / MemoryFileDetection / MemoryPromptBuilder）
+     * 在 render-path 上每条 tool-use 消息都会调用；未绑定会话场景下逐次 WARN 会刷屏。
+     * 一次性保证「至少有一条 ≥WARN 的可观测信号」（本仓铁律：取不到会话态不得静默，
+     * 禁只 DEBUG）同时不淹没日志。旧实现两处生产者侧只有 DEBUG、消费侧零日志 ⇒
+     * 「未绑定会话」整体静默降级，排查时看不到任何线索。
+     *
+     * <p><b>⚠️ 为何是「按调用点」而不是「全进程一条」</b>：消费侧每次都先调生产者
+     * （{@code getAutoMemPath}）拿值，生产者自己就会打第一条 —— 若全进程只允许一条，
+     * 消费侧的告警<b>结构上永不可达</b>（实测踩到：断言「消费侧 WARN 含 caller=MemoryFileDetection」
+     * 时，日志里只有 caller=getAutoMemPath 那一条）。按 caller 计数仍满足「不刷屏」
+     * （调用点数量个位数，每个最多一条），且每个跳过点都真的可观测。
+     */
+    private static final java.util.Set<String> NO_ELIGIBLE_ROOT_WARNED =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 测试复位告警闸（防跨用例顺序依赖：先跑的用例消费掉「唯一一次」会让他用例假绿）。 */
+    static void resetNoEligibleProjectWarnForTest() {
+        NO_ELIGIBLE_ROOT_WARNED.clear();
+    }
+
+    /**
      * 生产默认实例 · 类级根供应 = {@link #currentSessionProjectRootOrNull()}（显式 env 或 null）。
      *
      * <p><b>[批 4b-1 变更]</b>：本 supplier 原为「会话 ThreadLocal 注入」的惰性读取点，现随载体删除
@@ -445,6 +468,9 @@ public final class AutoMemPaths {
      * {@code sessions.main_project_id → projects.path}，批 4b-1 起经<b>显式入参</b>传给消费方）。本方法是路径层
      * 纯防御（null/blank/config-home/memoryBase 永不拼接）——走到 null 只表示「上游无有效项目」，
      * 不是本方法负责去查 DB。调用方（MemoryPromptBuilder/LlmAgentLoop 守卫）据此 fail loud。
+     * <!-- [S2 · F-24 2026-09-14] ⚠️ 上游的 {@code tryResolveBoundProjectFromDb} 是「B′ 兜底第二链」，
+     *      与 SessionProjectRoot 的冻结表回源解析器是<b>两条独立实现</b>（差异 A/B）——
+     *      ⛔ 勿声称「全仓只有这一处 DB 查询实现」。未合并原因与代价见 SessionProjectRoot 类 javadoc 的「残差 R-DB」段。 -->
      *
      * @param projectRoot 候选项目根（可能来自回落链的 config-home）
      * @return false = 无有效项目（getAutoMemPath/getAutoMemBase 应返回 null，禁止拼 config-home）
@@ -455,6 +481,40 @@ public final class AutoMemPaths {
         }
         return !isSameDirectory(projectRoot, getMemoryBaseDir())
             && !isSameDirectory(projectRoot, NexusaiPaths.getAppConfigHomeDir());
+    }
+
+    /**
+     * [P1a F-06] 统一「无有效项目根」告警出口（≥WARN · 进程内一次性）。
+     *
+     * <p>生产者侧（{@link #getAutoMemBase(String)} / {@link #getAutoMemPath(String)}）与消费侧
+     * （{@code MemoryPrefetcher.resolveMemoryDirs} / {@code MemoryFileDetection} 的两处
+     * {@code getAutoMemPath} 判定）共用本出口，口径一致：违反 {@link #isEligibleProjectRoot} 的
+     * 候选根都必须 ≥WARN（⛔ 禁止只 DEBUG 或零日志）。
+     *
+     * <p><b>文案区分两种原因</b>（同一个 null 返回，两种不同语义，不可混同）：
+     * <ul>
+     *   <li>{@code null}/空白 —— 调用方没给会话项目根（本仓特有第三态）；</li>
+     *   <li>命中 config-home / memoryBase —— <b>回落污染信号</b>（把进程级配置根当项目根用，
+     *       会派生 config-home slug 假目录）。</li>
+     * </ul>
+     *
+     * @param caller  调用点标识（如 {@code getAutoMemPath} / {@code MemoryPrefetcher.resolveMemoryDirs}）
+     * @param rawRoot 原始候选根（未过 eligibility 判定；可为 null）
+     */
+    public void logNoEligibleProject(String caller, String rawRoot) {
+        if (!NO_ELIGIBLE_ROOT_WARNED.add(String.valueOf(caller))) {
+            return;
+        }
+        if (rawRoot == null || rawRoot.isBlank()) {
+            log.warn("[AutoMemPaths] {} 无有效项目根: rawRoot={}（null/空白 —— 调用方未提供会话项目根）"
+                    + " → 返回 null / 跳过 per-project 记忆目录（⛔ 不伪造项目根）。本调用点进程内只打一次。",
+                caller, rawRoot);
+            return;
+        }
+        log.warn("[AutoMemPaths] {} 无有效项目根: rawRoot={} —— 命中 config-home / memoryBase"
+                + "（回落污染信号：进程级配置根不得当项目根）→ 返回 null / 跳过 per-project 记忆目录。"
+                + "本调用点进程内只打一次。",
+            caller, rawRoot);
     }
 
     /** 路径是否指向同一目录（absolute+normalize 后比对；Windows 大小写折叠）。 */
@@ -515,10 +575,8 @@ public final class AutoMemPaths {
         String projectRoot = explicitProjectRoot;
         // A′: 无有效项目（null/blank/config-home/memoryBase）→ per-project auto 记忆基路径不存在
         if (!isEligibleProjectRoot(projectRoot)) {
-            if (log.isDebugEnabled()) {
-                log.debug("[AutoMemPaths] getAutoMemBase 无有效项目（null/blank/config-home），返回 null: rawRoot={}",
-                    explicitProjectRoot);
-            }
+            // [P1a F-06] 生产者侧静默点 1：原只有 debug（生产不可见）⇒ 提为统一 ≥WARN 出口
+            logNoEligibleProject("getAutoMemBase", explicitProjectRoot);
             return null;
         }
         String canonical = findCanonicalGitRoot(projectRoot);
@@ -601,10 +659,8 @@ public final class AutoMemPaths {
         //   <memoryBase>/projects/C--Users-WIN--nexusai/memory 假目录 → 在此拦截返回 null
         //   （调用方跳过 auto 记忆分支；不写缓存 —— CHM 禁 null 值，null 不缓存）。
         if (!isEligibleProjectRoot(projectRoot)) {
-            if (log.isDebugEnabled()) {
-                log.debug("[AutoMemPaths] getAutoMemPath 无有效项目（null/blank/config-home），返回 null（per-project auto 记忆不存在）: rawRoot={}",
-                    explicitProjectRoot);
-            }
+            // [P1a F-06] 生产者侧静默点 2：原只有 debug（生产不可见）⇒ 提为统一 ≥WARN 出口
+            logNoEligibleProject("getAutoMemPath", explicitProjectRoot);
             return null;
         }
         String projectsDir = Paths.get(getMemoryBaseDir(), "projects").toString();

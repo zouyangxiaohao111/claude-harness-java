@@ -3,7 +3,6 @@ package com.nexusai.application.agent.mcp.config;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.settings.storage.FileConfigStorage;
 import java.nio.file.Path;
-import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -41,15 +40,8 @@ class McpConfigFileWriterTest {
 
     @BeforeEach
     void setUp() {
-        // projectMcpJsonPath 走 CwdResolution override（避免读到真实 user.dir）
-        CwdResolution.setCurrentOverride(tempDir.toString());
         storage = Mockito.mock(FileConfigStorage.class);
         writer = new McpConfigFileWriter(storage, null);
-    }
-
-    @AfterEach
-    void tearDown() {
-        CwdResolution.clearCurrentOverride();
     }
 
     // ── describeMcpConfigFilePath（utils.ts:254-271） ──
@@ -149,11 +141,18 @@ class McpConfigFileWriterTest {
     // ── projectMcpJsonPath（cwd 域入口） ──
 
     @Test
-    @DisplayName("projectMcpJsonPath → CwdResolution.getCwd()/.mcp.json")
-    void projectMcpJsonPath_usesCurrentCwd() {
-        // [批 3c] 无会话 → 显式 null（本用例靠 CwdResolution.setCurrentOverride(tempDir) 的
-        //   ThreadLocal 测试缝取 cwd，override 是 L1 层，先于任何会话解析命中，不涉会话）
+    @DisplayName("projectMcpJsonPath → getCwdForNonSession()/.mcp.json（无 override 通道）")
+    void projectMcpJsonPath_usesNonSessionCwd() {
+        // [批 3c] 无会话 → 显式命名出口 getCwdForNonSession()。
+        // [S2 F-07 2026-09-14] 原装置 = @TempDir + CwdResolution.setCurrentOverride(tempDir)
+        //   （override ThreadLocal 测试缝，L1 层先于任何会话解析命中）。该通道已按用户裁定 #8
+        //   **整条删除**，且本仓**无**任何「无会话 cwd 注入缝」剩余 ⇒ 断言只能锁「无会话出口的真值」。
+        //   鉴别力：若有人把 projectMcpJsonPath 改回「可注入」或改读会话层，本用例仍会红（值不符）。
+        String nonSessionCwd = CwdResolution.getCwdForNonSession();
         assertThat(writer.projectMcpJsonPath())
-            .isEqualTo(Path.of(CwdResolution.getCwd(null), ".mcp.json"));
+            .as("projectMcpJsonPath = getCwdForNonSession()/.mcp.json（无会话出口）")
+            .isEqualTo(Path.of(nonSessionCwd, ".mcp.json"))
+            .as("[S2 F-07 反向对照] 不得等于 @TempDir —— 证明 override 注入通道确实已删除")
+            .isNotEqualTo(Path.of(tempDir.toString(), ".mcp.json"));
     }
 }

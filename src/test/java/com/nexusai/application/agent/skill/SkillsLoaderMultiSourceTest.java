@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.skill;
 
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.CommandLoadedFrom;
 import com.nexusai.model.command.CommandSource;
@@ -263,5 +265,98 @@ class SkillsLoaderMultiSourceTest {
 
         List<Command> skills = loader.getSkillDirCommands(temp.resolve("proj").toString());
         assertThat(skills).isEmpty();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P1a F-04] 无会话 cwd：默认 cwdSupplier 不得回落进程 user.dir（裁定 (B)：跳过 + ≥WARN）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 未绑定会话（cwd 解析为 null）时，旧默认 {@code cwdSupplier = () -> System.getProperty("user.dir")}
+     * 会把<b>后端 JVM 启动目录</b>当会话项目根 ⇒ 该会话的技能列表静默混入后端自身仓库的项目级技能
+     * （A 项目会话看到 B 项目技能），且只有 DEBUG 可见（生产不可观测）。
+     *
+     * <p><b>鉴别力来源（夹具自检）</b>：本仓 {@code backend/.claude/skills} 真实存在项目级技能，
+     * 故同一个 loader 用<b>显式 user.dir</b> 调用时必须扫出 PROJECT_SETTINGS 源（正向对照）；
+     * cwd=null 时必须一个都没有。旧实现在 ② 处回落 user.dir ⇒ 该断言变红。
+     */
+    @Test
+    @DisplayName("[P1a F-04] 默认 cwdSupplier 不得回落进程 user.dir：cwd=null ⇒ 跳过 project/legacy 源 + ≥WARN")
+    void noCwd_defaultSupplier_neverFallsBackToProcessUserDir(@TempDir Path temp) throws Exception {
+        setupFiveSources(temp);
+        SkillsLoader loader = newLoader(temp.resolve("cfg"), temp.resolve("managed"), List.of());
+        String processCwd = System.getProperty("user.dir");
+
+        // ① 正向对照（夹具自检）：显式传 user.dir（= 本模块目录）→ 确实扫出 PROJECT_SETTINGS 源
+        List<Command> withProcessCwd = loader.getSkillDirCommands(processCwd);
+        assertThat(withProcessCwd).extracting(Command::getSource)
+            .as("夹具自检：显式 cwd=user.dir 必须能扫出 PROJECT_SETTINGS 源（否则本用例零鉴别力）")
+            .contains(CommandSource.PROJECT_SETTINGS);
+
+        // ② 主断言：cwd=null（未绑定会话）→ 默认 supplier 必须为 null，⛔ 不得回落 user.dir
+        ListAppender<ILoggingEvent> app = attachWarnCapture();
+        try {
+            List<Command> noCwd = loader.getSkillDirCommands(null);
+
+            assertThat(noCwd).extracting(Command::getSource)
+                .as("无会话 cwd 必须跳过 project/legacy（两者都是 PROJECT_SETTINGS 源）——"
+                    + "旧实现在此回落 user.dir，把后端自身的项目级技能混进该会话列表")
+                .doesNotContain(CommandSource.PROJECT_SETTINGS);
+            assertThat(noCwd).extracting(Command::getName)
+                .as("cwd 依赖源按名核对：project(proj-skill)/legacy(legacy-cmd) 均不得出现")
+                .doesNotContain("proj-skill", "legacy-cmd");
+            assertThat(noCwd).extracting(Command::getName)
+                .as("cwd 无关源继续加载（裁定 (B)：不抛、列表仍可用）")
+                .contains("user-skill", "managed-skill");
+            assertThat(app.list.stream().map(ILoggingEvent::getFormattedMessage))
+                .as("跳过必须 ≥WARN（规则十二：取不到会话态不得静默，禁只 DEBUG）")
+                .anyMatch(m -> m.contains("无会话 cwd"));
+        } finally {
+            detachWarnCapture(app);
+        }
+    }
+
+    /** 注入的 cwdSupplier 返回 null（生产 = SessionProjectRoot 未绑定）：同裁定 (B) 的跳过 + ≥WARN。 */
+    @Test
+    @DisplayName("[P1a F-04] 注入的 cwdSupplier 返回 null ⇒ 同款跳过 + ≥WARN（且 null 路径不 NPE）")
+    void noCwd_injectedNullSupplier_skipsCwdDependentSources(@TempDir Path temp) throws Exception {
+        setupFiveSources(temp);
+        SkillsLoader loader = newLoader(temp.resolve("cfg"), temp.resolve("managed"), List.of());
+        loader.setCwdSupplier(() -> null);
+
+        ListAppender<ILoggingEvent> app = attachWarnCapture();
+        try {
+            List<Command> noCwd = loader.getSkillDirCommands(null);
+
+            assertThat(noCwd).extracting(Command::getSource)
+                .as("注入 null cwdSupplier ⇒ 无 PROJECT_SETTINGS 源（旧实现在此处对 null cwd 直接派发，"
+                    + "会 NPE / 静默扫到进程 cwd）")
+                .doesNotContain(CommandSource.PROJECT_SETTINGS);
+            assertThat(noCwd).extracting(Command::getName)
+                .doesNotContain("proj-skill", "legacy-cmd")
+                .contains("user-skill");
+            assertThat(app.list.stream().map(ILoggingEvent::getFormattedMessage))
+                .as("≥WARN 必须留下可观测信号")
+                .anyMatch(m -> m.contains("无会话 cwd"));
+        } finally {
+            detachWarnCapture(app);
+        }
+    }
+
+    // ── logback 捕获 helpers（≥WARN 判据） ──
+
+    private static ListAppender<ILoggingEvent> attachWarnCapture() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SkillsLoader.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void detachWarnCapture(ListAppender<ILoggingEvent> appender) {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SkillsLoader.class);
+        logger.detachAppender(appender);
     }
 }

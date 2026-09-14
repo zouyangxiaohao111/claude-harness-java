@@ -252,6 +252,9 @@ class ClaudeCodeBackendAdapterTest {
         // WHY（规则九）: CC claudeCodeBackend.ts:220-234 isolation:'worktree' 时创建独立 git worktree，
         //   worktree 路径经 :311 override.worktreePath + runWithCwdOverride（:235-240）使并发 agent 各写各的
         //   cwd；不传路径 = 共享 cwd 并发写互踩（P1 Report D-1 未接线根因）。断言：建树被调 +
+        //   ⚠️ 源仓标注：上文 runWithCwdOverride（:235-240）是 **CC（claude-code-best
+        //   src/workflow/backends/claudeCodeBackend.ts）** 的方法，本仓同能力由 TUC.effectiveCwd 承接
+        //   （[S2 F-07] 本仓自有的 override ThreadLocal 通道已删）—— 两者同名不同域，勿混读。
         //   slug 命中清理正则 + 路径到达 executeStreaming。
         WorktreeService mockWorktreeService = mock(WorktreeService.class);
         ClaudeCodeBackendAdapter isolated = isolatedAdapter(mockWorktreeService);

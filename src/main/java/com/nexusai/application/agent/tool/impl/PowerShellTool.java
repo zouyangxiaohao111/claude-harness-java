@@ -831,6 +831,15 @@ public class PowerShellTool implements Tool {
                         log.debug("[PowerShellTool] 持久化降级（保留截断 stdout）: total={}", combinedTotal);
                     }
                 }
+            } catch (IllegalStateException ise) {
+                // [S2 · F-10 2026-09-14 · 用户裁定 #6 (B)] ⛔ 本 catch 覆盖了 :814 的
+                //   CwdResolution.getOriginalCwdLayer(ctx.sessionId()) 的 fail-loud
+                //   （UnresolvedProjectRootException extends IllegalStateException）。
+                //   原实现把它连同落盘异常一起降级成「保留截断 stdout」且**只 DEBUG** ⇒ 项目根解析
+                //   失败在 PowerShell 落盘路径上完全无痕。现改为冒泡（REST 边界译 400）。
+                log.error("[PowerShellTool] 项目根解析失败（fail-loud，⛔ 不降级吞掉）: sessionId={}",
+                    ctx != null ? ctx.sessionId() : null, ise);
+                throw ise;
             } catch (Exception pe) {
                 if (log.isDebugEnabled()) {
                     log.debug("[PowerShellTool] 持久化异常降级（保留截断 stdout）: {}", pe.toString());

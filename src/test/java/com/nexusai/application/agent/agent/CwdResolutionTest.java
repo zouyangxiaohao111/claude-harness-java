@@ -2,6 +2,7 @@ package com.nexusai.application.agent.agent;
 
 import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -20,46 +21,58 @@ import static org.assertj.core.api.Assertions.catchThrowable;
  * 顺序错误或某层异常抛出，则文件工具/git/权限相对路径会取错 cwd（跨项目污染 / cd 后用旧 cwd）。本测试
  * 锁定五场景分层正确 + 异常 safeGet 回落 + cd-in-worktree 合并存储语义（INV-2）。
  *
- * <p>场景对应 AC-1 五场景：
+ * <p>场景对应（[S2 · F-07 2026-09-14] 原「场景① override 非空 → override」已随 override 通道按用户
+ * 裁定 #8 删除而**整段移除** —— 该层不再存在，无替代可锚；方法名保留历史序号以对齐 git 历史）：
  * <ol>
- *   <li>override 非空 → override</li>
- *   <li>override 空 + sessionCwd 非空 → sessionCwd</li>
- *   <li>+ boundProject 非空 → boundProject（override/sessionCwd 均空时）</li>
- *   <li>全空 → user.dir</li>
+ *   <li>场景②：sessionCwd 非空 → sessionCwd</li>
+ *   <li>场景③：+ boundProject 非空 → boundProject（sessionCwd 空时）</li>
+ *   <li>场景④：DB 无此会话 ⇒ 无会话出口（[S2 F-09/F-20] 语义已按用户裁定变更）</li>
  *   <li><b>活跃 worktree 内 cd 后 getCwd 返回 cd 子目录</b>（合并存储，WorktreeCwdTracker 不作优先层，INV-2）</li>
  * </ol>
  */
-@DisplayName("[CC-CWD-01/02/04] CwdResolution 三层 getCwd + override + originalCwd 层")
+@DisplayName("[CC-CWD-01/02/04] CwdResolution 分层 getCwd + originalCwd 层")
 class CwdResolutionTest {
+
+    /**
+     * [fix-junit 2026-09-14] <b>本类自行拥有 static 回源槽，不依赖任何全局默认。</b>
+     *
+     * <p><b>WHY</b>：本类是「回源四态（bound / unbound / unknown / resolutionFailure）」的守护者，其中
+     * {@link #scenario4_unwiredResolverFailsLoudInsteadOfNonSessionExit} 断言的是<b>「未接线」这一态本身</b>
+     * ⇒ 绝不能让「环境恰好没装解析器」这种偶然来充当装置。
+     *
+     * <p><b>与全局默认的执行顺序</b>：JUnit 的 {@code BeforeEachCallback}（测试期全局默认
+     * {@code NoDatabaseSessionProjectRootExtension} 会装一个答 {@code unknown()} 的解析器）<b>先于</b>
+     * 本方法执行 ⇒ 本方法显式 {@code setDbResolver(null)} <b>覆盖</b>它，把本类置回「未接线」态。
+     * ⛔ 这不是「削弱全局默认」，而是把「本类要测的那一态」写成<b>显式、可读、不依赖环境</b>的装置
+     * （原注释「本类 @AfterEach 恒 setDbResolver(null) ⇒ 本用例运行在未接线态」只在「本类第一个用例」
+     * 成立，属顺序依赖；本方法消除该依赖）。
+     *
+     * <p>⚠️ 本类其余用例全部自行显式装置解析器（{@code setDbResolver}）或只用已绑定会话
+     * （{@code setForSession} ⇒ 冻结表命中，不回源）⇒ 本方法对它们无行为影响。
+     */
+    @BeforeEach
+    void ownResolverSlot_unwiredByDefault() {
+        SessionProjectRoot.setDbResolver(null);
+    }
 
     @AfterEach
     void cleanup() {
-        CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
         // 回源解析器是 static 注入口 → 用例必须自行注销，否则跨类污染（本类内用 try/finally 亦可）。
         SessionProjectRoot.setDbResolver(null);
     }
 
-    @Test
-    @DisplayName("场景①: override 非空 → 返回 override (对齐 CC cwdOverrideStorage.getStore ??)")
-    void scenario1_overrideWins(@TempDir Path overrideDir) throws Exception {
-        // WHY: CC pwd() 优先取 AsyncLocalStorage override（cwd.ts:19-21），并发 agent 各自隔离。
-        SessionCwdHolder.set("sess-a", "/some/session-cwd");
-        SessionProjectRoot.setForSession("sess-a", "/some/bound-project");
-
-        String result = CwdResolution.runWithCwdOverride(overrideDir.toString(),
-                () -> CwdResolution.getCwd("sess-a"));
-
-        assertThat(result)
-            .as("override 必须压过 sessionCwd / boundProject")
-            .isEqualTo(overrideDir.toRealPath().toString());
-    }
+    // [S2 · F-07 2026-09-14] 原「场景① override 非空 → 返回 override」（scenario1_overrideWins ×
+    //   CwdResolution.runWithCwdOverride）已**整段删除**：被测机制 = CwdResolution.CURRENT_OVERRIDE
+    //   （ThreadLocal + runWithCwdOverride/setCurrentOverride/clearCurrentOverride），已按用户裁定 #8
+    //   **整条删除**（生产 0 写入点 ⇒ 死管线；CC 的 cwdOverrideStorage 在本仓由 TUC.effectiveCwd 承接）。
+    //   ⛔ 这是「机制消失 ⇒ 无替代可锚」的删除，**不是**「用例被弱化」；不得用其它层伪造「override 仍生效」。
 
     @Test
-    @DisplayName("场景②: override 空 + sessionCwd 非空 → 返回 sessionCwd (对齐 CC STATE.cwd)")
+    @DisplayName("场景②: sessionCwd 非空 → 返回 sessionCwd (对齐 CC STATE.cwd；[S2 F-07] override 层已删)")
     void scenario2_sessionCwdWinsWhenNoOverride(@TempDir Path sessionDir) throws Exception {
-        // WHY: 无 override 时 pwd() 回 getCwdState()=STATE.cwd。worktree 入口与 cd 共用此层 [Fix-R1]。
+        // WHY: CC pwd() 回 getCwdState()=STATE.cwd。worktree 入口与 cd 共用此层 [Fix-R1]。
         SessionProjectRoot.setForSession("sess-a", "/some/bound-project");
         SessionCwdHolder.set("sess-a", sessionDir.toString());
 
@@ -71,7 +84,7 @@ class CwdResolutionTest {
     }
 
     @Test
-    @DisplayName("场景③: override+sessionCwd 均 空 + boundProject 非空 → 返回 boundProject (D-1: getForSession)")
+    @DisplayName("场景③: sessionCwd 空 + boundProject 非空 → 返回 boundProject (D-1: getForSession)")
     void scenario3_boundProjectWhenNoSessionCwd(@TempDir Path projectDir) throws Exception {
         // WHY: boundProject 层对齐 CC originalCwd（启动目录）。D-1 裁决：只读 getForSession，不读 resolve()
         // （resolve 回落 env/config home 属身份域，会使 user.dir 成死代码 + 身份域泄入工作目录域）。
@@ -84,16 +97,58 @@ class CwdResolutionTest {
             .isEqualTo(projectDir.toRealPath().toString());
     }
 
+    /**
+     * ⚠️⚠️ <b>[S2 · F-09/F-20 2026-09-14] 本用例<b>反转</b>批 4a 用户已裁定的场景④ —— 必须显式记录</b>。
+     *
+     * <p><b>反转的是哪条</b>：批 4a 裁定「<b>无解析器</b> / DB 无此会话 ⇒ 不抛，走无会话出口（进程
+     * user.dir）」。本批按用户裁定（F-09/F-20「新增解析失败态，仍 fail-loud」）把其中
+     * 「<b>解析器未接线</b>」这一半改为 <b>fail-loud</b>。
+     *
+     * <p><b>为什么推翻</b>：批 4a 把「未接线」与「DB 明确答无此会话」焊死成同一个 {@code unknown()}。
+     * 但「未接线」是<b>装配异常</b>（{@code setDbResolver} 未被调用 = 本该有却没有），把它当选票投给
+     * 「确无会话」的直接后果是：用户裁定 #7 的 fail-loud 会因装配异常而<b>全进程静默失效且零日志</b>
+     * （原实现连 DEBUG 都没有）。这正是 G2 组要治的失败模式，也是用户裁定「不许静默失效」的落点。
+     *
+     * <p><b>旧行为</b>：{@code getCwd("sess-not-in-db")} 返回进程 user.dir（realpath+NFC），不抛。
+     * <br><b>新行为</b>：抛 {@link IllegalStateException}，message 含 sessionId 且含「无法判定」
+     * （与「会话存在但未绑定」的文案<b>可辨识</b>，用户裁定 F-09 的「保留可辨识语义与纠错文案」）。
+     *
+     * <p><b>生产影响 = 零</b>：{@code ToolRegistrationConfig:1227} 已接线（{@code isDbResolverWired()}
+     * 见 {@link SessionProjectRoot}），故「未接线」分支在生产不可达 —— 只在纯 JUnit / 装配故障时暴露。
+     *
+     * <p><b>正向对照</b>：本用例下半段接线后断言同一 id 仍走「确无会话」出口 ⇒ 证明红的是
+     * 「未接线」这一特定态，不是「解析整体坏了」。⛔ 「DB 明确答无此会话」（{@code Lookup.unknown()}）
+     * 仍<b>不抛</b>，批 4a 该半条裁定不变（见 {@link #noSessionSentinel_goesToNamedNonSessionExit}）。
+     */
     @Test
-    @DisplayName("场景④ [批 4a] DB 无此会话（无解析器/合成 id）→ 按无会话出口解析（进程 user.dir），不抛")
-    void scenario4_unknownSessionGoesToNonSessionExit() throws Exception {
-        // WHY（规则九 · 批 4a 实测）：合成 sessionId 的生产路径多且合法（MCP 入站 / standalone
-        //   fork / subagent / 文档更新器现造 id）⇒ 「DB 无此会话」属「确无会话」，走命名出口；
-        //   ⛔ 不得 fail-loud（那会打死合成 id 的合法路径：实测 5 处生产点 + 100+ 测试类）。
-        //   RED: 把 unknown 分支也改成抛 ⇒ 本用例红。
-        assertThat(CwdResolution.getCwd("sess-not-in-db"))
-            .as("DB 无此会话 ⇒ 无会话出口（进程 user.dir）")
-            .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
+    @DisplayName("场景④ [S2 F-09/F-20 反转批 4a 的一侧] 解析器未接线 ⇒ 按「解析失败」fail-loud（不再当「确无会话」）")
+    void scenario4_unwiredResolverFailsLoudInsteadOfNonSessionExit() throws Exception {
+        // 前置：本类的 @BeforeEach（ownResolverSlot_unwiredByDefault）显式清空回源槽 ⇒ 本用例运行在
+        //   「未接线」态。⛔ 该断言同时是「全局默认扩展的执行顺序」的实测装置：全局默认的
+        //   BeforeEachCallback 先装、本类的 @BeforeEach 后清；若顺序反过来，此处立刻变红。
+        assertThat(SessionProjectRoot.isDbResolverWired())
+            .as("前置装置：本用例必须运行在「回源解析器未接线」态，否则测的不是本态")
+            .isFalse();
+
+        assertThatThrownBy(() -> CwdResolution.getCwd("sess-not-in-db"))
+            .as("解析器未接线 = 无法判定 ⇒ 必须 fail-loud（⛔ 不得回落进程 user.dir 冒充项目根）")
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("sess-not-in-db")
+            .hasMessageContaining("无法判定");
+        assertThatThrownBy(() -> CwdResolution.getOriginalCwdLayer("sess-not-in-db"))
+            .as("getOriginalCwdLayer 同判据（同一 fail-loud 出口）")
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("无法判定");
+
+        // 正向对照：接线后，同一个 id 走「确无会话」命名出口（批 4a 该半条裁定保持不变）
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        try {
+            assertThat(CwdResolution.getCwd("sess-not-in-db"))
+                .as("接线 + DB 明确答「无此会话」⇒ 无会话出口（进程 user.dir），仍不抛")
+                .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
     }
 
     @Test
@@ -119,19 +174,16 @@ class CwdResolutionTest {
     }
 
     @Test
-    @DisplayName("[批 4a #13] 无会话出口 = override ?? 进程 user.dir（只对确无会话开放）")
-    void nonSessionExit_resolvesOverrideThenProcessUserDir(@TempDir Path projectDir, @TempDir Path overrideDir)
-            throws Exception {
+    @DisplayName("[批 4a #13] 无会话出口 = 进程 user.dir（只对确无会话开放；[S2 F-07] override 层已删）")
+    void nonSessionExit_resolvesProcessUserDir(@TempDir Path projectDir) throws Exception {
         // WHY（规则九 · 用户裁定 #13）：无会话路径必须<b>命名自解释</b>且只对「确无会话」开放；
         //   它不得偷看会话层，否则「确无会话」与「漏传 sessionId」再次混为一谈。
+        // [S2 · F-07 2026-09-14] 原装置还断言「无会话出口仍认显式 override 层」
+        //   （runWithCwdOverride + cwdOverrideStorage 对齐）。override 通道已按用户裁定 #8 整条删除
+        //   ⇒ 该断言**整段删除**（机制消失，无替代可锚），出口现恒等于 normalizeCwd(进程 user.dir)。
         String expected = Path.of(System.getProperty("user.dir")).toRealPath().toString();
         assertThat(CwdResolution.getCwdForNonSession()).isEqualTo(expected);
         assertThat(CwdResolution.getOriginalCwdLayerForNonSession()).isEqualTo(expected);
-
-        // override 层仍生效（与旧 getCwd(null) 逐字节同行为）
-        assertThat(CwdResolution.runWithCwdOverride(overrideDir.toString(), CwdResolution::getCwdForNonSession))
-            .as("无会话出口仍认显式 override 层（对齐 CC cwdOverrideStorage）")
-            .isEqualTo(overrideDir.toRealPath().toString());
 
         // 反向锚：已绑定会话存在时，无会话出口仍返回 user.dir（不串会话层）
         SessionProjectRoot.setForSession("sess-a", projectDir.toString());
@@ -327,6 +379,71 @@ class CwdResolutionTest {
         assertThat(CwdResolution.getCwd("   ")).isEqualTo(expected);
         assertThat(CwdResolution.getOriginalCwdLayer(null)).isEqualTo(expected);
         assertThat(CwdResolution.getOriginalCwdLayer("   ")).isEqualTo(expected);
+    }
+
+    /**
+     * [S2 · F-09 验证 #1/#3] 回源 DB <b>炸了</b> ⇒ 第 4 态「解析失败」⇒ cwd 域 fail-loud（⛔ 不回落 user.dir）。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：dbResolver 抛错 = 解析本身失败，与「DB 明确答无此会话」是两件事。
+     * 原实现把两者焊死（catch → unknown → 走无会话出口返回进程 user.dir）⇒ 用户裁定 #7 的 fail-loud
+     * 被整体旁路，且**零日志**（catch 里连 WARN 都没有）。
+     *
+     * <p><b>RED（反向实验 · 有鉴别力）</b>：把 {@code refillFromDb} 的 catch 分支改回
+     * {@code return Lookup.unknown()} ⇒ 本用例红（getCwd 会返回 user.dir 而不是抛）。
+     *
+     * <p><b>正反对照（同一用例两臂）</b>：同一时刻把解析器换成「答无此会话」⇒ 同一 id 走无会话出口
+     * 且不抛 —— 证明红的是「DB 抛错」这一态，不是「解析整体坏了」。
+     */
+    @Test
+    @DisplayName("[S2 F-09] 回源 DB 抛错 ⇒ 解析失败态 ⇒ getCwd 抛（⛔ 不回落 user.dir）")
+    void dbResolverThrowing_failsLoudInsteadOfUserDir() throws Exception {
+        SessionProjectRoot.setDbResolver(sid -> {
+            throw new RuntimeException("db down");
+        });
+        try {
+            assertThatThrownBy(() -> CwdResolution.getCwd("sess-db-down"))
+                .as("DB 回源抛错 = 无法判定 ⇒ 必须 fail-loud（原实现静默返回进程 user.dir）")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sess-db-down")
+                .hasMessageContaining("无法判定");
+            assertThatThrownBy(() -> CwdResolution.getOriginalCwdLayer("sess-db-down"))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("无法判定");
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+
+        // 正向对照：同一 id，DB 明确答「无此会话」⇒ 无会话出口，仍不抛
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        try {
+            assertThat(CwdResolution.getCwd("sess-db-down"))
+                .as("接线正常且 DB 答无此会话 ⇒ 无会话出口（进程 user.dir），不抛")
+                .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [S2 · F-09 验证 #2 · 反向实验] 两处 catch 必须**同时**变异才应全红（依铁律「冗余守卫多点变异」）：
+     * 本用例只守「CwdResolution 侧收窄后的 safeLookup」这一半，{@code refillFromDb} 那一半由
+     * {@link #dbResolverThrowing_failsLoudInsteadOfUserDir} 守 —— 两半独立、各自可分辨。
+     *
+     * <p>装置：把 {@code SessionProjectRoot.lookup} 换成会抛的桩（直接覆盖 static 槽不可能），故本用例
+     * 改为断言「解析器自身返回第 4 态」也被 cwd 域同样处理（不因「解析器自己说失败」而降级成 unknown）。
+     */
+    @Test
+    @DisplayName("[S2 F-09] 解析器自行判定「解析失败」⇒ cwd 域同样 fail-loud（不降级成 unknown）")
+    void resolverSelfReportedFailure_failsLoud() {
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.resolutionFailure());
+        try {
+            assertThatThrownBy(() -> CwdResolution.getCwd("sess-self-failed"))
+                .as("解析器自报「无法判定」⇒ 必须原样上浮到 cwd 域 fail-loud")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("无法判定");
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
     }
 
     /**

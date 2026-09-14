@@ -143,12 +143,12 @@ public class AutoCompactor {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 递归守卫 querySource · CC original: querySource（autoCompact.ts:163，QuerySource 字符串联合）。
+     * 递归守卫 querySource（<b>便捷路径</b>来源）· CC original: querySource（autoCompact.ts:163，
+     * QuerySource 字符串联合）。
      *
      * <p>CC 值域（query.ts:189 + 1568-1578）含 'session_memory'/'compact'/'marble_origami'。
      * Java 端以 {@link com.nexusai.application.agent.QuerySource} 枚举 name 形式传入
-     * （LlmAgentLoop {@code params.querySource()}）；本字段保存当前调用来源，默认
-     * 'user'（主线程）。守卫判定（INV-6）：
+     * （LlmAgentLoop {@code params.querySource()}）。守卫判定（INV-6）：
      * <pre>
      *   querySource ∈ {session_memory, compact} → false（autoCompact.ts:171-173）
      *   CONTEXT_COLLAPSE 启用 && querySource === 'marble_origami' → false（autoCompact.ts:179-183）
@@ -157,6 +157,13 @@ public class AutoCompactor {
      * <p><b>[E-1a fork 屏蔽档]</b>：第一条豁免值域扩到
      * {@link com.nexusai.application.agent.QuerySource#isBackgroundForkSource}
      * （+ extract_memories / auto_dream）—— 后两者今天不走主循环（E-1b 才收敛），现网行为零变化。
+     *
+     * <p><b>[P1a F-08 · 单例可变会话字段]</b>本字段<b>只服务便捷重载</b>
+     * （{@link #tryAutoCompact(List, int)} → {@link #buildDefaultCompactConversationContext}）；
+     * 生产路径（LlmAgentLoop → {@link #autoCompactIfNeeded(List, int, String, CompactConversationContext, AutoCompactTrackingState)}）
+     * 的 querySource 已在调用内归一为局部变量 {@code effQuerySource}，<b>不再写回本字段</b>
+     * （旧实现在该处 {@code this.querySource = …}，是单例实例字段承载调用级会话态 ⇒
+     * A 会话的调用会把 querySource 留在字段上供 B 会话的回落路径误读）。默认 'user'（主线程）。
      */
     private String querySource = "user";
 
@@ -219,12 +226,25 @@ public class AutoCompactor {
     private String agentId;
 
     /**
-     * SM 成功链 runPostCompactCleanup · CC original: runPostCompactCleanup(querySource)（autoCompact.ts:297/326）。
-     * 默认 {@link PostCompactCleanup#runPostCompactCleanup(String)}（IMP-19 固定序列入口），
-     * 透传本压缩器的 querySource（main-thread gate · postCompactCleanup.ts:36-39）。
+     * SM 成功链 runPostCompactCleanup 执行器 · CC original: runPostCompactCleanup(querySource)
+     * （claude-code-best/src/services/compact/autoCompact.ts:326/:355；Open-ClaudeCode 同文件 :297/:326）。
+     *
+     * <p><b>[P1a F-08 · 单例可变会话字段修复]</b> 类型 {@code BiConsumer<String,String>} =
+     * {@code (querySource, sessionId)} —— 两参由<b>调用点显式传入</b>（对齐 CC 的「函数 + 实参」
+     * 形态：CC 的 session 维度不存在，Java 端第 2 参是本仓 per-session section 缓存所需的会话标识）。
+     *
+     * <p><b>旧实现为何错</b>：原为 {@code Runnable}，默认实现是捕获 {@code this} 的 lambda
+     * （{@code () -> PostCompactCleanup.runPostCompactCleanup(this.querySource, this.sessionId)}），
+     * 而 {@code sessionId} 字段在<b>生产零写入点</b>（无 setter 调用）⇒ 恒传 null ⇒
+     * {@link PostCompactCleanup#clearActiveSessionSystemPromptSections(String)} 的「调用方未传会话标识」
+     * WARN 分支恒命中 ⇒ 第 4 项 clearSystemPromptSections 与第 1 项 resetMicrocompactState 的
+     * <b>per-session 效果双失</b>（会话 section 缓存永不失效 + 本会话 microcompact 桶永不复位）。
+     * 默认值改为<b>方法引用</b>（不含 {@code this.*}），配合调用点显式传参 ⇒ 结构上不可能再读到
+     * 单例字段。CC 侧无此维度（{@code clearSystemPromptSections()} 无参、数据源是进程级 STATE，
+     * claude-code-best/src/constants/systemPromptSections.ts:1-6 import 自 bootstrap/state.js）。
      */
-    private Runnable runPostCompactCleanup =
-        () -> PostCompactCleanup.runPostCompactCleanup(this.querySource, this.sessionId);
+    private BiConsumer<String, String> postCompactCleanup =
+        PostCompactCleanup::runPostCompactCleanup;
 
     /**
      * SM 成功链 notifyCompaction · CC original: notifyCompaction(querySource ?? 'compact', agentId)
@@ -273,7 +293,7 @@ public class AutoCompactor {
     /**
      * [RV-E-01 GAP-03 兜底] 会话工具使用上下文 · CC original: {@code context}
      * （compact.ts:285）。auto 路径 ccContext==null 回落
-     * {@link #buildDefaultCompactConversationContext(String)} 时，经 {@link #prepareAutoContext}
+     * {@link #buildDefaultCompactConversationContext(String, String)} 时，经 {@link #prepareAutoContext}
      * 把本字段接线进 ctx.toolUseContext，使 isInPlanMode() 读真实 plan mode →
      * populatePlanModeAttachment 生产可达（与 buildAutoContext 主路径对称）。
      */
@@ -442,11 +462,19 @@ public class AutoCompactor {
         this.agentId = agentId;
     }
 
-    /** 注入 SM 成功链 runPostCompactCleanup 执行器。 */
-    public void setRunPostCompactCleanup(Runnable runPostCompactCleanup) {
-        this.runPostCompactCleanup = runPostCompactCleanup != null
-            ? runPostCompactCleanup
-            : () -> PostCompactCleanup.runPostCompactCleanup(this.querySource, this.sessionId);
+    /**
+     * 注入 SM 成功链 runPostCompactCleanup 执行器（显式两参：querySource + 会话标识）。
+     *
+     * <p>[P1a F-08] 旧签名为 {@code Runnable}，且 null 回落分支把「读 this.* 的闭包」原地重建
+     * （等于把缺陷重造一遍）；现为 {@code BiConsumer<String,String>}，null → 回落方法引用
+     * {@link PostCompactCleanup#runPostCompactCleanup(String, String)}（无 {@code this.*}）。
+     *
+     * @param postCompactCleanup 执行器（null → 回落 {@code PostCompactCleanup::runPostCompactCleanup}）
+     */
+    public void setPostCompactCleanup(BiConsumer<String, String> postCompactCleanup) {
+        this.postCompactCleanup = postCompactCleanup != null
+            ? postCompactCleanup
+            : PostCompactCleanup::runPostCompactCleanup;
     }
 
     /** 注入 SM 成功链 notifyCompaction 执行器。 */
@@ -796,7 +824,11 @@ public class AutoCompactor {
         if (messages == null || messages.isEmpty()) {
             return new AutoCompactResult(false, messages, null, 0, null, null);
         }
-        this.querySource = querySource != null ? querySource : "user";
+        // [P1a F-08 · 单例可变会话字段] querySource = 调用内局部变量（对齐 CC autoCompact.ts:163
+        //   的形参 querySource），绝不写回实例字段（旧实现 `this.querySource = …` 会把 A 会话的
+        //   调用来源留在单例上，B 会话的回落路径/清理门读到别人的来源）。归一语义与旧写点逐字
+        //   一致：null → "user"，空串原样保留（守卫对空串的行为继承旧语义，零漂移）。
+        String effQuerySource = querySource != null ? querySource : "user";
         // [P2-7 · 2026-09-11] model = 调用内局部变量（对齐 CC autoCompact.ts:267
         //   `const model = toolUseContext.options.mainLoopModel`）——绝不写入实例状态。
         //   旧实现写 this.model 且 ccContext.getModel()==null 时不覆写 → 保留上一会话的 model
@@ -859,7 +891,10 @@ public class AutoCompactor {
             // [sm-cursor-sessionize P0-2] 只清本会话游标（旧 static volatile 语义会跨会话清空，
             // A 压缩成功 → B 的 lastSummarizedMessageId 被清 → B 的 SM 提取时机错乱）。
             SessionMemoryService.setLastSummarizedMessageId(effSessionId, null);
-            runPostCompactCleanup.run();
+            // [P1a F-08] 显式两参传参（querySource + 会话标识）—— 旧 `runPostCompactCleanup.run()`
+            //   读默认闭包的 this.querySource/this.sessionId ⇒ 生产 sessionId 字段恒 null（零 setter
+            //   调用）⇒ clearSystemPromptSections 与 resetMicrocompactState 的 per-session 效果双失。
+            postCompactCleanup.accept(effQuerySource, effSessionId);
             // [SM-07] notifyCompaction 按 PROMPT_CACHE_BREAK_DETECTION 门控（DRIFT-9）·
             //   CC autoCompact.ts:302-304 `if (feature('PROMPT_CACHE_BREAK_DETECTION'))`
             //   —— feature 关闭时不动 cache-read 基线（旧实现无条件调用）。
@@ -893,7 +928,7 @@ public class AutoCompactor {
         try {
             // ── 5. [GR-1] CC 单函数 compactConversation（autoCompact.ts:313-321，消除双轨）──
             CompactConversationContext ctx = ccContext != null ? ccContext
-                : buildDefaultCompactConversationContext(model);
+                : buildDefaultCompactConversationContext(model, effQuerySource);
             prepareAutoContext(ctx);
             // [IMP2-03] auto 路径附件生产接线（✗-1..✗-4，INV-15）：async-agent/plan/plan_mode
             // 经 populatePostCompactAttachments 填充 ctx（数据源 taskFrameworkService/planProvider
@@ -924,7 +959,8 @@ public class AutoCompactor {
             // ── 6. legacy 成功链（autoCompact.ts:325-326，GR-2 补全）──
             // [sm-cursor-sessionize P0-2] 只清本会话游标（旧 static volatile 语义跨会话清空）
             SessionMemoryService.setLastSummarizedMessageId(effSessionId, null);
-            runPostCompactCleanup.run();
+            // [P1a F-08] 显式两参传参（querySource + 会话标识），同 SM 链（见上方说明）。
+            postCompactCleanup.accept(effQuerySource, effSessionId);
             // [IMP2-07] recordSuccess 内轮换 turnId + 归零 turnCounter + 复位熔断
             //   （CC query.ts:521-526 tracking 全量复位；DRIFT-4/S-6）
             tracking.recordSuccess();
@@ -1046,13 +1082,25 @@ public class AutoCompactor {
      * <p><b>[IMP-CM-12]</b> f4 全量路径 notifyCompaction 不再 no-op —— 经
      * {@link #wireAutoNotifyCompaction} 按 PROMPT_CACHE_BREAK_DETECTION 门控真实接线
      * （CC compact.ts:698-699；门控关闭 → no-op 等价）。
+     *
+     * <p><b>[P1a F-08]</b> {@code querySource} 由调用方显式传入（对齐同文件 {@code model} 的
+     * 显式入参手法 · P2-7）：旧实现读实例字段 {@code this.querySource}（由 autoCompactIfNeeded
+     * 写回，单例多会话串台）。便捷重载 {@link #tryAutoCompact(List, int)} 仍传字段值作为回落
+     * （见 {@link #querySource} 字段注释）。
+     *
+     * <p><b>会话字段（S-route 残差）</b>：{@code sessionId}/{@code agentId} 仍回落实例字段
+     * （S 路线保留 · 测试 seam 依赖）；本方法仅便捷路径可达，生产路径恒有 ccContext
+     * （LlmAgentLoop:5713 传 {@code buildAutoContext} 构建的上下文）⇒ 该回落不参与生产。
+     *
+     * @param model       有效模型名（null → 默认窗口）
+     * @param querySource 本调用的查询来源（调用内已归一，非 null）
      */
-    CompactConversationContext buildDefaultCompactConversationContext(String model) {
+    CompactConversationContext buildDefaultCompactConversationContext(String model, String querySource) {
         CompactConversationContext ctx = new CompactConversationContext()
             .setSessionId(this.sessionId)
             .setAgentId(this.agentId)
             .setModel(model)
-            .setQuerySource(this.querySource)
+            .setQuerySource(querySource)
             .setReadFileState(new LinkedHashMap<>());
         wireAutoNotifyCompaction(ctx);
         // [RV-E-01 GAP-03 兜底] ccContext==null 回落路径接线 plan mode 读侧（对齐 CC compact.ts:285

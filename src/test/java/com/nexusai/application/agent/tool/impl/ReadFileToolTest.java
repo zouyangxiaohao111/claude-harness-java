@@ -27,6 +27,7 @@ import com.nexusai.repository.provider.entity.ModelRecord;
 import com.nexusai.repository.provider.entity.ProviderRecord;
 import com.nexusai.repository.provider.mapper.ModelMapper;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -68,6 +69,21 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("Session L · ReadFileTool 对齐 CC FileReadTool.ts 契约")
 class ReadFileToolTest {
+
+    // ── [S2 · F-09/F-20/F-10 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution / PathGuard
+    //   fail-loud 抛（F-10 起 PathGuard 消费侧也不再吞）。见 SessionProjectRootTestSupport 类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     private static final ObjectMapper JSON = new ObjectMapper();
 

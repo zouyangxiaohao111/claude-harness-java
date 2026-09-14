@@ -268,7 +268,16 @@ class AutoCompactorCcContractTest {
 
         AtomicInteger cleanupCalls = new AtomicInteger();
         List<String> notifyCalls = new ArrayList<>();
-        auto.setRunPostCompactCleanup(cleanupCalls::incrementAndGet);
+        // [P1a F-08] seam 改显式两参（querySource, sessionId）—— 原 Runnable 形态已删。
+        //   捕获两参：证明成功链确实把 effQuerySource/effSessionId 显式传给清理器
+        //   （旧实现是读 this.* 的闭包 ⇒ 本断言在旧实现下 sid 恒 null）。
+        java.util.concurrent.atomic.AtomicReference<String> cleanupQs = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<String> cleanupSid = new java.util.concurrent.atomic.AtomicReference<>("__unset__");
+        auto.setPostCompactCleanup((qs, sid) -> {
+            cleanupCalls.incrementAndGet();
+            cleanupQs.set(qs);
+            cleanupSid.set(sid);
+        });
         auto.setNotifyCompaction((qs, aid) -> notifyCalls.add(qs + ":" + aid));
         // [SM-07] PROMPT_CACHE_BREAK_DETECTION 门控开启 → notifyCompaction 可达（CC feature on 语义）
         auto.setPromptCacheBreakDetectionGate(() -> true);
@@ -280,6 +289,11 @@ class AutoCompactorCcContractTest {
         assertThat(result.source()).isEqualTo("SESSION_MEMORY");
         // 成功链: runPostCompactCleanup + notifyCompaction + markPostCompaction（INV-8）
         assertThat(cleanupCalls.get()).isEqualTo(1);
+        assertThat(cleanupQs.get())
+            .as("清理器必须收到本调用的 querySource（便捷路径 = 字段归一值 'user'）").isEqualTo("user");
+        assertThat(cleanupSid.get())
+            .as("清理器必须收到会话标识（setSessionId('s1') → effSessionId），旧实现此处恒 null")
+            .isEqualTo("s1");
         assertThat(notifyCalls).contains("user:agent-1");
         // setSessionId("s1") 非 UUID → 方案 1b 走回落进程级单布尔；本断言验证 INV-8
         // markPostCompaction 确被调用（mark 成功链），会话级隔离语义由 PostCompactionStateTest 覆盖。
@@ -554,7 +568,8 @@ class AutoCompactorCcContractTest {
     void l4LegacySuccessChain() {
         AtomicInteger cleanupCalls = new AtomicInteger();
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000, (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>llm fallback</summary>", null));
-        auto.setRunPostCompactCleanup(cleanupCalls::incrementAndGet);
+        // [P1a F-08] seam 改显式两参（querySource, sessionId）—— 原 Runnable 形态已删
+        auto.setPostCompactCleanup((qs, sid) -> cleanupCalls.incrementAndGet());
         // 预置旧 lastSummarizedMessageId → L4 成功后应复位（autoCompact.ts:325 注释：legacy compaction
         // 替换全部消息，旧 message UUID 在新 messages 数组中已不存在）
         SessionMemoryService.setLastSummarizedMessageId(null, "old-msg-id");

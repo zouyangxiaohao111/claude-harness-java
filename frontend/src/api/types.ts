@@ -383,7 +383,7 @@ export interface AppSettings {
   contextCollapseEnabled?: boolean | null
   /** 历史裁剪开关（对齐 CC historySnipEnabled · 长对话 Snip 历史窗口） */
   historySnipEnabled?: boolean | null
-  /** snip 提示消息数阈值，null=窗口自适应（effectiveWindow ≥800k→900 / >600k→600 / ≥400k→360 / <400k→180，snip-nudge-scaleup 2026-09-09 再 ×2） */
+  /** snip 提示「上下文剩余百分比」阈值（有效域 1..100），null = 用后端默认 30。判据口径 = ContextUsageCalculator.snapshot（窗口取 DB models.max_context_tokens，已用取真实 API usage） */
   snipNudgeThreshold?: number | null
   /** 会话记忆开关（对齐 CC smSessionMemoryEnabled · Session Memory 服务） */
   smSessionMemoryEnabled?: boolean | null
@@ -632,7 +632,8 @@ export interface CreateTeamRequest {
   agentType?: string
   sessionId?: string
 }
-export interface SessionCreateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string }
+/** 会话创建请求 · mainProjectId 必填（后端 @NotBlank）：空串/null 一律 400，不产生「未绑定会话」 */
+export interface SessionCreateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId: string }
 /** 会话更新（PATCH /sessions/{id} · null=不改动，mainThreadAgent 空串=清除） */
 export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null }
 /** GET /agents/list?sessionId={sid} 单条（后端 AgentListDto · agentType 专家列表） */

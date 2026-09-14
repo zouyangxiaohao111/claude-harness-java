@@ -137,18 +137,41 @@ public class SkillsLoader {
     private Supplier<List<String>> additionalDirectoriesSupplier = List::of;
 
     /**
-     * 当前工作目录供应 · <b>进程级兜底</b>（JVM 启动目录）。
-     * {@link #getSkillDirCommands(String)} 的 cwd 入参为空时回退本供应。
+     * 当前工作目录供应 · {@link #getSkillDirCommands(String)} 的 cwd 入参为空时回退本供应。
      *
-     * <p>[批 3c · 2026-09-13] 原兜底读<b>裸 MDC</b>会话槽
-     * （{@code CwdResolution.getCwd(裸 MDC 会话槽)}）—— 该读点随批 3c 删除。
-     * WHY 直接回落 {@code user.dir} 而不引入新的会话来源：对齐 CC
-     * {@code getSkillDirCommands(cwd)}（loadSkillsDir.ts:638-642）—— <b>cwd 由调用方显式传入</b>，
-     * 本供应只在该入参为空时兜底，属「本就不需要会话」分支。会话 cwd 现由
-     * {@link SkillRegistry#resolveSessionCwd(String)} 按显式 sessionId 解析后传入。
-     * 行为等价：旧路径在无会话时 {@code CwdResolution.getCwd(null)} 亦恒回落 {@code user.dir}。
+     * <p><b>[P1a F-04 · 未绑定会话静默扫到进程 user.dir 修复]</b>
+     * 本供应<b>默认返回 null</b>（原为 {@code () -> System.getProperty("user.dir", ".")}），
+     * 且 {@link #getSkillDirCommands(String)} 在取到 null/空白 cwd 时：<b>跳过 cwd 依赖源</b>
+     * （project up-to-home / legacy）+ <b>≥WARN</b>，cwd 无关源（managed/user/additional）继续加载。
+     *
+     * <p><b>旧实现的缺陷</b>：生产链 {@code SkillRegistry.loadAllCommands} → 未绑定会话 →
+     * {@code SessionProjectRoot.getForSession(sid)==null}（ToolRegistrationConfig:549-550）→ 传入的 cwd
+     * 为 null → 回落到本供应 = <b>后端 JVM 启动目录</b> ⇒ 该会话的技能列表<b>静默混入后端自身项目
+     * 的 .nexusai/skills / .claude/skills</b>（A 项目会话看到 B 项目的项目级技能），且只有 DEBUG 可见。
+     *
+     * <p><b>为何不是「本就不需要会话」的分支（推翻旧注释的论证）</b>：旧注释称「CC 的
+     * {@code getSkillDirCommands(cwd)} cwd 由调用方显式传入 ⇒ 本供应只是空值兜底」。核对 CC 真源
+     * （<b>逐条标注源仓</b>）：
+     * <ul>
+     *   <li>{@code getSkillDirCommands} 的 cwd 是必填 {@code string}，无 null 分支
+     *       —— claude-code-best/src/skills/loadSkillsDir.ts:638-639
+     *       {@code export const getSkillDirCommands = memoize(async (cwd: string): Promise<Command[]>}；</li>
+     *   <li>CC 的 cwd = 进程级<b>冻结</b>的 projectRoot：Open-ClaudeCode/src/tools/SkillTool/SkillTool.ts:91-92
+     *       {@code getCommands(getProjectRoot())}（该文件 <b>仅存在于 Open-ClaudeCode</b>，claude-code-best
+     *       无此路径）+ Open-ClaudeCode/src/setup.ts:322（best 同语句在 setup.ts:327）
+     *       {@code void getCommands(getProjectRoot())}；</li>
+     *   <li>projectRoot 恒非空、进程单例：claude-code-best/src/bootstrap/state.ts:505-507
+     *       {@code export function getProjectRoot(): string { return STATE.projectRoot }}。</li>
+     * </ul>
+     * ⇒ CC 单进程单会话 + projectRoot 恒非空，<b>结构上不存在「cwd 取不到」这一态</b>，本仓该态必须自造表达。
+     * <p>⛔ <b>不得</b>引 CC 的 print 模式作「CC 也回落进程 cwd」的依据：Open-ClaudeCode/src/cli/print.ts:132
+     * {@code import { cwd } from 'process'} + :1770 {@code await getCommands(cwd())}（claude-code-best 同文件
+     * 在 :131 / :1802/:1859/:3301）—— 那是 Node 的 {@code process.cwd()}，与 CC 冻结的 projectRoot
+     * 不是同一个东西，且「用进程 cwd 冒充会话项目根」正是本项要治的串会话缺陷。
+     * <p>本仓一 JVM 多会话 ⇒ cwd 必须按 sessionId 现算，且会算不出来（unbound）。
+     * 会话 cwd 由 {@link SkillRegistry#resolveSessionCwd(String)} 按显式 sessionId 解析后传入。
      */
-    private Supplier<String> cwdSupplier = () -> System.getProperty("user.dir", ".");
+    private Supplier<String> cwdSupplier = () -> null;
 
     /**
      * bare 模式判定（可注入）· CC original: {@code isBareMode()}（envUtils.ts:60-65）
@@ -370,18 +393,28 @@ public class SkillsLoader {
      * <p><b>条件分离</b>（:771-790）：paths 非空且未激活 → {@link DynamicSkillsManager#registerConditional}，
      * 不随返回值暴露；manager 为 null（POJO）→ 全量返回（不分离）。
      *
-     * @param cwd 当前工作目录（project-up-to-home 遍历基准；空 → 回退 {@link #cwdSupplier}）
+     * @param cwd 当前工作目录（project-up-to-home 遍历基准；空 → 回退 {@link #cwdSupplier}；
+     *            两者皆空 ⇒ 无会话 cwd：<b>跳过 project/legacy 两源 + ≥WARN</b>（[P1a F-04] 裁定 (B)），
+     *            managed/user/additional 继续加载）
      * @return 无条件技能列表（不含条件技能 / 非 prompt）
      */
     public List<Command> getSkillDirCommands(String cwd) {
         String effectiveCwd = (cwd == null || cwd.isBlank()) ? cwdSupplier.get() : cwd;
+        // [P1a F-04] 无会话 cwd（未绑定会话）⇒ 显式跳过 cwd 依赖源 + ≥WARN。
+        //   ⛔ 绝不回落进程 user.dir（旧实现默认 cwdSupplier 即 user.dir ⇒ 静默把后端自身项目的
+        //   项目级技能混进该会话列表；生产链见 ToolRegistrationConfig:549-550 未绑定 → null）。
+        //   裁定 (B)：不抛（技能列表端点仍可用，返回 user/managed/additional 源）；
+        //   cwd 无关源不受影响，cwd 依赖源（project up-to-home / legacy commands）置空。
+        boolean hasSessionCwd = effectiveCwd != null && !effectiveCwd.isBlank();
         // T3: 内容读兼容（nexusai 复刻版 .claude 改造）—— 用户技能源拆两层：
         //   nexusai 自有根（~/.{appName}/skills，NexusaiPaths）优先 + claude（~/.claude/skills）回落。
         //   nexusai 在前加载（source=USER），同 name 时由 name 去重层保证 nexusai 赢（见 dedupByName）。
         String nexusaiUserSkillsDir = Paths.get(NexusaiPaths.getAppConfigHomeDir(), "skills").toString();
         String claudeUserSkillsDir = Paths.get(ClaudePaths.getClaudeConfigHomeDir(), "skills").toString();
         String managedSkillsDir = Paths.get(ClaudePaths.getManagedFilePath(), ".claude", "skills").toString();
-        List<String> projectSkillsDirs = MarkdownConfigLoader.getProjectDirsUpToHome("skills", effectiveCwd);
+        List<String> projectSkillsDirs = hasSessionCwd
+            ? MarkdownConfigLoader.getProjectDirsUpToHome("skills", effectiveCwd)
+            : List.of();
         List<String> additionalDirs = additionalDirectoriesSupplier.get();
         boolean skillsLocked = PluginOnlyPolicy.isRestrictedToPluginOnly(PluginOnlyPolicy.SURFACE_SKILLS, settingsSupplier);
         // P2-2: 引入 user/project 加载开关（CC isSettingSourceEnabled，settings/constants.ts:174-177）。
@@ -391,11 +424,23 @@ public class SkillsLoader {
         boolean projectSettingsEnabled =
             Boolean.TRUE.equals(projectSkillsEnabledSupplier.get()) && !skillsLocked;
 
-        if (log.isDebugEnabled()) {
-            log.debug("[SkillsLoader] getSkillDirCommands(cwd={}): managed={}, nexusaiUser={}, claudeUser={}, "
-                    + "project={}, additional={}, skillsLocked={} (CC loadSkillsDir.ts:640-652)",
-                effectiveCwd, managedSkillsDir, nexusaiUserSkillsDir, claudeUserSkillsDir,
-                projectSkillsDirs, additionalDirs, skillsLocked);
+        if (hasSessionCwd) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SkillsLoader] getSkillDirCommands(cwd={}): managed={}, nexusaiUser={}, claudeUser={}, "
+                        + "project={}, additional={}, skillsLocked={} (CC loadSkillsDir.ts:640-652)",
+                    effectiveCwd, managedSkillsDir, nexusaiUserSkillsDir, claudeUserSkillsDir,
+                    projectSkillsDirs, additionalDirs, skillsLocked);
+            }
+        } else {
+            // [P1a F-04] ≥WARN（禁只 DEBUG · 本仓铁律「取不到会话态不得静默」）：未绑定会话 ⇒
+            //   project/legacy 两源跳过；managed/user/additional 继续加载。旧实现此分支只在 DEBUG 可见
+            //   （因为 effectiveCwd 被静默填成进程 user.dir，根本走不到「缺失」）。
+            log.warn("[SkillsLoader] getSkillDirCommands 无会话 cwd（入参与 cwdSupplier 均为空）"
+                    + " → 跳过 project(up-to-home)/legacy 两源，仅加载 managed/user/additional；"
+                    + "⛔ 不回落进程 user.dir（旧实现在此静默混入后端自身项目的项目级技能）: "
+                    + "managed={}, nexusaiUser={}, claudeUser={}, additional={}, skillsLocked={} "
+                    + "(CC loadSkillsDir.ts:640-652)",
+                managedSkillsDir, nexusaiUserSkillsDir, claudeUserSkillsDir, additionalDirs, skillsLocked);
         }
 
         // bare 模式（CC :658-675）：仅加载显式 additionalDirs，跳过自动发现；skillsLocked 仍适用
@@ -463,7 +508,10 @@ public class SkillsLoader {
             }
         }
         // legacy commands-as-skills（CC :709-713，skillsLocked 时也是 skills，阻断）
-        List<Command> legacy = skillsLocked ? List.of() : LegacyCommandsLoader.loadSkillsFromCommandsDir(effectiveCwd);
+        // [P1a F-04] 无会话 cwd ⇒ 跳过 legacy 源（其遍历基准即 cwd；绝不能拿进程 user.dir 顶替）
+        List<Command> legacy = (skillsLocked || !hasSessionCwd)
+            ? List.of()
+            : LegacyCommandsLoader.loadSkillsFromCommandsDir(effectiveCwd);
 
         List<Command> allSkills = new ArrayList<>();
         allSkills.addAll(managed);

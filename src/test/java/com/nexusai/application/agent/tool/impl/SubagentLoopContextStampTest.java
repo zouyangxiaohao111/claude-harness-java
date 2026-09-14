@@ -45,7 +45,7 @@ class SubagentLoopContextStampTest {
         ToolUseContext subagentCtx = ToolUseContext.of(UUID.randomUUID(), "sess-child");
 
         ToolUseContext stamped =
-            SubagentExecutor.stampSubagentLoopContext(subagentCtx, sub, "worker", false);
+            SubagentExecutor.stampSubagentLoopContext(subagentCtx, sub, "worker", false, null);
 
         assertThat(stamped.subagentName())
             .as("hook 侧归因载体（SessionFileAccessHooks.subagentProps 经 HOOK_EXECUTOR 取用）")
@@ -69,6 +69,7 @@ class SubagentLoopContextStampTest {
 
         assertThat(bare.subagentName()).isNull();
         assertThat(bare.agentContext()).isNull();
+        assertThat(bare.teammateIdentity()).isNull();
     }
 
     @Test
@@ -78,7 +79,7 @@ class SubagentLoopContextStampTest {
         //   只断言「字段有值」不覆盖该目的；本用例在真实派生线程上消费一次，闭合「盖章 → 跨线程可用」。
         AgentContext.SubagentContext sub = subCtx("req_stamp_worker");
         ToolUseContext stamped = SubagentExecutor.stampSubagentLoopContext(
-            ToolUseContext.of(UUID.randomUUID(), "sess-child"), sub, "Explore", true);
+            ToolUseContext.of(UUID.randomUUID(), "sess-child"), sub, "Explore", true, null);
         String testThread = Thread.currentThread().getName();
 
         String[] seen = CompletableFuture.supplyAsync(() -> {
@@ -97,12 +98,39 @@ class SubagentLoopContextStampTest {
     }
 
     @Test
+    @DisplayName("[S1-T2b] teammate 身份同点盖章；非 teammate（null）不得伪造身份")
+    void stamp_carriesTeammateIdentity_andDoesNotFabricate() {
+        // WHY（规则九）：teammate 身份与 subagentName/agentContext 同点是**唯一生产盖章点**
+        //   （SubagentExecutor Step 20 TUC 定稿步）。取值链 = teammate 的
+        //   InProcessTeammateTaskState.identity() → AutonomousAgentLoop.runOneTurn 的 per-call 形参
+        //   → 本缝。断言两条：① 传值必盖（否则工具池线程读 null，Cron*/SendMessage/TaskUpdate 的
+        //   teammate 分支静默退化）；② 不传（null）不得伪造（普通 Agent-tool 子代理 / hook agent
+        //   路径不得被当成 teammate —— 失败方向取「身份缺失」而非「身份归到别人」）。
+        com.nexusai.application.agent.team.TeammateIdentity identity =
+            new com.nexusai.application.agent.team.TeammateIdentity(
+                "alice@team-x", "alice", "team-x", null, false, "sess-parent");
+
+        ToolUseContext stamped = SubagentExecutor.stampSubagentLoopContext(
+            ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "general-purpose", true, identity);
+
+        assertThat(stamped.teammateIdentity())
+            .as("teammate 身份必须被盖章（同一实例，不入 copy 语义）").isSameAs(identity);
+        assertThat(stamped.subagentName())
+            .as("身份盖章不影响 subagentName 同点盖章").isEqualTo("general-purpose");
+        // 反向对照：不传身份时不得凭空造一个
+        assertThat(SubagentExecutor.stampSubagentLoopContext(
+                ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "general-purpose", true, null)
+                .teammateIdentity())
+            .as("非 teammate 路径不得伪造 teammate 身份").isNull();
+    }
+
+    @Test
     @DisplayName("null agentContext：身份仍盖章，agent 载体为空（非 agent 上下文，不得伪造）")
     void nullAgentContext_stillStampsIdentity() {
         // WHY（缺值策略 (b) 类边界）：SubagentExecutor 的调用点恒传非 null（buildSubagentAgentContext
         //   返回值），但缝本身必须定义 null 语义且**不得伪造**一个空对象（那会让下游以为有归因上下文）。
         ToolUseContext stamped = SubagentExecutor.stampSubagentLoopContext(
-            ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "Explore", true);
+            ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "Explore", true, null);
 
         assertThat(stamped.subagentName()).isEqualTo("Explore");
         assertThat(stamped.agentContext()).isNull();

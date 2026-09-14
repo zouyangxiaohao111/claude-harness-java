@@ -705,14 +705,16 @@ public class TeamHelpers {
      * 同步当前 teammate 的 mode 到 config.json · 对齐 CC teamHelpers.ts:397-407 syncTeammateMode。
      *
      * <p>非 teammate 直接返回（CC :401 isTeammate()）；否则 setMemberMode(teamName, agentName, mode)。
+     *
+     * @param identity 本 agent 的 teammate 身份（[S1-T6] 显式载体，替代原 ThreadLocal 读）
      */
-    public void syncTeammateMode(String mode, String teamNameOverride) {
-        if (!Teammate.isTeammate()) {
+    public void syncTeammateMode(TeammateIdentity identity, String mode, String teamNameOverride) {
+        if (!Teammate.isTeammate(identity)) {
             return;
         }
         String teamName = teamNameOverride != null && !teamNameOverride.isBlank()
-            ? teamNameOverride : Teammate.getTeamName();
-        String agentName = Teammate.getAgentName();
+            ? teamNameOverride : Teammate.getTeamName(identity);
+        String agentName = Teammate.getAgentName(identity);
         if (teamName != null && !teamName.isBlank() && agentName != null && !agentName.isBlank()) {
             setMemberMode(teamName, agentName, mode);
         }

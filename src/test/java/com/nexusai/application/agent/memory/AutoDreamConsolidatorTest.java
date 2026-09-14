@@ -27,6 +27,7 @@ import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
 import com.nexusai.repository.settings.entity.SettingsRecord;
 import com.nexusai.repository.settings.mapper.SettingsMapper;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -77,6 +78,21 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("[IMP-M-P0-3/P2-1/D5-A] AutoDreamConsolidator 接线 + 锁并发/rollback/遥测 + 扁平 transcript + 参数化隔离")
 class AutoDreamConsolidatorTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     @TempDir
     Path tempDir;
@@ -864,6 +880,43 @@ class AutoDreamConsolidatorTest {
         assertThat(consolidator.scanSessionTranscripts(SessionStorage.getProjectDir(ws), null, 0))
             .as("参数必须是项目根：传已派生目录 ⇒ 二次派生到不存在位置 ⇒ 扫描得空（旧生产缺陷形状）")
             .isEmpty();
+    }
+
+    @Test
+    @DisplayName("[F-11] 会话门排除「确无会话」哨兵 no-session.jsonl（同包直调真守卫 · 含正向对照）")
+    void sessionGate_excludesNoSessionSentinel() throws IOException {
+        // WHY（CLAUDE.md 规则九 + 用户裁定 #1「改后再核一次承重消费方」）：
+        //   SessionKeys.NO_SESSION（"no-session"）是「确无会话」哨兵，必须在 transcript 扫描端
+        //   被排除 —— 否则哨兵会被当合法会话纳入会话门计数、进入合并候选。
+        //
+        //   ⛔ F-11 假守卫族修复：原断言落在 SessionKeysTest:130-139，那段在测试里**就地重写了**
+        //   本方法的判据（自建 uuid 正则 + 自建 startsWith）再断言自己，对 AutoDreamConsolidator
+        //   零引用零调用 ⇒ 把生产守卫 :699 改错它恒绿（= 声称守护实际守不住）。本用例改为
+        //   **直调真守卫**（scanSessionTranscripts 是包内方法、本类同包 ⇒ 无需反射，先例 :833/:860），
+        //   并配 **正向对照**（防「扫描恒空 / 判据恒滤」的假绿）。
+        //
+        //   生产纳入条件有两条（[B1 修复 2026-09-04]）：UUID 老格式兼容 + 本仓 sess- 键型
+        //   （AutoDreamConsolidator:699 `!isUuid(candidateId) && !candidateId.startsWith("sess-")`）
+        //   —— 哨兵两条均不满足而被排除。这是本仓对 CC 单判据的等价改造：CC validateUuid
+        //   （Open-ClaudeCode/src/utils/sessionStoragePortable.ts:23-29）之所以一条够用，是因为 CC
+        //   主会话 transcript 文件名**恰是 UUID**；本仓主会话键型 = sess-<8hex>，只认 UUID 会让
+        //   生产 sess-*.jsonl 全被排除、会话门恒 0 < minSessions=5 ⇒ autoDream 永不触发。
+        List<String> ctrl = writeSessions(ws, 5);
+        Path dir = SessionStorage.getProjectDir(ws);
+        Files.writeString(dir.resolve(com.nexusai.common.SessionKeys.NO_SESSION + ".jsonl"), "{}\n");
+
+        List<String> found = consolidator.scanSessionTranscripts(ws, null, 0);
+
+        // 否定断言：哨兵必须被排除（CC validateUuid 等价意图 —— 非会话文件不得纳入）
+        assertThat(found)
+            .as("「确无会话」哨兵不得被当会话键纳入 transcript 扫描（AutoDreamConsolidator:699）")
+            .doesNotContain(com.nexusai.common.SessionKeys.NO_SESSION);
+        // ⭐ 正向对照（⛔ 不可省）：同一次扫描必须真的纳入全部 5 个正牌会话 ——
+        //   否则上面那条在「扫描恒空 / 判据恒滤（例如误改成只收 UUID）」时也会绿，等于没测。
+        assertThat(found)
+            .as("正向对照：同一装置必须真的纳入 5 个 sess-*.jsonl（证明上一条不是装置恒空）")
+            .hasSize(5)
+            .containsAll(ctrl);
     }
 
     @Test

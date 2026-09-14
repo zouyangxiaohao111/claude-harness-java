@@ -4,6 +4,7 @@ import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -39,6 +40,21 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  */
 @DisplayName("WF-6 · PathValidation 核心（OPD-WF5-02-01/02/03/05）")
 class PathValidationTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     /** 测试环境：claudeConfigHomeDir / nexusaiConfigHomeDir 与 effectiveCwd 隔离，避免命中真实用户目录。 */
     private static PathValidationEnv env() {
@@ -529,7 +545,6 @@ class PathValidationTest {
 
     @AfterEach
     void clearCwdState() {
-        CwdResolution.clearCurrentOverride();
         SessionProjectRoot.reset();
     }
 

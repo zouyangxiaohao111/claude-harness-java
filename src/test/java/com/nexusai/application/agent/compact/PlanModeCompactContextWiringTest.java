@@ -64,7 +64,9 @@ class PlanModeCompactContextWiringTest {
         auto.setToolUseContext(planModeTuc(PermissionMode.PLAN));
 
         // [P2-7] 回落上下文构建现接收 model 显式入参（原读 AutoCompactor.model 实例字段）
-        CompactConversationContext ctx = auto.buildDefaultCompactConversationContext(null);
+        // [P1a F-08] 并接收 querySource 显式入参（原读 AutoCompactor.querySource 实例字段）；
+        //   本用例未调 setQuerySource ⇒ 字段恒默认 'user'，传字面量与原行为逐字等价。
+        CompactConversationContext ctx = auto.buildDefaultCompactConversationContext(null, "user");
 
         assertThat(ctx.getToolUseContext())
             .as("auto 回落路径（ccContext==null）必须把 toolUseContext 接线进 ctx")

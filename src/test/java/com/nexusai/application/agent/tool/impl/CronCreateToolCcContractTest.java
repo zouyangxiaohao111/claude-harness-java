@@ -4,7 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.LlmAgentLoop;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.application.agent.tool.Tool;
@@ -308,13 +309,12 @@ class CronCreateToolCcContractTest {
         ScheduleService svc = mock(ScheduleService.class);
         when(svc.listAll()).thenReturn(List.of());
         CronCreateTool tool = new CronCreateTool(svc, CronEnabledGates.DEFAULTS);
-        TeammateContext teammate = new TeammateContext(
-            "agent-A", "peer", "team", null, false, null,
-            AbortControllerFactory.create());
+        // [S1-T6] 身份改为 TUC 显式载体（原 ThreadLocal 注入手法已随载体删除）。
+        ToolUseContext tuc = teammateTuc(
+            new TeammateIdentity("agent-A", "peer", "team", null, false, null));
 
-        Tool.ValidationResult r = TeammateContext.runWithTeammateContext(
-            teammate,
-            () -> tool.validateInput(call("c1", input("*/5 * * * *", "p", null, true)).input(), null));
+        Tool.ValidationResult r = tool.validateInput(
+            call("c1", input("*/5 * * * *", "p", null, true)).input(), tuc);
 
         assertThat(r.ok()).isFalse();
         assertThat(r.errorCode()).isEqualTo("4");
@@ -707,5 +707,15 @@ class CronCreateToolCcContractTest {
         assertThat(cap.getValue().name())
             .as("无碰撞 → base 原样（既有 execute 用例同此路径）")
             .isEqualTo("cron:*/5 * * * *");
+    }
+
+    /**
+     * [S1-T6] 构造带 teammate 身份的 ToolUseContext（替代已删的 ThreadLocal 注入手法）·
+     * 身份经 {@code withTeammateIdentity}（= 生产唯一盖章入口）显式盖章。
+     */
+    private static ToolUseContext teammateTuc(TeammateIdentity identity) {
+        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-cron-create",
+            com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
+            .withTeammateIdentity(identity);
     }
 }

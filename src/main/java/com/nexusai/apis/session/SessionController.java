@@ -5,6 +5,7 @@ import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionUpdateRequest;
 import com.nexusai.domain.session.SessionService;
+import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
@@ -47,9 +48,17 @@ public class SessionController {
         return sessionService.getById(id);
     }
 
+    /**
+     * 新建会话 · [S3 · F-03a 2026-09-14] {@code @Valid} 使 {@code mainProjectId} 的
+     * {@code @NotBlank} 生效（空白 ⇒ {@code MethodArgumentNotValidException} ⇒ 400 + {@code errors[]}）。
+     *
+     * <p>⚠️ {@code @Valid} <b>挡得住 HTTP 请求</b>（curl 走的正是本方法），但<b>挡不住域内直构</b>
+     * （{@code SessionServiceTest} 直接 {@code new SessionCreateRequest(...)} 调
+     * {@link SessionService#create}）—— 后者由 SessionService 内的档二守卫兜住。两者缺一不可。
+     */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    public SessionDto create(@RequestBody SessionCreateRequest req) {
+    public SessionDto create(@Valid @RequestBody SessionCreateRequest req) {
         // [IMP-1 R4] 会话创建（新账号/新会话边界）→ 重读 bypassPermissions 开关（对齐 CC /login 后
         // resetBypassPermissionsCheck 语义）。provider 未注入（单测）→ 跳过。
         if (permissionConfigProvider != null) {

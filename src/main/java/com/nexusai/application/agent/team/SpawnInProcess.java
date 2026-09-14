@@ -26,7 +26,8 @@ import java.util.List;
  *   <li><b>taskId = generateTaskId('in_process_teammate')</b> → 't' 前缀 + 8 位随机
  *       （Task.ts:98-105 TASK_ID_PREFIXES + :98 generateTaskId）</li>
  *   <li><b>独立 abortController</b>（createAbortController，spawnInProcess.ts:122——不受 leader 中断）</li>
- *   <li><b>TeammateIdentity + TeammateContext</b>（spawnInProcess.ts:128-147）</li>
+ *   <li><b>TeammateIdentity</b>（spawnInProcess.ts:128-135；[S1-T4] 原先并行的 ThreadLocal
+ *       运行时载体已删除，身份只此一份纯数据）</li>
  *   <li><b>permissionMode = planModeRequired ? 'plan' : 'default'</b>（spawnInProcess.ts:173）</li>
  *   <li><b>registerTask 桥接</b>（spawnInProcess.ts:191 → framework.ts:77-117）
  *       ——经 {@link InProcessTeammateTaskRegistry} 落 BackgroundTask 状态层</li>
@@ -164,13 +165,16 @@ public class SpawnInProcess {
 
     /**
      * spawn 输出 · 对齐 CC spawnInProcess.ts:77-90 InProcessSpawnOutput。
+     *
+     * <p>[S1-T4] 原 {@code teammateContext} 组件（ThreadLocal 运行时载体槽）已删：该槽全仓
+     * <b>只写不读</b>（{@code .teammateContext()} 0 命中），身份数据由 {@code taskState.identity()}
+     * 承载（纯数据、随 taskState 显式传递）。
      */
     public record InProcessSpawnOutput(
         boolean success,
         String agentId,
         String taskId,
         AbortControllerFactory.AbortControllerRef abortController,
-        TeammateContext teammateContext,
         String error
     ) {}
 
@@ -205,7 +209,7 @@ public class SpawnInProcess {
      *   <li>taskId = generateTaskId（'t' 前缀，:113）</li>
      *   <li>独立 abortController（:122）</li>
      *   <li>parentSessionId = context.parentSessionId（:125 getSessionId）</li>
-     *   <li>TeammateIdentity（:128-135）+ TeammateContext（:139-147）</li>
+     *   <li>TeammateIdentity（:128-135；[S1-T4] 原 ThreadLocal 运行时载体已删）</li>
      *   <li>description = {@code `${name}: ${prompt.substring(0,50)}...`}（:155）</li>
      *   <li>taskState 全量初始化（permissionMode = planModeRequired?'plan':'default'，:157-180）</li>
      *   <li>registerTask 桥接（:191 → registry）</li>
@@ -231,11 +235,9 @@ public class SpawnInProcess {
                 agentId, config.name(), config.teamName(), config.color(),
                 config.planModeRequired(), parentSessionId);
 
-            // teammateContext（ThreadLocal 运行时载体，CC :139-147 createTeammateContext）
-            TeammateContext teammateContext = TeammateContext.create(
-                new TeammateContext.TeammateConfig(
-                    agentId, config.name(), config.teamName(), config.color(),
-                    config.planModeRequired(), parentSessionId, abortController));
+            // [S1-T4] 原 ThreadLocal 运行时载体（create 分支）已删：身份唯一载体 =
+            //   上方 identity（纯数据）；abortController 亦已由 taskState.abortController 承载
+            //   （生命周期同一对象，无信息丢失）。
 
             // description = `${name}: ${prompt.substring(0,50)}...`（CC :155）
             String prompt = config.prompt() != null ? config.prompt() : "";
@@ -352,30 +354,21 @@ public class SpawnInProcess {
             }
 
             // 启动运行循环（fire-and-forget，对齐 CC InProcessBackend.spawn startInProcessTeammate）。
-            // GAP-R1: runner 线程全程包 runWithTeammateContext —— 对齐 CC inProcessRunner.ts:1160
-            //   `runWithTeammateContext(teammateContext, () => runAgent(...))`（teammateContext
-            //   于 spawnInProcess.ts:139-147 createTeammateContext 构造，与 taskState/loop 同批）。
-            //   使 runner 线程（runTeammateLoop 全程）持 teammate 上下文；
-            //   工具执行线程的上下文由 StreamingToolExecutor.executeAsync 捕获传播
-            //   （ThreadLocal 不跨线程，Java 需手动桥接 AsyncLocalStorage 的自动传播语义）。
-            Thread runner = new Thread(() -> {
-                    // void 兼容：runWithTeammateContext 返回值丢弃（Runnable 块 lambda 不可 return）。
-                    TeammateContext.runWithTeammateContext(teammateContext,
-                        () -> {
-                            loop.runTeammateLoop(prompt);
-                            return null;
-                        });
-                },
+            // [S1-T4] 原 GAP-R1 的「线程包裹 teammate 上下文 → runTeammateLoop」
+            //   线程包裹已删：身份不再经 ThreadLocal 承载 —— 唯一来源是 taskState.identity()
+            //   （纯数据），由 AutonomousAgentLoop 显式传给下游（TaskService.getTaskListId /
+            //   SubagentExecutor 的 TUC 装配链），无需任何跨线程回放（用户铁律：回放不算合规）。
+            Thread runner = new Thread(() -> loop.runTeammateLoop(prompt),
                 "teammate-" + agentId);
             runner.setDaemon(true);
             runner.start();
             log.info("[spawnInProcessTeammate] Started agent execution for {}", agentId);
 
-            return new InProcessSpawnOutput(true, agentId, taskId, abortController, teammateContext, null);
+            return new InProcessSpawnOutput(true, agentId, taskId, abortController, null);
         } catch (Exception e) {
             String errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown error during spawn";
             log.warn("[spawnInProcessTeammate] Failed to spawn {}: {}", agentId, errorMessage);
-            return new InProcessSpawnOutput(false, agentId, taskId, null, null, errorMessage);
+            return new InProcessSpawnOutput(false, agentId, taskId, null, errorMessage);
         }
     }
 

@@ -17,6 +17,7 @@ import { projectApi, type ProjectDto } from '@/api/projects'
 import { selectProjectFolder } from '@/utils/projectFolder'
 import { isAbsolutePath, normalizePath } from '@/utils/path'
 import { compareSessions } from '@/utils/sessionOrder'
+import { resolveNewSessionProjectId } from '@/utils/newSessionProject'
 import { chatApi } from '@/api/chat'
 import { commandApi } from '@/api/command'
 import { tasksApi } from '@/api/tasks'
@@ -932,10 +933,17 @@ function App() {
     if (activeSession?.modelName) return { tag: (activeSession.model ?? 'DS') as ModelTag, name: activeSession.modelName }
     return { tag: 'DS' as ModelTag, name: 'DeepSeek-Chat' }
   }, [providersApi.list, activeSession, appSettings?.mainModelName])
-  const createSession = useCallback(async () => {
+  /**
+   * 新建会话（项目内）· [S3 · F-03c] `mainProjectId` 改为**必传参数**。
+   *
+   * <p>WHY：原实现自行解析 `activeSession?.mainProjectId ?? perSessionProjects[...]?.main?.id ?? undefined`
+   * —— `??` 不拦空串，且末段 `?? undefined` 会把「解析不出项目」静默降级为「不传项目」，正是
+   * 制造未绑定会话的那条路。改为必传后，解析职责上移到单点
+   * {@link resolveNewSessionProjectId}（由 handleNewSession 调用并保证非空），本函数不再可能
+   * 发出 `"mainProjectId":undefined` / `""`。
+   */
+  const createSession = useCallback(async (mainProjectId: string) => {
     const pickFrom = defaultNewSessionModel
-    // #1 绑定策略：新建会话带当前主项目 mainProjectId（项目维度创建）
-    const mainProjectId = activeSession?.mainProjectId ?? perSessionProjects[activeSessionId ?? '']?.main?.id ?? undefined
     // 单项目模式：工作组下已有「无对话空会话」则禁止再次创建（用户需求）
     const chatMessages = useChatStore.getState().messages
     const hasEmptySessionInGroup = storeSessions.some((s) => {
@@ -978,7 +986,7 @@ function App() {
       },
     }))
     showToast('已创建新会话', 'success')
-  }, [sessionDispatch, showToast, setSessions, storeSessions, activeSession, activeSessionId, perSessionProjects, realProjects, defaultNewSessionModel])
+  }, [sessionDispatch, showToast, setSessions, storeSessions, realProjects, defaultNewSessionModel])
 
   /**
    * 添加工作区（新项目工作组）：给已校验的绝对目录 → 注册/取项目 → 创建该项目首个会话并置顶左栏。
@@ -1005,7 +1013,10 @@ function App() {
     const pickFrom = defaultNewSessionModel
     let created: SessionDto
     try {
-      created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: p.id })
+      // [S3 · F-03c] 用 proj.id 而非 p.id：Project.id 类型上可缺省（src/types.ts:8，mock 数据形态），
+      //   p 是宽化后的 UI 类型；proj 是刚由 projectApi.create 拿到的 ProjectDto，其 id 必填
+      //   （src/api/projects.ts:7 `id: string`）——这里要的正是那个必有的 id。
+      created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: proj.id })
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
       return
@@ -1080,6 +1091,38 @@ function App() {
     }
     await openWorkspaceFromFolder(sel.path)
   }, [openWorkspaceFromFolder])
+
+  /**
+   * [S3 · F-03c 2026-09-14] 「+ 新会话」按钮的唯一入口闸门。
+   *
+   * <p><b>WHY（规则九 · 意图）</b>：本仓「项目」是会话表上的<b>可空</b>列，所以「无项目的新会话」
+   * 是前端能<b>制造</b>出来的状态（CC 状态空间里不存在：CC 启动即冻结 projectRoot，
+   * Open-ClaudeCode/src/bootstrap/state.ts:278-279）。裁定要求在制造点拦掉 —— 即按钮 →
+   * createSession 这条边。闸门放 App 层（不放 SessionList）：SessionList 是纯展示组件
+   * （props 只有 projectPathFor/projectNameFor，拿不到项目列表/picker），在这里天然单点。
+   *
+   * <p><b>为什么两个分支不是同一件事</b>：无项目可绑时，若直接走
+   * {@code handleSelectProjectFolder}，存量「未绑定<b>且已有消息</b>」的会话会落进它的
+   * 「当前会话已有对话，不能切换绑定目录」分支（App.tsx 该函数末段）—— 那是<b>改绑</b>的提示，
+   * 与用户点的「新建」无关（正是 F-03d 点名的孤儿态）。故此处统一走
+   * {@link handleAddWorkspace}：「选目录 → 注册项目 → 建该项目的新会话」，语义恒等于「新建」，
+   * 且完全不碰当前会话的绑定。无活跃会话时它也等价于原有引导路径，故不必再分流。
+   *
+   * <p><b>不许静默失效</b>：解析不出项目时<b>不</b>降级成「不传 mainProjectId 照样建」——
+   * 而是显式提示 + 打开目录选择（用户可见的两个动作）。
+   */
+  const handleNewSession = useCallback(async () => {
+    const pid = resolveNewSessionProjectId(
+      activeSession?.mainProjectId,
+      perSessionProjects[activeSessionId ?? '']?.main?.id,
+    )
+    if (pid) {
+      await createSession(pid)
+      return
+    }
+    showToast('请先选择项目目录，再新建会话', 'info')
+    await handleAddWorkspace()
+  }, [activeSession, activeSessionId, perSessionProjects, createSession, handleAddWorkspace, showToast])
 
   // ---- per-session project handlers ----
   const updateSessionProject = useCallback(
@@ -1650,10 +1693,20 @@ function App() {
         onCreateInProject={(pid) => {
           // #1 项目内新建：带 mainProjectId 创建（用真实默认模型，非 mock 随机）
           void (async () => {
+            // [S3 · F-03c 空串收口] 组键来自 `s.mainProjectId ?? '__unbound__'`（SessionList.tsx:97），
+            //   而 `''` 不是 nullish ⇒ 存量 TRIM(main_project_id)='' 的行会落在键为 '' 的组、
+            //   isUnbound===false ⇒ 组标题的「+」会渲染并以 pid='' 回调。`''` 不是可绑定项目
+            //   （EMPTY_PROJECT.id===''）⇒ 与「无项目」同义，走引导路径，不再发 "mainProjectId":""。
+            const targetPid = resolveNewSessionProjectId(pid, null)
+            if (!targetPid) {
+              showToast('该项目未绑定有效目录，请先选择项目目录', 'info')
+              await handleAddWorkspace()
+              return
+            }
             // 单项目模式：该项目下已有空会话则禁止再次创建
             const chatMessages = useChatStore.getState().messages
             const hasEmpty = storeSessions.some((s) => {
-              const sameGroup = (s.mainProjectId ?? null) === (pid ?? null)
+              const sameGroup = (s.mainProjectId ?? null) === targetPid
               if (!sameGroup) return false
               // 后端 messageCount 权威（同 createSession：前端 messages 未加载不算空）
               return (s.messageCount ?? 0) <= 0 && (chatMessages[s.id] ?? []).length === 0 && !useChatStore.getState().streams[s.id]
@@ -1664,13 +1717,15 @@ function App() {
             }
             const pickFrom = defaultNewSessionModel
             try {
-              const created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: pid ?? undefined })
+              // [S3 · F-03c] mainProjectId 由必传的 targetPid 给出（已保证非空）——
+              //   原 `pid ?? undefined` 既是类型洞（undefined 混入）也把「空串组键」放行到后端。
+              const created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: targetPid })
               // 同 createSession：按统一口径重排（新建会话 updatedAt 最新 → 自然置顶），不无条件前插
               setSessions([created, ...storeSessions].sort(compareSessions))
               sessionDispatch({ type: 'SWITCH', sessionId: created.id })
               sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
               // M2：项目内新建后写 perSessionProjects 真实 main（反查 realProjects）；无真实 id → 空项目
-              const realMain = (pid && realProjects.find((p) => p.id === pid)) || EMPTY_PROJECT
+              const realMain = realProjects.find((p) => p.id === targetPid) ?? EMPTY_PROJECT
               setPerSessionProjects((prev) => ({ ...prev, [created.id]: { main: realMain, subs: [], expanded: {}, flashing: null } }))
               showToast('已创建新会话', 'success')
             } catch (e) {
@@ -1678,7 +1733,7 @@ function App() {
             }
           })()
         }}
-        onCreateSession={() => createSession()}
+        onCreateSession={() => void handleNewSession()}
         onOpenAgentMarket={() => setShowMarket(true)}
         onOpenKnowledgeBase={() => showToast('知识库建设中，敬请期待', 'info')}
         doneUnreadIds={doneUnreadIds}

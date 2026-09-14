@@ -208,20 +208,19 @@ class TeammateMailboxAttachmentInjectTest {
     }
 
     @Test
-    @DisplayName("in-process teammate 上下文（TeammateContext 存在）→ 原样（防误读 leader inbox，CC :3690-3692）")
+    @DisplayName("in-process teammate 上下文（TUC.teammateIdentity 存在）→ 原样（防误读 leader inbox，CC :3690-3692）")
     void gated_inProcessTeammate() {
         String team = "mate-team";
         TeammateMailbox.writeToMailbox("team-lead",
                 TeammateMailbox.TeammateMessage.of("r", "hi", TeammateMailbox.isoNow(), null), team);
-        // 模拟 teammate 线程：TeammateContext 当前上下文非 null
-        com.nexusai.application.agent.team.TeammateContext ctx = com.nexusai.application.agent.team.TeammateContext.create(
-                new com.nexusai.application.agent.team.TeammateContext.TeammateConfig(
-                        "mate@t", "mate", "t", null, false, "s",
-                        com.nexusai.infra.util.AbortControllerFactory.create()));
+        // [S1-T6] 身份改为 TUC 显式载体（原 ThreadLocal 注入手法已随载体删除）。
+        com.nexusai.application.agent.tool.ToolUseContext tuc =
+                appStateCtx(teamContextAppState(team)).withTeammateIdentity(
+                        new com.nexusai.application.agent.team.TeammateIdentity(
+                                "mate@t", "mate", "t", null, false, "s"));
 
-        List<ChatMessageDto> result = com.nexusai.application.agent.team.TeammateContext.runWithTeammateContext(ctx,
-                () -> AgentLoopContext.maybeInjectTeammateMailbox(null, null,
-                        appStateCtx(teamContextAppState(team)), new ArrayList<>()));
+        List<ChatMessageDto> result = AgentLoopContext.maybeInjectTeammateMailbox(
+                null, null, tuc, new ArrayList<>());
 
         assertThat(result).as("teammate 上下文 → 不读 leader inbox").isEmpty();
     }

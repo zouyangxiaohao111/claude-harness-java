@@ -27,7 +27,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>会话级隔离（A mark → consume B false、consume A true；多会话服务不能跨会话串扰）</li>
  *   <li>未 mark 直接 consume → false</li>
  *   <li>回落路径：未注册 sessionId / 非法 UUID / registry 未接线 → 进程级单布尔生效
- *       （CC 单进程语义等价），且<b>不串扰</b>已注册会话</li>
+ *       （CC 单进程语义等价），且<b>不串扰</b>已注册会话。
+ *       <br>⚠️ <b>〔F-16b 假守卫族修复〕</b>该「不串扰」不变量<b>只能在回落单布尔仍为 true 的
+ *       时刻</b>被检验（mark 之后、consume 之前）—— 落在 consume 之后时回落值已被清零，
+ *       断言无论实现对错都返回 false（零鉴别力）。本类两条用例已按此时序摆放；反向实验必须
+ *       <b>同时</b>变异 {@code PostCompactionState.java:197} 与 {@code :224} 两个
+ *       {@code if (state != null)} 才能让两条都红（两者是独立分支）。</li>
  * </ol>
  */
 @DisplayName("[OD-17 方案 1b] PostCompactionState 会话级布尔状态机（挂 AgentState）")
@@ -148,12 +153,19 @@ class PostCompactionStateTest {
 
         PostCompactionState.markPostCompaction(ghost.toString());
 
+        // ⭐ [F-16b 假守卫族修复] 「不串扰」断言必须发生在<b>回落单布尔仍为 true 的时刻</b>
+        //   （mark 之后、consume(ghost) 之前）——
+        //   原位置在 :153 的 consume(ghost) <b>之后</b>，那时回落布尔已被消费清零（false），
+        //   于是「A 读到 false」无论实现是否正确都成立 ⇒ 该断言零独立鉴别力（无论实现对错都返回 false）。
+        //   移位后：此刻 defaultPendingPostCompaction == true，注册会话 A 若误读回落值 ⇒ 断言必红。
+        assertThat(PostCompactionState.consumePostCompaction(SESSION_A.toString()))
+            .as("已注册会话不得读回落单布尔（分桶优先）；此处回落布尔为 true，故本断言可失败")
+            .isFalse();
+
         // 未注册会话走回落单布尔 → 置位/消费/复位闭环
         assertThat(PostCompactionState.isPostCompactionPending(ghost.toString())).isTrue();
         assertThat(PostCompactionState.consumePostCompaction(ghost.toString())).isTrue();
         assertThat(PostCompactionState.consumePostCompaction(ghost.toString())).isFalse();
-        // 回落布尔不串扰已注册会话 A（A 从未 mark → false）
-        assertThat(PostCompactionState.consumePostCompaction(SESSION_A.toString())).isFalse();
     }
 
     @Test
@@ -161,10 +173,16 @@ class PostCompactionStateTest {
     void fallbackForInvalidUuid() {
         PostCompactionState.markPostCompaction("s1");
 
+        // ⭐ [F-16b 假守卫族修复] 同 fallbackForUnregisteredSession：移位到回落布尔仍为 true 时。
+        //   ⚠️ 本断言走的是 isPostCompactionPending 自己的分叉（PostCompactionState.java:224-226 的
+        //   `if (state != null)`），与 consumePostCompaction 的 :197 是<b>两个独立分支</b>
+        //   ⇒ 反向实验必须两处同时变异才能让两条断言都红（只变异一处 ⇒ 其中一条仍绿）。
+        assertThat(PostCompactionState.isPostCompactionPending(SESSION_A.toString()))
+            .as("已注册会话不得读回落单布尔（分桶优先）；此处回落布尔为 true，故本断言可失败")
+            .isFalse();
+
         assertThat(PostCompactionState.isPostCompactionPending("s1")).isTrue();
         assertThat(PostCompactionState.consumePostCompaction("s1")).isTrue();
-        // 注册会话 A 不受回落布尔影响（保持 false）
-        assertThat(PostCompactionState.isPostCompactionPending(SESSION_A.toString())).isFalse();
     }
 
     @Test

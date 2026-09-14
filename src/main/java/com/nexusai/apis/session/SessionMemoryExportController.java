@@ -155,6 +155,8 @@ public class SessionMemoryExportController {
      *   <li>无此会话（合成/伪造/已删 id：MCP 入站、standalone fork 等现造 id）⇒ 400。
      *       ⛔ 刻意<b>不</b>走 {@code CwdResolution.getCwdForNonSession()} 的「无会话出口」
      *       （那会返回进程 user.dir = 与请求方无关的目录，正是本批要消灭的「冒充项目根」）。</li>
+     *   <li>[S2 F-09/F-20 2026-09-14] <b>解析失败 / 无法判定</b>（回源解析器未接线 / 回源抛错 /
+     *       违约返回 null）⇒ 400，且日志文案与上一条<b>可辨识</b>（⛔ 不把装配异常混报成「无此会话」）。</li>
      * </ol>
      *
      * @param sessionId 请求显式传入的会话标识（{@code ?sessionId=}）
@@ -172,10 +174,12 @@ public class SessionMemoryExportController {
         String projectRoot = lookup.projectRoot();
         if (projectRoot == null || projectRoot.isBlank()) {
             log.warn("[SessionMemoryExportController] GET /session-memory/export: scope={} 需要会话项目根，"
-                + "但 sessionId={} 解析不到（sessionKnown={}：{}）→ 400"
+                + "但 sessionId={} 解析不到（sessionKnown={} resolutionFailed={}：{}）→ 400"
                 + "（⛔ 不回落 config home / user.dir 冒充项目根）",
-                scope, sessionId, lookup.sessionKnown(),
-                lookup.sessionKnown() ? "会话存在但无绑定项目根/绑定失效" : "无此会话（合成/伪造/已删 id）");
+                scope, sessionId, lookup.sessionKnown(), lookup.resolutionFailed(),
+                lookup.resolutionFailed()
+                    ? "项目根**无法判定**（回源解析器未接线 / 回源抛错 / 违约返回 null）"
+                    : lookup.sessionKnown() ? "会话存在但无绑定项目根/绑定失效" : "无此会话（合成/伪造/已删 id）");
             throw new ValidationException("sessionId has no bound project root for scope=" + scope);
         }
         if (log.isDebugEnabled()) {

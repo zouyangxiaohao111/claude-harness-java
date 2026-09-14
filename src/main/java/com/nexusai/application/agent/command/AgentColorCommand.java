@@ -120,7 +120,10 @@ public class AgentColorCommand {
      */
     private Env buildProductionEnv(String sessionId) {
         return new Env(
-            Teammate::isTeammate,
+            // [S1-T5 编译强制] 同 CommandRegistrationConfig /rename：显式 null 保持旧无参语义等价
+            //   （旧无参在 handler 线程读 ThreadLocal 恒 null）。真实修复（按 sessionId 解析会话身份）
+            //   属 T12/轨 IV，登记为待收敛。
+            () -> Teammate.isTeammate(null),
             () -> resolveSessionUuid(sessionId),
             () -> resolveTranscriptPath(sessionId),
             () -> SubagentTool.AGENT_COLORS,

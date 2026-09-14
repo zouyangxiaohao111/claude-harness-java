@@ -312,6 +312,73 @@ class MemoryFileDetectionTest {
             .isFalse();
     }
 
+    /**
+     * [P1a F-06] 消费侧静默点：无有效项目根（{@code getAutoMemPath(...)==null}）时，
+     * {@code classifyMemoryDirectory} 跳过 auto-memory 子判定 —— 旧实现该 null 分支<b>零日志</b>
+     * （{@code if (autoMemPath != null) {...}} 无 else）⇒ 「未绑定会话」整体静默降级不可观测。
+     * 现统一经 {@link AutoMemPaths#logNoEligibleProject(String, String)} 出 ≥WARN。
+     */
+    @Test
+    @DisplayName("[P1a F-06] 无有效项目根 → 判定仍为 false 且 ≥WARN（原零日志）")
+    void noEligibleProjectRoot_warns(@TempDir Path memoryBase) {
+        AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        // projectRoot == memoryBase ⇒ isEligibleProjectRoot=false ⇒ getAutoMemPath(...)==null
+        AutoMemPaths noRoot = new AutoMemPaths(
+            () -> memoryBase.toString(), () -> memoryBase.toString(), () -> null, () -> null);
+        MemoryFileDetection det = new MemoryFileDetection(noRoot, () -> "C:/cfg",
+            () -> true, () -> false, () -> false);
+
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(AutoMemPaths.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            assertThat(det.isMemoryDirectory(memoryBase.resolve("plain.md").toString(), null))
+                .as("正面判据：无有效项目 + 普通路径 ⇒ 不属于 memory 目录（false 本身是正确判定）")
+                .isFalse();
+            assertThat(appender.list.stream()
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage))
+                .as("跳过 auto-memory 子判定必须留下 ≥WARN（旧实现零日志 ⇒ 生产不可见）")
+                .anyMatch(m -> m.contains("无有效项目根")
+                    && m.contains("MemoryFileDetection.classifyMemoryDirectory"));
+        } finally {
+            logger.detachAppender(appender);
+            AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        }
+    }
+
+    @Test
+    @DisplayName("[P1a F-06] isShellCommandTargetingMemory 无有效项目根 → 判定照常 + ≥WARN（原零日志）")
+    void noEligibleProjectRoot_shellCommand_warns(@TempDir Path memoryBase) {
+        AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        AutoMemPaths noRoot = new AutoMemPaths(
+            () -> memoryBase.toString(), () -> memoryBase.toString(), () -> null, () -> null);
+        MemoryFileDetection det = new MemoryFileDetection(noRoot, () -> "C:/cfg",
+            () -> true, () -> false, () -> false);
+
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(AutoMemPaths.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            assertThat(det.isShellCommandTargetingMemory("ls -la /tmp", null))
+                .as("正面判据：命令未提及任何记忆目录 ⇒ false（判定本身不受本改动影响）")
+                .isFalse();
+            assertThat(appender.list.stream()
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage))
+                .as("无有效项目根时必须留下 ≥WARN（旧实现该分支零日志）")
+                .anyMatch(m -> m.contains("无有效项目根")
+                    && m.contains("MemoryFileDetection.isShellCommandTargetingMemory"));
+        } finally {
+            logger.detachAppender(appender);
+            AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        }
+    }
+
     @Test
     @DisplayName("isMemoryWriteOrEdit：Write/Edit 记忆文件 true；非记忆文件/Read 工具 false（collapseReadSearch.ts:109-115）")
     void isMemoryWriteOrEdit_memoryFile_isTrue() {

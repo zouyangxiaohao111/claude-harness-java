@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tasks;
 
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -36,6 +37,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("[OPD-TS-23] TaskStop 按 type 分发（bash→cancel 杀子进程 / local_agent→killAsyncAgent）")
 class TaskStopDispatchTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution / PathGuard
+    //   fail-loud 抛（F-10 起 PathGuard 消费侧也不再吞）。见 SessionProjectRootTestSupport 类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     @TempDir
     Path tempDir;

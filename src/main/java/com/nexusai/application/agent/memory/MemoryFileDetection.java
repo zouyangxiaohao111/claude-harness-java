@@ -402,6 +402,10 @@ public final class MemoryFileDetection {
                 if (normalizedCmp.equals(autoMemDirCmp) || normalizedCmp.startsWith(autoMemPathCmp)) {
                     return true;
                 }
+            } else {
+                // [P1a F-06] 消费侧静默点（原零日志）⇒ 统一 ≥WARN 出口（按调用点一次性）
+                autoMemPaths.logNoEligibleProject(
+                    "MemoryFileDetection.classifyMemoryDirectory", sessionProjectRoot);
             }
         }
         // configDir / memoryBaseDir 下的 session/projects/memory 目录（CC :189-206）
@@ -496,6 +500,10 @@ public final class MemoryFileDetection {
             String autoMem = autoMemPaths.getAutoMemPath(sessionProjectRoot);
             if (autoMem != null) {
                 autoMemDir = stripTrailing(autoMem);
+            } else {
+                // [P1a F-06] 消费侧静默点（原零日志）⇒ 统一 ≥WARN 出口（一次性）
+                autoMemPaths.logNoEligibleProject(
+                    "MemoryFileDetection.isShellCommandTargetingMemory", sessionProjectRoot);
             }
         }
 

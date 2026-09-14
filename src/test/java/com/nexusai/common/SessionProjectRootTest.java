@@ -1,6 +1,7 @@
 package com.nexusai.common;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -8,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -36,6 +38,24 @@ class SessionProjectRootTest {
     /** 绑定用临时目录（setForSession 校验绝对路径且目录存在，/cwd/xxx 假路径不再合法）。 */
     @TempDir
     Path tempDir;
+
+    /**
+     * [fix-junit 2026-09-14] <b>本类自行拥有 static 回源槽，不依赖任何全局默认。</b>
+     *
+     * <p><b>WHY</b>：本类是「回源四态」判据载体（{@link SessionProjectRoot}）的守护者，其中
+     * {@link #unwiredResolver_reportsResolutionFailureWithWarn} 断言的是<b>「未接线」这一态本身</b>
+     * ⇒ 不能让「环境恰好没装解析器」这种偶然充当装置。
+     *
+     * <p><b>与全局默认的执行顺序</b>：JUnit 的 {@code BeforeEachCallback}（测试期全局默认
+     * {@code NoDatabaseSessionProjectRootExtension} 会装一个答 {@code unknown()} 的解析器）<b>先于</b>
+     * 本方法执行 ⇒ 本方法显式 {@code setDbResolver(null)} <b>覆盖</b>它，把本类置回「未接线」态。
+     *
+     * <p>⚠️ 本类其余用例全部自行显式装置解析器或只用已绑定会话 ⇒ 本方法对它们无行为影响。
+     */
+    @BeforeEach
+    void ownResolverSlot_unwiredByDefault() {
+        SessionProjectRoot.setDbResolver(null);
+    }
 
     @AfterEach
     void cleanup() {
@@ -229,5 +249,167 @@ class SessionProjectRootTest {
 
         assertThat(SessionProjectRoot.getForSession("sess-bad-abs")).isNull();
         assertThat(SessionProjectRoot.getForSession("sess-bad-missing")).isNull();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // [S2 · F-09/F-20 2026-09-14 · 用户裁定 (A)] 新增第 4 态「解析失败」
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /** 挂 ListAppender 捕获 {@link SessionProjectRoot} 的 ≥WARN（[S2 F-20] 验证 #1 要求捕 WARN）。 */
+    private ch.qos.logback.classic.Logger attachWarnAppender() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SessionProjectRoot.class);
+        logger.setLevel(ch.qos.logback.classic.Level.WARN);
+        return logger;
+    }
+
+    private static List<String> warnMessages(
+            org.slf4j.event.Level level,
+            ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app) {
+        return app.list.stream()
+            .filter(ev -> ev.getLevel().toString().equals(level.name()))
+            .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+            .collect(java.util.stream.Collectors.toList());
+    }
+
+    /**
+     * [S2 · F-20 验证 #1] 解析器<b>未接线</b> ⇒ 第 4 态「解析失败」+ ≥WARN（原实现零日志 + 投 unknown）。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：{@code setDbResolver} 是 {@code @Bean} 方法体内副作用 ⇒ 若装配
+     * 顺序出问题，用户裁定 #7 的 fail-loud 会<b>全进程静默失效</b>（原实现连 DEBUG 都没有，无人能发现）。
+     * 本用例锁「未接线必须可辨识（非 unknown）+ 必须留痕」。
+     *
+     * <p><b>RED（反向实验 · 有鉴别力）</b>：把 {@code refillFromDb} 的未接线段改回
+     * {@code return Lookup.unknown()} ⇒ ①（resolutionFailed 断言）与 ③（WARN 断言）同时变红。
+     *
+     * <p><b>正反对照（同一用例两臂）</b>：未接线 ⇒ resolutionFailed + WARN；接线且 DB 答无会话 ⇒
+     * unknown() 且<b>不</b>打该 WARN（证明上面捕到的 WARN 是「未接线」特有，不是「每次都打」）。
+     */
+    @Test
+    @DisplayName("[S2 F-20] 解析器未接线 ⇒ 「解析失败」态（非 unknown）+ WARN；接线后 unknown 不误报")
+    void unwiredResolver_reportsResolutionFailureWithWarn() {
+        ch.qos.logback.classic.Logger logger = attachWarnAppender();
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        try {
+            // 前置：本类的 @BeforeEach（ownResolverSlot_unwiredByDefault）显式清空回源槽 ⇒ 本用例运行在
+            //   「未接线」态。⛔ 该断言同时是「全局默认扩展的执行顺序」的实测装置：全局默认的
+            //   BeforeEachCallback 先装、本类的 @BeforeEach 后清；若顺序反过来，此处立刻变红。
+            assertThat(SessionProjectRoot.isDbResolverWired())
+                .as("前置装置：必须处于「未接线」态，否则测的不是本态").isFalse();
+
+            SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("sess-real-but-unwired");
+            assertThat(lk.resolutionFailed())
+                .as("未接线 = 无法判定 ⇒ 第 4 态（⛔ 不是「确无会话」）").isTrue();
+            assertThat(lk.projectRoot()).isNull();
+            assertThat(lk.sessionKnown())
+                .as("未接线时无法断言会话存在 ⇒ sessionKnown=false（靠 resolutionFailed 分辨）").isFalse();
+            // 与 unknown() 严格可分（这是 record 加第三字段的全部理由）
+            assertThat(lk).isNotEqualTo(SessionProjectRoot.Lookup.unknown());
+            assertThat(warnMessages(org.slf4j.event.Level.WARN, app))
+                .as("未接线必须 ≥WARN 留痕并带 sessionId（原实现零日志）")
+                .anyMatch(m -> m.contains("未接线") && m.contains("sess-real-but-unwired"));
+
+            // 正向对照：接线 + DB 明确答「无此会话」⇒ unknown()，且不产生「未接线」WARN
+            app.list.clear();
+            SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+            assertThat(SessionProjectRoot.lookup("sess-real-but-unwired"))
+                .as("接线 + DB 明确答无此会话 ⇒ unknown（仍不抛、仍不回落）")
+                .isEqualTo(SessionProjectRoot.Lookup.unknown());
+            assertThat(warnMessages(org.slf4j.event.Level.WARN, app))
+                .as("接线后不得再报「未接线」（证明上一臂的 WARN 是该态特有，不是恒打）")
+                .noneMatch(m -> m.contains("未接线"));
+        } finally {
+            logger.detachAppender(app);
+            app.stop();
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [S2 · F-09 验证 #1/#2] 回源解析器<b>抛错</b> ⇒ 第 4 态 + ≥WARN（原实现 catch 后静默投 unknown）。
+     *
+     * <p><b>RED（反向实验 · 有鉴别力）</b>：把 catch 分支改回 {@code return Lookup.unknown()} ⇒
+     * ①（resolutionFailed）与 ③（WARN）同时变红。
+     */
+    @Test
+    @DisplayName("[S2 F-09] 回源抛错 ⇒ 「解析失败」态 + WARN（不静默当成「确无会话」）")
+    void dbResolverThrowing_reportsResolutionFailureWithWarn() {
+        ch.qos.logback.classic.Logger logger = attachWarnAppender();
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        SessionProjectRoot.setDbResolver(sid -> {
+            throw new RuntimeException("db down");
+        });
+        try {
+            SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("sess-db-down");
+            assertThat(lk.resolutionFailed())
+                .as("DB 炸了 = 无法判定 ⇒ 第 4 态（⛔ 绝不与 unknown 混同）").isTrue();
+            // 冗余守卫多点变异（依铁律）：只把 refillFromDb 的 catch 改回 unknown、不动作别处 ⇒ 本断言必红
+            assertThat(lk).isNotEqualTo(SessionProjectRoot.Lookup.unknown());
+            assertThat(warnMessages(org.slf4j.event.Level.WARN, app))
+                .as("回源抛错必须 ≥WARN 留痕并带 sessionId（原实现静默投 unknown）")
+                .anyMatch(m -> m.contains("sess-db-down") && m.contains("抛错"));
+            // 既有读法（memory 域 fail-soft）仍返回 null —— 失败语义属地不变
+            assertThat(SessionProjectRoot.getForSession("sess-db-down"))
+                .as("memory 域既有读法保持「无项目」（不抛）—— 失败语义属地不同，不因新态改变")
+                .isNull();
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+            logger.detachAppender(app);
+            app.stop();
+        }
+    }
+
+    /**
+     * [S2 · F-09/F-20 验证 #4] 回源器<b>违约返回 null</b> ⇒ 第 4 态 + ≥WARN。
+     *
+     * <p><b>WHY</b>：{@link SessionProjectRoot.DbResolver} 契约要求返回四态 {@code Lookup}；返回 null 是
+     * **实现违约**（⛔ 不是「无此会话」）。原实现把违约静默投给 unknown ⇒ 契约破坏无人发现。
+     */
+    @Test
+    @DisplayName("[S2 F-09] 回源器违约返回 null ⇒ 「解析失败」态 + WARN")
+    void dbResolverViolatingContract_returnsNull_reportsResolutionFailure() {
+        ch.qos.logback.classic.Logger logger = attachWarnAppender();
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        SessionProjectRoot.setDbResolver(sid -> null);
+        try {
+            SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup("sess-contract-violation");
+            assertThat(lk.resolutionFailed())
+                .as("违约返回 null = 无法判定（实现缺陷）⇒ 第 4 态").isTrue();
+            assertThat(warnMessages(org.slf4j.event.Level.WARN, app))
+                .as("违约必须 ≥WARN 留痕（原实现静默投 unknown）")
+                .anyMatch(m -> m.contains("sess-contract-violation") && m.contains("契约"));
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+            logger.detachAppender(app);
+            app.stop();
+        }
+    }
+
+    /**
+     * [S2 · F-20 验证 #4] Spring 上下文就绪断言用的接线探针：与 {@code setDbResolver} 同生共死。
+     */
+    @Test
+    @DisplayName("[S2 F-20] isDbResolverWired 与 setDbResolver 同步（供启动期就绪断言）")
+    void isDbResolverWired_tracksRegistration() {
+        assertThat(SessionProjectRoot.isDbResolverWired())
+            .as("前置：未注册 ⇒ false").isFalse();
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        try {
+            assertThat(SessionProjectRoot.isDbResolverWired())
+                .as("注册后 ⇒ true（生产 = ToolRegistrationConfig:1227 的 @Bean 副作用）").isTrue();
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+        assertThat(SessionProjectRoot.isDbResolverWired())
+            .as("注销后 ⇒ false（reset 刻意不清 dbResolver，故测试须显式注销）").isFalse();
     }
 }

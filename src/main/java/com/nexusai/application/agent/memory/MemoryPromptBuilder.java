@@ -1020,11 +1020,17 @@ public final class MemoryPromptBuilder {
     /**
      * [批 4b-1] 显式会话项目根版本 · 见 {@link #buildSearchingPastContextSection(String)}。
      *
+     * <p><b>[P1a F-05] 无会话项目根 ⇒ 不产出 transcript 搜索指令（≥WARN），绝不伪造目录。</b>
+     * 旧实现把 null/blank 静默换成字面 {@code "."}，经
+     * {@code SessionStorage.getProjectDir(Path.of("."))} → {@code AutoMemPaths.sanitizePath}
+     * 把 '.' 替成 '-' ⇒ 产出 {@code {configHome}/projects/-} 这一<b>幽灵目录</b>，模型拿到的是
+     * 指向不存在目录的假指令（且零日志，只有 debug 之外无从发现）。
+     *
      * @param autoMemDir         auto memory 目录
      * @param sessionProjectRoot 会话绑定项目根（transcript 搜索根的项目 slug 来源）；
-     *                           null/blank → 无法指向真实 transcript 目录（回退 "." 即提示失效，
-     *                           调用方须显式传入；本方法只做防御性不崩）
-     * @return 段行列表（gate 关闭时空）
+     *                           null/blank ⇒ 无会话项目根（本仓特有第三态）→ 本方法保留 memory 目录
+     *                           搜索指令、<b>去掉 transcript 搜索指令</b> + WARN（不伪造路径、不静默）
+     * @return 段行列表（gate 关闭时空）；无会话项目根时缺 item 2（transcript 搜索）
      */
     public List<String> buildSearchingPastContextSection(String autoMemDir, String sessionProjectRoot) {
         if (!coralFernFlag.getAsBoolean()) {
@@ -1032,14 +1038,9 @@ public final class MemoryPromptBuilder {
         }
         // [批 4b-1] 会话 projectRoot 由调用方显式传入（原经 AutoMemPaths ThreadLocal 隐式读取，
         //   载体已删）· 绝不读 JVM 进程工作目录
-        String projectRoot = sessionProjectRoot;
-        if (projectRoot == null || projectRoot.isBlank()) {
-            projectRoot = ".";
-        }
-        // S2：config-home 项目 slug 目录（CC getProjectDir(getOriginalCwd()) 等价，
-        //   sessionStoragePortable.ts:323-329 getProjectDir = join(getProjectsDir(), sanitizePath(cwd))）
-        java.nio.file.Path transcriptRoot =
-            com.nexusai.application.agent.tool.SessionStorage.getProjectDir(java.nio.file.Path.of(projectRoot));
+        // [P1a F-05] 无有效项目根 = 本仓真实第三态：只去掉依赖项目根的 transcript 段，
+        //   其余（memory 目录搜索）与项目根无关 → 保留（决策 (B)）。
+        boolean hasProjectRoot = sessionProjectRoot != null && !sessionProjectRoot.isBlank();
         // [A-4/C-3 登记 · IMP-MV2-40] embedded 恒 false（△-3，锚点 memdir.ts:384-389：
         //   hasEmbeddedSearchTools() || isReplModeEnabled()）—— Java 无 embedded tools / REPL
         //   平台 → 恒输出 Grep 工具形态 [N/A-保留]。
@@ -1047,23 +1048,40 @@ public final class MemoryPromptBuilder {
         String memSearch = embedded
             ? "grep -rn \"<search term>\" " + autoMemDir + " --include=\"*.md\""
             : GREP_TOOL_NAME + " with pattern=\"<search term>\" path=\"" + autoMemDir + "\" glob=\"*.md\"";
-        String transcriptSearch = embedded
-            ? "grep -rn \"<search term>\" " + transcriptRoot + "/ --include=\"*.jsonl\""
-            : GREP_TOOL_NAME + " with pattern=\"<search term>\" path=\"" + transcriptRoot + "/\" glob=\"*.jsonl\"";
-        return List.of(
+
+        List<String> section = new ArrayList<>(List.of(
             "## Searching past context",
             "",
             "When looking for past context:",
             "1. Search topic files in your memory directory:",
             "```",
             memSearch,
-            "```",
-            "2. Session transcript logs (last resort — large files, slow):",
-            "```",
-            transcriptSearch,
-            "```",
-            "Use narrow search terms (error messages, file paths, function names) rather than broad keywords.",
-            "");
+            "```"));
+        if (!hasProjectRoot) {
+            // CC 恒两段（memdir.ts:375-407，claude-code-best 与 Open-ClaudeCode 同构）——
+            //   CC 的 getOriginalCwd() 是进程单例（恒非空），
+            //   「无项目根」在 CC 不可表示；本仓一 JVM 多会话下由调用方显式传入 ⇒ 必须自己表达该态。
+            log.warn("[MemoryPromptBuilder] buildSearchingPastContextSection 无会话项目根"
+                + "（sessionProjectRoot={}）→ 跳过 transcript 搜索段（旧实现静默回落 \".\" 会产出"
+                + " config-home 下 projects/- 幽灵目录）；调用方应显式传入会话绑定项目根"
+                + "（loadMemoryPrompt(sessionProjectRoot) / buildMemoryLines 路径）", sessionProjectRoot);
+        } else {
+            // S2：config-home 项目 slug 目录（CC getProjectDir(getOriginalCwd()) 等价，
+            //   sessionStoragePortable.ts:323-329 getProjectDir = join(getProjectsDir(), sanitizePath(cwd))）
+            java.nio.file.Path transcriptRoot =
+                com.nexusai.application.agent.tool.SessionStorage.getProjectDir(
+                    java.nio.file.Path.of(sessionProjectRoot));
+            String transcriptSearch = embedded
+                ? "grep -rn \"<search term>\" " + transcriptRoot + "/ --include=\"*.jsonl\""
+                : GREP_TOOL_NAME + " with pattern=\"<search term>\" path=\"" + transcriptRoot + "/\" glob=\"*.jsonl\"";
+            section.add("2. Session transcript logs (last resort — large files, slow):");
+            section.add("```");
+            section.add(transcriptSearch);
+            section.add("```");
+        }
+        section.add("Use narrow search terms (error messages, file paths, function names) rather than broad keywords.");
+        section.add("");
+        return section;
     }
 
     // ════════════════════════════════════════════════════════════════

@@ -2,7 +2,6 @@ package com.nexusai.application.agent.mcp;
 
 import com.mybatisflex.core.MybatisFlexBootstrap;
 import com.nexusai.test.support.MybatisFlexDbTestSupport;
-import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.mcp.config.McpConfigAddValidator;
 import com.nexusai.application.agent.mcp.config.McpConfigFileWriter;
 import com.nexusai.infra.exception.ConflictException;
@@ -13,12 +12,10 @@ import com.nexusai.domain.mcp.McpServerService;
 import com.nexusai.repository.mcp.entity.McpServerRecord;
 import com.nexusai.repository.mcp.mapper.McpServerMapper;
 import org.flywaydb.core.Flyway;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.mockito.Mockito;
 import org.sqlite.SQLiteDataSource;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -44,8 +41,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class McpServerEnabledGateTest {
 
-    @TempDir
-    static Path tempDir;
+    // [S2 F-07 2026-09-14] 原 @TempDir tempDir + CwdResolution.setCurrentOverride(tempDir) 已删除：
+    //   override 通道按用户裁定 #8 整条删除，本类无断言依赖该 cwd。
 
     private static McpServerMapper mapper;
     private static McpServerService service;
@@ -90,15 +87,9 @@ class McpServerEnabledGateTest {
         // [S07] start() 内 channelSessionAllowlist.currentRequestSupplier()（真实会话态注入，需非 null）
         ReflectionTestUtils.setField(service, "channelSessionAllowlist",
             new ChannelSessionAllowlist());
-        // [mcp-add] create/update 经校验链 + 配置源写回（AC-1 双写）：project 写 .mcp.json 走 cwd override
-        CwdResolution.setCurrentOverride(tempDir.toString());
+        // [mcp-add] create/update 经校验链 + 配置源写回（AC-1 双写）
         ReflectionTestUtils.setField(service, "addValidator", new McpConfigAddValidator(null, null));
         ReflectionTestUtils.setField(service, "configFileWriter", new McpConfigFileWriter(null, null));
-    }
-
-    @AfterAll
-    static void tearDownOverride() {
-        CwdResolution.clearCurrentOverride();
     }
 
     @BeforeEach

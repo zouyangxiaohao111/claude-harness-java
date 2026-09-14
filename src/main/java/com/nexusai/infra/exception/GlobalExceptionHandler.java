@@ -22,6 +22,10 @@ import java.util.List;
  *   <li>NotFoundException → 404</li>
  *   <li>ConflictException → 409</li>
  *   <li>ValidationException → 400</li>
+ *   <li><b>UnresolvedProjectRootException → 400</b>（[S2 F-03b 2026-09-14 · 用户裁定 #12]：
+ *       会话项目根解析失败 / 无法判定 ⇒ <b>400 而非 500</b> —— 「本该绑定项目却没有」是客户端可见的
+ *       请求前提不成立，不是服务端故障。判据与同族 400 一致：与 {@code SessionMemoryExportController}
+ *       的「未绑定项目根 ⇒ 400」同一不变量的另一条链）</li>
  *   <li>MethodArgumentNotValidException（@Valid 失败）→ 400 + errors[]</li>
  *   <li>HttpMessageNotReadableException（JSON 解析错）→ 400</li>
  *   <li>Exception（兜底）→ 500</li>
@@ -57,6 +61,27 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Problem> handleValidation(ValidationException ex, HttpServletRequest req) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
             .body(withInstance(Problem.of(400, "Validation Failed", ex.getMessage()), req));
+    }
+
+    /**
+     * 会话项目根解析失败 ⇒ <b>400</b>（[S2 · F-03b 2026-09-14 · 用户裁定 #12 (B2)]）。
+     *
+     * <p><b>WHY 400 而非 500</b>：该异常表示「请求所依赖的会话项目绑定不成立 / 无法判定」——
+     * 客户端可据 400 纠正（补绑定 / 别用未绑定会话），而 500 会让它无法区分「我传错了」与
+     * 「后端炸了」。⛔ 不用 409：与计划登记及 {@code SessionMemoryExportController} 同族，
+     * 且本仓既有 4xx 惯例里该族一律 400。
+     *
+     * <p>⚠️ 本 handler 必须<b>新增</b>而不是把 {@code UnresolvedProjectRootException} 做成
+     * {@code ValidationException} 子类：后者会打红 {@code CwdResolutionTest} 的 4 处
+     * {@code isInstanceOf(IllegalStateException)} 断言，并让 {@code BashTool} 的
+     * {@code catch (IllegalStateException shellEx)} 行为漂移（见该类 javadoc）。
+     */
+    @ExceptionHandler(UnresolvedProjectRootException.class)
+    public ResponseEntity<Problem> handleUnresolvedProjectRoot(UnresolvedProjectRootException ex,
+                                                              HttpServletRequest req) {
+        log.warn("[GlobalExceptionHandler] 会话项目根解析失败 → 400: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(withInstance(Problem.of(400, "Unresolved Project Root", ex.getMessage()), req));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

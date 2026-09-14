@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -191,12 +191,12 @@ public class CronDeleteTool implements Tool {
      * </ol>
      *
      * <p><b>风险登记 (CRON-A3 / IMP-F2 修正)</b>: {@code ScheduleDto.agentId} 由 WF-B 填充
-     * （当前生产恒 null）、TeammateContext 生产端 0 设定（@deprecated）→ errorCode 2 分支生产
-     * 不可达；本实现按 CC {@code task.agentId !== ctx.agentId} 严格不等式结构对齐
+     * （当前生产恒 null）；[S1-T6] 身份改读 {@code ctx.teammateIdentity()} 后判据已显式化
+     * （缺值策略见 T14/轨 IV）；本实现按 CC {@code task.agentId !== ctx.agentId} 严格不等式结构对齐
      * （IMP-F2 / △-14：{@link Objects#equals} 语义，任一为 null 另一端非 null → 拒绝）。
      *
      * @param input 工具输入 {@code {id: string}}
-     * @param ctx   工具调用上下文（本实现不消费；所有权判断用全局 {@link TeammateContext}，对齐 CC :72）
+     * @param ctx   工具调用上下文（所有权判断用 {@code ctx.teammateIdentity()}，对齐 CC :72）
      * @return {@link ValidationResult#pass()} 或 fail("1"/"2", CC 精确消息)
      */
     @Override
@@ -215,14 +215,16 @@ public class CronDeleteTool implements Tool {
             return ValidationResult.fail("1", "No scheduled job with id '" + id + "'");
         }
         // CC :71-79 "Teammates may only delete their own crons." — 所有权预查
-        TeammateContext teammate = TeammateContext.getTeammateContext();
-        if (teammate != null) {
+        // [S1-T6] 判据改读**显式 TUC 载体**（原读 ThreadLocal：工具执行池线程恒 null ⇒
+        //   所有权分支生产不可达）。null = 非 teammate ⇒ 与旧「ThreadLocal 为 null」逐条等价。
+        TeammateIdentity teammateIdentity = ctx != null ? ctx.teammateIdentity() : null;
+        if (teammateIdentity != null) {
             // CC original: task.agentId !== ctx.agentId (CronDeleteTool.ts:73) — teammate 只能删自己的任务。
             // IMP-F2（组 5-3 / △-14 修正）：严格不等式语义——两端均 null 视为相等（CC undefined !== undefined → pass）；
             // 任一为 null 另一端非 null → 拒绝（CC undefined !== 'A' / 'A' !== undefined → reject）。
             // 旧实现 ownerAgentId != null 守卫在任务 agentId=null 时放行，偏离 CC（agentId null 边界）。
             String ownerAgentId = task.agentId();
-            String ctxAgentId = teammate.getData().agentId();
+            String ctxAgentId = teammateIdentity.agentId();
             if (!Objects.equals(ownerAgentId, ctxAgentId)) {
                 return ValidationResult.fail("2",
                     "Cannot delete cron job '" + id + "': owned by another agent");

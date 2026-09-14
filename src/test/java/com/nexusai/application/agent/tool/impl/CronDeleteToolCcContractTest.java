@@ -4,7 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.LlmAgentLoop;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.permission.ToolInputValidator;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.config.CronEnabledGates;
@@ -97,13 +98,11 @@ class CronDeleteToolCcContractTest {
         ScheduleService svc = mock(ScheduleService.class);
         when(svc.listAll()).thenReturn(List.of(dto("job-1", "agent-B")));
         CronDeleteTool tool = new CronDeleteTool(svc, CronEnabledGates.DEFAULTS);
-        TeammateContext teammate = new TeammateContext(
-            "agent-A", "peer", "team", null, false, null,
-            AbortControllerFactory.create());
+        // [S1-T6] 身份改为 TUC 显式载体（原 TeammateContext ThreadLocal runWithTeammateContext 注入）。
+        ToolUseContext tuc = teammateTuc(
+            new TeammateIdentity("agent-A", "peer", "team", null, false, null));
 
-        Tool.ValidationResult r = TeammateContext.runWithTeammateContext(
-            teammate,
-            () -> tool.validateInput(call("c1", "job-1").input(), null));
+        Tool.ValidationResult r = tool.validateInput(call("c1", "job-1").input(), tuc);
 
         assertThat(r.ok()).isFalse();
         assertThat(r.errorCode()).isEqualTo("2");
@@ -197,5 +196,15 @@ class CronDeleteToolCcContractTest {
         assertThat(result.issues().get(0).path()).isEqualTo(List.of("extra"));
         assertThat(result.issues().get(0).message())
             .isEqualTo("An unexpected parameter `extra` was provided");
+    }
+
+    /**
+     * [S1-T6] 构造带 teammate 身份的 ToolUseContext（替代已删的 ThreadLocal 注入手法）。
+     * 身份经 {@code withTeammateIdentity} 显式盖章 —— 与生产盖章入口同源。
+     */
+    private static ToolUseContext teammateTuc(TeammateIdentity identity) {
+        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-cron-del",
+            com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
+            .withTeammateIdentity(identity);
     }
 }

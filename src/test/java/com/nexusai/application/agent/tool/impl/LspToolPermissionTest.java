@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool.impl;
 
 import com.nexusai.application.agent.LlmAgentLoop;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -88,9 +89,38 @@ class LspToolPermissionTest {
         return ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of());
     }
 
-    /** 13 参工厂：显式 effectiveCwd（null 会被 ToolUseContext 归一为进程 CWD）。 */
+    /** 13 参工厂：显式 effectiveCwd（null 会被 ToolUseContext 归一为进程 CWD）。
+     *
+     * <p><b>⛔ [fix-junit 2026-09-14] 必须同时锚「会话 originalCwd」，否则「工作目录外」用例是假前提。</b>
+     * WHY（读码实证，勿删）：读权限的<b>白名单根</b>不是本工厂传入的 {@code effectiveCwd}，而是
+     * {@code CwdResolution.getOriginalCwdLayer(ctx.sessionId())} —— 链路
+     * {@code LspTool.checkPermissions(:352) → ReadPermissionChecker.check(:267) →
+     * WritePermissionChecker.check(:192) → PathValidationEnv.fromToolUseContext(:80) →
+     * CwdResolution.getOriginalCwdLayer(:281)}（基线栈实测，见下）。
+     * 两者<b>刻意区分</b>（{@code ReadPermissionChecker.java}）：
+     * <ul>
+     *   <li>{@code :448-449} —— 白名单锚 {@code ctx.effectiveCwd()} <b>已改为</b>
+     *       {@code CwdResolution.getOriginalCwdLayer}（对齐 CC {@code allWorkingDirectories} 锚
+     *       {@code getOriginalCwd()}，filesystem.ts:667-674）；</li>
+     *   <li>{@code :428-429} —— {@code effectiveCwd} <b>仅</b>保留作 {@link #input} 相对路径解析的
+     *       baseDir（{@code expandPath}，:180-182）：「相对路径基准应 getCwd 随 cd 变，与白名单锚
+     *       分离语义，不混改」。</li>
+     * </ul>
+     * ⇒ 只传 {@code effectiveCwd} 时，白名单根落到「非会话出口」= 进程 {@code user.dir}
+     * （= {@code <repo>/backend}），而本类的 {@link #lspWorkspace()} 与 {@link #lspOutside()} 是
+     * {@code backend/target/} 下的<b>兄弟目录</b> ⇒ 二者<b>都在</b>白名单内 ⇒
+     * {@code outsideWorkingDir_* } 断言必然假红（实测：未锚时 {@code outsideWorkingDir_ask} 拿到
+     * {@code Allow[reason=read permission default allow]}）。
+     * <p>故本工厂在构造 TUC 前先把该 sessionId 的 originalCwd 锚到 {@code effectiveCwd}
+     * （{@code SessionCwdHolder.setOriginalCwd}，即 {@code getOriginalCwdLayer} 的首读槽）。
+     * ⛔ 不要改产品判据来迁就夹具（{@code ReadPermissionChecker}/{@code CwdResolution}/{@code LspTool}）。 */
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        if (effectiveCwd != null) {
+            // 白名单锚（getOriginalCwdLayer 首读槽）= 本用例的工作目录 ws；与 effectiveCwd 同值但语义不同
+            SessionCwdHolder.setOriginalCwd(sessionId, effectiveCwd.toString());
+        }
+        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }
@@ -99,6 +129,9 @@ class LspToolPermissionTest {
     void clearToolCheckCache() {
         // 1c 层 ThreadLocal cache（CheckLayer1c:81 put）—— per-call 隔离，防跨测试污染
         ToolCheckCache.clear();
+        // 会话 originalCwd 槽是 static 表 ⇒ 用例必须自行注销，否则跨类污染
+        // （本类 sessionId 每用例随机，不注销也只是残留；按本仓惯例显式清理）
+        SessionCwdHolder.reset();
     }
 
     @Test

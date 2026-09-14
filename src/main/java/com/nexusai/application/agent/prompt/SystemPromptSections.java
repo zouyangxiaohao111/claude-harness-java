@@ -545,7 +545,12 @@ public final class SystemPromptSections {
             String sanitized = com.nexusai.application.agent.memory.AutoMemPaths.sanitizePath(originalCwd);
             return appTempDir.resolve(sanitized).resolve(sessionId).resolve("scratchpad").toString();
         } catch (Exception e) {
-            log.warn("[SystemPromptSections] getScratchpadDir 计算失败，返回 null（scratchpad 段不注入）: {}", e.toString());
+            // [S2 · F-10 2026-09-14 · 用户裁定 #6] 日志提为 ERROR（原 WARN）：本 catch 覆盖了
+            //   :541 的 CwdResolution.getOriginalCwdLayer(sessionId) 的 fail-loud ⇒ 「项目根解析
+            //   失败 / 无法判定」会被降级成「scratchpad 段不注入」。分类 = (b) 跳过（system prompt
+            //   段缺失不应打死整轮），但必须 ≥WARN 且如实反映严重度（ERROR）。
+            log.error("[SystemPromptSections] getScratchpadDir 计算失败，返回 null（scratchpad 段不注入）：",
+                e);
             return null;
         }
     }

@@ -16,6 +16,7 @@ import com.nexusai.model.session.dto.ToolCallDto;
 import com.nexusai.repository.session.entity.MessageRecord;
 import com.nexusai.repository.session.mapper.MessageMapper;
 import com.nexusai.repository.session.mapper.ToolCallMapper;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -62,6 +63,21 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("[reasoningDurationMs] 实时落库 + transcript 双轨 + STOMP 收口")
 class ChatServiceReplayPersistReasoningDurationTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     @TempDir
     Path tempDir;

@@ -42,7 +42,6 @@ class ShellExecutorSpawnCwdFallbackTest {
 
     @AfterEach
     void clearSessionState() {
-        CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
     }

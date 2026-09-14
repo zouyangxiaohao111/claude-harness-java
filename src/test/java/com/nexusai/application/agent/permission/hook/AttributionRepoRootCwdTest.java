@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import org.junit.jupiter.api.AfterEach;
@@ -28,9 +29,23 @@ import org.junit.jupiter.api.io.TempDir;
 @DisplayName("[IMP-PERM-CWD-04/05] CommitAttributionTracker.getAttributionRepoRoot 完整链")
 class AttributionRepoRootCwdTest {
 
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
+
     @AfterEach
     void cleanup() {
-        CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
     }

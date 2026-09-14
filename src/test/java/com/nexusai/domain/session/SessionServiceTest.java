@@ -117,7 +117,9 @@ class SessionServiceTest {
     @DisplayName("create 带 bareMode=true → 落库 sessions.bare_mode=1 + SessionDto.bareMode=true")
     void create_persistsBareModeTrue() {
         // WHY: 前端「精简模式」开关在创建会话时传入 → 必须落库（V33 列），否则该会话 bare 判定无源可读。
-        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, null, true);
+        // [S3 · F-03a] 第 4 参（mainProjectId）由 null 改为真实 id：mainProjectId 必填后 null 会被
+        //   服务层档二守卫拒成 400，本用例意图是 bareMode 落库，不该被项目契约拦下。
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, "proj-1", true);
 
         SessionDto dto = service.create(req);
 
@@ -135,7 +137,8 @@ class SessionServiceTest {
     @DisplayName("create 不带 bareMode → 落库 null（会话未显式设置，回落全局判定）")
     void create_nullBareModeStaysNull() {
         // WHY: bareMode 是可选开关（null = 该会话未显式设置），不得强塞默认值——判定回落 env/配置/false。
-        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, null, null);
+        // [S3 · F-03a] 同 create_persistsBareModeTrue：mainProjectId 补真实 id（必填契约）。
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, "proj-1", null);
 
         SessionDto dto = service.create(req);
 
@@ -145,6 +148,42 @@ class SessionServiceTest {
                 .as("create 未带 bareMode → bare_mode 保持 null")
                 .isNull();
         assertThat(dto.bareMode()).isNull();
+    }
+
+    // ── [S3 · F-03a] mainProjectId 必填 · 档二服务深守卫（域内直构路径）─────────────
+    // REST 侧的 400 由 SessionController 的 @Valid 给出（见 SessionControllerTest /
+    // SessionCreateTitleOnlyIntegrationTest）；本组钉死另一条防线 —— @Valid 挡不住的域内直构。
+
+    @Test
+    @DisplayName("[S3 F-03a 档二] create 缺 mainProjectId（域内直构，@Valid 不参与）→ ValidationException，不落库")
+    void create_missingMainProjectId_throws() {
+        // WHY（规则九 · 2026-09-14 用户裁定档二）：mainProjectId 必填是「未绑定会话」入口侧不变量。
+        //   Controller 的 @Valid 只覆盖 HTTP 入口（curl 走的也是那条），**域内直构完全绕过它** ——
+        //   真实调用点就是本测试类（:120/:138 形态）。守卫落在服务层才能保证该第三态在服务层
+        //   不可构造；否则「会话在、项目空」这个 CC 状态空间里不存在的态（CC 启动即冻结 projectRoot）
+        //   仍会被造出来，转由使用侧（CwdResolution）兜底 —— 那正是 F-03b 的存在理由。
+        // RED: 删掉 SessionService.create 的 mainProjectId 守卫 ⇒ 本用例不抛异常 → 红。
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, null, null);
+
+        assertThatThrownBy(() -> service.create(req))
+            .as("mainProjectId=null ⇒ 服务层 fail loud（ValidationException → GlobalExceptionHandler 400）")
+            .isInstanceOf(ValidationException.class)
+            .hasMessageContaining("mainProjectId");
+    }
+
+    @Test
+    @DisplayName("[S3 F-03a 档二] create mainProjectId 为纯空白 → 同样拒绝（空串不等于有效项目）")
+    void create_blankMainProjectId_throws() {
+        // WHY（规则九）：判据必须是 isBlank 而非 ==null —— 前端 EMPTY_PROJECT.id === '' 会把空串送进来，
+        //   「非 null 即合法」会让 '' 落库（SessionService:181 原样写入）⇒ 读数侧按「空即未绑定」判定
+        //   （ToolRegistrationConfig）⇒ 守卫空转。本用例是该判据在服务层的唯一鉴别装置。
+        // RED: 把守卫判据从 isBlank 改成 ==null ⇒ 本用例不抛 → 红。
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, "   ", null);
+
+        assertThatThrownBy(() -> service.create(req))
+            .as("mainProjectId 纯空白 ⇒ 同样 400（@NotNull 挡不住的那一态）")
+            .isInstanceOf(ValidationException.class)
+            .hasMessageContaining("mainProjectId");
     }
 
     @Test

@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.mcp;
 
 import com.mybatisflex.core.MybatisFlexBootstrap;
-import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.mcp.config.McpConfigAddValidator;
 import com.nexusai.application.agent.mcp.config.McpConfigDedup;
 import com.nexusai.application.agent.mcp.config.McpConfigFileWriter;
@@ -13,12 +12,10 @@ import com.nexusai.repository.mcp.entity.McpServerRecord;
 import com.nexusai.repository.mcp.mapper.McpServerMapper;
 import com.nexusai.test.support.MybatisFlexDbTestSupport;
 import org.flywaydb.core.Flyway;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.sqlite.SQLiteDataSource;
@@ -48,8 +45,8 @@ import static org.mockito.Mockito.when;
  */
 class McpServerServiceDeleteTokenCleanupTest {
 
-    @TempDir
-    static Path tempDir;
+    // [S2 F-07 2026-09-14] 原 @TempDir tempDir + CwdResolution.setCurrentOverride(tempDir) 已删除：
+    //   override 通道按用户裁定 #8 整条删除，本类无断言依赖该 cwd。
 
     private static McpServerMapper mapper;
     private static McpServerService service;
@@ -73,9 +70,9 @@ class McpServerServiceDeleteTokenCleanupTest {
         MybatisFlexDbTestSupport.resetAndStart(ds, McpServerMapper.class);
         mapper = MybatisFlexBootstrap.getInstance().getMapper(McpServerMapper.class);
 
-        // create/delete 经 mcp-add 校验链 + 配置源写回（AC-1 双写）：project 写 .mcp.json
-        // 走 CwdResolution override → @TempDir，避免污染真实工作区。
-        CwdResolution.setCurrentOverride(tempDir.toString());
+        // create/delete 经 mcp-add 校验链 + 配置源写回（AC-1 双写）
+        // [S2 F-07 2026-09-14] 原 CwdResolution.setCurrentOverride(tempDir) 已删除：
+        //   override 通道按用户裁定 #8 整条删除，本类无断言依赖该 cwd。
         service = new McpServerService();
         ReflectionTestUtils.setField(service, "mcpServerMapper", mapper);
         tokenService = Mockito.mock(McpOAuthTokenService.class);
@@ -84,11 +81,6 @@ class McpServerServiceDeleteTokenCleanupTest {
             Mockito.mock(com.nexusai.application.agent.mcp.ChannelNotificationGate.class));
         ReflectionTestUtils.setField(service, "addValidator", new McpConfigAddValidator(null, null));
         ReflectionTestUtils.setField(service, "configFileWriter", new McpConfigFileWriter(null, null));
-    }
-
-    @AfterAll
-    static void tearDownOverride() {
-        CwdResolution.clearCurrentOverride();
     }
 
     @BeforeEach

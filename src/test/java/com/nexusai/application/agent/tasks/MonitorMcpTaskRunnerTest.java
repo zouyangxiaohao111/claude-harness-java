@@ -7,6 +7,7 @@ import com.nexusai.application.agent.tasks.BackgroundTaskRunner;
 import com.nexusai.domain.mcp.McpServerService;
 import com.nexusai.model.mcp.dto.McpServerDto;
 import com.nexusai.model.mcp.dto.McpStatus;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -51,6 +52,21 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("[W9-03] MonitorMcpTaskRunner streaming 语义（CC LocalShellTask.tsx kind='monitor'）")
 class MonitorMcpTaskRunnerTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     /** [批 3b-D7] 显式创建会话（旧实现由下游读裸 MDC 会话槽；现所有注册入口（register… / outputFileFor）显式传）。 */
     private static final String SESSION = "sess-monitor-3b-fixture";

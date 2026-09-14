@@ -266,8 +266,14 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             List<ChatMessageDto> h = (List<ChatMessageDto>) args[3];
             blocks.add(b == null ? List.of() : List.copyOf(b));
             histories.add(h == null ? List.of() : List.copyOf(h));
-            int msgIdx = args.length == 19 ? 11 : 10;
-            int doneIdx = args.length == 19 ? 17 : 16;
+            // [fix-junit 2026-09-14] 按重载 arity 分派：20 参 = blocks+thinkingConfig（各后移一位）；
+            //   19 参 = 无 thinkingConfig 的重载（onChunk@9 / onAssistantMessage@10 / onComplete@16）。
+            // ⛔ 原为 `== 19 ? 大值 : 小值` ⇒ 19 参时 msgIdx=11 = onToolCallComplete（Consumer<ToolUseBlock>）
+            //   ⇒ 对它 accept(AssistantMessage) 抛 ClassCastException ⇒ onComplete 永不执行 ⇒
+            //   300s STREAM_TIMEOUT × 重试（实测单类 2111s、3 条断言失败）。守卫见
+            //   LlmProviderStreamArityInvariantTest（再追加 stream 形参 ⇒ 立刻翻红）。
+            int msgIdx = args.length == 20 ? 11 : 10;
+            int doneIdx = args.length == 20 ? 17 : 16;
             @SuppressWarnings("unchecked")
             java.util.function.Consumer<AssistantMessage> onMsg =
                 (java.util.function.Consumer<AssistantMessage>) args[msgIdx];
@@ -280,8 +286,11 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
         };
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
+        // [fix-junit 2026-09-14] 第二个重载：**20 个 matcher** ⇒ 绑定 20 参 blocks+thinkingConfig 重载
+        //   （⛔ 原为 19 个 matcher = 与上一桩重复的死桩，20 参重载从未被覆盖；hook agent 路径走的正是它）。
+        //   两桩的 matcher 数**必须差 1**（19 vs 20）—— 这是「两种重载各打一桩」的唯一实现方式。
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
@@ -364,11 +373,32 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
 
     /**
      * mock provider 工厂：第 1 次回 tool_calls（触发第 2 个工具轮）、第 2 次回 stop。
-     * 两种 stream 重载（blocks 重载 / blocks+thinkingConfig 重载）都必须打桩——hook agent 走后者。
      *
-     * <p>[C] 参数个数：blocks 重载 = 18（C 批次在末位追加 {@code Boolean skipCacheWrite}），
-     * blocks+thinkingConfig 重载 = 19（同样末位追加）。下方答案的位置索引按 <b>19 = 带
-     * thinkingConfig</b> 分派（后者 onChunk/onAssistantMessage 比前者后移一位）。
+     * <p><b>[fix-junit 2026-09-14 订正]</b> ⛔ 原文「两种 stream 重载（blocks 重载 /
+     * blocks+thinkingConfig 重载）都必须打桩——hook agent 走后者」：该句<b>意图正确</b>，但实现
+     * 曾与它不符，已于 [fix-junit 2026-09-14] 修好，现为<b>真</b>：
+     * 下方两个桩的 matcher 数<b>差 1</b>（<b>19</b> vs <b>20</b>）—— 19 参桩（{@code anyList()} 在 index 2
+     * ⇒ 排除 default String 版）绑定 <b>19 参 blocks 抽象重载</b>；20 参桩绑定
+     * <b>20 参 blocks+thinkingConfig 重载</b>，即 hook agent 路径（{@code ModelCaller} 的
+     * thinkingConfig 分支）所走的那一个。⛔ 修改任一桩时<b>必须保持 matcher 数差 1</b>。
+     *
+     * <p><b>修复史（勿删 · 两处同因，均已修）</b>：批 2b（{@code d1a42bc}）给该桩<b>追加了第 19 个
+     * matcher</b>，却没同步两个位置常量；随后给所有重载追加 {@code agentContext} 又把三档 arity 由
+     * 18/18/19 推到 19/19/20 ⇒ {@code == 19 ? 大值 : 小值} 语义反转，19 参时取到大档索引 ⇒
+     * {@code ClassCastException: AssistantMessage cannot be cast to ToolUseBlock} ⇒
+     * {@code onComplete} 永不执行 ⇒ 300s {@code STREAM_TIMEOUT} × 重试（实测本类 2111s / 3 条红）。
+     * 且第二个桩当时也是 19 个 matcher（死桩）⇒ 20 参重载从未被覆盖 ⇒ hook 臂恒红并再白烧一次 300s。
+     * 两者已一并修复：本类改后 = <b>5 run / 0 F / 秒级</b>。守卫见
+     * {@code LlmProviderStreamArityInvariantTest}（再给 {@code stream} 追加/中部插入形参 ⇒ 它立刻翻红）。
+     *
+     * <p>[C][fix-junit 2026-09-14 更正] 参数个数（实测 {@code LlmProvider.class.getMethods()}，
+     * 由 {@code LlmProviderStreamArityInvariantTest} 钉住）：本接口 {@code stream} 共 <b>3 个重载</b>，
+     * arity = <b>19 / 19 / 20</b> —— 19 参 = 抽象 blocks 重载（{@code ? querySource}，但无
+     * thinkingConfig）与 default String 版（有 thinkingConfig）；<b>20 参 = blocks+thinkingConfig</b>
+     * （{@code ? querySource + thinkingConfig}）。⛔ 原注释「blocks 重载 = 18 / blocks+thinkingConfig
+     * 重载 = 19」已过期：{@code Boolean skipCacheWrite} 与 {@code AgentContext agentContext}
+     * 两次<b>末尾追加</b>把三档整体推成 19/19/20。下方答案的位置索引按 <b>20 = 带 thinkingConfig</b>
+     * 分派（该重载 onChunk/onAssistantMessage 比 19 参者后移一位）。
      */
     @SuppressWarnings("unchecked")
     private static LlmProviderFactory newProviderFactory(List<List<SystemPromptBlock>> captured,
@@ -378,8 +408,14 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             Object[] args = inv.getArguments();
             List<SystemPromptBlock> blocks = (List<SystemPromptBlock>) args[2];
             captured.add(blocks == null ? null : List.copyOf(blocks));
-            int msgIdx = args.length == 19 ? 11 : 10;
-            int doneIdx = args.length == 19 ? 17 : 16;
+            // [fix-junit 2026-09-14] 按重载 arity 分派：20 参 = blocks+thinkingConfig（各后移一位）；
+            //   19 参 = 无 thinkingConfig 的重载（onChunk@9 / onAssistantMessage@10 / onComplete@16）。
+            // ⛔ 原为 `== 19 ? 大值 : 小值` ⇒ 19 参时 msgIdx=11 = onToolCallComplete（Consumer<ToolUseBlock>）
+            //   ⇒ 对它 accept(AssistantMessage) 抛 ClassCastException ⇒ onComplete 永不执行 ⇒
+            //   300s STREAM_TIMEOUT × 重试（实测单类 2111s、3 条断言失败）。守卫见
+            //   LlmProviderStreamArityInvariantTest（再追加 stream 形参 ⇒ 立刻翻红）。
+            int msgIdx = args.length == 20 ? 11 : 10;
+            int doneIdx = args.length == 20 ? 17 : 16;
             java.util.function.Consumer<AssistantMessage> onMsg = args[msgIdx] == null ? null
                 : (java.util.function.Consumer<AssistantMessage>) args[msgIdx];
             Runnable onComplete = (Runnable) args[doneIdx];
@@ -393,12 +429,15 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             onComplete.run();
             return null;
         };
-        // blocks 重载（18 参 · anyList() 在 index 2 → 只可能绑定 blocks 变体）
+        // 19 参重载之一（anyList() 在 index 2 → 排除 default String 版，只可能绑定抽象 blocks 变体）
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
             any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
-        // blocks+thinkingConfig 重载（19 参 · 全 any() + 19 个实参 → 只可能绑定该变体）
+        // [fix-junit 2026-09-14] 第二个重载（**活桩**）：20 个 matcher ⇒ 绑定 20 参 blocks+thinkingConfig 重载
+        //   —— hook agent 走的正是它（ModelCaller 的 thinkingConfig 分支）。⛔ 原为 19 个 matcher：
+        //   与上一桩重复 ⇒ 死桩，20 参重载从未被覆盖 ⇒ hook 臂无 provider 回应 ⇒ 白烧一次 300s 流超时
+        //   且 threePaths 的 hook 臂恒红。两桩 matcher 数必须差 1（19 vs 20）。
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         return factory;

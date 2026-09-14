@@ -2,7 +2,7 @@ package com.nexusai.application.agent.tasks;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.team.TeamHelpers;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -197,13 +197,9 @@ public class TaskService {
      *   <li>env <b>CLAUDE_CODE_TASK_LIST_ID</b>（CC tasks.ts:200 优先级 1）→ sysprop
      *       <b>nexusai.taskListId</b>（Spring 接口承载 CC env 语义，见
      *       {@link #resolveTaskListIdFromEnvOrProperty()}）</li>
-     *   <li><b>in-process teammate teamName</b>（CC tasks.ts:205-208 优先级 2 +
-     *       teammateContext.ts:47-49 getTeammateContext()，经
-     *       {@link TeammateContext#getTeammateContext()} 取 ThreadLocal；本分支已<b>live</b>——
-     *       {@link SpawnInProcess}（SpawnInProcess.java:285）将 runner 线程全程包在
-     *       {@code runWithTeammateContext(teammateContext, () -> loop.runTeammateLoop(prompt))}
-     *       中（对齐 CC inProcessRunner.ts:1160），teammate 的 {@code getTaskListId()} 直接返回
-     *       {@code teammateCtx.teamName}，与 leader 共享同一任务列表，见下方「何时生效」落地说明）</li>
+     *   <li><b>teammate teamName</b>（CC tasks.ts:205-208 优先级 2 +
+     *       teammateContext.ts:47-49 getTeammateContext()；[S1-T6] 本仓改由<b>显式形参
+     *       {@code identity}</b> 承载 —— 原 ThreadLocal 载体已随 S1-T4 删除，不再有回放）</li>
      *   <li><b>nexusai.team.name</b>（CC 优先级 3 的 getTeamName() Java 近似，对齐
      *       teammate.ts:111-119 实际行为；修复原遗留错误 teamName key——该 key 全仓库
      *       无任何写入点，grep 实证属脏 key）</li>
@@ -222,13 +218,12 @@ public class TaskService {
      *       AsyncLocalStorage（teammateContext.ts:41-49）存 leader 上下文，故
      *       {@code getTaskListId()} 直接返回 {@code teammateCtx.teamName}，让 teammate
      *      与 leader 共享同一任务列表。</li>
-     *   <li>Java 侧：{@link TeammateContext}（ThreadLocal-backed，commit f5903dca）已接线——
-     *       {@link SpawnInProcess}（SpawnInProcess.java:285）把 runner 线程包在
-     *       {@code TeammateContext.runWithTeammateContext(teammateContext, () -> loop.runTeammateLoop(prompt))}
-     *       中（对齐 CC inProcessRunner.ts:1160），runner 线程全程持 teammate 上下文；
-     *       工具执行线程的上下文由 StreamingToolExecutor.executeAsync 捕获传播
-     *       （ThreadLocal 不跨线程，Java 手动桥接 AsyncLocalStorage 自动传播语义）。
-     *       因此 teammate 的 {@code getTaskListId()} 优先级 2 <b>live</b>，与 leader 共享任务列表。</li>
+     *   <li>Java 侧（[S1-T6] 修订）：身份不再经 ThreadLocal 回放，而是由 <b>显式形参
+     *       {@code identity}</b> 承载 —— teammate 侧来源 = {@code InProcessTeammateTaskState.identity()}
+     *       （{@link com.nexusai.application.agent.subagent.AutonomousAgentLoop} 认领任务时传入），
+     *       工具侧来源 = {@code ToolUseContext.teammateIdentity()}。因此 teammate 的
+     *       {@code getTaskListId(...)} 优先级 2 <b>live</b> 且跨线程可见（不再依赖回放），
+     *       与 leader 共享任务列表。</li>
      * </ul>
      *
      * <p>最终回退 <b>会话 ID（进程级稳定 UUID）</b>：CC getTaskListId() 本身从不返回
@@ -245,7 +240,14 @@ public class TaskService {
      * @param sessionId 显式会话标识（调用方传入；null/空白 ⇒ 优先级 6 不可用 → WARN 后回退进程级 UUID）
      * @return 任务列表 ID
      */
-    public static String getTaskListId(String sessionId) {
+    /**
+     * [S1-T6] teammate 身份改为<b>显式形参</b> {@code identity}（原读 ThreadLocal：静态方法在
+     * 工具执行池线程 / hook 池线程读恒 null ⇒ 优先级 2 生产不可达）。null = 非 teammate。
+     *
+     * @param sessionId 显式会话标识（null/空白 ⇒ 优先级 6 不可用 → WARN 后回退进程级 UUID）
+     * @param identity  本 agent 的 teammate 身份（来源 = {@code ToolUseContext.teammateIdentity()}）
+     */
+    public static String getTaskListId(String sessionId, TeammateIdentity identity) {
         // 优先级 1（CC tasks.ts:200-204）：env CLAUDE_CODE_TASK_LIST_ID → sysprop nexusai.taskListId
         String explicit = resolveTaskListIdFromEnvOrProperty();
         if (explicit != null) {
@@ -255,18 +257,16 @@ public class TaskService {
             return explicit;
         }
 
-        // 优先级 2（CC tasks.ts:205-208 + teammateContext.ts:47-49）：in-process teammate teamName
-        // 接线说明：SpawnInProcess.java:285 已把 runner 线程包在
-        //   runWithTeammateContext(teammateContext, () -> loop.runTeammateLoop(prompt)) 中
-        //   （对齐 CC inProcessRunner.ts:1160），teammate 的 getTaskListId() 优先级 2 live，
-        //   与 leader 共享任务列表（详见方法 Javadoc「何时生效」）。
-        TeammateContext teammateCtx = TeammateContext.getTeammateContext();
-        if (teammateCtx != null && teammateCtx.getData().teamName() != null
-                && !teammateCtx.getData().teamName().isBlank()) {
+        // 优先级 2（CC tasks.ts:205-208 + teammateContext.ts:47-49）：teammate teamName
+        // [S1-T6] 来源改为**显式形参** identity（工具/loop 侧由 ToolUseContext.teammateIdentity()
+        //   沿链下传；SpawnInProcess 已不再包 ThreadLocal）。teammate 与 leader 共享任务列表
+        //   （详见方法 Javadoc「何时生效」）。
+        if (identity != null && identity.teamName() != null
+                && !identity.teamName().isBlank()) {
             if (log.isDebugEnabled()) {
-                log.debug("getTaskListId: 优先级2（in-process teammate teamName）解析列表 ID {}", teammateCtx.getData().teamName());
+                log.debug("getTaskListId: 优先级2（显式 teammate identity teamName）解析列表 ID {}", identity.teamName());
             }
-            return teammateCtx.getData().teamName();
+            return identity.teamName();
         }
 
         // 优先级 3（CC teammate.ts:111-119 getTeamName() Java 近似）：sysprop nexusai.team.name
@@ -340,7 +340,8 @@ public class TaskService {
      * {@link #getTaskListId(String)} 显式传入 {@code ctx.sessionId()}。
      */
     public static String getTaskListId() {
-        return getTaskListId(null);
+        // [S1-T6] 无会话 / 无身份来源的兼容入口（T11/轨 IV 将整体删除本重载）。
+        return getTaskListId(null, null);
     }
 
     /** 进程级稳定会话 UUID · 对齐 CC STATE.sessionId = randomUUID()（state.ts:331），懒初始化进程内稳定 */

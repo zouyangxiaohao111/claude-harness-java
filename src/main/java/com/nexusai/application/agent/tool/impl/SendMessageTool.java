@@ -12,6 +12,7 @@ import com.nexusai.application.agent.team.InProcessTeammateTaskRegistry;
 import com.nexusai.application.agent.team.SpawnInProcess;
 import com.nexusai.application.agent.team.TeamHelpers;
 import com.nexusai.application.agent.team.Teammate;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.team.TeammateMailbox;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
@@ -617,8 +618,8 @@ public class SendMessageTool implements Tool {
     private AgentToolResult handleMessage(ToolUseBlock call, String recipientName, String content,
                                           String summary, ToolUseContext ctx) {
         String teamName = resolveTeamName(ctx);
-        String senderName = resolveSenderName();
-        String senderColor = Teammate.getTeammateColor();
+        String senderName = resolveSenderName(ctx);
+        String senderColor = Teammate.getTeammateColor(identityOf(ctx));
 
         try {
             TeammateMailbox.writeToMailbox(recipientName,
@@ -675,8 +676,8 @@ public class SendMessageTool implements Tool {
             // CC :205-208 team 文件不存在 → 拒绝
             return ToolResult.error(call.id(), "Team \"" + teamName + "\" does not exist");
         }
-        String senderName = resolveSenderName();
-        String senderColor = Teammate.getTeammateColor();
+        String senderName = resolveSenderName(ctx);
+        String senderColor = Teammate.getTeammateColor(identityOf(ctx));
 
         // CC :220-226 recipients = members.filter(m => m.name.toLowerCase() !== senderName.toLowerCase())
         List<String> recipients = teamHelpers.listMemberNames(teamName).stream()
@@ -777,7 +778,8 @@ public class SendMessageTool implements Tool {
     private AgentToolResult handleShutdownRequest(ToolUseBlock call, String targetName, String reason,
                                                   ToolUseContext ctx) {
         String teamName = resolveTeamName(ctx);
-        String senderName = Teammate.getAgentName() != null ? Teammate.getAgentName()
+        String senderName = Teammate.getAgentName(identityOf(ctx)) != null
+                ? Teammate.getAgentName(identityOf(ctx))
                 : SwarmConstants.TEAM_LEAD_NAME;
         String requestId = "shutdown-" + System.currentTimeMillis() + "@" + targetName;
 
@@ -787,7 +789,8 @@ public class SendMessageTool implements Tool {
             TeammateMailbox.writeToMailbox(targetName,
                     new TeammateMailbox.TeammateMessage(senderName,
                             TeammateMailbox.toCompactJson(shutdownMsg),
-                            TeammateMailbox.isoNow(), false, Teammate.getTeammateColor(), null),
+                            TeammateMailbox.isoNow(), false,
+                            Teammate.getTeammateColor(identityOf(ctx)), null),
                     teamName);
             log.info("[SendMessageTool] shutdown_request 写入 mailbox target={} requestId={} from={}",
                     targetName, requestId, senderName);
@@ -829,7 +832,8 @@ public class SendMessageTool implements Tool {
             TeammateMailbox.writeToMailbox(SwarmConstants.TEAM_LEAD_NAME,
                     new TeammateMailbox.TeammateMessage(agentName,
                             TeammateMailbox.toCompactJson(approved),
-                            TeammateMailbox.isoNow(), false, Teammate.getTeammateColor(), null),
+                            TeammateMailbox.isoNow(), false,
+                            Teammate.getTeammateColor(identityOf(ctx)), null),
                     teamName);
             log.info("[SendMessageTool] shutdown_approved 写入 team-lead mailbox requestId={} from={}",
                     requestId, agentName);
@@ -894,7 +898,8 @@ public class SendMessageTool implements Tool {
             TeammateMailbox.writeToMailbox(SwarmConstants.TEAM_LEAD_NAME,
                     new TeammateMailbox.TeammateMessage(agentName,
                             TeammateMailbox.toCompactJson(rejected),
-                            TeammateMailbox.isoNow(), false, Teammate.getTeammateColor(), null),
+                            TeammateMailbox.isoNow(), false,
+                            Teammate.getTeammateColor(identityOf(ctx)), null),
                     teamName);
             log.info("[SendMessageTool] shutdown_rejected 写入 team-lead mailbox requestId={} from={} reason={}",
                     requestId, agentName, reason);
@@ -919,7 +924,7 @@ public class SendMessageTool implements Tool {
     private AgentToolResult handlePlanApproval(ToolUseBlock call, String recipient, String requestId,
                                                ToolUseContext ctx) {
         // CC :442-446 仅 team-lead 可批准/拒绝 plan · 对齐 teammate.ts:171-198 isTeamLead(teamContext)
-        if (!isTeamLead(resolveTeamName(ctx))) {
+        if (!isTeamLead(ctx, resolveTeamName(ctx))) {
             log.warn("[SendMessageTool] plan_approval_response 被非 team-lead 调用（CC :442-446 拒绝）");
             return ToolResult.error(call.id(),
                     "Only the team lead can approve plans. Teammates cannot approve their own or other plans.");
@@ -959,7 +964,7 @@ public class SendMessageTool implements Tool {
     private AgentToolResult handlePlanRejection(ToolUseBlock call, String recipient, String requestId,
                                                 String feedback, ToolUseContext ctx) {
         // CC :487-491 仅 team-lead 可拒绝 plan
-        if (!isTeamLead(resolveTeamName(ctx))) {
+        if (!isTeamLead(ctx, resolveTeamName(ctx))) {
             log.warn("[SendMessageTool] plan_approval_response 被非 team-lead 调用（CC :487-491 拒绝）");
             return ToolResult.error(call.id(),
                     "Only the team lead can reject plans. Teammates cannot reject their own or other plans.");
@@ -993,12 +998,13 @@ public class SendMessageTool implements Tool {
      * @param teamName 目标 team（CC teamContext.teamName 等价），null → 非 lead
      * @return true=team lead（可批准/拒绝 plan）；false=非 lead
      */
-    private boolean isTeamLead(String teamName) {
+    private boolean isTeamLead(ToolUseContext ctx, String teamName) {
         if (teamName == null || teamName.isBlank()) {
             // CC :178-180 !teamContext?.leadAgentId → false（无 team context 恒非 lead）
             return false;
         }
-        return Teammate.isTeamLead(teamHelpers.leadAgentId(teamName));
+        // [S1-T6] 身份改读显式 TUC 载体（原读 ThreadLocal）。
+        return Teammate.isTeamLead(identityOf(ctx), teamHelpers.leadAgentId(teamName));
     }
 
     /**
@@ -1063,12 +1069,22 @@ public class SendMessageTool implements Tool {
      * {@code getAgentName() || (isTeammate() ? 'teammate' : TEAM_LEAD_NAME)}。
      * 删除旧 {@code from} 输入（⊕-07）与 {@code "lead@default"} 回退（旧 resolveFrom）。
      */
-    private String resolveSenderName() {
-        String agentName = Teammate.getAgentName();
+    private String resolveSenderName(ToolUseContext ctx) {
+        // [S1-T6] 身份改读显式 TUC 载体（原读 ThreadLocal：工具执行池线程恒 null ⇒ 恒走
+        //   TEAM_LEAD_NAME 分支）。ctx 可为 null → identity null（与旧缺失语义等价）。
+        TeammateIdentity identity = identityOf(ctx);
+        String agentName = Teammate.getAgentName(identity);
         if (agentName != null && !agentName.isBlank()) {
             return agentName;
         }
-        return Teammate.isTeammate() ? "teammate" : SwarmConstants.TEAM_LEAD_NAME;
+        return Teammate.isTeammate(identity) ? "teammate" : SwarmConstants.TEAM_LEAD_NAME;
+    }
+
+    /**
+     * [S1-T6] 从工具上下文取 teammate 身份（null-safe）· 唯一取值点（防多处各自解引用漂移）。
+     */
+    private static TeammateIdentity identityOf(ToolUseContext ctx) {
+        return ctx != null ? ctx.teammateIdentity() : null;
     }
 
     /**
@@ -1083,7 +1099,8 @@ public class SendMessageTool implements Tool {
      * @return team 名；无 → null
      */
     private String resolveTeamName(ToolUseContext ctx) {
-        return Teammate.getTeamName(teamNameFromContext(ctx));
+        // [S1-T6] 身份改读显式 TUC 载体（原读 ThreadLocal）。
+        return Teammate.getTeamName(identityOf(ctx), teamNameFromContext(ctx));
     }
 
     /**

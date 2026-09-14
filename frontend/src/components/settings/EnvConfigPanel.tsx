@@ -216,7 +216,7 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   // ---- V54 · 压缩数值配置组（11 项 · 空 = null 回落后端默认 · 走 buildCompressionDto 写整 DTO null 不覆盖）----
   type CompactNumberKey = 'cachedMicrocompactTriggerThreshold' | 'cachedMicrocompactKeepRecent' | 'smMinTokens' | 'smMinTextBlockMessages' | 'smMaxTokens' | 'smMinimumMessageTokensToInit' | 'smMinimumTokensBetweenUpdate' | 'smToolCallsBetweenUpdates' | 'maxConsecutiveAutocompactFailures' | 'maxPtlRetries' | 'maxCompactStreamingRetries' | 'snipNudgeThreshold'
   const COMPACT_NUMBERS: { key: CompactNumberKey; name: string; desc: string; defaultValue: number | null; domain: CompactDomainKey }[] = [
-    { key: 'snipNudgeThreshold', name: 'Snip 提示消息数阈值', desc: '消息数达到该值提示模型考虑 Snip 压缩；留空按上下文窗口自适应（≥800k→900 / >600k→600 / ≥400k→360 / <400k→180）', defaultValue: null, domain: 'snip' },
+    { key: 'snipNudgeThreshold', name: 'Snip 提示剩余上下文阈值（%）', desc: '上下文剩余低于该百分比时提示模型考虑 Snip 压缩；有效范围 1–100，留空默认 30（关闭此提示请用上方 Snip 开关）', defaultValue: 30, domain: 'snip' },
     { key: 'cachedMicrocompactTriggerThreshold', name: '缓存微压缩触发阈值', desc: '活跃工具结果超过该阈值触发缓存微压缩', defaultValue: 10, domain: 'microMc' },
     { key: 'cachedMicrocompactKeepRecent', name: '缓存微压缩保留数', desc: '触发时保留最近 N 个工具结果', defaultValue: 5, domain: 'microMc' },
     { key: 'smMinTokens', name: 'SM 保留尾段最小 token 数', desc: '会话记忆压缩保留尾段的最小 token 数', defaultValue: 10000, domain: 'sm' },
@@ -243,9 +243,19 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
     })
   }, [settings?.cachedMicrocompactTriggerThreshold, settings?.cachedMicrocompactKeepRecent, settings?.smMinTokens, settings?.smMinTextBlockMessages, settings?.smMaxTokens, settings?.smMinimumMessageTokensToInit, settings?.smMinimumTokensBetweenUpdate, settings?.smToolCallsBetweenUpdates, settings?.maxConsecutiveAutocompactFailures, settings?.maxPtlRetries, settings?.maxCompactStreamingRetries, settings?.snipNudgeThreshold])
 
+  // snip 阈值本地校验失败内联提示（fail loud · 越界不往返后端）
+  const [snipThresholdError, setSnipThresholdError] = useState('')
+
   const saveCompactNumber = (key: CompactNumberKey) => {
     const raw = (compactNumDrafts[key] ?? '').trim()
-    void onSaveSettings(buildCompressionDto({ [key]: raw === '' || Number.isNaN(Number(raw)) ? null : Number(raw) })).catch(() => {})
+    const parsed = raw === '' || Number.isNaN(Number(raw)) ? null : Number(raw)
+    if (parsed != null && key === 'snipNudgeThreshold' && (parsed < 1 || parsed > 100)) {
+      // snip 阈值有效域 1..100（后端同样校验，越界返 400）；这里先挡住，避免无谓往返
+      setSnipThresholdError(`Snip 提示剩余上下文阈值必须在 1–100 之间（当前 ${parsed}）`)
+      return
+    }
+    setSnipThresholdError('')
+    void onSaveSettings(buildCompressionDto({ [key]: parsed })).catch(() => {})
   }
 
   /** 10 项布尔压缩开关（对齐后端 SettingsDto 0.5.x 契约字段） */
@@ -404,6 +414,8 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                   <input
                     className="settings-input"
                     type="number"
+                    min={n.key === 'snipNudgeThreshold' ? 1 : undefined}
+                    max={n.key === 'snipNudgeThreshold' ? 100 : undefined}
                     value={compactNumDrafts[n.key] ?? ''}
                     placeholder={n.defaultValue != null ? `默认 ${n.defaultValue} · 留空即用` : '留空自适应'}
                     onChange={(e) => setCompactNumDrafts((prev) => ({ ...prev, [n.key]: e.target.value }))}
@@ -412,6 +424,12 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                 </div>
               </div>
             ))}
+            {/* snip 阈值本地越界内联提示（fail loud · 前端先挡，不往返后端 400） */}
+            {snipThresholdError && numbers.some((n) => n.key === 'snipNudgeThreshold') && (
+              <div className="envc-row">
+                <span className="envc-desc" style={{ color: 'var(--error)' }}>{snipThresholdError}</span>
+              </div>
+            )}
           </div>
         )
       })}

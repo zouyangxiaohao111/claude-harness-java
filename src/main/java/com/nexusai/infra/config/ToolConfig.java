@@ -26,7 +26,8 @@ import java.nio.file.Path;
  *
  * <p><b>本 bean 的 supplier 仅是无会话兜底</b>：{@link PathGuard} 的动态 supplier 是
  * {@code Supplier<Path>}（无 sessionId 形参），且本 bean 为进程级单例（所有会话共享同一实例），
- * 故它只能提供「无会话」基准（{@code CwdResolution.getCwdForNonSession()} → 仅 override / 进程 user.dir 层）；
+ * 故它只能提供「无会话」基准（{@code CwdResolution.getCwdForNonSession()} → 进程 user.dir 层；
+ * [S2 F-07] 原 override 层已按用户裁定 #8 删除）；
  * 无会话调用方（测试 / 静态工具）才命中它。此处<b>不再</b>启动期 WARN —— 缺会话是调用方的事
  * （{@link PathGuard} 在无会话入参时按需 WARN 一次）。
  *

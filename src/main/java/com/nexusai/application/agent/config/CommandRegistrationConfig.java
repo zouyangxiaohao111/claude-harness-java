@@ -481,7 +481,12 @@ public class CommandRegistrationConfig {
         RenameCommand renameCommand = new RenameCommand();
         dispatcher.registerSlashCommand("rename", (args, sessionId, inFlightUserMessageId) -> {
             RenameCommand.Env env = new RenameCommand.Env(
-                Teammate::isTeammate,                       // CC isTeammate()
+                // [S1-T5 编译强制] Teammate.isTeammate 已改为显式首参（TeammateIdentity）。
+                //   handler 线程无 teammate 身份载体 ⇒ 显式传 null = 与旧无参调用**同值**
+                //   （旧无参在 handler 线程读 ThreadLocal 恒 null，只剩 dynamicTeamContext 分支）。
+                //   ⚠️ 本条不是 T12 的真实修复（T12/轨 IV 负责按 handler 形参 sessionId 解析会话身份）；
+                //   本处仅保持「旧行为逐字等价」，登记为待 T12 收敛。
+                () -> Teammate.isTeammate(null),            // CC isTeammate()
                 // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
                 () -> resolveSessionUuid(sessionId),
                 () -> resolveTranscriptPath(sessionId),

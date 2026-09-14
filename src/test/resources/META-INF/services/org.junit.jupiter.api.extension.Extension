@@ -1,0 +1,9 @@
+# [fix-junit 2026-09-14] JUnit 5「自动注册扩展」的 ServiceLoader 声明（配合
+# junit-platform.properties 的 junit.jupiter.extensions.autodetection.enabled=true）。
+#
+# 语义与设计依据见被测类 javadoc：com.nexusai.test.support.NoDatabaseSessionProjectRootExtension
+#   = 测试环境全局默认「本 JVM 不接 DB 回源，任何未绑定 sessionId 都属『确无会话』」
+#     （答 Lookup.unknown()，⛔ 不是 resolutionFailure()）。
+#
+# ⛔ 生产侧的「未接线 ⇒ fail-loud」不变；本文件只在测试类路径（target/test-classes）。
+com.nexusai.test.support.NoDatabaseSessionProjectRootExtension

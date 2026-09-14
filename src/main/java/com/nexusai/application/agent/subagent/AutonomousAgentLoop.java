@@ -46,8 +46,8 @@ import java.util.concurrent.TimeUnit;
  * <p>本类提供状态机 + 主循环, 不实现真实的子任务执行 (P1-3 Dream forked agent 留续).
  *
  * <h2>W8-01 状态机扩展（OPD-TP-06）</h2>
- * <p>生产基底确认: 本类为 {@code subagent/} 三生产基底之一 (TeammateContext/AutonomousAgentLoop/
- * AgentMessageBus), 保留作实施基底。W8-01 在 AutonomousAgentLoop 上补:
+ * <p>生产基底确认: 本类为 {@code subagent/} 生产基底之一 (AutonomousAgentLoop/AgentMessageBus),
+ * 保留作实施基底。W8-01 在 AutonomousAgentLoop 上补:
  * <ul>
  *   <li><b>终端转换 completed/failed/killed</b> (对齐 CC inProcessRunner.ts:1419-1533
  *       completed/failed + spawnInProcess.ts:227-328 killed): notified:true + endTime +
@@ -634,11 +634,16 @@ public class AutonomousAgentLoop {
      */
     public Optional<String> tryAutoClaimAndExecute() {
         // [team-cc-align fixPlan1] 认领列表目录 = getTaskListId() 动态解析（优先级 2
-        //   teammateCtx.teamName，runner 线程已包 runWithTeammateContext）——与 leader 建任务目录
-        //   （getTaskListId 同源）一致。原用 taskListId 字段（=parentSessionId，leader 会话）导致
-        //   成员认领读 {tasks}/{parentSessionId} 而 leader 任务在 {tasks}/{teamName} → 认领不到
-        //   （对齐 CC inProcessRunner.ts:854 idle 轮询 taskListId = teammateCtx.teamName）。
-        String effectiveListId = TaskService.getTaskListId();
+        //   teammate teamName）——与 leader 建任务目录（getTaskListId 同源）一致。原用
+        //   taskListId 字段（=parentSessionId，leader 会话）导致成员认领读 {tasks}/{parentSessionId}
+        //   而 leader 任务在 {tasks}/{teamName} → 认领不到（对齐 CC inProcessRunner.ts:854
+        //   idle 轮询 taskListId = teammateCtx.teamName）。
+        // [S1-T6] 身份来源 = **taskState.identity()（InProcessTeammateTaskState 显式字段）**：
+        //   原经 runner 线程 ThreadLocal 读回，现由 spawn 侧显式持有并直传（用户铁律：不回放）。
+        //   sessionId 位保持 null（与原无参调用逐字一致 → 优先级 3/4/5/6 行为零变化），
+        //   只把优先级 2 的来源从 ThreadLocal 换成显式 identity。
+        String effectiveListId = TaskService.getTaskListId(
+            null, taskState != null ? taskState.identity() : null);
         if (effectiveListId == null || agentName == null || taskService == null) {
             log.debug("[AutonomousAgentLoop] tryAutoClaimAndExecute 缺 taskListId/agentName/taskService, 跳过");
             return Optional.empty();
@@ -1155,6 +1160,12 @@ public class AutonomousAgentLoop {
         //   null → effectiveType=BuiltInAgents.GENERAL_PURPOSE（'general-purpose'，非 null）→
         //   GENERAL_PURPOSE_AGENT 未设 permissionMode（Optional.empty，AgentDefinition:169）→
         //   resolvePermissionMode:2438-2446 → DEFAULT（对齐 CC iterationAgentDefinition permissionMode:'default'）。
+        // [S1-T2b] 身份来源 = **本 teammate 的 taskState.identity()**（显式纯数据，spawn 时构造）。
+        //   经 executeStreaming 的 per-call 形参直达 SubagentExecutor 的 TUC 定稿步（盖章），
+        //   再由 TUC 沿链下传至工具执行池线程 —— ⛔ 不经 ThreadLocal / 进程级槽，⛔ 不用可变字段
+        //   （SubagentExecutor 是 Spring 单例，字段会在会话间串台）。
+        com.nexusai.application.agent.team.TeammateIdentity teammateIdentity =
+            taskState != null ? taskState.identity() : null;
         com.nexusai.application.agent.tool.impl.SubagentExecutor.SubagentResult result =
             subagentExecutor.executeStreaming(
                 prompt,
@@ -1162,7 +1173,8 @@ public class AutonomousAgentLoop {
                 model,
                 forkParams,
                 msg -> appendMessage(describeMessage(msg)),
-                bridge
+                bridge,
+                teammateIdentity
             );
         // CC :1204-1219: 生命周期 abort 优先（不归为本轮 work abort）；仅 work abort 时 workWasAborted=true
         return result != null && "aborted".equals(result.status()) && !isAborted();

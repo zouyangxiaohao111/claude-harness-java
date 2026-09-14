@@ -5,7 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.team.SpawnInProcess;
-import com.nexusai.application.agent.team.TeammateContext;
+import com.nexusai.application.agent.team.TeammateIdentity;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.infra.util.AbortControllerFactory;
@@ -76,7 +77,7 @@ class SubagentToolTeammateSpawnBranchTest {
 
     private static SpawnInProcess.InProcessSpawnOutput successOut() {
         return new SpawnInProcess.InProcessSpawnOutput(
-            true, "researcher@research-team", "t1a2b3c4d", null, null, null);
+            true, "researcher@research-team", "t1a2b3c4d", null, null);
     }
 
     @Test
@@ -155,7 +156,7 @@ class SubagentToolTeammateSpawnBranchTest {
         //   否则父 agent 以为 teammate 已 spawn 而去 SendMessage → 幽灵对端。
         when(spawner.spawnInProcessTeammate(any(), any())).thenReturn(
             new SpawnInProcess.InProcessSpawnOutput(
-                false, "researcher@research-team", null, null, null, "boom"));
+                false, "researcher@research-team", null, null, "boom"));
 
         ToolResult<?> result = tool.execute(teammateCall(null), null, null);
 
@@ -165,14 +166,16 @@ class SubagentToolTeammateSpawnBranchTest {
 
     // ═══════════════════════════════════════════════════════════════════
     // [W8-GAP-01 · 守卫分支] :273 / :279 守卫（teammate 不能嵌套 spawn）
-    //   参考 CronCreateToolCcContractTest.java:132-138 runWithTeammateContext 注入模式
+    //   [S1-T6] 身份注入手法改为 TUC 显式载体（原 runWithTeammateContext 已随载体删除）
     // ═══════════════════════════════════════════════════════════════════
 
-    /** 构造 in-process teammate 上下文（对齐 CronCreateToolCcContractTest:132-134）。 */
-    private static TeammateContext inProcessTeammate() {
-        return new TeammateContext(
-            "researcher", "peer", "research-team", null, false, null,
-            AbortControllerFactory.create());
+    /** [S1-T6] 构造带 teammate 身份的 ToolUseContext（原 ThreadLocal 注入手法已随载体删除）·
+     *  身份经 {@code withTeammateIdentity}（= 生产唯一盖章入口）显式盖章。 */
+    private static ToolUseContext inProcessTeammate() {
+        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-subagent-tool",
+                com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
+            .withTeammateIdentity(new TeammateIdentity(
+                "researcher", "peer", "research-team", null, false, null));
     }
 
     @Test
@@ -183,8 +186,8 @@ class SubagentToolTeammateSpawnBranchTest {
         //   干扰 lead 的归属判定（CC 注释 :267-271）。守卫必须先于 spawn 生效，绝不能静默放行。
         when(spawner.spawnInProcessTeammate(any(), any())).thenReturn(successOut());
 
-        ToolResult<?> result = TeammateContext.runWithTeammateContext(
-            inProcessTeammate(), () -> tool.execute(teammateCall(null), null, null));
+        // [S1-T6] 身份改为 TUC 显式载体（原 ThreadLocal 注入手法已随载体删除）。
+        ToolResult<?> result = tool.execute(teammateCall(null), inProcessTeammate(), null);
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
             .as("teammate 不能 spawn teammate → 守卫返回 error")
@@ -211,8 +214,7 @@ class SubagentToolTeammateSpawnBranchTest {
         input.put("run_in_background", true);
         ToolUseBlock call = new ToolUseBlock("tool-teammate-bg", "Agent", input);
 
-        ToolResult<?> result = TeammateContext.runWithTeammateContext(
-            inProcessTeammate(), () -> tool.execute(call, null, null));
+        ToolResult<?> result = tool.execute(call, inProcessTeammate(), null);
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
             .as("teammate 后台 spawn → 守卫返回 error（拒绝）")
@@ -244,8 +246,7 @@ class SubagentToolTeammateSpawnBranchTest {
         input.put("run_in_background", true);
         ToolUseBlock call = new ToolUseBlock("tool-teammate-bg-noname", "Agent", input);
 
-        ToolResult<?> result = TeammateContext.runWithTeammateContext(
-            inProcessTeammate(), () -> tool.execute(call, null, null));
+        ToolResult<?> result = tool.execute(call, inProcessTeammate(), null);
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
             .as("无 name 后台 spawn from in-process teammate → CC:279 守卫返回 error")
@@ -271,8 +272,7 @@ class SubagentToolTeammateSpawnBranchTest {
         input.put("run_in_background", true);
         ToolUseBlock call = new ToolUseBlock("tool-teammate-bg-noctxteam", "Agent", input);
 
-        ToolResult<?> result = TeammateContext.runWithTeammateContext(
-            inProcessTeammate(), () -> tool.execute(call, null, null));
+        ToolResult<?> result = tool.execute(call, inProcessTeammate(), null);
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
             .as("teammate 上下文 teamName 兜底 → CC:279 守卫返回 error")

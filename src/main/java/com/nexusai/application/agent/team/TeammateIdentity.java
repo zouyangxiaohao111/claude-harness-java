@@ -16,9 +16,10 @@ package com.nexusai.application.agent.team;
  * </pre>
  *
  * <p>说明：CC 注释「Same shape as TeammateContext (runtime) but stored as plain data」
- * （types.ts:8-12）——identity 是存入 AppState 的纯数据，TeammateContext 才是
- * AsyncLocalStorage 运行时载体。Java 侧对应关系：本 record 为纯数据载体；
- * {@link TeammateContext} 为 ThreadLocal 运行时载体。
+ * （types.ts:8-12）——identity 是存入 AppState 的纯数据，运行时载体是 AsyncLocalStorage。
+ * Java 侧对应关系（[S1-T4] 修订）：本 record 为<b>唯一</b>身份载体（纯数据），
+ * 原并行存在的 ThreadLocal 运行时载体类已删除 —— 身份一律经 ToolUseContext.teammateIdentity()
+ * 显式传参（用户铁律：回放不算合规）。
  *
  * @param agentId          完整 agent ID（"name@team"，CC types.ts:14）
  * @param agentName        agent 名（无 @ 后缀，CC types.ts:15）

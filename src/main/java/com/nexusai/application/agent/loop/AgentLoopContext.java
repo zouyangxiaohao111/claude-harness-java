@@ -2571,7 +2571,9 @@ public record AgentLoopContext(
         // 门控 3：in-process teammate 上下文 → 原样（防 teammate loop 误读 leader inbox，
         //   对齐 CC attachments.ts:3690-3692 isInProcessTeammate() 守卫 —— teammate 只经
         //   文件 mailbox + waitForNextPromptOrShutdown 收消息）
-        if (com.nexusai.application.agent.team.TeammateContext.getTeammateContext() != null) {
+        // [S1-T6] 判据改读**显式 TUC 载体**（原读 ThreadLocal）。identity 由 base TUC 盖章后随
+        //   TUC 显式下传（本方法已持有 per-turn tuc）；null = 非 teammate，与旧语义等价。
+        if (tuc.teammateIdentity() != null) {
             return messagesForLlm;
         }
         try {

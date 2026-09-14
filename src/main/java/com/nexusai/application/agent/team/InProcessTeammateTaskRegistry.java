@@ -76,7 +76,7 @@ public class InProcessTeammateTaskRegistry {
      *
      * <p>WHY（SendMessageTool shutdown approve 用）：模型批准 shutdown 时 SendMessageTool 只能拿到
      * shutdown_request.request_id（内含被 shutdown 的 teammate 名，CC agentId.ts:62-84），无 taskId /
-     * 无 teammate ThreadLocal（Java 工具经 CompletableFuture 异步执行，TeammateContext ThreadLocal 不可见）。
+     * 无 teammate ThreadLocal（Java 工具经 CompletableFuture 异步执行，thread-local 身份载体不可见）。
      * 故经 agentName 匹配 registry 中 loop 的 taskState().identity().agentName() 定位生命周期 abortController
      * （与 CC findTeammateTaskByAgentId 语义一致：匹配 identity.agentId，偏好 running）。
      *

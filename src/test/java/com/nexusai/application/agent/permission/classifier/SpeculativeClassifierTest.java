@@ -6,6 +6,7 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionRule;
@@ -216,27 +217,35 @@ class SpeculativeClassifierTest {
     }
 
     @Test
-    @DisplayName("getCwd(sessionId) 会话感知接线：无会话回落 user.dir，override 层返回会话 cwd（CC bashPermissions.ts:1513 + cwd.ts:26-32）")
+    @DisplayName("getCwd(sessionId) 会话感知接线：无会话回落 user.dir，会话 cwd 层返回该会话 cwd（CC bashPermissions.ts:1513 + cwd.ts:26-32）")
     void getCwd_sessionAware_wiringToCwdResolution(@TempDir Path sessionCwd) {
-        // WHY: P-2 接线意图 —— 分类器 cwd 必须经 CwdResolution.getCwd(sessionId)（override ?? sessionCwd ??
-        //      boundProject ?? user.dir 兜底链，对齐 CC getCwd 三层），而非直读 System.getProperty("user.dir")。
-        //      worktree/绑定项目会话下 user.dir 恒为 JVM 启动目录，直读会把 worktree 会话分类到错误 cwd。
-        //      本用例锁定：无会话零行为变化（回落 user.dir）+ 会话 override 层生效（非 user.dir）。
-        // 1) 无 override/session → 回落 user.dir（零行为变化）
-        CwdResolution.clearCurrentOverride();
+        // WHY: P-2 接线意图 —— 分类器 cwd 必须经 CwdResolution.getCwd(sessionId)（sessionCwd ??
+        //      boundProject ?? user.dir 兜底链，对齐 CC getCwd 分层回落），而非直读
+        //      System.getProperty("user.dir")。worktree/绑定项目会话下 user.dir 恒为 JVM 启动目录，
+        //      直读会把 worktree 会话分类到错误 cwd。
+        //      本用例锁定：无会话零行为变化（回落 user.dir）+ 会话 cwd 层生效（非 user.dir）。
+        //
+        // [S2 · F-07 2026-09-14] 原装置 = CwdResolution.setCurrentOverride(sessionCwd)
+        //   （override ThreadLocal 层，对齐 CC cwdOverrideStorage）。该通道已按用户裁定 #8
+        //   **整条删除** ⇒ 改锚到**生产真路径** SessionCwdHolder（会话级 cwd 槽 —— worktree 入口
+        //   EnterWorktreeTool 与 bash cd 写的就是这一层，[Fix-R1] 合并存储）。
+        //   语义变化：原「无会话 + override」→ 现「显式会话 + 会话 cwd 层」。
+        // 1) 无会话 → 回落 user.dir（零行为变化）
         assertThat(SpeculativeClassifier.getCwd(null))
             .as("无会话 → CwdResolution.getCwd(null) 回落 user.dir（对齐 CC 无会话兜底）")
             .isEqualTo(CwdResolution.getCwd(null))
             .isEqualTo(CwdResolution.normalizeCwd(System.getProperty("user.dir", ".")));
 
-        // 2) override 层（对齐 CC cwdOverrideStorage AsyncLocalStorage · cwd.ts:4）→ 会话显式 cwd 生效
-        CwdResolution.setCurrentOverride(sessionCwd.toString());
+        // 2) 会话 cwd 层（工作树入口 / bash cd 共用的那层）→ 该会话显式 cwd 生效
+        String sid = "sess-speculative-1";
+        SessionCwdHolder.set(sid, sessionCwd.toString());
         try {
-            assertThat(SpeculativeClassifier.getCwd("test-session"))
-                .as("override 层命中 → getCwd(sessionId) 返回会话 override cwd（非 user.dir）")
-                .isEqualTo(CwdResolution.normalizeCwd(sessionCwd.toString()));
+            assertThat(SpeculativeClassifier.getCwd(sid))
+                .as("会话 cwd 层命中 → getCwd(sessionId) 返回该会话 cwd（非 user.dir）")
+                .isEqualTo(CwdResolution.normalizeCwd(sessionCwd.toString()))
+                .isNotEqualTo(CwdResolution.normalizeCwd(System.getProperty("user.dir", ".")));
         } finally {
-            CwdResolution.clearCurrentOverride();
+            SessionCwdHolder.reset();
         }
     }
 }

@@ -2,10 +2,10 @@ package com.nexusai.application.agent.agent;
 
 import com.nexusai.common.SessionKeys;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.infra.exception.UnresolvedProjectRootException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.text.Normalizer;
 import java.util.function.Supplier;
@@ -19,25 +19,28 @@ import java.util.function.Supplier;
  *   <li>{@code cwd.ts:19-21} {@code pwd() = cwdOverrideStorage.getStore() ?? getCwdState()}（override ?? STATE.cwd）</li>
  *   <li>{@code cwd.ts:26-32} {@code getCwd() = try pwd() catch → getOriginalCwd()}（失败回 originalCwd）</li>
  *   <li>{@code cwd.ts:12-14} {@code runWithCwdOverride(cwd, fn)} 用 AsyncLocalStorage 在异步上下文覆盖
- *       cwd，并发 agent 各自隔离</li>
+ *       cwd，并发 agent 各自隔离 —— <b>本仓无对应物</b>（见「[S2 F-07] 删除 override 通道」）</li>
  *   <li>{@code state.ts:500-502} {@code getOriginalCwd()} 返回 {@code STATE.originalCwd}
  *       （启动=realpath cwd，随 worktree/resume 重锚）</li>
  *   <li>{@code state.ts:527-533} {@code STATE.cwd} 单一可变，{@code setCwdState} 做 NFC 归一化</li>
  * </ul>
  *
- * <p><b>分层解析</b>（{@link #getCwd(String)}，对齐 CC pwd/getCwd 三层）：
+ * <p><b>分层解析</b>（{@link #getCwd(String)}，对齐 CC pwd/getCwd 的<b>分层回落</b>语义；
+ * ⚠️ 本仓<b>已删</b> CC 的 override 层，故本仓为<b>两层</b>会话层 —— 见「[S2 F-07]」段）：
  * <pre>
  * getCwd(sessionId)  // sessionId 必填（null/空白 ⇒ 走 getCwdForNonSession()，见下）
  *   0. [批 6] sessionId == SessionKeys.NO_SESSION（显式「确无会话」哨兵）⇒ 直接走命名出口
  *      getCwdForNonSession() + ≥WARN（不查 DB、不打「伪造 id」告警）
- *   1. override = ThreadLocal CURRENT_OVERRIDE（对齐 CC cwdOverrideStorage AsyncLocalStorage；
- *      runWithCwdOverride 设置，退出 clear）→ 非空返回 normalizeCwd(override)
- *   2. sessionCwd = SessionCwdHolder.get(sessionId)（对齐 CC 单一 STATE.cwd；
+ *   1. sessionCwd = SessionCwdHolder.get(sessionId)（对齐 CC 单一 STATE.cwd；
  *      worktree 入口与 bash cd 共用此层，后者覆盖前者 [Fix-R1]）→ 非空返回 normalizeCwd
- *   3. boundProject = SessionProjectRoot.getForSession(sessionId)（D-1 裁决：仅绑定，
+ *   2. boundProject = SessionProjectRoot.getForSession(sessionId)（D-1 裁决：仅绑定，
  *      不读 resolve() 回落链——身份域红线；miss 时该方法自身回源 DB 并回填）→ 非空返回 normalizeCwd
- *   4. 三层全 MISS ⇒ 按 <b>DB 是否认得该会话</b> 分流（[批 4a] 用户裁定 #7/#13 的判据载体）：
+ *   3. 两层全 MISS ⇒ 按 <b>DB 给出的是哪种答案</b> 分流（[批 4a] 裁定 #7/#13 的判据载体 +
+ *      [S2 F-09/F-20] 新增第 4 态）：
  *      <ul>
+ *        <li><b>解析失败 / 无法判定</b>（回源解析器未接线 · 回源抛错 · 违约返回 null）⇒
+ *            <b>抛 IllegalStateException（fail-loud）</b>，文案与「未绑定」<b>可辨识</b>（[S2 F-09/F-20]
+ *            用户裁定 (A)：仍 fail-loud，但保留语义与纠错文案）</li>
  *        <li><b>会话存在（DB 有行）但无绑定项目根</b> ⇒ <b>抛 IllegalStateException（fail-loud）</b>
  *            —— 数据链路异常，⛔ 不得回落进程 user.dir 冒充会话项目根</li>
  *        <li><b>DB 无此会话</b>（合成/伪造/已删 id：MCP 入站调用 / standalone fork / subagent /
@@ -46,6 +49,39 @@ import java.util.function.Supplier;
  *            合成 id 生产点 + 100+ 测试类）</li>
  *      </ul>
  * </pre>
+ *
+ * <p><b>[S2 · F-09/F-20 2026-09-14 · 用户裁定 (A)] 新增第 4 态「解析失败」，三类吞点不再静默</b>：
+ * ① {@code SessionProjectRoot.refillFromDb} 的「解析器未接线」/「回源抛错」/「违约返回 null」三处
+ * 原为 {@code return Lookup.unknown()}（其中未接线那处<b>零日志</b>）⇒ 现统一 ≥WARN +
+ * {@link SessionProjectRoot.Lookup#resolutionFailed()}；② 本类 {@link #safeLookup} 的
+ * {@code catch(Exception)} 收窄为 {@link RuntimeException} 且强制 WARN、返回 resolutionFailed 而非
+ * unknown；③ {@link #safeGet} 同样收窄 + 带层名 WARN。⚠️ 判据是<b>同一个</b>「解析失败态」
+ * （F-09 与 F-20 共用，不产生两套判据）。
+ *
+ * <p><b>[S2 · F-09 反转既有裁定记录 · 必须显式保留]</b> 本项**反转**批 4a 用户已裁定的
+ * {@code CwdResolutionTest} scenario4（「无解析器 / 合成 id ⇒ 不抛」）：落地后「解析器未接线」
+ * 从「确无会话」变为「解析失败」⇒ 该场景**改为 fail-loud**。推翻的是「未接线 = 无会话」这一
+ * 批 4a 前提，理由 = 未接线是**装配异常**（本该有却没有），把它当选票投给「无会话」会让裁定 #7 的
+ * fail-loud 因装配异常全进程静默失效（原实现零日志，无人能发现）。旧行为 = 返回进程 user.dir 且不抛；
+ * 新行为 = 抛 IllegalStateException（reason 明确指向「无法判定」而非「无此会话」）。
+ * ⚠️ 生产不受影响：{@code ToolRegistrationConfig:1227} 已接线（见
+ * {@link SessionProjectRoot#isDbResolverWired()}），故该分支生产不可达、只在测试/装配故障时暴露。
+ *
+ * <p><b>[S2 · F-07 2026-09-14 · 用户裁定 #8] 删除 override 通道（CURRENT_OVERRIDE ThreadLocal）</b>：
+ * 原 L1 层 {@code ThreadLocal CURRENT_OVERRIDE} + {@code runWithCwdOverride/setCurrentOverride/
+ * clearCurrentOverride} 三方法 + 2 个读点（{@code getCwd} 的 L1、{@code getCwdForNonSession} 首层）
+ * 全部删除。理由（裁定 #8）：该通道<b>生产 0 写入点</b>（死管线 —— 全仓非本类命中均为 javadoc/注释），
+ * CC 的对应能力（{@code cwd.ts:12-14 runWithCwdOverride} 的 AsyncLocalStorage 覆盖）在本仓已由
+ * <b>另一实现</b>承接：{@code SubagentExecutor.withEffectiveCwd}（定义 :433 / 调用 :1918）+
+ * {@code AgentMemoryDirectory.withEffectiveCwd}（定义 :183 / 调用 :1933），即「TUC record 字段
+ * {@code effectiveCwd} 派生」而非线程本地覆盖 —— 本仓无 AsyncLocalStorage，且工具真正执行处是
+ * tool-exec 平台线程池 / STREAM_EXECUTOR 虚拟线程，该 ThreadLocal 结构上不可达（批 1 实测：唯一
+ * 真正生效的读点是 run 线程构造 base TUC 时的 effectiveCwd 快照，已由 {@code RunRequest.boundProject}
+ * 承接）。依 {@code dead-code-decision-rule}「对应物存在但已由另一实现承接 ⇒ 删除」。
+ *
+ * <p>⚠️ <b>删除后不构成「出口变强」</b>：因生产 0 写入点，{@code getCwdForNonSession()} 的行为
+ * 在删除前后<b>逐字节相同</b>（= {@code normalizeCwd(process user.dir)}）；变的只是「不再存在一条
+ * 可被误用的注入缝」。⛔ 不得据此宣称安全性提升。
  *
  * <p><b>[批 4a 2026-09-14 · 用户裁定 #7/#13] 删除 user.dir 兜底 + 新增显式无会话出口</b>：
  * <ul>
@@ -92,25 +128,18 @@ import java.util.function.Supplier;
  * realpath 解符号链接 + NFC 归一化；realpath 失败（目录被删/不存在）回原值 + NFC（不抛，对齐 CC catch 兜底）。
  *
  * <p><b>失败语义</b>（[批 4a] 由「恒非 null」改为 fail-loud）：{@link #getCwd(String)} 各层 safeGet
- * （层内异常回 null）逐层回落；<b>DB 认得该会话却三层全 MISS（含绑定失效）⇒ 抛</b>（不再回落 user.dir）；
+ * （层内异常回 null）逐层回落；<b>DB 认得该会话却两层全 MISS（含绑定失效）⇒ 抛</b>（不再回落 user.dir）；
  * <b>DB 无此会话</b>（合成/伪造 id）⇒ 无会话出口。只有 {@link #getCwdForNonSession()} 恒非 null
- * （override ?? 进程 user.dir）。
+ * （进程 user.dir）。
  *
  * <p><b>OD-1 决策</b>：{@code CwdOverride}（0 生产调用）已<b>合并入本类并删除</b>，无别名/双轨。
  *
- * <p>线程安全：{@link SessionCwdHolder} / {@link SessionProjectRoot} 内部 ConcurrentHashMap；
- * override 层 ThreadLocal（同 JVM 多线程=多 agent 各自隔离，对齐 CC AsyncLocalStorage 跨 async 边界语义）。
+ * <p>线程安全：{@link SessionCwdHolder} / {@link SessionProjectRoot} 内部 ConcurrentHashMap，
+ * 本类<b>零线程本地状态</b>（同 JVM 多会话各自按显式 sessionId 解析，与执行线程无关）。
  */
 public final class CwdResolution {
 
     private static final Logger log = LoggerFactory.getLogger(CwdResolution.class);
-
-    /**
-     * 当前线程显式 cwd override（对齐 CC {@code cwdOverrideStorage} AsyncLocalStorage · cwd.ts:4）。
-     * 由 {@link #runWithCwdOverride(String, Supplier)} / {@link #setCurrentOverride(String)} 设置，
-     * 退出 {@link #clearCurrentOverride()} 清除。子代理若跨线程需入口 set/finally clear。
-     */
-    private static final ThreadLocal<String> CURRENT_OVERRIDE = new ThreadLocal<>();
 
     /** null/空白 sessionId 的告警一次性开关（warnNullSession，见该方法 javadoc）。 */
     private static final java.util.concurrent.atomic.AtomicBoolean NULL_SESSION_WARNED =
@@ -129,7 +158,8 @@ public final class CwdResolution {
     /**
      * 统一入口：解析 sessionId 对应的当前工作目录（对齐 CC pwd/getCwd）。
      *
-     * <p>三层回落；各层 safeGet 异常回 null；<b>全 MISS ⇒ 抛</b>（无 user.dir 兜底，见类注释）。
+     * <p>两层回落（[S2 F-07] 已删 override 层）；各层 safeGet 异常回 null；<b>全 MISS ⇒ 抛</b>
+     * （无 user.dir 兜底，见类注释）。
      *
      * <p><b>[CRON-D5 F2 返工] 双键解析</b>：sessionCwd/SessionCwdHolder 层以派生 UUID 串为键
      * （BashTool/EnterWorktreeTool 以 {@code ctx.sessionId()} 登记），boundProject/
@@ -141,7 +171,7 @@ public final class CwdResolution {
      * @param sessionId 会话 ID（必填 —— null/空白 ⇒ 交由 {@link #getCwdForNonSession()} 按无会话解析）
      * @return 归一化 cwd；<b>DB 认得该会话却解析不出项目根 ⇒ 抛 IllegalStateException</b>；
      *         DB 无此会话 ⇒ 无会话出口值（进程 user.dir）
-     * @throws IllegalStateException 会话存在（DB 有行）但 override/sessionCwd/boundProject（含 DB 回源）
+     * @throws IllegalStateException 会话存在（DB 有行）但 sessionCwd/boundProject（含 DB 回源）
      *         全 MISS，或 boundProject 无效（非绝对路径/目录不存在）—— 数据链路异常，fail-loud
      */
     public static String getCwd(String sessionId) {
@@ -156,19 +186,23 @@ public final class CwdResolution {
             warnNoSessionSentinel("getCwd", "getCwdForNonSession");
             return getCwdForNonSession();
         }
-        // L1: override（对齐 CC cwdOverrideStorage.getStore()）
-        String override = safeGet(() -> CURRENT_OVERRIDE.get());
-        if (override != null && !override.isBlank()) {
-            return normalizeCwd(override);
-        }
-        // L2: sessionCwd（对齐 CC 单一 STATE.cwd · worktree 入口与 cd 共用 [Fix-R1] · F2 双键）
+        // L1: sessionCwd（对齐 CC 单一 STATE.cwd · worktree 入口与 cd 共用 [Fix-R1] · F2 双键）
+        //   [S2 F-07] 原「L1: override」层（CURRENT_OVERRIDE ThreadLocal）已按用户裁定 #8 删除。
         String sessionCwd = resolveSessionCwd(sessionId);
         if (sessionCwd != null) {
             return normalizeCwd(sessionCwd);
         }
-        // L3: boundProject（对齐 CC originalCwd 启动目录 · D-1 裁决仅读 getForSession · F2 双键）
+        // L2: boundProject（对齐 CC originalCwd 启动目录 · D-1 裁决仅读 getForSession · F2 双键）
         //     getForSession/lookup 内部 miss 时回源 DB 并回填（批 4a #9）⇒ 后端重启后首条消息前也能命中。
         SessionProjectRoot.Lookup bound = resolveBoundProject(sessionId);
+        // [S2 · F-09/F-20 2026-09-14 · 用户裁定 (A)] 第 4 态「解析失败」= 仍 fail-loud 抛，
+        //   但**保留可辨识语义与纠错文案**（⛔ 不与「有会话但未绑定」共用同一句 —— 那是 DB 给出了
+        //   明确答案；本态是「DB 没给出答案」）。判据来源见 SessionProjectRoot.Lookup#resolutionFailed()。
+        if (bound.resolutionFailed()) {
+            throw unresolvedProjectRoot(sessionId,
+                "项目根**无法判定**（非「无此会话」也非「未绑定」）—— 判据来源 = DB 回源解析器未接线，"
+                    + "或回源查询抛错 / 违约返回 null（详见同刻 ≥WARN 日志 [SessionProjectRoot]）");
+        }
         String boundProject = bound.projectRoot();
         if (boundProject != null) {
             if (isValidDirectory(boundProject)) {
@@ -229,11 +263,11 @@ public final class CwdResolution {
         }
         // [INV-3] L1: originalCwd 重锚层（worktree 入口 setOriginalCwd(worktreePath)，Exit clear 回落 ·
         //   F2 双键，见 {@link #alternateKeyOf}）
-        String originalCwd = safeGet(() -> SessionCwdHolder.getOriginalCwd(sessionId));
+        String originalCwd = safeGet("originalCwd", () -> SessionCwdHolder.getOriginalCwd(sessionId));
         if (originalCwd == null || originalCwd.isBlank()) {
             String alt = alternateKeyOf(sessionId);
             if (alt != null) {
-                originalCwd = safeGet(() -> SessionCwdHolder.getOriginalCwd(alt));
+                originalCwd = safeGet("originalCwd(alt)", () -> SessionCwdHolder.getOriginalCwd(alt));
             }
         }
         if (originalCwd != null && !originalCwd.isBlank()) {
@@ -242,6 +276,12 @@ public final class CwdResolution {
         // L2: boundProject（对齐 CC originalCwd 启动目录 · D-1 裁决仅读 getForSession · F2 双键 ·
         //   miss 回源 DB + 回填，批 4a #9）
         SessionProjectRoot.Lookup bound = resolveBoundProject(sessionId);
+        // [S2 · F-09/F-20] 第 4 态「解析失败」⇒ fail-loud（见 getCwd 同段注释）
+        if (bound.resolutionFailed()) {
+            throw unresolvedProjectRoot(sessionId,
+                "项目根**无法判定**（非「无此会话」也非「未绑定」）—— 判据来源 = DB 回源解析器未接线，"
+                    + "或回源查询抛错 / 违约返回 null（详见同刻 ≥WARN 日志 [SessionProjectRoot]）");
+        }
         String boundProject = bound.projectRoot();
         if (boundProject != null) {
             if (isValidDirectory(boundProject)) {
@@ -267,20 +307,20 @@ public final class CwdResolution {
      * <p>命名自解释：调用它 = 「本处确实没有会话标识，不需要会话项目根」。适用对象为
      * 启动期 bean / MCP transport / 进程级默认 supplier 等<b>结构上拿不到 sessionId</b> 的场景。
      *
-     * <p>解析层 = override（显式 cwd 覆盖仍生效，保持与旧 {@code getCwd(null)} 逐字节同行为）
-     * → 进程 {@code user.dir}（JVM 启动目录）。<b>不读</b> sessionCwd / boundProject 会话层。
+     * <p>解析层 = 进程 {@code user.dir}（JVM 启动目录，经 {@link #normalizeCwd} realpath+NFC）。
+     * <b>不读</b> sessionCwd / boundProject 会话层。
+     * <p>[S2 F-07] 原首层 override 已按用户裁定 #8 删除 ⇒ 本出口恒等于
+     * {@code normalizeCwd(process user.dir)}。
      *
      * <p>⛔ 有 sessionId 的调用方<b>不得</b>用它绕开 fail-loud（那是数据链路异常，应当暴露）。
      *
-     * @return 恒非 null 的归一化 cwd（override ?? 进程 user.dir）
+     * @return 恒非 null 的归一化 cwd（进程 user.dir）
      */
     public static String getCwdForNonSession() {
-        String override = safeGet(() -> CURRENT_OVERRIDE.get());
-        if (override != null && !override.isBlank()) {
-            return normalizeCwd(override);
-        }
+        // [S2 F-07] 原首层 override（CURRENT_OVERRIDE ThreadLocal）已按用户裁定 #8 删除 ⇒
+        //   本出口现恒等于 normalizeCwd(process user.dir)（生产 0 写入点使删除前后逐字节同值）。
         if (log.isDebugEnabled()) {
-            log.debug("[CwdResolution] 无会话解析 cwd（override 空 → 进程 user.dir）: user.dir={}",
+            log.debug("[CwdResolution] 无会话解析 cwd（进程 user.dir）: user.dir={}",
                 System.getProperty("user.dir"));
         }
         String userDir = System.getProperty("user.dir");
@@ -338,20 +378,23 @@ public final class CwdResolution {
      * @param cwd 待归一化路径
      * @return 归一化路径（null/空 原样返回）
      */
-    /** boundProject 有效性校验 · [2026-08-24 cwd 污染修复] 相对/不存在路径是无效绑定
-     *  （如「抓包流程」），返回会污染工具 cwd 致 Bash/Glob/Read 全失败；仅绝对路径且目录存在
-     *   才算有效。 */
-    /** [cwd-consistency 2026-08-25] private→public：LlmAgentLoop 冻结 projectRoot 前校验（与 getCwd 一致化）。 */
+    /**
+     * boundProject 有效性校验 · <b>委托 {@link SessionProjectRoot#isValidProjectRoot(String)}</b>
+     * （[S2 · F-24-merge Step 1 2026-09-14] 差异 A 消除）。
+     *
+     * <p>[2026-08-24 cwd 污染修复] 相对/不存在路径是无效绑定（如「绑定『抓包流程』」），返回会污染
+     * 工具 cwd 致 Bash/Glob/Read 全失败；仅绝对路径且目录存在才算有效。
+     * <p>[cwd-consistency 2026-08-25] private→public：LlmAgentLoop 冻结 projectRoot 前校验。
+     *
+     * <p><b>[S2 Step 1] 本方法不再自带实现</b>：原为 `isValidProjectRoot` 的**第二份拷贝**
+     * （同 `p.isAbsolute() && Files.isDirectory(p)` + 同 catch），是「同一能力两套判据」的实例。
+     * 现唯一实现下沉到 {@code common} 的 {@link SessionProjectRoot#isValidProjectRoot}，
+     * 本方法只做委托（`application→common` 既有方向，不成环）。保留本名是因为它有 130+ 调用点。
+     * <p>⛔ 不要在本方法里重新写判据 —— 那会再次制造两份拷贝
+     * （`SessionProjectRootValidityParityTest` 会红）。
+     */
     public static boolean isValidDirectory(String path) {
-        if (path == null || path.isBlank()) {
-            return false;
-        }
-        try {
-            Path p = Path.of(path);
-            return p.isAbsolute() && Files.isDirectory(p);
-        } catch (Exception e) {
-            return false;
-        }
+        return SessionProjectRoot.isValidProjectRoot(path);
     }
 
     public static String normalizeCwd(String cwd) {
@@ -371,51 +414,32 @@ public final class CwdResolution {
     }
 
     /**
-     * 在当前线程覆盖 cwd 执行 fn（对齐 CC {@code runWithCwdOverride(cwd, fn)} cwd.ts:12-14）。
+     * safeGet：<b>层内</b>读取异常回 null（对齐 CC getCwd catch → getOriginalCwd 兜底语义）。
      *
-     * <p>对齐 CC AsyncLocalStorage.run：override 在 fn 内及同线程调用链生效，fn 返回/异常后 finally clear。
-     * 子代理若跨线程需入口 set/finally clear。
+     * <p>[S2 · F-09 2026-09-14] 收窄为 {@link RuntimeException} 且<b>强制 ≥WARN（带层名）</b>：
+     * 原 {@code catch (Exception)} 回 null 是**零日志**的静默降级 —— 任一层的读取炸掉都会被
+     * 当成「该层 MISS」而悄悄落到下一层（甚至落到 user.dir）。现改为可观测：异常不再无声。
+     * ⛔ 仍回 null（保留分层回落语义）：本方法守的是「层内异常不得中断整条回落链」，
+     * 而「全层 MISS 之后怎么办」由 {@link #getCwd(String)} 的 fail-loud 判据承接。
      *
-     * @param cwd override 工作目录
-     * @param fn  待执行逻辑
-     * @param <T> 返回类型
-     * @return fn 返回值
+     * <p>⚠️ <b>真实守护范围（照实声明）</b>：{@link SessionCwdHolder} 的两个读点
+     * （{@code get}/{@code getOriginalCwd}）当前**不抛**，测试也无注入点 ⇒ 本 catch 与新增的
+     * WARN 目前**零覆盖**（同 {@link #safeLookup}，反向实验实测无红）。其价值仅为「将来这两个
+     * 读点开始抛时不再静默」的回归预防；本次改动的可观测收益是把**原零日志**的静默降级变成
+     * 带层名的 ≥WARN，⛔ 不等于「新增了行为守卫」。
+     *
+     * @param layer 层名（仅用于日志定位，如 {@code "sessionCwd"} / {@code "originalCwd"}）
+     * @param s     层读取器（null → 直接 null）
      */
-    public static <T> T runWithCwdOverride(String cwd, Supplier<T> fn) {
-        setCurrentOverride(cwd);
-        try {
-            return fn.get();
-        } finally {
-            clearCurrentOverride();
-        }
-    }
-
-    /**
-     * 设置当前线程 cwd override（null 等价清除）。
-     */
-    public static void setCurrentOverride(String cwd) {
-        if (cwd == null) {
-            CURRENT_OVERRIDE.remove();
-        } else {
-            CURRENT_OVERRIDE.set(cwd);
-        }
-    }
-
-    /** 清除当前线程 override（会话处理结束 finally 调）。 */
-    public static void clearCurrentOverride() {
-        CURRENT_OVERRIDE.remove();
-    }
-
-    /**
-     * safeGet：异常回 null（对齐 CC getCwd catch → getOriginalCwd 兜底语义）。
-     */
-    private static String safeGet(Supplier<String> s) {
+    private static String safeGet(String layer, Supplier<String> s) {
         if (s == null) {
             return null;
         }
         try {
             return s.get();
-        } catch (Exception e) {
+        } catch (RuntimeException e) {
+            log.warn("[CwdResolution] {} 层读取抛未预期异常 ⇒ 该层按 MISS 处理（继续回落下一层）: err={}",
+                layer, e.toString());
             return null;
         }
     }
@@ -423,41 +447,77 @@ public final class CwdResolution {
     /** sessionCwd 层解析（F2 双键：原键 → 另一形态；空/异常 → null）。
      *  <p>抽自 getCwd/getOriginalCwdLayer 两份同构代码，避免双键逻辑双轨。 */
     private static String resolveSessionCwd(String sessionId) {
-        String sessionCwd = safeGet(() -> SessionCwdHolder.get(sessionId));
+        String sessionCwd = safeGet("sessionCwd", () -> SessionCwdHolder.get(sessionId));
         if (sessionCwd == null || sessionCwd.isBlank()) {
             String alt = alternateKeyOf(sessionId);
             if (alt != null) {
-                sessionCwd = safeGet(() -> SessionCwdHolder.get(alt));
+                sessionCwd = safeGet("sessionCwd(alt)", () -> SessionCwdHolder.get(alt));
             }
         }
         return (sessionCwd != null && !sessionCwd.isBlank()) ? sessionCwd : null;
     }
 
-    /** boundProject 层三态解析（F2 双键）· {@code lookup} 内部 miss 回源 DB 并回填（批 4a #9）。 */
+    /** boundProject 层多态解析（F2 双键）· {@code lookup} 内部 miss 回源 DB 并回填（批 4a #9）。
+     *  <p>[S2 F-09 2026-09-14] 合并规则扩到四态：<b>任一键「解析失败」⇒ 结果解析失败</b>
+     *  （⛔ 不得被另一键的 unknown 冲掉），且「解析失败」优先于「无此会话」。 */
     private static SessionProjectRoot.Lookup resolveBoundProject(String sessionId) {
         SessionProjectRoot.Lookup bound = safeLookup(sessionId);
-        if (bound.projectRoot() == null || bound.projectRoot().isBlank()) {
-            String alt = alternateKeyOf(sessionId);
-            if (alt != null) {
-                SessionProjectRoot.Lookup altLookup = safeLookup(alt);
-                // 合并两键结果：只要任一键给出绑定 → 绑定；任一键证明会话存在 → 会话存在
-                if (altLookup.projectRoot() != null && !altLookup.projectRoot().isBlank()) {
-                    return altLookup;
-                }
-                if (altLookup.sessionKnown() && !bound.sessionKnown()) {
-                    return altLookup;
-                }
+        if (bound.projectRoot() != null && !bound.projectRoot().isBlank()) {
+            return bound;
+        }
+        // 仅在「原键无绑定」时才查另一形态键（保持既有惰性：有绑定时不多一次 DB 往返）
+        SessionProjectRoot.Lookup altLookup = null;
+        String alt = alternateKeyOf(sessionId);
+        if (alt != null) {
+            altLookup = safeLookup(alt);
+            // 合并两键结果：只要任一键给出绑定 → 绑定
+            if (altLookup.projectRoot() != null && !altLookup.projectRoot().isBlank()) {
+                return altLookup;
             }
+        }
+        // 无可用绑定 ⇒ 「会话存在」优先（任一键证明会话存在 → 会话存在）
+        if (bound.sessionKnown()) {
+            return bound;
+        }
+        if (altLookup != null && altLookup.sessionKnown()) {
+            return altLookup;
+        }
+        // [S2 F-09] 无绑定且两键皆不证明会话存在 ⇒ 任一键「解析失败」必须浮出（优先于 unknown）
+        if (bound.resolutionFailed()) {
+            return bound;
+        }
+        if (altLookup != null && altLookup.resolutionFailed()) {
+            return altLookup;
         }
         return bound;
     }
 
-    /** safeLookup：异常 → 无此会话（对齐 safeGet 的「层内异常不抛」语义）。 */
+    /**
+     * safeLookup：层内异常 → <b>「解析失败」</b>（[S2 F-09 2026-09-14] 收窄 + 强制 ≥WARN）。
+     *
+     * <p><b>WHY 改</b>：原 {@code catch (Exception) → Lookup.unknown()} 会把「解析本身炸了」静默
+     * 投给「确无会话」⇒ 用户裁定 #7 的 fail-loud 被整体旁路（正是根因 3 的落点）。现收窄为
+     * {@link RuntimeException}（{@code SessionProjectRoot.lookup} 全函数声明上不抛 checked）
+     * 并强制 WARN；返回值改用可辨识的 {@link SessionProjectRoot.Lookup#resolutionFailed()}。
+     *
+     * <p>⚠️ <b>本守卫的真实守护范围（反向实验实测，2026-09-14 · 必须照实声明）</b>：本 catch
+     * <b>当前零覆盖</b> —— 把它的返回值改回 {@code Lookup.unknown()} 后
+     * {@code SessionProjectRootTest / CwdResolutionTest / PathGuardCwdResolutionTest} 全绿
+     * （实测 36 tests / 0 failures）。原因是 {@code SessionProjectRoot.lookup} 自身结构上不抛
+     * （{@code refillFromDb} 已在其内部自吞全部 {@code Exception}），且测试无法注入会抛的 lookup。
+     * ⇒ 它的价值**仅为**「将来有人给 {@code lookup} 加抛点时不被静默吞成 unknown」的回归预防；
+     * ⛔ 不得声称它对当下行为有任何守护力（本仓已连续多次栽在「声称守护 X、实际守不住」）。
+     * 真正承重的那一半是 {@code SessionProjectRoot.refillFromDb} 的 catch —— 它由
+     * {@code SessionProjectRootTest.dbResolverThrowing_reportsResolutionFailureWithWarn} 守护
+     * （实测该处置回 unknown ⇒ 必红）。
+     */
     private static SessionProjectRoot.Lookup safeLookup(String sessionId) {
         try {
             return SessionProjectRoot.lookup(sessionId);
-        } catch (Exception e) {
-            return SessionProjectRoot.Lookup.unknown();
+        } catch (RuntimeException e) {
+            log.warn("[CwdResolution] SessionProjectRoot.lookup 抛出未预期异常 ⇒ 按「解析失败」处理"
+                + "（⛔ 不得静默当成『确无会话』）: sessionId={} err={}", sessionId, e.toString());
+            return SessionProjectRoot.Lookup.resolutionFailure();
         }
     }
 
@@ -467,13 +527,19 @@ public final class CwdResolution {
      * <p>⛔ 不得改回回落 {@code user.dir}：user.dir 是<b>进程级常量</b>（后端启动目录），
      * 不是会话项目根；回落会让工具/权限/transcript 全锚到后端目录（已造成过真实误删，
      * 见 {@code SessionService} 删除清理的顺序修复注释）。
+     *
+     * <p><b>[S2 · F-03b 2026-09-14 · 用户裁定 #12 (B2)] 返回类型
+     * {@link IllegalStateException} → {@link UnresolvedProjectRootException}</b>：新类型
+     * {@code extends IllegalStateException} ⇒ 既有 4 处 {@code isInstanceOf(IllegalStateException)}
+     * 断言与全部 {@code catch (ISE)} 吞点<b>行为不变</b>，同时让 REST 边界可经
+     * {@code GlobalExceptionHandler} 单点译 <b>400</b>（原为 500）。⛔ 不是 409。
      */
-    private static IllegalStateException unresolvedProjectRoot(String sessionId, String reason) {
+    private static UnresolvedProjectRootException unresolvedProjectRoot(String sessionId, String reason) {
         String msg = "[CwdResolution] 会话 " + sessionId + " 项目根解析失败（数据链路异常 —— web 会话必须"
             + "绑定项目才能进行）: " + reason + "。请检查 sessions.main_project_id → projects.path；"
             + "确无会话的调用方请显式走 getCwdForNonSession()/getOriginalCwdLayerForNonSession()。";
         log.error(msg);
-        return new IllegalStateException(msg);
+        return new UnresolvedProjectRootException(msg);
     }
 
     /**

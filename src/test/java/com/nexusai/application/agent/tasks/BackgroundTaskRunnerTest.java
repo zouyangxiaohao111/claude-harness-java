@@ -6,6 +6,7 @@ import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -62,6 +63,21 @@ import static org.mockito.Mockito.mock;
  */
 @DisplayName("[R-A7/方案B] BackgroundTaskRunner outputFile 路径对齐 CC 五层 getTaskOutputDir")
 class BackgroundTaskRunnerTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     /** [批 3b-D7] workflow 任务的显式创建会话（旧实现由下游读 ambient 会话槽）。 */
     private static final String WF_SESSION = "sess-wf-3b-fixture";

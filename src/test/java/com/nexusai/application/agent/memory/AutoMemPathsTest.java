@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.memory;
 
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
 import com.nexusai.application.agent.skill.ClaudePaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
@@ -950,7 +952,98 @@ class AutoMemPathsTest {
         assertThat(code).as("git %s failed: %s", String.join(" ", args), out).isEqualTo(0);
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // [P1a F-06] 无有效项目根：生产者侧必须 ≥WARN（原只有 DEBUG）+ 文案区分两种原因 + 一次性限流
+    // ════════════════════════════════════════════════════════════════
+
+    /**
+     * WHY（规则九 · 规则十二）：{@code isEligibleProjectRoot} 为 false 时返回 null 是<b>正确</b>的
+     * （本仓发明，CC 的 {@code getAutoMemBase()} 恒返回 string —— claude-code-best/src/memdir/paths.ts:203-205
+     * {@code findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot()}，CC 进程单例 projectRoot 恒非空），
+     * 但「本该有却没有」这一判据必须可观测：旧实现只有 {@code log.isDebugEnabled()} 的 debug
+     * ⇒ 生产环境「未绑定会话 ⇒ 记忆目录整体静默降级」不可见。裁定 #20 (B)：一次性 WARN。
+     */
+    @Test
+    @DisplayName("[P1a F-06] 无有效项目根（null/空白）⇒ getAutoMemPath/getAutoMemBase 返回 null 且 ≥WARN（原只 DEBUG）")
+    void noEligibleProjectRoot_nullRoot_warns() {
+        AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        AutoMemPaths paths = paths(null, null, null, null);
+        ListAppender<ILoggingEvent> app = attachAutoMemWarnCapture();
+        try {
+            assertThat(paths.getAutoMemPath()).as("无有效项目根 ⇒ null（不伪造）").isNull();
+            assertThat(paths.getAutoMemBase()).as("无有效项目根 ⇒ null（不伪造）").isNull();
+
+            assertThat(app.list.stream().map(ILoggingEvent::getFormattedMessage))
+                .as("返回 null 必须留下 ≥WARN（旧实现只 DEBUG ⇒ 生产不可见）")
+                .anyMatch(m -> m.contains("无有效项目根") && m.contains("null/空白"));
+        } finally {
+            detachAutoMemWarnCapture(app);
+            AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        }
+    }
+
+    @Test
+    @DisplayName("[P1a F-06] config-home 被当项目根 ⇒ ≥WARN 文案区分「回落污染信号」（与 null/空白 不同因）")
+    void noEligibleProjectRoot_configHome_warnsWithPollutionReason(@TempDir Path configHome) {
+        AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+        BundledSkillEnabledGates.bridgeSettingsMapper(null);
+        ListAppender<ILoggingEvent> app = attachAutoMemWarnCapture();
+        try {
+            AutoMemPaths paths = paths(configHome.toString(), configHome.toString(), null, null);
+            assertThat(paths.getAutoMemPath()).isNull();
+
+            assertThat(app.list.stream().map(ILoggingEvent::getFormattedMessage))
+                .as("两种 null 原因文案必须可区分：命中 config-home/memoryBase = 回落污染信号")
+                .anyMatch(m -> m.contains("无有效项目根") && m.contains("回落污染信号"));
+        } finally {
+            detachAutoMemWarnCapture(app);
+            NexusaiPaths.setConfigHomeDirOverride(null);
+            AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        }
+    }
+
+    @Test
+    @DisplayName("[P1a F-06] 告警按调用点各自一次性：同点重复调用只打一次，不同点各打一次（防 render-path 刷屏）")
+    void noEligibleProjectRoot_warnIsEmittedOncePerCallSite() {
+        AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        AutoMemPaths paths = paths(null, null, null, null);
+        ListAppender<ILoggingEvent> app = attachAutoMemWarnCapture();
+        try {
+            paths.getAutoMemPath();
+            paths.getAutoMemPath();
+            paths.getAutoMemBase();
+
+            List<String> msgs = app.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+            assertThat(msgs.stream().filter(m -> m.contains("getAutoMemPath 无有效项目根")).count())
+                .as("同一调用点重复触发只打一次（第一次必须打：可观测性下限）")
+                .isEqualTo(1);
+            assertThat(msgs.stream().filter(m -> m.contains("getAutoMemBase 无有效项目根")).count())
+                .as("不同调用点各自一次（⛔ 不能做成全进程一条：消费侧每次都先调生产者，"
+                    + "全局单条会让消费侧告警结构上不可达）")
+                .isEqualTo(1);
+        } finally {
+            detachAutoMemWarnCapture(app);
+            AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        }
+    }
+
     // ── helpers ──
+
+    private static ListAppender<ILoggingEvent> attachAutoMemWarnCapture() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(AutoMemPaths.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        return appender;
+    }
+
+    private static void detachAutoMemWarnCapture(ListAppender<ILoggingEvent> appender) {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(AutoMemPaths.class);
+        logger.detachAppender(appender);
+    }
 
     /** 在目录中执行 git init（初始化测试用临时 git 仓库）。 */
     private static void initGitRepo(Path dir) throws Exception {

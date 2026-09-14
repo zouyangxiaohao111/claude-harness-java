@@ -108,12 +108,20 @@ class SessionKeysTest {
 
     /**
      * ⭐ [批 6] 承重消费方复核（用户裁定 #1 明确要求改后**再核一次**）。
-     * 这三个消费方是「{@code "sess-"} 前缀在本仓语义承重」的全部落点（全仓 grep 实测）：
-     * {@code AutoDreamConsolidator:667}（包含式形态校验）· {@code SessionKeys} 自身两个方法 ·
-     * {@code CwdResolution:306 alternateKeyOf}。哨兵换形态后必须**逐个不抛且行为可预期**。
+     *
+     * <p>本用例只覆盖<b>两个</b>消费方 —— {@link SessionKeys} 自身两个方法。它们是「哨兵换形态后
+     * 本类内部不抛且行为可预期」的真守卫（直调本尊，见下方两条断言）。
+     *
+     * <p>⛔ <b>〔假守卫族修复 · F-11〕</b>原用例还有「消费者 3 = {@code AutoDreamConsolidator}
+     * 的包含式形态校验」，但那一段是<b>把该类的判据在测试里就地重写后用同一表达式断言自己</b>
+     * （测试内自建正则 + 自建 {@code startsWith}，对被测对象零引用、零调用）⇒ 改动生产守卫
+     * （{@code AutoDreamConsolidator.java:699}）时它恒绿，<b>声称守护实际守不住</b>。该段已删除。
+     * 「哨兵被 transcript 扫描排除」的真守卫改挂在<b>同包</b>测试
+     * {@code AutoDreamConsolidatorTest#sessionGate_excludesNoSessionSentinel}
+     * （直调包内 {@code scanSessionTranscripts}，含正向对照）。
      */
     @Test
-    @DisplayName("[批 6] 哨兵经 3 个承重消费方：canonicalUuid 走 hash 兜底不抛 / originalKey 诚实降级 null")
+    @DisplayName("[批 6] 哨兵经承重消费方：canonicalUuid 走 hash 兜底不抛 / originalKey 诚实降级 null")
     void noSessionSentinel_survivesLoadBearingConsumers() {
         // 消费者 1: canonicalUuid —— 旧实现在「8 位」与「sess- 前缀」上的特判都不命中 ⇒ hash 兜底
         UUID hashUuid = SessionKeys.canonicalUuid(SessionKeys.NO_SESSION);
@@ -127,15 +135,8 @@ class SessionKeysTest {
         assertThat(SessionKeys.originalKey(SessionKeys.NO_SESSION)).isNull();
         assertThat(SessionKeys.originalKey(hashUuid)).isNull();
 
-        // 消费者 3: AutoDreamConsolidator:667 的包含式守卫语义（!isUuid && !startsWith("sess-") ⇒ 排除）
-        //   此处以「等价判据」锁定哨兵会被排除（该类该行为包内静态，无法直调；用同一表达式表达意图）
-        java.util.regex.Pattern uuidRe = java.util.regex.Pattern.compile(
-            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            java.util.regex.Pattern.CASE_INSENSITIVE);
-        boolean looksLikeUuid = uuidRe.matcher(SessionKeys.NO_SESSION).matches();
-        boolean hasSessPrefix = SessionKeys.NO_SESSION.startsWith("sess-");
-        assertThat(looksLikeUuid || hasSessPrefix)
-            .as("哨兵不得被 AutoDreamConsolidator:667 当合法会话键纳入（两个纳入条件均须为假）")
-            .isFalse();
+        // ⛔ 原「消费者 3: AutoDreamConsolidator 的包含式守卫」整块已删（F-11 假守卫族）——
+        //   该块在本类内自建正则 + 自建 startsWith 后断言自己，对生产守卫零引用零调用 ⇒ 零鉴别力。
+        //   真守卫见 AutoDreamConsolidatorTest#sessionGate_excludesNoSessionSentinel（同包直调）。
     }
 }

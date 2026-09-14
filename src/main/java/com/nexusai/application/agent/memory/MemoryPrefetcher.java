@@ -350,9 +350,8 @@ public class MemoryPrefetcher {
         String autoMem = autoMemPaths.getAutoMemPath(sessionProjectRoot);
         // A′: 无有效项目（config-home 回落）→ auto-memory per-project 目录不存在 → 空检索目录（跳过预取）
         if (autoMem == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[MemoryPrefetcher] resolveMemoryDirs 无有效项目（auto-memory 目录不存在），返回空检索目录");
-            }
+            // [P1a F-06] 消费侧静默点：原来只有 debug（生产不可见）⇒ 提为统一 ≥WARN 出口
+            autoMemPaths.logNoEligibleProject("MemoryPrefetcher.resolveMemoryDirs", sessionProjectRoot);
             return List.of();
         }
         return List.of(Path.of(autoMem));

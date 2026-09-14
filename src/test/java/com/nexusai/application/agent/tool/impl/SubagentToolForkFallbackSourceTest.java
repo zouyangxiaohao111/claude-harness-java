@@ -83,14 +83,20 @@ class SubagentToolForkFallbackSourceTest {
             // [R2-ForkFallback] 5 参签名: (ToolUseBlock, ToolUseContext,
             //   Consumer<Tool.ToolProgress> onProgress, AgentOptions, ForkSubagentMessages.Message)
             //   SubagentTool.java:1487-1490 (grep 验证) · onProgress 对齐 CC AgentTool.tsx:250
+            // [S1-T3] 追加第 6 参 TeammateIdentity：本类用例是 **fork 路径 / Agent 工具子代理**，
+            //   ctx 为 null 或测试构造的普通 TUC（无 teammate 身份）⇒ 第 6 实参传 null（非 teammate），
+            //   与生产调用点同源（StreamingToolExecutor: ctx != null ? ctx.teammateIdentity() : null）。
+            //   ⛔ 不得传夹具身份：非 null 会命中 doExecute 内 CC:272/278 teammate 守卫并提前返回，
+            //   使本类断言的 forkParentSystemPrompt 回落逻辑根本不被执行（假绿）。
             Method m = SubagentTool.class.getDeclaredMethod("doExecute", ToolUseBlock.class,
                 ToolUseContext.class,
                 java.util.function.Consumer.class,
                 Class.forName("com.nexusai.application.agent.subagent.createSubagentContext$AgentOptions"),
-                Class.forName("com.nexusai.application.agent.subagent.ForkSubagentMessages$Message"));
+                Class.forName("com.nexusai.application.agent.subagent.ForkSubagentMessages$Message"),
+                com.nexusai.application.agent.team.TeammateIdentity.class);
             m.setAccessible(true);
             try {
-                m.invoke(tool, call, ctx, null, null, null);
+                m.invoke(tool, call, ctx, null, null, null, null);
             } catch (Throwable ignored) {
                 // 下游 (llmProviderFactory=null) 抛异常属预期 — 断言只依赖 executeAsync 派生日志
             }

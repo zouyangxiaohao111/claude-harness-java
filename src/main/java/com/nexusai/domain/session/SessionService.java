@@ -160,6 +160,20 @@ public class SessionService {
         if (!hasTitle && !hasModelName) {
             throw new ValidationException("Session requires at least one of: title, modelName");
         }
+        // [S3 · F-03a · 档二服务深守卫 2026-09-14 用户裁定] mainProjectId 必填。
+        //   WHY 与 SessionController 的 @Valid 并存：@Valid 只覆盖 HTTP 入口（curl 也走那条），
+        //   挡不住<b>域内直构</b>——SessionServiceTest 里 create_persistsBareModeTrue /
+        //   create_nullBareModeStaysNull 就是直接 new SessionCreateRequest(...) 调本方法，
+        //   @Valid 完全不参与。守卫放这里才能保证「未绑定会话」在服务层不可构造。
+        //   判据是 isBlank 而非 ==null：前端 EMPTY_PROJECT.id === '' 会送空串，@NotNull 挡不住 ⇒ 空转。
+        //   fail loud（规则十二）：抛 ValidationException ⇒ GlobalExceptionHandler → 400，不静默跳过。
+        //   本守卫的鉴别装置：SessionServiceTest.create_blankMainProjectId_throws
+        //   （判据退回 ==null ⇒ 该用例红；create_missingMainProjectId_throws 仍绿）。
+        if (req.mainProjectId() == null || req.mainProjectId().isBlank()) {
+            log.warn("[SessionService] create 拒绝：mainProjectId 缺失或空白（title={}）",
+                req.title());
+            throw new ValidationException("Session requires mainProjectId");
+        }
 
         // T2.2 对齐 CC: model_name 仅在显式传入时落库（会话 override），否则 null。
         //   null 合法 —— 读时由 ChatService.resolveModelNameForSession 运行时解析:

@@ -273,10 +273,20 @@ class E1aForkShieldGateTest {
         LlmProvider provider = Mockito.mock(LlmProvider.class);
         org.mockito.stubbing.Answer<Object> answer = inv -> {
             Object[] args = inv.getArguments();
-            // 19 参 = blocks+thinkingConfig 重载（onChunk/onAssistantMessage/onComplete 各后移一位）
-            int chunkIdx = args.length == 19 ? 10 : 9;
-            int msgIdx = args.length == 19 ? 11 : 10;
-            int doneIdx = args.length == 19 ? 17 : 16;
+            // [fix-junit 2026-09-14] 位置常量按**重载 arity** 分派（⛔ 原注释与代码皆错，见下）：
+            //   · 20 参 = blocks+thinkingConfig 重载（onChunk/onAssistantMessage/onComplete 各后移一位）；
+            //   · 19 参 = 两个**无 thinkingConfig** 的重载（抽象 blocks 重载 / default String 版）——
+            //     其 onChunk@9 / onAssistantMessage@10 / onComplete@16。
+            // ⛔ 原实现写 `== 19 ? 大值 : 小值` + 注释「19 参 = blocks+thinkingConfig 重载」，两者互为
+            //   印证因而同错：`agentContext` 被**追加**到 LlmProvider.stream 末尾后，三档 arity 从
+            //   18/18/19 整体推到 19/19/20，而本行的条件常量没同步 ⇒ 19 参时 msgIdx 取到 11
+            //   （= onToolCallComplete，Consumer<ToolUseBlock>），本桩随即对它 accept 一个 String
+            //   ⇒ ClassCastException(String→AssistantMessage) ⇒ onComplete 永不执行 ⇒ 300s
+            //   STREAM_TIMEOUT × 重试（实测单类 1505s，2 条断言失败）。
+            // 反向守卫：LlmProviderStreamArityInvariantTest（再给 stream 追加形参 ⇒ 它立刻翻红）。
+            int chunkIdx = args.length == 20 ? 10 : 9;
+            int msgIdx = args.length == 20 ? 11 : 10;
+            int doneIdx = args.length == 20 ? 17 : 16;
             java.util.function.Consumer<String> onChunk =
                 (java.util.function.Consumer<String>) args[chunkIdx];
             java.util.function.Consumer<AssistantMessage> onMsg =

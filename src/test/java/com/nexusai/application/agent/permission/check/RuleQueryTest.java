@@ -15,6 +15,7 @@ import com.nexusai.application.agent.tool.impl.EditFileTool;
 import com.nexusai.application.agent.tool.impl.PowerShellTool;
 import com.nexusai.application.agent.tool.impl.ReadFileTool;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
@@ -44,6 +45,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("[S03] RuleQuery PowerShell 内容规则提取与大小写不敏感匹配")
 class RuleQueryTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。（外层声明对全部 @Nested 子类同样生效。）
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -424,7 +440,6 @@ class RuleQueryTest {
 
         @AfterEach
         void clearCwdState() {
-            CwdResolution.clearCurrentOverride();
             SessionProjectRoot.reset();
         }
 

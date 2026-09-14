@@ -59,8 +59,33 @@ import static org.mockito.Mockito.when;
  *   <li><b>L4 尾段不丢（OD-04/INV-2）</b> — 压缩成功后必须用压缩结果（buildPostCompactMessages
  *       组装，含 messagesToKeep）直接取代消息链，不额外切片丢弃。</li>
  * </ol>
+ *
+ * <h2>⛔ 本类的边界（必读 · 铁律：不许用源码字面断言冒充行为守卫）</h2>
+ * <p>本类是<b>源码扫描型</b>测试：它读 {@code src/main/java/...} 的<b>文本</b>做 {@code indexOf} /
+ * {@code contains} 断言，因此它守护的只是「源码里存在某个文本形状」，<b>不具备行为鉴别力</b> ——
+ * 实现改对了但文本换了位置/换了个写法，它就会假红；实现改错了但文本仍在，它就会假绿。
+ * 适用边界（三条，超出即不成立）：
+ * <ol>
+ *   <li>只用于「接线<b>顺序</b>」这类<b>没有更便宜的运行时观察点</b>的不变量（如 DRIFT-1 编排顺序）。</li>
+ *   <li>⛔ <b>不得</b>用它守护「某行为是否发生」——那必须由真跑被测对象的测试承担
+ *       （本类已有反例：V-SH-2 曾以 {@code indexOf("return null;")} 冒充「终止信号不注入 LLM」
+ *       的行为守卫，生产改成渲染文本后它恒红且对真机制零覆盖 ⇒ 已退役，见下方 V-SH 段头）。</li>
+ *   <li>行的行号/文本一旦漂移必须<b>同步改锚</b>，⛔ 不得留着红条目「等下次修」——红条目会被
+ *       后来者当「已覆盖/环境红」忽略（本仓已知失效模式）。</li>
+ * </ol>
  */
 class LlmAgentLoopWiringOrderTest {
+
+    /**
+     * [S2 F-09/F-20 · 合并收口] 本类用**合成 sessionId**（{@code "sess-" + UUID}）驱动 {@code LlmAgentLoop}，
+     * 但从不注册 DB 回源解析器 ⇒ S2 引入的第 4 态「无法判定」会 fail-loud 抛出。
+     * 声明「本夹具无 DB」= 让解析器**明确回答「无此会话」**（而非「无法判定」）—— 语义是
+     * 「DB 答没有这个会话」，**不是**「解析失败」。
+     */
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        com.nexusai.test.support.SessionProjectRootTestSupport.declareNoDatabase();
+    }
 
     private static final String LLM_LOOP_PATH =
         "src/main/java/com/nexusai/application/agent/LlmAgentLoop.java";
@@ -391,6 +416,17 @@ class LlmAgentLoopWiringOrderTest {
     }
 
     // ─────────────────────── V-SH 复核修复：stop-hook 重入守卫 + hook_stopped 终止 + token_budget 复位 ───────────────────────
+    //
+    // ⛔ [F-11/F-12 假守卫族修复] V-SH-2 已退役（V-SH 编号出现 -2 空档，覆盖<b>未</b>削弱）：
+    //   原 vsh2_ 对 AgentLoopContext.java 做 `source.indexOf("return null;", caseIdx)` 并要求落在
+    //   hook_stopped_continuation case 内 —— 该 case 已改为返回 `<system-reminder>` 文本的三元表达式
+    //   （AgentLoopContext.java:3356-3370，形状对齐 CC messages.ts:4130-4138），其间唯一的字面
+    //   `return null;` 落在越过下一个 case 的位置 ⇒ 该断言在 master 上<b>恒红</b>，且它守护的是
+    //   「渲染产文本与否」，<b>不是</b>真正的不变量。
+    //   真正的不变量 = 「终止信号永不被 LLM 消费」，承担者 = AgentLoopContext.java:2497-2499 的
+    //   显式跳过名单（`if ("hook_stopped_continuation".equals(a.type())) continue;`），本类从不触碰它。
+    //   ⭐ 真守卫已存在且真跑：HookAttachmentLlmInjectionTest#hookStoppedContinuation_notInjected
+    //   （直调 maybeInjectHookAttachments 真行为，已补「同用例正向对照」防装置恒空）。
 
     @Test
     @DisplayName("V-SH-1: HOOK_STOPPED 终止后跳过 §14 Stop hooks（CC query.ts:1519-1520 hook_stopped 不触达 handleStopHooks）")
@@ -405,29 +441,6 @@ class LlmAgentLoopWiringOrderTest {
         assertThat(source)
             .as("§14 Stop hooks gate 必须排除 HOOK_STOPPED（CC query.ts:1520 立即退出不触达 handleStopHooks）")
             .contains("if (!skipStopPipeline && state.exitReason() != ExitReason.HOOK_STOPPED) {");
-    }
-
-    @Test
-    @DisplayName("V-SH-2: hook_stopped_continuation 终止信号不注入 LLM（renderHookAttachmentForLlm 返回 null）")
-    void vsh2_hookStoppedContinuationNotInjected() throws IOException {
-        // WHY: CC normalizeAttachmentForAPI 虽渲染该 attachment（messages.ts:4130-4136），但同一
-        // query() 内 shouldPreventContinuation → 立即 return {reason:'hook_stopped'}（query.ts:1519-1520），
-        // 渲染结果随 toolResults 丢弃，同次 query() 无后续 LLM 调用永不送达模型。Java attachments()
-        // 跨 loop 常驻，若渲染非 null 会在后续 LLM 调用被 maybeInjectHookAttachments 注入为 meta user
-        // 文本 → 错误地把终止当续行（ER-IMP-09 本应修复的'渲染注入继续'）。本测试锚定
-        // hook_stopped_continuation case 必须 return null。
-        String source = Files.readString(Path.of(
-            "src/main/java/com/nexusai/application/agent/loop/AgentLoopContext.java"));
-        int caseIdx = source.indexOf("case \"hook_stopped_continuation\":");
-        assertThat(caseIdx)
-            .as("renderHookAttachmentForLlm 必须存在 hook_stopped_continuation case")
-            .isGreaterThan(-1);
-        int nullIdx = source.indexOf("return null;", caseIdx);
-        int nextCaseIdx = source.indexOf("case \"", caseIdx + 1);
-        assertThat(nullIdx)
-            .as("hook_stopped_continuation case 内必须 return null（终止信号不注入 LLM）")
-            .isGreaterThan(caseIdx)
-            .isLessThan(nextCaseIdx > -1 ? nextCaseIdx : Integer.MAX_VALUE);
     }
 
     @Test

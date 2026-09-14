@@ -160,9 +160,11 @@ public class TaskController {
             throw new ValidationException("sessionId is required (GET /api/v1/tasks/list)");
         }
         String sid = sessionId;
-        // taskListId 解析链（TaskService.getTaskListId(sessionId)）的会话级 leaderTeamName / 当前会话位
-        //   由**显式形参**承载（批 3c：不再写回裸 MDC；旧实现 setSession+无参 getTaskListId() 读回同一值）。
-        String taskListId = TaskService.getTaskListId(sid);
+        // taskListId 解析链（TaskService.getTaskListId(sessionId, identity)）的会话级 leaderTeamName /
+        //   当前会话位由**显式形参**承载（批 3c：不再写回裸 MDC；旧实现 setSession+无参 getTaskListId() 读回同一值）。
+        // [S1-T6] REST 线程无 teammate 身份载体（无 ToolUseContext）⇒ identity 显式 null
+        //   （与旧行为等价：REST 线程 ThreadLocal 恒 null，优先级 2 本就不生效）。
+        String taskListId = TaskService.getTaskListId(sid, null);
         // [task-v2-merge] V1 V2 都查合并（用户拍板 2026-08-25：会话 V1（TodoWrite）/V2（TaskCreate）
         //   互斥只会有一个；端点两者都查返回，前端按非空方显示）：
         //   V2 = TaskService 文件（{configHome}/tasks/{taskListId}），V1 = sessions.todos 列（DB-first）。

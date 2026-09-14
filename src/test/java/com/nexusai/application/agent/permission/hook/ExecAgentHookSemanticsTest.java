@@ -19,6 +19,7 @@ import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.provider.dto.ModelDto;
 import com.nexusai.model.provider.dto.ProviderDto;
 import com.nexusai.model.provider.dto.ProviderType;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -50,6 +51,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("[H13] ExecAgentHook 语义补齐对齐 CC execAgentHook.ts")
 class ExecAgentHookSemanticsTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution / PathGuard
+    //   fail-loud 抛（F-10 起 PathGuard 消费侧也不再吞）。见 SessionProjectRootTestSupport 类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     private static final String DEFAULT_FAST_MODEL = "haiku-test";
     private static final String SO = ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME;

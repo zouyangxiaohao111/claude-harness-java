@@ -462,12 +462,16 @@ class CronIdleExecutorTest {
         //
         // [批 1 改锚] 原断言 = run 期间 CwdResolution.getCwd() == boundProject（依赖
         // CwdResolution.runWithCwdOverride 写的 ThreadLocal CURRENT_OVERRIDE —— 派生线程读不到，
-        // 正是用户 2026-09-13 裁定的失效模式，已从 cron 路径删除）。新断言分两半：
+        // 正是用户 2026-09-13 裁定的失效模式，已从 cron 路径删除）。
+        // [S2 F-07 2026-09-14] 该通道本体（CURRENT_OVERRIDE ThreadLocal + runWithCwdOverride）已按
+        //   用户裁定 #8 **整条删除** ⇒ 原 RED 横幅「恢复 runWithCwdOverride 包裹 ⇒ ② 变红」**已不可复现**
+        //   （方法不存在），故不再作为可执行反向实验；② 的鉴别力现在只能靠「换成任何显式注入/回落」
+        //   的变异（例如把 getCwd(null) 改成读 boundProject）。历史保留在此，⛔ 勿据此宣称已验证。
+        // 新断言分两半：
         //   ① 正向：本 run 携带锚值（显式通道在）；
-        //   ② 反向：执行线程上 CwdResolution.getCwd() 仍是 user.dir（无 cwd ThreadLocal 劫持），
+        //   ② 反向：执行线程上 CwdResolution.getCwd() 仍是 user.dir（无 cwd 线程本地劫持），
         //      且 run 结束后仍为 user.dir（无残留 ⇒ cronExecutor 线程池复用不串台）。
-        // RED（反向实验 · 有鉴别力）: 恢复 runWithCwdOverride 包裹 ⇒ ② 变红（run 期间 getCwd 被劫持
-        // 为 boundProject）；删掉 withBoundProject 挂载 ⇒ ① 变红。
+        // RED（反向实验 · 有鉴别力）: 删掉 withBoundProject 挂载 ⇒ ① 变红。
         java.nio.file.Path tmp = Files.createTempDirectory("cron-x-persistent");
         String boundProject = CwdResolution.normalizeCwd(tmp.toAbsolutePath().toString());
         String userDir = CwdResolution.normalizeCwd(System.getProperty("user.dir"));
@@ -495,8 +499,8 @@ class CronIdleExecutorTest {
             .as("① DURABLE 任务的项目锚必须显式随 RunRequest 传进 run（值传递，非 ThreadLocal）")
             .isEqualTo(boundProject);
         assertThat(cwdDuringRun.get())
-            .as("② 执行线程 CwdResolution.getCwd(null) 必须是 user.dir —— 无 ThreadLocal cwd 劫持"
-                + "（恢复 runWithCwdOverride 会把它变成 boundProject ⇒ 变红）")
+            .as("② 执行线程 CwdResolution.getCwd(null) 必须是 user.dir —— 无 cwd 线程本地劫持"
+                + "（[S2 F-07] 原 runWithCwdOverride 通道已整条删除 ⇒ 本行守的是「无任何隐藏注入」）")
             .isEqualTo(userDir);
         assertThat(CwdResolution.getCwd(null))
             .as("② run 结束后 cwd 无残留（无线程池复用串台）")

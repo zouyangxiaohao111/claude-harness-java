@@ -3203,7 +3203,17 @@ public class LlmAgentLoop implements AgentLoop {
         //   无锚 → null → 构造器 CwdResolution 兜底（会话 cwd 层优先语义不变）。
         java.nio.file.Path runExplicitCwd =
             (params.boundProject() != null && !params.boundProject().isBlank()) ? this.workspaceDir : null;
-        ToolUseContext baseTuc = buildBaseToolUseContext(state, initialModeInput, initialModeConfig, runExplicitCwd);
+        // [S1-T2] teammate 身份实参 = 显式 null。
+        //   ⛔ 不回落任何 ThreadLocal / 进程级槽（用户铁律：会话态一律显式传参）。
+        //   事实依据（本批 grep 复验）：本方法 doRun(RunRequest) 的生产调用方只有
+        //   MainSessionBackgroundService:358 / CronIdleExecutor:938 两处 loop.run(...)，均为
+        //   「主会话 / cron」路径；teammate 的 LLM 循环不经过 LlmAgentLoop
+        //   （SpawnInProcess → AutonomousAgentLoop.runTeammateLoop → SubagentExecutor 内联环）
+        //   ⇒ 此处**不存在** teammate 承载体，null 即该路径的正确值（等价 CC 主线程 undefined）。
+        //   若未来 teammate 走本循环，承载体须随 RunRequest 显式加组件（与 T7 的 agentContext 同法），
+        //   ⛔ 不得在此读 ThreadLocal。
+        ToolUseContext baseTuc = buildBaseToolUseContext(
+            state, initialModeInput, initialModeConfig, runExplicitCwd, null);
         com.nexusai.application.agent.loop.AgentLoopContext mainCtx;
         if (contextFactory != null) {
             // [P3-③] 生产：factory.forSession 构造 ctx + 会话级可变状态（实例引用共享）+ override 事件通道
@@ -4692,7 +4702,11 @@ public class LlmAgentLoop implements AgentLoop {
      *   <li>有 {@code streamSessionId} → 取 {@link com.nexusai.common.SessionProjectRoot}
      *       冻结值（{@code run()} 入口 DB 兜底 {@code tryResolveBoundProjectFromDb}
      *       {@code sessions.main_project_id → projects.path} 成功后的产物 = DB 主路径结果；
-     *       不重复查 DB，符合 F1 会话内不重查语义）。</li>
+     *       不重复查 DB，符合 F1 会话内不重查语义）。
+     *       <!-- [S2 · F-24 2026-09-14] ⚠️ 本条描述的 tryResolveBoundProjectFromDb 是「B′ 兜底第二链」，
+     *            与 SessionProjectRoot 的冻结表回源解析器（ToolRegistrationConfig#sessionProjectRootResolver）
+     *            是<b>两条独立实现</b>（差异 A/B）——⛔ 勿再声称「全仓只有这一处 DB 查询实现」。
+     *            未合并原因与代价见残差 R-DB（见 SessionProjectRoot 类 javadoc 的「残差 R-DB」段）。 --></li>
      *   <li>仍解析不到（DB 确实无绑定）→ 抛 {@link AutoMemoryNoBoundProjectException}，由调用方
      *       <b>当场 catch</b>：fail loud 记 error，本轮不注入 auto 记忆段，不让整个 turn 崩溃。</li>
      * </ol>
@@ -6646,33 +6660,15 @@ public class LlmAgentLoop implements AgentLoop {
             // [批 4b-1 已删] 原 [IMP-A · F3 · OPD-SPR-11]「同帧捕获会话 projectRoot → 回放到
             //   STREAM_EXECUTOR 虚拟线程」回放块已删：CURRENT_PROJECT_ROOT ThreadLocal 载体删除，
             //   无可回放对象（用户铁律：会话态一律显式传参，回放不算合规）。
-            // [GAP-R1 线程传播] loop 线程（runner，已被 SpawnInProcess runWithTeammateContext 包）捕获
-            //   teammate 上下文，回放到 STREAM_EXECUTOR 虚拟线程 —— 对齐 CC AsyncLocalStorage 跨异步
-            //   continuation 自动传播（inProcessRunner.ts:1160 runWithTeammateContext 包 runAgent）。
-            //   WHY: 流式 toolCall 回调（:3306 → StreamingToolExecutor.add:563 捕获）在虚拟线程执行，
-            //   虚拟线程不继承创建线程的 plain ThreadLocal → add() 捕获 null → t.capturedTeammateContext
-            //   =null → 工具 execute 跳过 runWithTeammateContext → SubagentTool.isTeammate() 恒 false →
-            //   CC AgentTool.tsx:272/278 守卫生产不触发。与上方 projectRoot 回放同模式（loop 线程捕获、虚拟线程内恢复）。
-            //   null = 主会话/普通 subagent → 不包装，行为零变化（impact 确认仅 teammate 场景生效）。
-            final com.nexusai.application.agent.team.TeammateContext teammateStreamCtx =
-                com.nexusai.application.agent.team.TeammateContext.getTeammateContext();
-            if (teammateStreamCtx != null && log.isDebugEnabled()) {
-                log.debug("[GAP-R1] 流式路径回放 teammate context 到 STREAM_EXECUTOR 虚拟线程: agentId={} "
-                        + "· 对齐 CC AsyncLocalStorage 跨异步传播 (inProcessRunner.ts:1160)",
-                    teammateStreamCtx.getData().agentId());
-            }
+            // [S1-T2] 原 [GAP-R1] teammate 上下文「loop 线程捕获（已删的 ThreadLocal 载体）→
+            //   STREAM_EXECUTOR 虚拟线程回放」块已整体删除：
+            //   身份载体改为 {@link ToolUseContext#teammateIdentity()} —— base TUC 在
+            //   buildBaseToolUseContext 处显式盖章，随 per-turn TUC 沿链下传，虚拟线程内
+            //   直接读 ctx 即可，不需要任何 ThreadLocal 回放（用户铁律：回放不算合规）。
             STREAM_EXECUTOR.execute(() -> {
                 // [批 4b-1] 原 projectRoot 回放（capture 原值 → set 回放值 → finally restore）已删：
-                //   ThreadLocal 载体删除。仅保留 teammate 上下文的回放（另一载体，另行收敛）。
-                if (teammateStreamCtx != null) {
-                    com.nexusai.application.agent.team.TeammateContext.runWithTeammateContext(
-                        teammateStreamCtx, () -> {
-                            params.deps().callModel(request);
-                            return null;
-                        });
-                } else {
-                    params.deps().callModel(request);
-                }
+                //   ThreadLocal 载体删除。
+                params.deps().callModel(request);
             });
             if (log.isDebugEnabled()) {
                 log.debug("[LlmAgentLoop] turn={} callModel submitted via deps (model={})",
@@ -8750,13 +8746,20 @@ public class LlmAgentLoop implements AgentLoop {
         // 发 TeammateIdle（CC stopHooks.ts:335 isTeammate() → 逐 task TaskCompleted → TeammateIdle）。
         // 门控：仅 teammate 会话且非 STOP_HOOK_PREVENTED（in-loop abort / §14 preventContinuation
         //   均置此 reason，CC 在 preventContinuation/abort 时早返不进入 teammate 段 stopHooks.ts:325-332）。
+        // [S1-T2] 身份来源改为 TUC 显式载体：原 `Teammate.isTeammate()/getAgentName()/getTeamName()`
+        //   是间接读（已删的 ThreadLocal 载体优先，其次进程级 dynamicTeamContext），
+        //   与「会话态一律显式传参」冲突 ⇒ 统一读 {@code params.toolUseContext().teammateIdentity()}。
+        //   ⚠️ 语义收窄（本批登记）：原 dynamicTeamContext 分支（CLI/tmux sysprop 进程级身份槽）
+        //   不再使本门控为真 —— 该进程级槽由 T13（轨 IV）整体删除，两处收敛方向一致。
+        com.nexusai.application.agent.team.TeammateIdentity teammateIdentity =
+            params.toolUseContext() != null ? params.toolUseContext().teammateIdentity() : null;
         if (ctx.hookRegistry() != null
-            && com.nexusai.application.agent.team.Teammate.isTeammate()
+            && teammateIdentity != null
             && state.exitReason() != ExitReason.STOP_HOOK_PREVENTED) {
-            String teammateName = com.nexusai.application.agent.team.Teammate.getAgentName() != null
-                ? com.nexusai.application.agent.team.Teammate.getAgentName() : "";
-            String teamName = com.nexusai.application.agent.team.Teammate.getTeamName() != null
-                ? com.nexusai.application.agent.team.Teammate.getTeamName() : "";
+            String teammateName = teammateIdentity.agentName() != null
+                ? teammateIdentity.agentName() : "";
+            String teamName = teammateIdentity.teamName() != null
+                ? teammateIdentity.teamName() : "";
             java.util.List<String> teammateBlockingErrors = new java.util.ArrayList<>();
             boolean teammatePreventedContinuation = false;
             String teammateStopReason = null;
@@ -8777,7 +8780,10 @@ public class LlmAgentLoop implements AgentLoop {
             // CC stopHooks.ts:346-350: listTasks(getTaskListId()) → filter(status==='in_progress' && owner===teammateName)
             // [合并裁决] loop() 为 static，LlmAgentLoop.listTasks 为实例方法不可直接调；等效经
             //   ctx.sessionState().taskService()（null → 空列表，与实例方法 null 降级语义一致）。
-            String teammateTaskListId = com.nexusai.application.agent.tasks.TaskService.getTaskListId();
+            // [S1-T6] 身份来源改为**上文已取的 TUC 显式身份** teammateIdentity（原无参调用读
+            //   ThreadLocal）；sessionId 位保持 null → 优先级 3/4/5/6 行为零变化。
+            String teammateTaskListId = com.nexusai.application.agent.tasks.TaskService.getTaskListId(
+                null, teammateIdentity);
             java.util.List<Task> teammateTasks = java.util.List.of();
             com.nexusai.application.agent.tasks.TaskService teammateTaskSvc =
                 ctx.sessionState() != null ? ctx.sessionState().taskService() : null;
@@ -9754,9 +9760,11 @@ public class LlmAgentLoop implements AgentLoop {
      * Input=empty（等价旧行为：无 CLI/settings 输入 → 初始 mode 解析回 DEFAULT）。
      */
     private ToolUseContext buildBaseToolUseContext(AgentState state) {
+        // [S1-T2] 便捷重载：无 teammate 身份承载体 → 显式 null（非 teammate 上下文）。
         return buildBaseToolUseContext(state,
             InitialPermissionModeResolver.Input.empty(),
             InitialPermissionModeResolver.Config.defaults(),
+            null,
             null);
     }
 
@@ -9769,10 +9777,21 @@ public class LlmAgentLoop implements AgentLoop {
      * 经 6 参重载喂给 buildPermissionContext（mode==null → 走 CC initialPermissionModeFromCLI
      * 多源优先级链：dangerouslySkip &gt; CLI --permission-mode &gt; settings.defaultMode）。
      */
+    /**
+     * [S1-T2] <b>teammate 身份的显式入口</b>：base TUC 是身份沿着 TUC 传递链（base → per-turn →
+     * 工具 execute 形参）到达每个消费点的唯一源头，本形参即该源头的显式载体。
+     *
+     * <p>⛔ 不再从 teammate ThreadLocal 载体捕获（原 :6661 捕获 + :6668 回放
+     * 已删）：plain ThreadLocal 不跨线程继承，回放不算合规（用户铁律）。
+     *
+     * @param teammateIdentity 本 agent 的 teammate 身份；null = 非 teammate（主会话 / cron /
+     *                         后台主会话循环 —— 本函数的全部生产调用方都在此列，见 doRun）
+     */
     private ToolUseContext buildBaseToolUseContext(AgentState state,
             InitialPermissionModeResolver.Input initialModeInput,
             InitialPermissionModeResolver.Config initialModeConfig,
-            java.nio.file.Path runExplicitCwd) {
+            java.nio.file.Path runExplicitCwd,
+            com.nexusai.application.agent.team.TeammateIdentity teammateIdentity) {
         if (state.sessionId() == null) {
             return null;
         }
@@ -9871,7 +9890,12 @@ public class LlmAgentLoop implements AgentLoop {
             //   后台任务（MainSessionBackgroundService 在 runWithAgentContext 内跑本 loop）则捕获到
             //   该后台任务自己的 SubagentContext（对齐 CC 的 ALS 传播）。
             //   ⛔ 派生线程内不得回放 ThreadLocal 再读（用户铁律：回放不算合规）。
-            .withAgentContext(com.nexusai.application.agent.subagent.AgentContext.getAgentContext());
+            .withAgentContext(com.nexusai.application.agent.subagent.AgentContext.getAgentContext())
+            // [S1-T2] teammate 身份盖章（唯一生产盖章点）：身份不再由 ThreadLocal 在派生线程回放，
+            //   而是随 base TUC 显式下传整条链（per-turn TUC / 工具 execute / stop hook）。
+            //   同值短路（withTeammateIdentity 内 equals 判定）：null→null 时返回同一实例，
+            //   主会话路径零新实例、零行为变化。
+            .withTeammateIdentity(teammateIdentity);
     }
 
 

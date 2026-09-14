@@ -236,7 +236,32 @@ public record ToolUseContext(
         //
         // @JsonIgnore: analytics 归因用身份，不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 subagentName / effectiveModelName / readFileState local-only 约束）。
-        @JsonIgnore com.nexusai.application.agent.subagent.AgentContext agentContext
+        @JsonIgnore com.nexusai.application.agent.subagent.AgentContext agentContext,
+        // ══════════════════════════════════════════════════════════════════════════════
+        // [S1-T1] teammate 身份显式载体（第 53 组件）· 对齐 CC InProcessTeammateTask/types.ts:13-20
+        //   TeammateIdentity（纯数据；CC 运行时载体是 AsyncLocalStorage，本仓原为
+        //   原 ThreadLocal 载体 + 4 个「捕获→回放」点，已随 S1-T2/T3/T4 整体删除）。
+        // ══════════════════════════════════════════════════════════════════════════════
+        // WHY 挂 TUC 而不是 continue 用 ThreadLocal：CURRENT 是 plain ThreadLocal，不跨线程继承
+        //   ⇒ 流式 toolCall 回调（STREAM_EXECUTOR 虚拟线程）/ 工具执行池线程 / hook 池线程读恒
+        //   null，必须靠「捕获→回放」桥接（用户铁律：回放不算合规，会话态一律显式传参）。
+        //   挂上 TUC 后，身份沿既有 TUC 传递链（base → per-turn → 工具 execute 形参）自然到达
+        //   每个消费点，不需要任何 ThreadLocal 回放。
+        //
+        // 语义边界（与 agentContext 严格正交）：
+        //   · agentContext  = 「本 invocation 的 analytics 归因边载荷」（classifier / exec-prompt
+        //     hook / tool-use summary 侧消费），失败方向取「属性缺失」；
+        //   · teammateIdentity = 「本 agent 是谁」（SubagentTool 守卫 / cron 归属 / stop hook
+        //     TeammateIdle 侧消费）。
+        //   ⛔ 不得把归因信息塞进本字段，也不得把身份塞进 agentContext（用户裁定：独立字段）。
+        //
+        // 生命周期：唯一生产盖章入口 {@link #withTeammateIdentity}；派生链（with*/copyWith）
+        //   原样透传；「新 agent 的 TUC」构造点（with(SubagentContextOverrides) / 兼容 ctor）
+        //   显式置 null —— 新 agent 不继承父的 teammate 身份（同 subagentName/isBuiltIn 失败方向）。
+        //
+        // @JsonIgnore: local-only。身份不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 agentContext / subagentName / effectiveModelName / readFileState 约束）。
+        @JsonIgnore com.nexusai.application.agent.team.TeammateIdentity teammateIdentity
         // [Session J 方案 A] 撤回 E session 加的 querySource + assistantMessage 顶层字段:
         //   - CC 真源 (主 agent grep 实证 Pattern #9):
         //     · querySource: toolUseContext.options.querySource (Tool.ts:176), Java 端对齐
@@ -664,7 +689,8 @@ public record ToolUseContext(
              null,     // [openai-lazy] effectiveProviderType 缺省 → null（判不出 → tool search 关闭，全量 schema 内联）
              null,     // [tuc-subagent-identity] subagentName 缺省 → null（非子代理上下文；唯一产出点盖章）
              false,    // [tuc-subagent-identity] isBuiltIn 缺省 → false
-             null);    // [批 5b-1] agentContext 缺省 → null（非 agent 上下文；唯一盖章入口 withAgentContext）
+             null,    // [批 5b-1] agentContext 缺省 → null（非 agent 上下文；唯一盖章入口 withAgentContext）
+             null);   // [S1-T1] teammateIdentity 缺省 → null（非 teammate 上下文；唯一盖章入口 withTeammateIdentity）
     }
 
     /** Stage 3.1 4 参兼容构造器. */
@@ -1408,7 +1434,8 @@ public record ToolUseContext(
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留 · CC Tool.ts:251 optional)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
-            agentContext());  // [批 5b-1] 透传 (null 保留)
+            agentContext(),   // [批 5b-1] 透传 (null 保留)
+            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
     }
 
     /** 覆写 messages 快照。null 参数 → 保留现有。 */
@@ -1445,7 +1472,8 @@ public record ToolUseContext(
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
-            agentContext());  // [批 5b-1] 透传 (null 保留)
+            agentContext(),   // [批 5b-1] 透传 (null 保留)
+            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
     }
 
     /**
@@ -1480,7 +1508,8 @@ public record ToolUseContext(
             limits,
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
-            agentContext());  // [批 5b-1] 透传 (null 保留)
+            agentContext(),   // [批 5b-1] 透传 (null 保留)
+            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
     }
 
     /**
@@ -1512,7 +1541,8 @@ public record ToolUseContext(
             fileReadingLimits(),
             modelName,
             effectiveProviderType(), subagentName(), isBuiltIn(),
-            agentContext());  // [批 5b-1] 透传
+            agentContext(),   // [批 5b-1] 透传
+            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
     }
 
     /**
@@ -1560,7 +1590,8 @@ public record ToolUseContext(
             fileReadingLimits(),
             effectiveModelName(),
             providerType, subagentName(), isBuiltIn(),
-            agentContext());  // [批 5b-1] 透传
+            agentContext(),   // [批 5b-1] 透传
+            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
     }
 
     /**
@@ -1610,7 +1641,8 @@ public record ToolUseContext(
             // [批 5b-1] 身份盖章时**不**动 agentContext：agent 归因上下文由独立的
             //   {@link #withAgentContext} 单点盖章（两者盖章时机同在 SubagentExecutor TUC 定稿步，
             //   但语义不同 —— 一个是「本 agent 是谁」，一个是「本 invocation 的归因边载荷」）。
-            agentContext());
+            agentContext(),
+            teammateIdentity());  // [S1-T1] 身份透传：withSubagentIdentity 只覆写子代理身份名，teammate 身份原样保留
     }
 
     /**
@@ -1658,7 +1690,56 @@ public record ToolUseContext(
             effectiveProviderType(),
             subagentName(),
             isBuiltIn(),
-            agentContext);
+            agentContext,
+            // [S1-T1] 身份透传：本 wither 只覆写 agentContext，teammate 身份原样保留。
+            this.teammateIdentity());
+    }
+
+    /**
+     * <b>[S1-T1] teammate 身份显式载体 · 唯一生产盖章入口</b>。
+     *
+     * <p><b>WHY</b>：原身份载体（plain ThreadLocal，S1-T4 已删）不跨线程
+     * 继承；而身份的消费点分布在 STREAM_EXECUTOR 虚拟线程（流式 toolCall 回调）与工具执行池线程
+     * 上 ⇒ 只能靠「loop 线程捕获 → 派生线程回放」桥接（用户铁律：回放不算合规）。
+     * 改为挂 TUC 后，身份随既定 TUC 传递链显式下传，回放机制整体删除。
+     *
+     * <p><b>同值短路</b>：传入与当前值 {@code equals} 的 identity 时返回 {@code this}（引用相等）
+     * —— 与 {@link #withAgentContext} 同款，保证「同一实例只发一次」类语义不被派生噪声放大。
+     *
+     * @param teammateIdentity 本 agent 的 teammate 身份；null = 非 teammate（主会话 /
+     *                         普通 subagent），等价 CC {@code teammateContextStorage.getStore()
+     *                         === undefined}
+     * @return 带该身份的新 TUC（其余字段原样透传）
+     */
+    public ToolUseContext withTeammateIdentity(
+            com.nexusai.application.agent.team.TeammateIdentity teammateIdentity) {
+        if (java.util.Objects.equals(teammateIdentity, this.teammateIdentity())) {
+            return this;
+        }
+        return new ToolUseContext(
+            agentId(), sessionId(), mode(), additionalWorkingDirectories(),
+            availableTools(), taskListId(), abortController(),
+            messages(), permissionContext(), permissionMode(),
+            mcpClients(),
+            isNonInteractiveSession(), renderedSystemPrompt(), effectiveCwd(),
+            inProgressToolUseIDs(), toolDecisions(), onCompactProgress(),
+            getAppState(), setAppState(), setStreamMode(), setSDKStatus(),
+            addNotification(), appendSystemMessage(), sendOSNotification(),
+            setResponseLength(), setHasInterruptibleToolInProgress(), updateFileHistoryState(),
+            updateAttributionState(), setConversationId(), setToolJSX(), openMessageSelector(),
+            userModified(), nestedMemoryAttachmentTriggers(), loadedNestedMemoryPaths(),
+            dynamicSkillDirTriggers(), discoveredSkillNames(), agentType(), requireCanUseTool(),
+            preserveToolUseResults(), localDenialTracking(), contentReplacementState(),
+            queryTracking(), toolUseId(), criticalSystemReminder_EXPERIMENTAL(),
+            readFileState(),
+            mcpServerConnections(),
+            fileReadingLimits(),
+            effectiveModelName(),
+            effectiveProviderType(),
+            subagentName(),
+            isBuiltIn(),
+            agentContext(),
+            teammateIdentity);
     }
 
     /** 覆写 permissionContext + permissionMode（每轮经 ctx.permissionContextBuilder() 重建）。 */
@@ -1701,7 +1782,8 @@ public record ToolUseContext(
             fileReadingLimits(),    // [OPD-D1-01] 透传 (null 保留)
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
-            agentContext());  // [批 5b-1] 透传 (null 保留)
+            agentContext(),   // [批 5b-1] 透传 (null 保留)
+            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
     }
 
     public ToolUseContext with(SubagentContextOverrides overrides) {
@@ -1907,6 +1989,11 @@ public record ToolUseContext(
             //   （SubagentExecutor TUC 定稿步 / buildBaseToolUseContext 捕获）。
             //   取 null 而非继承父 = 失败方向取「属性缺失」而不是「属性归到错 agent」（同 CC
             //   forkedAgent.ts:449 agentType 仅取 override 的取舍）。
+            null,
+            // [S1-T1] teammate 身份不继承父（同 subagentName/isBuiltIn/agentContext 语义）：本方法
+            //   是「新 agent 的 TUC」构造点，新 agent 的身份由唯一盖章入口
+            //   {@link #withTeammateIdentity} 装配。取 null 而非继承父 = 失败方向取「身份缺失」
+            //   而不是「身份归到父 teammate」。
             null);
     }
 

@@ -494,7 +494,10 @@ public class SubagentExecutor {
             source.isBuiltIn(),
             // [批 5b-1] agentContext 透传 — 同 subagentName/isBuiltIn：本方法是 TUC 的 record-copy
             //   wither（「派生视图」语义），非身份来源；不透传会把盖章点（withAgentContext）的值清掉。
-            source.agentContext()
+            source.agentContext(),
+            // [S1-T1] teammateIdentity 透传 — 同 subagentName/isBuiltIn/agentContext：record-copy
+            //   wither 只做派生视图，非身份来源；不透传会把盖章点（withTeammateIdentity）的值清掉。
+            source.teammateIdentity()
         );
     }
 
@@ -517,19 +520,26 @@ public class SubagentExecutor {
      *       plain ThreadLocal 恒 null）。</li>
      * </ul>
      *
-     * @param subagentCtx   Step 18 派生的子代理 TUC（{@code withEffectiveCwd} 之后、进 query loop 之前）
-     * @param agentContext  本子代理的归因上下文（{@code SubagentContext} 实例；null = 非 agent 上下文）
-     * @param subagentName  子代理类型名（{@code SubagentIdentity.of(def)} 单一派生点，与 LLM 侧同源）
-     * @param isBuiltIn     是否内置 agent（CC {@code agent.source === 'built-in'}）
+     * @param subagentCtx       Step 18 派生的子代理 TUC（{@code withEffectiveCwd} 之后、进 query loop 之前）
+     * @param agentContext      本子代理的归因上下文（{@code SubagentContext} 实例；null = 非 agent 上下文）
+     * @param subagentName      子代理类型名（{@code SubagentIdentity.of(def)} 单一派生点，与 LLM 侧同源）
+     * @param isBuiltIn         是否内置 agent（CC {@code agent.source === 'built-in'}）
+     * @param teammateIdentity  [S1-T2b] 本轮的 <b>teammate 身份</b>（teammate 路径 = 该 teammate 的
+     *                          {@code InProcessTeammateTaskState.identity()}；普通 Agent-tool 子代理 /
+     *                          workflow / hook = <b>null</b> = 非 teammate）。与上方两个载体同点盖章，
+     *                          沿 TUC 传递链显式下传（工具执行池线程据此判定 teammate 身份，⛔ 不读
+     *                          ThreadLocal / 进程级槽）。
      * @return 盖章后的 TUC（record-copy 语义，null 入参按 {@code ToolUseContext} 契约处理）
      */
     static ToolUseContext stampSubagentLoopContext(
             ToolUseContext subagentCtx,
             AgentContext.SubagentContext agentContext,
             String subagentName,
-            boolean isBuiltIn) {
+            boolean isBuiltIn,
+            com.nexusai.application.agent.team.TeammateIdentity teammateIdentity) {
         return subagentCtx.withSubagentIdentity(subagentName, isBuiltIn)
-            .withAgentContext(agentContext);
+            .withAgentContext(agentContext)
+            .withTeammateIdentity(teammateIdentity);
     }
 
     /**
@@ -1336,7 +1346,7 @@ public class SubagentExecutor {
         // [P0-1][P1-18] 内部 9 参重载: effortOverride=null + parentTucOverride=null + forkAllowedTools=null
         //   + abortControllerOverride=null + querySourceOverride=null + worktreePathOverride=null (标准路径行为不变)
         return executeStreaming(prompt, subagentType, modelOverride, forkParams, messageSink,
-            null, null, null, null, null, null);
+            null, null, null, null, null, null, null);
     }
 
     /**
@@ -1351,7 +1361,7 @@ public class SubagentExecutor {
                                            ForkPathParams forkParams, Consumer<SubagentMessage> messageSink,
                                            AbortController abortControllerOverride) {
         return executeStreaming(prompt, subagentType, modelOverride, forkParams, messageSink,
-            null, null, null, abortControllerOverride, null, null);
+            null, null, null, abortControllerOverride, null, null, null);
     }
 
     /**
@@ -1370,7 +1380,7 @@ public class SubagentExecutor {
                                            ForkPathParams forkParams, Consumer<SubagentMessage> messageSink,
                                            AbortController abortControllerOverride, String querySourceOverride) {
         return executeStreaming(prompt, subagentType, modelOverride, forkParams, messageSink,
-            null, null, null, abortControllerOverride, querySourceOverride, null);
+            null, null, null, abortControllerOverride, querySourceOverride, null, null);
     }
 
     /**
@@ -1395,7 +1405,32 @@ public class SubagentExecutor {
                                            AbortController abortControllerOverride, String querySourceOverride,
                                            String worktreePathOverride) {
         return executeStreaming(prompt, subagentType, modelOverride, forkParams, messageSink,
-            null, null, null, abortControllerOverride, querySourceOverride, worktreePathOverride);
+            null, null, null, abortControllerOverride, querySourceOverride, worktreePathOverride, null);
+    }
+
+    /**
+     * [S1-T2b] <b>teammate 路径入口</b>：流式执行 + 显式 teammate 身份（per-call，非可变字段）。
+     *
+     * <p><b>WHY 用 per-call 形参而不是 setter/字段</b>：{@code SubagentExecutor} 是 Spring
+     * 单例 bean（{@code ToolRegistrationConfig.subagentExecutor @Bean}），多个会话 / 多个 teammate
+     * 共享同一实例 —— 任何「per-teammate 可变字段」都会变成跨会话身份槽（本批正在消灭的形态，
+     * 用户铁律：会话态一律显式传参）。本类既有 per-call 覆写先例：{@code abortControllerOverride}
+     * / {@code querySourceOverride} / {@code worktreePathOverride}。
+     *
+     * <p>身份消费点（均在工具执行池线程 / 派生线程上读 TUC，不读 ThreadLocal）：
+     * {@code CronCreateTool} durable 禁止规则 / {@code CronDeleteTool}·{@code CronListTool} 所有权 /
+     * {@code SendMessageTool} sender 派生 / {@code TaskUpdateTool} completed 提醒 /
+     * {@code AgentLoopContext.maybeInjectTeammateMailbox} 门控 3 / {@code SubagentTool} CC:272-278 守卫。
+     *
+     * @param teammateIdentityOverride 本 teammate 的身份；null = 非 teammate（普通 Agent-tool
+     *                                 子代理 / workflow / hook agent 路径）
+     */
+    public SubagentResult executeStreaming(String prompt, String subagentType, String modelOverride,
+                                           ForkPathParams forkParams, Consumer<SubagentMessage> messageSink,
+                                           AbortController abortControllerOverride,
+                                           com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride) {
+        return executeStreaming(prompt, subagentType, modelOverride, forkParams, messageSink,
+            null, null, null, abortControllerOverride, null, null, teammateIdentityOverride);
     }
 
     /**
@@ -1420,7 +1455,8 @@ public class SubagentExecutor {
                                             ForkPathParams forkParams, Consumer<SubagentMessage> messageSink,
                                             String effortOverride, ToolUseContext parentTucOverride,
                                             List<String> forkAllowedTools, AbortController abortControllerOverride,
-                                            String querySourceOverride, String worktreePathOverride) {
+                                            String querySourceOverride, String worktreePathOverride,
+                                            com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride) {
         // s06 P1-2 修补: 真实 metrics — durationMs 通过本地变量注入 SubagentResult
         long startMs = System.currentTimeMillis();
         // ── Step 1: 解析 AgentDefinition ──
@@ -2057,7 +2093,8 @@ public class SubagentExecutor {
             //   [欠账清理批] 盖章动作抽成 {@link #stampSubagentLoopContext} 静态缝（Pattern #14）
             //   ⇒ 写入端有直接单测（见 {@code SubagentLoopContextStampTest}）。
             final ToolUseContext ctxForLoop = stampSubagentLoopContext(
-                subagentCtx, agentContext, identityForLoop.subagentName(), identityForLoop.isBuiltIn());
+                subagentCtx, agentContext, identityForLoop.subagentName(), identityForLoop.isBuiltIn(),
+                teammateIdentityOverride);
             log.info("[SubagentExecutor] [批 5b-1] 子代理 TUC 已盖 agent 归因上下文: agentId={} "
                     + "invokingRequestId={} invocationKind={}（commonPool 派生线程经显式载体可读）",
                 agentId, this.invokingRequestId, invocationKind);
@@ -2467,7 +2504,7 @@ public class SubagentExecutor {
         // 对齐 CC SkillTool.ts:208-212: skill.effort 非空 → 经 executeStreaming 内部重载合并进 agentDefinition.
         //   forkParams=null → 非 fork path (SkillTool 走普通 subagent, 不触发 fork 缓存共享前缀)
         return executeStreaming(prompt, subagentType, modelOverride, null, messageSink,
-                skill.getEffort(), parentTuc, forkAllowedTools, null, null, null);
+                skill.getEffort(), parentTuc, forkAllowedTools, null, null, null, null);
     }
 
     /**

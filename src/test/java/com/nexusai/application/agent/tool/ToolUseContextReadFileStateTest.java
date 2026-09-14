@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool;
 
 import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -27,6 +28,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("Session L+ · ToolUseContext.readFileState 跨工具共享 + 父→子透传 + FileStateCache 双限真 LRU")
 class ToolUseContextReadFileStateTest {
+
+    // ── [S2 · F-09/F-20/F-10 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution / PathGuard
+    //   fail-loud 抛（F-10 起 PathGuard 消费侧也不再吞）。见 SessionProjectRootTestSupport 类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     private static final UUID AGENT_ID = UUID.randomUUID();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);

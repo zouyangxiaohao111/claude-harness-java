@@ -725,6 +725,44 @@ class MemoryControllerTest {
             .andExpect(status().isInternalServerError());
     }
 
+    /**
+     * [S2 · F-03b 验证 #1 · 2026-09-14 · 用户裁定 #12 (B2)] 会话项目根解析失败 ⇒ REST <b>400</b>
+     * （改前为 500）。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：「会话存在但无绑定项目根 / 无法判定」是<b>请求前提不成立</b>
+     * （客户端补绑定即可纠正），不是服务端故障。改前它落到全局兜底 ⇒ 500，客户端无法区分
+     * 「我传错了」与「后端炸了」。本用例钉住「单点译 400」。
+     *
+     * <p><b>⚠️ 装置修正（复核更正 · 关键）</b>：本类 {@code setUp} 只做
+     * {@code SessionProjectRoot.setForSession(TEST_SESSION, projectDir)}、<b>不注册回源解析器</b>；
+     * 而 {@code refillFromDb} 在 {@code dbResolver == null} 时走「解析失败」态 ⇒ cwd 域同样 fail-loud，
+     * 但那测的是「未接线」而不是本用例的「有会话但未绑定」⇒ <b>必须显式注册解析器</b>。
+     *
+     * <p><b>正向对照（同一用例两臂）</b>：同一时刻已绑定会话（TEST_SESSION）必须仍 200 ⇒
+     * 证明 400 不是「控制器整体坏了 / advice 变成一律 400」。
+     *
+     * <p><b>RED（反向实验 · 两项都要）</b>：a) 注释掉 {@code GlobalExceptionHandler} 的
+     * {@code handleUnresolvedProjectRoot} ⇒ 用例红回 500；b) 把 {@code CwdResolution.unresolvedProjectRoot}
+     * 的返回类型改回父类 {@code IllegalStateException} ⇒ 同样红（证明「新类型」承重，
+     * 而不是被兜底 catch 顺手接住）。
+     */
+    @Test
+    @DisplayName("[S2 F-03b] 有会话但无绑定项目根 ⇒ 400（UnresolvedProjectRootException 单点译；改前 500）")
+    void listFiles_unresolvedProjectRootIs400() throws Exception {
+        String unboundSession = "sess-f03b-unbound";
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unbound());
+        try {
+            // 正向对照：已绑定会话（setUp 里 setForSession 过）不受影响，仍 200
+            mockMvc.perform(get("/api/v1/memory/files").param("sessionId", TEST_SESSION))
+                .andExpect(status().isOk());
+
+            mockMvc.perform(get("/api/v1/memory/files").param("sessionId", unboundSession))
+                .andExpect(status().isBadRequest());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
     @Test
     @DisplayName("POST /api/v1/memory/files → mkdir nexusai home 失败 → 500（memory.tsx:24-28 IO 失败）")
     void createFile_mkdirConfigHomeFailureIs500() throws Exception {

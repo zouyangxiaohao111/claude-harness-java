@@ -3,6 +3,7 @@ package com.nexusai.application.agent.subagent;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.tool.impl.SubagentExecutor;
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -35,6 +36,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @DisplayName("[RES-SP18] SubagentEnvInfo.computeEnvInfo 单实现（对齐 CC prompts.ts:606-649）")
 class SubagentEnvInfoTest {
+
+    // ── [S2 · F-09/F-20 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution fail-loud 抛。
+    //   见 SessionProjectRootTestSupport 的类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     @Test
     @DisplayName("computeEnvInfo: <env> 块六行结构 + modelDescription(marketing) + knowledgeCutoff")

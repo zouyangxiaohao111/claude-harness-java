@@ -16,6 +16,7 @@ import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.model.session.dto.ChatMessageDto;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -57,6 +58,21 @@ import static org.mockito.Mockito.when;
  */
 @DisplayName("[IMP-M-R2-P0-CLD] nested_memory 注入 LLM 消息流（CLD-06/F-1 最小反例）")
 class LlmAgentLoopNestedMemoryInjectionTest {
+
+    // ── [S2 · F-09/F-20/F-10 2026-09-14] 夹具 DB 姿态显式声明 ──
+    //   本夹具不接 DB 回源 ⇒ 未绑定 sessionId 属「确无会话」（还原本批前的 cwd 域行为）。
+    //   ⛔ 不声明则 SessionProjectRoot.lookup 走「未接线 = 无法判定」⇒ CwdResolution / PathGuard
+    //   fail-loud 抛（F-10 起 PathGuard 消费侧也不再吞）。见 SessionProjectRootTestSupport 类 javadoc。
+
+    @org.junit.jupiter.api.BeforeEach
+    void declareNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.declareNoDatabase();
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearNoDatabaseForSessionProjectRoot() {
+        SessionProjectRootTestSupport.clearNoDatabase();
+    }
 
     private static final ObjectMapper JSON = new ObjectMapper();
 

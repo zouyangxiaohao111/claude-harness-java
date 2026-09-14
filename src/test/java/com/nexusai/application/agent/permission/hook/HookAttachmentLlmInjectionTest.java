@@ -36,8 +36,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>hook_blocking_error → {@code "<system-reminder>\n{hookName} hook blocking error from command:
  *       "{command}": {content}\n</system-reminder>"}（prompt-align bd982d7e0 补 command 段；
  *       batch1-A 补 system-reminder 包裹，对齐 CC messages.ts:4530-4538）</li>
- *   <li>hook_stopped_continuation → <b>不注入</b>（V-SH-2 · CC query.ts:1519-1520 hook_stopped 立即
- *       退出，同次 query 无后续 LLM 调用，终止信号永不送达模型；Java 跨 loop 常驻故渲染返回 null）</li>
+ *   <li>hook_stopped_continuation → <b>不注入</b>（CC query.ts:1519-1520 hook_stopped 立即退出，
+ *       同次 query 无后续 LLM 调用，终止信号永不送达模型；Java 跨 loop 常驻，故由
+ *       {@code maybeInjectHookAttachments} 的<b>显式跳过名单</b>承担 ——
+ *       {@code AgentLoopContext.java:2497-2499} `if ("hook_stopped_continuation".equals(a.type()))
+ *       continue;`。⛔ <b>【F-12 更正】</b>原文此处写「Java 跨 loop 常驻故<b>渲染返回 null</b>」
+ *       是<b>假声明</b>：{@code AgentLoopContext.java:3356-3370} 的 render case 返回的是
+ *       {@code "<system-reminder>\n{hookName} hook stopped continuation: {content}\n</system-reminder>"}
+ *       文本（形状对齐 CC messages.ts:4130-4138），非 null。真正保证不送达 LLM 的是上面的跳过名单，
+ *       不是渲染侧 —— 该「渲染产文本」正是退役的 V-SH-2 曾误锚之处）</li>
  *   <li>hook_additional_context（content 非空）→ {@code "<system-reminder>\n{hookName} hook additional
  *       context: {content}\n</system-reminder>"}（batch1-A 补包裹，对齐 CC messages.ts:4557-4569）</li>
  *   <li>hook_success（仅 SessionStart/UserPromptSubmit + content 非空）→ {@code "<system-reminder>\n
@@ -131,6 +138,28 @@ class HookAttachmentLlmInjectionTest {
             .hasSameSizeAs(base);
         assertThat(injected)
             .as("不得出现 'hook stopped continuation' 文本（终止信号不渲染为 LLM 续行文本）")
+            .noneMatch(m -> m.content() != null && m.content().contains("hook stopped continuation"));
+
+        // ⭐ 正向对照（[F-12] 假守卫族修复 · ⛔ 不可省）：上面的 hasSameSizeAs / noneMatch 全是
+        //   <b>否定</b>断言 —— 若本装置恒空（例如跳过名单误改成「无条件 skip 全部 attachment」、
+        //   或本方法根本不产任何注入），它们会<b>恒绿</b>，即「声称守护实际守不住」。
+        //   同一 state 上追加一条「本应注入」的 hook attachment（生产真产点：StreamingToolExecutor
+        //   把 additionalContext 转成 hook_additional_context attachment），断言注入<b>恰好 +1</b>
+        //   且该条含 hook 文本 ⇒ 一句话证明「注入通道是活的、上一条的不为空是真信息」。
+        state.appendAttachment(AttachmentMessageDto.hookAdditionalContext(
+            "PreToolUse:Read", "toolu_3b", "PreToolUse", List.of("positive-control-ctx")));
+        List<ChatMessageDto> withControl =
+            AgentLoopContext.maybeInjectHookAttachments(null, state, base);
+
+        assertThat(withControl)
+            .as("正向对照：同一装置对可注入类型必须真的注入 1 条（证明上一条 hasSameSizeAs 不是装置恒空）")
+            .hasSize(base.size() + 1);
+        assertThat(withControl)
+            .as("正向对照：注入内容必须含 hook additional context 文本")
+            .anySatisfy(m -> assertThat(m.content()).contains("hook additional context"))
+            .anySatisfy(m -> assertThat(m.content()).contains("positive-control-ctx"));
+        assertThat(withControl)
+            .as("正向对照也必须同时守住终止信号：追加可注入附件后，hook stopped continuation 仍不得出现")
             .noneMatch(m -> m.content() != null && m.content().contains("hook stopped continuation"));
     }
 

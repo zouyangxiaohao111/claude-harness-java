@@ -33,18 +33,29 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * [T2.5] title-only 会话创建集成测试（全新库 Flyway V1→V14 全量执行）。
+ * [T2.5 + S3 · F-03a] 会话创建契约集成测试（全新库 Flyway 全量执行 V1→当前最新）。
  *
- * <p><b>WHY (CLAUDE.md 规则 9 · 测试验证意图)</b>：锁死原始 Bug 2 的场景回归——<b>全新数据库</b>
- * 下 {@code POST /api/v1/sessions} 只传 {@code {"title": "..."}} 不得 500。原始根因链：
- * 无 settings.main_model_id（V1 种入 settings 行但该列为 NULL）且 models 表无 seed（0 条 INSERT）
- * 时，create 期 {@code resolveDefaultModelName()} 确定性返回 null → {@code setModelName(null)} →
- * 撞 {@code model_name TEXT NOT NULL} → {@code SQLITE_CONSTRAINT_NOTNULL}。T2.1（model_name 可空）
- * + T2.2（create 不预填）修复后此路径必须 201 且落库 NULL。
+ * <p><b>WHY (CLAUDE.md 规则 9 · 测试验证意图)</b>：本类同时钉死两条创建契约不变量 ——
+ * <ol>
+ *   <li><b>[T2.5] 全新数据库下 {@code POST /api/v1/sessions} 只传 title 不得 500</b>（Bug 2 回归）。
+ *       原始根因链：无 settings.main_model_id（V1 种入 settings 行但该列为 NULL）且 models 表无
+ *       seed（0 条 INSERT）时，create 期 {@code resolveDefaultModelName()} 确定性返回 null →
+ *       {@code setModelName(null)} → 撞 {@code model_name TEXT NOT NULL} →
+ *       {@code SQLITE_CONSTRAINT_NOTNULL}。T2.1（model_name 可空）+ T2.2（create 不预填）
+ *       修复后此路径必须 201 且落库 NULL。</li>
+ *   <li><b>[S3 · F-03a 2026-09-14 用户裁定] {@code mainProjectId} 必填</b>：缺键 ⇒ 400、
+ *       纯空白 ⇒ 400（<b>判据是 @NotBlank 而非 @NotNull</b>——只有纯空白这一态能区分两者，
+ *       见 {@link #createBlankMainProjectId_400_withFieldError()}）。<b>WHY</b>：本仓一 JVM
+ *       多会话、项目按 sessionId 解析，「会话在、项目空」是 CC 状态空间里不存在的第三态
+ *       （CC 启动即冻结 projectRoot，Open-ClaudeCode/src/bootstrap/state.ts:278-279）——
+ *       把它显式化为「可表示但被拒绝」。</li>
+ * </ol>
+ * ⚠️ 因此第 1 组用例的请求体必须同时带 {@code mainProjectId}（否则先被第 2 条契约拒成 400）——
+ * 「title-only」指的是<b>不传 modelName</b>，不是「不传项目」。
  *
  * <p><b>全新库隔离</b>：默认 datasource 是 {@code ./nexusai.db}（会复用/污染开发库），故用
  * {@code @TempDir} + {@code @DynamicPropertySource} 把 {@code spring.datasource.url} 指向临时
- * SQLite 文件，Flyway 对空文件全量 V1→V14 → 得到真实"全新库"形态（settings 行存在但
+ * SQLite 文件，Flyway 对空文件全量执行 → 得到真实"全新库"形态（settings 行存在但
  * main_model_id NULL + models 空表 + model_name 可空）。
  *
  * <p><b>前置自证（fail loud · 规则十二）</b>：{@link #precondition_freshDbSettingsMainModelIdNullAndModelsEmpty()}
@@ -57,7 +68,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 // 关闭 MockMvc 自动挂载的过滤器，避免 OAuth token 前置依赖（鉴权行为由
 // BearerTokenAuthFilterTest / MemoryControllerTest / SessionControllerTest 专门覆盖）。
 @AutoConfigureMockMvc(addFilters = false)
-@DisplayName("[T2.5] title-only 会话创建集成测试（全新库）")
+@DisplayName("[T2.5 + S3 F-03a] 会话创建契约集成测试（全新库：mainProjectId 必填 + model_name 可空）")
 class SessionCreateTitleOnlyIntegrationTest {
 
     // CleanupMode.NEVER：SQLite DB 文件（.db/-shm/-wal）在测试结束时仍被 Hikari 连接池锁定，
@@ -103,17 +114,20 @@ class SessionCreateTitleOnlyIntegrationTest {
             "前置假设失败：全新库 models 表应为空（0 条 seed），实际=" + modelCount);
     }
 
-    // ── 5 个场景 ─────────────────────────────────────────────────────────
+    // ── 场景（T2.5 原 5 个 + S3 F-03a 判别用例 2 个）──────────────────────
 
     @Test
-    @DisplayName("title-only 创建：全新库不再 500，返回 201 + modelName 为 null 或键缺失")
+    @DisplayName("title-only（不传 modelName）+ 必填 mainProjectId：全新库不再 500，返回 201 + modelName 为 null 或键缺失")
     void createTitleOnly_no500_201() throws Exception {
+        // [S3 · F-03a] 请求体加 mainProjectId：本用例意图是「model_name 可空（T2.2）不炸全新库」，
+        //   与「mainProjectId 必填」是两条独立契约 —— 缺 mainProjectId 会在到达 T2.2 路径前被 400 拦下。
         MvcResult result = mockMvc.perform(post("/api/v1/sessions")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"title\":\"新会话\"}"))
+                .content("{\"title\":\"新会话\",\"mainProjectId\":\"proj-1\"}"))
             .andExpect(status().isCreated())
             .andExpect(jsonPath("$.id").value(not(blankOrNullString())))
             .andExpect(jsonPath("$.title").value("新会话"))
+            .andExpect(jsonPath("$.mainProjectId").value("proj-1"))
             .andReturn();
 
         assertModelNameNullOrAbsent(
@@ -126,7 +140,7 @@ class SessionCreateTitleOnlyIntegrationTest {
     void createTitleOnly_persistsNullModelName() throws Exception {
         MvcResult result = mockMvc.perform(post("/api/v1/sessions")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"title\":\"新会话\"}"))
+                .content("{\"title\":\"新会话\",\"mainProjectId\":\"proj-1\"}"))
             .andExpect(status().isCreated())
             .andReturn();
 
@@ -142,13 +156,13 @@ class SessionCreateTitleOnlyIntegrationTest {
     void createWithModelName_keepsExplicit() throws Exception {
         mockMvc.perform(post("/api/v1/sessions")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"title\":\"x\",\"modelName\":\"deepseek-chat\"}"))
+                .content("{\"title\":\"x\",\"modelName\":\"deepseek-chat\",\"mainProjectId\":\"proj-1\"}"))
             .andExpect(status().isCreated())
             .andExpect(jsonPath("$.modelName").value("deepseek-chat"));
     }
 
     @Test
-    @DisplayName("空 body（无 title 无 modelName）：契约至少传其一 → 400")
+    @DisplayName("空 body（无 title 无 modelName 无 mainProjectId）：契约至少传其一 → 400（不得变 500）")
     void createWithoutTitleOrModel_400() throws Exception {
         mockMvc.perform(post("/api/v1/sessions")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -156,12 +170,45 @@ class SessionCreateTitleOnlyIntegrationTest {
             .andExpect(status().isBadRequest());
     }
 
+    // ── [S3 · F-03a] mainProjectId 必填 · 两条判别用例 ────────────────────
+    // 判别点（工单验证 #1）：@NotBlank 与 @NotNull 在 `{"title":"x"}` 上表现【完全相同】，
+    //   只在 `{"mainProjectId":"  "}` 上分叉 ⇒ 只有第二条能证明用的是 @NotBlank。
+
+    @Test
+    @DisplayName("[S3 F-03a] 缺 mainProjectId 键 → 400 且 errors[].field = mainProjectId（@Valid 生效）")
+    void createWithoutMainProjectId_400_withFieldError() throws Exception {
+        // WHY（规则九）：mainProjectId 必填是「未绑定会话」入口侧不变量的落点。缺键只能靠 @Valid 拦
+        //   ——若它被摘掉，请求会一路走到 SessionService 落库 main_project_id=NULL ⇒ 制造出
+        //   使用侧（CwdResolution）必须再兜一次的第三态。
+        // RED: 删掉 SessionController.create 的 @Valid ⇒ 本用例红（服务层守卫虽仍 400，但响应体无
+        //   errors[]，field 断言失败 ⇒ 恰好证明 REST 契约层与域层守卫是两条不同的防线）。
+        mockMvc.perform(post("/api/v1/sessions")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"title\":\"x\"}"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errors[0].field").value("mainProjectId"));
+    }
+
+    @Test
+    @DisplayName("[S3 F-03a] mainProjectId 为纯空白 \"  \" → 400（证明判据是 @NotBlank 而非 @NotNull）")
+    void createBlankMainProjectId_400_withFieldError() throws Exception {
+        // WHY（规则九 · 唯一能区分 @NotBlank 与 @NotNull 的用例）：前端存在把 EMPTY_PROJECT.id === ''
+        //   送进来的路径。' ' 非 null ⇒ @NotNull 放行 ⇒ 落库 main_project_id=' ' ⇒ 读数侧按
+        //   「空即未绑定」判定（ToolRegistrationConfig）⇒ 守卫空转。只有 @NotBlank 会拒。
+        // RED: 把 SessionCreateRequest 的 @NotBlank 变异为 @NotNull ⇒ 本用例红（缺键那条仍绿）。
+        mockMvc.perform(post("/api/v1/sessions")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"title\":\"x\",\"mainProjectId\":\"  \"}"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errors[0].field").value("mainProjectId"));
+    }
+
     @Test
     @DisplayName("title-only 创建后：list 与 getById 均返回该会话 modelName 为 null 或键缺失")
     void createTitleOnly_thenList_getById() throws Exception {
         MvcResult created = mockMvc.perform(post("/api/v1/sessions")
                 .contentType(MediaType.APPLICATION_JSON)
-                .content("{\"title\":\"新会话\"}"))
+                .content("{\"title\":\"新会话\",\"mainProjectId\":\"proj-1\"}"))
             .andExpect(status().isCreated())
             .andReturn();
         String id = objectMapper.readTree(created.getResponse().getContentAsString()).get("id").asText();

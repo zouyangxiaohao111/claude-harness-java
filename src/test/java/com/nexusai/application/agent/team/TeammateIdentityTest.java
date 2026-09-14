@@ -6,7 +6,6 @@ import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.tasks.TaskType;
-import com.nexusai.infra.util.AbortControllerFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -24,10 +23,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>WHY（规则九）</b>：
  * <ul>
- *   <li><b>身份解析优先级 in-process &gt; dynamicTeamContext</b>（teammate.ts:11-13）——in-process
- *       teammate 经 AsyncLocalStorage（Java ThreadLocal）隔离，dynamicTeamContext 是 tmux teammate
- *       的 CLI 参数载体。若优先级倒置，并发 in-process teammate 的身份会被全局 dynamicTeamContext
- *       覆盖（teammateContext.ts 模块注释明示该隔离动机）。</li>
+ *   <li><b>身份解析优先级 显式 identity &gt; dynamicTeamContext</b>（teammate.ts:11-13）——in-process
+ *       teammate 的身份是<b>显式传参的纯数据</b>（[S1-T5] 原 ThreadLocal 载体已删），
+ *       dynamicTeamContext 是 tmux teammate 的 CLI 参数载体。若优先级倒置，并发 in-process
+ *       teammate 的身份会被全局 dynamicTeamContext 覆盖（teammateContext.ts 模块注释明示该隔离动机）。</li>
  *   <li><b>isTeammate 双条件</b>（teammate.ts:125-131）——tmux teammate 必须<b>同时</b>有 agentId
  *       与 teamName 才算 teammate；只设其一不算。否则半个身份被误判为 teammate，SendMessage/shutdown
  *       等 swarm 分支被错误触发。</li>
@@ -40,10 +39,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("T-A · teammate 身份解析 + TeammateMode 枚举（对齐 utils/teammate.ts）")
 class TeammateIdentityTest {
 
-    private static TeammateContext inProcess(String agentId, String agentName, String teamName,
-                                             boolean planModeRequired) {
-        return new TeammateContext(agentId, agentName, teamName, "#ff0000", planModeRequired,
-                "leader-session-1", AbortControllerFactory.create());
+    /**
+     * [S1-T5] in-process 身份 = {@link TeammateIdentity} 纯数据（原 ThreadLocal 载体类已删）。
+     * 作为「显式首参」注入各 helper —— 与生产 {@code ToolUseContext.teammateIdentity()} 同型。
+     */
+    private static TeammateIdentity inProcess(String agentId, String agentName, String teamName,
+                                              boolean planModeRequired) {
+        return new TeammateIdentity(agentId, agentName, teamName, "#ff0000", planModeRequired,
+                "leader-session-1");
     }
 
     @BeforeEach
@@ -61,35 +64,41 @@ class TeammateIdentityTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // 身份解析优先级 in-process > dynamicTeamContext
+    // 身份解析优先级 显式 identity > dynamicTeamContext
     // ════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("getAgentId/getAgentName: in-process (ThreadLocal) 优先于 dynamicTeamContext（teammate.ts:88-102）")
-    void inProcessContext_beatsDynamicTeamContext() {
-        // WHY: in-process teammate 经 ThreadLocal 隔离，必须优先；否则并发 teammate 身份被全局覆盖。
+    @DisplayName("getAgentId/getAgentName: 显式 identity 优先于 dynamicTeamContext（teammate.ts:88-102）")
+    void explicitIdentity_beatsDynamicTeamContext() {
+        // WHY: in-process teammate 身份是显式传参的纯数据，必须优先；否则并发 teammate 身份被全局覆盖。
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "tmux@team", "tmux-name", "team", null, false, "parent-tmux"));
-        TeammateContext ctx = inProcess("proc@team", "proc-name", "team", true);
+        TeammateIdentity identity = inProcess("proc@team", "proc-name", "proc-team", true);
 
-        String agentId = TeammateContext.runWithTeammateContext(ctx, Teammate::getAgentId);
-        String agentName = TeammateContext.runWithTeammateContext(ctx, Teammate::getAgentName);
-        String parent = TeammateContext.runWithTeammateContext(ctx, Teammate::getParentSessionId);
-
-        assertThat(agentId).as("in-process agentId 必须优先").isEqualTo("proc@team");
-        assertThat(agentName).as("in-process agentName 必须优先").isEqualTo("proc-name");
-        assertThat(parent).as("in-process parentSessionId 必须优先").isEqualTo("leader-session-1");
+        assertThat(Teammate.getAgentId(identity))
+                .as("显式 identity 的 agentId 必须优先").isEqualTo("proc@team");
+        assertThat(Teammate.getAgentName(identity))
+                .as("显式 identity 的 agentName 必须优先").isEqualTo("proc-name");
+        assertThat(Teammate.getTeamName(identity))
+                .as("显式 identity 的 teamName 必须优先").isEqualTo("proc-team");
+        assertThat(Teammate.getTeammateColor(identity))
+                .as("显式 identity 的 color 必须优先").isEqualTo("#ff0000");
+        assertThat(identity.parentSessionId())
+                .as("显式 identity 自带 parentSessionId（原 getParentSessionId 已删：生产 0 调用方）")
+                .isEqualTo("leader-session-1");
+        assertThat(Teammate.getAgentId(identity))
+                .as("显式 identity 存在时不得回落 dynamicTeamContext").isNotEqualTo("tmux@team");
     }
 
     @Test
-    @DisplayName("getAgentId/getAgentName: 无 in-process 时回退 dynamicTeamContext（teammate.ts:88-102）")
-    void dynamicTeamContext_usedWhenNoInProcess() {
+    @DisplayName("getAgentId/getAgentName: identity 为 null 时回退 dynamicTeamContext（teammate.ts:88-102）")
+    void dynamicTeamContext_usedWhenNoExplicitIdentity() {
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "tmux@team", "tmux-name", "team", null, false, "parent-tmux"));
 
-        assertThat(Teammate.getAgentId()).isEqualTo("tmux@team");
-        assertThat(Teammate.getAgentName()).isEqualTo("tmux-name");
-        assertThat(Teammate.getParentSessionId()).isEqualTo("parent-tmux");
+        assertThat(Teammate.getAgentId(null)).isEqualTo("tmux@team");
+        assertThat(Teammate.getAgentName(null)).isEqualTo("tmux-name");
+        assertThat(Teammate.getTeamName(null)).isEqualTo("team");
     }
 
     @Test
@@ -103,14 +112,14 @@ class TeammateIdentityTest {
         System.setProperty("nexusai.team.name", "cli-team");
         System.setProperty("nexusai.agent.color", "#00ff00");
 
-        assertThat(Teammate.getAgentName())
+        assertThat(Teammate.getAgentName(null))
                 .as("仅设 sysprop 无 dynamicTeamContext → agentName null").isNull();
-        assertThat(Teammate.getTeamName())
+        assertThat(Teammate.getTeamName(null))
                 .as("仅设 sysprop 无 dynamicTeamContext → teamName null").isNull();
-        assertThat(Teammate.getTeammateColor())
+        assertThat(Teammate.getTeammateColor(null))
                 .as("仅设 sysprop 无 dynamicTeamContext → color null").isNull();
-        // getTeamName(String)：teamContext 参数空时，同样不落 sysprop（对齐 CC teammate.ts:117 返回 undefined）
-        assertThat(Teammate.getTeamName(""))
+        // getTeamName(identity, teamContext)：teamContext 参数空时，同样不落 sysprop（对齐 CC teammate.ts:117 返回 undefined）
+        assertThat(Teammate.getTeamName(null, ""))
                 .as("空 teamContext 且无 dynamic → null（不落 sysprop）").isNull();
     }
 
@@ -118,12 +127,17 @@ class TeammateIdentityTest {
     @DisplayName("getTeamName(teamContext): 第 3 优先级 teamContext.teamName（leader 无 dynamic 时，teammate.ts:111-118）")
     void getTeamName_teamContextParamThirdPriority() {
         // WHY: leader 无 dynamicTeamContext 时经 AppState teamContext 传入 teamName（CC :104-107 注释语义）。
-        assertThat(Teammate.getTeamName("from-appstate")).isEqualTo("from-appstate");
+        assertThat(Teammate.getTeamName(null, "from-appstate")).isEqualTo("from-appstate");
+
+        // 显式 identity 优先于 teamContext 参数
+        assertThat(Teammate.getTeamName(
+                new TeammateIdentity("ip@t", "ip", "ip-team", null, false, null), "from-appstate"))
+                .as("显式 identity.teamName 优先于 teamContext 参数").isEqualTo("ip-team");
 
         // dynamic 优先于 teamContext 参数
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "a@dyn", "dyn", "dyn-team", null, false, null));
-        assertThat(Teammate.getTeamName("from-appstate")).isEqualTo("dyn-team");
+        assertThat(Teammate.getTeamName(null, "from-appstate")).isEqualTo("dyn-team");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -131,11 +145,12 @@ class TeammateIdentityTest {
     // ════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("isTeammate: in-process 恒 true（teammate.ts:125-131）")
-    void isTeammate_inProcessTrue() {
-        TeammateContext ctx = inProcess("p@t", "p", "t", false);
-        Boolean result = TeammateContext.runWithTeammateContext(ctx, Teammate::isTeammate);
-        assertThat(result).as("in-process teammate 恒 true").isTrue();
+    @DisplayName("isTeammate: 显式 identity 非 null 恒 true（teammate.ts:125-131）")
+    void isTeammate_explicitIdentityTrue() {
+        TeammateIdentity identity = inProcess("p@t", "p", "t", false);
+        assertThat(Teammate.isTeammate(identity)).as("显式 identity 恒 true").isTrue();
+        // 反方向：identity 为 null 且无 dynamic → false（证明判据是被判别的东西驱动，而非恒真）
+        assertThat(Teammate.isTeammate(null)).as("无 identity 无 dynamic → false").isFalse();
     }
 
     @Test
@@ -144,23 +159,23 @@ class TeammateIdentityTest {
         // 只有 agentId 无 teamName → 非 teammate
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "a@x", "a", null, null, false, null));
-        assertThat(Teammate.isTeammate()).as("缺 teamName 非 teammate").isFalse();
+        assertThat(Teammate.isTeammate(null)).as("缺 teamName 非 teammate").isFalse();
 
         // 只有 teamName 无 agentId → 非 teammate
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 null, "a", "team", null, false, null));
-        assertThat(Teammate.isTeammate()).as("缺 agentId 非 teammate").isFalse();
+        assertThat(Teammate.isTeammate(null)).as("缺 agentId 非 teammate").isFalse();
 
         // 两者都有 → teammate
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "a@x", "a", "team", null, false, null));
-        assertThat(Teammate.isTeammate()).as("agentId+teamName 齐全为 teammate").isTrue();
+        assertThat(Teammate.isTeammate(null)).as("agentId+teamName 齐全为 teammate").isTrue();
     }
 
     @Test
-    @DisplayName("isTeammate: 无 in-process 无 dynamic 无 sysprop 时 false")
+    @DisplayName("isTeammate: 无 identity 无 dynamic 无 sysprop 时 false")
     void isTeammate_falseWhenNeither() {
-        assertThat(Teammate.isTeammate()).isFalse();
+        assertThat(Teammate.isTeammate(null)).isFalse();
     }
 
     @Test
@@ -172,7 +187,7 @@ class TeammateIdentityTest {
         System.setProperty("nexusai.agent.name", "cli-agent");
         System.setProperty("nexusai.team.name", "cli-team");
 
-        assertThat(Teammate.isTeammate())
+        assertThat(Teammate.isTeammate(null))
                 .as("仅设 sysprop 但 dynamicTeamContext 为 null → 非 teammate").isFalse();
     }
 
@@ -193,11 +208,11 @@ class TeammateIdentityTest {
         assertThat(ctx.agentName()).isEqualTo("cli-agent");
         assertThat(ctx.teamName()).isEqualTo("cli-team");
         assertThat(ctx.color()).isEqualTo("#00ff00");
-        assertThat(Teammate.isTeammate()).as("接线后 isTeammate true").isTrue();
+        assertThat(Teammate.isTeammate(null)).as("接线后 isTeammate true").isTrue();
         // 名称解析经 dynamicTeamContext 返回（证明启动接线已覆盖 sysprop→dynamic 场景，运行期无需再回退 sysprop）
-        assertThat(Teammate.getAgentName()).as("接线后 getAgentName 经 dynamic").isEqualTo("cli-agent");
-        assertThat(Teammate.getTeamName()).as("接线后 getTeamName 经 dynamic").isEqualTo("cli-team");
-        assertThat(Teammate.getTeammateColor()).as("接线后 getTeammateColor 经 dynamic").isEqualTo("#00ff00");
+        assertThat(Teammate.getAgentName(null)).as("接线后 getAgentName 经 dynamic").isEqualTo("cli-agent");
+        assertThat(Teammate.getTeamName(null)).as("接线后 getTeamName 经 dynamic").isEqualTo("cli-team");
+        assertThat(Teammate.getTeammateColor(null)).as("接线后 getTeammateColor 经 dynamic").isEqualTo("#00ff00");
     }
 
     @Test
@@ -214,25 +229,25 @@ class TeammateIdentityTest {
     // ════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("isPlanModeRequired: in-process 优先于 dynamicTeamContext（teammate.ts:149-156）")
-    void isPlanModeRequired_inProcessPriority() {
+    @DisplayName("isPlanModeRequired: 显式 identity 优先于 dynamicTeamContext（teammate.ts:149-156）")
+    void isPlanModeRequired_explicitIdentityPriority() {
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "d@t", "d", "team", null, false, null)); // dynamic=false
-        TeammateContext ctx = inProcess("p@t", "p", "team", true); // in-process=true
-        Boolean result = TeammateContext.runWithTeammateContext(ctx, Teammate::isPlanModeRequired);
-        assertThat(result).as("in-process planModeRequired 必须优先").isTrue();
+        TeammateIdentity identity = inProcess("p@t", "p", "team", true); // identity=true
+        assertThat(Teammate.isPlanModeRequired(identity))
+                .as("显式 identity.planModeRequired 必须优先").isTrue();
     }
 
     @Test
-    @DisplayName("isPlanModeRequired: 无 in-process 时读 dynamicTeamContext.planModeRequired")
+    @DisplayName("isPlanModeRequired: identity 为 null 时读 dynamicTeamContext.planModeRequired")
     void isPlanModeRequired_dynamicValue() {
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "d@t", "d", "team", null, true, null));
-        assertThat(Teammate.isPlanModeRequired()).isTrue();
+        assertThat(Teammate.isPlanModeRequired(null)).isTrue();
 
         Teammate.setDynamicTeamContext(new Teammate.DynamicTeamContext(
                 "d@t", "d", "team", null, false, null));
-        assertThat(Teammate.isPlanModeRequired()).isFalse();
+        assertThat(Teammate.isPlanModeRequired(null)).isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -243,21 +258,24 @@ class TeammateIdentityTest {
     @DisplayName("isTeamLead: 4 分支 truth table（teammate.ts:178-197）")
     void isTeamLead_truthTable() {
         // 1) leadAgentId null → false（:178-180）
-        assertThat(Teammate.isTeamLead(null)).as("无 lead 恒非 lead").isFalse();
+        assertThat(Teammate.isTeamLead(null, null)).as("无 lead 恒非 lead").isFalse();
+        assertThat(Teammate.isTeamLead(inProcess("lead@team", "lead", "team", false), null))
+                .as("无 lead 恒非 lead（即便 identity 是 lead）").isFalse();
 
         // 2) myAgentId == leadAgentId → true（:187-189）
-        TeammateContext ctx = inProcess("lead@team", "lead", "team", false);
-        Boolean match = TeammateContext.runWithTeammateContext(ctx, () -> Teammate.isTeamLead("lead@team"));
-        assertThat(match).as("agentId 等于 leadAgentId 为 lead").isTrue();
+        TeammateIdentity lead = inProcess("lead@team", "lead", "team", false);
+        assertThat(Teammate.isTeamLead(lead, "lead@team"))
+                .as("agentId 等于 leadAgentId 为 lead").isTrue();
 
         // 3) myAgentId null → true（向后兼容，:193-195）
         Teammate.clearDynamicTeamContext();
-        assertThat(Teammate.isTeamLead("lead@team")).as("主会话无 agentId 为 lead").isTrue();
+        assertThat(Teammate.isTeamLead(null, "lead@team"))
+                .as("主会话无 agentId 为 lead").isTrue();
 
         // 4) myAgentId != leadAgentId → false（:197）
-        TeammateContext other = inProcess("mate@team", "mate", "team", false);
-        Boolean noMatch = TeammateContext.runWithTeammateContext(other, () -> Teammate.isTeamLead("lead@team"));
-        assertThat(noMatch).as("agentId != leadAgentId 非 lead").isFalse();
+        TeammateIdentity other = inProcess("mate@team", "mate", "team", false);
+        assertThat(Teammate.isTeamLead(other, "lead@team"))
+                .as("agentId != leadAgentId 非 lead").isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -273,11 +291,11 @@ class TeammateIdentityTest {
                 "a@t", "a", "team", "#123456", true, "parent");
         Teammate.setDynamicTeamContext(ctx);
         assertThat(Teammate.getDynamicTeamContext()).as("设置后应返回同一 context").isSameAs(ctx);
-        assertThat(Teammate.getTeammateColor()).as("dynamic color").isEqualTo("#123456");
+        assertThat(Teammate.getTeammateColor(null)).as("dynamic color").isEqualTo("#123456");
 
         Teammate.clearDynamicTeamContext();
         assertThat(Teammate.getDynamicTeamContext()).as("清除后 null").isNull();
-        assertThat(Teammate.getAgentId()).as("清除后无 agentId").isNull();
+        assertThat(Teammate.getAgentId(null)).as("清除后无 agentId").isNull();
     }
 
     // ════════════════════════════════════════════════════════════════════════

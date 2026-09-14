@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool;
 
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.infra.exception.UnresolvedProjectRootException;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -252,10 +253,22 @@ public class PathGuard {
      *
      * <p>{@code sessionId} null/空白 → 无会话兜底（{@link #currentWorkdir()}）+ WARN 一次
      * （不得只 DEBUG：缺失会话会让相对路径静默解析到错误目录，即工作区错位）。
-     * 解析器返回 null / 抛异常 → 同样回落 + WARN（对齐 CC getCwd catch 兜底，不抛）。
+     *
+     * <p><b>[S2 · F-10 2026-09-14 · 用户裁定 #6 (B)] 解析失败<b>不再回落</b></b>：原实现把解析器异常
+     * catch 成一条 WARN 后继续走（最终回落进程 {@code user.dir}）、把 {@code null} 也回落 ⇒
+     * 用户裁定 #7 的 fail-loud 在这条最热路径上被旁路。现改为：
+     * <ul>
+     *   <li>{@link UnresolvedProjectRootException}（或其子类型）⇒ ERROR + <b>原样上抛</b>；</li>
+     *   <li>其他 {@link RuntimeException} ⇒ ERROR + 抛出；{@link IllegalStateException} 家族归一为
+     *       {@link UnresolvedProjectRootException}（便于 REST 边界单点译 400），其余原样上抛
+     *       （缺陷类 ⇒ 500 类，⛔ 不伪装成 400）；</li>
+     *   <li>解析器返回 {@code null} ⇒ 抛 {@link UnresolvedProjectRootException}（默认解析器
+     *       {@code CwdResolution.getCwd} 恒非 null ⇒ null 只可能来自测试注入 = 注入方违约）。</li>
+     * </ul>
      *
      * @param sessionId 会话 ID（可 null）
-     * @return 归一化绝对路径的 workdir（恒非 null）
+     * @return 归一化绝对路径的 workdir
+     * @throws UnresolvedProjectRootException 会话项目根解析失败 / 无法判定（fail-loud，⛔ 不回落）
      */
     private Path sessionWorkdir(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
@@ -268,17 +281,38 @@ public class PathGuard {
             }
             return currentWorkdir();
         }
-        Path wd = null;
+        // [S2 · F-10 2026-09-14 · 用户裁定 #6 (B) / #7/#13] 消费侧默认**不吞**：
+        //   原实现把解析器异常 catch 成一条 WARN 后**继续往下走**（最终回落进程 user.dir）⇒
+        //   用户裁定 #7 的 fail-loud 在「相对路径校验」这条最热路径上被旁路（文件工具/权限判定
+        //   锚到错误仓库，用户只看到一条 WARN）。现要求：解析失败必须冒泡到调用方；
+        //   REST 边界由 GlobalExceptionHandler 单点译 400（⛔ 不在此处兜底）。
+        Path wd;
         try {
             wd = sessionWorkdirResolver.apply(sessionId);
-        } catch (Exception e) {
-            log.warn("[PathGuard] sessionWorkdirResolver 解析会话 cwd 异常 → 回落无会话兜底: sessionId={} cause={}",
-                sessionId, e.toString());
+        } catch (UnresolvedProjectRootException e) {
+            log.error("[PathGuard] 会话项目根解析失败（fail-loud，⛔ 不回落进程 user.dir）: sessionId={}",
+                sessionId, e);
+            throw e;
+        } catch (RuntimeException e) {
+            log.error("[PathGuard] sessionWorkdirResolver 解析会话 cwd 抛未预期异常（fail-loud，"
+                + "⛔ 不回落）: sessionId={}", sessionId, e);
+            // 会话 cwd 解析器的失败契约 = IllegalStateException 家族（CwdResolution 的 fail-loud 出口）
+            //   ⇒ 归一为领域异常，便于 REST 边界单点译 400；其他缺陷类异常（NPE/IO…）原样上抛
+            //   （500 类，⛔ 不得伪装成 400）。
+            if (e instanceof IllegalStateException) {
+                throw new UnresolvedProjectRootException(
+                    "[PathGuard] 会话项目根解析失败: sessionId=" + sessionId
+                        + " cause=" + e.getMessage(), e);
+            }
+            throw e;
         }
         if (wd == null) {
-            log.warn("[PathGuard] sessionWorkdirResolver 返回 null → 回落无会话兜底: sessionId={}；"
-                + "默认解析器 CwdResolution.getCwd 恒非 null，非默认解析器须返回会话 cwd", sessionId);
-            return currentWorkdir();
+            // [S2 F-10] 原实现「回落无会话兜底（进程 user.dir）」= 旁路 fail-loud。默认解析器
+            //   CwdResolution.getCwd 恒非 null ⇒ wd==null 只可能来自测试注入的解析器 ⇒ 按注入方
+            //   违约处理：抛，⛔ 不回落（与 setSessionWorkdirResolver 拒绝 null 同风格）。
+            throw new UnresolvedProjectRootException(
+                "[PathGuard] sessionWorkdirResolver 返回 null（违反契约：默认解析器恒非 null）: "
+                    + "sessionId=" + sessionId);
         }
         return wd.toAbsolutePath().normalize();
     }

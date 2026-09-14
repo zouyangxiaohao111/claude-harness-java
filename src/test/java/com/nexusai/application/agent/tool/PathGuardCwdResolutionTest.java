@@ -17,6 +17,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 
 /**
  * WF-1A · 文件操作域 cwd 统一入口接线验证 · 对齐 CC expandPath(baseDir=getCwd()) 每调用取（INV-1）。
@@ -36,7 +38,6 @@ class PathGuardCwdResolutionTest {
 
     @AfterEach
     void cleanup() {
-        CwdResolution.clearCurrentOverride();
         SessionCwdHolder.reset();
         SessionProjectRoot.reset();
     }
@@ -53,16 +54,26 @@ class PathGuardCwdResolutionTest {
     }
 
     @Test
-    @DisplayName("场景①: override 非空 → workdir()/resolve() 返回 override 目录（非 user.dir）")
-    void overrideLayerDrivesWorkdir(@TempDir Path overrideDir) throws Exception {
-        // WHY: CC pwd() 优先取 override（cwd.ts:19-21）。文件工具 workdir 必须随 override 变，
-        // 否则并发 agent 各自的 cwd 隔离失效。
-        PathGuard guard = productionLikeGuard("sess-wf1a-1");
-        Path expected = overrideDir.toRealPath();
+    @DisplayName("场景①: boundProject 层 → workdir()/resolve() 返回绑定项目根（非 user.dir）")
+    void boundProjectLayerDrivesWorkdir(@TempDir Path projectDir) throws Exception {
+        // WHY: 文件工具 workdir 必须能随「会话绑定的项目根」变，否则绑定项目后文件工具仍用
+        //   JVM 启动目录（跨项目污染）。
+        // [S2 · F-07 2026-09-14] 原装置 = CwdResolution.runWithCwdOverride(overrideDir, guard::workdir)
+        //   （override ThreadLocal 层，对齐 CC cwd.ts:19-21）。该通道已按用户裁定 #8 **整条删除**
+        //   ⇒ 改锚到**生产真路径**：SessionProjectRoot 绑定层（bind / resolveSessionProjectRoot
+        //   写入的那层，getCwd 的 L2）。
+        String sid = "sess-wf1a-1";
+        SessionProjectRoot.setForSession(sid, projectDir.toString());
+        PathGuard guard = productionLikeGuard(sid);
+        Path expected = projectDir.toRealPath();
 
-        Path workdir = CwdResolution.runWithCwdOverride(overrideDir.toString(), guard::workdir);
-
-        assertThat(workdir).isEqualTo(expected);
+        assertThat(guard.workdir())
+            .as("workdir() 必须取会话绑定项目根（L2），而非进程 user.dir")
+            .isEqualTo(expected)
+            .isNotEqualTo(Path.of(System.getProperty("user.dir")).toRealPath());
+        assertThat(guard.resolve("rel.txt"))
+            .as("resolve(rel) 必须落在绑定项目根下")
+            .isEqualTo(expected.resolve("rel.txt").normalize());
     }
 
     @Test
@@ -107,22 +118,92 @@ class PathGuardCwdResolutionTest {
     }
 
     @Test
-    @DisplayName("场景④: expandPath(raw, null) baseDir 缺省走统一入口 → 尊重 cwd override（非直读 user.dir · INV-6）")
-    void expandPathFallbackUsesCwdResolution(@TempDir Path sessionDir) throws Exception {
+    @DisplayName("场景④: expandPath(raw, null) baseDir 缺省走统一入口「无会话」出口（不读会话层 · INV-6）")
+    void expandPathFallbackUsesNonSessionExit(@TempDir Path sessionDir) throws Exception {
         // WHY: CC expandPath baseDir ?? getCwd()。旧 Java 直读 user.dir（PathGuard.expandPath:119），
-        // override/会话 cwd 变化时兜底仍解析到 user.dir 下。本测试锁定兜底走统一入口。
+        //   会话 cwd 变化时兜底仍解析到 user.dir 下。本测试锁定兜底走统一入口。
         //
         // [批 3c] 语义已变（已登记待裁定）：{@code expandPath(raw, null)} 是**静态**入口，没有 sessionId
-        //   形参，新实现显式按「无会话」解析 {@code CwdResolution.getCwd(null)}（仅 override / 进程
+        //   形参，新实现显式按「无会话」解析 {@code CwdResolution.getCwdForNonSession()}（仅进程
         //   user.dir 层）—— 即「静态兜底不再能解析到某个会话的 sessionCwd」这一前提本身随会话显式化
-        //   而消失。故本用例改用 override 层来证明「兜底确实经统一入口（而非直读 user.dir）」这一
-        //   原意图；原「解析到 sessionCwd 子路径」的断言形态已无法构造。
-        String expanded = CwdResolution.runWithCwdOverride(
-            sessionDir.toString(), () -> PathGuard.expandPath("rel.txt", null));
+        //   而消失；原「解析到 sessionCwd 子路径」的断言形态已无法构造。
+        // [S2 · F-07 2026-09-14] 原装置再用 {@code runWithCwdOverride} 证明「兜底确实经统一入口（而非
+        //   直读 user.dir）」。override 通道已按用户裁定 #8 **整条删除** ⇒ 「经统一入口 vs 直读 user.dir」
+        //   在本缝上**已不可观测**（两者同值）。改锚为「真值断言 + 反向对照」：断言真值，并同时证明
+        //   任何会话的 sessionCwd 层都不得被这个静态入口读到。
+        String sid = "sess-wf1a-4";
+        SessionCwdHolder.set(sid, sessionDir.toString());
+
+        String expanded = PathGuard.expandPath("rel.txt", null);
 
         assertThat(expanded)
-            .as("expandPath baseDir 缺省必须经 CwdResolution 统一入口（override 生效，而非直读 user.dir）")
-            .isEqualTo(sessionDir.toRealPath().resolve("rel.txt").normalize().toString());
+            .as("expandPath baseDir 缺省 = 无会话出口（进程 user.dir）下的 rel.txt")
+            .isEqualTo(Path.of(CwdResolution.getCwdForNonSession(), "rel.txt").normalize().toString())
+            .as("[反向对照] 不得读到任何会话的 sessionCwd（expandPath 静态入口无会话形参）")
+            .isNotEqualTo(sessionDir.toRealPath().resolve("rel.txt").normalize().toString());
+    }
+
+    /**
+     * [S2 · F-10 验证 #1 · 用户裁定 #6 (B)] 解析器抛异常 ⇒ 会话感知重载<b>冒泡</b>（⛔ 不回落 user.dir）。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：产生侧（CwdResolution）对「有会话却解析不出项目根」是 fail-loud
+     * 抛；消费侧原实现把它 catch 成一条 WARN 后继续走 ⇒ 最终回落进程 {@code user.dir} ⇒
+     * 用户裁定 #7 在「相对路径校验」这条最热路径上被完全旁路（文件工具/权限判定锚到后端启动目录，
+     * 用户只看到一条 WARN）。本用例钉住「消费侧默认不吞」。
+     *
+     * <p><b>RED（反向实验 · 有鉴别力）</b>：把 {@code PathGuard.sessionWorkdir} 的 catch 改回
+     * 「log.warn 后继续走」⇒ 本用例红（返回 user.dir 而不抛）。
+     *
+     * <p><b>正反对照（同一用例两臂）</b>：同一 guard 的解析器<b>不抛</b>时照常解析出该目录 ⇒
+     * 证明「抛」不是「guard 恒抛」。
+     */
+    @Test
+    @DisplayName("[S2 F-10] 解析器抛异常 ⇒ workdir(sessionId) 冒泡（fail-loud，⛔ 不回落 user.dir）")
+    void sessionWorkdirResolverThrowing_propagatesInsteadOfFallingBack(@TempDir Path okDir) throws Exception {
+        PathGuard guard = new PathGuard(() -> Path.of(System.getProperty("user.dir")));
+        guard.setSessionWorkdirResolver(sid -> {
+            throw new IllegalStateException("bound project root deleted");
+        });
+
+        Throwable thrown = catchThrowable(() -> guard.workdir("sess-f10-throw"));
+        assertThat(thrown)
+            .as("解析器异常必须冒泡到调用方/REST 边界（⛔ 不得静默回落 user.dir）")
+            .isInstanceOf(com.nexusai.infra.exception.UnresolvedProjectRootException.class)
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("sess-f10-throw");
+        assertThat(thrown.getMessage())
+            .as("消息不得暗示任何回落（回落是本次修复要消灭的行为）")
+            .doesNotContain("回落");
+
+        // 正向对照：同一 guard 换成不抛的解析器 ⇒ 照常解析（证明上面的红不是「guard 恒抛」）
+        guard.setSessionWorkdirResolver(sid -> okDir);
+        assertThat(guard.workdir("sess-f10-ok"))
+            .as("解析器正常时照常解析该会话 cwd")
+            .isEqualTo(okDir.toRealPath());
+    }
+
+    /**
+     * [S2 · F-10 验证 #1 第二臂] 解析器返回 {@code null} ⇒ 抛（注入方违约，⛔ 不回落 user.dir）。
+     *
+     * <p><b>WHY</b>：默认解析器 {@code CwdResolution.getCwd} 恒非 null ⇒ {@code null} 只可能来自
+     * 测试注入。原实现把它回落成进程 user.dir（旁路 fail-loud），现按「注入方违约」抛出。
+     *
+     * <p><b>RED（反向实验）</b>：把 {@code wd == null} 分支改回 {@code return currentWorkdir();} ⇒ 本用例红。
+     */
+    @Test
+    @DisplayName("[S2 F-10] 解析器返回 null ⇒ 抛（违约，⛔ 不回落 user.dir）")
+    void sessionWorkdirResolverReturningNull_throws() {
+        PathGuard guard = new PathGuard(() -> Path.of(System.getProperty("user.dir")));
+        guard.setSessionWorkdirResolver(sid -> null);
+
+        assertThatThrownBy(() -> guard.workdir("sess-f10-null"))
+            .as("解析器返回 null = 违反契约（默认解析器恒非 null）⇒ 必须抛，⛔ 不回落")
+            .isInstanceOf(com.nexusai.infra.exception.UnresolvedProjectRootException.class)
+            .hasMessageContaining("sess-f10-null");
+        // 会话感知 resolve 同走本路径（不是只有 workdir 一个入口）
+        assertThatThrownBy(() -> guard.resolve("sess-f10-null", "rel.txt"))
+            .as("resolve(sessionId, rel) 走同一 sessionWorkdir ⇒ 同样冒泡")
+            .isInstanceOf(com.nexusai.infra.exception.UnresolvedProjectRootException.class);
     }
 
     @Test

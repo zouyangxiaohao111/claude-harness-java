@@ -119,6 +119,14 @@ class SubagentToolD12ModelWiringTest {
      * （泛型运行时擦除为 raw {@code Consumer}，对齐 CC AgentTool.tsx:783-810 sync 路径 onProgress 上报，
      * IMP-SUB-28 A5 透传）。反射参数类型列表必须同步，否则 {@code getDeclaredMethod} 抛
      * {@code NoSuchMethodException} → 断言前先 AssertionError（RED）。invoke 实参相应补一个 {@code null}。
+     *
+     * <p>【S1-T3 追加第 6 参 {@code TeammateIdentity}}：本类用例全部是 <b>Agent 工具子代理路径</b>
+     * （直接构造 SubagentTool 并以 {@code ctx=null} 调用），<b>非</b> teammate 上下文 ⇒ 第 6 实参
+     * 传 {@code null}（= 非 teammate），与生产调用点同源语义
+     * （{@code StreamingToolExecutor} 传 {@code ctx != null ? ctx.teammateIdentity() : null}）。
+     * ⭐ 必须传 null 而非夹具身份：非 null 身份会额外命中 doExecute 内的 CC:272/278 teammate 守卫
+     * （"Teammates cannot spawn other teammates"）而提前返回 —— 本类断言的是 fork 路径 / 模型接线，
+     * 传身份会让被测代码根本不跑到断言点（假绿）。
      */
     private static void invokeDoExecute(SubagentTool tool, ToolUseBlock call) {
         try {
@@ -126,10 +134,11 @@ class SubagentToolD12ModelWiringTest {
                 ToolUseContext.class,
                 java.util.function.Consumer.class,
                 Class.forName("com.nexusai.application.agent.subagent.createSubagentContext$AgentOptions"),
-                Class.forName("com.nexusai.application.agent.subagent.ForkSubagentMessages$Message"));
+                Class.forName("com.nexusai.application.agent.subagent.ForkSubagentMessages$Message"),
+                com.nexusai.application.agent.team.TeammateIdentity.class);
             m.setAccessible(true);
             try {
-                m.invoke(tool, call, null, null, null, null);
+                m.invoke(tool, call, null, null, null, null, null);
             } catch (Throwable ignored) {
                 // 下游 llmProviderFactory=null 抛异常属预期 — 断言只依赖 D12 接线日志（接线点先于下游失败）
             }

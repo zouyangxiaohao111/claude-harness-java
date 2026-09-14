@@ -4,6 +4,7 @@ import com.nexusai.application.agent.permission.PermissionConfigProvider;
 import com.nexusai.domain.session.SessionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.domain.oauth_account.AccountOAuthTokenService;
+import com.nexusai.infra.exception.GlobalExceptionHandler;
 import com.nexusai.infra.security.BearerTokenAuthFilter;
 import com.nexusai.model.oauth_account.AccountOAuthToken;
 import com.nexusai.model.provider.dto.ModelTag;
@@ -29,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
@@ -206,7 +208,8 @@ class SessionControllerTest {
     @DisplayName("POST /api/v1/sessions → 201 + 新建会话 + 会话边界重读 bypassPermissions 开关（对齐 CC /login resetBypassPermissionsCheck）")
     void create_returnsCreated_andRefreshesPermissionGate() throws Exception {
         // WHY（补盲 · MM-F2 R-4）：SessionControllerTest 原仅 list/getById 两查询端点，
-        // create/update/delete（SessionController.java:41-62）0 覆盖。create 的会话创建边界
+        // create/update/delete（SessionController.java 的 @PostMapping/@PatchMapping/@DeleteMapping 三个
+        //   端点，S3 加 @Valid 后整体下移至 :59-88）0 覆盖。create 的会话创建边界
         // permissionConfigProvider.refresh() 重读 DB 开关（:46-48）对齐 CC /login 后
         // resetBypassPermissionsCheck（bypassPermissionsKillswitch.ts:53-55）。
         PermissionConfigProvider provider = mock(PermissionConfigProvider.class);
@@ -228,6 +231,65 @@ class SessionControllerTest {
         assertEquals("需求分析", captor.getValue().title());
         assertEquals("deepseek-chat", captor.getValue().modelName());
         assertEquals("proj-1", captor.getValue().mainProjectId());
+    }
+
+    /**
+     * [S3 · F-03a 2026-09-14 用户裁定] {@code mainProjectId} 必填 · REST 契约层 400。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：本仓一 JVM 多会话、项目按 sessionId 解析，「会话在、项目空」
+     * 是 CC 状态空间里不存在的第三态（CC 启动即冻结 projectRoot，Open-ClaudeCode/src/bootstrap/
+     * state.ts:278-279）。裁定把它显式化为「可表示但被拒绝」，落点就在这条 REST 边界上。
+     *
+     * <p><b>两条用例的鉴别力不同（工单验证 #1/#4）</b>：{@code @NotBlank} 与 {@code @NotNull} 在
+     * 「缺键」上表现<b>完全相同</b>，只在「纯空白」上分叉 ⇒ <b>第二条是唯一能证明判据是
+     * {@code @NotBlank} 的装置</b>（前端存在把 {@code EMPTY_PROJECT.id === ''} 送进来的路径）。
+     * 反向实验：把 {@code @NotBlank} 变异为 {@code @NotNull} ⇒ 第一条仍绿、第二条红。
+     *
+     * <p><b>为什么必须 {@code setControllerAdvice}</b>：{@code standaloneSetup} 默认不注册
+     * {@code @RestControllerAdvice}，而 {@code errors[]} 由
+     * {@link GlobalExceptionHandler#handleBeanValidation} 产出（先例 MemoryControllerTest:693-696）。
+     *
+     * <p><b>与 {@link #create_returnsCreated_andRefreshesPermissionGate()} 的关系</b>：
+     * 那也是 REST 创建点，但请求体已带 {@code "mainProjectId":"proj-1"}（该用例内）且它断言 captor
+     * 取到该值 ⇒ <b>本批改动对它零影响，它不红</b>——显式说明以免读者误以为它被漏掉。
+     */
+    @Test
+    @DisplayName("[S3 F-03a] POST /api/v1/sessions 缺 mainProjectId → 400 + errors[0].field，且不触达 SessionService")
+    void create_missingMainProjectId_400() throws Exception {
+        // ⚠️ 本断言在 {@code @NotBlank} 与 {@code @NotNull} 两种实现下<b>都绿</b>（缺键两态无差别），
+        //   即它<b>单独不足以</b>证明判据选对了 —— 鉴别力在 create_blankMainProjectId_400。
+        MockMvc validMvc = MockMvcBuilders.standaloneSetup(controller)
+            .setControllerAdvice(new GlobalExceptionHandler())
+            .build();
+
+        validMvc.perform(post("/api/v1/sessions")
+                .contentType(APPLICATION_JSON)
+                .content("{\"title\":\"需求分析\"}"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errors[0].field").value("mainProjectId"));
+
+        // 边界短路：被拒的请求绝不允许触达域层 —— 否则守卫只擦了显示面，库里仍会落未绑定会话
+        verify(sessionService, never()).create(any());
+    }
+
+    @Test
+    @DisplayName("[S3 F-03a] POST /api/v1/sessions mainProjectId 为纯空白 → 400（唯一区分 @NotBlank / @NotNull 的实验位）")
+    void create_blankMainProjectId_400() throws Exception {
+        // WHY（规则九 · 判据承重）：' ' 非 null ⇒ @NotNull 放行 ⇒ 请求落到 SessionService ⇒ 落库
+        //   main_project_id=' ' ⇒ 读数侧按「空即未绑定」判定 ⇒ 守卫空转。前端确实存在产生空串的路径
+        //   （EMPTY_PROJECT.id === ''）。只有 @NotBlank 会拒。
+        // RED（反向实验，工单验证 #4）：@NotBlank 变异为 @NotNull ⇒ 本用例红、create_missingMainProjectId_400 仍绿。
+        MockMvc validMvc = MockMvcBuilders.standaloneSetup(controller)
+            .setControllerAdvice(new GlobalExceptionHandler())
+            .build();
+
+        validMvc.perform(post("/api/v1/sessions")
+                .contentType(APPLICATION_JSON)
+                .content("{\"title\":\"需求分析\",\"mainProjectId\":\"  \"}"))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errors[0].field").value("mainProjectId"));
+
+        verify(sessionService, never()).create(any());
     }
 
     @Test

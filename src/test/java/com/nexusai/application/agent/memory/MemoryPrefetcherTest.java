@@ -115,6 +115,37 @@ class MemoryPrefetcherTest {
             null);  // agentMemoryDirectory
     }
 
+    /**
+     * [P1a F-06] 「无有效项目根」形态构造：{@code override=null} + {@code projectRoot==memoryBase}
+     * ⇒ {@code isEligibleProjectRoot=false} ⇒ {@code getAutoMemPath(...)==null}（A′ 分支）。
+     */
+    private MemoryPrefetcher buildNoEligibleRoot(Path memDir) {
+        AutoMemPaths paths = new AutoMemPaths(
+            () -> memDir.toString(),   // projectRoot == memoryBase
+            () -> memDir.toString(),   // memoryBase
+            () -> null,                // override 必须 null（否则绕开 eligibility 判定）
+            () -> null);
+        return new MemoryPrefetcher(
+            new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
+                new ModelConfigResolver() {
+                    @Override
+                    public String resolveFastModelName(String fallbackModelName) {
+                        return "claude-sonnet";
+                    }
+                    @Override
+                    public com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolve(String modelName) {
+                        return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
+                            new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
+                    }
+                }),
+            paths,
+            new MemoryAge(),
+            () -> true,
+            () -> true,
+            null,
+            null);
+    }
+
     /** 带 agent 注册中心 + agent-memory 目录的构造（G-19/G-69 @-mention 隔离测试用）。 */
     private MemoryPrefetcher buildWithAgents(Path memDir, Path cwd,
                                              com.nexusai.application.agent.subagent.AgentDefinitionRegistry registry) {
@@ -171,6 +202,40 @@ class MemoryPrefetcherTest {
         var handle = prefetcher.startPrefetch(List.of(userMsg("configure the system now")), ToolUseContext.createFileStateCache(), null);
 
         assertThat(handle).as("mothCopse 门控关闭必须不预取").isNull();
+    }
+
+    /**
+     * [P1a F-06] 消费侧静默点：{@code resolveMemoryDirs} 取不到 auto-memory 目录（无有效项目根）
+     * 时返回空目录列表 —— 旧实现只 DEBUG（生产不可见）。现统一 ≥WARN。
+     */
+    @Test
+    @DisplayName("[P1a F-06] resolveMemoryDirs 无有效项目根 → 空目录 + ≥WARN（原只 DEBUG）")
+    void noEligibleProjectRoot_warnsInsteadOfDebugOnly(@TempDir Path memDir) {
+        AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        // ⛔ 不能用 build()：它的 AutoMemPaths overrideSupplier = memDir（override 优先级最高，
+        //   在 eligibility 判定之前直接返回路径 ⇒ 永远走不到「无有效项目根」分支）。
+        //   本用例需要 override=null + projectRoot==memoryBase ⇒ isEligibleProjectRoot=false。
+        MemoryPrefetcher prefetcher = buildNoEligibleRoot(memDir);
+
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(AutoMemPaths.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            assertThat(prefetcher.resolveMemoryDirs("hello world", null))
+                .as("无有效项目根 ⇒ 空检索目录（预测取跳过，不伪造目录）")
+                .isEmpty();
+            assertThat(appender.list.stream()
+                    .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage))
+                .as("跳过预取必须留下 ≥WARN（旧实现只 DEBUG ⇒ 生产不可见）")
+                .anyMatch(m -> m.contains("无有效项目根")
+                    && m.contains("MemoryPrefetcher.resolveMemoryDirs"));
+        } finally {
+            logger.detachAppender(appender);
+            AutoMemPaths.resetNoEligibleProjectWarnForTest();
+        }
     }
 
     @Test

@@ -189,8 +189,13 @@ class RemoteAgentTaskServiceTest {
     @DisplayName("批 3b-D7 · 输出根收到的会话 = 显式 creatingSessionId（null 也原样传；绝不回落 MDC）")
     void creatingSession_nullForwardedAsNull_notResidualMdc() throws Exception {
         // WHY：taskOutputDirSupplier 现是 Function<String,Path>，会话由本方法显式转发 —— 本用例在
-        //   真实派生线程上写「别的会话」的残留 MDC（第三态），断言转发给 supplier 的是**显式值**
-        //   （null 就传 null，由下游 taskOutputDir 缺值 fail-loud），而不是 MDC 里的残留会话。
+        //   真实派生线程上断言转发给 supplier 的是**显式值**（null 就传 null，由下游 taskOutputDir
+        //   缺值 fail-loud），而不是任何 ambient/残留会话。
+        // ⚠️ [批 3c 遗留 · F-16c 澄清] 下方 setForSession(stale, …) 是批 3b 的「别的会话」诱饵登记，
+        //   批 3c 删除 ambient 会话槽后它<b>已无生产路径可达</b>（本服务只把 getForSession 当
+        //   sessionProjectRootResolver 按显式 sessionId 调用，不会去读「最近一次 set」）
+        //   ⇒ 它今天只是历史留痕，<b>不再</b>构成「不得取自别的会话」的对照装置。
+        //   故本用例的 as() 文案不再声称「会收到 sess-remote-stale-3b」（那是无产点的因果声明）。
         String stale = "sess-remote-stale-3b";
         com.nexusai.common.SessionProjectRoot.setForSession(stale, projectRoot.toString());
         AtomicReference<String> forwardedSession = new AtomicReference<>("<未调用>");
@@ -221,7 +226,7 @@ class RemoteAgentTaskServiceTest {
 
         assertThat(threadName.get()).isNotEqualTo(Thread.currentThread().getName());
         assertThat(forwardedSession.get())
-            .as("输出根收到的会话必须 = 显式值（null）；不得取自任何 ambient 会话（会收到 %s）", stale)
+            .as("输出根收到的会话必须 = RegisterOptions.sessionId()（显式传参；本用例传 null ⇒ 断言 null）")
             .isNull();
     }
 
@@ -611,8 +616,28 @@ class RemoteAgentTaskServiceTest {
         int calls = api.pollCalls;
         await(500, () -> api.pollCalls > calls);
         assertThat(framework.getTask(reg.taskId()).get().status()).isEqualTo(BackgroundTaskStatus.RUNNING);
-        // 无完成通知（markTaskNotified 未被触发）
+        // RUNNING 期间不得有终态通知（markTaskNotified 未被触发）
         assertThat(drainTaskNotifications()).isEmpty();
+
+        // ⭐ 正向对照（[F-16c] 假守卫族修复 · ⛔ 不可省）：上面那条 isEmpty 是<b>否定</b>断言，
+        //   而「状态 RUNNING ⇒ 无通知」本来就是状态断言的推论 —— 若观测通道本身是死的
+        //   （例如队列未接线、drain 选择器 mode 写错、通知根本不由本服务入队），isEmpty 会<b>恒绿</b>，
+        //   即「声称守护实际守不住」。故把任务驱动到<b>终态</b>，断言同一装置真的能捞到通知：
+        //   ① 证明 drainTaskNotifications（本类 :244-247）与通知队列是活的；
+        //   ② 反过来把上一条 isEmpty 变成「有信息」的断言（RUNNING 期为空 ≠ 装置恒空）。
+        //   （同类正向控制亦见 :325-347 pollTerminalNotification_outputFileReferencesUnifiedRoot，
+        //     但那条在另一个用例里 —— 本用例自证装置有效，不依赖跨用例的隐含前提。）
+        api.pollQueue.add(new RemoteSessionsApi.PollResult(List.of(), "e-final", "archived", null));
+        await(3000, () -> {
+            var t = framework.getTask(reg.taskId());
+            return t.isPresent() && t.get().status() == BackgroundTaskStatus.COMPLETED;
+        });
+        assertThat(framework.getTask(reg.taskId()).get().status())
+            .as("正向对照前置：archived 事件必须把任务驱动到终态")
+            .isEqualTo(BackgroundTaskStatus.COMPLETED);
+        assertThat(drainTaskNotifications())
+            .as("正向对照：同一观测装置在终态必须真的捞到通知（证明上一条 isEmpty 不是装置恒空）")
+            .isNotEmpty();
     }
 
     @Test

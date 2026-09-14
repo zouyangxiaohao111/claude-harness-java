@@ -886,8 +886,8 @@ public class CronIdleExecutor {
         if (boundProject != null && !boundProject.isBlank()) {
             req = req.withBoundProject(boundProject);
             log.info("CronIdleExecutor: 显式项目锚已挂载 RunRequest boundProject={} "
-                    + "mode={} sessionId={}（批 1 方向 C：替代 runWithCwdOverride / cronProjectRootOverride "
-                    + "两条 ThreadLocal 通道，对齐 CC 值随队列命令直传）",
+                    + "mode={} sessionId={}（批 1 方向 C：本显式锚替代了原两条**已删** ThreadLocal cwd "
+                    + "通道，对齐 CC 值随队列命令直传；[S2 F-07] 其中 override 通道的全仓载体亦已删除）",
                 boundProject, cmd.mode(), sessionId);
         } else if (sessionId == null || sessionId.isBlank()) {
             log.warn("CronIdleExecutor: 本 run 无项目锚（QueueItem.boundProject 空）且无 sessionId"

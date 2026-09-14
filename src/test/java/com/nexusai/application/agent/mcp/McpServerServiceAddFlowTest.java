@@ -20,7 +20,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import org.flywaydb.core.Flyway;
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -66,8 +65,10 @@ class McpServerServiceAddFlowTest {
 
     @BeforeAll
     static void setUpDatabase() throws Exception {
-        // describeMcpConfigFilePath(filePath 展示) 走 CwdResolution override（避免读到真实 user.dir）
-        CwdResolution.setCurrentOverride(tempDir.toString());
+        // [S2 F-07 2026-09-14] 原 CwdResolution.setCurrentOverride(tempDir) 已删除：override 通道
+        //   按用户裁定 #8 整条删除。withAddMeta 的 filePath 走 CwdResolution.getCwdForNonSession()
+        //   （无会话出口 = 归一化后的进程 user.dir），故 filePath 断言改锚为「真无会话语义」+
+        //   反向对照（不得再等于 tempDir —— 钉死 override 通道确实不再存在）。
 
         Path dbPath = MybatisFlexDbTestSupport.sharedDbPath();
         Files.createDirectories(dbPath.getParent());
@@ -110,11 +111,6 @@ class McpServerServiceAddFlowTest {
         service.setXaaEnabledGate(() -> false);
     }
 
-    @AfterAll
-    static void tearDownOverride() {
-        CwdResolution.clearCurrentOverride();
-    }
-
     @BeforeEach
     void clean() {
         for (McpServerRecord r : mapper.selectAll()) {
@@ -149,7 +145,13 @@ class McpServerServiceAddFlowTest {
         assertThat(Files.exists(projectMcpJson())).as("create 不得写 .mcp.json（DB 唯一源）").isFalse();
         // DTO 契约（filePath 由 describeMcpConfigFilePath 描述，仅展示）
         assertThat(dto.scope()).isEqualTo("project");
-        assertThat(dto.filePath()).isEqualTo(Path.of(tempDir.toString(), ".mcp.json").toString());
+        // [S2 F-07] withAddMeta 无会话入参 ⇒ 走 CwdResolution.getCwdForNonSession()（归一化后进程
+        //   user.dir）。原断言 = tempDir/.mcp.json（依赖已删的 override 通道）⇒ 改为生产真语义。
+        assertThat(dto.filePath())
+            .as("filePath = describeMcpConfigFilePath(scope, getCwdForNonSession()/.mcp.json)")
+            .isEqualTo(Path.of(CwdResolution.getCwdForNonSession(), ".mcp.json").toString())
+            .as("[S2 F-07 反向对照] 不得再等于 tempDir —— 证明 override 注入通道确实已删除")
+            .isNotEqualTo(Path.of(tempDir.toString(), ".mcp.json").toString());
     }
 
     @Test
