@@ -120,7 +120,7 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
          * 旧 4 参工厂 · 保留向后兼容 (委托 {@link #builder}).
          *
          * <p>WHY: 5 个 caller (BuiltInAgents 5 处 + SubagentExecutorForkModeTest) 历史调用点,
-         * 用户授权可破约但本期保留委托避免无谓 churn. 新代码应优先用 {@link #builder()}.
+         * 用户授权可破约但本期保留委托避免无谓 churn. 新代码应优先用 {@link #builder}.
          *
          * @param agentType      CC original: agentType (loadAgentsDir.ts:109)
          * @param whenToUse      CC original: whenToUse (loadAgentsDir.ts:110)
@@ -281,7 +281,7 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
          * 旧 5 参工厂 · 保留向后兼容 (委托 {@link #builder}).
          *
          * <p>WHY: loadAgentFile 历史调用点. 新代码 (loadAgentFile 16+ 字段解析) 应优先用
-         * {@link #builder()} 逐字段 fluent 设置, 对齐 CC parseAgentFromMarkdown 返回的 16+ 字段.
+         * {@link #builder} 逐字段 fluent 设置, 对齐 CC parseAgentFromMarkdown 返回的 16+ 字段.
          *
          * @param agentType     CC original: name (loadAgentsDir.ts:549)
          * @param whenToUse     CC original: description (loadAgentsDir.ts:550)

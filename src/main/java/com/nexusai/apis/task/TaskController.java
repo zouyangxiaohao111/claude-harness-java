@@ -141,7 +141,7 @@ public class TaskController {
      * 映射为 {@link TaskItemDto}（CC TaskSchema tasks.ts:76-88 全量投影）。
      *
      * <p>会话机制（批 3a 改 / 批 3c 显式化）：query {@code ?sessionId=} <b>必填</b>（缺 / 空白 ⇒ 400，
-     * 不再回落 MDC）→ <b>显式</b>传入 {@link TaskService#getTaskListId(String)} 的会话位（批 3c 起不再
+     * 不再回落 MDC）→ <b>显式</b>传入 {@link TaskService#getTaskListId(String, com.nexusai.application.agent.team.TeammateIdentity)} 的会话位（批 3c 起不再
      * 经 MDC 载体回放）→ 按 CC 优先级链（tasks.ts:199-210）解析 taskListId：
      * env CLAUDE_CODE_TASK_LIST_ID / in-process teammate teamName / team.name / 会话级
      * leaderTeamName / 当前会话。任务读取无锁（CC listTasks 无锁 readdir，tasks.ts:443-456）。

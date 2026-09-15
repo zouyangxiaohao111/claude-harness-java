@@ -328,7 +328,7 @@ public class SkillsLoader {
      *
      * <p><b>无双门控</b>：门控只在 getSkillDirCommands(:650) 与 addSkillDirectories(:925-927) 两个调用点，
      * 低层 loadSkillsFromSkillsDir（:407）本身无 skillsLocked 检查 —— {@link #loadFromDirectoryUnconditional}
-     * 与私有核心 {@link #loadFromDirectory(String, boolean)} 一律不门控（addSkillDirectories 门控已由
+     * 与私有核心 {@link #loadFromDirectory(String, boolean, CommandSource, CommandLoadedFrom)} 一律不门控（addSkillDirectories 门控已由
      * DynamicSkillsManager.isProjectSettingsEnabled:468-470 对齐），避免与动态目录加载双门控。
      *
      * <p>P1-2 条件分离（对齐 loadSkillsDir.ts:771-790）：{@code paths} 非空且未激活的条件技能

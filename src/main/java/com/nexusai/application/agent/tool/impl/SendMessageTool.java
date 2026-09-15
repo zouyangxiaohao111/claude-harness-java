@@ -993,7 +993,7 @@ public class SendMessageTool implements Tool {
      *
      * <p>teamName 为 null（无 teamContext，CC :178-180 {@code !teamContext?.leadAgentId → false}）→
      * 非 lead。leadAgentId 经 {@link TeamHelpers#leadAgentId} 从 team 配置 {@code leadAgentId} 解析，
-     * 委托 {@link Teammate#isTeamLead(String)} 单一真源。
+     * 委托 {@link Teammate#isTeamLead(TeammateIdentity, String)} 单一真源。
      *
      * @param teamName 目标 team（CC teamContext.teamName 等价），null → 非 lead
      * @return true=team lead（可批准/拒绝 plan）；false=非 lead

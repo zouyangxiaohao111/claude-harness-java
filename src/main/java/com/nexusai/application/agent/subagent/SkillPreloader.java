@@ -262,8 +262,13 @@ public class SkillPreloader {
                     .filter(ChatMessageDto.class::isInstance)
                     .map(ChatMessageDto.class::cast)
                     .toList();
+            // [批 r10 · 甲项 B1] originalCwd 槽（getOriginalCwdLayer 语义，存档锚）· 传惰性 Supplier
+            //   而非提前解析（理由同 SkillToolImpl:1495：本处不解析 cwd，提前求值会新增抛出面）。
+            //   ⛔ 不得以 cwd 顶替（getCwd 语义受 bash cd 影响）。
             List<ContentBlockParam> blocks = cmd.getPromptFn().apply("",
-                new PromptFnContext(cwd, messages, sessionId));
+                new PromptFnContext(cwd, messages, sessionId,
+                    () -> com.nexusai.application.agent.agent.CwdResolution
+                        .getOriginalCwdLayer(sessionId)));
             content = blocks.stream()
                 .filter(b -> b instanceof ContentBlockParam.TextBlockParam)
                 .map(b -> ((ContentBlockParam.TextBlockParam) b).text())

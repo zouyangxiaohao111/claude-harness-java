@@ -110,10 +110,22 @@ public class UserContextProvider {
      * <p>[批 3c] <b>构造期无会话来源</b>：本构造器无 projectRoot 形参、类内无 sessionId 字段，
      * 构造线程亦无可穿透的会话上下文 → 显式传 {@code null}（无会话），CwdResolution 逐层回落
      * user.dir，与旧实现（构造线程 MDC 恒空）行为零变化。
-     * <p><b>需同步改的消费点</b>（均不在本批清单，需改为显式传入 projectRoot，对齐
-     * {@code LlmAgentLoop.java:4397-4404} 已完成的会话化改造）：
-     * {@code PartialCompactService.java:838} / {@code ToolRegistrationConfig.java:2876} /
-     * {@code ContextAnalyzeService.java:805}（以及测试 {@code CompactCommandCcContractTest} 等）。
+     *
+     * <p><b>[r10b 2026-09-15] 原 javadoc 的「需同步改的消费点」清单已删除 —— 三行全部是错的</b>：
+     * 旧文写 {@code PartialCompactService.java:838} / {@code ToolRegistrationConfig.java:2876} /
+     * {@code ContextAnalyzeService.java:805}，实测这<b>三行都不是本类构造点</b>（真构造点 =
+     * {@code PartialCompactService:851} / {@code ToolRegistrationConfig:3020} /
+     * {@code ContextAnalyzeService:811}）；前两处早已会话化，本批 D11 又进一步改为
+     * <b>4 参显式 projectRoot 形态</b>（{@link #UserContextProvider(Path, Environment, ClaudemdEngine, String)}，
+     * 值/时机等价 —— 属形态统一）。
+     *
+     * <p>该清单真正<b>漏掉</b>的是与 {@code UserContextProvider} 相邻的
+     * {@code GitStatusProvider} 那一半 —— {@code PartialCompactService:852} 与
+     * {@code ToolRegistrationConfig:3021} 两处<b>有会话却调无参</b>
+     * {@code new GitStatusProvider()}（锚进程 user.dir）。已在本批 D1/D2 修复。
+     *
+     * <p><b>本构造器现在的合法消费方只有一个</b>：{@code ContextAnalyzeService:811}
+     * （REST 入参无 sessionId ⇒ 结构上确无会话，走命名出口合法）。
      */
     public UserContextProvider() {
         this(Path.of(CwdResolution.getOriginalCwdLayerForNonSession()), System::getenv, null);
@@ -168,6 +180,11 @@ public class UserContextProvider {
     public UserContextProvider(Path projectRoot, Environment environment,
                                com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine,
                                String sessionId) {
+        // [r10b · D12] 本三元是**第二解析点**（与 {@link #UserContextProvider(ClaudemdEngine, String)}
+        //   的 :143 同语义、同值），实测**生产不可达**：全仓唯一 4 参调用点
+        //   （{@code LlmAgentLoop:4397-4406}）两腿恒非 null（都会先 Path.of(...) 求值）；
+        //   grep {@code new UserContextProvider(null} / {@code (Path) null} = 0 命中。
+        //   [裁定] 不改「projectRoot 必填」：会波及 4 参构造的全部测试，低收益高风险。
         this.projectRoot = projectRoot != null
             ? projectRoot
             : Path.of(CwdResolution.getOriginalCwdLayer(

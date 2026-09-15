@@ -193,7 +193,7 @@ public final class AgentsHandler {
      * [B2] 结构化 agent 列表端点 · web 用户侧 agent 选择器数据源。
      *
      * <p>视图 = active winners（{@code subagentTool.registryForSession(sessionId).listAgents()}，
-     * registry 已 6 组覆盖合并只保留 winner）。不同于 {@link #agents()}（纯文本 CLI 等价），本端点
+     * registry 已 6 组覆盖合并只保留 winner）。不同于 {@link #agents(String)}（纯文本 CLI 等价），本端点
      * 返回 JSON 结构化 DTO 供前端选择器渲染（agentType/whenToUse/source/model/memory/tools/color）。
      *
      * <p><b>跳过 deny 过滤</b>（对齐 CC：用户侧 agent 选择器不过滤，区别于 Agent tool 的

@@ -9,7 +9,7 @@ import java.util.function.Supplier;
  * <p>L1 语义: 决定 analytics 用 prompt category。
  * <ul>
  *   <li>{@link #getQuerySourceForAgent(agentType, isBuiltInAgent)} → {@code agent:builtin:NAME} / {@code agent:custom} / {@code agent:default}</li>
- *   <li>{@link #getQuerySourceForREPL(settings)} → {@code repl_main_thread} / {@code repl_main_thread:outputStyle:NAME} / {@code repl_main_thread:outputStyle:custom}</li>
+ *   <li>{@link #getQuerySourceForREPL(Supplier, Map)} → {@code repl_main_thread} / {@code repl_main_thread:outputStyle:NAME} / {@code repl_main_thread:outputStyle:custom}</li>
  * </ul>
  *
  * <p>L2 契约 (5 Release Gate):

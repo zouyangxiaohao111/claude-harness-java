@@ -3093,7 +3093,11 @@ public class SubagentTool implements Tool {
             return ToolResult.error(toolUseId, "Subagent failed: " + e.getMessage());
         } finally {
             // P0-2 修复: 与 doExecute 中的 setCwd('tool-' + toolUseId, ...) 配对的清理,
-            //   避免 activeSessionCount 单调递增 (清理到对应前缀 key, 无 entry 时 no-op).
+            //   阻止 WorktreeCwdTracker.sessionCwd 这个 static ConcurrentHashMap 无界增长
+            //   (清理到对应前缀 key, 无 entry 时 no-op).
+            //   [acc8 复核 · 理由已更正] 原注释写「避免 activeSessionCount 单调递增」——
+            //   该读点实测 0 调用方（:2168-2173 已登记），故这条理由已空转；
+            //   仍然成立的真实理由是「不清理会泄漏 map 条目」。⛔ 不改代码（清理本身是对的）。
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
             // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevSyncProjectRoot) 已删
             //   （ThreadLocal 载体删除，见 executeSync 入口注释）。
@@ -3347,7 +3351,9 @@ public class SubagentTool implements Tool {
                             ag.toString());
                         finalizer.finalize(ag.toString(), failure);
                     } finally {
-                        // P0-2 修复: 异步线程结束时清理 tracker key (避免 activeSessionCount 单调递增).
+                        // P0-2 修复: 异步线程结束时清理 tracker key, 阻止 sessionCwd map 无界增长.
+                        //   [acc8 复核 · 理由已更正] 原注释写「避免 activeSessionCount 单调递增」——
+                        //   该读点实测 0 调用方（:2168-2173 已登记），故理由空转；真实理由是防 map 泄漏。
                         WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
                         // [IMP-G4 C7] 终态注销 name→agentId（避免映射残留指向已终止 agentId ·
                         //   CC React 状态随会话结束 GC，Java 显式注销等价位）
@@ -3492,7 +3498,11 @@ public class SubagentTool implements Tool {
             log.error("Subagent {} failed", selectedAgent.agentType(), e);
             return ToolResult.error(toolUseId, "Subagent failed: " + e.getMessage());
         } finally {
-            // P0-2 修复: executeAsync 降级到同步执行的清理 (与 doExecute 中的 setCwd 配对).
+            // P0-2 修复: executeAsync 降级到同步执行的清理 (与 doExecute 中的 setCwd 配对),
+            //   阻止 WorktreeCwdTracker.sessionCwd 这个 static ConcurrentHashMap 无界增长.
+            //   [acc8 复核 · 理由已更正] 本处原注释未给理由；与另两处 clearCwd 一致，
+            //   理由**不是** activeSessionCount（该读点实测 0 调用方，见 :2168-2173），
+            //   而是防 map 条目泄漏。⛔ 不改代码。
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
             // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevFallbackProjectRoot) 已删
             //   （ThreadLocal 载体删除，见本方法入口注释）。

@@ -121,9 +121,12 @@ public class YoloClassifierImpl implements YoloClassifier {
      *  yoloClassifier.ts:453-459 注释——缓存未填充（测试/未调 getUserContext 入口）
      *  → null → 无前缀，同 pre-PR 行为）。ToolRegistrationConfig 接线读
      *  {@code UserContextProvider.claudeMd()}；未注入/为 null → 无前缀。
-     *  POJO 单测不注入 → 零行为变化。 */
+     *  POJO 单测不注入 → 零行为变化。
+     *  <p>[r10b · 裁定 ②] 类型 {@code Supplier<String>} → {@code Function<String,String>}：
+     *  读源按<b>调用方传入的 sessionId</b> 解析 CLAUDE.md 扫描根（原无参 ⇒ 多会话下锚进程
+     *  user.dir = 后端启动目录，读到错的 CLAUDE.md）。消费点见 {@link #buildClaudeMdPrefix}。 */
     @Autowired(required = false)
-    private java.util.function.Supplier<String> claudeMdContentSupplier;
+    private java.util.function.Function<String, String> claudeMdContentSupplier;
 
     /** CC 1-stage 分类器 max_tokens（yoloClassifier.ts:1136）= 4096（thinkingPadding=0 非 ant）。 */
     private static final int CLASSIFIER_SINGLE_STAGE_MAX_TOKENS = 4096;
@@ -395,7 +398,7 @@ public class YoloClassifierImpl implements YoloClassifier {
         //  通道 → 前缀块 prepend 到 user 消息文本，语义等价（同为 user role 内容前置）。
         //  供应商未填充 → null → 零变化。promptLengths 分桶不变（CC :1045-1047 只累加
         //  转录 user 条目，不含 claudeMd 前缀消息）。
-        String claudeMdPrefix = buildClaudeMdPrefix();
+        String claudeMdPrefix = buildClaudeMdPrefix(ctx);
         if (claudeMdPrefix != null) {
             wrappedContent = claudeMdPrefix + "\n\n" + wrappedContent;
             singleStageUser = claudeMdPrefix + "\n\n" + singleStageUser;
@@ -440,15 +443,21 @@ public class YoloClassifierImpl implements YoloClassifier {
      * 无前缀（对齐 CC pre-PR 缓存未填充行为）。文本拼装委托
      * {@link YoloPromptBuilder#buildClaudeMdPrefix}。
      *
+     * <p><b>[r10b · 裁定 ②] 会话标识显式下传</b>：读源改吃 {@code ctx.sessionId()}
+     * （分类器调用链实测持有会话 —— 本方法唯一调用点 {@code classifyActionCore} 的 {@code ctx}
+     * 形参在作用域内，且 {@code ctx.sessionId()} 在同类 :780 已被真实消费）⇒ CLAUDE.md 扫描根
+     * 锚会话项目根，⛔ 不再回落进程 {@code user.dir}（后端启动目录）。
+     *
+     * @param ctx 分类器工具调用上下文（sessionId 源；null → 无会话，读源走无会话出口）
      * @return 前缀块文本；无 CLAUDE.md → null
      */
-    private String buildClaudeMdPrefix() {
+    private String buildClaudeMdPrefix(ToolUseContext ctx) {
         if (claudeMdContentSupplier == null) {
             return null;
         }
         String claudeMd;
         try {
-            claudeMd = claudeMdContentSupplier.get();
+            claudeMd = claudeMdContentSupplier.apply(ctx != null ? ctx.sessionId() : null);
         } catch (Exception e) {
             if (log.isWarnEnabled()) {
                 log.warn("YoloClassifier: claudeMd 读源异常，按无前缀处理（对齐 CC 缓存未填充语义）: {}",

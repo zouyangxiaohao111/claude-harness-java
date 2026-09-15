@@ -26,7 +26,7 @@ import org.springframework.web.bind.annotation.RestController;
  * <ol>
  *   <li>{@code memoryRoot = getAutoMemPath()}（dream.ts:33）；</li>
  *   <li>{@code transcriptDir = getProjectDir(getOriginalCwd())}（dream.ts:34）——Java 等价会话
- *       projectRoot（{@link CwdResolution#getOriginalCwdLayer()}，MemoryController.originalCwd 同源）；</li>
+ *       projectRoot（{@link CwdResolution#getOriginalCwdLayer(String)}，MemoryController.originalCwd 同源）；</li>
  *   <li>{@code await recordConsolidation()}（dream.ts:36-37）——手动 /dream 乐观盖章锁
  *       （consolidationLock.ts:130-140，{@link ConsolidationLock#recordConsolidation()}）；</li>
  *   <li>{@code prompt = DREAM_PROMPT_PREFIX + buildConsolidationPrompt(memoryRoot, transcriptDir, '')}
@@ -65,7 +65,7 @@ public class ExtractMemoriesController {
         "# Dream: Memory Consolidation (manual run)\n\n"
             + "You are performing a manual dream — a reflective pass over your memory files. Unlike the automatic background dream, this run has full tool permissions and the user is watching. Synthesize what you've learned recently into durable, well-organized memories so that future sessions can orient quickly.\n\n";
 
-    /** memory 存储层（memoryRoot = {@link MemoryStorage#memoryDir()}，CC getAutoMemPath）· @Bean
+    /** memory 存储层（memoryRoot = {@link MemoryStorage#memoryDir(String)}，CC getAutoMemPath）· @Bean
      *  自动装配（ToolRegistrationConfig.memoryStorage），required=false 容错单测反射注入。 */
     @Autowired(required = false)
     private MemoryStorage memoryStorage;

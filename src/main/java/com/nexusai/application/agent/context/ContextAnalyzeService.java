@@ -70,7 +70,7 @@ import java.util.function.Supplier;
  *
  * <p><b>生产接线（IMP-CM-16 · OPD-CM3-05/A03）</b>：web analyze 无 AgentState/工具上下文，
  * 但 memory 文件源与 tools 列表<b>经 Spring 注入真实生产源</b>——memory 段接
- * {@link ClaudemdEngine#getMemoryFiles(boolean)} + {@link ClaudemdEngine#filterInjectedMemoryFiles}
+ * {@link ClaudemdEngine#getMemoryFiles(boolean, String)} + {@link ClaudemdEngine#filterInjectedMemoryFiles}
  * （CC analyzeContext.ts:329，F1 已有），tools 段接 {@link ToolRegistry#getTools}
  * （CC buildAllTools print.ts:1474-1500，tool 模块）；测试/POJO 仍经构造注入假原料。
  * 权限 deny 过滤（CC appState.toolPermissionContext）web 无上下文 → 不应用（与
@@ -231,7 +231,7 @@ public class ContextAnalyzeService {
      *  analyzeContext.ts:567 → {@code getSkillToolCommands(cwd)} prompt.ts:213-215 → Java
      *  {@link SkillToolPrompt#getLimitedSkillToolCommands}）。
      *  <p>Spring 构造注入；null（测试/POJO）→ 回退注入 {@link #skills} 列表。生产经
-     *  {@link SkillRegistry#getModelInvocableCommands()}（对齐 CC commands.ts:563 getSkillToolCommands）
+     *  {@link SkillRegistry#getModelInvocableCommands(String)}（对齐 CC commands.ts:563 getSkillToolCommands）
      *  每 analyze 调用解析真实技能列表（CC countSkillTokens 内部调用点 analyzeContext.ts:567，Java
      *  惰性解析对齐 memoize + refresh 语义）。 */
     private final SkillRegistry skillRegistry;
@@ -422,7 +422,7 @@ public class ContextAnalyzeService {
      * <p><b>FIX-B2 生产数据源（拍板#4，总汇 §6.5）</b>：CC 在函数内部调用
      * {@code getLimitedSkillToolCommands(getCwd())}（:567）取真实技能列表；Java 生产经
      * {@link #resolveSkillSource()} 解析 {@link SkillToolPrompt#getLimitedSkillToolCommands}
-     * （= {@link SkillRegistry#getModelInvocableCommands()}，对齐 CC commands.ts:563
+     * （= {@link SkillRegistry#getModelInvocableCommands(String)}，对齐 CC commands.ts:563
      * getSkillToolCommands）——不再 {@code List.of()} 空注入。测试注入 {@link #skills} 假列表。
      *
      * <p><b>错误隔离（对齐 CC :605-613）</b>：CC countSkillTokens 整体 try/catch →
@@ -476,7 +476,7 @@ public class ContextAnalyzeService {
      * （analyzeContext.ts:567 → prompt.ts:213-215 → {@code getSkillToolCommands(cwd)} commands.ts:563）。
      *
      * <p>生产（skillRegistry != null）→ {@link SkillToolPrompt#getLimitedSkillToolCommands}
-     * （= {@link SkillRegistry#getModelInvocableCommands()}，模型可调用命令清单，与 skill listing
+     * （= {@link SkillRegistry#getModelInvocableCommands(String)}，模型可调用命令清单，与 skill listing
      * 同源）；测试/POJO（null）→ 回退注入 {@link #skills} 列表。每 analyze 调用解析一次（CC
      * countSkillTokens 内部调用点，memoize + refresh 语义由 SkillRegistry 承载）。
      *
@@ -498,7 +498,7 @@ public class ContextAnalyzeService {
      * [IMP-CM-16 · OPD-CM3-05/A03] memory 段计数原料解析 · CC original:
      * {@code filterInjectedMemoryFiles(await getMemoryFiles())}（analyzeContext.ts:329）。
      *
-     * <p>生产（claudemdEngine != null）→ {@link ClaudemdEngine#getMemoryFiles(boolean)} +
+     * <p>生产（claudemdEngine != null）→ {@link ClaudemdEngine#getMemoryFiles(boolean, String)} +
      * {@link ClaudemdEngine#filterInjectedMemoryFiles}（claudemd.ts:790-1075 + :1142-1151，
      * 逐文件投影为 {@link MemoryFileEntry}（path / type.ccName() / content）；测试/POJO（null）→
      * 回退构造注入 {@link #memoryFiles} 列表。每 analyze 调用解析一次（CC countMemoryFileTokens

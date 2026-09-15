@@ -23,7 +23,7 @@ import org.slf4j.LoggerFactory;
  *       {@code ~/.{appName}/magic-docs/prompt.md}（NexusaiPaths 自有根），再回落
  *       {@code ~/.claude/magic-docs/prompt.md}（CC 只读兼容）；两处均无 → default</li>
  *   <li>{@link #substituteVariables(String, Map)} — 单遍 {{var}} 替换 (避免 $ backreference + 双替换 bug)</li>
- *   <li>{@link #buildMagicDocsUpdatePrompt(String, String, String, String, String)} — 返回渲染后 prompt</li>
+ *   <li>{@link #buildMagicDocsUpdatePrompt(String, FileLoader, String, String, String, String)} — 返回渲染后 prompt</li>
  * </ul>
  *
  * <p>L2 契约 (5 Release Gate):

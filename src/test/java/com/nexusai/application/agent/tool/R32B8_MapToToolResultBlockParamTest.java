@@ -11,13 +11,13 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * R32-b8 #1 + G2 · {@link Tool#mapToToolResultBlockParam(AgentToolResult)} default 接口验证.
+ * R32-b8 #1 + G2 · {@link Tool#mapToToolResultBlockParam(AgentToolResult, String, boolean)} default 接口验证.
  *
  * <p><b>WHY (意图验证)</b>: 对齐 CC {@code Tool.ts:557-560 mapToolResultToToolResultBlockParam}
  * 是 CC 端每个 tool 必填字段, 由 toolExecution.ts:1292 消费。
  *
  * <p><b>G2 接线（DEL-G2-01）</b>: production 路径 {@code LlmAgentLoop.toolResultMessage}
- * 已改为经 per-tool {@link Tool#mapToToolResultBlockParam(AgentToolResult)} 构造 tool_result
+ * 已改为经 per-tool {@link Tool#mapToToolResultBlockParam(AgentToolResult, String, boolean)} 构造 tool_result
  * 块（AgentLoopContext 按 toolName 解析 Tool 实例）。default 实现不再是空占位 —— 返回
  * 合法 {@link ToolResultBlockParam}（tool_use_id/type/content/is_error），content 复用
  * {@link ToolResult#renderToolResultPayloadText} 渲染通用文本，保证未 override 工具也有合法块
@@ -25,13 +25,13 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>关键 invariant</b>（CLAUDE.md 规则 9 · 测试验证意图）:
  * <ul>
- *   <li>Default {@link Tool#mapToToolResultBlockParam(AgentToolResult)} 返回 {@link ToolResultBlockParam}
+ *   <li>Default {@link Tool#mapToToolResultBlockParam(AgentToolResult, String, boolean)} 返回 {@link ToolResultBlockParam}
  *       （tool_use_id 透传 / type='tool_result' / content 非空文本 / is_error 透传）。</li>
  *   <li>未 override 的工具（ReadFileTool / GlobTool / GrepTool）走 default，同样产出合法块。</li>
  *   <li>isError 结果（ToolResult.error）→ is_error=true 透传（对齐 CC tool_result.is_error）。</li>
  * </ul>
  *
- * @see Tool#mapToToolResultBlockParam(AgentToolResult)
+ * @see Tool#mapToToolResultBlockParam(AgentToolResult, String, boolean)
  * @see ToolResult
  */
 class R32B8_MapToToolResultBlockParamTest {

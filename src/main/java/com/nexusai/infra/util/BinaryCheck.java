@@ -10,9 +10,9 @@ import java.util.function.Predicate;
  *
  * <p>L1 语义: 检查文件/路径是否为 binary (基于 NUL byte 检测)。
  * <ul>
- *   <li>{@link #isBinary(Path, int)} — read first N bytes, check NUL byte</li>
+ *   <li>{@link #isBinary(Path)} — read first N bytes, check NUL byte</li>
  *   <li>{@link #isBinary(byte[])} — pure array check</li>
- *   <li>{@link #isPathBinary(Path, java.util.function.BiPredicate)} — custom IO abstraction</li>
+ *   <li>{@link #isPathBinary(Path, java.util.function.BiFunction)} — custom IO abstraction</li>
  * </ul>
  *
  * <p>L2 契约 (5 Release Gate):

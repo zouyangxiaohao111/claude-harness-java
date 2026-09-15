@@ -11,15 +11,16 @@ import com.nexusai.model.schedule.dto.ScheduleKind;
 import com.nexusai.model.schedule.dto.ScheduleScope;
 import com.nexusai.repository.schedule.entity.ScheduleRecord;
 import com.nexusai.repository.schedule.mapper.ScheduleMapper;
+import com.nexusai.test.support.MybatisFlexDbTestSupport;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.io.TempDir;
 import org.sqlite.SQLiteDataSource;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.ZonedDateTime;
 import java.util.List;
@@ -49,33 +50,36 @@ import static org.mockito.Mockito.when;
  * TestJob（mock NotificationQueue），不启动完整应用上下文。ScheduleService 注入 real TestJob
  * 验证 once 同步 fire 内联（gate→getById→enqueueLead→deleteAfterFire 全链路真实执行）。
  *
- * <p>注意：MybatisFlexBootstrap 是单例，本测试须独立运行
- * （{@code mvn -Dtest=ScheduleServiceRunNowOnceTest test}），不与其它使用 Flex 的测试类混跑。
+ * <p>[fix3] 与其它 Flex 测试类<b>可混跑</b>：DB 走共享稳定路径
+ * （{@link MybatisFlexDbTestSupport#sharedDbPath()}）+ {@code resetAndStart} 重置单例与
+ * mapper 代理缓存；每个用例前清空 {@code schedules} 表。⛔ 不再用 {@code @TempDir}
+ * （进程级单例 + 一次性启动门会让后跑的类静默绑到已被 JUnit 删除的临时目录）。
  */
 class ScheduleServiceRunNowOnceTest {
-
-    @TempDir
-    static Path tempDir;
 
     private static ScheduleMapper mapper;
     private QuartzScheduleService quartz;
     private ScheduleService service;
 
     @BeforeAll
-    static void setUpDatabase() {
-        String dbUrl = "jdbc:sqlite:" + tempDir.resolve("cron-b4-4.db");
+    static void setUpDatabase() throws Exception {
+        // [fix3] 共享稳定 DB（不再用 @TempDir）：MybatisFlexBootstrap 是**进程级单例**，且
+        //   start() 的启动门是 started.compareAndSet(false, true) ⇒ 本类若跑在别的 Flex 测试类
+        //   之后，setDataSource/addMapper 会**静默无效**，mapper 代理仍绑在前一个类的 @TempDir
+        //   （该目录已被 JUnit 删除）⇒ 查询报
+        //   SQLException: path to '...junit-...' does not exist。
+        //   经 MybatisFlexDbTestSupport.resetAndStart 重置单例 + mapper 代理缓存 ⇒ 可与其他 Flex 类混跑。
+        Path dbPath = MybatisFlexDbTestSupport.sharedDbPath();
+        Files.createDirectories(dbPath.getParent());
         SQLiteDataSource ds = new SQLiteDataSource();
-        ds.setUrl(dbUrl);
+        ds.setUrl("jdbc:sqlite:" + dbPath.toAbsolutePath());
         Flyway.configure()
             .dataSource(ds)
             .locations("classpath:db/migration")
             .baselineOnMigrate(true)
             .load()
             .migrate();
-        MybatisFlexBootstrap.getInstance()
-            .setDataSource(ds)
-            .addMapper(ScheduleMapper.class)
-            .start();
+        MybatisFlexDbTestSupport.resetAndStart(ds, ScheduleMapper.class);
         mapper = MybatisFlexBootstrap.getInstance().getMapper(ScheduleMapper.class);
     }
 

@@ -297,11 +297,17 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
         // ALIGN-BUNDLED-1（R2B-DEC-18 / BD-7）：真实 isGit 检测 · CC batch.ts:116-119 getIsGit()
         // （utils/git.ts:218-229 → findGitRoot(getCwd()) !== null）。旧桩 () -> false 使 /batch
         // 恒返回 NOT_A_GIT_REPO（可观察缺陷）。复用既有通道 GitStatusProvider.isGit()
-        // （walk-up .git 目录/文件，与 findGitRoot 同语义）；默认 cwd = 进程 cwd（对齐 CC getCwd()）。
-        // [INFERENCE] CC getIsGit 为进程级 memoize（git.ts:218），Java 每调用重算——
-        // 与 SubagentEnvInfo:159-164 同款，避免 Spring 多会话串状态（GitStatusProvider javadoc 同决议）。
+        // （walk-up .git 目录/文件，与 findGitRoot 同语义）。
+        // [r10b · D5 · 裁定 #10 第二域] cwd 改取**会话 cwd**（ctx.cwd()）：
+        //   CC 的 getIsGit 是进程级 memoize + ambient getCwd()（git.ts:218-222），在 CC 的
+        //   单进程单会话前提下 ambient cwd 恒 = 会话 cwd；本仓 1 JVM : N 会话 ⇒ ambient cwd
+        //   = 后端启动目录 ⇒ 语义不等价（非 git 项目的会话被误判为 git 仓库 → /batch 放行）。
+        //   会话 cwd 本就在 PromptFnContext 形参里（见 BatchSkillRegistrar.register 的 ctx）⇒ 显式传参。
+        //   [INFERENCE 保留] CC getIsGit 进程级 memoize vs Java 每调用重算——与 SubagentEnvInfo:159-164
+        //   同款，避免 Spring 多会话串状态（GitStatusProvider javadoc 同决议）。
         registerSkill("batch", () -> register(new BatchSkillRegistrar(
-            () -> new GitStatusProvider().isGit()).register()));
+            cwd -> new GitStatusProvider(cwd != null ? java.nio.file.Path.of(cwd) : null).isGit())
+            .register()));
     }
 
     private void registerClaudeApiSkill() {

@@ -973,7 +973,8 @@ public final class BashPathValidator {
      * （utils/fsOperations.ts:288-382）双侧 realpath 语义。
      *
      * <p>G3-1（symlink 逃逸）：双侧（输入 resolved 路径 vs cwd/additionalWorkingDirectories）
-     * 均先 {@link Path#toRealPath()}（存在时，解析全部 symlink 与 {@code ..}）后比对——
+     * 均先 {@link Path#toRealPath}（存在时，解析全部 symlink 与 {@code ..}）后比对——
+     * （{@code toRealPath(LinkOption...)} 为变参：调用不传 option，形参表写法不构成合法 javadoc 引用）
      * 项目内软链指向项目外文件不会被误判"在目录内"（{@code ./evil-link -> /etc/passwd}：
      * realpath 后 = /etc/passwd 不在 cwd 内 → 拒绝，读/写均拒）。目标不存在（ENOENT，写新文件）
      * → 找最深已存在祖先 realpath 再 rejoin 非存在尾段（对齐 CC {@code resolveDeepestExistingAncestorSync}

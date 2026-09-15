@@ -31,6 +31,22 @@ import java.util.Map;
  * <p><b>[RESIDUAL-FIX 残留 2]</b>：本类新增 {@code sessionWorktree} 三态，缓存完整
  * worktree 会话对象（对齐 CC {@code currentWorktreeSession} 模块级变量的 session 维度等价），
  * 供 resume 复刻 {@code restoreWorktreeSession}（worktree.ts:167-169）恢复完整会话对象语义。
+ *
+ * <p><b>[misc1 · 2026-09-15 · 已删] 原 {@code public static int activeSessionCount()}</b> ——
+ * 删除判据（{@code dead-code-decision-rule} 两条同时成立，<b>均经实测</b>，故非漏实现）：
+ * <ol>
+ *   <li><b>0 真实调用方（含测试 / 反射）</b>：在本类之外，{@code src/main/java} +
+ *       {@code src/test/java} 对该符号名命中 4 处，<b>全部是 {@code SubagentTool} 的注释</b>
+ *       （:2165 / :2171 / :3096 / :3350）；本类内除声明外无其它引用。其旧 javadoc 自陈
+ *       「用于监控」<b>不成立</b> —— 没有消费方就没有可观测性。</li>
+ *   <li><b>CC 无对应物</b>：{@code claude-code-best/src/utils/worktree.ts:156} 与
+ *       {@code Open-ClaudeCode/src/utils/worktree.ts:156} 均为
+ *       {@code let currentWorktreeSession: WorktreeSession | null = null} —— <b>单会话模块级
+ *       变量</b>（CC 单进程单会话），既无 session 维度表、也无任何计数访问器；CC 另有
+ *       {@code bootstrap/state.ts:975 getSessionCounter()}，但那是 OpenTelemetry
+ *       {@code AttributedCounter} 指标工厂（metrics 通道），与「活跃 worktree 会话数」无关。</li>
+ * </ol>
+ * 同款先例：批 {@code acc8} 删 {@code SubagentTool.agentRegistry()} 0 参重载。如需恢复，见 git 历史。
  */
 public final class WorktreeCwdTracker {
 
@@ -138,13 +154,6 @@ public final class WorktreeCwdTracker {
     public static Path getCwd(String sessionId) {
         if (sessionId == null) return null;
         return sessionCwd.get(sessionId);
-    }
-
-    /**
-     * 当前 session 数 (用于监控).
-     */
-    public static int activeSessionCount() {
-        return sessionCwd.size();
     }
 
     /**

@@ -43,7 +43,7 @@ import java.util.function.Predicate;
  *   <tr><td>isReadOnly(input)</td><td>{@link #isReadOnly(JsonNode)}</td><td><b>2</b></td></tr>
  *   <tr><td>isDestructive(input)</td><td>{@link #isDestructive(JsonNode)}</td><td><b>2</b></td></tr>
  *   <tr><td>isSearchOrReadCommand(input)</td><td>{@link #searchReadKind(JsonNode)} (4 态 enum, R32-b8 #2)</td><td><b>2</b> / <b>R32-b8 #2</b></td></tr>
- *   <tr><td>mapToolResultToToolResultBlockParam(content, id)</td><td>{@link #mapToToolResultBlockParam(AgentToolResult)}</td><td><b>R32-b8 #1</b></td></tr>
+ *   <tr><td>mapToolResultToToolResultBlockParam(content, id)</td><td>{@link #mapToToolResultBlockParam(AgentToolResult, String, boolean)}</td><td><b>R32-b8 #1</b></td></tr>
  *   <tr><td>isResultTruncated?(output)</td><td>{@link #isResultTruncated(String)}</td><td><b>OPD-TOOL-07-6</b></td></tr>
  *   <tr><td>isOpenWorld(input)</td><td>{@link #isOpenWorld(JsonNode)}</td><td><b>2</b></td></tr>
  *   <tr><td>requiresUserInteraction()</td><td>{@link #requiresUserInteraction()}</td><td><b>2</b></td></tr>
@@ -200,7 +200,7 @@ public interface Tool {
      * <p>30+ 旧工具仍返回 {@code ToolResult<String>} — Java 子类型协变, 自动适配新签名.
      * SkillTool 等需要 newMessages 的工具重写返回 {@code ToolResult<String>} (经 {@link ToolResult#successWithNewMessages}).
      *
-     * <p>不应抛异常, 所有错误转 {@link ToolResult#error()} 返回.
+     * <p>不应抛异常, 所有错误转 {@link ToolResult#error}（2/3 参重载）返回.
      *
      * @param call LLM 的工具调用请求（id + name + input）
      * @return 执行结果 ({@link ToolResult ToolResult&lt;T&gt;}; newMessages/contextModifier/mcpMeta 已折入)

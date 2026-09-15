@@ -42,28 +42,39 @@ public class SessionGitStatusRegistry {
     /**
      * 取（或懒建）会话级 GitStatusProvider · 同 sessionId 恒返回同一实例。
      *
-     * <p>{@code computeIfAbsent} 原子单飞：并发首触只建一次。无参构造 cwd 走
-     * {@code CwdResolution.getCwd()}（绑定项目/worktree 场景取对仓库，对齐 CC findGitRoot(getCwd())）。
+     * <p>{@code computeIfAbsent} 原子单飞：并发首触只建一次（⇒ <b>首个调用方传的
+     * {@code sessionCwd} 胜</b>；同会话后续传入不同值不生效，这是「会话开始一次快照、会话内不更新」
+     * 的应有语义，对齐 CC context.ts:97）。
      *
-     * @param sessionId 会话 ID（short 形态 sess-xxx）
+     * <p><b>[r10b · 裁定 ③ · 裁定 #10 第二域] 本方法不再自调 {@code CwdResolution}</b>：
+     * 调用方<b>手里已有 sessionId</b>（{@code LlmAgentLoop.doRun} 的回合边界）却让本缓存类反查会话态
+     * = 反查站点 ⇒ 按裁定 #10 口径改为<b>边界解析 ⇒ 形参下传</b>（同 D10 的槽形态）。本类退化为
+     * <b>纯会话级缓存</b>（key = sessionId，值 = 显式 cwd 构建的 provider）。
+     *
+     * <p>⚠️ <b>{@code sessionCwd} 必须是 {@code getCwd} 语义</b>（{@code CwdResolution#getCwd}
+     * 的返回值：L1 = sessionCwd 层，<b>bash {@code cd} 可覆盖</b>），理由是 CC 的 git 判定正是
+     * {@code findGitRoot(getCwd())}（git.ts:218-222）。
+     * <p>⛔ <b>不得用 {@code LlmAgentLoop.workspaceDir} / {@code runExplicitCwd} 顶替</b>：
+     * 那两处是 <b>boundProject / originalCwd 语义</b>（启动锚，不被 {@code cd} 覆盖）。
+     * 在发生过 {@code cd} 的会话里两者必然不同值 ⇒ 顶替会让 git 快照锚到 cd 前的目录。
+     * 该不可互换性有实测装置：{@code PromptSessionSlotsTest#p0_divergedFixture_*}（DIVERGED 夹具）。
+     *
+     * @param sessionId   会话 ID（short 形态 sess-xxx）
+     * @param sessionCwd  会话当前工作目录（{@code CwdResolution.getCwd(sessionId)} 的返回值，非 null）
      * @return 会话级 provider；null/blank sessionId → null（调用方回落每 run new）
      */
-    public GitStatusProvider getForSession(String sessionId) {
+    public GitStatusProvider getForSession(String sessionId, java.nio.file.Path sessionCwd) {
         if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
-        // [批 3c] 会话 cwd 显式取自本方法的 sessionId（原 GitStatusProvider 无参构造经裸 MDC 会话槽取，
-        //   该槽已删 ⇒ 无参构造只能回落进程 user.dir，会让会话 git 状态锚错仓库）。
-        return providers.computeIfAbsent(sessionId,
-            id -> new GitStatusProvider(java.nio.file.Path.of(
-                com.nexusai.application.agent.agent.CwdResolution.getCwd(id))));
+        return providers.computeIfAbsent(sessionId, id -> new GitStatusProvider(sessionCwd));
     }
 
     /**
      * 释放会话级 git status 快照 · 会话终止 / /clear 时接线，防 per-session 内存累积。
      *
-     * <p>移除后同 sessionId 再次 {@link #getForSession(String)} 懒建新实例（重新快照，
-     * 等价 CC reset 后新 turn）。null/未知会话 no-op。
+     * <p>移除后同 sessionId 再次 {@link #getForSession(String, java.nio.file.Path)} 懒建新实例
+     * （重新快照，等价 CC reset 后新 turn）。null/未知会话 no-op。
      */
     public void evict(String sessionId) {
         if (sessionId != null) {

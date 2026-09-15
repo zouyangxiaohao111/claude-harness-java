@@ -76,11 +76,25 @@ public record SystemPromptAssemblyInput(
      * （prompts.ts:821-839，Function Result Clearing 段）——Java 经 resolver.frcEnabled()
      * （settings 列，null→false；无 CACHED_MICROCOMPACT feature 等价物 → 门控承载）。
      */
-    boolean frcEnabled
+    boolean frcEnabled,
+    /**
+     * 会话态惰性三槽（cwd / originalCwd / worktreeBound）· CC original: 无对应 —— CC 的
+     * {@code getCwd()} / {@code getOriginalCwd()} / {@code getCurrentWorktreeSession()} 都是
+     * <b>进程级 ambient 读</b>（prompts.ts:640-641 / filesystem.ts:376-388），单进程单会话下
+     * 恒等；本仓多会话 ⇒ 由边界解析一次后经本槽下传（裁定 #10 第二域）。
+     *
+     * <p>{@code null} = <b>无会话 / 未接边界的调用方</b> ⇒ 读取方（{@link SystemPromptSections}）
+     * 按旧路径逐个解析（{@code cwd(input.sessionId())} / {@code SessionCwdHolder.isWorktreeBound}
+     * / {@code CwdResolution.getOriginalCwdLayer}），<b>fail-loud 面逐点不变</b>。
+     *
+     * <p>⛔ 槽必须<b>惰性</b>（{@link PromptSessionSlots} 内部 memoize，构造期零解析）：
+     * 传已解析值会扩大解析面（section 缓存命中 / assemble 短路两条路径本不读 cwd）。
+     */
+    PromptSessionSlots sessionSlots
 ) {
 
     /**
-     * 9 参便捷构造器（sessionId=null + 三个 SP-10/05/06 门控 false）· 供既有 9 参调用点
+     * 9 参便捷构造器（sessionId=null + 三个 SP-10/05/06 门控 false + 无槽）· 供既有 9 参调用点
      * 零改动迁移（ContextAnalyzeService/ResumeService 等 + 测试），null/false 语义 =
      * 会话上下文缺失 + 门控关闭（现行为零变化）。
      */
@@ -100,7 +114,7 @@ public record SystemPromptAssemblyInput(
     }
 
     /**
-     * 10 参便捷构造器（三个 SP-10/05/06 门控 false）· 保留既有 10 参调用点零改动迁移
+     * 10 参便捷构造器（三个 SP-10/05/06 门控 false + 无槽）· 保留既有 10 参调用点零改动迁移
      * （含 sessionId 的旧 canonical 形态，SessionMemoryService/PartialCompactService 等），
      * 门控关闭语义 = 现行为零变化。
      */
@@ -118,6 +132,34 @@ public record SystemPromptAssemblyInput(
         this(enabledTools, model, additionalWorkingDirs, mcpClients, outputStyleConfig,
             skillToolCommands, language, memoryLoader, tokenBudgetEnabled, sessionId,
             false, false, false);
+    }
+
+    /**
+     * 13 参便捷构造器（{@code sessionSlots = null}）· 供<b>未接边界</b>的调用方零改动迁移
+     * （{@code ResumeService:475} / {@code SubagentTool:4104} 等：它们把 input 构造写在
+     * {@code Supplier} 之外，"传已解析槽"会在「default 组装本不被调用」的路径上新增抛出；
+     * 见 §G 惰性风险）⇒ 槽缺省 null，读取方回落旧路径。
+     *
+     * <p>⚠️ 本构造器与下面 9/10 参构造器是<b>同一件事的三个宽度</b>，链式委托到 canonical
+     * （14 参）。⛔ 新增调用点若已持会话，应显式传槽（{@link PromptSessionSlots#of(String)}）。
+     */
+    public SystemPromptAssemblyInput(
+            Set<String> enabledTools,
+            String model,
+            List<String> additionalWorkingDirs,
+            List<McpClientInfo> mcpClients,
+            OutputStyleConfig outputStyleConfig,
+            List<String> skillToolCommands,
+            String language,
+            LoadMemoryPrompt memoryLoader,
+            boolean tokenBudgetEnabled,
+            String sessionId,
+            boolean nonInteractiveSession,
+            boolean scratchpadEnabled,
+            boolean frcEnabled) {
+        this(enabledTools, model, additionalWorkingDirs, mcpClients, outputStyleConfig,
+            skillToolCommands, language, memoryLoader, tokenBudgetEnabled, sessionId,
+            nonInteractiveSession, scratchpadEnabled, frcEnabled, null);
     }
 
     /**

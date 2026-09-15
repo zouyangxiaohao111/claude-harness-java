@@ -199,10 +199,11 @@ public class OpenAiSdkProvider implements LlmProvider {
     }
 
     /**
-     * [CCJ-EXEC-08] 19-arg blocks stream + thinkingConfig · blocks 连接后走
-     * {@link #stream(ProviderConfig, String, String, List, ArrayNode, Integer, TaskBudgetParam,
-     * String, ChatRequestOptions.ThinkingConfig, Consumer, Consumer, Consumer, Consumer, Runnable,
-     * AbortController, Consumer, Runnable)}（openai-compatible 端点 system 为 String 单值）。
+     * [CCJ-EXEC-08] blocks stream + thinkingConfig · blocks 连接后走
+     * {@link #stream}（openai-compatible 端点 system 为 String 单值）。
+     * ⚠️ 原文的形参表（17 项）与标题的「19-arg」都与本类现存重载（19 参 :117 / 20 参 :208）不符，
+     * 且类型列表也漂移（真实首段为 {@code List<SystemPromptBlock>}）⇒ 取<b>不写形参表</b>的
+     * 合法形态指向 stream 方法族，⛔ 不臆造某个具体重载。
      */
     @Override
     public void stream(ProviderConfig config,

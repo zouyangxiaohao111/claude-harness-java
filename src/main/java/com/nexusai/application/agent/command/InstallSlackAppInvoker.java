@@ -12,7 +12,7 @@ import java.util.function.UnaryOperator;
  *
  * <p>L2 契约 (5 Release Gate):
  * <ul>
- *   <li><b>A1</b>: {@link #call()} () → {@link Result}; 3 个函数式接口 slot
+ *   <li><b>A1</b>: {@link #call(GlobalConfig)} → {@link Result}; 3 个函数式接口 slot
  *       (browserOpener / clickLogger / counterUpdater)</li>
  *   <li><b>A2 Golden Trace</b>: log 'tengu_install_slack_app_clicked' →
  *       counter +1 → browserOpen → success?{text:Opening}:{text:Couldn't}</li>

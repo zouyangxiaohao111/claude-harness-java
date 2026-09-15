@@ -45,17 +45,16 @@ import org.assertj.core.api.Assertions;
  * 本测试断言：create 后直接读 DB（绕过 sessionJobs 反查）字段非 null，
  * 并模拟重启（清空 sessionJobs）后 listAll 仍能由 DB 列辨识 SESSION 任务。
  *
- * <p>用 MybatisFlexBootstrap（无 Spring）直连临时 SQLite + Flyway V1..V8，
+ * <p>用 MybatisFlexBootstrap（无 Spring）直连共享稳定 SQLite + Flyway V1..V20，
  * 不启动完整应用上下文（避免 Quartz / WebSocket / MCP 等耗时依赖）。
  *
- * <p>注意：MybatisFlexBootstrap 是单例，本测试须独立运行
- * （{@code mvn -Dtest=ScheduleServiceCreateStorageTest test}），不与其它
- * 使用 Flex 的测试类混跑。
+ * <p>[fix3 · 本段原文已过时] 原文写「MybatisFlexBootstrap 是单例，本测试须独立运行
+ * （{@code -Dtest=ScheduleServiceCreateStorageTest}），不与其它使用 Flex 的测试类混跑」
+ * —— 该限制<b>已被本类自身解除</b>（现已走
+ * {@link MybatisFlexDbTestSupport#sharedDbPath()} + {@code resetAndStart} 重置单例与
+ * mapper 代理缓存），故与其它 Flex 测试类<b>可混跑</b>。
  */
 class ScheduleServiceCreateStorageTest {
-
-    @TempDir
-    static Path tempDir;
 
     private static ScheduleMapper mapper;
     private static ScheduleService service;

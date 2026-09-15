@@ -3220,8 +3220,15 @@ public class LlmAgentLoop implements AgentLoop {
         // 共享同一 GitStatusProvider（内部 getGitStatus 实例级 memoize，会话内只算一次）→ system
         // 尾字节稳定 → 保护 deepseek 单前缀缓存。null 守卫全带：非 Spring（registry null）/ 无
         // sessionId / 无 sessionState → 跳过注入，loop() 回落每 run new（现状不变）。
+        // [r10b · 裁定 ③] cwd 在本边界显式解析后下传（注册表不再自调 CwdResolution）：
+        //   ⛔ 语义必须是 getCwd 语义（bash cd 可覆盖）—— CC 的 git 判定 = findGitRoot(getCwd())
+        //   （git.ts:218-222）。⚠️ 本方法手边的 runExplicitCwd / this.workspaceDir 是
+        //   boundProject/originalCwd 语义（启动锚，不被 cd 覆盖）⇒ **不可互换**（发生过 cd 的会话
+        //   两者必然不同值），故此处显式走 CwdResolution.getCwd(sessionId)。
         if (sessionGitStatusRegistry != null && sessionId != null && mainCtx.sessionState() != null) {
-            mainCtx.sessionState().setGitStatusProvider(sessionGitStatusRegistry.getForSession(sessionId));
+            mainCtx.sessionState().setGitStatusProvider(sessionGitStatusRegistry.getForSession(
+                sessionId,
+                java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId))));
         }
         // [ALIGN-COMP-1 P1] 续跑入口恢复 invokedSkills + suppress 副作用 · 镜像 CC
         //   loadConversationForResume:556-558（resume 加载转录后、deserialize 前调
@@ -4857,12 +4864,18 @@ public class LlmAgentLoop implements AgentLoop {
         String language = com.nexusai.application.agent.prompt.LanguageResolver.resolve(
             resolver != null ? resolver.language() : null);
         String sessionId = turnSessionId(ctx, perTurnTuc);
+        // [r10b · D10] 会话态惰性三槽（本方法 = prompt 域唯一边界）· 构造期零解析（惰性），
+        //   memoize 线程安全（多 section compute 并发读同一槽，见 PromptSessionSlots javadoc）。
+        com.nexusai.application.agent.prompt.PromptSessionSlots sessionSlots =
+            com.nexusai.application.agent.prompt.PromptSessionSlots.of(sessionId);
         com.nexusai.application.agent.prompt.OutputStyleConfig outputStyleConfig = null;
         if (resolver != null) {
             String styleName = resolver.outputStyle();
             // [批 3c] cwd 一律显式走会话来源（sessionId 为空 → getCwd(null) 按「无会话」解析
             //   → 进程 user.dir，= 旧无参重载「MDC 为空」分支等价语义），不再经任何隐式会话槽。
-            String cwd = com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId);
+            // [r10b · D10] 改读同一 slots 实例 ⇒ 同一次组装下 output_style 与 env_info_simple
+            //   的 cwd 解析合并为 1 次（值必然相同，异常面不变：此处本就是 eager 读）。
+            String cwd = sessionSlots.cwd();
             outputStyleConfig = com.nexusai.application.agent.prompt.PromptOutputStyleResolver.resolve(styleName, cwd);
         }
         com.nexusai.repository.session.entity.SessionRecord sessionRow = sessionRowOrNull(sessionId);
@@ -4894,7 +4907,8 @@ public class LlmAgentLoop implements AgentLoop {
             sessionId,
             nonInteractive,               // [SP-10] 会话级非交互门控（sessions.non_interactive_session V57）
             scratchpadEnabled,            // [SP-05] scratchpad 段门控（resolver.scratchpadEnabled）
-            frcEnabled);                  // [SP-06] frc 段门控（resolver.frcEnabled）
+            frcEnabled,                   // [SP-06] frc 段门控（resolver.frcEnabled）
+            sessionSlots);                // [r10b · D10] 会话态惰性三槽（唯一边界传槽者）
     }
 
     /**
@@ -11067,13 +11081,13 @@ public class LlmAgentLoop implements AgentLoop {
      * Workspace dir · 对齐 CC getProjectDir(getOriginalCwd()).
      *
      * <p><b>[TL-W2 P8]</b> 默认 <b>null</b>（无有效项目）—— 唯一赋值点是
-     * {@link #resolveSessionProjectRoot()}（会话入口单点解析，成功分支才 set workspaceDir）；
+     * {@link #resolveSessionProjectRoot(String)}（会话入口单点解析，成功分支才 set workspaceDir）；
      * 未命中/未绑定 → 保持 null，下游按「无有效项目」skip（memory 域 A′ 已就绪；子代理
      * transcript 派生 {@code SessionStorage.getAgentTranscriptPath(null, ...)} 恒返回 null）。
      *
      * <p>WHY 不再默认 {@code Path.of(AutoMemPaths.currentSessionProjectRoot())}：本类为
      * {@code @Scope("prototype")}（每次 {@code loopProvider.getObject()} 新实例），<b>字段初始化器
-     * 在构造期求值</b>，而会话 projectRoot 只在 {@link #run()} 内解析 ⇒ 构造期恒空 ⇒
+     * 在构造期求值</b>，而会话 projectRoot 只在 {@link #run(RunRequest)} 内解析 ⇒ 构造期恒空 ⇒
      * 初值恒为 {@code env ?? ~/.nexusai}（configHome）。run() 的未命中分支（无 streamSessionId /
      * resolver null / resolver 空 / 目录无效 / 异常）都不覆盖该值 ⇒ configHome 经
      * {@code buildSessionStateFromInstance → session.setWorkspaceDir} 进入 AgentState，

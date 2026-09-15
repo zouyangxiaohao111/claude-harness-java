@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <ul>
  *   <li>{@link #issueToken(String, String)}: 给 (deviceId, userId) 颁发 device token</li>
  *   <li>{@link #verifyToken(String, String, String)}: 验证 token 是否匹配 deviceId + userId</li>
- *   <li>{@link #revokeToken(String)}: 撤销 token</li>
+ *   <li>{@link #revokeToken(String, String)}: 撤销 token</li>
  * </ul>
  *
  * <p>LIMIT: 内存存储 (重启丢失). 真实场景应接数据库/Redis — 留 P1 接入.

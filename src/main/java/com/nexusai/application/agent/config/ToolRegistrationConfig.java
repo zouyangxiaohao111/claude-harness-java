@@ -3017,8 +3017,21 @@ public class ToolRegistrationConfig {
         return new SystemPromptContextProvider(
             state.sessionStartDate(),
             // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析（见 UserContextProvider javadoc）
-            new UserContextProvider(claudemdEngine, state != null ? state.sessionId() : null),
-            new GitStatusProvider());
+            // [r10b · D11] 同 PartialCompactService 的同名改动：projectRoot 在调用点显式解析
+            //   （值/时机与 2 参构造内部等价 ⇒ 行为零变化，属形态统一）。
+            //   ⛔ 语义 = getOriginalCwdLayer（会话存档锚），不是 getCwd。
+            new UserContextProvider(
+                java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
+                    .getOriginalCwdLayer(state.sessionId())),
+                System::getenv,
+                claudemdEngine,
+                state.sessionId()),
+            // [r10b · 裁定 #10 第二域 D2] 同 D1（PartialCompactService:852）：本方法持会话
+            //   （state.sessionId()，调用点 :2535 已保证 state 非 null），⛔ 不得再用无参构造 ⇒
+            //   否则 git 段锚进程 user.dir 而非会话 cwd（CC getIsGit = findGitRoot(getCwd())）。
+            //   ⚠️ 异常面零新增：上一行 2 参 UserContextProvider 已在同一会话上做同族 fail-loud 解析。
+            new GitStatusProvider(java.nio.file.Path.of(
+                com.nexusai.application.agent.agent.CwdResolution.getCwd(state.sessionId()))));
     }
 
     /**
@@ -3202,25 +3215,39 @@ public class ToolRegistrationConfig {
     }
 
     /**
-     * 注册分类器 CLAUDE.md 内容读源 Supplier · [prompt-align TOOLS-01] 镜像 CC
+     * 注册分类器 CLAUDE.md 内容读源 · [prompt-align TOOLS-01] 镜像 CC
      * {@code getCachedClaudeMdContent}（bootstrap/state.ts 缓存，context.ts 填充；
      * yoloClassifier.ts:453-459 注释语义）。
      *
      * <p>Java 分类器侧无 UserContextProvider bean（其为 plain class，new 构造），
-     * 此处以 {@code @Bean Supplier<String>} 承载，YoloClassifierImpl
+     * 此处以 {@code @Bean Function<String,String>} 承载，YoloClassifierImpl
      * {@code @Autowired(required=false)} 字段注入。读 {@code UserContextProvider.claudeMd()}
      * （经 ClaudemdEngine 完整 getClaudeMds 链或单文件子集；禁用/缺失 → null → 分类器
      * 无前缀，同 CC pre-PR 缓存未填充行为）。
      *
+     * <p><b>[r10b · 裁定 ② · 裁定 #10 第二域] 形参从「无会话」改为 <b>吃 sessionId</b></b>：
+     * 实测调用链<b>确实持有会话</b> —— {@code YoloClassifierImpl.classify(...)} /
+     * {@code classifyTextAction(...)} 都收 {@code ToolUseContext ctx}，而
+     * {@code ctx.sessionId()} 在同类 :780 已被真实消费（{@code dumpClassifierErrorPrompts}）；
+     * {@code buildClaudeMdPrefix()} 的唯一调用点 {@code classifyActionCore(...)} 也在
+     * {@code ctx} 作用域内。⇒ 按铁律「会话态一律显式传参」必须改（同 r10 的 D4 裁法）。
+     * ⛔ <b>不得以「对齐 CC」为由不改</b>：CC 的 {@code setCachedClaudeMdContent} 虽是进程级
+     * state（context.ts:176），但 CC 单进程单会话 ⇒ 它读到的 CLAUDE.md 恒是会话项目的；
+     * 本仓 1 JVM : N 会话下进程级读源 = <b>后端启动目录</b>的 CLAUDE.md（错的）。
+     *
+     * <p>⚠️ 失败面：{@code UserContextProvider(engine, sessionId)} 的 2 参构造会在构造期解析
+     * 会话 originalCwd（fail-loud），解析失败 → 抛出。消费侧
+     * （{@code YoloClassifierImpl.buildClaudeMdPrefix}）自带 try/catch → 记 WARN + 按「无前缀」
+     * 处理（= CC「缓存未填充」等价语义）⇒ <b>不阻断分类</b>。
+     *
      * @param claudemdEngine claudemd 引擎（null → UserContextProvider 回退单文件子集；
      *                       claudemdEngine @Bean 同文件 :1172，无循环依赖）
-     * @return CLAUDE.md 内容供应商（惰性，每次分类器调用求值）
+     * @return (sessionId) → CLAUDE.md 内容（惰性，每次分类器调用求值；sessionId null → 无会话）
      */
     @Bean
-    public java.util.function.Supplier<String> claudeMdContentSupplier(
+    public java.util.function.Function<String, String> claudeMdContentSupplier(
             com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine) {
-        com.nexusai.application.agent.prompt.UserContextProvider provider =
-            new com.nexusai.application.agent.prompt.UserContextProvider(claudemdEngine);
-        return provider::claudeMd;
+        return sessionId -> new com.nexusai.application.agent.prompt.UserContextProvider(
+            claudemdEngine, sessionId).claudeMd();
     }
 }

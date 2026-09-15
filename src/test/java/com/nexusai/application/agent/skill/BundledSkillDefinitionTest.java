@@ -263,7 +263,8 @@ class BundledSkillDefinitionTest {
     @Test
     @DisplayName("Batch/Debug register() 返回统一类型且 disableModelInvocation 透传（CC batch.ts:109 / debug.ts:23）")
     void batchAndDebugReturnUnifiedDefinition() {
-        BundledSkillDefinition batch = new BatchSkillRegistrar(() -> false).register();
+        // [r10b · D5] isGit 判定缝改吃**会话 cwd**（原无参 BooleanSupplier）⇒ lambda 补一参
+        BundledSkillDefinition batch = new BatchSkillRegistrar(cwd -> false).register();
         assertThat(batch.name()).isEqualTo("batch");
         assertThat(batch.userInvocable()).isTrue();
         assertThat(batch.disableModelInvocation()).as("CC batch.ts:109 disableModelInvocation: true").isTrue();

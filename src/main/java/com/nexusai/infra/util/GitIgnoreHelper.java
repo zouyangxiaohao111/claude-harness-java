@@ -13,7 +13,7 @@ import java.util.function.BiFunction;
  * <ul>
  *   <li>{@link #isPathGitignored(String, String, BiFunction)} — execFile 返回 0 → ignored</li>
  *   <li>{@link #getGlobalGitignorePath(String)} — ~/.config/git/ignore</li>
- *   <li>{@link #addFileGlobRuleToGitignore(String, String, BiFunction, BiFunction, BiFunction)} — appendEntry if not exists</li>
+ *   <li>{@link #addFileGlobRuleToGitignore} — appendEntry if not exists</li>
  * </ul>
  * 全部依赖注入 (testable)。
  *

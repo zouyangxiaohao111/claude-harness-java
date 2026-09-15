@@ -1491,8 +1491,16 @@ public class SkillToolImpl implements Tool {
                             .filter(ChatMessageDto.class::isInstance)
                             .map(ChatMessageDto.class::cast)
                             .toList();
+                // [批 r10 · 甲项 B1] originalCwd 槽（getOriginalCwdLayer 语义，存档锚）。
+                //   本处传**惰性** Supplier 而非提前解析：本方法不解析 cwd（用 ctx.effectiveCwd()），
+                //   提前调 getOriginalCwdLayer 会在此**新增**抛出面；而唯一消费点
+                //   GroupB.readSessionLogLines 原先把反查放在自己的 try 内（抛错被吞 + WARN + 空统计）
+                //   ⇒ 惰性让异常面与改造前逐点一致。
+                //   ⛔ 不得以 cwd 顶替（getCwd 语义受 bash cd 影响，两者在 cd 过的会话里必然不同值）。
                 promptFnBlocks = cmd.getPromptFn().apply(args,
-                        new PromptFnContext(cwd, messages, sessionId));
+                        new PromptFnContext(cwd, messages, sessionId,
+                            () -> com.nexusai.application.agent.agent.CwdResolution
+                                .getOriginalCwdLayer(sessionId)));
                 // CC processSlashCommand.tsx:884 skillContent = result.filter(text).map(text).join('\n\n')
                 content = promptFnBlocks.stream()
                         .filter(b -> b instanceof ContentBlockParam.TextBlockParam)

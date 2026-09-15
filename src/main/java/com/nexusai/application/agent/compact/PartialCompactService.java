@@ -848,8 +848,24 @@ public class PartialCompactService {
         return new SystemPromptContextProvider(
             state.sessionStartDate(),
             // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析
-            new UserContextProvider(claudemdEngine, state != null ? state.sessionId() : null),
-            new GitStatusProvider());
+            // [r10b · D11] 与下一行 GitStatusProvider 对齐为「边界解析 ⇒ 形参下传」形态：
+            //   projectRoot 改在调用点解析（值同 2 参构造内部的 getOriginalCwdLayer(sessionId)，
+            //   时机同构造期 ⇒ 异常面与行为**零变化**；本项是形态统一，非缺陷修复）。
+            //   ⛔ 语义 = getOriginalCwdLayer（会话存档锚），**不是** getCwd（两者在 cd 过的会话里必然不同）。
+            new UserContextProvider(
+                java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
+                    .getOriginalCwdLayer(state.sessionId())),
+                System::getenv,
+                claudemdEngine,
+                state.sessionId()),
+            // [r10b · 裁定 #10 第二域 D1] 会话态显式传参：本方法持会话（state.sessionId()），
+            //   ⛔ 不得再用无参构造 —— 无参走「无会话」命名出口 ⇒ git 段锚进程 user.dir（后端启动
+            //   目录）而非会话 cwd（CC getIsGit = findGitRoot(getCwd())，git.ts:218-222）。
+            //   形态对齐正确样例 LlmAgentLoop.java:4384-4386（同一 getCwd 源）。
+            //   ⚠️ 异常面零新增：上一行 UserContextProvider(engine, sessionId) 的 2 参构造已在同一
+            //   会话上做 getOriginalCwdLayer 解析（同族 fail-loud）⇒ 本行不引入新的抛出面。
+            new GitStatusProvider(java.nio.file.Path.of(
+                com.nexusai.application.agent.agent.CwdResolution.getCwd(state.sessionId()))));
     }
 
     /**

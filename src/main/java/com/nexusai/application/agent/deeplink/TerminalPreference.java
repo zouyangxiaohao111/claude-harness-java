@@ -10,7 +10,7 @@ import java.util.function.Supplier;
  *
  * <p>L1 语义: detect current terminal via TERM_PROGRAM env var + 存到 globalConfig 供 deep link handler 使用。
  * <ul>
- *   <li>{@link #updateDeepLinkTerminalPreference(envProvider, configGetter, configSaver)} — main entry</li>
+ *   <li>{@link #updateDeepLinkTerminalPreference(Supplier, BooleanSupplier, Supplier, GlobalConfigUpdater)} — main entry</li>
  *   <li>{@code TERM_PROGRAM_TO_APP} Map — lowercased TERM_PROGRAM → macOS .app name</li>
  * </ul>
  *

@@ -309,25 +309,27 @@ public class CommandRegistrationConfigGroupAGitDir {
      * CC context.resume 切入新会话未接线（branch.ts:279-281），fork 文件已生成但不切换当前会话。
      */
     private void registerBranchHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("branch", (args, sessionId, inFlightUserMessageId) -> {
-            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            if (sessionId == null || sessionId.isBlank()) {
+        dispatcher.registerSlashCommandCtx("branch", ctx -> {
+            // [批 3c] 会话标识取执行上下文（不再读裸 MDC）
+            if (ctx.sessionId() == null || ctx.sessionId().isBlank()) {
                 log.warn("[CommandRegistrationConfigGroupAGitDir] /branch 无会话上下文，无法读取 transcript（CC branch.ts:69 getSessionId + :78-87 读文件失败报 'No conversation to branch'）");
                 return;
             }
             try {
-                String workspaceDir = resolveWorkspaceDir(sessionId);
+                // [批 r10] 会话存档根走 ctx.projectRoot()（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+                //   替代原 3 份逐字节相同的 resolveWorkspaceDir）。解析点仍在 try 内 ⇒ catch 语义不变。
+                String workspaceDir = ctx.projectRoot();
                 // D3 读兼容：经 SessionStorage.resolveExistingTranscript 读 nexusai 现有 transcript（仅 nexusai，无 claude 回落）
-                Path transcript = SessionStorage.resolveExistingTranscript(Path.of(workspaceDir), sessionId);
+                Path transcript = SessionStorage.resolveExistingTranscript(Path.of(workspaceDir), ctx.sessionId());
                 if (transcript == null || !Files.exists(transcript)) {
                     log.warn("[CommandRegistrationConfigGroupAGitDir] /branch transcript 不存在，无法 fork: path={}（对齐 CC branch.ts:78-87 'No conversation to branch'）",
                         transcript);
                     return;
                 }
                 String content = Files.readString(transcript);
-                String customTitle = args != null && !args.isBlank() ? args.trim() : null;
+                String customTitle = ctx.args() != null && !ctx.args().isBlank() ? ctx.args().trim() : null;
                 BranchService service = new BranchService();
-                BranchService.ForkResult fork = service.createFork(sessionId, workspaceDir, content, customTitle);
+                BranchService.ForkResult fork = service.createFork(ctx.sessionId(), workspaceDir, content, customTitle);
                 // CC getUniqueForkName（branch.ts:179-220）：Java 无 searchSessionsByCustomTitle →
                 // titleExists 恒 false（碰撞检测未接线，受控差异）
                 String effectiveTitle = service.getUniqueForkName(fork.title(), name -> false);
@@ -349,12 +351,9 @@ public class CommandRegistrationConfigGroupAGitDir {
      * && tengu_quartz_lantern），此处不强行触发。交互 UI 属前端组件，受控差异。
      */
     private void registerDiffHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("diff", (args, sessionId, inFlightUserMessageId) -> {
-            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            String cwd = CwdResolution.getCwd(sessionId);
-            if (cwd == null || cwd.isBlank()) {
-                cwd = System.getProperty("user.dir", ".");
-            }
+        dispatcher.registerSlashCommandCtx("diff", ctx -> {
+            // [批 r10] cwd 走 ctx.cwd()（getCwd 语义 + user.dir 兜底单点；原 4 行样板消失）
+            String cwd = ctx.cwd();
             GitStatusProvider provider = new GitStatusProvider(Path.of(cwd));
             String gitStatus = provider.getGitStatus();
             log.info("[CommandRegistrationConfigGroupAGitDir] /diff 执行完成: cwd={} hasGitStatus={}（DiffDialog 交互 UI 属前端组件，后端暴露 git status 文本，受控差异）",
@@ -436,9 +435,4 @@ public class CommandRegistrationConfigGroupAGitDir {
         return "ant".equalsIgnoreCase(System.getenv("USER_TYPE"));
     }
 
-    /** 会话存档根 · 对齐 CC sessionStorage.ts getTranscriptPath()（原始项目根 ?? user.dir）。 */
-    private static String resolveWorkspaceDir(String sessionId) {
-        String root = CwdResolution.getOriginalCwdLayer(sessionId);
-        return root != null && !root.isBlank() ? root : System.getProperty("user.dir", ".");
-    }
 }

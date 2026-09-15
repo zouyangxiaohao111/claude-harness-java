@@ -4,9 +4,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import com.nexusai.application.agent.agent.CwdResolution;
+
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * User Input Dispatcher · 对齐 CC utils/processUserInput/processUserInput.ts (605 行).
@@ -36,7 +39,7 @@ public class UserInputDispatcher {
      * 该读点存在第三态（可能读到上一请求残留的、别的会话的 id）且随批 3c 删除 ⇒ 二者必须<b>显式</b>
      * 从分派入口穿进来（对齐 CC {@code command.call(args, context)} 的 context 显式携带语义）。
      */
-    private final Map<String, TriConsumer> slashCommandHandlers = new ConcurrentHashMap<>();
+    private final Map<String, Consumer<SlashCommandContext>> slashCommandHandlers = new ConcurrentHashMap<>();
 
     /**
      * 按命令名注册的 slash command <b>result</b> handler（Plan-P1 §4.3 · 镜像 CC
@@ -47,19 +50,136 @@ public class UserInputDispatcher {
      * {@link TriFunction} = {@code (args, sessionId, inFlightUserMessageId)}，
      * 同 {@link #slashCommandHandlers} 的 WHY（显式会话标识 + 显式在途消息 id，杜绝 MDC 第三态）。
      */
-    private final Map<String, TriFunction> slashCommandResultHandlers =
+    private final Map<String, Function<SlashCommandContext, LocalCommandResult>> slashCommandResultHandlers =
         new ConcurrentHashMap<>();
 
-    /** {@code (args, sessionId, inFlightUserMessageId) → void} · JDK 无三参 Consumer，本地声明。 */
+    /** {@code (args, sessionId, inFlightUserMessageId) → void} · JDK 无三参 Consumer，本地声明。
+     *
+     *  <p><b>[批 r10]</b> 本接口<b>保留</b>为源兼容面：{@link #registerSlashCommand(String, TriConsumer)}
+     *  已是转到 {@link #registerSlashCommandCtx} 的**薄包装**，既有 32 个 lambda 调用点**源码零改动**。
+     *  新代码（本批迁移的 12 站）用 ctx 形态。 */
     @FunctionalInterface
     public interface TriConsumer {
         void accept(String args, String sessionId, String inFlightUserMessageId);
     }
 
-    /** {@code (args, sessionId, inFlightUserMessageId) → LocalCommandResult} · JDK 无三参 Function，本地声明。 */
+    /** {@code (args, sessionId, inFlightUserMessageId) → LocalCommandResult} · JDK 无三参 Function，本地声明。
+     *
+     *  <p><b>[批 r10]</b> 同 {@link TriConsumer}：保留为薄包装层。 */
     @FunctionalInterface
     public interface TriFunction {
         LocalCommandResult apply(String args, String sessionId, String inFlightUserMessageId);
+    }
+
+    /**
+     * slash command 执行上下文 · 对齐 CC {@code command.call(args, context)}
+     * （processSlashCommand.tsx:869 / command.ts:62-65：handler 收 context、<b>不收 cwd</b>）的
+     * <b>显式携带</b>语义。
+     *
+     * <p><b>[批 r10] 为什么需要它</b>：CC 命令内直调 ambient {@code getCwd()} 天然正确，前提是
+     * 「<b>进程 = 会话</b>」（cwd.ts:19-21 单进程单值）。本仓是 <b>1 JVM : N 会话</b>，
+     * {@code CwdResolution.getCwd(String)} 必须按会话键查表 ⇒ 照抄「直调」就等于「每层按 sessionId
+     * 反查」（config 包内原有 11 处）。本类把命令执行所需的三个显式标识
+     * （args / sessionId / inFlightUserMessageId，同批 3c 已定的「会话态必须显式穿透」铁律）加上
+     * <b>两条惰性会话解析槽</b>一次性携带到 handler，使 handler 不再自行反查。
+     *
+     * <p><b>⭐ 为什么必须惰性（本类第一约束，改动前务必读）</b>：若在构造期 eager 求值，则
+     * <b>所有</b>注册命令（36 个）都会在「会话存在但未绑定项目根」时新增 fail-loud 抛出
+     * （{@link CwdResolution#getCwd} / {@link CwdResolution#getOriginalCwdLayer} 对该态抛
+     * {@code IllegalStateException}），而改造前只有真正需要 cwd 的 9 个命令会抛。
+     * 惰性 + memoize ⇒ 只有真正读 {@link #cwd()}/{@link #projectRoot()} 的 handler 才触发解析，
+     * <b>fail-loud 面严格不变</b>；同一 handler 内多次读取收敛为 1 次解析。
+     *
+     * <p><b>⚠️ 测试环境下 fail-loud 分支结构上不可达</b>：全局 JUnit 扩展
+     * {@code com.nexusai.test.support.NoDatabaseSessionProjectRootExtension}（经
+     * {@code src/test/resources/META-INF/services/org.junit.jupiter.api.extension.Extension}
+     * 自动注册）对<b>任意</b> sessionId 都答 {@code Lookup.sessionlessEnvironment()} ⇒ 走
+     * 「确无会话」命名出口（进程 user.dir），<b>永不抛</b>。要覆盖 fail-loud <b>必须</b>显式
+     * {@code SessionProjectRoot.setDbResolver(...)} 覆盖它（先例：{@code CwdResolutionTest}）。
+     * ⛔ 不要因为「把 {@code cwd()} 改成 eager 却没变红」就断言惰性无影响 —— 那只说明装置没接上。
+     *
+     * <p><b>双槽</b>：4 站要 getCwd 语义、7 站要 getOriginalCwdLayer 语义，两条 L1 不同
+     * （{@link CwdResolution} 的 sessionCwd 层 vs originalCwd 重锚层）⇒ 两槽独立缓存，互不串味。
+     *
+     * <p><b>线程</b>：非线程安全（解析结果非 volatile）。上下文由分派点构造后**同一线程**同步交给
+     * handler，不跨线程发布。<b>异常不缓存</b>：解析抛出时标记不置位（下次调用重新解析并重新抛），
+     * 保持 fail-loud 可重复暴露。
+     */
+    public static final class SlashCommandContext {
+
+        private final String args;
+        private final String sessionId;
+        private final String inFlightUserMessageId;
+        private final Function<String, String> cwdResolver;
+        private final Function<String, String> projectRootResolver;
+
+        private String cwd;
+        private boolean cwdResolved;
+        private String projectRoot;
+        private boolean projectRootResolved;
+
+        SlashCommandContext(String args, String sessionId, String inFlightUserMessageId,
+                            Function<String, String> cwdResolver,
+                            Function<String, String> projectRootResolver) {
+            this.args = args;
+            this.sessionId = sessionId;
+            this.inFlightUserMessageId = inFlightUserMessageId;
+            this.cwdResolver = cwdResolver;
+            this.projectRootResolver = projectRootResolver;
+        }
+
+        /** 命令名后的参数文本（已 trim）。 */
+        public String args() {
+            return args;
+        }
+
+        /** 分派入口显式传入的会话 ID（<b>可为 null</b>：非会话驱动的分派）。 */
+        public String sessionId() {
+            return sessionId;
+        }
+
+        /** 本轮「在途用户消息 id」（旧 MDC {@code reqId}；<b>可为 null</b>）。 */
+        public String inFlightUserMessageId() {
+            return inFlightUserMessageId;
+        }
+
+        /**
+         * 当前工作目录 · <b>getCwd 语义</b>（受 bash {@code cd} 影响，对齐 CC {@code getCwd()}）。
+         * 首次调用解析并 memoize。
+         */
+        public String cwd() {
+            if (!cwdResolved) {
+                cwd = nonBlankOrUserDir(cwdResolver.apply(sessionId));
+                cwdResolved = true;
+            }
+            return cwd;
+        }
+
+        /**
+         * 原始工作目录 · <b>getOriginalCwdLayer 语义</b>（会话存档锚，对齐 CC {@code getOriginalCwd()}；
+         * 不受 bash {@code cd} 影响，随 worktree 重锚）。首次调用解析并 memoize。
+         *
+         * <p>⛔ <b>与 {@link #cwd()} 不可互相替代</b>：在发生过 bash {@code cd} 的会话里两者必然不同值
+         * （cwd 槽被 cd 覆盖、originalCwd 槽不被覆盖）⇒ 用 {@code cwd()} 顶替会使 transcript 锚点漂到
+         * cd 后的子目录。
+         */
+        public String projectRoot() {
+            if (!projectRootResolved) {
+                projectRoot = nonBlankOrUserDir(projectRootResolver.apply(sessionId));
+                projectRootResolved = true;
+            }
+            return projectRoot;
+        }
+
+        /**
+         * user.dir 兜底 · <b>单点</b>（原 config 包内 4 份
+         * {@code if (x == null || x.isBlank()) x = System.getProperty("user.dir", ".");} 样板收敛于此）。
+         *
+         * <p>⚠️ 只兜「解析值为 null / 空白」；解析器**抛出**时原样向上抛（fail-loud 不被吞）。
+         */
+        private static String nonBlankOrUserDir(String v) {
+            return v != null && !v.isBlank() ? v : System.getProperty("user.dir", ".");
+        }
     }
 
     public void register(InputKind kind, Consumer<String> handler) {
@@ -81,6 +201,23 @@ public class UserInputDispatcher {
      *                后两者<b>均可为 null</b>（非会话/非用户消息驱动的分派）。
      */
     public void registerSlashCommand(String name, TriConsumer handler) {
+        // [批 r10] 薄包装：既有 32 个三参 lambda 调用点源码零改动。
+        registerSlashCommandCtx(name, ctx ->
+            handler.accept(ctx.args(), ctx.sessionId(), ctx.inFlightUserMessageId()));
+    }
+
+    /**
+     * 注册命名 slash command handler · <b>ctx 形态</b>（[批 r10]）。
+     *
+     * <p>与 {@link #registerSlashCommand(String, TriConsumer)} 是同一张表、同一语义，只是把三个散参
+     * 换成显式携带的执行上下文（含惰性 {@link SlashCommandContext#cwd()} /
+     * {@link SlashCommandContext#projectRoot()} 槽）。新代码与迁移站点用本方法。
+     *
+     * @param name    slash command 名（不含前导 '/'）
+     * @param handler 上下文 handler；<b>不得</b>在体内提前触发解析（惰性约束见
+     *                {@link SlashCommandContext} 类注释）
+     */
+    public void registerSlashCommandCtx(String name, Consumer<SlashCommandContext> handler) {
         boolean overwrite = slashCommandHandlers.containsKey(name);
         slashCommandHandlers.put(name, handler);
         if (log.isDebugEnabled()) {
@@ -136,11 +273,39 @@ public class UserInputDispatcher {
      *                后两者由分派入口显式传入（<b>均可为 null</b>，见 {@link #registerSlashCommand}）
      */
     public void registerSlashCommandResult(String name, TriFunction handler) {
+        // [批 r10] 薄包装：既有调用点源码零改动（见 registerSlashCommandCtx）。
+        registerSlashCommandResultCtx(name, ctx ->
+            handler.apply(ctx.args(), ctx.sessionId(), ctx.inFlightUserMessageId()));
+    }
+
+    /**
+     * 注册命名 slash command <b>result</b> handler · <b>ctx 形态</b>（[批 r10]）。
+     *
+     * <p>与 {@link #registerSlashCommandResult(String, TriFunction)} 同一张表、同一语义；
+     * 惰性约束同 {@link #registerSlashCommandCtx}。
+     *
+     * @param name    slash command 名（不含前导 '/'）
+     * @param handler 上下文 handler → {@link LocalCommandResult}
+     */
+    public void registerSlashCommandResultCtx(String name,
+                                              Function<SlashCommandContext, LocalCommandResult> handler) {
         slashCommandResultHandlers.put(name, handler);
         if (log.isDebugEnabled()) {
             log.debug("注册命名 slash command result handler: name={}（对齐 CC mod.call LocalCommandResult）",
                 name);
         }
+    }
+
+    /**
+     * 构造执行上下文 · 供两个分派点复用。
+     *
+     * <p><b>本方法不触发任何会话解析</b>（两个 resolver 只作为方法引用传入，惰性约束见
+     * {@link SlashCommandContext} 类注释）。
+     */
+    private static SlashCommandContext newSlashCommandContext(String args, String sessionId,
+                                                              String inFlightUserMessageId) {
+        return new SlashCommandContext(args, sessionId, inFlightUserMessageId,
+            CwdResolution::getCwd, CwdResolution::getOriginalCwdLayer);
     }
 
     /**
@@ -165,22 +330,22 @@ public class UserInputDispatcher {
         int space = rest.indexOf(' ');
         String name = space == -1 ? rest : rest.substring(0, space);
         String args = space == -1 ? "" : rest.substring(space + 1).trim();
-        TriFunction rh = slashCommandResultHandlers.get(name);
+        Function<SlashCommandContext, LocalCommandResult> rh = slashCommandResultHandlers.get(name);
         if (rh != null) {
-            LocalCommandResult result = rh.apply(args, sessionId, inFlightUserMessageId);
+            LocalCommandResult result = rh.apply(newSlashCommandContext(args, sessionId, inFlightUserMessageId));
             if (log.isDebugEnabled()) {
                 log.debug("分发命名 slash command result: session={} inFlightUserMessage={} name={} args={} kind={}",
                     sessionId, inFlightUserMessageId, name, args, result == null ? "null" : result.kind());
             }
             return result;
         }
-        TriConsumer cmd = slashCommandHandlers.get(name);
+        Consumer<SlashCommandContext> cmd = slashCommandHandlers.get(name);
         if (cmd != null) {
             if (log.isDebugEnabled()) {
                 log.debug("分发命名 slash command（void 回落，结果不可得 → skip）: session={} inFlightUserMessage={} name={} args={}",
                     sessionId, inFlightUserMessageId, name, args);
             }
-            cmd.accept(args, sessionId, inFlightUserMessageId);
+            cmd.accept(newSlashCommandContext(args, sessionId, inFlightUserMessageId));
             return LocalCommandResult.skip();
         }
         return null;
@@ -203,13 +368,13 @@ public class UserInputDispatcher {
             int space = rest.indexOf(' ');
             String name = space == -1 ? rest : rest.substring(0, space);
             String args = space == -1 ? "" : rest.substring(space + 1).trim();
-            TriConsumer cmd = slashCommandHandlers.get(name);
+            Consumer<SlashCommandContext> cmd = slashCommandHandlers.get(name);
             if (cmd != null) {
                 if (log.isDebugEnabled()) {
                     log.debug("分发命名 slash command: session={} inFlightUserMessage={} name={} args={}",
                         sessionId, inFlightUserMessageId, name, args);
                 }
-                cmd.accept(args, sessionId, inFlightUserMessageId);
+                cmd.accept(newSlashCommandContext(args, sessionId, inFlightUserMessageId));
                 return new RoutingResult(InputKind.SLASH_COMMAND, name, args);
             }
             // 未注册命名 handler → 回落通用 SLASH_COMMAND handler（向后兼容）

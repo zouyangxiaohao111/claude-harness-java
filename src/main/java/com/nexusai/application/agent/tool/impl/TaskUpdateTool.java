@@ -983,7 +983,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
      *
      * <p>独立 mapToolResult 分层：{@link #execute(ToolUseBlock, ToolUseContext)} 只构建结构化
      * {@link TaskUpdateOutput}，渲染文本全部在此产出（对齐 CC:364-405），execute() 经
-     * {@link #successWithOutput(String, TaskUpdateOutput)} 双通道返回。
+     * {@link #successWithOutput(String, TeammateIdentity, TaskUpdateOutput)} 双通道返回。
      *
      * <p>CC 真源（grep 实证，不信注释）：
      * <pre>
@@ -1081,7 +1081,7 @@ public class TaskUpdateTool extends AbstractTaskTool {
     /**
      * 结构化输出 Map · 对齐 CC TaskUpdateTool.ts:69-83 outputSchema（spread 字段，SubagentTool:1110-1118 风格）。
      *
-     * <p>供 {@link #successWithOutput(String, TaskUpdateOutput)} 经
+     * <p>供 {@link #successWithOutput(String, TeammateIdentity, TaskUpdateOutput)} 经
      * {@link ToolResult#successWithStructuredOutput} 填入 structuredOutput 通道
      * （IT-6 后走 AttachmentMessageDto structured_output attachment，对齐 CC
      * toolExecution.ts:1272-1279；provider 不再序列化为 text block 发模型）。

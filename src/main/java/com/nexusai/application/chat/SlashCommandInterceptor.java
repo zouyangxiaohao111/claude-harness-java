@@ -267,8 +267,13 @@ public class SlashCommandInterceptor {
             List<ChatMessageDto> messages = (messageService == null)
                 ? List.of()
                 : safeListBySession(sessionId);
+            // [批 r10 · 甲项 B1] 本方法已是 prompt 路径的边界（cwd 即在上一行解析）⇒ originalCwd 槽
+            //   也在边界提供。槽为 Supplier（惰性）而非已解析值：唯一消费点 GroupB.readSessionLogLines
+            //   原先把这次反查放在自己的 try 内（抛错被吞 + WARN）⇒ 惰性保持异常面逐点不变。
+            //   ⛔ 不得以 cwd 顶替：cwd 是 getCwd 语义（受 bash cd 影响），本槽要 getOriginalCwdLayer 语义。
             List<ContentBlockParam> promptFnBlocks = cmd.getPromptFn().apply(args,
-                PromptFnContext.of(cwd, messages, sessionId));
+                PromptFnContext.of(cwd, messages, sessionId,
+                    () -> CwdResolution.getOriginalCwdLayer(sessionId)));
             content = promptFnBlocks.stream()
                 .filter(b -> b instanceof ContentBlockParam.TextBlockParam)
                 .map(b -> ((ContentBlockParam.TextBlockParam) b).text())

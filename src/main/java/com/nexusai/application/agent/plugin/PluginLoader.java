@@ -209,7 +209,7 @@ public class PluginLoader {
      * （commandsPath/commandsPaths + skillsPath/skillsPaths + outputStylesPath/outputStylesPaths，
      * 与既有 agentsPath/agentsPaths 并列）。
      *
-     * <p>生产装配：{@link InstalledPluginsManager#install(String, String, String, Path, Path, Path, java.util.List, Path, java.util.List, Path, java.util.List)}
+     * <p>生产装配：{@link InstalledPluginsManager#install}（13 参重载，形参表过长不逐一罗列）
      * 解析出插件 manifest 全部组件路径后经本方法注册，随后 {@link #loadAllEnabledCommands()} /
      * {@link #loadAllEnabledSkills()} / {@link #loadAllEnabledOutputStyles()} 才能扫到插件组件
      * （仅 4 参 load 会丢 6 类路径字段 → 组件扫描恒空）。</p>

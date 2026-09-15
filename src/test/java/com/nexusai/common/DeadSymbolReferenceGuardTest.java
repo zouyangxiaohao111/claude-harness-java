@@ -39,7 +39,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <tr>
  *     <td><b>门 3</b>（本类主体）</td>
  *     <td>javadoc 里的 javadoc 链接（{@code {@link X}} / {@code {@link X#y}}）目标
- *         <b>本体是否尚存</b>。悬空 ⇒ 断言失败并<b>逐条列出</b>（红清单）。</td>
+ *         <b>本体是否尚存</b>。链接<b>写明了形参表</b>（{@code {@link X#y(A, B)}}）时，
+ *         成员存亡按<b>形参个数</b>比对，不只看名字（见 {@link #declaredCallable}）。
+ *         悬空 ⇒ 断言失败并<b>逐条列出</b>（红清单）。</td>
  *     <td><b>完全机械</b>：无豁免名单、无行号、无需人工判断。</td>
  *   </tr>
  *   <tr>
@@ -89,6 +91,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p><b>它守得住</b>：
  * <ol>
  *   <li>javadoc 链接目标的本体存亡（<b>含多行形态</b>，见 {@link #LINK_TAG}）；</li>
+ *   <li><b>同名重载被删</b>：链接写明了形参表（{@code {@link #m()}} / {@code {@link #m(A, B)}}）
+ *       而目标只剩其它元数的重载 ⇒ 判悬空。这是 2026-09-15 补上的判据
+ *       （此前 {@code declares(...)} 只比方法名，对这类<b>结构性失明</b>：
+ *       实测把已删 0 参的 {@code {@link #agentRegistry()}} 放回去，本类 <b>仍 7/7 绿</b>）；
+ *       ⛔ 链接<b>不写</b>形参表（{@code {@link #m}}）时元数不参与判定 —— 那是合法写法；</li>
  *   <li>已删类的本体文件复活；</li>
  *   <li>已删方法名提及<b>数量增长</b>。</li>
  * </ol>
@@ -102,6 +109,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       <b>合法降级目标</b>（「{@link} 目标不存在时降级为 {@code} 纯文本」）⇒ 不能对
  *       {@code {@code}} 设门，否则把正确的修法判红。裸文字（无任何 tag）同理，规模 ≥60 处，
  *       只能靠门 2 的数量门压增长。</li>
+ *   <li><b>元数对得上但<b>形参类型名</b>漂移</b>。链接写 {@code {@link #m(String)}}
+ *       而目标只剩 {@code m(int)}（同为 1 参）时，本类<b>判不出来</b>（判绿）。
+ *       WHY 刻意不修：类型名要比对就得处理泛型擦除 / 全限定与简单名混写 / 数组与变参后缀 /
+ *       嵌套类名等一堆归一化，误红代价远高于收益（本仓「假红陷阱」前科：误红比漏判更贵；
+ *       本类建立时源码正则判成员曾产生 2286 条假阳性）。⇒ 元数判据<b>只收敛「同名重载被删」
+ *       这一类</b>（acc8 实证的那一类），⛔ 不声称覆盖全部签名漂移。</li>
  *   <li><b>新删除未登记</b>。门 1 是台账驱动的 ⇒ 只能防「已登记的类复活」，
  *       <b>不能</b>发现「有人删了一个类但没登记」。闭环方式见 {@link #DELETED_CLASS_LEDGER}。</li>
  *   <li><b>测试横幅 / {@code @DisplayName} / RED 条件里的死引用</b>（审查 F-14 那一类）。
@@ -129,6 +142,29 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （{@code src/main/java} <b>47</b> 处 + {@code src/test/java} <b>13</b> 处）⇒ 门 3 <b>刻意保持红</b>，
  * 红清单即后续施工单；修完后自动转绿（本类<b>不</b> pin 死这 60 条的文件:行，
  * 避免行号漂移造成的假红，也避免「改了清单才转绿」的形式主义）。
+ *
+ * <p><b>2026-09-15 补元数判据 ⇒ 门 3 由「全绿」转红（65 条，红清单即施工单）</b>。
+ * 此前成员存亡<b>只比方法名</b>，对「同名重载被删」结构性失明
+ * （acc8 实证：把已删 0 参的 {@code {@link #agentRegistry()}} 放回 {@code SubagentTool} 的 javadoc，
+ * 目标只剩 {@code agentRegistry(String)} ⇒ 本类<b>仍 7/7 绿</b>，见
+ * {@link #gate3_reverseExperiment_arityMismatchIsDangling_andMatchingArityIsNot}）。
+ * 补上形参个数比对后，本仓新暴露 <b>65 处元数不符</b>的悬空链接。处理方式与 60 处时完全一致：
+ * <ul>
+ *   <li>本类<b>刻意不 pin</b> 这 65 条的文件:行（同样避免行号漂移假红）；
+ *       修法与门 3 相同 —— ① 改成现存重载名，或 ② 降级为 {@code}。数字只是当时的读数，
+ *       ⛔ 不是台账；</li>
+ *   <li>典型形态是「注释按<b>旧签名</b>写」：
+ *       {@code OpenAiSdkProvider} 的链接列了 17 参而真实方法已 20 参（同一段 javadoc 的标题
+ *       还自称「19-arg」）、{@code MemoryStorage} 链接 0 参 {@code #memoryDir()} 而真实已改
+ *       为 {@code memoryDir(String)}、{@code McpServerService} 链接 {@code #start()} 而现存
+ *       重载皆带参；</li>
+ *   <li><b>判红口径有独立对照</b>：真实 {@code javadoc -Xdoclint:all} 对本仓这类引用
+ *       报 {@code error: reference not found}（连变参简写 {@code {@link Path#toRealPath()}} /
+ *       {@code {@link Files#isDirectory(Path)}} 也报，故它们被判红<b>不是</b>本类误红）。
+ *       ⇒ 本门补的是「本仓无 javadoc 插件、这些错在构建期完全不暴露」的那一段，
+ *       ⛔ 不是把 javadoc lint 的全部门槛搬进来（只搬元数这一条，理由见
+ *       「它守不住」第 3 条）。</li>
+ * </ul>
  *
  * <p><b>⚠️ 60 &gt; 收尾审查给的 17 —— 这不是本类误报，是人工枚举的结构性漏项。</b>
  * 审查的 17 条是「只 grep 那 4 个已知死符号（{@code CacheSafeParamsHolder} /
@@ -488,6 +524,75 @@ class DeadSymbolReferenceGuardTest {
     }
 
     /**
+     * <b>门 3 元数盲区反向实验（两个方向都必须成立）</b>。
+     *
+     * <p>WHY 单独立一条：{@link #declaredCallable} 之前<b>只比方法名</b>，对「同名重载被删」
+     * <b>结构性失明</b> —— 删掉 {@code m()} 只留 {@code m(X)} 后，{@code {@link #m()}}
+     * 会被那个 1 参重载解析掉 ⇒ 永不判为悬空。实测（2026-09-15，改前）：在
+     * {@code SubagentTool} 的 javadoc 里放 {@code {@link #agentRegistry()}}（0 参已删、
+     * 只剩 {@code agentRegistry(String)}），本类 <b>7/7 仍绿</b>。
+     *
+     * <p>本用例用<b>同一个扫描器</b>{@code scan(...)}在 {@code @TempDir} 合成树上钉住两个方向：
+     * <ul>
+     *   <li><b>必须红</b>：{@code {@link StringBuilder#append()}} —— {@code StringBuilder}
+     *       只有 ≥1 参的 {@code append} 重载，0 参<b>不存在</b>；</li>
+     *   <li><b>必须绿</b>：{@code {@link StringBuilder#append(String)}}（元数对得上）
+     *       与 {@code {@link StringBuilder#append}}（<b>未写</b>形参表 ⇒ 元数不参与判定）。
+     *       后两条是防「带括号就红」那种偷懒改法的反向闸 —— 少了它们，
+     *       把门改窄成「有括号一律判死」也能过。</li>
+     * </ul>
+     *
+     * <p>外部对照（独立于本类）：真实 {@code javadoc -Xdoclint:all} 对
+     * {@code {@link StringBuilder#append()}} 报 {@code error: reference not found}，
+     * 而对 {@code {@link StringBuilder#append(String)}} 无告警
+     * ⇒ 本门的元数判据与 javadoc 自身的解析口径一致，不是本类自造的严格性。
+     * （同一实验里 {@code {@link Path#toRealPath()}} / {@code {@link Files#isDirectory(Path)}}
+     * 也报 {@code reference not found} —— 变参简写 <b>不</b>构成合法引用，
+     * 故它们被判红是对的，不是误红。）
+     */
+    @Test
+    @DisplayName("门3 自检：元数盲区 —— 同名重载被删必须红 / 元数对得上与未写形参表必须绿")
+    void gate3_reverseExperiment_arityMismatchIsDangling_andMatchingArityIsNot(@TempDir Path tmp)
+        throws IOException {
+        Path pkgDir = tmp.resolve("src/main/java/com/nexusai/guardprobe");
+        Files.createDirectories(pkgDir);
+        Files.writeString(pkgDir.resolve("GuardProbeAritySample.java"),
+            "package com.nexusai.guardprobe;\n"
+                + "\n"
+                + "/**\n"
+                + " * 元数盲区 needle（本类<b>必须</b>列红）：{" + "@link StringBuilder#append()}\n"
+                + " * 合法 needle（本类<b>不该</b>红）：{" + "@link StringBuilder#append(String)}\n"
+                + " * 无元数 needle（本类<b>不该</b>红）：{" + "@link StringBuilder#append}\n"
+                + " */\n"
+                + "class GuardProbeAritySample {\n"
+                + "}\n");
+
+        ScanResult r = scan(tmp, List.of(tmp.resolve("src/main/java")), false);
+
+        assertThat(r.links())
+            .as("3 条链接必须全部被解析到 —— 元数判据不能把形参表吃掉（形参表在 toLink 里被剥掉前"
+                + "必须先把个数记进 Link#arity；多参形参表里的空白也不算 label 分隔符）")
+            .hasSize(3);
+        assertThat(r.dangling())
+            .as("""
+                元数盲区 needle 必须被列红：{@link StringBuilder#append()} 的 0 参重载不存在，
+                旧实现（只比方法名）会被 1 参重载解析掉 ⇒ 恒绿 ⇒ 对「同名重载被删」失明。
+                实测对照：真实 javadoc -Xdoclint:all 对本条报 "reference not found"。""")
+            .hasSize(1);
+        assertThat(r.dangling().get(0).raw())
+            .as("被列红的必须<b>恰好</b>是 0 参那条 —— 另两条同样带括号，必须保持绿"
+                + "（本断言即「不许把门改窄成『带括号就红』」的反向闸）")
+            .isEqualTo("StringBuilder#append()");
+        assertThat(r.dangling().get(0).reason())
+            .as("红清单必须说清是**元数**对不上（同名方法存在），而不是「该成员整个不存在」——"
+                + "两者的修法不同（前者可改成现存重载名，后者只能降级为 {@code}）")
+            .contains("元数");
+        assertThat(r.unresolvedReceivers())
+            .as("两条合法 needle 必须解析成功，既不算悬空也不算『解析不到』")
+            .isEmpty();
+    }
+
+    /**
      * <b>门 3 范围自检</b>：扫描集合必须严格限定在 {@code backend/src}，
      * 且排除集合<b>恰为本类自己那 1 个文件</b>（排除集变大 = 有人偷偷跳过文件）。
      *
@@ -652,9 +757,31 @@ class DeadSymbolReferenceGuardTest {
 
     // ═══════════════════════════════ 扫描器 ═══════════════════════════════
 
-    /** 一条 javadoc 链接。{@code receiver} 为空表示「本文件成员」形态（{@code #member}）。 */
+    /**
+     * 一条 javadoc 链接。{@code receiver} 为空表示「本文件成员」形态（{@code #member}）。
+     *
+     * <p>{@code params} = 链接里<b>写明的形参表原文</b>（{@code #m()} ⇒ {@code ""}、
+     * {@code #m(A, B)} ⇒ {@code "A, B"}）；{@code null} = <b>未写形参表</b>（{@code #m}）
+     * ⇒ {@link #arity()} 为 {@code null}，元数不参与判定。
+     *
+     * <p>元数是「同名重载被删」这一盲区的判据：{@code #m()} 在目标只剩 {@code m(X)} 时必须判死，
+     * 而只比方法名的旧实现会把它解析掉（见 {@link #declaredCallable}）。
+     * 保留原文（而非只留个数）是为了让红清单能<b>照原样</b>写出悬空链接。
+     */
     private record Link(
-        String relPath, int line, String raw, String receiver, String member, String form) {}
+        String relPath, int line, String raw, String receiver, String member,
+        String params, String form) {
+
+        /** 链接写明的形参个数；{@code null} = 未写形参表（元数不参与判定）。 */
+        Integer arity() {
+            return params == null ? null : countParams(params);
+        }
+
+        /** 供红清单 / 失败信息展示的成员写法（{@code m}、{@code m()}、{@code m(A, B)}）。 */
+        String memberLabel() {
+            return params == null ? member : member + "(" + params + ")";
+        }
+    }
 
     /** 一条悬空链接（红清单的一行）。 */
     private record Dangling(String relPath, int line, String raw, String reason) {}
@@ -766,7 +893,10 @@ class DeadSymbolReferenceGuardTest {
      *   <li>丢掉 link <b>label</b>（{@code X 显示文字} 里空白之后的部分）—— 取首个空白前的 token；</li>
      *   <li>在<b>第一个</b> {@code #} 处切 receiver / member；</li>
      *   <li>member 去掉<b>形参表</b>（{@code #m(A, B)} → {@code m}）与链式尾巴
-     *       （{@code #m()#n()} → {@code m}；实测 {@code CommandController.java:821} 有此形态）。</li>
+     *       （{@code #m()#n()} → {@code m}；实测 {@code CommandController.java:821} 有此形态）。
+     *       ⚠️ 形参表<b>在剥掉之前先数量记进 {@link Link#arity()}</b>（{@code #m()} ⇒ 0、
+     *       {@code #m(A, B)} ⇒ 2、未写形参表 ⇒ {@code null}）—— 只有方法名会让
+     *       「同名重载被删」判不出来，见 {@link #declaresCallable}。</li>
      * </ol>
      *
      * <p><b>两处刻意规范化（已登记，不是静默跳过）</b>：
@@ -791,7 +921,12 @@ class DeadSymbolReferenceGuardTest {
         if (body.isEmpty()) {
             return null;   // 无目标伪形态（由分子分母配平断言负责发现）
         }
-        int sp = indexOfWhitespace(body);
+        // 丢 label（`{@link X 显示文字}` ⇒ 取首个空白前的 token）。
+        // ⚠️ 但形参表里的空白**不是** label 分隔符：`{@link #list(boolean, String, String)}`
+        //    只要在第一个空白处切，就得到 `#list(boolean,` —— 形参表被腰斩，
+        //    元数会从 3 被误数成 2（实测：本仓 {@code CommandController.java:224} 等
+        //    <b>30+ 处</b>多参链接全部误判）。故只在**括号深度 0** 处切。
+        int sp = indexOfTopLevelWhitespace(body);
         if (sp >= 0) {
             body = body.substring(0, sp);
         }
@@ -800,12 +935,17 @@ class DeadSymbolReferenceGuardTest {
         }
         String receiver = body;
         String member = null;
+        String params = null;
         int hash = body.indexOf('#');
         if (hash >= 0) {
             receiver = body.substring(0, hash);
             member = body.substring(hash + 1);
             int paren = member.indexOf('(');
             if (paren >= 0) {
+                // ⚠️ 形参表必须在这里取走 —— 下一行 `member = member.substring(0, paren)`
+                //    会把括号内容丢掉。旧实现正是在这里丢了元数 ⇒ 对「同名重载被删」结构性失明。
+                int close = member.indexOf(')', paren);
+                params = member.substring(paren + 1, close < 0 ? member.length() : close);
                 member = member.substring(0, paren);
             }
             int hash2 = member.indexOf('#');
@@ -831,7 +971,99 @@ class DeadSymbolReferenceGuardTest {
             form = receiver.contains(".") ? "TYPE_QUALIFIED" : "TYPE_SIMPLE";
         }
         int line = sf.text().substring(0, matchStart).split("\n", -1).length;
-        return new Link(sf.relPath(), line, captured.strip(), receiver, member, form);
+        return new Link(sf.relPath(), line, captured.strip(), receiver, member, params, form);
+    }
+
+    /**
+     * 形参表文本 → 形参<b>个数</b>（{@code "a, b"} ⇒ 2；{@code ""} ⇒ 0）。
+     *
+     * <p>只数<b>顶层</b>逗号：泛型里的逗号（{@code Map<String, String>}）与嵌套括号/数组
+     * （{@code int[]}）不算分隔符，否则 {@code {@link #m(Map<String, String>)} }（真 1 参）
+     * 会被数成 2 参 ⇒ 元数判据反向失效。
+     *
+     * <p>⛔ 刻意<b>只比个数、不比类型名</b>：类型名要面对泛型擦除、全限定 / 简单名混写、
+     * 数组 / 变参后缀、嵌套类名等一堆归一化问题，误红代价远高于收益（本仓「假红陷阱」前科）。
+     * ⇒ 「元数对得上但类型名漂移」是本门<b>已知、已登记</b>的漏判边界，见类 javadoc。
+     */
+    private static int countParams(String paramList) {
+        String s = paramList.strip();
+        if (s.isEmpty()) {
+            return 0;
+        }
+        int depth = 0;
+        int n = 1;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '<' || c == '(' || c == '[') {
+                depth++;
+            } else if (c == '>' || c == ')' || c == ']') {
+                depth--;
+            } else if (c == ',' && depth <= 0) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /**
+     * 元数对不上时，给红清单补一句<b>可施工</b>的说明（「同名重载被删」与「整个成员不存在」
+     * 的修法不同：前者按 F-26 ① 改成现存重载名或 ② 降级为 {@code}，后者只能 ②）。
+     * 仅在链接写明了形参表（{@code arity != null}）时才产出。
+     */
+    private static String arityHint(List<String> candidateFqns, String member, Integer arity) {
+        if (arity == null) {
+            return "";
+        }
+        java.util.TreeSet<Integer> existing = new java.util.TreeSet<>();
+        int loaded = 0;
+        for (String fqn : candidateFqns) {
+            Class<?> c = load(fqn);
+            if (c == null) {
+                continue;
+            }
+            loaded++;
+            collectCallableArities(c, member, existing);
+        }
+        if (loaded == 0) {
+            return "（链接写明了形参个数 " + arity + "）";
+        }
+        if (existing.isEmpty()) {
+            return "（同名可调用成员<b>整个</b>都不存在 —— 不止是元数问题）";
+        }
+        return "（候选类型上同名方法/构造器（含嵌套）的形参个数 = " + existing
+            + "，链接写的是 " + arity + " ⇒ 元数对不上，疑为「同名重载被删」）";
+    }
+
+    /** 收集 {@code cls}（含嵌套，不含父类链）里名为 {@code member} 的可调用成员的形参个数。 */
+    private static void collectCallableArities(Class<?> cls, String member, Set<Integer> out) {
+        if (cls == null || member == null) {
+            return;
+        }
+        try {
+            for (Method m : cls.getDeclaredMethods()) {
+                if (m.getName().equals(member)) {
+                    out.add(m.getParameterCount());
+                }
+            }
+        } catch (Throwable ignored) {
+            // 提示性产物，拿不到就不补。
+        }
+        try {
+            for (java.lang.reflect.Constructor<?> ctor : cls.getDeclaredConstructors()) {
+                if (cls.getSimpleName().equals(member)) {
+                    out.add(ctor.getParameterCount());
+                }
+            }
+        } catch (Throwable ignored) {
+            // 同上。
+        }
+        try {
+            for (Class<?> nested : cls.getDeclaredClasses()) {
+                collectCallableArities(nested, member, out);
+            }
+        } catch (Throwable ignored) {
+            // 同上。
+        }
     }
 
     /** {@code null} = 目标本体尚存；非 null = 悬空理由，或 {@code UNRESOLVED ...}。 */
@@ -846,11 +1078,12 @@ class DeadSymbolReferenceGuardTest {
             //    —— 对「红清单要能直接施工」而言，误红比漏判更贵（本仓有「假红陷阱」前科）。
             List<String> declared = index.declaredCandidateFqns(link.relPath());
             for (String fqn : declared) {
-                if (anyNestedDeclares(load(fqn), link.member())) {
+                if (anyNestedDeclares(load(fqn), link.member(), link.arity())) {
                     return null;
                 }
             }
-            return "本文件声明的类型里找不到成员 [#" + link.member() + "]（候选：" + declared + "）";
+            return "本文件声明的类型里找不到成员 [#" + link.memberLabel() + "]"
+                + arityHint(declared, link.member(), link.arity()) + "（候选：" + declared + "）";
         }
 
         // 包引用（javadoc 允许 {@link some.pkg}）—— 不是类型，不该按类型判存亡。
@@ -876,7 +1109,7 @@ class DeadSymbolReferenceGuardTest {
                     + "陈旧字节码（孤儿 .class，需 mvn clean）或本体已删。";
             }
             sawReceiver = true;
-            if (link.member() == null || anyNestedDeclares(cls, link.member())) {
+            if (link.member() == null || anyNestedDeclares(cls, link.member(), link.arity())) {
                 memberFound = true;
                 break;
             }
@@ -885,8 +1118,9 @@ class DeadSymbolReferenceGuardTest {
             return null;
         }
         if (sawReceiver) {
-            return "type [" + link.receiver() + "] 存在，但成员 [" + link.member()
-                + "] 找不到（反射不认；该成员疑已删除）";
+            return "type [" + link.receiver() + "] 存在，但成员 [" + link.memberLabel()
+                + "] 找不到（反射不认；该成员疑已删除）"
+                + arityHint(candidates, link.member(), link.arity());
         }
 
         // 无 {@code #} 的**限定成员引用**兜底：javadoc 里 {@code {@link A.B}} 本意是嵌套类型
@@ -901,7 +1135,9 @@ class DeadSymbolReferenceGuardTest {
                 String head = link.receiver().substring(0, link.receiver().lastIndexOf('.'));
                 String tail = link.receiver().substring(link.receiver().lastIndexOf('.') + 1);
                 for (String candidate : index.receiverCandidates(head, link.relPath())) {
-                    if (anyNestedDeclares(load(candidate), tail)) {
+                    // 形参表已随 receiver 一起被剥掉（无 `#` 形态，见 toLink 规范化 ②）
+                    // ⇒ 元数未知，按 null 走「只比名字」的放行判定。
+                    if (anyNestedDeclares(load(candidate), tail, null)) {
                         return null;
                     }
                 }
@@ -912,7 +1148,8 @@ class DeadSymbolReferenceGuardTest {
             //    {@code stored != ConfigStorage.NullMarker} 的生产代码里，绝不是死引用。
             //    在「本文件声明类型 + 同包全部类型 + import 到的类型」里找同名成员。
             for (String fqn : index.visibleTypeFqns(link.relPath())) {
-                if (anyNestedDeclares(load(fqn), link.receiver())) {
+                // 同 ①：形参表已在 toLink 里被剥掉 ⇒ 元数未知，不做元数判定。
+                if (anyNestedDeclares(load(fqn), link.receiver(), null)) {
                     return null;
                 }
             }
@@ -926,7 +1163,7 @@ class DeadSymbolReferenceGuardTest {
         Class<?> probed = index.probeExternalClass(simple);
         if (probed != null) {
             sawReceiver = true;
-            if (link.member() == null || anyNestedDeclares(probed, link.member())) {
+            if (link.member() == null || anyNestedDeclares(probed, link.member(), link.arity())) {
                 return null;
             }
         }
@@ -949,17 +1186,19 @@ class DeadSymbolReferenceGuardTest {
      * <p>WHY 必须递归：javadoc 的 {@code {@link #CONST}} 常写在<b>嵌套 record</b> 的字段注释里
      * （实测 {@code MicroCompactResult.CacheEdit.TYPE_DELETE_TOOL_RESULT}）。只查一层嵌套时，
      * 第 2 层及更深的方法/常量会被误判为已删。
+     *
+     * <p>{@code arity} 语义见 {@link Link#arity()}；{@code null} = 链接未写形参表 ⇒ 不判元数。
      */
-    private static boolean anyNestedDeclares(Class<?> cls, String member) {
+    private static boolean anyNestedDeclares(Class<?> cls, String member, Integer arity) {
         if (cls == null || member == null) {
             return false;
         }
-        if (reflectHasMember(cls, member)) {
+        if (reflectHasMember(cls, member, arity)) {
             return true;
         }
         try {
             for (Class<?> nested : cls.getDeclaredClasses()) {
-                if (anyNestedDeclares(nested, member)) {
+                if (anyNestedDeclares(nested, member, arity)) {
                     return true;
                 }
             }
@@ -977,21 +1216,68 @@ class DeadSymbolReferenceGuardTest {
      * <p>{@code getDeclaredConstructors()} 不可省：javadoc 的 {@code {@link #Foo(String)}}
      * 指的是<b>构造器</b>，而 {@code getDeclaredMethods()} <b>不含</b>构造器
      * ⇒ 漏了它会把所有构造器引用误判为死引用（实测会多出 49 条假红）。
+     *
+     * <h2>⭐ 元数判定（{@code arity != null} 时）</h2>
+     * <p>链接写明了形参表 ⇒ javadoc 语义上它指向的是<b>形参个数相等</b>的那个重载。
+     * 故此处：
+     * <ol>
+     *   <li>先按「名字 + 元数」在<b>类 → 父类链 → 接口</b>上找；命中即存在；</li>
+     *   <li>若某个类型<b>确有同名可调用成员</b>但元数全对不上 ⇒ 判<b>不存在</b>
+     *       （这正是旧实现「只比方法名」对<b>同名重载被删</b>结构性失明的那一类：
+     *       {@code {@link #agentRegistry()}} 被残留的 1 参重载解析掉 ⇒ 永不判为悬空）；</li>
+     *   <li>若该名字<b>根本不是可调用成员</b>（字段 / 嵌套类型 —— 如
+     *       {@code {@link #NullMarker()}} 这种写法）⇒ 仍按字段 / 嵌套类型放行
+     *       （⛔ 不据此判死，那是 javadoc lint 的活，不是死符号门）。
+     * </ol>
+     * <p>⚠️ 第 2 条的「判死」只判<b>名字确实是方法/构造器</b>的情形，且必须让父类链先走完 ——
+     * 否则「子类声明 {@code m(int)}、父类声明 {@code m(String)}、链接 {@code #m(String)}」
+     * 会在子类就被误判死。
      */
-    private static boolean reflectHasMember(Class<?> cls, String member) {
+    private static boolean reflectHasMember(Class<?> cls, String member, Integer arity) {
         if (cls == null || member == null) {
             return false;
         }
+        // ① 类 + 父类链上的 declared 可调用成员（方法 / 构造器），按元数比对。
+        boolean callableNamePresent = false;
         for (Class<?> k = cls; k != null; k = k.getSuperclass()) {
-            if (declares(k, member)) {
+            Boolean hit = declaredCallable(k, member, arity);
+            if (Boolean.TRUE.equals(hit)) {
                 return true;
             }
+            if (Boolean.FALSE.equals(hit)) {
+                callableNamePresent = true;
+            }
         }
-        // 接口的 default / static 成员不在父类链上，用 getMethods/getFields 兜底。
+        // ② 接口的 default / static 成员不在父类链上，用 getMethods 兜底（同样按元数比对）。
         try {
             for (Method m : cls.getMethods()) {
-                if (m.getName().equals(member)) {
+                if (!m.getName().equals(member)) {
+                    continue;
+                }
+                callableNamePresent = true;
+                if (arity == null || m.getParameterCount() == arity) {
                     return true;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 链接期失败（可选依赖缺失）不影响结论：已在上面的 declared 链里查过。
+        }
+        // ③ 同名可调用成员存在、链接又写明了形参表，却没有任何重载元数对得上 ⇒ 悬空。
+        if (arity != null && callableNamePresent) {
+            return false;
+        }
+        // ④ 元数未写明（或该名字不是可调用成员）⇒ 按字段 / 嵌套类型 / 接口常量放行。
+        try {
+            for (Class<?> k = cls; k != null; k = k.getSuperclass()) {
+                for (Field f : k.getDeclaredFields()) {
+                    if (f.getName().equals(member)) {
+                        return true;
+                    }
+                }
+                for (Class<?> n : k.getDeclaredClasses()) {
+                    if (n.getSimpleName().equals(member)) {
+                        return true;
+                    }
                 }
             }
             for (Field f : cls.getFields()) {
@@ -1000,38 +1286,52 @@ class DeadSymbolReferenceGuardTest {
                 }
             }
         } catch (Throwable ignored) {
-            // 链接期失败（可选依赖缺失）不影响结论：已在上面的 declared 链里查过。
+            // 同上：拿不到成员列表 ≠ 成员不存在，交给其它候选。
         }
         return false;
     }
 
-    private static boolean declares(Class<?> k, String member) {
+    /**
+     * 本类（不含父类）是否声明了名为 {@code member} 的<b>可调用成员</b>（方法 / 构造器）。
+     *
+     * @return {@code TRUE} = 有且元数相符（{@code arity} 为 {@code null} 视为任意元数均相符）；
+     *         {@code FALSE} = 有<b>同名</b>可调用成员但元数全不符（仅 {@code arity != null} 时可能）；
+     *         {@code null} = 本类无此名字的可调用成员（⇒ 交由父类链 / 接口 / 字段 / 嵌套类型继续判）。
+     */
+    private static Boolean declaredCallable(Class<?> k, String member, Integer arity) {
+        boolean named = false;
         try {
             for (Method m : k.getDeclaredMethods()) {
-                if (m.getName().equals(member)) {
-                    return true;
+                if (!m.getName().equals(member)) {
+                    continue;
                 }
-            }
-            for (Field f : k.getDeclaredFields()) {
-                if (f.getName().equals(member)) {
-                    return true;
-                }
-            }
-            for (Class<?> n : k.getDeclaredClasses()) {
-                if (n.getSimpleName().equals(member)) {
-                    return true;
-                }
-            }
-            // 构造器：javadoc 用「类简单名」引用它（{@link #Foo(String)}）。见方法 javadoc。
-            for (java.lang.reflect.Constructor<?> ctor : k.getDeclaredConstructors()) {
-                if (k.getSimpleName().equals(member)) {
-                    return true;
+                named = true;
+                if (arity == null || m.getParameterCount() == arity) {
+                    return Boolean.TRUE;
                 }
             }
         } catch (Throwable ignored) {
-            // 同上：拿不到成员列表 ≠ 成员不存在，交给其它候选。
+            // 拿不到方法列表 ≠ 方法不存在，交给其它候选。
         }
-        return false;
+        try {
+            // 构造器：javadoc 用「类简单名」引用它（{@link #Foo(String)}）。见 reflectHasMember javadoc。
+            for (java.lang.reflect.Constructor<?> ctor : k.getDeclaredConstructors()) {
+                if (!k.getSimpleName().equals(member)) {
+                    continue;
+                }
+                named = true;
+                if (arity == null || ctor.getParameterCount() == arity) {
+                    return Boolean.TRUE;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 同上。
+        }
+        if (!named) {
+            return null;
+        }
+        // arity == null 时上面任一命中即已返回 TRUE ⇒ 走到这里必然 arity != null。
+        return Boolean.FALSE;
     }
 
     /** 按 FQN 载入，{@code initialize=false}（⛔ 不触发静态初始化副作用）。 */
@@ -1193,9 +1493,23 @@ class DeadSymbolReferenceGuardTest {
         return n;
     }
 
-    private static int indexOfWhitespace(String s) {
+    /**
+     * 首个<b>括号深度 0</b> 的空白位置（{@code -1} = 无）。
+     *
+     * <p>用途：剥 {@code {@link}} 的 label，同时不腰斩形参表 ——
+     * {@code {@link #m(A, B)}} 里 {@code "A, B"} 中间的空白在深度 1 上，不算分隔符。
+     * ⚠️ 只数圆括号：泛型尖括号内的空白必然也在圆括号内（形参表里不会出现顶层泛型），
+     * 多收一对配平符只会在未配平的畸形写法上改变行为，净害无益。
+     */
+    private static int indexOfTopLevelWhitespace(String s) {
+        int depth = 0;
         for (int i = 0; i < s.length(); i++) {
-            if (Character.isWhitespace(s.charAt(i))) {
+            char c = s.charAt(i);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            } else if (depth <= 0 && Character.isWhitespace(c)) {
                 return i;
             }
         }

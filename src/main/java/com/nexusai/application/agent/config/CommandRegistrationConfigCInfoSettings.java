@@ -3,7 +3,6 @@ package com.nexusai.application.agent.config;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
-import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.api.Grove;
 import com.nexusai.application.agent.command.ReleaseNotesCommand;
 import com.nexusai.application.agent.security.SecurityReviewPrompt;
@@ -228,13 +227,9 @@ public class CommandRegistrationConfigCInfoSettings {
      * 缺失 → 回落 changelog 链接。受控差异：CC 外网拉取改为本地文件读（见类 JavaDoc）。
      */
     private void registerReleaseNotesHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommandResult("release-notes", (args, sessionId, inFlightUserMessageId) -> {
-            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            String cwd = CwdResolution.getCwd(sessionId);
-            if (cwd == null || cwd.isBlank()) {
-                cwd = System.getProperty("user.dir", ".");
-            }
-            String changelogPath = Path.of(cwd, "CHANGELOG.md").toString();
+        dispatcher.registerSlashCommandResultCtx("release-notes", ctx -> {
+            // [批 r10] cwd 走 ctx.cwd()（getCwd 语义 + user.dir 兜底单点；原 4 行样板消失）
+            String changelogPath = Path.of(ctx.cwd(), "CHANGELOG.md").toString();
             ReleaseNotesCommand.CommandResult result = new ReleaseNotesCommand().call(changelogPath);
             log.info("[CommandRegistrationConfigCInfoSettings] /release-notes 执行完成:\n{}", result.value());
             return UserInputDispatcher.LocalCommandResult.text(result.value());

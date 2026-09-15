@@ -972,7 +972,7 @@ public class MicroCompactor {
      *
      * <p><b>WHY 双通道</b>: CC 模块态 {@code pendingCacheEdits} 实为 {@code CacheEditsBlock}
      * （provider 注入请求用，microCompact.ts:58-60/336-339），经
-     * {@link #consumePendingCacheEditsBlock()} 取走；本函数消费的是 compactionInfo 形状
+     * {@link #consumePendingCacheEditsBlock(String)} 取走；本函数消费的是 compactionInfo 形状
      * {@code {trigger,deletedToolIds,baselineCacheDeletedTokens}}（boundary yield 用，
      * 供 {@link #maybeCreateMicrocompactBoundaryMessage(long, String)}）。cachedMicrocompactPath 删除
      * 触发时写入，测试缝也可注入。本函数保证消费契约（返回 + 清空）。

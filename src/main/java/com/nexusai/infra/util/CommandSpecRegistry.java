@@ -10,7 +10,7 @@ import java.util.function.Supplier;
  * <p>L1 语义: 命令 spec 查找 (用于 bash 命令自动补全 + 安全检查)。
  * <ul>
  *   <li>{@link CommandSpec} + {@link Argument} + {@link Option} records</li>
- *   <li>{@link #loadFigSpec(String)} — 路径/相对路径/symbolic-option 校验</li>
+ *   <li>{@link #loadFigSpec(String, Function)} — 路径/相对路径/symbolic-option 校验</li>
  *   <li>{@link #getCommandSpec(String, Supplier, Function)} — memoize-like 命令查找</li>
  * </ul>
  *

@@ -690,24 +690,26 @@ public class CommandRegistrationConfig28 {
      * 受控差异：CC toggle（同 tag 再执行移除，需读当前 tag）读侧通道未接线 → 恒 add；空参/help → 用法披露。
      */
     private void registerTagHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("tag", (args, sessionId, inFlightUserMessageId) -> {
-            String tag = args != null ? args.trim() : "";
+        dispatcher.registerSlashCommandCtx("tag", ctx -> {
+            String tag = ctx.args() != null ? ctx.args().trim() : "";
             if (tag.isBlank() || "help".equals(tag) || "--help".equals(tag)) {
                 log.info("[CommandRegistrationConfig28] /tag 用法: /tag <tag-name>（对齐 CC tag.tsx ShowHelp；门控 USER_TYPE==='ant' 默认关）");
                 return;
             }
-            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            if (sessionId == null || sessionId.isBlank()) {
+            // [批 3c] 会话标识取执行上下文（不再读裸 MDC）
+            if (ctx.sessionId() == null || ctx.sessionId().isBlank()) {
                 log.warn("[CommandRegistrationConfig28] /tag 无活动会话可打标（CC tag.tsx:95 'No active session to tag'）");
                 return;
             }
             try {
-                Path ws = Path.of(resolveWorkspaceDir(sessionId));
-                SessionStorage.reAppendSessionMetadata(ws, sessionId,
+                // [批 r10] 会话存档根走 ctx.projectRoot()（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+                //   替代原 3 份逐字节相同的 resolveWorkspaceDir）。解析点仍在 try 内 ⇒ catch 语义不变。
+                Path ws = Path.of(ctx.projectRoot());
+                SessionStorage.reAppendSessionMetadata(ws, ctx.sessionId(),
                     new SessionStorage.SessionMetadata(null, null, tag, null, null,
                         null, null, null, null, null, null));
                 log.info("[CommandRegistrationConfig28] /tag session={} 已打标 #{}（对齐 CC tag.tsx saveTag；toggle 移除读侧未接线，受控差异）",
-                    sessionId, tag);
+                    ctx.sessionId(), tag);
             } catch (Exception e) {
                 log.warn("[CommandRegistrationConfig28] /tag 失败: {}", e.getMessage());
             }
@@ -738,17 +740,20 @@ public class CommandRegistrationConfig28 {
      * 真实统计（turn 数 / 工具调用排行 / 时长 / 模型）。transcript 不存在 / 读失败 → 空统计（fail loud）。
      */
     private void registerStatsHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry) {
-        dispatcher.registerSlashCommand("stats", (args, sessionId, inFlightUserMessageId) -> {
-            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            String projectRoot = sessionId != null && !sessionId.isBlank()
-                ? CwdResolution.getOriginalCwdLayer(sessionId)
+        dispatcher.registerSlashCommandCtx("stats", ctx -> {
+            // [批 r10] 会话标识取执行上下文；存档根改走 ctx.projectRoot()（getOriginalCwdLayer 语义 +
+            //   user.dir 兜底单点）。报告根（本行）与 transcript 读源（readSessionLogLines）现在**复用
+            //   同一个 memoized 值** ⇒ 原「同一次 /stats 对同一会话解析两遍」收敛为一遍。
+            //   ⚠️ 保留原 null/空白短路（不解析）：原实现在该分支直接取 user.dir，不产生解析与告警。
+            String projectRoot = ctx.sessionId() != null && !ctx.sessionId().isBlank()
+                ? ctx.projectRoot()
                 : System.getProperty("user.dir", ".");
             try {
                 InsightsCollector collector = new InsightsCollector(
-                    () -> readSessionLogLines(sessionId));
+                    () -> readSessionLogLines(projectRoot, ctx.sessionId()));
                 InsightsCollector.HtmlReport report = collector.generateReport(
                     projectRoot != null ? projectRoot : ".");
-                int liveMessages = liveSessionMessageCount(sessionRegistry, sessionId);
+                int liveMessages = liveSessionMessageCount(sessionRegistry, ctx.sessionId());
                 log.info("[CommandRegistrationConfig28] /stats 执行完成: {}（turnCount={} 工具调用 {} 类，"
                         + "活跃 AgentState 消息 {} 条；对齐 CC stats.tsx Stats 面板 + insights.ts collectSessionStats）",
                     report.title(),
@@ -769,14 +774,10 @@ public class CommandRegistrationConfig28 {
      * <p>构造器以会话 cwd 直构（非 Spring bean），git 状态真实读取；非 git 仓库 / 无变更 → 披露。
      */
     private void registerDiffHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand("diff", (args, sessionId, inFlightUserMessageId) -> {
-            // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            String cwd = CwdResolution.getCwd(sessionId);
-            if (cwd == null || cwd.isBlank()) {
-                cwd = System.getProperty("user.dir", ".");
-            }
+        dispatcher.registerSlashCommandCtx("diff", ctx -> {
+            // [批 r10] cwd 走 ctx.cwd()（getCwd 语义 + user.dir 兜底单点；原 4 行样板消失）
             try {
-                GitStatusProvider provider = new GitStatusProvider(Path.of(cwd));
+                GitStatusProvider provider = new GitStatusProvider(Path.of(ctx.cwd()));
                 String status = provider.getGitStatus();
                 log.info("[CommandRegistrationConfig28] /diff 执行完成: {}（对齐 CC diff.tsx DiffDialog；web 端 per-turn diff 走 REST）",
                     status != null ? "git status:\n" + status : "非 git 仓库或无变更");
@@ -794,12 +795,6 @@ public class CommandRegistrationConfig28 {
     /** USER_TYPE==='ant'（CC 大小写敏感 === 'ant'；Java 侧容错增强 equalsIgnoreCase，登记差异同 CommandRegistrationConfig）。 */
     private static boolean isAnt() {
         return "ant".equalsIgnoreCase(System.getenv("USER_TYPE"));
-    }
-
-    /** 会话存档根 · 对齐 CC sessionStorage.ts getTranscriptPath()（原始项目根 ?? user.dir）。 */
-    private static String resolveWorkspaceDir(String sessionId) {
-        String root = CwdResolution.getOriginalCwdLayer(sessionId);
-        return root != null && !root.isBlank() ? root : System.getProperty("user.dir", ".");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -911,13 +906,18 @@ public class CommandRegistrationConfig28 {
         return flat.length() <= max ? flat : flat.substring(0, max) + "...";
     }
 
-    /** 读取会话 transcript JSONL 行（/stats 真实日志源，同 GroupB /insights readSessionLogLines）。 */
-    private static List<String> readSessionLogLines(String sessionId) {
+    /** 读取会话 transcript JSONL 行（/stats 真实日志源，同 GroupB /insights readSessionLogLines）。
+     *
+     *  <p><b>[r10-S1] 同值合并</b>：会话存档根由 {@code projectRoot} 形参传入 —— 原实现自行调用
+     *  {@link CwdResolution#getOriginalCwdLayer} 一次，与 {@code registerStatsHandler} 里为报告根做得
+     *  那次是**同一次 /stats 执行对同一会话的两次解析**（且两份 user.dir 兜底逻辑）。现在只解析一次。
+     *  解析点仍在 {@code registerStatsHandler} 的 {@code try} 之前（原 :743-745 已如此）⇒ 异常面不变。 */
+    private static List<String> readSessionLogLines(String projectRoot, String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             return List.of();
         }
         try {
-            String workspace = CwdResolution.getOriginalCwdLayer(sessionId);
+            String workspace = projectRoot;
             if (workspace == null || workspace.isBlank()) {
                 workspace = System.getProperty("user.dir", ".");
             }

@@ -46,7 +46,7 @@ import static org.mockito.Mockito.when;
  * （{@code --fallback-model} → {@code userSpecifiedFallbackModel} → {@code options.fallbackModel}，
  * withRetry.ts:337 {@code if (options.fallbackModel)} 优先于任何全局默认）；Java 端 per-call
  * 候选来源 = HTTP 请求体 {@code SendMessageRequest.fallbackModel} → {@link RunRequest} 工厂
- * → {@link QueryParams#fallbackModel()} → {@link TransientErrorHandler#handle(... fallbackModel)}
+ * → {@link QueryParams#fallbackModel()} → {@link TransientErrorHandler#handle}（fallbackModel 形参）
  * （fallbackModelParam 非空优先，env {@code FALLBACK_MODEL_ID} 仅兜底，决策 10）。
  *
  * <p>本测试锁定<b>按调用传入优先于 env 兜底</b>：构造携带 fallbackModel="per-call-A" 的

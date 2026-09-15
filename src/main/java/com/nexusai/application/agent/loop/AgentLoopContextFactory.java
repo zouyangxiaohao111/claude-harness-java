@@ -57,7 +57,7 @@ import java.nio.file.Path;
  *
  * <p><b>WHY 存在</b>: 主/Subagent/Hook 三路 deps 均需构造各自 {@link AgentLoopContext}。
  * P3-③ 后主循环 {@code LlmAgentLoop.run()} 调 {@link #forSession}（5 参重载携带会话级可变状态
- * + override 事件通道），Subagent/Hook 经 {@link #shared()} 构造隔离 ctx。无 carrier 引用。
+ * + override 事件通道），Subagent/Hook 经 {@link #shared(String)} 构造隔离 ctx。无 carrier 引用。
  *
  * <p><b>注入策略</b>: 全部 {@code @Autowired(required=false)}（对齐 LlmAgentLoop 容错模式；
  * 与 LlmAgentLoop 的注入清单同源，二者共享同一批 bean 实例，无行为漂移）。[IMP-02 D-27]

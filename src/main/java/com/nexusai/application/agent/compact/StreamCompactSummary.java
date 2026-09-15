@@ -66,7 +66,7 @@ import java.util.function.Supplier;
  *
  * <p><b>类归属（IMP-01 实施 Agent 决定，已登记进度文件）</b>: 本类归 compact 域，
  * 实现 {@link AutoCompactor.CompactCallback}（L4 auto 注入点），并暴露丰富的
- * {@link #streamCompactSummary(List, String, int, String, LlmProvider, ProviderConfig)}
+ * {@link #streamCompactSummary(List, String, int, String, LlmProvider, ProviderConfig, CompactConversationContext)}
  * 方法供测试与下游（IMP-04 compactConversation / IMP-07 autoCompactIfNeeded）直接调用。
  *
  * <p><b>CC 对齐注记</b>：

@@ -173,7 +173,7 @@ public class McpServerService {
     }
 
     /**
-     * [impl-I-3 rework #1] channel 门控 bean（@Component）· 供 {@link #start()} 接线
+     * [impl-I-3 rework #1] channel 门控 bean（@Component）· 供 {@link #start} 接线
      * {@code setAllowedChannelsSupplier}（session --channels 注入点）与 gate 数据流日志。
      *
      * <p>生产接线 fail-loud：本字段 @Autowired(required=true) → Spring 上下文装配失败即启动失败
@@ -183,7 +183,7 @@ public class McpServerService {
 
     /**
      * [S07] 会话态 --channels 白名单数据源 · 对齐 CC {@code getAllowedChannels()}
-     * （bootstrap/state.ts:1676-1682，进程内会话白名单）· 供 {@link #start()}/
+     * （bootstrap/state.ts:1676-1682，进程内会话白名单）· 供 {@link #start}/
      * {@link #startEnabledBatch()} 注入 {@link ChannelNotificationGate#setAllowedChannelsSupplier}
      * 真实会话态 supplier（替换恒空 {@code List::of} fail-closed 接线）。
      *
@@ -194,7 +194,7 @@ public class McpServerService {
     @Autowired private com.nexusai.application.agent.mcp.ChannelSessionAllowlist channelSessionAllowlist;
 
     /**
-     * [S08 F2 接线] 插件 MCP 集成（F1-F5）· 供 {@link #start()}/{@link #startEnabledBatch()}
+     * [S08 F2 接线] 插件 MCP 集成（F1-F5）· 供 {@link #start}/{@link #startEnabledBatch()}
      * 注入真实 pluginSource 解析器（CC mcpPluginIntegration.ts:354 addPluginScopeToServers
      * 注入 name@marketplace）→ gate 门序[4] marketplace 校验（McpToolPool:1359）可消费。
      *
@@ -211,7 +211,7 @@ public class McpServerService {
      * require('../skillSearch/localSearch.js').clearSkillIndexCache : undefined}）。
      *
      * <p>required=false 容错：SkillDiscoveryPrefetch 为 POJO（非 @Component/@Bean），生产
-     * 注入不到 → null → {@link #start()} 接线 no-op（对齐 CC flag-off 时 clearSkillIndexCache
+     * 注入不到 → null → {@link #start} 接线 no-op（对齐 CC flag-off 时 clearSkillIndexCache
      * 为 undefined、调用点 {@code ?.()} 短路）。组合根职责 = 把 {@code clearSkillIndexCache()}
      * 委托为 {@link McpToolPool#setSkillIndexClearer} 的 Runnable（镜像现有
      * {@code setMcpSkillsGate + setSkillPoolRefresher} 接线处）。
@@ -1096,7 +1096,7 @@ public class McpServerService {
     }
 
     /**
-     * [S08 F2] pluginSource 解析器装配 · 供 {@link #start()}/{@link #startEnabledBatch()}
+     * [S08 F2] pluginSource 解析器装配 · 供 {@link #start}/{@link #startEnabledBatch()}
      * 注入 {@link McpToolPool#setPluginSourceResolver}。
      *
      * <p>未装配 PluginMcpIntegration（测试直构/插件域禁用）→ 恒 null → gate 门序[4] 对

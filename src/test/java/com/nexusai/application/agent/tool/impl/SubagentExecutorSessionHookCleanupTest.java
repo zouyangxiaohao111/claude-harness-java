@@ -17,12 +17,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>WHY (规则九 · 测试验证意图): H5.md 步骤 2 必含测试项「集成: SubagentExecutor finally 真正调用
  * clearSessionHooks」, 但 SessionHookStoreTest 仅覆盖 SessionHookStore 自身, 无任何测试覆盖
  * SubagentExecutor 的 finally 接线 (对抗核验报告登记为未登记缺口). 实现代码在
- * {@code SubagentExecutor.execute} finally 块 Step 21.2b 调 {@link SubagentExecutor#cleanupSessionHooks(UUID)}
+ * {@code SubagentExecutor.execute} finally 块 Step 21.2b 调 {@link SubagentExecutor#cleanupSessionHooks(String, UUID)}
  * (对齐 CC runAgent.ts:822 clearSessionHooks). 若接线断裂: sub-agent 会话结束的运行时临时 hook
  * 不清理, 泄漏到后续会话复用 (注册了永不清理).
  *
  * <p><b>测试方式说明</b>: {@code execute} 22 步主流程依赖 LLM 循环等重依赖, 无法在单测中跑全流程.
- * 故把 finally 的 clearSessionHooks 抽成 package-private {@link SubagentExecutor#cleanupSessionHooks(UUID)}
+ * 故把 finally 的 clearSessionHooks 抽成 package-private {@link SubagentExecutor#cleanupSessionHooks(String, UUID)}
  * seam, 本测试:
  * <ul>
  *   <li>用真实 {@link HookRegistry} + 真实 {@link CommandHook} 注册 session hook (模拟 sub-agent 注册)</li>

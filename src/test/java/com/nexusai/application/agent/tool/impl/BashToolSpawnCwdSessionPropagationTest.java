@@ -47,12 +47,12 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 断言对象是「命令能否读到该目录下的文件」，与路径分隔符 / MSYS 路径形态无关（不解析 stdout 里的
  * 路径字符串，故不受 Git Bash 的 {@code /c/...} 形态影响）。
  *
- * <p><b>反向对照</b>见 {@link #existingSessionCwd_probeReadsFromThatDir()}：会话 cwd 存在
+ * <p><b>反向对照</b>见 {@link #existingSessionCwd_probeReadsFromThatDir(Path, Path)}：会话 cwd 存在
  * （不触发回落）时同一条探测命令必须读到标记 —— 它证明探测机制真的在跑，
  * 于是上一条的失败不可能被归因成「夹具/权限没放行」。
  *
  * <p><b>变异验证</b>：把 {@code BashTool} 里 {@code resolveSpawnCwd(sessionCwd, sessionId)} 的
- * 第 2 实参改成 {@code null} ⇒ {@link #deletedSessionCwd_readsMarkerFromSessionProject()} 红
+ * 第 2 实参改成 {@code null} ⇒ {@link #deletedSessionCwd_readsMarkerFromSessionProject(Path, Path)} 红
  * （姊妹 ShellExecutor 类仍全绿 ⇒ 本类确实补上了缺口）。
  */
 class BashToolSpawnCwdSessionPropagationTest {

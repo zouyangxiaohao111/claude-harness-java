@@ -1023,7 +1023,7 @@ public class SkillRegistry {
      *
      * <p>P2-9 过滤链精确对齐 CC getSkillToolCommands（commands.ts:563-581）：无 MCP 排除项 ——
      * MCP 命令 live outside getCommands（commands.ts:541-546），本过滤从数据源上就不含 MCP；
-     * 需含 MCP 的 listing 视图走 {@link #getModelInvocableCommandsForListing()}（thread-in 合并，
+     * 需含 MCP 的 listing 视图走 {@link #getModelInvocableCommandsForListing(String)}（thread-in 合并，
      * 对齐 CC attachments.ts:2677-2682 {@code uniqBy([...localCommands, ...mcpSkills], 'name')}）。
      * loadedFrom∈{BUNDLED,SKILLS,COMMANDS_DEPRECATED} 在 allowlist 免显式描述自动放行（CC :574-576）。
      *

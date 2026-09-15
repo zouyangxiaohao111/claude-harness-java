@@ -417,12 +417,12 @@ public class CommandRegistrationConfig {
      * （CC getCwd()）；readFileState cache 无 Java 等价 → 恒空列表（输出 "No files in context"，受控差异）。
      */
     private void registerFilesHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommandResult("files", (args, sessionId, inFlightUserMessageId) -> {
-            String cwd = CwdResolution.getCwd(sessionId);   // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-            if (cwd == null || cwd.isBlank()) {
-                cwd = System.getProperty("user.dir", ".");
-            }
-            FilesCommand.CommandResult result = FilesCommand.execute(cwd, List.of(), (abs, c) -> abs);
+        dispatcher.registerSlashCommandResultCtx("files", ctx -> {
+            // [批 r10] 用户裁定「乙 = 保形」：**仍然解析一次**，只是解析点从 handler 内联搬到 ctx 承载。
+            //   ⛔ 不得删这次解析 —— 删会让「未绑定会话」由「抛」变「不抛」，属语义变化（规则十二须显式登记）。
+            //   user.dir 兜底已收进 SlashCommandContext 单点（原 4 行样板消失）；cwd 对输出不可观测
+            //   （readFileState cache 未接线 ⇒ List.of() 恒空），故仅「是否抛」+ 日志受影响。
+            FilesCommand.CommandResult result = FilesCommand.execute(ctx.cwd(), List.of(), (abs, c) -> abs);
             log.info("[CommandRegistrationConfig] /files 执行完成: {}（readFileState cache 未接线 → 恒空，受控差异）",
                 result.value());
             return UserInputDispatcher.LocalCommandResult.text(result.value());
@@ -478,21 +478,28 @@ public class CommandRegistrationConfig {
      */
     private void registerRenameHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry registry) {
         RenameCommand renameCommand = new RenameCommand();
-        dispatcher.registerSlashCommand("rename", (args, sessionId, inFlightUserMessageId) -> {
+        dispatcher.registerSlashCommandCtx("rename", ctx -> {
+            // [批 r10] 会话存档根经 ctx.projectRoot() 承载（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+            //   替代原 3 份逐字节相同的实例方法 resolveWorkspaceDir）。
+            //   ⚠️ 传 **Supplier**（ctx::projectRoot）而非提前求值：RenameCommand.execute 在
+            //   (a) teammate 会话、(b) 无参且生成失败 两条路径上**提前返回**（RenameCommand:64-86），
+            //   原实现在那两条路径根本不解析 ⇒ 提前求值会新增 fail-loud 抛出（惰性面必须保住）。
+            //   ctx.projectRoot() memoize ⇒ 同一次 /rename 由「解析两遍」（transcriptPath + persist）收敛为 1 遍。
+            final java.util.function.Supplier<String> workspaceRoot = ctx::projectRoot;
             RenameCommand.Env env = new RenameCommand.Env(
-                // [S1-T12] teammate 守卫真实修复：按 handler 形参 sessionId 解析**会话级身份**
+                // [S1-T12] teammate 守卫真实修复：按会话标识解析**会话级身份**
                 //   （唯一入口 SessionAgentStateRegistry#teammateIdentityForSession）。
                 //   WHY 不是方法引用：CC `isTeammate()`（teammate.ts:125-131）读的是**本进程内**
                 //   的 AsyncLocalStorage / dynamicTeamContext；Java 的分派线程上不存在任何 teammate
                 //   载体，方法引用在此求值恒 false ⇒ 守卫静默失效（/rename 对 teammate 会话恒放行）。
                 //   改为查会话身份后，求值结果只依赖 sessionId，与求值线程无关。
-                () -> resolveIsTeammateSession(registry, sessionId),   // CC isTeammate()
-                // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
-                () -> resolveSessionUuid(sessionId),
-                () -> resolveTranscriptPath(sessionId),
+                () -> resolveIsTeammateSession(registry, ctx.sessionId()),   // CC isTeammate()
+                // [批 3c] 会话标识取执行上下文（不再读裸 MDC）
+                () -> resolveSessionUuid(ctx.sessionId()),
+                () -> resolveTranscriptPath(workspaceRoot.get(), ctx.sessionId()),
                 (messages, signal) -> CompletableFuture.completedFuture(null), // CC generateSessionName 未接线
-                (sid, name) -> { persistSessionMetadata(sid, name, true); return CompletableFuture.completedFuture(null); },
-                (sid, name) -> { persistSessionMetadata(sid, name, false); return CompletableFuture.completedFuture(null); },
+                (sid, name) -> { persistSessionMetadata(workspaceRoot, sid, name, true); return CompletableFuture.completedFuture(null); },
+                (sid, name) -> { persistSessionMetadata(workspaceRoot, sid, name, false); return CompletableFuture.completedFuture(null); },
                 (bridgeId, name) -> CompletableFuture.completedFuture(null),   // CC updateBridgeSessionTitle best-effort no-op
                 name -> {
                     // CC context.setAppState(standaloneAgentContext.name)：Java 无 name 字段 → 披露
@@ -501,7 +508,7 @@ public class CommandRegistrationConfig {
                     }
                 },
                 msg -> log.info("[CommandRegistrationConfig] /rename onDone: {}", msg));
-            RenameCommand.RenameResult result = renameCommand.execute(args, env);
+            RenameCommand.RenameResult result = renameCommand.execute(ctx.args(), env);
             log.info("[CommandRegistrationConfig] /rename 执行完成: renamed={} display={} message={}",
                 result.renamed(), result.display(), result.message());
         });
@@ -600,30 +607,35 @@ public class CommandRegistrationConfig {
 
     /** transcript 路径（CC getTranscriptPath · sessionStorage.ts）· 无会话 → null。
      *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
-     *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。 */
-    private static String resolveTranscriptPath(String sessionId) {
+     *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。
+     *
+     *  <p><b>[r10-S1]</b> 会话存档根由调用方以形参传入（原实现经 {@code resolveWorkspaceDir} 内部反查
+     *  {@link CwdResolution#getOriginalCwdLayer}）—— 消除 3 份逐字节相同的复制，并把解析点显式化。
+     *  ⚠️ 形参取值为「已解析的存档根」（调用方在**原解析位置**调用 {@code workspaceRoot.get()}）。 */
+    private static String resolveTranscriptPath(String workspaceRoot, String sessionId) {
         UUID sid = resolveSessionUuid(sessionId);
         if (sid == null) {
             return null;
         }
         Path transcript = SessionStorage.resolveExistingTranscript(
-            Path.of(resolveWorkspaceDir(sid.toString())), sid.toString());
+            Path.of(workspaceRoot), sid.toString());
         return transcript != null ? transcript.toString() : null;
     }
 
-    /** 会话存档根 · 对齐 CC sessionStorage.ts getTranscriptPath()（原始项目根 ?? user.dir）。 */
-    private static String resolveWorkspaceDir(String sessionId) {
-        String root = CwdResolution.getOriginalCwdLayer(sessionId);
-        return root != null && !root.isBlank() ? root : System.getProperty("user.dir", ".");
-    }
-
-    /** 持久化 custom-title（isTitle=true）或 agent-name（isTitle=false）到 transcript（CC saveCustomTitle/saveAgentName）。 */
-    private static void persistSessionMetadata(UUID sessionId, String name, boolean isTitle) {
+    /** 持久化 custom-title（isTitle=true）或 agent-name（isTitle=false）到 transcript（CC saveCustomTitle/saveAgentName）。
+     *
+     *  <p><b>[r10-S1]</b> 会话存档根改为 {@code Supplier} 形参。<b>WHY 用 Supplier 而非已解析值</b>：
+     *  原实现的解析就在本方法的 {@code try} 内（{@code resolveWorkspaceDir(sessionId.toString())}），
+     *  异常被下方 {@code catch} 吞掉并只打 WARN；若改成「调用方先解析、传值进来」，解析点会前移到本
+     *  方法的 try 之外 ⇒ 同一异常由「吞掉」变「抛出」＝ fail-loud 面扩大。Supplier 让 {@code get()}
+     *  仍留在 try 内，逐点保持原语义。 */
+    private static void persistSessionMetadata(java.util.function.Supplier<String> workspaceRoot,
+                                               UUID sessionId, String name, boolean isTitle) {
         if (sessionId == null) {
             return;
         }
         try {
-            Path ws = Path.of(resolveWorkspaceDir(sessionId.toString()));
+            Path ws = Path.of(workspaceRoot.get());
             SessionStorage.reAppendSessionMetadata(ws, sessionId.toString(),
                 new SessionStorage.SessionMetadata(null, isTitle ? name : null, null,
                     isTitle ? null : name, null, null, null, null, null, null, null));

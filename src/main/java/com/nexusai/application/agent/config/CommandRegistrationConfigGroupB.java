@@ -3,7 +3,6 @@ package com.nexusai.application.agent.config;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
-import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.command.InsightsCollector;
 import com.nexusai.application.agent.compact.SnipCompactor;
 import com.nexusai.application.agent.loop.FeatureFlags;
@@ -475,7 +474,12 @@ public class CommandRegistrationConfigGroupB {
         }
         try {
             String sessionId = ctx.sessionId();
-            String workspace = CwdResolution.getOriginalCwdLayer(sessionId);
+            // [批 r10 · 甲项 B1] 存档根改读 ctx.originalCwd()（getOriginalCwdLayer 语义）。
+            //   ⛔ 不得改用 ctx.cwd()：那是 getCwd 语义（受 bash cd 影响），两者在发生过 cd 的会话里
+            //   **必然不同值** ⇒ /insights 会读错 transcript（本批最容易被「看起来等价」骗过的一处）。
+            //   ⚠️ get() 仍在**本 try 内**（原反查位置）⇒ catch（吞异常 + WARN + 空统计）语义逐点不变。
+            //   ⚠️ 槽可为 null（PromptFnContext 未提供时）⇒ 按 null 走既有 user.dir 兜底，不 NPE。
+            String workspace = ctx.originalCwd() != null ? ctx.originalCwd().get() : null;
             if (workspace == null || workspace.isBlank()) {
                 workspace = System.getProperty("user.dir", ".");
             }

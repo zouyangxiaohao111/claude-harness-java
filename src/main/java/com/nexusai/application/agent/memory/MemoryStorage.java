@@ -76,8 +76,8 @@ public class MemoryStorage {
      * 注入 AutoMemPaths 构造器 · 默认记忆目录 = {@code autoMemPaths.getAutoMemPath()}
      * （CC per-project 路径，DEL-M-06 对齐）。
      *
-     * <p><b>[A1 修复]</b>：不再构造期冻结 —— 保留 AutoMemPaths 引用，{@link #memoryDir()}
-     * 每次现算（按当前线程 projectRoot 惰性解析）。extract/dream fork 不走本方法（参数直传，
+     * <p><b>[A1 修复]</b>：不再构造期冻结 —— 保留 AutoMemPaths 引用，{@link #memoryDir(String)}
+     * 每次现算（按入参 sessionId 解析）。extract/dream fork 不走本方法（参数直传，
      * 见 {@code AutoMemPaths#getAutoMemPath(String)} 显式重载）；本惰性面供会话线程消费者。
      */
     public MemoryStorage(AutoMemPaths autoMemPaths) {
@@ -165,7 +165,7 @@ public class MemoryStorage {
      * [TL-W1 P2] 冻结记忆目录（仅 {@code new MemoryStorage(Path)} 直构 · 测试/POJO）。
      *
      * <p><b>WHY</b>：ExtractMemoriesAgent 的便捷重载（2/3/4 参）需要 memoryDir 却无会话参数
-     * —— 旧实现经 {@link #memoryDir()} 惰性现算，在解析型 storage（生产 {@code new MemoryStorage(
+     * —— 旧实现经 {@code memoryDir()} 惰性现算，在解析型 storage（生产 {@code new MemoryStorage(
      * AutoMemPaths)}）下会读会话 ThreadLocal；调用线程若是 fork/hook 线程（ThreadLocal 空）即回落
      * config home → A′ 判无效 → null → 下游 NPE 被吞（审计 P2/P9）。现便捷重载只允许消费**冻结**
      * 值：解析型 storage 返回 null → 调用方 fail-loud（生产必须走显式 memoryDir 参数）。

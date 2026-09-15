@@ -3,7 +3,6 @@ package com.nexusai.application.agent.command;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
-import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
 import jakarta.annotation.PostConstruct;
@@ -85,9 +84,9 @@ public class AgentColorCommand {
             log.warn("[AgentColorCommand] UserInputDispatcher 未注入，/color 生产注册跳过");
             return;
         }
-        userInputDispatcher.registerSlashCommand("color", (args, sessionId, inFlightUserMessageId) -> {
-            Env env = buildProductionEnv(sessionId);
-            CommandResult r = execute(args, env);
+        userInputDispatcher.registerSlashCommandCtx("color", ctx -> {
+            Env env = buildProductionEnv(ctx);
+            CommandResult r = execute(ctx.args(), env);
             if (log.isDebugEnabled()) {
                 log.debug("[AgentColorCommand] /color 执行完成: handled={} message={} display={}",
                     r.handled(), r.message(), r.display());
@@ -120,18 +119,24 @@ public class AgentColorCommand {
      *
      * @param sessionId 分派入口显式传入的会话 ID（null/空 = 无会话上下文，同旧 MDC 缺值语义）
      */
-    private Env buildProductionEnv(String sessionId) {
+    private Env buildProductionEnv(UserInputDispatcher.SlashCommandContext ctx) {
+        // [批 r10] 会话存档根经 ctx.projectRoot() 承载（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+        //   替代本类原先的 workspaceDir/workspaceDirFor 反查）。
+        //   ⚠️ 以**惰性 Supplier** 下传两个消费点，各自的解析时机/异常面逐点不变：
+        //   - transcriptPath()：原解析点在 Env 被 execute 取用时（resolveTranscriptPath 内）
+        //   - persistAgentColor：原解析点在进入 runAsync **之前**（见该方法注释）
+        final java.util.function.Supplier<String> workspaceRoot = ctx::projectRoot;
         return new Env(
             // [S1-T12] teammate 守卫真实修复（同 CommandRegistrationConfig /rename 的第二处同型缺陷）：
-            //   按 handler 形参 sessionId 解析**会话级身份**（唯一入口
+            //   按会话标识解析**会话级身份**（唯一入口
             //   SessionAgentStateRegistry#teammateIdentityForSession）。
             //   WHY 不是方法引用：分派线程上不存在任何 teammate 载体 ⇒ 方法引用恒 false ⇒ 守卫静默失效。
-            () -> resolveIsTeammateSession(sessionAgentStateRegistry, sessionId),
-            () -> resolveSessionUuid(sessionId),
-            () -> resolveTranscriptPath(sessionId),
+            () -> resolveIsTeammateSession(sessionAgentStateRegistry, ctx.sessionId()),
+            () -> resolveSessionUuid(ctx.sessionId()),
+            () -> resolveTranscriptPath(workspaceRoot.get(), ctx.sessionId()),
             () -> SubagentTool.AGENT_COLORS,
-            this::persistAgentColor,
-            color -> setAppStateColor(sessionId, color),
+            (sid, color) -> persistAgentColor(workspaceRoot, sid, color),
+            color -> setAppStateColor(ctx.sessionId(), color),
             msg -> {
                 if (log.isDebugEnabled()) {
                     log.debug("[AgentColorCommand] onDone: {}", msg);
@@ -165,53 +170,30 @@ public class AgentColorCommand {
     /** transcript 路径（CC getTranscriptPath() · sessionStorage.ts）· 无会话 → null。
      *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
      *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。 */
-    private static String resolveTranscriptPath(String sessionId) {
+    private static String resolveTranscriptPath(String workspaceRoot, String sessionId) {
         UUID sid = resolveSessionUuid(sessionId);
         if (sid == null) {
             return null;
         }
-        Path transcript = SessionStorage.resolveExistingTranscript(workspaceDir(sessionId), sid.toString());
+        Path transcript = SessionStorage.resolveExistingTranscript(Path.of(workspaceRoot), sid.toString());
         return transcript != null ? transcript.toString() : null;
     }
 
-    /**
-     * 会话存档根 · 对齐 CC {@code sessionStorage.ts:202-205 getTranscriptPath()}:
-     * {@code projectDir = getSessionProjectDir() ?? getProjectDir(getOriginalCwd())}。
+    /** 持久化 agent-color entry + 会话缓存（CC sessionStorage.ts saveAgentColor:2838-2852）。
      *
-     * <p><b>WF-1C / DEL-05 / G8</b>：旧实现恒返回 {@code user.dir}（JVM 启动目录），
-     * 导致会话绑定项目场景下 transcript 落到启动目录而非项目目录，与 CC 行为漂移。
-     * 现走统一入口 {@link CwdResolution#getOriginalCwdLayer(String)}（绑定项目层 ?? user.dir 兜底，
-     * D-1 裁决不读 resolve() 回落链），使存档根跟随会话绑定的项目目录。
-     *
-     * <p>统一入口内含 normalizeCwd（realpath+NFC），各层 safeGet 异常回 null，最终恒非 null 不抛。
-     *
-     * @param sessionId 显式会话 ID（批 3c：由调用点形参穿透，不再读裸 MDC）
-     */
-    private static Path workspaceDir(String sessionId) {
-        return workspaceDirFor(sessionId);
-    }
-
-    /**
-     * 按显式 sessionId 解析会话存档根（异步线程入口）· 同 {@link #workspaceDir(String)} 语义，
-     * 会话标识全程走形参（不用线程局部请求上下文，避免 ForkJoinPool 跨线程丢失）。
-     *
-     * @param sessionId 会话 ID（null/空 → 回落 user.dir 兜底）
-     */
-    private static Path workspaceDirFor(String sessionId) {
-        String root = CwdResolution.getOriginalCwdLayer(sessionId);
-        return Path.of(root != null && !root.isBlank() ? root : System.getProperty("user.dir", "."));
-    }
-
-    /** 持久化 agent-color entry + 会话缓存（CC sessionStorage.ts saveAgentColor:2838-2852）。 */
-    private CompletableFuture<Void> persistAgentColor(UUID sessionId, String color) {
+     *  <p><b>[批 r10]</b> 会话存档根改为 {@code Supplier} 形参（取值 = ctx.projectRoot()，
+     *  getOriginalCwdLayer 语义 + user.dir 兜底单点）。用 Supplier 而非已解析值，是为了让
+     *  {@code get()} 留在**下方 runAsync 之前**的原解析位置（见下注释），逐点保持原语义。 */
+    private CompletableFuture<Void> persistAgentColor(java.util.function.Supplier<String> workspaceRoot,
+                                                      UUID sessionId, String color) {
         if (sessionId == null) {
             return CompletableFuture.completedFuture(null);
         }
         // WF-1C: 必须在进入异步线程前解析存档根——CompletableFuture.runAsync 跑在 ForkJoinPool，
         // 不传播任何 ThreadLocal 请求上下文，异步内再取会话 id 会得 null
-        // → 回落 user.dir（绑定项目场景 transcript 漂移）。sessionId 已是入参，直接据此解析统一入口，
+        // → 回落 user.dir（绑定项目场景 transcript 漂移）。解析点为**显式传入的 workspaceRoot**，
         // 跨线程稳定（对齐 CC saveAgentColor 在异步内用模块级 getSessionId/getSessionProjectDir 而非线程局部态）。
-        Path ws = workspaceDirFor(sessionId.toString());
+        Path ws = Path.of(workspaceRoot.get());
         return CompletableFuture.runAsync(() -> {
             try {
                 Path transcript = SessionStorage.getTranscriptPath(ws, sessionId.toString());

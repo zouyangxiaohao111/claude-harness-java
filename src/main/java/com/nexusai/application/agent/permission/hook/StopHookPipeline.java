@@ -24,7 +24,7 @@ import java.util.function.Consumer;
  * <ol>
  *   <li>{@link #saveCacheSafeParams(QuerySource)} — CC stopHooks.ts:96-98</li>
  *   <li>{@link #classifyAndWriteState(QuerySource, String)} — CC stopHooks.ts:108-132</li>
- *   <li>{@link #executePromptSuggestion(boolean)} — CC stopHooks.ts:136-140</li>
+ *   <li>{@link #executePromptSuggestion(boolean, PromptSuggestion, PromptSuggestion.SuggestionContext)} — CC stopHooks.ts:136-140</li>
  *   <li>{@link #executeExtractMemoriesAndAutoDream(String, ExtractMemoriesAgent, AutoDreamConsolidator, List, boolean, Consumer, boolean, Path, String)}
  *       — CC stopHooks.ts:136-156（FIX-EX 单方法，bareMode 门控并入）</li>
  *   <li>{@link #cleanupComputerUseAfterTurn(String)} — CC stopHooks.ts:164-173</li>

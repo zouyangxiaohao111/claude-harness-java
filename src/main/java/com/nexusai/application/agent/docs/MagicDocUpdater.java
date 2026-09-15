@@ -103,7 +103,7 @@ public class MagicDocUpdater {
     /**
      * [Session L] 强制注入的 EditFileTool · 对齐 CC magicDocs.ts:172-192 canUseTool
      * 仅允许 Edit 工具，无降级直写路径。构造器 {@link #MagicDocUpdater(MagicDocDetector, EditFileTool)}
-     * 与 {@link #MagicDocUpdater(MagicDocDetector, LlmProviderFactory, EditFileTool)} 均会
+     * 与 {@link #MagicDocUpdater(MagicDocDetector, LlmProviderFactory, EditFileTool, String)} 均会
      * {@code Objects.requireNonNull} 校验，null 立即抛 {@link IllegalArgumentException}（规则十二·显式失败）。
      */
     private final EditFileTool editFileTool;

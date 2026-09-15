@@ -288,7 +288,11 @@ public final class SystemPromptSections {
         // [cwd-session 2026-08-25 修复] 用 input.sessionId() 显式解析会话 cwd（渲染在 ForkJoinPool
         // 线程无 MDC，旧 cwd() 回落 user.dir 致 Primary working directory 注入后端启动目录）。
         // sessionId null → cwd() 兜底（cwdSupplier 测试缝 / MDC）。
-        Path cwdPath = cwd(input.sessionId());
+        // [r10b · D9] 已接边界（sessionSlots 非 null）→ 读槽（边界解析一次 ⇒ 槽 memoize）；
+        //   未接边界 → 保留旧路径逐点不变（fail-loud 面不变）。
+        Path cwdPath = input.sessionSlots() != null
+            ? Path.of(input.sessionSlots().cwd())
+            : cwd(input.sessionId());
         String cwd = cwdPath.toString().replace('\\', '/');
         // CC computeSimpleEnvInfo :655 Promise.all([getIsGit(), ...]) —— isGit 走 GitStatusProvider
         // walk-up（git.ts:27-86）；异常 → false（SubagentEnvInfo.isGitRepository :160-168 同款）
@@ -297,7 +301,10 @@ public final class SystemPromptSections {
         //   （prompts.ts:675-681），仅 EnterWorktree 工具进入的会话消费 '!' 子弹；sessionId null →
         //   false（无会话级 worktree 会话 = 非 worktree）。原 git 级 safeIsWorktree 已弃用
         //   （保留实现供诊断/其他消费，见 :350）。
-        boolean isWorktree = com.nexusai.application.agent.agent.SessionCwdHolder.isWorktreeBound(input.sessionId());
+        // [r10b · D9] 同一会话态读取收口到槽（未接边界时回落原读取点，语义逐点不变）
+        boolean isWorktree = input.sessionSlots() != null
+            ? input.sessionSlots().worktreeBound()
+            : com.nexusai.application.agent.agent.SessionCwdHolder.isWorktreeBound(input.sessionId());
         // CC :663-667 modelDescription：marketing 名存在 → named 形态，否则 model id 兜底；
         // null/blank model → 抑制（保持既有 blank 抑制语义）
         String modelDescription = null;
@@ -533,12 +540,33 @@ public final class SystemPromptSections {
      * @return scratchpad 目录路径；无会话/计算失败 → null
      */
     public static String getScratchpadDir(String sessionId) {
+        // [r10b · D9] 旧 1 参签名保留为薄包装（{@code LlmAgentLoop:4658} 等既有调用点零改动）
+        return getScratchpadDir(sessionId, null);
+    }
+
+    /**
+     * scratchpad 目录路径（会话态槽承载版）· [r10b · D9] 新增重载。
+     *
+     * <p>{@code originalCwdSlot} 非 null 时改从槽读 originalCwd（{@link PromptSessionSlots#originalCwd()}，
+     * 边界解析一次 + memoize）；null 时回落 {@link CwdResolution#getOriginalCwdLayer(String)}。
+     *
+     * <p>⚠️ <b>槽读必须在 {@code try} 内</b>（本方法体的 try）：槽解析会抛（fail-loud），而本方法的
+     * 契约是「解析失败 ⇒ 返回 null + ERROR 日志」（[S2 · F-10 · 用户裁定 #6]，跳过但 ≥ERROR）。
+     * 把 {@code originalCwdSlot.get()} 挪到 try 外会改变该异常面（抛穿而非降级）⇒ ⛔ 不得调整位置。
+     *
+     * @param sessionId       会话 ID；null/空 → 返回 null（scratchpad 会话级，无会话不注入）
+     * @param originalCwdSlot 会话原始 cwd 槽（{@code Supplier}，惰性；null = 未接边界，走旧路径）
+     * @return scratchpad 目录路径；无会话/计算失败 → null
+     */
+    public static String getScratchpadDir(String sessionId, java.util.function.Supplier<String> originalCwdSlot) {
         if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
         try {
             Path appTempDir = NexusaiPaths.getAppTempPath();
-            String originalCwd = CwdResolution.getOriginalCwdLayer(sessionId);
+            String originalCwd = originalCwdSlot != null
+                ? originalCwdSlot.get()
+                : CwdResolution.getOriginalCwdLayer(sessionId);
             if (originalCwd == null || originalCwd.isBlank()) {
                 originalCwd = System.getProperty("user.dir", ".");
             }
@@ -573,7 +601,9 @@ public final class SystemPromptSections {
             }
             return CompletableFuture.completedFuture(null);
         }
-        String scratchpadDir = getScratchpadDir(input.sessionId());
+        // [r10b · D9] 已接边界 → 槽（originalCwd 语义，与 CC getProjectTempDir 的 getOriginalCwd() 同源）
+        String scratchpadDir = getScratchpadDir(input.sessionId(),
+            input.sessionSlots() != null ? input.sessionSlots()::originalCwd : null);
         if (scratchpadDir == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[SystemPromptSections] scratchpad compute 跳过：sessionId null → 不注入（scratchpad 会话级）");

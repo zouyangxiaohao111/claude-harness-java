@@ -1171,7 +1171,7 @@ public class SubagentExecutor {
     }
 
     /**
-     * P2.3: 注入 McpTransportFactory · 注入后 {@link #initializeAgentMcp(AgentDefinition)}
+     * P2.3: 注入 McpTransportFactory · 注入后 {@link #initializeAgentMcp(AgentDefinition, List)}
      * 走 3 参重载（真接入 tools/list + tools/call）. 未注入时回退到 2 参 stub.
      *
      * @param factory Spring 自动装配的 {@link McpTransportFactory} bean, 或测试 stub
@@ -1718,7 +1718,9 @@ public class SubagentExecutor {
         // [批 4b-1] 显式传子代理会话 cwd（userContext = 会话项目根的 CLAUDE.md；原经 ThreadLocal 隐式读取）
         String userContext = userContextFor(agentDefinition, agentTuc != null && agentTuc.effectiveCwd() != null
             ? agentTuc.effectiveCwd().toString() : null);
-        String systemContext = resolveSystemContextText();
+        // [r10b · D3/D4] 会话标识显式下传（本作用域 :1692 已就绪）：兜底 provider 的 git 锚点 /
+        //   CLAUDE.md 扫描根必须按本子代理会话解析，⛔ 不得用无参构造回落进程 user.dir。
+        String systemContext = resolveSystemContextText(sessionId);
 
         // ── Step 9: agentSystemPrompt ──
         // 对齐 CC runAgent.ts:508-509: agentSystemPrompt = override?.systemPrompt ? override.systemPrompt : ...
@@ -2566,7 +2568,7 @@ public class SubagentExecutor {
      * executeForkedSkill · 对齐 CC SkillTool.ts:122-289 executeForkedSkill()
      * for-await runAgent + onProgress (子任务 a: skill_progress 上报).
      *
-     * <p>复用 {@link #execute(String, String, String)} 22 步主流程（隔离 sub-agent
+     * <p>复用 {@link #execute(String, String, String, ForkPathParams)} 22 步主流程（隔离 sub-agent
      * 上下文 + 独立 transcript + 独立 hook）, 但 prompt 由 caller 构造（CC: 注入技能
      * 内容到 system prompt 后整个调用 delegation）. agent 类型来自
      * {@link Command#getAgent()}（缺省 "general-purpose"）.
@@ -5533,13 +5535,21 @@ public class SubagentExecutor {
      * 会话级实例（per-executor 缓存 = per-spawn memoize 近似；CC 会话级 memoize 因 Java 无
      * 会话字段化承载而近似到 executor 实例边界）。
      *
+     * <p><b>[r10b · D3/D4 2026-09-15] 会话态显式传参</b>：兜底 provider 的 git 锚点与
+     * CLAUDE.md 扫描根改为按<b>本子代理会话</b>解析（原写死无会话 ⇒ 锚进程 {@code user.dir}）。
+     * ⚠️ 原 javadoc 称「有会话的子代理上下文由上游注入 engine/provider，不经本兜底」——
+     * <b>该说法与代码不符</b>：全仓唯一 {@code setSystemPromptContextProvider} 调用点在测试
+     * （{@code SubagentG4MetricsTest}），两个构造器均不注入该字段 ⇒ 本兜底是<b>生产路径</b>。
+     *
+     * @param sessionId 子代理会话 ID（[r10b · D3/D4] 兜底 provider 的 git 锚点按本会话解析；
+     *                  null = 确无会话 ⇒ 走无会话命名出口）
      * @return systemContext 文本；无 gitStatus/cacheBreaker → 空串（CC 空 systemContext 等价，
      *         Step 10 非 fork path 仅当非空才注入 system 消息）
      */
-    String resolveSystemContextText() {
+    String resolveSystemContextText(String sessionId) {
         try {
             com.nexusai.application.agent.prompt.SystemPromptContextProvider provider =
-                systemPromptContextProvider();
+                systemPromptContextProvider(sessionId);
             if (provider == null) {
                 return "";
             }
@@ -5577,18 +5587,28 @@ public class SubagentExecutor {
      * UserContextProvider(claudemdEngine=null) 为占位（回退单文件子集），sessionStartDate 用
      * 当前日期（getSystemContext 不消费 sessionStartDate）。
      *
+     * @param sessionId 子代理会话 ID（[r10b · D3/D4] 会话态显式传参：git 锚点与 CLAUDE.md
+     *                  扫描根均按本会话解析；null = 确无会话）
      * @return 注入的 provider 或惰性构造的会话级 provider（null 仅在构造失败时）
      */
-    private com.nexusai.application.agent.prompt.SystemPromptContextProvider systemPromptContextProvider() {
+    private com.nexusai.application.agent.prompt.SystemPromptContextProvider systemPromptContextProvider(
+            String sessionId) {
         com.nexusai.application.agent.prompt.SystemPromptContextProvider p = systemPromptContextProvider;
         if (p == null) {
             p = new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
                 java.time.LocalDate.now().toString(),
-                // [批 3c] 此处引擎恒 null（回退单文件子集）且无会话来源 → 显式无会话（回落 user.dir）；
-                //   有会话的子代理上下文由上游注入 engine/provider，不经本兜底。
+                // [批 3c] 此处引擎恒 null（回退单文件子集）。
+                // [r10b · D4] 会话态显式传参：原写死 null（= 显式无会话 ⇒ 引擎扫描根回落进程
+                //   user.dir），但本兜底是**生产路径**（全仓唯一 setSystemPromptContextProvider
+                //   调用点在测试 SubagentG4MetricsTest），会话标识在 Step 8 调用点已就绪 ⇒ 改传
+                //   本子代理会话，使 CLAUDE.md 扫描根锚会话项目根。
                 new com.nexusai.application.agent.prompt.UserContextProvider(
-                    (com.nexusai.application.agent.context.ClaudemdEngine) null, null),
-                new com.nexusai.application.agent.prompt.GitStatusProvider());
+                    (com.nexusai.application.agent.context.ClaudemdEngine) null, sessionId),
+                // [r10b · D3] 同 D1/D2：git 锚点必须按会话 cwd（CC getIsGit = findGitRoot(getCwd())），
+                //   ⛔ 无参构造锚进程 user.dir（后端启动目录）。
+                new com.nexusai.application.agent.prompt.GitStatusProvider(
+                    java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
+                        .getCwd(sessionId))));
             systemPromptContextProvider = p;
             if (log.isDebugEnabled()) {
                 log.debug("[SubagentExecutor] [IMP-G4 F5] 惰性构造 SystemPromptContextProvider "

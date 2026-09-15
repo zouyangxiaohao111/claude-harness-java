@@ -62,9 +62,9 @@ public record MicroCompactResult(
      * 待下发 cache_edits · 对齐 CC {@code PendingCacheEdits}（microCompact.ts:207-213）。
      *
      * <p>由 {@code cachedMicrocompactPath} 删除触发时产出（microCompact.ts:385-394），供
-     * {@link MicroCompactor#maybeCreateMicrocompactBoundaryMessage(long)} 流结束 yield 消费；
+     * {@link MicroCompactor#maybeCreateMicrocompactBoundaryMessage(long, String)} 流结束 yield 消费；
      * provider 注入请求用的 {@code CacheEditsBlock} 经
-     * {@link MicroCompactor#consumePendingCacheEditsBlock()} 独立通道。
+     * {@link MicroCompactor#consumePendingCacheEditsBlock(String)} 独立通道。
      *
      * @param trigger                    CC original: trigger (microCompact.ts:209) · 恒 'auto'
      * @param deletedToolIds             CC original: deletedToolIds (microCompact.ts:210) · 待删除工具 id

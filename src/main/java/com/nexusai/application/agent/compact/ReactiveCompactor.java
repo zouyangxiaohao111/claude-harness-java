@@ -39,7 +39,7 @@ import java.util.List;
  *   <li><b>enabled 门收敛到调用方</b>：tryReactiveCompact 内部不再判 enabled
  *       （CC 模块存在性 = REACTIVE_COMPACT feature 在调用点判定，query.ts:1119）；本类
  *       {@code enabled} 仅驱动 {@link #isReactiveCompactEnabled()}（feature + DISABLE_COMPACT 双门）</li>
- *   <li><b>摘要生产</b> —— 经 {@link #summaryProducer()} 把 {@link AutoCompactor.CompactCallback}
+ *   <li><b>摘要生产</b> —— 经 {@link #summaryProducer(CompactConversationContext)} 把 {@link AutoCompactor.CompactCallback}
  *       （生产 = {@link StreamCompactSummary}）适配为 {@link CompactConversation.SummaryProducer}
  *       （CC streamCompactSummary，compact.ts:451）</li>
  * </ol>
@@ -89,7 +89,7 @@ public class ReactiveCompactor {
 
     /**
      * 摘要回调 · 复用 {@link AutoCompactor.CompactCallback}（生产 = {@link StreamCompactSummary}）。
-     * 经 {@link #summaryProducer()} 适配为 {@link CompactConversation.SummaryProducer} 注入
+     * 经 {@link #summaryProducer(CompactConversationContext)} 适配为 {@link CompactConversation.SummaryProducer} 注入
      * 压缩上下文。null → 摘要能力缺失（compactConversation NPE 由调用方 try/catch 兜底 → surface）。
      */
     private final AutoCompactor.CompactCallback compactCallback;
@@ -98,7 +98,7 @@ public class ReactiveCompactor {
      * 兼容构造（旧签名）· 委托新构造传 null callback。
      *
      * <p><b>WHY 保留</b>: 既有测试/调用方以 TokenCounter lambda 构造（签名兼容）；null callback
-     * 下摘要生产不可用（见 {@link #summaryProducer()}）。
+     * 下摘要生产不可用（见 {@link #summaryProducer(CompactConversationContext)}）。
      */
     public ReactiveCompactor(TokenCounter tokenCounter) {
         this(tokenCounter, null);

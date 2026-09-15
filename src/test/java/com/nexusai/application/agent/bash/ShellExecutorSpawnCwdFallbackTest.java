@@ -29,9 +29,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>鉴别力设计</b>：本用例<b>必须</b>同时钉住两条腿，否则就是「只覆盖一侧」——
  * <ol>
- *   <li>{@link #deletedCwd_fallsBackToSessionOriginalCwd_notProcessUserDir()}：会话态
+ *   <li>{@link #deletedCwd_fallsBackToSessionOriginalCwd_notProcessUserDir(Path, Path)}：会话态
  *       ⇒ 回落 = 会话 originalCwd（<b>且显式断言不等于 user.dir</b>，否则「回落 user.dir」也能过）；</li>
- *   <li>{@link #nullSession_stillFallsBackToProcessUserDir()}：无会话（null）
+ *   <li>{@link #nullSession_stillFallsBackToProcessUserDir(Path, Path)}：无会话（null）
  *       ⇒ 回落 = 进程 user.dir（<b>正向对照</b>：证明上一条的差异来自会话载体，不是「函数恒返回 projectDir」）。</li>
  * </ol>
  * <p>变异验证（见交付报告）：把 {@code resolveSpawnCwd} 内回落层的 {@code sessionId} 换成

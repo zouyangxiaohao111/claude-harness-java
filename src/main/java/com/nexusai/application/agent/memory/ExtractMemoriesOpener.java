@@ -8,7 +8,7 @@ package com.nexusai.application.agent.memory;
  *
  * <p>L2 契约 (5 Release Gate):
  * <ul>
- *   <li><b>A1</b>: {@link #render(int, String, String, String, String, String, String)} (newMessageCount, existing, fileRead, fileEdit, fileWrite, glob, grep) → String</li>
+ *   <li><b>A1</b>: {@link #render(int, String, String, String, String, String, String, String)} (newMessageCount, existing, fileRead, fileEdit, fileWrite, glob, grep, bash) → String</li>
  *   <li><b>A2 Golden Trace</b>: existingMemories 非空 → '## Existing memory files' 段;空 → 无段;always 含 5 tool name + 双轮策略</li>
  *   <li><b>A3 纯函数</b>: 无副作用;同 input → 同 output</li>
  *   <li><b>A4 边界</b>: existingMemories null/empty → omit 段;tool names null 时 String.format %s 抛 NPE (caller 保证)</li>

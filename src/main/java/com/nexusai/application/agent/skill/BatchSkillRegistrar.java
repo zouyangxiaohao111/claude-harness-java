@@ -31,7 +31,7 @@ import org.slf4j.LoggerFactory;
  *       5-30 worker 每个 isolated worktree + gh pr create.</li>
  * </ul>
  *
- * <p>L3 (Java idiom): TS `getIsGit()` → 注入式 BooleanSupplier;
+ * <p>L3 (Java idiom): TS `getIsGit()` → 注入式 {@link IsGitForCwd}（<b>吃会话 cwd</b>）;
  *                    TS `registerBundledSkill({...})` → 返回 BundledSkillDefinition (上层 register);
  *                    TS `SKILL_TOOL_NAME` 等常量 → Java 常量.
  */
@@ -42,14 +42,23 @@ public final class BatchSkillRegistrar {
     public static final int MIN_AGENTS = 5;
     public static final int MAX_AGENTS = 30;
 
-    private final BooleanSupplier isGitSupplier;
+    private final IsGitForCwd isGitForCwd;
 
-    public BatchSkillRegistrar(BooleanSupplier isGitSupplier) {
-        this.isGitSupplier = Objects.requireNonNull(isGitSupplier);
+    public BatchSkillRegistrar(IsGitForCwd isGitForCwd) {
+        this.isGitForCwd = Objects.requireNonNull(isGitForCwd);
     }
 
+    /**
+     * isGit 判定缝 · <b>吃会话 cwd</b>（对齐 CC {@code findGitRoot(getCwd())}，git.ts:218-222）。
+     *
+     * <p><b>[r10b · D5 · 裁定 #10 第二域] 为什么从无参 {@code BooleanSupplier} 改为吃 cwd</b>：
+     * CC 的 {@code getIsGit} 属进程级 memoize + ambient {@code getCwd()} —— 那在 CC「单进程单会话」
+     * 前提下等价于会话 cwd；本仓是 1 JVM : N 会话，ambient cwd = 后端启动目录 ⇒ <b>语义不等价</b>
+     * （非 git 项目里的会话会被误判成 git 仓库，/batch 放行）。会话 cwd 在
+     * {@code PromptFnContext} 形参里本就可得 ⇒ 必须显式传参。
+     */
     @FunctionalInterface
-    public interface BooleanSupplier { boolean getAsBoolean(); }
+    public interface IsGitForCwd { boolean test(String cwd); }
 
     /** CC buildPrompt — 主链. */
     public String buildPrompt(String instruction) {
@@ -141,12 +150,15 @@ public final class BatchSkillRegistrar {
             null,   // context
             null,   // agent
             null,   // files
-            (args, cwd) -> {
+            // [r10b · D5] 第二参类型是 PromptFnContext（BundledSkillDefinition.java:71），
+            //   ⛔ 旧形参名 `cwd` 是历史遗留的误导命名（body 里从未使用过它）。现按真名 `ctx`
+            //   取会话 cwd（ctx.cwd() = 边界解析的会话工作目录，见 SlashCommandInterceptor:266）。
+            (args, ctx) -> {
                 String instruction = args == null ? "" : args.trim();
                 if (instruction.isEmpty()) {
                     return java.util.List.of(PromptBlock.text(MISSING_INSTRUCTION_MESSAGE));
                 }
-                if (!isGitSupplier.getAsBoolean()) {
+                if (!isGitForCwd.test(ctx != null ? ctx.cwd() : null)) {
                     return java.util.List.of(PromptBlock.text(NOT_A_GIT_REPO_MESSAGE));
                 }
                 return java.util.List.of(PromptBlock.text(buildPrompt(instruction)));

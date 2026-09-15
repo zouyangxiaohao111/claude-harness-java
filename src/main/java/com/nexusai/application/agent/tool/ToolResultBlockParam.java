@@ -19,8 +19,8 @@ import java.util.List;
  *
  * <p>{@code content} 形态契约（对齐 Anthropic SDK union）：
  * <ul>
- *   <li><b>字符串</b> — 纯文本（{@link #textContent(String)}）</li>
- *   <li><b>{@code List<ContentBlockParam>}</b> — 多块（{@link #blocksContent(List)}），
+ *   <li><b>字符串</b> — 纯文本（{@link #textContent(String, String)}）</li>
+ *   <li><b>{@code List<ContentBlockParam>}</b> — 多块（{@link #blocksContent(String, List)}），
  *       可包含 text/image/document</li>
  * </ul>
  *

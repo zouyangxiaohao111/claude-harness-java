@@ -30,7 +30,7 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <p>L3 (Java idiom): TS {@code fs/promises.stat} + {@code chmod 0o755 dir} →
- * Java {@link Files#isDirectory(Path)};TS {@code getErrnoCode} 检查 ENOENT/ENOTDIR/EACCES/EPERM →
+ * Java {@link Files#isDirectory}（变参 {@code isDirectory(Path, LinkOption...)}，调用只传 path）;TS {@code getErrnoCode} 检查 ENOENT/ENOTDIR/EACCES/EPERM →
  * Java 自定义 errno 字段 (caller 提供);TS {@code pathInWorkingPath} →
  * Java {@code Path.startsWith} 子路径检查。
  */
