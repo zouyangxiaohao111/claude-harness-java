@@ -1972,7 +1972,7 @@ function App() {
           }}
         />
       )}
-      {showAgentsPanel && <AgentsPanel onClose={() => setShowAgentsPanel(false)} />}
+      {showAgentsPanel && <AgentsPanel onClose={() => setShowAgentsPanel(false)} sessionId={activeSessionId} />}
       {showChromePanel && <ChromePanel sessionId={activeSessionId} onClose={() => setShowChromePanel(false)} />}
       {/* 技能市场（V58 主线程 agent 胶囊 → SkillMarketModal · 骨架版） */}
       {showMarket && (

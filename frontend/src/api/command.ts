@@ -1,6 +1,7 @@
 import { api } from './rest'
+import { API_BASE } from './base'
 
-const CMD_BASE = 'http://localhost:3458/api/command'
+const CMD_BASE = `${API_BASE}/command`
 
 export interface CommandDto {
   id: string

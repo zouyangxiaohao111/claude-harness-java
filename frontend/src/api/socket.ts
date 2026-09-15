@@ -1,5 +1,6 @@
 import { Client, type IMessage, type StompSubscription } from '@stomp/stompjs'
 import SockJS from 'sockjs-client'
+import { WS_BASE, SOCKJS_BASE } from './base'
 import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, MessageUsageEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations } from './types'
 
 export function parseStreamEvent(raw: unknown): StreamEvent {
@@ -31,11 +32,11 @@ export const isCancelled = (e: StreamEvent): e is MessageCancelledEvent => e.typ
 export function createSocketClient(): Client {
   let useSockJS = false
   const client = new Client({
-    brokerURL: 'ws://localhost:3458/ws',
+    brokerURL: WS_BASE,
     reconnectDelay: 2000,
     webSocketFactory: () => {
-      if (useSockJS) return new SockJS('http://localhost:3458/ws-sockjs')
-      return new WebSocket('ws://localhost:3458/ws')
+      if (useSockJS) return new SockJS(SOCKJS_BASE)
+      return new WebSocket(WS_BASE)
     },
     // F1：原生 WebSocket 连不上（未开 /ws / 代理拦截）→ 置位，重连走 SockJS
     onWebSocketError: () => { useSockJS = true },

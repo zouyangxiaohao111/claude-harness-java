@@ -1,8 +1,9 @@
 import { api } from './rest'
+import { API_BASE } from './base'
 import type { AgentListItem } from './types'
 
-const AGENT_BASE = 'http://localhost:3458/api/agent'
-const AGENTS_BASE = 'http://localhost:3458/api'
+const AGENT_BASE = `${API_BASE}/agent`
+const AGENTS_BASE = API_BASE
 
 export const agentApi = {
   awaySummary: (sessionId: string) =>

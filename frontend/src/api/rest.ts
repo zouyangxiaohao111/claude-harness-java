@@ -1,14 +1,14 @@
 /**
  * REST API 客户端 · 与 nexusai-backend (Spring Boot) 对接
  *
- * <p>BASE_URL 在 Tauri dev 模式下指向本机后端。
- * <p>生产环境打包后，Tauri WebView 走 tauri:// 协议，需要在 Rust 端用 tauri-plugin-http 代理。
+ * <p>BASE_URL 由 {@link ./base} 单一来源给出（dev 相对路径 + vite proxy；打包绝对地址）。
  * <p>v1 只做最小可用：原生 fetch + JSON + 错误归一化（RFC 7807 Problem → ApiError）。
  */
 
-// Phase 7 dev 联调固定 localhost:3458
-// 后续做 Phase 7.1（生产环境）时换为 tauri-plugin-http
-const BASE_URL = 'http://localhost:3458/api/v1'
+import { API_V1_BASE } from './base'
+
+/** 主 API 根（含 /v1）· 单一来源见 ./base */
+const BASE_URL = API_V1_BASE
 
 export class ApiError extends Error {
   status: number

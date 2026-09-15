@@ -92,15 +92,19 @@ class ScheduleControllerCreateDurableTest {
     }
 
     @Test
-    @DisplayName("①-b scope 缺省（= DURABLE）同样 ⇒ 400（前端不发 scope 时的实际形态）")
-    void defaultScopeDurableWithoutSessionId_is400() throws Exception {
+    @DisplayName("①-b [acc8] scope 缺省 ⇒ **不再**走 DURABLE 判据（对齐 CC 默认 session-only）⇒ 委派给 service")
+    void defaultScopeWithoutSessionId_delegatesInsteadOfDurableJudgement() throws Exception {
+        // [acc8 · 用户裁定 · 对齐 CC] 缺省 scope 由 DURABLE 改为 SESSION（CC CronCreateTool.ts:117
+        //   `durable = false` 默认 + ScheduleCronTool/prompt.ts:78「By default … lives only in this
+        //   Claude session」）⇒ Controller 的 ①a/②/③ 三条 DURABLE 判据**不再适用**于缺省形态。
+        //   ⛔ 与 ScheduleService.create 的缺省**同改**（两处都 SESSION），否则同一能力两套判据。
         mockMvc.perform(post("/api/v1/schedules")
                 .contentType(APPLICATION_JSON)
                 .content(body("")))
-            .andExpect(status().isBadRequest())
-            .andExpect(jsonPath("$.title").value("Validation Failed"));
+            .andExpect(status().isCreated());
 
-        verify(service, never()).create(any());
+        // 委派给 service（缺省形态的 400 由 service 侧 SESSION 校验给出，不在 Controller 层）
+        verify(service).create(any());
     }
 
     @Test

@@ -44,11 +44,13 @@ import org.slf4j.LoggerFactory;
  *                    TS `console.log` → 返回 String (上层负责输出,testable).
  *
  * <p><b>D4/去重② 接线（探查 GAP-1/DC-2）</b>：本类此前 0 生产调用方（孤儿死代码），
- * `claude agents` 等价列表端点后端不可达。现注入 {@link SubagentTool}（agentRegistry）并暴露
+ * `claude agents` 等价列表端点后端不可达。现注入 {@link SubagentTool} 并暴露
  * {@code GET /api/agents} 端点 → 返回对齐 CC agents.ts 的 agent 列表文本，使 AgentsHandler
  * 成为生产可达的 agents 端点。
  * 【IMP-SUB-04 REWORK】不再声称"注入 getAgentColor 读侧 D11"——本端点实际只用
- * {@link SubagentTool#listAgents()}；getAgentColor 读侧显式登记为待前端消费（见 SubagentTool）。
+ * {@link SubagentTool#listAgents(String)}；getAgentColor 读侧显式登记为待前端消费（见 SubagentTool）。
+ * 【acc8/D4 根治】原为 0 参 {@code listAgents()}（恒进程默认视图）；现补可选 {@code sessionId}
+ * 查询参数走会话视图，见 {@link #agents(String)}。
  */
 @RestController
 @RequestMapping("/api/agents")
@@ -61,7 +63,7 @@ public final class AgentsHandler {
     private final Function<ResolvedAgent, String> modelDisplayResolver;
 
     /**
-     * 生产数据源（agentRegistry）· 对齐 CC agents.ts {@code getAgentDefinitionsWithOverrides}
+     * 生产数据源（{@link SubagentTool#listAgents(String)}）· 对齐 CC agents.ts {@code getAgentDefinitionsWithOverrides}
      * （registry 已 6 组覆盖合并 = activeAgents）。
      * {@code @Autowired(required=false)}：plain JUnit（无 Spring 容器）缺省 null → 端点
      * 返回 "No agents found."（不 NPE，保测试兼容）。
@@ -119,40 +121,43 @@ public final class AgentsHandler {
      * agents 列表端点 · 对齐 CC {@code agentsHandler()}（agents.ts:32-70）。
      *
      * <p>CC 编排：{@code getAgentDefinitionsWithOverrides(cwd) → getActiveAgentsFromList →
-     * resolveAgentOverrides → format}。Java 等价：{@link SubagentTool#listAgents()}（registry 已
+     * resolveAgentOverrides → format}。Java 等价：{@link SubagentTool#listAgents(String)}（registry 已
      * 6 组覆盖合并 = activeAgents）+ 本类 format。
      *
      * <p>WHY（探查 GAP-1/M-1）：Java 侧各组件上游存在但 agentsHandler 入口 0 生产调用方 → 端点
      * 缺失使 `claude agents` 等价命令后端不可达。本端点补上生产入口。
      *
-     * <p><b>[acc7/D4 已裁定：无会话源，保持 0 参 + ≥WARN]</b>：本 {@code @GetMapping} 无 sessionId
-     * 查询参数（同类 {@link #list(String)} 有 {@code @RequestParam(required=false) String sessionId}），
-     * 且 MDC/RequestContext 已按本仓铁律禁为会话源（threadlocal-session-state-global-ban）⇒
-     * {@link SubagentTool#listAgents()} 只能给<b>进程默认</b>（workspaceDir）agent-defs。
-     * 详见 {@link #agents()} 内注释。根治选项（补可选 {@code sessionId} 查询参数并改调
-     * {@link SubagentTool#listAgents(String)}，对齐 {@link #list(String)} 手法）需用户决策后另行施工。
+     * <p><b>[acc8/D4 根治：补可选 sessionId，走会话视图]</b>：CC 的 {@code agentsHandler} 取的是
+     * <b>cwd 维度</b>的 agent 定义（{@code getAgentDefinitionsWithOverrides(cwd)}，cwd = 当前会话
+     * 启动目录）⇒ 会话是它的必要输入。原 0 参实现只能给<b>进程默认</b>（workspaceDir）视图
+     * （acc7 已登记该缺口并 ≥WARN）。现补 {@code @RequestParam(required = false) String sessionId}，
+     * 手法与同类 {@link #list(String)} 完全一致：会话非空 → 该会话冻结发现 cwd 的 per-session 视图；
+     * 空/null → 进程默认兜底 + ≥WARN。
      *
+     * <p><b>⛔ 保持「可选」，不因缺参 400</b>：本端点是 `claude agents` 等价命令的文本面，
+     * 需支持无会话的裸 {@code curl} / CLI 调用（传 sessionId 反而无从谈起）⇒ 缺参是<b>合法形态</b>，
+     * 只是降级为进程默认并留下可诊断的 WARN。
+     *
+     * @param sessionId 会话 ID（可选 · null/空白 → 进程默认 workspaceDir 视图 + ≥WARN）
      * @return 对齐 CC agents.ts 文本（"{count} active agents\n\n{lines}" / "No agents found."）
      */
     @GetMapping
-    public String agents() {
+    public String agents(@RequestParam(required = false) String sessionId) {
         if (subagentTool == null) {
             log.warn("[AgentsHandler] SubagentTool 未注入，agents 端点返回空（plain JUnit 无 Spring 容器）");
             return "No agents found.";
         }
-        // [acc7/D4 已裁定：本端点<b>确实无</b>会话源] 两层判据：
-        //   ① 本 @GetMapping 签名无任何请求参数（既无 sessionId 形参，也无 HTTP 会话域）；
-        //   ② 进程内唯一「隐式会话源」RequestContext（MDC）已被本仓铁律禁读
-        //      （threadlocal-session-state-global-ban：「会话态一律不得经 ThreadLocal/MDC 读」，
-        //       且 RequestContext.sessionId() 存在「上一请求残留会话 id」第三态，比 null 更坏）
-        //   ⇒ 会话源不可得。⛔ 禁发明会话 id、禁静默退化 ⇒ 走 0 参 listAgents()（进程默认
-        //   workspaceDir agent-defs）并 ≥WARN（对齐 T15-3 F2/F3 治法）。
-        //   根治选项（需用户决策，本批未做）：给本端点补可选 @RequestParam sessionId 改调
-        //   listAgents(String)，手法同同类 {@link #list(String)}（:189）—— 会新增前端契约面，
-        //   超出本批授权（见派单书 D4「⛔ 不要为了改而改硬塞假 sessionId」）。
-        log.warn("[AgentsHandler] agents 端点无会话源（无 sessionId 请求参数；MDC/RequestContext 已禁读）"
-            + " → agent 列表按进程默认（workspaceDir）agent-defs，多项目部署下可能与当前会话不一致");
-        List<AgentDefinition> allAgents = subagentTool.listAgents();
+        // 会话源只能来自**显式请求参数**：⛔ 禁读 MDC/RequestContext
+        // （threadlocal-session-state-global-ban：「会话态一律不得经 ThreadLocal/MDC 读」，
+        //   且 RequestContext.sessionId() 存在「上一请求残留会话 id」第三态，比 null 更坏）。
+        boolean hasSession = sessionId != null && !sessionId.isBlank();
+        if (!hasSession) {
+            // 缺参是**合法**形态（裸 curl / CLI 等价命令），故不 400 ⇒ 降级进程默认 + ≥WARN
+            //   （对齐 T15-3 F2/F3 治法：禁静默退化）。多项目部署下该视图可能与当前会话不一致。
+            log.warn("[AgentsHandler] agents 端点未带 sessionId → agent 列表按进程默认（workspaceDir）"
+                + "agent-defs，多项目部署下可能与当前会话不一致");
+        }
+        List<AgentDefinition> allAgents = subagentTool.listAgents(sessionId);
         if (allAgents == null || allAgents.isEmpty()) {
             return "No agents found.";
         }

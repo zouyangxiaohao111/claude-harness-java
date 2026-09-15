@@ -1,12 +1,14 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { CatLoader } from './CatLoader'
 import { expandFromSplash } from '@/utils/tauri-bridge'
+import { API_V1_BASE } from '@/api/base'
 
 /** 后端就绪探测地址（业务端点，200 即视为后端就绪）。
  *  用 /api/v1/settings 而非 /actuator/health：后端 CORS 只放行 /api/**，
  *  /actuator 不在白名单 → tauri 源（tauri://localhost / http://tauri.localhost）下请求会被 CORS 拦截，
- *  事件 miss 时兜底探测永远探不通（卡 ~15s 进错误卡）。改走 CORS 内业务端点。 */
-const READY_URL = 'http://localhost:3458/api/v1/settings'
+ *  事件 miss 时兜底探测永远探不通（卡 ~15s 进错误卡）。改走 CORS 内业务端点。
+ *  地址单一来源见 @/api/base（dev 相对路径 + vite proxy；打包绝对地址）。 */
+const READY_URL = `${API_V1_BASE}/settings`
 const READY_POLL_MS = 500
 const READY_TIMEOUT_MS = 15_000
 

@@ -129,6 +129,25 @@ class ScheduleServiceCreateStorageTest {
     }
 
     @Test
+    @DisplayName("[acc8 对齐 CC] scope 缺省 ⇒ 落库为 SESSION（CC durable=false 默认；原默认 DURABLE 是反的）")
+    void defaultScopeIsSession_ccAligned() {
+        // CC 真源：CronCreateTool.ts:117 `durable = false`（缺省）+ ScheduleCronTool/prompt.ts:78
+        //   「By default (durable: false) the job lives only in this Claude session … Only use
+        //    durable: true when the user explicitly asks for the task to persist」。
+        // 落库值由**本方法**的缺省决定（Controller 的缺省只决定走哪条校验分支、不改请求体）
+        //   ⇒ 这条断言守住「缺省 = 会话级」这一 CC 对齐点。
+        ScheduleDto dto = service.create(new ScheduleCreateRequest(
+            "acc8-default-scope", ScheduleKind.cron, "0 9 * * *", null, null,
+            "echo default", "d", /* scope 缺省（null） */ null, "sess-1", null, null, null));
+        assertThat(dto.scope())
+            .as("缺省 scope 必须落库为 SESSION（CC CronCreateTool.ts:117 durable=false）")
+            .isEqualTo(ScheduleScope.SESSION);
+        assertThat(dto.boundProject())
+            .as("SESSION 恒无项目锚（boundProject 仅 DURABLE 由 sessionId 解析落库）")
+            .isNull();
+    }
+
+    @Test
     @DisplayName("create(SESSION) 后 DB 行 createdAt/scope/sessionId 非 null（落库而非仅内存）")
     void createPersistsCreatedAtAndScope() {
         createSessionJob("b2-persist", "sess-1");

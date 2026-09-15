@@ -103,7 +103,10 @@ public class ScheduleController {
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public ScheduleDto create(@Valid @RequestBody ScheduleCreateRequest req) {
-        ScheduleScope scope = req.scope() == null ? ScheduleScope.DURABLE : req.scope();
+        // [acc8 · 用户裁定 · 对齐 CC] 缺省 scope 从 DURABLE 改为 **SESSION**（CC cron 默认 session-only，
+        //   见 ScheduleService.create 内注释的 CC 真源行号）。⚠️ **必须与 ScheduleService.create 同改**
+        //   —— 否则本处判 DURABLE、下游判 SESSION，「同一能力两套判据」。
+        ScheduleScope scope = req.scope() == null ? ScheduleScope.SESSION : req.scope();
         if (scope != ScheduleScope.DURABLE) {
             return scheduleService.create(req);
         }

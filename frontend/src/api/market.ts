@@ -1,8 +1,9 @@
 import { api } from './rest'
+import { API_BASE } from './base'
 import type { MarketConnector, MarketExpert, MarketSkill, MarketUseExpertResult } from './types'
 
-/** 技能市场 BASE：契约在 /api/market/* 下（与 agentApi /agents/list 同域 http://localhost:3458/api） */
-const MARKET_BASE = 'http://localhost:3458/api'
+/** 技能市场 BASE：契约在 /api/market/* 下（与 agentApi /agents/list 同域，地址单一来源见 ./base） */
+const MARKET_BASE = API_BASE
 
 /** 组装查询串：过滤掉 undefined/空串的键（sessionId 可选传——市场源暂与会话无关，为将来个人化/鉴权预留） */
 function buildQs(params: Record<string, string | number | undefined>): string {

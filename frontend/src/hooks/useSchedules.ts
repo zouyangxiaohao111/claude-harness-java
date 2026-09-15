@@ -21,6 +21,13 @@ export interface UseSchedules {
   /** 任意变更后调用，或挂载时显式调用（虽然 hook 已自动挂载 fetch） */
   refresh: () => Promise<void>
 
+  /**
+   * 能否创建定时任务（= 有活动会话）。
+   * ⭐ **两个 scope 都**要求会话（见 {@link createSchedule}）⇒ 无会话时 UI 应**置灰创建按钮**
+   *   （而不是让用户填完表单再吃 400 —— 该前置在对话框里改不掉，纯确定性判据）。
+   */
+  canCreate: boolean
+
   createSchedule: (req: CreateScheduleRequest) => Promise<Schedule>
   updateSchedule: (id: string, req: UpdateScheduleRequest) => Promise<Schedule>
   deleteSchedule: (id: string) => Promise<void>
@@ -31,11 +38,42 @@ export interface UseSchedules {
 export type RunNowResult = RunNowResponse & { deleted: boolean }
 
 /**
+ * 构造创建请求体（纯函数 · 可确定性单测）。
+ *
+ * <p><b>守的不变量①：两个 scope 都必须带 sessionId</b>。收口前只有 DURABLE 分支注入 sessionId，
+ * SESSION 分支直接 `{...req, scope}` —— 若调用方没自带 sessionId，后端 service
+ * （`scope=SESSION requires non-empty 'sessionId'`）必然 400。而 SESSION 的语义正是
+ * 「生命周期绑创建一个会话」，它的 sessionId 本来就该是**活动会话**，⛔ 不该由调用方指定。
+ *
+ * <p><b>守的不变量②：缺省 scope = `SESSION`</b>（对齐 CC）。CC 真源
+ * {@code CronCreateTool.ts:117} `durable = false`（默认）+ {@code ScheduleCronTool/prompt.ts:78}
+ * 「By default (durable: false) the job lives only in this Claude session … Only use durable: true
+ * when the user explicitly asks for the task to persist」。⛔ 与后端两处缺省同源
+ * （`ScheduleService.create` / `ScheduleController.create`），否则同一能力两套判据。
+ *
+ * @param activeSessionId 当前活动会话（两 scope 皆必填）
+ * @throws Error 无活动会话（注定 400，前端先给可读提示）
+ */
+export function buildCreatePayload(
+  req: CreateScheduleRequest,
+  activeSessionId?: string | null,
+): CreateScheduleRequest {
+  if (!activeSessionId) {
+    throw new Error('请先打开一个会话再创建定时任务：两种任务都需要归属一个会话')
+  }
+  return { ...req, scope: req.scope ?? 'SESSION', sessionId: activeSessionId }
+}
+
+/**
  * 定时任务 hook。
  *
- * @param activeSessionId 当前活动会话 id（后端契约：REST 直建 DURABLE 任务**必须**带一个能解析出
- *   绑定项目根（boundProject）的 sessionId —— 任务的项目锚由后端按会话推导，客户端不得指定）。
- *   无活动会话时 `createSchedule` 会**先在前端拦截**并给出可读提示，不发请求（否则必然 400）。
+ * @param activeSessionId 当前活动会话 id。⭐ **创建的必备前置（两 scope 皆然）**：
+ *   - `DURABLE`：后端 REST 边界要求该 id 能解析出绑定项目根（boundProject），否则 400
+ *     （`ScheduleController.create` 三段判据；任务的项目锚由后端按会话推导，客户端不得指定）；
+ *   - `SESSION`：后端 service 层要求非空（`ScheduleService.create` `scope=SESSION requires
+ *     non-empty 'sessionId'`），且会话必须存在 —— 会话不存活时任务既不 fire
+ *     （`CronIdleExecutor` 要求 SESSION 命令会话存活）也不会被 closeSession 清理 ⇒ 成孤儿。
+ *   ⇒ 无活动会话时 `createSchedule` **先在前端拦截**并给出可读提示，不发这一次注定 400 的请求。
  */
 export function useSchedules(activeSessionId?: string | null): UseSchedules {
   const [list, setList] = useState<Schedule[]>([])
@@ -78,18 +116,10 @@ export function useSchedules(activeSessionId?: string | null): UseSchedules {
 
   // ---- Schedule CRUD ----
   const createSchedule = useCallback(async (req: CreateScheduleRequest): Promise<Schedule> => {
-    // 后端契约（[cwd3]）：REST 直建 DURABLE 必须带能解析出绑定项目根的 sessionId；
-    // 缺 id / 传哨兵 / 解析不到 ⇒ 400（Validation Failed / Unresolved Project Root）。
-    // ⇒ 前端先拦截：无活动会话时直接给可读提示，不发这一次注定 400 的请求。
-    const scope = req.scope ?? 'DURABLE'
-    if (scope === 'DURABLE' && !activeSessionId) {
-      throw new Error('请先打开一个会话再创建定时任务：任务需要归属一个已绑定项目的会话')
-    }
-    // DURABLE：sessionId 一律取当前活动会话（⛔ 不由调用方传，避免传错会话把任务锚到别的项目）；
-    // 后端还会用 sessionId 解析结果**覆盖**请求体里的 boundProject ⇒ 客户端无锚可伪造。
-    const payload: CreateScheduleRequest =
-      scope === 'DURABLE' ? { ...req, scope, sessionId: activeSessionId! } : { ...req, scope }
-    const created = await scheduleApi.create(payload)
+    // 两 scope 的 sessionId 一律取当前活动会话（⛔ 不由调用方传，避免传错会话把任务锚到别的项目）；
+    // DURABLE 下后端还会用 sessionId 解析结果**覆盖**请求体里的 boundProject ⇒ 客户端无锚可伪造。
+    // 无活动会话 ⇒ buildCreatePayload 抛（UI 侧另由 canCreate 置灰按钮，这是防旁路的最后一道闸）。
+    const created = await scheduleApi.create(buildCreatePayload(req, activeSessionId))
     setList((prev) => [...prev, created])
     return created
   }, [activeSessionId])
@@ -119,6 +149,7 @@ export function useSchedules(activeSessionId?: string | null): UseSchedules {
 
   return {
     list, loading, error, refresh,
+    canCreate: !!activeSessionId,
     createSchedule, updateSchedule, deleteSchedule, runNow,
   }
 }

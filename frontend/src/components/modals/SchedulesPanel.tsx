@@ -4,6 +4,7 @@ import { ApiError } from '@/api/rest'
 import type {
   Schedule,
   ScheduleKind,
+  ScheduleScope,
   CreateScheduleRequest,
   UpdateScheduleRequest,
 } from '@/api/types'
@@ -25,6 +26,32 @@ const KIND_LABEL: Record<ScheduleKind, string> = {
   cron: 'Cron',
   once: '单次',
   interval: '间隔',
+}
+
+/**
+ * 生命周期选项 · 文案用**代码核出来的真差别**（生命周期 vs 归属），⛔ 不写「全局 / 会话级」这种
+ * 二元对立 —— 两个 scope **都带 sessionId**（后端无条件落库），区别不在「有没有会话」，
+ * 而在「会话结束后会怎样」。依据：`ScheduleScope` 枚举 javadoc +
+ * `ScheduleService.create`（`cleanupBySession` 只按 scope=SESSION 过滤）+ `CronIdleExecutor`
+ * （SESSION 命令要求会话存活，会话已关不消费；DURABLE 照常 fire，headless 代跑）。
+ */
+const SCOPE_OPTIONS: { value: ScheduleScope; label: string; hint: string }[] = [
+  {
+    value: 'SESSION',
+    label: '仅本会话（会话结束即清理）· 默认',
+    hint: '只在这个会话活着时触发；会话一关，任务被自动清理，不再运行。',
+  },
+  {
+    value: 'DURABLE',
+    label: '持久（跨重启保留）',
+    hint: '会话关闭后仍继续触发（无界面后台运行）；任务归属创建它的会话，用于记录运行上下文。',
+  },
+]
+
+/** 列表徽标用的短标签（scope 缺省按 DURABLE 兜底，对齐后端 lookupScope） */
+const SCOPE_LABEL: Record<ScheduleScope, string> = {
+  DURABLE: '持久',
+  SESSION: '仅本会话',
 }
 
 const EditIcon = () => (
@@ -131,13 +158,19 @@ export function cronToHuman(cron: string): string {
   return singleCronToHuman(cron) ?? `${cron}（未识别调度）`
 }
 
-/** 归属短标签（截断显示）· 会话 > agent > 项目；全无 → 全局 */
+/** 归属短标签（截断显示）· 会话 > agent > 项目；全无 → 无归属 */
 const shortId = (id?: string | null) => (id && id.length > 10 ? `${id.slice(0, 8)}…` : id ?? '')
+/**
+ * 行徽标 = 「生命周期 · 归属」。⛔ 必须同时给出 scope —— 只看归属会把两种任务显示成一样
+ * （两 scope **都带 sessionId**），用户就分不清「会话关了这任务还跑不跑」。
+ */
 function scopeLabel(s: Schedule): string {
-  if (s.sessionId) return `会话${s.agentId ? `·${shortId(s.agentId)}` : ''}`
-  if (s.agentId) return `agent·${shortId(s.agentId)}`
-  if (s.boundProject) return `项目·${s.boundProject}`
-  return '全局'
+  const scope = s.scope === 'SESSION' ? 'SESSION' : 'DURABLE'
+  const who = s.sessionId ? `会话${s.agentId ? `·${shortId(s.agentId)}` : ''}`
+    : s.agentId ? `agent·${shortId(s.agentId)}`
+    : s.boundProject ? `项目·${s.boundProject}`
+    : '无归属'
+  return `${SCOPE_LABEL[scope]} · ${who}`
 }
 
 /**
@@ -148,7 +181,7 @@ function scopeLabel(s: Schedule): string {
  * <p>"立即运行" 调真实 /run 端点，toast 显示后端返回的 executed/output。
  */
 export function SchedulesPanel({ schedulesApi, showToast }: SchedulesPanelProps) {
-  const { list, loading, error, createSchedule, updateSchedule, deleteSchedule, runNow } = schedulesApi
+  const { list, loading, error, canCreate, createSchedule, updateSchedule, deleteSchedule, runNow } = schedulesApi
 
   const [editing, setEditing] = useState<Schedule | null>(null)
   const [addingKind, setAddingKind] = useState<ScheduleKind | null>(null)
@@ -207,12 +240,18 @@ export function SchedulesPanel({ schedulesApi, showToast }: SchedulesPanelProps)
             基于 Quartz 的自动化任务
             {loading && ' · 加载中…'}
             {error && <span style={{ color: 'var(--error)', marginLeft: 8 }}>· {error}</span>}
+            {/* 无活动会话 ⇒ 两种 scope 都建不了（后端 400）⇒ 置灰按钮 + 就地说明，
+                ⛔ 不让用户填完整张表单再吃一次注定失败的报错。 */}
+            {!canCreate && (
+              <span style={{ marginLeft: 8 }}>· 请先打开一个会话再添加：任务需要归属一个会话</span>
+            )}
           </div>
         </div>
         <button
           className="settings-add-btn"
           onClick={() => setAddingKind('cron')}
-          disabled={pending}
+          disabled={pending || !canCreate}
+          title={canCreate ? undefined : '请先打开一个会话再添加定时任务'}
         >
           + 添加调度
         </button>
@@ -411,6 +450,8 @@ const buildRequest = (form: ScheduleEditFormValue | AddFormValue, kind: Schedule
 interface AddFormValue {
   name: string
   description: string
+  /** 生命周期（用户可选）· 默认 SESSION（与后端两处 `req.scope == null → SESSION` 一致，对齐 CC） */
+  scope: ScheduleScope
   // dispatch by kind
   cron: string
   intervalSeconds: number
@@ -422,6 +463,7 @@ interface AddFormValue {
 const emptyAddForm = (kind: ScheduleKind): AddFormValue => ({
   name: '',
   description: '',
+  scope: 'SESSION',
   cron: '0 0 * * *',
   intervalSeconds: 3600,
   runAt: '',
@@ -447,7 +489,10 @@ function ScheduleAddModal({
 
   const onSubmit = async (v: AddFormValue) => {
     setForm(v)
-    const req = buildRequest(v, kind) as CreateScheduleRequest
+    // scope 只在**创建**时提交（⛔ buildRequest 不带它 —— 编辑路径复用同一个 buildRequest，
+    //   而 [cwd3 D6] update 带 scope/sessionId 会被后端 400 拒绝）
+    const scope: ScheduleScope = v.scope ?? 'SESSION'
+    const req = { ...buildRequest(v, kind), scope } as CreateScheduleRequest
     await onSave(req)
   }
 
@@ -499,6 +544,23 @@ function ScheduleAddModal({
                 value={form.description}
                 onChange={(e) => setForm((p) => ({ ...p, description: e.target.value }))}
               />
+            </div>
+          </div>
+          <div className="fm-row">
+            <div className="fm-field">
+              <label className="fm-field-label">任务生命周期</label>
+              <select
+                className="fm-select"
+                value={form.scope}
+                onChange={(e) => setForm((p) => ({ ...p, scope: e.target.value as ScheduleScope }))}
+              >
+                {SCOPE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <div className="fm-field-hint">
+                {SCOPE_OPTIONS.find((o) => o.value === form.scope)?.hint}
+              </div>
             </div>
           </div>
 

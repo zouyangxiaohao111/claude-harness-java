@@ -491,22 +491,25 @@ class AgentColorCommandTest {
     }
 
     /**
-     * <b>[acc7/D4] {@code GET /api/agents} 无会话源 ⇒ 0 参 {@code listAgents()} + ≥WARN</b>。
+     * <b>[acc8/D4 根治] {@code GET /api/agents} 带 sessionId ⇒ 走会话视图；不带 ⇒ 进程默认 + ≥WARN</b>。
      *
-     * <p>WHY（规则九 / 本仓铁律 threadlocal-session-state-global-ban）: 本端点签名无 sessionId 参数，
-     * MDC/RequestContext 又被禁为会话源 ⇒ 会话源<b>确实不可得</b>。两个后果都必须被钉住：
+     * <p>WHY（规则九 / 本仓铁律 threadlocal-session-state-global-ban）：会话源<b>只能来自显式请求参数</b>
+     * （MDC/RequestContext 禁读）。两个方向都必须被钉住 —— 只测一侧是「只覆盖一侧」写法：
      * <ol>
-     *   <li>⛔ <b>不得发明会话 id</b>（禁 {@code registryForSession(假 id)} 硬塞）—— 否则会把
-     *       「进程默认」伪装成「某会话视图」，比 null 更坏（RequestContext 第三态前车之鉴）；</li>
-     *   <li>静默退化不可接受 ⇒ 必须 ≥WARN（对齐 T15-3 F2/F3 治法）。</li>
+     *   <li><b>传 sessionId</b> ⇒ 必须把该 id 透传到会话视图（对齐同类 {@code /list}），
+     *       否则前端拿到的仍是进程默认表（多项目部署下与当前会话不一致）；</li>
+     *   <li><b>不传</b> ⇒ 是<b>合法</b>形态（裸 curl / `claude agents` 等价命令）⇒ ⛔ 不抛错，
+     *       降级进程默认，并 ≥WARN（静默退化不可接受，对齐 T15-3 F2/F3）。</li>
      * </ol>
      */
     @Test
-    @DisplayName("[acc7/D4] agents 端点无会话源 → 0 参 listAgents() + ≥WARN，且不发明会话 id")
-    void agentsEndpoint_noSessionSource_warnsAndDoesNotInventSessionId() throws Exception {
+    @DisplayName("[acc8/D4] agents 端点：传 sessionId 走会话视图；不传 → 进程默认 + ≥WARN（不抛错）")
+    void agentsEndpoint_sessionViewVsProcessDefault() throws Exception {
         AgentsHandler h = new AgentsHandler();
         SubagentTool tool = org.mockito.Mockito.mock(SubagentTool.class);
-        org.mockito.Mockito.when(tool.listAgents()).thenReturn(List.<com.nexusai.application.agent.subagent.AgentDefinition>of());
+        // 两种入参都返回空列表（此处只验**接线**：参数是否真的透传到会话视图；
+        //   视图内容本身由 SubagentTool 的单测覆盖 —— ⛔ 不在此处用假 registry 复刻语义）
+        org.mockito.Mockito.when(tool.listAgents(org.mockito.ArgumentMatchers.any())).thenReturn(List.of());
         Field field = AgentsHandler.class.getDeclaredField("subagentTool");
         field.setAccessible(true);
         field.set(h, tool);
@@ -518,19 +521,23 @@ class AgentColorCommandTest {
         appender.start();
         logger.addAppender(appender);
         try {
-            assertThat(h.agents()).isEqualTo("No agents found.");
-
-            // ① 走 0 参（进程默认）访问器
-            org.mockito.Mockito.verify(tool).listAgents();
-            // ② ⛔ 绝不经会话显式重载 —— 本端点无会话源，任何 registryForSession(x) 都是发明会话 id
+            // ① 传 sessionId ⇒ 必须把该 id **原样透传**到会话视图访问器
+            assertThat(h.agents("sess-A")).isEqualTo("No agents found.");
+            org.mockito.Mockito.verify(tool).listAgents("sess-A");
+            // ⛔ 只许经会话显式访问器，不得旁路 registryForSession（会话源必须只有形参一个）
             org.mockito.Mockito.verify(tool, org.mockito.Mockito.never())
                 .registryForSession(org.mockito.ArgumentMatchers.any());
 
+            // ② 不传 ⇒ 合法形态：不抛错、降级进程默认、且留下 ≥WARN
+            assertThat(h.agents(null))
+                .as("缺参是合法形态（裸 curl / CLI 等价命令）⇒ 不得抛错，降级进程默认视图")
+                .isEqualTo("No agents found.");
+            org.mockito.Mockito.verify(tool).listAgents(null);
             assertThat(appender.list.stream()
                     .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
                     .toList())
-                .as("无会话源 ⇒ 必须留下 ≥WARN（静默退化不可接受）")
-                .anyMatch(m -> m.contains("agents 端点无会话源"));
+                .as("缺参 ⇒ 必须留下 ≥WARN（静默退化不可接受）")
+                .anyMatch(m -> m.contains("agents 端点未带 sessionId"));
         } finally {
             logger.detachAppender(appender);
         }

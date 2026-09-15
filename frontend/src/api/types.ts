@@ -269,6 +269,17 @@ export interface UpdateDatabaseRequest extends Partial<Omit<CreateDatabaseReques
 
 // ---- Schedule ----
 export type ScheduleKind = 'cron' | 'once' | 'interval'
+/**
+ * 任务生命周期（后端 ScheduleScope 枚举）。
+ * - `SESSION`（**默认** · 对齐 CC `CronCreateTool.ts:117` `durable = false`）：**仅存活于该会话**
+ *   —— 会话结束自动清理（后端 `cleanupBySession`）；`sessionId` 表示**生命周期绑定**；
+ *   会话已关则**不再消费**。
+ * - `DURABLE`：落盘持久，跨进程/重启保留；`sessionId` 表示**归属对话/注入目标**
+ *   （fire 时 transcript 归创建会话；创建会话已关则 headless 代跑）。
+ * ⚠️ 两者**都带 sessionId**（后端无条件落库），生命周期判定以 scope 列为权威。
+ * ⚠️ 缺省值只管**新建**；存量行读侧以落库的 scope 列为权威，不因缺省值改动而变化。
+ */
+export type ScheduleScope = 'DURABLE' | 'SESSION'
 export interface Schedule {
   id: string
   name: string
@@ -280,11 +291,16 @@ export interface Schedule {
   description: string
   lastRunAt: string | null
   lastRunStatus: string | null
-  /** 归属：scope=SESSION 时绑定会话（DURABLE 全局任务恒 null）· 设置页归属标注 */
+  /**
+   * 生命周期（后端 `ScheduleDto.scope`）。两 scope 都带 sessionId，⛔ 不要用它反推 scope。
+   * 缺省（旧行 scope 列为 NULL）时按 `DURABLE` 处理（对齐后端 lookupScope 兜底）。
+   */
+  scope?: ScheduleScope | null
+  /** 归属/绑定的会话（见 {@link ScheduleScope}：DURABLE=归属对话，SESSION=生命周期绑定） */
   sessionId?: string | null
-  /** 创建者 teammate agentId（主线程/DURABLE 恒 null） */
+  /** 创建者 teammate agentId（主线程恒 null） */
   agentId?: string | null
-  /** DURABLE 任务绑定项目（无会话 REST 直建→null；SESSION 恒 null） */
+  /** 任务的项目锚 · 仅 DURABLE 非 null（由后端按 sessionId 解析并覆盖请求体，客户端不可伪造）；SESSION 恒 null */
   boundProject?: string | null
 }
 export interface CreateScheduleRequest {
@@ -296,17 +312,19 @@ export interface CreateScheduleRequest {
   command?: string              // hidden from UI but accepted in API
   description?: string
   /**
-   * 任务归属会话（[cwd3]）。`scope=DURABLE`（默认）时**必填**：后端从它解析任务的项目锚
-   * （boundProject），并**忽略**请求体里的 boundProject（防客户端伪造锚）。缺 id / 传 "no-session"
-   * 哨兵 / 解析不到绑定项目根 ⇒ 400。
-   * ⚠️ `scope=SESSION` 也用它（生命周期随会话清理）。
+   * 任务所属会话（[cwd3]）。**两个 scope 都必填**（REST 路径）：
+   * - `DURABLE`：后端从它解析任务的项目锚（boundProject），并**忽略**请求体里的 boundProject
+   *   （防客户端伪造锚）。缺 id / 传 "no-session" 哨兵 / 解析不到绑定项目根 ⇒ 400。
+   * - `SESSION`：仅要求非空（后端 service 层校验），语义是**生命周期绑定**。
+   * ⇒ 无活动会话时**两种任务都建不了**（前端置灰按钮并说明，见 SchedulesPanel）。
    */
   sessionId?: string
   /**
-   * 生命周期：DURABLE（默认，落库跨重启）| SESSION（随会话结束清理）。
-   * ⚠️ [cwd3] **创建后不可变** —— update 请求带 scope/sessionId 会被后端 400 拒绝。
+   * 生命周期：`SESSION`（默认 · 对齐 CC）| `DURABLE`。缺省由后端两处三元决定
+   * （`ScheduleController.create` / `ScheduleService.create`，同为 SESSION），UI 选择器初值同。
+   * ⚠️ [cwd3 D6] **创建后不可变** —— update 请求带 scope/sessionId 会被后端 400 拒绝。
    */
-  scope?: 'DURABLE' | 'SESSION'
+  scope?: ScheduleScope
 }
 export interface UpdateScheduleRequest extends Partial<CreateScheduleRequest> {}
 

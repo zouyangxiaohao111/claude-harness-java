@@ -210,7 +210,17 @@ public class ScheduleService {
         }
         validateKindFields(kind, req);
         // s14-P1-5: SESSION scope 必须带 sessionId (CC addSessionCronTask 强绑定 session)
-        ScheduleScope scope = req.scope() == null ? ScheduleScope.DURABLE : req.scope();
+        //
+        // [acc8 · 用户裁定 · 对齐 CC] 缺省 scope 从 DURABLE 改为 **SESSION**。
+        //   CC 真源：CronCreateTool.ts:117 {@code durable = false}（默认）+ ScheduleCronTool/prompt.ts:78
+        //   「By default (durable: false) the job lives only in this Claude session … Only use
+        //    durable: true when the user explicitly asks for the task to persist」
+        //   ⇒ CC 默认 = 会话级；本仓原默认 DURABLE 是**反的**（偏离）。现拉平。
+        //   ⚠️ 与 {@code ScheduleController.create} 的缺省**必须同改**，否则 Controller 判 DURABLE、
+        //      本方法判 SESSION ⇒ 同一能力两套判据（本仓反复栽过的失效模式）。
+        //   ⚠️ 存量行**不受影响**：scope 已随创建落库（V8+），读侧一律以 scope 列为权威
+        //      （见 {@link #lookupScope}）⇒ 老的 DURABLE 任务不会因本改动变成 SESSION。
+        ScheduleScope scope = req.scope() == null ? ScheduleScope.SESSION : req.scope();
         String sessionId = req.sessionId();
         if (scope == ScheduleScope.SESSION && (sessionId == null || sessionId.isBlank())) {
             throw new ValidationException("scope=SESSION requires non-empty 'sessionId'");
@@ -1275,6 +1285,11 @@ public class ScheduleService {
         for (var entry : sessionJobs.entrySet()) {
             if (entry.getValue().contains(s.getId())) return ScheduleScope.SESSION;
         }
+        // ⛔ [acc8] 本行是**存量行的读侧兜底**（scope 列为 NULL 的 V8 前旧行 / 非法值），
+        //   与「**新建**任务的缺省 scope」是**两件不相干的事** —— 后者对齐 CC 已是 SESSION
+        //   （见 {@link #create}）。此处按 DURABLE 处理是因为：旧行当年按 durable=true 落盘，
+        //   且 sessionJobs 已查不到 ⇒ 只能视为持久任务。⛔ 不要为了「默认值一致」把本行也改成
+        //   SESSION —— 那会把存量持久任务误判成会话级（会话一关就被 cleanupBySession 删掉）。
         return ScheduleScope.DURABLE;
     }
 

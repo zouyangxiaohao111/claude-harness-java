@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { chromeExtensionDir, chromeExtensionZipPath, installChromeExtension, isChromeInstalled } from '@/utils/chromeExtension'
 import { api } from '@/api/rest'
+import { BACKEND_WS_ORIGIN } from '@/api/base'
 
 /**
  * NexusAI in Chrome 连接面板（FNT-BROWSER-01）· 命令 /chrome
@@ -106,7 +107,7 @@ export function ChromePanel({ sessionId, onClose }: { sessionId: string; onClose
             : ' 打包版扩展目录与 zip 备份随安装包分发到安装目录（extension / extension-pack\\nexusai-extension.zip）；此处未拿到真实路径，可点上方「检查浏览器状态」刷新。'),
     },
     { title: '打开扩展面板点「连接」', desc: '点击浏览器右上角扩展图标（拼图），在 NexusAI in Chrome popup 中点击「连接」一次（无需填写 sessionId）。' },
-    { title: '全局连接已建立', desc: '扩展连上 ws://localhost:3458/ws/browser（hello 不带 sessionId），一个连接服务所有会话；面板「扩展 WS 连接」显示已连接。' },
+    { title: '全局连接已建立', desc: `扩展连上 ${BACKEND_WS_ORIGIN}/ws/browser（hello 不带 sessionId），一个连接服务所有会话；面板「扩展 WS 连接」显示已连接。` },
     { title: '在任意会话中使用', desc: '后端按 sessionId 路由浏览器工具调用，每个会话自动分配自己的浏览器标签页（对齐 CCB「每个对话自己的新 tab」）。' },
   ]
 

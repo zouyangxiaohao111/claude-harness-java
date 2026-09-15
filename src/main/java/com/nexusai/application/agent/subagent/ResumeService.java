@@ -47,7 +47,7 @@ import java.util.stream.Collectors;
  *       （web 端点）→ parentState=null → 重建返 null，CC :1006 同语义 → loop 保持默认 create）</li>
  *   <li>worktree stat 校验 + 父 cwd 兜底 + utimes（:82-97）</li>
  *   <li>agent 解析（:100-112，fork → ForkSubagentAgentDefinition；否则 activeAgents.find ——
- *       [RES-R6] 经 {@link SubagentTool#agentRegistry()} 的 {@link AgentDefinitionRegistry}
+ *       [RES-R6] 经 {@link SubagentTool#agentRegistry(String)} 的 {@link AgentDefinitionRegistry}
  *       命中自定义 agent，registry 不可得回退 {@link BuiltInAgents#get}；未命中 → GENERAL_PURPOSE_AGENT）</li>
  *   <li>forkParentSystemPrompt 继承（:116-148，renderedSystemPrompt 优先 —— web 端点以主会话
  *       {@link AgentState#systemPrompt()} 等价；[RES-R6-1] rendered 不可得 → getSystemPrompt
@@ -313,7 +313,7 @@ public class ResumeService {
      * agent 解析 · 对齐 CC resumeAgent.ts:100-112。
      *
      * <p>fork → ForkSubagentAgentDefinition；否则 activeAgents.find —— [RES-R6] 扩展为经
-     * {@link SubagentTool#agentRegistry()} 暴露的 {@link AgentDefinitionRegistry} 命中自定义 agent
+     * {@link SubagentTool#agentRegistry(String)} 暴露的 {@link AgentDefinitionRegistry} 命中自定义 agent
      * （内置 + 自定义合并，custom 覆盖 builtIn，loadAgentsDir.ts:216；CC :106-109
      * {@code activeAgents.find(a => a.agentType === meta.agentType)}）；registry 不可得
      * （plain JUnit 未注入）→ 回退 {@link BuiltInAgents#get}（内置 + fork）；未命中 →

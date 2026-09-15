@@ -588,36 +588,13 @@ public class SubagentTool implements Tool {
     }
 
     /**
-     * [RES-R6] 暴露当前会话的 Agent 定义注册中心 · 对齐 CC {@code toolUseContext.options.agentDefinitions.activeAgents}
-     * （内置 + 自定义合并，custom 覆盖 builtIn，loadAgentsDir.ts:216）。
-     *
-     * <p>[C-方案3][DEC-C-02][REWORK-1] 从单例 registry 改为 per-session 视图：按当前会话
-     * <b>冻结的发现 cwd</b>（{@link #sessionCwdFor}，首访问捕获锚 L3 boundProject，非动态
-     * {@link CwdResolution#getCwd(String)} —— 后者含 L2 SessionCwdHolder 会随 cd/worktree 漂移；
-     * 无会话 → {@code workspaceDir} 兜底）惰性载入一次（对齐 CC memoize(cwd) + startup-cwd-fixed），
-     * 非 per-call。
-     * 供 {@link ResumeService#resolveSelectedAgent}（resume 命中自定义 agent，
-     * CC resumeAgent.ts:106-109）、PostCompactAttachmentRestorer（compact 后 agent list delta）、
-     * MemoryPrefetcher（agent-memory 预取）消费 —— 均随当前会话冻结启动目录得到各自 project 的 agent 表。
-     *
-     * <p><b>[批 3c]</b> 本无参重载的会话源（裸 MDC 槽）已删除 → 恒为<b>进程默认</b>
-     * （workspaceDir）agent-defs。有显式会话的调用方必须改用
-     * {@link #agentRegistry(String)}（否则会把 per-session agent 表静默换成进程默认表）。
-     *
-     * @return 进程默认（workspaceDir）的 Agent 定义注册中心（恒非 null）
-     */
-    public AgentDefinitionRegistry agentRegistry() {
-        return currentRegistry();
-    }
-
-    /**
      * 按会话取 Agent 定义注册中心 · {@link #registryForSession(String)} 的语义等价重载。
      *
-     * <p><b>WHY 存在</b>：{@link #agentRegistry()} 无会话形参（原经裸 MDC 解析，批 3c 已删）——
-     * 有会话的调用方必须显式传会话，否则静默退化为进程默认 agent-defs。本重载把「会话从哪来」
-     * 钉在签名上（禁 MDC/禁回放）。
+     * <p><b>WHY 存在</b>：本仓**不再有**无参 {@code agentRegistry()}（原无参重载的裸 MDC 会话源已在
+     * 批 3c 删除，且据 CC 无对应物于批 acc8 删除便捷重载本身）—— 会话必须由调用方显式传，
+     * 否则会静默退化为进程默认 agent-defs。本方法把「会话从哪来」钉在签名上（禁 MDC/禁回放）。
      *
-     * @param sessionId 会话 ID（可 null/空白 → 进程默认兜底，与 {@link #agentRegistry()} 同）
+     * @param sessionId 会话 ID（可 null/空白 → 进程默认兜底，与 {@link #registryForSession(String)} 同）
      * @return 该会话的 Agent 定义注册中心（恒非 null）
      */
     public AgentDefinitionRegistry agentRegistry(String sessionId) {
@@ -638,8 +615,8 @@ public class SubagentTool implements Tool {
      * <p><b>[批 3c 已完成：MDC 读点删除]</b> 原 ② 的裸 MDC 会话槽已删除 —— 会话态一律显式传参，
      * 禁读 MDC/禁回放。无 ctx 的<b>有会话形参</b>访问器走
      * {@link #registryForSession(String)} / {@link #agentRegistry(String)} / {@link #listAgents(String)}；
-     * 仍无会话形参的访问器（{@link #prompt()} 因 {@code Tool.prompt()} 接口无参、{@link #listAgents()} /
-     * {@link #agentRegistry()} 保留给无会话调用方）走 ② workspaceDir 兜底（进程默认 agent-defs）。
+     * 仍无会话形参的访问器（{@link #prompt()} 因 {@code Tool.prompt()} 接口无参、{@link #listAgents()}）
+     * 走 ② workspaceDir 兜底（进程默认 agent-defs）。
      *
      * <p><b>[REWORK-1] 有会话 → 冻结发现键（非动态 sessionCwd）</b>：{@link #sessionDiscoveryCwdFor} 会话
      * 首访问捕获一次（锚 L3 boundProject = CC 启动目录），此后恒定 —— 会话内 bash cd / worktree 进入
@@ -2181,14 +2158,24 @@ public class SubagentTool implements Tool {
         }
 
         // [Phase A 任务 4] isolation/cwd 真正接入: 通过 IsolationResolver 解析有效 cwd,
-        //   并按 toolUseId 前缀 ('tool-' + call.id) 写入 WorktreeCwdTracker (session 维度追溯).
+        //   并按 toolUseId 前缀 ('tool-' + call.id) 写入 WorktreeCwdTracker.
         //   放在 filterDeniedAgents + hasRequiredMcpServers 之后, 只对真正启动的子 Agent 解析.
         //
         //   P0-2 修复: 原 key 为裸 call.id (toolUseId) 与 WorktreeCwdTracker L1 契约 (per sessionId) 冲突,
         //     导致 activeSessionCount 单调递增且 getCwd(sessionId) 拿不到. 现统一加 'tool-' 前缀表明
-        //     "本 turn 内 tool 维度追踪" 区别于 session 维度. 子 Agent 工具链真正读取 effective cwd 走
-        //     subagentCtx.toolUseContext().effectiveCwd() (SubagentExecutor Step 18 + withEffectiveCwd 透传),
-        //     本处 setCwd 仅作 session 维度可观测性写入 (监控 / 调试), 不在生产路径消费.
+        //     "本 turn 内 tool 维度追踪" 区别于 session 维度.
+        //
+        //   [acc8 复核 · ⛔ 上方的「可观测性写入」定性是错的，已更正] 本条 setCwd 是**预留**写点，
+        //     当前**无任何消费方**，故不构成「可观测性」：全仓读侧 getCwd/getWorktreeSession 的调用点
+        //     全部传 sessionKey（EnterWorktreeTool:386/429、ExitWorktreeTool:389/502/621、ChatService:3478…），
+        //     **没有一处**传 'tool-' + id；连当初被点名的监控读点 activeSessionCount() 也是 0 调用方。
+        //     ⛔ 保留写点（非死代码即删：Enter/Exit 的 session 维度链是活的，本处是同一 API 的另一维度），
+        //     但不得再声称它提供服务。
+        //
+        //   「每个工具调用在哪个 worktree」这一目的**已由另一条路完整实现**：子 Agent 的 effective cwd
+        //     经 Step 18 改写进 ToolUseContext 的 effectiveCwd 字段并由工具链直接读
+        //     （SubagentExecutor.withEffectiveCwd :432 → :2033 调用；CwdResolution:78-82 明确记录
+        //     「TUC record 字段 effectiveCwd 派生，而非线程本地覆盖」）—— 与本 tracker 无关。
         if (isolation != null || cwd != null) {
             Path explicitCwd = cwd == null ? null : Paths.get(cwd);
             // [批 subcwd D7] 兜底实参同 :2133 —— 父会话 cwd（会话态），⛔ 不用进程 user.dir。
