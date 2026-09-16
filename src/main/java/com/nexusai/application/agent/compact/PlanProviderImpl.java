@@ -21,8 +21,8 @@ import java.util.UUID;
  *   <tr><th>Java 方法</th><th>CC original</th><th>行号</th></tr>
  *   <tr><td>{@link #getPlanFilePath(UUID)}</td><td>getPlanFilePath(agentId)</td><td>plans.ts:119-129</td></tr>
  *   <tr><td>{@link #getPlan(UUID)}</td><td>getPlan(agentId)</td><td>plans.ts:135-144</td></tr>
- *   <tr><td>{@link #copyPlanForResume(UUID, String)}</td><td>copyPlanForResume</td><td>plans.ts:164-231</td></tr>
- *   <tr><td>{@link #copyPlanForFork(UUID, String)}</td><td>copyPlanForFork</td><td>plans.ts:239-264</td></tr>
+ *   <tr><td>{@link #copyPlanForResume(String, String)}</td><td>copyPlanForResume</td><td>plans.ts:164-231</td></tr>
+ *   <tr><td>{@link #copyPlanForFork(String, String)}</td><td>copyPlanForFork</td><td>plans.ts:239-264</td></tr>
  *   <tr><td>{@link #createPlanAttachmentIfNeeded(UUID)}</td><td>createPlanAttachmentIfNeeded</td><td>compact.ts:1470-1486</td></tr>
  * </table>
  *

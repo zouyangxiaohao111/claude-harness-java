@@ -85,7 +85,7 @@ class PermissionUpdatePersisterManagedOnlyTest {
         persister(projectHome, managedPolicy(tmp, true)).persist(new PermissionUpdate.AddRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(allowRule("Bash")),
-            PermissionBehavior.ALLOW));
+            PermissionBehavior.ALLOW), null);
 
         assertThat(Files.readString(file)).isEqualTo(before);
         JsonNode allow = JSON.readTree(file.toFile()).path("permissions").path("allow");
@@ -101,7 +101,7 @@ class PermissionUpdatePersisterManagedOnlyTest {
         persister(projectHome, managedPolicy(tmp, false)).persist(new PermissionUpdate.AddRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(allowRule("Bash")),
-            PermissionBehavior.ALLOW));
+            PermissionBehavior.ALLOW), null);
 
         JsonNode allow = JSON.readTree(file.toFile()).path("permissions").path("allow");
         assertThat(allow).extracting(JsonNode::asText).containsExactly("Read", "Bash");
@@ -116,7 +116,7 @@ class PermissionUpdatePersisterManagedOnlyTest {
         persister(projectHome, managedPolicy(tmp, true)).persist(new PermissionUpdate.RemoveRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(allowRule("Read")),
-            PermissionBehavior.ALLOW));
+            PermissionBehavior.ALLOW), null);
 
         JsonNode allow = JSON.readTree(file.toFile()).path("permissions").path("allow");
         assertThat(allow).isEmpty();

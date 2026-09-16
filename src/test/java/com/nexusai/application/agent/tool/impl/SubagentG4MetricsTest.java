@@ -119,6 +119,11 @@ class SubagentG4MetricsTest {
         try {
             System.setProperty("user.dir", processDir.toString());
             com.nexusai.application.agent.agent.SessionCwdHolder.set(sid, sessionDir.toString());
+            // [P10b] originalCwd 槽必须同样装夹 —— 否则 UserContextProvider 构造期
+            //   getOriginalCwdLayer(sid) 抛（DB 答「无此会话」）⇒ 整条 provider 构造失败 ⇒
+            //   resolveSystemContextText 回退空串 ⇒ 下方 doesNotContain("gitStatus") 在**空串上恒真**
+            //   ⇒ 本用例退化为死守护（文档写的反向实验不生效）。P10b 实测确认过该假绿形态。
+            com.nexusai.application.agent.agent.SessionCwdHolder.setOriginalCwd(sid, sessionDir.toString());
             // 会话层命中 ⇒ 不会落到回源器；显式装 unknown() 使「落回源」可观测为抛
             com.nexusai.common.SessionProjectRoot.setDbResolver(
                 s -> com.nexusai.common.SessionProjectRoot.Lookup.unknown());
@@ -129,6 +134,75 @@ class SubagentG4MetricsTest {
 
             assertThat(systemContext)
                 .as("⭐ 会话 cwd = 非 git 目录 ⇒ 兜底 provider 的 isGit=false ⇒ 无 gitStatus 行")
+                .doesNotContain("gitStatus");
+        } finally {
+            com.nexusai.application.agent.agent.SessionCwdHolder.reset();
+            com.nexusai.common.SessionProjectRoot.reset();
+            com.nexusai.common.SessionProjectRoot.setDbResolver(null);
+            if (savedUserDir != null) {
+                System.setProperty("user.dir", savedUserDir);
+            }
+        }
+    }
+
+    /**
+     * [P10b] 同一 executor 实例依次服务两个会话 ⇒ 各自拿到<b>自己会话</b>的 git 锚（⛔ 不得串值）。
+     *
+     * <p>WHY（守护什么）：{@code SubagentExecutor} 是 <b>Spring 单例</b>
+     * （{@code ToolRegistrationConfig:682 @Bean} 无 {@code @Scope}），且生产有两条路径在该单例上执行：
+     * {@code SkillToolImpl:1660 executeForkedSkill} 与 {@code AutonomousAgentLoop:1170 executeStreaming}
+     * —— 二者都经 {@code executeStreaming} 走到 {@code resolveSystemContextText(sessionId)}。若惰性
+     * provider 缓存在<b>实例裸字段</b>上，第 2 个会话会读到第 1 个会话冻进去的 git 锚 =
+     * <b>跨会话串值</b>（正是姊妹类 {@code SystemPromptContextProvider:21-22} javadoc 明令禁止的形态：
+     * 「CC lodash memoize 为进程级全局；Spring 多会话服务下会跨会话串 gitStatus/claudeMd」）。
+     *
+     * <p>装置：会话 A 的 cwd = 临时目录（<b>是</b> git 仓库）→ 期望含 {@code gitStatus}；
+     * 会话 B 的 cwd = 另一临时目录（<b>非</b> git 仓库）→ 期望<b>不</b>含 {@code gitStatus}。
+     * 进程 {@code user.dir} 指向<b>非</b> git 目录 ⇒ A 的 gitStatus 只可能来自 A 的会话 cwd，
+     * B 的「无 gitStatus」也不可能被进程目录解释掉。两个 cwd 槽（cwd + originalCwd）都显式装夹，
+     * 使 {@code UserContextProvider} 构造不抛（否则整条 provider 构造失败 → 回退空串 → 断言假绿）。
+     *
+     * <p>反向实验配方：把 {@code systemPromptContextProvider(sessionId)} 的
+     * {@code Map<String, …>} 按会话键改回<b>实例级裸字段</b>（{@code if (p == null) { … systemPromptContextProvider = p; }}）
+     * ⇒ 服务会话 B 时复用会话 A 的 provider ⇒ B 也含 gitStatus ⇒ 本用例红。
+     */
+    @Test
+    @DisplayName("[P10b] 同一 executor 服务两个会话 ⇒ 各自 git 锚不串值（单例共享的实例级缓存必红）")
+    void resolveSystemContextText_sameExecutorTwoSessions_doNotShareGitAnchor(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path tmp) throws Exception {
+        java.nio.file.Path gitDir = java.nio.file.Files.createDirectories(tmp.resolve("sess-a-git"));
+        java.nio.file.Files.createDirectory(gitDir.resolve(".git"));
+        java.nio.file.Path noGitDir = java.nio.file.Files.createDirectories(tmp.resolve("sess-b-nogit"));
+        assertThat(new GitStatusProvider(gitDir).findGitRoot())
+            .as("夹具前置：会话 A 的 cwd 必须落在 git 根上（否则 A 也拿不到 gitStatus）").isNotNull();
+        assertThat(new GitStatusProvider(noGitDir).findGitRoot())
+            .as("夹具前置：会话 B 的 cwd 必须不在任何 git 仓库内（否则 A/B 两锚不可分辨）").isNull();
+
+        String sidA = "sess-p10b-a";
+        String sidB = "sess-p10b-b";
+        String savedUserDir = System.getProperty("user.dir");
+        try {
+            // 进程目录亦指向非 git 目录 ⇒ gitStatus 只能来自会话层，排除 user.dir 巧合解释
+            System.setProperty("user.dir", noGitDir.toString());
+            com.nexusai.application.agent.agent.SessionCwdHolder.set(sidA, gitDir.toString());
+            com.nexusai.application.agent.agent.SessionCwdHolder.set(sidB, noGitDir.toString());
+            // originalCwd 槽（CLAUDE.md 扫描根 / UserContextProvider 构造输入）同样显式装夹
+            com.nexusai.application.agent.agent.SessionCwdHolder.setOriginalCwd(sidA, gitDir.toString());
+            com.nexusai.application.agent.agent.SessionCwdHolder.setOriginalCwd(sidB, noGitDir.toString());
+            // 会话层命中 ⇒ 不会落到回源器；显式装 unknown() 使「落回源」可观测为抛
+            com.nexusai.common.SessionProjectRoot.setDbResolver(
+                s -> com.nexusai.common.SessionProjectRoot.Lookup.unknown());
+
+            // ⭐ 同一个 executor 实例（生产形态：单例 bean 连续服务多个会话）
+            SubagentExecutor executor = new SubagentExecutor(
+                null, null, null, null, null, "model", "system-prompt");
+            String ctxA = executor.resolveSystemContextText(sidA);
+            String ctxB = executor.resolveSystemContextText(sidB);
+
+            assertThat(ctxA).as("会话 A 是 git 根 ⇒ systemContext 含 gitStatus（非空串，排除构造失败假绿）")
+                .contains("gitStatus");
+            assertThat(ctxB)
+                .as("⭐ 会话 B 非 git ⇒ ⛔ 不得复用会话 A 的 provider（那会把 A 的 git 锚串给 B）")
                 .doesNotContain("gitStatus");
         } finally {
             com.nexusai.application.agent.agent.SessionCwdHolder.reset();

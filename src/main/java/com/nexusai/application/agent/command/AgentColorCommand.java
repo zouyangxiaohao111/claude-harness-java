@@ -15,7 +15,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -36,8 +35,13 @@ import java.util.function.Supplier;
  *   <li><b>A5</b>: 真实 — args="BLUE" (大写) → 小写后匹配 → "Session color set to: blue"</li>
  * </ul>
  *
- * <p>L3 (Java idiom): Consumer&lt;String&gt; onDone; Supplier&lt;Boolean&gt; isTeammate + Supplier&lt;UUID&gt; sessionId +
- *                    BiFunction&lt;UUID,String,CF&lt;Void&gt;&gt; saveAgentColor + Supplier&lt;List&lt;String&gt;&gt; agentColors 注入测试可控.
+ * <p>L3 (Java idiom): Consumer&lt;String&gt; onDone; Supplier&lt;Boolean&gt; isTeammate + Supplier&lt;String&gt; sessionId +
+ *                    BiFunction&lt;String,String,CF&lt;Void&gt;&gt; saveAgentColor + Supplier&lt;List&lt;String&gt;&gt; agentColors 注入测试可控.
+ *
+ * <p><b>[session-id-short]</b>：会话标识全链为 <b>short 直键</b> {@code sess-xxxxxxxx}
+ * （{@code SessionService:189 setId(generateId("sess"))}，与 {@link SessionStorage} 的
+ * transcript 文件名键同源）——⛔ 不得再经 {@code UUID.fromString} 转换（先例
+ * {@code EffortCommand:405}）。
  *
  * <p><b>R-B1 · B-1 颜色 API 暴露（D4+D11 数据通道 → 前端可见）</b>：本类由 @Component 升级为
  * {@code @RestController}（@RestController 本身即 @Component 元注解，斜杠命令注册与依赖注入不受影响），
@@ -132,7 +136,9 @@ public class AgentColorCommand {
             //   SessionAgentStateRegistry#teammateIdentityForSession）。
             //   WHY 不是方法引用：分派线程上不存在任何 teammate 载体 ⇒ 方法引用恒 false ⇒ 守卫静默失效。
             () -> resolveIsTeammateSession(sessionAgentStateRegistry, ctx.sessionId()),
-            () -> resolveSessionUuid(ctx.sessionId()),
+            // [session-id-short] 会话标识直传（short 直键）——⛔ 不再经 resolveSessionUuid 转换
+            //   （原实现对该键必抛 IAE ⇒ 恒 null ⇒ 整条副作用链 no-op）。Env 惰性求值语义不变。
+            ctx::sessionId,
             () -> resolveTranscriptPath(workspaceRoot.get(), ctx.sessionId()),
             () -> SubagentTool.AGENT_COLORS,
             (sid, color) -> persistAgentColor(workspaceRoot, sid, color),
@@ -155,27 +161,19 @@ public class AgentColorCommand {
         return registry.teammateIdentityForSession(sessionId) != null;
     }
 
-    /** 由显式形参 sessionId 解析当前会话 UUID · null = 无会话上下文（批 3c：不再读裸 MDC）。 */
-    private static UUID resolveSessionUuid(String sessionId) {
+    /** transcript 路径（CC getTranscriptPath() · sessionStorage.ts）· 无会话 → null。
+     *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
+     *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。
+     *
+     *  <p><b>[session-id-short]</b>：sessionId 为 short 直键，<b>直接下传</b>给
+     *  {@link SessionStorage#resolveExistingTranscript}（其文件名键 {@code sessionId + ".jsonl"}
+     *  与生产写侧 {@code ChatService.appendReasoningDurationToTranscript} 同源）。
+     *  ⛔ 不再经 {@code UUID.fromString} 转换——short 键必抛 IAE ⇒ 恒 null ⇒ 读不到真实文件。 */
+    private static String resolveTranscriptPath(String workspaceRoot, String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
-        try {
-            return UUID.fromString(sessionId);
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
-    }
-
-    /** transcript 路径（CC getTranscriptPath() · sessionStorage.ts）· 无会话 → null。
-     *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
-     *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。 */
-    private static String resolveTranscriptPath(String workspaceRoot, String sessionId) {
-        UUID sid = resolveSessionUuid(sessionId);
-        if (sid == null) {
-            return null;
-        }
-        Path transcript = SessionStorage.resolveExistingTranscript(Path.of(workspaceRoot), sid.toString());
+        Path transcript = SessionStorage.resolveExistingTranscript(Path.of(workspaceRoot), sessionId);
         return transcript != null ? transcript.toString() : null;
     }
 
@@ -183,10 +181,13 @@ public class AgentColorCommand {
      *
      *  <p><b>[批 r10]</b> 会话存档根改为 {@code Supplier} 形参（取值 = ctx.projectRoot()，
      *  getOriginalCwdLayer 语义 + user.dir 兜底单点）。用 Supplier 而非已解析值，是为了让
-     *  {@code get()} 留在**下方 runAsync 之前**的原解析位置（见下注释），逐点保持原语义。 */
+     *  {@code get()} 留在**下方 runAsync 之前**的原解析位置（见下注释），逐点保持原语义。
+     *
+     *  <p><b>[session-id-short]</b>：sessionId 为 short 直键，直传 {@link SessionStorage}
+     *  （transcript 文件名键 {@code sessionId + ".jsonl"}）——⛔ 不再 {@code .toString()} 成 UUID 形态。 */
     private CompletableFuture<Void> persistAgentColor(java.util.function.Supplier<String> workspaceRoot,
-                                                      UUID sessionId, String color) {
-        if (sessionId == null) {
+                                                      String sessionId, String color) {
+        if (sessionId == null || sessionId.isBlank()) {
             return CompletableFuture.completedFuture(null);
         }
         // WF-1C: 必须在进入异步线程前解析存档根——CompletableFuture.runAsync 跑在 ForkJoinPool，
@@ -196,9 +197,9 @@ public class AgentColorCommand {
         Path ws = Path.of(workspaceRoot.get());
         return CompletableFuture.runAsync(() -> {
             try {
-                Path transcript = SessionStorage.getTranscriptPath(ws, sessionId.toString());
+                Path transcript = SessionStorage.getTranscriptPath(ws, sessionId);
                 if (transcript != null) {
-                    SessionStorage.reAppendSessionMetadata(ws, sessionId.toString(),
+                    SessionStorage.reAppendSessionMetadata(ws, sessionId,
                         new SessionStorage.SessionMetadata(null, null, null, null, color,
                             null, null, null, null, null, null));
                 }
@@ -212,13 +213,16 @@ public class AgentColorCommand {
         });
     }
 
-    /** 会话级颜色状态载体（CC standaloneAgentContext.color · color.ts:53-60/82-89）· 会话标识显式传入。 */
+    /** 会话级颜色状态载体（CC standaloneAgentContext.color · color.ts:53-60/82-89）· 会话标识显式传入。
+     *
+     *  <p><b>[session-id-short]</b>：经 {@link SessionAgentStateRegistry#get(String)}（<b>sessions</b> map，
+     *  short 直键）查主会话 AgentState——⛔ 不得走 {@code get(Object)} 的 UUID 分支
+     *  （那是 <b>agents</b> map / 后台化 agentId，查不到主会话 ⇒ 颜色恒不生效）。 */
     private void setAppStateColor(String sessionId, String color) {
-        UUID sid = resolveSessionUuid(sessionId);
-        if (sid == null || sessionAgentStateRegistry == null) {
+        if (sessionId == null || sessionId.isBlank() || sessionAgentStateRegistry == null) {
             return;
         }
-        AgentState state = sessionAgentStateRegistry.get(sid);
+        AgentState state = sessionAgentStateRegistry.get(sessionId);
         if (state != null) {
             state.setColor(color);
         }
@@ -226,10 +230,10 @@ public class AgentColorCommand {
 
     public record Env(
         Supplier<Boolean> isTeammate,
-        Supplier<UUID> sessionId,
+        Supplier<String> sessionId,
         Supplier<String> transcriptPath,
         Supplier<List<String>> agentColors,
-        BiFunction<UUID, String, CompletableFuture<Void>> saveAgentColor,
+        BiFunction<String, String, CompletableFuture<Void>> saveAgentColor,
         Consumer<String> setAppStateColor,
         Consumer<String> onDone
     ) {}
@@ -252,7 +256,7 @@ public class AgentColorCommand {
 
         String colorArg = trimmed.toLowerCase();
         if (RESET_ALIASES.contains(colorArg)) {
-            UUID sid = env.sessionId.get();
+            String sid = env.sessionId.get();
             env.saveAgentColor.apply(sid, "default").join();
             env.setAppStateColor.accept(null);  // CC: color: undefined
             String msg = "Session color reset to default";
@@ -267,7 +271,7 @@ public class AgentColorCommand {
             return new CommandResult(false, msg, "system");
         }
 
-        UUID sid = env.sessionId.get();
+        String sid = env.sessionId.get();
         env.saveAgentColor.apply(sid, colorArg).join();
         env.setAppStateColor.accept(colorArg);
         String msg = "Session color set to: " + colorArg;

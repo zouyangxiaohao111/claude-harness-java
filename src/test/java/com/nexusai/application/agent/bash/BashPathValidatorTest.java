@@ -64,7 +64,7 @@ class BashPathValidatorTest {
     @Test
     @DisplayName("rm -rf / → Ask（危险删除，含 allow 规则也不 auto-allow）")
     void dangerousRemovalRoot() {
-        PermissionResult r = BashPathValidator.check("rm -rf /", CWD,
+        PermissionResult r = BashPathValidator.check("rm -rf /", CWD, CWD,
             permCtx(PermissionMode.DEFAULT, bashAllow("rm:*")));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "rm -rf / 必须 ask，即便存在 Bash(rm:*) allow 规则（cannot be auto-allowed）");
@@ -76,11 +76,11 @@ class BashPathValidatorTest {
     @DisplayName("rm ~ / rmdir /etc / rm /usr → Ask（危险路径表单一真理源）")
     void dangerousRemovalVariants() {
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("rm ~", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("rm ~", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("rmdir /etc", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("rmdir /etc", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("rm /usr", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("rm /usr", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
     }
 
     // ── (b) 路径越界读取 → Ask ──
@@ -89,13 +89,13 @@ class BashPathValidatorTest {
     @DisplayName("ls /etc / cat ~/.ssh / find /tmp / git diff --no-index → Ask（越界读取）")
     void outOfBoundsRead() {
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("ls /etc", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("ls /etc", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("cat ~/.ssh/id_rsa", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("cat ~/.ssh/id_rsa", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("find /tmp", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("find /tmp", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("git diff --no-index /etc/a /etc/b", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("git diff --no-index /etc/a /etc/b", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
     }
 
     // ── (c) cd+write / cd+redirect → Ask ──
@@ -104,7 +104,7 @@ class BashPathValidatorTest {
     @DisplayName("cd .claude && mv test.txt settings.json → Ask（cd+write 相对 cwd 漂移）")
     void cdWriteAsk() {
         PermissionResult r = BashPathValidator.check("cd .claude && mv test.txt settings.json",
-            CWD, permCtx(PermissionMode.DEFAULT));
+            CWD, CWD, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "cd+write 复合命令因相对 cwd 漂移必须 ask（防 cd .claude/ && mv 绕过 .claude 校验）");
     }
@@ -113,7 +113,7 @@ class BashPathValidatorTest {
     @DisplayName("cd x && echo hi > y → Ask（cd+redirect 目标按原 cwd 校验不可靠）")
     void cdRedirectAsk() {
         PermissionResult r = BashPathValidator.check("cd x && echo hi > y",
-            CWD, permCtx(PermissionMode.DEFAULT));
+            CWD, CWD, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "cd+redirect 复合命令必须 ask（防 cd .claude/ && echo > settings.json 绕过）");
     }
@@ -124,7 +124,7 @@ class BashPathValidatorTest {
     @DisplayName("sed -i 's/x/y/' /etc/passwd → Ask（sed 写文件越界）")
     void sedWriteAsk() {
         PermissionResult r = BashPathValidator.check("sed -i 's/x/y/' /etc/passwd",
-            CWD, permCtx(PermissionMode.DEFAULT));
+            CWD, CWD, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "sed -i 就地编辑 /etc/passwd 越界必须 ask");
     }
@@ -135,7 +135,7 @@ class BashPathValidatorTest {
     @DisplayName("rm -- -/../.claude/settings.json → Ask（-- 之后位置参数仍被提取校验）")
     void doubleDashExtracted() {
         PermissionResult r = BashPathValidator.check("rm -- -/../.claude/settings.json",
-            CWD, permCtx(PermissionMode.DEFAULT));
+            CWD, CWD, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "-- 之后以 - 开头的位置参数必须被提取并校验（.claude 危险目录命中），不得静默放行");
     }
@@ -146,9 +146,9 @@ class BashPathValidatorTest {
     @DisplayName("mv -t /tmp x → Ask（mv/cp 禁 flag，防 --target-directory 绕过路径提取）")
     void mvFlagAsk() {
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("mv -t /tmp x", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("mv -t /tmp x", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Ask.class,
-            BashPathValidator.check("cp -r /etc /tmp", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("cp -r /etc /tmp", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
     }
 
     // ── (g) 白名单内路径 → Passthrough ──
@@ -157,16 +157,16 @@ class BashPathValidatorTest {
     @DisplayName("ls . / echo hi > /dev/null → Passthrough（只读 cwd + /dev/null 重定向）")
     void whitelistPassthrough() {
         assertInstanceOf(PermissionResult.Passthrough.class,
-            BashPathValidator.check("ls .", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("ls .", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
         assertInstanceOf(PermissionResult.Passthrough.class,
-            BashPathValidator.check("echo hi > /dev/null", CWD, permCtx(PermissionMode.DEFAULT)));
+            BashPathValidator.check("echo hi > /dev/null", CWD, CWD, permCtx(PermissionMode.DEFAULT)));
     }
 
     @Test
     @DisplayName("rm ./tmp.txt（acceptEdits 模式 cwd 内）→ Passthrough")
     void writeInCwdAcceptEdits() {
         assertInstanceOf(PermissionResult.Passthrough.class,
-            BashPathValidator.check("rm ./tmp.txt", CWD, permCtx(PermissionMode.ACCEPT_EDITS)));
+            BashPathValidator.check("rm ./tmp.txt", CWD, CWD, permCtx(PermissionMode.ACCEPT_EDITS)));
     }
 
     // ── (h) 只读 sed → 走 read 覆盖 → Passthrough ──
@@ -175,7 +175,7 @@ class BashPathValidatorTest {
     @DisplayName("sed -n '1p' file.txt → Passthrough（只读 sed 走 read 覆盖，cwd 内）")
     void readonlySedPassthrough() {
         PermissionResult r = BashPathValidator.check("sed -n '1p' file.txt",
-            CWD, permCtx(PermissionMode.DEFAULT));
+            CWD, CWD, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Passthrough.class, r,
             "只读 sed（-n p）应经 sedCommandIsAllowedByAllowlist 判定为 read 覆盖，cwd 内文件放行");
     }
@@ -185,7 +185,7 @@ class BashPathValidatorTest {
     @Test
     @DisplayName("Edit(//etc/**) deny 命中 /etc/hosts → Deny（// 根 root-relative）")
     void editDenyRuleDenies() {
-        PermissionResult r = BashPathValidator.check("cat /etc/hosts", CWD,
+        PermissionResult r = BashPathValidator.check("cat /etc/hosts", CWD, CWD,
             permCtx(PermissionMode.DEFAULT, editDeny("//etc/**")));
         assertInstanceOf(PermissionResult.Deny.class, r,
             "Edit(//etc/**) deny 规则（// 前缀 = 文件系统根 root-relative）命中 cat /etc/hosts → 必须 deny");
@@ -194,7 +194,7 @@ class BashPathValidatorTest {
     @Test
     @DisplayName("Edit(/.claude/**) deny 命中 cwd 下 .claude → Deny（/ 前缀 = session/cwd 根）")
     void editDenyProjectRootedClaudeDenies() {
-        PermissionResult r = BashPathValidator.check("cat .claude/settings.json", CWD,
+        PermissionResult r = BashPathValidator.check("cat .claude/settings.json", CWD, CWD,
             permCtx(PermissionMode.DEFAULT, editDeny("/.claude/**")));
         assertInstanceOf(PermissionResult.Deny.class, r,
             "Edit(/.claude/**) deny 规则（/ 前缀 = cwd 根，CC rootPathForSource session）命中 cwd/.claude/settings.json → 必须 deny");
@@ -203,7 +203,7 @@ class BashPathValidatorTest {
     @Test
     @DisplayName("Edit(/etc/**) 单 / 前缀 = cwd 根 → 不命中绝对 /etc/hosts（root-relative 语义变化）")
     void editDenySingleSlashNotRootAnchored() {
-        PermissionResult r = BashPathValidator.check("cat /etc/hosts", CWD,
+        PermissionResult r = BashPathValidator.check("cat /etc/hosts", CWD, CWD,
             permCtx(PermissionMode.DEFAULT, editDeny("/etc/**")));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "Edit(/etc/**) 单 / 前缀在 CC 中锚定 cwd（非文件系统根）→ 不命中绝对 /etc/hosts，回落越界 Ask（对齐 matchingRuleForInput patternWithRoot）");
@@ -214,7 +214,7 @@ class BashPathValidatorTest {
     @Test
     @DisplayName("cat '/etc/hosts'（单引号包裹路径）→ argv 剥引号后命中 Edit(//etc/**) deny → Deny")
     void editDenyQuotedPathDenies() {
-        PermissionResult r = BashPathValidator.check("cat '/etc/hosts'", CWD,
+        PermissionResult r = BashPathValidator.check("cat '/etc/hosts'", CWD, CWD,
             permCtx(PermissionMode.DEFAULT, editDeny("//etc/**")));
         assertInstanceOf(PermissionResult.Deny.class, r,
             "AST argv 剥引号后路径 /etc/hosts 必须被校验（单引号包裹不得绕过 deny 规则）");
@@ -223,7 +223,7 @@ class BashPathValidatorTest {
     @Test
     @DisplayName("timeout 5 cat /etc/hosts → stripWrappersFromArgv 剥 timeout 后 baseCmd=cat → Deny")
     void wrapperPrefixedDenyArgv() {
-        PermissionResult r = BashPathValidator.check("timeout 5 cat /etc/hosts", CWD,
+        PermissionResult r = BashPathValidator.check("timeout 5 cat /etc/hosts", CWD, CWD,
             permCtx(PermissionMode.DEFAULT, editDeny("//etc/**")));
         assertInstanceOf(PermissionResult.Deny.class, r,
             "argv 级 wrapper 剥离（CC stripWrappersFromArgv pathValidation.ts:1263）→ timeout 5 不掩蔽 cat 路径校验");
@@ -239,7 +239,7 @@ class BashPathValidatorTest {
         // → mv 走 acceptEdits auto-allow → Passthrough。剥除 timeout 前缀后命中 cd → Ask，
         // 该断言唯一验证"wrapper 前置 cd 不得绕过 cd+write 守卫"这一安全不变量。
         PermissionResult r = BashPathValidator.check("timeout 10 cd .claude && mv test.txt settings.json",
-            CWD, permCtx(PermissionMode.ACCEPT_EDITS));
+            CWD, CWD, permCtx(PermissionMode.ACCEPT_EDITS));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "ACCEPT_EDITS 下 wrapper 前置 cd 仍必须 ask（cd+write 守卫不得被 timeout 前缀绕过）");
     }
@@ -253,9 +253,96 @@ class BashPathValidatorTest {
         // 首词归一化（tryParseShellCommand 等价）后 tokens[0]==='cd' 命中 → Ask。该断言唯一
         // 验证"引号包裹首词 cd 不得绕过 cd+write 守卫"这一安全不变量。
         PermissionResult r = BashPathValidator.check("'cd' .claude && mv test.txt settings.json",
-            CWD, permCtx(PermissionMode.ACCEPT_EDITS));
+            CWD, CWD, permCtx(PermissionMode.ACCEPT_EDITS));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "ACCEPT_EDITS 下引号包裹首词 cd 仍必须 ask（cd+write 守卫不得被引号首词绕过）");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P7] 越界基准双轴：轴 A（相对路径解析基准）与轴 B（越界白名单根）必须是
+    //      两个相互独立的可注入量 —— 对齐 CC：
+    //        轴 A = checkPathConstraints 的 cwd 形参（getCwd()，utils/cwd.ts:26-32）
+    //        轴 B = allWorkingDirectories(context) 的首项 getOriginalCwd()
+    //               （utils/permissions/filesystem.ts:666-673；pathInAllowedWorkingPath
+    //                 :683-707 只吃 context，白名单永不看 cwd 形参）
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[P7] 轴A=子目录 / 轴B=项目根：cat ../data.txt → Passthrough（白名单根不看解析基准）")
+    void dualAxis_whitelistRootWiderThanResolutionBase(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：本仓旧实现把「解析基准」同一值复用为「越界白名单根」⇒ cd 进子目录后
+        //   白名单根随之变窄到子目录（CC 语义下白名单根恒 = 会话 originalCwd，cd 不改范围）。
+        //   断言：解析基准 = proj/sub（轴 A），白名单根 = proj（轴 B）时，`../data.txt` 按轴 A
+        //   解析为 proj/data.txt，落在轴 B 的 proj 子树内 ⇒ 必须 Passthrough。
+        //   单轴实现（白名单根 := 解析基准 = proj/sub）下该路径判在 sub 之外 ⇒ 变红。
+        Path proj = tmp.resolve("proj");
+        Path sub = proj.resolve("sub");
+        Files.createDirectories(sub);
+        Files.writeString(proj.resolve("data.txt"), "x");
+        assertInstanceOf(PermissionResult.Passthrough.class,
+            BashPathValidator.check("cat ../data.txt", sub, proj, permCtx(PermissionMode.DEFAULT)),
+            "白名单根 = proj 时，proj/data.txt 在允许范围内必须 Passthrough"
+                + "（解析基准 proj/sub 只用于 resolve 相对路径，不得当白名单根用）");
+    }
+
+    @Test
+    @DisplayName("[P7] 轴A=项目根 / 轴B=项目子目录：cat <proj>/other.txt → Ask（改轴B即改判定）")
+    void dualAxis_whitelistRootNarrowerThanResolutionBase(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：反方向 —— 固定解析基准（proj）、只改白名单根（sub ⊂ proj），判定结果必须
+        //   随之改变，证明「轴 B 是独立入参」而非解析基准的影子。绝对路径 proj/other.txt 在解析
+        //   基准 proj 之内、在白名单根 sub 之外 ⇒ 必须 Ask。单轴实现（白名单根 := 解析基准 = proj）
+        //   下该路径在 proj 内 ⇒ 误判 Passthrough（过度放行，安全方向错）⇒ 变红。
+        Path proj = tmp.resolve("proj");
+        Path sub = proj.resolve("sub");
+        Files.createDirectories(sub);
+        Path other = proj.resolve("other.txt");
+        Files.writeString(other, "x");
+        assertInstanceOf(PermissionResult.Ask.class,
+            BashPathValidator.check("cat " + other, proj, sub, permCtx(PermissionMode.DEFAULT)),
+            "白名单根 = sub 时，sub 之外的 proj/other.txt 必须 Ask"
+                + "（轴 B 独立于轴 A；不得以解析基准当白名单根）");
+    }
+
+    @Test
+    @DisplayName("[P7] 轴A/轴B 同值（无 cd）时行为与单轴一致：cat data.txt → Passthrough")
+    void dualAxis_sameValueBehavesAsBefore(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：双轴拆分的回归护栏 —— 生产常态（会话根未 cd）下两轴同值，
+        //   行为必须与拆分前逐字一致，不得因拆分放大 ask。
+        Path proj = tmp.resolve("proj");
+        Files.createDirectories(proj);
+        Files.writeString(proj.resolve("data.txt"), "x");
+        assertInstanceOf(PermissionResult.Passthrough.class,
+            BashPathValidator.check("cat data.txt", proj, proj, permCtx(PermissionMode.DEFAULT)),
+            "两轴同值时白名单内路径必须 Passthrough（拆分不得改变常态行为）");
+    }
+
+    @Test
+    @DisplayName("[P7] 轴B 缺失（null）→ Ask（宁问不放，白名单根不得回落解析基准）")
+    void dualAxis_whitelistRootMissingAsks(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：白名单根取不到时该路径必须落 ask（isInWorkingDir 恒 false = fail-closed），
+        //   ⛔ 不得静默回落解析基准 —— 回落等于把「轴 A」重新当「轴 B」用，正是本批要消除的混用。
+        Path proj = tmp.resolve("proj");
+        Files.createDirectories(proj);
+        Files.writeString(proj.resolve("data.txt"), "x");
+        assertInstanceOf(PermissionResult.Ask.class,
+            BashPathValidator.check("cat data.txt", proj, null, permCtx(PermissionMode.DEFAULT)),
+            "白名单根缺失 ⇒ 无法判定是否越界 ⇒ 必须 Ask（不得回落解析基准）");
+    }
+
+    @Test
+    @DisplayName("[P7] 单条复合命令 cd 子目录 + 相对读：cd src && cat ../package.json → Ask")
+    void dualAxis_compoundCdThenRelativeReadAsks(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：对齐 CC「cd 不参与相对路径解析」——checkPathConstraints 对每条子命令都用
+        //   同一个 cwd 形参解析（不模拟 cd 后的目录），故 `cd src` 合法而 `../package.json` 按**项目根**
+        //   解析 = 项目外 ⇒ 必须 Ask。本断言钉住「轴 A 是整条命令的解析基准，不随前面子命令的 cd 前移」，
+        //   防有人「顺手」把 cd 也模拟进解析基准（那会放大成安全漏洞）。
+        Path proj = tmp.resolve("proj");
+        Files.createDirectories(proj.resolve("src"));
+        Files.writeString(tmp.resolve("package.json"), "{}");
+        assertInstanceOf(PermissionResult.Ask.class,
+            BashPathValidator.check("cd src && cat ../package.json", proj, proj,
+                permCtx(PermissionMode.DEFAULT)),
+            "相对路径 ../package.json 按项目根解析 ⇒ 落在项目外 ⇒ 必须 Ask");
     }
 
     // ── G3-1 symlink 逃逸（双侧 realpath，对齐 CC pathInAllowedWorkingPath filesystem.ts:683-707）──
@@ -276,7 +363,7 @@ class BashPathValidatorTest {
         } catch (IOException | UnsupportedOperationException e) {
             Assumptions.assumeTrue(false, "symlink 不可创建（Windows 无权限/未开开发者模式），跳过");
         }
-        PermissionResult r = BashPathValidator.check("cat link", proj, permCtx(PermissionMode.DEFAULT));
+        PermissionResult r = BashPathValidator.check("cat link", proj, proj, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "项目内 symlink → 项目外文件必须 ask（realpath 后 target 不在 cwd 内），读/写均拒绝");
     }
@@ -299,7 +386,7 @@ class BashPathValidatorTest {
             Assumptions.assumeTrue(false, "symlink 不可创建（Windows 无权限/未开开发者模式），跳过");
         }
         PermissionResult r = BashPathValidator.check("echo hi > linkDir/new.txt",
-            proj, permCtx(PermissionMode.DEFAULT));
+            proj, proj, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "重定向目标经父 symlink realpath 后落在项目外必须 ask（防写逃逸）");
     }
@@ -311,7 +398,7 @@ class BashPathValidatorTest {
         Files.createDirectories(proj);
         Files.writeString(proj.resolve("file.txt"), "hi");
         assertInstanceOf(PermissionResult.Passthrough.class,
-            BashPathValidator.check("cat file.txt", proj, permCtx(PermissionMode.DEFAULT)),
+            BashPathValidator.check("cat file.txt", proj, proj, permCtx(PermissionMode.DEFAULT)),
             "无软链普通路径 realpath 前后一致，行为不得回归");
     }
 
@@ -321,7 +408,7 @@ class BashPathValidatorTest {
         Path proj = tmp.resolve("proj");
         Files.createDirectories(proj);
         assertInstanceOf(PermissionResult.Passthrough.class,
-            BashPathValidator.check("cat newfile.txt", proj, permCtx(PermissionMode.DEFAULT)),
+            BashPathValidator.check("cat newfile.txt", proj, proj, permCtx(PermissionMode.DEFAULT)),
             "目标不存在路径回退 lexical（对齐 CC safeResolvePath ENOENT 回退）仍应判在目录内");
     }
 
@@ -412,7 +499,7 @@ class BashPathValidatorTest {
         Files.createDirectories(proj);
         Path outside = tmp.resolve("secret.txt");
         Files.writeString(outside, "secret");
-        PermissionResult r = BashPathValidator.check("cat ../SECRET.txt", proj, permCtx(PermissionMode.DEFAULT));
+        PermissionResult r = BashPathValidator.check("cat ../SECRET.txt", proj, proj, permCtx(PermissionMode.DEFAULT));
         assertInstanceOf(PermissionResult.Ask.class, r,
             "越界路径（../SECRET.txt 指向项目外，大小写变体）必须 ask，大小写不敏感比较不得放大逃逸");
     }
@@ -428,7 +515,7 @@ class BashPathValidatorTest {
         Files.createDirectories(proj);
         Files.writeString(proj.resolve("file.txt"), "hi");
         assertInstanceOf(PermissionResult.Passthrough.class,
-            BashPathValidator.check("cat FILE.TXT", proj, permCtx(PermissionMode.DEFAULT)),
+            BashPathValidator.check("cat FILE.TXT", proj, proj, permCtx(PermissionMode.DEFAULT)),
             "大小写变体路径必须判在目录内（大小写不敏感比较），不得误拒");
     }
 }

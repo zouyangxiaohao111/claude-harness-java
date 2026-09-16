@@ -2815,6 +2815,52 @@ public class BashTool implements Tool {
         return null;
     }
 
+    /**
+     * <b>轴 B</b>：越界白名单根（仅路径约束用）· 对齐 CC {@code allWorkingDirectories(context)}
+     * 的首项 {@code getOriginalCwd()}（utils/permissions/filesystem.ts:666-673）。
+     *
+     * <p><b>⛔ 与 {@link #effectiveCwd}（轴 A）是两个轴，不得互换</b>：
+     * <ul>
+     *   <li>轴 A {@link #effectiveCwd} = CC {@code getCwd()}（utils/cwd.ts:26-32）—— 只用于
+     *       <b>解析相对路径</b>；bash {@code cd} / worktree 入口会改它。CC
+     *       {@code checkPathConstraints}（bashPermissions.ts:1112）收的正是这个作 {@code cwd} 形参。</li>
+     *   <li>轴 B 本方法 = CC {@code getOriginalCwd()} —— 只用于<b>越界白名单</b>。CC
+     *       {@code pathInAllowedWorkingPath}（filesystem.ts:683-707）只吃 {@code context}，
+     *       <b>从不</b>看 {@code cwd} 形参。</li>
+     * </ul>
+     * <b>WHY 必须分开</b>：旧实现把轴 A 的值当轴 B 用 ⇒ bash {@code cd} 进子目录后白名单根随之
+     * 变窄（CC 语义下 cd 不改白名单范围），项目内的 {@code cat ../x} 被误 ask；反向（解析基准宽于
+     * 项目根）则过度放行。两向都错，故按 CC 显式双轴。
+     *
+     * <p><b>取不到 ⇒ null</b>（调用点按「宁问不放」ask）：无会话态、或 {@code getOriginalCwdLayer}
+     * 对「会话存在却无绑定项目根」等数据链路异常 fail-loud 抛 —— ⛔ 两者都<b>不</b>回落进程
+     * {@code user.dir}，也<b>不</b>回落轴 A 的解析基准（回落轴 A 正是本批要消灭的混用）。
+     *
+     * @param ctx 工具调用上下文（可为 null ⇒ 无会话态）
+     * @return 会话 originalCwd 层路径；取不到 ⇒ null
+     */
+    private static Path pathWhitelistRoot(ToolUseContext ctx) {
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[BashTool] 越界白名单根（轴 B = CC getOriginalCwd）取不到：无会话态 ctx={}"
+                + " ⇒ 不回落 user.dir / 解析基准（调用点按 ask 处理）",
+                ctx == null ? "null" : "sessionId=null");
+            return null;
+        }
+        try {
+            String original = CwdResolution.getOriginalCwdLayer(sessionId);
+            if (original == null || original.isBlank()) {
+                log.warn("[BashTool] 越界白名单根（轴 B）解析为空 sessionId={} ⇒ ask（宁问不放）", sessionId);
+                return null;
+            }
+            return Path.of(original);
+        } catch (IllegalStateException e) {
+            log.warn("[BashTool] 越界白名单根（轴 B）解析失败（会话 originalCwd 层数据链路异常）"
+                + " sessionId={} ⇒ ask（宁问不放）", sessionId, e);
+            return null;
+        }
+    }
+
     private static String truncate(String s, int max) {
         return s.length() > max ? s.substring(0, max) + "\n... (truncated, " + (s.length() - max) + " more chars)" : s;
     }
@@ -3423,7 +3469,10 @@ public class BashTool implements Tool {
         //     安全防护。deny=Edit-deny 规则；ask=越界/不可静态校验。ctx/permCtx 缺失时跳过
         //     （管线外直调场景无规则集/工作目录上下文）。原探查 D-03 登记 "path 约束未实现" 已补齐。
         if (ctx != null && ctx.permissionContext() != null) {
-            // cwd-align-ext：path 约束越界基准 = 会话态 cwd（CC bashPermissions.ts:1112 checkPathConstraints 用 getCwd）
+            // [P7] 双轴显式化：轴 A = 会话态 cwd（CC bashPermissions.ts:1112 checkPathConstraints
+            //   的 cwd 形参 = getCwd()，**只**用于 resolve 相对路径）；轴 B = 会话 originalCwd
+            //   （CC allWorkingDirectories 首项，**只**用于越界白名单，pathInAllowedWorkingPath
+            //   从不看 cwd 形参）。⛔ 两轴不得互换 —— 旧实现把轴 A 当轴 B 用。
             Path cwd = effectiveCwd(ctx);
             if (cwd == null) {
                 // [批 subcwd D8] 基准缺失 ⇒ **宁问不放**：越界判定（ls /etc、cat ~/.ssh、
@@ -3437,7 +3486,10 @@ public class BashTool implements Tool {
                     java.util.List.of(),
                     null, null, null, false, null, null);
             }
-            PermissionResult pathResult = BashPathValidator.check(command, cwd, ctx.permissionContext());
+            // 轴 B 取不到 ⇒ null 传入，由 BashPathValidator 统一 ask（单点文案 + WARN），
+            //   ⛔ 此处不回落 cwd（回落即混用）。
+            PermissionResult pathResult = BashPathValidator.check(
+                command, cwd, pathWhitelistRoot(ctx), ctx.permissionContext());
             if (!(pathResult instanceof PermissionResult.Passthrough)) {
                 if (log.isDebugEnabled()) {
                     log.debug("BashTool: path 约束命中（{}），command={}",
@@ -3637,7 +3689,9 @@ public class BashTool implements Tool {
                     java.util.List.of(),
                     null, null, null, false, null, null);
             }
-            PermissionResult pathResult = BashPathValidator.check(command, cwd, ctx.permissionContext());
+            // [P7] 轴 A = cwd（resolve 相对路径）/ 轴 B = 会话 originalCwd（越界白名单）· 同 3.4 主链
+            PermissionResult pathResult = BashPathValidator.check(
+                command, cwd, pathWhitelistRoot(ctx), ctx.permissionContext());
             if (!(pathResult instanceof PermissionResult.Passthrough)) {
                 if (log.isDebugEnabled()) {
                     log.debug("Bash operator all-allow path 重检命中（CC bashPermissions.ts:2045-2055）: command={}",

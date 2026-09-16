@@ -41,6 +41,13 @@ import java.util.Set;
  * <p><b>旧架构删除说明</b>：原 {@code collectRules()}（整源收集）+ 各 loader 的
  * {@code save(List<PermissionRule>)}（整源重写）已删除——CC 无对应能力，
  * 增量写盘是唯一正确语义（避免"改一个桶抹掉其它桶"）。
+ *
+ * <h2>[P11d] sessionId 显式形参（项目级 source 的落点）</h2>
+ * <p>{@link #persist(PermissionUpdate, String)} / {@link #persistAll(List, String)} 接收
+ * {@code sessionId} 并逐层下传到 loader 的写方法 ⇒ project/local source 落到<b>该会话的项目根</b>
+ * （改前恒落后端启动目录 = 多会话共写一份文件，既串又错）。读侧
+ * （{@code PermissionContextBuilder:355} → {@code loader.load(sessionId)}）传<b>同一个 sessionId</b>
+ * ⇒ 读写同址（本批最关键的不变量）。
  */
 @Component
 public class PermissionUpdatePersister {
@@ -114,9 +121,16 @@ public class PermissionUpdatePersister {
      * <p>先按 destination 拦截非可持久化 source（CC supportsPersistence，
      * PermissionUpdate.ts:208-216），再按 {@code type} 分发到对应写盘通道。
      *
-     * @param update 权限更新（非 null）
+     * <p><b>[P11d] {@code sessionId} 是独立形参（⛔ 不塞进 {@link PermissionUpdate} record）</b>：
+     * {@link PermissionUpdate} 是 CC {@code types/permissions.ts} 的<b>逐字段投影</b>，CC 该类型
+     * <b>没有</b> sessionId 字段 ⇒ 往 sealed record 加字段会破坏对齐契约；且本仓铁律要求会话态
+     * <b>显式传参</b>。{@code sessionId} 决定项目级 source 写盘落到哪个文件
+     * （读侧同值 ⇒ 读写同址，见 {@link com.nexusai.application.agent.permission.source.PermissionSourceLoader})。
+     *
+     * @param update    权限更新（非 null）
+     * @param sessionId 会话 ID（short；project/local source 的项目根解析依据；null = 确无会话腿）
      */
-    public void persist(PermissionUpdate update) {
+    public void persist(PermissionUpdate update, String sessionId) {
         Objects.requireNonNull(update, "update is null");
 
         PermissionUpdate.Destination dest = extractDestination(update);
@@ -132,24 +146,25 @@ public class PermissionUpdatePersister {
         PermissionSourceLoader loader = loaderFor(dest);
 
         switch (update) {
-            case PermissionUpdate.AddRules a -> persistAddRules(a, loader);
-            case PermissionUpdate.RemoveRules r -> persistRemoveRules(r, loader);
-            case PermissionUpdate.ReplaceRules rp -> persistReplaceRules(rp, loader);
-            case PermissionUpdate.SetMode s -> persistSetMode(s, loader);
-            case PermissionUpdate.AddDirectories ad -> persistAddDirectories(ad, loader);
-            case PermissionUpdate.RemoveDirectories rd -> persistRemoveDirectories(rd, loader);
+            case PermissionUpdate.AddRules a -> persistAddRules(a, loader, sessionId);
+            case PermissionUpdate.RemoveRules r -> persistRemoveRules(r, loader, sessionId);
+            case PermissionUpdate.ReplaceRules rp -> persistReplaceRules(rp, loader, sessionId);
+            case PermissionUpdate.SetMode s -> persistSetMode(s, loader, sessionId);
+            case PermissionUpdate.AddDirectories ad -> persistAddDirectories(ad, loader, sessionId);
+            case PermissionUpdate.RemoveDirectories rd -> persistRemoveDirectories(rd, loader, sessionId);
         }
     }
 
     /**
      * 持久化多条更新（对齐 CC {@code persistPermissionUpdates}，PermissionUpdate.ts:349-353）。
      *
-     * @param updates 权限更新列表（非 null）
+     * @param updates   权限更新列表（非 null）
+     * @param sessionId 会话 ID（见 {@link #persist(PermissionUpdate, String)}）
      */
-    public void persistAll(List<PermissionUpdate> updates) {
+    public void persistAll(List<PermissionUpdate> updates, String sessionId) {
         Objects.requireNonNull(updates, "updates is null");
         for (PermissionUpdate update : updates) {
-            persist(update);
+            persist(update, sessionId);
         }
     }
 
@@ -159,7 +174,7 @@ public class PermissionUpdatePersister {
      * <p>去重语义（CC :265-270）：existing 归一化 roundtrip（parse→serialize）后建 Set，
      * 仅追加不在 Set 中的新规则，避免 "Bash(*)" 与 "Bash" 重复写入。
      */
-    private void persistAddRules(PermissionUpdate.AddRules a, PermissionSourceLoader loader) {
+    private void persistAddRules(PermissionUpdate.AddRules a, PermissionSourceLoader loader, String sessionId) {
         // [IMP-3 G1] 对齐 CC addPermissionRulesToSettings（permissionsLoader.ts:239-242）：
         //   allowManagedPermissionRulesOnly 为 true 时直接 return false 不写任何新规则。
         //   注意 CC 仅在 addRules 路径门控（removeRules/setMode/addDirectories 等不经
@@ -177,7 +192,7 @@ public class PermissionUpdatePersister {
             .map(r -> r.ruleValue().toRuleString())
             .toList();
 
-        List<String> existing = loader.readPermissionsStringArray(field);
+        List<String> existing = loader.readPermissionsStringArray(field, sessionId);
         Set<String> existingSet = new HashSet<>();
         for (String raw : existing) {
             existingSet.add(normalizeRuleString(raw));
@@ -196,7 +211,7 @@ public class PermissionUpdatePersister {
 
         List<String> merged = new ArrayList<>(existing);
         merged.addAll(newRules);
-        loader.savePermissionsField(field, merged);
+        loader.savePermissionsField(field, merged, sessionId);
 
         if (log.isDebugEnabled()) {
             log.debug("PermissionUpdatePersister: addRules 追加 {} 条到 {} 桶 destination={}（去重后新增 {} 条）",
@@ -210,19 +225,19 @@ public class PermissionUpdatePersister {
      * <p>CC 单桶语义（:275）：仅作用于 {@code update.behavior} 对应桶（非跨 3 桶），
      * roundtrip 归一化后 filter 匹配（:282-287）。
      */
-    private void persistRemoveRules(PermissionUpdate.RemoveRules r, PermissionSourceLoader loader) {
+    private void persistRemoveRules(PermissionUpdate.RemoveRules r, PermissionSourceLoader loader, String sessionId) {
         String field = behaviorField(r.behavior());
         Set<String> rulesToRemove = new HashSet<>();
         for (PermissionRule rule : r.rules()) {
             rulesToRemove.add(rule.ruleValue().toRuleString());
         }
 
-        List<String> existing = loader.readPermissionsStringArray(field);
+        List<String> existing = loader.readPermissionsStringArray(field, sessionId);
         List<String> filtered = existing.stream()
             .filter(raw -> !rulesToRemove.contains(normalizeRuleString(raw)))
             .toList();
 
-        loader.savePermissionsField(field, filtered);
+        loader.savePermissionsField(field, filtered, sessionId);
 
         if (log.isDebugEnabled()) {
             log.debug("PermissionUpdatePersister: removeRules 从 {} 桶移除 {} 条 destination={}（剩余 {} 条）",
@@ -233,13 +248,13 @@ public class PermissionUpdatePersister {
     /**
      * replaceRules 替换桶 · 对齐 CC PermissionUpdate.ts:329-340。
      */
-    private void persistReplaceRules(PermissionUpdate.ReplaceRules rp, PermissionSourceLoader loader) {
+    private void persistReplaceRules(PermissionUpdate.ReplaceRules rp, PermissionSourceLoader loader, String sessionId) {
         String field = behaviorField(rp.behavior());
         List<String> ruleStrings = rp.rules().stream()
             .map(r -> r.ruleValue().toRuleString())
             .toList();
 
-        loader.savePermissionsField(field, ruleStrings);
+        loader.savePermissionsField(field, ruleStrings, sessionId);
 
         if (log.isDebugEnabled()) {
             log.debug("PermissionUpdatePersister: replaceRules 整桶替换 {} 桶 destination={}（{} 条）",
@@ -255,9 +270,9 @@ public class PermissionUpdatePersister {
      * （ant-only / 子 agent 内部），落盘时降级为 {@code "default"}（对齐 CC
      * {@code toExternalPermissionMode}，PermissionMode.ts:111-115）。
      */
-    private void persistSetMode(PermissionUpdate.SetMode s, PermissionSourceLoader loader) {
+    private void persistSetMode(PermissionUpdate.SetMode s, PermissionSourceLoader loader, String sessionId) {
         String externalMode = toExternalModeName(s.mode());
-        loader.savePermissionsValue("defaultMode", externalMode);
+        loader.savePermissionsValue("defaultMode", externalMode, sessionId);
 
         if (log.isDebugEnabled()) {
             log.debug("PermissionUpdatePersister: setMode 写 defaultMode={} destination={}",
@@ -270,8 +285,8 @@ public class PermissionUpdatePersister {
      *
      * <p>去重语义（CC :253-255）：精确字符串匹配（非 roundtrip），避免重复目录。
      */
-    private void persistAddDirectories(PermissionUpdate.AddDirectories ad, PermissionSourceLoader loader) {
-        List<String> existing = loader.readPermissionsStringArray("additionalDirectories");
+    private void persistAddDirectories(PermissionUpdate.AddDirectories ad, PermissionSourceLoader loader, String sessionId) {
+        List<String> existing = loader.readPermissionsStringArray("additionalDirectories", sessionId);
         List<String> dirsToAdd = ad.paths().stream()
             .filter(d -> !existing.contains(d))
             .toList();
@@ -286,7 +301,7 @@ public class PermissionUpdatePersister {
 
         List<String> merged = new ArrayList<>(existing);
         merged.addAll(dirsToAdd);
-        loader.savePermissionsField("additionalDirectories", merged);
+        loader.savePermissionsField("additionalDirectories", merged, sessionId);
 
         if (log.isDebugEnabled()) {
             log.debug("PermissionUpdatePersister: addDirectories 追加 {} 个目录 destination={}（新增 {} 个）",
@@ -297,14 +312,14 @@ public class PermissionUpdatePersister {
     /**
      * removeDirectories 删除 additionalDirectories · 对齐 CC PermissionUpdate.ts:297-315。
      */
-    private void persistRemoveDirectories(PermissionUpdate.RemoveDirectories rd, PermissionSourceLoader loader) {
+    private void persistRemoveDirectories(PermissionUpdate.RemoveDirectories rd, PermissionSourceLoader loader, String sessionId) {
         Set<String> dirsToRemove = new HashSet<>(rd.paths());
-        List<String> existing = loader.readPermissionsStringArray("additionalDirectories");
+        List<String> existing = loader.readPermissionsStringArray("additionalDirectories", sessionId);
         List<String> filtered = existing.stream()
             .filter(d -> !dirsToRemove.contains(d))
             .toList();
 
-        loader.savePermissionsField("additionalDirectories", filtered);
+        loader.savePermissionsField("additionalDirectories", filtered, sessionId);
 
         if (log.isDebugEnabled()) {
             log.debug("PermissionUpdatePersister: removeDirectories 移除 {} 个目录 destination={}（剩余 {} 个）",

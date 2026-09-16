@@ -71,7 +71,7 @@ class InitialPermissionModeSourceDbGlobalMergeTest {
         SettingsMapper mapper = mock(SettingsMapper.class);
         when(mapper.selectOneById(1)).thenReturn(dbRow);
 
-        InitialPermissionModeResolver.Input input = newSource(nexusaiHome, mapper).resolveInput(null, false);
+        InitialPermissionModeResolver.Input input = newSource(nexusaiHome, mapper).resolveInput(null, null, false);
 
         assertThat(input.settingsDefaultMode())
             .as("DB 列 permission_mode=plan 必须优先于磁盘 defaultMode=acceptEdits（DB ?? 磁盘）")
@@ -93,7 +93,7 @@ class InitialPermissionModeSourceDbGlobalMergeTest {
         SettingsMapper mapper = mock(SettingsMapper.class);
         when(mapper.selectOneById(1)).thenReturn(dbRow);
 
-        InitialPermissionModeResolver.Input input = newSource(nexusaiHome, mapper).resolveInput(null, false);
+        InitialPermissionModeResolver.Input input = newSource(nexusaiHome, mapper).resolveInput(null, null, false);
 
         assertThat(input.settingsDefaultMode())
             .as("DB permission_mode=null → 回落磁盘 defaultMode=acceptEdits（零行为变化）")
@@ -108,7 +108,7 @@ class InitialPermissionModeSourceDbGlobalMergeTest {
         //   2 参构造器场景（newSource(nexusaiHome) 无 mapper）。
         writeDiskDefaultMode(nexusaiHome);
 
-        InitialPermissionModeResolver.Input input = newSourceWithoutMapper(nexusaiHome).resolveInput(null, false);
+        InitialPermissionModeResolver.Input input = newSourceWithoutMapper(nexusaiHome).resolveInput(null, null, false);
 
         assertThat(input.settingsDefaultMode())
             .as("mapper 未注入 → 磁盘 defaultMode=acceptEdits（与 V44 前行为一致）")

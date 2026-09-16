@@ -24,6 +24,7 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.ToolResult;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.eventbus.ws.BridgePermissionRequestEvent;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -37,6 +38,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -59,6 +61,12 @@ import org.springframework.messaging.simp.SimpMessagingTemplate;
  */
 @DisplayName("[S16] 更新三态闭环：建议批准 → apply → persist → updatedPermissions 推送")
 class UpdateTriStateTest {
+
+    /** [P11d] 每用例清掉本类登记的服务会话→项目根绑定（@TempDir 每用例不同 ⇒ 必须清，防跨用例污染）。 */
+    @AfterEach
+    void clearSessionBinding() {
+        SessionProjectRoot.clearSession(SESSION_ID);
+    }
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
@@ -108,10 +116,18 @@ class UpdateTriStateTest {
 
     /** 真实管线装配 · persister 仅触碰 projectSettings（tempDir），不污染 user.home。 */
     private static Object[] wireRealPipeline(Path projectHome) {
+        // [P11d] 项目级 source 的落点按会话项目根解析 ⇒ 夹具必须把本会话登记到 tempDir，
+        //   否则会话腿解析不到（测试环境默认答「确无会话」⇒ 落进程 user.dir，与断言目录不符）。
+        //   生产等价物 = ProjectSessionBindingService.bind（web 会话必绑项目）。
+        SessionProjectRoot.setForSession(SESSION_ID, projectHome.toString());
         SettingsJsonParser parser = new SettingsJsonParser(JSON, new PermissionRuleValueParser());
         UserSettingsLoader userLoader = new UserSettingsLoader(parser);
-        ProjectSettingsLoader projectLoader = new ProjectSettingsLoader(parser, () -> projectHome.toString());
-        LocalSettingsLoader localLoader = new LocalSettingsLoader(parser, () -> projectHome.toString());
+        // [P11d] ⭐ 无会话腿指向**另一个目录**（两条腿必须可区分）：漏传 sessionId 时写盘会落这里
+        //   ⇒ 断言「projectHome/.nexusai/settings.json 存在」翻红。若两条腿指向同一目录，
+        //   「persistAll 漏传 sessionId」这类管道缺陷在本夹具里**照样全绿**（已实测）。
+        Path noSessionLeg = projectHome.resolveSibling(projectHome.getFileName() + "-no-session-leg");
+        ProjectSettingsLoader projectLoader = new ProjectSettingsLoader(parser, () -> noSessionLeg.toString());
+        LocalSettingsLoader localLoader = new LocalSettingsLoader(parser, () -> noSessionLeg.toString());
         PermissionUpdateApplier applier = new PermissionUpdateApplier();
         PermissionUpdatePersister persister = new PermissionUpdatePersister(userLoader, projectLoader, localLoader, new PermissionRuleValueParser());
         return new Object[] { applier, persister, projectLoader };
@@ -196,7 +212,8 @@ class UpdateTriStateTest {
             });
 
         // 4) 下一轮真实生效：重新从磁盘加载（PermissionContextBuilder 同源）
-        List<PermissionRule> reloaded = projectLoader.load();
+        // [P11d] 会话腿读（无会话腿现指向另一个目录）
+        List<PermissionRule> reloaded = projectLoader.load(SESSION_ID);
         assertThat(reloaded).anySatisfy(r -> {
             assertThat(r.ruleValue().toolName()).isEqualTo("Bash");
             assertThat(r.ruleValue().ruleContent()).isEqualTo("git status");
@@ -267,7 +284,8 @@ class UpdateTriStateTest {
             .contains("Bash(npm publish)");
 
         // 下一轮生效
-        assertThat(projectLoader.load()).anySatisfy(r ->
+        // [P11d] 会话腿读（无会话腿现指向另一个目录）
+        assertThat(projectLoader.load(SESSION_ID)).anySatisfy(r ->
             assertThat(r.ruleValue().ruleContent()).isEqualTo("npm publish"));
     }
 
@@ -331,7 +349,8 @@ class UpdateTriStateTest {
         assertThat(root.path("permissions").path("allow").toString())
             .as("hook allow 携带的 updatedPermissions 必须持久化（CC handleHookAllow → persistPermissions）")
             .contains("Bash(ls -la)");
-        assertThat(projectLoader.load()).anySatisfy(r ->
+        // [P11d] 会话腿读（无会话腿现指向另一个目录）
+        assertThat(projectLoader.load(SESSION_ID)).anySatisfy(r ->
             assertThat(r.ruleValue().ruleContent()).isEqualTo("ls -la"));
     }
 

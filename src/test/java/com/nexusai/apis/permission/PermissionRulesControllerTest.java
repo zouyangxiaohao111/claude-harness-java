@@ -1,6 +1,7 @@
 package com.nexusai.apis.permission;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -89,9 +90,10 @@ class PermissionRulesControllerTest {
         PermissionRule denyRule = new PermissionRule(
             PermissionRuleSource.PROJECT_SETTINGS, PermissionBehavior.DENY,
             PermissionRuleValue.withContent("Read", "/secret/**"));
-        when(userLoader.load()).thenReturn(List.of(allowRule));
-        when(projectLoader.load()).thenReturn(List.of(denyRule));
-        when(localLoader.load()).thenReturn(List.of());
+        // [P11d] 读侧按 sessionId 调用（GET ?sessionId=... 缺省 null）
+        when(userLoader.load(any())).thenReturn(List.of(allowRule));
+        when(projectLoader.load(any())).thenReturn(List.of(denyRule));
+        when(localLoader.load(any())).thenReturn(List.of());
 
         mockMvc.perform(get("/api/v1/permissions/rules"))
             .andExpect(status().isOk())
@@ -117,7 +119,7 @@ class PermissionRulesControllerTest {
             .andExpect(status().isCreated())
             .andExpect(jsonPath("$.added").value(1));
 
-        verify(persister).persist(any(PermissionUpdate.AddRules.class));
+        verify(persister).persist(any(PermissionUpdate.AddRules.class), any());
     }
 
     @Test
@@ -133,7 +135,7 @@ class PermissionRulesControllerTest {
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.removed").value(1));
 
-        verify(persister).persist(any(PermissionUpdate.RemoveRules.class));
+        verify(persister).persist(any(PermissionUpdate.RemoveRules.class), any());
     }
 
     @Test
@@ -158,6 +160,40 @@ class PermissionRulesControllerTest {
                     {"destination":"userSettings","behavior":"allow","rules":["Bash(x"]}
                     """))
             .andExpect(status().isBadRequest());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // [P11d] sessionId 透传：项目级 source 的读写落点必须由同一 sessionId 决定
+    // ══════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[P11d] GET ?sessionId= 透传到 loader.load(sessionId)（project/local 按会话项目根读）")
+    void listPassesSessionIdToLoaders() throws Exception {
+        when(projectLoader.load(any())).thenReturn(List.of());
+
+        mockMvc.perform(get("/api/v1/permissions/rules").param("sessionId", "sess-a"))
+            .andExpect(status().isOk());
+
+        // ⭐ 本批最关键不变量的一半：读侧必须带会话 id（否则读到的是别的项目的规则）
+        verify(projectLoader).load(eq("sess-a"));
+        verify(localLoader).load(eq("sess-a"));
+        verify(userLoader).load(eq("sess-a"));
+    }
+
+    @Test
+    @DisplayName("[P11d] POST 请求体 sessionId 透传到 persister.persist(update, sessionId)（写落该会话项目根）")
+    void addPassesSessionIdToPersister() throws Exception {
+        when(parser.parse("Bash")).thenReturn(PermissionRuleValue.wholeTool("Bash"));
+
+        mockMvc.perform(post("/api/v1/permissions/rules")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("""
+                    {"destination":"projectSettings","behavior":"allow","rules":["Bash"],"sessionId":"sess-a"}
+                    """))
+            .andExpect(status().isCreated());
+
+        // ⭐ 另一半：写侧必须带同一个会话 id（与读侧同值 ⇒ 读写同址）
+        verify(persister).persist(any(PermissionUpdate.AddRules.class), eq("sess-a"));
     }
 
     @Test

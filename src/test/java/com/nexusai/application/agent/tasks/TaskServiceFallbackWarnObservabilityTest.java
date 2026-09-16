@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>本测试锁「每次回落 = 一条 WARN」这一判据（第 1 次、第 2 次都必须在日志里）。
  *
  * <p>⚠️ <b>与派单措辞的差异（已实测）</b>：派单原文写「两个<b>不同会话</b>各触发一次 ⇒ 捕获到
- * 两条独立 WARN」。实测该措辞<b>不可实现</b>——{@link TaskService#getTaskListId(String, Object)}
+ * 两条独立 WARN」。实测该措辞<b>不可实现</b>——{@link TaskService#getTaskListId(String, com.nexusai.application.agent.team.TeammateIdentity)}
  * 走到最终回落的<b>充要条件</b>是优先级 6（显式会话形参）也 miss，即 {@code sessionId} 必为
  * null/空白；<b>带会话的调用在优先级 6 就返回了，永远到不了本级</b>。因此「按 sessionId 分桶」
  * 的键恒为同一个（死分支）。本测试改锁同一意图的<b>可实现形式</b>：每次回落各一条 WARN。

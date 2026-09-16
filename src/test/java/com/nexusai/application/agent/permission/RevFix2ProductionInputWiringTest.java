@@ -123,7 +123,7 @@ class RevFix2ProductionInputWiringTest {
             "{\"permissions\":{\"defaultMode\":\"plan\",\"disableBypassPermissionsMode\":\"disable\"}}");
 
         InitialPermissionModeSource source = newSource(nexusaiHome);
-        InitialPermissionModeResolver.Input input = source.resolveInput(null, false);
+        InitialPermissionModeResolver.Input input = source.resolveInput(null, null, false);
 
         // local 覆盖 project（CC 覆盖序 local > project > user，constants.ts:4-16）
         assertThat(input.settingsDefaultMode())
@@ -148,7 +148,7 @@ class RevFix2ProductionInputWiringTest {
             "{\"permissions\":{\"defaultMode\":\"acceptEdits\"}}");
 
         InitialPermissionModeSource source = newSource(nexusaiHome);
-        InitialPermissionModeResolver.Input input = source.resolveInput(null, false);
+        InitialPermissionModeResolver.Input input = source.resolveInput(null, null, false);
 
         assertThat(input.settingsDefaultMode()).isEqualTo("acceptEdits");
         assertThat(InitialPermissionModeResolver.resolve(input, DEFAULT_CFG).mode())

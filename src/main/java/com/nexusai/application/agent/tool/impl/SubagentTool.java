@@ -2161,14 +2161,20 @@ public class SubagentTool implements Tool {
         //   并按 toolUseId 前缀 ('tool-' + call.id) 写入 WorktreeCwdTracker.
         //   放在 filterDeniedAgents + hasRequiredMcpServers 之后, 只对真正启动的子 Agent 解析.
         //
-        //   P0-2 修复: 原 key 为裸 call.id (toolUseId) 与 WorktreeCwdTracker L1 契约 (per sessionId) 冲突,
-        //     导致 activeSessionCount 单调递增且 getCwd(sessionId) 拿不到. 现统一加 'tool-' 前缀表明
+        //   P0-2 修复: 原 key 为裸 call.id (toolUseId)，与同一张 sessionCwd 平表里的 session 维度
+        //     键 (sessionId) 共用命名空间 ⇒ 两维度不可区分. 现统一加 'tool-' 前缀表明
         //     "本 turn 内 tool 维度追踪" 区别于 session 维度.
+        //
+        //   [批 P2 更正] ⛔ 本段原文另称该写法「导致 activeSessionCount 单调递增且 getCwd(sessionId) 拿不到」——
+        //     该效果**从未被观测过**：该访问器实测 0 调用方、且已删除（见 WorktreeCwdTracker 类 javadoc）；
+        //     getCwd(String) 是按入参 key 直查，传 sessionId 时本就能查到自己的条目。
+        //     真实理由只有上面那条「命名空间不可区分」。
         //
         //   [acc8 复核 · ⛔ 上方的「可观测性写入」定性是错的，已更正] 本条 setCwd 是**预留**写点，
         //     当前**无任何消费方**，故不构成「可观测性」：全仓读侧 getCwd/getWorktreeSession 的调用点
         //     全部传 sessionKey（EnterWorktreeTool:386/429、ExitWorktreeTool:389/502/621、ChatService:3478…），
-        //     **没有一处**传 'tool-' + id；连当初被点名的监控读点 activeSessionCount() 也是 0 调用方。
+        //     **没有一处**传 'tool-' + id；连当初被点名的监控读点 activeSessionCount() 也是 0 调用方
+        //     （该访问器已随 misc1 删除，见 WorktreeCwdTracker 类 javadoc）。
         //     ⛔ 保留写点（非死代码即删：Enter/Exit 的 session 维度链是活的，本处是同一 API 的另一维度），
         //     但不得再声称它提供服务。
         //
@@ -3096,8 +3102,8 @@ public class SubagentTool implements Tool {
             //   阻止 WorktreeCwdTracker.sessionCwd 这个 static ConcurrentHashMap 无界增长
             //   (清理到对应前缀 key, 无 entry 时 no-op).
             //   [acc8 复核 · 理由已更正] 原注释写「避免 activeSessionCount 单调递增」——
-            //   该读点实测 0 调用方（:2168-2173 已登记），故这条理由已空转；
-            //   仍然成立的真实理由是「不清理会泄漏 map 条目」。⛔ 不改代码（清理本身是对的）。
+            //   该读点实测 0 调用方（:2173-2179 已登记）、且该访问器已随 misc1 删除，故这条理由
+            //   已空转；仍然成立的真实理由是「不清理会泄漏 map 条目」。⛔ 不改代码（清理本身是对的）。
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
             // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevSyncProjectRoot) 已删
             //   （ThreadLocal 载体删除，见 executeSync 入口注释）。
@@ -3353,7 +3359,8 @@ public class SubagentTool implements Tool {
                     } finally {
                         // P0-2 修复: 异步线程结束时清理 tracker key, 阻止 sessionCwd map 无界增长.
                         //   [acc8 复核 · 理由已更正] 原注释写「避免 activeSessionCount 单调递增」——
-                        //   该读点实测 0 调用方（:2168-2173 已登记），故理由空转；真实理由是防 map 泄漏。
+                        //   该读点实测 0 调用方（:2173-2179 已登记）、且该访问器已随 misc1 删除，故理由
+                        //   空转；真实理由是防 map 泄漏。
                         WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
                         // [IMP-G4 C7] 终态注销 name→agentId（避免映射残留指向已终止 agentId ·
                         //   CC React 状态随会话结束 GC，Java 显式注销等价位）
@@ -3501,8 +3508,8 @@ public class SubagentTool implements Tool {
             // P0-2 修复: executeAsync 降级到同步执行的清理 (与 doExecute 中的 setCwd 配对),
             //   阻止 WorktreeCwdTracker.sessionCwd 这个 static ConcurrentHashMap 无界增长.
             //   [acc8 复核 · 理由已更正] 本处原注释未给理由；与另两处 clearCwd 一致，
-            //   理由**不是** activeSessionCount（该读点实测 0 调用方，见 :2168-2173），
-            //   而是防 map 条目泄漏。⛔ 不改代码。
+            //   理由**不是** activeSessionCount（该读点实测 0 调用方、且该访问器已随 misc1 删除，
+            //   见 :2173-2179），而是防 map 条目泄漏。⛔ 不改代码。
             WorktreeCwdTracker.clearCwd("tool-" + toolUseId);
             // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevFallbackProjectRoot) 已删
             //   （ThreadLocal 载体删除，见本方法入口注释）。

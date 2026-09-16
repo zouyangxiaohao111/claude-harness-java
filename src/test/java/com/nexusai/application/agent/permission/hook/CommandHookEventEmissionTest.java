@@ -137,7 +137,7 @@ class CommandHookEventEmissionTest {
 
     private CommandHookExecutor newExecutor(FakeHookProcess process, HookEventBus bus) {
         CommandHookExecutor executor = new CommandHookExecutor(
-            spec -> process, k -> null, p -> true, () -> "C:/project", id -> "C:/data");
+            spec -> process, k -> null, p -> true, sid -> "C:/project", id -> "C:/data");
         executor.setHookEventBus(bus);
         executor.progressIntervalMs = 10L; // 测试提速 (S4 允许, 不触碰 HookEventBus)
         return executor;

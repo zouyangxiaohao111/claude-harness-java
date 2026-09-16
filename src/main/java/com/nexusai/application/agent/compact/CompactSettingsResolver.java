@@ -12,7 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
  * <p><b>WHY 存在（唯一目标）</b>: 压缩总开关/各子开关（auto/reactive/contextCollapse/snip/
  * SM×2/cached-MC/time-based-MC + DISABLE_COMPACT/DISABLE_AUTO_COMPACT 一票否决）此前只有
  * env（CompactEnvProperties）+ FeatureFlags（record 一次性装配）+ 硬编码 三条来源，DB 无可配列。
- * 本类承载 settings 12 列的<b>实时读取</b>——每次 {@link SettingsMapper#selectOneById(int)} 单行
+ * 本类承载 settings 12 列的<b>实时读取</b>——每次 {@link SettingsMapper#selectOneById(java.io.Serializable)} 单行
  * （id=1，settings 单行多列），不缓存（前端 PUT /api/v1/settings 后下一轮即生效，对齐 V42
  * agent_swarms_enabled "前端开关→PUT→DB→实时读源" 权威先例）。
  *

@@ -30,20 +30,28 @@ public interface WorkflowService {
 
     /**
      * 面板/工具启动 workflow · CC original: {@code launch(input, toolUseContext, canUseTool)}
-     * (service.ts:53-67)：parse script → register → detached runWorkflow。
+     * (service.ts:53-67 / 实现 :188-257)：parse script → register → detached runWorkflow。
      *
      * <p>三源解析（service.ts:141-179）：script > scriptPath > name；脚本编译期校验失败抛
      * {@code IllegalArgumentException("Script validation failed: ...")}（service.ts:190-194，
      * 不进后台）。
+     *
+     * <p><b>[P10a · D3] 项目根只解析一次</b>（CC：{@code service.ts:133-136
+     * cwd: cwdOverride ?? getProjectRoot()} 每次 launch 解析一次；工具入口已解析的值<b>下传</b>，
+     * ⛔ 服务内不得对同一 sessionId 再解析一遍 —— 否则同链两套判据）。
      *
      * @param input       脚本三源 + args/description/resume/title/maxConcurrency
      * @param ctx         工具调用上下文（buildHost 载荷：cwd/toolUseId/agentId）
      * @param canUseTool  权限判定函数 · CC original: {@code CanUseToolFn}
      *                    （src/hooks/useCanUseTool.tsx:27）；Java 侧核心层为
      *                    {@code HookPermissionResolver.CanUseTool}，bundle 以 Object 不透明承载透传
+     * @param projectRoot 调用方<b>已解析</b>的项目根（同链唯一解析点，工具入口产物）；null/空白 =
+     *                    调用方未解析 ⇒ 本方法按会话解析一次
+     *                    （{@link com.nexusai.application.agent.agent.CwdResolution#getProjectRoot(String)}）
      * @return {@code {runId, scriptPath?}} 的异步结果
      */
-    CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool);
+    CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool,
+                                           String projectRoot);
 
     /**
      * 杀掉一个 run · CC original: {@code kill(runId)} (service.ts:68) → taskRegistrar.kill。

@@ -407,7 +407,9 @@ public class CommandRegistrationConfigGroupAGitDir {
                     new PermissionUpdate.AddDirectories(PermissionUpdate.Destination.LOCAL_SETTINGS,
                         List.of(success.absolutePath()));
                 if (persister != null) {
-                    persister.persist(update);
+                    // [P11d] 传 lambda 形参 sessionId：LOCAL_SETTINGS 落本会话项目根
+                    //   （读侧同一值 ⇒ 读写同址）
+                    persister.persist(update, sessionId);
                 }
                 if (applier != null) {
                     // best-effort 应用到默认权限上下文（per-turn 重建，仅内存演示；pathGuard 生效受限，受控差异）

@@ -44,7 +44,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class RenameColorTeammateGuardCrossSessionTest {
 
-    /** 会话 A = teammate 会话；会话 B = 普通会话。取 UUID 形态（令颜色状态通道可观测）。 */
+    /** 会话 A = teammate 会话；会话 B = 普通会话。
+     *
+     *  <p><b>[session-id-short]</b>取 <b>UUID 形态</b>作会话键，用于证明「会话键形态不影响路由」——
+     *  颜色状态通道按 {@code registry.get(String)}（sessions map）查，与键是不是 UUID 形态无关。
+     *  生产 short 键形态由 {@code AgentColorCommandTest} 覆盖。 */
     private static final String SESSION_A = "3f1b6c2e-0000-4000-8000-0000000000aa";
     private static final String SESSION_B = "3f1b6c2e-0000-4000-8000-0000000000bb";
 
@@ -67,11 +71,12 @@ class RenameColorTeammateGuardCrossSessionTest {
 
     private static SessionAgentStateRegistry registryWithBothSessions(AgentState a, AgentState b) {
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
+        // [session-id-short] 只注册 **String 会话键**（sessions map）——这正是生产的注册形态。
+        //   ⛔ 原实现额外 register(UUID.fromString(SESSION_x)) 到 agents map，是为兼容旧
+        //   setAppStateColor 的 `resolveSessionUuid → get(UUID)` 错路由；该路由已删 ⇒ 那两条
+        //   UUID 注册成为死夹具，且会**掩盖回归**（若颜色回退到 UUID 查，本测试仍绿）⇒ 一并删除。
         registry.register(SESSION_A, a);
         registry.register(SESSION_B, b);
-        // /color 的 setAppStateColor 经 UUID 键查（registry.get(UUID) → agents map）⇒ 同实例同注册
-        registry.register(UUID.fromString(SESSION_A), a);
-        registry.register(UUID.fromString(SESSION_B), b);
         return registry;
     }
 

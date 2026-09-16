@@ -259,7 +259,7 @@ class AgentColorCommandTest {
         AgentColorCommand cmd = new AgentColorCommand();
         AtomicReference<String> savedColor = new AtomicReference<>();
         AtomicReference<String> appStateColor = new AtomicReference<>("__unset__");
-        AtomicReference<UUID> savedSession = new AtomicReference<>();
+        AtomicReference<String> savedSession = new AtomicReference<>();
         AgentColorCommand.CommandResult r = cmd.execute("reset", env(false,
             (sid, color) -> { savedSession.set(sid); savedColor.set(color); return CompletableFuture.completedFuture(null); },
             appStateColor::set, msg -> { }));
@@ -267,7 +267,11 @@ class AgentColorCommandTest {
         assertThat(r.message()).isEqualTo("Session color reset to default");
         // CC color.ts:51 用 "default" sentinel（非空串）持久化，truthiness 守卫跨会话重启保留
         assertThat(savedColor.get()).isEqualTo("default");
-        assertThat(savedSession.get()).isNotNull();
+        // [session-id-short] ⭐ 守卫：分派入口的 short 键必须**原样直传**到 saveAgentColor
+        //   （原实现经 resolveSessionUuid 转换 ⇒ short 键抛 IAE ⇒ 得 null ⇒ 本断言红）。
+        assertThat(savedSession.get())
+            .as("saveAgentColor 收到的 sessionId 必须是 short 直键原值（⛔ 不得被 UUID 转换吞掉）")
+            .isEqualTo(SESSION_SHORT);
         // CC color.ts:53-60 standaloneAgentContext.color = undefined
         assertThat(appStateColor.get()).isNull();
     }
@@ -789,14 +793,21 @@ class AgentColorCommandTest {
     // helpers
     // ════════════════════════════════════════════════════════════════════
 
-    /** 构造默认 Env · agentColors 用 SubagentTool.AGENT_COLORS（生产真源，探查 △-3）。 */
+    /** [session-id-short] 夹具会话 ID = 生产 short 直键形态（{@code SessionService:189 generateId("sess")}）。 */
+    private static final String SESSION_SHORT = "sess-1a2b3c4d";
+
+    /** 构造默认 Env · agentColors 用 SubagentTool.AGENT_COLORS（生产真源，探查 △-3）。
+     *
+     *  <p><b>[session-id-short]</b>：{@code sessionId} 槽改为 <b>short 直键</b> {@link #SESSION_SHORT}
+     *  （原为 {@code UUID::randomUUID}）——Env 组件类型已随生产链路由 {@code Supplier<UUID>} 收敛为
+     *  {@code Supplier<String>}；测试夹具必须用生产真形态，否则测不出「short 键被直传」的语义。 */
     private static AgentColorCommand.Env env(boolean isTeammate,
-                                             java.util.function.BiFunction<UUID, String, CompletableFuture<Void>> save,
+                                             java.util.function.BiFunction<String, String, CompletableFuture<Void>> save,
                                              Consumer<String> setAppState,
                                              Consumer<String> onDone) {
         return new AgentColorCommand.Env(
             () -> isTeammate,
-            UUID::randomUUID,
+            () -> SESSION_SHORT,
             () -> "/tmp/transcript.jsonl",
             () -> SubagentTool.AGENT_COLORS,
             save != null ? save : (sid, c) -> CompletableFuture.completedFuture(null),

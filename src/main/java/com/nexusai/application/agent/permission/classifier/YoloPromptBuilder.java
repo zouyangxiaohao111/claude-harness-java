@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.Tool;
+import com.nexusai.common.SessionKeys;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
@@ -96,7 +97,10 @@ public class YoloPromptBuilder {
     /** [R4-3] 项目根惰性供应 · 决策 D6 项目根（{@code CwdResolution.getOriginalCwdLayer()}，
      *  无会话回落 {@code user.dir}）。localSettings 源 = {@code <projectRoot>/.nexusai/settings.local.json}
      *  （项目级，对齐 LocalSettingsLoader 既有语义）；nexusai.home 已废弃（第二轮拍板），不再经
-     *  {@code @Value("${nexusai.home}")} 注入。 */
+     *  {@code @Value("${nexusai.home}")} 注入。
+     *  <p><b>[P11d] 语义收窄为「无会话腿」</b>：只在 {@code sessionId} 为 null/空白/{@code no-session}
+     *  哨兵时使用；真会话腿在 {@link #projectRoot(String)} 里按 sessionId 现算
+     *  （⛔ 不改构造器注入 —— {@code SubagentExecutor:5021 new YoloPromptBuilder()} 是别的批的领地）。 */
     private final Supplier<String> projectRootSupplier = () -> CwdResolution.getOriginalCwdLayer(null);
 
     /** [prompt-align TOOLS-02] 托管策略文件路径 · policySettings 源
@@ -105,7 +109,7 @@ public class YoloPromptBuilder {
     private volatile String policySettingsPath = "";
 
     /** [prompt-align TOOLS-02] localSettings 源路径覆盖（测试用）· null → 默认解析
-     *  （{@link #localSettingsPath()}）。 */
+     *  （{@link #localSettingsPath(String)}）。 */
     private volatile Path localSettingsPathOverride;
 
     /** settings.autoMode 规则 · 对齐 CC AutoModeRules（yoloClassifier.ts:85-89）{allow, soft_deny, environment}。 */
@@ -191,6 +195,21 @@ public class YoloPromptBuilder {
      * @return 分类器 system prompt（含 TOOL_USE_LINE 锚点行）
      */
     public String buildYoloSystemPrompt() {
+        return buildYoloSystemPrompt(null);
+    }
+
+    /**
+     * 构建分类器 system prompt（按会话解析 localSettings 源）· 对齐 CC
+     * {@code buildYoloSystemPrompt}（yoloClassifier.ts:484-540）。
+     *
+     * <p><b>[P11d]</b> 与 {@link #buildYoloSystemPrompt()} 的唯一差别：{@code sessionId} 决定
+     * {@code localSettings} 源的<b>项目根</b>（{@link #localSettingsPath(String)}）⇒ 每个会话的
+     * {@code settings.autoMode} 规则取自各自项目，不再共用后端启动目录（改前 = 跨会话串值）。
+     *
+     * @param sessionId 会话 ID（short；null/空白/哨兵 ⇒ 无会话腿）
+     * @return 分类器 system prompt（含 TOOL_USE_LINE 锚点行）
+     */
+    public String buildYoloSystemPrompt(String sessionId) {
         String systemPrompt;
         if (!BASE_PROMPT.isEmpty() && !EXTERNAL_PERMISSIONS_TEMPLATE.isEmpty()) {
             // CC :488-492 systemPrompt = BASE_PROMPT.replace('<permissions_template>', EXTERNAL 模板)
@@ -202,7 +221,7 @@ public class YoloPromptBuilder {
         }
         // [IMP-6 OPD-WF6-03-RV] 用户 auto-mode 规则注入 · CC :494-539（getAutoModeConfig 源
         //   [TOOLS-02] 四源合并（user/local/flag/policy，projectSettings 排除），见 readAutoModeConfig）。
-        AutoModeRules autoMode = readAutoModeConfig();
+        AutoModeRules autoMode = readAutoModeConfig(sessionId);
         if (autoMode != null) {
             String userAllow = toBulletLines(autoMode.allow());
             String userDeny = toBulletLines(autoMode.softDeny());
@@ -319,12 +338,22 @@ public class YoloPromptBuilder {
      * @return autoMode 三段规则（四源合并）；全空/源全缺 → null
      */
     AutoModeRules readAutoModeConfig() {
+        return readAutoModeConfig(null);
+    }
+
+    /**
+     * [P11d] 读四源合并的 {@code autoMode} 三段规则（localSettings 源按会话解析项目根）。
+     *
+     * @param sessionId 会话 ID（short；null/空白/哨兵 ⇒ 无会话腿）
+     * @return autoMode 三段规则（四源合并）；全空/源全缺 → null
+     */
+    AutoModeRules readAutoModeConfig(String sessionId) {
         List<String> allow = new ArrayList<>();
         List<String> softDeny = new ArrayList<>();
         List<String> environment = new ArrayList<>();
         // CC settings.ts:951-971 四源按序合并 [userSettings, localSettings, flagSettings, policySettings]
         mergeAutoModeSource(userSettingsPath, allow, softDeny, environment);
-        mergeAutoModeSource(localSettingsPath(), allow, softDeny, environment);
+        mergeAutoModeSource(localSettingsPath(sessionId), allow, softDeny, environment);
         // flagSettings：Java web 无 CLI --settings → 恒空（FlagSettingsLoader:43 先例）→ 显式跳过
         if (policySettingsPath != null && !policySettingsPath.isBlank()) {
             mergeAutoModeSource(Paths.get(policySettingsPath), allow, softDeny, environment);
@@ -365,14 +394,33 @@ public class YoloPromptBuilder {
         }
     }
 
-    /** localSettings 源路径 · 覆盖注入 → 原样；否则 projectRootSupplier 项目根 →
+    /** localSettings 源路径 · 覆盖注入 → 原样；否则按会话项目根 →
      *  {@code <projectRoot>/.nexusai/settings.local.json}（决策 D6，LocalSettingsLoader 语义；
-     *  文件缺失由 mergeAutoModeSource lenient 跳过）。 */
-    private Path localSettingsPath() {
+     *  文件缺失由 mergeAutoModeSource lenient 跳过）。
+     *  <p>[P11d] 项目根按 {@code sessionId} 现算（见 {@link #projectRoot(String)}）。 */
+    private Path localSettingsPath(String sessionId) {
         if (localSettingsPathOverride != null) {
             return localSettingsPathOverride;
         }
-        return Paths.get(projectRootSupplier.get(), NexusaiPaths.getProjectDirName(), "settings.local.json");
+        return Paths.get(projectRoot(sessionId), NexusaiPaths.getProjectDirName(), "settings.local.json");
+    }
+
+    /**
+     * [P11d] 项目根解析（本类唯一入口）。
+     *
+     * <p>会话非空 ⇒ {@code CwdResolution.getProjectRoot(sessionId)}（会话冻结项目根；四态语义见该方法
+     * javadoc —— 会话存在却无绑定 / DB 明确答无此会话 / 无法判定 ⇒ fail-loud 抛）。
+     * <p>会话为 null / 空白 / {@code no-session} 哨兵 ⇒ 铁律出口「本环境确无会话」⇒
+     * {@link #projectRootSupplier}（生产 = 命名无会话出口，进程 {@code user.dir} + ≥WARN）。
+     *
+     * @param sessionId 会话 ID（short；可为 null = 确无会话）
+     * @return 项目根绝对路径字符串
+     */
+    private String projectRoot(String sessionId) {
+        if (sessionId == null || sessionId.isBlank() || SessionKeys.isNoSession(sessionId)) {
+            return projectRootSupplier.get();
+        }
+        return CwdResolution.getProjectRoot(sessionId);
     }
 
     /** string[] 读取 · CC schema z.array(z.string())（settings.ts:940-945）；非数组 → 空表。 */

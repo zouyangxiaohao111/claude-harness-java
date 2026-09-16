@@ -134,6 +134,14 @@ import java.util.function.Supplier;
  * （非 cwd 槽 {@code resolve()}），与 cwd 槽（{@link SessionCwdHolder#get}）双独立，对齐 CC
  * {@code STATE.cwd}/{@code STATE.originalCwd} 双字段。
  *
+ * <p><b>getProjectRoot</b>（{@link #getProjectRoot(String)}，对齐 CC {@code getProjectRoot()} state.ts:498-508）：
+ * 本类<b>第三个</b>「按会话解析」入口，且与上面两个语义不同 —— {@link #getCwd(String)} = CC {@code getCwd()}
+ * （bash {@code cd} 可覆盖）、{@link #getOriginalCwdLayer(String)} = CC {@code getOriginalCwd()}
+ * （{@code EnterWorktreeTool} 会重锚），而本入口 = CC {@code getProjectRoot()}（<b>不</b>随 mid-session
+ * worktree 重锚的项目身份根）。判据载体仍是 {@link SessionProjectRoot.Lookup} 四态，只是
+ * <b>L1 直接跳过</b> sessionCwd/originalCwd 两槽。⛔ 三个入口不得互相替代 ——
+ * workflow 域要的是本入口（{@code ports.ts:54-60}：与 journal runsDir 同根）。
+ *
  * <p><b>归一化</b>（{@link #normalizeCwd(String)}，对齐 CC setCwdState NFC + Shell.ts setCwd realpathSync）：
  * realpath 解符号链接 + NFC 归一化；realpath 失败（目录被删/不存在）回原值 + NFC（不抛，对齐 CC catch 兜底）。
  *
@@ -182,8 +190,38 @@ public final class CwdResolution {
     private static final java.util.concurrent.atomic.AtomicBoolean SESSIONLESS_WARNED_GET_ORIGINAL_CWD =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
+    /**
+     * [P10a] {@link #getProjectRoot(String)} 入口专属闸（「DB 明确答无此会话」）。
+     *
+     * <p>同 {@link #UNKNOWN_SESSION_WARNED_GET_CWD} 的按入口拆闸理由：本仓现有 3 个「按会话解析」
+     * 入口（{@code getCwd} / {@code getOriginalCwdLayer} / {@code getProjectRoot}）若共用一闸，
+     * 先触发的那个会把其余入口的告警吃掉（可见度上限 = 1 行/进程）。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** [P10a] {@link #getProjectRoot(String)} 入口专属闸（sessionless 态）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean SESSIONLESS_WARNED_GET_PROJECT_ROOT =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     /** [批 6] 显式「确无会话」哨兵路径的告警一次性开关（warnNoSessionSentinel）。 */
     private static final java.util.concurrent.atomic.AtomicBoolean NO_SESSION_WARNED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 无会话<b>命名出口</b>（{@link #getCwdForNonSession()} /
+     * {@link #getOriginalCwdLayerForNonSession()}）的告警一次性开关（warnNonSessionExit）。
+     *
+     * <p><b>WHY 必须 ≥WARN 而非 DEBUG</b>（铁律「不许静默失效」出口 (b)）：这两个方法
+     * <b>恒返回进程 {@code user.dir}</b>（JVM 启动目录）—— 它<b>不是</b>任何会话的项目根。
+     * 「确无会话」是合法形态故不抛，但它是<b>信息缺失</b>；只打 DEBUG 会让「本该有会话却走了
+     * 无会话出口」的漏传在默认日志级别下完全静默。
+     *
+     * <p>⚠️ <b>两出口共用一个闸</b>（与 {@link #UNKNOWN_SESSION_WARNED_GET_CWD} 的按入口拆闸<b>不同</b>）：
+     * 二者语义同族（同一返回值定义、同一句「确无会话」判定），族内重复告警不新增信息；而本族实测有
+     * <b>31 个调用点</b>（{@code ForNonSession} 20 + {@code (null)} 11），逐次打印会淹没日志。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean NON_SESSION_EXIT_WARNED =
         new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private CwdResolution() {}
@@ -202,7 +240,10 @@ public final class CwdResolution {
         UNKNOWN_SESSION_WARNED_GET_ORIGINAL_CWD.set(false);
         SESSIONLESS_WARNED_GET_CWD.set(false);
         SESSIONLESS_WARNED_GET_ORIGINAL_CWD.set(false);
+        UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT.set(false);
+        SESSIONLESS_WARNED_GET_PROJECT_ROOT.set(false);
         NO_SESSION_WARNED.set(false);
+        NON_SESSION_EXIT_WARNED.set(false);
     }
 
     /**
@@ -377,6 +418,85 @@ public final class CwdResolution {
     }
 
     /**
+     * <b>会话项目根层</b>（对齐 CC {@code getProjectRoot()} {@code bootstrap/state.ts:498-508}）。
+     *
+     * <p><b>CC 真源（自验 · ⛔ 不信注释）</b>：{@code state.ts:498-508} javadoc 逐字 ——
+     * 「Get the stable project root directory. Unlike {@code getOriginalCwd()}, this is
+     * <b>never updated by mid-session EnterWorktreeTool</b> (so skills/history stay stable when
+     * entering a throwaway worktree). It IS set at startup by {@code --worktree} … Use for
+     * <b>project identity</b> (history, skills, sessions) <b>not file operations</b>」；写入方实测
+     * 只有 {@code setup.ts:277-281}（启动，含 {@code --worktree}）与
+     * {@code ExitWorktreeTool.ts:129-136}（退出恢复）—— {@code EnterWorktreeTool.ts:96} 只写
+     * {@code setOriginalCwd}，<b>不写</b> projectRoot。
+     *
+     * <p><b>本仓对应物 = {@link SessionProjectRoot}</b>（唯一写入方 = 项目绑定
+     * {@code ProjectSessionBindingService:80} / run 入口冻结 {@code LlmAgentLoop:11347} / DB 回源
+     * {@code SessionProjectRoot:448}；⛔ <b>无</b> worktree 写入方）。⚠️ 因此
+     * {@link #getCwd(String)}（L1 = {@code SessionCwdHolder.get}，bash {@code cd} 与 worktree 入口
+     * 都写）与 {@link #getOriginalCwdLayer(String)}（L1 = {@code SessionCwdHolder.getOriginalCwd}，
+     * {@code EnterWorktreeTool:392} 会重锚）<b>都不是</b> projectRoot —— 前者 = CC {@code getCwd()}，
+     * 后者 = CC {@code getOriginalCwd()}。
+     *
+     * <p><b>WHY 必须单独成一个入口（而不是复用上面两个）</b>：CC {@code src/workflow/ports.ts:54-60}
+     * 要求 workflow 的 {@code host.cwd} 与 journal {@code runsDir}（{@code persistence.ts:32-34}
+     * {@code getRunsDir() = join(getProjectRoot(), ...)}）<b>同根</b>，否则「进入
+     * worktree/子目录后，命名 workflow 解析与 journal 持久化会 <b>desync</b>」。任何一层落到
+     * {@code getCwd}/{@code getOriginalCwd} 都会把这条不变量破坏掉（前者被 bash {@code cd} 挪走，
+     * 后者被 worktree 入口挪走）。
+     *
+     * <p><b>四态语义与 {@code CommandHookExecutor.resolveSessionProjectRoot}（批 P9 正范式）逐态一致</b>：
+     * 命中绑定 → 该值；{@code sessionless}（本环境确无会话，合法）→ 无会话命名出口 + ≥WARN；
+     * {@code unbound}（会话存在却无绑定）/ {@code unknown}（DB 明确答无此会话）/ {@code resolutionFailed}
+     * （无法判定）→ <b>fail-loud 抛</b>（⛔ 绝不用进程 {@code user.dir} 冒充项目根）。
+     * 判据载体即 {@link SessionProjectRoot.Lookup} —— ⛔ 不新造第四套判据。
+     *
+     * <p><b>归一化</b>：与同族两层一致，经 {@link #normalizeCwd(String)}（realpath + NFC，失败回原值不抛）。
+     *
+     * @param sessionId 会话 ID（null/空白 或显式 {@link SessionKeys#NO_SESSION} 哨兵 ⇒ 无会话命名出口）
+     * @return 归一化的会话项目根；<b>会话存在却无绑定 / DB 明确答无此会话 / 无法判定 ⇒ 抛</b>；
+     *         本环境确无会话（sessionless）⇒ 无会话出口值（进程 user.dir）
+     * @throws IllegalStateException 同 {@link #getCwd(String)} 的三类数据链路异常（fail-loud）
+     */
+    public static String getProjectRoot(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            warnNullSession("getProjectRoot", "getOriginalCwdLayerForNonSession");
+            return getOriginalCwdLayerForNonSession();
+        }
+        if (SessionKeys.isNoSession(sessionId)) {
+            warnNoSessionSentinel("getProjectRoot", "getOriginalCwdLayerForNonSession");
+            return getOriginalCwdLayerForNonSession();
+        }
+        // ⛔ 刻意<b>不</b>读 sessionCwd / originalCwd 两槽（两者都会被 worktree/cd 挪走，见上 javadoc）。
+        SessionProjectRoot.Lookup bound = resolveBoundProject(sessionId);
+        if (bound.resolutionFailed()) {
+            throw unresolvedProjectRoot(sessionId,
+                "项目根**无法判定**（非「无此会话」也非「未绑定」）—— 判据来源 = DB 回源解析器未接线，"
+                    + "或回源查询抛错 / 违约返回 null（详见同刻 ≥WARN 日志 [SessionProjectRoot]）");
+        }
+        String boundProject = bound.projectRoot();
+        if (boundProject != null) {
+            if (isValidDirectory(boundProject)) {
+                return normalizeCwd(boundProject);
+            }
+            throw unresolvedProjectRoot(sessionId,
+                "boundProject 无效（需绝对路径且目录存在）: " + boundProject);
+        }
+        if (bound.sessionKnown()) {
+            throw unresolvedProjectRoot(sessionId,
+                "会话存在但无绑定项目根（sessions.main_project_id 为空 / projects.path 失效）");
+        }
+        if (bound.sessionless()) {
+            warnSessionlessEnvironment("getProjectRoot", "getOriginalCwdLayerForNonSession",
+                SESSIONLESS_WARNED_GET_PROJECT_ROOT);
+            return getOriginalCwdLayerForNonSession();
+        }
+        warnUnknownSession("getProjectRoot", sessionId, UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT);
+        throw unresolvedProjectRoot(sessionId,
+            "DB 明确答「无此会话」（已删 / 未登记 / 来源不明 id）—— 数据链路异常，⛔ 不回落进程 user.dir；"
+                + "若本调用确无会话，必须显式传 SessionKeys." + SessionKeys.NO_SESSION + " 哨兵");
+    }
+
+    /**
      * <b>无会话出口</b> · 只对「<b>确无会话</b>」开放（用户裁定 #13）。
      *
      * <p>命名自解释：调用它 = 「本处确实没有会话标识，不需要会话项目根」。适用对象为
@@ -389,15 +509,17 @@ public final class CwdResolution {
      *
      * <p>⛔ 有 sessionId 的调用方<b>不得</b>用它绕开 fail-loud（那是数据链路异常，应当暴露）。
      *
+     * <p><b>[批 P5 2026-09-15 · 铁律出口 (b)] ≥WARN 留痕</b>：本出口是「值传播源」——返回值
+     * <b>不是</b>任何会话的项目根（是进程 {@code user.dir}）。原实现只打 {@code log.debug}
+     * ⇒ 默认日志级别下「本该有会话却走了无会话出口」完全静默。现改为 <b>warn-once</b>
+     * （{@link #NON_SESSION_EXIT_WARNED}，与本族另一出口共用一个闸）。
+     *
      * @return 恒非 null 的归一化 cwd（进程 user.dir）
      */
     public static String getCwdForNonSession() {
         // [S2 F-07] 原首层 override（CURRENT_OVERRIDE ThreadLocal）已按用户裁定 #8 删除 ⇒
         //   本出口现恒等于 normalizeCwd(process user.dir)（生产 0 写入点使删除前后逐字节同值）。
-        if (log.isDebugEnabled()) {
-            log.debug("[CwdResolution] 无会话解析 cwd（进程 user.dir）: user.dir={}",
-                System.getProperty("user.dir"));
-        }
+        warnNonSessionExit("getCwdForNonSession");
         String userDir = System.getProperty("user.dir");
         return normalizeCwd(userDir != null ? userDir : "");
     }
@@ -409,13 +531,14 @@ public final class CwdResolution {
      * 不读 originalCwd / boundProject 会话层，恒取进程 {@code user.dir}（JVM 启动目录）。
      * 现状 {@code getOriginalCwdLayer(null)} 本就无 override 层，本方法保持同行为。
      *
+     * <p><b>[批 P5 2026-09-15 · 铁律出口 (b)] ≥WARN 留痕</b>：同 {@link #getCwdForNonSession()}
+     * —— 原只打 {@code log.debug}，现 <b>warn-once</b>（与 {@link #getCwdForNonSession()} 共用
+     * {@link #NON_SESSION_EXIT_WARNED}）。
+     *
      * @return 恒非 null 的归一化原始 cwd（进程 user.dir）
      */
     public static String getOriginalCwdLayerForNonSession() {
-        if (log.isDebugEnabled()) {
-            log.debug("[CwdResolution] 无会话解析 originalCwd（进程 user.dir）: user.dir={}",
-                System.getProperty("user.dir"));
-        }
+        warnNonSessionExit("getOriginalCwdLayerForNonSession");
         String userDir = System.getProperty("user.dir");
         return normalizeCwd(userDir != null ? userDir : "");
     }
@@ -699,6 +822,31 @@ public final class CwdResolution {
                 + "与 {}() 同义）。本路径为有意声明（批 6：MCP 入站 / standalone fork·子代理 / "
                 + "无会话 plan provider），非缺陷（本告警仅打印一次）",
                 method, SessionKeys.NO_SESSION, namedExit);
+        }
+    }
+
+    /**
+     * [批 P5 2026-09-15] 无会话<b>命名出口</b>的 ≥WARN 留痕（铁律「不许静默失效」出口 (b)：
+     * 本就不需要 ⇒ 可跳过但日志 <b>≥WARN</b>，⛔ 禁只 DEBUG）。
+     *
+     * <p><b>为什么必须 ≥WARN</b>：{@link #getCwdForNonSession()} /
+     * {@link #getOriginalCwdLayerForNonSession()} <b>恒返回进程 {@code user.dir}</b>（后端启动目录，
+     * 不是任何会话的项目根）。「确无会话」是合法形态 ⇒ 不抛；但它是<b>信息缺失</b>，若只打 DEBUG，
+     * 「本该有会话却漏传 sessionId」在默认日志级别下无法被发现。
+     *
+     * <p><b>只打印一次</b>（{@link #NON_SESSION_EXIT_WARNED}，两出口共用）：本族实测有 31 个调用点
+     * （{@code ForNonSession} 20 + {@code (null)} 11），逐次打印会淹没日志。
+     *
+     * @param method 出口方法名（{@code getCwdForNonSession} / {@code getOriginalCwdLayerForNonSession}）
+     */
+    private static void warnNonSessionExit(String method) {
+        if (NON_SESSION_EXIT_WARNED.compareAndSet(false, true)) {
+            log.warn("[CwdResolution] {} 是无会话命名出口（本处确无会话标识）⇒ 返回值 = 进程 user.dir = {}"
+                + "（JVM 启动目录，经 normalizeCwd realpath+NFC；⛔ 不是任何会话的项目根）。"
+                + "确无会话的调用方（启动期 bean / MCP transport / 进程级默认 supplier 等结构上拿不到 "
+                + "sessionId 者）属正常用法；⚠️ 若此处本该有会话，则属数据链路异常（调用方漏传 / 传了陈旧 id），"
+                + "应改用 getCwd(sessionId)/getOriginalCwdLayer(sessionId)。本告警按出口族仅打印一次",
+                method, System.getProperty("user.dir"));
         }
     }
 }

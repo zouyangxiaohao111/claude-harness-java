@@ -38,7 +38,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
@@ -495,7 +494,9 @@ public class CommandRegistrationConfig {
                 //   改为查会话身份后，求值结果只依赖 sessionId，与求值线程无关。
                 () -> resolveIsTeammateSession(registry, ctx.sessionId()),   // CC isTeammate()
                 // [批 3c] 会话标识取执行上下文（不再读裸 MDC）
-                () -> resolveSessionUuid(ctx.sessionId()),
+                // [session-id-short] short 直键直传——⛔ 不再经 resolveSessionUuid 转换
+                //   （原实现对该键必抛 IAE ⇒ 恒 null ⇒ custom-title/agent-name 静默不落盘）。
+                ctx::sessionId,
                 () -> resolveTranscriptPath(workspaceRoot.get(), ctx.sessionId()),
                 (messages, signal) -> CompletableFuture.completedFuture(null), // CC generateSessionName 未接线
                 (sid, name) -> { persistSessionMetadata(workspaceRoot, sid, name, true); return CompletableFuture.completedFuture(null); },
@@ -593,32 +594,22 @@ public class CommandRegistrationConfig {
         return registry.teammateIdentityForSession(sessionId) != null;
     }
 
-    /** 由显式形参 sessionId 解析当前会话 UUID · null = 无会话上下文（批 3c：不再读裸 MDC）。 */
-    private static UUID resolveSessionUuid(String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) {
-            return null;
-        }
-        try {
-            return UUID.fromString(sessionId);
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
-    }
-
     /** transcript 路径（CC getTranscriptPath · sessionStorage.ts）· 无会话 → null。
      *  <b>D3 读兼容</b>：走 {@link SessionStorage#resolveExistingTranscript} 读 nexusai
      *  自有 transcript（仅 nexusai 会话，无 claude ~/.claude/projects 回落）。
      *
      *  <p><b>[r10-S1]</b> 会话存档根由调用方以形参传入（原实现经 {@code resolveWorkspaceDir} 内部反查
      *  {@link CwdResolution#getOriginalCwdLayer}）—— 消除 3 份逐字节相同的复制，并把解析点显式化。
-     *  ⚠️ 形参取值为「已解析的存档根」（调用方在**原解析位置**调用 {@code workspaceRoot.get()}）。 */
+     *  ⚠️ 形参取值为「已解析的存档根」（调用方在**原解析位置**调用 {@code workspaceRoot.get()}）。
+     *
+     *  <p><b>[session-id-short]</b>：sessionId 为 short 直键，直传 {@link SessionStorage}
+     *  （文件名键 {@code sessionId + ".jsonl"}）——⛔ 不再经 {@code UUID.fromString} 转换。 */
     private static String resolveTranscriptPath(String workspaceRoot, String sessionId) {
-        UUID sid = resolveSessionUuid(sessionId);
-        if (sid == null) {
+        if (sessionId == null || sessionId.isBlank()) {
             return null;
         }
         Path transcript = SessionStorage.resolveExistingTranscript(
-            Path.of(workspaceRoot), sid.toString());
+            Path.of(workspaceRoot), sessionId);
         return transcript != null ? transcript.toString() : null;
     }
 
@@ -628,15 +619,19 @@ public class CommandRegistrationConfig {
      *  原实现的解析就在本方法的 {@code try} 内（{@code resolveWorkspaceDir(sessionId.toString())}），
      *  异常被下方 {@code catch} 吞掉并只打 WARN；若改成「调用方先解析、传值进来」，解析点会前移到本
      *  方法的 try 之外 ⇒ 同一异常由「吞掉」变「抛出」＝ fail-loud 面扩大。Supplier 让 {@code get()}
-     *  仍留在 try 内，逐点保持原语义。 */
+     *  仍留在 try 内，逐点保持原语义。
+     *
+     *  <p><b>[session-id-short]</b>：sessionId 为 short 直键，直传 {@link SessionStorage}
+     *  （文件名键 {@code sessionId + ".jsonl"}）——⛔ 不再 {@code .toString()} 成 UUID 形态
+     *  （原实现经 {@code resolveSessionUuid} 得 null ⇒ 本方法恒早返 ⇒ custom-title/agent-name 静默不落盘）。 */
     private static void persistSessionMetadata(java.util.function.Supplier<String> workspaceRoot,
-                                               UUID sessionId, String name, boolean isTitle) {
-        if (sessionId == null) {
+                                               String sessionId, String name, boolean isTitle) {
+        if (sessionId == null || sessionId.isBlank()) {
             return;
         }
         try {
             Path ws = Path.of(workspaceRoot.get());
-            SessionStorage.reAppendSessionMetadata(ws, sessionId.toString(),
+            SessionStorage.reAppendSessionMetadata(ws, sessionId,
                 new SessionStorage.SessionMetadata(null, isTitle ? name : null, null,
                     isTitle ? null : name, null, null, null, null, null, null, null));
         } catch (Exception e) {

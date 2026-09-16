@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * （QueueItem.sessionId 是原始键 "sess-xxx" 或派生 UUID 串 vs AgentState.sessionId 派生 UUID ——
  * 裸 equals 必 MISS，CRON-D5 F2 同教训）。
  *
- * <p>用例直调 {@link NotificationQueue#drainForQuery(boolean, String, UUID)} —— CC query.ts:1570-1578
+ * <p>用例直调 {@link NotificationQueue#drainForQuery(boolean, String, String)} —— CC query.ts:1570-1578
  * 消费点内联 scoping filter 的 Java 对齐路径；sleepRan 恒传 true：阈值=later 全量快照 (CC query.ts:1571
  * {@code sleepRan ? 'later' : 'next'})，使 LATER 项进入快照，不影响 scoping 分支语义。
  */

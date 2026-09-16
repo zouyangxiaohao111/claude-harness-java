@@ -31,8 +31,8 @@ import java.util.List;
  *
  * <p><b>② NEW-13 门控差异（有意差异，拍板保持现状）</b>：本类无 {@code CronEnabledGates}
  * 引用、无 {@code @ConditionalOnProperty}——POST create 直通
- * {@link com.nexusai.domain.schedule.ScheduleService#create}（ScheduleService.java:131-224，
- * 仅 MAX_JOBS 校验/字段校验/落库/Quartz 注册，无功能门）；对比工具路径
+ * {@link com.nexusai.domain.schedule.ScheduleService#create(ScheduleCreateRequest, String)}
+ * （仅 MAX_JOBS 校验/字段校验/落库/Quartz 注册，无功能门）；对比工具路径
  * {@code CronCreateTool.isEnabled()}（CronCreateTool.java:162-164，对齐 CC :67-69）受
  * {@code nexusai.feature.agent-trigger-cron} 门控（CronEnabledGates.java:22/:76-78）。
  * <b>拍板（NEW-13, 2026-08-15 IMPL-13）</b>：REST create 不加门控，保持现状；无 CC 基准
@@ -94,11 +94,19 @@ public class ScheduleController {
      * 再交给 service ⇒ 客户端在请求体里塞的 {@code boundProject} 一律被<b>解析值覆盖</b>
      * （原实现把 {@code req.boundProject()} 直接落库 ⇒ 调用方可把任意路径写成任务的项目锚）。
      *
+     * <p><b>[P11a] 已解析锚再以形参显式下传</b>：重建请求体之外，本方法还把<b>同一个</b>
+     * {@code lk.projectRoot()} 作为 {@code ScheduleService#create(req, resolvedProjectRoot)} 的
+     * 第二形参传入。⛔ 这不是「把请求字段交回来」——形参承载的是<b>本方法刚解析出的服务端值</b>；
+     * 目的是消除同一条链上的<b>重复解析</b>（收口前 service 对同一 sessionId 又 lookup 一次并丢弃
+     * 这里的值 = 同一事实两个来源）。守护：
+     * {@code ScheduleCreateAnchorSingleResolutionTest}（lookup 只被调用一次）。
+     *
      * <p><b>为什么落点在 Controller 而不是 service</b>：用户裁定原文限定「REST 直建」；且工具路径
      * （{@code CronCreateTool}）与 8 处直调 service 的单测各有自己的语义（工具路径无 HTTP ⇒ 用
      * {@link SessionKeys#NO_SESSION} 哨兵声明无会话），把 REST 的 400 语义塞进 service 会让两边
      * 互相污染。service 侧另做<b>sentinel-aware 归一取值</b>（见
-     * {@link com.nexusai.domain.schedule.ScheduleService#create}）保证「锚只能来自 sessionId 解析」。
+     * {@link com.nexusai.domain.schedule.ScheduleService#create(ScheduleCreateRequest, String)}）
+     * 保证「锚只能来自 sessionId 解析（上游下传的已解析值，或本类自解析）」。
      */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
@@ -140,7 +148,10 @@ public class ScheduleController {
                 + "sessionId={} boundProject={}（客户端传入的 boundProject={} 被丢弃）",
                 sessionId, lk.projectRoot(), req.boundProject());
         }
-        return scheduleService.create(normalized);
+        // [P11a] 把**本方法刚解析出的锚**显式下传（第二形参）⇒ service 不再对同一 sessionId
+        //   重复解析（收口前 service 又查一遍并丢弃这里的值 = 同链两个来源）。
+        //   ⛔ 传的是 lk.projectRoot()（服务端解析结果），**不是** req.boundProject()（客户端字段）。
+        return scheduleService.create(normalized, lk.projectRoot());
     }
 
     /**

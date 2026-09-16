@@ -831,10 +831,66 @@ public class SubagentExecutor {
 
     /**
      * [IMP-G4 组11-1] 会话级 system/user 上下文提供者（F5）· 对齐 CC memoized getSystemContext()
-     * （runAgent.ts:380-383）。由装配方注入；未注入 → 惰性构造会话级 provider（gitStatus 通道），
-     * 保证子 agent systemContext 非空。
+     * （runAgent.ts:380-383）。由装配方注入；未注入 → 惰性构造 provider（gitStatus 通道，
+     * <b>按 sessionId 键</b>，见 {@link #systemPromptContextProviderBySession}），保证子 agent
+     * systemContext 非空。
+     *
+     * <p>⚠️ 注入路径<b>不含会话键</b>（同一实例对所有会话返回同一 provider）—— 注入方若跨会话复用
+     * 同一 provider，等价于把 {@link #systemPromptContextProviderBySession} 的会话隔离绕开。
+     * 当前全仓<b>无生产注入点</b>（唯一调用点在测试 {@code SubagentG4MetricsTest}），故生产恒走按会话
+     * 键的兜底分支（P10b 实核）。
      */
     private volatile com.nexusai.application.agent.prompt.SystemPromptContextProvider systemPromptContextProvider;
+
+    /**
+     * [P10b] 按会话 provider 缓存容量上限 · 对齐 CC {@code memoizeWithLRU}（utils/memoize.ts:234-280）
+     * 在本路径同族函数上的用法（git.ts:27 {@code findGitRootImpl} 用 {@code memoizeWithLRU}，max 50）。
+     */
+    private static final int SYSTEM_PROMPT_PROVIDER_CACHE_MAX = 64;
+
+    /**
+     * [P10b] 未注入时<b>按会话</b>惰性构造的 provider 缓存 · 键 = 会话 ID（null/空白归一为
+     * {@link com.nexusai.common.SessionKeys#NO_SESSION}）。
+     *
+     * <p>⛔ <b>不得退化为实例级裸字段</b>：本类是 <b>Spring 单例</b>
+     * （{@code ToolRegistrationConfig:682} {@code @Bean subagentExecutor} 无 {@code @Scope}），
+     * 且生产有两条路径在这个单例上执行 —— {@code SkillToolImpl:1660 executeForkedSkill} 与
+     * {@code AutonomousAgentLoop:1170 executeStreaming}（teammate）—— 二者都经
+     * {@code executeStreaming} 到达 {@link #resolveSystemContextText(String)}。裸字段会让第 2 个
+     * 会话复用第 1 个会话冻进去的 git 锚 / CLAUDE.md 扫描根 = <b>跨会话串值</b>
+     * （P10b 守护测试 {@code SubagentG4MetricsTest#resolveSystemContextText_sameExecutorTwoSessions_doNotShareGitAnchor}
+     * 在裸字段下实测红：会话 B 拿到会话 A 的 gitStatus 全文）。
+     *
+     * <p>按会话键与姊妹类 {@link com.nexusai.application.agent.prompt.SystemPromptContextProvider}
+     * javadoc（:21-22）一致：CC {@code getIsGit} 是 {@code memoize(async () => …)}（git.ts:218，
+     * <b>零参 ⇒ 进程级无键</b>），CC 单会话进程下「进程级 ≡ 会话级」；本仓是多会话 Web 服务，
+     * 故该 memoize 必须显式按 sessionId 键承载。
+     *
+     * <p>⚠️ 淘汰即 {@link com.nexusai.application.agent.prompt.SystemPromptContextProvider#close()}
+     * （构造期 self-register 于 {@code SystemPromptInjection} 静态清理表，见该类 :109-133
+     * 「register/unregister 成对，静态表不再随实例创建有界累积」）—— 否则本缓存会把静态表变成
+     * <b>按会话数无界增长</b>，那是本批修复本身引入的新泄漏。
+     */
+    private final java.util.Map<String,
+        com.nexusai.application.agent.prompt.SystemPromptContextProvider>
+        systemPromptContextProviderBySession =
+        new java.util.LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(
+                    java.util.Map.Entry<String, com.nexusai.application.agent.prompt.SystemPromptContextProvider> eldest) {
+                if (size() <= SYSTEM_PROMPT_PROVIDER_CACHE_MAX) {
+                    return false;
+                }
+                // 淘汰最久未用条目并注销其静态清理回调（close() 幂等，不抛）
+                try {
+                    eldest.getValue().close();
+                } catch (Exception e) {
+                    log.warn("[SubagentExecutor] [P10b] 会话 provider 淘汰注销失败（不阻断淘汰）: {}",
+                        e.toString());
+                }
+                return true;
+            }
+        };
 
     /**
      * [IMP-G4 组11-1] 本 executor 是否承载 async 执行（完成/终止遥测 is_async 字段）· 对齐 CC
@@ -5290,7 +5346,7 @@ public class SubagentExecutor {
      * <p>finally 调用点：{@link #executeStreaming} Step 21（:1490-1493 一带），正常/abort/error
      * 三路均执行（CC runAgent.ts:816 finally 块）。
      *
-     * <p>package-private：同包测试直测接线（对齐 {@link #cleanupSessionHooks(UUID, UUID)} 可测约定）。
+     * <p>package-private：同包测试直测接线（对齐 {@link #cleanupSessionHooks(String, UUID)} 可测约定）。
      *
      * @param agentId 子 agent UUID 字符串（null → no-op，独立操作不抛异常）
      */
@@ -5532,8 +5588,14 @@ public class SubagentExecutor {
      *
      * <p>渲染格式对齐 {@link com.nexusai.application.agent.prompt.SystemPromptContextProvider#appendSystemContext}
      * （:304-322）：{@code "key: value"} 行，多键换行拼接，空串过滤。未注入 provider 时惰性构造
-     * 会话级实例（per-executor 缓存 = per-spawn memoize 近似；CC 会话级 memoize 因 Java 无
-     * 会话字段化承载而近似到 executor 实例边界）。
+     * <b>按会话缓存</b>的实例（见 {@link #systemPromptContextProviderBySession}）。
+     *
+     * <p><b>[P10b 2026-09-15 · 旧注释纠错]</b>原文称「CC 会话级 memoize 因 Java 无会话字段化承载
+     * 而近似到 executor 实例边界」——<b>两处都不对</b>：① CC 的 {@code getIsGit} 是
+     * {@code memoize(async () => …)}（{@code claude-code-best/src/utils/git.ts:218}，<b>零参 ⇒ 进程级
+     * 无键</b>），并非 per-session memoize；CC 之所以无问题，只因它是<b>单会话进程</b>（进程级 ≡ 会话级）。
+     * ② 本仓 executor 是 Spring 单例，「实例边界」= 进程边界 ⇒ 近似落回 CC 的进程级粒度，
+     * 在多会话 Web 服务下等效于<b>跨会话串值</b>（已由 P10b 守护测试实测红灯证实）。
      *
      * <p><b>[r10b · D3/D4 2026-09-15] 会话态显式传参</b>：兜底 provider 的 git 锚点与
      * CLAUDE.md 扫描根改为按<b>本子代理会话</b>解析（原写死无会话 ⇒ 锚进程 {@code user.dir}）。
@@ -5580,7 +5642,8 @@ public class SubagentExecutor {
     }
 
     /**
-     * [IMP-G4 F5] 会话级 SystemPromptContextProvider 惰性构造 · 未注入时新建（per-executor 缓存）。
+     * [IMP-G4 F5] 会话级 SystemPromptContextProvider 惰性构造 · 未注入时新建（<b>按 sessionId 键</b>
+     * 缓存，见 {@link #systemPromptContextProviderBySession}）。
      *
      * <p>构造参数对齐 LlmAgentLoop:2641-2644（sessionStartDate + UserContextProvider(claudemdEngine)
      * + GitStatusProvider）：getSystemContext() 仅消费 GitStatusProvider（gitStatus/cacheBreaker），
@@ -5588,34 +5651,56 @@ public class SubagentExecutor {
      * 当前日期（getSystemContext 不消费 sessionStartDate）。
      *
      * @param sessionId 子代理会话 ID（[r10b · D3/D4] 会话态显式传参：git 锚点与 CLAUDE.md
-     *                  扫描根均按本会话解析；null = 确无会话）
-     * @return 注入的 provider 或惰性构造的会话级 provider（null 仅在构造失败时）
+     *                  扫描根均按本会话解析；null/空白 = 确无会话 ⇒ 归一为
+     *                  {@link com.nexusai.common.SessionKeys#NO_SESSION} 作缓存键，
+     *                  其解析出口与 null 同为「无会话命名出口」）
+     * @return 注入的 provider，或本会话惰性构造的 provider（构造抛错时由调用方
+     *         {@link #resolveSystemContextText(String)} 捕获并回退空串）
      */
     private com.nexusai.application.agent.prompt.SystemPromptContextProvider systemPromptContextProvider(
             String sessionId) {
-        com.nexusai.application.agent.prompt.SystemPromptContextProvider p = systemPromptContextProvider;
-        if (p == null) {
-            p = new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
-                java.time.LocalDate.now().toString(),
-                // [批 3c] 此处引擎恒 null（回退单文件子集）。
-                // [r10b · D4] 会话态显式传参：原写死 null（= 显式无会话 ⇒ 引擎扫描根回落进程
-                //   user.dir），但本兜底是**生产路径**（全仓唯一 setSystemPromptContextProvider
-                //   调用点在测试 SubagentG4MetricsTest），会话标识在 Step 8 调用点已就绪 ⇒ 改传
-                //   本子代理会话，使 CLAUDE.md 扫描根锚会话项目根。
-                new com.nexusai.application.agent.prompt.UserContextProvider(
-                    (com.nexusai.application.agent.context.ClaudemdEngine) null, sessionId),
-                // [r10b · D3] 同 D1/D2：git 锚点必须按会话 cwd（CC getIsGit = findGitRoot(getCwd())），
-                //   ⛔ 无参构造锚进程 user.dir（后端启动目录）。
-                new com.nexusai.application.agent.prompt.GitStatusProvider(
-                    java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
-                        .getCwd(sessionId))));
-            systemPromptContextProvider = p;
+        // 注入方优先：注入路径本身不含会话键，其会话隔离由装配方负责（见字段 javadoc）。
+        com.nexusai.application.agent.prompt.SystemPromptContextProvider injected =
+            systemPromptContextProvider;
+        if (injected != null) {
+            return injected;
+        }
+        // 未注入 ⇒ 按本会话惰性构造并**按会话缓存**。
+        // ⭐ [P10b] 键必须是 sessionId（⛔ 不是实例边界）：executor 是 Spring 单例，
+        //   实例级缓存 = 进程级缓存 ⇒ 多会话下第 2 个会话复用第 1 个会话的 git 锚。
+        //   null/空白 → NO_SESSION 哨兵（LinkedHashMap 不允许 null 键；且 CwdResolution 对
+        //   两者解析出口相同，归一后缓存身份与构造输入一致、不依赖到达顺序）。
+        String key = (sessionId == null || sessionId.isBlank())
+            ? com.nexusai.common.SessionKeys.NO_SESSION : sessionId;
+        // accessOrder=true 的 LinkedHashMap 非线程安全 ⇒ 读写同锁（冷路径：每会话至多一次构造）
+        synchronized (systemPromptContextProviderBySession) {
+            com.nexusai.application.agent.prompt.SystemPromptContextProvider cached =
+                systemPromptContextProviderBySession.get(key);
+            if (cached != null) {
+                return cached;
+            }
+            com.nexusai.application.agent.prompt.SystemPromptContextProvider built =
+                new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
+                    java.time.LocalDate.now().toString(),
+                    // [批 3c] 此处引擎恒 null（回退单文件子集）。
+                    // [r10b · D4] 会话态显式传参：原写死 null（= 显式无会话 ⇒ 引擎扫描根回落进程
+                    //   user.dir），但本兜底是**生产路径**（全仓唯一 setSystemPromptContextProvider
+                    //   调用点在测试 SubagentG4MetricsTest），会话标识在 Step 8 调用点已就绪 ⇒ 改传
+                    //   本子代理会话，使 CLAUDE.md 扫描根锚会话项目根。
+                    new com.nexusai.application.agent.prompt.UserContextProvider(
+                        (com.nexusai.application.agent.context.ClaudemdEngine) null, key),
+                    // [r10b · D3] 同 D1/D2：git 锚点必须按会话 cwd（CC getIsGit = findGitRoot(getCwd())），
+                    //   ⛔ 无参构造锚进程 user.dir（后端启动目录）。
+                    new com.nexusai.application.agent.prompt.GitStatusProvider(
+                        java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
+                            .getCwd(key))));
+            systemPromptContextProviderBySession.put(key, built);
             if (log.isDebugEnabled()) {
                 log.debug("[SubagentExecutor] [IMP-G4 F5] 惰性构造 SystemPromptContextProvider "
-                    + "(未注入, per-executor 缓存 · CC runAgent.ts:380-383)");
+                    + "(未注入, 按会话缓存 · sessionId={})", key);
             }
+            return built;
         }
-        return p;
     }
 
     /**

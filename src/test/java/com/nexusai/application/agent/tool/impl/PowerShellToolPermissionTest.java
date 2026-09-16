@@ -3,6 +3,7 @@ package com.nexusai.application.agent.tool.impl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionResult;
@@ -484,11 +485,32 @@ class PowerShellToolPermissionTest {
     /**
      * 显式会话基准 cwd 的 ctx · [裁定 #15]：需要按 cwd 校验路径 / 走 git 写守卫的用例必须显式给基准
      * （⛔ 不得再依赖已删除的进程 {@code user.dir} 兜底 —— 那是服务器启动目录，不是会话项目根）。
+     *
+     * <p>[P7] <b>双轴</b>：{@code effectiveCwd}（TUC 快照）是<b>轴 A</b>（相对路径解析基准）；
+     * 越界白名单根是<b>轴 B</b> = 会话 originalCwd 层（CC {@code allWorkingDirectories} 首项
+     * {@code getOriginalCwd()}）。生产两轴同源于同一会话绑定 ⇒ 夹具必须同时把轴 B 钉到同一目录，
+     * 否则轴 B 落测试环境的无会话出口（进程 {@code user.dir} = 后端启动目录）⇒「路径在会话 cwd 内
+     * → Allow」的前提不成立（会误 ask）。用完清理，防跨用例串读。
      */
     private static ToolUseContext ctxWithCwd(Path cwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+        String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        SessionCwdHolder.setOriginalCwd(sessionId, cwd.toString());
+        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionId,
             PermissionMode.DEFAULT, List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", cwd);
+        pinnedOriginalCwdSessions.add(sessionId);
+        return ctx;
+    }
+
+    /** ctxWithCwd 钉过的会话 id（@AfterEach 统一清理，防全局静态槽串读）。 */
+    private static final List<String> pinnedOriginalCwdSessions = new java.util.ArrayList<>();
+
+    @org.junit.jupiter.api.AfterEach
+    void clearPinnedSessions() {
+        for (String sid : pinnedOriginalCwdSessions) {
+            SessionCwdHolder.clearOriginalCwd(sid);
+        }
+        pinnedOriginalCwdSessions.clear();
     }
 
     private static ToolUseContext ctxWith(ToolPermissionContext permCtx) {

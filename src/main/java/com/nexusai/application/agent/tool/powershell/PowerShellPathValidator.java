@@ -320,18 +320,30 @@ public final class PowerShellPathValidator {
      * @param input                原始 input（仅消息展示，rule 匹配不依赖）
      * @param parsed               parse-succeeded 的 ParsedResult
      * @param permCtx              权限上下文（可为 null → 仅危险删除 deny / cd 复合 ask 生效）
-     * @param cwd                  校验基准 cwd
+     * @param resolutionBase       <b>轴 A</b>：相对路径解析基准（对齐 CC {@code checkPathConstraints}
+     *                             的 {@code cwd} 形参 = {@code getCwd()}，utils/cwd.ts:26-32）
+     * @param whitelistRoot        <b>轴 B</b>：越界白名单根（对齐 CC {@code allWorkingDirectories}
+     *                             首项 {@code getOriginalCwd()}，filesystem.ts:666-673）
      * @param compoundCommandHasCd 复合命令是否含 cwd 变更 cmdlet（CC :1532）
      * @return deny | ask | passthrough（passthrough 由调用方过滤不加入 decisions）
      */
     public static PermissionResult check(JsonNode input, PowerShellAstService.ParsedResult parsed,
-                                         ToolPermissionContext permCtx, Path cwd, boolean compoundCommandHasCd) {
+                                         ToolPermissionContext permCtx, Path resolutionBase,
+                                         Path whitelistRoot, boolean compoundCommandHasCd) {
         if (!parsed.valid()) {
             return passthrough("Cannot validate paths for unparsed command");
         }
+        // [P7] 轴 B 缺失 ⇒ 留痕 + fail-closed 传播（⛔ 不静默回落解析基准 —— 那正是本仓原混用形态）。
+        //   isInWorkingDir(whitelistRoot=null) 恒 false ⇒ 真路径一律落 ask（宁问不放）；
+        //   ⛔ 这里<b>不</b>无条件 ask：那会把「与白名单无关」的命令（无路径参数，如 Get-Process）
+        //   一起变成 ask = 大面积误 ask（同 (裁定 #15) / gitGuardsDependOnCwd 的判据）。
+        if (whitelistRoot == null) {
+            log.warn("PowerShellPathValidator: 越界白名单根（轴 B = CC getOriginalCwd）缺失 ⇒ 路径一律按"
+                + "「不在允许范围」处理（fail-closed；⛔ 不回落解析基准、⛔ 不回落 user.dir）");
+        }
         PermissionResult firstAsk = null;
         for (PowerShellAstService.Statement st : parsed.statements()) {
-            PermissionResult r = checkStatement(st, permCtx, cwd, compoundCommandHasCd);
+            PermissionResult r = checkStatement(st, permCtx, resolutionBase, whitelistRoot, compoundCommandHasCd);
             if (r instanceof PermissionResult.Deny) {
                 if (log.isDebugEnabled()) {
                     log.debug("PowerShellPathValidator: 路径约束 deny 命中 statement={}", st.text());
@@ -348,7 +360,7 @@ public final class PowerShellPathValidator {
         // 重定向目标校验（CC pathValidation.ts:1937-2041 nested + statement redirections 目标
         // validatePath('create')，OPD-PS-06）。deny 优先于已记录的 ask（CC 两遍遍历 deny > ask 语义）；
         // 仅当无 statement ask 时补 redirection ask（CC firstAsk ??= 语义）。
-        PermissionResult redirResult = checkRedirections(parsed, permCtx, cwd);
+        PermissionResult redirResult = checkRedirections(parsed, permCtx, resolutionBase, whitelistRoot);
         if (redirResult instanceof PermissionResult.Deny) {
             return redirResult;
         }
@@ -370,10 +382,11 @@ public final class PowerShellPathValidator {
      * @return deny（Edit deny 规则命中）| ask（目标被阻断/越界）| null（全部放行）
      */
     private static PermissionResult checkRedirections(PowerShellAstService.ParsedResult parsed,
-                                                       ToolPermissionContext permCtx, Path cwd) {
+                                                       ToolPermissionContext permCtx, Path resolutionBase,
+                                                       Path whitelistRoot) {
         PermissionResult firstAsk = null;
         for (PowerShellAstService.Redirection r : PowerShellPermissionChain.getFileRedirections(parsed)) {
-            PathCheck v = validatePath(r.target(), cwd, permCtx, OP_CREATE);
+            PathCheck v = validatePath(r.target(), resolutionBase, whitelistRoot, permCtx, OP_CREATE);
             if (v.allowed()) continue;
             if (v.rule() != null) {
                 if (log.isDebugEnabled()) {
@@ -390,10 +403,13 @@ public final class PowerShellPathValidator {
         return firstAsk;
     }
 
-    /** 单语句路径检查 · 对齐 CC pathValidation.ts:1569-1906 checkPathConstraintsForStatement。 */
+    /** 单语句路径检查 · 对齐 CC pathValidation.ts:1569-1906 checkPathConstraintsForStatement。
+     *  {@code resolutionBase} = 轴 A（CLI 侧 {@code checkPathConstraintsForStatement} 内部的
+     *  {@code const cwd = getCwd()}，pathValidation.ts:1583 —— 三守卫的 cd-判定同用该值）；
+     *  {@code whitelistRoot} = 轴 B（越界白名单，CC 侧只吃 context，从不看 cwd）。 */
     private static PermissionResult checkStatement(PowerShellAstService.Statement st,
-                                                   ToolPermissionContext permCtx, Path cwd,
-                                                   boolean compoundCommandHasCd) {
+                                                   ToolPermissionContext permCtx, Path resolutionBase,
+                                                   Path whitelistRoot, boolean compoundCommandHasCd) {
         PermissionResult firstAsk = null;
         if (compoundCommandHasCd) {
             firstAsk = ask("复合命令更改工作目录（Set-Location/Push-Location/Pop-Location/New-PSDrive）"
@@ -410,7 +426,7 @@ public final class PowerShellPathValidator {
             if (pipelineSourceText != null) {
                 // 管道表达式源 deny 猜测（CC :1652-1681）：路径不可静态校验，但 Edit deny 仍须命中
                 String stripped = pipelineSourceText.replaceAll("^['\"]|['\"]$", "");
-                PermissionResult guessed = checkDenyRuleForGuessedPath(stripped, cwd, permCtx, ex.operationType());
+                PermissionResult guessed = checkDenyRuleForGuessedPath(stripped, resolutionBase, permCtx, ex.operationType());
                 if (guessed instanceof PermissionResult.Deny) {
                     return guessed;
                 }
@@ -431,7 +447,7 @@ public final class PowerShellPathValidator {
                 if (isRemoval && PowerShellPermissionChain.isDangerousRemovalRawPath(filePath)) {
                     return dangerousRemovalDeny(filePath);
                 }
-                PathCheck v = validatePath(filePath, cwd, permCtx, ex.operationType());
+                PathCheck v = validatePath(filePath, resolutionBase, whitelistRoot, permCtx, ex.operationType());
                 if (isRemoval && v.resolvedPath() != null
                     && PowerShellPermissionChain.isDangerousRemovalPath(v.resolvedPath())) {
                     return dangerousRemovalDeny(v.resolvedPath());
@@ -447,7 +463,7 @@ public final class PowerShellPathValidator {
             }
         }
         // nestedCommands（控制流内嵌命令）镜像主循环（CC :1811-1906）
-        PermissionResult nested = checkNestedCommands(st.nestedCommands(), permCtx, cwd);
+        PermissionResult nested = checkNestedCommands(st.nestedCommands(), permCtx, resolutionBase, whitelistRoot);
         if (nested instanceof PermissionResult.Deny) {
             return nested;
         }
@@ -642,13 +658,14 @@ public final class PowerShellPathValidator {
      * 单路径校验 · 对齐 CC pathValidation.ts:1013-1264 validatePath。
      * 返回 allowed=false 时 message/rule 决定 ask 还是 deny。
      */
-    static PathCheck validatePath(String filePath, Path cwd, ToolPermissionContext permCtx, String operationType) {
+    static PathCheck validatePath(String filePath, Path resolutionBase, Path whitelistRoot,
+            ToolPermissionContext permCtx, String operationType) {
         String cleanPath = expandTilde(filePath.replaceAll("^['\"]|['\"]$", ""));
         String normalizedPath = normalizeSlashes(cleanPath);
 
         // 反引号转义：无法静态校验 → deny 猜测 + ask（CC :1032-1061）
         if (normalizedPath.contains("`")) {
-            PermissionResult guessed = checkDenyRuleForGuessedPath(normalizedPath.replace("`", ""), cwd, permCtx, operationType);
+            PermissionResult guessed = checkDenyRuleForGuessedPath(normalizedPath.replace("`", ""), resolutionBase, permCtx, operationType);
             if (guessed instanceof PermissionResult.Deny) {
                 PermissionRule r = ((PermissionResult.Deny) guessed).reason() instanceof PermissionDecisionReason.Rule rr ? rr.rule() : null;
                 return new PathCheck(false, normalizedPath, null, r);
@@ -658,7 +675,7 @@ public final class PowerShellPathValidator {
         // 模块限定 provider 路径（::）→ deny 猜测 + ask（CC :1063-1096）
         if (normalizedPath.contains("::")) {
             String afterProvider = normalizedPath.substring(normalizedPath.indexOf("::") + 2);
-            PermissionResult guessed = checkDenyRuleForGuessedPath(afterProvider, cwd, permCtx, operationType);
+            PermissionResult guessed = checkDenyRuleForGuessedPath(afterProvider, resolutionBase, permCtx, operationType);
             if (guessed instanceof PermissionResult.Deny) {
                 PermissionRule r = ((PermissionResult.Deny) guessed).reason() instanceof PermissionDecisionReason.Rule rr ? rr.rule() : null;
                 return new PathCheck(false, normalizedPath, null, r);
@@ -685,13 +702,13 @@ public final class PowerShellPathValidator {
                 return new PathCheck(false, normalizedPath, "写操作不允许 glob 通配符，请指定精确路径", null);
             }
             if (containsPathTraversal(normalizedPath)) {
-                String abs = resolveAgainstCwd(normalizedPath, cwd);
-                PathCheck p = isPathAllowed(normalizeSlashes(abs), cwd, permCtx, operationType);
+                String abs = resolveAgainstCwd(normalizedPath, resolutionBase);
+                PathCheck p = isPathAllowed(normalizeSlashes(abs), resolutionBase, whitelistRoot, permCtx, operationType);
                 return new PathCheck(p.allowed(), normalizeSlashes(abs), p.message(), p.rule());
             }
             String basePath = getGlobBaseDirectory(normalizedPath);
-            String absBase = resolveAgainstCwd(basePath, cwd);
-            PermissionRule deny = editDenyRule(normalizeSlashes(absBase), cwd, permCtx);
+            String absBase = resolveAgainstCwd(basePath, resolutionBase);
+            PermissionRule deny = editDenyRule(normalizeSlashes(absBase), resolutionBase, permCtx);
             if (deny != null) {
                 return new PathCheck(false, normalizeSlashes(absBase), null, deny);
             }
@@ -699,8 +716,8 @@ public final class PowerShellPathValidator {
                 "glob 模式路径无法静态校验（glob 展开内符号链接不可见），需人工审批", null);
         }
         // 常规解析 + isPathAllowed（CC :1244-1263）
-        String abs = resolveAgainstCwd(normalizedPath, cwd);
-        PathCheck p = isPathAllowed(normalizeSlashes(abs), cwd, permCtx, operationType);
+        String abs = resolveAgainstCwd(normalizedPath, resolutionBase);
+        PathCheck p = isPathAllowed(normalizeSlashes(abs), resolutionBase, whitelistRoot, permCtx, operationType);
         return new PathCheck(p.allowed(), normalizeSlashes(abs), p.message(), p.rule());
     }
 
@@ -745,9 +762,10 @@ public final class PowerShellPathValidator {
      * 解析后路径判定 · 对齐 CC pathValidation.ts:863-977 isPathAllowed。
      * 顺序：deny 规则 →（写）auto-edit 安全 → 工作目录 → allow 规则 → 兜底。
      */
-    static PathCheck isPathAllowed(String resolvedPath, Path cwd, ToolPermissionContext permCtx, String operationType) {
+    static PathCheck isPathAllowed(String resolvedPath, Path resolutionBase, Path whitelistRoot,
+            ToolPermissionContext permCtx, String operationType) {
         // 1. Edit deny 规则（CC :871-883）
-        PermissionRule deny = editDenyRule(resolvedPath, cwd, permCtx);
+        PermissionRule deny = editDenyRule(resolvedPath, resolutionBase, permCtx);
         if (deny != null) {
             return new PathCheck(false, resolvedPath, null, deny);
         }
@@ -764,8 +782,8 @@ public final class PowerShellPathValidator {
                 return new PathCheck(false, resolvedPath, msg, null);
             }
         }
-        // 3. 工作目录内（CC :917-927）
-        boolean inWorkingDir = isInWorkingDir(resolvedPath, cwd, permCtx);
+        // 3. 工作目录内（CC :917-927）· 白名单根 = 轴 B（whitelistRoot），⛔ 不是解析基准
+        boolean inWorkingDir = isInWorkingDir(resolvedPath, whitelistRoot, permCtx);
         if (inWorkingDir) {
             if (OP_READ.equals(operationType) || (permCtx != null && permCtx.mode() == PermissionMode.ACCEPT_EDITS)) {
                 return new PathCheck(true, resolvedPath, null, null);
@@ -777,7 +795,7 @@ public final class PowerShellPathValidator {
             return new PathCheck(true, resolvedPath, null, null);
         }
         // 4. allow 规则（CC :961-973）
-        PermissionRule allow = editAllowRule(resolvedPath, cwd, permCtx);
+        PermissionRule allow = editAllowRule(resolvedPath, resolutionBase, permCtx);
         if (allow != null) {
             return new PathCheck(true, resolvedPath, null, allow);
         }
@@ -821,11 +839,21 @@ public final class PowerShellPathValidator {
         return null;
     }
 
-    /** 工作目录内判定（cwd + additionalWorkingDirectories）· 对齐 CC pathInAllowedWorkingPath 的 Java 近似。 */
-    static boolean isInWorkingDir(String resolvedPath, Path cwd, ToolPermissionContext permCtx) {
+    /** 工作目录内判定（<b>轴 B</b> whitelistRoot + additionalWorkingDirectories）· 对齐 CC
+     *  {@code pathInAllowedWorkingPath} 的 Java 近似。
+     *
+     *  <p>[P7] 白名单根 = {@code whitelistRoot} 形参（CC {@code allWorkingDirectories} 首项
+     *  {@code getOriginalCwd()}，filesystem.ts:666-673），⛔ <b>不再</b>复用相对路径解析基准
+     *  （旧实现让 bash/Set-Location 的 cd 把白名单范围一起挪走，CC 语义下 cd 不改白名单范围）。
+     *
+     *  <p>⚠️ 本实现仍是 lexical {@code startsWith}（无 realpath），与
+     *  {@link com.nexusai.application.agent.bash.BashPathValidator#isInWorkingDir} 的
+     * 双侧 realpath 版本<b>不是</b>同一套语义 —— 合并两者是独立批次的事（见 P7 报告残留项）。
+     */
+    static boolean isInWorkingDir(String resolvedPath, Path whitelistRoot, ToolPermissionContext permCtx) {
         try {
             Path resolved = Paths.get(resolvedPath).toAbsolutePath().normalize();
-            if (cwd != null && resolved.startsWith(cwd.toAbsolutePath().normalize())) {
+            if (whitelistRoot != null && resolved.startsWith(whitelistRoot.toAbsolutePath().normalize())) {
                 return true;
             }
             if (permCtx != null && permCtx.additionalWorkingDirectories() != null) {
@@ -844,15 +872,16 @@ public final class PowerShellPathValidator {
     // ════════════════════════════════════════════════════════════════════════
     // checkDenyRuleForGuessedPath · 对齐 CC pathValidation.ts:984-1008
     // ════════════════════════════════════════════════════════════════════════
-    /** 仅查 deny 规则的路径猜测（:: / 反引号 / 管道源场景）。只 deny 不 auto-allow。 */
-    static PermissionResult checkDenyRuleForGuessedPath(String strippedPath, Path cwd,
+    /** 仅查 deny 规则的路径猜测（:: / 反引号 / 管道源场景）。只 deny 不 auto-allow。
+     *  只吃轴 A（把相对路径解析成绝对路径后查 root-relative deny 规则），不查白名单。 */
+    static PermissionResult checkDenyRuleForGuessedPath(String strippedPath, Path resolutionBase,
                                                         ToolPermissionContext permCtx, String operationType) {
         if (strippedPath == null || strippedPath.isEmpty() || strippedPath.contains("\0")) {
             return null;
         }
         String tildeExpanded = expandTilde(strippedPath);
-        String abs = normalizeSlashes(resolveAgainstCwd(tildeExpanded, cwd));
-        PermissionRule deny = editDenyRule(abs, cwd, permCtx);
+        String abs = normalizeSlashes(resolveAgainstCwd(tildeExpanded, resolutionBase));
+        PermissionRule deny = editDenyRule(abs, resolutionBase, permCtx);
         if (deny != null) {
             return deny("路径 '" + abs + "' 被 Edit deny 规则阻断", new PermissionDecisionReason.Rule(deny));
         }
@@ -863,7 +892,8 @@ public final class PowerShellPathValidator {
     // nestedCommands 镜像 · 对齐 CC pathValidation.ts:1811-1906
     // ════════════════════════════════════════════════════════════════════════
     private static PermissionResult checkNestedCommands(List<PowerShellAstService.CommandElement> nested,
-                                                        ToolPermissionContext permCtx, Path cwd) {
+                                                        ToolPermissionContext permCtx, Path resolutionBase,
+                                                        Path whitelistRoot) {
         PermissionResult firstAsk = null;
         if (nested == null) return null;
         for (PowerShellAstService.CommandElement cmd : nested) {
@@ -882,7 +912,7 @@ public final class PowerShellPathValidator {
                 if (isRemoval && PowerShellPermissionChain.isDangerousRemovalRawPath(filePath)) {
                     return dangerousRemovalDeny(filePath);
                 }
-                PathCheck v = validatePath(filePath, cwd, permCtx, ex.operationType());
+                PathCheck v = validatePath(filePath, resolutionBase, whitelistRoot, permCtx, ex.operationType());
                 if (isRemoval && v.resolvedPath() != null
                     && PowerShellPermissionChain.isDangerousRemovalPath(v.resolvedPath())) {
                     return dangerousRemovalDeny(v.resolvedPath());

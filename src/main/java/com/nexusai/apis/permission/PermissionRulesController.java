@@ -26,6 +26,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -48,9 +49,11 @@ import java.util.UUID;
  *
  * <h2>端点</h2>
  * <ul>
- *   <li>{@code GET    /api/v1/permissions/rules} —— 读取全部可编辑规则（按行为分组）</li>
- *   <li>{@code POST   /api/v1/permissions/rules} —— 新增规则（对齐 CC addPermissionRulesToSettings）</li>
- *   <li>{@code DELETE /api/v1/permissions/rules} —— 删除规则（对齐 CC deletePermissionRuleFromSettings）</li>
+ *   <li>{@code GET    /api/v1/permissions/rules?sessionId=sess-xxx} —— 读取全部可编辑规则（按行为分组）</li>
+ *   <li>{@code POST   /api/v1/permissions/rules} —— 新增规则（对齐 CC addPermissionRulesToSettings；
+ *       请求体含 {@code sessionId}）</li>
+ *   <li>{@code DELETE /api/v1/permissions/rules} —— 删除规则（对齐 CC deletePermissionRuleFromSettings；
+ *       请求体含 {@code sessionId}）</li>
  *   <li>{@code POST   /api/v1/sessions/{sessionId}/permission-retry} —— 重试被拒工具
  *       （对齐 CC onRetryDenials → createPermissionRetryMessage）</li>
  * </ul>
@@ -94,15 +97,22 @@ public class PermissionRulesController {
      * getAskRules / getDenyRules）。响应元素 = {@link RuleDto}
      * {@code {source, behavior, ruleValue}}。
      *
+     * <p><b>[P11d] {@code sessionId} 查询参数</b>（可选）：project/local 两源的 settings 文件位置
+     * 按该会话的项目根解析（{@code CwdResolution.getProjectRoot}）；缺省/null ⇒ 无会话腿
+     * （进程 {@code user.dir}，与改前一致）。⭐ 与 POST/DELETE 写侧的 {@code sessionId}
+     * 同值时 ⇒ <b>读写同址</b>（界面看到的规则 = agent 运行期用的规则）。
+     *
+     * @param sessionId 会话 ID（可选 query 参数；short 形态 {@code sess-xxx}）
      * @return 规则列表（按 loader 顺序 + 文件顺序）
      */
     @GetMapping("/api/v1/permissions/rules")
-    public List<RuleDto> list() {
+    public List<RuleDto> list(
+            @RequestParam(name = "sessionId", required = false) String sessionId) {
         List<PermissionSourceLoader> loaders =
             List.of(userSettingsLoader, projectSettingsLoader, localSettingsLoader);
         List<RuleDto> result = new ArrayList<>();
         for (PermissionSourceLoader loader : loaders) {
-            for (PermissionRule rule : loader.load()) {
+            for (PermissionRule rule : loader.load(sessionId)) {
                 result.add(new RuleDto(
                     ccSourceName(rule.source()),
                     ccBehaviorName(rule.ruleBehavior()),
@@ -110,7 +120,8 @@ public class PermissionRulesController {
             }
         }
         if (log.isDebugEnabled()) {
-            log.debug("[PermissionRulesController] 读取规则列表: 返回 {} 条（3 editable 源合并）", result.size());
+            log.debug("[PermissionRulesController] 读取规则列表: 返回 {} 条（3 editable 源合并）sessionId={}",
+                result.size(), sessionId);
         }
         return result;
     }
@@ -125,7 +136,7 @@ public class PermissionRulesController {
      * <p>经 {@link PermissionUpdatePersister#persist} 的 AddRules 增量写盘
      * （roundtrip 归一化去重），由前端经 待前端对接.md §17 消费。
      *
-     * @param req 请求体 {@code {destination, behavior, rules[]}}
+     * @param req 请求体 {@code {destination, behavior, rules[], sessionId?}}
      * @return 新增成功的规则数
      */
     @PostMapping("/api/v1/permissions/rules")
@@ -137,9 +148,12 @@ public class PermissionRulesController {
         if (rules.isEmpty()) {
             throw new IllegalArgumentException("rules 列表为空或全部解析失败");
         }
-        permissionUpdatePersister.persist(new PermissionUpdate.AddRules(dest, rules, behavior));
-        log.info("[PermissionRulesController] 新增 {} 条 {} 规则到 {}（对齐 CC addPermissionRulesToSettings）",
-            rules.size(), ccBehaviorName(behavior), req.destination());
+        // [P11d] 传 req.sessionId()：project/local source 写盘按<b>该会话项目根</b>解析
+        //   （与 GET list 的 sessionId 同值 ⇒ 读写同址；缺省 null ⇒ 无会话腿，与改前一致）
+        permissionUpdatePersister.persist(
+            new PermissionUpdate.AddRules(dest, rules, behavior), req.sessionId());
+        log.info("[PermissionRulesController] 新增 {} 条 {} 规则到 {}（对齐 CC addPermissionRulesToSettings）sessionId={}",
+            rules.size(), ccBehaviorName(behavior), req.destination(), req.sessionId());
         return Map.of("added", rules.size(), "destination", req.destination(), "behavior", req.behavior());
     }
 
@@ -150,7 +164,7 @@ public class PermissionRulesController {
      * deletePermissionRule「Cannot delete permission rules from read-only settings」
      * 语义一致（permissions.ts:1333-1337）。
      *
-     * @param req 请求体 {@code {destination, behavior, rules[]}}
+     * @param req 请求体 {@code {destination, behavior, rules[], sessionId?}}
      * @return 删除操作的规则数（best-effort，未匹配项静默跳过 —— CC 同语义）
      */
     @DeleteMapping("/api/v1/permissions/rules")
@@ -161,9 +175,11 @@ public class PermissionRulesController {
         if (rules.isEmpty()) {
             throw new IllegalArgumentException("rules 列表为空或全部解析失败");
         }
-        permissionUpdatePersister.persist(new PermissionUpdate.RemoveRules(dest, rules, behavior));
-        log.info("[PermissionRulesController] 删除 {} 条 {} 规则从 {}（对齐 CC deletePermissionRuleFromSettings）",
-            rules.size(), ccBehaviorName(behavior), req.destination());
+        // [P11d] 同 add：写盘落在该会话的项目根（见 add 注释）
+        permissionUpdatePersister.persist(
+            new PermissionUpdate.RemoveRules(dest, rules, behavior), req.sessionId());
+        log.info("[PermissionRulesController] 删除 {} 条 {} 规则从 {}（对齐 CC deletePermissionRuleFromSettings）sessionId={}",
+            rules.size(), ccBehaviorName(behavior), req.destination(), req.sessionId());
         return Map.of("removed", rules.size(), "destination", req.destination(), "behavior", req.behavior());
     }
 
@@ -339,8 +355,21 @@ public class PermissionRulesController {
     public record RuleDto(String source, String behavior, String ruleValue) {
     }
 
-    /** 规则新增/删除请求体 · CC EditPermissionRuleArgs 等价 {@code {destination, behavior, rules}}。 */
-    public record RuleWriteRequest(String destination, String behavior, List<String> rules) {
+    /**
+     * 规则新增/删除请求体 · CC EditPermissionRuleArgs 等价 {@code {destination, behavior, rules}}
+     * <b>+ [P11d] {@code sessionId}</b>。
+     *
+     * <p>{@code sessionId} 决定 project/local 两源的写盘落点（该会话项目根）。
+     * ⚠️ 与 CC 的差异：CC 是单会话进程，落盘位置无需入参 ⇒ 本字段是 web 多会话的受控扩列
+     * （缺省 null = 无会话腿，与改前行为一致）。
+     *
+     * @param destination {@code userSettings}/{@code projectSettings}/{@code localSettings}
+     * @param behavior    {@code allow}/{@code deny}/{@code ask}
+     * @param rules       规则字符串列表
+     * @param sessionId   会话 ID（short；可 null）
+     */
+    public record RuleWriteRequest(String destination, String behavior, List<String> rules,
+                                   String sessionId) {
     }
 
     /** 重试被拒工具请求体 · CC createPermissionRetryMessage(commands) 的 commands 入参。 */

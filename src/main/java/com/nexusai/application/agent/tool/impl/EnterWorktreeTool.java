@@ -276,7 +276,23 @@ public class EnterWorktreeTool implements Tool {
                     "Already in a worktree session: this session is already in a worktree. "
                             + "Exit the current worktree with ExitWorktree before entering another one.");
         }
-        Path gitRoot = currentGitRoot(sessionKey);
+        // [P10c] ⭐ 边界解析一次 · 进入前的会话 cwd —— <b>必须在 applySessionCwd 之前</b>取值。
+        // WHY（CC 真源，自验；不信本仓旧注释）：CC {@code worktree.ts:712} 在
+        //   {@code createWorktreeForSession} 入口 {@code const originalCwd = getCwd()}（此后才
+        //   {@code EnterWorktreeTool.ts:94 process.chdir(worktreePath)}）⇒ transcript 的
+        //   {@code currentWorktreeSession.originalCwd}（:722/:757，:97 saveWorktreeState 落盘）
+        //   记的是【进入前目录】，退出时 :789 {@code process.chdir(originalCwd)} 靠它回原目录。
+        // ⛔ 不得挪到 applySessionCwd 之后：本仓 {@code applySessionCwd} 写
+        //   {@code SessionCwdHolder}（CwdResolution 的 L1 层）⇒ 之后取 {@code getCwd} 只会拿到
+        //   刚写进去的 worktreePath（原缺陷：transcript 的 originalCwd 被写成 worktree 自身）。
+        // 时机与本仓原有 {@code currentGitRoot(sessionKey)} 内的 {@code getCwd} 调用<b>同一状态</b>
+        //   （本方法之前无任何 SessionCwdHolder 写入点：全仓写点仅 ResumeService:569 /
+        //   BashTool:1446 / PowerShellTool:783 与本类 :404）⇒ 无新增抛点（fail-loud 面不变）。
+        // 同批 P10a 手法一致：边界解析一次 ⇒ 形参下传（本处同时消除原 :433 的第二次解析）。
+        // sessionKey 为 null ⇒ {@code getCwd(null)} 走无会话命名出口（进程 user.dir + 一次性 WARN），
+        //   与改造前 {@code currentGitRoot(null)} 的行为逐字节相同。
+        String preEntryCwd = CwdResolution.getCwd(sessionKey);
+        Path gitRoot = currentGitRoot(preEntryCwd);
         try {
             // CC worktree.ts:716-719 — validateWorktreeSlug 先行（hook 分支与 git 分支共用；
             //   hooks 收到的是原始 slug，分支名由 git 路径从 slug 推导）
@@ -306,7 +322,7 @@ public class EnterWorktreeTool implements Tool {
                 }
                 // [WF-2] 写 transcript worktree-state（对齐 CC EnterWorktreeTool.ts:97
                 //   saveWorktreeState(worktreeSession)）· hookBased 无 git 分支 → branch=null
-                persistWorktreeState(ctx, sessionKey, slug, worktreePath, null, true);
+                persistWorktreeState(ctx, sessionKey, slug, worktreePath, null, true, preEntryCwd);
                 // [G22③] 进入 worktree 后清 CWD 依赖缓存（对齐 CC :98-102
                 //   clearSystemPromptSections + clearMemoryFileCaches + getPlansDirectory.cache.clear）
                 clearWorktreeCaches(ctx);
@@ -329,7 +345,7 @@ public class EnterWorktreeTool implements Tool {
             }
             // [WF-2] 写 transcript worktree-state（对齐 CC EnterWorktreeTool.ts:97
             //   saveWorktreeState(worktreeSession)）· git 路径携带 branch
-            persistWorktreeState(ctx, sessionKey, slug, r.worktreePath(), r.worktreeBranch(), false);
+            persistWorktreeState(ctx, sessionKey, slug, r.worktreePath(), r.worktreeBranch(), false, preEntryCwd);
             // [G22③] 进入 worktree 后清 CWD 依赖缓存（对齐 CC :98-102）
             clearWorktreeCaches(ctx);
             log.info("[EnterWorktreeTool] {}", message);
@@ -412,6 +428,12 @@ public class EnterWorktreeTool implements Tool {
      * {@link #captureSessionOriginalCwd} 已捕获的前端传入目录（缺失回退 user.dir，与
      * Exit 侧 resolveOriginalCwd 回退一致）。
      *
+     * <p><b>[P10c] originalCwd 的兜底来源改为形参 {@code preEntryCwd}</b>（{@code execute} 在
+     * {@code applySessionCwd} <b>之前</b>解析一次传入，对齐 CC {@code worktree.ts:712}）。
+     * ⛔ 不得改回「本方法内现算 {@code CwdResolution.getCwd}」——两个调用点
+     * （{@code :318} hook / {@code :341} git）都在 {@code applySessionCwd} <b>之后</b>，
+     * 那时 L1 已是 worktreePath。
+     *
      * <p>[TL-W2 P10] transcript 定位：workspaceDir = <b>会话绑定项目根</b>
      * （{@code SessionProjectRoot.getForSession(sessionKey)}：按 sessionId 从全局冻结表现算，
      * 未绑定 → null ⇒ 不落盘 —— 与读侧 ChatService.restoreWorktreeForResume 同一来源，读写锚
@@ -421,16 +443,21 @@ public class EnterWorktreeTool implements Tool {
      * sessionId = ctx.sessionId() UUID 串。
      */
     private void persistWorktreeState(ToolUseContext ctx, String sessionKey, String slug,
-                                      Path worktreePath, String worktreeBranch, boolean hookBased) {
+                                      Path worktreePath, String worktreeBranch, boolean hookBased,
+                                      String preEntryCwd) {
         if (ctx == null || sessionKey == null) {
             return;
         }
         String originalCwd =
                 com.nexusai.application.agent.worktree.WorktreeCwdTracker.getOriginalCwd(sessionKey);
         if (originalCwd == null || originalCwd.isBlank()) {
-            // cwd-align-ext：兜底 = 会话 cwd（CC EnterWorktreeTool.ts:96 setOriginalCwd(getCwd()) 就地捕获）；
-            //   无 sessionId 回落 user.dir（方案 1，零行为变化）。
-            originalCwd = CwdResolution.getCwd(sessionKey);
+            // [P10c] 兜底 = 形参 preEntryCwd（execute 在 applySessionCwd **之前**解析一次）。
+            //   ⛔ 原实现此处现算 CwdResolution.getCwd(sessionKey) —— 但本方法总在 applySessionCwd
+            //   之后被调用（:318/:341），此时 L1 sessionCwd 已被本次 worktree 改写 ⇒ 取到
+            //   worktreePath 自身，与 CC worktree.ts:712（chdir 之前捕获）相反。
+            //   下面的 user.dir 仅为结构性兜底：CwdResolution.getCwd 对非 null sessionKey 恒非 null
+            //   （各层 MISS ⇒ 抛，不返回 null）⇒ 本行正常不可达，⛔ 不声称它守住了什么。
+            originalCwd = preEntryCwd;
             if (originalCwd == null || originalCwd.isBlank()) {
                 originalCwd = System.getProperty("user.dir", ".");
             }
@@ -569,15 +596,18 @@ public class EnterWorktreeTool implements Tool {
     /**
      * 当前 git 仓库根目录 — 对齐 CC findCanonicalGitRoot(getCwd())（EnterWorktreeTool.ts:84）。
      * cwd-align-ext：user.dir 硬编码 → 会话 cwd + 复用 {@link AutoMemPaths#findCanonicalGitRoot}
-     * （worktree/submodule .git 文件解析）；无 sessionId 回落 user.dir（方案 1，零行为变化）。
+     * （worktree/submodule .git 文件解析）；cwd 为空回落 user.dir（方案 1，零行为变化）。
      *
-     * <p>[批 3c] 会话来源显式化：sessionId 由调用方 {@code execute} 显式传入（= {@code ctx.sessionId()}，
-     * 无 ctx ⇒ null）；⛔ 不再读裸 MDC。
+     * <p>[P10c] 形参由 {@code sessionId} 改为<b>已解析的 cwd</b>（{@code execute} 边界解析一次后下传）
+     * —— 原实现自带一次 {@code CwdResolution.getCwd}，与同方法调用链上游的解析重复。
+     * ⛔ 不在本方法内重新解析：解出来的值必须与 transcript 的 originalCwd 同源同时机。
      *
-     * @param sessionId 当前会话 id（可 null/空白 → 回落 user.dir）
+     * <p>[批 3c] 会话来源显式化：cwd 由调用方 {@code execute} 显式解析并传入（源 = {@code ctx.sessionId()}）；
+     * ⛔ 不再读裸 MDC。
+     *
+     * @param cwd 会话当前 cwd（可 null/空白 → 回落 user.dir）
      */
-    private Path currentGitRoot(String sessionId) {
-        String cwd = CwdResolution.getCwd(sessionId);
+    private Path currentGitRoot(String cwd) {
         if (cwd == null || cwd.isBlank()) {
             cwd = System.getProperty("user.dir", ".");
         }

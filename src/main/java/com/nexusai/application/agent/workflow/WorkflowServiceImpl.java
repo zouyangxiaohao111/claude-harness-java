@@ -185,22 +185,28 @@ public final class WorkflowServiceImpl implements WorkflowService {
      *
      * <p><b>[批 3c 会话透传说明]</b> 本方法是 runsDir 消费链上<b>唯一</b>手上有会话的入口
      * （{@link ToolUseContext#sessionId()}）：会话已显式用于 host bundle 与
-     * {@link #resolveProjectRoot}（{@code cwd}）。但 runsDir 的两条消费链在<b>下游且无会话形参</b>——
+     * {@link #resolveProjectRoot}（{@code cwd}；[P10a · D3] 调用方下传时本方法不再解析 ——
+     * {@code projectRoot} 形参非空即终结）。但 runsDir 的两条消费链在<b>下游且无会话形参</b>——
      * ① {@code WorkflowPorts.journalStore()}（接口无参，引擎/hooks 调用，batch 3c 不动接口）；
      * ② {@code WorkflowRunPersistence} 的 run_done 总线订阅者（任意线程）。故无法从本方法一路透传，
      * 见 {@link #getRunAsync} 与 {@link WorkflowPortsImpl#journalStore()} 的「已知边界」。
      */
     @Override
-    public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool) {
+    public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool,
+                                                  String projectRoot) {
         if (input == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("LaunchInput 不能为 null"));
         }
         log.info("WorkflowService.launch 入口：name={} scriptPath={} resumeFromRunId={} maxConcurrency={} "
-                + "sessionId={}（CC service.ts:188-257）",
+                + "sessionId={} projectRoot（调用方下传）={}（CC service.ts:188-257）",
                 input.name(), input.scriptPath(), input.resumeFromRunId(), input.maxConcurrency(),
-                ctx != null ? ctx.sessionId() : null);
+                ctx != null ? ctx.sessionId() : null, projectRoot);
         try {
-            ResolvedSource src = resolveSource(input, ctx);
+            // [P10a · D3] 项目根**只解析一次**：调用方（工具入口）给了就用它，否则本方法解析一次。
+            //   ⛔ 不得在 resolveSource / buildHost 里各解析一次（CC 端此值只解析一次）。
+            String cwd = resolveProjectRoot(ctx, projectRoot);
+
+            ResolvedSource src = resolveSource(input, cwd);
 
             // parseScript 快速校验：失败抛「Script validation failed」不进后台（service.ts:190-194）
             try {
@@ -211,7 +217,7 @@ public final class WorkflowServiceImpl implements WorkflowService {
                 throw new IllegalArgumentException("Script validation failed: " + e.getMessage());
             }
 
-            WorkflowHostContext host = buildHost(ctx, canUseTool);
+            WorkflowHostContext host = buildHost(ctx, canUseTool, cwd);
 
             // taskRegistrar.register：resumeFromRunId → runId 复用（service.ts:197-206）
             TaskRegistrar.RegisterResult reg = ports.taskRegistrar().register(
@@ -406,7 +412,8 @@ public final class WorkflowServiceImpl implements WorkflowService {
 
     @Override
     public List<String> listNamed(String workflowDir) {
-        String projectRoot = resolveProjectRoot(null);
+        // 面板路径无会话来源（接口无 sessionId 形参）⇒ 无会话腿（user.dir）。调用方未解析 ⇒ 本方法解析。
+        String projectRoot = resolveProjectRoot(null, null);
         List<String> names = workflowDir != null
                 ? NamedWorkflows.list(workflowDir)
                 : NamedWorkflows.listWithFallback(projectRoot);
@@ -428,8 +435,11 @@ public final class WorkflowServiceImpl implements WorkflowService {
      *
      * <p>script > scriptPath（readFile）> name（{@code resolveNamedWorkflow}）；缺 → Error。
      * {@code workflowName = name ?? title ?? 'workflow'}（service.ts:153）。
+     *
+     * <p><b>[P10a · D3]</b> 命名解析基准 {@code cwd} 由 {@link #launch} 下传（⛔ 本方法<b>不再</b>
+     * 自行解析 —— 原实现调 {@code resolveProjectRoot(ctx)} 造成同链第二次解析）。
      */
-    private ResolvedSource resolveSource(LaunchInput input, ToolUseContext ctx) throws Exception {
+    private ResolvedSource resolveSource(LaunchInput input, String cwd) throws Exception {
         String workflowName = input.name() != null ? input.name()
                 : (input.title() != null ? input.title() : "workflow");
         if (input.script() != null) {
@@ -446,7 +456,7 @@ public final class WorkflowServiceImpl implements WorkflowService {
             return new ResolvedSource(script, input.scriptPath(), workflowName);
         }
         if (input.name() != null) {
-            NamedWorkflows.NamedWorkflow found = NamedWorkflows.resolveWithFallback(resolveProjectRoot(ctx), input.name());
+            NamedWorkflows.NamedWorkflow found = NamedWorkflows.resolveWithFallback(cwd, input.name());
             if (found == null) {
                 throw new IllegalArgumentException("Named workflow \"" + input.name()
                         + "\" not found (looked in " + WorkflowConstants.WORKFLOW_DIR_NAME
@@ -463,13 +473,15 @@ public final class WorkflowServiceImpl implements WorkflowService {
     /**
      * 构造 host 上下文 · CC original: buildHost (service.ts:128-139)。
      *
-     * <p>{@code cwd} 用 projectRoot（对齐 ports.ts hostFactory / journalStore 同根，
-     * 防 worktree/子目录 desync，service.ts:133-136）；{@code budgetTotal = null}（turn 级预算注入点）。
+     * <p>{@code cwd} <b>不是</b>本方法解析的 —— 由 {@link #launch} <b>一次性</b>解析后作为形参下传
+     * （CC 等价：{@code service.ts:133-136 cwd: cwdOverride ?? getProjectRoot()} 每次 launch 只解析一次；
+     * 工具入口已解析的值经 {@code launch} 形参进来后不再重复解析）。
+     *
+     * <p>{@code budgetTotal = null}（turn 级预算注入点）。
      */
-    private WorkflowHostContext buildHost(ToolUseContext toolUseContext, Object canUseTool) {
+    private WorkflowHostContext buildHost(ToolUseContext toolUseContext, Object canUseTool, String cwd) {
         WorkflowHostBundle bundle = WorkflowHostBundle.build(toolUseContext, canUseTool, null);
         HostHandle handle = HostHandle.create(bundle);
-        String cwd = resolveProjectRoot(toolUseContext);
         String toolUseId = toolUseContext != null ? toolUseContext.toolUseId() : null;
         if (log.isDebugEnabled()) {
             log.debug("buildHost：cwd={} budgetTotal=null toolUseId={}（service.ts:128-139）", cwd, toolUseId);
@@ -478,18 +490,36 @@ public final class WorkflowServiceImpl implements WorkflowService {
     }
 
     /**
-     * 解析 projectRoot · CC original: {@code getProjectRoot()}（service.ts:136，bootstrap/state.ts）。
+     * 解析 projectRoot · CC original: {@code getProjectRoot()}（service.ts:136，bootstrap/state.ts:498-508）。
      *
      * <p>Java 等价 = 会话绑定项目（boundProject，memory：session-bound-dir-is-cc-startup-dir），
-     * 经 {@link CwdResolution#getCwd(String)} 四层解析（override → sessionCwd → boundProject → user.dir）；
-     * 无会话（cron/后台/测试）回落 {@code user.dir}。
+     * 经 {@link CwdResolution#getProjectRoot(String)} 解析（⛔ <b>不</b>走 {@code getCwd}/
+     * {@code getOriginalCwdLayer} —— 那两条槽会被 bash {@code cd} / worktree 入口挪走，
+     * 破坏 CC {@code ports.ts:54-60} 的「host cwd 与 journal runsDir 同根」不变量）。
+     *
+     * <p><b>[P10a · D3] 只解析一次</b>：{@code alreadyResolved} 非空时直接用（调用方 —— 工具入口 ——
+     * 已解析）；这是「同一链路不得两套判据」的落点。给定值<b>优先于</b>会话解析，但测试的
+     * {@code cwdOverride} 仍最优先（保持既有测试语义）。
+     *
+     * <p>会话无法解析 ⇒ {@link CwdResolution#getProjectRoot(String)} fail-loud 抛（对齐 P9
+     * {@code CommandHookExecutor.resolveSessionProjectRoot} 四态）。
+     *
+     * <p>⚠️ <b>已知未修（登记，非本批范围）</b>：无会话腿仍是裸内联
+     * {@code System.getProperty("user.dir")}，绕过命名出口 {@code CwdResolution.getCwdForNonSession()}。
+     *
+     * @param ctx             工具调用上下文（可 null = 无会话调用方）
+     * @param alreadyResolved 调用方<b>已解析</b>的项目根（null = 本方法解析）
+     * @return 归一化的项目根
      */
-    private String resolveProjectRoot(ToolUseContext ctx) {
+    private String resolveProjectRoot(ToolUseContext ctx, String alreadyResolved) {
         if (cwdOverride != null) {
             return cwdOverride;
         }
+        if (alreadyResolved != null && !alreadyResolved.isBlank()) {
+            return alreadyResolved;
+        }
         if (ctx != null && ctx.sessionId() != null) {
-            return CwdResolution.getCwd(ctx.sessionId());
+            return CwdResolution.getProjectRoot(ctx.sessionId());
         }
         return System.getProperty("user.dir");
     }

@@ -232,7 +232,7 @@ class PowerShellPermissionChainCwdBaseTest {
         // WHY：resolveAgainstCwd 原实现无条件 Paths.get(cwd.toString(), path) ⇒ cwd=null 时
         //   NPE（异常经 1c 降级）或（若有人补个 user.dir 兜底）把越界路径误判为工作目录内。
         PowerShellPathValidator.PathCheck pc =
-            PowerShellPathValidator.validatePath("./p15-rel.txt", null, null, "read");
+            PowerShellPathValidator.validatePath("./p15-rel.txt", null, null, null, "read");
         assertFalse(pc.allowed(),
             "会话基准缺失 ⇒ 相对路径无法校验 ⇒ 不得放行（宁问不放）实测=" + pc.resolvedPath());
         assertFalse(pc.resolvedPath().startsWith(System.getProperty("user.dir")),

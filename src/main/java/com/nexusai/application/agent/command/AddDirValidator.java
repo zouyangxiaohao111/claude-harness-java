@@ -22,7 +22,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p>L2 契约 (5 Release Gate):
  * <ul>
- *   <li><b>A1</b>: 5 状态 {@link Result} record (sealed 风格) + {@link #validateDirectoryForWorkspace(String, List, Function)} 5 参</li>
+ *   <li><b>A1</b>: 5 状态 {@link Result} record (sealed 风格) + {@link #validateDirectoryForWorkspace(String, List, Stat)} 5 参</li>
  *   <li><b>A2 Golden Trace</b>: emptyPath → emptyPath;stat isDirectory()=false → notADirectory;stat throws ENOENT → pathNotFound;pathInWorkingPath(absolutePath, workingDir) → alreadyInWorkingDirectory;pass → success</li>
  *   <li><b>A3 纯函数 + 副作用受控</b>: 注入式 {@link Stat} (实际 NIO 调用 or test fake);其余纯函数</li>
  *   <li><b>A4 边界</b>: null directoryPath → emptyPath;stat throws 非已知 errno → 透传 (re-throw)</li>

@@ -252,7 +252,7 @@ class SettingsJsonMergeWriteBackTest {
             PermissionRule npmPublish = rule(PermissionBehavior.ALLOW, "Bash", "npm publish:*");
             persister.persist(
                 new PermissionUpdate.AddRules(
-                    PermissionUpdate.Destination.USER_SETTINGS, List.of(npmPublish), PermissionBehavior.ALLOW));
+                    PermissionUpdate.Destination.USER_SETTINGS, List.of(npmPublish), PermissionBehavior.ALLOW), null);
 
             JsonNode root = MAPPER.readTree(settingsFile.toFile());
             // hooks/env/未知 key 保留
@@ -287,7 +287,7 @@ class SettingsJsonMergeWriteBackTest {
         PermissionRule askEdit = rule(PermissionBehavior.ASK, "Edit", null);
         persister.persist(
             new PermissionUpdate.AddRules(
-                PermissionUpdate.Destination.PROJECT_SETTINGS, List.of(askEdit), PermissionBehavior.ASK));
+                PermissionUpdate.Destination.PROJECT_SETTINGS, List.of(askEdit), PermissionBehavior.ASK), null);
 
         JsonNode root = MAPPER.readTree(settingsFile.toFile());
         assertThat(root.path("hooks").isObject()).isTrue();

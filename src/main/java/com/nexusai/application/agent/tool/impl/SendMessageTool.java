@@ -50,7 +50,7 @@ import java.util.Optional;
  *   <li><b>name@team 拒绝（⊕-09）</b>：validateInput 拒绝 {@code to} 含 {@code @}（:623-630）。</li>
  *   <li><b>team 名（⊕-10）</b>：删除 {@code team-{sessionId前8}} 合成；team 名取
  *       {@code getTeamName(appState.teamContext)}（:156），Java 等价
- *       {@link Teammate#getTeamName(String)}（in-process &gt; dynamic &gt; teamContext）。</li>
+ *       {@link Teammate#getTeamName(TeammateIdentity, String)}（in-process &gt; dynamic &gt; teamContext）。</li>
  *   <li><b>输出契约（⊕-11）</b>：删除 {@code message_id/delivered_to/type/timestamp}；
  *       plain 消息输出 {@code {success, message, routing}}（:175-187），广播
  *       {@code {success, message, recipients[], routing}}（:252-265）。</li>
@@ -1092,7 +1092,7 @@ public class SendMessageTool implements Tool {
      * 与 teammate.ts:111-118（in-process &gt; dynamic &gt; teamContext.teamName）。
      *
      * <p><b>IMP-G2 ⊕-10</b>：删除旧 {@code team-{sessionId前8}} 合成（defaultTeamName）；
-     * Java 等价 {@link Teammate#getTeamName(String)}（teamContext.teamName 经
+     * Java 等价 {@link Teammate#getTeamName(TeammateIdentity, String)}（teamContext.teamName 经
      * {@code ctx.getAppState()} 读取）。无任何 team context → null（mailbox 回退 'default'）。
      *
      * @param ctx 工具调用上下文（可为 null）

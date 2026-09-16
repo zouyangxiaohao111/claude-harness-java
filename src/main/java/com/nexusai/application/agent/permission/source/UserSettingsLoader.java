@@ -37,6 +37,12 @@ import java.util.List;
  * <h2>无状态 / Spring 单例</h2>
  * <p>{@link #load()} 每次重新读盘（{@code user.home} 不变）—— Spring 单例 OK。
  *
+ * <h2>[P11d] 用户级源<b>不感知会话</b></h2>
+ * <p>本 loader 的文件路径恒为 {@code ~/.{appName}/settings.json}（{@link NexusaiPaths#getAppConfigHomeDir()}），
+ * 与 {@code sessionId} 无关 ⇒ {@link #load(String)} 及 3 个写方法<b>忽略</b> {@code sessionId}
+ * 形参，行为逐字节同改前（项目级源才按会话解析项目根：
+ * {@link LocalSettingsLoader} / {@link ProjectSettingsLoader}）。
+ *
  * <h2>异常处理</h2>
  * <p>本类捕获所有异常并返回空 list（与 {@link PermissionSourceLoader} 契约一致）。
  * 这是 lenient 加载策略：单个 source 失败不应让 PermissionContextBuilder 失败。
@@ -98,18 +104,34 @@ public class UserSettingsLoader implements PermissionSourceLoader {
     }
 
     /**
-     * 读取 {@code permissions.<field>} 原始字符串数组（增量写盘前读现有桶内容）。
+     * {@inheritDoc}
+     *
+     * <p><b>[P11d] ⛔ 刻意忽略 {@code sessionId}</b>：userSettings 是<b>用户级</b>源
+     * （{@code ~/.{appName}/settings.json}，跨项目共享），其文件位置与会话无关 ⇒ 本覆写
+     * 只为与接口形态一致，<b>行为与 {@code load()} 逐字节相同</b>。
      */
     @Override
-    public List<String> readPermissionsStringArray(String field) {
+    public List<PermissionRule> load(String sessionId) {
+        return load();
+    }
+
+    /**
+     * 读取 {@code permissions.<field>} 原始字符串数组（增量写盘前读现有桶内容）。
+     *
+     * <p>[P11d] {@code sessionId} 忽略（用户级源与会话无关，见 {@link #load(String)}）。
+     */
+    @Override
+    public List<String> readPermissionsStringArray(String field, String sessionId) {
         return parser.readPermissionsStringArray(resolvePath(), field);
     }
 
     /**
      * 单字段 merge 写 {@code permissions.<field>} 数组（整体替换）。
+     *
+     * <p>[P11d] {@code sessionId} 忽略（用户级源与会话无关，见 {@link #load(String)}）。
      */
     @Override
-    public void savePermissionsField(String field, List<String> values) {
+    public void savePermissionsField(String field, List<String> values, String sessionId) {
         if (values == null) {
             throw new IllegalArgumentException("values is null");
         }
@@ -123,9 +145,11 @@ public class UserSettingsLoader implements PermissionSourceLoader {
 
     /**
      * 单字段 merge 写 {@code permissions.<field>} 字符串值（如 {@code defaultMode}）。
+     *
+     * <p>[P11d] {@code sessionId} 忽略（用户级源与会话无关，见 {@link #load(String)}）。
      */
     @Override
-    public void savePermissionsValue(String field, String value) {
+    public void savePermissionsValue(String field, String value, String sessionId) {
         Path targetFile = resolvePath();
         String json = parser.mergeWritePermissionsValue(targetFile, field, value);
         atomicWrite(targetFile, json);

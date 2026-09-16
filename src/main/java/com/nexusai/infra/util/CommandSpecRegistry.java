@@ -11,7 +11,7 @@ import java.util.function.Supplier;
  * <ul>
  *   <li>{@link CommandSpec} + {@link Argument} + {@link Option} records</li>
  *   <li>{@link #loadFigSpec(String, Function)} — 路径/相对路径/symbolic-option 校验</li>
- *   <li>{@link #getCommandSpec(String, Supplier, Function)} — memoize-like 命令查找</li>
+ *   <li>{@link #getCommandSpec(String, List, Function)} — memoize-like 命令查找</li>
  * </ul>
  *
  * <p>L2 契约 (5 Release Gate):

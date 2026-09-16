@@ -301,7 +301,7 @@ class TrustGateHookRegistryTest {
         registry.setHooksConfigSnapshot(snapshot);
         registry.setHookMatcherEngine(new HookMatcherEngine(snapshot, new PermissionRuleValueParser()));
         CommandHookExecutor executor = new CommandHookExecutor(launcher,
-            k -> null, p -> true, () -> "C:/project", id -> "C:/plugins/" + id);
+            k -> null, p -> true, sid -> "C:/project", id -> "C:/plugins/" + id);
         registry.setCommandHookExecutor(executor);
         return registry;
     }

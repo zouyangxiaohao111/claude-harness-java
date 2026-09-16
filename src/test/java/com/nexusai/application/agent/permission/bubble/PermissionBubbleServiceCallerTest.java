@@ -139,7 +139,7 @@ class PermissionBubbleServiceCallerTest {
     /**
      * 构造 ToolUseContext · permissionMode 由调用方决定.
      *
-     * <p>使用 9 字段 {@link ToolUseContext#of(UUID, UUID, PermissionMode, List, String,
+     * <p>使用 9 字段 {@link ToolUseContext#of(UUID, String, PermissionMode, List, String,
      * AbortController, List, ToolPermissionContext, PermissionMode)} 便利工厂, 后面 37 字段
      * (Stage 3.2 C2 4 + Stage 3.3 UI 11 + Stage 3.4 session 13 + readFileState) 由
      * compact ctor 兜底 null.

@@ -1016,13 +1016,15 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             }
             return;
         }
+        // [P11d] 会话 id 上提（apply 与 persist 共用同一值）：project/local source 的写盘落点
+        //   按会话解析（读侧 PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。
+        //   [session-id-short] ctx.sessionId() 已 String（short）
+        String sessionId = ctx != null ? ctx.sessionId() : null;
         // 1) apply —— CC applyPermissionUpdates（PermissionUpdate.ts:196-206）
         //    [DEL-WF1-03] SESSION destination 更新不再同步 SessionSource（已删）；
         //    "Allow this session" 跨轮持久待后续 appState 承载任务（见探查/progress/wf12.md）。
         ToolPermissionContext applied = current;
         if (permissionUpdateApplier != null) {
-            // [session-id-short] ctx.sessionId() 已 String（short）
-            String sessionId = ctx != null ? ctx.sessionId() : null;
             applied = permissionUpdateApplier.applyAll(updates, current);
             if (log.isDebugEnabled()) {
                 log.debug("PERMISSION updatedPermissions: apply 完成 requestId={} updates={} sessionId={}",
@@ -1037,10 +1039,10 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         // 2) persist —— CC persistPermissionUpdates（PermissionUpdate.ts:349-353；
         //    supportsPersistence 拦截 CLI_ARG/SESSION 非可持久化 destination）
         if (permissionUpdatePersister != null) {
-            permissionUpdatePersister.persistAll(updates);
+            permissionUpdatePersister.persistAll(updates, sessionId);
             if (log.isInfoEnabled()) {
-                log.info("PERMISSION updatedPermissions: persist 完成 requestId={} updates={}",
-                    requestId, updates.size());
+                log.info("PERMISSION updatedPermissions: persist 完成 requestId={} updates={} sessionId={}",
+                    requestId, updates.size(), sessionId);
             }
         } else {
             if (log.isDebugEnabled()) {

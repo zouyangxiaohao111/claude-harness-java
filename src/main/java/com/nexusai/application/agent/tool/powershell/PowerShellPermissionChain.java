@@ -378,7 +378,11 @@ public class PowerShellPermissionChain {
             (p, op) -> internalPathCarveOut(p, op, carveOutProjectRoot));
         PermissionResult pathResult;
         try {
-            pathResult = PowerShellPathValidator.check(input, parsed, permCtx, cwd, hasCdSubCommand);
+            // [P7] 双轴显式化：轴 A = cwd（resolve 相对路径，= CLI 侧 checkPathConstraintsForStatement
+            //   内部的 getCwd()，pathValidation.ts:1583）；轴 B = 会话 originalCwd（越界白名单，
+            //   CC allWorkingDirectories 首项，filesystem.ts:666-673）。⛔ 两轴不得互换。
+            pathResult = PowerShellPathValidator.check(
+                input, parsed, permCtx, cwd, pathWhitelistRoot(ctx), hasCdSubCommand);
         } finally {
             PowerShellPathValidator.clearInternalPathCarveOut();
         }
@@ -1058,6 +1062,46 @@ public class PowerShellPermissionChain {
         log.warn("PowerShellPermissionChain: 权限越界基准 cwd 缺失（ToolUseContext 为 null，无会话态可取）"
             + " ⇒ 返回 null（消费点按「宁问不放」处理，⛔ 不回落进程 user.dir）");
         return null;
+    }
+
+    /**
+     * <b>轴 B</b>：越界白名单根（<b>仅</b>路径约束的白名单判定用）· 对齐 CC
+     * {@code allWorkingDirectories(context)} 首项 {@code getOriginalCwd()}
+     * （utils/permissions/filesystem.ts:666-673）。
+     *
+     * <p><b>⛔ 与 {@link #effectiveCwd}（轴 A，取 {@code getCwd()}）是两个轴</b>：
+     * 轴 A 只 resolve 相对路径（{@code Set-Location} 会改它；CC {@code getCwd()} 同）；
+     * 轴 B 只做越界白名单（CC {@code pathInAllowedWorkingPath} 只吃 context，从不看 cwd 形参）。
+     * 旧实现把轴 A 当轴 B 用 ⇒ {@code Set-Location} 到子目录后白名单范围被一起挪走。
+     *
+     * <p><b>取不到 ⇒ null</b>（{@link PowerShellPathValidator#check} 统一按「宁问不放」ask）：
+     * 无会话态、或 {@code getOriginalCwdLayer} 对数据链路异常 fail-loud 抛 —— ⛔ 两者都<b>不</b>回落
+     * 进程 {@code user.dir}，也<b>不</b>回落轴 A（回落轴 A 正是本批要消灭的混用）。
+     *
+     * @param ctx 工具调用上下文（可为 null ⇒ 无会话态）
+     * @return 会话 originalCwd 层路径；取不到 ⇒ null
+     */
+    static Path pathWhitelistRoot(ToolUseContext ctx) {
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("PowerShellPermissionChain: 越界白名单根（轴 B = CC getOriginalCwd）取不到：无会话态"
+                + " ctx={} ⇒ 不回落 user.dir / 解析基准（调用点按 ask 处理）",
+                ctx == null ? "null" : "sessionId=null");
+            return null;
+        }
+        try {
+            String original = com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayer(sessionId);
+            if (original == null || original.isBlank()) {
+                log.warn("PowerShellPermissionChain: 越界白名单根（轴 B）解析为空 sessionId={} ⇒ ask（宁问不放）",
+                    sessionId);
+                return null;
+            }
+            return Path.of(original);
+        } catch (IllegalStateException e) {
+            log.warn("PowerShellPermissionChain: 越界白名单根（轴 B）解析失败（会话 originalCwd 层数据链路异常）"
+                + " sessionId={} ⇒ ask（宁问不放）", sessionId, e);
+            return null;
+        }
     }
 
     /**

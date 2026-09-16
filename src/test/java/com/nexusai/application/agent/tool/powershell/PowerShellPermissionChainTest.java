@@ -226,7 +226,7 @@ class PowerShellPermissionChainTest {
             "read".equals(op) && p.replace('\\', '/').contains("agent-memory"));
         try {
             PowerShellPathValidator.PathCheck pc = PowerShellPathValidator.validatePath(
-                "C:/Users/u/.claude/agent-memory/team/MEMORY.md", Path.of("C:/work"), null, "read");
+                "C:/Users/u/.claude/agent-memory/team/MEMORY.md", Path.of("C:/work"), Path.of("C:/work"), null, "read");
             assertTrue(pc.allowed(),
                 "agent-memory 内部可读路径必须经 carve-out 放行（CC isPathAllowed step3.5 checkReadableInternalPath）");
         } finally {
@@ -240,7 +240,7 @@ class PowerShellPermissionChainTest {
         // 未注入 carve-out（bean 缺失/测试隔离）→ isPathAllowed 走原 fail-safe：工作目录外 + 无 allow 规则
         // → 拒绝。证明 carve-out 是显式接入，不是静默放行。
         PowerShellPathValidator.PathCheck pc = PowerShellPathValidator.validatePath(
-            "C:/Users/u/.claude/agent-memory/team/MEMORY.md", Path.of("C:/work"), null, "read");
+            "C:/Users/u/.claude/agent-memory/team/MEMORY.md", Path.of("C:/work"), Path.of("C:/work"), null, "read");
         assertFalse(pc.allowed(),
             "未注入 carve-out 时工作目录外内部路径必须仍拒绝（fail-safe，不得静默放行）");
     }

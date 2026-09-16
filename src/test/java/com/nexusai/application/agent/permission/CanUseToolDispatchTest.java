@@ -419,7 +419,9 @@ class CanUseToolDispatchTest {
 
         assertThat(result.decision()).isEqualTo(ToolPermissionGate.Decision.ALLOW);
         Mockito.verify(applier).applyAll(Mockito.anyList(), Mockito.any());
-        Mockito.verify(persister).persistAll(Mockito.anyList());
+        // [P11d] ⭐ 必须是**本 ctx 的会话 id**（不是 any()）：漏传/传 null ⇒ 项目级 source 会落
+        //   无会话腿 = 后端启动目录 ⇒「界面显示已保存、agent 运行期不认」（本批要防的静默失效）。
+        Mockito.verify(persister).persistAll(Mockito.anyList(), Mockito.eq(SESSION_ID));
     }
 
     @Test

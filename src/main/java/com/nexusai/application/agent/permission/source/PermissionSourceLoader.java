@@ -34,11 +34,21 @@ import com.nexusai.application.agent.permission.ToolPermissionContext;
  *   </li>
  * </ul>
  *
- * <h2>[s03 P2 #3 修补] load(UUID) 重载</h2>
- * <p>原接口 {@link #load()} 是全局的（不感知 session）；加 {@link #load(UUID)} default method，
- * 向后兼容所有现有 loader（自动转调 {@code load()}）。
- * [DEL-WF1-03] SessionSource（per-session loader 唯一实现）已删，当前无 loader 覆写
- * per-session 语义——load(UUID) 对全部 loader 等价于 load()。
+ * <h2>[s03 P2 #3 修补] load(String) 重载</h2>
+ * <p>原接口 {@link #load()} 是全局的（不感知 session）；加 {@link #load(String)} default method，
+ * 向后兼容所有只读 loader（自动转调 {@code load()}）。
+ *
+ * <p><b>[P11d 2026-09-16] 3 个 editable disk loader（User/Project/Local）现覆写
+ * {@link #load(String)}</b> —— 项目级（project/local）按会话解析项目根，不再共用后端启动目录：
+ * <ul>
+ *   <li>{@code LocalSettingsLoader} / {@code ProjectSettingsLoader}：会话非空 ⇒
+ *       {@code CwdResolution.getProjectRoot(sessionId)}（对齐 CC {@code getProjectRoot()}）；
+ *       会话为空/哨兵 ⇒ 命名无会话出口（进程 {@code user.dir}，见
+ *       {@code CwdResolution.getOriginalCwdLayerForNonSession()}）。</li>
+ *   <li>{@code UserSettingsLoader}：<b>用户级，不感知会话</b>（{@code ~/.{appName}/settings.json}
+ *       与 sessionId 无关）⇒ 覆写仅为形态一致，行为与 {@code load()} 逐字节相同。</li>
+ * </ul>
+ * 只读 loader（Policy/Flag/CliArg）不覆写，仍等价于 {@code load()}。
  *
  * <h2>设计哲学</h2>
  * <ul>
@@ -90,20 +100,20 @@ public interface PermissionSourceLoader {
     /**
      * <b>[s03 P2 #3 新增]</b> 加载指定 session 的规则。
      *
-     * <p>对齐 CC session-scoped source 语义：仅返回属于 {@code sessionId} 的规则。
-     * default 实现转调 {@link #load()} （全局 loader 不感知 session，返回全部规则）。
-     * （[DEL-WF1-03] SessionSource 已删，当前无 loader 需要 session 隔离。）
+     * <p>对齐 CC session-scoped source 语义：按 {@code sessionId} 解析该会话的项目根
+     * （项目级 source 的文件位置依赖它）。default 实现转调 {@link #load()}
+     * （只读 loader 不感知 session，返回全部规则）。
      *
-     * <p>PermissionContextBuilder 现在对所有 loader 调用本方法，
-     * 现有 disk-based loader 自动得到空 sessionId（即 default 转调 {@code load()}）。
+     * <p>PermissionContextBuilder 对所有 loader 调用本方法（见该类 {@code :355}）。
      *
      * <p>[session-id-short] sessionId 统一 short（sess-xxx）。
      *
-     * @param sessionId 会话 ID（short；可为 null —— 全局 load）
+     * @param sessionId 会话 ID（short；null/空白/{@link com.nexusai.common.SessionKeys#NO_SESSION}
+     *                  哨兵 ⇒ 「本环境确无会话」命名出口，见 3 个 editable loader 的覆写）
      * @return 该 session 的规则列表（可能为空）
      */
     default List<PermissionRule> load(String sessionId) {
-        return load();  // [s03 P2 #3] 向后兼容 — 现有 loader 不感知 session
+        return load();  // [s03 P2 #3] 向后兼容 — 只读 loader 不感知 session
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -116,10 +126,14 @@ public interface PermissionSourceLoader {
      * <p>仅 3 个 editable loader（User/Project/Local）override。read-only loader
      * （Policy/Flag/CliArg/Command/Session）不支持写盘，default 抛 {@link UnsupportedOperationException}。
      *
-     * @param field permissions 下的桶名（{@code allow/deny/ask/additionalDirectories}）
+     * <p><b>[P11d] 读与写共用同一个 {@code sessionId} 解析出的<b>同一个文件</b></b> ——
+     * 这是本批最关键的不变量（只改一侧会让「界面显示已保存、agent 运行期不认」静默失效）。
+     *
+     * @param field     permissions 下的桶名（{@code allow/deny/ask/additionalDirectories}）
+     * @param sessionId 会话 ID（short；解析项目级 source 的文件位置）
      * @return 原始字符串列表（可能为空）
      */
-    default List<String> readPermissionsStringArray(String field) {
+    default List<String> readPermissionsStringArray(String field, String sessionId) {
         throw new UnsupportedOperationException(
             source() + " 是只读 source，不支持读取权限桶用于写盘");
     }
@@ -127,10 +141,11 @@ public interface PermissionSourceLoader {
     /**
      * 单字段 merge 写 {@code permissions.<field>} 数组（整体替换）。
      *
-     * @param field  permissions 下的桶名
-     * @param values 新数组值（可为空 → 写 {@code []}）
+     * @param field     permissions 下的桶名
+     * @param values    新数组值（可为空 → 写 {@code []}）
+     * @param sessionId 会话 ID（short；解析项目级 source 的文件位置，须与读侧同一值）
      */
-    default void savePermissionsField(String field, List<String> values) {
+    default void savePermissionsField(String field, List<String> values, String sessionId) {
         throw new UnsupportedOperationException(
             source() + " 是只读 source，不支持写盘");
     }
@@ -138,10 +153,11 @@ public interface PermissionSourceLoader {
     /**
      * 单字段 merge 写 {@code permissions.<field>} 字符串值（如 {@code defaultMode}）。
      *
-     * @param field permissions 下的字段名
-     * @param value 新字符串值
+     * @param field     permissions 下的字段名
+     * @param value     新字符串值
+     * @param sessionId 会话 ID（short；解析项目级 source 的文件位置，须与读侧同一值）
      */
-    default void savePermissionsValue(String field, String value) {
+    default void savePermissionsValue(String field, String value, String sessionId) {
         throw new UnsupportedOperationException(
             source() + " 是只读 source，不支持写盘");
     }

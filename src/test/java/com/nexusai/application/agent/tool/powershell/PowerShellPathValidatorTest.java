@@ -12,11 +12,14 @@ import com.nexusai.application.agent.permission.PermissionRuleValue;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -45,8 +48,7 @@ class PowerShellPathValidatorTest {
         stmts.add(new PowerShellAstService.Statement("PipelineAst",
             cmds[0].text() + (cmds.length > 1 ? " ; " + cmds[1].text() : ""),
             List.of(cmds), List.of()));
-        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false,
-            false, false, false, false, List.of(), List.of(), stmts, List.of(), "stub");
+        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false, false, false, false, false, List.of(), List.of(), stmts, List.of(), "stub");
     }
 
     private static ObjectNode input(String command) {
@@ -77,7 +79,7 @@ class PowerShellPathValidatorTest {
         JsonNode in = input("Remove-Item / -Recurse -Force");
         PermissionResult r = PowerShellPathValidator.check(in,
             single(cmd("Remove-Item", "cmdlet", "/", "-Recurse", "-Force")),
-            permCtx(), Path.of("C:/work/project"), false);
+            permCtx(), Path.of("C:/work/project"), Path.of("C:/work/project"), false);
         assertInstanceOf(PermissionResult.Deny.class, r,
             "Remove-Item / 在 parse-success 下必须硬 deny（isDangerousRemovalRawPath('/')）");
     }
@@ -88,7 +90,7 @@ class PowerShellPathValidatorTest {
         JsonNode in = input("Remove-Item ~");
         PermissionResult r = PowerShellPathValidator.check(in,
             single(cmd("Remove-Item", "cmdlet", "~")),
-            permCtx(), Path.of("C:/work/project"), false);
+            permCtx(), Path.of("C:/work/project"), Path.of("C:/work/project"), false);
         assertInstanceOf(PermissionResult.Deny.class, r,
             "Remove-Item ~ 展开家目录后必须硬 deny");
     }
@@ -99,7 +101,7 @@ class PowerShellPathValidatorTest {
         JsonNode in = input("Set-Content /etc/hosts x");
         PermissionResult r = PowerShellPathValidator.check(in,
             single(cmd("Set-Content", "cmdlet", "/etc/hosts", "x")),
-            permCtx(editDeny("//etc/**")), Path.of("C:/work/project"), false);
+            permCtx(editDeny("//etc/**")), Path.of("C:/work/project"), Path.of("C:/work/project"), false);
         assertInstanceOf(PermissionResult.Deny.class, r,
             "Edit(//etc/**) deny 规则（// 前缀 = 文件系统根 root-relative，对齐 BashPathValidatorTest.editDenyRuleDenies）"
                 + "命中 Set-Content /etc/hosts → 必须 deny");
@@ -111,7 +113,7 @@ class PowerShellPathValidatorTest {
         JsonNode in = input("Set-Location ./x ; Get-Content ./secret");
         PermissionResult r = PowerShellPathValidator.check(in,
             single(cmd("Set-Location", "cmdlet", "./x"), cmd("Get-Content", "cmdlet", "./secret")),
-            permCtx(), Path.of("C:/work/project"), true);
+            permCtx(), Path.of("C:/work/project"), Path.of("C:/work/project"), true);
         assertInstanceOf(PermissionResult.Ask.class, r,
             "cd 复合命令内路径操作因 cwd 漂移必须 ask（CC BashTool parity）");
     }
@@ -122,7 +124,7 @@ class PowerShellPathValidatorTest {
         JsonNode in = input("Set-Content");
         PermissionResult r = PowerShellPathValidator.check(in,
             single(cmd("Set-Content", "cmdlet")),
-            permCtx(), Path.of("C:/work/project"), false);
+            permCtx(), Path.of("C:/work/project"), Path.of("C:/work/project"), false);
         assertInstanceOf(PermissionResult.Ask.class, r,
             "Set-Content 写操作但无法确定目标路径 → 必须 ask");
     }
@@ -133,9 +135,77 @@ class PowerShellPathValidatorTest {
         JsonNode in = input("Get-Content ./file.txt");
         PermissionResult r = PowerShellPathValidator.check(in,
             single(cmd("Get-Content", "cmdlet", "./file.txt")),
-            permCtx(), Path.of("C:/work/project"), false);
+            permCtx(), Path.of("C:/work/project"), Path.of("C:/work/project"), false);
         assertTrue(r instanceof PermissionResult.Passthrough
                 || r instanceof PermissionResult.Allow,
             "工作目录内只读路径 → 不应 deny（passthrough 由调用方 reduce 决定）");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P7] 越界基准双轴：轴 A（相对路径解析基准）与轴 B（越界白名单根）必须独立 —— 对齐 CC：
+    //   轴 A = checkPathConstraints 的 cwd 形参（getCwd()，utils/cwd.ts:26-32）
+    //   轴 B = allWorkingDirectories(context) 首项 getOriginalCwd()
+    //          （utils/permissions/filesystem.ts:666-673；pathInAllowedWorkingPath :683-707 只吃 context）
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[P7] 轴A=子目录 / 轴B=项目根：../data.txt → 放行（白名单根不看解析基准）")
+    void dualAxis_whitelistRootWiderThanResolutionBase(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：旧实现把「解析基准」同一值复用为白名单根 ⇒ Set-Location 进子目录后白名单
+        //   范围随之下移（CC 语义下 cd 不改白名单范围）⇒ 项目内的 ../x 被误 ask。
+        //   解析基准 = proj/sub、白名单根 = proj 时，../data.txt 解析为 proj/data.txt，落在 proj 子树内
+        //   ⇒ 必须放行。单轴实现（白名单根 := proj/sub）下该路径判在 sub 之外 ⇒ 变红。
+        Path proj = tmp.resolve("proj");
+        Path sub = proj.resolve("sub");
+        Files.createDirectories(sub);
+        Files.writeString(proj.resolve("data.txt"), "x");
+        PowerShellPathValidator.PathCheck pc = PowerShellPathValidator.validatePath(
+            "../data.txt", sub, proj, /*permCtx*/ null, "read");
+        assertTrue(pc.allowed(),
+            "白名单根 = proj 时 proj/data.txt 必须放行（解析基准 proj/sub 只用于 resolve，"
+                + "不得当白名单根用）实测 resolved=" + pc.resolvedPath());
+    }
+
+    @Test
+    @DisplayName("[P7] 轴A=项目根 / 轴B=子目录：<proj>/other.txt → 拒绝（轴B独立于轴A）")
+    void dualAxis_whitelistRootNarrowerThanResolutionBase(@TempDir Path tmp) throws Exception {
+        // WHY（规则九）：反方向 —— 固定解析基准、只改白名单根，判定结果必须随之改变，证明轴 B 是
+        //   独立入参。绝对路径 proj/other.txt 在解析基准 proj 之内、在白名单根 sub 之外 ⇒ 必须拒绝。
+        //   单轴实现（白名单根 := proj）下该路径在 proj 内 ⇒ 误放行（安全方向错）⇒ 变红。
+        Path proj = tmp.resolve("proj");
+        Path sub = proj.resolve("sub");
+        Files.createDirectories(sub);
+        Path other = proj.resolve("other.txt");
+        Files.writeString(other, "x");
+        PowerShellPathValidator.PathCheck pc = PowerShellPathValidator.validatePath(
+            other.toString(), proj, sub, /*permCtx*/ null, "read");
+        assertFalse(pc.allowed(),
+            "白名单根 = sub 时 sub 之外的 proj/other.txt 必须拒绝（轴 B 独立于轴 A）"
+                + "实测 resolved=" + pc.resolvedPath());
+    }
+
+    @Test
+    @DisplayName("[P7] 两轴同值时行为不变：proj 内 ./data.txt → 放行")
+    void dualAxis_sameValueBehavesAsBefore(@TempDir Path tmp) throws Exception {
+        Path proj = tmp.resolve("proj");
+        Files.createDirectories(proj);
+        Files.writeString(proj.resolve("data.txt"), "x");
+        PowerShellPathValidator.PathCheck pc = PowerShellPathValidator.validatePath(
+            "./data.txt", proj, proj, /*permCtx*/ null, "read");
+        assertTrue(pc.allowed(), "两轴同值时白名单内路径必须放行（拆分不得改变常态行为）");
+    }
+
+    @Test
+    @DisplayName("[P7] 轴B 缺失 → Ask（宁问不放，白名单根不得回落解析基准）")
+    void dualAxis_whitelistRootMissingAsks() {
+        // WHY（规则九）：越界白名单根缺失时该路径必须落 ask（isInWorkingDir(whitelistRoot=null)
+        //   恒 false = fail-closed）—— 回落解析基准等于把「轴 A」重新当「轴 B」用，正是本批要消灭
+        //   的混用；无条件 ask 则会把与白名单无关的无路径命令一起变成 ask（误 ask），故不做。
+        JsonNode in = input("Get-Content ./file.txt");
+        PermissionResult r = PowerShellPathValidator.check(in,
+            single(cmd("Get-Content", "cmdlet", "./file.txt")),
+            permCtx(), Path.of("C:/work/project"), /*whitelistRoot*/ null, false);
+        assertInstanceOf(PermissionResult.Ask.class, r,
+            "越界白名单根（轴 B）缺失 ⇒ 必须 ask（不得回落解析基准，也不得静默放行）");
     }
 }

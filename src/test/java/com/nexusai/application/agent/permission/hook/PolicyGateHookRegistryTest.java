@@ -364,7 +364,7 @@ class PolicyGateHookRegistryTest {
             "", 0);
         CommandHookExecutorTest.FakeLauncher launcher = new CommandHookExecutorTest.FakeLauncher(proc);
         CommandHookExecutor executor = new CommandHookExecutor(launcher,
-            k -> null, p -> true, () -> "C:/project", id -> "C:/plugins/" + id);
+            k -> null, p -> true, sid -> "C:/project", id -> "C:/plugins/" + id);
         registry.setCommandHookExecutor(executor);
 
         List<String> watchPaths =
@@ -393,7 +393,7 @@ class PolicyGateHookRegistryTest {
             "", 0);
         CommandHookExecutor executor = new CommandHookExecutor(
             new CommandHookExecutorTest.FakeLauncher(proc),
-            k -> null, p -> true, () -> "C:/project", id -> "C:/plugins/" + id);
+            k -> null, p -> true, sid -> "C:/project", id -> "C:/plugins/" + id);
         registry.setCommandHookExecutor(executor);
 
         List<String> watchPaths =

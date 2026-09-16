@@ -154,19 +154,23 @@ public class WorkflowPortsImpl implements WorkflowPorts {
     /** 默认 runsDir · 对齐 CC {@code getRunsDir() = join(getProjectRoot(), '.claude', 'workflow-runs')}
      * (persistence.ts:32-34)。决策 D6/D7：目录迁至 nexusai 自有
      * {@code <projectRoot>/<WORKFLOW_RUNS_DIR>}（appName=nexusai → {@code .nexusai/workflow-runs}）。
-     * projectRoot = 会话绑定启动目录（boundProject/originalCwd 层，非可变 getCwd——防 worktree/
-     * 子目录 desync，ports.ts:55-59 注释）。
+     *
+     *  <p><b>[P10a] 槽统一 = {@link CwdResolution#getProjectRoot(String)}</b>（= CC
+     *  {@code getProjectRoot()}，<b>不</b>随 mid-session worktree/bash cd 重锚）。原实现读
+     *  {@code getOriginalCwdLayer} —— 那是 CC 的 {@code getOriginalCwd()}（{@code EnterWorktreeTool}
+     *  会重锚 ⇒ 进 worktree 后 journal 根被挪走），而 {@code WorkflowTool}/{@code WorkflowServiceImpl}
+     *  读的是 {@code getCwd}（bash {@code cd} 可覆盖）⇒ 两者<b>不同根</b>，正是
+     *  {@code ports.ts:54-60} 明令避免的 desync。
      *
      *  <p>包可见：WorkflowServiceImpl 生产 runsDirResolver 复用（W-3c 持久化同根）。
      *
      *  <p><b>[批 3c] 会话显式化</b>：会话 ID 由调用方作为<b>形参</b>传入（原经裸 MDC 会话槽读取，已删除）。
-     *  {@code sessionId} 为 null/空白 → {@link CwdResolution#getOriginalCwdLayer(String)}
-     *  逐层回落至 {@code user.dir}（进程默认，= 原「无 MDC」时的兜底值，语义不变）。
+     *  {@code sessionId} 为 null/空白 → {@link CwdResolution#getProjectRoot(String)} 的无会话命名出口。
      *
-     *  @param sessionId 会话 ID（消费链手上有会话就传；确实没有 → null = 进程默认）
+     *  @param sessionId 会话 ID（消费链手上有会话就传；确实没有 → null = 无会话出口）
      *  @return 该会话的 runsDir（恒非 null） */
     static String defaultRunsDir(String sessionId) {
-        String projectRoot = CwdResolution.getOriginalCwdLayer(sessionId);
+        String projectRoot = CwdResolution.getProjectRoot(sessionId);
         if (log.isDebugEnabled()) {
             log.debug("WorkflowPorts.defaultRunsDir: sessionId={} projectRoot={} runsDir={}/{}",
                     sessionId, projectRoot, projectRoot, WorkflowConstants.WORKFLOW_RUNS_DIR);
@@ -307,10 +311,13 @@ public class WorkflowPortsImpl implements WorkflowPorts {
         WorkflowHostBundle bundle = WorkflowHostBundle.build(
                 toolUseContext, args.canUseTool(), args.parentMessage());
         HostHandle handle = HostHandle.create(bundle);
-        // cwd 用 projectRoot 而非 getCwd()：与 journalStore 的 runsDir 同根（ports.ts:55-59）
+        // [P10a] cwd 用 projectRoot 而非 getCwd()：与 journalStore 的 runsDir 同根（ports.ts:54-60）
+        //   原实现虽写着本注释、实际调的是 getOriginalCwdLayer（= CC getOriginalCwd，worktree 入口
+        //   会重锚）⇒ 注释与代码不一致，且与 defaultRunsDir 之外的另两处（WorkflowTool /
+        //   WorkflowServiceImpl 读 getCwd）依旧两套判据。现三处 + runsDir 统一走 getProjectRoot。
         // [批 3c] 会话来源显式化：hostFactory 的 context 即本会话 ToolUseContext → sessionId 从它直取
         //   （优先级 (2) 显式载体）；⛔ 不再读 MDC。
-        String cwd = CwdResolution.getOriginalCwdLayer(toolUseContext.sessionId());
+        String cwd = CwdResolution.getProjectRoot(toolUseContext.sessionId());
         String toolUseId = toolUseContext.toolUseId();
         if (log.isDebugEnabled()) {
             log.debug("WorkflowPorts.hostFactory: cwd={} toolUseId={} agentId={}",

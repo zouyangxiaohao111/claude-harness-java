@@ -385,14 +385,28 @@ public final class BashPathValidator {
      * <p>流程（CC 顺序）：进程替换 → 输出重定向提取 → 危险重定向 → 子命令切分 →
      * compoundCommandHasCd 判定 → 输出重定向校验 → 逐子命令路径校验（deny 优先于 ask）。
      *
-     * @param command bash 命令（input.command）
-     * @param cwd     校验基准 cwd（ctx.effectiveCwd）
-     * @param permCtx 权限上下文（可为 null → 仅危险删除 / cd 复合 ask 生效）
+     * @param command        bash 命令（input.command）
+     * @param resolutionBase <b>轴 A</b>：相对路径解析基准（对齐 CC {@code checkPathConstraints} 的
+     *                       {@code cwd} 形参 = {@code getCwd()}，utils/cwd.ts:26-32）
+     * @param whitelistRoot  <b>轴 B</b>：越界白名单根（对齐 CC {@code allWorkingDirectories} 的首项
+     *                       {@code getOriginalCwd()}，utils/permissions/filesystem.ts:666-673）
+     * @param permCtx        权限上下文（可为 null → 仅危险删除 / cd 复合 ask 生效）
      * @return deny | ask | passthrough
      */
-    public static PermissionResult check(String command, Path cwd, ToolPermissionContext permCtx) {
+    public static PermissionResult check(String command, Path resolutionBase, Path whitelistRoot,
+            ToolPermissionContext permCtx) {
         if (command == null || command.isBlank()) {
             return passthrough("空命令，无路径可校验");
+        }
+        // 轴 B 缺失 ⇒ 留痕 + fail-closed 传播（⛔ 不静默回落解析基准 —— 那正是本仓原混用形态）。
+        //   白名单根是「是否越界」的唯一基准，取不到就不能声称任何路径「在范围内」（isInWorkingDir
+        //   恒 false ⇒ 真路径一律落 ask）。
+        //   ⛔ 这里<b>不</b>无条件 ask：那会把「本来就不含路径参数」的子命令（如 `date`）一起变成
+        //   ask = 大面积误 ask（判据同 PowerShellPermissionChain.gitGuardsDependOnCwd）。
+        if (whitelistRoot == null) {
+            log.warn("BashPathValidator: 越界白名单根（轴 B = CC getOriginalCwd）缺失 ⇒ 路径一律按"
+                + "「不在允许范围」处理（fail-closed；⛔ 不回落解析基准、⛔ 不回落 user.dir）command={}",
+                command);
         }
         // 1. 进程替换（可执行任意写文件命令，无法作为 redirect target 检出）→ ask（CC :1028-1038）
         if (PROCESS_SUBSTITUTION.matcher(command).find()) {
@@ -429,14 +443,15 @@ public final class BashPathValidator {
             .anyMatch(sub -> isCdArgv(sub.argv()));
         // 4. 输出重定向校验（cd+redirect → ask；target /dev/null 跳过；create 类型校验）
         PermissionResult redirectResult = validateOutputRedirections(
-            redirs.redirections(), cwd, permCtx, compoundCommandHasCd);
+            redirs.redirections(), resolutionBase, whitelistRoot, permCtx, compoundCommandHasCd);
         if (!(redirectResult instanceof PermissionResult.Passthrough)) {
             return redirectResult;
         }
         // 5. 逐子命令 argv 路径校验（deny 优先于 ask）
         PermissionResult firstAsk = null;
         for (Subcommand sub : subcommands) {
-            PermissionResult r = validateSinglePathCommandArgv(sub, cwd, permCtx, compoundCommandHasCd);
+            PermissionResult r = validateSinglePathCommandArgv(sub, resolutionBase, whitelistRoot,
+                permCtx, compoundCommandHasCd);
             if (r instanceof PermissionResult.Deny) {
                 return r;
             }
@@ -571,13 +586,14 @@ public final class BashPathValidator {
      * baseCmd=argv[0] 判定 SUPPORTED_PATH_COMMANDS（CC :901-907）。
      *
      * @param sub                子命令（argv + raw text）
-     * @param cwd                校验基准 cwd
+     * @param resolutionBase     轴 A：相对路径解析基准
+     * @param whitelistRoot      轴 B：越界白名单根
      * @param permCtx            权限上下文
      * @param compoundCommandHasCd 复合命令是否含 cd
      * @return deny | ask | passthrough
      */
-    private static PermissionResult validateSinglePathCommandArgv(Subcommand sub, Path cwd,
-            ToolPermissionContext permCtx, boolean compoundCommandHasCd) {
+    private static PermissionResult validateSinglePathCommandArgv(Subcommand sub, Path resolutionBase,
+            Path whitelistRoot, ToolPermissionContext permCtx, boolean compoundCommandHasCd) {
         List<String> stripped = stripWrappersFromArgv(sub.argv());
         if (stripped.isEmpty()) {
             return passthrough("空命令 - 无路径可校验");
@@ -594,7 +610,7 @@ public final class BashPathValidator {
                 BashRuleMatcher.stripSafeWrappers(sub.text()), false)
             ? OP_READ : null;
         return createPathChecker(baseCmd, operationTypeOverride)
-            .apply(args, cwd, permCtx, compoundCommandHasCd);
+            .apply(args, resolutionBase, whitelistRoot, permCtx, compoundCommandHasCd);
     }
 
     /**
@@ -723,15 +739,16 @@ public final class BashPathValidator {
 
     /** 路径检查器 · 对齐 CC createPathChecker（pathValidation.ts:703-784）。 */
     private static PathChecker createPathChecker(String command, String operationTypeOverride) {
-        return (args, cwd, permCtx, compoundCommandHasCd) -> {
+        return (args, resolutionBase, whitelistRoot, permCtx, compoundCommandHasCd) -> {
             PermissionResult result = validateCommandPaths(
-                command, args, cwd, permCtx, compoundCommandHasCd, operationTypeOverride);
+                command, args, resolutionBase, whitelistRoot, permCtx, compoundCommandHasCd,
+                operationTypeOverride);
             if (result instanceof PermissionResult.Deny) {
                 return result;
             }
             // 危险删除在显式 deny 之后、其他结果之前（CC :732-737）
             if ("rm".equals(command) || "rmdir".equals(command)) {
-                PermissionResult dangerous = checkDangerousRemovalPaths(command, args, cwd);
+                PermissionResult dangerous = checkDangerousRemovalPaths(command, args, resolutionBase);
                 if (!(dangerous instanceof PermissionResult.Passthrough)) {
                     return dangerous;
                 }
@@ -742,14 +759,14 @@ public final class BashPathValidator {
 
     @FunctionalInterface
     private interface PathChecker {
-        PermissionResult apply(List<String> args, Path cwd, ToolPermissionContext permCtx,
-                               boolean compoundCommandHasCd);
+        PermissionResult apply(List<String> args, Path resolutionBase, Path whitelistRoot,
+                               ToolPermissionContext permCtx, boolean compoundCommandHasCd);
     }
 
     /** 命令路径校验 · 对齐 CC validateCommandPaths（pathValidation.ts:603-701）。 */
     private static PermissionResult validateCommandPaths(String command, List<String> args,
-            Path cwd, ToolPermissionContext permCtx, boolean compoundCommandHasCd,
-            String operationTypeOverride) {
+            Path resolutionBase, Path whitelistRoot, ToolPermissionContext permCtx,
+            boolean compoundCommandHasCd, String operationTypeOverride) {
         Function<List<String>, List<String>> extractor = PATH_EXTRACTORS.get(command);
         if (extractor == null) {
             return passthrough("命令 '" + command + "' 无路径提取器");
@@ -778,7 +795,7 @@ public final class BashPathValidator {
         }
 
         for (String path : paths) {
-            PathCheck v = validatePath(path, cwd, permCtx, operationType);
+            PathCheck v = validatePath(path, resolutionBase, whitelistRoot, permCtx, operationType);
             if (!v.allowed()) {
                 if (v.rule() != null) {
                     return deny("路径 '" + v.resolvedPath() + "' 被 Edit deny 规则阻断",
@@ -801,15 +818,17 @@ public final class BashPathValidator {
         return false;
     }
 
-    /** 危险删除硬 ask · 对齐 CC checkDangerousRemovalPaths（pathValidation.ts:70-108）。 */
-    private static PermissionResult checkDangerousRemovalPaths(String command, List<String> args, Path cwd) {
+    /** 危险删除硬 ask · 对齐 CC checkDangerousRemovalPaths（pathValidation.ts:70-108）。
+     *  只吃轴 A（把 argv 里的相对路径解析成绝对路径后与危险路径表比对），不查白名单。 */
+    private static PermissionResult checkDangerousRemovalPaths(String command, List<String> args,
+            Path resolutionBase) {
         Function<List<String>, List<String>> extractor = PATH_EXTRACTORS.get(command);
         List<String> paths = extractor.apply(args);
         for (String path : paths) {
             String cleanPath = expandTilde(path.replaceAll("^['\"]|['\"]$", ""));
             String absolutePath = isAbsoluteLike(cleanPath)
                 ? normalizeSlashes(cleanPath)
-                : resolveAgainstCwd(cleanPath, cwd);
+                : resolveAgainstCwd(cleanPath, resolutionBase);
             if (PowerShellPermissionChain.isDangerousRemovalPath(absolutePath)) {
                 if (log.isDebugEnabled()) {
                     log.debug("BashPathValidator: 危险删除命中 command={} path={}", command, absolutePath);
@@ -824,7 +843,8 @@ public final class BashPathValidator {
 
     /** 输出重定向校验 · 对齐 CC validateOutputRedirections（pathValidation.ts:924-1003）。 */
     private static PermissionResult validateOutputRedirections(List<BashParser.RedirectTarget> redirections,
-            Path cwd, ToolPermissionContext permCtx, boolean compoundCommandHasCd) {
+            Path resolutionBase, Path whitelistRoot, ToolPermissionContext permCtx,
+            boolean compoundCommandHasCd) {
         if (compoundCommandHasCd && !redirections.isEmpty()) {
             if (log.isDebugEnabled()) {
                 log.debug("BashPathValidator: cd+redirect 复合命令, ask redirections={}", redirections.size());
@@ -838,7 +858,7 @@ public final class BashPathValidator {
             if ("/dev/null".equals(target)) {
                 continue; // /dev/null 恒安全（丢弃输出）
             }
-            PathCheck v = validatePath(target, cwd, permCtx, OP_CREATE);
+            PathCheck v = validatePath(target, resolutionBase, whitelistRoot, permCtx, OP_CREATE);
             if (!v.allowed()) {
                 if (v.rule() != null) {
                     return deny("Output redirection to '" + v.resolvedPath() + "' was blocked by a deny rule.",
@@ -858,7 +878,8 @@ public final class BashPathValidator {
     /** 路径校验结果 · 对齐 CC ResolvedPathCheckResult。 */
     private record PathCheck(boolean allowed, String resolvedPath, String message, PermissionRule rule) {}
 
-    private static PathCheck validatePath(String path, Path cwd, ToolPermissionContext permCtx, String operationType) {
+    private static PathCheck validatePath(String path, Path resolutionBase, Path whitelistRoot,
+            ToolPermissionContext permCtx, String operationType) {
         String cleanPath = expandTilde(path.replaceAll("^['\"]|['\"]$", ""));
         String normalizedPath = normalizeSlashes(cleanPath);
 
@@ -881,22 +902,23 @@ public final class BashPathValidator {
                 return new PathCheck(false, normalizedPath,
                     "写操作不允许 glob 通配符，请指定精确路径", null);
             }
-            return validateGlobPattern(normalizedPath, cwd, permCtx, operationType);
+            return validateGlobPattern(normalizedPath, resolutionBase, whitelistRoot, permCtx, operationType);
         }
         // 常规解析 + isPathAllowed（CC :465-485）
-        String abs = resolveAgainstCwd(normalizedPath, cwd);
-        return isPathAllowed(normalizeSlashes(abs), cwd, permCtx, operationType);
+        String abs = resolveAgainstCwd(normalizedPath, resolutionBase);
+        return isPathAllowed(normalizeSlashes(abs), resolutionBase, whitelistRoot, permCtx, operationType);
     }
 
     /** glob 模式校验（基目录解析）。对齐 CC validateGlobPattern（utils/pathValidation.ts:269-316）。 */
-    private static PathCheck validateGlobPattern(String cleanPath, Path cwd, ToolPermissionContext permCtx, String operationType) {
+    private static PathCheck validateGlobPattern(String cleanPath, Path resolutionBase,
+            Path whitelistRoot, ToolPermissionContext permCtx, String operationType) {
         if (containsPathTraversal(cleanPath)) {
-            String abs = resolveAgainstCwd(cleanPath, cwd);
-            return isPathAllowed(normalizeSlashes(abs), cwd, permCtx, operationType);
+            String abs = resolveAgainstCwd(cleanPath, resolutionBase);
+            return isPathAllowed(normalizeSlashes(abs), resolutionBase, whitelistRoot, permCtx, operationType);
         }
         String basePath = getGlobBaseDirectory(cleanPath);
-        String absBase = resolveAgainstCwd(basePath, cwd);
-        return isPathAllowed(normalizeSlashes(absBase), cwd, permCtx, operationType);
+        String absBase = resolveAgainstCwd(basePath, resolutionBase);
+        return isPathAllowed(normalizeSlashes(absBase), resolutionBase, whitelistRoot, permCtx, operationType);
     }
 
     private static boolean containsPathTraversal(String s) {
@@ -920,11 +942,12 @@ public final class BashPathValidator {
     /** 解析后路径判定 · 对齐 CC isPathAllowed（utils/pathValidation.ts:141-263）。
      *  OPD-WF5-02-05：步骤 2/2.5/3.5/3.7 委派核心 {@link PathValidation}（内部路径白名单 /
      *  auto-edit 安全检查含可疑 Windows 模式 / 沙箱写白名单），Bash 保留扩展层结构。 */
-    private static PathCheck isPathAllowed(String resolvedPath, Path cwd, ToolPermissionContext permCtx, String operationType) {
-        PathValidationEnv env = PathValidationEnv.forProcess(cwd);
+    private static PathCheck isPathAllowed(String resolvedPath, Path resolutionBase, Path whitelistRoot,
+            ToolPermissionContext permCtx, String operationType) {
+        PathValidationEnv env = PathValidationEnv.forProcess(resolutionBase);
         boolean read = OP_READ.equals(operationType);
-        // 1. Edit deny 规则（CC :151-162；OPD-WF5-FS-052 root-relative，传 cwd 锚定根）
-        PermissionRule deny = editDenyRule(resolvedPath, permCtx, cwd);
+        // 1. Edit deny 规则（CC :151-162；OPD-WF5-FS-052 root-relative，传轴 A 锚定根）
+        PermissionRule deny = editDenyRule(resolvedPath, permCtx, resolutionBase);
         if (deny != null) {
             return new PathCheck(false, resolvedPath, null, deny);
         }
@@ -942,8 +965,8 @@ public final class BashPathValidator {
                 return new PathCheck(false, resolvedPath, safety.message(), null);
             }
         }
-        // 3. 工作目录内（CC :201-211）
-        boolean inWorkingDir = isInWorkingDir(resolvedPath, cwd, permCtx);
+        // 3. 工作目录内（CC :201-211）· 白名单根 = 轴 B（whitelistRoot），⛔ 不是解析基准
+        boolean inWorkingDir = isInWorkingDir(resolvedPath, whitelistRoot, permCtx);
         if (inWorkingDir) {
             if (read || (permCtx != null && permCtx.mode() == PermissionMode.ACCEPT_EDITS)) {
                 return new PathCheck(true, resolvedPath, null, null);
@@ -957,8 +980,8 @@ public final class BashPathValidator {
             }
         }
         // 3.7 sandbox write allowlist → 无配置（null）→ 不命中（沙箱执行域待专项探查 OPD-WF4-DEC-03）
-        // 4. allow 规则（CC :248-259；OPD-WF5-FS-052 root-relative，传 cwd 锚定根）
-        PermissionRule allow = editAllowRule(resolvedPath, permCtx, cwd);
+        // 4. allow 规则（CC :248-259；OPD-WF5-FS-052 root-relative，传轴 A 锚定根）
+        PermissionRule allow = editAllowRule(resolvedPath, permCtx, resolutionBase);
         if (allow != null) {
             return new PathCheck(true, resolvedPath, null, allow);
         }
@@ -972,11 +995,18 @@ public final class BashPathValidator {
      * （utils/permissions/filesystem.ts:683-707）+ {@code getPathsForPermissionCheck}
      * （utils/fsOperations.ts:288-382）双侧 realpath 语义。
      *
-     * <p>G3-1（symlink 逃逸）：双侧（输入 resolved 路径 vs cwd/additionalWorkingDirectories）
+     * <p><b>[P7] 白名单根 = 轴 B（{@code whitelistRoot} 形参），⛔ 不再复用相对路径解析基准。</b>
+     * CC 的 {@code allWorkingDirectories(context)}（filesystem.ts:666-673）=
+     * {@code new Set([getOriginalCwd(), ...context.additionalWorkingDirectories.keys()])} ——
+     * 白名单<b>从不</b>看 {@code checkPathConstraints/getCwd()} 那个 {@code cwd} 形参；
+     * 旧实现的 {@code isInWorkingDir(..., cwd, ...)} 让「bash cd 进子目录」把白名单根一起变窄
+     * （CC 语义下 cd 不改白名单范围），且反向（解析基准宽于项目根）会过度放行。
+     *
+     * <p>G3-1（symlink 逃逸）：双侧（输入 resolved 路径 vs whitelistRoot/additionalWorkingDirectories）
      * 均先 {@link Path#toRealPath}（存在时，解析全部 symlink 与 {@code ..}）后比对——
      * （{@code toRealPath(LinkOption...)} 为变参：调用不传 option，形参表写法不构成合法 javadoc 引用）
      * 项目内软链指向项目外文件不会被误判"在目录内"（{@code ./evil-link -> /etc/passwd}：
-     * realpath 后 = /etc/passwd 不在 cwd 内 → 拒绝，读/写均拒）。目标不存在（ENOENT，写新文件）
+     * realpath 后 = /etc/passwd 不在白名单根内 → 拒绝，读/写均拒）。目标不存在（ENOENT，写新文件）
      * → 找最深已存在祖先 realpath 再 rejoin 非存在尾段（对齐 CC {@code resolveDeepestExistingAncestorSync}
      * fsOperations.ts:215-270，防 {@code /cwd/symlinkdir/newfile → symlinkdir->/etc} 写逃逸）；
      * 全路径均不存在或解析失败 → 回退 lexical {@code toAbsolutePath().normalize()}
@@ -992,15 +1022,18 @@ public final class BashPathValidator {
      * 绕过/误拒）。只改"判定在目录内"的比较方向，realpath 双侧展开（G3-1）与
      * deny/越界拒绝逻辑不动——原 escape（项目内→外）仍拒绝。
      *
-     * @param resolvedPath 已解析的绝对路径（validatePath 产）
-     * @param cwd          校验基准 cwd（effectiveCwd）
-     * @param permCtx      权限上下文（additionalWorkingDirectories 扩展白名单）
+     * @param resolvedPath  已解析的绝对路径（validatePath 产）
+     * @param whitelistRoot <b>轴 B</b>：越界白名单根（会话 originalCwd 层，
+     *                      = {@code CwdResolution.getOriginalCwdLayer(sessionId)}）；
+     *                      ⛔ <b>不是</b>相对路径解析基准（轴 A = 调用方 cwd 形参）
+     * @param permCtx       权限上下文（additionalWorkingDirectories 扩展白名单）
      * @return 解析后物理路径是否在某工作目录内
      */
-    private static boolean isInWorkingDir(String resolvedPath, Path cwd, ToolPermissionContext permCtx) {
+    private static boolean isInWorkingDir(String resolvedPath, Path whitelistRoot,
+            ToolPermissionContext permCtx) {
         try {
             Path resolved = resolvePhysical(Paths.get(resolvedPath));
-            if (cwd != null && pathInWorkingPathNormalized(resolved, resolvePhysical(cwd))) {
+            if (whitelistRoot != null && pathInWorkingPathNormalized(resolved, resolvePhysical(whitelistRoot))) {
                 return true;
             }
             if (permCtx != null && permCtx.additionalWorkingDirectories() != null) {

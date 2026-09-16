@@ -14,7 +14,7 @@ import org.springframework.beans.factory.annotation.Autowired;
  * boundary / proactive / coordinator / skill_search_intent / scratchpad / frc /
  * agent_main_thread / verify_plan_reminder + language / output_style 两段注入）此前只有
  * env（FeatureFlags）+ 硬编码默认 + 既有判定类 三条来源，DB 无可配列。本类承载 settings
- * 12 列的<b>实时读取</b>——每次 {@link SettingsMapper#selectOneById(int)} 单行（id=1，
+ * 12 列的<b>实时读取</b>——每次 {@link SettingsMapper#selectOneById(java.io.Serializable)} 单行（id=1，
  * settings 单行多列），不缓存（前端 PUT /api/v1/settings 后下一轮即生效，对齐 V42
  * agent_swarms_enabled "前端开关→PUT→DB→实时读源" 权威先例）。
  *

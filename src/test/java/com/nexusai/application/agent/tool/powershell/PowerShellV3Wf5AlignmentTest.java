@@ -13,6 +13,7 @@ import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.permission.DangerousPatternDetector;
 import com.nexusai.application.agent.permission.PermissionUpdate;
 import com.nexusai.application.agent.permission.PermissionUpdateApplier;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.PowerShellTool;
 import org.junit.jupiter.api.DisplayName;
@@ -68,8 +69,7 @@ class PowerShellV3Wf5AlignmentTest {
         }
 
         static PowerShellAstService.ParsedResult invalid() {
-            return new PowerShellAstService.ParsedResult(false, List.of("stub"), false, false, false, false, false,
-                false, false, false, false, List.of(), List.of(), List.of(), List.of(), "stub");
+            return new PowerShellAstService.ParsedResult(false, List.of("stub"), false, false, false, false, false, false, false, false, false, List.of(), List.of(), List.of(), List.of(), "stub");
         }
     }
 
@@ -89,8 +89,7 @@ class PowerShellV3Wf5AlignmentTest {
         stmts.add(new PowerShellAstService.Statement("PipelineAst",
             cmds[0].text() + (cmds.length > 1 ? " ; " + cmds[1].text() : ""),
             List.of(cmds), List.of()));
-        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false,
-            false, false, false, false, List.of(), List.of(), stmts, List.of(), "stub");
+        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false, false, false, false, false, List.of(), List.of(), stmts, List.of(), "stub");
     }
 
     /** 带语句级 redirections 的 ParsedResult（OPD-PS-05/06 用）。 */
@@ -99,8 +98,7 @@ class PowerShellV3Wf5AlignmentTest {
             List<PowerShellAstService.Redirection> redirections) {
         PowerShellAstService.Statement st = new PowerShellAstService.Statement("PipelineAst",
             commandText, List.of(commandElement), List.of());
-        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false,
-            false, false, false, false, List.of(), List.of(), List.of(st), redirections, commandText);
+        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false, false, false, false, false, List.of(), List.of(), List.of(st), redirections, commandText);
     }
 
     private static ObjectNode input(String command) {
@@ -254,9 +252,20 @@ class PowerShellV3Wf5AlignmentTest {
         FakeAstService ast = new FakeAstService();
         ast.stub(single(cmd("Set-Content", "cmdlet", "file.txt")));
         PowerShellTool tool = new PowerShellTool(new PowerShellPermissionChain(ast));
-        PermissionResult result = tool.checkPermissions(input("Set-Content file.txt"), ctxAcceptEdits());
-        assertInstanceOf(PermissionResult.Allow.class, result,
-            "acceptEdits 模式顶层 checkPermissionMode 必须放行 Set-Content（CC :1349-1352）");
+        ToolUseContext ctx = ctxAcceptEdits();
+        // [P7] 双轴：轴 A（相对路径解析基准）= TUC.effectiveCwd；轴 B（越界白名单根）=
+        //   会话 originalCwd 层（CC allWorkingDirectories 首项 getOriginalCwd）。本用例把轴 A 钉成
+        //   合成目录 C:/work/project（见 ctxAcceptEdits 注释），轴 B 必须同样钉住 —— 否则轴 B 落
+        //   测试环境的无会话出口（进程 user.dir = 后端启动目录）⇒「写 cmdlet 在白名单内 → Allow」
+        //   的前提被破坏。生产两轴同源于同一会话绑定（常态相等；bash cd 到子目录后轴 A 才前移）。
+        SessionCwdHolder.setOriginalCwd(ctx.sessionId(), "C:/work/project");
+        try {
+            PermissionResult result = tool.checkPermissions(input("Set-Content file.txt"), ctx);
+            assertInstanceOf(PermissionResult.Allow.class, result,
+                "acceptEdits 模式顶层 checkPermissionMode 必须放行 Set-Content（CC :1349-1352）");
+        } finally {
+            SessionCwdHolder.clearOriginalCwd(ctx.sessionId());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -319,8 +328,7 @@ class PowerShellV3Wf5AlignmentTest {
         if (cmds.length > 0) {
             stmts.add(new PowerShellAstService.Statement("PipelineAst", cmds[0].text(), List.of(cmds), List.of()));
         }
-        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false,
-            false, false, false, false, List.of(), typeLiterals, stmts, List.of(), "cmd");
+        return new PowerShellAstService.ParsedResult(true, List.of(), false, false, false, false, false, false, false, false, false, List.of(), typeLiterals, stmts, List.of(), "cmd");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -400,6 +408,7 @@ class PowerShellV3Wf5AlignmentTest {
         PowerShellAstService.ParsedResult parsed = withRedirections(setContent, "Set-Content file.txt",
             List.of(new PowerShellAstService.Redirection("C:/outside/target.txt", false)));
         PermissionResult r = PowerShellPathValidator.check(input("x"), parsed, null,
+            Path.of("C:/work/project"),
             Path.of("C:/work/project"), false);
         assertInstanceOf(PermissionResult.Ask.class, r,
             "重定向目标 C:/outside/target.txt 在工作目录外必须 ask（CC :1999-2038 validatePath 'create'）");
@@ -422,6 +431,7 @@ class PowerShellV3Wf5AlignmentTest {
             java.util.Map.of(), deny, java.util.Map.of(), java.util.Map.of(),
             false, false, java.util.Map.of(), false, false, null);
         PermissionResult r = PowerShellPathValidator.check(input("x"), parsed, permCtx,
+            Path.of("C:/work/project"),
             Path.of("C:/work/project"), false);
         assertInstanceOf(PermissionResult.Deny.class, r,
             "重定向目标命中 Edit deny 规则必须 deny（CC :1965-1970/:2018-2023 decisionReason.type==='rule' → deny）");
@@ -436,6 +446,7 @@ class PowerShellV3Wf5AlignmentTest {
         PowerShellAstService.ParsedResult parsed = withRedirections(getProc, "Get-Process > $null",
             List.of(new PowerShellAstService.Redirection("$null", false)));
         PermissionResult r = PowerShellPathValidator.check(input("x"), parsed, null,
+            Path.of("C:/work/project"),
             Path.of("C:/work/project"), false);
         assertTrue(r instanceof PermissionResult.Passthrough,
             "> $null 重定向目标跳过 validatePath（CC :1944/:1997 isNullRedirectionTarget），无 deny/ask");

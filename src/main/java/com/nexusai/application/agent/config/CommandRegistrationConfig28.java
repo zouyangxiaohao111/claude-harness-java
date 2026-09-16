@@ -394,7 +394,9 @@ public class CommandRegistrationConfig28 {
                 int total = 0;
                 int[] behaviorCounts = new int[3]; // allow/deny/ask
                 for (PermissionSourceLoaderRef ref : loaders) {
-                    List<PermissionRule> rules = ref.loader().load();
+                    // [P11d] 传 lambda 形参 sessionId：project/local 两源按本会话项目根读取
+                    //   （与 REST /api/v1/permissions/rules 及写侧同址）
+                    List<PermissionRule> rules = ref.loader().load(sessionId);
                     if (rules == null || rules.isEmpty()) {
                         continue;
                     }

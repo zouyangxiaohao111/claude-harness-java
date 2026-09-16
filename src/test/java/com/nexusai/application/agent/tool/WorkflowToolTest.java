@@ -2,7 +2,9 @@ package com.nexusai.application.agent.tool;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.loop.FeatureFlags;
+import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.tool.impl.WorkflowTool;
 import com.nexusai.application.agent.workflow.LaunchInput;
 import com.nexusai.application.agent.workflow.LaunchResult;
@@ -10,14 +12,18 @@ import com.nexusai.application.agent.workflow.WorkflowPorts;
 import com.nexusai.application.agent.workflow.WorkflowService;
 import com.nexusai.application.agent.workflow.WorkflowServiceImpl;
 import com.nexusai.application.agent.workflow.progress.RunProgress;
+import com.nexusai.common.SessionProjectRoot;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.nio.file.Files;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -213,6 +219,42 @@ class WorkflowToolTest {
                 tool.renderToolUseMessage(f.objectNode()));
     }
 
+    // ═══════════════════ [P10a] 槽收敛 + 同链单次解析 ═══════════════════
+
+    @Test
+    @DisplayName("[P10a] 工具入口按「会话项目根」解析并显式下传 launch（⛔ 不落 worktree/cd 槽）")
+    void executeResolvesProjectRootAndPassesItDown() throws Exception {
+        // WHY（CLAUDE.md 规则 9）：CC ports.ts:54-60 要求 workflow 的解析基准 = getProjectRoot()
+        //   （⛔ 不随 mid-session worktree / bash cd 变），且与 journal runsDir 同根；本仓对应槽 =
+        //   SessionProjectRoot。此处造两槽分叉现场：项目根 = A，getCwd/getOriginalCwd 槽 = B。
+        java.nio.file.Path projectRoot = Files.createTempDirectory("p10a-toolA-");
+        java.nio.file.Path divergedCwd = Files.createTempDirectory("p10a-toolB-");
+        String sessionId = "sess-p10a-tool";
+        try {
+            SessionProjectRoot.setForSession(sessionId, projectRoot.toString());
+            SessionCwdHolder.set(sessionId, divergedCwd.toString());
+            SessionCwdHolder.setOriginalCwd(sessionId, divergedCwd.toString());
+
+            ToolUseBlock call = new ToolUseBlock("toolu-p10a", WorkflowTool.NAME,
+                    JsonNodeFactory.instance.objectNode().put("script", "return 42"));
+            ToolUseContext ctx = new ToolUseContext(UUID.randomUUID(), sessionId,
+                    PermissionMode.DEFAULT, Map.of());
+
+            new WorkflowTool().execute(call, ctx);
+
+            assertEquals(1, fakeService.launchCalls(), "合法脚本必须到达 launch");
+            assertEquals(projectRoot.toRealPath().toString(), fakeService.lastProjectRoot,
+                    "工具入口解析出的项目根必须是会话项目根(A)且原样下传 ⇒ 服务端不再二次解析；"
+                            + "落 B（worktree/cd 槽）即 desync（ports.ts:54-60）");
+        } finally {
+            SessionProjectRoot.clearSession(sessionId);
+            SessionCwdHolder.clear(sessionId);
+            SessionCwdHolder.clearOriginalCwd(sessionId);
+            Files.deleteIfExists(projectRoot);
+            Files.deleteIfExists(divergedCwd);
+        }
+    }
+
     // ═══════════════════ Fake WorkflowService ═══════════════════
 
     /** 记录 launch 调用的 fake service（仅 execute→launch 链路需要 launch；其余接口空实现）。 */
@@ -220,6 +262,8 @@ class WorkflowToolTest {
 
         private int launchCount;
         LaunchInput lastInput;
+        /** [P10a · D3] 工具入口下传的项目根（服务端不得再解析 ⇒ 该值即同链唯一解析产物）。 */
+        String lastProjectRoot;
 
         /** launch 调用次数（测试断言用）。 */
         int launchCalls() {
@@ -232,9 +276,11 @@ class WorkflowToolTest {
         }
 
         @Override
-        public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool) {
+        public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool,
+                                                     String projectRoot) {
             launchCount++;
             lastInput = input;
+            lastProjectRoot = projectRoot;
             return CompletableFuture.completedFuture(new LaunchResult("run-123", null));
         }
 

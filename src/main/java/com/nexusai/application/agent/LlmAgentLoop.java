@@ -3120,11 +3120,13 @@ public class LlmAgentLoop implements AgentLoop {
         // permissionSetup.ts:689-695）：CLI 侧（--permission-mode / --dangerously-skip-permissions，
         // main.tsx:1099 / main.tsx:621）+ settings 磁盘 meta（InitialPermissionModeSource，
         // CC getSettings_DEPRECATED = getInitialSettings，settings.ts:820）。
+        // [P11d] 额外传 params.sessionId()：project/local 两层的 settings 文件按<b>本会话项目根</b>
+        //   解析（改前恒后端启动目录 ⇒ 多会话共用一份项目级 settings，既串又错）。
         // initialPermissionModeSource 未注入（非 Spring 单测）→ settings 侧回落空，仅透传 CLI 侧。
         InitialPermissionModeResolver.Input initialModeInput =
             initialPermissionModeSource != null
                 ? initialPermissionModeSource.resolveInput(
-                    params.permissionModeCli(), params.dangerouslySkipPermissions())
+                    params.sessionId(), params.permissionModeCli(), params.dangerouslySkipPermissions())
                 : new InitialPermissionModeResolver.Input(
                     params.permissionModeCli(), params.dangerouslySkipPermissions(), null, false);
         // [IMP-1 R4] Statsig 门改接数据库开关（方案 A）：permissionConfigProvider 提供

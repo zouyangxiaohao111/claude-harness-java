@@ -44,7 +44,8 @@ class WorkflowNotificationsTest {
         }
 
         @Override public WorkflowPorts ports() { return null; }
-        @Override public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool) {
+        @Override public CompletableFuture<LaunchResult> launch(LaunchInput input, ToolUseContext ctx, Object canUseTool,
+                                                               String projectRoot) {
             return null;
         }
         @Override public void kill(String runId) { }

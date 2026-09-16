@@ -13,7 +13,7 @@ import java.util.function.Supplier;
  * <ul>
  *   <li>{@link #create()} — 返回新 AbortController (record + AtomicBoolean + listener list)</li>
  *   <li>{@link #sleep(long, AbortControllerRef, boolean)} — await ms, abort → silent resolve OR throw</li>
- *   <li>{@link #peekForStdinData(CompletionStage, long, Runnable)} — 异步 peek 检测首次 data</li>
+ *   <li>{@link #peekForStdinData(CompletableFuture, long, Runnable)} — 异步 peek 检测首次 data</li>
  * </ul>
  *
  * <p>L2 契约 (5 Release Gate):

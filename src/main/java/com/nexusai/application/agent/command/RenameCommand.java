@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.command;
 
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -24,7 +23,7 @@ import java.util.function.Supplier;
  * </ul>
  *
  * <p>L3 (Java idiom): Consumer&lt;String&gt; onDone 替代 CC onDone; Supplier&lt;Boolean&gt; isTeammate +
- *                    Supplier&lt;UUID&gt; sessionId + Supplier&lt;String&gt; transcriptPath +
+ *                    Supplier&lt;String&gt; sessionId（short 直键 sess-xxxxxxxx） + Supplier&lt;String&gt; transcriptPath +
  *                    BiFunction generateName + Consumer&lt;AppState&gt; setAppState +
  *                    Supplier&lt;CompletableFuture&lt;Void&gt;&gt; saveCustomTitle + saveAgentName +
  *                    Supplier&lt;CompletableFuture&lt;Void&gt;&gt; updateBridgeTitle 全部注入测试可控.
@@ -45,14 +44,18 @@ import java.util.function.Supplier;
  */
 public class RenameCommand {
 
-    /** 执行环境 (CC 全局 state 注入). */
+    /** 执行环境 (CC 全局 state 注入).
+     *
+     *  <p><b>[session-id-short]</b>：{@code sessionId} 为 short 直键 {@code sess-xxxxxxxx}
+     *  （与 {@code SessionStorage} transcript 文件名键同源）——⛔ 不得再经 {@code UUID.fromString}
+     *  转换（先例 {@code EffortCommand:405} / {@code AgentColorCommand}）。 */
     public record Env(
         Supplier<Boolean> isTeammate,
-        Supplier<UUID> sessionId,
+        Supplier<String> sessionId,
         Supplier<String> transcriptPath,
         BiFunction<List<String>, String, CompletableFuture<String>> generateName,  // (messages, signal) → name
-        BiFunction<UUID, String, CompletableFuture<Void>> saveCustomTitle,        // (sessionId, name) → void
-        BiFunction<UUID, String, CompletableFuture<Void>> saveAgentName,
+        BiFunction<String, String, CompletableFuture<Void>> saveCustomTitle,      // (sessionId, name) → void
+        BiFunction<String, String, CompletableFuture<Void>> saveAgentName,
         BiFunction<String, String, CompletableFuture<Void>> updateBridgeTitle,
         Consumer<String> setAppStateName,
         Consumer<String> onDone
@@ -84,13 +87,13 @@ public class RenameCommand {
             }
             trimmed = generated;
         }
-        UUID sessionId = env.sessionId.get();
+        String sessionId = env.sessionId.get();
         String fullPath = env.transcriptPath.get();
         // 1. saveCustomTitle
         env.saveCustomTitle.apply(sessionId, trimmed).join();
         // 2. bridge 同步 (best-effort, 不阻断)
         try {
-            env.updateBridgeTitle.apply(sessionId.toString(), trimmed).join();
+            env.updateBridgeTitle.apply(sessionId, trimmed).join();
         } catch (Exception ignored) {
             // CC: .catch(() => {}) — 不阻断主流程
         }

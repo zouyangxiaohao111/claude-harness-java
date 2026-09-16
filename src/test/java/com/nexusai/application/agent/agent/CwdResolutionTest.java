@@ -604,4 +604,75 @@ class CwdResolutionTest {
             SessionProjectRoot.setDbResolver(null);
         }
     }
+
+    /**
+     * [批 P5 2026-09-15 · 铁律「不许静默失效」出口 (b)] 无会话命名出口必须 <b>≥WARN</b> 且 <b>warn-once</b>。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：{@link CwdResolution#getCwdForNonSession()} /
+     * {@link CwdResolution#getOriginalCwdLayerForNonSession()} <b>恒返回进程 {@code user.dir}</b>
+     * —— 它<b>不是</b>任何会话的项目根。这是本批「值流轴」的核心：只改读侧答不了「是否真的不再
+     * 回落 user.dir」，必须让这条值传播<b>可观测</b>。原实现只打 {@code log.debug}
+     * ⇒ 默认日志级别下「本该有会话却漏传 sessionId」完全静默（静默失效）。
+     *
+     * <p>判据 = <b>恰好 1 条</b>：<b>0 条</b> ⇒ 只 DEBUG（原缺陷）；<b>2+ 条</b> ⇒ 无一次性闸
+     * （本族 31 个调用点会淹日志）；两出口<b>共闸</b> ⇒ 第二个出口不得追加第二条。
+     *
+     * <p>RED（反向实验）：把 {@code NON_SESSION_EXIT_WARNED.compareAndSet(false, true)} 改成
+     * {@code if (true)}（或改回 {@code log.debug}）⇒ 本用例红（计数 3 / 计数 0）。
+     *
+     * <p>装置说明：命名出口<b>不读会话层</b>（不查 DB / 不查冻结表）⇒ 本用例用<b>计数解析器</b>
+     * 断言「0 次回源」，以此证明无会话出口结构上不触及会话态（⭐ 该断言不受
+     * {@code NoDatabaseSessionProjectRootExtension} 对任意 sessionId 答 sessionless 的陷阱影响，
+     * 因为它断言的是「查了几次」而非「抛不抛」）。
+     */
+    @Test
+    @DisplayName("[批 P5] 无会话命名出口 ≥WARN 且 warn-once：两次调用恰好 1 条（两出口共闸）")
+    void nonSessionExit_warnsExactlyOnceAndNeverQueriesSessionLayer(@TempDir Path projectDir) {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(CwdResolution.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        CwdResolution.resetWarnGatesForTesting();
+        final java.util.concurrent.atomic.AtomicInteger dbCalls = new java.util.concurrent.atomic.AtomicInteger();
+        SessionProjectRoot.setDbResolver(sid -> {
+            dbCalls.incrementAndGet();
+            return SessionProjectRoot.Lookup.bound(projectDir.toString());
+        });
+        try {
+            CwdResolution.getCwdForNonSession();
+            CwdResolution.getCwdForNonSession();
+            // 同族另一出口：与前者共用一个闸 ⇒ 不得再追加第二条告警
+            CwdResolution.getOriginalCwdLayerForNonSession();
+
+            java.util.List<String> warns = app.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("是无会话命名出口"))
+                .toList();
+            assertThat(warns)
+                .as("⭐ 两次调用只允许 1 条 ≥WARN —— 0 条=只 DEBUG（原缺陷）；2 条=无一次性闸")
+                .hasSize(1);
+            assertThat(warns.get(0))
+                .as("告警必须点名具体出口方法（占位符已被实参替换）")
+                .contains("getCwdForNonSession 是无会话命名出口");
+            assertThat(app.list.stream()
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("{}"))
+                .toList())
+                .as("⛔ 不得残留未替换的 {} 占位符（参数化占位符个数必须与实参一致）")
+                .isEmpty();
+
+            // 命名出口不得触及会话层：即便解析器已接线且能答 bound，也不得查（0 次回源）
+            assertThat(dbCalls.get())
+                .as("无会话命名出口 = 进程 user.dir，结构上不读会话层 ⇒ 0 次 DB 回源")
+                .isZero();
+        } finally {
+            logger.detachAppender(app);
+            app.stop();
+            CwdResolution.resetWarnGatesForTesting();
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
 }

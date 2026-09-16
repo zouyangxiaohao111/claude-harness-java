@@ -48,7 +48,19 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       {@code @RestController} / {@code @Controller} / {@code @Repository} / {@code @Configuration}
  *       （经编译产物反射判注解，非源码文本匹配 ⇒ 无解析器 bug 面）。</li>
  *   <li><b>判据</b>：类型上<b>非 static 且非 final</b> 的<b>声明字段</b>（{@code getDeclaredFields()}）。
- *       static/final 天然不可承载会话态（常量/进程级持有者），故排除。</li>
+ *       ⛔ 排除理由<b>只对 {@code static}</b> 成立（常量 / 进程级持有者）；{@code final} 的排除是
+ *       <b>有意收窄扫描面</b>，<b>不是</b>「final 承载不了会话态」——
+ *       <b>{@code final} 可变容器（{@code Map}/{@code List}/{@code AtomicBoolean}/{@code Set}）
+ *       恰恰是「按会话键承载会话态」的正范式</b>。</li>
+ *   <li><b>⭐ 已知结构性盲区（登记 · 有意不修）</b>：由上一条 ⇒ <b>{@code final} 可变容器不在扫描面内</b>。
+ *       批 P10b 的 {@code SubagentExecutor#systemPromptContextProviderBySession}（{@code final} LRU Map、
+ *       跨会话串值缺陷的<b>修复形态</b>）正是此类 ⇒ 本闸门<b>拦不住同类问题</b>。
+ *       <br><b>为何不修（实测代价，2026-09-16 @ P3 基线）</b>：把 {@code final} 非 static 字段纳入候选集 ⇒
+ *       候选 348 → <b>948</b>（+600），其中「会话可疑」34 → <b>122</b>（<b>+88</b> 条），而这 88 条里绝大多数
+ *       是<b>正确实现</b>（如 {@code ExtractMemoriesAgent} 的 7 张 {@code …BySession} Map、
+ *       {@code SessionAgentStateRegistry#sessions}），把它们当「违规」逼逐条登记，等于把<b>正范式</b>
+ *       判成嫌疑 ⇒ 直接触发本类反对的「噪声闸门必被绕过」。
+ *       <br>⇒ 该盲区由<b>人工评审 + 本类文档</b>兜底，而非靠扩大扫描面。</li>
  *   <li><b>两层断言</b>：
  *       <br>· <b>Tier-1（人读白名单，双向）</b>：「会话可疑」字段（类型属会话载体集 <b>或</b> 字段名含
  *         会话关键字）必须<b>逐个</b>出现在 {@link #TIER1_REGISTERED} 且白名单里不许有已消失项 ——
@@ -107,7 +119,7 @@ class BeanSingletonSessionStateAuditTest {
         "com.nexusai.application.agent.tool.impl.SubagentExecutor#AgentMemoryDirectory agentMemoryDirectory", // 已核：装配依赖（@Autowired 注入式构造传入）；bean 创建期写一次
         "com.nexusai.application.agent.tool.impl.SubagentExecutor#Function agentDefinitionResolver", // 装配注入的函数（无状态）
         "com.nexusai.application.agent.tool.impl.SubagentExecutor#Map additionalAgentDefinitions", // 装配依赖（bean 创建期写一次）
-        "com.nexusai.application.agent.tool.impl.SubagentExecutor#SystemPromptContextProvider systemPromptContextProvider", // 已核：per-invocation 构造（SubagentTool `new SubagentExecutor(...)` 传入）；bean 面同 agentIdOverride
+        "com.nexusai.application.agent.tool.impl.SubagentExecutor#SystemPromptContextProvider systemPromptContextProvider", // 已核【P10b 复核 2026-09-16】：⛔ 原写「已核：per-invocation 构造」**为假** —— 该字段确乘在**单例 bean 面**上（`ToolRegistrationConfig:682` @Bean `subagentExecutor` 无 `@Scope`），且 2 条生产路径在该单例上跑（`SkillToolImpl:1660` executeForkedSkill / `AutonomousAgentLoop:1170` executeStreaming，二者均经 `SubagentExecutor:1779` resolveSystemContextText 到达读取点）。⭐ 但该字段**仅作装配注入位**：全仓唯一 `setSystemPromptContextProvider` 调用点在测试 `SubagentG4MetricsTest:87` ⇒ 生产恒 null ⇒ 读取恒走**按会话键**的 `systemPromptContextProviderBySession`（读取方法 `SubagentExecutor:5660`：`:5664` 注入优先，未注入则 `:5678` 查按会话键缓存）。⚠️ 这条假保证正是 P10b「跨会话串值」缺陷长期存活的直接原因
         "com.nexusai.application.agent.tool.impl.SubagentExecutor#UUID agentIdOverride", // 已核：per-invocation。bean 面确被 SpawnInProcess:60 注入并透传至 AutonomousAgentLoop:288，但 setAgentIdOverride 只在 `new SubagentExecutor(...)` 实例上调用（SubagentTool:3319/:3446）⇒ 共享 bean 上该字段恒 null（不构成当前跨会话泄漏）；保留登记因为「若有人对 bean 调该 setter 即为跨代理串扰」—— 属待评审项而非已裁定非载体
         "com.nexusai.application.agent.tool.impl.SubagentExecutor#boolean deferContextModifier", // 已核：per-invocation 构造传入；bean 面无写入方
         "com.nexusai.application.agent.tool.impl.SubagentExecutor#boolean sdkAgentProgressSummariesEnabled", // feature/配置位（per-invocation 构造时传入）
@@ -121,9 +133,12 @@ class BeanSingletonSessionStateAuditTest {
      * <p>这些字段在单例上<b>故意</b>进程级；任何把它们改成会话级的动作都必须改本清单（= 二次评审点）。
      */
     private static final Set<String> DOCUMENTED_PROCESS_SCOPED = new TreeSet<>(Set.of(
-        "com.nexusai.application.agent.context.ClaudemdEngine#boolean hasLoggedInitialLoad", // T8 判据「可观测语义/指标基数」：tengu_claudemd__initial_load 的语义是「每 JVM 一条」==> 会话化会改变指标基数 ==> 明确不会话化
-        "com.nexusai.apis.claudemd.ClaudeMdController#boolean externalIncludesApproved", // T15-3 判据（裁定 2）：CC 真源 getCurrentProjectConfig()（claudemd.ts:796/:1420）==> 该态是【项目级 config】而非会话级；本仓为进程级（更宽）==> 已知偏离，正确键 = 项目根，登记为契约决策（⛔ 不按 sessionId 会话化）
-        "com.nexusai.apis.claudemd.ClaudeMdController#boolean externalIncludesWarningShown" // 同上（CC ProjectConfig.hasClaudeMdExternalIncludesWarningShown，config.ts:116/:147）
+        "com.nexusai.application.agent.context.ClaudemdEngine#boolean hasLoggedInitialLoad" // T8 判据「可观测语义/指标基数」：tengu_claudemd__initial_load 的语义是「每 JVM 一条」==> 会话化会改变指标基数 ==> 明确不会话化
+        // [P3 · 2026-09-16] 原此处的 ClaudeMdController#boolean externalIncludesApproved /
+        //   externalIncludesWarningShown 两条已删除 —— 字段本体已被 T15-3（de4ed2e9）删除，
+        //   审批态改按**项目根键**承载并落 DB 表 claude_md_include_approval（V74）。
+        //   ⛔ 替代物 `externalIncludesApprovedByProject` / `...WarningShownByProject` 是 `final` Map
+        //      ⇒ 结构性进不了本清单（见类 javadoc 的盲区登记），**不得**改写成它们。
     ));
 
     /**
@@ -131,9 +146,25 @@ class BeanSingletonSessionStateAuditTest {
      *
      * <p>更新方式：跑红后从断言消息里的 {@code 全量字段清单} 复制排序后的列表重算 —— 每次改动
      * 都必须是一次<b>显式评审</b>（这正是本闸门的目的）。
+     *
+     * <p><b>[P3 · 2026-09-16] 本次重钉的差异 = 恰 4 行</b>（已在评审中逐条归因；旧值
+     * {@code 634f8500…} 对应的字段清单在当前代码下已不存在）：
+     * <ol>
+     *   <li><b>删 2 行</b>（T15-3 / {@code de4ed2e9} 删字段本体）：
+     *       {@code ClaudeMdController#boolean externalIncludesApproved} /
+     *       {@code …#boolean externalIncludesWarningShown}；</li>
+     *   <li><b>改名 2 行</b>（T15-3 接缝带会话维度）：
+     *       {@code ClaudemdEngine#Supplier hasClaudeMdExternalIncludesApproved} →
+     *       {@code #Function …Approved}；{@code …WarningShown} 同（{@code Supplier<Boolean>} →
+     *       {@code Function<String, Boolean>}）。</li>
+     * </ol>
+     * ⭐ 归因方式（可复核）：把上述 4 处按「旧态」还原后重算 SHA-256，<b>逐字节等于旧值
+     * {@code 634f8500…}</b> ⇒ 旧清单被唯一确定，不存在第 5 处差异（SHA-256 见证，非目测）。
+     * 其余一切字段（含 P10b 新增的 {@code systemPromptContextProviderBySession}）均未进入候选集
+     * —— 后者是 {@code final} 字段，见类 javadoc 的盲区登记。
      */
     private static final String PINNED_FINGERPRINT =
-        "634f85006ed5a04e547a302fcd1f6751c2ea967eb5b0acb2b2a54b0930c8f8c1";
+        "1fa10951cf1797873c7f3dbf7d2e4098fdf974e49d5cb8d41b7a31ff537dace9";
 
     /** 「会话可疑」判据 ①：字段类型属会话载体集（简名匹配，兼容泛型外层）。 */
     private static final Set<String> SESSION_CARRIER_TYPES = Set.of(
@@ -272,10 +303,14 @@ class BeanSingletonSessionStateAuditTest {
                         }
                         Class<?> rt = m.getReturnType();
                         if (rt != null && rt != void.class && !rt.isPrimitive() && !isPrototype(rt)
-                                && rt.getName().startsWith("com.nexusai.")) {
+                                && isRepositoryOwned(rt)) {
                             // 只审计本仓类型：@Bean 也可返回第三方类型（如 Spring 的
                             // ServletServerContainerFactoryBean）—— 那不是本仓的可改代码，
                             // 纳入会让闸门把上游库的字段当成违规。
+                            // [P3 · 2026-09-16] 判据由「FQN 前缀 com.nexusai.」改为「code source
+                            //   归属本仓 target/classes」：按**来源**判归属，不按**包名**判。
+                            //   ⚠️ 实测（见 {@link #isRepositoryOwned}）：本仓当前 81 个 @Bean 方法上
+                            //   两种判据**逐条等价（差异 0）**，候选字段集（348 条）与指纹均不变。
                             singletonTypes.add(rt);
                         }
                     }
@@ -303,6 +338,42 @@ class BeanSingletonSessionStateAuditTest {
         }
         List<String> sorted = new ArrayList<>(new LinkedHashSet<>(new TreeSet<>(fields)));
         return new ScanResult(beanClassCount, sorted);
+    }
+
+    /**
+     * 类型是否<b>本仓编译产物</b>（code source 归属 {@code target/classes}）。
+     *
+     * <p>[P3 · 2026-09-16] 取代原 FQN 前缀判据 {@code rt.getName().startsWith("com.nexusai.")}：
+     * 按<b>来源</b>判归属，不按<b>包名</b>判。
+     *
+     * <p>⚠️ <b>实测等价性（必须照实读）</b>：本仓当前 81 个 {@code @Bean} 方法上，两种判据
+     * <b>逐条等价（差异 0）</b>，候选字段集（348 条）与 Tier-2 指纹完全相同。原因：JDK 类型
+     * （{@code java.util.function.Function} / {@code Supplier} / {@code List} …）的
+     * {@code getProtectionDomain().getCodeSource()} 在 Java 9+ 返 <b>{@code null}</b>
+     * （模块化后不暴露 CodeSource）⇒ <b>新判据同样不收 JDK 类型</b>。
+     * <p>⭐ 因此：{@code ToolRegistrationConfig} 的 {@code Function<String,String>}
+     * {@code @Bean}（{@code claudeMdContentSupplier} / {@code sessionProjectRootResolver}）
+     * <b>在本判据下依旧不进入扫描面</b>，且它<b>本来也无字段可审计</b>
+     * （{@code java.util.function.Function} 声明的字段数 = 0，实测）。
+     *
+     * <p>两向差异实测（2026-09-16）<b>均为 0</b>：① 本仓自有但非 {@code com.nexusai.*} 包名的类型
+     * = 0（本仓 {@code src/main/java} 下只有 {@code com/nexusai}）⇒ 旧判据今日**没有**可漏之物；
+     * ② 占用 {@code com.nexusai.*} 包名的第三方 jar 类型 = 0 ⇒ 新判据真正防住的是这一理论误收面。
+     * ⛔ <b>不得</b>据此判据说「本判据让某个 {@code Function} {@code @Bean} 进了视野」—— 删除该
+     * {@code @Bean} 后本测试<b>仍绿</b>（2026-09-16 实测，见批 P3 报告）。
+     */
+    private static boolean isRepositoryOwned(Class<?> type) {
+        try {
+            java.security.CodeSource codeSource = type.getProtectionDomain().getCodeSource();
+            if (codeSource == null || codeSource.getLocation() == null) {
+                return false; // 无 code source（JDK 模块类 / 引导类路径）⇒ 非本仓
+            }
+            Path source = Paths.get(codeSource.getLocation().toURI()).toAbsolutePath().normalize();
+            Path root = resolveClassesRoot().toAbsolutePath().normalize();
+            return source.equals(root) || source.startsWith(root);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /** 字段是否带装配类注解（按简名匹配，见 {@link #WIRING_ANNOTATION_NAMES}）。 */

@@ -45,6 +45,9 @@ import java.util.function.Supplier;
  *   <li>project：{@code <projectRoot>/.nexusai/settings.json}（ProjectSettingsLoader:53-55）</li>
  *   <li>local：{@code <projectRoot>/.nexusai/settings.local.json}（LocalSettingsLoader:58-60）</li>
  * </ul>
+ * <p><b>[P11d]</b> {@code projectRoot} = <b>该会话的项目根</b>
+ * （{@code CwdResolution.getProjectRoot(sessionId)}；会话为空/哨兵 ⇒ 无会话腿 process {@code user.dir}）
+ * —— 改前恒为后端启动目录，导致所有会话共用同一份项目级 settings（既串又错）。
  *
  * <p><b>lenient 加载</b>：单文件缺失 / JSON 损坏 → 该层 {@link SettingsJsonParser.PermissionsMeta#EMPTY}，
  * 不阻断启动（对齐 CC getSettings_DEPRECATED 读失败返回空 settings）。
@@ -76,10 +79,10 @@ public class InitialPermissionModeSource {
     private SettingsMapper settingsMapper;
 
     /**
-     * Spring 生产构造器 · 项目根惰性接线 {@code CwdResolution.getOriginalCwdLayer()}
-     * （语义 = D6 项目根；无会话回落 {@code user.dir}）；settingsMapper 走
-     * {@code @Autowired(required=false)} 字段注入。{@code nexusai.home} 已废弃，不再经
-     * {@code @Value} 注入。
+     * Spring 生产构造器 · 无会话腿项目根接线 {@code CwdResolution.getOriginalCwdLayer(null)}
+     * （语义 = D6 项目根的无会话出口；真会话腿在 {@link #readMergedPermissionsMeta(String)}
+     * 里按 sessionId 现算）；settingsMapper 走 {@code @Autowired(required=false)} 字段注入。
+     * {@code nexusai.home} 已废弃，不再经 {@code @Value} 注入。
      *
      * @param parser settings.json 解析器（共享 bean，复用 {@link SettingsJsonParser#parsePermissionsMeta}）
      */
@@ -92,9 +95,9 @@ public class InitialPermissionModeSource {
      * 2 参构造器（测试/手动接线；settingsMapper = null → 不读 DB 全局，回落磁盘）。
      *
      * @param parser               settings.json 解析器（共享 bean）
-     * @param projectRootSupplier  项目根惰性供应（决策 D6 项目根；生产接
-     *                             {@code CwdResolution.getOriginalCwdLayer()}，无会话回落
-     *                             {@code user.dir}；null 空安全回退 user.dir）
+     * @param projectRootSupplier  <b>无会话腿</b>项目根惰性供应（生产接
+     *                             {@code CwdResolution.getOriginalCwdLayer()}；null 空安全回退
+     *                             user.dir）
      */
     public InitialPermissionModeSource(
             SettingsJsonParser parser, Supplier<String> projectRootSupplier) {
@@ -123,6 +126,9 @@ public class InitialPermissionModeSource {
     /**
      * 解析初始 mode 多源输入 = CLI 参数 + 磁盘 settings 权限元数据。
      *
+     * @param sessionId                 会话 ID（short）· <b>[P11d]</b> project/local 两层的
+     *                                  settings 文件位置按它解析（会话项目根）；null/空白/哨兵
+     *                                  ⇒ 确无会话腿（{@link #projectRootSupplier}）
      * @param permissionModeCli         CLI {@code --permission-mode} 值
      *                                  （CC original: {@code permissionModeCli}，main.tsx:1099
      *                                  {@code permissionMode: permissionModeCli}；可为 null）
@@ -132,8 +138,8 @@ public class InitialPermissionModeSource {
      * @return 对齐 CC initialPermissionModeFromCLI 入参（permissionSetup.ts:689-695）+ settings 派生字段
      */
     public InitialPermissionModeResolver.Input resolveInput(
-            String permissionModeCli, boolean dangerouslySkipPermissions) {
-        SettingsJsonParser.PermissionsMeta meta = readMergedPermissionsMeta();
+            String sessionId, String permissionModeCli, boolean dangerouslySkipPermissions) {
+        SettingsJsonParser.PermissionsMeta meta = readMergedPermissionsMeta(sessionId);
         // [V44] DB 全局默认（settings.permission_mode 列）合并进 settings 槽：DB ?? 磁盘 settings.json。
         //   优先级链（settings 槽内部）：DB 全局 > 磁盘三源（local>project>user）；最终链：
         //   per-call > 会话 override（CLI 槽）> DB 全局（settings 槽）> settings.json defaultMode > default。
@@ -186,15 +192,19 @@ public class InitialPermissionModeSource {
     /**
      * 读 3 层 settings 磁盘权限元数据并按 CC 覆盖序合并（user → project → local）。
      *
+     * @param sessionId 会话 ID（short）· <b>[P11d]</b> project/local 两层的项目根按它现算；
+     *                  null/空白/{@code no-session} 哨兵 ⇒ 无会话腿 {@link #projectRootSupplier}
      * @return 合并后的权限元数据（defaultMode + disableBypassPermissionsMode）
      */
-    private SettingsJsonParser.PermissionsMeta readMergedPermissionsMeta() {
+    private SettingsJsonParser.PermissionsMeta readMergedPermissionsMeta(String sessionId) {
         // user 源改走 NexusaiPaths（决策 D2，用户级 ~/.nexusai/settings.json）
         Path userPath = NexusaiPaths.getAppConfigHomePath().resolve(USER_FILE_NAME);
         // project/local 源保持项目内 .nexusai（决策 D6，projectRoot=会话项目根；单次求值防会话切换漂移）
         // 项目级目录名动态化（决策 D1/D6）：NexusaiPaths.getProjectDirName() = "." + appName
         // （生产 appName=nexusai → .nexusai；appName 变则项目级目录名全联动）
-        String projectRoot = projectRootSupplier.get();
+        // [P11d] 项目根来源 = 该会话的项目根（会话冻结值，四态 fail-loud）；⛔ 改前恒后端起
+        //   动目录 ⇒ 所有会话共用一份项目级 settings（既串又错）。
+        final String projectRoot = projectRoot(sessionId);
         Path projectPath = Paths.get(projectRoot, NexusaiPaths.getProjectDirName(), PROJECT_FILE_NAME);
         Path localPath = Paths.get(projectRoot, NexusaiPaths.getProjectDirName(), LOCAL_FILE_NAME);
 
@@ -217,5 +227,24 @@ public class InitialPermissionModeSource {
                 defaultMode, disableBypass);
         }
         return new SettingsJsonParser.PermissionsMeta(defaultMode, disableBypass);
+    }
+
+    /**
+     * [P11d] 项目级两层的项目根解析（读侧唯一入口）。
+     *
+     * <p>会话非空 ⇒ {@code CwdResolution.getProjectRoot(sessionId)}（会话冻结项目根；四态语义见该方法
+     * javadoc —— 会话存在却无绑定 / DB 明确答无此会话 / 无法判定 ⇒ fail-loud 抛，⛔ 不用
+     * {@code user.dir} 冒充）。
+     * <p>会话为 null / 空白 / {@code no-session} 哨兵 ⇒ 铁律出口「本环境确无会话」⇒ 无会话腿
+     * {@link #projectRootSupplier}。
+     *
+     * @param sessionId 会话 ID（short；可为 null = 确无会话）
+     * @return 项目根绝对路径字符串
+     */
+    private String projectRoot(String sessionId) {
+        if (sessionId == null || sessionId.isBlank() || com.nexusai.common.SessionKeys.isNoSession(sessionId)) {
+            return projectRootSupplier.get();
+        }
+        return CwdResolution.getProjectRoot(sessionId);
     }
 }

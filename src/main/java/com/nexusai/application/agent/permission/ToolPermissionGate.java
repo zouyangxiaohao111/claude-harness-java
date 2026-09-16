@@ -841,10 +841,13 @@ public class ToolPermissionGate {
             }
         }
         if (permissionUpdatePersister != null) {
-            permissionUpdatePersister.persistAll(updates);
+            // [P11d] 传该工具调用的会话 id：project/local source 落到本会话项目根（读侧
+            //   PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。ctx 可 null（旧测试路径）⇒ null。
+            String sessionId = ctx != null ? ctx.sessionId() : null;
+            permissionUpdatePersister.persistAll(updates, sessionId);
             if (log.isDebugEnabled()) {
-                log.debug("PERMISSION gate A4: updatedPermissions persist 完成 callId={} updates={}",
-                    toolUseId, updates.size());
+                log.debug("PERMISSION gate A4: updatedPermissions persist 完成 callId={} updates={} sessionId={}",
+                    toolUseId, updates.size(), sessionId);
             }
         }
         // CC setAppState 同步 (permissions.ts:448-451)

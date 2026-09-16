@@ -85,7 +85,7 @@ class PermissionUpdatePersisterIncrementalTest {
         persister(projectHome).persist(new PermissionUpdate.AddRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(rule(PermissionBehavior.ALLOW, "Bash", "npm publish:*")),
-            PermissionBehavior.ALLOW));
+            PermissionBehavior.ALLOW), null);
 
         JsonNode root = JSON.readTree(file.toFile());
         JsonNode p = root.path("permissions");
@@ -114,7 +114,7 @@ class PermissionUpdatePersisterIncrementalTest {
         persister(projectHome).persist(new PermissionUpdate.AddRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(rule(PermissionBehavior.ALLOW, "Bash", "npm run test")),
-            PermissionBehavior.ALLOW));
+            PermissionBehavior.ALLOW), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("allow"))
@@ -130,7 +130,7 @@ class PermissionUpdatePersisterIncrementalTest {
         persister(projectHome).persist(new PermissionUpdate.RemoveRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(rule(PermissionBehavior.DENY, "Bash", "rm -rf /*")),
-            PermissionBehavior.DENY));
+            PermissionBehavior.DENY), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("deny")).isEmpty();
@@ -149,7 +149,7 @@ class PermissionUpdatePersisterIncrementalTest {
         persister(projectHome).persist(new PermissionUpdate.ReplaceRules(
             PermissionUpdate.Destination.PROJECT_SETTINGS,
             List.of(rule(PermissionBehavior.ASK, "Write", null)),
-            PermissionBehavior.ASK));
+            PermissionBehavior.ASK), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("ask"))
@@ -167,7 +167,7 @@ class PermissionUpdatePersisterIncrementalTest {
         Path file = writeSettings(projectHome);
 
         persister(projectHome).persist(new PermissionUpdate.SetMode(
-            PermissionUpdate.Destination.PROJECT_SETTINGS, PermissionMode.PLAN));
+            PermissionUpdate.Destination.PROJECT_SETTINGS, PermissionMode.PLAN), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("defaultMode").asText()).isEqualTo("plan");
@@ -188,7 +188,7 @@ class PermissionUpdatePersisterIncrementalTest {
         Path file = writeSettings(projectHome);
 
         persister(projectHome).persist(new PermissionUpdate.SetMode(
-            PermissionUpdate.Destination.PROJECT_SETTINGS, PermissionMode.AUTO));
+            PermissionUpdate.Destination.PROJECT_SETTINGS, PermissionMode.AUTO), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("defaultMode").asText()).isEqualTo("default");
@@ -200,7 +200,7 @@ class PermissionUpdatePersisterIncrementalTest {
         Path file = writeSettings(projectHome);
 
         persister(projectHome).persist(new PermissionUpdate.AddDirectories(
-            PermissionUpdate.Destination.PROJECT_SETTINGS, List.of("/workspace/b")));
+            PermissionUpdate.Destination.PROJECT_SETTINGS, List.of("/workspace/b")), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("additionalDirectories"))
@@ -218,7 +218,7 @@ class PermissionUpdatePersisterIncrementalTest {
         Path file = writeSettings(projectHome);
 
         persister(projectHome).persist(new PermissionUpdate.RemoveDirectories(
-            PermissionUpdate.Destination.PROJECT_SETTINGS, List.of("/workspace/a")));
+            PermissionUpdate.Destination.PROJECT_SETTINGS, List.of("/workspace/a")), null);
 
         JsonNode p = permissions(file);
         assertThat(p.path("additionalDirectories")).isEmpty();
@@ -236,7 +236,7 @@ class PermissionUpdatePersisterIncrementalTest {
         persister(projectHome).persist(new PermissionUpdate.AddRules(
             PermissionUpdate.Destination.SESSION,
             List.of(rule(PermissionBehavior.ALLOW, "Bash", "git status")),
-            PermissionBehavior.ALLOW));
+            PermissionBehavior.ALLOW), null);
 
         assertThat(Files.readString(file)).isEqualTo(before);
     }

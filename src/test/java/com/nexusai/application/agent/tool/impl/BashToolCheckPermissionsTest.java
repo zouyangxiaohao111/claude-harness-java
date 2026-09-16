@@ -314,17 +314,60 @@ class BashToolCheckPermissionsTest {
         //      `mkdir s09`（create inWorkingDir + ACCEPT_EDITS）经 path 约束放行后命中 mode 分支 → Allow(Mode)。
         BashTool tool = new BashTool();
         ToolPermissionContext permCtx = ctx(PermissionMode.ACCEPT_EDITS, Set.of(), Set.of(), Set.of());
+        java.nio.file.Path cleanCwd =
+            java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "nexusai-mode-test");
         ToolUseContext tctx = ToolUseContext.of(AGENT, SESSION, permCtx.mode(),
             List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of(),
             permCtx, permCtx.mode(),
             Map.of(), false, "",
-            java.nio.file.Path.of(System.getProperty("java.io.tmpdir"), "nexusai-mode-test"));
+            cleanCwd);
 
-        PermissionResult result = check(tool, "mkdir s09", tctx);
+        // [P7] 双轴：effectiveCwd（TUC 快照）是轴 A（解析基准）；越界白名单根是轴 B = 会话
+        //   originalCwd 层（CC allWorkingDirectories 首项 getOriginalCwd）。生产两轴同源于同一会话
+        //   绑定 ⇒ 夹具须把轴 B 同时钉到该干净目录，否则轴 B 落测试环境的无会话出口
+        //   （进程 user.dir）⇒ `mkdir s09` 被误判越界（Ask），mode 分支不可达。
+        com.nexusai.application.agent.agent.SessionCwdHolder
+            .setOriginalCwd(SESSION, cleanCwd.toString());
+        PermissionResult result;
+        try {
+            result = check(tool, "mkdir s09", tctx);
+        } finally {
+            com.nexusai.application.agent.agent.SessionCwdHolder.clearOriginalCwd(SESSION);
+        }
 
         assertThat(result).isInstanceOf(PermissionResult.Allow.class);
         assertThat(((PermissionResult.Allow) result).reason())
             .isEqualTo(new PermissionDecisionReason.Mode(PermissionMode.ACCEPT_EDITS));
+    }
+
+    @Test
+    @DisplayName("[P7] 越界白名单根取会话 originalCwd（⛔ 不是 TUC.effectiveCwd 快照）")
+    void pathConstraintWhitelistRootIsSessionOriginalCwd(@TempDir java.nio.file.Path tmp) throws Exception {
+        // WHY（规则九）：生产接线必须把**轴 B**（白名单根）绑到会话 originalCwd 层，而不是复用它
+        //   旁边那个 TUC.effectiveCwd 快照（轴 A）。构造「轴 A 比轴 B 窄」的真实形态 —— bash cd 进
+        //   项目子目录后：轴 A = proj/sub（解析基准）、轴 B = proj（白名单根，cd 不改范围）。
+        //   `cat ../data.txt` 按轴 A 解析 = proj/data.txt，落在轴 B 的 proj 子树内 ⇒ path 约束必须放行。
+        //   反向实验（本断言的唯一硬指标）：把 BashTool 调用点改回以 cwd 充当 whitelistRoot
+        //   ⇒ 该路径判在 proj/sub 之外 ⇒ Ask ⇒ 本用例红。
+        java.nio.file.Path proj = tmp.resolve("proj");
+        java.nio.file.Path sub = proj.resolve("sub");
+        java.nio.file.Files.createDirectories(sub);
+        java.nio.file.Files.writeString(proj.resolve("data.txt"), "x");
+        BashTool tool = new BashTool();
+        ToolPermissionContext permCtx = ctx(PermissionMode.DEFAULT, Set.of(), Set.of(), Set.of());
+        ToolUseContext tctx = ToolUseContext.of(AGENT, SESSION, permCtx.mode(),
+            List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of(),
+            permCtx, permCtx.mode(),
+            Map.of(), false, "", sub);
+        com.nexusai.application.agent.agent.SessionCwdHolder
+            .setOriginalCwd(SESSION, proj.toString());
+        try {
+            assertThat(check(tool, "cat ../data.txt", tctx))
+                .as("白名单根 = 会话 originalCwd（proj）时，proj/data.txt 必须通过 path 约束")
+                .isNotInstanceOf(PermissionResult.Ask.class);
+        } finally {
+            com.nexusai.application.agent.agent.SessionCwdHolder.clearOriginalCwd(SESSION);
+        }
     }
 
     @Test

@@ -157,7 +157,7 @@ class CommandHookExecutorTest {
     /** 构造测试用 executor · fake launcher + 空 env (无 SHELL_PREFIX) + 恒真 pathExists. */
     private CommandHookExecutor newExecutor(FakeHookProcess process) {
         return new CommandHookExecutor(new FakeLauncher(process),
-            k -> null, p -> true, () -> "C:/project", pluginId ->
+            k -> null, p -> true, sid -> "C:/project", pluginId ->
             "C:/Users/test/.claude/plugins/" + pluginId);
     }
 
@@ -419,7 +419,7 @@ class CommandHookExecutorTest {
         FakeHookProcess fake = FakeHookProcess.normal("", "", 0);
         FakeLauncher launcher = new FakeLauncher(fake);
         CommandHookExecutor executor = new CommandHookExecutor(launcher,
-            k -> null, p -> true, () -> "C:/project", id -> "C:/data");
+            k -> null, p -> true, sid -> "C:/project", id -> "C:/data");
 
         executor.execute(command("echo hi", null, null), preToolEvent(), "h", "{}",
             null, null, null, null, false, null,
@@ -435,7 +435,7 @@ class CommandHookExecutorTest {
         FakeHookProcess fake = FakeHookProcess.normal("", "", 0);
         FakeLauncher launcher = new FakeLauncher(fake);
         CommandHookExecutor executor = new CommandHookExecutor(launcher,
-            k -> null, p -> true, () -> "C:/project", id -> "C:/data");
+            k -> null, p -> true, sid -> "C:/project", id -> "C:/data");
 
         executor.execute(command("echo hi", null, null), preToolEvent(), "h", "{}",
             null, null, null, null, false, null);
@@ -747,7 +747,7 @@ class CommandHookExecutorTest {
     @DisplayName("buildEnv: CLAUDE_PROJECT_DIR 恒注入 + skillRoot → CLAUDE_PLUGIN_ROOT (CC :882-926)")
     void buildEnv_projectDirAndSkillRoot() {
         Map<String, String> env = CommandHookExecutor.buildEnv(preToolEvent(), null, null, "C:/skills/s",
-            Function.identity(), () -> "C:/proj", id -> "C:/data", false, null);
+            Function.identity(), sid -> "C:/proj", id -> "C:/data", false, null);
         // 双注入：CC 协议名 + nexusai 命名（同一项目根路径，兼容两类脚本，决策 D1/D6）
         assertThat(env).containsEntry("CLAUDE_PROJECT_DIR", "C:/proj");
         assertThat(env).containsEntry("NEXUSAI_PROJECT_DIR", "C:/proj");
@@ -760,7 +760,7 @@ class CommandHookExecutorTest {
     void buildEnv_claudeEnvFile_onSessionStart() {
         HookEvent sessionStart = HookEvent.sessionStart("s1", null, "startup", null, null);
         Map<String, String> env = CommandHookExecutor.buildEnv(sessionStart, null, null, null,
-            Function.identity(), () -> "C:/proj", id -> "C:/data", false, 0);
+            Function.identity(), sid -> "C:/proj", id -> "C:/data", false, 0);
         assertThat(env.get("CLAUDE_ENV_FILE")).contains("SessionStart-hook-0.sh");
     }
 

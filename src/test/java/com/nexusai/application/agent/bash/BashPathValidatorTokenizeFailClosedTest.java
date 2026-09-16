@@ -100,7 +100,7 @@ class BashPathValidatorTokenizeFailClosedTest {
         // 基线：同一命令在 tokenize 正常时 = Passthrough。
         // 该断言同时钉死夹具有效性——若 BASELINE 不再是 Passthrough，本用例失去鉴别力，
         // 下面的 Ask 断言就不再能证明「Ask 由失败分支产生」。
-        assertThat(BashPathValidator.check(BENIGN_COMMAND, CWD, null))
+        assertThat(BashPathValidator.check(BENIGN_COMMAND, CWD, CWD, null))
             .as("夹具基线：'%s' 在 tokenize 正常时必须 Passthrough，否则本用例无鉴别力",
                 BENIGN_COMMAND)
             .isInstanceOf(PermissionResult.Passthrough.class);
@@ -110,7 +110,7 @@ class BashPathValidatorTokenizeFailClosedTest {
             throw new IllegalStateException("模拟 tokenizer 崩溃");
         };
 
-        PermissionResult r = BashPathValidator.check(BENIGN_COMMAND, CWD, null);
+        PermissionResult r = BashPathValidator.check(BENIGN_COMMAND, CWD, CWD, null);
 
         // 意图断言：不可静态分析的命令必须转人工确认（Ask），而不是被判定「校验通过」。
         // 反向实验：改回 return List.of() → 此处为 Passthrough → 红（实测输出见任务报告）。
@@ -131,9 +131,9 @@ class BashPathValidatorTokenizeFailClosedTest {
     void tokenizeOk_behaviorUnchanged() {
         // WHY: fail-closed 只允许作用于失败分支。若把它做成无条件 ask，正常命令会全部转人工，
         // 属过度收紧（可用性回归）。此用例钉死「正常路径零变化」。
-        assertThat(BashPathValidator.check(BENIGN_COMMAND, CWD, null))
+        assertThat(BashPathValidator.check(BENIGN_COMMAND, CWD, CWD, null))
             .isInstanceOf(PermissionResult.Passthrough.class);
-        assertThat(BashPathValidator.check("echo hi > /dev/null", CWD, null))
+        assertThat(BashPathValidator.check("echo hi > /dev/null", CWD, CWD, null))
             .isInstanceOf(PermissionResult.Passthrough.class);
 
         assertThat(warnMessages())

@@ -320,9 +320,13 @@ public class WorkflowTool implements Tool {
         }
 
         // Step 2: 三源解析 + parseScript 快速校验（CC WorkflowTool.ts:88-107，失败回错误给模型，不进后台）
+        // [P10a · D3] 本处解析出的 projectRoot 是**同链唯一解析点** —— 下面 Step 4 显式下传给
+        //   service.launch（形参），⛔ 不让服务端对同一 sessionId 再解析一次（CC 端此值只解析一次）。
+        String projectRoot;
         ResolvedScript src;
         try {
-            src = resolveScriptSource(launchInput, resolveCwd(ctx));
+            projectRoot = resolveCwd(ctx);
+            src = resolveScriptSource(launchInput, projectRoot);
         } catch (Exception e) {
             log.warn("WorkflowTool 脚本源解析失败：{}（回错误给模型，不进后台，CC WorkflowTool.ts:91-96）", e.getMessage());
             return ToolResult.error(call.id(), "Error: " + e.getMessage());
@@ -353,7 +357,7 @@ public class WorkflowTool implements Tool {
 
         CompletableFuture<LaunchResult> future;
         try {
-            future = service.launch(launchInput, ctx, null);
+            future = service.launch(launchInput, ctx, null, projectRoot);
         } catch (Exception e) {
             log.warn("WorkflowTool.launch 调用同步异常：{}", e.getMessage());
             return ToolResult.error(call.id(), "Error: " + e.getMessage());
@@ -442,12 +446,22 @@ public class WorkflowTool implements Tool {
     }
 
     /**
-     * cwd 解析 · 与 {@code WorkflowServiceImpl.resolveProjectRoot} 同源（memory：session-bound-dir-is-cc-startup-dir）。
-     * 会话绑定项目（sessionId → {@link CwdResolution#getCwd}）；无会话（cron/后台/测试）回落 user.dir。
+     * cwd 解析 · <b>单点</b>：{@link CwdResolution#getProjectRoot(String)}（= CC {@code getProjectRoot()}），
+     * 与 {@code WorkflowServiceImpl} 的 host cwd、{@code WorkflowPortsImpl.defaultRunsDir} 的 journal
+     * 根<b>同槽</b>（CC {@code ports.ts:54-60}：否则进 worktree/子目录后命名 workflow 解析与 journal
+     * 持久化 desync）。
+     *
+     * <p><b>[P10a] 槽纠正</b>：原为 {@link CwdResolution#getCwd}（= CC {@code getCwd()}，bash {@code cd}
+     * 可覆盖），而 journal 根当时读 {@code getOriginalCwdLayer}（= CC {@code getOriginalCwd()}，
+     * worktree 入口会重锚）⇒ 「脚本去哪找」与「运行记录存哪」不同根。
+     *
+     * <p>⚠️ <b>已知未修（登记，非本批范围）</b>：无会话腿仍是裸内联
+     * {@code System.getProperty("user.dir")}，绕过命名出口
+     * {@link CwdResolution#getCwdForNonSession()}（后者批 P5 已加 warn-once ≥WARN）⇒ 这条腿<b>静默</b>。
      */
     private String resolveCwd(ToolUseContext ctx) {
         if (ctx != null && ctx.sessionId() != null) {
-            return CwdResolution.getCwd(ctx.sessionId());
+            return CwdResolution.getProjectRoot(ctx.sessionId());
         }
         return System.getProperty("user.dir");
     }

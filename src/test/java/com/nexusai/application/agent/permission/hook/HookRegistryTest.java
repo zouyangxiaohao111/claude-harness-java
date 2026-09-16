@@ -100,7 +100,7 @@ class HookRegistryTest {
     /** 构造测试用 executor · fake launcher 恒返回给定进程. */
     private static CommandHookExecutor newExecutor(CommandHookExecutorTest.FakeLauncher launcher) {
         return new CommandHookExecutor(launcher,
-            k -> null, p -> true, () -> "C:/project",
+            k -> null, p -> true, sid -> "C:/project",
             pluginId -> "C:/Users/test/.claude/plugins/" + pluginId);
     }
 

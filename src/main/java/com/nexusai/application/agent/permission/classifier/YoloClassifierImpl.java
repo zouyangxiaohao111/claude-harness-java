@@ -371,7 +371,8 @@ public class YoloClassifierImpl implements YoloClassifier {
         }
 
         // system prompt · CC :484-540（buildYoloSystemPrompt；2-stage 另经 replaceOutputFormatWithXml :741-748）
-        String systemPrompt = promptBuilder.buildYoloSystemPrompt();
+        // [P11d] 传 ctx.sessionId()：localSettings 源的 autoMode 规则按本会话项目根解析
+        String systemPrompt = promptBuilder.buildYoloSystemPrompt(ctx != null ? ctx.sessionId() : null);
 
         // 转录（CC :302-360）+ 分桶（CC :1038-1059）· 全量 + 排除 assistant 文本防注入
         List<YoloPromptBuilder.CompactMessage> entries =

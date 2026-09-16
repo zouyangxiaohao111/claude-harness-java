@@ -22,9 +22,10 @@ import java.nio.file.Path;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -88,7 +89,7 @@ class ScheduleControllerCreateDurableTest {
             .andExpect(jsonPath("$.title").value("Validation Failed"))
             .andExpect(jsonPath("$.status").value(400));
 
-        verify(service, never()).create(any());
+        verifyNoInteractions(service);  // [P11a] 双参形态后 never().create(any()) 只盯 1 参重载 ⇒ 改盯整对象
     }
 
     @Test
@@ -116,7 +117,7 @@ class ScheduleControllerCreateDurableTest {
             .andExpect(status().isBadRequest())
             .andExpect(jsonPath("$.title").value("Validation Failed"));
 
-        verify(service, never()).create(any());
+        verifyNoInteractions(service);  // [P11a] 双参形态后 never().create(any()) 只盯 1 参重载 ⇒ 改盯整对象
     }
 
     @Test
@@ -128,7 +129,7 @@ class ScheduleControllerCreateDurableTest {
             .andExpect(status().isBadRequest())
             .andExpect(jsonPath("$.title").value("Validation Failed"));
 
-        verify(service, never()).create(any());
+        verifyNoInteractions(service);  // [P11a] 双参形态后 never().create(any()) 只盯 1 参重载 ⇒ 改盯整对象
     }
 
     @Test
@@ -144,7 +145,7 @@ class ScheduleControllerCreateDurableTest {
             .andExpect(jsonPath("$.title").value("Unresolved Project Root"))
             .andExpect(jsonPath("$.status").value(400));
 
-        verify(service, never()).create(any());
+        verifyNoInteractions(service);  // [P11a] 双参形态后 never().create(any()) 只盯 1 参重载 ⇒ 改盯整对象
     }
 
     @Test
@@ -154,7 +155,7 @@ class ScheduleControllerCreateDurableTest {
         ScheduleDto dto = new ScheduleDto("sch-new", "b-1a", ScheduleKind.cron, "0 9 * * *",
             null, null, "echo", "d", null, null, ScheduleScope.DURABLE,
             "sess-anchor-1", null, projectDir.toString());
-        when(service.create(any(ScheduleCreateRequest.class))).thenReturn(dto);
+        when(service.create(any(ScheduleCreateRequest.class), any())).thenReturn(dto);
 
         mockMvc.perform(post("/api/v1/schedules")
                 .contentType(APPLICATION_JSON)
@@ -164,7 +165,8 @@ class ScheduleControllerCreateDurableTest {
             .andExpect(jsonPath("$.id").value("sch-new"));
 
         ArgumentCaptor<ScheduleCreateRequest> captor = ArgumentCaptor.forClass(ScheduleCreateRequest.class);
-        verify(service).create(captor.capture());
+        // [P11a] DURABLE 走双参形态：第二形参 = Controller 自己刚解析出的锚（服务端值）
+        verify(service).create(captor.capture(), eq(projectDir.toString()));
         // RED（RE-1a-2）：把 controller 改回直接 scheduleService.create(req) ⇒ 本断言拿到 "/etc/evil" ⇒ 红
         assertThat(captor.getValue().boundProject())
             .as("[RE-1a-2] 锚必须来自 sessionId 解析结果，客户端伪造值被覆盖")

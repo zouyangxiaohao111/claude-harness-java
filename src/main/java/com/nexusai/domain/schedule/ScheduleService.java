@@ -191,6 +191,30 @@ public class ScheduleService {
      * {@link #nextAvailableName} 递增后缀处理；REST 路径 name 由调用方提供，重复创建走正常路径。
      */
     public ScheduleDto create(ScheduleCreateRequest req) {
+        return create(req, null);
+    }
+
+    /**
+     * 创建 schedule · <b>上游已解析锚 显式下传</b>（[P11a] 消除同链重复解析）。
+     *
+     * <p><b>为什么有 {@code resolvedProjectRoot} 形参</b>：DURABLE 的任务锚只能来自
+     * 「sessionId → 绑定项目根」的解析。REST 链上 {@code ScheduleController.create} 为了给
+     * 「缺 id / 假 id / 解析不到」三种情况出 400，<b>已经</b>用 {@link SessionProjectRoot#lookup}
+     * 解析过一次；收口前本方法对同一 sessionId 又解析一次并<b>丢弃</b>上游值 ⇒ 同一条链上同一事实
+     * 两个来源（本仓反复栽过的「同一能力两套判据」）。收口后由调用方把<b>它自己刚解析出的锚</b>
+     * 传进来，本方法直接采用。
+     *
+     * <p><b>⛔ 语义边界（不是「把请求字段交回来」）</b>：形参承载的是<b>服务端解析结果</b>
+     * （{@code Lookup#projectRoot()}），<b>不是</b> {@code ScheduleCreateRequest#boundProject()}。
+     * 「客户端伪造锚不被采信」这条约束不因本形参而松动 —— 见 DURABLE 分支的取值注释与
+     * RED（RE-1a-3）配方。
+     *
+     * @param req                 创建请求
+     * @param resolvedProjectRoot 上游（REST 边界）已解析出的项目根；<b>{@code null}/空白 = 本方法自解析</b>
+     *                            （工具链 {@code CronCreateTool} 无会话上下文，保持改造前行为）
+     * @return 落库后的 {@link ScheduleDto}
+     */
+    public ScheduleDto create(ScheduleCreateRequest req, String resolvedProjectRoot) {
         // s14-P1-4: 检查 MAX_JOBS 上限 (对齐 CC CronCreateTool.ts:25 MAX_JOBS=50)
         int currentCount = scheduleMapper.selectAll().size();
         if (currentCount >= MAX_JOBS) {
@@ -269,8 +293,11 @@ public class ScheduleService {
         s.setAgentId(req.agentId());
         // 批次X Q2: DURABLE 任务存 boundProject（创建会话绑定项目）· CC original: 无字段
         // （CC durable 项目锚=文件位置 cronTasks.ts:74-83；Java 全局单表须显式落列 V23）。
-        // [cwd3 · 步骤 1a] 锚的**唯一来源 = sessionId 解析结果**（见下方 DURABLE 分支），
-        // ⛔ 不再透传 req.boundProject()（那让调用方可任意指定项目锚）。
+        // [cwd3 · 步骤 1a] 锚的**唯一合法来源**有二，且**都不是**请求体的 boundProject 字段：
+        //   (1) **上游边界显式下传的已解析锚**（REST：ScheduleController.create 用自己刚解析出的
+        //       lk.projectRoot() 作为第二形参传入）；[P11a] 收口后本类对同一条链**不再重复解析**；
+        //   (2) **本类自解析**（工具链 CronCreateTool 无会话上下文 ⇒ 传 null ⇒ 走下方 lookup）。
+        // ⛔ 绝不透传 req.boundProject()（那让调用方可任意指定项目锚 = 客户端伪造锚）。
         // SESSION 恒 null（其项目锚由 sessionId 恢复路径承载，两路径清晰分离）。
         //
         // [cron-durable-session-fire] DURABLE 的 session_id 语义 = 归属对话/注入目标（非 SESSION 的
@@ -278,16 +305,23 @@ public class ScheduleService {
         // fire 时 CronIdleExecutor 据此判定创建会话存活 → transcript 归创建会话文件；已关 →
         // headless 无 transcript。cleanupBySession 只按 scope=SESSION 过滤（ScheduleService:941），
         // DURABLE 行带 sessionId 不会被误删（生命周期绑定仍归 SESSION）。
-        // [cwd3 · 步骤 1a] DURABLE 项目锚归一取值（sentinel-aware）：
-        //   · 真实会话 id ⇒ 必须能从它解析出绑定项目根，否则抛（锚绝不来自请求体）；
-        //   · null/空白/**哨兵** ⇒ 无锚（bound_project 恒 NULL）—— 这是工具路径
-        //     「无 ctx ⇒ SessionKeys.NO_SESSION」（CronCreateTool）与既有单测的合法形态；
-        //     经 REST 的「无会话 DURABLE」已被 ScheduleController.create 拒掉 ⇒ 不会由此产生。
+        // [cwd3 · 步骤 1a / P11a] DURABLE 项目锚取值（sentinel-aware，三态）：
+        //   · resolvedProjectRoot **非空** ⇒ 上游边界已解析（REST：ScheduleController 自己刚解析
+        //     出的 lk.projectRoot()）⇒ **直接采用，本方法不再 lookup**（[P11a] 消除同链重复解析）；
+        //     ⚠️ 它仍是「服务端解析值」而非「请求字段」—— ⛔ 来源绝不能变成 req.boundProject()。
+        //   · resolvedProjectRoot null/空白 + sessionId 为真实会话 ⇒ 本类自解析（工具链/直调路径）
+        //     ⇒ 必须能解析出绑定项目根，否则抛（fail-loud 语义与改造前逐字一致）；
+        //   · resolvedProjectRoot null/空白 + sessionId null/空白/**哨兵** ⇒ 无锚
+        //     （bound_project 恒 NULL）—— 这是工具路径「无 ctx ⇒ SessionKeys.NO_SESSION」
+        //     （CronCreateTool）与既有单测的合法形态；经 REST 的「无会话 DURABLE」已被
+        //     ScheduleController.create 拒掉 ⇒ 不会由此产生。
         //   ⛔ 不得回写成 s.setBoundProject(req.boundProject())：那正是本批要堵的「客户端伪造锚」。
         //   RED（RE-1a-3）：把 else 分支改回 req.boundProject() ⇒ 「DURABLE+null ⇒ bound_project
         //   恒 NULL」断言翻红（该断言是「无会话 ⇒ 无锚」不变量的守护，不是「不抛」）。
         if (scope == ScheduleScope.DURABLE) {
-            if (sessionId != null && !sessionId.isBlank() && !SessionKeys.isNoSession(sessionId)) {
+            if (resolvedProjectRoot != null && !resolvedProjectRoot.isBlank()) {
+                s.setBoundProject(resolvedProjectRoot);
+            } else if (sessionId != null && !sessionId.isBlank() && !SessionKeys.isNoSession(sessionId)) {
                 SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup(sessionId);
                 if (lk.resolutionFailed() || lk.projectRoot() == null || lk.projectRoot().isBlank()) {
                     log.warn("[Schedule] create() DURABLE 锚解析失败: sessionId={} sessionKnown={} "

@@ -13,6 +13,9 @@ import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.common.SessionKeys;
+import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.infra.exception.UnresolvedProjectRootException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -158,7 +161,17 @@ public class CommandHookExecutor {
     private final ProcessLauncher processLauncher;
     private final Function<String, String> envResolver;
     private final Function<String, Boolean> pathExists;
-    private final Supplier<String> projectRootResolver;
+    /**
+     * CLAUDE_PROJECT_DIR 取值器 · <b>入参 = sessionId，出参 = 项目根</b>。
+     * <p>返回 {@code null} = 调用方选择「不注入」（生产缺省 {@link #resolveSessionProjectRoot(String)}
+     * <b>不</b>走此路 —— 它对数据链路异常态 <b>抛</b>；{@code null} 只剩「注入式测试 resolver 想表达
+     * 不注入」一种来源）。</p>
+     *
+     * <p>[批 P9] 原为 {@code Supplier<String>}（无会话形参）且缺省 = {@code user.dir} ⇒ 生产恒取
+     * {@code defaultProjectRoot()} = 后端启动目录，每个 command hook 的 {@code CLAUDE_PROJECT_DIR}
+     * 都不是会话项目根。现改为按会话解析（缺省 {@link #resolveSessionProjectRoot(String)}）。
+     */
+    private final Function<String, String> projectRootResolver;
     private final Function<String, String> pluginDataDirResolver;
 
     /**
@@ -217,16 +230,21 @@ public class CommandHookExecutor {
      * @param processLauncher      进程启动器 (默认 {@link DefaultProcessLauncher})
      * @param envResolver          env 取值器 (默认 {@link System#getenv})
      * @param pathExists           路径存在判断 (默认 {@link Files#exists})
-     * @param projectRootResolver  CLAUDE_PROJECT_DIR 取值器 (默认 user.dir, CC getProjectRoot)
+     * @param projectRootResolver  CLAUDE_PROJECT_DIR 取值器 · <b>入参 sessionId, 出参项目根</b>
+     *                             （返回 {@code null} = 调用方选择不注入；生产缺省
+     *                             {@link #resolveSessionProjectRoot(String)} 对「本该有却没有」
+     *                             的态 <b>抛</b>，⛔ 不返回 null）；缺省
+     *                             {@link #resolveSessionProjectRoot(String)} = 按会话解析
+     *                             (CC getProjectRoot · hooks.ts:900)。⛔ 不再缺省 user.dir。
      * @param pluginDataDirResolver CLAUDE_PLUGIN_DATA 取值器 (默认 ~/.nexusai/plugins/{id})
      */
     CommandHookExecutor(ProcessLauncher processLauncher, Function<String, String> envResolver,
-                        Function<String, Boolean> pathExists, Supplier<String> projectRootResolver,
+                        Function<String, Boolean> pathExists, Function<String, String> projectRootResolver,
                         Function<String, String> pluginDataDirResolver) {
         this.processLauncher = processLauncher != null ? processLauncher : new DefaultProcessLauncher();
         this.envResolver = envResolver != null ? envResolver : System::getenv;
         this.pathExists = pathExists != null ? pathExists : CommandHookExecutor::defaultPathExists;
-        this.projectRootResolver = projectRootResolver != null ? projectRootResolver : CommandHookExecutor::defaultProjectRoot;
+        this.projectRootResolver = projectRootResolver != null ? projectRootResolver : CommandHookExecutor::resolveSessionProjectRoot;
         this.pluginDataDirResolver = pluginDataDirResolver != null ? pluginDataDirResolver : CommandHookExecutor::defaultPluginDataDir;
     }
 
@@ -1342,22 +1360,38 @@ public class CommandHookExecutor {
     /**
      * 构造 env · 对齐 CC :882-926.
      *
-     * <p>CLAUDE_PROJECT_DIR + NEXUSAI_PROJECT_DIR 恒注入（双注入同一项目根，决策 D1/D6）;
+     * <p>CLAUDE_PROJECT_DIR + NEXUSAI_PROJECT_DIR <b>按会话解析后注入</b>（双注入同一项目根，
+     * 决策 D1/D6）；resolver 返回 {@code null} ⇒ 两键均不注入（[批 P9] 仅注入式测试 resolver 会这样；
+     * 生产缺省 resolver 对「本该有却没有」的态 <b>抛</b>，见 {@link #resolveSessionProjectRoot(String)}）·
+     * ⛔ 绝不回落进程 {@code user.dir} 冒充项目根；
      * pluginRoot → CLAUDE_PLUGIN_ROOT/CLAUDE_PLUGIN_DATA;
      * skillRoot → CLAUDE_PLUGIN_ROOT; 非 PS + SessionStart/Setup/CwdChanged/FileChanged +
      * hookIndex 非 null → CLAUDE_ENV_FILE.
+     *
+     * @param hookEvent     触发事件（{@code sessionId} 为项目根解析的<b>唯一</b>源）
+     * @param projectRootResolver 入参 sessionId, 出参项目根（{@code null} = 不注入）
      */
     public static Map<String, String> buildEnv(HookEvent hookEvent, String pluginRoot, String pluginId,
                                                String skillRoot, Function<String, String> toHookPath,
-                                               Supplier<String> projectRootResolver,
+                                               Function<String, String> projectRootResolver,
                                                Function<String, String> pluginDataDirResolver,
                                                boolean isPowerShell, Integer hookIndex) {
         Map<String, String> env = new HashMap<>();
-        String projectDir = toHookPath.apply(projectRootResolver.get());
-        // 双注入：CLAUDE_PROJECT_DIR 对齐 CC hook env 协议（老 CC 脚本读取）；NEXUSAI_PROJECT_DIR
-        // nexusai 命名（决策 D1/D6 自有根语义），同一路径两键，兼容两类脚本。
-        env.put("CLAUDE_PROJECT_DIR", projectDir);
-        env.put("NEXUSAI_PROJECT_DIR", projectDir);
+        // [批 P9] CLAUDE_PROJECT_DIR = **该会话**的项目根（CC getProjectRoot · hooks.ts:896-900
+        //   「stable project root · not the worktree path」）。sessionId 由 hookEvent 显式携带
+        //   （HookEvent.java:52 · CC core_session_id），进子进程前解析一次随 env 传下去。
+        //   ⛔ 该值**不得**回落进程 user.dir 冒充项目根（原缺陷：恒取 defaultProjectRoot()）。
+        //   resolver 返回 null ⇒ 不注入（[批 P9] 只剩注入式测试 resolver 一种来源；生产缺省 resolver
+        //   对「本该有却没有」抛 UnresolvedProjectRootException，见 resolveSessionProjectRoot）。
+        String sessionId = hookEvent != null ? hookEvent.sessionId() : null;
+        String projectRoot = projectRootResolver.apply(sessionId);
+        if (projectRoot != null) {
+            String projectDir = toHookPath.apply(projectRoot);
+            // 双注入：CLAUDE_PROJECT_DIR 对齐 CC hook env 协议（老 CC 脚本读取）；NEXUSAI_PROJECT_DIR
+            // nexusai 命名（决策 D1/D6 自有根语义），同一路径两键，兼容两类脚本。
+            env.put("CLAUDE_PROJECT_DIR", projectDir);
+            env.put("NEXUSAI_PROJECT_DIR", projectDir);
+        }
         if (pluginRoot != null) {
             env.put("CLAUDE_PLUGIN_ROOT", toHookPath.apply(pluginRoot));
             if (pluginId != null) {
@@ -2244,12 +2278,89 @@ public class CommandHookExecutor {
     }
 
     /**
-     * CLAUDE_PROJECT_DIR env 取值器缺省（CC getProjectRoot state.ts:511-513）·
-     * <b>非 spawn cwd</b>（G14 后 spawn cwd 经 CwdResolution.getCwd 解析，不再走此方法）。
-     * 此处 user.dir 兜底仅用于 CLAUDE_PROJECT_DIR env（项目根域），生产 bean 注入实际 resolver。
+     * CLAUDE_PROJECT_DIR 取值器<b>生产缺省</b> · 按会话解析项目根
+     * （对齐 CC {@code getProjectRoot()} · hooks.ts:900 · state.ts:496-508
+     * 「stable project root · never updated by mid-session EnterWorktreeTool · 用于 project identity」）·
+     * <b>非 spawn cwd</b>（G14 后 spawn cwd 经 {@link #resolveSpawnCwd} 解析，不走本方法）。
+     *
+     * <p><b>为何槽 = {@link SessionProjectRoot}（而非 cwd 家族）</b>：本仓
+     * {@code EnterWorktreeTool} <b>写</b> {@code SessionCwdHolder} 的两个槽
+     * （cwd 槽 {@code EnterWorktreeTool.java:388} · originalCwd 槽 {@code :392}），却只<b>读</b>
+     * {@link SessionProjectRoot}（{@code :450}）⇒ 只有它满足 CC {@code getProjectRoot()} 的
+     * 「worktree 不更新」判据；{@code getCwd} 语义 = CC {@code getCwd()}（bash {@code cd} 可覆盖）、
+     * {@code getOriginalCwdLayer} 语义 = CC {@code getOriginalCwd()}（EnterWorktreeTool <b>会</b>更新）。
+     *
+     * <p><b>四态分流</b>（{@link SessionProjectRoot.Lookup}）：
+     * <ul>
+     *   <li>{@code bound} ⇒ 返回该会话项目根。</li>
+     *   <li>{@code sessionless}（{@code sessionId} null/空白 或 {@link SessionKeys#NO_SESSION} 哨兵）
+     *       ⇒ <b>确无会话</b>：走命名出口 {@link CwdResolution#getOriginalCwdLayerForNonSession()}
+     *       （进程 {@code user.dir}，批 P5 已加 warn-once ≥WARN）+ <b>本处自己再留一条 ≥WARN</b>
+     *       （铁律「不许静默失效」出口 (b)，⛔ 不得 {@code log.debug}）。</li>
+     *   <li>{@code unbound} / {@code unknown} / {@code resolutionFailure} ⇒ <b>数据链路异常</b>
+     *       （本该有却没有）⇒ <b>先 {@code log.error} 留痕（含 {@link #describeLookupFailure} 三态
+     *       可读描述），再抛 {@link UnresolvedProjectRootException}</b>（用户铁律出口 (a)：本该有却
+     *       没有 ⇒ 抛，⛔ 不是「跳过注入」静默吞掉）。⛔ 绝不用 {@code user.dir} 冒充项目根
+     *       （那会让 hook 在错的目录上操作 —— 正是本批要治的病）。</li>
+     * </ul>
+     *
+     * <h2>⚠️ 抛出的<b>真实终点</b>（⛔ 勿读成「会 400」）</h2>
+     * <p>本方法的异常在 hook 域<b>不会</b>冒泡到 REST 边界，<b>也不会</b>打断 hook 链：
+     * {@code HookRegistry:4564 try} → {@code :4574 executeConfiguredCommand} → {@code :4596}
+     * {@code catch (Exception e)} 会把它按 CC {@code hooks.ts:2698-2729}（runHook catch）语义
+     * <b>降级为 {@code NON_BLOCKING_ERROR}</b>：该 hook <b>不运行</b> + 一条
+     * {@code log.warn("配置驱动 hook '...' 执行失败, 视为 non_blocking_error")} + 一个
+     * {@code hookNonBlockingError} attachment（{@code "Failed to run: ..."}）。
+     * <p>⛔ <b>不会</b>到 {@code GlobalExceptionHandler}、<b>不会</b>变 400；⛔ 也<b>不会</b>中断
+     * hook 链。<b>这是 CC 的 hook 失败语义（规则三：严格对齐 CC），本批有意不改它</b>——改造点只到
+     * 「本该有却没有 ⇒ 我们这层抛」，CC 那层怎么处理 hook 失败是 CC 的事。
+     * <p>⇒ 实用收益 = hook 不再带着<b>缺失</b>的 {@code CLAUDE_PROJECT_DIR} 照常运行（脚本
+     * {@code cd $CLAUDE_PROJECT_DIR} 更危险）+ 日志与 attachment 双通道可见。
+     *
+     * @param sessionId 会话 ID（可 null/空白 —— 那是「确无会话」）
+     * @return 会话项目根
+     * @throws UnresolvedProjectRootException 会话存在却解析不出项目根 / 无法判定（fail-loud；
+     *         真实终点见上「抛出的真实终点」段 —— 被 {@code HookRegistry:4596} 降级，⛔ 不是 400）
      */
-    private static String defaultProjectRoot() {
-        return System.getProperty("user.dir", "");
+    private static String resolveSessionProjectRoot(String sessionId) {
+        SessionProjectRoot.Lookup lookup = SessionProjectRoot.lookup(sessionId);
+        String boundProject = lookup.projectRoot();
+        if (boundProject != null) {
+            return boundProject;
+        }
+        if (lookup.sessionless()) {
+            log.warn("[CommandHookExecutor] CLAUDE_PROJECT_DIR 无会话态：hook 事件未携带会话标识"
+                + "（sessionId={}）⇒ 走无会话命名出口（进程 user.dir），⛔ 它不是任何会话的项目根",
+                sessionId);
+            return CwdResolution.getOriginalCwdLayerForNonSession();
+        }
+        // [批 P9 · 用户裁定：本该有却没有 ⇒ 抛（铁律出口 (a)）]
+        //   三态语义（见 describeLookupFailure）：unbound = 会话存在但无绑定项目根 / resolutionFailure
+        //   = 无法判定（装配异常）/ unknown = DB 明确答无此会话 —— 三者**均不该发生**（web 会话必须
+        //   绑定项目才能进行）⇒ ⛔ 不再「跳过注入」静默吞掉，改为 fail-loud 抛。
+        //   ⛔ 仍绝不用进程 user.dir 冒充项目根（那会让 hook 在错的目录上操作 —— 本批要治的病）。
+        //   异常类型复用 {@link UnresolvedProjectRootException}（⛔ 不新造），消息前缀用本类名
+        //   （对齐 PathGuard:283-315 的既有范式：各站点自带前缀直构，CwdResolution 的工厂是 private
+        //   且其消息带 [CwdResolution] 前缀，跨域复用会让日志指向错的类）。
+        String reason = describeLookupFailure(lookup);
+        log.error("[CommandHookExecutor] CLAUDE_PROJECT_DIR 无法解析会话项目根（数据链路异常 ⇒ "
+            + "fail-loud 抛，⛔ 不回落进程 user.dir 冒充项目根）: sessionId={} · {}", sessionId, reason);
+        throw new UnresolvedProjectRootException(
+            "[CommandHookExecutor] 会话 " + sessionId + " 项目根解析失败（数据链路异常 —— web 会话必须"
+                + "绑定项目才能进行）: " + reason
+                + "。请检查 sessions.main_project_id → projects.path；确无会话的调用方请显式走"
+                + " CwdResolution.getOriginalCwdLayerForNonSession()。");
+    }
+
+    /** {@link SessionProjectRoot.Lookup} 失败态的可读描述（用于 log.error 留痕与异常消息）。 */
+    private static String describeLookupFailure(SessionProjectRoot.Lookup lookup) {
+        if (lookup.resolutionFailed()) {
+            return "DB 回源解析器未接线 / 查询抛错 / 违约返回 null = 无法判定";
+        }
+        if (lookup.sessionKnown()) {
+            return "会话存在但无绑定项目根（sessions.main_project_id 为空 / projects.path 失效）";
+        }
+        return "DB 明确答「无此会话」";
     }
 
     /**

@@ -25,7 +25,7 @@ import java.util.UUID;
  * </ul>
  *
  * <p>Java 端 R28-1 改造：querySource 从 RunRequest 必传，不再用 deriveQuerySource 派生。
- * 保留 {@link #deriveFrom(UUID, UUID)} 用于 fallback 兼容。
+ * 保留 {@link #deriveFrom(UUID, String)} 用于 fallback 兼容。
  */
 public enum QuerySource {
     USER,

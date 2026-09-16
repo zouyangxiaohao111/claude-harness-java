@@ -36,9 +36,11 @@ import java.util.Map;
  * 删除判据（{@code dead-code-decision-rule} 两条同时成立，<b>均经实测</b>，故非漏实现）：
  * <ol>
  *   <li><b>0 真实调用方（含测试 / 反射）</b>：在本类之外，{@code src/main/java} +
- *       {@code src/test/java} 对该符号名命中 4 处，<b>全部是 {@code SubagentTool} 的注释</b>
- *       （:2165 / :2171 / :3096 / :3350）；本类内除声明外无其它引用。其旧 javadoc 自陈
- *       「用于监控」<b>不成立</b> —— 没有消费方就没有可观测性。</li>
+ *       {@code src/test/java} 对该符号名命中 <b>5 处</b>，<b>全部是 {@code SubagentTool} 的注释</b>
+ *       （:2168 / :2176 / :3104 / :3361 / :3511。批 P2 更正：原登记「命中 4 处
+ *       :2165 / :2171 / :3096 / :3350」既少数一处、两处行号亦漂移）；本类内亦已无任何引用
+ *       （声明本身已删）。
+ *       其旧 javadoc 自陈「用于监控」<b>不成立</b> —— 没有消费方就没有可观测性。</li>
  *   <li><b>CC 无对应物</b>：{@code claude-code-best/src/utils/worktree.ts:156} 与
  *       {@code Open-ClaudeCode/src/utils/worktree.ts:156} 均为
  *       {@code let currentWorktreeSession: WorktreeSession | null = null} —— <b>单会话模块级
