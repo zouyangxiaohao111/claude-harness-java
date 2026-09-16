@@ -300,7 +300,16 @@ class AutoCompactorCcContractTest {
             .as("notifyCompaction 的 (querySource, agentId) 同源 ccContext")
             .contains("user:agent-1");
         // 会话级隔离语义由 PostCompactionStateCrossSessionTest 覆盖（本用例只验值传递）
-        assertThat(PostCompactionState.isPostCompactionPending("s1")).isTrue();
+        // [G3 改锚] 本用例的 ccContext 是**子代理形**（agentId="agent-1" 非 null ⇒ 非主线程，
+        //   主线程约定为 null，见 ToolUseContext javadoc :402-412）⇒ 按 G3 新契约 markPostCompaction
+        //   对子代理 **no-op**（⛔ 不得把子代理压缩写进父会话 AgentState）
+        //   ⇒ 此处断言从 isTrue() 反转为 isFalse()。
+        //   ⚠️ 原断言「INV-8 markPostCompaction 确被调用」的**主线程**侧覆盖由
+        //   PostCompactionStateTest.markSetsPendingOnAgentState（agentId=null 路径）+
+        //   CompactSubagentSessionStateIsolationG3Test.mainThreadMark_stillSetsParentAgentStateFlag 承担。
+        assertThat(PostCompactionState.isPostCompactionPending("s1"))
+            .as("[G3] 子代理形 agentId ⇒ 不写父会话标记（主线程置位见 PostCompactionStateTest）")
+            .isFalse();
         // setLastSummarizedMessageId 复位（autoCompact.ts:296）
         assertThat(SessionMemoryService.getLastSummarizedMessageId("s1")).isNull();
     }

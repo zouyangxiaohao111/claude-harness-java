@@ -133,7 +133,9 @@ class LlmAgentLoopReactiveCarryoverTest {
             null,                                                                // 32 claudemdEngine
             null,                                                                // 33 modelConfigResolver
             null,                                                                // 34 sdkEventQueue
-            null, null);                                                          // 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null,                                                           // 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null,                                                                // 37 microCompactor（G1）
+            null);                                                               // 38 autoCompactor（G1）
     }
 
     /** 首次调用 PTL(413)，重试（reactive compact 后）返回 stop 纯文本 → 正常完成。 */

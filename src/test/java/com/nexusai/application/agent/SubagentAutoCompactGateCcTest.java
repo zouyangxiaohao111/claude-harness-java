@@ -47,8 +47,31 @@ import static org.mockito.Mockito.when;
  *   <li><b>fork 隔离回归</b> — 子代理（agentId≠sessionId）压缩不破坏主线程行为；主线程
  *       （agentId==sessionId）压缩行为不变。</li>
  * </ol>
+ *
+ * <p><b>⚠️ [G4 消歧 · 必读] 本类是「部件测试」，⛔ 它不覆盖生产接线</b>：
+ * <ol>
+ *   <li><b>压缩器是**当形参注入**的</b>：下面全部用例调
+ *       {@code queryLoop(params, state, uuids, AutoCompactor)} —— 即 <b>4 参 {@code AutoCompactor} 重载</b>
+ *       （测试专用通道）。本类因此只证明「**若给**实例，{@code shouldAutoCompact} 内无 agent 守卫」
+ *       —— 这是一个**正确且有价值的部件结论**（CC {@code autoCompact.ts:160-239} 确无 agent:* 守卫）。</li>
+ *   <li><b>生产子代理走的是另一条重载</b>：{@code SubagentExecutor:4676} 调
+ *       <b>4 参 {@code boolean} 重载</b>（{@code queryLoop(params, state, uuids, skillListingResume)}），
+ *       fork/hook 走 <b>3 参重载</b>；这两条重载的形参 {@code autoCompactor} 恒为 {@code null}，
+ *       实例只能经 {@code AgentLoopContext} 翻包拿到（G1 的派生行）。</li>
+ *   <li>⇒ <b>「生产子代理到底会不会压缩 / 会不会被 blocking 预检硬退」不由本类守护</b>，而由：
+ *       <ul>
+ *         <li>{@link SubagentAutoCompactWiringG1Test} —— 走生产 4 参 {@code boolean} 重载，
+ *             断言压缩器**只从 ctx 分量**下发时子代理超阈**真的发生压缩**（{@code compact_boundary}）；</li>
+ *         <li>{@link SubagentBlockingLimitShieldG4Test} —— 断言子代理超阈**不发生
+ *             {@code BLOCKING_LIMIT} 硬退**（{@code rcOwnsBlocking} 恒真 = 等价 CC 全局判据）。</li>
+ *       </ul>
+ *   </li>
+ *   <li><b>本类的真实教训</b>：曾被读成「本仓子代理会压缩」并写进
+ *       {@code docs/zjkycode/specs/2026-09-14-subagent-compaction-verify-brief.md}，
+ *       而当时生产**不会** —— 本仓铁律「<b>seam 层有守护 ≠ 接线被守护</b>」的实例。</li>
+ * </ol>
  */
-@DisplayName("[IMP2-08] subagent autocompact gate 对齐 CC（移除 !isSubagent 排除，DRIFT-8/S-8）")
+@DisplayName("[IMP2-08] 【部件测试 · 不覆盖生产接线】subagent autocompact gate 对齐 CC：压缩器由形参注入，仅证 shouldAutoCompact 内无 agent 守卫（移除 !isSubagent 排除，DRIFT-8/S-8；生产路径见 SubagentAutoCompactWiringG1Test / SubagentBlockingLimitShieldG4Test）")
 class SubagentAutoCompactGateCcTest {
 
     @AfterEach
@@ -57,7 +80,7 @@ class SubagentAutoCompactGateCcTest {
     }
 
     @Test
-    @DisplayName("子代理（agentId≠sessionId）超阈 → 自动压缩照常执行（CC 无 agent:* 守卫）")
+    @DisplayName("子代理（agentId≠sessionId）超阈 → 自动压缩照常执行（CC 无 agent:* 守卫）【部件级：压缩器为形参注入 · ⛔ 非生产路径，见类 javadoc】")
     void subagentOverLimit_autoCompacts() {
         AgentState state = subagentState();
         appendLargeMessages(state, 50);
@@ -74,7 +97,7 @@ class SubagentAutoCompactGateCcTest {
     }
 
     @Test
-    @DisplayName("fork 子代理（querySource=agent:builtin:fork）超阈 → 压缩照常（fork 隔离回归）")
+    @DisplayName("fork 子代理（querySource=agent:builtin:fork）超阈 → 压缩照常（fork 隔离回归）【部件级：压缩器为形参注入 · ⛔ 非生产路径，见类 javadoc】")
     void forkOverLimit_autoCompacts() {
         AgentState state = subagentState();
         appendLargeMessages(state, 50);
@@ -91,7 +114,7 @@ class SubagentAutoCompactGateCcTest {
     }
 
     @Test
-    @DisplayName("主线程（agentId==sessionId）超阈 → 压缩照常（既有行为不回归）")
+    @DisplayName("主线程（agentId==sessionId）超阈 → 压缩照常（既有行为不回归）【部件级：压缩器为形参注入 · ⛔ 非生产路径，见类 javadoc】")
     void mainThreadOverLimit_autoCompacts() {
         String id = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         AgentState state = new AgentState("sys", id, UUID.randomUUID());
@@ -109,7 +132,7 @@ class SubagentAutoCompactGateCcTest {
     }
 
     @Test
-    @DisplayName("递归守卫: querySource=compact 超阈也不压缩（gate 移除后死锁防护仍在，S-3）")
+    @DisplayName("递归守卫: querySource=compact 超阈也不压缩（gate 移除后死锁防护仍在，S-3）【部件级：压缩器为形参注入 · ⛔ 非生产路径，见类 javadoc】")
     void compactQuerySource_neverCompacts() {
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         appendLargeMessages(state, 50);

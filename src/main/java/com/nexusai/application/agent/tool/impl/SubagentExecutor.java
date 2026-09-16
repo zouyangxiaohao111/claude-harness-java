@@ -4379,6 +4379,30 @@ public class SubagentExecutor {
             //   sink.accept 均不持锁.
             java.util.concurrent.atomic.AtomicReference<String> currentParentUuid =
                 new java.util.concurrent.atomic.AtomicReference<>(lastRecordedUuid);
+            // [G2] 已落转录的 uuid 集合 · 供压缩落盘去重（"只写转录尚未有的消息"，对齐 CC
+            //   runAgent.ts:792-805「Record only the new message with correct parent」）。
+            //   并发集合：StreamingToolExecutor 异步 append 跨线程触发 listener（见上方线程安全约束）。
+            //   两个来源都必须预置（缺任一都会写出重复内容）：
+            //   ① initialMessages 的 "uuid" 键 = **c:2133 批量写入转录时实际落在文件里的 uuid**
+            //      （AgentTranscript.enrichTranscriptMessage 就地回填，且 assignInitialMessageUuids
+            //      幂等不覆盖 ⇒ 二者同值，即文件真值）；
+            //   ② state 现存消息的 id = **DTO id 真值** —— ⚠️ 实测：convertToChatMessageDto
+            //      （本类 :5901）对 user/assistant/tool 三分支**一律 UUID.randomUUID() 新建 id**，
+            //      从不读 map 的 "uuid" ⇒ 初始批的 DTO id 与文件 uuid **不相等**；而压缩落盘回调
+            //      收到的 postCompact 是 **DTO** 列表、只能按 DTO id 去重 ⇒ 只预置 ①（文件 uuid）
+            //      对初始批**结构性不命中**，必须同时预置 ② 才真能挡住重复写入。
+            Set<String> recordedIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+            for (Map<String, Object> m : initialMessages) {
+                Object u = m != null ? m.get("uuid") : null;
+                if (u != null) {
+                    recordedIds.add(String.valueOf(u));
+                }
+            }
+            for (ChatMessageDto m : state.rawMessages()) {
+                if (m != null && m.id() != null) {
+                    recordedIds.add(m.id());
+                }
+            }
             // [IMP-G4 E5] assistant 消息响应长度累计（setResponseLength 通道）· 对齐 CC
             //   AgentTool.tsx:1094-1102 getAssistantMessageContentLength → setResponseLength。
             //   Java setResponseLength 是 Consumer<String>（接收累计长度，StreamCompactSummary :651-652
@@ -4443,6 +4467,11 @@ public class SubagentExecutor {
                 //   recordSidechainTranscript([message], agentId, lastRecordedUuid)
                 recordMessageTranscript(sessionDir, sessionId.toString(), agentIdHex,
                         msg, currentParentUuid.get());
+                // [G2] 登记已落转录的 DTO id → 压缩落盘回调据此跳过「转录已有」的消息（去重）。
+                //   注意顺序：本登记必须在 recordMessageTranscript **之后**（写成功才算已落）。
+                if (msg.id() != null) {
+                    recordedIds.add(msg.id());
+                }
                 // [P1-18] 2 参 toSubagentMessage: 注入 fork agentId + toolContent 判定,
                 //   供 SkillToolImpl.buildForkProgressSink 回填 SkillProgressData.agentId
                 //   (CC SkillTool.ts:256) 与 tool 块过滤 (CC SkillTool.ts:246-248).
@@ -4468,6 +4497,23 @@ public class SubagentExecutor {
                     currentParentUuid.set(msg.id());
                 }
             });
+
+            // ── [G2] 压缩产物落进**子代理自己的** transcript · 对齐 CC runAgent.ts:792-805 ──
+            //   CC 把压缩产物当普通消息 yield 出 query()，子代理侧 isRecordableMessage
+            //   （runAgent.ts:238-246 显式收纳 'system'+subtype==='compact_boundary'，:798）逐条
+            //   recordSidechainTranscript ⇒ 落进**子代理自己的** jsonl。Java 子代理此前只武装
+            //   appendListener（只覆盖 appendMessage 通道），压缩产物经
+            //   AgentState.persistCompactedMessages（独立通道）⇒ 无人落盘 ⇒
+            //   LlmAgentLoop.persistCompactedMessages 恒走 fail-loud「无落库通道」ERROR，
+            //   且下轮 resume 从转录读回**压缩前全量** ⇒ 压缩白做。
+            //   ⛔ 绝不写父会话 DB 表：子代理 boundary 若进父会话表，父会话加载时按「最后一个
+            //   boundary」剪枝（ChatService:1291-1293 + BoundaryReader.findLastCompactBoundaryIndex）
+            //   ⇒ 父真实历史被整段跳过（CC 取 leaf 时显式排除 sidechain，sessionStorage.ts:3900）。
+            //   监听器本体抽到 {@link #compactTranscriptPersistListener}（同实现，零行为变化）——
+            //   目的是让它成为同包测试可直接驱动的 seam（否则该 lambda 在私有方法内，接线只能靠
+            //   全量 run 观测 ⇒ 「工厂/接线是否有守护」缺口，本仓已复现 6 次的同型问题）。
+            armCompactTranscriptPersist(state, sessionDir, sessionId.toString(), agentIdHex,
+                recordedIds, currentParentUuid);
     
             log.info("[SubagentExecutor] [H7-arch Phase 2] queryLoop 启动: agentId={} maxTurns={} initialMsgs={} tools={} model={}",
                     agentId, maxTurns, initialMsgCount, allTools.size(), effectiveModel);
@@ -4781,6 +4827,10 @@ public class SubagentExecutor {
             // [S4-1 流式化] finally 解除 appendListener (防泄漏: 本 state 为子 agent 隔离实例,
             //   不解除则异常/早退路径残留回调引用; 对齐 CC runAgent.ts:816-859 finally 清理).
             state.clearAppendListener();
+            // [G2] 同点解除压缩落盘监听（AgentState.clearCompactPersistListener javadoc:
+            //   "run 收口必调，防泄漏跨 run 复用陈旧 PersistCtx"）—— 本 state 为子 agent 隔离
+            //   实例，但 resume 路径复用同一 state 时不解除会残留指向上一 run 的 sessionDir 闭包。
+            state.clearCompactPersistListener();
             // [P1-6-CLEANUP-1] 子 agent 完成/失败路径释放 invokedSkills (对齐 CC 4 调用方)
             cleanSubagentInvokedSkills(state, agentId);
             // [P2-12 · 2026-09-11] 子 agent 结束点回收 skill_listing 槽位（防进程内无界增长）。
@@ -5293,6 +5343,95 @@ public class SubagentExecutor {
     }
 
     /**
+     * [G2] 武装「压缩产物落子代理自己 transcript」监听器到 {@code state} · <b>接线点唯一入口</b>。
+     *
+     * <p><b>WHY 抽成独立方法（R4 补闭 · 本仓第 7 次「seam 有守护 ≠ 接线被守护」的处置）</b>：
+     * 原实现把 {@code state.setCompactPersistListener(...)} 内联在私有方法
+     * {@code runSubagentQueryLoop} 的 19 步重依赖之后 ⇒ 单测到不了（本仓既有记载：
+     * {@code SubagentExecutorInvokedSkillCleanupTest:22}「runSubagentQueryLoop 依赖 LLM 循环等
+     * 重依赖无法在单测跑全流程」；同型先例 {@code SubagentIdentityProducerTest} 类 javadoc）。
+     * 抽出后「武装动作」可被同包测试直接驱动（行为级）。<b>⚠️ 守护粒度（如实声明）</b>：
+     * 本方法 + 其单测守护的是「**武装动作**」（调用后 {@code state.isCompactPersistArmed()} 为真、
+     * 且经真实派发面 {@code AgentState.persistCompactedMessages} 收到 postCompact 时产物真的落进
+     * 子代理自己的转录）；**不**守护「{@code runSubagentQueryLoop} 是否调用了本方法」——
+     * 后者由源级守卫 {@code SubagentCompactTranscriptPersistG2Test} 承担（该 repo 对
+     * {@code SubagentExecutor} 接线层的既有标准即源级守卫，见 {@code SubagentIdentityProducerTest}）。
+     *
+     * @param state             子代理的 AgentState（武装目标）
+     * @param sessionDir        transcript 根目录
+     * @param sessionId         会话 id
+     * @param agentId           子 agent id（a+16hex）
+     * @param recordedIds       已落转录 id 集（就地写入）
+     * @param currentParentUuid 当前链尾（就地更新）
+     */
+    static void armCompactTranscriptPersist(AgentState state, Path sessionDir, String sessionId,
+                                            String agentId, Set<String> recordedIds,
+                                            java.util.concurrent.atomic.AtomicReference<String> currentParentUuid) {
+        state.setCompactPersistListener(compactTranscriptPersistListener(
+            sessionDir, sessionId, agentId, recordedIds, currentParentUuid));
+    }
+
+    /**
+     * [G2] 压缩产物落进**子代理自己的** transcript 的监听器 · 对齐 CC runAgent.ts:792-805
+     * （压缩产物当普通消息 yield 出 query()，子代理侧 isRecordableMessage:238-246 收纳
+     * {@code 'system'+subtype==='compact_boundary'}，:798-800 逐条 recordSidechainTranscript）。
+     *
+     * <p><b>⛔ 与「复用主代理 compactPersistListener / 写父会话 DB 表」的区别（本批最危险的错路）</b>：
+     * 那些路会**静默截断父会话真实历史** —— 父会话加载时按「最后一个 boundary」剪枝
+     * （{@code ChatService:1291-1293} + {@code BoundaryReader.findLastCompactBoundaryIndex}），
+     * 子代理的 boundary 一旦进父会话表即成为「最后一条」⇒ 父会话下次从子代理那个书签往后读，
+     * 前面整段被跳过。本监听器<b>只</b>写子代理自己的 jsonl（经 {@link #recordMessageTranscript}），
+     * 与父会话 DB 零接触（CC 取 leaf 时亦显式排除 sidechain，sessionStorage.ts:3900）。
+     *
+     * <p><b>去重</b>：{@code recordedIds} = 已落转录的 id 集（appendListener 逐条登记 + 初始批预置）。
+     * 只写「转录尚未有的」消息，对齐 CC "Record only the new message with correct parent"。
+     *
+     * <p><b>boundary 的 {@code parentUuid = null}</b> 是「压缩后成为新链」的关键
+     * （CC sessionStorage.ts:1391-1407 注释逐字 "correct: truncates --continue chain at compact
+     * boundary"）；写完后 {@code currentParentUuid} 置为 boundary 的 id，后续消息挂到它上面。
+     *
+     * <p><b>为什么抽成独立静态方法</b>：原实现是内联在私有方法 {@code runSubagentQueryLoop} 里的
+     * lambda，测试无法驱动 ⇒ 「监听器是否真的落盘 / 是否真的置链头」只能靠全量 run 观测
+     * （= 本仓已复现 6 次的「seam 层有守护 ≠ 接线被守护」缺口）。抽取为同包可见的静态 seam 后，
+     * 行为逐位不变，但可被测试直接 apply() 驱动。
+     *
+     * @param sessionDir        transcript 根目录
+     * @param sessionId         会话 id
+     * @param agentId           子 agent id（a+16hex）
+     * @param recordedIds       已落转录 id 集（就地写入；并发集，跨线程 append 安全）
+     * @param currentParentUuid 当前链尾（就地更新）
+     * @return {@code UnaryOperator} 语义的监听器：返回**入参列表**（无 DB 归一化 ⇒ 内存用压缩后视图替换）
+     */
+    static java.util.function.UnaryOperator<List<ChatMessageDto>> compactTranscriptPersistListener(
+            Path sessionDir, String sessionId, String agentId,
+            Set<String> recordedIds,
+            java.util.concurrent.atomic.AtomicReference<String> currentParentUuid) {
+        return postCompact -> {
+            if (postCompact == null) {
+                return null;
+            }
+            for (ChatMessageDto m : postCompact) {
+                if (m == null || m.id() == null) {
+                    continue;
+                }
+                // 转录已有（appendListener 已写 / 初始批已写）→ 跳过，只写「尚未有的」。
+                if (!recordedIds.add(m.id())) {
+                    continue;
+                }
+                boolean isBoundary =
+                    com.nexusai.application.agent.compact.CompactBoundaryMessage
+                        .SUBTYPE_COMPACT_BOUNDARY.equals(m.subtype());
+                // boundary 显式 parentUuid=null = 新链头；其余消息挂当前链尾。
+                String parentForMsg = isBoundary ? null : currentParentUuid.get();
+                recordMessageTranscript(sessionDir, sessionId, agentId, m, parentForMsg);
+                // 本条写完后成为链尾（CC runAgent.ts:801-802 lastRecordedUuid = message.uuid）。
+                currentParentUuid.set(m.id());
+            }
+            return postCompact;
+        };
+    }
+
+    /**
      * 记录单条消息 transcript（per-message 实时录制）· 对齐 CC runAgent.ts per-message
      * transcript 录制模式 (runAgent.ts:792-805 逐消息 recordSidechainTranscript)。
      *
@@ -5302,19 +5441,27 @@ public class SubagentExecutor {
      * prevUuid=null 无法自链, 必须由调用方携带 lastRecordedUuid 作为本条消息的 parentUuid,
      * 否则 transcript parent chain 断裂 (resume 时消息链重建错乱)。
      *
+     * <p>[G2] 改为 {@code static} + package-private：本方法只用静态依赖（{@code chatMessageToMap}
+     * + {@code AgentTranscript.recordSidechainTranscript} + 静态 log），无实例状态；提升后
+     * {@link #compactTranscriptPersistListener} 才能做成可被同包测试直接驱动的静态 seam
+     * （对齐本类既有「package-private 供同包测试验证」约定，如 {@code injectContentReplacementState}）。
+     *
      * @param sessionDir  transcript 根目录
      * @param sessionId   会话 id
      * @param agentId     子 agent id
      * @param msg         待录制的消息 (id 经 chatMessageToMap 写入 map 的 "uuid" 键)
-     * @param parentUuid  lastRecordedUuid (上一已录制消息的 uuid; null = 链首)
+     * @param parentUuid  lastRecordedUuid (上一已录制消息的 uuid; null = **显式链首**)
      */
-    private void recordMessageTranscript(Path sessionDir, String sessionId, String agentId,
-                                         ChatMessageDto msg, String parentUuid) {
+    static void recordMessageTranscript(Path sessionDir, String sessionId, String agentId,
+                                        ChatMessageDto msg, String parentUuid) {
         List<Map<String, Object>> msgs = new ArrayList<>();
         Map<String, Object> map = chatMessageToMap(msg);
-        if (parentUuid != null) {
-            map.put("parentUuid", parentUuid);
-        }
+        // [G2] parentUuid **无条件**落键（含 null）：null 必须作为「链首」被显式写出，
+        //   否则 AgentTranscript.enrichTranscriptMessage 会把 prevUuid 回填进来，boundary 就无法
+        //   成为新链头（CC sessionStorage.ts:1391-1407 "truncates --continue chain at compact
+        //   boundary" 依赖的正是显式 parentUuid=null）。单条写入路径 startingParentUuid 恒 null
+        //   ⇒ 本改动对既有 appendListener 路径逐位等价（原先「不落键」解析结果同样是 null）。
+        map.put("parentUuid", parentUuid);
         msgs.add(map);
         try {
             AgentTranscript.recordSidechainTranscript(sessionDir, sessionId, agentId, msgs);
@@ -6084,7 +6231,15 @@ public class SubagentExecutor {
         );
     }
 
-    private static Map<String, Object> chatMessageToMap(ChatMessageDto msg) {
+    /**
+     * ChatMessageDto → transcript JSONL map.
+     *
+     * <p>[G2] package-private（原 private）：让同包测试能直接验证「写入侧字段契约」
+     * （subtype / timestamp / compactMetadata / logicalParentUuid / isCompactSummary）——
+     * 这些字段缺失时 boundary 在转录里**认不出来也排不出先后**，而该缺陷只会在运行期静默
+     * 退化成「压缩白做」。对齐本类既有「package-private 供同包测试验证」约定。
+     */
+    static Map<String, Object> chatMessageToMap(ChatMessageDto msg) {
         Map<String, Object> map = new LinkedHashMap<>();
         // [S4-1 差异项 4] 保留消息创建时 uuid · CC 每条 message 自带 uuid (runAgent.ts:745);
         //   transcript 录制时 AgentTranscript.enrichTranscriptMessage 对无 uuid 的消息随机生成
@@ -6118,6 +6273,33 @@ public class SubagentExecutor {
                 map.put("toolCallId", msg.toolCallId());
             }
             map.put("isError", msg.isError());
+        }
+        // ── [G2] 压缩产物可辨识 + 可排序 · 对齐 CC JSONL 消息字段 ──
+        //   WHY（两个字段此前**完全没有**，写了 boundary 也认不出来/排不出先后）：
+        //   ① subtype —— 读侧 isCompactBoundaryMessage（messages.ts:4608）按
+        //      subtype==='compact_boundary' 判别边界；缺该键则 boundary 退化成普通 system 消息。
+        //   ② timestamp —— 读侧「取最新 leaf」（AgentTranscript.findLatestLeaf，对齐
+        //      sessionStorage.ts:2046-2059 findLatestMessage）只能靠它判链头先后；
+        //      缺则压缩前旧链与压缩后新链无法排序 ⇒ 修好 leaf 判据也白修。
+        //   ③ compactMetadata / logicalParentUuid —— CC messages.ts:4540-4553；读侧
+        //      preservedSegment 重挂（logicalParentUuid = 压缩前最后消息 uuid）与元数据可观察性。
+        //   ④ isCompactSummary —— CC messages.ts:465/480（摘要 user 消息标记）。
+        //   惰性写入（null / false 不落键）· 读侧缺省与 CC undefined 同义（非双轨）。
+        if (msg.subtype() != null) {
+            map.put("subtype", msg.subtype());
+        }
+        if (msg.createdAt() != null) {
+            // ISO-8601 带偏移（OffsetDateTime.toString）→ 读侧 OffsetDateTime/Instant 均可解析。
+            map.put("timestamp", msg.createdAt().toString());
+        }
+        if (msg.compactMetadata() != null) {
+            map.put("compactMetadata", msg.compactMetadata());
+        }
+        if (msg.logicalParentUuid() != null) {
+            map.put("logicalParentUuid", msg.logicalParentUuid());
+        }
+        if (msg.isCompactSummary()) {
+            map.put("isCompactSummary", true);
         }
         return map;
     }

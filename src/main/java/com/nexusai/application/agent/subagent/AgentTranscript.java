@@ -10,6 +10,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -279,15 +281,12 @@ public class AgentTranscript {
                 return Optional.empty();
             }
 
-            // find leaf: uuid 非任何 parentUuid (CC :4210-4214)
+            // find leaf: uuid 非任何 parentUuid (CC :4210-4214) → 取**时间最新**者
             Set<String> parentUuids = agentMessages.stream()
                 .map(AgentMessage::parentUuid)
                 .filter(Objects::nonNull)
                 .collect(Collectors.toSet());
-            AgentMessage leaf = agentMessages.stream()
-                .filter(m -> m.uuid() != null && !parentUuids.contains(m.uuid()))
-                .findFirst()
-                .orElse(null);
+            AgentMessage leaf = findLatestLeaf(agentMessages, parentUuids);
             if (leaf == null) {
                 return Optional.empty();
             }
@@ -302,6 +301,82 @@ public class AgentTranscript {
         } catch (Exception e) {
             log.warn("读取 agent transcript 失败 {}: {}", path, e.getMessage());
             return Optional.empty();
+        }
+    }
+
+    /**
+     * 取「时间最新」的 leaf 候选 · 对齐 CC {@code findLatestMessage}
+     * (sessionStorage.ts:4211 调用 / :2046-2059 定义).
+     *
+     * <p><b>CC original</b>: {@code findLatestMessage(agentMessages, msg => !parentUuids.has(msg.uuid))}
+     * —— O(n) 单趟取 {@code Date.parse(msg.timestamp)} 最大者（注释逐字 "Find the most recent leaf
+     * message with this agentId"）。
+     *
+     * <p><b>⛔ 为什么不能沿用「文件序首条」（本批最关键的一处）</b>：转录文件原本只有**一条链**
+     * （每条消息的 parentUuid 指向文件里的上一条），此时「文件序首条 leaf」恰好等于「链尾」。
+     * 但 compaction 落盘的 compact_boundary 的 {@code parentUuid = null}（CC 语义，
+     * sessionStorage.ts:1391-1407 注释逐字 "correct: truncates --continue chain at compact
+     * boundary"）⇒ 写入后文件里**有两条链头** ⇒ 「文件序首条 leaf」会挑中**压缩前**那条旧链尾
+     * ⇒ {@link #buildConversationChain} 从旧链尾反向走 ⇒ resume 重建出**压缩前全量** ⇒ 压缩白做。
+     *
+     * <p><b>无 timestamp 候选的处置（对齐边界，非双轨）</b>：{@link AgentMessage#timestamp()} 为
+     * null/不可解析 = 该条**无时序信息**，一律让位给任何带 timestamp 的候选；仅当**全部**候选都无
+     * timestamp 时才参与（此时取文件序首条 —— 与改动前 {@code findFirst()} 逐位等价，legacy 转录
+     * 零回归）。并列时间戳取**先出现者**（CC {@code t > maxTime} 严格大于语义，逐位对齐）。
+     *
+     * @param agentMessages 该 agent 的 sidechain 消息（文件序）
+     * @param parentUuids   所有消息的 parentUuid 集合（leaf 判据：uuid 不在其中）
+     * @return 最新 leaf；无候选 → null
+     */
+    private static AgentMessage findLatestLeaf(List<AgentMessage> agentMessages, Set<String> parentUuids) {
+        AgentMessage latest = null;
+        long maxTime = Long.MIN_VALUE;
+        boolean hasTimestamped = false;
+        for (AgentMessage m : agentMessages) {
+            if (m.uuid() == null || parentUuids.contains(m.uuid())) {
+                continue;   // 非 leaf 候选（CC predicate: !parentUuids.has(msg.uuid)）
+            }
+            Long t = parseTimestampMillis(m.timestamp());
+            if (t == null) {
+                // 无时序信息：只在「尚无任何带 timestamp 的候选」时占位（文件序首条 = 旧 findFirst 语义）
+                if (!hasTimestamped && latest == null) {
+                    latest = m;
+                }
+                continue;
+            }
+            if (!hasTimestamped || t > maxTime) {
+                latest = m;
+                maxTime = t;
+                hasTimestamped = true;
+            }
+        }
+        return latest;
+    }
+
+    /**
+     * ISO-8601 时间戳 → epoch millis · 对齐 CC {@code Date.parse(msg.timestamp)}
+     * (sessionStorage.ts:2054).
+     *
+     * <p>写入侧形态 = {@code OffsetDateTime.toString()}（{@code SubagentExecutor.chatMessageToMap}），
+     * 解析尝试顺序：带偏移的 ISO（{@code OffsetDateTime}）→ 瞬时形态（{@code Instant}）。
+     * 二者皆失败 → null = 「无时序信息」（调用方按无排序信息处置，⛔ 不抛、不中断读取）。
+     *
+     * @param timestamp 转录节点的 timestamp 字段值（可 null）
+     * @return epoch millis；无/不可解析 → null
+     */
+    private static Long parseTimestampMillis(String timestamp) {
+        if (timestamp == null || timestamp.isBlank()) {
+            return null;
+        }
+        try {
+            return OffsetDateTime.parse(timestamp).toInstant().toEpochMilli();
+        } catch (Exception ignore) {
+            // 非 ISO-offset 形态 → 尝试 ISO 瞬时形态（如 "2026-09-16T14:09:42Z"）
+        }
+        try {
+            return Instant.parse(timestamp).toEpochMilli();
+        } catch (Exception ignore) {
+            return null;
         }
     }
 
@@ -377,6 +452,10 @@ public class AgentTranscript {
             ? node.path("parentUuid").asText() : null;
         String toolCallId = node.has("toolCallId") && !node.get("toolCallId").isNull()
             ? node.path("toolCallId").asText() : null;
+        // [G2] 时间戳 · CC original: msg.timestamp（sessionStorage.ts:2046-2059 findLatestMessage
+        //   以 Date.parse(msg.timestamp) 判「最新 leaf」）。缺失/非字符串 → null（无排序信息）。
+        String timestamp = node.has("timestamp") && !node.get("timestamp").isNull()
+            ? node.path("timestamp").asText(null) : null;
         List<AgentMessage.ToolCallInfo> toolCalls = new ArrayList<>();
         JsonNode tcs = node.path("toolCalls");
         if (tcs.isArray()) {
@@ -389,7 +468,7 @@ public class AgentTranscript {
             }
         }
         return new AgentMessage(role, content, isApiError, agentId, isSidechain,
-            uuid, parentUuid, toolCalls, toolCallId);
+            uuid, parentUuid, toolCalls, toolCallId, timestamp);
     }
 
     /**

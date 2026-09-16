@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AbortController;
 
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer; // [批 5a] 仅 javadoc 引用（载体已删）
@@ -48,8 +49,30 @@ public final class CompactProgressState {
     /** STOMP topic 后缀 · 前端订阅点（收到 compact_start 转圈 / compact_progress 走条 / compact_end 收起）。 */
     public static final String TOPIC_SUFFIX = "/compact-progress";
 
-    /** 会话级在飞压缩 AbortController · 跨线程（前端 cancel）abort 用。 */
+    /**
+     * 在飞压缩 AbortController · 跨线程（前端 cancel）abort 用。
+     *
+     * <p><b>[G3] 键从 {@code sessionId} 升级为 {@code (sessionId, agentId)} 双元</b>：
+     * <b>子代理的 sessionId 就是父会话的 sessionId</b>（{@code SubagentExecutor} 探查 :4291/:4309）
+     * ⇒ 单键时子代理压缩与父会话压缩落**同一个槽** ⇒ 后写者覆盖前写者，且 {@code finally} 的
+     * remove 会**误删对方仍在飞的槽** ⇒ 父会话按 Esc → {@link #abortForSession} 恒 false ⇒
+     * <b>静默失效</b>（用户以为停了，其实没停）。
+     *
+     * <p>CC 无对应物（CC 用 {@code context.abortController} = per-invocation 实例，REPL.tsx 持
+     * React state，没有「按 id 查表」这一跳）—— 本键是本仓为 Web 多会话/子代理并发自造的。
+     */
     private static final ConcurrentMap<String, AbortController> sessionAborts = new ConcurrentHashMap<>();
+
+    /** [G3] 键分隔符（sessionId 形如 {@code sess-xxxxxxxx}、agentId 为 UUID ⇒ 无碰撞面；分隔符防前缀误配）。 */
+    private static final String KEY_SEP = "|";
+    /** [G3] 主线程后缀：agentId 为 null/空白 ⇒ 主线程（对齐本仓「主线程 agentId=null」约定）。 */
+    private static final String MAIN_THREAD_AGENT = "";
+
+    /** [G3] 复合键 · {@code sessionId|agentId}（agentId null/空白 → 主线程后缀）。 */
+    private static String key(String sessionId, String agentId) {
+        return sessionId + KEY_SEP
+            + (agentId == null || agentId.isBlank() ? MAIN_THREAD_AGENT : agentId);
+    }
 
     private CompactProgressState() { /* 工具类不可实例化 */ }
 
@@ -71,37 +94,72 @@ public final class CompactProgressState {
     //   PartialCompactService / ToolRegistrationConfig manual 三路显式赋值）。
     //   StreamCompactSummary 消费侧经 `summarize(…, ctx)` 读取，⛔ 不再有 ThreadLocal 回放。
 
-    /** 会话级登记在飞压缩 AbortController · 供前端 cancel（跨线程 abort）。 */
-    public static void registerSessionAbort(String sessionId, AbortController abortController) {
+    /**
+     * 登记在飞压缩 AbortController · 供前端 cancel（跨线程 abort）。
+     *
+     * @param sessionId  会话 ID
+     * @param agentId    agent ID（null/空白 = 主线程；子代理传 {@code state.agentId()} 的字符串形）
+     * @param abortController 本次压缩的摘要中断源
+     */
+    public static void registerSessionAbort(String sessionId, String agentId, AbortController abortController) {
         if (sessionId != null && abortController != null) {
-            sessionAborts.put(sessionId, abortController);
+            sessionAborts.put(key(sessionId, agentId), abortController);
         }
     }
 
-    /** 移除会话在飞压缩 AbortController（压缩 finally；幂等）。 */
-    public static void removeSessionAbort(String sessionId) {
-        if (sessionId != null) {
-            sessionAborts.remove(sessionId);
-        }
+    /** 兼容重载 · 主线程（agentId=null）语义，与 [G3] 升级前逐字一致（仅测试/非 loop 路径使用）。 */
+    public static void registerSessionAbort(String sessionId, AbortController abortController) {
+        registerSessionAbort(sessionId, null, abortController);
     }
 
     /**
-     * 会话级 abort 在飞压缩 · 由 cancelSession（前端停止键/Esc → POST /sessions/{id}/cancel）
-     * 调用。压缩中 → abort('user_cancel')（StreamCompactSummary provider 硬断流）；
-     * 无在飞压缩 → false（cancelSession 仅处理 AgentState，行为不回归）。
+     * 移除**本调用方自己那个**在飞压缩 AbortController（压缩 finally；幂等）。
      *
-     * @return true 实际 abort 了在飞压缩
+     * <p><b>⭐ [G3] 必须按自己的键删</b>：这是消灭「父子互相误删」的关键 —— 旧实现按 sessionId
+     * 删单槽，子代理的 finally 会把父会话仍在飞的槽一起删掉（反之亦然）。
+     *
+     * @param sessionId 会话 ID
+     * @param agentId   agent ID（须与本调用方 {@link #registerSessionAbort} 传入的一致；null/空白 = 主线程）
+     */
+    public static void removeSessionAbort(String sessionId, String agentId) {
+        if (sessionId != null) {
+            sessionAborts.remove(key(sessionId, agentId));
+        }
+    }
+
+    /** 兼容重载 · 主线程键（与升级前「按 sessionId 删单槽」在仅主线程注册时逐字等价）。 */
+    public static void removeSessionAbort(String sessionId) {
+        removeSessionAbort(sessionId, null);
+    }
+
+    /**
+     * 会话级 abort **该会话一切**在飞压缩（含子代理）· 由 cancelSession（前端停止键/Esc →
+     * POST /sessions/{id}/cancel）调用。压缩中 → abort('user_cancel')（StreamCompactSummary
+     * provider 硬断流）；无在飞压缩 → false（cancelSession 仅处理 AgentState，行为不回归）。
+     *
+     * <p><b>[G3] 语义 = 停这个会话「一切」在飞压缩</b>（父 + 各子代理，键前缀匹配遍历）——
+     * 用户按停止就是要停整棵树，故签名保持 {@code String}（{@code ChatService:1969} 不改）。
+     * 任一命中且真正 abort 了 → true。
+     *
+     * @return true 实际 abort 了至少一个在飞压缩
      */
     public static boolean abortForSession(String sessionId) {
         if (sessionId == null) {
             return false;
         }
-        AbortController ac = sessionAborts.get(sessionId);
-        if (ac != null && !ac.isCancelled()) {
-            ac.abort("user_cancel");
-            return true;
+        final String prefix = sessionId + KEY_SEP;
+        boolean aborted = false;
+        for (Map.Entry<String, AbortController> entry : sessionAborts.entrySet()) {
+            if (!entry.getKey().startsWith(prefix)) {
+                continue;
+            }
+            AbortController ac = entry.getValue();
+            if (ac != null && !ac.isCancelled()) {
+                ac.abort("user_cancel");
+                aborted = true;
+            }
         }
-        return false;
+        return aborted;
     }
 
     /** 会话压缩进度 topic · {@code /topic/sessions/{sessionId}/compact-progress}。 */

@@ -426,7 +426,8 @@ public class PartialCompactService {
             //   成对；三路必达：成功 / 业务失败(400/404) / 异常）。幂等，未注册也安全。
             //   [批 5a] clear/clearAbort（两个 ThreadLocal）已删 —— 进度 sink 与摘要断流源随 ccCtx
             //   引用生命周期回收；仅会话级 abort 槽位仍需显式移除。
-            CompactProgressState.removeSessionAbort(sessionId);
+            // [G3] 同上：主线程键（只删自己那个键 —— 不再可能误删子代理/他路仍在飞的槽）。
+            CompactProgressState.removeSessionAbort(sessionId, null);
             if (log.isDebugEnabled()) {
                 log.debug("[PartialCompact] 压缩进度通道已清理: sessionId={}（会话级 abort 槽位移除）",
                     sessionId);
@@ -479,7 +480,9 @@ public class PartialCompactService {
         // 会话级 abort 恒注册（与 wsTemplate 无关；manual 路径同样无条件注册）。
         // [批 5a] 线程级 abort（原 registerAbort 的 ThreadLocal）已删 —— 摘要断流源现经
         //   ccCtx.setAbortController（buildContext :632）显式携带。
-        CompactProgressState.registerSessionAbort(sessionId, compactAbort);
+        // [G3] agentId 显式传 null = **主线程**（REST /partial-compact 无 agent 参数，恒主线程语义；
+        //   与 loop 侧「主线程 state.agentId()==null」同一归一化 ⇒ 主线程键一致，行为与升级前一致）。
+        CompactProgressState.registerSessionAbort(sessionId, null, compactAbort);
         if (progressSink == null) {
             // fail loud（规则十二）：非 STOMP 路径跳过的是「推送」，不是「压缩」——不能静默。
             log.warn("[PartialCompact] wsTemplate/sessionId 缺失 → partial 压缩进度不推前端"

@@ -2595,7 +2595,9 @@ public class ToolRegistrationConfig {
         //   装箱进 ccCtx.abortController（[批 5a]，原 registerAbort 的 ThreadLocal 已删）。
         //   finally removeSessionAbort（成对防泄漏）。对齐 CC 压缩中 Esc → abortController
         //   → provider 断流 → 'Compaction canceled.'（compact.ts:126-127）。
-        com.nexusai.application.agent.compact.CompactProgressState.registerSessionAbort(sessionId, compactAbort);
+        // [G3] agentId = 本方法已就绪的局部量（:2515 由 state.agentId() 派生；主线程 state 为 null）。
+        com.nexusai.application.agent.compact.CompactProgressState.registerSessionAbort(
+            sessionId, agentId, compactAbort);
         try {
             CompactCommand.CompactCommandResult result = CompactCommand.call(args, ctx);
             // [compact-cost] manual /compact 那次 LLM 调用的 usage → 会话成本/用量合计
@@ -2649,7 +2651,8 @@ public class ToolRegistrationConfig {
             // [批 5a] 进度 sink / 摘要断流源无 ThreadLocal 槽位需清（原 clear()/clearAbort() 已删）——
             //   两者随 ccCtx 引用生命周期回收。
             // [可中断] 会话级在飞压缩登记清理（register 成对；幂等）
-            com.nexusai.application.agent.compact.CompactProgressState.removeSessionAbort(sessionId);
+            // [G3] 同一 agentId（只删自己那个键）。
+            com.nexusai.application.agent.compact.CompactProgressState.removeSessionAbort(sessionId, agentId);
             // [RES-C2] R5-4：manual provider 生命周期终结（close 幂等）
             manualProvider.close();
         }

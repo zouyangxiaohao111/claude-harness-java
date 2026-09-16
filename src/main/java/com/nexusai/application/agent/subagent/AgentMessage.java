@@ -33,10 +33,34 @@ public record AgentMessage(
     String uuid,         // CC original: msg.uuid (sessionStorage.ts:4210)
     String parentUuid,   // CC original: msg.parentUuid (sessionStorage.ts:2069)
     List<ToolCallInfo> toolCalls, // CC original: tool_use blocks (messages.ts:2795)
-    String toolCallId    // CC original: tool_result.tool_use_id (runAgent.ts:875)
+    String toolCallId,   // CC original: tool_result.tool_use_id (runAgent.ts:875)
+    // [G2] 转录节点的 ISO-8601 时间戳 · CC original: msg.timestamp (sessionStorage.ts:2046-2059
+    //   findLatestMessage 以 Date.parse(msg.timestamp) 取「最新 leaf」)。
+    //   WHY 需要：compact_boundary 的 parentUuid=null（CC :1391-1407「truncates --continue chain
+    //   at compact boundary」）⇒ 压缩后文件里存在**两条链头**，「取最新 leaf」只能靠时间戳判先后。
+    //   null = 该条无时间信息（legacy 转录 / 非 chatMessageToMap 写入的消息）。
+    String timestamp
 ) {
     /** CC original: tool_use 块 id/name/input (messages.ts:2795 block.id / block.name). */
     public record ToolCallInfo(String id, String name, String arguments) {}
+
+    /**
+     * 9 参兼容构造器（timestamp 默认 null）· 与 [S5 P0] 扩展前的分量逐位同构。
+     *
+     * <p>⛔ 保留理由：{@code new AgentMessage(...)} 的既有调用方 12 处全为 9 实参
+     * （{@code MessageFilters:224} + {@code AgentSummaryServiceIntegrationTest} 6 处 +
+     * {@code AgentTranscriptReadTest} 4 处，python 括号匹配实测），其中 10 处在**本批领地之外**
+     * 的测试文件 ⇒ 无本构造器则本批改动会牵动领地外文件（越界）。
+     * 读侧合并（{@code MessageFilters.filterMessages} 相邻 user 合并）经本构造器重建消息 →
+     * timestamp=null（该值只服务「取最新 leaf」，而 leaf 判定发生在合并**之前**的原始解析集上，
+     * 故合并丢 timestamp 不影响 leaf 选择）。
+     */
+    public AgentMessage(String role, String content, boolean isApiError, String agentId,
+                        boolean isSidechain, String uuid, String parentUuid,
+                        List<ToolCallInfo> toolCalls, String toolCallId) {
+        this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
+            toolCalls, toolCallId, null);
+    }
 
     public static AgentMessage of(String role, String content) {
         return new AgentMessage(role, content, false, null, false, null, null, List.of(), null);

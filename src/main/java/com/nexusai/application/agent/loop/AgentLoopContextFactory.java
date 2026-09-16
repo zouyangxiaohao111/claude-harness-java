@@ -4,8 +4,10 @@ import com.nexusai.application.agent.CommandLifecycleNotifier;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.api.PromptSuggestion;
 import com.nexusai.application.agent.api.SpeculationEngine;
+import com.nexusai.application.agent.compact.AutoCompactor;
 import com.nexusai.application.agent.compact.CompactConstants;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
+import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.TokenEstimator;
 import com.nexusai.application.agent.diff.TraceRecorder;
@@ -143,6 +145,11 @@ public class AgentLoopContextFactory {
     @Autowired(required = false) private ModelMapper modelMapper;
     @Autowired(required = false) private ProviderMapper providerMapper;
     @Autowired(required = false) private CompactThresholdSystem compactThresholdSystem;
+    // [G1 接线] 压缩器进 AgentLoopContext 工具包 —— 子代理 / fork / hook 三路的 ctx 均出自本工厂，
+    //   故此处装配一次即三路共享（三路 queryLoop 形参恒传 null，靠 queryLoop 内的「形参优先，为空
+    //   则翻包」派生拿到实例）。required=false：单测 / 非 Spring 场景无 bean → null → 等价接线前。
+    @Autowired(required = false) private AutoCompactor autoCompactor;
+    @Autowired(required = false) private MicroCompactor microCompactor;
     @Autowired(required = false) private ApplicationEventPublisher eventPublisher;
     @Autowired(required = false) private TraceRecorder traceRecorder;
     @Autowired(required = false) private PermissionContextBuilder permissionContextBuilder;
@@ -269,6 +276,22 @@ public class AgentLoopContextFactory {
      */
     public void setQueueEventPublisher(com.nexusai.application.agent.tasks.QueueEventPublisher queueEventPublisher) {
         this.queueEventPublisher = queueEventPublisher;
+    }
+
+    /**
+     * [G1] 测试 / 非 Spring 场景注入 AutoCompactor（生产由 Spring @Autowired 字段注入，见本类
+     * {@code autoCompactor} 字段）。⛔ <b>存在的唯一理由 = 让 G1 的「工厂 → ctx」那一环可被守护</b>：
+     * {@code SubagentAutoCompactWiringG1Test} 必须能经本工厂装配出 ctx 并断言
+     * {@code ctx.autoCompactor()} 非 null —— 否则「工厂是否把压缩器装进 ctx」零守护，
+     * 有人把构造点改回 {@code null} 时生产子代理静默退回 blocking 硬退 bug 而测试全绿。
+     */
+    public void setAutoCompactor(AutoCompactor autoCompactor) {
+        this.autoCompactor = autoCompactor;
+    }
+
+    /** [G1] 测试 / 非 Spring 场景注入 MicroCompactor（同 {@link #setAutoCompactor}）。 */
+    public void setMicroCompactor(MicroCompactor microCompactor) {
+        this.microCompactor = microCompactor;
     }
 
     /**
@@ -426,7 +449,10 @@ public class AgentLoopContextFactory {
             modelConfigResolver,
             sdkEventQueue,
             queueEventPublisher,
-            modelCostCalculator);
+            modelCostCalculator,
+            // [G1 接线] 顺序必须与 record 分量顺序一致（microCompactor 在前、autoCompactor 在后）。
+            microCompactor,
+            autoCompactor);
     }
 
     /**

@@ -182,7 +182,8 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
             null, null, null, null, null, null, null, null, // 12-19 transientErrorHandler..streamUserMessageId
             FeatureFlags.ALL_DISABLED,                      // 20 featureFlags
             null, null, null, null, null, null, null, null, // 21-28 reactiveCompactor..permissionContextBuilder
-            null, null, null, null, null, null, null, null);  // 29-34 promptSuggestion..sdkEventQueue · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null, null, null, null, null, null, null,  // 29-34 promptSuggestion..sdkEventQueue · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null);  // 37 microCompactor · 38 autoCompactor（G1）
     }
 
     private static ChatMessageDto message(String id, Role role, String content) {

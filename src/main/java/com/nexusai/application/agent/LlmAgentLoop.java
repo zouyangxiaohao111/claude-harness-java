@@ -3912,6 +3912,12 @@ public class LlmAgentLoop implements AgentLoop {
         //   （审计 C3 死字段陷阱，WF-B-UN-2），已在本专项补填。
         long loopStartTime = System.currentTimeMillis();
         AgentLoopContext ctx = params.deps().context();
+        // [G1] 接线：形参优先，为空则从 ctx 的工具包取（子代理/fork/hook 三路的唯一来源）。
+        //      既有单测走 3 参/4 参重载 ⇒ 形参 null 且 TestContexts 的 ctx 分量也是 null ⇒ 行为零变化。
+        com.nexusai.application.agent.compact.AutoCompactor effectiveAutoCompactor =
+            autoCompactor != null ? autoCompactor : ctx.autoCompactor();
+        com.nexusai.application.agent.compact.MicroCompactor effectiveMicroCompactor =
+            microCompactor != null ? microCompactor : ctx.microCompactor();
         if (log.isInfoEnabled()) {
             log.info("[queryLoop] 入口: querySource={} isMainLoop={} model={} turn={}",
                 params.querySource(), params.deps().isMainLoop(), params.modelName(), state.turnCount());
@@ -3977,7 +3983,7 @@ public class LlmAgentLoop implements AgentLoop {
         // [U2 · R1] pdfProcessor 透传（null = 无 PDF 注入）· 统一队列 drain prompt 路径 PDF blocks 注入。
         // [mid-turn-align] injectedQueuedMessages 透传（null = 非主循环 → loop() 跳过镜像写，成功路径
         //   仍经 state.injectedQueuedMessages() 补落库）。
-        AgentState finalState = loop(ctx, params, state, consumedCommandUuids, autoCompactor, autoCompactTracking, microCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, 0, false, /*stopHookBlockingReentries=*/0, /*suppressTurnZeroDrain=*/false, skillListingResume);
+        AgentState finalState = loop(ctx, params, state, consumedCommandUuids, effectiveAutoCompactor, autoCompactTracking, effectiveMicroCompactor, settingsResolver, countTokensClient, imageStore, pdfProcessor, injectedQueuedMessages, 0, false, /*stopHookBlockingReentries=*/0, /*suppressTurnZeroDrain=*/false, skillListingResume);
         boolean aborted = finalState != null
             && AgentState.ExitReason.ABORTED.equals(finalState.exitReason());
         // [R-A3] 开始-结束时间差 · 对齐 CC agentToolUtils.ts:352 Date.now() - startTime。
@@ -5731,7 +5737,9 @@ public class LlmAgentLoop implements AgentLoop {
                     && autoCompactAbort != com.nexusai.application.agent.tool.AbortController.NOOP;
                 if (autoCompactAbortRegistered) {
                     com.nexusai.application.agent.compact.CompactProgressState
-                        .registerSessionAbort(state.sessionId(), autoCompactAbort);
+                        .registerSessionAbort(state.sessionId(),
+                            state.agentId() != null ? state.agentId().toString() : null,
+                            autoCompactAbort);
                     if (log.isDebugEnabled()) {
                         log.debug("[auto-compact 可中断] 会话级 Esc 桥已注册: sessionId={} abort={}",
                             state.sessionId(), autoCompactAbort);
@@ -5859,7 +5867,8 @@ public class LlmAgentLoop implements AgentLoop {
                     //   —— 摘要断流源与 fork 参数现随 ccCtx 的引用生命周期回收，无需显式清槽。
                     if (autoCompactAbortRegistered) {
                         com.nexusai.application.agent.compact.CompactProgressState
-                            .removeSessionAbort(state.sessionId());
+                            .removeSessionAbort(state.sessionId(),
+                                state.agentId() != null ? state.agentId().toString() : null);
                     }
                 }
             }
@@ -6263,6 +6272,8 @@ public class LlmAgentLoop implements AgentLoop {
             //   REACTIVE_COMPACT feature 门 + DISABLE_COMPACT env/DB 一票否决 + DB
             //   settings.reactive_compact_enabled 覆盖），对齐 CC query.ts:632-635
             //   `reactiveCompact?.isReactiveCompactEnabled() && isAutoCompactEnabled()`。
+            // [G1] 本行 `autoCompactor != null` 在 G1 接线后生产恒为真 ⇒ 等价于 CC query.ts:633 的全局
+            //      isAutoCompactEnabled()（autoCompact.ts:147-158，无实例门）。测试路径仍 null ⇒ 保持 null-safe。
             boolean rcOwnsBlocking = ctx.reactiveCompactor() != null
                 && ctx.reactiveCompactor().isReactiveCompactEnabled()
                 && autoCompactor != null && autoCompactor.isAutoCompactEnabled();
@@ -7412,7 +7423,9 @@ public class LlmAgentLoop implements AgentLoop {
                             // [批 5a] 摘要断流源改由 ccCtx.setAbortController 显式携带（见 auto 块），
                             //   本块只保留会话级登记。
                             com.nexusai.application.agent.compact.CompactProgressState
-                                .registerSessionAbort(state.sessionId(), reactiveCompactAbort);
+                                .registerSessionAbort(state.sessionId(),
+                                    state.agentId() != null ? state.agentId().toString() : null,
+                                    reactiveCompactAbort);
                             if (log.isDebugEnabled()) {
                                 log.debug("[reactive-compact 可中断] 会话级 Esc 桥已注册: "
                                     + "sessionId={} abort={}", state.sessionId(), reactiveCompactAbort);
@@ -7501,7 +7514,8 @@ public class LlmAgentLoop implements AgentLoop {
                             //   remove 会误删另一线程为同一会话注册的在飞压缩槽）。幂等。
                             if (reactiveCompactAbortRegistered) {
                                 com.nexusai.application.agent.compact.CompactProgressState
-                                    .removeSessionAbort(state.sessionId());
+                                    .removeSessionAbort(state.sessionId(),
+                                        state.agentId() != null ? state.agentId().toString() : null);
                             }
                         }
                         // 恢复失败 → surface + STOP_FAILURE + 跳过 stop pipeline · CC query.ts:1168-1182

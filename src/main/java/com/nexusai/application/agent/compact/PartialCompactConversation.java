@@ -518,7 +518,8 @@ public final class PartialCompactConversation {
 
             // ── 20. notifyCompaction + markPostCompaction + reAppendSessionMetadata（compact.ts:1047-1057）──
             ctx.getNotifyCompaction().run();
-            PostCompactionState.markPostCompaction(ctx.getSessionId());
+            // [G3] 传 ctx 的 agentId（REST partial 路径 = 哨兵 "main" ⇒ 按主线程处理，行为不变）。
+            PostCompactionState.markPostCompaction(ctx.getSessionId(), ctx.getAgentId());
             CompactConversation.reAppendSessionMetadata(ctx);
 
             // ── 21. hooks_start: post_compact（compact.ts:1065-1075）──

@@ -202,7 +202,8 @@ class LlmAgentLoopEffortCcTest {
             factory, null, null, null, null, null, null, null, null,
             FeatureFlags.ALL_DISABLED,
             null, null, null, null, null, null, null, null, null, null, null, null,
-            null, null, null, null);  // 33 modelConfigResolver · 34 sdkEventQueue · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null, null, null,   // 33 modelConfigResolver · 34 sdkEventQueue · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null);  // 37 microCompactor · 38 autoCompactor（G1）
     }
 
     private static ChatMessageDto message(String id, Role role, String content,

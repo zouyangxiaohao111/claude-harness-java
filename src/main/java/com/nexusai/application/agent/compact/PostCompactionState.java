@@ -183,8 +183,29 @@ public final class PostCompactionState {
      *
      * @param sessionId 会话 ID（null / blank / registry 未接线 / 归一化后未注册 →
      *                  回落 {@link #fallbackPendingBySession} 的对应会话桶（无会话 → 无会话桶）；任一格式经 ChatService.parseSessionUuid 归一化命中注册会话）
+     * @param agentId   [G3] agent ID（字符串形）。主线程（{@code null}/空白/哨兵 {@code "main"}）→
+     *                  写会话级 AgentState（与升级前逐字一致）；**子代理** → no-op（⛔ 不污染父会话标记，
+     *                  详见方法体 WHY）
      */
-    public static void markPostCompaction(String sessionId) {
+    public static void markPostCompaction(String sessionId, String agentId) {
+        // ── [G3] 子代理分支：⛔ 不写父会话的 AgentState ──
+        //   WHY：**子代理的 sessionId 就是父会话的 sessionId**（SubagentExecutor 探查 :4291/:4309）
+        //   ⇒ resolveAgentState(sessionId) 命中的是**父**的 AgentState ⇒ 父的下一个 API success
+        //   被误标 isPostCompaction=true（PromptCacheBreakDetection 的 cache-miss 归因失真）。
+        //   CC 对照：CC 是**进程级单布尔** STATE.pendingPostCompaction（bootstrap/state.ts:256/771，
+        //   setter 无形参）—— 本仓为 Web 多会话把它下沉到会话级 AgentState，是**本仓自造**的那一跳。
+        //   ⚠️ 设计取舍 = **no-op + log.debug**（不另建按 agentId 键控的记录）：
+        //   消费侧 {@link #consumePostCompaction(String)} 只按 sessionId 解析 AgentState ⇒ 子代理侧
+        //   的任何记录**无人可读**（write-only 死状态），且需自带清理生命周期 ⇒ 纯增负担。
+        //   主线程路径（含 agentId=="main" 的 REST partial 路径）行为与今天**逐字一致**。
+        if (!isMainThreadAgent(agentId)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[PostCompactionState] markPostCompaction: 子代理压缩不写父会话标记"
+                    + "（agentId={} sessionId={}）· 父会话 isPostCompaction 归因保持洁净 · CC 对照见本方法 javadoc",
+                    agentId, sessionId);
+            }
+            return;
+        }
         AgentState state = resolveAgentState(sessionId);
         if (state != null) {
             state.setPendingPostCompaction(true);
@@ -198,6 +219,28 @@ public final class PostCompactionState {
         log.warn("[PostCompactionState] markPostCompaction: sessionId={} "
                 + "pendingPostCompaction=true（回落会话级 Map 的无会话/未注册桶 · sessionId 无法解析到 "
                 + "AgentState）· CC bootstrap/state.ts:771", sessionId);
+    }
+
+    /** 兼容重载 · 主线程（agentId=null）语义，与 [G3] 升级前**逐字一致**。 */
+    public static void markPostCompaction(String sessionId) {
+        markPostCompaction(sessionId, null);
+    }
+
+    /**
+     * [G3] 主线程判定。
+     *
+     * <p>{@code null}/空白 = 主线程（对齐本仓约定：{@code ToolUseContext} javadoc :402-412
+     * 「主线程 ctx.agentId() 保持 null，子代理路径都显式传非 null agentId」）。
+     *
+     * <p>⚠️ <b>实测补充</b>：REST partial 路径显式传非 null 哨兵 {@code "main"}
+     * （{@code PartialCompactService:613 cc.setAgentId("main")}）⇒ 仅判 null 会把**主线程**的
+     * partial 压缩误判为子代理（**父的标记永不置位 = 回归**）。故此处把该哨兵并入主线程判定。
+     *
+     * @param agentId agent ID（字符串形；可 null）
+     * @return true = 主线程（应写会话级 AgentState）
+     */
+    private static boolean isMainThreadAgent(String agentId) {
+        return agentId == null || agentId.isBlank() || "main".equals(agentId);
     }
 
     /**

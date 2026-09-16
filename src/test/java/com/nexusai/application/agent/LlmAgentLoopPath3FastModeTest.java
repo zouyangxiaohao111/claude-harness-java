@@ -79,7 +79,8 @@ class LlmAgentLoopPath3FastModeTest {
             Mockito.mock(ToolRegistry.class), null, null, null, null, null, null, null, null,
             qc, factory, new TransientErrorHandler(), null, null, null, null, null, null, null,
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED, null, null, null, null, null,
-            null, null, null, null, null, null, null, null, null, null, null);  // 33 modelConfigResolver · 34 sdkEventQueue · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null, null, null, null, null, null, null, null, null, null,  // 33 modelConfigResolver · 34 sdkEventQueue · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null);  // 37 microCompactor · 38 autoCompactor（G1）
     }
 
     private void runLoop(LlmProviderFactory factory) {

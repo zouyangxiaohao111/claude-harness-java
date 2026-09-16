@@ -322,7 +322,9 @@ class LlmAgentLoopAutoCompactAbortTest {
             null, null, null, null, null,                                 // 21-25
             null, null, null, null, null,                                 // 26-30
             null, null, null, null, null,                                 // 31-35
-            costCalculator());                                            // 36 modelCostCalculator
+            costCalculator(),                                             // 36 modelCostCalculator
+            null,                                                         // 37 microCompactor（G1）
+            null);                                                        // 38 autoCompactor（G1）
     }
 
     /** 计价器桩：窗口/上限值同 CompactSessionCostWiringTest（保证阈值体系与既有用例同解）。 */

@@ -56,7 +56,8 @@ class ApplyPerMessageBudgetBudgetConstantTest {
             null, null, null, null, null, null, null, null, null, null,   // 10-19
             flags,                                                        // 20 FeatureFlags
             null, null, null, null, null, null, null, null, null, null,   // 21-30
-            session, null, null, null, null, null);                       // 31-34 · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            session, null, null, null, null, null,                       // 31-34 · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null);                                                  // 37 microCompactor · 38 autoCompactor（G1）
     }
 
     private AgentLoopContext buildGateOnCtx(AgentLoopContext.LoopSessionState session) {

@@ -10,6 +10,7 @@ import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.compact.CompactConstants;
 import com.nexusai.application.agent.compact.AutoCompactor;
+import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.CompactThresholdSystem;
 import com.nexusai.application.agent.compact.PlanModeAttachments;
 import com.nexusai.application.agent.compact.PlanProvider;
@@ -184,7 +185,16 @@ public record AgentLoopContext(
         // [V-TOK] 模型计费纯函数（DeepSeek 双档 · 元/百万 tokens）· static loop() 每 message_delta
         //   经 ctx 取用折算 cost 进 AgentState 会话累计（LlmAgentLoop E2/E3）。可空：非 Spring
         //   fallback / 单测 → null → 仅累计 input tokens，cost/桶跳过。
-        com.nexusai.application.agent.cost.ModelCostCalculator modelCostCalculator
+        com.nexusai.application.agent.cost.ModelCostCalculator modelCostCalculator,
+        // [G1 接线] micro 压缩器 · 子代理/fork/hook 三路的来源（三者 ctx 均出自同一
+        //   AgentLoopContextFactory，故只需工厂装配一次）。形参优先：3/4/8 参 queryLoop 重载传
+        //   null 且 TestContexts 经 compat ctor 置 null ⇒ 既有单测行为逐字不变；工厂路径非 null
+        //   ⇒ 子代理 s08 自动压缩链可用。
+        MicroCompactor microCompactor,
+        // [G1 接线] auto 压缩器 · 同 microCompactor。接线后 loop 内 rcOwnsBlocking /
+        //   collapseOwnsBlocking 的 `autoCompactor != null` 生产恒真 ⇒ 与 CC query.ts:633 的全局
+        //   isAutoCompactEnabled() 行为等价（子代理不再被 blocking 预检硬退）。测试路径仍 null ⇒ 保持 null-safe。
+        AutoCompactor autoCompactor
 ) {
     private static final Logger log = LoggerFactory.getLogger(AgentLoopContext.class);
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -263,7 +273,9 @@ public record AgentLoopContext(
             null, // modelConfigResolver（32 参 compat 不传 → null）
             null, // sdkEventQueue（32 参 compat 不传 → null · 非 Spring fallback 跳过 SDK 出站）
             null, // queueEventPublisher（32 参 compat 不传 → null · 非 Spring fallback 跳过排队事件出站）
-            null); // modelCostCalculator（32 参 compat 不传 → null · 非 Spring 单测跳过计费累计）
+            null, // modelCostCalculator（32 参 compat 不传 → null · 非 Spring 单测跳过计费累计）
+            null, // [G1] microCompactor（32 参 compat 不传 → null · 无压缩器，行为同接线前）
+            null); // [G1] autoCompactor（32 参 compat 不传 → null · 无压缩器，行为同接线前）
     }
     // [IMP-15] max_output_tokens 接线 · 对齐 CC claude.ts getMaxOutputTokensForModel + query.ts max_output_tokens_escalate
     // ════════════════════════════════════════════════════════════════════

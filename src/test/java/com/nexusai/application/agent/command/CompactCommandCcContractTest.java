@@ -476,7 +476,13 @@ class CompactCommandCcContractTest {
         assertThat(notifyCalls).containsExactly("compact:agent-1");
         // SESSION="s1" 非 UUID → 方案 1b 走回落进程级单布尔；本断言验证 INV-8 markPostCompaction
         // 确被调用（mark 成功链），会话级隔离语义由 PostCompactionStateTest 覆盖（规则 9：意图在专属测试钉死）。
-        assertThat(PostCompactionState.isPostCompactionPending(SESSION)).isTrue();
+        // [G3 改锚] 本用例 ctx 为**子代理形**（cc.setAgentId(AGENT) 非 null ⇒ 非主线程）⇒ 按 G3
+        //   新契约 markPostCompaction 对子代理 no-op（⛔ 不得写父会话 AgentState）⇒ isTrue→isFalse。
+        //   主线程（agentId=null）置位由 PostCompactionStateTest.markSetsPendingOnAgentState +
+        //   CompactSubagentSessionStateIsolationG3Test 控制组覆盖。
+        assertThat(PostCompactionState.isPostCompactionPending(SESSION))
+            .as("[G3] 子代理形 agentId ⇒ 不写父会话标记（主线程置位见 PostCompactionStateTest）")
+            .isFalse();
         assertThat(SessionMemoryService.getLastSummarizedMessageId(SESSION)).isNull();
         assertThat(CompactWarningState.isCompactWarningSuppressed(SESSION)).isTrue();
         // displayText（SM 路径 buildDisplayText(context)，无 userDisplayMessage）

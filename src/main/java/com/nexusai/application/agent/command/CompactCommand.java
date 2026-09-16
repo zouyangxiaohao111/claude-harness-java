@@ -261,7 +261,8 @@ public final class CompactCommand {
                     if (ctx.promptCacheBreakDetectionGate().getAsBoolean()) {
                         ctx.notifyCompaction().run();
                     }
-                    PostCompactionState.markPostCompaction(ctx.sessionId());
+                    // [G3] 传 ctx.agentId()（manual /compact：主线程 state ⇒ null；子代理 ⇒ UUID 串）。
+                    PostCompactionState.markPostCompaction(ctx.sessionId(), ctx.agentId());
                     CompactWarningState.suppressCompactWarning(ctx.sessionId(), ctx.warningPushContext());
                     log.info("[CompactCommand] SM 优先压缩成功: session={} agent={} preTokens={}",
                         ctx.sessionId(), ctx.agentId(), smResult.preCompactTokenCount());

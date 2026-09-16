@@ -300,7 +300,9 @@ class LlmAgentLoopReactiveCompactAbortTest {
             rc, null, null, null, null,                                   // 21-25
             null, null, null, null, null,                                 // 26-30
             null, null, null, null, null,                                 // 31-35
-            costCalculator());                                            // 36 modelCostCalculator
+            costCalculator(),                                             // 36 modelCostCalculator
+            null,                                                         // 37 microCompactor（G1）
+            null);                                                        // 38 autoCompactor（G1）
     }
 
     /** REACTIVE_COMPACT 开（同 CompactSessionCostWiringTest 口径）。 */

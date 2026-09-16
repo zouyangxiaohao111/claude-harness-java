@@ -870,7 +870,8 @@ public class AutoCompactor {
                     (querySource == null || querySource.isEmpty()) ? "compact" : querySource,
                     effAgentId);
             }
-            PostCompactionState.markPostCompaction(effSessionId);
+            // [G3] 传 effAgentId（ccContext.getAgentId()：主线程=null · 子代理=UUID 串）。
+            PostCompactionState.markPostCompaction(effSessionId, effAgentId);
             // [IMP-CM-13] SM 成功复位 tracking · CC 对齐 query.ts:519-526 公共复位
             //   （consecutiveFailures: 0）——autoCompact.ts SM 分支自身不返回 consecutiveFailures，
             //   但调用方 query.ts:470 `if (compactionResult)` 对任何压缩成功（SM/legacy 同分支）

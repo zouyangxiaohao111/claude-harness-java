@@ -68,7 +68,8 @@ class TodoWriteReminderInjectionTest {
         return new AgentLoopContext(
             registry, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, // 8-18
             null, null, null, null, null, null, null, // 19-25
-            null, null, null, null, null, session, null, null, null, null, null); // 26-34 · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null, null, null, null, session, null, null, null, null, null, // 26-34 · 35 queueEventPublisher · 36 modelCostCalculator（新增）
+            null, null); // 37 microCompactor · 38 autoCompactor（G1）
     }
 
     /** turns 达标（≥ turnsSinceWrite=10）：10 个无 TodoWrite 的 assistant turn。 */

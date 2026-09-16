@@ -506,7 +506,8 @@ public final class CompactConversation {
 
             // ── 15. notifyCompaction + markPostCompaction + reAppendSessionMetadata（compact.ts:698-711，INV-8）──
             ctx.getNotifyCompaction().run();
-            PostCompactionState.markPostCompaction(ctx.getSessionId());
+            // [G3] 传 ctx 的 agentId（主线程=null · 子代理=UUID 串）⇒ 子代理压缩不写父会话标记。
+            PostCompactionState.markPostCompaction(ctx.getSessionId(), ctx.getAgentId());
             reAppendSessionMetadata(ctx);
 
             // ── 16. hooks_start: post_compact + executePostCompactHooks（compact.ts:719-729）──
