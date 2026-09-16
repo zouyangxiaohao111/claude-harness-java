@@ -25,6 +25,24 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 导致壳静默闪退。故放宽到 60s。
 pub const WAIT_BACKEND_READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 构造一个「不弹控制台黑窗」的 [`Command`]。
+///
+/// GUI 壳里 spawn 控制台程序（taskkill / powershell / tasklist）默认会新分配一个控制台并
+/// 弹出黑色 cmd 窗口——用户关预览时看到的弹窗即 taskkill 所致。Windows 统一设
+/// `CREATE_NO_WINDOW` 标志从根上抑制；非 Windows 无此概念，原样返回。
+pub fn silent_command(program: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        /// 不新建控制台窗口（winbase.h `CREATE_NO_WINDOW`）。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// 探活：GET http://localhost:3458/actuator/health 返回 2xx 即视为后端就绪。
 ///
 /// 用 std::net::TcpStream::connect_timeout 手写一个最简 HTTP/1.1 GET，
@@ -110,7 +128,7 @@ fn is_our_backend_process(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').CommandLine");
-        match Command::new("powershell")
+        match silent_command("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .output()
         {
@@ -335,7 +353,7 @@ pub fn kill_process_tree(pid: u32) {
     {
         let pid_str = pid.to_string();
         // taskkill /PID <pid> /T /F：/T 连子进程树一起杀，/F 强制
-        let result = Command::new("taskkill")
+        let result = silent_command("taskkill")
             .args(["/PID", pid_str.as_str(), "/T", "/F"])
             .status();
         if let Err(e) = result {

@@ -14,6 +14,31 @@ mod updater;
 /// None = 启动时 3458 已有外部后端在跑（复用）或尚未自启 —— 此时关窗不回收外部进程。
 struct BackendState(std::sync::Mutex<Option<u32>>);
 
+/// 主窗口 label。tauri.conf.json `app.windows` 未写 label，Tauri 首个窗口默认取 "main"。
+const MAIN_WINDOW_LABEL: &str = "main";
+
+/// 关窗事件是否应当回收后端？应当则返回要回收的 pid（`None` = 不回收）。
+///
+/// 【只认主窗口】`Builder::on_window_event` 是**应用级**钩子（对所有窗口都触发），
+/// 而独立预览窗口（`standalone-preview`，承载 PDF/Word/HTML/Excel/图片等）关闭**不等于**
+/// 应用退出——若一并回收，就会连带杀掉端口 3458 的后端（历史缺陷：用户关预览把后端也关了）。
+/// 未知 / 空 label 一律不回收：宁可留孤儿让 [`backend::cleanup_stale_backend_pid`] 下次兜底，
+/// 也不误杀正在服务的后端。
+///
+/// ⛔ **`take()` 必须由本函数执行，调用方不得先取出 pid 再判 label**：非主窗口关闭时
+/// 只判定、**不出栈**——否则 pid 被子窗口提前消费，之后真正关主窗口时 state 已是 `None`，
+/// 后端回收不掉 → 反而制造孤儿（与防孤儿的初衷相反）。
+fn reclaim_target_on_close(
+    window_label: &str,
+    state: &std::sync::Mutex<Option<u32>>,
+) -> Option<u32> {
+    if window_label == MAIN_WINDOW_LABEL {
+        state.lock().unwrap().take()
+    } else {
+        None
+    }
+}
+
 /// 查找本机 Chrome / Chromium 可执行文件。
 /// Windows：Program Files / Program Files (x86) / %LOCALAPPDATA%；
 /// macOS：/Applications/Google Chrome.app；
@@ -132,7 +157,7 @@ fn is_chrome_installed() -> Result<bool, String> {
 fn is_chrome_running() -> bool {
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("tasklist")
+        backend::silent_command("tasklist")
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("chrome.exe"))
@@ -215,7 +240,7 @@ fn main() {
         // 单实例：第二实例启动即退出并把已运行实例的主窗口置前聚焦，
         // 防止两个壳实例各自拉起后端、争抢 3458 端口（窗口 label 默认 "main"）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = window.set_focus();
             }
         }))
@@ -240,7 +265,7 @@ fn main() {
             // 注：460x400 小于 tauri.conf.json 的 minWidth/minHeight(960x600)，先临时下调最小尺寸，
             //     否则 set_size 会被系统 clamp 回 960x600，小窗不生效；前端放大后如需恢复
             //     960x600 下限，由前端 setMinSize 再设回（后端就绪前保持小窗由壳保证）。
-            if let Some(window) = app.get_webview_window("main") {
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = window.set_min_size(Some(tauri::PhysicalSize::new(460, 400)));
                 let _ = window.set_size(tauri::PhysicalSize::new(460, 400));
                 let _ = window.center();
@@ -327,17 +352,13 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // 用户关窗：整树杀掉本会话自启的后端 java（防孤儿）；take() 后 state 置 None
+            // 用户关窗：整树杀掉本会话自启的后端 java（防孤儿）。本钩子对所有窗口触发，
+            // 是否该回收（及出栈）一律交给 reclaim_target_on_close 判定。
             if let tauri::WindowEvent::CloseRequested { .. } = event {
-                let pid = window
-                    .app_handle()
-                    .state::<BackendState>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .take();
-                if let Some(p) = pid {
-                    eprintln!("[backend] 窗口关闭，回收后端进程树 pid={}", p);
+                let state = window.app_handle().state::<BackendState>();
+                if let Some(p) = reclaim_target_on_close(window.label(), &state.0) {
+                    // 走 log_launcher：release 无控制台，eprintln 会丢，文件才是唯一排障通道
+                    backend::log_launcher(&format!("主窗口关闭，回收后端进程树 pid={}", p));
                     backend::kill_process_tree(p);
                 }
             }
@@ -361,4 +382,80 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_of(pid: Option<u32>) -> std::sync::Mutex<Option<u32>> {
+        std::sync::Mutex::new(pid)
+    }
+
+    /// 主窗口关闭 → 必须回收（防孤儿的原始意图，不许丢），且出栈后 state 置 None
+    /// （保证 `RunEvent::ExitRequested` 兜底分支幂等，不会重复 kill）。
+    #[test]
+    fn main_window_close_reclaims_and_clears_state() {
+        let state = state_of(Some(1234));
+        assert_eq!(reclaim_target_on_close("main", &state), Some(1234));
+        assert_eq!(*state.lock().unwrap(), None);
+        // 无 pid（启动时复用外部后端）⇒ 无事发生
+        assert_eq!(reclaim_target_on_close("main", &state_of(None)), None);
+    }
+
+    /// 独立预览子窗口（PDF/Word/HTML/Excel/图片）关闭 → **绝不**回收后端。
+    /// 这是本次缺陷的不变量：关预览 ≠ 应用退出，不该连带杀掉端口 3458 的后端。
+    #[test]
+    fn preview_child_window_close_does_not_reclaim_backend() {
+        assert_eq!(
+            reclaim_target_on_close("standalone-preview", &state_of(Some(1234))),
+            None
+        );
+    }
+
+    /// ⛔ 子窗口关闭**不得消费掉 pid**：否则之后关主窗口时 state 已空 → 后端回收不掉，
+    /// 「防孤儿」反而变成「制造孤儿」。这条守的是 `take()` 的**时机**，不只是返回值。
+    #[test]
+    fn child_window_close_must_not_consume_pid() {
+        let state = state_of(Some(1234));
+        assert_eq!(reclaim_target_on_close("standalone-preview", &state), None);
+        assert_eq!(*state.lock().unwrap(), Some(1234)); // pid 仍在
+        // 之后关主窗口仍能正常回收
+        assert_eq!(reclaim_target_on_close("main", &state), Some(1234));
+    }
+
+    /// 空 / 未知 label → 不回收（保守：宁可留孤儿给下次启动兜底，也不误杀在服务的后端）。
+    #[test]
+    fn unknown_or_empty_label_does_not_reclaim_backend() {
+        assert_eq!(reclaim_target_on_close("", &state_of(Some(1234))), None);
+        assert_eq!(
+            reclaim_target_on_close("some-other-window", &state_of(Some(1234))),
+            None
+        );
+        assert_eq!(
+            reclaim_target_on_close("Main", &state_of(Some(1234))),
+            None // label 大小写敏感，不做模糊匹配
+        );
+    }
+
+    /// ⭐ 接线层守护（源码级）：把「该不该杀、杀哪个」抽成纯函数后，上面几条只守住了
+    /// **函数本身**，守不住「钩子是否真的把 `window.label()` 喂进来了」——而 Tauri 的
+    /// `on_window_event` 钩子需要 App 运行时，**无法在单测里执行**，故行为级测试永远抓不到
+    /// 「钩子绕过判定函数、恢复原始 bug」这类变异（实测：钩子改 `if true` 时上列测试全绿）。
+    /// 本测试补上这一层。
+    ///
+    /// ⚠️ **局限（如实登记，非完备守护）**：这是字符串级守护，只拦「调用被整行删除 / 改名」，
+    /// 拦不住「改了传参」或等价改写（如 `if window.label() == "main"`）。它是对
+    /// 「钩子不可单测」这一平台约束的妥协。
+    #[test]
+    fn close_hook_must_route_through_reclaim_target() {
+        let src = include_str!("main.rs");
+        // 只查 `#[cfg(test)]` 之前的生产代码段：否则本测试自己的字符串字面量会自匹配 → 假绿
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        assert!(
+            prod.contains("reclaim_target_on_close(window.label()"),
+            "关窗钩子必须经由 reclaim_target_on_close(window.label(), …) 判定；\
+             绕过它直接 kill 会复活「关独立预览窗连带杀掉后端」缺陷"
+        );
+    }
 }
