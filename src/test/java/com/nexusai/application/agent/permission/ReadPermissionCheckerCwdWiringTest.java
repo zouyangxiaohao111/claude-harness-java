@@ -247,7 +247,8 @@ class ReadPermissionCheckerCwdWiringTest {
             .as("cwd 正确 → content allow 规则命中 → Allow；cwd 丢失 → 不命中 → 兜底 Ask")
             .isInstanceOf(PermissionResult.Allow.class);
         assertThat(((PermissionResult.Allow) result).reason())
-            .as("CC filesystem.ts:1160-1176：allow 必须归因为 Rule(allow rule)，而非 defaultAllow 的 Other")
+            .as("CC filesystem.ts:1160-1176：allow 必须归因为 Rule(allow rule)，而非 read 链默认放行"
+                + "（step6 工作目录内 = Mode(DEFAULT)，filesystem.ts:1146-1149）")
             .isInstanceOf(PermissionDecisionReason.Rule.class);
     }
 

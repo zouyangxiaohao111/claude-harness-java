@@ -36,7 +36,9 @@ import java.util.Set;
  *       等价物），仅消费 allow 结果——read-specific deny/ask 规则优先（CC :1124-1125 注释），
  *       edit deny/ask 不阻断 read（CC :1132 仅 behavior==='allow' 返回）。DEL-33 关闭。</li>
  *   <li>路径在工作目录内 → allow（CC :1136-1151）——✓ 已实现（{@link #isInWorkingDir}，
- *       全部 pathsToCheck 必须落在工作目录展开形式内，CC pathInAllowedWorkingPath :683-707）</li>
+ *       全部 pathsToCheck 必须落在工作目录展开形式内，CC pathInAllowedWorkingPath :683-707）；
+ *       [批 E1 · O-2b] reason = {@code Mode(PermissionMode.DEFAULT)}（CC :1146-1149
+ *       {@code {type:'mode', mode:'default'}}）</li>
  *   <li><b>内部路径白名单 checkReadableInternalPath（CC :1153-1158）——△ 部分实现</b>：
  *       agent-memory（CC :1704-1712 isAgentMemoryPath）/ auto-memory（CC :1716-1723 memdir）/
  *       bundled-skills（CC :1759-1774 getBundledSkillsRoot）三个读 carve-out 已补（本类
@@ -45,7 +47,8 @@ import java.util.Set;
  *   <li><b>read allow rule → allow（CC :1160-1176）——△ 上游近似覆盖</b>：
  *       本类不查 allow rule；由权限管线上游 CheckLayer2b_ToolAlwaysAllowed（CheckLayer2b/BypassAndAllowHook）
  *       近似覆盖（deletion-manifest DEL-24 KEEP_WITH_REASON 关联）。</li>
- *   <li>兜底 → ask（CC :1178-1193）——✓ 已实现</li>
+ *   <li>兜底 → ask（CC :1178-1193）——✓ 已实现；[批 E1 · O-2] reason =
+ *       {@code WorkingDir("Path is outside allowed working directories")}（CC :1189-1192）</li>
  * </ol>
  *
  * <h2>Java 端实现差异（L.md 标注 · concerns · 反 2026-08-05 reflector-L R1 修正披露）</h2>
@@ -304,7 +307,9 @@ public class ReadPermissionChecker {
                 log.debug("[ReadPermissionChecker] agent-memory 读 carve-out 静默 allow (IMP-M-P2-2): path={}",
                     path);
             }
-            return defaultAllow(input);
+            // [批 E1 · O-2b] ⛔ 不得改用 defaultAllow：CC 该分支 reason type = 'other'
+            //   （filesystem.ts:1709-1718），而 step6 是 'mode'。两条腿拆开各走各的构造器。
+            return agentMemoryReadAllow(input);
         }
 
         // ── 步骤 6: 路径在工作目录内 → allow（全部展开路径必须在内，CC :1136-1151 + pathInAllowedWorkingPath :683-707） ──
@@ -313,6 +318,7 @@ public class ReadPermissionChecker {
                 log.debug("[ReadPermissionChecker] 全部展开路径在 working dir → allow: path={} pathsToCheck={}",
                     path, pathsToCheck);
             }
+            // [批 E1 · O-2b] reason = Mode(PermissionMode.DEFAULT)（CC filesystem.ts:1146-1149）。
             return defaultAllow(input);
         }
 
@@ -337,7 +343,13 @@ public class ReadPermissionChecker {
         // [IMP-4 G2 + GAP-3] 对齐 CC checkReadPermissionForTool 兜底（filesystem.ts:1178-1193）：
         //   suggestions = generateSuggestions(path,'read',permCtx,pathsToCheck)。
         //   兜底只在本链已判"不在工作目录"之后到达（step 6 isInWorkingDir 为 false 才继续），
-        //   故 isOutsideWorkingDir 恒 true（CC :1183 注释同义）。read 分支
+        //   故 isOutsideWorkingDir 恒 true（CC :1183 注释同义）。
+        // [批 E1 · O-2] reason 类型 = WorkingDir（CC filesystem.ts:1189-1192 恒用
+        //   `{type:'workingDir', reason:'Path is outside allowed working directories'}`；
+        //   旧值 Other("default ask for read outside working dir") 在 CC 全仓 grep 零命中，
+        //   且与 write 侧同位置（WritePermissionChecker.java:274）自家不一致）。
+        //   语义自证：该 return 的唯一可达条件 = 上方 step 6 isInWorkingDir == false，
+        //   即"确定不在工作目录"⇒ 归因恒为 workingDir。read 分支
         //   （filesystem.ts:1426-1437）对目录 getDirectoryForPath → getPathsForPermissionCheck
         //   展开 → 逐条 createReadRuleSuggestion(dir,'session')，由 PermissionUpdates 统一承接。
         List<PermissionUpdate> readSuggestions = PermissionUpdates.generateSuggestions(
@@ -347,7 +359,7 @@ public class ReadPermissionChecker {
         }
         return new PermissionResult.Ask(
             "Claude 请求读取 " + path + "，需要用户授权",
-            new PermissionDecisionReason.Other("default ask for read outside working dir"),
+            new PermissionDecisionReason.WorkingDir("Path is outside allowed working directories"),
             readSuggestions, path, input, null, false, null, List.of());
     }
 
@@ -519,14 +531,53 @@ public class ReadPermissionChecker {
     }
 
     /**
-     * 默认 Allow result（updatedInput 回传原 input；reason=Other）。
+     * step6「工作目录内 → allow」的默认 Allow result（updatedInput 回传原 input）。
+     *
+     * <p><b>reason = {@code Mode(PermissionMode.DEFAULT)}</b> · 对齐 CC
+     * {@code utils/permissions/filesystem.ts:1146-1149}
+     * {@code decisionReason: {type:'mode', mode:'default'}}。旧值
+     * {@code Other("read permission default allow")} 与 CC 类型不符（[批 E1 · O-2b]）；
+     * ⚠️ 该历史串已于 [批 E3] 退役 —— agent-memory 腿改用 CC 文案，本类不再产出它。
+     *
+     * <p>⚠️ 本方法<b>只</b>服务 step6 这一条腿。agent-memory 读 carve-out（step 4.5）在 CC
+     * 该分支归因是 {@code other}（{@code filesystem.ts:1709-1718}）
+     * ⇒ 走 {@link #agentMemoryReadAllow}，⛔ 两条腿不得再合并回一个方法
+     * （合并必然把其中一条的 reason 类型写错 —— 这正是本批拆开的原因）。
+     *
      * <p>bundled-skills 分支判定已迁至 {@link PathValidation#checkReadableInternalPath}
      * （OPD-WF5-02-02，isWithin 尾分隔符防 nonce 前缀攻击语义等价），本类不再重复。
+     *
+     * @param input 工具入参（原样回传 updatedInput）
+     * @return Allow（reason = {@code Mode(PermissionMode.DEFAULT)}）
      */
     public static PermissionResult defaultAllow(JsonNode input) {
         return new PermissionResult.Allow(
             input,
-            new PermissionDecisionReason.Other("read permission default allow"),
+            new PermissionDecisionReason.Mode(PermissionMode.DEFAULT),
+            null, false, null, List.of());
+    }
+
+    /**
+     * agent-memory 读 carve-out（step 4.5）的 Allow result · reason <b>保持 {@code Other}</b>。
+     *
+     * <p>对齐 CC {@code utils/permissions/filesystem.ts:1709-1718}
+     * {@code decisionReason: {type:'other', reason:'Agent memory files are allowed for reading'}}
+     * —— CC 该分支确实是 {@code other}，⛔ 不得改成 {@code Mode}。
+     *
+     * <p>[批 E3] reason 串已对齐 CC 文案 —— 原 Java 历史值
+     * {@code "read permission default allow"} 退役。⭐ 换串<b>不掉判别力</b>：该串在本类中
+     * 仍<b>只</b>由本方法产出（{@code defaultAllow} 现产 {@code Mode(DEFAULT)}），且与 step6 腿的
+     * {@code Mode(DEFAULT)} 类型不同 ⇒
+     * {@code ReadPermissionCheckerInternalPathTest#agentMemoryReadCarveOut_staysOtherNotModeDefault}
+     * 的「命中 carve-out」与「未被 step6 兜住」两条判别均不受影响。
+     *
+     * @param input 工具入参（原样回传 updatedInput）
+     * @return Allow（reason = {@code Other}）
+     */
+    static PermissionResult agentMemoryReadAllow(JsonNode input) {
+        return new PermissionResult.Allow(
+            input,
+            new PermissionDecisionReason.Other("Agent memory files are allowed for reading"),
             null, false, null, List.of());
     }
 }

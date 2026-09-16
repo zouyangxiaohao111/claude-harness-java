@@ -110,7 +110,9 @@ class LspToolPermissionTest {
      * （= {@code <repo>/backend}），而本类的 {@link #lspWorkspace()} 与 {@link #lspOutside()} 是
      * {@code backend/target/} 下的<b>兄弟目录</b> ⇒ 二者<b>都在</b>白名单内 ⇒
      * {@code outsideWorkingDir_* } 断言必然假红（实测：未锚时 {@code outsideWorkingDir_ask} 拿到
-     * {@code Allow[reason=read permission default allow]}）。
+     * {@code Allow[reason=Mode(DEFAULT)]} —— [批 E1 · O-2b] 前该处 reason 是
+     * {@code Other("read permission default allow")}，step6 归因类型已于本批对齐 CC
+     * filesystem.ts:1146-1149）。
      * <p>故本工厂在构造 TUC 前先把该 sessionId 的 originalCwd 锚到 {@code effectiveCwd}
      * （{@code SessionCwdHolder.setOriginalCwd}，即 {@code getOriginalCwdLayer} 的首读槽）。
      * ⛔ 不要改产品判据来迁就夹具（{@code ReadPermissionChecker}/{@code CwdResolution}/{@code LspTool}）。 */

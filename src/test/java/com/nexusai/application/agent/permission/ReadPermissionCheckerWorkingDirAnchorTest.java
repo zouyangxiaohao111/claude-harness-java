@@ -350,7 +350,7 @@ class ReadPermissionCheckerWorkingDirAnchorTest {
     // ──────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("端到端：worktree 内文件 → step6 工作目录内 Allow（reason=read permission default allow）")
+    @DisplayName("端到端：worktree 内文件 → step6 工作目录内 Allow（reason=Mode(DEFAULT)）")
     void readWorktreeFileOnly_allowedByWorkingDirStep() {
         assertAnchorsDiverge();
         Path target = worktreeFile();
@@ -362,9 +362,10 @@ class ReadPermissionCheckerWorkingDirAnchorTest {
             .as("CC pathInAllowedWorkingPath（filesystem.ts:683-707）命中 → allow")
             .isInstanceOf(PermissionResult.Allow.class);
         assertThat(((PermissionResult.Allow) result).reason())
-            .as("必须归因为 step6 工作目录放行（Other 默认 allow），而非其它白名单分支 —— "
+            .as("必须归因为 step6 工作目录放行 Mode(DEFAULT)（CC filesystem.ts:1146-1149 "
+                + "`decisionReason: {type:'mode', mode:'default'}`），而非其它白名单分支 —— "
                 + "锚被换成 getProjectRoot 时该路径落白名单外 ⇒ 走兜底 Ask ⇒ 红")
-            .isEqualTo(new PermissionDecisionReason.Other("read permission default allow"));
+            .isEqualTo(new PermissionDecisionReason.Mode(PermissionMode.DEFAULT));
     }
 
     @Test
@@ -380,6 +381,12 @@ class ReadPermissionCheckerWorkingDirAnchorTest {
             .as("⭐ 锚 = worktree ⇒ boundProject 内路径在工作目录外 ⇒ 必须兜底 ask；"
                 + "锚被改成 getProjectRoot 时此处翻成 Allow ⇒ 红")
             .isInstanceOf(PermissionResult.Ask.class);
+        assertThat(((PermissionResult.Ask) result).reason())
+            .as("[批 E1 · O-2] 兜底 ask 的 reason 必须归因 "
+                + "WorkingDir(\"Path is outside allowed working directories\")"
+                + "（CC filesystem.ts:1189-1192 该处恒用 type:'workingDir'）；"
+                + "旧实现 Other(\"default ask for read outside working dir\") ⇒ 本条红")
+            .isInstanceOf(PermissionDecisionReason.WorkingDir.class);
     }
 
     // ──────────────────────────────────────────────────────────────────────

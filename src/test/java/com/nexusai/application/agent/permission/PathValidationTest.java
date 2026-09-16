@@ -1,7 +1,10 @@
 package com.nexusai.application.agent.permission;
 
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.test.support.SessionProjectRootTestSupport;
@@ -18,6 +21,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -61,6 +65,7 @@ class PathValidationTest {
         return new PathValidationEnv(
             "session-1", "agent-1",
             "C:/proj", "C:/proj",
+            "C:/proj",             // sessionProjectRoot（[批 E2] 稳定项目根 ⇒ slug = C--proj）
             "C:/Users/u/.claude",  // claudeConfigHomeDir（只读兼容根 D3/D4）
             "C:/Users/u/.claude",  // nexusaiConfigHomeDir（自有主根 D1，白名单内部路径基址）
             true,          // scratchpadEnabled
@@ -69,6 +74,9 @@ class PathValidationTest {
             "C:/Users/u/.claude/memory",
             "C:/tmp/claude/bundled-skills/0.2.33/nonce");
     }
+
+    /** [批 E2] 本项目 slug（= AutoMemPaths.sanitizePath(sessionProjectRoot)，与落盘介质同源）。 */
+    private static final String PROJ_SLUG = AutoMemPaths.sanitizePath("C:/proj");
 
     // ════════════════════════════════════════════════════════════════════
     // 1. OPD-WF5-02-01 · hasSuspiciousWindowsPathPattern 7 类
@@ -152,24 +160,311 @@ class PathValidationTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("读白名单 session-memory → allow（CC :1620-1629）")
+    @DisplayName("[E2] 读白名单 session-memory → allow（真实介质形状，CC :1620-1629）")
     void read_sessionMemory() {
+        // [批 E2] 夹具改为**真实介质形状**：{configHome}/projects/{slug}/{sessionId}/session-memory/summary.md
+        //   （SessionMemoryService.resolvePath:2272-2283）。旧夹具
+        //   "{configHome}/session-memory/summary.md" 是**假门**——实测该目录 0 文件，
+        //   真实 summary.md 全在 projects/{slug}/{sid}/ 下，旧断言只因 project-dir 宽口兜住才「绿」
+        //   （reason 实为 "Project directory files..."，与本用例断言不符 ⇒ 本用例改前必红）。
         PathValidation.InternalPathResult r = PathValidation.checkReadableInternalPath(
-            "C:/Users/u/.claude/session-memory/summary.md", env());
+            "C:/Users/u/.claude/projects/" + PROJ_SLUG + "/session-1/session-memory/summary.md", env());
         assertThat(r.allowed()).isTrue();
         assertThat(r.decisionReason())
+            .as("必须是 session-memory 分支本身命中（⛔ 不是 project-dir / tool-results 等别分支兜住）")
             .isEqualTo(new PermissionDecisionReason.Other("Session memory files are allowed for reading"));
     }
 
     @Test
-    @DisplayName("读白名单 project-dir → allow（CC :1633-1642）")
+    @DisplayName("[E2] 读白名单 project-dir → allow（当前项目 slug 内，CC :1633-1642）")
     void read_projectDir() {
         PathValidation.InternalPathResult r = PathValidation.checkReadableInternalPath(
-            "C:/Users/u/.claude/projects/sess.jsonl", env());
+            "C:/Users/u/.claude/projects/" + PROJ_SLUG + "/session-1/session.jsonl", env());
         assertThat(r.allowed()).isTrue();
         assertThat(r.decisionReason())
             .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [批 E2] 内部路径白名单：session-memory 假门 + project-dir 跨项目宽口
+    //   CC 真源：filesystem.ts:261-263 getSessionMemoryDir（= projectDir/sessionId/session-memory）、
+    //            :284-291 isProjectDirPath（= getProjectDir(getCwd())，只放行**当前项目**）。
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[E2] 宽口：别的项目（别的 slug）下的路径 → 任何分支都不放行")
+    void e2_otherProject_notAllowedByAnyBranch() {
+        // ⛔ 必须断言「具体不命中」而非只断 allowed()：本项目 slug 之外的路径若被任何分支放行，
+        //    本断言即红（旧行为 = project-dir 宽口 {configHome}/projects/ 放行**全部 662 个项目**
+        //    —— 实测 configHome/projects/ 下 662 个 slug 目录）。
+        String otherProject = "C:/Users/u/.claude/projects/C--some-other-project/session-9/session.jsonl";
+        PathValidation.InternalPathResult r = PathValidation.checkReadableInternalPath(otherProject, env());
+        assertThat(r.allowed())
+            .as("别的项目的历史 transcript / session-memory 不得被静默放行（对齐 CC :284-291 只放当前项目）")
+            .isFalse();
+        assertThat(r.decisionReason()).isNull();
+
+        // 别的项目的 session-memory 同样不得放行（旧行为：project-dir 宽口放行）
+        String otherSessionMemory =
+            "C:/Users/u/.claude/projects/C--some-other-project/session-9/session-memory/summary.md";
+        assertThat(PathValidation.checkReadableInternalPath(otherSessionMemory, env()).allowed())
+            .as("别的项目的 session-memory 不得被静默放行")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("[E2] 防过度收窄：本项目 session-memory / transcript / subagent / tool-results 仍放行")
+    void e2_currentProject_stillAllowed() {
+        String base = "C:/Users/u/.claude/projects/" + PROJ_SLUG;
+        assertThat(PathValidation.checkReadableInternalPath(base + "/session-1/session-memory/summary.md", env())
+            .decisionReason())
+            .as("本项目 session-memory")
+            .isEqualTo(new PermissionDecisionReason.Other("Session memory files are allowed for reading"));
+        assertThat(PathValidation.checkReadableInternalPath(base + "/session-1/session.jsonl", env())
+            .decisionReason())
+            .as("本项目 transcript（媒体 SessionStorage.sessionProjectDir 同根）")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+        assertThat(PathValidation.checkReadableInternalPath(base + "/session-1/subagents/agent-a1.jsonl", env())
+            .decisionReason())
+            .as("本项目 subagent sidechain")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+        assertThat(PathValidation.checkReadableInternalPath(base + "/session-1/tool-results/o.txt", env())
+            .decisionReason())
+            .as("本项目 tool-results（落点 slug 与本项目 root 一致时被 project-dir 先行遮蔽，同 CC 顺序）")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+    }
+
+    @Test
+    @DisplayName("[E2][③′ 腿 2] 稳定根半：cd/worktree 后仍按**稳定项目根**取 slug 放行")
+    void e2_anchor_stableHalf_allowsSessionProjectRootSlug() {
+        // effectiveCwd 模拟 bash cd 进子目录（= CC getCwd，会被 cd 改）；sessionProjectRoot = 稳定项目根。
+        PathValidationEnv cdEnv = new PathValidationEnv(
+            "session-1", "agent-1", "C:/proj/sub", "C:/proj",
+            "C:/proj",             // sessionProjectRoot（稳定锚 ⇒ slug = C--proj）
+            "C:/Users/u/.claude", "C:/Users/u/.claude",
+            false, "C:/tmp/claude", false, null, null);
+
+        assertThat(cdEnv.projectDirs())
+            .as("两半各自独立：应同时含 cwd 半（C--proj-sub）与稳定根半（C--proj）")
+            .containsExactly(
+                Path.of("C:/Users/u/.claude", "projects", AutoMemPaths.sanitizePath("C:/proj/sub"))
+                    .normalize().toString() + java.io.File.separator,
+                Path.of("C:/Users/u/.claude", "projects", PROJ_SLUG).normalize().toString()
+                    + java.io.File.separator);
+
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + PROJ_SLUG + "/session-1/session.jsonl", cdEnv).decisionReason())
+            .as("稳定根半：cd 进子目录后仍按**稳定项目根**取 slug 放行"
+                + "（⭐ 删掉稳定根半 ⇒ 本断言必红，因为 C--proj 不在 cwd 半 C--proj-sub 内）")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+
+        // 稳定根半的 session-memory（介质写盘落点）亦须放行
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + PROJ_SLUG + "/session-1/session-memory/summary.md", cdEnv)
+            .decisionReason())
+            .as("介质写盘的 session-memory 稳定根半必须放行（否则提取链读回静默拿到空内容）")
+            .isEqualTo(new PermissionDecisionReason.Other("Session memory files are allowed for reading"));
+    }
+
+    @Test
+    @DisplayName("[E2][③′ 腿 1] cwd 半：effectiveCwd 的 slug 子树整体放行（对齐 CC getProjectDir(getCwd())）")
+    void e3_anchor_cwdHalf_allowsEffectiveCwdSlug() {
+        PathValidationEnv cdEnv = new PathValidationEnv(
+            "session-1", "agent-1", "C:/proj/sub", "C:/proj",
+            "C:/proj",             // 稳定根 ≠ cwd ⇒ 两个 slug 分裂，正好分离两条腿
+            "C:/Users/u/.claude", "C:/Users/u/.claude",
+            false, "C:/tmp/claude", false, null, null);
+        String cwdSlug = AutoMemPaths.sanitizePath("C:/proj/sub");
+
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + cwdSlug + "/session-1/session.jsonl", cdEnv).decisionReason())
+            .as("cwd 半：effectiveCwd 的 slug 放行（对齐 CC isProjectDirPath = getProjectDir(getCwd())）"
+                + "（⭐ 删掉 cwd 半 ⇒ 本断言必红）")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+
+        // ⭐ [③′ 有意变更] 收窄版曾断言「effectiveCwd slug 下的**非** tool-results 文件不得放行」——
+        //   ③′ 起该断言**反转**：CC 的 isProjectDirPath 是**整个** getProjectDir(getCwd()) 子树，
+        //   不只 tool-results。故此处明确钉住新语义（防止有人按旧断言「修回去」）。
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + cwdSlug + "/session-1/tool-results/o.txt", cdEnv).decisionReason())
+            .as("cwd 半下的 tool-results 落点也由 **project-dir** 分支放行（见下方阴影登记）")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + cwdSlug + "/other.txt", cdEnv).allowed())
+            .as("cwd 半是整子树放行（③′ 与 CC 一致），非仅 tool-results")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("[③′ ①] bash 通道：forProcess(resolutionBase) 的 cwd 半放行「当前 cwd 的 slug」")
+    void e3_forProcess_cwdHalf_allowsCurrentCwdSlug() {
+        // bash 侧真实构造：BashPathValidator.java:947 `PathValidationEnv.forProcess(resolutionBase)`，
+        //   resolutionBase = 本次 bash 命令的相对路径解析基准 = **当前 cwd**（随 cd 变，⛔ 无需 sessionId）。
+        //   CC 对照：CC 的 bash 路径校验确实走到 isProjectDirPath(getCwd())（pathValidation.ts:232
+        //   步骤 3.5 → filesystem.ts:284-291）⇒ CC 的 bash 放行「当前 cwd 那个 slug」。
+        Path base = Path.of("C:/proj").toAbsolutePath().normalize();
+        PathValidationEnv bashEnv = PathValidationEnv.forProcess(base);
+
+        // 夹具前提自检（fail-loud）：真实工厂下 cwd 半必须可得（原 E2 收窄把它整条砍掉了 ⇒ 本条改前必红）
+        assertThat(bashEnv.sessionProjectRoot())
+            .as("夹具前提：forProcess 结构性无会话 ⇒ 稳定根半恒缺（这正是 ③′ 要用 cwd 半的原因）")
+            .isNull();
+        assertThat(bashEnv.projectDirs())
+            .as("夹具前提：forProcess 的 effectiveCwd = resolutionBase ⇒ cwd 半必须可得")
+            .hasSize(1);
+
+        String slug = AutoMemPaths.sanitizePath(base.toString());
+        String target = Path.of(NexusaiPaths.getAppConfigHomeDir(), "projects", slug, "sess-1", "session.jsonl")
+            .toString();
+        assertThat(PathValidation.checkReadableInternalPath(target, bashEnv).decisionReason())
+            .as("⭐ ③′ ①：bash 必须能读「当前 cwd 的 slug」（与 CC 一致；E2 收窄版此处为 passthrough ⇒ 改前必红）")
+            .isEqualTo(new PermissionDecisionReason.Other("Project directory files are allowed for reading"));
+
+        // bash 侧 session-memory 仍 fail-closed（无 sessionId ⇒ CC 的 join(…, undefined, …) 无意义）
+        assertThat(bashEnv.sessionMemoryDirs())
+            .as("bash 无会话身份 ⇒ session-memory 两半皆无 ⇒ fail-closed")
+            .isEmpty();
+    }
+
+    @Test
+    @DisplayName("[③′ ②] bash 反向：把 resolutionBase 换成别的目录 ⇒ 那个 slug 不被放行（防又变宽口）")
+    void e3_forProcess_otherCwdSlug_notAllowed() {
+        Path baseA = Path.of("C:/projA").toAbsolutePath().normalize();
+        Path baseB = Path.of("C:/projB").toAbsolutePath().normalize();
+        PathValidationEnv envA = PathValidationEnv.forProcess(baseA);
+
+        String slugB = AutoMemPaths.sanitizePath(baseB.toString());
+        String otherTarget = Path.of(NexusaiPaths.getAppConfigHomeDir(), "projects", slugB, "sess-1",
+            "session.jsonl").toString();
+        assertThat(PathValidation.checkReadableInternalPath(otherTarget, envA).allowed())
+            .as("⭐ ③′ ②：cwd=A 时不得放行 slug(B) ⇒ 挡住「又变回 662 个 slug 的宽口」")
+            .isFalse();
+
+        // 对照：同一 env 下 slug(A) 放行（证明上面那条不是「整条不通」的假红）
+        String slugA = AutoMemPaths.sanitizePath(baseA.toString());
+        assertThat(PathValidation.checkReadableInternalPath(
+                Path.of(NexusaiPaths.getAppConfigHomeDir(), "projects", slugA, "sess-1", "session.jsonl")
+                    .toString(), envA).allowed())
+            .as("对照组：cwd=A 时 slug(A) 必须放行（否则上一条断言无鉴别力）")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("[E2][③′] 两半皆缺 ⇒ 两分支 fail-closed；缺一半 ⇒ 只那一半失效（⛔ 都不回落宽口）")
+    void e2_nullSession_failClosed() {
+        // (a) 两半皆缺（effectiveCwd=null 且 sessionProjectRoot=null）⇒ 空列表 ⇒ 两分支都不命中
+        PathValidationEnv empty = new PathValidationEnv(
+            null, null, null, "C:/proj", null,
+            "C:/Users/u/.claude", "C:/Users/u/.claude",
+            false, "C:/tmp/claude", false, null, null);
+        assertThat(empty.sessionMemoryDirs()).as("无 slug ⇒ session-memory 空（兑现 fail-closed 契约）").isEmpty();
+        assertThat(empty.projectDirs()).as("无 slug ⇒ project-dir 空（⛔ 不回落宽口 projects/ 根）").isEmpty();
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + PROJ_SLUG + "/session-1/session.jsonl", empty).allowed())
+            .as("两半皆缺 ⇒ 本项目 transcript 也不放行（fail-closed）")
+            .isFalse();
+
+        // (b) sessionId=null 但 cwd 在（⭐ 真实 forProcess 形态）⇒
+        //     project-dir 只含 **cwd 半**（③′ 有意行为）；session-memory 仍 fail-closed（无会话身份）
+        PathValidationEnv bashLike = PathValidationEnv.forProcess(Path.of("C:/proj"));
+        assertThat(bashLike.projectDirs())
+            .as("bash：只 cwd 半（⭐ 恰 1 项，⛔ 不是整个 projects/ 根）")
+            .hasSize(1);
+        assertThat(bashLike.sessionMemoryDirs())
+            .as("bash 无会话身份 ⇒ session-memory 仍 fail-closed")
+            .isEmpty();
+
+        // (c) sessionId 有、稳定根缺（介质侧解析失败态）⇒ 稳定根半失效，
+        //     但 cwd 半仍在（③′：bash/无绑定场景按 cwd 放行）—— 关键是**不回落整根**
+        PathValidationEnv noRoot = new PathValidationEnv(
+            "session-1", "agent-1", "C:/proj", "C:/proj", null,
+            "C:/Users/u/.claude", "C:/Users/u/.claude",
+            false, "C:/tmp/claude", false, null, null);
+        assertThat(noRoot.projectDirs())
+            .as("稳定根缺 ⇒ project-dirs 只含 cwd 半（⭐ 恰 1 项，⛔ 不得回落 {configHome}/projects/ 宽口）")
+            .containsExactly(Path.of("C:/Users/u/.claude", "projects", PROJ_SLUG).normalize().toString()
+                + java.io.File.separator);
+        assertThat(PathValidation.checkReadableInternalPath(
+                "C:/Users/u/.claude/projects/" + "C--some-other-project" + "/session-1/session.jsonl", noRoot)
+            .allowed())
+            .as("稳定根缺时仍不得放行**别的** slug（防「缺一半就变宽口」）")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("[E2] 与落盘介质同源：白名单 slug == SessionStorage.sessionProjectDir（活体对照）")
+    void e2_slugSameSourceAsMedia() {
+        // 经生产工厂构造（真实锚链：fromToolUseContext → CwdResolution.getProjectRoot），
+        // 再与**介质自己**的派生（SessionStorage.sessionProjectDir）逐字对照 —— 二者若不同源，
+        // 媒体写 → 权限读 回环即断裂（session memory 提取会静默拿到空内容），本断言即红。
+        String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
+            Map.of(), false, "", Path.of("C:/proj"));
+        PathValidationEnv env = PathValidationEnv.fromToolUseContext(tuc);
+
+        String mediaDir = SessionStorage.sessionProjectDir(sessionId).normalize().toString();
+        String expectSessionMemory = Path.of(mediaDir, sessionId, "session-memory").normalize().toString()
+            + java.io.File.separator;
+        // [③′] 两半 ⇒ 用 contains 断言「介质同源那一腿必须在内」（⛔ 不是 equals：还有 cwd 半）
+        assertThat(env.sessionMemoryDirs())
+            .as("白名单 session-memory 必须含与介质 SessionStorage.sessionProjectDir 同源的那一腿")
+            .contains(expectSessionMemory);
+        assertThat(env.projectDirs())
+            .as("白名单 project-dir 必须含介质同一 slug 目录（⛔ 不是整个 projects/ 根）")
+            .contains(mediaDir + java.io.File.separator);
+        // cwd 半也在（③′）：本 env effectiveCwd = "C:/proj" ⇒ slug C--proj
+        assertThat(env.projectDirs())
+            .as("③′ cwd 半：effectiveCwd 的 slug 也须在内")
+            .contains(Path.of(NexusaiPaths.getAppConfigHomeDir(), "projects", "C--proj")
+                .normalize().toString() + java.io.File.separator);
+    }
+
+    @Test
+    @DisplayName("[E2] 项目根解析失败（L1 命中但 L2 无绑定）⇒ 白名单 fail-closed（⛔ 不把抛带进权限路径）")
+    void e2_projectRootResolutionFailure_failClosedNotThrow() {
+        // 该态存在性：worktree 入口写了 SessionCwdHolder.originalCwd（L1 命中 ⇒ getOriginalCwdLayer
+        //   正常返回、不抛），但会话无绑定项目（L2 MISS）⇒ **getProjectRoot 抛**。
+        //   ⛔ 若无本测试，PathValidationEnv 里那个 catch 就是「声称守护、实际守不住」的冗余守卫
+        //   （本仓已被抓过多次）。本用例同时用 assertThatThrownBy 证明「catch 是承重的」。
+        String sid = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        com.nexusai.application.agent.agent.SessionCwdHolder.setOriginalCwd(sid, "C:/wt");
+        SessionProjectRoot.setDbResolver(s -> SessionProjectRoot.Lookup.unbound());
+        try {
+            assertThatThrownBy(() -> CwdResolution.getProjectRoot(sid))
+                .as("夹具前提自检：该态下 getProjectRoot 确实抛（⇒ PathValidationEnv 的 catch 承重）")
+                .isInstanceOf(IllegalStateException.class);
+
+            ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), sid, PermissionMode.DEFAULT,
+                List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
+                Map.of(), false, "", Path.of("C:/wt"));
+            PathValidationEnv env = PathValidationEnv.fromToolUseContext(tuc);
+
+            assertThat(env.sessionProjectRoot()).as("解析失败 ⇒ 稳定项目根为 null（⛔ 不回落 user.dir）").isNull();
+            // [③′] 稳定根半缺失 ⇒ 只剩 cwd 半（本 env effectiveCwd = "C:/wt"）——
+            //   ⭐ 恰 1 项即证明「缺一半」**不会**退化成整个 projects/ 根宽口。
+            assertThat(env.projectDirs())
+                .as("解析失败 ⇒ 稳定根半缺失、只剩 cwd 半（⛔ 不得回落 projects/ 宽口）")
+                .hasSize(1);
+            // ⭐ 非平凡断言（用**真实** config home 拼目标，⛔ 不是假前缀的同义反复）：
+            //   别的项目 slug 必须在白名单外。
+            assertThat(PathValidation.checkReadableInternalPath(
+                    Path.of(NexusaiPaths.getAppConfigHomeDir(), "projects", "C--some-other-project",
+                        "session-1", "session.jsonl").toString(), env).allowed())
+                .as("解析失败 ⇒ 别的项目 slug 仍不放行（cwd 半只覆盖 C--wt，⛔ 不是宽口）")
+                .isFalse();
+            // 该态下介质写盘 slug 不可得（介质侧同样抛）⇒ 其 session-memory 亦不放行
+            assertThat(PathValidation.checkReadableInternalPath(
+                    Path.of(NexusaiPaths.getAppConfigHomeDir(), "projects", PROJ_SLUG,
+                        "session-1", "session-memory", "summary.md").toString(), env).allowed())
+                .as("解析失败 ⇒ 介质写盘 slug 的 session-memory 不放行（fail-closed）")
+                .isFalse();
+        } finally {
+            com.nexusai.application.agent.agent.SessionCwdHolder.clearOriginalCwd(sid);
+            SessionProjectRoot.setDbResolver(s -> SessionProjectRoot.Lookup.sessionlessEnvironment());
+        }
+    }
+
 
     @Test
     @DisplayName("读白名单 plan 文件 → allow；写 plan 按 OD-20 passthrough")
@@ -214,7 +509,7 @@ class PathValidationTest {
 
         // scratchpad 未启用 → 写分支不命中（读分支仍经 project-temp 放行，CC :1688-1701 覆盖整个 temp 空间）
         PathValidationEnv disabled = new PathValidationEnv(
-            "session-1", "agent-1", "C:/proj", "C:/proj",
+            "session-1", "agent-1", "C:/proj", "C:/proj", "C:/proj",
             "C:/Users/u/.claude", "C:/Users/u/.claude", false, "C:/tmp/claude", false, null, null);
         assertThat(PathValidation.checkEditableInternalPath(scratch, disabled).allowed())
             .as("CC :410-412 isScratchpadEnabled 门：禁用时写分支不命中")
@@ -265,7 +560,7 @@ class PathValidationTest {
             .isTrue();
 
         PathValidationEnv overridden = new PathValidationEnv(
-            "session-1", "agent-1", "C:/proj", "C:/proj",
+            "session-1", "agent-1", "C:/proj", "C:/proj", "C:/proj",
             "C:/Users/u/.claude", "C:/Users/u/.claude", true, "C:/tmp/claude", true,
             "C:/Users/u/.claude/memory", null);
         assertThat(PathValidation.checkEditableInternalPath(memFile, overridden).allowed())
@@ -372,7 +667,7 @@ class PathValidationTest {
     @DisplayName("isPathAllowed：工作目录内 read → allowed；目录外 → blocked")
     void isPathAllowed_workingDir() {
         PathValidationEnv env = new PathValidationEnv(
-            "s1", null, "C:/proj", "C:/proj", "C:/Users/u/.claude", "C:/Users/u/.claude",
+            "s1", null, "C:/proj", "C:/proj", "C:/proj", "C:/Users/u/.claude", "C:/Users/u/.claude",
             false, "C:/tmp/claude", false, null, null);
         // 末位 cwd = 会话 cwd（root-relative edit 规则匹配根锚）；本用例 permCtx=null（无规则桶）
         // ⇒ cwd 不参与判定，取本场景会话 cwd "C:/proj"（与 env.effectiveCwd 同源）。
@@ -419,7 +714,7 @@ class PathValidationTest {
         // env 工作目录锚会话项目根（让 ② 确定性地走到 step3「工作目录内 read → allowed」收尾，
         //   不依赖 deny 以外的偶发分支）
         PathValidationEnv env = new PathValidationEnv(
-            "s1", null, sessionCwd, sessionCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
+            "s1", null, sessionCwd, sessionCwd, sessionCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
             false, "C:/tmp/claude", false, null, null);
 
         // ① 传会话 cwd → deny 命中（step1 deny 优先于其余各步）
@@ -447,7 +742,7 @@ class PathValidationTest {
     @DisplayName("validatePath：写操作 glob 阻断；UNC/~/shell 展开阻断（CC :373-485）")
     void validatePath_blocks() {
         PathValidationEnv env = new PathValidationEnv(
-            "s1", null, "C:/proj", "C:/proj", "C:/Users/u/.claude", "C:/Users/u/.claude",
+            "s1", null, "C:/proj", "C:/proj", "C:/proj", "C:/Users/u/.claude", "C:/Users/u/.claude",
             false, "C:/tmp/claude", false, null, null);
         assertThat(PathValidation.validatePath("C:/proj/*.txt", "C:/proj", null,
             PermissionUpdates.OperationType.WRITE, env, null).allowed()).isFalse();
@@ -492,7 +787,7 @@ class PathValidationTest {
         String originalCwd = "C:/proj";
         String cdSubdir = "C:/proj/sub"; // 模拟 bash cd 进子目录（effectiveCwd=子目录）
         PathValidationEnv env = new PathValidationEnv(
-            "s1", null, cdSubdir, originalCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
+            "s1", null, cdSubdir, originalCwd, originalCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
             false, "C:/tmp/claude", false, null, null);
 
         // cd 子目录内 → 放行（两种锚都放行；WHY: 子目录在 originalCwd 子树内）
@@ -520,7 +815,7 @@ class PathValidationTest {
         //   additional 语义不回归。
         String originalCwd = "C:/proj";
         PathValidationEnv env = new PathValidationEnv(
-            "s1", null, "C:/proj", originalCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
+            "s1", null, "C:/proj", originalCwd, originalCwd, "C:/Users/u/.claude", "C:/Users/u/.claude",
             false, "C:/tmp/claude", false, null, null);
         ToolPermissionContext permCtx = ToolPermissionContext.of(
             PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(),

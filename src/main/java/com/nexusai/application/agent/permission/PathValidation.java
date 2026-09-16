@@ -653,14 +653,26 @@ public final class PathValidation {
             return InternalPathResult.passthrough();
         }
 
-        // ── session-memory（CC :1620-1629）──
-        if (isWithin(normalized, env.sessionMemoryDir())) {
-            return InternalPathResult.allow("Session memory files are allowed for reading");
+        // ── session-memory（CC :1620-1629；isSessionMemoryPath）──
+        // [批 E2 · 假门改真门 / ③′] env.sessionMemoryDirs() = {configHome}/projects/{slug}/{sessionId}/session-memory/
+        //   的**两半**（cwd 半 + 稳定根半，与 project-dirs 同一 slug 集）。
+        //   无会话身份 ⇒ 空列表 ⇒ 本分支 fail-closed 不命中（⛔ 不再退化成
+        //   {configHome}/session-memory/ 假门）。
+        for (String dir : env.sessionMemoryDirs()) {
+            if (isWithin(normalized, dir)) {
+                return InternalPathResult.allow("Session memory files are allowed for reading");
+            }
         }
 
         // ── project-dir（CC :1633-1642；===projectDir || startsWith(projectDir+sep)）──
-        if (isWithin(normalized, env.projectDir())) {
-            return InternalPathResult.allow("Project directory files are allowed for reading");
+        // [批 E2 · 大门收窄 / ③′] env.projectDirs() 收窄到**当前项目**的两半（对齐 CC :284-291
+        //   isProjectDirPath = getProjectDir(getCwd())）：cwd 半（bash 通道经 forProcess 的
+        //   resolutionBase 天然可得）+ 稳定根半（介质同源）；旧的整个 projects/ 根宽口已删
+        //   （实测会放行 662 个项目的任意会话 transcript / session-memory）。
+        for (String dir : env.projectDirs()) {
+            if (isWithin(normalized, dir)) {
+                return InternalPathResult.allow("Project directory files are allowed for reading");
+            }
         }
 
         // ── plan 文件（CC :1645-1654）──
