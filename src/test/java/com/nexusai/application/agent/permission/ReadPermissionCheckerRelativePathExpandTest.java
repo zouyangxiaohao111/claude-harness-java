@@ -22,10 +22,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * FIX-A-R2 · backfilledInput（file_path 绝对化）透传 → 相对/~ 路径命中 read deny 规则。
  *
- * <p><b>验证的验收标准（WHY 安全缺口）</b>：权限内容规则（deny/ask）以<b>绝对 glob</b>
- * 形式登记（用户 settings 写的是绝对路径），而 LLM 传入的 {@code file_path} 可能是
- * {@code ~} 或相对路径。若相对/~ 路径不展开为绝对，就匹配不到绝对 deny/ask glob →
- * 落入 ask 兜底，绕过权限门。
+ * <p><b>验证的验收标准（WHY 安全缺口）</b>：权限内容规则（deny/ask）以
+ * <b>文件系统根锚定的绝对 glob</b> 形式登记（CC 写 {@code //…}；⛔ 裸绝对路径在 CC
+ * {@code patternWithRoot} 下表达的是 <b>source 根相对</b>路径，见 {@link #toFsRootGlob}），
+ * 而 LLM 传入的 {@code file_path} 可能是 {@code ~} 或相对路径。若相对/~ 路径不展开为绝对，
+ * 就匹配不到该 deny/ask glob → 落入 ask 兜底，绕过权限门。
  *
  * <p>CC 的机制是 <b>backfill</b>（而非 checker 二次展开）：{@code toolExecution.ts:781-793}
  * 在 hook/canUseTool 观察前把 {@code processedInput} 换成 backfill clone（
@@ -35,10 +36,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 透传给 permission 门（grep 复验 hard_metrics），checker 用原始 path 展开
  * （filesystem.ts:1048 {@code getPathsForPermissionCheck(path)}，与 CC 对称）。
  *
- * <p>本测试锁定 <b>backfill 绝对化 + checker 绝对匹配</b> 的集成安全属性：相对/~ 路径
+ * <p>本测试锁定 <b>backfill 绝对化 + checker 根锚定匹配</b> 的集成安全属性：相对/~ 路径
  * 经 {@code backfillObservableInput} 绝对化后，命中 read deny 规则（防相对/~ 路径绕过）。
  * StreamingToolExecutor 接线点（{@code permissionInput = backfilledInput}）由主 agent
  * grep 复验（hard_metrics）。
+ *
+ * <p>[P19] 本类两条夹具原先用「单 `/` 绝对串 glob」表达 deny 规则 —— 那是 P19 前 read 桶
+ * 无根锚的模型；CC 语义下（两桶共用 {@code patternWithRoot}）必须用 {@code //} 前缀，
+ * 否则规则会锚到 cwd 而漏掉目标文件（这正是本测试要防的绕过面）。
  */
 @DisplayName("FIX-A-R2 · backfill 绝对化透传 → 相对/~ 路径命中 read deny")
 class ReadPermissionCheckerRelativePathExpandTest {
@@ -73,9 +78,24 @@ class ReadPermissionCheckerRelativePathExpandTest {
         return Paths.get("target", "rpr-" + rand()).toAbsolutePath();
     }
 
-    /** glob 规则内容：绝对路径转 '/' + '/**'（Windows PathMatcher 下 '/' 即分隔符）。 */
-    private static String toGlob(Path dir) {
-        return dir.toAbsolutePath().toString().replace('\\', '/') + "/**";
+    /**
+     * 规则内容 → <b>文件系统根锚定</b>的 glob（CC patternWithRoot filesystem.ts:860-892）。
+     *
+     * <p>WHY（[P19] read 桶 root-relative 化后）：read 桶路径规则与 edit 桶共用同一份
+     * {@code matchesPathRuleRootRelative}（CC 两桶共用 {@code patternWithRoot}，
+     * filesystem.ts:943）⇒ 裸绝对路径（单 `/`）按 CC 语义被当作 <b>source 根</b>
+     * （session → cwd）相对，<b>不</b>表达「文件系统上的绝对路径」。要表达后者必须用
+     * {@code //} 前缀（Windows 盘符形 {@code //c/…}，CC :867-887）。
+     *
+     * @param dir 目录（{@code @TempDir} 或 target 下临时目录）
+     * @return {@code //<root>/<posixPath>/**}
+     */
+    private static String toFsRootGlob(Path dir) {
+        String abs = dir.toAbsolutePath().toString().replace('\\', '/');
+        if (abs.matches("^[a-zA-Z]:.*")) {
+            return "//" + abs.substring(0, 1).toLowerCase() + abs.substring(2) + "/**";
+        }
+        return "//" + abs + "/**";
     }
 
     private static PermissionRule rule(PermissionRuleSource source, PermissionBehavior behavior,
@@ -88,12 +108,12 @@ class ReadPermissionCheckerRelativePathExpandTest {
     // ──────────────────────────────────────────────────────────────────────
 
     @Test
-    @DisplayName("相对 file_path 经 backfill 绝对化后命中 read deny 绝对 glob → Deny(Rule)")
+    @DisplayName("相对 file_path 经 backfill 绝对化后命中 read deny 文件系统根 glob → Deny(Rule)")
     void relativeFilePath_backfilled_thenHitsReadDeny() {
         Path dir = targetDir();
         PathGuard guard = new PathGuard(dir);
         ReadFileTool tool = new ReadFileTool(guard);
-        PermissionRule deny = rule(PermissionRuleSource.SESSION, PermissionBehavior.DENY, "Read", toGlob(dir));
+        PermissionRule deny = rule(PermissionRuleSource.SESSION, PermissionBehavior.DENY, "Read", toFsRootGlob(dir));
         ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(
             PermissionRuleSource.SESSION, Set.of(deny)), Map.of()), dir);
         ReadPermissionChecker checker = new ReadPermissionChecker(new WritePermissionChecker());
@@ -112,12 +132,12 @@ class ReadPermissionCheckerRelativePathExpandTest {
     }
 
     @Test
-    @DisplayName("~ file_path 经 backfill 绝对化后命中 read deny 绝对 glob → Deny(Rule)")
+    @DisplayName("~ file_path 经 backfill 绝对化后命中 read deny 文件系统根 glob → Deny(Rule)")
     void tildeFilePath_backfilled_thenHitsReadDeny() {
         Path home = Paths.get(System.getProperty("user.home", "."));
         PathGuard guard = new PathGuard(targetDir());
         ReadFileTool tool = new ReadFileTool(guard);
-        PermissionRule deny = rule(PermissionRuleSource.SESSION, PermissionBehavior.DENY, "Read", toGlob(home));
+        PermissionRule deny = rule(PermissionRuleSource.SESSION, PermissionBehavior.DENY, "Read", toFsRootGlob(home));
         ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(
             PermissionRuleSource.SESSION, Set.of(deny)), Map.of()), targetDir());
         ReadPermissionChecker checker = new ReadPermissionChecker(new WritePermissionChecker());

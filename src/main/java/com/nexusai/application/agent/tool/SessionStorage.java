@@ -545,8 +545,11 @@ public final class SessionStorage {
      * reasoningDurationMs, timestamp: Instant.now 毫秒}}。append-only + JSONL 兼容；现有 tail 窗口
      * 读者（absorbTailField 按 type 读取）对未知 type 忽略，向后兼容。
      *
-     * <p><b>⚠️ workspaceDir 必须传【原始项目根】</b>（Path.of(CwdResolution.getOriginalCwdLayer(
-     * sessionId))），不能传 sessionProjectDir(sessionId)——getTranscriptPath 内部再
+     * <p><b>⚠️ workspaceDir 必须传【原始项目根】</b>
+     * （{@code Path.of(SessionStorage.sessionProjectRoot(sessionId))} = 稳定会话绑定项目根；
+     * ⛔ <b>不是</b> {@code CwdResolution.getOriginalCwdLayer(sessionId)} —— 后者 L1 是 worktree
+     * 重锚槽，进 worktree 会让写侧锚漂移 = F1/CC gh-30217 同型，见 {@link #sessionProjectRoot(String)}），
+     * 不能传 sessionProjectDir(sessionId)——getTranscriptPath 内部再
      * getProjectDir(workspaceDir) 一次，传已派生 project dir 会双重包裹成
      * {@code {configHome}/projects/{configHome}/projects/{slug}}（AgentColorCommand:195 /
      * CompactConversation:997 均传原始项目根）。
@@ -554,7 +557,7 @@ public final class SessionStorage {
      * <p>best-effort：任一副属（workspaceDir/sessionId/messageId/durationMs null）或写失败 → no-op
      * （仅 log.warn 中文日志），不阻断主流程（对齐 reAppendSessionMetadata 容错风格）。
      *
-     * @param workspaceDir        原始项目根（Path.of(CwdResolution.getOriginalCwdLayer(sessionId))）
+     * @param workspaceDir        原始项目根（{@code Path.of(SessionStorage.sessionProjectRoot(sessionId))}）
      * @param sessionId           会话 ID（DB 键 "sess-xxx"）
      * @param messageId           产生该推理的 assistant 消息 id
      * @param reasoningDurationMs 推理耗时 ms；null → no-op（无 reasoning 不记录）

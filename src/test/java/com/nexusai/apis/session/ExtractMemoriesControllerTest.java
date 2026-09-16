@@ -110,8 +110,10 @@ class ExtractMemoriesControllerTest {
         //   transcriptDir, '') —— 前端 POST 拿到完整手动 dream prompt 注入会话运行。若 200 但缺前缀头/
         //   缺 4 阶段指引 → 注入的是残缺 prompt，dream 无法按 CC 语义执行。
         String memoryRoot = tempDir.toString();
-        // [S2] transcriptDir = getProjectDir(getOriginalCwd(sessionId)) —— config-home 项目 slug 目录
-        //   （sess-dream-test 未绑 boundProject → CwdResolution 回落 user.dir，与端点同源派生）
+        // [S2] transcriptDir 锚 = 稳定槽 SessionStorage.sessionProjectRoot(sessionId)
+        //   （= CwdResolution.getProjectRoot）⇒ config-home 项目 slug 目录。
+        //   [F1 2026-09-16] ⛔ 不是 getProjectDir(getOriginalCwd(sessionId))（该层随 worktree 重锚）。
+        //   （sess-dream-test 未绑 boundProject → 本环境走无会话出口回落 user.dir，与端点同源派生）
         String transcriptDir = com.nexusai.application.agent.tool.SessionStorage
             .getProjectDir(java.nio.file.Path.of(System.getProperty("user.dir", "."))).toString();
 
@@ -123,6 +125,7 @@ class ExtractMemoriesControllerTest {
             // CC dream.ts:33 memoryRoot=getAutoMemPath() 注入 prompt（buildConsolidationPrompt 模板）
             .andExpect(content().string(org.hamcrest.Matchers.containsString("Memory directory: `" + memoryRoot + "`")))
             // CC dream.ts:34 transcriptDir=getProjectDir(getOriginalCwd()) 注入 prompt
+            //   （[F1 2026-09-16] Java 端同形态、入参换成稳定槽 sessionProjectRoot ⇒ 锚非 originalCwd）
             .andExpect(content().string(org.hamcrest.Matchers.containsString(
                 "Session transcripts: `" + transcriptDir + "` (large JSONL files")));
     }
@@ -184,7 +187,10 @@ class ExtractMemoriesControllerTest {
     @Test
     @DisplayName("[批 3a 反向实验 · 批 3c 诱饵已删] transcriptDir 取显式 sessionId 的 boundProject（不得回落 user.dir）")
     void transcriptDir_usesExplicitSessionId_notMdc() throws Exception {
-        // WHY（规则九）：CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd())。旧实现从
+        // WHY（规则九）：CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd())。[F1 2026-09-16]
+        //   Java 端锚已改稳定槽 SessionStorage.sessionProjectRoot（= CwdResolution.getProjectRoot）——
+        //   本用例经 SessionProjectRoot.setForSession 绑 boundProject，走的正是该稳定槽 ⇒ 本用例
+        //   恰是「transcriptDir 跟会话绑定项目走」的有效鉴别器。旧实现从
         //   裸 MDC 会话槽取会话 ⇒ 该槽第三态（上一请求残留的别的会话）会让 dream 去读**别的项目**的转录。
         //   装置：给显式 sessionId 绑一个与 user.dir 不同的 boundProject。
         //   若实现不用显式 sessionId（或回落 user.dir），transcriptDir 会变成 user.dir 派生值 → 红。

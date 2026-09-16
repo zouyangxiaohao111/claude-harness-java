@@ -324,7 +324,7 @@ public final class PostCompactAttachmentRestorer {
         for (java.util.Map.Entry<String, CompactConversation.ReadFileState> e : candidates) {
             String path = e.getKey();
             // [R1] deny 检查 · 对齐 CC isFileReadDenied（attachments.ts:3041 matchingRuleForInput 'read'/'deny'）
-            if (permCtx != null && isFileReadDenied(path, permCtx)) {
+            if (permCtx != null && isFileReadDenied(path, permCtx, workspaceDir)) {
                 if (log.isDebugEnabled()) {
                     log.debug("[PostCompactAttachmentRestorer] 附件重读 deny 跳过: {}", path);
                 }
@@ -418,14 +418,17 @@ public final class PostCompactAttachmentRestorer {
      *
      * @param path    待恢复文件路径
      * @param permCtx 权限上下文（null → false 不 deny）
+     * @param cwd     [P19] read 桶路径规则的 root-relative 匹配基准（会话工作目录，调用方持
+     *                {@code workspaceDir}）；null → 按「无会话」回落（CC 这边 cwd 来自
+     *                {@code toolPermissionContext}/{@code getCwd()}，Java 需显式传）
      * @return true = 文件读被 deny，恢复应跳过
      */
-    static boolean isFileReadDenied(String path, ToolPermissionContext permCtx) {
+    static boolean isFileReadDenied(String path, ToolPermissionContext permCtx, String cwd) {
         if (permCtx == null || path == null) {
             return false;
         }
         JsonNode input = JsonNodeFactory.instance.objectNode().put("file_path", path);
-        return RuleQuery.getDenyRuleByContentsForTool(permCtx, READ_TOOL_STUB, input) != null;
+        return RuleQuery.getDenyRuleByContentsForTool(permCtx, READ_TOOL_STUB, input, cwd) != null;
     }
 
     /**

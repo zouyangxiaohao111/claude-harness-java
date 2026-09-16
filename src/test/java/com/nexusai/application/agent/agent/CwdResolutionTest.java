@@ -69,12 +69,59 @@ class CwdResolutionTest {
     //   **整条删除**（生产 0 写入点 ⇒ 死管线；CC 的 cwdOverrideStorage 在本仓由 TUC.effectiveCwd 承接）。
     //   ⛔ 这是「机制消失 ⇒ 无替代可锚」的删除，**不是**「用例被弱化」；不得用其它层伪造「override 仍生效」。
 
+    /**
+     * ⚠️⚠️ <b>[批 P17 2026-09-16] 本用例的夹具此前是「宣称守护 X、实际守不住 X」的假夹具 —— 修复记录必须显式保留</b>。
+     *
+     * <p><b>缺陷（P15b 独立发现 · P17 修复）</b>：原夹具用<b>字面量</b>
+     * {@code setForSession("sess-a", "/some/bound-project")} 充当 boundProject，而该路径在磁盘上
+     * <b>不存在</b> ⇒ 被 {@code SessionProjectRoot.setForSession} 的 {@code isValidProjectRoot}
+     * （绝对路径 + 目录存在）<b>拒绑</b>（打「拒绝绑定无效项目根」WARN）⇒ 冻结表里<b>根本没有</b>
+     * {@code sess-a} 的绑定。⇒ {@code getCwd} 返回 sessionCwd 的<b>真实原因</b>是「压根没有
+     * boundProject」，<b>不是</b>「sessionCwd 压过了 boundProject」⇒ 断言文案宣称的那条不变量
+     * <b>从未被验证过</b>。
+     *
+     * <p><b>⭐ 「零鉴别力」的实测读数（P17 · 改前夹具）</b>：把 {@code CwdResolution.getCwd} 改成
+     * <b>boundProject 优先于 sessionCwd</b>（= 恰好违反本用例宣称的那条不变量，且不改变「只有
+     * sessionCwd 时仍返回 sessionCwd」）⇒ 改前夹具<b>仍然绿</b>
+     * （{@code Tests run: 1, Failures: 0, Errors: 0}，EXIT=0）。
+     * <br>⚠️ <b>必须区分的一条</b>：把 L1 整段<b>删掉</b>确实会让改前夹具变红，但红的是
+     * 「无绑定 ⇒ 落到 L2 ⇒ 回源解析器未接线 ⇒ {@code resolutionFailure} ⇒ fail-loud 抛」这条
+     * <b>与本不变量无关</b>的路径 ⇒ ⛔ 不得用它当作「夹具有效」的证据。
+     *
+     * <p><b>修法（三步，⛔ 缺一不可）</b>：①boundProject 改用 {@code @TempDir} 下的<b>真实目录</b>；
+     * ②<b>显式断言前置态</b>（绑定确实生效 / sessionCwd 槽确实非空且指向 sessionDir / 两值确实不同）
+     * —— 否则夹具会<b>静默退化</b>回原样（P15b 臂 8 的教训：先造有效态，再把「它确实有效」断言出来）；
+     * ③再断言结果 == sessionCwd。
+     *
+     * <p><b>RED（反向实验 · 修复后实测必红）</b>：① 让 boundProject 优先于 sessionCwd ⇒ 红
+     * （返回值 = boundProject ≠ sessionCwd）；② 删掉 L1 整段 ⇒ 红（同上）。
+     */
     @Test
     @DisplayName("场景②: sessionCwd 非空 → 返回 sessionCwd (对齐 CC STATE.cwd；[S2 F-07] override 层已删)")
-    void scenario2_sessionCwdWinsWhenNoOverride(@TempDir Path sessionDir) throws Exception {
+    void scenario2_sessionCwdWinsWhenNoOverride(@TempDir Path sessionDir,
+                                                @TempDir Path boundProjectDir) throws Exception {
         // WHY: CC pwd() 回 getCwdState()=STATE.cwd。worktree 入口与 cd 共用此层 [Fix-R1]。
-        SessionProjectRoot.setForSession("sess-a", "/some/bound-project");
+        //   ⭐ [批 P17] 两层都必须<b>真的有值</b>，「压过」才有意义 —— 否则测的是「无绑定时返回
+        //   sessionCwd」（缺陷记录见方法 javadoc）。
+        SessionProjectRoot.setForSession("sess-a", boundProjectDir.toString());
         SessionCwdHolder.set("sess-a", sessionDir.toString());
+
+        // ⭐ 前置态断言：不显式断言 ⇒ 夹具静默退化（本用例已静默退化过一次，见方法 javadoc）
+        String frozenBound = SessionProjectRoot.getForSession("sess-a");
+        assertThat(frozenBound)
+            .as("前置态①：boundProject 必须**真的**绑上了 —— 原夹具喂不存在的字面量被 setForSession 拒绑，"
+                + "测的就不是本不变量（绑定失败时该值为 null）")
+            .isNotNull();
+        assertThat(CwdResolution.normalizeCwd(frozenBound))
+            .as("前置态①b：且绑定的正是本用例的 boundProject 目录（⛔ 冻结的是 setForSession 的原值，"
+                + "故经 normalizeCwd 后比较）")
+            .isEqualTo(boundProjectDir.toRealPath().toString());
+        assertThat(SessionCwdHolder.get("sess-a"))
+            .as("前置态②：sessionCwd 槽必须非空且指向本用例的 sessionDir（否则 L1 无从『压过』）")
+            .isEqualTo(sessionDir.toRealPath().toString());
+        assertThat(sessionDir.toRealPath().toString())
+            .as("前置态③：两层值必须不同 —— 相同则『压过』无从谈起（断言会恒真，仍是零鉴别力夹具）")
+            .isNotEqualTo(boundProjectDir.toRealPath().toString());
 
         String result = CwdResolution.getCwd("sess-a");
 

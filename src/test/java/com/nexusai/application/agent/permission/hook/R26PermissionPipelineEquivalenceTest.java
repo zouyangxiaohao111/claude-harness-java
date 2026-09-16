@@ -113,7 +113,14 @@ class R26PermissionPipelineEquivalenceTest {
                 PermissionRuleValue.wholeTool("Bash"))));
         ToolPermissionContext parent = ToolPermissionContext.of(
             PermissionMode.DEFAULT, parentAllow, Map.of(), Map.of(), Map.of());
-        return ExecAgentHook.buildHookPermissionContext(parent, "sessions/sess-1/transcript.jsonl");
+        // [P19] transcriptPath 必须是<b>绝对</b>路径 —— 生产传入的是
+        //   {@code SessionStorage.getTranscriptPath(...)} 的 Path（绝对），CC 亦然
+        //   （execAgentHook.ts:77-79 getAgentTranscriptPath/getTranscriptPath）。CC 写的是
+        //   {@code Read(/${transcriptPath})}（execAgentHook.ts:172）：绝对路径已以 `/` 开头，
+        //   再拼一个 `/` 得到 {@code //…} ⇒ patternWithRoot 的<b>文件系统根</b>分支
+        //   （filesystem.ts:860-892）。旧夹具传相对路径 ⇒ 规则退化为单 `/`（= session 根 = cwd），
+        //   与非绝对 transcriptPath 不自洽（CC 下同样不命中）。
+        return ExecAgentHook.buildHookPermissionContext(parent, "/sessions/sess-1/transcript.jsonl");
     }
 
     /** DONT_ASK + SESSION 内容 allow 规则（Bash(git status:*)）· 无 whole-tool 规则。 */

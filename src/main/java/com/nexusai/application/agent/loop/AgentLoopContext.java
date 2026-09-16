@@ -391,8 +391,15 @@ public record AgentLoopContext(
         }
 
         /**
-         * workspaceDir 默认解析 · 对齐 CC getOriginalCwd()（sessionStorage.ts:202-205 subagent
-         * transcript 锚 getProjectDir(getOriginalCwd())）。
+         * workspaceDir 默认解析 · <b>无会话兜底</b>（{@code CwdResolution.getOriginalCwdLayerForNonSession()}
+         * = 归一化进程 {@code user.dir}）。
+         *
+         * <p>[F1 2026-09-16] 原 javadoc 以「CC subagent transcript 锚
+         * {@code getProjectDir(getOriginalCwd())}（sessionStorage.ts:202-205）」为由解释本默认值 ——
+         * 该理由<b>已不成立</b>：transcript 锚已迁至稳定槽 {@code SessionStorage.sessionProjectRoot}
+         * （= {@link CwdResolution#getProjectRoot}），不再取 originalCwd 层。本方法取的是
+         * {@link CwdResolution#getOriginalCwdLayerForNonSession()}（<b>无会话命名出口</b>），
+         * 与 transcript 锚无隶属关系（二者只在「确无会话」时同为 {@code user.dir}）。
          *
          * <p>[批 3c] 显式传 {@code null} = <b>本处无会话来源</b>：唯一调用点是本类字段初始化
          * （{@code private Path workspaceDir = Path.of(resolveDefaultWorkspaceDir())}，静态方法，
@@ -458,8 +465,13 @@ public record AgentLoopContext(
         private ContentReplacementState contentReplacementState = ContentReplacementState.create();
         /** workspace dir · 默认 user.dir；测试可覆盖。
          *
-         *  <p>cwd-align-ext：默认取会话 originalCwd（CC subagent transcript 锚 getProjectDir(getOriginalCwd())
-         *  sessionStorage.ts:202-205）；无 sessionId 回落 user.dir（方案 1，零行为变化）。 */
+         *  <p>cwd-align-ext：默认取 {@code CwdResolution.getOriginalCwdLayerForNonSession()}
+         *  （<b>无会话命名出口</b> = 归一化进程 user.dir），空/空白再回落 raw user.dir
+         *  （方案 1，零行为变化）。
+         *  [F1 2026-09-16] 原注称「CC subagent transcript 锚 getProjectDir(getOriginalCwd())
+         *  sessionStorage.ts:202-205」—— <b>已不成立</b>：transcript 锚 = 稳定槽
+         *  {@code SessionStorage.sessionProjectRoot}（= {@code CwdResolution.getProjectRoot}），
+         *  本默认值与 transcript 锚无关。 */
         private Path workspaceDir = Path.of(resolveDefaultWorkspaceDir());
         /**
          * [批 4b-2] 本 run 的<b>显式项目锚</b>（该回合的项目根，<b>非</b>会话键）· 唯一生产来源 =

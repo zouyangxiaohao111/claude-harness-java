@@ -242,7 +242,7 @@ public class PowerShellPermissionChain {
         // STEP 1+2a: deny/ask 内容规则（精确 + 前缀），CC :661-711。deny 早返回；ask → deferred（CC :701-723）
         ToolPermissionContext permCtx = ctx != null ? ctx.permissionContext() : null;
         PermissionRule contentRule = permCtx != null && tool != null
-            ? RuleQuery.getRuleForInput(permCtx, tool, input)
+            ? RuleQuery.getRuleForInput(permCtx, tool, input, psCwd(ctx))
             : null;
         if (contentRule != null && contentRule.ruleBehavior() == PermissionBehavior.DENY) {
             if (log.isDebugEnabled()) {
@@ -886,7 +886,8 @@ public class PowerShellPermissionChain {
             // deny 规则扫描（对归一化片段，CC :841-852；多词规则 Remove-Item foo:* 仍命中）
             if (permCtx != null && tool != null) {
                 PermissionRule denyRule =
-                    RuleQuery.getDenyRuleByContentsForTool(permCtx, tool, inputWithCommand(normalizedFrag));
+                    RuleQuery.getDenyRuleByContentsForTool(
+                        permCtx, tool, inputWithCommand(normalizedFrag), psCwd(ctx));
                 if (denyRule != null && denyRule.ruleBehavior() == PermissionBehavior.DENY) {
                     return new PermissionResult.Deny(
                         "Permission to use PowerShell with command " + command + " has been denied.",
@@ -895,6 +896,19 @@ public class PowerShellPermissionChain {
             }
         }
         return null;
+    }
+
+    /**
+     * [P19] 会话 cwd 字符串形式 · 供 {@code RuleQuery} content 规则的 root-relative 基准。
+     *
+     * <p>PowerShell 工具名不是 PathTool ⇒ 本链的规则匹配<b>不消费</b> cwd（形参仅为全链签名
+     * 一致）。仍显式取 {@code ctx.effectiveCwd()}（⛔ 不经 ThreadLocal/MDC），保值不留隐式回落。
+     *
+     * @param ctx 工具调用上下文（可 null）
+     * @return 会话 cwd 字符串；无值返回 null
+     */
+    private static String psCwd(ToolUseContext ctx) {
+        return ctx != null && ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null;
     }
 
     private JsonNode inputWithCommand(String command) {

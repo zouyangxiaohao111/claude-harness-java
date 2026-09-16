@@ -93,7 +93,7 @@ class EditFileToolErrorCode2Test {
      * 文件系统根锚定的 deny 规则内容（CC patternWithRoot filesystem.ts:860-892）。
      *
      * <p>WHY（OPD-WF5-FS-052 root-relative 重构后）: Edit 路径规则走
-     * {@code matchesEditPathRuleRootRelative} —— 裸绝对路径（无 {@code //} 前缀）按 CC
+     * {@code matchesPathRuleRootRelative} —— 裸绝对路径（无 {@code //} 前缀）按 CC
      * patternWithRoot 无前缀分支被当作 cwd 相对 → 在测试进程 cwd（模块根）下永不命中
      * {@code @TempDir} 下的文件。必须用 {@code //} 前缀锚定文件系统根（Windows 盘符形
      * {@code //c/...}，CC :867-887）才能命中绝对路径。

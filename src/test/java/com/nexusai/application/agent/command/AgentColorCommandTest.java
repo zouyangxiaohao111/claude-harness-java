@@ -678,8 +678,11 @@ class AgentColorCommandTest {
         f.set(cmd, tool);
     }
 
-    // WF-1C · 会话存档根走统一入口 originalCwd 层（DEL-05 / G8 / AC-1）
-    // 对齐 CC sessionStorage.ts:202-205 getTranscriptPath():
+    // WF-1C · 会话存档根走统一入口（DEL-05 / G8 / AC-1）
+    // [F1 2026-09-16] 锚 = 稳定槽 SessionStorage.sessionProjectRoot（= CwdResolution.getProjectRoot），
+    //   ⛔ 不是 originalCwd 层（该层随 EnterWorktreeTool 重锚 ⇒ 进 worktree 换根）。
+    // CC sessionStorage.ts:202-205 getTranscriptPath() 的算法（本仓对齐的是「先取会话项目目录、
+    //   再派生 slug」这一形态，只是入参换成了稳定槽）：
     //   projectDir = getSessionProjectDir() ?? getProjectDir(getOriginalCwd())
 
     @AfterEach
@@ -693,7 +696,10 @@ class AgentColorCommandTest {
     void colorCommand_boundProject_transcriptLandsInProjectDir() throws Exception {
         // WHY（规则九）：CC sessionStorage.ts:202-205 getTranscriptPath 的 projectDir 取
         //   getSessionProjectDir() ?? getProjectDir(getOriginalCwd())——会话存档根必须跟随会话绑定的
-        //   项目目录，而非 JVM 启动 user.dir。旧 Java 端 AgentColorCommand.workspaceDir() 恒返回
+        //   项目目录，而非 JVM 启动 user.dir。[F1 2026-09-16] 引的是 CC 算法；Java 端「会话绑定项目
+        //   目录」由稳定槽 SessionStorage.sessionProjectRoot（= CwdResolution.getProjectRoot）提供，
+        //   ⛔ 不是 getOriginalCwdLayer（本用例未进 worktree，两槽同值 ⇒ 断言不受影响）。
+        //   旧 Java 端 AgentColorCommand.workspaceDir() 恒返回
         //   user.dir（:156 DEL-05），导致绑定项目场景下 transcript 落到启动目录而非项目目录，
         //   与 CC 行为漂移（G8）。若业务逻辑改为走统一入口后该测试仍报错，说明接线未真正落地。
         Path projectDir = Files.createTempDirectory("wf1c-project-");
@@ -721,14 +727,16 @@ class AgentColorCommandTest {
                 .as("统一入口应解析到绑定的项目目录（realpath 归一化后等价）")
                 .isEqualTo(projectDir.toRealPath());
 
-            // [S2] transcript 锚点迁 config-home：{configHome}/projects/{sanitizePath(originalCwdLayer)}/{sessionId}.jsonl
-            //   经 sessionProjectDir 同 seam 派生（内部 getOriginalCwdLayer 已 realpath+NFC 归一）
+            // [S2] transcript 锚点迁 config-home：{configHome}/projects/{sanitizePath(sessionProjectRoot)}/{sessionId}.jsonl
+            //   经 sessionProjectDir 同 seam 派生（内部 sessionProjectRoot 已 realpath+NFC 归一）
+            //   [F1 2026-09-16] slug 源 = 稳定槽 SessionStorage.sessionProjectRoot
+            //   （= CwdResolution.getProjectRoot），⛔ 不再是 originalCwdLayer（随 worktree 重锚）
             transcriptInProject = com.nexusai.application.agent.tool.SessionStorage
                 .sessionProjectDir(sessionId.toString()).resolve(sessionId + ".jsonl");
             transcriptInUserDir = Path.of(System.getProperty("user.dir", ".")).resolve(sessionId + ".jsonl");
 
             assertThat(Files.isRegularFile(transcriptInProject))
-                .as("transcript 必须落到 config-home projects slug 目录（S2，对齐 CC getProjectDir(originalCwd)）")
+                .as("transcript 必须落到 config-home projects slug 目录（S2，锚 = 稳定槽 sessionProjectRoot = CwdResolution.getProjectRoot；[F1 2026-09-16] ⛔ 非 getProjectDir(originalCwd)）")
                 .isTrue();
             assertThat(Files.isRegularFile(transcriptInUserDir))
                 .as("transcript 不得漂移到 user.dir（DEL-05 旧直读行为）")
@@ -776,12 +784,14 @@ class AgentColorCommandTest {
                 .as("未绑定回落 user.dir")
                 .isEqualTo(Path.of(System.getProperty("user.dir", ".")).toRealPath());
 
-            // [S2] transcript 锚点迁 config-home：{configHome}/projects/{sanitizePath(originalCwdLayer)}/{sessionId}.jsonl
-            //   经 sessionProjectDir 同 seam 派生（内部 getOriginalCwdLayer 已 realpath+NFC 归一）
+            // [S2] transcript 锚点迁 config-home：{configHome}/projects/{sanitizePath(sessionProjectRoot)}/{sessionId}.jsonl
+            //   经 sessionProjectDir 同 seam 派生（内部 sessionProjectRoot 已 realpath+NFC 归一）
+            //   [F1 2026-09-16] slug 源 = 稳定槽 SessionStorage.sessionProjectRoot
+            //   （= CwdResolution.getProjectRoot），⛔ 不再是 originalCwdLayer（随 worktree 重锚）
             transcript = com.nexusai.application.agent.tool.SessionStorage.sessionProjectDir(sessionId.toString())
                 .resolve(sessionId + ".jsonl");
             assertThat(Files.isRegularFile(transcript))
-                .as("未绑定 → transcript 落 config-home projects slug（对齐 CC getProjectDir(getOriginalCwd())）").isTrue();
+                .as("未绑定 → transcript 落 config-home projects slug（锚 = 稳定槽 sessionProjectRoot = CwdResolution.getProjectRoot；[F1 2026-09-16] ⛔ 非 getProjectDir(getOriginalCwd())）").isTrue();
         } finally {
             if (transcript != null) {
                 try { Files.deleteIfExists(transcript); } catch (IOException ignored) { }

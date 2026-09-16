@@ -1905,8 +1905,10 @@ public class ChatService {
      *
      * <p>best-effort：durationMs==null（无 reasoning）/ sessionId==null / messageId==null → 直接
      * return（不记录）；写失败仅 log.warn 中文日志，不阻断 DB 落库（以 DB 为权威，transcript 仅
-     * 审计/未来用途）。workspaceDir 传原始项目根（CwdResolution.getOriginalCwdLayer(sessionId)），
-     * 防 getTranscriptPath 双重包裹（SessionStorage.appendReasoningDuration JavaDoc 已标注）。
+     * 审计/未来用途）。workspaceDir 传稳定会话绑定项目根
+     * （{@code SessionStorage.sessionProjectRoot(sessionId)}），防 getTranscriptPath 双重包裹
+     * （SessionStorage.appendReasoningDuration JavaDoc 已标注；⛔ 不得传
+     * {@code CwdResolution.getOriginalCwdLayer} —— 随 worktree 重锚 = F1 同型）。
      *
      * @param sessionId           会话 ID（DB 键 "sess-xxx"）
      * @param messageId           产生该推理的 assistant 消息 id
@@ -1928,7 +1930,7 @@ public class ChatService {
             SessionStorage.appendReasoningDuration(workspaceDir, sessionId, messageId, reasoningDurationMs);
         } catch (Exception e) {
             // [S2 · F-10 2026-09-14 · 用户裁定 #6] 日志提为 ERROR（原 WARN）：本 catch 覆盖了
-            //   :1920 的 CwdResolution.getOriginalCwdLayer(sessionId) 的 fail-loud ⇒ 「项目根解析
+            //   上一行 SessionStorage.sessionProjectRoot(sessionId) 的 fail-loud ⇒ 「项目根解析
             //   失败」会被降级成一条 WARN 且继续走「本 turn 不写 transcript」。分类 = (b) 跳过，
             //   故保留 best-effort 语义（不阻断主流程），但必须 ≥WARN 且如实反映严重度（ERROR）。
             log.error("[ChatService] appendReasoningDurationToTranscript 失败（best-effort 跳过，不阻断主流程）: "

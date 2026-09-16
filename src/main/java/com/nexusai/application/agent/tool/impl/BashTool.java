@@ -3284,7 +3284,8 @@ public class BashTool implements Tool {
         if (ctx != null && ctx.permissionContext() != null) {
             com.nexusai.application.agent.permission.PermissionRule askRule =
                 com.nexusai.application.agent.permission.check.RuleQuery
-                    .getAskRuleByContentsForTool(ctx.permissionContext(), this, input);
+                    .getAskRuleByContentsForTool(ctx.permissionContext(), this, input,
+                        ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null);
             if (askRule != null) {
                 if (log.isDebugEnabled()) {
                     log.debug("Bash 内容 ask 规则命中 → Ask(Rule 归因): rule={} command={}",
@@ -3526,7 +3527,8 @@ public class BashTool implements Tool {
             // step 5: prefix allow 兜底（CC bashPermissions.ts:1129-1139）
             com.nexusai.application.agent.permission.PermissionRule allowRule =
                 com.nexusai.application.agent.permission.check.RuleQuery
-                    .getAllowRuleByContentsForTool(ctx.permissionContext(), this, input);
+                    .getAllowRuleByContentsForTool(ctx.permissionContext(), this, input,
+                        ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null);
             if (allowRule != null) {
                 if (log.isDebugEnabled()) {
                     log.debug("Bash content prefix allow 命中（CC bashPermissions.ts:1129-1139）: rule={} command={}",

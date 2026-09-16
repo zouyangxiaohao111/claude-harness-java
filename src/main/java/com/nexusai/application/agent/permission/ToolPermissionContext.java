@@ -9,8 +9,13 @@ import java.util.Set;
  * 工具权限上下文 · 对齐 CC {@code Tool.ts:123-138} (ToolPermissionContext)
  *
  * <h2>职责</h2>
- * <p>把"8 source 规则合并结果 + 当前 mode + 工作目录"打包成一个 record，
+ * <p>把"8 source 规则合并结果 + 当前 mode"打包成一个 record，
  * 让 10 层检查函数（{@code CheckLayer}）只需一个 {@code permCtx} 参数。
+ *
+ * <p>⚠️ [P19] 本 record <b>不带工作目录</b>（CC {@code ToolPermissionContext} 也不带——
+ * cwd 由 {@code getCwd()} 全局取；Java 无 ambient cwd 单例）⇒ 需要 cwd 的匹配/校验入口
+ * 必须<b>显式传形参</b>（如 {@code RuleQuery.getEditRuleByContentsForPath(..., cwd)} 与
+ * {@code RuleQuery.*ByContentsForTool(..., cwd)}，值源 {@code ToolUseContext.effectiveCwd()}）。
  *
  * <h2>字段对应</h2>
  * <ul>

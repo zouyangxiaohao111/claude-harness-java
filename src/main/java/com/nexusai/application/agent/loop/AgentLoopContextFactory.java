@@ -432,9 +432,10 @@ public class AgentLoopContextFactory {
     /**
      * 全新会话级状态 · taskService / workspaceDir 注入（对齐 LlmAgentLoop 实例字段）。
      *
-     * @param projectRoot 会话 projectRoot（非空 → 直接作为 workspaceDir；null/空白 → 走末级兜底）
+     * @param projectRoot 会话 projectRoot（非空 → 直接作为 workspaceDir；null/空白 → 走末级兜底
+     *                    {@link #resolveFallbackWorkspaceDir(String)}）
      * @param sessionId   会话 ID（[批 3c] 显式会话来源；仅末级兜底分支消费，null = 无会话 →
-     *                    兜底回落 user.dir）
+     *                    兜底走无会话命名出口（进程 user.dir））
      */
     private AgentLoopContext.LoopSessionState freshSession(String projectRoot, String sessionId) {
         AgentLoopContext.LoopSessionState session = new AgentLoopContext.LoopSessionState();
@@ -444,9 +445,11 @@ public class AgentLoopContextFactory {
             //   （修 M-07 user.dir 兜底链：子代理 STOP hook transcript_path 指向 P/<session>/...）。
             session.setWorkspaceDir(Path.of(projectRoot));
         } else {
-            // cwd-align-ext：末级兜底改走会话 originalCwd（CC getOriginalCwd() subagent transcript 锚）；
+            // [批 P21 2026-09-16] 末级兜底锚 = 稳定会话项目根（CwdResolution.getProjectRoot，
+            //   CC getProjectRoot() state.ts:498-508）；⛔ 原取 getOriginalCwdLayer 是 F1
+            //   （CC gh-30217）同型 —— 该层 L1 被 EnterWorktreeTool 重锚，进 worktree 会漂移。
             //   [批 3c] sessionId 由本方法形参显式传入（原裸 MDC 会话槽读点已废），
-            //   null（无会话）回落 user.dir（零行为变化）。
+            //   null（无会话）→ getProjectRoot 走无会话命名出口 = 进程 user.dir（零行为变化）。
             session.setWorkspaceDir(workspaceDir != null ? workspaceDir
                 : Path.of(resolveFallbackWorkspaceDir(sessionId)));
         }
@@ -454,16 +457,40 @@ public class AgentLoopContextFactory {
     }
 
     /**
-     * workspaceDir 末级兜底 · 对齐 CC getOriginalCwd()（subagent/hook transcript 锚）。
+     * workspaceDir 末级兜底 · 锚 <b>稳定会话项目根</b>
+     * （{@link CwdResolution#getProjectRoot(String)}，对齐 CC {@code getProjectRoot()}
+     * {@code bootstrap/state.ts:498-508}）。
+     *
+     * <p><b>WHY 必须是稳定锚（⛔ 不是 {@code getOriginalCwdLayer}）</b>：本方法产出的
+     * {@code workspaceDir} 被其<b>全部消费点</b>当作<b>会话绑定项目根</b>使用 —— transcript /
+     * tool-results / content-replacement / per-project 记忆目录 / subagent transcript 载荷都经
+     * {@code SessionStorage.getProjectDir(workspaceDir)} 派生一次（见 {@code SessionStorage:143}）。
+     * 若取 {@link CwdResolution#getOriginalCwdLayer(String)}，其 L1 槽
+     * （{@code SessionCwdHolder.getOriginalCwd}）会被 {@code EnterWorktreeTool.applySessionCwd}
+     * <b>重锚</b> ⇒ worktree 会话的兜底值随「进入 worktree」漂移 = <b>与 F1（CC gh-30217）同型</b>
+     * （批 P13 已就 transcript 存储根修过同一根因，本处是同一根因在 {@code workspaceDir} 兜底上的
+     * 另一实例）。原 javadoc 以「对齐 CC getOriginalCwd()（subagent/hook transcript 锚）」为由解释
+     * 本取值 —— <b>该理由已不成立</b>：transcript 锚已迁至稳定槽
+     * （{@code SessionStorage.sessionProjectRoot}），本兜底与 transcript 锚无隶属关系。
      *
      * <p>[批 3c] sessionId 由 {@link #freshSession(String, String)} 调用点显式传入（build 链上的
-     * {@code streamSessionId} / forSession 形参；shared() 无会话 → null）——原裸 MDC 会话槽读点已废，
-     * 无 sessionId 回落 user.dir（零行为变化）。
+     * {@code streamSessionId} / forSession 形参；shared() 无会话 → null）——原裸 MDC 会话槽读点已废。
      *
-     * @param sessionId 会话 ID（null = 无会话 → 回落 user.dir）
+     * <p>⚠️ <b>[批 P21 实测] 可达性</b>：生产可达的调用形态<b>只有 {@code sessionId == null}</b>
+     * 一种 —— {@link #shared(String)} 硬编码传 null，而会传非 null sessionId 的两条路径
+     * （3 参 {@link #forSession(String, String, String)} / {@link #build} 收到 null session）经全仓
+     * grep <b>无生产调用方</b>。故本行与 {@code AgentLoopContext.resolveDefaultWorkspaceDir()}
+     * （同取无会话命名出口）在<b>可达路径上取值相同</b>；改用 {@code getProjectRoot} 是
+     * <b>零行为变化</b>地消除「sessionId 一旦成为真值就锚进 worktree」的潜伏缺陷，
+     * 同时保住「有会话却解析不出项目根 ⇒ fail-loud」语义（⛔ 不用无会话出口
+     * {@code getOriginalCwdLayerForNonSession()} 冒充项目根 —— {@code CwdResolution:514}
+     * 明文禁止「有 sessionId 的调用方」用它绕开 fail-loud）。
+     *
+     * @param sessionId 会话 ID（null = 无会话 → {@code getProjectRoot} 走无会话命名出口 = 进程 user.dir）
      */
     private static String resolveFallbackWorkspaceDir(String sessionId) {
-        String cwd = CwdResolution.getOriginalCwdLayer(sessionId);
-        return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
+        String projectRoot = CwdResolution.getProjectRoot(sessionId);
+        return projectRoot != null && !projectRoot.isBlank() ? projectRoot
+            : System.getProperty("user.dir", ".");
     }
 }

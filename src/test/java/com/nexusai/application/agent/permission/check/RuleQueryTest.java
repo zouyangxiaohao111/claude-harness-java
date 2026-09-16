@@ -11,6 +11,7 @@ import com.nexusai.application.agent.permission.PermissionRuleValue;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.PathGuard;
+import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.EditFileTool;
 import com.nexusai.application.agent.tool.impl.PowerShellTool;
@@ -263,7 +264,7 @@ class RuleQueryTest {
         void powerShellDenyRule_reachable_ci() {
             ToolPermissionContext permCtx = denyCtx(rule("PowerShell", "Remove-Item:*"));
             PermissionRule hit = RuleQuery.getDenyRuleByContentsForTool(
-                permCtx, new PowerShellTool(), commandInput("remove-item -Recurse -Force C:\\temp"));
+                permCtx, new PowerShellTool(), commandInput("remove-item -Recurse -Force C:\\temp"), null);
             assertThat(hit).as("remove-item 应命中 PowerShell(Remove-Item:*)").isNotNull();
             assertThat(hit.ruleValue().ruleContent()).isEqualTo("Remove-Item:*");
         }
@@ -273,7 +274,7 @@ class RuleQueryTest {
         void powerShellDenyRule_exact_reachable() {
             ToolPermissionContext permCtx = denyCtx(rule("PowerShell", "Get-Process"));
             PermissionRule hit = RuleQuery.getDenyRuleByContentsForTool(
-                permCtx, new PowerShellTool(), commandInput("GET-PROCESS"));
+                permCtx, new PowerShellTool(), commandInput("GET-PROCESS"), null);
             assertThat(hit).as("GET-PROCESS 应命中 PowerShell(Get-Process)").isNotNull();
         }
 
@@ -282,7 +283,7 @@ class RuleQueryTest {
         void powerShellDenyRule_noMatch() {
             ToolPermissionContext permCtx = denyCtx(rule("PowerShell", "Get-Process"));
             PermissionRule hit = RuleQuery.getDenyRuleByContentsForTool(
-                permCtx, new PowerShellTool(), commandInput("Get-Process chrome"));
+                permCtx, new PowerShellTool(), commandInput("Get-Process chrome"), null);
             assertThat(hit).as("带参数命令不得命中 exact 规则").isNull();
         }
 
@@ -296,7 +297,7 @@ class RuleQueryTest {
             ToolPermissionContext permCtx = ToolPermissionContext.of(
                 PermissionMode.DEFAULT, Map.of(), Map.of(), ask, Map.of());
             PermissionRule hit = RuleQuery.getRuleForInput(
-                permCtx, new PowerShellTool(), commandInput("write-host hello"));
+                permCtx, new PowerShellTool(), commandInput("write-host hello"), null);
             assertThat(hit).as("write-host hello 应命中 PowerShell(Write-Host *)").isNotNull();
         }
 
@@ -306,11 +307,11 @@ class RuleQueryTest {
             // NPM PUBLISH 大写规则不得命中小写命令（Bash 仍大小写敏感）
             ToolPermissionContext denyUpper = denyCtx(rule("Bash", "NPM PUBLISH:*"));
             assertThat(RuleQuery.getDenyRuleByContentsForTool(
-                denyUpper, new BashTool(), commandInput("npm publish --access public")))
+                denyUpper, new BashTool(), commandInput("npm publish --access public"), null))
                 .as("Bash 前缀匹配保持大小写敏感，NPM PUBLISH:* 不得命中 npm publish").isNull();
             // 大写命令命中大写规则
             assertThat(RuleQuery.getDenyRuleByContentsForTool(
-                denyUpper, new BashTool(), commandInput("NPM PUBLISH --access public")))
+                denyUpper, new BashTool(), commandInput("NPM PUBLISH --access public"), null))
                 .as("NPM PUBLISH --access public 应命中 NPM PUBLISH:*").isNotNull();
         }
 
@@ -319,30 +320,40 @@ class RuleQueryTest {
         void bashPrefixRule_stillMatches() {
             ToolPermissionContext permCtx = denyCtx(rule("Bash", "npm publish:*"));
             PermissionRule hit = RuleQuery.getDenyRuleByContentsForTool(
-                permCtx, new BashTool(), commandInput("npm publish --access public"));
+                permCtx, new BashTool(), commandInput("npm publish --access public"), null);
             assertThat(hit).as("npm publish --access public 应命中 Bash(npm publish:*)").isNotNull();
         }
 
         @Test
-        @DisplayName("回归：Edit 路径 glob 规则仍命中（edit_file 工具名 ↔ Edit 规则名等价组）")
+        @DisplayName("[P19] Edit 路径 glob 规则经 matchesContent 入口仍命中（root 锚 = 显式 cwd）")
         void editGlobRule_stillMatches(@TempDir java.nio.file.Path workspace) {
-            ToolPermissionContext permCtx = denyCtx(rule("Edit", "/Users/foo/**"));
+            // [P19] 本入口（getDenyRuleByContentsForTool）的 PathTool 分支已改 root-relative。
+            //   source=SESSION ⇒ `/…` 根 = cwd（CC rootPathForSource filesystem.ts:748-751），
+            //   故规则路径与待匹配路径必须相对<b>同一</b> cwd 表达。
+            //   ⚠️ 旧断言（规则 "/Users/foo/**" + 绝对 target + cwd=null）编码的是「绝对串 glob」
+            //   ——正是轴 C 的缺陷本身，不能保留。
+            ToolPermissionContext permCtx = denyCtx(rule("Edit", "/sub/**"));
             PermissionRule hit = RuleQuery.getDenyRuleByContentsForTool(
                 permCtx, new EditFileTool(new PathGuard(workspace)),
-                filePathInput("/Users/foo/bar.txt"));
-            assertThat(hit).as("/Users/foo/bar.txt 应命中 Edit(/Users/foo/**)").isNotNull();
+                filePathInput(workspace.resolve("sub/bar.txt").toString()),
+                workspace.toString());
+            assertThat(hit).as("cwd/sub/bar.txt 应命中 Edit(/sub/**)（根锚 = cwd）").isNotNull();
         }
 
         @Test
-        @DisplayName("回归：Read 精确规则仍命中，不匹配返回 null（read_file ↔ Read 等价组）")
+        @DisplayName("[P19] Read 无前缀精确规则按 cwd 相对匹配（root=cwd），越界不命中")
         void readExactRule_stillMatches(@TempDir java.nio.file.Path workspace) {
+            // [P19] 对齐 CC patternWithRoot 无前缀分支（filesystem.ts:906-916）：root=null
+            //   ⇒ matchingRuleForInput 取 getCwd() 当根（:991-992）。规则 "secret.txt" 因此
+            //   表达「<cwd>/secret.txt」而非「任意位置的 secret.txt」。
             ToolPermissionContext permCtx = denyCtx(rule("Read", "secret.txt"));
             ReadFileTool readTool = new ReadFileTool(new PathGuard(workspace));
+            String cwd = workspace.toString();
             assertThat(RuleQuery.getDenyRuleByContentsForTool(
-                permCtx, readTool, filePathInput("secret.txt")))
-                .as("secret.txt 应命中 Read(secret.txt)").isNotNull();
+                permCtx, readTool, filePathInput("secret.txt"), cwd))
+                .as("无前缀规则 root=cwd ⇒ cwd/secret.txt 命中").isNotNull();
             assertThat(RuleQuery.getDenyRuleByContentsForTool(
-                permCtx, readTool, filePathInput("other.txt")))
+                permCtx, readTool, filePathInput("other.txt"), cwd))
                 .as("other.txt 不得命中 Read(secret.txt)").isNull();
         }
 
@@ -392,6 +403,205 @@ class RuleQueryTest {
         void nullArg_false() {
             assertThat(RuleQuery.toolNameMatches(null, "Read")).isFalse();
             assertThat(RuleQuery.toolNameMatches("Read", null)).isFalse();
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // P19 · Read 桶的根锚（轴 C · 两桶同根）
+    //
+    // 对齐 CC getPatternsByRoot（claude-code-best/src/utils/permissions/filesystem.ts:919-953）：
+    // {@code toolType='edit'}（:926-928 → FILE_EDIT_TOOL_NAME）与 {@code toolType='read'}
+    // （:929-931 → FILE_READ_TOOL_NAME）在 :943 <b>共同</b>落到
+    // {@code patternWithRoot(pattern, rule.source)} ⇒ <b>两桶共用一份根锚</b>，差异只在
+    // 「哪些规则进桶」（CC 按 toolName 过滤），不在「怎么锚根」。
+    // 匹配侧 {@code matchingRuleForInput}（:955-1025）同样不分桶：按 root 分桶后
+    // {@code relativePath(root ?? getCwd(), fileAbsolutePath)}，{@code ..} 开头 ⇒ 越界不匹配（:998-1003）。
+    //
+    // WHY：P14 只把 <b>Edit 桶</b>（getEditRuleByContentsForPath）改成 root-relative，
+    //   <b>Read 桶</b>（matchesContent → matchRuleContent 的 PathTool 分支）仍走
+    //   {@code matchesGlob(ruleContent, 绝对路径)} —— 无根锚。⇒ 同一 {@code /agents/**}
+    //   规则，Read 桶按绝对串 glob 判、Edit 桶按根锚相对判，<b>同规则两桶结论可相反</b>
+    //   （用户级规则误命中/该命中不命中，权限判定错位且用户看不出原因）。
+    // ════════════════════════════════════════════════════════════════════
+    @Nested
+    @DisplayName("P19 · Read 桶根锚（CC patternWithRoot：edit/read 两桶同一份根）")
+    class P19ReadBucketRootAnchorTests {
+
+        @AfterEach
+        void clearConfigHomeOverride() {
+            NexusaiPaths.setConfigHomeDirOverride(null);
+        }
+
+        /** Read 工具实例（真实工具，非 mock——走 matchesContent 的 tool.name() 门控）。 */
+        private ReadFileTool readTool(Path workspace) {
+            return new ReadFileTool(new PathGuard(workspace));
+        }
+
+        private PermissionRule contentRule(PermissionRuleSource source, String toolName, String content) {
+            return new PermissionRule(source, PermissionBehavior.DENY,
+                PermissionRuleValue.withContent(toolName, content));
+        }
+
+        private ToolPermissionContext denyCtxForSource(PermissionRuleSource source, PermissionRule rule) {
+            Map<PermissionRuleSource, Set<PermissionRule>> deny = new EnumMap<>(PermissionRuleSource.class);
+            deny.put(source, Set.of(rule));
+            return ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(), deny, Map.of(), Map.of());
+        }
+
+        /** Edit 桶（P14 已 root-relative）对该 path 的判定。 */
+        private PermissionRule editBucket(ToolPermissionContext permCtx, String path, String cwd) {
+            return RuleQuery.getEditRuleByContentsForPath(
+                permCtx, path, PermissionBehavior.DENY, cwd);
+        }
+
+        /** Read 桶（本批改造对象）对同一 path 的判定。 */
+        private PermissionRule readBucket(
+                ToolPermissionContext permCtx, Tool tool, String path, String cwd) {
+            return RuleQuery.getDenyRuleByContentsForTool(
+                permCtx, tool, filePathInput(path), cwd);
+        }
+
+        // ── 1. 两桶一致（本批核心不变量） ──────────────────────────────────
+
+        @Test
+        @DisplayName("两桶一致 · USER_SETTINGS 的 `/agents/**`：两桶对同一 path 判定必须相同（根内命中）")
+        void sameRuleContent_editAndReadBuckets_agreeInRoot(
+                @TempDir Path configHome, @TempDir Path projectDir) {
+            // WHY（轴 C）：CC 两桶同一份 patternWithRoot ⇒ 同 ruleContent / 同 source / 同 path
+            //   必须同结论。若两桶仍用两套模型，用户级规则会在「读」与「写」上给出相反答案 ——
+            //   用户看不到原因，且 deny/allow 的语义随工具漂移。
+            NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+            String inRoot = configHome.resolve("agents/x.md").toString();
+
+            PermissionRule editHit = editBucket(
+                denyCtxForSource(PermissionRuleSource.USER_SETTINGS,
+                    contentRule(PermissionRuleSource.USER_SETTINGS, "Edit", "/agents/**")),
+                inRoot, projectDir.toString());
+            PermissionRule readHit = readBucket(
+                denyCtxForSource(PermissionRuleSource.USER_SETTINGS,
+                    contentRule(PermissionRuleSource.USER_SETTINGS, "Read", "/agents/**")),
+                readTool(projectDir), inRoot, projectDir.toString());
+
+            assertThat(readHit)
+                .as("Read 桶也必须锚 configHome（CC filesystem.ts:943 两桶共用 patternWithRoot）")
+                .isNotNull();
+            assertThat(editHit != null)
+                .as("两桶结论必须一致：edit=%s read=%s", editHit, readHit)
+                .isEqualTo(readHit != null);
+        }
+
+        @Test
+        @DisplayName("两桶一致 · USER_SETTINGS 的 `/agents/**`：⛔ 两桶都不得锚 cwd（根外不命中）")
+        void sameRuleContent_editAndReadBuckets_agreeOutsideRoot(
+                @TempDir Path configHome, @TempDir Path projectDir) {
+            NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+            String outside = projectDir.resolve("agents/x.md").toString();
+
+            PermissionRule editHit = editBucket(
+                denyCtxForSource(PermissionRuleSource.USER_SETTINGS,
+                    contentRule(PermissionRuleSource.USER_SETTINGS, "Edit", "/agents/**")),
+                outside, projectDir.toString());
+            PermissionRule readHit = readBucket(
+                denyCtxForSource(PermissionRuleSource.USER_SETTINGS,
+                    contentRule(PermissionRuleSource.USER_SETTINGS, "Read", "/agents/**")),
+                readTool(projectDir), outside, projectDir.toString());
+
+            assertThat(readHit)
+                .as("用户级 `/…` 规则不得锚 cwd —— 否则用户级配置会去命中<b>项目</b>路径（误 deny）")
+                .isNull();
+            assertThat(editHit).as("Edit 桶同一 path 同样不命中（P14 已钉）").isNull();
+        }
+
+        // ── 2. 根锚生效 / 越界不匹配 ──────────────────────────────────────
+
+        @Test
+        @DisplayName("Read 桶 · 非 USER_SETTINGS 源（session）的 `/…` 规则锚 cwd（防「一律 configHome」过度纠正）")
+        void readBucket_slashRule_anchorsCwdForNonUserSettings(
+                @TempDir Path configHome, @TempDir Path projectDir) {
+            // CC rootPathForSource（filesystem.ts:746-758）：只有 userSettings 走 settings 根，
+            //   session/cliArg/command → getOriginalCwd()（= 会话 cwd）。
+            NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+            PermissionRule rule = contentRule(PermissionRuleSource.SESSION, "Read", "/agents/**");
+
+            assertThat(readBucket(
+                denyCtxForSource(PermissionRuleSource.SESSION, rule),
+                readTool(projectDir), projectDir.resolve("agents/x.md").toString(), projectDir.toString()))
+                .as("session 源 `/agents/**` 根 = cwd ⇒ 命中 cwd/agents/x.md")
+                .isNotNull();
+            assertThat(readBucket(
+                denyCtxForSource(PermissionRuleSource.SESSION, rule),
+                readTool(projectDir), configHome.resolve("agents/x.md").toString(), projectDir.toString()))
+                .as("session 源不得锚 configHome（那是 userSettings 的根）")
+                .isNull();
+        }
+
+        @Test
+        @DisplayName("Read 桶 · 越界不匹配：cwd 之外的路径（`..` 语义）不命中无前缀相对规则")
+        void readBucket_outsideCwd_noMatch(@TempDir Path projectDir, @TempDir Path otherDir) {
+            // CC matchingRuleForInput :998-1003：relativePath 以 `..` 开头 ⇒ continue（不匹配）。
+            PermissionRule rule = contentRule(PermissionRuleSource.SESSION, "Read", "sub/file.txt");
+            ToolPermissionContext permCtx =
+                denyCtxForSource(PermissionRuleSource.SESSION, rule);
+
+            assertThat(readBucket(permCtx, readTool(projectDir),
+                projectDir.resolve("sub/file.txt").toString(), projectDir.toString()))
+                .as("root 内 cwd/sub/file.txt 命中").isNotNull();
+            assertThat(readBucket(permCtx, readTool(projectDir),
+                otherDir.resolve("sub/file.txt").toString(), projectDir.toString()))
+                .as("root 之外（rel 以 .. 开头）⇒ 不命中（CC :998-1003）").isNull();
+        }
+
+        @Test
+        @DisplayName("Read 桶 · `~/…` 规则锚家目录（旧绝对串 glob 下恒不命中）")
+        void readBucket_tildeRule_anchorsHome(@TempDir Path projectDir) {
+            // CC patternWithRoot :893-898：`~/…` 根 = homedir().normalize('NFC')。
+            PermissionRule rule = contentRule(PermissionRuleSource.SESSION, "Read", "~/.claude/**");
+            String homeTarget = Path.of(System.getProperty("user.home"), ".claude", "x.md").toString();
+
+            assertThat(readBucket(denyCtxForSource(PermissionRuleSource.SESSION, rule),
+                readTool(projectDir), homeTarget, projectDir.toString()))
+                .as("`~/.claude/**` 必须锚家目录才可能命中（旧实现把 `~` 当字面字符 ⇒ 永不命中）")
+                .isNotNull();
+        }
+
+        @Test
+        @DisplayName("Read 桶 · 裸绝对路径规则（无 `//` 前缀）按 cwd 相对 ⇒ 不命中文件系统绝对路径")
+        void readBucket_bareAbsoluteRule_isCwdRelative(@TempDir Path projectDir) {
+            // CC patternWithRoot：只有 `//…` 才是文件系统根；裸 `/etc/passwd` 走 `DIR_SEP` 分支
+            //   ⇒ root = rootPathForSource(source)。source=SESSION ⇒ root=cwd ⇒ 该规则表达
+            //   `<cwd>/etc/passwd`，不是 `/etc/passwd`。与 Edit 桶（EditFileToolErrorCode2Test
+            //   已钉同一语义）一致 —— 这正是两桶同根的判别式。
+            PermissionRule rule = contentRule(PermissionRuleSource.SESSION, "Read", "/etc/passwd");
+            assertThat(readBucket(denyCtxForSource(PermissionRuleSource.SESSION, rule),
+                readTool(projectDir), "/etc/passwd", projectDir.toString()))
+                .as("裸绝对路径规则按 cwd 相对解析 ⇒ 文件系统 /etc/passwd 不在 cwd 下 ⇒ 不命中"
+                    + "（要表达文件系统根须写 `//etc/passwd`）")
+                .isNull();
+            assertThat(editBucket(denyCtxForSource(PermissionRuleSource.SESSION,
+                contentRule(PermissionRuleSource.SESSION, "Edit", "/etc/passwd")),
+                "/etc/passwd", projectDir.toString()))
+                .as("Edit 桶同一规则同结论（两桶同根，不得只改一侧）")
+                .isNull();
+        }
+
+        // ── 3. 反向鉴别：Bash/PowerShell 分支不得消费 cwd ──────────────────
+
+        @Test
+        @DisplayName("非 PathTool 分支不消费 cwd：Bash 前缀规则在任意 cwd 下结论不变")
+        void nonPathToolBranch_ignoresCwd(@TempDir Path projectDir) {
+            // WHY：cwd 形参是为 PathTool 的根锚定新增的。若误把它喂给 Bash/PowerShell 匹配，
+            //   命令规则语义会被路径域污染（权限判定错位）。
+            PermissionRule bashRule = contentRule(
+                PermissionRuleSource.SESSION, "Bash", "npm publish:*");
+            ToolPermissionContext permCtx =
+                denyCtxForSource(PermissionRuleSource.SESSION, bashRule);
+            ObjectNode input = commandInput("npm publish --access public");
+
+            assertThat(RuleQuery.getDenyRuleByContentsForTool(permCtx, new BashTool(), input, null))
+                .as("cwd=null 命中 Bash(npm publish:*)").isNotNull();
+            assertThat(RuleQuery.getDenyRuleByContentsForTool(
+                permCtx, new BashTool(), input, projectDir.toString()))
+                .as("cwd!=null 结论必须相同（Bash 分支不消费 cwd）").isNotNull();
         }
     }
 

@@ -222,8 +222,11 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         //   NEXUSAI_PROJECT_DIR env ?? ~/.nexusai（config home）⇒ AgentLoopContextFactory.freshSession
         //   因该值非空白恒 setWorkspaceDir(...) ⇒ fork 的 ctx.workspaceDir 恒为 config home 而非
         //   boundProject（下游 A′ 判「无有效项目」→ 派生被跳过）。
-        //   对齐 CC forkedAgent 参数透传；null（调用方未接线）= 不造字段 → freshSession 走会话
-        //   originalCwd 回落（非 config home）。
+        //   对齐 CC forkedAgent 参数透传；null（调用方未接线）= 不造字段 → freshSession(projectRoot=null,
+        //   sessionId=null) → AgentLoopContextFactory.resolveFallbackWorkspaceDir(null) ⇒ CwdResolution
+        //   **无会话命名出口** getOriginalCwdLayerForNonSession（= 进程 user.dir，非 config home）。
+        //   ⛔ 旧文写「走会话 originalCwd 回落」不准确：本重载的 sessionId 恒为 null（shared() 硬编码），
+        //      结构上不经过任何会话层。
         AgentLoopContext ctx = contextFactory.shared(p.projectRoot());
         SubagentLoopDeps deps = new SubagentLoopDeps(ctx);
 

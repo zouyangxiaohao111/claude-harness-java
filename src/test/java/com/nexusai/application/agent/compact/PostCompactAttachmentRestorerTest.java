@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.compact;
 
+import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionMode;
@@ -10,6 +11,9 @@ import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.skill.ClaudePaths;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.telemetry.Telemetry;
+import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.common.SessionKeys;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
@@ -25,6 +29,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -503,23 +508,30 @@ class PostCompactAttachmentRestorerTest {
     }
 
     @Test
-    @DisplayName("[R1 A-03] deny 检查: 文件读被 deny 规则拒绝 → 跳过（CC isFileReadDenied）")
+    @DisplayName("[R1 A-03 · P24] deny 检查: 文件读被 deny 规则拒绝 → 跳过（CC isFileReadDenied；规则根锚 = cwd）")
     void denyRuleSkipsFile() {
         // WHY: CC generateFileAttachment 先查 isFileReadDenied(filename, toolPermissionContext)
         //   （attachments.ts:3041）→ 命中 deny 返回 null 被过滤。Java 等价：RuleQuery 查 read-deny
         //   content rule（Read 工具 + file_path）。
+        // [P24] 规则形态由 `//<abs>`（文件系统根）改为 **裸 `/` 前缀 + source=SESSION**：
+        //   按 RuleQuery.rootPathForSource，裸 /… 规则的根 = 规则 source 的根，source=SESSION ⇒ 根 = cwd
+        //   —— 规则根<b>就是被测值</b>。`//` 形态结构上不消费 cwd（规则根 = 盘符根），
+        //   即使 cwd 传错也恒绿（本批实测：cwd 改成 null / 固定错目录，旧夹具 23 条断言全绿一条不红）。
+        Path secret = tempDir.resolve("secret.txt");
+        Path normal = tempDir.resolve("normal.txt");
         Map<String, CompactConversation.ReadFileState> state = new LinkedHashMap<>();
-        state.put("/abs/secret.txt", new CompactConversation.ReadFileState("secret-content", 2L));
-        state.put("/abs/normal.txt", new CompactConversation.ReadFileState("normal-content", 1L));
+        state.put(secret.toString(), new CompactConversation.ReadFileState("secret-content", 2L));
+        state.put(normal.toString(), new CompactConversation.ReadFileState("normal-content", 1L));
         PermissionRule deny = new PermissionRule(
             PermissionRuleSource.SESSION, PermissionBehavior.DENY,
-            PermissionRuleValue.withContent("Read", "/abs/secret.txt"));
+            PermissionRuleValue.withContent("Read", "/secret.txt"));
         Map<PermissionRuleSource, Set<PermissionRule>> denyRules =
             Map.of(PermissionRuleSource.SESSION, Set.of(deny));
         ToolPermissionContext permCtx = ToolPermissionContext.of(
             PermissionMode.DEFAULT, Map.of(), denyRules, Map.of(), Map.of());
+        assertTwoLegsDiverge(tempDir);
         List<ChatMessageDto> restored = PostCompactAttachmentRestorer.restoreFileAttachments(
-            state, 5, Set.of(), null, null, null, permCtx, null);
+            state, 5, Set.of(), tempDir.toString(), null, null, permCtx, null);
         assertThat(restored).hasSize(1);
         assertThat(restored.get(0).content()).contains("normal.txt");
         assertThat(restored).noneMatch(m -> m.content().contains("secret.txt"));
@@ -571,5 +583,206 @@ class PostCompactAttachmentRestorerTest {
             .isNull();
         assertThat(PostCompactAttachmentRestorer.renderDeferredToolsDelta("not-json")).isNull();
         assertThat(PostCompactAttachmentRestorer.renderDeferredToolsDelta(null)).isNull();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [P24] cwd 接线守护：restore(ctx, …) → isFileReadDenied → RuleQuery
+    //   read-deny 规则的 root-relative 根锚 = ctx.getWorkspaceDir()
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * [P24] 夹具 cwd · {@code @TempDir} 下的<b>全新随机子目录</b>。
+     *
+     * <p><b>WHY 放在 @TempDir（系统临时目录）而非工作目录内</b>：本类守护的接线断点是
+     * 「cwd 传丢了会怎样」，所以夹具 cwd 必须与<b>回落腿</b>
+     * （{@code RuleQuery.resolveEffectiveCwd(null)} → {@code CwdResolution.getCwd(null)}
+     * → 归一化进程 {@code user.dir}，maven 下 = 模块目录）<b>必然不同值</b>。
+     * 临时目录与模块目录既非同一路径、又非同盘符 ⇒ 回落腿下的 relativePath 直接越界。
+     */
+    private Path fixtureCwd() throws Exception {
+        Path dir = tempDir.resolve("p24ws-" + UUID.randomUUID().toString().substring(0, 8));
+        Files.createDirectories(dir);
+        return dir;
+    }
+
+    /** POSIX 归一（比对两侧一致，避免 Windows 分隔符假差异）。 */
+    private static String toPosix(String s) {
+        return s == null ? null : s.replace('\\', '/');
+    }
+
+    /**
+     * ⭐ <b>两腿分叉前置断言</b>——本类 [P24] 用例鉴别力的<b>唯一来源</b>，也是
+     * 「禁止退化成恒绿空转」的闸门。
+     *
+     * <p>左腿 = 夹具声明并注入的会话 cwd；右腿 = cwd 丢失时 {@code RuleQuery} 实际使用的回落值
+     * {@code CwdResolution.getCwd(null)}（= 归一化进程 {@code user.dir}）。
+     * <b>两腿必须不同值</b>，否则「cwd 真传」与「cwd 丢失」落点同值 ⇒ 断言对 P19/P24 接线
+     * 恒绿空转 —— 前提一破<b>必须红</b>，⛔ 不许静默。
+     */
+    private static void assertTwoLegsDiverge(Path fixtureCwd) {
+        assertThat(toPosix(CwdResolution.getCwd(null)))
+            .as("夹具前提（两腿分叉）：RuleQuery 无 cwd 入参时的回落基准 = CwdResolution.getCwd(null) = 归一化进程 user.dir，"
+                + "它必须 ≠ 本夹具的 cwd；若两者同值，则「cwd 真传」与「cwd 丢失」落点相同，"
+                + "本类 [P24] 用例对该接线恒绿空转 —— 必须红，不许静默")
+            .isNotEqualTo(toPosix(fixtureCwd.toAbsolutePath().normalize().toString()));
+    }
+
+    /**
+     * [P24] 13 参 TUC 夹具（显式 {@code effectiveCwd}；会话键用 {@link SessionKeys#NO_SESSION} 哨兵）。
+     *
+     * <p>用 {@code NO_SESSION} 让 {@code CwdResolution} 走<b>无会话命名出口</b>（进程 user.dir）——
+     * 不查 DB、不依赖 JUnit 扩展的 resolver 装配状态，回落腿取值完全确定。
+     */
+    private static ToolUseContext tuc(ToolPermissionContext permCtx, Path effectiveCwd) {
+        return ToolUseContext.of(UUID.randomUUID(), SessionKeys.NO_SESSION, PermissionMode.DEFAULT,
+            List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
+            Map.of(), false, "", effectiveCwd);
+    }
+
+    /**
+     * [P24] read-deny 规则夹具 · <b>裸 {@code /} 前缀 + {@code source=SESSION}</b>。
+     *
+     * <p>按 {@code RuleQuery.rootPathForSource}，裸 {@code /…} 规则的根 = 规则 source 的根，
+     * {@code SESSION} ⇒ 根 = cwd ⇒ <b>规则根就是被测值</b>。这正是「打破规则形态不消费 cwd」
+     * 的关键：{@code //…}（文件系统根 / 盘符根）形态的根与 cwd 无关，结构上抓不住 cwd 传错。
+     */
+    private static ToolPermissionContext denyReadRule(String ruleContent) {
+        PermissionRule deny = new PermissionRule(
+            PermissionRuleSource.SESSION, PermissionBehavior.DENY,
+            PermissionRuleValue.withContent("Read", ruleContent));
+        return ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(),
+            Map.of(PermissionRuleSource.SESSION, Set.of(deny)), Map.of(), Map.of());
+    }
+
+    private static Map<String, CompactConversation.ReadFileState> stateOf(String path, long ts) {
+        Map<String, CompactConversation.ReadFileState> m = new LinkedHashMap<>();
+        m.put(path, new CompactConversation.ReadFileState("snapshot-" + path, ts));
+        return m;
+    }
+
+    /**
+     * [P24] <b>主守护</b>：{@code restore(ctx, …)} 把 {@code ctx.getWorkspaceDir()} 真传给
+     * {@code RuleQuery} 作 read-deny 规则的 root-relative 根锚。
+     *
+     * <p><b>WHY（规则九）</b>：P19 给这条链路补了 {@code cwd} 形参，但原先<b>没有任何断言</b>能抓住
+     * 「{@code PostCompactAttachmentRestorer} 传错/没传 cwd」—— 唯一的 read-deny 用例
+     * （{@link #denyRuleSkipsFile}）用的是 {@code //<abs>} 文件系统根 glob，规则形态本身不消费 cwd。
+     * 本用例把规则换成裸 {@code /secret.txt} + {@code SESSION}：cwd 正确 ⇒ 相对路径
+     * {@code secret.txt} 命中 deny ⇒ 该文件<b>不</b>被恢复；cwd 传丢（或传成别的目录）⇒
+     * 相对路径越界 ⇒ 不命中 ⇒ 文件被恢复。两条腿结论相反，接线才有鉴别力。
+     */
+    @Test
+    @DisplayName("[P24] restore(ctx)：read-deny 根锚 = ctx.getWorkspaceDir()（裸 '/' 前缀 + SESSION）")
+    void restoreDenyRootFollowsCtxWorkspaceDir() throws Exception {
+        Path cwd = fixtureCwd();
+        assertTwoLegsDiverge(cwd);
+        Path secret = cwd.resolve("secret.txt");
+        Path normal = cwd.resolve("normal.txt");
+        Files.writeString(secret, "secret-content");
+        Files.writeString(normal, "normal-content");
+
+        CompactConversationContext ctx = new CompactConversationContext()
+            .setWorkspaceDir(cwd)
+            .setToolUseContext(tuc(denyReadRule("/secret.txt"), cwd));
+
+        Map<String, CompactConversation.ReadFileState> state = new LinkedHashMap<>();
+        state.put(secret.toString(), new CompactConversation.ReadFileState("snap-secret", 2L));
+        state.put(normal.toString(), new CompactConversation.ReadFileState("snap-normal", 1L));
+
+        List<String> contents = PostCompactAttachmentRestorer.restore(ctx, state, List.of())
+            .stream().map(ChatMessageDto::content).toList();
+
+        assertThat(contents)
+            .as("cwd = ctx.getWorkspaceDir() 时，规则 '/secret.txt' 的根 = 该目录 ⇒ secret.txt 命中 deny 被跳过；"
+                + "cwd 传丢（回落进程 user.dir）时相对路径越界 ⇒ 不命中 ⇒ secret.txt 会被恢复（本断言转红）")
+            .noneMatch(c -> c.contains("secret.txt"));
+        assertThat(contents)
+            .as("未被 deny 覆盖的 normal.txt 必须正常恢复（证明 deny 是精确命中而非整批丢弃）")
+            .anyMatch(c -> c.contains("normal.txt"));
+    }
+
+    /**
+     * [P24] <b>镜像见证</b>：同规则 + 同 ctx，仅把 {@code ctx.getWorkspaceDir()} 换成另一个目录
+     * ⇒ 结论翻转（不再被 deny）。
+     *
+     * <p>证明根锚<b>跟随 ctx 声明的会话 cwd</b>，而不是「目标路径自身的父目录」「某个常量根」
+     * 或任何与 cwd 无关的取值 —— 后三种退化实现都会让本用例仍然命中 deny 而<b>转红</b>。
+     */
+    @Test
+    @DisplayName("[P24] 镜像见证：同一 deny 规则 + 同一 ctx，仅换 ctx.getWorkspaceDir() → 不再命中 deny")
+    void sameRuleDifferentWorkspaceDirDoesNotDeny() throws Exception {
+        Path cwd = fixtureCwd();
+        assertTwoLegsDiverge(cwd);
+        Path otherCwd = fixtureCwd();
+        Path secret = cwd.resolve("secret.txt");
+        Files.writeString(secret, "secret-content");
+
+        CompactConversationContext ctx = new CompactConversationContext()
+            .setWorkspaceDir(otherCwd)   // ⭐ 仅此一处与主守护用例不同
+            .setToolUseContext(tuc(denyReadRule("/secret.txt"), otherCwd));
+
+        List<String> contents = PostCompactAttachmentRestorer
+            .restore(ctx, stateOf(secret.toString(), 1L), List.of())
+            .stream().map(ChatMessageDto::content).toList();
+
+        assertThat(contents)
+            .as("根锚 = ctx.getWorkspaceDir() = otherCwd ⇒ secret.txt 不在该根之下，relativePath 越界 ⇒ 不命中 deny；"
+                + "若根锚退化成「目标自己的父目录」或任何与 cwd 无关的常量，本用例会命中 deny 而转红")
+            .anyMatch(c -> c.contains("secret.txt"));
+    }
+
+    /**
+     * [P24] <b>生产装配链守护</b>：{@code tuc.effectiveCwd()} 经
+     * {@code CompactConversation.buildAutoContext} 落到 {@code ctx.workspaceDir}，
+     * 再经 {@code restore} 抵达 {@code RuleQuery}。
+     *
+     * <p><b>WHY 需要这一层</b>：{@code CompactConversationContext.workspaceDir} 的
+     * <b>生产唯一写入点</b>是 {@code CompactConversation.buildAutoContext}
+     * （{@code ctx.setWorkspaceDir(tuc.effectiveCwd())}，且带 {@code != null} 门）。只测
+     * {@code restore} 覆盖不到这一跳 —— 那一跳若断（改成 {@code null} / 不 set / 换成别的源），
+     * 上面两个用例仍会全绿。本用例把两条跳一起钉住。
+     */
+    @Test
+    @DisplayName("[P24] buildAutoContext → restore：tuc.effectiveCwd() 真接到 read-deny 根锚（生产装配链全程）")
+    void buildAutoContextCarriesEffectiveCwdIntoDenyRoot() throws Exception {
+        Path cwd = fixtureCwd();
+        assertTwoLegsDiverge(cwd);
+        Path secret = cwd.resolve("secret.txt");
+        Files.writeString(secret, "secret-content");
+
+        CompactConversationContext ctx = CompactConversation.buildAutoContext(
+            tuc(denyReadRule("/secret.txt"), cwd), "p24-model", "compact", null);
+
+        assertThat(ctx.getWorkspaceDir())
+            .as("装配链前置：buildAutoContext 必须把 tuc.effectiveCwd() 落进 ctx.workspaceDir"
+                + "（若这一跳断掉，下面 restore 的 deny 断言也会红，但本条给出更直接的定位）")
+            .isEqualTo(cwd);
+
+        List<String> contents = PostCompactAttachmentRestorer
+            .restore(ctx, stateOf(secret.toString(), 1L), List.of())
+            .stream().map(ChatMessageDto::content).toList();
+
+        assertThat(contents)
+            .as("生产装配全程（tuc.effectiveCwd → ctx.workspaceDir → restore → isFileReadDenied → RuleQuery）"
+                + "任一跳丢失 cwd ⇒ 根锚变成进程 user.dir ⇒ secret.txt 会被恢复 ⇒ 本断言转红")
+            .noneMatch(c -> c.contains("secret.txt"));
+    }
+
+    /**
+     * [P24] <b>前置闸门自证</b>：{@link #assertTwoLegsDiverge} 真的会红（⛔ 不是恒绿装饰）。
+     *
+     * <p>本用例把「夹具腿」直接取成「回落腿」的值（两腿折叠成同值），断言该前置断言抛
+     * {@link AssertionError}。它证明 [P24] 三个用例的鉴别力<b>完全来自两腿分叉</b>：
+     * 一旦将来有人把夹具落回 {@code user.dir}，前置断言立刻红，而不是静默退化成恒绿空转。
+     */
+    @Test
+    @DisplayName("[P24] 前置闸门自证：两腿折叠成同值时 assertTwoLegsDiverge 必红（证明非恒绿装饰）")
+    void twoLegsDivergeGuardItselfFailsWhenCollapsed() {
+        Path fallback = Path.of(CwdResolution.getCwd(null));
+        org.assertj.core.api.Assertions
+            .assertThatThrownBy(() -> assertTwoLegsDiverge(fallback))
+            .as("把夹具 cwd 取成回落值本身（两腿同值）⇒ 前置断言必须抛 AssertionError；"
+                + "若这里不抛，说明 [P24] 的门禁是恒绿装饰，三个用例的鉴别力无从谈起")
+            .isInstanceOf(AssertionError.class);
     }
 }

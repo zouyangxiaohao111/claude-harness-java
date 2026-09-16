@@ -10,9 +10,7 @@ import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.Tool;
 
-import java.nio.file.FileSystems;
 import java.nio.file.Path;
-import java.nio.file.PathMatcher;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
@@ -41,11 +39,14 @@ import org.slf4j.LoggerFactory;
  * </ul>
  *
  * <h2>Phase 2 content 匹配（对齐 CC {@code permissionRuleParser.ts}）</h2>
- * <p>ruleContent 匹配分三种模式：
+ * <p>ruleContent 匹配按工具类型分派（见 {@link #matchRuleContent}）：
  * <ul>
- *   <li><b>路径 glob</b>（ruleContent 含 {@code /}）：{@code Edit(/Users/foo/**)} 匹配路径</li>
- *   <li><b>命令前缀</b>（ruleContent 含 {@code :}）：{@code Bash(npm publish:*)} 匹配命令前缀</li>
- *   <li><b>精确匹配</b>（其他）：{@code Bash(rm -rf /)} 精确匹配 command 字段</li>
+ *   <li><b>PathTool</b>（Read / Edit / Write）→ {@link #matchesPathRuleRootRelative}：
+ *       <b>root-relative</b>（对齐 CC {@code matchingRuleForInput} + {@code patternWithRoot}，
+ *       filesystem.ts:853-1025）——规则前缀决定根，⛔ 不是对绝对路径串做 glob</li>
+ *   <li><b>Bash</b> → {@code BashRuleMatcher}（CC bashPermissions.ts 剥离/compound guard 语义）</li>
+ *   <li><b>PowerShell</b> → {@link #matchesPowerShellRuleContent}（大小写不敏感独立路径）</li>
+ *   <li><b>Other</b> 含 {@code :*} → 命令前缀；否则精确匹配</li>
  * </ul>
  *
  * <h2>无状态 / 线程安全</h2>
@@ -56,7 +57,13 @@ public final class RuleQuery {
     /** SLF4J 日志器 · 内容规则提取与 PowerShell 匹配的数据流日志（中文）。 */
     private static final Logger log = LoggerFactory.getLogger(RuleQuery.class);
 
-    /** [批 3c] 「cwd 缺省回落」只 WARN 一次（权限链每工具调用都会求值，不得刷屏）。 */
+    /**
+     * [批 3c] 「cwd 缺省回落」只 WARN 一次（权限链每工具调用都会求值，不得刷屏）。
+     *
+     * <p>[P19] 单点收敛给 {@link #resolveEffectiveCwd(String)} —— root-relative 路径规则匹配的
+     * 两条入口（{@code getEditRuleByContentsForPath} 与 {@code matchesContent} 的 PathTool 分支）
+     * 共用同一回落语义与同一告警位。
+     */
     private static final java.util.concurrent.atomic.AtomicBoolean CWD_FALLBACK_WARNED =
         new java.util.concurrent.atomic.AtomicBoolean();
 
@@ -448,18 +455,22 @@ public final class RuleQuery {
      * <ul>
      *   <li>{@code rule.toolName == tool.name()}</li>
      *   <li>{@code rule.ruleContent != null}（带内容限定的规则）</li>
-     *   <li>ruleContent 与 input 的目标字段匹配（glob / 前缀 / 精确）</li>
+     *   <li>ruleContent 与 input 的目标字段匹配（PathTool → root-relative；Bash/PowerShell → 命令匹配）</li>
      * </ul>
      *
      * @param permCtx 权限上下文
      * @param tool    工具实例
      * @param input   已解析 JSON 输入
+     * @param cwd     [P19] PathTool（Read/Edit/Write）路径规则的 root-relative 匹配基准；
+     *                null/空 → 按「无会话」解析（见 {@link #resolveEffectiveCwd(String)}）。
+     *                Bash/PowerShell 分支不消费（形态参数，仅为全链一致传递）
      * @return        第一个 content-specific rule（deny > ask）；无匹配返回 null
      */
     public static PermissionRule getRuleForInput(
             ToolPermissionContext permCtx,
             Tool tool,
-            JsonNode input
+            JsonNode input,
+            String cwd
     ) {
         // s03-P1#1: deny 优先于 ask（CC deny > ask > allow）。若先查 ask 桶，
         // 同一 command 同时命中 ask 和 deny 时 ask 赢 → deny 被软化（CC 不允许）。
@@ -467,7 +478,7 @@ public final class RuleQuery {
         for (Map.Entry<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> entry
                 : permCtx.alwaysDenyRules().entrySet()) {
             for (PermissionRule rule : entry.getValue()) {
-                if (matchesContent(rule, tool, input)) {
+                if (matchesContent(rule, tool, input, entry.getKey(), cwd)) {
                     return rule;
                 }
             }
@@ -476,7 +487,7 @@ public final class RuleQuery {
         for (Map.Entry<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> entry
                 : permCtx.alwaysAskRules().entrySet()) {
             for (PermissionRule rule : entry.getValue()) {
-                if (matchesContent(rule, tool, input)) {
+                if (matchesContent(rule, tool, input, entry.getKey(), cwd)) {
                     return rule;
                 }
             }
@@ -494,17 +505,20 @@ public final class RuleQuery {
      * @param permCtx 权限上下文
      * @param tool    工具实例
      * @param input   已解析 JSON 输入
+     * @param cwd     [P19] PathTool（Read/Edit/Write）路径规则的 root-relative 匹配基准；
+     *                null/空 → 按「无会话」解析（见 {@link #resolveEffectiveCwd(String)}）
      * @return        第一个 content-specific deny rule；无匹配返回 null
      */
     public static PermissionRule getDenyRuleByContentsForTool(
             ToolPermissionContext permCtx,
             Tool tool,
-            JsonNode input
+            JsonNode input,
+            String cwd
     ) {
         for (Map.Entry<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> entry
                 : permCtx.alwaysDenyRules().entrySet()) {
             for (PermissionRule rule : entry.getValue()) {
-                if (matchesContent(rule, tool, input)) {
+                if (matchesContent(rule, tool, input, entry.getKey(), cwd)) {
                     return rule;
                 }
             }
@@ -529,17 +543,20 @@ public final class RuleQuery {
      * @param permCtx 权限上下文
      * @param tool    工具实例
      * @param input   已解析 JSON 输入
+     * @param cwd     [P19] PathTool（Read/Edit/Write）路径规则的 root-relative 匹配基准；
+     *                null/空 → 按「无会话」解析（见 {@link #resolveEffectiveCwd(String)}）
      * @return        第一个 content-specific ask rule；无匹配返回 null
      */
     public static PermissionRule getAskRuleByContentsForTool(
             ToolPermissionContext permCtx,
             Tool tool,
-            JsonNode input
+            JsonNode input,
+            String cwd
     ) {
         for (Map.Entry<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> entry
                 : permCtx.alwaysAskRules().entrySet()) {
             for (PermissionRule rule : entry.getValue()) {
-                if (matchesContent(rule, tool, input)) {
+                if (matchesContent(rule, tool, input, entry.getKey(), cwd)) {
                     if (log.isDebugEnabled()) {
                         log.debug("RuleQuery 命中内容 ask 桶规则: rule={} tool={}",
                             ruleToString(rule), tool.name());
@@ -570,8 +587,13 @@ public final class RuleQuery {
      * （CC {@code rootPathForSource}：userSettings → config home，其余源 → cwd；
      * 见 {@link #rootPathForSource}）/ {@code ./…} 或无前缀 → cwd。
      * 路径先 expandPath（~ 展开 + 相对→绝对 + POSIX 归一）再计算 relativePath(root, path)
-     * 匹配（见 {@link #matchesEditPathRuleRootRelative}）。旧 content glob 直比（matchesGlob
+     * 匹配（见 {@link #matchesPathRuleRootRelative}）。旧 content glob 直比（{@code matchesGlob}
      * 对绝对路径字符串做 glob）为近似，拍板重构对齐 CC。
+     *
+     * <p><b>[P19]</b> 此前本方法是<b>唯一</b>走 root-relative 的内容规则入口；read 桶经
+     * {@link #matchesContent} 的 PathTool 分支仍走绝对串 glob（轴 C）。现两桶共用
+     * {@link #matchesPathRuleRootRelative} + {@link #resolveEffectiveCwd(String)}，
+     * 无 cwd 时的回落语义也同源。
      *
      * <p><b>[欠账清理批 · 3 参重载已删]</b> 原 {@code getEditRuleByContentsForPath(permCtx, path, behavior)}
      * 3 参重载（内部以 {@code cwd=null} 委托本方法 = 静默走「无会话」回落 user.dir）<b>全仓零调用方</b>
@@ -604,13 +626,7 @@ public final class RuleQuery {
         if (permCtx == null || path == null) {
             return null;
         }
-        if ((cwd == null || cwd.isEmpty()) && CWD_FALLBACK_WARNED.compareAndSet(false, true)) {
-            log.warn("[RuleQuery] getEditRuleByContentsForPath 无 cwd 入参（无会话）→ root-relative 规则匹配"
-                + "基准回落进程 user.dir={}；如需会话 cwd 须由调用方显式传入 cwd（工具侧 ctx.effectiveCwd()）",
-                System.getProperty("user.dir"));
-        }
-        String effectiveCwd = cwd != null && !cwd.isEmpty()
-            ? cwd : CwdResolution.getCwd(null);
+        String effectiveCwd = resolveEffectiveCwd(cwd);
         Map<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> bucket =
             switch (behavior) {
                 case ALLOW -> permCtx.alwaysAllowRules();
@@ -628,13 +644,39 @@ public final class RuleQuery {
                 if (!toolNameMatches(rule.ruleValue().toolName(), "Edit")) {
                     continue;
                 }
-                if (matchesEditPathRuleRootRelative(
+                if (matchesPathRuleRootRelative(
                         rule.ruleValue().ruleContent(), path, entry.getKey(), effectiveCwd)) {
                     return rule;
                 }
             }
         }
         return null;
+    }
+
+    /**
+     * 解析 root-relative 路径规则匹配的<b>校验基准 cwd</b> · [P19] 单点收敛。
+     *
+     * <p>{@code cwd} 非空 → 直接采用（调用方显式声明的会话 cwd，如
+     * {@code ctx.effectiveCwd()}）；null/空 → 按「无会话」解析
+     * {@link CwdResolution#getCwd(String)}{@code (null)}（override / 进程 user.dir），
+     * 并首次 WARN 留痕。
+     *
+     * <p>两条入口共用本方法，保证「Edit 桶路径规则」与「Read 桶路径规则」的
+     * 无会话回落语义<b>同源</b>（否则两桶在无 cwd 时锚到不同的根 —— 轴 C 的变体）。
+     *
+     * @param cwd 调用方声明的校验基准（可为 null/空）
+     * @return    实际使用的绝对基准 cwd
+     */
+    private static String resolveEffectiveCwd(String cwd) {
+        if (cwd != null && !cwd.isEmpty()) {
+            return cwd;
+        }
+        if (CWD_FALLBACK_WARNED.compareAndSet(false, true)) {
+            log.warn("[RuleQuery] 路径内容规则匹配无 cwd 入参（无会话）→ root-relative 规则匹配"
+                + "基准回落进程 user.dir={}；如需会话 cwd 须由调用方显式传入 cwd（工具侧 ctx.effectiveCwd()）",
+                System.getProperty("user.dir"));
+        }
+        return CwdResolution.getCwd(null);
     }
 
     /**
@@ -650,17 +692,20 @@ public final class RuleQuery {
      * @param permCtx 权限上下文
      * @param tool    工具实例
      * @param input   已解析 JSON 输入
+     * @param cwd     [P19] PathTool（Read/Edit/Write）路径规则的 root-relative 匹配基准；
+     *                null/空 → 按「无会话」解析（见 {@link #resolveEffectiveCwd(String)}）
      * @return        第一个 content-specific allow rule；无匹配返回 null
      */
     public static PermissionRule getAllowRuleByContentsForTool(
             ToolPermissionContext permCtx,
             Tool tool,
-            JsonNode input
+            JsonNode input,
+            String cwd
     ) {
         for (Map.Entry<com.nexusai.application.agent.permission.PermissionRuleSource, Set<PermissionRule>> entry
                 : permCtx.alwaysAllowRules().entrySet()) {
             for (PermissionRule rule : entry.getValue()) {
-                if (matchesContent(rule, tool, input)) {
+                if (matchesContent(rule, tool, input, entry.getKey(), cwd)) {
                     return rule;
                 }
             }
@@ -706,17 +751,25 @@ public final class RuleQuery {
      *   <li>toolName 不匹配 → false</li>
      *   <li>从 input 提取匹配目标（Bash→command, Edit/Write/Read→file_path）</li>
      *   <li>目标为 null（未知工具类型）→ false</li>
-     *   <li>按 ruleContent 特征选择匹配模式（glob / 前缀 / 精确）</li>
+     *   <li>按 ruleContent 特征选择匹配模式（PathTool root-relative / 前缀 / 精确）</li>
      * </ol>
      *
-     * @param rule  权限规则
-     * @param tool  工具实例
-     * @param input   已解析 JSON 输入
-     * @return        true = ruleContent 匹配 input 内容
+     * <p>[P19] {@code source} 由调用方的 {@code entry.getKey()} 逐条传入 —— CC
+     * {@code matchingRuleForInput} 的 {@code patternWithRoot(pattern, rule.source)}
+     * （filesystem.ts:943）按<b>规则自身来源</b>锚根，不是按工具或会话锚根。
+     *
+     * @param rule   权限规则
+     * @param tool   工具实例
+     * @param input  已解析 JSON 输入
+     * @param source 规则来源（决定 {@code /…} 前缀规则的根锚定）
+     * @param cwd    PathTool 路径规则的 root-relative 匹配基准
+     * @return       true = ruleContent 匹配 input 内容
      */
     private static boolean matchesContent(
             PermissionRule rule, Tool tool,
-            JsonNode input
+            JsonNode input,
+            com.nexusai.application.agent.permission.PermissionRuleSource source,
+            String cwd
     ) {
         // 必须有 content 才算 content-specific rule
         if (rule.ruleValue().ruleContent() == null) {
@@ -733,9 +786,10 @@ public final class RuleQuery {
             return false;
         }
         // 按 ruleContent 特征 + toolName 选择匹配模式（[s03 P2 #8 修补] 加 toolName 参数；
-        // [s09] 加 ruleBehavior 参数：Bash deny/ask 桶与 allow 桶剥离参数不同）
+        // [s09] 加 ruleBehavior 参数：Bash deny/ask 桶与 allow 桶剥离参数不同；
+        // [P19] 加 source + cwd：PathTool 分支改走 CC patternWithRoot 根锚定）
         return matchRuleContent(rule.ruleValue().ruleContent(), target, tool.name(),
-            rule.ruleBehavior());
+            rule.ruleBehavior(), source, cwd);
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -754,7 +808,9 @@ public final class RuleQuery {
      *
      * <p>修补后分派语义(对齐 CC permissionRuleParser.ts):
      * <ul>
-     *   <li><b>PathTool</b>(read_file/write_file/edit_file)+ ruleContent 含 {@code /} 或 {@code **} → glob</li>
+     *   <li><b>PathTool</b>(Read/Edit/Write) → {@link #matchesPathRuleRootRelative}
+     *       （[P19] 对齐 CC {@code matchingRuleForInput} filesystem.ts:955-1025 的
+     *       {@code patternWithRoot} 根锚定；见下方 P19 说明）</li>
      *   <li><b>BashTool</b> → {@link com.nexusai.application.agent.bash.BashRuleMatcher}
      *       （[s09] 对齐 CC bashPermissions.ts filterRulesByContentsMatchingInput：
      *       env/wrapper 剥离 + compound guard + xargs 前缀 + wildcard exact 拒绝；
@@ -763,17 +819,34 @@ public final class RuleQuery {
      *   <li>否则 → 精确字符串匹配</li>
      * </ul>
      *
+     * <p><b>[P19 · 轴 C 收口]</b> PathTool 分支原为「{@code startsWith("/") || contains("**")}
+     * → {@code matchesGlob} 对<b>绝对路径串</b>做 glob，否则精确相等」——<b>无根锚</b>。
+     * CC 的 Edit 桶与 Read 桶<b>共用一份根锚</b>：{@code getPatternsByRoot} 的
+     * {@code toolType='edit'}（filesystem.ts:926-928）与 {@code toolType='read'}（:929-931）
+     * 在 :943 共同落到 {@code patternWithRoot(pattern, rule.source)}。故同一 {@code /…} 规则
+     * 在两桶必须同根 —— 原实现下 {@code Read(/agents/**)} 按绝对串 glob 判、Edit 桶按根锚相对判，
+     * 同规则两桶结论可相反。现两桶统一走 {@link #matchesPathRuleRootRelative}。
+     *
+     * <p>⚠️ 生产可达面：本分支当前<b>只被 Read 工具命中</b>（Edit/Write 的 content rule 走
+     * {@link #getEditRuleByContentsForPath} 路径，不经过本方法；全仓 {@code matchesContent}
+     * 的 4 个 public 入口在生产只传 Read/Bash/PowerShell 工具）。Edit/Write 一并纳入是为
+     * CC 语义「两桶同根」收口（同一分派点不得对同形规则用两套模型），非生产行为变更。
+     *
      * @param ruleContent 规则内容字符串
      * @param target      从 input 提取的匹配目标
      * @param toolName    工具名(PathTool/BashTool/Other 三种类型)
      * @param behavior    规则行为桶（Bash 匹配的剥离参数分桶依据；
      *                    CC matchingRulesForInput :937-986：deny/ask 桶
      *                    stripAllEnvVars=true + skipCompoundCheck=true）
+     * @param source      规则来源（决定 PathTool 的 {@code /…} 前缀根锚定）
+     * @param cwd         PathTool 路径规则的 root-relative 匹配基准
      * @return            true = 匹配
      */
     private static boolean matchRuleContent(
             String ruleContent, String target, String toolName,
-            com.nexusai.application.agent.permission.PermissionBehavior behavior) {
+            com.nexusai.application.agent.permission.PermissionBehavior behavior,
+            com.nexusai.application.agent.permission.PermissionRuleSource source,
+            String cwd) {
         // 0. PowerShell 工具：大小写不敏感独立匹配路径（OPD-PERM-37）
         //    PowerShell cmdlet 大小写不敏感（Get-Process == get-process），CC powershellPermissions.ts
         //    全程 strEquals/strStartsWith 小写比较 + matchWildcardPattern(..., true)；
@@ -800,13 +873,10 @@ public final class RuleQuery {
             && (toolName.equals("Edit")
                 || toolName.equals("Write")
                 || toolName.equals("Read"));
-        // 1. PathTool (file_path 类工具): 用 glob (路径必须含 `/` 才能视为 glob)
+        // 1. PathTool (file_path 类工具): root-relative 匹配（[P19] 对齐 CC matchingRuleForInput）
         if (isPathTool) {
-            if (ruleContent.startsWith("/") || ruleContent.contains("**")) {
-                return matchesGlob(ruleContent, target);
-            }
-            // PathTool 但 ruleContent 不像 glob (如 "src/main.java") → 精确
-            return ruleContent.equals(target);
+            // cwd 缺失（无会话）在此单点解析，与 getEditRuleByContentsForPath 同一入口/同一告警位
+            return matchesPathRuleRootRelative(ruleContent, target, source, resolveEffectiveCwd(cwd));
         }
         // 2. Other 工具: 用 :* 前缀语法
         if (ruleContent.contains(":*")) {
@@ -882,45 +952,20 @@ public final class RuleQuery {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // 内部：路径 glob 匹配
-    // ──────────────────────────────────────────────────────────────────────
-
-    /**
-     * 路径 glob 匹配（对齐 CC 的路径 glob 语义）。
-     *
-     * <p>匹配规则：
-     * <ul>
-     *   <li>{@code **} 匹配任意层级路径（含 {@code /}）</li>
-     *   <li>{@code *} 匹配单个路径段（不含 {@code /}）</li>
-     *   <li>其他字符按字面匹配</li>
-     * </ul>
-     *
-     * <p>使用 {@link PathMatcher} 的 glob 语法实现。
-     * {@code **} 在 NIO glob 中匹配任意深度路径，{@code *} 匹配单层，
-     * 与 CC 语义一致。
-     *
-     * @param pattern glob 模式（如 {@code /Users/foo/**}）
-     * @param path    实际路径（如 {@code /Users/foo/bar.txt}）
-     * @return        true = 路径匹配 glob 模式
-     */
-    static boolean matchesGlob(String pattern, String path) {
-        try {
-            // 使用 NIO PathMatcher 的 glob 语法：** 匹配任意深度，* 匹配单层
-            PathMatcher matcher = FileSystems.getDefault().getPathMatcher("glob:" + pattern);
-            return matcher.matches(java.nio.file.Paths.get(path));
-        } catch (Exception e) {
-            // glob 模式非法时回退到精确匹配
-            return pattern.equals(path);
-        }
-    }
-
-    // ──────────────────────────────────────────────────────────────────────
     // OPD-WF5-FS-052 · matchingRuleForInput root-relative 匹配（对齐 CC patternWithRoot + relativePath + ignore）
     // ──────────────────────────────────────────────────────────────────────
 
     /**
      * CC {@code matchingRuleForInput} 的 Java root-relative 等价（filesystem.ts:955-1025
-     * + patternWithRoot :853-917）。仅用于 Edit 路径规则（matchingRuleForInput 'edit' 桶）。
+     * + patternWithRoot :853-917）。<b>edit 桶与 read 桶共用同一份实现</b> —— CC 的
+     * {@code getPatternsByRoot} 对 {@code toolType='edit'}（filesystem.ts:926-928）与
+     * {@code toolType='read'}（:929-931）在 :943 共同调用 {@code patternWithRoot(pattern, rule.source)}，
+     * 两桶<b>没有任何根锚差异</b>；差异只在「哪些规则进桶」（CC 按 toolName 过滤：
+     * edit 桶取 {@code Edit(...)}、read 桶取 {@code Read(...)}），不在「怎么锚根」。
+     * 故本方法不按桶分支，也<b>不应</b>再叫 Edit 专属名（原 {@code matchesEditPathRuleRootRelative}）。
+     *
+     * <p>两个调用方：{@link #getEditRuleByContentsForPath}（edit 桶路径入口）与
+     * {@link #matchesContent} 的 PathTool 分支（read 桶经 public 内容规则入口抵达）。
      *
      * <p>匹配三步：
      * <ol>
@@ -938,13 +983,14 @@ public final class RuleQuery {
      *       {@link #globMatchesPosix} 等价表达：bare 目录模式匹配其下全部内容）。</li>
      * </ol>
      *
-     * @param ruleContent Edit 规则内容（如 {@code //etc/**} / {@code ~/.claude/**} / {@code /.claude/**}）
+     * @param ruleContent 路径规则内容（如 {@code //etc/**} / {@code ~/.claude/**} / {@code /.claude/**}；
+     *                    Read 与 Edit 同形）
      * @param path        待匹配路径（原始 input 或已展开绝对路径均可，内部统一 expand）
      * @param source      规则来源（决定 {@code /…} 前缀的根锚定）
      * @param cwd         校验基准 cwd（CC getOriginalCwd 等价）
      * @return            true = root-relative 命中
      */
-    static boolean matchesEditPathRuleRootRelative(
+    static boolean matchesPathRuleRootRelative(
             String ruleContent, String path,
             com.nexusai.application.agent.permission.PermissionRuleSource source,
             String cwd) {
@@ -1002,7 +1048,7 @@ public final class RuleQuery {
         }
         boolean matched = globMatchesPosix(globPattern, rel);
         if (matched && log.isDebugEnabled()) {
-            log.debug("RuleQuery.matchesEditPathRuleRootRelative: 命中 root={} pattern={} target={} rel={}",
+            log.debug("RuleQuery.matchesPathRuleRootRelative: 命中 root={} pattern={} target={} rel={}",
                 root, relativePattern, target, rel);
         }
         return matched;

@@ -129,7 +129,8 @@ class CompactForkProjectRootWiringTest {
             false);
 
         assertThat(cs.projectRoot())
-            .as("未绑定 → null（fork 端 shared(null) 走 CwdResolution originalCwd 回落；"
+            .as("未绑定 → null（fork 端 shared(null) 的 sessionId 恒 null ⇒ 走 CwdResolution"
+                + "**无会话命名出口** getOriginalCwdLayerForNonSession（= 进程 user.dir）；"
                 + "写 config home 会伪造项目根）")
             .isNull();
     }
@@ -207,7 +208,8 @@ class CompactForkProjectRootWiringTest {
             new CompactConversationContext().setCacheSafeParams(cs).setAbortController(new AbortController()));
 
         assertThat(recording.lastParams().projectRoot())
-            .as("null = 不造字段（fork 端 shared(null) 走 CwdResolution originalCwd 回落，非 config home）")
+            .as("null = 不造字段（fork 端 shared(null) 的 sessionId 恒 null ⇒ 走 CwdResolution"
+                + "无会话命名出口 getOriginalCwdLayerForNonSession = 进程 user.dir，非 config home）")
             .isNull();
     }
 

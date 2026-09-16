@@ -226,7 +226,7 @@ public class ReadPermissionChecker {
         // 参与匹配——deny 规则可经解析后落点命中（CC :1084-1100 SECURITY 注释语义：
         // deny 必须先于一切 allow 检查，防 symlink 间接路径绕过）。
         for (String pathToCheck : pathsToCheck) {
-            PermissionRule denyRule = lookupRule(permCtx, tool, pathToCheck, true);
+            PermissionRule denyRule = lookupRule(permCtx, tool, pathToCheck, true, cwdString(ctx));
             if (denyRule != null) {
                 if (log.isInfoEnabled()) {
                     log.info("[ReadPermissionChecker] deny rule 命中 → deny: rule={} path={} pathToCheck={}",
@@ -241,7 +241,7 @@ public class ReadPermissionChecker {
 
         // ── 步骤 4: read-specific ask rule → ask（遍历全部展开路径，CC :1103-1122） ──
         for (String pathToCheck : pathsToCheck) {
-            PermissionRule askRule = lookupRule(permCtx, tool, pathToCheck, false);
+            PermissionRule askRule = lookupRule(permCtx, tool, pathToCheck, false, cwdString(ctx));
             if (askRule != null) {
                 if (log.isInfoEnabled()) {
                     log.info("[ReadPermissionChecker] ask rule 命中 → ask: rule={} path={} pathToCheck={}",
@@ -321,7 +321,8 @@ public class ReadPermissionChecker {
         //   CC 的 content allow（如 hook agent 的 Read(/transcriptPath) session rule，
         //   execAgentHook.ts:141-153）在工具 checkPermissions 内匹配 — 旧 R26 hook 层
         //   的 2b' 在 hook 内做同样匹配，随 6 hook 删除收窄回本路径（OD-SS-02）。
-        PermissionRule allowRule = RuleQuery.getAllowRuleByContentsForTool(permCtx, tool, input);
+        PermissionRule allowRule =
+            RuleQuery.getAllowRuleByContentsForTool(permCtx, tool, input, cwdString(ctx));
         if (allowRule != null) {
             if (log.isInfoEnabled()) {
                 log.info("[ReadPermissionChecker] allow rule 命中 → allow: rule={} path={}",
@@ -397,18 +398,36 @@ public class ReadPermissionChecker {
      * @param tool        工具实例
      * @param pathToCheck 展开路径（original 或 symlink 目标）
      * @param deny        true=deny 桶；false=ask 桶
+     * @param cwd         [P19] read 桶路径规则的 root-relative 匹配基准（会话 cwd，来自
+     *                    {@code ctx.effectiveCwd()}）。CC {@code matchingRuleForInput} 的
+     *                    cwd 来自 {@code ctx}；Java 的 {@code ToolPermissionContext} 不带 cwd
+     *                    ⇒ 必须显式传。null → 按「无会话」回落（见 {@code RuleQuery}}）
      * @return 第一个 content 匹配的规则；无匹配返回 null
      */
     private static PermissionRule lookupRule(
-            ToolPermissionContext permCtx, Tool tool, String pathToCheck, boolean deny
+            ToolPermissionContext permCtx, Tool tool, String pathToCheck, boolean deny, String cwd
     ) {
         JsonNode syntheticInput = JsonNodeFactory.instance.objectNode().put("file_path", pathToCheck);
         if (deny) {
-            return RuleQuery.getDenyRuleByContentsForTool(permCtx, tool, syntheticInput);
+            return RuleQuery.getDenyRuleByContentsForTool(permCtx, tool, syntheticInput, cwd);
         }
         // ask 桶走 getAskRuleByContentsForTool（仅查 ask 桶，对齐 CC ask 专用桶语义）。
         // deny 桶已在上方 deny=true 分支查过（无命中才走到这里），无需再查。
-        return RuleQuery.getAskRuleByContentsForTool(permCtx, tool, syntheticInput);
+        return RuleQuery.getAskRuleByContentsForTool(permCtx, tool, syntheticInput, cwd);
+    }
+
+    /**
+     * [P19] 会话 cwd 字符串形式 · 供 read 桶路径规则的 root-relative 匹配基准。
+     *
+     * <p>对齐 CC {@code matchingRuleForInput} 的 {@code getCwd()}（cwd 来自 ctx）：
+     * 本仓 cwd 的唯一可信来源是 {@link ToolUseContext#effectiveCwd()}（⛔ 不经
+     * ThreadLocal/MDC 读）。null → 交 {@code RuleQuery} 按「无会话」回落并 WARN 留痕。
+     *
+     * @param ctx 工具调用上下文（可 null）
+     * @return 会话 cwd 字符串；无值返回 null
+     */
+    private static String cwdString(ToolUseContext ctx) {
+        return ctx != null && ctx.effectiveCwd() != null ? ctx.effectiveCwd().toString() : null;
     }
 
     /**

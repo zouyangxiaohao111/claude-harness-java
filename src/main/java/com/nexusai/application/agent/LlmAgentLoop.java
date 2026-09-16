@@ -4402,12 +4402,31 @@ public class LlmAgentLoop implements AgentLoop {
                 // [cwd-fix 2026-08-25] 显式传会话绑定 projectRoot（sessionState.workspaceDir，CC 启动冻结）——
                 //   旧构造 new UserContextProvider(claudemdEngine) 依赖隐式会话解析（裸 MDC 槽，批 3c 已删），
                 //   system prompt 构建线程可能无会话 → getOriginalCwdLayer 落 user.dir（nexusai-backend），
-                //   LLM 误报工作目录（会话绑定 DingDing 实测）。workspaceDir 缺失 → 回退 getOriginalCwdLayer。
+                //   LLM 误报工作目录（会话绑定 DingDing 实测）。
+                // [批 P23 2026-09-16] 兜底腿锚由 getOriginalCwdLayer 改为 getProjectRoot（稳定会话项目根）
+                //   —— 与**本三元的主腿同语义**。主腿 workspaceDir 的唯一生产写入点是
+                //   resolveSessionProjectRoot → SessionProjectRoot.lookup（sessions.main_project_id →
+                //   projects.path），与 CwdResolution.getProjectRoot 同一条判据；原兜底腿取
+                //   getOriginalCwdLayer 则多一层 SessionCwdHolder.getOriginalCwd（EnterWorktreeTool
+                //   重锚槽）⇒ **同一三元两条腿语义不同**，进 worktree 后兜底腿漂到 worktreePath
+                //   = F1（CC gh-30217）同型（P13 修 transcript 存储根 / P21 修
+                //   AgentLoopContextFactory.resolveFallbackWorkspaceDir，本处是第三处）。
+                //   ⚠️ 可达性（本批实测，非推断）：本兜底**可被非 null sessionId 触达** ——
+                //   LlmAgentLoop.workspaceDir 字段初值 null，且 buildSessionStateFromInstance 无条件
+                //   setWorkspaceDir ⇒ 一旦 resolveSessionProjectRoot 失败，LoopSessionState.workspaceDir
+                //   即为 null。夹具（SessionProjectRoot.setForSession(S, bound) +
+                //   SessionCwdHolder.setOriginalCwd(S, worktree) + setWorkspaceDir(null)）实测：
+                //   改前读到 worktree 目录的 CLAUDE.md（哨兵 WORKTREE_MARKER），改后读到 boundProject 的
+                //   （BOUND_MARKER）。守护类 = LlmAgentLoopUserContextFallbackAnchorTest
+                //   （改回 getOriginalCwdLayer ⇒ 2 红读 WORKTREE_MARKER；改成 getCwd ⇒ 2 红读 CD_MARKER）。
+                //   ⚠️ 生产可达态只有「未绑定 / DB 无此会话 / 无法判定 / 确无会话」四种，前三种
+                //   **两锚同族 fail-loud**（改前改后都抛）⇒ 本次改动在生产上零行为变化，
+                //   消除的是「重锚槽一旦有值就锚进 worktree」的潜伏分叉。
                 new com.nexusai.application.agent.prompt.UserContextProvider(
                     (ctx.sessionState() != null && ctx.sessionState().workspaceDir() != null)
                         ? ctx.sessionState().workspaceDir()
                         : java.nio.file.Path.of(com.nexusai.application.agent.agent.CwdResolution
-                            .getOriginalCwdLayer(state != null ? state.sessionId() : null)),
+                            .getProjectRoot(state != null ? state.sessionId() : null)),
                     System::getenv,
                     ctx.claudemdEngine(),
                     // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析（否则回落 user.dir，
