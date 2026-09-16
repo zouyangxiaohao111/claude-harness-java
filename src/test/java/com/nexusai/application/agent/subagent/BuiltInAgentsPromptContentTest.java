@@ -25,17 +25,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class BuiltInAgentsPromptContentTest {
 
-    /** CC statuslineSetup.ts 第 1 行（模板字符串首行，运行时以该句开头）。 */
+    /** CC statuslineSetup.ts 第 1 行（模板字符串首行，运行时以该句开头）。
+     *  ⚠️ [H2] 品牌随产品改名收敛：CC 原文为 `…for Claude Code.`，Java 运行时为 `…for NexusAI.`
+     *  （BuiltInAgents:89；src/main 已 0 处残留旧品牌）⇒ 本常量按**运行时真值**钉住首行。 */
     private static final String CC_STATUSLINE_FIRST_LINE =
-        "You are a status line setup agent for Claude Code.";
+        "You are a status line setup agent for NexusAI.";
 
-    /** CC verificationAgent.ts 第 1 行（模板字符串首行，运行时以该句开头）。 */
+    /** CC verificationAgent.ts 第 1 行（模板字符串首行，运行时以该句开头）。
+     *  该句不含品牌词 ⇒ 与 CC 原文逐字相同（[H2] 未改）。 */
     private static final String CC_VERIFICATION_FIRST_LINE =
         "You are a verification specialist.";
 
-    /** CC DEFAULT_AGENT_PROMPT 首句（prompts.ts:758）；D9 后 statusline/verification 必须<b>不含</b>它。 */
+    /** CC DEFAULT_AGENT_PROMPT 首句（prompts.ts:758）；D9 后 statusline/verification 必须<b>不含</b>它。
+     *  ⚠️ [H2] 同上：原文 `…for Claude Code`，Java 运行时 `…for NexusAI`（BuiltInAgents:47）。 */
     private static final String DEFAULT_PREFIX_MARKER =
-        "You are an agent for Claude Code";
+        "You are an agent for NexusAI";
 
     private static String statuslineSpecific() throws Exception {
         return readPrivateConstant("STATUSLINE_SETUP_SPECIFIC");
@@ -144,22 +148,34 @@ class BuiltInAgentsPromptContentTest {
     // ── R1d 字节长度守卫（对齐 CC 运行时 UTF-8 字节数）──────────────────────
 
     @Test
-    @DisplayName("statusline SPECIFIC 字节长度守卫 7001")
+    @DisplayName("statusline SPECIFIC 字节长度守卫 6993")
     void statusline_prompt_byte_length_guard() throws Exception {
-        // WHY: 7001 = CC STATUSLINE_SYSTEM_PROMPT 运行时 UTF-8 字节数（含尾随空白占位符还原）。
-        // 防止未来无意截断 / 增删行导致与 CC 全文漂移。
-        // 注：独立复验按 TS 模板语义提取 CC 运行时文本，与 Java 反射值逐字节 cmp BYTE-IDENTICAL，
-        //     长度即 7001（IMP-SUB-07-reflection 误报 6977，属其提取工具少计字节，见 concerns）。
-        assertThat(statuslineSpecific().getBytes(StandardCharsets.UTF_8).length).isEqualTo(7001);
+        // WHY（守卫未变）：防止未来无意截断 / 增删行导致全文漂移。
+        // 本守卫的**语义 = 「与 CC STATUSLINE_SYSTEM_PROMPT 运行时文本（含尾随空白占位符还原、
+        // ${TOOL_NAME} 还原）逐字节一致」** ⇒ 非恰为基准值即红（⛔ 不放宽成区间）。
+        //
+        // ⚠️ [H2] 新基准 = 6993（原 7001）。旧值 = **CC 原文**运行时长度（本轮实测 CC 侧
+        //   = 7001B，与旧期望逐字节吻合 ⇒ 反证旧值确实是「CC 原文口径」）；
+        //   Java 侧因**产品品牌/路径改名**偏离 −8B，实测（本轮 dump 逐行差分，合计逐行闭合）：
+        //     · BuiltInAgents 首行 2×  Claude Code → NexusAI  = −4 ×2 = −8
+        //     · 第 48 行  1×          Claude Code → NexusAI  = −4
+        //     · ~/.claude → ~/.nexusai（4 行各 1 处）        = +1 ×4 = +4
+        //                              ────────────────────────────────
+        //                              合计                    = −8 ⇒ 7001 − 8 = 6993 ✔
+        //   （`NexusAI` = 7B 而 `Claude Code` = 11B ⇒ 每次 −4；`.nexusai` = 8B 而 `.claude` = 7B ⇒ 每次 +1）
+        // ⛔ 未删守卫、未放宽为范围 —— 仅把基准值更新为新实测值并留全差额来源。
+        assertThat(statuslineSpecific().getBytes(StandardCharsets.UTF_8).length).isEqualTo(6993);
     }
 
     @Test
-    @DisplayName("verification SPECIFIC 字节长度守卫 9634")
+    @DisplayName("verification SPECIFIC 字节长度守卫 9637")
     void verification_prompt_byte_length_guard() throws Exception {
-        // WHY: 9634 = CC VERIFICATION_SYSTEM_PROMPT（${BASH_TOOL_NAME}→Bash、
-        // ${WEB_FETCH_TOOL_NAME}→WebFetch 还原后）运行时 UTF-8 字节数。
-        // 注：同 statusline —— 逐字节 cmp BYTE-IDENTICAL，正确长度为 9634（reflection 误报 9520）。
-        assertThat(verificationSpecific().getBytes(StandardCharsets.UTF_8).length).isEqualTo(9634);
+        // WHY（守卫未变）：同 statusline —— 「与 CC VERIFICATION_SYSTEM_PROMPT 运行时文本
+        //   （${BASH_TOOL_NAME}→Bash、${WEB_FETCH_TOOL_NAME}→WebFetch 还原后）逐字节一致」。
+        // ⚠️ [H2] 新基准 = 9637（原 9634）。旧值 = CC 原文口径（本轮实测 CC 侧 = 9634B，与旧期望吻合）；
+        //   Java 侧偏离 +3B，来源**唯一且已逐行定位**：3 处 `mcp__claude-in-chrome__` →
+        //   `mcp__nexusai-in-chrome__`（`claude`=6B → `nexusai`=7B ⇒ 每处 +1）= +3 ⇒ 9634 + 3 = 9637 ✔
+        assertThat(verificationSpecific().getBytes(StandardCharsets.UTF_8).length).isEqualTo(9637);
     }
 
     // ── R1e 返工 R2 回归：whenToUse 补 user's（对齐 CC statuslineSetup.ts:137）─
@@ -169,6 +185,9 @@ class BuiltInAgentsPromptContentTest {
     void statusline_when_to_use_contains_users() {
         // WHY: CC 原文本为 "the user's Claude Code status line"，漏 user's 属翻译丢失。
         assertThat(BuiltInAgents.STATUSLINE_SETUP_AGENT.whenToUse())
-            .isEqualTo("Use this agent to configure the user's Claude Code status line setting.");
+            // [H2] 期望值随品牌收敛（CC 原文 `…the user's Claude Code status line setting.`；
+            //   Java 运行时 = BuiltInAgents:495「…the user's NexusAI status line setting.」）。
+            //   断言形状与意图（含 user's + 完整 whenToUse 文案）不变。
+            .isEqualTo("Use this agent to configure the user's NexusAI status line setting.");
     }
 }

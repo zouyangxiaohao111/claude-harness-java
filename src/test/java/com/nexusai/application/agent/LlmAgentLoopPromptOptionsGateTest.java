@@ -76,10 +76,29 @@ class LlmAgentLoopPromptOptionsGateTest {
         return r;
     }
 
+    /**
+     * [H3 修红] 反射签名补第 2 参 {@code ToolUseContext perTurnTuc}。
+     *
+     * <p><b>根因</b>：实现已为 <b>2 参</b>
+     * （{@code LlmAgentLoop:4602} {@code buildEffectivePromptOptions(AgentLoopContext ctx,
+     * ToolUseContext perTurnTuc)}），测试仍按 <b>1 参</b>反射 ⇒ {@code NoSuchMethod}。
+     * 该参**有文档且被使用**：javadoc「{@code @param perTurnTuc 当前 turn 工具上下文
+     * （mcpClients/sessionId 源）}」，方法体第 1 行即 {@code String sessionId = turnSessionId(ctx, perTurnTuc);}
+     * ⇒ 属**实现侧真新增**（非实现错）。
+     *
+     * <p><b>本用例为何传 {@code null}</b>：{@code turnSessionId(ctx, perTurnTuc)} 为
+     * {@code perTurnTuc != null ? perTurnTuc.sessionId() : ctx.streamSessionId()}（{@code :4302-4304}，
+     * null-safe）。本类 ctx 由 {@code TestContexts.agentLoopContext(...)} 构造 ⇒
+     * {@code streamSessionId()==null} ⇒ {@code sessionId==null} ⇒ [SP-03] 会话主线程 agent 分支
+     * **不激活** —— 这正是本类 3 个用例要测的「**无会话 → 回落 resolver 门控**」链；
+     * 传 TUC 只会额外激活该分支（另一条路径，已由本类 TUC-bearing 用例
+     * {@code invokeMergeCoordinatorUserContext(ctx, tuc, parts)} 覆盖）。⛔ 断言一律未改。
+     */
     private static EffectivePromptOptions invokeBuildOptions(AgentLoopContext ctx) throws Exception {
-        Method m = LlmAgentLoop.class.getDeclaredMethod("buildEffectivePromptOptions", AgentLoopContext.class);
+        Method m = LlmAgentLoop.class.getDeclaredMethod("buildEffectivePromptOptions",
+            AgentLoopContext.class, ToolUseContext.class);
         m.setAccessible(true);
-        return (EffectivePromptOptions) m.invoke(null, ctx);
+        return (EffectivePromptOptions) m.invoke(null, ctx, null);
     }
 
     private static Map<String, String> invokeMergeCoordinatorUserContext(

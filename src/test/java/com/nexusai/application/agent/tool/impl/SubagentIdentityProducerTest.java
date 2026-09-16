@@ -178,19 +178,32 @@ class SubagentIdentityProducerTest {
             .as("产出点必须唯一（新增第二个盖章点 = 绕过单派生点，须显式评审）")
             .isEqualTo(1);
 
-        // 取出盖章语句所在的整条赋值语句（到第一个 ';' 为止）
+        // ⚠️ [H1 修红] 锚点更新：批 5c（ff71006d）把盖章**抽出为** `stampSubagentLoopContext(...)`
+        //   （定义在文件前部 :588，其体内唯一一处 `.withSubagentIdentity(`），单派生点的绑定随之下移到
+        //   **调用点**（executeStreaming 内 `final ToolUseContext ctxForLoop = stampSubagentLoopContext(...)`）。
+        //   旧锚点 `lastIndexOf("final ToolUseContext ctxForLoop", call)` 是**从产出点向前搜** —— 抽出后
+        //   产出点位于文件前部、调用点在其后 ⇒ 恒返回 -1（这就是本条红的根因）。
+        //   ⇒ 改从文件末尾取最后一次出现（调用点），断言**其语句**的实参仍来自 identityForLoop。
         int call = text.indexOf(".withSubagentIdentity(");
-        int stmtStart = text.lastIndexOf("final ToolUseContext ctxForLoop", call);
+        int stmtStart = text.lastIndexOf("final ToolUseContext ctxForLoop", text.length());
         assertThat(stmtStart)
-            .as("盖章必须发生在 executeStreaming 的 ctxForLoop（子代理 loop 承载 TUC）上")
+            .as("盖章必须发生在 executeStreaming 的 ctxForLoop（子代理 loop 承载 TUC）上："
+                + "即 `final ToolUseContext ctxForLoop = stampSubagentLoopContext(...)` 调用点必须存在")
             .isGreaterThan(0);
-        String stmt = text.substring(stmtStart, text.indexOf(';', call));
+        String stmt = text.substring(stmtStart, text.indexOf(';', stmtStart));
 
         assertThat(stmt)
             .as("盖章实参必须来自 identityForLoop（= SubagentIdentity.of(defForLoop) 单派生点），"
                 + "不得硬编码或在仓内另起来源")
             .contains("identityForLoop.subagentName()")
             .contains("identityForLoop.isBuiltIn()");
+
+        // [H1] 抽取重构后补的**等强**链接断言：产出点（helper 内）与单派生点绑定（调用点）之间
+        //   原本靠「相邻同一语句」隐含，抽出后该隐含消失 ⇒ 显式断言「盖章 helper 全文件只有一个调用点」，
+        //   使「唯一产出点 ← 唯一调用点 ← identityForLoop 绑定」重新闭合成链（⛔ 非新增约束，是原意图的等价表达）。
+        assertThat(text.split("stampSubagentLoopContext\\(", -1).length - 1)
+            .as("盖章 helper 必须只有一个调用点（否则第二条盖章路径可绕过单派生点；定义处 1 次 + 调用处 1 次 = 2）")
+            .isEqualTo(2);
 
         assertThat(text)
             .as("identityForLoop 必须绑定到 SubagentIdentity.of(defForLoop)（同一份 agentDefinition）")

@@ -171,26 +171,32 @@ class SubagentToolForkMessagesCompletenessTest {
         // GIVEN: SubagentTool 无 Spring 注入
         SubagentTool tool = new SubagentTool();
 
-        // WHEN: 反射查 executeAsync 11 参签名
-        //   [IMP-SUB-28 A5 返工 R3] 第 10 参 onProgress (Consumer<Tool.ToolProgress>) — async worker
+        // WHEN: 反射查 executeAsync **12** 参签名
+        //   [H1 修红] 12 参（原 11 参 + 第 10 参 name）：[IMP-G4 C7] 为 `name→agentId 注册`
+        //   （CC AgentTool.tsx:703-712 仅 async spawn）追加了 `String name`，与既有的
+        //   onProgress/parentCtx（[IMP-SUB-28 A5] 降级 sync 流式 sink）经「[冲突裁决·并集]」并存
+        //   —— 见 SubagentTool:3168-3179 形参表 + :2330 调用点注释（顺序 name→onProgress→ctx）。
+        //   本类仅同步签名引用；各断言（参数位置/类型）意图逐条不变，并新增 name 位。
+        //   [IMP-SUB-28 A5 返工 R3] 第 10→11 参 onProgress (Consumer<Tool.ToolProgress>) — async worker
         //   路径不转发父 onProgress（CC async 返回 async_launched，进度走 task panel），仅
-        //   backgroundTaskRunner 未注入的降级同步路径接线（sync 语义）；第 11 参 parentCtx (D21 累加源).
+        //   backgroundTaskRunner 未注入的降级同步路径接线（sync 语义）；第 11→12 参 parentCtx (D21 累加源).
         Class<?> agentDefClass = Class.forName("com.nexusai.application.agent.subagent.AgentDefinition");
         Class<?> forkParamsClass = Class.forName("com.nexusai.application.agent.tool.impl.SubagentExecutor$ForkPathParams");
         Method m;
         try {
             m = SubagentTool.class.getDeclaredMethod("executeAsync", String.class, String.class, String.class,
                 agentDefClass, String.class, forkParamsClass, String.class, String.class, String.class,
+                String.class,
                 java.util.function.Consumer.class, ToolUseContext.class);
         } catch (NoSuchMethodException e) {
-            throw new AssertionError("executeAsync 11 参签名（forkParams + currentCwd + effectiveIsolation + invokingRequestId + onProgress + parentCtx）不存在 — 合并后未对齐",
+            throw new AssertionError("executeAsync 12 参签名（forkParams + currentCwd + effectiveIsolation + invokingRequestId + name + onProgress + parentCtx）不存在 — 合并后未对齐",
                 e);
         }
 
-        // THEN: 11 参含 ForkPathParams (6) + currentCwd (7) + effectiveIsolation (8) + invokingRequestId (9)
-        //   + onProgress (10) + parentCtx (11)
+        // THEN: 12 参含 ForkPathParams (6) + currentCwd (7) + effectiveIsolation (8) + invokingRequestId (9)
+        //   + name (10) + onProgress (11) + parentCtx (12)
         Class<?>[] paramTypes = m.getParameterTypes();
-        assertThat(paramTypes).hasSize(11);
+        assertThat(paramTypes).hasSize(12);
         assertThat(paramTypes[5])
             .as("executeAsync 第 6 参（forkParams）必须是 SubagentExecutor.ForkPathParams")
             .isEqualTo(forkParamsClass);
@@ -204,10 +210,13 @@ class SubagentToolForkMessagesCompletenessTest {
             .as("executeAsync 第 9 参（invokingRequestId）必须是 String 类型（[RF-1] CC AgentTool.tsx:723 assistantMessage?.requestId）")
             .isEqualTo(String.class);
         assertThat(paramTypes[9])
-            .as("executeAsync 第 10 参（onProgress）必须是 java.util.function.Consumer（[IMP-SUB-28 A5] async 不转发父 onProgress，仅降级 sync 接线，CC AgentTool.tsx:686-764）")
-            .isEqualTo(java.util.function.Consumer.class);
+            .as("executeAsync 第 10 参（name）必须是 String 类型（[IMP-G4 C7] async spawn 的 name→agentId 注册，CC AgentTool.tsx:703-712）")
+            .isEqualTo(String.class);
         assertThat(paramTypes[10])
-            .as("executeAsync 第 11 参（parentCtx）必须是 ToolUseContext（D21 降级 sync 路径 setResponseLength 累加源）")
+            .as("executeAsync 第 11 参（onProgress）必须是 java.util.function.Consumer（[IMP-SUB-28 A5] async 不转发父 onProgress，仅降级 sync 接线，CC AgentTool.tsx:686-764）")
+            .isEqualTo(java.util.function.Consumer.class);
+        assertThat(paramTypes[11])
+            .as("executeAsync 第 12 参（parentCtx）必须是 ToolUseContext（D21 降级 sync 路径 setResponseLength 累加源）")
             .isEqualTo(ToolUseContext.class);
     }
 

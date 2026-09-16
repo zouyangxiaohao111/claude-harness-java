@@ -146,7 +146,10 @@ class SubagentEnvInfoTest {
         assertThat(prompt).as("旧发散行已删（验收 #3/#4）").doesNotContain("Environment: Java");
         assertThat(prompt).as("env 块由单实现注入（含 <env> 结构）").contains("<env>");
         assertThat(prompt).as("组装顺序 [DEFAULT_AGENT_PROMPT, agentSpecific?, notes, envInfo]")
-            .contains("You are an agent for Claude Code")
+            // [H1 修红] 期望值随产品改名收敛：DEFAULT_AGENT_PROMPT 首句已由 "for Claude Code"
+            //   改为 "for NexusAI"（BuiltInAgents:47；src/main 已 0 处残留旧品牌）⇒ 断言形状与
+            //   意图（= 组合结果含 DEFAULT_AGENT_PROMPT 前缀）不变，仅更新被引用的品牌值。
+            .contains("You are an agent for NexusAI")
             .contains("Notes:")
             .contains("Here is useful information about the environment you are running in:");
     }
@@ -168,16 +171,21 @@ class SubagentEnvInfoTest {
         // built-in getSystemPrompt 直接读到真实模型名。
         SubagentExecutor executor = new SubagentExecutor(
             null, null, null, null, null, "claude-sonnet-4-6", "fallback");
+        // [H1 修红] 7 参：批 4b-1（d57c0754）为删 AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 载体
+        //   给本方法追加了第 7 参 sessionProjectRoot（实现 :3457-3460）⇒ 反射签名须同步。
         Method m = SubagentExecutor.class.getDeclaredMethod("buildAgentSystemPrompt",
-            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class);
+            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class,
+            String.class);
         m.setAccessible(true);
         String prompt = (String) m.invoke(executor,
-            false, BuiltInAgents.GENERAL_PURPOSE_AGENT, List.of(), "claude-sonnet-4-6", List.of(), null);
+            false, BuiltInAgents.GENERAL_PURPOSE_AGENT, List.of(), "claude-sonnet-4-6", List.of(),
+            null /*userContext*/, null /*sessionProjectRoot：本用例不涉 agent-memory*/);
 
         assertThat(prompt).as("env 块含真实模型名 modelDescription（marketing 名 → named 形式）")
             .contains("You are powered by the model named Sonnet 4.6. The exact model ID is claude-sonnet-4-6.");
         assertThat(prompt).as("内置 agent 基本结构保留（DEFAULT_AGENT_PROMPT 前缀）")
-            .startsWith("You are an agent for Claude Code");
+            // [H1 修红] 同上：品牌值更新（断言仍是「以 DEFAULT_AGENT_PROMPT 首句开头」）。
+            .startsWith("You are an agent for NexusAI");
     }
 
     @Test
@@ -187,11 +195,15 @@ class SubagentEnvInfoTest {
         // 不得编造模型名 → env 块无 modelDescription 行；effectiveModel 显式传参为 null → 抑制。
         SubagentExecutor executor = new SubagentExecutor(
             null, null, null, null, null, null, "fallback");
+        // [H1 修红] 7 参：批 4b-1（d57c0754）为删 AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 载体
+        //   给本方法追加了第 7 参 sessionProjectRoot（实现 :3457-3460）⇒ 反射签名须同步。
         Method m = SubagentExecutor.class.getDeclaredMethod("buildAgentSystemPrompt",
-            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class);
+            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class,
+            String.class);
         m.setAccessible(true);
         String prompt = (String) m.invoke(executor,
-            false, BuiltInAgents.GENERAL_PURPOSE_AGENT, List.of(), null, List.of(), null);
+            false, BuiltInAgents.GENERAL_PURPOSE_AGENT, List.of(), null, List.of(),
+            null /*userContext*/, null /*sessionProjectRoot*/);
 
         assertThat(prompt).as("null effectiveModel → 无 modelDescription 行")
             .doesNotContain("You are powered by the model");
@@ -211,12 +223,15 @@ class SubagentEnvInfoTest {
         //   built-in 子代理 env 块恒含 Additional working directories 行。
         SubagentExecutor executor = new SubagentExecutor(
             null, null, null, null, null, "claude-sonnet-4-6", "fallback");
+        // [H1 修红] 7 参：批 4b-1（d57c0754）为删 AutoMemPaths.CURRENT_PROJECT_ROOT ThreadLocal 载体
+        //   给本方法追加了第 7 参 sessionProjectRoot（实现 :3457-3460）⇒ 反射签名须同步。
         Method m = SubagentExecutor.class.getDeclaredMethod("buildAgentSystemPrompt",
-            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class);
+            boolean.class, AgentDefinition.class, List.class, String.class, List.class, String.class,
+            String.class);
         m.setAccessible(true);
         String prompt = (String) m.invoke(executor,
             false, BuiltInAgents.GENERAL_PURPOSE_AGENT, List.of(), "claude-sonnet-4-6",
-            List.of("/extra/a", "/extra/b"), null);
+            List.of("/extra/a", "/extra/b"), null /*userContext*/, null /*sessionProjectRoot*/);
 
         assertThat(prompt).as("附加目录经显式传参下传 computeEnvInfo，env 块含 Additional working directories 行")
             .contains("Additional working directories: /extra/a, /extra/b");

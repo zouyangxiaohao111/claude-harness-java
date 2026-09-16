@@ -99,7 +99,13 @@ class SubagentSyncForegroundRegistrationTest {
 
         // ── Link B: registerSyncForeground 调 registerAgentForeground + 写回 summaryTaskId ──
         UUID agentId = UUID.randomUUID();
-        BackgroundTask registered = executor.registerSyncForeground(agentId, "研究项目结构", "prompt", "general-purpose", null);
+        // [H1 修红] 第 5 参 createSessionId 必须显式非空：批 3b-D7 删除了 MDC/sysprop/"unknown"
+        //   三源兜底 ⇒ BackgroundTaskRunner.taskOutputDir(null) **有意** fail-loud
+        //   （「任务产物必须归属某个会话目录，不编造兜底值」，BackgroundTaskRunner:588-592）。
+        //   生产调用点同样显式透传创建会话（SubagentExecutor:2173-2176「透传创建会话 sessionId」）。
+        //   ⛔ 断言未改动 —— 仅补齐夹具缺失的显式会话值（本用例链路 L1/L2/L3 皆不受其影响）。
+        BackgroundTask registered = executor.registerSyncForeground(
+            agentId, "研究项目结构", "prompt", "general-purpose", "session-1");
 
         assertThat(registered).isNotNull();
         assertThat(registered.id()).isEqualTo(agentId.toString());
