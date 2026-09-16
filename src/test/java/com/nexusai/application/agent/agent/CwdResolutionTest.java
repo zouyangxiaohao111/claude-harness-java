@@ -561,22 +561,30 @@ class CwdResolutionTest {
     }
 
     /**
-     * [cwd3 步骤 2 · S2.6] 两个入口的 ≥WARN 闸必须<b>各自独立</b>。
+     * [cwd3 步骤 2 · S2.6] <b>三个</b>入口的 ≥WARN 闸必须<b>各自独立</b>（[批 P15b] 由两入口扩到三入口）。
      *
      * <p><b>WHY（规则九 · 意图）</b>：原实现两个入口共用<b>同一个</b>一次性 AtomicBoolean ⇒
      * 可见度上限 1 行日志/进程：先触发的入口会把另一入口的告警吃掉，后者永远不打印
      * （「静默失效」的一种）。判据 = 让 {@link CwdResolution#getCwd(String)} 先触发 ⇒
-     * {@link CwdResolution#getOriginalCwdLayer(String)} <b>仍须有自己的 WARN</b>。
+     * {@link CwdResolution#getOriginalCwdLayer(String)} /
+     * {@link CwdResolution#getProjectRoot(String)} <b>仍须各有一条自己的 WARN</b>。
      *
-     * <p>RED（反向实验）：把两个 {@code SESSIONLESS_WARNED_*} 合并回单个 static 闸 ⇒ 本用例红
-     * （第二个断言的 anyMatch 找不到）。
+     * <p><b>[批 P15b] 为什么必须补第三个入口</b>：{@code getProjectRoot} 的入口专属闸
+     * （{@code SESSIONLESS_WARNED_GET_PROJECT_ROOT}，批 P10a 新增）在补本臂之前<b>零测试引用</b>
+     * —— 它被删掉、被合并、被写成恒 {@code true} 都不会有任何用例变红（本仓反复栽的
+     * 「以为守住了、其实没守」）。本臂的名字判据是「warn 文案里出现的是<b>哪个入口名</b>」，
+     * 故它对「闸对象被换成别人」有鉴别力。
      *
-     * <p>装置说明：用 <b>sessionless</b> 路径（不抛）以便连续调两个入口；若用 {@code unknown}
-     * （抛）则第二个入口之前的语句就中断了。⚠️ 必须先复位一次性闸 —— 否则先跑的用例用掉闸，
+     * <p>RED（反向实验）：① 把三个 {@code SESSIONLESS_WARNED_*} 合并回单个 static 闸 ⇒ 本用例红
+     * （第 2/3 个断言的 anyMatch 找不到）；② 把 {@code getProjectRoot} 的 sessionless 分支改成
+     * logger 打到别处 / 不调用 {@code warnSessionlessEnvironment} ⇒ 第 3 个断言红。
+     *
+     * <p>装置说明：用 <b>sessionless</b> 路径（不抛）以便连续调三个入口；若用 {@code unknown}
+     * （抛）则后续入口之前的语句就中断了。⚠️ 必须先复位一次性闸 —— 否则先跑的用例用掉闸，
      * 本用例假红（故有 {@code resetWarnGatesForTesting}）。
      */
     @Test
-    @DisplayName("[cwd3 S2.6] 两入口告警闸独立：getCwd 先触发 ⇒ getOriginalCwdLayer 仍有 WARN")
+    @DisplayName("[cwd3 S2.6 · P15b 扩三入口] 三入口告警闸独立：getCwd 先触发 ⇒ 另两入口仍各有 WARN")
     void warnGatesAreIndependentPerEntry() {
         ch.qos.logback.classic.Logger logger =
             (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(CwdResolution.class);
@@ -589,6 +597,7 @@ class CwdResolutionTest {
         try {
             CwdResolution.getCwd("sess-warn-entry-a");
             CwdResolution.getOriginalCwdLayer("sess-warn-entry-b");
+            CwdResolution.getProjectRoot("sess-warn-entry-c");
 
             java.util.List<String> msgs = app.list.stream()
                 .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
@@ -598,11 +607,440 @@ class CwdResolutionTest {
             assertThat(msgs)
                 .as("⭐ 第二个入口必须**仍有**自己的 WARN —— 单闸实现下这一条会被第一条吃掉")
                 .anyMatch(m -> m.contains("getOriginalCwdLayer 判定「本环境确无会话」"));
+            assertThat(msgs)
+                .as("⭐ [P15b] 第三个入口（getProjectRoot）必须**仍有**自己的 WARN —— 补批 P10a "
+                    + "SESSIONLESS_WARNED_GET_PROJECT_ROOT 的零测试洞")
+                .anyMatch(m -> m.contains("getProjectRoot 判定「本环境确无会话」"));
         } finally {
             logger.detachAppender(app);
             app.stop();
             SessionProjectRoot.setDbResolver(null);
         }
+    }
+
+    /**
+     * [批 P15b · 补 P10a 零测试洞] {@code unknown} 态的 <b>三入口</b> ≥WARN 闸必须各自独立。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：{@link #warnGatesAreIndependentPerEntry} 走的是 sessionless
+     * 路径，只覆盖 {@code SESSIONLESS_WARNED_*} 三闸；而批 P10a 新增的
+     * {@code UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT} 走的是 <b>unknown</b> 路径
+     * （{@code warnUnknownSession}）。两者是不同的分支、不同的闸对象 ⇒ 前者绿不能推出后者守得住。
+     * 补本臂前，全仓对 {@code UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT} 的引用<b>只有定义处</b>。
+     *
+     * <p>判据 = 让 {@code getCwd} 先触发（吃掉自己的闸）⇒ {@code getProjectRoot} <b>仍须有自己的
+     * WARN 且文案里点名 getProjectRoot</b>。
+     *
+     * <p>RED（反向实验）：把 {@code UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT} 与
+     * {@code UNKNOWN_SESSION_WARNED_GET_CWD} 指向同一个 AtomicBoolean ⇒ 本用例红（第三个断言的
+     * anyMatch 找不到：getCwd 已把共享闸用掉）。
+     */
+    @Test
+    @DisplayName("[P15b · 补 P10a] unknown 态三入口告警闸独立：getCwd 先触发 ⇒ getProjectRoot 仍有 WARN")
+    void unknownWarnGatesAreIndependentPerEntry() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(CwdResolution.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        CwdResolution.resetWarnGatesForTesting();
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        try {
+            // unknown 态是 fail-loud ⇒ 三个入口都抛；告警在抛之前打（warnUnknownSession 在 throw 前）
+            catchThrowable(() -> CwdResolution.getCwd("sess-unk-a"));
+            catchThrowable(() -> CwdResolution.getOriginalCwdLayer("sess-unk-b"));
+            catchThrowable(() -> CwdResolution.getProjectRoot("sess-unk-c"));
+
+            java.util.List<String> msgs = app.list.stream()
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+            assertThat(msgs)
+                .as("getCwd 入口必须有「DB 中不存在」WARN")
+                .anyMatch(m -> m.contains("getCwd 的 sessionId=sess-unk-a 在 DB 中不存在"));
+            assertThat(msgs)
+                .as("getOriginalCwdLayer 入口必须有自己的 WARN（[cwd3 S2.6] 拆闸）")
+                .anyMatch(m -> m.contains("getOriginalCwdLayer 的 sessionId=sess-unk-b 在 DB 中不存在"));
+            assertThat(msgs)
+                .as("⭐ [P15b] getProjectRoot 入口必须有自己的 WARN —— 补 P10a 那只闸的零测试洞")
+                .anyMatch(m -> m.contains("getProjectRoot 的 sessionId=sess-unk-c 在 DB 中不存在"));
+        } finally {
+            logger.detachAppender(app);
+            app.stop();
+            CwdResolution.resetWarnGatesForTesting();
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [批 P15b · 补 P10a 零测试洞] {@code getProjectRoot} <b>自己那两只</b>闸必须互异（跨态不互吞）。
+     *
+     * <p><b>WHY（规则九 · 意图）</b>：批 P10a 给 {@code getProjectRoot} 加了<b>两只</b>一次性闸
+     * （{@code UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT} 与 {@code SESSIONLESS_WARNED_GET_PROJECT_ROOT}），
+     * 补本臂前两只都<b>零测试引用</b>。两只闸若被写成同一个对象（或其中一只被删、被替换），
+     * 「同一入口先走 A 态、后走 B 态」时后一条告警会被永久吃掉 —— 而
+     * {@link #warnGatesAreIndependentPerEntry} 只跑 sessionless、
+     * {@link #unknownWarnGatesAreIndependentPerEntry} 只跑 unknown，<b>两条都不会红</b>。
+     * 故必须有本臂：把两态<b>依次</b>打在同一个入口上。
+     *
+     * <p>RED（反向实验 · 派单书 §三 指定）：把
+     * {@code SESSIONLESS_WARNED_GET_PROJECT_ROOT} 与 {@code UNKNOWN_SESSION_WARNED_GET_PROJECT_ROOT}
+     * 合并为同一个 AtomicBoolean（或让二者的 getProjectRoot 调用点指向同一对象）⇒ 本用例红
+     * （第二段断言的 anyMatch 找不到：第一段已把共享闸用掉）。
+     */
+    @Test
+    @DisplayName("[P15b · 补 P10a] getProjectRoot 两条闸互异：先 sessionless 后 unknown，两条告警都在")
+    void projectRootWarnGatesAreIndependentPerState() {
+        ch.qos.logback.classic.Logger logger =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(CwdResolution.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> app =
+            new ch.qos.logback.core.read.ListAppender<>();
+        app.start();
+        logger.addAppender(app);
+        CwdResolution.resetWarnGatesForTesting();
+        try {
+            // 第一段：sessionless 态 ⇒ 消耗 SESSIONLESS_WARNED_GET_PROJECT_ROOT
+            SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
+            CwdResolution.getProjectRoot("sess-pr-gate-1");
+            // 第二段：换成 unknown 态 ⇒ 必须仍能打出自己那条（证明与上一只隔开）
+            SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+            catchThrowable(() -> CwdResolution.getProjectRoot("sess-pr-gate-2"));
+
+            java.util.List<String> msgs = app.list.stream()
+                .map(ch.qos.logback.classic.spi.ILoggingEvent::getFormattedMessage).toList();
+            assertThat(msgs)
+                .as("sessionless 态告警（第一段）必须在")
+                .anyMatch(m -> m.contains("getProjectRoot 判定「本环境确无会话」"));
+            assertThat(msgs)
+                .as("⭐ unknown 态告警（第二段）必须**仍在** —— 两闸若合并，这条会被第一段吃掉")
+                .anyMatch(m -> m.contains("getProjectRoot 的 sessionId=sess-pr-gate-2 在 DB 中不存在"));
+        } finally {
+            logger.detachAppender(app);
+            app.stop();
+            CwdResolution.resetWarnGatesForTesting();
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    // ==================================================================================
+    // [批 P15b] getProjectRoot 六臂矩阵
+    //
+    // WHY（规则九 · 意图）：补臂前实测 —— 全仓对 CwdResolution.getProjectRoot( 的直接调用 = 0，
+    //   其四个非命中臂（unbound / unknown / resolutionFailure / sessionless）一个测试都没有；
+    //   loader 侧（ProjectSettingsLoader:205-209）在 null/哨兵臂就短路了 ⇒ 永远不会抵达本入口的
+    //   sessionless 分支。这正是「以为守住了、其实没守」的形态。
+    //
+    // 每臂的判据不只是「结果对不对」，还包括「与另两入口 getCwd / getOriginalCwdLayer 是否同构」
+    //   —— 后者是派单书 §四 的停下条件（不一致 ⇒ 说明三段合并会把行为差异吃进抽象里）。
+    //   ⚠️ 因此本组用例是**带鉴别力的合并前置**，不是重复断言。
+    //
+    // ⚠️ 每条断言同粒度口径（与既有用例一致，均用 hasMessageContaining 级别的包含断言），
+    //   但额外加了「三入口 message 逐字相等」这一条 —— 既有用例全仓无一条全文相等断言，
+    //   故文案漂移在它们眼里不可见；本组补上该可见度（详见交付报告「局限」段）。
+    // ==================================================================================
+
+    /**
+     * [P15b 臂 1 · bound] 命中绑定 ⇒ 返回该目录（normalizeCwd realpath+NFC），且与该夹具下另两入口同值。
+     *
+     * <p>夹具 = {@code setForSession}（冻结表命中 ⇒ 不回源），sessionCwd / originalCwd 两槽皆空
+     * ⇒ 三入口都只落到 boundProject 层，必须同值。
+     *
+     * <p><b>RED</b>：把 {@code getProjectRoot} 里 {@code return normalizeCwd(boundProject)} 改成
+     * {@code return getOriginalCwdLayerForNonSession()} ⇒ 本用例红（返回进程 user.dir 而非临时目录）。
+     */
+    @Test
+    @DisplayName("[P15b 臂1 bound] getProjectRoot 命中绑定 ⇒ 与另两入口同值")
+    void projectRoot_armBound_sameValueAsOtherTwoEntries(@TempDir Path projectDir) throws Exception {
+        SessionProjectRoot.setForSession("sess-pr-bound", projectDir.toString());
+        String expected = projectDir.toRealPath().toString();
+
+        String fromProjectRoot = CwdResolution.getProjectRoot("sess-pr-bound");
+
+        assertThat(fromProjectRoot)
+            .as("命中绑定 ⇒ 归一化后的绑定目录（经 normalizeCwd realpath+NFC）")
+            .isEqualTo(expected);
+        assertThat(fromProjectRoot)
+            .as("⭐ 三入口同夹具必须同值 —— 不一致即派单书 §四 停下条件")
+            .isEqualTo(CwdResolution.getCwd("sess-pr-bound"))
+            .isEqualTo(CwdResolution.getOriginalCwdLayer("sess-pr-bound"));
+    }
+
+    /**
+     * [P15b 臂 2 · unbound] 会话存在（DB 有行）却无绑定 ⇒ <b>抛</b>，文案含 sessionId，且与另两入口逐字相同。
+     *
+     * <p><b>RED</b>：把 {@code getProjectRoot} 的 {@code if (bound.sessionKnown()) throw ...} 改成
+     * {@code return getOriginalCwdLayerForNonSession()} ⇒ 本用例红（不抛）。
+     */
+    @Test
+    @DisplayName("[P15b 臂2 unbound] getProjectRoot ⇒ 抛，文案与另两入口逐字相同")
+    void projectRoot_armUnbound_throwsSameMessageAsOtherTwoEntries() {
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unbound());
+        try {
+            Throwable pr = catchThrowable(() -> CwdResolution.getProjectRoot("sess-pr-unbound"));
+            Throwable cwd = catchThrowable(() -> CwdResolution.getCwd("sess-pr-unbound"));
+            Throwable orig = catchThrowable(() -> CwdResolution.getOriginalCwdLayer("sess-pr-unbound"));
+
+            assertThat(pr)
+                .as("会话存在却无绑定 = 数据链路异常 ⇒ 必须 fail-loud（⛔ 不回落 user.dir）")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sess-pr-unbound");
+            assertThat(pr.getMessage())
+                .as("⭐ 三入口同夹具必须同文案（逐字）—— 不一致即派单书 §四 停下条件")
+                .isEqualTo(cwd.getMessage())
+                .isEqualTo(orig.getMessage());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [P15b 臂 3 · unknown] DB 明确答「无此会话」⇒ <b>抛</b>，文案含「DB 明确答「无此会话」」+ 哨兵提示，
+     * 且与另两入口逐字相同。
+     *
+     * <p><b>RED</b>：把 {@code getProjectRoot} 的 {@code warnUnknownSession(...); throw ...} 改回
+     * {@code return getOriginalCwdLayerForNonSession()} ⇒ 本用例红（不抛）。
+     */
+    @Test
+    @DisplayName("[P15b 臂3 unknown] getProjectRoot ⇒ 抛，文案含哨兵提示且与另两入口逐字相同")
+    void projectRoot_armUnknown_throwsSameMessageAsOtherTwoEntries() {
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.unknown());
+        try {
+            Throwable pr = catchThrowable(() -> CwdResolution.getProjectRoot("sess-pr-unknown"));
+            Throwable cwd = catchThrowable(() -> CwdResolution.getCwd("sess-pr-unknown"));
+            Throwable orig = catchThrowable(() -> CwdResolution.getOriginalCwdLayer("sess-pr-unknown"));
+
+            assertThat(pr)
+                .as("DB 明确答无此会话 = 数据链路异常 ⇒ 必须抛")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sess-pr-unknown")
+                .hasMessageContaining("DB 明确答「无此会话」")
+                .hasMessageContaining("SessionKeys.");
+            assertThat(pr.getMessage())
+                .as("⭐ 三入口同夹具必须同文案（逐字）—— 不一致即派单书 §四 停下条件")
+                .isEqualTo(cwd.getMessage())
+                .isEqualTo(orig.getMessage());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [P15b 臂 4 · resolutionFailure（未接线）] {@code setDbResolver(null)} ⇒ <b>抛</b>，文案含「无法判定」，
+     * 且与另两入口逐字相同。
+     *
+     * <p>装置来自本类 {@code @BeforeEach}（显式 {@code setDbResolver(null)}），此处<b>再断言一次前置态</b>
+     * —— 否则「环境恰好没装解析器」会冒充本臂装置（既有 {@code scenario4} 同款做法）。
+     */
+    @Test
+    @DisplayName("[P15b 臂4 resolutionFailure(未接线)] getProjectRoot ⇒ 抛「无法判定」，与另两入口逐字相同")
+    void projectRoot_armResolutionFailureUnwired_throwsSameMessageAsOtherTwoEntries() {
+        assertThat(SessionProjectRoot.isDbResolverWired())
+            .as("前置装置：本用例必须运行在「回源解析器未接线」态，否则测的不是本臂")
+            .isFalse();
+
+        Throwable pr = catchThrowable(() -> CwdResolution.getProjectRoot("sess-pr-unwired"));
+        Throwable cwd = catchThrowable(() -> CwdResolution.getCwd("sess-pr-unwired"));
+        Throwable orig = catchThrowable(() -> CwdResolution.getOriginalCwdLayer("sess-pr-unwired"));
+
+        assertThat(pr)
+            .as("未接线 = 装配异常 = 无法判定 ⇒ 必须 fail-loud")
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("sess-pr-unwired")
+            .hasMessageContaining("无法判定");
+        assertThat(pr.getMessage())
+            .as("⭐ 三入口同夹具必须同文案（逐字）—— 不一致即派单书 §四 停下条件")
+            .isEqualTo(cwd.getMessage())
+            .isEqualTo(orig.getMessage());
+    }
+
+    /**
+     * [P15b 臂 5 · resolutionFailure（回源抛错）] 解析器抛异常 ⇒ <b>抛</b>，与臂 4 同文案，
+     * 且与另两入口逐字相同。
+     *
+     * <p><b>RED</b>：删掉 {@code getProjectRoot} 的 {@code if (bound.resolutionFailed()) throw ...}
+     * 整段 ⇒ 本用例红（落到 sessionKnown/sessionless/unknown 都不成立 ⇒ 最终走 unknown 分支抛出的文案
+     * 变成「DB 明确答「无此会话」」⇒ {@code hasMessageContaining("无法判定")} 红）。
+     */
+    @Test
+    @DisplayName("[P15b 臂5 resolutionFailure(回源抛错)] getProjectRoot ⇒ 抛「无法判定」，与另两入口逐字相同")
+    void projectRoot_armResolutionFailureResolverThrows_throwsSameMessageAsOtherTwoEntries() {
+        SessionProjectRoot.setDbResolver(sid -> {
+            throw new RuntimeException("db down");
+        });
+        try {
+            Throwable pr = catchThrowable(() -> CwdResolution.getProjectRoot("sess-pr-dbdown"));
+            Throwable cwd = catchThrowable(() -> CwdResolution.getCwd("sess-pr-dbdown"));
+            Throwable orig = catchThrowable(() -> CwdResolution.getOriginalCwdLayer("sess-pr-dbdown"));
+
+            assertThat(pr)
+                .as("回源抛错 = 无法判定 ⇒ 必须 fail-loud（⛔ 不得当成「无此会话」）")
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("sess-pr-dbdown")
+                .hasMessageContaining("无法判定");
+            assertThat(pr.getMessage())
+                .as("⭐ 三入口同夹具必须同文案（逐字）—— 不一致即派单书 §四 停下条件")
+                .isEqualTo(cwd.getMessage())
+                .isEqualTo(orig.getMessage());
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [P15b 臂 6a · sessionless（null / 空白 / NO_SESSION 哨兵）] 不装绑定 ⇒
+     * <b>== {@code getOriginalCwdLayerForNonSession()}</b>，且与该夹具下另两入口同值。
+     *
+     * <p>三种夹具都走 {@code getProjectRoot} 的**前两个 if**（null/空白 → warnNullSession；
+     * 哨兵 → warnNoSessionSentinel），都不查 DB。
+     *
+     * <p><b>RED</b>：把 {@code getProjectRoot} 的 sessionless 分支 {@code return
+     * getOriginalCwdLayerForNonSession()} 改成返回别的值（如 {@code normalizeCwd("/")}）⇒ 本用例红。
+     */
+    @Test
+    @DisplayName("[P15b 臂6a sessionless null/空白/哨兵] getProjectRoot == getOriginalCwdLayerForNonSession()")
+    void projectRoot_armSessionlessByNullBlankSentinel_matchesNonSessionExit() {
+        String expected = CwdResolution.getOriginalCwdLayerForNonSession();
+
+        assertThat(CwdResolution.getProjectRoot(null))
+            .as("null sessionId ⇒ 无会话命名出口")
+            .isEqualTo(expected);
+        assertThat(CwdResolution.getProjectRoot("   "))
+            .as("空白 sessionId ⇒ 无会话命名出口")
+            .isEqualTo(expected);
+        assertThat(CwdResolution.getProjectRoot(com.nexusai.common.SessionKeys.NO_SESSION))
+            .as("显式「确无会话」哨兵 ⇒ 无会话命名出口")
+            .isEqualTo(expected);
+
+        // ⭐ 三入口同夹具同值（另两入口的 null 路由走各自命名出口，但值同源 = normalizeCwd(user.dir)）
+        assertThat(CwdResolution.getProjectRoot(null))
+            .as("⭐ 三入口同夹具必须同值 —— 不一致即派单书 §四 停下条件")
+            .isEqualTo(CwdResolution.getCwd(null))
+            .isEqualTo(CwdResolution.getOriginalCwdLayer(null));
+        assertThat(CwdResolution.getProjectRoot("   "))
+            .isEqualTo(CwdResolution.getCwd("   "))
+            .isEqualTo(CwdResolution.getOriginalCwdLayer("   "));
+        assertThat(CwdResolution.getProjectRoot(com.nexusai.common.SessionKeys.NO_SESSION))
+            .isEqualTo(CwdResolution.getCwd(com.nexusai.common.SessionKeys.NO_SESSION))
+            .isEqualTo(CwdResolution.getOriginalCwdLayer(com.nexusai.common.SessionKeys.NO_SESSION));
+    }
+
+    /**
+     * [P15b 臂 6b · sessionless（DB 答 sessionless）] 解析器答「本环境确无会话」⇒
+     * <b>== {@code getOriginalCwdLayerForNonSession()}</b>，且与另两入口同值。
+     *
+     * <p>本臂是唯一「经回源链路抵达 sessionless」的形态（6a 是入口短路）。补臂前无任何用例
+     * 从 {@code getProjectRoot} 打到这一分支。
+     *
+     * <p><b>RED</b>：把 {@code getProjectRoot} 的 {@code if (bound.sessionless()) return ...}
+     * 整段删掉 ⇒ 本用例红（落到 unknown 分支 ⇒ 抛，而非返回值）。
+     */
+    @Test
+    @DisplayName("[P15b 臂6b sessionless via DB] getProjectRoot == getOriginalCwdLayerForNonSession()")
+    void projectRoot_armSessionlessFromDb_matchesNonSessionExit() {
+        SessionProjectRoot.setDbResolver(sid -> SessionProjectRoot.Lookup.sessionlessEnvironment());
+        try {
+            String expected = CwdResolution.getOriginalCwdLayerForNonSession();
+            String fromProjectRoot = CwdResolution.getProjectRoot("sess-pr-sessionless");
+
+            assertThat(fromProjectRoot)
+                .as("DB 答 sessionless（本环境确无会话）⇒ 命名出口，不抛")
+                .isEqualTo(expected);
+            assertThat(fromProjectRoot)
+                .as("⭐ 三入口同夹具必须同值 —— 不一致即派单书 §四 停下条件")
+                .isEqualTo(CwdResolution.getCwd("sess-pr-sessionless"))
+                .isEqualTo(CwdResolution.getOriginalCwdLayer("sess-pr-sessionless"));
+        } finally {
+            SessionProjectRoot.setDbResolver(null);
+        }
+    }
+
+    /**
+     * [P15b 臂 8 · bound 但绑定失效] 绑定目录在<b>绑定之后被删掉</b> ⇒ <b>抛</b>「boundProject 无效」，
+     * 且与另两入口逐字相同。
+     *
+     * <p><b>WHY（规则九）</b>：这是 {@code getProjectRoot} 最后一个此前<b>零覆盖</b>的分支
+     * （其余 7 个分支由臂 1-6 覆盖）。语义 = 2026-08-24「cwd 污染修复」：绑定失效（目录被删/移走）
+     * 时⛔ 不得把无效路径交给工具（Bash/Glob/Read 会全失败），必须 fail-loud。
+     *
+     * <p>⚠️ <b>夹具为什么要「先绑有效目录、再删」</b>（实测得出，⛔ 不是随意选的）：
+     * {@code SessionProjectRoot} 的两条写入通道都会把「无效路径」折掉 ——
+     * ①{@code setForSession} 自带 {@code isValidProjectRoot} 校验，<b>直接拒绑</b>
+     * （实测：喂不存在的路径 ⇒ 打「拒绝绑定无效项目根」WARN 且 {@code BY_SESSION} 无条目）；
+     * ②{@code refillFromDb} 对 DB 给的无效路径折成 {@code Lookup.unbound()}（返回 {@code unbound}）。
+     * ⇒ 唯一能抵达本分支的形态是<b>绑定当时有效、之后失效</b>（{@code lookup} 命中冻结表时
+     * <b>不重新校验</b>）。本用例据此构造，并显式断言该前置态。
+     *
+     * <p><b>RED</b>：把 {@code getProjectRoot} 的
+     * {@code throw unresolvedProjectRoot(sessionId, "boundProject 无效（需绝对路径且目录存在）: " + ...)}
+     * 改成 {@code return normalizeCwd(boundProject)} ⇒ 本用例红（不抛，返回无效路径）。
+     */
+    @Test
+    @DisplayName("[P15b 臂8 绑定后失效] getProjectRoot ⇒ 抛「boundProject 无效」，与另两入口逐字相同")
+    void projectRoot_armBoundButInvalidDir_throwsSameMessageAsOtherTwoEntries(@TempDir Path doomedDir) throws Exception {
+        // ① 绑定当时**有效**（否则 setForSession 会拒绑，测的就不是本分支）
+        SessionProjectRoot.setForSession("sess-pr-baddir", doomedDir.toString());
+        assertThat(SessionProjectRoot.isValidProjectRoot(doomedDir.toString()))
+            .as("前置装置 ①：绑定时该目录必须有效，否则会被 setForSession 拒绑")
+            .isTrue();
+
+        // ② 绑定之后失效（目录被删）—— 冻结表仍持有该路径，且 lookup 命中时不重新校验
+        java.nio.file.Files.delete(doomedDir);
+        assertThat(SessionProjectRoot.isValidProjectRoot(doomedDir.toString()))
+            .as("前置装置 ②：删目录后该路径必须已失效，否则测的不是本分支")
+            .isFalse();
+
+        Throwable pr = catchThrowable(() -> CwdResolution.getProjectRoot("sess-pr-baddir"));
+        Throwable cwd = catchThrowable(() -> CwdResolution.getCwd("sess-pr-baddir"));
+        Throwable orig = catchThrowable(() -> CwdResolution.getOriginalCwdLayer("sess-pr-baddir"));
+
+        assertThat(pr)
+            .as("绑定失效（目录已删）⇒ 必须 fail-loud，⛔ 不得返回该路径污染工具 cwd")
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessageContaining("sess-pr-baddir")
+            .hasMessageContaining("boundProject 无效");
+        assertThat(pr.getMessage())
+            .as("⭐ 三入口同夹具必须同文案（逐字）—— 不一致即派单书 §四 停下条件")
+            .isEqualTo(cwd.getMessage())
+            .isEqualTo(orig.getMessage());
+    }
+
+    /**
+     * [P15b 臂 7 · <b>有意偏离（非六臂，不触发 §四 停下条件）</b>] sessionCwd / originalCwd 两槽有值时，
+     * {@code getProjectRoot} <b>不受影响</b>。
+     *
+     * <p><b>WHY（规则九）</b>：这是 {@code getProjectRoot} 存在的<b>唯一理由</b>（类 javadoc：
+     * 「不随 mid-session worktree 重锚的项目身份根」；CC {@code state.ts:498-508}）。它<b>有意</b>与另两
+     * 入口不同构：{@code getCwd} 的 L1 会被 bash {@code cd} 挪走、{@code getOriginalCwdLayer} 的 L1
+     * 会被 {@code EnterWorktreeTool} 重锚。⛔ 本臂断言的是「三入口<b>应当</b>不同」，
+     * 与派单书 §四「同夹具下行为不一致 ⇒ 停下」是两件事。
+     *
+     * <p><b>RED</b>：在 {@code getProjectRoot} 里插入读 {@code SessionCwdHolder.get(sessionId)}
+     * 的 L1 层（照抄 {@code getCwd}）⇒ 本用例红。
+     */
+    @Test
+    @DisplayName("[P15b 臂7 有意偏离] getProjectRoot 不被 cd / worktree 重锚（另两入口被挪走）")
+    void projectRoot_ignoresSessionCwdAndOriginalCwdSlots(@TempDir Path projectDir,
+                                                          @TempDir Path cdDir,
+                                                          @TempDir Path worktreePath) throws Exception {
+        SessionProjectRoot.setForSession("sess-pr-identity", projectDir.toString());
+        // bash cd ⇒ 挪走 getCwd 的 L1（sessionCwd 槽）
+        SessionCwdHolder.set("sess-pr-identity", cdDir.toString());
+        // EnterWorktreeTool ⇒ 重锚 getOriginalCwdLayer 的 L1（originalCwd 槽）
+        SessionCwdHolder.setOriginalCwd("sess-pr-identity", worktreePath.toString());
+
+        assertThat(CwdResolution.getProjectRoot("sess-pr-identity"))
+            .as("projectRoot = 项目身份根 ⇒ ⛔ 不被 cd（sessionCwd 槽）挪走")
+            .isEqualTo(projectDir.toRealPath().toString())
+            .isNotEqualTo(cdDir.toRealPath().toString());
+        assertThat(CwdResolution.getProjectRoot("sess-pr-identity"))
+            .as("projectRoot = 项目身份根 ⇒ ⛔ 不被 worktree 入口（originalCwd 槽）重锚")
+            .isNotEqualTo(worktreePath.toRealPath().toString());
+
+        // 正向对照：同夹具同刻，另两入口**确实**被各自的重锚源挪走（证明本臂不是「槽没生效」而绿）
+        assertThat(CwdResolution.getCwd("sess-pr-identity"))
+            .as("对照：getCwd 的 L1 已被 cd 覆盖 ⇒ 返回 cd 子目录")
+            .isEqualTo(cdDir.toRealPath().toString());
+        assertThat(CwdResolution.getOriginalCwdLayer("sess-pr-identity"))
+            .as("对照：getOriginalCwdLayer 的 L1 已被 worktree 重锚 ⇒ 返回 worktreePath")
+            .isEqualTo(worktreePath.toRealPath().toString());
     }
 
     /**

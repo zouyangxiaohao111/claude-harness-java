@@ -704,7 +704,8 @@ public class CommandRegistrationConfig28 {
                 return;
             }
             try {
-                // [批 r10] 会话存档根走 ctx.projectRoot()（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+                // [批 r10] 会话存档根走 ctx.projectRoot()（[F1 2026-09-16] 语义 = **稳定会话绑定项目根**
+                //   `CwdResolution.getProjectRoot`，原 getOriginalCwdLayer 随 worktree 重锚 ⇒ 已改；
                 //   替代原 3 份逐字节相同的 resolveWorkspaceDir）。解析点仍在 try 内 ⇒ catch 语义不变。
                 Path ws = Path.of(ctx.projectRoot());
                 SessionStorage.reAppendSessionMetadata(ws, ctx.sessionId(),
@@ -743,8 +744,9 @@ public class CommandRegistrationConfig28 {
      */
     private void registerStatsHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry) {
         dispatcher.registerSlashCommandCtx("stats", ctx -> {
-            // [批 r10] 会话标识取执行上下文；存档根改走 ctx.projectRoot()（getOriginalCwdLayer 语义 +
-            //   user.dir 兜底单点）。报告根（本行）与 transcript 读源（readSessionLogLines）现在**复用
+            // [批 r10] 会话标识取执行上下文；存档根改走 ctx.projectRoot()（[F1 2026-09-16] 语义 =
+            //   **稳定会话绑定项目根** `CwdResolution.getProjectRoot`，原 getOriginalCwdLayer 随 worktree
+            //   重锚 ⇒ 已改）。报告根（本行）与 transcript 读源（readSessionLogLines）现在**复用
             //   同一个 memoized 值** ⇒ 原「同一次 /stats 对同一会话解析两遍」收敛为一遍。
             //   ⚠️ 保留原 null/空白短路（不解析）：原实现在该分支直接取 user.dir，不产生解析与告警。
             String projectRoot = ctx.sessionId() != null && !ctx.sessionId().isBlank()

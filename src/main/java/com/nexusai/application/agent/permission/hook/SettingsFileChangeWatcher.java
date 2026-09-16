@@ -87,8 +87,8 @@ public class SettingsFileChangeWatcher implements ApplicationRunner {
      *  本字段不再参与 user 候选路径构造。 */
     private volatile String userHome = System.getProperty("user.home", ".");
     /** project/local settings 基目录覆盖（测试注入；默认 null → 惰性 CwdResolution 项目根）.
-     *  nexusai.home 已废弃（第二轮拍板），不再注入；生产项目根 = {@link CwdResolution#getOriginalCwdLayer(String)}
-     *  {@code (null)}（决策 D6 项目根，无会话入参 → 跳过会话层，回落进程 {@code user.dir}）. */
+     *  nexusai.home 已废弃（第二轮拍板），不再注入；生产项目根 = {@link CwdResolution#getOriginalCwdLayerForNonSession()}
+     *  （决策 D6 项目根，本类无会话槽 → 不读会话层，恒取归一化进程 {@code user.dir}）. */
     private volatile String projectRootOverride;
     /** 企业 policy 文件路径（{@code nexusai.policy.path}；空 = 无 policy 源）. */
     private volatile String policyFilePath = "";
@@ -147,7 +147,7 @@ public class SettingsFileChangeWatcher implements ApplicationRunner {
     }
 
     /** project/local settings 基目录 · 测试注入临时目录（legacy 名 nexusaiHome；默认 null →
-     *  CwdResolution.getOriginalCwdLayer(null) 项目根，无会话入参 → 进程 user.dir）. */
+     *  CwdResolution.getOriginalCwdLayerForNonSession() 项目根，无会话出口 → 进程 user.dir）. */
     public void setNexusaiHome(String nexusaiHome) {
         if (nexusaiHome != null && !nexusaiHome.isBlank()) {
             this.projectRootOverride = nexusaiHome;
@@ -157,10 +157,11 @@ public class SettingsFileChangeWatcher implements ApplicationRunner {
     /** project/local settings 基目录 · 测试覆盖优先，否则 CwdResolution 项目根（决策 D6）.
      *  nexusai.home 已废弃，不再注入.
      *
-     *  <p><b>[批 3c 会话态显式化]</b>：本类为进程级 Spring bean（WatchService 轮询线程 +
-     *  ApplicationRunner），<b>无会话入参</b> → 项目根显式按「无会话」解析
-     *  （{@code getOriginalCwdLayer(null)}：跳过 originalCwd/boundProject 会话层，回落进程
-     *  {@code user.dir}）。如需会话项目根，须由调用方显式传入（测试缝
+     *  <p><b>[批 3c 会话态显式化 · 批 P12 改命名出口]</b>：本类为进程级 Spring bean（WatchService
+     *  轮询线程 + ApplicationRunner），<b>无会话入参</b> → 项目根显式按「无会话」解析
+     *  （{@code getOriginalCwdLayerForNonSession()}：不读 originalCwd/boundProject 会话层，恒取归一化进程
+     *  {@code user.dir}；⭐ 原写法 {@code getOriginalCwdLayer(null)} 值相同，但会打「收到 null
+     *  sessionId」告警，把结构性无会话报成漏传）。如需会话项目根，须由调用方显式传入（测试缝
      *  {@link #setNexusaiHome(String)} 即此通道）。 */
     private String projectRoot() {
         if (projectRootOverride != null && !projectRootOverride.isBlank()) {
@@ -171,7 +172,7 @@ public class SettingsFileChangeWatcher implements ApplicationRunner {
                 + "如需会话 cwd 须由调用方显式传入（setNexusaiHome 测试缝 / 会话态解析）",
                 System.getProperty("user.dir"));
         }
-        return CwdResolution.getOriginalCwdLayer(null);
+        return CwdResolution.getOriginalCwdLayerForNonSession();
     }
 
     /** 企业 policy 文件路径 · 测试注入（POJO 默认空 = 无 policy 源）. */
@@ -275,8 +276,8 @@ public class SettingsFileChangeWatcher implements ApplicationRunner {
         paths.add(Path.of(userHome, NexusaiPaths.getProjectDirName(), SETTINGS_FILE).toAbsolutePath().normalize());
         // [T3 hook 读兼容] claude 用户级只读回落源（~/.claude/settings.json，对齐 skills/commands 双目录）
         paths.add(Path.of(ClaudePaths.getClaudeConfigHomeDir(), SETTINGS_FILE).toAbsolutePath().normalize());
-        // project/local 源保持项目内 .nexusai（决策 D6，项目根 = CwdResolution.getOriginalCwdLayer(null)
-        //   —— 见 projectRoot()：无会话入参 → 跳过会话层，回落进程 user.dir）
+        // project/local 源保持项目内 .nexusai（决策 D6，项目根 = CwdResolution.getOriginalCwdLayerForNonSession()
+        //   —— 见 projectRoot()：无会话出口 → 不读会话层，恒取归一化进程 user.dir）
         // 项目级目录名动态化（决策 D1/D6）：NexusaiPaths.getProjectDirName() = "." + appName
         // （生产 appName=nexusai → .nexusai；appName 变则项目级目录名全联动）
         String projectRoot = projectRoot();

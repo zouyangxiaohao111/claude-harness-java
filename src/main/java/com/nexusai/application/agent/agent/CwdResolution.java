@@ -127,7 +127,11 @@ import java.util.function.Supplier;
  *       {@code EnterWorktreeTool.ts:96 setOriginalCwd(getCwd())} 写 {@code STATE.originalCwd}=worktreePath；
  *       Exit clear 回落下一层，对齐 CC {@code ExitWorktreeTool.ts:129 setOriginalCwd(originalCwd)} 恢复）→ 非空返回 normalizeCwd</li>
  *   <li>{@code SessionProjectRoot.getForSession(sessionId)}（boundProject，启动锚）→ 非空返回 normalizeCwd</li>
- *   <li>{@code user.dir} 兜底</li>
+ *   <li>两层全 MISS（含绑定失效）/ DB 明确答「无此会话」/ 无法判定 ⇒ <b>抛
+ *       {@link UnresolvedProjectRootException}（fail-loud）</b>（{@code [cwd3 步骤 2]} 前的旧行为 = 回落
+ *       进程 {@code user.dir}，<b>已删</b>）；{@code user.dir} 兜底<b>只对「确无会话」开放</b>——
+ *       null / 空白 sessionId、{@code SessionKeys.NO_SESSION} 哨兵、DB 答 sessionless ⇒
+ *       {@link #getOriginalCwdLayerForNonSession()}（= 归一化进程 {@code user.dir}）</li>
  * </ol>
  * <b>D-1 裁决：不读 resolve()</b>（resolve() 回落 CLAUDE_PROJECT_DIR env / config home 属身份域，会使 user.dir
  * 成死代码且身份域泄入工作目录域）。worktree 重锚由 {@link SessionCwdHolder#getOriginalCwd} 独立槽承裁

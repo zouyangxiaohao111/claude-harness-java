@@ -94,7 +94,10 @@ public final class SessionStorage {
     // config-home 派生二基 · [S2] transcript 锚点迁 config-home（对齐 CC sessionStorage.ts:199-206）
     //   getProjectsDir()    = join(getClaudeConfigHomeDir(), 'projects')
     //   getProjectDir(cwd)  = join(getProjectsDir(), sanitizePath(cwd))
-    //   sessionProjectDir(sessionId) = getProjectDir(getOriginalCwdLayer(sessionId))
+    //   sessionProjectRoot(sessionId) = CwdResolution.getProjectRoot(sessionId)          ← raw 稳定锚
+    //   sessionProjectDir(sessionId)  = getProjectDir(sessionProjectRoot(sessionId))     ← slug 目录
+    //   [F1 2026-09-16] 锚由 getOriginalCwdLayer（随 worktree 重锚）改为 getProjectRoot（稳定）。
+    //     理由/CC 对照（gh-30217 同型）见 sessionProjectRoot() javadoc。
     //   [决策 D1（nexusai 复刻版 .claude 改造）] getClaudeConfigHomeDir → nexusai 自有根
     //     {user.home}/.{appName}（弃 ~/.claude；claude projects 不再回落——transcript 完全隔离，2026-08-30 拍板）。
     // ════════════════════════════════════════════════════════════════════════
@@ -130,14 +133,59 @@ public final class SessionStorage {
     }
 
     /**
-     * 按会话解析项目 slug 目录 · projectRoot 用稳定锚（boundProject/originalCwd 层，勿用 sessionCwd）：
-     * {@code CwdResolution.getOriginalCwdLayer(sessionId)} 恒非 null（user.dir 兜底）。
+     * ⭐ <b>按会话解析「稳定项目根」（raw，未经 config-home 派生）</b> —— F1 两槽收口的<b>唯一取值点</b>。
      *
-     * @param sessionId 会话 ID（null → 回落 user.dir 兜底层）
-     * @return {@code {configHome}/projects/{sanitizePath(originalCwdLayer(sessionId))}}
+     * <p><b>为什么必须是稳定锚</b>：transcript 是「会话身份」的存储（history / resume / hook 载荷），
+     * 其根只应由<b>会话绑定项目根</b>决定，⛔ 不得被 worktree（一次性隔离目录）挪走。
+     * 原实现取 {@code CwdResolution.getOriginalCwdLayer(sessionId)}，而该槽的 L1 =
+     * {@code SessionCwdHolder.getOriginalCwd}，被 {@code EnterWorktreeTool.applySessionCwd}
+     * <b>重锚</b> ⇒ 进 worktree 后写侧换根。而读侧（{@code SubagentStop} hook 的
+     * {@code agent_transcript_path}）取 {@code ctx.sessionState().workspaceDir()} = <b>会话绑定项目根</b>
+     * ⇒ <b>两槽分裂：hook 按读侧找不到写侧写的文件</b>。与 CC 的 <b>gh-30217</b> 同型
+     * （CC {@code sessionStorage.ts:207-211} 注释逐字：「Without this, hooks get a transcript_path
+     * computed from originalCwd while the actual file was written to sessionProjectDir — different
+     * directories, so the hook sees MISSING (gh-30217)」）。
+     *
+     * <p><b>CC 对照（⭐ 效果等价、机制有意不同 · 勿误"对齐"成缓存）</b>：CC 靠
+     * {@code ensureCurrentSessionFile()}「第一次算一次 ⇒ 缓存进 {@code this.sessionFile} 实例字段」
+     * （{@code sessionStorage.ts:1298-1304}）实现「首次之后固定」；本仓是<b>每次现算</b>，故改用
+     * <b>稳定槽</b>（{@code CwdResolution.getProjectRoot} → {@code SessionProjectRoot}，批 P9 / P10a
+     * 两次确认的 CC {@code getProjectRoot()} 对应物，{@code EnterWorktreeTool} 只读不写它）而非缓存
+     * —— <b>有意选择</b>：缓存要引入会话级可变状态与失效语义，而本仓已有现成稳定槽；同款先例见
+     * {@code ChatService.restoreWorktreeForResume}（[TL-W2 P10] 已把 worktree-state 的写/读两侧统一到
+     * 「会话绑定项目根」，本处只是把该先例推广到 transcript 存储根）。
+     *
+     * <p><b>四态与 {@code getOriginalCwdLayer} 逐态一致</b>（唯一差异 = 去掉 originalCwd(worktree) 层）：
+     * {@code sessionId} null/哨兵 ⇒ 无会话命名出口；{@code resolutionFailed} / {@code unbound} /
+     * {@code unknown} ⇒ <b>fail-loud 抛</b>（⛔ 绝不用进程 {@code user.dir} 冒充项目根）；
+     * {@code sessionless}（本环境确无会话）⇒ 无会话命名出口 + ≥WARN。
+     *
+     * <p>⚠️ <b>返回的是 raw 项目根，不是 {@code {configHome}/projects/{slug}}</b>：调用方若要走
+     * {@link #getTranscriptPath} / {@link #getAgentTranscriptPath} / {@link #getSessionFile}
+     * （内部各自再 {@code getProjectDir} 派生一次），<b>必须</b>传本值；传 {@link #sessionProjectDir}
+     * 会双重包裹成 {@code {projects}/{slug(configHome/projects/slug)}} 这个<b>不存在</b>的目录。
+     * 要已派生的 slug 目录请用 {@link #sessionProjectDir(String)}。
+     *
+     * @param sessionId 会话 ID（null/空白 → 无会话命名出口）
+     * @return raw 稳定项目根（已 realpath + NFC 归一，与 {@link CwdResolution#getProjectRoot} 同源）
+     */
+    public static String sessionProjectRoot(String sessionId) {
+        return CwdResolution.getProjectRoot(sessionId);
+    }
+
+    /**
+     * 按会话解析项目 slug 目录 = {@code getProjectDir(sessionProjectRoot(sessionId))}。
+     *
+     * <p>锚 = {@link #sessionProjectRoot(String)}（<b>稳定</b>会话绑定项目根 · F1 收口；详见该方法的
+     * WHY 与 CC 对照）。消费方：{@code SubagentExecutor.resolveSessionDir} /
+     * {@code MainSessionBackgroundService.resolveSessionDir} / {@code ResumeService.resolveSessionDir} /
+     * {@code SubagentController}。
+     *
+     * @param sessionId 会话 ID（null/空白 → 无会话命名出口）
+     * @return {@code {configHome}/projects/{sanitizePath(sessionProjectRoot(sessionId))}}
      */
     public static Path sessionProjectDir(String sessionId) {
-        return getProjectDir(Path.of(CwdResolution.getOriginalCwdLayer(sessionId)));
+        return getProjectDir(Path.of(sessionProjectRoot(sessionId)));
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -186,6 +234,33 @@ public final class SessionStorage {
         }
         return getProjectDir(workspaceDir).resolve(sessionId).resolve(SUBAGENTS_SUBDIR)
             .resolve(AGENT_FILE_PREFIX + agentId + AGENT_FILE_EXT);
+    }
+
+    /**
+     * ⭐ <b>读侧 seam</b>：按会话解析 subagent sidechain 路径（{@code SubagentStop} hook 的
+     * {@code agent_transcript_path}）。
+     *
+     * <p><b>WHY 需要本方法（而不是让调用方自己传 workspaceDir）</b>：读侧此前由调用方传
+     * {@code ctx.sessionState().workspaceDir()} —— 那是<b>另一个槽</b>，与写侧
+     * {@link #sessionProjectDir(String)} 只在「未进 worktree」时才巧合同值 ⇒ 一进 worktree 就分裂
+     * （CC gh-30217 同型，详见 {@link #sessionProjectRoot(String)} 的 WHY）。本方法把读侧的取值
+     * <b>收口到与写侧同一个 seam</b>（{@link #sessionProjectDir(String)}）⇒ 两槽同源，结构上不可能再分裂。
+     *
+     * <p>与 {@link #getAgentTranscriptPath(Path, String, String)} 的关系：本方法 =
+     * 用 {@link #sessionProjectRoot(String)} 调用它（派生一次，⛔ 不双重包裹）。
+     *
+     * <p>空值策略与 3 参重载一致：{@code sessionId} / {@code agentId} null 或空白 ⇒ {@code null}
+     * （下游 hook 载荷省略该字段），⛔ 不为「无会话」凭空造一条 user.dir 下的幻影路径。
+     *
+     * @param sessionId 主会话 ID（null/空白 ⇒ null）
+     * @param agentId   子代理 ID（null ⇒ null）
+     * @return {@code {configHome}/projects/{slug(sessionProjectRoot)}/{sessionId}/subagents/agent-{agentId}.jsonl}
+     */
+    public static Path getAgentTranscriptPathForSession(String sessionId, String agentId) {
+        if (sessionId == null || sessionId.isBlank() || agentId == null) {
+            return null;
+        }
+        return getAgentTranscriptPath(Path.of(sessionProjectRoot(sessionId)), sessionId, agentId);
     }
 
     /**

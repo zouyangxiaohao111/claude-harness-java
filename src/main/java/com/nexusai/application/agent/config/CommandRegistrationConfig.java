@@ -478,7 +478,8 @@ public class CommandRegistrationConfig {
     private void registerRenameHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry registry) {
         RenameCommand renameCommand = new RenameCommand();
         dispatcher.registerSlashCommandCtx("rename", ctx -> {
-            // [批 r10] 会话存档根经 ctx.projectRoot() 承载（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+            // [批 r10] 会话存档根经 ctx.projectRoot() 承载（[F1 2026-09-16] 语义 = **稳定会话绑定项目根**
+            //   `CwdResolution.getProjectRoot`，原 getOriginalCwdLayer 随 worktree 重锚 ⇒ 已改；
             //   替代原 3 份逐字节相同的实例方法 resolveWorkspaceDir）。
             //   ⚠️ 传 **Supplier**（ctx::projectRoot）而非提前求值：RenameCommand.execute 在
             //   (a) teammate 会话、(b) 无参且生成失败 两条路径上**提前返回**（RenameCommand:64-86），

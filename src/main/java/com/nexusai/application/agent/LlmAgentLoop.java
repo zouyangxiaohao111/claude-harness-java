@@ -8174,11 +8174,14 @@ public class LlmAgentLoop implements AgentLoop {
                         ? state.currentToolUseContext() : params.toolUseContext();
                     // [IMP-HOOKS-S5 D-10] in-loop SubagentStop 同样承载 agent_transcript_path
                     //   （CC executeStopHooks hooks.ts:3676；与 §14 同一语义，防双轨漂移）
+                    // [F1 2026-09-16] 取值收口到 SessionStorage.getAgentTranscriptPathForSession（读侧 seam）：
+                    //   旧实现传 ctx.sessionState().workspaceDir() —— 那是**另一个槽**，与写侧
+                    //   SessionStorage.sessionProjectDir 只在「未进 worktree」时同值 ⇒ 一进 worktree 分裂，
+                    //   hook 按读侧找不到写侧写的文件（CC gh-30217 同型）。现两侧共用同一 seam（内部
+                    //   sessionProjectRoot = 稳定会话绑定项目根）⇒ 结构上不可能再分裂。
                     java.nio.file.Path loopTranscriptPath = stopMainAgentId != null
-                        ? com.nexusai.application.agent.tool.SessionStorage.getAgentTranscriptPath(
-                            ctx.sessionState().workspaceDir(),
-                            state.sessionId(),
-                            stopMainAgentId)
+                        ? com.nexusai.application.agent.tool.SessionStorage
+                            .getAgentTranscriptPathForSession(state.sessionId(), stopMainAgentId)
                         : null;
                     HookEvent stopEvent = stopMainAgentId != null
                         ? HookEvent.subagentStop(
@@ -8626,11 +8629,10 @@ public class LlmAgentLoop implements AgentLoop {
                 //   join(projectDir, sessionId, 'subagents', 'agent-<id>.jsonl')）；
                 //   workspaceDir 取 ctx.sessionState().workspaceDir()（loop() static
                 //   无实例字段可用）。旧注释"Java 无等价通道"不成立（SessionStorage 已有）。
+                // [F1 2026-09-16] 同 in-loop：读侧取值收口到 getAgentTranscriptPathForSession
+                //   （与写侧同 seam · 稳定锚），⛔ 不再传 ctx.sessionState().workspaceDir()（另一槽 ⇒ 分裂）。
                 java.nio.file.Path transcriptPath = com.nexusai.application.agent.tool.SessionStorage
-                    .getAgentTranscriptPath(
-                        ctx.sessionState().workspaceDir(),
-                        state.sessionId(),
-                        mainAgentId);
+                    .getAgentTranscriptPathForSession(state.sessionId(), mainAgentId);
                 HookEvent stopEvent = mainAgentId != null
                     ? HookEvent.subagentStop(
                         mainAgentId,
@@ -11080,12 +11082,18 @@ public class LlmAgentLoop implements AgentLoop {
     private static final int MAX_TOOL_RESULT_CHARS = com.nexusai.application.agent.tool.ToolResultStorage.DEFAULT_MAX_RESULT_SIZE_CHARS;
 
     /**
-     * Workspace dir · 对齐 CC getProjectDir(getOriginalCwd()).
+     * Workspace dir · <b>稳定会话绑定项目根</b>（对齐 CC {@code getProjectRoot()}，⛔ 不是
+     * {@code getProjectDir(getOriginalCwd())}）。[F1 2026-09-16] 原 javadoc 写的「对齐 CC
+     * getProjectDir(getOriginalCwd())」<b>不成立</b>：originalCwd 层随 worktree 重锚，而本字段
+     * 由 {@code resolveSessionProjectRoot} 从 {@code SessionProjectRoot}（稳定槽）解析 ⇒ 会话内不变。
      *
      * <p><b>[TL-W2 P8]</b> 默认 <b>null</b>（无有效项目）—— 唯一赋值点是
      * {@link #resolveSessionProjectRoot(String)}（会话入口单点解析，成功分支才 set workspaceDir）；
-     * 未命中/未绑定 → 保持 null，下游按「无有效项目」skip（memory 域 A′ 已就绪；子代理
-     * transcript 派生 {@code SessionStorage.getAgentTranscriptPath(null, ...)} 恒返回 null）。
+     * 未命中/未绑定 → 保持 null，下游按「无有效项目」skip（memory 域 A′ 已就绪）。
+     * ⚠️ [F1] 读侧（{@code SubagentStop} 的 {@code agent_transcript_path}）已<b>不再</b>派生自本字段
+     * （旧实现传本字段给 {@code SessionStorage.getAgentTranscriptPath}），改走与写侧同源的
+     * {@code SessionStorage.getAgentTranscriptPathForSession(sessionId, agentId)}（null/空白
+     * sessionId 或 null agentId ⇒ 返回 null）。
      *
      * <p>WHY 不再默认 {@code Path.of(AutoMemPaths.currentSessionProjectRoot())}：本类为
      * {@code @Scope("prototype")}（每次 {@code loopProvider.getObject()} 新实例），<b>字段初始化器

@@ -9,6 +9,7 @@ import com.nexusai.application.agent.permission.PermissionRule;
 import com.nexusai.application.agent.permission.PermissionRuleSource;
 import com.nexusai.application.agent.permission.PermissionRuleValue;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.EditFileTool;
@@ -24,6 +25,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -536,6 +538,115 @@ class RuleQueryTest {
             assertThat(CwdResolution.getCwd(sessionId))
                 .as("未绑定回落 user.dir（经统一入口）")
                 .isEqualTo(Path.of(System.getProperty("user.dir")).toRealPath().toString());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // P14 · Edit 规则 `/…` 的<b>根按规则来源（source）分派</b>
+    //
+    // 对齐 CC rootPathForSource（claude-code-best/src/utils/permissions/filesystem.ts:746-758）
+    // + getSettingsRootPathForSource（claude-code-best/src/utils/settings/settings.ts:239-253）：
+    // CC 的 patternWithRoot `DIR_SEP` 分支（filesystem.ts:899-905）取
+    // `root = rootPathForSource(source)`，⛔ <b>不是恒等于 cwd</b>。逐源映射：
+    // <ul>
+    //   <li>{@code userSettings} → {@code getClaudeConfigHomeDir()}（CC envUtils.ts:7-14）；</li>
+    //   <li>{@code projectSettings} / {@code localSettings} / {@code policySettings}
+    //       → {@code getOriginalCwd()}（settings.ts:243-246）；</li>
+    //   <li>{@code cliArg} / {@code command} / {@code session} → {@code getOriginalCwd()}
+    //       （filesystem.ts:748-751）；</li>
+    //   <li>{@code flagSettings} → {@code dirname(--settings 路径)}，路径不可得时回落
+    //       {@code getOriginalCwd()}（settings.ts:248-251）—— nexusai web 无 CLI flag
+    //       （{@code FlagSettingsLoader} 永远 empty）⇒ 恒取回落值 cwd。</li>
+    // </ul>
+    //
+    // WHY：此前 `/…` 分支一律取 {@code cwd} 当根（源码注释自陈「settings 源≈cwd 近似」），
+    //   等于把<b>用户级</b> settings 里 `Edit(/…/**)` 表达的「用户配置根下的路径」错锚到
+    //   <b>项目</b>根 ⇒ 同一规则「Edit 命中 / 用户看不出为何失效」；反过来项目路径也可能
+    //   被用户级规则误命中。本 @Nested 钉住「⛔ 别把所有源都改成 configHome」（防过度纠正）。
+    // ════════════════════════════════════════════════════════════════════
+    @Nested
+    @DisplayName("P14 · Edit 规则 `/…` 根按 source 分派（CC rootPathForSource）")
+    class P14SlashRootPerSourceTests {
+
+        @AfterEach
+        void clearConfigHomeOverride() {
+            NexusaiPaths.setConfigHomeDirOverride(null);
+        }
+
+        private PermissionRule slashRule(PermissionRuleSource source, String content) {
+            return new PermissionRule(source, PermissionBehavior.DENY,
+                PermissionRuleValue.withContent("Edit", content));
+        }
+
+        private ToolPermissionContext denyCtxFor(PermissionRuleSource source, PermissionRule rule) {
+            Map<PermissionRuleSource, Set<PermissionRule>> deny = new EnumMap<>(PermissionRuleSource.class);
+            deny.put(source, Set.of(rule));
+            return ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(), deny, Map.of(), Map.of());
+        }
+
+        @Test
+        @DisplayName("USER_SETTINGS + Edit(/agents/**) → 锚 configHome：命中 configHome/agents/x.md")
+        void userSettingsSlashRule_anchorsConfigHome(@TempDir Path configHome, @TempDir Path projectDir) {
+            NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+            PermissionRule rule = slashRule(PermissionRuleSource.USER_SETTINGS, "/agents/**");
+
+            PermissionRule hit = RuleQuery.getEditRuleByContentsForPath(
+                denyCtxFor(PermissionRuleSource.USER_SETTINGS, rule),
+                configHome.resolve("agents/x.md").toString(),
+                PermissionBehavior.DENY,
+                projectDir.toString());
+
+            assertThat(hit)
+                .as("CC `userSettings` 的 `/…` 根 = config home（filesystem.ts:752-757）⇒ "
+                    + "用户级 Edit(/agents/**) 必须命中 configHome/agents/x.md")
+                .isNotNull()
+                .isEqualTo(rule);
+        }
+
+        @Test
+        @DisplayName("USER_SETTINGS + Edit(/agents/**) → ⛔不锚 cwd：不命中 cwd/agents/x.md")
+        void userSettingsSlashRule_doesNotAnchorCwd(@TempDir Path configHome, @TempDir Path projectDir) {
+            NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+            PermissionRule rule = slashRule(PermissionRuleSource.USER_SETTINGS, "/agents/**");
+
+            PermissionRule hit = RuleQuery.getEditRuleByContentsForPath(
+                denyCtxFor(PermissionRuleSource.USER_SETTINGS, rule),
+                projectDir.resolve("agents/x.md").toString(),
+                PermissionBehavior.DENY,
+                projectDir.toString());
+
+            assertThat(hit)
+                .as("用户级 `/…` 规则不得再锚 cwd —— 否则用户级配置会去命中<b>项目</b>路径（误 deny）")
+                .isNull();
+        }
+
+        @Test
+        @DisplayName("非 USER_SETTINGS 源（session/cliArg/command/project/local/policy/flag）仍锚 cwd —— 防过度纠正")
+        void nonUserSettingsSources_stillAnchorCwd(@TempDir Path configHome, @TempDir Path projectDir) {
+            NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
+
+            for (PermissionRuleSource source : List.of(
+                    PermissionRuleSource.SESSION,
+                    PermissionRuleSource.CLI_ARG,
+                    PermissionRuleSource.COMMAND,
+                    PermissionRuleSource.PROJECT_SETTINGS,
+                    PermissionRuleSource.LOCAL_SETTINGS,
+                    PermissionRuleSource.POLICY_SETTINGS,
+                    PermissionRuleSource.FLAG_SETTINGS)) {
+                PermissionRule rule = slashRule(source, "/agents/**");
+
+                PermissionRule hit = RuleQuery.getEditRuleByContentsForPath(
+                    denyCtxFor(source, rule),
+                    projectDir.resolve("agents/x.md").toString(),
+                    PermissionBehavior.DENY,
+                    projectDir.toString());
+
+                assertThat(hit)
+                    .as("source=%s 的 `/agents/**` 仍须锚 cwd（CC rootPathForSource 只让 userSettings "
+                        + "走 config home；policySettings 在 CC 也是 getOriginalCwd）", source)
+                    .isNotNull()
+                    .isEqualTo(rule);
+            }
         }
     }
 }

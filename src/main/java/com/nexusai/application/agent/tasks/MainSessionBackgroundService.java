@@ -577,11 +577,22 @@ public class MainSessionBackgroundService {
 
     /**
      * 会话目录根 · [R1] 旧 {tmpdir}/nexusai-sessions 平铺根 → config-home 项目 slug 目录
-     * （{@link SessionStorage#sessionProjectDir}，对齐 CC getProjectDir(getOriginalCwd())）。
-     * 供 subagent sidechain transcript（AgentTranscript）与主会话后台 symlink（initTaskOutputAsSymlink）
-     * 使用 —— 双根分裂消除（SessionStorage.getAgentTranscriptPath 与 AgentTranscript.getTranscriptPath 同根）。
+     * （{@link SessionStorage#sessionProjectDir}）。
      *
-     * @param sessionId 会话 ID（null → 回落 user.dir 兜底层）
+     * <p><b>[F1 2026-09-16] 锚 = 稳定会话绑定项目根</b>（{@code CwdResolution.getProjectRoot}，
+     * 经 {@code SessionStorage.sessionProjectRoot} 单点）—— 原「对齐 CC
+     * {@code getProjectDir(getOriginalCwd())}」的说法<b>已不成立</b>：originalCwd 层被
+     * {@code EnterWorktreeTool} 重锚 ⇒ 进 worktree 后换根，与读侧（hook 的 agent_transcript_path）
+     * 分裂。⛔ 勿改回。详见 {@code SessionStorage.sessionProjectRoot} javadoc（含 CC gh-30217 对照）。
+     *
+     * <p>供 subagent sidechain transcript（AgentTranscript）与主会话后台 symlink（initTaskOutputAsSymlink）
+     * 使用 —— 双根分裂消除（读侧 seam {@code SessionStorage.getAgentTranscriptPathForSession} 与
+     * {@code AgentTranscript.getTranscriptPath} 同根）。
+     *
+     * @param sessionId 会话 ID。null / 空白 / {@code SessionKeys.NO_SESSION} 哨兵 ⇒ 走<b>无会话命名出口</b>
+     *                  （值 = 进程 {@code user.dir}，并打 ≥WARN）；DB 明确答「无此会话」/ 会话存在但未绑定
+     *                  项目 / <b>无法判定</b>（回源器未接线、抛错、违约返回 null）⇒ <b>fail-loud 抛</b>
+     *                  （⛔ 不是「回落 user.dir 兜底层」）
      */
     private Path resolveSessionDir(String sessionId) {
         return SessionStorage.sessionProjectDir(sessionId);

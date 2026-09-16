@@ -138,12 +138,14 @@ class SessionStorageTest {
         Path projectDir = SessionStorage.sessionProjectDir(sessionId);
 
         assertThat(projectDir)
-            .as("resolveSessionDir 统一根必须落在 config-home projects 下（对齐 CC getProjectDir(getOriginalCwd())）")
+            .as("resolveSessionDir 统一根必须落在 config-home projects 下"
+                + "（[F1 2026-09-16] 锚 = 稳定会话绑定项目根 getProjectRoot；⛔ 不再是 getOriginalCwdLayer）")
             .startsWith(SessionStorage.getProjectsDir());
         assertThat(projectDir.getFileName().toString())
-            .as("末段 = sanitizePath(originalCwdLayer)（项目 slug 目录）")
+            .as("末段 = sanitizePath(sessionProjectRoot(sessionId))（项目 slug 目录）"
+                + "· [F1 2026-09-16] 锚 = 稳定会话绑定项目根 getProjectRoot（原 getOriginalCwdLayer 随 worktree 重锚）")
             .isEqualTo(com.nexusai.application.agent.memory.AutoMemPaths.sanitizePath(
-                com.nexusai.application.agent.agent.CwdResolution.getOriginalCwdLayer(sessionId)));
+                com.nexusai.application.agent.agent.CwdResolution.getProjectRoot(sessionId)));
     }
 
     /** config-home 项目 slug 目录（S2 派生）· 与 getTranscriptPath 内部派生同源。 */

@@ -25,8 +25,11 @@ import org.springframework.web.bind.annotation.RestController;
  * （dream.ts:31）。{@code getPromptForCommand(args)}（dream.ts:32-45）：
  * <ol>
  *   <li>{@code memoryRoot = getAutoMemPath()}（dream.ts:33）；</li>
- *   <li>{@code transcriptDir = getProjectDir(getOriginalCwd())}（dream.ts:34）——Java 等价会话
- *       projectRoot（{@link CwdResolution#getOriginalCwdLayer(String)}，MemoryController.originalCwd 同源）；</li>
+ *   <li>{@code transcriptDir = getProjectDir(getOriginalCwd())}（dream.ts:34）——Java 等价
+ *       <b>稳定会话绑定项目根</b>的 config-home slug 目录
+ *       （{@code SessionStorage.sessionProjectDir} ⇒ {@code CwdResolution.getProjectRoot}）；
+ *       ⚠️ [F1 2026-09-16] 锚<b>不再</b>取 {@code getOriginalCwdLayer}（随 worktree 重锚 ⇒
+ *       子代理扫到的目录与写侧不同）；</li>
  *   <li>{@code await recordConsolidation()}（dream.ts:36-37）——手动 /dream 乐观盖章锁
  *       （consolidationLock.ts:130-140，{@link ConsolidationLock#recordConsolidation()}）；</li>
  *   <li>{@code prompt = DREAM_PROMPT_PREFIX + buildConsolidationPrompt(memoryRoot, transcriptDir, '')}
@@ -91,7 +94,9 @@ public class ExtractMemoriesController {
      * 生成手动 /dream prompt · POST /api/agent/dream。
      *
      * <p>流程: gate（CC dream.ts:31 isAutoMemoryEnabled）→ memoryRoot（getAutoMemPath）→
-     * transcriptDir（getProjectDir(getOriginalCwd())）→ {@link ConsolidationLock#recordConsolidation()}
+     * transcriptDir（[F1 2026-09-16] = 稳定会话绑定项目根的 slug 目录，
+     * {@code SessionStorage.sessionProjectDir}；⛔ 不再取 getOriginalCwdLayer）→
+     * {@link ConsolidationLock#recordConsolidation()}
      * 乐观盖章 → prompt = DREAM_PROMPT_PREFIX + buildConsolidationPrompt(memoryRoot, transcriptDir, '')
      * + 可选 args。结果语义:
      * <ul>
@@ -138,10 +143,13 @@ public class ExtractMemoriesController {
         }
         // CC dream.ts:33 memoryRoot = getAutoMemPath()（per-project）
         String memoryRoot = dreamMemDir.toString();
-        // CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd()) —— [S2] Java 等价
-        //   config-home 项目 slug 目录（getOriginalCwdLayer 层做 config-home 派生）
+        // CC dream.ts:34 transcriptDir = getProjectDir(getOriginalCwd()) —— [S2] Java 等价形式 =
+        //   config-home 项目 slug 目录（config-home 派生在 SessionStorage 内完成）。
+        // [F1 2026-09-16] 锚改走 SessionStorage.sessionProjectDir（稳定会话绑定项目根）：
+        //   manual /dream 让子代理去扫的 transcript 目录，必须与写侧 sessionProjectDir /
+        //   读侧 agent_transcript_path 同一根；原 getOriginalCwdLayer 随 worktree 重锚 ⇒ 扫不到。
         String transcriptDir = com.nexusai.application.agent.tool.SessionStorage
-            .getProjectDir(java.nio.file.Path.of(CwdResolution.getOriginalCwdLayer(sessionIdParam))).toString();
+            .sessionProjectDir(sessionIdParam).toString();
         // CC dream.ts:36-37 await recordConsolidation() —— 手动 /dream 乐观盖章锁（best-effort）
         new ConsolidationLock(dreamMemDir).recordConsolidation();
         if (log.isDebugEnabled()) {

@@ -1917,7 +1917,14 @@ public class ChatService {
             return;
         }
         try {
-            Path workspaceDir = Path.of(CwdResolution.getOriginalCwdLayer(sessionId));
+            // [F1 2026-09-16] 锚由 CwdResolution.getOriginalCwdLayer（随 worktree 重锚）改为
+            //   SessionStorage.sessionProjectRoot（稳定会话绑定项目根）—— flat 主 transcript 的
+            //   读侧（CompactConversation.transcriptPathFor / AgentColorCommand.resolveTranscriptPath）
+            //   锚 boundProject，写侧若锚 originalCwd 则同一次会话的逐条 entry 会分裂到两个 slug
+            //   （实测：sess-afbae75d 的 257 条 reasoning-duration 全落在 worktree slug）。
+            //   ⛔ 传 raw 根，不是 sessionProjectDir（后者已派生 ⇒ getTranscriptPath 内再派生一次会双重包裹）。
+            Path workspaceDir = Path.of(com.nexusai.application.agent.tool.SessionStorage
+                .sessionProjectRoot(sessionId));
             SessionStorage.appendReasoningDuration(workspaceDir, sessionId, messageId, reasoningDurationMs);
         } catch (Exception e) {
             // [S2 · F-10 2026-09-14 · 用户裁定 #6] 日志提为 ERROR（原 WARN）：本 catch 覆盖了

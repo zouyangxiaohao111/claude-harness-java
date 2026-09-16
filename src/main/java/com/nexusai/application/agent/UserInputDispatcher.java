@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.application.agent.tool.SessionStorage;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -85,7 +86,7 @@ public class UserInputDispatcher {
      *
      * <p><b>⭐ 为什么必须惰性（本类第一约束，改动前务必读）</b>：若在构造期 eager 求值，则
      * <b>所有</b>注册命令（36 个）都会在「会话存在但未绑定项目根」时新增 fail-loud 抛出
-     * （{@link CwdResolution#getCwd} / {@link CwdResolution#getOriginalCwdLayer} 对该态抛
+     * （{@link CwdResolution#getCwd} / {@link CwdResolution#getProjectRoot} 对该态抛
      * {@code IllegalStateException}），而改造前只有真正需要 cwd 的 9 个命令会抛。
      * 惰性 + memoize ⇒ 只有真正读 {@link #cwd()}/{@link #projectRoot()} 的 handler 才触发解析，
      * <b>fail-loud 面严格不变</b>；同一 handler 内多次读取收敛为 1 次解析。
@@ -98,8 +99,15 @@ public class UserInputDispatcher {
      * {@code SessionProjectRoot.setDbResolver(...)} 覆盖它（先例：{@code CwdResolutionTest}）。
      * ⛔ 不要因为「把 {@code cwd()} 改成 eager 却没变红」就断言惰性无影响 —— 那只说明装置没接上。
      *
-     * <p><b>双槽</b>：4 站要 getCwd 语义、7 站要 getOriginalCwdLayer 语义，两条 L1 不同
-     * （{@link CwdResolution} 的 sessionCwd 层 vs originalCwd 重锚层）⇒ 两槽独立缓存，互不串味。
+     * <p><b>双槽</b>：4 站要 getCwd 语义、其余站要「会话存档锚」语义，两条 L1 不同
+     * （{@link CwdResolution} 的 sessionCwd 层 vs <b>稳定会话绑定项目根</b>）⇒ 两槽独立缓存，互不串味。
+     *
+     * <p><b>[F1 2026-09-16] {@link #projectRoot()} 的锚已由 {@code getOriginalCwdLayer} 改为
+     * {@code getProjectRoot}（稳定）</b>：它的 4 个消费点（{@code /color} · {@code /rename} ·
+     * {@code /tag} · {@code /stats}）全部是 <b>transcript 存档根</b>（写 {@code reAppendSessionMetadata}
+     * 的 sidecar entry / 读 {@code resolveExistingTranscript}），锚必须与会话绑定项目根一致 ——
+     * ⛔ 随 worktree 重锚会让同一次命令的「读侧找文件 / 写侧落文件」分裂（CC gh-30217 同型），
+     * 且 worktree 外写下的 sidecar 会静默失踪。语义细节见 {@link #projectRoot()}。
      *
      * <p><b>线程</b>：非线程安全（解析结果非 volatile）。上下文由分派点构造后**同一线程**同步交给
      * handler，不跨线程发布。<b>异常不缓存</b>：解析抛出时标记不置位（下次调用重新解析并重新抛），
@@ -156,11 +164,20 @@ public class UserInputDispatcher {
         }
 
         /**
-         * 原始工作目录 · <b>getOriginalCwdLayer 语义</b>（会话存档锚，对齐 CC {@code getOriginalCwd()}；
-         * 不受 bash {@code cd} 影响，随 worktree 重锚）。首次调用解析并 memoize。
+         * 会话存档根 · <b>稳定会话绑定项目根</b>（对齐 CC {@code getProjectRoot()}；不受 bash
+         * {@code cd} 影响，<b>亦不随 worktree 重锚</b>）。首次调用解析并 memoize。
+         *
+         * <p><b>[F1 2026-09-16] 锚由 {@code getOriginalCwdLayer} 改为 {@code getProjectRoot}</b>：
+         * 本槽的消费点（{@code /color} · {@code /rename} · {@code /tag} · {@code /stats}）全部用它
+         * 作 <b>transcript 存档根</b>（{@code SessionStorage.getTranscriptPath} /
+         * {@code reAppendSessionMetadata} / {@code resolveExistingTranscript}）。transcript 是
+         * 「会话身份」的存储，其根只应由会话绑定项目根决定，⛔ 不得被 worktree（一次性隔离目录）
+         * 挪走 —— 原实现用 {@code getOriginalCwdLayer}（被 {@code EnterWorktreeTool} 重锚）会让
+         * 「进 worktree 前后落点不同」+「写侧与读侧分裂」（与 CC gh-30217 同型；
+         * {@code SessionStorage.sessionProjectRoot} 有完整 WHY）。
          *
          * <p>⛔ <b>与 {@link #cwd()} 不可互相替代</b>：在发生过 bash {@code cd} 的会话里两者必然不同值
-         * （cwd 槽被 cd 覆盖、originalCwd 槽不被覆盖）⇒ 用 {@code cwd()} 顶替会使 transcript 锚点漂到
+         * （cwd 槽被 cd 覆盖、本槽不被覆盖）⇒ 用 {@code cwd()} 顶替会使 transcript 锚点漂到
          * cd 后的子目录。
          */
         public String projectRoot() {
@@ -305,7 +322,10 @@ public class UserInputDispatcher {
     private static SlashCommandContext newSlashCommandContext(String args, String sessionId,
                                                               String inFlightUserMessageId) {
         return new SlashCommandContext(args, sessionId, inFlightUserMessageId,
-            CwdResolution::getCwd, CwdResolution::getOriginalCwdLayer);
+            // [F1 2026-09-16] projectRoot 槽锚 = 稳定会话绑定项目根（原 CwdResolution::getOriginalCwdLayer
+            //   随 worktree 重锚 ⇒ transcript 存档根分裂；详见 projectRoot() javadoc）。
+            //   经 SessionStorage.sessionProjectRoot 单一出口维护（与写侧 sessionProjectDir 同源）。
+            CwdResolution::getCwd, SessionStorage::sessionProjectRoot);
     }
 
     /**

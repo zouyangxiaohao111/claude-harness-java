@@ -104,8 +104,9 @@ public class MultiSourceHooksConfigLoader {
     private static final List<String> INVALID_ARRAY = java.util.Collections.emptyList();
 
     /**
-     * Spring 生产构造器 · 项目根惰性接线 {@code CwdResolution.getOriginalCwdLayer()}
-     * （语义 = D6 项目根；无会话回落 {@code user.dir}）；userHome 保留（user settings 已走
+     * Spring 生产构造器 · 项目根惰性接线 {@code CwdResolution.getOriginalCwdLayerForNonSession()}
+     * （语义 = D6 项目根；本类结构性无会话 ⇒ 走<b>无会话命名出口</b>，值 = 归一化进程 {@code user.dir}）；
+     * userHome 保留（user settings 已走
      * {@link NexusaiPaths#getAppConfigHomePath()}）。{@code nexusai.home} 已废弃，不再经
      * {@code @Value} 注入。
      *
@@ -122,7 +123,7 @@ public class MultiSourceHooksConfigLoader {
                                         ManagedPolicySettingsSupplier policySettingsSupplier,
                                         @Value("${user.home}") String userHome) {
         this(objectMapper, hooksSettings, hooksConfigSnapshot, policySettingsSupplier,
-            () -> CwdResolution.getOriginalCwdLayer(null), userHome);
+            CwdResolution::getOriginalCwdLayerForNonSession, userHome);
     }
 
     /**
@@ -133,8 +134,8 @@ public class MultiSourceHooksConfigLoader {
      * @param hooksConfigSnapshot    快照层（capture/update）
      * @param policySettingsSupplier 企业 managed policy 读取器（policy hooks 源）
      * @param projectRootSupplier    项目根惰性供应（决策 D6 项目根，project/local 路径基；生产接
-     *                               {@code CwdResolution.getOriginalCwdLayer()}，无会话回落
-     *                               {@code user.dir}；null 空安全回退 user.dir）
+     *                               {@code CwdResolution.getOriginalCwdLayerForNonSession}，本类无会话槽 ⇒
+     *                               值 = 归一化进程 {@code user.dir}；null 空安全回退 user.dir）
      * @param userHome               保留：历史构造参数 / 测试 API 兼容；user settings 路径已改走
      *                               {@link NexusaiPaths#getAppConfigHomePath()}（userHome 不再参与
      *                               userSettingsPath，决策 D2）

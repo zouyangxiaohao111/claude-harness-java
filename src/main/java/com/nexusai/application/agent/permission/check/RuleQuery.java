@@ -7,6 +7,7 @@ import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionRule;
 import com.nexusai.application.agent.permission.PermissionRuleValue;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.Tool;
 
 import java.nio.file.FileSystems;
@@ -566,7 +567,8 @@ public final class RuleQuery {
      * <p><b>OPD-WF5-FS-052 root-relative 重构</b>：匹配语义对齐 CC matchingRuleForInput
      * 的 patternWithRoot 根锚定（filesystem.ts:853-917）——规则前缀决定匹配根：
      * {@code //…} 文件系统根 / {@code ~/…} 家目录 / {@code /…} 规则 source 根
-     * （session/cliArg/command=cwd，settings 源≈cwd 近似）/ {@code ./…} 或无前缀 → cwd。
+     * （CC {@code rootPathForSource}：userSettings → config home，其余源 → cwd；
+     * 见 {@link #rootPathForSource}）/ {@code ./…} 或无前缀 → cwd。
      * 路径先 expandPath（~ 展开 + 相对→绝对 + POSIX 归一）再计算 relativePath(root, path)
      * 匹配（见 {@link #matchesEditPathRuleRootRelative}）。旧 content glob 直比（matchesGlob
      * 对绝对路径字符串做 glob）为近似，拍板重构对齐 CC。
@@ -926,8 +928,9 @@ public final class RuleQuery {
      *       / homedir）+ Windows 反斜杠→POSIX 归一（CC :964-966）；</li>
      *   <li><b>根锚定</b>（CC patternWithRoot :853-917）——规则前缀决定根：
      *       {@code //…} 文件系统根（Windows {@code //c/…} 盘符根）、{@code ~/…} 家目录、
-     *       {@code /…} 规则 source 根（session/cliArg/command=cwd；settings 源≈cwd 近似，
-     *       CC rootPathForSource 的 settings-root 解析归 settings 域专项）、
+     *       {@code /…} 规则 <b>source 根</b>（CC {@code rootPathForSource} filesystem.ts:746-758：
+     *       userSettings → config home；project/local/policy Settings 与 cliArg/command/session
+     *       → cwd；flagSettings → flag 路径所在目录，不可得则 cwd。见 {@link #rootPathForSource}）、
      *       {@code ./…} 或无前缀 → cwd（CC :907-916）；</li>
      *   <li><b>相对路径匹配</b>（CC :991-1020）——relativePath(root, path) 以 {@code ..} 开头
      *       即越界不匹配（:997-1000）；空路径跳过（:1002-1005）；POSIX glob 匹配
@@ -978,8 +981,8 @@ public final class RuleQuery {
             root = posixNormalize(System.getProperty("user.home", "."));
             relativePattern = pattern.substring(1); // 去 ~，留 /…/**
         } else if (pattern.startsWith("/")) {
-            // CC :899-905 —— 规则 source 根（session/cliArg/command=cwd；settings 源≈cwd 近似）
-            root = posixNormalize(cwd);
+            // CC :899-905 + rootPathForSource :746-758 —— 根由规则来源（source）决定，⛔ 不恒等于 cwd
+            root = posixNormalize(rootPathForSource(source, cwd));
             relativePattern = pattern;
         } else {
             // CC :906-916 —— 无根：./ 前缀剥离，root=cwd
@@ -1003,6 +1006,57 @@ public final class RuleQuery {
                 root, relativePattern, target, rel);
         }
         return matched;
+    }
+
+    /**
+     * 规则来源 → {@code /…} 前缀规则的根 · CC {@code rootPathForSource}
+     * （claude-code-best/src/utils/permissions/filesystem.ts:746-758）
+     * + {@code getSettingsRootPathForSource}（claude-code-best/src/utils/settings/settings.ts:239-253）。
+     *
+     * <p>CC 的 {@code patternWithRoot} {@code DIR_SEP} 分支（filesystem.ts:899-905）取
+     * {@code root = rootPathForSource(source)} —— 即「规则写在哪个来源里，{@code /…} 就相对
+     * 那个来源的根」，⛔ <b>不是恒等于 cwd</b>。逐源与 CC 逐条对齐：
+     * <ul>
+     *   <li>{@code userSettings} → {@code getClaudeConfigHomeDir()}（settings.ts:241-242）。
+     *       本仓用户级 settings 实存于 {@code {appName}} 自有根 ——
+     *       {@code UserSettingsLoader.resolvePath()} = {@code NexusaiPaths.getAppConfigHomeDir()}
+     *       {@code /settings.json} ⇒ 语义锚 = 该文件所在根。</li>
+     *   <li>{@code policySettings} / {@code projectSettings} / {@code localSettings}
+     *       → {@code getOriginalCwd()}（settings.ts:243-246）。
+     *       ⚠️ CC 的 {@code policySettings} 根<b>也是 cwd</b>，不是 managed 文件所在目录。</li>
+     *   <li>{@code cliArg} / {@code command} / {@code session}
+     *       → {@code expandPath(getOriginalCwd())}（filesystem.ts:748-751）。</li>
+     *   <li>{@code flagSettings} → {@code dirname(--settings 路径)}，路径不可得时回落
+     *       {@code getOriginalCwd()}（settings.ts:248-251）。本仓 web 无 CLI flag
+     *       （{@code FlagSettingsLoader} 永远 empty，无 flag 路径可得）⇒ 恒取 CC 的回落值 cwd。</li>
+     * </ul>
+     *
+     * <p>⚠️ 与 CC 的已知偏差（有意）：CC 的 cwd 是 {@code getOriginalCwd()}（会话启动目录），
+     * 本方法的 {@code cwd} 形参是调用方声明的校验基准（{@code ctx.effectiveCwd()} 等）。
+     * 二者取同值的接线由调用侧负责，不属本方法范围。
+     *
+     * @param source 规则来源（null → 无 source 信息，按 cwd 兜底 = 本分支接入 source 前的行为）
+     * @param cwd    调用方声明的校验基准 cwd
+     * @return {@code /…} 规则的根（未 POSIX 归一；调用点统一走 {@link #posixNormalize}）
+     */
+    private static String rootPathForSource(
+            com.nexusai.application.agent.permission.PermissionRuleSource source,
+            String cwd) {
+        if (source == null) {
+            return cwd;
+        }
+        return switch (source) {
+            // CC :752-757 → getSettingsRootPathForSource('userSettings')（settings.ts:241-242）
+            case USER_SETTINGS -> NexusaiPaths.getAppConfigHomeDir();
+            // CC :753-757 → getSettingsRootPathForSource('policy'|'project'|'local'Settings)
+            // = getOriginalCwd()（settings.ts:243-246）
+            case POLICY_SETTINGS, PROJECT_SETTINGS, LOCAL_SETTINGS -> cwd;
+            // CC :748-751 → expandPath(getOriginalCwd())
+            case CLI_ARG, COMMAND, SESSION -> cwd;
+            // CC :753-757 → dirname(--settings 路径) ?: getOriginalCwd()（settings.ts:248-251）
+            // 本仓无 flag 路径 ⇒ 取 CC 回落值
+            case FLAG_SETTINGS -> cwd;
+        };
     }
 
     /** 平台判定（Windows → 盘符根 / POSIX 归一）。 */

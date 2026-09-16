@@ -124,7 +124,8 @@ public class AgentColorCommand {
      * @param sessionId 分派入口显式传入的会话 ID（null/空 = 无会话上下文，同旧 MDC 缺值语义）
      */
     private Env buildProductionEnv(UserInputDispatcher.SlashCommandContext ctx) {
-        // [批 r10] 会话存档根经 ctx.projectRoot() 承载（getOriginalCwdLayer 语义 + user.dir 兜底单点，
+        // [批 r10] 会话存档根经 ctx.projectRoot() 承载（[F1 2026-09-16] 语义 = **稳定会话绑定项目根**
+        //   `CwdResolution.getProjectRoot`，原为 getOriginalCwdLayer 随 worktree 重锚 ⇒ 已改；
         //   替代本类原先的 workspaceDir/workspaceDirFor 反查）。
         //   ⚠️ 以**惰性 Supplier** 下传两个消费点，各自的解析时机/异常面逐点不变：
         //   - transcriptPath()：原解析点在 Env 被 execute 取用时（resolveTranscriptPath 内）
@@ -180,7 +181,8 @@ public class AgentColorCommand {
     /** 持久化 agent-color entry + 会话缓存（CC sessionStorage.ts saveAgentColor:2838-2852）。
      *
      *  <p><b>[批 r10]</b> 会话存档根改为 {@code Supplier} 形参（取值 = ctx.projectRoot()，
-     *  getOriginalCwdLayer 语义 + user.dir 兜底单点）。用 Supplier 而非已解析值，是为了让
+     *  <b>稳定会话绑定项目根</b> [`CwdResolution.getProjectRoot`，F1 2026-09-16 起；
+     *  原 getOriginalCwdLayer 随 worktree 重锚 ⇒ 读写分裂，已改]）。用 Supplier 而非已解析值，是为了让
      *  {@code get()} 留在**下方 runAsync 之前**的原解析位置（见下注释），逐点保持原语义。
      *
      *  <p><b>[session-id-short]</b>：sessionId 为 short 直键，直传 {@link SessionStorage}

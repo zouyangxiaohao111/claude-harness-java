@@ -103,10 +103,11 @@ public record PathValidationEnv(
      * @return 路径校验环境
      */
     public static PathValidationEnv forProcess(Path cwd) {
-        // [WF-1D · DEL-06] originalCwd 走统一入口（对齐 CC getOriginalCwd）。forProcess 无
-        //   sessionId 槽（record sessionId=null）→ getOriginalCwdLayer(null) 回落 user.dir
-        //   （INV-4），但经统一入口，满足 INV-6「无 user.dir 直读残留于工作目录域」。
-        String originalCwd = CwdResolution.getOriginalCwdLayer(null);
+        // [WF-1D · DEL-06 · 批 P12] originalCwd 走统一入口（对齐 CC getOriginalCwd）。forProcess
+        //   结构性无 sessionId 槽（record sessionId=null）⇒ 走【无会话命名出口】getOriginalCwdLayerForNonSession()
+        //   （值 = 归一化进程 user.dir，INV-4；⭐ 原写法 getOriginalCwdLayer(null) 值逐字节相同，但它会把
+        //   结构性无会话报成「漏传 sessionId」）。经统一入口，满足 INV-6「无 user.dir 直读残留于工作目录域」。
+        String originalCwd = CwdResolution.getOriginalCwdLayerForNonSession();
         return new PathValidationEnv(
             null,
             null,
