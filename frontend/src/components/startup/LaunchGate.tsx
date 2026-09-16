@@ -10,7 +10,10 @@ import { API_V1_BASE } from '@/api/base'
  *  地址单一来源见 @/api/base（dev 相对路径 + vite proxy；打包绝对地址）。 */
 const READY_URL = `${API_V1_BASE}/settings`
 const READY_POLL_MS = 500
-const READY_TIMEOUT_MS = 15_000
+// 启动就绪超时：30s。⚠️ 原为 15s，部分电脑（首次启动 / 冷启动 / 杀软扫描 / 机械盘）后端就绪
+//   会超过 15s ⇒ 前端先超时进 error 卡，而 Rust 侧 wait_backend_ready 实际是 60s（backend.rs:26）
+//   ⇒ 前端过早判死。改 30s 与之留出余量；⛔ 不要大于 Rust 侧 60s（否则等不到失败信号）。
+const READY_TIMEOUT_MS = 30_000
 
 type GateStatus = 'booting' | 'ready' | 'error'
 
@@ -120,7 +123,7 @@ export function LaunchGate({ children }: LaunchGateProps) {
     void pollOnce()
     pollId = window.setInterval(() => void pollOnce(), READY_POLL_MS)
     failId = window.setTimeout(
-      () => goError('启动超时：本地引擎在 15 秒内未就绪。请检查后端服务后关闭并重新打开应用。'),
+      () => goError(`启动超时：本地引擎在 ${READY_TIMEOUT_MS / 1000} 秒内未就绪。请检查后端服务后关闭并重新打开应用。`),
       READY_TIMEOUT_MS,
     )
 
