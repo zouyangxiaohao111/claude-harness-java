@@ -4417,11 +4417,26 @@ public class LlmAgentLoop implements AgentLoop {
                 //   即为 null。夹具（SessionProjectRoot.setForSession(S, bound) +
                 //   SessionCwdHolder.setOriginalCwd(S, worktree) + setWorkspaceDir(null)）实测：
                 //   改前读到 worktree 目录的 CLAUDE.md（哨兵 WORKTREE_MARKER），改后读到 boundProject 的
-                //   （BOUND_MARKER）。守护类 = LlmAgentLoopUserContextFallbackAnchorTest
-                //   （改回 getOriginalCwdLayer ⇒ 2 红读 WORKTREE_MARKER；改成 getCwd ⇒ 2 红读 CD_MARKER）。
+                //   （BOUND_MARKER）。守护类 = LlmAgentLoopUserContextFallbackAnchorTest。
+                //   ⭐ [批 D3 2026-09-16 重做观测通道] 该守护原经 **claudemdEngine == null（降级态）** 观测
+                //   （降级态 claudeMd() 直接读 projectRoot/CLAUDE.md ⇒ 该字段值「看得见」）—— **那是错的通道**：
+                //   该字段的用途是「**引擎存在时**当 AutoMem/TeamMem 基址」（本三元经 UserContextProvider 的
+                //   if(claudemdEngine != null) 分支落 getMemoryFiles 的第 3 实参），而降级态下 AutoMem/TeamMem
+                //   这条链根本不存在 ⇒ 旧通道是**张冠李戴**；且批 D3 已把降级态扫描根改为按调用现算
+                //   getOriginalCwdLayer（**不看**该字段）⇒ 旧通道下该字段成为死值（原 3 条断言全红）。
+                //   现改为经**引擎存在态**观测：捕获 getMemoryFiles(force, sessionId, **第 3 实参**)。
+                //   实测：改回 getOriginalCwdLayer ⇒ 2 红（捕获到 worktree 目录）；改成 getCwd ⇒ 2 红（捕获到 cd 目录）。
                 //   ⚠️ 生产可达态只有「未绑定 / DB 无此会话 / 无法判定 / 确无会话」四种，前三种
                 //   **两锚同族 fail-loud**（改前改后都抛）⇒ 本次改动在生产上零行为变化，
                 //   消除的是「重锚槽一旦有值就锚进 worktree」的潜伏分叉。
+                //   ⭐ [批 D3 2026-09-16] 逆向指认（两处 javadoc 互相指认的第二侧，⛔ 勿删）：
+                //   本三元把 projectRoot 交给 UserContextProvider 后，**引擎存在时**它是 AutoMem/TeamMem
+                //   基址（要稳定 ⇒ 故上面选 getProjectRoot）；而**引擎缺失（claudemdEngine == null）降级态**
+                //   下，该字段**不再**被当作扫描根 —— UserContextProvider.claudeMd() 改按调用现算
+                //   CwdResolution.getOriginalCwdLayer（CC claudemd.ts:850 getOriginalCwd，**随 worktree 变**）。
+                //   ⇒ 同一字段两用途、锚方向相反，二者**不矛盾**（判据分别是 CC state.ts:498-508 与
+                //   claudemd.ts:850）；⛔ 不得以「顺手统一」为由改本三元任一腿
+                //   （完整说明见 UserContextProvider 的 projectRoot 字段 javadoc）。
                 new com.nexusai.application.agent.prompt.UserContextProvider(
                     (ctx.sessionState() != null && ctx.sessionState().workspaceDir() != null)
                         ? ctx.sessionState().workspaceDir()

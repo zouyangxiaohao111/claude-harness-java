@@ -16,7 +16,10 @@ import com.nexusai.application.agent.config.MemoryBareModeConfig;
  * {@code getClaudeMds(getMemoryFiles())}（多文件 + 类型描述 + MEMORY_INSTRUCTION_PROMPT 头），
  * 与 memory 模块强耦合。注入 ClaudemdEngine 时走完整链
  * （{@code getClaudeMds(filterInjectedMemoryFiles(getMemoryFiles()))}，CC context.ts:170-172）；
- * 未注入 → 回退单项目根 {@code CLAUDE.md}（trim，等价主文件）。
+ * 未注入 → 回退单项目根 {@code CLAUDE.md}（trim，等价主文件）；
+ * <b>[批 D3 2026-09-16]</b> 该回退的<b>扫描根</b>按调用现算
+ * {@link CwdResolution#getOriginalCwdLayer(String)}（= CC {@code getOriginalCwd}，随 worktree 变），
+ * 拿不到会话态才回落 {@link #projectRoot} 字段 + ≥WARN（见 {@link #degradedClaudeMdScanRoot()}）。
  *
  * <p><b>currentDate 会话冻结（I-10）</b>：日期不实时取，而用 {@code AgentState.sessionStartDate}
  * 冻结值 —— 跨午夜不陈旧，prompt cache-key 稳定（CC common.ts:17-24 注释语义）。
@@ -40,7 +43,30 @@ public class UserContextProvider {
         String get(String key);
     }
 
-    /** 项目根目录（默认会话 originalCwd 层 · 测试可注入临时目录） */
+    /**
+     * 项目根目录（默认会话 originalCwd 层 · 测试可注入临时目录）。
+     *
+     * <p>⭐ <b>[批 D3 2026-09-16] 本字段服务两个用途，锚方向<b>相反</b>且各有 CC 依据 —— ⛔ 不是写错</b>：
+     * <ol>
+     *   <li><b>路 A（{@code claudemdEngine != null}）· AutoMem/TeamMem 基址</b>：作为
+     *       {@code getMemoryFiles(..., sessionProjectRoot)} 的落点，要求<b>稳定</b>
+     *       （<b>不</b>随 worktree 变）⇒ 生产调用点取
+     *       {@link CwdResolution#getProjectRoot(String)}（[批 P23] 领地，见
+     *       {@code LlmAgentLoop} 中该三元两条腿的 javadoc，判据 CC
+     *       {@code bootstrap/state.ts:498-508} getProjectRoot「never updated by mid-session
+     *       EnterWorktreeTool」）。</li>
+     *   <li><b>路 B（{@code claudemdEngine == null} 降级态）· CLAUDE.md 扫描根「兜底值」</b>：
+     *       仅当本字段<b>同时</b>被当作扫描根时才有语义，而扫描根在 CC 里锚
+     *       {@code getOriginalCwd()}（{@code utils/claudemd.ts:850} 逐字
+     *       {@code const originalCwd = getOriginalCwd()}），<b>要</b>随 worktree 变 ⇒
+     *       降级态<b>不</b>直接用本字段，而在调用时现算
+     *       {@link CwdResolution#getOriginalCwdLayer(String)}（见
+     *       {@link #degradedClaudeMdScanRoot()}），本字段只作其<b>拿不到会话态时的回落值</b>。</li>
+     * </ol>
+     * ⇒ <b>同一字段两用途、锚方向相反</b>：「AutoMem 基址要稳定」与「降级态扫描根要跟 worktree」
+     * <b>不矛盾</b>（不同用途 / 不同 CC 锚）⇒ 二者<b>不得</b>为「顺手统一」而互改
+     * （改任一处的锚都是行为变更，各有守护测试）。
+     */
     private final Path projectRoot;
 
     private final Environment environment;
@@ -195,7 +221,13 @@ public class UserContextProvider {
     }
 
     /**
-     * 读取项目根 CLAUDE.md（trim）· 对齐 CC {@code getClaudeMds} 单主文件子集。
+     * 读取 CLAUDE.md（trim）· 对齐 CC {@code getClaudeMds} 单主文件子集。
+     *
+     * <p><b>[批 D3 2026-09-16] 降级态（{@code claudemdEngine == null}）的扫描根</b> =
+     * 按调用现算 {@link CwdResolution#getOriginalCwdLayer(String)}（CC {@code claudemd.ts:850}
+     * {@code getOriginalCwd()} 的对应物，<b>随 worktree 变</b>），⛔ 不是本类 {@link #projectRoot}
+     * 字段（那是「引擎存在时当 AutoMem 基址」的稳定锚，[批 P23] 领地）。见
+     * {@link #degradedClaudeMdScanRoot()}。
      *
      * <p>门控（CC context.ts:165-172 语义）：
      * <ol>
@@ -250,7 +282,12 @@ public class UserContextProvider {
                 return null;
             }
         }
-        Path claudeMd = projectRoot.resolve("CLAUDE.md");
+        // [批 D3 2026-09-16] 降级态扫描根：CC 的 CLAUDE.md 扫描根锚 getOriginalCwd()
+        //   （claudemd.ts:850，**随 worktree 变**），⛔ 不是稳定会话项目根（那是 AutoMem 用途的锚，
+        //   见本类 projectRoot 字段 javadoc 的「同字段两用途」段与 [批 P23] 领地）。
+        //   ⇒ 走 CwdResolution.getOriginalCwdLayer（= CC getOriginalCwd 对应物）现算，
+        //   拿不到会话态时回落本字段 + ≥WARN（铁律「不许静默失效」）。
+        Path claudeMd = degradedClaudeMdScanRoot().resolve("CLAUDE.md");
         if (!Files.isRegularFile(claudeMd)) {
             if (log.isDebugEnabled()) {
                 log.debug("[UserContextProvider] 未找到 {}，claudeMd 为 null", claudeMd);
@@ -270,6 +307,68 @@ public class UserContextProvider {
             log.warn("[UserContextProvider] 读取 CLAUDE.md 失败，claudeMd 为 null（对齐 CC context.ts 不阻断组装）: {}", e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * [批 D3 2026-09-16] <b>降级态（{@code claudemdEngine == null}）CLAUDE.md 扫描根</b>。
+     *
+     * <p><b>锚 = {@link CwdResolution#getOriginalCwdLayer(String)}</b>（= CC {@code getOriginalCwd()}
+     * 对应物，{@code utils/claudemd.ts:850} 逐字 {@code const originalCwd = getOriginalCwd()}）。
+     * 该锚<b>随 mid-session {@code EnterWorktreeTool} 重锚</b>（{@code SessionCwdHolder.originalCwd} 槽），
+     * 故 worktree 会话读到的是 <b>worktree 自己</b>的 CLAUDE.md —— 与 CC 一致。
+     *
+     * <p><b>WHY 必须<b>按调用现算</b>而不是用构造期字段</b>：构造发生在 run 开始
+     * （{@code LlmAgentLoop.collectRunMaterial}），而 {@code EnterWorktreeTool} 是<b>会话中途</b>才
+     * 重锚的 ⇒ 构造期冻结的值读不到 worktree 的 CLAUDE.md（用户可见差异）。同理，本方法 ⛔ 不得
+     * 改成「解析一次并缓存」。
+     *
+     * <p><b>⛔ 不新增抛出面</b>：{@link CwdResolution#getOriginalCwdLayer(String)} 在
+     * {@code unbound} / {@code unknown} / {@code resolutionFailed} 三种会话态下 <b>fail-loud 抛</b>
+     * （{@code UnresolvedProjectRootException}）—— 那是数据链路异常的正确暴露面，但本处是
+     * <b>降级态的兜底</b>，抛出去会让「引擎缺失」这个本就脆弱的形态再断一条链
+     * （{@code claudeMd()} 的契约是「被禁用/缺失/异常 → {@code null}，不阻断组装」）。
+     * ⇒ 本方法<b>自己吞掉</b>并回落。
+     *
+     * <p><b>⭐ 回落必须响（铁律「不许静默失效」）</b>：两条回落腿（无会话 / 解析不可得）各打一条
+     * <b>≥WARN</b>，点名「降级态扫描根回落」。⛔ 不得降为 debug：降级态本就少见，静默会让
+     * 「本该读到 worktree 的 CLAUDE.md 却读到主项目的」永久无人发现。
+     *
+     * <p>回落值 = 构造期字段 {@link #projectRoot}（⛔ <b>不是</b>
+     * {@link CwdResolution#getOriginalCwdLayerForNonSession()} / 进程 {@code user.dir} ——
+     * 「字段兜底」与「无会话出口」是两回事，混用会把扫描根锚到后端启动目录）。
+     *
+     * @return 归一化的扫描根；拿不到会话态时 = 构造期 {@link #projectRoot}（恒非 null）
+     */
+    private Path degradedClaudeMdScanRoot() {
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[UserContextProvider] 降级态（claudemdEngine=null）CLAUDE.md 扫描根解析：本实例无会话"
+                + "（sessionId 为空）⇒ 回落构造期 projectRoot={}（⛔ 非进程 user.dir，也非 CC getOriginalCwd）",
+                projectRoot);
+            return projectRoot;
+        }
+        try {
+            String resolved = CwdResolution.getOriginalCwdLayer(sessionId);
+            if (resolved != null && !resolved.isBlank()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[UserContextProvider] 降级态 CLAUDE.md 扫描根 = getOriginalCwdLayer({}) = {}",
+                        sessionId, resolved);
+                }
+                return Path.of(resolved);
+            }
+            log.warn("[UserContextProvider] 降级态（claudemdEngine=null）CLAUDE.md 扫描根解析："
+                + "getOriginalCwdLayer({}) 返回空 ⇒ 回落构造期 projectRoot={}", sessionId, projectRoot);
+        } catch (com.nexusai.infra.exception.UnresolvedProjectRootException e) {
+            // 预期内的 fail-loud（未绑定 / DB 无此会话 / 无法判定）⇒ 本处兜底并留痕
+            log.warn("[UserContextProvider] 降级态（claudemdEngine=null）CLAUDE.md 扫描根解析："
+                + "getOriginalCwdLayer({}) fail-loud ⇒ 回落构造期 projectRoot={}（原因为数据链路异常，"
+                + "详见同刻 CwdResolution 的 ERROR 行）: {}", sessionId, projectRoot, e.getMessage());
+        } catch (RuntimeException e) {
+            // ⛔ 「不新增抛出面」是硬要求 ⇒ 未预期异常同样不得逸出（⛔ 不得改成静默 return）
+            log.warn("[UserContextProvider] 降级态（claudemdEngine=null）CLAUDE.md 扫描根解析："
+                + "getOriginalCwdLayer({}) 抛未预期异常 ⇒ 回落构造期 projectRoot={}: {}",
+                sessionId, projectRoot, e.toString());
+        }
+        return projectRoot;
     }
 
     /**

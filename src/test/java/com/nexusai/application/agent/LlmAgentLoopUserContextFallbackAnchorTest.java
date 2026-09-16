@@ -2,6 +2,8 @@ package com.nexusai.application.agent;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
+import com.nexusai.application.agent.context.ClaudemdEngine;
+import com.nexusai.application.agent.context.MemoryFileInfo;
 import com.nexusai.application.agent.loop.AgentLoopContext;
 import com.nexusai.application.agent.loop.LoopDeps;
 import com.nexusai.application.agent.loop.QueryParams;
@@ -18,6 +20,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -38,39 +41,48 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （CC gh-30217）同型。批 P13 修 transcript 存储根、P21 修
  * {@code AgentLoopContextFactory.resolveFallbackWorkspaceDir}，本类守的是第三处。
  *
- * <h2>可达性（本批实测，⛔ 不是推断）</h2>
- * 与本仓既有认知（P21 处 {@code sessionId 恒 null}）<b>不同</b>：本兜底的 sessionId 来自
- * {@code state.sessionId()}，<b>可真非 null</b>。机制：
+ * <h2>⭐ [批 D3 2026-09-16 重做] 观测通道换成「引擎存在态」—— 为什么必须换</h2>
+ * 本类原经 <b>{@code claudemdEngine == null}（降级态）</b> 观测该三元：降级态下
+ * {@code UserContextProvider.claudeMd()} 直接读 {@code projectRoot/CLAUDE.md} ⇒ 该字段的值
+ * 「看得见」。<b>但那是错的观测通道</b>，两条实测理由：
  * <ol>
- *   <li>{@code LlmAgentLoop.workspaceDir} 字段<b>初值 null</b>（只有
- *       {@code resolveSessionProjectRoot} 成功分支才赋值）；</li>
- *   <li>{@code buildSessionStateFromInstance()} <b>无条件</b>
- *       {@code session.setWorkspaceDir(workspaceDir)} ⇒ 解析失败时
- *       {@code LoopSessionState.workspaceDir} 被写成 null（覆盖其非 null 默认值）；</li>
- *   <li>主循环经 5 参 {@code forSession(..., session, ...)} 用该实例传入 session。</li>
+ *   <li><b>用途在降级态根本不存在</b>：该字段服务于「引擎存在时当 <b>AutoMem/TeamMem 基址</b>」
+ *       （{@code UserContextProvider:230} 的 {@code if (claudemdEngine != null)} 分支内的
+ *       {@code getMemoryFiles(false, sessionId, projectRoot)}）。{@code engine == null} 时
+ *       AutoMem/TeamMem 这条链根本不存在 ⇒ 该字段在那个通道上<b>只剩「扫描根」一个用途</b>
+ *       ⇒ 用降级态 read 去观测「AutoMem 基址的锚」是<b>张冠李戴</b>。</li>
+ *   <li><b>批 D3 已把降级态扫描根改为不看该字段</b>：降级态扫描根改按调用现算
+ *       {@code CwdResolution.getOriginalCwdLayer}（= CC {@code claudemd.ts:850}
+ *       {@code getOriginalCwd()}，<b>随 worktree 变</b>，见
+ *       {@code UserContextProvider.degradedClaudeMdScanRoot()}）⇒ 降级态下该字段<b>观测上成为死值</b>，
+ *       连「主腿胜出」的正向对照臂都读不到 {@code workspaceDir}（原实现下三条断言全红）。</li>
  * </ol>
- * 故兜底腿可达。实测读数见类内两条用例的红/绿记录（批 P23 报告）。
+ * ⇒ <b>本类改为观测引擎侧实参</b>：用 {@link CapturingEngine} 捕获
+ * {@code getMemoryFiles(forceIncludeExternal, sessionId, sessionProjectRoot)} 的
+ * <b>第 3 实参</b>—— 那正是「AutoMem/TeamMem 基址」本体，也就是 P23 要守的东西。
+ * ⚠️ <b>守护意图不变</b>（仍抓「锚改回 {@code getOriginalCwdLayer}」/「改成 {@code getCwd}」），
+ * 变的只是观测通道。⛔ 本类<b>不再</b>声称它守的是「降级态读哪个文件」（那是批 D3 的
+ * {@code UserContextProviderDegradedScanRootTest} 的领地）。
  *
- * <h2>RED 条件（反向实验配方）</h2>
- * 把 {@code LlmAgentLoop} 该处锚改回 {@code CwdResolution.getOriginalCwdLayer(...)} ⇒
- * {@link #fallbackAnchor_doesNotFollowWorktreeReanchor()} 红（读到 worktree 的 CLAUDE.md 哨兵）；
- * 改成 {@code CwdResolution.getCwd(...)} ⇒ 同一条红（读到 cd 目录的哨兵）。
+ * <h2>RED 条件（反向实验配方 · 改后实测有效）</h2>
+ * <ul>
+ *   <li>把 {@code LlmAgentLoop} 该处锚改回 {@code CwdResolution.getOriginalCwdLayer(...)} ⇒
+ *       {@link #fallbackLeg_anchorsStableSessionProjectRoot()} 红（捕获到 worktree 目录）；</li>
+ *   <li>改成 {@code CwdResolution.getCwd(...)} ⇒ 同一条红（捕获到 cd 目录）。</li>
+ * </ul>
  *
  * <h2>夹具要点（⛔ 不要删）</h2>
  * <ul>
- *   <li><b>三个候选目录各放一个可区分的 CLAUDE.md 哨兵</b> —— 断言「读到哪一个」，
- *       而不是断言路径字符串；这是本类唯一的鉴别力来源。三值相同则任何实现都绿。</li>
- *   <li><b>必须让「重锚槽」「cd 槽」「稳定锚」取三个不同目录</b>：任一相同 ⇒ 对应断言恒绿。</li>
+ *   <li><b>四个候选目录各不同值</b>（稳定锚 / 重锚槽 / cd 槽 / 主腿）—— 断言「捕获到哪一个」，
+ *       而不是断言路径字符串的写法；四值相同则任何实现都绿。</li>
  *   <li><b>必须显式 {@code setForSession}</b>：单测环境里
  *       {@code NoDatabaseSessionProjectRootExtension} 对任意 sessionId 答 sessionless
  *       （见 {@code SessionProjectRootTestSupport}），不显式登记稳定锚会落到进程 user.dir。</li>
- *   <li><b>{@code claudemdEngine} 必须为 null</b>（{@code TestContexts} 默认即 null）：
- *       此时 {@code UserContextProvider.claudeMd()} 走 {@code projectRoot/CLAUDE.md} 子集分支，
- *       本兜底值直接决定读哪个文件；若注入引擎，扫描根改由 {@code sessionId} 解析，
- *       本兜底值就<b>观测不到</b>（断言恒绿）。</li>
+ *   <li><b>必须注入引擎</b>（{@link CapturingEngine}）：降级态观测不到 {@code sessionProjectRoot}
+ *       ⇒ 断言恒绿（这正是本类换通道的原因）。</li>
  * </ul>
  */
-@DisplayName("[批 P23] collectRunMaterial 的 UserContextProvider 兜底腿锚 = 稳定会话项目根（F1 同型第三处）")
+@DisplayName("[批 P23 · D3 重做观测通道] collectRunMaterial 的 UserContextProvider 兜底腿锚 = 稳定会话项目根")
 class LlmAgentLoopUserContextFallbackAnchorTest {
 
     private static final String SESSION = "sess-p23-fallback-anchor";
@@ -94,6 +106,9 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
     @TempDir
     Path configHome;
 
+    /** 每个用例独立的捕获器（⛔ 不用 static 共享，避免用例间串读）。 */
+    private static CapturingEngine ENGINE;
+
     @BeforeEach
     void setUp() throws Exception {
         NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
@@ -103,10 +118,7 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
         SessionProjectRoot.setForSession(SESSION, boundProject.toString());
         SessionCwdHolder.setOriginalCwd(SESSION, worktree.toString());
         SessionCwdHolder.set(SESSION, cdDir.toString());
-
-        Files.writeString(boundProject.resolve("CLAUDE.md"), "BOUND_MARKER");
-        Files.writeString(worktree.resolve("CLAUDE.md"), "WORKTREE_MARKER");
-        Files.writeString(cdDir.resolve("CLAUDE.md"), "CD_MARKER");
+        ENGINE = new CapturingEngine();
     }
 
     @AfterEach
@@ -120,20 +132,51 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
     }
 
     /**
-     * 组装 {@code collectRunMaterial} 的 userContext.claudeMd（claudemdEngine=null ⇒
-     * 单文件子集分支，值 = 兜底锚目录下 CLAUDE.md 的 trim 内容）。
+     * 捕获型引擎：只记 {@code getMemoryFiles} 的<b>第 3 实参</b>（{@code sessionProjectRoot}
+     * = AutoMem/TeamMem 基址），不触真实 memory 链。
      *
-     * <p>夹具三件套：① {@code workspaceDir=null} 强制走兜底腿；② {@code state.sessionId()}
-     * 非 null（本兜底的可达前提）；③ 三个候选目录的哨兵互不相同。
+     * <p>返回值取空列表 ⇒ 下游 {@code filterInjectedMemoryFiles}/{@code getClaudeMds} 得到空内容，
+     * {@code claudeMd()} 走「无内容 → null」；⛔ 这不影响本类的断言 —— 断言的是<b>被捕获的实参</b>，
+     * 它在任何下游失败之前就已记录（故本类不依赖 memory 链可用）。
      */
-    private static String assembledClaudeMd() {
-        AgentLoopContext ctx = TestContexts.agentLoopContext(null, null, null, null, null);
-        ctx.sessionState().setWorkspaceDir(null);
+    private static final class CapturingEngine extends ClaudemdEngine {
+        private final List<String> captured = new ArrayList<>();
+
+        CapturingEngine() {
+            super(null, null);
+        }
+
+        @Override
+        public List<MemoryFileInfo> getMemoryFiles(boolean forceIncludeExternal, String sessionId,
+                                                   String sessionProjectRoot) {
+            captured.add(sessionProjectRoot);
+            return List.of();
+        }
+
+        /** 最后一次捕获到的 {@code sessionProjectRoot}（null = 从未被调用 ⇒ 观测装置失效）。 */
+        String lastSessionProjectRoot() {
+            return captured.isEmpty() ? null : captured.get(captured.size() - 1);
+        }
+    }
+
+    /**
+     * 组装 {@code collectRunMaterial} 的 userContext.claudeMd 并返回捕获到的 AutoMem/TeamMem 基址。
+     *
+     * <p>夹具三件套：① 注入 {@link CapturingEngine}（引擎存在态 ⇒ 该字段走 AutoMem/TeamMem 基址通道）；
+     * ② {@code state.sessionId()} 非 null；③ 四个候选目录互不相同。
+     *
+     * @param workspaceDir 主腿值（null ⇒ 强制走兜底腿）
+     */
+    private static String captureSessionProjectRoot(Path workspaceDir) {
+        AgentLoopContext ctx = TestContexts.agentLoopContext(null, null, null, null, null, null, null,
+            ENGINE);
+        ctx.sessionState().setWorkspaceDir(workspaceDir);
         AgentState state = new AgentState(null, SESSION, null);
         QueryParams params = QueryParams.forLoop(
             state.rawMessages(), List.of(), minimalTuc(), QuerySource.REPL_MAIN_THREAD, "test-model",
             null, null, null, null, null, depsOf(ctx), ProviderConfig.empty());
-        return LlmAgentLoop.collectRunMaterial(ctx, params, state).userContext().get("claudeMd");
+        LlmAgentLoop.collectRunMaterial(ctx, params, state);
+        return ENGINE.lastSessionProjectRoot();
     }
 
     private static ToolUseContext minimalTuc() {
@@ -151,11 +194,10 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
     }
 
     @Test
-    @DisplayName("夹具有效性自检：cd 槽与重锚槽确实生效且与稳定锚不同值（否则本类恒绿）")
+    @DisplayName("夹具有效性自检：三槽互异且观测装置确实在用（否则本类恒绿）")
     void fixture_actuallySeparatesTheThreeAnchors() {
-        // WHY（规则十二 · 反恒绿）：本类全部鉴别力都来自「三个槽指向三个不同目录」。
+        // WHY（规则十二 · 反恒绿）：本类全部鉴别力都来自「三个槽指向三个不同目录 + 观测装置生效」。
         // 若夹具写错（如 cd 槽未设），getCwd 变异体就会与正确实现同值 ⇒ 断言恒绿。
-        // 本用例把该前提显式钉住：三槽互异，且两个「错锚」出口确实能取到各自的值。
         assertThat(CwdResolution.getCwd(SESSION))
             .as("cd 槽必须真的生效（否则 getCwd 变异体与正确实现同值 ⇒ 恒绿）")
             .isEqualTo(CwdResolution.normalizeCwd(cdDir.toString()));
@@ -165,65 +207,64 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
         assertThat(CwdResolution.getProjectRoot(SESSION))
             .as("稳定锚必须真的生效（显式 setForSession）")
             .isEqualTo(CwdResolution.normalizeCwd(boundProject.toString()));
+
+        // ⭐ 观测装置自检：引擎存在态下捕获器必须真的被调用（否则「捕获 == null」会让断言全绿/全红）
+        String captured = captureSessionProjectRoot(null);
+        assertThat(captured)
+            .as("⭐ 观测装置必须生效：claudemdEngine 非 null ⇒ getMemoryFiles 必被调用并捕获 sessionProjectRoot"
+                + "（若为 null ⇒ 本类观测通道失效，必须停下报告）")
+            .isNotNull();
     }
 
     @Test
-    @DisplayName("进/出 worktree 前后，兜底腿恒读稳定会话项目根（⛔ 不随 EnterWorktreeTool 重锚）")
-    void fallbackAnchor_doesNotFollowWorktreeReanchor() {
-        String before = assembledClaudeMd();
-        assertThat(before)
-            .as("兜底腿必须读稳定会话项目根的 CLAUDE.md（改回 getOriginalCwdLayer ⇒ 读到 WORKTREE_MARKER ⇒ 红）")
-            .isEqualTo("BOUND_MARKER");
-        assertThat(before)
-            .as("⛔ 不得锚到 worktree 目录（重锚槽）")
-            .isNotEqualTo("WORKTREE_MARKER");
+    @DisplayName("进/出 worktree 前后，兜底腿恒把稳定会话项目根传作 AutoMem/TeamMem 基址（⛔ 不随重锚）")
+    void fallbackLeg_anchorsStableSessionProjectRoot() {
+        assertThat(captureSessionProjectRoot(null))
+            .as("兜底腿必须把稳定会话项目根传进 getMemoryFiles 的第 3 实参"
+                + "（改回 getOriginalCwdLayer ⇒ 捕获 worktree 目录 ⇒ 红）")
+            .isEqualTo(CwdResolution.normalizeCwd(boundProject.toString()));
 
         // 进 worktree（EnterWorktreeTool.applySessionCwd 的同款效果）
         SessionCwdHolder.setOriginalCwd(SESSION, worktree.toString());
-        assertThat(assembledClaudeMd())
-            .as("重锚后仍恒读稳定会话项目根（F1/gh-30217 同型防线）")
-            .isEqualTo("BOUND_MARKER");
+        assertThat(captureSessionProjectRoot(null))
+            .as("重锚后仍恒传稳定会话项目根（F1/gh-30217 同型防线）")
+            .isEqualTo(CwdResolution.normalizeCwd(boundProject.toString()));
+        assertThat(captureSessionProjectRoot(null))
+            .as("⛔ 不得锚到 worktree 目录（重锚槽）")
+            .isNotEqualTo(CwdResolution.normalizeCwd(worktree.toString()));
 
         // 出 worktree（ExitWorktreeTool.clearOriginalCwd 的同款效果）
         SessionCwdHolder.clearOriginalCwd(SESSION);
-        assertThat(assembledClaudeMd())
-            .as("退出 worktree 后仍恒读稳定会话项目根")
-            .isEqualTo("BOUND_MARKER");
+        assertThat(captureSessionProjectRoot(null))
+            .as("退出 worktree 后仍恒传稳定会话项目根")
+            .isEqualTo(CwdResolution.normalizeCwd(boundProject.toString()));
     }
 
     @Test
     @DisplayName("兜底腿恒不随 bash cd 漂移（⛔ 不得用 getCwd 层）")
-    void fallbackAnchor_doesNotFollowCdOverrideLayer() {
-        // WHY：workspaceDir / 项目根的语义是「会话绑定项目身份」，bash cd 是**文件操作**语义
+    void fallbackLeg_doesNotFollowCdOverrideLayer() {
+        // WHY：workspaceDir / 项目根语义是「会话绑定项目身份」，bash cd 是**文件操作**语义
         // （CC getProjectRoot() javadoc 逐字：'Use for project identity … not file operations'）。
-        // cd 一挪，读到的 CLAUDE.md 与 auto-memory 项目目录都会跟着换项目 —— 正是本类要挡的。
+        // cd 一挪，AutoMem/TeamMem 项目目录就会跟着换项目 —— 正是本类要挡的。
         // 夹具有效性由 fixture_actuallySeparatesTheThreeAnchors 保证（cd 槽确有值且与稳定锚不同）。
-        String md = assembledClaudeMd();
-        assertThat(md)
-            .as("兜底腿必须读稳定会话项目根（改成 getCwd ⇒ 读到 CD_MARKER ⇒ 红）")
-            .isEqualTo("BOUND_MARKER");
-        assertThat(md)
+        String captured = captureSessionProjectRoot(null);
+        assertThat(captured)
+            .as("兜底腿必须传稳定会话项目根（改成 getCwd ⇒ 捕获 cd 目录 ⇒ 红）")
+            .isEqualTo(CwdResolution.normalizeCwd(boundProject.toString()));
+        assertThat(captured)
             .as("⛔ 不得锚到 bash cd 覆盖层")
-            .isNotEqualTo("CD_MARKER");
+            .isNotEqualTo(CwdResolution.normalizeCwd(cdDir.toString()));
     }
 
     @Test
-    @DisplayName("正向对照：workspaceDir 非 null 时读主腿（证明上面的断言真的在看该三元）")
+    @DisplayName("正向对照：workspaceDir 非 null 时传主腿（证明断言真的在看该三元）")
     void primaryLeg_winsWhenWorkspaceDirPresent() throws Exception {
-        // WHY（规则十二 · 反恒绿）：若上面的断言装置其实没在看 UserContextProvider（如被缓存、
-        // 被别的来源覆盖），本用例会读到 BOUND_MARKER 而非 PRIMARY_MARKER ⇒ 红。
+        // WHY（规则十二 · 反恒绿）：若断言装置其实没在看该三元（如被缓存、被别的来源覆盖），
+        // 本用例会捕获到稳定锚而非主腿目录 ⇒ 红。
         // 主腿用**第四个**目录：与兜底腿期望值不同，才具备判别力。
-        Files.writeString(primaryDir.resolve("CLAUDE.md"), "PRIMARY_MARKER");
-        AgentLoopContext ctx = TestContexts.agentLoopContext(null, null, null, null, null);
-        ctx.sessionState().setWorkspaceDir(primaryDir);
-        AgentState state = new AgentState(null, SESSION, null);
-        QueryParams params = QueryParams.forLoop(
-            state.rawMessages(), List.of(), minimalTuc(), QuerySource.REPL_MAIN_THREAD, "test-model",
-            null, null, null, null, null, depsOf(ctx), ProviderConfig.empty());
-        String md = LlmAgentLoop.collectRunMaterial(ctx, params, state).userContext().get("claudeMd");
-
-        assertThat(md)
-            .as("主腿存在 ⇒ 直接用 workspaceDir 指向的第四个目录（本类断言确实作用于该三元，非恒绿）")
-            .isEqualTo("PRIMARY_MARKER");
+        String captured = captureSessionProjectRoot(primaryDir);
+        assertThat(captured)
+            .as("主腿存在 ⇒ 直接传 workspaceDir 指向的第四个目录（本类断言确实作用于该三元，非恒绿）")
+            .isEqualTo(CwdResolution.normalizeCwd(primaryDir.toString()));
     }
 }

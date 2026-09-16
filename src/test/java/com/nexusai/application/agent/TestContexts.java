@@ -156,6 +156,34 @@ public final class TestContexts {
     }
 
     /**
+     * [批 D3] 8 参重载：额外注入 {@code claudemdEngine}（<b>引擎存在态</b>观测用）。
+     *
+     * <p><b>WHY 需要它（⛔ 不是为了让测试好写）</b>：{@code claudemdEngine == null} 时
+     * {@code UserContextProvider.claudeMd()} 走「降级态单文件子集」分支 —— 该分支只看
+     * <b>扫描根</b>，<b>观测不到</b>引擎侧入参 {@code sessionProjectRoot}（AutoMem/TeamMem 基址）。
+     * 而 {@code LlmAgentLoop} 那个三元要守的恰是「<b>AutoMem 基址</b>那条腿锚稳定根」
+     * ⇒ 观测装置<b>必须</b>是引擎存在态。位置与 {@code bridge} 版 8 参/32 参兼容构造器逐位同构
+     * （{@code claudemdEngine} 在 {@code AgentLoopContext} 位置 32 = 32 参兼容构造器末位）。
+     *
+     * @param claudemdEngine claudemd 引擎（⭐ 传 spy/子类以捕获 {@code getMemoryFiles} 的第 3 实参）
+     */
+    public static AgentLoopContext agentLoopContext(
+            ToolRegistry toolRegistry,
+            LlmProviderFactory factory,
+            QueryConfig queryConfig,
+            ToolUseSummaryGenerator generator,
+            AgentLoopContext.TokenBudgetBeans tokenBudgetBeans,
+            FeatureFlags flags,
+            AgentLoopContext.EventBridge bridge,
+            com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine) {
+        return new AgentLoopContext(
+            toolRegistry, null, null, null, null, null, null, null, null,   // 1-9
+            queryConfig, factory, null, null, null, null, null, null, null, null,  // 10-19
+            flags != null ? flags : FeatureFlags.ALL_DISABLED, null, null, null, null, null,  // 20-25
+            null, tokenBudgetBeans, bridge, null, null, null, claudemdEngine);  // 26-32
+    }
+
+    /**
      * [H7-arch Phase 5-2 P3-⑤] 最小 dummy Tool · 供需要真实 buildStreamingExecutor 的测试
      * （StreamingFallbackTombstoneTest / ModelFallbackTest）在 base TUC 注入非空 availableTools。
      *

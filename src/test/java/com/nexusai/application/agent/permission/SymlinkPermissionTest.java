@@ -57,7 +57,17 @@ class SymlinkPermissionTest {
         @Override public JsonNode inputSchema() { return JSON.createObjectNode(); }
         @Override public AgentToolResult<?> execute(ToolUseBlock call) { return null; }
     }
-    /** 13 参工厂：显式 effectiveCwd（null 会被 ToolUseContext 归一为进程 CWD）。 */
+    /**
+     * 13 参工厂：显式 effectiveCwd。
+     *
+     * <p>⚠️ effectiveCwd <b>不是</b>权限链的工作目录锚（锚 =
+     * {@code CwdResolution.getOriginalCwdLayer(ctx.sessionId())}，见
+     * {@link #workingDirFailClosed_anyPathOutside}）；它只作 {@code expandPath} 的相对路径 baseDir
+     * 与规则匹配基准。传 null 时由 TUC 构造器回填 {@code CwdResolution.getCwd(sessionId)}
+     * （{@code ToolUseContext.java:451-453}）。⛔ 旧 javadoc 写「null 会被 ToolUseContext 归一为进程 CWD
+     * （:311-312）」——行号与机制<b>都不对</b>：那是<b>按会话</b>解析（会 fail-loud），只在单测
+     * sessionless 环境下才恒等于进程 {@code user.dir}。
+     */
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd) {
         return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
@@ -216,24 +226,40 @@ class SymlinkPermissionTest {
 
     @Test
     @DisplayName("工作目录判定 fail-closed：任一展开路径越界 → 不在工作目录内")
-    void workingDirFailClosed_anyPathOutside() {
+    void workingDirFailClosed_anyPathOutside(@TempDir Path outside) {
+        // ⭐ 工作目录锚 = CwdResolution.getOriginalCwdLayer(ctx.sessionId())（对齐 CC
+        //   allWorkingDirectories = getOriginalCwd()，filesystem.ts:666-674），⛔ **不是**
+        //   ctx.effectiveCwd()（后者只作 expandPath 的相对路径 baseDir / 规则匹配基准）。
+        //   单测环境该锚恒 = 归一化进程 user.dir（本 maven 模块目录）：NoDatabaseSessionProjectRootExtension
+        //   对任意 sessionId 答 sessionlessEnvironment() ⇒ 走无会话命名出口 getOriginalCwdLayerForNonSession()。
+        //   ⛔ 旧夹具把「界内」路径写成相对 target/s08-cwd-*、把「界外」也写在 target/ 下 ——
+        //   二者**都在** user.dir 锚内 ⇒ 第二条断言恒假红（夹具前提与实现不符，非实现缺陷）。
+        //   现「界内」基准直接写成 user.dir（与实现独立表述），「界外」用 @TempDir（java.io.tmpdir 之下）。
+        Path anchor = Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize();
+        // ctx.effectiveCwd() 仍传相对 target/ 路径：它不是锚，只影响 expandPath 基准；
+        // 若有人把锚改回读 effectiveCwd，则下方「界内」断言会因 effectiveCwd=target/s08-cwd-* 而反转 ⇒ 红。
         Path cwd = Paths.get("target", "s08-cwd-" + UUID.randomUUID().toString().substring(0, 8));
-        Path outside = Paths.get("target", "s08-out-" + UUID.randomUUID().toString().substring(0, 8));
         ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of()), cwd);
 
+        Path inside = anchor.resolve("s08-in-" + UUID.randomUUID().toString().substring(0, 8) + ".txt");
+        Path out = outside.resolve("s08-out-" + UUID.randomUUID().toString().substring(0, 8) + ".txt");
+        // 夹具前提自检（fail-loud）：@TempDir 必须真在锚之外，否则本用例静默失去鉴别力
+        assertThat(out.startsWith(anchor))
+            .as("夹具前提：@TempDir 路径 %s 必须在工作目录锚 %s 之外", out, anchor)
+            .isFalse();
+
         // 全部在内 → true
-        assertThat(ReadPermissionChecker.isInWorkingDir(
-            List.of(cwd.resolve("a.txt").toString()), ctx))
-            .as("全部展开路径在 cwd 内 → true")
+        assertThat(ReadPermissionChecker.isInWorkingDir(List.of(inside.toString()), ctx))
+            .as("全部展开路径在工作目录锚（单测 = 进程 user.dir）内 → true")
             .isTrue();
         // 混入越界路径 → false（CC pathsToCheck.every 语义）
         assertThat(ReadPermissionChecker.isInWorkingDir(
-            List.of(cwd.resolve("a.txt").toString(), outside.resolve("b.txt").toString()), ctx))
+            List.of(inside.toString(), out.toString()), ctx))
             .as("任一展开路径越界 → false（fail-closed）")
             .isFalse();
         // 全部越界 → false
         assertThat(ReadPermissionChecker.isInWorkingDir(
-            List.of(outside.resolve("b.txt").toString()), ctx))
+            List.of(out.toString()), ctx))
             .isFalse();
     }
 }
