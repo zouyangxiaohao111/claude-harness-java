@@ -411,6 +411,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   // 附件（A1 契约）：≤5MB 读 base64 直传（图片带预览）；>5MB multipart upload 拿 contentId
   const addFiles = (fileList: FileList | File[]) => {
     const files = Array.from(fileList)
+    // [attach] 观测入口：浏览器 drop / 原生 input / paste 通道实际拿到几个 File
+    console.warn(`[attach] addFiles 入口 files=${files.length} 明细=${files.map((f) => f.name).join(' | ')}`)
     if (files.length === 0) return
     files.forEach((f) => {
       const mediaType = f.type || 'application/octet-stream'
@@ -458,6 +460,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
 
   // Tauri：拖拽文件路径 → fs 读 → base64（≤5MB 直传）/ upload（>5MB 拿 contentId）
   const addPaths = async (paths: string[]) => {
+    // [attach] 观测入口：drop / dialog 实际交进来的 path 清单
+    console.warn(`[attach] addPaths 入口 paths=${paths.length} 明细=${paths.join(' | ')}`)
     const pending: PendingAttachment[] = []
     for (const p of paths) {
       try {
@@ -476,6 +480,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           const info = await stat(p)
           if (info.size > BASE64_LIMIT) {
             pending.push({ type, filename: name, mediaType, path: p, size: info.size })
+            console.warn(`[attach] 结局=${name} → pending（通道=path 大文件 ${info.size}B）`)
             continue
           }
         }
@@ -484,25 +489,46 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           // >5MB → multipart upload 落盘 → contentId
           // [批 3a] 同上：无会话显式拒绝，不静默丢附件归属
           if (!sessionId) {
+            // [attach] 观测：无会话时该文件被静默跳过（用户只会看到「少了几个」）
+            console.warn(`[attach] 结局=${name} → 跳过（无 sessionId，>5MB 无法 upload）`)
             showToast(`大文件需先打开一个会话再上传：${name}`, 'info')
             continue
           }
           const file = new File([bytes], name, { type: mediaType })
           const r = await uploadAttachment(file, sessionId)
           pending.push({ type, filename: name, mediaType, contentId: r.contentId, size: bytes.length })
+          console.warn(`[attach] 结局=${name} → pending（通道=upload contentId=${r.contentId} ${bytes.length}B）`)
         } else {
           const dataUrl = `data:${mediaType};base64,${u8ToBase64(bytes)}`
           pending.push({ type, filename: name, mediaType, base64: dataUrl, ...(isImage ? { preview: dataUrl } : {}), size: bytes.length })
+          console.warn(`[attach] 结局=${name} → pending（通道=base64 ${bytes.length}B）`)
         }
-      } catch {
+      } catch (err) {
+        // [attach] 观测：原实现 catch 吞掉异常对象，只弹「读取失败」—— 真因（无权限/路径不存在）零留痕
+        console.warn(`[attach] 结局=${p} → 读取失败`, err)
         showToast(`读取附件失败：${p}`, 'info')
       }
     }
+    // [attach] 观测：过滤前对 addedNamesRef 做快照 —— 下面靠它判定「丢弃是撞到已有名字还是本批内重名」
+    //   ⛔ 只读快照，不改上面 filter 的任何判定
+    const addedNamesBefore = new Set(addedNamesRef.current)
     const fresh = pending.filter((a) => {
       if (addedNamesRef.current.has(a.filename)) return false
       addedNamesRef.current.add(a.filename)
       return true
     })
+    console.warn(`[attach] 去重结果 pending=${pending.length} → fresh=${fresh.length}`)
+    // [attach] 观测：按与上面 filter **完全相同**的规则重放一遍，逐个报出被丢弃的 filename 与命中的键
+    const seenNames = new Set(addedNamesBefore)
+    for (const a of pending) {
+      if (seenNames.has(a.filename)) {
+        console.warn(`[attach] 去重丢弃 filename=${a.filename} 命中键=filename`
+          + (addedNamesBefore.has(a.filename) ? '（addedNamesRef 已有同名）' : '（本批内重名，先到先得）'))
+        continue
+      }
+      seenNames.add(a.filename)
+    }
+    console.warn(`[attach] toast 前 fresh.length=${fresh.length}`)
     if (fresh.length) {
       setAttachments((prev) => [...prev, ...fresh])
       showToast(`已添加 ${fresh.length} 个附件`, 'success')
@@ -519,7 +545,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         const paths = Array.isArray(sel) ? sel : sel ? [sel] : []
         if (paths.length) void addPaths(paths)
         return
-      } catch {
+      } catch (err) {
+        // [attach] 观测：原实现完全静默 —— dialog 不可用会静默回退原生 input，实际通道与预期不符且无痕
+        console.warn('[attach] dialog 不可用 → 回退原生 file input', err)
         /* dialog 不可用 → 回退原生 file input */
       }
     }
@@ -531,6 +559,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     if (!IS_TAURI) return
     let un: (() => void) | null = null
     void getCurrentWebview().onDragDropEvent((e) => {
+      // [attach] 观测：enter 与 drop 都带 paths（本仓已知 enter 也带）—— ⛔ 非 drop 类型同样留痕，
+      //   否则「只收到 1 个路径」到底是 drop 只给了一个、还是被中间某步丢掉，无法区分
+      const p = e.payload
+      const pathsIn = p.type === 'enter' || p.type === 'drop' ? p.paths : []
+      console.warn(`[attach] 拖拽事件 type=${p.type} paths=${pathsIn.length}`
+        + (pathsIn.length ? ` 明细=${pathsIn.join(' | ')}` : ''))
       if (e.payload.type === 'drop') void addPaths(e.payload.paths)
     }).then((u) => { un = u })
     return () => { un?.() }

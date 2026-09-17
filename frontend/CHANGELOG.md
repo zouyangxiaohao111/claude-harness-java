@@ -2,6 +2,38 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.12] - 2026-09-17
+
+### 🔍 观测：附件/拖拽链路加 `[attach]` 日志（**纯日志 · 零行为变更**）
+- **背景**：用户报告「Word/PDF 不能上传多份，现在只许一份」，且提示气泡写「已添加 **1** 个附件」。
+  该气泡由**拖拽路径**的 `addPaths` 打出（计的是**实际加进去几个**）⇒ 说明**交给前端的路径数组本身只有 1 个**。
+- **卡点**：拖拽入口 `getCurrentWebview().onDragDropEvent` → `addPaths` **此前一行日志都没有**，
+  无法区分「drop 事件只给了一个路径」与「给了 N 个但中途某步丢弃」。
+- **本次**：只在 7 个插入点加 `console.warn('[attach] …')`，**不改任何行为**：
+  ① drop 事件入口（`enter`/`drop` 都留痕 + `paths.length`）② `addPaths` 入口（`paths.length` + 明细）
+  ③ 每个文件的结局（path 大文件 / upload / base64 三通道 + 无 sessionId 跳过 + 读取失败**带真实 err**）
+  ④ 去重结果 `pending → fresh` + 逐个被丢弃的 filename 与命中键 ⑤ toast 前 `fresh.length`
+  ⑥ `addFiles` 入口（粘贴 / 原生 input 通道）⑦ `handleAddFiles` 的 `catch`（**原为完全静默**，现补真实 err）
+- ⚠️ 为什么用 `console.warn` 而非 `console.log`：`frontLog.ts` 只劫持 `error/warn/log`，且
+  `console.log` 走**关键字白名单预筛**（不命中**不上报**）⇒ 日志会静默丢失。
+- ⛔ **零行为变更已逐行核验**：git diff 仅 **36 新增行 + 2 处 `} catch {` → `} catch (err) {`**（为取到 err 所必需）；
+  控制流 / 分支条件 / toast 文案 / 去重逻辑 / 状态更新 / 返回值**零改动**。
+  验证：`tsc --noEmit` exit=0 · `npm run build` exit=0 · 构建产物中 **12 条 `[attach]` 文案齐全** ·
+  去重回放判定与原 filter 在 **1280 组用例上逐项等价**（mismatches=0）。
+- **顺带查实两件事**（均**未改**，仅登记）：① `console.debug` **根本不被劫持** ⇒ 本文件既有的
+  `[paste]` 三条诊断**从未落进任何日志文件**；② `addedNamesRef` 只在「发送/清空」时 clear，**会话切换不 clear**。
+
+### 🔴 已定位但**本版不修**的后端缺陷（下批处理）
+- **症状**：agent 正在流式输出（busy）时发送的消息会进「等候区」，而**入队时只携带 ≤5MB 的 base64 图片**，
+  PDF / Word / 其它文件被**静默丢弃**（无日志），且**两个消费点都只兜图片**。
+- **证据**：后端日志 `附件解析完成: 请求=1` 共 **9 次从无例外**；`attachments/upload` 调用 **0 次**；
+  `QUEUE busy 携附件 … images=0` 在用户会话中反复出现（该会话长期跑长任务，有一轮静默 **176 秒**）
+  ⇒ **用户几乎每条带 Word/PDF 的消息都撞上这条**。
+- **为什么不在本版修**：勘察发现推荐方案的前提**不成立** —— `MediaLimitGuard.guard(...)` 全仓
+  **只有一个调用点**（`ChatService.java:876`，空闲 HTTP 路径），两条消费路径**都不经过**；
+  且入队侧 `busyQueuedImageAttachments` 与 drain 侧 `hasBase64ImageAttachments` 是**同一组三个条件**
+  ⇒ **只改一侧 = 行为零变化**（会"宣称修好实际没变"）。⇒ 需按 CC 真实设计重做，留待下批。
+
 ## [0.1.11] - 2026-09-17
 
 ### 🔴 修复：装了新版本仍一直提示「有新版本」
