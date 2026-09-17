@@ -55,18 +55,60 @@ class R32B9_HookAllowToProviderIntegrationTest {
             String acceptFeedback, List<JsonNode> contentBlocks, List<String> imagePasteIds) {
         try {
             Class<?> toolResultClass = Class.forName("com.nexusai.application.agent.tool.ToolResult");
-            // [A1 泛型化] ToolResult<T> 的 3 参构造器 (toolUseId, data, isError) 擦除后为
-            //   (String, Object, boolean) — 反射第二参必须用 Object.class, 不能用 String.class.
-            Object toolResult = toolResultClass.getConstructor(String.class, Object.class, boolean.class)
-                .newInstance(toolUseId, resultContent, false);
+            // [I3 修红 · 判据 = 测试错（签名过期），非实现错]
+            //   老 3 参构造器 `(toolUseId, data, isError)` **已删除**：实测 `ToolResult` 现为
+            //   **4 字段 record** `(data, newMessages, contextModifier, mcpMeta)`
+            //   （`ToolResult.java:64-69`，javadoc 逐字标注 CC original Tool.ts:322-335 = 「对齐 CC
+            //   ToolResult 4 字段契约」），且 `grep -c "public ToolResult(" ToolResult.java` = **0**
+            //   ⇒ 无任何显式构造器 ⇒ 老 3 参 ctor 结构性不存在。
+            //   ⇒ 改用**生产工厂** `ToolResult.success(toolUseId, data)`（其第三语义 `isError=false`
+            //   与老 ctor 第三实参 `false` 逐字同义；工厂内部 `new ToolResult<>(data, null, null, null)`）。
+            //   ⛔ 未放宽断言：本 helper 的产物仍是「一个承载 data 的 ToolResult」，下游
+            //   `toolResultMessage(result, acceptFeedback, contentBlocks, imagePasteIds)`（4 参重载
+            //   `LlmAgentLoop:14058-14062` **仍存在**）与各断言（content/acceptFeedback/…）一律未改。
+            Object toolResult = com.nexusai.application.agent.tool.ToolResult.success(toolUseId, resultContent);
+            // [I3 修红 · 判据续] **必须调 8 参重载**（`LlmAgentLoop:13928-13935`）：同一「组 2-1」重构
+            //   把 `toolUseId`/`isError` 从 `ToolResult` 字段改为 mapper 的**显式形参** ——
+            //   `LlmAgentLoop` javadoc 逐字：「[IMP-C2] toolUseId/isError 参数透传（组 2-1 拍板）:
+            //   ToolResult 已删除 toolUseId/isError 字段（对齐 CC ToolResult 4 字段契约），本 mapper
+            //   显式接收二者。toolUseId 由调用方从调用块（ToolUseBlock#id()）推导」。
+            //   ⛔ 若沿用原 4 参重载（`result, acceptFeedback, contentBlocks, imagePasteIds`），
+            //   toolCallId 恒 null ⇒ 工具消息**无法配对**：Anthropic 侧该消息被跳过
+            //   （`AnthropicSdkProvider:2196-2197` toolCallId null/blank → continue）/ OpenAI 侧角色错位
+            //   ⇒ 下游 3 条 payload 断言全假（本轮实测：`hasImage=false` / `role expected tool but user`）。
             Method m = LlmAgentLoop.class.getDeclaredMethod(
                 "toolResultMessage",
-                toolResultClass, String.class, List.class, List.class);
+                toolResultClass, String.class, boolean.class,
+                com.nexusai.application.agent.tool.Tool.class,
+                String.class, String.class, List.class, List.class, java.util.Map.class);
             m.setAccessible(true);
-            return (ChatMessageDto) m.invoke(null, toolResult, acceptFeedback, contentBlocks, imagePasteIds);
+            return (ChatMessageDto) m.invoke(null, toolResult, toolUseId, false, null,
+                null, acceptFeedback, contentBlocks, imagePasteIds, java.util.Map.of());
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * [I3 修红 · 生产形状配对夹具] assistant(tool_use id={@code toolUseId})。
+     *
+     * <p><b>WHY 必需（判据 = 测试错：夹具非生产形状）</b>：provider 出站前会跑
+     * {@code ToolResultPairingRepair.ensureToolResultPairing}（对齐 CC {@code ensureToolResultPairing}）。
+     * 对**孤立** {@code Role.tool} 结果（无前置 assistant {@code tool_use}），其处置是
+     * <b>替换为 synthetic user 占位</b>（`ToolResultPairingRepair:131-141`，注释逐字
+     * 「载荷必须仍以 user 开头（Anthropic "first message must use the user role"）」）——
+     * 于是：① OpenAI 侧该消息 role 变 {@code user}；② Anthropic 侧 {@code content} 退化为字符串
+     * ⇒ 两个 provider 的 payload 断言全假。生产里 tool 结果**必然**有配对的前置 assistant tool_use
+     * ⇒ 夹具补前置 assistant 后，tool 结果消息落在 {@code messages[1]}（其前置为 {@code messages[0]}）。
+     * ⛔ 观测面与断言一律未改，仅补齐缺失的生产前提 + 随之修正**消息下标**（0→1）。
+     */
+    private static ChatMessageDto assistantWithToolUse(String toolUseId) {
+        return new ChatMessageDto(
+            "a-" + toolUseId, null, Role.assistant, "assistant", "", null,
+            List.of(new com.nexusai.model.session.dto.ToolCallDto(toolUseId, "Bash", "{}", null, null)),
+            com.nexusai.model.session.dto.FinishReason.tool_calls,
+            null, null, null, OffsetDateTime.now(), null, null,
+            null, List.of(), List.of());
     }
 
     private static JsonNode invokeBuildRequestBodyAnthropic(List<ChatMessageDto> history) throws Exception {
@@ -125,8 +167,10 @@ class R32B9_HookAllowToProviderIntegrationTest {
         assertThat(toolMsg.contentBlocks()).hasSize(2);
 
         // Step 4: AnthropicSdkProvider buildMessageParams
-        JsonNode body = invokeBuildRequestBodyAnthropic(List.of(toolMsg));
-        JsonNode userMsg = body.get("messages").get(0);
+        // [I3] 配对夹具（见 assistantWithToolUse javadoc）⇒ tool_result 消息 = messages[1]
+        JsonNode body = invokeBuildRequestBodyAnthropic(
+            List.of(assistantWithToolUse("tool-call-1"), toolMsg));
+        JsonNode userMsg = body.get("messages").get(1);
         assertThat(userMsg.get("role").asText()).isEqualTo("user");
 
         JsonNode content = userMsg.get("content");
@@ -172,8 +216,9 @@ class R32B9_HookAllowToProviderIntegrationTest {
             event.getAcceptFeedback(), event.getContentBlocks(), List.of("3"));
 
         // Step 4: OpenAiSdkProvider payload
-        JsonNode body = invokeBuildRequestBodyOpenAi(List.of(toolMsg));
-        JsonNode toolMsgNode = body.get(0);
+        // [I3] 配对夹具（见 assistantWithToolUse javadoc）⇒ tool 消息 = body[1]
+        JsonNode body = invokeBuildRequestBodyOpenAi(List.of(assistantWithToolUse("call-2"), toolMsg));
+        JsonNode toolMsgNode = body.get(1);
         assertThat(toolMsgNode.get("role").asText()).isEqualTo("tool");
         assertThat(toolMsgNode.get("tool_call_id").asText()).isEqualTo("call-2");
 
@@ -239,8 +284,10 @@ class R32B9_HookAllowToProviderIntegrationTest {
         assertThat(toolMsg.acceptFeedback()).isEqualTo("用户反馈文本");
         assertThat(toolMsg.contentBlocks()).isNull();
 
-        JsonNode body = invokeBuildRequestBodyAnthropic(List.of(toolMsg));
-        JsonNode content = body.get("messages").get(0).get("content");
+        // [I3] 配对夹具（见 assistantWithToolUse javadoc）⇒ tool_result 消息 = messages[1]
+        JsonNode body = invokeBuildRequestBodyAnthropic(
+            List.of(assistantWithToolUse("call-fb"), toolMsg));
+        JsonNode content = body.get("messages").get(1).get("content");
         // tool_result 块 + 独立 feedback text block 在 user message content array
         boolean foundFeedbackBlock = false;
         for (JsonNode block : content) {

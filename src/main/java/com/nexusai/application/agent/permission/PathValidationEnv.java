@@ -66,7 +66,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * 非 Spring 测试可经 {@code new PathValidationEnv(...)} 直接构造任意前缀验证分支逻辑。
  *
  * @param sessionProjectRoot [批 E2] 会话<b>稳定项目根</b>（raw，未派生；对齐 CC {@code getProjectRoot()}
- *        bootstrap/state.ts:498-508）。{@link #sessionMemoryDir()} / {@link #projectDir()} 的 slug 由
+ *        bootstrap/state.ts:498-508）。{@link #sessionMemoryDirs()} / {@link #projectSlugs()} 的 slug 由
  *        它派生，<b>必须与落盘介质同源</b>：介质链实测 =
  *        {@code SessionMemoryService.resolvePath}（SessionMemoryService.java:2272-2283）
  *        → {@code SessionStorage.sessionProjectDir(sessionId)}（SessionStorage.java:187-189）
@@ -76,6 +76,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *        {@link #originalCwd}（= CC {@code getOriginalCwd()}，{@code EnterWorktreeTool} 会重锚）——
  *        二者与 slug 不同源，进 worktree / cd 后分裂（CC gh-30217 同型）。
  *        null/空白（无会话 / 介质侧解析不出来）⇒ 上述两分支 fail-closed 不命中。
+ *
+ *        <p>⚠️ <b>[I4 悬空链接修复]</b> 原文引用 {@code #sessionMemoryDir()} / {@code #projectDir()}，二者均
+ *        <b>已随批 E2「假门改真门」删除</b>（E2 实测：{@code sessionMemoryDir()} 指向的
+ *        {@code {configHome}/session-memory/} 目录<b>不存在</b>（0 文件）⇒ 对真实文件结构性从不命中 = 假门；
+ *        {@code projectDir()} 返回<b>整个</b> {@code {configHome}/projects/} 根（实测 <b>662</b> 个 slug）⇒
+ *        模型可静默读任意项目/任意会话）。其真实替代物 = {@link #sessionMemoryDirs()}（按
+ *        {@code projects/{slug}/{sessionId}/session-memory/} 派生）与 {@link #projectSlugs()}（「两半」
+ *        slug 集：cwd 半 ∪ 稳定根半）⇒ 按「指向正确目标」处置，⛔ 非简单降级为 {@code}。
  */
 public record PathValidationEnv(
         String sessionId,
@@ -119,7 +127,9 @@ public record PathValidationEnv(
             ctx.sessionId() == null ? null : ctx.sessionId());
         // [批 E2] 稳定项目根走统一入口 CwdResolution.getProjectRoot（对齐 CC getProjectRoot state.ts:498-508），
         //   与 SessionStorage.sessionProjectRoot / sessionProjectDir（介质侧写盘锚）同源 ⇒
-        //   sessionMemoryDir()/projectDir() 的 slug 与真实落盘目录一致。解析不出来 ⇒ null（fail-closed）。
+        //   sessionMemoryDirs()/projectSlugs() 的 slug 与真实落盘目录一致（[I4] 原注释写的是已随 E2
+        //   删除的 sessionMemoryDir()/projectDir()，此处按真实成员更正，语义不变）。
+        //   解析不出来 ⇒ null（fail-closed）。
         String sessionProjectRoot = resolveSessionProjectRootOrNull(ctx.sessionId());
         return new PathValidationEnv(
             ctx.sessionId() == null ? null : ctx.sessionId(),
@@ -189,7 +199,7 @@ public record PathValidationEnv(
             cwd == null ? null : cwd.toAbsolutePath().normalize().toString(),
             originalCwd,
             // [批 E2] forProcess 结构性无会话槽（record sessionId=null）⇒ 无稳定项目根可解析
-            //   ⇒ null（sessionMemoryDir()/projectDir() fail-closed 不命中，兑现本方法 javadoc
+            //   ⇒ null（sessionMemoryDirs()/projectSlugs() fail-closed 不命中，兑现本方法 javadoc
             //   已有的「会话级白名单分支不命中」承诺；⛔ 不回落 user.dir 冒充项目根）。
             null,
             ClaudePaths.getClaudeConfigHomeDir(),

@@ -11,6 +11,7 @@ import com.nexusai.application.agent.permission.PermissionRuleSource;
 import com.nexusai.application.agent.permission.PermissionRuleValue;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.tool.AgentToolResult;
+import com.nexusai.application.agent.tool.ShellError;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -232,7 +233,10 @@ public class PromptShellExecutor {
                 }
                 // (c) 失败 → ShellError 等价（CC BashTool.call 非 0 退出码 throw ShellError，
                 //     Java BashTool 返回 ToolResult.error；interrupted 特判 :169-172）
-                if (com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(toolResult.data())) {
+                // [I1 修红 · 判据见方法 javadoc] 旧门 = 仅 `isToolErrorData`（**前缀白名单**）⇒ 对
+                //   shell 路径的真实形状（`"interrupted"`（BashTool:1621）/ `…\nExit code N`
+                //   （BashTool:1930/2649 · IMP-C2 R2 约定））**恒 false** ⇒ 本分支不可达（H3 已证）。
+                if (isShellFailureResult(toolResult.data())) {
                     String data = toolResult.data() == null ? "" : toolResult.data();
                     throw new ShellCommandFailedException("", data, "interrupted".equals(data.trim()));
                 }
@@ -241,6 +245,17 @@ public class PromptShellExecutor {
                 //     PowerShell $env:PATH / $$）按字面插入（CC :127-131 注释）。
                 String output = formatBashOutput(toolResult.data(), "", false);
                 result = replaceOnce(result, match.fullMatch(), output);
+            } catch (ShellError e) {
+                // [I1 修红 · CC 主分派] CC formatBashError 以 `e instanceof ShellError` 分派
+                //   （promptShellExecution.ts:167-183）；本仓真实失败同样 `throw new ShellError(...)`
+                //   （BashTool:1509-1517，与 CC BashTool.tsx:714-718 同）—— 但本类此前**没有**
+                //   `catch (ShellError)`，真实 ShellError 落入下方 `catch (Exception)` ⇒ 产出
+                //   `[Error]\n…`，**永远走不到 CC 的 `Shell command failed for pattern "…": …`
+                //   / `interrupted` 分支** ⇒ 此处补 CC 主分派（复用同一 formatBashError 构建点，
+                //   避免第二套文案）。
+                throw formatBashError(
+                    new ShellCommandFailedException(e.stdout(), e.stderr(), e.interrupted()),
+                    match.fullMatch());
             } catch (MalformedCommandException e) {
                 throw e;   // CC :133-134 rethrow —— 权限/注入失败 fail-loud 上抛
             } catch (ShellCommandFailedException e) {
@@ -421,6 +436,58 @@ public class PromptShellExecutor {
             parts.add(inline ? "[stderr: " + stderr.trim() + "]" : "[stderr]\n" + stderr.trim());
         }
         return String.join(inline ? " " : "\n", parts);
+    }
+
+    /**
+     * shell 失败标记 · {@code (?i)} 行首（或串首）的 {@code exit code <N>}。
+     *
+     * <p><b>[I1 · 来源 = 本仓 IMP-C2 R2 约定]</b>：{@code ShellError} javadoc 逐字
+     * 「Bash/PowerShell 工具族当前经 ToolResult.error(data 文本) 表达 shell 失败（IMP-C2 R2
+     * 「\n Exit code N」标记）」；实测生产写入形态：
+     * <ul>
+     *   <li>{@code BashTool:2653} {@code result + "\nExit code " + exitCode}</li>
+     *   <li>{@code BashTool:1930} {@code "sed: …" + "\nExit code 1"}</li>
+     * </ul>
+     * ⛔ 锚定**行首**（非「任意位置 contains」）以压低假阳性：输出正文里偶然出现 "exit code 3"
+     * 不会误判，只有作为标记行出现才判失败。
+     */
+    private static final Pattern SHELL_EXIT_CODE_MARKER =
+            Pattern.compile("(?im)^[ \\t]*exit code \\d+[ \\t]*$");
+
+    /**
+     * 判定 runner 返回的 {@code ToolResult} 是否代表 shell 执行失败（{@code ShellError} 等价位）。
+     *
+     * <p><b>[I1 修红 · 为什么必须改判据]</b>：{@code AgentToolResult}/{@code ToolResult} 是
+     * <b>4 字段 record（data/newMessages/contextModifier/mcpMeta），⛔ 无 isError 标志</b>
+     * （`AgentToolResult.java:30-48` 实测；CC 侧 error-ness 也在 content block 的 `is_error`，
+     * 不在 result 对象）⇒ 返回值侧的失败**只能**由 data 内容判定。旧实现只用
+     * {@code LlmAgentLoop.isToolErrorData}（**前缀白名单**：`"Error:"`/`"File does not exist"`/…），
+     * 而 shell 路径的真实失败形状**都不以白名单前缀开头** ⇒ (c) 分支对其自身注释所述场景
+     * （「Java BashTool 返回 ToolResult.error」）**结构性不可达** —— 连其下一行特判的
+     * {@code "interrupted"}（{@code BashTool:1621} 的真实生产值）也被前置门挡住。
+     *
+     * <p>本判据 = **三种真实形状的并集**（⛔ 不删 {@code isToolErrorData} 这一支，保持
+     * Edit/Write/MCP/WebFetch 等其它族的既有行为不变）：
+     * <ol>
+     *   <li>{@code "interrupted"}（trim 后精确匹配）—— {@code BashTool:1621} 真实返回值；</li>
+     *   <li>行首 {@code exit code <N>} 标记 —— IMP-C2 R2 约定（见 {@link #SHELL_EXIT_CODE_MARKER}）；</li>
+     *   <li>{@link com.nexusai.application.agent.LlmAgentLoop#isToolErrorData(Object)}（既有前缀族）。</li>
+     * </ol>
+     *
+     * @param data runner 返回结果的 data（可 null）
+     * @return true = 视为执行失败 → 走 CC {@code formatBashError} ShellError 分支
+     */
+    private static boolean isShellFailureResult(String data) {
+        if (data == null || data.isEmpty()) {
+            return false;
+        }
+        if ("interrupted".equals(data.trim())) {
+            return true;
+        }
+        if (SHELL_EXIT_CODE_MARKER.matcher(data).find()) {
+            return true;
+        }
+        return com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(data);
     }
 
     /**

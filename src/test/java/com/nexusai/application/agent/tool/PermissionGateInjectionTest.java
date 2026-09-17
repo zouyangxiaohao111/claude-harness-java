@@ -489,11 +489,21 @@ class PermissionGateInjectionTest {
         assertThat(source)
             .as("SubagentExecutor 必须构造 SubagentLoopDeps（isMainLoop=false）· P3-③ 持 AgentLoopContext（factory.shared(会话 projectRoot)）")
             .contains("new com.nexusai.application.agent.loop.SubagentLoopDeps(")
-            // [TL-W3 Phase A] 断言随实现收口更新：原 currentSessionProjectRoot() —— 上游回放核验后
-            //   确认 not covered（teammate 裸线程 / HOOK_EXECUTOR 无回放调度线程）⇒ 改 orNull 变体：
-            //   无会话上下文返回 null（shared(null) 走既有「无会话上下文」分支），绝不回落 config home
-            //   冒充项目根。断言意图（factory.shared 传会话 projectRoot · 非自建 carrier）不变。
-            .contains("contextFactory.shared(AutoMemPaths.currentSessionProjectRootOrNull())");
+            // [I3 修红 · 判据 = 测试错（源级锚点**第二次**过期），非实现错]
+            //   ⚠️ 本条锚点已被**两次**收口改写（上一次见下方 TL-W3 注记）：
+            //   ① 原 `AutoMemPaths.currentSessionProjectRoot()` →（TL-W3 Phase A）→ `…OrNull()` 变体；
+            //   ② 批 4b-1（删 `AutoMemPaths.CURRENT_PROJECT_ROOT` ThreadLocal 载体）后，
+            //      实现改为**按本子代理会话 id 查冻结表**（`SubagentExecutor:4565-4567`）：
+            //        `contextFactory.shared(subagentCtx != null && subagentCtx.sessionId() != null
+            //             ? com.nexusai.common.SessionProjectRoot.getForSession(subagentCtx.sessionId().toString()) : …)`
+            //      —— 该点注释逐字「原接线 AutoMemPaths.currentSessionProjectRootOrNull()（ThreadLocal
+            //      载体已删 ⇒ 恒 null）→ 改按本子代理会话 id 查冻结表（用户铁律：直传或按 sessionId 查；
+            //      ⛔ 不回落 config home）」。
+            //   ⇒ 锚点更新为「调用仍在 + 会话 projectRoot 的唯一合法来源（按 sessionId 查冻结表）」。
+            //   ⛔ 断言意图（factory.shared 传**会话 projectRoot** · 非自建 carrier）不变、未放宽：
+            //      由「1 条全字面量锚」改为「2 条约定锚」（调用点 + 来源单点，后者全仓仅 1 处出现）。
+            .contains("contextFactory.shared(")
+            .contains("com.nexusai.common.SessionProjectRoot.getForSession(");
         assertThat(source)
             .as("SubagentExecutor 必须用 base TUC withAvailableTools(effectiveTools)（D7 工具隔离）")
             // IMP-SUB-19 #23: create() 直接返回 ToolUseContext，不再经 toolUseContext() 解包装。

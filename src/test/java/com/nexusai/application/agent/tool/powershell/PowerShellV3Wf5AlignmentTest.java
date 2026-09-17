@@ -423,8 +423,15 @@ class PowerShellV3Wf5AlignmentTest {
             List.of("/etc/hosts"), List.of());
         PowerShellAstService.ParsedResult parsed = withRedirections(setContent, "Set-Content file.txt",
             List.of(new PowerShellAstService.Redirection("/etc/hosts", false)));
+        // [I5 修夹具 · 前缀语义] 规则模式必须写 **`//etc/**`**（双斜杠），⛔ 不是 `/etc/**`：
+        //   CC patternWithRoot 注释逐字「Patterns starting with **/** resolve relative to the directory
+        //   where settings are stored (without .claude/)」⇒ **单 `/` = 设置/项目根，仅 `//` = 文件系统根**；
+        //   本仓 RuleQuery.matchesPathRuleRootRelative 语义一致。本用例目标 `/etc/hosts` 是**绝对路径**
+        //   ⇒ 单斜杠模式会被解析成 `<cwd>/etc/**`（cwd=C:/work/project）⇒ 不匹配 ⇒ 落 Ask。
+        //   ⚠️ 原夹具用单斜杠 ⇒ 该用例期望 Deny 但实得 Ask，且 **CC 在同样夹具下也是 Ask**（本仓无缺陷）。
+        //   本改动**只修前缀**，用例意图（deny 规则命中 ⇒ 拒绝）不变。
         PermissionRule denyRule = new PermissionRule(PermissionRuleSource.SESSION, PermissionBehavior.DENY,
-            new PermissionRuleValue("Edit", "/etc/**"));
+            new PermissionRuleValue("Edit", "//etc/**"));
         java.util.Map<PermissionRuleSource, java.util.Set<PermissionRule>> deny = new java.util.HashMap<>();
         deny.computeIfAbsent(PermissionRuleSource.SESSION, k -> new java.util.HashSet<>()).add(denyRule);
         ToolPermissionContext permCtx = new ToolPermissionContext(PermissionMode.DEFAULT,

@@ -2,6 +2,7 @@ package com.nexusai.application.agent.skill;
 
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionPipeline;
+import com.nexusai.application.agent.tool.ShellError;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.BashTool;
@@ -205,6 +206,45 @@ class PromptShellExecutorTest {
     // ════════════════════════════════════════════════════════════════════════
     // ⑤ formatBashOutput / formatBashError 文案（CC :145-183）
     // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[I1] runner **抛 ShellError** → 走 CC formatBashError 的 `e instanceof ShellError` 主分派（Shell command failed + [stderr]）")
+    void shellErrorThrown_routedToCcShellErrorBranch() {
+        // WHY（[I1]）：CC promptShellExecution.ts:167-183 以 `e instanceof ShellError` 分派；真实失败在
+        //   BashTool 侧就是 `throw new ShellError(...)`（BashTool.tsx:714-718 / Java BashTool:1509-1517）
+        //   —— 修复前本类**没有** catch(ShellError) ⇒ 落入 `catch (Exception)` ⇒ 产出 `[Error]\n…`
+        //   （CLI 文案与 CC 背离）。本用例锁定新补的 CC 主分派。
+        PromptShellExecutor executor = new PromptShellExecutor();
+        executor.setPermissionChecker(fakeChecker(true));
+        executor.setCommandRunner(cmd -> {
+            throw new ShellError("", "boom\nExit code 2", 2, false);
+        });
+
+        assertThatThrownBy(() -> executor.executeShellCommandsInPrompt(
+                "!`bad cmd`", ctx(), "/skill", null, null))
+            .isInstanceOf(MalformedCommandException.class)
+            .hasMessageContaining("Shell command failed for pattern \"!`bad cmd`\"")
+            .hasMessageContaining("[stderr]")
+            .hasMessageContaining("boom");
+    }
+
+    @Test
+    @DisplayName("[I1] runner 抛 ShellError(interrupted=true) → CC `Shell command interrupted … [Command interrupted]`")
+    void shellErrorThrownInterrupted_routedToCcInterruptedMessage() {
+        // WHY（[I1]）：CC 该分支由 `throw new ShellError(..., interrupted=true)` 驱动（BashTool.tsx:714-718
+        //   在 signal.reason !== 'interrupt' 的超时/强杀路径触发）⇒ 锁定 interrupted 文案可达。
+        PromptShellExecutor executor = new PromptShellExecutor();
+        executor.setPermissionChecker(fakeChecker(true));
+        executor.setCommandRunner(cmd -> {
+            throw new ShellError("", "", 130, true);
+        });
+
+        assertThatThrownBy(() -> executor.executeShellCommandsInPrompt(
+                "!`sleep 100`", ctx(), "/skill", null, null))
+            .isInstanceOf(MalformedCommandException.class)
+            .hasMessageContaining(
+                "Shell command interrupted for pattern \"!`sleep 100`\": [Command interrupted]");
+    }
 
     @Test
     @DisplayName("formatBashOutput 文案: stdout / [stderr] 块 / inline（CC :145-165）")

@@ -36,8 +36,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>配置根 seam（2026-09-16 修正）</b>：session-memory 与 plans 的<b>白名单基址</b>是
  * nexusai 自有根 {@code NexusaiPaths.getAppConfigHomeDir()}（{@code ~/.{appName}} = {@code ~/.nexusai}）
- * —— 见 {@link PathValidationEnv#sessionMemoryDir()}（{@code Path.of(nexusaiConfigHomeDir,
- * "session-memory")}）与 {@link PathValidationEnv#plansPrefix()}。{@link PathValidationEnv}
+ * —— 见 {@link PathValidationEnv#sessionMemoryDirs()}（[I4 悬空链接修复] 原引用单数
+ * {@code sessionMemoryDir()}，该**假门**已随批 E2 删除；真实派生 = {@code Path.of(nexusaiConfigHomeDir,
+ * "projects", slug, sessionId, "session-memory")}，即按会话+项目 slug 定位，⛔ 不再是
+ * {@code Path.of(nexusaiConfigHomeDir, "session-memory")}）与 {@link PathValidationEnv#plansPrefix()}。{@link PathValidationEnv}
  * 的 {@code claudeConfigHomeDir}（{@code ~/.claude}）只是只读兼容根（D3/D4 读取回落源），
  * <b>不</b>参与这两个分支。
  * ⛔ 旧测试覆写的是 {@link ClaudePaths#setConfigDirOverride}（另一个根）⇒ 白名单基址仍指向真实

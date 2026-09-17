@@ -134,7 +134,12 @@ class BashToolTest {
     void prompt_defaultAttributionAndTrailingSpacePreserved() {
         String p = bashTool.prompt();
         assertThat(p).contains("Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>");
-        assertThat(p).contains("🤖 Generated with [Claude Code](https://claude.com/claude-code)");
+        // [I2 修红 · 品牌族（H2 同源）] 期望串随产品改名收敛：CC 原文为
+        //   `🤖 Generated with [Claude Code](https://claude.com/claude-code)`；本仓生产已改为
+        //   **`🤖 Generated with [NexusAI]`**（`BashToolPrompt:139-140` `defaultTexts()`，⛔ 无 URL
+        //   —— claude.com 链接随品牌一并去除）。新值为**实测**（本轮从 `bashTool.prompt()` 实际输出
+        //   逐字取得），断言形状（contains）与意图（默认归因段存在）不变。
+        assertThat(p).contains("🤖 Generated with [NexusAI]");
         // CC prompt.ts:89 行尾空格（text block 会剥，{{TRAIL}} 运行时补）保真
         assertThat(p).contains("given direct instructions \n");
     }
