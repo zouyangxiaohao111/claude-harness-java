@@ -6,6 +6,8 @@ import { subagentColor } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
+// [OBS2] 渲染错误边界（防御性兜底）：见下方「消息区整层」与「逐行」两处包裹
+import { ErrorBoundary } from '@/components/common/ErrorBoundary'
 
 // @引用 token（@"引号路径" 或 @路径 · 遇空白/中文标点/右括号/引号结束）
 const AT_MENTION_RE = /@"[^"]+"|@[^\s，。、；：（()）“”"'#]+/g
@@ -983,6 +985,15 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
   return (
     <>
     <div className="stream-inner" ref={streamWrapRef}>
+      {/* [OBS2] 消息区整层边界：兜住「按 flow 组装本区域的 JSX 本身出错」这类容器级异常
+          （行级边界在下面 flatRows.map 里，管「某一条消息毒」）。两层都渲染不出额外 DOM（无错时
+          边界直接返回 children），所以既不改变布局也不影响 streamWrapRef 的滚动绑定。
+          ⛔ 防御性兜底，不是本批根因修复（根因是 STOMP 通道无心跳、半开连接不可察）。 */}
+      <ErrorBoundary
+        tag="MessageList.area"
+        title="消息区显示出错了"
+        hint="输入框仍可使用。点「重试」重新渲染消息区。"
+      >
       {/* 对话裁剪 hover 按钮样式（组件内联 · 对齐 CommandPalette 先例）；确认弹窗已并入 DialogOpsModal 裁剪 tab */}
       <style>{`
         .msg-hover-actions {
@@ -1159,22 +1170,37 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
       {/* 按 userMessageId 分组渲染（消息链锚定 · 对齐 GET /messages 后端出站链）：
           每组 = 一个 flow（user 消息 + 其 assistant/工具流），工具轮挂主气泡下；排队场景顺序正确 */}
       {flatRows.map((row) => {
+        // [OBS2] 每一行单独包一层错误边界：React 18+ 未捕获的渲染错误会卸载**整棵**子树，
+        //   即「一条消息毒」会带走整个消息列表。逐行隔开后，坏的那条只挂自己那一行。
+        //   ⛔ 只加这一层壳，不动行内渲染逻辑。
         if (row.kind === 'msg') {
-          return <MemoMessage key={row.key} msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile} />
+          return (
+            <ErrorBoundary key={row.key} tag="MessageList.row.msg" compact
+              title="这条消息显示失败" hint="其余内容不受影响。">
+              <MemoMessage msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile} />
+            </ErrorBoundary>
+          )
         }
         if (row.kind === 'err') {
-          return <ApiErrorCard key={row.key} err={row.err} />
+          return (
+            <ErrorBoundary key={row.key} tag="MessageList.row.err" compact
+              title="这条错误提示显示失败" hint="其余内容不受影响。">
+              <ApiErrorCard err={row.err} />
+            </ErrorBoundary>
+          )
         }
         // [流式性能] 流式块行 → 独立 memo 组件（只订自己块对象）。父级只给稳定 key(sid, blockId)，
         //   content 推进只让目标行重渲；末块行带 'streaming' 尾态 class（同旧逻辑）。
         return (
-          <StreamBlockRow
-            key={row.key}
-            sessionId={row.sid}
-            blockId={row.blockId}
-            isStreamingTail={row.blockId === lastStreamId}
-            onRunHtml={openHtmlPreview}
-          />
+          <ErrorBoundary key={row.key} tag="MessageList.row.stream" compact
+            title="这段回复显示失败" hint="其余内容不受影响，可点「重试」重新渲染。">
+            <StreamBlockRow
+              sessionId={row.sid}
+              blockId={row.blockId}
+              isStreamingTail={row.blockId === lastStreamId}
+              onRunHtml={openHtmlPreview}
+            />
+          </ErrorBoundary>
         )
       })}
       {/* 无 flow 锚定的错误（userMessageId/assistantMessageId 均缺失）→ 兜底渲染在末尾 */}
@@ -1194,6 +1220,7 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
           </div>
         </div>
       )}
+      </ErrorBoundary>
     </div>
     </>
   )

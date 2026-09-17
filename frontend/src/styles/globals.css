@@ -9966,3 +9966,14 @@ html {
 .ml-load-older{display:block;margin:2px auto 12px;padding:5px 16px;font-size:12px;color:var(--ink-muted,#888);background:transparent;border:1px solid var(--hairline,#e5e5e5);border-radius:999px;cursor:pointer;transition:all .12s}
 .ml-load-older:hover{color:var(--ink);background:rgba(0,0,0,.04);border-color:#d0d0d5}
 .ml-load-older:disabled{opacity:.5;cursor:default}
+/* [OBS2] 渲染错误边界兜底 UI（components/common/ErrorBoundary.tsx）：顶层整页用默认版，
+   消息区每行用 .compact 紧凑版（一条坏消息只占一行，不撑满整屏）。
+   文案只向用户说明现象 + 提供「重试」出路，不出现任何内部术语。 */
+.err-boundary{margin:8px 0;padding:10px 14px;font-size:13px;color:var(--ink,#222);background:rgba(220,60,60,.05);border:1px solid rgba(220,60,60,.28);border-radius:10px}
+.err-boundary-title{font-weight:600}
+.err-boundary-hint{margin-top:4px;font-size:12px;color:var(--ink-muted,#888)}
+.err-boundary-retry{margin-top:8px;padding:4px 14px;font-size:12px;color:var(--ink,#222);background:transparent;border:1px solid var(--hairline,#e5e5e5);border-radius:999px;cursor:pointer;transition:all .12s}
+.err-boundary-retry:hover{background:rgba(0,0,0,.04);border-color:#d0d0d5}
+.err-boundary.compact{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px}
+.err-boundary.compact .err-boundary-hint{margin-top:0}
+.err-boundary.compact .err-boundary-retry{margin-top:0;margin-left:auto}

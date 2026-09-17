@@ -36,7 +36,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 @ContextConfiguration(classes = {
     WebSocketConfig.class,
     BrowserWebSocketConfig.class,
-    BrowserWsChannel.class
+    BrowserWsChannel.class,
+    // [OBS2] WebSocketConfig 构造器新增了出站投递观测组件（clientOutboundChannel 拦截器）→ 本轻量上下文
+    //   必须一并装配，否则配置类无法实例化（新增依赖，不是本测试语义变更）。
+    WebSocketDeliveryDiagnostics.class
 })
 @DisplayName("浏览器扩展 WS 端点与既有 STOMP 端点共存（@EnableWebSocket + @EnableWebSocketMessageBroker）")
 class BrowserWebSocketConfigContextTest {

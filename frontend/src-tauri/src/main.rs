@@ -9,6 +9,8 @@ use tauri::{Emitter, Manager};
 mod backend;
 /// 自动更新（多源 latest.json 检查 / 下载 sha256 / NSIS 安装）。
 mod updater;
+/// 前端日志 / 心跳落盘（OBS1）：前端错误与每 10s 心跳经 IPC 落到 `{data_dir}/logs/frontend.log`。
+mod frontlog;
 
 /// 本会话由 Tauri 壳自启的后端 java 进程 pid。
 /// None = 启动时 3458 已有外部后端在跑（复用）或尚未自启 —— 此时关窗不回收外部进程。
@@ -255,7 +257,9 @@ fn main() {
             updater::app_version,
             updater::update_check,
             updater::update_download,
-            updater::update_install
+            updater::update_install,
+            frontlog::frontend_log,
+            frontlog::frontend_heartbeat
         ])
         .setup(|app| {
             // ===== 启动期小窗（承载 loader）+ 就绪放大交给前端 =====

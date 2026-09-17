@@ -208,7 +208,7 @@ pub fn log_launcher(msg: &str) {
 /// 无第三方依赖的 UTC 时间戳 `YYYY-MM-DD HH:MM:SS`（避免仅为日志引入 chrono / time）。
 /// 采用 Howard Hinnant `civil_from_days`：由 Unix 纪元秒换算公历年月日；
 /// 当前时间恒为 1970 年后的正秒，故只实现正数分支。
-fn utc_timestamp() -> String {
+pub(crate) fn utc_timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -11,6 +11,7 @@ import { useTeamStore } from '../stores/teamStore'
 import { useTodoStore } from '../stores/todoStore'
 import { teamsApi } from '../api/teams'
 import { EMPTY_COMPACT_TABLE, dropCompactSession, isCompactCanceled, reduceCompactTable, type CompactProgressWire, type CompactTable } from '../utils/compactProgress'
+import { noteInboundFrame } from '../utils/inboundFrameStats'
 
 /** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
  *  notifier.markFrameDirty：N 次 markDirty 折叠为一次动画帧 flush，通知推迟到下一帧）。
@@ -433,6 +434,18 @@ export function useChatSocket(
         const events: TaskEvent[] = Array.isArray(raw) ? raw : [raw]
         events.forEach(handleTaskEvent)
       })
+      // [OBS2 · 断线即补，不必等 complete] 连接建立（含重连成功）→ 按当前会话主动重拉一次尾页。
+      //   WHY：此前唯一的补偿只挂在「收到 message.complete」上（见下方 isComplete 分支的
+      //   wasDisconnectedRef 判断），而 complete 本身也走这条刚断过的通道 —— 通道死了（半开连接 /
+      //   帧推给零订阅者静默丢弃）就永不补偿：2026-09-17 事故里前端整屏不更新、状态栏却仍显示绿色
+      //   「已连接」，直到本轮结束按 F5 才看到完整内容。挂到 onConnect 后，重连成功即补齐断档，
+      //   不再依赖「complete 恰好到达」这个前提。
+      //   ⛔ 位置：放在所有订阅之后 —— 先订阅再回填补齐，避免「重拉完成 → 订阅就绪」之间的窗口丢帧。
+      //   ⛔ 复用既有重载入口 onReconnectReload（→ App.handleReconnectReload → loadTailWindow →
+      //   GET /messages/page 尾页），不新写一套。该入口直连 HTTP，**不经过** App.tsx 里
+      //   「messages 缓存非空即不重拉」那一处（那处只在切换 activeSessionId 的 effect 内判缓存），
+      //   故重连触发的这次天然穿透缓存，无需改动 App.tsx。
+      if (sid) onReconnectReloadRef.current?.(sid)
     }
     client.activate()
     clientRef.current = client
@@ -674,6 +687,9 @@ export function useChatSocket(
 
   function dispatchEvent(evt: StreamEvent, topic?: string) {
     const st = useChatStore.getState()
+    // [OBS2 · 入站帧留痕] 在分派入口统一计数（所有 type 都过这里）→ frontLog 心跳 note 里带上，
+    //   把「心跳在跳但 framesIn 不涨」与「帧在涨却没渲染」两种病因在日志里分开。
+    noteInboundFrame(evt.type)
     // TEMP 诊断（多会话联调）：事件流全量 + tool_call 块 id 匹配检查
     console.debug('[stream]', evt.type, { sessionId: evt.sessionId ?? sessionId, assistantMessageId: (evt as { assistantMessageId?: string }).assistantMessageId })
     // 多会话分发：事件归属会话优先取 evt.sessionId（切走会话的事件仍落到原会话 streams）

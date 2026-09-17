@@ -241,6 +241,8 @@ public class LlmAgentLoop implements AgentLoop {
     private static final java.util.concurrent.ExecutorService STREAM_EXECUTOR =
         java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
     private static final long STREAM_TIMEOUT_SECONDS = 300;
+    /** [OBS1] chunk 推送限流日志的最小间隔（ms）：chunk 极密集，逐条打日志会把日志刷爆。 */
+    private static final long PUSH_LOG_INTERVAL_MS = 1000L;
     private static final int DEFAULT_TOKEN_BUDGET = 180_000;
     private static final int ANT_TOKEN_BUDGET = 8_000;
     private static final int FALLBACK_TOKEN_BUDGET = 200_000;
@@ -1788,9 +1790,12 @@ public class LlmAgentLoop implements AgentLoop {
                 snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft());
         ws.convertAndSend(topic, event);
         if (log.isInfoEnabled()) {
-            log.info("[usage-push] STOMP → type=message.usage asst={} usage(input={},output={},cacheRead={},cacheCreate={}) "
+            // [OBS2] 补打 topic：usage 与 chunk 走的是同一个 stream topic（ctx.streamTopic()），
+            //   这行日志是判断「通道有没有问题」的承重前提 —— 只有带上 topic 才能把「后端推哪去了」
+            //   与前端订阅/收帧对齐（配 WebSocketDeliveryDiagnostics 的 [ws-deliver] 汇总段读）。
+            log.info("[usage-push] STOMP → topic={} type=message.usage asst={} usage(input={},output={},cacheRead={},cacheCreate={}) "
                     + "ctx(window={},used={},pct={}) · CC claude.ts:2244-2248",
-                assistantMessageId, usage.inputTokens(), usage.outputTokens(),
+                topic, assistantMessageId, usage.inputTokens(), usage.outputTokens(),
                 usage.cacheReadInputTokens(), usage.cacheCreationInputTokens(),
                 snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft());
         }
@@ -5907,6 +5912,12 @@ public class LlmAgentLoop implements AgentLoop {
             StringBuilder acc = new StringBuilder();
             StringBuilder reasoningBuf = new StringBuilder();
             int[] chunkCount = {0};
+            // [OBS1] chunk 推送观测（净新增，非 CC 对齐 · 2026-09-17「前端整屏静止」事故驱动）：
+            //   正文/reasoning chunk 极密集，逐条打日志会把日志刷爆，故各自限流「同一 turn 内每秒最多 1 条」。
+            //   布局：[0]=本 turn 累计已推 chunk 数，[1]=上次打点时刻(ms，0=尚未打点)，
+            //   [2]=上次打点时的累计值（用于算本窗口新增）。lambda 捕获用数组 holder（同 chunkCount 惯例）。
+            long[] wsPushTextStat = {0L, 0L, 0L};
+            long[] wsPushReasonStat = {0L, 0L, 0L};
             // [reasoningDurationMs] 推理计时状态（净新增，非 CC 对齐）：reasoningStartMs = 首 reasoning
             //   chunk 到达时刻；reasoningEndMs = 推理阶段结束（首 content chunk 更准，onAssistantMessage
             //   兜底纯 reasoning 无 content 场景）。lambda 捕获用数组 holder（同 chunkCount 惯例）。
@@ -6568,6 +6579,8 @@ public class LlmAgentLoop implements AgentLoop {
                                 ctx.streamSessionId(), turnUserMessageId,
                                 turnAssistantId,
                                 chunk));
+                        // [OBS1] 推送留痕（限流：同 turn 内每秒最多 1 条）—— 日志里可直接判定「后端推没推」
+                        logChunkPushRateLimited("正文", state.turnCount(), ctx.streamTopic(), wsPushTextStat);
                     }
                 },
                 msg -> {
@@ -6679,6 +6692,8 @@ public class LlmAgentLoop implements AgentLoop {
                                 ctx.streamSessionId(), turnUserMessageId,
                                 turnAssistantId,
                                 reasoningChunk));
+                        // [OBS1] 推送留痕（限流：同 turn 内每秒最多 1 条）—— 与正文分开计数，便于分辨哪条流停了
+                        logChunkPushRateLimited("reasoning", state.turnCount(), ctx.streamTopic(), wsPushReasonStat);
                     }
                 },
                 // [H7-arch Phase 5 P4 C2] onStreamingFallback · 对齐 CC query.ts:678-680
@@ -12538,6 +12553,35 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     // ── helpers ──
+
+    /**
+     * [OBS1] STOMP chunk 推送限流日志：让「后端到底推没推、推了多少」能**直接从日志判定**。
+     *
+     * <p>事故背景（2026-09-17）：两个 chunk 推送点（正文 / reasoning）只调
+     * {@code AgentLoopContext.traceEmit} + {@code convertAndSend}、**零 {@code log.*}**，
+     * 导致「整屏静止」时无法分辨是「后端没推」还是「前端没渲染」。
+     *
+     * <p>限流：chunk 极密集（一次响应可达数千个），逐条打会把日志刷爆 ⇒ 同一 turn 内
+     * **每秒最多 1 条**；每行带「本窗口新增 + 本 turn 累计」两个计数，连续两行相减即得速率量级。
+     *
+     * <p>⚠️ 本方法只递增计数、只打日志，**不参与也不影响任何推送逻辑/条件/次序**。
+     *
+     * @param kind  通道名（正文 / reasoning），用于区分是哪个流停了
+     * @param turn  当前 turn 序号
+     * @param topic STOMP 目标 topic
+     * @param stat  该通道的观测状态数组，布局见 {@code loop()} 内 {@code wsPushTextStat} 声明处
+     */
+    private static void logChunkPushRateLimited(String kind, int turn, String topic, long[] stat) {
+        stat[0]++;
+        long now = System.currentTimeMillis();
+        if (stat[1] != 0L && now - stat[1] < PUSH_LOG_INTERVAL_MS) {
+            return;
+        }
+        log.info("[OBS1] turn={} STOMP {} chunk 推送：本窗口 {} 个（本 turn 累计 {} 个）topic={}",
+            turn, kind, stat[0] - stat[2], stat[0], topic);
+        stat[1] = now;
+        stat[2] = stat[0];
+    }
 
     /**
      * Phase-based 日志: 把"turn N done: N chars"这种通用标签替换成语义化阶段。

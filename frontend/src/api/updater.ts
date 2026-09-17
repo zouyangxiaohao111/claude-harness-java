@@ -13,12 +13,12 @@ export interface UpdateInfo {
 }
 
 /**
- * 默认源（与 Rust DEFAULT_SOURCES 一致：自建源占位符 + 公开 GitHub release 兜底）。
- * 自建源地址不入库；实际生效的是 Rust 侧解析：`update_check` 的 sources 参数，
+ * 默认源（与 Rust DEFAULT_SOURCES 一致：内网 MinIO 主源 + 公开 GitHub release 外网兜底）。
+ * 实际生效的是 Rust 侧解析：`update_check` 的 sources 参数，
  * 或运行环境变量 NEXUSAI_UPDATER_SOURCES（逗号分隔）。
  */
 export const DEFAULT_UPDATER_SOURCES = [
-  'https://your-update-host.example/nexusai/updater/latest.json',
+  'http://192.168.20.125:9000/nexusai/updater/latest.json',
   'https://github.com/zouyangxiaohao111/claude-harness-java/releases/latest/download/latest.json',
 ]
 
