@@ -212,9 +212,22 @@ pub async fn update_download(info: UpdateInfo, app: AppHandle) -> Result<String,
         .map_err(|e| format!("下载任务失败: {e}"))?
 }
 
+/// 当前应用版本（更新检查的「当前版本」基准）。
+///
+/// <p>⛔ <b>必须读 `package_info().version`（= `tauri.conf.json` 的 `version`），不得读 `env!("CARGO_PKG_VERSION")`</b>。
+///
+/// <p><b>WHY（2026-09-17 用户实测）</b>：本函数原先读 `CARGO_PKG_VERSION`，即 `Cargo.toml` 的 `version`。
+/// 而**安装包版本由 `tauri.conf.json` 的 `version` 决定**（tauri-codegen `context.rs:273-278`：
+/// 有 `config.version` 就用它，没有才回退 `CARGO_PKG_VERSION`）。本仓 `Cargo.toml` 长期停在 `0.1.6`、
+/// `tauri.conf.json` 一路走到 `0.1.10` ⇒ 应用**自报 `0.1.6`**、远端 `latest.json` 是 `0.1.10`
+/// ⇒ `newer("0.1.10", "0.1.6") == true` ⇒ **无论装到哪个版本，更新提示永远不消失**。
+/// （这也是用户早前「装了新版还提示更新」的真正根因 —— 当时误归因为 CDN 缓存。）
+///
+/// <p>改读 `package_info()` 后，自报版本与安装包**永远同源**，`Cargo.toml` 再漂移也不会影响比版本。
+/// 另见 `cargo_toml_version_matches_tauri_conf` 测试：它钉住「两个版本文件必须一致」，防再次漂移。
 #[tauri::command]
-pub fn app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+pub fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
 }
 
 #[tauri::command]
@@ -340,6 +353,66 @@ mod tests {
             body.contains("spawn_blocking("),
             "update_download 必须经 tauri::async_runtime::spawn_blocking 执行。\
              同步跑期间整个 UI 的 Tauri IPC 都会卡（下载耗时数分钟）。"
+        );
+    }
+
+    /// ⭐ 守护：`app_version` 必须读**安装包版本**（`package_info().version`），
+    /// ⛔ 不得读 `env!("CARGO_PKG_VERSION")`（= `Cargo.toml` 的 version）。
+    ///
+    /// <p><b>WHY（2026-09-17 用户实测）</b>：安装包版本由 `tauri.conf.json` 决定
+    /// （tauri-codegen `context.rs:273-278`：有 `config.version` 就用它，没有才回退 `CARGO_PKG_VERSION`）；
+    /// 而 `Cargo.toml` 曾长期停在 `0.1.6`、`tauri.conf.json` 一路走到 `0.1.10`
+    /// ⇒ 应用自报 `0.1.6`、远端 `0.1.10` ⇒ **更新提示永远不消失**（用户连着两个版本都遇到）。
+    /// 这条守护让「有人把它改回去」立刻变红。
+    #[test]
+    fn app_version_must_use_package_info_not_cargo_pkg_version() {
+        let body = fn_body(prod_src(), "pub fn app_version")
+            .expect("app_version 必须存在（前端经 invoke('app_version') 取「当前版本」）");
+        assert!(
+            body.contains("package_info()"),
+            "app_version 必须读安装包版本 `app.package_info().version`（= tauri.conf.json 的 version），\
+             实得函数体：{body}"
+        );
+        assert!(
+            !body.contains("CARGO_PKG_VERSION"),
+            "⛔ app_version 不得读 CARGO_PKG_VERSION（= Cargo.toml 的 version）—— \
+             那与安装包版本是两个来源，一旦漂移会导致更新提示永远不消失（2026-09-17 实测）。"
+        );
+    }
+
+    /// ⭐⭐ 守护：**两个版本文件必须一致** —— `Cargo.toml` 的 `version` == `tauri.conf.json` 的 `version`。
+    ///
+    /// <p><b>WHY</b>：本仓有**两个**版本真相（crate 版本 vs 打包版本），且历史上它们长期不一致
+    /// （`Cargo.toml` 停在 `0.1.6` 而 `tauri.conf.json` 到 `0.1.10`）。发版时只改三处
+    /// （`tauri.conf.json` / `package.json` / `pom.xml`）而忘了 `Cargo.toml` 是**极易发生**的疏漏。
+    /// 这条守护把「发版时忘改」变成**编译后立刻红**，而不是等用户装了包发现还在提示更新。
+    /// ⚠️ 读的是两个文件的**源文本**（`include_str!`），不是运行时值 —— 所以覆盖「发版流程」而非「运行行为」。
+    #[test]
+    fn cargo_toml_version_matches_tauri_conf() {
+        let cargo = include_str!("../Cargo.toml");
+        let conf = include_str!("../tauri.conf.json");
+
+        /// 从一行里取出值：先去行尾逗号（JSON 有、TOML 无），再去首尾引号。
+        /// ⚠️ 顺序不能反 —— 先 `trim_matches('"')` 的话，`"0.1.11",` 会剩下一个尾部引号。
+        fn pick(src: &str, prefix: &str) -> String {
+            src.lines()
+                .map(str::trim)
+                .find_map(|l| l.strip_prefix(prefix))
+                .map(|v| v.trim().trim_end_matches(',').trim().trim_matches('"').to_string())
+                .unwrap_or_default()
+        }
+
+        let cargo_v = pick(cargo, "version =");
+        let conf_v = pick(conf, "\"version\":"); // tauri.conf.json 是 JSON：`"version": "x.y.z",`
+
+        assert!(
+            !cargo_v.is_empty() && !conf_v.is_empty(),
+            "未能从两个文件中解析出版本号：Cargo.toml={cargo_v:?} tauri.conf.json={conf_v:?}"
+        );
+        assert_eq!(
+            cargo_v, conf_v,
+            "⛔ Cargo.toml 与 tauri.conf.json 的 version 必须一致（发版时**两个都要改**）。\
+             不一致会导致：Cargo.lock/crate 版本、与安装包版本、与 app_version 三者语义分叉。"
         );
     }
 }
