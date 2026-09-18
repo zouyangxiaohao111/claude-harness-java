@@ -15,6 +15,8 @@ import { COMMAND_ITEMS, isDisabledCommand } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
+import { deliverAttachmentFiles } from '@/utils/attachmentDelivery'
+import { classifyAttachmentPath, planPathAttachmentChannel } from '@/utils/pathAttachment'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
@@ -408,54 +410,63 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     setToolsDisabledCount(0)
   }, [sessionId])
 
-  // 附件（A1 契约）：≤5MB 读 base64 直传（图片带预览）；>5MB multipart upload 拿 contentId
+  // 附件（A1 契约 · 批 ATT-DROP）：**投递决策全在 utils/attachmentDelivery（有单测）**，本函数只做副作用接线。
+  //   ⛔ 红线：不允许「已显示 chip、模型收不到」的静默丢弃 —— 每个 File 必须落进
+  //   「真的进入投递通道（base64 / upload）」或「同步拒绝（提示 + 不生成 chip）」。
+  //   本批三处行为变更（详见 attachmentDelivery.ts 头注）：
+  //   ① video/audio 不再按图片的 5MB 阈值走 base64（后端对其 base64 零消费方 ⇒ 静默丢弃），改走 upload；
+  //   ② 其余类型（docx/xlsx/zip/txt…）的 ≤5MB 腿（原实现必然静默丢弃）⇒ 同步拒绝 + 不生成 chip；
+  //      其 >5MB 腿仍走 upload（原样，后端白名单按扩展名兜底，可能送达）；
+  //   ③ 「已添加 N 个附件」用**真实投递数**，不再用入口文件数（原实现丢弃时虚报）。
   const addFiles = (fileList: FileList | File[]) => {
     const files = Array.from(fileList)
     // [attach] 观测入口：浏览器 drop / 原生 input / paste 通道实际拿到几个 File
     console.warn(`[attach] addFiles 入口 files=${files.length} 明细=${files.map((f) => f.name).join(' | ')}`)
     if (files.length === 0) return
-    files.forEach((f) => {
-      const mediaType = f.type || 'application/octet-stream'
-      const type: PendingAttachment['type'] = mediaType.startsWith('image/') ? 'image'
-        : f.name.toLowerCase().endsWith('.pdf') ? 'pdf'
-        : mediaType.startsWith('video/') ? 'video'
-        : mediaType.startsWith('audio/') ? 'audio'
-        : 'file'
-      if (f.size > BASE64_LIMIT) {
-        // 大文件 → multipart 上传落盘 → contentId
-        // [批 3a] 上传请求必须带会话（后端按 sessionId 归属附件）；旧实现 sessionId 缺省时
-        //   `if (sessionId)` 静默丢弃该字段 → 附件落到 'unknown' 归属（用户无感知）。改为显式拒绝。
-        if (!sessionId) {
-          showToast(`大文件需先打开一个会话再上传：${f.name}`, 'info')
-          return
-        }
-        if (addedNamesRef.current.has(f.name)) return
-        addedNamesRef.current.add(f.name)
-        setAttachments((prev) => [...prev, { type, filename: f.name, mediaType, size: f.size, contentId: '__uploading__' }])
-        void uploadAttachment(f, sessionId)
-          .then((r) => setAttachments((prev) => prev.map((a) =>
-            a.contentId === '__uploading__' && a.filename === f.name ? { ...a, contentId: r.contentId } : a)))
-          .catch(() => {
-            setAttachments((prev) => prev.filter((a) => !(a.contentId === '__uploading__' && a.filename === f.name)))
-            showToast(`大文件上传失败：${f.name}`, 'info')
-          })
-      } else {
-        // ≤5MB → base64 直传（图片 dataURL 预览）
-        const reader = new FileReader()
-        reader.onload = () => {
-          if (addedNamesRef.current.has(f.name)) return
-          addedNamesRef.current.add(f.name)
-          const dataUrl = reader.result as string
+    void (async () => {
+      const summary = await deliverAttachmentFiles(files, {
+        sessionId,
+        isDuplicate: (n) => addedNamesRef.current.has(n),
+        reserve: (n) => { addedNamesRef.current.add(n) },
+        release: (n) => { addedNamesRef.current.delete(n) },
+        onAccepted: (a) => {
+          console.warn(`[attach] 结局=${a.filename} → chip（通道=${a.uploading ? 'upload' : 'base64'} type=${a.type} size=${a.size}B）`)
           setAttachments((prev) => [...prev, {
-            type, filename: f.name, mediaType, size: f.size,
-            base64: dataUrl,
-            ...(type === 'image' ? { preview: dataUrl } : {}),
+            type: a.type, filename: a.filename, mediaType: a.mediaType, size: a.size,
+            ...(a.base64 ? { base64: a.base64, ...(a.type === 'image' ? { preview: a.base64 } : {}) } : {}),
+            ...(a.uploading ? { contentId: '__uploading__' } : {}),
           }])
-        }
-        reader.readAsDataURL(f)
+        },
+        onUploaded: (filename, contentId) => setAttachments((prev) => prev.map((a) =>
+          a.contentId === '__uploading__' && a.filename === filename ? { ...a, contentId } : a)),
+        onFailed: (filename, reason) => {
+          // 异步失败 → 撤下占位 chip（绝不留下「有 chip 但模型收不到」）+ 带原因的提示（响亮失败）
+          console.warn(`[attach] 结局=${filename} → 失败（${reason}）`)
+          setAttachments((prev) => prev.filter((a) => !(a.contentId === '__uploading__' && a.filename === filename)))
+          showToast(`附件未能送达：${filename}（${reason}）`, 'info')
+        },
+        onRejected: (filename, reason) => {
+          console.warn(`[attach] 结局=${filename} → 拒绝（${reason}）`)
+        },
+        encodeDataUrl: async (file, mediaType) => {
+          const bytes = new Uint8Array(await file.arrayBuffer())
+          return `data:${mediaType};base64,${u8ToBase64(bytes)}`
+        },
+        upload: (file, sid) => uploadAttachment(file, sid),
+      })
+      console.warn(`[attach] addFiles 汇总 接受=${summary.accepted} 拒绝=${summary.rejected.length}`
+        + ` 重复=${summary.duplicates.length} 读取失败=${summary.failed.length}`)
+      const unsupported = summary.rejected.filter((r) => r.reason === 'unsupported').map((r) => r.filename)
+      const noSession = summary.rejected.filter((r) => r.reason === 'no-session').map((r) => r.filename)
+      const parts: string[] = []
+      if (summary.accepted > 0) parts.push(`已添加 ${summary.accepted} 个附件`)
+      if (unsupported.length) parts.push(`不支持的文件类型：${unsupported.join('、')}（本通道仅支持 图片 / PDF / 视频 / 音频）`)
+      if (noSession.length) parts.push(`需先打开一个会话再添加附件：${noSession.join('、')}`)
+      if (summary.failed.length) parts.push(`读取失败：${summary.failed.map((f) => f.filename).join('、')}`)
+      if (parts.length) {
+        showToast(parts.join('；'), summary.rejected.length || summary.failed.length ? 'info' : 'success')
       }
-    })
-    showToast(`已添加 ${files.length} 个附件`, 'success')
+    })()
   }
 
   // Tauri：拖拽文件路径 → fs 读 → base64（≤5MB 直传）/ upload（>5MB 拿 contentId）
@@ -465,22 +476,19 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     const pending: PendingAttachment[] = []
     for (const p of paths) {
       try {
-        const name = p.split(/[\\/]/).pop() ?? p
-        const lower = name.toLowerCase()
-        const isImage = /\.(png|jpe?g|gif|webp|bmp)$/.test(lower)
-        const isPdf = lower.endsWith('.pdf')
-        const type: PendingAttachment['type'] = isImage ? 'image' : isPdf ? 'pdf'
-          : /\.(mp4|webm|mov)$/.test(lower) ? 'video'
-          : /\.(mp3|wav|ogg|m4a)$/.test(lower) ? 'audio' : 'file'
-        const mediaType = isImage ? 'image/*' : isPdf ? 'application/pdf'
-          : type === 'video' ? 'video/*' : type === 'audio' ? 'audio/*' : 'application/octet-stream'
+        const cls = classifyAttachmentPath(p)
+        const { name, type, mediaType, isImage } = cls
         // [local-read] 前后端同机：>5MB 拖拽附件直接传本地 path（后端同机读盘 + 注册附件表，省一次 upload 拷贝）——
         //   plugin-fs stat 拿 size 判定，不整读大文件进内存
         if (localRead) {
           const info = await stat(p)
-          if (info.size > BASE64_LIMIT) {
+          // 图片与 PDF 保持原语义：
+          //   - 图片 ≤5MB 必须走 base64（才能变成 image content block 让模型直接看到图）
+          //   - PDF 有自己的内联 document block 链（后端 registerBase64Pdf / PdfAttachmentProcessor）
+          // 其余类型（Word/Excel/视频/音频/其它）走 path：零拷贝、不落盘、不进请求体
+          if (planPathAttachmentChannel(cls, info.size, localRead) === 'path') {
             pending.push({ type, filename: name, mediaType, path: p, size: info.size })
-            console.warn(`[attach] 结局=${name} → pending（通道=path 大文件 ${info.size}B）`)
+            console.warn(`[attach] 结局=${name} → pending（通道=path ${info.size}B）`)
             continue
           }
         }

@@ -154,6 +154,16 @@ public class AgentLoopContextFactory {
     @Autowired(required = false) private TraceRecorder traceRecorder;
     @Autowired(required = false) private PermissionContextBuilder permissionContextBuilder;
     @Autowired(required = false) private TaskService taskService;
+    /**
+     * [attach-busy-resolve 2026-09-18] 附件表统一 contentId → path 解析（生产单例 bean · 同
+     * {@link #taskService} 范式）。经 {@link #build} 接线进 {@code LoopSessionState}，使
+     * {@code freshSession} 产出的会话状态也带附件消费依赖（mid-turn drain 的 contentId 腿）。
+     * required=false：单测 / 非 Spring 场景无 bean → null → 消费端跳过该通道（同未接线前）。
+     */
+    @Autowired(required = false) private com.nexusai.domain.session.AttachmentService attachmentService;
+    /** [attach-busy-resolve 2026-09-18] 媒体附件存储（{@link #attachmentService} 同级 · ③ 回退腿）。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.attachment.MediaAttachmentStore mediaAttachmentStore;
     @Autowired(required = false) private Path workspaceDir;
 
     // [IMP-GP-03 · OPD-WF7-JS-03] promptSuggestion/speculation 生产接线（SpeculationEngine 非死代码）。
@@ -424,6 +434,20 @@ public class AgentLoopContextFactory {
         // 否则主代理 sentSkillNames 生产仍不被 reset（NG-1 只解一半）。
         SkillChangeDetector.registerSentSkillNames(session.sentSkillNames());
         SkillChangeDetector.registerSuppressNextSkillListing(session.suppressNextSkillListing());
+        // [attach-busy-resolve 2026-09-18] 附件消费 bean 接线 · 与 SkillChangeDetector 注册同理选在 build()：
+        //   本方法是 shared()/forSession 3 参（freshSession 创建 sessionState）与 forSession 5 参
+        //   （LlmAgentLoop.buildSessionStateFromInstance 直接传入、不经 freshSession）的**单一汇聚点**
+        //   —— freshSession() 自身只被前者经过，只在它里面接线会漏掉后者（主循环），反之在此接线两条都覆盖。
+        //   用途：mid-turn drain 消费 busy-queued 携附件时，buildMediaAttachmentNotes /
+        //   buildLargeImagePathNotes 的 contentId 腿（附件表 getPath）与 store 回退腿需要这两个 bean；
+        //   sessionState=null 时（freshSession 新建）与调用方传入时都必须带上，否则该路径静默丢说明。
+        //   ⚠️ 与 LlmAgentLoop.buildSessionStateFromInstance() 的同名接线<b>并存且幂等</b>：两处写入的是
+        //   同一类型的 Spring 单例 bean（AttachmentService @Service / MediaAttachmentStore @Component
+        //   各只有一条 bean 定义，两处 @Autowired 按类型解析到同一实例）→ 后写的 build() 覆盖值 ===
+        //   先写的实例，覆盖不改变任何语义；null 时（非 Spring 单测 / 无 bean）两处同为 null，
+        //   消费端保持「无 bean → 跳过该通道」的既有语义。
+        session.setAttachmentService(attachmentService);
+        session.setMediaAttachmentStore(mediaAttachmentStore);
         return new AgentLoopContext(
             toolRegistry, hookRegistry, mcpServerService,
             notificationQueue, commandLifecycleNotifier,

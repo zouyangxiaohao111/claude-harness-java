@@ -2222,8 +2222,14 @@ public class MessageService {
      * @param list      反序列化后的附件快照（可 null/空）
      * @param sessionId 所属会话 id（消息表 session_id 列，toDto 的 m.getSessionId() 可拿；null → 不拼 url）
      * @return url 已填充的附件快照列表；无变更/无 session → 原列表
+     *
+     * <p><b>[busy 气泡附件胶囊] 为何是 public</b>：该 url 投影是「附件快照 → 前端可点预览 url」的
+     * <b>唯一规则</b>。除 GET /messages 读侧（本类 {@code toDto}）外，{@code queue.drained} 出站
+     * （{@code QueueEventPublisher.emitDrained}）也要把<b>同一投影</b>发给前端 live 气泡 —— 若不复用
+     * 而各写一份，live 胶囊与 F5 重拉后的胶囊会漂移（同一附件两种可点性）。故跨包共享本方法，
+     * ⛔ 不要在别处复制这条 url 拼法。
      */
-    private static List<UserAttachmentInfo> resolveAttachmentUrls(List<UserAttachmentInfo> list, String sessionId) {
+    public static List<UserAttachmentInfo> resolveAttachmentUrls(List<UserAttachmentInfo> list, String sessionId) {
         if (list == null || list.isEmpty() || sessionId == null || sessionId.isBlank()) {
             return list;
         }

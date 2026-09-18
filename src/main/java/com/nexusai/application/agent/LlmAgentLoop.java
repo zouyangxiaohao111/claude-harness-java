@@ -3731,6 +3731,13 @@ public class LlmAgentLoop implements AgentLoop {
         session.setTurnsSinceLastTaskManagement(turnsSinceLastTaskManagement);
         session.setTurnsSinceLastTaskReminder(turnsSinceLastTaskReminder);
         session.setTaskService(taskService);
+        // [attach-busy-resolve 2026-09-18] 附件消费 bean 随 per-run 容器下传：mid-turn drain
+        //   （static drainAndInjectQueued）消费 busy-queued 携附件时，媒体/大图 contentId 通道
+        //   需要附件表（拼真实落盘路径）与媒体 store（附件表未命中回退）。两者在本类都是
+        //   @Autowired(required=false) 实例字段 → 经本唯一汇聚点（生产工厂路径与 fallback 路径共用）
+        //   下传，避免改 static 方法签名。null（非 Spring 单测）→ 消费端各自跳过对应通道。
+        session.setAttachmentService(this.attachmentService);
+        session.setMediaAttachmentStore(this.mediaAttachmentStore);
         // [prompt-align CTX-02] settings 门控实时读源注入（DB task_reminder_enabled · null→fallback
         //   isTodoV2Enabled；生产与 5 参 factory.forSession 共用本方法为唯一汇聚点）。
         session.setPromptAlignSettingsResolver(promptAlignSettingsResolver);
@@ -9272,6 +9279,14 @@ public class LlmAgentLoop implements AgentLoop {
             //   attachments.ts:1060-1083 per-command pastedContents）；turn-0（queuedOrigin==null）原
             //   build 分支；纯文本 else。
             boolean hasImage = busyQueued && hasBase64ImageAttachments(item.attachments());
+            // [attach-busy-resolve 2026-09-18] ⛔ 判据必须<b>分开</b>，不得由同一条件兼任：
+            //   hasImage          = 有可内联的 ≤5MB base64 图 → 只负责触发 registerRunPromptImages（F1 链）
+            //   injectAttachments = 有任何<b>已解析</b>附件（图 / PDF / 大图 / 媒体）→ 负责触发附件注入分支
+            //   WHY：附件入队侧已放开（ChatService.busyQueuedResolvedAttachments 携全部已校验附件），
+            //   但原分流判据只认 hasImage ⇒ 只带 Word/PDF 的排队项仍落「纯文本 busy」分支（该分支对
+            //   item.attachments() <b>零引用</b>）→ 入队侧的修复在 drain 处被整段吃掉（附件二次丢失）。
+            boolean injectAttachments = busyQueued
+                && item.attachments() != null && !item.attachments().isEmpty();
             ChatMessageDto appended;
             if (busyQueued) {
                 // [P0-1] busy-queued 登记 registry（uuid, content, 'busy-queued'）前置到 append 前：
@@ -9281,25 +9296,76 @@ public class LlmAgentLoop implements AgentLoop {
                 //   queued_origin='busy-queued'）；turn 末 persistInjectedQueuedMessages 补落经
                 //   existsById 幂等跳过。原文 RAW 与 DB content 一致（消除 live 带壳 / DB 原文 错位）。
                 //   [OD-D5] 登记收口公共段（带图与纯文本 busy 共用，防 injectedQueuedMessages 双条目）。
-                state.addInjectedQueuedMessage(item.uuid(), item.value(), queuedOrigin);
+                //   [busy 附件快照] 同时登记非图片附件快照（item.userAttachments，enqueueBusyPrompt 构造）：
+                //   实时落库分支（ChatService.persistAppendedMessage user 分支 :1506 透传
+                //   m.userAttachments()）与轮末补落分支（persistInjectedQueuedMessages）都以本 registry
+                //   为快照载体 → 两条落库路径落出的 user_attachments 一致（F5 气泡附件胶囊 + 预览 url）。
+                state.addInjectedQueuedMessage(item.uuid(), item.value(), queuedOrigin, item.userAttachments());
                 if (injectedQueuedMessages != null) {
                     injectedQueuedMessages.add(
-                        new AgentState.InjectedQueuedMessage(item.uuid(), item.value(), queuedOrigin));
+                        new AgentState.InjectedQueuedMessage(item.uuid(), item.value(), queuedOrigin,
+                            item.userAttachments()));
                 }
             }
-            if (prompt && (queuedOrigin == null || hasImage) && (imageStore != null || pdfProcessor != null)) {
+            if (prompt && (queuedOrigin == null || hasImage || injectAttachments)
+                    && (imageStore != null || pdfProcessor != null)) {
                 // [OD-D5] 消费点完整注册：只传本项 attachments（per-item 语义，消费即清；CC per-command）。
                 //   带图 busy 消息产物统一 .withQueuedOrigin('busy-queued')（append 实时落库
                 //   injectedQueuedById 命中 → createQueuedUserMessage 落库带 imagePasteIds）。
                 if (hasImage) {
                     registerRunPromptImages(imageStore, imageSessionKey(state.sessionId()), item.attachments());
                 }
+                // [attach-busy-resolve 2026-09-18] 非图片附件补齐 —— 与 doRun 入口同源同参
+                //   （:3335 registerRunPromptPdfs / :3346 buildMediaAttachmentNotes / :3360
+                //   buildLargeImagePathNotes）。三条产物拼进<b>模型侧</b> prompt；原文仍进 state/DB
+                //   （气泡与落库不被污染，同 doRun 的 userPrompt vs effectiveUserPrompt 分化）。
+                String modelContent = content;
+                if (injectAttachments) {
+                    // ① PDF：registerRunPromptPdfs（≤20 页 → document/image block 直注；>20 页 → 引导文本）。
+                    //   pdfSupportsImage 与 doRun :3334 同源（同一 ModelCapabilityResolver + 同 modelName）。
+                    boolean pdfSupportsImage = ModelCapabilityResolver.supportsImage(
+                        ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().modelMapper() : null,
+                        ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().providerMapper() : null,
+                        params.modelName());
+                    long pdfStartMs = System.currentTimeMillis();
+                    int registeredPdfs = registerRunPromptPdfs(pdfProcessor, state.sessionId(),
+                        imageSessionKey(state.sessionId()), item.attachments(), pdfSupportsImage, imageStore);
+                    long pdfCostMs = System.currentTimeMillis() - pdfStartMs;
+                    // ②③ 媒体（video/audio/file）/ 大图（>5MB）路径说明：附件表 contentId / path 通道
+                    //   拼「本地路径」，供模型按真实路径引用（像素级理解本期不做）。
+                    com.nexusai.application.agent.loop.AgentLoopContext.LoopSessionState ss = ctx.sessionState();
+                    StringBuilder attachNotes = new StringBuilder();
+                    attachNotes.append(buildMediaAttachmentNotes(
+                        ss != null ? ss.mediaAttachmentStore() : null,
+                        ss != null ? ss.attachmentService() : null,
+                        imageSessionKey(state.sessionId()), item.attachments()));
+                    attachNotes.append(buildLargeImagePathNotes(imageStore,
+                        ss != null ? ss.attachmentService() : null,
+                        imageSessionKey(state.sessionId()), item.attachments()));
+                    if (attachNotes.length() > 0) {
+                        modelContent = (content == null ? "" : content) + attachNotes;
+                    }
+                    // [红线 §四 可观测] drain 是工具边界热路径 —— PDF 解析/分页/渲染（PDFBox）在中段
+                    //   同步执行，此处打印耗时供生产量化（见批次报告「已知代价」）。
+                    if (log.isInfoEnabled()) {
+                        log.info("[attach-busy-resolve] busy 排队项附件 drain 注入: session={} uuid={} 附件={} "
+                                + "PDF注册={} pdfSupportsImage={} PDF解析耗时={}ms 说明长度={}（原文{}字符 + 附件说明{}字符）",
+                            state.sessionId(), item.uuid(), item.attachments().size(), registeredPdfs,
+                            pdfSupportsImage, pdfCostMs, attachNotes.length(),
+                            content == null ? 0 : content.length(), attachNotes.length());
+                    }
+                    if (pdfCostMs >= 1000L) {
+                        log.warn("[attach-busy-resolve] drain 内 PDF 解析耗时 {}ms（≥1s）—— 已拖慢当前轮工具边界: "
+                                + "session={} uuid={} 附件={}（缓解方向见批次报告：改造为入队期预解析）",
+                            pdfCostMs, state.sessionId(), item.uuid(), item.attachments().size());
+                    }
+                }
                 ChatMessageDto built = buildUserMessageWithImages(
                     imageStore,
                     pdfProcessor,
                     ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().modelMapper() : null,
                     ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().providerMapper() : null,
-                    content, params.modelName(), imageSessionKey(state.sessionId()),
+                    modelContent, params.modelName(), imageSessionKey(state.sessionId()),
                     item.uuid(), isMeta,
                     resolveMultimodalModelName(ctx) /* [U2 自主引导] 多模态档位模型名注入引导（settings.multimodalModelName）*/);
                 appended = queuedOrigin != null ? built.withQueuedOrigin(queuedOrigin) : built;
@@ -9316,6 +9382,22 @@ public class LlmAgentLoop implements AgentLoop {
             } else {
                 // turn-0 纯文本 prompt：原文，无标记（不包壳）
                 appended = toMessage(Role.user, content, null, item.uuid(), isMeta);
+            }
+            // [busy 附件快照] busy-queued 携非图片附件快照 → 挂在产出 DTO 上：
+            //   ① 实时落库（state.appendMessage → ChatService.persistAppendedMessage user 分支）取
+            //      m.userAttachments() 落 V63 user_attachments 列（busy 路径唯一的快照落库点 ——
+            //      本 DTO 是该消息在 DB 落库时的字段来源）；
+            //   ② 只挂快照元数据，绝不改 content —— DB 侧 content 仍取 registry 原文（inj.content），
+            //      模型侧说明（本地路径=/contentId= 引导）不进 DB/气泡/快照（红线：原文进 state/DB/气泡）。
+            //   两个 build 分支（携图 build / 纯文本 toMessage）共用本段，防单分支漏挂。
+            if (busyQueued && item.userAttachments() != null && !item.userAttachments().isEmpty()) {
+                appended = appended.withUserAttachments(item.userAttachments());
+                if (log.isInfoEnabled()) {
+                    log.info("[LlmAgentLoop] turn={} drain 注入 busy-queued user 消息携附件快照 {} 项"
+                            + "（非图片 → user_attachments V63；F5 重拉气泡附件胶囊）session={} uuid={}",
+                        state.turnCount(), item.userAttachments().size(),
+                        state.sessionId(), item.uuid());
+                }
             }
             state.appendMessage(appended);
             // [P0-2 OD-D9] mid-turn busy-queued 补推 /stream message.user（content=原文 RAW，
@@ -13654,9 +13736,16 @@ public class LlmAgentLoop implements AgentLoop {
     /**
      * [OD-D5] 是否含可内联注入的 base64 image 附件（busy-queued 携图 drain 分流判定）。
      *
-     * <p>判定与 {@code ChatService.busyQueuedImageAttachments} 同条件：type=image/mediaType=image/*
-     * + base64 非空白 + base64 ≤ 5MB（Anthropic image block 硬限制，apiLimits.ts:19）。
-     * contentId/path 大图/PDF/media 不命中（本期 busy mid-turn 不支撑，端后 doRun 兜底）。
+     * <p>判定条件：type=image/mediaType=image/* + base64 非空白 + base64 ≤ 5MB
+     * （Anthropic image block 硬限制，apiLimits.ts:19）。
+     *
+     * <p>[attach-busy-resolve 2026-09-18] ⚠️ 本判据<b>只</b>回答「有没有可内联的 base64 图」
+     * （决定是否 registerRunPromptImages），<b>不再</b>兼任「本项有没有附件」的分流门 ——
+     * 后者由 drain 内独立的 {@code injectAttachments}（{@code item.attachments()} 非空）承担。
+     * WHY：入队侧已放开为非图片附件也随队列携带（{@code ChatService.busyQueuedResolvedAttachments}），
+     * 若本判据继续兼任分流门，只带 PDF/Word 的排队项会落纯文本分支 → 附件二次丢失。
+     * contentId/path 大图/PDF/media <b>不</b>命中本判据（它们由 registerRunPromptPdfs /
+     * buildMediaAttachmentNotes / buildLargeImagePathNotes 消费）。
      *
      * @param attachments QueueItem.attachments()（可 null/空）
      * @return true = 存在至少一个可注入图片（drain 走完整 registerRunPromptImages + buildUserMessageWithImages）

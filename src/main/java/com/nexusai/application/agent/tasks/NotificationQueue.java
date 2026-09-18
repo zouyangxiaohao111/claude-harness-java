@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tasks;
 
 import com.nexusai.model.session.dto.AttachmentRequest;
+import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.repository.session.entity.QueueOperationRecord;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
@@ -140,13 +141,47 @@ public class NotificationQueue {
          * （handlePromptSubmit.ts:340 忙时 enqueue 携带 raw pastedContents；
          * attachments.ts:1060-1083 每条 queued_command 各自 pastedContents → buildImageContentBlocks）。
          *
-         * <p>仅 busy-queued 携图（enqueueBusyPrompt 提取 ≤5MB base64 image 直传项）；
+         * <p>仅 busy-queued 携附件（{@code ChatService.enqueueBusyPrompt} → 三道门与空闲路径同源：
+         * 数量 ≤50 / resolveAttachments 白名单+存在性+≤200MB+防穿越 / MediaLimitGuard 100 项+5MB，
+         * 见 {@code ChatService.busyQueuedResolvedAttachments}）；
          * task-notification/coordinator/channel/cron 不携。drain 消费点逐项注册
-         * （registerRunPromptImages per-item），消费即清（CC per-command 独立附件，
-         * attachments.ts:1060-1083 —— 绝不共享桶）。null = 无附件（纯文本）。
+         * （registerRunPromptImages / registerRunPromptPdfs per-item），消费即清（CC per-command
+         * 独立附件，attachments.ts:1060-1083 —— 绝不共享桶）。null = 无附件（纯文本）。
+         *
+         * <p>[attach-busy-resolve 2026-09-18] 原注释「提取 ≤5MB base64 image 直传项」已作废 ——
+         * 按类型裁剪是「非图片附件静默丢弃」的缺陷本身，现为入队不裁剪（对齐 CC）。
          */
-        @Nullable List<AttachmentRequest> attachments
+        @Nullable List<AttachmentRequest> attachments,
+        /**
+         * [busy 附件快照] <b>非图片</b>附件快照（type/filename/mediaType/contentId）· 前端 F5 重拉气泡
+         * 附件胶囊 + 预览 url 的数据源（{@code messages.user_attachments} V63 列）。
+         *
+         * <p><b>WHY（为什么必须随队列携带）</b>：busy 消息的 user 行<b>不在 controller 落库</b>
+         * （{@code ChatController:119-147} busy 分支只入队），而在 <b>drain 时点</b>由
+         * {@code ChatService.persistAppendedMessage} user 分支 {@code createQueuedUserMessage(...)} 落库；
+         * {@code attachments}（第 13 参）已被 {@code busyQueuedImageAttachments} 过滤成「≤5MB base64 图片」，
+         * 非图片附件（Word/Excel/视频/上传版 PDF…）过不了该过滤 ⇒ 只有本字段能把快照带到落库点，
+         * 否则 {@code user_attachments} 恒 NULL（F5 后附件消失）。
+         *
+         * <p><b>图片为何不在本字段</b>：图片走 {@code image_paste_ids}（V46）+ image-cache 独立通道，
+         * 双写会在前端画两遍（{@code MessageList.tsx:631} 只渲染非图片项）。
+         * 仅 busy-queued 携（{@code ChatService.enqueueBusyPrompt} 构造）；其余 workload 恒 null。
+         * null = 无附件（纯文本，落库列恒 NULL，零变化）。
+         */
+        @Nullable List<ChatMessageDto.UserAttachmentInfo> userAttachments
     ) {
+        /**
+         * 13-arg 兼容构造（userAttachments=null）— [busy 附件快照] 既有 13 参 canonical 调用方零改动
+         * （仅 busy-queued 携快照；其余构造点留空 = 无附件快照）。
+         */
+        public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
+                         @Nullable String uuid, boolean isMeta, @Nullable String workload,
+                         boolean skipSlashCommands, @Nullable MessageOrigin origin,
+                         @Nullable String sessionId, @Nullable String boundProject,
+                         @Nullable String scheduleId, @Nullable List<AttachmentRequest> attachments) {
+            this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
+                sessionId, boundProject, scheduleId, attachments, null);
+        }
         /**
          * 12-arg 兼容构造（attachments=null）— [OD-D5] 既有 canonical 调用方零改动
          * （normalizePriority 等 12 参直传路径仍可用，attachments 留空 = 无附件）。

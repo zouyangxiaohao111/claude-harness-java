@@ -13,7 +13,7 @@
 
     <groupId>com.nexusai</groupId>
     <artifactId>nexusai-backend</artifactId>
-    <version>0.1.12</version>
+    <version>0.1.13</version>
     <name>nexusai-backend</name>
     <description>NexusAI Backend - Spring Boot 3.4 + SQLite + MyBatis-Flex</description>
 

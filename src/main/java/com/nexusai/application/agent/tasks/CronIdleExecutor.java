@@ -562,16 +562,33 @@ public class CronIdleExecutor {
                             // [C1] 5 参重载落库 isMeta · CC original: isMeta（useScheduledTasks.ts:76 cron
                             //   入队 isMeta 语义 —— UI 隐藏但模型可见）：cron（workload=WORKLOAD_CRON）落
                             //   isMeta=true；busy-queued（mode=prompt 但 workload!=cron）恒 false
-                            MessageCreatedResponse created = messageService.createQueuedUserMessage(
-                                cmd.sessionId(), cmd.uuid(), cmd.value(), OffsetDateTime.now(), isCron);
+                            // [busy 附件快照] 携非图片附件快照（busy-queued，enqueueBusyPrompt 构造）→
+                            //   8 参重载落 V63 user_attachments：端后兜底路径（本 turn 无后续工具边界
+                            //   → 残留 busy 消息由本执行器起新轮消费）与 mid-turn drain 实时落库路径
+                            //   落出同一份快照 —— 否则「消息在轮末才被消费」这条常见路径的
+                            //   user_attachments 仍恒 NULL（F5 后气泡附件胶囊照样消失）。
+                            //   无快照（cron / 纯文本 busy）仍走 5 参（invoked overload 不变）。
+                            MessageCreatedResponse created;
+                            if (cmd.userAttachments() != null && !cmd.userAttachments().isEmpty()) {
+                                created = messageService.createQueuedUserMessage(
+                                    cmd.sessionId(), cmd.uuid(), cmd.value(), OffsetDateTime.now(), isCron,
+                                    null /* queuedOrigin：端后兜底不标 busy-queued，与 5 参路径同语义 */,
+                                    null /* imagePasteIds：busy 图由 AM 回写 / doRun 注册链承载，本处不重复 */,
+                                    cmd.userAttachments());
+                            } else {
+                                created = messageService.createQueuedUserMessage(
+                                    cmd.sessionId(), cmd.uuid(), cmd.value(), OffsetDateTime.now(), isCron);
+                            }
                             // 落库后真实 user 消息 id（cron uuid=null 时 createQueuedUserMessage 内部 generateId 兜底）
                             if (created != null && created.userMessageId() != null) {
                                 persistedUserId = created.userMessageId();
                                 consumedUserId = persistedUserId;
                             }
                             if (log.isInfoEnabled()) {
-                                log.info("CronIdleExecutor: prompt 落库 user 消息 session={} id={} workload={}",
-                                    cmd.sessionId(), persistedUserId, cmd.workload());
+                                log.info("CronIdleExecutor: prompt 落库 user 消息 session={} id={} workload={}"
+                                        + " userAttachments={}（busy 附件快照 → V63 列，F5 气泡附件胶囊）",
+                                    cmd.sessionId(), persistedUserId, cmd.workload(),
+                                    cmd.userAttachments() == null ? 0 : cmd.userAttachments().size());
                             }
                         } catch (Exception e) {
                             log.warn("CronIdleExecutor: prompt user 消息落库失败 session={} id={}: {}"
@@ -883,11 +900,15 @@ public class CronIdleExecutor {
                     allPrompts.size(), cmd.mode(), modelName, sessionUuid);
             }
         } else {
-            // [OD-D5] 端后兜底携附件：残留带图 busy-queued（cmd.attachments() 含 ≤5MB base64 image）
-            //   → 10 参 RunRequest.session 附件重载 → doRun registerRunPromptImages 单次注册
-            //   （enqueue 未预登记 → 无双份；reflector MAJOR-5）。task-notification/cron 无附件 →
+            // [OD-D5] 端后兜底携附件：残留 busy-queued（cmd.attachments() = 入队时已过校验/已解析的
+            //   全类型附件，见 ChatService.busyQueuedResolvedAttachments）→ 10 参 RunRequest.session
+            //   附件重载 → doRun registerRunPromptImages + registerRunPromptPdfs +
+            //   buildMediaAttachmentNotes/buildLargeImagePathNotes 单次注册/注入（enqueue 未预登记
+            //   pending 桶 → 无双份；reflector MAJOR-5）。task-notification/cron 无附件 →
             //   cmd.attachments() 空列表，行为零变化。sessionBatch 无需补附件（OD-D6 batch 仅
-            //   task-notification，不携图）。
+            //   task-notification，不携附件）。
+            //   [attach-busy-resolve 2026-09-18] 原注释举「≤5MB base64 image」为例已作废 ——
+            //   cmd.attachments() 现为全类型已解析附件（mid-turn drain 未消费到此的项由本兜底承接）。
             req = RunRequest.session(
                 promptValue, sessionUuid, null, config, modelName, null,
                 null, null, null, cmd.attachments());

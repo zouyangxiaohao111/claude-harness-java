@@ -80,7 +80,6 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.Base64;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -111,10 +110,10 @@ public class ChatService {
     private static final String DEFAULT_MODEL = "mock-fast";
     private static final int SETTINGS_SINGLETON_ID = 1;
 
-    // [附件双模式 · path 附件校验] 白名单扩展名（可读盘直传类型）· 对齐前端大文件 path 通道（>5MB PDF/媒体/图片）
-    private static final Set<String> PATH_ATTACHMENT_ALLOWED_EXTENSIONS = Set.of(
-        "pdf", "doc", "docx", "xls", "xlsx", "mp4", "mov", "mp3", "wav", "webm",
-        "jpg", "jpeg", "png", "gif", "webp");
+    // [附件双模式 · path 附件校验] 用户裁定 2026-09-18「所有文件都允许走 path 通道」——
+    //   原 PATH_ATTACHMENT_ALLOWED_EXTENSIONS 15 项扩展名白名单（pdf/doc/docx/xls/xlsx/mp4/mov/mp3/wav/webm/
+    //   jpg/jpeg/png/gif/webp）已整条移除：zip/txt/csv/md/ogg/m4a/bmp 等一律被它 warn 跳过进不了模型。
+    //   path 通道的安全性由「存在性 + ≤200MB + 防穿越」三道门承担，扩展名不是安全边界（见 resolveAttachmentPath）。
     // [附件双模式] path 附件单文件大小上限 200MB（Files.size 校验；对齐前端 >5MB 阈值 + 留大余量防读盘拖垮）
     private static final long PATH_ATTACHMENT_MAX_BYTES = 200L * 1024 * 1024;
     // [附件双模式] path 附件扩展名 → mediaType（register 推断用；对齐 AttachmentController.EXTENSION_TO_MIME 子集）
@@ -288,70 +287,120 @@ public class ChatService {
         //   能进 drainForQuery 快照（sleepRan=false 绝大多数工具边界 threshold=NEXT），在下一工具边界
         //   被当前轮 mid-turn 注入同轮回答；仅当前轮不再调工具时才留到 turn 结束由 CronIdleExecutor
         //   起新轮兜底消费（mainThreadConsumable 不看 priority，兜底不受影响）。
-        // [OD-D5] busy-queued 携图：从 req.attachments() 提取 image 类（≤5MB base64 直传项）→
-        //   QueueItem.attachments 携带。不预写 pendingPromptImages（防共享桶错配 + 端后 doRun
-        //   双注册；reflector MAJOR-2/5）——drain 消费点逐项 registerRunPromptImages 消费即清。
-        //   contentId/path 大图/PDF/media 本期 busy mid-turn 不支撑（端后兜底 doRun 空闲链）。
-        //   空图 → 现状纯文本零变化。
-        java.util.List<AttachmentRequest> busyImages = busyQueuedImageAttachments(req);
+        // [attach-busy-resolve 2026-09-18] busy-queued 携<b>全部已解析附件</b>（对齐 CC「入队不裁剪」）。
+        //   原实现只携 {type=image + base64 非空 + ≤5MB} 三项（busyQueuedImageAttachments）⇒
+        //   PDF / Word / Excel / 大图 / 大文件在 busy（agent 正在流式输出）时被<b>静默丢弃</b>
+        //   （无任何日志），用户发的文件永远到不了模型。现改为跑与空闲路径同源的校验 + 解析链
+        //   （见 busyQueuedResolvedAttachments）。
+        //   ⛔ 仍不预写 pendingPromptImages/pendingPdfs（防共享桶错配 + 端后 doRun 双注册；
+        //      reflector MAJOR-2/5）——登记仍由 drain 消费点逐项 registerRunPromptImages /
+        //      registerRunPromptPdfs 即时消费即清；本处只做「校验 + 附件表注册得 contentId」。
+        java.util.List<AttachmentRequest> busyAttachments = busyQueuedResolvedAttachments(sessionId, req);
+        // [busy 附件快照] 非图片附件快照（V63 user_attachments）随队列携带 —— busy 消息的 user 行不在
+        //   controller 落库（busy 分支只入队），而在 drain 时点由 ChatService.persistAppendedMessage
+        //   user 分支 createQueuedUserMessage(...， m.userAttachments()) 落库 ⇒ 快照必须经队列带到落库点，
+        //   否则 user_attachments 恒 NULL（F5 重拉后气泡附件胶囊消失、预览 url 拼不出）。
+        //   ⭐ 快照取自 <b>busyAttachments（已解析列表）</b>而非 req.attachments()（原始请求）：
+        //      path 附件（local-read）在原始请求里只有 path、<b>没有 contentId</b>，只有 resolveAttachments
+        //      跑过（注册附件表）之后才有 ⇒ 用原始列表构造会让 path 附件 F5 后<b>没有预览 url</b>
+        //      （前端靠 contentId 拼 /attachments/content/{sid}/{cid}）。
+        //   图片【不】入快照：图片走 image_paste_ids（V46）+ image-cache 通道（双写前端画两遍）；
+        //   复用既有 userAttachmentSnapshotOf（与空闲路径回写同一构造器，不新增平行实现）。
+        java.util.List<ChatMessageDto.UserAttachmentInfo> busyUserAttachments = null;
+        if (!busyAttachments.isEmpty()) {
+            java.util.List<AttachmentRequest> nonImage = new java.util.ArrayList<>();
+            for (AttachmentRequest att : busyAttachments) {
+                if (att != null && !isImageAttachment(att)) {
+                    nonImage.add(att);
+                }
+            }
+            java.util.List<ChatMessageDto.UserAttachmentInfo> snap = userAttachmentSnapshotOf(nonImage);
+            busyUserAttachments = snap.isEmpty() ? null : snap;
+        }
         notificationQueue.enqueue(new NotificationQueue.QueueItem(
             content, NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,
             null, userMessageId, false, "busy-queued", false, null, sessionId,
-            null /* boundProject */, null /* scheduleId */, busyImages));
+            null /* boundProject */, null /* scheduleId */, busyAttachments, busyUserAttachments));
         if (log.isInfoEnabled()) {
-            log.info("QUEUE busy 携附件: session={} uuid={} images={}（OD-D5 busy 图片通道：≤5MB base64 直传项随队列入队，"
-                    + "drain 消费点逐项注册；大图/PDF/media 端后兜底）",
-                sessionId, userMessageId, busyImages == null ? 0 : busyImages.size());
+            log.info("QUEUE busy 携附件: session={} uuid={} attachments={} userAttachments={}"
+                    + "（入队不裁剪：已通过校验/解析的附件随队列携带，drain 消费点逐项注册；未过校验项已在入队处 "
+                    + "warn 拦下。busy 附件快照：非图片项（含 path 附件解析后 contentId）随队列携带 → drain 落库 "
+                    + "V63 列，F5 重拉气泡附件胶囊 + 预览 url）",
+                sessionId, userMessageId, busyAttachments == null ? 0 : busyAttachments.size(),
+                busyUserAttachments == null ? 0 : busyUserAttachments.size());
         }
         queueEventPublisher.emitChanged(sessionId);
     }
 
     /**
-     * [OD-D5] 提取 busy-queued 可携带图片附件（≤5MB base64 image 直传项）。
+     * [attach-busy-resolve 2026-09-18] busy 入队附件 = 「已校验 + 已解析」形态（对齐 CC「入队不裁剪」）。
      *
-     * <p>对齐 CC busy enqueue 携 {@code pastedContents}（handlePromptSubmit.ts:340）——CC 只把
-     * 「图片粘贴内容」随命令携带，非图片附件（PDF/media/path 大图）不在 busy 内联注入范围。
-     * Java 侧过滤条件：
-     * <ul>
-     *   <li>{@code type=image} 或 {@code mediaType=image/*}（同 {@code LlmAgentLoop.isImageAttachment}）</li>
-     *   <li>{@code base64} 非空白（直传内容；contentId/path 通道需空闲 resolveAttachments 补全，
-     *       busy mid-turn 不支撑）</li>
-     *   <li>{@code base64.length() ≤ 5MB}（Anthropic image block base64 硬限制，apiLimits.ts:19；
-     *       超限大图本期走端后兜底 doRun 空闲链，不随 busy 队列内联注入）</li>
-     * </ul>
-     * 空附件 / 无命中 → 空列表（纯文本行为零变化）。
+     * <p><b>WHY（CLAUDE.md 规则 9）</b>：busy（agent 正在流式输出）时再发消息走
+     * {@link #enqueueBusyPrompt}（不落库、不 processUserMessage）——该路径<b>完全绕过</b>
+     * {@code processUserMessage} 里的三道门（数量门 {@code :865}、{@link #resolveAttachments} {@code :871}、
+     * {@link MediaLimitGuard} {@code :876}）。原实现只按类型挑 image，导致：
+     * <ol>
+     *   <li>非图片附件<b>静默丢弃</b>（连 debug 日志都没有）→ 用户发的 Word/PDF/Excel 永远到不了模型；</li>
+     *   <li>若只放开类型闸门而不补门 ⇒ {@code path} 是 HTTP 请求体字段，可被构造（越权读盘 / 任意大文件）
+     *       → <b>安全回归</b>。</li>
+     * </ol>
+     * 故本方法<b>同源复用</b>空闲路径的三道门（不新写一套判据，避免两侧漂移）：
+     * <ol>
+     *   <li><b>数量门</b>：{@code req.attachments().size() > MAX_ATTACHMENTS_PER_REQUEST(50)} → 抛
+     *       {@link ValidationException}（同 {@code :865-867}；busy 路径原本无任何数量门 ⇒ 单条队列项
+     *       可携带任意多附件）。controller 同步调用 → 400；{@code processUserMessage} 兜底调用 → 同空闲路径语义。</li>
+     *   <li><b>校验/解析门</b>：{@link #resolveAttachments}（扩展名白名单 / {@code Files.exists} /
+     *       ≤200MB / 防穿越 / 附件表注册得 contentId / base64 PDF 落盘注册）。未过项由内部 warn 拦下
+     *       （fail loud，不静默）。</li>
+     *   <li><b>媒体限额门</b>：{@link MediaLimitGuard#guard}（100 项裁剪保最新 + &gt;5MB base64 图压缩，
+     *       压缩失败拒绝）。</li>
+     * </ol>
      *
-     * @param req 原请求体（可 null）
-     * @return 可携带图片附件列表（恒非 null；无 → emptyList）
+     * <p>空附件 / 无 req → 空列表（纯文本 busy 行为零变化）。
+     *
+     * @param sessionId 会话 id（{@link #resolveAttachments} 附件表注册归属）
+     * @param req       原请求体（可 null）
+     * @return 已校验/已解析附件列表（恒非 null；无 → emptyList）
+     * @throws ValidationException 附件数 &gt; {@value #MAX_ATTACHMENTS_PER_REQUEST}
      */
-    private java.util.List<AttachmentRequest> busyQueuedImageAttachments(SendMessageRequest req) {
+    private java.util.List<AttachmentRequest> busyQueuedResolvedAttachments(String sessionId, SendMessageRequest req) {
         if (req == null || req.attachments() == null || req.attachments().isEmpty()) {
             return java.util.List.of();
         }
-        java.util.List<AttachmentRequest> images = new java.util.ArrayList<>();
-        for (AttachmentRequest att : req.attachments()) {
-            if (att == null) {
-                continue;
-            }
-            boolean imageType = (att.type() != null && "image".equalsIgnoreCase(att.type()))
-                || (att.mediaType() != null && att.mediaType().startsWith("image/"));
-            if (!imageType) {
-                continue;
-            }
-            String b64 = att.base64();
-            if (b64 == null || b64.isBlank()) {
-                continue;   // contentId/path 通道 busy mid-turn 不支撑（红线 §五.7）
-            }
-            if (b64.length() > MediaLimitConstants.API_IMAGE_MAX_BASE64_SIZE) {
-                if (log.isDebugEnabled()) {
-                    log.debug("QUEUE busy 跳过超限图（>5MB base64 不内联注入，端后 doRun 兜底）: filename={} base64Len={}",
-                        att.filename(), b64.length());
-                }
-                continue;
-            }
-            images.add(att);
+        // 门 ①：数量门（与空闲路径 :865-867 同源同判据同文案）
+        if (req.attachments().size() > MAX_ATTACHMENTS_PER_REQUEST) {
+            log.warn("QUEUE busy 附件超量被拒: session={} attachments={}（单请求上限 {}，同空闲路径 :865 数量门）",
+                sessionId, req.attachments().size(), MAX_ATTACHMENTS_PER_REQUEST);
+            throw new ValidationException("一次最多发送 " + MAX_ATTACHMENTS_PER_REQUEST + " 个附件");
         }
-        return images;
+        // 门 ②：校验 + 解析（同源 resolveAttachments：白名单/存在性/≤200MB/防穿越/附件表注册）
+        List<AttachmentRequest> resolved = resolveAttachments(sessionId, req.attachments());
+        // 门 ③：媒体限额（100 项裁剪 + 5MB 图压缩；同源 :876）
+        resolved = MediaLimitGuard.guard(resolved);
+        if (log.isInfoEnabled()) {
+            log.info("QUEUE busy 附件解析: session={} 原始={} 已解析={}（三道门与空闲路径同源：数量≤{} / resolveAttachments "
+                    + "白名单+存在性+≤200MB+防穿越 / MediaLimitGuard 100项+5MB）",
+                sessionId, req.attachments().size(), resolved.size(), MAX_ATTACHMENTS_PER_REQUEST);
+        }
+        return resolved;
+    }
+
+    /**
+     * [busy 附件快照] 是否图片附件（{@code type=image} 或 {@code mediaType=image/*}）·
+     * 同 {@code LlmAgentLoop.isImageAttachment} 判据。
+     *
+     * <p>单点判据：{@link #enqueueBusyPrompt} 的 busy 附件快照<b>非图片过滤</b>用它把图片挡在
+     * user_attachments 之外（图片走 {@code image_paste_ids} V46 + image-cache 通道；两处判据若各写
+     * 一份会漂移 —— 一处改一处忘：图片要么漏进 user_attachments 双写、要么漏出 imagePasteIds 丢失）。
+     * 模型注入侧的类型判别在 {@code busyQueuedResolvedAttachments} → {@code LlmAgentLoop} 的
+     * {@code injectAttachments/hasImage} 谓词，本方法不参与该链路。
+     *
+     * @param att 附件项（调用方保证非 null）
+     * @return true = 图片附件
+     */
+    private static boolean isImageAttachment(AttachmentRequest att) {
+        return (att.type() != null && "image".equalsIgnoreCase(att.type()))
+            || (att.mediaType() != null && att.mediaType().startsWith("image/"));
     }
 
     // ─────────────────────────── P5 · 变量 + 扩展对齐 ───────────────────────────
@@ -627,11 +676,25 @@ public class ChatService {
                 if (ts == null) {
                     ts = baseTs.plusNanos(tsSeq++);
                 }
-                messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
-                    ts, false, inj.queuedOrigin());
+                // [busy 附件快照] 携快照（非图片附件）才走 8 参重载：与实时落库分支
+                //   （persistAppendedMessage user 分支 m.userAttachments()）同源（同一
+                //   QueueItem.userAttachments）→ 补落路径落出同一 user_attachments，
+                //   F5 重拉气泡附件胶囊 + 预览 url 不因走哪条落库路径而异。
+                //   无快照仍走 6 参（invoked overload 不变 = 既有落库形状/调用方契约零变化）。
+                if (inj.userAttachments() != null && !inj.userAttachments().isEmpty()) {
+                    messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
+                        ts, false, inj.queuedOrigin(),
+                        null /* imagePasteIds：图片走 AM 回写（updateUserImagePasteIds）通道，本处不重复 */,
+                        inj.userAttachments());
+                } else {
+                    messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
+                        ts, false, inj.queuedOrigin());
+                }
                 if (log.isInfoEnabled()) {
-                    log.info("ChatService: mid-turn 注入排队 user 消息补落库 session={} id={} chars={}",
-                        sessionId, inj.uuid(), inj.content() == null ? 0 : inj.content().length());
+                    log.info("ChatService: mid-turn 注入排队 user 消息补落库 session={} id={} chars={}"
+                            + " userAttachments={}（携快照走 8 参重载落 V63 列，F5 气泡附件胶囊）",
+                        sessionId, inj.uuid(), inj.content() == null ? 0 : inj.content().length(),
+                        inj.userAttachments() == null ? 0 : inj.userAttachments().size());
                 }
             } catch (Exception e) {
                 log.warn("ChatService: mid-turn 注入排队 user 消息落库失败（不打断收口）: session={} id={}: {}",
@@ -1507,9 +1570,10 @@ public class ChatService {
                             ctx.lastUserMessageId.set(m.id());
                             if (log.isInfoEnabled()) {
                                 log.info("ChatService: mid-turn 注入排队 user 消息实时原位落库 session={} id={}"
-                                        + " images={}",
+                                        + " images={} userAttachments={}",
                                     sessionId, m.id(),
-                                    m.imagePasteIds() == null ? 0 : m.imagePasteIds().size());
+                                    m.imagePasteIds() == null ? 0 : m.imagePasteIds().size(),
+                                    m.userAttachments() == null ? 0 : m.userAttachments().size());
                             }
                         } catch (Exception e) {
                             log.warn("ChatService: mid-turn 注入排队 user 消息实时原位落库失败: session={} id={}: {}",
@@ -2760,7 +2824,8 @@ public class ChatService {
      * <ul>
      *   <li><b>1. {@code base64}</b> 非空白 → 原样保留（CC {@code PastedContent.content} 直发，
      *       ≤5MB 图片 base64 通道，imageStore/附件表不经手）</li>
-     *   <li><b>1.5. {@code path}</b> 非空白（local-read=true）→ 校验白名单/存在/≤200MB/防穿越 → 注册附件表
+     *   <li><b>1.5. {@code path}</b> 非空白（local-read=true）→ 校验存在/≤200MB/防穿越（<b>无扩展名白名单</b>，
+     *       用户裁定 2026-09-18 全扩展名放行）→ 注册附件表
      *       （source='path'）→ 得新 contentId → 输出 {type, contentId, filename, mediaType, base64=null, path}</li>
      *   <li><b>2. {@code type=pdf} + contentId</b>（无 base64）→ contentId 首选附件表（{@link AttachmentService#getContent}
      *       校验 pdf 记录存在，附件表 path 读盘）；附件表无记录且旧 {@link PdfAttachmentStore} 有 → store 兜底
@@ -2824,7 +2889,8 @@ public class ChatService {
             }
             // 1.5) [附件双模式 · 统一附件表 contentId · 用户拍板 2026-09-02] path 附件（本地直读，省 upload）：
             //   local-read=true（前后端同机 Tauri 桌面）时前端把 >5MB 大文件以本地绝对路径 path 随消息直传。
-            //   校验白名单扩展名 + Files.exists + size≤200MB + 防穿越（normalize 禁 ../ 符号链接）通过 →
+            //   校验 Files.exists + size≤200MB + 防穿越（normalize 禁 ../ 符号链接）通过 →
+            //   （扩展名白名单已移除 · 用户裁定 2026-09-18「所有文件都允许走 path 通道」）
             //   attachmentService.register(source='path') 注册附件表（contentId=attachments 自增 id，零拷贝不复制
             //   进 store）→ resolved 输出 AttachmentRequest(type, contentId, filename, mediaType, base64=null, path)。
             //   校验失败 → warn 跳过（fail loud，不静默丢弃）。
@@ -3094,15 +3160,40 @@ public class ChatService {
         return lower.equals("video") || lower.equals("audio") || lower.equals("file");
     }
 
-    /** [附件双模式] 附件表记录 mediaType 是否为媒体（video/* | audio/*；octet-stream 容忍——前端 file 类型未精确标注）。 */
+    /**
+     * [附件双模式] 附件表记录 mediaType 是否为「媒体 contentId 分支」可消费的记录（撞号门）。
+     *
+     * <p><b>判据是反向排除（只拒「明显非媒体」），不是正向白名单</b>：media 分支拿到的 contentId 是
+     * <b>附件表 id</b>，而 {@code MediaAttachmentStore} 的 id 是 {@code nextId(sessionId)} <b>每会话从 1
+     * 重算的独立 id 空间</b> —— 两者毫无关联，同号纯属巧合。附件表里<b>唯一能确定「这条记录不可能是本次
+     * 要的媒体」</b>的情形，是它属于一条<b>互斥的类型通道</b>：{@code image/*}（图片通道 image-cache /
+     * 图片 upload）与 {@code application/pdf}（PDF 通道 pdf-cache）。<b>其余一切都可能是 {@code type=file}
+     * 的正当目标，必须放行</b>：{@code video/*} · {@code audio/*} · {@code application/octet-stream}
+     * （前端未精确标注 File.type 时的回落）· 文档类 MIME（{@code docx/xlsx/doc/xls} 等）· null（未标注）。
+     *
+     * <p><b>WHY（2026-09-18 · 批 ATT-UPLOAD-DOC 的必要补门）</b>：upload 白名单放开到
+     * {@code doc/docx/xls/xlsx} 后，前端 {@code planAttachmentChannel} 对 {@code type='file'} 只留
+     * upload 一条腿、传的是真实 {@code File.type}（OOXML MIME / {@code application/msword} /
+     * {@code application/vnd.ms-excel}），拿回附件表 contentId 后随消息发
+     * {@code type=file + contentId}（无 base64、无 path）⇒ 落进 media 分支。若此处仍是正向白名单
+     * （只认 video/audio/octet-stream），文档 MIME 会被判「非媒体」⇒ 当撞号按未命中 ⇒ 回退
+     * {@code MediaAttachmentStore.get(sessionId, 附件表 id)} ⇒ <b>id 空间不同 ⇒ 结构性未命中</b> ⇒
+     * warn + continue ⇒ <b>静默丢弃</b>（前端 chip 在、模型收不到，正面违反红线）；偶然同号时更坏 ——
+     * 会把一条<b>无关的旧媒体</b>送进模型。本方法的 javadoc 与调用点注释（「明显非媒体（image/* 或
+     * application/pdf）」）本就写明了该意图，是<b>实现与文档意图相矛盾</b>，此处按文档意图改正。
+     *
+     * <p>⚠️ <b>本门是启发式，不是完整性保证</b>：它只能挡住「类型互斥」的撞号，挡不住「同号且同为文档类」
+     * 的巧合 —— 那种情形与「正常 upload 的文档」在请求里是<b>同一个比特形态</b>（type=file + contentId
+     * + 无 base64/path），不存在能区分它们的实现。
+     */
     private static boolean isMediaRecordType(AttachmentRecord rec) {
         String mt = rec.getMediaType();
         if (mt == null) {
             return true; // 未标注 → 容忍存在性（未知即按媒体消费，下游按实际 mediaType 分流）
         }
         String lower = mt.toLowerCase();
-        return lower.startsWith("video/") || lower.startsWith("audio/")
-            || "application/octet-stream".equals(lower);
+        // 只拒属于互斥类型通道的记录：image/*（图片通道）与 application/pdf（PDF 通道）
+        return !lower.startsWith("image/") && !lower.startsWith("application/pdf");
     }
 
     /**
@@ -3268,12 +3359,17 @@ public class ChatService {
      *
      * <p><b>校验链</b>（local-read 本地直读外部磁盘路径 = 把宿主机文件路径暴露给后端，必须严格校验）：
      * <ol>
-     *   <li>扩展名白名单 {@link #PATH_ATTACHMENT_ALLOWED_EXTENSIONS}</li>
      *   <li>{@code Files.exists}（文件真实存在，非空目录）</li>
      *   <li>{@code Files.size ≤ 200MB}（{@link #PATH_ATTACHMENT_MAX_BYTES}）</li>
      *   <li>防穿越：{@code normalize} 后禁 {@code ..} 路径段 / 符号链接（防指向任意系统文件）</li>
      * </ol>
      * 任一失败 → warn 并返回 null（fail loud，调用方跳过该附件）。
+     *
+     * <p><b>扩展名不再设白名单</b>（用户裁定 2026-09-18「所有文件都允许走 path 通道」）：原
+     * {@code PATH_ATTACHMENT_ALLOWED_EXTENSIONS} 15 项白名单已移除，任意扩展名（含无扩展名）均可登记。
+     * 理由：path 通道是「前后端同机 · 用户自己选的文件」通道，扩展名不是安全边界——真正的边界是上列
+     * 三道门；白名单只起到「静默丢弃用户附件」的副作用（zip/txt/csv/md/ogg/m4a/bmp 全部到不了模型）。
+     * 未知扩展名的 mediaType 由 {@link #PATH_EXT_TO_MEDIA_TYPE} 回落 {@code application/octet-stream}。
      *
      * <p><b>注册</b>：{@code attachmentService.register(sessionId, path, mediaType, filename, size, "path")}
      * → contentId = attachments 自增 id（零拷贝：不复制进 store，附件表 path 记外部绝对路径）。
@@ -3293,15 +3389,12 @@ public class ChatService {
         if (p == null) {
             return null; // 校验失败已 warn（fail loud）
         }
-        // 扩展名白名单
         String filename = (att.filename() != null && !att.filename().isBlank())
             ? att.filename() : p.getFileName().toString();
+        // [全扩展名放行 · 用户裁定 2026-09-18] 此处原有 PATH_ATTACHMENT_ALLOWED_EXTENSIONS 白名单校验
+        //   （ext 不在 15 项内 → warn + return null）已整条移除：任意扩展名/无扩展名均可登记走 path 通道。
+        //   ext 仍用于下方 mediaType 推断（PATH_EXT_TO_MEDIA_TYPE，未知 → application/octet-stream）。
         String ext = extensionOf(filename);
-        if (!PATH_ATTACHMENT_ALLOWED_EXTENSIONS.contains(ext)) {
-            log.warn("[attachments path] path 附件扩展名不在白名单，跳过: path={} filename={} ext={}",
-                rawPath, filename, ext);
-            return null;
-        }
         long size;
         try {
             if (!Files.exists(p) || Files.isDirectory(p)) {

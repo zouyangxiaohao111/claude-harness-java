@@ -12,6 +12,7 @@ import { useTodoStore } from '../stores/todoStore'
 import { teamsApi } from '../api/teams'
 import { EMPTY_COMPACT_TABLE, dropCompactSession, isCompactCanceled, reduceCompactTable, type CompactProgressWire, type CompactTable } from '../utils/compactProgress'
 import { noteInboundFrame } from '../utils/inboundFrameStats'
+import { parseDrainedQueueItems, type DrainedQueueItem } from '../utils/queuedUserBubble'
 
 /** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
  *  notifier.markFrameDirty：N 次 markDirty 折叠为一次动画帧 flush，通知推迟到下一帧）。
@@ -181,8 +182,10 @@ export function useChatSocket(
    *   topic 参数：事件来源的 streamTopic，App 侧校验当前登记匹配才删（防旧 turn 终止误删新 turn 登记） */
   onSessionDone?: (sessionId: string, topic?: string) => void,
   /** 排队命令被后端消费（queue.drained）→ 回调 App：append 正式气泡 + 登记新 streamTopic。
-   *   drained[].uuid = 后端 user 消息 id（DB 权威），前端气泡 id 用它 → GET 刷新不重复 */
-  onQueueDrained?: (sessionId: string, drained: { uuid?: string; content: string }[]) => void,
+   *   drained[].uuid = 后端 user 消息 id（DB 权威），前端气泡 id 用它 → GET 刷新不重复。
+   *   [busy 气泡附件胶囊] drained[].userAttachments = 后端权威附件快照（与 GET /messages 同投影）——
+   *   原样透传（形状搬运），App 侧直接挂到气泡上；前端不重算 contentId/url。 */
+  onQueueDrained?: (sessionId: string, drained: DrainedQueueItem[]) => void,
   /** 排队命令快照变化（queue.changed）→ 回调 App：刷新排队框（useCommandQueue.setQueued） */
   onQueueChanged?: (sessionId: string, commands: { content: string; mode: string; isEditable: boolean; isMeta?: boolean }[]) => void,
   /** [断连恢复] WS 被服务端强杀（send time limit 超时 → close）后,重连收到的第一个 message.complete
@@ -351,9 +354,10 @@ export function useChatSocket(
         // 排队条刷新（remaining 移除已消费）+ 气泡 append 回调（App 立即 append 用户2 气泡，
         //   渲染按 userMessageId 分组自动排到当前 assistant 工具轮之后 —— 工具边界插入，不延后到 complete）
         onQueueChangedRef.current?.(sid, remaining.map(toQueued))
-        onQueueDrainedRef.current?.(sid, drained.map((d) => ({
-          uuid: d.uuid != null ? String(d.uuid) : undefined, content: String(d.content ?? ''),
-        })))
+        // [busy 气泡附件胶囊] 载荷归一（含后端权威快照 userAttachments）抽到 utils/queuedUserBubble：
+        //   闭包内联的映射无法单测 ⇒ 写错时单测全绿而线上胶囊消失。⛔ 不要在此处按请求体重算附件
+        //   —— path 附件请求体无 contentId，重算必得不可点胶囊（详见该模块头注）。
+        onQueueDrainedRef.current?.(sid, parseDrainedQueueItems(drained))
       }
     })
     // [Phase2 · session-file-panel-collapse-atfile] 会话改动文件（files.changed · 全量快照整表替换 → chatStore.changedFiles）

@@ -92,9 +92,13 @@ class ChatServiceBusyImagePersistenceTest {
     }
 
     @Test
-    @DisplayName("enqueueBusyPrompt：req 含 ≤5MB base64 image → QueueItem.attachments 携带；非 image/无附件 → 空")
+    @DisplayName("enqueueBusyPrompt：入队不裁剪 —— image/video 均随队列携带；未过校验的 path 项被拦下")
     void enqueueBusyPrompt_carriesImageAttachments_only() {
         // GIVEN: 空闲 turn 已跑 → busy 排队；req 混合 image(≤5MB base64) + video + path 大图(无 base64)
+        // ⚠️ [attach-busy-resolve 2026-09-18] 本用例契约已<b>有意变更</b>（对齐 CC「入队不裁剪」）：
+        //   旧契约「只携 image base64 项」= 非图片附件被静默丢弃的缺陷本身。
+        //   新契约：全部已解析附件随队列携带；未过校验（本例 attachmentService 未注入 + localRead=false
+        //   → path 分支不激活）的项被拦下。完整契约见 ChatServiceBusyAttachResolveTest。
         NotificationQueue queue = mock(NotificationQueue.class);
         QueueEventPublisher qep = mock(QueueEventPublisher.class);
         ReflectionTestUtils.setField(service, "notificationQueue", queue);
@@ -109,7 +113,8 @@ class ChatServiceBusyImagePersistenceTest {
 
         service.enqueueBusyPrompt(SESSION, "msg-q-1", req);
 
-        // THEN: enqueue 的 QueueItem.attachments 只含 image base64 项
+        // THEN: enqueue 的 QueueItem.attachments = 已解析项（image base64 + video base64），
+        //   未过校验的 path 项（attachmentService 未注入 / local-read=false）被拦下
         ArgumentCaptor<NotificationQueue.QueueItem> captor = ArgumentCaptor.forClass(NotificationQueue.QueueItem.class);
         verify(queue).enqueue(captor.capture());
         NotificationQueue.QueueItem item = captor.getValue();
@@ -117,7 +122,10 @@ class ChatServiceBusyImagePersistenceTest {
         assertThat(item.workload()).isEqualTo("busy-queued");
         assertThat(item.sessionId()).isEqualTo(SESSION);
         assertThat(item.uuid()).isEqualTo("msg-q-1");
-        assertThat(item.attachments()).hasSize(1);
+        assertThat(item.attachments())
+            .as("入队不裁剪：image 与 video 都在（path 项因未过校验被拦下）")
+            .extracting(AttachmentRequest::type)
+            .containsExactly("image", "video");
         assertThat(item.attachments().get(0).contentId()).isEqualTo("1");
         assertThat(item.attachments().get(0).base64()).isEqualTo(PNG_BASE64);
     }

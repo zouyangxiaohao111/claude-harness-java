@@ -232,10 +232,22 @@ public class AgentState {
      * busy-queued 项（busy-queued 才需落库），queuedOrigin 供 ChatService 落库联动
      * createQueuedUserMessage(..., queuedOrigin)。2 参便捷构造器默认 queuedOrigin=null
      * （测试 / 旧调用方兼容；语义 = 非标记落库，与现状等价）。
+     *
+     * <p>[busy 附件快照] 4 参扩展 + {@code userAttachments}（<b>非图片</b>附件快照 · V63 落库用）：
+     * busy 消息的 user 行在 drain 时点落库，快照来源只有队列项
+     * （{@code NotificationQueue.QueueItem.userAttachments}）—— registry 是它到
+     * {@code ChatService.persistInjectedQueuedMessages} 补落分支的载体。3/2 参便捷构造器默认
+     * null（测试 / 旧调用方兼容；语义 = 无附件快照，落库列恒 NULL，与改动前等价）。
      */
-    public record InjectedQueuedMessage(String uuid, String content, String queuedOrigin) {
+    public record InjectedQueuedMessage(String uuid, String content, String queuedOrigin,
+                                        java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo>
+                                            userAttachments) {
         public InjectedQueuedMessage(String uuid, String content) {
-            this(uuid, content, null);
+            this(uuid, content, null, null);
+        }
+
+        public InjectedQueuedMessage(String uuid, String content, String queuedOrigin) {
+            this(uuid, content, queuedOrigin, null);
         }
     }
     /**
@@ -622,6 +634,23 @@ public class AgentState {
      */
     public void addInjectedQueuedMessage(String uuid, String content, String queuedOrigin) {
         this.injectedQueuedMessages.add(new InjectedQueuedMessage(uuid, content, queuedOrigin));
+    }
+
+    /**
+     * [busy 附件快照] 4 参重载：+ 非图片附件快照（{@code QueueItem.userAttachments}）。
+     *
+     * <p>drain busy-queued 时登记：实时落库分支已把同一快照挂到产出 DTO（{@code m.userAttachments()}）；
+     * 本处登记供轮末 <b>补落</b>分支（实时落库漏落时）落出同一份 user_attachments，
+     * 防「实时路径有快照 / 补落路径无快照」二义。
+     *
+     * @param uuid            队列命令 id（CC attachment.source_uuid · 落库用指定 id）
+     * @param content         原始排队文本（可为空串/ null）
+     * @param queuedOrigin    排队来源标记（'busy-queued'；null = 不标记）
+     * @param userAttachments 非图片附件快照（null = 无附件，落库列恒 NULL）
+     */
+    public void addInjectedQueuedMessage(String uuid, String content, String queuedOrigin,
+            java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo> userAttachments) {
+        this.injectedQueuedMessages.add(new InjectedQueuedMessage(uuid, content, queuedOrigin, userAttachments));
     }
 
     /**

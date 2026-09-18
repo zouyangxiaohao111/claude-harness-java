@@ -73,8 +73,10 @@ import java.util.Map;
  * <ol>
  *   <li>空文件 → {@link ValidationException} 400</li>
  *   <li>&gt; 100MB → 400（{@link #MEDIA_MAX_SIZE}，对齐 apiLimits.ts:72 too_large）</li>
- *   <li>非白名单类型（mediaType 非 image/video/audio/pdf 且扩展名不在表）→ 400</li>
- *   <li>魔数不符（防 HTML/文本改名伪装媒体或 PDF 入库）→ 400</li>
+ *   <li>非白名单类型（mediaType 非 image/video/audio/pdf 且扩展名不在表：媒体类 +
+ *       [ATT-DOC] 文档类 doc/docx/xls/xlsx）→ 400</li>
+ *   <li>魔数不符（防 HTML/文本改名伪装媒体或 PDF；[ATT-DOC] 文档类按容器魔数：
+ *       docx/xlsx=ZIP {@code PK\x03\x04}、doc/xls=OLE2）→ 400</li>
  * </ol>
  *
  * <p><b>安全</b>：落盘文件名恒为 {@code {id}.{ext}}（id 自增），<b>不使用客户端原始文件名</b>落盘
@@ -171,11 +173,12 @@ public class AttachmentController {
         // 类型校验：mediaType 主类型 image/video/audio 或扩展名白名单 或 PDF
         if (!isAllowedType(filename, mediaType)) {
             log.warn("附件上传拒绝：非白名单类型（mediaType={} filename={}）session={}", mediaType, filename, sessionId);
-            throw new ValidationException("附件上传失败：不支持的文件类型（支持 image/video/audio/pdf）");
+            throw new ValidationException(
+                    "附件上传失败：不支持的文件类型（支持 image/video/audio/pdf/doc/docx/xls/xlsx）");
         }
-        // 魔数校验（防 HTML/文本改名伪装媒体或 PDF）
+        // 魔数校验（防 HTML/文本改名伪装媒体或 PDF；[ATT-DOC] 文档类按容器魔数：docx/xlsx=ZIP、doc/xls=OLE2）
         byte[] head = readHead(file, sessionId);
-        if (!verifyMagic(head, mediaType)) {
+        if (!verifyMagic(head, mediaType, filename)) {
             log.warn("附件上传拒绝：魔数与类型不符（mediaType={} filename={}）session={}", mediaType, filename, sessionId);
             throw new ValidationException("附件上传失败：文件内容与声明的类型不符（魔数校验失败）");
         }
@@ -407,7 +410,13 @@ public class AttachmentController {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 类型白名单 · mediaType 主类型 image/video/audio 或 PDF；或文件名扩展名白名单兜底。
+     * 类型白名单 · mediaType 主类型 image/video/audio 或 PDF；或文件名扩展名白名单兜底
+     * （媒体类 + [ATT-DOC] 文档类 doc/docx/xls/xlsx）。
+     *
+     * <p>[ATT-DOC · 用户裁定 2026-09-18] 放开到<b>文档类</b>：此前的表只有媒体扩展名，
+     * 而 {@code >5MB 的 Word/Excel} 在前端只能走 upload 腿（{@code attachmentDelivery.ts}
+     * 对 {@code type=file} 的 {@code >5MB} 决策）⇒ 必然命中本门 400「不支持的文件类型」。
+     * 放开后仍由 {@link #verifyMagic} 按容器魔数兜底（docx/xlsx=ZIP、doc/xls=OLE2）。
      */
     private boolean isAllowedType(String filename, String mediaType) {
         if (isPdfFile(filename, mediaType)) {
@@ -425,7 +434,10 @@ public class AttachmentController {
                     || lower.endsWith(".gif") || lower.endsWith(".webp") || lower.endsWith(".bmp")
                     || lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".mkv")
                     || lower.endsWith(".mp3") || lower.endsWith(".wav") || lower.endsWith(".ogg")
-                    || lower.endsWith(".flac");
+                    || lower.endsWith(".flac")
+                    // [ATT-DOC] 文档类（docx/xlsx=OOXML/ZIP；doc/xls=旧版 OLE2）
+                    || lower.endsWith(".doc") || lower.endsWith(".docx")
+                    || lower.endsWith(".xls") || lower.endsWith(".xlsx");
         }
         return false;
     }
@@ -509,8 +521,23 @@ public class AttachmentController {
     /**
      * 魔数校验 · 按 mediaType 具体类型匹配魔数表；仅知主类型（image/* 等）时尝试该组全部魔数。
      * 校验失败返回 false（调用方 400）。
+     *
+     * <p><b>[ATT-DOC] 文档类按扩展名定向判容器</b>（docx/xlsx = OOXML/ZIP {@code 50 4B 03 04}；
+     * doc/xls = 旧版 OLE2 复合文档 {@code D0 CF 11 E0 A1 B1 1A E1}）。
+     * 判据是<b>扩展名</b>而非 mediaType：前端 {@code File.type} 既可能是真实 OOXML MIME，
+     * 也可能是 {@code application/octet-stream}（{@code attachmentDelivery.ts} 的
+     * {@code rawMediaType || 'application/octet-stream'}），依 mediaType 判会漏掉后者。
+     *
+     * <p><b>位置约束（安全）</b>：文档类分支必须落在<b>显式媒体类型判定之后</b>。
+     * 否则 {@code 报告.docx} 声明 {@code application/pdf} 时会被文档类分支（ZIP 恒真）放行，
+     * 绕开 PDF 魔数门 —— 且分流按 {@link #isPdfFile} 会把它落进 pdf-cache，
+     * 正是「非 PDF 入库污染会话」那条既有红线。
+     *
+     * @param h         文件头（{@link #MAGIC_READ_BYTES} 字节，读不足的位置为 0）
+     * @param mediaType 客户端声明 MIME（可 null）
+     * @param filename  客户端原始文件名（文档类容器判定的唯一依据；可 null）
      */
-    private boolean verifyMagic(byte[] h, String mediaType) {
+    private boolean verifyMagic(byte[] h, String mediaType, String filename) {
         String mt = mediaType == null ? "" : mediaType.toLowerCase();
         if (mt.equals("image/png")) return isPng(h);
         if (mt.equals("image/jpeg")) return isJpeg(h);
@@ -524,6 +551,14 @@ public class AttachmentController {
         if (mt.equals("audio/ogg")) return isOgg(h);
         if (mt.equals("audio/flac") || mt.equals("audio/x-flac")) return isFlac(h);
         if (mt.equals("application/pdf")) return isPdf(h);
+        // [ATT-DOC] 文档类容器（扩展名定向）· 必须在上述显式媒体类型判定<b>之后</b>，
+        //   否则 .docx 声明 application/pdf 会经本分支（ZIP 恒真）绕开 PDF 魔数门
+        if (isOoxmlDocFile(filename)) {
+            return isZip(h);
+        }
+        if (isLegacyOfficeDocFile(filename)) {
+            return isOle2(h);
+        }
         if (mt.startsWith("image/")) {
             return isPng(h) || isJpeg(h) || isGif(h) || isWebp(h) || isBmp(h);
         }
@@ -588,5 +623,41 @@ public class AttachmentController {
 
     private boolean isPdf(byte[] h) {
         return h.length >= 5 && h[0] == '%' && h[1] == 'P' && h[2] == 'D' && h[3] == 'F' && h[4] == '-';
+    }
+
+    /**
+     * [ATT-DOC] OOXML 文档（docx/xlsx）· 按扩展名判定（大小写不敏感）。
+     *
+     * <p>OOXML 是 ZIP 容器（本地文件头 {@code PK\x03\x04}）；此处只判「是不是 ZIP 容器」，
+     * 不深入校验 OPC 结构（首条目名 / [Content_Types].xml）——理由是读头只有
+     * {@link #MAGIC_READ_BYTES} 字节，且真 docx 的首条目顺序并非规范保证，
+     * 加严会误伤真实文件（假阴性 = 用户合法文档传不上，比弱识别更坏）。
+     */
+    private boolean isOoxmlDocFile(String filename) {
+        if (filename == null) {
+            return false;
+        }
+        String lower = filename.toLowerCase();
+        return lower.endsWith(".docx") || lower.endsWith(".xlsx");
+    }
+
+    /** [ATT-DOC] 旧版 Office 文档（doc/xls）· 按扩展名判定（大小写不敏感）。 */
+    private boolean isLegacyOfficeDocFile(String filename) {
+        if (filename == null) {
+            return false;
+        }
+        String lower = filename.toLowerCase();
+        return lower.endsWith(".doc") || lower.endsWith(".xls");
+    }
+
+    /** [ATT-DOC] ZIP 容器本地文件头 {@code PK\x03\x04}（OOXML docx/xlsx）。 */
+    private boolean isZip(byte[] h) {
+        return h[0] == 'P' && h[1] == 'K' && h[2] == 0x03 && h[3] == 0x04;
+    }
+
+    /** [ATT-DOC] OLE2 复合文档魔数（旧版 doc/xls）。 */
+    private boolean isOle2(byte[] h) {
+        return (h[0] & 0xFF) == 0xD0 && (h[1] & 0xFF) == 0xCF && (h[2] & 0xFF) == 0x11 && (h[3] & 0xFF) == 0xE0
+                && (h[4] & 0xFF) == 0xA1 && (h[5] & 0xFF) == 0xB1 && (h[6] & 0xFF) == 0x1A && (h[7] & 0xFF) == 0xE1;
     }
 }

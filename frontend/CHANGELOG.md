@@ -2,6 +2,83 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.13] - 2026-09-18
+
+### 🔴 修复：附件走不通的**三条独立病因**（+ 四处体验/契约问题）
+
+> 用户原话：「Word/PDF 不能上传多份，现在只许一份」。调查发现**三个独立缺陷叠在一起** ——
+> 每一个都能单独让附件消失。
+
+#### ① 前端：非图片非PDF 附件改走 `path` 通道（修「小 Word/Excel 静默消失」）
+- **根因**：`addPaths` 的 path 通道被 `>5MB` 挡住，而 `BASE64_LIMIT = 5MB` 本是**图片**的
+  Anthropic API 硬限制（CC `apiLimits.ts:22` `API_IMAGE_MAX_BASE64_SIZE`），却被**无差别套用到所有类型**
+  ⇒ ≤5MB 的 Word/Excel 被塞进 base64 通道，而后端对 `type=file` 的 base64 **没有任何消费方** ⇒ 静默丢弃。
+- **反直觉现象**：同名的 >5MB 文件反而走 path、模型能拿到路径说明 ⇒ **小的丢、大的能用**。
+- **修复**：`localRead=true` 时「>5MB **或（非图片且非PDF）**」都走 path（零拷贝、不落盘、不进请求体）。
+  图片与 PDF 保持原语义（图片需 base64 成 image block；PDF 有自己的内联 document block 链）。
+- 顺带：**PDF 不再白绕一圈 base64**（此前 ≤5MB 的 PDF 会在 `~/.nexusai/pdf-cache/` **多写一份副本**）。
+
+#### ② 后端：busy 等候区不再丢弃非图片附件（+ 补回三道校验门）
+- **根因**：agent 正在流式输出时发送的消息会入队，而 `busyQueuedImageAttachments` **只携带
+  ≤5MB 的 base64 图片** ⇒ PDF/Word/Excel/大图/大文件被静默丢弃（**零日志**）；两个消费点
+  （轮内 drain / 轮后 `CronIdleExecutor`）都只兜图片 ⇒ **假兜底**。
+- **修复**：入队侧复用**空闲路径同源的三道门**（数量 ≤50 / `resolveAttachments` 校验解析 /
+  `MediaLimitGuard` 100 项 + 5MB）⇒ 队列携带**已解析**附件；drain 侧把 `hasImage` 与
+  `injectAttachments` 拆成两个独立谓词，并补 `registerRunPromptPdfs` + 媒体/大图路径说明。
+- ⚠️ **两个「改了等于没改」的坑（调查中实证）**：只改入队侧 = 行为零变化（两侧是**同一组三条件的
+  两份拷贝**）；`MediaLimitGuard` 全仓**仅一个调用点**、在空闲 HTTP 路径 ⇒ 不能当 busy 路径的兜底门。
+
+#### ③ 后端：path 附件不再设扩展名白名单（按用户裁定「所有文件都允许走 path」）
+- 原 `PATH_ATTACHMENT_ALLOWED_EXTENSIONS` 15 项把 `zip/txt/csv/md/ogg/m4a/bmp` warn 跳过 ⇒ 永远到不了模型。
+- 安全性由**存在性 / ≤200MB / 防穿越**三道门承担（扩展名不是安全边界）。
+
+#### ④ upload 通道白名单放开到文档类（+ ⭐ 一条**必要补门**）
+- `AttachmentController.isAllowedType` 加 `doc/docx/xls/xlsx`；`verifyMagic` 改为**按扩展名定向判容器**
+  （docx/xlsx = OOXML/ZIP `50 4B 03 04`；doc/xls = OLE2）。
+  ⚠️ 文档类分支必须落在**显式媒体类型判定之后** —— 否则 `.docx` 声明 `application/pdf` 会被
+  ZIP 恒真的分支放行并落进 pdf-cache（既有红线「非 PDF 入库污染会话」）。
+- ⭐ **必要补门**：`ChatService.isMediaRecordType` 原为**正向白名单**（只认 video/audio/octet-stream），
+  与它调用点 javadoc 早已写明的意图（「只拒**明显非媒体**：`image/*` 或 `application/pdf`」）**相矛盾**
+  ⇒ 真 OOXML MIME 的 docx 被判「撞号」⇒ 回退 `MediaAttachmentStore`（**id 空间与附件表毫无关联**）
+  ⇒ 结构性未命中 ⇒ **静默丢弃**。**若不同批修，第 ④ 批会把「响亮 400」变成「静默丢弃」。**
+  改为反向排除后，顺带修好同族形态：path 通道注册的 `.docx/.doc/.xls/.xlsx` 在 F5 重拉时此前同样被静默丢弃。
+
+#### ⑤ `addFiles` 通道（浏览器拖拽 / 原生 input / 粘贴）不再静默丢弃
+- `video/audio` ≤5MB 改走 upload；`file` 类改走 upload（白名单已放开）；失败**响亮退场**（撤 chip + 提示）。
+- ⛔ 核心红线：**绝不允许「显示 chip 但模型收不到」**。
+
+#### ⑥ busy 消息的两处一致性
+- **F5 后附件胶囊消失**：busy 消息的 `user_attachments` 快照此前**恒 NULL**（drain 落库点拿不到快照）；
+  现随队列携带（取自 **`resolveAttachments` 之后的已解析列表** —— 用原始请求会让 path 附件没有
+  `contentId` ⇒ F5 后拼不出预览 url），并在**三条落库路径**（实时 / 补落 / 端后兜底）一致落库。
+- **F5 之前气泡没有胶囊**：drained 事件此前只带 `{uuid, content}` ⇒ 现由**后端出站载荷**携带
+  权威快照（`QueueItem.userAttachments` 经 `resolveAttachmentUrls` 投影），前端原样搬运、不重算
+  ⇒ **live 与 F5 后逐字段一致**。
+
+#### ⑦ 附件 bean 补接到 `build()` 汇聚点
+- `AgentLoopContextFactory.freshSession()` 漏接 `attachmentService`/`mediaAttachmentStore`
+  ⇒ 走 `shared()`/`forSession 3 参`/fallback 的 loop 拿到 `null` ⇒ 媒体说明的 contentId 腿**静默跳过**。
+  照本文件既有范式（`SkillChangeDetector` 的接线点选 `build()`，因为它是**单一汇聚点**）补齐。
+
+### 🧪 测试与验证
+- **前端**：43 文件 / **451 单测**（新增 `attachmentDelivery` 73 条、`pathAttachment` 52 条、`queuedUserBubble` 13 条）
+- **后端**：22 个测试类 / **193 用例**（新增 `BusyQueuedAttachmentSnapshotDbTest`、
+  `ChatServiceBusyAttachResolveTest`、`ChatServicePathAttachmentAnyExtensionTest`、
+  `ChatServiceDocMediaRecordResolveTest`、`AttachmentControllerUploadDocTest`、
+  `QueueEventPublisherDrainedAttachmentsTest` 等）
+- **反向实验 30+ 次**：每处修复都做了「改错 → **必须变红** → 改回」
+- **真 e2e（真文件 + **隔离的**真后端 + 真模型）**：批量 **N=2/3/5 全部命中**
+  （「后端注入条数」vs「模型说出个数」**差 = 0**）；busy 场景拿到 **wire 级证据**（模型实际收到的请求体）；
+  两次反向验证**复现了用户原话的症状**（「我**只收到1个文件**」/「我**没有收到任何附件**」）
+
+### ⚠️ 已知边界（本版**未修**，已登记）
+- **idle 乐观气泡的 path 附件仍不可点**（请求体无 contentId ⇒ `url=null`，**F5 后才可点**）—— 需发送响应回传已解析附件
+- **反向排除的固有边界**：挡不住「media-cache 旧 id 恰好撞上一条**同为文档类**的行」的巧合
+  （与正常上传在请求里是**同一比特形态**，无实现可区分）
+- **远端（`localRead=false`）** 无本地路径可传，该通道不适用
+- **模型拿到的是「本地路径」说明而非正文**（Word/Excel）；要读内容得靠模型自己的文件工具
+  —— **这一点与 CC 行为一致**（CC `FileReadTool` 同样拒读二进制）
+
 ## [0.1.12] - 2026-09-17
 
 ### 🔍 观测：附件/拖拽链路加 `[attach]` 日志（**纯日志 · 零行为变更**）

@@ -25,6 +25,7 @@ import { settingsApi } from '@/api/settings'
 import { attachmentApi } from '@/api/attachment'
 import { ApiError } from '@/api/rest'
 import { debugLog } from '@/utils/debugLog'
+import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedUserBubble'
 import { useChatStore, selectCompact, collectRemovedUuids } from '@/stores/chatStore'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { useAwaySummary } from '@/hooks/useAwaySummary'
@@ -802,31 +803,24 @@ function App() {
   const handleQueueChanged = useCallback((_sid: string, commands: { content: string; mode: string; isEditable: boolean; isMeta?: boolean }[]) => {
     commandQueue.setQueued(commands)
   }, [commandQueue])
-  const handleQueueDrained = useCallback((sid: string, drained: { uuid?: string; content: string }[]) => {
+  const handleQueueDrained = useCallback((sid: string, drained: DrainedQueueItem[]) => {
     if (drained.length === 0) return
     // 工具边界消费 → 【立即 append】用户2 气泡（打字机期可见）；渲染按 userMessageId 分组自动排到
     //   当前 assistant 工具轮之后（用户2 的 group 在 bash 后、AI 回复其前）—— 不延后到 complete。
     //   会话级单 topic 常驻（activeStreams 里 sid 仍在）→ 新轮回答经同一订阅收到，无需重新订阅。
     //   uuid = 排队命令 uuid（DB user 消息 id）→ 气泡 id 用它防重。
+    //   [busy 气泡附件胶囊] 气泡附件胶囊由 buildDrainedUserMessages 从**事件里的后端权威快照**搬运
+    //   （原实现只用 {uuid, content} ⇒ busy 气泡恒无胶囊、必须 F5 才出现）。⛔ 前端不留快照暂存：
+    //   权威源已在事件里，再存一份即平行真源。方案论证见 utils/queuedUserBubble.ts 头注。
     const st = useChatStore.getState()
     const prev = st.messages[sid] ?? []
     const existingIds = new Set(prev.map((m) => m.id))
-    const msgs = drained
-      .filter((d) => !(d.uuid && existingIds.has(d.uuid)))   // 防 queue.drained 重发/与重拉重复
-      .map((d) => {
-        const msgId = d.uuid ?? `queued-${sid}-${Date.now()}-${Math.random().toString(36).slice(2)}`
-        return {
-          id: msgId, sessionId: sid, role: 'user' as const, author: '你', content: d.content,
-          reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null,
-          toolCallId: null, assistantMessageId: null, userMessageId: msgId, subtype: null, isMeta: false, isApiErrorMessage: false,
-          apiError: null, error: null, errorDetails: null, matchedRule: null,
-        }
-      })
+    const msgs = buildDrainedUserMessages(sid, drained, existingIds)
     if (msgs.length > 0) {
       // [有界窗口] 追加路径 → appendMessages（内部 capTail）：勿用 setMessages([...prev, ...msgs])，
       //   那条路不裁剪，是内存无界的漏洞口。
       st.appendMessages(sid, msgs)
-      void debugLog(`[drained-append] sid=${sid} uids=${msgs.map((m) => m.userMessageId ?? m.id).join(',')} contents=${msgs.map((m) => m.content?.slice(0, 10) ?? '').join(',')}`)
+      void debugLog(`[drained-append] sid=${sid} uids=${msgs.map((m) => m.userMessageId ?? m.id).join(',')} contents=${msgs.map((m) => m.content?.slice(0, 10) ?? '').join(',')} attach=${msgs.map((m) => m.userAttachments?.length ?? 0).join(',')}`)
     }
   }, [])
 
@@ -1578,6 +1572,9 @@ function App() {
       //   【不】乐观插入气泡（交给排队框展示暗色条）、【不】覆盖 activeStreams（保持原 topic 收流），
       //   等 queue.drained 事件（handleQueueDrained）再 append 正式气泡 + 登记新 streamTopic。
       if (resp.queued) {
+        // [busy 气泡附件胶囊] 排队时【不】插气泡、也不缓存附件 —— 气泡的附件胶囊由后端权威快照
+        //   随 queue.drained 事件带来（前端不按请求体自算：path 附件请求体无 contentId ⇒ 会得到
+        //   不可点的胶囊，且与 F5 后不一致）。见 handleQueueDrained。
         if (showToast) showToast('消息已排队，当前轮结束后自动发送', 'info')
         return
       }
@@ -1594,6 +1591,11 @@ function App() {
       // 用户附件快照（非图片：PDF/Word/视频/音频/文件）→ user 气泡内联胶囊 + 点击预览。
       //   内容源：base64（≤5MB 即时）→ path（local-read 大文件本地读盘）→ url（upload contentId 后端 /content 预览——
       //   upload 已注册附件表，contentId 立即拼 url，发送即能点预览，不必等 F5 后端出站）
+      //   ⚠️ 已知边界（本批未改，如实登记）：`path` 附件（local-read 通道）在**请求体**里只有 path、
+      //   没有 contentId（Composer.doSend 的 `...(a.contentId ? … : {})`）⇒ 本乐观气泡的 path 附件
+      //   胶囊 contentId/url 为 null（点击无预览），要 F5 重拉（后端读侧回填 url）才可点。
+      //   修它需要发送响应回传「已解析附件」（后端配合），不属本批（本批只修 busy→drained 那条腿，
+      //   那条腿已改走后端权威快照，见 handleQueueDrained）。
       const userAttachments = attachments?.filter((a) => a.type !== 'image' && a.filename)
         .map((a) => {
           const cid = a.contentId ?? null

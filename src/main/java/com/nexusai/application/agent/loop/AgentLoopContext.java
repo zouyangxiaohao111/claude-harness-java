@@ -468,6 +468,23 @@ public record AgentLoopContext(
         /** [P2] Task service（Spring bean · null 时 listTasks 降级空列表）。 */
         private TaskService taskService;
         /**
+         * [attach-busy-resolve 2026-09-18] 附件表统一 contentId 解析（Spring bean · 同
+         * {@link #taskService} 范式：bean 引用随 per-run 容器下传，使 static 方法无需 LlmAgentLoop 实例）。
+         *
+         * <p><b>用途</b>：mid-turn drain 消费 busy-queued 携附件时，为 contentId 通道的媒体/大图附件
+         * 拼「真实落盘路径」说明（{@code buildMediaAttachmentNotes} / {@code buildLargeImagePathNotes}
+         * 的 ②号通道）；{@code doRun} 实例字段 {@code this.attachmentService} 到不了 static drain。
+         * null（非 Spring 单测 / 工厂未接线）→ 同既有语义：仅 path 直读通道可用。
+         */
+        private com.nexusai.domain.session.AttachmentService attachmentService;
+        /**
+         * [attach-busy-resolve 2026-09-18] 媒体（video/audio/file）附件存储（Spring bean · 同上范式）。
+         *
+         * <p><b>用途</b>：mid-turn drain 消费 busy-queued 携媒体附件时，附件表未命中 → 回退 store 记录
+         * 拼路径说明（{@code buildMediaAttachmentNotes} ③号通道）。null → 该回退通道跳过。
+         */
+        private com.nexusai.application.agent.attachment.MediaAttachmentStore mediaAttachmentStore;
+        /**
          * [prompt-align CTX-02] settings 门控实时读源（DB task_reminder_enabled）· 对齐 taskService
          * 字段范式（同 :398 邻域）。null = 无 resolver（非 Spring / 工厂未接线）→ task_reminder
          * 门控回落 {@link TaskSystemConfig#isTodoV2Enabled()}（MDC isInteractive 会话感知）。
@@ -547,6 +564,16 @@ public record AgentLoopContext(
         }
         public void setAppStateReader(java.util.function.Function<java.util.Map<String, Object>, java.util.Map<String, Object>> v) {
             this.appStateReader = v;
+        }
+        /** 见字段 {@link #attachmentService} 说明。 */
+        public com.nexusai.domain.session.AttachmentService attachmentService() { return attachmentService; }
+        public void setAttachmentService(com.nexusai.domain.session.AttachmentService v) { this.attachmentService = v; }
+        /** 见字段 {@link #mediaAttachmentStore} 说明。 */
+        public com.nexusai.application.agent.attachment.MediaAttachmentStore mediaAttachmentStore() {
+            return mediaAttachmentStore;
+        }
+        public void setMediaAttachmentStore(com.nexusai.application.agent.attachment.MediaAttachmentStore v) {
+            this.mediaAttachmentStore = v;
         }
     }
 
