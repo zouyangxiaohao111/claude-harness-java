@@ -158,7 +158,9 @@ public class ProjectSessionBindingService {
             s.getTotalCostYuan(),
             SessionService.sumTokensFromModelUsage(s.getModelUsageJson()),
             // [SP-03] 会话指定主线程 agent 透出（V58 列 main_thread_agent；null = 未指定，agent 分支休眠）
-            s.getMainThreadAgent()
+            s.getMainThreadAgent(),
+            // [coordinator-session V75] 会话级 coordinator 模式透出（0/1 → Boolean，null = 未设置）
+            s.getCoordinatorMode() != null ? s.getCoordinatorMode() != 0 : null
         );
     }
 

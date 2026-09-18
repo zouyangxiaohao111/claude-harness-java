@@ -402,6 +402,8 @@ export interface AppSettings {
   websearchDomainCheckUrl?: string | null
   /** Agent Swarms 功能开关（设置页「环境配置」模块写 · 后端 TaskSystemConfig.isAgentSwarmsEnabled 读） */
   agentSwarmsEnabled?: boolean | null
+  /** 协调者模式开关（设置页「环境配置」模块写 · 后端 PromptAlignSettingsResolver.coordinatorModeEnabled 读；未配置/null → 关闭） */
+  coordinatorModeEnabled?: boolean | null
   /** 权限分类器模型全名（V45 列 classifier_model；留空 → 主循环模型，对齐 CC getClassifierModel 兜底 getMainLoopModel） */
   classifierModel?: string | null
   // 0.5.x 契约：五层压缩开关（对齐后端 SettingsDto 新增 12 字段 camelCase · settings 表列承载）
@@ -552,6 +554,10 @@ export interface SessionDto {
   totalTokens?: number | null
   /** 会话级团队上下文（Team 协作 · GET /sessions/{id} 返回；无 team 为 null） */
   teamContext?: SessionTeamContext | null
+  /** 会话级协调者模式覆盖（V75 coordinator_mode）· 三态：null = 未设置（回落全局「协调者模式」开关 →
+   *  再回落 feature+env）；true = 本会话强制协调者；false = 本会话强制普通（压过全局开）。
+   *  「A 会话是协调者、B 会话不是」的唯一载体（后端 PromptAlignSettingsResolver 逐次按 sessionId 读） */
+  coordinatorMode?: boolean | null
 }
 export type SessionGroup = 'current' | 'today' | 'yesterday' | 'week'
 
@@ -665,7 +671,7 @@ export interface CreateTeamRequest {
 /** 会话创建请求 · mainProjectId 必填（后端 @NotBlank）：空串/null 一律 400，不产生「未绑定会话」 */
 export interface SessionCreateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId: string }
 /** 会话更新（PATCH /sessions/{id} · null=不改动，mainThreadAgent 空串=清除） */
-export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null }
+export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null; /** V75 会话级协调者模式覆盖（coordinator_mode）· true/false=显式设置，不传=不改动 */ coordinatorMode?: boolean | null }
 /** GET /agents/list?sessionId={sid} 单条（后端 AgentListDto · agentType 专家列表） */
 export interface AgentListItem {
   agentType: string

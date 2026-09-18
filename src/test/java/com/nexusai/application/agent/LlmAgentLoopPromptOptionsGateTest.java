@@ -73,6 +73,10 @@ class LlmAgentLoopPromptOptionsGateTest {
         when(r.proactiveEnabled()).thenReturn(proactive);
         when(r.coordinatorModeEnabled()).thenReturn(coordinator);
         when(r.scratchpadEnabled()).thenReturn(scratchpad);
+        // [coordinator-session V75] 会话层显式 stub 成 null（未设置）——本类测的是「无会话 / 两层链」。
+        //   ⚠️ 不 stub 会得 FALSE（Mockito 对包装 Boolean 返回类型默认 false，不是 null）⇒ 被读成
+        //   「该会话显式关」压掉 coordinaor DB/env 层 ⇒ 用例红。
+        when(r.sessionCoordinatorMode(org.mockito.ArgumentMatchers.any())).thenReturn(null);
         return r;
     }
 
@@ -93,12 +97,21 @@ class LlmAgentLoopPromptOptionsGateTest {
      * **不激活** —— 这正是本类 3 个用例要测的「**无会话 → 回落 resolver 门控**」链；
      * 传 TUC 只会额外激活该分支（另一条路径，已由本类 TUC-bearing 用例
      * {@code invokeMergeCoordinatorUserContext(ctx, tuc, parts)} 覆盖）。⛔ 断言一律未改。
+     *
+     * <p>[coordinator-scope 2026-09-18] 反射签名再补第 3 参 {@code QuerySource querySource}
+     * （{@code buildEffectivePromptOptions} 新形参 · coordinator 分支的第二个必要条件
+     * {@code mainThreadInvocation} 的判据源）。本类用例断言一律只看门控位
+     * （{@code coordinatorModeEnabled}/{@code agentMainThreadEnabled}/{@code proactiveEnabled}），
+     * ⛔ 未改；新参传 {@link QuerySource#REPL_MAIN_THREAD} 保持「主线程场景」语义。
      */
     private static EffectivePromptOptions invokeBuildOptions(AgentLoopContext ctx) throws Exception {
         Method m = LlmAgentLoop.class.getDeclaredMethod("buildEffectivePromptOptions",
-            AgentLoopContext.class, ToolUseContext.class);
+            AgentLoopContext.class, ToolUseContext.class, QuerySource.class);
         m.setAccessible(true);
-        return (EffectivePromptOptions) m.invoke(null, ctx, null);
+        // [coordinator-scope] 第 3 参 = querySource（顶层循环判据源）。本类用例测「无会话 → 回落
+        //   resolver 门控」，走的是主线程场景 ⇒ 传 REPL_MAIN_THREAD（本类断言只看门控位，不看
+        //   mainThreadInvocation）。
+        return (EffectivePromptOptions) m.invoke(null, ctx, null, QuerySource.REPL_MAIN_THREAD);
     }
 
     private static Map<String, String> invokeMergeCoordinatorUserContext(

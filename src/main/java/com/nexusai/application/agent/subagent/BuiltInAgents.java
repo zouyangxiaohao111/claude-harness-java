@@ -3,6 +3,8 @@ package com.nexusai.application.agent.subagent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.nexusai.application.agent.coordinator.CoordinatorMode;
+import com.nexusai.application.agent.prompt.PromptAlignSettingsResolver;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 
 import java.util.List;
@@ -18,6 +20,9 @@ import java.util.List;
  *   <li>Plan - 规划 Agent (无 tools 字段=全部, disallowedTools, model='inherit', omitClaudeMd=true)</li>
  *   <li>verification - 验证 Agent (无 tools 字段=全部, disallowedTools, model='inherit', color='red', background=true, criticalSystemReminder)</li>
  *   <li>claude-code-guide - 文档向导 (tools=[Glob,Grep,Read,WebFetch,WebSearch], model='haiku', permissionMode='dontAsk')</li>
+ *   <li>worker - coordinator 模式的执行 Agent (tools=ASYNC_AGENT_ALLOWED_TOOLS 减内部编排工具,
+ *       仅在 coordinator 激活时作为<b>唯一</b>内置 agent 出现; 定义在
+ *       {@code coordinator.WorkerAgentDefinition}, 对齐 CC src/coordinator/workerAgent.ts)</li>
  * </ul>
  *
  * <p><b>[Session S1 P0-2]</b>: Explore/Plan/verification 旧实现用 tools 白名单 (仅 3 工具) 阉割能力,
@@ -408,13 +413,19 @@ public class BuiltInAgents {
      * notes + env，<b>无</b> 通用 "You are an agent for NexusAI" 前缀。故这两个 agent 不走
      * buildSystemPrompt 的 DEFAULT 前缀路径（basePrompt=null）。
      *
+     * <p><b>可见性 public（coordinator worker 复用）</b>：{@code WorkerAgentDefinition} 在
+     * {@code application.agent.coordinator} 包，其 agent 专属 prompt 也是 CC 模板字面量全文
+     * （workerAgent.ts:49-58），装配路径与本方法完全同构（CC runAgent.ts:901-919 对<b>所有</b>
+     * 内置 agent 一律追加 notes + env）→ 直接复用本方法，避免在第二处复刻 AGENT_NOTES 文本
+     * （两处真值）。本方法原为 private，仅放宽可见性，<b>行为零变化</b>。
+     *
      * @param agentPrompt                  完整 agent prompt（CC 全文）
      * @param modelId                     完整 model id；null → 抑制模型描述行
      * @param additionalWorkingDirectories 附加工作目录路径列表
      * @return 完整 system prompt（agentPrompt + AGENT_NOTES + env）
      */
-    private static String buildStandaloneSystemPrompt(String agentPrompt, String modelId,
-                                                      List<String> additionalWorkingDirectories) {
+    public static String buildStandaloneSystemPrompt(String agentPrompt, String modelId,
+                                                     List<String> additionalWorkingDirectories) {
         return assembleAgentSystemPrompt(null, agentPrompt, modelId, additionalWorkingDirectories);
     }
 
@@ -583,6 +594,51 @@ public class BuiltInAgents {
     private static volatile String entrypoint = "";
 
     /**
+     * [coordinator 缺件补齐] coordinator 模式门（第 1 层：env + feature）· 对齐 CC
+     * {@code getBuiltInAgents()} 的 {@code feature('COORDINATOR_MODE') && isEnvTruthy(CLAUDE_CODE_COORDINATOR_MODE)}
+     * （builtInAgents.ts:33-41 → coordinator/coordinatorMode.ts:36-41）。
+     *
+     * <p><b>static</b>：本类是静态工具（无 bean），{@code getBuiltInAgents()} 是静态方法 ——
+     * 与 {@link #explorePlanEnabled} 同款静态门，经 {@link #setCoordinatorMode}（程序/测试）与
+     * {@link GateConfig#setCoordinatorMode}（Spring {@code @Autowired(required=false)}）注入，
+     * 对齐 {@code LlmAgentLoop.setCoordinatorMode/setCoordinatorModeBean} 既有一对。
+     *
+     * <p><b>默认 {@code new CoordinatorMode()}</b>（feature 恒关 → {@code isCoordinatorMode()}=false）
+     * —— 未注入时分支不激活（fail-closed），与 application.yml
+     * {@code nexusai.feature.coordinator-mode: false} 默认一致。
+     *
+     * <p><b>为什么读 CoordinatorMode 而不是自己读 env</b>：CC 真源就是这个全局面（同一
+     * {@code isCoordinatorMode()} 也被 coordinator 系统提示注入、权限上下文、fork 互斥消费）。
+     * 第二处 env 解析 = 第二个真值面 → 门可能半开（提示说「用 worker 派活」而 agent 列表无 worker，
+     * 正是本缺件补齐前的故障形态）。故此处复用同一门对象，不新增判据。
+     */
+    private static volatile CoordinatorMode coordinatorMode = new CoordinatorMode();
+
+    /**
+     * [coordinator 缺件补齐] coordinator 门（第 2 层：DB 覆盖）· settings 单行
+     * {@code coordinator_mode_enabled} 实时读源。
+     *
+     * <p><b>为什么必须并入 DB 层（不是可选项）</b>：coordinator 的<b>唯一用户可达激活路径就是这一个
+     * DB 列</b> —— 前端「设置 → 环境配置 → 协调者模式」勾选框写
+     * {@code settings.coordinatorModeEnabled}（{@code front/src/components/settings/EnvConfigPanel.tsx:727-742}），
+     * 后端经 {@code PromptAlignSettingsResolver.coordinatorModeEnabled()} 读（:135）；
+     * 而 {@code nexusai.feature.coordinator-mode} 在 application.yml 恒 {@code false} 且<b>没有任何
+     * UI/接口</b>可改。coordinator 系统提示注入（6 处要求 {@code subagent_type: "worker"}）走的正是
+     * DB 覆盖链 —— {@code LlmAgentLoop:4618/4660}（prompt options 门）与 {@code :4273/:4708}（工具池 /
+     * userContext）= {@code resolver.coordinatorModeEnabled() ?? coordinatorMode.isCoordinatorMode()}。
+     *
+     * <p>若本分支只读 {@link CoordinatorMode}（env+feature），则「前端勾选 → DB=1」这一真实路径上
+     * 提示已注入而 agent 列表无 worker ⇒ <b>本缺件补齐想修的故障原样保留</b>（门半开）。故此处与
+     * 提示注入侧<b>收敛为同一判定</b>，对齐本仓既有「统一判定」先例
+     * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（该类 JavaDoc 记的正是
+     * 同一类故障：「DB 打开、env 关 → 开关空转 + 双发」）。
+     *
+     * <p>未注入（非 Spring 单测 / 无 mapper）→ {@code coordinatorModeEnabled()} 返回 null → 回落
+     * 第 1 层 {@link #coordinatorMode}（与 {@code LlmAgentLoop} 的回落语义一致）。
+     */
+    private static volatile PromptAlignSettingsResolver promptAlignSettingsResolver;
+
+    /**
      * [Session S2] Spring @Value 注入容器（static utility 无 bean, 用嵌套 @Configuration 转接）·
      * 对齐 CC feature()/GrowthBook gate。测试可绕过容器直接调 static setter。
      */
@@ -602,10 +658,91 @@ public class BuiltInAgents {
         public void setEntrypoint(String v) {
             BuiltInAgents.entrypoint = v == null ? "" : v;
         }
+
+        /**
+         * coordinator 门注入 · @Autowired(required=false) 容错无 bean 场景（null → 复位默认，
+         * 对齐 {@code LlmAgentLoop.setCoordinatorModeBean}）。委托静态 setter：本类无实例字段，
+         * {@code getBuiltInAgents()} 读的是静态槽位。
+         *
+         * @param coordinatorMode Spring 容器中的 CoordinatorMode bean（可 null）
+         */
+        @org.springframework.beans.factory.annotation.Autowired(required = false)
+        public void setCoordinatorMode(CoordinatorMode coordinatorMode) {
+            BuiltInAgents.setCoordinatorMode(coordinatorMode);
+        }
+
+        /**
+         * DB 覆盖层注入 · {@code @Autowired(required=false)}（无 mapper / 非 Spring 上下文 → 不注入
+         * → 回落 env+feature 层，与 {@code LlmAgentLoop}/{@code SubagentExecutor} 同款容错）。
+         *
+         * @param resolver PromptAlignSettingsResolver bean（可 null；全仓唯一实现 = ToolRegistrationConfig:3216）
+         */
+        @org.springframework.beans.factory.annotation.Autowired(required = false)
+        public void setPromptAlignSettingsResolver(PromptAlignSettingsResolver resolver) {
+            BuiltInAgents.setPromptAlignSettingsResolver(resolver);
+        }
     }
 
     public static boolean areExplorePlanAgentsEnabled() {
         return explorePlanEnabled;
+    }
+
+    /**
+     * 注入 coordinator 门（程序/测试用入口）· 对齐 {@code LlmAgentLoop.setCoordinatorMode}。
+     *
+     * <p>null → 复位默认（{@code new CoordinatorMode()}，feature 恒关 → 分支不激活）。
+     *
+     * @param coordinatorMode coordinator 模式门（null → 复位默认）
+     */
+    public static void setCoordinatorMode(CoordinatorMode coordinatorMode) {
+        BuiltInAgents.coordinatorMode = coordinatorMode != null ? coordinatorMode : new CoordinatorMode();
+        if (log.isDebugEnabled()) {
+            log.debug("[BuiltInAgents] setCoordinatorMode 注入: 非空={}（coordinator 分支门，静态 getBuiltInAgents 读取）",
+                coordinatorMode != null);
+        }
+    }
+
+    /**
+     * 注入 DB 覆盖层（程序/测试用入口）· null 复位（回落 env+feature 层）。
+     *
+     * @param resolver PromptAlignSettingsResolver（可 null）
+     */
+    public static void setPromptAlignSettingsResolver(PromptAlignSettingsResolver resolver) {
+        BuiltInAgents.promptAlignSettingsResolver = resolver;
+        if (log.isDebugEnabled()) {
+            log.debug("[BuiltInAgents] setPromptAlignSettingsResolver 注入: 非空={}（coordinator 门 DB 覆盖层）",
+                resolver != null);
+        }
+    }
+
+    /**
+     * coordinator 模式是否激活 · 对齐 CC {@code builtInAgents.ts:33-41} 门，
+     * 叠加本仓 DB 覆盖层（{@code settings.coordinator_mode_enabled}）。
+     *
+     * <p><b>取值链</b>：DB {@code settings.coordinator_mode_enabled}（经 {@link #promptAlignSettingsResolver}
+     * 实时读，与 {@code LlmAgentLoop} 提示注入门同一读源）有值即用；null（未配置 / 无 Spring 上下文 /
+     * 行缺失 / 读异常）→ 回落 {@link #coordinatorMode}（{@code feature('COORDINATOR_MODE') &&
+     * isEnvTruthy(CLAUDE_CODE_COORDINATOR_MODE)}，CC 原判定链）。
+     *
+     * <p><b>逐调用求值</b>（非启动期快照）：CC 每次调用都重读 env/feature，本仓 DB 读源亦「不缓存」
+     * （PromptAlignSettingsResolver JavaDoc）—— 门在会话中途变化时 agent 列表随之变化，保持同语义。
+     * 代价 = 每次 {@link #getBuiltInAgents()} 一次 settings 单行 SELECT（与其它 DB 门一致；
+     * 调用点只有 registry 构建 / agent 未命中报错 / guide agent 装配，非逐消息）。
+     *
+     * <p><b>为什么与提示注入门必须同源</b>：提示说「用 worker 派活」而列表无 worker = 派活必失败
+     * （{@code SubagentExecutor:1594-1600}）。两者判定一旦分叉就是本缺件补齐前的故障形态。
+     *
+     * <p><b>[coordinator 单一来源] 判定体已收敛到唯一实现</b>
+     * {@link PromptAlignSettingsResolver#coordinatorModeActive(PromptAlignSettingsResolver, CoordinatorMode)}
+     * —— 本方法只负责「本类的两个静态槽位（DB 层 + feature/env 层）即数据源」这一句，优先级语义不再
+     * 在本类留第二份拷贝（两份拷贝 = 将来只改一处就会重新分叉）。本类自己的静态槽位保留：它们是
+     * {@code GateConfig} 的注入落点与单测夹具（{@code BuiltInAgentsCoordinatorTest}），
+     * 生产与 {@code PromptAlignSettingsResolver.staticResolver} 恒为同一 bean 实例。
+     *
+     * @return true = coordinator 激活（{@link #getBuiltInAgents()} 走整表替换分支）
+     */
+    public static boolean isCoordinatorModeActive() {
+        return PromptAlignSettingsResolver.coordinatorModeActive(promptAlignSettingsResolver, coordinatorMode);
     }
 
     /**
@@ -622,18 +759,40 @@ public class BuiltInAgents {
      * <p>CC 真源（Pattern #9 已实读）:
      * <ol>
      *   <li>SDK disable env + noninteractive → []（:25-30；Java 无 SDK 入口，跳过）</li>
-     *   <li>coordinator mode → coordinator agents（:35-43；Java 无 coordinator 模块，跳过）</li>
-     *   <li>base = [GENERAL_PURPOSE, STATUSLINE_SETUP]（:45-48）</li>
-     *   <li>areExplorePlanAgentsEnabled() → + [EXPLORE, PLAN]（:50-52）</li>
-     *   <li>非 SDK 入口 → + CLAUDE_CODE_GUIDE（:54-61）</li>
-     *   <li>feature('VERIFICATION_AGENT') && GB → + VERIFICATION（:64-69）</li>
+     *   <li>coordinator 激活 → {@code getCoordinatorAgents()}（:33-41；已对齐 —— 见下）</li>
+     *   <li>base = [GENERAL_PURPOSE, STATUSLINE_SETUP]（:43-46）</li>
+     *   <li>areExplorePlanAgentsEnabled() → + [EXPLORE, PLAN]（:48-50）</li>
+     *   <li>非 SDK 入口 → + CLAUDE_CODE_GUIDE（:53-60）</li>
+     *   <li>feature('VERIFICATION_AGENT') && GB → + VERIFICATION（:62-67）</li>
      * </ol>
+     *
+     * <p><b>[coordinator 缺件补齐] 第 2 条已实施</b>（此前的注释写「Java 无 coordinator 模块，跳过」
+     * 已过期 —— coordinator 模块早已存在且工具侧/提示侧均已对齐，缺的恰是这一分支 + worker 定义）。
+     * CC 该分支是<b>整表替换</b>（:39 {@code return getCoordinatorAgents()} 直接返回，base 列表
+     * 全部消失），不是「把 worker 追加进列表」；本实现同构，故 coordinator 模式下
+     * {@link #get(String)} 对 worker 之外的 agentType 一律 null（对齐 CC 语义）。
+     * 门 = {@link #isCoordinatorModeActive()}：DB {@code settings.coordinator_mode_enabled}
+     * 覆盖 → 回落 {@link CoordinatorMode}（env+feature）—— <b>与 coordinator 系统提示注入门同源</b>，
+     * 不新增第二处判据（分叉即「提示让用 worker 但列表没有 worker」= 本缺件补齐前的故障形态）。
      *
      * <p><b>不含 FORK</b>（CC builtInAgents.ts:22-72 全文无 FORK；FORK 在 AgentTool.tsx:335 直接引用，
      * 不经 getBuiltInAgents）。Java 端 FORK 生产路径由 {@link #get(String)} fork 特殊分支兜底
      * （SubagentExecutor.execute 以类型字符串 "fork" 重解析，S2-5 偏差见 concerns）。
      */
     public static List<AgentDefinition> getBuiltInAgents() {
+        // ── CC builtInAgents.ts:33-41 coordinator 分支（整表替换）───────────────────────────
+        // 位置对齐 CC：在 SDK disable 门（Java 无）之后、base 列表之前。早返 → 后置各门
+        // （explore/plan、entrypoint、verification）全部短路，与 CC 直接 return 同语义。
+        if (isCoordinatorModeActive()) {
+            List<AgentDefinition> coordinatorAgents =
+                com.nexusai.application.agent.coordinator.WorkerAgentDefinition.getCoordinatorAgents();
+            if (log.isDebugEnabled()) {
+                log.debug("[BuiltInAgents] getBuiltInAgents coordinator 分支命中 → 整表替换为 {}（CC builtInAgents.ts:39）",
+                    coordinatorAgents.stream().map(AgentDefinition::agentType).toList());
+            }
+            return coordinatorAgents;
+        }
+
         List<AgentDefinition> agents = new java.util.ArrayList<>();
         agents.add(GENERAL_PURPOSE_AGENT);
         agents.add(STATUSLINE_SETUP_AGENT);

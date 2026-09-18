@@ -91,6 +91,15 @@ public class CommandRegistrationConfig {
 
     private static final Logger log = LoggerFactory.getLogger(CommandRegistrationConfig.class);
 
+    /**
+     * [coordinator-session V75] coordinator feature+env 回落层 · 供 transcript {@code mode} 行取值
+     * （{@code PromptAlignSettingsResolver.staticCoordinatorSessionModeLabel} 的最后一层）。
+     * 字段注入（本类无显式构造器 + 多 @Autowired(required=false) 缝的既有范式）：
+     * plain JUnit 缺省 null → 该层缺席，标签退化为「会话列 ?? settings ?? false」（不 NPE）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.coordinator.CoordinatorMode coordinatorMode;
+
     // ════════════════════════════════════════════════════════════════════════
     // 1. Bundled 命令注册（prompt 型 + local 元数据）· 对齐 CC getCommands 合并清单
     // ════════════════════════════════════════════════════════════════════════
@@ -625,16 +634,22 @@ public class CommandRegistrationConfig {
      *  <p><b>[session-id-short]</b>：sessionId 为 short 直键，直传 {@link SessionStorage}
      *  （文件名键 {@code sessionId + ".jsonl"}）——⛔ 不再 {@code .toString()} 成 UUID 形态
      *  （原实现经 {@code resolveSessionUuid} 得 null ⇒ 本方法恒早返 ⇒ custom-title/agent-name 静默不落盘）。 */
-    private static void persistSessionMetadata(java.util.function.Supplier<String> workspaceRoot,
+    private void persistSessionMetadata(java.util.function.Supplier<String> workspaceRoot,
                                                String sessionId, String name, boolean isTitle) {
         if (sessionId == null || sessionId.isBlank()) {
             return;
         }
         try {
             Path ws = Path.of(workspaceRoot.get());
+            // [coordinator-session V75] 第 7 位 = mode（SessionMetadata 字段序：lastPrompt / customTitle /
+            //   tag / agentName / agentColor / agentSetting / **mode** / worktreeState / prNumber /
+            //   prUrl / prRepository）—— 值 = 会话有效 coordinator 模式标签（CC ModeEntry 字面量）。
             SessionStorage.reAppendSessionMetadata(ws, sessionId,
                 new SessionStorage.SessionMetadata(null, isTitle ? name : null, null,
-                    isTitle ? null : name, null, null, null, null, null, null, null));
+                    isTitle ? null : name, null, null,
+                    com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                        .staticCoordinatorSessionModeLabel(sessionId, coordinatorMode),
+                    null, null, null, null));
         } catch (Exception e) {
             log.warn("[CommandRegistrationConfig] persistSessionMetadata 失败: session={} title={} err={}",
                 sessionId, isTitle, e.getMessage());

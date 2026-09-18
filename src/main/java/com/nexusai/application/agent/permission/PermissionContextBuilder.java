@@ -132,9 +132,20 @@ public class PermissionContextBuilder {
      */
     private PermissionManagedPolicy managedPolicy;
 
-    /** [canUseTool v2] awaitAutomatedChecksBeforeDialog 计算 · 仅 coordinator worker 模式为 true。 */
-    private boolean isAwaitAutomatedChecksBeforeDialog() {
-        return coordinatorMode != null && coordinatorMode.isCoordinatorMode();
+    /**
+     * [canUseTool v2] awaitAutomatedChecksBeforeDialog 计算 · 仅 coordinator worker 模式为 true。
+     *
+     * <p><b>[coordinator 单一来源]</b> 判定走唯一实现
+     * {@link PromptAlignSettingsResolver#staticCoordinatorModeActive(CoordinatorMode)}
+     * （DB 覆盖 → 回落 feature+env）。此前写死 {@code coordinatorMode != null && ...}：DB-only 激活
+     * （前端勾选，唯一用户可达路径）且 bean 未注入时恒 false ⇒ 提示词已按协调者铺、权限链仍走普通
+     * agent 语义（半激活）。DB 层不依赖 bean，故 bean 为 null 时仍须生效。
+     */
+    private boolean isAwaitAutomatedChecksBeforeDialog(String sessionId) {
+        // [coordinator-session V75] 会话感知入口（静态槽 + 会话列）· 会话层来源 = 调用点显式传入的
+        //   sessionId（本类无 ThreadLocal 会话态可取，也不允许取 —— 见类内 sessionId 直传范式）。
+        return com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+            .staticCoordinatorModeActiveForSession(sessionId, coordinatorMode);
     }
 
     /**
@@ -430,7 +441,8 @@ public class PermissionContextBuilder {
             //   coordinatorMode 来源：H14/H13 v3 都补接线 isAwaitAutomatedChecksBeforeDialog()
             //   （此前死 helper 未调用 → coordinator worker 模式永不置 true）。现在 coordinator
             //   worker 模式 (CC runAgent.ts:457-464) 也置 true（gate 的 coordinator 分支有生产入口）。
-            Map.of(), shouldAvoidPermissionPrompts, awaitAutomatedChecksBeforeDialog || isAwaitAutomatedChecksBeforeDialog(), null
+            Map.of(), shouldAvoidPermissionPrompts, awaitAutomatedChecksBeforeDialog
+                || isAwaitAutomatedChecksBeforeDialog(state.sessionId()), null
         );
 
         // s03 ShadowedRuleDetector：检测被覆盖的规则，记录 warn 日志（不阻断流程）

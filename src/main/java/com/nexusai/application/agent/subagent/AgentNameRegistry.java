@@ -68,15 +68,29 @@ public class AgentNameRegistry {
      * 注销 name→agentId · 对齐 CC 无显式注销（React 状态随会话结束 GC）；
      * Java 在子 agent 终态清理时调用，避免 name 映射残留指向已终止 agentId。
      *
+     * <p><b>[终态清理] 同时清空该 agentId 的待投递队列</b>：{@link #pendingMessages} 的
+     * 唯一消费点是 {@link #drain(String)}，而 drain 只发生在 agent <b>存活期</b>
+     * （{@code SubagentExecutor.runSubagentQueryLoop} 启动段 /
+     * {@code LlmAgentLoop.drainPendingAgentMessages} 每轮）—— agent 终态后不再有消费点。
+     * 若此处不清，向已终止 agent 投递的消息会「调用方拿到成功、消息永不到达」并永久驻留
+     * （静默丢失 + 内存泄漏）。
+     *
      * @param name 子 agent 名
      */
     public void unregister(String name) {
         if (name == null || name.isBlank()) {
             return;
         }
+        // Map.remove 返回被移除的值 = 本 name 映射到的 agentId（清理目标）
         String removed = nameToAgentId.remove(name);
-        if (log.isDebugEnabled()) {
-            log.debug("[AgentNameRegistry] 注销 name→agentId: name='{}' 移除={}", name, removed);
+        if (removed != null) {
+            ArrayDeque<String> dropped = pendingMessages.remove(removed);
+            if (log.isDebugEnabled()) {
+                log.debug("[AgentNameRegistry] 注销 name→agentId: name='{}' 移除={} 清空待投递队列条数={}",
+                    name, removed, dropped != null ? dropped.size() : 0);
+            }
+        } else if (log.isDebugEnabled()) {
+            log.debug("[AgentNameRegistry] 注销 name→agentId: name='{}' 移除=null（未注册，无队列可清）", name);
         }
     }
 

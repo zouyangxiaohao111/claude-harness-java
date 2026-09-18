@@ -883,13 +883,26 @@ public class CommandController {
         }
         // CC conversation.ts:93-106 —— 保留后台化任务 agentId；isBackgrounded===false 前台化任务不保留。
         // 保留集合只依赖任务表（与会话上下文无关，CC conversation.ts:93 同样全局遍历）→ 先算。
+        // [coordinator-align] 必须带<b>类型门</b>：CC conversation.ts:99-105 的 preservedAgentIds
+        //   只从 isLocalAgentTask(task)（type==='local_agent'，LocalAgentTask.tsx:149-151）与
+        //   isInProcessTeammateTask(task)（type==='in_process_teammate'，InProcessTeammateTask/types.ts:78-86）
+        //   取 agentId —— isLocalShellTask（type==='local_bash'，LocalShellTask/guards.ts:34-41）
+        //   <b>不在其列</b>，即便 shell task 带了 agentId 也不进 preserved。
+        //   WHY 此处必须与「shell task 开始有 agentId」同批改：一旦 BashTool/PowerShellTool 开始把
+        //   ctx.agentId() 传进 shell task，本循环若只判 task.agentId()!=null，就会把「派过 bash 的子代理」
+        //   也收进 preserved → /clear 后其 invokedSkills 跨清存活，方向与 CC 相反（新引入的偏差，
+        //   静默无报错）。故门 = 类型白名单，而不是「有没有 agentId」。
         java.util.Set<UUID> preserved = new java.util.HashSet<>();
         for (com.nexusai.application.agent.tasks.BackgroundTask task : taskFrameworkService.listAll()) {
             if (!task.isBackgrounded()) {
                 continue; // CC shouldKillTask（:94-98）
             }
+            if (!isAgentOwningTaskType(task)) {
+                continue; // CC :99-105 类型收窄（local_bash / remote_agent / monitor_mcp 等不收）
+            }
             if (task.agentId() != null) {
-                // local_agent / in_process_teammate 均为 agentId 归属（CC :99-106；Java taskId===agentId）
+                // local_agent（含 main-session 后台化）/ in_process_teammate 均为 agentId 归属
+                // （CC :99-106；Java 主会话后台化任务 taskId===agentId，见 MainSessionBackgroundService:142-174）
                 preserved.add(task.agentId());
             }
         }
@@ -925,6 +938,36 @@ public class CommandController {
         state.clearInvokedSkills(preserved);
         log.info("[CommandController] {}: 会话 {} 的 invokedSkills 已清理（preserved 后台化 agent {} 个，对齐 CC conversation.ts:93）",
             trigger, sessionIdStr, preserved.size());
+    }
+
+    /**
+     * [coordinator-align] {@code preservedAgentIds} 的<b>类型门</b> —— 该任务类型是否把 agentId 贡献给保留集合。
+     *
+     * <p><b>CC 真源（实测，非注释转述）</b>：{@code Open-ClaudeCode/src/commands/clear/conversation.ts:99-105}
+     * <pre>
+     *   if (isLocalAgentTask(task)) {            // LocalAgentTask.tsx:149-151  type === 'local_agent'
+     *     preservedAgentIds.add(task.agentId); ...push(task)
+     *   } else if (isInProcessTeammateTask(task)) {  // InProcessTeammateTask/types.ts:78-86  type === 'in_process_teammate'
+     *     preservedAgentIds.add(task.identity.agentId)
+     *   }
+     * </pre>
+     * 即<b>只</b>收 local_agent + in_process_teammate；{@code isLocalShellTask}
+     * （LocalShellTask/guards.ts:34-41，type==='local_bash'）虽有 agentId 字段也<b>不进</b>保留集合。
+     *
+     * <p><b>WHY 单独抽出这一判据</b>：本仓 TaskType 有 7 个值（LOCAL_BASH/LOCAL_AGENT/REMOTE_AGENT/
+     * IN_PROCESS_TEAMMATE/LOCAL_WORKFLOW/MONITOR_MCP/DREAM），而调用方若写成
+     * 「{@code task.agentId() != null} 就保留」，等价于「凡带归属就保留」—— 在 shell task 尚无 agentId
+     * 的年代看似等价，一旦上游补齐（BashTool/PowerShellTool 开始传 {@code ctx.agentId()}）立刻退化成
+     * 与 CC 相反的行为。写成显式白名单 + 单独方法，使「哪两类被收」这一事实只有一个落点。
+     *
+     * @param task 任务表条目（非 null）
+     * @return true = 该类型任务的 agentId 进 preservedAgentIds（CC conversation.ts:99-105 收窄后的两类）
+     */
+    private static boolean isAgentOwningTaskType(
+            com.nexusai.application.agent.tasks.BackgroundTask task) {
+        com.nexusai.application.agent.tasks.TaskType type = task.type();
+        return type == com.nexusai.application.agent.tasks.TaskType.LOCAL_AGENT
+            || type == com.nexusai.application.agent.tasks.TaskType.IN_PROCESS_TEAMMATE;
     }
 
     /**

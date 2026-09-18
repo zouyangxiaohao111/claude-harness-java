@@ -1,0 +1,27 @@
+-- ===================================================================
+-- V75: 会话级 coordinator 模式
+-- 语义：NULL = 未设置 → 回落 settings.coordinator_mode_enabled → 再回落 feature && env
+-- 范式同 V57（会话/运行级状态入 sessions 会话列）。
+--
+-- 背景（multi-session-vs-cc-single-session 铁律）：CC 是单进程单会话，coordinator 属
+--   会话属性 —— 持久化在主会话 JSONL 的 {"type":"mode","mode":"coordinator"} 记录里
+--   （types/logs.ts:138-142 ModeEntry；写入 utils/sessionStorage.ts:825-831
+--   reAppendSessionMetadata / saveMode），恢复会话时 matchSessionMode
+--   （coordinator/coordinatorMode.ts:49-78）把运行时状态（env）对齐到存档模式。
+--   Web 多会话后端（多会话并存同一进程）无法用进程级 env 表达会话属性，且本仓铁律
+--   禁止会话态经 ThreadLocal/MDC 读 ⇒ 会话列承载，按 sessionId 直查 DB。
+--
+-- 与 settings.coordinator_mode_enabled（V56 全局单例列）的关系：本列是**更高的会话级
+--   覆盖层**，三层优先级 会话列 > settings > feature && env。仿 V57「null = 未配置回落
+--   原判定链」三态范式：不给 DEFAULT，存量行保持 NULL ⇒ 判定链与加列前逐位相同（零行为
+--   变化）。显式置 0 才是「本会话强制关」。
+--
+-- 读侧：PromptAlignSettingsResolver.coordinatorModeActive / ...ForSession（唯一判定）；
+--   写侧：SessionService.update（PATCH /api/v1/sessions/{id}，同 bare_mode V33 /
+--   permission_mode V44 / main_thread_agent V58 会话列范式）+ transcript mode 行
+--   （SessionStorage.reAppendSessionMetadata，CC 双通道对齐）。
+--
+-- 回退注意：DROP COLUMN 会丢失「本会话强制关」这一显式状态（置 0 的行回退后变成
+--   「未设置」⇒ 若全局 settings 为开，该会话会由关变开）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN coordinator_mode INTEGER;

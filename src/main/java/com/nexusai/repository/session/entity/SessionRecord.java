@@ -142,6 +142,20 @@ public class SessionRecord {
      *   null = 存量旧行（V66 DEFAULT 0 语义，读侧按 0 处理）。
      */
     private Integer titleExplicit;
+    /**
+     * 会话级 coordinator 模式（V75 列 coordinator_mode，INTEGER 0/1 三态可空）· CC original:
+     * ModeEntry {@code {"type":"mode","mode":"coordinator"|"normal"}}（types/logs.ts:138-142），
+     * 经 sessionStorage.ts:825-831 落入主会话 JSONL，恢复时 matchSessionMode
+     * （coordinator/coordinatorMode.ts:49-78）把运行时对齐到存档模式。
+     * CC 单进程单会话 → 对齐手段是「翻进程 env」（:64-69）；Web 多会话后端无进程级会话属性，
+     * 且本仓铁律禁止会话态经 ThreadLocal/MDC 读 ⇒ 会话列承载，按 sessionId 直查 DB
+     * （multi-session-vs-cc-single-session 铁律，V57/V58 同款会话列范式）。
+     * 三层优先级：本列 > {@code settings.coordinator_mode_enabled}（V56 全局单例列）>
+     * {@code feature('COORDINATOR_MODE') && env(CLAUDE_CODE_COORDINATOR_MODE)}。
+     * 三态：null = 该会话未设置（回落 settings → 再回落 feature+env）；1 = 本会话强制协调者；
+     * 0 = 本会话强制普通（压过全局开）—— 这正是「A 会话是协调者、B 会话不是」的载体。
+     */
+    private Integer coordinatorMode;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -198,4 +212,7 @@ public class SessionRecord {
     // [title-cc-align V66] 显式命名标志 getter/setter（V66 会话列 title_explicit，MyBatis-Flex snake↔camel 映射）
     public Integer getTitleExplicit() { return titleExplicit; }
     public void setTitleExplicit(Integer titleExplicit) { this.titleExplicit = titleExplicit; }
+    // [coordinator-session V75] 会话级 coordinator 模式 getter/setter（V75 会话列 coordinator_mode，MyBatis-Flex snake↔camel 映射）
+    public Integer getCoordinatorMode() { return coordinatorMode; }
+    public void setCoordinatorMode(Integer coordinatorMode) { this.coordinatorMode = coordinatorMode; }
 }

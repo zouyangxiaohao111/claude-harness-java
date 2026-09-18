@@ -4015,7 +4015,11 @@ public class SubagentExecutor {
         if (summaryService == null || coordinatorMode == null) {
             return null;
         }
-        boolean coordinator = coordinatorMode.isCoordinatorMode();
+        // [coordinator 单一来源] coordinator 项走唯一判定（DB 覆盖 → 回落本形参 feature+env），
+        //   与工具池 / 权限链 / fork 互斥同源；此前只读形参 ⇒ DB-only 激活时 ASYNC 摘要门漏开。
+        // [coordinator-session V75] 会话感知入口（静态槽 + 会话列）· 会话层来源 = 本方法形参 sessionId
+        boolean coordinator = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+            .staticCoordinatorModeActiveForSession(sessionId, coordinatorMode);
         boolean fork = ForkSubagent.isForkSubagentEnabled();
         boolean sdk = sdkAgentProgressSummariesEnabled;
         // CC 三套分路径门 (AgentTool.tsx:750/:852/:934 + resumeAgent.ts:250-253):
@@ -4338,10 +4342,12 @@ public class SubagentExecutor {
                     //   门控：settings.coordinator_mode_enabled（DB 实时读源）非 null → 用 DB 值；
                     //   null → CoordinatorMode.isCoordinatorMode() 回落（feature+env 双真，默认关
                     //   = 未配置零行为变化）。CC 本无条件包 coordinator（concern 1 文档化偏差，owner 可拍板）。
-                    boolean coordGate = (promptAlignSettingsResolver != null
-                            && promptAlignSettingsResolver.coordinatorModeEnabled() != null)
-                        ? promptAlignSettingsResolver.coordinatorModeEnabled()
-                        : (coordinatorMode != null && coordinatorMode.isCoordinatorMode());
+                    //   [coordinator 单一来源] 判定收敛为唯一实现（DB 覆盖 → 回落 feature+env）；
+                    //   与 LlmAgentLoop.drainPendingAgentMessages 的消费端同源（同一 DB 读源）。
+                    // [coordinator-session V75] 会话感知入口 · 会话层来源 = 本方法内 sessionId
+                    //   （= subagentCtx.sessionId()，子代理归属会话）→ 父会话的会话级覆盖对子代理可见。
+                    boolean coordGate = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                        .coordinatorModeActiveForSession(sessionId, promptAlignSettingsResolver, coordinatorMode);
                     int coordinatorWrapped = 0;
                     for (String pm : pending) {
                         if (coordGate) {

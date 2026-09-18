@@ -106,6 +106,16 @@ public class CommandRegistrationConfig28 {
 
     private static final Logger log = LoggerFactory.getLogger(CommandRegistrationConfig28.class);
 
+    /**
+     * [coordinator-session V75] coordinator feature+env 回落层 · 供 transcript {@code mode} 行取值
+     * （{@code PromptAlignSettingsResolver.staticCoordinatorSessionModeLabel} 的最后一层）。
+     * 字段注入（本类已有显式构造器 + @Autowired(required=false) 形参范式；字段注入不触动该构造器
+     * 签名 ⇒ 既有直构调用点零改动）：plain JUnit 缺省 null → 该层缺席，标签退化为
+     * 「会话列 ?? settings ?? false」（不 NPE）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.coordinator.CoordinatorMode coordinatorMode;
+
     // ════════════════════════════════════════════════════════════════════════
     // 1. Bundled 命令元数据注册（14 个 local-jsx · 对齐 CC commands/ 各 index.ts 合并清单）
     // ════════════════════════════════════════════════════════════════════════
@@ -708,9 +718,14 @@ public class CommandRegistrationConfig28 {
                 //   `CwdResolution.getProjectRoot`，原 getOriginalCwdLayer 随 worktree 重锚 ⇒ 已改；
                 //   替代原 3 份逐字节相同的 resolveWorkspaceDir）。解析点仍在 try 内 ⇒ catch 语义不变。
                 Path ws = Path.of(ctx.projectRoot());
+                // [coordinator-session V75] 第 7 位 = mode（SessionMetadata 字段序：lastPrompt / customTitle /
+                //   tag / agentName / agentColor / agentSetting / **mode** / worktreeState / prNumber /
+                //   prUrl / prRepository）—— 值 = 会话有效 coordinator 模式标签（CC ModeEntry 字面量）。
                 SessionStorage.reAppendSessionMetadata(ws, ctx.sessionId(),
-                    new SessionStorage.SessionMetadata(null, null, tag, null, null,
-                        null, null, null, null, null, null));
+                    new SessionStorage.SessionMetadata(null, null, tag, null, null, null,
+                        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                            .staticCoordinatorSessionModeLabel(ctx.sessionId(), coordinatorMode),
+                        null, null, null, null));
                 log.info("[CommandRegistrationConfig28] /tag session={} 已打标 #{}（对齐 CC tag.tsx saveTag；toggle 移除读侧未接线，受控差异）",
                     ctx.sessionId(), tag);
             } catch (Exception e) {

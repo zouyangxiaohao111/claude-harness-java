@@ -296,7 +296,8 @@ class PartialCompactModelWiringTest {
     private static SessionDto sessionDto(String modelName) {
         return new SessionDto(SESSION, ModelTag.DS, modelName, "title", "现在", SessionGroup.current,
             null, null, 0, OffsetDateTime.now(), OffsetDateTime.now(),
-            null, null, null, null, null, null, null, null, null);
+            null, null, null, null, null, null, null, null, null,
+            null);   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
     }
 
     private static void stubAnthropicModel(ModelMapper mm, ProviderMapper pm) {

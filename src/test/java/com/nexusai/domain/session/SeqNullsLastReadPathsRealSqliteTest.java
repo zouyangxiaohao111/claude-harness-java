@@ -461,7 +461,8 @@ class SeqNullsLastReadPathsRealSqliteTest {
     private static SessionDto sessionDto() {
         return new SessionDto("sess-x", ModelTag.DS, "test-model", "导出示例", "刚刚", SessionGroup.current,
             null, null, null, OffsetDateTime.now(), OffsetDateTime.now(),
-            null, null, null, null, null, null, null, null, null);
+            null, null, null, null, null, null, null, null, null,
+            null);   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
     }
 
     /** 真 ChatService（真 mapper），仅替换标题链路需要的外部依赖。 */

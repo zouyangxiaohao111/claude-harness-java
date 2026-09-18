@@ -74,6 +74,15 @@ public class AgentColorCommand {
     private SubagentTool subagentTool;
 
     /**
+     * [coordinator-session V75] coordinator feature+env 回落层 · 供 transcript {@code mode} 行取值
+     * （{@code PromptAlignSettingsResolver.staticCoordinatorSessionModeLabel} 的最后一个层）。
+     * {@code @Autowired(required=false)}：plain JUnit 缺省 null → 该层缺席，标签退化为
+     * 「会话列 ?? settings.coordinator_mode_enabled ?? false」（不 NPE）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.coordinator.CoordinatorMode coordinatorMode;
+
+    /**
      * /color 生产注册 · 对齐 CC commands.ts COMMANDS 中 color 命令注册（D4/去重③）。
      *
      * <p>WHY（探查 GAP-3/M-3/C15）：UserInputDispatcher 生产仅注册 /compact，/color 未注册 →
@@ -201,9 +210,17 @@ public class AgentColorCommand {
             try {
                 Path transcript = SessionStorage.getTranscriptPath(ws, sessionId);
                 if (transcript != null) {
+                    // [coordinator-session V75] 第 7 位 = mode（SessionMetadata 字段序：lastPrompt /
+                    //   customTitle / tag / agentName / agentColor / agentSetting / **mode** /
+                    //   worktreeState / prNumber / prUrl / prRepository）—— 值 = 会话有效 coordinator
+                    //   模式标签（CC ModeEntry 字面量 coordinator|normal），对齐 CC saveMode
+                    //   （cli/print.ts:5206）在每次元数据重 append 时重盖章 mode 行的行为。
                     SessionStorage.reAppendSessionMetadata(ws, sessionId,
                         new SessionStorage.SessionMetadata(null, null, null, null, color,
-                            null, null, null, null, null, null));
+                            null,
+                            com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                                .staticCoordinatorSessionModeLabel(sessionId, coordinatorMode),
+                            null, null, null, null));
                 }
             } catch (Exception e) {
                 log.warn("[AgentColorCommand] saveAgentColor 持久化失败: session={} error={}",

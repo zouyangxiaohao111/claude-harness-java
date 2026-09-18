@@ -182,7 +182,12 @@ public class BackgroundTaskRunner {
                     sessionTask.id(), sessionTask.description(), tail);
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null,
+                        NotificationQueue.Priority.NEXT,
+                        // [coordinator-align] agentId 归属：子代理 spawn 的后台任务通知必须带归属 agentId，
+                        //   否则 drainForQuery 主线程规则（只捞 agentId==null）必然截走 → 子代理收不到。
+                        //   主会话 spawn（agentId==null）→ 表达式仍为 null，不编造归属。
+                        sessionTask.agentId() != null ? sessionTask.agentId().toString() : null,
+                        null, false, null, false, null,
                         sessionTask.sessionId()));
             });
         watchdog.start();
@@ -225,7 +230,11 @@ public class BackgroundTaskRunner {
                     sizeWatchdogKillNote(result));
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null, completed.sessionId()));
+                        NotificationQueue.Priority.NEXT,
+                        // [coordinator-align] agentId 归属：完成通知必须回到任务归属 subagent（spawn 由
+                        //   BashTool/PowerShellTool 的 run_in_background 路径发起）。主会话任务 → null。
+                        completed.agentId() != null ? completed.agentId().toString() : null,
+                        null, false, null, false, null, completed.sessionId()));
 
                 // OPD-TS-22/TP-18: 终态 task_notification SDK 事件（Java 无 print.ts XML→SDK 解析，
                 // 必须直接发射供前端消费；XML 通知仍走队列供模型，非双发——CC 双发风险是两条 SDK 路径）
@@ -252,7 +261,10 @@ public class BackgroundTaskRunner {
                 // [OD-D8] spawn 失败同 NEXT（对齐成功路径：CC LocalShellTask.tsx:166-171 完成/失败同 priority）
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null, failed.sessionId()));
+                        NotificationQueue.Priority.NEXT,
+                        // [coordinator-align] agentId 归属：失败通知与完成通知同归属（CC 同函数同参）
+                        failed.agentId() != null ? failed.agentId().toString() : null,
+                        null, false, null, false, null, failed.sessionId()));
 
                 emitTerminatedSdk(failed);
 
@@ -325,7 +337,12 @@ public class BackgroundTaskRunner {
         //   （s14+ 各 TaskType 实际执行器落地前为死代码），收窄不扩大行为面。
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
-                null, null, null, false, null, false, null, completed.sessionId()));
+                null,
+                // [coordinator-align] agentId 归属：stub 任务同样可能由子代理发起（task 由调用方构造，
+                //   agentId 透传保留）。当前无调用方（死代码），但归属算式必须与其它终态路径同形，
+                //   否则 s14+ 落地执行器时这里就是下一个「通知错投主代理」的破口。
+                completed.agentId() != null ? completed.agentId().toString() : null,
+                null, false, null, false, null, completed.sessionId()));
 
         emitTerminatedSdk(completed);
 
@@ -459,7 +476,11 @@ public class BackgroundTaskRunner {
         // [OD-D8] kill 终态同 NEXT（CC LocalShellTask.tsx:166-171 completed/failed/killed 同 priority）
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
-                NotificationQueue.Priority.NEXT, null, null, false, null, false, null, killed.sessionId()));
+                NotificationQueue.Priority.NEXT,
+                // [coordinator-align] agentId 归属：markKilled 由 cancel/killShellTasksForAgent 复用，
+                //   被杀任务可能是子代理的（agentId 非 null）→ 终止通知须回归属代理；主会话任务 → null。
+                killed.agentId() != null ? killed.agentId().toString() : null,
+                null, false, null, false, null, killed.sessionId()));
 
         emitTerminatedSdk(killed);
     }
@@ -1060,7 +1081,11 @@ public class BackgroundTaskRunner {
                     task.id(), task.description(), tail);
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null,
+                        NotificationQueue.Priority.NEXT,
+                        // [coordinator-align] agentId 归属：前台→后台化的任务沿用其归属 agentId
+                        //   （stall advisory 必须让归属代理看到，否则子代理以为命令还活着）。
+                        task.agentId() != null ? task.agentId().toString() : null,
+                        null, false, null, false, null,
                         task.sessionId()));
             });
     }
@@ -1116,7 +1141,10 @@ public class BackgroundTaskRunner {
             // [OD-D8] 前台→后台 bash 完成同 NEXT（CC LocalShellTask.tsx:166-171 completed/failed/killed 同 priority）
             notificationQueue.enqueuePendingNotification(
                 new NotificationQueue.QueueItem(xml, "task-notification",
-                    NotificationQueue.Priority.NEXT, null, null, false, null, false, null, completed.sessionId()));
+                    NotificationQueue.Priority.NEXT,
+                    // [coordinator-align] agentId 归属：前台→后台 bash 完成通知回归属 subagent
+                    completed.agentId() != null ? completed.agentId().toString() : null,
+                    null, false, null, false, null, completed.sessionId()));
             emitTerminatedSdk(completed);
 
             log.info("BackgroundTaskRunner.completeForegroundBackgroundedTask: task {} 完成 exitCode={} (G1-2)",
@@ -1141,7 +1169,10 @@ public class BackgroundTaskRunner {
                 // [OD-D8] 前台→后台 bash 失败同 NEXT（对齐成功路径）
                 notificationQueue.enqueuePendingNotification(
                     new NotificationQueue.QueueItem(xml, "task-notification",
-                        NotificationQueue.Priority.NEXT, null, null, false, null, false, null, failed.sessionId()));
+                        NotificationQueue.Priority.NEXT,
+                        // [coordinator-align] agentId 归属：前台→后台 bash 失败通知同完成路径归属
+                        failed.agentId() != null ? failed.agentId().toString() : null,
+                        null, false, null, false, null, failed.sessionId()));
                 emitTerminatedSdk(failed);
                 log.error("BackgroundTaskRunner.completeForegroundBackgroundedTask: task {} 失败: {}",
                     taskId, e.getMessage());
@@ -1242,7 +1273,11 @@ public class BackgroundTaskRunner {
             killed, result, killed.worktreePath(), killed.worktreeBranch());
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
-                null, null, null, false, null, false, null, killed.sessionId()));
+                null,
+                // [coordinator-align] agentId 归属：async agent 任务本身即由 subagent 拥有
+                //   （registerAsyncAgent 以 taskId===agentId 登记）→ 被杀通知必须回归属代理。
+                killed.agentId() != null ? killed.agentId().toString() : null,
+                null, false, null, false, null, killed.sessionId()));
 
         emitTerminatedSdk(killed);
 
@@ -1725,8 +1760,16 @@ public class BackgroundTaskRunner {
      * 行明确), 会"全杀"所有 LOCAL_BASH. Phase 3 通过 BackgroundTask.agentId 字段做
      * owner-scoped 过滤, 对齐 CC fail-closed 语义.
      *
+     * <p>[coordinator-align] 与 CC 同构的<b>两件事</b>（killShellTasks.ts:53-76 一个函数体）：
+     * <ol>
+     *   <li>杀：owner-scoped 终止 RUNNING 的 LOCAL_BASH 任务（上方循环）；</li>
+     *   <li>收尸：{@code dequeueAllMatching(item -> agentId.equals(item.agentId()))} 清掉队列中
+     *       归属该 agent 的滞留通知（CC :71-75）。第 2 步在循环<b>之外无条件</b>执行。</li>
+     * </ol>
+     * 只做第 1 步会留下孤儿通知（该 agent 的 query loop 已退出，主线程规则又捞不到 agentId!=null 的项）。
+     *
      * @param agentId 拥有待终止 task 的 sub-agent UUID
-     * @return 实际终止的 task 数
+     * @return 实际终止的 task 数（不含被收回的通知条数）
      */
     public int killShellTasksForAgent(UUID agentId) {
         if (agentId == null) {
@@ -1753,6 +1796,25 @@ public class BackgroundTaskRunner {
         }
         log.info("BackgroundTaskRunner.killShellTasksForAgent: agent={} 终止 {} 个 task",
             agentId, killed);
+        // [coordinator-align] 收尸：清掉队列里<b>归属该 agent</b> 的通知 · 对齐 CC
+        //   killShellTasks.ts:71-75 {@code dequeueAllMatching(cmd => cmd.agentId === agentId)}。
+        //   CC 原文注释：「Purge any queued notifications addressed to this agent — its query loop
+        //   has exited and won't drain them. killTask fires 'killed' notifications asynchronously;
+        //   drop the ones already queued and any that land later sit harmlessly (no consumer matches
+        //   a dead agentId).」
+        //   WHY 必须与上面的杀任务循环同批：①② 之前 shell task 的 agentId 恒 null ⇒ 本函数
+        //   结构性 no-op（杀 0 个）；①② 之后它会真杀，而被杀任务经 markKilled 会入队一条归属该 agent
+        //   的终止通知 —— 此时该 agent 的 query loop 已退出，主线程按 drainForQuery 规则
+        //   （只捞 agentId==null）也捞不到 ⇒ 通知滞留成<b>没人消费的孤儿</b>（静默：不报错、白占队列）。
+        //   ⚠ 谓词只按 agentId 精确匹配，<b>不得</b>退化成 dequeueAll（会误删别人/主线程的通知）。
+        //   ⚠ 与 CC 一致：本句在杀任务循环<b>之外无条件</b>执行（killed==0 也执行）。
+        List<NotificationQueue.QueueItem> orphaned =
+            notificationQueue.dequeueAllMatching(item -> agentId.toString().equals(item.agentId()));
+        if (!orphaned.isEmpty()) {
+            log.info("BackgroundTaskRunner.killShellTasksForAgent: agent={} 同时收回 {} 条归属该 agent 的"
+                + "滞留通知（其实例 query loop 已退出，再无消费者 · 对齐 CC killShellTasks.ts:75）",
+                agentId, orphaned.size());
+        }
         return killed;
     }
 
@@ -1821,7 +1883,11 @@ public class BackgroundTaskRunner {
         String xml = TaskNotificationBuilder.buildEnqueueShellNotification(notified, 0);
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
-                null, null, null, false, null, false, null, notified.sessionId()));
+                null,
+                // [coordinator-align] agentId 归属：本入口按 taskId 通用取任务（bash/agent 皆可），
+                //   归属一律以 task 自身 agentId 为准；主会话任务 → null 不编造。
+                notified.agentId() != null ? notified.agentId().toString() : null,
+                null, false, null, false, null, notified.sessionId()));
         if (log.isDebugEnabled()) {
             log.debug("BackgroundTaskRunner.enqueueAgentNotification: task {} notified",
                 taskId);
@@ -2018,7 +2084,12 @@ public class BackgroundTaskRunner {
             finalTask, result, finalTask.worktreePath(), finalTask.worktreeBranch());
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
-                null, null, null, false, null, false, null, finalTask.sessionId()));
+                null,
+                // [coordinator-align] agentId 归属：async agent 终态通知必须回归属子代理
+                //   （taskId===agentId，registerAsyncAgent 登记）——这是 S4-1 残差 ① 的完整闭合：
+                //   仅改 XML 形状为 agent 格式不够，还要让通知真正可达归属代理。
+                finalTask.agentId() != null ? finalTask.agentId().toString() : null,
+                null, false, null, false, null, finalTask.sessionId()));
 
         emitTerminatedSdk(finalTask);
 

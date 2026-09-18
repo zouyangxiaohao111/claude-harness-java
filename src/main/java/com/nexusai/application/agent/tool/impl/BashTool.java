@@ -73,6 +73,7 @@ import java.text.Normalizer;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.regex.Matcher;
@@ -1078,7 +1079,9 @@ public class BashTool implements Tool {
             // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
             //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
             String sessionId = ctx != null ? ctx.sessionId() : null;
-            return executeBackground(command, call.id(), sessionId);
+            // [coordinator-align] ctx 一并下传：task 的归属 agentId 只能从 ctx 取得
+            //   （对齐 CC BashTool.tsx:656 `agentId: toolUseContext.agentId`）。
+            return executeBackground(command, call.id(), sessionId, ctx);
         }
 
         // E4: stdout/stderr 捕获载体（reader 线程写入，finally 清理 spill 临时文件）
@@ -2718,8 +2721,13 @@ public class BashTool implements Tool {
      *
      * <p>生成 taskId → 创建 BackgroundTask(RUNNING) → spawn 到 BackgroundTaskRunner
      * <br>返回: task_id 和 output_file 提示消息
+     *
+     * @param ctx 发起调用的 ToolUseContext · [coordinator-align] task 的归属 agentId 唯一来源
+     *            （CC BashTool.tsx:656 {@code agentId: toolUseContext.agentId}）。可为 null
+     *            （1 参 dispatch 兼容路径）→ 归属按「主线程」处理（agentId=null）。
      */
-    private ToolResult executeBackground(String command, String toolUseId, String createSessionId) {
+    private ToolResult executeBackground(String command, String toolUseId, String createSessionId,
+                                         ToolUseContext ctx) {
         String taskId = TaskIdGenerator.generate(TaskType.LOCAL_BASH);
         // 批次4 #10：outputFile 走 taskOutputPath 同源分层 {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/{taskId}.output
         // （对齐 CC getTaskOutputPath = join(getTaskOutputDir(), `${taskId}.output`)，diskOutput.ts:72-74；
@@ -2734,16 +2742,28 @@ public class BashTool implements Tool {
             log.warn("BashTool: cannot create task output dir {}: {}", outputFile, e.getMessage());
         }
 
+        // [coordinator-align] 归属 agentId 透传 · 对齐 CC BashTool.tsx:656
+        //   {@code agentId: toolUseContext.agentId}（spawnShellTask 入参）。
+        //   CC BashTool.tsx:649-650 注释点明这是「always-shared task channel」的目的：
+        //   子代理的 background bash 才算真登记（并且能在 agent 退出时被 kill）。
+        //   ⛔ 改前走 11 参兼容构造器 → agentId 硬编码 null ⇒ 子代理 spawn 的 LOCAL_BASH 任务
+        //   与主会话的<b>长得一模一样</b>，NotificationQueue.drainForQuery 的主线程规则
+        //   （只捞 agentId==null）必然把完成通知截给主代理，子代理永远收不到（上报的现象）。
+        //   主线程 = ctx.agentId()==null（CC :642 isMainThread = !toolUseContext.agentId）；
+        //   ctx==null（1 参 dispatch 兼容路径）→ 无归属可传，保持 null（⛔ 不编造、不回落全局）。
+        //   isBackgrounded=true 与 11 参构造器的硬编码值一致 —— 本改动不动该语义。
+        UUID taskAgentId = ctx != null ? ctx.agentId() : null;
         BackgroundTask task = new BackgroundTask(
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             abbreviate(command, 100), toolUseId,
             System.currentTimeMillis(), null, null,
-            outputFile, 0L, false
+            outputFile, 0L, false,
+            taskAgentId, true
         );
 
         backgroundTaskRunner.spawn(task, command, createSessionId);
 
-        log.info("BashTool: background task {} spawned, output={}, createSessionId={}", taskId, outputFile, createSessionId);
+        log.info("BashTool: background task {} spawned, output={}, createSessionId={}, agentId={}", taskId, outputFile, createSessionId, taskAgentId);
         return ToolResult.success(toolUseId,
             "Background task started: " + taskId
             + "\nUse TaskOutput to read the result from: " + outputFile);

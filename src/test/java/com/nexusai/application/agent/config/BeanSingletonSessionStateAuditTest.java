@@ -96,6 +96,7 @@ class BeanSingletonSessionStateAuditTest {
         "com.nexusai.application.agent.compact.AutoCompactor#boolean contextCollapseEnabled", // feature/配置位；bean 创建期经 setContextCollapseEnabled 写一次
         "com.nexusai.application.agent.compact.AutoCompactor#boolean contextCollapseModeEnabled", // feature/配置位；bean 创建期经 setContextCollapseModeEnabled 写一次
         "com.nexusai.application.agent.compact.CompactThresholdSystem#ToIntFunction modelContextWindowResolver", // 装配注入的函数（无状态）
+        "com.nexusai.application.agent.prompt.PromptAlignSettingsResolver#SessionMapper sessionMapper", // [V75] 装配依赖（无状态 mapper，字段上无注解故未被装配过滤剔除，同 TodoStatusController#SessionMapper 情形）；会话 id 逐次入参、不在本字段驻留任何按会话键的值
         "com.nexusai.application.agent.mcp.HttpMcpTransport#String sessionId", // 已核：协议层 session id（MCP HTTP 会话，非用户会话）。实例由 McpTransportFactory:67 `new HttpMcpTransport(...)` 按连接创建；全仓无 `@Autowired HttpMcpTransport` 注入点 ⇒ 该 @Component 注解从不作为单例被消费 ⇒ 字段 per-instance，非会话载体
         "com.nexusai.application.agent.mcp.WorkspaceTrustState#boolean nonInteractiveSession", // 启动期配置位（进程级）
         "com.nexusai.application.agent.memory.AutoDreamConsolidator#long lastSessionScanAt", // 已核【非载体】：CC 真源 autoDream.ts:124 `let lastSessionScanAt = 0`（initAutoDream() 闭包变量）+ :145/:152 扫描节流。它节流的是 `listSessionsTouchedSince`（跨全部会话的 transcript 扫描 = **全局**操作）⇒ 进程级节流是**正确语义**（限流全局资源），名字里的 session 只是「上次扫描时刻」的误称 ⇒ 不属会话态载体，不会话化
@@ -164,7 +165,7 @@ class BeanSingletonSessionStateAuditTest {
      * —— 后者是 {@code final} 字段，见类 javadoc 的盲区登记。
      */
     private static final String PINNED_FINGERPRINT =
-        "1fa10951cf1797873c7f3dbf7d2e4098fdf974e49d5cb8d41b7a31ff537dace9";
+        "23ec18ecfaf4791e866c5e473a9c07b6cc8f2b3bdcb3fdb766bbe52ff90cfed9";
 
     /** 「会话可疑」判据 ①：字段类型属会话载体集（简名匹配，兼容泛型外层）。 */
     private static final Set<String> SESSION_CARRIER_TYPES = Set.of(

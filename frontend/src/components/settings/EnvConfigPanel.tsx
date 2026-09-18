@@ -52,6 +52,8 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   const [wsDomainCheckUrl, setWsDomainCheckUrl] = useState<string>(settings?.websearchDomainCheckUrl ?? '')
   // 工具延迟加载公告方式（settings.deferredToolsDeltaEnabled · 未配置 = 关闭）
   const [dtdDeltaEnabled, setDtdDeltaEnabled] = useState<boolean>(settings?.deferredToolsDeltaEnabled ?? false)
+  // 协调者模式（settings.coordinatorModeEnabled · 未配置 = 关闭）
+  const [coordinatorModeOn, setCoordinatorModeOn] = useState<boolean>(settings?.coordinatorModeEnabled ?? false)
   // away-summary 门控（localStorage · 两开关都开才触发 blur 摘要；后端 features API 补后接入）
   const [gates, setGates] = useState<{ AWAY_SUMMARY?: boolean; tengu_sedge_lantern?: boolean }>(() => {
     try { return JSON.parse(localStorage.getItem(AWAY_GATES_KEY) ?? '{}') } catch { return {} }
@@ -76,6 +78,11 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   useEffect(() => {
     setDtdDeltaEnabled(settings?.deferredToolsDeltaEnabled ?? false)
   }, [settings?.deferredToolsDeltaEnabled])
+
+  // 协调者模式草稿 ← settings（后端异步加载后回填）
+  useEffect(() => {
+    setCoordinatorModeOn(settings?.coordinatorModeEnabled ?? false)
+  }, [settings?.coordinatorModeEnabled])
 
   // 挂载时读 /memory/config 开关；失败 fail loud（内联错误文案，不阻塞其他 envc 区块）
   // [批 3a] 无活动会话 → 不发请求（后端 sessionId 必填会 400），直接内联错误态。
@@ -709,6 +716,30 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                 onChange={(e) => {
                   setDtdDeltaEnabled(e.target.checked)
                   void onSaveSettings({ deferredToolsDeltaEnabled: e.target.checked })
+                }}
+              />
+              <span></span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      {/* 模块：协调者模式（写 settings.coordinatorModeEnabled → 后端 PromptAlignSettingsResolver.coordinatorModeEnabled 读） */}
+      <div className="envc-card">
+        <div className="envc-card-title">协调者模式</div>
+        <div className="envc-row">
+          <div className="envc-label-group">
+            <span className="envc-name">协调者模式</span>
+            <span className="envc-desc">开启后主 Claude 只负责拆解与派发任务，具体执行交给子代理完成；默认关闭</span>
+          </div>
+          <div className="envc-control">
+            <label className="settings-switch">
+              <input
+                type="checkbox"
+                checked={coordinatorModeOn}
+                onChange={(e) => {
+                  setCoordinatorModeOn(e.target.checked)
+                  void onSaveSettings({ coordinatorModeEnabled: e.target.checked })
                 }}
               />
               <span></span>

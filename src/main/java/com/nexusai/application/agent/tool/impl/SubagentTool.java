@@ -1062,11 +1062,19 @@ public class SubagentTool implements Tool {
      * 收敛：优先 CoordinatorMode bean（动态 env 判定，CC 真源）；bean 未注入（测试/直构）回退
      * fork-gate 布尔字段（默认 false，与既有测试契约一致）。
      *
+     * <p><b>[coordinator 单一来源] bean 分支改走唯一判定</b>
+     * {@link PromptAlignSettingsResolver#staticCoordinatorModeActive(CoordinatorMode)}（DB 覆盖 → 回落
+     * feature+env）：此前本 helper 只读 bean（feature+env），DB-only 激活（前端勾选 =
+     * 唯一用户可达路径）时本 helper 恒 false ⇒ AgentTool prompt 按普通 agent、shouldRunAsync 不走
+     * coordinator、fork 互斥失效（半激活）。bean 未注入（测试 / 直构）仍回退遗留 config 布尔
+     * （{@code nexusai.fork.coordinator-mode}），保持既有直构契约。
+     *
      * @return 当前是否 coordinator 模式
      */
     private boolean isCoordinatorMode() {
         if (coordinatorModeBean != null) {
-            return coordinatorModeBean.isCoordinatorMode();
+            return com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                .staticCoordinatorModeActive(coordinatorModeBean);
         }
         return coordinatorMode;
     }

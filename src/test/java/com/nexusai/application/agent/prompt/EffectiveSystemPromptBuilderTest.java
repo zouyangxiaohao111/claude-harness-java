@@ -260,7 +260,7 @@ class EffectiveSystemPromptBuilderTest {
     @DisplayName("SP-02: coordinator 门开 + def null → [getCoordinatorSystemPrompt(), append?]，custom/memMechanics/default 全不出现在结果（systemPrompt.ts:71-74，coordinator 优先级高于 custom/default）")
     void coordinator_gateEnabled_defNull_coordinatorPlusAppend() {
         CountingSupplier assemble = new CountingSupplier();
-        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, false, true, null, List.of());
+        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, false, true, true, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(
             assemble, null, "CUSTOM", "MEM-MECH", "APPEND", opts);
@@ -281,12 +281,33 @@ class EffectiveSystemPromptBuilderTest {
     @DisplayName("SP-02: coordinator 门开 + def null + 无 append → 输出恰为 [getCoordinatorSystemPrompt()]（CC ...(append?[append]:[])）")
     void coordinator_gateEnabled_noAppend_soleCoordinatorPrompt() {
         CountingSupplier assemble = new CountingSupplier();
-        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, false, true, null, List.of());
+        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, false, true, true, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, null, null, null, opts);
 
         assertThat(prompt.elements()).as("无 append → 仅 coordinator prompt 单元素").containsExactly(CoordinatorMode.getCoordinatorSystemPrompt());
         assertThat(assemble.calls()).isZero();
+    }
+
+    @Test
+    @DisplayName("[scope] coordinator 门开但非主线程调用（子代理/hook agent）→ 分支不触发，custom 保留（CC 结构性前提：coordinator 提示只经 buildEffectiveSystemPrompt 进主线程）")
+    void coordinator_gateEnabled_notMainThread_coordinatorSkipped() {
+        // WHY: CC 的 coordinator 分支活在 buildEffectiveSystemPrompt 内，而该函数只被主线程路径调用；
+        //   子代理走 runAgent.ts:517-527 getAgentSystemPrompt（:892-916），不经过本函数。
+        //   Java 三路径共用本 builder ⇒ 必须由 mainThreadInvocation 显式声明路径，否则子代理自己的
+        //   agent 提示会被 coordinator 提示整体替换（worker 误以为自己是协调者）。
+        //   变异点：coordinator 分支去掉 mainThreadInvocation 条件 → 本用例红。
+        CountingSupplier assemble = new CountingSupplier();
+        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, false, true, false, null, List.of());
+
+        SystemPrompt prompt = EffectiveSystemPromptBuilder.build(
+            assemble, null, "CUSTOM", "MEM-MECH", "APPEND", opts);
+
+        assertThat(prompt.elements())
+            .as("非主线程 + coordinator 门开 → 落 custom 路径，coordinator 提示不注入")
+            .containsExactly("CUSTOM", "MEM-MECH", "APPEND");
+        assertThat(prompt.elements())
+            .as("coordinator 提示不得出现在子代理/hook agent 的提示里").doesNotContain(CoordinatorMode.getCoordinatorSystemPrompt());
     }
 
     @Test
@@ -306,7 +327,7 @@ class EffectiveSystemPromptBuilderTest {
     @DisplayName("SP-02: coordinator 门开但 def 非 null → 分支不触发（CC !mainThreadAgentDefinition 恒真条件破坏，:63），落 agent/custom 路径")
     void coordinator_gateEnabled_defPresent_coordinatorSkipped() {
         CountingSupplier assemble = new CountingSupplier();
-        EffectivePromptOptions opts = new EffectivePromptOptions(() -> builtinAgent("AGENT-PROMPT"), false, false, true, null, List.of());
+        EffectivePromptOptions opts = new EffectivePromptOptions(() -> builtinAgent("AGENT-PROMPT"), false, false, true, true, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, "CUSTOM", null, "APPEND", opts);
 
@@ -323,7 +344,7 @@ class EffectiveSystemPromptBuilderTest {
     void agentMainThread_gateEnabled_defPresent_agentReplacesDefault() {
         CountingSupplier assemble = new CountingSupplier();
         EffectivePromptOptions opts = new EffectivePromptOptions(
-            () -> builtinAgent("AGENT-PROMPT"), true, false, false, "model-x", List.of("dir1"));
+            () -> builtinAgent("AGENT-PROMPT"), true, false, false, false, "model-x", List.of("dir1"));
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(
             assemble, null, "CUSTOM", "MEM-MECH", "APPEND", opts);
@@ -344,7 +365,7 @@ class EffectiveSystemPromptBuilderTest {
                 capturedModel.set(modelId);
                 capturedDirs.set(dirs);
                 return "AGENT-PROMPT";
-            }), true, false, false, "model-x", List.of("dir1", "dir2"));
+            }), true, false, false, false, "model-x", List.of("dir1", "dir2"));
 
         EffectiveSystemPromptBuilder.build(new CountingSupplier(), null, null, null, null, opts);
 
@@ -356,7 +377,7 @@ class EffectiveSystemPromptBuilderTest {
     @DisplayName("SP-03: agentMainThreadEnabled 关（DB 门默认关）→ def 非 null 也不产生 agentSystemPrompt，落 custom/default（门控位是唯一触发源）")
     void agentMainThread_gateDisabled_defPresent_agentDormant() {
         CountingSupplier assemble = new CountingSupplier();
-        EffectivePromptOptions opts = new EffectivePromptOptions(() -> builtinAgent("AGENT-PROMPT"), false, false, false, null, List.of());
+        EffectivePromptOptions opts = new EffectivePromptOptions(() -> builtinAgent("AGENT-PROMPT"), false, false, false, false, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, "CUSTOM", null, "APPEND", opts);
 
@@ -369,7 +390,7 @@ class EffectiveSystemPromptBuilderTest {
     @DisplayName("SP-03: agentMainThreadEnabled 开但 def supplier 为 null（主循环无 /init）→ 分支休眠，落 default（扩展点登记）")
     void agentMainThread_gateEnabled_defSupplierNull_agentDormant() {
         CountingSupplier assemble = new CountingSupplier();
-        EffectivePromptOptions opts = new EffectivePromptOptions(null, true, false, false, null, List.of());
+        EffectivePromptOptions opts = new EffectivePromptOptions(null, true, false, false, false, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, null, null, "APPEND", opts);
 
@@ -387,7 +408,7 @@ class EffectiveSystemPromptBuilderTest {
     void proactive_gateEnabled_agentPresent_defaultPlusAgentInstructions() {
         CountingSupplier assemble = new CountingSupplier();
         EffectivePromptOptions opts = new EffectivePromptOptions(
-            () -> builtinAgent("AGENT-PROMPT"), true, true, false, null, List.of());
+            () -> builtinAgent("AGENT-PROMPT"), true, true, false, false, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, null, null, "APPEND", opts);
 
@@ -405,7 +426,7 @@ class EffectiveSystemPromptBuilderTest {
     void proactive_gateDisabled_agentPresent_fallsToAgentReplace() {
         CountingSupplier assemble = new CountingSupplier();
         EffectivePromptOptions opts = new EffectivePromptOptions(
-            () -> builtinAgent("AGENT-PROMPT"), true, false, false, null, List.of());
+            () -> builtinAgent("AGENT-PROMPT"), true, false, false, false, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, null, null, "APPEND", opts);
 
@@ -417,7 +438,7 @@ class EffectiveSystemPromptBuilderTest {
     @DisplayName("SP-04: proactive 门开但 agentSystemPrompt 缺省（无 def/agent 门关）→ 分支休眠，落 default+append")
     void proactive_gateEnabled_noAgentDef_agentDormant() {
         CountingSupplier assemble = new CountingSupplier();
-        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, true, false, null, List.of());
+        EffectivePromptOptions opts = new EffectivePromptOptions(null, false, true, false, false, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, null, null, "APPEND", opts);
 
@@ -432,7 +453,7 @@ class EffectiveSystemPromptBuilderTest {
     void proactive_noAppend_defaultPlusAgentSoleTail() {
         CountingSupplier assemble = new CountingSupplier();
         EffectivePromptOptions opts = new EffectivePromptOptions(
-            () -> builtinAgent("AGENT-PROMPT"), true, true, false, null, List.of());
+            () -> builtinAgent("AGENT-PROMPT"), true, true, false, false, null, List.of());
 
         SystemPrompt prompt = EffectiveSystemPromptBuilder.build(assemble, null, null, null, null, opts);
 

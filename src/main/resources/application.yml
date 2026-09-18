@@ -341,6 +341,13 @@ nexusai:
     # [OD-01 S1] tengu_sm_compact GB flag · 对齐 CC sessionMemoryCompact.ts:416-419
     # 默认开 = SM 压缩优先（与 sm-session-memory 作 AND）。
     sm-compact: true
+    # [coordinator 缺件补齐] coordinator 协调者模式 · 对齐 CC 编译期 feature('COORDINATOR_MODE')
+    #   （coordinatorMode.ts:36-41 feature('COORDINATOR_MODE') ? isEnvTruthy(CLAUDE_CODE_COORDINATOR_MODE) : false）。
+    #   开启需同时满足：本项 true AND env CLAUDE_CODE_COORDINATOR_MODE 为真值({1,true,yes,on})。
+    #   另有 DB settings.coordinator_mode_enabled 可覆盖（当前仅覆盖部分消费点）。
+    #   消费点 CoordinatorMode(Environment)（CoordinatorMode.java:85）读取本键；缺失 = getProperty 返回
+    #   null → isTruthy(null)=false → isCoordinatorMode() 恒早返 false（静默，无异常无日志），故本键必须存在。
+    coordinator-mode: false
 
   # ---------------------------------------------------------------
   # [ODF-A3] bare 模式统一判定 · Java 独有增强（CC envUtils.ts:60-65 无对应配置）

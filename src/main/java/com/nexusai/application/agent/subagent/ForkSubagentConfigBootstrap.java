@@ -36,7 +36,12 @@ public class ForkSubagentConfigBootstrap {
         ForkSubagentConfig.register(config);
         // [R-A12] coordinator 单一来源：动态 CoordinatorMode bean（env 真源）→ ForkSubagent supplier。
         //   bean 为 @Component（Spring 必注入非 null）；测试/直构路径经 ForkSubagent 静态槽回退。
-        ForkSubagent.setCoordinatorModeSupplier(() -> coordinatorMode.isCoordinatorMode());
+        //   [coordinator 单一来源·收敛] supplier 走唯一判定（DB 覆盖 → 回落本 bean 的 feature+env）：
+        //   coordinator 与 fork 是互斥模式（forkSubagent.ts:34 !isCoordinatorMode()），若这里只读 bean，
+        //   则 DB-only 激活（前端勾选）时「coordinator 提示已铺 + fork 分支仍开」同时成立。
+        ForkSubagent.setCoordinatorModeSupplier(
+            () -> com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                .staticCoordinatorModeActive(coordinatorMode));
         // 同步 ForkSubagent 运行时门槽（进程级全局，对齐 CC feature('FORK_SUBAGENT')；
         //   coordinator 槽位现仅作 supplier 未注入时的 fallback）
         ForkSubagent.syncRuntimeGate(

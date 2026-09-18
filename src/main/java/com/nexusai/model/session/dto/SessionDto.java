@@ -75,5 +75,14 @@ public record SessionDto(
      * mainThreadAgentDefinition（resumeAgent.ts:121-124，systemPrompt.ts:77-83）。null = 该会话
      * 未指定（agent 分支休眠，走默认系统提示组装链）。前端会话级设置读写本字段。
      */
-    String mainThreadAgent
+    String mainThreadAgent,
+    /**
+     * 会话级 coordinator 模式覆盖（V75 列 coordinator_mode，三态）· CC original: ModeEntry
+     * {@code {"type":"mode","mode":"coordinator"|"normal"}}（types/logs.ts:138-142 + sessionStorage.ts:825-831）
+     * + matchSessionMode（coordinator/coordinatorMode.ts:49-78）恢复对齐 —— CC 单进程单会话翻进程 env，
+     * Web 多会话无进程级会话属性 ⇒ 会话列承载（multi-session-vs-cc-single-session 铁律）。
+     * null = 该会话未设置（回落全局 settings.coordinator_mode_enabled → 再回落 feature && env）；
+     * true = 本会话强制协调者；false = 本会话强制普通（压过全局开）。前端会话级读写本字段。
+     */
+    Boolean coordinatorMode
 ) {}

@@ -1167,7 +1167,7 @@ public class LlmAgentLoop implements AgentLoop {
 
     /**
      * [U2 自主引导] 解析多模态档位模型名（settings.multimodalModelName → DB models.name，vision 模型）·
-     * 供文本主模型 &gt;20 页 PDF 引导注入 Agent(model=...) 用。未配置/未命中 → null（引导回落默认模型语义，
+     * 供文本主模型 &gt;10 页（超内联阈值）PDF 引导注入 Agent(model=...) 用。未配置/未命中 → null（引导回落默认模型语义，
      * 用户拍板非报错）。实例方法：读 {@link #modelConfigResolver} 实例字段（run() doRun 直连路径）。
      */
     private String resolveMultimodalModelName() {
@@ -1586,7 +1586,7 @@ public class LlmAgentLoop implements AgentLoop {
      * contentId）；[附件双模式] 本处理器三通道解析（path 直读 / base64 直传 / contentId 附件表优先 · store 回退）。
      * doRun 入口 {@code registerRunPromptPdfs} 经本处理器解析为待注入 blocks（pendingPdfs），
      * 主 user 消息构造（{@link #buildUserMessageWithImages} → drainPendingPdfs）消费：
-     * ≤20 页 → document/image block 直接注入；&gt;20 页 → NEEDS_SUBAGENT（主模型自主引导：按主模型能力
+     * ≤10 页 → document/image block 直接注入；&gt;10 页 → NEEDS_SUBAGENT（主模型自主引导：按主模型能力
      * 注入 pdf_reference 式文本——多模态主模型自行 Read pages 分段；文本主模型调 Agent 派多模态子代理）。
      * 系统<b>不自动 fork</b>（对齐 CC pdf_reference 引导，主模型自主决策）。
      * {@code @Autowired(required=false)}：非 Spring 场景（单测 new）为 null → 无 PDF 可注入，纯文本（现状不变）。
@@ -3319,8 +3319,8 @@ public class LlmAgentLoop implements AgentLoop {
         }
         // [U2 · R1] 生产链路接线 · 同 F1 图片登记模式：把 RunRequest.attachments() 的 type=pdf 项经
         //   PdfAttachmentProcessor 解析为待注入 blocks（pendingPdfs），首个 user 消息构造
-        //   （buildUserMessageWithImages → drainPendingPdfs）消费：≤20 页 → document/image block
-        //   直接注入（对齐 CC FileReadTool.ts:1001-1015/916-945）；>20 页 → NEEDS_SUBAGENT（R2 subagent
+        //   （buildUserMessageWithImages → drainPendingPdfs）消费：≤10 页 → document/image block
+        //   直接注入（对齐 CC FileReadTool.ts:1001-1015/916-945）；>10 页 → NEEDS_SUBAGENT（R2 subagent
         //   解析，注入文本说明）。[附件双模式] 三条通道统一在此解析（PdfAttachmentProcessor 内部）：
         //   path 附件（非空 path 直读外部绝对路径，附件表零拷贝注册同源）、≤5MB base64 直传（base64 通道）、
         //   contentId（附件表优先 / PdfAttachmentStore 历史 contentId 回退）→ resolvePdfBlocks 分页决策。
@@ -4230,6 +4230,33 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * 是否<b>顶层（主线程）循环</b>来源 · coordinator 能力（提示词分支 / 工具池裁剪）的共享顶层门。
+     *
+     * <p><b>值域</b>：{@link QuerySource#USER}（{@code RunRequest.user} 主会话）与
+     * {@link QuerySource#REPL_MAIN_THREAD}（{@code RunRequest.session}）。子代理
+     * （SUBAGENT / FORK / WORKFLOW）、hook agent（HOOK_AGENT）、后台 fork
+     * （COMPACT / SESSION_MEMORY / EXTRACT_MEMORIES / AUTO_DREAM / MARBLE_ORIGAMI）均<b>不是</b>。
+     *
+     * <p><b>为什么是单点</b>：CC 的 coordinator 两处能力都只在顶层入口生效 ——
+     * 工具池裁剪（{@code main.tsx:1872-1877 headless + mergeAndFilterTools REPL}；worker/subagent
+     * 走 {@code runAgent.ts filterToolsForAgent}、hook agent 走 {@code execAgentHook.ts:93-105}
+     * 各自装配）与系统提示分支（{@code buildEffectiveSystemPrompt}，子代理走
+     * {@code runAgent.ts:517-527 getAgentSystemPrompt} 不经过）。两个消费点必须同判据，
+     * 否则会出现「工具池按 worker 装配、提示词却按 coordinator 铺」的半激活态。
+     *
+     * <p><b>⛔ 不得改用 {@code ToolUseContext.agentId()}</b>：agentId 非 null ≠ 子代理 ——
+     * 主会话后台化（{@code MainSessionBackgroundService:406} 传 {@code agentId=taskId}，
+     * querySource 仍 REPL_MAIN_THREAD）属「主线程且 agentId 非 null」，用 agentId 判会误关
+     * 后台化主会话的 coordinator 能力。判据来源只能是 querySource。
+     *
+     * @param querySource 本次调用的查询来源（null → false，fail-closed）
+     * @return true = 顶层循环
+     */
+    private static boolean isTopLevelLoopSource(QuerySource querySource) {
+        return querySource == QuerySource.USER || querySource == QuerySource.REPL_MAIN_THREAD;
+    }
+
+    /**
      * [backend-sendmsg-inbox 2026-09-08] 子代理每轮消费 SendMessage 待办并前置本轮消息顶部 ·
      * 对齐 CC queryLoop 每轮 drain（LocalAgentTask.drainPendingMessages :181 →
      * getAgentPendingMessageAttachments attachments.ts:1085-1101 → wrapCommandText case
@@ -4269,10 +4296,12 @@ public class LlmAgentLoop implements AgentLoop {
         }
         // [sendmsg-inbox] coordinator 包裹门控 · 与 SubagentExecutor.runSubagentQueryLoop 启动段
         //   （:3954-3957）取值一致：DB resolver 非 null → 用 DB 值；null → CoordinatorMode 回落。
-        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver r = promptAlignResolverFromCtx(ctx);
-        boolean coordGate = (r != null && r.coordinatorModeEnabled() != null)
-            ? r.coordinatorModeEnabled()
-            : coordinatorMode.isCoordinatorMode();
+        // [coordinator 单一来源] 判定收敛：DB 覆盖 → 回落 feature+env，唯一实现在
+        //   PromptAlignSettingsResolver.coordinatorModeActive（不再各写一份三元）。
+        // [coordinator-session V75] 会话感知入口：会话列(sessions.coordinator_mode) > settings > feature+env。
+        //   本方法持有 ctx（subagent 循环跑在父会话 ctx 上）→ 会话层来源 = ctx.streamSessionId()。
+        boolean coordGate = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+            .coordinatorModeActiveForSession(ctx.streamSessionId(), promptAlignResolverFromCtx(ctx), coordinatorMode);
         java.util.List<ChatMessageDto> out = new java.util.ArrayList<>(messagesForLlm);
         int coordinatorWrapped = 0;
         // FIFO 队列保持投递序：逆序遍历 + add(0) → 前置到本轮 messagesForLlm 顶部
@@ -4532,7 +4561,7 @@ public class LlmAgentLoop implements AgentLoop {
                     state.systemPrompt(),                  // customSystemPrompt（替换 default）
                     memoryMechanicsPrompt,                 // memoryMechanicsPrompt（G-11：custom 与 append 之间）
                     state.appendSystemPrompt(),            // appendSystemPrompt（OPD-SP-31 接线：恒末尾追加）
-                    buildEffectivePromptOptions(ctx, runTuc));
+                    buildEffectivePromptOptions(ctx, runTuc, params.querySource()));
             // 3. coordinator userContext 并入（QueryEngine.ts:302-306 · 合并语义不变）
             java.util.Map<String, String> mergedUserContext =
                 mergeCoordinatorUserContext(ctx, runTuc, sysParts);
@@ -4608,14 +4637,21 @@ public class LlmAgentLoop implements AgentLoop {
      *
      * @param ctx        loop 上下文（sessionState 承载 resolver）
      * @param perTurnTuc 当前 turn 工具上下文（sessionId 源，可 null）
+     * @param querySource 本次调用的查询来源（顶层循环判定源 · coordinator 分支的第二个必要条件）
      * @return EffectivePromptOptions（coordinator 门控可真 → 分支可达）
      */
     private static com.nexusai.application.agent.prompt.EffectiveSystemPromptBuilder.EffectivePromptOptions
-            buildEffectivePromptOptions(AgentLoopContext ctx, ToolUseContext perTurnTuc) {
+            buildEffectivePromptOptions(AgentLoopContext ctx, ToolUseContext perTurnTuc,
+                                        QuerySource querySource) {
         com.nexusai.application.agent.prompt.PromptAlignSettingsResolver r = promptAlignResolverFromCtx(ctx);
         Boolean agentGate = r != null ? r.agentMainThreadEnabled() : null;
         Boolean proactiveGate = r != null ? r.proactiveEnabled() : null;
-        Boolean coordinatorGate = r != null ? r.coordinatorModeEnabled() : null;
+        // [coordinator 单一来源] 门收敛为唯一判定（DB 覆盖 → 回落 feature+env）：
+        //   本处不再自带 `coordinatorGate != null ? ... : isCoordinatorMode()` 三元。
+        // [coordinator-session V75] 走会话感知入口（会话列最高优先）——本方法持有 perTurnTuc
+        //   ⇒ 会话层来源 = turnSessionId(ctx, perTurnTuc)（与同方法内 SP-03 读会话列的来源同源）。
+        boolean coordinatorGate = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+            .coordinatorModeActiveForSession(turnSessionId(ctx, perTurnTuc), r, coordinatorMode);
         // [SP-03] 会话指定主线程 agent → mainThreadAgentDefinition supplier（对齐 CC appState.agent +
         //   resumeAgent.ts:121-124）。读会话列 main_thread_agent（V58），非空且 registry 可触达 →
         //   findAgent(agentType) 等价 lookup；命中 → supplier + sessionAgentActive（gate 激活）。
@@ -4653,11 +4689,23 @@ public class LlmAgentLoop implements AgentLoop {
         }
         // gate = 会话指定 agent 即激活（对齐 CC mainThreadAgentDefinition 非空即参与）；DB 门控作手动 override
         boolean agentEnabled = sessionAgentActive || (agentGate != null && agentGate);
+        // [coordinator-scope 2026-09-18] 本次调用是否**顶层（主线程）循环** · coordinator 分支的第二个必要条件。
+        //   判据 = querySource ∈ {USER, REPL_MAIN_THREAD}（{@link #isTopLevelLoopSource}，与
+        //   sessionVisibleToolsBase 的 coordinator 工具池裁剪同源单点）。
+        //   ⚠️ 为什么不用 ToolUseContext.agentId()：agentId 非 null ≠ 子代理 —— 主会话后台化
+        //   （MainSessionBackgroundService:406 传 agentId=taskId、querySource 仍 REPL_MAIN_THREAD）
+        //   会是「主线程但 agentId 非 null」⇒ 用 agentId 判会把后台化主会话的 coordinator 提示误关。
+        //   CC 的 coordinator 分支只被主线程路径调用（子代理走 runAgent.ts:517-527
+        //   getAgentSystemPrompt，:892-916），Java 三路径共用 collectRunMaterial ⇒ 不显式收窄就会让
+        //   worker 拿到 coordinator 提示（自己的 agent 提示与 agent-memory 被整体替换）。
+        //   querySource 为 null（未标注来源）→ 无法证明是顶层 ⇒ fail-closed 按非顶层。
+        boolean mainThreadInvocation = isTopLevelLoopSource(querySource);
         return new com.nexusai.application.agent.prompt.EffectiveSystemPromptBuilder.EffectivePromptOptions(
             mainDefSupplier,                         // mainThreadAgentDefinition（SP-03：会话指定 agent supplier；null=休眠）
             agentEnabled,                            // agentMainThreadEnabled（会话指定 || resolver，null→false）
             proactiveGate != null && proactiveGate,  // proactiveEnabled（null→false，CC 3P 默认不激活）
-            coordinatorGate != null ? coordinatorGate : coordinatorMode.isCoordinatorMode(), // coordinatorModeEnabled
+            coordinatorGate,                         // coordinatorModeEnabled（统一判定：DB 覆盖 → 回落 feature+env）
+            mainThreadInvocation,                    // mainThreadInvocation（顶层循环才允许 coordinator 提示）
             null,                                    // modelId（agent 分支休眠）
             java.util.List.of());                    // additionalWorkingDirs（agent 分支休眠）
     }
@@ -4705,8 +4753,10 @@ public class LlmAgentLoop implements AgentLoop {
             AgentLoopContext ctx, ToolUseContext perTurnTuc,
             com.nexusai.application.agent.prompt.SystemPromptParts sysParts) {
         com.nexusai.application.agent.prompt.PromptAlignSettingsResolver r = promptAlignResolverFromCtx(ctx);
-        Boolean gate = r != null ? r.coordinatorModeEnabled() : null;
-        boolean coordinatorActive = gate != null ? gate : coordinatorMode.isCoordinatorMode();
+        // [coordinator 单一来源] 同 drainPendingAgentMessages：唯一判定（DB 覆盖 → 回落 feature+env）
+        // [coordinator-session V75] 会话感知入口（会话列最高优先），来源 = turnSessionId(ctx, perTurnTuc)
+        boolean coordinatorActive = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+            .coordinatorModeActiveForSession(turnSessionId(ctx, perTurnTuc), r, coordinatorMode);
         if (!coordinatorActive) {
             return sysParts.userContext();
         }
@@ -9321,7 +9371,7 @@ public class LlmAgentLoop implements AgentLoop {
                 //   （气泡与落库不被污染，同 doRun 的 userPrompt vs effectiveUserPrompt 分化）。
                 String modelContent = content;
                 if (injectAttachments) {
-                    // ① PDF：registerRunPromptPdfs（≤20 页 → document/image block 直注；>20 页 → 引导文本）。
+                    // ① PDF：registerRunPromptPdfs（≤10 页 → document/image block 直注；>10 页 → 引导文本）。
                     //   pdfSupportsImage 与 doRun :3334 同源（同一 ModelCapabilityResolver + 同 modelName）。
                     boolean pdfSupportsImage = ModelCapabilityResolver.supportsImage(
                         ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().modelMapper() : null,
@@ -12252,13 +12302,25 @@ public class LlmAgentLoop implements AgentLoop {
         //   编排白名单）。用户 2026-08-23 拍板：bareMode 随会话走 → 读当前会话 bare_mode，而非全局判定。
         //   CC 顺序：simpleTools 选择（bare 裁剪）先于 filterToolsByDenyRules（tools.ts:297）——
         //   故 bare 裁剪置于 deny 过滤之前，随后仍走既有 deny/isEnabled/SPECIAL_TOOLS 过滤。
-        if (available != null && MemoryBareModeConfig.isBareMode(tuc.sessionId())) {
+        // [coordinator 单一来源] coordinator 门（DB 覆盖 → 回落 feature+env）在本方法<b>只算一次</b>，
+        //   bare 追加与工具池裁剪共用同一值 —— 此前两处各读一次 CoordinatorMode（且都漏 DB 层），
+        //   DB-only 激活时会出现「bare 没追加编排三工具、裁剪却按白名单」的自相矛盾。
+        //   ⚠️ 惰性求值：唯一判定要读 settings 单行，只在真会被消费（bare 裁剪或顶层循环）时才算，
+        //   与改动前的「门都在分支内求值」等价的短路语义；两个消费点仍共用同一个值。
+        boolean bareSession = available != null && MemoryBareModeConfig.isBareMode(tuc.sessionId());
+        boolean topLevelLoop = isTopLevelLoopSource(querySource);
+        //   [coordinator-session V75] 会话感知入口（静态槽 + 会话列）：会话层来源 = tuc.sessionId()
+        //   （本方法是 per-turn TUC 驱动的静态门，逐轮求值 ⇒ 会话列改动下一轮即生效）。
+        boolean coordinatorActive = (bareSession || topLevelLoop)
+            && com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                .staticCoordinatorModeActiveForSession(tuc.sessionId(), coordinatorMode);
+        if (bareSession) {
             int before = available.size();
-            available = applyBareModeSimpleTools(available);
+            available = applyBareModeSimpleTools(available, coordinatorActive);
             if (log.isInfoEnabled()) {
                 log.info("LlmAgentLoop.sessionVisibleTools: bare 模式（Web 精简模式）工具池 {}→{}（裁剪为 [Bash,Read,Edit]{}，对齐 CC tools.ts:287-296）",
                         before, available.size(),
-                        coordinatorMode.isCoordinatorMode() ? " + [Agent,TaskStop,SendMessage]" : "");
+                        coordinatorActive ? " + [Agent,TaskStop,SendMessage]" : "");
             }
         }
         if (available != null) {
@@ -12282,9 +12344,7 @@ public class LlmAgentLoop implements AgentLoop {
         //   故仅对顶层循环来源（USER = RunRequest.java:143 主会话 / REPL_MAIN_THREAD）裁剪，
         //   排除 SUBAGENT/FORK/HOOK_AGENT/COMPACT 等（否则 coordinator 模式会错误把 worker
         //   工具池裁剪为编排白名单 → worker 拿不到 Bash/Read/Edit）。
-        boolean topLevelLoop = querySource == QuerySource.USER
-                || querySource == QuerySource.REPL_MAIN_THREAD;
-        if (topLevelLoop && coordinatorMode.isCoordinatorMode()) {
+        if (topLevelLoop && coordinatorActive) {
             available = AgentToolUtils.applyCoordinatorToolFilter(available);
             if (log.isInfoEnabled()) {
                 log.info("LlmAgentLoop.sessionVisibleTools: coordinator 模式开启，顶层循环工具池经"
@@ -12339,10 +12399,15 @@ public class LlmAgentLoop implements AgentLoop {
      * 语义（tools.ts:272-298）。coordinator 叠加时按 CC 追加编排三工具，随后既有
      * {@code applyCoordinatorToolFilter}（A1，main.tsx:1872-1877 等价）把顶层循环池裁为白名单。
      *
-     * @param tools 裁剪前工具列表（null → null）
+     * <p><b>[coordinator 单一来源]</b> coordinator 门由调用方（{@code sessionVisibleToolsBase}）用
+     * 统一判定算好后<b>传入</b>，本方法不再自读 {@code CoordinatorMode} —— 否则同一轮的 bare 追加与
+     * 工具池裁剪会读两个可能分叉的门（DB-only 激活时 bare 缺编排三工具、裁剪却按白名单）。
+     *
+     * @param tools             裁剪前工具列表（null → null）
+     * @param coordinatorActive coordinator 门（唯一判定产物；true → 追加编排三工具）
      * @return 仅含 simpleTools（+coordinator 追加）的工具列表，保留原顺序；null 输入 → null
      */
-    private static List<Tool> applyBareModeSimpleTools(List<Tool> tools) {
+    private static List<Tool> applyBareModeSimpleTools(List<Tool> tools, boolean coordinatorActive) {
         if (tools == null) {
             return null;
         }
@@ -12350,7 +12415,7 @@ public class LlmAgentLoop implements AgentLoop {
         keep.add(com.nexusai.application.agent.tool.ToolNameConstants.BASH_TOOL_NAME);
         keep.add(com.nexusai.application.agent.tool.ToolNameConstants.FILE_READ_TOOL_NAME);
         keep.add(com.nexusai.application.agent.tool.ToolNameConstants.FILE_EDIT_TOOL_NAME);
-        if (coordinatorMode.isCoordinatorMode()) {
+        if (coordinatorActive) {
             keep.add(com.nexusai.application.agent.tool.AgentToolConstants.AGENT_TOOL_NAME);
             keep.add(com.nexusai.application.agent.tool.ToolNameConstants.TASK_STOP_TOOL_NAME);
             keep.add(com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME);
@@ -12851,8 +12916,8 @@ public class LlmAgentLoop implements AgentLoop {
      * 路径（loop() 静态上下文，store 经 queryLoop→loop 参数透传）。单点路由逻辑保证两路行为一致。
      *
      * @param store        图片附件缓存（null → 无图片可注入 → 纯文本）
-     * @param pdfProcessor [U2 · R1] PDF 附件处理器（null → 无 PDF 可注入）· ≤20 页 document/image block
-     *                     直接注入；&gt;20 页 → NEEDS_SUBAGENT（U2 自主引导：按主模型能力注入 pdf_reference
+     * @param pdfProcessor [U2 · R1] PDF 附件处理器（null → 无 PDF 可注入）· ≤10 页 document/image block
+     *                     直接注入；&gt;10 页 → NEEDS_SUBAGENT（U2 自主引导：按主模型能力注入 pdf_reference
      *                     式文本——多模态主模型自行 Read pages 分段 / 文本主模型调 Agent 派多模态子代理。
      *                     系统<b>不自动 fork</b>，主模型自主决策）
      * @param modelMapper  模型 mapper（null → supportsImage=false → 多模态工具路由）
@@ -12880,7 +12945,7 @@ public class LlmAgentLoop implements AgentLoop {
 
     /**
      * [U2 自主引导] 10 参内部重载 · 追加多模态档位模型名（{@code settings.multimodalModelName} →
-     * {@code ModelConfigResolver.resolveMultimodalModelName()}，vision 模型名）· &gt;20 页 PDF
+     * {@code ModelConfigResolver.resolveMultimodalModelName()}，vision 模型名）· &gt;10 页 PDF
      * （NEEDS_SUBAGENT）按主模型能力分流引导：多模态主模型自行 Read pages 分段；文本主模型引导
      * 调 Agent 工具（model=多模态档位名）派多模态子代理处理。{@code multimodalModelName} 为 null
      * （非 Spring 单测 / 未配置）→ 引导回落默认模型语义（用户拍板非报错，注记"未配置用默认模型"）。
@@ -12958,14 +13023,14 @@ public class LlmAgentLoop implements AgentLoop {
             }
         }
 
-        // ── PDF：≤20 页且模型支持 → document/image block 直接注入（对齐 CC FileReadTool.ts:1001-1015/916-945）；
-        //    >20 页（NEEDS_SUBAGENT）→ U2 自主引导：按主模型能力注入 pdf_reference 式文本（多模态主模型自行
-        //    Read pages 分段 / 文本主模型调 Agent 派多模态子代理），系统不自动 fork；模型不支持（≤20 页）→
+        // ── PDF：≤10 页且模型支持 → document/image block 直接注入（对齐 CC FileReadTool.ts:1001-1015/916-945）；
+        //    >10 页（NEEDS_SUBAGENT）→ U2 自主引导：按主模型能力注入 pdf_reference 式文本（多模态主模型自行
+        //    Read pages 分段 / 文本主模型调 Agent 派多模态子代理），系统不自动 fork；模型不支持（≤10 页）→
         //    文本说明，不注入媒体块 ──
         StringBuilder pdfNotes = new StringBuilder();
         for (PdfAttachmentProcessor.PendingPdf pdf : pdfs) {
             if (pdf.needsSubagent()) {
-                // [U2 · 自主引导] 分页决策 >20 页 → 注入按主模型能力分流的引导文本（不自动 fork；对齐 CC
+                // [U2 · 自主引导] 分页决策 >10 页 → 注入按主模型能力分流的引导文本（不自动 fork；对齐 CC
                 //   pdf_reference：文件名 + 路径 + 页数 + 能力对应动作，主模型自主 Read pages / Agent 派子代理）
                 pdfNotes.append(buildPdfGuidanceNote(pdf, pdfSupported, multimodalModelName));
             } else if (pdfSupported) {
@@ -12974,8 +13039,8 @@ public class LlmAgentLoop implements AgentLoop {
                 }
                 hasInjectedMedia = true;
                 if (log.isDebugEnabled()) {
-                    log.debug("[U2] PDF blocks 直接注入：filename={} pages={} blocks={}（模型支持 PDF，≤20 页直接注入 document/image block）",
-                        pdf.filename(), pdf.pageCount(), pdf.blocks().size());
+                    log.debug("[U2] PDF blocks 直接注入：filename={} pages={} blocks={}（模型支持 PDF，未超内联阈值 {} 页，直接注入 document/image block）",
+                        pdf.filename(), pdf.pageCount(), pdf.blocks().size(), PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD);
                 }
             } else if (pdf.pdfPath() != null && !pdf.pdfPath().isBlank()) {
                 // [vision-cc-align 2026-09-03] 文本模型 PDF → 不再逐页注册页图（懒渲染省成本）：引导
@@ -13057,7 +13122,7 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [U2 自主引导] &gt;20 页 PDF（PendingPdf.needsSubagent=true）按<b>主模型能力</b>分流注入引导文本
+     * [U2 自主引导] &gt;10 页 PDF（PendingPdf.needsSubagent=true）按<b>主模型能力</b>分流注入引导文本
      * （系统<b>不自动 fork</b>，主模型自主决策 · 对齐 CC pdf_reference：文件名 + 路径 + 页数 + 能力对应动作）。
      *
      * <p><b>分流策略</b>：
@@ -13087,15 +13152,18 @@ public class LlmAgentLoop implements AgentLoop {
         if (pdfSupported) {
             // 主模型多模态（支持 PDF）→ 引导主模型自行 Read pages 分段（不叫子代理）
             if (log.isDebugEnabled()) {
-                log.debug("[U2 分页决策] PDF >20 页自主引导（多模态主模型 Read pages 分段）: filename={} path={} pages={}",
+                log.debug("[U2 分页决策] PDF >10 页自主引导（多模态主模型 Read pages 分段）: filename={} path={} pages={}",
                     pdf.filename(), pdfPath, pageCount);
             }
             StringBuilder sb = new StringBuilder("\n- PDF 附件 ").append(name).append("：");
             if (pageCount > 0) {
                 sb.append(pageCount).append(" 页，");
             }
-            sb.append("超过单次读取上限 ").append(PdfSupport.PDF_MAX_PAGES_PER_READ)
-                .append(" 页，请用 Read 工具 + pages 参数分段读取（如 pages:'1-5'、'6-10'…每段 ≤")
+            // [B1 2026-09-18] 两个数字必须拆开：降级触发线（为何只给路径）= 内联阈值 10；
+            //   怎么读 = Read 工具单次分段上限 PDF_MAX_PAGES_PER_READ(20)。旧文案
+            //   「超过单次读取上限 20 页」把二者混为一谈，降级线改 10 后即为错述。
+            sb.append("超过内联阈值 ").append(PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD)
+                .append(" 页（不直接注入内容），请用 Read 工具 + pages 参数分段读取（如 pages:'1-5'、'6-10'…每段 ≤")
                 .append(PdfSupport.PDF_MAX_PAGES_PER_READ).append(" 页）");
             if (pdfPath != null && !pdfPath.isBlank()) {
                 sb.append("，路径：").append(pdfPath);
@@ -13105,7 +13173,7 @@ public class LlmAgentLoop implements AgentLoop {
 
         // 主模型文本（不支持 PDF）→ 引导主模型调 Agent 工具派多模态子代理（注入动态多模态档位模型名）
         if (log.isDebugEnabled()) {
-            log.debug("[U2 分页决策] PDF >20 页自主引导（文本主模型 → Agent 派多模态子代理）: filename={} path={} pages={} 多模态模型={}",
+            log.debug("[U2 分页决策] PDF >10 页自主引导（文本主模型 → Agent 派多模态子代理）: filename={} path={} pages={} 多模态模型={}",
                 pdf.filename(), pdfPath, pageCount, mm == null ? "未配置(回落默认)" : mm);
         }
         StringBuilder sb = new StringBuilder("\n- PDF 附件 ").append(name).append("：");
@@ -13819,8 +13887,8 @@ public class LlmAgentLoop implements AgentLoop {
      * 非空 path / ≤5MB base64 直传 / &gt;5MB contentId），[附件双模式] PdfAttachmentProcessor 内部三通道
      * 解析（path 直读 / base64 直传 / contentId 附件表优先 · store 回退），LlmAgentLoop doRun 入口调用本方法
      * （先于首个 user 消息构造），首个 user 消息构造（{@link #buildUserMessageWithImages} →
-     * drainPendingPdfs）消费：≤20 页 → document/image block 直接注入（对齐 CC FileReadTool.ts:1001-1015
-     * /916-945）；&gt;20 页 → NEEDS_SUBAGENT（U2 自主引导：PendingPdf 携 pdfPath → buildPdfGuidanceNote
+     * drainPendingPdfs）消费：≤10 页 → document/image block 直接注入（对齐 CC FileReadTool.ts:1001-1015
+     * /916-945）；&gt;10 页 → NEEDS_SUBAGENT（U2 自主引导：PendingPdf 携 pdfPath → buildPdfGuidanceNote
      * 按主模型能力注入引导文本——多模态主模型自行 Read pages / 文本主模型调 Agent 派多模态子代理，
      * 系统不自动 fork）。
      *

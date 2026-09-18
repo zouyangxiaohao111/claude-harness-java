@@ -51,6 +51,30 @@ class AgentNameRegistryTest {
     }
 
     @Test
+    @DisplayName("[终态清理] unregister: 注销 name 时同步清空其映射 agentId 的待投递队列（否则消息永久滞留：终态 agent 不再 drain）")
+    void unregisterClearsPendingQueueOfMappedAgentId() {
+        // WHY（CLAUDE.md 规则九）：pendingMessages 的唯一消费点是 drain(agentId)（SubagentExecutor
+        //   启动段 / LlmAgentLoop 每轮 drainPendingAgentMessages），两者都只在 agent 存活期发生。
+        //   agent 终态 → unregister；此后投递的消息既送不到（调用方已拿到 success:true）、
+        //   也永远不被消费 → 静默丢失 + 队列永久驻留（内存泄漏）。
+        //   变异点：unregister 去掉 pendingMessages.remove(removed) → 本用例红。
+        AgentNameRegistry registry = new AgentNameRegistry();
+        registry.register("worker-a", "agent-111");
+        registry.register("worker-b", "agent-222");
+        registry.queue("agent-111", "hello");
+        registry.queue("agent-222", "keep-me");
+
+        registry.unregister("worker-a");
+
+        assertThat(registry.hasPending("agent-111"))
+            .as("注销后该 name 映射到的 agentId 的待投递队列必须清空").isFalse();
+        assertThat(registry.drain("agent-111"))
+            .as("drain 不再返回滞留消息（终态 agent 已无消费点）").isEmpty();
+        assertThat(registry.hasPending("agent-222"))
+            .as("⛔ 只清本 name 映射到的 agentId，不得误清其它存活 agent 的队列").isTrue();
+    }
+
+    @Test
     @DisplayName("queue+drain: 按名路由待办消息 FIFO 消费（CC queuePendingMessage → LocalAgentTask 每轮消费）")
     void queueThenDrainFifo() {
         AgentNameRegistry registry = new AgentNameRegistry();

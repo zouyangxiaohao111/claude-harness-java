@@ -320,6 +320,68 @@ class CommandControllerBuiltInCommandsTest {
     }
 
     @Test
+    @DisplayName("[coordinator-align] preservedAgentIds 只收 agent 类任务（local_agent / in_process_teammate），"
+        + "不收 shell 任务 —— 对齐 CC conversation.ts:99-105")
+    void clearInvokedSkillsPreservingBackgrounded_onlyCollectsAgentTaskTypes() {
+        // WHY（规则九）：conversation.ts:99-105 的 preservedAgentIds 是<b>类型收窄</b>的 ——
+        //   只从 isLocalAgentTask(task)（type==='local_agent'，LocalAgentTask.tsx:149-151）与
+        //   isInProcessTeammateTask(task)（type==='in_process_teammate'，types.ts:78-86）取 agentId；
+        //   local_bash（isLocalShellTask，guards.ts:34-41）即便带 agentId 也<b>不进</b> preserved。
+        //   代码后果：若 shell 任务的 agentId 也被收进 preserved，/clear 后「派过 bash 的子代理」
+        //   的 invokedSkills 会跨 /clear 存活 —— 而该子代理在 CC 语义下没有跨 /clear 存活的理由，
+        //   于是 /clear 变成「清一半」：主会话 skill 没了、shell-spawning 代理的 skill 还在，
+        //   模型上下文里混进已失效的 skill 内容（静默错误，不报错）。方向与 CC 相反。
+        //
+        // 本用例是「上游补齐」的配套门：一旦 BashTool/PowerShellTool 开始给 shell task 传
+        // ctx.agentId()（本批 ①②），没有这道类型门就会<b>新引入</b>这个与 CC 相反的偏差。
+        //
+        // 走反射直调私有方法：/clear 端点已停用（409，见上方 CLEAR_DISABLED_REASON），
+        // 清理链本身按决策保留不删，故只能从方法入口取证。
+        java.util.UUID agentTaskAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a1");
+        java.util.UUID teammateAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a2");
+        java.util.UUID bashTaskAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a3");
+        java.util.UUID remoteAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a4");
+        long now = System.currentTimeMillis();
+        String out = "/tmp/nexusai-sessions/sess-x/tasks/";
+        when(taskFrameworkService.listAll()).thenReturn(java.util.List.of(
+            // 应保留（CC isLocalAgentTask / isInProcessTeammateTask）
+            new BackgroundTask("a00000000", TaskType.LOCAL_AGENT, BackgroundTaskStatus.RUNNING,
+                "agent", null, now, null, null, out + "a00000000.output", 0L, false, agentTaskAgent, true),
+            new BackgroundTask("t00000000", TaskType.IN_PROCESS_TEAMMATE, BackgroundTaskStatus.RUNNING,
+                "teammate", null, now, null, null, out + "t00000000.output", 0L, false, teammateAgent, true),
+            // 不应保留（shell 任务；本批 ①② 之后它们也有 agentId 了）
+            new BackgroundTask("b00000000", TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
+                "bash", null, now, null, null, out + "b00000000.output", 0L, false, bashTaskAgent, true),
+            // 不应保留（CC conversation.ts 同样不收 remote_agent —— 防「只排掉 local_bash」的偷懒门）
+            new BackgroundTask("r00000000", TaskType.REMOTE_AGENT, BackgroundTaskStatus.RUNNING,
+                "remote", null, now, null, null, out + "r00000000.output", 0L, false, remoteAgent, true)));
+
+        AgentState state = new AgentState("test-system-prompt");
+        when(sessionAgentStateRegistry.get(org.mockito.ArgumentMatchers.any())).thenReturn(state);
+        state.addInvokedSkill("agent-skill", "/s/a.md", "c", agentTaskAgent);
+        state.addInvokedSkill("teammate-skill", "/s/t.md", "c", teammateAgent);
+        state.addInvokedSkill("bash-skill", "/s/b.md", "c", bashTaskAgent);
+        state.addInvokedSkill("remote-skill", "/s/r.md", "c", remoteAgent);
+        state.addInvokedSkill("main-skill", "/s/m.md", "c", null);
+
+        ReflectionTestUtils.invokeMethod(controller, "clearInvokedSkillsPreservingBackgrounded",
+            "[coordinator-align] test", "sess-cmd-test");
+
+        assertThat(state.getInvokedSkillsForAgent(agentTaskAgent))
+            .as("local_agent 后台化任务的 agentId 必须在 preserved 内（CC conversation.ts:100-102）").hasSize(1);
+        assertThat(state.getInvokedSkillsForAgent(teammateAgent))
+            .as("in_process_teammate 的 identity.agentId 必须在 preserved 内（CC conversation.ts:103-104）").hasSize(1);
+        assertThat(state.getInvokedSkillsForAgent(bashTaskAgent))
+            .as("local_bash 任务的 agentId 不得进 preserved（CC :99-105 只收 isLocalAgentTask/"
+                + "isInProcessTeammateTask，不收 isLocalShellTask）—— 收了就与 CC 相反，shell 代理的 "
+                + "skill 会跨 /clear 错误存活").isEmpty();
+        assertThat(state.getInvokedSkillsForAgent(remoteAgent))
+            .as("remote_agent 同样不在 CC 的 preserved 来源内 —— 本条防「只排掉 local_bash」的偷懒门").isEmpty();
+        assertThat(state.getInvokedSkillsForAgent(null))
+            .as("null-agent（主会话）skill 恒被清（CC state.ts:1551）").isEmpty();
+    }
+
+    @Test
     @Disabled(CLEAR_DISABLED_REASON)
     @DisplayName("[IMP-SP2-08] /clear 无 preserved → resetPromptCacheBreakDetection 清空 PREVIOUS（CC caches.ts:63）")
     void executeBuiltin_clear_resetsPromptCacheBreakDetection() throws Exception {

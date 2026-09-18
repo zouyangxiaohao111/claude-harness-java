@@ -269,6 +269,20 @@ public class SessionService {
                 s.setMainThreadAgent(agentType);
             }
         }
+        // [coordinator-session V75] 会话级 coordinator 模式（coordinator_mode 列）：PATCH 语义，
+        //   仅显式传入时更新（null 不改动）。三层判定链 会话列 > settings.coordinator_mode_enabled >
+        //   feature && env（PromptAlignSettingsResolver.coordinatorModeActive）——本列即「A 会话是
+        //   协调者、B 会话不是」的唯一载体（CC 单进程单会话可翻进程 env，Web 多会话不可）。
+        //   ⚠️ 清除会话级覆盖（回到「未设置」）本批次未开 API 面：PATCH null 语义是「不改动」，
+        //   与 bare_mode/permission_mode 同款（V33/V44 先例），不引入第二种 null 语义。
+        if (req.coordinatorMode() != null) {
+            s.setCoordinatorMode(req.coordinatorMode() ? 1 : 0);
+            if (log.isInfoEnabled()) {
+                log.info("[SessionService] update: session={} 会话级 coordinator 模式={}（V75 列，"
+                        + "压过 settings/feature/env 三层回落下层）",
+                    id, req.coordinatorMode());
+            }
+        }
         s.setUpdatedAt(OffsetDateTime.now().toString());
 
         sessionMapper.update(s);
@@ -693,7 +707,10 @@ public class SessionService {
             s.getTotalCostYuan(),
             sumTokensFromModelUsage(s.getModelUsageJson()),
             // [SP-03] 会话指定主线程 agent 透出（V58 列 main_thread_agent；null = 未指定，agent 分支休眠）
-            s.getMainThreadAgent()
+            s.getMainThreadAgent(),
+            // [coordinator-session V75] 会话级 coordinator 模式透出（0/1 → Boolean，null 保持 null =
+            //   未设置回落下一层；与 PATCH 写侧构成对称契约）
+            s.getCoordinatorMode() != null ? s.getCoordinatorMode() != 0 : null
         );
     }
 

@@ -726,4 +726,80 @@ class SessionServiceTest {
         assertThat(SessionService.sumTokensFromModelUsage("{}")).as("空对象 → 0").isZero();
         assertThat(SessionService.sumTokensFromModelUsage("[]")).as("非对象 JSON → 0（fail-soft 不抛）").isZero();
     }
+
+    // ═══════════ [coordinator-session V75] 会话级 coordinator 模式读写（coordinator_mode 列）═══════════
+
+    @Test
+    @DisplayName("[V75] update 带 coordinatorMode=true → 落库 coordinator_mode=1 + DTO 透出 true")
+    void update_persistsCoordinatorModeTrue() {
+        // WHY（规则九）：coordinator 在本仓此前只能全局进程级（settings 单例 / env）⇒ 做不到「A 会话是
+        //   协调者、B 会话不是」。V75 列 = 会话级唯一载体，写侧必须真落库（PATCH 是全部会话级开关的
+        //   既有范式：bare_mode V33 / permission_mode V44 / main_thread_agent V58）。
+        // 变异点：update 漏写 coordinatorMode → 列恒 NULL → 判定永久回落 settings/env → 会话级覆盖失效 → 红。
+        SessionRecord existing = new SessionRecord();
+        existing.setId("sess-1");
+        when(sessionMapper.selectOneById("sess-1")).thenReturn(existing);
+
+        SessionDto dto = service.update("sess-1",
+            new SessionUpdateRequest("新标题", null, null, null, null, null, null, true));
+
+        assertThat(existing.getCoordinatorMode())
+            .as("PATCH coordinatorMode=true → sessions.coordinator_mode=1")
+            .isEqualTo(1);
+        assertThat(dto.coordinatorMode()).as("update 返回 DTO 回显 true").isTrue();
+    }
+
+    @Test
+    @DisplayName("[V75] update 带 coordinatorMode=false → 落库 0（显式关，压过全局开）")
+    void update_persistsCoordinatorModeFalse() {
+        // WHY：三态里的 0 不是「未设置」而是「本会话强制普通」——这是「A 协调者 / B 普通」中 B 的
+        //   唯一表达（全局 settings 开时仍能把 B 压回普通）。若写侧把 false 折叠成 null（或不写），
+        //   B 会被全局开带走 ⇒ 多会话互不串味的需求直接落空。
+        SessionRecord existing = new SessionRecord();
+        existing.setId("sess-1");
+        existing.setCoordinatorMode(1);
+        when(sessionMapper.selectOneById("sess-1")).thenReturn(existing);
+
+        SessionDto dto = service.update("sess-1",
+            new SessionUpdateRequest(null, null, null, null, null, null, null, false));
+
+        assertThat(existing.getCoordinatorMode())
+            .as("PATCH coordinatorMode=false → 列=0（显式关，非 NULL）")
+            .isZero();
+        assertThat(dto.coordinatorMode()).as("DTO 回显 false（0 ≠ null）").isFalse();
+    }
+
+    @Test
+    @DisplayName("[V75] update 不带 coordinatorMode → 列不改动（PATCH 语义，null 跳过）")
+    void update_nullCoordinatorModeUnchanged() {
+        // WHY：七参兼容构造器/未传字段 = 「不改动」，不得误清该会话的显式覆盖（对齐 bareMode :199 同款语义）。
+        SessionRecord existing = new SessionRecord();
+        existing.setId("sess-1");
+        existing.setCoordinatorMode(0);
+        when(sessionMapper.selectOneById("sess-1")).thenReturn(existing);
+
+        service.update("sess-1", new SessionUpdateRequest("新标题", null, null, null, null, null, null));
+
+        assertThat(existing.getCoordinatorMode())
+            .as("update 未带 coordinatorMode → 原 coordinator_mode=0 保持")
+            .isZero();
+    }
+
+    @Test
+    @DisplayName("[V75] getById 列 NULL → DTO coordinatorMode=null（三态透出，不是 false）")
+    void getById_toDtoCoordinatorModeNullStaysNull() {
+        // WHY：null = 未设置（回落 settings → env）与 false = 显式关，语义不同，DTO 必须保真区分——
+        //   折叠成 false 会让前端把「未设置」画成「已关闭」，且掩盖三层链的存在。
+        SessionRecord record = new SessionRecord();
+        record.setId("sess-1");
+        record.setTitle("t");
+        record.setModelTag(ModelTag.DS.name());
+        record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
+        record.setMessageCount(0);
+        when(sessionMapper.selectOneById("sess-1")).thenReturn(record);
+
+        assertThat(service.getById("sess-1").coordinatorMode())
+            .as("列 NULL → DTO null（未设置，非 false）")
+            .isNull();
+    }
 }

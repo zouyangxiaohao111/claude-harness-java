@@ -20,8 +20,12 @@ import java.util.function.Supplier;
  *       !mainThreadAgentDefinition} → {@code asSystemPrompt([getCoordinatorSystemPrompt(),
  *       ...(append?[append]:[])])}。Java 门控 = {@link EffectivePromptOptions#coordinatorModeEnabled()}
  *       （LlmAgentLoop 经 resolver.coordinatorModeEnabled() 求值，null→回落
- *       CoordinatorMode.isCoordinatorMode()）；Java 无主线程 agent 定义（def 恒 null）→
- *       {@code !mainThreadAgentDefinition} 恒真（CC 语义保持）。</li>
+ *       CoordinatorMode.isCoordinatorMode()）<b>且</b>
+ *       {@link EffectivePromptOptions#mainThreadInvocation()}；Java 无主线程 agent 定义（def 恒 null）→
+ *       {@code !mainThreadAgentDefinition} 恒真（CC 语义保持）。
+ *       ⭐ {@code mainThreadInvocation} 承载 CC 的<b>结构性前提</b>：本函数只被主线程路径调用，
+ *       子代理走 {@code runAgent.ts:517-527 getAgentSystemPrompt}（:892-916）不经过本函数
+ *       ⇒ 子代理/hook agent 结构性拿不到 coordinator 提示。</li>
  *   <li><b>agent</b>（:77-83）：mainThreadAgentDefinition 非空 → agentSystemPrompt（built-in 走
  *       options 变体 / custom 走无参变体，Java 统一 {@code getSystemPrompt(modelId, dirs)}）。
  *       Java 门控 = {@link EffectivePromptOptions#agentMainThreadEnabled()}
@@ -80,6 +84,20 @@ public final class EffectiveSystemPromptBuilder {
      *                                  isEnvTruthy(CLAUDE_CODE_COORDINATOR_MODE)}（:63-65）；
      *                                  Java 侧 resolver.coordinatorModeEnabled()（null→回落
      *                                  CoordinatorMode.isCoordinatorMode()，feature+env 双真）。
+     * @param mainThreadInvocation      <b>本次调用是否顶层（主线程）循环</b>（coordinator 分支的<b>第二个必要条件</b>）·
+     *                                  CC original: coordinator 提示只在顶层路径可达 —— 该分支位于
+     *                                  {@code buildEffectiveSystemPrompt}（:62-75），而子代理走
+     *                                  {@code runAgent.ts:517-527 → getAgentSystemPrompt}（:892-916），
+     *                                  <b>不经过</b>本函数 ⇒ 对子代理结构性不可达。Java 三条路径
+     *                                  （主循环 / 所有子代理 / hook agent）收敛到同一 builder ⇒ 必须
+     *                                  显式声明路径，否则子代理会被 coordinator 提示整体替换自己的
+     *                                  agent 提示与 agent-memory（coordinator 分支早退于 custom 之前）。
+     *                                  fail-closed 默认：false = 非顶层 ⇒ 不注入 coordinator 提示。
+     *                                  LlmAgentLoop 取值 = querySource ∈ {USER, REPL_MAIN_THREAD}
+     *                                  （{@code isTopLevelLoopSource}，与 coordinator 工具池裁剪同判据）。
+     *                                  ⛔ 不用 {@code ToolUseContext.agentId()}：主会话后台化
+     *                                  （{@code MainSessionBackgroundService:406} 传 agentId=taskId）
+     *                                  是「主线程且 agentId 非 null」，用 agentId 判会误关其提示。
      * @param modelId                   内置 agent env 块 modelDescription 渲染入参 · CC original:
      *                                  resolvedAgentModel（runAgent.ts:340，逐调用传递）；仅 agent
      *                                  分支命中时消费（休眠，LlmAgentLoop 传 null）。
@@ -92,18 +110,19 @@ public final class EffectiveSystemPromptBuilder {
         boolean agentMainThreadEnabled,
         boolean proactiveEnabled,
         boolean coordinatorModeEnabled,
+        boolean mainThreadInvocation,
         String modelId,
         List<String> additionalWorkingDirs
     ) {
 
         /**
-         * 默认关闭选项 · 既有 4/5 参调用零改动迁移：三个分支门控全关 + def null →
+         * 默认关闭选项 · 既有 4/5 参调用零改动迁移：三个分支门控全关 + 非主线程 + def null →
          * 仅 custom/default 三元路径（现行为零变化）。
          *
-         * @return {@code (null, false, false, false, null, [])}
+         * @return {@code (null, false, false, false, false, null, [])}
          */
         public static EffectivePromptOptions disabled() {
-            return new EffectivePromptOptions(null, false, false, false, null, List.of());
+            return new EffectivePromptOptions(null, false, false, false, false, null, List.of());
         }
     }
 
@@ -153,9 +172,13 @@ public final class EffectiveSystemPromptBuilder {
             : null;
 
         // ── 第 2 层：coordinator 分支（CC systemPrompt.ts:62-75）──
-        // 条件 coordinatorGate && !mainThreadAgentDefinition（Java def 恒 null → 恒真）。
+        // 条件 mainThreadInvocation && coordinatorGate && !mainThreadAgentDefinition。
+        // ⚠️ mainThreadInvocation 是**结构性**条件（非 feature/env 门）：CC 的 coordinator 分支活在
+        //    buildEffectiveSystemPrompt 内，而该函数只被主线程路径调用（子代理走 runAgent.ts:517-527
+        //    getAgentSystemPrompt，:892-916）。Java 三路径共用本 builder ⇒ 必须显式声明「本次是主线程」，
+        //    否则子代理/hook agent 会被 coordinator 提示整体替换（本分支早退于 custom 之前）。
         // 返回 [getCoordinatorSystemPrompt(), ...(append?[append]:[])]，无 memoryMechanics。
-        if (opt.coordinatorModeEnabled() && mainDef == null) {
+        if (opt.coordinatorModeEnabled() && opt.mainThreadInvocation() && mainDef == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[EffectiveSystemPromptBuilder] coordinatorModeEnabled 命中，返回 [getCoordinatorSystemPrompt(), ...(append?[append]:[])]（CC systemPrompt.ts:71-74）");
             }

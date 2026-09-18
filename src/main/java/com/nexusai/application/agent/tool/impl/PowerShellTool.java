@@ -611,7 +611,9 @@ public class PowerShellTool implements Tool {
             // [批 3b-D7 签名收紧] 不再判 ctx.sessionId()==null（ToolUseContext 契约保证非空）——
             //   用户裁定「不传递不能有守卫」；ctx 本身仍可空（本文件既有 dispatch 兼容路径）
             String sessionId = ctx != null ? ctx.sessionId() : null;
-            return executeBackground(command, call.id(), sessionId);
+            // [coordinator-align] ctx 一并下传：task 的归属 agentId 只能从 ctx 取得
+            //   （对齐 CC PowerShellTool.tsx:465 `agentId: toolUseContext.agentId`）。
+            return executeBackground(command, call.id(), sessionId, ctx);
         }
         // ── CC :717-728 — pwsh 探测 pre-flight（缺失返回 code 0 + stderr sentinel）──
         String pwshPath = resolvePwshPath();
@@ -1034,8 +1036,14 @@ public class PowerShellTool implements Tool {
      * <p>生成 taskId → 创建 BackgroundTask(RUNNING) → spawn 到 BackgroundTaskRunner → 返回
      * backgroundTaskId（CC 后台早返回 data.backgroundTaskId）。TaskType 复用 LOCAL_BASH（CC PowerShell
      * 走同一 LocalShellTask local_bash 通道，无独立 PS 类型）。
+     *
+     * @param ctx 发起调用的 ToolUseContext · [coordinator-align] task 的归属 agentId 唯一来源
+     *            （CC PowerShellTool.tsx:465 {@code agentId: toolUseContext.agentId}）。可为 null
+     *            （1 参 dispatch 兼容路径）→ 归属按「主线程」处理（agentId=null）。
      */
-    private ToolResult<java.util.Map<String, Object>> executeBackground(String command, String toolUseId, String createSessionId) {
+    private ToolResult<java.util.Map<String, Object>> executeBackground(String command, String toolUseId,
+                                                                       String createSessionId,
+                                                                       ToolUseContext ctx) {
         String taskId = TaskIdGenerator.generate(TaskType.LOCAL_BASH);
         // 批次4 #18：outputFile 走 taskOutputPath 同源分层 {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/{taskId}.output
         // （对齐 CC getTaskOutputPath，diskOutput.ts:72-74；sessionId 防并发会话 clobber；扩展名 .output 对齐 CC）。
@@ -1049,16 +1057,25 @@ public class PowerShellTool implements Tool {
             log.warn("[PowerShellTool] cannot create task output dir {}: {}", outputFile, e.getMessage());
         }
 
+        // [coordinator-align] 归属 agentId 透传 · 对齐 CC PowerShellTool.tsx:465
+        //   {@code agentId: toolUseContext.agentId}（:452 同款 isMainThread = !toolUseContext.agentId）。
+        //   与 BashTool 同因同理：改前走 11 参兼容构造器 → agentId 硬编码 null ⇒ 子代理 spawn 的
+        //   后台 PS 任务通知必被主代理截走（NotificationQueue 主线程规则只捞 agentId==null）。
+        //   ctx==null（1 参 dispatch 兼容路径）→ 无归属可传，保持 null（⛔ 不编造、不回落全局）。
+        //   isBackgrounded=true 与 11 参构造器的硬编码值一致。
+        java.util.UUID taskAgentId = ctx != null ? ctx.agentId() : null;
         BackgroundTask task = new BackgroundTask(
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             abbreviate(command, 100), toolUseId,
             System.currentTimeMillis(), null, null,
-            outputFile, 0L, false
+            outputFile, 0L, false,
+            taskAgentId, true
         );
 
         backgroundTaskRunner.spawn(task, command, createSessionId);
 
-        log.info("[PowerShellTool] background task {} spawned, output={}, createSessionId={}", taskId, outputFile, createSessionId);
+        log.info("[PowerShellTool] background task {} spawned, output={}, createSessionId={}, agentId={}",
+            taskId, outputFile, createSessionId, taskAgentId);
         Map<String, Object> structuredOutput = Map.of(
             "backgroundTaskId", taskId,
             "backgroundedByUser", false,

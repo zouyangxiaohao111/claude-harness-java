@@ -13,7 +13,8 @@ import org.springframework.stereotype.Component;
  * Coordinator mode gate · 对齐 CC coordinator/coordinatorMode.ts.
  *
  * <p>L1 语义: COORDINATOR_MODE 启用检测 (feature flag + env var);INTERNAL_WORKER_TOOLS
- *            内部 worker 工具集合 (TeamCreate/TeamDelete/SendMessage/SyntheticOutput).
+ *            内部 worker 工具集合 (TeamCreate/TeamDelete/SendMessage/StructuredOutput —
+ *            真名见 ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME，非 'SyntheticOutput').
  *
  * <p>L2 契约 (5 Release Gate):
  * <ul>
@@ -39,8 +40,25 @@ public final class CoordinatorMode {
     public static final String COORDINATOR_ENV = "CLAUDE_CODE_COORDINATOR_MODE";
     public static final String COORDINATOR_MODE_FEATURE = "COORDINATOR_MODE";
 
+    /**
+     * 内部 worker 工具集合 · 对齐 CC coordinatorMode.ts:29-34
+     * ({@code INTERNAL_WORKER_TOOLS = new Set([TEAM_CREATE_TOOL_NAME, TEAM_DELETE_TOOL_NAME,
+     * SEND_MESSAGE_TOOL_NAME, SYNTHETIC_OUTPUT_TOOL_NAME])})。
+     *
+     * <p>用途 = 从 worker 工具清单里<b>做减法</b>（{@link #getCoordinatorUserContext}：遍历
+     * ASYNC_AGENT_ALLOWED_TOOLS，命中本集合即剔除）。减法按字符串相等匹配，<b>写错一个名字不会报错</b>
+     * ——只是静默漏删一项。
+     *
+     * <p>[coordinator 缺件补齐] 原第 4 项写死为字面量 {@code "SyntheticOutput"}（CC 早期旧名），
+     * 与工具真名 {@code "StructuredOutput"}（{@link com.nexusai.application.agent.tool.ToolNameConstants#SYNTHETIC_OUTPUT_TOOL_NAME}）
+     * 不符 ⇒ 漏删一项、模型可见 worker 工具清单多一项。现全部改为引用 {@code ToolNameConstants}
+     * 常量（CC 真源同样用常量，非字面量），常量改名时此处随之同步，不再有第二处真值。
+     */
     public static final Set<String> INTERNAL_WORKER_TOOLS = Set.of(
-        "TeamCreate", "TeamDelete", "SendMessage", "SyntheticOutput");
+        com.nexusai.application.agent.tool.ToolNameConstants.TEAM_CREATE_TOOL_NAME,
+        com.nexusai.application.agent.tool.ToolNameConstants.TEAM_DELETE_TOOL_NAME,
+        com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME,
+        com.nexusai.application.agent.tool.ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME);
 
     private final Supplier<Boolean> featureFlagSupplier;
     private final Supplier<String> envSupplier;
