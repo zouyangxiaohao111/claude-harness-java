@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { BASE64_LIMIT } from '../attachmentDelivery'
-import { classifyAttachmentPath, planPathAttachmentChannel } from '../pathAttachment'
+import { BASE64_LIMIT, DEDUP_NS_FILE, fileDedupKey } from '../attachmentDelivery'
+import { DEDUP_NS_PATH, classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '../pathAttachment'
 
 /**
  * `addPaths` 通道（Tauri 拖拽 `onDragDropEvent` / `plugin-dialog.open()` 拿**绝对路径**）
@@ -148,5 +148,44 @@ describe('localRead=false：任何类型都不走 path（回落 read 腿 → bas
         `${name} @ ${label}(${bytes}B)：非 local-read 模式不得传本地 path`,
       ).toBe('read')
     }
+  })
+})
+
+/**
+ * ⭐ 批 ATT-DEDUP-KEY：`addPaths` 的去重键 = **完整路径**（旧键是 basename）。
+ *
+ * <b>修的两个缺陷（同一次改动，两个方向都要钉）</b>：
+ * <ol>
+ *   <li><b>同名不同目录被误丢</b>：旧键是 basename ⇒ 拖入 `D:\甲\报告.docx` 之后
+ *       `D:\乙\报告.docx` 会被判重复丢弃（用户只看到「少了一个」，无任何提示）。</li>
+ *   <li><b>与其他通道撞键</b>：旧实现 `addFiles` / `addPaths` 共用同一个 basename 命名空间
+ *       ⇒ 一份叫 `image.png` 的拖入文件会**挡住**随后的同名粘贴截图（正是本批主症状的邻例）。</li>
+ * </ol>
+ * ⛔ 同时钉住「不得为算内容哈希而读全文件」：本函数**纯字符串**，签名里没有 File/IO
+ * ⇒ 零拷贝设计（`stat` 只取 size、大文件只传路径）不会被判重代码破坏。
+ */
+describe('⭐ pathDedupKey：键 = 完整路径（同名不同目录不得互相覆盖 · 批 ATT-DEDUP-KEY）', () => {
+  it('⭐ 同名不同目录 ⇒ 两个键（旧实现都是 basename「报告.docx」⇒ 第二个被误丢）', () => {
+    const a = pathDedupKey('D:\\甲\\报告.docx')
+    const b = pathDedupKey('D:\\乙\\报告.docx')
+    expect(a).not.toBe(b)
+    // 反向锚点：basename 确实相同 —— 说明「键不同」不是因为文件名不同，而是因为键不再是文件名
+    expect(classifyAttachmentPath('D:\\甲\\报告.docx').name).toBe('报告.docx')
+    expect(classifyAttachmentPath('D:\\乙\\报告.docx').name).toBe('报告.docx')
+  })
+
+  it('同一路径（Tauri enter/drop 双触发、重复拖放）⇒ 同一个键（去重仍然要生效）', () => {
+    expect(pathDedupKey('D:\\甲\\报告.docx')).toBe(pathDedupKey('D:\\甲\\报告.docx'))
+  })
+
+  it('与 addFiles 通道的键**不撞**（命名空间不同 ⇒ 「拖入的 image.png」不再挡住「粘贴的 image.png」）', () => {
+    const pathKey = pathDedupKey('D:\\甲\\image.png')
+    expect(pathKey).not.toBe(fileDedupKey('image.png', 1024))
+    expect(pathKey.startsWith(DEDUP_NS_FILE), '不得落进 addFiles 的 file: 命名空间').toBe(false)
+    expect(pathKey.startsWith(DEDUP_NS_PATH)).toBe(true)
+  })
+
+  it('POSIX 路径同样按整串取键（不同目录不同键）', () => {
+    expect(pathDedupKey('/home/u/甲/a.png')).not.toBe(pathDedupKey('/home/u/乙/a.png'))
   })
 })

@@ -27,13 +27,38 @@ import { BASE64_LIMIT, type AttachmentFileType } from './attachmentDelivery'
 
 /** `addPaths` 的扩展名分类结果。 */
 export interface PathAttachmentClass {
-  /** basename（`C:\a\b.docx` → `b.docx`）—— 同时是附件去重键，故必须与原实现逐字一致。 */
+  /** basename（`C:\a\b.docx` → `b.docx`）—— chip 显示名与投递字段，**不再是去重键**（见 {@link pathDedupKey}）。 */
   name: string
   type: AttachmentFileType
   mediaType: string
   /** 是否图片 —— 与 {@link PathAttachmentClass.isPdf} 一起决定 local-read 分支能否走 path。 */
   isImage: boolean
   isPdf: boolean
+}
+
+/** `addPaths` 去重键的命名空间前缀（与 `attachmentDelivery` 的 `md5:` / `file:` 互不串扰）。 */
+export const DEDUP_NS_PATH = 'path:'
+
+/**
+ * `addPaths` 通道的去重键 = **完整路径**（`C:\a\b.docx` 与 `C:\other\b.docx` 是两个键）。
+ *
+ * <b>修的两个缺陷（同一次改动）</b>：
+ * <ol>
+ *   <li><b>同名不同目录被误丢</b>：旧键是 basename ⇒ 拖入 `D:\甲\报告.docx` 之后，
+ *       `D:\乙\报告.docx` 会被判重复而丢弃（用户只会看到「少了一个」）。</li>
+ *   <li><b>与 `addFiles` 通道撞键</b>：旧实现两条腿共用同一个 basename 命名空间 ⇒
+ *       一份叫 `image.png` 的拖入文件会**挡住**随后的同名粘贴截图（而那正是本批要修的主症状）。</li>
+ * </ol>
+ *
+ * ⛔ <b>为什么这里绝不算内容 md5</b>：本通道的**零拷贝设计**是「大文件不进前端内存」的全部依据 ——
+ * `stat` 只取 `size`，`>5MB` 的附件**只传路径字符串**给后端同机读盘（见
+ * `planPathAttachmentChannel`）。为了判重去 `readFile` 整读一遍，就把这个设计直接破坏了
+ * （一个 2GB 的视频会被读进 WebView 内存只为算个哈希）。⇒ 用路径本身作键：**零 I/O、零内存**。
+ * 代价如实登记：同一份文件从两个不同路径（复制品）拖入会被视为两份 —— 这是**可接受**的，
+ * 因为对 path 通道而言「同一路径」就是后端读盘时的同一份文件。
+ */
+export function pathDedupKey(path: string): string {
+  return `${DEDUP_NS_PATH}${path}`
 }
 
 /**
@@ -44,7 +69,8 @@ export interface PathAttachmentClass {
  *
  * ⚠️ 原实现写的是 `p.split(/[\\/]/).pop() ?? p`，但 `split` 恒返回非空数组 ⇒ `.pop()` **永不为
  * `undefined`** ⇒ `?? p` 是**死代码**。此处逐字保留：改掉它会改变「路径以分隔符结尾」时的
- * `filename`（实测为**空串**），进而改变去重键 —— 那是行为变更，不属本批。
+ * `filename`（实测为**空串**）—— 那是 chip 显示名与投递字段的行为变更，不属本批。
+ * （去重键已于批 ATT-DEDUP-KEY 改为**完整路径**（{@link pathDedupKey}），故本处不再影响判重。）
  */
 export function classifyAttachmentPath(pathOrName: string): PathAttachmentClass {
   const name = pathOrName.split(/[\\/]/).pop() ?? pathOrName

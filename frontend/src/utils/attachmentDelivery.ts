@@ -33,6 +33,7 @@
  */
 
 import type { AttachmentRequest } from '@/api/types'
+import { md5Hex } from './md5'
 
 /**
  * 附件类型 —— **直接取 API 契约的联合类型**（`AttachmentRequest['type']`），不另立字面量：
@@ -122,12 +123,74 @@ export function planAttachmentChannel(type: AttachmentFileType, size: number): A
   return 'upload'
 }
 
+/**
+ * ⭐ <b>去重键 = 身份，不是名字</b>（2026-09-18 批 ATT-DEDUP-KEY 的用户裁定：
+ * 「图片应该是按照字节 md5 判断是否重复」）。
+ *
+ * <b>为什么必须换掉「文件名」</b>（有日志铁证）：WebView2 给剪贴板位图合成的名字**恒为
+ * `image.png`** ⇒ 截图后第二个 Ctrl+V 被按名判重丢弃（日志：`addFiles 汇总 接受=0 … 重复=1`）；
+ * 而绕道微信再复制时剪贴板变成「文件」、名字是唯一 UUID ⇒ 反而能粘上。同一个动作两种结局，
+ * 判据却是名字 —— 名字根本不是身份。
+ *
+ * <b>三条腿各用什么键 / 为什么</b>：
+ * <ul>
+ *   <li><b>base64 腿</b>（图片与 PDF ≤5MB，见 {@link planAttachmentChannel}）：
+ *       {@link contentDedupKey} = **内容字节 md5**。字节本来就要整读进内存做 base64
+ *       ⇒ 哈希**零额外 I/O、零额外内存**（这正是用户裁定「按字节 md5」的落点）。
+ *       实测代价（本机 Node 24 跑 `utils/md5.ts`，非 WebView2）：**≈84 MB/s** ⇒
+ *       5MB（本腿上界）≈59ms、200KB 的常见截图 ≈2ms —— 每个附件一次，在 async 投递循环里。</li>
+ *   <li><b>upload 腿</b>：{@link fileDedupKey} = 名 + 大小。⛔ 这里**不**算内容 md5，理由见该函数。</li>
+ *   <li><b>path 腿</b>（`addPaths`，不在本模块）：**完整路径**，见 `pathAttachment.pathDedupKey`。
+ *       ⛔ 不得为算 md5 而读全文件 —— 零拷贝是本仓明确设计。</li>
+ * </ul>
+ * 三条腿的键**带不同前缀**（`md5:` / `file:` / `path:`）故互不串扰：同一份文件经
+ * 「粘贴」与「拖拽」进来会各自成键（这也是修缺陷的一部分 —— 旧实现两条腿共用一个
+ * basename 命名空间，一份叫 `image.png` 的拖入文件会**挡住**后来的同名粘贴截图）。
+ */
+export const DEDUP_NS_CONTENT = 'md5:'
+export const DEDUP_NS_FILE = 'file:'
+
+/**
+ * upload 腿去重键 = `名字 + 单个空格 + 大小`。分隔符不可省：否则 `("a1", 2)` 与 `("a", 12)`
+ * 会拼成同一个串；大小恒为十进制数字，加空格后两类拼接不再可能相等。
+ *
+ * ⛔ <b>为什么不在这里算内容 md5（内存代价论证）</b>：upload 腿承载**任意大小**的文件 ——
+ * `video` / `audio` / `file` 类与大小无关、一律走 upload（见 {@link planAttachmentChannel}），
+ * 即这条腿上会出现几百 MB 的视频。要拿内容 md5 就必须先 `arrayBuffer()` 把**整个文件**读进内存：
+ * <ol>
+ *   <li>峰值内存多占「文件本身大小」一份（浏览器 FormData 上传本来是流式读盘，不整读）；</li>
+ *   <li>哈希是同步计算 ⇒ 大文件上要**卡住主线程**：实测 `utils/md5.ts` ≈84 MB/s
+ *       （本机 Node 24）⇒ 100MB 要 1.2 秒、1GB 要 12 秒，期间占位 chip 根本出不来
+ *       （而占位 chip 存在的意义正是「大文件上传立刻给反馈」）；</li>
+ *   <li>超过 ArrayBuffer 上限（Chrome ~2GB）时 `arrayBuffer()` 直接抛错 ⇒ 一个**判重**判断
+ *       反倒把「能被上传」的文件变成「加不进来」。</li>
+ * </ol>
+ * ⇒ 用「名 + 大小」：**严格强于原键**（原键只有名字）—— 同名同大小视为同一份（覆盖
+ * 「Tauri enter/drop 双触发」「同一份文件拖两次」），同名不同大小不再误判重复
+ * （正是 `image.png` 那一类被测出来的假重复）。代价如实登记：同名同大小但内容不同的两个
+ * 大文件会被判重复（base64 腿没有这个代价 —— 那里是内容身份）。
+ */
+export function fileDedupKey(name: string, size: number): string {
+  return `${DEDUP_NS_FILE}${name} ${size}`
+}
+
+/** base64 腿去重键 = 内容字节 md5（**身份 = 内容**，用户裁定）。 */
+export function contentDedupKey(bytes: Uint8Array): string {
+  return `${DEDUP_NS_CONTENT}${md5Hex(bytes)}`
+}
+
 /** chip 生成参数（`uploading=true` 表示上传中，调用方应写占位 contentId 让 doSend 挡住未完成批次）。 */
 export interface AcceptedAttachment {
   type: AttachmentFileType
   filename: string
   mediaType: string
   size: number
+  /**
+   * 本次投递占用的去重键。⭐ 调用方**必须**把它存进 chip，并在「移除该 chip / 清空 / 发送后」
+   * **用它**释放 —— 键已不是文件名，仍按 filename 释放 ⇒ 移除了 chip 但键还在
+   * ⇒ **同一张图再也加不回来**。
+   */
+  dedupKey: string
   /** base64 腿：dataURL（调用方按 type==='image' 决定是否用作 preview） */
   base64?: string
   /** upload 腿：true（contentId 由 onUploaded 异步回填） */
@@ -138,22 +201,37 @@ export interface AcceptedAttachment {
 export interface AttachmentDeliveryDeps<F extends AttachmentFileLike> {
   /** 当前会话 id；缺失 ⇒ upload 腿不可用（附件归属靠 sessionId，后端缺值直接 400）⇒ 响亮拒绝 */
   sessionId?: string
-  /** 去重键是否已被占用（键 = 文件名，与 addPaths 同源语义：先到先得） */
-  isDuplicate: (filename: string) => boolean
+  /**
+   * 去重键是否已被占用（键见 {@link fileDedupKey} / {@link contentDedupKey}，与 `addPaths` 同源语义：先到先得）。
+   * ⛔ 参数是**键**，不是文件名 —— 调用方不得退回按名字判断。
+   */
+  isDuplicate: (key: string) => boolean
   /** 占用去重键（进入任一投递通道时调用） */
-  reserve: (filename: string) => void
+  reserve: (key: string) => void
   /** 释放去重键（异步失败回滚；原实现漏了这步 ⇒ 失败后同名文件再也加不进来） */
-  release: (filename: string) => void
+  release: (key: string) => void
   /** **生成 chip**：只有真正进入投递通道才调用 —— reject 分支绝不调用（红线） */
   onAccepted: (a: AcceptedAttachment) => void
-  /** 上传成功 → 回填真 contentId */
-  onUploaded: (filename: string, contentId: string) => void
-  /** 异步失败（上传/读盘）→ 调用方必须**撤下 chip**并提示（红线：不留「有 chip 收不到」） */
-  onFailed: (filename: string, reason: string) => void
+  /**
+   * 上传成功 → 回填真 contentId。
+   * <b>第一个参数是去重键，不是文件名</b>：改键后**允许出现两个同名 chip**（两张都叫
+   * `image.png` 的不同截图），按 filename 回填会**回填到错的那一个**。filename 仍一并回传，
+   * 供调用方提示/日志。
+   */
+  onUploaded: (key: string, filename: string, contentId: string) => void
+  /**
+   * 异步失败（上传/读盘）→ 调用方必须**撤下 chip**并提示（红线：不留「有 chip 收不到」）。
+   * 同 {@link AttachmentDeliveryDeps.onUploaded}：按**键**定位被撤的那个 chip，filename 供提示。
+   */
+  onFailed: (key: string, filename: string, reason: string) => void
   /** 同步拒绝 → 只提示，**不生成 chip** */
   onRejected: (filename: string, reason: AttachmentRejectReason) => void
-  /** File → dataURL（读盘失败应 reject/throw，由本模块转成 onFailed） */
-  encodeDataUrl: (file: F, mediaType: string) => Promise<string>
+  /**
+   * File → dataURL **并**把**同一份字节**交回（去重键要按内容算，见 {@link contentDedupKey}）。
+   * 交回字节而不是让本模块另读一次：base64 腿本来就要整读，多读一遍纯属浪费。
+   * 读盘失败应 reject/throw，由本模块转成 onFailed。
+   */
+  encodeDataUrl: (file: F, mediaType: string) => Promise<{ dataUrl: string; bytes: Uint8Array }>
   /** multipart 上传（失败应 reject/throw，由本模块转成 onFailed） */
   upload: (file: F, sessionId: string) => Promise<{ contentId: string }>
 }
@@ -164,7 +242,7 @@ export type AttachmentOutcome =
   | 'upload'              // 已生成占位 chip，上传在飞（结果经 onUploaded / onFailed 落地）
   | 'reject-unsupported'  // 同步拒绝（无 chip）
   | 'reject-no-session'   // 同步拒绝（无 chip）
-  | 'duplicate'           // 同名已在列表内（不是丢弃：那份已经在附着列表里）
+  | 'duplicate'           // **同一身份**已在列表内（不是丢弃：那份已经在附着列表里）
   | 'failed'              // 同步读盘失败（无 chip；上传失败经 onFailed 异步落地，不计入本结局）
 
 /** 整批汇总（**只统计同步结局**；上传失败在上传完成后经 onFailed 落地，见模块头注）。 */
@@ -172,6 +250,7 @@ export interface AttachmentDeliverySummary {
   /** 实际进入投递通道的个数 —— 「已添加 N 个附件」只能用它，**不得用入口文件数**（原实现虚报） */
   accepted: number
   rejected: { filename: string; reason: AttachmentRejectReason }[]
+  /** 被判「同一身份」的**文件名**（供提示用）—— 判据是去重键（内容/路径），不是名字 */
   duplicates: string[]
   failed: { filename: string; reason: string }[]
 }
@@ -184,11 +263,19 @@ function errorText(err: unknown): string {
 /**
  * 投递单个文件。**顺序**（每一道都对应一条红线）：
  * 1. 分类 → 决策；`'reject'` ⇒ 同步拒绝（不 reserve、不 chip），返回
- * 2. 去重（同名已在列表 ⇒ 'duplicate'）
- * 3. 无 sessionId ⇒ 同步拒绝（不 chip）
- * 4. `'upload'`：reserve → chip(占位) → 起上传（**不 await**，保持整批并行）；失败 → release + onFailed（撤 chip）
- * 5. `'base64'`：先读盘（失败 ⇒ 不 reserve、不 chip，只 onFailed），读回后**再查一次重名**
- *    （同名同批的第二个不该再生成一个 chip），最后 reserve + chip
+ * 2. `'upload'`：算键（名+大小）→ 去重 → 无 sessionId ⇒ 同步拒绝 → reserve → chip(占位)
+ *    → 起上传（**不 await**，保持整批并行）；失败 → release + onFailed（撤 chip）
+ * 3. `'base64'`：无 sessionId ⇒ 同步拒绝（**故意排在读盘之前**：没会话就没必要把文件读进内存）
+ *    → 读盘（失败 ⇒ 不 reserve、不 chip，只 onFailed）→ 按**内容 md5** 去重 → reserve + chip
+ *
+ * <b>⚠️ 与改键前的两处顺序差异（如实登记，均为「内容身份」的必然代价）</b>：
+ * <ul>
+ *   <li>base64 腿的**去重检查只能在读盘之后**（键 = 内容 ⇒ 不读就不知道）⇒
+ *       「同一张图粘两次」会**多读一次盘 + 多算一次 md5**才判出 duplicate（≤5MB，可忽略）。
+ *       改键前那次「读盘前的廉价预判」因此取消。</li>
+ *   <li>base64 腿的 `no-session` 检查前移到读盘之前 ⇒ 「无会话 + 内容重复」这个组合的结局
+ *       由 `duplicate` 变为 `reject-no-session`（两者都**不生成 chip**，只是提示文案不同）。</li>
+ * </ul>
  */
 export async function deliverAttachmentFile<F extends AttachmentFileLike>(
   file: F,
@@ -200,39 +287,48 @@ export async function deliverAttachmentFile<F extends AttachmentFileLike>(
     deps.onRejected(file.name, 'unsupported')
     return 'reject-unsupported'
   }
-  if (deps.isDuplicate(file.name)) {
-    return 'duplicate'
-  }
   const sessionId = deps.sessionId
-  if (!sessionId) {
-    deps.onRejected(file.name, 'no-session')
-    return 'reject-no-session'
-  }
   if (channel === 'upload') {
-    deps.reserve(file.name)
-    deps.onAccepted({ type, filename: file.name, mediaType, size: file.size, uploading: true })
+    const key = fileDedupKey(file.name, file.size)
+    if (deps.isDuplicate(key)) return 'duplicate'
+    if (!sessionId) {
+      deps.onRejected(file.name, 'no-session')
+      return 'reject-no-session'
+    }
+    deps.reserve(key)
+    deps.onAccepted({ type, filename: file.name, mediaType, size: file.size, uploading: true, dedupKey: key })
     void deps.upload(file, sessionId).then(
-      (r) => deps.onUploaded(file.name, r.contentId),
+      (r) => deps.onUploaded(key, file.name, r.contentId),
       (err) => {
-        deps.release(file.name)
-        deps.onFailed(file.name, errorText(err))
+        deps.release(key)
+        deps.onFailed(key, file.name, errorText(err))
       },
     )
     return 'upload'
   }
+  if (!sessionId) {
+    deps.onRejected(file.name, 'no-session')
+    return 'reject-no-session'
+  }
   let dataUrl: string
+  let bytes: Uint8Array
   try {
-    dataUrl = await deps.encodeDataUrl(file, mediaType)
+    const read = await deps.encodeDataUrl(file, mediaType)
+    dataUrl = read.dataUrl
+    bytes = read.bytes
   } catch (err) {
-    deps.onFailed(file.name, errorText(err))
+    // 此时还没有内容键（字节没读回来）⇒ 用 file 键报回。该键必然**未被 reserve**
+    //（本腿只在读盘成功后 reserve），故调用方按键撤 chip 会落空、只会用到 filename 做提示。
+    deps.onFailed(fileDedupKey(file.name, file.size), file.name, errorText(err))
     return 'failed'
   }
-  // 读盘期间可能已有同名项占位（同批重名：先完成先占）⇒ 与 addPaths 的「先到先得」一致
-  if (deps.isDuplicate(file.name)) {
+  const key = contentDedupKey(bytes)
+  // 同批内同内容：先完成先占（本循环顺序 await ⇒ 与 addPaths 的「先到先得」一致）
+  if (deps.isDuplicate(key)) {
     return 'duplicate'
   }
-  deps.reserve(file.name)
-  deps.onAccepted({ type, filename: file.name, mediaType, size: file.size, base64: dataUrl })
+  deps.reserve(key)
+  deps.onAccepted({ type, filename: file.name, mediaType, size: file.size, base64: dataUrl, dedupKey: key })
   return 'base64'
 }
 

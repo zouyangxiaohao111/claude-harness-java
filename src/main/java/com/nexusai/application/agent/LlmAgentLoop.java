@@ -12925,7 +12925,14 @@ public class LlmAgentLoop implements AgentLoop {
                     ImageAttachmentStore.Base64Content cached = store == null
                         ? null : store.getBase64(sessionIdKey, img.id());
                     if (cached == null) {
-                        continue;  // 缓存未命中 → 该图跳过，不进 content
+                        // [附件静默丢弃 · fail-loud] 该图照样不进 content（控制流不变），但必须留痕：
+                        //   base64 空 + image-cache 磁盘读回也空 ⇒ 该图<b>彻底消失</b>（模型侧无 image block、
+                        //   无路径说明；F5 按 image_paste_ids 拉图也 cache miss）。此前裸 continue、零日志。
+                        log.warn("[附件静默丢弃] 图片 drain 缓存未命中（base64 空 + image-cache 磁盘读回空），"
+                                + "该图不进模型 content（对模型不可见）: id={} mediaType={} sessionKey={}"
+                                + "（被 buildUserMessageWithImages 的「record base64 空 → 磁盘读回」门拦下）",
+                            img.id(), img.mediaType(), sessionIdKey);
+                        continue;
                     }
                     base64 = cached.base64();
                 }
@@ -13508,7 +13515,15 @@ public class LlmAgentLoop implements AgentLoop {
                 realPath = attachmentService.getPath(cid);   // 附件表 contentId → 真实落盘 path
             }
             if (realPath == null || realPath.isBlank()) {
-                continue;   // 无法解析真实路径 → fail loud 跳过（模型不感知，与旧行为一致）
+                // [附件静默丢弃 · fail-loud] 该丢的照样丢（拼不出「本地路径=…」就产不出说明，控制流不变），
+                //   但原注释自称「fail loud 跳过」却<b>一行日志都没有</b> —— 这正是本次要修的形态：
+                //   图对模型不可见（chip 在、模型零内容），而运维查不到任何痕迹。
+                //   门：path 为空 且 附件表 getPath(contentId) 也解析不出 → 无真实路径可给模型。
+                log.warn("[附件静默丢弃] 大图附件解析不出真实路径，无法生成路径说明（该图对模型不可见）: "
+                        + "type={} filename={} mediaType={} contentId={} path={}"
+                        + "（被 buildLargeImagePathNotes 的「path 空 + 附件表无 path」门拦下）",
+                    att.type(), att.filename(), att.mediaType(), att.contentId(), att.path());
+                continue;
             }
             String filename = (att.filename() != null && !att.filename().isBlank()) ? att.filename() : "(未命名)";
             String mediaType = (att.mediaType() == null || att.mediaType().isBlank()) ? "image/png" : att.mediaType();
@@ -13579,12 +13594,24 @@ public class LlmAgentLoop implements AgentLoop {
                 continue;
             }
             if (att.contentId() == null || att.contentId().isBlank()) {
+                // [附件静默丢弃 · fail-loud] 该丢的照样丢（本条链产不出说明，控制流不变），但必须留痕：
+                //   type ∈ {video,audio,file} 的附件既无 path 又无 contentId ⇒ <b>没有任何一条链会接手它</b>
+                //   （PDF/image 有各自的链，本类链是 media 的唯一消费方）⇒ 用户可见产物（说明文本）为零，
+                //   而此前是<b>裸 continue、零日志</b>：前端 chip 已显示、模型零内容、运维无痕。
+                log.warn("[附件静默丢弃] 媒体附件无 path 且无 contentId，无法生成说明（该附件对模型不可见）: "
+                        + "type={} filename={} mediaType={}（被 buildMediaAttachmentNotes 的 path/contentId 双空门拦下）",
+                    att.type(), att.filename(), att.mediaType());
                 continue;
             }
             long id;
             try {
                 id = Long.parseLong(att.contentId().trim());
             } catch (NumberFormatException e) {
+                // [附件静默丢弃 · fail-loud] contentId 非数字 ⇒ 既查不了附件表也回退不了 media store ⇒
+                //   该媒体附件对模型不可见。此前裸 continue、零日志（同 ChatService 侧同类分支恒 warn）。
+                log.warn("[附件静默丢弃] 媒体附件 contentId 非数字，无法解析路径（该附件对模型不可见）: "
+                        + "contentId={} type={} filename={} 原因={}",
+                    att.contentId(), att.type(), att.filename(), e.toString());
                 continue;
             }
             // ② 附件表统一 contentId（upload contentId = attachments 自增 id）→ 附件表真实落盘 path
@@ -13597,11 +13624,21 @@ public class LlmAgentLoop implements AgentLoop {
             }
             // ③ 回退 media store（历史 store contentId / 测试构造）
             if (store == null) {
+                // [附件静默丢弃 · fail-loud] 附件表未命中（contentId 不属附件表）+ media store 未注入 ⇒
+                //   回退源缺失，该媒体附件对模型不可见。此前裸 continue、零日志。
+                log.warn("[附件静默丢弃] 媒体附件附件表未命中且 media store 未注入，无法生成说明"
+                        + "（该附件对模型不可见）: contentId={} type={} filename={}（回退链：附件表 → media store，后者缺）",
+                    att.contentId(), att.type(), att.filename());
                 continue;
             }
             com.nexusai.application.agent.attachment.MediaAttachmentStore.StoredMedia media =
                 store.get(sessionKey, id);
             if (media == null) {
+                // [附件静默丢弃 · fail-loud] 附件表与 media store <b>双未命中</b> ⇒ 解析不出真实路径，
+                //   该媒体附件对模型不可见。此前裸 continue、零日志（前端 chip 在、模型零内容）。
+                log.warn("[附件静默丢弃] 媒体附件附件表与 media-cache 均未命中，无法生成说明"
+                        + "（该附件对模型不可见）: contentId={} type={} filename={} sessionKey={}",
+                    att.contentId(), att.type(), att.filename(), sessionKey);
                 continue;
             }
             String filename = (media.filename() != null && !media.filename().isBlank())
@@ -13609,9 +13646,21 @@ public class LlmAgentLoop implements AgentLoop {
             sb.append("\n- ").append(att.type()).append(" 附件 ").append(filename)
                 .append("（").append(media.mediaType()).append("，").append(media.size()).append("B）")
                 .append("contentId=").append(att.contentId()).append("，本地路径=").append(media.path());
+            // [附件文本内联 2026-09-18] ③ store 回退腿与 ①② path 腿同待遇（同一判据同一阈值）
+            appendTextAttachmentBody(sb, filename, media.path());
         }
         return sb.toString();
     }
+
+    /**
+     * [附件文本内联 · 2026-09-18] 文本类附件正文内联阈值 · 与 CC {@code MAX_OUTPUT_SIZE}
+     * （{@code Open-ClaudeCode/src/utils/file.ts:48} = {@code 0.25 * 1024 * 1024} = 262144B）
+     * <b>同源同值</b> —— 直接引用本仓既有 CC 对齐常量
+     * {@link com.nexusai.application.agent.tool.FileReadingLimits#DEFAULT_MAX_SIZE_BYTES}，
+     * 不新造数字（ReadFileTool 的 full-read 上限亦同值）。
+     */
+    private static final int TEXT_ATTACHMENT_INLINE_MAX_BYTES =
+        com.nexusai.application.agent.tool.FileReadingLimits.DEFAULT_MAX_SIZE_BYTES;
 
     /** [附件双模式] 媒体附件按真实 path 拼说明（path 附件 / 附件表 path）；尺寸 stat 失败 → 省略。 */
     private static void appendMediaPathNote(StringBuilder sb, AttachmentRequest att, String path) {
@@ -13635,6 +13684,120 @@ public class LlmAgentLoop implements AgentLoop {
             sb.append("contentId=").append(att.contentId()).append("，");
         }
         sb.append("本地路径=").append(path);
+        appendTextAttachmentBody(sb, filename, path);
+    }
+
+    /**
+     * [附件文本内联 · 2026-09-18 · 对齐 CC @提及] path / 附件表通道的<b>文本类</b>附件，阈值内把
+     * <b>正文内联</b>进模型侧说明（模型不必自己调文件工具读）。
+     *
+     * <p><b>CC 真源（逐条 · 行号已用 {@code grep -n} 复验，2026-09-18）</b>：
+     * {@code Open-ClaudeCode/src/utils/attachments.ts:3020} {@code generateFileAttachment} 的
+     * at-mention 尺寸门（{@code :3046-3064}）：
+     * <pre>
+     *   if (mode === 'at-mention'
+     *       &amp;&amp; !isFileWithinReadSizeLimit(filename, getDefaultFileReadingLimits().maxSizeBytes)) {
+     *     const ext = parse(filename).ext.toLowerCase()
+     *     if (!isPDFExtension(ext)) {
+     *       try {
+     *         const stats = await getFsImplementation().stat(filename)
+     *         logEvent('tengu_attachment_file_too_large', { size_bytes: stats.size, mode })   // :3057
+     *         return null                       // :3061 ← 超阈值：静默丢弃（无用户可见告警）
+     *       } catch (stat 失败 → 走下面正常读取分支，即不 return null) {}   // 原 catch 体见 :3058-3060
+     *     }
+     *   }
+     * </pre>
+     * 阈值内 → {@code FileReadTool.call} 读出正文 → {@code type:'file'} attachment →
+     * {@code src/utils/messages.ts:3545-3590}（{@code case 'file'}·text 分支 {@code :3556-3578}）
+     * 渲染成合成 {@code Read} tool_use/tool_result 对（{@code wrapMessagesInSystemReminder}）。
+     * 阈值常量 {@code MAX_OUTPUT_SIZE = 0.25 * 1024 * 1024 = 262144B}（{@code src/utils/file.ts:48}），
+     * 判据 {@code stats.size <= maxSizeBytes}（{@code src/utils/file.ts:547-558}）——
+     * <b>{@code <=}</b>：恰好等于上限仍在阈值内。
+     *
+     * <p><b>本仓与 CC 的两处刻意差异（红线优先于对齐）</b>：
+     * <ol>
+     *   <li><b>超阈值不丢弃</b>：CC 静默 {@code return null}（用户与模型都不知道附件没了）；
+     *       本仓红线十二要求 fail loud ⇒ <b>降级</b>：保留上面已拼好的「本地路径=…」说明
+     *       （模型仍可按路径调工具读）<b>并打 WARN</b>。</li>
+     *   <li><b>注入形态用本仓接口</b>：CC 造合成 tool_use/tool_result 对；本仓拼进既有说明文本
+     *       （与 {@code ChatService.appendReferencedFiles} 的 {@code 【引用文件 @…】} 同构，
+     *       与 {@code buildMediaAttachmentNotes} 同通道）—— 本仓铁律「行为对齐 CC、接口用本仓的」，
+     *       且不触碰 content-block 组装链（图片/PDF/Office 通道刚全绿）。</li>
+     * </ol>
+     *
+     * <p><b>阈值取值</b>：直接复用本仓既有 CC 对齐常量
+     * {@link com.nexusai.application.agent.tool.FileReadingLimits#DEFAULT_MAX_SIZE_BYTES}（256KB），
+     * 它与 CC {@code MAX_OUTPUT_SIZE} <b>同源同值</b>；不沿用 {@code ChatService.appendReferencedFiles}
+     * 的 1MB/100k 字符（那是 <b>@引用</b> 通道的口径：用户显式点名 + 超长截断而非降级，语义不同）。
+     *
+     * <p><b>不破坏 path 通道的零拷贝设计</b>：非文本类（{@link ReadFileTool#isNonTextExtension}）与
+     * 超阈值均在 <b>read 之前</b> return —— 只有「文本类且 ≤256KB」的小文件才读盘。读失败
+     * （非普通文件 / stat 失败 / 非 UTF-8 解码失败）同样 WARN + 降级，绝不静默。
+     *
+     * @param sb       说明文本缓冲（已含「本地路径=…」行）
+     * @param filename 展示名（说明行用的同一个）
+     * @param path     真实落盘路径（外部绝对路径 / 附件表 path）
+     */
+    private static void appendTextAttachmentBody(StringBuilder sb, String filename, String path) {
+        if (path == null || path.isBlank()) {
+            return;
+        }
+        // 扩展名：优先真实落盘 path（真源），无则回落展示名 filename
+        String ext = attachmentExtension(path);
+        if (ext.isEmpty()) {
+            ext = attachmentExtension(filename);
+        }
+        if (com.nexusai.application.agent.tool.impl.ReadFileTool.isNonTextExtension(ext)) {
+            // 非文本类（二进制 / 图片 / PDF）：读之前返回（零拷贝设计不受损）
+            return;
+        }
+        java.nio.file.Path p;
+        long size;
+        try {
+            p = java.nio.file.Path.of(path);
+            if (!java.nio.file.Files.isRegularFile(p)) {
+                log.warn("[附件文本内联] 文本类附件不是普通文件，降级仅给本地路径说明: filename={} path={}",
+                    filename, path);
+                return;
+            }
+            size = java.nio.file.Files.size(p);
+        } catch (Exception e) {
+            log.warn("[附件文本内联] 文本类附件 stat 失败，降级仅给本地路径说明: filename={} path={} err={}",
+                filename, path, e.toString());
+            return;
+        }
+        if (size > TEXT_ATTACHMENT_INLINE_MAX_BYTES) {
+            log.warn("[附件文本内联] 文本类附件正文超内联上限({}B) → 降级仅给本地路径说明"
+                    + "（不静默丢弃 · 差异于 CC 的 return null）: filename={} size={}B path={}",
+                TEXT_ATTACHMENT_INLINE_MAX_BYTES, filename, size, path);
+            return;
+        }
+        String content;
+        try {
+            content = java.nio.file.Files.readString(p, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.warn("[附件文本内联] 文本类附件正文读取/解码失败，降级仅给本地路径说明: filename={} path={} err={}",
+                filename, path, e.toString());
+            return;
+        }
+        sb.append("\n\n【附件文件 ").append(filename).append("】\n").append(content);
+        if (log.isInfoEnabled()) {
+            log.info("[附件文本内联] 文本类附件正文已内联: filename={} size={}B 字符={} path={}",
+                filename, size, content.length(), path);
+        }
+    }
+
+    /** 取路径/文件名的扩展名（含点，小写）；无扩展名 → ""（与 ReadFileTool 步骤 5 同判据：只在末段含点）。 */
+    private static String attachmentExtension(String filenameOrPath) {
+        if (filenameOrPath == null) {
+            return "";
+        }
+        int lastDot = filenameOrPath.lastIndexOf('.');
+        int lastSep = Math.max(filenameOrPath.lastIndexOf('/'), filenameOrPath.lastIndexOf('\\'));
+        if (lastDot <= lastSep || lastDot == filenameOrPath.length() - 1) {
+            return "";
+        }
+        return filenameOrPath.substring(lastDot).toLowerCase();
     }
 
     /** [attachments-v2 Step2] 是否为媒体附件类型（video/audio/file）。 */

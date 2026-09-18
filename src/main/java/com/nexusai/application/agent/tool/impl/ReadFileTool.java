@@ -144,6 +144,38 @@ public class ReadFileTool implements Tool {
     );
 
     /**
+     * [附件文本内联 · 2026-09-18] 是否为「非文本扩展名」（二进制 / 图片 / PDF）。
+     *
+     * <p><b>WHY（CLAUDE.md 规则 9 · 单点复用，不新造第三套清单）</b>：附件通道要给文本类附件内联正文
+     * （对齐 CC @提及），必须先回答「这个扩展名能不能当文本读」。本仓已有的判据就是本类
+     * {@code validateInput} 步骤 5 的拒绝集 {@link #NON_TEXT_BINARY_EXTENSIONS}（CC
+     * {@code src/constants/files.ts BINARY_EXTENSIONS} 对齐）——但它被本类私有，调用方只能复制一份，
+     * 于是「图片/PDF 另写一套」的第三套清单必然出现。故在此<b>导出</b>同一判据：任一张清单更新，
+     * 附件内联腿同步生效，不存在两份真相。
+     *
+     * <p><b>与 validateInput 步骤 5 的关系</b>：步骤 5 判「拒绝读二进制」，本判据判「不得内联正文」，
+     * 两者集合同为 {@code NON_TEXT_BINARY_EXTENSIONS}；本判据<b>额外</b>把
+     * {@link #IMAGE_EXTENSIONS}（图片走 image block 通道）与 {@code .pdf}（走 PdfAttachmentProcessor
+     * 通道）也算作非文本 —— 二者在 ReadFileTool 里由 call() 的 image/pdf 分支各自处理，
+     * 附件内联腿没有那两条分支，若不放行会退化成「把 PNG 字节当 UTF-8 正文读」（白读一次 + 乱码）。
+     *
+     * @param ext 扩展名（带点或不带点均可，大小写不敏感）；null/空白/无扩展名 → false（无扩展名按文本处理）
+     * @return true = 非文本（附件内联腿必须在<b>读之前</b>返回）
+     */
+    public static boolean isNonTextExtension(String ext) {
+        if (ext == null || ext.isBlank()) {
+            return false;
+        }
+        String lower = ext.trim().toLowerCase();
+        if (!lower.startsWith(".")) {
+            lower = "." + lower;
+        }
+        return NON_TEXT_BINARY_EXTENSIONS.contains(lower)
+            || IMAGE_EXTENSIONS.contains(lower.substring(1))
+            || ".pdf".equals(lower);
+    }
+
+    /**
      * [G33①] file_unchanged 摘要文本 · CC original: FILE_UNCHANGED_STUB
      * （FileReadTool/prompt.ts:8-9）逐字一致。
      *

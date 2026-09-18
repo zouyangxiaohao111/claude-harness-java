@@ -15,8 +15,8 @@ import { COMMAND_ITEMS, isDisabledCommand } from './CommandPalette'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
-import { deliverAttachmentFiles } from '@/utils/attachmentDelivery'
-import { classifyAttachmentPath, planPathAttachmentChannel } from '@/utils/pathAttachment'
+import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
+import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
@@ -33,6 +33,12 @@ interface PendingAttachment {
   type: AttachmentRequest['type']
   filename: string
   mediaType: string
+  /**
+   * 去重键（批 ATT-DEDUP-KEY）：图片/≤5MB = 内容 md5；>5MB 的 File = 名+大小；path 附件 = 完整路径。
+   * ⛔ 与 chip **同生命周期** —— 移除 chip / 清空 / 发送后必须用**它**释放（键已不是文件名，
+   * 按 filename 释放 ⇒ 移除了 chip 但键还在 ⇒ 同一张图再也加不回来）。
+   */
+  dedupKey: string
   base64?: string   // ≤5MB 直传内容（图片 dataURL）
   contentId?: string // 大文件 upload 后后端附件表缓存 id
   path?: string     // local-read 模式本地绝对路径（>5MB 不 upload，后端同机读盘）
@@ -226,8 +232,11 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   const highlightRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
-  // 去重：Tauri onDragDropEvent 与浏览器 drop 可能双触发，同文件只添加一次
-  const addedNamesRef = useRef<Set<string>>(new Set())
+  // 去重：Tauri onDragDropEvent 与浏览器 drop 可能双触发，同一份文件只添加一次。
+  // ⭐ 批 ATT-DEDUP-KEY：键**不是文件名** —— 内容 md5（图片/≤5MB）/ 名+大小（大文件 upload）/
+  //   完整路径（path 附件）。详见 `utils/attachmentDelivery.ts` 的「去重键 = 身份，不是名字」段。
+  //   ⛔ 三个释放点都必须用 chip 上的 `dedupKey`（见下面 chip 移除、清空、doSend）。
+  const addedKeysRef = useRef<Set<string>>(new Set())
   // 点击缩略图 → 放大预览（lightbox）
   const [zoomImg, setZoomImg] = useState<string | null>(null)
   // Mode 下拉（受控 · V33 bare_mode：simple=精简 true / full=完整 false）
@@ -426,31 +435,40 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     void (async () => {
       const summary = await deliverAttachmentFiles(files, {
         sessionId,
-        isDuplicate: (n) => addedNamesRef.current.has(n),
-        reserve: (n) => { addedNamesRef.current.add(n) },
-        release: (n) => { addedNamesRef.current.delete(n) },
+        isDuplicate: (k) => addedKeysRef.current.has(k),
+        reserve: (k) => { addedKeysRef.current.add(k) },
+        release: (k) => { addedKeysRef.current.delete(k) },
         onAccepted: (a) => {
-          console.warn(`[attach] 结局=${a.filename} → chip（通道=${a.uploading ? 'upload' : 'base64'} type=${a.type} size=${a.size}B）`)
+          console.warn(`[attach] 结局=${a.filename} → chip（通道=${a.uploading ? 'upload' : 'base64'} type=${a.type} size=${a.size}B 键=${a.dedupKey}）`)
           setAttachments((prev) => [...prev, {
-            type: a.type, filename: a.filename, mediaType: a.mediaType, size: a.size,
+            type: a.type, filename: a.filename, mediaType: a.mediaType, size: a.size, dedupKey: a.dedupKey,
             ...(a.base64 ? { base64: a.base64, ...(a.type === 'image' ? { preview: a.base64 } : {}) } : {}),
             ...(a.uploading ? { contentId: '__uploading__' } : {}),
           }])
         },
-        onUploaded: (filename, contentId) => setAttachments((prev) => prev.map((a) =>
-          a.contentId === '__uploading__' && a.filename === filename ? { ...a, contentId } : a)),
-        onFailed: (filename, reason) => {
+        // ⭐ 按**键**回填（不是按文件名）：改键后允许两个同名 chip 共存（两张都叫 image.png 的不同截图），
+        //   按 filename 匹配会把 contentId 回填到错的那一个 ⇒ 发送的是 A 的 contentId 配 B 的图。
+        onUploaded: (key, filename, contentId) => {
+          // 留痕带**键**：现场若出现「同名两个 chip」，凭 filename 无法区分是谁回填的
+          console.warn(`[attach] 上传完成 filename=${filename} contentId=${contentId} 键=${key}`)
+          setAttachments((prev) => prev.map((a) =>
+            a.contentId === '__uploading__' && a.dedupKey === key ? { ...a, contentId } : a))
+        },
+        onFailed: (key, filename, reason) => {
           // 异步失败 → 撤下占位 chip（绝不留下「有 chip 但模型收不到」）+ 带原因的提示（响亮失败）
+          // 同上传回填：按**键**定位被撤的那一个，绝不连带撤掉同名的另一个。
           console.warn(`[attach] 结局=${filename} → 失败（${reason}）`)
-          setAttachments((prev) => prev.filter((a) => !(a.contentId === '__uploading__' && a.filename === filename)))
+          setAttachments((prev) => prev.filter((a) => !(a.contentId === '__uploading__' && a.dedupKey === key)))
           showToast(`附件未能送达：${filename}（${reason}）`, 'info')
         },
         onRejected: (filename, reason) => {
           console.warn(`[attach] 结局=${filename} → 拒绝（${reason}）`)
         },
+        // 字节一并交回：去重键要按**内容**算（用户裁定「按字节 md5」），而这份字节本来就要读
+        //   ⇒ 不额外读一次盘。详见 utils/attachmentDelivery.ts 的 contentDedupKey。
         encodeDataUrl: async (file, mediaType) => {
           const bytes = new Uint8Array(await file.arrayBuffer())
-          return `data:${mediaType};base64,${u8ToBase64(bytes)}`
+          return { dataUrl: `data:${mediaType};base64,${u8ToBase64(bytes)}`, bytes }
         },
         upload: (file, sid) => uploadAttachment(file, sid),
       })
@@ -487,7 +505,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           //   - PDF 有自己的内联 document block 链（后端 registerBase64Pdf / PdfAttachmentProcessor）
           // 其余类型（Word/Excel/视频/音频/其它）走 path：零拷贝、不落盘、不进请求体
           if (planPathAttachmentChannel(cls, info.size, localRead) === 'path') {
-            pending.push({ type, filename: name, mediaType, path: p, size: info.size })
+            pending.push({ type, filename: name, mediaType, path: p, size: info.size, dedupKey: pathDedupKey(p) })
             console.warn(`[attach] 结局=${name} → pending（通道=path ${info.size}B）`)
             continue
           }
@@ -504,11 +522,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           }
           const file = new File([bytes], name, { type: mediaType })
           const r = await uploadAttachment(file, sessionId)
-          pending.push({ type, filename: name, mediaType, contentId: r.contentId, size: bytes.length })
+          pending.push({ type, filename: name, mediaType, contentId: r.contentId, size: bytes.length, dedupKey: fileDedupKey(name, bytes.length) })
           console.warn(`[attach] 结局=${name} → pending（通道=upload contentId=${r.contentId} ${bytes.length}B）`)
         } else {
           const dataUrl = `data:${mediaType};base64,${u8ToBase64(bytes)}`
-          pending.push({ type, filename: name, mediaType, base64: dataUrl, ...(isImage ? { preview: dataUrl } : {}), size: bytes.length })
+          // 键 = 内容 md5（与 addFiles 通道同一套身份；字节已在手，零额外成本）
+          pending.push({ type, filename: name, mediaType, base64: dataUrl, ...(isImage ? { preview: dataUrl } : {}), size: bytes.length, dedupKey: contentDedupKey(bytes) })
           console.warn(`[attach] 结局=${name} → pending（通道=base64 ${bytes.length}B）`)
         }
       } catch (err) {
@@ -517,24 +536,26 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         showToast(`读取附件失败：${p}`, 'info')
       }
     }
-    // [attach] 观测：过滤前对 addedNamesRef 做快照 —— 下面靠它判定「丢弃是撞到已有名字还是本批内重名」
+    // [attach] 观测：过滤前对 addedKeysRef 做快照 —— 下面靠它判定「丢弃是撞到已登记的键还是本批内同键」
     //   ⛔ 只读快照，不改上面 filter 的任何判定
-    const addedNamesBefore = new Set(addedNamesRef.current)
+    const addedKeysBefore = new Set(addedKeysRef.current)
     const fresh = pending.filter((a) => {
-      if (addedNamesRef.current.has(a.filename)) return false
-      addedNamesRef.current.add(a.filename)
+      if (addedKeysRef.current.has(a.dedupKey)) return false
+      addedKeysRef.current.add(a.dedupKey)
       return true
     })
     console.warn(`[attach] 去重结果 pending=${pending.length} → fresh=${fresh.length}`)
-    // [attach] 观测：按与上面 filter **完全相同**的规则重放一遍，逐个报出被丢弃的 filename 与命中的键
-    const seenNames = new Set(addedNamesBefore)
+    // [attach] 观测：按与上面 filter **完全相同**的规则重放一遍，逐个报出被丢弃的 filename 与被命中的键
+    //   ⭐ 键已不是文件名（内容 md5 / 完整路径 / 名+大小）⇒ 日志必须把键打出来，否则
+    //   「为什么这两张 image.png 被判成同一份」在现场无从判断。
+    const seenKeys = new Set(addedKeysBefore)
     for (const a of pending) {
-      if (seenNames.has(a.filename)) {
-        console.warn(`[attach] 去重丢弃 filename=${a.filename} 命中键=filename`
-          + (addedNamesBefore.has(a.filename) ? '（addedNamesRef 已有同名）' : '（本批内重名，先到先得）'))
+      if (seenKeys.has(a.dedupKey)) {
+        console.warn(`[attach] 去重丢弃 filename=${a.filename} 命中键=${a.dedupKey}`
+          + (addedKeysBefore.has(a.dedupKey) ? '（addedKeysRef 已登记）' : '（本批内同键，先到先得）'))
         continue
       }
-      seenNames.add(a.filename)
+      seenKeys.add(a.dedupKey)
     }
     console.warn(`[attach] toast 前 fresh.length=${fresh.length}`)
     if (fresh.length) {
@@ -542,6 +563,28 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       showToast(`已添加 ${fresh.length} 个附件`, 'success')
     }
   }
+
+  /**
+   * ⭐ 拖拽入口必须走**最新**的 `addPaths`（批 ATT-DRAG-STALE）。
+   *
+   * <b>WHY（真缺陷 · 有日志铁证）</b>：`onDragDropEvent` 只能在挂载时订阅一次（见下面的 useEffect
+   * 依赖数组 —— ⛔ 把 addPaths 放进去会每次渲染重订阅/退订，丢事件甚至监听器泄漏），而 `addPaths`
+   * 是**每次渲染新建**的函数，闭包捕获 `localRead` 与 `sessionId`。若监听器直接引用它，锁死的
+   * 是**首帧**那一个，而首帧时：
+   * <ul>
+   *   <li>`localRead`（`App` 初值 false，真实值等 `GET /attachments/config` 回来）⇒ `addPaths` 里
+   *       `if (localRead)` 整块被跳过 ⇒ 非图片非 PDF 文件直落 base64 腿 ⇒ 后端对 `type=file` 的
+   *       base64 **零消费方** ⇒ **静默丢弃**（实测日志：桌面拖入 2.4MB 的 .docx，记的是「通道=base64」，
+   *       且全份日志里 `通道=path` 出现 0 次）；</li>
+   *   <li>`sessionId`（store 初值 ''）⇒ >5MB 文件命中 `if (!sessionId)` ⇒ 弹「需先打开一个会话」并丢弃。</li>
+   * </ul>
+   * ⇒ **同一个文件：拖拽丢、走「附件」对话框能送达**（后者每次渲染新建闭包，拿到的是当前值）。
+   *
+   * `useLayoutEffect`（而非在渲染体内直接赋值）保证 ref 在每次提交后、**在被动副作用（订阅）之前**
+   * 指向最新实现；且它无依赖数组 ⇒ 每次渲染后都刷新。
+   */
+  const addPathsRef = useRef(addPaths)
+  useLayoutEffect(() => { addPathsRef.current = addPaths })
 
   /** 添加文件按钮：Tauri 桌面 → plugin-dialog.open() 拿绝对路径（localRead path 通道，大文件不 upload）；
    *  浏览器（无绝对路径）→ 原生 file input → File 对象走 upload。 */
@@ -563,6 +606,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   }
 
   // Tauri 拖拽事件：WebView 拦截浏览器 drop，改由 onDragDropEvent 拿文件真实路径
+  //   ⛔ 依赖数组必须是 []：放进 addPaths 会每次渲染重订阅/退订（丢事件 / 监听器泄漏）。
+  //   ⇒ 回调经 addPathsRef 取**当前**实现（首个 bug 就是这里锁死了首帧闭包，见上）。
   useEffect(() => {
     if (!IS_TAURI) return
     let un: (() => void) | null = null
@@ -573,7 +618,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       const pathsIn = p.type === 'enter' || p.type === 'drop' ? p.paths : []
       console.warn(`[attach] 拖拽事件 type=${p.type} paths=${pathsIn.length}`
         + (pathsIn.length ? ` 明细=${pathsIn.join(' | ')}` : ''))
-      if (e.payload.type === 'drop') void addPaths(e.payload.paths)
+      if (e.payload.type === 'drop') void addPathsRef.current(e.payload.paths)
     }).then((u) => { un = u })
     return () => { un?.() }
   }, [])
@@ -656,7 +701,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       }
     })
     sendMessage(req.length ? req : undefined)
-    addedNamesRef.current.clear()
+    // ⭐ 释放点③（发送后）：键随 chip 一起清空 ⇒ 同一张图发送后可以再粘一次（不被误判重复）
+    addedKeysRef.current.clear()
     setAttachments([])
   }
   // 计划模式已并入权限模式下拉（PermissionMode.plan）· 不再独立 tool-chip
@@ -928,7 +974,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   <button
                     className="attach-remove"
                     onClick={() => {
-                      addedNamesRef.current.delete(attachments[i].filename)
+                      // ⭐ 释放点①：必须用该 chip 的 **dedupKey**（键已不是文件名 —— 用 filename 释放
+                      //   会「移除了 chip 但键还在」⇒ 同一张图再也加不回来）
+                      addedKeysRef.current.delete(a.dedupKey)
                       setAttachments((prev) => prev.filter((_, j) => j !== i))
                     }}
                     title="移除附件"
@@ -956,8 +1004,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 </svg>
                 <span>附件{attachments.length > 0 ? ` (${attachments.length})` : ''}</span>
               </div>
+              {/* ⭐ 释放点②（清空）：`clear()` 与键的具体形态无关 ⇒ 改键后无需改动（逐字核过） */}
               {attachments.length > 0 && (
-                <button className="tool-chip" onClick={() => { addedNamesRef.current.clear(); setAttachments([]); showToast('已清空附件', 'info') }} title="清空附件">
+                <button className="tool-chip" onClick={() => { addedKeysRef.current.clear(); setAttachments([]); showToast('已清空附件', 'info') }} title="清空附件">
                   <span>清空</span>
                 </button>
               )}

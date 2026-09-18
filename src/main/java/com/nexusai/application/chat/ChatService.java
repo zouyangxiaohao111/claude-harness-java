@@ -2852,8 +2852,19 @@ public class ChatService {
         List<AttachmentRequest> resolved = new ArrayList<>(raw.size());
         for (AttachmentRequest att : raw) {
             if (att == null) {
+                // [附件静默丢弃 · fail-loud] 请求体 attachments 里出现 null 元素 ⇒ 该项无内容可消费
+                //   （不是「用户看得见的东西被丢」，而是请求体本身异常）—— 但静默跳过会让排障无从下手，
+                //   按本仓 fail-loud 红线补痕（同分支其它 continue 恒 warn）。
+                log.warn("[A1 attachments] 请求体 attachments 含 null 元素，跳过该项: session={} 元素下标={} 请求总数={}",
+                    sessionId, resolved.size(), raw.size());
                 continue;
             }
+            // [mediaType 通配符归一化] 见 normalizeWildcardMediaType javadoc：前端 pathAttachment.ts 对
+            //   图片/视频/音频发的是字面量 'image/*' / 'video/*' / 'audio/*'（不是真实 MIME），若原样带下去
+            //   会让 ImageAttachmentStore 按 {id}.{ext}（ext=mediaType.split('/')[1]='*'）落盘 ⇒ 文件名非法
+            //   ⇒ 图彻底丢（实测 backend.log:70449）。归一化在<b>分支选择之前</b>：覆盖 base64 直传 / path /
+            //   contentId 全部通道（三条通道的 mediaType 都从这里透传下去），且不改任何控制流。
+            att = normalizeWildcardMediaType(att);
             // 1) 直传 base64（剥离 dataUrl 前缀后保留）· [AM-CC-20260825] 前端粘贴/选择图片传
             //    dataUrl（data:image/png;base64,xxx）——若含前缀，F1 storeWithId base64 decode 失败
             //    → image-cache 空 → multimodal_attachment cache miss（2026-08-25 联调实测）。
@@ -3474,6 +3485,118 @@ public class ChatService {
             return "";
         }
         return filename.substring(dot + 1).toLowerCase();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [mediaType 通配符归一化] 防御性兜底 · 唯一入口 = resolveAttachments 循环首行
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 把通配符 MIME（subtype 为字面量 {@code *}）按扩展名归一为真实 MIME。
+     *
+     * <p><b>缺陷（实测铁证）</b>：前端 {@code front/src/utils/pathAttachment.ts:57}
+     * （{@code classifyAttachmentPath}）对图片/视频/音频发的是<b>字面量</b> {@code 'image/*'} /
+     * {@code 'video/*'} / {@code 'audio/*'}，<b>不是真实 MIME</b>。该值在 A1 各分支被原样透传，
+     * 最终落到 {@code LlmAgentLoop.registerRunPromptImages} →
+     * {@code ImageAttachmentStore.storeWithId}，而 store 按 {@code {id}.{ext}} 落盘、ext 由
+     * {@code mediaType.split('/')[1]} 推得（{@code ImageAttachmentStore:114-123}，对齐 CC
+     * imageStore.ts:34）⇒ 通配符下 ext = {@code "*"} ⇒ <b>文件名非法</b>。
+     *
+     * <p>{@code ~/.nexusai/logs/backend.log:70449-70450}（2026-09-17 22:13:43）实测：
+     * <pre>
+     * 图片落盘失败：session=sess-569ef8ea id=2100589017534963712 mediaType=image/* 原因=Illegal char &lt;*&gt; at index 20
+     * </pre>
+     * id 为雪花 id ⇒ 该图走「≤5MB base64 直传」通道。后果：①该图<b>彻底丢</b>（image-cache 无文件，
+     * 模型侧既无 image block 也无路径说明）；②前端 F5 按 {@code image_paste_ids} 批量拉图 <b>cache miss</b>。
+     * 大图走 upload 通道（带真实 {@code Content-Type}），故该缺陷长期被掩盖 —— 只有小图会带着通配符上线。
+     *
+     * <p><b>为什么必须后端兜底（不能只改前端）</b>：{@code mediaType} 是<b>请求体可构造的输入</b>
+     * （{@code POST /chat} 的 {@code attachments[].mediaType}）——任何客户端（旧版前端 / 脚本 /
+     * 第三方集成）都能发 {@code image/*}。只改前端 1 个源只覆盖「本版前端」，后端仍会因非法文件名
+     * 丢掉<b>用户的图</b>。本方法落在发送侧 A1（{@link #resolveAttachments}）= 全部消费链的唯一共同上游。
+     *
+     * <p><b>归一化规则</b>（扩展名来源：filename 优先，path 兜底）：
+     * <ol>
+     *   <li>扩展名命中 {@link #PATH_EXT_TO_MEDIA_TYPE} → 用映射值（png/jpg/mp4/mp3/…）</li>
+     *   <li>否则扩展名形如 {@code [a-z0-9]{1,10}}（合法文件名字符段）→ {@code 主类型/扩展名}
+     *       （bmp/ogg/m4a 等<b>不在 15 项映射里但前端确实会发</b>的扩展名走此支，保住「文件名与字节一致」）</li>
+     *   <li>否则（无扩展名 / 扩展名含 {@code *} 等非法字符）→ 按主类型的安全默认：
+     *       image→{@code image/png}、video→{@code video/mp4}、audio→{@code audio/mpeg}、其余
+     *       → {@code application/octet-stream}</li>
+     * </ol>
+     *
+     * <p><b>边界</b>：非通配符（subtype ≠ {@code *}，含 null / 无斜杠）<b>原样返回</b>，零行为变更；
+     * 只改 mediaType 的<b>值</b>，<b>不改任何控制流</b>（该丢的附件照丢，三道门 / 限额门 / 魔数门一律不放宽）。
+     *
+     * @param att 请求体附件（可为 null 字段）
+     * @return mediaType 已归一化的新附件记录（非通配符 → 同一实例）
+     */
+    private static AttachmentRequest normalizeWildcardMediaType(AttachmentRequest att) {
+        String mediaType = att.mediaType();
+        if (!isWildcardMediaType(mediaType)) {
+            return att;
+        }
+        String ext = extensionOf(att.filename());
+        if (ext.isEmpty() && att.path() != null && !att.path().isBlank()) {
+            String base = att.path();
+            try {
+                Path p = Path.of(base);
+                if (p.getFileName() != null) {
+                    base = p.getFileName().toString();
+                }
+            } catch (Exception ignored) {
+                // 路径形态非法 → 原样交给 extensionOf 再取一次（它自带「无点/点结尾 → ""」兜底）
+            }
+            ext = extensionOf(base);
+        }
+        String normalized = PATH_EXT_TO_MEDIA_TYPE.get(ext);
+        if (normalized == null) {
+            normalized = ext.matches("[a-z0-9]{1,10}")
+                ? majorTypeOf(mediaType) + "/" + ext
+                : defaultMediaTypeOfMajorType(mediaType);
+        }
+        if (log.isWarnEnabled()) {
+            log.warn("[A1 attachments] mediaType 为通配符（前端字面量 'image/*' 等），已按扩展名归一化为真实 MIME: "
+                    + "type={} filename={} contentId={} path={} 原={} 归一={} 扩展名={}"
+                    + "（不归一化会让 image-cache 落盘文件名 {id}.* 非法 ⇒ 图彻底丢，实测 backend.log:70449）",
+                att.type(), att.filename(), att.contentId(), att.path(), mediaType, normalized,
+                ext.isEmpty() ? "(无)" : ext);
+        }
+        return new AttachmentRequest(att.type(), att.contentId(), att.filename(), normalized,
+            att.base64(), att.path());
+    }
+
+    /**
+     * 是否通配符 MIME · subtype 段恰为单个 {@code *} 字符（前端 pathAttachment.ts 的字面量形态，
+     * 图片 / 视频 / 音频三条分别发出）。
+     * 无斜杠 / 斜杠结尾 / null / 空白 → false（不属通配符形态，不得误判成需归一化）。
+     */
+    private static boolean isWildcardMediaType(String mediaType) {
+        if (mediaType == null) {
+            return false;
+        }
+        String mt = mediaType.trim();
+        int slash = mt.indexOf('/');
+        if (slash < 0 || slash == mt.length() - 1) {
+            return false;
+        }
+        return "*".equals(mt.substring(slash + 1).trim());
+    }
+
+    /** 取 MIME 主类型（小写）· {@code image/*} → {@code image}；无斜杠 → 空串。 */
+    private static String majorTypeOf(String mediaType) {
+        int slash = mediaType.indexOf('/');
+        return slash > 0 ? mediaType.substring(0, slash).trim().toLowerCase() : "";
+    }
+
+    /** 通配符 MIME 的安全默认（扩展名推不出时按主类型给）· 未知主类型 → {@code application/octet-stream}。 */
+    private static String defaultMediaTypeOfMajorType(String mediaType) {
+        return switch (majorTypeOf(mediaType)) {
+            case "image" -> "image/png";
+            case "video" -> "video/mp4";
+            case "audio" -> "audio/mpeg";
+            default -> "application/octet-stream";
+        };
     }
 
     /**

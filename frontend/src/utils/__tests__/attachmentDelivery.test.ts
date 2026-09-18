@@ -2,9 +2,13 @@ import { describe, expect, it } from 'vitest'
 import {
   BASE64_CONSUMER_TYPES,
   BASE64_LIMIT,
+  DEDUP_NS_CONTENT,
+  DEDUP_NS_FILE,
   classifyAttachmentFile,
+  contentDedupKey,
   deliverAttachmentFile,
   deliverAttachmentFiles,
+  fileDedupKey,
   planAttachmentChannel,
   type AcceptedAttachment,
   type AttachmentDeliveryDeps,
@@ -24,13 +28,24 @@ import {
  * ⇒ 模型侧零痕迹。
  */
 
-type FakeFile = { name: string; type: string; size: number; arrayBuffer: () => Promise<ArrayBuffer> }
+type FakeFile = {
+  name: string
+  type: string
+  size: number
+  /** 假件内容 —— 批 ATT-DEDUP-KEY 起，base64 腿的去重键是**内容 md5**，故夹具必须能造「同名不同图」 */
+  bytes: Uint8Array
+  arrayBuffer: () => Promise<ArrayBuffer>
+}
 
-function fakeFile(name: string, type: string, size: number): FakeFile {
+/** 默认内容（不传第 4 参时所有假件内容相同 ⇒ 同名即同内容，等价于「同一份文件」）。 */
+const DEFAULT_BYTES = new Uint8Array([1, 2, 3, 4])
+
+function fakeFile(name: string, type: string, size: number, bytes: Uint8Array = DEFAULT_BYTES): FakeFile {
   return {
     name,
     type,
     size,
+    bytes,
     arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer as ArrayBuffer,
   }
 }
@@ -56,7 +71,10 @@ interface Recorder {
   chips: AcceptedAttachment[]
   taken: Set<string>
   uploaded: [string, string][]
+  /** 异步回填携带的**去重键**（批 ATT-DEDUP-KEY：调用方按键定位 chip，不再按文件名） */
+  uploadedByKey: [string, string][]
   failed: [string, string][]
+  failedByKey: [string, string][]
   rejected: [string, string][]
 }
 
@@ -64,22 +82,25 @@ function makeRecorder(overrides: Partial<AttachmentDeliveryDeps<FakeFile>> = {})
   const taken = new Set<string>()
   const chips: AcceptedAttachment[] = []
   const uploaded: [string, string][] = []
+  const uploadedByKey: [string, string][] = []
   const failed: [string, string][] = []
+  const failedByKey: [string, string][] = []
   const rejected: [string, string][] = []
   const deps: AttachmentDeliveryDeps<FakeFile> = {
     sessionId: 'sess-1',
-    isDuplicate: (n) => taken.has(n),
-    reserve: (n) => { taken.add(n) },
-    release: (n) => { taken.delete(n) },
+    isDuplicate: (k) => taken.has(k),
+    reserve: (k) => { taken.add(k) },
+    release: (k) => { taken.delete(k) },
     onAccepted: (a) => { chips.push(a) },
-    onUploaded: (n, cid) => { uploaded.push([n, cid]) },
-    onFailed: (n, r) => { failed.push([n, r]) },
+    // 键是第 1 个参数，文件名第 2 个 —— 旧断言继续按**文件名**记录（不改断言强度）
+    onUploaded: (k, n, cid) => { uploaded.push([n, cid]); uploadedByKey.push([k, cid]) },
+    onFailed: (k, n, r) => { failed.push([n, r]); failedByKey.push([k, r]) },
     onRejected: (n, r) => { rejected.push([n, r]) },
-    encodeDataUrl: async (_f, mt) => `data:${mt};base64,AAAA`,
+    encodeDataUrl: async (f, mt) => ({ dataUrl: `data:${mt};base64,AAAA`, bytes: f.bytes }),
     upload: async () => ({ contentId: '4711' }),
     ...overrides,
   }
-  return { deps, chips, taken, uploaded, failed, rejected }
+  return { deps, chips, taken, uploaded, uploadedByKey, failed, failedByKey, rejected }
 }
 
 /** 等上传腿的 then/catch 落地（本模块有意不 await 上传，保持整批并行）。 */
@@ -178,7 +199,9 @@ describe('⭐ [ATT-UPLOAD-DOC] upload 白名单放开 doc/docx/xls/xlsx ⇒ file
     expect(rec.chips, '先出占位 chip').toHaveLength(1)
     await flush()
     expect(rec.failed).toEqual([['e.docx', '附件上传失败 (400): {"error":"不支持的文件类型"}']])
-    expect(rec.taken.has('e.docx'), '失败后必须释放去重键，否则同名文件再也加不进来').toBe(false)
+    // ⚠️ 断言形式随键变（键 = `file:名 大小`，不再是文件名）：改断言「登记表已空」，
+    //   强度与原 `taken.has('e.docx') === false` 相同 —— 没释放时表里仍有 1 个键 ⇒ 红。
+    expect(rec.taken.size, '失败后必须释放去重键，否则同名文件再也加不进来').toBe(0)
   })
 })
 
@@ -223,7 +246,7 @@ describe('投递通道细节', () => {
     expect(rec.chips).toHaveLength(1) // 先出占位 chip（上传中）
     await flush()
     expect(rec.failed).toEqual([['big.mp4', '附件上传失败 (400): {"error":"不支持的文件类型"}']])
-    expect(rec.taken.has('big.mp4'), '失败后必须释放去重键，否则同名文件再也加不进来').toBe(false)
+    expect(rec.taken.size, '失败后必须释放去重键，否则同名文件再也加不进来').toBe(0)
   })
 
   it('读盘失败 → 不生成 chip + onFailed（不是静默跳过）', async () => {
@@ -232,7 +255,7 @@ describe('投递通道细节', () => {
     expect(outcome).toBe('failed')
     expect(rec.chips).toEqual([])
     expect(rec.failed).toEqual([['a.png', 'permission denied']])
-    expect(rec.taken.has('a.png'), '读盘失败不该占用去重键').toBe(false)
+    expect(rec.taken.size, '读盘失败不该占用去重键').toBe(0)
   })
 
   it('无 sessionId → 同步拒绝（附件靠 sessionId 归属，后端缺值 400；前端不再发出去）', async () => {
@@ -279,5 +302,151 @@ describe('投递通道细节', () => {
     expect(summary.duplicates).toEqual(['a.png'])
     expect(rec.chips).toHaveLength(3)
     expect(rec.rejected).toHaveLength(0)
+  })
+})
+
+/**
+ * ⭐ 批 ATT-DEDUP-KEY：**去重键 = 身份，不是名字**。
+ *
+ * <b>被钉住的真 bug（用户报告 + 日志铁证）</b>：截图后直接 Ctrl+V **只能粘一张** ——
+ * WebView2 给剪贴板位图合成的文件名**恒为 `image.png`**，而旧去重键就是文件名
+ * ⇒ 第二张被误判「重复」丢弃（日志 `addFiles 汇总 接受=0 拒绝=0 重复=1`）；
+ * 绕道微信再复制时剪贴板变成「文件」、名字是唯一 UUID ⇒ 反而能粘上（日志里的
+ * `d5e049a1-….png`）。同一个用户动作两种结局，判据却是名字。
+ *
+ * <b>用户裁定</b>：「图片应该是按照字节 md5 判断是否重复」。
+ * ⛔ 本组用例与实现**不允许**退回按文件名判重 —— 每条都点名「同名」这一条件，
+ * 再要求结局按**内容**分岔（同内容 ⇒ duplicate，异内容 ⇒ 都接受），
+ * 即：把「名字」与「身份」解耦这件事本身作为被测性质。
+ */
+describe('⭐ 去重键 = 内容身份（不是文件名 · 批 ATT-DEDUP-KEY）', () => {
+  const SHOT_A = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 1, 1])
+  const SHOT_B = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 2, 2, 2])
+
+  it('⭐ 核心复现：两张**同名不同内容**的截图（WebView2 合成名恒为 image.png）⇒ 两张都要被接受', async () => {
+    const rec = makeRecorder()
+    const summary = await deliverAttachmentFiles(
+      [
+        fakeFile('image.png', 'image/png', 1024, SHOT_A),
+        fakeFile('image.png', 'image/png', 1024, SHOT_B),
+      ],
+      rec.deps,
+    )
+    // 改前：第二张 second === 'duplicate'、accepted=1、chips=1（= 用户看到的现象）
+    expect(summary.duplicates, '两张内容不同的截图不得被判重复').toEqual([])
+    expect(summary.accepted).toBe(2)
+    expect(rec.chips).toHaveLength(2)
+    expect(rec.chips.map((c) => c.filename)).toEqual(['image.png', 'image.png'])
+    // 两个 chip 的键必须**不同** —— 键若仍是文件名，这里必然相等
+    expect(rec.chips[0].dedupKey).not.toBe(rec.chips[1].dedupKey)
+    // 且身份是**内容 md5**（用户裁定的落点），不是名字
+    expect(rec.chips[0].dedupKey.startsWith(DEDUP_NS_CONTENT)).toBe(true)
+    expect(rec.chips[0].dedupKey).not.toContain('image.png')
+  })
+
+  it('同一张图（同名同内容）粘两次 ⇒ 第二次 duplicate（内容同 ⇒ 才是真重复）', async () => {
+    const rec = makeRecorder()
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('base64')
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('duplicate')
+    expect(rec.chips).toHaveLength(1)
+    // 键相同 ⇒ 必须同一个键（不能因为「两次不是同一个 Uint8Array 实例」而漏判）
+    expect(rec.chips[0].dedupKey).toBe(contentDedupKey(SHOT_A))
+  })
+
+  it('内容相同但**名字不同** ⇒ duplicate（身份 = 内容；「绕道微信换个名字」不该变成两张）', async () => {
+    const rec = makeRecorder()
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('base64')
+    expect(
+      await deliverAttachmentFile(fakeFile('d5e049a1-1111-2222-3333-444455556666.png', 'image/png', 1024, SHOT_A), rec.deps),
+    ).toBe('duplicate')
+    expect(rec.chips).toHaveLength(1)
+  })
+
+  it('对照组：同名不同内容之外，**异名异内容**当然也都接受（防「恒不去重」式假绿）', async () => {
+    const rec = makeRecorder()
+    expect(await deliverAttachmentFile(fakeFile('a.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('base64')
+    expect(await deliverAttachmentFile(fakeFile('b.png', 'image/png', 1024, SHOT_B), rec.deps)).toBe('base64')
+    expect(rec.chips).toHaveLength(2)
+    expect(rec.taken.size).toBe(2)
+  })
+
+  it('upload 腿（>5MB 图片）：同名不同大小 ⇒ 都接受（旧键「只看名字」会把第二个误丢）', async () => {
+    const rec = makeRecorder()
+    const big = BASE64_LIMIT + 1
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', big), rec.deps)).toBe('upload')
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', big + 7), rec.deps)).toBe('upload')
+    expect(rec.chips).toHaveLength(2)
+    expect(rec.chips[0].dedupKey).not.toBe(rec.chips[1].dedupKey)
+    expect(rec.chips[0].dedupKey.startsWith(DEDUP_NS_FILE)).toBe(true)
+  })
+
+  it('upload 腿：**同名同大小**（Tauri enter/drop 双触发那一类）⇒ 第二次 duplicate（仍要能去重）', async () => {
+    const rec = makeRecorder()
+    const big = BASE64_LIMIT + 1
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', big), rec.deps)).toBe('upload')
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', big), rec.deps)).toBe('duplicate')
+    expect(rec.chips).toHaveLength(1)
+    expect(rec.chips[0].dedupKey).toBe(fileDedupKey('image.png', big))
+  })
+
+  it('⭐ 同名两 chip 的异步回填/失败必须按**键**定位（按文件名会回填到错的那一个）', async () => {
+    const rec = makeRecorder()
+    const big = BASE64_LIMIT + 1
+    await deliverAttachmentFile(fakeFile('image.png', 'image/png', big), rec.deps)
+    await deliverAttachmentFile(fakeFile('image.png', 'image/png', big + 7), rec.deps)
+    await flush()
+    const keys = rec.chips.map((c) => c.dedupKey)
+    // 按文件名看，两条记录长得一模一样（正是旧接线无法区分的原因）
+    expect(rec.uploaded).toEqual([['image.png', '4711'], ['image.png', '4711']])
+    // 按键看，一一对应到各自那个 chip ⇒ 调用方据此回填不会串到另一个同名 chip
+    expect(rec.uploadedByKey).toEqual([[keys[0], '4711'], [keys[1], '4711']])
+    expect(new Set(keys).size).toBe(2)
+  })
+
+  it('上传失败也要按**键**释放 + 撤 chip，且不影响同名的另一个 chip', async () => {
+    const big = BASE64_LIMIT + 1
+    const rec = makeRecorder({
+      upload: async (f) => { if (f.size === big) throw new Error('上传失败'); return { contentId: '4711' } },
+    })
+    await deliverAttachmentFile(fakeFile('image.png', 'image/png', big), rec.deps)
+    await deliverAttachmentFile(fakeFile('image.png', 'image/png', big + 7), rec.deps)
+    await flush()
+    expect(rec.failedByKey).toEqual([[rec.chips[0].dedupKey, '上传失败']])
+    // 失败的键已释放、成功的那条仍占着 ⇒ 只释放**自己那一个**（不是按名字一刀切）
+    expect(rec.taken.has(rec.chips[0].dedupKey)).toBe(false)
+    expect(rec.taken.has(rec.chips[1].dedupKey)).toBe(true)
+  })
+
+  it('⭐ 移除 chip 后能重新加同一张图（键释放正确）—— 漏释放的症状是「再也加不回来」', async () => {
+    const rec = makeRecorder()
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('base64')
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('duplicate')
+    // 调用方「移除 chip」= 用该 chip 的 dedupKey 释放（Composer 侧接线见 Composer.attachmentEntry.test.tsx）
+    rec.deps.release(rec.chips[0].dedupKey)
+    expect(rec.taken.size).toBe(0)
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('base64')
+    expect(rec.chips).toHaveLength(2)
+  })
+
+  it('⭐ 清空/发送后（键全部释放）能重新加同一张图', async () => {
+    const rec = makeRecorder()
+    await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)
+    // 模拟 Composer 的 clear()（「清空」按钮与 doSend 都走它）
+    rec.deps.release(rec.chips[0].dedupKey)
+    rec.taken.clear()
+    expect(await deliverAttachmentFile(fakeFile('image.png', 'image/png', 1024, SHOT_A), rec.deps)).toBe('base64')
+    expect(rec.chips).toHaveLength(2)
+  })
+
+  it('读盘失败时回传的键**未被占用**（否则失败会把文件名永久锁死）', async () => {
+    const rec = makeRecorder({ encodeDataUrl: async () => { throw new Error('EACCES') } })
+    const f = fakeFile('image.png', 'image/png', 1024, SHOT_A)
+    expect(await deliverAttachmentFile(f, rec.deps)).toBe('failed')
+    expect(rec.chips).toEqual([])
+    expect(rec.failedByKey).toEqual([[fileDedupKey('image.png', 1024), 'EACCES']])
+    expect(rec.taken.size).toBe(0)
+    // 同一个文件再来一次必须还能投（键没被占用）
+    const rec2 = makeRecorder()
+    expect(await deliverAttachmentFile(f, rec2.deps)).toBe('base64')
   })
 })
