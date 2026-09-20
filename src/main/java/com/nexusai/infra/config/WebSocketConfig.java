@@ -90,6 +90,17 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
                     + "该 bean 由 @EnableWebSocketMessageBroker 提供，缺失说明 Broker 装配被改写；"
                     + "⛔ 不要在此退化为「不配心跳」：半开连接将再次不可察（2026-09-17 事故根因）。");
         }
+        // [消息保序 · 2026-09-18] ⛔ Spring 默认【不保证】同一会话的消息按发送顺序投递。
+        //   WHY：下方 configureClientOutboundChannel 把出站通道扩成了线程池（core 8 / max 16）——
+        //   线程池把每条待发消息当独立任务分派，相邻两帧可能落在不同线程、执行反序。
+        //   实测后果（2026-09-18 用户报）：流式【正文与思考同时】出现字符错位（「前后」显示成「后前」）。
+        //   两条通道一起中招 ⇒ 病灶不在任一条渲染链（两者渲染路径不同），而在共用的这一跳投递；
+        //   且 F5 从 DB 重拉即恢复正常 —— 因为 DB 由累积线程【按序】写入，乱序只发生在投递。
+        //   WHY 现在才显形：后端 chunk 推送实测 ~120 个/秒（backend.log `[OBS1] 本窗口 222 个` / 1.8s），
+        //   密度越高，相邻 chunk 撞上不同线程且执行反序的概率越大。
+        //   ⛔ 不要为性能把它关掉：丢序是不可自愈的静默数据损坏（用户只能靠 F5 自救），
+        //   而它换来的只是「单会话队头阻塞」——那至少是可察的。跨会话隔离不受影响（保序是按会话的）。
+        config.setPreservePublishOrder(true);
         // server → client 订阅前缀
         config.enableSimpleBroker("/topic", "/queue")
             // [OBS2 · 半开连接可察] 打开 STOMP 心跳 —— 事故根因修复。

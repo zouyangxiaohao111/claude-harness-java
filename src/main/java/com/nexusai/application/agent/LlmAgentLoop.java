@@ -231,6 +231,66 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [M2 · 2026-09-18 子代理投递修复] per-session <b>dispatching 保留态</b> —
+     * 逐字移植 CC {@code QueryGuard.ts:16-18/:30/:38-43/:49-53} 的 {@code reserve} /
+     * {@code cancelReservation}（CC 真源 {@code utils/QueryGuard.ts}）。
+     *
+     * <p><b>WHY（CC 是三态，Java 此前只有两态）</b>：CC 的 {@code _status} 有
+     * {@code idle → dispatching → running} 三态，{@code dispatching} = 「条目已出队、异步链还没走到
+     * {@code onQuery}"这段缺口；CC 的 {@code isActive}（{@code QueryGuard.ts:99-101}）对
+     * {@code dispatching} <b>也</b>返回 true ⇒ 队列处理器在这段缺口内不会再取同会话的条目。
+     * Java 侧此前无此态：{@code CronIdleExecutor} 先 dequeue（取出即删）、再跨线程提交，
+     * 「置 running」在下游更晚处（{@link #markRunning}，{@code LlmAgentLoop.run()} 入口）⇒
+     * 同会话可被连续出队两批（TOCTOU）。core=1 时代之所以「看着」安全，只因提交全序是假安全；
+     * [M1] 把 {@code cronExecutor} 改虚拟线程后提交不再全序 ⇒ 该缺口必须由本保留态显式关闭。
+     *
+     * <p><b>释放铁律（⛔ 违反 = 新增静默卡死）</b>：{@link #reserve} 返回 true 的调用方
+     * <b>必须</b>在执行结束的 finally 释放（{@code CronIdleExecutor.executeQueuedInput} 新增的
+     * 外层 try/finally，覆盖其任务体的 <b>所有</b> return/continue/异常分支）；
+     * 返回 false 的调用方<b>不得</b>调 {@link #cancelReservation}（否则会误清他人的保留）。
+     *
+     * <p>键 = 现有 sessionId（与 {@link #RUNNING_SESSIONS} 同键域，含
+     * {@code CronIdleExecutor.GLOBAL_SESSION_KEY} 哨兵）。
+     */
+    private static final java.util.Set<String> DISPATCHING_SESSIONS =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * 保留会话（idle → dispatching）· 逐字 CC {@code QueryGuard.ts:38-43 reserve()}：
+     * 「非 idle 一律 false」⇒ 已在 running（{@link #isSessionRunning}）或已 dispatching 均拒绝。
+     *
+     * @return true = 本次调用取得保留（调用方负责在结束的 finally 调 {@link #cancelReservation}）；
+     *         false = 会话已活跃（调用方<b>不得</b>释放）
+     */
+    public static boolean reserve(String sessionId) {
+        if (sessionId == null) return false;
+        if (isSessionRunning(sessionId)) return false;   // CC: status !== 'idle' → false
+        return DISPATCHING_SESSIONS.add(sessionId);      // 已在 dispatching → add=false（独占拒绝）
+    }
+
+    /**
+     * 取消保留（dispatching → idle）· 逐字 CC {@code QueryGuard.ts:49-53 cancelReservation()}：
+     * <b>仅 dispatching 态生效</b>（running/idle 态不动作，防误清他人保留）。
+     */
+    public static void cancelReservation(String sessionId) {
+        if (sessionId == null) return;
+        DISPATCHING_SESSIONS.remove(sessionId);
+    }
+
+    /** 会话是否处于 dispatching（条目已出队、异步链尚未开跑）· CC {@code QueryGuard} dispatching 分量。 */
+    public static boolean isSessionDispatching(String sessionId) {
+        return sessionId != null && DISPATCHING_SESSIONS.contains(sessionId);
+    }
+
+    /**
+     * 会话是否活跃（dispatching || running）· 逐字 CC {@code QueryGuard.ts:99-101 isActive}
+     * （{@code return this._status !== 'idle'}）—— 队列处理器判「能不能取该会话的条目」用本方法。
+     */
+    public static boolean isSessionActive(String sessionId) {
+        return isSessionRunning(sessionId) || isSessionDispatching(sessionId);
+    }
+
+    /**
      * [对抗核验 H13-GAP-4 v3] LLM 调用执行器 · 虚拟线程池（Java 25）。
      *
      * <p>WHY: 同步 provider（OpenAiSdkProvider/AnthropicSdkProvider）的 stream 是阻塞 HTTP —— 若在 loop
@@ -1837,6 +1897,41 @@ public class LlmAgentLoop implements AgentLoop {
      *  不调 LlmAgentLoop.run，SubagentExecutor.java:2015）恒 false 不注入。 */
     private boolean backgroundSessionTask;
 
+    /**
+     * [C1 收口] 本 run 是否为「该会话的交互式用户回合」—— <b>队长 inbox 消费资格的唯一判据</b>。
+     *
+     * <p>WHY：C1 修复（doRun 回灌 sessions.team_context）让同会话**每一个** LlmAgentLoop run 都
+     * 具备「我是队长」身份，而队长 inbox 的消费语义是「构建进本 run 的 LLM 上下文 + 标已读」——
+     * 一旦由非交互 run 先跑，队员消息会在用户下一轮之前被吃掉（对用户可见症状与 C1 未修一模一样，
+     * 且时序相关、更难查）。故把「谁有资格消费」显式化：<b>只有交互式前台用户回合</b>。
+     *
+     * <p>⛔ 不得用全局 sysprop / ThreadLocal / 其它进程级槽做判据（用户铁律：会话态显式传参）。
+     * 本标志是 per-run 值，由调用方在 {@code run()} 前显式设定；{@code LlmAgentLoop} 是
+     * {@code @Scope("prototype")} ⇒ 每次 {@code getObject()} 全新实例，标志不跨 run 泄漏。
+     *
+     * <p>置位处唯一 = {@code ChatService}（交互式用户消息；{@code RunRequest.session} 唯一前台调用方）。
+     * 未置位（默认 false）的 run：{@code CronIdleExecutor}（空闲代跑排队命令）、
+     * {@code MainSessionBackgroundService}（后台化主会话任务）⇒ 两者都不消费、不标读队长 inbox。
+     *
+     * <p>⚠️ 已知代价（显式登记）：headless / SDK 形态的前台 run 在未置位时也不消费队长 inbox ——
+     * CC 的 headless poller（{@code cli/print.ts:2648}）是消费的。本仓当前无非交互前台入口，
+     * 若将来引入，须在该入口同样置位（与 T7 的 agentContext 同法）。
+     */
+    private boolean teammateInboxConsumer;
+
+    /**
+     * 设定本 run 是否有资格消费队长 inbox（见 {@link #teammateInboxConsumer}）。
+     *
+     * @param consumer true = 交互式前台用户回合（ChatService 路径）；false = 非交互 run（cron / 后台）
+     */
+    public void setTeammateInboxConsumer(boolean consumer) {
+        this.teammateInboxConsumer = consumer;
+        if (log.isDebugEnabled()) {
+            log.debug("[C1 收口] setTeammateInboxConsumer: session='{}' consumer={}（队长 inbox 消费资格）",
+                this.streamSessionId, consumer);
+        }
+    }
+
     private volatile PermissionMode defaultPermissionMode = PermissionMode.DEFAULT;
 
     /** [R32-b7b-2 R4 重做] CC session override (/model) — 优先级 1 (最高). */
@@ -2411,6 +2506,66 @@ public class LlmAgentLoop implements AgentLoop {
         }
     }
 
+    /**
+     * [批 A4e] <b>权限模式来源守护</b> —— {@link RunRequest#permissionModeSource()} 与
+     * {@link RunRequest#permissionModeCli()} / {@link RunRequest#sessionId()} 的一致性检查。
+     *
+     * <h2>WHY（本批根因：{@code null} 的第三态）</h2>
+     * <p>{@code permissionModeCli == null} 有两个<b>合法</b>身份（「没有覆盖」⇒ 回落全局；
+     * 「CLI 确实没给」⇒ {@code auto} opt-in 判断依据，CC main.tsx:1409），外加一个<b>缺陷身份</b>
+     * 「调用方本该解析会话选定模式却没解析」。三者在数据上<b>完全同形</b> ⇒ 批 A4b 的
+     * {@code CronIdleExecutor} 缺陷（走硬编码 null 的便捷重载 ⇒ 整轮静默绕过权限检查）
+     * 静默穿越三个批次。<b>唯一可检的形态</b>是：调用方声明「本 run 不承载会话权限语义」
+     * （{@link com.nexusai.application.agent.permission.PermissionModeSource#NOT_APPLICABLE}）
+     * <b>却携带了真实会话</b> —— 那是自相矛盾的声明，本方法对它 ≥WARN。
+     *
+     * <h2>⛔ 只打日志，绝不改值</h2>
+     * <p>{@code autoModeIntent} 依赖 {@code permissionModeCli == null}；「把 null 换成解析后的
+     * 全局值」会破坏 {@code auto} opt-in 语义 —— 本守护<b>不触碰任何字段</b>，仅留痕。
+     *
+     * <h2>判定口径（⛔ 不看 {@code SessionKeys.NO_SESSION} 哨兵）</h2>
+     * <ul>
+     *   <li>{@code sessionId} 为 null/空白 ⇒ 无会话 ⇒ {@code NOT_APPLICABLE} <b>合法</b>（DEBUG）；</li>
+     *   <li>{@code sessionId} == {@link com.nexusai.common.SessionKeys#NO_SESSION} 哨兵
+     *       ⇒ 「确无会话」（全局 cron / 普通 prompt）⇒ 本就不承载会话权限语义 ⇒ <b>合法</b>（DEBUG）；
+     *       该哨兵语义由 {@code SessionKeys} 的 javadoc 定义（形态上明确「不是会话键」）；</li>
+     *   <li>{@code NOT_APPLICABLE} 且携带真实会话（或竟然带了非 null 值）⇒ <b>WARN</b>
+     *       —— 结构性矛盾，疑似「忘了传」（本批要抓的正是它）；</li>
+     *   <li>{@code CLI_ARGUMENT} / {@code SESSION_OVERRIDE} ⇒ 调用方已解析，值为 null 是
+     *       该槽确实为空 ⇒ <b>合法</b>（DEBUG），永不 WARN。</li>
+     * </ul>
+     *
+     * @param params 本回合 RunRequest
+     */
+    private void guardPermissionModeSource(RunRequest params) {
+        com.nexusai.application.agent.permission.PermissionModeSource source = params.permissionModeSource();
+        String cli = params.permissionModeCli();
+        String sid = params.sessionId();
+        boolean hasRealSession = sid != null && !sid.isBlank()
+            && !com.nexusai.common.SessionKeys.isNoSession(sid);
+        if (source == com.nexusai.application.agent.permission.PermissionModeSource.NOT_APPLICABLE) {
+            if (cli != null || hasRealSession) {
+                log.warn("[批 A4e] 权限模式来源标注自相矛盾: permissionModeSource=NOT_APPLICABLE"
+                    + "（声明「本 run 不承载会话权限语义」）却 permissionModeCli={} sessionId={} —— "
+                    + "疑似调用点用了硬编码 null 的便捷重载而漏传会话选定权限模式（批 A4b 型缺陷："
+                    + "该轮会回落全局 settings.permission_mode，本机实测可为 bypassPermissions ⇒ "
+                    + "静默绕过全部权限检查，含 deny）。请改用带 permissionModeCli 的重载；"
+                    + "若确不承载会话权限语义，请改用无 sessionId 的入口。【≥WARN 显式留痕，非静默】",
+                    cli, sid);
+                return;
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("[批 A4e] 权限模式来源标注一致: source=NOT_APPLICABLE 且无会话 ⇒ "
+                    + "本 run 不承载会话权限语义（合法）");
+            }
+            return;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[批 A4e] 权限模式来源标注一致: source={} permissionModeCli={} sessionId={} "
+                + "（cli=null 表示该槽确实为空 ⇒ 合法回落全局 settings）", source, cli, sid);
+        }
+    }
+
     /** run() 主体（[批 4b-1] 会话项目根不再经 ThreadLocal 传播：由 resolveSessionProjectRoot 解析后
      *  存 workspaceDir / SessionProjectRoot，消费点显式传参）。 */
     private AgentState doRun(RunRequest params) {
@@ -2654,6 +2809,48 @@ public class LlmAgentLoop implements AgentLoop {
                         }
                     } else if (log.isDebugEnabled()) {
                         log.debug("[R3] 会话 todos 回读跳过: session='{}' todos 列为空（从未 TodoWrite）", sessionId);
+                    }
+                    // ── [C1] 会话 teamContext 回灌注入 · 与上面的 todos 回读是**兄弟语句** ──
+                    //   ⛔ 绝不能写进 if (!persistedTodos.isEmpty()) 之内 —— 会话从未 TodoWrite 时
+                    //   todos 列为空，回灌会被「todos 为空」劫持 ⇒ C1 在多数会话仍死（计划 §六#10）。
+                    //   WHY（C1 读侧单向断头路）：LlmAgentLoop prototype 每 send 新实例 ⇒ appStateRef 恒空
+                    //   （:610-611），队长跨轮拿不到「我是队长」⇒ AgentLoopContext.maybeInjectTeammateMailbox
+                    //   的门控 2/3 读不到 appState.teamContext ⇒ 队长永远读不到队员消息。
+                    //   sessions.team_context（V39 列）是跨 send 的唯一真源。
+                    //   CC 真源：attachments.ts:3625-3647（getAppState → appState.teamContext → isTeamLead）；
+                    //   TeamCreateTool.ts:207-224（setAppState.teamContext，进程级长寿）；reconnection.ts:75-119。
+                    //   只写内存（setAppState → appStateRef），**不动库**；库真源仍是 sessions 列。
+                    //   写侧唯一 = TeamCreateTool.java:449-457；清侧 = TeamDeleteTool.java:269/:446-468（列+appState
+                    //   同清）⇒「解散后不再注入」成立。
+                    //   ⚠️ [C1 收口] 回灌同时是 inbox **消费资格**的判据（二者用同一门控表达）：
+                    //   回灌后 appState.teamContext 是 maybeInjectTeammateMailbox 的唯一入口条件 ⇒
+                    //   未回灌的 run 既不注入也不 markRead。故此处必须限定为**交互式前台用户回合**
+                    //   （setTeammateInboxConsumer 由 ChatService 置位），否则同会话每个 run（含
+                    //   CronIdleExecutor 空闲代跑 / MainSessionBackgroundService 后台任务）都会抢先
+                    //   markRead 吃掉队员消息 ⇒ 用户下一轮看不到（症状与 C1 未修相同，且时序相关、
+                    //   更难查）。判据 = per-run 显式值，⛔ 不用全局 sysprop / ThreadLocal。
+                    //   安全性依据：appState.teamContext 另两个读者（TeamCreateTool.teamNameFromContext
+                    //   / SendMessageTool.readTeamContext / TeamDeleteTool）均 **store 优先**
+                    //   （sessions 列先查，appState 仅回退）⇒ 非前台 run 少这一份 appState 无影响。
+                    Map<String, Object> persistedTeamContext =
+                        com.nexusai.domain.session.SessionService.parseTeamContext(sessionRecord.getTeamContext());
+                    if (teammateInboxConsumer && persistedTeamContext != null) {
+                        setAppState(prev -> {
+                            Map<String, Object> next = new java.util.HashMap<>(prev);
+                            next.put(com.nexusai.application.agent.tool.impl.TeamCreateTool.APPSTATE_TEAM_CONTEXT,
+                                persistedTeamContext);
+                            return next;
+                        });
+                        if (log.isDebugEnabled()) {
+                            log.debug("[R3] 会话 teamContext 回灌注入: session='{}' team='{}' inboxConsumer={}（sessions.team_context 列，跨 send 真源；回灌＝身份，消费资格另由 inboxConsumer 门控）",
+                                sessionId, persistedTeamContext.get("teamName"), teammateInboxConsumer);
+                        }
+                    } else if (!teammateInboxConsumer && log.isDebugEnabled()) {
+                        log.debug("[R3] 会话 teamContext 回灌跳过: session='{}' 本 run 非交互式前台回合"
+                            + "（setTeammateInboxConsumer 未置位）⇒ 不注入身份、也不消费队长 inbox",
+                            sessionId);
+                    } else if (log.isDebugEnabled()) {
+                        log.debug("[R3] 会话 teamContext 回灌跳过: session='{}' 无 team_context（非团队会话）", sessionId);
                     }
                 } else if (log.isDebugEnabled()) {
                     log.debug("[R3] 会话 todos 回读跳过: session='{}' 不存在", sessionId);
@@ -3127,6 +3324,12 @@ public class LlmAgentLoop implements AgentLoop {
         // CC getSettings_DEPRECATED = getInitialSettings，settings.ts:820）。
         // [P11d] 额外传 params.sessionId()：project/local 两层的 settings 文件按<b>本会话项目根</b>
         //   解析（改前恒后端启动目录 ⇒ 多会话共用一份项目级 settings，既串又错）。
+        // [批 A4e] 权限模式来源守护（本批的唯一消费点）：
+        //   把「声明 PermissionModeSource.NOT_APPLICABLE（本 run 不承载会话权限语义）却携带真实会话」
+        //   这一结构性矛盾 ≥WARN 留痕 —— 正是批 A4b 之 bug（cron drain 走硬编码 null 的便捷重载）
+        //   的可检形态。⛔ 只打日志，不改值：autoModeIntent 依赖 permissionModeCli == null
+        //   （CC main.tsx:1409），改值会破坏 auto opt-in 语义。
+        guardPermissionModeSource(params);
         // initialPermissionModeSource 未注入（非 Spring 单测）→ settings 侧回落空，仅透传 CLI 侧。
         InitialPermissionModeResolver.Input initialModeInput =
             initialPermissionModeSource != null
@@ -3213,6 +3416,64 @@ public class LlmAgentLoop implements AgentLoop {
         ToolUseContext baseTuc = buildBaseToolUseContext(
             state, initialModeInput, initialModeConfig, runExplicitCwd, null,
             params.agentContext());
+        // ── [批 A2b] 会话 SESSION 档授权回读注入 · 对齐 CC appState.toolPermissionContext（会话内存态）──
+        //   背景：CC 的 appState.toolPermissionContext 活在长驻进程里（文件类弹窗「Yes, during this
+        //   session」destination='session'，permissionOptions.tsx:49-52 / usePermissionHandler.ts:123），
+        //   且 supportsPersistence 明确排除 session（PermissionUpdate.ts:208-216）⇒ CC 侧「本次会话」
+        //   永不落盘、只活内存。本仓 LlmAgentLoop 是 prototype（每 send 新实例，:199 +
+        //   ChatService:900 loopProvider.getObject()）⇒ appStateRef 恒空（:626）⇒ SESSION 档授权
+        //   活不过下一条用户消息。
+        //   sessions.session_permission_rules（V75 列，SessionPermissionOverlay.persistSessionUpdates
+        //   两条 apply+persist 单点写入）是**跨 send 唯一通道**：doRun 入口回读 → 注入
+        //   appStateRef.toolPermissionContext → 消费方 = AgentLoopContext.mergeAppStatePermissionRules
+        //   （:1486，批 A2 已把 SESSION 桶/mode/附加目录并进 per-turn ctx）+ 工具侧 SkillToolImpl
+        //   COMMAND 桶同键共存。
+        //   ⛔ 只读 DB 会话列，不读也不写任何 settings 文件（落盘 = 把「本次会话」变成「永久」）。
+        //   mode 取 baseTuc 的 per-turn 基线 mode：A2 合并语义是「appState 侧 mode 胜出」
+        //   （AgentLoopContext:1622-1624）⇒ 无 SESSION setMode 时注入值必须与基线同值（否则会把
+        //   本次 run 的 mode 覆盖掉）；列里真有 SESSION setMode 时用列值 —— 那正是「本次会话允许
+        //   编辑」跨 send 存活的语义本体。本块放在 baseTuc 构造之后（而非 todos 回读 :2631 处）
+        //   的唯一原因就是拿 baseline mode。
+        //   best-effort（镜像 todos 回读 :2631-2664）：sessionMapper 未注入 / 查询异常 → warn+skip。
+        if (sessionMapper != null && sessionId != null) {
+            try {
+                // [session-id-short] 直键查询：sessionId 已为 short，不再经 originalKey 反解。
+                com.nexusai.repository.session.entity.SessionRecord sessionPermRecord =
+                    sessionMapper.selectOneById(sessionId);
+                if (sessionPermRecord != null) {
+                    com.nexusai.application.agent.permission.PermissionMode basePermMode =
+                        (baseTuc != null && baseTuc.permissionContext() != null)
+                            ? baseTuc.permissionContext().mode()
+                            : com.nexusai.application.agent.permission.PermissionMode.DEFAULT;
+                    com.nexusai.application.agent.permission.ToolPermissionContext sessionOverlay =
+                        com.nexusai.application.agent.permission.SessionPermissionOverlay.toContext(
+                            sessionPermRecord.getSessionPermissionRules(), basePermMode);
+                    if (sessionOverlay != null) {
+                        setAppState(prev -> {
+                            Map<String, Object> next = new java.util.HashMap<>(prev);
+                            next.put("toolPermissionContext", sessionOverlay);
+                            return next;
+                        });
+                        if (log.isDebugEnabled()) {
+                            log.debug("[批 A2b] 会话 SESSION 档授权回读注入: session='{}' mode={} "
+                                    + "allow={} deny={} ask={} dirs={}（V75 列 = 跨 send 唯一通道）",
+                                sessionId, sessionOverlay.mode(),
+                                sessionOverlay.alwaysAllowRules().size(),
+                                sessionOverlay.alwaysDenyRules().size(),
+                                sessionOverlay.alwaysAskRules().size(),
+                                sessionOverlay.additionalWorkingDirectories().size());
+                        }
+                    } else if (log.isDebugEnabled()) {
+                        log.debug("[批 A2b] 会话 SESSION 档授权回读跳过: session='{}' 列无 SESSION 档条目"
+                            + "（从未「本次会话允许」）", sessionId);
+                    }
+                } else if (log.isDebugEnabled()) {
+                    log.debug("[批 A2b] 会话 SESSION 档授权回读跳过: session='{}' 不存在", sessionId);
+                }
+            } catch (Exception e) {
+                log.warn("[批 A2b] 读取会话 SESSION 档授权失败，跳过回读注入: {}", e.getMessage());
+            }
+        }
         com.nexusai.application.agent.loop.AgentLoopContext mainCtx;
         if (contextFactory != null) {
             // [P3-③] 生产：factory.forSession 构造 ctx + 会话级可变状态（实例引用共享）+ override 事件通道
@@ -5475,6 +5736,31 @@ public class LlmAgentLoop implements AgentLoop {
             //
             // 边界情况：无 boundary 且无 snip 裁剪时 {@code modelView()} 内容与 {@code rawMessages()}
             //   逐条相同（同 size，不触发下面的日志）。
+            // ── [OPD-TS-27 · WF3-03 / C3 2026-09-19] 统一队列 mid-turn drain · 对齐 CC query.ts:1547-1643 ──
+            // [OD-D2] prevIterationRanTools 守门：仅上一轮真工具轮（onAssistantMessage 置位）drain
+            //   排队（CC query.ts:1547 位于工具结果路径尾）。needsFollowUp 不再门控 drain（其全部现有
+            //   mark 保留，门控 max_tokens 恢复 / stop hooks / NORMAL / exit-reason）；retry/fallback/
+            //   budget-continue 恢复轮 markNeedsFollowUp 但不置 lastIterationRanTools → 不 drain
+            //   （OD-D2 对齐 CC：恢复 continue 不经过 :1547）。turn-0 首轮仍经 firstIteration 强制放行
+            //   （已并入 prevIterationNeededFollowUp ⇒ 该轮上方 turn-0 drain 已消费完队列，本处 no-op）。
+            //
+            // ⭐ [C3 位置修正] 本 drain 必须在 entryModelView / messagesForQuery 快照<b>之前</b>执行 ——
+            //   对齐 CC「消息快照在 drain 之后组装」⇒ drain 产物必然进【紧接的下一轮】请求。
+            //   原实现位于快照之后（旧 :5871 > :5758）⇒ 产物要再等一轮才进请求；且 drain 之后若该轮
+            //   只回文本（needsFollowUp=false）⇒ do-while 退出，该消息<b>从未进任何请求</b>
+            //   （队列项已被移除 = 永久丢）。本次只在迭代内前移：守门判据（prevIterationNeededFollowUp）
+            //   与消费次数逐条不变（原位置与本位置之间无 break/continue/return，且本处仍在
+            //   MAX_STRUCTURED_OUTPUT_RETRIES 安全阀之后 ⇒ break 轮不会误消费队列）。
+            //   ⚠️ 下游一致变化（均为 CC 对齐面，非回归）：snip / microcompact / collapse /
+            //   autocompact 阈值、applyPerMessageBudget、blocking-limit 预检、ImageValidator 的
+            //   测量/校验源从此包含本轮的 mid-turn 注入项（CC 的 messagesForQuery 本就含 drain 产物）。
+            //   消费次数（toolResults/toolUseId 配对）不变：注入项仍恒追加在上一轮 tool 结果之后，
+            //   数组形状与「下一轮才可见」时期逐条一致。
+            if (prevIterationNeededFollowUp) {
+                drainAndInjectQueued(ctx, params, state, consumedCommandUuids,
+                    injectedQueuedMessages, imageStore, pdfProcessor, didLastTurnUseSleep(state));
+            }
+
             List<ChatMessageDto> entryModelView = state.modelView();
             int preBoundaryCount = state.rawMessages().size();
             if (entryModelView.size() != preBoundaryCount) {
@@ -5597,19 +5883,10 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
 
-            // ── [OPD-TS-27 · WF3-03] 统一队列 mid-turn drain · 对齐 CC query.ts:1547-1643 ──
-            // [OD-D2] prevIterationRanTools 守门：仅上一轮真工具轮（onAssistantMessage :5574 置位）drain
-            // 排队（CC query.ts:1547 位于工具结果路径尾）。needsFollowUp 不再门控 drain（其全部现有 mark 保留，
-            // 门控 max_tokens 恢复 / stop hooks / NORMAL / exit-reason）；retry/fallback/budget-continue
-            // 恢复轮 markNeedsFollowUp 但不置 lastIterationRanTools → 不 drain（OD-D2 对齐 CC：恢复
-            // continue 不经过 :1547）。turn-0 首轮仍经 firstIteration 强制放行（:4396 已并入）。风险
-            // 取舍（OD-D2 拍板接受）：mid-turn busy-queued 同轮回答在恢复轮不再注入，等下一真工具轮或
-            // turn 末 CronIdleExecutor 空闲兜底。逻辑抽取至 drainAndInjectQueued（循环顶 + maxTurns
-            // 边界两处调用，收敛单一实现）。
-            if (prevIterationNeededFollowUp) {
-                drainAndInjectQueued(ctx, params, state, consumedCommandUuids,
-                    injectedQueuedMessages, imageStore, pdfProcessor, didLastTurnUseSleep(state));
-            }
+            // [C3 2026-09-19] mid-turn drain 已上移至 entryModelView/messagesForQuery 快照<b>之前</b>
+            //   （见循环入口「mid-turn drain」块）—— 对齐 CC「快照在 drain 之后组装」，使 drain 产物
+            //   进【紧接的下一轮】请求而非再等一轮；此处不再重复消费（勿在此恢复第二处 drain：会双发）。
+
             // [skill-listing-cc-align 2026-09-10] A8「skill_listing 恒定头部装配」块已删除：旧实现每轮
             //   全量重建清单 → prependSkillListing 置请求队首（add(0)），并误引 CC messages.ts:3728-3738
             //   （实为 plan-mode pair-planning 文本，与 skill_listing 无关）。现改为每 run 一次决策 +
@@ -5961,7 +6238,11 @@ public class LlmAgentLoop implements AgentLoop {
             // openai_sdk 默认（与既有 1 参行为一致，不抛异常不落 mock）。
             LlmProvider provider = ctx.llmProviderFactory().getProvider(params.config(),
                 resolveMainProviderType(ctx, params.modelName()));
-            log.debug("LlmAgentLoop turn={} model={} provider={} msgs={}",
+            // [C1 · 2026-09-18 子代理投递修复] debug → INFO：本行是「请求边界锚」——每个 turn
+            //   实际发给模型的请求规模。事故盲区 L5：有 `drain 注入 N 条` 却<b>无</b>同 turn 的 `msgs=`
+            //   行 ⇒ (e) 「注入没进请求」成立。debug 级在默认日志下不可见 ⇒ 诊断时无法闭合该判据。
+            //   ⛔ 不要降回 debug：该判据的可观测性正是本批目的（成本 = 每 turn 1 行，非 chunk 热路径）。
+            log.info("LlmAgentLoop turn={} model={} provider={} msgs={}",
                 state.turnCount(), params.modelName(), provider.type(), state.rawMessages().size());
 
             // Phase 6·s02：捕获 onAssistantMessage 回调里的完整 message
@@ -6060,8 +6341,9 @@ public class LlmAgentLoop implements AgentLoop {
             // [B5 d-2] 发送边界基于请求级局部 messagesForQuery（boundary 剥离 + snip/micro/collapse/
             // compact 后的请求面，CC query.ts:540-544 toolUseContext.messages = messagesForQuery）；
             // 注入（relevant_memories/todo/task/hook/prependUserContext）在局部之上新建列表，不污染
-            // 测量源 messagesForQuery（其本身已是循环顶部注入前防御性快照）。blocking 测量
-            //（下方用 messagesForQuery）对齐 CC query.ts:637-638 与注入解耦。
+            // 测量源 messagesForQuery（其本身已是循环顶部防御性快照 —— [C3 2026-09-19] 该快照现位于
+            // mid-turn drain <b>之后</b>，故测量源含本轮队列注入项；这些 attachment 注入仍在其上、
+            // 不回流）。blocking 测量（下方用 messagesForQuery）对齐 CC query.ts:637-638 与注入解耦。
             List<ChatMessageDto> messagesForLlm = messagesForQuery;
             if (pendingMemoryPrefetch != null
                     && pendingMemoryPrefetch.settledAt != 0
@@ -6186,6 +6468,10 @@ public class LlmAgentLoop implements AgentLoop {
             //   meta user message 追加队尾并标已读（对齐 CC「build before mark read」）。动态注入
             //   不持久化（Batch2 设计决策，防 maybeInjectHookAttachments 每轮重渲染同消息膨胀）。
             //   perTurnTuc 为 null 时方法内安全跳过（门控 2）。
+            // [C1 收口] 「谁可消费队长 inbox」不在此处判 —— 门控落在 doRun 的 teamContext **回灌**点：
+            //   非交互 run（setTeammateInboxConsumer 未置位）根本不会拿到 appState.teamContext ⇒
+            //   本方法门控 2/3 自然早返（无注入、无 markRead）。身份与消费资格用同一判据表达，
+            //   避免在静态 loop() 里多穿一个 per-run 参数。
             messagesForLlm = AgentLoopContext.maybeInjectTeammateMailbox(ctx, state, perTurnTuc, messagesForLlm);
 
             // ── [ER-IMP-2026-04 P-21] output_token_usage 每迭代注入（对齐 CC attachments.ts:980-982
@@ -6398,7 +6684,7 @@ public class LlmAgentLoop implements AgentLoop {
                     isAtBlockingLimit = warningState.isAtBlockingLimit();
                     if (log.isDebugEnabled()) {
                         log.debug("[LlmAgentLoop] blocking-limit 预检(四态): tokenUsage={} (减snipFreed={}) model={} "
-                                + "percentLeft={} warn={} error={} auto={} blocking={} 测量源=messagesForQuery(不含注入) 测量口径=tokenCountWithEstimation",
+                                + "percentLeft={} warn={} error={} auto={} blocking={} 测量源=messagesForQuery(含本轮队列注入·不含 attachment 注入) 测量口径=tokenCountWithEstimation",
                             tokenUsage, snipTokensFreed, effectiveModel,
                             warningState.percentLeft(), warningState.isAboveWarningThreshold(),
                             warningState.isAboveErrorThreshold(), warningState.isAboveAutoCompactThreshold(),
@@ -6424,7 +6710,7 @@ public class LlmAgentLoop implements AgentLoop {
                     int blockingLimit = AgentLoopContext.computeBlockingLimit(ctx, effectiveModel, null);
                     isAtBlockingLimit = tokenUsage >= blockingLimit;
                     if (log.isDebugEnabled()) {
-                        log.debug("[LlmAgentLoop] blocking-limit 预检(兜底): tokenUsage={} (减snipFreed={}) blockingLimit={} model={} 测量源=messagesForQuery(不含注入) 测量口径=tokenCountWithEstimation",
+                        log.debug("[LlmAgentLoop] blocking-limit 预检(兜底): tokenUsage={} (减snipFreed={}) blockingLimit={} model={} 测量源=messagesForQuery(含本轮队列注入·不含 attachment 注入) 测量口径=tokenCountWithEstimation",
                             tokenUsage, snipTokensFreed, blockingLimit, effectiveModel);
                     }
                 }
@@ -9218,15 +9504,36 @@ public class LlmAgentLoop implements AgentLoop {
         // [3a] drain 归属收敛：传本会话 short（state.sessionId()）→ 只捞本会话命令，捞不到别的会话的
         // cron / prompt；sessionId==null 全局命令一律不捞（交 CronIdleExecutor）。
         // [3e] [session-id-short] QueueItem.sessionId 与 state.sessionId() 同 short，裸 equals 必中。
-        // [mid-turn-align] busy-queued（mode=prompt + workload="busy-queued" + sessionId=本会话）现被
-        //   当前轮 drain 注入本轮上下文（同轮回答）——对齐 CC query.ts:1556-1560 主线程 drain 只滤
-        //   slash + agentId（query.ts:1569-1577），workload 不参与过滤；busy-queued 即 mode=prompt +
-        //   agentId=null + sessionId=当前会话 short，裸 equals 必中。
-        //   注入后排队 user 消息【不立即落库】，轮结束由 ChatService 补落库（DB 顺序 = user →
-        //   assistant... → queued-user，不再有插入到未落库 assistant 前的错位）。
+        // [mid-turn-align / C3 2026-09-19] busy-queued（mode=prompt + workload="busy-queued" +
+        //   sessionId=本会话）在本轮 drain 注入【本轮请求】—— drain 已位于 entryModelView /
+        //   messagesForQuery 快照<b>之前</b>（见循环入口块），产物进【紧接的工具轮】请求 = 真同轮可见
+        //   （对齐 CC query.ts:1547-1643：消息快照在 drain 之后组装）。⚠️ 原实现 drain 在快照之后
+        //   ⇒ 产物要再等一轮才进请求（「同轮回答」在 C3 改前不成立，改后成立）。
+        //   对齐 CC query.ts:1556-1560 主线程 drain 只滤 slash + agentId（query.ts:1569-1577），
+        //   workload 不参与过滤；busy-queued 即 mode=prompt + agentId=null + sessionId=当前会话 short，
+        //   裸 equals 必中。
+        //   [C2 2026-09-19] 登记在 state.appendMessage <b>之前</b> ⇒ append 触发 appendListener 即
+        //   实时落库；轮末 persistInjectedQueuedMessages 补落经 existsById 幂等跳过（同一 uuid 恒一条）。
         java.util.List<com.nexusai.application.agent.tasks.NotificationQueue.QueueItem> drained =
             ctx.notificationQueue().drainForQuery(sleepRan, notificationAgentId, state.sessionId());
-        if (drained.isEmpty()) return 0;
+        if (drained.isEmpty()) {
+            // [P0-D3-obs] 早返回前留痕（可观测性修复，零行为变化）：
+            //   原实现 isEmpty 直接 `return 0`，而唯一那条 drain 汇总日志（本方法末
+            //   「统一队列 drain 逐条注入 {} 条」）在 return **之后** ⇒ 「日志里没有 drain 行」既不等于
+            //   「没发生 drain」也不等于「队列为空」，两种情形日志上都表现为「静默」。
+            //   09-18 e2e 判读即被此坑误导（用「无 drain 行」当「未消费」的证据）。
+            //   本行 = 唯一能把「已进入 drainForQuery 且本轮 0 条」与「压根没进 drain」分开的证据；
+            //   判读铁律配套：先确认 X 是否会打日志，再据「日志无」下结论。
+            // [09-19 提级 debug→info · 用户拍板] 本行是上述唯一锚点，必须默认可见（默认日志级别下
+            //   debug 不落盘 ⇒ 提级前它自身也「不会打日志」，锚点等于不存在）。对照：本方法末那条
+            //   汇总行（:9722「统一队列 drain 逐条注入 {} 条」, log.info）只在 drained>0 时执行 ⇒
+            //   「没有汇总行」既可能是没 drain、也可能是 drain 了 0 条。这条 INFO 专治该判读坑。
+            log.info("[LlmAgentLoop] turn={} 本回合队列空、未发生 drain（统一队列 drain 本轮 0 条；"
+                + "sleepRan={}, agent={}, session={}）—— 本行存在即证明 drainForQuery 已执行且本回合"
+                + "无可消费项，无本行 = 压根未进入 drain",
+                state.turnCount(), sleepRan, notificationAgentId, state.sessionId());
+            return 0;
+        }
         // [B4-1 · 决策 #10] 批量取但逐命令独立 user message · 对齐 CC queueProcessor.ts:42-43
         // 「each becomes its own user message with its own UUID」+ messages.ts:3782
         // (queued_command → createUserMessage({ uuid: attachment.source_uuid }))。
@@ -9247,8 +9554,9 @@ public class LlmAgentLoop implements AgentLoop {
                 // [P0-1 C6 折叠适配] 折叠合成消息 content 只存 "N background commands completed"
                 //   （去 TASK_NOTIFICATION_PREFIX —— 发送层 task-notification 分支会加一次前缀，此处
                 //   再加会二次前缀）；明细留 background_task_notification attachment（模型仍可见完成明细）。
-                //   折叠不落库（registry 不登记 busy-queued）→ 不推送 Java inert：仅 state 暂态 + 发送层
-                //   处理，发送层加前缀单次。isMeta 随新公式 = mode==task-notification → true（OD-D3：
+                //   [C2 2026-09-19] 折叠段现<b>落库</b>（登记 registry ⇒ append 实时落库；原「折叠不落库」
+                //   已作废）；不推送 Java inert（无 /stream message.user，busy-queued 专属通道）。
+                //   发送层加前缀单次。isMeta 随新公式 = mode==task-notification → true（OD-D3：
                 //   mid-turn 通知 UI 隐藏、模型可见；reflector MINOR-2 —— 折叠为 mid-turn 注入，
                 //   与单条 task-notification 同公式，不保留旧 C5 false）。
                 String foldedContent = foldSize + " background commands completed";
@@ -9258,8 +9566,20 @@ public class LlmAgentLoop implements AgentLoop {
                         foldedXml.append(drained.get(j).value()).append('\n');
                     }
                 }
-                state.appendMessage(toMessage(Role.user, foldedContent, null, item.uuid(), true)
-                    .withQueuedOrigin("task-notification"));
+                ChatMessageDto foldedMsg = toMessage(Role.user, foldedContent, null, item.uuid(), true)
+                    .withQueuedOrigin("task-notification");
+                // [C2 2026-09-19] 折叠段同样登记落库（登记面 = 全部 mid-turn 注入项）：content = 折叠摘要
+                //   （RAW），queuedOrigin='task-notification'，isMeta=true（resume 后 UI 隐藏，与 live 一致）。
+                //   ⚠️ 残留（有意）：逐条原始 XML 明细只落在 background_task_notification attachment（内存，
+                //   非落库）⇒ resume 后折叠段只还原摘要句、不还原明细。折叠为 Java 独有决策（决策6），
+                //   CC 无对应（CC 逐条 queued_command attachment 落盘）。
+                state.addInjectedQueuedMessage(foldedMsg.id(), foldedMsg.content(),
+                    foldedMsg.queuedOrigin(), null, true);
+                if (injectedQueuedMessages != null) {
+                    injectedQueuedMessages.add(new AgentState.InjectedQueuedMessage(
+                        foldedMsg.id(), foldedMsg.content(), foldedMsg.queuedOrigin(), null, true));
+                }
+                state.appendMessage(foldedMsg);
                 // 折叠段 attachment 收敛为 1 条（各原始 XML 拼接，模型仍可见完成明细/exit code）
                 state.appendAttachment(new com.nexusai.application.agent.attachment.AttachmentMessageDto(
                     null, "attachment", "background_task_notification", foldedXml.toString(), null, null, null));
@@ -9286,10 +9606,12 @@ public class LlmAgentLoop implements AgentLoop {
             // [P0-1 MINOR-5] 发送层包壳统一声明：drain append 一律存【原文 RAW + 各自 queuedOrigin 标记】，
             //   壳只在发送层 wrapQueuedMessagesForApi（ModelRequest 构造前）临时生成 —— live/resume 共用，
             //   防实现遗漏（resume 丢壳根治，对齐 CC transcript 存 RAW + normalizeMessagesForAPI 包壳）。
-            //   scope 收窄（§4.1）：仅 busy-queued 落库持久化标记（registry 登记 → ChatService 落 V67
-            //   queued_origin 列）；task-notification/coordinator/channel/cron mid-turn 不落库，仅 state
-            //   暂态 + 发送层处理（现状 scope，resume 后消失，明示验收不误判）。
-            //   turn-0 首次输入（prompt && workload=null && origin=null）无标记 → 不包壳（CC 直发 user 消息）。
+            //   [C2 2026-09-19 落库面扩大] 原「仅 busy-queued 落库」已作废：all queuedOrigin 非空项
+            //   （busy-queued / task-notification / coordinator / channel / cron）均登记 registry 并落库
+            //   （V67 queued_origin + V51 is_meta），对齐 CC（queued_command 落 transcript；落库过滤器
+            //   不看 isMeta —— 原「isMeta ⇒ 不落库」系误引 messages.ts:3753-3756，那里只讲 UI 隐藏）。
+            //   turn-0 首次输入（prompt && workload=null && origin=null）无标记 → 不登记不包壳
+            //   （user 行由 controller createUserMessage 落库；CC 直发 user 消息）。
             String queuedOrigin;
             if (busyQueued) {
                 queuedOrigin = "busy-queued";
@@ -9338,25 +9660,8 @@ public class LlmAgentLoop implements AgentLoop {
             boolean injectAttachments = busyQueued
                 && item.attachments() != null && !item.attachments().isEmpty();
             ChatMessageDto appended;
-            if (busyQueued) {
-                // [P0-1] busy-queued 登记 registry（uuid, content, 'busy-queued'）前置到 append 前：
-                //   append 触发实时落库 appendListener（AgentState.appendMessage → ChatService.
-                //   persistAppendedMessage user 分支）时 injectedQueuedById 已命中 →
-                //   createQueuedUserMessage(..., inj.queuedOrigin()) 即时落 DB（原文 content + V67
-                //   queued_origin='busy-queued'）；turn 末 persistInjectedQueuedMessages 补落经
-                //   existsById 幂等跳过。原文 RAW 与 DB content 一致（消除 live 带壳 / DB 原文 错位）。
-                //   [OD-D5] 登记收口公共段（带图与纯文本 busy 共用，防 injectedQueuedMessages 双条目）。
-                //   [busy 附件快照] 同时登记非图片附件快照（item.userAttachments，enqueueBusyPrompt 构造）：
-                //   实时落库分支（ChatService.persistAppendedMessage user 分支 :1506 透传
-                //   m.userAttachments()）与轮末补落分支（persistInjectedQueuedMessages）都以本 registry
-                //   为快照载体 → 两条落库路径落出的 user_attachments 一致（F5 气泡附件胶囊 + 预览 url）。
-                state.addInjectedQueuedMessage(item.uuid(), item.value(), queuedOrigin, item.userAttachments());
-                if (injectedQueuedMessages != null) {
-                    injectedQueuedMessages.add(
-                        new AgentState.InjectedQueuedMessage(item.uuid(), item.value(), queuedOrigin,
-                            item.userAttachments()));
-                }
-            }
+            // [C2 2026-09-19] 原「仅 busy-queued 登记 registry」块已下移 —— 现于 append 前对<b>全部</b>
+            //   mid-turn 注入项（queuedOrigin 非空）统一登记，见下方「mid-turn 注入项登记 registry」段。
             if (prompt && (queuedOrigin == null || hasImage || injectAttachments)
                     && (imageStore != null || pdfProcessor != null)) {
                 // [OD-D5] 消费点完整注册：只传本项 attachments（per-item 语义，消费即清；CC per-command）。
@@ -9425,8 +9730,9 @@ public class LlmAgentLoop implements AgentLoop {
                 appended = toMessage(Role.user, content, null, item.uuid(), isMeta)
                     .withQueuedOrigin(queuedOrigin);
             } else if (queuedOrigin != null) {
-                // task-notification / coordinator / channel / cron：原文 RAW + 标记（不落库，
-                //   registry 不登记）；发送层 wrapQueuedMessagesForApi 按标记加壳（单次）。
+                // task-notification / coordinator / channel / cron：原文 RAW + 标记；与 busy-queued 同样
+                //   **登记落库**（[C2 2026-09-19] 见下方 append 前登记段，isMeta 随 DTO 落 is_meta 列）；
+                //   发送层 wrapQueuedMessagesForApi 按标记加壳（单次）。
                 appended = toMessage(Role.user, content, null, item.uuid(), isMeta)
                     .withQueuedOrigin(queuedOrigin);
             } else {
@@ -9449,6 +9755,35 @@ public class LlmAgentLoop implements AgentLoop {
                         state.sessionId(), item.uuid());
                 }
             }
+            // ── [C2 2026-09-19] mid-turn 注入项登记 registry（面 = 全部 queuedOrigin 非空项）──
+            // CC 语义：mid-turn 注入的排队命令/通知<b>落库</b>（落 RAW content + origin 标记；给模型看的壳
+            //   在【请求组装时】由 wrapQueuedMessagesForApi 临时生成 ⇒ resume 重包、如实还原）。
+            //   落库过滤器只滤 progress / 非 ant attachment，<b>不看 isMeta</b>（原「isMeta ⇒ 不落库」
+            //   系误引 messages.ts:3753-3756 —— 那里只讲 isMeta 用于 UI 隐藏）。
+            // ★ 登记时机：必须在 state.appendMessage 之前 —— append 触发实时落库 appendListener
+            //   （ChatService.persistAppendedMessage user 分支）按 m.id() 反查 registry 命中即
+            //   createQueuedUserMessage 落 DB（RAW content + queued_origin + is_meta）；轮末
+            //   persistInjectedQueuedMessages 补落经 existsById 幂等跳过 ⇒ 同一 uuid 恒一条（无重复落库）。
+            // ★ uuid 归属：队列项有 uuid 用队列项（busy-queued / cron 生产者显式携带，且与前端气泡 id
+            //   一致）；task-notification 等生产者 uuid=null → 用本 DTO 自身 id（toMessage /
+            //   buildUserMessageWithImages 已兜底随机 UUID）—— 实时落库与轮末补落两路同源同一 id。
+            // ★ turn-0 prompt（queuedOrigin==null）不登记：其 user 行由 controller createUserMessage
+            //   预落库，再登记 = 重复行（appendListener 分支亦按 registry 判定，故不登记即不落）。
+            if (queuedOrigin != null && !queuedOrigin.isBlank()) {
+                String regUuid = item.uuid() != null ? item.uuid() : appended.id();
+                state.addInjectedQueuedMessage(regUuid, item.value(), queuedOrigin,
+                    item.userAttachments(), appended.isMeta());
+                if (injectedQueuedMessages != null) {
+                    injectedQueuedMessages.add(
+                        new AgentState.InjectedQueuedMessage(regUuid, item.value(), queuedOrigin,
+                            item.userAttachments(), appended.isMeta()));
+                }
+                if (log.isDebugEnabled()) {
+                    log.debug("[LlmAgentLoop] turn={} [C2] mid-turn 注入项登记落库 registry: uuid={} "
+                            + "queuedOrigin={} isMeta={}（队列项 uuid={}）",
+                        state.turnCount(), regUuid, queuedOrigin, appended.isMeta(), item.uuid());
+                }
+            }
             state.appendMessage(appended);
             // [P0-2 OD-D9] mid-turn busy-queued 补推 /stream message.user（content=原文 RAW，
             //   isMeta=false，uuid=item.uuid()）→ 前端「原文气泡」：排队框移除后气泡显示原文（CC
@@ -9468,9 +9803,9 @@ public class LlmAgentLoop implements AgentLoop {
                     state.turnCount(), isMeta, queuedOrigin, state.sessionId(), item.mode(), item.workload(),
                     item.uuid(), content != null ? content.length() : 0);
             }
-            // [即时落库 2026-09-03] busy-queued 登记已前置（见 append 前）→ append 实时落库
-            //   createQueuedUserMessage（ChatService.persistAppendedMessage user 分支 :1253 命中即落）。
-            //   此处仅保留注入确认 log，不再重复 addInjectedQueuedMessage。
+            // [即时落库 2026-09-03 / C2] 登记已前置（见 append 前统一登记段，面含全部 queuedOrigin
+            //   非空项）→ append 实时落库 createQueuedUserMessage（ChatService.persistAppendedMessage
+            //   user 分支命中即落）。此处仅保留注入确认 log，不再重复 addInjectedQueuedMessage。
             if (busyQueued && log.isInfoEnabled()) {
                 log.info("[LlmAgentLoop] turn={} 注入排队 user 消息（同轮回答 RAW+queuedOrigin=busy-queued；"
                         + "登记已前置 → append 实时落库 createQueuedUserMessage 落 V67 queued_origin）: "

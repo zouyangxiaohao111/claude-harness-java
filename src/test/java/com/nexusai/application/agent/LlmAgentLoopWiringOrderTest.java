@@ -195,7 +195,12 @@ class LlmAgentLoopWiringOrderTest {
         //（autoCompact.ts:313），无手工 [boundary,summary] 组装双轨。per-session 上下文经 buildAutoContext 映射。
         int autoCtxIdx = source.indexOf("CompactConversation.buildAutoContext(");
         int autocompactIdx = source.indexOf("autoCompactor.autoCompactIfNeeded(");
-        int blockingIdx = source.indexOf("blocking-limit 预检");
+        // [锚点修复 2026-09-20] 原锚点用中文字面量 "blocking-limit 预检" 做 indexOf —— 该串在
+        //   C2(08001bf2) 新增的注释里被逐字引用（HEAD:5755，位于真实预检段 HEAD:6613 之前）⇒
+        //   indexOf 命中注释而非真实预检，顺序断言反转假红。改用真实预检段**首条可执行语句**
+        //   （HEAD:6631 · rcOwnsBlocking 跳过条件计算）做锚：真实代码串、全文 indexOf 唯一（计数=1），
+        //   且取预检段「起点」而非尾端 ⇒ autocompact 必须整体先于预检（更严）。
+        int blockingIdx = source.indexOf("boolean rcOwnsBlocking = ctx.reactiveCompactor() != null");
 
         assertThat(boundaryIdx).as("boundary 剥离必须存在（DRIFT-17）").isPositive();
         assertThat(budgetIdx).as("预算步骤必须存在").isPositive();

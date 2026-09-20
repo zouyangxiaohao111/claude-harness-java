@@ -77,7 +77,7 @@ class ChatControllerImmediateBusyTest {
     void send_busyImmediate_dispatchBypassesQueue() {
         LlmAgentLoop.markRunning(sid);
         SendMessageRequest req = new SendMessageRequest("/btw info", null, null, null, null, null, null, null, null);
-        when(chatService.isImmediateLocalJsxCommand("/btw info")).thenReturn(true);
+        when(chatService.isImmediateLocalJsxCommand(eq(sid), eq("/btw info"))).thenReturn(true);
         when(chatService.dispatchImmediateLocalJsx(anyString(), anyString(), eq("/btw info"), eq(true), eq(wsTemplate)))
             .thenReturn(true);
 
@@ -96,7 +96,7 @@ class ChatControllerImmediateBusyTest {
     void send_busyImmediate_noHandler_fallsBackToEnqueue() {
         LlmAgentLoop.markRunning(sid);
         SendMessageRequest req = new SendMessageRequest("/plugin x", null, null, null, null, null, null, null, null);
-        when(chatService.isImmediateLocalJsxCommand("/plugin x")).thenReturn(true);
+        when(chatService.isImmediateLocalJsxCommand(eq(sid), eq("/plugin x"))).thenReturn(true);
         when(chatService.dispatchImmediateLocalJsx(anyString(), anyString(), eq("/plugin x"), eq(true), eq(wsTemplate)))
             .thenReturn(false);
 
@@ -113,7 +113,7 @@ class ChatControllerImmediateBusyTest {
     void send_busyNonImmediate_enqueuesAsBefore() {
         LlmAgentLoop.markRunning(sid);
         SendMessageRequest req = new SendMessageRequest("normal question", null, null, null, null, null, null, null, null);
-        when(chatService.isImmediateLocalJsxCommand("normal question")).thenReturn(false);
+        when(chatService.isImmediateLocalJsxCommand(eq(sid), eq("normal question"))).thenReturn(false);
 
         MessageCreatedResponse resp = controller.send(sid, req);
 

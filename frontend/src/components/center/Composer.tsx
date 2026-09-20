@@ -3,7 +3,7 @@ import type { ClipboardEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import { QueuedCommandsBar } from './QueuedCommandsBar'
 import { SessionToolsPanel } from './SessionToolsPanel'
 import { CatArtBody } from '../startup/CatArt'
-import type { QueuedCommand } from '@/hooks/useCommandQueue'
+import type { PoppedQueueInput, QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
 import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
 import { uploadAttachment } from '@/api/chat'
@@ -49,6 +49,51 @@ interface PendingAttachment {
 /** 5MB 直传上限（后端 MediaLimitGuard） */
 const BASE64_LIMIT = 5 * 1024 * 1024
 
+/** 拉回排队附件时 chip 去重键的命名空间（批 A5）· 与 `md5:` / `file:` / `path:` 并列，互不冲突。 */
+const DEDUP_NS_QUEUED = 'queued:'
+
+/** 拉回排队附件时的 chip 去重键（批 A5）。
+ *
+ * ⛔ **为什么不按内容 md5 算**（base64 腿 chip 正常路径就是这个键）：同一张图被拉回时已在内存里，
+ *   但 `mediaLimitGuard` 允许单条 5MB、单请求 100 项 ⇒ 最坏 500MB 逐个同步 md5 = 主线程卡住数秒
+ *   （本仓 `attachmentDelivery.ts` / `pathAttachment.ts` 头注都明确禁止在大文件上同步算内容哈希）。
+ *   故退回**廉价且唯一**的键：path 腿用完整路径（零 I/O，与入队前**同一个键**）、
+ *   上传腿用 contentId、其余用 filename+序号。
+ *   代价如实登记：base64 腿拉回后，同一张图再粘一次不会被判为重复（多出一个 chip）—— 相对
+ *   「按 Esc 后附件全丢」是可接受的方向；且 chip 的移除按**索引**走，不受该键影响。 */
+function restoredDedupKey(a: AttachmentRequest, index: number): string {
+  if (a.path) return pathDedupKey(a.path)
+  if (a.contentId) return `${DEDUP_NS_QUEUED}${a.contentId}`
+  return `${DEDUP_NS_QUEUED}${a.filename ?? 'attachment'}#${index}`
+}
+
+/** 后端回传的排队附件 → 待发 chip（批 A5 · 「图片一起还给你」）。
+ *
+ * <p>字段映射：后端 `AttachmentRequest`（= 队列项 `attachments`，`resolveAttachments` + `MediaLimitGuard`
+ * 之后的**已解析**形态）→ `PendingAttachment`。两个关键点：
+ * <ul>
+ *   <li>`base64` 一律按**纯 base64** 存放（后端出站就是纯 base64），`preview` 另拼 dataURL ——
+ *       chip 的 `<img src>` 需要 dataURL，而 `doSend` 又会把 dataURL 前缀剥掉再发 ⇒ 不再重投时出错。</li>
+ *   <li>contentId / path 原样保留（上传腿 / local-read 腿重投靠它们）。</li>
+ * </ul> */
+export function restorePendingAttachments(list?: AttachmentRequest[] | null): PendingAttachment[] {
+  if (!list || list.length === 0) return []
+  return list.map((a, i) => {
+    const pure = a.base64 ? a.base64.replace(/^data:[^;]+;base64,/, '') : undefined
+    const mediaType = a.mediaType ?? ''
+    return {
+      type: a.type,
+      filename: a.filename ?? '附件',
+      mediaType,
+      dedupKey: restoredDedupKey(a, i),
+      ...(pure ? { base64: pure } : {}),
+      ...(pure && a.type === 'image' ? { preview: `data:${mediaType || 'image/png'};base64,${pure}` } : {}),
+      ...(a.contentId ? { contentId: a.contentId } : {}),
+      ...(a.path ? { path: a.path } : {}),
+    }
+  })
+}
+
 /** Uint8Array → base64（Tauri fs 读文件二进制 → dataURL 直传） */
 function u8ToBase64(bytes: Uint8Array): string {
   let binary = ''
@@ -67,7 +112,14 @@ interface ComposerProps {
   streaming: boolean
   onStop: () => void
   queuedCommands: QueuedCommand[]
-  popEditable: () => void
+  /**
+   * 拉回全部可编辑排队命令（Esc / 排队条「编辑」按钮）。
+   *
+   * <p>返回值是**新契约**（批 A5）：`{text, attachments}`。`text` 由 `App` 负责写进输入框
+   * （`setComposerText` 归 `App` 所有）；`attachments` 由本组件还原成待发 chip
+   * （附件 `attachments` state 归本组件所有）。返回 `null` = 无可拉回项/请求失败 → 本组件零改动。
+   */
+  popEditable: () => Promise<PoppedQueueInput | null>
   /** 当前绑定项目名（null=未绑定，显示"未选中"） */
   boundProjectName: string | null
   /** 当前绑定项目 id（@ 引用文件候选源 = 该项目 git 文件树 · null=未绑定不弹候选） */
@@ -708,6 +760,26 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   // 计划模式已并入权限模式下拉（PermissionMode.plan）· 不再独立 tool-chip
   const hasEditableQueued = queuedCommands.some((c) => c.isEditable)
 
+  /**
+   * 拉回全部可编辑排队命令（Esc / 排队条「编辑」按钮 · 批 A5）。
+   *
+   * <p>分工：`text` 由 `App` 写进输入框（`setComposerText` 归 `App`），**附件由本组件还原**成待发
+   * chip（`attachments` state 归本组件）。`null` = 无可拉回项/请求失败 → 零改动（绝不半途清空）。
+   *
+   * <p>未移除的排队项（cron / channel / task-notification 等不可编辑项）由 `useCommandQueue` 与
+   * 后端 `popForEdit` 同源判据留在队列 —— 本组件不做任何本地队列裁剪。
+   */
+  const handlePopEditable = useCallback(async () => {
+    const res = await popEditable()
+    if (!res) return
+    const restored = restorePendingAttachments(res.attachments)
+    if (restored.length === 0) return
+    // 登记去重键（与「移除 chip / 清空 / 发送后」三处释放点配对，见 addedKeysRef 注释）
+    for (const p of restored) addedKeysRef.current.add(p.dedupKey)
+    // 还原的 chip 排在已有 chip **之前** —— 与「排队项文本接在草稿之前」同一顺序语义
+    setAttachments((prev) => [...restored, ...prev])
+  }, [popEditable])
+
   // 让高亮层的内容区宽度/高度/滚动位置与 textarea 严格一致（滚动条出现会改变 clientWidth/clientHeight）
   const syncHighlight = () => {
     const ta = textareaRef.current
@@ -745,7 +817,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         </div>
       )}
       {/* F19/#3 排队命令条（输入框上方，后端 B5 未接恒空隐藏） */}
-      <QueuedCommandsBar queuedCommands={queuedCommands} onEdit={popEditable} />
+      {/* 「编辑」按钮与 Esc 走同一个入口（文本 + 附件一起拉回） */}
+      <QueuedCommandsBar queuedCommands={queuedCommands} onEdit={() => void handlePopEditable()} />
       <div className="composer-inner">
         {/* 输入框上方一行：左=项目绑定，右=模型选择器（设计稿 v7） */}
         <div className="composer-top">
@@ -911,7 +984,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                     setComposerText(composerText.replace(/\/\S*$/, ''))
                     e.stopPropagation()
                   } else if (hasEditableQueued) {
-                    popEditable()
+                    // 批 A5：拉回【全部】可编辑排队项（文本由 App 回填 + 本组件还原附件）
+                    void handlePopEditable()
                     e.stopPropagation()
                   }
                 }

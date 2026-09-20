@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload } from '../api/types'
+import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload, PermissionUpdate } from '../api/types'
 import type { SessionFile } from '../types'
 import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
 
@@ -108,6 +108,9 @@ export interface PermissionRequestItem {
   timestampMs?: number
   /** worker 徽标颜色（leader inbox 请求 · 后端 #132 补 workerBadgeColor · 可 null 回落默认） */
   workerBadgeColor?: string | null
+  /** 一键授权建议（后端 PermissionPromptDetails.suggestions）· 弹窗按 destination 渲染第三档，
+   *  点选后**原样**回传 updatedPermissions（前端不做结构转换）。空/缺省 → 不渲染第三档。 */
+  suggestions?: PermissionUpdate[] | null
 }
 
 export interface ChatState {
@@ -139,6 +142,12 @@ export interface ChatState {
   permissionQueue: PermissionRequestItem[]
   connection: 'idle' | 'connecting' | 'connected' | 'disconnected'
   agentStatus: AgentStatus
+  /** [C6 · 停止键可见性] 服务端权威运行态（sessionId -> 该会话是否有服务端 run 存活）。
+   *  与 agentStatus 的区别：agentStatus 是【全局单值】、只驱动状态点；本表【按会话键控】，
+   *  是「要不要显示停止键」的第三路判据（见 utils/turnRunning.ts）。两个写入源：
+   *  ① 载入 / 切会话 / 重连时 GET /sessions/{id}/running 重建 —— 这是 F5 后仍能看见停止键的唯一途径；
+   *  ② session.status 事件实时翻转（thinking/streaming → true，idle → false）。 */
+  serverRunning: Record<string, boolean>
   retry: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null
   /** [按会话键控] 压缩警告（sessionId -> token_warning 事件 · 键不存在 = 该会话无警告）。
    *  后端推的是会话级 topic（/topic/sessions/{sid}/token-warning）→ 原全局单字段会让 A 会话的
@@ -174,6 +183,8 @@ export interface ChatState {
   setConversationId: (sessionId: string, conversationId: string) => void
   setConnection: (c: ChatState['connection']) => void
   setAgentStatus: (s: AgentStatus) => void
+  /** [C6] 写该会话的服务端运行态（GET /running 重建 · session.status 事件翻转） */
+  setServerRunning: (sessionId: string, running: boolean) => void
   /** 按轮次 id 惰性建流式块（chunk 到达时确保存在；同 id 复用最后块） */
   ensureStreamBlock: (sessionId: string, assistantMessageId: string, userMessageId?: string | null) => void
   appendChunk: (sessionId: string, assistantMessageId: string, delta: string) => void
@@ -260,6 +271,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   permissionQueue: [],
   connection: 'idle',
   agentStatus: 'idle',
+  serverRunning: {},   // [C6] sessionId -> 服务端 run 存活（键缺失 = 未查过/未在跑 ⇒ 一律 false）
   retry: null,
   tokenWarning: {},   // [按会话键控] sessionId -> token_warning（键不存在 = 无警告）
   compact: {},        // [按会话键控] sessionId -> 压缩进度（键不存在 = 该会话无在飞压缩）
@@ -345,6 +357,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // [按会话键控] 压缩进度 / 压缩警告也是会话级键：删会话一并释放（否则该键永不再被读，纯残留）
     const compact = { ...st.compact }
     const tokenWarning = { ...st.tokenWarning }
+    // [C6] 服务端运行态同属会话级键：删会话一并释放
+    const serverRunning = { ...st.serverRunning }
     delete messages[sessionId]
     delete streams[sessionId]
     delete streamOrder[sessionId]
@@ -359,10 +373,15 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     delete extendedWindow[sessionId]
     delete compact[sessionId]
     delete tokenWarning[sessionId]
-    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, extendedWindow, compact, tokenWarning }
+    delete serverRunning[sessionId]
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, extendedWindow, compact, tokenWarning, serverRunning }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
+  // [C6] 服务端运行态按会话键控（多会话并行：A 在跑不得让 B 显示停止键）
+  setServerRunning: (sessionId, running) => set((st) => ({
+    serverRunning: { ...st.serverRunning, [sessionId]: running },
+  })),
   ensureStreamBlock: (sessionId, assistantMessageId, userMessageId) => set((st) => {
     const blocks = st.streams[sessionId]
     const last = blocks && blocks.length > 0 ? blocks[blocks.length - 1] : undefined

@@ -1,13 +1,22 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { JsonBlock } from '@/markdown/JsonBlock'
 import type { PermissionRequestItem } from '@/stores/chatStore'
-import type { AskUserAnswers, AskUserAnnotations, AskUserQuestion } from '@/api/types'
+import type { AskUserAnswers, AskUserAnnotations, AskUserQuestion, PermissionUpdate } from '@/api/types'
+import { buildSuggestionOptions } from './permissionSuggestionLabels'
 
 interface Props {
   request: PermissionRequestItem
-  onDecision: (requestId: string, decision: 'allow' | 'deny', answers?: AskUserAnswers, annotations?: AskUserAnnotations) => void
+  onDecision: (requestId: string, decision: 'allow' | 'deny', answers?: AskUserAnswers, annotations?: AskUserAnnotations, permissionUpdates?: PermissionUpdate[]) => void
   /** 中止权限请求（用户放弃决策 → App 发 deny + dequeue · 对齐 CC Ctrl+C onReject，解除 worker 等待） */
   onAbort?: () => void
+  /**
+   * [批 A4c P3] 当前会话绑定项目的展示名 —— 项目级档位文案里的「项目标识」。
+   *
+   * <p>为什么需要它：后端推来的 `suggestions` 只带 `destination`（规则落到哪个设置文件），
+   * 项目级 destination 的落点是 `<项目>/.nexusai/settings.local.json`，而项目名/路径只有
+   * 前端（会话绑定项目）知道。取不到时传 null ⇒ 文案退化为「在本项目中」，不编造项目名。
+   */
+  projectLabel?: string | null
 }
 
 /** 每问勾选态：question 文本 → 单选 label / 多选 label[] */
@@ -60,9 +69,15 @@ function ToolInput({ toolInput }: { toolInput: unknown }) {
   return <JsonBlock label="工具参数" payload={typeof toolInput === 'string' ? tryParse(toolInput) ?? toolInput : toolInput} defaultOpen />
 }
 
-export function PermissionBubble({ request, onDecision, onAbort }: Props) {
+export function PermissionBubble({ request, onDecision, onAbort, projectLabel }: Props) {
   const questions = extractQuestions(request)
   const elapsed = useElapsed(request.timestampMs)
+  // 一键授权档位（后端 suggestions → 文案）· useMemo：useElapsed 每秒触发重渲染，
+  //   不 memo 会让「未识别形态」的 warn 每秒刷屏。
+  const suggestionOptions = useMemo(
+    () => buildSuggestionOptions(request.suggestions, request.toolName, projectLabel),
+    [request.suggestions, request.toolName, projectLabel],
+  )
   // 无 questions → 保持原 allow/deny 弹窗（+ 中止按钮）
   if (questions.length === 0) {
     return (
@@ -79,6 +94,21 @@ export function PermissionBubble({ request, onDecision, onAbort }: Props) {
         {request.reason && <div className="pb-reason">{request.reason.reason ?? request.reason.detail}</div>}
         <ToolInput toolInput={(request as PermissionRequestItem & { toolInput?: unknown }).toolInput} />
         {request.timestampMs && <div className="pb-waiting">已等待 {elapsed}s</div>}
+        {/* 一键授权档位：suggestions 为空则不渲染（后端没给建议就没有第三档）。
+            每档只回传它自己那条建议 —— 允许/拒绝两档仍走空 updates（不产生任何规则）。 */}
+        {suggestionOptions.length > 0 && (
+          <div className="pb-suggestions">
+            {suggestionOptions.map((opt, i) => (
+              <button
+                key={`${opt.update.type}-${i}`}
+                className="pb-suggestion"
+                onClick={() => onDecision(request.requestId, 'allow', undefined, undefined, [opt.update])}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="pb-actions">
           {onAbort && <button className="pb-abort" onClick={onAbort}>中止</button>}
           <button onClick={() => onDecision(request.requestId, 'deny')}>拒绝</button>
@@ -86,6 +116,11 @@ export function PermissionBubble({ request, onDecision, onAbort }: Props) {
         </div>
       </div>
     )
+  }
+  // AskUser 提问弹窗无「一键授权」语义（答案走 answers/annotations，不是规则）——
+  //   后端若给这条路径带了 suggestions，不静默吞掉，留痕。
+  if (suggestionOptions.length > 0) {
+    console.warn('[perm] AskUser 弹窗收到 suggestions，本路径不支持一键授权档位，已忽略', request.requestId)
   }
   return <AskUserForm request={request} questions={questions} onDecision={onDecision} onAbort={onAbort} />
 }

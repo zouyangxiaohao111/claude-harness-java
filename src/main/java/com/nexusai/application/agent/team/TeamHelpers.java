@@ -190,22 +190,57 @@ public class TeamHelpers {
         }
     }
 
-    /** 删除 team 目录（递归）· 对齐 CC cleanupTeamDirectories：含 config.json + inboxes/。 */
+    /**
+     * 删除 team 目录（递归）· 对齐 CC cleanupTeamDirectories：含 config.json + inboxes/。
+     *
+     * <p>[P0-7 · D6] 删除经 {@link #deleteRecursivelyQuietly} —— 原实现内层 lambda 抛
+     * {@link UncheckedIOException} 而外层只 catch {@code IOException}（穿网），REST 侧变 500、
+     * 模型工具报错。CC teamHelpers.ts:661-669 从不外抛。
+     */
     public void deleteTeam(String teamName) {
-        Path dir = teamDir(teamName);
-        if (!Files.isDirectory(dir)) {
+        deleteRecursivelyQuietly(teamDir(teamName), "team 目录");
+    }
+
+    /**
+     * 递归静默清理目录 · 对齐 CC cleanupTeamDirectories（teamHelpers.ts:661-669 / 673-681）：
+     * 单项失败跳过并记日志、<b>绝不外抛</b>（对齐 CC 的 try/catch 全捕获 + logForDebugging）。
+     *
+     * <p>实现要点（P0-7 原方案的 5 处缺陷，全部规避）：
+     * <ul>
+     *   <li>{@code Files.walk} 先物化再在流外 for 删除 —— 流内的失败被包成 {@code UncheckedIOException}
+     *       会穿过外层 {@code catch (IOException)}；本仓既有惯用法见 {@code AttachmentStoreBase:239-245}。</li>
+     *   <li>{@code deleteIfExists} 对应 CC {@code rm force:true}（枚举后、删除前条目被并发删掉时不误计失败）。</li>
+     *   <li>成功日志门控 {@code failed == 0}（规则十二：跳过了却宣称「已清理」= 比 CC 还差）。</li>
+     * </ul>
+     *
+     * @param dir  目标目录；null / 非目录 ⇒ no-op
+     * @param what 仅用于日志的目录类别名（"team 目录" / "任务目录"）
+     */
+    private void deleteRecursivelyQuietly(Path dir, String what) {
+        if (dir == null || !Files.isDirectory(dir)) {
             return;
         }
+        List<Path> sorted;
         try (Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
-                try {
-                    Files.delete(p);
-                } catch (IOException e) {
-                    throw new UncheckedIOException("删除 team 目录项失败: " + p, e);
-                }
-            });
-        } catch (IOException e) {
-            throw new UncheckedIOException("删除 team 目录失败: " + dir, e);
+            sorted = walk.sorted(Comparator.reverseOrder()).toList();
+        } catch (IOException | UncheckedIOException e) {
+            log.warn("[TeamHelpers] 遍历{} {} 失败(放弃本次清理): {}", what, dir, e.toString());
+            return;
+        }
+        int failed = 0;
+        for (Path p : sorted) {
+            try {
+                Files.deleteIfExists(p);
+            } catch (IOException e) {
+                failed++;
+                log.warn("[TeamHelpers] 删除{}项失败(跳过) {}: {}", what, p, e.toString());
+            }
+        }
+        if (failed == 0) {
+            log.info("[TeamHelpers] 已清理{}: {}", what, dir);
+        } else {
+            // 不重试 —— 对齐 CC teamHelpers.ts:667/679（失败即放弃，rm 的 force 语义）。
+            log.warn("[TeamHelpers] 清理{} {} 结束：{} 项未删除（残留，不重试）", what, dir, failed);
         }
     }
 
@@ -838,6 +873,10 @@ public class TeamHelpers {
                 log.warn("[TeamHelpers] cleanupSessionTeams 清理 team {} 失败: {}", name, e.getMessage());
             }
         }
+        // [P0-2 · B1] 与 TeamDeleteTool 对称：会话删除路径同样要解除本会话的 leader→team 绑定
+        //   （taskListId 解析优先级 4 的键），否则会话已删而 leaderTeamNames 仍留着该会话的键
+        //   （JVM 级 static map，无其它清零点）。sessionId 非空已在方法入口校验。
+        com.nexusai.application.agent.tasks.TaskService.clearLeaderTeamName(sessionId);
     }
 
     /**
@@ -854,19 +893,13 @@ public class TeamHelpers {
         //   + getTasksDir(sanitizedName)（:673）；旧 sanitizePathComponent 不转小写断链。
         Path tasksDir = com.nexusai.application.agent.tasks.TaskSystemConfig.getClaudeConfigHomeDir()
             .resolve("tasks").resolve(sanitizeName(teamName));
-        if (Files.isDirectory(tasksDir)) {
-            try (Stream<Path> walk = Files.walk(tasksDir)) {
-                walk.sorted(Comparator.reverseOrder()).forEach(p -> {
-                    try {
-                        Files.delete(p);
-                    } catch (IOException e) {
-                        throw new UncheckedIOException("删除任务目录项失败: " + p, e);
-                    }
-                });
-                log.info("[TeamHelpers] 已清理任务目录: {}", tasksDir);
-            } catch (IOException e) {
-                log.warn("[TeamHelpers] 清理任务目录 {} 失败: {}", tasksDir, e.getMessage());
-            }
+        // [P0-7 · D6] 与 deleteTeam 走**同一个** helper（"删一处、两处行为同时变"）。
+        boolean existed = Files.isDirectory(tasksDir);
+        deleteRecursivelyQuietly(tasksDir, "任务目录");
+        // 对齐 CC teamHelpers.ts:677：**只在目录确实被清掉之后**通知任务已更新（失败残留时通知
+        // 会让前端面板刷新出一个已经不存在的列表）。
+        if (existed && !Files.exists(tasksDir)) {
+            com.nexusai.application.agent.tasks.TaskService.notifyTasksUpdated();
         }
     }
 

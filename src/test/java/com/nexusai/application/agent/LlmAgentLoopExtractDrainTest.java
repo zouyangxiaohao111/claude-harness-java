@@ -4,6 +4,7 @@ import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.memory.ExtractMemoriesAgent;
 import com.nexusai.application.agent.memory.MemoryStorage;
+import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
@@ -80,6 +81,24 @@ class LlmAgentLoopExtractDrainTest {
     }
 
     /**
+     * 反射注入 hookRegistry 字段（{@code @Autowired(required=false)}，单测手动接线）。
+     *
+     * <p>WHY: 阶段 4（extract/dream）整块挂在 {@code ctx.hookRegistry() != null} 之下
+     * （{@code LlmAgentLoop:8568} if 条件）—— 它是 Stop hook 流水线的承载者，extract 触发在
+     * hook 执行**之前**（对齐 CC stopHooks.ts:149）。无 hookRegistry ⇒ 整块跳过 ⇒ 本测试
+     * 结构性不可达（探针实测 hookRegistry=null）。与同类既有范式一致：
+     * {@code LlmAgentLoopHookMessageInjectionTest:51-56} / {@code LlmAgentLoopPlainHookMessageCcAlignTest:74}。
+     *
+     * <p>选测试面反射（不改生产面）：LlmAgentLoop 是 {@code @Component @Scope("prototype")}，
+     * 但注入点仅本测试构造的实例，零生产 API 面、零行为语义变更、零跨会话串值风险。
+     */
+    private static void setHookRegistry(LlmAgentLoop loop, HookRegistry registry) throws Exception {
+        java.lang.reflect.Field f = LlmAgentLoop.class.getDeclaredField("hookRegistry");
+        f.setAccessible(true);
+        f.set(loop, registry);
+    }
+
+    /**
      * 驱动真实 loop 单轮（主 provider 纯文本 stop）· s09 触发提取（env 门全开 +
      * setExtractMemoriesAgent 注入阻塞 fork）。loop.run() 在独立线程执行，join(5s) 断言
      * 每轮退出不阻塞（旧 drain 代码下 join 超时）。
@@ -115,6 +134,18 @@ class LlmAgentLoopExtractDrainTest {
 
         LlmAgentLoop loop = new LlmAgentLoop(factory, null, registry);
         loop.setExtractMemoriesAgent(agent);
+        // 阶段 4（extract）挂在 ctx.hookRegistry() != null 之下（LlmAgentLoop:8568）——
+        //   不注入 ⇒ 整块跳过 ⇒ 本契约测试结构性不可达。空 registry = 无 hook 执行，不影响
+        //   提取触发（extract 在 hook 执行前 fire-and-forget）。
+        setHookRegistry(loop, new HookRegistry());
+        // 会话项目根：阶段 4 在 LlmAgentLoop:8691 读 ctx.sessionState().workspaceDir() → 经
+        //   AutoMemPaths.getAutoMemPath 派生 memoryDir；null ⇒ memoryDir 无有效项目 ⇒ agent
+        //   ExtractMemoriesAgent:608 显式跳过（实测 warn: memBase=null）⇒ 提取永不启动。
+        //   非 Spring 测试 ctx 走 buildMainLoopContext() → workspaceDir 取本实例字段（初值 null）；
+        //   运行时 resolveSessionProjectRoot 唯一链未接线（无 DB resolver）⇒ 保持无项目、不覆盖
+        //   ⇒ 需在 run() 前用既有测试钩子显式注入（LlmAgentLoop:11670 setWorkspaceDir）。
+        Path sessionProjectRoot = java.nio.file.Files.createDirectories(memDir.resolve("proj-root"));
+        loop.setWorkspaceDir(sessionProjectRoot);
 
         // agentId=null = 主线程会话（ChatService:207-210 同款）；s09 门控 state.agentId()==null
         RunRequest request = RunRequest.session("hello", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null,

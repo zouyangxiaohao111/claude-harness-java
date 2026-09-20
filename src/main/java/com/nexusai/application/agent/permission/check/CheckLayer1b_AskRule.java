@@ -53,6 +53,12 @@ import java.util.List;
  * <p>本层生成的 suggestions 是 {@link PermissionUpdate.AddRules} 类型的列表，
  * 把当前工具的 whole-tool ask 转 whole-tool allow，写到 {@code USER_SETTINGS}
  * destination——用户点击"Allow forever"就执行此 update。
+ *
+ * <p><b>[批 A4d · P2 甲-2] 工具守卫</b>：CC 里 Bash 与 PowerShell 弹窗的
+ * always-allow 档要求 {@code suggestions} 非空，而 CC 1b ask 命中返回体本就不带
+ * suggestions（{@code permissions.ts:1216-1225}）⇒ 本层对
+ * {@link ToolNameConstants#ALWAYS_ALLOW_REQUIRES_SUGGESTIONS} 里的工具<b>不产</b>
+ * suggestions（前端不渲染第三档），其余工具照旧产。逐字 CC file:line 见该常量 Javadoc。
  */
 public class CheckLayer1b_AskRule implements CheckLayer {
 
@@ -102,7 +108,9 @@ public class CheckLayer1b_AskRule implements CheckLayer {
      * @param input    已解析的 JSON 输入（1b 只需要传给 shouldUseSandbox 判断）
      * @param ctx      工具调用上下文（1b 不需要）
      * @param permCtx  权限上下文
-     * @return         AskDecision（含 suggestions）、null（未命中或 Bash sandbox fall-through）
+     * @return         AskDecision（含 suggestions；工具在
+     *                 {@link ToolNameConstants#ALWAYS_ALLOW_REQUIRES_SUGGESTIONS} 里时
+     *                 suggestions 为空列表）、null（未命中或 Bash sandbox fall-through）
      */
     @Override
     public PermissionResult check(
@@ -137,17 +145,43 @@ public class CheckLayer1b_AskRule implements CheckLayer {
         }
         // 3. 构造 suggestions：把当前 tool 的 whole-tool ask 转 whole-tool allow
         //    写到 USER_SETTINGS destination —— 用户点击"Always allow"按钮即生效
-        List<PermissionUpdate> suggestions = List.of(
-            new PermissionUpdate.AddRules(
-                PermissionUpdate.Destination.USER_SETTINGS,
-                List.of(new PermissionRule(
-                    askRule.source(),
-                    com.nexusai.application.agent.permission.PermissionBehavior.ALLOW,
-                    com.nexusai.application.agent.permission.PermissionRuleValue.wholeTool(tool.name())
-                )),
-                com.nexusai.application.agent.permission.PermissionBehavior.ALLOW
-            )
-        );
+        //
+        //    [批 A4d · P2 甲-2] 「始终允许」档位的**工具守卫** —— 严格对齐 CC：
+        //      CC 1b whole-tool ask 命中返回体（permissions.ts:1216-1225）**不带**
+        //      suggestions；而各弹窗的 always-allow 档分两类：
+        //        · Bash / PowerShell 的该档条件就是 `suggestions.length > 0`
+        //          （bashToolUseOptions.tsx:105 / powershellToolUseOptions.tsx:52，
+        //           后者与 Bash 同构）⇒ suggestions 空 ⇒ 该档不出现
+        //          ⇒ 本层对这二者**不产** suggestions，前端因此不渲染第三档。
+        //        · 其余工具（Fallback / 文件类 / Skill / WebFetch / Monitor…）该档只受
+        //          shouldShowAlwaysAllowOptions() 门控，与 suggestions 无关
+        //          ⇒ 本层**照旧产**（保持 A1/A3 行为）。
+        //    集合定义与逐字 CC file:line 见
+        //      ToolNameConstants.ALWAYS_ALLOW_REQUIRES_SUGGESTIONS。
+        //    工具身份用 RuleQuery.getToolNameForPermissionCheck（与上面的
+        //      getAskRuleForTool → toolMatchesRule 同一身份函数），避免「规则按 A 名命中、
+        //      守卫按 B 名判断」的轴向漂移。
+        String nameForRuleMatch = RuleQuery.getToolNameForPermissionCheck(tool);
+        List<PermissionUpdate> suggestions;
+        if (ToolNameConstants.ALWAYS_ALLOW_REQUIRES_SUGGESTIONS.contains(nameForRuleMatch)) {
+            // 刻意不产（对齐 CC，非异常）⇒ 按项目「不许静默失效」红线留痕（≥WARN，禁只 DEBUG）
+            log.warn("1b ask 规则命中：工具 {} 的「始终允许」档在 CC 里依赖 suggestions 非空 "
+                    + "（bashToolUseOptions.tsx:105 / powershellToolUseOptions.tsx:52）⇒ 不产 suggestions",
+                nameForRuleMatch);
+            suggestions = List.of();
+        } else {
+            suggestions = List.of(
+                new PermissionUpdate.AddRules(
+                    PermissionUpdate.Destination.USER_SETTINGS,
+                    List.of(new PermissionRule(
+                        askRule.source(),
+                        com.nexusai.application.agent.permission.PermissionBehavior.ALLOW,
+                        com.nexusai.application.agent.permission.PermissionRuleValue.wholeTool(tool.name())
+                    )),
+                    com.nexusai.application.agent.permission.PermissionBehavior.ALLOW
+                )
+            );
+        }
         // 4. 命中 → 返回 AskDecision（对齐 CC permissions.ts:1196-1203）
         if (log.isDebugEnabled()) {
             log.debug("1b ask 规则命中 → Ask 分发 (tool={} rule={})",

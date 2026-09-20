@@ -3,12 +3,14 @@ package com.nexusai.application.agent.tool.impl;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.team.TeammateMailbox;
 import com.nexusai.application.agent.tasks.Task;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -22,6 +24,7 @@ import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -59,6 +62,9 @@ class TaskUpdateToolMailboxNotifyTest {
         // configHome 指向临时目录：{configHome}/teams/tl-1/inboxes/{owner}.json
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
         System.setProperty("nexusai.experimental.agent-teams", "true");
+        // [P0-3 · B5] 这两条 sysprop 在 main 侧**零写入点**（仅测试写）。此处**故意设着**：
+        //   用例的断言值（"teammateLead"/"green"/缺省）与它们（"leadAgent"/"blue"）不同，
+        //   若实现回退去读 sysprop，断言即红 —— 它们是「已不再读进程级身份」的反证。
         System.setProperty("nexusai.agent.name", "leadAgent");
         System.setProperty("nexusai.agent.color", "blue");
     }
@@ -92,14 +98,37 @@ class TaskUpdateToolMailboxNotifyTest {
             Task.TaskStatus.PENDING, List.of(), List.of(), Map.of());
     }
 
+    /**
+     * [P0-3 · B5] 本用例的 teammate 身份 —— 取值**故意与 setUp 的 sysprop 不同**
+     * （sysprop 是 "leadAgent"/"blue"，这里是 "teammateLead"/"green"）。
+     * WHY：身份来源必须是显式 {@code ctx.teammateIdentity()}。若断言里出现 "teammateLead"/"green"，
+     * 就证明**没有**再读进程级 sysprop（sysprop 恒被 setUp 设着 ⇒ 旧实现必然给出 "leadAgent"/"blue"）。
+     */
+    private static final TeammateIdentity TEAMMATE_IDENTITY = new TeammateIdentity(
+        "teammateLead@tl-1", "teammateLead", "tl-1", "green", false, "sess-lead");
+
+    /** 只带会话 + teammate 身份的 TUC（TUC 的 compact ctor 强校验 sessionId 非 null）。 */
+    private static ToolUseContext tuc(TeammateIdentity identity) {
+        return ToolUseContext.of(UUID.randomUUID(), "sess-lead").withTeammateIdentity(identity);
+    }
+
     private ToolResult<String> runUpdate(String owner) {
+        return runUpdate(owner, TEAMMATE_IDENTITY);
+    }
+
+    /** ctx 无 teammate 身份（identity==null ⇒ 传 ctx=null）· 用于回落 'team-lead' 的对照。 */
+    private ToolResult<String> runUpdateNoIdentity(String owner) {
+        return runUpdate(owner, null);
+    }
+
+    private ToolResult<String> runUpdate(String owner, TeammateIdentity identity) {
         TaskService taskService = mock(TaskService.class);
         when(taskService.getTask("tl-1", "t-1")).thenReturn(Optional.of(baseTask()));
         when(taskService.updateTask(eq("tl-1"), eq("t-1"), any())).thenReturn(Optional.of(taskWithOwner(owner)));
         TaskUpdateTool tool = new TaskUpdateTool(taskService, null);
         ToolUseBlock call = new ToolUseBlock("call-1", "TaskUpdate",
             json.createObjectNode().put("taskId", "t-1").put("owner", owner));
-        return tool.execute(call);
+        return tool.execute(call, identity != null ? tuc(identity) : null);
     }
 
     @Test
@@ -115,10 +144,12 @@ class TaskUpdateToolMailboxNotifyTest {
         JsonNode messages = readInbox("teammateB");
         assertThat(messages).hasSize(1);
         JsonNode msg = messages.get(0);
-        assertThat(msg.get("from").asText()).isEqualTo("leadAgent"); // getAgentName()
+        // [P0-3 · B5] from/color 取自**显式身份**（"teammateLead"/"green"），不是 setUp 里设的
+        //   sysprop "leadAgent"/"blue" —— 断言值不同即证明未再读进程级 sysprop。
+        assertThat(msg.get("from").asText()).isEqualTo("teammateLead"); // ctx.teammateIdentity().agentName()
         assertThat(msg.get("read").asBoolean()).isFalse();           // writeToMailbox 强制 read:false
         assertThat(msg.get("timestamp").asText()).isNotEmpty();
-        assertThat(msg.get("color").asText()).isEqualTo("blue");     // getTeammateColor()
+        assertThat(msg.get("color").asText()).isEqualTo("green");    // Teammate.getTeammateColor(identity)
         assertThat(msg.get("summary")).isNull();                     // 缺省省略键（undefined → 省略）
 
         // text = task_assignment JSON（teammateMailbox.ts:953-960 + TaskUpdateTool.ts:280-287）
@@ -127,7 +158,7 @@ class TaskUpdateToolMailboxNotifyTest {
         assertThat(assignment.get("taskId").asText()).isEqualTo("t-1");
         assertThat(assignment.get("subject").asText()).isEqualTo("subject");       // existingTask.subject（更新前值）
         assertThat(assignment.get("description").asText()).isEqualTo("desc");      // existingTask.description
-        assertThat(assignment.get("assignedBy").asText()).isEqualTo("leadAgent");
+        assertThat(assignment.get("assignedBy").asText()).isEqualTo("teammateLead");
         assertThat(assignment.get("timestamp").asText()).isNotEmpty();
         // 两端 timestamp 均为 ISO-8601（CC new Date().toISOString()）
         assertThatCode(() -> Instant.parse(assignment.get("timestamp").asText()))
@@ -158,31 +189,35 @@ class TaskUpdateToolMailboxNotifyTest {
     }
 
     @Test
-    @DisplayName("auto-set owner（in_progress + swarms + 无 owner）→ 写 inbox，from/assignedBy = agent 名（CC:188-198 + :278）")
+    @DisplayName("auto-set owner（in_progress + swarms + 无 owner）→ 挂**显式身份**名 + 写 inbox（CC:188-198 + :278）")
     void autoSetOwner_inProgress_writesInbox() throws Exception {
+        // WHY（规则九 + P0-3 · B5）：自动挂名与 mailbox sender 在 CC 是**同一个** getAgentName()
+        //   （:188-198 自动挂名 / :278 senderName，同读 teammate context）⇒ 本仓两处都必须取
+        //   ctx.teammateIdentity()。owner 落 "teammateLead"（身份名）而不是 sysprop 的 "leadAgent"。
         TaskService taskService = mock(TaskService.class);
         when(taskService.getTask("tl-1", "t-1")).thenReturn(Optional.of(baseTask()));
         when(taskService.updateTask(eq("tl-1"), eq("t-1"), any()))
-            .thenReturn(Optional.of(taskWithOwner("leadAgent")));
+            .thenReturn(Optional.of(taskWithOwner("teammateLead")));
         TaskUpdateTool tool = new TaskUpdateTool(taskService, null);
         ToolUseBlock call = new ToolUseBlock("call-1", "TaskUpdate",
             json.createObjectNode().put("taskId", "t-1").put("status", "in_progress"));
 
-        ToolResult<String> result = tool.execute(call);
+        ToolResult<String> result = tool.execute(call, tuc(TEAMMATE_IDENTITY));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode messages = readInbox("leadAgent");
+        JsonNode messages = readInbox("teammateLead");
         assertThat(messages).hasSize(1);
-        assertThat(messages.get(0).get("from").asText()).isEqualTo("leadAgent");
+        assertThat(messages.get(0).get("from").asText()).isEqualTo("teammateLead");
         JsonNode assignment = json.readTree(messages.get(0).get("text").asText());
-        assertThat(assignment.get("assignedBy").asText()).isEqualTo("leadAgent");
+        assertThat(assignment.get("assignedBy").asText()).isEqualTo("teammateLead");
     }
 
     @Test
-    @DisplayName("无 agent 名 → from/assignedBy 回退 'team-lead'（CC:278 getAgentName() || 'team-lead'）")
-    void noAgentName_fallsBackToTeamLead() throws Exception {
-        System.clearProperty("nexusai.agent.name");
-        ToolResult<String> result = runUpdate("teammateB");
+    @DisplayName("ctx 无 teammate 身份 → from/assignedBy 回退 'team-lead'（CC:278 getAgentName() || 'team-lead'）")
+    void noTeammateIdentity_fallsBackToTeamLead() throws Exception {
+        // ⭐ 反证：`nexusai.agent.name` 仍被 setUp 设为 "leadAgent"，结果**仍是** "team-lead"
+        //   ⇒ 证明来源已不是进程级 sysprop（旧实现在这里会给出 "leadAgent"）。
+        ToolResult<String> result = runUpdateNoIdentity("teammateB");
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         JsonNode messages = readInbox("teammateB");
@@ -193,10 +228,13 @@ class TaskUpdateToolMailboxNotifyTest {
     }
 
     @Test
-    @DisplayName("无 agent 颜色 → 信封省略 color 键（CC undefined → JSON.stringify 省略）")
+    @DisplayName("身份 color 为 null → 信封省略 color 键（CC undefined → JSON.stringify 省略）")
     void noColor_omitsColorKey() throws Exception {
-        System.clearProperty("nexusai.agent.color");
-        ToolResult<String> result = runUpdate("teammateB");
+        // ⭐ 反证：`nexusai.agent.color` 仍被 setUp 设为 "blue"，color 键**仍然缺席**
+        //   ⇒ 证明来源已不是进程级 sysprop。
+        TeammateIdentity noColor = new TeammateIdentity(
+            "teammateLead@tl-1", "teammateLead", "tl-1", null, false, "sess-lead");
+        ToolResult<String> result = runUpdate("teammateB", noColor);
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         JsonNode messages = readInbox("teammateB");

@@ -39,9 +39,11 @@ import static org.mockito.Mockito.when;
  * <b>绕过 :1547</b> → 恢复轮不 drain 排队命令。Java 旧实现用 needsFollowUp 门控循环顶 drain，恢复路径
  * markNeedsFollowUp → 恢复轮仍 drain（偏差）。OD-D2 改看 prevIterationRanTools（仅真工具轮置位）。
  *
- * <p><b>可观测口径（drain 注入晚一拍）</b>: 循环顶 drain（:4574）位于 messagesForQuery 快照（:4483）
- * <b>之后</b> → 被 drain 的 busy-queued 只进 state.messages，<b>不进本轮</b>模型请求（下一轮才可见）。
- * 因此本测试断言<b>每次模型调用时队列的 size</b>：
+ * <p><b>可观测口径（队列 size 即时点）</b>: 本测试只看<b>每次模型调用时队列的 size</b>（不看请求内容），
+ * 故与「drain 相对快照的位置」解耦。⚠️ [C3 2026-09-19] 循环顶 drain 已上移至 messagesForQuery 快照
+ * <b>之前</b>（对齐 CC：快照在 drain 之后组装 ⇒ 产物进【本轮】请求）；改前位于快照之后（只进
+ * state、下一轮才可见）。本条位置变更不改变本测试的任一断言（drain 触发时点/次数不变）。
+ * 断言：
  * <ul>
  *   <li><b>call1（恢复 continue 后的下一模型调用）</b>：OD-D2 下恢复轮不 drain → busy-queued <b>仍在队列</b>
  *       （queue.size()==1）。旧实现（看 needsFollowUp）恢复轮已 drain → 队列空 → 断言变红。</li>

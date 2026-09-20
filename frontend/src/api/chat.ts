@@ -1,5 +1,5 @@
 import { api, BASE_URL } from './rest'
-import type { ChatMessageDto, MessageCreatedResponse, PartialCompactRequest, PartialCompactResponse, SendMessageRequest } from './types'
+import type { ChatMessageDto, MessageCreatedResponse, PartialCompactRequest, PartialCompactResponse, QueuePopResponse, SendMessageRequest } from './types'
 
 export const chatApi = {
   listMessages: (sessionId: string) =>
@@ -23,13 +23,22 @@ export const chatApi = {
     api<PartialCompactResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages/after/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
   cancel: (sessionId: string) =>
     api<void>(`/sessions/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' }),
+  /** [C6] 会话服务端运行态（GET /sessions/{id}/running → {running}）—— 停止键可见性的权威源。
+   *  **非轮询**：只在【载入 / 切会话 / 重连】各查一次，用于重建「本页未发送 / 后台 drain 起的 run」；
+   *  运行中的实时翻转走 session.status 事件（thinking/streaming → 运行中，idle → 空闲）。
+   *  响应只有一个布尔（后端契约：不含敏感信息）。 */
+  sessionRunning: (sessionId: string) =>
+    api<{ running: boolean }>(`/sessions/${encodeURIComponent(sessionId)}/running`),
   background: (sessionId: string, req?: SendMessageRequest) =>
     api<{ taskId: string }>(`/sessions/${encodeURIComponent(sessionId)}/background`, { method: 'POST', body: req ?? undefined }),
   partialCompact: (sessionId: string, req: PartialCompactRequest) =>
     api<PartialCompactResponse>(`/sessions/${encodeURIComponent(sessionId)}/partial-compact`, { method: 'POST', body: req }),
-  // F19/#3 排队命令：弹出可编辑的排队命令（后端 B4 未接，先封装；调用失败优雅降级）
-  popEditableQueuedCommand: (sessionId: string) =>
-    api<{ content: string; mode?: string } | null>(`/sessions/${encodeURIComponent(sessionId)}/queue/pop`, { method: 'POST' }),
+  /** F19/#3 排队命令：弹出全部【可编辑】的排队命令（批 A5 · 对齐 CC PopAllEditableResult）。
+   *  `currentInput` = 输入框当前草稿（CC `popAllEditable(currentInput, ...)` 的实参，参与 `\n` join）——
+   *  ⛔ 不可省：后端用它把草稿接在排队项后面，省掉=按 Esc 静默清掉用户草稿。 */
+  popEditableQueuedCommand: (sessionId: string, currentInput?: string) =>
+    api<QueuePopResponse>(`/sessions/${encodeURIComponent(sessionId)}/queue/pop`,
+      { method: 'POST', body: { currentInput: currentInput ?? '' } }),
   /** 重拉后按 imagePasteIds 批量拉图（后端 POST /attachments/image/batch/{sessionId} · body {ids} · miss 缺席） */
   fetchImagesBatch: (sessionId: string, ids: string[]) =>
     api<Record<string, { mediaType: string; base64: string }>>(`/attachments/image/batch/${encodeURIComponent(sessionId)}`, { method: 'POST', body: { ids } }),

@@ -84,6 +84,26 @@ public class LocalSettingsLoader implements PermissionSourceLoader {
     private final Supplier<String> projectRootSupplier;
 
     /**
+     * [批 A4c P4] gitignore 守护（写盘成功后把 {@code .nexusai/settings.local.json} 加入忽略列表）。
+     *
+     * <p>{@code @Autowired(required = false)} <b>字段注入</b>（不走构造器）—— 本类有两个 public
+     * 构造器，构造器注入正是批 A4b 那条「Spring 回落无参构造器 ⇒ loaders 恒空」缺陷的现场；
+     * 字段注入与构造器选择无关，天然免疫该坑。
+     *
+     * <p>为 {@code null}（POJO 测试路径 / 注入缺失）⇒ 写盘后记 <b>WARN</b> 跳过（不静默）。
+     */
+    private LocalSettingsGitignore gitignoreGuard;
+
+    /**
+     * 注入 gitignore 守护 · 生产由 Spring 注入；POJO 测试可注入桩/置 null 验证
+     * ①写盘成功后确实调用 ②调用传入的项目根正确。
+     */
+    @Autowired(required = false)
+    public void setGitignoreGuard(LocalSettingsGitignore gitignoreGuard) {
+        this.gitignoreGuard = gitignoreGuard;
+    }
+
+    /**
      * Spring 生产构造器 · 无会话腿项目根接线 {@code CwdResolution.getOriginalCwdLayer(null)}
      * （语义 = D6 项目根的无会话出口；真会话腿在调用期按 sessionId 现算）。
      * {@code nexusai.home} 已废弃，不再经 {@code @Value} 注入。
@@ -178,7 +198,7 @@ public class LocalSettingsLoader implements PermissionSourceLoader {
         }
         Path targetFile = resolvePath(sessionId);
         String json = parser.mergeWritePermissions(targetFile, field, values);
-        atomicWrite(targetFile, json);
+        atomicWrite(targetFile, json, sessionId);
         if (log.isDebugEnabled()) {
             log.debug("LocalSettingsLoader: savePermissionsField {} 桶 {} 条 -> {}", field, values.size(), targetFile);
         }
@@ -191,7 +211,7 @@ public class LocalSettingsLoader implements PermissionSourceLoader {
     public void savePermissionsValue(String field, String value, String sessionId) {
         Path targetFile = resolvePath(sessionId);
         String json = parser.mergeWritePermissionsValue(targetFile, field, value);
-        atomicWrite(targetFile, json);
+        atomicWrite(targetFile, json, sessionId);
         if (log.isDebugEnabled()) {
             log.debug("LocalSettingsLoader: savePermissionsValue {} = {} -> {}", field, value, targetFile);
         }
@@ -199,8 +219,17 @@ public class LocalSettingsLoader implements PermissionSourceLoader {
 
     /**
      * 原子写盘：写临时文件 → ATOMIC_MOVE 替换目标文件。
+     *
+     * <p>[批 A4c P4] 写成功后补一步 <b>gitignore 守护</b>（对齐 CC
+     * {@code settings.ts:508-514} —— {@code source === 'localSettings'} 时调
+     * {@code addFileGlobRuleToGitignore}）。⛔ 该步<b>不阻断写盘</b>：守护内部自吞异常（≥WARN），
+     * 写盘的成败判定完全不受影响 —— 与 CC 的 {@code void addFileGlobRuleToGitignore(...)} 同语义。
+     *
+     * @param targetFile 目标文件（{@code <projectRoot>/<projectDirName>/settings.local.json}）
+     * @param json       完整文件内容
+     * @param sessionId  会话 id（解析项目根用；与读侧同值 ⇒ 读写同址）
      */
-    private void atomicWrite(Path targetFile, String json) {
+    private void atomicWrite(Path targetFile, String json, String sessionId) {
         Path dir = targetFile.getParent();
         Path tempFile = dir.resolve(FILE_NAME + ".tmp");
         try {
@@ -212,6 +241,28 @@ public class LocalSettingsLoader implements PermissionSourceLoader {
             try { Files.deleteIfExists(tempFile); } catch (IOException ignored) {}
             throw new RuntimeException("Failed to save settings: " + targetFile, e);
         }
+        ensureGitignored(sessionId);
+    }
+
+    /**
+     * [批 A4c P4] 写盘成功后确保 {@code <项目>/.nexusai/settings.local.json} 被 git 忽略。
+     *
+     * <p><b>WHY</b>：{@code local} 的语义是「个人、不共享」（见类 javadoc），但该文件此前
+     * <b>完全不在 .gitignore 覆盖范围内</b>（实测 {@code git check-ignore -v
+     * .nexusai/settings.local.json} 无匹配）⇒ 会被提交、规则变团队共享。CC 在同一个时机做同样的
+     * 事（{@code settings.ts:508-514}），落点是全局 ignore（{@code ~/.config/git/ignore}，
+     * 见 {@link LocalSettingsGitignore}）。
+     *
+     * <p>未接线（POJO 测试构造路径 / Spring 注入缺失）⇒ <b>WARN</b>（禁只 DEBUG ——
+     * 本仓「不许静默失效」铁律；静默正是这类缺陷能躲过三个批次的原因）。
+     */
+    private void ensureGitignored(String sessionId) {
+        if (gitignoreGuard == null) {
+            log.warn("LocalSettingsLoader: gitignore 守护未接线 ⇒ {} 不会被自动加入忽略列表，"
+                + "该文件可能被误提交（sessionId={}）", FILE_NAME, sessionId);
+            return;
+        }
+        gitignoreGuard.ensureIgnored(resolveProjectRoot(sessionId), NexusaiPaths.getProjectDirName());
     }
 
     /**

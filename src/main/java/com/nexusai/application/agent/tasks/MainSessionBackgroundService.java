@@ -7,7 +7,10 @@ import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.AgentTranscript;
 import com.nexusai.application.agent.tool.SessionStorage;
+import com.nexusai.common.SessionKeys;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.repository.session.entity.SessionRecord;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import jakarta.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -93,6 +96,20 @@ public class MainSessionBackgroundService {
      */
     @Autowired(required = false)
     private ChatService chatService;
+    /**
+     * [批 A4e · R2] 会话行读取（本入口的<b>会话选定权限模式</b>来源）。
+     *
+     * <p><b>WHY</b>：批 A4b 修掉了 {@code CronIdleExecutor} 队列 drain 轮的同类缺陷（该轮曾走
+     * {@code RunRequest} 的「硬编码 permissionModeCli=null」便捷重载 ⇒ 回落全局
+     * {@code settings.permission_mode}，本机实测 = {@code bypassPermissions} ⇒ 整轮静默绕过权限检查），
+     * 但把本入口登记为残留 R2。本批一并修：主会话后台化派生查询跑的是<b>同一个会话</b>
+     * （对齐 CC {@code LocalMainSessionTask} 沿用同一 appState/权限上下文），丢会话模式即行为分叉。
+     *
+     * <p>{@code required=false}：非 Spring 单测 / 裁剪环境注入不到 → 走「取不到」分支
+     * （≥WARN 留痕，不阻断 run）。
+     */
+    @Autowired(required = false)
+    private SessionMapper sessionMapper;
     /** [IMP2-10 · MISS-2 · OD-13] taskBudget 配置源（tokens；0 = 未配置 → 回落 RunRequest.DEFAULT_TASK_BUDGET_TOTAL） */
     @Value("${nexusai.agent.task-budget.total:0}")
     private int taskBudgetTotalConfigured = 0;
@@ -403,8 +420,15 @@ public class MainSessionBackgroundService {
             //   ⛔ 任何消费点都不许 new SubagentContext(...) 重建）：
             //   经 RunRequest.withAgentContext(...) 显式下传 → buildBaseToolUseContext 形参 →
             //   base TUC.withAgentContext(...) → loop() / provider 侧单一来源。
-            AgentState runState = loop.run(RunRequest.session(userPrompt, sessionUuid, agentUuid, cfg, modelName,
-                null, null, null, taskBudget).withAgentContext(agentContext));
+            // [批 A4e · R2] 会话选定权限模式显式装配（原走 session(...) 便捷重载 ⇒ permissionModeCli
+            //   硬编码 null ⇒ 回落全局 settings.permission_mode（本机实测可 = bypassPermissions）
+            //   ⇒ 后台派生查询静默绕过会话权限。与 CronIdleExecutor 同源：
+            //   ChatService.resolveEffectivePermissionMode(session, null)（本入口无 per-call 来源）。
+            //   取不到会话 ⇒ 本方法内 ≥WARN 留痕（⛔ 不许静默回落全局）。
+            String effectivePermissionMode = resolveSessionPermissionMode(sessionUuid);
+            AgentState runState = loop.run(RunRequest.sessionFromSessionOverride(
+                userPrompt, sessionUuid, agentUuid, cfg, modelName,
+                null, effectivePermissionMode, false, taskBudget, null).withAgentContext(agentContext));
 
             // run 收口：解除监听（防 PersistCtx/sessionId 泄漏到下轮 / 下个 task 复用本 loop 实例）
             if (runState != null) {
@@ -431,6 +455,63 @@ public class MainSessionBackgroundService {
             // CC :474 completeMainSessionTask(taskId, false)
             completeMainSessionTask(taskId, false);
         }
+    }
+
+    /**
+     * [批 A4e · R2] 主会话后台化派生查询的【会话选定有效权限模式】。
+     *
+     * <p><b>WHY（A4b 同类缺陷 · 残留 R2）</b>：本入口原走 {@code RunRequest.session(...)} 的
+     * 「硬编码 {@code permissionModeCli=null}」便捷重载 ⇒ {@code InitialPermissionModeResolver}
+     * 回落 settings 槽（DB 全局 {@code settings.permission_mode}，本机实测 {@code bypassPermissions}）
+     * ⇒ <b>后台派生查询静默绕过会话权限（含 deny）</b>。后台查询跑的是<b>同一个会话</b>，
+     * 会话选定模式必须带上（对齐 CC {@code LocalMainSessionTask} 沿用同一权限上下文）。
+     *
+     * <p>取值与 {@link com.nexusai.application.chat.ChatService#resolveEffectivePermissionMode}
+     * <b>同一判据点</b>（本入口无 per-call HTTP 请求体来源 ⇒ 传 null）—— 避免「同一能力两套判据」。
+     *
+     * <p><b>拿不到会话时 ≥WARN（⛔ 不得静默回落全局）</b>：① {@code sessionId} 空白；
+     * ② {@code SessionKeys.NO_SESSION} 哨兵（确无会话）；③ 会话行不存在/不可读 或 mapper 未注入。
+     * 三者返回 {@code null}（⇒ resolver 回落 settings 槽）但<b>每次都有 WARN 说明原因</b>。
+     *
+     * <p>会话存在但 {@code sessions.permission_mode} 本就为空 ⇒ 返回 null：这是三态链
+     * （{@code 会话 override ?? 全局 default}）的<b>正常末态</b>，不是静默失效，故只记 INFO。
+     *
+     * @param sessionUuid 本 run 的会话键（可能为 null / NO_SESSION 哨兵）
+     * @return 会话选定模式；不可得 → null（已 WARN 留痕，非静默）
+     */
+    private String resolveSessionPermissionMode(String sessionUuid) {
+        if (sessionUuid == null || sessionUuid.isBlank()) {
+            log.warn("主会话后台化: **拿不到会话**（sessionId 空白）→ 无法取会话选定权限模式，"
+                + "permissionModeCli=null ⇒ 回落全局 settings.permission_mode（本机实测可为 "
+                + "bypassPermissions ⇒ 本轮将绕过全部权限检查）。【≥WARN 显式留痕，非静默】");
+            return null;
+        }
+        if (SessionKeys.isNoSession(sessionUuid)) {
+            log.warn("主会话后台化: **确无会话**（sessionId=NO_SESSION 哨兵）→ 无法取会话选定权限模式 "
+                + "⇒ 回落全局 settings.permission_mode（本机实测可为 bypassPermissions）。"
+                + "【≥WARN 显式留痕，非静默】");
+            return null;
+        }
+        if (sessionMapper == null) {
+            log.warn("主会话后台化: sessionMapper 未注入（非 Spring 单测/裁剪环境）→ 无法取会话选定权限模式 "
+                + "⇒ 回落全局 settings.permission_mode。sessionId={} 【≥WARN 显式留痕，非静默】",
+                sessionUuid);
+            return null;
+        }
+        String originalKey = SessionKeys.originalKey(sessionUuid);
+        SessionRecord session = sessionMapper.selectOneById(
+            originalKey == null ? sessionUuid : originalKey);
+        if (session == null) {
+            log.warn("主会话后台化: 会话行不存在/不可读（sessionId={}，会话已删）→ 无法取会话选定权限模式 "
+                + "⇒ 回落全局 settings.permission_mode。【≥WARN 显式留痕，非静默】", sessionUuid);
+            return null;
+        }
+        String mode = ChatService.resolveEffectivePermissionMode(session, null);
+        log.info("主会话后台化: 权限模式已装配 sessionId={} session.permission_mode={} → "
+            + "permissionModeCli={}（与 ChatService/CronIdleExecutor 同源 resolveEffectivePermissionMode；"
+            + "null ⇒ resolver 回落全局 settings，属三态链正常末态）",
+            sessionUuid, session.getPermissionMode(), mode);
+        return mode;
     }
 
     /**

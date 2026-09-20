@@ -1274,9 +1274,16 @@ public class BackgroundTaskRunner {
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
                 null,
-                // [coordinator-align] agentId 归属：async agent 任务本身即由 subagent 拥有
-                //   （registerAsyncAgent 以 taskId===agentId 登记）→ 被杀通知必须回归属代理。
-                killed.agentId() != null ? killed.agentId().toString() : null,
+                // [H1 修正 · 原 coordinator-align 归属算式已作废] async agent 被杀通知不得携带 agentId。
+                //   WHY：本方法处理的是 LOCAL_AGENT 被杀路径，agentId 即「任务自身」（taskId===agentId）；
+                //   该 agent 的 query loop 已退出（kill 是外部发起：TaskStop / 团队解散 / stopAll），
+                //   没有任何消费者会按该 agentId drain。drainForQuery 主线程规则「cmd.agentId() != null
+                //   ⇒ 跳过」（NotificationQueue.java:729 ← query.ts:1574）⇒ 带 agentId 时通知在主线程
+                //   侧被跳过、子代理侧无人 drain ⇒ 永久滞留（CC killShellTasks.ts:70-75
+                //   「no consumer matches a dead agentId」）。这与 :2091 是同一根因的两条路径。
+                //   ⛔ LOCAL_BASH 的 markKilled 路径（:477）不属本修正 —— 那里的 agentId 是「还活着的
+                //   派活 owner」，且 killShellTasksForAgent 会按它回收孤儿通知。
+                null,
                 null, false, null, false, null, killed.sessionId()));
 
         emitTerminatedSdk(killed);
@@ -2085,10 +2092,18 @@ public class BackgroundTaskRunner {
         notificationQueue.enqueuePendingNotification(
             new NotificationQueue.QueueItem(xml, "task-notification",
                 null,
-                // [coordinator-align] agentId 归属：async agent 终态通知必须回归属子代理
-                //   （taskId===agentId，registerAsyncAgent 登记）——这是 S4-1 残差 ① 的完整闭合：
-                //   仅改 XML 形状为 agent 格式不够，还要让通知真正可达归属代理。
-                finalTask.agentId() != null ? finalTask.agentId().toString() : null,
+                // [H1 修正 · 原 coordinator-align 归属算式已作废] async agent 终态通知不得携带 agentId。
+                //   WHY：该 agent 的 query loop 在本方法（finalizer 入队）之前**已经退出** ——
+                //   SubagentTool.java:3334 execute 阻塞返回后，:3340-3357 才 finalize ⇒ 带 agentId
+                //   会指向一个已死消费者。而 drainForQuery 主线程规则是「cmd.agentId() != null ⇒ 跳过」
+                //   （NotificationQueue.java:729 ← query.ts:1574）⇒ 带 agentId 时主线程不捞、子代理侧
+                //   又已退出不 drain ⇒ 通知永久滞留、任何消费者都取不到（CC killShellTasks.ts:70-75
+                //   自陈「no consumer matches a dead agentId」）。
+                //   CC 真源：LocalAgentTask.tsx:317 enqueueAgentNotification 入队**不带 agentId**；
+                //   query.ts:1863-1872 主线程只捞 agentId===undefined。
+                //   ⛔ 反向参照：LOCAL_BASH（:477/:1279 之外那组）的 task.agentId 是「还活着的派活 owner」，
+                //   语义不同，不属本修正，一律不动（LocalShellTask.tsx:121-137,204 shell 才带 owning agentId）。
+                null,
                 null, false, null, false, null, finalTask.sessionId()));
 
         emitTerminatedSdk(finalTask);

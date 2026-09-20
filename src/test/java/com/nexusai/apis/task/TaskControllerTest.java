@@ -383,4 +383,60 @@ class TaskControllerTest {
         assertThat(runner.getTask(a2.toString()).orElseThrow().isBackgrounded())
             .as("他会话前台任务不受影响").isFalse();
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P0-2 · B1] REST 任务清单与会话领导的任务板**同源**（同一块白板）
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[P0-2 · B1] GET /api/v1/tasks/list?sessionId=队长会话 → taskListId = {team}（与队长 TaskList 同源）")
+    void listTasksMerged_leaderSession_resolvesToTeamBoard() throws Exception {
+        // WHY（规则九）：B1 的验收之一就是「前端面板不能新分叉」——REST 端点走
+        //   TaskController.java:167 `TaskService.getTaskListId(sid, null)`，与队长 TaskList 工具
+        //   路径**同一个解析链**。改动前优先级 4（leaderTeamName）在生产无写入点 ⇒ 端点会返回
+        //   {tasks}/{sessionId}，而队长工具路径（修复后）落 {tasks}/{team} ⇒ 面板与工具**两个白板**。
+        //   本用例用 MockMvc standalone（⛔ 无需 Spring 上下文 ⇒ 不启动 Flyway、不碰真库）。
+        String team = "p02-rest-team";
+        String leadSession = "sess-p02-rest-lead";
+        System.setProperty("nexusai.task.config-dir", tempDir.toString());
+        System.setProperty("nexusai.experimental.agent-teams", "true");
+        try {
+            com.nexusai.application.agent.tool.ToolUseContext leadCtx =
+                com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), leadSession);
+            com.fasterxml.jackson.databind.ObjectMapper json =
+                new com.fasterxml.jackson.databind.ObjectMapper();
+
+            // 队长建队（真实 TeamCreateTool + TeamHelpers → {configHome}/teams/{team}/config.json）
+            new com.nexusai.application.agent.tool.impl.TeamCreateTool(
+                new com.nexusai.application.agent.team.TeamHelpers(), service)
+                .execute(block("TeamCreate", json.createObjectNode().put("team_name", team)), leadCtx);
+
+            // 队长建任务（真实 TaskCreateTool → {configHome}/tasks/{taskListId}）
+            new com.nexusai.application.agent.tool.impl.TaskCreateTool(service, null)
+                .execute(block("TaskCreate", json.createObjectNode()
+                    .put("subject", "队长建的任务").put("description", "同源验证")), leadCtx);
+
+            // ⭐ REST 断言：taskListId = sanitizeName(team)，任务在案
+            mockMvc.perform(get("/api/v1/tasks/list").param("sessionId", leadSession))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.taskListId").value(team))
+                .andExpect(jsonPath("$.v2Tasks.length()").value(1))
+                .andExpect(jsonPath("$.v2Tasks[0].subject").value("队长建的任务"));
+
+            // ⭐ 同源断言：队长 TaskList 工具路径解析出**同一个** taskListId
+            assertThat(TaskService.getTaskListId(leadSession, null))
+                .as("REST 端点(taskListId) 与队长工具路径必须同源")
+                .isEqualTo(team);
+        } finally {
+            TaskService.clearLeaderTeamName(leadSession);
+            System.clearProperty("nexusai.task.config-dir");
+            System.clearProperty("nexusai.experimental.agent-teams");
+        }
+    }
+
+    private static com.nexusai.application.agent.tool.ToolUseBlock block(
+            String name, com.fasterxml.jackson.databind.node.ObjectNode input) {
+        return new com.nexusai.application.agent.tool.ToolUseBlock(
+            UUID.randomUUID().toString(), name, input);
+    }
 }

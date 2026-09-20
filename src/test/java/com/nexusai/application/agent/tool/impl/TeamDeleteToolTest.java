@@ -58,6 +58,15 @@ class TeamDeleteToolTest {
     @TempDir
     Path tempDir;
 
+    /**
+     * {@link #appStateCtx} 的会话标识 —— 必须与用例里 mock/verify 的 UUID **逐字一致**。
+     *
+     * <p>⚠ 该字面量此前是**损坏的控制字符 U+0002**（与 master 逐字节相同），而 mock 桩的是
+     * {@code 00000000-…-0001} ⇒ **桩永不命中** ⇒ `delete_readsTeamNameFromSessionStore` 长期
+     * 空转并恒红。本批在 coordinator 拍板下改回真 UUID（该用例**首次真正执行**）。
+     */
+    private static final String APPSTATE_CTX_SESSION_ID = "00000000-0000-0000-0000-000000000001";
+
     @BeforeEach
     void setUp() {
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
@@ -79,7 +88,7 @@ class TeamDeleteToolTest {
     /** 带 appState 桥的 ToolUseContext · 对齐 CC ToolUseContext.getAppState/setAppState。 */
     private ToolUseContext appStateCtx(Map<String, Object> appState) {
         return ToolUseContext.of(
-                UUID.randomUUID(), "",
+                UUID.randomUUID(), APPSTATE_CTX_SESSION_ID,
                 PermissionMode.DEFAULT,
                 List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
                 List.of(), null, PermissionMode.DEFAULT, Map.of(),
@@ -413,5 +422,107 @@ class TeamDeleteToolTest {
         assertThat(content).contains("Team cleanup requested by team lead");
         // 活跃成员存在 → 不得删除 team 目录
         assertThat(teamConfigPath(team)).exists();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P0-6 · D1②] terminate 定位：全形 agentId 主用 + 裸名兜底；编号用 CC 原形
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** 注册一个存活 loop（identity 的 agentId 可与 formatAgentId(member,team) 不一致）。 */
+    private static void registerLoop(SpawnInProcess spawner, String team, String memberName,
+                                     String identityAgentId, String identityTeamName) {
+        AutonomousAgentLoop loop = new AutonomousAgentLoop();
+        loop.setAgentId(identityAgentId);
+        loop.setAgentName(memberName);
+        loop.setTeamName(identityTeamName);
+        InProcessTeammateTaskState state = new InProcessTeammateTaskState(
+            "t-" + memberName,
+            new TeammateIdentity(identityAgentId, memberName, identityTeamName, null, false, "s"),
+            "work", null, false, "default", null,
+            new java.util.ArrayList<>(), new java.util.HashSet<>(), new java.util.ArrayList<>(),
+            false, false, 0, 0, AbortControllerFactory.create(), null, null, new java.util.ArrayList<>());
+        loop.setTaskState(state);
+        spawner.registry().register(state, loop, null);
+    }
+
+    /** 写一个含 team-lead + 指定成员的 config.json（活跃成员守卫据此判定）。 */
+    private void writeTeamWithMember(String team, String memberName, String memberAgentId)
+            throws Exception {
+        ObjectNode config = new ObjectMapper().createObjectNode();
+        config.put("name", team);
+        config.put("leadAgentId", "team-lead@" + team);
+        ArrayNode members = config.putArray("members");
+        ObjectNode lead = members.addObject();
+        lead.put("agentId", "team-lead@" + team);
+        lead.put("name", "team-lead");
+        ObjectNode mate = members.addObject();
+        mate.put("agentId", memberAgentId);
+        mate.put("name", memberName);
+        new TeamHelpers().writeConfig(team, config.toString());
+    }
+
+    @Test
+    @DisplayName("[P0-6 · D1②] 全形 agentId 匹配落空 → 裸名兜底仍发出 shutdown_request（用户文案不降级）")
+    void requestShutdown_fullAgentIdMiss_fallsBackToBareName() throws Exception {
+        // WHY：主用定位键 = formatAgentId(memberName, teamName)（CC InProcessBackend.ts:211 的
+        //   identity.agentId）。团队名归一化不一致时全形会落空 —— 落空若不兜底，用户可见文案会从
+        //   「Shutdown requested…」降级成「Cannot cleanup…」（可观测回归）。本用例构造该不一致现场。
+        String team = "norm-team";
+        SpawnInProcess spawner = new SpawnInProcess(new TaskFrameworkService(new SdkEventQueue()));
+        // identity 的 agentId/teamName 都是**旧名**，与 formatAgentId("mate","norm-team") 不一致
+        registerLoop(spawner, team, "mate", "mate@legacy-name", "legacy-name");
+        writeTeamWithMember(team, "mate", "mate@legacy-name");
+
+        Map<String, Object> appState = new LinkedHashMap<>();
+        appState.put("teamContext", Map.of("teamName", team));
+        TeamDeleteTool tool = newTool();
+        tool.setSpawnInProcess(spawner);
+
+        AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
+            appStateCtx(appState));
+
+        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        assertThat(output.get("success").asBoolean()).isFalse();
+        assertThat(output.get("message").asText())
+            .as("⭐ 全形落空必须走裸名兜底 ⇒ 文案仍是「Shutdown requested…」而非「Cannot cleanup…」")
+            .contains("Shutdown requested for active teammate(s): mate")
+            .doesNotContain("Cannot cleanup");
+
+        Path mailbox = tempDir.resolve("teams").resolve(team).resolve("inboxes").resolve("mate.json");
+        assertThat(mailbox).as("兜底命中 ⇒ shutdown_request 必须写入 teammate mailbox").exists();
+        String content = Files.readString(mailbox);
+        assertThat(content).contains("shutdown_request");
+        // CC InProcessBackend.ts:225 编号原形 "shutdown-{全形 agentId}-{ts}"（含 @）；
+        // 旧形 "shutdown-{member}-{ts}" 无 @ ⇒ parseRequestId 恒 null ⇒ 旧回落腿恒哑。
+        assertThat(content)
+            .as("requestId 必须是 CC 原形（含全形 agentId）")
+            .contains("\\\"requestId\\\":\\\"shutdown-mate@norm-team-");
+    }
+
+    @Test
+    @DisplayName("[P0-6 · D1②] 幂等守卫：已请求过 shutdown → 不重发、仍视为已请求（CC InProcessBackend.ts:222）")
+    void requestShutdown_alreadyRequested_isIdempotent() throws Exception {
+        String team = "idem-team";
+        SpawnInProcess spawner = new SpawnInProcess(new TaskFrameworkService(new SdkEventQueue()));
+        registerLoop(spawner, team, "mate", "mate@" + team, team);
+        writeTeamWithMember(team, "mate", "mate@" + team);
+        // 置 shutdownRequested=true（CC task.shutdownRequested 的 Java 等价读点）
+        spawner.registry().findByAgentId("mate@" + team).orElseThrow().requestShutdown();
+
+        Map<String, Object> appState = new LinkedHashMap<>();
+        appState.put("teamContext", Map.of("teamName", team));
+        TeamDeleteTool tool = newTool();
+        tool.setSpawnInProcess(spawner);
+
+        AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
+            appStateCtx(appState));
+
+        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        assertThat(output.get("message").asText())
+            .as("已请求过 → 仍视为「已请求」（守卫 return true），文案不降级")
+            .contains("Shutdown requested for active teammate(s): mate");
+        assertThat(Files.exists(tempDir.resolve("teams").resolve(team).resolve("inboxes").resolve("mate.json")))
+            .as("幂等守卫 ⇒ **不得**重发 shutdown_request（mailbox 不产生新文件）")
+            .isFalse();
     }
 }

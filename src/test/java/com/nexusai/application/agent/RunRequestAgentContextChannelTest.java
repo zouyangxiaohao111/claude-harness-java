@@ -30,9 +30,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <h2>断言构成（★ = 行为断言，○ = 源码扫描断言）</h2>
  * <ul>
- *   <li>★ {@link #component_exists_asLastComponent()} —— record 组件存在且是第 20 位（在
- *       {@code boundProject} 之后）：保证 16 处 canonical {@code new RunRequest(...)} 只需<b>追加</b>
- *       一个实参即可编译，而不是插入式改签名（插入会大面积破坏既有实参位置）。</li>
+ *   <li>★ {@link #component_exists_asLastComponent()} —— record 组件 {@code agentContext} 存在且在第
+ *       20 位（在 {@code boundProject} 之后；[批 A4e] 末位追加 {@code permissionModeSource} 后仍为
+ *       第 20 位）：保证各 canonical {@code new RunRequest(...)} 只需<b>追加</b>一个实参即可编译，
+ *       而不是插入式改签名（插入会大面积破坏既有实参位置）。</li>
  *   <li>★ {@link #withAgentContext_sameValueShortCircuitsToThisInstance()} ——
  *       {@code withAgentContext(同一实例)} / {@code (null)} 返回 {@code this}（引用相等）。
  *       这是 sparse-edge 语义（{@code invocationEmitted} 同一 {@code AtomicBoolean}「只发一次」）
@@ -46,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       （{@code buildBaseToolUseContext(..., params.agentContext())} 与
  *       {@code params.toolUseContext().agentContext()}）。<b>这是源码扫描，不是行为测试</b>。</li>
  *   <li>○ {@link #allCanonicalConstructors_passAgentContext()} —— {@code RunRequest.java} 内
- *       {@code new RunRequest(} 调用点数 == 16（canonical 构造点全部补齐；少一处会编译不过，
+ *       {@code new RunRequest(} 调用点数 == 18（canonical 构造点全部补齐；少一处会编译不过，
  *       多一处说明新加了工厂而未同步本计数 —— 两者都必须人工确认）。</li>
  * </ul>
  */
@@ -55,16 +56,27 @@ class RunRequestAgentContextChannelTest {
     // ──────────────────────────── ★ 行为断言 ────────────────────────────
 
     @Test
-    @DisplayName("★ RunRequest 组件 agentContext 存在，且为第 20 位（末位）")
+    @DisplayName("★ RunRequest 组件 agentContext 存在，且为第 20 位（[A4e] permissionModeSource 末位追加后仍紧随 boundProject）")
     void component_exists_asLastComponent() {
         var components = RunRequest.class.getRecordComponents();
-        assertThat(components).as("RunRequest 组件数（新增 agentContext 后为 20）").hasSize(20);
+        assertThat(components)
+            .as("RunRequest 组件数（S1-T7 新增 agentContext 后为 20；批 A4e 末位追加 permissionModeSource 后为 21）")
+            .hasSize(21);
+        // [批 A4e] 末位现为 permissionModeSource（同样的「末位追加」约定，避免插入式改签名）
         var last = components[components.length - 1];
-        assertThat(last.getName()).isEqualTo("agentContext");
-        assertThat(last.getType()).isEqualTo(AgentContext.class);
+        assertThat(last.getName())
+            .as("[批 A4e] permissionModeSource 必须末位追加（同 agentContext 的约定）")
+            .isEqualTo("permissionModeSource");
+        assertThat(last.getType())
+            .isEqualTo(com.nexusai.application.agent.permission.PermissionModeSource.class);
+        // agentContext 仍在第 20 位、紧随 boundProject（本批未插入式改动既有实参位置）
         assertThat(components[components.length - 2].getName())
-            .as("agentContext 必须紧随 boundProject（末位追加 ⇒ 16 处 canonical 构造点只追加一个实参）")
+            .as("agentContext 必须仍紧随 boundProject（agentContext 未被插入式改动）")
+            .isEqualTo("agentContext");
+        assertThat(components[components.length - 3].getName())
+            .as("boundProject 必须仍紧随 batchUserPrompts")
             .isEqualTo("boundProject");
+        assertThat(components[components.length - 2].getType()).isEqualTo(AgentContext.class);
     }
 
     @Test
@@ -131,7 +143,7 @@ class RunRequestAgentContextChannelTest {
     }
 
     @Test
-    @DisplayName("○（源码扫描）canonical new RunRequest( 调用点 == 17（原 16 处补齐 + withAgentContext 新增 1）")
+    @DisplayName("○（源码扫描）canonical new RunRequest( 调用点 == 18（原 17 + A4e sessionFromSessionOverride 1）")
     void allCanonicalConstructors_passAgentContext() {
         Path f = backendRoot().resolve("src/main/java/com/nexusai/application/agent/RunRequest.java");
         String src = readText(f);
@@ -143,24 +155,33 @@ class RunRequestAgentContextChannelTest {
             canonical += countOccurrences(l, "new RunRequest(");
         }
         assertThat(canonical)
-            .as("canonical 构造点数 = 施工单口径的 16 处（原工厂）**+ 1 处**（本批新增的 "
-                + "withAgentContext 副本方法，本身也是一处 canonical 构造） = 17。"
+            .as("canonical 构造点数 = S1-T7 后的 17 处 **+ 1 处**（批 A4e 新增的 "
+                + "sessionFromSessionOverride 工厂 = 会话 override 槽专用来源标注）= 18。"
                 + "⚠️ 少一处会编译不过；多/少一处都说明工厂集变了 —— 必须人工确认后同步本计数"
-                + "（本断言刻意对计数敏感：它是「16 处构造点是否全补齐」的机械落点）")
-            .isEqualTo(17);
+                + "（本断言刻意对计数敏感：它是「构造点是否全补齐」的机械落点）")
+            .isEqualTo(18);
 
-        // ── 2. 每个构造点都必须是 20 个顶层实参（= 组件数）──
+        // ── 2. 每个构造点都必须是 21 个顶层实参（= 组件数）──
         List<Integer> arities = canonicalArities(src, "new RunRequest(");
         assertThat(arities)
-            .as("每个 canonical new RunRequest(...) 的顶层实参数（应恒为 20 = record 组件数）；"
+            .as("每个 canonical new RunRequest(...) 的顶层实参数（应恒为 21 = record 组件数）；"
                 + "若某处少一个 ⇒ 说明新增组件时漏补该构造点")
-            .hasSize(17)
-            .allSatisfy(a -> assertThat(a).isEqualTo(20));
+            .hasSize(18)
+            .allSatisfy(a -> assertThat(a).isEqualTo(21));
 
         // ── 3. 两处副本方法必须**透传** agentContext（而不是补 null）──
-        assertThat(countOccurrences(src, ", agentContext);"))
-            .as("withBoundProject / withAgentContext 两处副本方法都必须透传 agentContext"
-                + "（本仓多次出现「新增副本方法漏透传字段」）")
+        //    [批 A4e] 组件 permissionModeSource 末位追加后，两处副本方法的实参表尾变成
+        //    `, agentContext, permissionModeSource);` —— 用「尾两参连写」作判据，
+        //    同时证明「agentContext 未漏」且「新组件未漏」（任一被补成 null ⇒ 计数 ≠ 2 ⇒ 红）。
+        assertThat(countOccurrences(src, ", agentContext, permissionModeSource);"))
+            .as("withBoundProject / withAgentContext 两处副本方法必须**同时**透传 agentContext 与"
+                + " permissionModeSource（本仓多次出现「新增副本方法漏透传字段」；批 A4e 新增组件同款风险）")
+            .isEqualTo(2);
+
+        // ── 4. [批 A4e] 两处副本方法必须**透传** permissionModeSource（同款「漏透传新字段」风险）──
+        assertThat(countOccurrences(src, ", permissionModeSource);"))
+            .as("withBoundProject / withAgentContext 两处副本方法都必须透传 permissionModeSource"
+                + "（批 A4e 新增组件；漏透传 ⇒ 副本会把来源标注静默丢掉）")
             .isEqualTo(2);
     }
 

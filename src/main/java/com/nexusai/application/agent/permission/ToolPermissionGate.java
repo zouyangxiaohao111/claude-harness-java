@@ -219,6 +219,23 @@ public class ToolPermissionGate {
     private final PermissionUpdatePersister permissionUpdatePersister;
 
     /**
+     * [批 A2b] 会话列 mapper —— hook allow 携带的 destination=SESSION 更新写进
+     * {@code sessions.session_permission_rules}（V75 列）用（跨 send 唯一通道；
+     * ⛔ 不写 settings.json：CC {@code supportsPersistence} 排除 session，
+     * {@code PermissionUpdate.ts:208-216}）。{@code null} = 未注入 → 列写入跳过 + WARN。
+     *
+     * <p>非 final：经 {@link #setSessionMapper} setter 注入（{@code @Autowired(required=false)}）——
+     * 本类构造器已是 13 参且被 4+ 个测试类直接 new，扩构造器会大面积破坏既有调用点
+     * （见 {@link #ToolPermissionGate(PermissionPipeline, PermissionPrompter, AutoModeGate,
+     * DenialTracker, PermissionBubbleService, CoordinatorPermissionHandler,
+     * SwarmWorkerPermissionHandler, InteractiveHandler, PermissionDecisionLogger, HookRegistry,
+     * PermissionUpdateApplier, PermissionUpdatePersister)} 的 REV-FIX-1 登记）。
+     */
+    private com.nexusai.repository.session.mapper.SessionMapper sessionMapper;
+    // ↑ 注入点 = 下方 setSessionMapper（@Autowired(required=false) setter）· 单一注入点，
+    //   镜像 PermissionUpdatePersister.setManagedPolicy 的字段+注解 setter 组合。
+
+    /**
      * [U6-A1] BASH_CLASSIFIER 特性开关 · 可为 null（未注入时 feature 判定为 false）。
      *
      * <p>CC {@code feature('BASH_CLASSIFIER')}（useCanUseTool.tsx:126）门控投机竞速分支；
@@ -329,6 +346,16 @@ public class ToolPermissionGate {
         this.permissionUpdateApplier = permissionUpdateApplier;
         this.permissionUpdatePersister = permissionUpdatePersister;
         this.bashClassifierFeature = bashClassifierFeature;
+    }
+
+    /**
+     * [批 A2b] 注入会话列 mapper（destination=SESSION 批准更新写 {@code sessions.session_permission_rules}
+     * V75 列）。生产由 {@code @Autowired(required=false)} 注入；POJO 单测经本 setter 注入
+     * （镜像 {@code PermissionUpdatePersister.setManagedPolicy} 的 setter 注入模式）。
+     */
+    @Autowired(required = false)
+    public void setSessionMapper(com.nexusai.repository.session.mapper.SessionMapper sessionMapper) {
+        this.sessionMapper = sessionMapper;
     }
 
     /**
@@ -822,6 +849,17 @@ public class ToolPermissionGate {
         if (updates == null || updates.isEmpty()) {
             return;
         }
+        // 0) [批 A2b] destination=SESSION 的更新写入 sessions.session_permission_rules（V75 列）——
+        //    会话列是跨 send 唯一通道（LlmAgentLoop prototype 每 send 新实例 ⇒ appStateRef 恒空），
+        //    由 LlmAgentLoop.doRun 回读注入 appStateRef.toolPermissionContext（A2 再并进 per-turn ctx）。
+        //    ⛔ 只写 DB 会话列，**不写 settings.json / settings.local.json**：CC supportsPersistence
+        //    排除 session（PermissionUpdate.ts:208-216）。
+        //    ⚠️ 与 :1066 的 WebSocketPermissionPrompter.applyAndPersistUpdates 是**两个**等价单点
+        //    （用户弹窗批准 / hook allow 携带 updatedPermissions），两处都必须挂钩；
+        //    放在 `current == null` 早退之前 = 对齐 CC persistPermissions 先行顺序（见该方法注释）。
+        //    本调用永不抛（内部 try/catch），不影响 hook 决策。
+        SessionPermissionOverlay.persistSessionUpdates(
+            sessionMapper, ctx != null ? ctx.sessionId() : null, updates, "gate:" + toolUseId);
         ToolPermissionContext current = ctx != null ? ctx.permissionContext() : null;
         if (current == null) {
             if (log.isWarnEnabled()) {
@@ -844,10 +882,25 @@ public class ToolPermissionGate {
             // [P11d] 传该工具调用的会话 id：project/local source 落到本会话项目根（读侧
             //   PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。ctx 可 null（旧测试路径）⇒ null。
             String sessionId = ctx != null ? ctx.sessionId() : null;
-            permissionUpdatePersister.persistAll(updates, sessionId);
-            if (log.isDebugEnabled()) {
-                log.debug("PERMISSION gate A4: updatedPermissions persist 完成 callId={} updates={} sessionId={}",
-                    toolUseId, updates.size(), sessionId);
+            // [批 A4c P1] 写盘失败**不得吞掉 hook/coordinator/swarm 的 allow 决策**：
+            //   本方法 3 个调用点（:794 hook allow / :1019 coordinator allow / :1126 swarm allow）
+            //   全都处在"决策已定、只差落地"的位置，抛出去会：
+            //     - :794 被 :820 catch(Throwable) 吞 → 返回 null = "hook 未表态" ⇒ hook 的 allow 静默丢失；
+            //     - :1019/:1126 被 :1285 catch(Throwable) 吞 → cancelAndAbortDecision ⇒ allow 变中止。
+            //   裁定语义与 WebSocketPermissionPrompter.applyAndPersistUpdates:1081-1105 完全一致：
+            //   写盘失败 ⇒ fail-loud（ERROR + 异常原文）**且仍继续走到 appState 同步**（本次运行内授权生效），
+            //   但"规则没写进设置文件"留痕（重启后不再存在）。
+            //   ⛔ 那一处与本处是**两个**等价单点，必须同时挂钩（本仓上一批栽在只覆盖一侧）。
+            try {
+                permissionUpdatePersister.persistAll(updates, sessionId);
+                if (log.isDebugEnabled()) {
+                    log.debug("PERMISSION gate A4: updatedPermissions persist 完成 callId={} updates={} sessionId={}",
+                        toolUseId, updates.size(), sessionId);
+                }
+            } catch (Throwable th) {
+                log.error("PERMISSION gate A4: updatedPermissions persist 失败（本次运行内授权仍生效，"
+                    + "但规则未落盘 ⇒ 重启后不再存在）callId={} updates={} sessionId={} err={}",
+                    toolUseId, updates.size(), sessionId, th.toString(), th);
             }
         }
         // CC setAppState 同步 (permissions.ts:448-451)

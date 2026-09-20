@@ -104,6 +104,7 @@ class BeanSingletonSessionStateAuditTest {
         "com.nexusai.application.agent.memory.SessionMemoryService#boolean smSessionMemoryEnabled", // feature/配置位（进程级开关，非会话态）
         "com.nexusai.application.agent.memory.TeamMemoryWatcher#Future currentPushFuture", // 进程级 in-flight 推送句柄（team memory 为项目级共享）
         "com.nexusai.application.agent.memory.TeamMemoryWatcher#boolean hasPendingChanges", // 进程级 in-flight 标志（同上，项目级共享）
+        "com.nexusai.application.agent.permission.ToolPermissionGate#SessionMapper sessionMapper", // [批 A2b 补登记 2026-09-18] 装配依赖（无状态 mapper，字段上无注解故未被装配过滤剔除，同 TodoStatusController#SessionMapper 情形）。注入点 = `@Autowired(required=false) setSessionMapper`（单一 setter，bean 创建期写一次，字段无写入方）；会话 id 逐次入参（`sessionMapper, ctx.sessionId(), …`）⇒ 不在本字段驻留任何按会话键的值
         "com.nexusai.application.agent.permission.hook.FileChangedWatcher#String currentCwd", // 监听目录（进程级配置，非 per-session）
         "com.nexusai.application.agent.permission.hook.HooksSettings#Function sessionHooksProvider", // 装配注入的 provider 函数（字段名含 session 指回调语义）
         "com.nexusai.application.agent.permission.hook.SettingsFileChangeWatcher#String projectRootOverride", // 测试/装配 override（进程级配置）
@@ -163,9 +164,30 @@ class BeanSingletonSessionStateAuditTest {
      * {@code 634f8500…}</b> ⇒ 旧清单被唯一确定，不存在第 5 处差异（SHA-256 见证，非目测）。
      * 其余一切字段（含 P10b 新增的 {@code systemPromptContextProviderBySession}）均未进入候选集
      * —— 后者是 {@code final} 字段，见类 javadoc 的盲区登记。
+     *
+     * <p><b>[权限批补登记 · 2026-09-18] 本次重钉的差异 = 恰 15 行新增、0 行消失</b>
+     * （旧值 {@code 23ec18ec…} 由 {@code 52662801} coordinator 批钉定）。逐条归因：
+     * <ol>
+     *   <li><b>权限批（本线）4 条</b>：{@code ToolPermissionGate#SessionMapper sessionMapper}
+     *       （批 A2b 引入的装配字段，已同步登记进 {@link #TIER1_REGISTERED}，理由见该处注释）、
+     *       {@code LocalSettingsGitignore#BiFunction gitExec} / {@code #Predicate dirIsInGitRepoFn} /
+     *       {@code #Supplier globalGitignorePathSupplier}（批 A4c P4 引入的装配点，无状态）；</li>
+     *   <li><b>其它批次 11 条</b>：{@code McpServerService} 三个 {@code BooleanSupplier *Gate}（feature 门）、
+     *       {@code NexusProperties#Encryption encryption} / {@code #Set openaiReasoningField} 与
+     *       {@code ApiAccessLogProperties#boolean enabled} / {@code #List excludeUris}（配置属性绑定）、
+     *       {@code WorkbuddyMarketService#long lastTencentCallMs}（调用节流时间戳，进程级）、
+     *       {@code AnthropicSdkProvider#PromptCacheBreakDetection promptCacheBreak}（provider 级缓存态）、
+     *       {@code MockLlmProvider#AgentUsage mockUsage} / {@code #Boolean lastSkipCacheWrite}（测试 mock）。</li>
+     * </ol>
+     * ⭐ <b>本次重钉的语义依据</b>：{@link #TIER1_REGISTERED} 是**语义闸门**（会话可疑字段逐项登记），
+     * 它在本次重钉时**已通过** ⇒ 上述 353 个字段中不存在「会话可疑却未登记」者；Tier-2 指纹是
+     * 变更绊线，只需跟上现实。
+     * ⭐ 归因方式（可复核）：在 {@code 52662801} 的 detached worktree 上把本常量临时改为任意假值 ⇒
+     * 断言消息即打印**那个时代**的全量字段清单（实测 338 条）；与当前（353 条）做
+     * {@code comm -13} ⇒ **恰好是上面 15 条、且 {@code comm -23} 为空**（无消失项）。
      */
     private static final String PINNED_FINGERPRINT =
-        "23ec18ecfaf4791e866c5e473a9c07b6cc8f2b3bdcb3fdb766bbe52ff90cfed9";
+        "ab487c7c4db1a0730f86e55a8ecdda945e850560f49cbfffc08623e8a4b1d7e9";
 
     /** 「会话可疑」判据 ①：字段类型属会话载体集（简名匹配，兼容泛型外层）。 */
     private static final Set<String> SESSION_CARRIER_TYPES = Set.of(

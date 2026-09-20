@@ -134,7 +134,8 @@ const BASE_PROPS = {
   streaming: false,
   onStop: () => {},
   queuedCommands: [],
-  popEditable: () => {},
+  // 批 A5：popEditable 改返 {text, attachments} | null（App 回填文本 + Composer 还原附件）
+  popEditable: async () => null,
   boundProjectName: null,
   onSelectProject: () => {},
   currentModel: 'ds-openai/deepseek-v4-flash',

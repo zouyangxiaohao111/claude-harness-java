@@ -21,4 +21,19 @@ public enum PermissionBehavior {
     ALLOW,
     DENY,
     ASK;
+
+    /**
+     * CC {@code permissionBehaviorSchema} 字面量（{@code PermissionRule.ts:25-27}，
+     * {@code z.enum(['allow','deny','ask'])} 小写、大小写敏感）。
+     *
+     * <p>[批 A1] {@link PermissionUpdate.WireSerializer} 唯一的 behavior → CC 串映射点。
+     * 注意本枚举的 {@code name()}（{@code ALLOW}）不是线格式 —— CC 形状是小写。
+     */
+    public String ccLiteral() {
+        return switch (this) {
+            case ALLOW -> "allow";
+            case DENY -> "deny";
+            case ASK -> "ask";
+        };
+    }
 }

@@ -251,6 +251,95 @@ class CronNotifyProducerSessionRoutingTest {
             .isEqualTo(SessionKeys.canonicalUuid(createSession));
     }
 
+    // ─────────── 4. H1 负向断言：LOCAL_AGENT 终态通知不得带 agentId（否则谁都捞不到）───────────
+
+    /**
+     * WHY（H1 · 规则九）: async agent（LOCAL_AGENT，{@code taskId===agentId}）的 query loop 在终态
+     * 通知入队之前<b>已经退出</b>（{@code SubagentTool.java:3334 execute} 阻塞返回 → {@code :3340-3357}
+     * 才 finalize）。若通知仍携带该 agentId，{@link NotificationQueue#drainForQuery} 的主线程规则
+     * 「{@code cmd.agentId() != null} ⇒ 跳过」会让它<b>在唯一活着的消费者（该会话 turn）侧被跳过</b>，
+     * 而子代理侧已死、无人 drain ⇒ 通知永久滞留（CC {@code killShellTasks.ts:70-75} 自陈
+     * 「no consumer matches a dead agentId」）。用户可观测症状与「投给已退出的 worker」完全一致 ——
+     * 所以只断言「第 4 实参 = null」不足以证明修复。
+     *
+     * <p>本用例断言<b>后果</b>：① 入队项 agentId 为 null；② 该通知<b>真能被消费</b>
+     * （本会话 turn drain 捞得到 —— 这是修复要恢复的能力）；③ 「worker 自己的 agentId」不再是
+     * 收件人（按它 drain 捞不到，防「改成指向另一个死 id」的伪修）。
+     */
+    @Test
+    @DisplayName("H1 负向: LOCAL_AGENT 完成通知不带 agentId → 本会话 turn 能消费、worker 自己的 agentId 捞不到")
+    void localAgentCompleteNotification_noAgentId_claimableBySessionTurnOnly() {
+        String createSession = "sess-notify-h1-complete";
+        NotificationQueue queue = new NotificationQueue();
+        BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
+
+        UUID agentId = UUID.randomUUID();
+        BackgroundTask task = runner.registerAsyncAgent(
+            agentId, "异步任务", "prompt", "general-purpose", null, createSession);
+        assertThat(task.agentId()).as("前置条件：async agent 任务的 agentId 即任务自身（taskId===agentId）")
+            .isEqualTo(agentId);
+        runner.completeAsyncAgent(task.id(), AsyncAgentResult.success(
+            "summary", 1, 10L, task.id(), 5L, com.nexusai.application.agent.tool.AgentUsage.EMPTY));
+
+        NotificationQueue.QueueItem item = queue
+            .peek(q -> NotificationQueue.MODE_TASK_NOTIFICATION.equals(q.mode())).orElseThrow();
+        assertThat(item.agentId())
+            .as("LOCAL_AGENT 终态通知不得携带 agentId —— 该 agent 的 loop 已退出，携带即为死收件人，"
+                + "主线程侧被 drainForQuery 跳过 ⇒ 通知永久滞留（谁都取不到）")
+            .isNull();
+        assertThat(SessionKeys.canonicalUuid(item.sessionId()))
+            .as("创建会话 sessionId 必须保留 —— 它是通知能被该会话 turn 捞到的唯一凭据")
+            .isEqualTo(SessionKeys.canonicalUuid(createSession));
+
+        // 后果断言 1：该 agent 自己（worker agentId）不再是收件人 —— 防「换一个死 id 填上」
+        assertThat(queue.drainForQuery(true, agentId.toString(), createSession))
+            .as("按 worker 自己的 agentId drain 必须捞不到 —— 它已退出，正是原缺陷的收件人")
+            .isEmpty();
+
+        // 后果断言 2（正门）：该会话 turn 能真正消费到 → 通知可达，不滞留
+        NotificationQueue.QueueItem drained = drainTaskNotification(queue, createSession);
+        assertThat(drained)
+            .as("主线程以创建会话 turn 消费必须捞到 —— 通知真正可达（否则只是把「投给死 worker」"
+                + "换成「谁都收不到」，用户症状一模一样）")
+            .isNotNull();
+        assertThat(drained.value()).contains(task.id());
+        assertThat(queue.hasCommandsInQueue())
+            .as("通知已被消费出队 —— 不得滞留在队列里等一个永不出现的消费者")
+            .isFalse();
+    }
+
+    /**
+     * WHY: 同 {@link #localAgentCompleteNotification_noAgentId_claimableBySessionTurnOnly} 的根因，
+     * 但走<b>另一条终态路径</b> —— {@code killAsyncAgent}（被 TaskStop / 团队解散 / stopAll 外部杀）。
+     * 两条路径同源同修，必须各自有独立证据（「改了代码」≠「在每个入口都生效」）。
+     */
+    @Test
+    @DisplayName("H1 负向: LOCAL_AGENT 被杀通知不带 agentId → 本会话 turn 能消费、worker 自己的 agentId 捞不到")
+    void localAgentKilledNotification_noAgentId_claimableBySessionTurnOnly() {
+        String createSession = "sess-notify-h1-killed";
+        NotificationQueue queue = new NotificationQueue();
+        BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
+
+        UUID agentId = UUID.randomUUID();
+        BackgroundTask task = runner.registerAsyncAgent(
+            agentId, "异步任务", "prompt", "general-purpose", null, createSession);
+        assertThat(runner.killAsyncAgent(task.id()))
+            .as("前置条件：RUNNING 的 async agent 任务可被真杀（终态通知走 killAsyncAgent 路径）").isTrue();
+
+        NotificationQueue.QueueItem item = queue
+            .peek(q -> NotificationQueue.MODE_TASK_NOTIFICATION.equals(q.mode())).orElseThrow();
+        assertThat(item.agentId())
+            .as("LOCAL_AGENT 被杀通知不得携带 agentId —— 与完成路径同一根因（收件人已死）")
+            .isNull();
+
+        assertThat(queue.drainForQuery(true, agentId.toString(), createSession))
+            .as("按 worker 自己的 agentId drain 必须捞不到")
+            .isEmpty();
+        assertThat(drainTaskNotification(queue, createSession))
+            .as("本会话 turn 必须能消费到被杀通知 —— 否则 kill 结果对用户永久不可见")
+            .isNotNull();
+    }
+
     // ─────────────────── helpers ───────────────────
 
     /** 以指定会话的 turn drain 一条 task-notification（3a 语义），无则返回 null。 */

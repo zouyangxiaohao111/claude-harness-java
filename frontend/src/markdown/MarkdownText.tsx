@@ -2,26 +2,33 @@
  * 对话正文 markdown 渲染入口（对齐 deepseek-harness MarkdownText 裁剪版）。
  *
  * 双态：
- * - streaming=true：`StreamingRenderer` + `IncrementalMarkdownParser(parseGfm)` —— 每帧对
- *   增长文本做**增量尾窗解析**（冻结前部块缓存为 React 元素），无整段 innerHTML 重写，
- *   根治「打字到代码块/长内容卡顿」。[markdown-fix] 不跑文本预处理（全局改写会破坏
- *   尾窗 verbatim-slice 不变量）；代码块由真实语法树渐进成形（未闭合 fence 也产 code 节点）。
+ * - streaming=true：**原样纯文本直出**（[stream-raw] 2026-09-18 起）—— 不调用
+ *   `StreamingRenderer`、不跑任何 markdown 解析，逐字符输出后端原文
+ *   （`<div class="md-stream-raw">` + globals.css 的 pre-wrap 呈现）；完整渲染交给收口臂。
+ *   此前走 `StreamingRenderer` + `IncrementalMarkdownParser(parseGfm)` —— 每帧对增长文本做
+ *   **增量尾窗解析**（冻结前部块缓存为 React 元素）。该路径与收口臂是**两套解析器**，实测流式期
+ *   与收口结果不一致（`##标题` 流式期字面裸露、收口才成形，且掉字/整体位移）⇒ 用户裁定
+ *   「流式期间不做 markdown 解析」。`StreamingRenderer` 原样保留，见其上方注释。
  * - streaming=false（缺省）：settled 一次全量 —— [rescue] 脏输入抢救（repair）→ parseGfmWithMath →
  *   引用自愈 / ```math / shiki 高亮都在这臂生效。
  *
  * [chat-switch-stream-align] deepseek 对照两项增强：
  * 1. 长单块纯文本降级（D1）：一个始终无法冻结的超长单块（未分段长 prose / 超长代码 fence）会让
  *    增量 parser 每帧对整块全文 O(n²) 重 parse → 主线程被占「字不吐」。检测到「无冻结块 + 尾窗
- *    仅 1 个长文本块」→ 退化为 `<pre>` 纯文本直出（零 parse 逐帧透传，帧率恢复）；streaming 结束
+ *    仅 1 个长文本块」→ 退化为纯文本直出（零 parse 逐帧透传，帧率恢复）；streaming 结束
  *    settled 一次性精排恢复 markdown/高亮。deepseek 未做此扩展（其靠真实回复多段可冻结兜底）。
+ *    ⚠ [stream-raw] 起生产不再走此路径（流式臂已改纯文本直出）：`STREAM_DEGRADE_CHARS` 与
+ *    该判定**在新路径下不再被求值**，保留仅为支持一行回退。
  * 2. 流式渲染器跨 remount 复用（D2）：组件收到 streamKey（会话:块 id）时，StreamingRenderer 提升到
  *    模块级注册表 —— 切走会话再切回同一流式块，直接复用其增量状态（冻结前缀/冻结元素/降级态），
  *    不从零 parse 当前已长全文（治大文本回复在会话间来回切换时的整块重解析卡顿）。
  *    注册表 LRU 上限回收孤儿（finalize/clear 后块不再渲染）。
+ *    ⚠ [stream-raw] 起生产不再走此路径（同上）：`MessageList` 已不再传 `streamKey`，本分支无生产
+ *    消费者，保留仅为支持一行回退（`acquireStreamingRenderer` 仍被 renderer.test.tsx 直接引用）。
  *
  * 安全由 render.tsx 兜底（raw HTML 字面量、URL 白名单、图片 http(s)）。
  */
-import { memo, useMemo, useRef } from 'react'
+import { memo, useMemo } from 'react'
 import type { ReactNode } from 'react'
 import { IncrementalMarkdownParser } from './incremental.ts'
 import { parseGfm, parseGfmWithMath } from './parse.ts'
@@ -46,7 +53,9 @@ export interface MarkdownTextProps {
   /** html 代码块「运行」回调（透传给 CodeBlock）。须引用稳定（冻结元素会烘焙它）。 */
   onRunHtml?: ((code: string) => void) | undefined
   /** [chat-switch-stream-align] 流式渲染器复用键（通常 `${sessionId}:${assistantMessageId}`，块行唯一）。
-   *  仅 streaming 时有效：命中则走模块级 StreamingRenderer 注册表（切走/切回不重建增量状态）。缺省回落组件 ref。 */
+   *  仅 streaming 时有效：命中则走模块级 StreamingRenderer 注册表（切走/切回不重建增量状态）。缺省回落组件 ref。
+   *  ⚠ [stream-raw] 2026-09-18 起**此 prop 无生产消费者**（`MessageList` 已去掉该传参，流式臂改纯文本
+   *  直出、不再需要跨 remount 复用增量状态）—— 类型保留仅为避免连带破坏与支持一行回退。 */
   streamKey?: string
 }
 
@@ -112,13 +121,25 @@ function renderSettledCached(
 
 // [D1] 超长单块纯文本降级阈值（字符）：流式文本超过该长度仍冻结不出多块（frozen 空 + 尾窗仅 1 块）
 //   时退化为纯文本。避免未分段长 prose / 超长代码 fence 每帧全量 parse O(n²) 占死主线程 → 「字不吐」。
+//   ⚠ [stream-raw] 2026-09-18 起生产不再走 StreamingRenderer ⇒ 本常量与其判定**不再被求值**
+//   （流式臂整体就是纯文本直出，无需按长度降级）。保留仅为支持一行回退。
 const STREAM_DEGRADE_CHARS = 8000
-/** 降级纯文本根 class（globals.css 定义 pre-wrap 排版；视觉与正文一致）。 */
+/** [D1] 降级纯文本根 class（globals.css 定义 pre-wrap 排版；视觉与正文一致）。
+ *  ⚠ 同上：自 [stream-raw] 起不再被流式臂使用（流式臂改用 `STREAM_RAW_CLASS`）。 */
 const STREAM_DEGRADE_CLASS = 'md-stream-degraded'
+/** [stream-raw] 流式臂原样纯文本根 class（globals.css 同名规则：pre-wrap 保留换行、字体继承正文）。
+ *  **必须是 `<div>` 而非 `<pre>`**：`.msg .content pre`（特异性 0,2,1）会压过本类（0,1,0）的
+ *  `font`/`line-height`/`padding`，此前 D1 降级态用 `<pre>` 实际渲染成 12px 代码框（注释声称
+ *  「视觉与正文一致」与事实不符）。 */
+const STREAM_RAW_CLASS = 'md-stream-raw'
 
 /**
  * 流式渲染态：增量 parser + 已冻结块缓存 + 引用/脚注状态（+ 长单块降级态）。
  * 每帧只对尾窗重解析；同文本幂等。实例可经模块级注册表跨组件 remount 复用（streamKey）。
+ *
+ * ⚠ [stream-raw] 2026-09-18 起**生产不再走此路径** —— 流式臂已改为原样纯文本直出
+ * （`MarkdownText` 的 `streaming` 分支，见 `STREAM_RAW_CLASS`）。本类保留以支持**一行回退**
+ * 与既有单测（`renderer.test.tsx` / D1/D2 用例直接引用 `acquireStreamingRenderer`）。
  */
 class StreamingRenderer {
   private readonly parser = new IncrementalMarkdownParser(parseGfm)
@@ -222,7 +243,10 @@ class StreamingRenderer {
 //   后块不再渲染 → 条目成孤儿，由 LRU 上限淘汰回收（内存有界）。
 const STREAM_RENDERER_CACHE_MAX = 128
 const streamRenderers = new Map<string, StreamingRenderer>()
-/** [D2] 取/建流式渲染器（key=streamKey）。export 仅供单测断言 keyed 复用与 LRU 淘汰。 */
+/** [D2] 取/建流式渲染器（key=streamKey）。export 仅供单测断言 keyed 复用与 LRU 淘汰。
+ *  ⚠ [stream-raw] 2026-09-18 起**生产不再调用本函数**（流式臂已改纯文本直出、`streamKey` 无生产
+ *  消费者）—— 保留以支持一行回退，且既有单测（`renderer.test.tsx` D2 段）直接 import 它，
+ *  删除会让该文件整体加载失败、把爆炸半径从一条断言扩大到整个文件。 */
 export function acquireStreamingRenderer(
   key: string,
   onRunHtml: ((code: string) => void) | undefined,
@@ -246,25 +270,15 @@ export const MarkdownText = memo(function MarkdownText({
   streaming = false,
   className = 'content md',
   onRunHtml,
-  streamKey,
 }: MarkdownTextProps) {
-  const streamRef = useRef<StreamingRenderer | null>(null)
-  const onRunRef = useRef(onRunHtml)
   const children = useMemo(() => {
-    if (!streaming) {
-      streamRef.current = null
-      return renderSettledCached(text, onRunHtml)
-    }
-    // [D2] 有 streamKey → 模块级注册表复用（切走/切回同流式块不重建增量状态）
-    if (streamKey !== undefined) {
-      return acquireStreamingRenderer(streamKey, onRunHtml).render(text)
-    }
-    // 无 key（旧调用/非块行兜底）：组件 ref 持有；非追加 / 回调变化 → 重建渲染器（冻结元素烘焙 onRunHtml）
-    if (streamRef.current === null || onRunRef.current !== onRunHtml) {
-      onRunRef.current = onRunHtml
-      streamRef.current = new StreamingRenderer(onRunHtml)
-    }
-    return streamRef.current.render(text)
-  }, [text, streaming, onRunHtml, streamKey])
+    // [stream-raw] 流式臂：原样纯文本直出 —— 不调用 StreamingRenderer、不跑任何 markdown 解析，
+    //   输出逐字符等于后端原文（契约由 streamRaw.test.tsx 钉住）。完整渲染由收口臂
+    //   （streaming=false 的一次全量）承担。
+    //   回退 = 删掉本行、恢复原 `streamKey`/组件 ref 两条分支（StreamingRenderer 与
+    //   acquireStreamingRenderer 均原样保留）。
+    if (streaming) return <div className={STREAM_RAW_CLASS}>{text}</div>
+    return renderSettledCached(text, onRunHtml)
+  }, [text, streaming, onRunHtml])
   return <div className={className}>{children}</div>
 })

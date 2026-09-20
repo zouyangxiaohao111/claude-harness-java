@@ -211,12 +211,15 @@ public class AgentState {
     @JsonIgnore
     private final java.util.Set<String> realtimeToolResultsPushed = ConcurrentHashMap.newKeySet();
     /**
-     * [mid-turn-align] mid-turn 注入的排队 user 消息（busy-queued）暂存 · goal 2：注入时<b>不立即落库</b>，
-     * 轮结束由 ChatService 在 replayAndPersist 之后补落库（createQueuedUserMessage，指定 id = 队列 uuid，
-     * DB 顺序 = user → assistant... → queued-user）。LlmAgentLoop 工具边界 drain busy-queued 时记录
-     * 原始 value（非 wrapCommandText 包裹文本）；同一注入内容镜像写 LlmAgentLoop 实例字段一份作 error
-     * 逃生门（run() 抛异常时本 state 不可达，ChatService 从 {@code loop.injectedQueuedMessages()} 重新
-     * enqueue 回队列）。
+     * [mid-turn-align / C2 2026-09-19] mid-turn 注入的排队 user 消息暂存 · 登记面 = <b>全部</b> mid-turn
+     * 注入项（busy-queued + task-notification / coordinator / channel / cron）。载体语义：登记发生在
+     * {@code state.appendMessage} <b>之前</b> ⇒ append 触发的实时落库 appendListener
+     * （ChatService.persistAppendedMessage user 分支）经 {@code injectedQueuedById} 命中即刻落 DB
+     * （RAW content + V67 queued_origin + V51 is_meta）；轮末 persistInjectedQueuedMessages 补落经
+     * existsById 幂等跳过（同一 uuid 恒一条）。LlmAgentLoop 工具边界 drain 时记录原始 value
+     * （非 wrapCommandText 包裹文本 —— 壳只在请求组装时由 wrapQueuedMessagesForApi 临时生成）。
+     * 同一注入内容镜像写 LlmAgentLoop 实例字段一份（{@code loop.injectedQueuedMessages()}；error 分支的
+     * reenqueue 逃生门已按用户拍板删除，该镜像通道现无生产读者）。
      *
      * <p><b>local-only 约束（CLAUDE.md BudgetTracker 架构红线）</b>：{@code @JsonIgnore} —— 绝不
      * 序列化到 outbound DTO / STOMP / WebSocket / EventPublisher payload，绝不写入 LLM 请求 payload。
@@ -228,10 +231,21 @@ public class AgentState {
     /**
      * [mid-turn-align] 单条 mid-turn 注入的排队 user 消息（uuid = 队列命令 id，content = 原始文本，可空串）。
      *
-     * <p>[P0-1 OD-1/OD-3] 3 参扩展 + queuedOrigin（排队来源标记）：本 registry 仅登记
-     * busy-queued 项（busy-queued 才需落库），queuedOrigin 供 ChatService 落库联动
-     * createQueuedUserMessage(..., queuedOrigin)。2 参便捷构造器默认 queuedOrigin=null
+     * <p>[P0-1 OD-1/OD-3] 3 参扩展 + queuedOrigin（排队来源标记）：queuedOrigin 供 ChatService 落库
+     * 联动 createQueuedUserMessage(..., queuedOrigin)。2 参便捷构造器默认 queuedOrigin=null
      * （测试 / 旧调用方兼容；语义 = 非标记落库，与现状等价）。
+     *
+     * <p>[C2 2026-09-19 · 登记面从 busy-queued 扩到<b>全部</b> mid-turn 注入项] 不再只登记 busy-queued
+     * —— drain 消费到的 task-notification / coordinator / channel / cron 同样登记，对齐 CC
+     * （queued_command 落 transcript：落库过滤器 isLoggableMessage 只滤 progress / 非 ant attachment，
+     * <b>不看 isMeta</b>；本机真实 CC transcript 实测有 queued_command attachment 在盘上）。
+     * 原「isMeta ⇒ 不落库」依据（messages.ts:3753-3756）系误引 —— 那里只讲 isMeta 用于 UI 隐藏
+     * （消费者 filterForBriefTool / shouldShowUserMessage 均为 UI 谓词）。
+     *
+     * <p><b>[C2] isMeta 落库字段</b>：落库 is_meta 列须反映消息真实 isMeta（task-notification 等
+     * mid-turn 通知 = true ⇒ resume 后前端 UI 隐藏，与 live 语义一致 + 对齐 CC）。原实现 ChatService
+     * 两条落库路径硬编码 isMeta=false ⇒ 通知行 resume 后会当普通 user 气泡显示（与 live 隐藏不一致）。
+     * busy-queued 恒 false ⇒ 既有行为零变化。
      *
      * <p>[busy 附件快照] 4 参扩展 + {@code userAttachments}（<b>非图片</b>附件快照 · V63 落库用）：
      * busy 消息的 user 行在 drain 时点落库，快照来源只有队列项
@@ -241,13 +255,25 @@ public class AgentState {
      */
     public record InjectedQueuedMessage(String uuid, String content, String queuedOrigin,
                                         java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo>
-                                            userAttachments) {
+                                            userAttachments,
+                                        boolean isMeta) {
         public InjectedQueuedMessage(String uuid, String content) {
-            this(uuid, content, null, null);
+            this(uuid, content, null, null, false);
         }
 
         public InjectedQueuedMessage(String uuid, String content, String queuedOrigin) {
-            this(uuid, content, queuedOrigin, null);
+            this(uuid, content, queuedOrigin, null, false);
+        }
+
+        /**
+         * 4 参兼容构造（isMeta=false）— [C2 2026-09-19 加 isMeta 前] 的既有调用方零改动。
+         *
+         * <p>busy-queued 恒 false（isMeta 新公式对 busy 项为 false）⇒ 既有语义逐条不变。
+         */
+        public InjectedQueuedMessage(String uuid, String content, String queuedOrigin,
+                                     java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo>
+                                         userAttachments) {
+            this(uuid, content, queuedOrigin, userAttachments, false);
         }
     }
     /**
@@ -651,6 +677,27 @@ public class AgentState {
     public void addInjectedQueuedMessage(String uuid, String content, String queuedOrigin,
             java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo> userAttachments) {
         this.injectedQueuedMessages.add(new InjectedQueuedMessage(uuid, content, queuedOrigin, userAttachments));
+    }
+
+    /**
+     * [C2 2026-09-19] 5 参重载：+ {@code isMeta}（该注入消息的真实 isMeta · 落 is_meta 列）。
+     *
+     * <p>调用面 = LlmAgentLoop.drainAndInjectQueued 对<b>全部</b> mid-turn 注入项（不再只 busy-queued）
+     * 的统一登记；{@code isMeta} 取产出 DTO 的 {@code m.isMeta()}（busy-queued = false，通知 /
+     * coordinator / channel / cron = true）。ChatService 两条落库路径据此落 is_meta，使 resume 后
+     * UI 可见性与 live 一致（与 queued_origin 同源同判据）。
+     *
+     * @param uuid            队列命令 id / 产出消息 id（CC attachment.source_uuid · 落库用指定 id）
+     * @param content         原始排队文本（可空串 / null；RAW，壳不落库）
+     * @param queuedOrigin    排队来源标记（'busy-queued' / 'task-notification' / 'cron' / 'coordinator' / 'channel|srv'）
+     * @param userAttachments 非图片附件快照（null = 无附件）
+     * @param isMeta          该消息真实 isMeta（落 V51 is_meta 列；true = resume 后 UI 隐藏）
+     */
+    public void addInjectedQueuedMessage(String uuid, String content, String queuedOrigin,
+            java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo> userAttachments,
+            boolean isMeta) {
+        this.injectedQueuedMessages.add(
+            new InjectedQueuedMessage(uuid, content, queuedOrigin, userAttachments, isMeta));
     }
 
     /**

@@ -229,13 +229,23 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
     }
   }
 
-  /** 展开收件箱 → 拉历史 + 标记已读（折叠时新消息累计未读角标） */
+  /**
+   * 展开收件箱 → 拉历史 + 清本地未读角标（折叠时新消息累计未读角标）。
+   *
+   * [C2 修正] 原来这里还调 `teamsApi.markRead(teamName)` 打后端标 read=true —— 展开收件箱是纯 UI
+   * 动作，既非投递也非入队，却把消息全标已读 ⇒ 抢在模型之前吞掉队友消息（对模型静默不可见）。
+   * CC 的两个标读调用点都在「已投递或已可靠入队」**之后**（useInboxPoller.ts:806/:864、
+   * print.ts:2538），无任何 UI 触发入口。标读已改由消费侧
+   * `AgentLoopContext.maybeInjectTeammateMailbox` 在构建注入后按谓词执行。
+   * ⛔ `markAllRead()` 必须保留：它是**唯一**清零点（teamStore.ts:58），删了未读角标永不归零。
+   * ⛔ `teamsApi.inbox` 必须保留（TeamController 走 readMailbox，纯读不写文件）。
+   */
   const toggleInbox = () => {
     const next = !inboxOpen
     setInboxOpen(next)
     if (next && teamName) {
       teamsApi.inbox(teamName).then(setInbox).catch(() => {})
-      teamsApi.markRead(teamName).then(() => markAllRead()).catch(() => {})
+      markAllRead()
     }
   }
 

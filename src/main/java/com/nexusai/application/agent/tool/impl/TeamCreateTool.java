@@ -62,8 +62,14 @@ public class TeamCreateTool implements Tool {
     /** CC swarm/constants.ts:1 TEAM_LEAD_NAME · lead agent 确定性名字段。 */
     public static final String TEAM_LEAD_NAME = "team-lead";
 
-    /** appState teamContext 键 · 对齐 CC {@code appState.teamContext}（TeamCreateTool.ts:134）。 */
-    static final String APPSTATE_TEAM_CONTEXT = "teamContext";
+    /**
+     * appState teamContext 键 · 对齐 CC {@code appState.teamContext}（TeamCreateTool.ts:134）。
+     *
+     * <p>[H1/C1] 提为 {@code public}：跨包读侧（{@code AgentLoopContext.maybeInjectTeammateMailbox}
+     * 的 {@code appState.get("teamContext")}、{@code LlmAgentLoop} 的会话回灌）必须复用它，
+     * ⛔ 不得新造第二个字面量散点。
+     */
+    public static final String APPSTATE_TEAM_CONTEXT = "teamContext";
     static final String TEAM_CONTEXT_NAME = "teamName";
     static final String TEAM_CONTEXT_FILE_PATH = "teamFilePath";
     static final String TEAM_CONTEXT_LEAD = "leadAgentId";
@@ -240,7 +246,12 @@ public class TeamCreateTool implements Tool {
                 log.warn("[TeamCreateTool] ensureTasksDir 失败 team={} taskListId={}: {}",
                         finalTeamName, taskListId, e.getMessage());
             }
-            TaskService.setLeaderTeamName(taskListId);
+            // [P0-2 · B1] 显式 sessionId：原 1 参调用 → setLeaderTeamName 的会话键恒 null → WARN 跳过
+            //   ⇒ leaderTeamNames 无写入点 ⇒ getTaskListId 优先级 4 恒 miss ⇒ leader 落 {tasks}/{sessionId}，
+            //   而 teammate 走优先级 2（identity.teamName()）落 {tasks}/{team} ⇒ 两侧必然不同目录
+            //   （团队模式主干断裂）。此处传 ctx.sessionId() 与同方法 :212/:228 同源。
+            //   ⛔ 不得改用 :210 的 cleanupKey（ctx.sessionId()==null 时它回落进程级 UUID ⇒ 新跨会话污染）。
+            TaskService.setLeaderTeamName(taskListId, ctx != null ? ctx.sessionId() : null);
 
             // CC :194-212 setAppState(teamContext) —— 供 TeamDelete/SendMessage 读当前 team 上下文；
             //   leadSessionId 一并落 teamContext（stomp-lead-session 方案 3：前端需经

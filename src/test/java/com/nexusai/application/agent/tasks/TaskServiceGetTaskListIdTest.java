@@ -64,7 +64,10 @@ class TaskServiceGetTaskListIdTest {
         System.clearProperty("nexusai.taskListId");
         System.clearProperty("nexusai.team.name");
         System.clearProperty("nexusai.sessionId");
-        TaskService.clearLeaderTeamName();
+        // [P0-2 · B1] 按本用例 sessionId 清（0 参重载 = clear(null) ⇒ 立即 return，清不掉任何键）。
+        //   本类 :110 显式 setLeaderTeamName("leader-1", SESSION) ⇒ 键必须在这里被清掉，
+        //   否则 JVM 级 static Map 会把 "leader-1" 泄漏给同类后续用例与同 JVM 的其它测试类。
+        TaskService.clearLeaderTeamName(SESSION);
     }
 
     private TaskService newService() {

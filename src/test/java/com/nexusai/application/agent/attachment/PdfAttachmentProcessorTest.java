@@ -26,13 +26,14 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * [R1] PdfAttachmentProcessor 单元契约 · PDF 分页决策 + document/image block 注入（≤20 页直接注入）。
+ * [R1] PdfAttachmentProcessor 单元契约 · PDF 分页决策 + document/image block 注入
+ * （≤{@link PdfSupport#PDF_AT_MENTION_INLINE_THRESHOLD} 页直接注入 · B1 2026-09-18 由 20 降为 10）。
  *
  * <p><b>WHY（意图验证 · CLAUDE.md 规则九）</b>：附件 PDF 在 LlmAgentLoop 主 user 消息注入前
- * 必须先做<b>分页决策</b>（≤{@link PdfSupport#PDF_MAX_PAGES_PER_READ} 直接注入 / &gt;20 页
+ * 必须先做<b>分页决策</b>（≤{@link PdfSupport#PDF_AT_MENTION_INLINE_THRESHOLD} 直接注入 / &gt;10 页
  * 标记 NEEDS_SUBAGENT 交 R2），再按<b>三态</b>解析（≤3MB → document block / &gt;3MB → 页图
  * image block）。任一决策漏掉都会让"超大 PDF 整份 base64 进 API 击穿 32MB 请求上限"或
- * ">20 页 PDF 强注入导致 API 400"等真实问题重现。
+ * ">10 页 PDF 强注入导致 API 400"等真实问题重现。
  */
 @DisplayName("[R1] PdfAttachmentProcessor · PDF 分页决策 + block 注入契约")
 class PdfAttachmentProcessorTest {
@@ -76,8 +77,8 @@ class PdfAttachmentProcessorTest {
     }
 
     @Test
-    @DisplayName("resolvePdfBlocks: 分页决策 25 页 > 20 → NEEDS_SUBAGENT（R2 标记，不注入 blocks）")
-    void moreThan20Pages_returnsNeedsSubagent(@TempDir Path dir) throws Exception {
+    @DisplayName("resolvePdfBlocks: 分页决策 25 页 > 10（内联阈值）→ NEEDS_SUBAGENT（R2 标记，不注入 blocks）")
+    void moreThan10Pages_returnsNeedsSubagent(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "big.pdf", 25);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -94,6 +95,91 @@ class PdfAttachmentProcessorTest {
             .isNotNull()
             .isNotBlank()
             .endsWith(".pdf");
+    }
+
+    /** 非 PDF 字节（损坏/加密等价）：pdfbox 结构解析必失败 → {@code getPDFPageCount} 恒返 null（可达路径）。 */
+    private static Path writeCorruptedFile(Path dir, String name, int sizeBytes) throws Exception {
+        Path file = dir.resolve(name);
+        byte[] junk = new byte[sizeBytes];
+        byte[] header = "%PDF-1.4 corrupted".getBytes(StandardCharsets.US_ASCII);
+        System.arraycopy(header, 0, junk, 0, header.length);
+        for (int i = header.length; i < junk.length; i++) {
+            junk[i] = (byte) (i * 31 + 7);
+        }
+        Files.write(file, junk);
+        return file;
+    }
+
+    // ═════════════ [B1 2026-09-18] 降级线 20 → 10（PDF_AT_MENTION_INLINE_THRESHOLD）═════════════
+    // WHY（CLAUDE.md 规则九）：对齐 CC attachments.ts:2988-2999 tryGetPDFReference —— @-mention 内联阈值
+    //   是 10 页（>10 → 只给路径），Read 工具分段上限 20 页是另一件事。20→10 的变更区间（11–20 页）
+    //   在此之前**无任何用例覆盖**，是「改了但没验」的典型形态，故三条边界用例必须固定住。
+
+    @Test
+    @DisplayName("分页决策: 11 页（落在 20→10 新降级区）→ NEEDS_SUBAGENT，不注入 blocks")
+    void elevenPages_returnsNeedsSubagent(@TempDir Path dir) throws Exception {
+        Path file = writeRealPdf(dir, "mid.pdf", 11);
+        String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
+        PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
+
+        PdfAttachmentProcessor.PdfBlocksResult result =
+            processor.resolvePdfBlocks("sess-1", null, base64);
+
+        assertThat(result.resolution())
+            .as("11 页 > 内联阈值 10 → 只给路径（旧阈值 20 下会被内联，正是本次变更点）")
+            .isEqualTo(PdfAttachmentProcessor.Resolution.NEEDS_SUBAGENT);
+        assertThat(result.pageCount()).isEqualTo(11);
+        assertThat(result.blocks()).isEmpty();
+        assertThat(result.pdfPath())
+            .as("NEEDS_SUBAGENT 必须携 pdfPath（引导模型 Read pages 分段 / 派多模态子代理）")
+            .isNotNull().isNotBlank().endsWith(".pdf");
+    }
+
+    @Test
+    @DisplayName("分页决策: 10 页（临界值）→ 仍 INJECT document block（不误伤）")
+    void tenPages_stillInjectsDocumentBlock(@TempDir Path dir) throws Exception {
+        Path file = writeRealPdf(dir, "edge.pdf", 10);
+        String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
+        PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
+
+        PdfAttachmentProcessor.PdfBlocksResult result =
+            processor.resolvePdfBlocks("sess-1", null, base64);
+
+        assertThat(result.resolution())
+            .as("10 页 == 阈值（判据为 > 而非 >=）→ 仍内联，边界不得误伤")
+            .isEqualTo(PdfAttachmentProcessor.Resolution.INJECT);
+        assertThat(result.pageCount()).isEqualTo(10);
+        assertThat(result.blocks()).hasSize(1);
+        assertThat(result.blocks().get(0)).isInstanceOf(ContentBlockParam.DocumentBlockParam.class);
+    }
+
+    @Test
+    @DisplayName("分页决策: pageCount 读不出（损坏 → null）→ 按 size/100KB 估算仍降级"
+        + "（10×100KB+1B 边界 ⇒ 估算必须 ceil=11 > 10，非截断=10）")
+    void unreadablePageCount_estimatesFromSize_stillDegrades(@TempDir Path dir) throws Exception {
+        // 10×100KB + 1B：正好卡在估算阈值上一字节 —— 只有 ceil（CC Math.ceil 浮点除法语义）才得出 11；
+        //   若退化为整型截断则得 10 → 不降级 → 本用例变红（同时钉住「页数读不出」与「ceil 语义」两件事）。
+        long sizeBytes = 10L * 100 * 1024 + 1;
+        Path file = writeCorruptedFile(dir, "broken.pdf", (int) sizeBytes);
+        // 前置断言（规则十二 fail loud）：夹具必须真的读不出页数，否则本用例测的不是目标分支
+        assertThat(PdfSupport.getPDFPageCount(file))
+            .as("夹具前提：损坏 PDF 的 pageCount 必须为 null（走 size 估算分支）")
+            .isNull();
+        String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
+        PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
+
+        PdfAttachmentProcessor.PdfBlocksResult result =
+            processor.resolvePdfBlocks("sess-1", null, base64);
+
+        assertThat(result.resolution())
+            .as("pageCount=null 时按 size/100KB 估算（CC attachments.ts:2999）→ 11 > 10 → 仍降级")
+            .isEqualTo(PdfAttachmentProcessor.Resolution.NEEDS_SUBAGENT);
+        // [B1 2026-09-18 · R3] 结果页数 = 估算值（非原始 null）：对齐 CC attachments.ts:3002/3009
+        //   pdf_reference.pageCount = effectivePageCount —— 引导文案才有估算页数可展示。
+        assertThat(result.pageCount())
+            .as("降级结果须携估算页数 11（对齐 CC effectivePageCount；传原始 null 则文案丢页数）")
+            .isEqualTo(11);
+        assertThat(result.blocks()).isEmpty();
     }
 
     @Test
@@ -172,9 +258,9 @@ class PdfAttachmentProcessorTest {
     }
 
     @Test
-    @DisplayName("生产链路: >20 页 PDF 附件 → NEEDS_SUBAGENT → 主 user 消息注入自主引导文本"
+    @DisplayName("生产链路: >10 页 PDF 附件 → NEEDS_SUBAGENT → 主 user 消息注入自主引导文本"
         + "（多模态主模型 Read pages 分段，系统不自动 fork），无 media block")
-    void productionPath_moreThan20Pages_injectsReadPagesGuidance(@TempDir Path dir) throws Exception {
+    void productionPath_moreThan10Pages_injectsReadPagesGuidance(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "big.pdf", 25);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -196,15 +282,17 @@ class PdfAttachmentProcessorTest {
             .contains("big.pdf")
             .contains("25")
             .contains("请用 Read 工具 + pages 参数分段读取")
-            .contains("超过单次读取上限 20 页")
+            // [B1 2026-09-18] 文案两数字拆开：降级触发线 10（为何只给路径）+ Read 分段上限 20（怎么读）
+            .contains("超过内联阈值 10 页")
+            .contains("每段 ≤20 页")
             .contains("请总结这个 PDF")
             .doesNotContain("已派子代理");   // 系统不自动 fork
     }
 
     @Test
-    @DisplayName("生产链路: >20 页 PDF + 文本主模型（claude-3-haiku）→ 引导调 Agent 派多模态子代理"
+    @DisplayName("生产链路: >10 页 PDF + 文本主模型（claude-3-haiku）→ 引导调 Agent 派多模态子代理"
         + "（model 提示多模态档位名；系统不自动 fork）")
-    void productionPath_moreThan20Pages_textModel_injectsAgentGuidance(@TempDir Path dir) throws Exception {
+    void productionPath_moreThan10Pages_textModel_injectsAgentGuidance(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "big.pdf", 25);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -234,8 +322,8 @@ class PdfAttachmentProcessorTest {
     }
 
     @Test
-    @DisplayName("生产链路: >20 页 PDF + 文本主模型 + 已配置多模态档位名 → 引导注入 model=多模态名")
-    void productionPath_moreThan20Pages_textModel_multimodalNameInjected(@TempDir Path dir) throws Exception {
+    @DisplayName("生产链路: >10 页 PDF + 文本主模型 + 已配置多模态档位名 → 引导注入 model=多模态名")
+    void productionPath_moreThan10Pages_textModel_multimodalNameInjected(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "big.pdf", 25);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -307,8 +395,8 @@ class PdfAttachmentProcessorTest {
     }
 
     @Test
-    @DisplayName("文本模型路径: 25 页 >20 仍 NEEDS_SUBAGENT（分页决策优先，不页图注册）")
-    void textModel_moreThan20Pages_stillNeedsSubagent(@TempDir Path dir) throws Exception {
+    @DisplayName("文本模型路径: 25 页 >10 仍 NEEDS_SUBAGENT（分页决策优先，不页图注册）")
+    void textModel_moreThan10Pages_stillNeedsSubagent(@TempDir Path dir) throws Exception {
         Path file = writeRealPdf(dir, "big.pdf", 25);
         String base64 = Base64.getEncoder().encodeToString(Files.readAllBytes(file));
         PdfAttachmentProcessor processor = new PdfAttachmentProcessor();
@@ -325,7 +413,7 @@ class PdfAttachmentProcessorTest {
         assertThat(pending.get(0).visionContentIds()).isEmpty();
         // [pdf-subagent] needsSubagent PendingPdf 须携 pdfPath（resolvePdfBlocks 产物，LlmAgentLoop 派子代理读原 PDF）
         assertThat(pending.get(0).pdfPath())
-            .as(">20 页 needsSubagent PendingPdf 必须保留磁盘 pdfPath（自主引导注入用）")
+            .as(">10 页 needsSubagent PendingPdf 必须保留磁盘 pdfPath（自主引导注入用）")
             .isNotNull()
             .isNotBlank()
             .endsWith(".pdf");

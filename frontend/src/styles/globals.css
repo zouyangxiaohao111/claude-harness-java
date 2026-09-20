@@ -5869,6 +5869,28 @@ html {
   font-size: 11.5px;
   color: var(--ink-faint);
 }
+/* 一键授权档位（后端 suggestions 渲染 · 允许/拒绝之外的额外选项） */
+.pb-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.pb-suggestions button {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px dashed var(--hairline-strong);
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: all 160ms;
+}
+.pb-suggestions button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--ink);
+}
 .pb-actions {
   display: flex;
   justify-content: flex-end;
@@ -9959,8 +9981,18 @@ html {
 .ud-btn.primary{background:#4A6CF7;border-color:#4A6CF7;color:#fff;font-weight:600}
 .ud-btn.primary:hover{background:#3b55d8}
 .ud-btn.ghost{color:#8b90a6;border-color:transparent}
-/* [chat-switch-stream-align D1] 流式「超长单块」纯文本降级：pre-wrap 保留换行、视觉与正文一致，
-   零 mdast parse（每帧直出 text）——治长 prose/长代码 fence 每帧全量 parse O(n²) 导致的「字不吐」。 */
+/* [stream-raw] 流式臂原样纯文本直出：pre-wrap 保留换行、字体/字号/行高继承正文（零 mdast parse，
+   逐字符等于后端原文）。选择器只用类名（0,1,0）且宿主是 <div>：不可用 <pre> 承载——
+   `.msg .content pre`（0,2,1）会压过本规则，把字体/行高/内外边距覆写成代码框样式。
+   原 [chat-switch-stream-align D1] 的 `.md-stream-degraded` 规则**保留**（紧随其后，同体）——
+   D1 降级路径在 [stream-raw] 后不再被执行，但那条规则是「一行回退」的一部分，理由见下条注释。 */
+.md-stream-raw{white-space:pre-wrap;word-break:break-word;margin:0;padding:0;font:inherit;color:inherit;line-height:inherit;font-family:inherit}
+/* [stream-raw] 回退线配套：D1 降级态的类（`MarkdownText` 的 `STREAM_DEGRADE_CLASS`，宿主是 <pre>）。
+   [stream-raw] 后生产不再走 D1 路径，但 `StreamingRenderer`／常量／本规则必须一起在，回退才是一条线：
+   少了本规则，回退后命中 D1 降级时 `<pre class="md-stream-degraded">` 会落到 `.msg .content pre`
+   （0,2,1，**不设 `white-space`**）手上 ⇒ 长行不折行 + 横向滚动 + `word-break` 丢失。
+   与 `.md-stream-raw` 同体（同为 0,1,0 —— `.msg .content pre` 仍会覆写 font/padding，那是回退路径
+   的既有形态，不在本次范围）。 */
 .md-stream-degraded{white-space:pre-wrap;word-break:break-word;margin:0;padding:0;font:inherit;color:inherit;line-height:inherit;font-family:inherit}
 /* [window-paging] 消息列表顶部「加载更早」（hasMore 有更早历史时 · 对齐 deepseek loadOlder 按钮） */
 .ml-load-older{display:block;margin:2px auto 12px;padding:5px 16px;font-size:12px;color:var(--ink-muted,#888);background:transparent;border:1px solid var(--hairline,#e5e5e5);border-radius:999px;cursor:pointer;transition:all .12s}

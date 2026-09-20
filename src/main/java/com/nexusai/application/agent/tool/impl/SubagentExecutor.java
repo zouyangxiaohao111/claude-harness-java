@@ -604,6 +604,42 @@ public class SubagentExecutor {
     private final ToolUseContext parentToolUseContext;
 
     /**
+     * [P0-D1] model → (ProviderConfig, providerType) 运行时解析器 · 单一来源（同
+     * {@code SubagentTool:209 modelConfigResolver} / {@code ModelConfigResolver}）。
+     *
+     * <p><b>WHY（修「三条路径恒 mock」）</b>：{@link #providerConfig} 是<b>装配期</b>注入的常量，而
+     * 生产 {@code ToolRegistrationConfig.subagentExecutor @Bean} 传的是 <b>null</b>（第 5 实参）⇒
+     * {@code LlmProviderFactory:48-50}（{@code config==null → mockLlmProvider}）⇒ <b>本 bean 上跑的
+     * 三条路径</b>的 query loop 恒为 MockLlmProvider：① 队友 {@code AutonomousAgentLoop:1169}
+     * {@code executeStreaming}（{@code SpawnInProcess:60} {@code @Autowired} 注入的就是本单例）；
+     * ② fork 技能 {@code SkillToolImpl:1660 executeForkedSkill}（经 {@code ToolRegistrationConfig:607}
+     * {@code setSubagentExecutor(本单例)}）；③ workflow worker {@code ClaudeCodeBackendAdapter:290}。
+     * 对照组：{@code SubagentTool} 每次调用 <b>new 私有实例</b>并经 {@code effectiveProviderConfig}
+     * （{@code SubagentTool:1497-1508}）在<b>运行时</b>按模型名解析 ⇒ 那条路是好的。
+     *
+     * <p><b>为何是字段而不是 setter / 可变 providerConfig</b>：本类是 Spring 单例（
+     * {@code ToolRegistrationConfig:683 @Bean} 无 {@code @Scope}），本类 :853-861 明令「不得退化为
+     * 实例级裸字段」（per-session 状态会跨会话串值，有守护测试
+     * {@code SubagentG4MetricsTest#resolveSystemContextText_sameExecutorTwoSessions_doNotShareGitAnchor}）。
+     * 本字段承载的是<b>无状态单例服务引用</b>（会话无关，解析入参才是 per-call 模型名），故不构成串值面；
+     * 而 {@code providerConfig} 保持 {@code final} 不变（per-call 值一律走局部变量下传）。
+     *
+     * <p>{@code @Autowired(required=false)}：测试直构（{@code new SubagentExecutor(...)}）不注入 →
+     * 回落 {@code null} → {@link #effectiveProviderConfig} 退回 {@code providerConfig}（旧行为不变）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
+
+    /**
+     * [P0-D2] settings 读取器 · 供 {@link #settingsSubagentModelId()}（settings.subagent_model_name
+     * 全名/裸名反查为 DB models.name）。与 {@code SubagentTool:200 @Autowired(required=false)
+     * SettingsMapper} 同款（同一解析链 {@code SubagentTool:2205 getAgentModel} → {@code AgentModelResolver}）。
+     * 未注入（测试/手动直构）→ 返回 null（解析链回落 env / 'inherit'）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
+
+    /**
      * s18 P1-5/6: Worktree 服务 — 用于 sub-agent 隔离 (isolation=worktree).
      * 可选注入, 未注入时回退到旧 user.dir stub 行为.
      */
@@ -1415,6 +1451,149 @@ public class SubagentExecutor {
         return "fork".equalsIgnoreCase(agentType);
     }
 
+    /** [P0-D2] settings 单例行 id（同 {@code SubagentTool:241} / {@code ModelConfigResolver:44}）。 */
+    private static final int SETTINGS_SINGLETON_ID = 1;
+
+    /**
+     * [P0-D1] 有效 ProviderConfig · 逻辑与 {@code SubagentTool:1497-1508 effectiveProviderConfig}
+     * <b>逐字同构</b>（同一语义的单一来源，见该类 javadoc）。
+     *
+     * <p>解析顺序：装配期显式注入的 {@link #providerConfig}（非 null → 原样返回，<b>零行为变化</b>）
+     * → 按 model 运行时解析（{@link com.nexusai.infra.llm.ModelConfigResolver#resolve}，与
+     * {@code ChatService.buildConfigForModel} 同源）→ 都不可用 → {@code null}（由
+     * {@code LlmProviderFactory:48-50} 落 mock 兜底，<b>不在此处构造 mock</b>）。
+     *
+     * <p><b>为何在 SubagentExecutor 内解析（而不是让三个调用方各自传）</b>：三条受害路径
+     * （队友 / fork 技能 / workflow worker）共用<b>同一个 Spring 单例 bean</b>，调用方无从预知
+     * per-call 模型；把解析下沉到本类 ⇒ 一处修、三条路径同时修好，且未来任何新的
+     * {@code new SubagentExecutor(...)} / 复用本 bean 的调用点<b>默认安全</b>。
+     *
+     * @param effectiveModel 本子代理生效模型名（{@link #resolveEffectiveModel} 产物，可能 null/blank）
+     * @return 有效 ProviderConfig；不可用 → null（调用方/工厂落 mock）
+     */
+    ProviderConfig effectiveProviderConfig(String effectiveModel) {
+        if (providerConfig != null) {
+            return providerConfig;
+        }
+        if (modelConfigResolver != null && effectiveModel != null && !effectiveModel.isBlank()) {
+            com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolved =
+                modelConfigResolver.resolve(effectiveModel);
+            if (resolved != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[SubagentExecutor] [P0-D1] provider 运行时解析命中: model={} providerType={} "
+                        + "（SubagentTool.effectiveProviderConfig 同源）",
+                        effectiveModel, resolved.providerType());
+                }
+                return resolved.config();
+            }
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[SubagentExecutor] [P0-D1] provider 解析不可用: providerConfig={} resolver={} model={} "
+                + "→ 返回 null（LlmProviderFactory 落 mock 兜底，不构造 mock）",
+                providerConfig != null, modelConfigResolver != null, effectiveModel);
+        }
+        return null;
+    }
+
+    /**
+     * [P0-D2] 子代理 effective model 解析 · 对齐 CC {@code getAgentModel}
+     * （{@code utils/model/agent.ts:37-95}），与 {@code SubagentTool:2720 getAgentModel} 走
+     * <b>同一条</b> {@link com.nexusai.application.agent.subagent.AgentModelResolver} 解析链。
+     *
+     * <p><b>WHY（修「字面量 gpt-4 兜底」）</b>：旧实现 =
+     * {@code modelOverride != null ? modelOverride : agentDefinition.model().orElse(fallbackModelName)}，
+     * 其中 {@code fallbackModelName} 是装配期字面量 {@code "gpt-4"}
+     * （{@code ToolRegistrationConfig.subagentExecutor @Bean} 第 6 实参）。队友的 agentDefinition 是
+     * {@code BuiltInAgents.GENERAL_PURPOSE_AGENT}（{@code BuiltInAgents:490-497} 未设 model ⇒
+     * {@code model()} 为 {@code Optional.empty}）⇒ 落 {@code "gpt-4"}；而
+     * {@code ModelConfigResolver.resolve} 是 <b>DB {@code models.name} 精确匹配</b>，库里没有
+     * {@code gpt-4} 行 ⇒ 解析 null ⇒ <b>即便 provider 解析（P0-D1）修好也仍静默落 mock</b>。
+     *
+     * <p>解析链（{@code AgentModelResolver.resolveWithEnv} 实现，本方法只负责供料）：
+     * <ol>
+     *   <li>{@code modelOverride}（显式指定，最优先）—— 在调用点短路，不进本方法</li>
+     *   <li>{@code settings.subagent_model_name}（DB 默认子代理模型；与 SubagentTool 同源）</li>
+     *   <li>{@code CLAUDE_CODE_SUBAGENT_MODEL} env</li>
+     *   <li>{@code agentDefinition.model() ?? 'inherit'} → {@code 'inherit'} 取
+     *       <b>父线程当前模型</b>（CC {@code toolUseContext.options.mainLoopModel} 语义）</li>
+     * </ol>
+     * 全部不可用 → 回落 {@link #fallbackModelName}，但<b>必须告警</b>（旧实现是静默的；静默 =
+     * 「模型以为用了 X、实际落 mock」的不可见失败）。
+     *
+     * @param agentDefinition 解析后的 agent 定义（model 可空 = CC 'inherit'）
+     * @param permissionMode  父当前权限模式（供 'inherit' 的 plan 模式升级判断，可空）
+     * @param parentTucOverride per-call 父 TUC 覆盖（fork 技能路径）；null → 回落构造器级字段
+     * @return 生效模型名（恒非 null：最终回落 {@link #fallbackModelName}）
+     */
+    String resolveEffectiveModel(AgentDefinition agentDefinition, PermissionMode permissionMode,
+                                 ToolUseContext parentTucOverride) {
+        String resolved = com.nexusai.application.agent.subagent.AgentModelResolver.resolve(
+            agentDefinition.model().orElse(null),
+            parentModelName(parentTucOverride),
+            null,   // toolSpecifiedModel：modelOverride 已在调用点短路（保持既有优先级，零行为变化）
+            permissionMode == null ? null : permissionMode.name(),
+            settingsSubagentModelId());
+        if (resolved != null && !resolved.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SubagentExecutor] [P0-D2] effective model 解析: type={} agentModel={} parentModel={} "
+                    + "→ {}（CC getAgentModel, agent.ts:37-95）",
+                    agentDefinition.agentType(), agentDefinition.model().orElse(null),
+                    parentModelName(parentTucOverride), resolved);
+            }
+            return resolved;
+        }
+        log.warn("[SubagentExecutor] [P0-D2] effective model 全链不可解析（settings.subagent_model_name / "
+            + "CLAUDE_CODE_SUBAGENT_MODEL / 父线程模型 均空）: type={} agentModel={} parentModel={} "
+            + "→ 回落装配兜底 '{}'（该名可能不在 DB models.name ⇒ 下游 provider 解析落 mock；"
+            + "这是<b>告警</b>而非静默，需要时请配置 settings.subagent_model_name）",
+            agentDefinition.agentType(), agentDefinition.model().orElse(null),
+            parentModelName(parentTucOverride), fallbackModelName);
+        return fallbackModelName;
+    }
+
+    /**
+     * 父线程当前模型名（CC {@code toolUseContext.options.mainLoopModel} 语义）。
+     *
+     * <p>来源 = {@link ToolUseContext#effectiveModelName()}（本仓 ToolUseContext:164 的
+     * 「当前 turn 有效模型名」字段，Java 扩展，语义对齐 CC options.mainLoopModel）。
+     * per-call 覆盖（fork 技能）优先于构造器级 {@code parentToolUseContext}；两者皆无
+     * （队友 / workflow 等 standalone 路径）→ null ⇒ 解析链的 'inherit' 腿自行处理。
+     */
+    private String parentModelName(ToolUseContext parentTucOverride) {
+        ToolUseContext tuc = parentTucOverride != null ? parentTucOverride : parentToolUseContext;
+        if (tuc == null) {
+            return null;
+        }
+        String m = tuc.effectiveModelName();
+        return (m != null && !m.isBlank()) ? m : null;
+    }
+
+    /**
+     * settings.subagent_model_name（DB 默认子代理模型）· 与 {@code SubagentTool:2754-2772
+     * settingsSubagentModelId} 同语义。
+     *
+     * <p>未注入（测试/手动直构）/ 读取异常 → null（吞并，不向上传播进 async 线程）。
+     */
+    private String settingsSubagentModelId() {
+        try {
+            if (settingsMapper == null) {
+                return null;
+            }
+            com.nexusai.repository.settings.entity.SettingsRecord s =
+                settingsMapper.selectOneById(SETTINGS_SINGLETON_ID);
+            String subagentRaw = s != null ? s.getSubagentModelName() : null;
+            if (log.isDebugEnabled()) {
+                log.debug("[SubagentExecutor] settings.subagentModelName 读取: {}（[P0-D2] DB 优先）", subagentRaw);
+            }
+            return subagentRaw;
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SubagentExecutor] settings.subagentModelName 读取异常，回落 null: {}", e.toString());
+            }
+            return null;
+        }
+    }
+
     /**
      * 执行子 Agent · 22 步流程（对齐 CC runAgent.ts:248-860）
      *
@@ -1601,13 +1780,22 @@ public class SubagentExecutor {
                     + "可用 Agent types: " + availableList);
         }
 
-        String effectiveModel = modelOverride != null
-                ? modelOverride
-                : agentDefinition.model().orElse(fallbackModelName);
-
         // ── Step 2: toolPermissionContext ──
         boolean isAsync = agentDefinition.background().orElse(false);
         PermissionMode permissionMode = resolvePermissionMode(agentDefinition);
+
+        // ── [P0-D2] effective model ──
+        //   旧实现 = modelOverride ?? agentDefinition.model() ?? fallbackModelName，其 fallbackModelName
+        //   是装配期字面量 "gpt-4"（ToolRegistrationConfig.subagentExecutor @Bean 第 6 实参）。队友的
+        //   agentDefinition 是 BuiltInAgents.GENERAL_PURPOSE_AGENT（BuiltInAgents:490-497 未设 model）
+        //   ⇒ 落 "gpt-4"；而 ModelConfigResolver.resolve 是 DB models.name 精确匹配、库里无该行 ⇒ 解析
+        //   null ⇒ 即便 provider 解析（P0-D1）修好也仍静默落 mock。现委托 resolveEffectiveModel，与
+        //   SubagentTool:2720 getAgentModel 走同一条 AgentModelResolver 解析链（CC utils/model/agent.ts:37-95）。
+        //   声明下移到 resolvePermissionMode 之后：仅为把父当前 permissionMode 供 'inherit' 的 plan 模式
+        //   升级判断（CC agent.ts:84）；两处表达式均无副作用，语句顺序变化不影响任何行为。
+        String effectiveModel = (modelOverride != null && !modelOverride.isBlank())
+                ? modelOverride
+                : resolveEffectiveModel(agentDefinition, permissionMode, parentTucOverride);
         // [B-2] shouldAvoidPermissionPrompts · 对齐 CC runAgent.ts:440-451 降级公式:
         //   shouldAvoidPrompts = canShowPermissionPrompts!==undefined ? !canShowPermissionPrompts
         //                       : (agentPermissionMode==='bubble' ? false : isAsync)
@@ -2212,7 +2400,7 @@ public class SubagentExecutor {
             summarySpawnPath, summaryTaskId,
             summaryService, coordinatorMode, sdkAgentProgressSummariesEnabled,
             agentIdHex, sessionDir, sessionId.toString(),
-            llmProviderFactory, providerConfig, effectiveModel,
+            llmProviderFactory, effectiveProviderConfig(effectiveModel), effectiveModel,
             progressTracker, sdkEventQueue,
             // [S1-T7] 本子代理的归因上下文（Step 19.8 之前已构造 · 见上方上提块）。
             agentContext);
@@ -4664,7 +4852,7 @@ public class SubagentExecutor {
                         //   来源 = AgentState.systemPrompt()（new AgentState(agentSystemPrompt, ...)）。
                         state.rawMessages(), java.util.List.of(), baseTuc,
                         forkQuerySource, effectiveModel, maxTurns, null, null, null, null,
-                        deps, providerConfig)
+                        deps, effectiveProviderConfig(effectiveModel))
                         // [IMP2-05 运行时接线] 注入 agentType 级精确 querySource（CC querySource 值域
                         //   唯一来源：promptCategory.ts:16-28 getQuerySourceForAgent → AgentTool.tsx:609
                         //   toolUseContext.options.querySource ?? getQuerySourceForAgent(...)，fork 子

@@ -1,5 +1,11 @@
 package com.nexusai.application.agent.permission;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
+import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+
+import java.io.IOException;
 import java.util.List;
 
 /**
@@ -33,7 +39,30 @@ import java.util.List;
  * <p>sealed + permits 让 PR 4+ 的 {@code switch (update)} 模式匹配在编译期
  * 保证 exhaustive——6 个 case 缺一不可。下游 IDE / javac -encoding UTF-8 会强制实现，避免
  * 漏掉某 case 导致 silent skip（CLAUDE.md 规则十二）。
+ *
+ * <h2>[批 A1] 线格式 = CC 形状（{@link WireSerializer}）</h2>
+ * <p>本接口的出站 JSON 由 {@link WireSerializer} 单点产出，严格对齐 CC
+ * {@code utils/permissions/PermissionUpdateSchema.ts:42-78}：
+ * <ul>
+ *   <li>{@code type} 判别字段（{@code addRules} / {@code replaceRules} / {@code removeRules} /
+ *       {@code setMode} / {@code addDirectories} / {@code removeDirectories}）——CC
+ *       {@code z.discriminatedUnion('type', ...)}；</li>
+ *   <li>{@code destination} / {@code behavior} / {@code mode} 一律 CC 小驼峰字面量
+ *       （{@code localSettings} / {@code allow} / {@code acceptEdits}）；</li>
+ *   <li>{@code rules} 元素<b>扁平</b>为 {@code toolName} + 可选 {@code ruleContent}
+ *       （CC {@code PermissionRuleValue}，注意 CC 的规则对象<b>没有</b> {@code source} /
+ *       {@code ruleBehavior} —— Java {@link PermissionRule} 的这两项是本地扩展，出处见
+ *       {@code PermissionUpdateApplier} 的 [DEL-WF1-04] 说明，落桶归属由 {@code destination} 表达）；</li>
+ *   <li>{@code AddDirectories} / {@code RemoveDirectories} 的字段名是 {@code directories}
+ *       （不是 Java 侧的 {@code paths}）—— 二者唯一可区分之处就是 {@code type}，
+ *       这正是批 A1 修掉的「新增目录被反向执行成删除目录」根因。</li>
+ * </ul>
+ * <p>为什么用自定义 serializer 而不是 {@code @JsonTypeInfo}：Java 记录比 CC 富（多
+ * {@code source}/{@code ruleBehavior}），以纯注解表达扁平化与字段更名会把改造面扩散到
+ * 共享枚举与 {@link PermissionRule} 的全局 Jackson 行为（settings 落盘、hook 载荷等）。
+ * 单点 serializer 把线格式收敛在一处，且与 CC schema 的 6 case 一一对应，便于逐条对读。
  */
+@JsonSerialize(using = PermissionUpdate.WireSerializer.class)
 public sealed interface PermissionUpdate
         permits PermissionUpdate.AddRules,
                 PermissionUpdate.RemoveRules,
@@ -62,7 +91,113 @@ public sealed interface PermissionUpdate
         PROJECT_SETTINGS,
         LOCAL_SETTINGS,
         CLI_ARG,
-        SESSION
+        SESSION;
+
+        /**
+         * CC {@code permissionUpdateDestinationSchema} 字面量
+         * （{@code PermissionUpdateSchema.ts:27-40}，{@code z.enum} 大小写敏感）。
+         *
+         * <p>全仓 destination → CC 串的唯一映射点；解析侧反向（{@code ccLiteral} →
+         * 枚举）由 {@code WebSocketPermissionPrompter.parseDestination} 承担。
+         */
+        public String ccLiteral() {
+            return switch (this) {
+                case USER_SETTINGS -> "userSettings";
+                case PROJECT_SETTINGS -> "projectSettings";
+                case LOCAL_SETTINGS -> "localSettings";
+                case CLI_ARG -> "cliArg";
+                case SESSION -> "session";
+            };
+        }
+    }
+
+    /**
+     * 把 {@link PermissionUpdate} 6 型写成 CC {@code discriminatedUnion('type', ...)} 形状。
+     *
+     * <p>对齐 CC {@code PermissionUpdateSchema.ts:42-78}，逐 case 对应：
+     * <ul>
+     *   <li>{@code addRules} / {@code replaceRules} / {@code removeRules} — type + rules
+     *       （元素为 {@code {toolName, ruleContent?}}）+ behavior + destination（:44-61）；</li>
+     *   <li>{@code setMode} — type + mode + destination（:62-66）；</li>
+     *   <li>{@code addDirectories} / {@code removeDirectories} — type + directories +
+     *       destination（:67-77）。</li>
+     * </ul>
+     * <p>{@code ruleContent} 为 null 时省略该字段（CC {@code ruleContent?: string} optional）；
+     * {@code behavior} 写在 {@code rules} 之后，与 CC 声明顺序一致（顺序对 JSON 等值无影响，
+     * 仅便于与 CC schema 逐行对读）。
+     */
+    final class WireSerializer extends JsonSerializer<PermissionUpdate> {
+
+        @Override
+        public void serialize(PermissionUpdate value, JsonGenerator gen,
+                              SerializerProvider serializers) throws IOException {
+            gen.writeStartObject();
+            switch (value) {
+                case AddRules u -> {
+                    gen.writeStringField("type", "addRules");
+                    writeRules(gen, u.rules());
+                    gen.writeStringField("behavior", u.behavior().ccLiteral());
+                    gen.writeStringField("destination", u.destination().ccLiteral());
+                }
+                case ReplaceRules u -> {
+                    gen.writeStringField("type", "replaceRules");
+                    writeRules(gen, u.rules());
+                    gen.writeStringField("behavior", u.behavior().ccLiteral());
+                    gen.writeStringField("destination", u.destination().ccLiteral());
+                }
+                case RemoveRules u -> {
+                    gen.writeStringField("type", "removeRules");
+                    writeRules(gen, u.rules());
+                    gen.writeStringField("behavior", u.behavior().ccLiteral());
+                    gen.writeStringField("destination", u.destination().ccLiteral());
+                }
+                case SetMode u -> {
+                    gen.writeStringField("type", "setMode");
+                    gen.writeStringField("mode", ToolPermissionGate.modeToCcString(u.mode()));
+                    gen.writeStringField("destination", u.destination().ccLiteral());
+                }
+                case AddDirectories u -> {
+                    gen.writeStringField("type", "addDirectories");
+                    writeStringArray(gen, "directories", u.paths());
+                    gen.writeStringField("destination", u.destination().ccLiteral());
+                }
+                case RemoveDirectories u -> {
+                    gen.writeStringField("type", "removeDirectories");
+                    writeStringArray(gen, "directories", u.paths());
+                    gen.writeStringField("destination", u.destination().ccLiteral());
+                }
+            }
+            gen.writeEndObject();
+        }
+
+        /**
+         * CC {@code rules: PermissionRuleValue[]} —— 每项扁平为
+         * {@code {toolName, ruleContent?}}（无 {@code source} / {@code ruleBehavior} / 无嵌套
+         * {@code ruleValue}）。
+         */
+        private static void writeRules(JsonGenerator gen, List<PermissionRule> rules)
+                throws IOException {
+            gen.writeArrayFieldStart("rules");
+            for (PermissionRule rule : rules) {
+                PermissionRuleValue ruleValue = rule.ruleValue();
+                gen.writeStartObject();
+                gen.writeStringField("toolName", ruleValue.toolName());
+                if (ruleValue.ruleContent() != null) {
+                    gen.writeStringField("ruleContent", ruleValue.ruleContent());
+                }
+                gen.writeEndObject();
+            }
+            gen.writeEndArray();
+        }
+
+        private static void writeStringArray(JsonGenerator gen, String field, List<String> values)
+                throws IOException {
+            gen.writeArrayFieldStart(field);
+            for (String v : values) {
+                gen.writeString(v);
+            }
+            gen.writeEndArray();
+        }
     }
 
     /**

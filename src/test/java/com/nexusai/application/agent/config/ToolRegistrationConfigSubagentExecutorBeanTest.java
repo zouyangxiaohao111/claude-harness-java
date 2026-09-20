@@ -126,4 +126,32 @@ class ToolRegistrationConfigSubagentExecutorBeanTest {
             .as("fork 路径装配必须注入 sdkEventQueue，否则周期摘要只记录不发射 task_progress（D-3）")
             .isSameAs(sdkEventQueue);
     }
+
+    @Test
+    @DisplayName("[P0-D1/D2] bean 装配实参：providerConfig=null + fallbackModelName=\"gpt-4\"（三路径恒 mock 的装配侧根因）")
+    void beanPassesNullProviderConfigAndLiteralFallbackModel() throws Exception {
+        // WHY（本批补的缺失覆盖）: 本类此前只覆盖 fallbackSystemPrompt / summaryService /
+        //   coordinatorMode / sdkEventQueue —— **providerConfig 与 fallbackModelName 零覆盖**（这正是
+        //   「三条路径恒 MockLlmProvider」这个洞长期测不出来的原因：@Bean 把第 5 实参写死 null、
+        //   第 6 实参写死字面量 "gpt-4"，没有任何用例断言过这两个值）。
+        //   本用例**只是把装配事实钉住**（characterization test）；「providerConfig 为 null 时仍能自解析」
+        //   的行为证明在 SubagentExecutorProviderResolutionTest（需最小容器验 @Autowired 字段注入）。
+        //   ⚠️ 若将来 @Bean 改为传入真实 providerConfig，本断言应随之更新（那是装配侧的改进，不是回归）。
+        ToolRegistrationConfig config = new ToolRegistrationConfig();
+        SubagentExecutor executor = config.subagentExecutor(
+            null, null, null, null, null, null, null, null, null, null, null, false, null, null, null, null, null, null, null);
+
+        Field pc = SubagentExecutor.class.getDeclaredField("providerConfig");
+        pc.setAccessible(true);
+        Field fm = SubagentExecutor.class.getDeclaredField("fallbackModelName");
+        fm.setAccessible(true);
+
+        assertThat(pc.get(executor))
+            .as("@Bean 第 5 实参必须是 null（装配事实）⇒ 三条路径的 provider 只能靠运行时自解析（P0-D1）")
+            .isNull();
+        assertThat(fm.get(executor))
+            .as("@Bean 第 6 实参是字面量 \"gpt-4\"（装配事实）—— 旧兜底链落到它 ⇒ DB models.name 无此行 "
+                + "⇒ 静默落 mock（P0-D2）；现仅作最后一道兜底且必须告警")
+            .isEqualTo("gpt-4");
+    }
 }

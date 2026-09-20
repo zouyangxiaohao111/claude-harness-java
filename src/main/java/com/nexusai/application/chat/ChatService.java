@@ -260,8 +260,10 @@ public class ChatService {
      *
      * <p>enqueue {@code mode=prompt, workload="busy-queued", priority=NEXT, uuid=userMessageId}，
      * 不 cancel 旧 turn——对齐 CC busy prompt 默认 {@code priority='next'}：优先在下一个工具边界被
-     * 当前轮 mid-turn drain 注入消费（同轮回答）；仅当前轮不再调工具时才留到 turn 结束由
-     * CronIdleExecutor 起新轮消费（B3）。
+     * 当前轮 mid-turn drain 注入<b>紧接的那一轮请求</b>（= 同轮可见；drain 位于 messagesForQuery
+     * 快照之前 —— [C3 2026-09-19] 改前 drain 在快照之后，产物要再等一轮才进请求，「同轮回答」
+     * 在当时不成立）；仅当前轮不再调工具时才留到 turn 结束由 CronIdleExecutor 起新轮消费（B3）。
+     * 注入即登记落库（[C2 2026-09-19] RAW content + queued_origin + is_meta）。
      *
      * @param sessionId     目标会话（short）
      * @param userMessageId DB user 消息 id（前端正式气泡 id 与 DB 一致）
@@ -681,14 +683,17 @@ public class ChatService {
                 //   QueueItem.userAttachments）→ 补落路径落出同一 user_attachments，
                 //   F5 重拉气泡附件胶囊 + 预览 url 不因走哪条落库路径而异。
                 //   无快照仍走 6 参（invoked overload 不变 = 既有落库形状/调用方契约零变化）。
+                // [C2 2026-09-19] isMeta 由硬编码 false 改为 inj.isMeta() —— mid-turn 通知
+                //   （task-notification 等）须落 is_meta=true（resume 后 UI 隐藏，与 live 语义一致、
+                //   对齐 CC queued_command）；busy-queued 恒 false ⇒ 既有行为零变化。
                 if (inj.userAttachments() != null && !inj.userAttachments().isEmpty()) {
                     messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
-                        ts, false, inj.queuedOrigin(),
+                        ts, inj.isMeta(), inj.queuedOrigin(),
                         null /* imagePasteIds：图片走 AM 回写（updateUserImagePasteIds）通道，本处不重复 */,
                         inj.userAttachments());
                 } else {
                     messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
-                        ts, false, inj.queuedOrigin());
+                        ts, inj.isMeta(), inj.queuedOrigin());
                 }
                 if (log.isInfoEnabled()) {
                     log.info("ChatService: mid-turn 注入排队 user 消息补落库 session={} id={} chars={}"
@@ -899,6 +904,11 @@ public class ChatService {
             //   让 LlmAgentLoop 在 OpenAiSdkProvider 解析 chunk 时**立即推 STOMP** (真流式).
             loop = loopProvider.getObject();
             loop.setStreamContext(wsTemplate, sessionId, userMessageId);
+            // [C1 收口] 本 run 是**交互式前台用户回合** ⇒ 唯一有资格消费队长 inbox 的 run：
+            //   置位后 doRun 回灌的 teamContext 才会被 maybeInjectTeammateMailbox 消费并标已读。
+            //   非交互 run（CronIdleExecutor 空闲代跑 / MainSessionBackgroundService 后台任务）不置位
+            //   ⇒ 不会抢先 markRead 吃掉队员消息（判据 = per-run 显式值，非 sysprop/ThreadLocal）。
+            loop.setTeammateInboxConsumer(true);
             // STREAM-P1-FIX: 真实注入 token budget / query config
             //   不再是 setXxx 死代码 - 实际进 LlmAgentLoop.run() 的 loop() 内每轮 check
             if (tokenBudgetChecker != null) loop.setTokenBudgetChecker(tokenBudgetChecker);
@@ -1015,14 +1025,21 @@ public class ChatService {
                     realErrorAssistantId, task.assistantMessageId,
                     realErrorAssistantId.equals(task.assistantMessageId) ? "task-placeholder" : "registry-inflight");
             }
-            sendAndLog(wsTemplate, streamTopic,
-                MessageErrorEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realErrorAssistantId,
-                    errorCode, errorMsg),
-                "error code=" + errorCode + " msg=" + abbreviate(errorMsg, 200));
-            sendAndLog(wsTemplate, streamTopic,
-                SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
-                "status=idle (after error)");
-            inProgress.remove(sessionId, task);
+            // [C6 · 停止键可见性] 同族缺口（本批审计发现的第三处）：error 事件推送本身也可能抛
+            //   （convertAndSend 走 broker）→ 若把 idle 写在它之后，error 推送一炸就跳过 idle ⇒
+            //   前端 serverRunning 永久 true（停止键永不消失）。与成功路径同款：idle + inProgress.remove
+            //   进 finally，保证「run 收口必推 idle」在三条终态分支（成功 / cancel / error）上一致。
+            try {
+                sendAndLog(wsTemplate, streamTopic,
+                    MessageErrorEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realErrorAssistantId,
+                        errorCode, errorMsg),
+                    "error code=" + errorCode + " msg=" + abbreviate(errorMsg, 200));
+            } finally {
+                sendAndLog(wsTemplate, streamTopic,
+                    SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
+                    "status=idle (after error)");
+                inProgress.remove(sessionId, task);
+            }
             return;
         }
 
@@ -1043,67 +1060,79 @@ public class ChatService {
                 (lastAsst != null && lastAsst.id() != null) ? "lastAssistantMessage" : "task-placeholder");
         }
 
-        // [实时落库 2026-09-03] run() 返回后收口：解除 appendListener（防泄漏/下轮误触发）+ queued-user
-        //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
-        //   批量已删——消息已实时落库，此处不再遍历 state.rawMessages()。
-        if (state != null) {
-            // [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks / getRemainingResults 收尾]
-            //   非 NORMAL 终态(用户停止 ABORTED / STREAM_ERROR / MAX_TURNS 等)时，为"有 tool_use 但
-            //   无对应 tool_result"的孤儿工具补 synthetic is_error（content 以 "Error" 开头 → 落库 isError=true）
-            //   ——此刻 appendListener 仍武装，append 即持久化补写 DB tool_call.result + STOMP 推 tool_result，
-            //   根治"被取消/中断的工具卡永久执行中"(历史 F5 复现)。正常 NORMAL 收尾工具必已由执行器补结果，跳过。
-            if (state.exitReason() != AgentState.ExitReason.NORMAL) {
-                repairOrphanToolResults(state, sessionId);
+        // ── [C6 · 停止键可见性] run 已返回 ⇒ 收口段整体包 try/finally（idle 必达）─────────────────
+        // WHY：run 返回后的每一步都可能抛 —— 孤儿工具补写（repairOrphanToolResults → appendListener 落库）、
+        //   publishCompleteEvent 的上下文快照装配 + STOMP 推送、costTracker.saveCurrentSessionCosts 的
+        //   DB 读-改-写（sessionMapper.selectOneById + update，两处均无 try）。而这段末尾的 status=idle 是
+        //   前端「停止键」**唯一的解除信号**（前端 serverRunning[sid] 只能靠它翻回 false）。
+        //   任一步抛出把 idle 吞掉，前端就永久停在「运行中」：停止键永不消失 + Esc 永走停止分支 +
+        //   对话操作弹窗永久打不开，直到 F5 / 切会话 / 重连（只有那三条路会走 GET /running 重建）。
+        //   故 idle + inProgress.remove 进 finally：**真源在服务端 ⇒ 由服务端保证这条必达**，不把
+        //   「STOMP 事件必达」当前提假定。
+        //   ⛔ 不要把 idle 挪回 try 内 —— 挪回去正是本批修的缺口（costTracker 一抛即跳过它）。
+        //   ⛔ cancel 分支的 return 也在 try 内：idle 同样由 finally 出，日志后缀经 idleWhy 保留原貌。
+        String finalContent = state.lastAssistant() == null ? "" : state.lastAssistant();
+        String idleWhy = "status=idle";
+        try {
+            // [实时落库 2026-09-03] run() 返回后收口：解除 appendListener（防泄漏/下轮误触发）+ queued-user
+            //   幂等兜底（listener 单条漏落或 mock loop 未武装时，existsById 判重补落）。原 replayAndPersist
+            //   批量已删——消息已实时落库，此处不再遍历 state.rawMessages()。
+            if (state != null) {
+                // [Fix2 2026-09-09 · 对齐 CC yieldMissingToolResultBlocks / getRemainingResults 收尾]
+                //   非 NORMAL 终态(用户停止 ABORTED / STREAM_ERROR / MAX_TURNS 等)时，为"有 tool_use 但
+                //   无对应 tool_result"的孤儿工具补 synthetic is_error（content 以 "Error" 开头 → 落库 isError=true）
+                //   ——此刻 appendListener 仍武装，append 即持久化补写 DB tool_call.result + STOMP 推 tool_result，
+                //   根治"被取消/中断的工具卡永久执行中"(历史 F5 复现)。正常 NORMAL 收尾工具必已由执行器补结果，跳过。
+                if (state.exitReason() != AgentState.ExitReason.NORMAL) {
+                    repairOrphanToolResults(state, sessionId);
+                }
+                state.clearAppendListener();
+                // [SM/compact 对齐 CC] 同步解除压缩落库监听（防陈旧 PersistCtx/sessionId 泄漏到下轮）
+                state.clearCompactPersistListener();
+                persistInjectedQueuedMessages(state, sessionId);
             }
-            state.clearAppendListener();
-            // [SM/compact 对齐 CC] 同步解除压缩落库监听（防陈旧 PersistCtx/sessionId 泄漏到下轮）
-            state.clearCompactPersistListener();
-            persistInjectedQueuedMessages(state, sessionId);
-        }
 
-        // 5) cancel 检查
-        if (task.cancel.get()) {
-            log.info("AGENT cancelled by user");
-            // [mid-turn-align] cancel 分支 queued-user 已由上方收口 persistInjectedQueuedMessages
-            //   幂等补落（run 返回后即执行，先于本 cancel 检查），此处不再重复调用。
-            sendAndLog(wsTemplate, streamTopic,
-                MessageCancelledEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realAssistantId),
-                "cancelled");
+            // 5) cancel 检查
+            if (task.cancel.get()) {
+                log.info("AGENT cancelled by user");
+                // [mid-turn-align] cancel 分支 queued-user 已由上方收口 persistInjectedQueuedMessages
+                //   幂等补落（run 返回后即执行，先于本 cancel 检查），此处不再重复调用。
+                sendAndLog(wsTemplate, streamTopic,
+                    MessageCancelledEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), realAssistantId),
+                    "cancelled");
+                // idle 由下方 finally 统一推（事件内容不变，仅日志后缀保留「cancelled」原貌）
+                idleWhy = "status=idle (cancelled)";
+                return;
+            }
+
+            log.info("AGENT done: turns={} exit={} totalChars={}",
+                state.turnCount(), state.exitReason(),
+                state.rawMessages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
+
+            // 6) 消息已实时落库（appendListener → persistAppendedMessage，run 全程逐条落），无 run 末批量。
+            //   原 replayAndPersist 已删：本处仅收口（clearAppendListener + persistInjectedQueuedMessages
+            //   幂等兜底）已在上方执行。queued-user 原位顺序 = append 即落（对齐 CC messages.ts:3782 消费时落库）。
+
+            // 7) message.complete · [V-TOK 实施] 照抄 CC result 事件结构（真实 usage/cost/上下文，
+            //    替代 mock 42）——usage = 末条 assistant 的 provider usage；total_cost_usd/modelUsage =
+            //    state 会话累计（LlmAgentLoop 每轮累加）；上下文三字段常驻每轮推（对齐 CC StatusLine）。
+            //   [cron-complete] 装配提取到 publishCompleteEvent（cron 触发链路复用，单点防漂移）
+            publishCompleteEvent(sessionId, userMessageId, state, streamTopic, wsTemplate,
+                turnStartMs, realAssistantId);
+
+            // 7.1) [V-TOK 实施] 会话累计持久化 save（写 sessions 表 total_cost_yuan + model_usage_json，
+            //     跨 turn 权威；restore 在 LlmAgentLoop 会话启动时做 —— save/restore 分属两处各一）。
+            if (costTracker != null) {
+                costTracker.saveCurrentSessionCosts(sessionId, state);
+            }
+        } finally {
+            // 8) status=idle —— 收口必达点（WHY 见上方）。异常仍向上抛（fail loud，不吞），只是先推完 idle：
+            //    前端据此把该会话 serverRunning 翻回 false → 停止键消失。
             sendAndLog(wsTemplate, streamTopic,
                 SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
-                "status=idle (cancelled)");
+                idleWhy);
             inProgress.remove(sessionId, task);
-            return;
         }
-
-        log.info("AGENT done: turns={} exit={} totalChars={}",
-            state.turnCount(), state.exitReason(),
-            state.rawMessages().stream().mapToInt(m -> m.content() == null ? 0 : m.content().length()).sum());
-
-        // 6) 消息已实时落库（appendListener → persistAppendedMessage，run 全程逐条落），无 run 末批量。
-        //   原 replayAndPersist 已删：本处仅收口（clearAppendListener + persistInjectedQueuedMessages
-        //   幂等兜底）已在上方执行。queued-user 原位顺序 = append 即落（对齐 CC messages.ts:3782 消费时落库）。
-
-        // 7) message.complete · [V-TOK 实施] 照抄 CC result 事件结构（真实 usage/cost/上下文，
-        //    替代 mock 42）——usage = 末条 assistant 的 provider usage；total_cost_usd/modelUsage =
-        //    state 会话累计（LlmAgentLoop 每轮累加）；上下文三字段常驻每轮推（对齐 CC StatusLine）。
-        //   [cron-complete] 装配提取到 publishCompleteEvent（cron 触发链路复用，单点防漂移）
-        String finalContent = state.lastAssistant() == null ? "" : state.lastAssistant();
-        publishCompleteEvent(sessionId, userMessageId, state, streamTopic, wsTemplate,
-            turnStartMs, realAssistantId);
-
-        // 7.1) [V-TOK 实施] 会话累计持久化 save（写 sessions 表 total_cost_yuan + model_usage_json，
-        //     跨 turn 权威；restore 在 LlmAgentLoop 会话启动时做 —— save/restore 分属两处各一）。
-        if (costTracker != null) {
-            costTracker.saveCurrentSessionCosts(sessionId, state);
-        }
-
-        // 8) status=idle
-        sendAndLog(wsTemplate, streamTopic,
-            SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
-            "status=idle");
-
-        inProgress.remove(sessionId, task);
 
         // 9) 标题生成（首条）
         maybeGenerateTitle(session, userMessageId, finalContent, wsTemplate);
@@ -1565,8 +1594,12 @@ public class ChatService {
                             //   （busy 图行由 overload 写入，非 AM 回写 —— 守卫上方已拦截脏写上一行）。
                             //   content 仍 inj.content()（QueueItem.value 原文，壳不落库）；userAttachments
                             //   本期 busy 图 null（base64 直传无附件表 contentId）。
+                            // [C2 2026-09-19] isMeta 由硬编码 false 改为 m.isMeta() —— mid-turn 通知
+                            //   （task-notification / coordinator / channel / cron）落 is_meta=true
+                            //   （resume 后 UI 隐藏，与 live 一致、对齐 CC queued_command）；busy-queued
+                            //   恒 false ⇒ 既有行为零变化（ChatServiceBusyImagePersistenceTest 断言 eq(false) 仍绿）。
                             messageService.createQueuedUserMessage(sessionId, m.id(), inj.content(), ts,
-                                false, inj.queuedOrigin(), m.imagePasteIds(), m.userAttachments());
+                                m.isMeta(), inj.queuedOrigin(), m.imagePasteIds(), m.userAttachments());
                             ctx.lastUserMessageId.set(m.id());
                             if (log.isInfoEnabled()) {
                                 log.info("ChatService: mid-turn 注入排队 user 消息实时原位落库 session={} id={}"
@@ -2161,11 +2194,15 @@ public class ChatService {
      * <p><b>回落</b>：两者均 null → 返回 null → resolver 回落 settings 槽（DB 全局
      * {@code settings.permission_mode} → 磁盘 settings.json defaultMode → default）。
      *
+     * <p><b>[批 A4b] 可见性 public</b>：队列 drain 侧 {@code CronIdleExecutor.runAgentLoop} 必须以
+     * <b>同一判据</b>解析会话选定模式（「同一能力两套判据」是本仓已登记的残留 R7 型缺陷）。故本方法
+     * 从 package-private 提升为 {@code public static}，由 drain 侧直调（无 per-call ⇒ 传 null）。
+     *
      * @param session 会话记录（可能为 null，null 时跳过会话层 override）
      * @param perCallPermissionMode HTTP 请求体携带的 permissionMode（可能为 null）
      * @return 生效的 CC 权限模式串；无 per-call 且无会话 override → null（回落全局）
      */
-    static String resolveEffectivePermissionMode(SessionRecord session, String perCallPermissionMode) {
+    public static String resolveEffectivePermissionMode(SessionRecord session, String perCallPermissionMode) {
         if (perCallPermissionMode != null) {
             return perCallPermissionMode;
         }

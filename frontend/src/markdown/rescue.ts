@@ -170,6 +170,45 @@ export function tableSplit(line: string, next: string | undefined): number {
   return idx
 }
 
+/** 顶层节点：本闸门只用到 `type` 与起始偏移（position 来自真解析器）。 */
+type TopNode = { type: string; position?: { start: { offset: number } } }
+
+/** P1 拆点闸门：拆在该 `|` 之前**是否真能拼出一张表** —— 判据是**拿真解析器裁定**：
+ *  把这次拆分单独应用到源码、重解析，看**拆出的右半段起点**是否真出现一个顶层 `table` 节点
+ *  （插入的 `\n` 占一位 ⇒ 右半段起点 = `probe.start + 1`）。真出现才保留这次拆分。
+ *
+ *  为什么需要：拆行只把表头行从前面劈开、**并不修复格数不匹配**；格数不匹配时右半段与分隔行
+ *  仍不成表，而左半段已被拆走 ⇒ **净掉字**（实测 S1：`'## 参数 | 说明\n|---|---|\n|a|b|\n'` 拆后
+ *  产物 `'## 参数 \n| 说明\n|---|---|\n|a|b|\n'`，heading 文本只剩 `参数`）。
+ *
+ *  历史（2026-09-18 批次 B → 本版）：闸门最初用「右半段按 `|` 朴素切分的格数 == 分隔行格数」
+ *  近似，与 GFM 真解析器**两个方向都不一致**（真解析器认转义竖线 `\|`、行内代码与链接 title
+ *  的 `|` 也各有语义）：
+ *  - 过度拒绝：`'## 表格|指标 \| 单位|数值\n|---|---|\n'` 朴素切出 3 格 vs 2 格 ⇒ 判「不成表」不拆，
+ *    而真解析器拆后出 `['heading','table']`（基线 a3ee1bb2 的结果）⇒ 真回归。
+ *  - 漏网：`'## 标题|a \| b\n|---|---|\n'` 朴素切出 2 格 vs 2 格 ⇒ 放行，而 `\|` 是字面量、真解析器
+ *    只认 1 格 ⇒ 拆完 `['heading','paragraph']` —— 正是本闸门要防的形态。
+ *  改为直接问解析器后两个方向同时修好，且**不再残留任何格数近似**（符合 C1/C3：块级判据来自
+ *  真解析器，不自造边界状态机）。
+ *
+ *  为什么不是「把右半段 + 分隔行两行当片段解析」：片段口径要成立必须额外论证「这两行的判定与
+ *  前置块上下文无关」。实测（2026-09-18 本机，`parseGfmWithMath`）在 2142 个候选点（7 种行首前缀
+ *  × 17 种右半段 × 7 种分隔行 × 3 种尾部）上两种口径**零分歧**，即片段口径**可用**；此处仍取
+ *  真文档口径，只为免去该局部性假设（代价相同量级：每个候选行一次 parse，候选要求「本行 `|`
+ *  前有非空内容 **且** 下一行是分隔行」，真实语料中极稀疏，无候选时零额外 parse）。
+ *  注：批次 B 的朴素近似用的是 `line.slice(idx + 1)` —— 把**拆点那个 `|` 也算掉了**，右半段
+ *  口径本身就错（真拆出的右半段从该 `|` 开始）：`'## 标题||a|b\n|---|---|\n'` 朴素按 `|a|b`
+ *  算 2 格 ⇒ 放行，真解析器拆后是 `['heading','paragraph']`（右半段 `||a|b` 是 3 格）。
+ *
+ *  `probe` 是**已构造好的候选编辑**（与最终入列的同形），本函数不修改它。 */
+function splitFormsTable(src: string, probe: Edit): boolean {
+  const rightAt = probe.start + 1
+  const root = parseGfmWithMath(applyEdits(src, [probe]))
+  return (root.children as unknown as TopNode[]).some(
+    (c) => c.type === 'table' && c.position?.start.offset === rightAt,
+  )
+}
+
 /** 顶层块：position 来自真解析器，必然存在。 */
 interface Block {
   type: 'paragraph' | 'heading'
@@ -246,14 +285,17 @@ export function passTable(src: string, headings = false): TablePassResult {
       }
       const idx = tableSplit(cur.line, next)
       if (idx > 0 && !cutInsideInline(p, a + cur.off + idx)) {
-        edits.push({
-          start: a + cur.off + idx,
-          end: a + cur.off + idx,
+        const at = a + cur.off + idx
+        const edit: Edit = {
+          start: at,
+          end: at,
           text: '\n',
           pass: 'table',
           kind: p.type === 'heading' ? 'split-table-from-heading' : 'insert-newline',
           line: cur.line,
-        })
+        }
+        // 闸门（见 `splitFormsTable` 注释）：拆完**真能成表**才拆 —— 否则劈掉表头行而表格仍不成，净掉字。
+        if (splitFormsTable(src, edit)) edits.push(edit)
       }
     }
   }
@@ -436,5 +478,5 @@ export function repair(src: string, opts: { tableHeader?: boolean } = {}): Repai
   }
 }
 
-/* 已知残差 R1–R7 见设计文档 §12：
+/* 已知残差 R1–R9 见设计文档 §12（R8/R9 为 2026-09-18 登记、尚待裁定）：
  *   docs/zjkycode/specs/2026-09-12-markdown-dirty-input-rescue-design.md */

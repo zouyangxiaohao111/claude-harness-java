@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyEdits, bulletFix, headingFix, isSepRow, passFence, passMarkers, passTable, relLines, repair, tableSplit } from '../rescue.ts'
+import { applyEdits, bulletFix, headingFix, isSepRow, passFence, passMarkers, passTable, relLines, repair, tableSplit, PROD_REPAIR_OPTS } from '../rescue.ts'
 import { parseGfmWithMath } from '../parse.ts'
 
 describe('rescue · 工具层', () => {
@@ -180,6 +180,118 @@ describe('rescue · P1 表格抢救', () => {
     const r = passTable(src)
     expect(r.edits).toHaveLength(0)
     expect(r.src).toBe(src)
+  })
+})
+
+describe('rescue · P1e 闸门：拆完**真能成表**才拆（判据来自真解析器，非格数近似）', () => {
+  // 语义级判据（顶层节点类型序列 + heading 文本），**刻意不用** rescue.invariant.test.ts 那套
+  // isSubsequence + 长度不减：P1e 的失效形态恰好是「插一个字符 + 原表头行被劈开」，
+  // 输出仍是输入的超序列、长度也不减 ⇒ 那两条守不住本回归。
+  const topTypes = (s: string): string[] =>
+    (parseGfmWithMath(s).children as unknown as { type: string }[]).map((c) => c.type)
+  const firstNodeText = (s: string): string => {
+    const first = parseGfmWithMath(s).children[0] as unknown as { children?: { value?: string }[] }
+    return (first.children ?? []).map((c) => c.value ?? '').join('')
+  }
+
+  it('S1：`## 参数 | 说明` + 2 格分隔行 → 不拆，heading 文本仍完整是 `参数 | 说明`', () => {
+    // 实测（闸门关闭时，本条断言的失败输出）：`table.edits` = [{start:6,end:6,…}]，
+    // 产物 `'## 参数 \n| 说明\n|---|---|\n|a|b|\n'` —— heading 文本只剩 `参数`（`| 说明` 被劈走）
+    // 且顶层序列仍是 ['heading','paragraph']（表格没成）。
+    const src = '## 参数 | 说明\n|---|---|\n|a|b|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    // 闸门「保持该行原样，不做任何插入」= 抢救对该输入零改动。
+    // 注：不写 `not.toContain('## 参数\n')` —— 实测失效形态是插在 `|` **之前**，
+    // 拆点前那个空格留在原行尾，产物是 `'## 参数 \n| 说明…'`（带尾空格），
+    // 无空格的子串判据会静默假绿。逐字节全等没有这个陷阱。
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.out).toBe(src)
+    expect(firstNodeText(r.out)).toBe('参数 | 说明')               // 标题文本一字不少
+    expect(topTypes(r.out)).toEqual(['heading', 'paragraph'])      // 首块仍是 heading，未退化
+  })
+
+  it('S2：`## 核心结论 | 指标 | 说明` + 2 格分隔行 → 仍拆成表（行为不得回归）', () => {
+    // 对照组：标题内 `|` 数(2) == 分隔行格数(2) → 拆完右半段真能成表。
+    const src = '## 核心结论 | 指标 | 说明\n|---|---|\n| a | 1 |\n'
+    const out = repair(src, PROD_REPAIR_OPTS).out
+    expect(topTypes(out)).toEqual(['heading', 'table'])
+    expect(firstNodeText(out)).toBe('核心结论')
+  })
+
+  // ---- 转义竖线 `\|`（GFM 里单元格内写「字面竖线」的唯一正确写法）----
+  // 闸门曾用「右半段按 `|` 朴素切分的格数 == 分隔行格数」近似：真解析器认 `\|`、朴素切分不认，
+  // 于是两个方向都错。以下两条分别钉住这两个方向（回归门）。
+  it('R1（方向 1 · 过度拒绝）：`## 表格|指标 \\| 单位|数值` → 拆完真成表，不得被判不成表而不拆', () => {
+    // 朴素口径：右半段 `指标 \| 单位|数值` 切出 3 格 vs 分隔行 2 格 ⇒ 「不成表」不拆 ⇒ 回归
+    //（基线 a3ee1bb2 该输入出 `['heading','table']`；`\|` 是字面量 ⇒ 真格数 2 == 2）。
+    const src = '## 表格|指标 \\| 单位|数值\n|---|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(1)
+    expect(topTypes(r.out)).toEqual(['heading', 'table'])   // 实测：拆后顶层真出 table
+    expect(firstNodeText(r.out)).toBe('表格')
+  })
+
+  it('R2（方向 2 · 漏网）：`## 标题|a \\| b` → 真解析器只认 1 格 vs 分隔行 2 格 ⇒ 必须拦住', () => {
+    // 朴素口径切出 2 格 vs 2 格 ⇒ 放行 ⇒ 拆完 `['heading','paragraph']`（劈掉表头、表格也没成）。
+    // 实测：`\|` 是字面量 ⇒ 真格数 1 ≠ 2 ⇒ 真解析器判不成表。
+    const src = '## 标题|a \\| b\n|---|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.out).toBe(src)                                  // 零改动（逐字节，不用子串判据）
+    expect(topTypes(r.out)).toEqual(['heading', 'paragraph'])
+  })
+
+  // ---- 自构边界（各条 `top` 均为本机实测 `parseGfmWithMath(r.out)` 的顶层类型）----
+  it('B1 行内代码里的竖线不是分隔点：``## 标题|`a|b`|c`` → 不拆（真解析器：3 格 vs 2 格）', () => {
+    // GFM 表格行内代码**不**保护 `|`（要写字面竖线须 `\|`）⇒ 右半段 `` |`a|b`|c `` 真格数 3 ≠ 2。
+    // 实测 top = ["heading","paragraph"]；拆了也成不了表（且会劈掉 heading 文本）。
+    const src = '## 标题|`a|b`|c\n|---|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.out).toBe(src)
+    expect(topTypes(r.out)).toEqual(['heading', 'paragraph'])
+  })
+
+  it('B2 链接 title 内的转义竖线：`|[t](u "a\\|b")|c` → 拆（真解析器：2 格）', () => {
+    // 同 R1 的族（朴素口径切出 3 格 ⇒ 旧闸门过度拒绝）；真解析器认 `\|` ⇒ 2 格 == 2 格 ⇒ 成表。
+    const src = '## 标题|[t](u "a\\|b")|c\n|---|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(1)
+    expect(topTypes(r.out)).toEqual(['heading', 'table'])   // 实测
+  })
+
+  it('B3 链接 title 内的裸竖线：`|[t](u "a|b")|c` → 不拆（真解析器：3 格）', () => {
+    const src = '## 标题|[t](u "a|b")|c\n|---|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.out).toBe(src)
+    expect(topTypes(r.out)).toEqual(['heading', 'paragraph'])   // 实测
+  })
+
+  it('B4 双竖线：`## 标题||a|b` → 不拆（拆出的右半段含两个竖线 → 真解析器 3 格 vs 2 格）', () => {
+    // 这条同时钉住「右半段口径必须从拆点那个 `|` 开始」：批次 B 的近似用 `line.slice(idx+1)`
+    // 把拆点自己的 `|` 也算掉了 ⇒ 按 `|a|b` 算 2 格 ⇒ 放行。真拆出的右半段是 `||a|b`（3 格）。
+    const src = '## 标题||a|b\n|---|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.out).toBe(src)
+    expect(topTypes(r.out)).toEqual(['heading', 'paragraph'])   // 实测
+  })
+
+  it('B5 单列表格：`## 标题|a` + `|---|` → 拆（真解析器：1 格 == 1 格，真成表）', () => {
+    const src = '## 标题|a\n|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(1)
+    expect(topTypes(r.out)).toEqual(['heading', 'table'])   // 实测
+  })
+
+  it('B6 空右半段：`## 标题|` + `|---|` → 不拆（右半段只剩 `|`，真解析器判 paragraph）', () => {
+    // 朴素口径：`line.slice(idx+1)` 为空 ⇒ 1 格 == 1 格 ⇒ 放行；真解析器 `'|\n|---|\n'` 是 paragraph。
+    const src = '## 标题|\n|---|\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.out).toBe(src)
+    expect(topTypes(r.out)).toEqual(['heading', 'paragraph'])   // 实测
   })
 })
 

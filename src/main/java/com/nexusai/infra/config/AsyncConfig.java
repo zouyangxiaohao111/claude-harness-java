@@ -4,7 +4,6 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.scheduling.annotation.EnableAsync;
 import org.springframework.scheduling.annotation.EnableScheduling;
-import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
 
@@ -26,7 +25,11 @@ import java.util.concurrent.Executor;
  * （API 一行切换）—— 配置接口不动。
  *
  * <p>v3（CRON-D2）：加 {@code @EnableScheduling}（使能 {@code CronIdleExecutor} 的
- * {@code @Scheduled} 轮询）+ 专用 {@code cronExecutor}（core=1 串行，避免同会话并发 agent_loop）。
+ * {@code @Scheduled} 轮询）+ 专用 {@code cronExecutor}（原 core=1 串行）。
+ *
+ * <p>v4（[M1] 2026-09-18 子代理投递修复）：{@code cronExecutor} 亦改虚拟线程 —— 原 core=1/max=1
+ * 是一条可被永久占住的 OS 线程（真因 L1）；「同会话不并发」改由 {@code CronIdleExecutor} 出队点
+ * 同步占位 + {@code LlmAgentLoop} per-session dispatching 保留态（CC QueryGuard）守住，不再靠池串行。
  */
 @Configuration
 @EnableAsync
@@ -44,22 +47,37 @@ public class AsyncConfig {
     }
 
     /**
-     * CRON-D2: cron idle 专用执行器 · core=1 串行（同会话不并发 agent_loop，RUNNING_SESSIONS 计数配合）。
-     * 线程名前缀 "cron-idle-" 便于日志排查。
+     * CRON-D2: cron idle 专用执行器。
+     *
+     * <p><b>[M1 · 2026-09-18 子代理投递修复 · 用户裁定] 由 core=1/max=1 串行改为虚拟线程</b>，
+     * 与同文件 {@link #chatExecutor()}（2026-08-24 同款失效类已拍板改虚拟线程）同款。
+     *
+     * <p><b>WHY（失效类与 chatExecutor 逐字相同）</b>：原 {@code ThreadPoolTaskExecutor}
+     * core=1/max=1/queue=100 是一条<b>可被永久占住的 OS 线程</b> —— 一个卡在权限弹窗
+     * （{@code WebSocketPermissionPrompter} 的 {@code future.get()} 无超时是<b>设计</b>，对齐 CC 无限等待）
+     * 或任何长阻塞的 run 会把<b>所有会话</b>的空闲代跑一起饿死。实锤：事故日志里
+     * {@code cron-idle-1} 出现 7829 次而 {@code cron-idle-2} 及以后 <b>0 次</b>，该线程最后一行后
+     * 64 分钟零日志（异步子代理跑完但主代理收不到结果的真因 L1）。
+     *
+     * <p>虚拟线程无池上限 ⇒ 每 run 独立，阻塞不传染其他会话（会话隔离真正成立，不再靠「池只有 1 条」
+     * 这个假安全）。适合 IO 密集型（LLM 调用/DB/STOMP）。ThreadLocal（MDC/sessionId）虚拟线程支持。
+     *
+     * <p>⚠️ <b>必须与 M2（per-session dispatching 保留态）同批</b>：core=1 时代「同会话不并发」之所以
+     * 看着成立，只因提交全序 ⇒ 单上本改动 = 单纯调大池（高危：制造同会话并发与静默新缺陷）。
+     * 虚拟线程后该不变量由 {@code LlmAgentLoop.reserve/cancelReservation}（CC QueryGuard dispatching）
+     * 在出队点显式守住。
+     *
+     * <p>可观测性保留：线程名前缀仍是 {@code cron-idle-}（{@code logback-spring.xml} 的
+     * {@code [%thread]} 是判定「任务走哪条线程/开跑没有」的现成证据）。
      */
     @Bean(name = "cronExecutor")
     public Executor cronExecutor() {
-        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(1);
-        executor.setMaxPoolSize(1);
-        executor.setQueueCapacity(100);
-        executor.setThreadNamePrefix("cron-idle-");
-        executor.setKeepAliveSeconds(60);
-        executor.setWaitForTasksToCompleteOnShutdown(true);
-        executor.setAwaitTerminationSeconds(15);
-        executor.setRejectedExecutionHandler(
-            new java.util.concurrent.ThreadPoolExecutor.CallerRunsPolicy());
-        executor.initialize();
-        return executor;
+        // [M1] 每任务独立虚拟线程 + 保留 "cron-idle-" 命名（Executors.newThreadPerTaskExecutor(factory)
+        //   与 newVirtualThreadPerTaskExecutor 等价，只是允许自定义 ThreadFactory）。
+        java.util.concurrent.ThreadFactory factory = Thread
+            .ofVirtual()
+            .name("cron-idle-", 0)
+            .factory();
+        return java.util.concurrent.Executors.newThreadPerTaskExecutor(factory);
     }
 }

@@ -240,6 +240,58 @@ public final class ToolNameConstants {
     );
 
     /**
+     * [批 A4d · P2 甲-2] 「始终允许」档位在 CC 弹窗里<b>依赖 suggestions 非空</b>的工具集
+     * —— 本层（1b whole-tool ask 规则命中）对这二者<b>不产</b> suggestions。
+     *
+     * <p><b>WHY（CC 真源逐字推导，⛔ 不是写死 "Bash"）</b>
+     * <p>CC 1b whole-tool ask 规则命中时（{@code utils/permissions/permissions.ts:1205-1227}，
+     * 具体返回体 :1216-1225）返回的 ask <b>不带</b> {@code suggestions} 字段。各弹窗对
+     * 「always allow」档的处理分两类：
+     *
+     * <p><b>① 依赖 {@code suggestions} 非空</b>（suggestions 为空 ⇒ 该档整个不出现）：
+     * <ul>
+     *   <li><b>Bash</b> — {@code components/permissions/BashPermissionRequest/bashToolUseOptions.tsx:105}
+     *       <pre>} else if (suggestions.length &gt; 0) {</pre>
+     *       同文件 :92 的 editable-prefix 输入分支条件亦含 {@code suggestions.length > 0}：
+     *       <pre>if (editablePrefix !== undefined &amp;&amp; onEditablePrefixChange &amp;&amp; !hasNonBashSuggestions &amp;&amp; suggestions.length &gt; 0) {</pre>
+     *       ⇒ Bash 两个用户可见的 always-allow 档（{@code yes-prefix-edited} / {@code yes-apply-suggestions}）
+     *       都被 suggestions 非空把守。（第三个 {@code yes-classifier-reviewed}（:123）不要求
+     *       suggestions，但被 {@code process.env.USER_TYPE === 'ant'}（:124）关掉 —— 本仓是
+     *       非 ant 构建，该档不存在。）</li>
+     *   <li><b>PowerShell</b> — {@code components/permissions/PowerShellPermissionRequest/powershellToolUseOptions.tsx:52}
+     *       <pre>if (shouldShowAlwaysAllowOptions() &amp;&amp; suggestions.length &gt; 0) {</pre>
+     *       ⚠️ <b>与 Bash 同构</b>：只写死 "Bash" 会漏掉 PowerShell（本仓反复栽的「只覆盖一侧」）。</li>
+     * </ul>
+     *
+     * <p><b>② 不依赖 {@code suggestions}</b>（只受 {@code shouldShowAlwaysAllowOptions()} 门控，
+     * 即 {@code utils/permissions/permissionsLoader.ts:42-44}
+     * {@code return !shouldAllowManagedPermissionRulesOnly()}）：
+     * <ul>
+     *   <li>Fallback（MCP 工具 + 未登记/默认工具）— {@code FallbackPermissionRequest.tsx:118}
+     *       取 {@code showAlwaysAllowOptions}，:128 无条件 push {@code 'yes-dont-ask-again'}
+     *       （该方法签名里根本没有 suggestions 参数）</li>
+     *   <li>Skill — {@code SkillPermissionRequest.tsx:63} {@code if (showAlwaysAllowOptions)}</li>
+     *   <li>WebFetch — {@code WebFetchPermissionRequest.tsx:54} {@code if (showAlwaysAllowOptions)}</li>
+     *   <li>Monitor — {@code MonitorPermissionRequest.tsx:44} {@code if (showAlwaysAllowOptions)}</li>
+     *   <li>文件类（Edit/Write/NotebookEdit + 经 {@code FilesystemPermissionRequest} 的
+     *       Glob/Grep/Read，有 path 时）— 档位来自固定选项表
+     *       {@code FilePermissionDialog/permissionOptions.tsx:77-179}，与 suggestions 无关</li>
+     * </ul>
+     *
+     * <p>⇒ 甲-2：<b>只对 ① 的工具不产</b> suggestions；② 的工具<b>照旧产</b>（保持 A1/A3 行为）。
+     *
+     * <p><b>有意保留的洞（用户裁定 · 不对齐 CC）</b>
+     * <p>CC 里整工具 ask（{@code permissions.ts:1205-1227}）<b>先于</b>整工具 allow
+     * （{@code :1304-1318} 2b 分支）⇒ 对 ② 类工具存在「残留 ask 永久压住 allow」的洞，
+     * CC 对此无任何补偿（全仓 {@code removeRules} 仅 2 个生产点，均非此用途）。
+     * 甲-2 <b>有意保留</b>此洞以对齐 CC。
+     */
+    public static final Set<String> ALWAYS_ALLOW_REQUIRES_SUGGESTIONS = Set.of(
+        BASH_TOOL_NAME,          // 'Bash'       — bashToolUseOptions.tsx:92 / :105
+        POWER_SHELL_TOOL_NAME    // 'PowerShell' — powershellToolUseOptions.tsx:52
+    );
+
+    /**
      * [B6] ALL_AGENT_DISALLOWED_TOOLS · 单一权威 · 对齐 CC
      * {@code Open-ClaudeCode/src/constants/tools.ts:36-46}（DEL-WFB-03 双定义合并）。
      *

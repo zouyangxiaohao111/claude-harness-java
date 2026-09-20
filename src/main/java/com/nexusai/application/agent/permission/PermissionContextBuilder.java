@@ -66,6 +66,10 @@ import java.util.UUID;
  * <p>保留无参构造器 {@link #PermissionContextBuilder()}（用于 PR 1-4 测试）。
  * Spring 注入用 {@link #PermissionContextBuilder(List)}（PR 1+）。
  *
+ * <p>⚠️ <b>[批 A4b]</b> 因本类有<b>两个</b> public 构造器，{@link #PermissionContextBuilder(List)}
+ * 上的 {@code @Autowired} 是 Spring 选中它的<b>唯一依据</b>（一个都没标 ⇒ 容器回落无参构造器 ⇒
+ * 权限规则全不加载）。删该注解前请先读它的 javadoc。
+ *
  * @see ToolUseContext
  * @see ToolPermissionContext
  * @see PermissionPipeline
@@ -177,8 +181,21 @@ public class PermissionContextBuilder {
     /**
      * Spring 注入构造器。
      *
+     * <p><b>[批 A4b · 守护]</b> ⛔ {@code @Autowired} 不可移除。本类<b>同时存在两个 public 构造器</b>
+     * （本构造器 + {@link #PermissionContextBuilder()}），此时 Spring 的构造器选择规则
+     * （{@code AutowiredAnnotationBeanPostProcessor#determineCandidateConstructors}）要求
+     * <b>恰有一个</b>候选标注 {@code @Autowired}；<b>一个都没标</b>时它返回 null ⇒ 容器回落
+     * <b>无参构造器</b> ⇒ {@code loaders = Collections.emptyList()} ⇒ user / project / local /
+     * policy（企业管控）settings 的 {@code permissions.allow/deny/ask} <b>全部不加载</b>
+     * （含用户手写的 {@code permissions.deny} 静默失效）。本类 javadoc 曾长期声称「Spring 注入用
+     * {@link #PermissionContextBuilder(List)}」而代码从未告知 Spring —— 典型「注释骗人」实例，
+     * 静默三个批次（且只打 DEBUG）。守护测试：
+     * {@code PermissionContextBuilderSpringWiringTest}（以 bean class 注册 ⇒ 走容器构造器解析；
+     * 去掉本注解该测试必变红）。
+     *
      * @param loaders source loader 链（Spring 注入所有 {@link PermissionSourceLoader} bean）
      */
+    @Autowired
     public PermissionContextBuilder(List<PermissionSourceLoader> loaders) {
         if (loaders == null) {
             throw new IllegalArgumentException("loaders is null");
@@ -335,6 +352,20 @@ public class PermissionContextBuilder {
             Boolean availabilityOverride) {
         if (state == null) {
             throw new IllegalArgumentException("state is null");
+        }
+
+        // [批 A4b · fail-loud] loaders 为空 = 权限规则源<b>全部断链</b>（静默失效）。
+        //   ⛔ 不得只 DEBUG：本断链（1 参构造器缺 @Autowired → Spring 回落无参构造器）
+        //   曾静默三个批次，正因为唯一可观察点只是下方那条 DEBUG 日志。
+        //   此处 WARN 的触发面 = 生产装配断链 / 测试手工 new。normal 生产（6 个 loader）不触发。
+        if (loaders.isEmpty() && log.isWarnEnabled()) {
+            log.warn("PermissionContextBuilder: ⚠️ loaders 为空（loaderCount=0）—— user / project / "
+                + "local / policy(企业管控) settings 的 permissions.allow/deny/ask 全部不会被加载，"
+                + "本次权限判定无任何磁盘规则（含用户手写 deny 规则静默失效、企业管控 policy 失效、"
+                + "ShadowedRuleDetector 恒 0、auto 模式危险规则剥离变空操作）。"
+                + "成因排查优先级最高者：Spring 构造器选择回落无参构造器（1 参构造器 "
+                + "PermissionContextBuilder(List) 缺 @Autowired）。sessionId={} mode={}",
+                state.sessionId(), mode);
         }
 
         // Phase 2 PR 1: 3 桶（allow/deny/ask）+ 8 source 索引

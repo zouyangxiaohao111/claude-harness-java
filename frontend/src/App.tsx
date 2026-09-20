@@ -26,6 +26,8 @@ import { attachmentApi } from '@/api/attachment'
 import { ApiError } from '@/api/rest'
 import { debugLog } from '@/utils/debugLog'
 import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedUserBubble'
+import { computeTurnRunning } from '@/utils/turnRunning'
+import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
 import { useChatStore, selectCompact, collectRemovedUuids } from '@/stores/chatStore'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { useAwaySummary } from '@/hooks/useAwaySummary'
@@ -52,7 +54,7 @@ import { CompactProgressBar } from '@/components/center/CompactProgressBar'
 import { NotificationBanner } from '@/components/center/NotificationBanner'
 import { Composer } from '@/components/center/Composer'
 import { TraceView } from '@/components/center/TraceView'
-import { useCommandQueue } from '@/hooks/useCommandQueue'
+import { useCommandQueue, type PoppedQueueInput } from '@/hooks/useCommandQueue'
 import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
 import { AgentsPanel } from '@/components/center/AgentsPanel'
 import { ChromePanel } from '@/components/center/ChromePanel'
@@ -420,8 +422,15 @@ function App() {
   }, [activeSessionId, storeMessages])
   // turn 运行中判定：activeStreams 含本会话 = turn 已登记（含 thinking 阶段，此时 streams 空）。
   //   OR streams 有流式块 = 打字机在推（后端主动推流/cron 续跑未登记 activeStreams 时仍要可停）。
-  //   两信号互补：思考阶段靠 activeStreams；打字机阶段靠 streamOrder 有块（防「打字机在动但发送键已出」脱节）
-  const turnRunning = !!activeStreams[activeSessionId] || hasStream
+  //   OR 服务端权威运行态 = 后台 drain（排队命令 / cron / 任务通知）起的 run —— 它不经「本页发送」、
+  //     思考或等待权限阶段也没有 chunk ⇒ 前两路全假、UI 连停止键都不出现；F5 还会清空本地簿记。
+  //   三信号互补与 WHY 见 utils/turnRunning.ts。
+  const serverRunning = useChatStore((s) => (activeSessionId ? !!s.serverRunning[activeSessionId] : false))
+  const turnRunning = computeTurnRunning({
+    streamRegistered: !!activeStreams[activeSessionId],
+    hasStream,
+    serverRunning,
+  })
   // 压缩进行中（compact-progress 事件 · 不经 LlmAgentLoop → turnRunning 假，需并入发送键⇄停止）
   // [多会话隔离 2026-09-11] 只看【当前活动会话】的进度：原实现读全局单对象 → A 压缩中切到 B，
   //   B 的发送键变停止（且点击取消的是 B）。此处与 CompactProgressBar 用同一键 → 键出现即横幅出现、
@@ -768,13 +777,63 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [realChangedSession])
 
+  // [C6 · 停止键可见性] 载入 / 切会话 → 用服务端权威运行态重建「要不要显示停止键」。
+  //   实现（GET + 失败静默 + 非轮询）与 WHY 见 hooks/useServerRunning.ts（抽出去是为了可被渲染级用例
+  //   钉住 —— 内联在 App 里时「把 GET 整条改死」任何单测都照绿）。
+  useServerRunningRebuild(activeSessionId, isRealActive)
+
+  // [C6 · 遗留2] 服务端权威「收口」（true→false）→ 对账本地 turn 簿记（对账单点见 hooks/useServerRunning.ts：
+  //   store 侧定稿残留流式块 + 回调回收本处 activeStreams 登记）。complete/cancel/error 三处事件回调
+  //   （handleSessionDone）是**唯一**的登记清除点；其中任一条帧在无断连时静默丢失（未送达 / 处理中途抛错），
+  //   登记即恒真 —— 而 turnRunning 是或语义，服务端随后说 idle / GET /running 返回 false 也压不住
+  //   ⇒ 停止键永久卡住。本回调**只删登记这一份**（不碰 handleSessionDone 的「完成未读绿点」等副作用）。
+  //
+  // ⚠️ [C6 · 轮次判据 · 防误回收本轮登记] 收口回调带 sid 但不带轮次 ⇒ 必须自己判「这个边沿关的是哪一轮」：
+  //   登记（sendMessage）与边沿是两条独立通道，同一会话上「刚为下一轮登记」与「上一轮的迟到边沿」可重合
+  //   （典型：上一轮 idle 帧迟到；或载入/切会话/重连发出、在下一轮起轮后才回来的 GET /running=false）。
+  //   盲删会把**新一轮**的登记抹掉 —— 停止键虽仍由 serverRunning / hasStream 撑着（会闪）。
+  //   ⛔ 不复用 handleSessionDone 的 topic 校验：streamTopic 是**会话级常量**（后端 streamTopic(sessionId) =
+  //   "/topic/sessions/{sid}/stream"），登记值与事件 topic 恒等 ⇒ 那条判据在本仓永不触发（挡不住任何东西）。
+  //   真判据 = **轮次号**：每次登记 +1；服务端说 true 时把该会话当时的轮次号记下（= 被服务端确认过的轮）；
+  //   只有「登记轮次 ≤ 最近一次 true 的轮次」的登记，才可能是本边沿关掉的那一轮 ⇒ 才可回收。
+  //   未见过 true 的登记（本轮起轮帧还没到 / 已丢）永不被这条边沿回收 —— 它本来就没被服务端确认过在跑。
+  //   可达性（为什么这条判断不是空转）：store 里存着**过期的 true**（上一轮的收口帧静默丢失 / 迟到的
+  //   GET true）时，服务端其实已空闲 ⇒ 用户还能按下发送（服务端不排队、立即受理）⇒ 就是「本轮刚登记、
+  //   上一轮的 true 仍在」这个现场；随后上一轮那条迟到的 false 一到就会误回收本轮登记。
+  //   ⚠️ 覆盖边界（已知残留，非本判据能兜）：若「上一轮的迟到 false」是在本轮的 true 之后才落地的
+  //   （无 STOMP 保序约束的 GET 通道 + 发送恰落在该 GET 的往返窗口内），本地与「本轮自己的收口」逐字
+  //   同形 ⇒ 无法区分，仍会误回收；要真区分需服务端在 status 事件里带上轮次 id（当前不带）。
+  const streamRegGenRef = useRef<Record<string, number>>({})
+  const streamTrueGenRef = useRef<Record<string, number>>({})
+  const markStreamRunning = useCallback((sid: string) => {
+    streamTrueGenRef.current[sid] = streamRegGenRef.current[sid] ?? 0
+  }, [])
+  const reclaimStreamRegistration = useCallback((sid: string) => {
+    // 登记晚于最近一次 true ⇒ 那个 true 属于上一轮，本登记尚未被服务端确认 ⇒ 不收
+    if ((streamRegGenRef.current[sid] ?? 0) > (streamTrueGenRef.current[sid] ?? 0)) return
+    setActiveStreams((prev) => {
+      if (!prev[sid]) return prev
+      const next = { ...prev }
+      delete next[sid]
+      return next
+    })
+  }, [])
+  useServerRunningReconcile(reclaimStreamRegistration, markStreamRunning)
+
   // 排队消费：queue.drained 到达（工具边界）→ App 立即 append 用户2 气泡；渲染按 userMessageId 分组
   //   自动排到当前 assistant 工具轮之后（对齐 deepseek-harness/CC 工具边界插入，不延后到 complete）。
   // 会话生命周期明确信号（对齐 Harness 事件驱动确定性）：complete/cancel 到达 → 移除 activeStreams。
   //   不用「streams 从有到无」推断移除——推断与 sendMessage 登记竞争，是「换会话卡住」的根因。
-  //   topic 校验：事件来源 topic 必须等于当前登记 topic 才删。防竞态——turn A 运行中 send B，
-  //   activeStreams[sid] 已登记为 topicB，此时 A 的终止事件（topicA）若盲删会把 topicB 一并移除
-  //   → B 订阅被取消 → 新 turn 输出丢失。topic 不匹配说明该终止信号属于已被轮换掉的旧 turn，忽略。
+  //   topic 校验（handleSessionDone 里那一行 if (topic && prev[sid] !== topic) return prev）：
+  //   ⚠️ [2026-09-19 注释纠错] 原文称它防「turn A 运行中 send B ⇒ A 的终止事件（topicA）误删 B 的登记
+  //   （topicB）」—— 该说法在本仓**不成立**（逐处核实：登记值 = resp.streamTopic（:1676 是唯一登记点）
+  //   = 后端**会话级常量** /topic/sessions/{sid}/stream（ChatService.streamTopic :2690-2692；ChatController
+  //   :137/:150 与 MessageService :1238/:1295 同一字面量），而终止事件也正是推到这个 topic ⇒ topicA ≡ topicB
+  //   ⇒ prev[sid] !== topic 恒假 ⇒ 本判据在本仓**永不 early return**，挡不住任何东西（同 :795-796 的结论）。
+  //   它成立的前提是旧 per-message topic /topic/sessions/{sid}/messages/{uuid}/stream —— 该形状已废
+  //   （ChatService :2682）。故本行是给「改回 per-turn topic」这类将来重设计留的兜底，**不是**当前回归的
+  //   守护；真要区分「终止信号属于哪一轮」，需服务端在事件里带轮次 id（当前不带，见上方轮次判据的覆盖边界）。
+  //   ⛔ 删/留属行为决策（未动）。
   // ---- 「完成未读」绿点（需求：运行结束且非当前会话 → 静止绿点；切到即清除）----
   const activeSessionIdRef = useRef(activeSessionId)
   activeSessionIdRef.current = activeSessionId
@@ -835,6 +894,10 @@ function App() {
       // 重拉失败静默（不 toast 打扰——可能后台会话;下次 complete / 手动 F5 / 切会话重拉兜底）
       console.debug('[reconnect-reload]', 'sid=', sid, '失败（静默,待下次兜底）')
     }
+    // [C6 · 停止键可见性] 断连窗口内 run 的起轮 / 收口事件可能推给了零订阅者（STOMP topic 非持久）
+    //   → 连上就重查一次服务端运行态，避免「run 早已结束但停止键仍挂着」/「run 在跑却没停止键」。
+    //   与载入/切会话共用同一条 GET+回写实现（hooks/useServerRunning.ts）——单点，防两处判据漂移。
+    await refreshServerRunning(sid)
   }, [loadTailWindow])
 
   // 多会话并行订阅（订阅所有 activeStreams；complete/cancel 明确回调移除）
@@ -1614,6 +1677,9 @@ function App() {
       //   若发送时 clearStream，会触发 wasRunning 检测「streams 从有到无」→ 误移除刚登记的 activeStreams
       //   → 订阅取消 → 新消息 chunk 收不到 → 会话卡住（多会话隔离被破坏）
       // 登记活跃流式会话（useChatSocket 订阅所有 activeStreams · 切走不取消，事件持续接收）
+      // [C6 · 轮次判据] 登记即开新一轮：轮次号 +1（在 updater **外**自增 —— updater 可能被 React 重复调用）。
+      //   收口回调据「本轮次号 ≤ 最近一次 true 的轮次号」判定该边沿是否属于本轮（见 reclaimStreamRegistration）。
+      streamRegGenRef.current[activeSessionId] = (streamRegGenRef.current[activeSessionId] ?? 0) + 1
       setActiveStreams((prev) => ({ ...prev, [activeSessionId]: resp.streamTopic }))
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
@@ -1808,10 +1874,15 @@ function App() {
         {currentPermission && (
           <PermissionBubble
             request={currentPermission}
-            onDecision={(id, d, answers, annotations) => {
+            // [批 A4c P3] 项目级档位文案的「项目标识」。currentPermission 已按
+            //   sessionId === activeSessionId 过滤（见上方 currentPermission 定义）⇒ 用
+            //   activeSession 的绑定项目即可，与 Composer 的 boundProjectName 同一来源。
+            projectLabel={activeSession.mainProjectId ? (realProjects.find((p) => p.id === activeSession.mainProjectId)?.name ?? null) : null}
+            onDecision={(id, d, answers, annotations, permissionUpdates) => {
               // 路由到请求来源会话（用户切走标签时仍发回正确的 session）
               const targetSession = currentPermission.sessionId ?? activeSessionId
-              if (clientRef.current) sendPermissionResponse(clientRef.current, targetSession, currentPermission.kind, id, d, { answers, annotations })
+              // permissionUpdates 仅「一键授权」档位携带（原样回传后端 suggestions）；允许/拒绝为 undefined
+              if (clientRef.current) sendPermissionResponse(clientRef.current, targetSession, currentPermission.kind, id, d, { answers, annotations, permissionUpdates })
               dequeuePermission(id)
             }}
             onAbort={() => {
@@ -1846,11 +1917,15 @@ function App() {
             streaming={turnRunning || compactActive}
             onStop={stopStreaming}
             queuedCommands={commandQueue.queuedCommands}
-            popEditable={() => {
-              if (!activeSessionId) return
-              void commandQueue.popEditable(activeSessionId).then((content) => {
-                if (content) setComposerText(content)
-              })
+            popEditable={async (): Promise<PoppedQueueInput | null> => {
+              if (!activeSessionId) return null
+              // 草稿（composerText）随请求上送 —— 对齐 CC popAllEditable(currentInput, …)：回填是
+              //   「排队项 + 草稿」，不是「用排队项覆盖草稿」
+              const res = await commandQueue.popEditable(activeSessionId, composerText)
+              // 回填 = 全部可编辑排队项 + 草稿（后端按 CC `\n` join 好的整段文本，前端不再拼）
+              if (res) setComposerText(res.text)
+              // 附件交回 Composer 还原为待发 chip（附件状态归 Composer 所有）
+              return res
             }}
             boundProjectName={activeSession.mainProjectId ? (realProjects.find((p) => p.id === activeSession.mainProjectId)?.name ?? null) : null}
             boundProjectId={activeSession.mainProjectId}

@@ -17,6 +17,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 import java.util.LinkedHashSet;
@@ -28,6 +29,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -618,6 +620,88 @@ class TaskUpdateToolStructuredOutputTest {
         assertThat(so.get("updatedFields")).isEqualTo(List.of());
         // 已存在引用被 filter 排除 → blockTask 不被调用（CC:305-307 只遍历 newBlocks）
         verify(taskService, never()).blockTask(any(), any(), any());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P0-3 · B5] 置 in_progress 自动挂负责人 —— 身份来源 = 显式 ctx.teammateIdentity()
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("B5: in-process teammate 置 in_progress + 无 owner → 自动挂**自己**的名字（CC:188-198 getAgentName()）")
+    void autoSetOwner_inProcessTeammate_usesExplicitIdentity() {
+        // WHY（规则九）：CC :188-198 的 agentName 来自 getAgentName()（teammate.ts:98-102 读
+        //   teammate context）。本仓原实现读进程级 sysprop nexusai.agent.name —— main 侧**零写入
+        //   点**（仅测试写），且 Web 部署下 TeammateContextBootstrap 见到该 sysprop 直接
+        //   IllegalStateException 拒启 ⇒ 该分支生产恒 null = 「自动挂负责人」是条死路。
+        System.setProperty("nexusai.experimental.agent-teams", "true");
+        try {
+            TaskService taskService = mock(TaskService.class);
+            Task task = new Task("t-1", "subject", "desc", null, null,
+                Task.TaskStatus.PENDING, List.of(), List.of(), Map.of());
+            when(taskService.getTask("tl-1", "t-1")).thenReturn(Optional.of(task));
+            when(taskService.updateTask(eq("tl-1"), eq("t-1"), any())).thenReturn(Optional.of(task));
+
+            TaskUpdateTool tool = new TaskUpdateTool(taskService, null);
+            ToolUseBlock call = new ToolUseBlock("call-1", "TaskUpdate",
+                json.createObjectNode().put("taskId", "t-1").put("status", "in_progress"));
+            // 生产可达前提（同文件 :415-417 已消费同一字段）：ctx 携带显式 teammate 身份。
+            ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-b5")
+                .withTeammateIdentity(new TeammateIdentity(
+                    "x@t", "x", "t", null, false, "sess-b5"));
+
+            ToolResult<String> result = tool.execute(call, ctx);
+
+            Map<String, Object> so = ToolResult.presentationMeta(result);
+            assertThat(updatedFields(so))
+                .as("自动挂 owner 必须进 updatedFields（CC :191 updates.owner = agentName）")
+                .contains("owner");
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
+            verify(taskService).updateTask(eq("tl-1"), eq("t-1"), captor.capture());
+            assertThat(captor.getValue())
+                .as("partialUpdates.owner 必须是身份名 'x'（不是 sysprop / 'team-lead'）")
+                .containsEntry("owner", "x");
+        } finally {
+            TaskSystemConfig.clearForTest();
+        }
+    }
+
+    @Test
+    @DisplayName("B5 反向断言: ctx == null（主线程）⇒ **不**自动挂 owner（与改前行为逐字一致）")
+    void autoSetOwner_noCtx_doesNotAssignOwner() {
+        // WHY：teammateIdentity == null 时必须完全退化为改前行为（CC 主线程 getAgentName() undefined
+        //   ⇒ 不挂名）。这是「对 leader/主线程零影响」这条风险承诺的反向证据。
+        System.setProperty("nexusai.experimental.agent-teams", "true");
+        try {
+            TaskService taskService = mock(TaskService.class);
+            Task task = new Task("t-1", "subject", "desc", null, null,
+                Task.TaskStatus.PENDING, List.of(), List.of(), Map.of());
+            when(taskService.getTask("tl-1", "t-1")).thenReturn(Optional.of(task));
+            when(taskService.updateTask(eq("tl-1"), eq("t-1"), any())).thenReturn(Optional.of(task));
+
+            TaskUpdateTool tool = new TaskUpdateTool(taskService, null);
+            ToolUseBlock call = new ToolUseBlock("call-1", "TaskUpdate",
+                json.createObjectNode().put("taskId", "t-1").put("status", "in_progress"));
+
+            ToolResult<String> result = tool.execute(call); // ctx == null（主线程）
+
+            Map<String, Object> so = ToolResult.presentationMeta(result);
+            assertThat(updatedFields(so))
+                .as("无 teammate 身份 ⇒ updatedFields 不得含 owner")
+                .doesNotContain("owner");
+            @SuppressWarnings("unchecked")
+            ArgumentCaptor<Map<String, Object>> captor = ArgumentCaptor.forClass(Map.class);
+            verify(taskService).updateTask(eq("tl-1"), eq("t-1"), captor.capture());
+            assertThat(captor.getValue()).doesNotContainKey("owner");
+        } finally {
+            TaskSystemConfig.clearForTest();
+        }
+    }
+
+    /** structuredOutput 的 updatedFields 取值（同文件既有断言用 {@code List.of(...)} 直接比较）。 */
+    @SuppressWarnings("unchecked")
+    private static List<String> updatedFields(Map<String, Object> structuredOutput) {
+        return (List<String>) structuredOutput.get("updatedFields");
     }
 
     /** [IMP-C2] successWithStructuredOutput 折入 data(Map) 后，模型侧渲染文本在 "summary" 键。 */

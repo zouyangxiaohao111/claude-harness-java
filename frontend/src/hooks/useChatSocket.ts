@@ -13,6 +13,7 @@ import { teamsApi } from '../api/teams'
 import { EMPTY_COMPACT_TABLE, dropCompactSession, isCompactCanceled, reduceCompactTable, type CompactProgressWire, type CompactTable } from '../utils/compactProgress'
 import { noteInboundFrame } from '../utils/inboundFrameStats'
 import { parseDrainedQueueItems, type DrainedQueueItem } from '../utils/queuedUserBubble'
+import { isQueuedCommandEditable } from './useCommandQueue'
 
 /** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
  *  notifier.markFrameDirty：N 次 markDirty 折叠为一次动画帧 flush，通知推迟到下一帧）。
@@ -127,8 +128,9 @@ function subscribeTeamTopics(client: Client, leadSessionId: string) {
 const bridgeDismissSubs = new Map<string, StompSubscription>()
 
 /** 订阅单会话 3 种权限 topics（message/bridge/channel）→ 入队。
- *  多会话各订阅各的；弹窗由 App 过滤当前会话（非本会话不默认弹，侧栏黄点提示）。 */
-function subscribePermTopics(client: Client, sid: string): { message: StompSubscription; bridge: StompSubscription; channel: StompSubscription } {
+ *  多会话各订阅各的；弹窗由 App 过滤当前会话（非本会话不默认弹，侧栏黄点提示）。
+ *  导出仅供测试直接驱动（归一化字段清单是本模块唯一的入队点，改错无编译期约束）。 */
+export function subscribePermTopics(client: Client, sid: string): { message: StompSubscription; bridge: StompSubscription; channel: StompSubscription } {
   const topics = [
     { kind: 'message', topic: `/topic/sessions/${sid}/permission-requests` },
     { kind: 'bridge', topic: `/topic/sessions/${sid}/permission-bridge-requests` },
@@ -148,7 +150,10 @@ function subscribePermTopics(client: Client, sid: string): { message: StompSubsc
       // bridge 事件字段 = displayInput（后端 BridgePermissionRequestEvent），非 toolInput —— 不修则
       //   AskUserForm extractQuestions 拿不到 questions → 回退「需要权限」通用弹窗（双弹窗根因之一）
       const toolInput = kind === 'bridge' ? (raw.displayInput ?? raw.toolInput) : raw.toolInput
-      st.enqueuePermission({ kind, sessionId: sid, requestId: raw.requestId, toolName: raw.toolName, description: raw.description, reason: raw.reason, warning: raw.warning, toolInput, isLeaderInbox, workerName, workerBadgeColor: raw.workerBadgeColor ?? null, timestampMs: raw.timestampMs })
+      // [批 A3] suggestions 原样透传（后端已按 CC 形状序列化）：此前未入队 → 弹窗拿不到
+      //   一键授权建议（「始终允许」永远不出现）。空数组/null 归一为 null（弹窗侧判空不渲染）。
+      const suggestions = Array.isArray(raw.suggestions) && raw.suggestions.length > 0 ? raw.suggestions : null
+      st.enqueuePermission({ kind, sessionId: sid, requestId: raw.requestId, toolName: raw.toolName, description: raw.description, reason: raw.reason, warning: raw.warning, toolInput, isLeaderInbox, workerName, workerBadgeColor: raw.workerBadgeColor ?? null, timestampMs: raw.timestampMs, suggestions })
       console.debug('[perm] queued, queueLen=', st.permissionQueue.length, raw.requestId)
       // 后端无限等待用户响应（2026-08-24 移除 30s 自动超时；用户取消会话 → user_abort）
     })
@@ -341,9 +346,13 @@ export function useChatSocket(
     const queue = client.subscribe(`/topic/sessions/${sid}/queue`, (msg) => {
       let raw: Record<string, unknown>
       try { raw = JSON.parse(msg.body) } catch { return }
+      // isEditable 判据单点 = isQueuedCommandEditable（CC :359-361 非 task-notification && !isMeta）——
+      //   ⛔ 不要在这里内联 `mode === 'prompt' && !isMeta`：与 useCommandQueue 的本地过滤判据会漂移
+      //   （两处若一处改一处忘 ⇒ 排队框显示与「Esc 拉回」结果对不上，且单测全绿）。
       const toQueued = (c: Record<string, unknown>) => ({
         content: String(c.content ?? ''), mode: String(c.mode ?? 'prompt'),
-        isEditable: String(c.mode ?? 'prompt') === 'prompt' && !c.isMeta, isMeta: !!c.isMeta,
+        isEditable: isQueuedCommandEditable({ mode: c.mode as string | undefined, isMeta: !!c.isMeta }),
+        isMeta: !!c.isMeta,
       })
       if (raw.type === 'queue.changed') {
         const list = Array.isArray(raw.commands) ? (raw.commands as Record<string, unknown>[]) : []
@@ -847,6 +856,19 @@ export function useChatSocket(
       const raw = (evt as SessionStatusEvent).status
       const status = raw === 'thinking' || raw === 'streaming' ? raw : 'idle'
       st.setAgentStatus(status)
+      // [C6 · 停止键可见性] 同一事件兼作「服务端运行态」的实时信号（按会话键控）：
+      //   thinking/streaming → 该会话有 run 在跑（后台 drain 起的 run 也走这条通道，此前该路径
+      //   不推任何 status ⇒ UI 无从显示停止键）；idle → run 收口，停止键消失。
+      //   漏收本事件时的重建途径 = GET /sessions/{id}/running（载入 / 切会话 / 重连各查一次）。
+      //   ⛔ 与 agentStatus 不同：那个是全局单值、只驱动状态点，不能当停止键判据。
+      // [C6 · 遗留2 · T1] 收口（idle）落地前**必须**先 flush 打字机缓冲：下一行的 store 写会**同步**
+      //   触发 useServerRunning 的收口对账（zustand subscribe 在 set 内同步回调），那里 finalizeBlocks
+      //   把流式块转消息并清空块表；缓冲若还攒着增量，随后那次 rAF flush 的 appendChunk 就找不到块
+      //   （chatStore.appendChunk idx<0 **静默** return）⇒ 尾段（≤1 帧 · ~120 chunk/秒 ≈ 1-2 个 chunk）
+      //   无声消失。与 complete 分支同型（:781 先 flush 再 finalizeBlocks）。
+      //   ⚠️ 位置承重：必须在本行之前 —— 放到 setServerRunning 之后 = flush 落在 finalizeBlocks 之后 ⇒ 尾段照丢。
+      if (sid && status === 'idle') flushStreamAppends()
+      if (sid) st.setServerRunning(sid, status !== 'idle')
     } else if (isTokenWarning(evt)) {
       // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 隐藏；false（新压缩）→ 恢复显示。
       // [按会话键控] 归属会话优先取事件自带 sessionId，兜底当前会话 ref（不用闭包 sessionId ——

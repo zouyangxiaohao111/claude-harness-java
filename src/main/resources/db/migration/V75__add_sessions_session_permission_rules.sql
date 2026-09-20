@@ -1,0 +1,33 @@
+-- ===================================================================
+-- V75: sessions 表加 session_permission_rules（会话级「本次会话允许」授权 · 批 A2b）
+--
+-- 背景：CC 的 appState.toolPermissionContext 是**长驻进程内的内存对象** —— 文件类弹窗的
+--   「Yes, during this session」/「Yes, allow all edits during this session」
+--   （destination='session'，usePermissionHandler.ts:123 + permissionOptions.tsx:49-52）
+--   经 setToolPermissionContext 写进 appState 后，后续每次权限检查读同一对象；且 CC 的
+--   supportsPersistence 明确排除 session（PermissionUpdate.ts:208-216，
+--   permissionOptions.tsx:107-109 逐字「only affect in-memory state, not persisted settings」）
+--   ⇒ SESSION 档在 CC 是「会话内存态、永不落盘」。
+--   本仓 Web 端每个 HTTP send 都是新的 LlmAgentLoop（@Scope("prototype")，LlmAgentLoop.java:199；
+--   ChatService.java:900 loopProvider.getObject() 在 processUserMessage 内 = 每 send 一次）
+--   ⇒ appStateRef（实例字段，LlmAgentLoop.java:626）每 send 恒空
+--   ⇒ SESSION 档授权活不过下一条用户消息。Web 多会话无进程级 appState 单例 →
+--   会话级状态必须存 sessions 表列（multi-session-vs-cc-single-session 铁律，
+--   todos V43 / effort_level V31 / bare_mode V33 / disabled_tools V35 / team_context V40 同款范式）。
+--
+-- session_permission_rules TEXT（JSON 对象，可空；null = 该会话无 SESSION 档授权）：
+--   规范形（Jackson 规范形，字段名对齐 CC PermissionRuleValue 扁平形状）：
+--     {"mode":"acceptEdits",
+--      "alwaysAllowRules":[{"toolName":"Read","ruleContent":"//tmp/x/**"}],
+--      "alwaysDenyRules":[],"alwaysAskRules":[],
+--      "additionalWorkingDirectories":["/tmp/extra"]}
+--   只承载 **source=SESSION** 的条目（其余 source 每轮由 PermissionContextBuilder 从盘重读，
+--   不入本列 —— 入列会让盘上规则的旧值跨 send 复活）。mode 可缺省（= 本次会话未做
+--   SESSION 档 setMode，读侧按 per-turn 基线 mode 回落，对齐 CC「无 setMode 即不动 mode」）。
+--   读写共用同一对函数：SessionPermissionOverlay.toJson / toContext（LlmAgentLoop.doRun 回读注入）
+--   —— 照 todos V43「三通道共用同一规范形」先例。
+--
+-- ⛔ 本列**不得**经 settings.json / settings.local.json 落盘路径承载：那会把 CC 的
+--   「本次会话」变成「永久」，改坏 CC 语义（CC 类型上就没有「session 落盘」档）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN session_permission_rules TEXT;

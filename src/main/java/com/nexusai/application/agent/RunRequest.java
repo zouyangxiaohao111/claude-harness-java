@@ -1,6 +1,7 @@
 package com.nexusai.application.agent;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.nexusai.application.agent.permission.PermissionModeSource;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.AttachmentRequest;
 
@@ -132,12 +133,37 @@ public record RunRequest(
      *
      * <p>null = 本回合无归因上下文（主线程 / cron / 无 agent 的调用点）。
      */
-    com.nexusai.application.agent.subagent.AgentContext agentContext
+    com.nexusai.application.agent.subagent.AgentContext agentContext,
+    /**
+     * [批 A4e] <b>{@link #permissionModeCli} 的显式来源标注</b>（末位追加，对齐本 record
+     * 「新组件一律追加」的既有约定 —— 见 {@link RunRequestAgentContextChannelTest}）。
+     *
+     * <p><b>WHY 必须有这个组件（本批根因）</b>：{@code permissionModeCli == null} 有<b>三个</b>身份，
+     * 而前两个（「没有覆盖」⇒ 回落全局 / 「CLI 确实没给」⇒ {@code auto} opt-in 判断依据）是合法设计，
+     * 第三个「<b>调用方本该解析却没解析</b>」是缺陷 —— 三者数据上完全同形 ⇒ 批 A4b 的 bug 静默三批。
+     * 本字段把「<b>值属于哪个槽</b>」显式写下（{@link PermissionModeSource}），使消费点
+     * （{@code LlmAgentLoop.doRun}）能对「声明 {@code NOT_APPLICABLE} 却携带会话/携带值」的
+     * 结构性矛盾 ≥WARN 留痕。
+     *
+     * <p>⛔ <b>本字段不参与取值</b>：它只描述来源，消费点守护只打日志不改值 ——
+     * 「把 null 替换成解析后的全局值」会破坏 {@code auto} opt-in 语义（{@code autoModeIntent}
+     * 依赖 {@code permissionModeCli == null}，CC main.tsx:1409），本批明令禁止。
+     *
+     * <p>⛔ <b>必传，无默认值</b>（紧凑构造器抛 {@link IllegalArgumentException}）：
+     * 硬编码 {@code permissionModeCli} 的便捷重载必须在自己的实现里<b>显式声明</b>
+     * {@link PermissionModeSource#NOT_APPLICABLE} —— 逼作者思考，不许省略。
+     *
+     * @see PermissionModeSource
+     */
+    PermissionModeSource permissionModeSource
 ) {
     /**
-     * 紧凑构造器：校验 userPrompt / querySource 必传（对齐 CC 运行时检查）。
+     * 紧凑构造器：校验 userPrompt / querySource / permissionModeSource 必传（对齐 CC 运行时检查）。
      *
-     * @throws IllegalArgumentException if userPrompt blank or querySource null
+     * <p>[批 A4e] {@code permissionModeSource} 的 null 校验 = 「不许省」的机械落点：
+     * 任何新增工厂/构造点若忘了声明来源，会在此<b>立即抛</b>而不是静默退化（不静默失效）。
+     *
+     * @throws IllegalArgumentException if userPrompt blank / querySource null / permissionModeSource null
      */
     public RunRequest {
         if (userPrompt == null || userPrompt.isBlank()) {
@@ -145,6 +171,12 @@ public record RunRequest(
         }
         if (querySource == null) {
             throw new IllegalArgumentException("querySource is null");
+        }
+        if (permissionModeSource == null) {
+            throw new IllegalArgumentException(
+                "permissionModeSource is null —— 每个 RunRequest 构造点必须显式声明"
+                    + " permissionModeCli 的来源（CLI_ARGUMENT / SESSION_OVERRIDE / NOT_APPLICABLE），"
+                    + "⛔ 不给默认值是为了逼作者思考（批 A4e）");
         }
     }
 
@@ -165,7 +197,7 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext);
+            boundProject, agentContext, permissionModeSource);
     }
 
     /**
@@ -187,7 +219,7 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext);
+            boundProject, agentContext, permissionModeSource);
     }
 
     // ── [IMP2-10 · MISS-2 · OD-13] taskBudget 生产来源解析 ──
@@ -236,14 +268,16 @@ public record RunRequest(
     /** 最小化测试 helper：userPrompt + modelName + querySource（USER）；taskBudget 可选（null = 无任务预算）。 */
     public static RunRequest forTest(String userPrompt, String modelName, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, null, modelName, QuerySource.USER,
-            null, null, null, null, taskBudget, null, null, null, null, null, false, null, null, null, null, null);
+            null, null, null, null, taskBudget, null, null, null, null, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /** [RES-SP31] 测试 helper 重载：额外携带 appendSystemPrompt（验证 RunRequest → AgentState 传递链）。 */
     public static RunRequest forTest(String userPrompt, String modelName, TaskBudget taskBudget,
                                      String appendSystemPrompt) {
         return new RunRequest(userPrompt, null, modelName, QuerySource.USER,
-            null, null, null, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null, null);
+            null, null, null, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /**
@@ -257,14 +291,16 @@ public record RunRequest(
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            null, null, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null, null, null);
+            null, null, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /** [RES-SP31] user 工厂重载：额外携带 appendSystemPrompt（VerifyChatController 等主线程 HTTP 入口）。 */
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   String appendSystemPrompt, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            null, null, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null, null);
+            null, null, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /**
@@ -278,7 +314,8 @@ public record RunRequest(
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   String appendSystemPrompt, String fallbackModel, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            null, null, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null, null, null);
+            null, null, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /**
@@ -290,6 +327,10 @@ public record RunRequest(
      * CC original: {@code --permission-mode} main.tsx:1099 /
      * {@code --dangerously-skip-permissions} main.tsx:621）→ 本字段 →
      * LlmAgentLoop.doRun 组装 InitialPermissionModeResolver.Input（与 settings 磁盘 meta 合并）。
+     *
+     * <p>[批 A4e] 来源标注 = {@link PermissionModeSource#CLI_ARGUMENT}（本重载接收调用方显式解析的
+     * CLI/请求体槽值；为 {@code null} 表示该槽确实为空 ⇒ 合法回落，正是 CC
+     * {@code permissionModeCli === undefined} 语义）。
      */
     public static RunRequest user(String userPrompt, ProviderConfig config, String modelName, String systemPrompt,
                                   String appendSystemPrompt, String fallbackModel,
@@ -297,7 +338,8 @@ public record RunRequest(
                                   TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             null, null, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null, null, null,
+            PermissionModeSource.CLI_ARGUMENT);
     }
 
     /**
@@ -316,12 +358,21 @@ public record RunRequest(
      * → 主线程首迭代 StopDecision → MAX_OUTPUT_TOKENS break。直接以 agentId==sessionId
      * 驱动 loop 的主线程调用方由 LlmAgentLoop checkTokenBudget 入参守卫（isSubagent 语义）
      * 归一为 null；真 subagent（agentId != sessionId）传非空。
+     *
+     * <p>⛔ <b>[批 A4e] 本重载把 {@code permissionModeCli} 硬编码为 {@code null}</b>，故来源标注为
+     * {@link PermissionModeSource#NOT_APPLICABLE}（= 本重载<b>不解析</b>权限模式）。
+     * 消费点守护（{@code LlmAgentLoop.doRun}）对「{@code NOT_APPLICABLE} 却携带真实会话」的
+     * 结构性矛盾 <b>≥WARN</b> 留痕 —— 这正是批 A4b 之 bug（cron drain 走了硬编码 null 的便捷重载）
+     * 的可检形态。会话相关路径请改用
+     * {@link #session(String, String, UUID, ProviderConfig, String, String, String, String, String, boolean, TaskBudget, JsonNode, List)}
+     * 或 {@link #sessionFromSessionOverride(String, String, UUID, ProviderConfig, String, String, String, boolean, TaskBudget, List)}。
      */
     public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /** [RES-SP31] session 工厂重载：额外携带 appendSystemPrompt（ChatService 主会话 HTTP 入口）。 */
@@ -329,7 +380,8 @@ public record RunRequest(
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, appendSystemPrompt, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /**
@@ -344,7 +396,8 @@ public record RunRequest(
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null, appendSystemPrompt, null, false, null, null, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /**
@@ -356,6 +409,10 @@ public record RunRequest(
      * CC original: {@code --permission-mode} main.tsx:1099 /
      * {@code --dangerously-skip-permissions} main.tsx:621）→ 本字段 →
      * LlmAgentLoop.doRun 组装 InitialPermissionModeResolver.Input（与 settings 磁盘 meta 合并）。
+     *
+     * <p>[批 A4e] 来源标注 = {@link PermissionModeSource#CLI_ARGUMENT}
+     * （值来自 CLI/请求体槽：web = per-call HTTP 请求体 ?? 会话 override 的解析结果；
+     * 为 {@code null} 表示该槽确实为空 ⇒ 合法回落 + {@code auto} opt-in 判断依据）。
      */
     public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
@@ -364,7 +421,37 @@ public record RunRequest(
                                      TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, null, null, null, null,
+            PermissionModeSource.CLI_ARGUMENT);
+    }
+
+    /**
+     * [批 A4e] <b>会话 override 槽</b>专用 session 工厂 —— {@code permissionModeCli} 的实参由调用方
+     * 从 {@code sessions.permission_mode} 列解析而来（无 per-call HTTP 请求体来源的路径：
+     * cron 队列 drain / 主会话后台化派生查询），来源标注
+     * {@link PermissionModeSource#SESSION_OVERRIDE}。
+     *
+     * <p><b>WHY 单开一个工厂而不是复用 13 参重载</b>：{@code permissionModeCli} 属于哪个槽
+     * （CLI/请求体 vs 会话 override）是<b>调用点才知道</b>的事，而两个调用点的值形态完全一样
+     * （都是 {"plan"/"acceptEdits"/null}）—— 复用同一重载会让来源标注退化为猜测。
+     * 用工厂名把「值的槽位」写在调用点上，正与本 record 既有约定一致
+     * （{@code withBoundProject} / {@code withAgentContext} 也是「用方法名表达语义」）。
+     *
+     * <p><b>取不到会话时</b>：调用方自己必须 ≥WARN 留痕（见 {@code CronIdleExecutor.resolveSessionPermissionMode}
+     * / {@code MainSessionBackgroundService}），本工厂只负责把来源标注成 {@code SESSION_OVERRIDE}
+     * —— 值仍可为 {@code null}（会话未设 override ⇒ 合法回落全局，属三态链正常末态）。
+     *
+     * @param permissionModeCli 会话选定模式（可为 null = 会话未设 override 或取不到；取不到须调用方已留痕）
+     * @param attachments      附件列表（可 null/空 = 无附件）
+     */
+    public static RunRequest sessionFromSessionOverride(String userPrompt, String sessionId, UUID agentId,
+                                                        ProviderConfig config, String modelName, String systemPrompt,
+                                                        String permissionModeCli, boolean dangerouslySkipPermissions,
+                                                        TaskBudget taskBudget, List<AttachmentRequest> attachments) {
+        return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
+            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null,
+            null, permissionModeCli, dangerouslySkipPermissions, null, attachments, null, null, null,
+            PermissionModeSource.SESSION_OVERRIDE);
     }
 
     /**
@@ -382,7 +469,8 @@ public record RunRequest(
                                      TaskBudget taskBudget, JsonNode jsonSchema) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, null, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, null, null, null, null,
+            PermissionModeSource.CLI_ARGUMENT);
     }
 
     // ── [A1 · attachment-multimodal] 附件透传工厂重载 ──
@@ -400,7 +488,8 @@ public record RunRequest(
                                   TaskBudget taskBudget, List<AttachmentRequest> attachments) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             null, null, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, attachments, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, null, attachments, null, null, null,
+            PermissionModeSource.CLI_ARGUMENT);
     }
 
     /**
@@ -417,7 +506,8 @@ public record RunRequest(
                                      TaskBudget taskBudget, JsonNode jsonSchema, List<AttachmentRequest> attachments) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, null, null, null);
+            appendSystemPrompt, permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, null, null, null,
+            PermissionModeSource.CLI_ARGUMENT);
     }
 
     /**
@@ -426,10 +516,25 @@ public record RunRequest(
      *
      * <p><b>WHY</b>：CronIdleExecutor 端后兜底消费残留带图 busy-queued 时（QueueItem.attachments），
      * 需把附件透传 RunRequest.attachments() → LlmAgentLoop.doRun registerRunPromptImages 单次注册
-     * （enqueue 未预登记 → 无双份）。CronIdleExecutor 不涉 permissionMode/dangerouslySkip/jsonSchema，
-     * 用 9 参形状 + attachments 尾参即可（10 参，与既有各 session 重载类型区分无歧义）。
+     * （enqueue 未预登记 → 无双份）。用 9 参形状 + attachments 尾参（10 参，与既有各 session 重载
+     * 类型区分无歧义）。
      *
      * <p>附件语义同 A1：null/空 = 无附件（行为与现状一致）。
+     *
+     * <p>⚠️ <b>[批 A4b · 已证伪的旧注释]</b> 原 javadoc 曾写「CronIdleExecutor 不涉
+     * permissionMode/dangerouslySkip/jsonSchema」—— <b>该假设已证伪</b>。CronIdleExecutor 的队列
+     * drain 轮<b>确实需要</b>会话选定的权限模式：丢它 ⇒ 回落全局 {@code settings.permission_mode}
+     * （本机实测 = {@code bypassPermissions}）⇒ <b>整轮静默绕过全部权限检查（含 deny）</b>。
+     * 故 drain 侧已改走 12 参重载 {@link #session(String, String, UUID, ProviderConfig, String, String,
+     * String, String, String, boolean, TaskBudget, JsonNode, List)} 显式传 {@code permissionModeCli}。
+     *
+     * <p>⛔ <b>本重载把 {@code permissionModeCli} 硬编码为 {@code null}</b>、
+     * {@code dangerouslySkipPermissions} 硬编码为 {@code false}。仅当调用方<b>确能证明</b>该 run
+     * 不承载会话权限语义时才可用；任何会话相关路径请改用带 {@code permissionModeCli} 的重载
+     * （会话 override 槽 → {@link #sessionFromSessionOverride}）。
+     *
+     * <p>[批 A4e] 来源标注 = {@link PermissionModeSource#NOT_APPLICABLE}
+     * ⇒ 若调用方携带真实会话，消费点守护会 <b>≥WARN</b>（结构性矛盾，不许静默）。
      */
     public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
@@ -437,7 +542,8 @@ public record RunRequest(
                                      TaskBudget taskBudget, List<AttachmentRequest> attachments) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
             sessionId, agentId, systemPrompt, null, taskBudget, fallbackModel, null, null,
-            appendSystemPrompt, null, false, null, attachments, null, null, null);
+            appendSystemPrompt, null, false, null, attachments, null, null, null,
+            PermissionModeSource.NOT_APPLICABLE);
     }
 
     /**
@@ -454,23 +560,38 @@ public record RunRequest(
      *   <li>{@code querySource=REPL_MAIN_THREAD}（主线程命令，同 {@link #session}）</li>
      * </ul>
      *
+     * <p><b>[批 A4b · 模式传递]</b> 本工厂补 {@code permissionModeCli} + {@code dangerouslySkipPermissions}
+     * 两个入参。⛔ 原实现把它们<b>硬编码为 {@code null} / {@code false}</b>，且原 javadoc 未提权限模式 ——
+     * 调用方（{@code CronIdleExecutor} 队列 drain 批量子路径）因而<b>静默丢掉会话选定的权限模式</b>，
+     * 回落全局 {@code settings.permission_mode}（本机实测 = {@code bypassPermissions}）⇒ 整轮绕过权限检查。
+     * 现由调用方显式传入（拿不到会话时同样由调用方 ≥WARN 留痕，见 {@code CronIdleExecutor}），
+     * 与 {@link #session} 各重载同语义。
+     *
      * @param prompts      批量通知原文（非空；size==1 时 batchUserPrompts=空 List，回落单条语义）
      * @param sessionId    会话 short 键（headless → null/GLOBAL 兜底由调用方决定）
      * @param agentId      主线程恒 null（对齐 CC 主线程契约，query.ts:342）
      * @param config       主模型 ProviderConfig
      * @param modelName    主模型名
      * @param systemPrompt 系统提示词（可 null）
+     * @param permissionModeCli 会话选定的有效权限模式（null = 会话未设 override → 回落全局 settings，
+     *                          属三态链正常末态；取不到会话时调用方须已 ≥WARN 留痕）
+     * @param dangerouslySkipPermissions 危险跳过开关（drain 侧无 per-call 来源 ⇒ 恒 false）
      * @param taskBudget   任务预算（可 null）
      */
     public static RunRequest sessionBatch(List<String> prompts, String sessionId, UUID agentId,
                                           ProviderConfig config, String modelName, String systemPrompt,
+                                          String permissionModeCli, boolean dangerouslySkipPermissions,
                                           TaskBudget taskBudget) {
         if (prompts == null || prompts.isEmpty()) {
             throw new IllegalArgumentException("sessionBatch prompts is empty");
         }
         List<String> rest = prompts.size() > 1 ? new java.util.ArrayList<>(prompts.subList(1, prompts.size())) : List.of();
+        // [批 A4e] 来源标注 = SESSION_OVERRIDE：本工厂唯一调用方 = CronIdleExecutor 队列 drain
+        //   （无 per-call HTTP 请求体来源 ⇒ 值只能来自会话 sessions.permission_mode 列）。
         return new RunRequest(prompts.get(0), config, modelName, QuerySource.REPL_MAIN_THREAD,
-            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null, null, false,
-            null, null, rest, null, null);
+            sessionId, agentId, systemPrompt, null, taskBudget, null, null, null, null,
+            permissionModeCli, dangerouslySkipPermissions,
+            null, null, rest, null, null,
+            PermissionModeSource.SESSION_OVERRIDE);
     }
 }

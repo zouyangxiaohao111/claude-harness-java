@@ -134,6 +134,23 @@ public class SessionRecord {
      */
     private String mainThreadAgent;
     /**
+     * 会话级 SESSION 档授权（V75 列 session_permission_rules，TEXT JSON 对象，可空）·
+     * CC original: appState.toolPermissionContext 里的 destination='session' 条目
+     * （文件类弹窗「Yes, during this session」/「Yes, allow all edits during this session」，
+     * permissionOptions.tsx:49-52 类型上只有 accept-once / accept-session / reject 三档；
+     * usePermissionHandler.ts:123 destination: 'session'）。CC 该授权活在长驻进程内存里、
+     * 且 supportsPersistence 明确排除 session（PermissionUpdate.ts:208-216）⇒ 永不落盘；
+     * 本仓 LlmAgentLoop 是 prototype（每 send 新实例）⇒ 必须由会话列承载跨 send 存活
+     * （multi-session-vs-cc-single-session 铁律，todos V43 / effort_level V31 同款范式）。
+     * 规范形 {"mode":"acceptEdits","alwaysAllowRules":[{"toolName","ruleContent"?}],
+     * "alwaysDenyRules":[],"alwaysAskRules":[],"additionalWorkingDirectories":["..."]}，
+     * 只含 source=SESSION 条目；mode 可缺省（无 SESSION setMode ⇒ 读侧回落 per-turn 基线 mode）。
+     * 可空：null = 该会话无 SESSION 档授权（读侧 skip 不注入 / 不建 appState 键）。
+     * 读写解析放 SessionPermissionOverlay.toJson（写侧）/ toContext（读侧）—— 本列仅存
+     * JSON 串、解析在读侧（照抄 disabledTools L51 / todos L73 先例）。
+     */
+    private String sessionPermissionRules;
+    /**
      * 显式命名标志（V66 列 title_explicit，三态）· CC original: hasExplicitTitle / custom-title
      *   storage（initReplBridge.ts:299-336 / REPL.tsx:2684-2698）：
      *   0 = 未显式命名（count1/count3 可自动生成，对齐 CC hasExplicitTitle=false）
@@ -212,6 +229,9 @@ public class SessionRecord {
     // [title-cc-align V66] 显式命名标志 getter/setter（V66 会话列 title_explicit，MyBatis-Flex snake↔camel 映射）
     public Integer getTitleExplicit() { return titleExplicit; }
     public void setTitleExplicit(Integer titleExplicit) { this.titleExplicit = titleExplicit; }
+    // [批 A2b V76] 会话级 SESSION 档授权 getter/setter（V76 会话列 session_permission_rules，MyBatis-Flex snake↔camel 映射）
+    public String getSessionPermissionRules() { return sessionPermissionRules; }
+    public void setSessionPermissionRules(String sessionPermissionRules) { this.sessionPermissionRules = sessionPermissionRules; }
     // [coordinator-session V75] 会话级 coordinator 模式 getter/setter（V75 会话列 coordinator_mode，MyBatis-Flex snake↔camel 映射）
     public Integer getCoordinatorMode() { return coordinatorMode; }
     public void setCoordinatorMode(Integer coordinatorMode) { this.coordinatorMode = coordinatorMode; }

@@ -36,13 +36,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class TaskServiceFallbackWarnObservabilityTest {
 
+    /** 本用例用到的会话（对照用例的显式会话）。 */
+    private static final String SESSION = "sess-s1-t14";
+
+    /** [P0-2 · B1] 按本用例 sessionId 清（0 参重载 = clear(null) ⇒ 清不掉任何键）。 */
     @BeforeEach
     @AfterEach
     void reset() {
         System.clearProperty("nexusai.taskListId");
         System.clearProperty("nexusai.team.name");
         System.clearProperty("nexusai.sessionId");
-        TaskService.clearLeaderTeamName();
+        TaskService.clearLeaderTeamName(SESSION);
         TaskService.resetFallbackWarnCounterForTesting();
     }
 
@@ -100,8 +104,8 @@ class TaskServiceFallbackWarnObservabilityTest {
     void noFallbackWarn_whenSessionResolves() {
         ListAppender<ILoggingEvent> logs = captureFallbackWarn();
         try {
-            assertThat(TaskService.getTaskListId("sess-s1-t14", null)).isEqualTo("sess-s1-t14");
-            assertThat(TaskService.getTaskListId("sess-s1-t14",
+            assertThat(TaskService.getTaskListId(SESSION, null)).isEqualTo(SESSION);
+            assertThat(TaskService.getTaskListId(SESSION,
                 new com.nexusai.application.agent.team.TeammateIdentity(
                     "p@t", "p", "t-x", null, false, null))).isEqualTo("t-x");
         } finally {

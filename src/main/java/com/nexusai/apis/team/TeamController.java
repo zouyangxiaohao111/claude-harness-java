@@ -58,7 +58,7 @@ import java.util.stream.Stream;
  *   <li>POST /api/v1/teams —— 创建（复用 TeamCreateTool.execute，每 leader 一 team 守卫/自动换名/落库）；</li>
  *   <li>DELETE /api/v1/teams/{teamName} —— 解散（复用 TeamDeleteTool.deleteTeamByName，活跃成员 → 409）；</li>
  *   <li>POST/DELETE /api/v1/teams/{teamName}/members[/{agentId}] —— 成员 join/leave（可选，发布状态）；</li>
- *   <li>GET /api/v1/teams/{teamName}/inbox + POST /inbox/read —— B1 轮询兜底 + 已读回执。</li>
+ *   <li>GET /api/v1/teams/{teamName}/inbox —— B1 轮询兜底（纯读；标读不在此层，见 C2 说明）。</li>
  * </ul>
  *
  * <p>状态变化 STOMP：创建/解散/成员加入退出 → TeamStatusPublisher 推
@@ -436,20 +436,16 @@ public class TeamController {
         return messages;
     }
 
-    /** POST /api/v1/teams/{teamName}/inbox/read?recipient=team-lead → 标 read=true（B1 已读回执）。 */
-    @PostMapping("/{teamName}/inbox/read")
-    public Map<String, Object> markRead(
-            @PathVariable String teamName,
-            @RequestParam(defaultValue = SwarmConstants.TEAM_LEAD_NAME) String recipient) {
-        if (!teamHelpers.teamExists(teamName)) {
-            throw new NotFoundException("Team " + teamName + " not found");
-        }
-        TeammateMailbox.markMessagesAsRead(recipient, teamName);
-        if (log.isInfoEnabled()) {
-            log.info("[TeamController] POST /api/v1/teams/{}/inbox/read recipient={} → 已标已读", teamName, recipient);
-        }
-        return Map.of("success", true);
-    }
+    // ── [C2 删除 · 2026-09-18] 原 POST /api/v1/teams/{teamName}/inbox/read 已删除 ──
+    //   WHY：该端点让「展开收件箱」这个纯 UI 动作把全部消息标 read=true，抢在模型之前把消息吞掉
+    //   （消息只置 read 位不删元素，但对模型静默不可见 = 队友的话永远进不了队长上下文）。
+    //   CC 全仓无任何 UI 触发的标读入口 —— `markMessagesAsRead` 只有两个**轮询器**调用点，且都在
+    //   「已投递或已可靠入队」**之后**：`src/hooks/useInboxPoller.ts:200-202`（helper，调用点 :806/:864）
+    //   + `src/cli/print.ts:2538`（print 模式轮询器，取到 unread 后立即标读再处理）；
+    //   团队 UI `src/components/teams/TeamsDialog.tsx` 对 markMessagesAsRead/markRead **零命中**。
+    //   删除后本端点零调用方（前端 teamsApi.markRead 同批删除）⇒ 按 dead-code-decision-rule 可删。
+    //   标读的正确时机在消费侧：`AgentLoopContext.maybeInjectTeammateMailbox`
+    //   （构建 <teammate-message> 后才 markMessagesAsReadByPredicate，对齐 CC attachments.ts:3769-3796）。
 
     /** 解析 AgentToolResult.data 为 JSON（工具输出 JSON 串）· 解析失败 → null。 */
     private static JsonNode parseToolResult(Object data) {

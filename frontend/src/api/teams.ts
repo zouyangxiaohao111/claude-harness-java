@@ -34,9 +34,7 @@ export const teamsApi = {
   kill: (name: string, agentId: string) =>
     api<{ success: boolean }>(`/teams/${encodeURIComponent(name)}/members/${encodeURIComponent(agentId)}/kill`, { method: 'POST' }),
   inbox: (name: string) => api<TeammateMessageDto[]>(`/teams/${encodeURIComponent(name)}/inbox`),
-  markRead: (name: string, from?: string) =>
-    api<void>(`/teams/${encodeURIComponent(name)}/inbox/read`, {
-      method: 'POST',
-      body: from ? { from, read: true } : { read: true },
-    }),
+  // [C2 删除] teamsApi.markRead 已删除 —— 其对应的 POST /{teamName}/inbox/read 端点同批删除。
+  //   展开收件箱不该把消息标已读（会把队友消息抢在模型之前吞掉）。标读改由消费侧
+  //   AgentLoopContext.maybeInjectTeammateMailbox 在构建注入后按谓词执行。
 }

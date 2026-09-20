@@ -64,13 +64,20 @@ class TaskListIdExplicitResolutionTest {
 
     private final ObjectMapper json = new ObjectMapper();
 
+    /**
+     * [P0-2 · B1] 清 leader team name 必须按**本用例的 sessionId** 清：0 参重载 = clear(null)
+     * ⇒ 立即 return，清不掉任何键（旧写法是静默 no-op）。{@code TaskService.leaderTeamNames} 是
+     * JVM 级 static Map，断言5 的 TeamCreateTool 建队后会在本会话键上登记 team ⇒ 不清则
+     * 断言4a-4e（走优先级 6 = 会话本身）被优先级 4 劫持而红。
+     */
     @BeforeEach
     @AfterEach
     void clearSyspropsAndSessionScopedState() {
         System.clearProperty("nexusai.taskListId");
         System.clearProperty("nexusai.team.name");
         System.clearProperty("nexusai.sessionId");
-        TaskService.clearLeaderTeamName();
+        TaskService.clearLeaderTeamName(SESSION_A);
+        TaskService.clearLeaderTeamName(SESSION_B);
     }
 
     /** 显式 teammate 身份（纯数据 record；生产来源 = {@code ToolUseContext.teammateIdentity()}）。 */

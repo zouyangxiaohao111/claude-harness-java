@@ -69,14 +69,19 @@ describe('代码块（CodeBlock banner + 复制/运行）', () => {
     expect(html).not.toContain('md-code-run')
     expect(html).not.toContain('运行')
   })
-  it('未闭合 ```html（流式中）→ 仍产 CodeBlock、lang=html、partial 值、有运行', () => {
+  it('未闭合 ```html：流式臂原样纯文本，收口臂才出 CodeBlock（lang=html/有运行）', () => {
+    // [stream-raw] 流式臂不再解析 markdown（见 streamRaw.test.tsx 的逐字符契约），
+    // 故「未闭合 fence 也渐进成形」不再是流式臂的行为；成形由收口臂一次完成。
     const text = '说明\n\n```html\n<div class="x">\n<p>部分代码'
-    const html = render(text, true)
-    expect(html).toContain('md-code-block')
-    expect(html).toContain('html')
-    expect(html).toContain('md-code-run')
-    expect(html).toContain('部分代码')
-    expect(html).toContain('&lt;div class=&quot;x&quot;&gt;')
+    const streaming = render(text, true)
+    expect(streaming).toContain('md-stream-raw')
+    expect(streaming).toContain('部分代码')
+    expect(streaming).not.toContain('md-code-block')
+
+    const settled = render(text, false)
+    expect(settled).toContain('md-code-block')
+    expect(settled).toContain('md-code-run')
+    expect(settled).toContain('&lt;div class=&quot;x&quot;&gt;')
   })
 })
 
@@ -108,10 +113,24 @@ describe('XSS 自持（替代 DOMPurify）', () => {
   })
 })
 
-describe('streaming 与 settled 一致性（[markdown-fix] 去 patches 后同源；[rescue] 粘连标记是唯一例外）', () => {
-  it('heading/段落/表格/列表/强调/链接 两种形态渲染一致', () => {
+describe('streaming 与 settled 的分工（[stream-raw] 起两臂不再相等：流式=原文，收口=markdown）', () => {
+  it('heading/段落/表格/列表/强调/链接：流式臂输出原文、收口臂输出 markdown 结构', () => {
     const text = '## 标题\n\n一段有 **加粗** 与 [链接](https://e.com) 的文本。\n\n| x | y |\n| --- | --- |\n| 1 | 2 |\n\n- 甲\n- 乙'
-    expect(render(text, true)).toBe(render(text, false))
+    // 流式臂：原样纯文本（本用例的文本无 HTML 敏感字符，故可直接 toContain 原文）
+    const streaming = render(text, true)
+    expect(streaming).toContain('md-stream-raw')
+    expect(streaming).toContain(text)
+    expect(streaming).not.toContain('<h2>')
+    expect(streaming).not.toContain('<table>')
+    // 收口臂：真 markdown 渲染
+    const settled = render(text, false)
+    expect(settled).toContain('<h2>标题</h2>')
+    expect(settled).toContain('<strong>加粗</strong>')
+    expect(settled).toContain('href="https://e.com"')
+    expect(settled).toContain('<table>')
+    expect(settled).toContain('<ul>')
+    // 两臂**不再相等** —— 这正是本批次的分工（原文 → 一次精排）
+    expect(streaming).not.toBe(settled)
   })
   it('脚注 settled 出 <sup> + data-footnotes', () => {
     const html = render('正文[^1]\n\n[^1]: 注释内容')
@@ -127,16 +146,22 @@ describe('streaming 与 settled 一致性（[markdown-fix] 去 patches 后同源
     const settled = render('##核心\n正文\n')
     expect(settled).toContain('<h2>核心</h2>')
     expect(settled).not.toContain('##核心')
-    // 两态不再逐字节相等：流式臂不抢救（方案 B）。差异只允许是「裸露减少」——
-    // 写成对照形态（两臂各有正向 + 镜像反向），「仍然裸露」与「没有变成标题」都要钉住。
+    // 两态不再逐字节相等：流式臂不抢救（方案 B）。[stream-raw] 起流式臂整体为纯文本直出，
+    // 故「仍然裸露」的形态是**连段落包装都没有**（不再有 `<p>##核心`）——两向都钉住。
     const streaming = render('##核心\n正文\n', true)
-    expect(streaming).toContain('<p>##核心')
+    expect(streaming).toContain('md-stream-raw')
+    expect(streaming).toContain('##核心')
     expect(streaming).not.toContain('<h2>')
+    expect(streaming).not.toContain('<p>')
   })
 })
 
 // —— 以下两条 [rescue] describe 按设计文档 §7 的层序排列（层 3 两态 → 层 4 回滚哨兵）；
 //    历史回归钉（[markdown-fix] / [chat-switch-stream-align]）统一排在其后。
+// ⚠ [stream-raw] 2026-09-18：本 describe 的各条 streaming 断言（`toContain('##一句话结论')` 等）
+//   在新契约下**仍然为真但语义变空** —— 流式臂现在整体就是原文纯文本，故「流式仍裸露」不再是
+//   「不抢救」的证据（它根本没解析）。真正的两臂契约已由 `streamRaw.test.tsx` 逐字符钉住；
+//   本 describe 保留其收口臂断言（那半仍然有判别力），断言本身不改。
 describe('[rescue] 两态差异只允许是「裸露减少」', () => {
   it('流式臂不抢救：含粘连标记的文本在 streaming 下仍裸露', () => {
     const t = '##一句话结论\n'
@@ -210,25 +235,33 @@ describe('[markdown-fix] 围栏代码零改写（原 patches 整文本正则的 
   })
 })
 
-// 超过 STREAM_DEGRADE_CHARS(8000) 的单块长度：必然触发 D1 纯文本降级
+// 超过 STREAM_DEGRADE_CHARS(8000) 的单块长度（历史 D1 降级判定的触发长度；该判定在
+// [stream-raw] 后不再被求值，此常量仍作为「超长单块」语料保留）
 const LONG_SINGLE_BLOCK = 'x'.repeat(9000)
 
-describe('[chat-switch-stream-align] D1 · streaming 超长单块 → 纯文本降级（零 mdast parse，治「字不吐」）', () => {
-  it('超长单段 prose（不可冻结单块）→ <pre md-stream-degraded> 直出原文，不产 md 元素', () => {
+// ⚠ [stream-raw] 2026-09-18：D1 的「按长度降级」判定在流式臂已不再执行（流式臂整体就是纯文本
+//   直出，无需降级）。本 describe 的流式臂断言按新契约改写为「md-stream-raw 直出原文」——
+//   断言仍为真，但已不再能区分「是否触发降级」（新路径下长/短文本走同一条路）。
+describe('[stream-raw] · streaming 一律纯文本直出（原 D1 降级路径已不再执行）', () => {
+  it('超长单段 prose → md-stream-raw 直出原文，不产 md 元素', () => {
     const html = render(LONG_SINGLE_BLOCK, true)
-    expect(html).toContain('md-stream-degraded')
+    expect(html).toContain('md-stream-raw')
     expect(html).toContain(LONG_SINGLE_BLOCK.slice(0, 40))
     expect(html).not.toContain('<p>')
+    expect(html).not.toContain('md-stream-degraded')
   })
   it('降级不丢字：settled 精排仍含全文（一次全量自愈）', () => {
     const html = render(LONG_SINGLE_BLOCK, false)
     expect(html).toContain(LONG_SINGLE_BLOCK.slice(0, 40))
   })
-  it('正常多段短文本不触发降级（冻结有效，维持 markdown）', () => {
+  it('多段短文本同样走纯文本直出（两臂分工：流式原文、收口成形）', () => {
     const text = '短段第一行。\n\n' + 'y'.repeat(300)
-    const html = render(text, true)
-    expect(html).not.toContain('md-stream-degraded')
-    expect(html).toContain('<p>')
+    const streaming = render(text, true)
+    expect(streaming).toContain('md-stream-raw')
+    expect(streaming).not.toContain('md-stream-degraded')
+    expect(streaming).not.toContain('<p>')
+    // 收口臂才出段落结构
+    expect(render(text, false)).toContain('<p>')
   })
 })
 

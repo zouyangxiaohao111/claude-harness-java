@@ -1,5 +1,16 @@
 -- ===================================================================
--- V75: 会话级 coordinator 模式
+-- V76: 会话级 coordinator 模式
+--
+-- ⚠️ 版本号由来（原为 V75，因撞号让位到 V76）：
+--   本迁移原为 V75__add_sessions_coordinator_mode.sql，与 always-allow 批次的
+--   V75__add_sessions_session_permission_rules.sql **撞号**。谁让位由**真库**定：
+--   用户真库 flyway_schema_history 已应用的是 permission_rules 那条
+--   （version 75 | ... | checksum 149204197 | success 1），coordinator_mode **未被应用**
+--   ⇒ **由本迁移让位到 V76**（已应用的那条必须保持 V75，否则 Flyway 报
+--   「applied migration not resolved locally: 75」整库起不来）。
+--   两者都是 ALTER TABLE sessions ADD COLUMN，**列不冲突**
+--   （coordinator_mode vs session_permission_rules），仅版本号需要让位。
+--
 -- 语义：NULL = 未设置 → 回落 settings.coordinator_mode_enabled → 再回落 feature && env
 -- 范式同 V57（会话/运行级状态入 sessions 会话列）。
 --

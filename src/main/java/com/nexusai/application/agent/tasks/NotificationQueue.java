@@ -66,6 +66,48 @@ public class NotificationQueue {
     public static final String MODE_PROMPT = "prompt";
 
     /**
+     * 该 mode 的排队命令能否被「拉回输入框编辑」—— CC
+     * {@code NON_EDITABLE_MODES = new Set<PromptInputMode>(['task-notification'])}
+     * （utils/messageQueueManager.ts:343-345）+
+     * {@code isPromptInputModeEditable(mode) = !NON_EDITABLE_MODES.has(mode)}（同文件 :347-351）。
+     *
+     * <p><b>本仓 mode 取值域</b>：全部 {@code QueueItem} 构造点（8 处生产调用）只传
+     * {@link #MODE_PROMPT} / {@link #MODE_TASK_NOTIFICATION} 两个字面量（{@code MODE_PROMPT}：
+     * LlmAgentLoop:3539 用户 prompt / ChatService:320 busy-queued /
+     * ChannelNotification:154 channel / CronIdleExecutor:235 missed 通知 / TestJob:373 cron 命令；
+     * {@code MODE_TASK_NOTIFICATION}：BackgroundTaskRunner / RemoteAgentTaskService /
+     * MainSessionBackgroundService / MonitorMcpTaskRunner / WorkflowNotifications / CommandHookExecutor）。
+     * 故本判据在当前取值域下等价于 {@code mode == MODE_PROMPT}，但按 CC 写成「非 task-notification」
+     * —— mode 域日后扩展（CC 尚有 channel 等）时不必改判据。
+     *
+     * @param mode 排队命令 mode（null 视同非 task-notification，与 CC {@code Set.has(undefined)} 同为 false 等价）
+     * @return true = 该 mode 可编辑
+     */
+    public static boolean isPromptInputModeEditable(String mode) {
+        return !MODE_TASK_NOTIFICATION.equals(mode);
+    }
+
+    /**
+     * 该排队命令能否被「拉回输入框编辑」—— CC
+     * {@code isQueuedCommandEditable(cmd) = isPromptInputModeEditable(cmd.mode) && !cmd.isMeta}
+     * （utils/messageQueueManager.ts:359-361）。
+     *
+     * <p><b>WHY 必须与 {@code mode} 判据同时判 {@code isMeta}</b>：本仓 {@code mode='prompt'} 而
+     * {@code isMeta=true} 的项有三处 —— cron 命令（{@code TestJob:373}，{@code workload='cron'}）、
+     * cron missed 启动通知（{@code CronIdleExecutor:235}）、外部 channel 入站消息
+     * （{@code ChannelNotification:154}，正文是 {@code <channel>} 原始 XML）。这些是<b>系统生成</b>的
+     * 内容，不是用户在输入框里敲的字 —— 一旦把它们拼进用户输入框，用户就会「拉回」一段自己从未写过的
+     * XML（CC 同文件 :353-357 的注释即为此：{@code System-generated commands ... contain raw XML and
+     * must not leak into the user's input.}）。
+     *
+     * @param cmd 排队命令（null → false）
+     * @return true = 可拉回编辑
+     */
+    public static boolean isQueuedCommandEditable(QueueItem cmd) {
+        return cmd != null && isPromptInputModeEditable(cmd.mode()) && !cmd.isMeta();
+    }
+
+    /**
      * 消息来源判别 · CC original: {@code MessageOrigin}（textInputTypes.ts:341
      * {@code QueuedCommand.origin?: MessageOrigin}；{@code {kind: 'channel', server} | {kind: 'human'} |
      * {@code {kind: 'task-notification'} | ...}）。
@@ -647,10 +689,14 @@ public class NotificationQueue {
      * 每条带 content logOperation('popAll')）与「模型消费通用移除」（removeByFilter → 'remove' 无 content）。
      *
      * <p>谓词契约（MINOR 1）：返回该谓词命中的<b>全部</b>项（保持旧序，与现 removeByFilter
-     * 谓词语义完全一致）；调用方取首条回填（复刻 ChatController 旧行为：移除全部 prompt
-     * 命令仅回填最旧一条）。无匹配 → 返回空 List、不触发审计（CC :432-443 空守卫同款）。
+     * 谓词语义完全一致）；调用方（{@code ChatController.popQueuedCommand}）把全部命中项的
+     * 文本 {@code \n} join 后回填输入框、并把附件事项一并回传（对齐 CC popAllEditable
+     * messageQueueManager.ts:455-478）—— <b>「未命中谓词的项留在队列」这一「不可编辑项留队」
+     * 语义由本方法的「只移除命中项」结构天然给出</b>（CC :480-481
+     * {@code commandQueue.length = 0; commandQueue.push(...nonEditable)} 的等价物）。
+     * 无匹配 → 返回空 List、不触发审计（CC :432-443 空守卫同款）。
      *
-     * @param predicate 匹配谓词（ChatController 传 sessionId + mode=prompt 过滤）
+     * @param predicate 匹配谓词（ChatController 传 sessionId + {@link #isQueuedCommandEditable} 过滤）
      * @return 匹配并移除的项（原顺序）；无匹配 → 空 List
      */
     public synchronized List<QueueItem> popForEdit(Predicate<QueueItem> predicate) {

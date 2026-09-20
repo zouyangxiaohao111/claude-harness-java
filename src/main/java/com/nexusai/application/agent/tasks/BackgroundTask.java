@@ -73,8 +73,20 @@ public record BackgroundTask(
     /** CC TaskStateBase.notified (line 56) — L1 防重复通知标记 */
     boolean notified,
     /**
-     * Phase 3: 拥有此 task 的 sub-agent UUID (CC taskId===agentId 合一) ·
-     * 主线程 spawn 时为 null（CC: taskId===agentId 但 main-thread task 走前台）。
+     * Phase 3: 拥有此 task 的 sub-agent UUID (CC taskId===agentId 合一) · 主线程 spawn 时为 null。
+     *
+     * <p><b>两种语义，不可共用一个算式（H1）</b>：
+     * <ul>
+     *   <li>{@link TaskType#LOCAL_BASH}：<b>派活 owner</b> —— 谁 spawn 了这条后台 bash
+     *       （子代理 spawn → 非 null；主会话 spawn → null）。终态通知必须带回该 agentId
+     *       （CC LocalShellTask.tsx:121-137,204 shell 才带 owning agentId）。</li>
+     *   <li>{@link TaskType#LOCAL_AGENT}：<b>任务自身</b>（taskId===agentId）。终态通知<b>不得</b>
+     *       透传它当收件人 —— 该 agent 的 query loop 在 finalizer 入队前已退出
+     *       （SubagentTool.java:3334 execute 阻塞返回 → :3340-3357 才 finalize），
+     *       带 agentId 必成孤儿（CC killShellTasks.ts:70-75「no consumer matches a dead agentId」；
+     *       CC LocalAgentTask.tsx:317 enqueueAgentNotification 入队不带 agentId）。
+     *       ⛔ 本字段的此语义仅用于「任务自身标识」，不是通知收件人。</li>
+     * </ul>
      */
     @Nullable UUID agentId,
     /**

@@ -59,8 +59,17 @@ public class SessionToolDisableConfig {
      * 会话 mapper 静态桥接 setter · 测试（跨包）+ Spring 桥接共用。
      */
     public static void setSessionMapper(SessionMapper mapper) {
+        SessionMapper previous = sessionMapper;
         sessionMapper = mapper;
-        if (mapper != null) {
+        // [F1 · 2026-09-18 返工] 只在桥接**真的发生变化**时记一行（原：mapper 非 null 就无条件 INFO）。
+        //   本 setter 由 LlmAgentLoop.setSessionMapper 静态桥在**每次 prototype 实例化**时调用
+        //   （LlmAgentLoop = @Component @Scope("prototype")）——调用方除了 ChatService 每轮新建 loop，
+        //   还有 CronIdleExecutor.canDispatch() 的第三层「通道可用」探针（loopProvider.getObject()）。
+        //   无条件 INFO 的代价 = 队列非空时每个探针一拍一行（≈1 行/3s ≈ 2.9 万行/天，与本批
+        //   亲手修掉的 57600 行/天 同一量级），而这一行**不携带任何新信息**（注入的还是同一个单例 bean）。
+        //   语义上值得留痕的是「桥接从未装 → 装上」或「换了另一个实现」，故判据 = 引用发生变化；
+        //   ⛔ 不是「把噪声挪到别处」：同一事物的重复报告被消除，真实事件（首装 / 换实现）一行不少。
+        if (mapper != null && mapper != previous) {
             log.info("SessionToolDisableConfig 注入 SessionMapper（会话级禁用工具集合读取可用，V34 列）");
         }
     }

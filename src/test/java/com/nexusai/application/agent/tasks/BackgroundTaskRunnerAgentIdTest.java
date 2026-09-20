@@ -16,7 +16,17 @@ import java.util.UUID;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * [coordinator-align] 后台任务完成通知必须携带 <b>任务归属 subagent 的 agentId</b>。
+ * [coordinator-align] <b>后台 bash</b>（{@link TaskType#LOCAL_BASH}）完成通知必须携带
+ * <b>任务归属 subagent 的 agentId</b>。
+ *
+ * <p>⚠️ <b>适用范围收窄（H1）</b>：本类只覆盖 {@code LOCAL_BASH} —— 其 {@code task.agentId} 是
+ * 「<b>还活着的派活 owner</b>」（谁 spawn 了这条后台 bash），通知回归属 agent 是对的
+ * （CC {@code LocalShellTask.tsx:121-137,204} shell 才带 owning agentId）。
+ * <b>反例（不属本类，别照搬这里的判据）</b>：{@code LOCAL_AGENT}（async agent，{@code taskId===agentId}）
+ * 的终态通知<b>绝不带 agentId</b> —— 该 agent 的 query loop 在 finalizer 入队前已退出
+ * （{@code SubagentTool.java:3334 execute} → {@code :3340-3357 finalize}），带它就是指向死消费者；
+ * CC {@code LocalAgentTask.tsx:317 enqueueAgentNotification} 入队不带 agentId。该反例的守护门是
+ * {@code CronNotifyProducerSessionRoutingTest}（H1 两条负向断言），不是本类。
  *
  * <p><b>WHY（规则九 · 测试验证意图，而非行为）</b>：本测试守护的不是「某个参数被填了」这个动作，
  * 而是「通知能被<b>正确的消费者</b>领取」这一后果。
@@ -25,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li>主线程（{@code currentAgentId == null}）只捞 {@code cmd.agentId() == null} 的通知；</li>
  *   <li>子代理只捞 {@code mode == task-notification && cmd.agentId() == 自己} 的通知。</li>
  * </ul>
- * 因此若子代理 spawn 的后台任务通知以 {@code agentId = null} 入队，它会<b>必然</b>被主线程捞走，
+ * 因此若子代理 spawn 的后台 bash 通知以 {@code agentId = null} 入队，它会<b>必然</b>被主线程捞走，
  * 子代理永远收不到 —— 这正是用户上报的现象（子代理跑的后台 bash 完成了，结果通知跑到主代理那里）。
  * 该后果对模型是可见的功能错误：子代理以为自己还在等命令，主代理却收到一条不属于自己的完成通知，
  * 双方上下文都被污染。所以本类断言的是「入队项的 agentId 等于任务归属 agent 的 agentId」，

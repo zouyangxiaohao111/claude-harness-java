@@ -254,6 +254,18 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     private PermissionUpdatePersister permissionUpdatePersister;
 
     /**
+     * [批 A2b] 会话列 mapper —— destination=SESSION 的批准更新写进
+     * {@code sessions.session_permission_rules}（V75 列）用（跨 send 唯一通道；
+     * ⛔ 不写 settings.json：CC {@code supportsPersistence} 排除 session，
+     * {@code PermissionUpdate.ts:208-216}）。{@code null} = 未注入（单测直构）→
+     * 列写入跳过 + WARN（{@link SessionPermissionOverlay#persistSessionUpdates}）。
+     * 注入方式 = setter（非构造器）：{@link #WebSocketPermissionPrompter(SimpMessagingTemplate)}
+     * 也是既有测试直构入口，扩构造器实参会破坏既有测试调用点。
+     */
+    @Autowired(required = false)
+    private com.nexusai.repository.session.mapper.SessionMapper sessionMapper;
+
+    /**
      * [WF-11 · OPD-WF8-01-T3] serializeDecisionReason classifier 门控 · CC original:
      * {@code feature('BASH_CLASSIFIER') || feature('TRANSCRIPT_CLASSIFIER')}
      * （structuredIO.ts:69-74）。{@code null}（未接线 / 测试直构）→ 门控关闭（classifier 序列化为 undefined）。
@@ -565,6 +577,15 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      */
     public void setChannelRelayAllowlistChecker(java.util.function.Function<String, Boolean> checker) {
         this.relayAllowlistChecker = checker;
+    }
+
+    /**
+     * [批 A2b] 注入会话列 mapper（destination=SESSION 批准更新写 {@code sessions.session_permission_rules}
+     * V75 列）。生产由 {@code @Autowired(required=false)} 注入；POJO 单测经本 setter 注入
+     * （与 {@code LlmAgentLoop.setSessionMapper} / {@code TodoWriteTool.setSessionMapper} 同款）。
+     */
+    public void setSessionMapper(com.nexusai.repository.session.mapper.SessionMapper sessionMapper) {
+        this.sessionMapper = sessionMapper;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -998,7 +1019,14 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      *       派生保持最新）。</li>
      * </ol>
      *
-     * <p>本方法为幂等增强：applier / persister 未注入（旧测试构造路径）→ 仅日志不抛。
+     * <p><b>[批 A2b] 本仓在步骤 1 之前加一步「SESSION 档 → 会话列」</b>
+     * （{@link SessionPermissionOverlay#persistSessionUpdates}）：destination=SESSION 的更新写
+     * {@code sessions.session_permission_rules}（V75 列）。CC 侧 SESSION 档是长驻进程内存态
+     * （{@code supportsPersistence} 排除 session，{@code PermissionUpdate.ts:208-216}），本仓
+     * prototype loop 每 send 新实例 ⇒ 必须有 DB 承载才能跨 send 存活（详见该类 javadoc）。
+     * ⛔ 该步只写 DB 会话列，**不碰任何 settings 文件**。
+     *
+     * <p>本方法为幂等增强：applier / persister / sessionMapper 未注入（旧测试构造路径）→ 仅日志不抛。
      *
      * @param updates   批准的权限更新（可为空列表 → no-op）
      * @param ctx       当前工具调用上下文（permissionContext 承载规则集；可为 null）
@@ -1008,6 +1036,22 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         if (updates == null || updates.isEmpty()) {
             return;
         }
+        // [P11d] 会话 id 上提（apply 与 persist 共用同一值）：project/local source 的写盘落点
+        //   按会话解析（读侧 PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。
+        //   [session-id-short] ctx.sessionId() 已 String（short）
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        // 0) [批 A2b] destination=SESSION 的更新写入 sessions.session_permission_rules（V75 列）——
+        //    会话列是**跨 send 唯一通道**（LlmAgentLoop prototype 每 send 新实例 ⇒ appStateRef 恒空），
+        //    由 LlmAgentLoop.doRun 回读注入 appStateRef.toolPermissionContext（批 A2 再并进 per-turn ctx）。
+        //    ⛔ 只写 DB 会话列，**不写 settings.json / settings.local.json**：CC supportsPersistence
+        //    明确排除 session（PermissionUpdate.ts:208-216）——落盘会把「本次会话」变成「永久」。
+        //    ⚠️ 刻意放在 `current == null` 早退**之前**：本步骤与「本 run 的 ctx 能否 apply」无关，
+        //    且顺序对齐 CC handleUserAllow（persistPermissions 先于 setToolPermissionContext，
+        //    PermissionContext.ts:291-318/139-147）——ctx 退化（无 permCtx）时授权仍落列，
+        //    下一条消息即可被 per-turn 重建读到，而不是随本次早退一起丢失。
+        //    本方法永不抛（内部 try/catch），不影响批准流。
+        SessionPermissionOverlay.persistSessionUpdates(
+            sessionMapper, sessionId, updates, "ws:" + requestId);
         ToolPermissionContext current = ctx != null ? ctx.permissionContext() : null;
         if (current == null) {
             if (log.isWarnEnabled()) {
@@ -1016,13 +1060,11 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             }
             return;
         }
-        // [P11d] 会话 id 上提（apply 与 persist 共用同一值）：project/local source 的写盘落点
-        //   按会话解析（读侧 PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。
-        //   [session-id-short] ctx.sessionId() 已 String（short）
-        String sessionId = ctx != null ? ctx.sessionId() : null;
         // 1) apply —— CC applyPermissionUpdates（PermissionUpdate.ts:196-206）
-        //    [DEL-WF1-03] SESSION destination 更新不再同步 SessionSource（已删）；
-        //    "Allow this session" 跨轮持久待后续 appState 承载任务（见探查/progress/wf12.md）。
+        //    [DEL-WF1-03] SESSION destination 更新不再同步 SessionSource（已删）。
+        //    [批 A2b 起] "Allow this session" 的跨 send 承载 = 上面步骤 0) 的 V75 会话列
+        //    （doRun 回读注入 appState → 批 A2 并进 per-turn ctx）；原「待后续 appState 承载任务」
+        //    欠账（探查/progress/wf12.md）已闭环。
         ToolPermissionContext applied = current;
         if (permissionUpdateApplier != null) {
             applied = permissionUpdateApplier.applyAll(updates, current);
@@ -1039,10 +1081,25 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         // 2) persist —— CC persistPermissionUpdates（PermissionUpdate.ts:349-353；
         //    supportsPersistence 拦截 CLI_ARG/SESSION 非可持久化 destination）
         if (permissionUpdatePersister != null) {
-            permissionUpdatePersister.persistAll(updates, sessionId);
-            if (log.isInfoEnabled()) {
-                log.info("PERMISSION updatedPermissions: persist 完成 requestId={} updates={} sessionId={}",
-                    requestId, updates.size(), sessionId);
+            // [批 A4c P1] 写盘失败**不得吞掉批准**：本方法在 onResponse 里位于
+            //   `future.complete(result)`（onResponse:1898）**之前**，且该段无外层 try/catch
+            //   ⇒ persistAll 抛（loader.atomicWrite 失败即抛 RuntimeException，见
+            //   LocalSettingsLoader:203-215）会穿出 onResponse、future 永不完成
+            //   ⇒ 弹窗卡死（既不是允许也不是拒绝）。
+            //   裁定语义：写盘失败 ⇒ fail-loud（ERROR + 异常原文）**且仍放行** ——
+            //   步骤 3 的 appState 同步继续执行（本次运行内授权照常生效），
+            //   但"规则没写进设置文件"必须留痕（重启后该授权不再存在）。
+            //   ⛔ 与 ToolPermissionGate.applyAndPersistPermissionUpdates:881-890 是**两个**等价单点，两处同步修。
+            try {
+                permissionUpdatePersister.persistAll(updates, sessionId);
+                if (log.isInfoEnabled()) {
+                    log.info("PERMISSION updatedPermissions: persist 完成 requestId={} updates={} sessionId={}",
+                        requestId, updates.size(), sessionId);
+                }
+            } catch (Throwable th) {
+                log.error("PERMISSION updatedPermissions: persist 失败（本次运行内授权仍生效，"
+                    + "但规则未落盘 ⇒ 重启后不再存在）requestId={} updates={} sessionId={} err={}",
+                    requestId, updates.size(), sessionId, th.toString(), th);
             }
         } else {
             if (log.isDebugEnabled()) {
@@ -1074,19 +1131,25 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      * 对齐 CC {@code PermissionUpdateSchema}（PermissionUpdateSchema.ts，discriminated union
      * 按 {@code type} 判别）。
      *
-     * <p>宽松双形状：
+     * <p><b>[批 A1] 仅接受 CC 形状</b>：{@code {type: 'addRules'|'removeRules'|'replaceRules'|
+     * 'setMode'|'addDirectories'|'removeDirectories', ...}}，其中 {@code destination} /
+     * {@code behavior} / {@code mode} 为 camelCase 字面量，{@code rules} 元素为扁平的
+     * {@code {toolName, ruleContent?}}。
+     *
+     * <p>批 A1 前的「无 type 就按字段形状推断」回退分支已删除：
      * <ul>
-     *   <li><b>CC 形状</b>：{@code {type: 'addRules'|'removeRules'|'replaceRules'|'setMode'|
-     *       'addDirectories'|'removeDirectories', ...}}，destination/behavior/mode 为 camelCase
-     *       字面量（OPD-PERM-03 依现状同时接受）；</li>
-     *   <li><b>Java 直连形状</b>：无 type 字段时按字段形状推断（rules+behavior→addRules /
-     *       mode+destination→setMode / directories+destination→addDirectories /
-     *       paths+destination→removeDirectories）。removeRules 与 setMode/directories 均要求
-     *       destination 必填（CC schema 必填，缺字段拒收返回 null——未上线可破约）。</li>
+     *   <li>CC {@code z.discriminatedUnion('type', ...)} <b>从不</b>接受缺 {@code type} 的条目，
+     *       推断分支是纯 Java 本地宽松；</li>
+     *   <li>那条推断正是「{@code paths} 一律推成 {@code removeDirectories}」的根因 ——
+     *       {@link PermissionUpdate.AddDirectories} 早先出站只写 {@code paths}，回传后被
+     *       解析成<b>删除</b>目录（反向执行）；</li>
+     *   <li>出站侧（{@link PermissionUpdate.WireSerializer}）现在恒写 {@code type}，推断分支
+     *       已无生产者。</li>
      * </ul>
      *
      * @param nodes 原始 JSON 节点列表（可为 null）
-     * @return 解析后的权限更新列表；无法解析的节点跳过（不抛，best-effort）
+     * @return 解析后的权限更新列表；无法解析的节点跳过（不抛，best-effort）——
+     *         <b>但每一条被丢弃的节点都有 ≥WARN 留痕</b>，见 {@link #parsePermissionUpdate}
      */
     public static List<PermissionUpdate> parseUpdatedPermissions(List<JsonNode> nodes) {
         if (nodes == null || nodes.isEmpty()) {
@@ -1124,42 +1187,55 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     }
 
     /**
-     * [Session S16] 单节点解析 · 判别联合 + 字段形状推断（见 {@link #parseUpdatedPermissions}）。
+     * [Session S16] 单节点解析 · 严格判别联合（对齐 CC {@code z.discriminatedUnion('type', ...)}）。
+     *
+     * <p><b>[批 A1]</b>：只认 {@code type}；缺/未知 {@code type} 一律丢弃并 WARN（不再做
+     * 字段形状推断 —— 那条推断会把 {@code AddDirectories} 误判成 {@code RemoveDirectories}）。
+     * 判别通过但字段非法/缺失的条目同样丢弃并 WARN（fail-loud 红线：禁止静默失效）。
+     *
+     * @param node 单条原始 JSON 节点
+     * @return 解析成功的 {@link PermissionUpdate}；无法解析 → {@code null}（必有 ≥WARN 留痕）
      */
     static PermissionUpdate parsePermissionUpdate(JsonNode node) {
         if (node == null || !node.isObject()) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION update 解析: 条目非对象，丢弃 node={}", abbreviateNode(node));
+            }
             return null;
         }
         String type = node.path("type").asText(null);
-        if (type != null && !type.isBlank()) {
-            return switch (type) {
-                case "addRules" -> parseAddOrReplace(node, true);
-                case "replaceRules" -> parseAddOrReplace(node, false);
-                case "removeRules" -> parseRemoveRules(node);
-                case "setMode" -> parseSetMode(node);
-                case "addDirectories" -> parseDirectories(node, true);
-                case "removeDirectories" -> parseDirectories(node, false);
-                default -> null;
-            };
-        }
-        // Java 直连/旧形状推断（无 type 判别字段）
-        if (node.has("mode")) {
-            return parseSetMode(node);
-        }
-        if (node.has("directories")) {
-            return parseDirectories(node, true);
-        }
-        if (node.has("paths")) {
-            return parseDirectories(node, false);
-        }
-        if (node.has("rules")) {
-            if (node.has("behavior")) {
-                JsonNode rulesNode = node.get("rules");
-                return parseAddOrReplace(node, rulesNode == null || rulesNode.size() > 0);
+        if (type == null || type.isBlank()) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION update 解析: 缺 type 判别字段，丢弃（CC discriminatedUnion('type') "
+                    + "不接受无 type 条目；JSON 直连形状已不再是合法线格式）node={}", abbreviateNode(node));
             }
-            return parseRemoveRules(node);
+            return null;
         }
-        return null;
+        PermissionUpdate parsed = switch (type) {
+            case "addRules" -> parseAddOrReplace(node, true);
+            case "replaceRules" -> parseAddOrReplace(node, false);
+            case "removeRules" -> parseRemoveRules(node);
+            case "setMode" -> parseSetMode(node);
+            case "addDirectories" -> parseDirectories(node, true);
+            case "removeDirectories" -> parseDirectories(node, false);
+            default -> null;
+        };
+        if (parsed == null && log.isWarnEnabled()) {
+            log.warn("PERMISSION update 解析: type={} 条目字段缺失或非法，丢弃 node={}",
+                type, abbreviateNode(node));
+        }
+        return parsed;
+    }
+
+    /**
+     * 截断节点文本用于日志（避免超长 JSON 刷屏）。仅用于 WARN 留痕，不参与解析。
+     */
+    private static String abbreviateNode(JsonNode node) {
+        if (node == null) {
+            return "null";
+        }
+        String text = node.toString();
+        return text.length() <= 500 ? text : text.substring(0, 500) + "...(truncated)";
     }
 
     /** addRules / replaceRules 解析（type 判别或字段形状推断共用）。 */
@@ -1203,14 +1279,22 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         return mode == null ? null : new PermissionUpdate.SetMode(destination, mode);
     }
 
-    /** addDirectories / removeDirectories 解析 · CC 字段名 {@code directories}（Java 直连形状接受 paths）。 */
+    /**
+     * addDirectories / removeDirectories 解析 · CC 字段名 {@code directories}
+     * （{@code PermissionUpdateSchema.ts:67-77}）。
+     *
+     * <p><b>[批 A1]</b> 不再接受 Java 侧的 {@code paths} 别名。{@code paths} 与
+     * {@code directories} 字段名+类型完全相同，靠字段名在 add/remove 之间做推断必然把
+     * 「新增目录」读成「删除目录」——判别只允许来自 {@code type}
+     * （{@link #parsePermissionUpdate} 已按 {@code type} 分派 add 标志）。
+     */
     private static PermissionUpdate parseDirectories(JsonNode node, boolean add) {
         PermissionUpdate.Destination destination = parseDestination(node);
         if (destination == null) {
             // CC schema destination 必填（PermissionUpdateSchema.ts:70/75）——缺 destination 拒收
             return null;
         }
-        JsonNode dirsNode = node.has("directories") ? node.get("directories") : node.get("paths");
+        JsonNode dirsNode = node.get("directories");
         if (dirsNode == null || !dirsNode.isArray() || dirsNode.isEmpty()) {
             return null;
         }
@@ -1218,6 +1302,10 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         for (JsonNode dir : dirsNode) {
             if (dir != null && dir.isTextual() && !dir.asText().isBlank()) {
                 paths.add(dir.asText());
+            } else if (log.isWarnEnabled()) {
+                // fail-loud：被丢掉的目录项必须留痕（CC z.array(z.string()) 整条 fail，
+                //   本仓取逐项过滤语义，故逐项 WARN）
+                log.warn("PERMISSION update 解析: directories 元素非字符串/空白，丢弃该元素 dir={}", dir);
             }
         }
         if (paths.isEmpty()) {
@@ -1228,7 +1316,18 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             : new PermissionUpdate.RemoveDirectories(destination, paths);
     }
 
-    /** rules 数组解析 · 每项 {@code {toolName, ruleContent?}}（CC ruleValue 形状）。 */
+    /**
+     * rules 数组解析 · 每项 {@code {toolName, ruleContent?}}（CC {@code PermissionRuleValue} 形状）。
+     *
+     * <p><b>[批 A1] fail-loud</b>：取不到 {@code toolName} 的规则元素<b>不再静默 continue</b>。
+     * 静默丢弃的后果是「前端点了『总是允许』但规则从未生效且零日志」——不可归因。
+     * 这里保留「逐项过滤」语义（CC {@code z.array(...)} 会整条 fail，本仓历史上取宽松逐项
+     * 语义以兼容部分坏条目），但每一项被丢掉的元素都会打出 WARN。
+     *
+     * <p>注意 CC 的规则元素<b>没有</b> {@code source} / {@code ruleBehavior} / 嵌套
+     * {@code ruleValue} —— 早先 Java record 的嵌套形状（{@code {source, ruleBehavior,
+     * ruleValue:{toolName,...}}}）回传时会在本方法被全部丢弃，现在会 WARN 出来。
+     */
     private static List<PermissionRule> parseRules(JsonNode node,
                                                    PermissionUpdate.Destination destination,
                                                    com.nexusai.application.agent.permission.PermissionBehavior behavior) {
@@ -1243,10 +1342,18 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         List<PermissionRule> rules = new java.util.ArrayList<>(rulesNode.size());
         for (JsonNode ruleNode : rulesNode) {
             if (ruleNode == null || !ruleNode.isObject()) {
+                if (log.isWarnEnabled()) {
+                    log.warn("PERMISSION update 解析: rules 元素非对象，丢弃该元素 rule={}", ruleNode);
+                }
                 continue;
             }
             String toolName = ruleNode.path("toolName").asText(null);
             if (toolName == null || toolName.isBlank()) {
+                if (log.isWarnEnabled()) {
+                    log.warn("PERMISSION update 解析: rules 元素缺 toolName，丢弃该元素 "
+                        + "（CC PermissionRuleValue.toolName 必填；扁平形状应为 "
+                        + "toolName + 可选 ruleContent）rule={}", ruleNode);
+                }
                 continue;
             }
             String ruleContent = ruleNode.path("ruleContent").asText(null);
@@ -1305,15 +1412,14 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         return null;
     }
 
-    /** CC destination 字面量 · 对齐 PermissionUpdateDestination（types/permissions.ts:147-153）。 */
+    /**
+     * CC destination 字面量 · 对齐 PermissionUpdateDestination（types/permissions.ts:147-153）。
+     *
+     * <p>[批 A1] 映射本体已上移到 {@link PermissionUpdate.Destination#ccLiteral()} 单点
+     * （出站 serializer 与入站解析必须同源，否则线格式又会漂移）。
+     */
     private static String ccDestination(PermissionUpdate.Destination d) {
-        return switch (d) {
-            case USER_SETTINGS -> "userSettings";
-            case PROJECT_SETTINGS -> "projectSettings";
-            case LOCAL_SETTINGS -> "localSettings";
-            case CLI_ARG -> "cliArg";
-            case SESSION -> "session";
-        };
+        return d.ccLiteral();
     }
 
     /** CC mode 字面量 · 对齐 PermissionMode（types/permissions.ts:16-38）。 */

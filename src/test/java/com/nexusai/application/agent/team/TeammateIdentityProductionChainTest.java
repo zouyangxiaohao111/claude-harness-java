@@ -10,6 +10,7 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.config.CronEnabledGates;
 import com.nexusai.application.agent.tool.impl.CronCreateTool;
+import com.nexusai.application.agent.tool.impl.SendMessageTool;
 import com.nexusai.application.agent.tool.impl.SubagentExecutor;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.domain.schedule.ScheduleService;
@@ -139,6 +140,149 @@ class TeammateIdentityProductionChainTest {
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         return factory;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [P0-6 · D1①] shutdown 决策身份生产链（teammate 工具路径 → 真 abort / 真成员名）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** shutdown_response 工具输入（对齐 SendMessageToolTest 的 {@code {to, message{type,approve,request_id}}} 形）。 */
+    private static ObjectNode shutdownResponseInput(boolean approve) {
+        ObjectNode input = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+        input.put("to", "team-lead");
+        ObjectNode msg = input.putObject("message");
+        msg.put("type", "shutdown_response");
+        msg.put("approve", approve);
+        if (!approve) {
+            // CC SendMessageTool.ts:705-715 + 本仓 :369-374：拒绝时 reason 必填（否则 validateInput 挡下）
+            msg.put("reason", "still working");
+        }
+        // ⚠ request_id 用**生产原形**（CC InProcessBackend.ts:225 / 本仓 TeamDeleteTool 的
+        //   "shutdown-{全形 agentId}-{ts}"）。它对 AgentIdFormatter.parseRequestId 是**不可解析**的
+        //   （ts 段落到 "alice" ⇒ parseLong 失败 ⇒ null ⇒ 回落字面量 "teammate"）——这正是原缺陷。
+        //   判别力来源：若实现退回「只反解 request_id」，本用例必红。
+        msg.put("request_id", "shutdown-alice@team-x-1699999999999");
+        return input;
+    }
+
+    /** 第 1 次调用投递 {@code SendMessage(shutdown_response)} 的 tool_use，第 2 次起文本收尾。 */
+    private static LlmProviderFactory scriptedShutdownResponseProvider(
+            CountDownLatch turnFinished, boolean approve) {
+        AtomicInteger calls = new AtomicInteger();
+        LlmProvider provider = Mockito.mock(LlmProvider.class);
+        Mockito.doAnswer(inv -> {
+            Consumer<AssistantMessage> onMsg = inv.getArgument(10);
+            Runnable onComplete = inv.getArgument(16);
+            if (calls.incrementAndGet() == 1) {
+                onMsg.accept(new AssistantMessage("responding", "tool_calls",
+                    List.of(new ToolUseBlock("tu-shutdown", "SendMessage", shutdownResponseInput(approve))),
+                    "", null, 10L));
+            } else {
+                onMsg.accept(new AssistantMessage("done", "stop", List.of(), "", null, 10L));
+                turnFinished.countDown();
+            }
+            onComplete.run();
+            return null;
+        }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
+        when(factory.getProvider(any(), any())).thenReturn(provider);
+        return factory;
+    }
+
+    /** team-lead 收件箱里**最后一条含 marker 的**消息（teammate loop 之后还会追加 idle_notification）。 */
+    private com.fasterxml.jackson.databind.JsonNode teamLeadInboxMessage(String team, String marker)
+            throws Exception {
+        Path p = tempDir.resolve("teams").resolve(team).resolve("inboxes").resolve("team-lead.json");
+        assertThat(p).as("team-lead 收件箱必须存在").exists();
+        String raw = Files.readString(p);
+        List<com.fasterxml.jackson.databind.JsonNode> msgs = jsonToList(raw);
+        return msgs.stream()
+            .filter(m -> m.path("text").asText().contains(marker))
+            .reduce((a, b) -> b)
+            .orElseThrow(() -> new AssertionError(
+                "收件箱里没有含 '" + marker + "' 的消息，实际=" + raw));
+    }
+
+    private static java.util.List<com.fasterxml.jackson.databind.JsonNode> jsonToList(String s)
+            throws Exception {
+        com.fasterxml.jackson.databind.JsonNode root =
+            new com.fasterxml.jackson.databind.ObjectMapper().readTree(s);
+        List<com.fasterxml.jackson.databind.JsonNode> out = new ArrayList<>();
+        root.forEach(out::add);
+        return out;
+    }
+
+    @Test
+    @DisplayName("[P0-6 · D1①] 生产链：teammate 工具路径发 shutdown_response(approve) → **真 abort** + 确认消息 from=真实成员名")
+    void shutdownApproval_throughProductionChain_reallyAborts() throws Exception {
+        // WHY（规则九）：改动前 handleShutdownApproval 只解析 request_id，而请求侧编号由 TeamDeleteTool
+        //   生成为 "shutdown-{member}-{ts}"（**无 @**）⇒ parseRequestId 恒 null ⇒ 回落字面量
+        //   "teammate" ⇒ findByAgentName("teammate") 恒落空 ⇒ **永不 abort**（「关机」只是封信）。
+        //   本用例走真实 spawn 链把身份送到工具池线程上的 SendMessageTool，断言链尾的**可观测产物**
+        //   = 生命周期控制器真被 abort（不是中间字段自称）。
+        SpawnInProcess spawner = new SpawnInProcess(new TaskFrameworkService(new SdkEventQueue()));
+        SendMessageTool sendMessage = new SendMessageTool(new TeamHelpers());
+        sendMessage.setSpawnInProcess(spawner);
+        ToolRegistry registry = new ToolRegistry().register(sendMessage);
+        CountDownLatch turnFinished = new CountDownLatch(1);
+        spawner.setSubagentExecutor(
+            subagentExecutor(registry, scriptedShutdownResponseProvider(turnFinished, true)));
+
+        SpawnInProcess.InProcessSpawnOutput out = spawner.spawnInProcessTeammate(
+            new SpawnInProcess.InProcessSpawnConfig("alice", "team-x", "do X", null, false, null),
+            new SpawnInProcess.SpawnContext("sess-1", "tu-1"));
+        try {
+            assertThat(out.success()).as("spawn 成功").isTrue();
+            AutonomousAgentLoop loop = spawner.registry().get(out.taskId()).orElseThrow();
+
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (System.currentTimeMillis() < deadline && !loop.isAborted()) {
+                Thread.sleep(50);
+            }
+            assertThat(loop.isAborted())
+                .as("⭐ 生产链上 teammate 批准 shutdown 必须**真 abort** 生命周期控制器"
+                    + "（改前：request_id 反解失败 → 回落 'teammate' → 定位落空 → 永不 abort）")
+                .isTrue();
+
+            com.fasterxml.jackson.databind.JsonNode approved =
+                teamLeadInboxMessage("team-x", "shutdown_approved");
+            assertThat(approved.get("from").asText())
+                .as("⭐ 确认消息 from 必须是**真实成员名**（身份取自显式 ctx，不是 'teammate'）")
+                .isEqualTo("alice");
+        } finally {
+            spawner.registry().kill(out.taskId());
+        }
+    }
+
+    @Test
+    @DisplayName("[P0-6 · D1③ 同根因同修] 生产链：拒绝路径 team-lead 邮箱的 from 是真实成员名（不是 'teammate'）")
+    void shutdownRejection_throughProductionChain_usesRealMemberName() throws Exception {
+        // WHY：handleShutdownRejection 与 handleShutdownApproval 是同一能力的两个分支，改动前
+        //   两处各自解析 request_id ⇒ 同一断链。此处锁定拒绝路径同样取显式身份。
+        SpawnInProcess spawner = new SpawnInProcess(new TaskFrameworkService(new SdkEventQueue()));
+        SendMessageTool sendMessage = new SendMessageTool(new TeamHelpers());
+        sendMessage.setSpawnInProcess(spawner);
+        ToolRegistry registry = new ToolRegistry().register(sendMessage);
+        CountDownLatch turnFinished = new CountDownLatch(1);
+        spawner.setSubagentExecutor(
+            subagentExecutor(registry, scriptedShutdownResponseProvider(turnFinished, false)));
+
+        SpawnInProcess.InProcessSpawnOutput out = spawner.spawnInProcessTeammate(
+            new SpawnInProcess.InProcessSpawnConfig("alice", "team-x", "do X", null, false, null),
+            new SpawnInProcess.SpawnContext("sess-3", "tu-3"));
+        try {
+            assertThat(turnFinished.await(30, TimeUnit.SECONDS))
+                .as("拒绝不 abort ⇒ 收尾轮必须跑完（否则夹具没驱动到链路）").isTrue();
+
+            com.fasterxml.jackson.databind.JsonNode rejected =
+                teamLeadInboxMessage("team-x", "shutdown_rejected");
+            assertThat(rejected.get("from").asText())
+                .as("⭐ 拒绝消息 from 必须是真实成员名 'alice'（改前为 'teammate'）")
+                .isEqualTo("alice");
+        } finally {
+            spawner.registry().kill(out.taskId());
+        }
     }
 
     /** 真实 CronCreateTool（+ mock ScheduleService 作为外部 IO 替身）。 */

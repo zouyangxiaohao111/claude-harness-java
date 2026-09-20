@@ -84,7 +84,7 @@ class AgentToolUtilsAgentSetsTest {
     void asyncAllowedHas16IncludingToolSearch() {
         // WHY: CC constants/tools.ts:55-71 字面量 16 项 + [PDF 分页子代理修复] vision_analyze 补进
         //   第 17 项（Java 文本模型 deepseek 看 PDF 页图/附件图靠 vision_analyze 代理视觉模型——
-        //   fork 异步子代理 >20 页 PDF NEEDS_SUBAGENT 分页依赖；isReadOnly+isConcurrencySafe 异步安全）。
+        //   fork 异步子代理 >10 页 PDF NEEDS_SUBAGENT 分页依赖；isReadOnly+isConcurrencySafe 异步安全）。
         //   含 ToolSearch 是 hook agent 反递归/补全工具的必要白名单。
         Assertions.assertThat(AgentToolUtils.ASYNC_AGENT_ALLOWED_TOOLS)
             .as("ASYNC 白名单必须为 17 项（含 vision_analyze 供 PDF 分页子代理读页图）")

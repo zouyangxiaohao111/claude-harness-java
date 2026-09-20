@@ -1478,9 +1478,12 @@ public record AgentLoopContext(
                 permCtx = ctx.permissionContextBuilder().buildPermissionContext(state,
                     awaitAutomatedChecks, baseTuc.permissionMode(), shouldAvoidPrompts,
                     baseBypassAvailable);
-                // [P0-2] 合并 appState 的 skill allowedTools command 授权到 per-turn permCtx ·
-                //   对齐 CC SkillTool.ts:790-801 (contextModifier 改 appState.toolPermissionContext).
-                permCtx = mergeAppStateCommandRules(baseTuc, permCtx);
+                // [P0-2 + 批 A2] 合并 appState 的会话级授权到 per-turn permCtx ·
+                //   对齐 CC setToolPermissionContext（PermissionContext.ts:139-147）+
+                //   SkillTool.ts:790-801 (contextModifier 改 appState.toolPermissionContext).
+                //   批 A2 起由「只搬 COMMAND 一个桶」扩为「8 source 全桶 + mode + 附加目录」，
+                //   使 destination=SESSION 的授权（文件类「本会话允许」）真正跨轮存活。
+                permCtx = mergeAppStatePermissionRules(baseTuc, permCtx);
                 if (permCtx != null) {
                     permMode = permCtx.mode();
                 }
@@ -1530,26 +1533,68 @@ public record AgentLoopContext(
     }
 
     /**
-     * [P0-2] 把 appState 中技能注入的 allowedTools command 授权合并进 per-turn permCtx ·
-     * 对齐 CC SkillTool.ts:790-801 contextModifier 修改
-     * {@code appState.toolPermissionContext.alwaysAllowRules.command} 的会话内存语义.
+     * [P0-2 + 批 A2] 把 appState 里的会话级权限上下文合并进 per-turn permCtx ·
+     * 对齐 CC {@code PermissionContext.persistPermissions}（PermissionContext.ts:139-147：
+     * {@code persistPermissionUpdates} → {@code applyPermissionUpdates} →
+     * {@code setToolPermissionContext}）+ SkillTool.ts:790-801（contextModifier 改
+     * {@code appState.toolPermissionContext.alwaysAllowRules.command}）。
      *
-     * <p><b>CC 真源</b>: SkillTool contextModifier 把技能 allowedTools 去重合入
-     * {@code appState.toolPermissionContext.alwaysAllowRules.command}（SkillTool.ts:779-806）,
-     * 后续 per-turn 权限上下文由 appState 派生 → 技能授权的工具在后续工具调用不再被权限层阻断.
-     * Java 端 per-turn permCtx 由 {@link PermissionContextBuilder} 每轮重建（不读 appState）,
-     * 故在此把 {@code appStateRef['toolPermissionContext']} 的 command 规则（
-     * {@link PermissionRuleSource#COMMAND} 桶, 由 SkillToolImpl.buildContextModifier 写入）
-     * 合并进重建结果的同一桶（去重, 保既有 COMMAND 规则）.
+     * <p><b>WHY（批 A2 · SESSION 死目的地）</b>：CC 的 {@code appState.toolPermissionContext}
+     * 是<b>长效对象</b>——「Yes, allow all edits during this session」(destination=session) /
+     * 「Always allow Read(…)」等授权经 {@code setToolPermissionContext} 写入 appState 后，
+     * 后续每次权限检查都读同一对象。Java 端 per-turn permCtx 由
+     * {@link PermissionContextBuilder} <b>每轮从盘重建</b>（只遍历 source loader，不读 appState，
+     * PermissionContextBuilder.java:346-379）⇒ 只写进 appState 的 SESSION 规则 / mode /
+     * 附加目录在<b>下一轮全部丢失</b>（点了等于没点）。
      *
-     * <p><b>空安全</b>: appState 无 toolPermissionContext / 无 command 规则 / getAppState 抛异常
-     * → 原样返回 permCtx（不阻断 per-turn 构建, fail-loud 以 warn 日志暴露）.
+     * <p><b>合并语义（是叠加，不是替换）</b>：{@code permCtx} 是<b>基座</b>（每轮从盘重读
+     * user / project / local 三条桶的既有语义不破），appState 侧只做叠加：
+     * <ol>
+     *   <li><b>allow / deny / ask 三条桶 × 全 source</b> union —— 原先只搬 {@code COMMAND}
+     *       一个桶（技能 allowedTools），扩到 8 个 source（CC 桶 key 即归属）。这是 SESSION
+     *       {@code addRules} 跨轮存活的主通道；</li>
+     *   <li><b>mode</b> —— appState 侧的 setMode 结果胜出（CC {@code applyPermissionUpdate}
+     *       case {@code 'setMode'} 直接改 {@code context.mode}，PermissionUpdate.ts:59-67）。
+     *       这是文件类「Yes, allow all edits during this session」=
+     *       {@code SetMode(session, acceptEdits)}（PermissionUpdates.java:254-255）生效的必要条件；
+     *       plan 模式的 {@code setMode(session, plan)}（EnterPlanModeTool.java:278-292）同路；</li>
+     *   <li><b>additionalWorkingDirectories</b> —— SESSION {@code addDirectories}
+     *       （「允许本会话访问该目录」，PermissionUpdates.java:262-263）叠加（putIfAbsent，不删既有）。</li>
+     * </ol>
+     *
+     * <p><b>刻意不取</b> appState 侧的 {@code isBypassPermissionsModeAvailable} /
+     * {@code shouldAvoidPermissionPrompts} / {@code awaitAutomatedChecksBeforeDialog} /
+     * {@code strippedDangerousRules} / {@code prePlanMode}：这 5 个字段由调用方按 base TUC
+     * 逐轮保真（F1-BY / B-2 / H9-v2），取 appState 值会回归。
+     *
+     * <p><b>BUBBLE 守卫</b>：fork 子 agent（{@code permissionMode='bubble'}）的
+     * {@code shareSetAppState=true}（SubagentExecutor.java:1696 {@code !isAsync}，fork 定义
+     * {@code background=empty} ⇒ isAsync=false），其「本会话允许」授权会写回<b>父</b> appState，
+     * 而回写的 ctx 带的是子 agent 自己的 {@code mode=BUBBLE}。BUBBLE 是 fork 子 agent 的
+     * <b>冒泡内部标记</b>（CC types/permissions.ts:34-41 的用户可寻址集合不含 bubble；
+     * PermissionUpdatePersister.java:269 同判 AUTO/BUBBLE 为 internal），不是主循环的授权模式
+     * ⇒ 不得采纳，否则顶层 gate 的 bubble 分支（ToolPermissionGate.java:1224
+     * {@code ctx.permissionMode()==BUBBLE}）会在主线程误触发。
+     *
+     * <p><b>不落盘</b>：本方法只读 appState 内存快照、不写任何 settings 文件 ——
+     * SESSION 仍然不持久化（CC {@code supportsPersistence} 只认 user/project/localSettings，
+     * PermissionUpdate.ts:208-216）。
+     *
+     * <p><b>生命周期边界（批 A2 已知残留）</b>：appState 载体 = {@code LlmAgentLoop.appStateRef}
+     * （实例字段，LlmAgentLoop.java:626），而 LlmAgentLoop 是 prototype bean
+     * （每 send 新实例，ChatService.java:900 {@code loopProvider.getObject()}）⇒ 本合并保证的是
+     * <b>同一次 run 内跨轮</b>（do-while 迭代，LlmAgentLoop.java:5981）存活；跨用户消息（跨 send）
+     * 不在本批范围。同轮内第 2+ 个 tool call 亦不即时生效（per-turn ctx 每轮只构造一次）。
+     *
+     * <p><b>空安全</b>：appState 无 toolPermissionContext / 无任何叠加项 / getAppState 抛异常
+     * → 原样返回 permCtx（不阻断 per-turn 构建；异常 fail-loud 以 warn 日志暴露）。
      *
      * @param baseTuc  loop base TUC（getAppState 桥接会话 appStateRef 快照）
      * @param permCtx  重建后的 per-turn permission context
-     * @return 合并 command 规则后的 permCtx；无技能授权时原样返回
+     * @return 叠加 appState 会话级授权后的 permCtx；无叠加项时原样返回（同一实例）
      */
-    private static com.nexusai.application.agent.permission.ToolPermissionContext mergeAppStateCommandRules(
+    private static com.nexusai.application.agent.permission.ToolPermissionContext
+            mergeAppStatePermissionRules(
             com.nexusai.application.agent.tool.ToolUseContext baseTuc,
             com.nexusai.application.agent.permission.ToolPermissionContext permCtx) {
         if (baseTuc == null || permCtx == null) {
@@ -1564,34 +1609,126 @@ public record AgentLoopContext(
             if (!(tpcObj instanceof com.nexusai.application.agent.permission.ToolPermissionContext tpc)) {
                 return permCtx;
             }
-            Set<com.nexusai.application.agent.permission.PermissionRule> commandRules =
-                tpc.alwaysAllowRules().get(com.nexusai.application.agent.permission.PermissionRuleSource.COMMAND);
-            if (commandRules == null || commandRules.isEmpty()) {
-                return permCtx;
-            }
+            // ① 三条 behavior 桶 × 全 source union（per-turn 基座优先，appState 只做叠加去重）
             Map<com.nexusai.application.agent.permission.PermissionRuleSource,
                     Set<com.nexusai.application.agent.permission.PermissionRule>> allow =
-                new EnumMap<>(permCtx.alwaysAllowRules());
-            Set<com.nexusai.application.agent.permission.PermissionRule> merged = new LinkedHashSet<>(
-                allow.getOrDefault(com.nexusai.application.agent.permission.PermissionRuleSource.COMMAND,
-                    Set.of()));
-            merged.addAll(commandRules);
-            allow.put(com.nexusai.application.agent.permission.PermissionRuleSource.COMMAND, merged);
+                mergeAppStateRuleBuckets(permCtx.alwaysAllowRules(), tpc.alwaysAllowRules());
+            Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+                    Set<com.nexusai.application.agent.permission.PermissionRule>> deny =
+                mergeAppStateRuleBuckets(permCtx.alwaysDenyRules(), tpc.alwaysDenyRules());
+            Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+                    Set<com.nexusai.application.agent.permission.PermissionRule>> ask =
+                mergeAppStateRuleBuckets(permCtx.alwaysAskRules(), tpc.alwaysAskRules());
+            // ② mode：appState 侧 setMode 胜出（BUBBLE 守卫见方法 javadoc）
+            PermissionMode mode = (tpc.mode() != null && tpc.mode() != PermissionMode.BUBBLE)
+                ? tpc.mode() : permCtx.mode();
+            // ③ 附加工作目录：SESSION addDirectories 叠加（既有目录优先，不覆盖不删）
+            Map<String, com.nexusai.application.agent.permission.AdditionalWorkingDirectory> dirs =
+                mergeAppStateWorkingDirectories(permCtx.additionalWorkingDirectories(),
+                    tpc.additionalWorkingDirectories());
+
+            boolean unchanged = mode == permCtx.mode()
+                && allow.equals(permCtx.alwaysAllowRules())
+                && deny.equals(permCtx.alwaysDenyRules())
+                && ask.equals(permCtx.alwaysAskRules())
+                && dirs.equals(permCtx.additionalWorkingDirectories());
+            if (unchanged) {
+                return permCtx;
+            }
             if (log.isDebugEnabled()) {
-                log.debug("AgentLoopContext mergeAppStateCommandRules: 合并 {} 条 skill command 授权规则",
-                    commandRules.size());
+                log.debug("AgentLoopContext mergeAppStatePermissionRules: sessionId={} 合并 appState 会话级授权"
+                        + " (allow {}→{} / deny {}→{} / ask {}→{} 条, 附加目录 {}→{}, mode {}→{})",
+                    baseTuc.sessionId(), countRules(permCtx.alwaysAllowRules()), countRules(allow),
+                    countRules(permCtx.alwaysDenyRules()), countRules(deny),
+                    countRules(permCtx.alwaysAskRules()), countRules(ask),
+                    permCtx.additionalWorkingDirectories().size(), dirs.size(),
+                    permCtx.mode(), mode);
             }
             return new com.nexusai.application.agent.permission.ToolPermissionContext(
-                permCtx.mode(), allow, permCtx.alwaysDenyRules(), permCtx.alwaysAskRules(),
-                permCtx.additionalWorkingDirectories(), permCtx.isBypassPermissionsModeAvailable(),
+                mode, allow, deny, ask, dirs,
+                permCtx.isBypassPermissionsModeAvailable(),
                 permCtx.isAutoModeAvailable(), permCtx.strippedDangerousRules(),
                 permCtx.shouldAvoidPermissionPrompts(), permCtx.awaitAutomatedChecksBeforeDialog(),
                 permCtx.prePlanMode());
         } catch (Exception e) {
-            log.warn("AgentLoopContext mergeAppStateCommandRules failed, fallback permCtx: {}",
+            log.warn("AgentLoopContext mergeAppStatePermissionRules failed, fallback permCtx: {}",
                 e.toString());
             return permCtx;
         }
+    }
+
+    /**
+     * [批 A2] 规则桶叠加：{@code base} 全量保留（每轮从盘重读的既有语义），{@code overlay}
+     * 逐 source 逐规则 union 进去（{@link com.nexusai.application.agent.permission.PermissionRule}
+     * record 逐字段 equals 天然去重）。
+     *
+     * @param base    per-turn 重建结果（基座）
+     * @param overlay appState 侧快照（叠加）
+     * @return 叠加后的新 map（调用方负责去重判断）；overlay 为空时返回 {@code base} 原实例
+     */
+    private static Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+            Set<com.nexusai.application.agent.permission.PermissionRule>> mergeAppStateRuleBuckets(
+            Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+                Set<com.nexusai.application.agent.permission.PermissionRule>> base,
+            Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+                Set<com.nexusai.application.agent.permission.PermissionRule>> overlay) {
+        if (overlay == null || overlay.isEmpty()) {
+            return base;
+        }
+        Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+                Set<com.nexusai.application.agent.permission.PermissionRule>> merged =
+            new EnumMap<>(com.nexusai.application.agent.permission.PermissionRuleSource.class);
+        base.forEach((source, rules) -> merged.put(source, new LinkedHashSet<>(rules)));
+        overlay.forEach((source, rules) -> {
+            if (rules == null || rules.isEmpty()) {
+                return;
+            }
+            merged.computeIfAbsent(source, k -> new LinkedHashSet<>()).addAll(rules);
+        });
+        return merged;
+    }
+
+    /**
+     * [批 A2] 附加工作目录叠加：{@code base}（symlink PWD 注入等）优先，{@code overlay}
+     * （appState 侧 SESSION {@code addDirectories}）按路径 putIfAbsent 补入。
+     *
+     * <p>不删任何既有目录（移除走 {@code removeDirectories} 更新，与 CC
+     * PermissionUpdate.ts:104-120 同语义）。
+     *
+     * @param base    per-turn 重建的目录集
+     * @param overlay appState 侧目录集
+     * @return 叠加后的新 map；overlay 为空时返回 {@code base} 原实例
+     */
+    private static Map<String, com.nexusai.application.agent.permission.AdditionalWorkingDirectory>
+            mergeAppStateWorkingDirectories(
+            Map<String, com.nexusai.application.agent.permission.AdditionalWorkingDirectory> base,
+            Map<String, com.nexusai.application.agent.permission.AdditionalWorkingDirectory> overlay) {
+        if (overlay == null || overlay.isEmpty()) {
+            return base;
+        }
+        Map<String, com.nexusai.application.agent.permission.AdditionalWorkingDirectory> merged =
+            new java.util.LinkedHashMap<>(base);
+        overlay.forEach(merged::putIfAbsent);
+        return merged;
+    }
+
+    /**
+     * [批 A2] 数所有 source 的 rule 总数（合并 debug 日志用）。
+     *
+     * @param map source → rule set 映射
+     * @return 所有 source 的 rule 总数
+     */
+    private static int countRules(
+            Map<com.nexusai.application.agent.permission.PermissionRuleSource,
+                Set<com.nexusai.application.agent.permission.PermissionRule>> map) {
+        if (map == null) {
+            return 0;
+        }
+        int total = 0;
+        for (Set<com.nexusai.application.agent.permission.PermissionRule> rules : map.values()) {
+            total += rules.size();
+        }
+        return total;
     }
 
     /**
@@ -2639,7 +2776,9 @@ public record AgentLoopContext(
             if (appState == null) {
                 return messagesForLlm;
             }
-            Object tcObj = appState.get("teamContext");
+            // [C1] 键复用 TeamCreateTool.APPSTATE_TEAM_CONTEXT（不新造第二个字面量散点）
+            Object tcObj = appState.get(
+                com.nexusai.application.agent.tool.impl.TeamCreateTool.APPSTATE_TEAM_CONTEXT);
             if (!(tcObj instanceof Map<?, ?> teamContext)) {
                 return messagesForLlm;
             }

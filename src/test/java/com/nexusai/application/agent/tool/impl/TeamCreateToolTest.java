@@ -55,6 +55,16 @@ class TeamCreateToolTest {
     @TempDir
     Path tempDir;
 
+    /**
+     * {@link #appStateCtx} 的会话标识 —— 必须与用例里 mock/verify 的 UUID **逐字一致**。
+     *
+     * <p>⚠ 该字面量此前是**损坏的控制字符 U+0002**（与 master 逐字节相同），而 mock 桩的是
+     * {@code 00000000-…-0001} ⇒ **桩永不命中** ⇒ `create_alreadyLeading_readsFromSessionStore`
+     * 与 `create_setTeamContext_writesToSessionStore` 长期空转并恒红。本批在 coordinator 拍板下
+     * 改回真 UUID（这两条用例**首次真正执行**）。
+     */
+    private static final String APPSTATE_CTX_SESSION_ID = "00000000-0000-0000-0000-000000000001";
+
     @BeforeEach
     void setUp() {
         // configHome 指向临时目录：TeamHelpers 文件委托需要可写 configHome
@@ -63,6 +73,9 @@ class TeamCreateToolTest {
 
     @AfterEach
     void tearDown() {
+        // [P0-2 · B1] TeamCreate 现在会把 leader→team 绑定登记进 TaskService.leaderTeamNames
+        //   （JVM 级 static Map）。不按本用例的会话键清 ⇒ 泄漏给同类后续用例与同 JVM 的其它测试类。
+        TaskService.clearLeaderTeamName(APPSTATE_CTX_SESSION_ID);
         TaskSystemConfig.clearForTest();
     }
 
@@ -85,7 +98,7 @@ class TeamCreateToolTest {
     /** 带 appState 桥的 ToolUseContext · 对齐 CC ToolUseContext.getAppState/setAppState。 */
     private ToolUseContext appStateCtx(Map<String, Object> appState) {
         return ToolUseContext.of(
-                UUID.randomUUID(), "",
+                UUID.randomUUID(), APPSTATE_CTX_SESSION_ID,
                 PermissionMode.DEFAULT,
                 List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
                 List.of(), null, PermissionMode.DEFAULT, Map.of(),

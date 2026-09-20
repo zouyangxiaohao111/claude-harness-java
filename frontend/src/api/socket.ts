@@ -1,7 +1,7 @@
 import { Client, type IMessage, type StompSubscription } from '@stomp/stompjs'
 import SockJS from 'sockjs-client'
 import { WS_BASE, SOCKJS_BASE } from './base'
-import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, MessageUsageEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations } from './types'
+import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, MessageUsageEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations, PermissionUpdate } from './types'
 
 export function parseStreamEvent(raw: unknown): StreamEvent {
   const obj = (raw ?? {}) as Record<string, unknown>
@@ -64,8 +64,12 @@ export type PermissionKind = 'message' | 'bridge' | 'channel'
 
 /** 发送权限决策，按 kind 路由到对应 destination（message/bridge/channel）。
  *  AskUser 场景额外携带 answers/annotations（仅提供时带上，缺省不发）；
- *  后端 MessagePermissionResponseEvent 已支持解析并合并进 Allow.updatedInput。 */
-export function sendPermissionResponse(client: Client, sessionId: string, kind: PermissionKind, requestId: string, decision: 'allow' | 'deny', extra?: { answers?: AskUserAnswers; annotations?: AskUserAnnotations }) {
+ *  后端 MessagePermissionResponseEvent 已支持解析并合并进 Allow.updatedInput。
+ *
+ *  `permissionUpdates` = 用户点「一键授权」时后端推来的 suggestions **原样**回传
+ *  （wire 键 `updatedPermissions`，CC 判别联合形状）→ 后端 apply 到 ctx + 落盘。
+ *  ⛔ 前端不做任何结构转换；仅点击第三档时携带（普通允许/拒绝不传 → 不产生规则）。 */
+export function sendPermissionResponse(client: Client, sessionId: string, kind: PermissionKind, requestId: string, decision: 'allow' | 'deny', extra?: { answers?: AskUserAnswers; annotations?: AskUserAnnotations; permissionUpdates?: PermissionUpdate[] }) {
   const dest = {
     message: `/app/sessions/${sessionId}/permission-response`,
     bridge: `/app/sessions/${sessionId}/permission-bridge-response`,
@@ -74,5 +78,9 @@ export function sendPermissionResponse(client: Client, sessionId: string, kind: 
   const payload: Record<string, unknown> = { requestId, decision }
   if (extra?.answers !== undefined) payload.answers = extra.answers
   if (extra?.annotations !== undefined) payload.annotations = extra.annotations
+  // 空数组不发（与后端 @JsonInclude(NON_NULL) 对齐：无更新 = 不传字段）
+  if (extra?.permissionUpdates !== undefined && extra.permissionUpdates.length > 0) {
+    payload.updatedPermissions = extra.permissionUpdates
+  }
   client.publish({ destination: dest, body: JSON.stringify(payload) })
 }

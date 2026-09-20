@@ -760,7 +760,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
             {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
           </div>
         )}
-        {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} streamKey={`${sessionId}:${blockId}`} />}
+        {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
         {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live sessionId={sessionId} />)}
       </div>
     </div>

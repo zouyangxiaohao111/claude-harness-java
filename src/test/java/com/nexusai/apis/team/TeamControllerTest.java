@@ -65,7 +65,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  *   <li><b>delete</b>——无活跃成员 → 清理目录 + 清会话列 teamContext + 发布 "deleted"；</li>
  *   <li><b>delete 活跃成员</b>——拒删 409 + 目录保留（CC TeamDeleteTool.ts:176-195）；</li>
  *   <li><b>members</b>——append/remove 落 config + 发布 member_joined/member_left；</li>
- *   <li><b>inbox/read</b>——B1 已读回执：inbox 文件消息 read=true。</li>
+ *   <li><b>inbox</b>——GET 返回 teammate 消息列表（B1 轮询兜底）。<b>无 inbox/read</b>：该端点已删
+ *       （C2 —— 展开收件箱不应全量标已读）。</li>
  * </ul>
  */
 class TeamControllerTest {
@@ -561,26 +562,11 @@ class TeamControllerTest {
             .andExpect(status().isNotFound());
     }
 
-    // ── inbox / 已读回执（B1）────────────────────────────────────────────────
-
-    @Test
-    @DisplayName("POST /api/v1/teams/{team}/inbox/read → inbox 文件消息 read=true（B1 已读回执）")
-    void inboxRead_marksMessagesAsRead() throws Exception {
-        // WHY: design doc §2.2 已读回执——前端读消息流后标 read=true，未读计数归零。
-        writeTeamConfig("inbox-team", "team-lead");
-        TeammateMailbox.writeToMailbox("team-lead",
-            new TeammateMailbox.TeammateMessage("mate", "hello from mate", TeammateMailbox.isoNow(), false, null, "hi"),
-            "inbox-team");
-
-        mockMvc.perform(post("/api/v1/teams/inbox-team/inbox/read"))
-            .andExpect(status().isOk())
-            .andExpect(jsonPath("$.success").value(true));
-
-        // inbox 文件消息 read=true（markMessagesAsRead 锁内写回）
-        Path inbox = tempDir.resolve("teams/inbox-team/inboxes/team-lead.json");
-        JsonNode messages = json.readTree(Files.readString(inbox));
-        assertThat(messages.get(0).get("read").asBoolean()).as("已读回执必须标 read=true").isTrue();
-    }
+    // ── inbox（B1）────────────────────────────────────────────────────────
+    // [C2 删除 · 2026-09-18] 原 `inboxRead_marksMessagesAsRead` 用例随
+    //   POST /{team}/inbox/read 端点一并删除 —— 展开收件箱不再全量标已读（会把队友消息抢在
+    //   模型之前吞掉）。标读时机已移到消费侧 AgentLoopContext.maybeInjectTeammateMailbox，
+    //   其谓词标读行为由 TeammateMailboxTest.markMessagesAsReadByPredicate_marksMatchingOnly 覆盖。
 
     @Test
     @DisplayName("GET /api/v1/teams/{team}/inbox → 返回 teammate 消息列表（B1 轮询兜底/初始未读态）")

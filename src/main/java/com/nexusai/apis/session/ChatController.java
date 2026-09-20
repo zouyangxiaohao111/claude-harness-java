@@ -1,9 +1,12 @@
 package com.nexusai.apis.session;
 
+import com.nexusai.model.session.dto.AttachmentRequest;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.MessageCreatedResponse;
 import com.nexusai.model.session.dto.PartialCompactRequest;
 import com.nexusai.model.session.dto.PartialCompactResponse;
+import com.nexusai.model.session.dto.QueuePopRequest;
+import com.nexusai.model.session.dto.QueuePopResponse;
 import com.nexusai.model.session.dto.SendMessageRequest;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.agent.LlmAgentLoop;
@@ -161,36 +164,78 @@ public class ChatController {
     }
 
     /**
-     * [queue-first B4] 弹出可编辑排队命令（对齐 CC 排队条 Esc/↑ 拉回编辑）· 返回 {content} 填输入框。
+     * [queue-first B4 · 批 A5] 弹出全部<b>可编辑</b>排队命令（对齐 CC 排队条 Esc/↑ 拉回编辑）·
+     * 返回 {@link QueuePopResponse}{@code {text, attachments}}。
      *
-     * <p>经 {@link NotificationQueue#popForEdit} 从会话队列移除<b>全部</b> mode=prompt 命令
-     * （谓词与旧 removeByFilter 完全一致，保持旧序）并审计 op='popAll'（带 content，对齐 CC
-     * popAllEditable messageQueueManager.ts:471-476），仅取最旧一条的 content 回填输入框
-     * （复刻旧行为：移除全部 prompt 命令只回填最旧一条）；无排队命令 → 空 Map（前端视为
-     * null，无编辑内容）。
+     * <p><b>语义（对齐 CC {@code popAllEditable}，utils/messageQueueManager.ts:428-484）</b>：
+     * <ol>
+     *   <li><b>谓词 = 可编辑</b>：只取 {@link NotificationQueue#isQueuedCommandEditable} 命中的项
+     *       （CC :359-361 {@code isPromptInputModeEditable(mode) && !cmd.isMeta}）。本仓
+     *       {@code mode=prompt && isMeta=true} 的系统项有三处 —— cron 命令（{@code TestJob:373}）、
+     *       cron missed 启动通知（{@code CronIdleExecutor:235}）、channel 入站消息
+     *       （{@code ChannelNotification:154}，正文是原始 XML）—— <b>不再被弹出</b>
+     *       （旧谓词只判 {@code mode=prompt}，会把这三类系统文本拼进用户输入框）。</li>
+     *   <li><b>不可编辑项留在队列</b>：{@link NotificationQueue#popForEdit} 只移除谓词命中项
+     *       ⇒ 其余项原样留队，继续由各自消费通道（子 agent / cron / channel）处理
+     *       （CC :480-481 {@code commandQueue.push(...nonEditable)} 的等价物）。</li>
+     *   <li><b>回填全部可编辑项 + 当前输入</b>：{@code [...queuedTexts, currentInput].filter(Boolean).join('\n')}
+     *       （CC :455-456 逐字）—— 旧实现移除全部却只回填最旧一条，另 N-1 条
+     *       <b>不回填、不落库、不重投、不报错 ⇒ 静默消失</b>。</li>
+     *   <li><b>附件一起还</b>：全部弹出项的 {@code QueueItem.attachments} 原序展开回传
+     *       （CC :463-478 收集 {@code pastedContents} 图片 + value 内嵌图片块）。</li>
+     * </ol>
+     *
+     * <p><b>审计</b>：仍走 {@code popForEdit} → op='popAll'（带 content，CC :471-476）—— 与
+     * 「模型消费通用移除」（{@code removeByFilter} → 'remove' 无 content）可区分。
+     * 审计只覆盖<b>实际被弹出</b>的可编辑项；不可编辑项留在队列，不产生 popAll 记录。
+     *
+     * <p><b>无命中</b> → 200 + {@link QueuePopResponse#empty()}（{@code text=""}、{@code attachments=[]}），
+     * 不 emitChanged、不审计（CC :432-443 空守卫同款）。<b>不返回 204/空体</b>：前端 {@code api<>()}
+     * 统一按 JSON 解析，空体会走异常路径（与「队列为空」的正常语义混淆）。
+     *
+     * @param sessionId 会话 ID（路径变量）
+     * @param req       请求体（可缺省）· 携带用户输入框草稿 {@code currentInput}，参与 {@code \n} join
+     *                  （CC 的 currentInput 实参；缺省 = 无草稿）
      */
     @PostMapping("/queue/pop")
     @ResponseStatus(HttpStatus.OK)
-    public Map<String, String> popQueuedCommand(@PathVariable String sessionId) {
+    public QueuePopResponse popQueuedCommand(@PathVariable String sessionId,
+                                             @RequestBody(required = false) QueuePopRequest req) {
         if (notificationQueue == null) {
             log.warn("ChatController: NotificationQueue 未注入, /queue/pop 返回空");
-            return Map.of();
+            return QueuePopResponse.empty();
         }
         List<NotificationQueue.QueueItem> popped = notificationQueue.popForEdit(
             cmd -> cmd.sessionId() != null && cmd.sessionId().equals(sessionId)
-                && NotificationQueue.MODE_PROMPT.equals(cmd.mode()));
+                && NotificationQueue.isQueuedCommandEditable(cmd));
         if (popped.isEmpty()) {
-            return Map.of();
+            return QueuePopResponse.empty();
         }
-        // 只返回最旧一条的 content（拉回编辑）；已从队列移除（popForEdit 审计 'popAll'）
+        // 已从队列移除（popForEdit 审计 'popAll'）→ 推快照刷新排队框（不可编辑项仍在，框不消失）
         if (queueEventPublisher != null) {
             queueEventPublisher.emitChanged(sessionId);
         }
-        if (log.isInfoEnabled()) {
-            log.info("POST /queue/pop: session={} 弹出排队命令 content前20字符={}",
-                sessionId, abbreviate(popped.get(0).value(), 20));
+        String currentInput = req != null && req.currentInput() != null ? req.currentInput() : "";
+        List<String> parts = new java.util.ArrayList<>(popped.size() + 1);
+        List<AttachmentRequest> attachments = new java.util.ArrayList<>();
+        for (NotificationQueue.QueueItem cmd : popped) {
+            parts.add(cmd.value() != null ? cmd.value() : "");
+            if (cmd.attachments() != null && !cmd.attachments().isEmpty()) {
+                attachments.addAll(cmd.attachments());
+            }
         }
-        return Map.of("content", popped.get(0).value());
+        parts.add(currentInput);
+        // CC messageQueueManager.ts:455-456 逐字：[...queuedTexts, currentInput].filter(Boolean).join('\n')
+        String text = parts.stream()
+            .filter(p -> p != null && !p.isEmpty())
+            .collect(java.util.stream.Collectors.joining("\n"));
+        if (log.isInfoEnabled()) {
+            log.info("POST /queue/pop: session={} 弹出可编辑排队命令 {} 条（回填 {} 字符，附件 {} 件）"
+                    + "· 含草稿={} 首条前20字符={}",
+                sessionId, popped.size(), text.length(), attachments.size(),
+                !currentInput.isEmpty(), abbreviate(popped.get(0).value(), 20));
+        }
+        return new QueuePopResponse(text, attachments);
     }
 
     /** 截断日志字符串（超长省略）· 对齐 ChatService.abbreviate 语义。 */
@@ -255,6 +300,37 @@ public class ChatController {
     @ResponseStatus(HttpStatus.ACCEPTED)
     public void cancel(@PathVariable String sessionId) {
         chatService.cancelSession(sessionId, wsTemplate);
+    }
+
+    /**
+     * 会话是否正在跑（服务端权威运行态）· GET /api/v1/sessions/{sessionId}/running → 200 {running:bool}。
+     *
+     * <p><b>WHY</b>（用户需求「能够 UI 中手动终止会话循环」）：前端此前只能用**本地簿记**判断
+     * 「要不要显示停止键」（App.tsx 的 activeStreams 仅在「本页发送」时登记 + 有无流式块）。
+     * 后台 drain（排队命令 / cron / 任务通知）启动的 run 不在该簿记里，且思考阶段 / 等待权限阶段
+     * 尚无任何 chunk ⇒ 两个本地信号全假 ⇒ UI 上既无停止键也无活动迹象，用户无从终止；
+     * F5 更会清空本地簿记。本端点把「该会话是否有服务端 run 存活」暴露给前端，
+     * 供其在【载入 / 切会话 / 重连】时重建（F5 后仍能看见停止键）。
+     *
+     * <p><b>真源</b> = {@link LlmAgentLoop#isSessionActive}（{@code RUNNING_SESSIONS} 计数 &gt; 0
+     * 或 {@code DISPATCHING_SESSIONS} 保留中）—— 与队列消费闸门（CronIdleExecutor.poll 判空闲）
+     * 同一判据，不新增平行状态、不与 cancel 通道产生第二真源。
+     *
+     * <p><b>响应不含敏感信息</b>：仅一个布尔（会话 id 来自路径，回显在事件里而非本响应），
+     * 无 token / 无消息内容 / 无路径。
+     *
+     * <p><b>非轮询端点</b>：调用方只在【载入 / 切会话 / 重连】各查一次（不是定时轮询）；
+     * 运行中的实时翻转走 {@code session.status} 事件（thinking/streaming → 运行中，idle → 空闲）。
+     */
+    @GetMapping("/running")
+    public Map<String, Boolean> running(@PathVariable String sessionId) {
+        boolean running = LlmAgentLoop.isSessionActive(sessionId);
+        if (log.isInfoEnabled()) {
+            log.info("RUNNING 查询 session={} → running={}（真源=LlmAgentLoop.isSessionActive："
+                + "RUNNING_SESSIONS 计数>0 或 DISPATCHING 保留中；供前端重建停止键可见性）",
+                sessionId, running);
+        }
+        return Map.of("running", running);
     }
 
     /**

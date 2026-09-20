@@ -36,6 +36,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.anyLong;
@@ -1703,5 +1704,53 @@ class CronIdleExecutorTest {
         verify(state).clearAppendListener();
         verify(mockChat).publishCompleteEvent(eq(sessionId), eq("msg-cron-uuid"), eq(state),
             eq("/topic/sessions/" + sessionId + "/stream"), isNull(), anyLong(), isNull());
+    }
+
+    @Test
+    @DisplayName("[C6·A2] 事件顺序：complete 必须先于 idle 推（与主路径 ChatService 同序）")
+    void runOneAgentLoop_pushesCompleteBeforeIdle() {
+        // WHY（规则九 · 顺序即契约 · 反序会静默丢元数据）: 前端的「服务端运行态 true→false 收口边沿」
+        //   由 idle 那一刻触发；该边沿上的对账会对被收口的会话调 chatStore.finalizeBlocks，把残留流式块
+        //   定稿成正式消息（见 hooks/useServerRunning.ts · useServerRunningReconcile）。若 idle 先于
+        //   complete 推，块就在 complete 之前被定稿、流式块列表随之清空 ⇒ 紧随其后的那条 complete 的
+        //   finalizeBlocks 见「无块」直接 no-op ⇒ 该轮 turn 级 usage / 成本 / 上下文快照（只有
+        //   complete meta 才带）丢失，且定稿提前一拍。
+        //   ⛔ 与「退订 / 丢帧」无关：前端当前会话的 stream 订阅是**常驻**的（useChatSocket.ts:547
+        //   `if (!active[sid] && sid !== sessionIdRef.current)` ⇒ 本会话不退订），complete 不会推给零订阅者。
+        //   主路径 ChatService.runAgentLoop 的顺序是 thinking(:873) → complete(:1120) → idle(:1131
+        //   finally)，drain 路径必须同序。
+        //   RED: 把 idle 放回 run() 之后 / complete 之前的 finally（反序）→ 本用例变红。
+        String sessionId = "sess-cron-order";
+        LlmAgentLoop loop = mock(LlmAgentLoop.class);
+        @SuppressWarnings("unchecked")
+        ObjectProvider<LlmAgentLoop> provider = mock(ObjectProvider.class);
+        when(provider.getObject()).thenReturn(loop);
+        ReflectionTestUtils.setField(executor, "loopProvider", provider);
+        AgentState state = mock(AgentState.class);
+        when(loop.run(any(RunRequest.class))).thenReturn(state);
+
+        List<String> pushed = new ArrayList<>();
+        ChatService mockChat = mock(ChatService.class);
+        doAnswer(inv -> { pushed.add("complete"); return null; })
+            .when(mockChat).publishCompleteEvent(any(), any(), any(), any(), any(), anyLong(), any());
+        ReflectionTestUtils.setField(executor, "chatService", mockChat);
+        org.springframework.messaging.simp.SimpMessagingTemplate mockWs =
+            mock(org.springframework.messaging.simp.SimpMessagingTemplate.class);
+        doAnswer(inv -> {
+            Object payload = inv.getArgument(1);
+            if (payload instanceof com.nexusai.eventbus.ws.SessionStatusEvent statusEvent) {
+                pushed.add("status:" + statusEvent.getStatus());
+            }
+            return null;
+        }).when(mockWs).convertAndSend(anyString(), any(Object.class));
+        ReflectionTestUtils.setField(executor, "wsTemplate", mockWs);
+
+        QueueItem cmd = new QueueItem("定时任务提示词", NotificationQueue.MODE_PROMPT, Priority.LATER,
+            null, "msg-cron-order", true, NotificationQueue.WORKLOAD_CRON, false, null, sessionId);
+
+        ReflectionTestUtils.invokeMethod(executor, "runOneAgentLoop", cmd);
+
+        // 推送顺序契约：起轮 → 收口 → 空闲（idle 最后：收口边沿触发的对账不得抢在 complete 之前定稿）
+        assertThat(pushed).containsExactly("status:thinking", "complete", "status:idle");
     }
 }

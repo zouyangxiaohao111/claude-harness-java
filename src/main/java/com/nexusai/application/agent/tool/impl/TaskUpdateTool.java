@@ -513,7 +513,14 @@ public class TaskUpdateTool extends AbstractTaskTool {
             && "in_progress".equals(statusStr)
             && !input.has("owner")
             && existingTask.owner() == null) {
-            String agentName = TaskSystemConfig.getAgentName();
+            // [P0-3 · B5] 取值来源从进程级 sysprop 换成显式身份：原 TaskSystemConfig.getAgentName()
+            //   读 nexusai.agent.name，而全仓 main **零写入点**（仅测试写），且 Web 部署下
+            //   TeammateContextBootstrap 见到该 sysprop 直接 IllegalStateException 拒启
+            //   ⇒ 该分支在生产恒 null ⇒ 「置进行中自动挂负责人」是条死路。
+            //   身份改取 ctx.teammateIdentity()（与同文件 :415-417 消费同一字段，该路径生产可达）。
+            //   对 leader/主线程零影响：teammateIdentity==null ⇒ agentName 为 null ⇒ 行为与改前一致。
+            String agentName = (ctx != null && ctx.teammateIdentity() != null)
+                    ? ctx.teammateIdentity().agentName() : null;
             if (agentName != null && !agentName.isBlank()) {
                 partialUpdates.put("owner", agentName);
                 updatedFields.add("owner");
@@ -689,13 +696,23 @@ public class TaskUpdateTool extends AbstractTaskTool {
         if (ownerValue instanceof String newOwner
             && !newOwner.isEmpty()
             && TaskSystemConfig.isAgentSwarmsEnabled()) {
-            String senderName = TaskSystemConfig.getAgentName();
+            // [P0-3 · B5 未闭环项 · 同根因同修] 与上方自动挂 owner（:516）**同一身份来源**：
+            //   CC :278 的 getAgentName() 与 :188-198 的 getAgentName() 是同一个函数
+            //   （teammate.ts:98-102，AsyncLocalStorage teammate context），teammate 自挂时
+            //   senderName **就是它自己的名字**、不是回落 'team-lead'。原实现读进程级 sysprop
+            //   nexusai.agent.name（main 侧**零写入点**）⇒ 生产恒回落 'team-lead'（假身份）。
+            //   ⛔ 不符「行为已等价」：CC 在该路径给出的是真实成员名。
+            TeammateIdentity selfIdentity = ctx != null ? ctx.teammateIdentity() : null;
+            String senderName = selfIdentity != null ? selfIdentity.agentName() : null;
             if (senderName == null || senderName.isEmpty()) {
                 // 对齐 CC :278 getAgentName() || 'team-lead'（swarm/constants.ts:1 TEAM_LEAD_NAME）
                 // JS falsy 语义：仅空串 '' 回退；全空白串 ' ' 为 truthy 不回退（与下方 owner 判据同口径）
                 senderName = "team-lead";
             }
-            String senderColor = TaskSystemConfig.getTeammateColor();
+            // [P0-3 · B5 同族] color 与 name 在 CC 同源（TaskUpdateTool.ts:279 getTeammateColor()
+            //   → teammate.ts:138-145 读同一个 teammate context）⇒ 一并改显式身份，避免
+            //   「同一能力两套判据」（本仓 :622/:680 已用 Teammate.getTeammateColor(identityOf(ctx))）。
+            String senderColor = Teammate.getTeammateColor(selfIdentity);
             // CC :280-287：消息体 timestamp 与信封 timestamp 为两次 new Date().toISOString()
             String assignmentText = TeammateMailbox.taskAssignmentJson(
                 taskId, originalSubject, originalDescription, senderName, TeammateMailbox.isoNow());

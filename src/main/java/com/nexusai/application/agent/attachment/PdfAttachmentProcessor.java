@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * PDF 附件处理器 · R1 分页决策 + document/image block 注入（≤{@link PdfSupport#PDF_MAX_PAGES_PER_READ} 页）。
+ * PDF 附件处理器 · R1 分页决策 + document/image block 注入（≤{@link PdfSupport#PDF_AT_MENTION_INLINE_THRESHOLD} 页）。
  *
  * <p><b>定位</b>：主 user 消息附件消费处（LlmAgentLoop A4 注入，对齐 CC attachments.ts:1062-1071
  * prompt 数组 {@code [{type:'text'}, ...blocks]}）。[附件双模式] 三条传输通道在此统一解析
@@ -37,9 +37,9 @@ import java.util.UUID;
  *
  * <p><b>分页决策 + 三态解析</b>（对齐 CC FileReadTool.ts:894-1017 + pdf.ts:179-300）：
  * <ol>
- *   <li>分页：{@link PdfSupport#getPDFPageCount} → 页数 &gt; {@link PdfSupport#PDF_MAX_PAGES_PER_READ}(20)
- *       → {@link Resolution#NEEDS_SUBAGENT}（&gt;20 页自主引导标记，注入 pdf_reference 式文本）；页数 null（无法确定）→ 继续三态
- *       （CC :949-955 {@code pageCount !== null && pageCount > threshold} 等价）</li>
+ *   <li>分页：{@link PdfSupport#getPDFPageCount} → 页数 &gt; {@link PdfSupport#PDF_AT_MENTION_INLINE_THRESHOLD}(10)
+ *       → {@link Resolution#NEEDS_SUBAGENT}（&gt;10 页自主引导标记，注入 pdf_reference 式文本）；页数 null（无法确定）
+ *       → 以 {@code size/100KB} 估算 effectivePageCount 再判定（CC attachments.ts:2988-2999 等价）</li>
  *   <li>≤3MB（{@link PdfSupport#PDF_EXTRACT_SIZE_THRESHOLD}）→ document block（CC :1001-1015）</li>
  *   <li>&gt;3MB ≤100MB → {@link PdfSupport#extractPDFPages} 逐页 JPEG → image blocks
  *       （CC :916-945 页图 image blocks 送达）</li>
@@ -63,7 +63,7 @@ public final class PdfAttachmentProcessor {
     /** 无会话兜底桶名 · 同 {@link ImageAttachmentStore} / {@link PdfAttachmentStore}。 */
     private static final String UNKNOWN_SESSION = "unknown";
 
-    /** 解析结果分派：INJECT=直接注入 blocks；NEEDS_SUBAGENT=&gt;20 页自主引导（主模型 Read pages / Agent 派多模态子代理）；ERROR=解析失败跳过。 */
+    /** 解析结果分派：INJECT=直接注入 blocks；NEEDS_SUBAGENT=&gt;10 页自主引导（主模型 Read pages / Agent 派多模态子代理）；ERROR=解析失败跳过。 */
     public enum Resolution { INJECT, NEEDS_SUBAGENT, ERROR }
 
     /**
@@ -95,7 +95,7 @@ public final class PdfAttachmentProcessor {
             return new PdfBlocksResult(Resolution.INJECT, blocks, pageCount, null, List.of(), pdfPath);
         }
 
-        /** [pdf-自主引导] &gt;20 页 NEEDS_SUBAGENT · pdfPath 保留 resolvePdfBlocks 已解析的磁盘路径（供 LlmAgentLoop 注入引导文本引用）。 */
+        /** [pdf-自主引导] &gt;10 页 NEEDS_SUBAGENT · pdfPath 保留 resolvePdfBlocks 已解析的磁盘路径（供 LlmAgentLoop 注入引导文本引用）。 */
         public static PdfBlocksResult needsSubagent(String pdfPath, Integer pageCount) {
             return new PdfBlocksResult(Resolution.NEEDS_SUBAGENT, List.of(), pageCount, null, List.of(), pdfPath);
         }
@@ -115,7 +115,7 @@ public final class PdfAttachmentProcessor {
      *
      * @param filename         客户端原始文件名（可 null）
      * @param blocks           待注入 content blocks（needsSubagent=false 时非空）
-     * @param needsSubagent    true = &gt;20 页，自主引导标记（主模型 Read pages / Agent 派多模态子代理），本次不注入媒体块
+     * @param needsSubagent    true = &gt;10 页，自主引导标记（主模型 Read pages / Agent 派多模态子代理），本次不注入媒体块
      * @param pageCount        页数（可 null）
      * @param visionContentIds [pdf-vision-align] 文本模型 PDF 页图注册 contentId 列表（多模态路径 = 空列表）
      * @param pdfPath          [pdf-自主引导] PDF 磁盘绝对路径（resolvePdfBlocks 解析产物；needsSubagent=true
@@ -239,22 +239,15 @@ public final class PdfAttachmentProcessor {
         }
 
         // ── 分页决策 · 对齐 CC FileReadTool.ts:949-955（pageCount null → 继续三态）──
+        // [B1 2026-09-18 · 降级线 20 → 10] 判据对齐 CC attachments.ts:2988-2999 tryGetPDFReference：
+        //   页数读不出（null）时按 size/100KB 估算 effectivePageCount，再与 @-mention 内联阈值
+        //   PDF_AT_MENTION_INLINE_THRESHOLD(10) 比较 → 超过则只给路径（NEEDS_SUBAGENT）。
+        //   ⚠️ 取**三通道汇合点**（path/contentId/base64 共用同一处），不改 resolveFilePath 的 path 分支：
+        //   只改 path 腿会让「>5MB 与 ≤5MB 的 PDF」行为相反（同一能力两套判据）。
+        //   Read 工具的 PDF_MAX_PAGES_PER_READ(20) 是「怎么读」的分段上限，与「是否内联」是两件事，不动。
         Integer pageCount = PdfSupport.getPDFPageCount(filePath);
-        if (pageCount != null && pageCount > PdfSupport.PDF_MAX_PAGES_PER_READ) {
-            if (log.isDebugEnabled()) {
-                log.debug("[U2 分页决策] PDF 页数 {} 超出单次直接读取上限 {} → NEEDS_SUBAGENT（自主引导，主模型 Read pages / Agent 派多模态子代理）path={}",
-                    pageCount, PdfSupport.PDF_MAX_PAGES_PER_READ, filePath);
-            }
-            // [pdf-自主引导] pdfPath 保留进结果对象 → PendingPdf → LlmAgentLoop 注入引导文本引用
-            //   （模型自行 Read 原 PDF + pages 分段 / Agent 派多模态子代理，系统不自动 fork）
-            return PdfBlocksResult.needsSubagent(filePath.toString(), pageCount);
-        }
-        if (log.isDebugEnabled()) {
-            log.debug("[U2 分页决策] PDF 页数 {} ≤ {} → 直接注入（document/image block / 文本模型页图注册）path={}",
-                pageCount == null ? "未知(null)" : pageCount, PdfSupport.PDF_MAX_PAGES_PER_READ, filePath);
-        }
-
-        // ── 尺寸读取 + 上限检查（>maxExtract → ERROR，两分支共享）──
+        // ⚠️ size 必须先于判据读取（pageCount=null 分支估算需要），故由下方三态段上移（CC 亦为
+        //   Promise.all([stat, getPDFPageCount]) 并行取，二者无先后依赖）。
         long size;
         try {
             size = Files.size(filePath);
@@ -262,6 +255,32 @@ public final class PdfAttachmentProcessor {
             return PdfBlocksResult.failure(new PdfSupport.PdfError(PdfSupport.ErrorReason.UNKNOWN,
                 "PDF 读取 size 失败: " + (e.getMessage() == null ? e.toString() : e.getMessage())), pageCount);
         }
+        // CC: pageCount ?? Math.ceil(stats.size / (100 * 1024)) —— JS `/` 是浮点除法，Java 必须用浮点
+        //   除数（100.0 * 1024），否则整型整除先行截断、Math.ceil 退化为空操作（估算向下取整，
+        //   恰好卡在 10×100KB 边界时漏降级）。
+        Integer effectivePageCount = pageCount != null
+            ? pageCount
+            : (int) Math.ceil(size / (100.0 * 1024));
+        // effectivePageCount != null 与 CC 判据同形（Java 下该分支恒真，保留以对齐形状）
+        if (effectivePageCount != null && effectivePageCount > PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD) {
+            if (log.isDebugEnabled()) {
+                log.debug("[U2 分页决策] PDF 页数 {}（effective={} size={}B）超出内联阈值 {} → NEEDS_SUBAGENT（自主引导，主模型 Read pages / Agent 派多模态子代理）path={}",
+                    pageCount, effectivePageCount, size, PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD, filePath);
+            }
+            // [pdf-自主引导] pdfPath 保留进结果对象 → PendingPdf → LlmAgentLoop 注入引导文本引用
+            //   （模型自行 Read 原 PDF + pages 分段 / Agent 派多模态子代理，系统不自动 fork）
+            // [B1 2026-09-18 · R3] 传 effectivePageCount（非原始 pageCount）：对齐 CC attachments.ts:3002/3009
+            //   pdf_reference 的 pageCount = effectivePageCount —— 「页数读不出」的 PDF 降级后，
+            //   引导文案仍须带估算页数（传原始 null 会让 PendingPdf.pageCount=null → 文案丢页数）。
+            return PdfBlocksResult.needsSubagent(filePath.toString(), effectivePageCount);
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[U2 分页决策] PDF 页数 {}（effective={}）≤ {} → 直接注入（document/image block / 文本模型页图注册）path={}",
+                pageCount == null ? "未知(null)" : pageCount, effectivePageCount,
+                PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD, filePath);
+        }
+
+        // ── 尺寸上限检查（>maxExtract → ERROR，两分支共享；size 已于分页判据前读取）──
         if (size > PdfSupport.getMaxExtractSize()) {
             return PdfBlocksResult.failure(new PdfSupport.PdfError(PdfSupport.ErrorReason.TOO_LARGE,
                 "PDF exceeds maximum allowed size for text extraction ("
@@ -389,7 +408,7 @@ public final class PdfAttachmentProcessor {
      *
      * <p>对齐 {@code registerRunPromptImages}（F1）模式：doRun 入口调用（先于首个 user 消息构造），
      * 主 user 消息构造 {@code buildUserMessageWithImages} → {@link #drainPendingPdfs} 消费。
-     * NEEDS_SUBAGENT（&gt;20 页）同样登记（PendingPdf.needsSubagent=true + pdfPath），注入侧由
+     * NEEDS_SUBAGENT（&gt;10 页）同样登记（PendingPdf.needsSubagent=true + pdfPath），注入侧由
      * LlmAgentLoop 注入按主模型能力分流的 pdf_reference 式引导文本（U2 自主引导，系统不自动 fork）。
      *
      * @param sessionId  会话 id（路径通道 PdfAttachmentStore 解析用）

@@ -335,22 +335,44 @@ export interface RunNowResponse {
 
 /** 权限模式（对齐 CC permissions.defaultMode · 6 种全量；计划模式 plan 并入权限模块，工具旁不再独立展示） */
 export type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk' | 'auto'
-/** 权限模式中文标签（环境配置 + Composer 选择器用） */
+/**
+ * 权限模式中文标签（环境配置 + Composer 选择器用）。
+ *
+ * <p>⛔ `dontAsk` 的短标签必须能自证「不是自动放行」：Composer 的 `pm-value` 芯片**只显示标签**
+ * （抽屉里才有说明小字），写成「不询问」会被读成「不问就放行」—— 与真实语义相反。
+ */
 export const PERMISSION_MODE_LABELS: Record<PermissionMode, string> = {
   default: '默认',
   plan: '计划模式',
   acceptEdits: '接受编辑',
   bypassPermissions: '绕过权限',
-  dontAsk: '不询问',
+  dontAsk: '不询问（拒绝）',
   auto: '自动',
 }
-/** 权限模式说明（抽屉选项旁小字 · 超宽省略 + hover title 显示完整） */
+/**
+ * 权限模式说明（抽屉选项旁小字 · 超宽省略 + hover title 显示完整）。
+ *
+ * <p>6 条逐条对照 CC 语义定义（{@code claude-code-best/src/entrypoints/sdk/coreSchemas.ts:347-355}
+ * 的 6 句 describe），中文说清功能、不直译：
+ * <ul>
+ *   <li>{@code default} = "Standard behavior, prompts for dangerous operations."</li>
+ *   <li>{@code acceptEdits} = "Auto-accept file edit operations."</li>
+ *   <li>{@code bypassPermissions} = "Bypass all permission checks."</li>
+ *   <li>{@code plan} = "Planning mode, no actual tool execution."</li>
+ *   <li>{@code dontAsk} = <b>"Don't prompt for permissions, deny if not pre-approved."</b>
+ *       —— ⚠️ 语义是<b>不弹窗 + 未预先批准的一律拒绝</b>（严格模式），
+ *       <b>不是</b>「不询问就自动批准」（那是 {@code bypassPermissions}）。
+ *       后端实现一致：{@code ToolPermissionGate.applyDontAskTransform}（Ask → Deny，
+ *       文案 "Permission to use X has been denied because NexusAI is running in don't ask mode."）。</li>
+ *   <li>{@code auto} = "Automatic mode (transcript classifier)."</li>
+ * </ul>
+ */
 export const PERMISSION_MODE_DESCRIPTIONS: Record<PermissionMode, string> = {
   default: '每个敏感操作询问',
   plan: '只读探索，不执行修改',
   acceptEdits: '自动接受文件编辑',
   bypassPermissions: '绕过所有权限',
-  dontAsk: '不询问，自动批准一切',
+  dontAsk: '不弹窗；未预先批准的会被拒绝',
   auto: '自动判定（classifier）',
 }
 
@@ -960,6 +982,15 @@ export interface SendMessageRequest {
   appendSystemPrompt?: string
   fallbackModel?: string
 }
+/** [批 A5] POST /sessions/{id}/queue/pop 响应 · 对齐 CC PopAllEditableResult
+ *  （utils/messageQueueManager.ts:415-419 {text, cursorOffset, images}）的 web 等价物。
+ *  - text = 全部【可编辑】排队项文本 + 输入框草稿，`\n` join（CC :455-456 逐字）；
+ *  - attachments = 全部弹出项的附件（后端 QueueItem.attachments 原序展开，可直接并入待发 chip 重投）；
+ *  无可弹出项 = {text: '', attachments: []}（不是 null / 空体 —— 前端统一按 JSON 解析）。 */
+export interface QueuePopResponse {
+  text: string
+  attachments: AttachmentRequest[]
+}
 export interface MessageCreatedResponse { userMessageId: string; assistantMessageId: string; streamTopic: string; queued?: boolean }
 export interface PartialCompactRequest { messageId: string; direction?: 'from' | 'up_to'; feedback?: string }
 export interface PartialCompactResponse { messages: ChatMessageDto[]; conversationId: string }
@@ -1147,6 +1178,65 @@ export interface AskUserAnnotation {
 /** AskUser 注解：questionText → { preview?, notes? } */
 export type AskUserAnnotations = Record<string, AskUserAnnotation>
 
+// ---- 权限更新（PermissionUpdate）· 线格式 ----
+//
+// 后端 `PermissionUpdate` 的 wire 由单点序列化器产出，形状为 CC 的
+// discriminatedUnion('type', ...)：
+//   addRules / replaceRules / removeRules → {type, rules:[{toolName, ruleContent?}], behavior, destination}
+//   setMode                               → {type, mode, destination}
+//   addDirectories / removeDirectories    → {type, directories:[...], destination}
+//
+// 前端**只做原样透传**（弹窗回传 updatedPermissions）——不做任何结构转换，
+// 否则等于引入第二份实现。
+//
+// 注意：`ruleContent` 缺省表示「整个工具」放行（不是空串）。
+
+/** 更新落地位置（后端 Destination.ccLiteral 的逐字取值，大小写敏感） */
+export type PermissionUpdateDestination =
+  | 'userSettings'
+  | 'projectSettings'
+  | 'localSettings'
+  | 'cliArg'
+  | 'session'
+
+/** 规则行为（后端 PermissionBehavior.ccLiteral） */
+export type PermissionBehaviorLiteral = 'allow' | 'deny' | 'ask'
+
+/** 权限模式（setMode 的 mode · 后端 ToolPermissionGate.modeToCcString） */
+export type PermissionModeCcLiteral =
+  | 'default' | 'plan' | 'acceptEdits' | 'bypassPermissions' | 'dontAsk' | 'auto'
+
+/** 单条规则（ruleContent 缺省 = 整工具放行） */
+export interface PermissionRuleValueWire {
+  toolName: string
+  ruleContent?: string
+}
+
+/** 规则型更新（addRules / replaceRules / removeRules 共用形状） */
+export interface PermissionUpdateRulesWire {
+  type: 'addRules' | 'replaceRules' | 'removeRules'
+  rules: PermissionRuleValueWire[]
+  behavior: PermissionBehaviorLiteral
+  destination: PermissionUpdateDestination
+}
+/** 模式型更新 */
+export interface PermissionUpdateSetModeWire {
+  type: 'setMode'
+  mode: PermissionModeCcLiteral
+  destination: PermissionUpdateDestination
+}
+/** 目录型更新 */
+export interface PermissionUpdateDirectoriesWire {
+  type: 'addDirectories' | 'removeDirectories'
+  directories: string[]
+  destination: PermissionUpdateDestination
+}
+/** 权限更新（6 型判别联合 · 与后端线格式逐字段一致） */
+export type PermissionUpdate =
+  | PermissionUpdateRulesWire
+  | PermissionUpdateSetModeWire
+  | PermissionUpdateDirectoriesWire
+
 export interface PermissionRequestEvent extends StreamEventBase {
   type: 'permission.request'
   requestId: string
@@ -1156,7 +1246,8 @@ export interface PermissionRequestEvent extends StreamEventBase {
   /** 危险命令警告（红/黄警示文案；空/缺省则正常弹窗） */
   warning?: string | null
   description?: string | null
-  suggestions?: unknown[] | null
+  /** 一键授权建议（后端 PermissionPromptDetails.suggestions）· 原样回传 updatedPermissions */
+  suggestions?: PermissionUpdate[] | null
   blockedPath?: string | null
   /** AskUser 问题（便捷访问；实际 wire 位置在 toolInput.questions，解析 toolInput 获得） */
   questions?: AskUserQuestion[]

@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
+import com.nexusai.application.agent.team.InProcessTeammateTaskRegistry;
 import com.nexusai.application.agent.team.SpawnInProcess;
 import com.nexusai.application.agent.team.TeamHelpers;
 import com.nexusai.application.agent.team.TeammateMailbox;
@@ -258,9 +259,20 @@ public class TeamDeleteTool implements Tool {
                 ? sessionId : leadSessionIdFromConfig(teamName);
 
         // CC :199-207 cleanupTeamDirectories + unregisterTeamForSessionCleanup + clearLeaderTeamName
-        teamHelpers.cleanupTeamDirectories(teamName);
+        // [P0-7 · D6] 只包 :261 一行：cleanupTeamDirectories 历史上有 UncheckedIOException 穿网
+        //   （TeamHelpers 内层 lambda 抛出、外层只 catch IOException）⇒ REST 变 500 / 工具报错。
+        //   ⛔ 不得把 :262/:263 一起包进来 —— 一旦 :261 抛，收尾两步会被跳过，而 CC
+        //   TeamDeleteTool.ts:200-204 是**无条件执行**。
+        try {
+            teamHelpers.cleanupTeamDirectories(teamName);
+        } catch (Exception e) {
+            log.error("[TeamDeleteTool] team={} cleanupTeamDirectories 异常（收尾继续执行）", teamName, e);
+        }
         teamHelpers.unregisterTeamForSessionCleanup(teamName);
-        TaskService.clearLeaderTeamName();
+        // [P0-2 · B1] 显式 sessionId：原 0 参调用 → clearLeaderTeamName(null) 立即 return，
+        //   清不掉任何键 ⇒ 团队解散后 leader 仍绑着已删的 team 任务板。effectiveLeadSessionId
+        //   在 :257-258 已解析（config 尚在），与 setTeamContext 清理同源。保持 0 参重载不动。
+        TaskService.clearLeaderTeamName(effectiveLeadSessionId);
         // [team-frontend-channel] REST 路径无 ctx —— 会话列 teamContext 清理由 sessionId 显式承担
         // [team-panel-backend-bugfix 加固] sessionId 为空（REST 解散未传 / 旧数据无 ctx）→
         //   从 team config.leadSessionId 反查兜底清列（复用 effectiveLeadSessionId，防残留）。
@@ -297,14 +309,44 @@ public class TeamDeleteTool implements Tool {
         if (spawnInProcess == null) {
             return false;
         }
-        Optional<AutonomousAgentLoop> loop = spawnInProcess.registry().findByAgentName(memberName);
+        InProcessTeammateTaskRegistry registry = spawnInProcess.registry();
+        if (registry == null) {
+            return false;
+        }
+        // [P0-6 · D1②] 定位**主用**全形 agentId（对齐 CC InProcessBackend.ts:211
+        //   findTeammateTaskByAgentId 的键 = identity.agentId = name@team）；**必须保留**
+        //   findByAgentName(memberName) 作兜底（先全形后裸名）—— 团队名归一化不一致会让全形
+        //   匹配落空，落空会把用户可见文案从「Shutdown requested…」降级成「Cannot cleanup…」。
+        String fullAgentId = SpawnInProcess.formatAgentId(memberName, teamName);
+        Optional<AutonomousAgentLoop> loop = registry.findByAgentId(fullAgentId);
         if (loop.isEmpty()) {
             if (log.isDebugEnabled()) {
-                log.debug("[TeamDeleteTool] requestShutdown: 未找到存活 loop agent={}", memberName);
+                log.debug("[TeamDeleteTool] requestShutdown: 全形 agentId={} 未命中，降级裸名兜底 agent={}",
+                        fullAgentId, memberName);
+            }
+            loop = registry.findByAgentName(memberName);
+        }
+        if (loop.isEmpty()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TeamDeleteTool] requestShutdown: 未找到存活 loop agent={}（全形 {}）",
+                        memberName, fullAgentId);
             }
             return false;
         }
-        String requestId = "shutdown-" + memberName + "-" + System.currentTimeMillis();
+        // CC InProcessBackend.ts:222 幂等守卫：已请求过 → return true（**不重发、不 abort**）。
+        //   Java 侧对应读只读标志 AutonomousAgentLoop.isShutdownRequested()；⛔ 不在此调
+        //   loop.requestShutdown()（那会直接置 SHUTDOWN 状态、跳过模型 approve/reject 决策）。
+        if (loop.get().isShutdownRequested()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TeamDeleteTool] requestShutdown: 已请求过 shutdown，跳过重发 agent={}", memberName);
+            }
+            return true;
+        }
+        // CC InProcessBackend.ts:225 编号原形 "shutdown-{agentId}-{ts}"，agentId 为**全形**
+        //   name@team（TeamDeleteTool.ts:122 传全形）。原实现 "shutdown-{memberName}-{ts}" 无 `@`
+        //   ⇒ AgentIdFormatter.parseRequestId 必返回 null ⇒ 旧回落腿恒哑。
+        //   ⛔ 不要改用 generateRequestId（那是 handleShutdownRequest 的形）。
+        String requestId = "shutdown-" + fullAgentId + "-" + System.currentTimeMillis();
         TeammateMailbox.ShutdownRequestMessage shutdown = TeammateMailbox.createShutdownRequestMessage(
                 requestId, SwarmConstants.TEAM_LEAD_NAME, "Team cleanup requested by team lead");
         TeammateMailbox.writeToMailbox(memberName,

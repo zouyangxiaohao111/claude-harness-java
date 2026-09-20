@@ -205,7 +205,7 @@ class LlmAgentLoopBusyAttachmentDrainTest {
     }
 
     @Test
-    @DisplayName("[PDF 腿] busy 项携 ≤20 页 path PDF + 多模态模型 → drain 注册 PDF 后 document block 进模型侧 contentBlocks")
+    @DisplayName("[PDF 腿] busy 项携 ≤10 页 path PDF + 多模态模型 → drain 注册 PDF 后 document block 进模型侧 contentBlocks")
     void busyQueuedPdfAttachment_multimodalModel_drainInjectsPdfDocumentBlock() throws IOException {
         LlmProvider provider = stopProvider();
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
@@ -263,7 +263,7 @@ class LlmAgentLoopBusyAttachmentDrainTest {
     }
 
     @Test
-    @DisplayName("[PDF 腿] busy 项携 >20 页 path PDF（回落夹具：无 mapper → pdfSupported=true）→ drain 注册后引导文本进 content")
+    @DisplayName("[PDF 腿] busy 项携 >10 页 path PDF（回落夹具：无 mapper → pdfSupported=true）→ drain 注册后引导文本进 content")
     void busyQueuedLargePdfAttachment_drainInjectsPdfGuidanceTextIntoContent() throws IOException {
         LlmProvider provider = stopProvider();
         LlmProviderFactory factory = mock(LlmProviderFactory.class);
@@ -280,7 +280,7 @@ class LlmAgentLoopBusyAttachmentDrainTest {
         loop.setPdfAttachmentProcessor(pdfProcessor);
         loop.setContextFactory(ctxFactory);
 
-        // >20 页（PDF_MAX_PAGES_PER_READ）→ NEEDS_SUBAGENT → 引导文本（本夹具无 mapper，
+        // >10 页（PDF_AT_MENTION_INLINE_THRESHOLD）→ NEEDS_SUBAGENT → 引导文本（本夹具无 mapper，
         //   buildUserMessageWithImages 的 pdfSupported 回落 1 参 CC 契约 = true → 「Read pages 分段」引导）
         Path pdf = Files.createTempFile("nexusai-drain-bigpdf-", ".pdf");
         try (PDDocument doc = new PDDocument()) {
@@ -304,7 +304,10 @@ class LlmAgentLoopBusyAttachmentDrainTest {
         assertThat(m.content())
             .as("PDF 注册腿的产物必须进模型侧 content（模型侧出现 PDF 引导文本）")
             .contains("长报告.pdf")
-            .contains("超过单次读取上限")
+            // [B1 2026-09-18 · R5] 必须钉住**数值**：「超过内联阈值 10 页」。刻意写**字面量 10**
+            //   而非拼 PdfSupport.PDF_AT_MENTION_INLINE_THRESHOLD —— 后者会随常量一起漂移，
+            //   阈值被改回 20 时本断言仍绿（变异不变红 = 零鉴别力）。
+            .contains("超过内联阈值 10 页")
             .contains(absPath)
             .contains("忙时发的大 PDF");
     }

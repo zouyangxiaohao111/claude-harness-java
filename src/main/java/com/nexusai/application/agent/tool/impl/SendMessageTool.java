@@ -813,17 +813,22 @@ public class SendMessageTool implements Tool {
      * <p>顺序（CC :330-366）：先写 shutdown_approved 到 team-lead mailbox（:330-346），再经
      * findTeammateTaskByAgentId 找本 in-process teammate 任务 → task.abortController.abort()
      *（:356-357，生命周期级——审批即退出整个 teammate）；找不到任务 → :362-364 warning 但仍返回
-     * success（:392-398，不失败）。agent 名经 requestId 解析（Java in-process 无 teammate context
-     * 时 getAgentName() 为 null 的兜底；CC 用 getAgentId/getAgentName 的 paneId/backendType 差异
-     * 登记受控残留 SM-15）。
+     * success（:392-398，不失败）。
      *
-     * @param requestId shutdown_response 回显的 request_id（内含被 shutdown 的 teammate 名）
+     * <p><b>[P0-6 · D1①] 身份来源改显式 ctx</b>：CC 用 {@code getAgentId()/getAgentName()}
+     *（SendMessageTool.ts:338-343,388），**不解析 request_id**。原实现只解析 request_id，而本仓
+     * request_id 由 TeamDeleteTool 生成为 {@code "shutdown-{member}-{ts}"}（**无 `@`**）⇒
+     * {@link AgentIdFormatter#parseRequestId} 必返回 null ⇒ 回落字面量 "teammate" ⇒
+     * {@code findByAgentName("teammate")} 必落空 ⇒ <b>永不 abort</b>（「关机」只是封信）。
+     * request_id 反解<b>降级为 ctx 无身份时的兜底并保留</b>（测试/无身份路径仍可定位）。
+     *
+     * @param requestId shutdown_response 回显的 request_id（ctx 无身份时的兜底线索）
      */
     private AgentToolResult handleShutdownApproval(ToolUseBlock call, String requestId, ToolUseContext ctx) {
-        String agentName = extractAgentNameFromRequestId(requestId);
-        if (agentName == null) {
-            agentName = "teammate";
-        }
+        // [P0-6 · D1①] 主用显式身份（ctx.teammateIdentity()）；反解仅作兜底。
+        ShutdownActor actor = resolveShutdownActor(ctx, requestId);
+        String agentName = actor.agentName();
+        String agentId = actor.agentId();
         String teamName = resolveTeamName(ctx);
         // 1. 先写确认到 team-lead mailbox（CC :330-346 createShutdownApprovedMessage + writeToMailbox）
         try {
@@ -841,14 +846,18 @@ public class SendMessageTool implements Tool {
             log.warn("[SendMessageTool] shutdown_approved 写入失败 requestId={}: {}", requestId, e.getMessage());
         }
         // 2. 找 in-process teammate 任务并 abort 生命周期控制器（CC :353-365）
-        AutonomousAgentLoop loop = findTeammateLoop(agentName);
+        // [P0-6 · D1①] 定位主用 registry.findByAgentId(agentId)（与 CC
+        //   InProcessTeammateTask.tsx:126-146 findTeammateTaskByAgentId 同键 = identity.agentId）；
+        //   顺带消掉 findByAgentName 的 equalsIgnoreCase **裸名匹配**误伤 —— registry 是进程级
+        //   单例 map，裸名可命中别的 team/会话的同名 teammate。ctx 无身份时降级裸名兜底。
+        AutonomousAgentLoop loop = findTeammateLoop(agentId, agentName);
         if (loop != null && loop.taskState() != null && loop.taskState().abortController() != null) {
             loop.taskState().abortController().abort();
-            log.info("[SendMessageTool] shutdown approve: abort 生命周期控制器 agent={}（in-process teammate 退出）",
-                    agentName);
+            log.info("[SendMessageTool] shutdown approve: abort 生命周期控制器 agent={} agentId={}"
+                    + "（in-process teammate 退出）", agentName, agentId);
         } else {
             log.warn("[SendMessageTool] shutdown approve: 未找到 in-process teammate 任务/abortController "
-                    + "agent={}（CC :362-364 同语义，不失败）", agentName);
+                    + "agent={} agentId={}（CC :362-364 同语义，不失败）", agentName, agentId);
         }
         // 3. [team-panel-backend-bugfix2] 自动离开全链路：移除成员 + 释放未完成任务 + 发 member_left
         //   + 同步 team_context.teammates（对齐 CC useInboxPoller.ts:727 removeTeammateFromTeamFile
@@ -887,10 +896,12 @@ public class SendMessageTool implements Tool {
      */
     private AgentToolResult handleShutdownRejection(ToolUseBlock call, String requestId,
                                                     String reason, ToolUseContext ctx) {
-        String agentName = extractAgentNameFromRequestId(requestId);
-        if (agentName == null) {
-            agentName = "teammate";
-        }
+        // [P0-6 · D1③/同根因同修] 与 handleShutdownApproval 用**同一**身份来源 + 同一 requestId 兜底
+        //   （CC SendMessageTool.ts:434-439 同款）。原实现只解析 request_id ⇒ 同一断链（回落到
+        //   字面量 "teammate"）⇒ team-lead 邮箱里的 shutdown_rejected 的 from/message 是 "teammate"
+        //   而不是真实成员名。
+        ShutdownActor actor = resolveShutdownActor(ctx, requestId);
+        String agentName = actor.agentName();
         String teamName = resolveTeamName(ctx);
         try {
             TeammateMailbox.ShutdownRejectedMessage rejected =
@@ -1029,6 +1040,41 @@ public class SendMessageTool implements Tool {
     }
 
     /**
+     * shutdown 决策主体（approve / reject 共用）· [P0-6 · D1①] 身份来源单点化。
+     *
+     * <p>WHY 单一来源：approve 与 reject 是同一能力的两个分支，若各自实现身份解析就会重演本仓
+     * 「同一能力两套判据」的历史缺陷 —— 一处修好、另一处仍哑。
+     *
+     * @param agentId   全形 agentId（name@team）；仅 ctx 有身份时非 null
+     * @param agentName 裸 agent 名（恒非 null；ctx 无身份时为 request_id 反解值或字面量 "teammate"）
+     */
+    private record ShutdownActor(String agentId, String agentName) {}
+
+    /**
+     * [P0-6 · D1①] 解析 shutdown 决策主体 —— <b>显式 ctx 身份优先，request_id 反解降级为兜底</b>。
+     *
+     * <p>对齐 CC：{@code SendMessageTool.ts:338-343,388} 用 {@code getAgentId()/getAgentName()}，
+     * <b>不解析 request_id</b>。本仓保留反解仅覆盖 ctx 无身份的历史/测试路径（否则该路径变哑）。
+     */
+    private ShutdownActor resolveShutdownActor(ToolUseContext ctx, String requestId) {
+        TeammateIdentity self = identityOf(ctx);
+        String agentName = self != null ? self.agentName() : null;
+        String agentId = self != null ? self.agentId() : null;
+        if (agentName == null || agentName.isBlank()) {
+            agentName = extractAgentNameFromRequestId(requestId);
+            agentId = null;
+            if (log.isDebugEnabled()) {
+                log.debug("[SendMessageTool] shutdown 决策身份：ctx 无身份，降级 request_id 反解 agent={}（requestId={}）",
+                        agentName, requestId);
+            }
+        }
+        if (agentName == null) {
+            agentName = "teammate";
+        }
+        return new ShutdownActor(agentId, agentName);
+    }
+
+    /**
      * W8-GAP-02: 从 request_id 提取被 shutdown 的 teammate 名 · 对齐 CC agentId.ts:62-84
      * generateRequestId（{type}-{ts}@{agentId}）+ parseRequestId。
      *
@@ -1051,17 +1097,35 @@ public class SendMessageTool implements Tool {
      * W8-GAP-02: 经 registry 找 in-process teammate loop · 对齐 CC findTeammateTaskByAgentId
      * （InProcessTeammateTask.tsx:92-108，偏好 running/存活）。未注入 spawnInProcess 时返回 null
      * （测试/手动直构，approve 路径降级为仅写确认，对齐 CC :362-364 不失败）。
+     *
+     * <p>[P0-6 · D1①] 主用 {@code findByAgentId(agentId)}（CC 同键 = {@code identity.agentId}）；
+     * agentId 为 null（ctx 无身份）时才降级到裸名 {@code findByAgentName(agentName)}。
+     *
+     * @param agentId   全形 agentId（name@team）；ctx 无身份时为 null
+     * @param agentName 裸 agent 名（兜底键）
      */
-    private AutonomousAgentLoop findTeammateLoop(String agentName) {
-        if (agentName == null || spawnInProcess == null) {
+    private AutonomousAgentLoop findTeammateLoop(String agentId, String agentName) {
+        if (spawnInProcess == null) {
             return null;
         }
         InProcessTeammateTaskRegistry registry = spawnInProcess.registry();
         if (registry == null) {
             return null;
         }
-        Optional<AutonomousAgentLoop> loop = registry.findByAgentName(agentName);
-        return loop.orElse(null);
+        if (agentId != null && !agentId.isBlank()) {
+            Optional<AutonomousAgentLoop> byId = registry.findByAgentId(agentId);
+            if (byId.isPresent()) {
+                return byId.get();
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("[SendMessageTool] findTeammateLoop: findByAgentId 未命中，降级裸名兜底 agentId={} agent={}",
+                        agentId, agentName);
+            }
+        }
+        if (agentName == null) {
+            return null;
+        }
+        return registry.findByAgentName(agentName).orElse(null);
     }
 
     /**
