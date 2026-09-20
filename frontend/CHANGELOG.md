@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.16] - 2026-09-20
+
+### 修复
+- 修复 0.1.15 安装后 app 无法启动的 bug。
+
 ## [0.1.15] - 2026-09-20
 
 ### 修复

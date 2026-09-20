@@ -27,6 +27,15 @@ export default defineConfig({
           port: 1421,
         }
       : undefined,
+    // 后端单一来源：dev 下前端走相对路径（src/api/base.ts 的 API_BASE / API_V1_BASE / WS_BASE /
+    //   SOCKJS_BASE），由本 proxy 转发到本机后端 3458。⛔ ws/sockjs 两条必须 ws:true（升级转发），
+    //   否则 STOMP 连不上 → socket.ts 的原生 WS 会一直失败并降级 SockJS，SockJS 也失败则整条会话流断。
+    //   打包版不走本 proxy（WebView 用绝对地址，见 base.ts 分环境说明）。
+    proxy: {
+      '/api': { target: 'http://localhost:3458', changeOrigin: true },
+      '/ws': { target: 'http://localhost:3458', changeOrigin: true, ws: true },
+      '/ws-sockjs': { target: 'http://localhost:3458', changeOrigin: true, ws: true },
+    },
     watch: {
       ignored: ['**/src-tauri/**'],
     },

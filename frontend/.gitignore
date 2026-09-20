@@ -33,3 +33,4 @@ npm-debug.log*
 # 浏览器扩展 popup（Chrome action default_popup 引用；否则 clone/发布缺文件 Chrome 报错）
 !extension/popup.html
 .claude/worktrees/
+scripts/.minio-credentials.json
