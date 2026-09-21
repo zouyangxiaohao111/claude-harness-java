@@ -2,12 +2,14 @@ package com.nexusai.application.agent.permission;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.application.agent.memory.AutoMemPaths;
 import com.nexusai.application.agent.permission.check.RuleQuery;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.nio.file.Paths;
@@ -53,13 +55,20 @@ import java.util.Set;
  *       （[S08] pathsToCheck）。</li>
  *   <li><b>1.6 范围校验常量</b>：CLAUDE_FOLDER_PERMISSION_PATTERN（'/.claude/**'）与
  *       GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN（'~/.claude/**'）取自 CC
- *       FileEditTool/constants.ts:5/:8（slice(0,-2) = '…/.claude/' 前缀比较）。</li>
+ *       FileEditTool/constants.ts:5/:8（slice(0,-2) = '…/.claude/' 前缀比较）。
+ *       <b>[同源修复]</b> 接受集另含 {@link #skillScopeRoots} 产出的 skill scope 前缀
+ *       （与 {@link #getClaudeSkillScope} 单点同源）——修复「产出
+ *       '~/.{appName}/skills/{name}/**' 被消费侧拒收 ⇒ 会话授权永不生效」的前缀漂移缺陷。</li>
  *   <li><b>建议（suggestions）兜底已实现（GAP-3）</b>：兜底 ask 现附
  *       {@link PermissionUpdates#generateSuggestions} 的 write 分支
  *       （filesystem.ts:1448-1463）——default/plan mode 建议 SetMode(acceptEdits)，
- *       工作目录外再建议 AddDirectories。1.7 安全检查 ask 仍传 {@code List.of()}
- *       （CC :1307-1327 用 getClaudeSkillScope 的 session-scoped addRules 建议，
- *       该 skill-scope 等价物 Java 未实现，属独立 RETAIN-gap，非本类职责）。</li>
+ *       工作目录外再建议 AddDirectories。1.7 安全检查 ask 与兜底 ask <b>同口径</b>：
+ *       skill scope 命中 → session-scoped addRules（{@link #getClaudeSkillScope}，
+ *       CC :1313-1326）；未命中 → 回落 generateSuggestions
+ *       （{@link #safetyAskSuggestions}，CC :1327）。⛔ <b>两条分支均不得传
+ *       {@code List.of()}</b>：空建议 ⇒ 前端「一键授权」第三档不渲染
+ *       （PermissionBubble.tsx:97 / permissionSuggestionLabels.ts:253）。1.6 消费侧与
+ *       skill 建议产出侧单点同源（{@link #skillScopeRoots}）。</li>
  *   <li><b>[S08] symlink 路径展开已实现</b>：{@link PermissionPaths#getPathsForPermissionCheck}
  *       （CC fsOperations.ts:288-382 等价物）在 deny/safety/ask/working-dir 检查前展开
  *       original+symlink 全路径并遍历（CC filesystem.ts:1219-1221 precomputedPathsToCheck
@@ -104,6 +113,51 @@ public class WritePermissionChecker {
      * 全局 ~/.claude/ 会话授权前缀。
      */
     private static final String GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN = "~/.claude/**";
+
+    /**
+     * {@link #CLAUDE_FOLDER_PERMISSION_PATTERN} 的 {@code slice(0, -2)} 展开（CC 原实现即
+     * {@code pattern.slice(0, -2)}，FileEditTool/constants.ts:5）—— 文件夹级前缀
+     * {@code '/.claude/'}。仅作可读性分解，语义与
+     * {@code CLAUDE_FOLDER_PERMISSION_PATTERN.substring(0, len - 2)} 逐字节相同。
+     */
+    private static final String CLAUDE_FOLDER_ROOT_PREFIX =
+        CLAUDE_FOLDER_PERMISSION_PATTERN.substring(
+            0, CLAUDE_FOLDER_PERMISSION_PATTERN.length() - 2);
+
+    /**
+     * {@link #GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN} 的 {@code slice(0, -2)} 展开
+     * （CC FileEditTool/constants.ts:8）—— 文件夹级前缀 {@code '~/.claude/'}。
+     */
+    private static final String GLOBAL_CLAUDE_FOLDER_ROOT_PREFIX =
+        GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN.substring(
+            0, GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN.length() - 2);
+
+    /**
+     * [T2 · 写侧 auto-mem 基址] auto-memory 路径解析（<b>写</b> carve-out · 对齐 CC
+     * {@code checkEditableInternalPath} 的 memdir 写分支（仓内既有注释口径 filesystem.ts:1572-1581，
+     * 见 {@code PathValidation} 同分支注释），reason 文案 {@code "auto memory files are allowed for writing"}）。
+     *
+     * <p><b>WHY 必须有本字段</b>：{@link PathValidationEnv#fromToolUseContext} 构造时把
+     * {@code hasAutoMemPathOverride=false} / {@code autoMemBaseDir=null} 硬编码（工厂是 read/write
+     * 共用的纯静态派生，拿不到注入 bean），唯一填充口是 {@link PathValidationEnv#withAutoMem}。
+     * 读侧 {@code ReadPermissionChecker} 早已在同一处调用点 wither 填充（ReadPermissionChecker.java:284-285），
+     * 写侧此前<b>没有</b>任何基址来源 ⇒ {@code PathValidation.isAutoMemPath} 在 {@code base==null}
+     * 时恒返回 false ⇒ CC 那条写 carve-out <b>结构性不可达</b>，写
+     * {@code <memoryBase>/projects/<slug>/memory/*.md} 永远落到 1.7 safety Ask（每次写记忆都弹窗 ⇒
+     * 记忆提取链被用户交互打断）。
+     *
+     * <p>本字段 = <b>与读侧同一个 Spring bean</b>（{@code ToolRegistrationConfig#autoMemPaths}，
+     * 全仓单例）⇒ ⛔ 不新起第二套路径算法。{@code @Autowired(required=false)}：无 bean（POJO /
+     * 未装配）时 {@code withAutoMem(null)} 直接 return this，行为与接线前<b>逐字节一致</b>
+     * （fail-closed，不伪造基址）。
+     */
+    @Autowired(required = false)
+    private AutoMemPaths autoMemPaths;
+
+    /** 显式注入槽（镜像 {@code ReadPermissionChecker.setAutoMemPaths}）· 供非 Spring 测试装配。 */
+    public void setAutoMemPaths(AutoMemPaths autoMemPaths) {
+        this.autoMemPaths = autoMemPaths;
+    }
 
     /**
      * 对齐 CC {@code checkWritePermissionForTool(tool, input, toolPermissionContext)}
@@ -187,9 +241,16 @@ public class WritePermissionChecker {
 
         // ── 1.5 内部可编辑路径白名单（CC :1241-1250 checkEditableInternalPath）──
         // OPD-WF5-02-02：委派核心 PathValidation.checkEditableInternalPath（scratchpad / job /
-        // launch.json；plan 按 OD-20 passthrough 写盘仍走 ask；agent-memory / auto-memory 分支
-        // 在工具层 EditFileTool/WriteFileTool 已实现，先于本 checker 执行，核心不重复）。
-        PathValidationEnv editEnv = PathValidationEnv.fromToolUseContext(ctx);
+        // launch.json；plan 按 OD-20 passthrough 写盘仍走 ask；agent-memory 分支在工具层
+        // EditFileTool/WriteFileTool 已实现，先于本 checker 执行，核心不重复）。
+        // [T2 · 写侧 auto-mem 基址] auto-memory 分支必须由核心层接管：CC filesystem.ts:1572-1581
+        //   的写 carve-out（`!hasAutoMemPathOverride && isAutoMemPath(p)` →
+        //   "auto memory files are allowed for writing"）判定在核心层，其基址只能经本 wither 填入
+        //   （工厂硬编码 null ⇒ 不填则 isAutoMemPath 恒 false、该分支结构性不可达、写记忆恒落 1.7
+        //   safety Ask）。逐字镜像读侧 ReadPermissionChecker.java:284-285 的同一接线，⛔ 不另起路径算法；
+        //   autoMemPaths==null（未装配）时 withAutoMem 直接 return this ⇒ 与接线前行为一致（fail-closed）。
+        PathValidationEnv editEnv = PathValidationEnv.fromToolUseContext(ctx)
+            .withAutoMem(autoMemPaths);
         PathValidation.InternalPathResult internalEdit = PathValidation.checkEditableInternalPath(expanded, editEnv);
         if (internalEdit.allowed()) {
             if (log.isDebugEnabled()) {
@@ -209,7 +270,10 @@ public class WritePermissionChecker {
         }
 
         // ── 1.7 checkPathSafetyForAutoEdit（CC :1302-1338，安全检查在 allow 规则之前；遍历全部展开路径） ──
-        PermissionResult safety = checkPathSafetyForAutoEdit(pathsToCheck, path, ctx);
+        // expanded 透传：1.7 的 generateSuggestions 回落需要已展开绝对路径
+        // （CC 传原始 path，但其 getDirectoryForPath 内部自行 expandPath；本仓
+        //  PermissionUpdates.getDirectoryForPath 反过来要求入参已展开，见其 javadoc）。
+        PermissionResult safety = checkPathSafetyForAutoEdit(pathsToCheck, path, expanded, ctx);
         if (safety != null) {
             return safety;
         }
@@ -344,11 +408,20 @@ public class WritePermissionChecker {
      *
      * <p>语义：仅查 <b>session</b> 桶的 edit allow 规则（CC 用
      * {@code alwaysAllowRules: {session: ...}} 构造 session-only 上下文，:1262-1272），
-     * 命中后做范围校验（ruleContent 必须以 '/.claude/' 或 '~/.claude/' 开头、不含 '..'、
-     * 以 '/**' 结尾，CC :1281-1290）——防止会话级授权借 '/.claude/../**' 逃逸到
+     * 命中后做范围校验（ruleContent 须以 CC 文件夹级前缀 '/.claude/' 或 '~/.claude/' 开头、
+     * <b>或</b>以与 {@link #getClaudeSkillScope} 同源的 skill scope 前缀
+     * （{@link #skillScopeRoots}，含 nexusai 自有根 '~/.{appName}/skills/'）开头，
+     * 不含 '..'、以 '/**' 结尾，CC :1281-1290）——防止会话级授权借 '/.claude/../**' 逃逸到
      * .claude/ 之外，也防止非 session 源规则绕过安全检查。
      *
-     * @param cwd  校验基准 cwd（root-relative 匹配根锚定，CC getOriginalCwd 等价）
+     * <p><b>同源约束（本方法的存在理由之一）</b>：接受的前缀集合必须与
+     * {@link #getClaudeSkillScope} 产出的前缀集合同源。历史缺陷：产出侧第三条 pattern
+     * {@code '~/.{appName}/skills/<name>/**'} 因消费侧硬编码 {'/.claude/','~/.claude/'}
+     * 结构上必被拒 → 落 1.7 safety Ask（自有根段判危险目录）→ 步骤 4（edit allow rule）不可达
+     * ⇒ 用户确认过的会话授权永不生效，每次同类调用重新弹窗。
+     *
+     * @param cwd  校验基准 cwd（root-relative 匹配根锚定，CC getOriginalCwd 等价；
+     *             同时供 {@link #skillScopeRoots} 的 project 段配对使用，其 prefix 与 cwd 无关）
      * @return Allow 或 null（未命中/范围校验失败 → 继续 1.7 安全检查）
      */
     private PermissionResult checkClaudeFolderSessionAllow(
@@ -369,16 +442,22 @@ public class WritePermissionChecker {
             return null;
         }
         String content = rule.ruleValue().ruleContent();
+        // 接受集 = CC 两个「文件夹级」前缀（filesystem.ts:1281-1290）
+        //   ∪ 与产出侧 getClaudeSkillScope 同源的 skill scope 前缀（修前缀漂移）。
+        // ⛔ 刻意不对 CC 那两个前缀做「skills 级收窄」：CC 接受 '/.claude/' 本身，收窄成
+        //   '/.claude/skills/' 会把 '/.claude/agents/**' 这类会话授权从 1.6 放行降级为 1.7 ask，
+        //   属偏离 CC 的行为回退（规则七：显式择优，不折中调和）。
         boolean scopeOk = content != null
-            && (content.startsWith(CLAUDE_FOLDER_PERMISSION_PATTERN.substring(
-                    0, CLAUDE_FOLDER_PERMISSION_PATTERN.length() - 2))
-                || content.startsWith(GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN.substring(
-                    0, GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN.length() - 2)))
+            && (content.startsWith(CLAUDE_FOLDER_ROOT_PREFIX)
+                || content.startsWith(GLOBAL_CLAUDE_FOLDER_ROOT_PREFIX)
+                || startsWithSkillScopePrefix(content, cwd))
+            // ⛔ 护栏①：'..' 拒绝（防 '/.claude/../**' 逃逸到文件夹之外）——不得放宽
             && !content.contains("..")
+            // ⛔ 护栏②：'/ **' 结尾（须是目录级授权，非裸前缀/具体文件）——不得放宽
             && content.endsWith("/**");
         if (!scopeOk) {
             if (log.isDebugEnabled()) {
-                log.debug("[WritePermissionChecker] .claude/** session allow 范围校验失败（'..' 或非 .claude 前缀或非 /** 结尾）→ 继续安全检查: content={} path={}",
+                log.debug("[WritePermissionChecker] session allow 范围校验失败（'..' 或前缀不在接受集或非 /** 结尾）→ 继续安全检查: content={} path={}",
                     content, path);
             }
             return null;
@@ -408,16 +487,20 @@ public class WritePermissionChecker {
      * </ol>
      *
      * @param pathsToCheck 展开路径集合（original + symlink 全路径）
-     * @param rawPath      原始 input 路径（用于消息展示）
-     * @param ctx          工具调用上下文（{cwd}/.claude/{commands,agents,skills} 判定用）
+     * @param rawPath      原始 input 路径（skill scope 判定 + 消息展示；getClaudeSkillScope 内部自行 expandPath）
+     * @param expanded     已展开绝对路径（回落的 generateSuggestions 用；⛔ 不可传 rawPath，
+     *                     见 {@link #safetyAskSuggestions} 的「第一实参」说明）
+     * @param ctx          工具调用上下文（{cwd}/.claude/{commands,agents,skills} 判定 + 建议生成用）
      * @return Ask 或 null（全部通过）
      */
     private PermissionResult checkPathSafetyForAutoEdit(
-            List<String> pathsToCheck, String rawPath, ToolUseContext ctx) {
-        // 1.7 建议（CC :1307-1327）：path 在 .claude/skills/{name}/ 内 → getClaudeSkillScope
-        //    session-scoped addRules 建议（OPD-WF5-FS-018）；否则维持空建议（generateSuggestions
-        //    兜底为既有 RETAIN-gap，非本方法职责）。
-        List<PermissionUpdate> skillSuggestions = skillScopeSuggestions(rawPath, ctx);
+            List<String> pathsToCheck, String rawPath, String expanded, ToolUseContext ctx) {
+        // 1.7 建议（CC :1312-1327）：path 在 .claude/skills/{name}/ 内 → getClaudeSkillScope
+        //    session-scoped addRules 建议（OPD-WF5-FS-018）；否则回落 generateSuggestions
+        //    （filesystem.ts:1327）。⛔ 不得退回 List.of()：空建议 ⇒ 前端「一键授权」第三档
+        //    不渲染（PermissionBubble.tsx:97），用户点什么都生不出规则。
+        List<PermissionUpdate> safetySuggestions =
+            safetyAskSuggestions(rawPath, expanded, pathsToCheck, ctx);
         // 1. 可疑 Windows 路径模式（CC :630-639，classifierApprovable=false）
         // OPD-WF5-02-01：委派 PathValidation.hasSuspiciousWindowsPathPattern（7 类全查）。
         for (String pathToCheck : pathsToCheck) {
@@ -430,7 +513,7 @@ public class WritePermissionChecker {
                     "Claude 请求写入含可疑 Windows 路径模式的文件 " + rawPath + "，需用户确认",
                     new PermissionDecisionReason.SafetyCheck(
                         "Path contains suspicious Windows-specific patterns", false),
-                    skillSuggestions, rawPath, null, null, false, null, List.of());
+                    safetySuggestions, rawPath, null, null, false, null, List.of());
             }
         }
         // 2. Claude 配置文件（CC :641-650，classifierApprovable=true）
@@ -443,7 +526,7 @@ public class WritePermissionChecker {
                 return new PermissionResult.Ask(
                     "Claude 请求写入 " + rawPath + "，但尚未授权",
                     new PermissionDecisionReason.SafetyCheck("Claude config file path", true),
-                    skillSuggestions, rawPath, null, null, false, null, List.of());
+                    safetySuggestions, rawPath, null, null, false, null, List.of());
             }
         }
         // 3. 危险文件/目录（CC :652-661，classifierApprovable=true）
@@ -456,7 +539,7 @@ public class WritePermissionChecker {
                 return new PermissionResult.Ask(
                     "Claude 请求编辑 " + rawPath + "，属敏感文件",
                     new PermissionDecisionReason.SafetyCheck("Path is a sensitive file", true),
-                    skillSuggestions, rawPath, null, null, false, null, List.of());
+                    safetySuggestions, rawPath, null, null, false, null, List.of());
             }
         }
         return null;
@@ -477,6 +560,89 @@ public class WritePermissionChecker {
     private record SkillScope(String skillName, String pattern) {}
 
     /**
+     * skill scope 根配对 · <b>单点同源</b>：一组 {@code (base, prefix)} ——
+     * {@code base} 用于匹配展开后的绝对路径（{@link #getClaudeSkillScope} 消费），
+     * {@code prefix} 用于拼出会话授权 ruleContent（{@link #getClaudeSkillScope} 产出，
+     * {@link #checkClaudeFolderSessionAllow} 1.6 消费）。
+     *
+     * <p><b>WHY 必须成对承载</b>：两侧若各自字面维护（历史形态 = 两个平行数组 + 消费侧硬编码
+     * {{'/.claude/','~/.claude/'}}），第三组前缀（nexusai 自有根）就会漂移 —— 产出侧写出
+     * {@code '~/.{appName}/skills/<name>/**'}，消费侧收不下 ⇒ 用户确认过的会话规则永不生效。
+     * ⛔ 不得退回两个平行数组。
+     *
+     * @param base   绝对路径匹配基（POSIX 归一；大小写不敏感比较由调用方 {@code toLowerCase} 做）
+     * @param prefix 会话授权模式前缀（{@code pattern = prefix + skillName + "/**"}）
+     */
+    private record SkillRoot(String base, String prefix) {}
+
+    /**
+     * skill scope 三条根配对 · <b>1.6 消费侧与 getClaudeSkillScope 产出侧的唯一来源</b>。
+     *
+     * <p>三条根（CC {@code getClaudeSkillScope} filesystem.ts:101-157 的两条 + nexusai 自有根
+     * 扩展，决策 D1/D6）：
+     * <ol>
+     *   <li>project base = {@code {cwd}/.claude/skills}，prefix {@code '/.claude/skills/'}；</li>
+     *   <li>global base = {@code {user.home}/.claude/skills}，prefix {@code '~/.claude/skills/'}；</li>
+     *   <li>nexusai 自有根 base = {@code {user.home}/.{appName}/skills}，prefix
+     *       {@code '~/.{appName}/skills/'}（nexusai 复刻版 .claude 改造）。</li>
+     * </ol>
+     *
+     * <p>⛔ <b>必须是方法不能是 static final 常量</b>：{@code appName} 与 {@code cwd} 运行时可变
+     * （{@link NexusaiPaths#setAppNameOverride} / {@code CwdResolution}），静态常量会在
+     * {@code spring.application.name} 注入前被固化 —— 时序纪律同
+     * {@link NexusaiPaths#getAppTempDirName()}。
+     *
+     * @param cwd       校验基准 cwd（null/空 → 经 sessionId 显式解析，见 {@link CwdResolution#getCwd}）
+     * @param sessionId 会话 ID（cwd 缺省时的显式来源；null = 无会话 → 进程 user.dir）
+     * @return 三条配对（顺序稳定：project → global → nexusai 自有根）
+     */
+    private static List<SkillRoot> skillScopeRoots(String cwd, String sessionId) {
+        // [批 3c] cwd 缺省 → 显式 sessionId 解析（原经裸 MDC 的无参重载已删）；sessionId 亦空
+        //   → 进程 user.dir（调用方 cwdOf(ctx) 恒非 null，此分支仅显式传空 cwd 的调用方命中）。
+        String cwdPosix = toPosix(cwd != null && !cwd.isEmpty()
+            ? cwd : CwdResolution.getCwd(sessionId));
+        String homePosix = toPosix(System.getProperty("user.home", ""));
+        // 决策 D1/D6 全动态：用户级 nexusai 自有根 = NexusaiPaths.getAppConfigHomeDir()（~/.{appName}），
+        // 其 skills 目录与 ~/.claude/skills 等价，加入 global base（nexusai 复刻版 .claude 改造）。
+        String nexusaiHomePosix = toPosix(NexusaiPaths.getAppConfigHomeDir());
+        return List.of(
+            new SkillRoot(cwdPosix + "/.claude/skills", "/.claude/skills/"),
+            new SkillRoot(homePosix + "/.claude/skills", "~/.claude/skills/"),
+            new SkillRoot(nexusaiHomePosix + "/skills",
+                "~/" + NexusaiPaths.getProjectDirName() + "/skills/"));
+    }
+
+    /**
+     * 1.6 范围校验的 skill scope 前缀判定 · <b>与产出侧同源</b>。
+     *
+     * <p>{@link #getClaudeSkillScope}（产出：{@code prefix + skillName + "/**"}）与本方法（消费）
+     * 共用 {@link #skillScopeRoots} 的 prefix 集合，消除「产出
+     * {@code ~/.{appName}/skills/<name>/**} 却被消费侧 {'/.claude/','~/.claude/'} 拒收」的漂移 ——
+     * 该漂移使会话授权规则永不生效（用户确认后每次同类调用重新弹窗；实机证据：
+     * {@code sessions.session_permission_rules} 已写入
+     * {@code {"toolName":"Edit","ruleContent":"~/.nexusai/skills/tbox-generator/**"}} 仍弹）。
+     *
+     * <p>⛔ 只放宽「前缀集合」这一处；{@code '..'} 与 {@code '/**'} 两条护栏不得动。
+     * ⛔ 前缀必须停在 {@code skills/}：退化为 {@code '~/.{appName}/'} 会把自有根下
+     * settings.json 一并放行，属扩大豁免面。
+     *
+     * @param content ruleContent（可为 null）
+     * @param cwd     校验基准 cwd（仅供 skillScopeRoots 的 project 段配对；prefix 与 cwd 无关）
+     * @return true = content 以任一同源 skill scope 前缀开头
+     */
+    private static boolean startsWithSkillScopePrefix(String content, String cwd) {
+        if (content == null) {
+            return false;
+        }
+        for (SkillRoot root : skillScopeRoots(cwd, null)) {
+            if (content.startsWith(root.prefix())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 会话级 skill 写保护窄化建议 · 对齐 CC {@code getClaudeSkillScope}
      * （filesystem.ts:101-157）：path 在项目/全局 {@code .claude/skills/{name}/} 内时，
      * 返回 skillName + 会话级 allow 模式（pattern = 前缀 + skillName + '/**'），供 1.7
@@ -486,7 +652,9 @@ public class WritePermissionChecker {
      * <p>语义细节（读 CC 实际源码，非注释）：
      * <ul>
      *   <li>project base = cwd/.claude/skills（prefix '/.claude/skills/'），
-     *       global base = homedir/.claude/skills（prefix '~/.claude/skills/'）（:107-116）</li>
+     *       global base = homedir/.claude/skills（prefix '~/.claude/skills/'）（:107-116），
+     *       另加 nexusai 自有根 {user.home}/.{appName}/skills（prefix '~/.{appName}/skills/'，决策 D1/D6）
+     *       —— 三组配对统一由 {@link #skillScopeRoots} 产出，1.6 消费侧共用同一集合</li>
      *   <li>skillName 取 base 后第一段，需有分隔符（直接 skills/ 下的文件无 scope，:134-136）</li>
      *   <li>拒绝遍历（skillName 含 '..'，对齐 1.6 ruleContent.includes('..') guard，:138-144）、
      *       拒绝 '.'/空、拒绝 glob 元字符 [*?[\]]（防根目录通配模式匹配所有 skill，:150）</li>
@@ -507,26 +675,10 @@ public class WritePermissionChecker {
             return null;
         }
         String absolutePathLower = absolutePath.toLowerCase();
-        // [批 3c] cwd 缺省 → 显式 sessionId 解析（原经裸 MDC 的无参重载已删）；sessionId 亦空
-        //   → 进程 user.dir（调用方 cwdOf(ctx) 恒非 null，此分支仅显式传空 cwd 的调用方命中）。
-        String cwdPosix = toPosix(cwd != null && !cwd.isEmpty()
-            ? cwd : CwdResolution.getCwd(sessionId));
-        String homePosix = toPosix(System.getProperty("user.home", ""));
-        // 决策 D1/D6 全动态：用户级 nexusai 自有根 = NexusaiPaths.getAppConfigHomeDir()（~/.{appName}），
-        // 其 skills 目录与 ~/.claude/skills 等价，加入 global base（nexusai 复刻版 .claude 改造）。
-        String nexusaiHomePosix = toPosix(NexusaiPaths.getAppConfigHomeDir());
-        String[] bases = {
-            cwdPosix + "/.claude/skills",
-            homePosix + "/.claude/skills",
-            nexusaiHomePosix + "/skills"
-        };
-        String[] prefixes = {
-            "/.claude/skills/",
-            "~/.claude/skills/",
-            "~/" + NexusaiPaths.getProjectDirName() + "/skills/"
-        };
-        for (int b = 0; b < bases.length; b++) {
-            String dirLower = bases[b].toLowerCase();
+        // 单点同源：base/prefix 配对由 skillScopeRoots 产出（⛔ 不再维护两个平行字面数组 ——
+        //   历史缺陷即 base[2]/prefixes[2] 与 1.6 消费侧硬编码前缀三方不同步）。
+        for (SkillRoot root : skillScopeRoots(cwd, sessionId)) {
+            String dirLower = root.base().toLowerCase();
             if (!absolutePathLower.startsWith(dirLower + "/")) {
                 continue;
             }
@@ -543,32 +695,85 @@ public class WritePermissionChecker {
             if (skillName.matches(".*[*?\\[\\]].*")) {
                 return null;
             }
-            return new SkillScope(skillName, prefixes[b] + skillName + "/**");
+            return new SkillScope(skillName, root.prefix() + skillName + "/**");
         }
         return null;
     }
 
     /**
-     * 1.7 安全检查建议 · 对齐 CC filesystem.ts:1312-1327：skill scope 命中 →
-     * {@code addRules: [Edit(prefix+skillName+'/**')] session allow}（窄化授权单个 skill）；
-     * 未命中 → 空建议。
+     * 1.7 安全检查 ask 建议 · 对齐 CC {@code filesystem.ts:1312-1327}：
+     * <ol>
+     *   <li>skill scope 命中（{@link #getClaudeSkillScope}）→
+     *       {@code addRules: [Edit(prefix+skillName+'/**')] session allow}
+     *       （窄化授权单个 skill，CC :1313-1326）；</li>
+     *   <li>未命中 → {@code generateSuggestions(path, 'write', toolPermissionContext, pathsToCheck)}
+     *       （CC :1327）—— 逐字对齐第二实参<b>字面量 {@code 'write'}</b>（CC :1327 原文，
+     *       ⛔ 非按操作类型推导；CC generateSuggestions :1453 {@code write || create} 同分支）。</li>
+     * </ol>
+     *
+     * <p><b>WHY 必须回落（恒非空建议）</b>：前端「一键授权」第三档仅在 suggestions 非空时渲染
+     * （PermissionBubble.tsx:97 / permissionSuggestionLabels.ts:253 / useChatSocket.ts:155
+     * 空数组 → null）。空建议 ⇒ 弹窗只剩「允许 / 拒绝」两档 ⇒ 用户点什么都生不出规则，
+     * 与 CC（safety ask 恒附建议）不一致。
+     *
+     * <p><b>第一实参用 {@code expanded} 而非 CC 的原始 {@code path}</b>：CC 的路径展开藏在
+     * {@code getDirectoryForPath} 内部（CC path.ts:109-125 自身 {@code expandPath(path)}）；
+     * 本仓 {@link PermissionUpdates#getDirectoryForPath} 反过来要求「入参恒为已展开的绝对路径」
+     * （见其 javadoc :163）。若直喂 rawPath，相对路径输入下 AddDirectories 会基于相对目录构造，
+     * 偏离 CC 的<b>可观测结果</b>（CC 内部展开后得到绝对目录）。故 Java 侧等价物是 expanded
+     * （与兜底步骤 5 同一惯例，见 {@code check} 的 writeSuggestions 调用点）。
+     *
+     * <p><b>残留（CC 同构，非本仓分歧，如实标注）</b>{@link PermissionUpdates#generateSuggestions}
+     * 的 {@code shouldSuggestAcceptEdits} 判据只认 DEFAULT/PLAN（PermissionUpdates.java:247-248；
+     * CC :1449-1451 同一判据，CC 亦含 'auto' | 'bubble' 内部模式）。故
+     * <b>「工作目录内 + mode ∉ {DEFAULT, PLAN}」一格</b>（含子 Agent 的 {@link PermissionMode#BUBBLE}、
+     * ACCEPT_EDITS / BYPASS_PERMISSIONS / DONT_ASK / AUTO）write 分支仍返回空。工作目录外因
+     * AddDirectories（:257-266）恒非空。⛔ 不得以「顺手放宽判据」的方式私自补掉——那会偏离 CC；
+     * 如需覆盖应作为独立对齐项另行登记。
+     *
+     * @param rawPath     原始 input 路径（skill scope 判定；getClaudeSkillScope 内部 expandPath）
+     * @param expanded    已展开绝对路径（回落的 generateSuggestions 第一实参）
+     * @param pathsToCheck 展开路径集合（CC 第四实参等价物 · isInWorkingDir 判定用）
+     * @param ctx         工具调用上下文（sessionId / mode 来源）
+     * @return 非空建议（skill 命中 → AddRules；否则 → generateSuggestions 结果，见上方残留说明）
      */
-    private static List<PermissionUpdate> skillScopeSuggestions(String rawPath, ToolUseContext ctx) {
+    private static List<PermissionUpdate> safetyAskSuggestions(
+            String rawPath, String expanded, List<String> pathsToCheck, ToolUseContext ctx) {
         String cwd = cwdOf(ctx);
         // [批 3c] sessionId 显式穿透（cwd 缺省时不再经裸 MDC 解析）
         SkillScope scope = getClaudeSkillScope(rawPath, cwd, ctx != null ? ctx.sessionId() : null);
-        if (scope == null) {
+        if (scope != null) {
+            PermissionRule rule = new PermissionRule(
+                PermissionRuleSource.SESSION, PermissionBehavior.ALLOW,
+                PermissionRuleValue.withContent("Edit", scope.pattern()));
+            if (log.isDebugEnabled()) {
+                log.debug("[WritePermissionChecker] getClaudeSkillScope 命中，会话级窄化建议: path={} skill={} pattern={}",
+                    rawPath, scope.skillName(), scope.pattern());
+            }
+            return List.of(new PermissionUpdate.AddRules(
+                PermissionUpdate.Destination.SESSION, List.of(rule), PermissionBehavior.ALLOW));
+        }
+        // 非 skill 路径 → 回落 generateSuggestions（CC filesystem.ts:1327）。
+        if (ctx == null || ctx.permissionContext() == null) {
+            // 防御兜底：唯一调用方 check 已在入口 fail-loud（permissionContext 恒非 null）；
+            // 此分支仅防未来新调用方漏守卫（fail-loud 留痕，⛔ 不静默返回空）。
+            if (log.isWarnEnabled()) {
+                log.warn("[WritePermissionChecker] 1.7 safety ask 缺少 permissionContext，无法生成回落建议: path={}",
+                    rawPath);
+            }
             return List.of();
         }
-        PermissionRule rule = new PermissionRule(
-            PermissionRuleSource.SESSION, PermissionBehavior.ALLOW,
-            PermissionRuleValue.withContent("Edit", scope.pattern()));
+        // 第四实参等价物：CC pathInAllowedWorkingPath(filePath, ctx, pathsToCheck) 的取反
+        // （filesystem.ts:1425-1429 → :689-690 直接用 pathsToCheck，不再二次展开）。
+        boolean outsideWorkingDir = !ReadPermissionChecker.isInWorkingDir(pathsToCheck, ctx);
+        List<PermissionUpdate> fallback = PermissionUpdates.generateSuggestions(
+            expanded, PermissionUpdates.OperationType.WRITE,
+            ctx.permissionContext().mode(), outsideWorkingDir);
         if (log.isDebugEnabled()) {
-            log.debug("[WritePermissionChecker] getClaudeSkillScope 命中，会话级窄化建议: path={} skill={} pattern={}",
-                rawPath, scope.skillName(), scope.pattern());
+            log.debug("[WritePermissionChecker] 1.7 safety ask 非 skill 路径，回落 generateSuggestions: path={} mode={} outsideWorkingDir={} 建议数={}",
+                rawPath, ctx.permissionContext().mode(), outsideWorkingDir, fallback.size());
         }
-        return List.of(new PermissionUpdate.AddRules(
-            PermissionUpdate.Destination.SESSION, List.of(rule), PermissionBehavior.ALLOW));
+        return fallback;
     }
 
     /** POSIX 归一（Windows 反斜杠 → 正斜杠，供 skill scope 路径前缀比较）。 */

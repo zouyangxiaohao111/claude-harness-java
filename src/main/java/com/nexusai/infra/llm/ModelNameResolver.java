@@ -206,6 +206,39 @@ public final class ModelNameResolver {
     }
 
     /**
+     * [T1] 剥掉尾部的 {@code [1m]} 后缀（大小写不敏感）· <b>只产出 DB 查询键，绝不回写任何字段</b>。
+     *
+     * <p><b>WHY</b>：{@code [1m]} 是<b>上下文窗口标记</b>，不是模型身份。本仓既有口径同此：
+     * {@code AgentModelResolver.getCanonicalName}（剥 [1m] + 小写后再判族）、
+     * {@code CompactThresholdSystem.has1mContext}（{@code model.toLowerCase().contains("[1m]")}
+     * 只用来切窗口，不参与身份）。对齐 CC：{@code utils/context.ts:35-40 has1mContext}
+     * （{@code /\[1m\]/i.test(model)}，大小写不敏感）+ {@code utils/model/model.ts:451-454}
+     * （剥 [1m] 后再做模型名比对）。
+     *
+     * <p>会话主力模型名带 {@code [1m]}（如 {@code deepseek-flash[1m]}，
+     * {@code settings.main_model_name} / {@code sessions.model_name} 由前端原样写入），而
+     * {@code models.name} 存的是不带后缀的名字 ⇒ 按字面量精确查必然落空 ⇒
+     * {@code AgentLoopContext.computeBudgetFromGates} 落到硬编码 200_000 兜底。
+     *
+     * @param modelName 原始模型名
+     * @return 剥掉尾部 {@code [1m]} 并 trim 的查询键；无该后缀 / 剥后为空 / null → null
+     */
+    private static String strip1mTag(String modelName) {
+        if (modelName == null) {
+            return null;
+        }
+        String trimmed = modelName.trim();
+        int tagLen = "[1m]".length();
+        int len = trimmed.length();
+        // regionMatches(true, …) = 大小写不敏感（同 SkillModelOverrideResolver 的 [1m] 判定风格）
+        if (len <= tagLen || !trimmed.regionMatches(true, len - tagLen, "[1m]", 0, tagLen)) {
+            return null;
+        }
+        String stripped = trimmed.substring(0, len - tagLen).trim();
+        return stripped.isEmpty() ? null : stripped;
+    }
+
+    /**
      * 按模型名解析 enabled model（统一入口，全名感知）。
      *
      * <p>优先真全名路径：首段命中 providers 表精确前缀（selectOneByQuery eq name）才走联合查
@@ -216,6 +249,14 @@ public final class ModelNameResolver {
      * getMainLoopModel model.ts:92-98 语义：未知名直接传 API，失败即失败，G-2 修复）。
      * 无 /（裸 modelName）或 providerMapper 为 null → 历史兼容路径：按 name 查第一条
      * （enabled=true，ORDER BY provider_id,id 保证确定性——跨提供商同名模型取最小 provider_id 那条）。
+     *
+     * <p>[T1] <b>历史兼容路径容忍尾部 [1m] 后缀</b>：原键未命中且其尾部带 {@code [1m]}（大小写不敏感）
+     * 时，用 {@link #strip1mTag} 剥出的键<b>同语义重查一次</b>（精确键优先、剥后缀键兜底）。
+     * 这解决「会话主力模型名 {@code deepseek-flash[1m]} vs {@code models.name=deepseek-flash}」
+     * 的错配 —— 修复前该错配令 {@code AgentLoopContext.computeBudgetFromGates} 落到硬编码
+     * {@code FALLBACK_TOKEN_BUDGET=200_000}，1M 会话被静默按 20 万计窗口。
+     * <b>只影响查询键</b>：返回的仍是 DB 原记录，剥后名不回写任何字段。真全名路径
+     * （providerName/modelName）<b>不做</b>此剥离，语义不变。
      *
      * @param modelMapper   模型 mapper（调用方持有；null → null）
      * @param providerMapper 提供商 mapper（调用方持有；null → 直接走兼容路径）
@@ -276,6 +317,33 @@ public final class ModelNameResolver {
                 .orderBy("provider_id", true)
                 .orderBy("id", true));
         ModelRecord model = (ms != null && !ms.isEmpty()) ? ms.get(0) : null;
+        // [T1] 查表容忍 [1m] 后缀：原键未命中且原键尾部带 [1m] 时，用剥后键【同语义】重查一次。
+        //   语义 = 精确键优先、剥后缀键兜底（确定性）：
+        //     · 表内确实存在字面量 "foo[1m]" 行 → 第一次即命中，行为与修复前逐字节相同（零回归）；
+        //     · 表内只有 "foo" 行（常态，[1m] 是窗口标记非身份）→ 第二次剥后缀命中。
+        //   为什么不「先剥再查」：那会把 foo[1m] 静默解析到 foo 行，令 1M 会话的窗口被降级成
+        //   foo 行的值（很可能 200k）——正是本次要修的「静默降级」的反向版本。
+        //   为什么重查必须以「剥后键 != 原键」为条件：ModelNameResolverG5Test 的
+        //   verify(modelMapper).selectListByQuery(captor)（默认 times(1)）要求无 [1m] 时不得多发查询。
+        //   对齐 CC：utils/context.ts:35-40 has1mContext + utils/model/model.ts:451-454（剥 [1m] 再比对）。
+        if (model == null) {
+            String stripped = strip1mTag(modelName);
+            if (stripped != null && !stripped.equals(modelName)) {
+                List<ModelRecord> msStripped = modelMapper.selectListByQuery(
+                    QueryWrapper.create()
+                        .eq("name", stripped)
+                        .eq("enabled", true)
+                        .orderBy("provider_id", true)
+                        .orderBy("id", true));
+                model = (msStripped != null && !msStripped.isEmpty()) ? msStripped.get(0) : null;
+                if (model != null) {
+                    // 数据流日志：原键 → 实际查询键 → 命中 modelId（[1m] 只影响查询键，返回值仍是 DB 原记录）
+                    log.info("[ModelNameResolver] [1m] 后缀剥离查表命中: 原键={} → 查键={} modelId={}"
+                            + "（CC model.ts:451-454 剥 [1m] 再比对；只改查询键，不回写任何字段）",
+                        modelName, stripped, model.getId());
+                }
+            }
+        }
         if (model == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[ModelNameResolver] 历史兼容路径未命中: modelName={}", modelName);

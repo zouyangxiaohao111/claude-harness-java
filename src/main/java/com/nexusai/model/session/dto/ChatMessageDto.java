@@ -999,6 +999,33 @@ public record ChatMessageDto(
     }
 
     /**
+     * 拷贝方法：仅替换 {@code isMeta}，其余字段全透传（与 {@link #withIsCompactSummary} /
+     * {@link #withIsVisibleInTranscriptOnly} 同款 record 拷贝模式）。
+     *
+     * <p><b>WHY 需要它（[A1] mcp_instructions_delta 尾部投递）</b>：附件通道产出的 meta 消息
+     * 在 transcript 里必须 {@code isMeta=true}（CC {@code createUserMessage({isMeta:true})}；
+     * 前端只按 {@code isMeta} 隐藏 —— 见 front/src/App.tsx:1864、DialogOpsModal.tsx:24）。
+     * 而 {@code PostCompactAttachmentRestorer.buildAttachmentMessage} 的 envelope 建的是
+     * {@code isMeta=false} ⇒ 投递通道 append 进转录后，用户界面上会多出一条「用户消息」。
+     * 本方法让调用方在**不改 producer 落库形状**的前提下把该标志拨正。
+     *
+     * @param newIsMeta 新的 isMeta 值
+     * @return 与原 record 全字段相同、仅 isMeta 覆盖的新实例
+     */
+    public ChatMessageDto withIsMeta(boolean newIsMeta) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, newIsMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+    }
+
+    /**
      * reasoningDurationMs 拷贝方法：覆盖推理耗时（ms）· 镜像 CC spread {@code {...m, ...}} 语义
      * （净新增字段，CC 无对应）。
      *

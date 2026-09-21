@@ -225,11 +225,41 @@ public record PathValidationEnv(
         // [批 4b-1] 显式传会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）：
         //   本 env 的 effectiveCwd 即 CwdResolution.getCwd(sessionId) 的显式快照。
         String base = autoMemPaths.getAutoMemPath(effectiveCwd);
+        String autoMemBaseDir = base == null ? null : withTrailingSeparator(base);
+        if (log.isDebugEnabled()) {
+            log.debug("[PathValidationEnv] withAutoMem: effectiveCwd={} hasOverride={} autoMemBaseDir={}",
+                effectiveCwd, autoMemPaths.hasAutoMemPathOverride(), autoMemBaseDir);
+        }
         return new PathValidationEnv(sessionId, agentId, effectiveCwd, originalCwd,
             sessionProjectRoot, claudeConfigHomeDir, nexusaiConfigHomeDir, scratchpadEnabled, claudeTempDir,
             autoMemPaths.hasAutoMemPathOverride(),
-            base == null ? null : Path.of(base).normalize().toString(),
+            autoMemBaseDir,
             bundledSkillsRoot);
+    }
+
+    /**
+     * 归一化并<b>保底一个尾分隔符</b>——恢复 CC {@code getAutoMemPath()} 的尾分隔符契约
+     * （memdir/paths.ts:149 {@code (normalized + sep).normalize('NFC')} / :230-232 per-project 分支）。
+     *
+     * <p><b>⛔ 为何这一步存在（防后人当「多余的 + sep」删掉）</b>：CC {@code isAutoMemPath} 是裸
+     * {@code startsWith(getAutoMemPath())}（paths.ts:258-262），它的安全<b>全部</b>押在「autoMemPath 恒带
+     * 尾分隔符」这条契约上。本字段 {@link #autoMemBaseDir} 就是该函数的等价物（见类 javadoc），
+     * 一旦在此被 {@code Path.of(…).normalize()} 吞掉尾分隔符（Java {@code Path#normalize()} 的既有行为，
+     * 本仓实测见 {@code AutoMemPathPrefixBoundaryTest.productionEnv_*}），契约即被<b>生产者侧</b>打断 ⇒
+     * 下游任何裸 startsWith 类判定退化为<b>字符串前缀</b>匹配（{@code <base>-evil/} 被静默放行）。
+     * 消费侧 {@code PathValidation.isAutoMemPath} 已另行改为边界式（双保险），但本字段作为
+     * 「CC 同名函数的等价物」必须保持契约形态 —— 否则字段语义与 javadoc 声明不符，
+     * 并再次为后人的裸前缀判定埋雷。
+     *
+     * @param path 非 null 路径（已由 {@code getAutoMemPath} 归一化为绝对路径）
+     * @return normalize 后带唯一尾分隔符的字符串
+     */
+    private static String withTrailingSeparator(String path) {
+        String normalized = Path.of(path).normalize().toString();
+        // Path#toString 恒以平台分隔符收尾表达（Windows 上 '/' 亦被转为 '\'），故只需查平台分隔符。
+        return normalized.endsWith(java.io.File.separator)
+            ? normalized
+            : normalized + java.io.File.separator;
     }
 
     public PathValidationEnv withBundledSkillsRoot(String root) {

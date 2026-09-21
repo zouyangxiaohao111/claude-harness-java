@@ -5898,6 +5898,25 @@ public class LlmAgentLoop implements AgentLoop {
             // 守卫（方法内）：会话首轮只记录不播报 / 同日无动作 / 无会话标识不追加。
             AgentLoopContext.maybeEmitDateChange(state);
 
+            // ── [A1 · 每轮 mcp_instructions_delta 尾部投递] 对齐 CC attachments.ts:854-863
+            //    `maybe('mcp_instructions_delta', () => getMcpInstructionsDeltaAttachment(...))`
+            //    —— 位于 allThreadAttachments 段（:824-941），与上方 date_change(:830) 同为该段成员，
+            //    且位于下方 changed_files(:871) **之前**（CC 段内相对序：830 → 854 → 871）。
+            // WHY: C4=A2 把 mcp_instructions 改为会话冻结段后，MCP 服务器中途连接/断开不再即时可见
+            //    （要等 /clear 或 /compact）；CC 上游早已没有该 system 段，改走本 delta 尾部附件。
+            // 形态（对齐 2.1.88，⛔ 不抄 2.1.278 的 prefix_delta 死通道）：producer 产出 delta 后经
+            //    `yield attachment; toolResults.push(attachment)`（query.ts:1580-1588）成为会话尾部的
+            //    一条真实消息 ⇒ 必须进【紧接的下一轮请求】，故与 date_change 同置于
+            //    entryModelView / messagesForQuery 快照**之前**（快照随之包含它）。
+            // ⛔ 回写头部同样被禁止：本调用只 append（头部字节不变）。
+            // 门控：无（对齐 2.1.278 —— 2.1.88 的 isMcpInstructionsDeltaEnabled 已在发行产物中删除）
+            //    ⇒ 每轮无条件评估；是否产出仍由「当前连接集 vs 已公告集合」的 diff 决定（内容未变 ⇒ 零追加）。
+            // ⚠️ 该消息**不落库**（ChatService.persistAppendedMessage 的 user 分支无 attachment 出口；
+            //    date_change / edited_text_file 两支兄弟同款）⇒ 只在本 run 内可见，跨 run 会在尾部
+            //    重公告一次 —— 事实与后果见 AgentLoopContext.maybeEmitMcpInstructionsDelta 的「落库事实」段。
+            AgentLoopContext.maybeEmitMcpInstructionsDelta(
+                state, params.toolUseContext(), resolveTurnEffectiveModel(params, recoveryState));
+
             // ── [步骤 7 · 投递层] 变更文件 tails 投递 · 对齐 CC attachments.ts:871
             //    `maybe('changed_files', () => getChangedFiles(context))` ——
             //    位于 allThreadAttachments 段（:824-941），与上方 date_change 同为该段成员，
@@ -6981,6 +7000,16 @@ public class LlmAgentLoop implements AgentLoop {
             //   修 resume 丢壳。MINOR-4 定序：包壳【先于】maybeAppendSnipIdTags —— CC wrapCommandText 先包壳、
             //   appendMessageTagToUserMessage 后追加 [id:xxx]，故 [id] 位于壳外（与 CC 一致）。
             messagesForLlm = wrapQueuedMessagesForApi(messagesForLlm);
+            // ── [A1 · 发送边界渲染] mcp_instructions_delta 的持久化 JSON payload → 人可读文案
+            //    （对齐 CC：附件结构化持久化 + 发送时 normalizeAttachmentForAPI 渲染
+            //      messages.ts:4216-4231；本仓落库的 content 是 producer 的 JSON —— 那是跨轮 diff
+            //      的扫描源 scanAnnouncedDeltaNames，故不能落地时就渲染掉）。
+            //    纯函数替换（withContent，id/role/isMeta/subtype 全透传）⇒ 同一 payload 每轮渲染
+            //    出同一字节 ⇒ 前缀稳定性不受影响；无该 subtype → 原引用（零行为变化）。
+            //    ⚠️ 只作用于 mcp_instructions_delta（本通道引入的 subtype）；deferred_tools_delta /
+            //    agent_listing_delta 两兄弟仍是「注入时渲染、回放面为 JSON」的既有形态，本批⛔未改
+            //    （超出 A1 范围，已登记）。
+            messagesForLlm = AgentLoopContext.maybeRenderDeltaAttachmentsForApi(messagesForLlm);
             // [snip-ccb-align] [id:xxx] tag 注入（对齐 CCB messages.ts:2667-2686 appendMessageTagToUserMessage）：
             //   HISTORY_SNIP 门控给 user 消息（非 isMeta）API 副本末尾追加 [id:<6位短id>]，
             //   让模型能引用消息 ID 调用 SnipTool。只改发送副本（ChatMessageDto.withContent），

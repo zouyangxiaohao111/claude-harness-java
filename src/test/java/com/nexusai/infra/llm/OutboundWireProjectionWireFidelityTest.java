@@ -1,5 +1,6 @@
 package com.nexusai.infra.llm;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.openai.models.ChatCompletionMessageToolCall;
@@ -42,12 +43,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * </ol>
  *
  * <h2>登记：同一类（折叠）的其余点位</h2>
- * <p>逐字段比对 {@code toSdkMessage} / {@code toOpenAiSdkTool} 后，同类折叠只有<b>两处</b>：
+ * <p>逐字段比对 {@code toSdkMessage} / {@code toOpenAiSdkTool} 后，同类折叠只有<b>三处</b>：
  * {@code arguments}（本类 ①②③）与工具的顶层 {@code type}
- * （{@link #toolTopLevelType_absentVsExplicitNull_pairwiseDistinguishable()}）。
- * 其余「投影比 wire 宽」的差异（tool 消息缺 {@code toolCallId}、assistant 的空白
- * {@code id}/{@code name}、system 角色占位等）属<b>有意的超集</b>（类 javadoc「口径一」），
- * 方向只会更严，不产生假阴性，本批不动。
+ * （{@link #toolTopLevelType_absentVsExplicitNull_pairwiseDistinguishable()}），
+ * 以及<b>⑥ 段</b>新钉的「按 role 分派」（旧实现对所有 role 恒带全部字段 = 对 user/assistant
+ * 而言是 wire <b>超集</b> ⇒ 假阳性；本批已改为逐 role 只带 wire 真读的字段）。
+ *
+ * <p>⚠ 仍属<b>有意占位</b>（非超集，是「wire 上整条不存在」的忠实投影）：system 角色 →
+ * {@code FILTERED_SYSTEM}；被 {@code toOpenAiSdkTool} 丢弃的畸形 tool → {@code DROPPED_TOOL}。
+ * 二者保留「条数/顺序对齐」，不参与字段级判据。
  *
  * <p>纯 JUnit：⛔ 无 Spring / 无 {@code @SpringBootTest} / 无真 API / 无真 DB
  * （{@code projectMessage} / {@code toSdkMessage} / {@code fingerprintHead} 均为纯函数）。
@@ -155,6 +159,188 @@ class OutboundWireProjectionWireFidelityTest {
             .isNotEqualTo(absent);
     }
 
+    // ═══════════ ⑥ 按 role 分派：投影字段集必须 = wire 对该 role 真读的字段集 ═══════════
+    //
+    //   ⭐ 本段治的病与 ①②③ 同类（投影 ≠ wire），但方向相反：①②③ 治「投影比 wire 窄 / 折叠过头」
+    //   （假阴性），本段治「投影比 wire 宽」（假阳性 —— 投影变而 wire 没变）。
+    //   ⛔ 判据不看「投影串里有什么」，而是拿【真 wire】（SDK 序列化）做分辨力对照（见 ⑦）。
+
+    @Test
+    @DisplayName("等价重建：四个 role 各造两份全新 DTO（新 id/时间戳）⇒ 投影逐字相同（挡假阳性）")
+    void equivalentRebuild_allRoles_projectionIdentical() {
+        List<JsonNode> blocks = List.of(textBlock("块文字"));
+        for (Role role : Role.values()) {
+            ChatMessageDto a = dtoOf(role, "正文", role == Role.tool ? "tc-1" : null,
+                role == Role.tool ? "反馈" : null, blocks, role == Role.assistant ? toolCalls("tc-1", "Bash", "{}") : List.of());
+            ChatMessageDto b = dtoOf(role, "正文", role == Role.tool ? "tc-1" : null,
+                role == Role.tool ? "反馈" : null, blocks, role == Role.assistant ? toolCalls("tc-1", "Bash", "{}") : List.of());
+            assertThat(b.id()).as("前置：两份 DTO 必须是不同实例、不同 id").isNotEqualTo(a.id());
+            assertThat(OutboundWireProjection.projectMessage(b))
+                .as("role=%s：只有客户端字段（id/createdAt）不同 ⇒ 线级投影必须逐字相同", role)
+                .isEqualTo(OutboundWireProjection.projectMessage(a));
+        }
+    }
+
+    @Test
+    @DisplayName("user：改 acceptFeedback / toolCallId / toolCalls ⇒ 指纹不动（wire 的 user 分支从不读它们）")
+    void user_nonWireFieldsDoNotMoveFingerprint() {
+        ChatMessageDto base = dtoOf(Role.user, "问题", null, null, List.of(), List.of());
+        ChatMessageDto withFeedback = dtoOf(Role.user, "问题", "tc-9", "接受反馈", List.of(), List.of());
+
+        assertThat(msg0Fingerprint(withFeedback))
+            .as("user 的 acceptFeedback/toolCallId/toolCalls 不进 wire ⇒ 改了不得改变指纹（否则假阳性）")
+            .isEqualTo(msg0Fingerprint(base));
+    }
+
+    @Test
+    @DisplayName("user + 可渲染 contentBlocks：改标量 content ⇒ 指纹不动（wire 丢弃它）；改块文字 ⇒ 指纹必变")
+    void user_renderableBlocks_dropScalarContent() {
+        List<JsonNode> blocks = List.of(textBlock("块甲"));
+        ChatMessageDto keep = dtoOf(Role.user, "会被丢弃的正文 A", null, null, blocks, List.of());
+        ChatMessageDto dropped = dtoOf(Role.user, "会被丢弃的正文 B", null, null, blocks, List.of());
+        ChatMessageDto blockChanged = dtoOf(Role.user, "会被丢弃的正文 A", null, null, List.of(textBlock("块乙")), List.of());
+
+        assertThat(msg0Fingerprint(dropped))
+            .as("contentBlocks 能渲染成 parts 时 wire 走 contentOfArrayOfContentParts ⇒ 标量 content 被丢弃，改它不得改指纹")
+            .isEqualTo(msg0Fingerprint(keep));
+        assertThat(msg0Fingerprint(blockChanged))
+            .as("块文字真的上 wire ⇒ 改它必须改指纹")
+            .isNotEqualTo(msg0Fingerprint(keep));
+    }
+
+    @Test
+    @DisplayName("user + 不可渲染 contentBlocks（document）：改块内容 ⇒ 指纹不动（wire 回落标量 content）")
+    void user_nonRenderableBlocks_doNotMoveFingerprint() {
+        List<JsonNode> pdfA = List.of(documentBlock("QUJDRA=="));
+        List<JsonNode> pdfB = List.of(documentBlock("RUZHSA=="));
+        ChatMessageDto a = dtoOf(Role.user, "正文", null, null, pdfA, List.of());
+        ChatMessageDto b = dtoOf(Role.user, "正文", null, null, pdfB, List.of());
+
+        assertThat(msg0Fingerprint(b))
+            .as("document 块被 toSdkUserContentPart 丢弃、wire 回落标量 content ⇒ 改块数据不得改指纹")
+            .isEqualTo(msg0Fingerprint(a));
+    }
+
+    @Test
+    @DisplayName("assistant：改 acceptFeedback / toolCallId / contentBlocks ⇒ 指纹不动；改 content ⇒ 必变")
+    void assistant_nonWireFieldsDoNotMoveFingerprint() {
+        ChatMessageDto base = dtoOf(Role.assistant, "回答", null, null, List.of(),
+            toolCalls("tc-1", "Bash", "{}"));
+        ChatMessageDto nonWireFlipped = dtoOf(Role.assistant, "回答", "tc-zzz", "反馈", List.of(textBlock("块")),
+            toolCalls("tc-1", "Bash", "{}"));
+        ChatMessageDto contentFlipped = dtoOf(Role.assistant, "回答2", null, null, List.of(),
+            toolCalls("tc-1", "Bash", "{}"));
+
+        assertThat(msg0Fingerprint(nonWireFlipped))
+            .as("assistant 分支从不读 acceptFeedback/toolCallId/contentBlocks ⇒ 改了不得改变指纹")
+            .isEqualTo(msg0Fingerprint(base));
+        assertThat(msg0Fingerprint(contentFlipped))
+            .as("content 是 assistant 的 wire 字段 ⇒ 改它必须改指纹")
+            .isNotEqualTo(msg0Fingerprint(base));
+    }
+
+    @Test
+    @DisplayName("tool：改 toolCalls ⇒ 指纹不动；改 toolCallId / acceptFeedback ⇒ 必变（二者真上 wire）")
+    void tool_roleFieldSet() {
+        ChatMessageDto base = dtoOf(Role.tool, "工具输出", "tc-1", null, List.of(), toolCalls("x", "Other", "{}"));
+        ChatMessageDto toolCallsFlipped = dtoOf(Role.tool, "工具输出", "tc-1", null, List.of(),
+            toolCalls("y", "Bash", "{\"a\":1}"));
+        ChatMessageDto idFlipped = dtoOf(Role.tool, "工具输出", "tc-2", null, List.of(), List.of());
+        ChatMessageDto feedbackFlipped = dtoOf(Role.tool, "工具输出", "tc-1", "反馈", List.of(), List.of());
+
+        assertThat(msg0Fingerprint(toolCallsFlipped))
+            .as("tool 分支不读 toolCalls ⇒ 改了不得改变指纹")
+            .isEqualTo(msg0Fingerprint(base));
+        assertThat(msg0Fingerprint(idFlipped))
+            .as("tool_call_id 是 tool 的 wire 字段 ⇒ 改它必须改指纹")
+            .isNotEqualTo(msg0Fingerprint(base));
+        assertThat(msg0Fingerprint(feedbackFlipped))
+            .as("acceptFeedback 在 tool 分支真上 wire（独立 text part）⇒ 改它必须改指纹")
+            .isNotEqualTo(msg0Fingerprint(base));
+    }
+
+    @Test
+    @DisplayName("system：字段全被丢弃 ⇒ 任何改动都不改指纹（占位保条数对齐）")
+    void systemRole_isFilteredPlaceholder() {
+        ChatMessageDto a = dtoOf(Role.system, "A", null, null, List.of(), List.of());
+        ChatMessageDto b = dtoOf(Role.system, "B", "tc-1", "反馈", List.of(textBlock("块")),
+            toolCalls("tc-1", "Bash", "{}"));
+
+        assertThat(OutboundWireProjection.projectMessage(b))
+            .as("system 出站被 toSdkMessage 过滤 ⇒ 占位恒等")
+            .isEqualTo(OutboundWireProjection.FILTERED_SYSTEM)
+            .isEqualTo(OutboundWireProjection.projectMessage(a));
+    }
+
+    // ═══════════ ⑦ 分辨力对照真 wire：投影 ⟺ SDK 出站 JSON（不是「我以为的 wire」） ═══════════
+
+    @Test
+    @DisplayName("⭐ 逐形态：投影的分辨力必须 ⟺ 真 wire（SDK 序列化）的分辨力")
+    void projectionDiscriminationMatchesSdkWire() {
+        List<JsonNode> textA = List.of(textBlock("块甲"));
+
+        // ① user：标量 content（真上 wire）
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.user, "甲", null, null, List.of(), List.of())),
+            List.of(dtoOf(Role.user, "乙", null, null, List.of(), List.of())), "user 标量 content");
+        // ② user：可渲染块时标量 content 被丢弃
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.user, "正文A", null, null, textA, List.of())),
+            List.of(dtoOf(Role.user, "正文B", null, null, textA, List.of())), "user 可渲染块 → content 被丢弃");
+        // ③ user：document 块（wire 丢弃该块）
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.user, "正文", null, null, List.of(documentBlock("QUJDRA==")), List.of())),
+            List.of(dtoOf(Role.user, "正文", null, null, List.of(documentBlock("RUZHSA==")), List.of())),
+            "user document 块被丢弃");
+        // ④ user：acceptFeedback 不进 wire
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.user, "正文", null, null, List.of(), List.of())),
+            List.of(dtoOf(Role.user, "正文", "tc-9", "反馈", List.of(), List.of())), "user 非 wire 字段");
+        // ⑤ assistant：tool_calls.arguments
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.assistant, "回答", null, null, List.of(), toolCalls("tc-1", "Bash", "{}"))),
+            List.of(dtoOf(Role.assistant, "回答", null, null, List.of(), toolCalls("tc-1", "Bash", "{\"x\":1}"))),
+            "assistant tool_calls.arguments");
+        // ⑥ assistant：空白 id/name 的 tool call 被丢弃（两侧都该判「无变化」）
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.assistant, "回答", null, null, List.of(), toolCalls("tc-1", "Bash", "{}"))),
+            List.of(dtoOf(Role.assistant, "回答", null, null, List.of(),
+                List.of(new ToolCallDto("  ", "Bash", "{}", null, null)))), "assistant 空白 id 的 tool call 被丢弃");
+        // ⑦ tool：acceptFeedback 上 wire（owner assistant 前置以满足配对修复）
+        assertSameDiscrimination(
+            toolPair("tc-1", "工具输出", null, List.of()),
+            toolPair("tc-1", "工具输出", "反馈", List.of()), "tool acceptFeedback");
+        // ⑧ tool：text 块上 wire、非 text 块被跳
+        assertSameDiscrimination(
+            toolPair("tc-1", "工具输出", null, List.of(documentBlock("QUJDRA=="))),
+            toolPair("tc-1", "工具输出", null, List.of(documentBlock("RUZHSA=="))), "tool 非 text 块被跳");
+        // ⑨ tool：toolCalls 不进 wire
+        assertSameDiscrimination(
+            toolPair("tc-1", "工具输出", null, List.of()),
+            List.of(toolOwner("tc-1"),
+                dtoOf(Role.tool, "工具输出", "tc-1", null, List.of(), toolCalls("y", "Other", "{}"))),
+            "tool toolCalls");
+        // ⑩ user：contentBlocks 的【原始 JSON 形状】不进 wire，wire 只看渲染出的 part
+        //    （resolveImageUrl 两分支：顶层 url / source.url → 同一个 image_url ⇒ wire 逐字相同）
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.user, "正文", null, null,
+                List.of(imageBlockFromSourceUrl("http://e/x.png")), List.of())),
+            List.of(dtoOf(Role.user, "正文", null, null,
+                List.of(imageBlockTopLevelUrl("http://e/x.png")), List.of())),
+            "user image 块两种写法 → 同一 image_url");
+        // ⑪ user：块里的非 wire 键（如 cache_control）不进 wire
+        assertSameDiscrimination(
+            List.of(dtoOf(Role.user, "正文", null, null, List.of(textBlock("甲")), List.of())),
+            List.of(dtoOf(Role.user, "正文", null, null,
+                List.of(textBlockWithExtraKey("甲", "cache_control")), List.of())),
+            "user text 块的非 wire 键被忽略");
+        // ⑫ tool：text 块的非 wire 键同理
+        assertSameDiscrimination(
+            toolPair("tc-1", "工具输出", null, List.of(textBlock("甲"))),
+            toolPair("tc-1", "工具输出", null, List.of(textBlockWithExtraKey("甲", "cache_control"))),
+            "tool text 块的非 wire 键被忽略");
+    }
+
     // ═══════════════════════════════ 脚手架 ═══════════════════════════════
 
     /**
@@ -206,5 +392,107 @@ class OutboundWireProjectionWireFidelityTest {
         fn.put("description", "d1");
         fn.putObject("parameters").put("type", "object");
         return wrapper;
+    }
+
+    // ─────────── ⑥⑦ 段脚手架：逐 role 消息 + 真 wire 分辨力对照 ───────────
+
+    /** 逐 role 消息（19 参构造，末参 isMeta 后置字段按既有约定传默认值）。 */
+    private static ChatMessageDto dtoOf(Role role, String content, String toolCallId, String acceptFeedback,
+                                       List<?> contentBlocks, List<ToolCallDto> toolCalls) {
+        return new ChatMessageDto(
+            java.util.UUID.randomUUID().toString(), "sess-x", role, "a",
+            content, null, toolCalls, null, null, null,
+            "刚刚", T, toolCallId, null,
+            acceptFeedback, contentBlocks, List.of(), null,
+            false);
+    }
+
+    private static List<ToolCallDto> toolCalls(String id, String name, String arguments) {
+        return List.of(new ToolCallDto(id, name, arguments, null, null));
+    }
+
+    private static JsonNode textBlock(String text) {
+        ObjectNode b = JSON.createObjectNode();
+        b.put("type", "text");
+        b.put("text", text);
+        return b;
+    }
+
+    /** 真实形态的 document 块（{@code R32B9_OpenAiSdkProviderMultiModalTest:180} 同形）。 */
+    private static JsonNode documentBlock(String base64) {
+        ObjectNode b = JSON.createObjectNode();
+        b.put("type", "document");
+        ObjectNode source = b.putObject("source");
+        source.put("type", "base64");
+        source.put("media_type", "application/pdf");
+        source.put("data", base64);
+        return b;
+    }
+
+    /** image 块写法①（CC 风格）：{@code source.url}。 */
+    private static JsonNode imageBlockFromSourceUrl(String url) {
+        ObjectNode b = JSON.createObjectNode();
+        b.put("type", "image");
+        b.putObject("source").put("type", "url").put("url", url);
+        return b;
+    }
+
+    /** image 块写法②（旧/直连风格）：顶层 {@code url} —— {@code resolveImageUrl} 第一分支，与①同解。 */
+    private static JsonNode imageBlockTopLevelUrl(String url) {
+        ObjectNode b = JSON.createObjectNode();
+        b.put("type", "image");
+        b.put("url", url);
+        return b;
+    }
+
+    /** text 块 + 一个 wire 从不读的键（如 {@code cache_control}）⇒ wire 字节与纯 text 块逐字相同。 */
+    private static JsonNode textBlockWithExtraKey(String text, String extraKey) {
+        ObjectNode b = JSON.createObjectNode();
+        b.put("type", "text");
+        b.put("text", text);
+        b.putObject(extraKey).put("type", "ephemeral");
+        return b;
+    }
+
+    /** owning assistant（tool 消息协议上必须应答前置 tool_call，否则配对修复会剥离孤儿结果）。 */
+    private static ChatMessageDto toolOwner(String toolCallId) {
+        return dtoOf(Role.assistant, "", null, null, List.of(), toolCalls(toolCallId, "Bash", "{}"));
+    }
+
+    /** {@code [owning assistant, tool 结果]} 配对列表（真 wire 与投影两侧都经同一次配对修复）。 */
+    private static List<ChatMessageDto> toolPair(String toolCallId, String content, String feedback,
+                                                 List<?> blocks) {
+        return List.of(toolOwner(toolCallId),
+            dtoOf(Role.tool, content, toolCallId, feedback, blocks, List.of()));
+    }
+
+    /**
+     * <b>真 wire 串</b>：{@code toSdkMessage} 的产物经 SDK 自己的 ObjectMapper 序列化 ——
+     * 这是「DeepSeek 实际收到的 JSON」的最忠实可获得物（SDK 内部序列化规则不再由我复述）。
+     */
+    private static String sdkWireJson(List<ChatMessageDto> msgs) {
+        try {
+            return com.openai.core.ObjectMappers.jsonMapper()
+                .writeValueAsString(OpenAiSdkProvider.buildSdkMessages(msgs));
+        } catch (Exception e) {
+            throw new AssertionError("SDK 出站序列化失败: " + e, e);
+        }
+    }
+
+    /**
+     * ⭐ 分辨力对照：<b>投影判「相同/不同」必须与真 wire（SDK JSON）判的一致</b>。
+     * <p>这条比「断言某个字段在投影里」强得多：它不依赖我对 wire 规则的复述 ——
+     * 投影若多带一个 wire 不读的字段，真 wire 判「相同」而投影判「不同」⇒ 立即红。
+     */
+    private static void assertSameDiscrimination(List<ChatMessageDto> a, List<ChatMessageDto> b, String what) {
+        String wireA = sdkWireJson(a);
+        String wireB = sdkWireJson(b);
+        boolean projSame = OutboundWireProjection.projectMessages(a)
+            .equals(OutboundWireProjection.projectMessages(b));
+        assertThat(projSame)
+            .as("⭐ 投影分辨力必须 ⟺ 真 wire 分辨力 · 形态=%s\nwireA=%s\nwireB=%s\nprojA=%s\nprojB=%s",
+                what, wireA, wireB,
+                OutboundWireProjection.projectMessages(a), OutboundWireProjection.projectMessages(b))
+            .isEqualTo(wireA.equals(wireB));
     }
 }

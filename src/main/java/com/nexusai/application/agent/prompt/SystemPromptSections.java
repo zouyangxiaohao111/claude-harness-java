@@ -243,17 +243,34 @@ public final class SystemPromptSections {
         //    [2.1.278 口径（当前依据）] 实测 cacheBreak:!0/cacheBreak:true 均为 0 处，且独立段名
         //      'mcp_instructions' 已不存在（11 次命中全是 mcp_instructions_delta 9 + pool_change 2）
         //      ⇒ CC 改成走 **delta 尾部附件**投递 MCP 指令，不再有「每轮重算的 system 段」。
-        //    ⭐ 已知分歧（登记，A1 留作后续批次）：本仓**尚无 MCP 指令 delta 的「每轮投递」通道** ⇒
-        //      改为可缓存段后，**MCP 服务器在会话中途连接/断开，其指令不再即时进系统提示**，
-        //      要等 /clear 或 /compact 触发会话级分段缓存失效后才刷新。
-        //      ⚠️ 「尚无」的准确边界（grep 复核 2026-09-21，⛔ 别读成「delta 完全不存在」）：
-        //        已有 ① 渲染 case（AgentLoopContext:3830 `mcp_instructions_delta`）；
-        //        ② producer（PostCompactAttachmentRestorer.mcpInstructionsDeltaAttachment），
-        //           但只在**压缩后重宣布**路径被调用（appendPostCompactDeltaAttachments），且
-        //           gate `isMcpInstructionsDeltaEnabled()` 默认 false ⇒ 生产默认 no-op。
-        //        缺的是 CC attachments.ts:856 那样的**每轮调用**（`maybe('mcp_instructions_delta', ...)`
-        //        挂在每轮 attachments 流水线上）⇒ 那才是「MCP 中途变更即时可见」的来源。
-        //      （现状缓解：本机 MCP 默认 enabled=false、servers=0，中途连接属罕见路径。）
+        //    ⭐ 已知分歧（登记 · **A1 已补通道** 2026-09-21）：改为可缓存段后，**MCP 服务器在会话
+        //      中途连接/断开，其指令不再即时进系统提示** —— 但 A1 已按 CC 2.1.88 形态补上
+        //      **每轮 attachments 流水线上的 delta 尾部投递通道**
+        //      （LlmAgentLoop 每轮 `maybeEmitMcpInstructionsDelta`，位于 date_change 之后、
+        //       changed_files 之前 = CC attachments.ts:830 → :854 → :871 的相对序），
+        //      指令变更经**尾部追加**的 mcp_instructions_delta 消息即时可见，本 system 段**保持
+        //      会话冻结是正确的**（⛔ 不要把 cacheBreak 改回去）。
+        //      [2026-09-21 去门] 上面那条「残留边界」已关闭：该通道的 gate
+        //        `isMcpInstructionsDeltaEnabled()` 已按 2.1.278 整体删除（发行产物 0 命中）
+        //        ⇒ delta 通道无条件每轮运行，本 system 段保持会话冻结不再有「默认配置下分歧仍在」的问题。
+        //    [准确事实 · 2026-09-21 复验重读 2.1.88 真源 + 2.1.278 发行产物]
+        //      ⛔ 上面「CC 门关 ⇒ 指令不即时可见」的暗示是**错的**，别据此推「本仓与 CC 同形」：
+        //      2.1.88 `constants/prompts.ts:513-520` 的 mcp_instructions 段是
+        //        `DANGEROUS_uncachedSystemPromptSection('mcp_instructions',
+        //           () => isMcpInstructionsDeltaEnabled() ? null : getMcpInstructionsSection(mcpClients),
+        //           'MCP servers connect/disconnect between turns')`
+        //      而 `constants/systemPromptSections.ts:32-38` = `{name, compute, cacheBreak:true}`，
+        //      `resolveSystemPromptSections`（:49-56）对 cacheBreak 段**每轮重算并覆写缓存项**
+        //      ⇒ CC 门**关**时走的是「每轮重算的 system 段」通道：MCP 中途连接**仍然即时可见**，
+        //      代价是 late connect 把 prompt cache 打爆（函数名 DANGEROUS_ 与 reason 文案自述）。
+        //      门**开**时该段 compute 返 null（段消失），改由 delta 附件投递。
+        //      ⇒ CC 的两个分支**都**即时可见；本仓「段会话冻结 + 门默认关」= CC 里不存在的**第三态**
+        //        ⇒ 「同形」不成立（见 findingBFact）。
+        //      2.1.278 发行产物（`bin/claude.exe`, package.json version=2.1.278）实测：
+        //        `mcp_instructions_delta` 的挂点（offset 206242680 `Ja("mcp_instructions_delta",...)`）
+        //        与 producer（offset 206259433 `function tXn(...)`）**外层无任何 gate**；字符串
+        //        `CLAUDE_CODE_MCP_INSTR_DELTA` / `tengu_basalt_3kr` 各自 **0 次命中**（同命令可命中
+        //        `tengu_mcp_instructions_pool_change` 等）⇒ 2.1.278 **已删除该门**，delta 无条件每轮跑。
         sections.add(systemPromptSection("mcp_instructions", () -> mcpInstructionsCompute(input)));
         // 8. scratchpad · CC original: getScratchpadInstructions() (prompts.ts:517-518 = :797-819)
         //    [SP-05] 恒 null → scratchpadCompute：input.scratchpadEnabled() 门控（resolver，null→false）

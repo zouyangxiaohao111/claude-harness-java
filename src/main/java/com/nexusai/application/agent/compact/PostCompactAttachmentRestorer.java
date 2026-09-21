@@ -1255,7 +1255,8 @@ public final class PostCompactAttachmentRestorer {
     }
     // ════════════════════════════════════════════════════════════════════
     // [IMP2-03] 生产接线 · async-agent/plan/plan_mode 填充 + 3×delta 重宣布
-    // （CC compact.ts:545-585 · ✗-1..✗-4 · INV-15；delta gate 默认关 → 生产默认 no-op）
+    // （CC compact.ts:545-585 · ✗-1..✗-4 · INV-15；deferred_tools / agent_listing 两门默认关，
+    //   mcp_instructions 门已于 2026-09-21 删除 ⇒ 该支无条件重宣布）
     // ════════════════════════════════════════════════════════════════════
 
     /** CC 附件类型字面量 · deferred_tools_delta（attachments.ts:1474） */
@@ -1274,9 +1275,9 @@ public final class PostCompactAttachmentRestorer {
     public static final String NEXUSAI_IN_CHROME_MCP_SERVER_NAME = "nexusai-in-chrome";
 
     // [R9(b) env seam 归一] 本类原有的第二份 env 注入 seam（envOverride 字段）已删除：
-    //   两条门（shouldInjectAgentListInMessages / isMcpInstructionsDeltaEnabled）改调
-    //   ToolSearchService.currentEnv()（全仓唯一 env 读取入口）。语义不变（仅换「从哪读 env」），
-    //   测试注入统一走 ToolSearchService.envOverride。
+    //   门（shouldInjectAgentListInMessages；原还有 isMcpInstructionsDeltaEnabled，该门
+    //   2026-09-21 已整体删除）改调 ToolSearchService.currentEnv()（全仓唯一 env 读取入口）。
+    //   语义不变（仅换「从哪读 env」），测试注入统一走 ToolSearchService.envOverride。
 
     /**
      * [IMP2-03] 生产路径附件填充 · 对齐 CC compact.ts:545-560（async-agent → plan → plan_mode
@@ -1362,9 +1363,10 @@ public final class PostCompactAttachmentRestorer {
      * <p>Java 消息历史 preservedMessages 等价 CC diff 扫描源（partial 传 messagesToKeep、
      * 全量传 []）——从历史重建已 announce 集合，diff 后仅宣布增量；空历史 → 宣布全量集合。
      *
-     * <p><b>Gate 默认关</b>：三 delta 均 feature/env 门控（isDeferredToolsDeltaEnabled /
-     * shouldInjectAgentListInMessages / isMcpInstructionsDeltaEnabled 默认 false）→ 生产默认
-     * no-op。CC 默认（feature 关）下 deferred-tools 走每调用 prepend（claude.ts:1330-1345
+     * <p><b>Gate</b>：deferred_tools_delta / agent_listing_delta 两支仍 feature/env 门控
+     * （isDeferredToolsDeltaEnabled / shouldInjectAgentListInMessages 默认 false）→ 该两支生产
+     * 默认 no-op；<b>mcp_instructions_delta 支无门</b>（isMcpInstructionsDeltaEnabled 已按 2.1.278
+     * 删除）⇒ 压缩后重宣布时该支无条件参与。CC 默认（feature 关）下 deferred-tools 走每调用 prepend（claude.ts:1330-1345
      * {@code <available-deferred-tools>} meta user message）、agent list 走 session_guidance
      * 子弹（prompts.ts:373）、mcp instructions 走 system prompt 段（prompts.ts:578-608）。
      * <b>[IMP2-03 返工 r2 更正]</b>：Java 主循环<b>无</b> deferred-tools prepend 通道（全库 grep
@@ -1473,9 +1475,9 @@ public final class PostCompactAttachmentRestorer {
             return null;
         }
         // formatDeferredToolLine = tool.name（ToolSearchTool/prompt.ts:115-117）→ addedLines == addedNames
-        String payload = "{\"type\":\"" + DELTA_TYPE_DEFERRED_TOOLS + "\",\"addedNames\":["
-            + jsonArray(added) + "],\"addedLines\":[" + jsonArray(added)
-            + "],\"removedNames\":[" + jsonArray(removed) + "]}";
+        String payload = "{\"type\":\"" + DELTA_TYPE_DEFERRED_TOOLS + "\",\"addedNames\":"
+            + jsonArray(added) + ",\"addedLines\":" + jsonArray(added)
+            + ",\"removedNames\":" + jsonArray(removed) + "}";
         return deltaAttachment(DELTA_TYPE_DEFERRED_TOOLS, payload);
     }
 
@@ -1563,10 +1565,10 @@ public final class PostCompactAttachmentRestorer {
             addedTypes.add(a.agentType());
             addedLines.add(formatAgentLine(a));
         }
-        String payload = "{\"type\":\"" + DELTA_TYPE_AGENT_LISTING + "\",\"addedTypes\":["
-            + jsonArray(addedTypes) + "],\"addedLines\":[" + jsonArray(addedLines)
-            + "],\"removedTypes\":[" + jsonArray(removed)
-            + "],\"isInitial\":" + (announced.isEmpty())
+        String payload = "{\"type\":\"" + DELTA_TYPE_AGENT_LISTING + "\",\"addedTypes\":"
+            + jsonArray(addedTypes) + ",\"addedLines\":" + jsonArray(addedLines)
+            + ",\"removedTypes\":" + jsonArray(removed)
+            + ",\"isInitial\":" + (announced.isEmpty())
             + ",\"showConcurrencyNote\":true}";
         return deltaAttachment(DELTA_TYPE_AGENT_LISTING, payload);
     }
@@ -1575,21 +1577,23 @@ public final class PostCompactAttachmentRestorer {
      * mcp_instructions_delta 生产 · 对齐 CC {@code getMcpInstructionsDeltaAttachment}
      * （attachments.ts:1559-1585）+ {@code getMcpInstructionsDelta}（mcpInstructionsDelta.ts:55-130）。
      *
-     * <p>Gate：isMcpInstructionsDeltaEnabled（env CLAUDE_CODE_MCP_INSTR_DELTA 优先，
-     * feature tengu_basalt_3kr / USER_TYPE=ant，默认关）。内容：已连接且 instructions 非空的
-     * server（Java TUC.mcpClients 即已连接 map）+ clientSide chrome 指令（ToolSearch 乐观可用
-     * + 模型支持 + ToolSearch 在池，且 nexusai-in-chrome 已连接时）对已 announce 集合的 diff。
+     * <p><b>无门（对齐 2.1.278）</b>：本方法<b>无任何 feature/env 门</b>，无条件每轮计算。
+     * 2.1.88 的 {@code isMcpInstructionsDeltaEnabled()}（env CLAUDE_CODE_MCP_INSTR_DELTA 优先，
+     * feature tengu_basalt_3kr / USER_TYPE=ant，默认关；mcpInstructionsDelta.ts:37-44）在 2.1.278
+     * 发行产物里已被<b>整体删除</b>——{@code CLAUDE_CODE_MCP_INSTR_DELTA} / {@code tengu_basalt_3kr}
+     * 各 0 命中，挂点 {@code Ja("mcp_instructions_delta",...)} 外层与 producer {@code function tXn(...)}
+     * 体内均无 gate（且独立段名 {@code 'mcp_instructions'} 的 system 段亦已不存在）。
+     * 内容：已连接且 instructions 非空的 server（Java TUC.mcpClients 即已连接 map）+
+     * clientSide chrome 指令（ToolSearch 乐观可用 + 模型支持 + ToolSearch 在池，且
+     * nexusai-in-chrome 已连接时）对已 announce 集合的 diff。
      *
      * @param tuc      工具使用上下文（mcpClients 数据源）
-     * @param model    主循环模型名（clientSide chrome gate）
+     * @param model    主循环模型名（clientSide chrome 条件）
      * @param messages 历史消息（diff 扫描源；全量压缩传 [] → 宣布全量）
-     * @return mcp_instructions_delta 附件；gate 关/无 instructions → null
+     * @return mcp_instructions_delta 附件；无 instructions / 内容未变 → null
      */
     public static ChatMessageDto mcpInstructionsDeltaAttachment(
             ToolUseContext tuc, String model, List<ChatMessageDto> messages) {
-        if (!isMcpInstructionsDeltaEnabled()) {
-            return null;
-        }
         if (tuc == null || tuc.mcpClients() == null || tuc.mcpClients().isEmpty()) {
             return null;
         }
@@ -1648,13 +1652,72 @@ public final class PostCompactAttachmentRestorer {
             sortedBlocks.add(addedBlocks.get(i));
         }
         removed.sort(String::compareTo);
-        String payload = "{\"type\":\"" + DELTA_TYPE_MCP_INSTRUCTIONS + "\",\"addedNames\":["
-            + jsonArray(sortedNames) + "],\"addedBlocks\":[" + jsonArray(sortedBlocks)
-            + "],\"removedNames\":[" + jsonArray(removed) + "]}";
+        String payload = "{\"type\":\"" + DELTA_TYPE_MCP_INSTRUCTIONS + "\",\"addedNames\":"
+            + jsonArray(sortedNames) + ",\"addedBlocks\":" + jsonArray(sortedBlocks)
+            + ",\"removedNames\":" + jsonArray(removed) + "}";
         return deltaAttachment(DELTA_TYPE_MCP_INSTRUCTIONS, payload);
     }
 
+    /**
+     * [A1] mcp_instructions_delta JSON payload → {@link AttachmentMessageDto} · 供发送边界
+     * <b>复用既有渲染 case</b>（AgentLoopContext {@code renderHookAttachmentForLlm} case
+     * 'mcp_instructions_delta' · CC messages.ts:4216-4231）。
+     *
+     * <p><b>WHY 需要它</b>：本仓 delta 消息的持久化载体是单字段 {@code ChatMessageDto.content}
+     * （= producer 的原样 JSON，跨轮 diff 的扫描源），而渲染器吃的是
+     * {@code AttachmentMessageDto.mcpInstructionsDelta(addedBlocks, removedNames)}。本方法只做
+     * 「<b>读回自己写下的 JSON</b>」这一步形态转换 —— ⛔ <b>不是第二套构造</b>：delta 的产出仍在
+     * {@link #mcpInstructionsDeltaAttachment}，本方法只解析它写下的 {@code addedBlocks} /
+     * {@code removedNames} 两个数组（字段名与 {@link #scanAnnouncedDeltaNames} 的读取同源）。
+     *
+     * <p>解析失败 / 非对象 / 两段均空 → null（保守跳过：不渲染、不替换，发送面保持原样）。
+     *
+     * @param jsonPayload producer 写下的 payload（{@code {type, addedNames, addedBlocks, removedNames}}）
+     * @return type='mcp_instructions_delta' 的 AttachmentMessageDto；解析失败 / 无可渲染内容 → null
+     */
+    public static AttachmentMessageDto mcpInstructionsDeltaToAttachment(String jsonPayload) {
+        if (jsonPayload == null || jsonPayload.isBlank()) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode node =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(jsonPayload);
+            if (node == null || !node.isObject()) {
+                return null;
+            }
+            java.util.List<String> addedBlocks = new ArrayList<>();
+            com.fasterxml.jackson.databind.JsonNode ab = node.path("addedBlocks");
+            if (ab.isArray()) {
+                for (com.fasterxml.jackson.databind.JsonNode n : ab) {
+                    if (n.isTextual()) {
+                        addedBlocks.add(n.asText());
+                    }
+                }
+            }
+            java.util.List<String> removedNames = new ArrayList<>();
+            com.fasterxml.jackson.databind.JsonNode rn = node.path("removedNames");
+            if (rn.isArray()) {
+                for (com.fasterxml.jackson.databind.JsonNode n : rn) {
+                    if (n.isTextual()) {
+                        removedNames.add(n.asText());
+                    }
+                }
+            }
+            if (addedBlocks.isEmpty() && removedNames.isEmpty()) {
+                return null;
+            }
+            return AttachmentMessageDto.mcpInstructionsDelta(addedBlocks, removedNames);
+        } catch (Exception e) {
+            log.debug("[PostCompactAttachmentRestorer] mcpInstructionsDeltaToAttachment: 解析失败,"
+                + " 返回 null (subtype=mcp_instructions_delta)");
+            return null;
+        }
+    }
+
     // ── delta gate（默认关 · env 覆盖镜像 CC）──
+    // ⚠️ 本段只剩 agent_listing 一条门。mcp_instructions 那条（isMcpInstructionsDeltaEnabled）
+    //    已于 2026-09-21 整体删除 —— 对齐 2.1.278（该门在发行产物里 0 命中），见
+    //    mcpInstructionsDeltaAttachment 的 javadoc。
 
     // [dtd-cfg R9 收敛] 原此处有一份 isDeferredToolsDeltaEnabled() env-only 拷贝，已删除：
     //   真源 = ToolSearchService.isDeferredToolsDeltaEnabled()（env 层）+ 统一判定
@@ -1679,21 +1742,13 @@ public final class PostCompactAttachmentRestorer {
         return false; // feature tengu_agent_list_attach 默认关（Java 静态面无通道，登记）
     }
 
-    /**
-     * CC isMcpInstructionsDeltaEnabled（mcpInstructionsDelta.ts:37-44）：env
-     * CLAUDE_CODE_MCP_INSTR_DELTA 优先，feature tengu_basalt_3kr / USER_TYPE=ant 默认关。
-     */
-    public static boolean isMcpInstructionsDeltaEnabled() {
-        // [R9(b) env seam 归一] 统一走 ToolSearchService.currentEnv()（本类第二份 seam 已删）
-        java.util.Map<String, String> e = ToolSearchService.currentEnv();
-        if (isEnvTruthy(e.get("CLAUDE_CODE_MCP_INSTR_DELTA"))) {
-            return true;
-        }
-        if (isEnvDefinedFalsy(e.get("CLAUDE_CODE_MCP_INSTR_DELTA"))) {
-            return false;
-        }
-        return "ant".equals(e.get("USER_TYPE"));
-    }
+    // [去门 · 2026-09-21] 原此处有 CC 2.1.88 的 isMcpInstructionsDeltaEnabled()
+    //   （env CLAUDE_CODE_MCP_INSTR_DELTA 优先，feature tengu_basalt_3kr / USER_TYPE=ant，
+    //    默认关；mcpInstructionsDelta.ts:37-44）。该门已整体删除（对齐 2.1.278）：
+    //   2.1.278 发行产物（bin/claude.exe, 237232800 B）中 CLAUDE_CODE_MCP_INSTR_DELTA 与
+    //   tengu_basalt_3kr 各 0 命中；挂点 Ja("mcp_instructions_delta",...) 与 producer
+    //   function tXn(...) 体内外均无 gate；独立 system 段名 'mcp_instructions' 亦已不存在。
+    //   ⇒ delta 通道无条件每轮运行（两条调用路径：每轮挂点 + 压缩重宣布）。
 
     // ── delta 小工具 ──
 
@@ -1818,7 +1873,16 @@ public final class PostCompactAttachmentRestorer {
         return "All tools";
     }
 
-    /** JSON 字符串数组（safeJson 转义）· CC addedNames/addedLines 等数组字段。 */
+    /**
+     * JSON 字符串数组（safeJson 转义）· CC addedNames/addedLines 等数组字段。
+     *
+     * <p><b>⚠️ 返回值<b>自带方括号</b></b>（{@code ArrayNode.toString()} = {@code ["a","b"]}）——
+     * 三处 payload 拼装曾写成 {@code "addedNames":[" + jsonArray(x) + "]"}，产出
+     * {@code "addedNames":[["a","b"]]}（双层数组）。后果：消费侧 {@link #scanAnnouncedDeltaNames}
+     * 逐元素判 {@code isTextual()} 恒 false ⇒ <b>已公告集合恒空 ⇒ 跨轮 name-diff 死掉 ⇒ 每轮重公告全量</b>
+     * （{@code renderDeferredToolsDelta} 同因返回 null，deferred 路径退化成直塞原始 JSON）。
+     * 已修为直接相接，⛔ 拼装时不要再包一层方括号。
+     */
     private static String jsonArray(List<String> values) {
         ArrayNode arr = SKILL_JSON.createArrayNode();
         if (values != null) {

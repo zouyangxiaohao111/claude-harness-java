@@ -267,8 +267,9 @@ public final class ToolSearchService {
      *
      * <p><b>[R9(b) env seam 归一]</b> 本方法是全仓「env 读取入口」的单点。原先
      * {@code PostCompactAttachmentRestorer} 自带第二份 {@code envOverride} 字段（同类两个
-     * env 入口），现该类两条门（{@code shouldInjectAgentListInMessages} /
-     * {@code isMcpInstructionsDeltaEnabled}）改调此处，第二份 seam 已删除。语义不变：只换
+     * env 入口），现该类门（{@code shouldInjectAgentListInMessages}；另一条
+     * {@code isMcpInstructionsDeltaEnabled} 已于 2026-09-21 按 2.1.278 整体删除）改调此处，
+     * 第二份 seam 已删除。语义不变：只换
      * 「从哪读 env」，{@code isEnvTruthy} / {@code USER_TYPE==ant} 等判据不动。
      *
      * @return env 快照（非 null）

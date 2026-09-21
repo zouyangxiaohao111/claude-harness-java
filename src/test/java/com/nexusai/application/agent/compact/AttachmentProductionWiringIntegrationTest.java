@@ -144,12 +144,13 @@ class AttachmentProductionWiringIntegrationTest {
     @DisplayName("3×delta gate 开: 压缩后重宣布 deferred_tools/agent_listing/mcp_instructions_delta")
     void deltaGatesOnProduceThreeDeltaAttachments() {
         // gate 注入（CC isDeferredToolsDeltaEnabled USER_TYPE=ant / shouldInjectAgentListInMessages
-        // env / isMcpInstructionsDeltaEnabled env，测试 seam 替代真实环境）
-        // [R9(b) env seam 归一] 三条门统一读 ToolSearchService.currentEnv() → 单一 seam 注入全部。
+        // env，测试 seam 替代真实环境；mcp_instructions 门已删 ⇒ 无需注入）
+        // [R9(b) env seam 归一] 门统一读 ToolSearchService.currentEnv() → 单一 seam 注入全部。
+        // ⚠️ mcp_instructions_delta 门已删（2026-09-21 · 对齐 2.1.278）⇒ 不再注入
+        //   CLAUDE_CODE_MCP_INSTR_DELTA；该支无条件重宣布。
         com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride = Map.of(
             "USER_TYPE", "ant",
-            "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true",
-            "CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+            "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true");
 
         // 工具池：MCP 工具（恒 deferred）+ ToolSearch（gate2/4 目标）+ Agent 工具
         List<Tool> tools = new ArrayList<>();
@@ -214,10 +215,11 @@ class AttachmentProductionWiringIntegrationTest {
         //   该 delta 就是误导 + 死锁。单点 toolReferenceUsable(openai_compatible, claude-*) = false →
         //   dtd gate 拦截。变异：单点去掉 provider 那一半 → 本用例变红（dtd 误产出）。
         // [R9(b) env seam 归一] 三条门统一读 ToolSearchService.currentEnv() → 单一 seam 注入全部。
+        // ⚠️ mcp_instructions_delta 门已删（2026-09-21 · 对齐 2.1.278）⇒ 不再注入
+        //   CLAUDE_CODE_MCP_INSTR_DELTA；该支无条件重宣布。
         com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride = Map.of(
             "USER_TYPE", "ant",
-            "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true",
-            "CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+            "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true");
 
         List<Tool> tools = new ArrayList<>();
         tools.add(tool("mcp__docs-server__search", true));
@@ -241,7 +243,7 @@ class AttachmentProductionWiringIntegrationTest {
     }
 
     @Test
-    @DisplayName("3×delta gate 默认关: 压缩后无 delta 附件（对齐 CC feature 默认关）")
+    @DisplayName("delta 门默认关: 仅 mcp_instructions_delta 一支产出（该门已删 · 对齐 2.1.278）")
     void deltaGatesOffNoDeltaAttachments() {
         ToolUseContext tuc = ToolUseContext.of(
             null, "", PermissionMode.DEFAULT,
@@ -258,7 +260,13 @@ class AttachmentProductionWiringIntegrationTest {
         CompactionResult result = CompactConversation.compactConversation(
             messages("m1", "m2"), ctx, false, null, false, null);
 
-        assertThat(result.attachments()).isEmpty();
+        // [去门 · 2026-09-21 · 对齐 2.1.278] 旧语义 = 「三条门默认关 ⇒ 附件为空」。mcp_instructions
+        //   门已被 2.1.278 整体删除 ⇒ 该支**无条件**重宣布：docs-server 带 instructions ⇒ 恰好一条
+        //   mcp_instructions_delta。deferred_tools / agent_listing 两条门仍默认关 ⇒ 那两支不产出。
+        //   （变异自证：若把门以任何形式塞回来 ⇒ 本断言变红。）
+        assertThat(result.attachments().stream().map(ChatMessageDto::subtype))
+            .as("门默认关时仅 mcp_instructions_delta 一支产出（其余两门仍默认关）")
+            .containsExactly(PostCompactAttachmentRestorer.DELTA_TYPE_MCP_INSTRUCTIONS);
     }
 
     // ════════════════════════════════════════════════════════════════════

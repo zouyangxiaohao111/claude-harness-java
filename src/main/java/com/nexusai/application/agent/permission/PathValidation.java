@@ -752,14 +752,44 @@ public final class PathValidation {
         return isWithin(normalizedPath, env.scratchpadDir());
     }
 
-    /** CC memdir/paths.ts:274-278 isAutoMemPath · startsWith(getAutoMemPath())。 */
+    /**
+     * auto-memory 目录判定（读/写 carve-out 共用）· CC {@code isAutoMemPath}（memdir/paths.ts:258-262）
+     * 的<b>边界式</b>落地。
+     *
+     * <h2>形态选型（CC 真源对照，2026-09-21 读源码自验）</h2>
+     * <p>CC 原式是<b>裸</b> {@code startsWith(getAutoMemPath())}，它安全<b>只依赖契约</b>：
+     * {@code getAutoMemPath()} 恒带尾分隔符（paths.ts:149 {@code (normalized + sep).normalize('NFC')}、
+     * paths.ts:230-232 per-project 分支同形），且 CC 拿到该值后<b>不再做一次 {@code path.normalize()}</code>
+     * （{@code .normalize('NFC')} 是 String 归一，不吞分隔符）⇒ 契约在 CC 侧成立 ⇒ 裸前缀恰好等价于路径段边界。
+     *
+     * <p>本仓把该契约在<b>生产者侧</b>打断过：{@code PathValidationEnv.withAutoMem} 曾用
+     * {@code Path.of(base).normalize()} 二次归一，而 Java {@code Path#normalize()} <b>会吞掉尾分隔符</b>
+     * （实测见 {@code AutoMemPathPrefixBoundaryTest}）⇒ {@code autoMemBaseDir} 变成无尾分隔符形态 ⇒
+     * 裸 startsWith 退化为<b>字符串前缀</b>匹配 ⇒ {@code <base>-evil/x.md} 被静默放行（读写 carve-out 同时中招）。
+     *
+     * <p>故此处采用本文件既有的边界式 helper {@link #isWithin}，与 CC {@code isProjectDirPath}
+     * （filesystem.ts:284-291 {@code === dir || startsWith(dir + sep)}）、{@code isScratchpadPath}
+     * （:410-424 同形）一致：对 base「带尾分隔符」与「已 normalize 掉尾分隔符」<b>两种输入都正确</b>。
+     * 换言之，判定不再把正确性押在「上游谁没吞分隔符」上。
+     *
+     * <p><b>⛔ 为何这条边界存在（防后人当「冗余 + sep()」删掉）</b>：carve-out 的语义是
+     * 「auto-memory 目录<b>及其子树</b>内的文件免交互」（CC :1572-1581 写 / :1716-1725 读），
+     * 而<b>字符串</b>前缀会把「同级相邻目录」也算进来（{@code memory-evil} 只是示例，任何
+     * {@code <base>*} 形态都可命中）：写侧 = 静默写用户未授权的目录，读侧 = 静默读该目录。
+     * ⛔ 也不得改成 {@code startsWith(base 的父目录)}（那是<b>放宽</b>，哨兵见
+     * {@code AutoMemPathPrefixBoundaryTest.siblingDir_isNotCarvedOut}）。
+     *
+     * @param normalizedPath 已 normalize 的绝对路径（生产两个入口都在入口处 normalizePath 过）
+     * @param env            路径校验环境（基址 = {@link PathValidationEnv#autoMemBaseDir}）
+     */
     static boolean isAutoMemPath(String normalizedPath, PathValidationEnv env) {
         String base = env.autoMemBaseDir();
         if (base == null || base.isBlank()) {
             return false;
         }
-        String baseNorm = normalizePath(base);
-        return baseNorm != null && normalizedPath.startsWith(baseNorm);
+        // 边界式：equals(base) || startsWith(base + sep)（isWithin 内部对两侧各自 normalize，
+        // 故 base 带不带尾分隔符都正确）。
+        return isWithin(normalizedPath, base);
     }
 
     /**

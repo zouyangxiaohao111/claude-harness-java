@@ -3,6 +3,7 @@ package com.nexusai.application.agent.permission;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.Tool;
@@ -358,6 +359,179 @@ class WritePermissionCheckerTest {
     }
 
     // ──────────────────────────────────────────────────────────────────────
+    // T3-exemption-prefix-same-source · 1.6 豁免前缀与自有根同源（去硬编码 .claude）
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * 自有根 skills 下的绝对路径（{@code {user.home}/.{appName}/skills/foo/bar.md}，POSIX 形）。
+     *
+     * <p>⛔ 刻意用真实 {@link NexusaiPaths#getAppConfigHomeDir()} 而非 {@code @TempDir} 覆写：
+     * 本组用例要证的正是「产出侧 pattern 能被消费侧 1.6 收下」，而 1.6 的
+     * {@code '~/'} 根锚定为 {@code System.getProperty("user.home")}（RuleQuery
+     * matchesPathRuleRootRelative）。若覆写 configHome 到临时目录，产出侧 base 段与
+     * {@code '~/'} 前缀就不同源（该缺口属既有登记项，非本任务范围）⇒ 用例将无法覆盖生产形态。
+     * 仅做路径字符串运算，不触碰磁盘。
+     */
+    private static String nexusaiSkillAbsPath(String skill) {
+        return Paths.get(NexusaiPaths.getAppConfigHomeDir(), "skills", skill, "bar.md")
+            .toString().replace('\\', '/');
+    }
+
+    /** 自有根 skills 路径的 {@code '~/'} 显示形（同一条路径的另一种 input 形态）。 */
+    private static String nexusaiSkillTildePath(String skill, String file) {
+        return "~/" + NexusaiPaths.getProjectDirName() + "/skills/" + skill + "/" + file;
+    }
+
+    @Test
+    @DisplayName("自有根 skills 会话授权：getClaudeSkillScope 真实产出的 pattern 被 1.6 收下 → Allow(Rule)（前缀同源修复）")
+    void nexusaiSkillRootSessionAllow_producedPatternIsAccepted() {
+        // WHY：1.6 范围校验此前只接受 {'/.claude/','~/.claude/'}，而 getClaudeSkillScope 产出的第三条
+        //   pattern 是 '~/.{appName}/skills/<name>/**' ⇒ 结构上必被拒 → 落 1.7 safety Ask
+        //   （自有根段在 DANGEROUS_DIRECTORIES 判定内）→ 步骤 4（edit allow rule）不可达
+        //   ⇒ 用户确认过的会话授权永不生效，每次同类调用重新弹窗。
+        //   实机证据：sessions.session_permission_rules 已写入
+        //   {"toolName":"Edit","ruleContent":"~/.nexusai/skills/tbox-generator/**"}，下次同类调用仍弹。
+        //   因此判据不是「硬编码多一个 .nexusai 字符串」，而是「产出侧 pattern 必须被消费侧收下」。
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+        String absPath = nexusaiSkillAbsPath("foo");
+
+        // ① 走真实 1.7 安全检查 Ask，取出 getClaudeSkillScope 真实产出的 ruleContent
+        //    （⛔ 不手写死串 —— 手写只能证明「我又写了一遍」，「同源」必须由产出侧自己给出）
+        ToolUseContext probeCtx =
+            ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of()), cwdDir());
+        PermissionResult probe = checker.check(tool, input(absPath), probeCtx);
+        assertThat(probe)
+            .as("前置：自有根 skills 路径无会话规则时可编辑性未定 → 落 1.7 安全检查 Ask")
+            .isInstanceOf(PermissionResult.Ask.class);
+        PermissionResult.Ask probeAsk = (PermissionResult.Ask) probe;
+        assertThat(probeAsk.suggestions())
+            .as("1.7 安全检查 Ask 须附 getClaudeSkillScope 会话级 addRules 建议（filesystem.ts:1312-1327）")
+            .hasSize(1);
+        String produced = ((PermissionUpdate.AddRules) probeAsk.suggestions().get(0))
+            .rules().get(0).ruleValue().ruleContent();
+        assertThat(produced)
+            .as("产出侧 pattern = '~/' + getProjectDirName() + '/skills/' + skillName + '/**'")
+            .isEqualTo("~/" + NexusaiPaths.getProjectDirName() + "/skills/foo/**");
+
+        // ② 把①的真实产出原样作为 SESSION allow 规则再跑同一路径 → 必须在 1.6（安全检查之前）放行
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, produced))),
+            Map.of(), Map.of()), cwdDir());
+        PermissionResult result = checker.check(tool, input(absPath), ctx);
+
+        assertThat(result)
+            .as("产出→消费同源：用户确认过的会话授权必须生效（不得再落 1.7 safety Ask）")
+            .isInstanceOf(PermissionResult.Allow.class);
+        assertThat(((PermissionResult.Allow) result).reason())
+            .as("1.6 .claude/** session allow 命中：reason=Rule（filesystem.ts:1281-1300）")
+            .isInstanceOf(PermissionDecisionReason.Rule.class);
+    }
+
+    @Test
+    @DisplayName("自有根 skills 会话授权（'~/' 显示形 input 路径）→ 同样被 1.6 收下 → Allow(Rule)")
+    void nexusaiSkillRootSessionAllow_tildeFormPath_allow() {
+        // WHY：LLM 给的 file_path 可能是 '~/.nexusai/skills/foo/bar.md' 这种显示形（工具 getPath
+        //   原样透传，1.6/步骤 4 按 CC filesystem.ts:1262 用原始 path 匹配）。若修复只对绝对形生效，
+        //   显示形仍会弹窗 —— 实机证据里的授权内容就是 '~/.nexusai/...' 形态。
+        String pattern = "~/" + NexusaiPaths.getProjectDirName() + "/skills/foo/**";
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, pattern))),
+            Map.of(), Map.of()), cwdDir());
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+
+        PermissionResult result = checker.check(tool, input(nexusaiSkillTildePath("foo", "bar.md")), ctx);
+
+        assertThat(result)
+            .as("'~/' 显示形同样走 1.6 范围校验 + root-relative 匹配（root=user.home）")
+            .isInstanceOf(PermissionResult.Allow.class);
+        assertThat(((PermissionResult.Allow) result).reason())
+            .isInstanceOf(PermissionDecisionReason.Rule.class);
+    }
+
+    @Test
+    @DisplayName("护栏·不得放宽到自有根：'~/.nexusai/**' 不在同源接受集 → 仍落 1.7 safety Ask")
+    void nexusaiRootWildcard_stillSafetyAsk() {
+        // WHY：安全边界不得因新增前缀而放宽。同源前缀必须停在 'skills/' 段 —— 若实现把前缀退化为
+        //   '~/.{appName}/'（如为省事只取 getProjectDirName()），自有根下的 settings.json /
+        //   hooks / 任意配置都会被 1.6 直接放行（属扩大豁免面）。本用例即该退化的判别器：
+        //   规则在 1.6 root-relative 匹配层是命中的，唯因前缀不在接受集而被范围校验拒。
+        String pattern = "~/" + NexusaiPaths.getProjectDirName() + "/**";
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, pattern))),
+            Map.of(), Map.of()), cwdDir());
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+
+        PermissionResult result =
+            checker.check(tool, input(nexusaiSkillTildePath("foo", "bar.md")), ctx);
+
+        assertThat(result)
+            .as("豁免面未放宽：自有根级通配不得从 1.6 放行（否则 settings.json 一并放行）")
+            .isInstanceOf(PermissionResult.Ask.class);
+        assertThat(((PermissionResult.Ask) result).reason())
+            .as("1.6 拒收 → 落 1.7 自有根危险段 Ask(SafetyCheck)")
+            .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+    }
+
+    @Test
+    @DisplayName("护栏·'..' 拒绝不得失效：'~/.nexusai/skills/../x/**' 不产生 1.6 Allow")
+    void nexusaiSkillRootDotDot_stillSafetyAsk() {
+        // WHY：安全边界不得因新增前缀而放宽。'..' 段是逃离 skills/ 的唯一后门。
+        //   注（实测语义，非注释推断）：expandPathForMatch 会 normalize 目标（RuleQuery:1134
+        //   abs.normalize()），故含 '..' 的 pattern 在 glob 层通常已无法命中；1.6 的 '..' 护栏
+        //   与之互为纵深防御（CC filesystem.ts:1288 同款 isExcluded-style 守卫）。
+        //   本用例锁定「无论如何不产生 1.6 Allow」这一结果。
+        String pattern = "~/" + NexusaiPaths.getProjectDirName() + "/skills/../x/**";
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, pattern))),
+            Map.of(), Map.of()), cwdDir());
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+
+        PermissionResult result = checker.check(tool,
+            input("~/" + NexusaiPaths.getProjectDirName() + "/skills/../x/y.md"), ctx);
+
+        assertThat(result)
+            .as("'..' 逃逸用例不得被 1.6 放行（否则可借 skills/../ 授出 skills/ 之外的写权限）")
+            .isInstanceOf(PermissionResult.Ask.class);
+        assertThat(((PermissionResult.Ask) result).reason())
+            .as("落 1.7 自有根危险段 Ask(SafetyCheck)")
+            .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+    }
+
+    @Test
+    @DisplayName("机制钉桩：'~/evil/**' 的终点是步骤 4（完整 permCtx allow rule），不是 1.6")
+    void arbitraryHomeRule_endsAtStep4Not16() {
+        // WHY：钉住 1.6 的语义边界 —— 1.6 的范围校验只决定「是否在 1.7 安全门之前放行」，
+        //   它不是 allow 规则的硬闸；同一条会话规则还能在步骤 4（filesystem.ts:1377-1393，
+        //   用完整 permCtx 而非 session-only）命中。故「越界用例仍被拒」不能拿
+        //   '~/evil/**' 当例子（该路径 1.7 三道检查全不触发，最终 Allow(Rule)），
+        //   否则后人会把 1.6 误改成「放行全部 allow 规则」的硬闸，反而放宽安全检查。
+        String pattern = "~/evil/**";
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, pattern))),
+            Map.of(), Map.of()), cwdDir());
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+
+        PermissionResult result = checker.check(tool, input("~/evil/x.md"), ctx);
+
+        assertThat(result)
+            .as("步骤 4 edit allow rule 命中（1.6 范围校验不构成硬闸，CC matchingRuleForInput 亦无范围校验）")
+            .isInstanceOf(PermissionResult.Allow.class);
+        assertThat(((PermissionResult.Allow) result).reason())
+            .as("reason=Rule（步骤 4 filesystem.ts:1384-1392，非 1.6）")
+            .isInstanceOf(PermissionDecisionReason.Rule.class);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     // OPD-WF5-FS-052 · matchingRuleForInput root-relative（// 根 / ~/ home / 单 / cwd 根）
     // ──────────────────────────────────────────────────────────────────────
 
@@ -442,6 +616,116 @@ class WritePermissionCheckerTest {
         assertThat(addRules.rules().get(0).ruleValue().ruleContent())
             .as("pattern = 前缀 + skillName + '/**'（filesystem.ts:151）")
             .isEqualTo("/.claude/skills/my-skill/**");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // T4-safety-ask-suggestion-fallback · 1.7 safety ask 非 skill 路径回落
+    // generateSuggestions（CC filesystem.ts:1327）
+    // ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("非 skill 路径触发 1.7 safety → Ask.suggestions 非空（回落 generateSuggestions，filesystem.ts:1327）")
+    void safetyAsk_nonSkillPath_suggestionsNonEmpty() {
+        Path cwd = cwdDir();
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of()), cwd);
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwd));
+
+        PermissionResult result = checker.check(tool, input("C:/x/.bashrc"), ctx);
+
+        assertThat(result).isInstanceOf(PermissionResult.Ask.class);
+        PermissionDecisionReason reason = ((PermissionResult.Ask) result).reason();
+        assertThat(reason)
+            .as("前置：C:/x/.bashrc 命中 1.7 危险文件（DANGEROUS_FILES filesystem.ts:57-68），"
+                + "且非 skill 路径（getClaudeSkillScope → null）⇒ 走回落分支")
+            .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+        assertThat(((PermissionDecisionReason.SafetyCheck) reason).classifierApprovable()).isTrue();
+
+        List<PermissionUpdate> suggestions = ((PermissionResult.Ask) result).suggestions();
+        assertThat(suggestions)
+            .as("WHY 这条断言重要：前端「一键授权」第三档【只在 suggestions 非空时渲染】"
+                + "（PermissionBubble.tsx:97 / permissionSuggestionLabels.ts:253 /"
+                + " useChatSocket.ts:155 空数组 → null）。回落前本仓恒传 List.of() ⇒"
+                + " 弹窗只剩「允许 / 拒绝」两档，用户点什么都生不出规则；"
+                + "CC filesystem.ts:1327 在 safety 失败时恒给非空建议 ⇒ 本用例即该对齐的可执行契约")
+            .isNotEmpty();
+        assertThat(suggestions)
+            .as("DEFAULT mode ⇒ shouldSuggestAcceptEdits=true（PermissionUpdates.java:247-248，CC :1449-1451）"
+                + "⇒ 必含 SetMode(session, acceptEdits)")
+            .anyMatch(u -> u instanceof PermissionUpdate.SetMode setMode
+                && setMode.destination() == PermissionUpdate.Destination.SESSION
+                && setMode.mode() == PermissionMode.ACCEPT_EDITS);
+    }
+
+    @Test
+    @DisplayName("可疑 Windows 路径（ADS）safety → 返回 Ask.suggestions 非空且不抛异常")
+    void safetyAsk_suspiciousWindowsAds_suggestionsNonEmptyWithoutThrow() {
+        Path cwd = cwdDir();
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of()), cwd);
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwd));
+
+        PermissionResult result = checker.check(tool, input("C:/x/file.txt::$DATA"), ctx);
+
+        assertThat(result)
+            .as("WHY 重要：ADS 冒号路径让 Java Paths.get 抛 InvalidPathException，而 CC 的兜底"
+                + " dirname 是纯字符串操作、恒不抛（path.ts:149）⇒ 本仓权限链必须返回 Ask（弹窗）"
+                + "而不是抛异常——抛异常意味着工具直接失败、用户连授权入口都看不到"
+                + "（PermissionUpdates.getDirectoryForPath 的 dirname 降级即为此而设）")
+            .isInstanceOf(PermissionResult.Ask.class);
+        assertThat(((PermissionResult.Ask) result).reason())
+            .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+        assertThat(((PermissionResult.Ask) result).suggestions())
+            .as("同 1：suspicious-Windows safety 亦须附非空建议（CC :1327 单点算一次，三分支共用）")
+            .isNotEmpty();
+    }
+
+    @Test
+    @DisplayName("工作目录内非 skill safety 路径（.claude/settings.json）→ 仍非空（不落空）")
+    void safetyAsk_inWorkingDirNonSkillPath_suggestionsNonEmpty() {
+        Path cwd = cwdDir();
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of()), cwd);
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwd));
+
+        // 工作目录内的 Claude 配置文件（CC isClaudeConfigFilePath filesystem.ts:200-222）
+        String path = cwd.resolve(".claude").resolve("settings.json").toString();
+        PermissionResult result = checker.check(tool, input(path), ctx);
+
+        assertThat(((PermissionResult.Ask) result).reason())
+            .as("前置：命中 1.7 Claude 配置文件分支（filesystem.ts:641-650）")
+            .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+        assertThat(((PermissionResult.Ask) result).suggestions())
+            .as("WHY 重要：工作目录内不等于「无需建议」——安全工作目录内 + 非 skill 路径同样"
+                + "要给出 SetMode(acceptEdits) 建议，否则用户在目录内改 .claude/settings.json 时"
+                + "依旧只能「允许 / 拒绝」，无第三档可选（CC :1327 同一口径）")
+            .anyMatch(u -> u instanceof PermissionUpdate.SetMode setMode
+                && setMode.mode() == PermissionMode.ACCEPT_EDITS);
+    }
+
+    @Test
+    @DisplayName("残留契约：BUBBLE mode + 工作目录内 → 仍为空（CC 同构判据，非本仓分歧）")
+    void safetyAsk_bubbleMode_inWorkingDir_residualEmpty() {
+        Path cwd = cwdDir();
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.BUBBLE, Map.of(), Map.of(), Map.of()), cwd);
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwd));
+
+        String path = cwd.resolve(".claude").resolve("settings.json").toString();
+        PermissionResult result = checker.check(tool, input(path), ctx);
+
+        assertThat(result)
+            .as("前置：BUBBLE 不改变 1.7 安全判定（仍 ask）")
+            .isInstanceOf(PermissionResult.Ask.class);
+        assertThat(((PermissionResult.Ask) result).suggestions())
+            .as("【显式钉住的残留，⛔ 不是已修好】PermissionUpdates.shouldSuggestAcceptEdits 只认"
+                + " DEFAULT/PLAN（PermissionUpdates.java:247-248 = CC :1449-1451 同一判据）；"
+                + " 路径在工作目录内 ⇒ AddDirectories 亦不产生 ⇒ BUBBLE/ACCEPT_EDITS/DONT_ASK/AUTO"
+                + " 四态在「目录内」一格仍返回空建议。这是 CC 同构行为（子 Agent 以 BUBBLE 运行时"
+                + " 触发目录内敏感文件 ask 会落进此洞），故本批【刻意不补】——⛔ 不得以顺手放宽"
+                + " mode 判据的方式私自补掉，如需覆盖须作为独立对齐项另行登记。"
+                + " 本用例把该洞钉成显式契约，防止未来被误读成「已全覆盖」")
+            .isEmpty();
     }
 
     // ──────────────────────────────────────────────────────────────────────

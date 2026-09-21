@@ -3835,9 +3835,11 @@ public record AgentLoopContext(
                 //   - removedNames 非空 → 'The following MCP servers have disconnected. Their instructions above
                 //     no longer apply:\n' + removedNames.join('\n')
                 //   wrapInSystemReminder + isMeta。addedBlocks/removedNames 均空 → 不注入（Java 防御）。
-                //   与 SP-30 静态 mcp_instructions section（SystemPromptSections，已对齐）区分——本 case 是
-                //   MCP 指令增删事件 attachment 的动态渲染。归 mcp 域：Java 无 mcp_instructions_delta
-                //   producer → 防御纯渲染。
+                //   与 SP-30 静态 mcp_instructions section（SystemPromptSections，会话冻结）区分——本 case 是
+                //   MCP 指令增删事件 attachment 的动态渲染。消费方（A1 已接线）：
+                //   ① 发送边界 {@link #maybeRenderDeltaAttachmentsForApi} —— 把持久化的 delta JSON
+                //      payload 渲染成本文案（附件结构化持久化 + 发送时渲染）；
+                //   ② 本类 hook 附件注入链（{@link #maybeInjectHookAttachments}）。
                 AttachmentMessageDto.McpInstructionsDeltaRef mid = a.mcpInstructionsDelta();
                 if (mid == null) {
                     return null;
@@ -4706,6 +4708,177 @@ public record AgentLoopContext(
             "刚刚", java.time.OffsetDateTime.now(), null, null,
             null, java.util.List.of(), java.util.List.of(), null, true)
             .withSubtype("edited_text_file");
+    }
+
+    /**
+     * <b>[A1 · 每轮 mcp_instructions_delta 尾部投递]</b> · 对齐 CC 2.1.88 形态
+     * {@code getAttachments} 的 {@code maybe('mcp_instructions_delta', ...)}（Open-ClaudeCode/src/
+     * utils/attachments.ts:854-863，位于 {@code allThreadAttachments} 段 :824-941）。
+     *
+     * <h2>为什么是这个形态（形态对齐 2.1.88；门对齐 2.1.278）</h2>
+     * 形态 = 挂在<b>每轮 attachments 流水线</b>上（2.1.88）：delta 经
+     * {@code yield attachment; toolResults.push(attachment)}（query.ts:1580-1588）成为<b>会话尾部
+     * 的一条真实消息</b>（append-only ⇒ 头部字节不动、变更即时可见）。本方法即该形态的 Java 等价：
+     * {@code state.appendMessage(...)} 尾部追加，⛔ 绝不触碰 {@code messages[0]}、⛔ 不调任何清集合入口。
+     * <p><b>门：本方法无门</b>（对齐 2.1.278，其发行产物已删除 isMcpInstructionsDeltaEnabled）；
+     * 2.1.88 那层 feature/env 门不再存在。对照：2.1.278 的 {@code prefix_delta} 通道实测为<b>死通道</b>
+     * （偏移 8041674 {@code dPr(){return "off"}} ⇒ 下游恒 return ⇒ 永不执行），本仓⛔ 不照抄该通道。
+     *
+     * <h2>内容来源（单一构造，⛔ 无第二套）</h2>
+     * 复用既有 producer {@code PostCompactAttachmentRestorer.mcpInstructionsDeltaAttachment}
+     * （attachments.ts:1559-1585 + mcpInstructionsDelta.ts:55-130）—— 与「压缩后重宣布」路径
+     * （{@code appendPostCompactDeltaAttachments}）用的是<b>同一个</b>构造。追加的消息形态 = producer 的
+     * 原样 JSON payload（role=user / author='attachment' / isMeta=true / subtype='mcp_instructions_delta'）。
+     *
+     * <p><b>⚠️ 落库事实（2026-09-21 定性 · 曾经本注释写反，已按代码改准）</b>：该消息<b>不落库</b>。
+     * {@code state.appendMessage} 只负责「内存追加 + 触 appendListener」，真正写 DB 的是
+     * {@code ChatService.persistAppendedMessage}（ChatService.java:1462），而它的 role=user 分支
+     * （:1563-1755）只有 4 个出口 —— 图片回写 / mid-turn 排队（{@code injectedQueuedById}）/
+     * {@code author=hook & subtype=hook_additional_context} / {@code subtype=skill_listing}，
+     * 其余一律 {@code return}。本形状不命中任何一个出口。两支兄弟（{@code date_change} /
+     * {@code edited_text_file}，同段同通道，见 {@link #maybeEmitDateChange} / {@link #maybeEmitChangedFiles}）
+     * <b>同样不落库</b> ⇒ 这是本仓 attachment 尾投的<b>既有形态</b>（不是本通道漏落）。
+     * 证据：{@code ChatServiceAttachmentTailPersistTest}（正对照 hook/skill_listing 落库、
+     * 三支尾投一条不落）+ 真库只读盘点（{@code messages} 表 attachment 行仅 skill_listing / task_status）。
+     *
+     * <p><b>⇒ 对 producer 的 diff 扫描源（{@code scanAnnouncedDeltaNames}）意味着什么</b>：
+     * 扫描源是 {@code state.rawMessages()}，<b>同一 run 内</b>有效（第二次调用即命中已公告集合并返回 null
+     * —— 这是「内容未变 ⇒ 一条都不追加」成立的范围）；<b>跨 run 无效</b> —— 每个 run 的历史从 DB
+     * 重建，里面没有本消息 ⇒ 下一 run 会把当前连接集<b>整体重公告一次</b>。故「已投递的指令绝不重复追加」
+     * 只在 run 内成立；跨 run 是<b>每用户轮一次的有界重公告</b>（不是无界线性膨胀，也不是
+     * 「只可见一次然后消失」）。是否改为落库（使跨 run 也生效、对齐 CC「attachment 进 transcript」）
+     * 属产品裁定，未在本批擅自决定（见 openQuestions）。
+     *
+     * <p>LLM 面看到的是<b>渲染后的人可读文案</b>（经 {@link #maybeRenderDeltaAttachmentsForApi}
+     * 在发送边界复用既有渲染 case，CC messages.ts:4216-4231）—— 对齐 CC「结构化附件持久化 +
+     * 发送时 normalizeAttachmentForAPI 渲染」，而不是把 JSON 直接甩给模型。
+     *
+     * <h2>门控（⛔ 无门 · 无条件每轮 · 对齐 2.1.278）</h2>
+     * 本方法<b>不再有任何 off 开关</b>：2.1.88 的 producer 门
+     * {@code isMcpInstructionsDeltaEnabled()}（mcpInstructionsDelta.ts:37-44）已在 2.1.278
+     * 发行产物里被整体删除（{@code CLAUDE_CODE_MCP_INSTR_DELTA} / {@code tengu_basalt_3kr} 各 0
+     * 命中，挂点与 producer 体内外均无 gate）。⇒ <b>「内容有变就必须投递」由本方法无条件保证</b>，
+     * 「MCP 中途连接/断开不即时可见」的分歧随该门的删除而关闭（前提：会话冻结的 system 段
+     * 仍在 C4=A2 保持冻结，指令变更只经本尾部通道曝光）。
+     *
+     * @param state AgentState（{@code rawMessages()} = producer 的 diff 扫描源；
+     *              {@code appendMessage} = 尾部投递通道；{@code sessionId()} = 消息标识载体）
+     * @param tuc   挂点传入的 ToolUseContext（CC 侧同一函数只收 toolUseContext；null → no-op）。
+     *              ⚠️ 生产挂点传的是 LlmAgentLoop 的 <b>run 级 base TUC</b>
+     *              （{@code params.toolUseContext()}，与 {@link #maybeEmitChangedFiles} 同参），
+     *              而 {@code deferred_tools_delta} 兄弟用的是 per-turn TUC ⇒ base TUC 的
+     *              {@code effectiveProviderType()} 恒 null（全仓唯一盖章点 =
+     *              {@code toolExecContext} :1523）⇒ producer 内 clientSide chrome 子块的门
+     *              （{@code toolReferenceUsable(null, model)} 恒 false）经本挂点<b>结构不可达</b>。
+     *              已登记（待解 D），本批未改（改需在挂点重建 per-turn TUC，牵动 state 盖章）。
+     * @param model 主循环模型名（producer 的 clientSide chrome 门：ToolSearch 乐观可用 + 模型支持）
+     */
+    public static void maybeEmitMcpInstructionsDelta(AgentState state,
+            com.nexusai.application.agent.tool.ToolUseContext tuc, String model) {
+        if (state == null || tuc == null) {
+            return;
+        }
+        // [去门 · 2026-09-21] 原此处有 producer 门 isMcpInstructionsDeltaEnabled 的短路
+        //   （默认 false ⇒ 零字节）。该门已按 2.1.278 整体删除 ⇒ 本挂点**无条件每轮**评估。
+        if (log.isDebugEnabled()) {
+            int connected = tuc.mcpClients() == null ? 0 : tuc.mcpClients().size();
+            int raw = state.rawMessages() == null ? 0 : state.rawMessages().size();
+            log.debug("[mcp_instructions_delta] 每轮无条件评估（无门）：已连接 server={} 条"
+                + " · diff 扫描源 rawMessages={} 条 · CC attachments.ts:854-863", connected, raw);
+        }
+        ChatMessageDto dtd = com.nexusai.application.agent.compact.PostCompactAttachmentRestorer
+                .mcpInstructionsDeltaAttachment(tuc, model, state.rawMessages());
+        if (dtd == null) {
+            // 无增量 = 已公告名称集合已覆盖当前连接（或本仓无带 instructions 的 MCP server）
+            // ⇒ 一条都不追加（要求 (a)/(c)：内容未变 / 首轮无需投递）
+            if (log.isDebugEnabled()) {
+                log.debug("[mcp_instructions_delta] producer 无增量（已公告集合已覆盖当前连接）⇒ 零追加"
+                    + " · CC mcpInstructionsDelta.ts:95-110");
+            }
+            return;
+        }
+        String sessionId = state.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            log.info("[mcp_instructions_delta] 检测到增量但无会话标识 ⇒ 无落库通道，不追加"
+                + "（对齐 CC simple 模式禁用附件的语义）");
+            return;
+        }
+        // sessionId / isMeta 由本通道补正（⚠️ 当前**不落库**，两处均为「形态正确性 + 未来落库预留」，
+        //   不是当前生效的落库前置条件 —— 见方法 javadoc 的「落库事实」段）：
+        //   · sessionId：producer 的 envelope 走 attachments.ts:3201 形态（sessionId=null），而
+        //     messages.session_id NOT NULL ⇒ 一旦本通道落库，不补即 insert 失败。
+        //   · isMeta：producer 的 envelope 建的是 isMeta=false，而前端**只按 isMeta** 隐藏元消息
+        //     （front/src/App.tsx:1864 / DialogOpsModal.tsx:24）⇒ 一旦落库，不拨正就会多出一条
+        //     「用户消息」（内容还是给模型看的 system-reminder）。CC 侧该消息由
+        //     normalizeAttachmentForAPI 以 {@code createUserMessage({isMeta:true})} 产出（messages.ts:4228-4230）。
+        //   · 当前有效性：不落库 + user 分支不推 STOMP ⇒ 该消息对 UI 本就不可见，isMeta 只对
+        //     「模型面」与「未来落库」有意义；isMeta **不影响 provider 序列化**（R32C1 实证），
+        //     故模型面照常看到（这正是投递目的）。
+        state.appendMessage(dtd.withSessionId(sessionId).withIsMeta(true));
+        log.info("[mcp_instructions_delta] 尾部追加 delta 消息（头部字节不变，⛔ 绝不回写 messages[0]）:"
+            + " sessionId={} payloadLen={} · CC attachments.ts:854-863 + query.ts:1580-1588",
+            sessionId, dtd.content() == null ? 0 : dtd.content().length());
+    }
+
+    /**
+     * <b>[A1 · 发送边界渲染]</b> 把持久化的 {@code mcp_instructions_delta} JSON payload 渲染成
+     * 人可读文案，<b>复用</b> {@link #renderHookAttachmentForLlm} 的 case
+     * {@code 'mcp_instructions_delta'}（CC messages.ts:4216-4231）—— 单一渲染实现，⛔ 不另写模板。
+     *
+     * <p><b>WHY 必须有这一步</b>：CC 的附件是「<b>结构化持久化 + 发送时渲染</b>」——transcript 里存
+     * {@code {type:'mcp_instructions_delta', addedBlocks, removedNames}}（mcpInstructionsDelta.ts:10-16，
+     * 经 {@code createAttachmentMessage} 成为 AttachmentMessage），文案只在
+     * {@code normalizeAttachmentForAPI}（= 出站边界）才生成。本仓的载体是
+     * {@code ChatMessageDto.content}（单字段），其内容是 producer 的 JSON（**内存内**是跨轮 diff 的
+     * 扫描源；⚠️ 该消息当前<b>不落库</b>，见 {@link #maybeEmitMcpInstructionsDelta} 的「落库事实」段）
+     * ⇒ 若不做本步，模型看到的就是原始 JSON。
+     *
+     * <p><b>为什么放在发送边界</b>：与 {@code wrapQueuedMessagesForApi} 同一处 ——
+     * 那里的注释已把该点定义为「唯一发送边界 · 对齐 CC normalizeMessagesForAPI（messages.ts:2269-2291）」。
+     *
+     * <p><b>纯函数 / 幂等</b>：仅当 subtype 命中<b>且 content 仍是可解析的 delta JSON</b> 时替换
+     * （{@code withContent}，id/role/isMeta/subtype 全透传）；同一 payload 每轮渲染出同一字节
+     * ⇒ 前缀稳定性不受影响。已是渲染文案（非 JSON）→ 解析失败 → 原样返回。
+     * 无命中 / 列表空 → <b>返回原引用</b>（零行为变化）。
+     *
+     * @param messagesForLlm 发送面消息列表（{@code wrapQueuedMessagesForApi} 之后）
+     * @return 需要替换时的新列表；否则原引用
+     */
+    public static java.util.List<ChatMessageDto> maybeRenderDeltaAttachmentsForApi(
+            java.util.List<ChatMessageDto> messagesForLlm) {
+        if (messagesForLlm == null || messagesForLlm.isEmpty()) {
+            return messagesForLlm;
+        }
+        java.util.List<ChatMessageDto> out = null;
+        for (int i = 0; i < messagesForLlm.size(); i++) {
+            ChatMessageDto m = messagesForLlm.get(i);
+            if (m == null || m.content() == null
+                    || !com.nexusai.application.agent.compact.PostCompactAttachmentRestorer
+                        .DELTA_TYPE_MCP_INSTRUCTIONS.equals(m.subtype())) {
+                continue;
+            }
+            com.nexusai.application.agent.attachment.AttachmentMessageDto att =
+                com.nexusai.application.agent.compact.PostCompactAttachmentRestorer
+                    .mcpInstructionsDeltaToAttachment(m.content());
+            if (att == null) {
+                // 已渲染 / 非 JSON（幂等分支）或两段均空（无可渲染内容）
+                continue;
+            }
+            String text = renderHookAttachmentForLlm(att);
+            if (text == null) {
+                continue;
+            }
+            if (out == null) {
+                // 惰性复制：只有真的命中才复制（否则返回原引用，零行为变化）
+                out = new java.util.ArrayList<>(messagesForLlm);
+            }
+            out.set(i, m.withContent(text));
+        }
+        if (out != null && log.isDebugEnabled()) {
+            log.debug("[mcp_instructions_delta] 发送边界渲染 {} 条 delta JSON → 人可读文案"
+                + "（CC messages.ts:4216-4231，附件结构化持久化 + 发送时渲染）", out.size());
+        }
+        return out != null ? out : messagesForLlm;
     }
 
     /**

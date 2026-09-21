@@ -2,6 +2,14 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.18] - 2026-09-21
+
+### 修复
+- 修复探针口径假阳性导致的「头部漂移」误报。
+
+### 新增
+- MCP 指令变更「每轮 delta 尾部投递」通道。
+
 ## [0.1.17] - 2026-09-21
 
 ### 修复

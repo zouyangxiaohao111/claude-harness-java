@@ -156,9 +156,9 @@ public final class PermissionUpdates {
 
     /**
      * 取文件/目录路径对应的目录 · 对齐 CC {@code getDirectoryForPath}
-     * （path.ts:109-125）：目录 → 返回自身；文件或不存在 → 返回父目录。
+     * （path.ts:133-150）：目录 → 返回自身；文件或不存在 → 返回父目录。
      *
-     * <p>UNC 路径不做文件系统访问直接返回 dirname（防 NTLM 凭据泄露，CC :112-114）。
+     * <p>UNC 路径不做文件系统访问直接返回 dirname（防 NTLM 凭据泄露，CC :134-136）。
      * 入参恒为已展开的绝对路径（调用方 {@code expandPath} 结果），无需二次展开
      * （CC getDirectoryForPath 内部 {@code expandPath(path)} 的结果即本方法入参）。
      *
@@ -166,26 +166,55 @@ public final class PermissionUpdates {
      * 供 {@link #generateSuggestions} 的 read/write/create 三分支复用目录展开。
      *
      * @param absolutePath 绝对路径（expandPath 结果）
-     * @return 对应目录路径；无法确定父目录时回退原路径
+     * @return 对应目录路径；无法确定父目录时回退原路径（恒不抛，见 {@link #dirnameString}）
      */
     public static String getDirectoryForPath(String absolutePath) {
         if (absolutePath == null) {
             return null;
         }
-        // SECURITY: UNC 路径不做 stat（防 NTLM 凭据泄露，CC path.ts:112-114）
+        // SECURITY: UNC 路径不做 stat（防 NTLM 凭据泄露，CC path.ts:134-136）
         if (absolutePath.startsWith("\\\\") || absolutePath.startsWith("//")) {
-            Path p = Paths.get(absolutePath);
-            return p.getParent() != null ? p.getParent().toString() : absolutePath;
+            return dirnameString(absolutePath);
         }
         try {
             if (Files.isDirectory(Paths.get(absolutePath))) {
                 return Paths.get(absolutePath).toAbsolutePath().normalize().toString();
             }
         } catch (Exception e) {
-            // 路径不存在或不可访问 → 落到父目录分支（CC path.ts:119-121 catch 忽略）
+            // 路径不存在或不可访问 → 落到父目录分支（CC path.ts:145-147 catch 忽略）
         }
-        Path p = Paths.get(absolutePath).getParent();
-        return p != null ? p.toString() : absolutePath;
+        // CC 兜底 dirname(absolutePath)（path.ts:149）为纯字符串操作、恒不抛；Java 的
+        // Paths.get 在 Windows 对非法字符（ADS 冒号形 'C:/x/f.txt::$DATA'）抛
+        // InvalidPathException ⇒ 必须降级到字符串级 dirname 才能保持 CC「恒不抛」语义。
+        // [T4] 该分支随 1.7 safety ask 回落接入 generateSuggestions 后首次可达
+        // （ADS 路径同时命中 suspicious-Windows safety 分支）——否则权限链抛异常而非返回 Ask。
+        try {
+            Path p = Paths.get(absolutePath).getParent();
+            return p != null ? p.toString() : absolutePath;
+        } catch (Exception e) {
+            return dirnameString(absolutePath);
+        }
+    }
+
+    /**
+     * 字符串级父目录 · <b>恒不抛</b>（CC {@code dirname} 等价，path.ts:136/:149）。
+     *
+     * <p>仅作 {@link #getDirectoryForPath} 在 {@code Paths.get} 抛
+     * {@link java.nio.file.InvalidPathException}（Windows 非法字符，如 ADS 冒号）时的
+     * 降级出口，正常路径不走此处。
+     *
+     * @param path 绝对路径（可 null）
+     * @return 父目录字符串；无分隔符 → 原路径；根形（{@code /x}）→ 根
+     */
+    private static String dirnameString(String path) {
+        if (path == null) {
+            return null;
+        }
+        int cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        if (cut < 0) {
+            return path;
+        }
+        return cut == 0 ? path.substring(0, 1) : path.substring(0, cut);
     }
 
     /**
