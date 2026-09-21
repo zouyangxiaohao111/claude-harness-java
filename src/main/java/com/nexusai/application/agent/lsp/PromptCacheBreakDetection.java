@@ -45,6 +45,18 @@ public final class PromptCacheBreakDetection {
     private static final Logger log = LoggerFactory.getLogger(PromptCacheBreakDetection.class);
 
     public static final long MIN_CACHE_MISS_TOKENS = 2_000L;
+
+    /**
+     * [前缀缓存头部探针 · 同语义单一来源] cacheRead 视为「仍然命中」的比例门槛 ——
+     * {@code cacheRead >= 上一条 cacheRead × 0.95} 即不判为 cache break。
+     *
+     * <p>CC 真源 {@code services/api/promptCacheBreakDetection.ts:487}
+     * {@code cacheReadTokens >= prevCacheRead * 0.95}（内联字面量），本常量把它提出来供
+     * {@link #checkResponseForCacheBreak} 与出站探针（{@code OpenAiSdkProvider}）共用 ——
+     * 严格同判据，⛔ 不把 0.95 抄成第二份（同语义禁止双实现）。
+     */
+    public static final double CACHE_READ_HIT_RATIO = 0.95;
+
     public static final long CACHE_TTL_5MIN_MS = 5L * 60L * 1000L;
     public static final long CACHE_TTL_1HOUR_MS = 60L * 60L * 1000L;
     public static final int MAX_TRACKED_SOURCES = 10;
@@ -257,7 +269,8 @@ public final class PromptCacheBreakDetection {
             return;
         }
         long tokenDrop = prevCacheRead - cacheReadTokens;
-        if (cacheReadTokens >= prevCacheRead * 0.95 || tokenDrop < MIN_CACHE_MISS_TOKENS) {
+        if (cacheReadTokens >= prevCacheRead * CACHE_READ_HIT_RATIO
+                || tokenDrop < MIN_CACHE_MISS_TOKENS) {
             state.pendingChanges = null;
             return;
         }
@@ -372,9 +385,45 @@ public final class PromptCacheBreakDetection {
     }
 
     private static long computeHash(Object data) {
+        return computeHashOfCanonical(stableString(data));
+    }
+
+    /**
+     * [前缀缓存头部探针 · 步骤 1] 出站头部指纹（hash + 规范化串长度）· 供
+     * {@code OpenAiSdkProvider} 出站探针复用。
+     *
+     * <p>hash 与 {@link #recordPromptState} 内部<b>同一实现</b>（同一 {@link #stableString} 规范化 +
+     * 同一 SHA-256 取前 32 位 = CC {@code computeHash} 语义，真源
+     * {@code services/api/promptCacheBreakDetection.ts:170-180}）—— 本方法只是把既有私有能力
+     * 按需放宽可见性，⛔ 不另造第二套 hash（同语义禁止双实现）。
+     *
+     * <p>返回的 {@code length} 是<b>规范化串</b>长度（Map/List 递归展开后的字符数，
+     * 标量取 {@code toString().length()}）—— 只用于「长度是否漂移」的旁证，不是出站字节数。
+     *
+     * <p>⚠️ <b>非 Map/List 的入参走 {@code data.toString()}</b>（见 {@link #stableString}）——
+     * 因此⛔ <b>绝不可</b>把 {@code ChatMessageDto} / tools 源 JSON 节点直接喂进来：
+     * {@code ChatMessageDto} 是未覆写 {@code toString} 的 record，其 {@code id/createdAt/time}
+     * 等<b>不进 wire</b> 的客户端字段会进 hash；出站探针每轮新造 meta 元消息 ⇒ hash 每请求都变
+     * （恒假阳性）。⇒ 调用方必须先用<b>线级投影</b>把入参收敛成「只含上 wire 的字段」
+     * （生产实现 = {@code com.nexusai.infra.llm.OutboundWireProjection}）。
+     *
+     * @param data 任意出站头部构件的<b>线级投影串</b>（String）或本身就是稳定结构的 Map/List；
+     *             null → 等价于 {@code ""}
+     * @return 指纹；data 为 null → {@code (hash(""), 0)}
+     */
+    public static ProbeDigest probeDigest(Object data) {
+        String canonical = stableString(data);
+        return new ProbeDigest(computeHashOfCanonical(canonical), canonical.length());
+    }
+
+    /** 出站头部指纹（见 {@link #probeDigest(Object)}）· hash + 规范化串长度。 */
+    public record ProbeDigest(long hash, int length) {}
+
+    /** JSON 规范化串 → hash（{@link #computeHash} 与 {@link #probeDigest} 的唯一算法实现）。 */
+    private static long computeHashOfCanonical(String canonical) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] hash = md.digest(stableString(data).getBytes(StandardCharsets.UTF_8));
+            byte[] hash = md.digest(canonical.getBytes(StandardCharsets.UTF_8));
             return ((hash[0] & 0xFFL) << 24) | ((hash[1] & 0xFFL) << 16)
                 | ((hash[2] & 0xFFL) << 8) | (hash[3] & 0xFFL);
         } catch (Exception ex) {

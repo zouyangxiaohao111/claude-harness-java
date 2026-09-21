@@ -20,6 +20,7 @@ import com.nexusai.application.agent.attachment.MediaLimitConstants;
 import com.nexusai.application.agent.attachment.MediaLimitGuard;
 import com.nexusai.application.agent.attachment.PdfAttachmentStore;
 import com.nexusai.application.agent.tool.impl.AskUserQuestionTool;
+import com.nexusai.application.agent.tool.impl.BriefTool;
 import com.nexusai.application.agent.tool.impl.PdfSupport;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
@@ -1784,6 +1785,11 @@ public class ChatService {
                     || content.toLowerCase().contains("dangerous")
                     || content.toLowerCase().contains("not found")
                     || content.toLowerCase().contains("no such tool");
+                // [brief-payload] UI 面载荷：SendUserMessage 走结构化 payload JSON（见 toolResultUiPayload），
+                //   其余工具仍为该文本的 truncate 副本。模型面文本不受影响（rec.content = content 原样落库）。
+                ToolCallRecord tcUpdate = toolCallMapper.selectOneById(m.toolCallId());
+                String uiPayload = toolResultUiPayload(
+                    tcUpdate != null ? tcUpdate.getToolName() : null, m, content);
                 // [工具调用实时推] 去重 + STOMP 推送。父 id = m.assistantMessageId()（= turnAssistantId）；
                 //   null 时跳过推送（实时上下文无原 replayAndPersist finalAssistantId 随机占位——DB insert
                 //   无条件保留，前端刷新经 GET /messages 重建卡片；fail loud 已 debug 记日志）。
@@ -1799,17 +1805,17 @@ public class ChatService {
                     sendAndLog(wsTemplate, streamTopic,
                         new MessageToolResultEvent(sessionId, ctx.lastUserMessageId.get(),
                             m.assistantMessageId(),
-                            m.toolCallId(), truncate(content, 5000), isError),
+                            m.toolCallId(), uiPayload, isError),
                         "tool_result id=" + abbreviate(m.toolCallId(), 24)
-                            + " len=" + content.length() + " isError=" + isError);
+                            + " len=" + content.length()
+                            + " uiPayload=" + abbreviate(uiPayload, 80) + " isError=" + isError);
                 }
                 MessageRecord rec = newToolMessage(sessionId, m.toolCallId(), content, ctx.lastUserMessageId.get());
                 rec.setCreatedAt(ts.toString());
                 rec.setSeq(nextSeq(sessionId));   // [seq 排序键] 位置键取号
                 messageMapper.insert(rec);
-                ToolCallRecord tcUpdate = toolCallMapper.selectOneById(m.toolCallId());
                 if (tcUpdate != null) {
-                    tcUpdate.setResult(truncate(content, 5000));
+                    tcUpdate.setResult(uiPayload);
                     tcUpdate.setIsError(isError);
                     toolCallMapper.update(tcUpdate);
                 }
@@ -2730,6 +2736,59 @@ public class ChatService {
     private static String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() > max ? s.substring(0, max) + "\n... (truncated)" : s;
+    }
+
+    /**
+     * [brief-payload] {@code tool_calls.result} 承载的 UI 面载荷 · 对齐 CC「数据 / 给模型看的文本」分离
+     * （BriefTool.ts:42-63 {@code outputSchema} = 数据 vs :175-183 {@code mapToolResultToToolResultBlockParam}
+     * = 模型面文案）。
+     *
+     * <p><b>WHY 用 tool_calls.result 承载</b>：CC 的 UI 渲染的是工具 output
+     * {@code {message, attachments:[{path,size,isImage}], sentAt}}，而人类文案只给模型看。
+     * nexusai 的 {@code tool_calls.result} 列<b>只被 {@code MessageService.toDto} 一处读取</b>
+     * （→ {@code ToolCallDto.result}，纯 UI 面；模型面 tool_result 文本走
+     * {@code messages(role=tool).content}，resume/重放不经本列）——故对 SendUserMessage
+     * 本列承载结构化 payload：前端能拿到 message/attachments/sentAt，模型面文本逐字不变。
+     * 其余工具本列仍是人类文案的截断副本 ⇒ 不破坏既有工具卡展示。
+     *
+     * <p><b>回落链</b>：非 SendUserMessage / 结构化载荷缺失（{@code structuredOutput} 未接线、
+     * 协议不符无 {@code message} 键）/ 序列化失败 → 人类文案截断（原行为，前端按 legacy 解析
+     * {@code arguments} 兜底）。
+     *
+     * @param toolName        该 tool_call 的工具名（DB 记录；null = 查不到记录）
+     * @param m               tool_result 消息（{@code structuredOutput} 即工具 output data，
+     *                        由 {@code ToolResultApplier} → {@code AgentState.recordStructuredOutput}
+     *                        → {@code LlmAgentLoop.toolResultMessage} 挂载）
+     * @param modelFacingText 模型面 tool_result 文本（{@code messages.content}，本方法不改它）
+     * @return 落库/推送的 UI 面载荷
+     */
+    static String toolResultUiPayload(String toolName, ChatMessageDto m, String modelFacingText) {
+        if (toolName == null
+                || !(BriefTool.NAME.equals(toolName) || BriefTool.LEGACY_NAME.equals(toolName))) {
+            return truncate(modelFacingText, 5000);
+        }
+        Map<String, Object> structured = m == null ? null : m.structuredOutput();
+        // [F1 2026-09-20] 判定 + 序列化**单一源** = BriefTool.structuredUiPayload —— 实时通道
+        //   （StreamingToolExecutor.pushToolResultRealtime）读同一方法。两条投放通道（executor 先手
+        //   实时推 / 本处落库重拉）必须逐字同形：交互路径上先手通常是 executor（本方法所在分支被
+        //   realtimeToolResultsPushed 去重跳过，见上文 :1797 注释），若两处各写各的序列化，
+        //   前端 F5 前后拿到的载荷形态就可能不同。
+        String json = BriefTool.structuredUiPayload(toolName, structured);
+        if (json == null) {
+            if (log.isWarnEnabled()) {
+                log.warn("ChatService: SendUserMessage 结构化载荷缺失，回落到人类文案（前端按 arguments 兜底）: "
+                    + "toolName={} structuredOutput={}",
+                    toolName, structured == null ? "null" : structured.keySet());
+            }
+            return truncate(modelFacingText, 5000);
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("ChatService: SendUserMessage UI 载荷改结构化 JSON（模型面文本不变）: "
+                + "toolName={} 字段={} payloadLen={} modelFacingLen={}",
+                toolName, structured.keySet(), json.length(),
+                modelFacingText == null ? 0 : modelFacingText.length());
+        }
+        return json;
     }
 
     private MessageRecord newAssistantMessage(String sessionId, String id, String userMessageId) {

@@ -4647,6 +4647,85 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * <b>[步骤 7 · 投递层]</b> 把启动载入的 CLAUDE.md / rules 登记进 readFileState ·
+     * 对齐 CC {@code REPL.tsx:3797-3818 onInit}（{@code getMemoryFiles()} → 逐个
+     * {@code readFileState.set({content, timestamp: Date.now(), offset: undefined, limit: undefined})}）。
+     *
+     * <p><b>WHY 必须有这一步</b>：本步骤的投递通道（{@code ChangedFilesDetector} → 尾部
+     * edited_text_file）判据是 {@code mtime > readFileState 里的记录时间戳}，而
+     * {@code ChangedFilesDetector} 又会<b>跳过 offset/limit 已设的 entry</b>（CC attachments.ts:2076-2078）。
+     * 若启动不登记（或登记时写了 offset），根 CLAUDE.md / rules 的变更就<b>永远不会</b>被投递 ——
+     * 而它们恰恰是「头部冻结」最需要补偿 freshness 的对象。这一格（{@code offset/limit = null}）
+     * 就是本步骤覆盖范围能否包含启动记忆文件的<b>唯一开关</b>。
+     *
+     * <p><b>扫描根口径与本 run 的 head 完全一致</b>：用与上方 {@code UserContextProvider} 相同的
+     * 三元（{@code sessionState.workspaceDir() ?? CwdResolution.getProjectRoot(sessionId)}），
+     * 保证「登记的文件」与「进头部 claudeMd 的文件」是同一批（否则会出现头部没有、尾部却报变更的错位）。
+     *
+     * <p><b>为什么用未过滤的 {@code getMemoryFiles}</b>：CC REPL.tsx:3798 就是未过滤的
+     * {@code getMemoryFiles()}（{@code filterInjectedMemoryFiles} 只作用于进 claudeMd 的那一步，
+     * context.ts:170-172）—— 登记面大于头部面是 CC 的既有形态，不在此处收窄。
+     *
+     * <p><b>不阻断组装</b>：任何异常只记 WARN（CC 该路径无 try；本仓必须保证材料收集不因
+     * 一个附件登记失败而整体失败）。
+     *
+     * <p><b>⭐ 跨 run 语义（本批修正点，勿退回）</b>：本方法<b>每 run</b> 被调用，而
+     * readFileState 在本仓是 <b>run 级</b>缓存 ⇒ 登记时间戳若每次都取「当下」，用户在两条消息
+     * 之间改 CLAUDE.md 的 mtime 会被下一次登记吸收、<b>永不投递</b>。故登记走会话级
+     * 「首次登记」固化表（{@code SessionChangedFilesBaselineRegistry}，按 sessionId 分区）：
+     * 首次落基线，此后每次 run 复用同一时间戳 + 内容基线 ⇒ 判据 {@code mtime > 记录时间戳}
+     * 在「run 与 run 之间改盘」这一真实场景下成立。同一变更的「只投一次」由检测后的
+     * {@code SessionChangedFilesBaselineRegistry.syncFromRunCache} 固化（见 maybeEmitChangedFiles）。
+     * 会话标识缺失 ⇒ 无跨 run 身份可用 ⇒ 退回改造前形态（诚实降级，日志可见）。
+     *
+     * @param ctx    循环上下文（{@code claudemdEngine} / {@code sessionState} 来源）
+     * @param params 入参（{@code toolUseContext().readFileState()} 为登记目标）
+     * @param state  AgentState（{@code sessionId} 供扫描根解析 + InstructionsLoaded 载荷）
+     */
+    private static void seedMemoryFilesBaselineForChangeDetection(
+            AgentLoopContext ctx,
+            com.nexusai.application.agent.loop.QueryParams params,
+            AgentState state) {
+        if (ctx == null || state == null || ctx.claudemdEngine() == null) {
+            return;
+        }
+        ToolUseContext tuc = params != null ? params.toolUseContext() : null;
+        if (tuc == null || tuc.readFileState() == null) {
+            return;
+        }
+        try {
+            String sessionProjectRoot = (ctx.sessionState() != null
+                    && ctx.sessionState().workspaceDir() != null)
+                ? ctx.sessionState().workspaceDir().toString()
+                : com.nexusai.application.agent.agent.CwdResolution.getProjectRoot(state.sessionId());
+            java.util.List<com.nexusai.application.agent.context.MemoryFileInfo> files =
+                ctx.claudemdEngine().getMemoryFiles(false, state.sessionId(), sessionProjectRoot);
+            // [步骤 7 修正] 会话级「首次登记」固化表：readFileState 在本仓是 run 级缓存
+            //   （LlmAgentLoop 为 prototype、每 send 新实例 ⇒ buildBaseToolUseContext 每次新建），
+            //   而本方法每 run 都会走一次 ⇒ 若每次都以「当下」当登记时间戳，用户两条消息之间
+            //   改 CLAUDE.md 的 mtime 会被下一次登记吸收、永不投递
+            //   （独立验证 #1 判 REFUTED；判据 mtime > 记录时间戳 保持不变）。
+            //   会话基线为 null（无会话标识）⇒ 三参重载退回改造前形态（诚实降级）。
+            com.nexusai.application.agent.tool.FileStateCache sessionBaseline =
+                com.nexusai.application.agent.attachment.SessionChangedFilesBaselineRegistry
+                    .forSession(state.sessionId());
+            int seeded = ctx.claudemdEngine()
+                .registerMemoryFilesBaseline(files, tuc.readFileState(), sessionBaseline);
+            if (log.isDebugEnabled()) {
+                log.debug("[步骤7·投递层] readFileState 启动登记完成: sessionId={} 登记 {} 个记忆文件"
+                    + "（会话基线{} / readFileState 现有 {} 条）· CC REPL.tsx:3797-3818",
+                    state.sessionId(), seeded,
+                    sessionBaseline != null ? "已建档" : "缺失(无会话，退回每 run 取当下)",
+                    tuc.readFileState().size());
+            }
+        } catch (Exception e) {
+            // 不阻断材料收集（登记失败只失去「启动记忆文件的变更投递」这一条通道）
+            log.warn("[步骤7·投递层] readFileState 启动登记失败（不阻断材料收集，该通道本轮不生效）: "
+                + "sessionId={} 原因={} · CC REPL.tsx:3797-3818", state.sessionId(), e.getMessage());
+        }
+    }
+
+    /**
      * [prompt-assembly-B] per-run 系统提示「材料收集」· 由 {@code queryLoop} 的**调用方**调用
      * （{@code fetchSystemPromptParts} utils/queryContext.ts:44-74 → {@code buildEffectiveSystemPrompt}
      * utils/systemPrompt.ts:41-123 → coordinator userContext 合并 QueryEngine.ts:302-306）。
@@ -4657,9 +4736,14 @@ public class LlmAgentLoop implements AgentLoop {
      * 副本交给 queryLoop。CC 真源 {@code query.ts:393-411}「Immutable params — never reassigned
      * during the query loop」—— {@code loop()} 收到**已折好**的提示，自己不重折。
      *
-     * <p><b>生命周期自管</b>：{@link com.nexusai.application.agent.prompt.SystemPromptContextProvider}
-     * 由本方法创建并在 {@code finally} 中 {@code close()}（构造即注册缓存清理回调，注销成对，
-     * 异常路径同样关），调用方无需持有/关闭。会话级 {@link com.nexusai.application.agent.prompt.GitStatusProvider}
+     * <p><b>生命周期归属 = 会话级（本方法<u>不</u> close）</b>：
+     * {@link com.nexusai.application.agent.prompt.SystemPromptContextProvider} 由
+     * {@code state.promptCacheStore()}（会话级 store）<b>持有并复用</b>，本方法只取用、<b>不</b>创建也
+     * <b>不</b>在 {@code finally} 中 {@code close()}（见下方 {@code finally} 的数据流日志说明）——
+     * 这与「每 run 新建 / 每 run close」的旧形态相反。注销（register/unregister 成对、静态表不随
+     * 会话数累积）的等价动作改由<b>会话终结</b>承担：
+     * {@code SessionPromptCacheRegistry.evict → SessionPromptCacheStore.close}。
+     * 会话级 {@link com.nexusai.application.agent.prompt.GitStatusProvider}
      * 仍从 {@code ctx.sessionState()} 取（跨 run 共享同一实例 → 会话内 git 快照字节稳定）。
      *
      * <p><b>禁止把它搬回 do-while 内</b>（CC query.ts:1991-1999 refreshTools 只刷 tools 不重算
@@ -4701,12 +4785,24 @@ public class LlmAgentLoop implements AgentLoop {
                 : new com.nexusai.application.agent.prompt.GitStatusProvider(java.nio.file.Path.of(
                     com.nexusai.application.agent.agent.CwdResolution.getCwd(
                         state != null ? state.sessionId() : null)));
-        // [RES-C2] R5-4 注销通道（Java 内部卫生，非 CC 对齐项）：本方法创建的 provider 在 finally
-        //   close() 注销（register/unregister 成对，CACHE_CLEAR_HOOKS 不随会话有界累积）。CC 参考：
-        //   getSystemContext 进程级 memoize（context.ts:116）不销毁 —— close 不改变任何缓存清理语义。
+        // [步骤 2 · 会话级 prompt 缓存 store] provider 改为<b>会话级</b>：store 首建（本会话首个 run）
+        //   后跨 run 复用<b>同一实例</b> ⇒ 其内部实例级 memoize（getSystemContext context.ts:116 /
+        //   getUserContext context.ts:155）与传入的会话冻结日期（common.ts:24）一并跨 run 冻结 ——
+        //   这正是 CC 进程级 memoize 的等价物（本仓按 sessionId 分区的会话级，见 store 类 javadoc）。
+        //   ⛔ 不再每 run new：每 run 重建 = memoize 归零 ⇒ userContext/systemContext 每 run 重算 ⇒
+        //   头部字节漂移（本批要修的 bug）。⛔ 也不在本方法 close（见下方 finally 的数据流日志说明）。
+        final com.nexusai.application.agent.prompt.SessionPromptCacheStore promptCacheStore =
+            state.promptCacheStore();
+        //   会话冻结日期改取 store 上的值（= 本会话首个 run 的本地日，跨午夜保留旧日期）：
+        //   AgentState.sessionStartDate() 仍是「构造期本地日」（每 run 计算），store 只取首建那一次。
         final com.nexusai.application.agent.prompt.SystemPromptContextProvider sysPromptCtxProvider =
-            new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
-                state.sessionStartDate(),
+            promptCacheStore.contextProvider(() ->
+                new com.nexusai.application.agent.prompt.SystemPromptContextProvider(
+                // [步骤 4 · 集合D-2] 日期以 **Supplier** 注入（store::sessionStartDate），
+                //   ⛔ 不传值快照：集合 D-2 的失效（CC getSessionStartDate.cache.clear，caches.ts:55）
+                //   要求「清后下次读取取当天」，值快照会让清空无处落地（只剩两份日期副本）。
+                //   唯一真相 = store.sessionStartDate（volatile），见 PromptCacheGroup 集合 D 行。
+                promptCacheStore::sessionStartDate,
                 // [cwd-fix 2026-08-25] 显式传会话绑定 projectRoot（sessionState.workspaceDir，CC 启动冻结）——
                 //   旧构造 new UserContextProvider(claudemdEngine) 依赖隐式会话解析（裸 MDC 槽，批 3c 已删），
                 //   system prompt 构建线程可能无会话 → getOriginalCwdLayer 落 user.dir（nexusai-backend），
@@ -4755,7 +4851,13 @@ public class LlmAgentLoop implements AgentLoop {
                     // [批 3c] 会话显式传入 → 引擎 CLAUDE.md 扫描根按本会话解析（否则回落 user.dir，
                     //   会话绑定项目的 CLAUDE.md 进不了 system prompt）
                     state != null ? state.sessionId() : null),
-                gp);
+                gp));
+        // ── [步骤 7 · 投递层] 启动把 CLAUDE.md / rules 登记进 readFileState ──
+        //   对齐 CC REPL.tsx:3797-3818（onInit：getMemoryFiles() → readFileState.set(offset/limit=undefined)）
+        //   + attachments.ts:1737-1741 注释自述「刻意留空 offset/limit 正是为了让 getChangedFiles 生效」。
+        //   登记后，本 run 内若这些文件被改动（用户/外部工具/后续工具写盘），下一轮就会在<b>尾部</b>
+        //   投递 edited_text_file 变更提示（AgentLoopContext.maybeEmitChangedFiles），而头部字节不变。
+        seedMemoryFilesBaselineForChangeDetection(ctx, params, state);
         try {
             // 0. memoryMechanicsPrompt（G-11 插入位）：custom 非空 && hasAutoMemPathOverride() →
             //    loadMemoryPrompt()（CC QueryEngine.ts:316-319，组装在 while 前一次 · 每 query() 一次）。
@@ -4832,7 +4934,16 @@ public class LlmAgentLoop implements AgentLoop {
                 //   故此处存 EffectiveSystemPromptBuilder 的产物（未 append systemContext）。
                 .withSystemPrompt(effectiveSystemPrompt.elements())
                 .withUserContext(mergedUserContext)
-                .withSystemContext(java.util.Map.copyOf(sysParts.systemContext()));
+                // [步骤 5 · item 6 迭代序] ⭐ <b>保持插入序</b>：CC 的 appendSystemContext 用
+                //   `Object.entries(context)`（utils/api.ts:437-447）拼 `key: value` 行 ⇒ **插入序**。
+                //   原实现用 `Map.copyOf`：其迭代序是**哈希探测序**（JDK ImmutableCollections.MapN，
+                //   由类初始化时随机化的 SALT 决定），**不是插入序**（同一 JVM 内同键集稳定，
+                //   但字节与 CC 的 Object.entries 序无关，且一旦 JDK 实现/键集变化即整体漂移）。
+                //   改为"LinkedHashMap 快照 + unmodifiableMap"：既保住原 Map.copyOf 的不可变快照语义
+                //   （QueryParams 是 record、下游可能共享该引用），又让迭代序 = 插入序（= CC 语义）。
+                //   ⛔ 不改渲染模板本身（模板已与 CC 逐字一致，见 appendSystemContext javadoc）。
+                .withSystemContext(java.util.Collections.unmodifiableMap(
+                    new java.util.LinkedHashMap<>(sysParts.systemContext())));
             if (log.isDebugEnabled()) {
                 log.debug("[prompt-assembly-B] per-run 材料收集完成（调用方一次）: custom={}, "
                         + "defaultBlocks={}, userKeys={}, systemKeys={}, runTuc={}",
@@ -4842,8 +4953,20 @@ public class LlmAgentLoop implements AgentLoop {
             }
             return out;
         } finally {
-            // [RES-C2] R5-4：本方法创建的 provider 生命周期终结（close 幂等）
-            sysPromptCtxProvider.close();
+            // [步骤 2 · provider 生命周期归属已改] ⛔ 本方法<b>不再</b> close sysPromptCtxProvider：
+            //   provider 现在是<b>会话级</b>（store 持有，跨 run 复用同一实例 ⇒ userContext /
+            //   systemContext / gitStatus / 会话冻结日期全部跨 run 冻结）。若照旧每 run close()，
+            //   注销的是 SystemPromptInjection 的缓存清理回调（memoize 值本身仍在实例里）——
+            //   语义上等于「本 run 注册、下次 run 才重建」，且与「跨 run 复用」的意图相冲突。
+            //   close 的等价动作（register/unregister 成对、静态表不随会话数累积）改由<b>会话终结</b>承担：
+            //   SessionPromptCacheRegistry.evict → SessionPromptCacheStore.close（见 SessionService#delete）。
+            //   本 finally 保留为材料收集出口的<b>数据流日志</b>（零行为变化）。
+            if (log.isDebugEnabled()) {
+                log.debug("[prompt-assembly-B] 材料收集出口: sessionId={} 会话级provider已建={} "
+                        + "会话级分段缓存条数={}（>0 ⇒ 后续 run 命中同一份 Map，段值跨 run 稳定）",
+                    state.sessionId(), promptCacheStore.hasContextProvider(),
+                    promptCacheStore.sectionCache().size());
+            }
         }
     }
 
@@ -5760,6 +5883,31 @@ public class LlmAgentLoop implements AgentLoop {
                 drainAndInjectQueued(ctx, params, state, consumedCommandUuids,
                     injectedQueuedMessages, imageStore, pdfProcessor, didLastTurnUseSleep(state));
             }
+
+            // ── [步骤 5 · 跨午夜投递] date_change · 对齐 CC attachments.ts:830（getAttachmentMessages 内
+            //    allThreadAttachments 段：`maybe('queued_commands', ...)` 之后紧接
+            //    `maybe('date_change', () => Promise.resolve(getDateChangeAttachments(messages)))`）──
+            // 位置理由（与上方 drain 同一条）：CC 的 getAttachmentMessages 在<b>每轮迭代</b>取快照，
+            //   产出的附件经 `yield attachment; toolResults.push(attachment)`（query.ts:1580-1588）
+            //   成为会话里的真实消息 ⇒ 必然进【紧接的下一轮请求】。本仓故置于
+            //   entryModelView / messagesForQuery 快照<b>之前</b>，且与 CC 同一相对序
+            //   （queued_commands → date_change，两者同为 allThreadAttachments 成员）。
+            // ⛔ 回写头部是被明令禁止的：CC 源码注释（attachments.ts:1403-1418）自述「清缓存会重新
+            //   生成前缀，把整条会话变 cache_creation，每次跨午夜约 920K 有效 token」——
+            //   本调用只做「尾部追加真实消息」，不触任何清集合入口（见 maybeEmitDateChange javadoc）。
+            // 守卫（方法内）：会话首轮只记录不播报 / 同日无动作 / 无会话标识不追加。
+            AgentLoopContext.maybeEmitDateChange(state);
+
+            // ── [步骤 7 · 投递层] 变更文件 tails 投递 · 对齐 CC attachments.ts:871
+            //    `maybe('changed_files', () => getChangedFiles(context))` ——
+            //    位于 allThreadAttachments 段（:824-941），与上方 date_change 同为该段成员，
+            //    且<b>不在任何 feature(...) 门控内</b>（对照同段 :864 feature('BUDDY') 即知）⇒ 每轮、所有线程都评估。
+            // 位置理由与 date_change 逐字相同：CC 的附件经 `yield attachment; toolResults.push(attachment)`
+            //    （query.ts:1580-1588）成为会话里的一条**真实消息**并随转录持久化 ⇒ 必然进【紧接的下一轮请求】。
+            //    本仓故同样置于 entryModelView / messagesForQuery 快照**之前**（快照随之包含它）。
+            // 判据（方法内）：mtime > readFileState 记录时间戳 ⇒ 尾部追加 isMeta user 消息（带变更行）。
+            // ⛔ 回写头部同样被禁止（本调用只 append，不触任何清集合入口）。
+            AgentLoopContext.maybeEmitChangedFiles(state, params.toolUseContext());
 
             List<ChatMessageDto> entryModelView = state.modelView();
             int preBoundaryCount = state.rawMessages().size();
@@ -9431,8 +9579,11 @@ public class LlmAgentLoop implements AgentLoop {
         }
         return state;
         } finally {
-            // [RES-C2 搬运] 会话级 SystemPromptContextProvider 生命周期已随材料收集上移到调用方
-            //   （collectRunMaterial 内 try/finally close，close 幂等，register/unregister 成对）——
+            // [RES-C2 搬运 + 步骤 2 生命周期改准] 会话级 SystemPromptContextProvider 生命周期归属
+            //   **会话级 store**（state.promptCacheStore() 持有并跨 run 复用），既不在本 loop 关闭，
+            //   也不在 collectRunMaterial 的 finally 里关闭（该 finally 只留数据流日志，见其内注释）——
+            //   注销（register/unregister 成对）由**会话终结**承担：
+            //   SessionPromptCacheRegistry.evict → SessionPromptCacheStore.close。
             //   本 loop 不再持有该组件。
             // [MEM-03/G-20] 预取 dispose 等价（CC [Symbol.dispose] attachments.ts:2410-2418，
             //   query.ts `using` 绑定 → 全部退出路径触发）：abort 子控制器 + 发射

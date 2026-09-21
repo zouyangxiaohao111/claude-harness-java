@@ -87,6 +87,11 @@ class ResumeServiceTest {
         registry = new SessionAgentStateRegistry();
         service.setSubagentTool(subagentTool);
         service.setSessionAgentStateRegistry(registry);
+        // [步骤 2] 会话级 prompt 缓存 store 是<b>进程级静态表</b>（键 = sessionId）——本类所有用例共用
+        //   固定 {@link #SESSION_UUID} ⇒ 不归零则前一用例写入的分段缓存（如 env_info_simple 里的
+        //   模型描述）会被后一用例短路命中，断言「重建出的提示含 test-model」即假红。
+        //   同 PostCompactCleanup.resetForTest / SkillListingSentRegistry.reset 的既有隔离口径。
+        com.nexusai.application.agent.prompt.SessionPromptCacheRegistry.resetForTest();
     }
 
     // ────────────────────────────────────────────────────────────────────────

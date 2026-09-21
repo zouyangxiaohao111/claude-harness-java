@@ -366,43 +366,68 @@ public class ToolRegistrationConfig {
     }
 
     /**
-     * [IMP-SP-07] 工具注册失效接线 · 对齐 CC {@code clearSystemPromptSections}（systemPromptSections.ts:65-68）
-     * 的工具注册触发。
+     * [IMP-SP-07 · 步骤 4 已按集合语义重写] 工具注册失效接线 ·
+     * <b>集合 A（分段缓存）only</b> —— {@link PromptCacheGroup#TOOL_REGISTRATION_SECTIONS}。
      *
-     * <p><b>触发时机（concern 现场确认）</b>：本 Session 选择 ToolRegistrationConfig @Bean 构建后
+     * <p><b>⛔ 集合归类结论 + 判据（步骤 4 要求「判不出来就停下报告」，此处给出判据后落地）</b>：
+     * <ol>
+     *   <li><b>这不是 CC 的 6 个 A 清空点之一</b>（已 grep 穷举全仓：postCompactCleanup.ts:62 /
+     *       setup.ts:346 / EnterWorktreeTool.ts:99 / ExitWorktreeTool.ts:143 /
+     *       sessionRestore.ts:364 / sessionRestore.ts:388）⇒ 本仓登记录为 <b>有意偏离</b>。</li>
+     *   <li>CC 的工具池变化<b>从不清分段缓存</b>，由 ①请求 {@code tools} 数组本身变化
+     *       ②{@code mcp_instructions} 段的每轮重算承担
+     *       （2.1.88 口径 = {@code cacheBreak=true}，prompts.ts:513-521；
+     *       ⚠️ 2.1.278 已删除该 system 段，改走 {@code mcp_instructions_delta} 尾部附件
+     *       ⇒ 「每轮重算」这条在 2.1.278 已不存在，本仓也已把 mcp_instructions 改为可缓存段，
+     *       见 {@code SystemPromptSections.buildDynamicSections} 第 7 条登记注释）
+     *       ⇒ CC 侧「工具相关」的失效由「tools 数组 + MCP delta 投递」表达。</li>
+     *   <li>故本仓把它归入 <b>集合 A only</b>（工具清单影响的是提示组装面），
+     *       ⛔ 明确<b>不</b>碰 B（claudeMd+日期）/ C（systemContext）/ D（gitStatus+日期）
+     *       —— 那三项与工具注册表毫无因果关系，清了就是「做多了比 CC 还差」。</li>
+     * </ol>
+     *
+     * <p><b>触发时机（concern 现场确认，未变）</b>：本 Session 选择 ToolRegistrationConfig @Bean 构建后
      * （context-refresh 语义）接线 —— 启动期注册表为空 → no-op。真正的运行时工具集合变化
      * （MCP {@code ToolRegistry.assembleToolPool} 每轮刷新）不在 IMP-SP-07 §4 范围（ToolRegistry 禁改），
-     * 待 IMP-SP-08 评估把失效点移到工具集合实际变化处；每轮 assemble 若直接 clear 会破坏缓存命中
-     * （CC 工具集为启动期静态 + MCP 增删事件驱动，非每轮）。
+     * 每轮 assemble 若直接 clear 会破坏缓存命中（CC 工具集为启动期静态 + MCP 增删事件驱动，非每轮）。
+     * ⚠ 运行期可达性已在步骤 4 的返回中登记（该 @Bean 为启动期单例 ⇒ 实际恒 no-op）。
+     *
+     * <p><b>为何仍遍历全部活跃会话</b>：本事件是<b>全局</b>的（工具注册表是进程级单例 bean，
+     * 不存在「只影响某个会话的工具清单」）⇒ 无会话维度可传。CC 侧该语义就是进程级
+     * （{@code clearSystemPromptSections()} 清 STATE，state.ts:1639），本仓 cache 下放到会话级
+     * ⇒ 「清全部活跃会话」是 CC 进程级清空的忠实翻译。⛔ 这与「会话局部事件（/compact）不得广播」
+     * 不矛盾 —— 判据是<b>事件本身是否为全局</b>，不是「一律不广播」。
      *
      * @param trigger 触发源描述（日志定位用）
      */
     private void invalidateActiveSessionSystemPromptSections(String trigger) {
         if (sessionAgentStateRegistry == null) {
             log.warn("[ToolRegistrationConfig] {} 失效接线：SessionAgentStateRegistry 未接线 → 跳过"
-                + "（工具清单变化后 sections 可能保持陈旧，对齐 CC clearSystemPromptSections 语义未生效）", trigger);
+                + "（工具清单变化后 sections 可能保持陈旧，集合A 失效未生效）", trigger);
             return;
         }
         // [批 3c · 2026-09-13] 原实现用裸 MDC 取「当前会话」再清其 section 缓存；该读点已随批 3c
-        //   删除（MDC 第三态可能读到别的会话的 id）。现改为**按会话键遍历全部活跃会话**——不引入
-        //   任何环境态会话槽，且更贴近 CC：CC clearSystemPromptSections()（systemPromptSections.ts:65）
-        //   清的是进程级 STATE.systemPromptSectionCache（state.ts:1639，无 session 维度），本仓缓存
-        //   下放到 AgentState（per-session）⇒「清全部活跃会话」是 CC 进程级清空的对等翻译。
+        //   删除（MDC 第三态可能读到别的会话的 id）。现改为**按会话键遍历全部活跃会话**
+        //   （全局事件 ⇒ CC 进程级语义对等翻译，理由见方法 javadoc）。
         List<AgentState> active = sessionAgentStateRegistry.snapshot();
         if (active.isEmpty()) {
             log.info("[ToolRegistrationConfig] {} 失效接线：当前无活跃会话 → 无需清空"
-                + "（启动期注册表为空，运行中工具集变化时按活跃会话清；对齐 CC clearSystemPromptSections）", trigger);
+                + "（启动期注册表为空，运行中工具集变化时按活跃会话清；集合A only）", trigger);
             return;
         }
         int cleared = 0;
         for (AgentState state : active) {
-            if (state != null) {
-                state.systemPromptSectionCache().clear();
-                cleared++;
+            if (state == null) {
+                continue;
             }
+            // [步骤 4] 经会话级 store 的**集合语义**入口（原直调 systemPromptSectionCache().clear()
+            //   绕过了集合定义与逐集合日志）⇒ 现在日志能指认「清了哪个集合 + 原因 + sessionId」。
+            state.promptCacheStore().clearGroups(
+                com.nexusai.application.agent.prompt.PromptCacheGroup.TOOL_REGISTRATION_SECTIONS, trigger);
+            cleared++;
         }
-        log.info("[ToolRegistrationConfig] {} 失效接线：已清空 {} 个活跃会话的 system prompt section 缓存"
-            + "（工具清单变化 → sections 重算；批 3c 起为全活跃会话，对齐 CC 进程级 clearSystemPromptSections）",
+        log.info("[ToolRegistrationConfig] {} 失效接线：已清空 {} 个活跃会话的集合A（分段缓存）"
+            + "（工具清单变化 → sections 重算；⛔ 未动 B/C/D —— 与工具注册表无因果关系）",
             trigger, cleared);
     }
 
@@ -2942,7 +2967,7 @@ public class ToolRegistrationConfig {
             sessionMemoryService, new MicroCompactor(), reactiveCompactor,
             () -> buildCompactConversationContext(sessionId, agentId, model, streamCompactSummary,
                 toolUseContext, telemetry, compactAbort, progressSink),
-            notifyCompactionRunnable(agentId), clearUserContextCacheRunnable(),
+            notifyCompactionRunnable(agentId), clearUserContextCacheRunnable(sessionId),
             toolUseContext, sysPromptCtxProvider, defaultSysPromptAssemble, customSystemPrompt,
             appendSystemPrompt, useGlobalCacheScope,
             // [SM-10] notifyCompaction 门控（DRIFT-9 影响面）· CC compact.ts:67-72
@@ -2980,26 +3005,45 @@ public class ToolRegistrationConfig {
 
     /**
      * clearUserContextCache 真实接线 · 对齐 CC compact.ts:63/117/203
-     * {@code getUserContext.cache.clear?.()}。
+     * {@code getUserContext.cache.clear?.()} —— <b>集合 B only</b>
+     * （{@link com.nexusai.application.agent.prompt.PromptCacheGroup#COMPACT_COMMAND_USER_CONTEXT}）。
      *
      * <p><b>IMP2-02（△-2，P0）</b>: 旧实现注入 {@code () -> {}} no-op → 下轮 LLM turn 可能命中
-     * 陈旧指令/记忆。现改为 {@link SystemPromptInjection#clearUserOnlyProviderCaches()}（Java
-     * getUserContext.cache.clear 等价，FIX-CL：仅清已注册 provider 的 user 上下文缓存，
-     * 与 {@code PostCompactCleanup} 序列内操作同实现；[merge 适配 2026-08-14] 清理面收敛为
-     * user-only 通道，SP-07 △-6：CC postCompactCleanup.ts:51-60 只清 getUserContext.cache，
-     * 不清 systemContext/gitStatus）。
+     * 陈旧指令/记忆。[merge 适配 2026-08-14] 清理面收敛为 user-only 通道，SP-07 △-6：
+     * CC postCompactCleanup.ts:51-60 只清 getUserContext.cache，不清 systemContext/gitStatus。
      *
-     * @return CC getUserContext.cache.clear Runnable
+     * <p><b>[步骤 4] 从「广播清全部 provider」改为「按本会话精确清」</b>：
+     * CC 侧 {@code getUserContext.cache} 是<b>进程级</b> memoize（一进程一会话）；本仓一 JVM 多会话
+     * ⇒ 广播清会「会话 A 压缩 ⇒ 打掉会话 B 的 claudeMd 头部」（跨会话串味，且正是本批要消除的
+     * 每轮重建类浪费）。会话标识此处已知（{@code handleCompactCommand} 的显式形参）
+     * ⇒ 按 sessionId 走 {@code SessionPromptCacheRegistry}（只清目标会话的 store）。
+     * ⛔ 唯一保留广播的情形是 sessionId 缺失（测试直构 / 无会话来源），那时广播 = CC 进程级语义。
+     *
+     * @param sessionId 本会话标识（{@code handleCompactCommand} 显式传入；null/空白 ⇒ 退化为
+     *                  CC 进程级广播清）
+     * @return CC getUserContext.cache.clear Runnable（在 CompactCommand 三条成功链各被调一次）
      */
-    private Runnable clearUserContextCacheRunnable() {
+    private Runnable clearUserContextCacheRunnable(String sessionId) {
         return () -> {
-            // [merge 适配 2026-08-14] 清理面收敛为 user-only 通道（SP-07 △-6：CC
-            //   postCompactCleanup.ts:51-60 只清 getUserContext.cache，不清 systemContext/gitStatus）
-            //   —— 与 runPostCompactCleanup 内部一致，避免显式 clear 与序列内双通道不一致。
-            int cleared = com.nexusai.application.agent.prompt.SystemPromptInjection.clearUserOnlyProviderCaches();
-            if (log.isDebugEnabled()) {
-                log.debug("[R1] clearUserContextCache 执行: 清空 {} 个 provider 的 user 上下文缓存 · CC getUserContext.cache.clear",
-                    cleared);
+            if (sessionId != null && !sessionId.isBlank()) {
+                // 集合 B only（SP-07 △-6：不清 systemContext/gitStatus）
+                boolean cleared = com.nexusai.application.agent.prompt.SessionPromptCacheRegistry
+                    .clearPromptCaches(sessionId,
+                        com.nexusai.application.agent.prompt.PromptCacheGroup.COMPACT_COMMAND_USER_CONTEXT,
+                        "compact:clearUserContextCache");
+                if (log.isDebugEnabled()) {
+                    log.debug("[R1] clearUserContextCache 执行（按会话精确清）: sessionId={} 命中store={} · "
+                        + "CC compact.ts:63/117/203 getUserContext.cache.clear", sessionId, cleared);
+                }
+            } else {
+                // ⚠ 醒目 WARN（跨会话隐患留痕 · 文案单点见 SystemPromptInjection.NO_SESSION_BROADCAST_WARNING）：
+                //   无会话标识 ⇒ 广播清全部已注册 provider ⇒ 在本仓多会话下会打掉**全部会话**的
+                //   claudeMd 头部。主 agent 已裁定保留 CC-parity 语义、仅告警留痕；正确调用方式 =
+                //   调用方显式传 sessionId（本方法形参），走 SessionPromptCacheRegistry 按会话精确清。
+                int cleared = com.nexusai.application.agent.prompt.SystemPromptInjection.clearUserOnlyProviderCaches();
+                log.warn("[R1] clearUserContextCache {} · CC compact.ts:63/117/203；本次实际广播清 {} 个 provider；"
+                    + "调用方应显式传 sessionId（clearUserContextCacheRunnable(sessionId)）",
+                    com.nexusai.application.agent.prompt.SystemPromptInjection.NO_SESSION_BROADCAST_WARNING, cleared);
             }
         };
     }

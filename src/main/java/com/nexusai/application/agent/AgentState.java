@@ -1179,18 +1179,13 @@ public class AgentState {
     }
 
     /**
-     * [IMP-SP-02] run 级 system prompt section 缓存 · CC original: {@code systemPromptSectionCache}
-     * (Open-ClaudeCode/src/bootstrap/state.ts:203/:399/:1641-1653)。
+     * [IMP-SP-02 · 步骤 2 会话级搬迁] 本会话的 prompt 缓存 store（分段缓存 + 会话冻结值）·
+     * 懒解析一次后恒同一实例（{@link #promptCacheStore()}）。
      *
-     * <p><b>run 级事实（非会话级）</b>：AgentState 每 run 新建
-     * （LlmAgentLoop:1627 {@code new AgentState(...)}，SessionAgentStateRegistry.register 每 run
-     * 覆盖旧实例），本缓存随 AgentState 同生命周期 → 跨 run 命中恒 0，缓存仅服务于单 run 内
-     * 的 section 组装（SP-09 口径）。CC state.ts:399 为进程级全局 Map，Java 以每 run 实例隔离
-     * 达成等价语义（无跨会话串味）。由
-     * {@link com.nexusai.application.agent.prompt.SystemPromptSectionRegistry#resolveAll} 读写
-     * （per-section name-keyed，null 值也缓存），/clear、/compact、工具注册三触发点已接线
-     * 直调 {@code clear()}（CommandController:333 / PostCompactCleanup:277 /
-     * ToolRegistrationConfig:310，对齐 CC clearSystemPromptSections 的失效语义，SP-03 S-3）。
+     * <p><b>代理的 CC 真源</b>：{@code systemPromptSectionCache} 容器声明
+     * （Open-ClaudeCode/src/bootstrap/state.ts:203）· 初始化 {@code new Map()}（:399）·
+     * 全局单例 {@code STATE}（:429）· 读 {@code getSystemPromptSectionCache()}（:1641）·
+     * 写 {@code setSystemPromptSectionCacheEntry}（:1645）· 清 {@code clearSystemPromptSectionState}（:1652）。
      *
      * <p><b>local-only 约束（CLAUDE.md BudgetTracker 架构红线）</b>：
      * {@code @JsonIgnore} —— 与 {@link #budgetTracker} / {@link #currentToolUseContext} /
@@ -1198,12 +1193,57 @@ public class AgentState {
      * WebSocket / EventPublisher payload，绝不写入 LLM 请求 payload。
      */
     @JsonIgnore
-    private final com.nexusai.application.agent.prompt.SystemPromptSectionCache systemPromptSectionCache =
-        new com.nexusai.application.agent.prompt.SystemPromptSectionCache();
+    private volatile com.nexusai.application.agent.prompt.SessionPromptCacheStore promptCacheStore;
 
-    /** [IMP-SP-02] 取出本 run 的 system prompt section 缓存（字段初始化器，非 null） */
+    /**
+     * [IMP-SP-02 · 步骤 2] 取本会话的 prompt 缓存 store（懒解析一次，之后恒同一实例）·
+     * 会话级寻址的唯一入口。
+     *
+     * <p><b>生命周期事实（已按代码改写 —— 原注释称「run 级、跨 run 命中恒 0」，那是改造前的旧事实）</b>：
+     * {@code AgentState} 仍每 run 新建（{@code LlmAgentLoop.run} 的 {@code new AgentState(...)}），
+     * 但<b>缓存不再随 AgentState 同生命</b> —— 它挂在本 store（键 = sessionId，由
+     * {@link com.nexusai.application.agent.prompt.SessionPromptCacheRegistry} 寻址），
+     * <b>跨 run 不销毁</b>，仅<b>会话终结</b>（{@code SessionService#delete} → {@code evict}）时移除。
+     * ⇒ 同一会话相邻 run 命中同一份分段 Map / 同一份 userContext+systemContext，
+     * 段值跨 run 逐字节稳定（DeepSeek 隐式前缀缓存命中的前提）。
+     *
+     * <p><b>为什么不真做全局单例</b>：CC 是「一进程 = 一会话」，其缓存是进程级；本仓一 JVM 多会话
+     * ⇒ 必须按 sessionId 分区（否则会话 A 的 {@code env_info_simple} / {@code memory} 会串到会话 B）。
+     * 无 sessionId 的 AgentState（测试 / 无会话调用方）拿到的是<b>未注册</b>的一次性 store
+     * ⇒ 等价改造前的每实例缓存，且不共享键。完整语义映射见 {@code SessionPromptCacheStore} 类 javadoc。
+     *
+     * <p><b>清空点不变</b>：{@code /clear}（CommandController）、{@code /compact}（PostCompactCleanup）、
+     * 工具注册（ToolRegistrationConfig）、worktree 进/出（Enter/ExitWorktreeTool）仍直调
+     * {@code systemPromptSectionCache().clear()} —— 现在清的是<b>会话级</b> Map（正是 CC 语义）。
+     * 「哪些事件该清哪个集合（分段 / userContext / systemContext / gitStatus）」的精确接线属步骤 4，本步不动。
+     *
+     * @return 会话级 store（恒非 null；同会话的多个 AgentState / 多次取用恒同一实例）
+     */
+    public com.nexusai.application.agent.prompt.SessionPromptCacheStore promptCacheStore() {
+        com.nexusai.application.agent.prompt.SessionPromptCacheStore store = this.promptCacheStore;
+        if (store != null) {
+            return store;
+        }
+        synchronized (this) {
+            if (this.promptCacheStore == null) {
+                this.promptCacheStore = com.nexusai.application.agent.prompt.SessionPromptCacheRegistry
+                    .forSession(this.sessionId, this.sessionStartDate);
+            }
+            return this.promptCacheStore;
+        }
+    }
+
+    /**
+     * [IMP-SP-02 · 步骤 2] 取本会话的 system prompt section 缓存 —— <b>转发</b>到会话级 store
+     * （不再返回 AgentState 私有实例）。
+     *
+     * <p>由 {@link com.nexusai.application.agent.prompt.SystemPromptSectionRegistry#resolveAll} 读写
+     * （per-section name-keyed，null 值也缓存）；调用方（清空点 / 组装器）代码零改动。
+     *
+     * @return 会话级分段缓存（恒非 null）
+     */
     public com.nexusai.application.agent.prompt.SystemPromptSectionCache systemPromptSectionCache() {
-        return this.systemPromptSectionCache;
+        return promptCacheStore().sectionCache();
     }
 
     /**
@@ -1401,7 +1441,17 @@ public class AgentState {
     @JsonIgnore
     private final String sessionStartDate = localIsoDate();
 
-    /** [IMP-SP-05] 取出会话冻结日期（构造时定格，跨午夜不陈旧 · CC original: getSessionStartDate） */
+    /**
+     * [IMP-SP-05] 取出会话冻结日期（构造时定格）· CC original: {@code getSessionStartDate}
+     * （constants/common.ts:24 {@code memoize(getLocalISODate)}）。
+     *
+     * <p>⚠ 注释改准（步骤 4 复核）：原写「跨午夜不陈旧」<b>与 CC 实际行为相反</b> ——
+     * 定格 = 跨午夜<b>保留旧日期</b>（陈旧），新日期由尾部 {@code date_change} 附件告知
+     * （CC utils/attachments.ts:1405-1418）。回写头部会把整段前缀缓存打掉（CC 源码量级 ~920K token）。
+     * <p>⚠ 本字段仍是「每 run 构造期本地日」；<b>会话冻结的真源在
+     * {@link com.nexusai.application.agent.prompt.SessionPromptCacheStore#sessionStartDate()}</b>
+     * （首建时取本值一次后不再更新，对齐 CC 进程级 memoize）。
+     */
     public String sessionStartDate() {
         return this.sessionStartDate;
     }

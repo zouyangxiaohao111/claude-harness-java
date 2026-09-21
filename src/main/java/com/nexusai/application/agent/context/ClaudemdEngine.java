@@ -1743,6 +1743,109 @@ public class ClaudemdEngine {
     }
 
     /**
+     * <b>[步骤 7 · 投递层]</b> 会话启动把 CLAUDE.md / rules 登记进 readFileState ·
+     * 对齐 CC {@code REPL.tsx:3797-3818}（{@code onInit}）。
+     *
+     * <h2>CC 真源逐行</h2>
+     * <pre>
+     * const memoryFiles = await getMemoryFiles()                       // REPL.tsx:3798（未过滤全量）
+     * for (const file of memoryFiles) {                                // :3805
+     *   readFileState.current.set(file.path, {
+     *     content: file.contentDiffersFromDisk ? file.rawContent ?? file.content : file.content,
+     *     timestamp: Date.now(),                                       // :3812 启动时刻
+     *     offset: undefined,                                           // :3813 ⭐ 刻意留空
+     *     limit: undefined,                                            // :3814 ⭐ 刻意留空
+     *     isPartialView: file.contentDiffersFromDisk })                // :3815
+     * }
+     * </pre>
+     *
+     * <p><b>为什么 {@code offset/limit} 必须刻意留 undefined</b>（CC 自己在 attachments.ts:1737-1741
+     * 注释自述）：{@code getChangedFiles} 会<b>跳过</b> {@code offset/limit} 已设的 entry
+     * （attachments.ts:2076-2078，理由是窗口条目只缓存了局部视图、拿它 diff 会误导）⇒
+     * 若这里写成 {@code offset: 1}，CLAUDE.md 变更检测这条路对根记忆文件<b>根本不会生效</b>。
+     * 这一格是「头部冻结 ≠ 什么都看不到」这条投递通道对本步骤覆盖范围（启动载入的 CLAUDE.md / rules）
+     * 生效的<b>唯一开关</b>。
+     *
+     * <p><b>与 {@link #memoryFilesToAttachments} 的分工</b>：后者是 <b>nested</b> memory 的
+     * 懒加载登记点（CC attachments.ts:1710-1770，带 {@code loadedNestedMemoryPaths} 去重 + 已存在则跳），
+     * 本方法是<b>启动</b>登记点（CC REPL onInit，未过滤、无去重、直接覆盖）。两处都写同一张表，
+     * 且都刻意用 {@code offset/limit = null} —— 这正是 CC 的两条登记路径。
+     *
+     * <p><b>⭐ 登记时间戳的取法（本批修正点，勿退回）</b>：CC 的 {@code readFileState} 是
+     * <b>会话级</b>表且只在会话启动登记<b>一次</b>（{@code REPL.tsx:3797-3818 onInit}）⇒ 它的
+     * {@code timestamp: Date.now()} 就是「会话启动时刻」，此后永久保留。本仓的 readFileState
+     * 是 <b>run 级</b>缓存（{@code LlmAgentLoop} 是 {@code @Scope("prototype")}，每 send 新实例；
+     * {@code buildBaseToolUseContext} 的 {@code readFileState=null} 分支每次 run 新建
+     * {@link com.nexusai.application.agent.tool.FileStateCache}），而本方法<b>每 run 被调用一次</b>：
+     * 若每次都以「当下」覆盖，则<b>用户在两条消息之间改盘</b>（= 真实场景）的 mtime 会小于本 run
+     * 的登记时间戳 ⇒ 被下一次登记<b>吸收</b> ⇒ 永不投递（独立验证 #1 判定 REFUTED 的那一条）。
+     * 故本方法经 {@code sessionBaseline}（会话级「首次登记」固化表，
+     * {@link com.nexusai.application.agent.attachment.SessionChangedFilesBaselineRegistry}）
+     * 取基线：<b>key 已存在 ⇒ 复用旧基线（时间戳 + 内容），不覆盖</b>；否则落首次基线。
+     * 判据本身不变（{@code mtime > 记录时间戳}，ChangedFilesDetector）。
+     *
+     * @param memoryFiles     记忆文件列表（{@code getMemoryFiles} 产物；null/空 → no-op）
+     * @param readFileState   本 run 的 readFileState 缓存（null → no-op，同 CC 无 context 场景）
+     * @param sessionBaseline <b>会话级</b>首次登记固化表；null（无会话 id / 测试直调）⇒ 退回
+     *                        「每次登记取当下」的改造前形态（无跨 run 记忆可用 —— 无会话即无
+     *                        跨 run 身份，属诚实降级而非静默跳过）
+     * @return 实际登记的条数（0 = 未登记；数据流日志与测试判据用）
+     */
+    public int registerMemoryFilesBaseline(List<MemoryFileInfo> memoryFiles,
+                                           com.nexusai.application.agent.tool.FileStateCache readFileState,
+                                           com.nexusai.application.agent.tool.FileStateCache sessionBaseline) {
+        if (memoryFiles == null || memoryFiles.isEmpty() || readFileState == null) {
+            return 0;
+        }
+        int seeded = 0;
+        int reused = 0;
+        for (MemoryFileInfo file : memoryFiles) {
+            if (file == null || file.path() == null) {
+                continue;
+            }
+            String key = readFileStateKey(file.path());
+            com.nexusai.application.agent.tool.ToolUseContext.ReadState baseline =
+                sessionBaseline != null ? sessionBaseline.get(key) : null;
+            if (baseline == null) {
+                // CC :3811 —— 内容与磁盘不一致时用 rawContent（保证 diff 基线 = 磁盘真实字节）
+                String content = file.contentDiffersFromDisk()
+                    ? (file.rawContent() != null ? file.rawContent() : file.content())
+                    : file.content();
+                baseline = new com.nexusai.application.agent.tool.ToolUseContext.ReadState(
+                    System.currentTimeMillis(), null, null, file.contentDiffersFromDisk(), content);
+                if (sessionBaseline != null) {
+                    // 「首次会话登记」固化点：此后本会话的每次 run 都复用它，不再取当下
+                    sessionBaseline.set(key, baseline);
+                }
+            } else {
+                reused++;
+            }
+            readFileState.set(key, baseline);
+            seeded++;
+        }
+        log.info("[步骤7·投递层] 启动登记完成: 已把 {} 个 CLAUDE.md/rules 文件写进本 run 的 readFileState"
+            + "（其中 {} 条复用会话基线 —— 用户两条消息之间改盘才能被投递）"
+            + "（offset/limit 刻意留空 ⇒ 变更检测对根记忆文件生效）· CC REPL.tsx:3797-3818",
+            seeded, reused);
+        return seeded;
+    }
+
+    /**
+     * 便利重载 · <b>无会话基线</b>（{@code sessionBaseline = null}）⇒ 每次登记以「当下」取时间戳，
+     * 即改造前形态。⛔ 仅供「无会话 id / 测试直调」使用；生产路径必须走三参重载
+     * （见 {@link #registerMemoryFilesBaseline(List, com.nexusai.application.agent.tool.FileStateCache,
+     * com.nexusai.application.agent.tool.FileStateCache)} 的修正说明）。
+     *
+     * @param memoryFiles   记忆文件列表
+     * @param readFileState 本 run 的 readFileState 缓存
+     * @return 实际登记的条数
+     */
+    public int registerMemoryFilesBaseline(List<MemoryFileInfo> memoryFiles,
+                                           com.nexusai.application.agent.tool.FileStateCache readFileState) {
+        return registerMemoryFilesBaseline(memoryFiles, readFileState, null);
+    }
+
+    /**
      * readFileState key 归一化 · 对齐 {@code ToolUseContext.keyForReadFileState} 的
      * {@code Path.toAbsolutePath().normalize()} 语义（CC path.normalize(key)，
      * fileStateCache.ts:42/46/51/55）。memoryFile.path 为绝对路径，幂等。

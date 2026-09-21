@@ -26,8 +26,14 @@ import java.util.function.Supplier;
  * 是 ant 内部 flag（context.ts:131/143）。Java 用 {@code System.getenv("BREAK_CACHE_COMMAND")}
  * truthy 作门（默认关，对齐 CC 默认关），cacheBreaker 机制照常实现（FeatureFlags 越界改留主 agent 定夺）。
  *
- * <p><b>currentDate 属 user 通道（I-10）</b>：用会话冻结 {@code sessionStartDate}
- * （AgentState 构造时取本地日），跨午夜不陈旧；随压缩 replaceMessages 不清除。
+ * <p><b>currentDate 属 user 通道（I-10）· 跨午夜<u>刻意陈旧</u></b>：取会话冻结日期
+ * （{@code sessionStartDateSupplier}，生产为 {@code SessionPromptCacheStore::sessionStartDate}），
+ * 且本字段被 {@link #getUserContext()} 的 memoize 包住 ⇒ 会话中途日期<b>不变</b>。
+ * ⚠ 原注释写「跨午夜不陈旧」是<b>与代码相反</b>的陈述（已改准）：CC 的实际行为正是
+ * <b>跨午夜保留旧日期</b>（{@code getUserContext} 进程级 memoize 冻结 currentDate，
+ * context.ts:186），新日期在<b>尾部</b>以 {@code date_change} 附件告知（utils/attachments.ts:1405-1418）；
+ * 两侧都不回写头部（回写 = 打掉整段前缀缓存，CC 源码给的量级约 920K 有效 token 变 cache_creation）。
+ * 本类随压缩 replaceMessages 不清除（CC 同）。
  */
 public class SystemPromptContextProvider {
 
@@ -52,7 +58,21 @@ public class SystemPromptContextProvider {
         String get(String key);
     }
 
-    private final String sessionStartDate;
+    /**
+     * 会话冻结日期来源 · <b>不是</b>本地副本 —— 唯一真相由持有者提供
+     * （生产：{@link SessionPromptCacheStore#sessionStartDate()}，见
+     * {@link SessionPromptCacheStore#contextProvider(Supplier)}；测试：常量 lambda）。
+     *
+     * <p><b>为什么是 Supplier 而不是 String 字段</b>：CC 的 {@code getSessionStartDate}
+     * 是一个<b>可被独立清空</b>的 memoize（{@code memoize(getLocalISODate)}，constants/common.ts:24；
+     * 清空点 {@code caches.ts:55}）。若在本类存成 final String，则「清 D-2」在本类无处落地，
+     * 只能退化为「两份日期副本」（违反单点真相）。用 Supplier 后，持有者改值即对下一次
+     * {@code getUserContext()} 重算生效 —— 与 CC「clear 后下次读取取当天」语义一致
+     * （⚠ 注意：<b>只清 D-2 不会让头部变</b>，因为 currentDate 被集合 B 的 memoize 包住，
+     * 这正是 CC 的真实不对称，见 {@link PromptCacheGroup}）。
+     */
+    private final Supplier<String> sessionStartDateSupplier;
+
     private final UserContextProvider userContextProvider;
     private final GitStatusProvider gitStatusProvider;
     private final Environment environment;
@@ -93,7 +113,7 @@ public class SystemPromptContextProvider {
     }
 
     /**
-     * 测试注入构造：可替换环境查询。
+     * 测试注入构造：可替换环境查询（日期为常量 String）。
      *
      * @param environment 环境变量查询（默认 {@code System::getenv}；测试注入假实现）
      */
@@ -101,7 +121,44 @@ public class SystemPromptContextProvider {
                                        UserContextProvider userContextProvider,
                                        GitStatusProvider gitStatusProvider,
                                        Environment environment) {
-        this.sessionStartDate = sessionStartDate;
+        this(() -> sessionStartDate, userContextProvider, gitStatusProvider, environment);
+    }
+
+    /**
+     * <b>生产形态</b>便捷构造（无环境注入 ⇒ {@code System::getenv}）：会话冻结日期以
+     * {@link Supplier} 注入。见下方四参构造的完整语义说明。
+     *
+     * @param sessionStartDateSupplier 会话冻结日期来源（通常为
+     *                                 {@code sessionPromptCacheStore::sessionStartDate}）
+     */
+    public SystemPromptContextProvider(Supplier<String> sessionStartDateSupplier,
+                                       UserContextProvider userContextProvider,
+                                       GitStatusProvider gitStatusProvider) {
+        this(sessionStartDateSupplier, userContextProvider, gitStatusProvider, System::getenv);
+    }
+
+    /**
+     * <b>生产形态</b>构造：会话冻结日期以 {@link Supplier} 注入（唯一真相在持有者侧）·
+     * 对齐 CC {@code getSessionStartDate = memoize(getLocalISODate)}（constants/common.ts:24）
+     * 的「可被独立清空」语义（清空点 caches.ts:55）。
+     *
+     * <p>为何不复制成字段：集合 D-2 的失效要求日期可被重置（CC {@code getSessionStartDate.cache.clear?.()}），
+     * 若本类存 final String，则「两份日期副本」不可避免。生产装配方
+     * （{@link SessionPromptCacheStore}）传 {@code store::sessionStartDate}，
+     * 持有者改值即对下一次 {@link #getUserContext()} 重算生效。
+     * ⚠ 只清 D-2 不会让头部变（currentDate 在集合 B 的 memoize 内），必须同时清 B ——
+     * 这是 CC 的真实不对称（见 {@link PromptCacheGroup}）。
+     *
+     * @param sessionStartDateSupplier 会话冻结日期来源（非 null；{@code get()} 可返回 null）
+     * @param environment              环境变量查询（默认 {@code System::getenv}）
+     */
+    public SystemPromptContextProvider(Supplier<String> sessionStartDateSupplier,
+                                       UserContextProvider userContextProvider,
+                                       GitStatusProvider gitStatusProvider,
+                                       Environment environment) {
+        this.sessionStartDateSupplier = sessionStartDateSupplier != null
+            ? sessionStartDateSupplier
+            : () -> null;
         this.userContextProvider = userContextProvider;
         this.gitStatusProvider = gitStatusProvider;
         this.environment = environment != null ? environment : System::getenv;
@@ -150,6 +207,16 @@ public class SystemPromptContextProvider {
      */
     public Map<String, String> getSystemContext() {
         if (systemContextComputed) {
+            // [步骤 5 · 数据流日志] 复用命中（跨 run 不重算）：直接返回上次算出的字节 ⇒ 头部稳定
+            if (log.isDebugEnabled()) {
+                Map<String, String> cached = systemContextCache;
+                String gs = cached == null ? null : cached.get("gitStatus");
+                log.debug("[SystemPromptContextProvider] getSystemContext 复用命中（跨 run 不重算）: "
+                    + "会话冻结值长度 gitStatus={} cacheBreaker={} keys={}",
+                    gs == null ? "null" : gs.length() + " chars",
+                    cached == null ? "null" : cached.containsKey("cacheBreaker"),
+                    cached == null ? null : cached.keySet());
+            }
             return systemContextCache;
         }
         synchronized (this) {
@@ -182,6 +249,10 @@ public class SystemPromptContextProvider {
             if (log.isDebugEnabled()) {
                 log.debug("[SystemPromptContextProvider] getSystemContext 完成: 耗时 {} ms, hasGitStatus={}, hasCacheBreaker={}",
                     System.currentTimeMillis() - start, gitStatus != null, injection != null);
+                // [步骤 5 · 数据流日志] 构建一次（本会话仅此一次；此后每次调用都走上方复用命中分支）
+                log.debug("[SystemPromptContextProvider] getSystemContext 构建一次（会话级冻结）: "
+                    + "会话冻结值长度 gitStatus={} chars, keys={}（此后跨 run 复用 ⇒ system 尾字节稳定）",
+                    gitStatus == null ? 0 : gitStatus.length(), result.keySet());
             }
             return result;
         }
@@ -203,6 +274,16 @@ public class SystemPromptContextProvider {
      */
     public Map<String, String> getUserContext() {
         if (userContextComputed) {
+            // [步骤 5 · 数据流日志] 复用命中（跨 run 不重算）：这是 messages[0] 逐字节稳定的**直接原因**
+            if (log.isDebugEnabled()) {
+                Map<String, String> cached = userContextCache;
+                String cmd = cached == null ? null : cached.get("claudeMd");
+                log.debug("[SystemPromptContextProvider] getUserContext 复用命中（跨 run 不重算 ⇒ messages[0] 字节稳定）: "
+                    + "会话冻结值长度 claudeMd={} currentDate={} keys={}",
+                    cmd == null ? "null" : cmd.length() + " chars",
+                    cached == null ? null : cached.get("currentDate"),
+                    cached == null ? null : cached.keySet());
+            }
             return userContextCache;
         }
         synchronized (this) {
@@ -220,13 +301,18 @@ public class SystemPromptContextProvider {
             if (claudeMd != null) {
                 result.put("claudeMd", claudeMd);
             }
-            result.put("currentDate", userContextProvider.currentDate(sessionStartDate));
+            result.put("currentDate", userContextProvider.currentDate(sessionStartDateSupplier.get()));
 
             userContextCache = result;
             userContextComputed = true;
             if (log.isDebugEnabled()) {
                 log.debug("[SystemPromptContextProvider] getUserContext 完成: 耗时 {} ms, hasClaudeMd={}",
                     System.currentTimeMillis() - start, claudeMd != null);
+                // [步骤 5 · 数据流日志] 构建一次（本会话仅此一次；此后每次调用都走上方复用命中分支）·
+                //   会话冻结日期 = sessionStartDateSupplier.get()（= 会话开始日，跨午夜保留旧值）
+                log.debug("[SystemPromptContextProvider] getUserContext 构建一次（会话级冻结）: "
+                    + "会话冻结值长度 claudeMd={} chars, 会话冻结日期={}, keys={}（此后跨 run 复用 ⇒ messages[0] 稳定）",
+                    claudeMd == null ? 0 : claudeMd.length(), sessionStartDateSupplier.get(), result.keySet());
             }
             return result;
         }
@@ -338,14 +424,43 @@ public class SystemPromptContextProvider {
 
     /**
      * 双清 getSystemContext/getUserContext 缓存 · 由 SystemPromptInjection setter 触发
-     * （CC context.ts:32-33）。
+     * （CC context.ts:32-33）。= {@link PromptCacheGroup#INJECTION_CHANGE}（集合 B + C）。
      */
     public void clearCaches() {
         systemContextCache = null;
         systemContextComputed = false;
         userContextCache = null;
         userContextComputed = false;
-        log.info("[SystemPromptContextProvider] 会话级 systemContext/userContext 缓存已双清（对齐 CC context.ts:32-33）");
+        log.info("[SystemPromptContextProvider] 会话级 systemContext/userContext 缓存已双清（对齐 CC context.ts:32-33，集合 B+C）");
+    }
+
+    /**
+     * <b>仅清集合 C</b>（systemContext 冻结值）· 对齐 CC {@code getSystemContext.cache.clear?.()}
+     * （context.ts:116-150 的 memoize；清空点 caches.ts:53 / context.ts:33）。
+     *
+     * <p>⚠ 本方法<b>不</b>清 {@link GitStatusProvider} 的 memoize（那是集合 D-1）：重算时
+     * {@code getGitStatus()} 仍返回<b>旧的</b> gitStatus 值 —— 这正是 CC 的不对称
+     * （{@code caches.ts:53} 与 {@code :54} 是相邻两行但语义独立）。
+     * 要连 gitStatus 一起刷新，必须<u>同时</u>清 C 与 D-1（{@link PromptCacheGroup#CLEAR_SESSION_ALL} 的形态）。
+     *
+     * <p>包级可见：唯一调用方是同包的 {@link SessionPromptCacheStore}（集合分发单点）；
+     * ⛔ 不对外开放，避免绕过集合语义直接清单项。
+     */
+    void clearSystemContextCache() {
+        systemContextCache = null;
+        systemContextComputed = false;
+        log.info("[SystemPromptContextProvider] 集合C systemContext 冻结值已清（对齐 CC getSystemContext.cache.clear，caches.ts:53）");
+    }
+
+    /**
+     * <b>仅清集合 D-1</b>（gitStatus 快照）· 对齐 CC {@code getGitStatus.cache.clear?.()}
+     * （caches.ts:54）。委托给 {@link GitStatusProvider#clearCache()}。
+     *
+     * <p>⚠ 单独清它不会让头部变（systemContext 的 memoize 才是读点，context.ts:128）——
+     * CC {@code caches.ts:53-54} 是相邻两行一起清，本仓由 {@link PromptCacheGroup#CLEAR_SESSION_ALL} 表达。
+     */
+    void clearGitStatusCache() {
+        gitStatusProvider.clearCache();
     }
 
     /**
@@ -354,18 +469,21 @@ public class SystemPromptContextProvider {
      * postCompactCleanup.ts:51-60）。systemContext/gitStatus 缓存<b>保留</b> —— CC compact
      * 清理面只 {@code getUserContext.cache.clear?.()}，不清 getSystemContext（SP-07 △-6：
      * 旧 Java 实现双清为多清偏差，compact 后 systemContext 命中缓存不重算）。
+     *
+     * <p>包级可见（原 private）：集合分发单点 {@link SessionPromptCacheStore} 需按会话精确清
+     * 集合 B；⛔ 不对外开放，避免绕过集合语义。
      */
-    private void clearUserContextCache() {
+    void clearUserContextCache() {
         userContextCache = null;
         userContextComputed = false;
         if (log.isDebugEnabled()) {
-            log.debug("[SystemPromptContextProvider] user-only 缓存已清（保留 systemContext，CC postCompactCleanup.ts:51-60）");
+            log.debug("[SystemPromptContextProvider] 集合B userContext 冻结值已清（保留 systemContext/gitStatus，CC postCompactCleanup.ts:51-60）");
         }
     }
 
     /** 会话冻结日期（测试/审计可见）。 */
     public String sessionStartDate() {
-        return sessionStartDate;
+        return sessionStartDateSupplier.get();
     }
 
     /**

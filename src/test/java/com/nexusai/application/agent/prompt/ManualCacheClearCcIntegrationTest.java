@@ -135,7 +135,10 @@ class ManualCacheClearCcIntegrationTest {
         }
         REGISTERED_HOOKS.clear();
         // 复位 PostCompactCleanup 静态宿主，避免跨用例/跨测试类污染
-        new PostCompactCleanup(null, null, null);
+        new PostCompactCleanup(null, null);
+        // [步骤 4] 复位会话级 prompt 缓存注册表：evict→store.close→provider.close 顺手注销 provider
+        //   注册到 SystemPromptInjection 的回调（register/unregister 成对），避免跨用例静态表累积
+        SessionPromptCacheRegistry.resetForTest();
         // 复位 PromptCacheBreakDetection 静态 PREVIOUS 表（notifyCompaction 接线测试用）
         new PromptCacheBreakDetection(r -> {}).resetPromptCacheBreakDetection();
         SessionMemoryService.setLastSummarizedMessageId(SESSION, null);
@@ -145,16 +148,65 @@ class ManualCacheClearCcIntegrationTest {
 
     /** 注入全部 spy 协作器（main-thread 操作可观察）。 */
     private static void wireSpies() {
-        new PostCompactCleanup(ENABLED_COLLAPSE, new SessionAgentStateRegistry(), CLAUDEMD_SPY);
+        new PostCompactCleanup(ENABLED_COLLAPSE, CLAUDEMD_SPY);
     }
 
-    /** 注册 cache-clear 观察钩子并跟踪（@AfterEach 注销）。 */
+    /**
+     * 注册 cache-clear 观察钩子并跟踪（@AfterEach 注销）·
+     * <b>只用于验「无会话标识 ⇒ 退化为 CC 进程级广播」那条遗留分支</b>
+     * （步骤 4 之后，按会话精确清<b>不再</b>经 SystemPromptInjection 广播通道，故本钩子
+     * 观察不到 per-session 清 —— per-session 的可观测面见 {@link #wireSessionProbe(String)}）。
+     */
     private static AtomicInteger registerClearCounter() {
         AtomicInteger counter = new AtomicInteger();
         Runnable hook = counter::incrementAndGet;
         REGISTERED_HOOKS.add(hook);
         SystemPromptInjection.registerUserCacheClearHook(hook);
         return counter;
+    }
+
+    /** 会话级失效探针：会话 provider（计数假件）+ 两个 compute 计数。 */
+    private record SessionProbe(SystemPromptContextProvider provider, AtomicInteger userComputes,
+                                AtomicInteger systemComputes) {
+    }
+
+    /**
+     * [步骤 4] 把该会话接上**会话级 provider**（计数假件）—— per-session 失效的唯一可观测面。
+     *
+     * <p>WHY：步骤 4 起集合 B 的失效走 {@code store.clearGroups → provider.clearUserContextCache()}
+     * <b>直清 provider</b>（不再经 {@code SystemPromptInjection} 的全局广播通道）
+     * ⇒ 「钩子被触发次数」不再是有效观测；有效观测是<b>同 provider 的 userContext 缓存失效
+     * （下一次 getUserContext 重算）</b>，这也正是该失效在真实链路上的目的
+     * （压缩后下轮头部重算 claudeMd/日期）。
+     */
+    private static SessionProbe wireSessionProbe(String sessionId) {
+        AtomicInteger userComputes = new AtomicInteger();
+        AtomicInteger systemComputes = new AtomicInteger();
+        SystemPromptContextProvider provider = new SystemPromptContextProvider("2026-08-12",
+            new UserContextProvider(Path.of("")) {
+                @Override
+                public String claudeMd() {
+                    userComputes.incrementAndGet();
+                    return "项目指令";
+                }
+
+                @Override
+                public String currentDate(String sessionStartDate) {
+                    userComputes.incrementAndGet();
+                    return "Today's date is " + sessionStartDate + ".";
+                }
+            },
+            new GitStatusProvider(Path.of("")) {
+                @Override
+                public String getGitStatus() {
+                    systemComputes.incrementAndGet();
+                    return "GIT-BLOCK";
+                }
+            },
+            env -> null);
+        SessionPromptCacheStore store = SessionPromptCacheRegistry.forSession(sessionId, "2026-08-12");
+        store.contextProvider(() -> provider);
+        return new SessionProbe(provider, userComputes, systemComputes);
     }
 
     private static ChatMessageDto msg(String id, Role role, String content) {
@@ -189,9 +241,10 @@ class ManualCacheClearCcIntegrationTest {
             // notifyCompaction 真实接线（feature 门控，CC compact.ts:67-72）
             () -> PromptCacheBreakDetection.gatedBy(flags).notifyCompaction("compact", AGENT),
             // clearUserContextCache 真实接线（CC getUserContext.cache.clear，compact.ts:63/117/203）
-            // [merge 适配 2026-08-14] 清理面收敛为 user-only 通道（SP-07 △-6：只清 getUserContext），
-            //   显式 clear 与 runPostCompactCleanup 内部一致走 clearUserOnlyProviderCaches
-            () -> SystemPromptInjection.clearUserOnlyProviderCaches(),
+            // [步骤 4] 生产接线已是**按本会话精确清**（ToolRegistrationConfig.clearUserContextCacheRunnable(sessionId)
+            //   → SessionPromptCacheRegistry.clearPromptCaches）；本测试镜像该形态（原为全局广播通道）。
+            () -> SessionPromptCacheRegistry.clearPromptCaches(SESSION,
+                PromptCacheGroup.COMPACT_COMMAND_USER_CONTEXT, "test:clearUserContextCache"),
             null, null, null, null, null, false, () -> flags.promptCacheBreakDetection(),
             null);  // [批 5a-2] warningPushContext
     }
@@ -201,10 +254,12 @@ class ManualCacheClearCcIntegrationTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("manual 传统路径: /compact 成功 → resetContextCollapse + clearAllProviderCaches + resetGetMemoryFilesCache('compact') 全执行（无参门）")
+    @DisplayName("manual 传统路径: /compact 成功 → resetContextCollapse + 集合B 会话级失效 + resetGetMemoryFilesCache('compact') 全执行（无参门）")
     void manualTraditionalPath_noArgGate_allMainThreadOpsExecute() {
         wireSpies();
-        AtomicInteger cacheClears = registerClearCounter();
+        SessionProbe probe = wireSessionProbe(SESSION);
+        probe.provider().getUserContext();          // 首次 compute（建立冻结值）
+        int userComputesBefore = probe.userComputes().get();
 
         List<ChatMessageDto> preCompact = List.of(
             msg("m1", Role.user, "hi"),
@@ -219,17 +274,25 @@ class ManualCacheClearCcIntegrationTest {
             .as("操作 1: resetContextCollapse 必须执行（CC postCompactCleanup.ts:42-49，无参门 gate=TRUE）").isEqualTo(1);
         assertThat(MEMFILES_RESETS.get())
             .as("操作 3: resetGetMemoryFilesCache('compact') 必须执行（CC :60）").isEqualTo(1);
-        // 2 次 = 命令调用点显式 clearUserContextCache（compact.ts:117）+ runPostCompactCleanup 内部 :59 双清（CC 同构）
-        assertThat(cacheClears.get())
-            .as("操作 2: getUserContext.cache.clear 等价 clearAllProviderCaches 执行 2 次（显式 + 序列内，CC compact.ts:117 + postCompactCleanup.ts:59）")
-            .isEqualTo(2);
+        // [步骤 4] 操作 2 的可观测面改为**同 provider 的 userContext 缓存失效**（原为全局广播钩子计数）：
+        //   命令侧显式清（compact.ts:117）+ 序列内清（:59）都走 store→provider.clearUserContextCache，
+        //   故压缩后再次 getUserContext 必然重算。此断言同时钉死「不得回退到 no-op 假接线」。
+        probe.provider().getUserContext();
+        assertThat(probe.userComputes().get())
+            .as("操作 2: 集合B userContext 冻结值必须失效（CC getUserContext.cache.clear，compact.ts:117 + :59）")
+            .isGreaterThan(userComputesBefore);
+        assertThat(probe.systemComputes().get())
+            .as("集合C 必须保留（SP-07 △-6：compact 不清 getSystemContext/gitStatus）")
+            .isEqualTo(0);
     }
 
     @Test
     @DisplayName("manual SM 优先路径: 压缩成功 → 3 项 main-thread 操作全执行（无参门）")
     void manualSmPath_noArgGate_allMainThreadOpsExecute(@TempDir Path baseDir) throws Exception {
         wireSpies();
-        AtomicInteger cacheClears = registerClearCounter();
+        SessionProbe probe = wireSessionProbe(SESSION);
+        probe.provider().getUserContext();
+        int userComputesBefore = probe.userComputes().get();
         java.nio.file.Files.createDirectories(baseDir.resolve("s1").resolve("session-memory"));
         java.nio.file.Files.writeString(
             baseDir.resolve("s1").resolve("session-memory").resolve("summary.md"),
@@ -248,14 +311,19 @@ class ManualCacheClearCcIntegrationTest {
             .as("SM 成功链 resetContextCollapse 必须执行（CC compact.ts:64 无参调用）").isEqualTo(1);
         assertThat(MEMFILES_RESETS.get())
             .as("SM 成功链 resetGetMemoryFilesCache('compact') 必须执行").isEqualTo(1);
-        assertThat(cacheClears.get()).isEqualTo(2);
+        probe.provider().getUserContext();
+        assertThat(probe.userComputes().get())
+            .as("SM 成功链同样必须清集合B userContext 冻结值（CC compact.ts:63）")
+            .isGreaterThan(userComputesBefore);
     }
 
     @Test
     @DisplayName("manual reactive 注入路径（CC 死代码语义）: isReactiveOnlyMode 恒 false → /compact 走传统链，3 项 main-thread 操作全执行（无参门）")
     void manualReactiveInjection_noArgGate_allMainThreadOpsExecute() {
         wireSpies();
-        AtomicInteger cacheClears = registerClearCounter();
+        SessionProbe probe = wireSessionProbe(SESSION);
+        probe.provider().getUserContext();
+        int userComputesBefore = probe.userComputes().get();
         AtomicInteger reactiveCalls = new AtomicInteger();
         ReactiveCompactor reactive = new ReactiveCompactor(
             msgs -> 200_000,
@@ -291,9 +359,26 @@ class ManualCacheClearCcIntegrationTest {
             .as("传统链成功 resetContextCollapse 必须执行（CC postCompactCleanup.ts:42-49，无参门 gate=TRUE）").isEqualTo(1);
         assertThat(MEMFILES_RESETS.get())
             .as("传统链成功 resetGetMemoryFilesCache('compact') 必须执行（CC :60）").isEqualTo(1);
+        probe.provider().getUserContext();
+        assertThat(probe.userComputes().get())
+            .as("操作 2: 集合B userContext 冻结值必须失效（CC compact.ts:117 + :59）")
+            .isGreaterThan(userComputesBefore);
+    }
+
+    @Test
+    @DisplayName("[步骤 4 · 遗留分支] 无会话标识 ⇒ 集合B 退化为 CC 进程级广播（清全部已注册 provider），不得静默跳过")
+    void noSessionId_broadcastsLegacyCcProcessScope() {
+        // WHY: 步骤 4 把集合B 改成**按会话精确清**（一 JVM 多会话必须分区）。但「无会话标识」的
+        //   历史无参入口在 JS 世界等价于 CC 的**进程级**调用方（一进程一会话）——那种形态下
+        //   CC 的行为就是清进程级 memoize = 本仓的「清全部已注册 provider」。
+        //   ⛔ 若这里静默跳过，压缩后就可能命中陈旧 claudeMd（P0 缓存残留回归）；
+        //   ⛔ 若所有会话都广播，则跨会话串味（另一个极端）。本用例钉死「按会话标识二分支」。
+        wireSpies();
+        AtomicInteger cacheClears = registerClearCounter();
+        PostCompactCleanup.runPostCompactCleanup("repl_main_thread:test");   // 无会话标识（无参入口语义）
         assertThat(cacheClears.get())
-            .as("操作 2: getUserContext.cache.clear 等价 clearAllProviderCaches 执行 2 次（显式 + 序列内，CC compact.ts:117 + postCompactCleanup.ts:59）")
-            .isEqualTo(2);
+            .as("无会话标识 ⇒ 必须走 CC 进程级广播（clearUserOnlyProviderCaches），不得静默跳过")
+            .isEqualTo(1);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -332,12 +417,27 @@ class ManualCacheClearCcIntegrationTest {
             null,   // [批 5a] progressSink
             null);  // [批 5a-2] warningPushContext
 
-        // ── 2a. clearUserContextCache 真实接线：注册观察钩子 → 执行 → 钩子触发 ──
-        AtomicInteger cacheClears = registerClearCounter();
+        // ── 2a. clearUserContextCache 真实接线：执行 → 该会话 provider 的 userContext 缓存失效 ──
+        //   [步骤 4] 观测面改为**同会话 provider 重算**（原为全局广播钩子计数）：生产接线已是
+        //   clearUserContextCacheRunnable(sessionId) → SessionPromptCacheRegistry（按会话精确清），
+        //   不再经 SystemPromptInjection 广播通道。此断言同时钉死「不得回退到 no-op 假接线」。
+        SessionProbe probe = wireSessionProbe(SESSION);
+        probe.provider().getUserContext();
+        int userComputesBefore = probe.userComputes().get();
         ctx.clearUserContextCache().run();
-        assertThat(cacheClears.get())
-            .as("clearUserContextCache 必须真实清除 provider 缓存（no-op 注入替换为 SystemPromptInjection.clearAllProviderCaches）")
-            .isEqualTo(1);
+        probe.provider().getUserContext();
+        assertThat(probe.userComputes().get())
+            .as("clearUserContextCache 必须真实清除**本会话** provider 的 userContext 缓存（按会话精确清，CC compact.ts:63/117/203）")
+            .isGreaterThan(userComputesBefore);
+        // 跨会话隔离（步骤 4 的核心不变量）：别的会话的 userContext 不得被本会话压缩牵连
+        SessionProbe other = wireSessionProbe("sess-other-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        other.provider().getUserContext();
+        int otherBefore = other.userComputes().get();
+        ctx.clearUserContextCache().run();
+        other.provider().getUserContext();
+        assertThat(other.userComputes().get())
+            .as("对照：清本会话不得打掉别的会话的 userContext 冻结值（⛔ 不得广播清全部会话）")
+            .isEqualTo(otherBefore);
 
         // ── 2b. notifyCompaction 真实接线：feature 开 → 重置 cache-read 基线 → 下降不误报 break ──
         List<PromptCacheBreakDetection.CacheBreakResult> events = new ArrayList<>();

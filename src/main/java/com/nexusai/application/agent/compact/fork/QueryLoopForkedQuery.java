@@ -61,10 +61,12 @@ import java.util.function.Supplier;
  *
  * <p><b>有意不做的（登记处 {@code docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md}）</b>:
  * <ul>
- *   <li><b>不记 sidechain transcript</b>（用户决策 4 / D-E1a-01）⇒ 不造 CC 的
- *       {@code createAgentId(forkLabel)}（forkedAgent.ts:533）—— CC 该 agentId <b>只</b>用于
- *       sidechain transcript 的键（:534-551），本仓既然不记，agentId 取 {@code null}
- *       （= CC {@code skipTranscript=true} 时 {@code agentId=undefined} 分支）。</li>
+ *   <li><b>不记 sidechain transcript</b>（用户决策 4 / D-E1a-01）⇒ 不造 CC 给 transcript 用的
+ *       {@code createAgentId(forkLabel)}（forkedAgent.ts:528 那个<b>局部变量</b>，只喂
+ *       :531-597 recordSidechainTranscript）。<b>但 fork 的「身份」agentId 仍必须非空</b> ——
+ *       它是 forkedAgent.ts:448 隔离 TUC 的 {@code overrides?.agentId ?? createAgentId()}（恒非空），
+ *       本仓把它写进 {@link AgentState#agentId()} 以喂 stop-hook 门（{@code StopHookPipeline:286}），
+ *       理由见 {@link #forkAgentId}。⛔ 别把 :528 的同名局部变量当成身份来源（同名不同物）。</li>
  *   <li><b>不引入 thinking/effort</b>：CC {@code runForkedAgent} 透传的参数表里<b>没有</b>
  *       thinkingConfig（forkedAgent.ts:545-556 只有 systemPrompt/userContext/systemContext/
  *       canUseTool/toolUseContext/querySource/maxOutputTokensOverride/maxTurns/skipCacheWrite），
@@ -187,15 +189,23 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
 
         // ── 2. 隔离 AgentState ──
         //   [session] sessionId 取 fork 隔离上下文的 sessionId（= 父会话 id；无父 = standalone 造）。
-        //   [agentId=null 的 CC 依据] CC forkedAgent.ts:533
-        //     {@code const agentId = skipTranscript ? undefined : createAgentId(forkLabel)} ——
-        //     该 agentId 的唯一用途是 sidechain transcript 的键（:534-551 recordSidechainTranscript）；
-        //     本仓 fork 有意不记 sidechain transcript（用户决策 4 / D-E1a-01）⇒ 等价于
-        //     {@code skipTranscript=true} 分支 ⇒ agentId=undefined（→ null）。
+        //   [agentId 恒非空 · 对齐 CC forkedAgent.ts:448] CC 的 fork 身份来自隔离 ToolUseContext 的
+        //     {@code agentId: overrides?.agentId ?? createAgentId()}（forkedAgent.ts:448，
+        //     createSubagentContext 内 · 无 label ⇒ a+16hex）—— <b>恒非空</b>。
+        //     ⛔ 旧注释引的 forkedAgent.ts:533 是**同名不同物的局部变量**
+        //     （{@code skipTranscript ? undefined : createAgentId(forkLabel)}）—— 它只喂
+        //     recordSidechainTranscript（:531-597），与身份无关；照它把 agentId 填 null 是读错了变量。
+        //   [为什么必须非空（本行曾是失控根因）] nexusai 的 stop-hook 门读的是**本 state 的 agentId 串**
+        //     （LlmAgentLoop:8570 stopMainAgentId = state.agentId() → :8704 传 StopHookPipeline →
+        //     :286 {@code agentId != null → 跳过}），不是 CC 的 toolUseContext.agentId。
+        //     填 null ⇒ 提取 fork 被当成主线程 ⇒ fork 自己回合结束又触发一次记忆提取 ⇒
+        //     提取 fork 生提取 fork；失控轮里恒「No memory updates needed」= 0 写入 ⇒
+        //     唯一收敛出口（INV-5「fork 真写了文件」）永不满足 ⇒ 永不收敛
+        //     （用户真机实测：约每 2 秒一次真 API、持续 4~8 分钟）。
         //   [systemPrompt=null] fork 的模型面提示由 params.systemPrompt() 承载（CC query({
         //     systemPrompt }) 同源）；state.systemPrompt() 是 CC customSystemPrompt 语义，fork 不设。
         String forkSessionId = forkCtx != null ? forkCtx.sessionId() : null;
-        AgentState state = new AgentState(null, forkSessionId, null);
+        AgentState state = new AgentState(null, forkSessionId, forkAgentId(forkCtx));
         if (p.maxTurns() != null) {
             // maxTurns 落地在 state（主循环轮末判）+ 透传 QueryParams（循环外消费点）
             state.maxTurns(p.maxTurns());
@@ -298,5 +308,40 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
             result.aborted(), providerType, System.currentTimeMillis() - startTime);
 
         return new ForkedAgentResult(produced, totalUsage, providerType);
+    }
+
+    /**
+     * fork 的「身份」agentId · <b>恒非空</b> · 对齐 CC {@code forkedAgent.ts:448}
+     * {@code agentId: overrides?.agentId ?? createAgentId()}（隔离 ToolUseContext 的身份）。
+     *
+     * <p><b>WHY 必须有这个身份（⛔ 不是「可选的 transcript 键」）</b>：nexusai 的 stop-hook 提取/梦境门
+     * 读的是 {@code AgentState.agentId()}（{@code LlmAgentLoop:8570 → StopHookPipeline:286}
+     * {@code agentId != null → 跳过}）。填 null 会让后台提取 fork 落到「主线程分支」——fork 自己回合
+     * 结束又触发一次提取（提取 fork 生提取 fork），而失控轮恒 0 写入（「No memory updates needed」）
+     * ⇒ 唯一收敛出口 INV-5 永不满足 ⇒ 永不收敛（用户真机实测：约每 2 秒一次真 API、4~8 分钟）。
+     *
+     * <p><b>取值优先级</b>：
+     * <ol>
+     *   <li>{@code forkCtx.agentId()}（fork 的隔离 TUC 已带同一身份 ——
+     *       {@code RunForkedAgent.createIsolatedContext} → {@code ToolUseContext.with} 缺省生成
+     *       {@code packAgentId(createAgentId())}），复用 ⇒ 一个 fork 一个身份（与
+     *       {@code SubagentExecutor} 的 state.agentId == TUC.agentId 约定一致，避免 hook 载荷里的
+     *       agent_id 与 TUC 身份分裂成两个）；</li>
+     *   <li>缺失（测试直构 TUC / 无 agentId 的 ctx）→ 现造
+     *       {@link com.nexusai.application.agent.subagent.AgentContext#createAgentId()} 经
+     *       {@code packAgentId} 桥成 UUID —— <b>复用本仓既有生成器</b>（对齐 CC
+     *       {@code utils/uuid.ts:24-27}，a+16hex），⛔ 不另造一套。</li>
+     * </ol>
+     *
+     * @param forkCtx fork 的隔离 ToolUseContext（可为 null = standalone）
+     * @return 恒非 null 的 fork 身份 UUID（可经 {@code AgentContext.unpackAgentId} 还原 a+16hex）
+     */
+    static java.util.UUID forkAgentId(ToolUseContext forkCtx) {
+        java.util.UUID existing = forkCtx != null ? forkCtx.agentId() : null;
+        if (existing != null) {
+            return existing;
+        }
+        return com.nexusai.application.agent.subagent.AgentContext
+            .packAgentId(com.nexusai.application.agent.subagent.AgentContext.createAgentId());
     }
 }

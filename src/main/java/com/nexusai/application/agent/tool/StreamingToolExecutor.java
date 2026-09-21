@@ -3139,14 +3139,42 @@ public class StreamingToolExecutor {
     /** 当前已排队/执行中的工具数 · AgentLoopContext:1520/1652 消费（runTools 日志 + fork 守卫）。 */
     public int size() { return tools.size(); }
 
+    /**
+     * [team-hang P-d] 默认工具执行器 · <b>每任务一条虚拟线程</b>（原为每实例一个
+     * {@code newFixedThreadPool(min(8, cores))}）。
+     *
+     * <p><b>WHY 必须换（实测泄漏）</b>：原实现每次实例化都新建一个固定池，且<b>全仓无任何
+     * {@code shutdown} 调用点</b>（本类无 close/AutoCloseable，也没有调用方知道「本实例用完了」）
+     * ⇒ 池的 core 线程在任务结束后仍存活 ⇒ 长会话里 executor 实例数 ≈ 轮数，线程数线性增长
+     * （实测 jstack：{@code tool-exec-*} 线程 <b>547</b> 条）。这不是「池太大」，是<b>池根本不会死</b>。
+     *
+     * <p><b>为什么不是「共享静态池」</b>（最省事的那条路，明确否掉）：固定池的容量是<b>全局名额</b>。
+     * 权限提示在设计上无超时（{@code WebSocketPermissionPrompter} 的 {@code future.get()} 有意对齐
+     * CC 无限等待）——一个 teammate 在等用户点弹窗时会<b>长期占住一个名额</b>；改成全局
+     * min(8,cores) 后，8 个 teammate 同时等待弹窗就能把池占满，<b>Leader 自己的工具将无法执行</b>
+     * （跨会话饿死）。共享池等于把「每会话独立名额」这个既有隔离降级成全局竞争，代价比泄漏更重。
+     *
+     * <p><b>为什么没破坏「工具执行隔离」</b>：
+     * <ol>
+     *   <li>本池只做一件事 —— 给 {@code CompletableFuture.runAsync(..., executor)}（本类唯一消费点，
+     *       {@code executeAsync} 内）提供线程；工具之间真正的隔离契约是<b>兄弟级 abort 树</b>
+     *       （{@code siblingAbortController}/{@code toolAbortController} + Bash 错误级联，
+     *       对齐 CC StreamingToolExecutor.ts:44-47/:294-318）与 in-progress 集，<b>不依赖池身份</b>。</li>
+     *   <li>「每任务一条虚拟线程」在隔离维度上比固定池<b>更强</b>：固定池的 min(8,cores) 是每实例
+     *       并发上限，一个停住的工具会占住名额并让同批其他工具排队；虚拟线程无名额竞争，
+     *       <b>任何工具都不会因别的工具停住而拿不到线程</b>。</li>
+     *   <li>不再需要 shutdown：虚拟线程随任务结束而结束，无 OS 线程留存 ⇒ 泄漏消失（这正是本项要修的）。</li>
+     * </ol>
+     * <p>命名前缀仍是 {@code tool-exec-}（诊断现成证据；{@code logback-spring.xml} 的 {@code [%thread]}
+     * 与既有断言按前缀判「是否走工具执行线程」）。与 {@code AsyncConfig.cronExecutor}（:74-81）同款
+     * {@code Thread.ofVirtual().name(prefix, 0).factory()} 写法（本仓既有约定）。
+     */
     private static ExecutorService defaultExecutor() {
-        return Executors.newFixedThreadPool(
-            Math.min(8, Runtime.getRuntime().availableProcessors()),
-            r -> {
-                Thread t = new Thread(r, "tool-exec-" + System.nanoTime());
-                t.setDaemon(true);
-                return t;
-            });
+        java.util.concurrent.ThreadFactory factory = Thread
+            .ofVirtual()
+            .name("tool-exec-", 0)
+            .factory();
+        return Executors.newThreadPerTaskExecutor(factory);
     }
 
     private static String abbreviate(String s, int max) {
@@ -3690,7 +3718,8 @@ public class StreamingToolExecutor {
         //   AgentLoopContext.applyToolResultBudget(:2181) 的落库兜底：String data trim 空 → 占位
         //   "(<tool> completed with no output)"，保证实时事件与 role=tool 落库/给 LLM 结果一致
         //   （BashTool 空输出假卡事故 2026-09-05 · 修复 A）。rawData 为 null / 非 String（结构化 data<T>）
-        //   不兜底（对齐 applyToolResultBudget 仅 String 分支），原样 truncateResult。
+        //   不兜底（对齐 applyToolResultBudget 仅 String 分支）；SendUserMessage 走结构化 JSON，
+        //   其余非 String 走原样 truncateResult（见下方 else 分支）。
         Object rawData = t.result == null ? null : t.result.data();
         String result;
         if (rawData instanceof String sd && sd.trim().isEmpty()) {
@@ -3702,8 +3731,18 @@ public class StreamingToolExecutor {
                     t.call.name(), abbreviate(t.call.id(), 24), result);
             }
         } else {
-            // null / 非 String data（结构化 data<T>）不兜底（对齐 applyToolResultBudget 仅 String 分支）
-            result = truncateResult(rawData);
+            // [brief-payload 2026-09-20] SendUserMessage 的 UI 面载荷 = 结构化 output JSON。
+            //   本出口是**交互路径的先手**（ChatService.java:1797 注释自述「通常晚于 executor push
+            //   → 此处跳过」）⇒ 此处若送 String.valueOf(Map)（truncateResult 对非 String 的行为），
+            //   前端 fromStructured 解析失败 → 回落 arguments ⇒ 附件实时显示成 [file] 路径且无大小
+            //   （图片也被误标 [file]，因 isImage 未知），F5 后才变 [image] path (size)。
+            //   与落库/重拉同源（ChatService.toolResultUiPayload 委托同一静态判定），
+            //   对齐 CC toolExecution.ts:1456-1466 toolUseResult = result.data（UI 只认数据对象，
+            //   模型面文本走 tool_result content）。⛔ 模型面不受影响（本值只进 STOMP 事件）。
+            //   非本工具 / 非结构化 data → truncateResult（原行为，含 null ↔ ""）。
+            String briefJson = com.nexusai.application.agent.tool.impl.BriefTool
+                .structuredUiPayload(t.call.name(), rawData);
+            result = briefJson != null ? briefJson : truncateResult(rawData);
         }
         try {
             ts.wsTemplate().convertAndSend(ts.streamTopic(),

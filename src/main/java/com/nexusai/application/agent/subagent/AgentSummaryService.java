@@ -39,6 +39,10 @@ import java.util.function.Consumer;
  *       LLM (CC agentSummary.ts:78-84 forkContextMessages) — 修复"摘要 LLM 无 transcript 上下文".</li>
  *   <li><b>A8</b>: summarize 返回后先复查 stopped (CC agentSummary.ts:121) 再更新 callback —
  *       修复 stop 竞态下"stop 后回调仍可能触发" (T3/T4).</li>
+ *   <li><b>A9 [team-hang 假进度]</b>: transcript 指纹（{@link #transcriptFingerprint}）自上次
+ *       摘要以来未变 ⇒ 本轮**不 fork LLM、不更新 callback**，只打 WARN「自上次真实活动已 N 秒」。
+ *       WHY：摘要契约是「描述 most recent action」；转录不前进时没有动作可描述，再 fork 只会产出
+ *       **编造**文本（实测：agent 挂住 10+ 分钟而摘要仍每 30s 换一句）。语义 = 摘要只随真实活动前进。</li>
  * </ul>
  *
  * <p>L3 (Java idiom): ScheduledExecutorService 替代 setTimeout; Consumer callback 替代 setAppState;
@@ -119,6 +123,20 @@ public class AgentSummaryService {
         /** 本轮 in-flight 摘要的 AbortController (CC agentSummary.ts:91 summaryAbortController). */
         volatile AbortController inFlight;
 
+        /**
+         * [team-hang 假进度] 上一次**真实观测到**的 transcript 指纹（{@link #transcriptFingerprint}）。
+         *
+         * <p>WHY：摘要契约是「Describe your most recent action」——它**描述动作**，不产生动作。
+         * 若转录自上次摘要有增无变，agent 就没有「most recent action」；此时再 fork 一次 LLM，
+         * 模型在「Previous: "…" — say something NEW」提示下只能**编**一句新的（实测：worker-d
+         * 卡在 Bash 权限等待后，摘要仍每 30s 产出 "Implementing matmul in matrix.py" /
+         * "Running test_matrix.py suite" 等——那些动作从未发生，产物零落地）。
+         * 记录指纹 ⇒ 转录未变时不再产出新文本，摘要由「猜测」退回为「事实信号」。
+         */
+        volatile String lastTranscriptFingerprint;
+        /** 转录最近一次前进的时刻（毫秒）· 用于在停滞时打印「已停滞 N 秒」。初值 0 = 尚未观察。 */
+        volatile long lastTranscriptAdvanceAtMs;
+
         AgentSummaryState(String taskId, String agentId,
                           SummarySummarizer summarizer,
                           Consumer<String> updateCallback,
@@ -152,6 +170,17 @@ public class AgentSummaryService {
                     }
                     return;
                 }
+                // [team-hang 假进度] 转录未前进 ⇒ 不产出新摘要（见下）。
+                String fingerprint = transcriptFingerprint(transcript);
+                if (fingerprint.equals(lastTranscriptFingerprint)) {
+                    long stalledSec = (System.currentTimeMillis() - lastTranscriptAdvanceAtMs) / 1000L;
+                    log.warn("[AgentSummary] {} 转录无新增（自上次真实活动已 {} 秒）⇒ 跳过本轮摘要："
+                        + "本 agent 可能已挂住，重复 fork 只会产出**编造**的进度文本，面板会被假进度误导",
+                        taskId, stalledSec);
+                    return;
+                }
+                lastTranscriptFingerprint = fingerprint;
+                lastTranscriptAdvanceAtMs = System.currentTimeMillis();
                 // CC agentSummary.ts:78 filterIncompleteToolCalls → forkContextMessages (clean 上下文)
                 List<AgentMessage> clean = summarizer.filterIncompleteToolCalls(transcript);
                 if (log.isDebugEnabled()) {
@@ -225,6 +254,34 @@ public class AgentSummaryService {
      *
      * <p>package-private static (而非 private): 单测直接验证 prompt 含完整示例 (Pattern #14 seam).
      */
+    /**
+     * [team-hang 假进度] transcript「是否前进」指纹 · 由条数 + 末条身份构成。
+     *
+     * <p>WHY 用这个组合：摘要只取决于 agent 已产出的消息（CC agentSummary.ts:68
+     * {@code getAgentTranscript(agentId)}）。转录**新增一条**必然改变「条数」或「末条身份」，
+     * 二者任一变化即视为「有新的 most recent action」。末条身份优先取 {@code uuid}
+     * （{{@link AgentMessage#uuid()} 的 CC original 是 {@code msg.uuid}}），legacy 转录无 uuid 时
+     * 回落到内容长度+散列，避免把「同长度不同内容」误判为未变。
+     *
+     * <p>package-private static：单测可直接对指纹做等价性断言（Pattern #14 seam）。
+     */
+    static String transcriptFingerprint(List<AgentMessage> transcript) {
+        if (transcript == null || transcript.isEmpty()) {
+            return "0";
+        }
+        AgentMessage last = transcript.get(transcript.size() - 1);
+        String lastIdentity;
+        if (last == null) {
+            lastIdentity = "null";
+        } else if (last.uuid() != null && !last.uuid().isBlank()) {
+            lastIdentity = last.uuid();
+        } else {
+            String content = last.content() != null ? last.content() : "";
+            lastIdentity = "c" + content.length() + ":" + content.hashCode();
+        }
+        return transcript.size() + "|" + lastIdentity;
+    }
+
     static String buildSummaryPrompt(String previousSummary) {
         String prevLine = previousSummary != null
             ? "\nPrevious: \"" + previousSummary + "\" — say something NEW.\n"

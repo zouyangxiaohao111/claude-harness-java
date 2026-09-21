@@ -170,8 +170,20 @@ public class TeamDeleteTool implements Tool {
             String sessionIdStr = (ctx != null && ctx.sessionId() != null)
                     ? ctx.sessionId() : null;
             AgentToolResult<?> result = deleteTeamByName(teamName, sessionIdStr, waitMs, call.id());
-            // CC :215-222 清 appState teamContext + inbox（会话列清已在 deleteTeamByName 内按 sessionId 承担）
-            clearTeamContext(ctx);
+            // [team-disband-race] 只在**真的删掉**时才清 teamContext —— 对齐 CC TeamDeleteTool.ts
+            //   的守卫早退（:89-99 活跃成员 > 0 → return {...success:false}，此时 setAppState 清
+            //   teamContext 尚未执行）。原实现无条件 clearTeamContext ⇒ 第一次因活跃成员被拒删
+            //   却已把会话的 teamContext 抹掉，第二次调用 teamNameFromContext() 恒为 null →
+            //   退化成分支 :182「No team name found, nothing to clean up」且 success=true
+            //   （**假成功**：零清理却报成功，模型据此停止重试）。实测铁证：backend.log
+            //   15:56:11 拒删（outLen=212）→ 15:56:23 第二次 1ms 返回 outLen=68。
+            if (isSuccess(result)) {
+                // CC :215-222 清 appState teamContext + inbox（会话列清已在 deleteTeamByName 内按 sessionId 承担）
+                clearTeamContext(ctx);
+            } else if (log.isDebugEnabled()) {
+                log.debug("[TeamDeleteTool] team={} 解散被拒（活跃成员守卫）→ 保留 teamContext，供重试/后续 requestShutdown",
+                        teamName);
+            }
             return result;
         }
 
@@ -180,6 +192,25 @@ public class TeamDeleteTool implements Tool {
 
         return ToolResult.success(call.id(),
                 buildOutput(true, "No team name found, nothing to clean up", null));
+    }
+
+    /**
+     * 工具结果是否 success:true · 与 REST 侧 TeamController.parseToolResult 同口径
+     * （{@code data()} 为 JSON 字符串，{@code success} 缺失/解析失败 → false，不抛）。
+     */
+    private static boolean isSuccess(AgentToolResult<?> result) {
+        if (result == null || result.data() == null) {
+            return false;
+        }
+        try {
+            JsonNode data = MAPPER.readTree(String.valueOf(result.data()));
+            return data != null && data.path("success").asBoolean(false);
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[TeamDeleteTool] 解析工具结果判定 success 失败，按未成功处理: {}", e.getMessage());
+            }
+            return false;
+        }
     }
 
     /**

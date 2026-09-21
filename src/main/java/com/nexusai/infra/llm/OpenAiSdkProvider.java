@@ -5,6 +5,7 @@ import cn.hutool.json.JSONUtil;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.nexusai.application.agent.lsp.PromptCacheBreakDetection;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
@@ -270,7 +271,10 @@ public class OpenAiSdkProvider implements LlmProvider {
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
                 null, thinkingConfig != null && "disabled".equals(thinkingConfig.type()),
-                null, effortValue, null, true);
+                null, effortValue, null,
+                // includeUsage=true（流式 usage 采集）+ streamingMainChain=true（探针链标记：
+                // 本路径是唯一会在 :343 打「响应」探针的路径 ⇒ 与响应行同桶，1:1 可对排）。
+                true, true);
 
             String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
             if (log.isDebugEnabled()) {
@@ -335,6 +339,12 @@ public class OpenAiSdkProvider implements LlmProvider {
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(buildAssistantMessage(state));
             }
+            // [前缀缓存头部探针 · 步骤 1] 响应侧 cacheRead 掉幅（与 [usage-push] 逐条对排）。
+            //   sessionId 与出站探针同源（同一 history 经 SessionIdResolver 解析 ⇒ 同桶）。
+            //   ⛔ 非流式 chatWithOptions* 不接此线：那条链路没有 [usage-push] 对排需求，
+            //   且侧查询（标题/解释器/分类器）会把同会话的「上一条 input」基线踩脏。
+            logHeadProbeResponse(sessionId, state.inputTokens,
+                state.cacheReadInputTokens, state.cacheCreationInputTokens);
             finished.set(true);
             try {
                 response.close();
@@ -732,11 +742,13 @@ public class OpenAiSdkProvider implements LlmProvider {
     }
 
     /**
-     * [DEC-04] 带 includeUsage 的 buildRequestParams · 10-param 主实现。
+     * [DEC-04] 带 includeUsage 的 buildRequestParams（10 参 · 保留旧签名）。
      *
-     * <p>流式路径传 {@code includeUsage=true} 写入 {@code stream_options.include_usage}
-     * （OpenAI streaming 默认不返回 usage，需显式开启）；非流式路径传 false（stream_options 对
-     * non-streaming 无效）。CC 侧 Anthropic 流式 usage 恒返回，本 flag 为 OpenAI 协议等价。
+     * <p>行为与 11 参重载<b>完全一致</b>，只差探针记账口径：本重载不带「是否流式主链」载荷 ⇒
+     * 出站探针按<b>侧查询</b>记账（走独立桶 {@link #HEAD_PROBE_SIDE_SUFFIX}，{@code chain=side}）。
+     * 流式主链（{@link #doStream}）改调 11 参重载并显式传 {@code streamingMainChain=true}，
+     * 使主链出站行与响应行同桶 ⇒ 严格 1:1 可对排。见
+     * {@link #buildRequestParams(String, String, List, ArrayNode, JsonNode, boolean, Double, String, Integer, boolean, boolean)}。
      */
     public static ChatCompletionCreateParams buildRequestParams(String modelName,
                                                          String systemPrompt,
@@ -748,17 +760,50 @@ public class OpenAiSdkProvider implements LlmProvider {
                                                          String effortValue,
                                                          Integer maxTokens,
                                                          boolean includeUsage) {
+        return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
+            thinkingDisabled, temperature, effortValue, maxTokens, includeUsage, false);
+    }
+
+    /**
+     * [DEC-04] buildRequestParams · 11-param 主实现（含探针链标记）。
+     *
+     * <p><b>includeUsage</b>：流式路径传 {@code true} 写入 {@code stream_options.include_usage}
+     * （OpenAI streaming 默认不返回 usage，需显式开启）；非流式路径传 false（stream_options 对
+     * non-streaming 无效）。CC 侧 Anthropic 流式 usage 恒返回，本 flag 为 OpenAI 协议等价。
+     *
+     * <p><b>streamingMainChain</b>（[前缀缓存头部探针 · 可判读化]）：本请求是否走
+     * <b>流式主链</b>（{@link #doStream}，即唯一会打「响应」探针的那条路）。⛔ 它<b>只</b>影响探针
+     * 的记账分桶与日志标记（{@code chain=stream|side}），<b>不改任何一个 wire 字节</b>：
+     * 出站 params 的构造逐字与传入 false 时相同。WHY 必须显式传而不复用 includeUsage 推断：
+     * 二者语义不同（一个管 {@code stream_options}，一个管日志可判读性），复用会在将来任一侧
+     * 变更时静默串味。见 {@link #HEAD_PROBE_SIDE_SUFFIX}。
+     */
+    public static ChatCompletionCreateParams buildRequestParams(String modelName,
+                                                         String systemPrompt,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         JsonNode outputFormatSchema,
+                                                         boolean thinkingDisabled,
+                                                         Double temperature,
+                                                         String effortValue,
+                                                         Integer maxTokens,
+                                                         boolean includeUsage,
+                                                         boolean streamingMainChain) {
         ChatCompletionCreateParams.Builder b = ChatCompletionCreateParams.builder()
             .model(modelName == null ? "" : modelName);
         if (systemPrompt != null && !systemPrompt.isBlank()) {
             b.addSystemMessage(systemPrompt);
         }
-        if (history != null) {
+        // [前缀缓存头部探针 · 步骤 1] 出站消息列表提到外层：探针需在同一处拿到「配对修复后的真实出站列表」
+        //   （hash 的是它，不是入参 history）—— 语义与条件与原来完全一致，仅变量作用域外扩。
+        List<ChatMessageDto> outbound = history == null
+            ? null : ToolResultPairingRepair.ensureToolResultPairing(history);
+        int sentMessageCount = 0;
+        if (outbound != null) {
             // [P1 发送边界配对修复] CC original: ensureToolResultPairing（claude.ts:1324 —— 主线程与 fork
             //   共用同一处；forkedAgent.ts:538-541 明确「不在 fork 侧 filter 悬挂 tool_use，下游统一修」）。
             //   Java 侧唯一 DTO→wire 转换点即此处（stream/chat/chatWithRaw/chatWithOptions 共用），
             //   fork 经 ProductionForkedQuery.streamOnce → provider.stream 同样落到这里。
-            List<ChatMessageDto> outbound = ToolResultPairingRepair.ensureToolResultPairing(history);
             if (outbound != history && log.isDebugEnabled()) {
                 log.debug("OpenAiSdkProvider 发送边界配对修复: {} → {} 条（悬挂 tool_use/孤儿 tool_result）",
                     history.size(), outbound.size());
@@ -767,14 +812,17 @@ public class OpenAiSdkProvider implements LlmProvider {
                 ChatCompletionMessageParam param = toSdkMessage(m);
                 if (param != null) {
                     b.addMessage(param);
+                    sentMessageCount++;
                 }
             }
         }
+        // [G4] strict 模型层门控（OpenAI · Java 多 provider 扩展 ⊕）：flag && model != null && 白名单。
+        //   意图层（ToolRegistry）已把 flag && tool.strict() 写入 JSON strict 字段。
+        //   [前缀缓存头部探针] 提到 tools 块外：探针要按「同一门控」做线级投影（strict 门控不通过时
+        //   strict 不上 wire，投影须同步省略），tools 为空时也需有值（纯函数，零副作用）。
+        boolean strictModelGate = StructuredOutputsSupport.shouldTransmitStrictOpenAi(modelName);
         if (tools != null && !tools.isEmpty()) {
             int added = 0;
-            // [G4] strict 模型层门控（OpenAI · Java 多 provider 扩展 ⊕）：flag && model != null && 白名单。
-            //   意图层（ToolRegistry）已把 flag && tool.strict() 写入 JSON strict 字段。
-            boolean strictModelGate = StructuredOutputsSupport.shouldTransmitStrictOpenAi(modelName);
             for (JsonNode toolNode : tools) {
                 ChatCompletionTool sdkTool = toOpenAiSdkTool(toolNode, strictModelGate);
                 if (sdkTool != null) {
@@ -838,6 +886,13 @@ public class OpenAiSdkProvider implements LlmProvider {
         if (includeUsage) {
             b.streamOptions(ChatCompletionStreamOptions.builder().includeUsage(true).build());
         }
+        // [前缀缓存头部探针 · 步骤 1] 出站头部指纹（每次请求一行 INFO，只打 hash 与长度）·
+        //   落点即本方法 = 本类唯一 DTO→wire 转换点 ⇒ stream / chatWithRaw / chatWithOptions /
+        //   chatWithOptionsMessage 四条路径全覆盖，不漏请求。
+        //   [可判读化] streamingMainChain 由调用方显式声明（doStream=true，其余=false）：
+        //   主链行 chain=stream 且与响应行同桶 ⇒ 1:1 可对排；侧查询行 chain=side 走独立桶。
+        logHeadProbeOutbound(systemPrompt, outbound, sentMessageCount, tools, strictModelGate,
+            streamingMainChain);
         return b.build();
     }
 
@@ -1473,6 +1528,297 @@ public class OpenAiSdkProvider implements LlmProvider {
                 return "high";
             default:
                 return null;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [前缀缓存头部探针 · 步骤 1] 出站头部指纹 + 响应侧 cacheRead 掉幅（零行为变化观测）
+    //
+    //   目的：指认「每发一次消息（= 每起一个 run）头部哪个字节在漂」——
+    //        system 串 / tools 线级投影 / messages[0..2] 线级投影 逐项 hash + 长度，与 [usage-push] 对排。
+    //   纪律：只打 hash 与长度，⛔ 绝不打正文（防泄漏 + 防日志爆炸）。
+    //   ⚠️ [判读口径 2026-09-21] **只把 `system` / `tools` / `messages[0..2]` 三项当「稳定前缀」判据**，
+    //        ⛔ **不要把「每轮全字段逐字节相同」当预期**：CC 自己每轮也会改字节 —— 一条
+    //        mid-conversation `role:"system"` 消息一旦从「本轮尾」变成**历史**，CC 会把它的 `content`
+    //        从 **ARRAY 改成裸 JSON 字符串并丢掉 cache_control**（`"content":[{"type":"text",...}]` →
+    //        `"content":"# Environment\n..."`；c7 行为轴实测，确定性可复现）。该变化落在**尾部**、不破前缀。
+    //        ⇒ 若把「全字段相同」当判据，在这个点上**必然判错**；三项口径已实测跨 turn 稳定。
+    //   生效范围：仅本类 = openai_compatible / openai_sdk 路由（LlmProviderFactory.getProvider
+    //        case "openai_compatible"/"openai_sdk"），Anthropic / Mock 链路零影响。
+    //   hash 能力来源：{@link PromptCacheBreakDetection#probeDigest(Object)} —— 与 CC
+    //        services/api/promptCacheBreakDetection.ts:170 computeHash 同源（SHA-256 取前 32 位），
+    //        ⛔ 不另造第二套（同语义禁止双实现）。
+    //   ⭐ [F1 修复] **hash 输入口径 = 线级投影，不是 DTO 的 toString**：
+    //        messages[i] 是每轮用 UUID.randomUUID() + OffsetDateTime.now() 新造的 userContext 元消息
+    //        （AgentLoopContext.metaUserMessage / prependUserContext + result.add(0,..)），
+    //        而 ChatMessageDto 是未覆写 toString 的 record ⇒ id/createdAt/time 会进 hash
+    //        ⇒ 即使 wire 字节完全不变，msg0 hash 也每次请求都变（假阳性，且方向指向最关心的那一格）。
+    //        tools 同理：源数组里的 defer_loading 从不被 toOpenAiSdkTool 读取 ⇒ 不进 wire。
+    //        ⇒ 统一经 {@link OutboundWireProjection}（生产唯一投影实现）投影后再 hash。
+    //        ⛔ 任何地方都不得再对 ChatMessageDto / tools 源节点直接 probeDigest。
+    //   ⭐ [可判读化] **出站行带 chain=stream|side 标记 + 主链/侧查询分桶**：出站探针四条发送路径
+    //        全打，响应探针只在流式主链打 ⇒ 若共用一个会话桶，侧查询会把主链的 turn 顶掉、
+    //        出站↔响应无法 1:1 对排。现：主链行 chain=stream（桶 = sessionId）、侧查询行 chain=side
+    //        （桶 = sessionId+"#side"）；响应行带 turn，与主链出站行按 sessionId+turn 逐条对排。
+    //   ⚠️ 有意**不**接 PROMPT_CACHE_BREAK_DETECTION 门控：该 flag 默认关（OPD-SP-14），
+    //        门控会让本探针恒静默 ⇒ 步骤 1 拿不到任何证据；判据（CACHE_READ_HIT_RATIO /
+    //        MIN_CACHE_MISS_TOKENS）仍逐字复用 PromptCacheBreakDetection 的常量与语义。
+    // ════════════════════════════════════════════════════════════════════
+
+    /** [前缀缓存头部探针] 探针态 LRU 上限（纯观察态，不影响任何请求行为）。 */
+    private static final int HEAD_PROBE_MAX_SESSIONS = 256;
+
+    /** [前缀缓存头部探针] 无 sessionId 的请求（chatWithRaw 无 history）共用桶 · ⛔ 绝不编造会话 id。 */
+    private static final String HEAD_PROBE_NO_SESSION = "<no-session>";
+
+    /**
+     * [前缀缓存头部探针] <b>侧查询（非流式主链）的桶后缀</b> · 与主链桶隔离。
+     *
+     * <p><b>WHY 必须隔离（本后缀的存在理由）</b>：出站探针在<b>四条</b>发送路径都打
+     * （stream / chatWithRaw / chatWithOptions / chatWithOptionsMessage —— 落点都是
+     * {@code buildRequestParams} 这个唯一 DTO→wire 转换点），而响应探针<b>只在流式主链</b>
+     * （{@link #doStream}）打。若二者共用同一会话桶，则本会话每发一次侧查询（标题 / 分类器 /
+     * 解释器）就把主链桶的 {@code requestSeq} 顶掉一格 ⇒ 主链的「出站 turn=N」与「响应」
+     * 不再 1:1（日志上表现为<b>主链 turn 跳号</b>，且无法判断某条响应属于哪一次出站请求）。
+     * 隔离后：主链桶<b>只</b>由（主链出站 + 主链响应）读写 ⇒ 严格 1:1；侧查询走
+     * {@code <sessionId>#side} 独立桶，序号自成一列，互不顶号。
+     */
+    private static final String HEAD_PROBE_SIDE_SUFFIX = "#side";
+
+    /**
+     * [前缀缓存头部探针] 按（会话, 链）分区的观察态：
+     * 请求序号 + 最近一次出站 turn + 上一次响应的 input / cacheRead。
+     */
+    private static final class HeadProbeState {
+        long requestSeq;
+        /** 最近一次<b>出站</b>的 turn · 响应行据此与出站行逐条对排（见 {@link #logHeadProbeResponse}）。 */
+        long lastTurn;
+        long lastInputTokens = -1L;
+        long lastCacheReadTokens = -1L;
+    }
+
+    /**
+     * [前缀缓存头部探针] 会话级观察态表 · accessOrder LRU，超过 {@link #HEAD_PROBE_MAX_SESSIONS}
+     * 淘汰最久未访问项（会话结束无需显式清理，且保证不无界增长）。
+     * <p>读写一律在 {@code synchronized (HEAD_PROBE_STATE)} 内（该 map 自身即互斥量）。
+     */
+    private static final Map<String, HeadProbeState> HEAD_PROBE_STATE =
+        Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, HeadProbeState> eldest) {
+                return size() > HEAD_PROBE_MAX_SESSIONS;
+            }
+        });
+
+    /**
+     * 取（必要时建）会话/链 探针态 · <b>调用方必须已持有 {@link #HEAD_PROBE_STATE} 锁</b>。
+     *
+     * @param sessionId          会话 id（null/空白 → {@link #HEAD_PROBE_NO_SESSION}）
+     * @param streamingMainChain true = 流式主链（与响应探针<b>同一桶</b>；
+     *                           false = 侧查询（独立桶，见 {@link #HEAD_PROBE_SIDE_SUFFIX}）
+     */
+    private static HeadProbeState headProbeStateLocked(String sessionId, boolean streamingMainChain) {
+        String base = (sessionId == null || sessionId.isBlank()) ? HEAD_PROBE_NO_SESSION : sessionId;
+        String key = streamingMainChain ? base : base + HEAD_PROBE_SIDE_SUFFIX;
+        return HEAD_PROBE_STATE.computeIfAbsent(key, k -> new HeadProbeState());
+    }
+
+    /**
+     * [前缀缓存头部探针] 单片头部构件（已投影的线级串）指纹 → 日志片段。
+     *
+     * @param data 已投影的线级串（system 串 / 工具投影串 / 消息投影串；null = 该项不存在）
+     * @return {@code h=<hash>,len=<串长度>}；null → {@code "-"}
+     */
+    private static String headProbeField(Object data) {
+        if (data == null) {
+            return "-";
+        }
+        PromptCacheBreakDetection.ProbeDigest d = PromptCacheBreakDetection.probeDigest(data);
+        return "h=" + d.hash() + ",len=" + d.length();
+    }
+
+    /**
+     * [前缀缓存头部探针] {@code messages[index]} 的指纹 → 日志片段。
+     *
+     * <p>⭐ <b>先经 {@link OutboundWireProjection#projectMessage} 投影再 hash</b>（F1 修复）：
+     * 直接 hash {@code ChatMessageDto} 会把不进 wire 的 {@code id/createdAt/time} 算进去 ⇒
+     * 每轮新造的元消息恒假阳性。见本段开头注释。
+     *
+     * @param messages 出站消息列表（配对修复后）
+     * @param index    消息下标
+     * @return {@code h=<hash>,len=<投影串长度>}；越界/为 null → {@code "-"}
+     */
+    private static String headProbeMessageField(List<ChatMessageDto> messages, int index) {
+        if (messages == null || index >= messages.size()) {
+            return "-";
+        }
+        ChatMessageDto m = messages.get(index);
+        if (m == null) {
+            return "-";
+        }
+        return headProbeField(OutboundWireProjection.projectMessage(m));
+    }
+
+    /**
+     * [前缀缓存头部探针] 头部三项构件的一次完整指纹（<b>纯计算 · 无 IO · 无状态</b>）。
+     *
+     * <p>日志（{@link #logHeadProbeOutbound}）与单测共用本方法来保证「同一口径」——
+     * 单测直接对本方法断言，即等于对真实探针的 hash 输入断言（⛔ 不是复制一份口径去断言）。
+     *
+     * @param systemPrompt    出站 system 串（可 null = 不发送）
+     * @param outbound        配对修复后的出站消息列表（可 null）
+     * @param sentCount       真实写入请求体的消息条数
+     * @param tools           出站 tools 数组源 JSON（可 null）
+     * @param strictModelGate strict 模型层门控（见 {@link OutboundWireProjection#projectToolNode}）
+     * @return 三个构件 + 条数的指纹快照
+     */
+    static HeadProbeFingerprint fingerprintHead(String systemPrompt, List<ChatMessageDto> outbound,
+                                                int sentCount, ArrayNode tools, boolean strictModelGate) {
+        return new HeadProbeFingerprint(
+            headProbeField(systemPrompt),
+            tools == null ? "-" : headProbeField(OutboundWireProjection.projectTools(tools, strictModelGate)),
+            headProbeMessageField(outbound, 0),
+            headProbeMessageField(outbound, 1),
+            headProbeMessageField(outbound, 2),
+            sentCount);
+    }
+
+    /**
+     * [前缀缓存头部探针] 头部指纹快照 · 每项形如 {@code h=<hash>,len=<len>}，缺失为 {@code "-"}。
+     *
+     * @param system    出站 system 串指纹
+     * @param tools     出站工具线级投影指纹
+     * @param msg0      {@code messages[0]} 线级投影指纹
+     * @param msg1      {@code messages[1]} 线级投影指纹
+     * @param msg2      {@code messages[2]} 线级投影指纹
+     * @param sentCount 真实写入请求体的消息条数
+     */
+    record HeadProbeFingerprint(String system, String tools, String msg0, String msg1, String msg2,
+                                int sentCount) {}
+
+    /**
+     * [前缀缓存头部探针 · 出站] 每次 OpenAI 请求一行 INFO · 头部三项指纹（<b>只打 hash 与长度</b>）。
+     *
+     * <p>打印项（固定顺序）：{@code sessionId / turn / chain / 线程名 / sys / tools / msg0 / msg1 / msg2 / 消息总数}。
+     * {@code sys} 取<b>出站 system 串</b>（openai-compatible 端点 system 为单字符串，见
+     * {@link #stream} 的 {@code \n\n} join —— block 划分与 cache_control 不落 wire，故此处不打 block 维度）；
+     * {@code tools} 取<b>出站 tools 的线级投影</b>；{@code msgN} 取出站消息（配对修复后）的
+     * <b>线级投影</b>（两者均经 {@link OutboundWireProjection}，见本段开头 F1 说明）。
+     *
+     * <p>{@code turn} = <b>本探针自维护的「会话内请求序号」</b>（1 起）：provider 签名链
+     * （{@code LlmProvider.stream} / {@code doStream}）没有任何 run/turn 载体，故用会话内请求序号
+     * 作为 run 边界的可对排锚点（同一 sessionId 相邻两行的 turn 连续 ⇒ 就是相邻两次模型请求）。
+     *
+     * <p>调用点 = {@link #buildRequestParams}（本类唯一 DTO→wire 转换点）⇒ 四条发送路径全覆盖。
+     *
+     * <p><b>已知边界（如实登记，不粉饰）</b>：tools 的线级投影重建的是
+     * {@code toOpenAiSdkTool} 的<b>字段集</b>，不是 SDK 对象本身（SDK 对象 {@code toString} 的
+     * 确定性未验证，直接 hash 有产生假漂移的风险）⇒「转换环节丢掉某个畸形 tool」这一格由投影的
+     * {@link OutboundWireProjection#DROPPED_TOOL} 占位覆盖，但 SDK 内部序列化差异（若有）本行看不见。
+     * 若 tools 指纹跨 run 全同而 cacheRead 仍塌，须排除该项后再下结论。
+     *
+     * @param systemPrompt       出站 system 串（可 null = 不发送 system）
+     * @param outbound           配对修复后的出站消息列表（可 null）
+     * @param sentCount          真实写入请求体的消息条数（{@code toSdkMessage} 过滤 system 角色后计数）
+     * @param tools              出站 tools 数组源 JSON（可 null）
+     * @param strictModelGate    strict 模型层门控（{@code toOpenAiSdkTool} 的同一入参）
+     * @param streamingMainChain true = 流式主链请求（{@link #doStream}，其响应行也打）；
+     *                           false = 侧查询（标题 / 分类器 / 解释器，无响应行）
+     *
+     * <p><b>⭐ 判读方式</b>：日志行上有 {@code chain=stream|side} 标记 + {@code turn} 序号。
+     * 同一 sessionId 下：<b>主链</b>行（{@code chain=stream}）的 turn 从 1 起<b>连号</b>，且与
+     * 「响应」行（带同一 turn）<b>逐条 1:1</b>；<b>侧查询</b>行（{@code chain=side}）走独立桶
+     * （{@link #HEAD_PROBE_SIDE_SUFFIX}）⇒ 其 turn 自成一列，<b>不会</b>把主链序号顶掉
+     * （这正是本标记 + 分桶要修的可判读性缺陷）。对排方法：按 sessionId 分组 → 只看
+     * {@code chain=stream} 的行 → 相邻两行 turn 应连续，且每条都能在响应行里找到同 turn 的那条。
+     *
+     * <p>包级可见（原 private）供单测直接驱动：主链/侧查询的<b>分桶与连号</b>是纯记账逻辑，
+     * 不经真实网络即可断言（与 {@link #fingerprintHead} 同先例）。
+     */
+    static void logHeadProbeOutbound(String systemPrompt, List<ChatMessageDto> outbound,
+                                     int sentCount, ArrayNode tools, boolean strictModelGate,
+                                     boolean streamingMainChain) {
+        if (!log.isInfoEnabled()) {
+            return;
+        }
+        try {
+            String sessionId = SessionIdResolver.resolve(outbound, null);
+            long turn;
+            synchronized (HEAD_PROBE_STATE) {
+                HeadProbeState st = headProbeStateLocked(sessionId, streamingMainChain);
+                turn = ++st.requestSeq;
+                // 响应行靠 lastTurn 与本行对排（只记主链桶；侧查询桶无响应行，记了也无用）
+                st.lastTurn = turn;
+            }
+            HeadProbeFingerprint fp = fingerprintHead(systemPrompt, outbound, sentCount, tools, strictModelGate);
+            log.info("[前缀缓存探针] 出站 sessionId={} turn={} chain={} thread={} sys[{}] tools[{}] "
+                    + "msg0[{}] msg1[{}] msg2[{}] msgCount={}",
+                sessionId, turn, streamingMainChain ? "stream" : "side",
+                java.lang.Thread.currentThread().getName(),
+                fp.system(), fp.tools(), fp.msg0(), fp.msg1(), fp.msg2(), fp.sentCount());
+        } catch (Exception e) {
+            log.warn("[前缀缓存探针] 出站指纹计算失败: {}", e.toString());
+        }
+    }
+
+    /**
+     * [前缀缓存头部探针 · 响应] cacheRead 掉幅 + cacheBreak 同判据标记（供与 {@code [usage-push]} 对排）。
+     *
+     * <p><b>掉幅口径</b>（派单书原话「cacheRead 相对上一条请求 input 的掉幅」）：
+     * {@code 掉幅 = 上一条请求 input - 本次 cacheRead}（首条 / 上一条缺失 → {@code -1}）。
+     * 另附「cacheRead 相对上一条 cacheRead 的跌幅」，并用 {@link PromptCacheBreakDetection} 的
+     * {@link PromptCacheBreakDetection#CACHE_READ_HIT_RATIO} 与
+     * {@link PromptCacheBreakDetection#MIN_CACHE_MISS_TOKENS} 按
+     * {@code checkResponseForCacheBreak} <b>同一判据</b>标记是否构成 cache break
+     * （真源 CC promptCacheBreakDetection.ts:487-488，⛔ 不另造阈值）。
+     *
+     * <p>只有本类流式主链（{@code doStream}）接此线：非流式 chatWithOptions* 属侧查询，
+     * 无 {@code [usage-push]} 对排需求，且会把同会话的「上一条 input」基线踩脏。
+     *
+     * <p><b>⭐ 判读方式</b>：本行带 {@code turn}，取值 = 该会话<b>主链桶</b>最近一次<b>出站</b>的 turn
+     * （{@link HeadProbeState#lastTurn}）⇒ 「主链出站行 ↔ 响应行」按 {@code sessionId + turn}
+     * <b>逐条 1:1 对排</b>。本方法读写的是<b>主链桶</b>（{@code streamingMainChain=true}）——
+     * 侧查询走 {@code #side} 独立桶（{@link #HEAD_PROBE_SIDE_SUFFIX}），既不会顶掉主链 turn，
+     * 也不会踩脏本行的「上一条 input / 上一条 cacheRead」基线。
+     *
+     * @param sessionId     会话 id（可 null → "<no-session>" 桶）
+     * @param inputTokens   本次请求 input tokens（{@code usage.prompt_tokens}）
+     * @param cacheRead     本次 cacheRead tokens（{@code prompt_cache_hit_tokens} / cached_tokens）
+     * @param cacheCreation 本次 cacheCreation tokens（{@code prompt_cache_miss_tokens}；OpenAI 无等价 → 0）
+     */
+    static void logHeadProbeResponse(String sessionId, long inputTokens,
+                                     long cacheRead, long cacheCreation) {
+        if (!log.isInfoEnabled()) {
+            return;
+        }
+        try {
+            long prevInput;
+            long prevRead;
+            long turn;
+            synchronized (HEAD_PROBE_STATE) {
+                // 恒主链桶：本方法只在 doStream（流式主链）被调，其出站行也记在主链桶
+                HeadProbeState st = headProbeStateLocked(sessionId, true);
+                prevInput = st.lastInputTokens;
+                prevRead = st.lastCacheReadTokens;
+                turn = st.lastTurn;
+                st.lastInputTokens = inputTokens;
+                st.lastCacheReadTokens = cacheRead;
+            }
+            long dropVsPrevInput = prevInput < 0L ? -1L : prevInput - cacheRead;
+            long dropVsPrevRead = prevRead < 0L ? -1L : prevRead - cacheRead;
+            boolean cacheBreakLike = prevRead > 0L
+                && cacheRead < prevRead * PromptCacheBreakDetection.CACHE_READ_HIT_RATIO
+                && (prevRead - cacheRead) >= PromptCacheBreakDetection.MIN_CACHE_MISS_TOKENS;
+            String hitRate = inputTokens > 0L
+                ? String.format(Locale.ROOT, "%.1f%%", cacheRead * 100.0 / inputTokens)
+                : "-";
+            log.info("[前缀缓存探针] 响应 sessionId={} turn={} input={} cacheRead={} cacheCreate={} 命中率={} "
+                    + "上一条input={} 掉幅(上一条input-本次cacheRead)={} 上一条cacheRead={} "
+                    + "cacheRead跌幅={} cacheBreak判定={}",
+                sessionId, turn, inputTokens, cacheRead, cacheCreation, hitRate,
+                prevInput, dropVsPrevInput, prevRead, dropVsPrevRead, cacheBreakLike);
+        } catch (Exception e) {
+            log.warn("[前缀缓存探针] 响应掉幅计算失败: {}", e.toString());
         }
     }
 

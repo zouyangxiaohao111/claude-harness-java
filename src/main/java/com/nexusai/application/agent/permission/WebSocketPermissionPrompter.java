@@ -690,8 +690,21 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         //    [G21] 携带 warning（权限弹窗渲染文本）· sed 编辑 / 破坏性命令警告随 STOMP 推送（非 API）
         try {
             // [session-id-short] ctx.sessionId() 已 short，恒等直传（不再 originalKey 反解）
-            String topic = topicFor(ctx.sessionId());
-            String eventSessionId = ctx.sessionId();
+            // [team-hang] 投递会话 = {@link #owningSessionId}（teammate 的请求必须送到**有 UI 的
+            //   Leader 会话**，对齐 CC inProcessRunner.ts:117-135 createInProcessCanUseTool —— CC 把
+            //   teammate 的 'ask' 决策推给 leader 的 ToolUseConfirm 弹窗）。⛔ 原实现直接用
+            //   ctx.sessionId()：teammate 的 TUC sessionId 是「确无会话」哨兵 no-session（见
+            //   createSubagentContext standalone 分支）⇒ 推到 /topic/sessions/no-session/… =
+            //   **无人订阅的 topic** ⇒ future 永不完成 ⇒ 工具线程永久阻塞（实测 worker-d /
+            //   probe-bash 挂 10+ 分钟，jstack 证 tool-exec 线程停在 prompt:752 future.get()）。
+            String deliverySessionId = owningSessionId(ctx);
+            String topic = topicFor(deliverySessionId);
+            String eventSessionId = deliverySessionId;
+            if (!java.util.Objects.equals(deliverySessionId, ctx.sessionId())) {
+                log.info("PERMISSION 投递会话改写: ctx.sessionId={} → 投递会话={}（teammate 归因到 "
+                        + "Leader 会话，对齐 CC leader ToolUseConfirm 弹窗）requestId={} tool={}",
+                    ctx.sessionId(), deliverySessionId, requestId, tool.name());
+            }
             String description = details != null && details.description() != null
                 ? details.description()
                 : describeFallback(tool, input);
@@ -2098,5 +2111,48 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         }
         // [session-id-short] sessionId 已 short 恒等直拼（originalKey 反解已删，前端订阅 short 命中）
         return "/topic/sessions/" + sessionId + "/permission-requests";
+    }
+
+    /**
+     * [team-hang] 交互式权限提示的**投递会话（owning session）** · 对齐 CC
+     * {@code utils/swarm/inProcessRunner.ts:117-135 createInProcessCanUseTool}。
+     *
+     * <p><b>CC 真源行为</b>：in-process teammate 的 'ask' 决策**不走 teammate 自己的会话**——
+     * CC 把它 push 到 leader 的 {@code setToolUseConfirmQueue}（leader 的
+     * ToolUseConfirm 弹窗 + worker badge，inProcessRunner.ts:196-240），bridge 不可用时回落到
+     * 「发到 leader 的 inbox」。两者都以 <b>Leader 会话</b>为落点。
+     *
+     * <p><b>WHY 必须有这一步（实测根因）</b>：teammate 的 ToolUseContext.sessionId 是
+     * 「确无会话」哨兵 {@code no-session}（{@code createSubagentContext} standalone 分支——
+     * teammate 走的是无父上下文路径）。若按 teammate 自己的 sessionId 拼 topic，就推到
+     * {@code /topic/sessions/no-session/permission-requests}——**前端只订阅当前活跃会话的
+     * topic**（front/src/hooks/useChatSocket.ts subscribePermTopics）⇒ 无人订阅 ⇒
+     * {@link #prompt} 末尾 {@code future.get()} 永不返回 ⇒ 工具线程永久阻塞。
+     * 实测证据（2026-09-20 e2e）：worker-d / probe-bash / worker-b 三个 teammate 的 Bash 全部
+     * 停在 {@code PERMISSION STOMP → topic=/topic/sessions/no-session/permission-requests}，
+     * jstack 显示 tool-exec 线程 park 在 prompt 的 future.get()，10+ 分钟不恢复、不超时、不报错。
+     *
+     * <p><b>取值规则</b>：teammate 身份（{@link ToolUseContext#teammateIdentity()}）携带
+     * {@code parentSessionId}（= Leader 的 session，CC types.ts:19）且非空 → 用它；否则原样用
+     * {@code ctx.sessionId()}（主会话 / 普通子代理行为**零变化**）。
+     *
+     * <p>⛔ 不引入任何超时：CC 的权限请求本身无超时（用户离开多久都保持弹窗等待），逃逸通道是
+     * 用户作答 / abort（{@code ctx.abortController().onCancel}）/ kill。本方法只修「请求根本没送到
+     * 有 UI 的会话」这一投递断头，不改变等待语义。
+     *
+     * @param ctx 工具上下文（可 null → 返回 null，调用方 topicFor 会 fail-loud）
+     * @return 实际投递的 sessionId（teammate → Leader 会话；其余 → ctx.sessionId()）
+     */
+    static String owningSessionId(ToolUseContext ctx) {
+        if (ctx == null) {
+            return null;
+        }
+        com.nexusai.application.agent.team.TeammateIdentity identity = ctx.teammateIdentity();
+        if (identity != null
+                && identity.parentSessionId() != null
+                && !identity.parentSessionId().isBlank()) {
+            return identity.parentSessionId();
+        }
+        return ctx.sessionId();
     }
 }

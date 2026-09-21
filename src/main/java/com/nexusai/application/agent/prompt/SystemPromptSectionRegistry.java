@@ -28,6 +28,12 @@ import java.util.concurrent.CompletableFuture;
  *       {@link CompletableFuture}[] + {@link CompletableFuture#allOf(CompletableFuture...)}
  *       按索引收集等价）。</li>
  * </ol>
+ *
+ * <p><b>谁可以 cacheBreak=true</b>：段名必须在 {@link SystemPromptCacheBreakWhitelist} 登记
+ * （构造期 fail loud，见 {@link SystemPromptSection} 紧凑构造器）—— 对齐目标 CC <b>2.1.278</b>
+ * 实测 {@code cacheBreak:true} <b>0 处</b>，故本仓白名单<b>当前为空表</b> ⇒
+ * 上面第 1 条里的 {@code cacheBreak=true} 分支（I-2「恒重算」）在本仓<b>结构化不可达</b>
+ * （没有任何段能构造出 {@code cacheBreak=true}）；该分支代码保留为机制，⛔ 不是遗漏。
  */
 public class SystemPromptSectionRegistry {
 
@@ -69,7 +75,8 @@ public class SystemPromptSectionRegistry {
      * <p>并发：compute 并行执行，写回 synchronizedMap（{@link SystemPromptSectionCache}）
      * 线程安全；结果数组按注册序收集，与输入序一致。
      *
-     * @param cache 会话级缓存（挂 AgentState，参数注入以测试跨会话隔离）
+     * @param cache 会话级缓存（由 {@code SessionPromptCacheStore#sectionCache()} 提供，
+     *              跨 run 复用；参数注入同时使跨会话隔离可测）
      * @return 与注册序一致的解析结果数组（null 段也入列）
      */
     public List<String> resolveAll(SystemPromptSectionCache cache) {
@@ -84,15 +91,27 @@ public class SystemPromptSectionRegistry {
             futures[i] = CompletableFuture.supplyAsync(() -> {
                 if (!s.cacheBreak() && cache.has(s.name())) {
                     if (log.isDebugEnabled()) {
-                        log.debug("[SystemPromptSectionRegistry] 缓存命中，跳过 compute: name={}, cacheBreak={}", s.name(), s.cacheBreak());
+                        // 数据流日志（命中分支）：段名 + 命中值长度，证明「同一会话第二次 run 起走缓存」
+                        String hit = cache.get(s.name());
+                        log.debug("[SystemPromptSectionRegistry] 会话级缓存命中，跳过 compute: name={}, cacheBreak={}, 命中值长度={}",
+                            s.name(), s.cacheBreak(), hit == null ? 0 : hit.length());
                     }
                     return cache.get(s.name());
                 }
                 if (log.isDebugEnabled()) {
-                    log.debug("[SystemPromptSectionRegistry] 缓存未命中，开始 compute: name={}, cacheBreak={}", s.name(), s.cacheBreak());
+                    // cacheBreak=true 走到这里不是「未命中」而是「每轮强制重算」：只写不读
+                    // （CC systemPromptSections.ts:50-54 跳过 cache 读、仍无条件写回）。
+                    log.debug("[SystemPromptSectionRegistry] {}: name={}, cacheBreak={}（cacheBreak=true ⇒ 每轮重算并覆盖缓存）",
+                        cache.has(s.name()) ? "cacheBreak 重算（已有旧值被覆盖）" : "缓存未命中，开始 compute",
+                        s.name(), s.cacheBreak());
                 }
                 String value = s.compute().compute().join();
                 cache.set(s.name(), value);
+                if (log.isDebugEnabled()) {
+                    // 数据流日志（首次计算分支）：段名 + 计算值长度（null 记 0）
+                    log.debug("[SystemPromptSectionRegistry] 首次计算完成并写回缓存: name={}, 计算值长度={}",
+                        s.name(), value == null ? 0 : value.length());
+                }
                 return value;
             });
         }
@@ -102,7 +121,8 @@ public class SystemPromptSectionRegistry {
             results.add(f.join());
         }
         if (log.isDebugEnabled()) {
-            log.debug("[SystemPromptSectionRegistry] resolve 完成: {} 条，结果按注册序返回", results.size());
+            log.debug("[SystemPromptSectionRegistry] resolve 完成: {} 条，结果按注册序返回；缓存现有 {} 条",
+                results.size(), cache.size());
         }
         return results;
     }

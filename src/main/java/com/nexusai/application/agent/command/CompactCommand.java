@@ -122,9 +122,10 @@ public final class CompactCommand {
      * @param reactiveCompactor               reactive-only 参考实现（null = 不路由 reactive）
      * @param compactConversationContextSupplier compactConversation 上下文工厂
      * @param notifyCompaction                CC notifyCompaction（feature 门控由调用方接线）
-     * @param clearUserContextCache           getUserContext.cache.clear（Java 等价：
-     *                                        SystemPromptInjection.clearAllProviderCaches；
-     *                                        IMP2-02 起由 ToolRegistrationConfig 注入真实实现）
+     * @param clearUserContextCache           getUserContext.cache.clear（集合B only，CC
+     *                                        compact.ts:63/117/203；IMP2-02 起由 ToolRegistrationConfig
+     *                                        注入真实实现；[步骤 4] 起为<b>按本会话精确清</b>
+     *                                        —— 见 {@code PromptCacheGroup.COMPACT_COMMAND_USER_CONTEXT}）
      * @param toolUseContext                  会话工具使用上下文（fork 缓存共享 · CC original:
      *                                        {@code context}（compact.ts:285）——manual 路径复用
      *                                        主线程一致的 TUC（AgentState.currentToolUseContext），

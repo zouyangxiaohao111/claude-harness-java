@@ -726,7 +726,9 @@ public class SkillChangeDetector implements ApplicationRunner {
 
     /**
      * 注销 sentSkillNames 引用（会话结束移除，防泄漏）· 由 {@code LlmAgentLoop.loop()} finally
-     * 成对调用（与 {@code sysPromptCtxProvider.close()} 同处）。主循环 forSession / subagent·hook
+     * 成对调用（⛔ <b>不是</b>{@code SystemPromptContextProvider.close()} 的同处调用点 ——
+     * 后者属<b>会话级</b> store 的生命周期，由 {@code SessionPromptCacheRegistry.evict} 承担，
+     * 且 {@code loop()} 内根本没有 provider 变量）。主循环 forSession / subagent·hook
      * shared() 三条路径统一经 queryLoop → loop 终结，按同一 LoopSessionState 实例身份注销。
      *
      * @param sentSkillNames per-run sentSkillNames Map（null 忽略）
@@ -751,7 +753,8 @@ public class SkillChangeDetector implements ApplicationRunner {
 
     /**
      * 注销 suppressNextSkillListing 引用（会话结束移除，防泄漏）· 由 {@code LlmAgentLoop.loop()}
-     * finally 成对调用（与 {@code sysPromptCtxProvider.close()} 同处）。主循环 forSession /
+     * finally 成对调用（⛔ <b>不是</b>{@code SystemPromptContextProvider.close()} 的同处调用点，
+     * 理由同上）。主循环 forSession /
      * subagent·hook shared() 三条路径统一经 queryLoop → loop 终结，按同一 LoopSessionState
      * 实例身份注销。
      *

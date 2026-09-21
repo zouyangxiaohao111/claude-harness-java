@@ -71,7 +71,7 @@ class AutoCompactorDefaultCleanupSessionTest {
     @AfterEach
     void tearDown() {
         // 复位静态宿主（PostCompactCleanup 的协作器是 static volatile ⇒ 跨用例会污染）
-        new PostCompactCleanup(null, null, null);
+        new PostCompactCleanup(null, null);
         MicroCompactor.removeSessionState(SESS_A);
         MicroCompactor.removeSessionState(SESS_B);
         SessionMemoryService.setLastSummarizedMessageId(SESS_A, null);
@@ -87,7 +87,7 @@ class AutoCompactorDefaultCleanupSessionTest {
     void smChain_defaultCleanup_clearsContextSession(@TempDir Path baseDir) throws Exception {
         // 组装：SESSION registry 走**默认** PostCompactCleanup 静态宿主（不注入任何 cleanup seam）
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        new PostCompactCleanup(null, registry, null);
+        new PostCompactCleanup(null, null);
         AgentState stateA = registerWithProbe(registry, SESS_A);
         AgentState stateB = registerWithProbe(registry, SESS_B);
         MicroCompactor.setPendingCacheEditsForTest(
@@ -131,7 +131,7 @@ class AutoCompactorDefaultCleanupSessionTest {
     @DisplayName("默认清理实现 · L4 legacy 链：ctx 会话的 section 缓存被清 + 该会话桶复位（第二个调用点）")
     void legacyChain_defaultCleanup_clearsContextSession() {
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        new PostCompactCleanup(null, registry, null);
+        new PostCompactCleanup(null, null);
         AgentState stateA = registerWithProbe(registry, SESS_A);
         MicroCompactor.setPendingCacheEditsForTest(
             new MicroCompactResult.PendingCacheEdits("auto", List.of("t1"), 0), SESS_A);
@@ -166,7 +166,7 @@ class AutoCompactorDefaultCleanupSessionTest {
         //   若会话标识改回环境态读取，新线程上必然取不到 ⇒ section 缓存不被清 ⇒ 本用例变红。
         //   正向对照 = 同装置在测试主线程上已由 legacyChain_defaultCleanup_clearsContextSession 证明为绿。
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        new PostCompactCleanup(null, registry, null);
+        new PostCompactCleanup(null, null);
         AgentState stateA = registerWithProbe(registry, SESS_A);
 
         AutoCompactor auto = new AutoCompactor(msgs -> 200_000,

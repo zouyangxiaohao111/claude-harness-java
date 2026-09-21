@@ -304,6 +304,23 @@ public class ReadFileTool implements Tool {
     private boolean compactLinePrefixEnabled = true;
 
     /**
+     * [步骤 7 · 投递层] 把行号前缀开关镜像给变更文件检测器（{@code ChangedFilesDetector}）。
+     *
+     * <p><b>WHY</b>：CC 的 {@code addLineNumbers}（utils/file.ts:290-319）是<b>一条</b>进程级函数，
+     * Read 输出与 {@code edited_text_file} 变更片段都调它 ⇒ 格式恒一致。本仓两处渲染分别落在
+     * 本类与检测器里，若各读各的开关就会在 killswitch 打开时出现两种行号格式（模型对行号时平添噪声）。
+     * 故本属性只有<b>一个</b> Spring 读取点（本字段），装配后推给检测器。
+     */
+    @jakarta.annotation.PostConstruct
+    void mirrorCompactLinePrefixToChangedFilesDetector() {
+        com.nexusai.application.agent.attachment.ChangedFilesDetector
+            .setCompactLinePrefixEnabled(compactLinePrefixEnabled);
+        if (log.isDebugEnabled()) {
+            log.debug("[ReadFileTool] 行号前缀开关已镜像到 ChangedFilesDetector: compact={}", compactLinePrefixEnabled);
+        }
+    }
+
+    /**
      * [OPD-D1-01] 遥测通道 · 对齐 CC logEvent('tengu_file_read_limits_override', ...)
      * （FileReadTool.ts:511-516）。@Autowired(required=false)：无 bean 时跳过（POJO 测试不破，
      * 同 BashTool.analyticsTracker 短路语义）。

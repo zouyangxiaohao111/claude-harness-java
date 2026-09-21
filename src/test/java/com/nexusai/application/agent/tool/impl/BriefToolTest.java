@@ -205,6 +205,67 @@ class BriefToolTest {
     }
 
     @Test
+    @DisplayName("[F2] 附件 TOCTOU 失败必须被识别为错误：模型面/前端都不得静默成功")
+    void attachmentFailureIsRecognizedAsErrorNotSilentSuccess(@TempDir Path tempDir) {
+        // WHY（两条独立受害面）：失败若不进 is_error 判定，则 ①**模型面**收到
+        //   「Message delivered to user.」——模型以为附件已送达，继续基于不存在的附件作答；
+        //   ②前端 tool_calls.is_error=false → 失败被渲染成投递成功（正文照出、附件退化成 [file] 路径）。
+        //   CC 对应形态（错误必须显式失败）：toolExecution.ts:1722 is_error:true + :1726
+        //   toolUseResult 加 "Error: " 前缀；Java 侧「正常返回 ToolResult.error」的唯一 isError 推导
+        //   入口是 LlmAgentLoop.isToolErrorData（前缀白名单）⇒ 错误串必须带 "Error: " 前缀。
+        String missing = tempDir.resolve("gone.png").toString();
+        AgentToolResult<?> r = tool.execute(call(input("hi", List.of(missing), null)), ctx());
+        Object data = ((ToolResult<?>) r).data();
+
+        // 判据 1：失败 data 命中 isToolErrorData（未命中 ⇒ 执行器 t.isError=false ⇒ 双 silent success）
+        assertThat(LlmAgentLoop.isToolErrorData(data))
+            .as("失败 data 必须被 isToolErrorData 识别为错误（否则落回成功分支）")
+            .isTrue();
+
+        // 判据 2：isError=true 时 mapper 透传错误消息，绝不回投递成功文案
+        ToolResultBlockParam errBlock = tool.mapToToolResultBlockParam(r, "brief-1", true);
+        assertThat(errBlock.isError()).isTrue();
+        assertThat((String) errBlock.content())
+            .as("模型面必须是错误消息，不得是投递成功文案")
+            .contains("Attachment resolution failed")
+            .doesNotContain("Message delivered to user.");
+    }
+
+    @Test
+    @DisplayName("模型面 tool_result 文本恒为人类文案、不含结构化 JSON（数据/文本分离防线）")
+    void modelFacingTextNeverLeaksStructuredPayload(@TempDir Path tempDir) throws Exception {
+        // WHY: CC 把「数据」(output {message,attachments,sentAt}) 与「给模型看的文本」
+        // (mapToolResultToToolResultBlockParam → 'Message delivered to user.') 分开
+        // (BriefTool.ts:42-63 vs :175-183)。本仓 UI 面载荷改走 tool_calls.result（结构化 JSON）后，
+        // 这条断言守住「模型面不许看到 JSON」——否则答案会被塞进 tool_result 里污染/膨胀模型上下文。
+        Path p = tempDir.resolve("a.png");
+        Files.write(p, new byte[] {1, 2, 3, 4});
+        AgentToolResult<?> r = tool.execute(
+            call(input("## 验收结果\n全部通过", List.of(p.toString()), "normal")), ctx());
+
+        // 数据侧确实带着答案（对照：不是「两边都没有」的假绿）
+        @SuppressWarnings("unchecked")
+        Map<String, Object> data = (Map<String, Object>) ((ToolResult<?>) r).data();
+        assertThat(data.get("message")).isEqualTo("## 验收结果\n全部通过");
+
+        // 模型侧：逐字人类文案，且不含任何结构化 JSON 痕迹
+        ToolResultBlockParam block = tool.mapToToolResultBlockParam(r, "brief-1", false);
+        assertThat((String) block.content()).isEqualTo("Message delivered to user. (1 attachment included)");
+        assertThat((String) block.content())
+            .doesNotContain("{").doesNotContain("\"message\"").doesNotContain("sentAt");
+    }
+
+    @Test
+    @DisplayName("isEnabled 保险开关：默认 true（nexusai.brief.enabled 默认开），置 false 即关闭")
+    void isEnabledDefaultsTrueAndIsConfigurable() {
+        // WHY: 用户拍板「保险开关默认必须是 true（默认开、可按需关）」；且未走 Spring 注入
+        // （测试/直接构造）时也必须为 true —— 否则工具在生产外路径静默消失。
+        assertThat(tool.isEnabled()).as("默认开（@Value :true + 字段初值 true）").isTrue();
+        tool.briefEnabled = false;
+        assertThat(tool.isEnabled()).as("置 false → ToolRegistry isEnabled 过滤 → 工具不暴露").isFalse();
+    }
+
+    @Test
     @DisplayName("只读/并发/分类/UI 契约（CC isConcurrencySafe/isReadOnly=true, userFacingName='', toAutoClassifierInput=message）")
     void readOnlyConcurrencyAndClassifierContracts() {
         JsonNode input = input("归类我", null, null);

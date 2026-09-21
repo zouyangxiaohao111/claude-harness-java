@@ -987,6 +987,48 @@ public class AutonomousAgentLoop {
         // 启动即认领任务（CC :1019, UI 立显活动）——返回值丢弃, 后续任务由 idle 循环认领（:853-861）
         tryAutoClaimAndExecute();
 
+        // [team-hang P-a] 生命周期 abort（kill / 会话清理）→ **级联中止本轮 work 控制器**。
+        //
+        // <p>WHY（实测缺口）：本轮工具执行时，TUC 的 abortController = 本轮 work 桥
+        //   （{@link #bridgeWorkAbortController}，经 SubagentExecutor.executeStreaming 的
+        //   abortControllerOverride 盖章，SubagentExecutor:1862-1881），而权限提示的逃逸通道
+        //   （{@code ctx.abortController().onCancel}，WebSocketPermissionPrompter:673-686）只监听
+        //   这一个对象。kill / 会话清理只 abort **生命周期** ref（{@link #kill} :773-775 +
+        //   SpawnInProcess unregisterCleanup），生命周期 ref 与 work ref 之间此前**没有任何边**
+        //   ⇒ 工具线程永远 park 在 {@code future.get()}（WebSocketPermissionPrompter:765，无超时是
+        //   有意对齐 CC）⇒ 用户「手动 kill 也杀不死」。
+        //
+        // <p><b>CC 对照</b>：CC {@code utils/abortController.ts:68-95 createChildAbortController}
+        //   正是这个语义 —— parent abort ⇒ child abort（reason 透传），而 <b>child abort 不回头影响
+        //   parent</b>；{@code StreamingToolExecutor.ts:44-47/:294-303} 就用它把「工具级 → 兄弟级 →
+        //   TUC 级」单向挂成树。CC 的 in-process runner 之所以没把 work 控制器挂到生命周期控制器上
+        //   （inProcessRunner.ts:1056 用裸 {@code createAbortController()}），是因为 CC 是单线程异步
+        //   模型：kill 后 runner 的 for-await 在下一条消息边界就 break 了，被遗弃的 promise 不占线程。
+        //   Java 是**阻塞线程**模型 —— 不挂这条边，kill 后那个线程永远醒不过来（本仓实测 jstack
+        //   tool-exec-* park 10+ 分钟）。故此处按 CC 的 createChildAbortController 语义补上这条边。
+        //
+        // <p>单向性保证「Escape 只停本轮不杀队友」不变：中止 work ref **不会** abort 生命周期 ref
+        //   （{@link #isAborted()} 仍 false ⇒ 队友存活进 idle，对齐 CC :1204-1219）。
+        //
+        // <p>只注册**一条**监听（每 teammate 一次，不在每轮重复注册）：teammate 可跑上千轮，
+        //   per-turn 注册会在生命周期 ref 的 listener 列表里累积上千个死 Runnable（CC 用 WeakRef
+        //   规避，Java 无对应能力）。监听体读 volatile 字段 {@link #currentWorkAbortController}，
+        //   故「注册一次」与「每轮一个 child」观测等价。
+        AbortControllerFactory.AbortControllerRef lifecycleAbort = abortController;
+        if (lifecycleAbort != null) {
+            lifecycleAbort.addListener(() -> {
+                AbortControllerFactory.AbortControllerRef work = currentWorkAbortController;
+                if (work != null && !work.aborted().get()) {
+                    log.warn("[AutonomousAgentLoop] 生命周期 abort（kill/会话清理）→ 级联中止本轮 work "
+                        + "控制器 agent={} reason={}（否则本轮工具若停在权限等待会永久 park，"
+                        + "对齐 CC createChildAbortController 单向级联）",
+                        agentId, lifecycleAbort.reason());
+                    work.abort(lifecycleAbort.reason() != null
+                        ? lifecycleAbort.reason() : "lifecycle_abort");
+                }
+            });
+        }
+
         try {
             while (!isAborted() && !shouldExit) {
                 log.debug("[AutonomousAgentLoop] teammate 处理 prompt: {} (agent={})",
@@ -994,6 +1036,16 @@ public class AutonomousAgentLoop {
 
                 // 本轮 work abortController（CC :1056, Escape 只停本轮不杀队友）
                 currentWorkAbortController = AbortControllerFactory.create();
+                // [team-hang P-a] createChild 的 fast path（对齐 CC utils/abortController.ts:75-78
+                //   「parent already aborted ⇒ child.abort(parent.reason)」）：关闭
+                //   「while 条件检查通过 → 生命周期恰好在此刻 abort → work 控制器已创建但没吃到级联」
+                //   的窄竞态窗口（否则该轮工具会重新 park，kill 又杀不死）。
+                if (abortController != null && abortController.aborted().get()) {
+                    currentWorkAbortController.abort(abortController.reason());
+                    log.warn("[AutonomousAgentLoop] 本轮 work 控制器创建时生命周期已 abort → 立即中止 "
+                        + "agent={} reason={}（对齐 CC createChildAbortController 快路径）",
+                        agentId, abortController.reason());
+                }
                 // GAP-6: 存入状态载体供 UI 追踪/中止本轮（CC :1059-1063 currentWorkAbortController）
                 if (taskState != null) {
                     taskState = taskState.withCurrentWorkAbortController(currentWorkAbortController);

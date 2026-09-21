@@ -232,6 +232,17 @@ nexusai:
     explainer:
       enabled: true
 
+  # ---------------------------------------------------------------
+  # [brief-enabled] SendUserMessage (Brief) 工具保险开关 · 对齐 CC isBriefEnabled()
+  # (BriefTool.ts:126-134 —— KAIROS/KAIROS_BRIEF feature + getKairosActive()/getUserMsgOptIn() + GB kill-switch)。
+  # Java Web 后端无 GrowthBook/无 CLI opt-in：单一配置承载 kill-switch 语义（同 nexusai.bridge.enabled 先例）。
+  # 默认 true = 默认开（用户拍板：保险开关默认必须开、可按需关）；false → ToolRegistry isEnabled()
+  # 过滤 → 工具不暴露给模型（LLM 看不到、不能调），既有消息展示不受影响。
+  # 消费点：BriefTool.isEnabled()。
+  # ---------------------------------------------------------------
+  brief:
+    enabled: true
+
   # [R32-b7a-2 Phase 5] 用户类型 · 决定 ConfigTool 等敏感工具是否暴露给 LLM.
   # default = 普通用户 (NexusAI 当前定位); ant = CC internal ant 环境.
   # 对齐 CC env USER_TYPE=ant (config.ts:9).

@@ -1147,8 +1147,19 @@ public class BashTool implements Tool {
             }
 
             // 临时文件承载命令后 pwd 输出（对齐 CC nativeCwdFilePath；避免污染 stdout）。
-            // preventCwdChanges：Java 前台主线程等价 preventCwdChanges=false（对齐 CC isMainThread）；
-            // 子代理（agentId 非 null）CC preventCwdChanges=true → 不追踪 cwd。
+            // [步骤 6 · 门控落在「回读」那一步，⛔ 不是「禁止 cd」] 对齐 CC Shell.ts:209-214
+            //   + bashProvider.ts:184-187：CC 对**所有** shell 调用都**无条件**把
+            //   `pwd -P >| <cwdFilePath>` 追加进命令串（buildExecCommand 不查 preventCwdChanges
+            //   —— 因为所有 shell 都在子进程跑，`cd` 天然只影响该子进程）。真正把 cd 提升为
+            //   会话级动作的**唯一**一步是父进程「回读落盘文件」（Shell.ts:395-414）。
+            //   ⇒ 本条命令包装对子代理**同样**执行（逐字对齐 CC），门控只加在下方的回读处
+            //   （:1442 的 isMainThread && backgroundTaskId == null）。
+            // preventCwdChanges 语义 = !isMainThread（CC BashTool.tsx:642-643
+            //   `isMainThread = !toolUseContext.agentId` → `preventCwdChanges = !isMainThread`）。
+            // ⚠️ [步骤 6 · 改准与代码相反的注释] 本行旧文案写着「子代理（agentId 非 null）CC
+            //   preventCwdChanges=true → 不追踪 cwd」，但当时的代码**无条件**包装 + **无条件**回读
+            //   ⇒ 注释与代码相反（子代理的 cd 实际被写进了父会话的 cwd 槽）。现回读处已按 CC
+            //   真源加 isMainThread 门控，注释与代码一致。
             String wrappedCommand = command;
             try {
                 cwdTrackFile = Files.createTempFile("bash-cwd-", ".tmp");
@@ -1434,12 +1445,32 @@ public class BashTool implements Tool {
             }
 
             // ── [WF-2A · CC-CWD-06] 前台命令跑完读回 cwd 更新 SessionCwdHolder ──
-            // 对齐 CC Shell.ts:395-414：仅前台命令（executeBackground 路径不经此）；
-            // readFileSync 读回 newCwd → NFC 比对（newCwd.normalize('NFC') !== cwd）→
-            // 变化时 setCwd（realpath+NFC）。Java 等价：读临时文件 → NFC 比对 sessionCwd
-            // → 变化时 SessionCwdHolder.set（内部 realpath+NFC，对齐 setCwdState）。
+            // [步骤 6 · cwd 语义对齐 CC] 守卫条件逐字对齐 CC Shell.ts:395
+            //   `if (result && !preventCwdChanges && !result.backgroundTaskId)`：
+            // ① `isMainThread` ⇔ `!preventCwdChanges`（CC BashTool.tsx:642-643
+            //    `isMainThread = !toolUseContext.agentId` → `preventCwdChanges = !isMainThread`）。
+            //    ⭐ 这是「子代理的 shell cd 不得写主会话 cwd 槽」的**唯一**门控点：nexusai 的
+            //    子代理 ctx.sessionId() = 父会话 id（createSubagentContext:232-234 父继承）
+            //    ⇒ 无本门控时子代理的 cd 会写进**父会话**的 SessionCwdHolder 槽。
+            //    子代理 cd 语义（以 CC 实际行为为准）：**不跨其自身多次 Bash 调用持久化** ——
+            //    下一条子代理命令的 spawn cwd 仍取 CwdResolution.getCwd(sessionId)（会话槽）。
+            // ② `backgroundTaskId == null` ⇔ `!result.backgroundTaskId`（只搬 isMainThread 会造出
+            //    「后台命令改 cwd」的新 bug）。⚠️ 如实声明守护范围：本文件两条后台化路径
+            //    （:1353 backgroundedFlag 命中 → return / :1385 AWAIT_TIMEOUT 转后台 → return；
+            //     两处分支判定本身在 :1344 `if (backgroundedFlag[0])` / :1372 `else if (await == AWAIT_TIMEOUT)`。
+            //     [行号漂移刷新] 原留痕写 :1333/:1361（旧形态指向分支判定行），已按本次 grep 复验改准）均
+            //    `return buildBackgroundedResult(...)` 早返回 ⇒ 本条件**当前结构上恒真** ——
+            //    它不带新增守护力，价值是逐字保留 CC 的守卫条件（防将来早返回被改动后回归）。
+            // ③ readFileSync 读回 newCwd → NFC 比对（newCwd.normalize('NFC') !== cwd）→
+            //    变化时 setCwd（realpath+NFC）。Java 等价：读临时文件 → NFC 比对 sessionCwd
+            //    → 变化时 SessionCwdHolder.set（内部 realpath+NFC，对齐 setCwdState）。
             // sessionId=null（dispatch 兼容路径）跳过持久化（无会话载体，对齐 CC 无 STATE）。
-            if (cwdTrackFile != null && sessionId != null) {
+            // ⚠️ 已知偏离（见返回 deviations · ⛔ 非本门控引入，是 nexusai 映射层既有偏差）：
+            //    主会话**后台化**（EVD-B / MainSessionBackgroundService）经 RunRequest.agentId 传
+            //    taskId（RunRequest.java:124-128）⇒ ctx.agentId() 非 null ⇒ 本门控视其为子代理，
+            //    其 cd 不落槽；而 CC 的 LocalMainSessionTask.ts:368-375 只包 runWithAgentContext
+            //    而不改 toolUseContext.agentId ⇒ CC 侧 isMainThread 仍 true、cd **会**落槽。
+            if (cwdTrackFile != null && sessionId != null && isMainThread && backgroundTaskId == null) {
                 try {
                     // readCwdTracked 读回 trim + Windows 内做 POSIX→native 转换（Shell.ts:400-402）
                     String newCwd = ShellExecutor.readCwdTracked(cwdTrackFile, IS_WINDOWS);
@@ -1448,8 +1479,13 @@ public class BashTool implements Tool {
                         if (!normalizedNew.equals(sessionCwd)) {
                             SessionCwdHolder.set(sessionId, newCwd);
                             if (log.isDebugEnabled()) {
-                                log.debug("[BashTool] cd 持久化: sessionId {} {} -> {}",
-                                    sessionId, sessionCwd, newCwd);
+                                // [步骤 6 · 数据流日志] 写会话 cwd 槽一行：sessionId / agentKey /
+                                //   旧值 / 新值 / 是否主线程。门控保证此处 isMainThread 恒 true
+                                //   ⇒ agentKey 恒 null，打印出来即为「门控已生效」的自证。
+                                log.debug("[BashTool] cd 持久化写会话 cwd 槽: sessionId={} agentKey={} "
+                                        + "isMainThread={} 旧值={} 新值={}",
+                                    sessionId, ctx != null ? ctx.agentId() : null, isMainThread,
+                                    sessionCwd, newCwd);
                             }
                         }
                     }
@@ -1459,6 +1495,13 @@ public class BashTool implements Tool {
                         log.debug("[BashTool] cd 追踪读回失败（命令可能于 pwd 前失败）: {}", trackEx.toString());
                     }
                 }
+            } else if (cwdTrackFile != null && sessionId != null && log.isDebugEnabled()) {
+                // [步骤 6 · 数据流日志] 门控跳过分支可观测（对齐 CC Shell.ts:395 未进回读分支）：
+                //   子代理（isMainThread=false）或已转后台（backgroundTaskId 非 null）的 shell cd
+                //   **不回读、不写会话 cwd 槽** —— 这正是「子代理 cd 不污染主会话槽」的正面证据。
+                log.debug("[BashTool] cd 回读被门控跳过（不写会话 cwd 槽）: sessionId={} agentKey={} "
+                        + "isMainThread={} backgroundTaskId={}",
+                    sessionId, ctx != null ? ctx.agentId() : null, isMainThread, backgroundTaskId);
             }
 
             // ── G5-6: claude-code-hint 旁路标签剥离 · 对齐 CC BashTool.tsx:774-784 + claudeCodeHints.ts:72-120 ──

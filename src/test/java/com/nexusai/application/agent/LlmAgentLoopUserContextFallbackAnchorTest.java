@@ -7,6 +7,7 @@ import com.nexusai.application.agent.context.MemoryFileInfo;
 import com.nexusai.application.agent.loop.AgentLoopContext;
 import com.nexusai.application.agent.loop.LoopDeps;
 import com.nexusai.application.agent.loop.QueryParams;
+import com.nexusai.application.agent.prompt.SessionPromptCacheRegistry;
 import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.ToolUseContext;
@@ -119,6 +120,15 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
         SessionCwdHolder.setOriginalCwd(SESSION, worktree.toString());
         SessionCwdHolder.set(SESSION, cdDir.toString());
         ENGINE = new CapturingEngine();
+        // [步骤 2] 会话级 prompt 缓存 store 是<b>进程级静态表</b>（键 = sessionId）。本类四个用例
+        //   共用固定 {@link #SESSION}，而每个用例都换一套 @TempDir 夹具并换新 {@link #ENGINE}；
+        //   不归零则第 2 个用例起会复用前一个用例建的会话级 UserContextProvider ⇒
+        //   {@code getMemoryFiles} 不再被调用 ⇒ 捕获为空 ⇒ 假红。
+        //   ⚠️ 这不是「测试特权」：生产同等语义由 CC 决定 —— getUserContext 是进程级 memoize，
+        //   会话中途 {@code EnterWorktreeTool} 重锚**不会**让它失效（见 P23/D3 分析与
+        //   UserContextProvider 的 projectRoot javadoc）⇒ 本锚只在「会话首个 run」消费。
+        //   同 PostCompactCleanup.resetForTest / SkillListingSentRegistry.reset 的既有隔离口径。
+        SessionPromptCacheRegistry.resetForTest();
     }
 
     @AfterEach

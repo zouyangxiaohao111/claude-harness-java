@@ -206,7 +206,24 @@ class BashToolTest {
 
     private static ToolUseContext ctxForSession(String sessionId) {
         // 4 参构造器：effectiveCwd=null → 经 WF-1A 走 CwdResolution.getCwd(sessionId) 兜底。
-        return new ToolUseContext(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        // [步骤 6 · cwd 门控] agentId **必须**传 null（= 主线程，对齐 CC 主线程
+        //   `toolUseContext.agentId === undefined`）：旧实现传 UUID.randomUUID() ⇒ ctx.agentId()
+        //   非 null ⇒ BashTool 的 `isMainThread` 判为 false ⇒ cd 回读被门控拦住。本组用例的
+        //   意图（见下方 WHY）是「**主线程**前台 cd 持久化」，故必须 null —— 否则测的是子代理路径。
+        return new ToolUseContext(null, sessionId, PermissionMode.DEFAULT,
+            java.util.Map.of());
+    }
+
+    /**
+     * 子代理 ctx（agentId 非 null，sessionId 仍为**父会话 id**）· 对齐
+     * {@code createSubagentContext:232-234} 的「sessionId 父继承 + agentId 新生成」。
+     *
+     * <p>用于钉住「子代理的 shell cd 不得写主会话 cwd 槽」（CC {@code BashTool.tsx:642-643}
+     * {@code isMainThread = !toolUseContext.agentId} → {@code preventCwdChanges = true}
+     * → {@code Shell.ts:395} 回读被跳过）。
+     */
+    private static ToolUseContext subagentCtx(String parentSessionId) {
+        return new ToolUseContext(UUID.randomUUID(), parentSessionId, PermissionMode.DEFAULT,
             java.util.Map.of());
     }
 
@@ -315,6 +332,63 @@ class BashToolTest {
             // realpath 已解符号链接 + NFC，路径不应含冗余 . 或 ..
             assertThat(persisted).doesNotContain("\\.").doesNotContain("/./");
         } finally {
+            deleteRecursively(sub);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // [步骤 6 · cwd 语义对齐 CC] 子代理的 shell cd 不得写主会话 cwd 槽
+    // WHY（意图验证 · 规则九）：CC 的会话 cwd 是**进程级单 STATE.cwd**，子代理与主线程共用同一
+    //   sessionId（本仓 createSubagentContext:232-234 父继承）⇒ 若回读不按
+    //   `preventCwdChanges = !isMainThread`（BashTool.tsx:642-643 + Shell.ts:395）门控，
+    //   子代理的 `cd` 会写进**父会话**的 cwd 槽，把主会话后续 Bash / 文件工具 / 权限基准
+    //   全挪到子代理的临时目录 —— 即「子代理污染主会话」。
+    //   CC 的保证形态是「门控落在**回读**那一步」（不是禁止 cd）：cd 仍照常在子进程生效、
+    //   命令包装仍无条件注入 `pwd -P`，只是父进程不回读。
+    // ─────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("[步骤6] 子代理 cd 不写主会话 cwd 槽（CC preventCwdChanges=!isMainThread）")
+    void cd_subagent_doesNotWriteSessionCwdSlot() throws Exception {
+        Path sub = Files.createTempDirectory("step6-sub-cd");
+        String parentSessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        try {
+            ToolResult<String> r = bashTool.execute(bashCall("step6-sub-1", cdCommandFor(sub)),
+                subagentCtx(parentSessionId));
+            // 反面对照①：cd 本身必须照常执行成功 —— 证明「门控在回读，不在禁止 cd」
+            assertThat(LlmAgentLoop.isToolErrorData(r.data())).as("子代理 cd 命令本身应成功执行").isFalse();
+            // 关键断言：父会话 cwd 槽必须仍为空
+            assertThat(SessionCwdHolder.get(parentSessionId))
+                .as("子代理 shell cd 不得写主会话（父会话）cwd 槽 —— 对齐 CC Shell.ts:395 !preventCwdChanges")
+                .isNull();
+        } finally {
+            deleteRecursively(sub);
+        }
+    }
+
+    @Test
+    @DisplayName("[步骤6] 主线程 cd 后子代理再 cd ⇒ 槽仍为主线程值（子代理不覆盖）")
+    void cd_subagent_doesNotOverwriteMainThreadSessionCwd() throws Exception {
+        // WHY 必须有这条（反面对照必须走得到被守护路径）：只断言「槽为 null」的用例在
+        //   「cd 根本没跑 / 门控把主线程也一起拦掉 / 读回整块被删」时同样绿 ⇒ 无鉴别力。
+        //   本用例先让主线程（agentId=null）写槽成功（反面对照②：门控不得误伤主线程），
+        //   再让子代理 cd 到另一目录，断言槽**未被覆盖**（= 子代理不污染主会话）。
+        Path main = Files.createTempDirectory("step6-main-cd");
+        Path sub = Files.createTempDirectory("step6-sub-cd2");
+        String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        try {
+            bashTool.execute(bashCall("step6-m-1", cdCommandFor(main)), ctxForSession(sessionId));
+            String afterMain = SessionCwdHolder.get(sessionId);
+            assertThat(afterMain)
+                .as("主线程 cd 必须正常写入槽（反面对照：门控不得把主线程一起拦掉）")
+                .isEqualTo(CwdResolution.normalizeCwd(main.toString()));
+
+            bashTool.execute(bashCall("step6-s-1", cdCommandFor(sub)), subagentCtx(sessionId));
+            assertThat(SessionCwdHolder.get(sessionId))
+                .as("子代理 cd 不得覆盖主会话 cwd 槽（对齐 CC Shell.ts:395 子代理不进回读分支）")
+                .isEqualTo(afterMain);
+        } finally {
+            deleteRecursively(main);
             deleteRecursively(sub);
         }
     }

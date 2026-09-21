@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.17] - 2026-09-21
+
+### 修复
+- 修复会话内每发一条消息前缀缓存命中率掉到 ~20% 的 bug。
+
 ## [0.1.16] - 2026-09-20
 
 ### 修复

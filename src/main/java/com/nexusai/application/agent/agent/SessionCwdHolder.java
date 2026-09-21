@@ -39,6 +39,36 @@ import java.util.concurrent.ConcurrentHashMap;
  * 恢复 pre-worktree（对齐 CC 退出 worktree 后 STATE.cwd 回到 pre-worktree）；resume 不持久化（已知简化，
  * 登记 OD-6）。
  *
+ * <p><b>[步骤 6 · cwd 语义对齐 CC · 读层 / 写入路径全集 / 子代理语义]</b>（全部自验 grep，不信注释）：
+ * <ul>
+ *   <li><b>读层</b>：CC {@code utils/cwd.ts:19-21} {@code pwd() = cwdOverrideStorage.getStore() ?? getCwdState()}
+ *       —— AsyncLocalStorage override <b>只覆盖读、不覆盖写</b>（{@code setCwdState} 永远写<b>进程级</b>
+ *       {@code STATE.cwd}，{@code state.ts:531-533}）。本仓无 AsyncLocalStorage（{@code [S2 F-07]} 已删
+ *       override 通道，理由见 {@link CwdResolution} 类注释）⇒ 本类即「唯一写槽」，按 sessionId 分区
+ *       （CC 一进程 = 一会话；本仓多租户 ⇒ 进程级单例必须降为会话级）。
+ *       ⚠️ 读层的子代理隔离<b>不由本类提供</b>：本仓子代理的「有效 cwd」经
+ *       {@code ToolUseContext.effectiveCwd} <b>值</b>承载（非 ThreadLocal 覆盖）。</li>
+ *   <li><b>写入路径全集</b>（CC 真源穷举 + 本仓 grep 复验）：① shell 回读（<b>主线程门控</b> ——
+ *       CC {@code Shell.ts:395} 的 {@code !preventCwdChanges}，本仓 {@code BashTool}/{@code PowerShellTool}
+ *       回读处同款 isMainThread 门控）；② 越界重置（CC {@code BashTool.tsx:702-707}
+ *       {@code resetCwdIfOutsideProject} → 本仓<b>未接</b>，登记）；③ <b>{@code EnterWorktreeTool} /
+ *       {@code ExitWorktreeTool}</b>（CC {@code :95} / {@code :126} 调 {@code setCwd}）；④
+ *       {@code WorktreeExitDialog} / /clear / setup 启动 / /resume worktree 恢复 / 进程入口；
+ *       ⑤ 本仓 {@code ResumeService}（resume 首 cwd 回填）。</li>
+ *   <li>⭐ <b>③ 这条写入路径是「子代理可达」的，而 CC 与本仓<b>同样放行</b></b>（实测 grep）：
+ *       CC {@code constants/tools.ts:55-71} 把 {@code ENTER/EXIT_WORKTREE_TOOL_NAME} 放进
+ *       {@code ASYNC_AGENT_ALLOWED_TOOLS}，且两工具文件对 {@code agentId}/{@code isMainThread}
+ *       引用数为 <b>0</b>；本仓 {@code AgentToolUtils.ASYNC_AGENT_ALLOWED_TOOLS} 同样含这两项，
+ *       {@code EnterWorktreeTool}/{@code ExitWorktreeTool} 亦<b>无</b> agentId 门控。
+ *       ⇒ 这是<b>有意的行为对齐</b>（子代理可经 worktree 工具改会话 cwd），⛔ <b>不得</b>读成「已隔离」：
+ *       「子代理绝不动会话 cwd」作为<b>整体保证是假的</b>；本仓真正成立的保证只有一句 ——
+ *       <b>子代理的 shell {@code cd} 不写主会话 cwd 槽</b>（由 shell 回读处的主线程门控提供，
+ *       见 {@code BashTool} 回读注释与 {@code BashToolTest} 的断言）。</li>
+ *   <li><b>子代理 shell cd 的语义</b>（以 CC 实际行为为准）：CC 子代理的
+ *       {@code preventCwdChanges = !isMainThread = true}（{@code BashTool.tsx:642-643}）⇒ 回读被跳过
+ *       ⇒ cd <b>不跨其自身多次 Bash 调用持久化</b>（下一条仍以 {@code pwd()} 起）。本仓门控后同义。</li>
+ * </ul>
+ *
  * <p>线程安全：{@link ConcurrentHashMap}，同 JVM 多会话按 sessionId 隔离。
  */
 public final class SessionCwdHolder {

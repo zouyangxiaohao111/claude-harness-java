@@ -43,6 +43,17 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CacheInvalidationTest {
 
     /**
+     * [步骤 4] 逐用例回收<b>会话级 prompt 缓存注册表</b>：本类夹具会经
+     * {@code AgentState.systemPromptSectionCache()}（及 {@code forSession}）在<b>进程级静态表</b>
+     * 里建 store ⇒ 不回收会跨用例/跨测试类累积（evict→close 亦顺手注销 provider 的
+     * SystemPromptInjection 回调，register/unregister 成对）。
+     */
+    @org.junit.jupiter.api.AfterEach
+    void tearDownSessionPromptCacheRegistry() {
+        SessionPromptCacheRegistry.resetForTest();
+    }
+
+    /**
      * 历史 /clear 用例停用说明 · [P0-0 / N1 · 2026-09-11 用户拍板]。
      *
      * <p>WHY：这两个用例断言「executeBuiltin(clear) 清 section 缓存」——停用后该分支已抛
@@ -135,7 +146,7 @@ class CacheInvalidationTest {
 
         // 构造即把 STATIC_SESSION_REGISTRY 覆盖为当前用例 registry（跨用例静态隔离：每用例新建覆盖；
         //   FIX-CL 新增 ClaudemdEngine 位传 null → STATIC_CLAUDE_MD 空 → resetGetMemoryFilesCache 跳过）
-        new PostCompactCleanup(null, fx.registry, null);
+        new PostCompactCleanup(null, null);
         // [批 3c] 会话标识显式传入（原经裸 MDC 会话槽定位会话级 section 缓存，该槽已删）
         PostCompactCleanup.runPostCompactCleanup("compact", fx.sessionId);
         assertThat(fx.resolveAfterClear())
@@ -184,7 +195,7 @@ class CacheInvalidationTest {
             assertThat(userCompute.get()).as("首次 getUserContext 走 compute").isEqualTo(2);
 
             Fixture fx = new Fixture();
-            new PostCompactCleanup(null, fx.registry, null);
+            new PostCompactCleanup(null, null);
             PostCompactCleanup.runPostCompactCleanup("REPL_MAIN_THREAD:test");
 
             assertThat(provider.getSystemContext())
@@ -204,57 +215,130 @@ class CacheInvalidationTest {
         }
     }
 
-    @Test
-    @DisplayName("FIX-CL /compact 触发: main-thread 分支调 SystemPromptInjection.clearUserOnlyProviderCaches → 已注册 user-only 缓存清空回调触发")
-    void compact_clearsProviderCachesViaSystemPromptInjection() {
-        // WHY: FIX-CL 把 CC getUserContext.cache.clear（postCompactCleanup.ts:52）接线为
-        //       SystemPromptInjection.clearUserOnlyProviderCaches()（触发已注册 provider 的 user
-        //       缓存清理；[IMP-SP2-08 SP-07 △-6] 收敛到 user-only 通道 —— CC :51-60 只清
-        //       getUserContext.cache，不清 getSystemContext，旧全清通道为多清偏差）。本用例注册一个
-        //       user-only 缓存清空回调，断言 /compact 后必然触发 —— 防止回退到
-        //       "Java 无 memoized 缓存 → no-op" 假接线。
-        java.util.concurrent.atomic.AtomicInteger hookFired = new java.util.concurrent.atomic.AtomicInteger();
-        SystemPromptInjection.registerUserCacheClearHook(hookFired::incrementAndGet);
+    /**
+     * [步骤 4] 会话级 provider 探针 —— per-session 失效的<b>唯一有效观测面</b>。
+     *
+     * <p>WHY：步骤 4 起集合 B 的失效走 {@code store.clearGroups → provider.clearUserContextCache()}
+     * <b>直清 provider</b>，不再经 {@code SystemPromptInjection} 的全局广播钩子通道
+     * ⇒ 「钩子触发次数」不再是有效观测；有效观测 = <b>同 provider 的 userContext 缓存失效
+     * （下一次 getUserContext 重算）</b>，这也是该失效在真实链路上的目的。
+     *
+     * @param store        目标会话的会话级 store（{@code state.promptCacheStore()} 或注册表取用）
+     * @param userComputes 计数载体（claudeMd + currentDate 各计一次）
+     * @return 接好的会话级 provider（调用方负责 close）
+     */
+    private static SystemPromptContextProvider wireSessionProvider(
+            SessionPromptCacheStore store, java.util.concurrent.atomic.AtomicInteger userComputes) {
+        SystemPromptContextProvider provider = new SystemPromptContextProvider("2026-08-12",
+            new UserContextProvider(java.nio.file.Path.of("")) {
+                @Override
+                public String claudeMd() {
+                    userComputes.incrementAndGet();
+                    return "项目指令";
+                }
 
-        Fixture fx = new Fixture();
-        fx.primeCache();
-        new PostCompactCleanup(null, fx.registry, null);
-        // main-thread querySource（CC isMainThreadCompact: repl_main_thread* 前缀）——只有 main-thread
-        // 压缩才重置模块级状态（postCompactCleanup.ts:36-39），subagent/compact 命令不触达
-        // [批 3c] 会话标识显式传入（原经裸 MDC 会话槽定位会话级 section 缓存，该槽已删）
-        PostCompactCleanup.runPostCompactCleanup("repl_main_thread:test", fx.sessionId);
-        assertThat(hookFired.get())
-            .as("clearUserOnlyProviderCaches 触发注册的 user-only 缓存清空回调（CC getUserContext.cache.clear 等价）")
-            .isGreaterThan(0);
-        assertThat(fx.resolveAfterClear())
-            .as("compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
-            .isEqualTo(2);
+                @Override
+                public String currentDate(String sessionStartDate) {
+                    userComputes.incrementAndGet();
+                    return "Today's date is " + sessionStartDate + ".";
+                }
+            },
+            new GitStatusProvider(java.nio.file.Path.of("")) {
+                @Override
+                public String getGitStatus() {
+                    return "GIT-BLOCK";
+                }
+            },
+            env -> null);
+        store.contextProvider(() -> provider);
+        return provider;
     }
 
     @Test
-    @DisplayName("IMP-SP2-01 生产大写枚举名: runPostCompactCleanup(\"REPL_MAIN_THREAD:…\") 触发 main-thread 清理（REQ-SP-07△21）")
-    void testCompaction_uppercaseEnumName_triggersMainThreadCleanup() {
-        // WHY: 生产传值链 LlmAgentLoop:2878/:2921-2922 传 params.querySource().name()，而
-        //       QuerySource.REPL_MAIN_THREAD.name() = "REPL_MAIN_THREAD"（大写枚举名，QuerySource.java:26）。
-        //       旧 gate 用大小写敏感 startsWith("repl_main_thread") → gate 恒 false → main-thread 清理
-        //       （clearUserOnlyProviderCaches + resetGetMemoryFilesCache('compact')）不执行。本用例用生产
-        //       大写值断言 user-only hook 真实触发（[IMP-SP2-08 SP-07 △-6] main-thread 清理面
-        //       收敛到 user-only 通道 —— 对齐 CC postCompactCleanup.ts:36-39 isMainThreadCompact
-        //       startsWith 前缀匹配，大小写不敏感；CC :51-60 只清 getUserContext.cache）。
-        java.util.concurrent.atomic.AtomicInteger hookFired = new java.util.concurrent.atomic.AtomicInteger();
-        SystemPromptInjection.registerUserCacheClearHook(hookFired::incrementAndGet);
-
+    @DisplayName("[步骤 4] main-thread /compact → 集合B 按**本会话**精确清（provider userContext 重算；⛔ 不牵连别的会话）")
+    void compact_clearsUserContextOfTargetSessionOnly() {
+        // WHY: 集合B（CC postCompactCleanup.ts:59 getUserContext.cache.clear）在 CC 侧是**进程级**
+        //   memoize（一进程一会话）；本仓一 JVM 多会话 ⇒ 必须映射为**按会话清**。本用例同时钉死两件事：
+        //   ① 目标会话必须真被清（防回退到 no-op 假接线）；② 别的会话<b>不得</b>被牵连
+        //   （⛔ 广播清会让「会话 A 压缩」打掉「会话 B 的 claudeMd 头部」= 跨会话串味）。
         Fixture fx = new Fixture();
         fx.primeCache();
-        new PostCompactCleanup(null, fx.registry, null);
-        // [批 3c] 会话标识显式传入（原经裸 MDC 会话槽定位会话级 section 缓存，该槽已删）
-        PostCompactCleanup.runPostCompactCleanup("REPL_MAIN_THREAD:test", fx.sessionId);
-        assertThat(hookFired.get())
-            .as("大写枚举名（生产真实值）必须触发 clearUserOnlyProviderCaches 回调（CC postCompactCleanup.ts:36-39）")
-            .isGreaterThan(0);
+        java.util.concurrent.atomic.AtomicInteger sessionAUsers = new java.util.concurrent.atomic.AtomicInteger();
+        SystemPromptContextProvider providerA = wireSessionProvider(fx.state.promptCacheStore(), sessionAUsers);
+        providerA.getUserContext();
+        int aBefore = sessionAUsers.get();
+
+        // 对照会话 B：同 JVM 的另一个会话（独立 store + 独立 provider）
+        String otherSession = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        java.util.concurrent.atomic.AtomicInteger sessionBUsers = new java.util.concurrent.atomic.AtomicInteger();
+        SystemPromptContextProvider providerB = wireSessionProvider(
+            SessionPromptCacheRegistry.forSession(otherSession, "2026-08-12"), sessionBUsers);
+        providerB.getUserContext();
+        int bBefore = sessionBUsers.get();
+
+        new PostCompactCleanup(null, null);
+        // main-thread querySource（CC isMainThreadCompact: repl_main_thread* 前缀）——只有 main-thread
+        // 压缩才重置模块级状态（postCompactCleanup.ts:36-39），subagent/compact 命令不触达
+        PostCompactCleanup.runPostCompactCleanup("repl_main_thread:test", fx.sessionId);
+
         assertThat(fx.resolveAfterClear())
-            .as("compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
+            .as("集合A: compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
             .isEqualTo(2);
+        providerA.getUserContext();
+        assertThat(sessionAUsers.get())
+            .as("集合B: 本会话 userContext 冻结值必须失效 → 重算（CC getUserContext.cache.clear）")
+            .isGreaterThan(aBefore);
+        providerB.getUserContext();
+        assertThat(sessionBUsers.get())
+            .as("对照：别的会话不得被本会话的压缩牵连（CC 进程级 → 本仓会话级映射，⛔ 不广播）")
+            .isEqualTo(bBefore);
+        providerA.close();
+        providerB.close();
+    }
+
+    @Test
+    @DisplayName("[步骤 4 · IMP-SP2-01] 生产大写枚举名走主线程门（清集合B）；子代理源只清集合A（集合B 刻意不清）")
+    void compaction_uppercaseMainThread_clearsUserContext_subagentDoesNot() {
+        // WHY: 生产传值链 LlmAgentLoop 传 params.querySource().name()，而
+        //       QuerySource.REPL_MAIN_THREAD.name() = "REPL_MAIN_THREAD"（大写枚举名）。
+        //       旧 gate 用大小写敏感 startsWith → gate 恒 false → main-thread 清理不执行。
+        //       [步骤 4] 观测面从「user-only 钩子触发」改为「目标会话 provider 重算」，并补上
+        //       **子代理负向对照**（CC :51-60 的 isMainThreadCompact 守卫要求子代理<u>刻意不清</u>
+        //       主会话 userContext，否则破坏主线程状态）。
+        Fixture mainFx = new Fixture();
+        mainFx.primeCache();
+        java.util.concurrent.atomic.AtomicInteger mainUsers = new java.util.concurrent.atomic.AtomicInteger();
+        SystemPromptContextProvider mainProvider =
+            wireSessionProvider(mainFx.state.promptCacheStore(), mainUsers);
+        mainProvider.getUserContext();
+        int mainBefore = mainUsers.get();
+        PostCompactCleanup.runPostCompactCleanup("REPL_MAIN_THREAD:test", mainFx.sessionId);
+        mainProvider.getUserContext();
+        assertThat(mainUsers.get())
+            .as("大写枚举名（生产真实值）必须命中 main-thread 门 → 集合B 清（CC postCompactCleanup.ts:36-39/:59）")
+            .isGreaterThan(mainBefore);
+        assertThat(mainFx.resolveAfterClear())
+            .as("集合A: compact 后 section 缓存清 → 同 name 重算（postCompactCleanup.ts:62）")
+            .isEqualTo(2);
+
+        // ── 负向对照：子代理源（agent:…）──
+        Fixture subFx = new Fixture();
+        subFx.primeCache();
+        java.util.concurrent.atomic.AtomicInteger subUsers = new java.util.concurrent.atomic.AtomicInteger();
+        SystemPromptContextProvider subProvider =
+            wireSessionProvider(subFx.state.promptCacheStore(), subUsers);
+        subProvider.getUserContext();
+        int subBefore = subUsers.get();
+        PostCompactCleanup.runPostCompactCleanup("agent:sub-1", subFx.sessionId);
+        subProvider.getUserContext();
+        assertThat(subUsers.get())
+            .as("子代理 compact 不得清主会话 userContext（CC :51-60 守卫；否则破坏主线程模块级状态）")
+            .isEqualTo(subBefore);
+        assertThat(subFx.resolveAfterClear())
+            .as("⭐ 但集合A 在守卫之外（无守卫）→ 子代理 compact 也清（CC :62）")
+            .isEqualTo(2);
+        mainProvider.close();
+        subProvider.close();
     }
 
     @Test

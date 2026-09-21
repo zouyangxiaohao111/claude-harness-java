@@ -4443,6 +4443,272 @@ public record AgentLoopContext(
     }
 
     /**
+     * [步骤 5 · 跨午夜] date_change <b>尾部</b>投递 · 对齐 CC {@code getDateChangeAttachments}
+     * （Open-ClaudeCode/src/utils/attachments.ts:1406-1443）及其注册点
+     * {@code maybe('date_change', () => Promise.resolve(getDateChangeAttachments(messages)))}（:830，
+     * 位于 {@code allThreadAttachments} 段 :815-941 —— 即<b>每轮迭代、所有线程</b>都评估）。
+     *
+     * <h2>CC 真源逐行（本方法的判据）</h2>
+     * <pre>
+     * const currentDate = getLocalISODate()                                   // :1419
+     * const lastDate = getLastEmittedDate()                                   // :1420
+     * if (lastDate === null) { setLastEmittedDate(currentDate); return [] }    // :1422-1426 首轮只记录
+     * if (currentDate === lastDate) return []                                 // :1428-1430 同日无动作
+     * setLastEmittedDate(currentDate)                                         // :1432
+     * return [{ type: 'date_change', newDate: currentDate }]                  // :1443
+     * </pre>
+     *
+     * <h2>⛔ 为什么不回写头部（本方法存在的全部理由）</h2>
+     * CC 源码注释（:1403-1418）逐字：date_change 附件<b>追加在会话尾部</b>，模型由此得知新日期，
+     * <b>而不改动被缓存的前缀</b>；{@code messages[0]}（来自
+     * {@code getUserContext → prependUserContext}）<b>故意保留旧日期</b> —— 清那层缓存会重新生成
+     * 前缀，把整条会话在下一轮变成 cache_creation（该注释给出的量级：通宵会话每次跨午夜约
+     * <b>920K 有效 token</b>）。⇒ 本方法<b>只追加尾部真实消息</b>，⛔ 绝不触碰 {@code messages[0]}，
+     * 也⛔ 不调用任何清集合入口（{@code SessionPromptCacheRegistry.clearPromptCaches}）。
+     *
+     * <h2>本仓映射（三处差异，均为显式登记而非静默简化）</h2>
+     * <ol>
+     *   <li><b>状态承载</b>：CC {@code STATE.lastEmittedDate}（bootstrap/state.ts:205/:401，
+     *       读 :1658 写 :1662）是<b>进程级</b>；本仓一 JVM 多会话 ⇒ 按 sessionId 分区承载在
+     *       {@code SessionPromptCacheStore.lastEmittedDate()}（该类「承载物③」，同一映射原则见该类
+     *       javadoc 的语义映射段）。</li>
+     *   <li><b>投递形态</b>：CC 把附件 yield 进消息流（query.ts:1580-1588
+     *       {@code yield attachment; toolResults.push(attachment)}）⇒ 它成为<b>会话里的一条真实消息</b>
+     *       并随转录持久化（下一次请求仍在，位置固定）。本仓同走真实消息通道
+     *       （{@code state.appendMessage}，与 skill_listing 的
+     *       {@code injectSkillListingForRun} 同一先例）—— ⛔ <b>不用</b>「每轮重渲染的瞬时注入」
+     *       （如 {@code maybeInjectHookAttachments} 那种 attachments 队尾重放）：那种形态下该消息在
+     *       请求中的位置会随转录增长而漂移，等于把「尾部追加」做成「尾部改写」，与 CC 的 append-only
+     *       语义相反，也会让本方法每轮重复注入同一提醒。</li>
+     *   <li><b>线程范围</b>：CC 放在 {@code allThreadAttachments} ⇒ <b>子代理也评估</b>
+     *       （不加 {@code isMainThread} 守卫）；本仓同 —— 且因 {@code lastEmittedDate} 按会话分区，
+     *       子代理与主线程<b>共享同一槽位</b>，与 CC 进程级共享一致（一日只播报一次，
+     *       不因进入子代理而重复播报）。</li>
+     * </ol>
+     *
+     * <p><b>无会话标识的守卫</b>：会话标识为空时<b>只记录不追加</b> —— 本仓 meta 消息的落库通道
+     * 需要 sessionId（{@code messages.session_id NOT NULL}），而 CC 侧 simple（{@code --bare}）
+     * 模式同样禁用附件（constants/common.ts:21-23 注释：宁可日期陈旧，也不整会话缓存失效）。
+     * 两者语义等价：无持久化通道时保留陈旧日期。
+     *
+     * @param state AgentState（{@code promptCacheStore()} 提供会话级 lastEmittedDate 槽；
+     *              {@code appendMessage} 提供尾部投递通道）
+     */
+    public static void maybeEmitDateChange(AgentState state) {
+        if (state == null) {
+            return;
+        }
+        com.nexusai.application.agent.prompt.SessionPromptCacheStore store = state.promptCacheStore();
+        String currentDate = com.nexusai.application.agent.prompt.SessionPromptCacheStore.localIsoDate();
+        String lastDate = store.lastEmittedDate();
+        if (lastDate == null) {
+            // CC :1422-1426 —— 本会话首轮：只记录，不播报（否则每个会话开头都会白播一次）
+            store.setLastEmittedDate(currentDate);
+            if (log.isDebugEnabled()) {
+                log.debug("[date_change] 本会话首轮：只记录不播报 currentDate={} sessionId={}"
+                    + " · CC attachments.ts:1422-1426", currentDate, state.sessionId());
+            }
+            return;
+        }
+        if (currentDate.equals(lastDate)) {
+            // CC :1428-1430 —— 同日：无动作（零注入，不影响前缀）
+            return;
+        }
+        // CC :1432 —— 跨午夜：先落状态（防同一 run 内多次迭代重复播报），再投递
+        store.setLastEmittedDate(currentDate);
+
+        String sessionId = state.sessionId();
+        com.nexusai.application.agent.attachment.AttachmentMessageDto att =
+            com.nexusai.application.agent.attachment.AttachmentMessageDto.dateChange(currentDate);
+        String text = renderHookAttachmentForLlm(att);
+        if (text == null) {
+            // 防御：date_change 渲染 case 对新日期非空恒产文本（见该 case）；此处仅守不变量
+            log.warn("[date_change] 渲染为空（不应发生，newDate={}）⇒ 不追加 · CC messages.ts:4163-4167",
+                currentDate);
+            return;
+        }
+        if (sessionId == null || sessionId.isBlank()) {
+            log.info("[date_change] 检测到跨午夜（{} -> {}）但无会话标识 ⇒ 无落库通道，不追加"
+                + "（对齐 CC simple 模式禁用附件）· CC attachments.ts:1419-1443", lastDate, currentDate);
+            return;
+        }
+        state.appendMessage(dateChangeMessage(sessionId, text));
+        log.info("[date_change] 跨午夜 → 尾部追加 date_change 消息（头部旧日期 {} 保持不变，绝不回写 messages[0]）: "
+            + "sessionId={} {} -> {} · CC attachments.ts:1406-1443 + query.ts:1580-1588",
+            lastDate, sessionId, lastDate, currentDate);
+    }
+
+    /**
+     * date_change 尾部消息构造 · 对齐 CC 附件经 {@code createAttachmentMessage}（attachments.ts:3201）
+     * 成为会话消息的形态（{@code isMeta:true} 的 user 消息，渲染文案见
+     * {@link #renderHookAttachmentForLlm} 的 case 'date_change' · CC messages.ts:4163-4167）。
+     *
+     * <p><b>author/subtype 取值理由</b>：与 {@link #skillListingMessage} 同一契约 ——
+     * author={@code "attachment"} 标明它由 attachment 通道产出（转录可识别、前端按 {@code isMeta}
+     * 隐藏），subtype={@code "date_change"} 与 CC {@code attachment.type} 同名。
+     * ⚠ 消费侧按<b>精确子类型</b>匹配（{@code PostCompactAttachmentRestorer} 只认
+     * invoked_skills / plan_mode / skill_listing 等已知值，{@code isToolUseSummaryRow} 只认
+     * tool_use_summary）⇒ 本子类型不会被误当作上述任何一类处理，也不会被 {@code messagesForQuery}
+     * 剔除（它必须真正进模型 —— 这正是投递的目的）。
+     *
+     * @param sessionId    目标会话 id（真实消息落库必需）
+     * @param renderedText 已渲染文案（由 {@link #renderHookAttachmentForLlm} 产出，单一渲染实现）
+     * @return isMeta=true 的 user 消息（author='attachment'，subtype='date_change'）；
+     *         renderedText 空 → null（不投递）
+     */
+    public static ChatMessageDto dateChangeMessage(String sessionId, String renderedText) {
+        if (renderedText == null || renderedText.isBlank()) {
+            return null;
+        }
+        return new ChatMessageDto(
+            UUID.randomUUID().toString(), sessionId, Role.user, "attachment",
+            renderedText, null, java.util.List.of(), null, null, null,
+            "刚刚", java.time.OffsetDateTime.now(), null, null,
+            null, java.util.List.of(), java.util.List.of(), null, true)
+            .withSubtype("date_change");
+    }
+
+    /**
+     * <b>[步骤 7 · 投递层]</b> 变更文件<b>尾部</b>投递 · 对齐 CC
+     * {@code maybe('changed_files', () => getChangedFiles(context))}（utils/attachments.ts:871）及其产物
+     * 的消费链 {@code yield attachment; toolResults.push(attachment)}（query.ts:1580-1588）。
+     *
+     * <h2>为什么需要它（与 date_change 是同一对取舍的另一半）</h2>
+     * 头部冻结（{@code userContext} / {@code systemPromptSectionCache} 跨 run 复用）之后，
+     * 模型看到的 CLAUDE.md / rules 是<b>会话开始那一刻的字节</b>。CC 的做法不是「冻结了事」，而是
+     * 另开一条<b>通用、无 feature 门控、每轮运行</b>的通道：上次读过的文件在磁盘上变了
+     * （判据 {@code mtime > fileState.timestamp}），就在<b>会话尾部</b>告诉模型。
+     * <ul>
+     *   <li>CC 注册点 {@code attachments.ts:871} 位于 {@code allThreadAttachments} 段（:824-941）——
+     *       <b>每轮迭代、所有线程</b>都评估，且<b>不在</b>任何 {@code feature(...)} 分支内
+     *       （对照同段 :864 {@code feature('BUDDY')} 的写法即知）。⇒ 主线程与子代理都走。</li>
+     *   <li>CLAUDE.md / rules 之所以能被这条通道看见，是因为 CC 在<b>会话启动</b>就把它们写进了
+     *       readFileState，且<b>刻意以 {@code offset/limit = undefined}</code> 存入</b>
+     *       （{@code REPL.tsx:3797-3818} + {@code attachments.ts:1737-1741} 注释自述）——
+     *       本仓对应登记见 {@code ClaudemdEngine.registerMemoryFilesBaseline}。</li>
+     * </ul>
+     *
+     * <h2>⛔ 为什么不回写头部（本方法存在的全部理由）</h2>
+     * 检测到变更后<b>只追加尾部真实消息</b>（与 {@link #maybeEmitDateChange} 同一条 append-only 通道，
+     * {@code state.appendMessage}），⛔ <b>绝不触碰 {@code messages[0]}</b>、⛔ 不调用任何清集合入口
+     * （{@code SessionPromptCacheRegistry.clearPromptCaches}）。回写头部 = 重新生成整段前缀 ⇒
+     * 缓存修复被这一下抹平（CC 在 date_change 处自述的量级：约 920K 有效 token 变 cache_creation）。
+     *
+     * <h2>本仓映射（差异显式登记，非静默简化）</h2>
+     * <ol>
+     *   <li><b>投递形态</b>：与 date_change 同选择 —— 真实消息（{@code state.appendMessage}，落库、
+     *       位置固定、随转录重放还原），⛔ 不用「每轮重渲染的瞬时注入」
+     *       （{@code maybeInjectHookAttachments} 那种队尾重放会让位置随转录增长漂移 = 把追加做成改写，
+     *       且每轮重复注入同一提醒）。</li>
+     *   <li><b>线程范围</b>：CC 放 {@code allThreadAttachments} ⇒ 子代理也评估。本仓由
+     *       {@code queryLoop} 统一调用（主循环与子代理共用该函数），且子代理的 readFileState 是
+     *       父缓存的 clone（{@code createSubagentContext}）⇒ 语义等价。</li>
+     *   <li><b>无会话标识的守卫</b>：会话标识为空时<b>只检测不投递</b>（meta 消息落库需 sessionId），
+     *       与 date_change 的同名守卫、CC simple（{@code --bare}）模式禁用附件的语义一致。</li>
+     * </ol>
+     *
+     * <p><b>检测副作用</b>：命中 mtime 变更的文件会被写回 readFileState（新内容 + 新 mtime）⇒
+     * 同一变更不会每轮重复投递（对齐 CC 的 {@code FileReadTool.call} 写回，见
+     * {@code ChangedFilesDetector} 的判据链）。<b>[步骤 7 修正]</b> 本仓 readFileState 是 run 级
+     * （每 run 新建）⇒ 上述写回本身活不过本 run，故本方法额外把写回后的状态固化进
+     * <b>会话级基线表</b>（{@code SessionChangedFilesBaselineRegistry.syncFromRunCache}），
+     * 使「同一变更只投一次」跨 run 成立；否则下一 run 的登记点又拿首次基线比对 ⇒ 每 run 重复投递。
+     *
+     * @param state AgentState（{@code sessionId()} 提供落库通道；{@code appendMessage} 提供尾部投递）
+     * @param tuc   当前轮 ToolUseContext（提供 readFileState / permissionContext / effectiveCwd /
+     *              fileReadingLimits —— CC 侧同一函数只收 {@code toolUseContext}）；null → no-op
+     */
+    public static void maybeEmitChangedFiles(AgentState state,
+                                             com.nexusai.application.agent.tool.ToolUseContext tuc) {
+        if (state == null || tuc == null) {
+            return;
+        }
+        com.nexusai.application.agent.tool.FileStateCache readFileState = tuc.readFileState();
+        if (readFileState == null || readFileState.size() == 0) {
+            return;
+        }
+        // CC FileReadTool.ts:502-516 —— maxSizeBytes = fileReadingLimits?.maxSizeBytes ?? defaults.maxSizeBytes
+        long maxFileSizeBytes = (tuc.fileReadingLimits() != null
+                && tuc.fileReadingLimits().maxSizeBytes() != null)
+            ? tuc.fileReadingLimits().maxSizeBytes()
+            : com.nexusai.application.agent.tool.FileReadingLimits.DEFAULT_MAX_SIZE_BYTES;
+        java.util.List<com.nexusai.application.agent.attachment.AttachmentMessageDto> changed =
+            com.nexusai.application.agent.attachment.ChangedFilesDetector.detectChangedFiles(
+                readFileState, tuc.permissionContext(),
+                tuc.effectiveCwd() != null ? tuc.effectiveCwd().toString() : null,
+                maxFileSizeBytes);
+        // ── [步骤 7 修正] 把「投递后的新状态」固化回会话基线 ──
+        //   WHY 必须紧跟检测且**先于**空列表早返回：检测器已把「新内容 + 新 mtime」写回 run 级
+        //   readFileState（CC FileReadTool.ts:1032-1037 同序），而 run 级缓存在本 run 结束即销毁；
+        //   不固化 ⇒ 下一 run 的登记点又拿「首次会话基线」比对 ⇒ 同一变更**每 run 重复投递**。
+        //   固化后判据（mtime > 记录时间戳）对同一变更不再成立 ⇒ 只投一次（CC 靠会话级 readFileState
+        //   天然获得该性质；本仓以会话级基线表等价表达，见 SessionChangedFilesBaselineRegistry）。
+        //   无会话标识 / 无基线（该会话没登记过记忆文件）⇒ no-op。
+        com.nexusai.application.agent.attachment.SessionChangedFilesBaselineRegistry
+            .syncFromRunCache(state.sessionId(), readFileState);
+        if (changed.isEmpty()) {
+            // 绝大多数轮次走这里：零注入、零字节变化（前缀不受任何影响）
+            if (log.isDebugEnabled()) {
+                log.debug("[changed_files] 本轮无变更文件投递（readFileState 共 {} 条）· CC attachments.ts:871",
+                    readFileState.size());
+            }
+            return;
+        }
+        String sessionId = state.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            log.info("[changed_files] 检测到 {} 个文件变更但无会话标识 ⇒ 无落库通道，不追加"
+                + "（对齐 CC simple 模式禁用附件）· CC attachments.ts:871", changed.size());
+            return;
+        }
+        int emitted = 0;
+        for (com.nexusai.application.agent.attachment.AttachmentMessageDto att : changed) {
+            String text = renderHookAttachmentForLlm(att);
+            if (text == null) {
+                // 防御：case 'edited_text_file' 对 filename/snippet 非空恒产文本；此处仅守不变量
+                log.warn("[changed_files] 渲染为空（不应发生）⇒ 跳过该条 · CC messages.ts:3538-3543");
+                continue;
+            }
+            state.appendMessage(changedFileMessage(sessionId, text));
+            emitted++;
+        }
+        if (emitted > 0) {
+            log.info("[changed_files] 变更文件尾部投递 {} 条 edited_text_file 消息"
+                + "（头部字节不变，⛔ 绝不回写 messages[0]）: sessionId={} · CC attachments.ts:871 + query.ts:1580-1588",
+                emitted, sessionId);
+        }
+    }
+
+    /**
+     * 变更文件尾部消息构造 · 对齐 CC 附件经 {@code createAttachmentMessage}（attachments.ts:3201）
+     * 成为会话消息的形态（{@code isMeta:true} 的 user 消息，渲染文案见
+     * {@link #renderHookAttachmentForLlm} 的 case 'edited_text_file' · CC messages.ts:3538-3543）。
+     *
+     * <p><b>author/subtype 取值理由</b>：与 {@link #dateChangeMessage} / {@link #skillListingMessage}
+     * 同一契约 —— author={@code "attachment"} 标明由 attachment 通道产出（前端按 {@code isMeta} 隐藏），
+     * subtype 与 CC {@code attachment.type} 同名（{@code edited_text_file}）。
+     * ⚠ 消费侧按<b>精确子类型</b>匹配已知值（{@code PostCompactAttachmentRestorer} 只认
+     * invoked_skills / plan_mode / skill_listing / deferred_tools_delta 等；{@code isToolUseSummaryRow}
+     * 只认 tool_use_summary）⇒ 本子类型不会被误当作上述任何一类处理，也不会被 {@code messagesForQuery}
+     * 剔除（它必须真正进模型 —— 这正是投递的目的）。
+     *
+     * @param sessionId    目标会话 id（真实消息落库必需）
+     * @param renderedText 已渲染文案（由 {@link #renderHookAttachmentForLlm} 产出，单一渲染实现）
+     * @return isMeta=true 的 user 消息（author='attachment'，subtype='edited_text_file'）；
+     *         renderedText 空 → null（不投递）
+     */
+    public static ChatMessageDto changedFileMessage(String sessionId, String renderedText) {
+        if (renderedText == null || renderedText.isBlank()) {
+            return null;
+        }
+        return new ChatMessageDto(
+            UUID.randomUUID().toString(), sessionId, Role.user, "attachment",
+            renderedText, null, java.util.List.of(), null, null, null,
+            "刚刚", java.time.OffsetDateTime.now(), null, null,
+            null, java.util.List.of(), java.util.List.of(), null, true)
+            .withSubtype("edited_text_file");
+    }
+
+    /**
      * [E-1a] 「本 query 产出消息」切片 · 对齐 CC 的 {@code agentMessages} 语义
      * （Open-ClaudeCode/src/tools/AgentTool/agentToolUtils.ts:320 {@code countToolUses(agentMessages)} /
      * :355 {@code getLastAssistantMessage(agentMessages)} —— CC 的 agentMessages 是 query 循环

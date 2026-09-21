@@ -5,6 +5,8 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.command.EffortCommand;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.PostCompactCleanup;
+import com.nexusai.application.agent.prompt.PromptCacheGroup;
+import com.nexusai.application.agent.prompt.SessionPromptCacheRegistry;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.SessionStartSeenRegistry;
 import com.nexusai.application.agent.skill.BuiltInCommands;
@@ -70,11 +72,18 @@ public class CommandController {
     @Autowired private SkillRegistry skillRegistry;
 
     /**
-     * [IMP-SP-07] 会话级主 AgentState 注册表 · /clear 失效接线：按显式传入的 sessionId 解析主会话
-     * AgentState → {@code systemPromptSectionCache().clear()}（对齐 CC clearSystemPromptSections
-     * systemPromptSections.ts:65-68 的 /clear 触发）。
-     * {@code @Autowired(required=false)}：plain JUnit（无 Spring 容器）缺省 null → 失效 debug skip
-     * （保测试兼容，见 CommandControllerBuiltInCommandsTest）。
+     * [IMP-SP-07] 会话级主 AgentState 注册表 · 按显式传入的 sessionId 解析主会话 AgentState。
+     *
+     * <p><b>⚠️ 注释已按代码改准</b>：原 javadoc 称 /clear 经本字段调
+     * {@code systemPromptSectionCache().clear()} —— 那<b>已不是事实</b>。分段缓存的 /clear 失效
+     * 现在走<b>集合语义入口</b> {@code SessionPromptCacheRegistry.clearPromptCaches(
+     * sessionId, PromptCacheGroup.CLEAR_SESSION_ALL, "executeBuiltin(/clear)")}
+     * （CommandController:452，对齐 CC clearSystemPromptSections systemPromptSections.ts:65-68）。
+     * 本字段当前实际用途：① resume 链路取主会话 {@code currentModel()}（fail loud，A-6）；
+     * ② {@code clearInvokedSkills(preserved)}。
+     *
+     * <p>{@code @Autowired(required=false)}：plain JUnit（无 Spring 容器）缺省 null → 走 fail loud /
+     * debug skip（保测试兼容，见 CommandControllerBuiltInCommandsTest）。
      */
     @Autowired(required = false)
     private SessionAgentStateRegistry sessionAgentStateRegistry;
@@ -336,10 +345,12 @@ public class CommandController {
      * compact/config 的 TUI 分发由 React 拿到 type/name 后自行触发 web 行为 —— DEC-9
      * concern 边界）。
      *
-     * <p><b>[IMP2-02 r1] clear 例外分支</b>：/clear 与 resume 同属后端真实执行分支 —— 触发
-     * 会话级缓存清理链（invalidateSystemPromptSections + runPostCompactCleanup +
-     * resetGetMemoryFilesCache('session_start') + clearInvokedSkillsPreservingBackgrounded，
-     * 对齐 CC clearSessionCaches caches.ts:47-144）。「不执行后端副作用」不适用 clear。
+     * <p><b>[IMP2-02 r1 · 步骤 4 已按集合重写] clear 例外分支</b>：/clear 与 resume 同属后端真实执行分支 ——
+     * 触发会话级缓存清理链（
+     * {@link SessionPromptCacheRegistry#clearPromptCaches}（{@link PromptCacheGroup#CLEAR_SESSION_ALL}
+     * = 集合 A+B+C+D）+ runPostCompactCleanup + resetGetMemoryFilesCache('session_start')
+     * + clearInvokedSkillsPreservingBackgrounded，对齐 CC clearSessionCaches caches.ts:47-144）。
+     * 「不执行后端副作用」不适用 clear。
      *
      * <p><b>⚠ [P0-0/N1 · 2026-09-11 用户拍板] /clear 已停用</b>：本端点对 clear（含别名 reset/new）
      * <b>直接抛 {@link ConflictException}（fail loud，409）</b>，不再静默"装作清了"——上述会话级清理链
@@ -436,9 +447,17 @@ public class CommandController {
         //   （含别名 reset/new）抛 ConflictException，本分支永不进入。清理链按决策【保留不删】（删除属另一
         //   决策，仅登记，见审计 §零 P0-0 / §12.4 N1）——请勿在此新增依赖；恢复 /clear 须先经用户拍板并
         //   同步前端入口（CommandPalette.COMMAND_ITEMS / App.sendMessage 停用门）。
-        // [IMP-SP-07] /clear 失效接线：clear 命令触发会话级 system prompt section 缓存失效
+        // [步骤 4 · 集合 A+B+C+D] /clear 失效接线 —— **集合语义已按 CC 重写**（原为「只清集合A」的
+        //   invalidateSystemPromptSections，见 CC 真源）：CC 的 /clear 经 clearSessionCaches 一次清<b>全集</b>
+        //   （commands/clear/caches.ts:52-55 相邻四行：getUserContext / getSystemContext / getGitStatus /
+        //   getSessionStartDate），故此处用 PromptCacheGroup.CLEAR_SESSION_ALL（A+B+C+D），
+        //   ⛔ 不再只清 A（旧行为少清 B/C/D = 与 CC 偏差），也 ⛔ 不广播清全部会话（只清本会话）。
+        //   CC 真源：conversation.ts:127 clearSessionCaches(preservedAgentIds)。
         if ("clear".equals(hit.getName())) {
-            invalidateSystemPromptSections("executeBuiltin(/clear)", sessionIdParam);
+            // [步骤 4] 会话级寻址在 registry 内（静态工具表，无需 Spring bean ⇒ 同时消除旧实现
+            //   「registry 未接线（plain JUnit）→ debug skip」的测试兼容分支）。
+            SessionPromptCacheRegistry.clearPromptCaches(
+                sessionIdParam, PromptCacheGroup.CLEAR_SESSION_ALL, "executeBuiltin(/clear)");
             // [C-方案3][DEC-C-03] /clear 等价清理 agent-defs 缓存 · 对齐 CC caches.ts:138
             //   clearAgentDefinitionsCache（loadAgentsDir.ts:395-398）→ Java 侧两层成对清：
             //   loadAgentsDir.clearCache（文件发现层 LOAD_CACHE + MarkdownConfigLoader memoize）
@@ -453,7 +472,9 @@ public class CommandController {
             // 全执行：resetMicrocompactState + resetContextCollapse + clearAllProviderCaches +
             // resetGetMemoryFilesCache('compact') + clearSystemPromptSections +
             // clearClassifierApprovals + clearSpeculativeChecks（postCompactCleanup.ts:31-77）。
-            // 既有 invalidateSystemPromptSections 保留（序列内 :62 同操作，幂等双清，未入删除清单）。
+            // [步骤 4] 序列内 :62（集合A）与 :59（集合B，main-thread）由本调用一并执行 ——
+            //   与上方 CLEAR_SESSION_ALL 的 A/B 部分**幂等重叠**，这正是 CC 的真实形态
+            //   （caches.ts:74 也调 runPostCompactCleanup，与 :52-53 相邻重叠），⛔ 不是双清 bug。
             // [批 3c] 显式传本会话（原无参入口无会话来源，第 4 项 clearSystemPromptSections 会 WARN 跳过）
             PostCompactCleanup.runPostCompactCleanup(null, sessionIdParam);
             // [MG-6 · A2-4 补充登记 6] removeSessionState 接线 · /clear 会话结束钩子 → 释放 SESSION_STATES 桶
@@ -717,6 +738,17 @@ public class CommandController {
      * 其他字符串同样不拒收，最终由 ResumeService 双键查 transcript miss → {@link NotFoundException}（404，
      * 等价 CC resumeAgent.ts:67-69 getAgentTranscript miss → throw）。
      *
+     * <p><b>⛔⛔ [步骤 4 · 映射陷阱 · 不得在此清任何 prompt 缓存集合]</b>：
+     * CC 在 {@code utils/sessionRestore.ts:364/:388}（同会话中途切 worktree / 退出恢复）
+     * 清<b>集合 A</b>{@code clearSystemPromptSections()}。本仓的 {@code /resume} <b>不是</b>那个语义
+     * —— 它是「恢复被后台化的 agent transcript」（{@code resumeAgentBackground}），
+     * 属于<b>同一会话内</b>的动作。本仓每发一次消息 = 一次 run；若照抄 CC 的 sessionRestore
+     * 清空点接到「同会话再次进入」这条路径上，就等于<b>每 run 清一次</b> ⇒ 头部每轮重建 ⇒
+     * DeepSeek 前缀缓存命中塌回 ~20%（本次要修的故障本身）。
+     * ⇒ 本入口<b>刻意不调用</b> {@link SessionPromptCacheRegistry#clearPromptCaches}；
+     * 完整的集合划分与陷阱说明见
+     * {@link com.nexusai.application.agent.prompt.PromptCacheGroup} 的「映射陷阱」段。
+     *
      * @param request   resume 请求体（{@code agentId} 必填，{@code prompt} 可空）
      * @param sessionIdParam 当前会话标识（批 3a：由 REST 入口显式传入，不再读 MDC）
      * @return {@link ResumeAgentResult}
@@ -814,42 +846,19 @@ public class CommandController {
     }
 
     /**
-     * [IMP-SP-07] /clear 失效接线 · 对齐 CC {@code clearSystemPromptSections} 的 /clear 触发点
-     * （systemPromptSections.ts:65-68，经 clearConversation → clearSessionCaches → runPostCompactCleanup）。
+     * [步骤 4 · 已按集合语义重写] /clear 失效入口 —— 原 {@code invalidateSystemPromptSections}
+     * （<b>只清集合 A</b>）已删除，改由
+     * {@link com.nexusai.application.agent.prompt.SessionPromptCacheRegistry#clearPromptCaches}
+     * 按 {@link com.nexusai.application.agent.prompt.PromptCacheGroup#CLEAR_SESSION_ALL}（A+B+C+D）
+     * 单点执行 —— 见 {@code executeBuiltinInternal} 内 /clear 分支的调用点。
      *
-     * <p>会话标识由调用方**显式传入**（批 3a：不再读裸 MDC 的会话 id）
-     * → {@link SessionAgentStateRegistry#get} → {@link AgentState#systemPromptSectionCache()#clear()}。
-     * 会话缺失 / 解析失败 → debug skip（保测试兼容）；registry 未接线（plain JUnit）→ debug skip。
-     *
-     * @param trigger   触发源描述（日志定位用）
-     * @param sessionId 当前会话标识（显式传参）
+     * <p><b>WHY 删除旧方法</b>（⛔ 不是重构噪声）：旧方法清的是「会话级分段缓存」= <b>只有集合 A</b>，
+     * 而 CC 的 /clear 是<b>唯一</b>的全集清理（commands/clear/caches.ts:52-55 相邻四行，A+B+C+D）。
+     * 保留它会让「/clear 到底清几个集合」在代码里出现<b>两处互相矛盾的答案</b>
+     * （同一事件两套语义 = 计划 §6 点名的「统一清 / 少清」两类偏差的温床）。
+     * 集合成员与调用点的对应关系现只由
+     * {@link com.nexusai.application.agent.prompt.PromptCacheGroup} 一处承载。
      */
-    private void invalidateSystemPromptSections(String trigger, String sessionId) {
-        if (sessionAgentStateRegistry == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[CommandController] {}: SessionAgentStateRegistry 未接线 → 失效跳过", trigger);
-            }
-            return;
-        }
-        String sessionIdStr = sessionId;
-        if (sessionIdStr == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[CommandController] {}: 无会话上下文（sessionId 为空）→ 失效跳过", trigger);
-            }
-            return;
-        }
-        // [session-id-short] sessionId 已 short 直键 registry（UUID.fromString 硬边界删除）
-        AgentState state = sessionAgentStateRegistry.get(sessionIdStr);
-        if (state == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[CommandController] {}: 会话 {} 无活跃 AgentState → 失效跳过", trigger, sessionIdStr);
-            }
-            return;
-        }
-        state.systemPromptSectionCache().clear();
-        log.info("[CommandController] {}: 会话 {} 的 system prompt section 缓存已失效（对齐 CC clearSystemPromptSections）",
-            trigger, sessionIdStr);
-    }
 
     /**
      * [OPD-TP-19] /clear preservedAgentIds 接线 · 对齐 CC conversation.ts:93-127

@@ -9,6 +9,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * SystemPromptSectionRegistry resolve 三态 + 并行 + 跨会话隔离测试。
@@ -19,8 +20,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <ul>
  *   <li>I-1 命中不重算：cacheBreak=false 且 name 已入 Map → 短路返回缓存值，compute 不调
  *       （命中先于 compute，短路唯一前提 systemPromptSections.ts:50）；</li>
- *   <li>I-2 cacheBreak=true 恒重算：DANGEROUS_uncachedSystemPromptSection 每轮都调 compute
- *       （systemPromptSections.ts:24/:37），值变化才打破 prompt 缓存；</li>
+ *   <li>I-2（2026-09-21 按 CC 2.1.278 改写）：{@code cacheBreak=true} 的「恒重算」语义本来是
+ *       DANGEROUS_uncachedSystemPromptSection 每轮都调 compute（systemPromptSections.ts:24/:37）。
+ *       2.1.278 实测 {@code cacheBreak:!0}/{@code cacheBreak:true} 均 0 处 ⇒ 本仓白名单清空、
+ *       mcp_instructions 改可缓存 ⇒ 该分支<b>结构化不可达</b>（构造期 fail loud）。
+ *       本用例改钉：「不可达」+ 新语义下同会话第二次 resolve 命中缓存不重算；</li>
  *   <li>并行 + 输入序：CompletableFuture.allOf 并行执行，结果数组按注册序（等价 CC
  *       Promise.all systemPromptSections.ts:43-57）——多条阻塞 compute 总耗时≈单条；</li>
  *   <li>跨会话隔离：cache 参数注入，两个 AgentState 的缓存互不串扰。</li>
@@ -51,17 +55,27 @@ class RegistryResolveTest {
     }
 
     @Test
-    @DisplayName("I-2：cacheBreak=true 两次 resolve 均调 compute（DANGEROUS_uncached，systemPromptSections.ts:24/:37）")
-    void resolve_cacheBreakTrue_recomputesEveryTurn() {
+    @DisplayName("I-2（2.1.278 改写）：cacheBreak=true 已不可构造 ⇒ 会话冻结；同会话第二次 resolve 命中缓存不重算")
+    void resolve_cacheBreakUnreachable_sectionFrozen() {
+        // WHY：2.1.88 时代本用例钉的是「mcp_instructions cacheBreak=true ⇒ 每轮重算」。
+        //   CC 2.1.278 实测 cacheBreak:!0/cacheBreak:true 均 0 处、独立段名 mcp_instructions 已不存在
+        //   ⇒ 本仓白名单清空、mcp_instructions 改为可缓存段 ⇒ 该易失分支在本仓结构化不可达。
+        //   ① 先钉「不可达」：危险工厂 + record 构造器对该段名都 fail loud；
+        assertThatThrownBy(() -> SystemPromptSections.dangerousUncachedSystemPromptSection(
+            "mcp_instructions", () -> CompletableFuture.completedFuture("mcp-value"), "MCP 状态每轮变化需破缓存"))
+            .as("白名单 0 条 ⇒ 危险工厂无法产出任何 cacheBreak=true 段（I-2 分支不可达）")
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessageContaining("白名单");
+
+        //   ② 再钉新语义：普通可缓存段在 registry 上「只算一次，之后恒命中」
         SystemPromptSectionCache cache = new SystemPromptSectionCache();
         int[] computeCount = {0};
-        SystemPromptSection volatileSection =
-            SystemPromptSections.dangerousUncachedSystemPromptSection("mcp-state", () -> {
-                computeCount[0]++;
-                return CompletableFuture.completedFuture("mcp-value");
-            }, "MCP 状态每轮变化需破缓存");
+        SystemPromptSection section = SystemPromptSections.systemPromptSection("mcp_instructions", () -> {
+            computeCount[0]++;
+            return CompletableFuture.completedFuture("mcp-value");
+        });
         SystemPromptSectionRegistry registry = new SystemPromptSectionRegistry();
-        registry.register(volatileSection);
+        registry.register(section);
 
         List<String> first = registry.resolveAll(cache);
         List<String> second = registry.resolveAll(cache);
@@ -69,8 +83,11 @@ class RegistryResolveTest {
         assertThat(first).containsExactly("mcp-value");
         assertThat(second).containsExactly("mcp-value");
         assertThat(computeCount[0])
-            .as("cacheBreak=true 短路条件恒不成立 → 两轮都调 compute，计数 2")
-            .isEqualTo(2);
+            .as("cacheBreak=false ⇒ 二次 resolve 命中短路（!cacheBreak && cache.has(name)），compute 计数 1")
+            .isEqualTo(1);
+        assertThat(cache.has("mcp_instructions"))
+            .as("首轮结果写回缓存（CC systemPromptSections.ts:54 无条件 set）")
+            .isTrue();
     }
 
     @Test

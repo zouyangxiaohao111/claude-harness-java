@@ -1,18 +1,19 @@
 package com.nexusai.application.agent.compact;
 
-import com.nexusai.application.agent.AgentState;
-import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.context.ClaudemdEngine;
 import com.nexusai.application.agent.loop.ContextCollapse;
 import com.nexusai.application.agent.permission.ClassifierApprovals;
 import com.nexusai.application.agent.permission.classifier.SpeculativeClassifier;
+import com.nexusai.application.agent.prompt.PromptCacheGroup;
+import com.nexusai.application.agent.prompt.SessionPromptCacheRegistry;
 import com.nexusai.application.agent.prompt.SystemPromptInjection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.util.Locale;
-import java.util.UUID;
+// [步骤 4] 原 `import java.util.Locale;` / `import java.util.UUID;` 已删：两者在步骤 4 后
+//   全类无引用（Locale 的实际使用处写的是全限定名 java.util.Locale.ROOT，见本类 isMainThreadCompact；
+//   UUID 随 STATIC_SESSION_REGISTRY 的删除一并失效）= 未使用导入，属噪声。
 
 /**
  * 压缩后清理 · 对齐 CC postCompactCleanup.ts {@code runPostCompactCleanup()}（:31-77）。
@@ -55,6 +56,8 @@ import java.util.UUID;
  *   <li>{@link ContextCollapse#resetContextCollapse()} —— CONTEXT_COLLAPSE feature 门控 + main-thread gate</li>
  *   <li>{@link ClassifierApprovals#clearClassifierApprovals()} —— 静态</li>
  *   <li>{@link ClaudemdEngine} —— Spring bean（FIX-CL 接线，{@code STATIC_CLAUDE_MD}）</li>
+ *   <li>[步骤 4] 集合 A/B 的缓存失效 —— {@link SessionPromptCacheRegistry}
+ *       （会话级 store 静态表，按 sessionId 分区；集合成员见 {@link PromptCacheGroup}）</li>
  * </ul>
  * 后者（ContextCollapse / ClaudemdEngine）为 Spring bean，本类以
  * {@code @Component} 构造注入并在启动时写入静态字段
@@ -66,9 +69,14 @@ import java.util.UUID;
  * <p>以下 CC 操作在 Java 端<b>无对应缓存结构</b>（教学版简化），序列中保留位置并以日志说明：
  * <ul>
  *   <li>{@code getUserContext.cache.clear()} + {@code resetGetMemoryFilesCache('compact')} ——
- *       [FIX-CL + IMP-SP2-08 SP-07 △-6] 真接线：{@code SystemPromptInjection.clearUserOnlyProviderCaches()}
- *       （getUserContext.cache.clear 等价，只清已注册 provider 的 user 缓存，<b>保留</b>
- *       systemContext/gitStatus —— CC :51-60 只清 user 通道）+ {@code STATIC_CLAUDE_MD.resetGetMemoryFilesCache('compact')}
+ *       [FIX-CL + IMP-SP2-08 SP-07 △-6 + 步骤 4] <b>真接线分两支</b>：有会话标识 ⇒
+ *       {@code SessionPromptCacheRegistry.clearPromptCaches(sessionId,
+ *       PromptCacheGroup.POST_COMPACT_USER_CONTEXT, …)}（按会话精确清，只清该会话 provider 的
+ *       user 缓存，<b>保留</b> systemContext/gitStatus —— CC :51-60 只清 user 通道）；
+ *       <b>无会话标识</b> ⇒ 回落到 CC 进程级广播
+ *       {@code SystemPromptInjection.clearUserOnlyProviderCaches()} 并打
+ *       {@code SystemPromptInjection.NO_SESSION_BROADCAST_WARNING}（跨会话隐患留痕）。
+ *       其后 {@code STATIC_CLAUDE_MD.resetGetMemoryFilesCache('compact')}
  *       （getMemoryFiles one-shot 发射态 + 缓存清空）</li>
  *   <li>{@code clearSystemPromptSections()} —— [IMP-SP-07] 已接线：清当前会话的 per-section 缓存
  *       （对齐 CC systemPromptSections.ts:65-68，/compact 后不命中旧缓存）</li>
@@ -90,10 +98,15 @@ public class PostCompactCleanup {
 
     /** CONTEXT_COLLAPSE 状态宿主 · CC original: contextCollapse（postCompactCleanup.ts:42-49）。 */
     private static volatile ContextCollapse STATIC_COLLAPSE;
-    /** [IMP-SP-07] 会话 AgentState 注册表宿主 · clearSystemPromptSections（:62）真实失效接线用。 */
-    private static volatile SessionAgentStateRegistry STATIC_SESSION_REGISTRY;
     /** [FIX-CL] claudemd 引擎宿主 · resetGetMemoryFilesCache('compact')（:52-59）真实失效接线用。 */
     private static volatile ClaudemdEngine STATIC_CLAUDE_MD;
+    // [步骤 4] 原 STATIC_SESSION_REGISTRY（会话 AgentState 注册表宿主）已<b>删除</b>：
+    //   集合 A/B 的失效改走**会话级 store 单点** SessionPromptCacheRegistry（静态工具表，按 sessionId
+    //   分区寻址），不再需要经「会话 AgentState」这一跳 —— AgentState.systemPromptSectionCache()
+    //   本就转发到同一份会话级 store（AgentState.java:1245）。删除理由（⛔ 非重构噪声）：
+    //   ① 该字段步骤 4 后**只写不读**（assigned-but-never-read = 误导性死状态）；
+    //   ② CC 的 runPostCompactCleanup(querySource) 是模块函数、**没有任何注册表形参**
+    //      （services/compact/postCompactCleanup.ts:31）⇒ 该参数本仓特有，删掉更贴近 CC。
 
     /**
      * Spring 装配入口：把协作器 bean 写入静态字段，供静态入口 {@link #runPostCompactCleanup(String)} 调用。
@@ -101,19 +114,15 @@ public class PostCompactCleanup {
      * <p>{@code required=false}：单测/无 bean 上下文下允许 null（对应操作降级跳过 + debug 日志）。
      * 非回调注册 —— 仅固定协作器，由容器创建本单例时注入一次。
      *
-     * @param contextCollapse     CONTEXT_COLLAPSE 状态宿主（CC :42-49）
-     * @param sessionAgentStateRegistry [IMP-SP-07] 会话 AgentState 注册表宿主（clearSystemPromptSections :62 失效接线）
-     * @param claudemdEngine      [FIX-CL] claudemd 引擎宿主（resetGetMemoryFilesCache('compact') :52-59 失效接线）
+     * @param contextCollapse CONTEXT_COLLAPSE 状态宿主（CC :42-49）
+     * @param claudemdEngine  [FIX-CL] claudemd 引擎宿主（resetGetMemoryFilesCache('compact') :52-59 失效接线）
      */
     public PostCompactCleanup(
             @org.springframework.beans.factory.annotation.Autowired(required = false)
             ContextCollapse contextCollapse,
             @org.springframework.beans.factory.annotation.Autowired(required = false)
-            SessionAgentStateRegistry sessionAgentStateRegistry,
-            @org.springframework.beans.factory.annotation.Autowired(required = false)
             ClaudemdEngine claudemdEngine) {
         STATIC_COLLAPSE = contextCollapse;
-        STATIC_SESSION_REGISTRY = sessionAgentStateRegistry;
         STATIC_CLAUDE_MD = claudemdEngine;
     }
 
@@ -164,7 +173,11 @@ public class PostCompactCleanup {
      * 有源入口（无会话形参）· 等价 {@code runPostCompactCleanup(querySource, null)}。
      *
      * <p><b>⚠ 调用方待接线</b>：本入口不携带会话标识 ⇒ 第 4 项 {@code clearSystemPromptSections}
-     * 会 WARN 跳过（无法定位会话级 AgentState）。调用方（{@code CompactCommand} /
+     * 会 WARN 跳过（无法定位会话级 store），第 3 项集合B 退化为 CC 进程级广播（<b>清全部会话</b>）
+     * 并打 {@code SystemPromptInjection.NO_SESSION_BROADCAST_WARNING}（跨会话隐患留痕 ·
+     * 主 agent 已裁定保留该 CC-parity 语义、仅加告警，见
+     * {@code SystemPromptInjection#clearUserOnlyProviderCaches()} 的 javadoc）。
+     * 调用方（{@code CompactCommand} /
      * {@code AutoCompactor} / {@code CommandController}）应改用
      * {@link #runPostCompactCleanup(String, String)} 显式传入会话；本批（3c）内
      * {@code PartialCompactService} 已切换为显式会话。
@@ -182,7 +195,8 @@ public class PostCompactCleanup {
      * <ol>
      *   <li>{@code resetMicrocompactState()}（:41）—— 复位 pendingCacheEdits / cached-MC 态（IMP-09 入口）</li>
      *   <li>{@code feature('CONTEXT_COLLAPSE')} 且 main-thread → {@code resetContextCollapse()}（:42-49）</li>
-     *   <li>main-thread → getUserContext.cache.clear + resetGetMemoryFilesCache('compact')（:51-60，Java no-op）</li>
+     *   <li>main-thread → getUserContext.cache.clear + resetGetMemoryFilesCache('compact')（:51-60；
+     *       Java <b>真接线</b> · 非 no-op —— 有会话 ⇒ 按会话精确清集合B，无会话 ⇒ 广播清 + 隐患 WARN）</li>
      *   <li>{@code clearSystemPromptSections()}（:62，[IMP-SP-07] 真实失效接线 —— 清当前会话 section 缓存）</li>
      *   <li>{@code clearClassifierApprovals()}（:63）</li>
  *   <li>{@code clearSpeculativeChecks()}（:64，CC 有 speculativeChecks 结构但外部构建恒禁用；Java 对齐恒禁用 —— 见 SpeculativeClassifier）</li>
@@ -193,9 +207,10 @@ public class PostCompactCleanup {
      *
      * @param querySource 压缩 query 的来源（/compact 等传 "compact"；主循环传 "repl_main_thread:…"；
      *                    subagent 传 "agent:…"；null = 无源视为 main-thread，对齐 CC undefined 语义）
-     * @param sessionId   显式会话标识（[批 3c] 供第 4 项 clearSystemPromptSections 定位会话级
-     *                    AgentState；原由裸 MDC 会话槽承载。null/空白 ⇒ 该项 WARN 跳过，见
-     *                    {@link #clearActiveSessionSystemPromptSections(String)}）
+     * @param sessionId   显式会话标识（[批 3c] 供集合 A/B 定位<b>会话级 store</b>
+     *                    —— {@link SessionPromptCacheRegistry} 按 sessionId 分区；原由裸 MDC 会话槽
+     *                    承载。null/空白 ⇒ 集合A 项 WARN 跳过 / 集合B 项退化为 CC 进程级广播，
+     *                    见 {@link #clearActiveSessionSystemPromptSections(String)}）
      */
     public static void runPostCompactCleanup(String querySource, String sessionId) {
         boolean isMainThread = isMainThreadCompact(querySource);
@@ -224,16 +239,41 @@ public class PostCompactCleanup {
         //    旧 Java 实现经 clearAllProviderCaches 双清 system/user 为多清偏差（CC 不清
         //    getSystemContext.cache，systemContext/gitStatus 缓存 /compact 后保留）。
         if (isMainThread) {
-            SystemPromptInjection.clearUserOnlyProviderCaches();
+            // [步骤 4 · 集合B] CC postCompactCleanup.ts:59 `getUserContext.cache.clear?.()` ——
+            //   该行在 isMainThreadCompact 守卫**之内**（:51）。CC 侧是进程级 memoize（一进程一会话）
+            //   ⇒ 本仓必须映射为**按会话清**（PromptCacheGroup.POST_COMPACT_USER_CONTEXT）。
+            //   ⛔ 不再无条件广播 SystemPromptInjection.clearUserOnlyProviderCaches()：那会
+            //   「会话 A 压缩 ⇒ 打掉会话 B 的 claudeMd 头部」（跨会话串味，且恰恰是本批要修的
+            //    每轮重建类的浪费）。仅在**无会话来源**（历史无参入口 / 测试）时才退化为广播 ——
+            //    那种调用方在 JS 世界等价于 CC 的「进程级」，广播是它的忠实翻译。
+            if (sessionId != null && !sessionId.isBlank()) {
+                SessionPromptCacheRegistry.clearPromptCaches(sessionId,
+                    PromptCacheGroup.POST_COMPACT_USER_CONTEXT, "compact:main-thread");
+            } else {
+                // ⚠ 醒目 WARN（跨会话隐患留痕 · 文案单点在 SystemPromptInjection.NO_SESSION_BROADCAST_WARNING）：
+                //   本分支 = 「无会话标识 ⇒ 广播清全部已注册 provider」，在本仓多会话 + provider 跨 run
+                //   长期存活下会打掉**全部会话**的 claudeMd 头部（跨会话串味）。主 agent 已裁定保留该
+                //   CC-parity 语义（CC 一进程=一会话 ⇒ 广播 == 清本会话，见 SystemPromptInjection javadoc），
+                //   仅告警留痕；正确调用方式 = runPostCompactCleanup(querySource, sessionId)。
+                int broadcastCleared = SystemPromptInjection.clearUserOnlyProviderCaches();
+                log.warn("[PostCompactCleanup] {} · CC postCompactCleanup.ts:59；本次实际广播清 {} 个 provider；"
+                    + "调用方应改用 runPostCompactCleanup(querySource, sessionId)",
+                    SystemPromptInjection.NO_SESSION_BROADCAST_WARNING, broadcastCleared);
+            }
             ClaudemdEngine claudemd = STATIC_CLAUDE_MD;
             if (claudemd != null) {
                 claudemd.resetGetMemoryFilesCache("compact", sessionId);
             } else if (log.isDebugEnabled()) {
                 log.debug("[PostCompactCleanup] resetGetMemoryFilesCache('compact') 跳过：ClaudemdEngine 未接线 · CC postCompactCleanup.ts:52-59");
             }
+        } else if (log.isDebugEnabled()) {
+            log.debug("[PostCompactCleanup] 集合B 跳过（子代理 compact）：CC postCompactCleanup.ts:59 在 "
+                + "isMainThreadCompact 守卫内 ⇒ 子代理**刻意不清**主会话 userContext（否则破坏主线程状态）"
+                + "· querySource={}", querySource);
         }
 
         // 4. clearSystemPromptSections（:62）—— [IMP-SP-07] 真实失效接线：清本会话 section 缓存
+        //    ⭐ 集合A 在守卫**之外**（无守卫）⇒ 子代理 compact 也执行，对齐 CC :62。
         //    [批 3c] 会话标识由**显式形参**传入（原读裸 MDC 的会话槽；载体已随本批删除）。
         clearActiveSessionSystemPromptSections(sessionId);
         // 5. clearClassifierApprovals（:63）—— 审批只对当前会话有效，compact 后失效
@@ -270,12 +310,19 @@ public class PostCompactCleanup {
     }
 
     /**
-     * [IMP-SP-07] clearSystemPromptSections 失效接线 · 对齐 CC {@code clearSystemPromptSections}
-     * （postCompactCleanup.ts:62 → systemPromptSections.ts:65-68）。
+     * [IMP-SP-07 · 步骤 4 已按集合语义重写] clearSystemPromptSections 失效接线 · 对齐 CC
+     * {@code clearSystemPromptSections()}（services/compact/postCompactCleanup.ts:62 →
+     * constants/systemPromptSections.ts:65-68）—— <b>只有集合 A</b>
+     * （{@link PromptCacheGroup#POST_COMPACT_SECTIONS}）。
      *
-     * <p>经**显式会话形参** {@code sessionId} → {@link SessionAgentStateRegistry#get}
-     * → {@link AgentState#systemPromptSectionCache()#clear()}。会话缺失 / 解析失败 / 无活跃状态 → warn 显式登记
-     * （不静默跳过）；registry 未接线（无 @Component bean 的测试场景）→ debug skip。
+     * <p><b>⭐ 为什么集合 A 在守卫之外</b>：CC 的 {@code :62} 在 {@code isMainThreadCompact} 守卫
+     * <b>之外</b>（无守卫）⇒ 子代理 compact 也执行。这与同函数 {@code :59}（集合B，守卫之内）
+     * 形成<b>刻意的不对称</b>：分段缓存重算是无害且正确的，而重置主会话的 userContext 缓存
+     * 会破坏主线程模块级状态（CC :36-40 的原话注释）。本方法<u>不</u>判 isMainThread —— 正是对齐点。
+     *
+     * <p>失效经<b>会话级单点</b> {@link SessionPromptCacheRegistry#clearPromptCaches}（按 sessionId 分区，
+     * ⛔ 不广播清全部会话；⛔ 不走 {@code forSession} 以免为清一个未跑过的会话凭空建 store）。
+     * 会话缺失 → WARN 显式登记（不静默跳过）。
      *
      * <p>[批 3c] 会话标识由调用方显式传入（原读裸 MDC 的会话槽 —— 该槽的第三态会读到上一请求残留的
      * <b>别的会话</b> id ⇒ 清掉别的会话的 section 缓存）。无来源时必须 ≥WARN（禁只 DEBUG）。
@@ -284,39 +331,32 @@ public class PostCompactCleanup {
      *                  null/空白 ⇒ WARN 跳过本项（其余清理项照常执行）
      */
     private static void clearActiveSessionSystemPromptSections(String sessionId) {
-        SessionAgentStateRegistry registry = STATIC_SESSION_REGISTRY;
-        if (registry == null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[PostCompactCleanup] clearSystemPromptSections 跳过：SessionAgentStateRegistry 未接线 · CC postCompactCleanup.ts:62");
-            }
-            return;
-        }
         if (sessionId == null || sessionId.isBlank()) {
             log.warn("[PostCompactCleanup] clearSystemPromptSections 跳过：调用方未传会话标识"
                 + "（无参 runPostCompactCleanup() 入口，无会话来源）→ 无法定位会话级 section 缓存 · "
                 + "CC postCompactCleanup.ts:62；调用方应改用 runPostCompactCleanup(querySource, sessionId)");
             return;
         }
-        // [session-id-short] sessionId 已 short 直键 registry（UUID.fromString 硬边界删除）
-        AgentState state = registry.get(sessionId);
-        if (state == null) {
-            log.warn("[PostCompactCleanup] clearSystemPromptSections 跳过：会话 {} 无活跃 AgentState（注册表未注册？）", sessionId);
-            return;
+        boolean cleared = SessionPromptCacheRegistry.clearPromptCaches(
+            sessionId, PromptCacheGroup.POST_COMPACT_SECTIONS, "compact:clearSystemPromptSections");
+        if (cleared) {
+            log.info("[PostCompactCleanup] clearSystemPromptSections: 会话 {} 的集合A 分段缓存已清空"
+                + "（无守卫 ⇒ 子代理也清，对齐 CC postCompactCleanup.ts:62）", sessionId);
+        } else {
+            log.warn("[PostCompactCleanup] clearSystemPromptSections 未命中：会话 {} 尚无会话级 store"
+                + "（该会话未跑过材料收集 ⇒ 分段缓存本为空），其余清理项照常执行 · CC postCompactCleanup.ts:62",
+                sessionId);
         }
-        state.systemPromptSectionCache().clear();
-        log.info("[PostCompactCleanup] clearSystemPromptSections: 会话 {} 的 system prompt section 缓存已清空 · CC postCompactCleanup.ts:62",
-            sessionId);
     }
 
     /**
      * 复位静态协作器（仅测试用）。
      *
-     * <p>各测试用例独立接线 {@link #PostCompactCleanup(ContextCollapse, SessionAgentStateRegistry, ClaudemdEngine)}
+     * <p>各测试用例独立接线 {@link #PostCompactCleanup(ContextCollapse, ClaudemdEngine)}
      * 时先经本方法复位，避免跨用例静态字段污染。
      */
     static void resetForTest() {
         STATIC_COLLAPSE = null;
-        STATIC_SESSION_REGISTRY = null;
         STATIC_CLAUDE_MD = null;
     }
 }

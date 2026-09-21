@@ -628,6 +628,15 @@ public class PowerShellTool implements Tool {
         Path combinedSpill = null;
         // [OD-2A-2] cd 追踪临时文件（外层声明，供 finally 清理）。
         Path cwdTrackFile = null;
+        // [步骤 6 · cwd 语义对齐 CC] isMainThread = ctx.agentId()==null（CC PowerShellTool.tsx:452
+        //   `isMainThread = !toolUseContext.agentId` → `preventCwdChanges = !isMainThread`）。
+        //   ⛔ preventCwdChanges 与沙箱（shouldUseSandbox）**无关** —— CC 里 preventCwdChanges 的唯一
+        //   来源就是 isMainThread（BashTool.tsx:642-643），回读门控在共享的 Shell.ts:395。
+        //   PowerShell 与 Bash 走**同一个** exec()（Shell.ts:181-197 的 resolveProvider[shellType]）
+        //   ⇒ 两者的回读门控必须同款，否则「子代理 PS cd 仍污染主会话 cwd 槽」。
+        final boolean isMainThread = ctx == null || ctx.agentId() == null;
+        // G8 受控差异：本工具无「前台→后台」就地转后台基础设施（下方 timeout 分支 destroyForcibly
+        //   + 早返回，对齐 CC result.backgroundTaskId 短路效果）⇒ 回读处无需再判 backgroundTaskId。
 
         try {
             // ── [OD-2A-2 · INV-2] PowerShell 前台 cd 持久化 · 对齐 CC powershellProvider
@@ -642,8 +651,14 @@ public class PowerShellTool implements Tool {
             //   `exit $_ec` 保持原退出码，否则 PowerShellTool.execute 的 exitCode 语义（
             //   PowerShellCommandSemantics，grep/robocopy 非零码）被追踪尾巴污染。
             // Shell.ts:385-421 跑完 readFileSync 读回 → NFC 比对（Shell.ts:406）→ 变化时 setCwd +
-            //   onCwdChangedForHooks；仅前台 !backgroundTaskId（:395）；preventCwdChanges 不更新（:395，
-            //   Java 未接沙箱执行路径 → 等价 false，登记 OD-2A-1）。
+            //   onCwdChangedForHooks；仅前台 !backgroundTaskId（:395）；preventCwdChanges 不更新（:395）。
+            // ⚠️ [步骤 6 · 改准与代码相反的注释] 本行旧文案称「preventCwdChanges … Java 未接沙箱
+            //   执行路径 → 等价 false」—— 把 preventCwdChanges **误当成沙箱开关**，与 CC 真源相反：
+            //   CC 里 preventCwdChanges 的唯一来源是 `!isMainThread`（BashTool.tsx:642-643），
+            //   与 shouldUseSandbox 无关。旧文案据此推出「等价 false（永不门控）」⇒ 子代理 PS 的
+            //   cd 实际被写进了父会话 cwd 槽（与注释声称的相反）。现按 CC 真源在下方回读处加
+            //   isMainThread 门控（:isMainThread 声明见上方），命令包装仍无条件（对齐 CC
+            //   buildExecCommand 不查 preventCwdChanges）。
             // Java 等价（与 BashTool [WF-2A] 同构，DEC-1 联动）：命令尾部追加完整 CC cwdTracking
             //   （含 $_ec 退出码保持，逐字对齐 powershellProvider.ts:65）到临时文件 → 跑完读回 →
             //   NFC 比对 sessionCwd → 变化时 SessionCwdHolder.set（内部 realpath+NFC，
@@ -764,7 +779,13 @@ public class PowerShellTool implements Tool {
             int exitCode = process.exitValue();
 
             // ── [OD-2A-2 · CC-CWD-06] 前台命令跑完读回 cwd 更新 SessionCwdHolder ──
-            // 对齐 CC Shell.ts:385-421：仅前台命令（executeBackground 路径不经此）；
+            // [步骤 6 · cwd 语义对齐 CC] 对齐 CC Shell.ts:395 守卫行
+            //   `if (result && !preventCwdChanges && !result.backgroundTaskId)`：
+            // ① `isMainThread` ⇔ `!preventCwdChanges`（CC PowerShellTool.tsx:452 / BashTool.tsx:642-643）
+            //    ⇒ **子代理的 PS cd 不得写主会话 cwd 槽**（子代理 ctx.sessionId() = 父会话 id）。
+            //    子代理 cd 语义以 CC 实际行为为准：**不跨其自身多次调用持久化**。
+            // ② backgroundTaskId 短路：本工具 timeout 分支 destroyForcibly + 早返回（:758），
+            //    结构上等价 CC `!result.backgroundTaskId` 短路，故此处不再重复该条件（见上方声明注释）。
             // readFileSync 读回 newCwd → NFC 比对（Shell.ts:406 newCwd.normalize('NFC') !== cwd）→
             // 变化时 setCwd（realpath+NFC，Shell.ts:447-464 setCwd）。Java 等价：读临时文件
             // → NFC 比对 sessionCwd → 变化时 SessionCwdHolder.set（内部 realpath+NFC，对齐 setCwdState）。
@@ -775,7 +796,7 @@ public class PowerShellTool implements Tool {
             //   cwd 含不可见前缀（SessionCwdHolder.set → normalizeCwd realpath 失败回原值+NFC
             //   仍带 BOM）→ 下一条命令 pb.directory 用带 BOM 路径失败。故读回后统一剥离
             //   ﻿（对齐 CC readFileSync utf8 语义 = 无 BOM 路径）。
-            if (cwdTrackFile != null && sessionId != null) {
+            if (cwdTrackFile != null && sessionId != null && isMainThread) {
                 try {
                     String newCwd = Files.readString(cwdTrackFile, StandardCharsets.UTF_8)
                         .replace("﻿", "").trim();
@@ -784,8 +805,12 @@ public class PowerShellTool implements Tool {
                         if (!normalizedNew.equals(sessionCwd)) {
                             com.nexusai.application.agent.agent.SessionCwdHolder.set(sessionId, newCwd);
                             if (log.isDebugEnabled()) {
-                                log.debug("[PowerShellTool] cd 持久化: sessionId {} {} -> {}",
-                                    sessionId, sessionCwd, newCwd);
+                                // [步骤 6 · 数据流日志] 写会话 cwd 槽一行：sessionId / agentKey /
+                                //   旧值 / 新值 / 是否主线程（门控保证此处 isMainThread 恒 true）。
+                                log.debug("[PowerShellTool] cd 持久化写会话 cwd 槽: sessionId={} agentKey={} "
+                                        + "isMainThread={} 旧值={} 新值={}",
+                                    sessionId, ctx != null ? ctx.agentId() : null, isMainThread,
+                                    sessionCwd, newCwd);
                             }
                         }
                     }
@@ -795,6 +820,12 @@ public class PowerShellTool implements Tool {
                         log.debug("[PowerShellTool] cd 追踪读回失败（命令可能于 pwd 前失败）: {}", trackEx.toString());
                     }
                 }
+            } else if (cwdTrackFile != null && sessionId != null && log.isDebugEnabled()) {
+                // [步骤 6 · 数据流日志] 门控跳过分支可观测：子代理（isMainThread=false）的 PS cd
+                //   不回读、不写会话 cwd 槽 —— 「子代理 cd 不污染主会话槽」的正面证据。
+                log.debug("[PowerShellTool] cd 回读被门控跳过（不写会话 cwd 槽）: sessionId={} agentKey={} "
+                        + "isMainThread={}",
+                    sessionId, ctx != null ? ctx.agentId() : null, isMainThread);
             }
             OutputCapture stdoutOut = stdoutCap[0] != null ? stdoutCap[0] : new OutputCapture("", 0, null);
             OutputCapture stderrOut = stderrCap[0] != null ? stderrCap[0] : new OutputCapture("", 0, null);

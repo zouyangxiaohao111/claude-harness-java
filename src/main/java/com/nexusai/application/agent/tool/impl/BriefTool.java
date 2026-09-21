@@ -75,17 +75,21 @@ import java.util.Map;
  *       {message, sentAt} 或 {message, attachments, sentAt}（BriefTool.ts:186-203）</li>
  * </ul>
  *
- * <p><b>受控偏差/登记（IMP-H3 范围外）</b>：
+ * <p><b>受控偏差/登记</b>：
  * <ul>
- *   <li><b>isEnabled 门控未实现</b>：CC {@code isBriefEnabled()}（BriefTool.ts:126-134）需要
- *       {@code feature('KAIROS')/KAIROS_BRIEF + getKairosActive()/getUserMsgOptIn()} 门控；Web
- *       后端 {@code getUserMsgOptIn()} 无进程内状态（BriefCommand 为静态工具未接线）→ 本任务
- *       不 override isEnabled()（保持默认 true，工具恒可用，避免 kairos 未部署时工具消失破坏
- *       现有部署），门控待 userMsgOptIn 接线后按 CC 对齐（登记 owner 待决）。</li>
- *   <li><b>renderToolUseMessage/renderToolResultMessage</b>（UI.tsx）为 React 渲染（N/A，Java 无前端）。</li>
- *   <li><b>消息投递通道</b>：CC 中 message 经工具输出 data 渲染为用户可见消息；Web 后端本工具
- *       输出 data 契约 {message,sentAt,attachments} 走正常 tool_result 通道送达前端，前端渲染
- *       SendUserMessage 输出属前端接线范围（待前端对接）。</li>
+ *   <li><b>isEnabled 门控已接线（本批）</b>：CC {@code isBriefEnabled()}（BriefTool.ts:126-134）由
+ *       {@code feature('KAIROS')/KAIROS_BRIEF + getKairosActive()/getUserMsgOptIn()} + GrowthBook
+ *       kill-switch 复合判定；Java Web 后端无 GrowthBook、{@code getUserMsgOptIn()} 无进程内状态
+ *       → 单一 yml 键 {@code nexusai.brief.enabled}（<b>默认 true</b>）承载 kill-switch 语义
+ *       （见 {@link #isEnabled()}）。CC 的「opt-in 才能启用」语义未建模（Web 无 CLI --brief），
+ *       即：Java 端恒 opt-in、只剩 kill-switch。</li>
+ *   <li><b>renderToolUseMessage/renderToolResultMessage</b>（UI.tsx）为 React 渲染（N/A，Java 无前端）；
+ *       前端渲染在 nexusai front（MessageList SendUserMessage 正文渲染）。</li>
+ *   <li><b>消息投递通道</b>：CC 中「数据」= 工具 output {@code {message, attachments, sentAt}}
+ *       渲染给用户、「给模型看的文本」= {@code mapToolResultToToolResultBlockParam} 的一句人类文案。
+ *       Java 后端同构：模型面文本走 {@code messages(role=tool).content}（本类
+ *       {@link #mapToToolResultBlockParam} 产出，逐字不变）；UI 面结构化载荷走
+ *       {@code tool_calls.result}（{@code ChatService.toolResultUiPayload} 落库 + 实时推送）。</li>
  * </ul>
  */
 @Component
@@ -114,6 +118,19 @@ public class BriefTool implements Tool {
             + "uses it.";
     /** CC maxResultSizeChars = 100_000（BriefTool.ts:142）。 */
     private static final long MAX_RESULT_SIZE_CHARS = 100_000L;
+
+    /**
+     * 保险开关 · {@code nexusai.brief.enabled}（默认 {@code true} = 默认开，可按需关）。
+     *
+     * <p>对齐 CC {@code isBriefEnabled()}（BriefTool.ts:126-134）的 <b>kill-switch 语义</b>：
+     * CC 由 {@code feature('KAIROS')||'KAIROS_BRIEF'} + {@code getKairosActive()/getUserMsgOptIn()}
+     * + GrowthBook {@code tengu_kairos_brief} 复合判定；Java Web 后端无 GrowthBook、无 CLI opt-in
+     * （{@code getUserMsgOptIn()} 无进程内状态），故用单一配置键承载「关掉即不暴露」这一条，
+     * 形态照抄同仓 stub 先例（{@code SendUserFileTool.sendUserFileEnabled} /
+     * {@code PushNotificationTool.bridgeEnabled}）。
+     */
+    @Value("${nexusai.brief.enabled:true}")
+    boolean briefEnabled = true;
 
     /** 注入式附件解析器（测试）；null → 生产默认链（stat + read-deny + bridge 上传）。 */
     private final AttachmentResolver attachmentResolver;
@@ -198,6 +215,20 @@ public class BriefTool implements Tool {
     @Override
     public long maxResultSizeChars() {
         return MAX_RESULT_SIZE_CHARS;
+    }
+
+    /**
+     * 是否启用 · {@code nexusai.brief.enabled}（默认 true）。
+     *
+     * <p>ToolRegistry 分发前经 {@code isEnabled()} 过滤（ToolRegistry.java:501/707/807）——
+     * false 时本工具不出现在候选集、不进 API tools，LLM 看不到也调不到；
+     * 已落库的历史 SendUserMessage 消息展示不受影响（前端按 toolName 渲染，与开关无关）。
+     *
+     * <p>CC original: {@code isEnabled() = isBriefEnabled()}（BriefTool.ts:151-153）。
+     */
+    @Override
+    public boolean isEnabled() {
+        return briefEnabled;
     }
 
     /** CC BriefTool.ts:154-156 isConcurrencySafe() = true。 */
@@ -342,12 +373,19 @@ public class BriefTool implements Tool {
             } catch (Exception e) {
                 // CC attachments.ts:73-79 语义：TOCTOU 下文件移动 → stat 抛错 → 模型看到错误。
                 // Java Tool 约定「错误不抛」，转 ToolResult.error 返回（is_error 由执行器推导）。
+                // [F2 2026-09-20] 错误串必须带 "Error: " 前缀 —— 执行器对「正常返回的 ToolResult.error」
+                //   只能经 LlmAgentLoop.isToolErrorData（**前缀白名单**）推导 t.isError；无前缀 ⇒
+                //   isError=false ⇒ ①mapper 走成功分支 ⇒ 模型收到「Message delivered to user.」
+                //   （silent success：明明没投递却告诉模型投递成功）②tool_calls.is_error=false ⇒
+                //   前端把失败当成功渲染。CC 对应形态：错误在 toolExecution.ts:1589 catch 里被显式标
+                //   is_error:true（:1722）+ toolUseResult 加 "Error: " 前缀（:1726）。本仓既有同款先例
+                //   （LspTool.java:188 注释「前缀 'Error: ' 使 isToolErrorData 识别为错误」）。
                 if (log.isWarnEnabled()) {
                     log.warn("[SendUserMessage] 附件解析失败: messageLen={} err={}",
                         message.length(), e.toString());
                 }
                 return ToolResult.error(call.id(),
-                    "Attachment resolution failed: "
+                    "Error: Attachment resolution failed: "
                         + (e.getMessage() == null ? e.toString() : e.getMessage()));
             }
         }
@@ -413,6 +451,39 @@ public class BriefTool implements Tool {
         }
         return new ToolResultBlockParam(
             toolUseId, "tool_result", "Message delivered to user." + suffix, isError);
+    }
+
+    /**
+     * [brief-payload] 工具 output data → UI 面结构化载荷 JSON（SendUserMessage 专用）· <b>单一判定源</b>。
+     *
+     * <p><b>WHY 单一源</b>：UI 面载荷在<b>两条</b>投放通道上必须逐字同形 —— ①实时（STOMP，
+     * {@code StreamingToolExecutor.pushToolResultRealtime}）②落库/重拉（{@code tool_calls.result}，
+     * {@code ChatService.toolResultUiPayload}）。两条通道谁是先手由并发决定（executor 先推 → ChatService
+     * 去重跳过；见 {@code ChatService.java:1796} 注释），若各写各的序列化，F5 前后载荷形态可能不同。
+     * 本方法即 CC 侧 {@code toolExecution.ts:1456-1466} 单一载体
+     * {@code createUserMessage({toolUseResult: result.data})} 的 Java 等价物。
+     *
+     * <p><b>判据</b>（对齐 {@code ChatService.toolResultUiPayload} 原判定）：
+     * 名字命中本工具（含历史别名 {@code Brief}）且 data 为 {@code Map} 且含 {@code message} 键。
+     * 其余一切（非本工具 / String 人类文案 / 结构化载荷缺失）→ null，调用方回落人类文案。
+     *
+     * @param toolName 工具名（实时= {@code call.name()}；落库= {@code tool_calls.tool_name}）
+     * @param data     工具 output data（成功= Map {@code {message, attachments?, sentAt}}；失败= String）
+     * @return 结构化 payload JSON；不适用 → null
+     */
+    public static String structuredUiPayload(String toolName, Object data) {
+        if (toolName == null || !(NAME.equals(toolName) || LEGACY_NAME.equals(toolName))) {
+            return null;
+        }
+        if (!(data instanceof Map<?, ?> m) || !m.containsKey("message")) {
+            return null;
+        }
+        try {
+            return MAPPER.writeValueAsString(m);
+        } catch (Exception e) {
+            log.warn("[SendUserMessage] 结构化 UI 载荷序列化失败，回落人类文案: err={}", e.toString());
+            return null;
+        }
     }
 
     // ═══════════════ 附件链（CC attachments.ts + upload.ts 生产接线） ═══════════════

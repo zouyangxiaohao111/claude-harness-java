@@ -3,7 +3,8 @@ import { MarkdownText } from '@/markdown/MarkdownText'
 import { projectPreview } from '@/markdown/plainPreview'
 import type { ChatMessageDto } from '@/api/types'
 import { subagentColor } from '@/api/types'
-import { compactNumber } from '@/utils/format'
+import { compactNumber, formatFileSize } from '@/utils/format'
+import { briefErrorMessage, briefPayload, dropTextInBriefTurns, isBriefBlock, isSendUserMessage } from '@/utils/sendUserMessage'
 import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
 // [OBS2] 渲染错误边界（防御性兜底）：见下方「消息区整层」与「逐行」两处包裹
@@ -370,6 +371,44 @@ function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool: NonNul
   )
 }
 
+/**
+ * SendUserMessage 正文渲染 · 对齐 CC {@code tools/BriefTool/UI.tsx:55-68 renderToolResultMessage 默认分支}：
+ * <b>无工具边框、无 gutter 标记、无折叠</b>（源码注释逐字：{@code userFacingName() returns '' so …
+ * AssistantToolUseMessage renders null (no tool chrome)}），正文 Markdown，下方附件列表。
+ *
+ * <p><b>WHY 不能走 ToolCard</b>：ToolCard 是「工具调用」的展示（标题 + 折叠 IN/OUT）。SendUserMessage
+ * 的定位是「Claude 对用户说的话」——CC 里它读起来就是普通回复正文；而本仓原先因
+ * {@code userFacingName()=''} + {@code (name ?? 'tool').trim()} 接不住空串 → 渲染成<b>无名折叠卡</b>，
+ * 模型的答案被埋进折叠区。
+ *
+ * <p>附件行对齐 CC {@code AttachmentList}（UI.tsx:98-100）：{@code [image]}/{@code [file]} + 路径 + 大小。
+ */
+function SendUserMessageBody({ tool }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number] }) {
+  const payload = useMemo(() => briefPayload(tool), [tool])
+  // 失败态：不渲染正文/附件，只给失败文案（对齐 CC UserToolResultMessage.tsx:71-86
+  //   is_error → UserToolErrorMessage，BriefTool 无 renderToolUseErrorMessage ⇒ 红字兜底）。
+  //   ⛔ 顺序在 payload 判定之前 —— 失败时 briefPayload 已返回 null，落到「return null」会静默消失。
+  const errText = briefErrorMessage(tool)
+  if (errText !== null) return <div className="sum-error">{errText}</div>
+  if (!payload) return null
+  return (
+    <div className="sum-body">
+      {payload.message !== '' && <MarkdownText text={payload.message} className="content md" />}
+      {payload.attachments.length > 0 && (
+        <div className="sum-attachments">
+          {payload.attachments.map((a) => (
+            <div className="sum-att" key={a.path}>
+              <span className="sum-att-kind">{a.isImage === true ? '[image]' : '[file]'}</span>
+              <span className="sum-att-path" title={a.path}>{a.path}</span>
+              {a.size != null && <span className="sum-att-size"> ({formatFileSize(a.size)})</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 /** [P2-13] compact 摘要专用渲染 · 对齐 CC {@code components/CompactSummary.tsx:74-104}（auto-compact 默认分支）
  *  + {@code components/Message.tsx:140-142}（{@code case 'user': if (message.isCompactSummary) return <CompactSummary/>}）。
  *
@@ -712,7 +751,11 @@ function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessage
               //   「¥ 金额」误读（此前「本轮 368」视觉像 $368 金额）
               <div className="msg-usage">本轮输出 {compactNumber(msg.outputTokens)} tokens</div>
             ) : null}
-            {msg.toolCalls?.map((t, i) => <ToolCard key={t.id ?? i} tool={t} matchedRule={msg.matchedRule} sessionId={msg.sessionId} />)}
+            {/* SendUserMessage（CC BriefTool）→ 正文渲染（无工具边框，对齐 CC UI.tsx 默认分支）；
+                其余工具照旧 ToolCard。按 toolCalls 原序分派，保持模型调用顺序。 */}
+            {msg.toolCalls?.map((t, i) => isSendUserMessage(t)
+              ? <SendUserMessageBody key={t.id ?? i} tool={t} />
+              : <ToolCard key={t.id ?? i} tool={t} matchedRule={msg.matchedRule} sessionId={msg.sessionId} />)}
           </div>
         </>
       )}
@@ -760,8 +803,12 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
             {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
           </div>
         )}
-        {b.content && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
-        {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live sessionId={sessionId} />)}
+        {/* 实时侧 dropText 等价（对齐 CC dropTextInBriefTurns 作用于流式文本）：本块含
+            SendUserMessage → 该轮助手正文是工作笔记，不展示（答案在工具正文里）。 */}
+        {b.content && !isBriefBlock(b.toolCalls) && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
+        {b.toolCalls.length > 0 && b.toolCalls.map((t, j) => isSendUserMessage(t)
+          ? <SendUserMessageBody key={t.id ?? j} tool={t} />
+          : <ToolCard key={t.id ?? j} tool={t} matchedRule={null} live sessionId={sessionId} />)}
       </div>
     </div>
   )
@@ -887,7 +934,9 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
       if (idx === undefined) { idx = arr.length; order.set(key, idx); arr.push({ key, items: [] }) }
       arr[idx].items.push(item)
     }
-    for (const m of messages) {
+    // [brief-align] 含 SendUserMessage 的轮次里丢掉冗余助手正文 · 对齐 CC components/Messages.tsx:169-206
+    //   dropTextInBriefTurns（transcript 模式绕过：本仓轨迹 tab 直读 store，不经本函数 —— 同 CC）。
+    for (const m of dropTextInBriefTurns(messages)) {
       if (m.role === 'tool') continue
       // [transcript-only] 仅 transcript 可见的 user 消息不进普通对话流（CC original:
       //   utils/messages.ts:5098-5115 shouldShowUserMessage —— 首行 `if (message.type !== 'user') return true`
@@ -1158,6 +1207,36 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
         .msg.stop-hook-summary .shs-line { padding-left: 14px; }
         .msg.stop-hook-summary .shs-branch { margin-right: 6px; opacity: 0.6; }
         .msg.stop-hook-summary .shs-error { color: var(--warning, #c9820e); }
+        /* SendUserMessage（CC BriefTool）正文块：无工具边框/无折叠，读起来就是 Claude 说的话
+           （对齐 CC tools/BriefTool/UI.tsx:55-68 默认分支：no tool chrome / no gutter mark） */
+        .sum-body { display: block; }
+        .sum-attachments { margin-top: 4px; }
+        .sum-att {
+          display: flex;
+          align-items: baseline;
+          gap: 4px;
+          font-size: 12.5px;
+          line-height: 1.7;
+          color: var(--ink-muted, #888);
+        }
+        .sum-att-kind { flex-shrink: 0; opacity: 0.85; }
+        /* 路径可能很长：截断显示，完整值在 title（对齐 CC getDisplayPath 单行展示语义） */
+        .sum-att-path {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          max-width: 520px;
+        }
+        .sum-att-size { flex-shrink: 0; opacity: 0.75; }
+        /* SendUserMessage 失败态：红字一行（对齐 CC FallbackToolUseErrorMessage.tsx:54 「color='error'」
+           + :75-78 的 <Text color="error">）——绝不渲染投递正文/附件，避免失败被当成投递成功 */
+        .sum-error {
+          color: var(--error);
+          font-size: 13px;
+          line-height: 1.6;
+          white-space: pre-wrap;
+          word-break: break-word;
+        }
       `}</style>
       {/* [window-paging] 顶部「加载更早」（hasMore 时；对齐 deepseek loadOlder 显式按钮，不做滚顶自动翻页） */}
       {hasMore && (

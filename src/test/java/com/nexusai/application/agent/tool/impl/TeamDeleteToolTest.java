@@ -35,6 +35,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -195,6 +196,66 @@ class TeamDeleteToolTest {
         assertThat(output.get("message").asText()).contains("active member(s): mate");
         assertThat(output.get("team_name").asText()).isEqualTo(team);
         assertThat(teamConfigPath(team)).as("活跃成员存在时不得删除 team 目录").exists();
+    }
+
+    @Test
+    @DisplayName("[team-disband-race] 拒删必须保留 teamContext —— 否则第二次调用退化成 No team name found 假成功")
+    void delete_blockedByActiveMember_preservesTeamContext() throws Exception {
+        // WHY（规则九，验证意图）：CC TeamDeleteTool.ts 的活跃成员守卫分支是**早退 return**
+        //   （activeMembers.length > 0 → return {success:false}），此时 setAppState 清 teamContext
+        //   尚未执行 ⇒ 拒删后 teamContext 仍在，leader 可以先 requestShutdown 再重试。
+        //   Java 原实现无条件 clearTeamContext ⇒ 第一次拒删就把会话列/appState 抹掉，第二次
+        //   teamNameFromContext() 恒 null → 走 "No team name found, nothing to clean up" 且
+        //   success=true（**假成功**：零清理却报成功，模型据此停止重试）。
+        //   实测铁证：backend.log 15:56:11 拒删（outLen=212）→ 15:56:23 第二次 1ms 返回 outLen=68。
+        //   变异点：把 isSuccess(result) 判断退回无条件 clearTeamContext → 本用例两个断言必红。
+        String team = "blocked-team";
+        TeamHelpers helpers = new TeamHelpers();
+        ObjectNode config = new ObjectMapper().createObjectNode();
+        config.put("name", team);
+        config.put("leadAgentId", "team-lead@" + team);
+        ArrayNode members = config.putArray("members");
+        ObjectNode lead = members.addObject();
+        lead.put("agentId", "team-lead@" + team);
+        lead.put("name", "team-lead");
+        ObjectNode mate = members.addObject();
+        mate.put("agentId", "mate@" + team);
+        mate.put("name", "mate"); // 无 isActive → 恒活跃（CC :87）
+        helpers.writeConfig(team, config.toString());
+
+        // 忠实的会话列 mock：clearTeamContext 真的抹掉 store（否则「第二次调用」断言恒真、无法判红）
+        Map<String, Object> store = new LinkedHashMap<>();
+        store.put("teamContext", new LinkedHashMap<>(Map.of("teamName", team)));
+        SessionService sessionService = mock(SessionService.class);
+        when(sessionService.getTeamContext(APPSTATE_CTX_SESSION_ID))
+                .thenAnswer(inv -> store.get("teamContext"));
+        doAnswer(inv -> {
+            store.remove("teamContext");
+            return null;
+        }).when(sessionService).clearTeamContext(APPSTATE_CTX_SESSION_ID);
+
+        TeamDeleteTool tool = newTool();
+        ReflectionTestUtils.setField(tool, "sessionService", sessionService);
+
+        Map<String, Object> appState = new LinkedHashMap<>();
+        appState.put("teamContext", Map.of("teamName", team));
+        AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
+                appStateCtx(appState));
+
+        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        assertThat(output.get("success").asBoolean()).as("活跃成员存在 → 拒删").isFalse();
+        assertThat(teamConfigPath(team)).exists();
+        assertThat(store.get("teamContext")).as("拒删时会话列 teamContext 必须保留（CC 早退语义）").isNotNull();
+        assertThat(appState.get("teamContext")).as("拒删时 appState.teamContext 必须保留（CC 早退语义）").isNotNull();
+
+        // 第二次调用：仍应被守卫拒删，而不是退化成 "No team name found"（假成功、零清理）
+        AgentToolResult<?> second = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
+                appStateCtx(appState));
+        JsonNode secondOutput = new ObjectMapper().readTree((String) second.data());
+        assertThat(secondOutput.get("message").asText())
+                .as("第二次仍应按守卫拒删，而非退化成 No team name found（假成功）")
+                .contains("active member(s): mate")
+                .doesNotContain("No team name found");
     }
 
     @Test

@@ -43,6 +43,23 @@ public final class StructuredPatchGenerator {
      * @return hunk 数组；无变更时返回空数组（对齐 CC getPatchFromContents 空 hunks）
      */
     public static List<StructuredPatchHunk> getPatch(String oldContent, String newContent) {
+        return getPatch(oldContent, newContent, CONTEXT_LINES);
+    }
+
+    /**
+     * [步骤 7 · 投递层] 可指定 context 行数的重载 · 判据 = CC
+     * {@code getSnippetForTwoFileDiff}（Open-ClaudeCode/src/tools/FileEditTool/utils.ts:362-377）里
+     * {@code structuredPatch('file.txt','file.txt', a, b, undefined, undefined, {context: 8, ...})}
+     * —— edited_text_file 附件片段用 <b>context=8</b>，与 Edit 工具的 context=3（{@link #CONTEXT_LINES}）不同。
+     *
+     * <p>⚠ 单点实现理由：diff 算法只允许一份。调用方按 CC 各自的 context 传入，
+     * ⛔ 不得为 context=8 另抄一份 diff（两份真相会随算法修复漂移）。
+     *
+     * @param oldContent 旧内容（CC original: fileAContents）
+     * @param newContent 新内容（CC original: fileBContents）
+     * @param context    上下文行数（CC original: structuredPatch options.context）
+     */
+    public static List<StructuredPatchHunk> getPatch(String oldContent, String newContent, int context) {
         // CC diff.ts:92-95 先对全文 escape，再交给 diff 库；此处逐行等价实现
         String oldEsc = escapeForDiff(normalizeCrlf(oldContent));
         String newEsc = escapeForDiff(normalizeCrlf(newContent));
@@ -50,7 +67,7 @@ public final class StructuredPatchGenerator {
         List<String> newLines = splitLines(newEsc);
 
         long start = System.nanoTime();
-        List<Hunk> raw = computeHunks(oldLines, newLines, CONTEXT_LINES);
+        List<Hunk> raw = computeHunks(oldLines, newLines, context);
         long costMs = (System.nanoTime() - start) / 1_000_000L;
         if (log.isDebugEnabled()) {
             log.debug("StructuredPatchGenerator: 生成 hunk 数={} oldLines={} newLines={} 耗时={}ms",

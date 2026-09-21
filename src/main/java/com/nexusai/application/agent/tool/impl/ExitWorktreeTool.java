@@ -3,7 +3,6 @@ package com.nexusai.application.agent.tool.impl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.context.ClaudemdEngine;
@@ -82,13 +81,12 @@ public class ExitWorktreeTool implements Tool {
     @Autowired(required = false)
     private HookRegistry hookRegistry;
 
-    /**
-     * [G22③] 会话 AgentState 注册表宿主 · 对齐 CC ExitWorktreeTool.ts:143
-     * {@code clearSystemPromptSections()}（restoreSessionToOriginalCwd :143）——退出 worktree
-     * 后清会话级 system prompt section 缓存。null = 未装配 → 跳过。
-     */
-    @Autowired(required = false)
-    private SessionAgentStateRegistry sessionAgentStateRegistry;
+    // [步骤 4] 原 `@Autowired(required=false) SessionAgentStateRegistry sessionAgentStateRegistry`
+    //   （及配套 setter）已<b>删除</b>：集合A 的失效改走会话级 store 静态表
+    //   SessionPromptCacheRegistry.clearPromptCaches(sessionId, WORKTREE_SECTIONS, …)，不再需要
+    //   经「会话 AgentState」这一跳（AgentState.systemPromptSectionCache() 本就转发到同一份
+    //   会话级 store，AgentState.java:1245）。删除理由（⛔ 非重构噪声）：该字段步骤 4 后只被 Spring
+    //   赋值、从不读取 = 误导性死状态；且 CC 的 ExitWorktreeTool 无此依赖形参。
 
     /**
      * [G22③] claudemd 记忆文件缓存引擎宿主 · 对齐 CC ExitWorktreeTool.ts:144
@@ -122,10 +120,8 @@ public class ExitWorktreeTool implements Tool {
         this.hookRegistry = hookRegistry;
     }
 
-    @Autowired(required = false)
-    public void setSessionAgentStateRegistry(SessionAgentStateRegistry sessionAgentStateRegistry) {
-        this.sessionAgentStateRegistry = sessionAgentStateRegistry;
-    }
+    // [步骤 4] setSessionAgentStateRegistry 已随字段一并删除（集合A 走 SessionPromptCacheRegistry，
+    //   见上方字段位注释）。全仓无调用点。
 
     @Autowired(required = false)
     public void setClaudemdEngine(ClaudemdEngine claudemdEngine) {
@@ -679,29 +675,30 @@ public class ExitWorktreeTool implements Tool {
      * </pre>
      *
      * <p>Java 等价同 Enter 侧 {@link EnterWorktreeTool#clearWorktreeCaches}（复用接线模式）：
-     * {@link SessionAgentStateRegistry#get(UUID)} → {@code systemPromptSectionCache().clear()} +
-     * {@link ClaudemdEngine#clearMemoryFileCaches()}；registry / engine 未注入 → 跳过（null 守卫）。
+     * {@code SessionPromptCacheRegistry.clearPromptCaches(sessionId, PromptCacheGroup.WORKTREE_SECTIONS, …)}
+     * （<b>集合 A only</b>）+ {@link ClaudemdEngine#clearMemoryFileCaches()}；
+     * claudemdEngine 未注入 → 跳过（null 守卫）。
      *
-     * @param ctx 工具调用上下文（用于解析当前会话 UUID；null → 无法定位会话级缓存）
+     * <p><b>⛔⛔ [步骤 4] 刻意只清集合 A —— 不得在此顺手清 B/C/D</b>：CC 的退出侧
+     * （ExitWorktreeTool.ts:143）与进入侧一样只调 {@code clearSystemPromptSections()}，
+     * 那一时刻 claudeMd / 日期 / gitStatus <b>故意保持陈旧</b>（理由与判据见 Enter 侧同名方法
+     * 与 {@code PromptCacheGroup.WORKTREE_SECTIONS}）。
+     *
+     * @param ctx 工具调用上下文（用于解析当前会话 UUID；null → 无法定位会话级缓存 → 集合A 失效 no-op）
      */
     private void clearWorktreeCaches(ToolUseContext ctx) {
         // [session-id-short] ctx.sessionId() 已 String（short）
         String sessionId = (ctx != null) ? ctx.sessionId() : null;
-        if (sessionAgentStateRegistry != null) {
-            if (sessionId != null) {
-                com.nexusai.application.agent.AgentState state = sessionAgentStateRegistry.get(sessionId);
-                if (state != null) {
-                    state.systemPromptSectionCache().clear();
-                    log.info("[ExitWorktreeTool] 清空会话 {} 的 system prompt section 缓存（对齐 CC ExitWorktreeTool.ts:143 clearSystemPromptSections）",
-                        sessionId);
-                } else if (log.isDebugEnabled()) {
-                    log.debug("[ExitWorktreeTool] clearSystemPromptSections 跳过：会话 {} 无活跃 AgentState", sessionId);
-                }
-            } else if (log.isDebugEnabled()) {
-                log.debug("[ExitWorktreeTool] clearSystemPromptSections 跳过：无 sessionId");
-            }
+        // [步骤 4 · 集合A only] 经会话级 store 单点（同 Enter 侧）
+        boolean cleared = com.nexusai.application.agent.prompt.SessionPromptCacheRegistry.clearPromptCaches(
+            sessionId, com.nexusai.application.agent.prompt.PromptCacheGroup.WORKTREE_SECTIONS,
+            "ExitWorktreeTool");
+        if (cleared) {
+            log.info("[ExitWorktreeTool] 清空会话 {} 的集合A 分段缓存（对齐 CC ExitWorktreeTool.ts:143 "
+                + "clearSystemPromptSections；⛔ 刻意不清 B/C/D）", sessionId);
         } else if (log.isDebugEnabled()) {
-            log.debug("[ExitWorktreeTool] clearSystemPromptSections 跳过：SessionAgentStateRegistry 未接线");
+            log.debug("[ExitWorktreeTool] 集合A 清空未命中（无 sessionId / 该会话尚无 store）：sessionId={}"
+                + " · CC ExitWorktreeTool.ts:143", sessionId);
         }
         if (claudemdEngine != null) {
             claudemdEngine.clearMemoryFileCaches();

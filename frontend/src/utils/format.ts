@@ -20,3 +20,19 @@ export function compactNumber(n: number): string {
   }
   return String(n)
 }
+
+/**
+ * 文件大小显示 · 逐条对齐 CC {@code utils/format.ts:9-23 formatFileSize}
+ * （1023 → '1023 bytes'；1024 → '1KB'；1572864 → '1.5MB'；一位小数并去掉尾随 {@code .0}）。
+ *
+ * 供 SendUserMessage 附件列表（CC BriefTool/UI.tsx:99 的 {@code ({formatFileSize(att.size)})}）。
+ */
+export function formatFileSize(sizeInBytes: number): string {
+  const kb = sizeInBytes / 1024
+  if (kb < 1) return `${sizeInBytes} bytes`
+  if (kb < 1024) return `${kb.toFixed(1).replace(/\.0$/, '')}KB`
+  const mb = kb / 1024
+  if (mb < 1024) return `${mb.toFixed(1).replace(/\.0$/, '')}MB`
+  const gb = mb / 1024
+  return `${gb.toFixed(1).replace(/\.0$/, '')}GB`
+}

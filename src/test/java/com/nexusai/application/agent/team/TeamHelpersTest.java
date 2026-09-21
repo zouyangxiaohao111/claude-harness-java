@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.team;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -8,7 +10,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -164,6 +171,78 @@ class TeamHelpersTest {
         // 未变 → 返回（不写）
         helpers.setMemberActive(TEAM, "researcher", false);
         assertThat(readConfig()).contains("\"isActive\":false");
+    }
+
+    /**
+     * [team-disband-race] 并发写不丢：N 个成员并发置 isActive=false ⇒ N 个 false 全部落盘。
+     *
+     * <p>WHY（规则九，验证意图而非行为）：TeamDeleteTool 的活跃成员守卫与轮询判据就是
+     * config.json 的 members[].isActive（TeamDeleteTool.activeNonLeadMembers 只放行
+     * {@code isActive === false}）。而 setMemberActive 是**唯一**写该字段的地方
+     * （AutonomousAgentLoop turn 开始置 true / 轮末 idle 置 false），每个 teammate 一个线程 ⇒
+     * 多成员下多线程同时「读整份 root → 改自己那一格 → 回写整份 root」。只要有一个 false 被并发
+     * 写覆盖回 true，轮询就永远拿不到「全部 inactive」⇒ TeamDelete 恒拒删。
+     * 实测铁证：backend.log 2026-09-20 15:56:11「team=teamtest-0920b 轮询 8000ms 后仍有 3 个活跃成员」。
+     *
+     * <p>为什么跑多轮：单轮竞态依赖线程调度，可能碰巧串行化而假绿；重复多轮稳定暴露丢失更新
+     * （无锁实现只需任意一轮丢一次即红）。
+     *
+     * <p><b>反向实验</b>：把 TeamHelpers.withConfigLock 退化为直接 {@code action.get()}（不取锁）
+     * ⇒ 本用例必红（各线程基于同一份旧快照回写整份 root，每轮最终只剩 1 个 false）。
+     */
+    @Test
+    void concurrentSetMemberActive_doesNotLoseUpdates() throws Exception {
+        final int memberCount = 8;
+        final int rounds = 12;
+        ObjectMapper mapper = new ObjectMapper();
+
+        for (int round = 0; round < rounds; round++) {
+            // 每轮重建配置：N 个成员全部 isActive=true（模拟「N 个 teammate 同时在场」）
+            String[] memberObjects = new String[memberCount];
+            for (int i = 0; i < memberCount; i++) {
+                memberObjects[i] = member("m" + i + "@" + TEAM, "m" + i, null, null, true);
+            }
+            writeConfig(membersJson(memberObjects));
+
+            CountDownLatch startGate = new CountDownLatch(1);
+            CountDownLatch finished = new CountDownLatch(memberCount);
+            List<Thread> threads = new ArrayList<>();
+            for (int i = 0; i < memberCount; i++) {
+                String name = "m" + i;
+                Thread t = new Thread(() -> {
+                    try {
+                        startGate.await();
+                        helpers.setMemberActive(TEAM, name, false);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        finished.countDown();
+                    }
+                }, "teammate-" + name + "@" + TEAM);
+                threads.add(t);
+                t.start();
+            }
+            startGate.countDown();  // 同时起跑，最大化「读-改-写」重叠窗口
+            assertThat(finished.await(30, TimeUnit.SECONDS))
+                .as("第 %d 轮：并发 setMemberActive 必须在 30s 内全部完成（锁不应死锁/饿死）", round)
+                .isTrue();
+            for (Thread t : threads) {
+                t.join(5000);
+            }
+
+            JsonNode root = mapper.readTree(readConfig());
+            Map<String, Boolean> states = new LinkedHashMap<>();
+            for (JsonNode m : root.path("members")) {
+                states.put(m.path("name").asText(), m.path("isActive").asBoolean(true));
+            }
+            assertThat(states).as("第 %d 轮：8 个成员必须都在 members 数组里", round).hasSize(memberCount);
+            for (int i = 0; i < memberCount; i++) {
+                assertThat(states.get("m" + i))
+                    .as("第 %d 轮：成员 m%d 的 isActive=false 被并发写覆盖（lost update）⇒ "
+                        + "TeamDelete 永远等不到全部 inactive", round, i)
+                    .isFalse();
+            }
+        }
     }
 
     @Test

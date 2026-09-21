@@ -1394,6 +1394,37 @@ public record AttachmentMessageDto(
     }
 
     /**
+     * [步骤 5 · 跨午夜] date_change attachment 工厂 · 对齐 CC
+     * {@code getDateChangeAttachments} 的产物 {@code [{type:'date_change', newDate}]}
+     * （utils/attachments.ts:1443）。
+     *
+     * <p><b>语义（CC 源码注释逐字，attachments.ts:1403-1418）</b>：跨午夜时把新日期以本附件
+     * <b>追加在会话尾部</b>告知模型，<b>不</b>改动 {@code messages[0]}（
+     * {@code getUserContext → prependUserContext} 产出的头部<b>故意保留旧日期</b>）——
+     * 回写头部会重新生成整段前缀，把整条会话变成 cache_creation
+     * （CC 源码给的量级：每次跨午夜约 920K 有效 token）。
+     *
+     * <p><b>本工厂只生产 attachment</b>：渲染归
+     * {@code AgentLoopContext.renderHookAttachmentForLlm} 的 case 'date_change'
+     * （对齐 CC messages.ts:4163-4167），投递归
+     * {@code AgentLoopContext.maybeEmitDateChange}（尾部真实消息追加）。
+     *
+     * @param newDate 新日期（{@code "YYYY-MM-DD"}，CC original: attachment.newDate，attachments.ts:1443）
+     * @return type='date_change' 的 attachment（dateChange = newDate）
+     */
+    public static AttachmentMessageDto dateChange(String newDate) {
+        return new AttachmentMessageDto(
+            null, "attachment", "date_change",
+            "The date has changed. Today's date is now " + newDate + ".",
+            null, null, null, null, null, null, null,
+            null, null, null, null, null, null, null, 0, false,
+            null, null, null, false, false, null, null, null, null, null, null,
+            null, null, null, null, null, null, null, null, null, null,
+            null, null, null, null, null, null,
+            newDate, null, null, null, null, null);
+    }
+
+    /**
      * 单条恢复文件引用 · 对齐 CC {@code 'file'} attachment
      * (utils/attachments.ts:3158-3164, {@code {type:'file', filename, content, truncated}})。
      *
@@ -1404,6 +1435,37 @@ public record AttachmentMessageDto(
      * @param truncated 是否因过大被截断 (CC original: attachment.truncated, attachments.ts:3162)
      */
     public record FileRef(String filename, String content, boolean truncated) {}
+
+    /**
+     * [步骤 7 · 投递层] edited_text_file attachment 工厂 · 对齐 CC {@code getChangedFiles} 的产物
+     * （{@code {type:'edited_text_file', filename, snippet}}，utils/attachments.ts:2117-2121）。
+     *
+     * <p><b>语义（CC 真源）</b>：该 attachment 存在的意义是「头部冻结 ≠ 什么都看不到」——
+     * 上次读过的文件在磁盘上变了（判据 {@code mtime > fileState.timestamp}），就在<b>会话尾部</b>
+     * 告知模型，⛔ 而<b>不</b>回写前缀（回写 = 重新生成整段前缀 ⇒ 缓存全灭）。
+     * 渲染归 {@code AgentLoopContext.renderHookAttachmentForLlm} 的 case 'edited_text_file'
+     * （CC messages.ts:3538-3543），投递归 {@code AgentLoopContext.maybeEmitChangedFiles}
+     * （尾部真实消息追加，与 date_change 同一条 append-only 通道）。
+     *
+     * <p>载荷复用既有 {@link LineSelectionRef}（其 javadoc 已声明承载
+     * {@code 'edited_text_file'} 的 filename/snippet —— 三类 IDE 附件共用同一 record）。
+     *
+     * @param filename 变更文件路径（CC original: attachment.filename，attachments.ts:2119）
+     * @param snippet  变更片段（CC original: attachment.snippet，attachments.ts:2120；
+     *                 由 {@code ChangedFilesDetector.getSnippetForTwoFileDiff} 按 8KB 上限截断）
+     * @return type='edited_text_file' 的 attachment（lineSelection.filename/snippet）
+     */
+    public static AttachmentMessageDto editedTextFile(String filename, String snippet) {
+        return new AttachmentMessageDto(
+            null, "attachment", "edited_text_file",
+            "Note: " + filename + " was modified",
+            null, null, null, null, null, null, null,
+            null, null, null, null, null, null, null, 0, false,
+            null, null, null, false, false, null, null, null, null, null, null,
+            null, null, null, null, null, null, null, null, null, null,
+            null, null, null, null, null, null,
+            null, null, null, null, new LineSelectionRef(filename, null, null, null, snippet), null);
+    }
 
     /**
      * plan 文件引用 · 对齐 CC {@code 'plan_file_reference'} attachment

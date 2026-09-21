@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -504,6 +505,75 @@ class StreamingToolExecutorRealtimePushTest {
         assertThat(res.getResult()).endsWith("... (truncated)");
     }
 
+    @Test
+    @DisplayName("T12 SendUserMessage 实时推 → result 是结构化 output JSON（附件含 isImage/size），非 Map.toString")
+    void briefToolRealtimeCarriesStructuredPayload() throws Exception {
+        // WHY（本条的判别点在**实时**通道，不是落库通道）：交互路径上先手是 executor 的实时推，
+        //   ChatService 那次推送被 realtimeToolResultsPushed 去重跳过（ChatService.java:1796 注释
+        //   自述「通常晚于 executor push → 此处跳过」）。故只要本出口送的是 String.valueOf(Map)
+        //   （Java Map.toString："{\"message\"=…, sentAt=…, attachments=[{path=…, size=…, isImage=…}]}"），
+        //   前端 fromStructured（JSON.parse）必失败 → 回落 arguments ⇒ 附件实时显示成无大小的 [file]
+        //   路径（图片也被误标 [file]，因 isImage 未知），F5 重拉后才恢复 [image] path (size)。
+        //   对齐 CC：UI 渲染源是工具 output 数据对象本身（toolExecution.ts:1456-1466 toolUseResult）。
+        SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        ToolRegistry registry = new ToolRegistry();
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("message", "## 验收结果\n全部通过");
+        data.put("sentAt", "2026-09-20T00:00:00Z");
+        data.put("attachments", List.of(Map.of("path", "/tmp/a.png", "size", 4096, "isImage", true)));
+        registry.register(structuredTool("SendUserMessage", data));
+        StreamingToolExecutor exec = newExecutor(registry, pool);
+        exec.setToolStreamPublisher(ws, TOPIC, "sess-1", "msg-u1");
+
+        exec.add(call("tc-brief", "SendUserMessage"), ToolParent.of("turn-1"), null);
+        exec.getRemainingResults();
+        pool.shutdown();
+        awaitToolResultPush(ws, 1);
+
+        ArgumentCaptor<StreamEvent> captor = ArgumentCaptor.forClass(StreamEvent.class);
+        verify(ws, atLeastOnce()).convertAndSend(eq(TOPIC), captor.capture());
+        MessageToolResultEvent evt = toolResult(captor, "tc-brief");
+        assertThat(evt).as("SendUserMessage 完成出口必须实时推 tool_result").isNotNull();
+        // 判别点：JSON.parse 能解（Map.toString 形态首字符虽同为 '{'，但 "key=" 无引号 ⇒ 解析必抛）
+        JsonNode node = JSON.readTree(evt.getResult());
+        assertThat(node.path("message").asText()).as("答案原文必须在实时载荷里").isEqualTo("## 验收结果\n全部通过");
+        assertThat(node.path("sentAt").asText()).isEqualTo("2026-09-20T00:00:00Z");
+        JsonNode att = node.path("attachments").get(0);
+        assertThat(att.path("isImage").asBoolean()).as("isImage 必须传到前端（否则图片被误标 [file]）").isTrue();
+        assertThat(att.path("size").asLong()).as("size 必须传到前端（否则附件行无大小）").isEqualTo(4096L);
+        assertThat(evt.getIsError()).isFalse();
+    }
+
+    @Test
+    @DisplayName("T12b 非本工具的结构化 data 不受影响 → 仍是原 truncateResult 形态（不误改别的工具）")
+    void otherToolStructuredDataUnchanged() throws Exception {
+        // WHY：结构化 data 的工具不止 SendUserMessage（ReadFileTool/WriteFileTool 等经
+        //   successWithStructuredOutput 折入 data Map）。本条钉住「本次只接 SendUserMessage」——
+        //   若有人把结构化 JSON 化推广到全部工具，本断言会红，逼其显式决策（范围守卫）。
+        SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        ToolRegistry registry = new ToolRegistry();
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("summary", "read a.txt");
+        data.put("startLine", 1);
+        registry.register(structuredTool("Read", data));
+        StreamingToolExecutor exec = newExecutor(registry, pool);
+        exec.setToolStreamPublisher(ws, TOPIC, "sess-1", "msg-u1");
+
+        exec.add(call("tc-read", "Read"), ToolParent.of("turn-1"), null);
+        exec.getRemainingResults();
+        pool.shutdown();
+        awaitToolResultPush(ws, 1);
+
+        ArgumentCaptor<StreamEvent> captor = ArgumentCaptor.forClass(StreamEvent.class);
+        verify(ws, atLeastOnce()).convertAndSend(eq(TOPIC), captor.capture());
+        MessageToolResultEvent evt = toolResult(captor, "tc-read");
+        assertThat(evt).isNotNull();
+        assertThat(evt.getResult()).as("非本工具仍走原 truncateResult（Map 原串）").contains("summary");
+        assertThat(evt.getResult()).doesNotContain("\"summary\":");   // 非 JSON：键未被引号包裹
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // 辅助
     // ════════════════════════════════════════════════════════════════════
@@ -599,6 +669,19 @@ class StreamingToolExecutorRealtimePushTest {
             Map.of(), false, "",
             java.nio.file.Paths.get("."),
             current -> java.util.Collections.unmodifiableSet(java.util.Set.of()));
+    }
+
+    /** 固定结构化 data 的工具（模拟 BriefTool/ReadFileTool 的 Map output；对齐 CC data:T）. */
+    private static Tool structuredTool(String name, Map<String, Object> data) {
+        return new Tool() {
+            @Override public String name() { return name; }
+            @Override public String description() { return "structured " + name; }
+            @Override public JsonNode inputSchema() { return JSON.createObjectNode(); }
+            @Override public boolean isConcurrencySafe(JsonNode input) { return true; }
+            @Override public AgentToolResult<?> execute(ToolUseBlock call) {
+                return ToolResult.success(call.id(), data);
+            }
+        };
     }
 
     /** 快速成功工具 (concurrency-safe, 默认 isEnabled=true). */

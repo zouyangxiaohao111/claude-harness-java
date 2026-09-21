@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.tasks.TaskLock;
 import com.nexusai.common.SessionKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 /**
@@ -191,6 +193,66 @@ public class TeamHelpers {
     }
 
     /**
+     * 加锁执行 config.json 的**读-改-写**临界区 · 照抄本仓 teammate inbox 已有的锁做法
+     * （{@code TeammateMailbox.writeToMailbox} → {@code TaskLock.withFileLockAndReturn}，
+     * 锁文件 = 目标文件同名 {@code .lock} 兄弟文件）。
+     *
+     * <p><b>[team-disband-race] 为什么必须有锁（file:line 判据）</b>：{@link #setMemberActive} /
+     * {@link #setMemberMode} / {@link #appendTeamMember} 等都是
+     * {@code readConfigNode → 改内存 JsonNode → writeConfig(root.toString())} 的读-改-写。
+     * 写回的是**整份 root 快照**，而写者是多条**并发线程**（每个 teammate 一个 {@code
+     * AutonomousAgentLoop} 线程：turn 开始置 true、轮末 idle 置 false；spawn 线程 append 成员）。
+     * 无锁时两个成员各自的 false 都基于同一份旧快照回写 ⇒ 后写者把先写者的字段**整个覆盖回 true**
+     * （lost update），该成员永远无法变 idle。
+     *
+     * <p><b>粒度选择：文件级（锁整个 config.json）而非成员级</b> —— 因为写回单位是**整份
+     * root**（{@code root.toString()}），成员级锁无法阻止「另一个成员基于旧快照回写整份文档」
+     * 覆盖掉本次更新；而 {@code members} 数组的增删（appendTeamMember / removeMember*）本身
+     * 就是文档级操作。故粒度必须覆盖「读-改-写整份文档」这一临界区，与 inbox 锁同为文件级
+     * （{@code {config.json}.lock}）。
+     *
+     * <p><b>两个必须遵守的约束</b>：
+     * <ul>
+     *   <li>⛔ {@link #writeConfig} 自身**不得**再取本锁（同 JVM 重复锁定同一文件会抛
+     *       {@link java.nio.channels.OverlappingFileLockException} → 重试耗尽）——故锁一律加在
+     *       调用方的临界区外层，writeConfig 保持无锁。</li>
+     *   <li>⛔ config.json **不存在时不得取锁**：{@code TaskLock.ensureFileLockFile} 会
+     *       {@code createDirectories} 锁文件父目录，会给「不存在的 team」凭空创建出空壳目录
+     *       （与 {@code TeammateMailbox.ensureInboxDir} 残留同因）。故先判存在，不存在直接放行
+     *       （调用方各自走原本的「team 不存在」早退路径）。</li>
+     * </ul>
+     *
+     * <p>锁获取失败（重试耗尽）→ log.warn 并**放弃本次更新**（不抛，与本类「读失败返回 null
+     * 不抛」的容错风格、以及 inbox 锁失败 logError 不抛的先例一致）；⛔ 不静默宣称已更新 ——
+     * 调用方拿到的 {@code onLockFailure} 即「本次未落盘」的语义值（boolean 方法传 false）。
+     *
+     * @param onLockFailure 取锁失败时返回给调用方的值（boolean 方法传 {@code false}，void 用传 null）
+     *
+     * <p><b>已知残留（未修，无实测证据）</b>：不持锁的**读者**（{@code TeamDeleteTool
+     * .activeNonLeadMembers} / {@code TeamStatusPublisher} / {@code TeamDiscovery}）与本方法的
+     * {@link #writeConfig}（truncate 直写）之间仍有「读到半截 JSON」的窗口 —— 读侧不取锁时
+     * {@code readConfigNode} 会返回 null 被当作「team 不存在」。本批实测日志中
+     * 「解析 config.json 失败」命中 **0 次**，故未引入原子替换（同目录 temp + ATOMIC_MOVE）；
+     * 该改动在 Windows 上会让「目标被读者短暂打开」时 move 失败，属**新增**失败模式，需先有
+     * 证据再上。
+     */
+    private <T> T withConfigLock(String teamName, T onLockFailure, Supplier<T> action) {
+        Path config = configPath(teamName);
+        if (!Files.exists(config)) {
+            // 不取锁（避免 createDirectories 造出无 config 的空壳 team 目录）
+            return action.get();
+        }
+        try {
+            return TaskLock.withFileLockAndReturn(config, action);
+        } catch (Exception e) {
+            // 锁获取失败（LockAcquisitionException）/ 临界区内未受检异常 → 本次更新未落盘，显式暴露
+            log.warn("[TeamHelpers] config.json 加锁失败（本次更新放弃，可能丢失本成员的变更）team={}: {}",
+                    teamName, e.toString());
+            return onLockFailure;
+        }
+    }
+
+    /**
      * 删除 team 目录（递归）· 对齐 CC cleanupTeamDirectories：含 config.json + inboxes/。
      *
      * <p>[P0-7 · D6] 删除经 {@link #deleteRecursivelyQuietly} —— 原实现内层 lambda 抛
@@ -293,36 +355,38 @@ public class TeamHelpers {
         if (teamName == null || agentId == null) {
             return false;
         }
-        boolean removed = false;
-        // 1) config.json members 数组移除（对齐 CC teamHelpers.ts:326-345）
-        String config = readConfig(teamName);
-        if (config != null) {
-            try {
-                JsonNode root = new ObjectMapper().readTree(config);
-                if (root != null && root.isObject() && root.has("members") && root.get("members").isArray()) {
-                    ObjectNode obj = (ObjectNode) root;
-                    ArrayNode members = (ArrayNode) obj.get("members");
-                    for (int i = members.size() - 1; i >= 0; i--) {
-                        JsonNode m = members.get(i);
-                        if (m != null && m.isObject() && agentId.equals(m.path("agentId").asText())) {
-                            members.remove(i);
-                            removed = true;
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            boolean removed = false;
+            // 1) config.json members 数组移除（对齐 CC teamHelpers.ts:326-345）
+            String config = readConfig(teamName);
+            if (config != null) {
+                try {
+                    JsonNode root = new ObjectMapper().readTree(config);
+                    if (root != null && root.isObject() && root.has("members") && root.get("members").isArray()) {
+                        ObjectNode obj = (ObjectNode) root;
+                        ArrayNode members = (ArrayNode) obj.get("members");
+                        for (int i = members.size() - 1; i >= 0; i--) {
+                            JsonNode m = members.get(i);
+                            if (m != null && m.isObject() && agentId.equals(m.path("agentId").asText())) {
+                                members.remove(i);
+                                removed = true;
+                            }
+                        }
+                        if (removed) {
+                            writeConfig(teamName, new ObjectMapper().writeValueAsString(obj));
+                            if (log.isInfoEnabled()) {
+                                log.info("[TeamHelpers] 已从 team={} 移除成员 agentId={}", teamName, agentId);
+                            }
                         }
                     }
-                    if (removed) {
-                        writeConfig(teamName, new ObjectMapper().writeValueAsString(obj));
-                        if (log.isInfoEnabled()) {
-                            log.info("[TeamHelpers] 已从 team={} 移除成员 agentId={}", teamName, agentId);
-                        }
-                    }
+                } catch (Exception e) {
+                    // 非 JSON 配置/解析失败不处理（不抛，对齐 CC readTeamFile ENOENT→null 容错）
+                    log.warn("[TeamHelpers] removeMemberByAgentId 解析 config.json 失败 team={}: {}",
+                        teamName, e.getMessage());
                 }
-            } catch (Exception e) {
-                // 非 JSON 配置/解析失败不处理（不抛，对齐 CC readTeamFile ENOENT→null 容错）
-                log.warn("[TeamHelpers] removeMemberByAgentId 解析 config.json 失败 team={}: {}",
-                    teamName, e.getMessage());
             }
-        }
-        return removed;
+            return removed;
+        });
     }
 
     /** 验证 team name (合法字符: a-zA-Z0-9_-). */
@@ -376,38 +440,40 @@ public class TeamHelpers {
             }
             return false;
         }
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null || !root.has("members") || !root.get("members").isArray()) {
-            if (log.isDebugEnabled()) {
-                log.debug("[TeamHelpers] removeTeammateFromTeamFile 读 team 文件失败或无 members: {}", teamName);
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null || !root.has("members") || !root.get("members").isArray()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[TeamHelpers] removeTeammateFromTeamFile 读 team 文件失败或无 members: {}", teamName);
+                }
+                return false;
             }
-            return false;
-        }
-        ArrayNode members = (ArrayNode) root.get("members");
-        int originalLength = members.size();
-        ArrayNode kept = new ObjectMapper().createArrayNode();
-        for (JsonNode m : members) {
-            if (m == null || !m.isObject()) {
-                kept.add(m);
-                continue;
+            ArrayNode members = (ArrayNode) root.get("members");
+            int originalLength = members.size();
+            ArrayNode kept = new ObjectMapper().createArrayNode();
+            for (JsonNode m : members) {
+                if (m == null || !m.isObject()) {
+                    kept.add(m);
+                    continue;
+                }
+                boolean drop = (agentId != null && !agentId.isBlank()
+                        && agentId.equals(m.path("agentId").asText()))
+                    || (name != null && !name.isBlank() && name.equals(m.path("name").asText()));
+                if (!drop) {
+                    kept.add(m);
+                }
             }
-            boolean drop = (agentId != null && !agentId.isBlank()
-                    && agentId.equals(m.path("agentId").asText()))
-                || (name != null && !name.isBlank() && name.equals(m.path("name").asText()));
-            if (!drop) {
-                kept.add(m);
+            if (kept.size() == originalLength) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[TeamHelpers] 成员 {} 不在 team {} 中, 返回 false", identifier, teamName);
+                }
+                return false;
             }
-        }
-        if (kept.size() == originalLength) {
-            if (log.isDebugEnabled()) {
-                log.debug("[TeamHelpers] 成员 {} 不在 team {} 中, 返回 false", identifier, teamName);
-            }
-            return false;
-        }
-        root.set("members", kept);
-        writeConfig(teamName, root.toString());
-        log.info("[TeamHelpers] 已从 team={} 移除成员 identifier={}", teamName, identifier);
-        return true;
+            root.set("members", kept);
+            writeConfig(teamName, root.toString());
+            log.info("[TeamHelpers] 已从 team={} 移除成员 identifier={}", teamName, identifier);
+            return true;
+        });
     }
 
     /**
@@ -421,35 +487,37 @@ public class TeamHelpers {
      * @return true 实际移除；false team/member 不存在
      */
     public boolean removeMemberFromTeam(String teamName, String tmuxPaneId) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null || !root.has("members") || !root.get("members").isArray()) {
-            return false;
-        }
-        ArrayNode members = (ArrayNode) root.get("members");
-        int memberIndex = -1;
-        for (int i = 0; i < members.size(); i++) {
-            JsonNode m = members.get(i);
-            if (m != null && m.isObject() && tmuxPaneId != null
-                    && tmuxPaneId.equals(m.path("tmuxPaneId").asText())) {
-                memberIndex = i;
-                break;
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null || !root.has("members") || !root.get("members").isArray()) {
+                return false;
             }
-        }
-        if (memberIndex == -1) {
-            return false;
-        }
-        members.remove(memberIndex);
-        if (root.has("hiddenPaneIds") && root.get("hiddenPaneIds").isArray()) {
-            ArrayNode hidden = (ArrayNode) root.get("hiddenPaneIds");
-            for (int i = hidden.size() - 1; i >= 0; i--) {
-                if (tmuxPaneId.equals(hidden.get(i).asText())) {
-                    hidden.remove(i);
+            ArrayNode members = (ArrayNode) root.get("members");
+            int memberIndex = -1;
+            for (int i = 0; i < members.size(); i++) {
+                JsonNode m = members.get(i);
+                if (m != null && m.isObject() && tmuxPaneId != null
+                        && tmuxPaneId.equals(m.path("tmuxPaneId").asText())) {
+                    memberIndex = i;
+                    break;
                 }
             }
-        }
-        writeConfig(teamName, root.toString());
-        log.info("[TeamHelpers] 已按 pane={} 从 team={} 移除成员", tmuxPaneId, teamName);
-        return true;
+            if (memberIndex == -1) {
+                return false;
+            }
+            members.remove(memberIndex);
+            if (root.has("hiddenPaneIds") && root.get("hiddenPaneIds").isArray()) {
+                ArrayNode hidden = (ArrayNode) root.get("hiddenPaneIds");
+                for (int i = hidden.size() - 1; i >= 0; i--) {
+                    if (tmuxPaneId.equals(hidden.get(i).asText())) {
+                        hidden.remove(i);
+                    }
+                }
+            }
+            writeConfig(teamName, root.toString());
+            log.info("[TeamHelpers] 已按 pane={} 从 team={} 移除成员", tmuxPaneId, teamName);
+            return true;
+        });
     }
 
     /**
@@ -461,37 +529,39 @@ public class TeamHelpers {
      * @return true 已设置（含无需变更）；false team/member 不存在
      */
     public boolean setMemberMode(String teamName, String memberName, String mode) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null || !root.has("members") || !root.get("members").isArray()) {
-            return false;
-        }
-        ArrayNode members = (ArrayNode) root.get("members");
-        JsonNode member = null;
-        for (JsonNode m : members) {
-            if (m != null && m.isObject() && memberName != null && memberName.equals(m.path("name").asText())) {
-                member = m;
-                break;
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null || !root.has("members") || !root.get("members").isArray()) {
+                return false;
             }
-        }
-        if (member == null) {
-            log.warn("[TeamHelpers] 设置成员 mode 失败: 成员 {} 不在 team {}", memberName, teamName);
-            return false;
-        }
-        if (mode != null && mode.equals(member.path("mode").asText(null))) {
-            return true;
-        }
-        for (JsonNode m : members) {
-            if (m.isObject() && memberName.equals(m.path("name").asText())) {
-                if (mode == null) {
-                    ((ObjectNode) m).remove("mode");
-                } else {
-                    ((ObjectNode) m).put("mode", mode);
+            ArrayNode members = (ArrayNode) root.get("members");
+            JsonNode member = null;
+            for (JsonNode m : members) {
+                if (m != null && m.isObject() && memberName != null && memberName.equals(m.path("name").asText())) {
+                    member = m;
+                    break;
                 }
             }
-        }
-        writeConfig(teamName, root.toString());
-        log.info("[TeamHelpers] 已设置成员 {} 的 mode 为 {} (team={})", memberName, mode, teamName);
-        return true;
+            if (member == null) {
+                log.warn("[TeamHelpers] 设置成员 mode 失败: 成员 {} 不在 team {}", memberName, teamName);
+                return false;
+            }
+            if (mode != null && mode.equals(member.path("mode").asText(null))) {
+                return true;
+            }
+            for (JsonNode m : members) {
+                if (m.isObject() && memberName.equals(m.path("name").asText())) {
+                    if (mode == null) {
+                        ((ObjectNode) m).remove("mode");
+                    } else {
+                        ((ObjectNode) m).put("mode", mode);
+                    }
+                }
+            }
+            writeConfig(teamName, root.toString());
+            log.info("[TeamHelpers] 已设置成员 {} 的 mode 为 {} (team={})", memberName, mode, teamName);
+            return true;
+        });
     }
 
     /** 批量 mode 更新条目 · 对齐 CC teamHelpers.ts:415 {@code {memberName, mode}}。 */
@@ -503,43 +573,45 @@ public class TeamHelpers {
      * <p>updateMap 查找 + anyChanged 才写回（避免无谓写）；返回 true（CC 恒 true，team 缺失 false）。
      */
     public boolean setMultipleMemberModes(String teamName, List<MemberModeUpdate> modeUpdates) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null || !root.has("members") || !root.get("members").isArray()) {
-            return false;
-        }
-        ArrayNode members = (ArrayNode) root.get("members");
-        java.util.Map<String, String> updateMap = new java.util.HashMap<>();
-        if (modeUpdates != null) {
-            for (MemberModeUpdate u : modeUpdates) {
-                if (u != null && u.memberName() != null) {
-                    updateMap.put(u.memberName(), u.mode());
-                }
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null || !root.has("members") || !root.get("members").isArray()) {
+                return false;
             }
-        }
-        boolean anyChanged = false;
-        for (JsonNode m : members) {
-            if (!m.isObject()) {
-                continue;
-            }
-            String name = m.path("name").asText();
-            if (updateMap.containsKey(name)) {
-                String newMode = updateMap.get(name);
-                String current = m.path("mode").asText(null);
-                if (!java.util.Objects.equals(current, newMode)) {
-                    if (newMode == null) {
-                        ((ObjectNode) m).remove("mode");
-                    } else {
-                        ((ObjectNode) m).put("mode", newMode);
+            ArrayNode members = (ArrayNode) root.get("members");
+            java.util.Map<String, String> updateMap = new java.util.HashMap<>();
+            if (modeUpdates != null) {
+                for (MemberModeUpdate u : modeUpdates) {
+                    if (u != null && u.memberName() != null) {
+                        updateMap.put(u.memberName(), u.mode());
                     }
-                    anyChanged = true;
                 }
             }
-        }
-        if (anyChanged) {
-            writeConfig(teamName, root.toString());
-            log.info("[TeamHelpers] 已批量设置 {} 个成员 mode (team={})", modeUpdates == null ? 0 : modeUpdates.size(), teamName);
-        }
-        return true;
+            boolean anyChanged = false;
+            for (JsonNode m : members) {
+                if (!m.isObject()) {
+                    continue;
+                }
+                String name = m.path("name").asText();
+                if (updateMap.containsKey(name)) {
+                    String newMode = updateMap.get(name);
+                    String current = m.path("mode").asText(null);
+                    if (!java.util.Objects.equals(current, newMode)) {
+                        if (newMode == null) {
+                            ((ObjectNode) m).remove("mode");
+                        } else {
+                            ((ObjectNode) m).put("mode", newMode);
+                        }
+                        anyChanged = true;
+                    }
+                }
+            }
+            if (anyChanged) {
+                writeConfig(teamName, root.toString());
+                log.info("[TeamHelpers] 已批量设置 {} 个成员 mode (team={})", modeUpdates == null ? 0 : modeUpdates.size(), teamName);
+            }
+            return true;
+        });
     }
 
     /**
@@ -557,41 +629,43 @@ public class TeamHelpers {
      * @return true 追加成功；team 不存在 / 无 members 数组 → false（不抛）
      */
     public boolean appendTeamMember(String teamName, TeamMemberRef member) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null || !root.has("members") || !root.get("members").isArray()) {
-            log.warn("[TeamHelpers] appendTeamMember 失败: team={} 不存在或无 members 数组", teamName);
-            return false;
-        }
-        ArrayNode members = (ArrayNode) root.get("members");
-        ObjectNode m = members.addObject();
-        m.put("agentId", member.agentId());
-        m.put("name", member.name());
-        if (member.agentType() != null) {
-            m.put("agentType", member.agentType());
-        }
-        if (member.model() != null) {
-            m.put("model", member.model());
-        }
-        if (member.prompt() != null) {
-            m.put("prompt", member.prompt());
-        }
-        if (member.color() != null) {
-            m.put("color", member.color());
-        }
-        m.put("planModeRequired", member.planModeRequired());
-        m.put("joinedAt", System.currentTimeMillis());
-        m.put("tmuxPaneId", member.tmuxPaneId() != null ? member.tmuxPaneId() : "");
-        if (member.cwd() != null) {
-            m.put("cwd", member.cwd());
-        }
-        m.putArray("subscriptions");
-        if (member.backendType() != null) {
-            m.put("backendType", member.backendType());
-        }
-        writeConfig(teamName, root.toString());
-        log.info("[TeamHelpers] 已追加成员 agentId={} name={} 到 team={} members（CC spawnMultiAgent.ts:495-509）",
-            member.agentId(), member.name(), teamName);
-        return true;
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null || !root.has("members") || !root.get("members").isArray()) {
+                log.warn("[TeamHelpers] appendTeamMember 失败: team={} 不存在或无 members 数组", teamName);
+                return false;
+            }
+            ArrayNode members = (ArrayNode) root.get("members");
+            ObjectNode m = members.addObject();
+            m.put("agentId", member.agentId());
+            m.put("name", member.name());
+            if (member.agentType() != null) {
+                m.put("agentType", member.agentType());
+            }
+            if (member.model() != null) {
+                m.put("model", member.model());
+            }
+            if (member.prompt() != null) {
+                m.put("prompt", member.prompt());
+            }
+            if (member.color() != null) {
+                m.put("color", member.color());
+            }
+            m.put("planModeRequired", member.planModeRequired());
+            m.put("joinedAt", System.currentTimeMillis());
+            m.put("tmuxPaneId", member.tmuxPaneId() != null ? member.tmuxPaneId() : "");
+            if (member.cwd() != null) {
+                m.put("cwd", member.cwd());
+            }
+            m.putArray("subscriptions");
+            if (member.backendType() != null) {
+                m.put("backendType", member.backendType());
+            }
+            writeConfig(teamName, root.toString());
+            log.info("[TeamHelpers] 已追加成员 agentId={} name={} 到 team={} members（CC spawnMultiAgent.ts:495-509）",
+                member.agentId(), member.name(), teamName);
+            return true;
+        });
     }
 
     /**
@@ -707,34 +781,47 @@ public class TeamHelpers {
      * 设置成员 active 状态 · 对齐 CC teamHelpers.ts:454-485 setMemberActive。
      *
      * <p>member 缺失 / team 缺失 → 返回（不写）；isActive 未变 → 返回；否则写回。
+     *
+     * <p><b>[team-disband-race] 整个读-改-写进 config.json 文件锁</b>：本方法是**并发热点**——
+     * 每个 teammate 的 {@code AutonomousAgentLoop} 线程在 turn 开始置 {@code true}、轮末 idle 置
+     * {@code false}（AutonomousAgentLoop.java:559 / :1010），多成员下多个线程同时读同一份快照回写
+     * 整份 root。无锁时后写者覆盖先写者 ⇒ 某成员的 {@code isActive=false} 永久丢失 ⇒
+     * TeamDelete 的活跃守卫/轮询永远拿不到「全部 inactive」。CC 同函数（teamHelpers.ts:454-485）
+     * 亦无锁（readTeamFileAsync → writeTeamFileAsync），但 CC 每个 teammate 是独立进程、写窗口
+     * 天然错开；Java 为**同 JVM 多线程共写**，竞态窗口被压到同毫秒级，故此处按本仓 inbox 锁先例
+     * 加锁（写侧对齐、机制超出 CC —— 属修真实竞态，非自创协议）。
      */
     public void setMemberActive(String teamName, String memberName, boolean isActive) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null || !root.has("members") || !root.get("members").isArray()) {
-            log.warn("[TeamHelpers] 设置成员 active 失败: team {} 不存在或无 members", teamName);
-            return;
-        }
-        ArrayNode members = (ArrayNode) root.get("members");
-        JsonNode member = null;
-        for (JsonNode m : members) {
-            if (m != null && m.isObject() && memberName != null && memberName.equals(m.path("name").asText())) {
-                member = m;
-                break;
+        withConfigLock(teamName, (Boolean) null, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null || !root.has("members") || !root.get("members").isArray()) {
+                log.warn("[TeamHelpers] 设置成员 active 失败: team {} 不存在或无 members", teamName);
+                return null;
             }
-        }
-        if (member == null) {
-            log.warn("[TeamHelpers] 设置成员 active 失败: 成员 {} 不在 team {}", memberName, teamName);
-            return;
-        }
-        Boolean current = member.path("isActive").isMissingNode()
-            || member.path("isActive").isNull() ? null : member.path("isActive").asBoolean();
-        if (current != null && current == isActive) {
-            return;
-        }
-        ((ObjectNode) member).put("isActive", isActive);
-        writeConfig(teamName, root.toString());
-        log.info("[TeamHelpers] 已设置成员 {} active={} (team={})", memberName, isActive, teamName);
+            ArrayNode members = (ArrayNode) root.get("members");
+            JsonNode member = null;
+            for (JsonNode m : members) {
+                if (m != null && m.isObject() && memberName != null && memberName.equals(m.path("name").asText())) {
+                    member = m;
+                    break;
+                }
+            }
+            if (member == null) {
+                log.warn("[TeamHelpers] 设置成员 active 失败: 成员 {} 不在 team {}", memberName, teamName);
+                return null;
+            }
+            Boolean current = member.path("isActive").isMissingNode()
+                || member.path("isActive").isNull() ? null : member.path("isActive").asBoolean();
+            if (current != null && current == isActive) {
+                return null;
+            }
+            ((ObjectNode) member).put("isActive", isActive);
+            writeConfig(teamName, root.toString());
+            log.info("[TeamHelpers] 已设置成员 {} active={} (team={})", memberName, isActive, teamName);
+            return null;
+        });
     }
+
 
     /**
      * 同步当前 teammate 的 mode 到 config.json · 对齐 CC teamHelpers.ts:397-407 syncTeammateMode。
@@ -761,25 +848,27 @@ public class TeamHelpers {
      * @return true pane 已入隐藏列表（已存在则不重复写，仍 true）；team 不存在 false
      */
     public boolean addHiddenPaneId(String teamName, String paneId) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null) {
-            return false;
-        }
-        ArrayNode hidden = root.has("hiddenPaneIds") && root.get("hiddenPaneIds").isArray()
-            ? (ArrayNode) root.get("hiddenPaneIds") : root.putArray("hiddenPaneIds");
-        boolean present = false;
-        for (JsonNode n : hidden) {
-            if (paneId != null && paneId.equals(n.asText())) {
-                present = true;
-                break;
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null) {
+                return false;
             }
-        }
-        if (!present) {
-            hidden.add(paneId);
-            writeConfig(teamName, root.toString());
-            log.info("[TeamHelpers] 已添加 {} 到 team {} hiddenPaneIds", paneId, teamName);
-        }
-        return true;
+            ArrayNode hidden = root.has("hiddenPaneIds") && root.get("hiddenPaneIds").isArray()
+                ? (ArrayNode) root.get("hiddenPaneIds") : root.putArray("hiddenPaneIds");
+            boolean present = false;
+            for (JsonNode n : hidden) {
+                if (paneId != null && paneId.equals(n.asText())) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                hidden.add(paneId);
+                writeConfig(teamName, root.toString());
+                log.info("[TeamHelpers] 已添加 {} 到 team {} hiddenPaneIds", paneId, teamName);
+            }
+            return true;
+        });
     }
 
     /**
@@ -788,23 +877,25 @@ public class TeamHelpers {
      * @return true pane 已从隐藏列表移除；team 不存在 false
      */
     public boolean removeHiddenPaneId(String teamName, String paneId) {
-        ObjectNode root = readConfigNode(teamName);
-        if (root == null) {
-            return false;
-        }
-        if (!root.has("hiddenPaneIds") || !root.get("hiddenPaneIds").isArray()) {
-            return true;
-        }
-        ArrayNode hidden = (ArrayNode) root.get("hiddenPaneIds");
-        for (int i = hidden.size() - 1; i >= 0; i--) {
-            if (paneId != null && paneId.equals(hidden.get(i).asText())) {
-                hidden.remove(i);
-                writeConfig(teamName, root.toString());
-                log.info("[TeamHelpers] 已从 team {} hiddenPaneIds 移除 {}", teamName, paneId);
-                break;
+        return withConfigLock(teamName, Boolean.FALSE, () -> {
+            ObjectNode root = readConfigNode(teamName);
+            if (root == null) {
+                return false;
             }
-        }
-        return true;
+            if (!root.has("hiddenPaneIds") || !root.get("hiddenPaneIds").isArray()) {
+                return true;
+            }
+            ArrayNode hidden = (ArrayNode) root.get("hiddenPaneIds");
+            for (int i = hidden.size() - 1; i >= 0; i--) {
+                if (paneId != null && paneId.equals(hidden.get(i).asText())) {
+                    hidden.remove(i);
+                    writeConfig(teamName, root.toString());
+                    log.info("[TeamHelpers] 已从 team {} hiddenPaneIds 移除 {}", teamName, paneId);
+                    break;
+                }
+            }
+            return true;
+        });
     }
 
     /**

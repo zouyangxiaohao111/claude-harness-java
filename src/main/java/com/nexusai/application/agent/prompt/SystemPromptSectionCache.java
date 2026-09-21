@@ -12,8 +12,13 @@ import java.util.Map;
  * （CC original: {@code systemPromptSectionCache: new Map()} 会话级 STATE 字段
  * (Open-ClaudeCode/src/bootstrap/state.ts:399)）。
  *
- * <p>每个 {@code AgentState} 持有一个本类实例（跨会话隔离），resolve 阶段按
- * section name 读写。对齐 CC {@code Map<string, string | null>}（state.ts:1641-1653）：
+ * <p><b>持有者 = 会话级 store（本类不再是 {@code AgentState} 的实例字段）</b>：
+ * 本类实例由 {@link SessionPromptCacheStore#sectionCache()} 持有（一个会话一份，跨 run 不销毁），
+ * {@code AgentState.systemPromptSectionCache()} 只是<b>转发</b>到该会话级实例
+ * ⇒ 同一会话的相邻 run 命中同一份 Map，段值跨 run 逐字节稳定（前缀缓存命中的前提）。
+ * 跨会话隔离由 store 的 sessionId 分区保证（⛔ 不是全局单例）。
+ *
+ * <p>resolve 阶段按 section name 读写。对齐 CC {@code Map<string, string | null>}（state.ts:1641-1653）：
  * <ul>
  *   <li>compute 返回 null 也要缓存（I-3），故内部用 {@link Collections#synchronizedMap}
  *       包装 {@link HashMap} —— {@link java.util.concurrent.ConcurrentHashMap} 拒绝 null
@@ -21,9 +26,9 @@ import java.util.Map;
  *   <li>resolve 并行 compute 多线程写同一 Map，synchronizedMap 保证并发安全。</li>
  * </ul>
  *
- * <p>local-only 约束：本类实例挂在 AgentState 且以 {@code @JsonIgnore} 标记
- * （同 budgetTracker 红线），绝不序列化到 outbound DTO / STOMP / WebSocket /
- * EventPublisher payload。
+ * <p>local-only 约束：本类实例经 {@code SessionPromptCacheStore} 挂在 AgentState 侧且以
+ * {@code @JsonIgnore} 标记（同 budgetTracker 红线），绝不序列化到 outbound DTO / STOMP /
+ * WebSocket / EventPublisher payload。
  */
 public class SystemPromptSectionCache {
 
@@ -74,14 +79,28 @@ public class SystemPromptSectionCache {
     }
 
     /**
+     * 已缓存段数（含值为 null 的条目）· <b>诊断/日志用</b>（数据流日志观测「会话级缓存是否在跨 run 复用」；
+     * CC 无对应 accessor，不承载任何行为语义）。
+     *
+     * @return 条目数
+     */
+    public int size() {
+        return cache.size();
+    }
+
+    /**
      * 清空全部缓存 · 对齐 CC {@code clearSystemPromptSectionState()}
      * （CC original: {@code STATE.systemPromptSectionCache.clear()} (state.ts:1652-1653)）。
      *
-     * <p>失效接线点直调本方法：CommandController（/clear）、PostCompactCleanup
-     * （/compact）与 ToolRegistrationConfig（工具注册失效）；本类只建能力。
+     * <p><b>失效调用面（步骤 4 起已改准 —— 原注释称三个调用点「直调本方法」，那已不是事实）</b>：
+     * 各失效点（{@code /clear} / {@code /compact} / worktree 进出 / 工具注册）一律经<b>会话级 store 的
+     * 集合语义入口</b> {@link SessionPromptCacheStore#clearGroups(java.util.Set, String)}
+     * （集合成员见 {@link PromptCacheGroup}）→ 本方法；⛔ <b>不再</b>由调用点直调 ——
+     * 直调会绕过「清哪几个集合」的定义与逐集合日志。本类只建能力（{@code SystemPromptSectionStore}
+     * 与 {@link SessionPromptCacheStore#close()} 亦会调用，后者是回收路径而非失效路径）。
      */
     public void clear() {
         cache.clear();
-        log.info("[SystemPromptSectionCache] 会话级 system prompt section 缓存已清空（对应 CC clearSystemPromptSectionState，/clear 与 /compact 后重新求值）");
+        log.info("[SystemPromptSectionCache] 会话级 system prompt section 缓存已清空（集合A；对应 CC clearSystemPromptSectionState，caches 各失效点后重新求值）");
     }
 }

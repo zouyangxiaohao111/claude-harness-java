@@ -129,7 +129,7 @@ class SystemPromptAssemblerTest {
     // ── I-12 13 条目注册清单 ──
 
     @Test
-    @DisplayName("I-12：buildDynamicSections 默认注册 10 条 = 9 无条件 + 1 DANGEROUS_uncached（mcp_instructions）；token_budget 门控关时恒不注册")
+    @DisplayName("I-12：buildDynamicSections 默认注册 10 条且全部可缓存（无 DANGEROUS_uncached）；token_budget 门控关时恒不注册")
     void dynamicRegistration_thirteenEntries() {
         List<SystemPromptSection> sections = SystemPromptSections.buildDynamicSections(input(null));
 
@@ -147,10 +147,9 @@ class SystemPromptAssemblerTest {
                 "frc",
                 "summarize_tool_results"
             );
-        assertThat(sections).as("仅 mcp_instructions 为 DANGEROUS_uncached（cacheBreak=true，:511-516）")
+        assertThat(sections).as("10 条全部 cacheBreak=false（对齐 CC 2.1.278：cacheBreak:true 计数 0）")
             .filteredOn(SystemPromptSection::cacheBreak)
-            .extracting(SystemPromptSection::name)
-            .containsExactly("mcp_instructions");
+            .isEmpty();
         assertThat(sections).as("3 feature-gated（numeric_length_anchors/token_budget/brief）门控关时不注册")
             .extracting(SystemPromptSection::name)
             .doesNotContain("numeric_length_anchors", "token_budget", "brief");
@@ -221,5 +220,80 @@ class SystemPromptAssemblerTest {
         int summarizeIdx = prompt.elements().indexOf("When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.");
         assertThat(boundaryIdx).as("boundary 存在").isNotNegative();
         assertThat(summarizeIdx).as("summarize_tool_results（registry 末条）在 boundary 之后").isGreaterThan(boundaryIdx);
+    }
+
+    @Test
+    @DisplayName("不变量（2.1.278 口径）：动态 section 里 cacheBreak=true 恰好 0 条（全份提示无可破前缀缓存段）")
+    void dynamicSections_noCacheBreakSection() {
+        // WHY：cacheBreak=true 的段每轮重算并覆盖缓存 ⇒ 毁掉其后<b>全部</b>前缀的命中。
+        //   CC 2.1.278 实测 cacheBreak:!0 / cacheBreak:true 均 0 处（2.1.88 时代的那 1 处
+        //   mcp_instructions 已被上游删除，MCP 指令改走 delta 尾部附件）⇒ 本仓对齐为 0 处。
+        //   本用例把这条不变量钉在<b>注册表实际产物</b>上：一旦有人新增易失段，本用例立刻变红。
+        List<SystemPromptSection> sections = SystemPromptSections.buildDynamicSections(tokenBudgetInput());
+
+        List<SystemPromptSection> volatileSections = sections.stream()
+            .filter(SystemPromptSection::cacheBreak)
+            .toList();
+
+        assertThat(volatileSections)
+            .as("动态 section 里 cacheBreak=true 恰好 0 条（对齐 CC 2.1.278）")
+            .isEmpty();
+        assertThat(SystemPromptCacheBreakWhitelist.size())
+            .as("重算白名单同为 0 条（守「破坏缓存必须显式 + 需理由」的纪律，机制保留）")
+            .isZero();
+    }
+
+    // ── 真入口可达性：mcp_instructions 经 SystemPromptAssembler 走会话级缓存命中路径 ──
+
+    @Test
+    @DisplayName("真入口可达性：同会话第二次 assemble（MCP 指令已变）仍产出首值 ⇒ mcp_instructions 确实走会话级缓存命中")
+    void mcpInstructions_secondAssembleHitsSessionCache() {
+        // WHY：本批把 mcp_instructions 从 cacheBreak=true 改为可缓存段，「会话级冻结」只有在
+        //   SystemPromptAssembler 真的把会话级 SystemPromptSectionCache 透传给 registry.resolveAll 时才成立。
+        //   本用例走**真入口** SystemPromptAssembler.assemble（生产路径 = LlmAgentLoop.collectRunMaterial
+        //   :4902-4916 构造同一个 assembler），用同一 cache 组装两次、第二次换掉 MCP 指令
+        //   ⇒ 断言第二次仍拿到首值：若接线断了（例如每次 new 一个空 cache），第二次必然拿到新值 → 红。
+        SystemPromptSectionCache sessionCache = new SystemPromptSectionCache();
+        SystemPromptAssembler assembler = new SystemPromptAssembler(sessionCache);
+
+        SystemPrompt first = assembler.assemble(mcpInput("github", "首轮指令（会话首值）"));
+        String firstMcp = elementStartingWith(first, "# MCP Server Instructions\n");
+        SystemPrompt second = assembler.assemble(mcpInput("github", "会话中途换过的指令"));
+        String secondMcp = elementStartingWith(second, "# MCP Server Instructions\n");
+
+        assertThat(firstMcp).as("首轮 assemble 必须产出 MCP 段（否则本用例无意义）")
+            .isNotNull()
+            .contains("首轮指令（会话首值）");
+        assertThat(secondMcp)
+            .as("第二次 assemble 换掉了 MCP 指令却仍返回首值 ⇒ mcp_instructions 走会话级缓存命中"
+                + "（要 /clear 或 /compact 才刷新 —— 已登记分歧）")
+            .isEqualTo(firstMcp)
+            .doesNotContain("会话中途换过的指令");
+        assertThat(sessionCache.has("mcp_instructions"))
+            .as("会话级分段缓存里确有该段（生产同一 cache 实例来自 SessionPromptCacheStore#sectionCache）")
+            .isTrue();
+    }
+
+    /** 含单个 MCP 客户端的组装输入（其余字段同 {@link #input}）。 */
+    private static SystemPromptAssemblyInput mcpInput(String serverName, String instructions) {
+        return new SystemPromptAssemblyInput(
+            Set.of("Read", "Edit"),
+            "claude-sonnet-4-6",
+            List.of(),
+            List.of(new SystemPromptAssemblyInput.McpClientInfo(serverName, instructions, true)),
+            null,
+            List.of(),
+            null,
+            null,
+            false
+        );
+    }
+
+    /** 取 elements 里以 prefix 开头的首个元素（无 → null）。 */
+    private static String elementStartingWith(SystemPrompt prompt, String prefix) {
+        return prompt.elements().stream()
+            .filter(e -> e != null && e.startsWith(prefix))
+            .findFirst()
+            .orElse(null);
     }
 }

@@ -78,12 +78,12 @@ class PostCompactCleanupCcContractTest {
         }
         REGISTERED_HOOKS.clear();
         // 复位静态宿主，避免跨用例/跨测试类污染
-        new PostCompactCleanup(null, null, null);
+        new PostCompactCleanup(null, null);
     }
 
     /** 注入全部 spy 协作器（main-thread 操作可观察）。 */
     private static void wireSpies() {
-        new PostCompactCleanup(ENABLED_COLLAPSE, new SessionAgentStateRegistry(), CLAUDEMD_SPY);
+        new PostCompactCleanup(ENABLED_COLLAPSE, CLAUDEMD_SPY);
     }
 
     /** 注册 cache-clear 观察钩子并跟踪（@AfterEach 注销）。 */

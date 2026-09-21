@@ -416,6 +416,12 @@ public final class PostCompactAttachmentRestorer {
      * <p>Java 实现：以 synthetic Read tool + input {file_path: path} 查 read-deny content rule
      * （RuleQuery.getDenyRuleByContentsForTool，与 ReadPermissionChecker step3 deny 同源）。
      *
+     * <p><b>[步骤 7 · 投递层] 可见性放宽为 public</b>：CC 的 {@code isFileReadDenied} 是
+     * {@code attachments.ts} 内<b>同一条</b>被多处消费的工具函数（{@code getChangedFiles} :2083 /
+     * 附件恢复 :3041 等）。本步骤新增的变更文件检测器（{@code ChangedFilesDetector}）是那组消费点
+     * 的第二处 ⇒ 放宽可见性以便<b>复用同一实现</b>，⛔ 而不是各写一份 deny 判定（两份真相必漂移）。
+     * 实现体与本类调用点零变化。
+     *
      * @param path    待恢复文件路径
      * @param permCtx 权限上下文（null → false 不 deny）
      * @param cwd     [P19] read 桶路径规则的 root-relative 匹配基准（会话工作目录，调用方持
@@ -423,7 +429,7 @@ public final class PostCompactAttachmentRestorer {
      *                {@code toolPermissionContext}/{@code getCwd()}，Java 需显式传）
      * @return true = 文件读被 deny，恢复应跳过
      */
-    static boolean isFileReadDenied(String path, ToolPermissionContext permCtx, String cwd) {
+    public static boolean isFileReadDenied(String path, ToolPermissionContext permCtx, String cwd) {
         if (permCtx == null || path == null) {
             return false;
         }

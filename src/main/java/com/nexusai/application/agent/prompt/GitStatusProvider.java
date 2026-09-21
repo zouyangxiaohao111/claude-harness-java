@@ -179,6 +179,29 @@ public class GitStatusProvider {
     }
 
     /**
+     * 清本 provider 的会话级 gitStatus 快照 · 对齐 CC {@code getGitStatus.cache.clear?.()}
+     * （CC original: {@code getGitStatus.cache.clear?.()} (Open-ClaudeCode/src/commands/clear/caches.ts:54)）。
+     *
+     * <p><b>⚠ 单独清它<u>不会</u>让头部立刻变（CC 的真实不对称，勿「顺手」合并成一次双清）</b>：
+     * CC 的 {@code getGitStatus} 只被 {@code getSystemContext} 消费（context.ts:128），而
+     * {@code getSystemContext} 自身是 memoize ⇒ 只清本缓存时，下一次 {@code getSystemContext()}
+     * 仍返回<b>旧的整块 map</b>（里面嵌着旧 gitStatus）。必须<b>先清集合 C</b>（systemContext 冻结值）
+     * 才会重算并重读到本处的新值 —— CC {@code caches.ts:53-54} 正是「C 与 D-1 相邻两行一起清」。
+     * ⇒ 集合划分与调用点由 {@link PromptCacheGroup} 单点承载，本方法只提供能力。
+     *
+     * <p>并发的等价性：与 {@link #getGitStatus()} 用同一把监视器，清空不会与计算交错
+     * （清后下一次调用重新计算，对齐 CC {@code memoize.cache.delete} 的语义）。
+     */
+    public void clearCache() {
+        synchronized (this) {
+            cachedGitStatus = null;
+            gitStatusComputed = false;
+        }
+        log.info("[GitStatusProvider] 会话级 gitStatus 快照已清空（对齐 CC getGitStatus.cache.clear，caches.ts:54；"
+            + "⚠ 需同时清集合C systemContext 才会重读本值，CC caches.ts:53-54 相邻两行）");
+    }
+
+    /**
      * 是否在 git 仓库中 · 对齐 CC {@code findGitRoot(cwd) !== null}
      * （CC original: {@code getIsGit} (git.ts:218-229) → {@code findGitRoot}
      * (git.ts:27-86，沿 cwd 上溯找 .git 目录/文件)）。

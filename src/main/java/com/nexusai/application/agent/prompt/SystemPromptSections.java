@@ -16,11 +16,18 @@ import java.util.concurrent.CompletableFuture;
 /**
  * SystemPromptSection 双工厂 · 对齐 CC constants/systemPromptSections.ts 的两个工厂函数。
  *
- * <p>CC original 全量（utils/systemPromptSections.ts）：
+ * <p>CC original 全量（constants/systemPromptSections.ts:20-38）：
  * <ul>
  *   <li>{@code systemPromptSection(name, compute)} —— 可缓存（cacheBreak=false）</li>
- *   <li>{@code DANGEROUS_uncachedSystemPromptSection(name, compute, _reason)} —— 易失（cacheBreak=true），reason 忽略</li>
+ *   <li>{@code DANGEROUS_uncachedSystemPromptSection(name, compute, _reason)} —— 易失
+ *       （cacheBreak=true，只写不读）；{@code _reason} 是<b>必填形参</b>，CC 实现体忽略其值，
+ *       Java 侧把「必填」落到运行期（空白 ⇒ fail loud）并额外要求段名在
+ *       {@link SystemPromptCacheBreakWhitelist} 白名单内（见该工厂 javadoc）</li>
  * </ul>
+ *
+ * <p><b>当前实际使用（2026-09-21 · 对齐 CC 2.1.278）</b>：白名单为空表 ⇒
+ * {@code dangerousUncachedSystemPromptSection} <b>无任何调用点</b>（工厂作为机制保留）；
+ * {@link #buildDynamicSections} 注册的 10 条动态段<b>全部</b>走可缓存工厂。
  */
 public final class SystemPromptSections {
 
@@ -122,21 +129,47 @@ public final class SystemPromptSections {
      * （CC original: {@code DANGEROUS_uncachedSystemPromptSection(name, compute, _reason): SystemPromptSection}
      * (constants/systemPromptSections.ts:32-38)）。
      *
-     * <p>结果 {@code cacheBreak=true}：每轮都重新计算，值变化时打破 prompt 缓存。
-     * {@code reason} 参数 CC 以 {@code _reason} 前缀标记为忽略，Java 同样忽略（仅文档语义）。
+     * <p>结果 {@code cacheBreak=true}：每轮都重新计算（<b>只写不读</b> —— 见
+     * {@link SystemPromptSectionRegistry#resolveAll} 的短路条件），值变化时打破 prompt 缓存。
      *
-     * @param name    唯一标识
+     * <p><b>reason 的 Java 侧语义（与原实现的注释相反，已按代码改准）</b>：CC 的实现体忽略
+     * {@code _reason} 的<b>值</b>，但它是<b>必填形参</b>（TS 签名级强制「必须显式标注理由」）。
+     * Java 侧把这条强制<b>落到运行期</b>：{@code reason} 为 null/空白 ⇒ 直接 fail loud。
+     * 值本身仍不进 {@link SystemPromptSection}（CC 的 record 也只有 name/compute/cacheBreak）。
+     *
+     * <p><b>重算白名单（Java 侧守卫 · 对齐 CC 2.1.278「全份提示 {@code cacheBreak:true} 计数 0」）</b>：
+     * 段名必须已在 {@link SystemPromptCacheBreakWhitelist} 登记（含理由），否则 fail loud。
+     * ⚠️ 该白名单<b>当前为空表（0 条）</b> ⇒ 本工厂当前对<b>任何</b>段名 fail loud；
+     * 工厂 + 白名单 + record 构造器的双点守卫作为机制保留（新增易失段仍须显式登记理由），
+     * ⛔ 不是「工厂已废弃可删」。
+     *
+     * @param name    唯一标识（必须在 {@link SystemPromptCacheBreakWhitelist} 内；
+     *                ⚠️ 该表当前为 0 条 ⇒ 眼下<b>任何</b>段名都会被拒）
      * @param compute 延迟求值回调（async）
-     * @param reason  忽略 —— CC original 原样吞掉（_reason），仅说明为何需要破缓存
+     * @param reason  重算理由（必填 · 非空白；值不落 {@link SystemPromptSection}）
      * @return 易失的 SystemPromptSection（cacheBreak=true）
+     * @throws IllegalArgumentException reason 为空白，或 name 不在重算白名单内（fail loud，
+     *                                  ⛔ 不允许「顺手加一个易失段」悄悄打掉前缀缓存）
      */
     public static SystemPromptSection dangerousUncachedSystemPromptSection(
         String name,
         SystemPromptSection.ComputeFn compute,
         String reason
     ) {
+        if (reason == null || reason.isBlank()) {
+            throw new IllegalArgumentException(
+                "cacheBreak=true 的 section 必须显式标注重算理由（CC DANGEROUS_uncachedSystemPromptSection 的 "
+                    + "_reason 为必填形参，systemPromptSections.ts:32-38）: name=" + name);
+        }
+        if (!SystemPromptCacheBreakWhitelist.isAllowed(name)) {
+            throw new IllegalArgumentException(
+                "cacheBreak=true 的段名不在重算白名单内（Java 侧守卫，对齐 CC 2.1.278「全份提示 cacheBreak=true 计数 0」"
+                    + "的不变量）: name=" + name + ", 已登记=" + SystemPromptCacheBreakWhitelist.allowedNames()
+                    + "；新增易失段必须先登记理由（SystemPromptCacheBreakWhitelist）");
+        }
         if (log.isDebugEnabled()) {
-            log.debug("[SystemPromptSections] 创建易失 section: name={}, cacheBreak=true（reason 忽略）", name);
+            log.debug("[SystemPromptSections] 创建易失 section: name={}, cacheBreak=true（每轮重算只写不读）"
+                    + " 传入理由={} 登记理由={}", name, reason, SystemPromptCacheBreakWhitelist.reasonFor(name));
         }
         return new SystemPromptSection(name, compute, true);
     }
@@ -145,17 +178,20 @@ public final class SystemPromptSections {
      * 14 条目动态 section 注册清单 · 对齐 CC getSystemPrompt 的 {@code dynamicSections} 数组
      * （prompts.ts:490-554）。
      *
-     * <p><b>I-12 不变量</b>：9 无条件 + 1 DANGEROUS_uncached（mcp_instructions）+ 1 feature-gated
+     * <p><b>I-12 不变量（2026-09-21 按 CC 2.1.278 口径改准 —— 原版为「+ 1 DANGEROUS_uncached」）</b>：
+     * <b>10 无条件全可缓存</b> + 1 feature-gated
      * （token_budget，由 {@link SystemPromptAssemblyInput#tokenBudgetEnabled()} 门控）+
      * 2 feature-gated（N/A，恒不注册）：
      * <pre>{@code
      * session_guidance / memory / ant_model_override / env_info_simple / language /
-     * output_style / scratchpad / frc / summarize_tool_results          ← 9 systemPromptSection
-     * mcp_instructions                                                  ← 1 DANGEROUS_uncached
+     * output_style / mcp_instructions / scratchpad / frc / summarize_tool_results
+     *                                                                   ← 10 systemPromptSection（全 cacheBreak=false）
      * token_budget (TOKEN_BUDGET feature)                               ← 1 feature-gated（tokenBudgetEnabled 门控）
      * numeric_length_anchors (USER_TYPE==='ant') / brief (KAIROS|KAIROS_BRIEF feature)
      *                                                                   ← 2 feature-gated 恒不注册
      * }</pre>
+     * ⇒ <b>{@code cacheBreak=true} 计 0</b>（对齐 2.1.278 实测 {@code cacheBreak:!0}=0 处）。
+     * 2.1.88 时代本条曾是「9 + 1 DANGEROUS_uncached（mcp_instructions）」，2.1.278 删掉了该段。
      *
      * <p><b>compute 全部本类实现</b>：env_info_simple 为惰性 supplier 闭包捕获 input
      * （本类实现全字段，对齐 CC computeSimpleEnvInfo prompts.ts:651-710，worktree 子弹 /
@@ -186,15 +222,39 @@ public final class SystemPromptSections {
         sections.add(systemPromptSection("ant_model_override", () -> CompletableFuture.completedFuture(null)));
         // 4. env_info_simple · CC original: computeSimpleEnvInfo(model, additionalWorkingDirectories) (prompts.ts:501-503)
         //    —— 本类实现全字段（对齐 CC computeSimpleEnvInfo prompts.ts:651-710）
+        //    ⚠️ [divergence-registered 2026-09-21] **放置分歧（有意登记，本批不改放置）**：
+        //      CC 2.1.278 行为轴实测 —— 动态环境块（cwd / Is a git repository / platform / shell / OS）**不在
+        //      system 数组里**，而是靠 `mid-conversation-system-2026-04-07` beta 作为 **role:"system" 的
+        //      mid-conversation 消息**放在 messages 里；system[2] 里那个 `# Environment` 只是**静态模型信息段**。
+        //      而本仓把它作为 **system 段**（本节）渲染 ⇒ **结构性分歧**。
+        //      本批（前缀缓存头部冻结）**只做字节冻结**（会话级 section 缓存 ⇒ 跨 run 字节稳定），
+        //      ⛔ **未做**「把 env 块迁到 messages 的 mid-conversation system 消息」这条放置迁移。
+        //      理由：本批目标是前缀字节稳定，放置迁移属**独立的架构对齐项**，混入会放大改动面与回归风险。
+        //      ⇒ 若后续要完全对齐，这是一个**已登记待做项**，不是遗漏。
+        //    [2.1.88 口径] 该段在 2.1.88 源码里确为 system 段（prompts.ts:501-503），故本仓形态**对 2.1.88 成立**。
         sections.add(systemPromptSection("env_info_simple", () -> envInfoSimpleCompute(input)));
         // 5. language · CC original: getLanguageSection(settings.language) (prompts.ts:504-506)
         sections.add(systemPromptSection("language", () -> languageCompute(input)));
         // 6. output_style · CC original: getOutputStyleSection(outputStyleConfig) (prompts.ts:507-509)
         sections.add(systemPromptSection("output_style", () -> outputStyleCompute(input)));
-        // 7. mcp_instructions · CC original: DANGEROUS_uncachedSystemPromptSection('mcp_instructions', ..., reason)
-        //    (prompts.ts:511-516) —— cacheBreak=true，MCP 连接/断开跨轮变化
-        sections.add(dangerousUncachedSystemPromptSection("mcp_instructions", () -> mcpInstructionsCompute(input),
-            "MCP servers connect/disconnect between turns"));
+        // 7. mcp_instructions · [C4-A2 · 2026-09-21 · 对齐 CC 2.1.278] cacheBreak=true → false（会话级冻结）
+        //    [2.1.88 口径（已作废 · 留作对照）] prompts.ts:511-516
+        //      DANGEROUS_uncachedSystemPromptSection('mcp_instructions', ..., 'MCP servers connect/disconnect between turns')
+        //    [2.1.278 口径（当前依据）] 实测 cacheBreak:!0/cacheBreak:true 均为 0 处，且独立段名
+        //      'mcp_instructions' 已不存在（11 次命中全是 mcp_instructions_delta 9 + pool_change 2）
+        //      ⇒ CC 改成走 **delta 尾部附件**投递 MCP 指令，不再有「每轮重算的 system 段」。
+        //    ⭐ 已知分歧（登记，A1 留作后续批次）：本仓**尚无 MCP 指令 delta 的「每轮投递」通道** ⇒
+        //      改为可缓存段后，**MCP 服务器在会话中途连接/断开，其指令不再即时进系统提示**，
+        //      要等 /clear 或 /compact 触发会话级分段缓存失效后才刷新。
+        //      ⚠️ 「尚无」的准确边界（grep 复核 2026-09-21，⛔ 别读成「delta 完全不存在」）：
+        //        已有 ① 渲染 case（AgentLoopContext:3830 `mcp_instructions_delta`）；
+        //        ② producer（PostCompactAttachmentRestorer.mcpInstructionsDeltaAttachment），
+        //           但只在**压缩后重宣布**路径被调用（appendPostCompactDeltaAttachments），且
+        //           gate `isMcpInstructionsDeltaEnabled()` 默认 false ⇒ 生产默认 no-op。
+        //        缺的是 CC attachments.ts:856 那样的**每轮调用**（`maybe('mcp_instructions_delta', ...)`
+        //        挂在每轮 attachments 流水线上）⇒ 那才是「MCP 中途变更即时可见」的来源。
+        //      （现状缓解：本机 MCP 默认 enabled=false、servers=0，中途连接属罕见路径。）
+        sections.add(systemPromptSection("mcp_instructions", () -> mcpInstructionsCompute(input)));
         // 8. scratchpad · CC original: getScratchpadInstructions() (prompts.ts:517-518 = :797-819)
         //    [SP-05] 恒 null → scratchpadCompute：input.scratchpadEnabled() 门控（resolver，null→false）
         sections.add(systemPromptSection("scratchpad", () -> scratchpadCompute(input)));
@@ -212,7 +272,8 @@ public final class SystemPromptSections {
                 CompletableFuture.completedFuture(TOKEN_BUDGET_SECTION)));
         }
         if (log.isDebugEnabled()) {
-            log.debug("[SystemPromptSections] buildDynamicSections 注册 {} 条（9 无条件 + 1 DANGEROUS_uncached mcp_instructions"
+            log.debug("[SystemPromptSections] buildDynamicSections 注册 {} 条（10 无条件全 cacheBreak=false"
+                    + "（含 mcp_instructions，对齐 CC 2.1.278 cacheBreak=true 计数 0）"
                     + "；token_budget 门控={}；numeric_length_anchors/brief 2 feature-gated N/A 恒不注册）",
                 sections.size(), input.tokenBudgetEnabled());
         }

@@ -341,6 +341,34 @@ public class SessionService {
         if (sessionGitStatusRegistry != null) {
             sessionGitStatusRegistry.evict(id);
         }
+        // [步骤 2 · 会话级 prompt 缓存 store] 会话删除 → 移除并<b>终结</b>该会话的 prompt 缓存 store
+        //   （终结 = 注销会话级 SystemPromptContextProvider 注册在 SystemPromptInjection 静态表上的
+        //   缓存清理回调 + 清分段缓存，见 SessionPromptCacheStore#close）。
+        //   对齐说明：CC 一进程一会话，会话结束即进程退出、内存随进程释放（STATE 里的分段缓存与
+        //   getSystemContext/getUserContext 的 memoize 一并消失）⇒ CC 无对应动作；本仓常驻 JVM
+        //   必须显式回收，与上面 SessionGitStatusRegistry.evict / SkillListingSentRegistry 同一口径。
+        //   ⛔ 不在 /clear、/compact、worktree 进/出接：那些事件只清缓存的<b>内容</b>、不销毁 store
+        //   （CC clearSystemPromptSections 清的是 Map，STATE 本身继续存活）。
+        //   best-effort：本注册表是 final + 私有构造的静态工具表（非 Spring bean，无实例可注入）
+        //   ⇒ 直呼静态方法，套 try/catch 保证异常不外溢、不阻塞删除主流程。
+        try {
+            com.nexusai.application.agent.prompt.SessionPromptCacheRegistry.evict(id);
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: SessionPromptCacheRegistry.evict 失败 session={}: {}",
+                id, e.toString());
+        }
+        // [步骤 7 修正 · 投递层跨 run] 会话删除 → 释放该会话的「记忆文件变更基线」表
+        //   （SessionChangedFilesBaselineRegistry：按 sessionId 分区的静态表，承载首次会话登记的
+        //    readFileState 基线，使「用户两条消息之间改 CLAUDE.md」可被投递、且同一变更只投一次）。
+        //   与上面 SessionPromptCacheRegistry.evict 同一口径：CC 一进程一会话、会话结束即进程退出，
+        //   本仓常驻 JVM 必须显式回收，否则随「会话数」无界累积。
+        //   best-effort：静态工具表（非 Spring bean）⇒ 直呼静态方法，套 try/catch 不外溢。
+        try {
+            com.nexusai.application.agent.attachment.SessionChangedFilesBaselineRegistry.evict(id);
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: SessionChangedFilesBaselineRegistry.evict 失败 session={}: {}",
+                id, e.toString());
+        }
         // [S1 轨 III · 会话键控残留] 会话删除 → 回收三处「按 sessionId 键控」的进程内表
         //   （均与上面 MicroCompactor.removeSessionState / SessionGitStatusRegistry.evict 同一口径：
         //    CC 一进程一会话，随进程退出释放；Java 常驻 JVM 必须显式回收，否则随「会话数」无界累积）。
