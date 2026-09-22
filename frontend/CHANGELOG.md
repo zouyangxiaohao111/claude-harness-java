@@ -2,6 +2,14 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.19] - 2026-09-22
+
+### 修复
+- 修复 MCP 服务器「全部断开」时未公告移除的 bug。
+
+### 新增
+- 会话内的变更提示（如日期变更、文件改动、MCP 指令变化）现在会随会话一并保存。
+
 ## [0.1.18] - 2026-09-21
 
 ### 修复

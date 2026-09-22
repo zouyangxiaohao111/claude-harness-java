@@ -92,22 +92,28 @@ class ChatServiceSkillListingPersistTest {
     }
 
     @Test
-    @DisplayName("守卫精度: 非 skill_listing 的 meta user / skill_listing 但 isMeta=false → 均不落库")
+    @DisplayName("守卫精度: skill_listing 但 isMeta=false / 非 attachment 的 meta user → 均不落库")
     void nonSkillListing_doNotPersist() {
         AgentState state = new AgentState("sys");
-        // isMeta=true 但 subtype 不符（sanity：不得误落）
-        ChatMessageDto otherMeta = new ChatMessageDto(
-            "other-1", SESSION, Role.user, "attachment", "other", null,
-            List.of(), null, null, null, "刚刚", OffsetDateTime.now(), null, null,
-            null, List.of(), List.of(), null, true, false, null, "invoked_skills");
-        // subtype 相符但 isMeta=false（非本通道）
+        // [C1 ③ · 2026-09-21 改准] 原夹具第一条是「author=attachment + isMeta=true + subtype=invoked_skills」
+        //   ⇒ 该形状在旧 4 出口世界不落库，但按 CC 2.1.278 的可记录性判据（黑名单默认放、拒绝集空集）
+        //   属**应落库**形状 → 由 ChatService.persistAppendedMessage 新增的
+        //   `author=attachment && isMeta` 通用出口落库（生产：invoked_skills 实际经
+        //   buildAttachmentMessage 产出 isMeta=false，那条仍不落库 —— 见第二条）。故此处换成真正
+        //   「不该落库」的形状：
+        // ① 形似但 isMeta=false（attachment 通道的真实 invoked_skills / deferred_tools_delta 形状）
         ChatMessageDto notMeta = new ChatMessageDto(
             "other-2", SESSION, Role.user, "attachment", "listing", null,
             List.of(), null, null, null, "刚刚", OffsetDateTime.now(), null, null,
             null, List.of(), List.of(), null, false, false, null, "skill_listing");
+        // ② meta user 但 author 不是 attachment（relevant_memories / nested_memory 的真实形状）
+        ChatMessageDto metaUser = new ChatMessageDto(
+            "other-1", SESSION, Role.user, "user", "memories", null,
+            List.of(), null, null, null, "刚刚", OffsetDateTime.now(), null, null,
+            null, List.of(), List.of(), null, true, false, null, "relevant_memories");
 
         service.armRealTimePersist(state, SESSION, STREAM_TOPIC, wsTemplate, "msg-user");
-        state.appendMessage(otherMeta);
+        state.appendMessage(metaUser);
         state.appendMessage(notMeta);
 
         verify(messageService, never()).appendMessage(any(ChatMessageDto.class), any(OffsetDateTime.class));

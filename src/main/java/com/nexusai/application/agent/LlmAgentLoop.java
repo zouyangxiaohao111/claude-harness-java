@@ -5911,9 +5911,12 @@ public class LlmAgentLoop implements AgentLoop {
             // ⛔ 回写头部同样被禁止：本调用只 append（头部字节不变）。
             // 门控：无（对齐 2.1.278 —— 2.1.88 的 isMcpInstructionsDeltaEnabled 已在发行产物中删除）
             //    ⇒ 每轮无条件评估；是否产出仍由「当前连接集 vs 已公告集合」的 diff 决定（内容未变 ⇒ 零追加）。
-            // ⚠️ 该消息**不落库**（ChatService.persistAppendedMessage 的 user 分支无 attachment 出口；
-            //    date_change / edited_text_file 两支兄弟同款）⇒ 只在本 run 内可见，跨 run 会在尾部
-            //    重公告一次 —— 事实与后果见 AgentLoopContext.maybeEmitMcpInstructionsDelta 的「落库事实」段。
+            // ✅ [C1 ③ · 2026-09-21 改准] 该消息**落库**（ChatService.persistAppendedMessage 的 user 分支
+            //    新增 attachment 通用出口：role=user && author=attachment && isMeta ⇒ appendMessage）——
+            //    date_change / edited_text_file 两支兄弟同款。故它随转录持久化：跨 run 的 diff 扫描源
+            //    （scanAnnouncedDeltaNames 读 state.rawMessages()，下一个 run 由 DB 重建）能找回它
+            //    ⇒ 「已公告集合」跨 run 也成立（内容未变 ⇒ 不再重公告）。判据与后果见
+            //    AgentLoopContext.maybeEmitMcpInstructionsDelta 的「落库事实」段。
             AgentLoopContext.maybeEmitMcpInstructionsDelta(
                 state, params.toolUseContext(), resolveTurnEffectiveModel(params, recoveryState));
 

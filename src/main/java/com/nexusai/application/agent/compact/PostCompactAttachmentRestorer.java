@@ -1587,14 +1587,23 @@ public final class PostCompactAttachmentRestorer {
      * clientSide chrome 指令（ToolSearch 乐观可用 + 模型支持 + ToolSearch 在池，且
      * nexusai-in-chrome 已连接时）对已 announce 集合的 diff。
      *
-     * @param tuc      工具使用上下文（mcpClients 数据源）
+     * <p><b>[A1 修 · 全部断开也必须公告]</b>：本方法<b>不得</b>按「{@code mcpClients} 为空」提前返回 ——
+     * 那会让「服务器全部断开」不产出任何 delta，而头部 {@code mcp_instructions} 段已被 C4=A2 改成
+     * <b>会话冻结</b>（压缩前的连接集与指令仍列在那里）⇒ 模型会以为那些指令仍有效、照旧去调已不存在的
+     * server 的工具。对齐 CC {@code getMcpInstructionsDelta}（mcpInstructionsDelta.ts:70-118）：
+     * 该函数<b>无</b>空连接早退，{@code connected} 为空时 {@code removed} = 全部已公告项。本方法同构：
+     * 「全部断开」时 {@code removedNames} = 全部已公告项；而「既无连接、又从未公告过任何东西」由下方
+     * 统一的「added/removed 均空 ⇒ null」收口（对齐 CC 的 {@code if (added.length === 0 &&
+     * removed.length === 0) return null}），⛔ 不产出无意义空 delta。
+     *
+     * @param tuc      工具使用上下文（mcpClients 数据源；null → null）
      * @param model    主循环模型名（clientSide chrome 条件）
      * @param messages 历史消息（diff 扫描源；全量压缩传 [] → 宣布全量）
-     * @return mcp_instructions_delta 附件；无 instructions / 内容未变 → null
+     * @return mcp_instructions_delta 附件；<b>既无连接又从未公告过任何东西</b> / 内容未变 → null
      */
     public static ChatMessageDto mcpInstructionsDeltaAttachment(
             ToolUseContext tuc, String model, List<ChatMessageDto> messages) {
-        if (tuc == null || tuc.mcpClients() == null || tuc.mcpClients().isEmpty()) {
+        if (tuc == null) {
             return null;
         }
         Set<String> announced = scanAnnouncedDeltaNames(messages, DELTA_TYPE_MCP_INSTRUCTIONS,
@@ -1602,7 +1611,11 @@ public final class PostCompactAttachmentRestorer {
         // blocks: serverName → 渲染块（mcpInstructionsDelta.ts:79-92，仅 instructions 非空 server）
         java.util.LinkedHashMap<String, String> blocks = new java.util.LinkedHashMap<>();
         Set<String> connectedNames = new HashSet<>();
-        for (java.util.Map.Entry<String, McpClientRuntime> e : tuc.mcpClients().entrySet()) {
+        // ⛔ [A1 修] 空/缺失 mcpClients 不再早退，按「无已连接 server」继续走 diff：
+        //   connectedNames 空 ⇒ removed = 全部已公告项（对齐 CC connected 为空的语义）。
+        java.util.Map<String, McpClientRuntime> clients =
+            tuc.mcpClients() == null ? java.util.Map.of() : tuc.mcpClients();
+        for (java.util.Map.Entry<String, McpClientRuntime> e : clients.entrySet()) {
             McpClientRuntime info = e.getValue();
             String name = info != null && info.serverName() != null ? info.serverName() : e.getKey();
             connectedNames.add(name);
@@ -1637,7 +1650,16 @@ public final class PostCompactAttachmentRestorer {
             }
         }
         if (addedNames.isEmpty() && removed.isEmpty()) {
+            // 既无连接、又从未公告过任何东西（announced 空 + connected 空 → blocks 空、removed 空）
+            // ⇒ 不产出（避免无意义空 delta；对齐 CC 的 added.length===0 && removed.length===0 → null）
             return null;
+        }
+        if (log.isDebugEnabled()) {
+            // 数据流：本方法无空连接早退 ⇒ connected 为空时 removed = 全部已公告项（对齐 CC
+            //   mcpInstructionsDelta.ts:100-104）。added 空 + removed 非空 = 「全部断开」形态。
+            log.debug("[PostCompactAttachmentRestorer] mcp_instructions delta: added={} removed={}"
+                + " connected={} announced={}（空连接不再早退，removed=全部已公告）",
+                addedNames, removed, connectedNames.size(), announced.size());
         }
         // CC 按 name 排序（mcpInstructionsDelta.ts:124 added.sort by name）
         java.util.List<Integer> order = new java.util.ArrayList<>();

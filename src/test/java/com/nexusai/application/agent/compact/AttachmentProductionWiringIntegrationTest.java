@@ -270,6 +270,59 @@ class AttachmentProductionWiringIntegrationTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // 验收 4 · 压缩重宣布路径（producer 的**第二条**生产调用方）：全部断开也必须公告移除
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("partial 压缩重宣布路径: kept 段已公告 + tuc 零连接 ⇒ 压缩后附件含 removedNames=全部已公告")
+    void partialCompact_allDisconnected_stillAnnouncesRemoval() {
+        // WHY（CLAUDE.md 规则九）：producer 有两个生产调用方 —— ① 每轮挂点（AgentLoopContext
+        //   .maybeEmitMcpInstructionsDelta，由 McpInstructionsDeltaTailDeliveryTest 守护）；
+        //   ② 压缩重宣布（appendPostCompactDeltaAttachments；partial 路径传 messagesToKeep，
+        //   见 PartialCompactConversation.java:462）。全量压缩传 List.of() ⇒ announced 恒空 ⇒
+        //   只有 **partial** 路径能把「已公告 + 全部断开」这一组合送到 producer。本用例锁第 ② 条：
+        //   去掉 producer 的空集早退后，这条路径才可能产出 removedNames；若谁把早退塞回去，
+        //   McpInstructionsDeltaTailDeliveryTest 与本办法各自变红（两条独立红集合，无假绿覆盖）。
+        ToolUseContext tuc = ToolUseContext.of(
+            null, SESSION, PermissionMode.DEFAULT,
+            List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of(),
+            null, PermissionMode.DEFAULT);   // ⚠️ 零 mcpClients —— 旧实现的早退条件
+
+        CompactConversationContext ctx = ctx(tuc);
+        List<ChatMessageDto> all = new ArrayList<>();
+        all.add(messages("u0").get(0));
+        // kept 段（[pivot,size)）里已有一条 delta ⇒ announced = {docs-server}
+        all.add(priorMcpDelta("docs-server", "## docs-server\n先查目录再读文件"));
+
+        // pivot=1 + UP_TO ⇒ summarize=[0,1)、keep=[1,2) → messagesToKeep 含该 delta
+        CompactionResult result = PartialCompactConversation.partialCompactConversation(
+            all, 1, ctx, null, CompactPrompt.Direction.UP_TO);
+
+        assertThat(result.messagesToKeep().stream().map(ChatMessageDto::subtype))
+            .as("前置：kept 段确实带上了那条已公告 delta（否则下面是空断言）")
+            .contains(PostCompactAttachmentRestorer.DELTA_TYPE_MCP_INSTRUCTIONS);
+
+        ChatMessageDto mid = result.attachments().stream()
+            .filter(a -> PostCompactAttachmentRestorer.DELTA_TYPE_MCP_INSTRUCTIONS.equals(a.subtype()))
+            .findFirst().orElseThrow(() -> new AssertionError(
+                "压缩重宣布路径未产出 mcp_instructions_delta：空集早退被塞回来了？"));
+        assertThat(mid.content())
+            .as("removedNames = 全部已公告项（对齐 CC getMcpInstructionsDelta：connected 为空 ⇒ removed=全部）")
+            .contains("\"removedNames\":[\"docs-server\"]")
+            .contains("\"addedNames\":[]");
+    }
+
+    /** 一条已公告的 mcp_instructions_delta 附件（author='attachment'，供跨轮 diff 扫描重建 announced）。 */
+    private static ChatMessageDto priorMcpDelta(String serverName, String block) {
+        String payload = "{\"type\":\"mcp_instructions_delta\",\"addedNames\":[\"" + serverName + "\"],"
+            + "\"addedBlocks\":[\"" + block.replace("\n", "\\n") + "\"],\"removedNames\":[]}";
+        return new ChatMessageDto(UUID.randomUUID().toString(), SESSION, Role.user, "attachment",
+            payload, null, List.of(), FinishReason.stop, null, null, "刚刚",
+            OffsetDateTime.now(), null, null, null, List.of(), List.of(), null, false, false,
+            PostCompactAttachmentRestorer.DELTA_TYPE_MCP_INSTRUCTIONS);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // 小工具
     // ════════════════════════════════════════════════════════════════════
 

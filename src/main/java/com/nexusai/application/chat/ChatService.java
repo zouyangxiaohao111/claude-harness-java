@@ -1451,7 +1451,11 @@ public class ChatService {
      *   <li><b>snip_boundary</b>：判重 selectOneById → insert system 行（subtype/snipMetadata）+ removedUuids
      *       非空推 MessageBoundaryEvent（压缩机制零改动，仅触发时机提前到 append 即落）</li>
      *   <li><b>user</b>：imagePasteIds 回写 lastUserMessageId 行；mid-turn 注入 queued-user 原位落库
-     *       （4 参单调 ts + 推进 lastUserMessageId）；普通 user 不重复 insert（controller 已落）</li>
+     *       （4 参单调 ts + 推进 lastUserMessageId）；{@code author=hook & subtype=hook_additional_context}
+     *       与 {@code subtype=skill_listing} 两条注入消息落库（命中即 return）；
+     *       <b>[C1 ③ · 2026-09-21]</b> {@code author=attachment && isMeta} 的尾部投递 attachment 落库
+     *       （date_change / edited_text_file / mcp_instructions_delta —— 对齐 2.1.278「不排除任何附件类型」）；
+     *       普通 user 不重复 insert（controller 已落）</li>
      *   <li><b>assistant</b>：toolCalls 非空 → insert finishReason=tool_calls + 逐条 ToolCallRecord
      *       （不落 usage 列，对齐原循环）；纯文本 → insert finishReason = subtype==max_tokens ? max_tokens
      *       : state.finishReason()（usage/cache 投影），每条 append 即落（取代仅末条）</li>
@@ -1644,6 +1648,11 @@ public class ChatService {
                                 sessionId, m.id(), e.getMessage());
                         }
                     }
+                    // [C1 ③ 单调出口 · 2026-09-21] 命中即 return：出口语义为「本条已被本出口处置」，
+                    //   不再落到下方新增的 attachment 通用出口（否则同一条会被 appendMessage 两次
+                    //   = DB 两行）。该 return 与下方 user 分支末尾的 return 同义（此处之后原本无语句），
+                    //   行为零变化，只把「单调」写实。
+                    return;
                 }
                 // [skill-listing-cc-align 2026-09-10] skill_listing 注入消息落库（真实消息通道）。
                 //   WHY：CC 的 skill_listing 是 attachment，随 userMessage 一并进入 transcript（位于首条
@@ -1692,6 +1701,45 @@ public class ChatService {
                         } catch (Exception e) {
                             log.warn("ChatService: skill_listing 落库失败（best-effort 不阻断）: session={} id={}: {}",
                                 sessionId, m.id(), e.getMessage());
+                        }
+                    }
+                    // [C1 ③ 单调出口 · 2026-09-21] 同 ③：命中即 return，不再落到下方 attachment 通用出口
+                    //   （skill_listing 是 author=attachment + isMeta=true，正是通用出口的形状 ⇒ 不 return
+                    //   会被 appendMessage 两次 = DB 两行）。
+                    return;
+                }
+                // ── [C1 ③ · 2026-09-21] 尾部投递 attachment 通用出口（role=user && author=attachment && isMeta）──
+                //   WHY：CC 的转录可记录性判据在 2.1.278 发行产物里翻转为**黑名单（默认放）**：
+                //   sessionStorage 等价函数（bin/claude.exe 偏移 207088589 起，ESM 导出映射表逐字证实为
+                //   isLoggableMessage）四条判据 = ①type==='progress' 拒；②空 hook_success 拒；
+                //   ③非 ant && C3o.has(attachment.type) 拒（C3o = new Set([])，全 exe 仅 1 处声明、
+                //   C3o.add 零命中 ⇒ 空集，拒不掉任何附件类型）；④cowork_memory_context/laptop 拒。
+                //   ⇒ 2.1.278 的规则 = **不排除任何附件类型**（2.1.88 的白名单 + 「隐私/训练数据」注释
+                //   已随该结构翻转作废）。
+                //   本仓此前 role=user 分支只有 4 个出口，三支尾投 attachment（date_change /
+                //   edited_text_file / mcp_instructions_delta）一条都不落库 ⇒ 每个 run 从 DB 重建历史后
+                //   这些消息消失（跨 run 去重语义退化 + resume 重放丢失）。
+                //   ⛔ 本出口不是「给这三支开后门」：判据按 CC 语义取【形状】（author=attachment +
+                //   isMeta=true），未来任何新 attachment 尾投自动落库，无需再改此处。
+                //   落库列值：messageService.appendMessage(m, ts) 2 参重载（与 ④ skill_listing 同一选型）
+                //   —— DTO→Record 完整映射（author/subtype/isMeta/cwd 全保留），createdAt 接本方法单调
+                //   ts，seq=null → MessageService.nextSeq 雪花自动取号（写序 = 尾部位置，读侧
+                //   ORDER BY seq 还原），不 bump sessions.messageCount。
+                //   ⚠️ 不推 STOMP（user 分支现状不推送；isMeta=true 前端已隐藏，GET /messages 可见即可）。
+                if (m.isMeta() && "attachment".equals(m.author())) {
+                    if (messageService != null) {
+                        try {
+                            messageService.appendMessage(m, ts);
+                            if (log.isInfoEnabled()) {
+                                log.info("ChatService: 尾部 attachment 消息落库: session={} id={} subtype={}"
+                                        + " len={}（对齐 2.1.278「不排除任何附件类型」）",
+                                    sessionId, abbreviate(m.id(), 16), m.subtype(),
+                                    m.content() == null ? 0 : m.content().length());
+                            }
+                        } catch (Exception e) {
+                            log.warn("ChatService: 尾部 attachment 消息落库失败（best-effort 不阻断）:"
+                                    + " session={} id={} subtype={}: {}",
+                                sessionId, m.id(), m.subtype(), e.getMessage());
                         }
                     }
                 }

@@ -44,8 +44,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       通道必须零字节（否则每个会话开头都白塞一条空壳）。</li>
  * </ol>
  * 另加两条本通道独有的不变量：<b>断连也必须被公告</b>（{@code removedNames} —— A2 分歧的另一半，
- * 只做「新增」等于只关了一半）、<b>发送边界把人可读文案渲染出来</b>（落库的是 diff 扫描用的 JSON，
- * 模型不该看到原始 JSON —— 对齐 CC「结构化附件持久化 + 发送时渲染」）。
+ * 只做「新增」等于只关了一半；<b>含「全部断开」</b>：{@code mcpClients} 为空同样必须公告移除，
+ * 否则会话冻结的头部 {@code mcp_instructions} 段会让模型以为那些指令仍有效）、<b>发送边界把人可读
+ * 文案渲染出来</b>（落库的是 diff 扫描用的 JSON，模型不该看到原始 JSON —— 对齐 CC「结构化附件
+ * 持久化 + 发送时渲染」）。
  *
  * <p><b>门（2026-09-21 去门 · 对齐 2.1.278）</b>：本通道<b>无任何 off 开关</b> —— 2.1.88 的
  * {@code isMcpInstructionsDeltaEnabled} 已在 2.1.278 发行产物中整体删除（见
@@ -206,6 +208,95 @@ class McpInstructionsDeltaTailDeliveryTest {
         assertThat(after).as("断连必须被公告（只做新增 = 只关了一半分歧）").hasSize(before + 1);
         assertThat(after.get(after.size() - 1).content())
             .contains("\"removedNames\":[\"im-server\"]");
+    }
+
+    // ════════ 不变量 ③′ · **全部**断开也必须被公告（A1 修 · 空集早退已拆除）════════
+
+    @Test
+    @DisplayName("全部断开（mcpClients 为空）⇒ 尾部追加一条 delta，removedNames = 原先的已公告集合，头部字节不变")
+    void allServersDisconnected_announcesRemovalOfAllAnnounced() {
+        // WHY（规则九）：C4=A2 把头部 mcp_instructions 段改成**会话冻结** ⇒ 服务器全断后那段仍列着
+        //   它们的指令。若「全部断开」不公告，模型会照旧去调已不存在的 server 的工具。本用例锁的正是
+        //   这个「空集早退」分歧：producer 曾按 mcpClients.isEmpty() 提前 return null。
+        String sessionId = newSessionId();
+        AgentState state = new AgentState("sys", sessionId, null);
+        ChatMessageDto head = userMsg(sessionId, "请求");
+        state.appendMessage(head);
+
+        // 第 1 轮：两台 server 都在 ⇒ 已公告集合 = {docs-server, im-server}
+        AgentLoopContext.maybeEmitMcpInstructionsDelta(state,
+            tuc(sessionId, server("docs-server", "先查目录再读文件"), server("im-server", "发消息用 im_send")),
+            "claude-sonnet-4-5");
+        int before = state.rawMessages().size();
+
+        // 第 2 轮：**全部**断开（tuc.mcpClients() 为空 map —— 这正是旧实现的早退条件）
+        AgentLoopContext.maybeEmitMcpInstructionsDelta(state, tuc(sessionId), "claude-sonnet-4-5");
+
+        List<ChatMessageDto> after = state.rawMessages();
+        assertThat(after)
+            .as("全部断开必须被公告（对齐 CC getMcpInstructionsDelta：connected 为空 ⇒ removed = 全部已公告）")
+            .hasSize(before + 1);
+        assertThat(after.get(0)).as("⛔ 头部（messages[0]）不得被回写 —— 回写即抹平前缀缓存修复").isSameAs(head);
+        assertThat(after.get(0).content()).as("头部字节逐字不变").isEqualTo("请求");
+
+        ChatMessageDto tail = after.get(after.size() - 1);
+        assertThat(tail.subtype()).isEqualTo("mcp_instructions_delta");
+        assertThat(tail.isMeta()).isTrue();
+        assertThat(tail.sessionId()).isEqualTo(sessionId);
+        assertThat(tail.content())
+            .as("removedNames = 全部已公告项（按 name 排序），且 addedNames 为空")
+            .contains("\"removedNames\":[\"docs-server\",\"im-server\"]")
+            .contains("\"addedNames\":[]");
+    }
+
+    @Test
+    @DisplayName("全断连后再重连 ⇒ 能重新公告（removed 不粘滞、也不每轮重复发移除）")
+    void reconnectAfterFullDisconnect_reAnnounces() {
+        String sessionId = newSessionId();
+        AgentState state = new AgentState("sys", sessionId, null);
+        state.appendMessage(userMsg(sessionId, "请求"));
+
+        // 1) 连接 docs-server ⇒ 公告新增
+        AgentLoopContext.maybeEmitMcpInstructionsDelta(state,
+            tuc(sessionId, server("docs-server", "先查目录再读文件")), "claude-sonnet-4-5");
+        // 2) 全部断开 ⇒ 公告移除
+        AgentLoopContext.maybeEmitMcpInstructionsDelta(state, tuc(sessionId), "claude-sonnet-4-5");
+        int afterDisconnect = state.rawMessages().size();
+        // 3) 再断一次 ⇒ 已公告集合已空 ⇒ 零追加（⛔ 不是「只要没连接就每轮发一条空 delta」）
+        AgentLoopContext.maybeEmitMcpInstructionsDelta(state, tuc(sessionId), "claude-sonnet-4-5");
+        assertThat(state.rawMessages())
+            .as("已公告集合已空 + 无连接 ⇒ added/removed 均空 ⇒ 零追加（空 delta 不产出）")
+            .hasSize(afterDisconnect);
+        // 4) 重连 ⇒ 重新公告（无粘滞）
+        AgentLoopContext.maybeEmitMcpInstructionsDelta(state,
+            tuc(sessionId, server("docs-server", "先查目录再读文件")), "claude-sonnet-4-5");
+        List<ChatMessageDto> after = state.rawMessages();
+        assertThat(after).as("重连 ⇒ 必须重新公告（上一条 removed 已把 announced 清空）").hasSize(afterDisconnect + 1);
+        ChatMessageDto tail = after.get(after.size() - 1);
+        assertThat(tail.content())
+            .as("重新公告 = addedNames 含 docs-server + 指令块")
+            .contains("\"addedNames\":[\"docs-server\"]")
+            .contains("## docs-server")
+            .contains("\"removedNames\":[]");
+        assertThat(deltas(state)).as("全断连 + 重连共 3 条 delta（新增／移除／再新增）").hasSize(3);
+    }
+
+    @Test
+    @DisplayName("从未连接 + 从未公告 ⇒ 一条都不产出（⛔ 不是「只要没连接就永远发一条空 delta」）")
+    void neverConnectedNeverAnnounced_producesNothing() {
+        String sessionId = newSessionId();
+        AgentState state = new AgentState("sys", sessionId, null);
+        state.appendMessage(userMsg(sessionId, "请求"));
+        int before = state.rawMessages().size();
+
+        // 连续多轮「零连接」：producer 不得产出任何 delta（added/removed 均空 ⇒ null 收口）
+        for (int i = 0; i < 3; i++) {
+            AgentLoopContext.maybeEmitMcpInstructionsDelta(state, tuc(sessionId), "claude-sonnet-4-5");
+        }
+        assertThat(state.rawMessages())
+            .as("从未连接 + 从未公告 ⇒ 每轮零追加（去掉空集早退 ≠ 无条件发空 delta）")
+            .hasSize(before);
+        assertThat(deltas(state)).isEmpty();
     }
 
     // ════════ 不变量 ④ · 首轮无需投递 ⇒ 零追加 ════════

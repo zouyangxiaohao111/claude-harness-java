@@ -4730,24 +4730,32 @@ public record AgentLoopContext(
      * （{@code appendPostCompactDeltaAttachments}）用的是<b>同一个</b>构造。追加的消息形态 = producer 的
      * 原样 JSON payload（role=user / author='attachment' / isMeta=true / subtype='mcp_instructions_delta'）。
      *
-     * <p><b>⚠️ 落库事实（2026-09-21 定性 · 曾经本注释写反，已按代码改准）</b>：该消息<b>不落库</b>。
-     * {@code state.appendMessage} 只负责「内存追加 + 触 appendListener」，真正写 DB 的是
-     * {@code ChatService.persistAppendedMessage}（ChatService.java:1462），而它的 role=user 分支
-     * （:1563-1755）只有 4 个出口 —— 图片回写 / mid-turn 排队（{@code injectedQueuedById}）/
-     * {@code author=hook & subtype=hook_additional_context} / {@code subtype=skill_listing}，
-     * 其余一律 {@code return}。本形状不命中任何一个出口。两支兄弟（{@code date_change} /
-     * {@code edited_text_file}，同段同通道，见 {@link #maybeEmitDateChange} / {@link #maybeEmitChangedFiles}）
-     * <b>同样不落库</b> ⇒ 这是本仓 attachment 尾投的<b>既有形态</b>（不是本通道漏落）。
-     * 证据：{@code ChatServiceAttachmentTailPersistTest}（正对照 hook/skill_listing 落库、
-     * 三支尾投一条不落）+ 真库只读盘点（{@code messages} 表 attachment 行仅 skill_listing / task_status）。
+     * <p><b>✅ 落库事实（2026-09-21 用户裁定 ③ 后改写；此前本注释两次写反，本轮按代码改准）</b>：
+     * 该消息<b>落库</b>。{@code state.appendMessage} 只负责「内存追加 + 触 appendListener」，真正写 DB 的是
+     * {@code ChatService.persistAppendedMessage}，其 role=user 分支现有出口：图片回写 / mid-turn 排队
+     * （{@code injectedQueuedById}）/ {@code author=hook & subtype=hook_additional_context} /
+     * {@code subtype=skill_listing} / <b>[C1 ③ 新增] {@code author=attachment && isMeta}</b>。
+     * 本形状（role=user / author='attachment' / isMeta=true / subtype='mcp_instructions_delta'）
+     * 命中最后一个出口 ⇒ 经 {@code MessageService.appendMessage(dto, ts)} 落 DB 一行
+     * （author/subtype/isMeta 全保留、seq 雪花自动取号、不 bump messageCount）。
+     * 两支兄弟（{@code date_change} / {@code edited_text_file}，同段同通道，见
+     * {@link #maybeEmitDateChange} / {@link #maybeEmitChangedFiles}）<b>同款落库</b>。
+     * 依据：CC 2.1.278 发行产物（bin/claude.exe，{@code isLoggableMessage} 等价函数）的可记录性判据
+     * 已翻转为<b>黑名单（默认放）</b>且拒绝集为空集 ⇒ 规则 = 「不排除任何附件类型」。
+     * 测试：{@code ChatServiceAttachmentTailPersistTest}（正对照 hook/skill_listing 仍恰好一次、
+     * 三支尾投各恰好一次）。
+     *
+     * <p><b>⚠️ 落库 content 是 producer 的 JSON payload，不是渲染文案</b>：DB 里存
+     * {@code {type, addedNames, addedBlocks, removedNames}}（那是跨轮 diff 的扫描源），人可读文案在
+     * <b>发送边界</b>由 {@link #maybeRenderDeltaAttachmentsForApi} 现场渲染（对齐 CC「附件结构化持久化 +
+     * 发送时 normalizeAttachmentForAPI 渲染」）。该渲染每轮对 {@code messagesForLlm} 生效，
+     * 包括从 DB 重建的历史行 ⇒ resume 重放给模型的是文案而非 JSON。
      *
      * <p><b>⇒ 对 producer 的 diff 扫描源（{@code scanAnnouncedDeltaNames}）意味着什么</b>：
-     * 扫描源是 {@code state.rawMessages()}，<b>同一 run 内</b>有效（第二次调用即命中已公告集合并返回 null
-     * —— 这是「内容未变 ⇒ 一条都不追加」成立的范围）；<b>跨 run 无效</b> —— 每个 run 的历史从 DB
-     * 重建，里面没有本消息 ⇒ 下一 run 会把当前连接集<b>整体重公告一次</b>。故「已投递的指令绝不重复追加」
-     * 只在 run 内成立；跨 run 是<b>每用户轮一次的有界重公告</b>（不是无界线性膨胀，也不是
-     * 「只可见一次然后消失」）。是否改为落库（使跨 run 也生效、对齐 CC「attachment 进 transcript」）
-     * 属产品裁定，未在本批擅自决定（见 openQuestions）。
+     * 扫描源是 {@code state.rawMessages()}。落库后它<b>跨 run 也有效</b> —— 每个 run 从 DB 重建的历史里
+     * 带着此前投递的 delta 行（content 仍是可解析 JSON），producer 据此得到非空的「已公告集合」
+     * ⇒ 「内容未变 ⇒ 一条都不追加」在跨 run 同样成立（对齐 CC「attachment 进 transcript」）。
+     * 落库前该性质只在 run 内成立（跨 run 每用户轮重公告一次）。
      *
      * <p>LLM 面看到的是<b>渲染后的人可读文案</b>（经 {@link #maybeRenderDeltaAttachmentsForApi}
      * 在发送边界复用既有渲染 case，CC messages.ts:4216-4231）—— 对齐 CC「结构化附件持久化 +
@@ -4789,7 +4797,10 @@ public record AgentLoopContext(
         ChatMessageDto dtd = com.nexusai.application.agent.compact.PostCompactAttachmentRestorer
                 .mcpInstructionsDeltaAttachment(tuc, model, state.rawMessages());
         if (dtd == null) {
-            // 无增量 = 已公告名称集合已覆盖当前连接（或本仓无带 instructions 的 MCP server）
+            // 无增量 = 已公告名称集合已覆盖当前连接集合（内容未变），**或**「既无连接、又从未公告过
+            //   任何东西」（announced 空 + connected 空 → producer 统一的 added/removed 均空收口）。
+            //   ⚠️ 连接非空但都无 instructions 且 announced 非空**不在**此列：那条路径 connectedNames
+            //   非空 ⇒ 不产生 removedNames（CC 同语义）。
             // ⇒ 一条都不追加（要求 (a)/(c)：内容未变 / 首轮无需投递）
             if (log.isDebugEnabled()) {
                 log.debug("[mcp_instructions_delta] producer 无增量（已公告集合已覆盖当前连接）⇒ 零追加"
@@ -4803,17 +4814,17 @@ public record AgentLoopContext(
                 + "（对齐 CC simple 模式禁用附件的语义）");
             return;
         }
-        // sessionId / isMeta 由本通道补正（⚠️ 当前**不落库**，两处均为「形态正确性 + 未来落库预留」，
-        //   不是当前生效的落库前置条件 —— 见方法 javadoc 的「落库事实」段）：
+        // sessionId / isMeta 由本通道补正（[C1 ③ · 2026-09-21] 该消息**现已落库** ⇒ 两者都是当前生效的
+        //   落库前置条件，见方法 javadoc 的「落库事实」段）：
         //   · sessionId：producer 的 envelope 走 attachments.ts:3201 形态（sessionId=null），而
-        //     messages.session_id NOT NULL ⇒ 一旦本通道落库，不补即 insert 失败。
+        //     messages.session_id NOT NULL ⇒ 落库时不补即 insert 失败。
         //   · isMeta：producer 的 envelope 建的是 isMeta=false，而前端**只按 isMeta** 隐藏元消息
-        //     （front/src/App.tsx:1864 / DialogOpsModal.tsx:24）⇒ 一旦落库，不拨正就会多出一条
+        //     （front/src/App.tsx:1864 / DialogOpsModal.tsx:24）⇒ 不拨正就会多出一条
         //     「用户消息」（内容还是给模型看的 system-reminder）。CC 侧该消息由
         //     normalizeAttachmentForAPI 以 {@code createUserMessage({isMeta:true})} 产出（messages.ts:4228-4230）。
-        //   · 当前有效性：不落库 + user 分支不推 STOMP ⇒ 该消息对 UI 本就不可见，isMeta 只对
-        //     「模型面」与「未来落库」有意义；isMeta **不影响 provider 序列化**（R32C1 实证），
-        //     故模型面照常看到（这正是投递目的）。
+        //   · 当前有效性：user 分支不推 STOMP ⇒ 该消息对 UI 不新增可见项（isMeta=true 前端隐藏，
+        //     GET /messages 可见）；isMeta **不影响 provider 序列化**（R32C1 实证），故模型面照常看到
+        //     （这正是投递目的）。
         state.appendMessage(dtd.withSessionId(sessionId).withIsMeta(true));
         log.info("[mcp_instructions_delta] 尾部追加 delta 消息（头部字节不变，⛔ 绝不回写 messages[0]）:"
             + " sessionId={} payloadLen={} · CC attachments.ts:854-863 + query.ts:1580-1588",
@@ -4829,9 +4840,10 @@ public record AgentLoopContext(
      * {@code {type:'mcp_instructions_delta', addedBlocks, removedNames}}（mcpInstructionsDelta.ts:10-16，
      * 经 {@code createAttachmentMessage} 成为 AttachmentMessage），文案只在
      * {@code normalizeAttachmentForAPI}（= 出站边界）才生成。本仓的载体是
-     * {@code ChatMessageDto.content}（单字段），其内容是 producer 的 JSON（**内存内**是跨轮 diff 的
-     * 扫描源；⚠️ 该消息当前<b>不落库</b>，见 {@link #maybeEmitMcpInstructionsDelta} 的「落库事实」段）
-     * ⇒ 若不做本步，模型看到的就是原始 JSON。
+     * {@code ChatMessageDto.content}（单字段），其内容是 producer 的 JSON（既是<b>跨轮 diff 的扫描源</b>，
+     * 也是<b>落 DB 的原文</b> —— [C1 ③ · 2026-09-21] 该消息现已落库，见
+     * {@link #maybeEmitMcpInstructionsDelta} 的「落库事实」段）⇒ 若不做本步，模型看到的就是原始 JSON
+     * （resume 从 DB 重建的历史行同理）。
      *
      * <p><b>为什么放在发送边界</b>：与 {@code wrapQueuedMessagesForApi} 同一处 ——
      * 那里的注释已把该点定义为「唯一发送边界 · 对齐 CC normalizeMessagesForAPI（messages.ts:2269-2291）」。
