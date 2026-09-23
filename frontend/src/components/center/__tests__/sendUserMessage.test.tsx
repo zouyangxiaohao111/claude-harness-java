@@ -79,7 +79,7 @@ describe('SendUserMessage 正文渲染（CC BriefTool 对齐）', () => {
   async function mount(messages: ChatMessageDto[]) {
     useChatStore.setState({
       messages: { [SID]: messages }, hasMore: {},
-      streams: {}, streamOrder: {}, streamTicks: {}, extendedWindow: {},
+      streams: {}, streamOrder: {}, streamTicks: {},
     })
     await act(async () => {
       root.render(

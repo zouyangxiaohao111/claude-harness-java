@@ -72,7 +72,7 @@ describe('MessageList 「加载更早」不跳底（根因回归）', () => {
     const head = [baseMsg('a1', 'user', SID), baseMsg('a2', 'assistant', SID)]
     useChatStore.setState({
       messages: { [SID]: head }, hasMore: { [SID]: true },
-      streams: {}, streamOrder: {}, streamTicks: {}, extendedWindow: {},
+      streams: {}, streamOrder: {}, streamTicks: {},
     })
     const older = [baseMsg('h1', 'user', SID), baseMsg('h2', 'assistant', SID)]
     const onLoadOlder = (sid: string) => { useChatStore.getState().prependMessages(sid, older, false) }

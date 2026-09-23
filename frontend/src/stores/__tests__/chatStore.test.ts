@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createChatStore, MESSAGE_WINDOW_KEEP, MESSAGE_WINDOW_MAX, IMAGE_CACHE_MAX_PER_SESSION } from '../chatStore'
+import { createChatStore, MESSAGE_WINDOW_TURNS, IMAGE_CACHE_MAX_PER_SESSION } from '../chatStore'
 import type { ChatMessageDto } from '../../api/types'
 
 /** 测试用最小 ChatMessageDto（避免每个用例重复造全字段）。 */
@@ -11,6 +11,16 @@ function baseMsg(id: string, sessionId: string = 'sess-1'): ChatMessageDto {
     isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null,
   }
 }
+
+/** 造 n 个「user + assistant」两轮条（assistant 的 userMessageId 指向其 user ⇒ 合计 n 轮）。 */
+const turnSeqs = (n: number, sid = 'sess-1', prefix = 't'): ChatMessageDto[] =>
+  Array.from({ length: n }, (_, i) => {
+    const uid = `${prefix}${i}`
+    return [
+      baseMsg(uid, sid),
+      { ...baseMsg(`${uid}-a`, sid), role: 'assistant' as const, userMessageId: uid },
+    ]
+  }).flat()
 
 describe('chatStore agentStatus', () => {
   it('setAgentStatus 更新会话运行状态，默认 idle（WHY：session.status 事件驱动 StreamHeader 状态点，初始必须为「就绪」）', () => {
@@ -270,63 +280,105 @@ describe('chatStore hasMore / prependMessages（[window-paging] 有界历史窗�
   })
 })
 
-// [内存] messages 硬顶：原实现四条追加路径全不裁剪 + 切会话缓存非空不重拉 → 无界涨（WebView2 实测 1.2GB）。
-// 这些用例守住「追加有界」与「prepend 不被 append 立刻吃掉」两条不变量 —— 若有人给某条追加路径
-// 去掉 capTail，长度断言会立即失败（测试验证的是「为何重要」：内存必须有界）。
-describe('chatStore 有界窗口（[内存] messages 硬顶）', () => {
+// [内存/性能] 窗口 = 最近 MESSAGE_WINDOW_TURNS 个【对话轮】（用户 2026-09-23 裁定）。
+// 沿革：原实现四条追加路径全不裁剪 → 无界涨（WebView2 renderer 实测 1.2GB）；先补「按条裁 300」，
+//   但用户实测「窗口没遵循 50、随对话不断增大」—— 300 条远大于 50，且点过「加载更早」后
+//   extendedWindow 会把上限【永久】抬到 500 条。现统一为「轮」口径，判据与 MessageList 渲染分组同源
+//   （唯一真源 = stores/messageTurns）。
+// 这些用例守住两条不变量：①追加有界（漏一条路径即再泄漏）②裁的是【整轮】（切半会渲染出半截轮）。
+describe('chatStore 有界窗口（窗口 = 最近 N 个对话轮）', () => {
   const many = (n: number, sid = 'sess-1', prefix = 'm') =>
     Array.from({ length: n }, (_, i) => baseMsg(`${prefix}${i}`, sid))
 
-  it('finalizeBlocks 追加超过 MESSAGE_WINDOW_KEEP → 从头部裁剪，长度稳定在 N（WHY：messages 只增不减是 renderer 1.2GB 根因）', () => {
+  it('finalizeBlocks 追加后超窗口 → 从头部挤出最老的整轮，轮数稳定在 N（WHY：无线增长是 renderer 1.2GB 的根因）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_KEEP)) // m0..m299（=KEEP）
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_TURNS))
     s.getState().ensureStreamBlock('sess-1', 'turn-x')
     s.getState().appendChunk('sess-1', 'turn-x', '正文')
     s.getState().finalizeBlocks('sess-1')
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP)      // 301 → 裁回 300
-    expect(msgs.some((m) => m.id === 'm0')).toBe(false) // 最老的被裁掉
-    expect(msgs[msgs.length - 1].id).toBe('turn-x')     // 最新（块落库）仍在
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS)      // 51 轮 → 裁回 50
+    expect(msgs.some((m) => m.id === 'm0')).toBe(false)  // 最老的一轮被挤出
+    expect(msgs[msgs.length - 1].id).toBe('turn-x')      // 最新（块落库）仍在
   })
 
-  it('appendMetaUser / expirePermission 追加同样受硬顶（WHY：追加路径必须统一收敛到一个裁剪函数，漏一条即再泄漏）', () => {
+  it('appendMetaUser（渲染不可见的占位）不占轮、不挤出真实轮；expirePermission 的可见留痕占轮（WHY：轮的计数口径必须与「渲染可见性」一致，否则看不见的占位会顶掉用户真实对话）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_KEEP))
-    s.getState().appendMetaUser('sess-1', 'meta-1')
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_TURNS))
+    s.getState().appendMetaUser('sess-1', 'u-new')   // isMeta 默认 true ⇒ groups 跳过 ⇒ 不算一轮
     let msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP)
-    expect(msgs[msgs.length - 1].id).toBe('meta-1')
-    expect(msgs.some((m) => m.id === 'm0')).toBe(false)
+    expect(msgs.some((m) => m.id === 'm0')).toBe(true)   // 真实轮没被挤出（占位不占轮）
+    expect(msgs[msgs.length - 1].id).toBe('u-new')
 
     s.getState().enqueuePermission({ kind: 'message', sessionId: 'sess-1', requestId: 'r1', toolName: 'edit' })
-    s.getState().expirePermission('sess-1', 'r1')
+    s.getState().expirePermission('sess-1', 'r1')        // role=system / isMeta=false ⇒ 渲染可见 ⇒ 占一轮
     msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP) // 超时留痕也不得撑破窗口
+    expect(msgs.some((m) => m.id === 'm0')).toBe(false)  // 最老的真实轮被挤出
+    expect(msgs.some((m) => m.id === 'perm-r1')).toBe(true)
   })
 
-  it('prepend 更早页后 append 不立刻吃掉它（WHY：prepend 是用户显式行为，不能被后台追加无声抹掉）', () => {
+  it('setMessages（服务端整表替换路径）按设计【不裁剪】（WHY：头部可能是 compact 摘要 / boundary 标记，裁了会误删标记 —— 分工见 setMessages 注释）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_KEEP))          // m0..m299
-    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true) // +50 → 350（< MAX）
-    expect(s.getState().messages['sess-1']).toHaveLength(MESSAGE_WINDOW_KEEP + 50)
-    expect(s.getState().extendedWindow['sess-1']).toBe(true)
-
-    s.getState().ensureStreamBlock('sess-1', 'turn-y')
-    s.getState().appendChunk('sess-1', 'turn-y', 'x')
-    s.getState().finalizeBlocks('sess-1') // append 一次：上限放宽到 MAX → 不得回落到 KEEP
-    const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP + 51)
-    expect(msgs.some((m) => m.id === 'old0')).toBe(true) // 刚加载的更早页仍在
+    s.getState().setMessages('sess-1', turnSeqs(80))     // 80 轮 = 160 条
+    expect(s.getState().messages['sess-1']).toHaveLength(160)
   })
 
-  it('prepend 达到绝对硬顶 MESSAGE_WINDOW_MAX → 头部裁剪（最老的先走），总量有界（WHY：prepend 也不能无限）', () => {
+  it('窗口按【轮】而非按条：一轮两条时保留整轮，绝不切半（WHY：切半会渲染出「有问无答」的半截轮）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_MAX))            // m0..m499（=MAX）
-    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true) // 550 → 裁回 500
+    // ⚠️ 必须走 appendMessages：setMessages 是「服务端整表替换」路径，按设计不裁剪（见上一个用例）
+    s.getState().appendMessages('sess-1', turnSeqs(MESSAGE_WINDOW_TURNS + 10))  // 60 轮 = 120 条
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_MAX)
-    // 明确行为：新到的更早页被同一次头部裁剪舍弃（尾部实时内容必须保住）
-    expect(msgs.some((m) => m.id === 'old0')).toBe(false)
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS * 2)   // 50 轮 × 2 条
+    // 被挤出的最老一轮：user 与 assistant 一起走（不得只留 assistant）
+    expect(msgs.some((m) => m.id === 't0')).toBe(false)
+    expect(msgs.some((m) => m.id === 't0-a')).toBe(false)
+    // 最老保留轮：user 与 assistant 成对在（切点落在轮首，不落轮中）
+    expect(msgs[0].id).toBe('t10')
+    expect(msgs[1].id).toBe('t10-a')
+    expect(msgs[msgs.length - 1].id).toBe(`t${MESSAGE_WINDOW_TURNS + 9}-a`)
+  })
+
+  it('按【轮】计数而非按条计数：轮内多出的 tool / 纯 meta 行不额外占轮（WHY：口径必须与 MessageList 渲染分组同源）', () => {
+    const s = createChatStore()
+    // 59 轮（t0..t58）；把最老一轮 t0 换成「user + tool行 + meta行 + assistant」四条
+    const rest = turnSeqs(59).slice(2)   // t1..t58（118 条）
+    const withNoise: ChatMessageDto[] = [
+      baseMsg('t0'),
+      { ...baseMsg('t0-tool'), role: 'tool' },
+      { ...baseMsg('t0-meta'), isMeta: true },
+      { ...baseMsg('t0-a'), role: 'assistant', userMessageId: 't0' },
+      ...rest,
+    ]
+    s.getState().setMessages('sess-1', withNoise)
+    s.getState().appendMessages('sess-1', [baseMsg('tail')])   // 60 轮 → 触发裁剪到 50 轮
+    const msgs = s.getState().messages['sess-1'] ?? []
+    // 结论一：t0 整轮（连同其 tool/meta 噪声行）被挤出 —— 噪声行没被当成独立轮而留下
+    expect(msgs.some((m) => m.id === 't0-tool')).toBe(false)
+    expect(msgs.some((m) => m.id === 't0-meta')).toBe(false)
+    // 结论二：留下的轮数恰好 = MESSAGE_WINDOW_TURNS（用对话行去重计数，不依赖条数算术）
+    const keptTurns = new Set(msgs.filter((m) => m.role !== 'tool' && !m.isMeta).map((m) => m.userMessageId ?? m.id))
+    expect(keptTurns.size).toBe(MESSAGE_WINDOW_TURNS)
+    expect(msgs[msgs.length - 1].id).toBe('tail')
+  })
+
+  it('prepend 不施加轮窗口裁剪（WHY：prepend 是用户显式行为；若这里也裁，刚加载的更早页被同次舍掉 = 按钮点了没反应）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_TURNS))
+    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true)
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS + 50)
+    expect(msgs[0].id).toBe('old0')   // 更早页确实进了窗口头部
+  })
+
+  it('prepend 后下一次 append 按 LRU 从头部挤出最早一轮（用户 2026-09-23 裁定：来一条，上面的归为历史）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', many(MESSAGE_WINDOW_TURNS))
+    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true)
+    s.getState().appendMessages('sess-1', [baseMsg('new1')])
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS)       // 恒为最近 50 轮
+    expect(msgs.some((m) => m.id === 'old0')).toBe(false) // 更早页被挤出（回看走「加载更早」重拉）
+    expect(msgs[msgs.length - 1].id).toBe('new1')
   })
 
   it('clearSession 释放该会话全部会话级状态（含 imageCache/hasMore/msgTotals/snippedIds）（WHY：删会话后这些键永不读取，纯占内存）', () => {
@@ -349,7 +401,6 @@ describe('chatStore 有界窗口（[内存] messages 硬顶）', () => {
     expect(st.snippedIds['sess-1']).toBeUndefined()
     expect(st.conversationIds['sess-1']).toBeUndefined()
     expect(st.streamTicks['sess-1']).toBeUndefined()
-    expect(st.extendedWindow['sess-1']).toBeUndefined()
   })
 })
 
@@ -378,23 +429,23 @@ describe('chatStore imageCache 淘汰上限（[内存] base64 永不释放 → �
 // 乐观 user 气泡）的唯一入口。这些路径原先各自 setMessages([...prev, new]) 绕过裁剪 —— 其中 away-summary
 // 由 blur 触发、不保证随后有 finalize 兜底 → 该会话生命周期内只增不减（核验复现 300+400=700）。
 // 本组守住「本地追加也有界」这条不变量：若有人改回 setMessages 拼接，长度断言会立即失败。
-describe('chatStore appendMessages（[内存] 本地追加也必须有界）', () => {
-  it('连续 append 超过 MESSAGE_WINDOW_KEEP → 长度稳定在 N，不随追加次数增长（WHY：核验曾复现 300+400=700）', () => {
+describe('chatStore appendMessages（本地追加也必须有界）', () => {
+  it('连续 append 超过 MESSAGE_WINDOW_TURNS 轮 → 轮数稳定在 N，不随追加次数增长（WHY：核验曾复现 300+400=700）', () => {
     const s = createChatStore()
-    for (let i = 0; i < MESSAGE_WINDOW_KEEP + 400; i++) {
+    for (let i = 0; i < MESSAGE_WINDOW_TURNS + 400; i++) {
       s.getState().appendMessages('sess-1', [baseMsg(`a${i}`)])
     }
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP)   // 700 → 稳定 300
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS)   // 450 轮 → 稳定 50
     expect(msgs.some((m) => m.id === 'a0')).toBe(false)  // 最老的先走
-    expect(msgs[msgs.length - 1].id).toBe(`a${MESSAGE_WINDOW_KEEP + 399}`) // 最新仍在
+    expect(msgs[msgs.length - 1].id).toBe(`a${MESSAGE_WINDOW_TURNS + 399}`) // 最新仍在
   })
 
   it('单次批量追加超上限同样裁到 N（WHY：queue.drained 一次可回插多条）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', Array.from({ length: MESSAGE_WINDOW_KEEP }, (_, i) => baseMsg(`m${i}`)))
+    s.getState().setMessages('sess-1', Array.from({ length: MESSAGE_WINDOW_TURNS }, (_, i) => baseMsg(`m${i}`)))
     s.getState().appendMessages('sess-1', Array.from({ length: 150 }, (_, i) => baseMsg(`batch${i}`)))
-    expect(s.getState().messages['sess-1']).toHaveLength(MESSAGE_WINDOW_KEEP)
+    expect(s.getState().messages['sess-1']).toHaveLength(MESSAGE_WINDOW_TURNS)
   })
 
   it('空追加早退、保持数组引用稳定（WHY：避免无谓重渲）', () => {
@@ -405,14 +456,12 @@ describe('chatStore appendMessages（[内存] 本地追加也必须有界）', (
     expect(s.getState().messages).toBe(before)
   })
 
-  it('prepend 扩容后 appendMessages 同样放宽到 MAX，不立刻吃掉更早页（WHY：显式行为不被后台追加抹掉）', () => {
+  it('批量追加超窗口时按【轮】裁，不把一轮切半（WHY：切半会渲染出半截轮）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', Array.from({ length: MESSAGE_WINDOW_KEEP }, (_, i) => baseMsg(`m${i}`)))
-    s.getState().prependMessages('sess-1', Array.from({ length: 50 }, (_, i) => baseMsg(`old${i}`)), true)
-    s.getState().appendMessages('sess-1', [baseMsg('new1')])
+    s.getState().appendMessages('sess-1', turnSeqs(MESSAGE_WINDOW_TURNS + 5))   // 55 轮 = 110 条
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(MESSAGE_WINDOW_KEEP + 51)   // 未回落 KEEP
-    expect(msgs.some((m) => m.id === 'old0')).toBe(true)  // 更早页仍在
-    expect(msgs[msgs.length - 1].id).toBe('new1')
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS * 2)
+    expect(msgs[0].userMessageId ?? msgs[0].id).toBe('t5')                     // 切点在轮首
+    expect(msgs[msgs.length - 1].id).toBe(`t${MESSAGE_WINDOW_TURNS + 4}-a`)
   })
 })

@@ -171,7 +171,7 @@ describe('OBS2 · ErrorBoundary 真实渲染（顶层兜底 + 逐行隔离）', 
     // 每条 userMessageId 均为 null → 分组键回落 m.id → 3 条各自成组 → 恰好 3 行
     useChatStore.setState({
       messages: { [SID]: msgs }, hasMore: {},
-      streams: {}, streamOrder: {}, streamTicks: {}, extendedWindow: {},
+      streams: {}, streamOrder: {}, streamTicks: {},
     })
 
     await act(async () => {

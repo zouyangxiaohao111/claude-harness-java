@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { isDialogueRow, turnKeyOf } from '../../stores/messageTurns'
 import { MarkdownText } from '@/markdown/MarkdownText'
 import { projectPreview } from '@/markdown/plainPreview'
 import type { ChatMessageDto } from '@/api/types'
@@ -814,7 +815,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   )
 })
 
-export function MessageList({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
@@ -937,23 +938,11 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     // [brief-align] 含 SendUserMessage 的轮次里丢掉冗余助手正文 · 对齐 CC components/Messages.tsx:169-206
     //   dropTextInBriefTurns（transcript 模式绕过：本仓轨迹 tab 直读 store，不经本函数 —— 同 CC）。
     for (const m of dropTextInBriefTurns(messages)) {
-      if (m.role === 'tool') continue
-      // [transcript-only] 仅 transcript 可见的 user 消息不进普通对话流（CC original:
-      //   utils/messages.ts:5098-5115 shouldShowUserMessage —— 首行 `if (message.type !== 'user') return true`
-      //   使该判据只作用于 user 消息；调用点 components/Messages.tsx:559 主列表过滤）。
-      //   TraceView 不过滤（轨迹 tab 需要展示）。
-      //   位置：与下方 isMeta 分支是两条互不交叉的 continue（本分支无任何豁免），先后顺序不影响结果集；
-      //   保持在 isMeta 之前 = 维持既有「先按显式标志剔除」的读法，也不会遮蔽紧随其后的 tool_use_summary 放行分支。
-      //   compact 摘要（kept 段为空）由后端打此标记（PartialCompactConversation.buildSummaryMessage）。
-      if (m.role === 'user' && m.isVisibleInTranscriptOnly === true) continue
-      // 放行「实时展示行」（isMeta=true 但属 UI 摘要行）：tool_use_summary 与
-      //   [P2-15] stop_hook_summary —— 默认 isMeta 跳过会把它们吞掉（渲染分支见 Message 组件）。
-      //   两者都只由 /topic/tasks 实时插入（不落库），isMeta=true 是为了不进「消息计数徽标 /
-      //   pivot 候选 / 轨迹」这些「真实对话消息」口径。
-      const isLiveDisplayRow = (m.author === 'attachment' && m.subtype === 'tool_use_summary')
-        || m.subtype === 'stop_hook_summary'
-      if (m.isMeta && !isLiveDisplayRow) continue
-      push(m.userMessageId ?? m.id, { kind: 'msg', m })
+      // 轮归属与过滤判据的【唯一真源】= stores/messageTurns（与 chatStore 的窗口裁剪同源，防两处漂移）。
+      //   原实现把三条 continue 与轮键内联在此、store 另写一份 —— 一旦漂移，「渲染出来的轮」与
+      //   「被裁剪的轮」就不是同一个东西（裁剪切点会落在一轮中间）。
+      if (!isDialogueRow(m)) continue
+      push(turnKeyOf(m), { kind: 'msg', m })
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
     //   的「位置」语义 —— 用户1 任务轮归用户1、排队 append 后的轮归排队）。冻结保证不被排队 append
@@ -1304,3 +1293,10 @@ export function MessageList({ messages, sessionId, onDelete, conversationId, scr
     </>
   )
 }
+
+// [打字性能] MessageList 包 memo：打字状态（composerText）在 App 里 ⇒ 每敲一键 App 重渲 ⇒
+//   此前会连带把本组件整表重跑（groups/flatRows 两个 useMemo + N 行 reconciliation），N 随窗口增长而变大。
+//   本组件 props 均为稳定引用（messages 来自 store 选择器；onDelete / onOpenRefFile / onLoadOlder 是
+//   useCallback；onNearBottomChange 是 useState setter；其余为标量）⇒ 父级重渲时这里可整体 bail。
+//   ⚠️ store 变化仍会重渲本组件（apiErrors / streamIds 是组件内订阅）—— memo 只拦「父级驱动」的重渲。
+export const MessageList = memo(MessageListInner)

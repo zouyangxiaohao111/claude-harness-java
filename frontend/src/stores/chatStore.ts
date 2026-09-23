@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload, PermissionUpdate } from '../api/types'
 import type { SessionFile } from '../types'
 import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
+import { capTailTurns } from './messageTurns'
 
 /**
  * [snip-persist] 从消息列表解析 snip_boundary 的 {@code snipMetadata.removedUuids}（合并去重）。
@@ -25,28 +26,15 @@ export function collectRemovedUuids(msgs: ChatMessageDto[] | null | undefined): 
   return Array.from(new Set(ids))
 }
 
-// ── [有界窗口] messages[sessionId] 硬顶（治内存：WebView2 renderer 实测涨到 1.2GB）──
-// 根因：原实现 messages 只增不减 —— finalizeBlocks / appendMetaUser / addToolUseSummary /
-//   expirePermission 四条追加路径无一裁剪，长会话/长 turn 下无限涨；再叠加切会话「缓存非空即
-//   不重拉」，切走再切回也压不回窗口。下面两条常量 + capTail/appendKeep 把「保留最近 N 条」收敛到一处。
-//
-// 追加路径（append 类）保留最近 MESSAGE_WINDOW_KEEP 条：只留尾部实时内容，头部（最老）优先丢弃。
-// WHY 300：= 6 × HISTORY_PAGE_SIZE(50) —— 覆盖用户数次「加载更早」翻页，同时把长会话里
-//   「每轮 append 几条」的累积封顶（这是个上界，不会破坏窗口分页语义）。
-export const MESSAGE_WINDOW_KEEP = 300
-// 绝对硬顶：用户显式 prepend 了更早历史后，允许窗口临时增大到本值。
-// WHY 需要它：prepend 的更早页在数组【头部】，而 append 裁剪保留【尾部】——若两者共用一个上限，
-//   下一次 append 会立刻把头部的更早页裁光，用户显式行为被后台追加无声抹掉。放宽到本值后，
-//   prepend 行的「预算」= MESSAGE_WINDOW_MAX - MESSAGE_WINDOW_KEEP = 200（= 4 页）。
-// prepend 达到本上限时的明确行为：仍从头部裁剪（最老的先走）——即「加载更早」在窗口满后备化为
-//   不再增长；取舍是「最新尾部必须保住」（尾部是实时对话，头部只是回溯）。需要任意深度历史时走
-//   Trace 全程（App 离开轨迹即释放，见 App.tsx traceMessages effect）。
-export const MESSAGE_WINDOW_MAX = 500
-
-/** 尾部保留最近 keep 条（头部裁剪）；未超上限时原样返回（保持数组引用稳定 —— 避免无谓重渲/重排）。 */
-function capTail(msgs: ChatMessageDto[], keep: number): ChatMessageDto[] {
-  return msgs.length > keep ? msgs.slice(msgs.length - keep) : msgs
-}
+// ── [有界窗口] messages[sessionId] 窗口上限 = 最近 MESSAGE_WINDOW_TURNS 个【对话轮】──
+// 沿革：原实现 messages 只增不减（finalizeBlocks / appendMetaUser / addToolUseSummary / expirePermission
+//   四条追加路径无一裁剪）→ 长会话下无限涨（WebView2 renderer 实测 1.2GB）。先补了「按条裁 300」，
+//   但用户实测「窗口没遵循 50、随对话不断增大」—— 因为 300 条远大于 50，且一旦点过「加载更早」，
+//   extendedWindow 会让上限【永久】变成 500 条（该键只在删会话时清）。
+// 现语义（用户 2026-09-23 裁定）：窗口 = **最近 50 个对话轮**（user+assistant 记一轮；tool 行 / 纯 meta
+//   行不计轮），新消息进来即从头部挤出最老的一轮（LRU）→ 挤出的**真卸载**出 store，回看时由顶部
+//   「加载更早」重新向服务端拉。轮判据的**唯一真源**在 ./messageTurns（与 MessageList 渲染分组同源）。
+export const MESSAGE_WINDOW_TURNS = 50
 
 // [图片缓存有界] 每会话图片缓存条数上限。base64 图（缩略图/粘贴图）单条可达数百 KB～数 MB，
 //   原实现只合并 {...old, ...new} 从不删、无上限 → 删了会话图片仍驻留。按会话封顶，超出按
@@ -135,9 +123,7 @@ export interface ChatState {
   streamTicks: Record<string, number>
   /** [snip-persist] 会话级被裁剪消息 id 集合（Snip 后前端标注「已裁剪」· 实时 STOMP + F5 boundary 解析合并） */
   snippedIds: Record<string, string[]>
-  /** [有界窗口] 该会话是否已显式「加载更早」prepend 过 → append 裁剪上限放宽到 MESSAGE_WINDOW_MAX，
-   *  避免 append 的头部裁剪立刻吃掉显式加载的更早页（见 MESSAGE_WINDOW_MAX 注释）。删会话时清理。 */
-  extendedWindow: Record<string, boolean>
+
   conversationIds: Record<string, string>             // sessionId -> partial 压缩后新 conversationId（消息 row key 刷新）
   permissionQueue: PermissionRequestItem[]
   connection: 'idle' | 'connecting' | 'connected' | 'disconnected'
@@ -166,7 +152,7 @@ export interface ChatState {
   /** 会话 token/金额汇总实时更新（complete 事件 → 覆盖会话累计 · 底部 footer 展示） */
   updateSessionUsage: (sessionId: string, usage: { totalCostYuan?: number | null; totalTokens?: number | null }) => void
   setMessages: (sessionId: string, msgs: ChatMessageDto[]) => void
-  /** [有界窗口] 尾部【追加】消息并裁剪（保留最近 N 条，头部裁剪）。凡「在既有消息后接新消息」一律
+  /** [有界窗口] 尾部【追加】消息并裁剪（保留最近 N 个对话轮，整轮裁剪）。凡「在既有消息后接新消息」一律
    *  走本方法，不要自行 `setMessages([...prev, ...new])` —— 那条路绕过裁剪、是内存无界的漏洞口。
    *  与 setMessages 的区别：setMessages = 服务端整表替换（有界，头部可能是 compact 摘要，不裁剪）；
    *  appendMessages = 本地追加（无界，必须裁剪，头部最老的先走）。 */
@@ -249,12 +235,6 @@ export interface ChatState {
   prependMessages: (sessionId: string, older: ChatMessageDto[], hasMore: boolean) => void
 }
 
-/** 追加路径（append）的裁剪上限：该会话已显式 prepend 过更早历史 → 放宽到 MESSAGE_WINDOW_MAX
- *  （给用户加载的更早页留预算，不被下一次 append 吃掉）；否则 MESSAGE_WINDOW_KEEP。 */
-function appendKeep(st: ChatState, sessionId: string): number {
-  return st.extendedWindow[sessionId] ? MESSAGE_WINDOW_MAX : MESSAGE_WINDOW_KEEP
-}
-
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
   sessions: [],
   messages: {},
@@ -266,7 +246,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   streamOrder: {},         // [流式性能] 会话流式块稳定顺序（块增删才换引用 · content 追加不触碰）
   streamTicks: {},          // [chat-switch-stream-align] 会话流式活动节拍（appendChunk/Reasoning 递增 · 滚底按会话隔离）
   snippedIds: {},          // [snip-persist] 会话级被裁剪消息 id（Snip 后「已裁剪」角标）
-  extendedWindow: {},      // [有界窗口] 已显式 prepend 更早历史的会话（append 裁剪上限放宽）
+
   conversationIds: {},
   permissionQueue: [],
   connection: 'idle',
@@ -304,14 +284,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     //   故此处【不裁剪】。凡本地「往尾部接消息」一律改用 appendMessages（见下），二者分工明确。
     return { messages: { ...st.messages, [sessionId]: msgs }, snippedIds }
   }),
-  // [有界窗口] 本地尾部追加 → 统一走 capTail（保留最近 N 条，头部裁剪）。这是 App 三条追加路径
+  // [有界窗口] 本地尾部追加 → 统一走 capTail（保留最近 N 个对话轮，整轮裁剪）。这是 App 三条追加路径
   //   （queue.drained 排队气泡 / away-summary 回插 / 发送成功乐观 user 气泡）的唯一入口：它们原先各自
   //   `setMessages([...prev, new])` 绕过了 setMessages 的不裁剪设计 → 其中 away-summary 由 blur 触发、
   //   不保证随后有 finalize 兜底，在会话生命周期内只增不减（内存无界漏洞）。收敛到本方法根治。
   appendMessages: (sessionId, msgs) => set((st) => {
     if (!msgs?.length) return st
     const prev = st.messages[sessionId] ?? []
-    return { messages: { ...st.messages, [sessionId]: capTail([...prev, ...msgs], appendKeep(st, sessionId)) } }
+    return { messages: { ...st.messages, [sessionId]: capTailTurns([...prev, ...msgs], MESSAGE_WINDOW_TURNS) } }
   }),
   /** [snip-persist] STOMP message.boundary 实时合并被裁剪消息 id（会话级 snippedIds） */
   markSnipped: (sessionId, ids) => set((st) => {
@@ -339,7 +319,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     },
   })),
   // 删除会话：清空该会话的【全部】会话级状态。原实现漏了 imageCache（base64 图片删会话后仍驻留
-  //   → 内存泄漏）以及 hasMore/msgTotals/snippedIds/streamTicks/extendedWindow（会话已删，这些键
+  //   → 内存泄漏）以及 hasMore/msgTotals/snippedIds/streamTicks（会话已删，这些键
   //   永远不会再被读，纯占内存）。此处按会话键逐个删除，保证删会话 = 该会话内存整体释放。
   clearSession: (sessionId) => set((st) => {
     const messages = { ...st.messages }
@@ -353,7 +333,6 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const msgTotals = { ...st.msgTotals }
     const snippedIds = { ...st.snippedIds }
     const streamTicks = { ...st.streamTicks }
-    const extendedWindow = { ...st.extendedWindow }
     // [按会话键控] 压缩进度 / 压缩警告也是会话级键：删会话一并释放（否则该键永不再被读，纯残留）
     const compact = { ...st.compact }
     const tokenWarning = { ...st.tokenWarning }
@@ -370,11 +349,10 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     delete msgTotals[sessionId]
     delete snippedIds[sessionId]
     delete streamTicks[sessionId]
-    delete extendedWindow[sessionId]
     delete compact[sessionId]
     delete tokenWarning[sessionId]
     delete serverRunning[sessionId]
-    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, extendedWindow, compact, tokenWarning, serverRunning }
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, compact, tokenWarning, serverRunning }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
@@ -523,8 +501,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const { [sessionId]: _drop, ...rest } = st.streams
     const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
-    // [有界窗口] 块转消息是追加路径 → 统一裁剪（保留最近 N 条，头部裁剪）
-    return { streams: rest, streamOrder: restOrder, messages: { ...st.messages, [sessionId]: capTail(ordered, appendKeep(st, sessionId)) } }
+    // [有界窗口] 块转消息是追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
+    return { streams: rest, streamOrder: restOrder, messages: { ...st.messages, [sessionId]: capTailTurns(ordered, MESSAGE_WINDOW_TURNS) } }
   }),
   clearStream: (sessionId) => set((st) => {
     const { [sessionId]: _drop, ...rest } = st.streams
@@ -543,13 +521,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     return {
       permissionQueue: st.permissionQueue.filter(r => r.requestId !== requestId),
       // [有界窗口] 超时留痕也是追加路径 → 统一裁剪
-      messages: { ...st.messages, [sessionId]: capTail([...msgs, {
+      messages: { ...st.messages, [sessionId]: capTailTurns([...msgs, {
         id: `perm-${requestId}`, sessionId, role: 'system', author: 'system',
         content: `工具 ${req.toolName} 请求权限，已超时（自动拒绝）`,
         reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null,
         reasoningDurationMs: null, time: null, toolCallId: null, assistantMessageId: null, subtype: 'permission_timeout',
         isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null,
-      }], appendKeep(st, sessionId)) },
+      }], MESSAGE_WINDOW_TURNS) },
     }
   }),
   setRetry: (retry) => set({ retry }),
@@ -591,8 +569,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       isMeta, isApiErrorMessage: false, apiError: null, error: null,
       errorDetails: null, matchedRule: null,
     }
-    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 条，头部裁剪）
-    return { messages: { ...st.messages, [sessionId]: capTail([...msgs, metaMsg], appendKeep(st, sessionId)) } }
+    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
+    return { messages: { ...st.messages, [sessionId]: capTailTurns([...msgs, metaMsg], MESSAGE_WINDOW_TURNS) } }
   }),
   addToolUseSummary: (sessionId, { id, content, userMessageId }) => set((st) => {
     const msgs = st.messages[sessionId] ?? []
@@ -615,8 +593,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const next = [...msgs]
     next.splice(insertAt, 0, summaryRow)
-    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 条，头部裁剪）
-    return { messages: { ...st.messages, [sessionId]: capTail(next, appendKeep(st, sessionId)) } }
+    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
+    return { messages: { ...st.messages, [sessionId]: capTailTurns(next, MESSAGE_WINDOW_TURNS) } }
   }),
   // [P2-15] Stop hook 摘要实时行（/topic/tasks 事件）：元数据型内容（hook 计数/错误/阻止原因）→
   //   行内挂 payload（不是正文），MessageList 走独立摘要行渲染分支（不得当普通气泡）。
@@ -643,7 +621,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const next = [...msgs]
     next.splice(insertAt, 0, row)
-    return { messages: { ...st.messages, [sessionId]: capTail(next, appendKeep(st, sessionId)) } }
+    return { messages: { ...st.messages, [sessionId]: capTailTurns(next, MESSAGE_WINDOW_TURNS) } }
   }),
   setHasMore: (sessionId, hasMore) => set((st) => ({
     hasMore: { ...st.hasMore, [sessionId]: hasMore },
@@ -662,18 +640,12 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       : st.snippedIds
     // 头部 unshift：older 更早 → 拼在 existing 前保持 created_at 时序（overlap id 以 existing 为准）
     const merged = fresh.length === 0 ? existing : [...fresh, ...existing]
-    // [有界窗口] prepend 是用户显式行为：按【绝对硬顶】MESSAGE_WINDOW_MAX 从头部裁剪（达到上限时
-    //   最老的先走 = 新到的更早页被同一次裁剪舍弃，见 MESSAGE_WINDOW_MAX 注释的明确行为）。
-    //   并标记该会话「窗口已扩容」→ 后续 append 的裁剪上限放宽到 MAX，避免刚加载的更早页被下一次
-    //   append 立刻吃掉（用户显式行为不得被后台追加无声抹掉）。未超正常窗口时不标记，保持紧上限。
-    const capped = capTail(merged, MESSAGE_WINDOW_MAX)
-    const extendedWindow = fresh.length > 0 && capped.length > MESSAGE_WINDOW_KEEP
-      ? { ...st.extendedWindow, [sessionId]: true }
-      : st.extendedWindow
+    // [窗口=最近 50 轮] prepend 是【用户显式行为】，此处**不施加轮窗口裁剪** ——
+    //   若这里也按 50 轮裁，刚加载的更早页会被同一次裁剪立刻舍掉，按钮点了等于没反应。
+    //   窗口收敛交给追加路径（append 类）：下一条新消息进来时按 50 轮从头部挤出最老的一轮（LRU）。
     return {
-      messages: { ...st.messages, [sessionId]: capped },
+      messages: { ...st.messages, [sessionId]: merged },
       snippedIds,
-      extendedWindow,
       hasMore: { ...st.hasMore, [sessionId]: hasMore },
     }
   }),

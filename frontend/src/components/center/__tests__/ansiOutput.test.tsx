@@ -75,7 +75,7 @@ describe('AnsiOutput 工具卡折叠（前 8 + 后 8）', () => {
     const msg = assistantToolMsg('m1', outputLines(n))
     useChatStore.setState({
       messages: { [SID]: [msg] }, hasMore: {},
-      streams: {}, streamOrder: {}, streamTicks: {}, extendedWindow: {},
+      streams: {}, streamOrder: {}, streamTicks: {},
     })
     await act(async () => {
       root.render(
