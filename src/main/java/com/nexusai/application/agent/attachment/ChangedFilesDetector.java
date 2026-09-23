@@ -68,7 +68,9 @@ import java.util.Map;
  *       超时返回 undefined ⇒ {@code !patch} ⇒ 片段 {@code ''}（静默无附件）。本仓的 LCS 端口
  *       （{@link StructuredPatchGenerator}）无超时概念，但 DP 矩阵是 O(行数²) 内存 ⇒ 用
  *       {@link #DIFF_MAX_MATRIX_CELLS} 表达同一件事：超限 = 等价于 CC 的超时退化（记 WARN 后返回空片段）。</li>
- *   <li><b>[CC 已知残缺，如实抄下] readFileState 是 100 条 + 25MB 双限 LRU</b>（fileStateCache.ts:18/:22，
+ *   <li><b>[CC 已知残缺，如实抄下] readFileState 是条目数 + 25MB 双限 LRU</b>
+ *       （条目数取值 = {@link ToolUseContext#READ_FILE_STATE_CACHE_SIZE}，对齐目标 CC 2.1.278 的
+ *       {@code LC=5000}；2.1.88 fileStateCache.ts:18 为 100。字节上限 :22 两版一致 = 25MB。
  *       本仓 {@link FileStateCache} 同构）⇒ 忙会话会把根 CLAUDE.md 挤掉，此后它的变更<b>不再被投递</b>
  *       （CC 只有 nested memory 有 {@code loadedNestedMemoryPaths} 非驱逐兜底，根 CLAUDE.md 没有）。</li>
  *   <li><b>[CC 已知残缺，如实抄下] 只投 8KB 截断的 diff 片段</b>（{@link #DIFF_SNIPPET_MAX_BYTES}）⇒
@@ -241,7 +243,12 @@ public final class ChangedFilesDetector {
         // CC :2104 —— 先写回 readFileState（新内容 + 新 mtime），再判片段是否为空：
         //   「mtime 变了但内容没变」（touch / 存盘重写）也落位 ⇒ 下一轮不再重复读盘
         //   ⚠ 本仓写的 offset/limit 是 null（= 全量视图），非 CC 的 offset=1 —— 见类 javadoc「有意偏离 1」
-        readFileState.set(path, new ToolUseContext.ReadState(mtime, null, null, false, newContent));
+        // [批 rfs-replay-3b] contentNotInModelContext=false —— ⚠️ 如实登记：本处 content 是「现读盘」
+        //   得来（严格说属「不在模型上下文」）。但 CC 2.1.278 在本位点（exe off 204536958 PostToolUse
+        //   hook 重同步）是 `...(!N||h.contentNotInModelContext)&&{contentNotInModelContext:!0}`（条件打标），
+        //   本批范围**不含**把这套条件打标接进本路径（派单书只要求 replay 的 Edit 支打标 + 门禁消费），
+        //   故此处给默认值 false 保持现有行为，不引入行为变化。见报告 deviations（登记为后续候选）。
+        readFileState.set(path, new ToolUseContext.ReadState(mtime, null, null, false, newContent, false));
         if (oldContent == null) {
             // 无基线内容（ReadState.full(mtime) 无 content 变体）⇒ 无从 diff，只落位新内容
             if (log.isDebugEnabled()) {

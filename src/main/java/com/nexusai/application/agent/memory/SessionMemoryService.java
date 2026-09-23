@@ -60,9 +60,13 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileAttribute;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -794,6 +798,11 @@ public class SessionMemoryService {
             String currentMemory = setupSessionMemoryFile(setupCtx, memoryPath);
 
             // ── buildSessionMemoryUpdatePrompt（CC :310-313）──
+            // [edit-obs-2a] fork 起点观测 · ⭐纯观测（不改 prompt、不改判定、不改落库）。
+            //   与 EditFileTool 的 SNF 观测配对：本行 sha256(currentMemory) == 失败时刻的
+            //   diskSha256 ⇒ 磁盘自 fork 起点未变（误引）；不等 ⇒ 内容在两次之间漂移。
+            //   同一 memoryPath 两次 fork 之间被 Edit 过 ⇒ 能从本行计数看出（H-D 的唯一通道）。
+            logForkStartBaseline(sessionId, memoryPath, currentMemory);
             String userPrompt = prompts.buildSessionMemoryUpdatePrompt(currentMemory, memoryPath.toString());
             List<ChatMessageDto> promptMessages = List.of(userMessage(userPrompt));
 
@@ -966,6 +975,8 @@ public class SessionMemoryService {
             Path memoryPath = resolvePath(sessionId);
             String currentMemory = setupSessionMemoryFile(setupCtx, memoryPath);
 
+            // [edit-obs-2a] fork 起点观测（manual 路径 · 与 extract 路径同一观测口径）
+            logForkStartBaseline(sessionId, memoryPath, currentMemory);
             String userPrompt = prompts.buildSessionMemoryUpdatePrompt(currentMemory, memoryPath.toString());
             List<ChatMessageDto> promptMessages = List.of(userMessage(userPrompt));
 
@@ -1265,6 +1276,53 @@ public class SessionMemoryService {
         emitTelemetry("tengu_session_memory_file_read",
             java.util.Map.of("content_length", content.length()));
         return content;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [edit-obs-2a] fork 起点观测 · 纯观测，零行为变更
+    //
+    // WHY（本批目的）: Edit 失败 415 次里 308 次是 SNF，其中 305 次落在「会话记忆 fork」
+    //   自己写的文件（session-memory/summary.md + memory/*.md）上。要判「模型误引（H-C）」
+    //   还是「fork 起点与施加时刻之间内容漂移（H-D）」，缺的正是「fork 那一刻 currentMemory
+    //   到底是什么」。本方法把该值以 len+sha256 落盘（⛔ 不打全文，避免体量失控）——
+    //   与 EditFileTool 的 diskSha256 直接可比，且同一路径被几次 fork 打过可从本行数出来。
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * [edit-obs-2a] fork 起点基线 INFO 落盘（对齐目标 CC 2.1.278；本方法为 Java 侧新增观测，
+     * CC 真源无对应物）。
+     *
+     * @param sessionId     会话 id（可为 null ⇒ 记 "确无会话" 字面量，不用占位符冒充会话）
+     * @param memoryPath    session memory 文件路径
+     * @param currentMemory fork 起点读到的当前内容（length + sha256；⛔ 不落全文）
+     */
+    private static void logForkStartBaseline(String sessionId, Path memoryPath, String currentMemory) {
+        if (!log.isInfoEnabled()) {
+            return;
+        }
+        String memory = currentMemory == null ? "" : currentMemory;
+        log.info("[SessionMemory] fork 起点观测(非判定): session={} path={} currentMemoryLen={} currentMemorySha256={}",
+            sessionId == null ? "<确无会话>" : sessionId,
+            memoryPath == null ? "<null>" : memoryPath,
+            memory.length(),
+            sha256Hex(memory));
+    }
+
+    /**
+     * [edit-obs-2a] sha256（UTF-8 字节）· 与 {@code EditFileTool#sha256Hex} 同算法同口径
+     * （本仓既有约定为各消费者私有小工具，见 McpbHandler.java:706 / Download.java:148）。
+     *
+     * @return 64 位小写十六进制；入参 null → 空串的摘要（不抛）
+     */
+    private static String sha256Hex(String s) {
+        String v = s == null ? "" : s;
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(md.digest(v.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 是 JDK 必备算法，理论不可达；真不可达也不阻断提取（观测不 fail-loud）
+            return "sha256-unavailable";
+        }
     }
 
     /**

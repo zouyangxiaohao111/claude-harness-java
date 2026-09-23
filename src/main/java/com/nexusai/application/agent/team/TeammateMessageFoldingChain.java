@@ -170,12 +170,20 @@ public final class TeammateMessageFoldingChain {
      * @param status     终态 'completed' | 'failed' | 'killed'
      * @param sessionId  会话 id（透传定位 transcript）
      * @return author='attachment' + subtype='task_status' 的 ChatMessageDto
+     *
+     * <p><b>[同 subtype 两种可见性 · 有意]</b> 本方法 isMeta 硬编码 false（下面构造器第 19 实参）：
+     * task_status 在<b>本支</b>是给<b>人</b>看的完成通知（前端渲染「Teammate @x shut down」），必须可见。
+     * 对照另一侧：compact 恢复支 {@code PostCompactAttachmentRestorer.asyncAgentAttachments} 产出同一个
+     * subtype 时走 {@code buildAttachmentMessage} ⇒ isMeta=true（给<b>模型</b>看的上下文恢复 ⇒ 前端隐藏）。
+     * 同一 subtype 的两种可见性按<b>收件人</b>区分，是预期语义 —— 勿「统一」成同一个值
+     * （锁进测试：TeammateMessageFoldingChainTest#taskStatus_twoVisibilities_areIntentional）。
      */
     public static ChatMessageDto teammateTaskStatusAttachment(String taskId, String agentName,
                                                               String status, String sessionId) {
         String payload = "{\"type\":\"task_status\",\"taskId\":\"" + taskId
             + "\",\"taskType\":\"in_process_teammate\",\"description\":\"" + agentName
             + "\",\"status\":\"" + status + "\",\"deltaSummary\":null,\"outputFilePath\":null}";
+        // isMeta 第 19 实参 = false：给人看的通知，保持可见（见上方 javadoc：有意与 compact 支相反）
         return new ChatMessageDto(
             null, sessionId, null, TYPE_ATTACHMENT, payload, null,
             null, null, null, null, "刚刚", null,

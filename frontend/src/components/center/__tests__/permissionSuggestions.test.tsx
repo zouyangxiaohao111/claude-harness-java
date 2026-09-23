@@ -232,6 +232,40 @@ describe('[批 A3] 建议档位文案 · 分工具', () => {
     expect(formatSuggestionLabel(update, 'Edit')).toContain('.claude/')
   })
 
+  // ── [批 2026-09-22 发钥匙] 本仓自有根（.nexusai）= 后端「编辑自有设置（本会话）」档的产出 ──
+
+  it('Edit `~/.nexusai/**` 规则（自有设置档）⇒ 配置目录特例文案（⛔ 不得掉进「未识别形态」）', () => {
+    // WHY：后端新档（PermissionUpdates.selfConfigRootRuleSuggestion）产出的 ruleContent 就是
+    //   `~/.nexusai/**` / `/.nexusai/**`。不登记这一形 ⇒ 用户点档前看到的按钮文案退化成
+    //   「允许：Edit(~/.nexusai/**)」+ 每次渲染一条 console.warn（留痕噪声）。本用例同时钉住
+    //   「不静默」——若走了未识别分支会有 warn 被断言出来。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    for (const ruleContent of ['~/.nexusai/**', '/.nexusai/**']) {
+      const update: PermissionUpdate = {
+        type: 'addRules', rules: [{ toolName: 'Edit', ruleContent }], behavior: 'allow', destination: 'session',
+      }
+      const label = formatSuggestionLabel(update, 'Edit')
+      expect(label, `自有设置档文案缺目录名: ${ruleContent}`).toContain('.nexusai/')
+      expect(label, `自有设置档必须说清作用域: ${ruleContent}`).toContain('本次会话')
+      expect(label, `文案不得出现内部术语: ${ruleContent}`).not.toMatch(/CC|claude/i)
+    }
+    expect(warn).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledTimes(0)
+    warn.mockRestore()
+  })
+
+  it('⛔ 尾斜杠标记不得误伤同前缀目录名（`.nexusai2/` 不走配置目录特例）', () => {
+    const update: PermissionUpdate = {
+      type: 'addRules', rules: [{ toolName: 'Edit', ruleContent: '~/.nexusai2/**' }], behavior: 'allow', destination: 'session',
+    }
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const label = formatSuggestionLabel(update, 'Edit')
+    expect(label).not.toContain('编辑配置目录')
+    expect(label).toContain('.nexusai2')  // 退回按规则原文渲染
+    expect(warn).toHaveBeenCalled()        // 且留痕（不静默）
+    warn.mockRestore()
+  })
+
   it('MCP 整工具（无 ruleContent）⇒ 不再询问该工具', () => {
     expect(formatSuggestionLabel(mcpWholeTool('mcp__fs__read'), 'mcp__fs__read')).toContain('mcp__fs__read')
   })

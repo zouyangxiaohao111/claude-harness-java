@@ -718,7 +718,10 @@ public class MemoryPrefetcher {
         // mark-after-filter：幸存者写 readFileState，后续 turn 不重复展示 · CC :2530-2537
         if (readFileState != null) {
             for (RelevantMemoryAttachment m : filtered) {
-                readFileState.set(m.path(), new ToolUseContext.ReadState(m.mtimeMs(), null, m.limit(), false, m.content()));
+                // [批 rfs-replay-3b] contentNotInModelContext=false：relevant-memory 的 content
+                //   已随附件注入模型上下文（模型看得到）；isPartialView 仍恒 false（本路径原样保留）。
+                readFileState.set(m.path(), new ToolUseContext.ReadState(
+                    m.mtimeMs(), null, m.limit(), false, m.content(), false));
             }
         }
         if (log.isDebugEnabled()) {

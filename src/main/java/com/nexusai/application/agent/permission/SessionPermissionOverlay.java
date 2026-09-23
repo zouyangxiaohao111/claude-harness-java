@@ -16,6 +16,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * [批 A2b] <b>会话级 SESSION 档授权载体</b> · sessions.session_permission_rules（V75 列）的
@@ -125,6 +126,72 @@ public final class SessionPermissionOverlay {
             ? parsed.mode()
             : (baseMode != null ? baseMode : PermissionMode.DEFAULT);
         return buildContext(parsed, mode);
+    }
+
+    /**
+     * [T1-A2 · 2026-09-22] <b>Leader 会话列活读桥</b>：返回一个可直接挂到
+     * {@code ToolUseContext.getAppState} 上的函数 —— 每次调用<b>实时</b>查一次 Leader 会话行，
+     * 把 SESSION 档列解码成 {@code appState.toolPermissionContext} 快照。
+     *
+     * <h2>WHY（teammate 看不到会话列的真因，与主会话同源的最小修法）</h2>
+     * <p>会话列**不是经 sessionId 读的**：全仓生产读点只有 {@code LlmAgentLoop.doRun}
+     * （LlmAgentLoop.java:3443-3457）把列注入 {@code appStateRef}，再由
+     * {@code AgentLoopContext.mergeAppStatePermissionRules}（:1604）经
+     * {@code baseTuc.getAppState().apply(null)} 并进 per-turn permCtx。teammate 的执行父 TUC 由
+     * {@code SpawnInProcess} 造「最小父 TUC」，其上 {@code getAppState} 是紧凑构造器兜底的**恒等函数**
+     * （ToolUseContext.java:469-470）⇒ 合并恒早退 ⇒ 用户弹窗批准后写进 Leader 会话列的授权
+     * （{@code WebSocketPermissionPrompter.applyAndPersistUpdates} 第 0 步 :1056-1066），
+     * teammate **下一轮读不回来**（= 用户最初的抱怨形态）。
+     *
+     * <p>因此这里给 teammate 的父 TUC 挂上<b>与主会话同一语义</b>的读桥：主会话读的是进程内
+     * {@code appStateRef} 活引用，teammate 读的是同一条会话的 DB 列（Web 端 prototype loop 模式下
+     * 该列就是 appState 的跨实例载体）。⛔ 不新造第二套状态机制、⛔ 不落盘。
+     *
+     * <h2>为什么必须「活读」而不是 spawn 时快照</h2>
+     * <p>批准发生在 spawn 之后是常态（e2e 观测到 park 48.6s 后才恢复）⇒ 快照必然漏掉本次 run 内
+     * 写入的授权，用例会「跨轮仍弹」。活读 = 每次 {@code apply(...)} 查一次 PK（per-turn ctx 每轮
+     * 构造一次 ⇒ 每轮一次查询，亚毫秒级、低频）。
+     *
+     * <h2>空态语义（⛔ 不塞空 ctx）</h2>
+     * <p>列无 SESSION 档条目 / 会话行不存在 / mapper 未注入 → 返回<b>不含</b>
+     * {@code toolPermissionContext} 键的空快照（合并方按「无叠加项」原样返回 per-turn ctx）。
+     * ⛔ 不得塞一个空 {@link ToolPermissionContext}：合并语义是「appState 侧 mode 胜出」
+     * （{@code AgentLoopContext:1622-1624}），空 ctx 的占位 mode 会把 teammate 的 per-turn 基线
+     * mode 覆盖掉（本批 teammate 基线恰为 {@code DEFAULT}，故传
+     * {@link PermissionMode#DEFAULT} 作 baseMode 是 no-op；列里真有 SESSION setMode 时用列值
+     * —— 那正是「本会话允许编辑对 teammate 也生效」的期望语义）。
+     *
+     * <p>本方法<b>永不抛</b>（读列失败 = 本轮不并入 + WARN，不阻断 teammate 执行）。
+     *
+     * @param sessionMapper  会话 mapper（可 null = 未注入 → 恒空快照，调用方须 WARN 不静默）
+     * @param leaderSessionId Leader 会话键（<= T1 之后 teammate 的归属会话）
+     * @param baseMode       列无 SESSION setMode 时的占位 mode（见上「空态语义」）
+     * @return {@code getAppState} 函数（输入 prev 被忽略 —— 与
+     *         {@code LlmAgentLoop.getAppStateSnapshot} 同形：恒返回当前快照）
+     */
+    public static Function<Map<String, Object>, Map<String, Object>> leaderAppStateReader(
+            SessionMapper sessionMapper, String leaderSessionId, PermissionMode baseMode) {
+        return prev -> {
+            if (sessionMapper == null || leaderSessionId == null || leaderSessionId.isBlank()) {
+                return Map.of();
+            }
+            try {
+                SessionRecord record = sessionMapper.selectOneById(leaderSessionId);
+                if (record == null) {
+                    return Map.of();
+                }
+                ToolPermissionContext overlay = toContext(record.getSessionPermissionRules(), baseMode);
+                if (overlay == null) {
+                    // 列无 SESSION 档条目 ⇒ 不放进快照（塞空 ctx 会让 mode 覆盖 per-turn 基线）
+                    return Map.of();
+                }
+                return Map.of("toolPermissionContext", overlay);
+            } catch (Exception e) {
+                log.warn("[T1-A2] teammate 读 Leader 会话列授权失败（本轮不并入，不阻断执行）: "
+                    + "leaderSession={} err={}", leaderSessionId, e.toString());
+                return Map.of();
+            }
+        };
     }
 
     // ════════════════════════════════════════════════════════════════════

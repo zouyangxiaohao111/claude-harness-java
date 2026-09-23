@@ -184,16 +184,13 @@ public class SettingsRecord {
     //   命名：snipNudgeThreshold 大写 T 映射 snip_nudge_threshold
     //   （MyBatis-Flex camelCase→snake 精确映射，同 V45 classifierModel 大写 M 反向先例）。
     private Integer snipNudgeThreshold;
-    // [prompt-align G0-02 V56] 提示词对齐门控 12 列（settings 单行多列；全部可空，
+    // [prompt-align G0-02 V56] 提示词对齐门控 11 列（settings 单行多列；全部可空，
     //   null = 回落 CC 原判定链 env/FeatureFlags/硬编码默认/既有判定类）。各列 CC original
     //   （Open-ClaudeCode 真源，行号以 worktree HEAD 6fe89de61 锚定，grep -n 复验）：
     //   task_reminder_enabled ↔ taskReminderEnabled：CC isTodoV2Enabled()
     //     （utils/tasks.ts:133-139）决定 Task V2 工具集启用 → task_reminder 系统提示附件注入门
     //     （utils/messages.ts:3680-3698）。null = 回落 TaskSystemConfig.isTodoV2Enabled()
     //     （经 MDC isInteractive 会话感知，决策 #65；保留现状不迁移，DocReflect R2）。
-    //   deferred_tools_delta_enabled ↔ deferredToolsDeltaEnabled：CC
-    //     utils/messages.ts:4178-4195 case 'deferred_tools_delta'。null = 回落当前 gate
-    //     （OPD-H-06 默认关）。
     //   system_prompt_boundary_enabled ↔ systemPromptBoundaryEnabled：CC
     //     constants/prompts.ts:572-573（BOUNDARY MARKER @572 + shouldUseGlobalCacheScope
     //     门 @573）+ utils/betas.ts:227-233。null = 回落 GlobalCacheScope.shouldUseGlobalCacheScope()。
@@ -220,7 +217,6 @@ public class SettingsRecord {
     //   skill_search_intent_enabled、agentMainThreadEnabled → agent_main_thread_enabled；
     //   同 websearchUseSmallModel 小写 s 教训反向先例）。
     private Boolean taskReminderEnabled;
-    private Boolean deferredToolsDeltaEnabled;
     private Boolean systemPromptBoundaryEnabled;
     private Boolean proactiveEnabled;
     private Boolean coordinatorModeEnabled;
@@ -376,11 +372,9 @@ public class SettingsRecord {
     // [V55] snip_nudge_threshold ↔ snipNudgeThreshold（MyBatis-Flex snake↔camel 映射）
     public Integer getSnipNudgeThreshold() { return snipNudgeThreshold; }
     public void setSnipNudgeThreshold(Integer snipNudgeThreshold) { this.snipNudgeThreshold = snipNudgeThreshold; }
-    // [prompt-align G0-02 V56] 提示词对齐门控 12 列 getter/setter（MyBatis-Flex snake↔camel 映射）
+    // [prompt-align G0-02 V56] 提示词对齐门控 11 列 getter/setter（MyBatis-Flex snake↔camel 映射）
     public Boolean getTaskReminderEnabled() { return taskReminderEnabled; }
     public void setTaskReminderEnabled(Boolean taskReminderEnabled) { this.taskReminderEnabled = taskReminderEnabled; }
-    public Boolean getDeferredToolsDeltaEnabled() { return deferredToolsDeltaEnabled; }
-    public void setDeferredToolsDeltaEnabled(Boolean deferredToolsDeltaEnabled) { this.deferredToolsDeltaEnabled = deferredToolsDeltaEnabled; }
     public Boolean getSystemPromptBoundaryEnabled() { return systemPromptBoundaryEnabled; }
     public void setSystemPromptBoundaryEnabled(Boolean systemPromptBoundaryEnabled) { this.systemPromptBoundaryEnabled = systemPromptBoundaryEnabled; }
     public Boolean getProactiveEnabled() { return proactiveEnabled; }

@@ -483,10 +483,6 @@ export interface AppSettings {
   enabledPlugins?: Record<string, boolean> | null
   /** 插件双读开关（settings.plugin_claude_fallback 0/1 · null = 回落默认 true：nexusai DB + CC settings.json 双读合并） */
   pluginClaudeFallback?: boolean | null
-  // V60 契约：提示词对齐门控列（后端 settings.deferred_tools_delta_enabled · INTEGER 列）
-  /** 工具延迟加载公告方式（settings.deferred_tools_delta_enabled · null/未配置 = 默认关闭）：
-   *  开 = 只公告变化的工具清单（增量附件，省 token）；关 = 每轮在消息队首发送完整清单。 */
-  deferredToolsDeltaEnabled?: boolean | null
   // V72 契约（2026-09-12 provider-custom-headers D6）：提供商自定义请求头的运行时占位符总开关
   /** 按会话展开请求头占位符（settings.allow_dynamic_header_values · 后端列 NOT NULL DEFAULT 1，
    *  即默认**开**）：开 = 值里的会话 ID 占位符替换成当前会话 ID；关 = 统一发固定值 nexusai-static。
@@ -1263,7 +1259,9 @@ export interface PermissionRequestEvent extends StreamEventBase {
  *  （{@code resolveCtxInfo}）。 */
 export interface TokenWarningEvent extends StreamEventBase {
   type: 'token_warning'
-  /** 压缩警告抑制态：压缩成功=true（隐藏）、新压缩开始=false（恢复显示） */
+  /** 压缩警告抑制态：压缩成功=true → 前端清除该会话告警；false（抑制位复位）**不等于显示** ——
+   *  是否显示另看载荷有无真实用量数字（{@code tokenUsage>0} 才显示；后端抑制开关翻转时推的
+   *  占位载荷 tokenUsage=0/contextWindow=0/percentLeft=null 仍不显示）。 */
   suppressed?: boolean
   /** 当前 token 用量（**本地估算** · 阈值判定用，非服务端真实 usage） */
   tokenUsage?: number

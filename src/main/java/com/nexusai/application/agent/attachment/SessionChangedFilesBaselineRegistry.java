@@ -25,12 +25,18 @@ import java.util.concurrent.ConcurrentHashMap;
  * 即：只有「同一 run 内改盘」才投递，而真实场景（用户两条消息之间改盘）恰好发生在
  * <b>run 与 run 之间</b> ⇒ 计划验收标准 #3 按自然解读不成立。
  *
- * <h2>⭐ 修法：把「首次会话登记」固化下来（run 级 readFileState + 会话级基线）</h2>
- * 本仓 {@code readFileState} 是 <b>run 级</b>缓存（{@code LlmAgentLoop.buildBaseToolUseContext}
- * 的 {@code readFileState=null} 分支 → {@code ToolUseContext} 构造器每次新建
- * {@link FileStateCache}；{@code LlmAgentLoop} 又是 {@code @Scope("prototype")}，每 send 新实例）
- * ⇒ 登记点每次 run 都会以「当下」为准。
- * 本表按 sessionId 持有<b>首次登记</b>的 {@code ReadState}（时间戳 + 内容基线），于是：
+ * <h2>⭐ 修法：把「首次会话登记」固化下来（会话级 readFileState + 会话级基线）</h2>
+ * ⛔ <b>注释更正（批 edit-gate-session-scope · E）</b>：本段原写「本仓 {@code readFileState} 是
+ * <b>run 级</b>缓存（{@code buildBaseToolUseContext} 的 {@code readFileState=null} 分支 →
+ * 构造器每次新建；{@code LlmAgentLoop} 为 {@code @Scope("prototype")} 每 send 新实例）」。
+ * 该断言<b>已不成立</b>：{@code buildBaseToolUseContext} 现取
+ * {@code SessionReadFileStateRegistry.forSession(sessionId)} ⇒ {@code readFileState} 已是
+ * <b>会话级</b>（同会话跨 run 恒同一张表；{@code LlmAgentLoop} 仍是 prototype，但缓存不再随
+ * loop 实例销毁 —— 缓存挂在静态注册表上）。本表<b>仍然必要</b>，理由已变：
+ * 本方法每 run 都会把「当下」写进登记的 entry（{@code registerMemoryFilesBaseline}），
+ * 会话级缓存只让<b>条目</b>活得更久、<b>不改时间戳被覆盖</b>这一事实 ⇒
+ * 没有本表仍会退化成「只有同一 run 内改盘才投递」。本表按 sessionId 持有
+ * <b>首次登记</b>的 {@code ReadState}（时间戳 + 内容基线），于是：
  * <ol>
  *   <li><b>登记</b>（{@code ClaudemdEngine.registerMemoryFilesBaseline}）：key 已存在 ⇒
  *       <b>复用旧基线</b>（不覆盖）；否则落下首次基线。两种情形都把该基线写进本 run 的 readFileState
@@ -42,16 +48,26 @@ import java.util.concurrent.ConcurrentHashMap;
  *       ⇒ 同一变更<b>只投一次</b>（否则下一次 run 又拿旧基线比对，变成每 run 刷屏）。</li>
  * </ol>
  *
- * <h2>⛔ 与 CC 的差异（显式登记，不假装抄全）</h2>
+ * <h2>与 CC 的关系（批 edit-gate-session-scope 后已对齐）</h2>
  * CC 的 {@code readFileState} <b>整张表就是会话级</b>（{@code REPL.tsx:3797-3818 onInit} 把
  * memory files 写进 {@code readFileState.current}，该 ref 活到进程结束＝会话结束），
- * 且<b>只在会话启动登记一次</b>。本仓受「run 级 readFileState + prototype loop」的结构限制，
- * 只把<b>登记基线的跨 run 记忆</b>提到会话级（本表），readFileState 本身仍是 run 级
- * —— 这是<b>有意的偏离</b>：把整张 readFileState 提为会话级会一并改变
- * 「Edit/Write 的 read-before-write 门禁」与「nested memory 的 readFileState 去重」的
- * 跨 run 语义（消费点很多），超出本次点名修复的范围（计划 §4 步骤 7 只要求投递通道成立）。
- * 计划文档给出的另一条路（把 readFileState 提为会话级）在结构上同样可行（本表即其前置），
- * 若后续要一步到位，应作为独立批次做并单独验证上述两条语义。
+ * 且<b>只在会话启动登记一次</b>。
+ * ⛔ <b>注释更正（批 edit-gate-session-scope · E）</b>：本段原写「本仓受『run 级
+ * readFileState + prototype loop』的结构限制，只把登记基线的跨 run 记忆提到会话级，
+ * readFileState 本身仍是 run 级 —— 这是有意的偏离」。该偏离<b>已由本批消除</b>：
+ * readFileState 已提到会话级（{@code SessionReadFileStateRegistry}，键 = sessionId，
+ * 注入点 {@code LlmAgentLoop.buildBaseToolUseContext}）。
+ * 由此一并改变的正是当时列为「待独立验证」的两条跨 run 语义：
+ * <ol>
+ *   <li><b>Edit/Write/Notebook 的 read-before-write 门禁</b>跨 run 生效 —— 这是本批的
+ *       <b>目标收益</b>（同会话上一轮 Read 过、本轮 Edit 不再被拒）；</li>
+ *   <li><b>nested memory 的 readFileState 去重</b>跨 run 生效 —— 子代理侧已用
+ *       {@code ToolUseContext.cloneFileStateCache} 隔离（{@code SubagentExecutor.withEffectiveCwd}），
+ *       会话表不被子代理写/清污染。</li>
+ * </ol>
+ * ⚠️ 仍未实现的一条：CC 2.1.278 的<b>跨进程</b> resume 恢复（从会话消息历史重放 Read 调用
+ * 重建缓存：发行产物 {@code restoreReadFileState} → {@code mergeReadFileStateFrom}）。
+ * 本仓静态表只覆盖同 JVM 内跨 run；后端进程重启后缓存为空。属独立批次。
  *
  * <h2>为什么是本表而不是复用 SessionPromptCacheStore</h2>
  * {@code SessionPromptCacheStore} 是「prompt 缓存」容器（分段缓存 / 四个冻结值 / 尾部日期状态），
@@ -81,7 +97,8 @@ public final class SessionChangedFilesBaselineRegistry {
      * 取（必要时首建）该会话的基线表 · 同 sessionId 恒返回同一实例（跨 run 不销毁）。
      *
      * <p>容量与 {@code readFileState} 同口径（{@link ToolUseContext#createFileStateCache()} =
-     * 100 条 + 25MB 双限真 LRU）—— 基线承载的正是同一批 entry 的「首次」版本，
+     * {@link ToolUseContext#READ_FILE_STATE_CACHE_SIZE} 条 + 25MB 双限真 LRU，条目数对齐目标
+     * CC 2.1.278 的 {@code LC=5000}）—— 基线承载的正是同一批 entry 的「首次」版本，
      * 用同一容量语义避免两处口径分叉。
      *
      * @param sessionId 会话 id（short 形态 sess-xxx）
@@ -126,7 +143,8 @@ public final class SessionChangedFilesBaselineRegistry {
      * <p><b>逐 key 规则</b>（key 集合取自基线表本身 —— 只有记忆文件才进基线）：
      * <ol>
      *   <li>run 缓存里<b>没有</b>该 key ⇒ 基线里删除它（本 run 未登记 / 文件已被删（ENOENT 驱逐）/
-     *       被 100 条 LRU 挤出）—— 与 CC「entry 掉出 readFileState 后不再投递」同义。</li>
+     *       被 {@link ToolUseContext#READ_FILE_STATE_CACHE_SIZE} 条 LRU 挤出）—— 与 CC「entry 掉出
+     *       readFileState 后不再投递」同义。</li>
      *   <li>run 缓存里是<b>全量视图</b>（{@code offset/limit} 均为 null）⇒ 固化（新时间戳 + 新内容）。</li>
      *   <li>run 缓存里是<b>窗口视图</b>（{@code offset/limit} 已设，模型用 Read(offset,limit) 读过）
      *       ⇒ <b>保留旧基线</b>：{@code ChangedFilesDetector} 会跳过窗口 entry（CC

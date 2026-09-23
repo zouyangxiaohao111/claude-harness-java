@@ -79,8 +79,10 @@ public class createSubagentContext {
          *  abortControllerRef.abort() → abortController.set(true) (通过 onCancel listener)。 */
         AbortController abortControllerRef,
         /** 文件状态缓存（从父 Agent 克隆）· 对齐 CC readFileState (runAgent.ts:375-378).
-         *  [P-CC-02] 类型为 FileStateCache (双限真 LRU: maxEntries=100 + maxSizeBytes=25MB,
-         *  用户 2026-08-05 拍板严格对齐 CC, 对齐 CC fileStateCache.ts:30-93). */
+         *  [P-CC-02] 类型为 FileStateCache (双限真 LRU:
+         *  maxEntries={@link ToolUseContext#READ_FILE_STATE_CACHE_SIZE}（=5000，对齐目标 CC 2.1.278
+         *  的 {@code LC=5000}；2026-09-22 用户裁定，原 100 系对齐 2.1.88）+ maxSizeBytes=25MB,
+         *  对齐 CC fileStateCache.ts:30-93). */
         FileStateCache readFileState,
         /** 内容替换状态（从父 Agent 克隆）· 对齐 CC contentReplacementState */
         Map<String, Object> contentReplacementState,

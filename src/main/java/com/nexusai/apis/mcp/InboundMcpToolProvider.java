@@ -80,8 +80,9 @@ import java.util.UUID;
  * <h2>ToolUseContext 构造（CC mcp.ts:112-134）</h2>
  * <p>{@code abortController} 新建、{@code mcpClients} 空、{@code isNonInteractiveSession}
  * =true、{@code availableTools}=getTools(空权限上下文)、{@code readFileState} 走
- * {@link ToolUseContext#createFileStateCache()}（100 条 / 25MB 双限 LRU，对齐 CC
- * createFileStateCacheWithSizeLimit(100)）。其余字段走 compact ctor 兜底。
+ * {@link ToolUseContext#createFileStateCache()}（{@link ToolUseContext#READ_FILE_STATE_CACHE_SIZE}
+ * 条 / 25MB 双限 LRU，条目数对齐目标 CC 2.1.278 的 {@code LC=5000}；2.1.88 为
+ * {@code createFileStateCacheWithSizeLimit(100)}）。其余字段走 compact ctor 兜底。
  *
  * @see InboundMcpServerConfig
  */

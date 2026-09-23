@@ -50,8 +50,6 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   const [wsApiKey, setWsApiKey] = useState<string>(settings?.apiKey ?? '')
   const [wsBaseUrl, setWsBaseUrl] = useState<string>(settings?.websearchBaseUrl ?? '')
   const [wsDomainCheckUrl, setWsDomainCheckUrl] = useState<string>(settings?.websearchDomainCheckUrl ?? '')
-  // 工具延迟加载公告方式（settings.deferredToolsDeltaEnabled · 未配置 = 关闭）
-  const [dtdDeltaEnabled, setDtdDeltaEnabled] = useState<boolean>(settings?.deferredToolsDeltaEnabled ?? false)
   // 协调者模式（settings.coordinatorModeEnabled · 未配置 = 关闭）
   const [coordinatorModeOn, setCoordinatorModeOn] = useState<boolean>(settings?.coordinatorModeEnabled ?? false)
   // away-summary 门控（localStorage · 两开关都开才触发 blur 摘要；后端 features API 补后接入）
@@ -73,11 +71,6 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
     setWsBaseUrl(settings?.websearchBaseUrl ?? '')
     setWsDomainCheckUrl(settings?.websearchDomainCheckUrl ?? '')
   }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.apiKey, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl])
-
-  // 工具延迟加载公告方式草稿 ← settings（后端异步加载后回填）
-  useEffect(() => {
-    setDtdDeltaEnabled(settings?.deferredToolsDeltaEnabled ?? false)
-  }, [settings?.deferredToolsDeltaEnabled])
 
   // 协调者模式草稿 ← settings（后端异步加载后回填）
   useEffect(() => {
@@ -696,30 +689,6 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                 </div>
               )}
             </div>
-          </div>
-        </div>
-      </div>
-
-      {/* 模块：工具加载（延迟加载工具的公告方式 · 写 settings.deferredToolsDeltaEnabled） */}
-      <div className="envc-card">
-        <div className="envc-card-title">工具加载</div>
-        <div className="envc-row">
-          <div className="envc-label-group">
-            <span className="envc-name">延迟加载公告用增量方式</span>
-            <span className="envc-desc">开启后只公告变化的工具清单（省 token）；关闭则每轮发送完整清单。默认关闭</span>
-          </div>
-          <div className="envc-control">
-            <label className="settings-switch">
-              <input
-                type="checkbox"
-                checked={dtdDeltaEnabled}
-                onChange={(e) => {
-                  setDtdDeltaEnabled(e.target.checked)
-                  void onSaveSettings({ deferredToolsDeltaEnabled: e.target.checked })
-                }}
-              />
-              <span></span>
-            </label>
           </div>
         </div>
       </div>

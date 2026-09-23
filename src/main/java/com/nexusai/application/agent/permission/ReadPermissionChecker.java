@@ -580,4 +580,203 @@ public class ReadPermissionChecker {
             new PermissionDecisionReason.Other("Agent memory files are allowed for reading"),
             null, false, null, List.of());
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [批 gate-allow-skip] CC `Wu` 等价物 —— 文件工具 read-before-write 门禁的「免门」判据
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * CC {@code bm}（**探针用 Read 工具占位对象**）等价物 —— 仅供 {@link #readLayerIsAllow}
+     * 构造合成 Read 调用。
+     *
+     * <p><b>来源分级：我 dd 读发行产物看到</b>（{@code .../@anthropic-ai/claude-code/bin/claude.exe}
+     * byte offset <b>200161381</b>，原文逐字）：
+     * <pre>
+     * var bm=new Proxy({name:nt,mcpInfo:void 0,familyParentToolName:void 0,aliasSkillToolNames:void 0,
+     *                   getPath:(e)=&gt;String(e.file_path)},
+     *   {get(e,n){if(typeof n==="symbol")return;if(n in e)return e[n];
+     *      throw new P(`readPermissionDecisionForPath probe consulted unsupported tool property: ${n}`, …)}});
+     * function wS(e,n){return $w(bm,{file_path:e},n)}      // off 200161740
+     * </pre>
+     * 即：CC 的逐路径 read 决策 {@code wS} = 拿<b>一个只为权限探针而造的占位工具</b>
+     * （{@code name: nt} + {@code getPath: file_path}）+ 合成 input {@code {file_path}} 跑
+     * {@code $w}（= {@code checkReadPermissionForTool}，off 200163639）。本 Java 占位工具
+     * 就是同一形态的镜像。
+     *
+     * <p>✅ <b>来源分级：我实测</b>（Python 读 exe bytes · 命令 {@code data.find(b'var nt=')}）
+     * —— {@code bm} 的结构、{@code wS} 的接线、<b>以及 {@code nt} 的值，三者同为实测档</b>，
+     * 且 export/import 绑定链闭合（同 chunk 内 export，权限模块按名 import）：
+     * <pre>
+     * exe off 197960630: nt="Read",Vlr=new Set(["png","jpg","jpeg…   （{@code var nt=} 起于 197960626）
+     * exe off 197960775: export{nt,Vlr,dYt}
+     * exe off 199949877: import{nt}from"B:/~BUN/root/chunk-zs2aa29f.js"
+     * </pre>
+     * ⇒ 与下文「{@code nt="Read"}（exe off 197960630）」（同为实测档）<b>不再自相矛盾</b>。
+     * ⛔ 本处曾写「{@code nt} 的值 = {@code "Read"}」= <b>我推断</b>、且「未直接观测到
+     * {@code nt="Read"} 的赋值（{@code nt} 定义在本 exe 的其它 chunk 边界外，grep 未命中）」
+     * —— 该「grep 未命中 / 未直接观测」是<b>假陈述</b>（一条 {@code data.find(b'var nt=')}
+     * 即命中 197960626），已按实测改正；同时抹掉原先三条「推断依据」（已无必要）。
+     *
+     * <p>⛔ <b>不得</b>拿调用方自己的工具实例（Edit/Write）顶替：本仓规则匹配按工具名
+     * <b>精确相等</b>分桶（{@code RuleQuery.toolNameMatches} = {@code equals}，
+     * {@code RuleQuery.java:738}），用错实例会把 read 桶的 deny/ask 规则查空 ⇒ 判据偏松。
+     * 权限链其余消费点只读 {@code getPath}/{@code name}，不读本占位工具的描述与 schema。
+     */
+    private static final Tool READ_TOOL_FOR_LAYER = new Tool() {
+        @Override public String name() { return "Read"; }
+        @Override public String description() {
+            return "[internal] Wu 免门判据的 Read 工具占位（不注册、不可执行）";
+        }
+        /**
+         * ⛔ 必须 override：{@link Tool#getPath} 的 default 返回 null，而本仓
+         * {@link #check} 第一道就是 `tool.getPath(input)`——不 override 会走「缺少 path → ask」，
+         * 免门判据<b>恒 false</b>（本批实测踩过：dc 用例里判据恒 false，日志
+         * {@code [ReadPermissionChecker] 缺少 path（tool.getPath=null/空）→ ask: tool=Read}）。
+         * 语义与 CC {@code bm} 的 {@code getPath:(e)=>String(e.file_path)} 逐字同源。
+         */
+        @Override public String getPath(JsonNode input) {
+            return input == null ? null : input.path("file_path").asText(null);
+        }
+        @Override public JsonNode inputSchema() { return JsonNodeFactory.instance.objectNode(); }
+        @Override public com.nexusai.application.agent.tool.AgentToolResult<?> execute(
+                com.nexusai.application.agent.tool.ToolUseBlock call) {
+            // 结构性不可达：本实例从不进 ToolRegistry、从不被 executor 调度。
+            return com.nexusai.application.agent.tool.ToolResult.error(
+                call.id(), "[internal] READ_TOOL_FOR_LAYER 仅用于权限层判定，不可执行");
+        }
+    };
+
+    /**
+     * 该路径的 <b>read 权限层是否 allow</b> —— CC {@code Wu(path, permissions)} 等价物。
+     *
+     * <h2>CC 真源（来源分级：我 dd 读发行产物看到 · exe byte offset 200161787）</h2>
+     * <pre>
+     * function Wu(e,n){if(Es(n,bm)!==null||wd(n,bm)!==null)return!1;switch(Bu([e],n).layer){
+     *   case"allow":return!0;
+     *   case"path-mode-ask":return n.mode==="bypassPermissions";
+     *   case"bare-deny":case"path-deny":case"path-rule-ask":case"bare-ask":return!1}}
+     * </pre>
+     * {@code Bu([path],n).layer} 的档位由 CC 逐路径 read 决策
+     * {@code wS(path,n)=$w(Read,{file_path:path},n)}（exe off 200161740 / 200163639）决定：
+     * {@code bare-deny}=Read 桶 whole-tool deny 规则命中；
+     * {@code path-deny}=该路径 read 决策 deny；{@code path-rule-ask}=该路径 read 决策 ask
+     * 且归因为 rule；{@code bare-ask}=Read 桶 whole-tool ask 规则命中；
+     * {@code path-mode-ask}=该路径 read 决策 ask 且归因<b>非</b> rule；{@code allow}=其余。
+     *
+     * <h2>本仓映射（等价物 + 与 CC 的差别）</h2>
+     * <ul>
+     *   <li>{@code bare-deny}/{@code bare-ask} → {@link RuleQuery#getDenyRuleForTool} /
+     *       {@link RuleQuery#getAskRuleForTool}（Read 桶 whole-tool 规则；本仓 read 决策链
+     *       {@link #check} <b>不</b>查 whole-tool 桶，故必须在这里补，否则 cc 语义丢失）。</li>
+     *   <li>{@code path-deny}/{@code path-rule-ask}/{@code allow} → 直接取
+     *       {@link #check}（= {@code $w} 等价物；本仓 step5 edit-implies-read 也含在内）。</li>
+     *   <li>{@code path-mode-ask} → 本仓 {@link PermissionResult.Ask} 且
+     *       {@code reason} <b>不是</b> {@link PermissionDecisionReason.Rule}；
+     *       CC 该档只在 {@code bypassPermissions} 模式放行，本方法同款。</li>
+     * </ul>
+     *
+     * <h2>⚠️ 与 CC 的<b>分档</b>（第三方模型同宽；仅一方模型本仓更松）</h2>
+     * CC 的真实门禁条件是 {@code Ue = !Jbt(model,remoteCall) && !Uu(tool,tools) && Wu(path,permissions)}
+     * —— 即 {@code !Jbt(model,remoteCall) && G9(...)}，而
+     * {@code G9(e,n,r,s){return !Uu(e,r) && Wu(n,s)}}（<b>我 dd 读发行产物看到</b> · exe off 200163140），
+     * {@code Uu(e,n){return n.some(r=>Ut(r,e)) && !n.some(r=>Ut(r,nt)) && !n.some(r=>Ut(r,Cl))}}
+     * （exe off 200163047）。
+     * <p>⭐ 两个<b>否定项</b>常量（我 dd 读发行产物看到）：{@code nt="Read"}（exe off 197960630）、
+     * {@code Cl="REPL"}（exe off 199683797）—— ⛔ <b>不是 Edit</b>。故
+     * {@code Uu("Edit",tools)} =「工具表含 Edit」<b>且「工具表不含 Read」且「不含 REPL」</b>。
+     * <p>⚠️ 由此<b>推翻</b>本批之前的错误断言（曾称「可用工具表必含 Edit ⇒ {@code Uu} 恒真 ⇒
+     * {@code G9} 恒假 ⇒ 那条例外永不触发」）：正常会话的工具表<b>含 Read</b> ⇒
+     * {@code !n.some(Read) = false} ⇒ {@code Uu=false} ⇒ {@code !Uu=true} ⇒
+     * <b>那条例外在 CC 里是活的（会触发）</b>。语义亦自洽：「模型手上没有 Read（读不了）
+     * 就不该要求它先读」。旁证：内联版 {@code oo()}（{@code function oo(e,r)} 起始于 exe off
+     * <b>213980847</b>）显式写
+     * {@code if(s.length>0 && !s.some(g=>Ut(g,nt)) && !s.some(g=>Ut(g,Cl))) return !1}。
+     * ⚠️ 本处曾误写 {@code 213980960}（该字节已落在 {@code oo} 函数体<b>之后</b>、下一函数
+     * {@code lMt} 的文本中间）—— 已按 dd 实测更正（同处其余 offset 一并对齐复核，见本类
+     * {@link #readLayerIsAllow} javadoc）。
+     * <p>⭐⭐ 分档结论：对<b>第三方模型</b>（{@code Jbt}=false，用户环境 deepseek 即此类）
+     * ⇒ {@code Ue ≡ Wu} ⇒ <b>本仓丢弃 {@code Jbt}/{@code Uu} 后与 CC 同宽</b>；
+     * <b>只有一方模型</b>（{@code Jbt}=true ⇒ CC 侧免门恒关）时，本仓不实现 {@code Jbt} ⇒
+     * <b>本仓才比 CC 松</b>。用户 2026-09-22 裁定「不看模型、不看格式」⇒ 本仓<b>只抄 {@code Wu}</b>，
+     * 这是裁定下的取舍，不是「对齐 CC」。
+     * <p>另：CC 的 Write 侧还有收窄 {@code !jPt(path)}（{@code jPt}=归一尾部 {@code .}/空格后扩展名是
+     * {@code .ipynb}，exe off 203517756 + {@code sz} off 197061992）—— 即 CC 的 Write 免门不覆盖
+     * Notebook 文件；本仓已在 {@code WriteFileTool} 门禁 1 同款补上（{@code isNotebookPath}）。
+     *
+     * <p><b>失败姿态 = fail-closed</b>：{@code path}/{@code ctx}/{@code permissionContext} 缺失、
+     * 或 read 决策链抛异常（含未注入 {@link WritePermissionChecker} 的 fail-loud ISE）⇒ 返回
+     * {@code false}（= 不免门 = 维持拒绝），⛔ 绝不 fail-open。
+     *
+     * @param path 已解析的绝对路径（调用方用 {@code guard.resolve(...)} 的规范化绝对路径）
+     * @param ctx  工具调用上下文（须带 permissionContext，否则 fail-closed）
+     * @return true = 该路径 read 层判 allow（可免 read-before-write 门禁）
+     */
+    public boolean readLayerIsAllow(String path, ToolUseContext ctx) {
+        if (path == null || path.isBlank() || ctx == null) {
+            if (log.isInfoEnabled()) {
+                log.info("[Wu 免门判据] 输入不完整 → false（fail-closed）: path={} ctx是否存在={}",
+                    path, ctx != null);
+            }
+            return false;
+        }
+        ToolPermissionContext permCtx = ctx.permissionContext();
+        if (permCtx == null) {
+            if (log.isInfoEnabled()) {
+                log.info("[Wu 免门判据] permissionContext 缺失 → false（fail-closed）: path={}", path);
+            }
+            return false;
+        }
+        try {
+            // CC Wu 首行: if(Es(n,bm)!==null||wd(n,bm)!==null)return!1;
+            PermissionRule bareDeny = RuleQuery.getDenyRuleForTool(permCtx, READ_TOOL_FOR_LAYER);
+            if (bareDeny != null) {
+                if (log.isInfoEnabled()) {
+                    log.info("[Wu 免门判据] Read 桶 whole-tool deny 规则命中 → false（bare-deny）: "
+                        + "path={} rule={}", path, RuleQuery.ruleToString(bareDeny));
+                }
+                return false;
+            }
+            PermissionRule bareAsk = RuleQuery.getAskRuleForTool(permCtx, READ_TOOL_FOR_LAYER);
+            if (bareAsk != null) {
+                if (log.isInfoEnabled()) {
+                    log.info("[Wu 免门判据] Read 桶 whole-tool ask 规则命中 → false（bare-ask）: "
+                        + "path={} rule={}", path, RuleQuery.ruleToString(bareAsk));
+                }
+                return false;
+            }
+            JsonNode syntheticReadInput =
+                JsonNodeFactory.instance.objectNode().put("file_path", path);
+            PermissionResult readDecision = check(READ_TOOL_FOR_LAYER, syntheticReadInput, ctx);
+            if (readDecision instanceof PermissionResult.Allow) {
+                if (log.isInfoEnabled()) {
+                    log.info("[Wu 免门判据] read 层判 allow → true: path={} reason={}",
+                        path, ((PermissionResult.Allow) readDecision).reason());
+                }
+                return true;
+            }
+            if (readDecision instanceof PermissionResult.Ask ask
+                    && !(ask.reason() instanceof PermissionDecisionReason.Rule)) {
+                // CC layer==="path-mode-ask" → return n.mode==="bypassPermissions"
+                boolean bypass = permCtx.mode() == PermissionMode.BYPASS_PERMISSIONS;
+                if (log.isInfoEnabled()) {
+                    log.info("[Wu 免门判据] read 层判「非规则归因 ask」（path-mode-ask）→ mode={} "
+                        + "→ {}: path={} reason={}", permCtx.mode(), bypass, path, ask.reason());
+                }
+                return bypass;
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[Wu 免门判据] read 层未判 allow → false: path={} decision={}",
+                    path, readDecision.getClass().getSimpleName());
+            }
+            return false;
+        } catch (RuntimeException e) {
+            // fail-closed：read 决策链异常（含 WritePermissionChecker 未注入的 fail-loud ISE）
+            // ⇒ 不免门 = 维持 read-before-write 拒绝。⛔ 绝不 fail-open。
+            if (log.isWarnEnabled()) {
+                log.warn("[Wu 免门判据] read 决策链抛异常 → false（fail-closed）: path={} cause={}",
+                    path, e.toString());
+            }
+            return false;
+        }
+    }
 }

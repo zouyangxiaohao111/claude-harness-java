@@ -8,6 +8,7 @@ import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.WriteFileTool;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -280,6 +281,12 @@ class AutoMemPathPrefixBoundaryTest {
         Path memoryBase = memoryRoot.resolve(".nexusai");
         AutoMemPaths pojo = new AutoMemPaths(
             projectRoot::toString, memoryBase::toString, () -> null, () -> null);
+        // [2026-09-22 · 锚改稳定项目根后必须绑定] withAutoMem 的 slug 锚 = sessionProjectRoot（对齐 CC
+        //   getAutoMemBase()），⛔ 不再是 effectiveCwd。不绑定 ⇒ sessionProjectRoot=user.dir（本夹具
+        //   @BeforeEach 的 sessionless 声明）⇒ base 落在 user.dir 派生的 slug 上 ⇒ 攻击路径恒不命中
+        //   ⇒ 本用例退化为恒绿（失守的是「边界式判定」这条守卫，不是安全）。绑定后才真正测到边界。
+        SessionProjectRoot.setDbResolver(
+            sid -> SessionProjectRoot.Lookup.bound(projectRoot.toString()));
         String autoMem = pojo.getAutoMemPath(projectRoot.toString());
         String attack = autoMem.substring(0, autoMem.length() - 1) + "-evil" + SEP + "MEMORY.md";
 

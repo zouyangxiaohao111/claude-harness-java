@@ -246,7 +246,8 @@ class ManualCacheClearCcIntegrationTest {
             () -> SessionPromptCacheRegistry.clearPromptCaches(SESSION,
                 PromptCacheGroup.COMPACT_COMMAND_USER_CONTEXT, "test:clearUserContextCache"),
             null, null, null, null, null, false, () -> flags.promptCacheBreakDetection(),
-            null);  // [批 5a-2] warningPushContext
+            null,  // [批 5a-2] warningPushContext
+            null);  // [compact-signal-fix] progressSink（本用例不断言进度事件 → no-op）
     }
 
     // ════════════════════════════════════════════════════════════════════

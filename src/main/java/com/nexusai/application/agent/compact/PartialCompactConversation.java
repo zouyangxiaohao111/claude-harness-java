@@ -426,8 +426,22 @@ public final class PartialCompactConversation {
             }
 
             // ── 12. readFileState 缓存（compact.ts:918-921）──
+            // 顺序对齐 CC（2.1.88 compact.ts:918-921 / 2.1.278 claude.exe off 204843678）：
+            //   ① Mt = cacheToObject(context.readFileState)  ← 先拷快照
+            //   ② context.readFileState.clear()              ← 再清活表
+            // ⚠ CC 的 context.readFileState 是 toolUseContext.readFileState（活表）。本仓本路径
+            //   ctx.readFileState 是 PartialCompactService:623 传入的一次性空 Map（非活表）⇒
+            //   活表清除经 ctx.getToolUseContext() 完成；⚠ tuc 由
+            //   assembleForkCacheSharingMaterials :823 best-effort 注入 ⇒ 会话未注册 AgentState
+            //   时 tuc==null ⇒ 活表不可达（返回 0，装配侧 :817 已 WARN 留痕）。详见
+            //   CompactConversationContext#clearReadFileState。
             Map<String, CompactConversation.ReadFileState> preCompactReadFileState = snapshotReadFileState(ctx);
-            ctx.clearReadFileState();
+            int preCompactLiveEntries = ctx.clearReadFileState();
+            if (log.isDebugEnabled()) {
+                log.debug("[PartialCompactConversation] readFileState 快照 {} 条 → 活表已清 {} 条"
+                        + "（sessionId={}；活表清 0 条 = tuc 未接线 ⇒ 本路径未对齐 CC 的活表清除）",
+                    preCompactReadFileState.size(), preCompactLiveEntries, ctx.getSessionId());
+            }
 
             // ── 12.1 loadedNestedMemoryPaths 清空（compact.ts:921，OPD-CM5-A-08 REWORK）──
             // CC partialCompactConversation 在 readFileState.clear() 后紧跟

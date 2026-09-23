@@ -3,7 +3,9 @@ package com.nexusai.application.agent.tool.impl;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge;
 import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.application.agent.team.LeaderPermissionBridge;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.TeamHelpers;
@@ -296,5 +298,93 @@ class TeamCreateToolTest {
         assertThat(captor.getValue().get("teamName")).isEqualTo("store-team");
         assertThat(captor.getValue().get("leadAgentId")).isEqualTo("team-lead@store-team");
         assertThat(captor.getValue().get("teammates")).isInstanceOf(Map.class);
+    }
+
+    // ═══════════════════════ [T2] leader 权限表面按会话注册 ═══════════════════════
+
+    @Test
+    @DisplayName("[T2] 建 team 成功 ⇒ 按 leadSessionId 注册 leader 确认表面（分桶键与 dispatcher 读侧同键）")
+    void create_registersLeaderConfirmSurfacePerSession() throws Exception {
+        // WHY: LeaderPermissionBridge 改按会话分桶后，「谁在什么时候注册本会话的表面」必须落地到
+        //   生产入口，否则分桶表恒空 ⇒ SwarmLeaderPermissionDispatcher 取不到 setter ⇒ leader inbox
+        //   权限请求恒自动 deny（团队权限断裂）。本用例钉死注册点 = 建 team 成功（leader 角色取得时），
+        //   且桶键 == config.json leadSessionId（dispatcher 用同一键查）。
+        //   变异点：删掉 TeamCreateTool 里的 registerSetter 调用 ⇒ 本断言 RED。
+        TeamCreateTool tool = newTool();
+        LeaderPermissionConfirmBridge bridge = new LeaderPermissionConfirmBridge();
+        bridge.setWs(mock(org.springframework.messaging.simp.SimpMessagingTemplate.class));
+        tool.setLeaderPermissionConfirmBridge(bridge);
+
+        AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "t2-team")),
+                appStateCtx(new LinkedHashMap<>()));
+        assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("创建 team 不应失败").isFalse();
+
+        // config 落盘的 leadSessionId 与本用例 ctx.sessionId 同源
+        String leadSessionId = new TeamHelpers().leadSessionId("t2-team");
+        assertThat(leadSessionId).isEqualTo(APPSTATE_CTX_SESSION_ID);
+
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue(leadSessionId))
+                .as("建 team 后本 leader 会话必须已注册确认表面（否则 dispatcher 恒自动 deny）")
+                .isNotNull();
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue("some-other-session"))
+                .as("⛔ 注册不得全局可见（会话分桶）").isNull();
+
+        bridge.unregisterSetter(leadSessionId);
+    }
+
+    @Test
+    @DisplayName("[T2] 无显式会话（ctx=null）⇒ 不注册、不造幻影会话桶")
+    void create_withoutExplicitSession_skipsRegistration() {
+        // WHY: ctx.sessionId()==null 时 config 的 leadSessionId 为空串（[fail-loud 2026-09-22]
+        //   已不再用任务级兜底键顶替 —— 见 create_withoutSession_doesNotFabricateLeadSessionId），
+        //   它**不是会话键**；若拿它当桶键注册，会造出一个**永远无人清理**（会话删除钩子按真实
+        //   会话 id 清）也无人查询的幻影桶 ⇒ 常驻 JVM 泄漏。故此时必须跳过注册（fail-loud info 留痕）。
+        TeamCreateTool tool = newTool();
+        LeaderPermissionConfirmBridge bridge = new LeaderPermissionConfirmBridge();
+        bridge.setWs(mock(org.springframework.messaging.simp.SimpMessagingTemplate.class));
+        tool.setLeaderPermissionConfirmBridge(bridge);
+
+        int before = LeaderPermissionBridge.toolUseConfirmQueueSessionBucketCount();
+        AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "nosess-team")), null);
+        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
+
+        assertThat(LeaderPermissionBridge.toolUseConfirmQueueSessionBucketCount())
+                .as("无会话 → 桶数不得增加（⛔ 不造幻影会话桶）").isEqualTo(before);
+    }
+
+    // ═════════════════ [fail-loud 2026-09-22] 无会话不得伪造 leadSessionId ═════════════════
+
+    @Test
+    @DisplayName("[fail-loud] 无显式会话 ⇒ config.json leadSessionId 落空串（⛔ 不落进程级兜底 UUID）")
+    void create_withoutSession_doesNotFabricateLeadSessionId() throws Exception {
+        // WHY（规则九）：config.json 的 leadSessionId 是**会话槽**，且是 TeamController.spawnMember
+        //   反查出 teammate 的 Leader 会话（SpawnContext.parentSessionId）的唯一来源。改前此处回落
+        //   TaskService.getTaskListId(null, identity)（最终 = **进程级共享 UUID**，形态上是一个合格
+        //   UUID，永不返回 null/blank）并 node.put 落盘 ⇒ 等于**在磁盘上制造**一个「看起来合法」的
+        //   伪会话键：此后 spawnMember 拿它当 Leader 会话喂下去，只会让下游 CwdResolution/
+        //   SessionStorage 按「未知会话」在链路深处炸（报错点离根因很远）。
+        //   变异点：把 leaderSessionKey 改回 TaskService.getTaskListId(null, ctx.teammateIdentity())
+        //   ⇒ 本断言 RED（config 里出现 non-blank 的伪键）。
+        String teamName = "nolead-team";
+        TeamCreateTool tool = newTool();
+
+        AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", teamName)), null);
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+                .as("无会话建 team 本身不失败（只在**会话槽**上不伪造）").isFalse();
+
+        TeamHelpers helpers = new TeamHelpers();
+        String raw = helpers.readConfig(teamName);
+        assertThat(raw).as("config.json 必须已落盘").isNotNull();
+        assertThat(raw)
+                .as("⭐ 无会话 ⇒ leadSessionId 必须是**空串**（确定性、非伪造，下游 isBlank 可直接识别）")
+                .contains("\"leadSessionId\":\"\"");
+        assertThat(helpers.leadSessionId(teamName))
+                .as("按 team 反查会话键必须得 null（⛔ 不是「看似合法的伪会话键」）").isNull();
+        assertThat(raw)
+                .as("⛔ 尤其不得落 TaskService 的进程级兜底 UUID（改前行为）")
+                .doesNotContain(TaskService.getTaskListId(null, null));
+
+        // 对侧（真会话）由既有用例 taskListIdExplicit 覆盖：config 落 ctx.sessionId() 本身
+        //   （TaskListIdExplicitResolutionTest 断言5 / 本类 create_registersLeaderConfirmSurfacePerSession）。
     }
 }

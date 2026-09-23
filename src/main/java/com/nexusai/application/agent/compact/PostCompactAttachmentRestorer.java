@@ -1179,6 +1179,12 @@ public final class PostCompactAttachmentRestorer {
             node.put("status", agent.status() == null ? "" : agent.status());
             node.put("deltaSummary", deltaSummary);
             node.put("outputFilePath", agent.outputFilePath() == null ? "" : agent.outputFilePath());
+            // [同 subtype 两种可见性 · 有意] 此处 task_status 经 buildAttachmentMessage ⇒ isMeta=true
+            //   → 前端 MessageList 跳过渲染（MessageList.tsx:955）：它是压缩后注入给**模型**的上下文恢复，
+            //   不是给**人**的通知。对照另一侧：teammate 完成通知支
+            //   TeammateMessageFoldingChain.teammateTaskStatusAttachment 用自有构造器、isMeta 硬编码 false
+            //   （仍可见）。同一 subtype 的两种可见性按**收件人**区分，是预期语义 —— 勿「统一」成同一个值
+            //   （锁进测试：TeammateMessageFoldingChainTest#taskStatus_twoVisibilities_areIntentional）。
             out.add(buildAttachmentMessage("task_status", toJson(node)));
         }
         return out;
@@ -1363,18 +1369,17 @@ public final class PostCompactAttachmentRestorer {
      * <p>Java 消息历史 preservedMessages 等价 CC diff 扫描源（partial 传 messagesToKeep、
      * 全量传 []）——从历史重建已 announce 集合，diff 后仅宣布增量；空历史 → 宣布全量集合。
      *
-     * <p><b>Gate</b>：deferred_tools_delta / agent_listing_delta 两支仍 feature/env 门控
-     * （isDeferredToolsDeltaEnabled / shouldInjectAgentListInMessages 默认 false）→ 该两支生产
-     * 默认 no-op；<b>mcp_instructions_delta 支无门</b>（isMcpInstructionsDeltaEnabled 已按 2.1.278
-     * 删除）⇒ 压缩后重宣布时该支无条件参与。CC 默认（feature 关）下 deferred-tools 走每调用 prepend（claude.ts:1330-1345
-     * {@code <available-deferred-tools>} meta user message）、agent list 走 session_guidance
-     * 子弹（prompts.ts:373）、mcp instructions 走 system prompt 段（prompts.ts:578-608）。
-     * <b>[IMP2-03 返工 r2 更正]</b>：Java 主循环<b>无</b> deferred-tools prepend 通道（全库 grep
-     * {@code available-deferred-tools} 0 命中，实证 eval JS 直读）——deferred 工具随 availableTools
-     * 全量进 LLM schema（llmToolsArray LlmAgentLoop:6119）；该差异属主循环域任务（登记于 progress
-     * IMP2-03 §7-1 返工 r2）。agent list / mcp instructions 两默认通道 Java 已有对应
-     * （AgentToolSection 子弹 / SystemPromptSections.mcpInstructionsCompute）。Gate 开时按 Java
-     * 数据源真实计算。
+     * <p><b>Gate</b>：agent_listing_delta 支仍 env 门控
+     * （shouldInjectAgentListInMessages，默认 false）；deferred_tools_delta 支与
+     * mcp_instructions_delta 支无 delta 专用门 —— deferred_tools_delta 的 delta 专用门
+     * （{@code isDeferredToolsDeltaEnabled} / {@code settings.deferred_tools_delta_enabled}）
+     * 与其互补的 prepend 通道已按 2.1.278 一并删除（2.1.278 发行产物 cc_bundle.js + claude.exe
+     * 双产物对 {@code isDeferredToolsDeltaEnabled} / {@code tengu_glacier} / prepend 文案
+     * 均 0 命中），mcp_instructions 门更早已删 ⇒ 两支无门，压缩后重宣布时按各自 capability
+     * 门（{@code deferredToolsDeltaAttachment} 内 isToolSearchEnabledOptimistic /
+     * toolReferenceUsable / isToolSearchToolAvailable）参与。agent list 默认通道走
+     * session_guidance 子弹（prompts.ts:373）、mcp instructions 走 system prompt 段
+     * （prompts.ts:578-608）。Gate 开时按 Java 数据源真实计算。
      */
     private static void appendPostCompactDeltaAttachments(
             CompactConversationContext ctx,
@@ -1412,10 +1417,7 @@ public final class PostCompactAttachmentRestorer {
      * deferred_tools_delta 生产 · 对齐 CC {@code getDeferredToolsDeltaAttachment}
      * （attachments.ts:1455-1475）+ {@code getDeferredToolsDelta}（toolSearch.ts:646-706）。
      *
-     * <p>Gate 链（任一不过 → null）：<b>统一判定</b>
-     * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（DB
-     * settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant，默认关）→
-     * isToolSearchEnabledOptimistic（SchemaNotSentHint）→
+     * <p>Gate 链（任一不过 → null）：isToolSearchEnabledOptimistic（SchemaNotSentHint）→
      * toolReferenceUsable（单点：provider 语义 取与 模型能力，判不出即不支持）→
      * isToolSearchToolAvailable（ToolSearch 在工具池）。内容：当前 deferred 工具集
      * （isDeferredTool：MCP 工具恒 defer，alwaysLoad 排除，ToolSearch 自身不 defer，
@@ -1429,13 +1431,6 @@ public final class PostCompactAttachmentRestorer {
      */
     public static ChatMessageDto deferredToolsDeltaAttachment(
             List<Tool> tools, String model, String providerType, List<ChatMessageDto> messages) {
-        // [dtd-cfg] 统一判定（DB settings.deferred_tools_delta_enabled → 回落 env USER_TYPE=ant）
-        //   替代本类原有的 env-only 拷贝（原 :1639）——否则前端把 DB 开关打开后，压缩内圈
-        //   仍判关 → DB 开关被内层挡成空转。单点 = PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()。
-        if (!com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
-                .staticDeferredToolsDeltaEnabled()) {
-            return null;
-        }
         if (!ToolSearchService.isToolSearchEnabledOptimistic()) {
             return null;
         }
@@ -1736,15 +1731,13 @@ public final class PostCompactAttachmentRestorer {
         }
     }
 
-    // ── delta gate（默认关 · env 覆盖镜像 CC）──
-    // ⚠️ 本段只剩 agent_listing 一条门。mcp_instructions 那条（isMcpInstructionsDeltaEnabled）
-    //    已于 2026-09-21 整体删除 —— 对齐 2.1.278（该门在发行产物里 0 命中），见
-    //    mcpInstructionsDeltaAttachment 的 javadoc。
-
-    // [dtd-cfg R9 收敛] 原此处有一份 isDeferredToolsDeltaEnabled() env-only 拷贝，已删除：
-    //   真源 = ToolSearchService.isDeferredToolsDeltaEnabled()（env 层）+ 统一判定
-    //   PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()（DB 覆盖 → env 回落）。
-    //   deferredToolsDeltaAttachment 已改调统一判定；本类不再持第二份判据（同 R9 型分叉隐患消除）。
+    // ── delta gate ──
+    // ⚠️ 本段只剩 agent_listing 一条门。deferred_tools 那条（isDeferredToolsDeltaEnabled）
+    //    与 mcp_instructions 那条（isMcpInstructionsDeltaEnabled）均已整体删除 —— 对齐 2.1.278
+    //    （两门在发行产物 cc_bundle.js + claude.exe 双产物 0 命中；deferred_tools 的 DB 列
+    //    settings.deferred_tools_delta_enabled 一并退役，已由 V77 迁移 DROP COLUMN 清除）。
+    //    deferred_tools_delta 支因此无 delta 专用门，只受 deferredToolsDeltaAttachment 内的
+    //    capability 门约束。
 
     /**
      * CC shouldInjectAgentListInMessages（AgentTool/prompt.ts:59-64）：env
@@ -1958,7 +1951,17 @@ public final class PostCompactAttachmentRestorer {
         return buildAttachmentMessage(subtype, null, content);
     }
 
-    /** 构建附件消息（含文件头）。 */
+    /**
+     * 构建附件消息（含文件头）· <b>isMeta = true</b>（压缩恢复附件对用户隐藏）。
+     *
+     * <p>WHY isMeta=true：这些附件是压缩后注入 LLM 的上下文恢复（file / file_reference /
+     * plan_file_reference / plan_mode / invoked_skills / task_status / 三支 delta），不是用户
+     * 消息 —— 前端 MessageList 对 {@code isMeta=true} 的行跳过渲染（MessageList.tsx:955
+     * {@code if (m.isMeta && !isLiveDisplayRow) continue}）。此前恒 false 使附件以 role=user 形态
+     * 进对话流、把 JSON 载荷原样露给用户。翻正用 {@link ChatMessageDto#withIsMeta(boolean)}
+     * （其 javadoc 即「不改 producer 落库形状的前提下把该标志拨正」），不动 21 参构造器的位置
+     * 实参、避免数错位。
+     */
     static ChatMessageDto buildAttachmentMessage(String subtype, String filePath, String content) {
         String body = content;
         if (filePath != null && !filePath.isBlank()) {
@@ -1969,7 +1972,7 @@ public final class PostCompactAttachmentRestorer {
             body, null, List.of(), FinishReason.stop,
             null, null, "刚刚", OffsetDateTime.now(), null, null, null,
             List.of(), List.of(), null, false, false,
-            subtype);
+            subtype).withIsMeta(true);
     }
 
     /**

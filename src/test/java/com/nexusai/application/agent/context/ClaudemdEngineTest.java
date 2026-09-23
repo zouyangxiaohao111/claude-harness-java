@@ -1159,7 +1159,8 @@ class ClaudemdEngineTest {
     @DisplayName("memoryFilesToAttachments loadedNestedMemoryPaths 去重 → 不重复发射 (attachments.ts:1723-1726)")
     void memoryFilesToAttachments_dedupNoDoubleFire() throws Exception {
         // WHY：loadedNestedMemoryPaths 是跨函数/跨 turn 去重唯一源（CC 注释：readFileState 是
-        //   100 条目 LRU，繁忙会话会驱逐 → 单靠它会在每次驱逐周期重新注入同一 CLAUDE.md）。已加载
+        //   ToolUseContext.READ_FILE_STATE_CACHE_SIZE 条目 LRU（=5000，对齐 CC 2.1.278 的 LC=5000），
+        //   繁忙会话仍会驱逐 → 单靠它会在每次驱逐周期重新注入同一 CLAUDE.md）。已加载
         //   路径再次出现 → 跳过，不重复发射（防 lazy 路径 instructionsLoaded 双发）。
         setUp(false);
         HookRegistry registry = new HookRegistry();

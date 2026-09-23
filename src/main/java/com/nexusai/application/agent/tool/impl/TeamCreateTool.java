@@ -93,6 +93,21 @@ public class TeamCreateTool implements Tool {
     @Autowired(required = false)
     private com.nexusai.application.agent.team.TeamStatusPublisher teamStatusPublisher;
 
+    /**
+     * [T2 · 会话分桶] leader 权限确认表面（Web STOMP ToolUseConfirm 队列）· 建 team 成功 = 本会话取得
+     * leader 角色 ⇒ 按 {@code leadSessionId} 注册其 setter（配对注销见 TeamDeleteTool /
+     * {@code SessionService.delete}）。可选注入（规则 8，构造器不动）：未注入（测试/手动直构）→ 跳过
+     * 注册，不破坏既有构造（此时 {@code SwarmLeaderPermissionDispatcher} 走 R1 自动 deny 降级）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge leaderPermissionConfirmBridge;
+
+    /** 测试/接线用 setter（leaderPermissionConfirmBridge · leader 确认表面按会话注册）。 */
+    public void setLeaderPermissionConfirmBridge(
+            com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge bridge) {
+        this.leaderPermissionConfirmBridge = bridge;
+    }
+
     @Autowired
     public TeamCreateTool(TeamHelpers teamHelpers, TaskService taskService) {
         this.teamHelpers = teamHelpers;
@@ -203,27 +218,28 @@ public class TeamCreateTool implements Tool {
             String leadAgentId = TEAM_LEAD_NAME + "@" + finalTeamName;
             // CC :147 leadAgentType = agent_type || TEAM_LEAD_NAME
             String leadAgentType = (agentType != null && !agentType.isBlank()) ? agentType : TEAM_LEAD_NAME;
-            // [A1-FIX] 会话级化归因键：[session-id-short] ctx.sessionId() 已 short 直键，
-            //   SessionService.delete 侧传 raw 'sess-xxx' 同键，cleanupSessionTeams(sessionId)
-            //   只清本会话 teams（防跨会话误删，探查 A1）。
-            //   ctx.sessionId() 为 null（无法归因）时回退 TaskService.getTaskListId()（进程/任务级兜底键）；
-            //   teammate 线程回退 teamName。保证归因键确定性，不落随机 UUID（否则 cleanupSessionTeams
-            //   永无法匹配，孤儿 config.json/inboxes/tasks 泄漏延续，finding R2-3 行为回归）。
-            //   真正无会话（[批 3c] 会话态已无 MDC 载体 → 进程级兜底）时亦确定性登记，孤儿清理交由 Batch4 A4/A5。
-            //   [S1-T11] 兜底分支同批显式化（原无参 getTaskListId() 已删除）：sessionId 位仍传 null
-            //   （本分支的前提就是 ctx.sessionId() == null ⇒ 传 null 与旧行为逐字一致），
-            //   teammate 身份改由 ctx 显式承载（原无参重载在该分支读不到任何线程态）。
-            String cleanupKey = (ctx != null && ctx.sessionId() != null)
-                    ? ctx.sessionId()
-                    : TaskService.getTaskListId(null, ctx != null ? ctx.teammateIdentity() : null);
-            // CC :162 leadSessionId = getSessionId()（team discovery 用实际 session id）——
-            //   与清理归因键同源，避免 config.json 落随机 UUID 与清理侧键不一致。
-            //   [merge-align F1/F2 修正] 原回退 UUID.randomUUID() 违反注释「不落随机 UUID」：
-            //   cleanupSessionTeams 无法匹配随机键 → 孤儿 config 泄漏。cleanupKey 经
-            //   TaskService.getTaskListId() 有兜底（MDC/进程级 UUID），恒非 null/blank，
-            //   此处回退仅防御性，用确定性占位（空串）而非随机 UUID，保证可清理性。
-            String leadSessionId = (cleanupKey != null && !cleanupKey.isBlank())
-                    ? cleanupKey : "";
+            // [fail-loud · 2026-09-22 用户裁定] leadSessionId = **真实 Lead 会话键**；无会话时 ⛔ 不伪造。
+            //   WHY（改前缺陷 · 已读码复核）: 改前此处为
+            //   `cleanupKey = ctx.sessionId() != null ? ... : TaskService.getTaskListId(null, ctx.teammateIdentity())`
+            //   —— 该方法最终回退是**进程级共享 UUID**（TaskService:335，永不返回 null/blank），优先级 3
+            //   还会返回 nexusai.team.name（**team 名**）。该值随即被 node.put 写进 config.json 的
+            //   leadSessionId（一个**会话槽**），TeamController.spawnMember 再反查它当 **Leader 会话**喂给
+            //   SpawnInProcess ⇒ 等于在磁盘上**制造**一个「形态合法」的伪会话键（比入口判 null 更难拦，
+            //   正是 SpawnInProcess.requireLeaderSessionId 需要按值识别进程兜底 UUID 的原因）。
+            //   与本仓铁律「不许静默伪造一个看起来合法的会话键」（SessionKeys.NO_SESSION javadoc 用户裁定）冲突。
+            //   ⚠️ 注释不可信·以代码为准：旧注释称本键「与清理归因键同源」，实测**不成立** ——
+            //   清理入桶用的是下一行的 sessionIdStr（= ctx.sessionId()），本键只喂 leadSessionId 这一个槽
+            //   ⇒ 去掉兜底**不改变** cleanupSessionTeams 的匹配键（不会造成孤儿 config 泄漏）。
+            //   无会话时落**空串**（确定性、非伪造；下游 isBlank 判据可直接识别），并 ≥WARN 留痕。
+            String leaderSessionKey = (ctx != null && ctx.sessionId() != null && !ctx.sessionId().isBlank())
+                    ? ctx.sessionId() : "";
+            if (leaderSessionKey.isEmpty()) {
+                log.warn("[TeamCreateTool] 建 team={} 时无显式会话（ctx.sessionId() 为空）⇒ config.json "
+                        + "leadSessionId 落空串（⛔ 不用进程级 UUID / team 名顶替）：该 team 无法按会话反查，"
+                        + "spawnMember 将 fail-loud 拒绝启动成员。请由**会话内**调用本工具"
+                        + "（对齐 multi-session-vs-cc-single-session 铁律）", finalTeamName);
+            }
+            String leadSessionId = leaderSessionKey;
 
             String teamFilePath = teamHelpers.configPath(finalTeamName).toString();
 
@@ -236,6 +252,21 @@ public class TeamCreateTool implements Tool {
             String sessionIdStr = (ctx != null && ctx.sessionId() != null)
                     ? ctx.sessionId() : null;
             teamHelpers.registerTeamForSessionCleanup(sessionIdStr, finalTeamName);
+
+            // [T2 · 会话分桶] 本会话取得 leader 角色 ⇒ 按会话注册 leader 权限确认表面
+            //   （LeaderPermissionBridge 分桶键 = leadSessionId，与 SwarmLeaderPermissionDispatcher
+            //   读侧同键；配对注销见 TeamDeleteTool / SessionService.delete）。
+            //   仅当确有**显式会话**（ctx.sessionId() 非空）才注册：ctx.sessionId()==null 时
+            //   leadSessionId 为空串（[fail-loud 2026-09-22] 已不再用任务级兜底键顶替）⇒ ⛔ 不得造出幻影会话桶。
+            if (leaderPermissionConfirmBridge != null
+                    && sessionIdStr != null && !sessionIdStr.isBlank()
+                    && leadSessionId != null && !leadSessionId.isBlank()) {
+                leaderPermissionConfirmBridge.registerSetter(leadSessionId);
+            } else if (log.isInfoEnabled()) {
+                log.info("[TeamCreateTool] 跳过 leader 权限表面注册 team={}（bridge 注入={} sessionId={}）："
+                        + "无显式会话 ⇒ 不造幻影会话桶", finalTeamName,
+                        leaderPermissionConfirmBridge != null, sessionIdStr);
+            }
 
             // CC :184-191 resetTaskList + ensureTasksDir + setLeaderTeamName（Team = Project = TaskList）
             String taskListId = TeamHelpers.sanitizeName(finalTeamName);

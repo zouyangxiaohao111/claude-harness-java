@@ -1688,7 +1688,8 @@ public class ClaudemdEngine {
      * <ol>
      *   <li>{@code loadedNestedMemoryPaths.has}（会话级非驱逐 Set）—— LRU 驱逐后重注入回归
      *       守卫（REPL.tsx:1964-1967/Tool.ts:216-220 注释）</li>
-     *   <li>{@code readFileState.has}（100 条目双限 LRU）—— 命中 = 模型本会话已 Read/Edit/Write
+     *   <li>{@code readFileState.has}（{@code ToolUseContext.READ_FILE_STATE_CACHE_SIZE} 条目双限 LRU，
+     *       对齐目标 CC 2.1.278 的 {@code LC=5000}；2.1.88 为 100）—— 命中 = 模型本会话已 Read/Edit/Write
      *       该文件，内容已在上下文 → 跳过注入（attachments.ts:1725）</li>
      * </ol>
      *
@@ -1730,7 +1731,10 @@ public class ClaudemdEngine {
                     ? (memoryFile.rawContent() != null ? memoryFile.rawContent() : memoryFile.content())
                     : memoryFile.content();
                 readFileState.set(cacheKey, new com.nexusai.application.agent.tool.ToolUseContext.ReadState(
-                    System.currentTimeMillis(), null, null, memoryFile.contentDiffersFromDisk(), content));
+                    // [批 rfs-replay-3b] contentNotInModelContext=false：本 entry 的 content 正是已随
+                    //   memory 附件注入模型上下文的那份（模型看得到）；「与磁盘不一致」那维已由
+                    //   isPartialView=contentDiffersFromDisk() 单独表达，⛔ 两者不得混用。
+                    System.currentTimeMillis(), null, null, memoryFile.contentDiffersFromDisk(), content, false));
             }
             if (shouldFireHook && isInstructionsMemoryType(memoryFile.type())) {
                 String loadReason = (memoryFile.globs() != null && !memoryFile.globs().isEmpty())
@@ -1812,7 +1816,9 @@ public class ClaudemdEngine {
                     ? (file.rawContent() != null ? file.rawContent() : file.content())
                     : file.content();
                 baseline = new com.nexusai.application.agent.tool.ToolUseContext.ReadState(
-                    System.currentTimeMillis(), null, null, file.contentDiffersFromDisk(), content);
+                    // [批 rfs-replay-3b] contentNotInModelContext=false（同上一处：内容已注入模型上下文；
+                    //   「与磁盘不一致」由 isPartialView 单独承载）。
+                    System.currentTimeMillis(), null, null, file.contentDiffersFromDisk(), content, false);
                 if (sessionBaseline != null) {
                     // 「首次会话登记」固化点：此后本会话的每次 run 都复用它，不再取当下
                     sessionBaseline.set(key, baseline);

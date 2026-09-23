@@ -4,6 +4,7 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.SessionStartSeenRegistry;
 import com.nexusai.application.agent.skill.SkillListingSentRegistry;
+import com.nexusai.application.agent.team.LeaderPermissionBridge;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.MessageMapper;
 import com.nexusai.repository.session.mapper.SessionFileMapper;
@@ -126,5 +127,33 @@ class SessionServiceDeleteRegistryCleanupTest {
         assertThat(registry.getByAgentId(bgAgentId))
             .as("后台化主会话注册在 agents 桶（agentUuid 键）—— 只清 sessions 桶则本断言 RED（finding：只修了一半）")
             .isNull();
+    }
+
+    @Test
+    @DisplayName("[T2] delete → LeaderPermissionBridge 本会话桶摘除（会话结束清理，注册/注销成对）")
+    void delete_clearsLeaderPermissionBridgeSessionBucket() {
+        // WHY（规则九）：LeaderPermissionBridge 自 [T2] 起按会话分桶（注册 = TeamCreateTool 建 team /
+        //   注销 = TeamDeleteTool 解散）。**会话被删除**是「team 未被显式解散」的兜底路径
+        //   （用户直接删会话）—— 若此处不摘桶：
+        //   ① 常驻 JVM 里桶随「删过的会话数」无界增长；
+        //   ② sessionId 复用/回归时取到上一世会话的确认表面，把权限弹窗推给错误会话（串台第二形态）。
+        //   变异点：删掉 SessionService.delete 里的 LeaderPermissionBridge.clearSession(id) ⇒ RED。
+        String id = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        SessionService service = newService(id);
+
+        LeaderPermissionBridge.SetToolUseConfirmQueueFn queueSetter = updater -> {
+        };
+        LeaderPermissionBridge.SetToolPermissionContextFn ctxSetter = (context, preserveMode) -> {
+        };
+        LeaderPermissionBridge.registerLeaderToolUseConfirmQueue(id, queueSetter);
+        LeaderPermissionBridge.registerLeaderSetToolPermissionContext(id, ctxSetter);
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue(id)).isNotNull();
+
+        service.delete(id);
+
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue(id))
+            .as("删会话必须摘除本会话的队列 setter 桶（否则悬挂 + 复用串台）").isNull();
+        assertThat(LeaderPermissionBridge.getLeaderSetToolPermissionContext(id))
+            .as("删会话必须摘除本会话的权限上下文 setter 桶").isNull();
     }
 }

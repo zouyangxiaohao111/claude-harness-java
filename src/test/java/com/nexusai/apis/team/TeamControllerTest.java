@@ -457,6 +457,44 @@ class TeamControllerTest {
         }
     }
 
+    // ── members/spawn · [fail-loud 2026-09-22] Leader 会话取不到 ⇒ 拒绝启动成员 ──
+
+    @Test
+    @DisplayName("[fail-loud] spawnMember: config 反查不到真实 leadSessionId ⇒ 409 + 四要素文案（⛔ 不造幻影会话）")
+    void spawnMember_missingLeadSessionInConfig_returns409WithFailLoudDetail() throws Exception {
+        // WHY（规则九）：「真 Leader 会话取不到」的生产触发形态之一 = team config.json **无**
+        //   leadSessionId（或落的是空串/伪造值）。改前 SpawnInProcess 会回落到进程级共享 UUID ⇒
+        //   teammate 的 Leader 会话 = 一个不存在的会话：CwdResolution/SessionStorage 按「未知会话」
+        //   在**链路深处**炸，报错点离根因很远且不含「Leader 会话缺失」上下文。
+        //   本用例钉死 REST 边界行为：**带四要素文案的 409**（沿用本端点既有「spawn 失败 → 409」契约，
+        //   见 spawnMember javadoc 失败契约）。
+        //   变异点：把 SpawnInProcess.requireLeaderSessionId 改回
+        //   `context.parentSessionId() != null ? ... : TaskService.getTaskListId(null, null)`
+        //   ⇒ 不再抛 ⇒ 本用例 RED（且会真的去 spawn 一个挂在进程 UUID 上的 teammate）。
+        // 夹具真实度：SpawnInProcess 用**真实**实例（不是 mock）—— 要验的正是「真链路会不会伪造会话键」；
+        //   cwd 由 SessionCwdHolder 显式给定，避免撞上 CwdResolution 的会话解析分支。
+        SessionCwdHolder.set("sess-1", tempDir.toAbsolutePath().normalize().toString());
+        ObjectNode noLead = baseConfig("nolead-team");
+        noLead.remove("leadSessionId");                       // 触发形态 1：字段缺失
+        teamHelpers.writeConfig("nolead-team", noLead.toString());
+        ReflectionTestUtils.setField(controller, "spawnInProcess",
+            new SpawnInProcess(new com.nexusai.application.agent.tasks.TaskFrameworkService(
+                new com.nexusai.application.agent.tasks.SdkEventQueue())));
+        try {
+            mockMvc.perform(post("/api/v1/teams/nolead-team/members/spawn?sessionId=sess-1")
+                    .contentType(APPLICATION_JSON)
+                    .content("{\"name\":\"worker\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.detail", containsString("Leader 会话")))
+                .andExpect(jsonPath("$.detail", containsString("环节=")))
+                .andExpect(jsonPath("$.detail", containsString("期望=")))
+                .andExpect(jsonPath("$.detail", containsString("实际=")))
+                .andExpect(jsonPath("$.detail", containsString("如何修=")));
+        } finally {
+            SessionCwdHolder.clear("sess-1");
+        }
+    }
+
     // ── members（可选 join/leave）─────────────────────────────────────────────
 
     @Test

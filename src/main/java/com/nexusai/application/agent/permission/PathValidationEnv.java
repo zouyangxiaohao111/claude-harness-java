@@ -218,23 +218,87 @@ public record PathValidationEnv(
             hasAutoMemPathOverride, autoMemBaseDir, bundledSkillsRoot);
     }
 
+    /**
+     * 填充 auto-memory 基址（<b>读/写共用</b> wither）—— 对齐 CC {@code getAutoMemPath()} 的 slug 锚。
+     *
+     * <p><b>⭐ 锚必须取【稳定项目根】{@link #sessionProjectRoot}，⛔ 不是 {@link #effectiveCwd}</b>：
+     * CC {@code getAutoMemBase()} = {@code findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot()}
+     * （memdir/paths.ts:203-205），{@code getAutoMemPath()} = {@code join(projectsDir,
+     * sanitizePath(getAutoMemBase()), 'memory') + sep}（paths.ts:229-232）—— 两处读的都是
+     * {@code getProjectRoot()}（bootstrap/state.ts:498-508「never updated by mid-session
+     * EnterWorktreeTool … Use for project identity (history, skills, sessions) not file operations」），
+     * <b>与 {@code getCwd()} 无关</b>。
+     *
+     * <p><b>⛔ 为何绝不能用 {@link #effectiveCwd} 当锚</b>：本字段 = CC {@code getCwd()}，bash {@code cd}
+     * （{@code BashTool} → {@code SessionCwdHolder.set}）与 worktree 入口都会把它挪走。一旦拿它当锚，
+     * 会话 {@code cd} 到别的仓库后算出的 slug 就与<b>真实落盘目录</b>（介质侧 {@code SessionStorage}
+     * 恒按稳定项目根派生）分裂 ⇒ {@code isAutoMemPath} 恒不命中 ⇒ CC 的写 carve-out
+     * （{@code checkEditableInternalPath} memdir 分支）<b>结构性失效</b>。
+     *
+     * <p><b>实机取证（2026-09-22 · 0.1.19 打包版日志）</b>：会话 {@code sess-80e95674} 的项目根冻结为
+     * {@code D:\code\ai_project\nexusai}（真实记忆目录 {@code ~/.nexusai/projects/D--code-ai-project-nexusai/memory/}，
+     * 与 session-memory 落点同源），但模型跑过 {@code cd "D:/code/ai_project/ai-agent-client-svn"}
+     * （SVN 工作副本）后 {@code effectiveCwd} = 该目录 ⇒ 旧实现算出的 base slug =
+     * {@code D--code-ai-project-ai-agent-client-svn} ⇒ 写
+     * {@code projects/D--code-ai-project-nexusai/memory/reference_svn_client_mirror.md} 恒落
+     * {@code [WritePermissionChecker] 危险文件/目录 → ask}（用户每写一次记忆弹一次窗）。
+     * 读侧之所以没症状，是因为它另有一条 {@code projectDirs()} 宽口（{@code projects/{slug}/}）兜住；
+     * <b>写侧只有本 carve-out 一条腿</b>（checkEditableInternalPath 无 project-dir 分支）。
+     *
+     * <p><b>canonical 归一不在此重复</b>：{@link AutoMemPaths#getAutoMemPath(String)} 内部即
+     * {@code getAutoMemBase(explicitRoot) = findCanonicalGitRoot(root) ?? NFC(root)}，与 CC
+     * {@code (findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot())} 逐字同链 ⇒ 本处只负责
+     * 「把 root 换对」，⛔ 不另加一层归一（否则与 CC 的解析链多出一环）。
+     *
+     * @param autoMemPaths auto-memory 路径解析器（读/写侧同一个 Spring bean；null → 原样返回，fail-closed）
+     * @return 填好 {@code autoMemBaseDir}/{@code hasAutoMemPathOverride} 的新 env
+     */
     public PathValidationEnv withAutoMem(AutoMemPaths autoMemPaths) {
         if (autoMemPaths == null) {
             return this;
         }
-        // [批 4b-1] 显式传会话项目根（原经 AutoMemPaths ThreadLocal 隐式解析，载体已删）：
-        //   本 env 的 effectiveCwd 即 CwdResolution.getCwd(sessionId) 的显式快照。
-        String base = autoMemPaths.getAutoMemPath(effectiveCwd);
+        // [CC 对齐 · getAutoMemBase/getAutoMemPath] 锚 = 稳定项目根（CC getProjectRoot()），
+        //   ⛔ 不是 effectiveCwd（CC getCwd()，bash cd / EnterWorktreeTool 会重锚 —— 见本方法 javadoc 的实机取证）。
+        String baseRoot = sessionProjectRoot;
+        if (baseRoot == null || baseRoot.isBlank()) {
+            // fail-closed 且【不静默】：无稳定项目根 ⇒ 不伪造基址。
+            //   ⛔ 尤其不得回落 effectiveCwd —— 那正是本方法要治的分裂源（回落只会再算出对不上真实
+            //   介质的 slug）；且此时介质侧（SessionStorage.sessionProjectDir）同样解析不出项目目录
+            //   ⇒ 本会话结构上不存在「项目内已落盘记忆文件」，返回 null 既不误放行也不误挡真实文件。
+            //   getAutoMemPath(null) 内部会经 logNoEligibleProject 打一条 ≥WARN（按 caller 一次性），
+            //   此处再补一条带 effectiveCwd 对照的 WARN，使「为何无基址」与「cwd 漂到哪了」同时可见。
+            warnAutoMemBaseRootMissing();
+        }
+        String base = autoMemPaths.getAutoMemPath(baseRoot);
         String autoMemBaseDir = base == null ? null : withTrailingSeparator(base);
         if (log.isDebugEnabled()) {
-            log.debug("[PathValidationEnv] withAutoMem: effectiveCwd={} hasOverride={} autoMemBaseDir={}",
-                effectiveCwd, autoMemPaths.hasAutoMemPathOverride(), autoMemBaseDir);
+            log.debug("[PathValidationEnv] withAutoMem: sessionProjectRoot={} effectiveCwd={} baseRoot={}"
+                    + " hasOverride={} autoMemBaseDir={}",
+                sessionProjectRoot, effectiveCwd, baseRoot,
+                autoMemPaths.hasAutoMemPathOverride(), autoMemBaseDir);
         }
         return new PathValidationEnv(sessionId, agentId, effectiveCwd, originalCwd,
             sessionProjectRoot, claudeConfigHomeDir, nexusaiConfigHomeDir, scratchpadEnabled, claudeTempDir,
             autoMemPaths.hasAutoMemPathOverride(),
             autoMemBaseDir,
             bundledSkillsRoot);
+    }
+
+    /**
+     * 「auto-memory 基址锚缺失」告警一次性开关（防权限热路径刷屏；本仓铁律：取不到会话态不得静默）。
+     *
+     * <p>与 {@link #PROJECT_ROOT_WARNED} 分开：后者管「会话项目根解析失败」，本条管「拿到了 null 项目根
+     * 进 withAutoMem」且额外暴露 {@code effectiveCwd} 对照 —— 单一一闸会让先触发的那条吃掉另一条信号。
+     */
+    private static final AtomicBoolean AUTO_MEM_BASE_ROOT_WARNED = new AtomicBoolean(false);
+
+    /** 无稳定项目根 ⇒ 基址 fail-closed 的 ≥WARN 出口（进程内一次性）。 */
+    private static void warnAutoMemBaseRootMissing() {
+        if (AUTO_MEM_BASE_ROOT_WARNED.compareAndSet(false, true)) {
+            log.warn("[PathValidationEnv] withAutoMem 无稳定项目根（sessionProjectRoot=null/空白）"
+                + " ⇒ auto-memory 基址 fail-closed 不填（⛔ 不回落 effectiveCwd —— 那正是「bash cd /"
+                + " worktree 后 slug 与真实介质分裂」的根源）。本调用点进程内只打一次。");
+        }
     }
 
     /**

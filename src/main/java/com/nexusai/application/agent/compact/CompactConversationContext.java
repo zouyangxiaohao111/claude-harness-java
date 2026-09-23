@@ -303,9 +303,16 @@ public class CompactConversationContext {
         this.hookRegistry = hookRegistry; return this;
     }
     /**
-     * 设置 readFileState · 对齐 CC context.readFileState（同一对象引用）：
-     * 压缩流程对同一 map 做 snapshot（cacheToObject）→ clear()（compact.ts:518-521），
-     * clear 对调用方传入的 map 生效（CC 语义）。调用方须传入可变 map（如 LinkedHashMap）。
+     * 设置 readFileState · 本仓承载的是<b>快照副本</b>，⛔ 不是 CC 的活表。
+     *
+     * <p><b>⛔ 注释更正（本批）</b>：原文写「对齐 CC context.readFileState（同一对象引用）…
+     * clear 对调用方传入的 map 生效（CC 语义）」——<b>与代码相反</b>。三条生产路径传入的
+     * 都不是会话活表：auto 传逐条复制的 {@code LinkedHashMap}
+     * （{@code CompactConversation.buildAutoContext:627-634}）、partial 传一次性空 Map
+     * （{@code PartialCompactService:623}）、manual 根本不调本方法（保持 null）。
+     * 故只清本字段<b>清不到</b> Edit/Write 门禁读的会话表 —— 这正是本批修复的缺陷
+     * （活表清除见 {@link #clearReadFileState()}，它同时清本字段与
+     * {@code toolUseContext.readFileState()}）。调用方须传入可变 map（如 LinkedHashMap）。
      */
     public CompactConversationContext setReadFileState(Map<String, CompactConversation.ReadFileState> readFileState) {
         this.readFileState = readFileState; return this;
@@ -355,11 +362,75 @@ public class CompactConversationContext {
         this.promptCacheSharingEnabled = promptCacheSharingEnabled; return this;
     }
 
-    /** 清空 readFileState（CC context.readFileState.clear()，compact.ts:521） */
-    public void clearReadFileState() {
+    /**
+     * 清 readFileState · 对齐 CC {@code context.readFileState.clear()}
+     * （2.1.88 {@code services/compact/compact.ts:521} 全量 / {@code :920} partial）。
+     *
+     * <h2>⚠ 语义澄清：CC 的 {@code context.readFileState} 是<b>活表</b>，不是快照副本</h2>
+     * CC 的 {@code context} 就是 {@code ToolUseContext}，{@code context.readFileState} 即
+     * {@code toolUseContext.readFileState}（<b>一次会话一张</b>）。CC 2.1.278 发行产物实证
+     * （{@code claude.exe} off 204805268，对照组 = 2.1.88 源码 :518-521）：
+     * <pre>
+     * xe = r4t(_e.readFileState);          // ① 先拷快照（r4t = Object.fromEntries(e.entries())）
+     * if (_e.readFileState.clear(), …)     // ② 再清活表（_e = cacheSafeParams.toolUseContext）
+     * </pre>
+     * 本仓 {@link #setReadFileState} 收到的是<b>快照副本</b>（{@code BuildAutoContext}
+     * 逐条复制成 {@code LinkedHashMap}），partial 路径更是一个一次性空 Map
+     * （{@code PartialCompactService:623}）——<b>只清本字段等于没清会话表</b>
+     * （压缩后模型上下文已不含文件内容，活表仍放行 Edit = 比 CC 更宽容，本类修复的缺陷）。
+     *
+     * <h2>本方法清两个目标（都要，不是二选一）</h2>
+     * <ol>
+     *   <li>本字段 {@link #readFileState}（快照副本；调用方直接传入活表 Map 的场景也覆盖）</li>
+     *   <li>{@code toolUseContext.readFileState()}（<b>活表</b> = 会话级 {@code FileStateCache}，
+     *       生产来自 {@code SessionReadFileStateRegistry.forSession} ⇒ <b>Edit/Write 门禁读的
+     *       同一实例</b>，{@code EditFileTool.java:646} / {@code WriteFileTool.java:645}）</li>
+     * </ol>
+     *
+     * <h2>逐路径可达性（⛔ 勿用「统一写法」掩盖差异 —— 三条路径的 tuc 来源不同）</h2>
+     * <ul>
+     *   <li><b>auto 全量</b>：tuc 恒接线（{@code LlmAgentLoop:6283 params.toolUseContext()}
+     *       → {@code CompactConversation.buildAutoContext:611 setToolUseContext}），
+     *       而 {@code params.toolUseContext()} = base TUC，其 readFileState 取自会话注册表
+     *       （{@code LlmAgentLoop:10602-10603}）⇒ <b>活表可达</b>。</li>
+     *   <li><b>manual 全量（/compact）</b>：tuc = {@code state.currentToolUseContext()}
+     *       （{@code ToolRegistrationConfig:2585}），该 per-turn TUC 与 base TUC
+     *       <b>共享同一 FileStateCache 引用</b>（{@code ToolUseContext.copyWith:1788} 透传
+     *       readFileState；{@code withQueryTracking/withMessages} 同）⇒ <b>活表可达</b>。
+     *       ⚠ 仅当本 JVM 内该会话尚未跑过一轮（per-turn stamp 为空 ⇒ tuc==null）⇒ 不可达
+     *       （此时也无「压缩前的已读状态」可作废）。</li>
+     *   <li><b>partial</b>：tuc 由 {@code PartialCompactService.assembleForkCacheSharingMaterials:823}
+     *       <b>best-effort</b> 注入（会话未注册 AgentState ⇒ :816 早退 + WARN ⇒ tuc==null）
+     *       ⇒ <b>可达性取决于会话是否已注册</b>；不可达时本方法只清快照副本并留 debug 日志
+     *       （该缺口由 :817 的 WARN 已在装配侧留痕）。</li>
+     * </ul>
+     *
+     * <p>⛔ <b>调用时机必须与 CC 一致：先拷快照、再调本方法</b>（摘要成功之后）。
+     * 提前调用会把「压缩失败」也变成「会话已读状态作废」。
+     *
+     * @return 被清除的<b>活表</b>条目数；tuc 未接线 / 无 readFileState ⇒ 0（= 活表未清）
+     */
+    public int clearReadFileState() {
         if (readFileState != null) {
             readFileState.clear();
         }
+        ToolUseContext tuc = this.toolUseContext;
+        if (tuc == null || tuc.readFileState() == null) {
+            // ⛔ 不静默：调用方需知道「本次只清了快照副本，会话表未被清」。
+            if (log.isDebugEnabled()) {
+                log.debug("[compact·readFileState] 活表不可达（toolUseContext 未接线/无 readFileState）: "
+                    + "sessionId={} ⇒ 仅清本地快照副本，Edit/Write 门禁仍放行（未对齐 CC 的活表清除）",
+                    sessionId);
+            }
+            return 0;
+        }
+        int cleared = tuc.readFileState().size();
+        tuc.readFileState().clear();
+        if (log.isDebugEnabled()) {
+            log.debug("[compact·readFileState] 活表已清（CC context.readFileState.clear()）: sessionId={} "
+                + "清除 {} 条 ⇒ 压缩后首次 Edit/Write 需要重新 Read", sessionId, cleared);
+        }
+        return cleared;
     }
 
 }

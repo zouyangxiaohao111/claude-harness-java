@@ -2,97 +2,60 @@ package com.nexusai.application.agent.compact;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
-import com.nexusai.application.agent.LlmAgentLoop;
-import com.nexusai.application.agent.QuerySource;
-import com.nexusai.application.agent.permission.PermissionMode;
-import com.nexusai.application.agent.permission.ToolPermissionContext;
-import com.nexusai.application.agent.prompt.PromptAlignSettingsResolver;
-import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseBlock;
-import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.application.agent.tool.impl.BashTool;
-import com.nexusai.application.agent.tool.impl.ToolSearchTool;
-import com.nexusai.application.agent.tool.impl.WebSearchTool;
 import com.nexusai.application.agent.toolsearch.ToolSearchService;
 import com.nexusai.model.session.dto.ChatMessageDto;
-import com.nexusai.repository.settings.entity.SettingsRecord;
-import com.nexusai.repository.settings.mapper.SettingsMapper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * [dtd-cfg] deferred_tools_delta 门控「统一判定」测试 · 对齐 CC
- * {@code utils/toolSearch.ts:624-634} {@code isDeferredToolsDeltaEnabled}。
+ * deferred_tools_delta 生产门控（delta 专用门已删 · 对齐 2.1.278）。
  *
- * <p><b>WHY（CLAUDE.md 规则 9）</b>：语义 = true → 持久化增量附件 {@code deferred_tools_delta}
- * 公告 deferred 工具；false → 每轮在消息队首 prepend 全量 {@code <available-deferred-tools>}
- * 清单。默认 false。此前该判定分裂：主循环走 DB-aware 门，而压缩内圈
- * {@code PostCompactAttachmentRestorer} 与主循环 prepend 各读 env-only 拷贝 → 前端把 DB 开关
- * 打开（生产 env 非 ant）时，内圈压缩重宣布被 env 挡掉、prepend 又照发全量 → 开关空转 + 双发。
- * 本测试锁死收敛后的单一判定
- * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（DB 覆盖 → env 回落）
- * 在三条路径上的一致取值。
+ * <p><b>本类的前身</b>：原名即 {@code DeferredToolsDeltaUnifiedGateTest}，锁定「DB
+ * settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant」这条统一判定在
+ * 主循环 / 压缩内圈 / prepend 三处取值一致。该判据（CC 2.1.88 toolSearch.ts:629-633
+ * {@code isDeferredToolsDeltaEnabled}）与其互补的 prepend 通道在 2.1.278 发行产物
+ * （cc_bundle.js + claude.exe）双产物 0 命中 ⇒ 本批整条删除。
  *
- * <p><b>变异自证</b>：把内圈 {@code deferredToolsDeltaAttachment} 的 gate 改回 env-only
- * （{@code ToolSearchService.isDeferredToolsDeltaEnabled()}）→
- * {@link #dbTrue_envFalse_deltaAttachmentProduced()} 与
- * {@link #dbTrue_envFalse_prependSuppressed()} 转红；把 prepend 改回 env-only →
- * {@link #dbFalse_envTrue_prependFullList()} 转红。
+ * <p><b>WHY（CLAUDE.md 规则 9）现在锁定什么</b>：门删掉后，deferred_tools_delta 的产出只受
+ * <b>capability 门</b>约束（isToolSearchEnabledOptimistic / toolReferenceUsable /
+ * isToolSearchToolAvailable / 工具池非空），不再有任何 delta 专用开关 ⇒ 「env 空且无 DB 配置」
+ * 与「env USER_TYPE=ant」两种形态都必须产出 —— 这正是删除的可观测后果。
+ *
+ * <p><b>变异自证</b>：把任意一道 delta 专用门（DB 列或 env USER_TYPE）加回
+ * {@code deferredToolsDeltaAttachment} 的 gate 链 ⇒
+ * {@link #noDeltaGate_envEmptyAndNoDb_stillProduces()} 转红（该形态下旧门会返回 null）；
+ * 放宽任意 capability 门 ⇒ {@link #capabilityGate_providerOpenAi_blocksDelta()} 或
+ * {@link #capabilityGate_noToolSearchTool_blocksDelta()} 转红。
  */
 class DeferredToolsDeltaUnifiedGateTest {
 
     private static final String MODEL = "claude-sonnet-4-5";
     private static final String ANTHROPIC = "anthropic";
+    private static final String OPENAI_COMPAT = "openai_compatible";
 
     @AfterEach
     void resetSeams() {
-        // 静态槽位 + env seam 全局单例 → 逐测复位，杜绝串扰（统一判定读 staticResolver）。
-        PromptAlignSettingsResolver.setStaticResolver(null);
+        // env seam 全局单例 → 逐测复位，杜绝串扰。
         ToolSearchService.envOverride = null;
-        // [R9(b) env seam 归一] PostCompactAttachmentRestorer 的第二份 envOverride 已删除，
-        //   全部 env 入口统一为 ToolSearchService.envOverride。
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // (a) NULL / 未设置 → false
+    // (a) delta 专用门已删 → env 空 / 无 DB 配置也必须产出
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("(a) 无 static resolver + env 非 ant → 统一判定 false（默认，对齐 CC）")
-    void noResolver_envEmpty_defaultFalse() {
-        ToolSearchService.envOverride = Map.of();
-        assertThat(PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled())
-            .as("未接线 / 无 Spring → 回落 env，默认非 ant → false")
-            .isFalse();
-    }
-
-    @Test
-    @DisplayName("(a) DB 列为 NULL（未配置）→ 回落 env，env 非 ant → false")
-    void dbNull_fallsBackToEnv_false() {
-        PromptAlignSettingsResolver.setStaticResolver(resolverWith(null));
-        ToolSearchService.envOverride = Map.of();
-        assertThat(PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()).isFalse();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // (b) DB 设 true（env 关）→ delta 附件路径生效（内圈不再挡）
-    // ════════════════════════════════════════════════════════════════════
-
-    @Test
-    @DisplayName("(b) DB deferred_tools_delta_enabled=true + env 非 ant → 内圈产出 deferred_tools_delta 附件")
-    void dbTrue_envFalse_deltaAttachmentProduced() {
-        PromptAlignSettingsResolver.setStaticResolver(resolverWith(true));
-        ToolSearchService.envOverride = Map.of(); // env 层判 false —— 旧 env-only 内圈会返回 null
+    @DisplayName("(a) env 空（USER_TYPE≠ant）+ 无 DB 覆盖 → 仍产出 deferred_tools_delta（旧门会返回 null）")
+    void noDeltaGate_envEmptyAndNoDb_stillProduces() {
+        ToolSearchService.envOverride = Map.of(); // 旧 env 层判 false —— 旧实现会在此返回 null → 红
 
         List<Tool> tools = List.of(
             tool("mcp__docs-server__search", true),  // MCP → 恒 deferred（added 非空）
@@ -102,54 +65,15 @@ class DeferredToolsDeltaUnifiedGateTest {
             tools, MODEL, ANTHROPIC, List.of());
 
         assertThat(dtd)
-            .as("DB 开关打开 → 压缩内圈须产出 delta（旧 env-only 拷贝会在此返回 null → 红）")
+            .as("delta 专用门已删 → 无 DB/env 开关，capability 门通过即产出")
             .isNotNull();
         assertThat(dtd.subtype()).isEqualTo(PostCompactAttachmentRestorer.DELTA_TYPE_DEFERRED_TOOLS);
         assertThat(dtd.content()).contains("mcp__docs-server__search");
     }
 
     @Test
-    @DisplayName("(b') DB=true + env 非 ant → prepend 被抑制（不双发）")
-    void dbTrue_envFalse_prependSuppressed() {
-        PromptAlignSettingsResolver.setStaticResolver(resolverWith(true));
-        ToolSearchService.envOverride = Map.of();
-
-        LlmAgentLoop.ToolsAssembly assembly = assembly(List.of(
-            new BashTool(), new ToolSearchTool(), new WebSearchTool()));
-
-        List<ChatMessageDto> out = assembly.prependAvailableDeferredTools(List.of());
-        assertThat(out)
-            .as("delta 路径生效时 prepend 全量清单须被抑制（旧 env-only 判断会误 prepend → 红）")
-            .isEmpty();
-    }
-
-    // ════════════════════════════════════════════════════════════════════
-    // (c) DB 设 false（env 真）→ 走 prepend 全清单
-    // ════════════════════════════════════════════════════════════════════
-
-    @Test
-    @DisplayName("(c) DB deferred_tools_delta_enabled=false + env USER_TYPE=ant → 每轮 prepend 全量清单")
-    void dbFalse_envTrue_prependFullList() {
-        PromptAlignSettingsResolver.setStaticResolver(resolverWith(false));
-        ToolSearchService.envOverride = Map.of("USER_TYPE", "ant"); // env 层判 true —— DB 须覆盖为 false
-
-        LlmAgentLoop.ToolsAssembly assembly = assembly(List.of(
-            new BashTool(), new ToolSearchTool(), new WebSearchTool()));
-        assertThat(assembly.useToolSearch()).isTrue();
-
-        List<ChatMessageDto> out = assembly.prependAvailableDeferredTools(List.of());
-        assertThat(out)
-            .as("DB=false → prepend 全清单（DB 覆盖 env 的 true；改回 env-only 则此处 size=0 → 红）")
-            .hasSize(1);
-        assertThat(out.get(0).content())
-            .contains("<available-deferred-tools>")
-            .contains("</available-deferred-tools>");
-    }
-
-    @Test
-    @DisplayName("(c') DB=false + env USER_TYPE=ant → 内圈 delta 附件被 DB 关挡（与 prepend 互补）")
-    void dbFalse_envTrue_deltaAttachmentNull() {
-        PromptAlignSettingsResolver.setStaticResolver(resolverWith(false));
+    @DisplayName("(a') env USER_TYPE=ant（旧门判 true）→ 同一形态，产出不变（门删后 env 不再有意义）")
+    void noDeltaGate_envAnt_stillProduces() {
         ToolSearchService.envOverride = Map.of("USER_TYPE", "ant");
 
         List<Tool> tools = List.of(
@@ -158,33 +82,45 @@ class DeferredToolsDeltaUnifiedGateTest {
 
         assertThat(PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
                 tools, MODEL, ANTHROPIC, List.of()))
-            .as("DB=false 覆盖 env=true → delta 关闭")
+            .as("env 两态产出相同 ⇒ 证明 env 开关已不在链上")
+            .isNotNull();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // (b) capability 门仍在（红线：不得为让测试过而放宽）
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("(b) capability 门：openai_compatible provider（无 tool_reference 语义）→ 不产出")
+    void capabilityGate_providerOpenAi_blocksDelta() {
+        ToolSearchService.envOverride = Map.of();
+
+        List<Tool> tools = List.of(
+            tool("mcp__docs-server__search", true),
+            tool("ToolSearch", false));
+
+        assertThat(PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
+                tools, MODEL, OPENAI_COMPAT, List.of()))
+            .as("toolReferenceUsable(openai_compatible,*) = false → gate 拦截（不得放宽）")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("(b') capability 门：工具池无 ToolSearch → 不产出")
+    void capabilityGate_noToolSearchTool_blocksDelta() {
+        ToolSearchService.envOverride = Map.of();
+
+        List<Tool> tools = List.of(tool("mcp__docs-server__search", true));
+
+        assertThat(PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
+                tools, MODEL, ANTHROPIC, List.of()))
+            .as("isToolSearchToolAvailable = false → gate 拦截（不得放宽）")
             .isNull();
     }
 
     // ════════════════════════════════════════════════════════════════════
     // 小工具
     // ════════════════════════════════════════════════════════════════════
-
-    /** 造带 DB 值的统一读源（mapper.selectOneById(1) 返回该行）。 */
-    private static PromptAlignSettingsResolver resolverWith(Boolean dbValue) {
-        SettingsMapper mapper = Mockito.mock(SettingsMapper.class);
-        SettingsRecord row = new SettingsRecord();
-        row.setDeferredToolsDeltaEnabled(dbValue);
-        Mockito.when(mapper.selectOneById(1)).thenReturn(row);
-        PromptAlignSettingsResolver r = new PromptAlignSettingsResolver();
-        r.setSettingsMapper(mapper);
-        return r;
-    }
-
-    private static LlmAgentLoop.ToolsAssembly assembly(List<Tool> available) {
-        ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-test", PermissionMode.DEFAULT, Map.of(),
-            available, null, AbortController.NOOP, List.of(),
-            (ToolPermissionContext) null, PermissionMode.DEFAULT)
-            .withEffectiveProviderType(ANTHROPIC);
-        return LlmAgentLoop.llmToolsArray(tuc, QuerySource.USER, List.of(), MODEL);
-    }
 
     /** 假 Tool（isMcp → 恒 deferred，CC isDeferredTool MCP 分支）。 */
     private static Tool tool(String name, boolean mcp) {

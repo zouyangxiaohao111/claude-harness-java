@@ -851,46 +851,75 @@ public class AutoCompactor {
 
         // ── 4. SM 优先 trySessionMemoryCompaction（autoCompact.ts:287-310，REQ-12）──
         // [FIX-SM] effSessionId/effAgentId 来自 ccContext（生产非 null，见上方推导）
-        CompactionResult smResult = trySessionMemoryCompaction(messages, effSessionId, effAgentId, model);
-        if (smResult != null) {
-            // SM 成功链：setLastSummarizedMessageId(undefined) + runPostCompactCleanup +
-            // [gate] notifyCompaction + markPostCompaction（INV-8 · autoCompact.ts:287-310）。
-            // [sm-cursor-sessionize P0-2] 只清本会话游标（旧 static volatile 语义会跨会话清空，
-            // A 压缩成功 → B 的 lastSummarizedMessageId 被清 → B 的 SM 提取时机错乱）。
-            SessionMemoryService.setLastSummarizedMessageId(effSessionId, null);
-            // [P1a F-08] 显式两参传参（querySource + 会话标识）—— 旧 `runPostCompactCleanup.run()`
-            //   读默认闭包的 this.querySource/this.sessionId ⇒ 生产 sessionId 字段恒 null（零 setter
-            //   调用）⇒ clearSystemPromptSections 与 resetMicrocompactState 的 per-session 效果双失。
-            postCompactCleanup.accept(effQuerySource, effSessionId);
-            // [SM-07] notifyCompaction 按 PROMPT_CACHE_BREAK_DETECTION 门控（DRIFT-9）·
-            //   CC autoCompact.ts:302-304 `if (feature('PROMPT_CACHE_BREAK_DETECTION'))`
-            //   —— feature 关闭时不动 cache-read 基线（旧实现无条件调用）。
-            if (promptCacheBreakDetectionGate.getAsBoolean()) {
-                notifyCompaction.accept(
-                    (querySource == null || querySource.isEmpty()) ? "compact" : querySource,
-                    effAgentId);
+        // [compact-signal-fix] SM 尝试**之前**发 compact_start —— 前端据此把输入框发送键变成
+        //   「停止」（压缩可取消，对齐 CC compact 期间的中断外观）。ccContext != null 守卫
+        //   两处都要（便捷重载 tryAutoCompact / 测试直构会传 null ⇒ 无进度通道）。
+        //   ⛔ 成对性由下方 finally 保证：前端 running 态无超时兜底（仅 compact_end 分支
+        //   hideAfterMs 非 null），缺 end 会把发送键永久卡成停止键（要 F5 才恢复）。
+        if (ccContext != null) {
+            ccContext.getOnCompactProgress().accept(new CompactProgressEvent.CompactStart());
+            if (log.isDebugEnabled()) {
+                log.debug("[AutoCompactor] SM 优先分支发 compact_start（压缩横幅置 running）: session={} agent={}",
+                    effSessionId, effAgentId);
             }
-            // [G3] 传 effAgentId（ccContext.getAgentId()：主线程=null · 子代理=UUID 串）。
-            PostCompactionState.markPostCompaction(effSessionId, effAgentId);
-            // [IMP-CM-13] SM 成功复位 tracking · CC 对齐 query.ts:519-526 公共复位
-            //   （consecutiveFailures: 0）——autoCompact.ts SM 分支自身不返回 consecutiveFailures，
-            //   但调用方 query.ts:470 `if (compactionResult)` 对任何压缩成功（SM/legacy 同分支）
-            //   执行公共复位 {compacted:true, turnId:uuid(), turnCounter:0, consecutiveFailures:0}，
-            //   故 SM 成功同样复位熔断计数 + 轮换 turnId + 归零 turnCounter（旧注释 DRIFT-10 误读，
-            //   仅看 autoCompact.ts 未见 query.ts 公共复位，属偏离 CC）。recordSuccess 复位后
-            //   tengu_post_autocompact_turn 在 SM 成功后正常发射（LlmAgentLoop:4700-4712 以
-            //   tracking.isCompacted() 为门，CC query.ts:1523-1533 同构）。
-            tracking.recordSuccess();
-            log.info("[AutoCompactor] SM 优先压缩成功: preTokens={} postTokens={} · source=SESSION_MEMORY",
-                smResult.preCompactTokenCount(), smResult.postCompactTokenCount());
-            return new AutoCompactResult(
-                true,
-                CompactionResult.buildPostCompactMessages(smResult),
-                "SESSION_MEMORY",
-                Math.max(0, smResult.preCompactTokenCount() - smResult.postCompactTokenCount()),
-                smResult,
-                // [IMP-A4-3] SM 成功不携带 consecutiveFailures（CC :306-309 SM 分支无该字段）
-                null);
+        }
+        try {
+            CompactionResult smResult = trySessionMemoryCompaction(messages, effSessionId, effAgentId, model);
+            if (smResult != null) {
+                // SM 成功链：setLastSummarizedMessageId(undefined) + runPostCompactCleanup +
+                // [gate] notifyCompaction + markPostCompaction（INV-8 · autoCompact.ts:287-310）。
+                // [sm-cursor-sessionize P0-2] 只清本会话游标（旧 static volatile 语义会跨会话清空，
+                // A 压缩成功 → B 的 lastSummarizedMessageId 被清 → B 的 SM 提取时机错乱）。
+                SessionMemoryService.setLastSummarizedMessageId(effSessionId, null);
+                // [P1a F-08] 显式两参传参（querySource + 会话标识）—— 旧 `runPostCompactCleanup.run()`
+                //   读默认闭包的 this.querySource/this.sessionId ⇒ 生产 sessionId 字段恒 null（零 setter
+                //   调用）⇒ clearSystemPromptSections 与 resetMicrocompactState 的 per-session 效果双失。
+                postCompactCleanup.accept(effQuerySource, effSessionId);
+                // [SM-07] notifyCompaction 按 PROMPT_CACHE_BREAK_DETECTION 门控（DRIFT-9）·
+                //   CC autoCompact.ts:302-304 `if (feature('PROMPT_CACHE_BREAK_DETECTION'))`
+                //   —— feature 关闭时不动 cache-read 基线（旧实现无条件调用）。
+                if (promptCacheBreakDetectionGate.getAsBoolean()) {
+                    notifyCompaction.accept(
+                        (querySource == null || querySource.isEmpty()) ? "compact" : querySource,
+                        effAgentId);
+                }
+                // [G3] 传 effAgentId（ccContext.getAgentId()：主线程=null · 子代理=UUID 串）。
+                PostCompactionState.markPostCompaction(effSessionId, effAgentId);
+                // [IMP-CM-13] SM 成功复位 tracking · CC 对齐 query.ts:519-526 公共复位
+                //   （consecutiveFailures: 0）——autoCompact.ts SM 分支自身不返回 consecutiveFailures，
+                //   但调用方 query.ts:470 `if (compactionResult)` 对任何压缩成功（SM/legacy 同分支）
+                //   执行公共复位 {compacted:true, turnId:uuid(), turnCounter:0, consecutiveFailures:0}，
+                //   故 SM 成功同样复位熔断计数 + 轮换 turnId + 归零 turnCounter（旧注释 DRIFT-10 误读，
+                //   仅看 autoCompact.ts 未见 query.ts 公共复位，属偏离 CC）。recordSuccess 复位后
+                //   tengu_post_autocompact_turn 在 SM 成功后正常发射（LlmAgentLoop:4700-4712 以
+                //   tracking.isCompacted() 为门，CC query.ts:1523-1533 同构）。
+                tracking.recordSuccess();
+                // [compact-signal-fix] 有意与 CC 分歧：CC 的 SM 分支不发任何 onCompactProgress
+                //   事件（CC 全部 14 处调用点都在 compactConversation/reactive 内，且这两事件只
+                //   驱动 TUI spinner 文案，不是进度条）；本仓 Web 进度横幅是 CC 无对应物的自造物，
+                //   用户已裁定补发。start/end 成对由 finally 保证，防止发送键永久卡成停止。
+                log.info("[AutoCompactor] SM 优先压缩成功: preTokens={} postTokens={} · source=SESSION_MEMORY",
+                    smResult.preCompactTokenCount(), smResult.postCompactTokenCount());
+                return new AutoCompactResult(
+                    true,
+                    CompactionResult.buildPostCompactMessages(smResult),
+                    "SESSION_MEMORY",
+                    Math.max(0, smResult.preCompactTokenCount() - smResult.postCompactTokenCount()),
+                    smResult,
+                    // [IMP-A4-3] SM 成功不携带 consecutiveFailures（CC :306-309 SM 分支无该字段）
+                    null);
+            }
+        } finally {
+            // [compact-signal-fix] finally 成对收口：SM 成功 / 返回 null 回落 legacy 分支 / 链中途
+            //   抛异常，三条路都恰好发一次 compact_end ⇒「SM 的 start 一定被闭合」。
+            //   ⛔ 只发事件，**不 catch** —— 异常照常向上抛（SM 调用在下方 legacy try 之外）。
+            if (ccContext != null) {
+                ccContext.getOnCompactProgress().accept(new CompactProgressEvent.CompactEnd());
+                if (log.isDebugEnabled()) {
+                    log.debug("[AutoCompactor] SM 优先分支 compact_start/compact_end 成对收口（finally）: session={} agent={}",
+                        effSessionId, effAgentId);
+                }
+            }
         }
 
         try {

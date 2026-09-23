@@ -370,7 +370,8 @@ class CachedMcBoundaryWiringCcTest {
         RecordingMicroCompactor micro = new RecordingMicroCompactor();
         CompactCommand.CompactCommandContext ctx = new CompactCommand.CompactCommandContext(
             List.of(singleMessage("m1", "hi")), null, null, null, false, null, null,
-            micro, null, null, null, null, null, null, null, null, null, false, () -> false, null);  // [批 5a-2] warningPushContext
+            micro, null, null, null, null, null, null, null, null, null, false, () -> false, null,  // [批 5a-2] warningPushContext
+            null);  // [compact-signal-fix] progressSink（本用例不断言进度事件 → no-op）
 
         Method m = CompactCommand.class.getDeclaredMethod(
             "microcompactMessages", List.class, CompactCommand.CompactCommandContext.class);

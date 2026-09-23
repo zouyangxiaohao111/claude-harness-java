@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
 import com.nexusai.application.agent.tasks.SdkEventQueue;
@@ -12,6 +13,7 @@ import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.InProcessTeammateTaskState;
+import com.nexusai.application.agent.team.LeaderPermissionBridge;
 import com.nexusai.application.agent.team.SpawnInProcess;
 import com.nexusai.application.agent.team.TeamHelpers;
 import com.nexusai.application.agent.team.TeammateIdentity;
@@ -316,6 +318,35 @@ class TeamDeleteToolTest {
         assertThat(output.get("team_name").asText()).isEqualTo(team);
         assertThat(output.has("existed")).as("CC 输出无 existed").isFalse();
         assertThat(teamConfigPath(team)).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("[T2] 解散 team ⇒ 注销本会话 leader 确认表面（与 TeamCreate 注册成对，不留悬挂桶）")
+    void delete_unregistersLeaderConfirmSurfacePerSession() throws Exception {
+        // WHY: LeaderPermissionBridge 按会话分桶后，注册（TeamCreateTool 建 team）与注销
+        //   （TeamDeleteTool 解散）必须成对 —— 只注册不注销 ⇒ 常驻 JVM 里桶悬挂；被解散会话的
+        //   确认表面若留着，sessionId 复用时会把旧表面当成新会话的（串台第二形态）。
+        //   变异点：删掉 TeamDeleteTool 里的 unregisterSetter 调用 ⇒ 末断言 RED。
+        LeaderPermissionConfirmBridge bridge = new LeaderPermissionConfirmBridge();
+        bridge.setWs(mock(org.springframework.messaging.simp.SimpMessagingTemplate.class));
+
+        Map<String, Object> appState = new LinkedHashMap<>();
+        TeamCreateTool create = new TeamCreateTool(new TeamHelpers(), new TaskService());
+        create.setLeaderPermissionConfirmBridge(bridge);
+        ObjectNode createInput = new ObjectMapper().createObjectNode();
+        createInput.put("team_name", "t2-del-team");
+        create.execute(block("TeamCreate", createInput), appStateCtx(appState));
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue(APPSTATE_CTX_SESSION_ID))
+                .as("前置：建 team 后本会话表面已注册（注册侧由 TeamCreateToolTest 钉死）").isNotNull();
+
+        TeamDeleteTool tool = newTool();
+        tool.setLeaderPermissionConfirmBridge(bridge);
+        AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
+                appStateCtx(appState));
+
+        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue(APPSTATE_CTX_SESSION_ID))
+                .as("解散后本会话 leader 确认表面必须注销（注册/注销成对）").isNull();
     }
 
     @Test

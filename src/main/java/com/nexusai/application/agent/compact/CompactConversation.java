@@ -416,8 +416,19 @@ public final class CompactConversation {
             }
 
             // ── 9. readFileState 缓存（compact.ts:517-522，REQ-04）──
+            // 顺序对齐 CC（2.1.88 compact.ts:518-521 / 2.1.278 claude.exe off 204805268）：
+            //   ① preCompactReadFileState = cacheToObject(context.readFileState)  ← 先拷快照
+            //   ② context.readFileState.clear()                                    ← 再清活表
+            // ⚠ CC 的 context.readFileState 是 toolUseContext.readFileState（活表），本仓
+            //   ctx.getReadFileState() 只是快照副本 ⇒ clearReadFileState() 两个都清
+            //   （详见 CompactConversationContext#clearReadFileState 的逐路径可达性说明）。
             Map<String, ReadFileState> preCompactReadFileState = snapshotReadFileState(ctx);
-            ctx.clearReadFileState();
+            int preCompactLiveEntries = ctx.clearReadFileState();
+            if (log.isDebugEnabled()) {
+                log.debug("[CompactConversation] readFileState 快照 {} 条 → 活表已清 {} 条"
+                        + "（sessionId={}；活表=会话级 FileStateCache，Edit/Write 门禁同实例）",
+                    preCompactReadFileState.size(), preCompactLiveEntries, ctx.getSessionId());
+            }
 
             // ── 9.1 loadedNestedMemoryPaths 清空（compact.ts:522，A13）──
             // CC context.loadedNestedMemoryPaths?.clear()（?: 空安全）：压缩完成后清空已加载

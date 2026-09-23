@@ -46,9 +46,19 @@ class SwarmPermissionLoopTest {
     private static final String WORKER = "worker-a";
     private static final String TEAM = "my-team";
 
+    /**
+     * [T2 · 会话分桶] 本 team 的 leader 会话 = leader ToolUseConfirm setter 的桶键
+     * （生产由 TeamCreateTool 落盘进 config.json {@code leadSessionId} 并据此注册；
+     * 本测试写进 config + 用同键注册，两侧同键是分桶生效的前提）。
+     */
+    private static final String LEAD_SESSION = "sess-lead-t2-0001";
+
     /** 捕获 dispatcher 推送的 ToolUseConfirm 队列（模拟 React 状态队列）。 */
     private final AtomicReference<List<LeaderPermissionBridge.ToolUseConfirmEntry>> capturedQueue =
             new AtomicReference<>();
+
+    /** dispatcher（[T2] 需注入 TeamHelpers 以解析 leadSessionId 桶键）。 */
+    private SwarmLeaderPermissionDispatcher dispatcher;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -56,27 +66,37 @@ class SwarmPermissionLoopTest {
         System.setProperty("nexusai.team.name", TEAM);
         // swarms opt-in（isAgentSwarmsEnabled 的 sysprop-override seam，agentSwarmsEnabled.ts:32）
         System.setProperty("nexusai.experimental.agent-teams", "true");
-        LeaderPermissionBridge.unregisterLeaderToolUseConfirmQueue();
+        LeaderPermissionBridge.unregisterLeaderToolUseConfirmQueue(LEAD_SESSION);
         SwarmPermissionPoller.clearAllPendingCallbacks();
         capturedQueue.set(null);
+        dispatcher = new SwarmLeaderPermissionDispatcher();
+        dispatcher.setTeamHelpers(new com.nexusai.application.agent.team.TeamHelpers());
         writeTeamConfig();
     }
 
     /** 写 team config：使 getLeaderName 经 {@code members.find(agentId === leadAgentId)}
      *  精确解析 leader 名 "team-lead"（对齐 CC permissionSync.ts:651-667），而非依赖旧 code path
-     *  的 "team-lead" 兜底（ML-2 已删除：team 文件缺失 → 返回 null）。 */
+     *  的 "team-lead" 兜底（ML-2 已删除：team 文件缺失 → 返回 null）。
+     *  [T2] 同时落盘 {@code leadSessionId} —— dispatcher 据此定位本会话的确认表面桶。 */
     private void writeTeamConfig() throws Exception {
         Path teamDir = tempConfigHome.resolve("teams").resolve(TEAM);
         java.nio.file.Files.createDirectories(teamDir);
-        String cfg = "{\"leadAgentId\":\"lead@my-team\",\"members\":["
+        String cfg = "{\"leadAgentId\":\"lead@my-team\",\"leadSessionId\":\"" + LEAD_SESSION + "\",\"members\":["
             + "{\"agentId\":\"lead@my-team\",\"name\":\"team-lead\"},"
             + "{\"agentId\":\"worker-a@my-team\",\"name\":\"worker-a\"}]}";
         java.nio.file.Files.writeString(teamDir.resolve("config.json"), cfg);
     }
 
-    /** 注册捕获式 queue setter · 对齐 CC leaderPermissionBridge.ts:28-32 registerLeaderToolUseConfirmQueue。 */
+    /** 注册捕获式 queue setter · 对齐 CC leaderPermissionBridge.ts:28-32 registerLeaderToolUseConfirmQueue
+     *  （[T2] 按 leader 会话注册 —— 生产里等价物 = TeamCreateTool 建 team 成功后按 leadSessionId 注册）。 */
     private void registerCapturingQueueSetter() {
-        LeaderPermissionBridge.registerLeaderToolUseConfirmQueue(updater ->
+        LeaderPermissionBridge.registerLeaderToolUseConfirmQueue(LEAD_SESSION, updater ->
+                capturedQueue.set(updater.apply(List.of())));
+    }
+
+    /** [T2 反面对照] 把捕获式 setter 注册到<b>另一个会话</b>（模拟「别的会话有确认表面」）。 */
+    private void registerCapturingQueueSetterForOtherSession() {
+        LeaderPermissionBridge.registerLeaderToolUseConfirmQueue("sess-other-9999", updater ->
                 capturedQueue.set(updater.apply(List.of())));
     }
 
@@ -87,7 +107,8 @@ class SwarmPermissionLoopTest {
         System.clearProperty("nexusai.agent.name");
         System.clearProperty("nexusai.agent.color");
         System.clearProperty("nexusai.experimental.agent-teams");
-        LeaderPermissionBridge.unregisterLeaderToolUseConfirmQueue();
+        LeaderPermissionBridge.unregisterLeaderToolUseConfirmQueue(LEAD_SESSION);
+        LeaderPermissionBridge.unregisterLeaderToolUseConfirmQueue("sess-other-9999");
         SwarmPermissionPoller.clearAllPendingCallbacks();
     }
 
@@ -122,7 +143,7 @@ class SwarmPermissionLoopTest {
         // 2. leader 侧：注册捕获式队列 setter + dispatch 读邮箱 → 推 ToolUseConfirm 队列（对齐 CC useInboxPoller:250-364）
         asLeader();
         registerCapturingQueueSetter();
-        int handled = new SwarmLeaderPermissionDispatcher().dispatchOnce();
+        int handled = dispatcher.dispatchOnce();
         assertThat(handled).as("leader 必须处理 1 条权限请求").isEqualTo(1);
 
         // dispatcher 必须推送 1 条 ToolUseConfirmEntry 到队列（dedup by toolUseId，CC :340-345）
@@ -173,7 +194,7 @@ class SwarmPermissionLoopTest {
         // leader 侧：dispatch 推队列 + 模拟 onAllow（含 permissionUpdates —— [REV-FIX-6 gap3] 透传）
         asLeader();
         registerCapturingQueueSetter();
-        new SwarmLeaderPermissionDispatcher().dispatchOnce();
+        dispatcher.dispatchOnce();
         List<LeaderPermissionBridge.ToolUseConfirmEntry> queue = capturedQueue.get();
         assertThat(queue).as("leader 必须推送权限提示到队列").isNotNull().hasSize(1);
         queue.get(0).onAllow().accept(Map.of("command", "ls -la"),
@@ -201,13 +222,46 @@ class SwarmPermissionLoopTest {
 
         asLeader();
         // 不注册确认表面（queue setter）→ 自动 deny（R1：mailbox 请求无 STOMP 会话，不悬挂 worker）
-        int handled = new SwarmLeaderPermissionDispatcher().dispatchOnce();
+        int handled = dispatcher.dispatchOnce();
         assertThat(handled).isEqualTo(1);
 
         List<TeammateMailbox.TeammateMessage> workerInbox = TeammateMailbox.readMailbox(WORKER, TEAM);
         assertThat(workerInbox).hasSize(1);
         TeammateMailbox.PermissionResponseMessage resp = TeammateMailbox.isPermissionResponse(workerInbox.get(0).text());
         assertThat(resp).as("auto-deny 必须回 error 响应").isNotNull();
+        assertThat(resp.subtype()).isEqualTo("error");
+    }
+
+    @Test
+    @DisplayName("[T2 跨会话隔离] 别的会话注册了确认表面 ⇒ 本 team 请求仍走自动 deny，⛔ 不得借用其表面")
+    void loop_otherSessionSurface_isNotBorrowed() {
+        // WHY（本任务要修的断裂）：改前 LeaderPermissionBridge 是**进程级单槽** —— 只要**任意**
+        //   会话注册过表面，本 team 的权限请求就会被推到**那个会话**的弹窗（跨会话串台：用户看到的
+        //   是别人会话的权限弹窗，而本会话 leader 永远等不到决策面 → 权限断裂）。
+        //   改后按会话分桶：本 team 的桶键 = config.leadSessionId，别的会话的注册对本 team 不可见。
+        asWorker();
+        SwarmPermissionPoller.registerPermissionCallback("perm-req-x", "tooluse-x",
+            outcome -> { }, feedback -> { });
+        SwarmPermissionSync.SwarmPermissionRequest req = SwarmPermissionSync.createPermissionRequest(
+            "perm-req-x", "Bash", "tooluse-x", Map.of("command", "rm"), "rm -rf /", List.of());
+        assertThat(SwarmPermissionSync.sendPermissionRequestViaMailbox(req)).isTrue();
+
+        asLeader();
+        // 反面对照：把「有确认表面」的注册放到**另一个会话**（本 team 的 leadSessionId 桶仍空）
+        registerCapturingQueueSetterForOtherSession();
+        assertThat(LeaderPermissionBridge.getLeaderToolUseConfirmQueue(LEAD_SESSION))
+            .as("前置：本 team 会话桶必须为空（对照有效的前提）").isNull();
+
+        int handled = dispatcher.dispatchOnce();
+
+        assertThat(handled).isEqualTo(1);
+        assertThat(capturedQueue.get())
+            .as("⛔ 不得把本 team 的请求推给别的会话的确认表面（改回单槽即 RED）").isNull();
+        List<TeammateMailbox.TeammateMessage> workerInbox = TeammateMailbox.readMailbox(WORKER, TEAM);
+        assertThat(workerInbox).hasSize(1);
+        TeammateMailbox.PermissionResponseMessage resp =
+            TeammateMailbox.isPermissionResponse(workerInbox.get(0).text());
+        assertThat(resp).as("无本会话表面 → R1 自动 deny（不把 worker 悬挂在别人的弹窗上）").isNotNull();
         assertThat(resp.subtype()).isEqualTo("error");
     }
 }

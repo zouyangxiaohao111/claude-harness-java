@@ -184,12 +184,35 @@ public final class CompactCommand {
              * 构造，故由装配方（{@code ToolRegistrationConfig.handleCompactCommand}）显式注入。
              * null = 无 STOMP 通道（非 STOMP 路径 / 测试直构）⇒ 抑制态推送跳过并 ≥WARN（(b) 类）。
              */
-            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext warningPushContext) {
+            com.nexusai.application.agent.compact.CompactWarningState.SessionPushContext warningPushContext,
+            /**
+             * [compact-signal-fix] 压缩进度事件出口（**显式载荷**）。
+             *
+             * <p><b>WHY 独立于 {@link #compactConversationContextSupplier}</b>：SM（session memory）
+             * 优先分支在 {@code call} 内直接 return，**从不调用** supplier（供应商会真读
+             * taskFrameworkService/planProvider，有副作用）⇒ 只能由本字段拿到 sink，不能经
+             * supplier 取 {@code CompactConversationContext.getOnCompactProgress()}。
+             *
+             * <p><b>有意与 CC 分歧</b>：CC 2.1.88 / 2.1.278 的 SM 分支同样**不发**任何
+             * onCompactProgress 事件（CC 全部 14 处调用点都在 compactConversation / reactive 内，
+             * 且 CC 的 compact_start/compact_end 只驱动 TUI spinner 文案，不是 Web 进度条）。
+             * 本仓 Web 端「输入框上方压缩进度横幅」是 CC 无对应物的自造物，用户已裁定在 SM
+             * 分支补发 {@code compact_end}。
+             *
+             * <p>[compact-signal-fix 二次] 发的是 <b>start + end 成对</b>：start 置前端 running 态
+             * （输入框发送键变「停止」，压缩可取消），end 放 {@code finally} 收口 —— 前端 running
+             * 态无超时兜底，缺 end 会把发送键永久卡成停止键。
+             *
+             * <p>null = no-op（构造器归一）。
+             */
+            java.util.function.Consumer<CompactProgressEvent> progressSink) {
 
         public CompactCommandContext {
             if (messages == null) {
                 throw new IllegalArgumentException("CompactCommandContext.messages is null");
             }
+            // [compact-signal-fix] 归一：null → no-op（测试直构 / 非 STOMP 路径无需判空）。
+            progressSink = progressSink != null ? progressSink : event -> { };
         }
 
         /** CC context.options.querySource ?? 'compact'（compact.ts:69）。 */
@@ -238,36 +261,63 @@ public final class CompactCommand {
         try {
             // ── 4. SM 优先（compact.ts:58-82，REQ-12）──
             if (customInstructions.isEmpty() && ctx.sessionMemoryService() != null) {
-                CompactionResult smResult = ctx.sessionMemoryService().trySessionMemoryCompaction(
-                    messages, ctx.sessionId(), ctx.agentId(), null);
-                if (smResult != null) {
-                    // SM 成功收尾链（compact.ts:63-75）：
-                    // getUserContext.cache.clear + runPostCompactCleanup + notifyCompaction +
-                    // markPostCompaction + suppressCompactWarning
-                    // [IMP-A2-5 · OPD-CM5-A-15] 收尾顺序对齐 CC：runPostCompactCleanup 先于
-                    // notifyCompaction（旧实现 notify 在前、cleanup 在后——A5 探查 △-1 曾登记不修，
-                    //   本次拍板对齐 CC；auto 路径 AutoCompactor:631-643 同序，手动 /compact 归一）。
-                    ctx.clearUserContextCache().run();
-                    // [merge 回归修复 2026-08-14] SM 成功链无参门：runPostCompactCleanup()
-                    // （compact.ts:64 无参调用）→ querySource=undefined → isMainThreadCompact=TRUE
-                    // → resetContextCollapse + clearUserOnlyProviderCaches + resetGetMemoryFilesCache('compact')
-                    // 全执行（merge 冲突解决时误改为 effectiveQuerySource()="compact" → gate=false
-                    // → P0 缓存残留回归；IMP2-02 修复被覆盖）。
-                    // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
-                    //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
-                    PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
-                    // [SM-10] notifyCompaction 按 PROMPT_CACHE_BREAK_DETECTION 门控（DRIFT-9）·
-                    //   CC compact.ts:67-72 `if (feature('PROMPT_CACHE_BREAK_DETECTION'))`
-                    //   —— feature 关闭时不动 cache-read 基线（旧实现无条件调用）。
-                    if (ctx.promptCacheBreakDetectionGate().getAsBoolean()) {
-                        ctx.notifyCompaction().run();
+                // [compact-signal-fix] SM 尝试**之前**发 compact_start —— 前端据此把输入框发送键
+                //   变成「停止」（压缩可取消，对齐 CC compact 期间的中断外观）。
+                //   ⛔ 与 end 的**成对性**是本改动的安全承重项：前端 running 态**无超时兜底**
+                //   （front/src/utils/compactProgress.ts 仅 compact_end 分支 hideAfterMs 非 null），
+                //   一旦「发了 start 没发 end」（返回 null 回落传统分支 / SM 链中途抛异常）横幅会永久
+                //   显示，且 front/src/App.tsx:439 的 compactActive 恒真 ⇒ 发送键**永久卡成停止键**
+                //   （要 F5 才恢复）⇒ end 只能放 finally（覆盖成功 / 回落 / 抛异常三条路）。
+                ctx.progressSink().accept(new CompactProgressEvent.CompactStart());
+                if (log.isDebugEnabled()) {
+                    log.debug("[CompactCommand] SM 优先分支发 compact_start（压缩横幅置 running）: session={} agent={}",
+                        ctx.sessionId(), ctx.agentId());
+                }
+                try {
+                    CompactionResult smResult = ctx.sessionMemoryService().trySessionMemoryCompaction(
+                        messages, ctx.sessionId(), ctx.agentId(), null);
+                    if (smResult != null) {
+                        // SM 成功收尾链（compact.ts:63-75）：
+                        // getUserContext.cache.clear + runPostCompactCleanup + notifyCompaction +
+                        // markPostCompaction + suppressCompactWarning
+                        // [IMP-A2-5 · OPD-CM5-A-15] 收尾顺序对齐 CC：runPostCompactCleanup 先于
+                        // notifyCompaction（旧实现 notify 在前、cleanup 在后——A5 探查 △-1 曾登记不修，
+                        //   本次拍板对齐 CC；auto 路径 AutoCompactor:631-643 同序，手动 /compact 归一）。
+                        ctx.clearUserContextCache().run();
+                        // [merge 回归修复 2026-08-14] SM 成功链无参门：runPostCompactCleanup()
+                        // （compact.ts:64 无参调用）→ querySource=undefined → isMainThreadCompact=TRUE
+                        // → resetContextCollapse + clearUserOnlyProviderCaches + resetGetMemoryFilesCache('compact')
+                        // 全执行（merge 冲突解决时误改为 effectiveQuerySource()="compact" → gate=false
+                        // → P0 缓存残留回归；IMP2-02 修复被覆盖）。
+                        // [批 3c] 显式传本会话：原无参入口不带会话 ⇒ 第 4 项 clearSystemPromptSections 无法定位
+                        //   会话级 section 缓存（WARN 跳过）。querySource 仍传 null 以保持「无参门 → gate=TRUE」语义。
+                        PostCompactCleanup.runPostCompactCleanup(null, ctx.sessionId());
+                        // [SM-10] notifyCompaction 按 PROMPT_CACHE_BREAK_DETECTION 门控（DRIFT-9）·
+                        //   CC compact.ts:67-72 `if (feature('PROMPT_CACHE_BREAK_DETECTION'))`
+                        //   —— feature 关闭时不动 cache-read 基线（旧实现无条件调用）。
+                        if (ctx.promptCacheBreakDetectionGate().getAsBoolean()) {
+                            ctx.notifyCompaction().run();
+                        }
+                        // [G3] 传 ctx.agentId()（manual /compact：主线程 state ⇒ null；子代理 ⇒ UUID 串）。
+                        PostCompactionState.markPostCompaction(ctx.sessionId(), ctx.agentId());
+                        CompactWarningState.suppressCompactWarning(ctx.sessionId(), ctx.warningPushContext());
+                        // [compact-signal-fix] 有意与 CC 分歧：CC 的 SM 分支不发任何 onCompactProgress 事件
+                        //   （CC 全部 14 处调用点都在 compactConversation/reactive 内，且这两事件只驱动 TUI spinner
+                        //   文案，不是进度条）；本仓「进度横幅」是 Web 端自造物（CC 无对应物），用户已裁定在 SM 分支补发。
+                        log.info("[CompactCommand] SM 优先压缩成功: session={} agent={} preTokens={}",
+                            ctx.sessionId(), ctx.agentId(), smResult.preCompactTokenCount());
+                        return new CompactCommandResult(smResult, buildDisplayText(ctx, null));
                     }
-                    // [G3] 传 ctx.agentId()（manual /compact：主线程 state ⇒ null；子代理 ⇒ UUID 串）。
-                    PostCompactionState.markPostCompaction(ctx.sessionId(), ctx.agentId());
-                    CompactWarningState.suppressCompactWarning(ctx.sessionId(), ctx.warningPushContext());
-                    log.info("[CompactCommand] SM 优先压缩成功: session={} agent={} preTokens={}",
-                        ctx.sessionId(), ctx.agentId(), smResult.preCompactTokenCount());
-                    return new CompactCommandResult(smResult, buildDisplayText(ctx, null));
+                } finally {
+                    // [compact-signal-fix] finally 成对收口：SM 成功 / 返回 null 回落传统分支 / 链中途
+                    //   抛异常，三条路都恰好发一次 compact_end ⇒「SM 的 start 一定被闭合」，发送键
+                    //   不会永久卡成停止键（start/end 成对由 finally 保证，不靠成功分支）。
+                    //   ⛔ 只发事件，**不 catch** —— 异常照常向上抛（外层 catch 做 CC 四分支翻译）。
+                    ctx.progressSink().accept(new CompactProgressEvent.CompactEnd());
+                    if (log.isDebugEnabled()) {
+                        log.debug("[CompactCommand] SM 优先分支 compact_start/compact_end 成对收口（finally）: session={} agent={}",
+                            ctx.sessionId(), ctx.agentId());
+                    }
                 }
             }
 

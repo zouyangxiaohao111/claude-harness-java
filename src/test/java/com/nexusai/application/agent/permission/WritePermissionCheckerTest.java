@@ -453,12 +453,39 @@ class WritePermissionCheckerTest {
     }
 
     @Test
-    @DisplayName("护栏·不得放宽到自有根：'~/.nexusai/**' 不在同源接受集 → 仍落 1.7 safety Ask")
-    void nexusaiRootWildcard_stillSafetyAsk() {
-        // WHY：安全边界不得因新增前缀而放宽。同源前缀必须停在 'skills/' 段 —— 若实现把前缀退化为
-        //   '~/.{appName}/'（如为省事只取 getProjectDirName()），自有根下的 settings.json /
-        //   hooks / 任意配置都会被 1.6 直接放行（属扩大豁免面）。本用例即该退化的判别器：
-        //   规则在 1.6 root-relative 匹配层是命中的，唯因前缀不在接受集而被范围校验拒。
+    @DisplayName("自有根通配 '~/.nexusai/**' ⇒ 穿透 1.7 危险档 → Allow(Rule)"
+        + "（依用户 2026-09-22 裁定：照 CC '~/.claude/**' ⇒ '~/.nexusai/**' 放宽到整个自有根）")
+    void nexusaiRootWildcard_penetratesByUserRuling_allow() {
+        // ── 本用例由上一批的护栏用例 nexusaiRootWildcard_stillSafetyAsk 【改写】而来 ──
+        // 旧名 = nexusaiRootWildcard_stillSafetyAsk（旧断言 Ask：守「自有根不得被宽前缀放宽」）。
+        // ⛔ 不是删除、不是静默改断言：用户 2026-09-22 裁定推翻了旧行为，故按裁定改写为钉【新行为】。
+        //
+        // 【用户裁定原话（2026-09-22）】「CC 里 `~/.claude/**` 能穿透，到我们这 就是 `~/.nexusai`
+        //   能穿透。`.claude` 对应就是我们的 `.nexusai`」；被问「照 CC 要推翻一条既有护栏，确认放宽吗」
+        //   时答：「放宽到整个自有根（照 CC）」。
+        //
+        // 【为什么 CC 真源支持该放宽（读码取证，非推断）】CC filesystem.ts:1281-1290（1.6 的范围校验）
+        //   用 ruleContent.startsWith(GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN.slice(0,-2))
+        //   = startsWith('~/.claude') 判定 ⇒ '~/.claude/**' 通过校验；而 1.6 在 1.7 之前返回
+        //   allow（:1273-1300 早于 :1302 的安全检查）⇒ CC 里「整个自有根」的会话批准确实穿透安全检查。
+        //   本仓对应物 = '~/.{appName}/**'（自有配置根），放宽落点在 1.7 第 3 道的穿透门护栏②
+        //   （WritePermissionChecker#isApprovalScopeAllowed 的「自有根档」）。
+        //
+        // 【仍然不放宽的部分（本用例的下界由同一夹具内的反例守住）】
+        //   ①比危险根更宽的范围（'~/**'、'/**'、'<repo>/**'）→ 见 broaderThanDangerousRoot_stillSafetyAsk；
+        //   ②1.6 行为未变（skill scope 前缀集不动）→ 见上方 skill 三用例；
+        //   ③1.7 第 1/2 道（可疑 Windows / Claude 配置文件）任何规则都不穿透。
+        //
+        // 【本用例走的是哪条路（为什么 reason 是 Rule 而不是别的）】⚠️ [批 2026-09-23 更正：原注释说
+        //   '~/.{appName}/**' 被 1.6 拒收、走 1.7 —— 那是「发钥匙」批**之前**的事实，现已相反]
+        //   实测（本批，surefire system-out 原始输出）：
+        //   "[WritePermissionChecker] 1.6 自有根（.{appName}）会话授权命中 → allow
+        //    [SELF_ROOT_16_ALLOW]: rule=Edit(~/.nexusai/**) path=~/.nexusai/skills/foo/bar.md"
+        //   ⇒ 该 Allow 来自 **1.6**（1.6 接受集自「发钥匙」批起含 '~/.{appName}/' 前缀，
+        //   filesystem.ts:1281-1290 早于 1.7）⇒ **根本走不到 1.7 第 3 道**。
+        //   即 Allow 来自『用户批准过的那条规则』（1.6 同样返回 Rule reason），不是某个宽松档。
+        //   ⛔ 1.7 的「自有根相等档」在本形上已不可达（见 WritePermissionChecker#isSelfRootAnchorRule
+        //   的登记段：相等档只剩「锚形但 1.6 拒收」的写法）。
         String pattern = "~/" + NexusaiPaths.getProjectDirName() + "/**";
         ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
             PermissionRuleSource.SESSION,
@@ -471,11 +498,69 @@ class WritePermissionCheckerTest {
             checker.check(tool, input(nexusaiSkillTildePath("foo", "bar.md")), ctx);
 
         assertThat(result)
-            .as("豁免面未放宽：自有根级通配不得从 1.6 放行（否则 settings.json 一并放行）")
+            .as("依用户裁定放宽到整个自有根：'~/.nexusai/**' 会话批准 ⇒ 穿透 1.7 第 3 道（照 CC 1.6）")
+            .isInstanceOf(PermissionResult.Allow.class);
+        assertThat(((PermissionResult.Allow) result).reason())
+            .as("Allow 必须来自步骤 4 命中的那条会话规则（Rule），证明是『用户批准过的』而非宽松档")
+            .isInstanceOf(PermissionDecisionReason.Rule.class);
+    }
+
+    @Test
+    @DisplayName("护栏（本批新增反例）·比危险根更宽的批准仍被拒：'~/**' / '/**' / '<repo>/**' ⇒ 仍 Ask")
+    void broaderThanDangerousRoot_stillSafetyAsk() {
+        // WHY：放宽只到「自有配置根」为止。批准范围若比危险根【更宽】（= 危险根的祖先 / 跨根），
+        //   等于「批准了整个 home / 整个文件系统 / 整个仓库」，不得穿透 1.7 危险档 —— 否则
+        //   <repo>/** 会连带放开 <repo>/.git/**、~/** 会连带放开 ~/.nexusai/hooks/**。
+        // 判据位置：WritePermissionChecker#isApprovalScopeAllowed 的拒绝分支（非严格在内且非自有根档）。
+        // ⛔ 这三条是本批放宽的【下界】：删掉它们 = 把护栏整道拆掉。
+        String target = nexusaiSkillTildePath("foo", "bar.md");
+        WritePermissionChecker checker = new WritePermissionChecker();
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+
+        // ① '~/**'（批准整个家目录 ⇒ 覆盖 <home>/.{appName} 的父目录）→ 仍 Ask
+        String homeWildcard = "~/**";
+        ToolUseContext ctxHome = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, homeWildcard))),
+            Map.of(), Map.of()), cwdDir());
+        assertThat(checker.check(tool, input(target), ctxHome))
+            .as("'~/**' 比自有根更宽（祖先）⇒ 不得穿透 1.7（否则整个家目录一并授出）")
             .isInstanceOf(PermissionResult.Ask.class);
-        assertThat(((PermissionResult.Ask) result).reason())
-            .as("1.6 拒收 → 落 1.7 自有根危险段 Ask(SafetyCheck)")
-            .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+
+        // ② '/**'（批准整个文件系统）→ 仍 Ask
+        String rootWildcard = "/**";
+        ToolUseContext ctxRoot = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, rootWildcard))),
+            Map.of(), Map.of()), cwdDir());
+        assertThat(checker.check(tool, input(target), ctxRoot))
+            .as("'/**' 是文件系统根 ⇒ 比任何危险根都宽 ⇒ 不得穿透 1.7")
+            .isInstanceOf(PermissionResult.Ask.class);
+
+        // ③ '<repo>/**'（批准整个仓库 ⇒ 是仓库内任何危险根的祖先）→ 仍 Ask
+        //    目标取 <repo>/.{appName}/teams/x/notes.md（仓库内自有根，dangerousRoot 的末段同样是
+        //    自有根段）—— 用来钉「放宽只到『恰为该根』，祖先/跨根一律拒」，即 <repo>/.{appName}/**
+        //    可穿透（见 WritePermissionCheckerUserApprovedPenetrationTest 的仓库内自有根用例）而
+        //    <repo>/** 不行。
+        Path repo = cwdDir();
+        String repoWildcard = toGlob(repo);
+        // ⚠️ getProjectDirName() 自带前导点（'.nexusai'）——⛔ 不要再加 '.'。
+        String repoOwnRootTarget = repo.toAbsolutePath()
+            .resolve(NexusaiPaths.getProjectDirName()).resolve("teams").resolve("x")
+            .resolve("notes.md").toString();
+        ToolUseContext ctxRepo = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(
+            PermissionRuleSource.SESSION,
+            Set.of(rule(PermissionRuleSource.SESSION, PermissionBehavior.ALLOW, repoWildcard))),
+            Map.of(), Map.of()), repo);
+        assertThat(checker.check(tool, input(repoOwnRootTarget), ctxRepo))
+            .as("'<repo>/**' 是危险根（<repo>/.{appName}）的祖先（跨根）⇒ 不得穿透 1.7")
+            .isInstanceOf(PermissionResult.Ask.class);
+
+        // 可达性对照（防「规则压根没命中」的假绿）：同一 '<repo>/**' 规则对仓库内普通文件 ⇒ Allow
+        //   ⇒ 证明该规则形态确实能被 RuleQuery 匹配到，故③ 的 Ask 是护栏判定的结果。
+        assertThat(checker.check(tool, input(targetFile(repo)), ctxRepo))
+            .as("可达性对照：'<repo>/**' 对 <repo>/a.txt（非危险路径）⇒ Allow（规则在匹配层命中）")
+            .isInstanceOf(PermissionResult.Allow.class);
     }
 
     @Test

@@ -1,20 +1,29 @@
 package com.nexusai.application.agent.team;
 
+import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.application.agent.permission.SessionPermissionOverlay;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
 import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskService;
+import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.SubagentExecutor;
+import com.nexusai.common.SessionKeys;
 import com.nexusai.infra.util.AbortControllerFactory;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Paths;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
 
 /**
  * Spawn In Process · 对齐 CC utils/swarm/spawnInProcess.ts（W8-01 生产化，DEL-29）。
@@ -67,6 +76,14 @@ public class SpawnInProcess {
      * 跳过推送（对齐 TeamCreateTool teamStatusPublisher 模式）。
      */
     @Autowired(required = false) private TeamStatusPublisher teamStatusPublisher;
+    /**
+     * [T1-A2] 会话 mapper · 供 teammate 的「最小父 TUC」挂 Leader <b>会话列活读桥</b>
+     * （{@link SessionPermissionOverlay#leaderAppStateReader}）。
+     *
+     * <p>可选注入：未注入（单测直构 / 早期启动）⇒ 读桥恒空快照 + 本类 <b>WARN</b> 留痕
+     * （⛔ 不静默 —— 静默的后果正是「批准了却还弹」这个用户可见缺陷）。
+     */
+    @Autowired(required = false) private SessionMapper sessionMapper;
 
     /**
      * 测试/接线用构造器：注入 TaskFrameworkService（BackgroundTask 状态层）。
@@ -127,6 +144,11 @@ public class SpawnInProcess {
     /** 测试/接线用 setter（messageService · 完成通知链 outboundSink 落库）. */
     public void setMessageService(com.nexusai.domain.session.MessageService messageService) {
         this.messageService = messageService;
+    }
+
+    /** 测试/接线用 setter（sessionMapper · Leader 会话列活读桥）. */
+    public void setSessionMapper(SessionMapper sessionMapper) {
+        this.sessionMapper = sessionMapper;
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -222,17 +244,75 @@ public class SpawnInProcess {
         String agentId = formatAgentId(config.name(), config.teamName());
         String taskId = generateTaskId();
         log.info("[spawnInProcessTeammate] Spawning {} (taskId: {})", agentId, taskId);
+
+        // parentSessionId = Leader's session（CC :125 getSessionId）
+        // ── [fail-loud · 2026-09-22 用户裁定] 取不到 Leader 真实会话键 ⇒ 直接抛，⛔ 不回落 ──
+        // WHY（改前缺陷 · 已读码复核）: 改前本行是
+        //   `parentSessionId = context.parentSessionId() != null ? ... : TaskService.getTaskListId(null, null)`。
+        //   TaskService.getTaskListId 的最终回退是**进程级共享 UUID**（PROCESS_SESSION_ID，TaskService:335，
+        //   永不返回 null/blank），中间还可能命中 nexusai.team.name（**team 名**）/ nexusai.taskListId
+        //   （任务列表键）—— 于是「真 Leader 会话取不到」（config.json 无 leadSessionId / 读取失败 /
+        //   SubagentTool 侧 ctx.sessionId() 为 null）被静默替换成一个**看起来像会话的伪造键**喂下去：
+        //   TeammateIdentity.parentSessionId / loop.setTaskListId / teammate 执行 TUC 的 sessionId
+        //   全挂在该幻影键上 ⇒ CwdResolution / SessionStorage 按「未知会话」在**链路深处**抛
+        //   （报错点离根因很远、无「Leader 会话缺失」上下文），权限/transcript/file-history 亦锚到
+        //   不存在的会话。用户裁定：「取不到就报错」「⛔ 不许回落到进程 UUID / team 名 / 任何看起来像
+        //   会话的伪造值」。
+        // 位置：**在 try 之前**抛出（⛔ 不能被本方法末尾的 catch (Exception) 吞成
+        //   InProcessSpawnOutput(false,...)）—— 调用方须真实看到异常：
+        //   Agent 工具路径 = SubagentTool.spawnTeammate（异常穿出 tool.execute → StreamingToolExecutor
+        //   catch(Throwable) 转 ToolResult.error 给模型）；REST 路径 = TeamController.spawnMember
+        //   （catch → ConflictException → 409，沿用该端点既有「spawn 失败 = 409」契约）。
+        // 边界：只拦 teammate 这一条链；「确无会话」的合法降级路径（入站 MCP / 无会话 plan provider /
+        //   workflow worker / standalone fork 子代理）仍走 SessionKeys.NO_SESSION + CwdResolution 命名出口。
+        String parentSessionId = requireLeaderSessionId(context, config);
+
         try {
             // 独立 AbortController（不受 leader 中断，CC :122）
             AbortControllerFactory.AbortControllerRef abortController = AbortControllerFactory.create();
 
-            // parentSessionId = Leader's session（CC :125 getSessionId）
-            // [S1-T11] 兜底分支显式化（原无参 TaskService.getTaskListId() 已删除）。本分支的前提是
-            //   「SpawnContext 未携带 leader session」⇒ 此刻**尚无**任何会话/身份来源可取（identity
-            //   正是下面才由 config+parentSessionId 构造出来，二者互为输入）⇒ 两来源显式传 null，
-            //   语义与旧无参重载逐字一致（走 1-5 级 sysprop，最终回退进程级共享 UUID 并留 WARN）。
-            String parentSessionId = context != null && context.parentSessionId() != null
-                ? context.parentSessionId() : TaskService.getTaskListId(null, null);
+            // ── [T1 · 消除 no-session] Leader 归属（sessionId + cwd）物化为「最小父 TUC」 ──
+            // WHY（改前断链）: 本条链上 Leader 归属**本来就算出来了**，但只喂给「元数据 / 任务键」——
+            //   parentSessionId 只进 TeammateIdentity（:240）与 loop.setTaskListId（:285，语义是任务列表
+            //   桶键、不是 TUC.sessionId），leaderCwd 只作 appendTeamMember 的第 8 实参（算完即丢）。
+            //   而 AutonomousAgentLoop.runOneTurn 调 teammate 入口时不带父 TUC ⇒
+            //   SubagentExecutor.effectiveParentTuc == null ⇒ createSubagentContext.create(null, ...) 走
+            //   hasParent=false 的 standalone 分支 ⇒ sessionId 置 SessionKeys.NO_SESSION 哨兵 ⇒
+            //   transcript 目录 / effectiveCwd / 权限会话规则 / file-history / hook 桶**全部挂在幻影会话键**上
+            //   （teammate 读写用户项目文件判「在工作目录之外」、授权落不到任何真实会话）。
+            // 改法（对齐 CC/CCB 形态）: CCB inProcessRunner.ts:892-902 / :1197-1200 的 teammate **直接复用
+            //   Leader 的 toolUseContext**（CC 一进程=一会话，sessionId/cwd 天生继承）；本仓一 JVM 多会话，
+            //   该「继承」必须显式落在 TUC 快照上（同 SubagentExecutor.java:2297-2302 注释自述的取舍）
+            //   ⇒ 这里把已算好的 (LeaderSessionId, LeaderCwd) 装成一个**最小父 TUC**，仅承载归属。
+            // ⛔ 不伪造 identity: agentId 传 null（本 TUC 不是某个 agent 的身份；子代理 agentId 由
+            //   create() 的 overrides 覆盖，父 agentId 不被 ToolUseContext.with() 读取）。
+            // ⛔ 不用 ThreadLocal / 全局单例（会话态一律显式传参）：载体 = AutonomousAgentLoop 的实例字段，
+            //   而该 loop 恒由本方法 `new`（1 loop = 1 teammate，生产无 Spring 注入点）。
+            // ⛔ 不硬删 NO_SESSION 哨兵: 它仍服务入站 MCP / 无会话 plan provider / workflow worker 等
+            //   合法降级路径（grep SessionKeys.NO_SESSION 多处消费）——本改动只让 **teammate 这条路**
+            //   不再走到它。
+            // [fail-loud] 走到这里 parentSessionId 必为**真实会话键**（requireLeaderSessionId 已把关）
+            //   ⇒ leaderParentTuc 无条件构造（原「无会话 → null → 下游 NO_SESSION 降级」分支已删：
+            //   那条降级正是本任务要消除的幻影会话键来源）。
+            String leaderCwd = resolveSpawnCwd(config, parentSessionId);
+            // effectiveCwd 显式钉为上面已算好的 leaderCwd（⛔ 不在下游另起一套路径算法；
+            //   ToolUseContext 规范构造器的兜底 CwdResolution.getCwd(sessionId) 与 resolveSpawnCwd
+            //   是同一个函数，此处显式传入还额外覆盖「config.cwd() 显式指定 cwd」的场景）。
+            // ── [T1-A2 · 2026-09-22] 再挂 Leader 会话列活读桥（getAppState）──
+            // WHY: 会话列（sessions.session_permission_rules）的**唯一生产读点**挂在
+            //   LlmAgentLoop.doRun（:3443-3457 → appStateRef），teammate 不走那条链 ⇒ 改前它的父 TUC
+            //   getAppState 是紧凑构造器兜底的恒等函数（ToolUseContext.java:469-470）⇒
+            //   AgentLoopContext.mergeAppStatePermissionRules（:1604-1607）恒早退 ⇒
+            //   「用户弹窗批准 → 下一轮同一工具调用仍弹」（= 用户最初的抱怨形态）。
+            //   修法 = 给父 TUC 挂上与主会话**同语义**的读桥（读桥本体 =
+            //   SessionPermissionOverlay.leaderAppStateReader，与 doRun 读同一份列解码）。
+            //   ⛔ 必须活读（批准发生在 spawn 之后是常态），⛔ 不新增第二套状态机制。
+            if (sessionMapper == null) {
+                log.warn("[spawnInProcessTeammate] sessionMapper 未注入 ⇒ teammate 的父 TUC 无 Leader 会话列"
+                    + "读桥：本轮起 SESSION 档授权（本会话允许编辑/允许读某目录）对 teammate **不可见**"
+                    + "（批准后仍会再弹）—— agent={} leaderSession={}", agentId, parentSessionId);
+            }
+            ToolUseContext leaderParentTuc = buildLeaderParentTuc(parentSessionId, leaderCwd);
 
             // identity（纯数据载体）
             TeammateIdentity identity = new TeammateIdentity(
@@ -283,6 +363,18 @@ public class SpawnInProcess {
             loop.setTeamName(config.teamName());
             loop.setTaskId(taskId);
             loop.setTaskListId(parentSessionId);
+            // [T1 · 消除 no-session] 把 Leader 归属交给运行循环 → runOneTurn 作为父 TUC 透传
+            //   teammate 命名入口 executeTeammateTurn ⇒ createSubagentContext.create 走 hasParent
+            //   分支继承 sessionId / effectiveCwd（详见本方法内 leaderParentTuc 构造处注释）。
+            loop.setLeaderParentTuc(leaderParentTuc);
+            // 数据流日志（CLAUDE.md 编码后必须添加数据流日志 · 中文）：一眼可见 teammate 的会话归属
+            if (log.isInfoEnabled()) {
+                log.info("[spawnInProcessTeammate] Leader 归属已注入 teammate 执行上下文（数据流）: "
+                    + "agent={} leaderSession={} leaderCwd={}（teammate 执行 TUC 将继承 sessionId/effectiveCwd；"
+                    + "[fail-loud] leaderSession 恒为真实会话键 —— 取不到时本方法已在入口抛 "
+                    + "MissingLeaderSessionException，此处不存在 null/伪造值）",
+                    agentId, parentSessionId, leaderCwd);
+            }
             loop.setAbortController(abortController);
             loop.setModel(config.model());
             loop.setTaskState(taskState);
@@ -335,7 +427,9 @@ public class SpawnInProcess {
                     boolean appended = teamHelpers.appendTeamMember(config.teamName(),
                         new TeamHelpers.TeamMemberRef(agentId, config.name(), config.agentType(),
                             config.model(), config.prompt(), config.color(), config.planModeRequired(),
-                            "in-process", resolveSpawnCwd(config, parentSessionId), "in-process"));
+                            // [T1] 复用方法开头已算好的 leaderCwd（原为内联 resolveSpawnCwd 调用 =
+                            //   算完即丢，正是本任务定位的 Leader cwd 丢弃点）。
+                            "in-process", leaderCwd, "in-process"));
                     if (appended) {
                         log.info("[spawnInProcessTeammate] 已写 config.json members: agentId={} team={}",
                             agentId, config.teamName());
@@ -377,6 +471,69 @@ public class SpawnInProcess {
     }
 
     /**
+     * <b>取 Leader 真实会话键 · 取不到即 fail-loud</b>（2026-09-22 用户裁定：teammate 这条路上
+     * 取不到会话就报错，⛔ 不回落到任何「看起来像会话」的伪造值）。
+     *
+     * <p><b>四条拒绝判据（顺序即优先级；任一命中即抛 {@link MissingLeaderSessionException}）</b>：
+     * <ol>
+     *   <li><b>null/空白</b> —— 改前由 {@code TaskService.getTaskListId(null, null)} 顶替（最终回退
+     *       进程级共享 UUID）。触发源：team config.json 无 {@code leadSessionId} / 反查失败 /
+     *       SubagentTool 侧 {@code ctx.sessionId()} 为 null。</li>
+     *   <li><b>{@link SessionKeys#NO_SESSION} 哨兵</b> —— 「确无会话」哨兵是**合法降级路径**的标记，
+     *       不是会话键；把它当 Leader 会话喂下去 = 幻影会话桶（同一类伪造，只是形态显式）。</li>
+     *   <li><b>{@code TaskService} 的进程级兜底 UUID</b> —— 即改前回落的那个值本身。它可能已经被
+     *       <b>上游落盘</b>（如旧版 TeamCreateTool 在无会话时把 cleanupKey 当 leadSessionId 写进
+     *       config.json）⇒ 仅在入口判 null 拦不住，必须按值识别（{@link TaskService#isFallbackProcessSessionId}）。</li>
+     *   <li><b>等于本 team 的 team 名</b> —— {@code TaskService.getTaskListId} 优先级 3 会返回
+     *       {@code nexusai.team.name}（**team 名**），改前同样可能被当成 sessionId 喂下去。</li>
+     * </ol>
+     *
+     * <p>⛔ 本方法<b>不</b>校验「该会话在 DB 里真实存在」：那属 SessionStorage/CwdResolution 的
+     * 职责（会按「未知会话」fail-loud 抛），且部分合法链路（合成会话/测试夹具）本就不落 DB。
+     * 本条只保证「喂给 teammate 的不是伪造值」。
+     *
+     * @param context 调用方传入的 spawn 上下文（Leader 会话的来源）
+     * @param config  spawn 配置（仅用于把 team 名纳入判据 + 错误信息上下文）
+     * @return 真实会话键（非 null/非空白、非哨兵、非进程兜底 UUID、非 team 名）
+     * @throws MissingLeaderSessionException 取不到真实会话键（含环节/期望/实际/如何修 四要素）
+     */
+    private static String requireLeaderSessionId(SpawnContext context, InProcessSpawnConfig config) {
+        String candidate = context != null ? context.parentSessionId() : null;
+        String link = "SpawnInProcess.spawnInProcessTeammate（teammate 启动的 Leader 会话解析）";
+        String expected = "一个真实 Lead 会话键（显式载体：ToolUseContext.sessionId() / "
+            + "team config.json leadSessionId）";
+        String fix = "由调用方显式传入真实会话键：Agent 工具路径 = ToolUseContext.sessionId()"
+            + "（须非空，⛔ 不得经 TaskService.getTaskListId 兜底）；REST 路径 = 建 team 时"
+            + "TeamCreateTool 落盘的 config.json leadSessionId（由会话内 ctx.sessionId() 写入）。";
+
+        if (candidate == null || candidate.isBlank()) {
+            throw new MissingLeaderSessionException(link, expected,
+                "null/空白（SpawnContext=" + context + "，teamName=" + config.teamName()
+                    + "）—— 改前此处会回落 TaskService.getTaskListId(null, null) 的进程级共享 UUID",
+                fix);
+        }
+        if (SessionKeys.isNoSession(candidate)) {
+            throw new MissingLeaderSessionException(link, expected,
+                "SessionKeys.NO_SESSION 哨兵（\"no-session\"）—— 哨兵是「确无会话」标记，不是会话键",
+                fix);
+        }
+        if (TaskService.isFallbackProcessSessionId(candidate)) {
+            throw new MissingLeaderSessionException(link, expected,
+                "TaskService 进程级兜底 UUID " + candidate + "（= 改前本路径的回落值；"
+                    + "多会话 JVM 下为全进程共享，可能已被上游落盘进 config.json）",
+                fix);
+        }
+        if (config.teamName() != null && !config.teamName().isBlank()
+                && config.teamName().equals(candidate)) {
+            throw new MissingLeaderSessionException(link, expected,
+                "team 名 \"" + candidate + "\"（TaskService.getTaskListId 优先级 3 的 nexusai.team.name "
+                    + "返回值，不是会话键）",
+                fix);
+        }
+        return candidate;
+    }
+
+    /**
      * 解析 teammate cwd · 对齐 CC spawnMultiAgent.ts:337 {@code workingDir = cwd || getCwd()}。
      *
      * <p>config.cwd() 非 null 优先（spawn 输入显式指定）；缺省取会话 cwd（对齐
@@ -395,5 +552,87 @@ public class SpawnInProcess {
         }
         String cwd = com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [T1] teammate 的「最小父 TUC」构造（sessionId + effectiveCwd + 会话列读桥）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 构造 teammate 的 Leader 归属父 TUC（<b>生产唯一入口</b>）= 本实例的 {@code sessionMapper}
+     * 经 {@link SessionPermissionOverlay#leaderAppStateReader} 变成会话列活读桥 → 交给
+     * {@link #buildLeaderParentTuc(String, String, Function)} 装 TUC + 钉 effectiveCwd。
+     *
+     * <p>把「读桥构造」收进本方法（而不是散在 {@code spawnInProcessTeammate} 里）的理由：
+     * 单测可用 {@code setSessionMapper} 注入假 mapper 后<b>逐字调用生产同一条链</b>
+     * （无需启动 spawn 线程 / LLM）⇒ 若有人把读桥摘掉/换成恒等（= 用户抱怨的缺陷形态），
+     * 用例立刻变红（已实测），而不是靠「读代码觉得对」。
+     *
+     * @param leaderSessionId Leader 会话键（真实键，由 {@link #requireLeaderSessionId} 把关）
+     * @param leaderCwd       Leader 工作目录（已解析）
+     */
+    ToolUseContext buildLeaderParentTuc(String leaderSessionId, String leaderCwd) {
+        return buildLeaderParentTuc(leaderSessionId, leaderCwd,
+            SessionPermissionOverlay.leaderAppStateReader(
+                sessionMapper, leaderSessionId, PermissionMode.DEFAULT));
+    }
+
+    /**
+     * 构造 teammate 的 Leader 归属父 TUC = {@link #minimalLeaderParentTuc} + 显式钉 effectiveCwd。
+     *
+     * <p>抽取为 package-private static 的理由（本仓既有惯例，见 {@code SubagentExecutor.withEffectiveCwd}）：
+     * 单测可<b>与生产逐字同源</b>地构造该 TUC（无需启动 spawn 线程 / LLM），从而确定性断言
+     * 「会话列规则能被 teammate 的 per-turn permCtx 读到」；若日后有人把 getAppState 读桥摘掉
+     * （或把 withEffectiveCwd 改回置 null），用例立刻变红。
+     *
+     * @param leaderSessionId      Leader 会话键（真实键，由 {@link #requireLeaderSessionId} 把关）
+     * @param leaderCwd            Leader 工作目录（已解析）
+     * @param leaderAppStateReader Leader 会话列活读桥（{@code getAppState}）
+     */
+    static ToolUseContext buildLeaderParentTuc(String leaderSessionId, String leaderCwd,
+            Function<Map<String, Object>, Map<String, Object>> leaderAppStateReader) {
+        // [T1-A1 承重] withEffectiveCwd 必须**保留** source.getAppState()（本批已改），
+        //   否则这里挂好的读桥会在派生时被置 null ⇒ 恒等函数 ⇒ 合并恒早退。
+        return SubagentExecutor.withEffectiveCwd(
+            minimalLeaderParentTuc(leaderSessionId, leaderAppStateReader),
+            Paths.get(leaderCwd));
+    }
+
+    /**
+     * 「最小父 TUC」：仅承载 <b>Leader 归属</b>（sessionId + getAppState 读桥），
+     * ⛔ 不承载 agent 身份 / 工具面（那些由 {@code createSubagentContext.create} 的 overrides 决定）。
+     *
+     * <p>为什么用 20 参便利工厂（{@code ToolUseContext.of(..., getAppState, ...)}，即
+     * 「R32-b15 Stage 3.2 C2 4 桥接字段」重载）：父 TUC 需要一个**非恒等**的 {@code getAppState}
+     * ——这是会话级授权（SESSION 档）进入 teammate per-turn permCtx 的唯一通道
+     * （{@code AgentLoopContext.mergeAppStatePermissionRules} :1604）；该重载正是为此保留的
+     * C2 桥接工厂（其余 43 个字段由紧凑构造器兜底）。
+     *
+     * <p>⛔ agentId 传 null：本 TUC 不是某个 agent 的身份（子代理 agentId 由 create() 的 overrides
+     * 覆盖；父 agentId 不被 {@code ToolUseContext.with()} 读取）。
+     */
+    private static ToolUseContext minimalLeaderParentTuc(String leaderSessionId,
+            Function<Map<String, Object>, Map<String, Object>> leaderAppStateReader) {
+        return ToolUseContext.of(
+            null,                          // agentId（本 TUC 只承载归属，不是身份）
+            leaderSessionId,               // sessionId = Leader 会话
+            PermissionMode.DEFAULT,        // mode（TUC.mode 非权限档；权限档走 permCtx）
+            List.of(),                     // availableTools（不进工具执行面）
+            "",                            // taskListId
+            AbortController.NOOP,          // abortController（执行用 abort 由 teammate loop 持有）
+            List.of(),                     // messages
+            null,                          // permissionContext
+            PermissionMode.DEFAULT,        // permissionMode
+            Map.of(),                      // mcpClients
+            false,                         // isNonInteractiveSession
+            "",                            // renderedSystemPrompt
+            null,                          // effectiveCwd（由 withEffectiveCwd 显式钉为 leaderCwd）
+            null,                          // inProgressToolUseIDs
+            null,                          // toolDecisions
+            null,                          // onCompactProgress
+            leaderAppStateReader,          // ★ getAppState = Leader 会话列活读桥
+            null,                          // setAppState（写通道本批不改，见 SubagentExecutor.withEffectiveCwd 注释）
+            null,                          // setStreamMode
+            null);                         // setSDKStatus
     }
 }

@@ -79,7 +79,8 @@ class ReactiveFailureTranslationCcTest {
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, abort,
             null, new MicroCompactor(), reactive, () -> cc, () -> { }, () -> { },
             tuc, sysCtx, () -> { throw new IllegalStateException("custom 短路: defaultAssemble 不应被调用"); },
-            "CUSTOM-PROMPT", null, false, () -> false, null);  // [批 5a-2] warningPushContext
+            "CUSTOM-PROMPT", null, false, () -> false, null,  // [批 5a-2] warningPushContext
+            null);  // [compact-signal-fix] progressSink（本用例不断言进度事件 → no-op）
     }
 
     private static CompactConversationContext baseCc(List<CompactProgressEvent> events) {

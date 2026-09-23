@@ -59,20 +59,31 @@ class AutonomousAgentLoopWorkAbortTest {
         volatile boolean workAbortObserved;
         /** Fix A: 捕获 runOneTurn 透传的 subagentType（teammate 必须 null，不得为 agentName）。 */
         volatile String capturedSubagentType;
+        /** [T1] 捕获 runOneTurn 透传的 Leader 归属父 TUC（本类未设置 ⇒ 恒 null；仅锁「如实透传」）。 */
+        volatile com.nexusai.application.agent.tool.ToolUseContext capturedLeaderParentTuc;
 
         RecordingExecutor(AbortControllerFactory.AbortControllerRef workAbortRef) {
             super(null, null, null, null, null, "fallback-model", "fallback-prompt");
             this.workAbortRef = workAbortRef;
         }
 
+        // [T1 修复·既有红] 本替身原覆写 6 参 executeStreaming(abortControllerOverride) —— 但
+        //   runOneTurn 自 S1-T2b（2551940a）起走的是 **teammate 命名入口**
+        //   （executeTeammateTurn / 原 7 参重载），那个 6 参覆写**从未被调用** ⇒ 本类三条用例
+        //   恒红（实测：真 SubagentExecutor 流程跑起来 → `subagentToolRegistry is null` NPE）。
+        //   T1 把 teammate 入口改为命名方法 executeTeammateTurn（避免 8 参重载与
+        //   workflow 8 参重载歧义）后，本替身同步覆写该命名入口 ⇒ 用例恢复鉴别力。
         @Override
-        public SubagentExecutor.SubagentResult executeStreaming(String prompt, String subagentType,
-                                                                String modelOverride,
-                                                                SubagentExecutor.ForkPathParams forkParams,
-                                                                Consumer<SubagentMessage> messageSink,
-                                                                com.nexusai.application.agent.tool.AbortController abortControllerOverride) {
+        public SubagentExecutor.SubagentResult executeTeammateTurn(
+                String prompt, String subagentType, String modelOverride,
+                SubagentExecutor.ForkPathParams forkParams,
+                Consumer<SubagentMessage> messageSink,
+                com.nexusai.application.agent.tool.AbortController abortControllerOverride,
+                com.nexusai.application.agent.tool.ToolUseContext parentTucOverride,
+                com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride) {
             this.capturedSubagentType = subagentType;
             this.capturedAbort = abortControllerOverride;
+            this.capturedLeaderParentTuc = parentTucOverride;
             if (workAbortRef != null) {
                 workAbortRef.abort(); // 模拟 Escape：中止本轮 work 控制器（经桥转发到透传的 abort）
             }
@@ -113,6 +124,8 @@ class AutonomousAgentLoopWorkAbortTest {
         boolean workWasAborted = loop.runOneTurn("do research", workAbort);
 
         assertThat(executor.capturedAbort).as("work abort 必须透传到 executeStreaming（非 null）").isNotNull();
+        assertThat(executor.capturedLeaderParentTuc)
+            .as("[T1] 未设置 Leader 归属时 runOneTurn 必须如实透传 null（不得凭空造父 TUC）").isNull();
         assertThat(executor.workAbortObserved).as("透传的 abort 必须响应 workAbort.abort()").isTrue();
         assertThat(workWasAborted).as("work abort 后本轮必须返回 workWasAborted=true（CC :1213-1219）").isTrue();
         assertThat(loop.isAborted()).as("work abort 不得触发生命周期 abort（只停本轮不杀队友）").isFalse();

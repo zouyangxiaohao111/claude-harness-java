@@ -50,6 +50,7 @@ import com.nexusai.application.agent.tool.Notification;
 import com.nexusai.application.agent.tool.impl.PdfSupport;
 import com.nexusai.application.agent.tool.impl.TodoWriteTool;
 import com.nexusai.application.agent.tool.StreamingToolExecutor;
+import com.nexusai.application.agent.tool.SessionReadFileStateRegistry;
 import com.nexusai.application.agent.tool.McpClientRuntime;
 import com.nexusai.application.agent.tool.McpServerInfo;
 import com.nexusai.application.agent.tool.Tool;
@@ -3415,7 +3416,10 @@ public class LlmAgentLoop implements AgentLoop {
         //   ⛔ 不得在此读 ThreadLocal。
         ToolUseContext baseTuc = buildBaseToolUseContext(
             state, initialModeInput, initialModeConfig, runExplicitCwd, null,
-            params.agentContext());
+            params.agentContext(),
+            // [批 rfs-replay-3b] 跨进程 readFileState 恢复的原料 = 本方法 :2662-2671 已读到的
+            //   那一次 DB 原始转录（⛔ 不再新增第二次 DB I/O；null/空 ⇒ replay 软降级跳过）。
+            resumeRawTranscript);
         // ── [批 A2b] 会话 SESSION 档授权回读注入 · 对齐 CC appState.toolPermissionContext（会话内存态）──
         //   背景：CC 的 appState.toolPermissionContext 活在长驻进程里（文件类弹窗「Yes, during this
         //   session」destination='session'，permissionOptions.tsx:49-52 / usePermissionHandler.ts:123），
@@ -3978,10 +3982,9 @@ public class LlmAgentLoop implements AgentLoop {
      * 实例 dedup 字段已随 C-8 双实现漂移删除（D-5），dedup 状态收敛为 LoopSessionState 内 fresh
      * 初始化（每 agent 独立、不跨 session 共享 · 对齐 CC 每进程 sentSkillNames 空 Map 起点）。
      */
-    // [dtd-cfg] 原 deferredToolsDeltaGate(ctx)（DB via ctx.sessionState resolver → 回落 env）已删除：
-    //   统一判定收敛为 PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()（静态槽位 =
-    //   ToolRegistrationConfig 接线的主 bean，与 ctx.sessionState() 的 resolver 同一实例；压缩内圈
-    //   静态无 ctx 也能读同一判定）。调用点见下方 delta 分支 + ToolsAssembly.prependAvailableDeferredTools。
+    // [dtd-cfg→2.1.278] 原 deferredToolsDeltaGate(ctx)（DB via ctx.sessionState resolver → 回落 env）
+    //   与后续统一判定 staticDeferredToolsDeltaEnabled() 均已删除 —— 对齐 2.1.278（delta 专用门在
+    //   发行产物双产物 0 命中 ⇒ delta 恒启用）。调用点见下方 delta 分支（门控只剩 useToolSearch）。
 
     private AgentLoopContext.LoopSessionState buildSessionStateFromInstance() {
         AgentLoopContext.LoopSessionState session = new AgentLoopContext.LoopSessionState();
@@ -4669,14 +4672,22 @@ public class LlmAgentLoop implements AgentLoop {
      * <p><b>不阻断组装</b>：任何异常只记 WARN（CC 该路径无 try；本仓必须保证材料收集不因
      * 一个附件登记失败而整体失败）。
      *
-     * <p><b>⭐ 跨 run 语义（本批修正点，勿退回）</b>：本方法<b>每 run</b> 被调用，而
-     * readFileState 在本仓是 <b>run 级</b>缓存 ⇒ 登记时间戳若每次都取「当下」，用户在两条消息
-     * 之间改 CLAUDE.md 的 mtime 会被下一次登记吸收、<b>永不投递</b>。故登记走会话级
+     * <p><b>⭐ 跨 run 语义（勿退回）</b>：本方法<b>每 run</b> 被调用 ⇒ 登记时间戳若每次都取「当下」，
+     * 用户在两条消息之间改 CLAUDE.md 的 mtime 会被下一次登记吸收、<b>永不投递</b>。故登记走会话级
      * 「首次登记」固化表（{@code SessionChangedFilesBaselineRegistry}，按 sessionId 分区）：
      * 首次落基线，此后每次 run 复用同一时间戳 + 内容基线 ⇒ 判据 {@code mtime > 记录时间戳}
      * 在「run 与 run 之间改盘」这一真实场景下成立。同一变更的「只投一次」由检测后的
      * {@code SessionChangedFilesBaselineRegistry.syncFromRunCache} 固化（见 maybeEmitChangedFiles）。
      * 会话标识缺失 ⇒ 无跨 run 身份可用 ⇒ 退回改造前形态（诚实降级，日志可见）。
+     *
+     * <p><b>⛔ 注释更正（批 edit-gate-session-scope · E）</b>：本段曾写「readFileState 在本仓是
+     * <b>run 级</b>缓存」。<b>该断言已不成立</b>：readFileState 现已<b>会话级</b>
+     * （{@code LlmAgentLoop.buildBaseToolUseContext} 取
+     * {@code SessionReadFileStateRegistry.forSession(sessionId)}）。本节这条会话基线固化
+     * （{@code SessionChangedFilesBaselineRegistry}）<b>仍然保留且必要</b>：它承载的是
+     * 「<b>首次登记的字节基线</b>」这一变更检测基准，与「缓存条目活多久」是两件事
+     * —— 会话级 readFileState 只让条目跨 run 存活，时间戳仍会被本方法每 run 覆盖，
+     * 故没有本表仍会退化成「只有同一 run 内改盘才投递」。
      *
      * @param ctx    循环上下文（{@code claudemdEngine} / {@code sessionState} 来源）
      * @param params 入参（{@code toolUseContext().readFileState()} 为登记目标）
@@ -4700,11 +4711,16 @@ public class LlmAgentLoop implements AgentLoop {
                 : com.nexusai.application.agent.agent.CwdResolution.getProjectRoot(state.sessionId());
             java.util.List<com.nexusai.application.agent.context.MemoryFileInfo> files =
                 ctx.claudemdEngine().getMemoryFiles(false, state.sessionId(), sessionProjectRoot);
-            // [步骤 7 修正] 会话级「首次登记」固化表：readFileState 在本仓是 run 级缓存
-            //   （LlmAgentLoop 为 prototype、每 send 新实例 ⇒ buildBaseToolUseContext 每次新建），
-            //   而本方法每 run 都会走一次 ⇒ 若每次都以「当下」当登记时间戳，用户两条消息之间
-            //   改 CLAUDE.md 的 mtime 会被下一次登记吸收、永不投递
+            // [步骤 7 修正] 会话级「首次登记」固化表：本方法每 run 都会走一次 ⇒ 若每次都以「当下」
+            //   当登记时间戳，用户两条消息之间改 CLAUDE.md 的 mtime 会被下一次登记吸收、永不投递
             //   （独立验证 #1 判 REFUTED；判据 mtime > 记录时间戳 保持不变）。
+            //   ⛔ 注释更正（批 edit-gate-session-scope · E）：原写「readFileState 在本仓是 run 级缓存
+            //   （LlmAgentLoop 为 prototype、每 send 新实例 ⇒ buildBaseToolUseContext 每次新建）」
+            //   —— 前一半（prototype / 每 send 新实例）仍为真，后一半（readFileState 每次新建）
+            //   <b>已不成立</b>：buildBaseToolUseContext 现取
+            //   SessionReadFileStateRegistry.forSession(sessionId) ⇒ readFileState 已是<b>会话级</b>。
+            //   本表（SessionChangedFilesBaselineRegistry）依然必要：它固化的是「首次登记的字节基线」，
+            //   与「缓存条目活多久」是两件事（见方法 javadoc）。
             //   会话基线为 null（无会话标识）⇒ 三参重载退回改造前形态（诚实降级）。
             com.nexusai.application.agent.tool.FileStateCache sessionBaseline =
                 com.nexusai.application.agent.attachment.SessionChangedFilesBaselineRegistry
@@ -6288,8 +6304,8 @@ public class LlmAgentLoop implements AgentLoop {
                     // → 把 per-turn TUC 写入压缩上下文，使 AutoCompactor 附件填充 +
                     // restore() 尾部 3×delta 重宣布（compact.ts:545-585）读取真实数据源。
                     // [IMP2-03 返工 r2 更正] 原注释「deferred-tools header prepend :3334-3336
-                    // 已存在」失实：Java 无 <available-deferred-tools> prepend 通道（0 命中），
-                    // 差异登记 progress §7-1 返工 r2；agent list/mcp instructions 默认通道存在。
+                    // 已存在」失实；该 prepend 通道已按 2.1.278 整段删除（现状：无
+                    // <available-deferred-tools> prepend 通道）；agent list/mcp instructions 默认通道存在。
                     ccCtx.setToolUseContext(params.toolUseContext());
                     // [S3-B2] 第二参透传 snipTokensFreed（CC query.ts:466 autocompact 第 6 参；
                     // autoCompact.ts:225 tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed）
@@ -6934,10 +6950,11 @@ public class LlmAgentLoop implements AgentLoop {
             //   ModelCaller → AnthropicSdkProvider buildMessageParams（resolveSkillModelOverride 决策 ④
             //   的 effort 侧落点；model 侧消费点 = getModelForCall:1388 已就绪）。
             String effortValueForCall = state.effortValue();
-            // [H4] defer_loading 管线（CC claude.ts:1120-1243 + 1330-1332）· 先装配工具 schema
-            //   （definitive 门控 + filteredTools + willDefer→defer_loading 发射），再按 delta 门控
-            //   prepend <available-deferred-tools> meta user 消息到 messagesForLlm 队首。
-            //   顺序对齐 CC：discovered 扫描在 prepend 前（prepend 为纯文本 meta，无 tool_reference 污染）。
+            // [H4] defer_loading 管线（CC claude.ts:1120-1243）· 装配工具 schema
+            //   （definitive 门控 + filteredTools + willDefer→defer_loading 发射）。
+            //   ⛔ 原 claude.ts:1330-1332 的 <available-deferred-tools> 队首 prepend 通道已按
+            //   2.1.278 删除（2.1.278 发行产物双产物 0 命中）；deferred 工具改由下方
+            //   deferred_tools_delta 持久化附件宣布。
             // [vision-defer-model] 本方法 static（无实例 mapper）→ 经 ctx.tokenBudgetBeans() 取 mapper
             //   （同 5243-5246 现成模式：AgentLoopContext.TokenBudgetBeans.modelMapper/providerMapper）。
             com.nexusai.application.agent.loop.AgentLoopContext.TokenBudgetBeans toolsBudgetBeans = ctx.tokenBudgetBeans();
@@ -6954,13 +6971,11 @@ public class LlmAgentLoop implements AgentLoop {
             if (state.structuredOutputJsonSchema() != null && toolsAssembly != null && toolsAssembly.tools() != null) {
                 appendStructuredOutputToolToSchema(toolsAssembly.tools(), state.structuredOutputJsonSchema());
             }
-            messagesForLlm = toolsAssembly.prependAvailableDeferredTools(messagesForLlm);
-            // [G16① OPD-H-06 关闭] delta 启用 → deferred_tools_delta 附件（主循环 + subagent
-            //   共享 queryLoop 路径）· 对齐 CC claude.ts:1328-1330（delta 启用时 deferred 工具
-            //   经 persisted attachment 宣布，替代 ephemeral <available-deferred-tools> prepend，
-            //   避免 prompt cache 随工具池变化 bust）+ attachments.ts:836-848 getAttachments →
-            //   getDeferredToolsDeltaAttachment + messages.ts:4178-4195 渲染。prependAvailableDeferredTools
-            //   已在 delta 禁用分支返回文本 meta（:8308 早退），本分支互补 delta 启用场景。
+            // [G16① OPD-H-06] deferred_tools_delta 附件（主循环 + subagent 共享 queryLoop 路径）·
+            //   对齐 CC claude.ts:1328-1330（deferred 工具经 persisted attachment 宣布）+
+            //   attachments.ts:836-848 getAttachments → getDeferredToolsDeltaAttachment +
+            //   messages.ts:4178-4195 渲染。原 ephemeral <available-deferred-tools> prepend 通道
+            //   已按 2.1.278 删除（本分支即其唯一替代）。
             //   Java 消息模型：author='attachment' + subtype='deferred_tools_delta' + content=JSON payload
             //   （与 compact 路径 PostCompactAttachmentRestorer 同款形状，scanAnnouncedDeltaNames
             //   跨 turn 重建 announced 集依赖该 JSON）。前置到 messagesForLlm（本轮 LLM 可见）
@@ -6969,13 +6984,12 @@ public class LlmAgentLoop implements AgentLoop {
             // [prompt-align CTX-09] 双表示：state.appendMessage(dtd) 持久化 JSON（scan 源），LLM 注入
             //   dtd.withContent(renderDeferredToolsDelta(dtd.content())) 人类可读副本（对齐 CC
             //   messages.ts:4178-4195 渲染，替代 JSON payload 直塞 LLM）。
-            // [dtd-cfg] 门控 = 统一判定 staticDeferredToolsDeltaEnabled（DB
-            //   settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant 默认关）·
-            //   与 prependAvailableDeferredTools / 压缩内圈共用同一判定，消除「DB 开、env 关
-            //   → delta 附件与旧 prepend 双发」。
-            if (toolsAssembly.useToolSearch()
-                    && com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
-                        .staticDeferredToolsDeltaEnabled()) {
+            // [dtd-cfg→2.1.278] 门控 = useToolSearch（本 turn 工具搜索 definitive 门）。原 delta
+            //   专用门（统一判定 staticDeferredToolsDeltaEnabled：DB settings.deferred_tools_delta_enabled
+            //   → 回落 env USER_TYPE=ant）已删 —— 对齐 2.1.278（该门与 tengu_glacier 在发行产物
+            //   cc_bundle.js + claude.exe 双产物 0 命中 ⇒ delta 恒启用）；该 DB 列已由 V77 迁移
+            //   DROP COLUMN 清除。
+            if (toolsAssembly.useToolSearch()) {
                 ChatMessageDto dtd = PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
                         perTurnTuc.availableTools(), effectiveModel, perTurnTuc.effectiveProviderType(),
                         messagesForLlm);
@@ -10503,9 +10517,11 @@ public class LlmAgentLoop implements AgentLoop {
     private ToolUseContext buildBaseToolUseContext(AgentState state) {
         // [S1-T2] 便捷重载：无 teammate 身份承载体 → 显式 null（非 teammate 上下文）。
         // [S1-T7] 无 agent 归因上下文承载体 → 显式 null（非 agent 上下文）。
+        // [批 rfs-replay-3b] 无 DB 转录承载体 → 显式 null（跨进程 replay 整段软降级跳过）。
         return buildBaseToolUseContext(state,
             InitialPermissionModeResolver.Input.empty(),
             InitialPermissionModeResolver.Config.defaults(),
+            null,
             null,
             null,
             null);
@@ -10535,13 +10551,20 @@ public class LlmAgentLoop implements AgentLoop {
      *                         来源 = {@code doRun} 的 {@code params.agentContext()}（RunRequest 组件）
      *                         ⇒ 全程显式传参，⛔ 不再从 {@code AgentContext} 的 ambient ThreadLocal
      *                         捕获（用户铁律：会话态一律不得经 ThreadLocal/MDC 读；回放不算合规）。
+     * @param dbTranscript     [批 rfs-replay-3b] <b>跨进程 readFileState 恢复（replay）的原料</b>：
+     *                         {@code doRun} 在 :2662-2671 已经读到的 DB 原始转录
+     *                         （{@code resumeRawTranscript} = {@code messageService.listRawForTranscript}）。
+     *                         ⛔ 显式传参而非就地再查一次 DB —— 「不新增 DB I/O」是硬约束；也正因如此
+     *                         它必须由调用方给，本方法<b>不</b>持 messageService。
+     *                         null/空 = 该 run 无历史（或便捷重载）⇒ replay 整段软降级跳过。
      */
     private ToolUseContext buildBaseToolUseContext(AgentState state,
             InitialPermissionModeResolver.Input initialModeInput,
             InitialPermissionModeResolver.Config initialModeConfig,
             java.nio.file.Path runExplicitCwd,
             com.nexusai.application.agent.team.TeammateIdentity teammateIdentity,
-            com.nexusai.application.agent.subagent.AgentContext agentContext) {
+            com.nexusai.application.agent.subagent.AgentContext agentContext,
+            List<ChatMessageDto> dbTranscript) {
         if (state.sessionId() == null) {
             return null;
         }
@@ -10587,6 +10610,52 @@ public class LlmAgentLoop implements AgentLoop {
             }
         }
         List<Tool> baseTools = toolRegistry != null ? toolRegistry.all() : List.of();
+        // [批 edit-gate-session-scope · B] readFileState 的会话级取表（唯一查找点 —— 供日志与构造实参
+        //   共用同一个值，避免两处各查一次造成口径分叉）。
+        com.nexusai.application.agent.tool.FileStateCache sessionReadFileState =
+            SessionReadFileStateRegistry.forSession(state.sessionId());
+        // ── [批 rfs-replay-3b] 跨进程 readFileState 恢复（replay）· 对齐 CC 2.1.278 ──
+        //   CC：`mergeReadFileStateFrom(h,v){this.readFileState=s6r(this.readFileState,aHt(h,v,LC))}`
+        //   （定义 exe off 222009557，由 resume 路径 restoreReadFileState off 222145682 调用）。
+        //   本仓落点 = 上面 forSession 取得会话表<b>之后</b>、base TUC 构造<b>之前</b>：
+        //     · 复用 `dbTranscript`（doRun 已读到的同一次 DB 历史）⇒ ⛔ 零新增 DB I/O；
+        //     · 目标表就是上面那唯一一次 forSession 查到的会话表 ⇒ ⛔ 查找点仍只有一处；
+        //     · merge 语义 = s6r 的 newer-timestamp-wins（活表更新的条目绝不被历史压回）；
+        //     · 软降级（无 transcript / 无 sessionId / 解析失败 / Edit 现读盘失败）⇒
+        //       debug 日志 + 跳过，⛔ 绝不抛异常阻断 run（同先例 ResumeService.restoreSessionCwd）。
+        //   cwd 兜底基准：消息自身 cwd 优先（每条读消息自带 cwd），缺失时用本回合 cwd 快照
+        //   （runExplicitCwd ?? CwdResolution.getCwd(sessionId)，与下方 TUC 构造的 effectiveCwd 同源）。
+        if (sessionReadFileState != null && dbTranscript != null && !dbTranscript.isEmpty()) {
+            String replayCwdFallback = runExplicitCwd != null
+                ? runExplicitCwd.toString()
+                : com.nexusai.application.agent.agent.CwdResolution.getCwd(state.sessionId());
+            com.nexusai.application.agent.tool.ReadFileStateReplay.Stats replayStats =
+                com.nexusai.application.agent.tool.ReadFileStateReplay.merge(
+                    state.sessionId(), dbTranscript, replayCwdFallback, sessionReadFileState);
+            if (log.isDebugEnabled()) {
+                log.debug("[rfs-replay] base TUC 注入前 replay: sessionId={} 扫描 {} 条 ⇒ "
+                        + "Read {} / Write {} / Edit(打标) {}，落表 {} 条（新插 {}/覆盖 {}/保活表 {}），"
+                        + "跳过: 窗口读 {} / 无结果 {} / stub或错误 {} / Edit 读盘失败 {}",
+                    state.sessionId(), replayStats.scannedMessages(),
+                    replayStats.readEntries(), replayStats.writeEntries(), replayStats.editEntries(),
+                    replayStats.applied(), replayStats.mergedNew(), replayStats.mergedOverwrite(),
+                    replayStats.skippedOlder(), replayStats.readSkippedRanged(),
+                    replayStats.readSkippedNoResult(), replayStats.readSkippedStubOrError(),
+                    replayStats.editSkippedDiskUnreadable());
+            }
+        } else if (log.isDebugEnabled()) {
+            log.debug("[rfs-replay] replay 跳过（软降级）: sessionId={} 会话表={} DB历史条数={}",
+                state.sessionId(), sessionReadFileState != null ? "有" : "null",
+                dbTranscript == null ? "null" : String.valueOf(dbTranscript.size()));
+        }
+        // 数据流日志：作用域来源（会话级注册表命中 ⇒ 跨 run 复用；null ⇒ 构造器每次新建 = 改造前行为）。
+        if (log.isDebugEnabled()) {
+            log.debug("[edit-gate·会话级 readFileState] base TUC 注入: sessionId={} 来源={} 现有 {} 条"
+                + "（会话级 ⇒ 同会话跨 run 复用同一张表；null ⇒ 每 ctx 新建）",
+                state.sessionId(),
+                sessionReadFileState != null ? "会话注册表" : "null(构造器兜底新建)",
+                sessionReadFileState != null ? sessionReadFileState.size() : 0);
+        }
         return new ToolUseContext(
             state.agentId(), state.sessionId(), mode,
             java.util.Map.of(), baseTools, "",
@@ -10631,7 +10700,17 @@ public class LlmAgentLoop implements AgentLoop {
             null,                             // queryTracking（loop 每轮派生 stamp）
             null,                             // toolUseId
             null,                             // criticalSystemReminder_EXPERIMENTAL
-            null,                             // [L+ R1] readFileState (compact ctor 兜底新 cache)
+            // [批 edit-gate-session-scope · B] readFileState 改为<b>会话级</b>（对齐 CC 两版：
+            //   2.1.88 REPL.tsx:1955 useRef / 2.1.278 发行产物 class Moe{readFileState; this.readFileState=VE(LC)}）。
+            //   改造前传 null ⇒ ToolUseContext 紧凑构造器（ToolUseContext.java:539-541）每次 run
+            //   新建一张 FileStateCache ⇒ 同一会话两条消息互不可见对方 Read 过的文件
+            //   ⇒ 用户上一轮 Read 过、本轮直接 Edit 会被门禁拒（errorCode 6/2/9）。
+            //   现在按 sessionId 取表：同会话跨 run 恒同一实例，run 内跨 turn 仍是同一张（withers 按引用透传）。
+            //   ⛔ 无会话标识（null/空白）⇒ forSession 返回 null ⇒ 构造器兜底每 ctx 新建（改造前行为）。
+            //   ⛔ 容量本批不动，但取值以常量为准：ToolUseContext.READ_FILE_STATE_CACHE_SIZE = 5000 条
+            //   （对齐 CC 2.1.278 的 LC=5000；2026-09-22 用户裁定改 5000；原 100 系对齐 2.1.88）＋ 25MB。
+            //   ⛔ 勿据旧注释「100 条」改回 100 —— 本批只改作用域这一维。
+            sessionReadFileState,
             buildBaseMcpServerConnections())   // [Q-09-R2-1] 主链 base TUC 注入活跃池连接包装（对齐 CC runAgent.ts:653-656 parentClients 来源=主链活跃池；修复前恒空 List.of()）
             // [S1-T7] agent 归因上下文**由调用方显式传入**（形参 agentContext，来源 =
             //   RunRequest.agentContext() 组件），随 TUC 显式下传：
@@ -12670,7 +12749,7 @@ public class LlmAgentLoop implements AgentLoop {
      * @param querySource 区分 HOOK_AGENT（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
      * @param messages    消息历史（discovered-set 扫描源；null → 走旧行为）
      * @param modelName   本次调用模型名（null → 走旧行为；haiku 等不支持 tool_reference 时关闭工具搜索）
-     * @return 工具装配结果（schema + useToolSearch + deferredToolNames，供 delta prepend）
+     * @return 工具装配结果（schema + useToolSearch + deferredToolNames）
      */
     public static ToolsAssembly llmToolsArray(
             ToolUseContext tuc, QuerySource querySource,
@@ -12691,7 +12770,7 @@ public class LlmAgentLoop implements AgentLoop {
      * @param messages    消息历史（discovered-set 扫描源；null → 走旧行为）
      * @param modelName   本次调用模型名（null → 走旧行为；haiku 等不支持 tool_reference 时关闭工具搜索）
      * @param tokenClient count_tokens 客户端（null → 纯 char fallback；3 参注入 = IMP-C6 token 优先）
-     * @return 工具装配结果（schema + useToolSearch + deferredToolNames，供 delta prepend）
+     * @return 工具装配结果（schema + useToolSearch + deferredToolNames）
      */
     public static ToolsAssembly llmToolsArray(
             ToolUseContext tuc, QuerySource querySource,
@@ -12961,57 +13040,21 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * 主循环工具搜索 + defer_loading 管线装配结果（对齐 CC claude.ts:1120-1243 + 1330-1332）。
+     * 主循环工具搜索 + defer_loading 管线装配结果（对齐 CC claude.ts:1120-1243）。
+     *
+     * <p>⛔ 原 {@code prependAvailableDeferredTools} 方法与其 delta 门控已按 2.1.278 删除：该门
+     * （isDeferredToolsDeltaEnabled / tengu_glacier）与 prepend 通道文案在 2.1.278 发行产物
+     * （cc_bundle.js + claude.exe）双产物 0 命中。
      *
      * @param tools             发送给 API 的工具 schema（filteredTools 语义，claude.ts:1154-1172）
      * @param useToolSearch     本 turn 是否启用工具搜索（definitive 门控 + 短路后）
-     * @param deferredToolNames 本 turn 预计算的 deferred 工具名集合
+     * @param deferredToolNames 本 turn 预计算的 deferred 工具名集合（claude.ts:1128-1134；
+     *                          现只供 llmToolsArray 内部过滤，已无 delta prepend 消费者）
      */
     public record ToolsAssembly(
             com.fasterxml.jackson.databind.node.ArrayNode tools,
             boolean useToolSearch,
             Set<String> deferredToolNames) {
-
-        /**
-         * delta 门控 prepend · 对齐 CC claude.ts:1330-1332：{@code useToolSearch &&
-         * !isDeferredToolsDeltaEnabled()} → 消息队首插入 meta user message
-         * {@code <available-deferred-tools>\n{deferred 名排序 join}\n</available-deferred-tools>}
-         * （formatDeferredToolLine = tool.name，prompt.ts:115-117；CC 无 list 时跳过）。
-         *
-         * <p>[dtd-cfg] 门控 = <b>统一判定</b>
-         * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（DB
-         * settings.deferred_tools_delta_enabled 覆盖 → 回落 env USER_TYPE=ant 默认关）。原直读
-         * env-only {@code ToolSearchService.isDeferredToolsDeltaEnabled()} 会让「DB 开、env 关」
-         * 时本 prepend 照发全量清单（与主循环 delta 附件双发）→ 已收敛到同一判定。
-         *
-         * @param messages 组装后消息（prependUserContext 之后、ModelRequest 构建之前调用）
-         * @return 前插后的消息列表（未命中门控 → 原列表）
-         */
-        public List<ChatMessageDto> prependAvailableDeferredTools(List<ChatMessageDto> messages) {
-            if (!useToolSearch
-                    || com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
-                        .staticDeferredToolsDeltaEnabled()) {
-                return messages;
-            }
-            if (deferredToolNames == null || deferredToolNames.isEmpty()) {
-                return messages;
-            }
-            List<String> lines = deferredToolNames.stream().sorted().toList();
-            String content = "<available-deferred-tools>\n" + String.join("\n", lines)
-                    + "\n</available-deferred-tools>";
-            List<ChatMessageDto> result = new ArrayList<>(messages);
-            // isMeta user message 构造（同 AgentLoopContext.metaUserMessage :2409-2414 形状）
-            result.add(0, new ChatMessageDto(
-                    java.util.UUID.randomUUID().toString(), null, Role.user, "system",
-                    content, null, java.util.List.of(), null, null, null,
-                    "刚刚", java.time.OffsetDateTime.now(), null, null,
-                    null, java.util.List.of(), java.util.List.of(), null, true));
-            if (log.isDebugEnabled()) {
-                log.debug("llmToolsArray delta prepend: 队首插入 <available-deferred-tools> 消息（{} 个 deferred 工具，对齐 CC claude.ts:1330-1332）",
-                        lines.size());
-            }
-            return result;
-        }
     }
 
     /** [Session J 方案 A] 从本次 RunRequest.querySource 构造 SubagentTool AgentOptions. */

@@ -317,7 +317,10 @@ public class TeamController {
      * spawnInProcessTeammate → 失败 → 409；成功 → 显式 publish member_joined（对齐 addMember:286，
      * spawnInProcessTeammate 内部仅 appendTeamMember 成功时推，端点兜底）+ toDto 返回含新成员。
      * 失败契约：spawnInProcess 未接线 / team 不存在 → 404；name 缺失 → 400（ValidationException）；
-     * spawn 失败 → 409（ConflictException）。
+     * spawn 失败 → 409（ConflictException）；<b>[fail-loud 2026-09-22] team config.json 反查不到真实
+     * leadSessionId</b>（缺字段 / 空串 / 伪造值）→ 409 + Problem.detail 载四要素文案
+     * （{@link com.nexusai.application.agent.team.MissingLeaderSessionException}；⛔ 不再回落到进程级
+     * UUID 生成幻影会话）。
      */
     @PostMapping("/{teamName}/members/spawn")
     @ResponseStatus(HttpStatus.CREATED)
@@ -347,7 +350,21 @@ public class TeamController {
         //   （rest 线程 = 进程级 UUID）→ 成员 parentSessionId/attachment/outboundSink 错位。
         String leadSessionId = leadSessionIdFromConfig(teamName);
         SpawnInProcess.SpawnContext ctx = new SpawnInProcess.SpawnContext(leadSessionId, "rest-" + UUID.randomUUID());
-        SpawnInProcess.InProcessSpawnOutput out = spawnInProcess.spawnInProcessTeammate(config, ctx);
+        SpawnInProcess.InProcessSpawnOutput out;
+        try {
+            out = spawnInProcess.spawnInProcessTeammate(config, ctx);
+        } catch (com.nexusai.application.agent.team.MissingLeaderSessionException e) {
+            // [fail-loud · 2026-09-22 用户裁定] config.json 反查不到真实 leadSessionId
+            //   （无该字段 / 空串 / 落的是进程兜底 UUID 等伪造值）⇒ SpawnInProcess 入口直接抛，
+            //   ⛔ 不再回落进程级 UUID 生成幻影会话。此处 = **REST 边界单点翻译**（本仓既有范式）：
+            //   保全栈（log.error，供排障）+ 转 409 沿用本端点既有「spawn 失败 → 409」契约
+            //   （⛔ 不改成 400/500 —— 契约变更需用户裁定）。异常文案自带
+            //   环节/期望/实际/如何修 四要素，直接进 Problem.detail 供前端展示。
+            log.error("[TeamController] POST /api/v1/teams/{}/members/spawn → Leader 会话缺失，"
+                + "拒绝启动成员（fail-loud，⛔ 不伪造会话键）: name={} leadSessionId={}",
+                teamName, req.name(), leadSessionId, e);
+            throw new ConflictException(e.getMessage());
+        }
         if (!out.success()) {
             throw new ConflictException(out.error() != null ? out.error() : "spawn failed");
         }

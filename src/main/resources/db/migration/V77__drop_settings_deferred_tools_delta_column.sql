@@ -1,0 +1,22 @@
+-- ===================================================================
+-- V77: settings 表删除 deferred_tools_delta_enabled 列（孤儿列清理）
+--
+-- 背景（代码为准）：V60 建该列承载「deferred 工具公告用增量方式」的 delta 专用门。
+--   该门（isDeferredToolsDeltaEnabled / 统一判定 staticDeferredToolsDeltaEnabled）已随
+--   2.1.278 对齐整体删除（发行产物 cc_bundle.js + claude.exe 双产物 0 命中 ⇒ delta 恒启用），
+--   deferred 工具公告的「增量附件 / 每轮全量清单」两态收敛为固定走增量附件。
+--   列失去唯一消费者后成为孤儿：读/写/回显/序列化/种值 链已一并删除
+--   （SettingsRecord 字段与 accessor、SettingsDto record 分量、SettingsService
+--   merge 与 toDto 透出、FactoryPresetSeeder applier、前端 types.ts 字段）。
+--
+-- V60__add_settings_prompt_align_gates.sql 保留（Flyway 已应用，删则校验和失配，只加本迁移）。
+--   V60 是 ADD COLUMN、本迁移是 DROP COLUMN，两条独立文件，合法。
+--
+-- 依赖检查（本仓实测）：该列无索引 / 无视图 / 无触发器引用；全仓除 V60 与本文件外
+--   无任何 SQL 提及该列。
+-- SQLite ALTER TABLE DROP COLUMN 支持（SQLite >= 3.35.0，sqlite-jdbc 3.46.0.0）；
+--   本仓既有先例 V19__drop_sessions_original_cwd.sql / V30__drop_models_context_window.sql
+--   （真库 flyway_schema_history 实测 success=1），同一 JDBC/驱动栈上已验证可行，
+--   无需脱离事务重建表（FK 安全，不触发级联删除）。
+-- ===================================================================
+ALTER TABLE settings DROP COLUMN deferred_tools_delta_enabled;

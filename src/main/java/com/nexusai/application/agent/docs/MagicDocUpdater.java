@@ -513,7 +513,8 @@ public class MagicDocUpdater {
         String normalizedContent = original == null ? "" : original.replace("\r\n", "\n");
 
         // [P-CC-02] 用 ToolUseContext.createFileStateCache() 替换原 new ConcurrentHashMap<>() —
-        //   走 FileStateCache 双限真 LRU (100 条 + 25MB, 用户 2026-08-05 拍板严格对齐 CC),
+        //   走 FileStateCache 双限真 LRU (ToolUseContext.READ_FILE_STATE_CACHE_SIZE 条 = 5000
+        //   + 25MB, 条目数对齐 CC 2.1.278 的 LC=5000 (2026-09-22 用户裁定; 原 100 系对齐 2.1.88)),
         //   与父 cache 同容量配置 (单条 entry 不会触发驱逐).
         FileStateCache readFileState =
             ToolUseContext.createFileStateCache();

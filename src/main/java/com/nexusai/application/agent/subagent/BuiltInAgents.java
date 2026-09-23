@@ -620,18 +620,17 @@ public class BuiltInAgents {
      *
      * <p><b>为什么必须并入 DB 层（不是可选项）</b>：coordinator 的<b>唯一用户可达激活路径就是这一个
      * DB 列</b> —— 前端「设置 → 环境配置 → 协调者模式」勾选框写
-     * {@code settings.coordinatorModeEnabled}（{@code front/src/components/settings/EnvConfigPanel.tsx:727-742}），
-     * 后端经 {@code PromptAlignSettingsResolver.coordinatorModeEnabled()} 读（:135）；
+     * {@code settings.coordinatorModeEnabled}（{@code front/src/components/settings/EnvConfigPanel.tsx:696-711}），
+     * 后端经 {@code PromptAlignSettingsResolver.coordinatorModeEnabled()} 读（:190）；
      * 而 {@code nexusai.feature.coordinator-mode} 在 application.yml 恒 {@code false} 且<b>没有任何
      * UI/接口</b>可改。coordinator 系统提示注入（6 处要求 {@code subagent_type: "worker"}）走的正是
-     * DB 覆盖链 —— {@code LlmAgentLoop:4618/4660}（prompt options 门）与 {@code :4273/:4708}（工具池 /
+     * DB 覆盖链 —— {@code LlmAgentLoop:5050/5104}（prompt options 门）与 {@code :4564/5155}（工具池 /
      * userContext）= {@code resolver.coordinatorModeEnabled() ?? coordinatorMode.isCoordinatorMode()}。
      *
      * <p>若本分支只读 {@link CoordinatorMode}（env+feature），则「前端勾选 → DB=1」这一真实路径上
      * 提示已注入而 agent 列表无 worker ⇒ <b>本缺件补齐想修的故障原样保留</b>（门半开）。故此处与
-     * 提示注入侧<b>收敛为同一判定</b>，对齐本仓既有「统一判定」先例
-     * {@code PromptAlignSettingsResolver.staticDeferredToolsDeltaEnabled()}（该类 JavaDoc 记的正是
-     * 同一类故障：「DB 打开、env 关 → 开关空转 + 双发」）。
+     * 提示注入侧<b>收敛为同一判定</b>（统一走 {@link PromptAlignSettingsResolver} 的
+     * coordinatorModeActive 家族入口，避免同一 DB 覆盖在多处各判一次而半开）。
      *
      * <p>未注入（非 Spring 单测 / 无 mapper）→ {@code coordinatorModeEnabled()} 返回 null → 回落
      * 第 1 层 {@link #coordinatorMode}（与 {@code LlmAgentLoop} 的回落语义一致）。

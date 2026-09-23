@@ -274,9 +274,8 @@ public class FactoryPresetSeeder implements ApplicationRunner {
         m.put("max_ptl_retries", (s, v) -> s.setMaxPtlRetries(num(v)));
         m.put("max_compact_streaming_retries", (s, v) -> s.setMaxCompactStreamingRetries(num(v)));
         m.put("snip_nudge_threshold", (s, v) -> s.setSnipNudgeThreshold(num(v)));
-        // —— 提示词对齐门控 12 列（V56；language/output_style 为字符串）——
+        // —— 提示词对齐门控 11 列（V56；language/output_style 为字符串）——
         m.put("task_reminder_enabled", (s, v) -> s.setTaskReminderEnabled(bool(v)));
-        m.put("deferred_tools_delta_enabled", (s, v) -> s.setDeferredToolsDeltaEnabled(bool(v)));
         m.put("system_prompt_boundary_enabled", (s, v) -> s.setSystemPromptBoundaryEnabled(bool(v)));
         m.put("proactive_enabled", (s, v) -> s.setProactiveEnabled(bool(v)));
         m.put("coordinator_mode_enabled", (s, v) -> s.setCoordinatorModeEnabled(bool(v)));

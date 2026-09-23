@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * IMP-07 · AutoCompactor CC 契约测试（守卫 querySource / 熔断 / DISABLE env / SM 优先 / PTL 重试）。
@@ -280,11 +281,20 @@ class AutoCompactorCcContractTest {
         // [SM-07] PROMPT_CACHE_BREAK_DETECTION 门控开启 → notifyCompaction 可达（CC feature on 语义）
         auto.setPromptCacheBreakDetectionGate(() -> true);
 
-        AutoCompactor.AutoCompactResult result = auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx());
+        // [compact-signal-fix] 显式持有进度事件列表：断言 auto SM 成功分支补发的 compact_end。
+        List<CompactProgressEvent> events = new ArrayList<>();
+        AutoCompactor.AutoCompactResult result = auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx(events));
 
         // SM 压缩成功
         assertThat(result.wasCompacted()).isTrue();
         assertThat(result.source()).isEqualTo("SESSION_MEMORY");
+        // [compact-signal-fix] SM 成功分支进度信号：**恰一对** start+end，且**顺序**为 start→end。
+        //   WHY：start 置前端 running 态（输入框发送键变「停止」，压缩可取消）；end 置 done
+        //   （compactProgress.ts:115-121）。running 态无超时兜底 ⇒ 必须成对，缺 end 会让发送键
+        //   永久卡死（需 F5 恢复）。containsExactly 同时钉死数量与顺序。
+        assertThat(events).containsExactly(
+            new CompactProgressEvent.CompactStart(),
+            new CompactProgressEvent.CompactEnd());
         // 成功链: runPostCompactCleanup + notifyCompaction + markPostCompaction（INV-8）
         assertThat(cleanupCalls.get()).isEqualTo(1);
         assertThat(cleanupQs.get())
@@ -312,6 +322,72 @@ class AutoCompactorCcContractTest {
             .isFalse();
         // setLastSummarizedMessageId 复位（autoCompact.ts:296）
         assertThat(SessionMemoryService.getLastSummarizedMessageId("s1")).isNull();
+    }
+
+    @Test
+    @DisplayName("[compact-signal-fix] SM 返回 null 回落 legacy → SM 的 start 仍被 end 闭合（前两事件恰为 start,end）")
+    void smNullFallback_closesSmStartWithEnd(@TempDir Path baseDir) {
+        // WHY（规则 9 · 验证意图）：前端 running 态**无超时兜底**（compactProgress.ts 里只有
+        //   compact_end 分支带 hideAfterMs）。若 end 只在「SM 成功」分支里发，则「SM 返回 null
+        //   回落 legacy 分支」会留下悬空 start ⇒ App.tsx:439 的 compactActive 恒真 ⇒ 输入框发送键
+        //   永久卡成停止键。RED teeth：把 end 从 finally 挪回成功分支 ⇒ events.get(1) 不再是
+        //   CompactEnd（legacy 路径自己的首个事件顶上来），本用例必红。
+        SessionMemoryService smReturnsNull = new SessionMemoryService(baseDir) {
+            @Override
+            public CompactionResult trySessionMemoryCompaction(
+                    List<ChatMessageDto> messages, String sessionId, String agentId,
+                    Integer autoCompactThreshold) {
+                return null;   // 模拟「无 session memory / 超阈回落」
+            }
+        };
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
+            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>legacy</summary>", null));
+        auto.setSessionMemoryService(smReturnsNull);
+
+        List<CompactProgressEvent> events = new ArrayList<>();
+        AutoCompactor.AutoCompactResult result =
+            auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx(events));
+
+        assertThat(result.wasCompacted())
+            .as("SM 返回 null 后 legacy 分支确实跑完（不是靠异常提前结束）").isTrue();
+        assertThat(result.source()).isEqualTo("AUTO");
+        assertThat(events).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(events.get(0)).as("SM 尝试**之前**必须发 compact_start")
+            .isEqualTo(new CompactProgressEvent.CompactStart());
+        assertThat(events.get(1)).as("SM 的 start 必须紧跟同一次尝试的 compact_end（finally 成对收口）")
+            .isEqualTo(new CompactProgressEvent.CompactEnd());
+    }
+
+    @Test
+    @DisplayName("[compact-signal-fix] SM 链抛异常 → 异常照常上抛（不吞）且 start/end 成对（end 在 start 之后）")
+    void smThrows_stillPairedStartEnd_andExceptionPropagates(@TempDir Path baseDir) {
+        // WHY（规则 9 · 验证意图）：SM 调用位于下方 legacy try 之外 ⇒ 异常必须原样上抛（不吞），
+        //   同时 running 态不得悬空 —— 缺 end 会把发送键永久卡成停止键。
+        // RED teeth：把 end 挪出 finally ⇒ 本用例事件列表里没有 CompactEnd，必红。
+        SessionMemoryService smThrows = new SessionMemoryService(baseDir) {
+            @Override
+            public CompactionResult trySessionMemoryCompaction(
+                    List<ChatMessageDto> messages, String sessionId, String agentId,
+                    Integer autoCompactThreshold) {
+                throw new IllegalStateException("sm boom");
+            }
+        };
+        AutoCompactor auto = new AutoCompactor(msgs -> 200_000,
+            (p, m, ctx) -> new CompactConversation.SummaryResult("should not be called", null));
+        auto.setSessionMemoryService(smThrows);
+
+        List<CompactProgressEvent> events = new ArrayList<>();
+        assertThatThrownBy(() -> auto.autoCompactIfNeeded(largeMessages(20), 0, "user", smCcCtx(events)))
+            .as("SM 调用在 legacy try 之外 ⇒ 异常必须照常上抛（finally 只发事件、不 catch）")
+            .isInstanceOf(IllegalStateException.class)
+            .hasMessage("sm boom");
+
+        assertThat(events)
+            .as("异常路径也要成对闭合：start 与 end 都在")
+            .contains(new CompactProgressEvent.CompactStart(), new CompactProgressEvent.CompactEnd());
+        assertThat(events.indexOf(new CompactProgressEvent.CompactStart()))
+            .as("end 必须在 start 之后")
+            .isLessThan(events.indexOf(new CompactProgressEvent.CompactEnd()));
     }
 
     @Test
@@ -903,10 +979,21 @@ class AutoCompactorCcContractTest {
      * {@code ccContext.getSessionId()} 才能让 SM 定位到 {@code <baseDir>/s1/session-memory/summary.md}。
      */
     private CompactConversationContext smCcCtx() {
+        return smCcCtx(new ArrayList<>());
+    }
+
+    /**
+     * [compact-signal-fix] 同 {@link #smCcCtx()}，但显式接进度事件收集器 —— 用于断言 auto SM
+     * 成功分支补发的 {@code compact_end}（前端压缩进度横幅的置 done 事件）。
+     *
+     * @param events 进度事件收集列表（恒非 null；接为 onCompactProgress sink）
+     */
+    private CompactConversationContext smCcCtx(List<CompactProgressEvent> events) {
         return new CompactConversationContext()
             .setSessionId("s1")
             .setAgentId("agent-1")
             .setQuerySource("user")
+            .setOnCompactProgress(events::add)
             .setReadFileState(new java.util.LinkedHashMap<>());
     }
 }

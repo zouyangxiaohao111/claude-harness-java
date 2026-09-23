@@ -335,6 +335,25 @@ public class TaskService {
     private static final String PROCESS_SESSION_ID = java.util.UUID.randomUUID().toString();
 
     /**
+     * <b>该值是否为「无会话时回落的进程级共享列表 UUID」</b>（{@link #PROCESS_SESSION_ID}）。
+     *
+     * <p><b>WHY 需要按值识别而不是只看 null</b>：本值是 {@link #getTaskListId(String, TeammateIdentity)}
+     * 第 7 级的<b>最终回退</b>，形态上是一个合格 UUID ⇒ {@code 看起来像会话}。它可能被<b>上游落盘</b>
+     * （历史/旧版路径把兜底键写进 team config.json 的 {@code leadSessionId}），此后调用方拿到的就是
+     * 一个「非 null、非空白、形态合法」的伪造会话键 —— 只在入口判 null 拦不住。
+     *
+     * <p>消费方 = {@code SpawnInProcess.requireLeaderSessionId}（teammate 启动链：⛔ 不接受伪造会话键，
+     * 2026-09-22 用户裁定）。⛔ 不得用它当「合法会话」判据（合法会话是会话 id，永不等于本值：本值
+     * 每次 JVM 启动随机生成、从不写入任何 session 表/会话目录）。
+     *
+     * @param candidate 待判定的值（可 null）
+     * @return 命中进程级兜底 UUID ⇒ true（null 恒 false）
+     */
+    public static boolean isFallbackProcessSessionId(String candidate) {
+        return PROCESS_SESSION_ID.equals(candidate);
+    }
+
+    /**
      * [S1-T11] 「无显式会话 → 回退进程级共享列表」的<b>回落次数</b>（仅用于 WARN 文本里的序号）。
      *
      * <p><b>WHY 不再用一次性闸（本仓裁定-8）</b>：原实现是进程级单次闸

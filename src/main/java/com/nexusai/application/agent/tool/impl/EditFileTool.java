@@ -35,8 +35,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Objects;
@@ -71,11 +75,34 @@ public class EditFileTool implements Tool {
     // errorCode 4 建议文案尾部. Java 无 findSimilarFile/suggestPathUnderCwd 等价, 输出基础文案 (见 E2 concerns).
     private static final String FILE_NOT_FOUND_CWD_NOTE = "Note: your current working directory is";
 
-    // [G33①/OPD-D2-07] CC original: FILE_UNEXPECTEDLY_MODIFIED_ERROR
-    // （FileEditTool/constants.ts:10-11）——call() 内 stale 复检（FileEditTool.ts:465
-    //   throw new Error(FILE_UNEXPECTEDLY_MODIFIED_ERROR)）文案逐字一致。
-    private static final String FILE_UNEXPECTEDLY_MODIFIED_ERROR =
-        "File has been unexpectedly modified. Read it again before attempting to write it.";
+    // ════════════════════════════════════════════════════════════════════
+    // [edit-obs-2a] SNF(errorCode 8) 失败路径观测常量 · 纯观测，不参与任何判定
+    // ════════════════════════════════════════════════════════════════════
+    /** 最佳对齐扫描的位置上限（防病态大文件 O(n*m) 纯计算开销；超限则跳过对齐量，记 -1）。 */
+    private static final int SNF_ALIGN_SCAN_LIMIT = 1_000_000;
+    /** 最佳对齐位置前后各取的上下文字符数。 */
+    private static final int SNF_CONTEXT_CHARS = 40;
+    /** old_string 首/尾各取的字符数（便于 grep）。 */
+    private static final int SNF_EDGE_CHARS = 80;
+
+    // ── [批 gate-allow-skip] call() 级 pre-read guard 的两条文案 · 对齐目标 CC 2.1.278 ──
+    //   来源分级：**我 dd 读发行产物看到**（claude.exe byte offset）——
+    //   · eAn @198714840 = "File has not been read yet. Read it first before writing to it."
+    //   · sQe @198715168 = "File content has changed since it was last read. …then retry the edit."
+    //   A2o（call() 级 guard，byte offset 206612007）的两个 throw 站点分别用它们：
+    //   `if(!r){ if(!h&&!M()){ … } throw new RX(eAn) } … throw new RX(sQe)`。
+    //   ⛔ 旧常量 FILE_UNEXPECTEDLY_MODIFIED_ERROR("File has been unexpectedly modified. …")
+    //   在 2.1.278 发行产物里**零命中**（"unexpectedly modified" grep count = 0）⇒ 它是 2.1.88 期
+    //   产物，本次随 A2o 对齐退役。
+    /** CC 2.1.278 {@code eAn} · call() 级 guard 在「无 entry 且未获免门」时抛出的文案。 */
+    private static final String FILE_NOT_READ_YET_ERROR =
+        "File has not been read yet. Read it first before writing to it.";
+
+    /** CC 2.1.278 {@code sQe} · call() 级 guard 在「mtime 更新且内容确变」时抛出的文案。 */
+    private static final String FILE_CONTENT_CHANGED_ERROR =
+        "File content has changed since it was last read. This commonly happens when a linter " +
+        "or formatter run via Bash rewrites the file. Call Read on this file to refresh, then " +
+        "retry the edit.";
 
     private final PathGuard guard;
 
@@ -116,6 +143,53 @@ public class EditFileTool implements Tool {
     /** 测试/装配用 setter · 与 ReadFileTool 同模式（构造器保留旧 API）。 */
     public void setPermissionChecker(com.nexusai.application.agent.permission.WritePermissionChecker permissionChecker) {
         this.permissionChecker = permissionChecker;
+    }
+
+    /**
+     * [批 gate-allow-skip] 门禁 1 的免门判据来源 —— read 权限层判定（CC {@code Wu} 等价物，
+     * 见 {@link com.nexusai.application.agent.permission.ReadPermissionChecker#readLayerIsAllow}）。
+     *
+     * <p>CC 的完整门禁条件是 {@code Ue=!Jbt(model,remoteCall)&&G9(Nt,M,s.tools,s.permissions())}
+     * （exe byte offset 206606039 区）,{@code G9(e,n,r,s)=!Uu(e,r)&&Wu(n,s)}（off 200163140），
+     * {@code Uu(e,n)=n.some(r=>Ut(r,e))&&!n.some(r=>Ut(r,nt))&&!n.some(r=>Ut(r,Cl))}（off 200163047）。
+     * <p>⭐ 两个<b>否定项</b>常量（我 dd 读发行产物看到）：{@code nt="Read"}（off 197960630）、
+     * {@code Cl="REPL"}（off 199683797）—— ⛔ <b>不是 Edit</b>。故 {@code Uu} =「工具表含该工具」且
+     * 「不含 Read」且「不含 REPL」。正常会话<b>含 Read</b> ⇒ {@code Uu=false} ⇒ {@code !Uu=true}
+     * ⇒ <b>那条例外在 CC 里是活的（会触发）</b>。⚠️ 本批之前此处写「{@code Uu} 恒真 ⇒ 例外永不触发」
+     * 是<b>错的</b>，已按 dd 取证更正。
+     * <p>⭐⭐ 分档：第三方模型（{@code Jbt}=false）⇒ {@code Ue ≡ Wu} ⇒ <b>本仓与 CC 同宽</b>；
+     * 一方模型（{@code Jbt}=true ⇒ CC 侧关免门）时本仓不实现 {@code Jbt} ⇒ <b>本仓才比 CC 松</b>。
+     * 用户 2026-09-22 裁定「不看模型、不看格式」⇒ 本仓<b>只抄 {@code Wu} 这一项</b>，不是「对齐 CC」。
+     *
+     * <p>{@code @Autowired(required = false)}：未注入（POJO/单测）⇒ 判据 fail-closed
+     * 恒 false ⇒ 门禁 1 行为与本批之前<b>逐字节一致</b>（不静默放宽）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.permission.ReadPermissionChecker readPermissionChecker;
+
+    /** 测试/装配用 setter（镜像 {@link #setPermissionChecker}）。 */
+    public void setReadPermissionChecker(
+            com.nexusai.application.agent.permission.ReadPermissionChecker readPermissionChecker) {
+        this.readPermissionChecker = readPermissionChecker;
+    }
+
+    /**
+     * 门禁 1 免门判据求值（CC {@code Wu(path, permissions)} 那一半）。
+     *
+     * @param file 已按会话 cwd 解析的规范化绝对路径（与 readFileState key 同源）
+     * @param ctx  工具调用上下文
+     * @return true = 该路径 read 层判 allow ⇒ 免 read-before-write 门禁
+     */
+    private boolean readLayerAllowsSkip(Path file, ToolUseContext ctx) {
+        if (readPermissionChecker == null) {
+            if (log.isWarnEnabled()) {
+                log.warn("EditFileTool: ReadPermissionChecker 未注入 → 免门判据 fail-closed=false"
+                    + "（read-before-write 门禁维持拒绝）path={}", file);
+            }
+            return false;
+        }
+        return readPermissionChecker.readLayerIsAllow(
+            file.toAbsolutePath().normalize().toString(), ctx);
     }
 
     /**
@@ -631,38 +705,78 @@ public class EditFileTool implements Tool {
         //   都收敛到同一绝对路径键），否则相对 Read + 绝对 Edit 会 key 错位致门禁永不命中。
         ReadState readState = ctx.readFileState().get(
             ToolUseContext.keyForReadFileState(guard, file.toString()));
+        // [批 rfs-replay-3b · 2 次修订] 门禁 1 判据 = **两态**（与 CC 2.1.278 一致）：
+        //   null（从未读过）/ isPartialView（只看到部分视图）⇒ 判「未读」errorCode 6。
+        //   ⛔ **不消费** contentNotInModelContext —— 依用户口径「CC 怎么做我们怎么做」：
+        //   2.1.278 发行产物本门禁条件是 `if(!Ee||Ee.isPartialView)`（**我 dd 读发行产物看到**：
+        //   exe off 206605650 起 `if(!Ee||Ee.isPartialView){`，该区间内该字段命中数 = 0）；
+        //   CC 真正的消费点只有 `fle`（at-mention 已读短路 / Edit/Write 写回打标，off 199640351）
+        //   与 ProposeSkillsTool 的 read/unread 分类（off 225888734）—— 二者本仓均无对应物
+        //   （详见 ToolUseContext.ReadState 该字段 javadoc）。
+        //   ⇒ 行为后果：跨进程 resume 后，对「只被上一进程 Edit 过」的文件，模型**不必重读**
+        //   即可继续 Edit（= CC 行为）。下方 debug 日志仍打印该布尔（可观测信息），但不参与判定。
         if (readState == null || readState.isPartialView()) {
-            return Tool.ValidationResult.fail("6",
-                "File has not been read yet. Read it first before writing to it.");
+            // [批 gate-allow-skip] 免门例外 · CC 2.1.278 Edit 门禁的同一位置（`if(!Ee||Ee.isPartialView){`
+            //   块内，exe **byte offset 206605650**）：
+            //     `let Ue=!Jbt(ze,s.remoteCall)&&G9(Nt,M,s.tools,s.permissions()); …; if(!Ue)
+            //      return {result:!1,behavior:"ask",message:"File has not been read yet. …",errorCode:6};`
+            //   ⇒ 只有 `Ue`(guardSkipped) 为真才放行。
+            //   本仓只抄 `Wu` 那一半（用户 2026-09-22 裁定「不看模型、不看格式」）。
+            //   ⚠️ 更正（本批 dd 取证 · 详见 ReadPermissionChecker#readLayerIsAllow javadoc）：CC 那条
+            //      例外**不是死的** —— `Uu` 的两个否定项常量是 `nt="Read"`（exe off 197960630）与
+            //      `Cl="REPL"`（off 199683797），⛔ 不是 Edit；正常会话含 Read ⇒ `Uu=false` ⇒
+            //      `!Uu=true` ⇒ 例外**会触发**。本批之前此处写「Uu 恒真 ⇒ 永不触发」是**错的**。
+            //   ⭐ 分档：第三方模型（`Jbt=false`）⇒ `Ue≡Wu` ⇒ **本仓与 CC 同宽**；一方模型
+            //      （`Jbt=true` ⇒ CC 关免门）时本仓不实现 `Jbt` ⇒ **本仓才比 CC 松**。
+            boolean skipAllowed = readLayerAllowsSkip(file, ctx);
+            if (log.isInfoEnabled()) {
+                log.info("EditFileTool: 门禁 1 判定 path={} 状态={} 判据(Wu:readLayerIsAllow)={} 判定={} "
+                        + "contentNotInModelContext={}（判定仅用 null/isPartialView 两态；末项仅供观测）",
+                    fullFilePathStr,
+                    readState == null ? "无 entry(readState==null)"
+                                      : "entry 存在但 isPartialView=true",
+                    skipAllowed,
+                    skipAllowed ? "免门命中→放行" : "免门未命中→拒绝(errorCode 6)",
+                    readState != null && readState.contentNotInModelContext());
+            }
+            if (!skipAllowed) {
+                return Tool.ValidationResult.fail("6",
+                    "File has not been read yet. Read it first before writing to it.");
+            }
         }
 
         // 门禁 2: stale-write 拒绝 · 对齐 CC FileEditTool.ts:275-310 errorCode=7
-        long lastWriteTime;
-        try {
-            lastWriteTime = Files.getLastModifiedTime(file).toMillis();
-        } catch (Exception e) {
-            // stat 失败: 不阻塞, 让 execute() 内部 catch 兜底
-            return Tool.ValidationResult.pass();
-        }
-        if (lastWriteTime > readState.mtimeMillis()) {
-            // CC 内容兜底: 仅当 entry 的 offset/limit 均为 null (isFullRead) 且
-            // fileContent 与 readState.content 完全一致时, 才放行 (防 mtime 误增).
-            boolean isPostWriteEntry = readState.offset() == null && readState.limit() == null;
-            String readContent = readState.content();
-            // 注: readContent 可能是 null (旧 entry 没填), 此时拿不到内容兜底, 直接拒.
-            if (!(isPostWriteEntry && readContent != null)) {
-                return Tool.ValidationResult.fail("7",
-                    "File has been modified since read, either by the user or by a linter. " +
-                    "Read it again before attempting to write to it.");
+        // [批 gate-allow-skip] CC 把本块包在 `if(Ee){…}` 里（exe **byte offset 206606445**：
+        //   `if(Ee){if(await Kb(M)>Ee.timestamp){…}}`）—— 免门命中后 Ee 可能为 null，
+        //   缺这道守卫会在 readState.mtimeMillis() 处 NPE ⇒ 必须同款补上。
+        if (readState != null) {
+            long lastWriteTime;
+            try {
+                lastWriteTime = Files.getLastModifiedTime(file).toMillis();
+            } catch (Exception e) {
+                // stat 失败: 不阻塞, 让 execute() 内部 catch 兜底
+                return Tool.ValidationResult.pass();
             }
-            // 复用已读 fileContent (已 CRLF 归一化), 与 readState.content 比对防 mtime 误增
-            // [G13④] BOM 归一：ReadState.content 为无 BOM 形式（ReadFileTool 按 CC readFileInRange
-            //   剥 UTF-8 BOM），fileContent 保留 BOM（FileEncodingReader 对齐 CC readFileSyncWithMetadata）
-            //   —— 双侧剥前导 U+FEFF 后比对，防 BOM 文件在 mtime 误增（云同步/杀软 touch）时误判"内容已变"。
-            if (!stripLeadingBom(fileContent).equals(stripLeadingBom(readContent))) {
-                return Tool.ValidationResult.fail("7",
-                    "File has been modified since read, either by the user or by a linter. " +
-                    "Read it again before attempting to write to it.");
+            if (lastWriteTime > readState.mtimeMillis()) {
+                // CC 内容兜底: 仅当 entry 的 offset/limit 均为 null (isFullRead) 且
+                // fileContent 与 readState.content 完全一致时, 才放行 (防 mtime 误增).
+                boolean isPostWriteEntry = readState.offset() == null && readState.limit() == null;
+                String readContent = readState.content();
+                // 注: readContent 可能是 null (旧 entry 没填), 此时拿不到内容兜底, 直接拒.
+                if (!(isPostWriteEntry && readContent != null)) {
+                    return Tool.ValidationResult.fail("7",
+                        "File has been modified since read, either by the user or by a linter. " +
+                        "Read it again before attempting to write to it.");
+                }
+                // 复用已读 fileContent (已 CRLF 归一化), 与 readState.content 比对防 mtime 误增
+                // [G13④] BOM 归一：ReadState.content 为无 BOM 形式（ReadFileTool 按 CC readFileInRange
+                //   剥 UTF-8 BOM），fileContent 保留 BOM（FileEncodingReader 对齐 CC readFileSyncWithMetadata）
+                //   —— 双侧剥前导 U+FEFF 后比对，防 BOM 文件在 mtime 误增（云同步/杀软 touch）时误判"内容已变"。
+                if (!stripLeadingBom(fileContent).equals(stripLeadingBom(readContent))) {
+                    return Tool.ValidationResult.fail("7",
+                        "File has been modified since read, either by the user or by a linter. " +
+                        "Read it again before attempting to write to it.");
+                }
             }
         }
 
@@ -674,6 +788,12 @@ public class EditFileTool implements Tool {
             EditMatchEngine.normalizeEdit(relPath, fileContent, oldString, newString);
         String actualOldString = EditMatchEngine.findActualString(fileContent, normalized.oldString());
         if (actualOldString == null) {
+            // [edit-obs-2a] SNF 失败路径观测 · ⭐纯观测：不改进出参、不改判定、不改权限。
+            //   (c) 复用本方法上方已读到的 fileContent（validateInput 每次重读盘 ⇒ 判定时磁盘内容已在手），
+            //       ⛔ 绝不为此再读一次盘。
+            //   (d) 派生量只做纯计算 + 打日志，⛔ 绝不参与本分支的判定。
+            //   只在失败分支打 ⇒ 成功 Edit（两周 6301 次）零日志、零开销（成功路径连本 if 都不进）。
+            logSnfFailure(ctx, fullFilePathStr, fileContent, oldString, newString);
             return Tool.ValidationResult.fail("8",
                 "String to replace not found in file.\nString: " + oldString);
         }
@@ -761,6 +881,189 @@ public class EditFileTool implements Tool {
             return s.substring(1);
         }
         return s;
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [edit-obs-2a] SNF(errorCode 8) 失败路径观测 · 纯观测，零行为变更
+    //
+    // WHY（本批目的）: 上一轮只读判定把两个候选机制都否掉了（H-A 同批内自打梯度反向；
+    //   H-B 跨批陈旧 —— 整组全失败批仅 0.37% 且代码侧无窗口），唯一有正面证据的方向是
+    //   H-C「模型逐字复现失准」（7/308 下界已证是误引）。⇒ 约 9 成 SNF 用现有日志判不出根因。
+    //   本方法把「失败时刻的 old_string / new_string / 磁盘内容」三者同时落盘，并给出能把
+    //   「误引（模型记错了字符）」与「漂移（磁盘内容在两次读之间变了）」分开的判别性派生量。
+    // ⛔ 本方法及 {@link #computeSnfDiagnostics} 只做纯计算 + 打日志：不返回判定值、不被任何
+    //   判定分支消费、不参与权限与进/出参。
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * [edit-obs-2a] SNF 失败路径 INFO 落盘 · 对齐目标 CC 2.1.278（本方法为 Java 侧新增观测，
+     * CC 真源无对应物）。
+     *
+     * @param ctx           工具上下文（取 sessionId；可为 null）
+     * @param fullFilePath  已解析的规范化绝对路径
+     * @param diskContent   施加时刻的磁盘内容（⭐ 复用 validateInput 已读到的 fileContent，不再读盘）
+     * @param oldString     模型给出的 old_string 原文（全量落盘）
+     * @param newString     模型给出的 new_string（⛔ 只落长度 + sha256，不落全文）
+     */
+    private static void logSnfFailure(ToolUseContext ctx, String fullFilePath, String diskContent,
+            String oldString, String newString) {
+        if (!log.isInfoEnabled()) {
+            return;
+        }
+        SnfDiagnostics d = computeSnfDiagnostics(diskContent, oldString);
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        log.info("EditFileTool SNF 观测(非判定): session={} path={} "
+                + "oldSha256={} oldLen={} newSha256={} newLen={} "
+                + "diskSha256={} diskBytes={} "
+                + "verbatimHit={} wsNormHit={} bomStripHit={} lineNoPrefix={} "
+                + "lcpLen={} alignPos={} ctxBefore=[{}] ctxAfter=[{}] head80=[{}] tail80=[{}] oldString=[{}]",
+            sessionId, fullFilePath,
+            d.oldSha256(), d.oldCharLen(),
+            sha256Hex(newString), newString == null ? 0 : newString.length(),
+            d.diskSha256(), d.diskByteLen(),
+            d.verbatimHit(), d.whitespaceNormalizedHit(), d.bomStrippedHit(), d.lineNumberPrefixShape(),
+            d.longestCommonPrefixLen(), d.bestAlignPos(),
+            d.contextBefore(), d.contextAfter(), d.head80(), d.tail80(), oldString);
+    }
+
+    /**
+     * [edit-obs-2a] SNF 判别性派生量（纯计算）· 供 {@link #logSnfFailure} 与单测直接调用。
+     *
+     * <p><b>判别设计</b>（把「误引」与「漂移」分开）：
+     * <ul>
+     *   <li><b>误引</b>（模型逐字复现失准）：{@code verbatimHit=false} 且
+     *       {@code wsNormHit=false} 且 {@code bomStripHit=false} 且 {@code lcpLen} 显著小于
+     *       old_string 长度 —— 即「连近似都对不上」，说明模型手上的文本与磁盘文本不是同一份的
+     *       措辞差异，而是模型自己写错了字。</li>
+     *   <li><b>漂移</b>（磁盘内容在 fork 起点与施加时刻之间被改）：
+     *       {@code verbatimHit=false} 但 {@code lcpLen} 很大（常等于 old_string 长度的一大半）且
+     *       {@code alignPos>=0} —— 说明磁盘上有「几乎相同但某处被改过」的段落，改的正是漂移字节；
+     *       {@code ctxBefore/ctxAfter} 直接给出差在哪。此形态须与 Site ② 的 fork 起点
+     *       {@code sha256(currentMemory)} 比对（相等 ⇒ 起点就已是这份内容 ⇒ 误引；不等 ⇒ 漂移）。</li>
+     *   <li><b>行号形态</b>（{@code lineNoPrefix=true}）：模型把 Read 输出的行号前缀（如
+     *       {@code 123\t} / {@code   123->}）抄进了 old_string —— 这是 CC prompt 明令禁止的
+     *       （见 {@link #prompt()}），属可判的第三种成因。</li>
+     * </ul>
+     *
+     * <p>⚠️ 本方法为纯函数，返回值只进日志。
+     *
+     * @param diskContent 磁盘内容（可为 null → 视作空串）
+     * @param oldString   模型给出的 old_string（可为 null → 视作空串）
+     * @return 派生量快照
+     */
+    static SnfDiagnostics computeSnfDiagnostics(String diskContent, String oldString) {
+        String disk = diskContent == null ? "" : diskContent;
+        String old = oldString == null ? "" : oldString;
+
+        // (d1) 逐字命中 —— 自洽性断言：预期 false（否则 findActualString 精确分支就会命中，
+        //   不会走到 errorCode 8）。例外：normalizeEdit 的 desanitize 改写过 old_string 时，
+        //   原件可能逐字在盘上而改写件不在 ⇒ 此时 verbatimHit=true 是有意义的诊断信号。
+        boolean verbatimHit = !old.isEmpty() && disk.contains(old);
+
+        // (d2) 归一化空白/换行后是否命中（CRLF↔LF + 折叠连续空白）
+        boolean whitespaceNormalizedHit = !old.isEmpty()
+            && collapseWhitespace(disk).contains(collapseWhitespace(old));
+
+        // (d3) 去 BOM 后是否命中（文件带 UTF-8 BOM 而模型没带；反之亦然，双侧各剥一次）
+        boolean bomStrippedHit = !old.isEmpty()
+            && stripLeadingBom(disk).contains(stripLeadingBom(old));
+
+        // (d4) old_string 是否以行号形态开头（形如 "  123->" 或 "123\t"）
+        boolean lineNumberPrefixShape = old.matches("(?s)^\\s*\\d+\\s*(?:->|→|\\t).*");
+
+        // (d5) 最佳对齐 = 与磁盘内容的最长公共前缀及其位置
+        int bestPos = -1;
+        int bestLen = 0;
+        if (!old.isEmpty() && !disk.isEmpty() && disk.length() <= SNF_ALIGN_SCAN_LIMIT) {
+            char first = old.charAt(0);
+            for (int i = 0; i < disk.length(); i++) {
+                if (disk.charAt(i) != first) {
+                    continue;
+                }
+                int max = Math.min(old.length(), disk.length() - i);
+                int cp = 0;
+                while (cp < max && disk.charAt(i + cp) == old.charAt(cp)) {
+                    cp++;
+                }
+                if (cp > bestLen) {
+                    bestLen = cp;
+                    bestPos = i;
+                }
+            }
+        }
+
+        String ctxBefore = "";
+        String ctxAfter = "";
+        if (bestPos >= 0) {
+            ctxBefore = disk.substring(Math.max(0, bestPos - SNF_CONTEXT_CHARS), bestPos);
+            ctxAfter = disk.substring(bestPos, Math.min(disk.length(), bestPos + SNF_CONTEXT_CHARS));
+        }
+
+        return new SnfDiagnostics(
+            verbatimHit,
+            whitespaceNormalizedHit,
+            bomStrippedHit,
+            lineNumberPrefixShape,
+            bestLen,
+            bestPos,
+            ctxBefore,
+            ctxAfter,
+            head(old, SNF_EDGE_CHARS),
+            tail(old, SNF_EDGE_CHARS),
+            sha256Hex(old),
+            old.length(),
+            sha256Hex(disk),
+            disk.getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    /** [edit-obs-2a] SNF 判别性派生量快照（⚠️ 只进日志，不参与任何判定）。 */
+    record SnfDiagnostics(
+        boolean verbatimHit,
+        boolean whitespaceNormalizedHit,
+        boolean bomStrippedHit,
+        boolean lineNumberPrefixShape,
+        int longestCommonPrefixLen,
+        int bestAlignPos,
+        String contextBefore,
+        String contextAfter,
+        String head80,
+        String tail80,
+        String oldSha256,
+        int oldCharLen,
+        String diskSha256,
+        int diskByteLen) {
+    }
+
+    /** [edit-obs-2a] 折叠连续空白（含换行）+ 统一行尾，供「归一化后是否命中」判定。 */
+    private static String collapseWhitespace(String s) {
+        return s.replace("\r\n", "\n").replace('\r', '\n').replaceAll("\\s+", " ").trim();
+    }
+
+    /** [edit-obs-2a] 取首 n 字符。 */
+    private static String head(String s, int n) {
+        return s.length() <= n ? s : s.substring(0, n);
+    }
+
+    /** [edit-obs-2a] 取末 n 字符。 */
+    private static String tail(String s, int n) {
+        return s.length() <= n ? s : s.substring(s.length() - n);
+    }
+
+    /**
+     * [edit-obs-2a] sha256（UTF-8 字节）· 本仓既有约定为各消费者私有小工具
+     * （同 {@code McpbHandler.java:706} / {@code Download.java:148}），故此处同样私有实现。
+     *
+     * @return 64 位小写十六进制；入参 null → 空串的摘要（不抛）
+     */
+    private static String sha256Hex(String s) {
+        String v = s == null ? "" : s;
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            return HexFormat.of().formatHex(md.digest(v.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            // SHA-256 是 JDK 必备算法，理论不可达；真不可达也不阻断 Edit（观测不 fail-loud）
+            return "sha256-unavailable";
+        }
     }
 
     /**
@@ -1008,14 +1311,15 @@ public class EditFileTool implements Tool {
                 Files.createDirectories(file.getParent());
             }
 
-            // [G33①/OPD-D2-07] call 级 stale 复检 · 对齐 CC FileEditTool.ts:451-468：
+            // [G33①/OPD-D2-07] call 级 pre-read guard · 对齐 CC 2.1.278 {@code A2o}
+            //   （exe byte offset 206612007；旧注释锚 FileEditTool.ts:451-468 是 2.1.88 行号）：
             //   validateInput errorCode-7 是前置门禁（读到内容之前）；CC 在 call() 内、读文件之后、
-            //   写盘之前再查一次 —— `lastWriteTime > lastRead.timestamp` 且非（full-read 且 content
-            //   一致）→ throw FILE_UNEXPECTEDLY_MODIFIED_ERROR（constants.ts:10 逐字）。WHY: 防
+            //   写盘之前再查一次 —— ① 无 entry 时按免门判据决定放行/抛 eAn；
+            //   ② mtime 更新且非（full-read 且 content 一致）→ throw sQe。WHY: 防
             //   validateInput 与 writeTextContent 之间文件被外部改动（TOCTOU），且 Java 全仓此前无
             //   该错误路径（仅依赖 validateInput errorCode-7，见 08-traceability REQ-G33-1）。
             //   content 兜底：full-read entry（offset/limit 均 null）且 content 一致才放行（Windows
-            //   云同步/杀软 mtime 误增防误拒，CC :455-457 注释同款）。
+            //   云同步/杀软 mtime 误增防误拒，CC A2o 的 `g2(r)&&JD(r,Uw(n))` 同款）。
             if (exists) {
                 long lastWriteTime;
                 try {
@@ -1028,25 +1332,56 @@ public class EditFileTool implements Tool {
                 ReadState lastRead = ctx != null
                     ? ctx.readFileState().get(ToolUseContext.keyForReadFileState(guard, file.toString()))
                     : null;
-                if (lastRead == null || lastWriteTime > lastRead.mtimeMillis()) {
-                    boolean isFullRead = lastRead != null
-                        && lastRead.offset() == null && lastRead.limit() == null;
+                // [批 gate-allow-skip] 本块对齐 CC 2.1.278 的 `A2o`（call() 级 pre-read guard，
+                //   exe **byte offset 206612007**）：
+                //   <pre>
+                //   if(!r){                                   // ← 无 entry
+                //     if(!h&&!M()){                           // h=Jbt(model,…)  M()=!G9(…)
+                //       if(y===void 0||Lbt(y,Uw(n)))return !1;// y=readBaseline（本仓无 remoteCall ⇒ 恒 void 0）
+                //       if(BEe(n,s,g)==="applies")return !0;  // ← 仅当有 baseline 且不一致时才可达
+                //       throw new RX(Mvn(w))
+                //     }
+                //     throw new RX(eAn)
+                //   }
+                //   if(ZZe(e)&lt;=r.timestamp)return !1;          // mtime 未增
+                //   if(g2(r)&amp;&amp;JD(r,Uw(n)))return !1;           // full-read 且内容一致
+                //   if(BEe(n,s,g)==="applies"&amp;&amp;!M())return !0; // ← 本仓未抄（见下方偏离登记）
+                //   throw new RX(sQe)
+                //   </pre>
+                //   本仓映射：h=false（用户裁定不做模型分叉）、y=undefined（无 remoteCall/readBaseline）
+                //   ⇒ `!r` 分支在 `!M()`（= 免门判据为真）时必然落到 `return !1` = <b>放行，不抛</b>。
+                //   ⚠️ 偏离登记：① 丢弃 `h`/`y` 两级（模型分叉 + readBaseline），用户 2026-09-22 裁定
+                //   「不看模型、不看格式」；② CC 第三条 `BEe(...)==="applies"`（mtime 更新但 old_string
+                //   仍能干净唯一匹配 ⇒ 放行并打 staleRecovered 标记）本仓<b>未抄</b> —— 抄了会把本仓
+                //   由「拒」改成「放行」，属放宽，本批不做，在此如实登记。
+                if (lastRead == null) {
+                    if (!readLayerAllowsSkip(file, ctx)) {
+                        if (log.isWarnEnabled()) {
+                            log.warn("EditFileTool: call 级 pre-read guard 拒绝（CC A2o !lastRead 且未获免门"
+                                + " ⇒ throw RX(eAn)）: path={}", relPath);
+                        }
+                        throw new IllegalStateException(FILE_NOT_READ_YET_ERROR);
+                    }
+                    if (log.isInfoEnabled()) {
+                        log.info("EditFileTool: call 级 pre-read guard 免门放行（CC A2o: !lastRead + "
+                            + "免门判据真 + readBaseline 缺失 ⇒ return !1）: path={}", relPath);
+                    }
+                } else if (lastWriteTime > lastRead.mtimeMillis()) {
+                    boolean isFullRead = lastRead.offset() == null && lastRead.limit() == null;
                     // [G13④] BOM 归一比对（同 validateInput errorCode-7）：ReadState 无 BOM、
                     //   FileEncodingReader 保留 BOM，双侧剥前导 U+FEFF 后等价。
                     boolean contentUnchanged = isFullRead
                         && stripLeadingBom(content).equals(stripLeadingBom(lastRead.content()));
                     if (!contentUnchanged) {
                         if (log.isWarnEnabled()) {
-                            log.warn("EditFileTool: call 级 stale 复检拒绝（CC FileEditTool.ts:465）: path={} "
+                            log.warn("EditFileTool: call 级 stale 复检拒绝（CC A2o 尾 throw RX(sQe)）: path={} "
                                 + "lastWriteTime={} readMtime={} isFullRead={}",
-                                relPath, lastWriteTime,
-                                lastRead == null ? -1L : lastRead.mtimeMillis(), isFullRead);
+                                relPath, lastWriteTime, lastRead.mtimeMillis(), isFullRead);
                         }
-                        // CC FileEditTool.ts:465 `throw new Error(FILE_UNEXPECTEDLY_MODIFIED_ERROR)`：
-                        // Java 由 executeInternal 外层 catch 转 "Edit error: <msg>"（isToolErrorData 前缀
-                        // "Edit error" 识别 → is_error=true，StreamingToolExecutor:1861）。message 保持
-                        // CC constants.ts:10 逐字。
-                        throw new IllegalStateException(FILE_UNEXPECTEDLY_MODIFIED_ERROR);
+                        // CC A2o 尾 `throw new RX(sQe)`：Java 由 executeInternal 外层 catch 转
+                        // "Edit error: <msg>"（isToolErrorData 前缀 "Edit error" 识别 → is_error=true，
+                        // StreamingToolExecutor:1861）。message 保持 CC 2.1.278 sQe 逐字。
+                        throw new IllegalStateException(FILE_CONTENT_CHANGED_ERROR);
                     }
                 }
             }

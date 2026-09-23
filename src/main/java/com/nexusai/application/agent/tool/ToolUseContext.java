@@ -121,10 +121,10 @@ public record ToolUseContext(
         // [P-CC-02] 类型由 Caffeine Cache 升级为 FileStateCache (双限真 LRU).
         // WHY R1: dedup 状态从 ReadFileTool 实例字段上提到 TUC，会话级 + 跨工具共享。
         // 对齐 CC QueryEngine.ts:191 + runAgent.ts:377/705/828 + FileEditTool.ts:140/275/453/520。
-        // [P-CC-02] 双限真 LRU: maxEntries=100 + maxSizeBytes=25MB (weigher 只算 content 字节),
-        //   严格对齐 CC utils/fileStateCache.ts:30-39 ({@code max:100, maxSize:25MB,
-        //   sizeCalculation: v => Math.max(1, Buffer.byteLength(v.content))}) — 用户
-        //   2026-08-05 拍板"剩余拍板项严格和CC对齐", 撤销旧 500/100MB 放宽.
+        // [P-CC-02] 双限真 LRU: maxEntries=5000 + maxSizeBytes=25MB (weigher 只算 content 字节),
+        //   maxSize/weigher 严格对齐 CC（两版一致）: 2.1.88 utils/fileStateCache.ts:30-39
+        //   ({@code maxSize:25MB, sizeCalculation: v => Math.max(1, Buffer.byteLength(v.content))});
+        //   maxEntries 对齐目标 CC 2.1.278 的 {@code LC=5000}（2.1.88 为 100，本批改标）.
         //   替代原 Round 1 无界 ConcurrentHashMap — 此前会无限增长, 大文件 / 长 session 会放大 ctx 内存.
         // @JsonIgnore: dedup cache 是工具运行时状态, 不进 AgentState / EventPublisher / STOMP / LLM payload
         // (类比 BudgetTracker local-only 约束, 避免把会话内 dedup 状态泄漏到 outbound DTO).
@@ -274,15 +274,27 @@ public record ToolUseContext(
 
     // ════════════════════════════════════════════════════════════════════════
     // [P-CC-02] readFileState 双限 LRU 工厂 + 克隆
-    // 用户 2026-08-05 拍板"剩余拍板项严格和CC对齐": 100 条 / 25MB (CC = 100 / 25MB).
+    // 用户裁定"严格和CC对齐": 5000 条 / 25MB（对齐目标 CC 2.1.278: LC=5000 / T=26214400）.
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * [P-CC-02] readFileState 默认条目数上限 · <b>用户 2026-08-05 拍板严格对齐 CC</b>:
-     * 100. CC {@code utils/fileStateCache.ts:18} READ_FILE_STATE_CACHE_SIZE=100 直译,
-     * 撤销旧值 500 (L+ round 5 曾按"用户后续指令"放宽, 该指令全目录无记录, 无法追溯).
+     * [P-CC-02] readFileState 默认条目数上限 · <b>用户 2026-09-22 拍板对齐 CC 2.1.278</b>:
+     * 5000. CC 发行产物 {@code claude.exe}（{@code // Version: 2.1.278}）内嵌源码
+     * {@code var LC=5000,T=26214400,L=4096;}（字节 offset 199640137）——
+     * {@code LC} 即<b>活表</b>条目数上限，直译 = 5000。
+     *
+     * <p><b>⚠ 注释更正（本批·勿退回）</b>：原 javadoc 写「用户 2026-08-05 拍板严格对齐 CC: 100」
+     * 并引 {@code utils/fileStateCache.ts:18}。该引用属 <b>CC 2.1.88</b>（源码参照
+     * {@code Open-ClaudeCode/src/utils/fileStateCache.ts:18} 确为
+     * {@code READ_FILE_STATE_CACHE_SIZE = 100}）；<b>对齐目标 CC 2.1.278 已改为 5000</b>
+     * ⇒ 旧的「严格对齐 CC」措辞在目标版本变更后<b>失实</b>，本批按目标版本改写。
+     * 撤销的旧值 500（L+ round 5 曾按"用户后续指令"放宽）与本批的 5000 无关（数值巧合）。
+     *
+     * <p>WHY 5000（用户裁定理由）: 稍后的「跨进程 replay」（resume 时从会话消息历史重放 Read
+     * 调用重建缓存，CC 2.1.278 {@code restoreReadFileState→mergeReadFileStateFrom}）会一次性
+     * 灌入大量条目，100 条会被 LRU 立刻吃掉 ⇒ 容量须先对齐。
      */
-    public static final int READ_FILE_STATE_CACHE_SIZE = 100;
+    public static final int READ_FILE_STATE_CACHE_SIZE = 5000;
 
     /**
      * [P-CC-02] readFileState 默认字节上限 · <b>用户 2026-08-05 拍板严格对齐 CC</b>:
@@ -325,13 +337,14 @@ public record ToolUseContext(
      * 创建一个新的 readFileState 双限 LRU Cache · 行为对齐 CC
      * {@code utils/fileStateCache.ts:101-106} {@code createFileStateCacheWithSizeLimit(maxEntries, maxSizeBytes)}.
      *
-     * <p>默认配置 (调用无参): maxEntries=100, maxSizeBytes=25MB, weigher=Math.max(1, content 字节)
-     * — 用户 2026-08-05 拍板严格对齐 CC (CC=100/25MB).
+     * <p>默认配置 (调用无参): maxEntries=5000, maxSizeBytes=25MB, weigher=Math.max(1, content 字节)
+     * — 对齐目标 CC <b>2.1.278</b>（{@code claude.exe} 内嵌 {@code var LC=5000,T=26214400,L=4096;}
+     * off 199640137）；maxSize／weigher 两版一致，maxEntries 由 2.1.88 的 100 改标为 2.1.278 的 5000。
      *
      * <p><b>WHY 双限 (maxEntries + maxSizeBytes) 而非单限</b>: CC LRUCache 构造
      * (fileStateCache.ts:34-38) {@code max}/{@code maxSize} 同时强制, 任一超限即驱逐;
      * 旧实现 (L+ round 5) 因 Caffeine maximumSize/maximumWeight 互斥只设字节限,
-     * 条目数上限"隐式", 小文件场景可驻留远超 100 条 — 偏离 CC {@code max:100} 硬限.
+     * 条目数上限"隐式", 小文件场景可驻留远超 maxEntries — 偏离 CC {@code max} 硬限.
      *
      * <p><b>eviction 策略</b>: {@link FileStateCache} 用 {@code LinkedHashMap}
      * {@code accessOrder=true} 实现真 LRU (与 CC lru-cache 同序), 同步驱逐.
@@ -362,7 +375,7 @@ public record ToolUseContext(
      *
      * <p><b>WHY 沿用源容量而非默认容量</b>: CC :123
      * {@code createFileStateCacheWithSizeLimit(cache.max, cache.maxSize)} — clone 出来的
-     * 新 cache 用源 cache 当时构造的 max/maxSize; 生产全为默认容量 (100/25MB), 自定义
+     * 新 cache 用源 cache 当时构造的 max/maxSize; 生产全为默认容量 (5000/25MB), 自定义
      * 容量场景 (测试工厂) 也严格一致.
      *
      * <p><b>WHY entries() 而非 asMap()</b>: FileStateCache 方法面严格对齐 CC
@@ -531,9 +544,17 @@ public record ToolUseContext(
         //     WriteFileTool 都会 .set()); FileStateCache 自身是 thread-safe, 无需外层 ConcurrentHashMap.
         //     2) 不可变 Map.copyOf 会让 ReadFileTool dispatchText set 时抛 UnsupportedOperationException;
         //     FileStateCache set 无此限制.
-        //     3) 每次新建 ctx 默认独立 (per-session 隔离), createSubagentContext.create 显式 clone 父 ctx.
-        //     4) [P-CC-02] 双限真 LRU: maxEntries=100 + maxSizeBytes=25MB 防无界增长
-        //     (用户 2026-08-05 拍板严格对齐 CC).
+        //     3) ⛔ 注释更正（批 edit-gate-session-scope · E）：原写「每次新建 ctx 默认独立
+        //     (per-session 隔离)」—— 隔离粒度是 <b>per-ctx</b> 而<b>不是</b> per-session：
+        //     本构造器只保证「这个 ctx 对象」独立，不保证「同一会话的多个 ctx」互相独立。
+        //     同一会话的多个 ctx 是否共享 readFileState，取决于<b>实参是谁</b>：
+        //     - 实参为 null（本分支）⇒ 每次新建 = 各 ctx 独立（无会话身份时的降级行为）；
+        //     - 实参非 null ⇒ <b>原样持有引用</b>（下方 WHY 不复制传入 cache），可能是会话级共享表。
+        //     生产主链现在传 SessionReadFileStateRegistry.forSession(sessionId) ⇒ <b>同会话跨 run 共享</b>
+        //     （对齐 CC 两版），故第 3 条的旧措辞与生产事实相反。
+        //     createSubagentContext.create 显式 clone 父 ctx（真子代理独立副本）。
+        //     4) [P-CC-02] 双限真 LRU: maxEntries=5000 + maxSizeBytes=25MB 防无界增长
+        //     (对齐目标 CC 2.1.278: LC=5000 / T=26214400).
         // WHY 不复制传入 cache: FileStateCache 已 thread-safe 且本类不修改 cache 内容, 共享引用即可;
         //   如需独立 (subagent fork), 调用方走 cloneFileStateCache() 显式 clone.
         if (readFileState == null) {
@@ -1079,8 +1100,10 @@ public record ToolUseContext(
 
     /**
      * [Session L+ R1] ReadFileTool dedup 缓存条目 · 对齐 CC FileStateCache
-     * ({@code utils/fileStateCache.ts}) + FileState 5 字段
-     * (content / timestamp / offset / limit / isPartialView).
+     * ({@code utils/fileStateCache.ts}) + FileState 字段
+     * (content / timestamp / offset / limit / isPartialView)。
+     * <p>[批 rfs-replay-3b] 对齐目标 CC <b>2.1.278</b> 再加第 6 维
+     * {@code contentNotInModelContext}（见下方该组件 javadoc）—— 2.1.88 的 5 字段版已过时。
      *
      * <p>WHY R1 上提: dedup 状态从 ReadFileTool 实例字段上提到 TUC 字段 (Map&lt;String, ReadState&gt;),
      * 会话级 + 跨工具共享 (ReadFileTool / EditFileTool / WriteFileTool / BashTool 都能读写同一 cache),
@@ -1115,25 +1138,67 @@ public record ToolUseContext(
      * </ul>
     /**
      * <p><b>内存说明</b>: {@code content} 全量驻留, 大文件 / 长 session 会放大 ctx 内存.
-     * [P-CC-02] 双限真 LRU: maxEntries=100 + maxSizeBytes=25MB
+     * [P-CC-02] 双限真 LRU: maxEntries=5000 + maxSizeBytes=25MB
      * (weigher 只算 content 字节, 对齐 CC {@code fileStateCache.ts:37}).
-     * 100 条 + 25MB 双约束防无界增长; 用户 2026-08-05 拍板严格对齐 CC, 撤销旧 500/100MB.
+     * 5000 条 + 25MB 双约束防无界增长; 对齐目标 CC 2.1.278 (LC=5000 / T=26214400).
      */
     public record ReadState(
             long mtimeMillis,
             Integer offset,
             Integer limit,
             boolean isPartialView,
-            String content
+            String content,
+            // ── [批 rfs-replay-3b · 2 次修订] 内容来源标记 · CC original: contentNotInModelContext ──
+            // [跨进程 readFileState 恢复批次] 对齐目标 CC 2.1.278 发行产物。
+            // ⚠️ **消费点如实登记（来源分级：以下 CC 事实均为「我 dd 读发行产物看到」）**：
+            //   · CC 2.1.278 的 **Edit / Write / Notebook 三道门禁都不消费本字段** ——
+            //     Edit 门禁条件是 `if(!Ee||Ee.isPartialView)`（exe off 206605650）、
+            //     Write 门禁 `if(!he||he.isPartialView)`（exe off 203520944），两区间内
+            //     `contentNotInModelContext` 命中数 = **0**；Notebook 门禁只判 entry 是否存在
+            //     （`if(!N)return{...errorCode:9}`，exe off 206617118）。
+            //   · CC 真正的消费点只有两处：① `fle(e){return e!==void 0 && g2(e) &&
+            //     !e.contentNotInModelContext}`（exe off 199640396）= at-mention **已读短路** +
+            //     Edit/Write/Notebook/Write-if-read 的**写回打标**；② ProposeSkillsTool 的
+            //     read/unread 分类（`if(e===void 0||e.contentNotInModelContext||e.isPartialView)return"unread"`，
+            //     exe off 225888734）。发行产物里其余命中点**全部是写回**
+            //     （`...X&&{contentNotInModelContext:!0}`），不是判定。
+            //   ⇒ **本仓暂无对应消费点**：本字段目前**只由 replay 的 Edit 派生分支写入**
+            //     （{@code ReadFileStateReplay.merge} 的 Edit 支，值恒为 true）、**不被任何判定读取**。
+            //     是否接线（fle / ProposeSkillsTool 类消费）属**独立决策，已登记，本批不做**。
+            // 语义：本 entry 的 content **不是模型上下文里看到的那份**，而是从磁盘现读的
+            //   （CC 2.1.278 Edit 支写回：`{content:Uw(dn), ..., offset:void 0, limit:void 0,
+            //   ...Bn&&{contentNotInModelContext:!0}}`，exe off 206610258；同款还见
+            //   extractReadFilesFromMessages off 209691008 / seedReadState off 210526341
+            //   / MCP 资源读 off 218139133 —— 凡「内容取自磁盘而非模型上下文」一律打标）。
+            // ⛔ 与 isPartialView 语义**不重叠**（判据：CC 对二者是并列两个独立字段）：
+            //   isPartialView = 「模型只看到**部分**视图（memory/CLAUDE.md 注入，与磁盘不一致）」，
+            //   由 attachments 注入侧写；contentNotInModelContext = 「内容**不在模型上下文里**」
+            //   （哪怕是全文读了盘）。CC `g2` 只看 offset/isPartialView/limit，`fle` 才额外看本字段
+            //   （g2 定义 exe off 199640211，fle 定义 off 199640351）⇒ 两者是不同判据维度，⛔ 不得合并成一个 boolean。
+            boolean contentNotInModelContext
     ) {
+        /**
+         * 5 参兼容构造器 · {@code contentNotInModelContext} 显式默认 {@code false}。
+         *
+         * <p>[批 rfs-replay-3b] <b>WHY 保留 5 参重载</b>：既有调用点（本仓 ~40 处，含测试）表达的是
+         * 「内容就在模型上下文里」（memory 注入 / relevant-memory / changed_files 重同步 / 真实 Read），
+         * 语义上就是 {@code false}。保留一个<b>显式给默认值</b>的重载，比让每个既有调用点各自漏参
+         * 要安全（⛔ 不是「漏掉就 null」的隐式行为 —— 这里默认值是写死的 {@code false}）。
+         * 本仓先例：{@code ChatMessageDto} 的 20/21/34/35 参兼容构造器同款做法。
+         */
+        public ReadState(long mtimeMillis, Integer offset, Integer limit,
+                         boolean isPartialView, String content) {
+            this(mtimeMillis, offset, limit, isPartialView, content, false);
+        }
+
         /** 便利构造器: Edit/Write 写回 (无 content, 强制 LLM 重新 Read) — 对齐 CC {@code offset: undefined}. */
         public static ReadState full(long mtimeMillis) {
-            return new ReadState(mtimeMillis, null, null, false, null);
+            return new ReadState(mtimeMillis, null, null, false, null, false);
         }
 
         /** 便利构造器: Edit/Write 写回 (带 content 用于 stale-write 兜底) — 对齐 CC {@code FileEditTool.ts:520}. */
         public static ReadState full(long mtimeMillis, String content) {
-            return new ReadState(mtimeMillis, null, null, false, content);
+            return new ReadState(mtimeMillis, null, null, false, content, false);
         }
 
         /**
@@ -1147,12 +1212,12 @@ public record ToolUseContext(
          * 门禁 FileEditTool.ts:276, 且同 range 二次读可 dedup :549-553)。
          */
         public static ReadState window(long mtimeMillis, int offset, int limit) {
-            return new ReadState(mtimeMillis, offset, limit, false, null);
+            return new ReadState(mtimeMillis, offset, limit, false, null, false);
         }
 
         /** 便利构造器: 行窗口读 (带 content, 用于诊断) — isPartialView=false (同 GAP-C 语义). */
         public static ReadState window(long mtimeMillis, int offset, int limit, String content) {
-            return new ReadState(mtimeMillis, offset, limit, false, content);
+            return new ReadState(mtimeMillis, offset, limit, false, content, false);
         }
     }
 

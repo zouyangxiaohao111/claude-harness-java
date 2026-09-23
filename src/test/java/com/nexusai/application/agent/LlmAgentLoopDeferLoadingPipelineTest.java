@@ -30,15 +30,15 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * [H4] LlmAgentLoop 主循环 defer_loading 管线测试 · 对齐 CC claude.ts:1120-1243
- * （definitive 门控 + deferredToolNames 短路 + filteredTools + willDefer→defer_loading 发射）
- * + claude.ts:1330-1332（delta 门控 prepend）。
+ * （definitive 门控 + deferredToolNames 短路 + filteredTools + willDefer→defer_loading 发射）。
  *
  * <p>WHY: 主循环 schema 构建（{@code llmToolsArray}）此前无工具搜索概念——deferred 工具
  * 全量预声明、无 defer_loading 发射、无 beta header。本管线让 Java 具备 CC 动态工具加载
  * 闭环（未发现的 deferred 工具不进 schema；已发现的经 defer_loading 延迟发送）。
  *
- * <p>变异点：删 llmToolsArray 管线（短路/filteredTools/willDefer 任一）→ 对应断言变红；
- * 删 delta prepend → prepend 用例变红。
+ * <p>变异点：删 llmToolsArray 管线（短路/filteredTools/willDefer 任一）→ 对应断言变红。
+ * ⛔ 原 claude.ts:1330-1332 的 {@code <available-deferred-tools>} prepend 用例已随该通道按
+ * 2.1.278 删除一并移除。
  */
 class LlmAgentLoopDeferLoadingPipelineTest {
 
@@ -219,31 +219,6 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         assertThat(schemaNames(discovered.tools()))
                 .as("discovered 后 WebSearch 进 schema（懒加载发现闭环）")
                 .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebSearch");
-    }
-
-    @Test
-    @DisplayName("delta 门控 prepend：useToolSearch=true 且 delta 未启用 → 队首插入 <available-deferred-tools> 消息（claude.ts:1330-1332）")
-    void pipeline_deltaPrepend_metaMessageAtHead() {
-        // WHY: claude.ts:1330-1332 每轮 prepend 临时 <available-deferred-tools>（delta attachment
-        //   未启用时），让模型知道可动态发现哪些工具；formatDeferredToolLine = tool.name 排序 join。
-        ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
-        ChatMessageDto original = userMsgWithToolReference("WebSearch");
-        List<ChatMessageDto> messages = new java.util.ArrayList<>(List.of(original));
-
-        LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
-                tuc(available), QuerySource.USER, messages, SUPPORTED_MODEL);
-        List<ChatMessageDto> withDelta = assembly.prependAvailableDeferredTools(messages);
-
-        assertThat(withDelta).hasSize(2);
-        assertThat(withDelta.get(0).role()).isEqualTo(Role.user);
-        assertThat(withDelta.get(0).isMeta()).isTrue();
-        assertThat(withDelta.get(0).content())
-                .as("delta prepend 内容 = <available-deferred-tools> 包裹的排序 deferred 名")
-                .contains("<available-deferred-tools>")
-                .contains("WebSearch")
-                .contains("</available-deferred-tools>");
-        assertThat(withDelta.get(1)).isSameAs(original);
     }
 
     @Test

@@ -81,6 +81,20 @@ public class TeamDeleteTool implements Tool {
     @Autowired(required = false)
     private com.nexusai.application.agent.team.TeamStatusPublisher teamStatusPublisher;
 
+    /**
+     * [T2 · 会话分桶] leader 权限确认表面（Web STOMP ToolUseConfirm 队列）· 解散 team = 本会话 leader
+     * 角色结束 ⇒ 按 {@code effectiveLeadSessionId} 注销其 setter（与 TeamCreateTool 的注册成对）。
+     * 可选注入（规则 8，构造器不动）：未注入（测试/手动直构）→ 跳过注销，不破坏既有构造。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge leaderPermissionConfirmBridge;
+
+    /** 测试/接线用 setter（leaderPermissionConfirmBridge · leader 确认表面按会话注销）。 */
+    public void setLeaderPermissionConfirmBridge(
+            com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge bridge) {
+        this.leaderPermissionConfirmBridge = bridge;
+    }
+
     @Autowired
     public TeamDeleteTool(TeamHelpers teamHelpers) {
         this.teamHelpers = teamHelpers;
@@ -304,6 +318,13 @@ public class TeamDeleteTool implements Tool {
         //   清不掉任何键 ⇒ 团队解散后 leader 仍绑着已删的 team 任务板。effectiveLeadSessionId
         //   在 :257-258 已解析（config 尚在），与 setTeamContext 清理同源。保持 0 参重载不动。
         TaskService.clearLeaderTeamName(effectiveLeadSessionId);
+        // [T2 · 会话分桶] 本会话 leader 角色结束 ⇒ 注销其权限确认表面 setter（与 TeamCreateTool 注册成对；
+        //   effectiveLeadSessionId 已在 :257-258（config 尚在时）预解析，与上面 clearLeaderTeamName 同源）。
+        //   会话删除路径的兜底清理由 SessionService.delete → LeaderPermissionBridge.clearSession 承担。
+        if (leaderPermissionConfirmBridge != null
+                && effectiveLeadSessionId != null && !effectiveLeadSessionId.isBlank()) {
+            leaderPermissionConfirmBridge.unregisterSetter(effectiveLeadSessionId);
+        }
         // [team-frontend-channel] REST 路径无 ctx —— 会话列 teamContext 清理由 sessionId 显式承担
         // [team-panel-backend-bugfix 加固] sessionId 为空（REST 解散未传 / 旧数据无 ctx）→
         //   从 team config.leadSessionId 反查兜底清列（复用 effectiveLeadSessionId，防残留）。

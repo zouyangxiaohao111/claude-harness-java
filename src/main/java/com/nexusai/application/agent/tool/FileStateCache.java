@@ -11,7 +11,9 @@ import java.util.Map;
 /**
  * 文件状态缓存 · 对齐 CC {@code utils/fileStateCache.ts:30-93 FileStateCache}（Java 直译）。
  *
- * <p><b>CC original:</b> {@code utils/fileStateCache.ts:30-93}（2026-08-05 拍板严格对齐 CC）:
+ * <p><b>CC original:</b> {@code utils/fileStateCache.ts:30-93}（2026-08-05 拍板严格对齐 CC 的类结构
+ * 与双限语义；<b>条目数取值随【对齐目标版本】走</b> —— 对齐目标 CC 2.1.278 = {@code LC=5000}，
+ * 2.1.88 {@code fileStateCache.ts:18} = 100；字节上限两版一致 = 25MB）:
  * <pre>
  * export class FileStateCache {
  *   private cache: LRUCache&lt;string, FileState&gt;
@@ -30,9 +32,10 @@ import java.util.Map;
  *
  * <p><b>WHY 自写而非 Caffeine（规则三：CC 复杂 Java 就复杂）</b>: Caffeine 的
  * {@code maximumSize} 与 {@code maximumWeight} 互斥（requireState 强校验），单 cache 无法
- * 同时表达 CC 的"100 条 + 25MB"双限。旧实现（L+ round 5）只设 {@code maximumWeight}，
- * 条目数上限"隐式"（注释自述 maxEntries 仅作 API 对齐）——小文件场景可驻留远超 100 条，
- * 偏离 CC {@code max:100} 硬限（可观察：dedup 命中集不同）。自写双限 LRU 精确复刻
+ * 同时表达 CC 的"条目数上限 + 25MB"双限（对齐目标 CC 2.1.278: {@code LC=5000} / {@code T=26214400}）。
+ * 旧实现（L+ round 5）只设 {@code maximumWeight}，
+ * 条目数上限"隐式"（注释自述 maxEntries 仅作 API 对齐）——小文件场景可驻留远超上限，
+ * 偏离 CC {@code max} 硬限（可观察：dedup 命中集不同）。自写双限 LRU 精确复刻
  * CC 双限 + 真 LRU 驱逐序（Caffeine 是 W-TinyLFU 近似，LinkedHashMap accessOrder 是纯 LRU）。
  *
  * <p><b>weigher 对齐</b>（{@code fileStateCache.ts:37}）: {@code Math.max(1, content UTF-8 字节)}，
@@ -58,7 +61,7 @@ public final class FileStateCache {
 
     private static final Logger log = LoggerFactory.getLogger(FileStateCache.class);
 
-    /** 条目数上限（CC original: {@code max}，fileStateCache.ts:18 READ_FILE_STATE_CACHE_SIZE=100） */
+    /** 条目数上限（CC original: {@code max}；对齐目标 CC 2.1.278 为 {@code LC=5000}，2.1.88 fileStateCache.ts:18 为 100） */
     private final int maxEntries;
     /** 字节总量上限（CC original: {@code maxSize}，fileStateCache.ts:22 DEFAULT_MAX_CACHE_SIZE_BYTES=25MB） */
     private final long maxSizeBytes;

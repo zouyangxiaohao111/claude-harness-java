@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.permission;
 
 import com.nexusai.application.agent.permission.hook.CommandHookExecutor;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -309,6 +310,158 @@ public final class PermissionUpdates {
             ? List.of(new PermissionUpdate.SetMode(
                 PermissionUpdate.Destination.SESSION, PermissionMode.ACCEPT_EDITS))
             : List.of();
+    }
+
+    /**
+     * 本仓自有配置根（{@code .{appName}}）的<b>项目级</b>会话授权模式 ·
+     * <b>CC {@code CLAUDE_FOLDER_PERMISSION_PATTERN}（{@code '/.claude/**'}，
+     * {@code tools/FileEditTool/constants.ts:5}）的 {@code .{appName}} 对应物</b>。
+     *
+     * <p>⛔ <b>必须是方法不能是 static final 常量</b>：{@code appName} 运行时可变
+     * （{@link NexusaiPaths#setAppNameOverride} / {@code spring.application.name}），静态常量会在
+     * 应用名注入前固化（时序纪律同 {@code WritePermissionChecker#skillScopeRoots}）。
+     *
+     * @return {@code "/.{appName}/**"}
+     */
+    public static String projectSelfFolderPattern() {
+        return "/" + NexusaiPaths.getProjectDirName() + "/**";
+    }
+
+    /**
+     * 本仓自有配置根（{@code .{appName}}）的<b>全局（家目录）</b>会话授权模式 ·
+     * <b>CC {@code GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN}（{@code '~/.claude/**'}，
+     * {@code tools/FileEditTool/constants.ts:8}）的 {@code .{appName}} 对应物</b>。
+     *
+     * <p>动态理由同 {@link #projectSelfFolderPattern()}。
+     *
+     * @return {@code "~/.{appName}/**"}
+     */
+    public static String globalSelfFolderPattern() {
+        return "~/" + NexusaiPaths.getProjectDirName() + "/**";
+    }
+
+    /**
+     * 「编辑自有设置（本会话）」专用档 · CC {@code getFilePermissionOptions}
+     * （{@code components/permissions/FilePermissionDialog/permissionOptions.tsx:98-113}）
+     * + {@code handleAcceptSession}（{@code usePermissionHandler.ts:104-129}）的
+     * {@code .{appName}} 对应物。
+     *
+     * <h2>CC 语义（读 CC 源码，非注释）</h2>
+     * <ol>
+     *   <li><b>何时给出该档</b>（permissionOptions.tsx:98-113）：{@code isInClaudeFolder(filePath)}
+     *       （{@code <cwd>/.claude} 内）或 {@code isInGlobalClaudeFolder(filePath)}
+     *       （{@code <home>/.claude} 内）<b>且</b> {@code operationType !== 'read'}
+     *       ⇒ <b>替换</b>通用会话档（「Yes, allow all edits during this session」），
+     *       给出专用档；否则维持通用档（该文件的 else 支）。</li>
+     *   <li><b>该档的产物</b>（usePermissionHandler.ts:104-129）：scope 为 claude-folder 系时产出
+     *       {@code {type:'addRules', rules:[{toolName:'Edit', ruleContent: <pattern>}],
+     *       behavior:'allow', destination:'session'}} —— pattern =
+     *       {@code GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN}（{@code '~/.claude/**'}，constants.ts:8）
+     *       或 {@code CLAUDE_FOLDER_PERMISSION_PATTERN}（{@code '/.claude/**'}，:5）。</li>
+     * </ol>
+     *
+     * <p><b>本仓映射</b>：{@code <home>/.claude → NexusaiPaths.getAppConfigHomeDir()}
+     * （{@code ~/.{appName}}）；{@code <cwd>/.claude → <cwd>/.{appName}}；pattern →
+     * {@link #globalSelfFolderPattern()} / {@link #projectSelfFolderPattern()}。
+     * 两类都命中时<b>全局优先</b>（对齐 CC :111 {@code inGlobalClaudeFolder ? 'global-claude-folder'
+     * : 'claude-folder'}）。
+     *
+     * <p>⚠️ <b>判据是「严格在内」</b>（CC 两个判定都是 {@code startsWith(dir + sep)}）——
+     * 目标恰为自有根目录本身（如 {@code ~/.nexusai}）<b>不</b>算命中本档。
+     *
+     * @param filePath 目标路径（调用方已 expandPath 的绝对路径；可 null/blank → 空）
+     * @param cwd      会话工作目录（{@code <cwd>/.{appName}} 判定基；null/blank → 只判全局根）
+     * @return 专用档的 addRules；不在自有根内 → {@link Optional#empty()}（调用方回落通用档）
+     */
+    public static Optional<PermissionUpdate.AddRules> selfConfigRootRuleSuggestion(
+            String filePath, String cwd) {
+        if (filePath == null || filePath.isBlank()) {
+            return Optional.empty();
+        }
+        String pattern;
+        if (isStrictlyInsideDir(filePath, NexusaiPaths.getAppConfigHomeDir())) {
+            pattern = globalSelfFolderPattern();
+        } else if (cwd != null && !cwd.isBlank()
+                && isStrictlyInsideDir(filePath, stripTrailingSlash(toPosixPath(cwd))
+                    + "/" + NexusaiPaths.getProjectDirName())) {
+            pattern = projectSelfFolderPattern();
+        } else {
+            if (log.isDebugEnabled()) {
+                log.debug("[PermissionUpdates] 自有设置专用档判据未命中（非自有根内）: filePath={} cwd={}",
+                    filePath, cwd);
+            }
+            return Optional.empty();
+        }
+        PermissionRule rule = new PermissionRule(
+            PermissionRuleSource.SESSION, PermissionBehavior.ALLOW,
+            PermissionRuleValue.withContent("Edit", pattern));
+        if (log.isDebugEnabled()) {
+            log.debug("[PermissionUpdates] 自有设置专用档产出 addRules: filePath={} ruleContent={} destination=session",
+                filePath, pattern);
+        }
+        return Optional.of(new PermissionUpdate.AddRules(
+            PermissionUpdate.Destination.SESSION, List.of(rule), PermissionBehavior.ALLOW));
+    }
+
+    /**
+     * 写侧 ask 的档位建议 · CC {@code getFilePermissionOptions} 的「档位二」决策
+     * （permissionOptions.tsx:105-150）在 Java 侧的落点。
+     *
+     * <h2>CC 语义（读源码，非注释）</h2>
+     * <p>CC 在同一处做<b>二选一</b>：目标在自有根内且非 read ⇒ 专用档；否则 ⇒ 通用会话档
+     * （{@code generateSuggestions} 的 write 分支 = SetMode(acceptEdits) [+ AddDirectories]）。
+     * 本方法把该二选一收成<b>单点</b>：命中自有根 ⇒ <b>只给专用档一条</b>（替换，不是追加）；
+     * 未命中 ⇒ 回落 {@link #generateSuggestions}。
+     *
+     * @param filePath            目标路径（调用方已 expandPath）
+     * @param mode                当前权限模式（回落 generateSuggestions 用）
+     * @param isOutsideWorkingDir 是否在工作目录外（回落 generateSuggestions 用）
+     * @param cwd                 会话工作目录（自有根的项目级判定基）
+     * @return 建议列表（专用档一条 或 通用档；空列表仅当 filePath 为 null）
+     */
+    public static List<PermissionUpdate> writeAskSuggestions(
+            String filePath, PermissionMode mode, boolean isOutsideWorkingDir, String cwd) {
+        Optional<PermissionUpdate.AddRules> dedicated = selfConfigRootRuleSuggestion(filePath, cwd);
+        if (dedicated.isPresent()) {
+            if (log.isInfoEnabled()) {
+                // [SELF_CONFIG_ROOT_OPTION] = ASCII 计数锚（验收 grep -ac 用）
+                log.info("[PermissionUpdates] 自有设置专用档命中 [SELF_CONFIG_ROOT_OPTION]:"
+                        + " filePath={} ruleContent={} destination=session",
+                    filePath, dedicated.get().rules().get(0).ruleValue().ruleContent());
+            }
+            return List.of(dedicated.get());
+        }
+        return generateSuggestions(filePath, OperationType.WRITE, mode, isOutsideWorkingDir);
+    }
+
+    /**
+     * 目标是否<b>严格落在</b>给定目录之内（不含目录本身）· CC {@code isInClaudeFolder} /
+     * {@code isInGlobalClaudeFolder}（permissionOptions.tsx:15-40）的
+     * {@code normalizedPath.startsWith(dir + sep)} 对应物（Windows 大小写不敏感，
+     * 对齐 CC {@code normalizeCaseForComparison}）。
+     */
+    private static boolean isStrictlyInsideDir(String filePath, String dir) {
+        String target = toPosixPath(filePath);
+        String root = stripTrailingSlash(toPosixPath(dir));
+        if (target == null || root == null || root.isEmpty()) {
+            return false;
+        }
+        boolean windows = CommandHookExecutor.isWindows();
+        String t = windows ? target.toLowerCase(java.util.Locale.ROOT) : target;
+        String r = windows ? root.toLowerCase(java.util.Locale.ROOT) : root;
+        return t.startsWith(r + "/");
+    }
+
+    /** 去尾部 '/'（{@code "a/b/"} → {@code "a/b"}）；null → null。 */
+    private static String stripTrailingSlash(String s) {
+        if (s == null) {
+            return null;
+        }
+        int end = s.length();
+        while (end > 0 && (s.charAt(end - 1) == '/' || s.charAt(end - 1) == '\\')) {
+            end--;
+        }
+        return s.substring(0, end);
     }
 
     /**

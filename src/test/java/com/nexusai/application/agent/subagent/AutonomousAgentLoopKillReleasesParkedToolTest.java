@@ -98,6 +98,8 @@ class AutonomousAgentLoopKillReleasesParkedToolTest {
         final CountDownLatch parked = new CountDownLatch(1);
         final AtomicReference<PermissionResult> released = new AtomicReference<>();
         volatile AbortController capturedBridge;
+        /** [T1] runOneTurn 透传的 Leader 归属父 TUC（保持签名一致的捕获位，本用例不断言其值）。 */
+        volatile ToolUseContext capturedLeaderParentTuc;
 
         ParkingExecutor(WebSocketPermissionPrompter prompter) {
             super(null, null, null, null, null, "fallback-model", "fallback-prompt");
@@ -105,15 +107,20 @@ class AutonomousAgentLoopKillReleasesParkedToolTest {
         }
 
         @Override
-        public SubagentResult executeStreaming(String prompt, String subagentType, String modelOverride,
+        public SubagentResult executeTeammateTurn(String prompt, String subagentType, String modelOverride,
                                                ForkPathParams forkParams,
                                                Consumer<SubagentMessage> messageSink,
                                                AbortController abortControllerOverride,
+                                               ToolUseContext parentTucOverride,
                                                TeammateIdentity teammateIdentityOverride) {
             // 捕获 runOneTurn 透传的 work 桥（= 工具 TUC 的 abortController）
             this.capturedBridge = abortControllerOverride;
+            // [T1] 捕获 runOneTurn 透传的 Leader 归属父 TUC（本用例不依赖其值，仅保持签名一致）
+            this.capturedLeaderParentTuc = parentTucOverride;
             AbortController bridge = abortControllerOverride != null
                 ? abortControllerOverride : AbortController.NOOP;
+            // ⚠ 本替身刻意仍用 NO_SESSION 哨兵构造工具 TUC：本用例验的是「kill 释放 park 住的工具」，
+            //   与 teammate 会话归属无关；真实归属链由 TeammateLeaderSessionInheritanceTest 守。
             ToolUseContext toolTuc = ToolUseContext.of(UUID.randomUUID(), NO_SESSION_SENTINEL,
                 PermissionMode.DEFAULT, List.of(), null, bridge);
             parked.countDown();

@@ -113,7 +113,10 @@ class CompactCommandCcContractTest {
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, abort,
             sm, new MicroCompactor(), reactive, () -> cc, notifyCompaction, () -> { },
             tuc, sysCtx, defaultAssemble, customSystemPrompt, null, useGlobalCacheScope,
-            promptCacheBreakDetectionGate, null);  // [批 5a-2] warningPushContext
+            promptCacheBreakDetectionGate, null,  // [批 5a-2] warningPushContext
+            // [compact-signal-fix] progressSink = 既有事件收集器（全部调用点恒传非 null 列表）⇒
+            //   SM 分支的 compact_end 与 compactConversation 路径事件进同一列表，可断言。
+            events::add);
     }
 
     /**
@@ -132,7 +135,9 @@ class CompactCommandCcContractTest {
         cc.setSummaryProducer(producer);
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, new AbortController(),
             sm, new MicroCompactor(), null, () -> cc, () -> { }, () -> { },
-            null, null, null, null, null, false, () -> false, pushCtx);
+            null, null, null, null, null, false, () -> false, pushCtx,
+            // [compact-signal-fix] 本 helper 不收集事件 ⇒ 传 null（构造器归一为 no-op）。
+            null);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -463,9 +468,12 @@ class CompactCommandCcContractTest {
         CompactWarningState.clearCompactWarningSuppression(null, null);
 
         List<String> notifyCalls = new ArrayList<>();
+        // [compact-signal-fix] 显式持有事件列表：helper 已把它接为 progressSink，用于断言 SM 分支
+        //   补发的 compact_end（前端压缩进度横幅的置 done 事件）。
+        List<CompactProgressEvent> events = new ArrayList<>();
         CompactCommandContext c = ctx(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
             smService, null, (m, p, t) -> { throw new IllegalStateException("SM 优先不应走摘要"); },
-            new ArrayList<>(), new AbortController(), () -> notifyCalls.add("compact:agent-1"));
+            events, new AbortController(), () -> notifyCalls.add("compact:agent-1"));
 
         CompactCommand.CompactCommandResult result = CompactCommand.call("", c);
 
@@ -487,6 +495,85 @@ class CompactCommandCcContractTest {
         assertThat(CompactWarningState.isCompactWarningSuppressed(SESSION)).isTrue();
         // displayText（SM 路径 buildDisplayText(context)，无 userDisplayMessage）
         assertThat(result.displayText()).isEqualTo("Compacted (ctrl+o to see full summary)");
+        // [compact-signal-fix] SM 分支进度信号：**恰一对** start+end，且**顺序**为 start→end。
+        //   WHY：start 置前端 running 态（输入框发送键变「停止」，压缩可取消）；end 置 done
+        //   （compactProgress.ts:115-121）。running 态无超时兜底 ⇒ 必须成对，缺 end 会把发送键
+        //   永久卡成停止键（要 F5 才恢复）。containsExactly 同时钉死数量与顺序（多一个/少一个/顺序反
+        //   都红）。
+        assertThat(events).containsExactly(
+            new CompactProgressEvent.CompactStart(),
+            new CompactProgressEvent.CompactEnd());
+    }
+
+    @Test
+    @DisplayName("[compact-signal-fix] SM 返回 null 回落传统分支 → SM 的 start 仍被 end 闭合（前两事件恰为 start,end）")
+    void smNullFallback_closesSmStartWithEnd(@TempDir Path baseDir) {
+        // WHY（规则 9 · 验证意图）：前端 running 态**无超时兜底** —— compactProgress.ts 里只有
+        //   compact_end 分支带 hideAfterMs（其余恒 null）。若 end 只在「SM 成功」分支里发，则
+        //   「SM 返回 null 回落传统分支」这条路会留下悬空 start ⇒ App.tsx:439 的 compactActive
+        //   恒真 ⇒ 输入框发送键永久卡成停止键。故断言：SM 的 start 之后**紧跟同一次尝试的 end**。
+        // RED teeth：把 end 从 finally 挪回成功分支 ⇒ 本用例 events.get(1) 不再是 CompactEnd，必红。
+        SessionMemoryService smReturnsNull = new SessionMemoryService(baseDir) {
+            @Override
+            public com.nexusai.application.agent.compact.CompactionResult trySessionMemoryCompaction(
+                    List<ChatMessageDto> messages, String sessionId, String agentId,
+                    Integer autoCompactThreshold) {
+                return null;   // 模拟「无 session memory / 无模板内容 / 超阈回落」
+            }
+        };
+        List<CompactProgressEvent> events = new ArrayList<>();
+        CompactCommandContext c = ctx(
+            List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo"),
+                msg("m3", Role.user, "again"), msg("m4", Role.assistant, "ok")),
+            smReturnsNull, null,
+            (m, p, t) -> new CompactConversation.SummaryResult("traditional summary", null),
+            events, new AbortController(), () -> { });
+
+        CompactCommand.CompactCommandResult result = CompactCommand.call("", c);
+
+        assertThat(result.compactionResult())
+            .as("SM 返回 null 后传统分支确实跑完（不是靠异常提前结束）").isNotNull();
+        assertThat(events).hasSizeGreaterThanOrEqualTo(2);
+        assertThat(events.get(0)).as("SM 尝试**之前**必须发 compact_start")
+            .isEqualTo(new CompactProgressEvent.CompactStart());
+        assertThat(events.get(1)).as("SM 的 start 必须紧跟同一次尝试的 compact_end（finally 成对收口）")
+            .isEqualTo(new CompactProgressEvent.CompactEnd());
+    }
+
+    @Test
+    @DisplayName("[compact-signal-fix] SM 链抛异常 → 异常照常上抛（不吞）且 start/end 成对（end 在 start 之后）")
+    void smThrows_stillPairedStartEnd_andExceptionPropagates(@TempDir Path baseDir) {
+        // WHY（规则 9 · 验证意图）：压缩**异常**路径同样不能让 running 态悬空 —— 一次失败的压缩
+        //   若把发送键永久卡成停止键，比压缩失败本身更糟。同时异常**不得被 finally 吞掉**：
+        //   外层 catch 还要做 CC 四分支错误翻译（compact.ts:125-135）。
+        // RED teeth：把 end 挪出 finally（只留成功分支）⇒ 本用例事件列表里没有 CompactEnd，必红。
+        SessionMemoryService smThrows = new SessionMemoryService(baseDir) {
+            @Override
+            public com.nexusai.application.agent.compact.CompactionResult trySessionMemoryCompaction(
+                    List<ChatMessageDto> messages, String sessionId, String agentId,
+                    Integer autoCompactThreshold) {
+                throw new IllegalStateException("sm boom");
+            }
+        };
+        List<CompactProgressEvent> events = new ArrayList<>();
+        CompactCommandContext c = ctx(
+            List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")),
+            smThrows, null,
+            (m, p, t) -> { throw new IllegalStateException("SM 抛异常时不应触达传统分支"); },
+            events, new AbortController(), () -> { });
+
+        assertThatThrownBy(() -> CompactCommand.call("", c))
+            .as("异常必须照常向上传播（finally 只发事件、不 catch）：被外层翻译为 "
+                + "'Error during compaction: …'（compact.ts:132-134）")
+            .isInstanceOf(IllegalArgumentException.class)
+            .hasMessage("Error during compaction: sm boom");
+
+        assertThat(events)
+            .as("异常路径也要成对闭合：start 与 end 都在")
+            .contains(new CompactProgressEvent.CompactStart(), new CompactProgressEvent.CompactEnd());
+        assertThat(events.indexOf(new CompactProgressEvent.CompactStart()))
+            .as("end 必须在 start 之后（不存在「只有 end 没有 start」的错序）")
+            .isLessThan(events.indexOf(new CompactProgressEvent.CompactEnd()));
     }
 
     // ════════════════════════════════════════════════════════════════════

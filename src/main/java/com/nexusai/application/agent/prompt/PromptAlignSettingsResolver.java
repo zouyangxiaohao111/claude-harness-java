@@ -1,7 +1,6 @@
 package com.nexusai.application.agent.prompt;
 
 import com.nexusai.application.agent.coordinator.CoordinatorMode;
-import com.nexusai.application.agent.toolsearch.ToolSearchService;
 import com.nexusai.repository.settings.entity.SettingsRecord;
 import com.nexusai.repository.settings.mapper.SettingsMapper;
 import org.slf4j.Logger;
@@ -11,13 +10,18 @@ import org.springframework.beans.factory.annotation.Autowired;
 /**
  * 提示词对齐门控统一实时读源 · [prompt-align G0-03 V56] settings 单行多列直读。
  *
- * <p><b>WHY 存在（唯一目标）</b>: 提示词装配链各门控（task_reminder / deferred_tools_delta /
- * boundary / proactive / coordinator / skill_search_intent / scratchpad / frc /
- * agent_main_thread / verify_plan_reminder + language / output_style 两段注入）此前只有
+ * <p><b>WHY 存在（唯一目标）</b>: 提示词装配链各门控（task_reminder / boundary / proactive /
+ * coordinator / skill_search_intent / scratchpad / frc / agent_main_thread /
+ * verify_plan_reminder + language / output_style 两段注入）此前只有
  * env（FeatureFlags）+ 硬编码默认 + 既有判定类 三条来源，DB 无可配列。本类承载 settings
- * 12 列的<b>实时读取</b>——每次 {@link SettingsMapper#selectOneById(java.io.Serializable)} 单行（id=1，
+ * 11 列的<b>实时读取</b>——每次 {@link SettingsMapper#selectOneById(java.io.Serializable)} 单行（id=1，
  * settings 单行多列），不缓存（前端 PUT /api/v1/settings 后下一轮即生效，对齐 V42
  * agent_swarms_enabled "前端开关→PUT→DB→实时读源" 权威先例）。
+ *
+ * <p><b>口径：这里的「11」是【本类的读集】</b>（12 − 已退役的 {@code deferred_tools_delta_enabled}
+ * —— 其读方法 {@code deferredToolsDeltaEnabled()} 已随 2.1.278 对齐删除；该 DB 列本身亦已由
+ * V77 迁移 {@code DROP COLUMN} 清除）。{@code SettingsService} 的 merge / 回显（透出）集同步收为
+ * 11 列 ⇒ <b>三处（本类读集 / merge 集 / 透出集）现同为 11 列，不再有数字分歧</b>。
  *
  * <h2>回落语义（null = 未配置/行缺失/异常）</h2>
  * <p>所有方法返回 <code>Boolean</code>/<code>String</code> 可空：null = DB 无值 → 调用方
@@ -146,18 +150,6 @@ public class PromptAlignSettingsResolver {
     public Boolean taskReminderEnabled() {
         SettingsRecord row = resolveSettingsRow();
         return row != null ? row.getTaskReminderEnabled() : null;
-    }
-
-    /**
-     * 实时读 {@code settings.deferred_tools_delta_enabled} · CC original:
-     * deferred_tools_delta 系统提示附件（utils/messages.ts:4178-4195，deferred 工具新增/移除
-     * delta 注入）。
-     *
-     * @return true/false = DB 有值；null = 未配置（回落当前 gate，OPD-H-06 默认关）
-     */
-    public Boolean deferredToolsDeltaEnabled() {
-        SettingsRecord row = resolveSettingsRow();
-        return row != null ? row.getDeferredToolsDeltaEnabled() : null;
     }
 
     /**
@@ -311,34 +303,6 @@ public class PromptAlignSettingsResolver {
         return r != null ? r.systemPromptBoundaryEnabled() : null;
     }
 
-    /**
-     * [dtd-cfg] deferred_tools_delta 门控 <b>统一判定（唯一真源）</b>：把「外圈 DB 覆盖」与
-     * 「内圈 env 门」合并为一个判定，供主循环 / 压缩内圈 / prepend 三处共用。
-     *
-     * <p><b>WHY 存在</b>：此前该判定分裂成两份——主循环经
-     * {@code LlmAgentLoop.deferredToolsDeltaGate(ctx)}（DB 覆盖，:3645-3662），而压缩内圈
-     * {@code PostCompactAttachmentRestorer}（:1412/:1639）与主循环 prepend（{@code LlmAgentLoop:11708}）
-     * 各读 env-only 拷贝。结果是 DB 打开、env 关（生产默认即此）时：外圈发 delta 附件，内圈
-     * 压缩重宣布被 env 门挡掉、prepend 又照发全量清单 → 开关空转 + 双发。此处收敛为一处。
-     *
-     * <p><b>语义（CC {@code toolSearch.ts:629-634}）</b>：true → 用持久化增量附件
-     * {@code deferred_tools_delta} 公告 deferred 工具；false → 每轮在消息队首 prepend 全量
-     * {@code <available-deferred-tools>} 清单。默认 false。
-     *
-     * <p><b>取值链</b>：DB {@code settings.deferred_tools_delta_enabled}（经静态槽位
-     * {@link #staticResolver}，即 ToolRegistrationConfig 接线的主 bean，与 ctx.sessionState()
-     * 的 resolver 同一实例）有值即用；null（未配置 / 无 Spring 上下文 / 行缺失）→ 回落
-     * {@link ToolSearchService#isDeferredToolsDeltaEnabled()}（env {@code USER_TYPE=ant}，
-     * 生产默认非 ant = false）。保留 env 兜底 = 对齐 CC 的 ant 开发通道，生产默认 false。
-     *
-     * @return true = delta 增量附件路径；false = 每轮 prepend 全量清单（默认）
-     */
-    public static boolean staticDeferredToolsDeltaEnabled() {
-        PromptAlignSettingsResolver r = staticResolver;
-        Boolean v = (r == null) ? null : r.deferredToolsDeltaEnabled();
-        return (v != null) ? v : ToolSearchService.isDeferredToolsDeltaEnabled();
-    }
-
     // ────────────────────────────────────────────────────────────────────────
     // [coordinator-cfg] coordinator 模式门控 · 统一判定（唯一真源）
     // ────────────────────────────────────────────────────────────────────────
@@ -461,7 +425,7 @@ public class PromptAlignSettingsResolver {
 
     /**
      * 静态槽位便捷重载 · DB 读源 = {@link #staticResolver}（ToolRegistrationConfig 接线的主 bean，
-     * 与 ctx.sessionState() 的 resolver 同一实例，同 {@link #staticDeferredToolsDeltaEnabled()}）。
+     * 与 ctx.sessionState() 的 resolver 同一实例）。
      * 供无 ctx 的静态门（工具池裁剪 / bare 追加 / 权限上下文 / 子代理 summary / fork 互斥）调用。
      *
      * @param envFeatureFallback feature+env 回落层（各调用方的 CoordinatorMode 持有物）

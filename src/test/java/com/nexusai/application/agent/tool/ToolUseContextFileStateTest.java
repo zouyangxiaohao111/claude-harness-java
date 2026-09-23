@@ -13,15 +13,16 @@ import static org.assertj.core.api.Assertions.assertThat;
  * [P-CC-02] readFileState 双限真 LRU（{@link FileStateCache}）容量配置 + 驱逐行为验证.
  *
  * <p><b>WHY（意图验证 · CLAUDE.md 规则九）</b>:
- * 验证 FileStateCache 双限（maxEntries=100 + maxSizeBytes=25MB）<b>同时</b>生效 ——
+ * 验证 FileStateCache 双限（maxEntries + maxSizeBytes=25MB）<b>同时</b>生效 ——
+ * （条目数上限随【对齐目标版本】走：本批 CC 2.1.278 = 5000；maxSize 两版一致 = 25MB）
  * 任一超限立即驱逐最久未访问 entry（LRU）。若有人把任一上限调大一个量级, 测试必须能区分.
  * 双限语义对齐 CC {@code utils/fileStateCache.ts:34-38}（LRUCache {@code max}/{@code maxSize}
  * 同时强制, 任一超限即驱逐）。
  *
  * <p>覆盖维度:
  * <ol>
- *   <li><b>条目数上限</b> — 插入 150 条 1 字节 entry → 恰留 100 条（CC max:100 硬限；
- *       旧 Caffeine maximumWeight-only 实现 150 条全留, 本用例 RED）</li>
+ *   <li><b>条目数上限</b> — 插入 maxEntries+50 条 1 字节 entry → 恰留 maxEntries 条
+ *       （CC {@code max} 硬限；旧 Caffeine maximumWeight-only 实现全留, 本用例 RED）</li>
  *   <li><b>字节总量上限</b> — 累积 >25MB → 按 LRU 驱逐（CC maxSize:25MB 硬限）</li>
  *   <li><b>单条超限</b> — 单条 >25MB → set 入口 reject（lru-cache maxEntrySize 拒绝：
  *       删除已有同 key、不插入、不驱逐其它 entry）</li>
@@ -34,30 +35,37 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ToolUseContextFileStateTest {
 
     /**
-     * [P-CC-02] 条目数硬限（CC max:100）——旧实现（Caffeine maximumWeight-only, maxEntries 仅
-     * "API 对齐"）在此场景 150 条全留, 本用例为真实 RED。
+     * [P-CC-02] 条目数硬限（CC {@code max}；对齐目标 2.1.278 = {@code LC=5000}）——旧实现
+     * （Caffeine maximumWeight-only, maxEntries 仅 "API 对齐"）在此场景全留, 本用例为真实 RED。
      */
     @Test
-    @DisplayName("条目数上限 100: 150 条 1 字节 entry → 恰留 100 条（CC max:100 硬限, 最旧 50 条驱逐）")
-    void maxEntries100EvictsOldestWhenOver100() {
+    @DisplayName("条目数上限: 超限必驱逐最旧（上限 = READ_FILE_STATE_CACHE_SIZE，本批对齐 2.1.278 = 5000）")
+    void maxEntriesEvictsOldestWhenOverLimit() {
+        // [rfs-align-3a] 本条不再写死 100：容量随【对齐目标版本】走（CC 2.1.278 = LC=5000）。
+        //   本用例守的是【机制】——超条目数限必驱逐、且驱逐最旧；值本身由
+        //   ToolUseContextReadFileStateTest#readFileStateCacheSizeIsCc5000 与
+        //   SessionReadFileStateRegistryTest#sessionCache_keepsCcDualLimitLru 钉死。
+        //   用常量而非字面量：下次目标版本再变时本条无需再改（旧名 maxEntries100EvictsOldestWhenOver100）。
+        final int cap = ToolUseContext.READ_FILE_STATE_CACHE_SIZE;
+        final int over = 50;
         FileStateCache cache = ToolUseContext.createFileStateCache();
-        IntStream.range(0, 150).forEach(i ->
+        IntStream.range(0, cap + over).forEach(i ->
             cache.set("path/file_" + i + ".java",
                 new ToolUseContext.ReadState(0L, null, null, false, "x")));
-        // 双限: 150 条 × 1B = 150B << 25MB（字节限不触发）→ 由条目数限驱逐到 100
+        // 双限: (cap+over) 条 × 1B << 25MB（字节限不触发）→ 由条目数限驱逐到 cap
         assertThat(cache.size())
-            .as("150 条 > maxEntries=100, 应驱逐最旧 50 条, 恰留 100 条")
-            .isEqualTo(100);
+            .as("超出 maxEntries 时应驱逐最旧 %d 条, 恰留 maxEntries 条", over)
+            .isEqualTo(cap);
         assertThat(cache.get("path/file_0.java"))
             .as("最早插入的 key 应被驱逐 (LRU 末尾淘汰)")
             .isNull();
-        assertThat(cache.get("path/file_49.java"))
-            .as("第 50 条也已被驱逐（恰留 file_50..file_149）")
+        assertThat(cache.get("path/file_" + (over - 1) + ".java"))
+            .as("被驱逐段的最后一条也应为 null")
             .isNull();
-        assertThat(cache.get("path/file_50.java"))
-            .as("第 51 条开始保留")
+        assertThat(cache.get("path/file_" + over + ".java"))
+            .as("驱逐段之后第一条应保留")
             .isNotNull();
-        assertThat(cache.get("path/file_149.java"))
+        assertThat(cache.get("path/file_" + (cap + over - 1) + ".java"))
             .as("最近插入的 key 必须保留")
             .isNotNull();
     }
@@ -183,7 +191,7 @@ class ToolUseContextFileStateTest {
                 new ToolUseContext.ReadState(System.currentTimeMillis(), 999, 999, true, null));
         }
         assertThat(cache.size())
-            .as("100 条 null content entry: 每条 weight=1, 累计 100 字节 << 25MB 且条数 ≤ 100 → 全留")
+            .as("100 条 null content entry: 每条 weight=1, 累计 100 字节 << 25MB 且条数 ≤ maxEntries → 全留")
             .isEqualTo(100);
     }
 
@@ -279,7 +287,8 @@ class ToolUseContextFileStateTest {
             .as("父 delete 后, 子 cache 仍持有 a.txt (clone 时已 fork)")
             .isNotNull();
 
-        // 验证子 cache 也受双限约束 (沿用父 100/25MB)
+        // 验证子 cache 也受双限约束
+        //   (沿用父的 ToolUseContext.READ_FILE_STATE_CACHE_SIZE 条 = 5000，对齐目标 CC 2.1.278；字节上限 25MB)
         for (int i = 0; i < 200; i++) {
             child.set("path_" + i + ".txt",
                 new ToolUseContext.ReadState(0L, null, null, false, "x".repeat(600 * 1024)));

@@ -4,6 +4,7 @@ import com.nexusai.application.agent.permission.PermissionUpdate;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -24,8 +25,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   <li>守卫 {@code isTeamLeader}（对齐 CC useInboxPoller :253 isTeamLead 才处理 permission_request）</li>
  *   <li>读 leader 自身邮箱（{@link SwarmPermissionSync#getLeaderName}，对齐 CC getAgentNameToPoll
  *       :81-105 的 leader 分支 leadName || 'team-lead'）</li>
- *   <li>permission_request → {@link LeaderPermissionBridge#getLeaderToolUseConfirmQueue()} 取
- *       队列 setter（对齐 CC :259 getLeaderToolUseConfirmQueue）：
+ *   <li>permission_request → {@link LeaderPermissionBridge#getLeaderToolUseConfirmQueue(String)} 取
+ *       <b>本会话桶</b>的队列 setter（对齐 CC :259 getLeaderToolUseConfirmQueue；[T2] 起按 team config
+ *       {@code leadSessionId} 分桶，⛔ 不跨会话借用其它会话的表面）：
  *       <ul>
  *         <li>无 setter → log + 自动 deny（<b>R1 降级</b>：mailbox 请求无 STOMP 会话；不悬挂 worker，
  *             对齐 CC :346-350 的 ToolUseConfirmQueue unavailable 丢弃语义 + 免悬挂增强）</li>
@@ -54,6 +56,19 @@ public class SwarmLeaderPermissionDispatcher {
     private final AtomicBoolean processing = new AtomicBoolean(false);
 
     /**
+     * [T2 · 会话分桶] team config {@code leadSessionId} 解析（leader ToolUseConfirm setter 的桶键）·
+     * required=false 容错（测试直构无 Spring 上下文 → null → 无法定位本会话表面 → 走 R1 自动 deny，
+     * 与「该会话无确认表面」同语义，不误借其它会话的表面）。
+     */
+    @Autowired(required = false)
+    private TeamHelpers teamHelpers;
+
+    /** 测试/接线用 setter（teamHelpers · leadSessionId 分桶键解析）。 */
+    public void setTeamHelpers(TeamHelpers teamHelpers) {
+        this.teamHelpers = teamHelpers;
+    }
+
+    /**
      * 单次 leader inbox 分发 · 可测入口（Spring {@code @Scheduled} 的 {@link #poll()} 委托于此）。
      *
      * @return 本次处理的消息条数（permission_request + sandbox_permission_request）
@@ -75,6 +90,18 @@ public class SwarmLeaderPermissionDispatcher {
             if (leaderName == null || leaderName.isBlank()) {
                 return 0;
             }
+            // [T2 · 会话分桶] 本 team 的 leader 会话 = leader ToolUseConfirm setter 的桶键
+            //   （TeamCreateTool.buildConfigJson 落盘 leadSessionId，与本 dispatch 同源 team）。
+            //   ⛔ 不设「全局兜底桶」：解析不出 ⇒ 该会话无确认表面 ⇒ 下面走 R1 自动 deny。
+            String leadSessionId = teamHelpers != null ? teamHelpers.leadSessionId(teamName) : null;
+            if (leadSessionId == null || leadSessionId.isBlank()) {
+                log.warn("[SwarmLeader] team={} 解析不出 leadSessionId（会话桶键）⇒ 本 team 的权限请求"
+                    + "无确认表面（teamHelpers 注入={}），将走自动 deny 降级",
+                    teamName, teamHelpers != null);
+            } else if (log.isDebugEnabled()) {
+                // 数据流日志：本 team 的权限请求将被路由到哪个会话的表面（分桶键可见）
+                log.debug("[SwarmLeader] team={} 权限请求表面桶键 leadSessionId={}", teamName, leadSessionId);
+            }
             List<TeammateMailbox.TeammateMessage> all = TeammateMailbox.readMailbox(leaderName, teamName);
             int handled = 0;
             for (int i = 0; i < all.size(); i++) {
@@ -87,7 +114,7 @@ public class SwarmLeaderPermissionDispatcher {
                 if (permReq != null) {
                     // 对齐 CC :403 markMessageAsReadByIndex（处理即已读，防重复分发）
                     TeammateMailbox.markMessageAsReadByIndex(leaderName, teamName, i);
-                    handlePermissionRequest(permReq, teamName);
+                    handlePermissionRequest(permReq, teamName, leadSessionId);
                     handled++;
                     continue;
                 }
@@ -95,7 +122,7 @@ public class SwarmLeaderPermissionDispatcher {
                         TeammateMailbox.isSandboxPermissionRequest(msg.text());
                 if (sandboxReq != null) {
                     TeammateMailbox.markMessageAsReadByIndex(leaderName, teamName, i);
-                    handleSandboxRequest(sandboxReq, teamName);
+                    handleSandboxRequest(sandboxReq, teamName, leadSessionId);
                     handled++;
                 }
             }
@@ -120,17 +147,19 @@ public class SwarmLeaderPermissionDispatcher {
     /**
      * 处理一条 mailbox 权限请求 · 对齐 CC useInboxPoller.ts:262-351（ToolUseConfirmQueue 路由 +
      * onAllow/onReject/onAbort → sendPermissionResponseViaMailbox + setter 队列推送 dedup by toolUseId）。
+     *
+     * @param leadSessionId [T2] 本 team 的 leader 会话（setter 桶键；null/未注册 → R1 自动 deny）
      */
-    private void handlePermissionRequest(TeammateMailbox.PermissionRequestMessage request, String teamName) {
+    private void handlePermissionRequest(TeammateMailbox.PermissionRequestMessage request, String teamName,
+                                         String leadSessionId) {
         LeaderPermissionBridge.SetToolUseConfirmQueueFn setter =
-                LeaderPermissionBridge.getLeaderToolUseConfirmQueue();
+                LeaderPermissionBridge.getLeaderToolUseConfirmQueue(leadSessionId);
         if (setter == null) {
             // R1 降级：mailbox 请求无 STOMP 会话 → 无确认表面时 log + 自动 deny，不悬挂 worker
             // （对齐 CC :346-350 ToolUseConfirmQueue unavailable 丢弃语义 + 免悬挂增强）
-            if (log.isDebugEnabled()) {
-                log.debug("[SwarmLeader] 无 leader ToolUseConfirm 队列，自动 deny 请求 id={} tool={} worker={}",
-                        request.requestId(), request.toolName(), request.agentId());
-            }
+            log.warn("[SwarmLeader] 无 leader ToolUseConfirm 队列（会话桶 session={}），自动 deny 请求"
+                    + " id={} tool={} worker={}", leadSessionId, request.requestId(), request.toolName(),
+                    request.agentId());
             resolveAndRespond(request.requestId(), request.agentId(), teamName,
                     "rejected", null, null, "No leader confirm surface available");
             return;
@@ -169,17 +198,19 @@ public class SwarmLeaderPermissionDispatcher {
      * 队列 → 决策 → sendSandboxPermissionResponseViaMailbox）。Java 无 workerSandboxPermissions UI
      * 队列，经同一 {@link LeaderPermissionBridge} ToolUseConfirm 队列裁决（R3：sandbox 分发依赖 sandbox
      * 运行时存在，低风险不阻塞主回环；ML-3 统一队列推送形态，toolName="network"）。
+     *
+     * @param leadSessionId [T2] 本 team 的 leader 会话（setter 桶键；null/未注册 → R1 自动 deny）
      */
-    private void handleSandboxRequest(TeammateMailbox.SandboxPermissionRequestMessage request, String teamName) {
+    private void handleSandboxRequest(TeammateMailbox.SandboxPermissionRequestMessage request, String teamName,
+                                      String leadSessionId) {
         String host = request.hostPattern().host();
         LeaderPermissionBridge.SetToolUseConfirmQueueFn setter =
-                LeaderPermissionBridge.getLeaderToolUseConfirmQueue();
+                LeaderPermissionBridge.getLeaderToolUseConfirmQueue(leadSessionId);
         if (setter == null) {
             // R1 降级：无确认表面 → 自动 deny（不悬挂 sandbox 等待方）
-            if (log.isDebugEnabled()) {
-                log.debug("[SwarmLeader] 无 leader ToolUseConfirm 队列，自动 deny sandbox 请求 id={} host={} worker={}",
-                        request.requestId(), host, request.workerName());
-            }
+            log.warn("[SwarmLeader] 无 leader ToolUseConfirm 队列（会话桶 session={}），自动 deny sandbox"
+                    + " 请求 id={} host={} worker={}", leadSessionId, request.requestId(), host,
+                    request.workerName());
             SwarmPermissionSync.sendSandboxPermissionResponseViaMailbox(
                     request.workerName(), request.requestId(), host, false, teamName);
             return;

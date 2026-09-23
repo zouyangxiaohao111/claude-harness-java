@@ -92,7 +92,8 @@ class CompactCommandPersistWritebackTest {
         cc.setOnCompactProgress(e -> { });
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, new AbortController(),
             null, new MicroCompactor(), null, () -> cc, () -> { }, () -> { },
-            null, null, null, null, null, false, () -> false, null);  // [批 5a-2] warningPushContext
+            null, null, null, null, null, false, () -> false, null,  // [批 5a-2] warningPushContext
+            null);  // [compact-signal-fix] progressSink（本用例不断言进度事件 → no-op）
     }
 
     /** SM 优先上下文 · baseDir 下 s1/session-memory/summary.md 提供真实 session memory。 */
@@ -108,7 +109,8 @@ class CompactCommandPersistWritebackTest {
         cc.setOnCompactProgress(e -> { });
         return new CompactCommandContext(messages, SESSION, AGENT, "compact", false, new AbortController(),
             sm, new MicroCompactor(), null, () -> cc, () -> { }, () -> { },
-            null, null, null, null, null, false, () -> false, null);  // [批 5a-2] warningPushContext
+            null, null, null, null, null, false, () -> false, null,  // [批 5a-2] warningPushContext
+            null);  // [compact-signal-fix] progressSink（本用例不断言进度事件 → no-op）
     }
 
     private static SessionMemoryService newSmService(Path baseDir) throws Exception {

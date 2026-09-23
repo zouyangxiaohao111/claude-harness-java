@@ -870,7 +870,10 @@ export function useChatSocket(
       if (sid && status === 'idle') flushStreamAppends()
       if (sid) st.setServerRunning(sid, status !== 'idle')
     } else if (isTokenWarning(evt)) {
-      // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 隐藏；false（新压缩）→ 恢复显示。
+      // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 清除该会话告警（写 null）。
+      //   suppressed=false → 本行**总是**写入事件，显示与否由渲染门 tokenWarningBannerText 决定：
+      //   载荷带真实用量数字（tokenUsage>0）→ 显示；无数字（后端抑制开关翻转时推的占位载荷
+      //   tokenUsage=0/contextWindow=0/percentLeft=null）→ 仍不显示。
       // [按会话键控] 归属会话优先取事件自带 sessionId，兜底当前会话 ref（不用闭包 sessionId ——
       //   mount 期建立的订阅闭包拿的是首渲染值）；都取不到 → 丢弃（不写空键污染 map）。
       //   常态通道是会话级 topic（subscribeSessionLevel 的 /token-warning），本分支是 stream/status

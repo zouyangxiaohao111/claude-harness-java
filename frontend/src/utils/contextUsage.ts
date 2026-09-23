@@ -72,11 +72,20 @@ export const TOKEN_WARNING_TEXT = '上下文接近自动压缩窗口'
  * {@code isAboveWarningThreshold}）；要显示数字就走快照口径（{@link resolveCtxInfo}）。
  *
  * @param warning 该会话的 token_warning（键不存在传 null）
- * @return 文案；null = 不渲染（无告警 / 压缩已成功 suppressed）
+ * @return 文案；null = 不渲染（无告警 / 压缩已成功 suppressed / **载荷无真实用量数字**）
  */
 export function tokenWarningBannerText(
   warning: TokenWarningEvent | null | undefined,
 ): string | null {
   if (!warning || warning.suppressed) return null
+  // 「有真实用量」判据（产出侧锚点）：
+  //   · 真数字 = LlmAgentLoop.java:6884-6892 在 isAboveWarningThreshold() 时推的
+  //     tokenUsage/effectiveWindow/percentLeft；
+  //   · 占位载荷 = CompactWarningState.java:291 publishTokenWarning(pushCtx, value, 0L, 0L, null)
+  //     —— 它只表示「抑制开关翻转」，恒 tokenUsage=0，不是用量告警。
+  // 判据只用 tokenUsage（> 0 即真实），⛔不得用 contextWindow：
+  //   effectiveWindow = min(模型窗口, settings.auto_compact_window) − reserved，用户把
+  //   auto_compact_window 配得极小时 effectiveWindow 可 ≤ 0 ⇒ 用它会静默吞掉真告警。
+  if (warning.tokenUsage == null || warning.tokenUsage <= 0) return null
   return TOKEN_WARNING_TEXT
 }

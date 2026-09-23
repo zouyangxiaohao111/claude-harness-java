@@ -35,6 +35,22 @@ const FILE_TOOLS = new Set(['Edit', 'Write', 'Read', 'Glob', 'Grep', 'NotebookEd
 /** Skill 规则前缀形态（`/^(.+):\*$/`） */
 const RULE_PREFIX_RE = /^(.+):\*$/
 
+/**
+ * 配置目录标记 → 展示名（编辑类规则的特例）。
+ *
+ * <p>`/.claude/**` 一类规则（含 `~/.claude/**`）落到「配置目录」文案；本仓自有根
+ * `.nexusai` 同理 —— 后端「编辑自有设置（本会话）」档产出的 ruleContent 形如
+ * `~/.nexusai/**` / `/.nexusai/**`（后端 `PermissionUpdates.selfConfigRootRuleSuggestion`），
+ * 不登记就会掉进「未识别形态」留痕 + 按规则原文渲染。
+ *
+ * <p>⚠️ 标记必须带尾斜杠：`Edit(~/.nexusai/**)` 命中 `.nexusai/`；不带尾斜杠会让
+ * `<某个叫 .nexusai2 的目录>` 这类规则误判成配置目录。
+ */
+const CONFIG_DIR_LABELS: ReadonlyArray<readonly [string, string]> = [
+  ['.claude/', '.claude/'],
+  ['.nexusai/', '.nexusai/'],
+]
+
 /** 会**写进设置文件**的 destination · 单一真源 = 后端 `PermissionUpdatePersister.java:112-114`
  *  （`case USER_SETTINGS, PROJECT_SETTINGS, LOCAL_SETTINGS -> true; case CLI_ARG, SESSION -> false;`）。
  *  ⚠️ `cliArg` 与 `session` 都不落盘 —— 漏掉 cliArg 会把它写成「不再询问」（实测踩过）。 */
@@ -169,9 +185,11 @@ function addRulesLabel(update: PermissionUpdateRulesWire, toolName: string, scop
     return `允许，且${scope}可读取 ${formatPathList(readDirs)}`
   }
 
-  // 配置文件目录（`.claude/`）：编辑类规则的特例
-  if (rules.every((r) => FILE_TOOLS.has(r.toolName) && r.ruleContent?.includes('.claude/'))) {
-    return `允许，且${scope}编辑配置目录 .claude/`
+  // 配置文件目录（`.claude/` 与本仓自有根 `.nexusai/`）：编辑类规则的特例
+  for (const [marker, label] of CONFIG_DIR_LABELS) {
+    if (rules.every((r) => FILE_TOOLS.has(r.toolName) && r.ruleContent?.includes(marker))) {
+      return `允许，且${scope}编辑配置目录 ${label}`
+    }
   }
 
   // WebFetch：规则内容 = `domain:<host>`

@@ -12,6 +12,7 @@ import com.nexusai.application.agent.tasks.TaskType;
 import com.nexusai.application.agent.team.TeamHelpers;
 import com.nexusai.application.agent.team.TeammateMailbox;
 import com.nexusai.application.agent.tool.ContentReplacementState;
+import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.infra.util.AbortControllerFactory;
 import com.nexusai.infra.util.SwarmConstants;
 import org.slf4j.Logger;
@@ -109,6 +110,24 @@ public class AutonomousAgentLoop {
 
     /** W8-01: 任务列表 id (taskListId = identity.parentSessionId, CC runner:1019) */
     private volatile String taskListId;
+
+    /**
+     * [T1 · 消除 no-session] Leader 归属父 TUC（sessionId + effectiveCwd）· 由
+     * {@link com.nexusai.application.agent.team.SpawnInProcess#spawnInProcessTeammate} 注入，
+     * {@link #runOneTurn} 作为 {@code parentTucOverride} 透传 teammate 命名入口
+     * {@code SubagentExecutor.executeTeammateTurn} ——
+     * 使 teammate 的执行 TUC 走 {@code createSubagentContext.create} 的 <b>hasParent 分支</b>，
+     * 从而继承 Leader 的 sessionId / effectiveCwd（而非落到 {@code SessionKeys.NO_SESSION} 哨兵）。
+     *
+     * <p><b>WHY 实例字段安全（与 SubagentExecutor 单例相反）</b>：本类虽标 {@code @Component}
+     * （类注解，见 :62-63），但<b>生产恒为 {@code new AutonomousAgentLoop()}</b>
+     * （{@code SpawnInProcess:280}，全仓无 {@code @Autowired} 注入点，只有
+     * {@code InProcessTeammateTaskRegistry} 持有实例）⇒ <b>1 loop = 1 teammate</b>，
+     * 实例字段不构成跨会话串台面。⚠️ 若将来有人把本类当 Spring bean 复用，本字段会串台 ——
+     * 那时的正解是把它降为 {@code runTeammateLoop}/{@code runOneTurn} 的显式形参。
+     * null = 无 Leader 归属（teammate 路径降级走 standalone + NO_SESSION 哨兵）。
+     */
+    private volatile ToolUseContext leaderParentTuc;
 
     /** W8-01: 生命周期 abortController (CC spawnInProcess.ts:122 独立 createAbortController) */
     private volatile AbortControllerFactory.AbortControllerRef abortController;
@@ -216,6 +235,16 @@ public class AutonomousAgentLoop {
     /** W8-01: 测试/接线用 setter (taskListId). */
     public void setTaskListId(String taskListId) {
         this.taskListId = taskListId;
+    }
+
+    /** [T1 · 消除 no-session] 测试/接线用 setter（Leader 归属父 TUC，见字段 javadoc）。 */
+    public void setLeaderParentTuc(ToolUseContext leaderParentTuc) {
+        this.leaderParentTuc = leaderParentTuc;
+    }
+
+    /** [T1 · 消除 no-session] 当前 Leader 归属父 TUC（测试/诊断；null = 无归属）。 */
+    public ToolUseContext leaderParentTuc() {
+        return leaderParentTuc;
     }
 
     /** W8-01: 测试/接线用 setter (abortController). */
@@ -1218,14 +1247,22 @@ public class AutonomousAgentLoop {
         //   （SubagentExecutor 是 Spring 单例，字段会在会话间串台）。
         com.nexusai.application.agent.team.TeammateIdentity teammateIdentity =
             taskState != null ? taskState.identity() : null;
+        // [T1 · 消除 no-session] 第 7 实参 = Leader 归属父 TUC（见 {@link #leaderParentTuc} 字段 javadoc）。
+        //   改前 teammate 入口是 7 参 executeStreaming 重载，无父 TUC 槽位（写死 parentTucOverride=null）
+        //   ⇒ executeStreaming 里 effectiveParentTuc==null ⇒ createSubagentContext.create 走 standalone
+        //   分支置 NO_SESSION 哨兵 ⇒ teammate 的 transcript/cwd/权限/file-history/hook 全挂幻影会话键。
+        //   传非 null ⇒ 走 hasParent 分支继承 Leader sessionId/effectiveCwd（对齐 CCB
+        //   inProcessRunner.ts:1197-1200 复用 Leader toolUseContext 的形态）。
+        //   null（无归属）= 保持原降级行为。
         com.nexusai.application.agent.tool.impl.SubagentExecutor.SubagentResult result =
-            subagentExecutor.executeStreaming(
+            subagentExecutor.executeTeammateTurn(
                 prompt,
                 null,
                 model,
                 forkParams,
                 msg -> appendMessage(describeMessage(msg)),
                 bridge,
+                leaderParentTuc,
                 teammateIdentity
             );
         // CC :1204-1219: 生命周期 abort 优先（不归为本轮 work abort）；仅 work abort 时 workWasAborted=true

@@ -312,6 +312,60 @@ public class WriteFileTool implements Tool {
         this.guard = guard;
     }
 
+    /**
+     * [批 gate-allow-skip] 门禁 1 的免门判据来源 —— read 权限层判定（CC {@code Wu} 等价物，
+     * 见 {@link com.nexusai.application.agent.permission.ReadPermissionChecker#readLayerIsAllow}）。
+     *
+     * <p>CC 的 Write 侧条件是
+     * {@code xe=!he && !jPt(y) && !Jbt(model,remoteCall) && G9(Tn,y,tools,perms)}
+     * （<b>我 dd 读发行产物看到</b>：exe **byte offset 203520944** 起的 `if(!he||he.isPartialView){` 块内）。
+     * 其中 {@code G9(e,n,r,s)=!Uu(e,r)&&Wu(n,s)}（off 200163140），
+     * {@code Uu(e,n)=n.some(r=>Ut(r,e))&&!n.some(r=>Ut(r,nt))&&!n.some(r=>Ut(r,Cl))}（off 200163047），
+     * 否定项常量为 {@code nt="Read"}（off 197960630）与 {@code Cl="REPL"}（off 199683797）
+     * —— ⛔ <b>不是 Edit</b>。正常会话<b>含 Read</b> ⇒ {@code Uu=false} ⇒ {@code !Uu=true}
+     * ⇒ <b>那条例外在 CC 里是活的（会触发）</b>；⚠️ 本批之前此处写「{@code Uu} 恒真 ⇒ 永不触发」
+     * 是<b>错的</b>，已按 dd 取证更正。
+     * <p>⭐⭐ 分档：第三方模型（{@code Jbt}=false，用户环境 deepseek 即此类）⇒ {@code Ue ≡ Wu}
+     * ⇒ <b>本仓与 CC 同宽</b>；一方模型（{@code Jbt}=true ⇒ CC 侧关免门）时本仓不实现 {@code Jbt}
+     * ⇒ <b>本仓才比 CC 松</b>。
+     * <p>⭐ 收窄 {@code !jPt(y)}（{@code jPt}=归一尾部 {@code .}/空格后扩展名 {@code .ipynb}，
+     * exe off 203517756 / {@code sz} off 197061992）：即 <b>CC 的 Write 免门不覆盖 Notebook 文件</b>。
+     * 本仓同款补齐（{@link #isNotebookPath}，在 {@code skipAllowed} 求值时与本判据相与）——
+     * ⚠️ 本批之前此处曾写「本仓 {@code .ipynb} 在更早处即被拒、无需复刻」，该说法对 <b>Write 侧不成立</b>
+     * （{@code WriteFileTool} 全文无 {@code .ipynb} 代码检查）⇒ 那是一个真洞，本批已修。
+     * 用户 2026-09-22 裁定「不看模型、不看格式」⇒ {@code Jbt} 分叉仍不实现，非「对齐 CC」。
+     *
+     * <p>{@code @Autowired(required = false)}：未注入（POJO/单测）⇒ 判据 fail-closed 恒 false
+     * ⇒ 门禁 1 行为与本批之前<b>逐字节一致</b>（不静默放宽）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.permission.ReadPermissionChecker readPermissionChecker;
+
+    /** 测试/装配用 setter（镜像 {@code EditFileTool.setReadPermissionChecker}）。 */
+    public void setReadPermissionChecker(
+            com.nexusai.application.agent.permission.ReadPermissionChecker readPermissionChecker) {
+        this.readPermissionChecker = readPermissionChecker;
+    }
+
+    /**
+     * 门禁 1 免门判据求值（CC {@code Wu(path, permissions)} 那一半）。
+     *
+     * @param file 已按会话 cwd 解析的规范化绝对路径（与 readFileState key 同源）
+     * @param ctx  工具调用上下文
+     * @return true = 该路径 read 层判 allow ⇒ 免 read-before-write 门禁
+     */
+    private boolean readLayerAllowsSkip(Path file, ToolUseContext ctx) {
+        if (readPermissionChecker == null) {
+            if (log.isWarnEnabled()) {
+                log.warn("WriteFileTool: ReadPermissionChecker 未注入 → 免门判据 fail-closed=false"
+                    + "（read-before-write 门禁维持拒绝）path={}", file);
+            }
+            return false;
+        }
+        return readPermissionChecker.readLayerIsAllow(
+            file.toAbsolutePath().normalize().toString(), ctx);
+    }
+
     // [PROBE-PG DC-2] WriteFileTool.pathGuard() 公开访问器已删除（全仓实测零消费者，
     //   CC FileWriteTool.ts 无对应 API；guard 字段保持 private 供内部使用——validateInput/
     //   executeInternal/构造器，见探查/tool_v4/implementation/probe-pathguard/probe-report.md §6.1）。
@@ -644,25 +698,168 @@ public class WriteFileTool implements Tool {
         //   absoluteFilePath）；用 `file` 而非裸 relPath，保证「解析基准 = 缓存键基准」同源。
         ReadState readState = ctx.readFileState().get(
             ToolUseContext.keyForReadFileState(guard, file.toString()));
+        // [批 rfs-replay-3b · 2 次修订] 门禁 1 判据 = **两态**（同 EditFileTool.java 门禁 1 口径）：
+        //   null（从未读过）/ isPartialView（只看到部分视图）⇒ 判「未读」errorCode 2。
+        //   ⛔ **不消费** contentNotInModelContext（依用户口径「CC 怎么做我们怎么做」）：
+        //   2.1.278 发行产物本门禁条件是 `if(!he||he.isPartialView)`（**我 dd 读发行产物看到**：
+        //   exe off 203520944 起 `let he=s.readFileState.get(y);if(!he||he.isPartialView){`，
+        //   该区间内该字段命中数 = 0）；CC 的消费点只有 `fle`（off 199640351）与 ProposeSkillsTool
+        //   分类（off 225888734），本仓暂无对应物（详见 ToolUseContext.ReadState 该字段 javadoc）。
+        //   下方 debug 日志仍打印该布尔（可观测信息），但不参与判定。
         if (readState == null || readState.isPartialView()) {
-            return Tool.ValidationResult.fail("2",
-                "File has not been read yet. Read it first before writing to it.");
+            // [批 gate-allow-skip] 免门例外 · CC 2.1.278 Write 门禁的同一位置（`if(!he||he.isPartialView){`
+            //   块内，exe **byte offset 203520944**）：
+            //     `xe=!he&&!jPt(y)&&!Jbt(Ee,s.remoteCall)&&G9(Tn,y,s.tools,s.permissions()); …;
+            //      if(!xe) return {result:!1,message:"File has not been read yet. …",errorCode:2};`
+            //   ⚠️ 更正（本批 dd 取证 · 详见 ReadPermissionChecker#readLayerIsAllow javadoc）：
+            //      CC 那条例外**不是死的** —— `Uu` 的两个否定项常量是 `nt="Read"`（exe off 197960630）
+            //      与 `Cl="REPL"`（off 199683797），⛔ 不是 Edit；正常会话含 Read ⇒ `Uu=false` ⇒
+            //      `!Uu=true` ⇒ 例外**会触发**。本批之前此处写「Uu 恒真 ⇒ 永不触发 ⇒ 本仓比 CC 松」
+            //      是**错的**。⭐ 分档：第三方模型（`Jbt=false`，用户环境 deepseek 即此类）⇒
+            //      `Ue≡Wu` ⇒ **本仓与 CC 同宽**；一方模型（`Jbt=true` ⇒ CC 关免门）时本仓不实现
+            //      `Jbt` ⇒ **本仓才比 CC 松**。用户裁定「不看模型、不看格式」⇒ 只抄 `Wu`，非「对齐 CC」。
+            //   ⭐ 收窄 `!jPt(y)` 本批已照抄（CC Write 免门不覆盖 Notebook 文件）：
+            boolean notebookNarrowed = isNotebookPath(file);
+            boolean skipAllowed = !notebookNarrowed && readLayerAllowsSkip(file, ctx);
+            if (log.isInfoEnabled()) {
+                // ⚠️ [批 gate-allow-skip-fix2] `判据(Wu:readLayerIsAllow)` 字段⛔不得直接打
+                //    skipAllowed：`!notebookNarrowed && readLayerAllowsSkip(...)` 会**短路** ——
+                //    .ipynb 命中时 read 层**根本没被求值**（同一次调用不会有 [Wu 免门判据] 日志），
+                //    此时打出的 false 是**短路值**，读者会误读成「read 层判否」。
+                //    ⇒ 收窄态显式标「未求值」；未收窄时 skipAllowed ≡ Wu 判决，可安全打印。
+                //    （判定行本身逐字未动，仅日志字段的取值来源改正。）
+                String wuField = notebookNarrowed
+                    ? "未求值(.ipynb 收窄短路)"
+                    : String.valueOf(skipAllowed);
+                log.info("WriteFileTool: 门禁 1 判定 path={} 状态={} jPt收窄(.ipynb)={} "
+                        + "判据(Wu:readLayerIsAllow)={} 免门放行skipAllowed={} 判定={} "
+                        + "contentNotInModelContext={}（判定仅用 null/isPartialView 两态；末项仅供观测）",
+                    file,
+                    readState == null ? "无 entry(readState==null)"
+                                      : "entry 存在但 isPartialView=true",
+                    notebookNarrowed,
+                    wuField,
+                    skipAllowed,
+                    skipAllowed ? "免门命中→放行" : "免门未命中→拒绝(errorCode 2)",
+                    readState != null && readState.contentNotInModelContext());
+            }
+            if (!skipAllowed) {
+                return Tool.ValidationResult.fail("2",
+                    "File has not been read yet. Read it first before writing to it.");
+            }
         }
 
         // 门禁 2: stale-write 拒绝 (CC :211-218 errorCode=3)
+        // [批 gate-allow-skip] 两处改动：
+        //  ① 补 `readState != null` 守卫（CC 同位置由 `if(!he||he.isPartialView){…return…}` 的**提前
+        //     return** 结构性保证；本仓免门后会**落到本行**，缺守卫即在 readState.mtimeMillis() NPE）。
+        //  ② 补 CC 的**内容兜底** `g2`（exe byte offset 199640211）+ `o6r`（off 199640624）——
+        //     CC 真形态（Write validateInput，off 203520944 块之后）：
+        //       `if(Math.floor(U)>he.timestamp){ let Ee=g2(he),ve=!1;
+        //          if(Ee){ let xe=await B.readFileBytes(y); ve=o6r(he,xe.toString("utf8")) }
+        //          if(!ve) return {result:!1,message:n4t(),errorCode:3} }`
+        //     ⇒ 仅当 entry 是 full-read（g2）**且**磁盘内容与 entry.content 等价（o6r = 剥 BOM +
+        //     CRLF 归一后相等）才放行。本批之前只有「mtime 更新即拒」⇒ 云同步/杀软 touch 误拒。
         long lastWriteTime;
         try {
             lastWriteTime = Files.getLastModifiedTime(file).toMillis();
         } catch (Exception e) {
             return Tool.ValidationResult.pass();
         }
-        if (lastWriteTime > readState.mtimeMillis()) {
-            return Tool.ValidationResult.fail("3",
-                "File has been modified since read, either by the user or by a linter. " +
-                "Read it again before attempting to write to it.");
+        if (readState != null && lastWriteTime > readState.mtimeMillis()) {
+            boolean isFullRead = readState.offset() == null && readState.limit() == null;
+            String readContent = readState.content();
+            boolean contentUnchanged = false;
+            if (isFullRead && readContent != null) {
+                try {
+                    // o6r(entry, diskBytes) 等价：FileEncodingReader 已 CRLF 归一，双侧剥 BOM 后比对。
+                    String disk = FileEncodingReader.readFileMetadata(file).content();
+                    contentUnchanged = stripLeadingBom(readContent).equals(stripLeadingBom(disk));
+                } catch (Exception e) {
+                    contentUnchanged = false;   // 读盘失败 → 不享受兜底（fail-closed，维持拒绝）
+                }
+            }
+            if (!contentUnchanged) {
+                if (log.isWarnEnabled()) {
+                    log.warn("WriteFileTool: 门禁 2 拒绝(3) path={} lastWriteTime={} readMtime={} "
+                        + "isFullRead={} contentUnchanged={}",
+                        file, lastWriteTime, readState.mtimeMillis(), isFullRead, contentUnchanged);
+                }
+                return Tool.ValidationResult.fail("3",
+                    "File has been modified since read, either by the user or by a linter. " +
+                    "Read it again before attempting to write to it.");
+            }
         }
 
         return Tool.ValidationResult.pass();
+    }
+
+    /**
+     * 剥前导 UTF-8 BOM · 对齐 CC 2.1.278 {@code Uw}
+     * （exe **byte offset 199640515**：{@code function Uw(e){return e.charCodeAt(0)===65279?e.slice(1):e}}；
+     * 相邻同族 helper：{@code g2} @199640211（isFullRead）/ {@code JD} @199640421（内容相等）/
+     * {@code Lb} @199640574（剥 BOM + CRLF 归一）/ {@code o6r} @199640624（= {@code JD(e, Lb(disk))}））。
+     *
+     * <p>与 {@code EditFileTool.stripLeadingBom} 同实现同用途（CC 侧 {@code Uw} 亦是全仓单点工具函数；
+     * Java 侧两处工具各持私有副本，与本仓既有惯例一致，⛔ 不另建公共 util 以避本批扩大面）。
+     */
+    private static String stripLeadingBom(String s) {
+        if (s != null && !s.isEmpty() && s.charAt(0) == '﻿') {
+            return s.substring(1);
+        }
+        return s;
+    }
+
+    /**
+     * CC {@code jPt(path)} 等价物 —— 归一尾部 {@code .}/空格后，扩展名是否为 {@code .ipynb}。
+     *
+     * <h2>CC 真源（来源分级：<b>我 dd 读发行产物看到</b> · Python 读 bytes）</h2>
+     * <pre>
+     * exe off 203517756: function jPt(e){return sz(e.replace(/[. ]+$/,""))}
+     * exe off 197061992: function sz(e){return p(e).toLowerCase()===".ipynb"}   // p = path.extname
+     * </pre>
+     * 作用点：CC Write {@code validateInput} 的免门条件
+     * {@code xe = !he && !jPt(y) && !Jbt(model,remoteCall) && G9(Tn,y,tools,perms)}
+     * （exe off 203520944 块内，{@code y = Ze(file_path)}）；{@code !xe ⇒ errorCode 2}
+     * ⇒ <b>CC 对未读的 {@code .ipynb} 一律不免门</b>。
+     *
+     * <p>⚠️ 本批之前 {@code WriteFileTool} 全文<b>无</b> {@code .ipynb} 代码检查
+     * （{@code grep -n ipynb} 只命中注释）⇒「未读的 notebook 可被 {@code write_file} 盲覆盖」，
+     * 本方法补上该收窄。Edit 侧不需要：CC 的 {@code FileEditTool} 在更靠前的
+     * {@code if(M.endsWith(".ipynb")) return {...,errorCode:5}}（exe off 206605236）处即拒，
+     * 本仓 {@link EditFileTool} 同款已有（errorCode 5）。
+     *
+     * <p>{@code replace(/[. ]+$/,"")} 只剥<b>尾部</b>连续的 {@code .} 与空格（Windows 归一形态，
+     * 如 {@code x.ipynb.} / {@code x.ipynb␠} ⇒ {@code x.ipynb}）；{@code sz} 用 Node
+     * {@code path.extname} 语义 ⇒ 纯 dotfile（基名以 {@code .} 开头且<b>无其它点</b>，如 {@code .ipynb}）
+     * 的扩展名是空串、<b>不算</b> notebook。本实现同语义（最后一点必须是首字符之外的点）。
+     *
+     * <p>⚠️ <b>如实登记：那步 {@code [. ]+$} 归一在本仓调用链上不可独立观测</b>（实测取证）：
+     * <ul>
+     *   <li>尾部<b>空格</b>：{@code PathGuard.expandPath} 入口即 {@code raw.trim()}
+     *       （{@code PathGuard.java:392}），到本方法时已无尾空格 ⇒ 该分支恒不生效（与 CC 同净效果）。</li>
+     *   <li>尾部<b>点</b>：路径会被 read 层「可疑 Windows 路径」第 4 类 {@code [.\s]+$} 先判 ask
+     *       （{@code PathValidation.hasSuspiciousWindowsPathPattern}，CC filesystem.ts:574-576）
+     *       ⇒ {@code Wu=false} ⇒ 免门本就为假 ⇒ 观察到的 errorCode 2 归因给 read 层而非本方法。</li>
+     * </ul>
+     * ⇒ 保留该归一仅为逐字对齐 CC（无害且防将来调用链变化），<b>不以它为任何测试的鉴别依据</b>。
+     */
+    private static boolean isNotebookPath(Path file) {
+        if (file == null) {
+            return false;
+        }
+        Path fileName = file.getFileName();
+        String base = fileName != null ? fileName.toString() : file.toString();
+        int end = base.length();
+        while (end > 0 && (base.charAt(end - 1) == '.' || base.charAt(end - 1) == ' ')) {
+            end--;
+        }
+        String normalized = base.substring(0, end);
+        int dot = normalized.lastIndexOf('.');
+        if (dot <= 0) {
+            return false;   // 无点 / 纯 dotfile ⇒ Node path.extname 返回 ""
+        }
+        return normalized.substring(dot).toLowerCase(java.util.Locale.ROOT).equals(".ipynb");
     }
 
     /**

@@ -4162,7 +4162,7 @@ public record AgentLoopContext(
                 //   恒渲染（无 payload 守卫）。门控归 producer 侧（plan 域未来接线）：Java 无
                 //   verify_plan_reminder producer（生产零命中）→ 防御纯渲染；全局 settings 列门控
                 //   resolver.verifyPlanReminderEnabled()（PromptAlignSettingsResolver:194，G0-03
-                //   settings 全局 12 列 verify_plan_reminder_enabled，非会话列）接线点属
+                //   settings 全局 11 列 verify_plan_reminder_enabled，非会话列）接线点属
                 //   producer 注入，render 不读。
                 String vpToolName = "true".equals(readVerifyPlanEnv())
                     ? ToolNameConstants.VERIFY_PLAN_EXECUTION_TOOL_NAME : "";

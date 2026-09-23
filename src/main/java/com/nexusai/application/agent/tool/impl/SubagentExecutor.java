@@ -434,6 +434,18 @@ public class SubagentExecutor {
             return null;
         }
         Path resolved = effectiveCwd != null ? effectiveCwd.toAbsolutePath() : null;
+        // [批 edit-gate-session-scope · C] 子代理 readFileState = 源的独立 clone（见下方实参处长注释）。
+        com.nexusai.application.agent.tool.FileStateCache subReadFileState =
+            ToolUseContext.cloneFileStateCache(source.readFileState());
+        if (log.isDebugEnabled()) {
+            log.debug("[edit-gate·子代理 readFileState] withEffectiveCwd 派生独立 clone: sessionId={} "
+                + "源条数={} 子代理副本条数={} 与源同实例={}（同实例=false 是承重断言：子代理 cleanup "
+                + "的 clear() 不得触到会话表）",
+                source.sessionId(),
+                source.readFileState() != null ? source.readFileState().size() : -1,
+                subReadFileState.size(),
+                subReadFileState == source.readFileState());
+        }
         // [Session J 方案 A] 完整 47 字段透传 — querySource/assistantMessage 已撤回顶层 record;
         //   中间 28 字段 (Stage 3.2 C2 4 + Stage 3.3 UI 11 + Stage 3.4 session 13) 传 null → compact ctor 兜底.
         //   47 字段 fileReadingLimits 走 canonical ctor 透传 source (对齐 CC forkedAgent.ts:456), 见末段.
@@ -457,8 +469,26 @@ public class SubagentExecutor {
             // [R32-b15 Stage 3.1 C13] 透传 onCompactProgress 到子 Agent 上下文
             // (子 Agent 触发压缩时仍走同一回调, 保持 session 级事件流一致)
             source.onCompactProgress(),
-            // Stage 3.2 C2 4 字段 — 子 Agent 独立 (source=null)
-            null, null, null, null,
+            // Stage 3.2 C2 4 字段 — getAppState **保留源**，其余 3 个（setAppState/setStreamMode/
+            //   setSDKStatus）仍子 Agent 独立 (source=null)。
+            // [T1-A1 · 2026-09-22] WHY getAppState 必须保留（改前置 null 是 Java 侧对 CC 的偏离）：
+            //   · 它是**唯一的 appState 读通道** —— AgentLoopContext.mergeAppStatePermissionRules
+            //     （AgentLoopContext.java:1604）经 `baseTuc.getAppState().apply(null)` 取快照，再把
+            //     会话级 SESSION 档授权（本会话允许编辑 / 本会话允许读某目录）并进 per-turn permCtx。
+            //   · 改前置 null ⇒ 紧凑构造器兜底**恒等函数** `s -> s`（ToolUseContext.java:469-470）
+            //     ⇒ apply(null) 返回 null ⇒ 合并恒早退（:1605 `return permCtx;`）⇒「弹窗批准后下一轮
+            //     免问」在**所有经本方法派生**的子代理路径失效：teammate（SpawnInProcess:283-285 的
+            //     最小父 TUC 经本方法）、worktree 隔离子代理（Step 18 :2367 派生）。
+            //   · CC 真源：forkedAgent.ts:274 `getAppState: overrides?.getAppState ??
+            //     parentContext.getAppState`（= 继承父，不是置 undefined）；本仓 ToolUseContext.with()
+            //     同判（:1941-1942 `override ?? parent`）⇒ 本方法是链上**唯一**把 getAppState 打成
+            //     恒等的一环（两处独立造成：SpawnInProcess 侧未携 + 本处置 null）。
+            //   · 保留后与 `with()` 语义一致（子代理读同一 appState 视图 = CC 的
+            //     appState.toolPermissionContext 进程级单例语义在本仓的会话化等价物）。
+            //   ⛔ setAppState 仍置 null（noop）：写通道本批不改（CC forkedAgent.ts:410-412 的
+            //     share ? parent : ()=>{} 由 with() 决定），故子代理**本次 run 内**仍不回写 appState
+            //     ——已知残留，跨轮/跨 send 由 DB 会话列（唯一持久通道）承担，见 SessionPermissionOverlay。
+            source.getAppState(), null, null, null,
             // Stage 3.3 UI 10 字段 — 子 Agent 独立 (source=null; prompt 回调通道 已删 S9)
             null, null, null, null, null, null, null, null, null, null,
             // Stage 3.4 session 13 字段 — 子 Agent 独立 (source=null, 简化透传避免错乱)
@@ -468,10 +498,23 @@ public class SubagentExecutor {
             false, false,
             null, null, null,
             null, null,
-            // [L+ R1] readFileState 透传 — 子 Agent 复用父 Agent 的 dedup cache,
-            //   避免 fork 后重复读已读文件. 对齐 CC runAgent.ts:705 readFileState 父→子透传语义.
-            //   compact ctor 内部会 .clone() 出新 Map (兜底逻辑), 避免子 Agent 写 dedup 污染父 cache.
-            source.readFileState(),
+            // [批 edit-gate-session-scope · C] readFileState <b>显式 clone</b>（⛔ 不再按引用透传）。
+            //   ⚠️ 原注释「compact ctor 内部会 .clone() 出新 Map (兜底逻辑)」与事实相反：
+            //      ToolUseContext 紧凑构造器（ToolUseContext.java:539-541）对非 null 实参
+            //      是<b>原样持有引用</b>，不做任何复制（:537-538 明写「共享引用即可」）；
+            //      只有实参为 null 时才 {@code createFileStateCache()} 新建——那是<b>新建空表</b>，
+            //      不是 clone。⇒ 改造前这里是「父 cache 引用直传」，子代理与父/会话共用同一张表。
+            //   WHY 必须改（不做就会让会话化反而更坏）：readFileState 会话化后，
+            //      子代理若按引用拿到会话表，则本文件 :2605 子代理 cleanup 阶段的
+            //      {@code subagentCtx.readFileState().clear()} 会清空<b>整个会话</b>的读状态
+            //      （主线程 Read 过的文件全部作废 ⇒ 下一次 Edit 报 errorCode 6/2/9）。
+            //   修法 = clone 语义（对齐 CC forkedAgent.ts:379-381
+            //      {@code overrides?.readFileState ?? cloneFileStateCache(parentContext.readFileState)}）：
+            //      子代理<b>继承</b>已读条目（fork 的 messages 里有父的 Read 结果，丢掉会让
+            //      fork 内 Edit read-before-write 门禁误拒 —— 见 RunForkedAgent.java:369-373
+            //      登记的依赖），但持有的是<b>独立副本</b> ⇒ 子代理写/清都污染不到会话表。
+            //   ⛔ 不传 null：null 走构造器的「新建空表」分支，会静默丢掉上面那份继承语义。
+            subReadFileState,
             // [MCP-I-9 Q-30] mcpServerConnections 透传 — 子 base TUC 继承父已建 MCP 连接,
             //   对齐 CC runAgent.ts:685 agentOptions.mcpClients = mergedMcpClients.
             //   (Step 15 计算 mergedClients 后经 withMcpServerConnections 写入; 此处仅透传 source)
@@ -1700,6 +1743,16 @@ public class SubagentExecutor {
     /**
      * [S1-T2b] <b>teammate 路径入口</b>：流式执行 + 显式 teammate 身份（per-call，非可变字段）。
      *
+     * <p><b>WHY 是「命名入口」而不是 {@code executeStreaming} 的又一个重载（T1 实证）</b>：
+     * 本方法原为 7 参 {@code executeStreaming(..., AbortController, TeammateIdentity)} 重载；
+     * T1 需要再加一个 per-call 形参（{@code parentTucOverride}）⇒ 变成 8 参 ⇒ 与既有 8 参重载
+     * {@code executeStreaming(..., AbortController, String querySource, String worktreePath)}
+     * <b>同 arity 且尾参均为引用类型</b> ⇒ 既有 matcher 调用点直接编译不过（实测：
+     * {@code ClaudeCodeBackendAdapterTest:236/:304} 的
+     * {@code executeStreaming(any(), any(), any(), isNull(), any(), any(), eq("workflow"), any())}
+     * 报「对 executeStreaming 的引用不明确」）。⇒ 改用命名入口（对齐本类既有命名入口先例
+     * {@link #executeForkedSkill}），调用点唯一且形参可读（无需与 8 参重载比位置）。
+     *
      * <p><b>WHY 用 per-call 形参而不是 setter/字段</b>：{@code SubagentExecutor} 是 Spring
      * 单例 bean（{@code ToolRegistrationConfig.subagentExecutor @Bean}），多个会话 / 多个 teammate
      * 共享同一实例 —— 任何「per-teammate 可变字段」都会变成跨会话身份槽（本批正在消灭的形态，
@@ -1713,13 +1766,20 @@ public class SubagentExecutor {
      *
      * @param teammateIdentityOverride 本 teammate 的身份；null = 非 teammate（普通 Agent-tool
      *                                 子代理 / workflow / hook agent 路径）
+     * @param parentTucOverride        [T1 · 消除 no-session] 本 teammate 的 <b>Leader 归属父 TUC</b>
+     *                                 （sessionId + effectiveCwd 由 SpawnInProcess 物化）。非 null ⇒
+     *                                 Step 5 走 {@code createSubagentContext.create(parent, overrides)}
+     *                                 的 <b>hasParent 分支</b>，sessionId/effectiveCwd 从 Leader 继承
+     *                                 （对齐 CCB inProcessRunner.ts:1197-1200 复用 Leader toolUseContext）；
+     *                                 null = 无法取得 Leader 归属 ⇒ 保持原 standalone 降级（NO_SESSION 哨兵）。
      */
-    public SubagentResult executeStreaming(String prompt, String subagentType, String modelOverride,
-                                           ForkPathParams forkParams, Consumer<SubagentMessage> messageSink,
-                                           AbortController abortControllerOverride,
-                                           com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride) {
+    public SubagentResult executeTeammateTurn(String prompt, String subagentType, String modelOverride,
+                                              ForkPathParams forkParams, Consumer<SubagentMessage> messageSink,
+                                              AbortController abortControllerOverride,
+                                              ToolUseContext parentTucOverride,
+                                              com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride) {
         return executeStreaming(prompt, subagentType, modelOverride, forkParams, messageSink,
-            null, null, null, abortControllerOverride, null, null, teammateIdentityOverride);
+            null, parentTucOverride, null, abortControllerOverride, null, null, teammateIdentityOverride);
     }
 
     /**
@@ -1748,6 +1808,50 @@ public class SubagentExecutor {
                                             com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride) {
         // s06 P1-2 修补: 真实 metrics — durationMs 通过本地变量注入 SubagentResult
         long startMs = System.currentTimeMillis();
+
+        // ── [fail-loud · 2026-09-22 用户裁定] 「携带 teammateIdentity 但没走父 TUC 通道」⇒ 直接报错 ──
+        // WHY（改前形态 · 已读码复核）: 本方法末尾的 Step 5 是**唯一**决定 teammate 执行 TUC 走
+        //   hasParent 分支（继承 Leader sessionId/effectiveCwd）还是 standalone 分支
+        //   （sessionId 置 SessionKeys.NO_SESSION 哨兵）的点，判据就是下面这个 effectiveParentTuc。
+        //   改前 teammate 路径若拿到 null 父 TUC（例如新入口忘了传 / setLeaderParentTuc 未调用），
+        //   这里**静默**降级：teammate 的 transcript/cwd/权限/file-history/hook 全挂 no-session 幻影键，
+        //   且「批准后写进 Leader 会话列的授权」在下一轮**读不回来**（子代理路径不加载会话列，
+        //   见 AgentLoopContext.mergeAppStatePermissionRules 的 getAppState 通道）—— e2e 反向实验已实证：
+        //   该形态不抛、静默降级、授权被丢弃。用户裁定：「将来若出现『携带 teammateIdentity 但没走
+        //   父 TUC 通道』的新路径**直接报错**」。
+        // 判据语义（边界）:
+        //   ① teammateIdentityOverride != null = 「这是 teammate 这条路」——teammate 是**会话内**概念
+        //      （team lead + teammate 同属一个 Leader 会话，对齐 CC 一进程=一会话：CC/CCB 的 teammate
+        //      直接复用 Leader 的 toolUseContext，inProcessRunner.ts:892-902/:1197-1200）
+        //      ⇒ 「teammate 无父 TUC」在结构上就是错的，不存在合法形态。
+        //   ② effectiveParentTuc == null = 「真会走到 no-session 哨兵那一步」（不是「参数没传」
+        //      这种中间态，而是将要发生的行为本身）。per-call 通道优先、否则构造器级
+        //      （与 Step 5 同一表达式 —— 本方法只算这一次，Step 5 复用该值，⛔ 不两处各算一次）。
+        //   ③ 合法降级路径（identity == null）**不受影响**：普通 Agent-tool 子代理 / workflow worker /
+        //      hook agent / 入站 MCP 的 standalone 无父场景仍照旧走 NO_SESSION 哨兵 + 命名出口
+        //      —— 本断言只拦「teammate 这条路」，即任务书要求的边界。
+        // ⛔ 位置选在本方法（12 参私有总入口）而非 executeTeammateTurn：本方法是**所有**
+        //   teammateIdentity 注入路径的唯一汇聚点（executeTeammateTurn 只是当前唯一的生产入口；
+        //   将来新入口若带 identity 直调本方法，本断言仍然生效）。⛔ 不放进 createSubagentContext.create：
+        //   那里只有 (parent, overrides) 通用语义，**没有 teammate 概念**，塞进去会污染通用合同
+        //   并让「合法无父」的通用路径跟着抛。
+        ToolUseContext effectiveParentTuc =
+            parentTucOverride != null ? parentTucOverride : parentToolUseContext;
+        if (teammateWithoutParentTuc(teammateIdentityOverride, effectiveParentTuc)) {
+            throw new com.nexusai.application.agent.team.MissingLeaderSessionException(
+                "SubagentExecutor.executeStreaming（teammate 执行入口 · 父 TUC 断言）",
+                "teammate 执行 TUC 的 Leader 归属父 TUC（内含 Leader sessionId；由 SpawnInProcess."
+                    + "spawnInProcessTeammate 物化并经 AutonomousAgentLoop.setLeaderParentTuc 透传）",
+                "teammateIdentity 非 null（agentId=" + teammateIdentityOverride.agentId()
+                    + "，parentSessionId=" + teammateIdentityOverride.parentSessionId()
+                    + "）但 effectiveParentTuc == null（per-call parentTucOverride=null 且构造器级 "
+                    + "parentToolUseContext=null）⇒ 原本会静默降级到 standalone 分支："
+                    + "sessionId 置 SessionKeys.NO_SESSION 哨兵、授权在下一轮读不回来",
+                "由 teammate 的启动方显式提供父 TUC：AutonomousAgentLoop.leaderParentTuc "
+                    + "（SpawnInProcess.setLeaderParentTuc 注入）/ 或 executeTeammateTurn 的 "
+                    + "parentTucOverride 实参；⛔ 不得让 teammate 落到 standalone/no-session 形态");
+        }
+
         // ── Step 1: 解析 AgentDefinition ──
         String effectiveType = subagentType != null ? subagentType : BuiltInAgents.GENERAL_PURPOSE;
         AgentDefinition agentDefinition = resolveAgentDefinition(effectiveType);
@@ -1828,7 +1932,9 @@ public class SubagentExecutor {
         //   isAsync=true 时显式传 shareSetAppState=false (CC forkedAgent.ts:410-411 async 不共享).
         ToolUseContext subagentCtx;
         // [P0-1] per-call 父 TUC 优先 (SkillTool fork 透传), 否则回退构造器级 (SubagentTool 路径)
-        ToolUseContext effectiveParentTuc = parentTucOverride != null ? parentTucOverride : parentToolUseContext;
+        // [fail-loud] 本值在方法入口已算好（连同「teammate 无父 ⇒ 抛」断言，见方法开头）——
+        //   ⛔ 此处不再重算，避免同一表达式两处求值后漂移。
+        //   teammate 路径：断言保证 identity != null 时本值恒非 null（不会落到下面的 standalone 分支）。
         // [RES-R2] resume 二次续跑 agentId override · 对齐 CC runAgent.ts:347 override?.agentId ?
         //   override.agentId : createAgentId() + resumeAgent.ts:240 override.agentId=原 agentId。
         //   仅 resume 路径 (forkParams.agentIdOverride 非 null) 使用原键续写 transcript/metadata;
@@ -2587,7 +2693,10 @@ public class SubagentExecutor {
             //   loop 内 stop 段（对齐 CC executeStopHooks hooks.ts:3653，无 finally 二次发射）。
             // [IMPL-10] DEL-L03-04: frontmatter hooks 已迁 SessionHookStore，Step 21.2
             //   unregister（GenericHook 注销）不再需要；清理由 clearSessionHooks(sessionId/agentId) 承担。
-            cleanupSessionHooks(sessionId, agentId);
+            // [T1 · A-4 伴改] sessionId 若是**从父（Leader）继承来的会话键**，则**不得**清那个桶
+            //   —— 那不是本 agent 自有的会话，清它等于清 Leader 自己注册的 skill/运行时 hooks。
+            //   说明见 {@link #sessionHookKeyToClear}。
+            cleanupSessionHooks(sessionHookKeyToClear(sessionId, effectiveParentTuc), agentId);
 
             // 清除 agent transcript 子目录
             try {
@@ -2601,10 +2710,26 @@ public class SubagentExecutor {
 
             // 清理 agent tracking（对齐 CC cleanupAgentTracking）
             // [P-CC-02] FileStateCache API: invalidateAll() → clear() (CC fileStateCache.ts:58-60 命名).
+            // [批 edit-gate-session-scope · C] ⭐ 同一性守卫（fail-loud）：readFileState 已<b>会话化</b>
+            //   （SessionReadFileStateRegistry，键 = sessionId）。子代理正常拿到的应是本文件
+            //   withEffectiveCwd 派生的<b>独立 clone</b>；万一将来有人把会话表直接交给子代理 TUC
+            //   （例如删掉 C 处的 cloneFileStateCache），本行的 clear() 会静默清空<b>整个会话</b>
+            //   的读状态（主线程 Read 过的文件全部作废）。⇒ 清之前先确认「我拿到的这张」不是
+            //   会话注册表里的那一张；是则 log.error + 跳过，绝不静默执行。
             try {
-                subagentCtx.readFileState().clear();
-                if (log.isDebugEnabled()) {
-                    log.debug("[SubagentExecutor] Step 21.4: 已失效 readFileState agent={} (a+16hex={})", agentId, agentIdHex);
+                com.nexusai.application.agent.tool.FileStateCache sessionTable =
+                    com.nexusai.application.agent.tool.SessionReadFileStateRegistry.peek(sessionId);
+                if (sessionTable != null && sessionTable == subagentCtx.readFileState()) {
+                    log.error("[SubagentExecutor] Step 21.4 同一性守卫命中 ⇒ 跳过 clear()：子代理 readFileState "
+                        + "与会话级 readFileState 是<b>同一实例</b>（agent={} a+16hex={} sessionId={} 条数={}）"
+                        + "—— 清除会作废整个会话的已读状态。请检查 withEffectiveCwd 的 cloneFileStateCache 是否被移除。",
+                        agentId, agentIdHex, sessionId, sessionTable.size());
+                } else {
+                    subagentCtx.readFileState().clear();
+                    if (log.isDebugEnabled()) {
+                        log.debug("[SubagentExecutor] Step 21.4: 已失效 readFileState agent={} (a+16hex={}) "
+                            + "（是子代理自己的副本，非会话表）", agentId, agentIdHex);
+                    }
                 }
             } catch (Exception e) {
                 log.warn("[SubagentExecutor] Step 21.4: fileState 清理失败: {}", e.getMessage());
@@ -2722,6 +2847,78 @@ public class SubagentExecutor {
         return wasAborted
                 ? SubagentResult.aborted(conclusion, toolUseCount, durationMs, agentIdStr, totalTokens, usage)
                 : SubagentResult.completed(conclusion, toolUseCount, durationMs, agentIdStr, totalTokens, usage);
+    }
+
+    /**
+     * [T1 · A-4] 计算「本次收尾应当清理的 session hook 键」：**继承来的会话键一律不清**（返回 null）。
+     *
+     * <p><b>WHY（本批新增的唯一「会反向打到 Leader 自身状态」的下游）</b>：
+     * <ul>
+     *   <li>Step 21.2b 有<b>两条</b>清理：{@code clearSessionHooks(sessionId)} 与
+     *       {@code clearSessionHooks(agentId)}。其中「按 sessionId 清」是 <b>Java 独有</b> ——
+     *       CC/CCB 的 agent 收尾只清 agentId（上游 {@code Open-ClaudeCode/src/tools/AgentTool/
+     *       runAgent.ts:821 clearSessionHooks(rootSetAppState, agentId)}，仅 agentId），sessionId 桶
+     *       只在 SessionEnd 清（CCB {@code src/utils/hooks.ts:4298}）。</li>
+     *   <li>而本仓子代理的 sessionId <b>是继承来的</b>（createSubagentContext.java:233-234
+     *       {@code sessionId = parentToolUseContext.sessionId()}）——普通 Agent-tool 子代理继承主会话、
+     *       本批之后 teammate 继承 Leader 会话。⇒ 按它清 = 清<b>Leader 自己</b>的桶，而 Leader 用 skill 时
+     *       注册的 frontmatter/运行时 hooks 正是以会话键注册的（RegisterSkillHooks.java:110
+     *       经 SkillToolImpl 以 sessionId 注册）⇒ Leader 的 skill hooks 会被子代理/teammate 收尾时清掉。
+     *       本批 teammate 由「每会话一次」变为「<b>每轮一次</b>」（{@code runOneTurn} 每轮调
+     *       {@code executeTeammateTurn}），若不加这个判据，Leader 的 hooks 会被 teammate 每轮清空一次。</li>
+     *   <li>判据 = 「这个 sessionId 是不是我从父 TUC 继承来的」：继承来的不归本 agent 所有
+     *       （standalone 路径的 {@code SessionKeys.NO_SESSION} 哨兵桶、以及未来万一出现「子代理自有独立
+     *       会话」的形态，都仍然照清）。</li>
+     * </ul>
+     *
+     * <p>⛔ 对齐取舍：sessionId 桶从此只在 SessionEnd 清（= CC/CCB 形态）。代价 = 子代理在**自己这一轮里**
+     * 经 skill 注册到父会话键上的临时 hooks 会存活到 SessionEnd（CC 同形，见上引 runAgent.ts:821）。
+     *
+     * <p>package-private static seam（本类既有惯例，见 {@link #withEffectiveCwd} /
+     * {@link #stampSubagentLoopContext}）：Step 21.2b 内联在 22 步主流程里，抽成纯函数后同包单测可直达。
+     *
+     * @param sessionId         本子代理 TUC 的会话键
+     * @param effectiveParentTuc Step 5 生效的父 TUC（null = standalone）
+     * @return 应当清理的会话键；null = 不清理（继承来的 / 无会话键）
+     */
+    static String sessionHookKeyToClear(String sessionId, ToolUseContext effectiveParentTuc) {
+        if (sessionId == null) {
+            return null;
+        }
+        if (effectiveParentTuc != null && sessionId.equals(effectiveParentTuc.sessionId())) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SubagentExecutor] Step 21.2b: session={} 系从父 TUC 继承（非本 agent 自有）"
+                    + "⇒ 跳过 clearSessionHooks(sessionId)，仅清 agentId（对齐 CC runAgent.ts:821）",
+                    sessionId);
+            }
+            return null;
+        }
+        return sessionId;
+    }
+
+    /**
+     * <b>[fail-loud 判据 · 2026-09-22 用户裁定]</b>「携带 teammateIdentity 但没走父 TUC 通道」⇒ true
+     * （调用方 {@code executeStreaming} 方法入口据此抛 {@code MissingLeaderSessionException}）。
+     *
+     * <p>抽成 package-private static seam 的理由（本类既有惯例，见 {@link #withEffectiveCwd} /
+     * {@link #sessionHookKeyToClear}）：断言本体在 22 步流程的入口，若只做「真调一次」的测试，
+     * 反向对照必须让流程继续往下跑（依赖未注入的 LLM/mapper，会在更远处以无关异常失败 ⇒ 假绿/假红）。
+     * 把判据抽成纯函数后，4 种组合（identity × parent）可**确定性地**各自断言，无需启动流程。
+     *
+     * <p><b>边界（为什么是这两个条件）</b>：{@code identity != null} = 「这是 teammate 这条路」
+     * （teammate 是会话内概念，结构上必然属于某个 Leader 会话 ⇒ 不存在「teammate 无父」的合法形态）；
+     * {@code effectiveParentTuc == null} = 「真会走到 no-session 哨兵那一步」。合法降级路径
+     * （普通 Agent-tool 子代理 / workflow worker / hook agent / 入站 MCP）identity 恒 null ⇒ 本判据
+     * 恒 false ⇒ 仍保留 {@code SessionKeys.NO_SESSION} 哨兵语义，不被本断言波及。
+     *
+     * @param teammateIdentityOverride 本轮 teammate 身份（null = 非 teammate 路径）
+     * @param effectiveParentTuc       per-call 父 TUC ?? 构造器级父 TUC（null = 将走 standalone 哨兵）
+     * @return true = 必须 fail-loud（teammate 却无父 TUC）
+     */
+    static boolean teammateWithoutParentTuc(
+            com.nexusai.application.agent.team.TeammateIdentity teammateIdentityOverride,
+            ToolUseContext effectiveParentTuc) {
+        return teammateIdentityOverride != null && effectiveParentTuc == null;
     }
 
     /**

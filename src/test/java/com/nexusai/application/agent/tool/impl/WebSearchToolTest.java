@@ -306,7 +306,7 @@ class WebSearchToolTest {
                 // [V52] 压缩配置 12 列未设 → null · [V54] 压缩数值 11 列未设 → null
                 null, null, null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null, null, null, null, null, null,
-                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null));   // permissionMode（V44 全局默认，本 fixture 未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 12 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null));   // permissionMode（V44 全局默认，本 fixture 未设 → null）· [V45] classifierModel 未设 → null · [V56] 提示词对齐门控 11 列未设 → null · [V61] enabledPlugins/pluginClaudeFallback 未设 → null · [V72] allowDynamicHeaderValues 未设 → null
 
         // 模拟 Spring 装配：裸 new + 反射注入字段 + 触发 @PostConstruct
         WebSearchTool tool = new WebSearchTool();

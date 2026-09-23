@@ -232,10 +232,10 @@ public class SettingsService {
             }
             s.setSnipNudgeThreshold(v);
         }
-        // [prompt-align G0-02 V56] 提示词对齐门控 12 列 merge（null = 不覆盖，对齐既有 merge；
+        // [prompt-align G0-02 V56] 提示词对齐门控 11 列 merge（null = 不覆盖，对齐既有 merge；
         //   DB 列承载，前端「环境配置」可配；消费点经 PromptAlignSettingsResolver 实时读，写库即生效）
+        //   ⚠️ 已退役的 deferred_tools_delta_enabled（V77 DROP COLUMN）不在 merge 集内。
         if (req.taskReminderEnabled() != null) s.setTaskReminderEnabled(req.taskReminderEnabled());
-        if (req.deferredToolsDeltaEnabled() != null) s.setDeferredToolsDeltaEnabled(req.deferredToolsDeltaEnabled());
         if (req.systemPromptBoundaryEnabled() != null) s.setSystemPromptBoundaryEnabled(req.systemPromptBoundaryEnabled());
         if (req.proactiveEnabled() != null) s.setProactiveEnabled(req.proactiveEnabled());
         if (req.coordinatorModeEnabled() != null) s.setCoordinatorModeEnabled(req.coordinatorModeEnabled());
@@ -451,10 +451,10 @@ public class SettingsService {
             //   （V55 列 snip_nudge_threshold；语义 = 上下文剩余百分比，值域 1..100）。
             //   null = 未配置 → 消费点回落默认 30%（SnipCompactor.SNIP_NUDGE_DEFAULT_REMAINING_PERCENT）
             s.getSnipNudgeThreshold(),
-            // [prompt-align G0-02 V56] 提示词对齐门控 12 列透出（V56 列；null = 未配置 →
+            // [prompt-align G0-02 V56] 提示词对齐门控 11 列透出（V56 列；null = 未配置 →
             //   消费点回落 CC 原判定链 env/FeatureFlags/硬编码默认/既有判定类）
+            //   ⚠️ 已退役的 deferred_tools_delta_enabled（V77 DROP COLUMN）不在透出集内。
             s.getTaskReminderEnabled(),
-            s.getDeferredToolsDeltaEnabled(),
             s.getSystemPromptBoundaryEnabled(),
             s.getProactiveEnabled(),
             s.getCoordinatorModeEnabled(),

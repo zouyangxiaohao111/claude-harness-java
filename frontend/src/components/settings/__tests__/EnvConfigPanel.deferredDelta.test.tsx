@@ -6,15 +6,14 @@ import { EnvConfigPanel } from '../EnvConfigPanel'
 import type { AppSettings, UpdateSettingsRequest } from '@/api/types'
 
 /**
- * [dtd-cfg] 「工具延迟加载公告用增量方式」开关 —— 前端可配置 + 保存链路。
+ * 「延迟加载公告用增量方式」开关已退役 —— 前端不再提供该勾选框。
  *
- * WHY（规则 9）：该开关决定 deferred 工具公告走「增量附件」还是「每轮全量清单」。
- * 此前前端完全没有这一项（AppSettings 无字段、面板无 UI）→ 后端 DB 列虽在但用户改不了。
- * 本用例锁死三件事：① 默认（未配置）关闭；② settings 带 true 时回填为开；③ 勾选后经
- * onSaveSettings 以 `deferredToolsDeltaEnabled` 键写回（后端 PUT /settings merge 生效）。
- *
- * 变异自证：把 checkbox 的 onChange 改成写别的键（或不写）→ 第 3 条断言红；把默认值改成
- * `?? true` → 第 1 条断言红。
+ * WHY（规则 9）：该开关写 settings.deferredToolsDeltaEnabled，但后端已删除该判据
+ * （deferred 工具公告的「增量附件 / 每轮全量清单」两态收敛为固定走增量附件），开关不再有任何
+ * 行为。留一个写不进行为的勾选框只会误导用户，故整块移除。后端该 DB 列与 DTO 字段随后一并清除
+ * （V77 迁移 DROP COLUMN），本用例锁死移除后的形态：面板不再渲染
+ * 这一行（防止被误加回）。原用例（默认关 / 回填 / 勾选写回 / 取消写回）断言的正是已删除的开关
+ * 行为，随开关一并移除。
  */
 
 vi.mock('@/api/memory', () => ({
@@ -25,7 +24,7 @@ vi.mock('@/api/memory', () => ({
   updateMemoryConfig: () => Promise.resolve({}),
 }))
 
-const FIELD_NAME = '延迟加载公告用增量方式'
+const RETIRED_FIELD_NAME = '延迟加载公告用增量方式'
 
 function baseSettings(over: Partial<AppSettings> = {}): AppSettings {
   return {
@@ -38,7 +37,7 @@ function baseSettings(over: Partial<AppSettings> = {}): AppSettings {
   }
 }
 
-describe('EnvConfigPanel · 工具延迟加载公告开关', () => {
+describe('EnvConfigPanel · 工具延迟加载公告开关（已退役）', () => {
   let container: HTMLDivElement
   let root: Root
 
@@ -54,16 +53,6 @@ describe('EnvConfigPanel · 工具延迟加载公告开关', () => {
     vi.restoreAllMocks()
   })
 
-  /** 面板里「延迟加载公告用增量方式」那一行的 checkbox。 */
-  function deferredDeltaCheckbox(): HTMLInputElement {
-    const rows = Array.from(container.querySelectorAll('.envc-row'))
-    const row = rows.find((r) => r.querySelector('.envc-name')?.textContent === FIELD_NAME)
-    if (!row) throw new Error(`未找到开关行：${FIELD_NAME}`)
-    const box = row.querySelector('input[type="checkbox"]')
-    if (!box) throw new Error('开关行内无 checkbox')
-    return box as HTMLInputElement
-  }
-
   async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<void>) {
     await act(async () => {
       root.render(<EnvConfigPanel settings={settings} onSaveSettings={onSave} onOpenMemoryEditor={() => {}} />)
@@ -71,39 +60,9 @@ describe('EnvConfigPanel · 工具延迟加载公告开关', () => {
     })
   }
 
-  it('settings 未配置该字段 → 默认关闭（checkbox 未勾选）', async () => {
+  it('面板不再渲染「延迟加载公告用增量方式」开关行（该字段已从 AppSettings 契约移除）', async () => {
     await render(baseSettings(), async () => {})
-    expect(deferredDeltaCheckbox().checked).toBe(false)
-  })
-
-  it('settings.deferredToolsDeltaEnabled=true → 回填为开', async () => {
-    await render(baseSettings({ deferredToolsDeltaEnabled: true }), async () => {})
-    expect(deferredDeltaCheckbox().checked).toBe(true)
-  })
-
-  it('勾选 → 经 onSaveSettings 以 deferredToolsDeltaEnabled 键写回 true', async () => {
-    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => {})
-    await render(baseSettings({ deferredToolsDeltaEnabled: false }), onSave)
-
-    const box = deferredDeltaCheckbox()
-    await act(async () => {
-      box.click()
-      await Promise.resolve()
-    })
-
-    expect(onSave).toHaveBeenCalledTimes(1)
-    expect(onSave.mock.calls[0][0]).toEqual({ deferredToolsDeltaEnabled: true })
-  })
-
-  it('取消勾选 → 写回 false', async () => {
-    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => {})
-    await render(baseSettings({ deferredToolsDeltaEnabled: true }), onSave)
-
-    await act(async () => {
-      deferredDeltaCheckbox().click()
-      await Promise.resolve()
-    })
-
-    expect(onSave.mock.calls[0][0]).toEqual({ deferredToolsDeltaEnabled: false })
+    const names = Array.from(container.querySelectorAll('.envc-name')).map((n) => n.textContent)
+    expect(names).not.toContain(RETIRED_FIELD_NAME)
   })
 })

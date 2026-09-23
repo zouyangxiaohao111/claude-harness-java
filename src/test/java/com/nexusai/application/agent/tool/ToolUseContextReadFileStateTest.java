@@ -22,8 +22,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>父子隔离</b> — createSubagentContext 必须 clone, 避免子 Agent 写 dedup 污染父 cache
  *       (但 ReadState 本身是 immutable record, 改值 = set 替换 = 不会污染 entry)</li>
  *   <li><b>clone 语义</b> — cloneFileStateCache 后子修改不影响父 (子独立 FileStateCache 实例)</li>
- *   <li><b>[P-CC-02] 双限容量</b> — maxEntries=100 + maxSizeBytes=25MB（用户 2026-08-05
- *       拍板严格对齐 CC fileStateCache.ts:18/:22）</li>
+ *   <li><b>[P-CC-02] 双限容量</b> — maxEntries={@link ToolUseContext#READ_FILE_STATE_CACHE_SIZE}
+ *       + maxSizeBytes=25MB（条目数对齐目标 CC 2.1.278 的 {@code LC=5000}，2026-09-22 用户裁定；
+ *       原 100 系对齐 2.1.88 fileStateCache.ts:18；字节上限两版一致 = :22）</li>
  * </ol>
  */
 @DisplayName("Session L+ · ToolUseContext.readFileState 跨工具共享 + 父→子透传 + FileStateCache 双限真 LRU")
@@ -167,15 +168,22 @@ class ToolUseContextReadFileStateTest {
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // [P-CC-02] FileStateCache 双限配置验证 (用户 2026-08-05 拍板严格对齐 CC 100/25MB)
+    // [P-CC-02] FileStateCache 双限配置验证
+    //   (条目数 = ToolUseContext.READ_FILE_STATE_CACHE_SIZE，对齐目标 CC 2.1.278 的 LC=5000，
+    //    2026-09-22 用户裁定，原 100 系对齐 2.1.88；字节上限 25MB 两版一致)
     // ════════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("[P-CC-02] READ_FILE_STATE_CACHE_SIZE = 100 · 用户 2026-08-05 拍板严格对齐 CC (fileStateCache.ts:18)")
-    void readFileStateCacheSizeIsCc100() {
+    @DisplayName("[P-CC-02/rfs-align-3a] READ_FILE_STATE_CACHE_SIZE = 5000 · 用户 2026-09-22 拍板对齐 CC 2.1.278 (LC=5000)")
+    void readFileStateCacheSizeIsCc5000() {
+        // ⚠ 本断言钉的是【对齐目标版本】：CC 2.1.278 发行产物 claude.exe 内嵌
+        //   `var LC=5000,T=26214400,L=4096;`（字节 offset 199640137）⇒ 条目数上限 = 5000。
+        //   ⛔ 不是 CC 2.1.88 的 100（源码参照 Open-ClaudeCode/src/utils/fileStateCache.ts:18
+        //   确为 READ_FILE_STATE_CACHE_SIZE=100）—— 两个版本的取值不同，本条按【对齐目标】
+        //   （2.1.278）钉，勿据 2.1.88 改回 100。
         assertThat(ToolUseContext.READ_FILE_STATE_CACHE_SIZE)
-            .as("条目数上限 100 (CC original: READ_FILE_STATE_CACHE_SIZE=100, utils/fileStateCache.ts:18)")
-            .isEqualTo(100);
+            .as("条目数上限 5000 (对齐目标 CC 2.1.278 的 LC=5000；2.1.88 fileStateCache.ts:18 为 100)")
+            .isEqualTo(5000);
     }
 
     @Test

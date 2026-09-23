@@ -182,7 +182,11 @@ public class ReadFileTool implements Tool {
      * <p>dedup 命中时 tool_result content = 本 stub（CC mapToolResult :686-691 file_unchanged
      * case → FILE_UNCHANGED_STUB）。旧实现自定义 "{@code <file_unchanged> path=...}" 偏离 CC。
      */
-    static final String FILE_UNCHANGED_STUB =
+    // [批 rfs-replay-3b] 可见性 static → public：跨进程 replay（ReadFileStateReplay）第二遍扫
+    //   tool_result 时必须能判「本结果是 file_unchanged 摘要而非文件内容」（CC 2.1.278 `aHt`
+    //   用 `SVt(Y.content)` 同款守卫，exe off 209689965；CC 2.1.88 亦 `startsWith(FILE_UNCHANGED_STUB)`）。
+    //   ⛔ 常量本体逐字不动，只放开可见性 ⇒ 单点真源，避免 replay 侧另抄一份字符串漂移。
+    public static final String FILE_UNCHANGED_STUB =
         "File unchanged since last read. The content from the earlier Read tool_result in this "
             + "conversation is still current — refer to that instead of re-reading.";
 
@@ -1239,8 +1243,11 @@ public class ReadFileTool implements Tool {
         if (ctx != null) {
             // [key 同源] 键 = 按会话 cwd 解析的规范化绝对路径（与 Edit/Write 门禁键同源）
             String keyForCache = ToolUseContext.keyForReadFileState(guard, file.toString());
+            // [批 rfs-replay-3b] contentNotInModelContext=false：本 entry 的 content 正是本回合
+            //   刚返回给模型的那份（模型确实看过）⇒ 不是「内容不在模型上下文」。
+            //   ⛔ 只有「内容取自磁盘、模型没看过」的 entry（replay 的 Edit 派生 / 未来 seed）才置 true。
             ctx.readFileState().set(keyForCache,
-                new ReadState(mtime, offset, limit, false, rawContent));
+                new ReadState(mtime, offset, limit, false, rawContent, false));
         }
 
         // [ODF-B4R-LAZY] 触发集生产者 · 对齐 CC FileReadTool.ts:1038（text 分支读成功 → 写触发集）
@@ -2118,7 +2125,8 @@ public class ReadFileTool implements Tool {
             // [key 同源] 键 = 按会话 cwd 解析的规范化绝对路径（与 NotebookEditTool 门禁键同源）
             String keyForCache = ToolUseContext.keyForReadFileState(guard, file.toString());
             ctx.readFileState().set(keyForCache,
-                new ReadState(notebookMtime, offset, limit, false, cellsJson));
+                // [批 rfs-replay-3b] contentNotInModelContext=false（同文本分支：模型刚看过本份内容）。
+                new ReadState(notebookMtime, offset, limit, false, cellsJson, false));
         }
 
         // [ODF-B4R-LAZY] 触发集生产者 · 对齐 CC FileReadTool.ts:848（notebook 分支读成功 → 写触发集）

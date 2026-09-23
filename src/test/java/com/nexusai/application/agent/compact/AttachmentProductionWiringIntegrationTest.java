@@ -143,13 +143,11 @@ class AttachmentProductionWiringIntegrationTest {
     @Test
     @DisplayName("3×delta gate 开: 压缩后重宣布 deferred_tools/agent_listing/mcp_instructions_delta")
     void deltaGatesOnProduceThreeDeltaAttachments() {
-        // gate 注入（CC isDeferredToolsDeltaEnabled USER_TYPE=ant / shouldInjectAgentListInMessages
-        // env，测试 seam 替代真实环境；mcp_instructions 门已删 ⇒ 无需注入）
-        // [R9(b) env seam 归一] 门统一读 ToolSearchService.currentEnv() → 单一 seam 注入全部。
-        // ⚠️ mcp_instructions_delta 门已删（2026-09-21 · 对齐 2.1.278）⇒ 不再注入
-        //   CLAUDE_CODE_MCP_INSTR_DELTA；该支无条件重宣布。
+        // gate 注入（agent_listing 门 shouldInjectAgentListInMessages 读 env，
+        // 测试 seam 替代真实环境）。
+        // ⚠️ deferred_tools 门（isDeferredToolsDeltaEnabled / USER_TYPE=ant）与 mcp_instructions 门
+        //   （CLAUDE_CODE_MCP_INSTR_DELTA）均已整体删除（对齐 2.1.278）⇒ 不再注入；两支持续重宣布。
         com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride = Map.of(
-            "USER_TYPE", "ant",
             "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true");
 
         // 工具池：MCP 工具（恒 deferred）+ ToolSearch（gate2/4 目标）+ Agent 工具
@@ -214,11 +212,11 @@ class AttachmentProductionWiringIntegrationTest {
         //   而 openai_compatible provider 无 tool_reference 语义（ToolSearch 命中不激活工具）→ 若仍产出
         //   该 delta 就是误导 + 死锁。单点 toolReferenceUsable(openai_compatible, claude-*) = false →
         //   dtd gate 拦截。变异：单点去掉 provider 那一半 → 本用例变红（dtd 误产出）。
-        // [R9(b) env seam 归一] 三条门统一读 ToolSearchService.currentEnv() → 单一 seam 注入全部。
-        // ⚠️ mcp_instructions_delta 门已删（2026-09-21 · 对齐 2.1.278）⇒ 不再注入
-        //   CLAUDE_CODE_MCP_INSTR_DELTA；该支无条件重宣布。
+        // [R9(b) env seam 归一] 门统一读 ToolSearchService.currentEnv() → 单一 seam 注入全部。
+        // ⚠️ deferred_tools 门（isDeferredToolsDeltaEnabled / USER_TYPE=ant）与 mcp_instructions 门
+        //   （CLAUDE_CODE_MCP_INSTR_DELTA）均已整体删除（对齐 2.1.278）⇒ 不再注入；
+        //   deferred_tools_delta 支截断由 capability 门（toolReferenceUsable）保证。
         com.nexusai.application.agent.toolsearch.ToolSearchService.envOverride = Map.of(
-            "USER_TYPE", "ant",
             "CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true");
 
         List<Tool> tools = new ArrayList<>();

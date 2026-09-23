@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.team;
 
+import com.nexusai.application.agent.compact.PostCompactAttachmentRestorer;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -143,5 +144,28 @@ class TeammateMessageFoldingChainTest {
         assertThat(out).hasSize(1);
         assertThat(out.get(0).subtype()).isEqualTo("teammate_shutdown_batch");
         assertThat(out.get(0).content()).contains("\"count\":2");
+    }
+
+    @Test
+    @DisplayName("同 subtype 两种可见性（有意）：teammate 通知支 isMeta=false + compact 恢复支 isMeta=true")
+    void taskStatus_twoVisibilities_areIntentional() {
+        // WHY（规则九）：同一个 subtype 'task_status' 有两个不同的**收件人** ——
+        //   ① teammate 完成通知支 = 给**人**看的界面通知 ⇒ 必须可见（isMeta=false），否则用户看不到队友已结束；
+        //   ② compact 恢复支 = 压缩后注入**给模型**看的上下文恢复 ⇒ 必须对用户隐藏（isMeta=true），
+        //      否则内部 JSON 载荷原样露给用户（这正是本批拨正的症状）。
+        //   两者对 isMeta 的要求**相反**，是有意区分；若被「统一」成同一个值，必有一侧回归
+        //   （通知消失 或 原始载荷外露）。本断言把两侧同时钉住（⛔ 不许弱化成只断言其一）。
+        ChatMessageDto teammate = TeammateMessageFoldingChain.teammateTaskStatusAttachment(
+            "t1", "alice", "completed", "sess-1");
+        List<ChatMessageDto> compact = PostCompactAttachmentRestorer.asyncAgentAttachments(
+            List.of(new PostCompactAttachmentRestorer.AsyncAgentInfo(
+                "agent-1", "bg", "completed", false, "done", null, null)), null);
+
+        assertThat(teammate.subtype()).isEqualTo("task_status");
+        assertThat(compact).hasSize(1);
+        assertThat(compact.get(0).subtype()).isEqualTo("task_status");
+        // 收件人不同 ⇒ isMeta 相反（有意，勿统一）
+        assertThat(teammate.isMeta()).isFalse();        // 给人看的通知 ⇒ 可见
+        assertThat(compact.get(0).isMeta()).isTrue();   // 给模型看的上下文恢复 ⇒ 前端隐藏
     }
 }

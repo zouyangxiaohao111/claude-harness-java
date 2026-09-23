@@ -3,7 +3,9 @@ import { tokenWarningBannerText } from '@/utils/contextUsage'
 
 /**
  * 压缩警告抑制态横幅 · 对齐 CC TokenWarning（上下文快满 / 自动压缩被抑制时提示）。
- * 消费后端 token_warning 事件：suppressed=true（压缩成功）→ 隐藏；false → 恢复显示。
+ * 消费后端 token_warning 事件：suppressed=true（压缩成功）→ 隐藏；
+ * suppressed=false **且载荷带真实用量数字**（tokenUsage>0）→ 显示（仅 suppressed=false 不够 ——
+ * 后端抑制开关翻转时推的是占位载荷 tokenUsage=0，见 CompactWarningState:291）。
  *
  * <p>[P3-d 口径统一 2026-09-11] **只给文字不给百分比**：{@code token_warning.percentLeft} 后端已改名
  * {@code thresholdRelativePercentLeft}（阈值相对口径，分母 autoCompactThreshold ≠ 上下文窗口），

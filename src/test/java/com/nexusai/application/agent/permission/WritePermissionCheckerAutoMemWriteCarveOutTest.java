@@ -9,6 +9,7 @@ import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.WriteFileTool;
+import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -79,6 +80,26 @@ class WritePermissionCheckerAutoMemWriteCarveOutTest {
     @org.junit.jupiter.api.AfterEach
     void clearNoDatabaseForSessionProjectRoot() {
         SessionProjectRootTestSupport.clearNoDatabase();
+    }
+
+    /**
+     * 把本用例的合成 sessionId 绑定到 {@code projectRoot}（= CC {@code getProjectRoot()} ·
+     * {@code SessionProjectRoot.lookup} → {@code projects.path}），<b>替代</b> {@code @BeforeEach} 的
+     * 「本夹具不接 DB」声明（那份声明会让 {@code CwdResolution.getProjectRoot} 走 sessionless 出口 ⇒
+     * 返回进程 {@code user.dir}，即<b>不是</b>本用例的项目根）。
+     *
+     * <p><b>WHY 必须显式绑定（2026-09-22 · 对齐 CC getAutoMemBase）</b>：{@code PathValidationEnv
+     * .withAutoMem} 的 slug 锚自本批起 = {@link PathValidationEnv#sessionProjectRoot}（对齐 CC
+     * {@code getAutoMemBase()} = {@code findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot()}），
+     * ⛔ 不再是 {@code effectiveCwd}。夹具若不绑定，{@code sessionProjectRoot} 会是 {@code user.dir}
+     * ⇒ 派生出的 base 与本用例 {@code @TempDir} 项目根不同源 ⇒ <b>正例假红</b>。
+     * 同时也说明「{@code effectiveCwd} 恰好等于项目根」这种夹具姿态<b>遮蔽了</b>本批要治的分裂场景
+     * —— 分裂场景见
+     * {@link #autoMemEntrypointWrite_isAllowed_whenEffectiveCwdDivergesFromProjectRoot}。
+     */
+    private static void bindSessionProjectRoot(Path projectRoot) {
+        SessionProjectRoot.setDbResolver(
+            sid -> SessionProjectRoot.Lookup.bound(projectRoot.toString()));
     }
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -155,6 +176,8 @@ class WritePermissionCheckerAutoMemWriteCarveOutTest {
         Path memoryBase = memoryRoot.resolve(NexusaiPaths.getProjectDirName());
         AutoMemPaths pojo = pojoAutoMemPaths(projectRoot, memoryBase);
         assertFixtureShape(pojo, projectRoot, memoryBase);
+        // 夹具姿态：sessionProjectRoot = projectRoot（= CC getProjectRoot()），本用例 effectiveCwd 亦 = 它。
+        bindSessionProjectRoot(projectRoot);
 
         String autoMem = pojo.getAutoMemPath(projectRoot.toString());
         // 尾分隔符 + resolve ⇒ <autoMem>/MEMORY.md（Path.of 归一化掉尾分隔符）
@@ -184,6 +207,7 @@ class WritePermissionCheckerAutoMemWriteCarveOutTest {
         //   使「carve-out 本身可达」与「checker 接线」两件事各自有独立证据。
         Path memoryBase = memoryRoot.resolve(NexusaiPaths.getProjectDirName());
         AutoMemPaths pojo = pojoAutoMemPaths(projectRoot, memoryBase);
+        bindSessionProjectRoot(projectRoot);
         ToolUseContext tuc = ctx(projectRoot);
         PathValidationEnv env = PathValidationEnv.fromToolUseContext(tuc).withAutoMem(pojo);
 
@@ -197,6 +221,143 @@ class WritePermissionCheckerAutoMemWriteCarveOutTest {
             .isTrue();
         assertThat(r.decisionReason())
             .as("reason 逐字对齐 CC")
+            .isEqualTo(new PermissionDecisionReason.Other("auto memory files are allowed for writing"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 1′. ⭐ 本批核心判据：分裂场景（effectiveCwd ≠ sessionProjectRoot）
+    // ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("⭐分裂场景：effectiveCwd ≠ sessionProjectRoot（模拟 bash cd / worktree）⇒ 写 <项目根 slug>/memory/MEMORY.md 仍必须 Allow")
+    void autoMemEntrypointWrite_isAllowed_whenEffectiveCwdDivergesFromProjectRoot(
+            @TempDir Path memoryRoot, @TempDir Path projectRoot, @TempDir Path divergedCwd) {
+        // WHY（本用例钉住的意图 · 规则九）：真实症状不是「基址没填」，而是「基址的 slug 锚取错了源」。
+        //   2026-09-22 实机：会话 sess-80e95674 的冻结项目根 = D:\code\ai_project\nexusai，但模型跑过
+        //   `cd "D:/code/ai_project/ai-agent-client-svn"` 后 effectiveCwd 变成那个 SVN 工作副本 ⇒
+        //   旧实现（base = getAutoMemPath(effectiveCwd)）算出的 slug 与真实记忆目录不同源 ⇒
+        //   写 memory/*.md 恒落 SafetyCheck Ask，用户每写一次记忆弹一次窗。
+        //   ⛔ 故本用例的扰动点就是「两个 cwd 字段不同源」，其余输入与正例逐字节同构。
+        Path memoryBase = memoryRoot.resolve(NexusaiPaths.getProjectDirName());
+        AutoMemPaths pojo = pojoAutoMemPaths(projectRoot, memoryBase);
+        assertFixtureShape(pojo, projectRoot, memoryBase);
+        // sessionProjectRoot = projectRoot（介质同源），effectiveCwd = divergedCwd（模拟 cd 后的 cwd）
+        bindSessionProjectRoot(projectRoot);
+
+        ToolUseContext tuc = ctx(divergedCwd);
+        PathValidationEnv env = PathValidationEnv.fromToolUseContext(tuc).withAutoMem(pojo);
+
+        // ① 夹具前提自检（防「恒绿」）：两个字段必须真的不同源，否则本用例测不到分裂（扰动无效）。
+        assertThat(env.sessionProjectRoot())
+            .as("夹具前提：sessionProjectRoot 必须已被绑定（非 null/空白）")
+            .isNotBlank();
+        assertThat(env.effectiveCwd())
+            .as("夹具前提：effectiveCwd 必须已填（模拟 cd 后的会话 cwd）")
+            .isNotBlank();
+        String rootSlug = AutoMemPaths.sanitizePath(pojo.getAutoMemBase(env.sessionProjectRoot()));
+        String cwdSlug = AutoMemPaths.sanitizePath(pojo.getAutoMemBase(env.effectiveCwd()));
+        assertThat(cwdSlug)
+            .as("夹具前提：分裂场景必须真的分裂（root slug=%s / cwd slug=%s）—— 二者相同则本用例恒定绿",
+                rootSlug, cwdSlug)
+            .isNotEqualTo(rootSlug);
+
+        // ② 真实落盘形状：<memoryBase>/projects/<sanitizePath(项目根)>/memory/MEMORY.md
+        String autoMem = pojo.getAutoMemPath(projectRoot.toString());
+        String memoryFile = Path.of(autoMem).normalize().resolve("MEMORY.md").toString();
+
+        // ③ 核心层（被改代码的直接分派点）：auto-mem 写 carve-out 必须命中
+        assertThat(PathValidation.checkEditableInternalPath(memoryFile, env).allowed())
+            .as("分裂场景下核心层必须命中 auto-mem 写 carve-out（锚取错源 ⇒ 结构性不命中）")
+            .isTrue();
+        assertThat(PathValidation.checkEditableInternalPath(memoryFile, env).decisionReason())
+            .as("reason 逐字对齐 CC")
+            .isEqualTo(new PermissionDecisionReason.Other("auto memory files are allowed for writing"));
+
+        // ④ 端到端（用户可见症状）：Edit/Write 记忆文件必须静默 allow、不弹窗
+        WritePermissionChecker checker = new WritePermissionChecker();
+        checker.setAutoMemPaths(pojo);
+        Tool tool = new WriteFileTool(new PathGuard(projectRoot));
+        PermissionResult result = checker.check(tool, input(memoryFile), ctx(divergedCwd));
+        assertThat(result)
+            .as("分裂场景下端到端必须 Allow（落 Ask ⇒ 每次写记忆都弹窗 = 用户报告的 0.1.19 症状）")
+            .isInstanceOf(PermissionResult.Allow.class);
+        assertThat(((PermissionResult.Allow) result).reason())
+            .as("reason 必须是 CC 逐字文案")
+            .isEqualTo(new PermissionDecisionReason.Other("auto memory files are allowed for writing"));
+
+        // ⑤ 反向鉴别器（证明「锚来自稳定项目根」而非「碰巧放行」）：由 effectiveCwd 派生的那条
+        //    【假】记忆目录不得被 carve-out 放行 —— 旧实现正是拿它当基址。
+        String cwdDerivedFile = Path.of(pojo.getAutoMemPath(divergedCwd.toString()))
+            .normalize().resolve("MEMORY.md").toString();
+        assertThat(PathValidation.checkEditableInternalPath(cwdDerivedFile, env).allowed())
+            .as("effectiveCwd 派生的假记忆目录不得被放行（若放行 ⇒ 基址仍取自 effectiveCwd）")
+            .isFalse();
+
+        // ⑥ 字段形态（诊断性 · 放在最后，与 AutoMemPathPrefixBoundaryTest「先行为后契约」同款）：
+        //    autoMemBaseDir 必须 = 稳定项目根派生的记忆目录（带 CC 契约的尾分隔符）。
+        assertThat(env.autoMemBaseDir())
+            .as("基址必须由【稳定项目根】派生（⛔ 不是 effectiveCwd）")
+            .isEqualTo(Path.of(autoMem).normalize().toString() + java.io.File.separator);
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 1″. ⭐ 真实路径形态复核（实机 0.1.19 症状路径）
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * <b>真实路径形态复核</b>（⛔ 不用 {@code @TempDir} 当 memoryBase/项目根）：
+     * {@code ~/.nexusai/projects/<主仓根 sanitize 后的 slug>/memory/<某.md>}。
+     *
+     * <p>夹具姿态 = 实机 0.1.19 那一刻：{@code memoryBase} = 真实配置主目录
+     * （{@link NexusaiPaths#getAppConfigHomeDir()} = {@code ~/.nexusai}）、项目根 = 真实 git 仓库
+     * canonical 根（{@code findCanonicalGitRoot(user.dir)}，worktree 经 gitdir/commondir 归一后即主仓根
+     * ⇒ slug 与实机一致），而会话 cwd 漂到<b>仓库外</b>（{@code @TempDir}，非 git ⇒ 模拟实机的
+     * {@code cd "D:/code/ai_project/ai-agent-client-svn"} SVN 工作副本）。
+     *
+     * <p>本用例<b>不</b>读写任何文件（carve-out 是纯路径判定）——{@code AutoMemPaths} 只做路径计算。
+     */
+    @Test
+    @DisplayName("⭐真实路径形态：~/.nexusai/projects/<主仓根 slug>/memory/x.md + cwd 漂到仓库外 ⇒ 必须 Allow")
+    void autoMemWrite_realConfigHomeAndRepoSlug_isAllowed_whenCwdDriftedOutsideRepo(
+            @TempDir Path driftedCwd) {
+        // 夹具前提 1：必须在 git 检出内跑（否则无从复现「主仓根 slug」）⇒ fail-loud，⛔ 不静默跳过。
+        String repoRoot = AutoMemPaths.findCanonicalGitRoot(System.getProperty("user.dir"));
+        assertThat(repoRoot)
+            .as("夹具前提：本测试须跑在 git 检出内（user.dir=%s）—— 否则无法复现实机 slug",
+                System.getProperty("user.dir"))
+            .isNotNull();
+        // 夹具前提 2：漂移 cwd 必须在任何 git 仓库之外，否则 canonical 归一后 slug 可能又相同 ⇒ 测不到分裂。
+        assertThat(AutoMemPaths.findCanonicalGitRoot(driftedCwd.toString()))
+            .as("夹具前提：漂移 cwd 必须是非 git 目录（模拟实机的 SVN 工作副本）")
+            .isNull();
+
+        String configHome = NexusaiPaths.getAppConfigHomeDir();
+        AutoMemPaths pojo = new AutoMemPaths(() -> repoRoot, () -> configHome, () -> null, () -> null);
+        bindSessionProjectRoot(Path.of(repoRoot));
+
+        // 真实路径形态（⛔ 不是 @TempDir）：~/.nexusai/projects/<主仓根 slug>/memory/<某.md>
+        String memoryFile = Path.of(pojo.getAutoMemPath(repoRoot))
+            .normalize().resolve("reference_svn_client_mirror.md").toString();
+        assertThat(memoryFile)
+            .as("夹具前提：路径形态必须是 <configHome>/projects/<slug>/memory/<file>")
+            .startsWith(configHome)
+            .contains("projects" + java.io.File.separator)
+            .contains("memory" + java.io.File.separator);
+        assertThat(pojo.getAutoMemBase(repoRoot))
+            .as("夹具前提：项目根 canonical 归一后即仓库根（实机 slug 来源）")
+            .isEqualTo(repoRoot);
+
+        WritePermissionChecker checker = new WritePermissionChecker();
+        checker.setAutoMemPaths(pojo);
+        Tool tool = new WriteFileTool(new PathGuard(Path.of(repoRoot)));
+
+        PermissionResult result = checker.check(tool, input(memoryFile), ctx(driftedCwd));
+
+        assertThat(result)
+            .as("真实路径形态 + cwd 已漂 ⇒ 仍必须 Allow（旧实现在此落 SafetyCheck Ask = 实机每次弹窗）")
+            .isInstanceOf(PermissionResult.Allow.class);
+        assertThat(((PermissionResult.Allow) result).reason())
+            .as("reason 必须是 CC 逐字文案")
             .isEqualTo(new PermissionDecisionReason.Other("auto memory files are allowed for writing"));
     }
 
@@ -246,6 +407,9 @@ class WritePermissionCheckerAutoMemWriteCarveOutTest {
         //   —— 即模型可无弹窗写 ~/.nexusai 下的任意文件（含 DB / settings）。本用例是那条红线的哨兵。
         Path memoryBase = memoryRoot.resolve(NexusaiPaths.getProjectDirName());
         AutoMemPaths pojo = pojoAutoMemPaths(projectRoot, memoryBase);
+        // 绑定稳定项目根 ⇒ base 真的落在本用例项目根派生的 slug 上，guardPath 才是「同 slug 同级」的
+        // ⭐ 有意义对照（不绑定则 sessionProjectRoot=user.dir ⇒ base 在别处 ⇒ 本断言恒绿 = 扰动无效）。
+        bindSessionProjectRoot(projectRoot);
         String autoMem = pojo.getAutoMemPath(projectRoot.toString());
         // 与 autoMem 同级但不在 memory 目录内（同 slug 目录下）：
         String guardPath = Path.of(autoMem).normalize().getParent()

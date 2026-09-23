@@ -9,6 +9,7 @@ import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.team.TeammateIdentity;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.tool.SessionReadFileStateRegistry;
 import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
@@ -158,6 +159,58 @@ class LlmAgentLoopBaseTucWriteTest {
             .isNull();
     }
 
+    /**
+     * <b>[批 edit-gate-session-scope · B] readFileState 的「作用域写点」</b>：
+     * {@code buildBaseToolUseContext} 必须按 {@code sessionId} 从会话注册表取表
+     * （同会话跨 run 恒同一实例；不同会话不同实例）。
+     *
+     * <p><b>WHY（规则九 · 测意图）</b>：改造前实参为 {@code null} ⇒
+     * {@link ToolUseContext} 紧凑构造器每次 run 新建一张表 ⇒ 同一会话两条消息互不可见对方
+     * Read 过的文件 ⇒ 用户上一轮 Read 过、本轮 Edit 被门禁拒（errorCode 6/2/9）。
+     * 本用例守的是「作用域」这一维：<b>同会话跨 run 必须是同一张表</b>。
+     *
+     * <p><b>RED 条件（变异分辨力）</b>：把注入实参改回 {@code null}
+     * （{@code SessionReadFileStateRegistry.forSession(state.sessionId())} → {@code null}）
+     * ⇒ 两个 loop 实例各得一张新表 ⇒ 第 2 条断言 {@code isSameAs} 红。
+     * 反向：把 {@code forSession} 改成返回全局单例 ⇒ 第 3 条 {@code isNotSameAs} 红。
+     * 两个 loop 是<b>不同实例</b>（{@code @Scope("prototype")} 的生产形态），
+     * 故本用例不可能是「同一个 ctx 被传了两遍」的假绿。
+     */
+    @Test
+    @DisplayName("Tier A 写点：readFileState 会话级 —— 同 sessionId 跨 loop 实例同一实例，异 sessionId 不同实例")
+    void tierA_readFileState_isSessionScoped() throws Exception {
+        Path anchor = canonical(Files.createDirectories(tempDir.resolve("tierA-readstate")));
+        String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        String otherSessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
+        try {
+            // 两次「run」= 两个**不同**的 LlmAgentLoop 实例（生产 prototype 语义）
+            ToolUseContext run1 = invokeBuildBaseTuc(
+                newLoop(), new AgentState("sys", sessionId, null), anchor);
+            ToolUseContext run2 = invokeBuildBaseTuc(
+                newLoop(), new AgentState("sys", sessionId, null), anchor);
+            ToolUseContext other = invokeBuildBaseTuc(
+                newLoop(), new AgentState("sys", otherSessionId, null), anchor);
+
+            assertThat(run2)
+                .as("两个 run 必须是不同的 TUC 对象（排除「同一 ctx 传两遍」的假绿）")
+                .isNotSameAs(run1);
+            assertThat(run2.readFileState())
+                .as("readFileState 必须会话级：同 sessionId 跨 run 复用同一张表"
+                    + "（改回 null ⇒ 本断言红）")
+                .isSameAs(run1.readFileState());
+            assertThat(other.readFileState())
+                .as("按 sessionId 分区：不同会话不得共享（退化成全局单例 ⇒ 本断言红）")
+                .isNotSameAs(run1.readFileState());
+            assertThat(SessionReadFileStateRegistry.peek(sessionId))
+                .as("该表必须真的注册在会话注册表里（而不是碰巧同一对象）")
+                .isSameAs(run1.readFileState());
+        } finally {
+            // 静态表跨用例存活 ⇒ 本用例自建的会话必须自行回收（不依赖他类的 resetForTest）。
+            SessionReadFileStateRegistry.evict(sessionId);
+            SessionReadFileStateRegistry.evict(otherSessionId);
+        }
+    }
+
     // ════════════════════════ Tier B（端到端写侧 · 覆盖调用点） ════════════════════════
 
     /**
@@ -251,10 +304,14 @@ class LlmAgentLoopBaseTucWriteTest {
     // ── helpers ──────────────────────────────────────────────
 
     /**
-     * 反射调 private 6 参 {@code buildBaseToolUseContext}。
+     * 反射调 private 7 参 {@code buildBaseToolUseContext}。
      *
      * <p>⚠️ 必须按<b>精确参数类型表</b>取（0-arg 便捷重载 + 同名 1 参版本仍在）：按名字过滤取第一个
      * 会静默测错重载。arity 漂移 ⇒ {@link NoSuchMethodException} ⇒ 本类变红（fail loud）。
+     *
+     * <p>[批 rfs-replay-3b] arity 6 → 7：新增 {@code List<ChatMessageDto> dbTranscript}
+     * （跨进程 readFileState replay 的原料）。本反射点按契约同步；传 null = 该路径无 DB 历史
+     * ⇒ replay 整段软降级跳过（本类关心的是 sessionId / effectiveCwd 写入端，与 replay 无关）。
      */
     private static ToolUseContext invokeBuildBaseTuc(LlmAgentLoop loop, AgentState state, Path runExplicitCwd) {
         try {
@@ -264,17 +321,19 @@ class LlmAgentLoopBaseTucWriteTest {
                 InitialPermissionModeResolver.Config.class,
                 Path.class,
                 TeammateIdentity.class,
-                AgentContext.class);
+                AgentContext.class,
+                List.class);
             m.setAccessible(true);
             return (ToolUseContext) m.invoke(loop, state,
                 InitialPermissionModeResolver.Input.empty(),
                 InitialPermissionModeResolver.Config.defaults(),
                 runExplicitCwd,
                 null,   // teammateIdentity：本路径不存在 teammate 承载体（见 doRun 注释）
-                null);  // agentContext：主线程 / cron 无归因（等价 CC 主线程 undefined）
+                null,   // agentContext：主线程 / cron 无归因（等价 CC 主线程 undefined）
+                null);  // dbTranscript：无 DB 历史 ⇒ replay 软降级跳过（rfs-replay-3b）
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(
-                "反射调用 6 参 buildBaseToolUseContext 失败（签名漂移？本类按精确参数表取方法，"
+                "反射调用 7 参 buildBaseToolUseContext 失败（签名漂移？本类按精确参数表取方法，"
                     + "arity 变更必须同步本反射点）", e);
         }
     }

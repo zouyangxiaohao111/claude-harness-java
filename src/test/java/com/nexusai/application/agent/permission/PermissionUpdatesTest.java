@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.permission;
 
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -267,5 +268,101 @@ class PermissionUpdatesTest {
     void generateSuggestions_nullFilePath_empty() {
         assertThat(PermissionUpdates.generateSuggestions(
             null, PermissionUpdates.OperationType.READ, PermissionMode.DEFAULT, true)).isEmpty();
+    }
+
+    // ── 自有设置专用档（CC permissionOptions.tsx:105-113 + usePermissionHandler.ts:104-129） ──
+
+    /** 自有根内的目标路径（家目录形；{@code .{appName}} 从生产同源取，⛔ 不写死字面量）。 */
+    private static String homeOwnRootFile() {
+        return java.nio.file.Paths.get(System.getProperty("user.home"),
+            NexusaiPaths.getProjectDirName(), "teams", "proj-a", "notes.md").toString();
+    }
+
+    /** 工作目录内的自有根目标路径。 */
+    private static String cwdOwnRootFile(String cwd) {
+        return java.nio.file.Paths.get(cwd, NexusaiPaths.getProjectDirName(), "teams", "notes.md").toString();
+    }
+
+    @Test
+    @DisplayName("自有设置专用档：~/.{appName} 内 → addRules(Edit,'~/.{appName}/**',allow,session)（照 CC）")
+    void selfConfigRoot_globalRoot_producesSessionEditRule() {
+        PermissionUpdate.AddRules addRules =
+            PermissionUpdates.selfConfigRootRuleSuggestion(homeOwnRootFile(), "D:/repo")
+                .orElseThrow(() -> new AssertionError("自有根内必须产出专用档（CC permissionOptions.tsx:105-113）"));
+
+        assertThat(addRules.destination())
+            .as("destination=session（CC usePermissionHandler.ts:123）")
+            .isEqualTo(PermissionUpdate.Destination.SESSION);
+        assertThat(addRules.behavior())
+            .as("behavior=allow（CC :122）").isEqualTo(PermissionBehavior.ALLOW);
+        assertThat(addRules.rules()).hasSize(1);
+        PermissionRuleValue rv = addRules.rules().get(0).ruleValue();
+        assertThat(rv.toolName()).as("toolName=Edit（CC FILE_EDIT_TOOL_NAME，constants.ts:2）").isEqualTo("Edit");
+        assertThat(rv.ruleContent())
+            .as("ruleContent = '~/.{appName}/**'（CC GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN 的对应物）")
+            .isEqualTo("~/" + NexusaiPaths.getProjectDirName() + "/**");
+        assertThat(addRules.rules().get(0).source())
+            .as("规则 source=SESSION（会话级，不落盘）").isEqualTo(PermissionRuleSource.SESSION);
+    }
+
+    @Test
+    @DisplayName("自有设置专用档：<cwd>/.{appName} 内 → addRules(Edit,'/.{appName}/**',allow,session)")
+    void selfConfigRoot_projectRoot_producesProjectScopedRule() {
+        String cwd = java.nio.file.Paths.get(System.getProperty("user.home"), "some-repo").toString();
+        PermissionUpdate.AddRules addRules =
+            PermissionUpdates.selfConfigRootRuleSuggestion(cwdOwnRootFile(cwd), cwd)
+                .orElseThrow(() -> new AssertionError("工作目录自有根内必须产出专用档"));
+
+        assertThat(addRules.rules().get(0).ruleValue().ruleContent())
+            .as("ruleContent = '/.{appName}/**'（CC CLAUDE_FOLDER_PERMISSION_PATTERN 的对应物）")
+            .isEqualTo("/" + NexusaiPaths.getProjectDirName() + "/**");
+        assertThat(addRules.destination()).isEqualTo(PermissionUpdate.Destination.SESSION);
+    }
+
+    @Test
+    @DisplayName("自有设置专用档：不在自有根内（含自有根目录本身）→ empty（维持通用档）")
+    void selfConfigRoot_outside_returnsEmpty() {
+        String home = System.getProperty("user.home");
+        String appDir = NexusaiPaths.getProjectDirName();
+        // ⛔ 「严格在内」：自有根目录**本身**不算命中（CC 两个判定都是 startsWith(dir + sep)）
+        assertThat(PermissionUpdates.selfConfigRootRuleSuggestion(
+            java.nio.file.Paths.get(home, appDir).toString(), home))
+            .as("自有根目录本身 → empty（CC isInClaudeFolder 要求严格在内，permissionOptions.tsx:24-26）")
+            .isEmpty();
+        // 同名前缀但不是自有根（<home>/.nexusaiX）——不得被 startsWith 前缀误判
+        assertThat(PermissionUpdates.selfConfigRootRuleSuggestion(
+            java.nio.file.Paths.get(home, appDir + "X", "a.md").toString(), home))
+            .as("'<home>/.{appName}X' 与 '<home>/.{appName}' 只共享字符串前缀，不是自有根内 → empty")
+            .isEmpty();
+        // 普通路径
+        assertThat(PermissionUpdates.selfConfigRootRuleSuggestion("/tmp/plain.txt", "/tmp"))
+            .isEmpty();
+    }
+
+    @Test
+    @DisplayName("writeAskSuggestions：自有根内 → **只给专用档**（替换通用档，不是追加）")
+    void writeAskSuggestions_selfRoot_replacesGenericOption() {
+        List<PermissionUpdate> result = PermissionUpdates.writeAskSuggestions(
+            homeOwnRootFile(), PermissionMode.DEFAULT, false, "D:/repo");
+
+        assertThat(result)
+            .as("替换语义（CC permissionOptions.tsx:105 的 if/else）：自有根内**不产出** SetMode 通用会话档")
+            .hasSize(1);
+        assertThat(result.get(0)).isInstanceOf(PermissionUpdate.AddRules.class);
+        assertThat(result)
+            .as("⛔ 不得同时出现 SetMode(acceptEdits)（那就是「追加」而不是「替换」）")
+            .noneMatch(u -> u instanceof PermissionUpdate.SetMode);
+    }
+
+    @Test
+    @DisplayName("writeAskSuggestions：非自有根 → 回落通用档（与 generateSuggestions 逐项相同）")
+    void writeAskSuggestions_outsideRoot_fallsBackToGeneric() {
+        List<PermissionUpdate> result = PermissionUpdates.writeAskSuggestions(
+            "a/b/file.txt", PermissionMode.DEFAULT, true, "D:/repo");
+
+        assertThat(result)
+            .as("非自有根 ⇒ 回落 generateSuggestions(write)（CC :114-150 的 else 支），行为不变")
+            .isEqualTo(PermissionUpdates.generateSuggestions(
+                "a/b/file.txt", PermissionUpdates.OperationType.WRITE, PermissionMode.DEFAULT, true));
     }
 }

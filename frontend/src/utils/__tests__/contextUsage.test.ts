@@ -78,4 +78,21 @@ describe('tokenWarningBannerText · 阈值告警只给文字不给数字', () =>
     expect(tokenWarningBannerText(undefined)).toBeNull()
     expect(tokenWarningBannerText({ ...base, suppressed: true })).toBeNull()
   })
+
+  it('占位载荷（suppressed=false 但无真实用量数字）→ 不渲染（WHY：CompactWarningState.publishSuppressedChange 推的是占位值 publishTokenWarning(pushCtx, value, 0L, 0L, null)，只表示「抑制开关翻转」，不是「用量告警」）', () => {
+    // 后端实测占位载荷形态：tokenUsage=0 / contextWindow=0 / percentLeft=null
+    // （percentLeft 在 wire 上可为 null，前端 useChatSocket 以 number|undefined 承载）
+    const placeholder = { ...base, tokenUsage: 0, contextWindow: 0, percentLeft: null } as unknown as TokenWarningEvent
+    expect(tokenWarningBannerText(placeholder)).toBeNull()
+  })
+
+  it('可选字段未随事件到达（缺省 / 半截载荷）→ 不渲染（WHY：缺数字即「没有用量证据」，不得凭 suppressed=false 就显示横幅）', () => {
+    expect(tokenWarningBannerText({ ...base })).toBeNull()                         // 三个可选字段全缺
+    expect(tokenWarningBannerText({ ...base, contextWindow: 200000 })).toBeNull()  // 半截：只有窗口没有用量
+  })
+
+  it('阳性对照：载荷带真实用量数字 → 显示（WHY：必须有这条 —— 若字段映射不同源，仅靠阴性用例会让守卫把横幅永久关死而全部验收仍然全绿）', () => {
+    expect(tokenWarningBannerText({ ...base, tokenUsage: 150000, contextWindow: 200000, percentLeft: 42 }))
+      .toBe(TOKEN_WARNING_TEXT)
+  })
 })

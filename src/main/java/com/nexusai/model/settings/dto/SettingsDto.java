@@ -142,10 +142,10 @@ public record SettingsDto(
     //   关闭 nudge 请用 history_snip_enabled，不要用 0（0 按非法处理，防旧语义静默翻转行为）。
     //   消费点：CompactSettingsResolver.snipNudgeThreshold() 实时读 + AgentLoopContext nudge 门。
     Integer snipNudgeThreshold,
-    // [prompt-align G0-02 V56] 提示词对齐门控 12 列（V56 建列，DB 承载，前端「环境配置」可配；
+    // [prompt-align G0-02 V56] 提示词对齐门控 11 列（V56 建列，DB 承载，前端「环境配置」可配；
     //   全部可空 = 回落 CC 原判定链）。各列 CC original（详见 SettingsRecord.java V56 JavaDoc）：
     //   taskReminderEnabled → CC isTodoV2Enabled（utils/tasks.ts:133-139）+ task_reminder
-    //     附件（utils/messages.ts:3680-3698）；deferredToolsDeltaEnabled → CC messages.ts:4178-4195；
+    //     附件（utils/messages.ts:3680-3698）；
     //   systemPromptBoundaryEnabled → CC constants/prompts.ts:572-573（BOUNDARY MARKER
     //     @572 + shouldUseGlobalCacheScope 门 @573）+ utils/betas.ts:227-233；
     //   proactiveEnabled → CC utils/systemPrompt.ts:105；coordinatorModeEnabled → CC
@@ -156,7 +156,6 @@ public record SettingsDto(
     //   null = 不覆盖（回落 env/FeatureFlags/硬编码默认/既有判定类）。消费点经
     //   PromptAlignSettingsResolver 实时读，写库即生效。
     Boolean taskReminderEnabled,
-    Boolean deferredToolsDeltaEnabled,
     Boolean systemPromptBoundaryEnabled,
     Boolean proactiveEnabled,
     Boolean coordinatorModeEnabled,

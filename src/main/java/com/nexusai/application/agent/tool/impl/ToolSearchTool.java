@@ -669,15 +669,18 @@ public class ToolSearchTool implements Tool {
     }
 
     /**
-     * CC prompt.ts:35-42 getToolLocationHint()：delta 开关
-     * {@code USER_TYPE==='ant' || getFeatureValue_CACHED_MAY_BE_STALE('tengu_glacier_2xr', false)}。
-     * <p>Java 无 growthbook feature 通道 → tengu_glacier_2xr 恒 false（登记 OPD-H concern），
-     * USER_TYPE 经 System.getenv 读取。
+     * CC prompt.ts:35-42 getToolLocationHint() —— deferred 工具的**位置提示**（进 LLM 工具描述，是活指令）。
+     *
+     * <p><b>恒返回 delta 措辞</b>（与 CC 原文 delta 分支逐字相同）。CC 原判据为
+     * {@code USER_TYPE==='ant' || getFeatureValue_CACHED_MAY_BE_STALE('tengu_glacier_2xr', false)}，
+     * 非 delta 分支则告知模型 deferred 工具出现在**另一个通道**（队首 prepend 全量清单消息）里。
+     * <p>2.1.278 发行产物（cc_bundle.js + claude.exe）对该开关与 {@code tengu_glacier} 均 0 命中，
+     * 本仓已按同一结论删掉 delta 专用门与互补的队首 prepend 全量清单通道
+     * （deferred 工具恒经 {@code <system-reminder>} 公告）⇒ 另一个通道已不存在，恒取 delta 措辞。
+     * <p>原实现在此直读 {@code System.getenv("USER_TYPE")}（绕过本仓 env seam）：删除后本方法
+     * 不再需要任何 env，故不保留 seam 调用（也无 env 可回落）。
      */
     private static String getToolLocationHint() {
-        boolean deltaEnabled = "ant".equals(System.getenv("USER_TYPE"));
-        return deltaEnabled
-                ? "Deferred tools appear by name in <system-reminder> messages."
-                : "Deferred tools appear by name in <available-deferred-tools> messages.";
+        return "Deferred tools appear by name in <system-reminder> messages.";
     }
 }

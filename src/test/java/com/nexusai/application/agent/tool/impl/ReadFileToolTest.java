@@ -1738,7 +1738,7 @@ class ReadFileToolTest {
         // 步骤 1: 显式注入 prevState isPartialView=true (模拟行窗口读)
         ctx.readFileState().set(ToolUseContext.keyForReadFileState(new PathGuard(workspace), "big.txt"),
             new ReadState(
-                Files.getLastModifiedTime(workspace.resolve("big.txt")).toMillis(), 1, 2000, true, null));
+                Files.getLastModifiedTime(workspace.resolve("big.txt")).toMillis(), 1, 2000, true, null, false));
 
         // 步骤 2: 同 range (offset=1, limit=2000) 二次读 — isPartialView=true → 拒绝 dedup.
         // [L+ GAP-B] 必须显式 offset/limit: full read (offset=null) 现由调用侧 null 守卫

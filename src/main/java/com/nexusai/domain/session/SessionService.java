@@ -369,6 +369,19 @@ public class SessionService {
             log.warn("[SessionService] delete: SessionChangedFilesBaselineRegistry.evict 失败 session={}: {}",
                 id, e.toString());
         }
+        // [批 edit-gate-session-scope · D] 会话删除 → 释放该会话的<b>会话级 readFileState</b>
+        //   （SessionReadFileStateRegistry：按 sessionId 分区的静态表，承载本会话 Read 过的
+        //    文件 dedup 缓存 + Edit/Write/Notebook read-before-write 门禁的判据来源）。
+        //   与上面 SessionChangedFilesBaselineRegistry.evict 同一口径：CC 一进程一会话、会话结束
+        //   即进程退出，本仓常驻 JVM 必须显式回收，否则随「会话数」无界累积
+        //   （每会话上限 = ToolUseContext.READ_FILE_STATE_CACHE_SIZE 条 = 5000（对齐 CC 2.1.278）/ 25MB）。
+        //   best-effort：静态工具表（非 Spring bean）⇒ 直呼静态方法，套 try/catch 不外溢、不阻塞删除主流程。
+        try {
+            com.nexusai.application.agent.tool.SessionReadFileStateRegistry.evict(id);
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: SessionReadFileStateRegistry.evict 失败 session={}: {}",
+                id, e.toString());
+        }
         // [S1 轨 III · 会话键控残留] 会话删除 → 回收三处「按 sessionId 键控」的进程内表
         //   （均与上面 MicroCompactor.removeSessionState / SessionGitStatusRegistry.evict 同一口径：
         //    CC 一进程一会话，随进程退出释放；Java 常驻 JVM 必须显式回收，否则随「会话数」无界累积）。
@@ -483,6 +496,11 @@ public class SessionService {
                 log.warn("[SessionService] delete: cleanupSessionTeams 失败 session={}: {}", id, e.toString());
             }
         }
+        // [T2 · 会话分桶] 会话结束 → 摘除本会话的 leader 权限表面桶（LeaderPermissionBridge 按会话分桶的
+        //   注册/注销成对收尾：注册 = TeamCreateTool 建 team，注销 = TeamDeleteTool 解绑 / 此处会话删除兜底）。
+        //   只清本会话桶，⛔ 不清全局（跨会话误清会摘掉别的会话的确认表面）。静态工具类无 bean 依赖，
+        //   无需 teamHelpers 判空；幂等（无本会话桶 → no-op）。
+        com.nexusai.application.agent.team.LeaderPermissionBridge.clearSession(id);
         // 级联删 messages + session_files（FK ON DELETE CASCADE 已配，但显式更安全）
         messageMapper.deleteByQuery(QueryWrapper.create().eq("session_id", id));
         sessionFileMapper.deleteByQuery(QueryWrapper.create().eq("session_id", id));

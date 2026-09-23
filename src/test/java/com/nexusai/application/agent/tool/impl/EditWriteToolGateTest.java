@@ -202,6 +202,129 @@ class EditWriteToolGateTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════
+    // 门禁 1 判据: contentNotInModelContext **不参与判定**（批 rfs-replay-3b · 2 次修订）
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * [批 rfs-replay-3b · 2 次修订] 门禁 1 判据 = <b>两态</b>：entry 不存在（从未读）/ isPartialView
+     * （只看到部分视图）⇒ 判「未读」。<b>⛔ 不消费</b> {@code contentNotInModelContext}。
+     *
+     * <p><b>WHY（CLAUDE.md 规则九 · 行为 = CC 行为）</b>：对齐目标 CC <b>2.1.278</b> 发行产物里，
+     * Edit 门禁条件是 {@code if(!Ee||Ee.isPartialView)}（exe off 206605650）、Write 门禁是
+     * {@code if(!he||he.isPartialView)}（exe off 203520944）—— 两区间内
+     * {@code contentNotInModelContext} 命中数均为 <b>0</b>。CC 真正的消费点只有 {@code fle}
+     * （at-mention 已读短路 / 写回打标，exe off 199640351）与 ProposeSkillsTool 的 read/unread
+     * 分类（exe off 225888734），本仓暂无对应物。依用户口径「CC 怎么做我们怎么做」，
+     * 本门禁<b>不得</b>把该字段当判据。
+     *
+     * <p><b>行为后果（本批唯一用户可感变化）</b>：跨进程 resume 后，对「只被上一进程 Edit 过」的
+     * 文件，模型<b>不必重读</b>即可继续 Edit/Write（= CC 行为）。replay 的 Edit 派生条目正是这种
+     * 「entry 在、但内容不在模型上下文」形态。把它当判据（旧行为）会让「本仓比 CC 更严」——
+     * 删掉它才是对齐。
+     *
+     * <p>本 nested class 的 5 条用例：打标⇒放行（Edit/Write 各一，新行为）；
+     * 对照①②③（未打标放行 / 真实 Read 落表不带标 / isPartialView 仍拒）保持原样。
+     * 「真实形态」（replay 的 Edit 派生条目 ⇒ 门禁放行）另见
+     * {@code ReadFileStateReplayTest$ReplayDerivedEditEntryPassesGate}。
+     */
+    @Nested
+    @DisplayName("[rfs-replay-3b] 门禁 1 判据 = 未读 / isPartialView 两态；contentNotInModelContext 不参与判定（对齐 CC 2.1.278）")
+    class ContentNotInModelContextGate {
+
+        @Test
+        @DisplayName("Edit · entry 存在且 contentNotInModelContext=true → **放行**（对齐 CC 2.1.278 Edit 门禁 off 206605650：不消费该字段）")
+        void editEntryNotInModelContextAllowed(@TempDir Path workspace) throws Exception {
+            Path target = workspace.resolve("a.txt");
+            Files.writeString(target, "hello\n");
+            EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
+            ToolUseContext ctx = ctxFor(workspace);
+
+            // replay 的 Edit 派生条目形态：content=盘上内容，标记=true。mtime 未变 ⇒ 门禁 2 也放行。
+            String key = ToolUseContext.keyForReadFileState(new PathGuard(workspace), "a.txt");
+            ctx.readFileState().set(key, new ReadState(
+                Files.getLastModifiedTime(target).toMillis(), null, null, false, "hello\n", true));
+
+            Tool.ValidationResult vr = editTool.validateInput(
+                editCallWith("a.txt", "hello", "CHANGED").input(), ctx);
+
+            assertThat(vr.ok())
+                .as("CC 2.1.278 Edit 门禁 `if(!Ee||Ee.isPartialView)` 不消费该字段 ⇒ 必须放行"
+                    + "（若此断言 RED，说明门禁又把第三态当判据了；实际 errorCode=%s）", vr.errorCode())
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("Write · entry 存在且 contentNotInModelContext=true → **放行**（对齐 CC 2.1.278 Write 门禁 off 203520944：不消费该字段）")
+        void writeEntryNotInModelContextAllowed(@TempDir Path workspace) throws Exception {
+            Path target = workspace.resolve("a.txt");
+            Files.writeString(target, "hello\n");
+            WriteFileTool writeTool = new WriteFileTool(new PathGuard(workspace));
+            ToolUseContext ctx = ctxFor(workspace);
+
+            String key = ToolUseContext.keyForReadFileState(new PathGuard(workspace), "a.txt");
+            ctx.readFileState().set(key, new ReadState(
+                Files.getLastModifiedTime(target).toMillis(), null, null, false, "hello\n", true));
+
+            Tool.ValidationResult vr = writeTool.validateInput(
+                writeCallWith("a.txt", "OVERWRITE").input(), ctx);
+
+            assertThat(vr.ok())
+                .as("CC 2.1.278 Write 门禁 `if(!he||he.isPartialView)` 不消费该字段 ⇒ 必须放行"
+                    + "（若此断言 RED，说明门禁又把第三态当判据了；实际 errorCode=%s）", vr.errorCode())
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("对照①: entry 存在且 contentNotInModelContext=false（内容在上下文）= 放行 —— 标记为 false 不得误拒")
+        void entryInModelContextPasses(@TempDir Path workspace) throws Exception {
+            Path target = workspace.resolve("a.txt");
+            Files.writeString(target, "hello\n");
+            EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
+            ToolUseContext ctx = ctxFor(workspace);
+
+            String key = ToolUseContext.keyForReadFileState(new PathGuard(workspace), "a.txt");
+            ctx.readFileState().set(key, new ReadState(
+                Files.getLastModifiedTime(target).toMillis(), null, null, false, "hello\n", false));
+
+            assertThat(editTool.validateInput(editCallWith("a.txt", "hello", "CHANGED").input(), ctx).ok())
+                .as("contentNotInModelContext=false ⇒ 门禁 1 放行（防把第三态写成无条件拒绝）")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("对照②: 真实 Read 落表的 entry（真实路径）contentNotInModelContext 恒 false → Edit 放行")
+        void realReadEntryIsNotMarked(@TempDir Path workspace) throws Exception {
+            Files.writeString(workspace.resolve("b.txt"), "hello\n");
+            EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
+            ToolUseContext ctx = ctxFor(workspace);
+
+            new ReadFileTool(new PathGuard(workspace)).execute(readCallWith("b.txt"), ctx);
+
+            String key = ToolUseContext.keyForReadFileState(new PathGuard(workspace), "b.txt");
+            assertThat(ctx.readFileState().get(key).contentNotInModelContext())
+                .as("真实 Read 派生条目不得带标记（否则正常 Read→Edit 会被误拒）").isFalse();
+            assertThat(editTool.validateInput(editCallWith("b.txt", "hello", "NEW").input(), ctx).ok())
+                .as("真实 Read 后 Edit 必须放行").isTrue();
+        }
+
+        @Test
+        @DisplayName("对照③: isPartialView=true 仍拒（前两态语义未被新析取项挤掉）")
+        void partialViewStillRejected(@TempDir Path workspace) throws Exception {
+            Path target = workspace.resolve("c.txt");
+            Files.writeString(target, "hello\n");
+            EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
+            ToolUseContext ctx = ctxFor(workspace);
+
+            String key = ToolUseContext.keyForReadFileState(new PathGuard(workspace), "c.txt");
+            ctx.readFileState().set(key, new ReadState(
+                Files.getLastModifiedTime(target).toMillis(), null, null, true, "hello\n", false));
+
+            assertThat(editTool.validateInput(editCallWith("c.txt", "hello", "NEW").input(), ctx).errorCode())
+                .as("isPartialView 仍判未读").isEqualTo("6");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     // 门禁 2: stale-write 拒绝 (mtime 变化)
     // ══════════════════════════════════════════════════════════════════════
 

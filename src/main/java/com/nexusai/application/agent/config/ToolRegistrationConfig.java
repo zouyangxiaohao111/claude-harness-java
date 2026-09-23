@@ -2973,7 +2973,8 @@ public class ToolRegistrationConfig {
             // [SM-10] notifyCompaction 门控（DRIFT-9 影响面）· CC compact.ts:67-72
             //   feature('PROMPT_CACHE_BREAK_DETECTION') —— 从 FeatureFlags 单源接线
             () -> featureFlags != null && featureFlags.promptCacheBreakDetection(),
-            warningPushContext);                   // [批 5a-2] token-warning push 上下文（显式载荷）
+            warningPushContext,                    // [批 5a-2] token-warning push 上下文（显式载荷）
+            progressSink);                         // [compact-signal-fix] SM 分支进度出口（不经 supplier）
     }
 
     /**
