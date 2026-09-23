@@ -283,7 +283,7 @@ public final class InitCommand {
             if ("ant".equals(userType) || newInitEnvSupplier.getAsBoolean()) {
                 // [T3/#21] prompt 文本 .nexusai → 动态 appName（决策 D1/D6）：模型指引的目录随
                 // spring.application.name 联动，appName=nexusai 时行为等价。
-                return NEW_PROMPT.replace(".nexusai", "." + NexusaiPaths.getAppName());
+                return NexusaiPaths.replaceSelfDirLiteral(NEW_PROMPT);
             }
         }
         return OLD_PROMPT;

@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.memory;
 
+import com.nexusai.application.agent.skill.NexusaiPaths;
+
 /**
  * auto-memory 无绑定项目业务异常（决策 2026-09-08：DB 查不到绑定＝错误，fail loud）。
  *
@@ -23,8 +25,13 @@ public class AutoMemoryNoBoundProjectException extends RuntimeException {
     private final String sessionId;
 
     public AutoMemoryNoBoundProjectException(String sessionId) {
+        // [批 appname-dyn 2026-09-23] 文案里的自有根字面 ~/.nexusai → 随 appName 动态
+        //   （单点真源 NexusaiPaths.replaceSelfDirLiteral；appName=nexusai ⇒ 逐字节不变）。
+        //   注：javadoc 之外，本类的**消息文本**是构造期求值（非静态常量）⇒ 可就地动态化，
+        //   无「静态常量早于 appName 注入被冻结」的时序问题。
         super("会话未绑定项目（sessions.main_project_id / projects.path 缺失），"
-            + "auto-memory 无有效 per-project 目录，拒绝以配置主目录(~/.nexusai)充当项目假目录; "
+            + "auto-memory 无有效 per-project 目录，拒绝以配置主目录("
+            + NexusaiPaths.replaceSelfDirLiteral("~/.nexusai") + ")充当项目假目录; "
             + "sessionId=" + sessionId);
         this.sessionId = sessionId;
     }

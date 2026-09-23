@@ -128,11 +128,16 @@ Summarize to the user:
      * @param registrar 统一注册入口 Consumer（Bootstrapper register(def)）
      */
     public boolean register(Consumer<BundledSkillDefinition> registrar) {
+        // [批 appname-dyn 2026-09-23] 文案里的自有根字面 .nexusai → 随 appName 动态
+        //   （单点真源 NexusaiPaths.replaceSelfDirLiteral；appName=nexusai ⇒ 逐字节不变）。
+        //   覆盖三处：description / whenToUse（本批枚举项）+ IMPORT_CC_PROMPT 正文（同一注册链的
+        //   指令正文，含 `mkdir -p ~/.nexusai/skills` 等实参 ⇒ 不动态化会让 appName≠nexusai 的
+        //   部署把 CC 技能导入到**别的**自有根，见 deviations）。
         BundledSkillDefinition def = new BundledSkillDefinition(
             SKILL_NAME,
-            DESCRIPTION,
+            NexusaiPaths.replaceSelfDirLiteral(DESCRIPTION),
             null,   // aliases
-            WHEN_TO_USE,
+            NexusaiPaths.replaceSelfDirLiteral(WHEN_TO_USE),
             null,   // argumentHint
             null,   // allowedTools
             null,   // model
@@ -144,7 +149,7 @@ Summarize to the user:
             null,   // agent
             null,   // files
             (args, ctx) -> {
-                String prompt = IMPORT_CC_PROMPT;
+                String prompt = NexusaiPaths.replaceSelfDirLiteral(IMPORT_CC_PROMPT);
                 if (args != null && !args.isEmpty()) {
                     // 对齐 ultracode.ts:229-231：if (args) prompt += `\n## User input\n\n${args}\n`
                     // truthy 判定（非 null 非空串，不 trim——空白串仍 truthy 追加）

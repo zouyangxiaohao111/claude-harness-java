@@ -73,7 +73,7 @@ class WorkflowProjectRootConvergenceTest {
         divergedCwd = Files.createTempDirectory("p10a-divergedB-");
 
         // A 下放一个命名 workflow（B 下不放 —— 落 B 就找不到）
-        Path workflows = projectRoot.resolve(WorkflowConstants.WORKFLOW_DIR_NAME);
+        Path workflows = projectRoot.resolve(WorkflowConstants.workflowDirName());
         Files.createDirectories(workflows);
         Files.writeString(workflows.resolve(PROBE_NAME + ".js"),
                 "export const meta = { name: '" + PROBE_NAME + "', description: 'p10a probe' }\nreturn 1");
@@ -98,7 +98,7 @@ class WorkflowProjectRootConvergenceTest {
     @Test
     @DisplayName("journal runsDir 锚会话项目根（CC getRunsDir() = join(getProjectRoot(), ...)）")
     void journalRunsDirAnchorsProjectRoot() {
-        assertEquals(realProjectRoot() + "/" + WorkflowConstants.WORKFLOW_RUNS_DIR,
+        assertEquals(realProjectRoot() + "/" + WorkflowConstants.workflowRunsDir(),
                 WorkflowPortsImpl.defaultRunsDir(SESSION_ID),
                 "journal runsDir 必须 = <projectRoot>/<WORKFLOW_RUNS_DIR>；落到 worktree/cd 槽 ⇒ "
                         + "「脚本去哪找」与「记录存哪」分叉（ports.ts:54-60 明令避免的 desync）");

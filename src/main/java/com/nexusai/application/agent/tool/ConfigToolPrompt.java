@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool;
 
 import com.nexusai.application.agent.settings.SupportedSettings;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -189,7 +190,9 @@ public class ConfigToolPrompt {
             "- **Set new value:** Include the \"value\" parameter\n\n" +
             "## Configurable settings list\n" +
             "The following settings are available for you to change:\n\n" +
-            "### Global Settings (stored in ~/.nexusai.json)\n" +
+            // [批 appname-dyn 追加 2026-09-23] 全局配置文件名经单点真源派生（旧版字面写死 ~/.nexusai.json
+            //   ⇒ appName≠nexusai 时模型被指到错误文件）。不变量：appName=nexusai ⇒ 逐字节不变。
+            "### Global Settings (stored in ~/" + NexusaiPaths.getGlobalConfigFileName() + ")\n" +
             String.join("\n", globalLines) + "\n\n" +
             "### Project Settings (stored in settings.json)\n" +
             String.join("\n", projectLines) + "\n\n" +

@@ -63,10 +63,17 @@ public final class BrowserToolRegistry {
             "browserTools.ts:2-26",
             false, false),
 
+        // [browser-text-channels 批] read_page / get_page_text 的 description + inputSchema 已按本仓扩展
+        //   content.js 的实测语义改写 —— 原文案是 CCB 的「空头支票」：filter/depth/ref_id/max_chars 四个
+        //   参数在扩展侧被静默忽略（readPage() 不收参数），实际只回可交互元素清单（每节点文本 200 字），
+        //   网页正文根本取不到。改后扩展侧四参数全部真实生效（见 front/extension/content.js 的 readPage）：
+        //   max_chars 两档都生效；depth / ref_id 只对 filter:"all" 的元素树有意义，与 filter:"interactive"
+        //   同时给出时**显式报错**（不静默忽略）—— 故各 description 里写明适用档（复核批问题 1）。
+        //   ccRef 仍指向 CCB 原定义，供对照（本仓已偏离，勿再用它当行为判据）。
         new BrowserToolSpec(
             "read_page",
             """
-            Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.""",
+            Get a tree of elements on the page. Returns a node tree by default: each node has tag/role/ariaLabel/href/visible and the element's text, plus a children array. Output is limited to 50000 characters by default. If the output exceeds this limit, you will receive an error asking you to specify a smaller depth or focus on a specific element using ref_id. Pass filter "interactive" to get only buttons/links/inputs as a flat list with ref IDs usable by computer/find; depth and ref_id apply only to the tree view (filter "all"), while max_chars applies to both. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.""",
             """
             {
               "type": "object",
@@ -74,26 +81,26 @@ public final class BrowserToolRegistry {
                 "filter": {
                   "type": "string",
                   "enum": ["interactive", "all"],
-                  "description": "Filter elements: \\"interactive\\" for buttons/links/inputs only, \\"all\\" for all elements including non-visible ones (default: all elements)"
+                  "description": "Filter elements: \\"interactive\\" for buttons/links/inputs only (\\"flat list with ref IDs usable by computer/find\\"), \\"all\\" for the full element tree including non-visible ones (default: all elements)"
                 },
                 "tabId": {
                   "type": "number",
-                  "description": "Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+                  "description": "Tab ID to read from. Optional: the extension routes to this session's own tab when it is omitted. Use tabs_context_mcp first if you want to target a specific tab."
                 },
                 "depth": {
                   "type": "number",
-                  "description": "Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large."
+                  "description": "Maximum depth of the element tree to traverse (default: 15). The root element counts as depth 1. Use a smaller depth if output is too large. Only applies with filter \\"all\\": the interactive list is flat, so passing depth together with filter \\"interactive\\" returns an explicit error."
                 },
                 "ref_id": {
                   "type": "string",
-                  "description": "Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large."
+                  "description": "Reference ID of an element, taken from a previous read_page with filter \\"interactive\\" or from find. Returns the specified element and its subtree as the tree root. Use this to focus on a specific part of the page when output is too large. A stale or unknown ref returns an explicit error. Only applies with filter \\"all\\": the interactive list is flat, so passing ref_id together with filter \\"interactive\\" returns an explicit error — use find to locate a single element instead."
                 },
                 "max_chars": {
                   "type": "number",
-                  "description": "Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs."
+                  "description": "Maximum characters for the output (default: 50000), enforced for both filter modes. If the output would exceed this, the call returns an explicit error instead of truncating it — narrow the result with depth/ref_id (filter \\"all\\") or find (filter \\"interactive\\"), or set a higher value if your client can handle large outputs."
                 }
               },
-              "required": ["tabId"]
+              "required": []
             }""",
             "browserTools.ts:28-63",
             true, true),
@@ -372,10 +379,13 @@ public final class BrowserToolRegistry {
             "browserTools.ts:323-360",
             false, false),
 
+        // [browser-text-channels 批] 补 mode（inner 默认 = 旧行为 innerText；full = DOM 遍历 textContent）
+        //   + 诊断字段 innerTextLen/textContentLen。WHY：用户拿 ChatGPT 回答正文时 innerText 只回
+        //   「用户消息 + 用时 25 秒」——离屏/虚拟化子树的内容 innerText 取不到，而模型无从判断该换招。
         new BrowserToolSpec(
             "get_page_text",
             """
-            Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.""",
+            Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. mode "inner" (default) returns document.body.innerText (visible text). If the text you need is missing — empty, or shorter than the page clearly contains — call it again with mode "full", which walks the DOM and returns textContent instead; that catches content innerText misses when it is virtualized or rendered off-screen. The response always carries innerTextLen/textContentLen so you can tell whether to switch modes. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.""",
             """
             {
               "type": "object",
@@ -383,6 +393,11 @@ public final class BrowserToolRegistry {
                 "tabId": {
                   "type": "number",
                   "description": "Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID."
+                },
+                "mode": {
+                  "type": "string",
+                  "enum": ["inner", "full"],
+                  "description": "Text extraction mode: \\"inner\\" (default) returns document.body.innerText (visible text only); \\"full\\" walks the DOM and returns textContent, catching content that innerText misses because it is off-screen or virtualized."
                 }
               },
               "required": ["tabId"]

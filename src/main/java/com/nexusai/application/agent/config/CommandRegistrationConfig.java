@@ -187,7 +187,7 @@ public class CommandRegistrationConfig {
      */
     private void registerStatuslineCommand() {
         registerPromptSkill(StatuslineCommand.NAME, StatuslineCommand.DESCRIPTION,
-            StatuslineCommand.ALLOWED_TOOLS, StatuslineCommand.PROGRESS_MESSAGE,
+            StatuslineCommand.allowedTools(), StatuslineCommand.PROGRESS_MESSAGE,
             (args, ctx) -> List.of(PromptBlock.text(StatuslineCommand.getPromptForCommand(args))));
     }
 

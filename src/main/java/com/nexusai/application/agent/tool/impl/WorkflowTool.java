@@ -139,7 +139,7 @@ public class WorkflowTool implements Tool {
                     WORKFLOW_TOOL_PROMPT.length());
         }
         // [T3/#21] prompt 文本 .nexusai → 动态 appName（决策 D1/D6）：workflow 目录指引随 appName 联动
-        return WORKFLOW_TOOL_PROMPT.replace(".nexusai", "." + NexusaiPaths.getAppName());
+        return NexusaiPaths.replaceSelfDirLiteral(WORKFLOW_TOOL_PROMPT);
     }
 
     /**
@@ -434,7 +434,7 @@ public class WorkflowTool implements Tool {
             NamedWorkflows.NamedWorkflow found = NamedWorkflows.resolveWithFallback(cwd, sanitized);
             if (found == null) {
                 throw new IllegalArgumentException("Named workflow \"" + input.name()
-                        + "\" not found (looked in " + WorkflowConstants.WORKFLOW_DIR_NAME
+                        + "\" not found (looked in " + WorkflowConstants.workflowDirName()
                         + " primary, .claude/workflows/ fallback)");
             }
             if (log.isDebugEnabled()) {

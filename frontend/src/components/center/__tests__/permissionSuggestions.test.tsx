@@ -299,6 +299,68 @@ describe('[批 A3] 建议档位文案 · 分工具', () => {
   })
 })
 
+describe('[appName 通道 2026-09-23] 自有根标记跟着 appName 走', () => {
+  /** 后端「编辑自有设置（本会话）」档产出的形态（PermissionUpdates.selfConfigRootRuleSuggestion） */
+  const selfConfigRule = (ruleContent: string): PermissionUpdate => ({
+    type: 'addRules', rules: [{ toolName: 'Edit', ruleContent }], behavior: 'allow', destination: 'session',
+  })
+
+  it('selfDirName=nexusai-scene ⇒ `~/.nexusai-scene/**` 命配置目录文案（场景中台线发行）', () => {
+    // WHY（规则九）：自有根 = `~/.{appName}`，后端产出的规则随之变。若前端写死 `.nexusai/`，
+    //   这条规则命不中 ⇒ 用户看到的按钮文案退化成难读的规则原文（`允许：Edit(~/.nexusai-scene/**)`）
+    //   + 每次渲染一条 console.warn。降级是静默的，只能靠断言钉住。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const label = formatSuggestionLabel(selfConfigRule('~/.nexusai-scene/**'), 'Edit', undefined, 'nexusai-scene')
+    expect(label).toContain('编辑配置目录')
+    expect(label).toContain('.nexusai-scene/')
+    expect(label).toContain('本次会话')
+    expect(label).not.toMatch(/CC|claude/i)
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it('⭐ 反向：给了 nexusai-scene ⇒ `~/.nexusai/**` 不再被认成本仓自有根（证明真跟着入参走，不是两表叠加）', () => {
+    // WHY：若实现是「把 nexusai-scene 追加进硬表」而不是「替换」，两个 appName 会同时命中 ⇒
+    //   场景发行里 .nexusai 目录也会被说成「配置目录」（过度承诺）。故必须钉住反向。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const label = formatSuggestionLabel(selfConfigRule('~/.nexusai/**'), 'Edit', undefined, 'nexusai-scene')
+    expect(label).not.toContain('编辑配置目录')
+    expect(label).toContain('.nexusai/**')  // 退回按规则原文渲染
+    expect(warn).toHaveBeenCalled()          // 且留痕（不静默）
+    warn.mockRestore()
+  })
+
+  it('⛔ selfDirName 缺失 / 空白 ⇒ 与落地前逐字相同（回落 .nexusai/，主线零变化）', () => {
+    for (const missing of [undefined, null, '', '   ']) {
+      const label = formatSuggestionLabel(selfConfigRule('~/.nexusai/**'), 'Edit', undefined, missing)
+      expect(label, `缺失值 ${JSON.stringify(missing)} 时不得改行为`).toContain('编辑配置目录 .nexusai/')
+      expect(label).toContain('本次会话')
+    }
+  })
+
+  it('⛔ 尾斜杠规则不得因入参化而放宽：nexusai-scene 下 `~/.nexusai-scene2/**` 仍不命中', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const label = formatSuggestionLabel(selfConfigRule('~/.nexusai-scene2/**'), 'Edit', undefined, 'nexusai-scene')
+    expect(label).not.toContain('编辑配置目录')
+    expect(label).toContain('.nexusai-scene2')
+    warn.mockRestore()
+  })
+
+  it('.claude/ 标记恒在（CC 自己的配置根，不随本仓 appName 变）', () => {
+    const label = formatSuggestionLabel(selfConfigRule('~/.claude/**'), 'Edit', undefined, 'nexusai-scene')
+    expect(label).toContain('编辑配置目录 .claude/')
+  })
+
+  it('入参经 buildSuggestionOptions 第 4 参贯通（组件链路走的就是这条路）', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const opts = buildSuggestionOptions([selfConfigRule('~/.nexusai-scene/**')], 'Edit', undefined, 'nexusai-scene')
+    expect(opts).toHaveLength(1)
+    expect(opts[0].label).toContain('编辑配置目录 .nexusai-scene/')
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+})
+
 describe('[批 A3] buildSuggestionOptions', () => {
   it('空 / null / undefined ⇒ 无档位', () => {
     expect(buildSuggestionOptions(null, 'Bash')).toEqual([])
@@ -424,5 +486,49 @@ describe('[批 A3] PermissionBubble 第三档渲染', () => {
     expect(container.querySelectorAll('.pb-suggestions button')).toHaveLength(0)
     expect(warn).toHaveBeenCalled()
     warn.mockRestore()
+  })
+})
+
+describe('[appName 通道 2026-09-23] PermissionBubble 的 selfDirName 贯通 + useMemo 依赖', () => {
+  const sceneRule: PermissionUpdate = {
+    type: 'addRules', rules: [{ toolName: 'Edit', ruleContent: '~/.nexusai-scene/**' }], behavior: 'allow', destination: 'session',
+  }
+  const nexusaiRule: PermissionUpdate = {
+    type: 'addRules', rules: [{ toolName: 'Edit', ruleContent: '~/.nexusai/**' }], behavior: 'allow', destination: 'session',
+  }
+
+  it('selfDirName=nexusai-scene ⇒ 第三档文案是「编辑配置目录 .nexusai-scene/」', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    render(<PermissionBubble request={req({ toolName: 'Edit', suggestions: [sceneRule] })} onDecision={vi.fn()} selfDirName="nexusai-scene" />)
+    const tier3 = container.querySelectorAll('.pb-suggestions button')
+    expect(tier3).toHaveLength(1)
+    expect(tier3[0].textContent).toContain('.nexusai-scene/')
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it('⭐ selfDirName 进 useMemo 依赖：同一 request 下换 selfDirName ⇒ 文案必须重算', () => {
+    // WHY（规则九）：档位文案是 useMemo 出来的。漏把 selfDirName 放进依赖数组 ⇒ 只有
+    //   「首次渲染时就拿到了 appName」的情形才对；settings 晚于弹窗到达的场景（App 的
+    //   GET /settings 与权限请求并发）会永远停在回落文案上 —— 而这个失效**没有任何报错**。
+    // ⚠️ 判据纪律：两次渲染必须传**同一个** request / suggestions 引用，否则 suggestions
+    //   这一项自己就变了，memo 无论如何都会重算 ⇒ 本用例会退化成恒绿。
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const suggestions = [sceneRule]
+    const request = req({ toolName: 'Edit', suggestions })
+    const onDecision = vi.fn()
+
+    render(<PermissionBubble request={request} onDecision={onDecision} />)
+    // 无 selfDirName ⇒ 场景线规则命不中，退回按规则原文渲染（不是配置目录文案）
+    expect((container.querySelector('.pb-suggestions button') as HTMLButtonElement).textContent).not.toContain('编辑配置目录')
+
+    act(() => root.render(<PermissionBubble request={request} onDecision={onDecision} selfDirName="nexusai-scene" />))
+    expect((container.querySelector('.pb-suggestions button') as HTMLButtonElement).textContent).toContain('编辑配置目录 .nexusai-scene/')
+    warn.mockRestore()
+  })
+
+  it('selfDirName 缺省 ⇒ 与今日一致（`~/.nexusai/**` 仍是配置目录文案）', () => {
+    render(<PermissionBubble request={req({ toolName: 'Edit', suggestions: [nexusaiRule] })} onDecision={vi.fn()} />)
+    expect((container.querySelector('.pb-suggestions button') as HTMLButtonElement).textContent).toContain('编辑配置目录 .nexusai/')
   })
 })

@@ -488,10 +488,22 @@ export interface AppSettings {
    *  即默认**开**）：开 = 值里的会话 ID 占位符替换成当前会话 ID；关 = 统一发固定值 nexusai-static。
    *  null/undefined = 未见该字段（后端 DTO 尚未透出时即为该态），前端按默认开处理。 */
   allowDynamicHeaderValues?: boolean | null
+  // appName 通道契约（2026-09-23 用户拍板「跟着 appName 走」）：GET /settings 的**只读**出站字段
+  /** 当前应用名 = 自有根目录名去掉前导点（后端 spring.application.name ⇒ 如 nexusai / nexusai-scene）。
+   *  ⚠️ **只读**：后端 PUT 的入参类型是 SettingsDto（无此字段），回传会被静默忽略 —— 前端不得把它当可写配置。
+   *  用途：拼自有根目录标记（权限弹窗「编辑配置目录」档位）与启动页日志路径。 */
+  readonly appName?: string | null
+  /** 当前自有配置根绝对路径（后端 = `{user.home}/.{appName}`，如 C:\Users\x\.nexusai-scene）。
+   *  ⚠️ **只读**：同 {@link appName}（PUT 入参无此字段，回传被忽略）。 */
+  readonly configHome?: string | null
 }
 
-/** PUT /api/v1/settings 部分更新请求 · 后端 merge 策略：仅覆盖非 null 字段 */
-export type UpdateSettingsRequest = Partial<AppSettings>
+/** PUT /api/v1/settings 部分更新请求 · 后端 merge 策略：仅覆盖非 null 字段。
+ *
+ *  ⚠️ **不含**只读的 `appName` / `configHome`（GET 出站专用 · 后端 `SettingsController.update`
+ *  的入参类型是 `SettingsDto`，回传会被静默忽略）—— 故在**类型层封死**，让「不小心把它当可写配置
+ *  写回去」在编译期就报错，而不是静默被后端丢弃（F2）。 */
+export type UpdateSettingsRequest = Partial<Omit<AppSettings, 'appName' | 'configHome'>>
 
 // ---- /context analyze（后端 ContextAnalyzeController）----
 export interface ContextAnalyzeRequest {

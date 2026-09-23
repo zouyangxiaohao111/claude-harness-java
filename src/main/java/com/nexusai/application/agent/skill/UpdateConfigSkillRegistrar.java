@@ -132,7 +132,7 @@ public final class UpdateConfigSkillRegistrar {
                 log.debug("[UpdateConfigSkillRegistrar] buildPrompt [hooks-only] req='{}'（CC updateConfig.ts:453-460）", req);
             }
             // [T3/#21] prompt 文本 .nexusai → 动态 appName（决策 D1/D6）
-            return List.of(PromptBlock.text(sb.toString().replace(".nexusai", "." + NexusaiPaths.getAppName())));
+            return List.of(PromptBlock.text(NexusaiPaths.replaceSelfDirLiteral(sb.toString())));
         }
         // Full prompt — UPDATE_CONFIG_PROMPT 已内联 SETTINGS/HOOKS/VERIFICATION/Example Workflows（CC :378-382 模板插值）
         StringBuilder sb = new StringBuilder(UPDATE_CONFIG_PROMPT);
@@ -145,7 +145,7 @@ public final class UpdateConfigSkillRegistrar {
             log.debug("[UpdateConfigSkillRegistrar] buildPrompt full userArgs='{}' schemaSupplier=nonNull（CC updateConfig.ts:462-472）", userArgs);
         }
         // [T3/#21] prompt 文本 .nexusai → 动态 appName（决策 D1/D6）
-        return List.of(PromptBlock.text(sb.toString().replace(".nexusai", "." + NexusaiPaths.getAppName())));
+        return List.of(PromptBlock.text(NexusaiPaths.replaceSelfDirLiteral(sb.toString())));
     }
 
     /** CC SETTINGS_EXAMPLES_DOCS — Settings 文件位置 + schema 示例（:15-104，含 Permission Rule Syntax / Attribution / Other Settings）. */

@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { CatLoader } from './CatLoader'
 import { expandFromSplash } from '@/utils/tauri-bridge'
 import { API_V1_BASE } from '@/api/base'
+import { cachedConfigDirLabel } from '@/utils/appNameCache'
 
 /** 后端就绪探测地址（业务端点，200 即视为后端就绪）。
  *  用 /api/v1/settings 而非 /actuator/health：后端 CORS 只放行 /api/**，
@@ -150,7 +151,10 @@ export function LaunchGate({ children }: LaunchGateProps) {
           <div className="cl-errTitle">本地引擎未能启动</div>
           <div className="cl-errMsg">{errorMsg}</div>
           <div className="cl-errHint">
-            请查看 ~/.nexusai/logs/backend.log 了解原因；
+            {/* [appName 通道 2026-09-23] 目录名跟着 appName 走。⚠️ 本页出现在**后端起不来**时，
+                GET /settings 结构上拉不到 ⇒ 只能读上次成功加载落的缓存；首装即失败时缓存为空
+                （已登记的已知边界）⇒ 回落 `.nexusai`，文案与落地前逐字相同。 */}
+            请查看 {`~/${cachedConfigDirLabel()}/logs/backend.log`} 了解原因；
             <br />
             如持续失败，请关闭应用后重新打开。
           </div>

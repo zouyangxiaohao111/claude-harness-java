@@ -17,6 +17,16 @@ interface Props {
    * 前端（会话绑定项目）知道。取不到时传 null ⇒ 文案退化为「在本项目中」，不编造项目名。
    */
   projectLabel?: string | null
+  /**
+   * [appName 通道 2026-09-23] 自有根目录名（**不含**前导点，如 `nexusai` / `nexusai-scene`）——
+   * 「编辑配置目录」档位文案里的自有根标记由它派生（`.{selfDirName}/`）。
+   *
+   * <p>为什么需要它：自有根 = `~/.{appName}`（后端 `NexusaiPaths.getAppConfigHomeDir`），
+   * 而后端「编辑自有设置」档产出的规则是 `~/.{appName}/**`。写死 `.nexusai/` 时，
+   * appName 非 nexusai 的发行里该规则命不中 ⇒ 文案退化成规则原文 + 每次渲染一条 console.warn。
+   * 取不到时传 null ⇒ 回落 `.nexusai/`（与落地前逐字相同，不猜、不编造）。
+   */
+  selfDirName?: string | null
 }
 
 /** 每问勾选态：question 文本 → 单选 label / 多选 label[] */
@@ -69,14 +79,15 @@ function ToolInput({ toolInput }: { toolInput: unknown }) {
   return <JsonBlock label="工具参数" payload={typeof toolInput === 'string' ? tryParse(toolInput) ?? toolInput : toolInput} defaultOpen />
 }
 
-export function PermissionBubble({ request, onDecision, onAbort, projectLabel }: Props) {
+export function PermissionBubble({ request, onDecision, onAbort, projectLabel, selfDirName }: Props) {
   const questions = extractQuestions(request)
   const elapsed = useElapsed(request.timestampMs)
   // 一键授权档位（后端 suggestions → 文案）· useMemo：useElapsed 每秒触发重渲染，
   //   不 memo 会让「未识别形态」的 warn 每秒刷屏。
+  //   ⚠️ selfDirName 必须进依赖数组：漏了会让 appName 变化（settings 加载完成）后文案不重算。
   const suggestionOptions = useMemo(
-    () => buildSuggestionOptions(request.suggestions, request.toolName, projectLabel),
-    [request.suggestions, request.toolName, projectLabel],
+    () => buildSuggestionOptions(request.suggestions, request.toolName, projectLabel, selfDirName),
+    [request.suggestions, request.toolName, projectLabel, selfDirName],
   )
   // 无 questions → 保持原 allow/deny 弹窗（+ 中止按钮）
   if (questions.length === 0) {

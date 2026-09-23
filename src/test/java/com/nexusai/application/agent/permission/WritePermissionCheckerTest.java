@@ -939,4 +939,58 @@ class WritePermissionCheckerTest {
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessageContaining("ctx is null");
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // [批 appname-dyn 2026-09-23] 危险文件名动态化（.{appName}.json）
+    //   本仓把 .nexusai.json 从静态 DANGEROUS_FILES 移出，改由
+    //   dangerousRootForAutoEdit 内 isDangerousFileName 经
+    //   NexusaiPaths.getGlobalConfigFileName() 动态判定 ⇒ 必须证明：
+    //   ①主线（appName=nexusai）该文件名**仍然**落 1.7 第 3 道「危险文件/目录」；
+    //   ②appName 一变，判定确实跟着走（旧名转普通 → 落兜底 ask 而非危险档）。
+    // ──────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("⭐危险文件名随 appName：nexusai ⇒ <home>/.nexusai.json 仍落 1.7 危险档；nexusai-scene ⇒ 换名")
+    void dangerousFileNameFollowsAppName() {
+        String home = System.getProperty("user.home", ".");
+        String legacyFile = Paths.get(home, ".nexusai.json").toString();
+        String sceneFile = Paths.get(home, ".nexusai-scene.json").toString();
+
+        WritePermissionChecker checker = new WritePermissionChecker();
+        ToolUseContext ctx = ctx(rulesCtx(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of()), cwdDir());
+        Tool tool = new ReadFileTool(new PathGuard(cwdDir()));
+
+        try {
+            NexusaiPaths.setAppNameOverride("nexusai");
+            PermissionResult legacyResult = checker.check(tool, input(legacyFile), ctx);
+            assertThat(legacyResult).isInstanceOf(PermissionResult.Ask.class);
+            PermissionDecisionReason legacyReason = ((PermissionResult.Ask) legacyResult).reason();
+            assertThat(legacyReason)
+                .as("⭐不变量：.nexusai.json 从静态 DANGEROUS_FILES 移出后，必须仍由动态判定兜住"
+                    + "（1.7 第 3 道「危险文件/目录」→ SafetyCheck(\"Path is a sensitive file\")）")
+                .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+            assertThat(((PermissionDecisionReason.SafetyCheck) legacyReason).reason())
+                .isEqualTo("Path is a sensitive file");
+
+            PermissionResult sceneUnderMain = checker.check(tool, input(sceneFile), ctx);
+            assertThat(((PermissionResult.Ask) sceneUnderMain).reason())
+                .as("appName=nexusai ⇒ 非当前 appName 的 .nexusai-scene.json 不属危险档（落兜底 ask）")
+                .isNotInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+
+            NexusaiPaths.setAppNameOverride("nexusai-scene");
+            PermissionResult sceneResult = checker.check(tool, input(sceneFile), ctx);
+            PermissionDecisionReason sceneReason = ((PermissionResult.Ask) sceneResult).reason();
+            assertThat(sceneReason)
+                .as("scene ⇒ .{appName}.json 必须危险（动态判定确实跟着 appName 走）")
+                .isInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+            assertThat(((PermissionDecisionReason.SafetyCheck) sceneReason).reason())
+                .isEqualTo("Path is a sensitive file");
+
+            assertThat(((PermissionResult.Ask) checker.check(tool, input(legacyFile), ctx)).reason())
+                .as("scene ⇒ 旧名 .nexusai.json 随之为非危险档（证明是动态派生而非静态恒真）")
+                .isNotInstanceOf(PermissionDecisionReason.SafetyCheck.class);
+        } finally {
+            NexusaiPaths.setAppNameOverride("nexusai");
+        }
+    }
 }

@@ -173,9 +173,9 @@ public class WorkflowPortsImpl implements WorkflowPorts {
         String projectRoot = CwdResolution.getProjectRoot(sessionId);
         if (log.isDebugEnabled()) {
             log.debug("WorkflowPorts.defaultRunsDir: sessionId={} projectRoot={} runsDir={}/{}",
-                    sessionId, projectRoot, projectRoot, WorkflowConstants.WORKFLOW_RUNS_DIR);
+                    sessionId, projectRoot, projectRoot, WorkflowConstants.workflowRunsDir());
         }
-        return projectRoot + "/" + WorkflowConstants.WORKFLOW_RUNS_DIR;
+        return projectRoot + "/" + WorkflowConstants.workflowRunsDir();
     }
 
     // ────────────────────────────────────────────────────────────────────

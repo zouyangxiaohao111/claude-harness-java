@@ -1,6 +1,7 @@
 package com.nexusai.application.project;
 
 import com.nexusai.common.SessionProjectRoot;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.model.project.dto.ProjectBindRequest;
@@ -113,7 +114,9 @@ public class ProjectSessionBindingService {
      */
     private void triggerMigrateOnce(String projectPath) {
         if (projectPath == null || projectPath.isBlank()) {
-            log.warn("[ClaudeToNexusaiMigrator] 绑定项目 path 为空，跳过 .claude → .nexusai 一次性导入");
+            // [批 appname-dyn 追加 2026-09-23] 目标目录名现读（与 ClaudeToNexusaiMigrator 实际写入目录同源）
+            log.warn("[ClaudeToNexusaiMigrator] 绑定项目 path 为空，跳过 .claude → {} 一次性导入",
+                NexusaiPaths.getProjectDirName());
             return;
         }
         try {

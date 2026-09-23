@@ -459,7 +459,7 @@ public final class WorkflowServiceImpl implements WorkflowService {
             NamedWorkflows.NamedWorkflow found = NamedWorkflows.resolveWithFallback(cwd, input.name());
             if (found == null) {
                 throw new IllegalArgumentException("Named workflow \"" + input.name()
-                        + "\" not found (looked in " + WorkflowConstants.WORKFLOW_DIR_NAME
+                        + "\" not found (looked in " + WorkflowConstants.workflowDirName()
                         + "/ 与 .claude/workflows/)");
             }
             if (log.isDebugEnabled()) {

@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.subagent;
 
 import com.nexusai.application.agent.settings.SettingsCache;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.CommandSource;
 import org.junit.jupiter.api.AfterEach;
@@ -232,6 +233,29 @@ class ClaudeCodeGuideAgentDefTest {
             .contains("**Available custom skills in this project:**")
             .contains("- /init:")
             .doesNotContain("**User's settings.json:**");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // [批 appname-dyn 追加 2026-09-23] base prompt 自有根字面随 appName 派生
+    //   （复验「同族低危」ClaudeCodeGuideAgentDef:238：旧版写死 ~/.nexusai 又拼 appName，自相矛盾）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @Test
+    @DisplayName("baseSystemPrompt 自有根：nexusai ⇒ 逐字节仍是 ~/.nexusai；nexusai-scene ⇒ 换名（不再自相矛盾）")
+    void baseSystemPrompt_selfRootFollowsAppName() {
+        try {
+            NexusaiPaths.setAppNameOverride("nexusai");
+            assertThat(ClaudeCodeGuideAgentDef.buildBaseSystemPrompt())
+                .as("不变量：appName=nexusai ⇒ 目录语义句逐字节同改前（含 ~/.claude 兼容读不动）")
+                .contains("目录语义（~/.nexusai 自有根 [appName 动态 nexusai] + ~/.claude 兼容读）");
+
+            NexusaiPaths.setAppNameOverride("nexusai-scene");
+            assertThat(ClaudeCodeGuideAgentDef.buildBaseSystemPrompt())
+                .as("scene ⇒ 自有根改走动态派生（旧版写死 ~/.nexusai 与拼出的 appName 自相矛盾 ⇒ 模型被指错目录）")
+                .contains("目录语义（~/.nexusai-scene 自有根 [appName 动态 nexusai-scene] + ~/.claude 兼容读）");
+        } finally {
+            NexusaiPaths.setAppNameOverride("nexusai");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

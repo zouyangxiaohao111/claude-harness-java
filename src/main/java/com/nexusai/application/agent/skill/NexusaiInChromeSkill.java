@@ -50,7 +50,17 @@ public final class NexusaiInChromeSkill {
         + "CAPTCHA RULE: If the page shows a CAPTCHA, slider-drag verification, or a login/consent "
         + "prompt, do NOT attempt to auto-solve it (no javascript_tool hacks, no blind coordinate "
         + "clicks). Stop, and call AskUserQuestion to ask the user to complete the verification in "
-        + "the browser manually. After they confirm, re-check with read_page / get_page_text and continue.";
+        + "the browser manually. After they confirm, re-check with read_page / get_page_text and continue.\n\n"
+        + "READING PAGE TEXT: to get a page's text content (an article body, an answer, a transcript), call "
+        + "mcp__nexusai-in-chrome__get_page_text first. If the text is missing or truncated (empty, or "
+        + "shorter than the page clearly contains), call it again with mode full, which walks the DOM "
+        + "instead of innerText and catches content that is virtualized or rendered off-screen. To locate "
+        + "or focus a specific region, use mcp__nexusai-in-chrome__read_page: filter interactive gives "
+        + "clickable refs, filter all gives the element tree, and depth / ref_id / max_chars narrow the "
+        + "output. To pull the exact text of one container, use mcp__nexusai-in-chrome__javascript_tool.\n\n"
+        + "DO NOT try to read a page's text by clicking its Copy button and then reading the clipboard: "
+        + "this extension has no clipboard access (no clipboardRead permission, and no copy/read "
+        + "implementation), so that path can never work.";
     public static final String TOOL_PREFIX = "mcp__nexusai-in-chrome__";
 
     private final Supplier<String> basePromptSupplier;

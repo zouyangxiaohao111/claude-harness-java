@@ -88,6 +88,18 @@ public class BuiltInAgents {
      * <p><b>[JDK25 文本块尾随空白]</b>: Java 文本块会剥离行尾空白（JLS 3.10.6 trailing white space 移除），
      * 而 CC 原文 4 行含尾随空白（~/.bashrc 后 2 空格、hostname -s) 后 2 空格、行内 3 空格、command 行尾 1 空格）。
      * 用占位符 <<TRAIL_2SP/3SP/1SP>> + 运行时 replace 恢复，保证逐字字节级对齐 CC。
+     *
+     * <p><b>[批 appname-dyn 追加 2026-09-23] 本字段是「源字面量」，⛔ 刻意不在类初始化期做
+     * appName 替换</b>：{@code static final} 冻结早于 {@code NexusaiAppNameInitializer} 的
+     * {@code @PostConstruct}（另一 bean，时序不保证先于本类加载）注入 appName（时序纪律同
+     * {@code StatuslineCommand#ALLOWED_TOOLS} / {@code NexusaiPaths#getAppTempDirName()}）
+     * ⇒ 就地动态化会让 appName 恒为默认值，appName≠nexusai 时文案仍指 {@code ~/.nexusai}。
+     * 故本字段保留源字面，运行期经 {@link #statuslineSetupSpecific()} 在执行点派生。
+     *
+     * <p><b>不变量</b>：{@code appName=nexusai} ⇒ {@link #statuslineSetupSpecific()} 逐字节 ==
+     * 本字段（{@code replaceSelfDirLiteral} 在默认名下属恒等）⇒ 主线文案零变化；
+     * {@code appName=nexusai-scene} ⇒ 文案内 {@code ~/.nexusai/settings.json} 变
+     * {@code ~/.nexusai-scene/settings.json}。
      */
     private static final String STATUSLINE_SETUP_SPECIFIC =
         """
@@ -222,11 +234,22 @@ public class BuiltInAgents {
           Also ensure that the user is informed that they can ask Claude to continue to make changes to the status line.
         """.replace("<<TRAIL_2SP>>", "  ")
            .replace("<<TRAIL_3SP>>", "   ")
-           .replace("<<TRAIL_1SP>>", " ")
-           // [T3/#21] .nexusai → 动态 appName（决策 D1/D6）：statusline 指引目录随 appName 联动
-           .replace(".nexusai", "." + NexusaiPaths.getAppName());
+           .replace("<<TRAIL_1SP>>", " ");
 
-
+    /**
+     * statusline-setup prompt 的<b>运行期形态</b> · 把源字面里的自有根字面 {@code .nexusai}
+     * 换成当前 {@code .{appName}}（单点真源 {@link NexusaiPaths#replaceSelfDirLiteral}）。
+     *
+     * <p><b>WHY 必须是方法而非在字段上就地替换</b>：见 {@link #STATUSLINE_SETUP_SPECIFIC} 的
+     * 时序说明 —— {@code static final} 冻结早于 appName 注入，就地替换会恒用默认 appName。
+     * 本方法是<b>唯一生产取值口</b>（{@link #STATUSLINE_SETUP_AGENT} 的 systemPromptFn 调它）。
+     *
+     * @return 与当前 appName 联动的 statusline-setup prompt
+     *         （appName=nexusai ⇒ 逐字节 == 源字段 {@link #STATUSLINE_SETUP_SPECIFIC}）
+     */
+    public static String statuslineSetupSpecific() {
+        return NexusaiPaths.replaceSelfDirLiteral(STATUSLINE_SETUP_SPECIFIC);
+    }
 
     /**
      * verification Agent 特定指令 · 对齐 CC verificationAgent.ts:10-129 VERIFICATION_SYSTEM_PROMPT 全文。
@@ -504,7 +527,7 @@ public class BuiltInAgents {
     public static final AgentDefinition STATUSLINE_SETUP_AGENT = AgentDefinition.BuiltInAgentDefinition.builder(
             STATUSLINE_SETUP,
             "Use this agent to configure the user's NexusAI status line setting.",
-            (modelId, dirs) -> buildStandaloneSystemPrompt(STATUSLINE_SETUP_SPECIFIC, modelId, dirs))
+            (modelId, dirs) -> buildStandaloneSystemPrompt(statuslineSetupSpecific(), modelId, dirs))
         .tools(List.of("Read", "Edit"))   // CC :138
         .model("sonnet")                   // CC :141
         .color("orange")                   // CC :142

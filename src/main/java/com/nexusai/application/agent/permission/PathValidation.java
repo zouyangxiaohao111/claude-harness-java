@@ -67,10 +67,14 @@ public final class PathValidation {
     /** CC path.ts:133 containsPathTraversal · `..` 路径段。 */
     static final Pattern PATH_TRAVERSAL = Pattern.compile("(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)");
 
-    /** CC filesystem.ts:57-68 DANGEROUS_FILES。Java 含 .nexusai.json（.claude.json 改名，OPD-WF5-02-04）。 */
+    /** CC filesystem.ts:57-68 DANGEROUS_FILES（静态黑名单）。Java 侧原有的一项 .nexusai.json
+     * （.claude.json 改名，OPD-WF5-02-04）已**移出本静态 Set**：静态常量无法运行时动态，而
+     * 全局配置文件名自批 appname-dyn 2026-09-23 起随 appName 派生（.{appName}.json）⇒ 改由
+     * {@link #isDangerousFilePathToAutoEdit} 方法内经 {@link NexusaiPaths#getGlobalConfigFileName()}
+     * 动态判定（与危险**目录**同一模式）。.claude.json 静态条目**保留不动**（CC mirror 只读兼容）。 */
     static final Set<String> DANGEROUS_FILES = Set.of(
         ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc",
-        ".zprofile", ".profile", ".ripgreprc", ".mcp.json", ".claude.json", ".nexusai.json");
+        ".zprofile", ".profile", ".ripgreprc", ".mcp.json", ".claude.json");
 
     /** CC filesystem.ts:74-79 DANGEROUS_DIRECTORIES。'.claude' 保留 CC mirror（只读兼容）；项目级
      * nexusai 目录（.{appName}）为动态（决策 D1/D6）→ isDangerousFilePathToAutoEdit 方法内
@@ -470,6 +474,13 @@ public final class PathValidation {
         }
         if (segments.length > 0) {
             String fileName = segments[segments.length - 1];
+            // [批 appname-dyn 2026-09-23] 危险文件名动态化：全局配置文件名 = .{appName}.json
+            //   （单点真源 NexusaiPaths.getGlobalConfigFileName()）。与危险目录段同款「静态 Set
+            //   无法运行时动态」处理。**不变量**：appName=nexusai ⇒ 该串 = ".nexusai.json" ⇒
+            //   本判定与移出静态条目**前**逐字节同行为（.nexusai.json 仍危险）。
+            if (fileName.equalsIgnoreCase(NexusaiPaths.getGlobalConfigFileName())) {
+                return true;
+            }
             for (String f : DANGEROUS_FILES) {
                 if (f.equalsIgnoreCase(fileName)) {
                     return true;

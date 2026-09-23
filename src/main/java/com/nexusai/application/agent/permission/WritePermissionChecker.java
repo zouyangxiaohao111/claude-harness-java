@@ -154,10 +154,16 @@ public class WritePermissionChecker {
 
     /**
      * CC DANGEROUS_FILES（filesystem.ts:57-68）——auto-edit 禁改文件（大小写不敏感）。
+     *
+     * <p>Java 侧原有的一项 {@code .nexusai.json} 已**移出本静态 Set**：静态常量无法运行时动态，
+     * 而全局配置文件名自批 appname-dyn 2026-09-23 起随 appName 派生（{@code .{appName}.json}）
+     * ⇒ 改由 {@link #isDangerousFileName} 经 {@link NexusaiPaths#getGlobalConfigFileName()}
+     * 动态判定（与危险**目录** {@link #isDangerousDirectorySegment} 同一模式）。
+     * {@code .claude.json} 静态条目**保留不动**（CC mirror 只读兼容）。
      */
     private static final Set<String> DANGEROUS_FILES = Set.of(
         ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc",
-        ".zprofile", ".profile", ".ripgreprc", ".mcp.json", ".claude.json", ".nexusai.json"
+        ".zprofile", ".profile", ".ripgreprc", ".mcp.json", ".claude.json"
     );
 
     /**
@@ -1206,26 +1212,54 @@ public class WritePermissionChecker {
         }
         if (segments.length > 0) {
             String fileName = segments[segments.length - 1];
-            for (String f : DANGEROUS_FILES) {
-                if (f.equalsIgnoreCase(fileName)) {
-                    // 危险文件 → 根取父目录；无父目录（裸文件名，如相对路径 ".bashrc"）→ 取文件名本身
-                    //   （保持与重构前 isDangerousFilePathToAutoEdit 同判：裸文件名同样危险；
-                    //    取文件名本身 ⇒ 需批准范围严格在「该文件之下」⇒ 实际上不可穿透，fail-closed）
-                    if (segments.length == 1) {
-                        return toPosix(fileName);
-                    }
-                    StringBuilder sb = new StringBuilder();
-                    for (int k = 0; k < segments.length - 1; k++) {
-                        if (k > 0) {
-                            sb.append('/');
-                        }
-                        sb.append(segments[k]);
-                    }
-                    return sb.toString();
+            if (isDangerousFileName(fileName)) {
+                // 危险文件 → 根取父目录；无父目录（裸文件名，如相对路径 ".bashrc"）→ 取文件名本身
+                //   （保持与重构前 isDangerousFilePathToAutoEdit 同判：裸文件名同样危险；
+                //    取文件名本身 ⇒ 需批准范围严格在「该文件之下」⇒ 实际上不可穿透，fail-closed）
+                if (segments.length == 1) {
+                    return toPosix(fileName);
                 }
+                StringBuilder sb = new StringBuilder();
+                for (int k = 0; k < segments.length - 1; k++) {
+                    if (k > 0) {
+                        sb.append('/');
+                    }
+                    sb.append(segments[k]);
+                }
+                return sb.toString();
             }
         }
         return null;
+    }
+
+    /**
+     * 危险<b>文件名</b>判定 · 静态 CC 黑名单（{@link #DANGEROUS_FILES}，filesystem.ts:57-68）
+     * ∪ 动态全局配置文件名（{@link NexusaiPaths#getGlobalConfigFileName()} = {@code .{appName}.json}）。
+     *
+     * <p><b>为什么必须动态</b>：静态 Set 无法运行时动态（appName 来自
+     * {@code spring.application.name} 且可被 {@link NexusaiPaths#setAppNameOverride} 覆写）
+     * —— 与危险目录段（{@link #isDangerousDirectorySegment}）同一理由（R12-3）。批 appname-dyn
+     * 2026-09-23 把 {@code .nexusai.json} 从静态 Set 移出，由本方法兜底。
+     *
+     * <p><b>不变量校验点</b>：{@code appName=nexusai} ⇒ 动态串 = {@code ".nexusai.json"}
+     * ⇒ 本判定与「仍在静态 Set 里」时<b>逐字节同行为</b>（{@code <home>/.nexusai.json} 仍危险）。
+     *
+     * @param fileName 路径末段（文件名；可 null）
+     * @return true = 该文件名命中危险文件
+     */
+    private static boolean isDangerousFileName(String fileName) {
+        if (fileName == null) {
+            return false;
+        }
+        if (fileName.equalsIgnoreCase(NexusaiPaths.getGlobalConfigFileName())) {
+            return true;
+        }
+        for (String f : DANGEROUS_FILES) {
+            if (f.equalsIgnoreCase(fileName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

@@ -470,7 +470,7 @@ public final class KeybindingsSkill {
         BundledSkillDefinition def = new BundledSkillDefinition(
             SKILL_NAME,
             // [T3/#21] description 含路径文本 → 动态 appName（决策 D1/D6）
-            SKILL_DESCRIPTION.replace(".nexusai", "." + NexusaiPaths.getAppName()),
+            NexusaiPaths.replaceSelfDirLiteral(SKILL_DESCRIPTION),
             null,   // aliases（CC 无）
             null,   // whenToUse（CC 无）
             null,   // argumentHint（CC 无）
@@ -517,7 +517,7 @@ public final class KeybindingsSkill {
 
         String prompt = String.join("\n\n", sections);
         // [T3/#21] prompt 文本 .nexusai → 动态 appName（决策 D1/D6）：keybindings 指引目录随 appName 联动
-        prompt = prompt.replace(".nexusai", "." + NexusaiPaths.getAppName());
+        prompt = NexusaiPaths.replaceSelfDirLiteral(prompt);
         if (log.isDebugEnabled()) {
             log.debug("[KeybindingsSkill] 生成 keybindings prompt：{} 段，{} 上下文，{} 动作，长度 {}",
                 sections.size(), CONTEXTS.size(), ACTIONS.size(), prompt.length());

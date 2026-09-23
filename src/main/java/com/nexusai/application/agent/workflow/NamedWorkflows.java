@@ -118,7 +118,7 @@ public final class NamedWorkflows {
         if (projectRoot == null || name == null) {
             return null;
         }
-        NamedWorkflow found = resolve(Path.of(projectRoot, WorkflowConstants.WORKFLOW_DIR_NAME).toString(), name);
+        NamedWorkflow found = resolve(Path.of(projectRoot, WorkflowConstants.workflowDirName()).toString(), name);
         if (found != null) {
             return found;
         }
@@ -144,7 +144,7 @@ public final class NamedWorkflows {
             return List.of();
         }
         Set<String> seen = new LinkedHashSet<>();
-        seen.addAll(list(Path.of(projectRoot, WorkflowConstants.WORKFLOW_DIR_NAME).toString()));
+        seen.addAll(list(Path.of(projectRoot, WorkflowConstants.workflowDirName()).toString()));
         seen.addAll(list(Path.of(projectRoot, ".claude/workflows").toString()));
         return List.copyOf(seen);
     }

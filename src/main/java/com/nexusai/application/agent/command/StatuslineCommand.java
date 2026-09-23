@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.command;
 
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AgentToolConstants;
 
 import java.util.List;
@@ -43,13 +44,35 @@ public final class StatuslineCommand {
     public static final String DEFAULT_PROMPT = "Configure my statusLine from my shell PS1 configuration";
     /** CC statusline.tsx:5 aliases */
     public static final List<String> ALIASES = List.of();
-    /** CC statusline.tsx:10-11 allowedTools */
+    /** CC statusline.tsx:10-11 allowedTools（<b>源字面量</b>）· 运行时形态见 {@link #allowedTools()}。
+     *
+     * <p>第三项 Edit 目标含自有根字面 {@code .nexusai}；本常量<b>不得</b>在此直接动态化 ——
+     * {@code static final} 在 {@link NexusaiPaths#setAppName} 注入前即冻结（时序纪律同
+     * {@link NexusaiPaths#getAppTempDirName()} 的 javadoc），故常量留作源字面量，
+     * 运行时经 {@link #allowedTools()} 派生。 */
     public static final List<String> ALLOWED_TOOLS = List.of(
         AgentToolConstants.AGENT_TOOL_NAME,
         "Read(~/**)",
         "Edit(~/.nexusai/settings.json)");
 
     private StatuslineCommand() {}
+
+    /**
+     * allowedTools 的<b>运行时形态</b> · 每一项经
+     * {@link NexusaiPaths#replaceSelfDirLiteral(String)} 把自有根字面 {@code .nexusai}
+     * 换成当前 {@code .{appName}}（appName=nexusai ⇒ 逐字节等于 {@link #ALLOWED_TOOLS}，主线零变化；
+     * appName=nexusai-scene ⇒ {@code Edit(~/.nexusai-scene/settings.json)}）。
+     *
+     * <p><b>WHY 需要本方法（而非直接改常量）</b>：见 {@link #ALLOWED_TOOLS} 的时序说明 ——
+     * 静态常量冻结早于 appName 注入，就地动态化会让 appName 恒为默认值。
+     *
+     * @return 与当前 appName 联动的 allowedTools（顺序/项数不变，仅路径文本联动）
+     */
+    public static List<String> allowedTools() {
+        return ALLOWED_TOOLS.stream()
+            .map(NexusaiPaths::replaceSelfDirLiteral)
+            .toList();
+    }
 
     /**
      * CC statusline.tsx:14-22 getPromptForCommand —

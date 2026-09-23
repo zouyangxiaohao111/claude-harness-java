@@ -10,6 +10,7 @@ import com.nexusai.application.agent.permission.PermissionRule;
 import com.nexusai.application.agent.permission.PermissionRuleSource;
 import com.nexusai.application.agent.permission.PermissionRuleValue;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -207,5 +208,51 @@ class PowerShellPathValidatorTest {
             permCtx(), Path.of("C:/work/project"), /*whitelistRoot*/ null, false);
         assertInstanceOf(PermissionResult.Ask.class, r,
             "越界白名单根（轴 B）缺失 ⇒ 必须 ask（不得回落解析基准，也不得静默放行）");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // [批 appname-dyn 追加 2026-09-23] 第三份 DANGEROUS_FILES 的全局配置文件名动态化
+    //   （PathValidation / WritePermissionChecker 已改，本份是复验点名的第三份）
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /** ACCEPT_EDITS 上下文（工作目录内写 → allowed）· 使 allowed() 成为可判别的二分信号。 */
+    private static ToolPermissionContext acceptEdits() {
+        return new ToolPermissionContext(PermissionMode.ACCEPT_EDITS, java.util.Map.of(),
+            java.util.Map.of(), java.util.Map.of(), java.util.Map.of(),
+            false, false, java.util.Map.of(), false, false, null);
+    }
+
+    @Test
+    @DisplayName("⭐危险文件名随 appName：nexusai ⇒ <home>/.nexusai.json 仍危险；nexusai-scene ⇒ 换名且旧名转放行")
+    void dangerousGlobalConfigFile_followsAppName() {
+        String home = System.getProperty("user.home", ".");
+        Path homeDir = Path.of(home);
+        try {
+            NexusaiPaths.setAppNameOverride("nexusai");
+            // 工作目录 = home + ACCEPT_EDITS ⇒ 非危险文件必 allowed；危险文件在 step2.5 先被拦 ⇒ 二分可判别
+            PowerShellPathValidator.PathCheck legacy = PowerShellPathValidator.isPathAllowed(
+                home + "/.nexusai.json", null, homeDir, acceptEdits(), "write");
+            assertFalse(legacy.allowed(),
+                "⭐不变量：.nexusai.json 已移出静态 DANGEROUS_FILES ⇒ 必须仍由动态判定拦下"
+                    + "（appName=nexusai，报错=" + legacy.message() + "）");
+            assertTrue(legacy.message() != null && legacy.message().contains("路径命中危险文件 .nexusai.json"),
+                "报错文案取 getGlobalConfigFileName() 规范形 ⇒ 与移出静态条目前的循环文案逐字节同："
+                    + legacy.message());
+            assertTrue(PowerShellPathValidator.isPathAllowed(
+                home + "/.nexusai-scene.json", null, homeDir, acceptEdits(), "write").allowed(),
+                "appName=nexusai ⇒ 非当前 appName 的 .nexusai-scene.json 不危险（应放行）");
+
+            NexusaiPaths.setAppNameOverride("nexusai-scene");
+            PowerShellPathValidator.PathCheck scene = PowerShellPathValidator.isPathAllowed(
+                home + "/.nexusai-scene.json", null, homeDir, acceptEdits(), "write");
+            assertFalse(scene.allowed(),
+                "⭐scene ⇒ .{appName}.json 必须危险（确实跟着 appName 走，报错=" + scene.message() + "）");
+            assertTrue(PowerShellPathValidator.isPathAllowed(
+                home + "/.nexusai.json", null, homeDir, acceptEdits(), "write").allowed(),
+                "scene ⇒ 旧名 .nexusai.json 随之为放行（证明确实是动态派生，不是静态恒真）");
+        } finally {
+            // 共享 JVM：appName 必须复原，否则污染后续测试
+            NexusaiPaths.setAppNameOverride("nexusai");
+        }
     }
 }

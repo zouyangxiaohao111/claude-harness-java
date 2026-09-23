@@ -32,8 +32,9 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * <h2>CC 对齐</h2>
  * <ul>
- *   <li>global source (theme/verbose/autoCompactEnabled 等) → {@code {user.home}/.nexusai.json}
- *       顶层 key 读写 (对齐 CC {@code ~/.claude.json} env.ts:14-24 单点顶层文件).</li>
+ *   <li>global source (theme/verbose/autoCompactEnabled 等) → {@code {user.home}/.{appName}.json}
+ *       顶层 key 读写（appName=nexusai 时 = {@code ~/.nexusai.json}；批 appname-dyn 2026-09-23
+ *       起随 appName 动态，见 {@link #globalFilePath()} 的偏离登记）。</li>
  *   <li>settings source (model/permissions.defaultMode/language 等) →
  *       {@code NexusaiPaths.getAppConfigHomeDir()/settings.json}（= {user.home}/.nexusai/settings.json）
  *       嵌套 path 读写.</li>
@@ -41,8 +42,10 @@ import java.util.concurrent.locks.ReentrantLock;
  * {@code <root>} = {@link NexusaiPaths#getAppConfigHomeDir()}（{@code {user.home}/.{appName}}，
  * 决策 D1 统一自有根）；{@code {appName}} = {@code spring.application.name} 默认 nexusai
  * （见 {@link NexusaiPaths#getAppName()}）。{@code nexusai.home} / env {@code NEXUSAI_HOME} 已废弃
- * （G3 第二轮拍板），不再读取；global 缺省 {@code {user.home}/.nexusai.json}，settings 缺省
- * {@code {user.home}/.nexusai/settings.json}（可经 {@code nexusai.config.global-file / settings-file} 覆盖）。
+ * （G3 第二轮拍板），不再读取；global 缺省 {@code {user.home}/.{appName}.json}，settings 缺省
+ * {@code {user.home}/.{appName}/settings.json}（可经 {@code nexusai.config.global-file / settings-file}
+ * 覆盖）。两处缺省在 appName=nexusai 时分别 = {@code {user.home}/.nexusai.json} 与
+ * {@code {user.home}/.nexusai/settings.json}（本批动态化前的值，主线零变化）。
  *
  * <h2>设计原则</h2>
  * <ul>
@@ -139,7 +142,8 @@ public class FileConfigStorage implements ConfigStorage {
 
     /**
      * 实际全局配置文件路径（{@code ConfigStorageProperties.getGlobalFile()} 覆盖优先，
-     * 缺省 {@code {user.home}/.nexusai.json}，对齐 CC {@code ~/.claude.json} 用户级全局文件，决策 D1）。
+     * 缺省 {@code {user.home}/.{appName}.json}，即 {@link NexusaiPaths#getGlobalConfigFilePath()}；
+     * appName=nexusai 时 = {@code {user.home}/.nexusai.json}，决策 D1 + 批 appname-dyn 2026-09-23 动态化）。
      *
      * <p>public：供 McpConfigFileWriter.globalConfigFilePath() 委托（describeMcpConfigFilePath
      * 必须报告与真实写入一致的路径——若此处报告 hard-code 的 nexusaiHome 路径而实际写入
@@ -150,11 +154,19 @@ public class FileConfigStorage implements ConfigStorage {
                 && !properties.getGlobalFile().isBlank()) {
             return Paths.get(properties.getGlobalFile());
         }
-        // 决策 D1 固定名：全局文件默认 {user.home}/.nexusai.json（对齐 CC ~/.claude.json，
-        // CC getGlobalClaudeFilePath 固定 homedir()/.claude.json，不受 CLAUDE_CONFIG_DIR 影响）。
-        // settingsFilePath() 走 home()=~/.{appName} 动态 —— 与 CC 不对称一致（全局文件固定 homedir，
-        // settings 随 config home 动态），无需改为 .{appName}.json。
-        return Paths.get(System.getProperty("user.home", "."), ".nexusai.json");
+        // ── [偏离登记 · 批 appname-dyn 2026-09-23] 全局文件名改为「跟着 appName 走」──────────
+        // 原设计（本文件上一版）：全局文件**固定** {user.home}/.nexusai.json，理由写在当时的注释里
+        //   ——「对齐 CC ~/.claude.json：CC getGlobalClaudeFilePath 固定 homedir()/.claude.json，
+        //     不受 CLAUDE_CONFIG_DIR 影响」，故 settings 随 config home 动态而 global 不动态。
+        // 谁改的 / 为何：用户 2026-09-23 裁定原话「要改就该 master 变成动态」+
+        //   「我想做的是跟着 appName 走」⇒ 全局文件名随 spring.application.name 派生。
+        //   ⇒ 原注释里那条「无需改为 .{appName}.json」的论证**已被推翻**，故删除并换成这一段。
+        // 与 CC 的关系（如实登记，不再声称对齐）：CC 的 ~/.claude.json 确实不受 CLAUDE_CONFIG_DIR
+        //   影响；本仓自此批起与 CC 在「全局文件是否随 appName 联动」上**有意分歧**。
+        // 偏离可见范围：仅 appName ≠ nexusai（appName=nexusai ⇒ 值逐字节 = {user.home}/.nexusai.json，
+        //   主线零变化）。
+        // 单一真源：路径由 NexusaiPaths.getGlobalConfigFilePath() 产出（⛔ 本类不再拼字面量）。
+        return Paths.get(NexusaiPaths.getGlobalConfigFilePath());
     }
 
     private Path settingsFilePath() {

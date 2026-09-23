@@ -2,6 +2,7 @@ package com.nexusai.application.agent.mcp.config;
 
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.settings.storage.FileConfigStorage;
+import com.nexusai.application.agent.skill.NexusaiPaths;
 import java.nio.file.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,8 +40,9 @@ public class McpConfigFileWriter {
 
     /**
      * 决策 G3（2026-08-30）：nexusai.home 已废弃，不再注入。路径兜底直接固定 user.home——
-     * 与 FileConfigStorage.globalFilePath() 的 {user.home}/.nexusai.json 一致（fileConfigStorage
-     * 恒在场委托，此兜底仅测试 mock 触发）。
+     * 与 FileConfigStorage.globalFilePath() 的缺省（{@code {user.home}/.{appName}.json}，
+     * 批 appname-dyn 2026-09-23 起随 appName 动态；appName=nexusai 时 = {@code {user.home}/.nexusai.json}）
+     * 一致（fileConfigStorage 恒在场委托，此兜底仅测试 mock 触发）。
      */
     public McpConfigFileWriter(
             @Autowired(required = false) FileConfigStorage fileConfigStorage,
@@ -65,21 +67,25 @@ public class McpConfigFileWriter {
         return Path.of(CwdResolution.getCwdForNonSession(), ".mcp.json");
     }
 
-    /** user scope 目标：{@code <user.home>/.nexusai.json}（对齐 CC getGlobalClaudeFile）。 */
+    /** user scope 目标：{@code <user.home>/.{appName}.json}（appName=nexusai 时 =
+     *  {@code <user.home>/.nexusai.json}；批 appname-dyn 2026-09-23 起随 appName 动态）。 */
     public String globalConfigFilePath() {
         if (fileConfigStorage != null) {
             // 委托 FileConfigStorage.globalFilePath()：ConfigStorageProperties.getGlobalFile()
             // 覆盖时报告真实写入路径（describeMcpConfigFilePath 必须与实际文件一致）。
-            // null 兜底（测试 mock / 未装配）：回退 user.home 默认路径，不 NPE。
+            // null 兜底（测试 mock / 未装配）：回退同一单点真源（NexusaiPaths 全局文件路径），不 NPE。
             Path p = fileConfigStorage.globalFilePath();
             if (p != null) {
                 return p.toString();
             }
             if (log.isDebugEnabled()) {
-                log.debug("[McpConfigFileWriter] FileConfigStorage.globalFilePath() 为 null，回退 user.home 默认路径");
+                log.debug("[McpConfigFileWriter] FileConfigStorage.globalFilePath() 为 null，回退 NexusaiPaths 全局文件默认路径");
             }
         }
-        return Path.of(System.getProperty("user.home", "."), ".nexusai.json").toString();
+        // [批 appname-dyn 2026-09-23] 兜底改用单一真源 NexusaiPaths.getGlobalConfigFilePath()：
+        //   与委托路径同源（旧实现此处另拼 ".nexusai.json" 字面量 = 第二套写法，appName 变时必漂，
+        //   而本方法契约要求「报告路径必须与实际写入一致」）。appName=nexusai ⇒ 逐字节等于旧值。
+        return NexusaiPaths.getGlobalConfigFilePath();
     }
 
     // ── describeMcpConfigFilePath（utils.ts:254-271，供 create/update 响应 filePath 展示） ──

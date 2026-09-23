@@ -22,9 +22,11 @@ import { chatApi } from '@/api/chat'
 import { commandApi } from '@/api/command'
 import { tasksApi } from '@/api/tasks'
 import { settingsApi } from '@/api/settings'
+import { mergeSettings } from '@/api/settingsMerge'
 import { attachmentApi } from '@/api/attachment'
 import { ApiError } from '@/api/rest'
 import { debugLog } from '@/utils/debugLog'
+import { rememberAppName } from '@/utils/appNameCache'
 import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedUserBubble'
 import { computeTurnRunning } from '@/utils/turnRunning'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
@@ -308,21 +310,39 @@ function App() {
 
   // ---- provider-env：真实全局设置（挂载拉取，供 ModelPickerModal 档位绑定 + 压缩窗口）----
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null)
+  // ⭐ appSettings 的**唯一写入口**：只读字段（appName/configHome）在此单点保留。
+  //   ⛔ 别处一律不许直接 setAppSettings —— 直接写 = 绕过只读字段保留：PUT /settings 的响应
+  //   契约是后端 SettingsDto（**不含** appName/configHome），写进去会把 appName 抹成 undefined
+  //   ⇒ PermissionBubble.selfDirName 变 null ⇒ 自有根档位文案**静默**退化回 .nexusai/。
+  //   （根修理由与合并规则见 api/settingsMerge.ts 的 mergeSettings。）
+  const applyAppSettings = useCallback(
+    (incoming: AppSettings) => setAppSettings((prev) => mergeSettings(prev, incoming)),
+    [],
+  )
   useEffect(() => {
     let cancelled = false
     settingsApi.get()
-      .then((s) => { if (!cancelled) setAppSettings(s) })
+      .then((s) => {
+        if (cancelled) return
+        applyAppSettings(s)
+        // [appName 通道 2026-09-23] 把只读 appName 落进极薄缓存：后端起不来时 LaunchGate
+        //   拿不到 GET /settings，只能靠上次成功加载的值拼日志路径（见 utils/appNameCache）。
+        rememberAppName(s.appName)
+      })
       .catch(() => { /* 后端未就绪则档位显示未配置，不阻断 */ })
     return () => { cancelled = true }
-  }, [])
+  }, [applyAppSettings])
   const onSaveSettings = useCallback(async (req: UpdateSettingsRequest) => {
     try {
       const updated = await settingsApi.update(req)
-      setAppSettings(updated)
+      // PUT 的响应契约仍是 SettingsDto（**不含**只读的 appName/configHome）⇒ 必须经 applyAppSettings
+      //   （内部 mergeSettings 从旧值保留只读字段），否则每次保存设置后 PermissionBubble 的
+      //   自有根标签会静默退化回 .nexusai/。⛔ 不许在此处再手写一份合并（本仓刚因「两套写法」返工过）。
+      applyAppSettings(updated)
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [showToast])
+  }, [showToast, applyAppSettings])
 
   // 快速模型初始值从后端 settings.fastModelName 读（刷新后恢复全局快速模型配置）
   useEffect(() => {
@@ -1431,7 +1451,9 @@ function App() {
     appSettings,
     guideActive: firstRunGuide.active,
     showToast,
-    onSettingsUpdated: (updated) => setAppSettings(updated),
+    // 「一键套用」的 PUT 响应同样不含 appName ⇒ 必须走唯一写入口（曾在此漏合并 ⇒ F1：点一次
+    //   就让自有根标签静默退化成 .nexusai/）。⛔ 别改回 (updated) => setAppSettings(updated)。
+    onSettingsUpdated: applyAppSettings,
   })
 
   // ---- 改动文件：真实 diff / 回滚（Phase 2 · 后端 SessionFilesController / files.changed 同源） ----
@@ -1878,6 +1900,9 @@ function App() {
             //   sessionId === activeSessionId 过滤（见上方 currentPermission 定义）⇒ 用
             //   activeSession 的绑定项目即可，与 Composer 的 boundProjectName 同一来源。
             projectLabel={activeSession.mainProjectId ? (realProjects.find((p) => p.id === activeSession.mainProjectId)?.name ?? null) : null}
+            // [appName 通道 2026-09-23] 「编辑配置目录」档位的自有根标记由 appName 派生。
+            //   取不到（settings 未加载完 / 后端未透出）⇒ null ⇒ 回落 .nexusai/（与落地前逐字相同）。
+            selfDirName={appSettings?.appName ?? null}
             onDecision={(id, d, answers, annotations, permissionUpdates) => {
               // 路由到请求来源会话（用户切走标签时仍发回正确的 session）
               const targetSession = currentPermission.sessionId ?? activeSessionId

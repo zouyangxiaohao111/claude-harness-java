@@ -146,8 +146,10 @@ public class EnterWorktreeTool implements Tool {
      */
     @Override
     public String prompt() {
-        // [T3/#21] .nexusai → 动态 appName（决策 D1/D6）：worktree 目录指引随 appName 联动
-        String prompt = """
+        // [T3/#21 + 批 appname-dyn 2026-09-23] .nexusai → 动态 appName（决策 D1/D6）：worktree
+        //   目录指引随 appName 联动；收敛到单点真源 NexusaiPaths.replaceSelfDirLiteral
+        //   （appName=nexusai ⇒ 逐字节不变）。
+        String prompt = NexusaiPaths.replaceSelfDirLiteral("""
             Use this tool ONLY when the user explicitly asks to work in a worktree. This tool creates an isolated git worktree and switches the current session into it.
 
             ## When to Use
@@ -175,7 +177,7 @@ public class EnterWorktreeTool implements Tool {
             ## Parameters
 
             - `name` (optional): A name for the worktree. If not provided, a random name is generated.
-            """.replace(".nexusai", NexusaiPaths.getProjectDirName());
+            """);
         return prompt;
     }
 

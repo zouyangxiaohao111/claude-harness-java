@@ -24,6 +24,13 @@
  *    （`~/.nexusai/settings.json`）是**所有项目**生效，落在项目级
  *    （`<项目>/.nexusai/settings.local.json`）只对本项目生效。用户看不出区别就只能猜。
  *    单点 = {@link scopePhrase}；项目标识由调用方传入（见 `PermissionBubble.projectLabel`）。
+ *
+ * 4. **自有根目录名必须跟着 appName 走**（2026-09-23 用户拍板）：自有根 = `~/.{appName}`，
+ *    写死 `.nexusai/` 会在 appName 非 nexusai 的发行里（如场景中台线 `nexusai-scene`）让按钮文案
+ *    退化成规则原文 + 每次渲染一条 `console.warn`（静默降级，只有留痕能察觉）。
+ *    单点 = {@link selfConfigDirMarker}；appName 由调用方传入
+ *    （`PermissionBubble.selfDirName` ← GET /settings 的只读 `appName`）。
+ *    ⭐ 不变量：**拿不到 appName 时行为与落地前逐字相同**（回落 `.nexusai/`）。
  */
 
 import { PERMISSION_MODE_LABELS, type PermissionUpdate, type PermissionUpdateRulesWire, type PermissionRuleValueWire } from '@/api/types'
@@ -35,21 +42,31 @@ const FILE_TOOLS = new Set(['Edit', 'Write', 'Read', 'Glob', 'Grep', 'NotebookEd
 /** Skill 规则前缀形态（`/^(.+):\*$/`） */
 const RULE_PREFIX_RE = /^(.+):\*$/
 
+/** `.claude/` 标记 → 展示名 · 恒在（CC 自己的配置根，与本仓 appName 无关，不随它变）。 */
+const CC_CONFIG_DIR_LABEL: readonly [string, string] = ['.claude/', '.claude/']
+
+/** 自有根目录名的回落值（拿不到 appName 时用它 ⇒ 文案与今日逐字相同）。 */
+const DEFAULT_SELF_DIR_NAME = 'nexusai'
+
 /**
- * 配置目录标记 → 展示名（编辑类规则的特例）。
+ * 自有根目录标记（含尾斜杠）· 由 appName 派生。
  *
- * <p>`/.claude/**` 一类规则（含 `~/.claude/**`）落到「配置目录」文案；本仓自有根
- * `.nexusai` 同理 —— 后端「编辑自有设置（本会话）」档产出的 ruleContent 形如
- * `~/.nexusai/**` / `/.nexusai/**`（后端 `PermissionUpdates.selfConfigRootRuleSuggestion`），
- * 不登记就会掉进「未识别形态」留痕 + 按规则原文渲染。
+ * <p>为什么必须跟着 appName 走：自有根 = `~/.{appName}`（后端 `NexusaiPaths.getAppConfigHomeDir`），
+ * 后端「编辑自有设置（本会话）」档产出的 ruleContent 形如 `~/.{appName}/**`
+ * （`PermissionUpdates.selfConfigRootRuleSuggestion`）。写死 `.nexusai/` 时，场景中台线
+ * （appName=nexusai-scene）产出的 `~/.nexusai-scene/**` **命不中** ⇒ 按钮文案退化成规则原文 +
+ * 每次渲染一条 console.warn。
  *
  * <p>⚠️ 标记必须带尾斜杠：`Edit(~/.nexusai/**)` 命中 `.nexusai/`；不带尾斜杠会让
  * `<某个叫 .nexusai2 的目录>` 这类规则误判成配置目录。
+ *
+ * @param selfDirName 自有根目录名（**不含**前导点，如 `nexusai` / `nexusai-scene`）·
+ *                    缺失/空白 ⇒ 回落 {@link DEFAULT_SELF_DIR_NAME}（⛔ 不猜、不编造）
  */
-const CONFIG_DIR_LABELS: ReadonlyArray<readonly [string, string]> = [
-  ['.claude/', '.claude/'],
-  ['.nexusai/', '.nexusai/'],
-]
+function selfConfigDirMarker(selfDirName?: string | null): string {
+  const name = typeof selfDirName === 'string' ? selfDirName.trim() : ''
+  return `.${name || DEFAULT_SELF_DIR_NAME}/`
+}
 
 /** 会**写进设置文件**的 destination · 单一真源 = 后端 `PermissionUpdatePersister.java:112-114`
  *  （`case USER_SETTINGS, PROJECT_SETTINGS, LOCAL_SETTINGS -> true; case CLI_ARG, SESSION -> false;`）。
@@ -162,7 +179,12 @@ function fallbackLabel(update: PermissionUpdate): string {
 }
 
 /** addRules 型建议的文案（rules 已确定为规则数组，无需再做类型收窄） */
-function addRulesLabel(update: PermissionUpdateRulesWire, toolName: string, scope: string): string {
+function addRulesLabel(
+  update: PermissionUpdateRulesWire,
+  toolName: string,
+  scope: string,
+  selfDirName?: string | null,
+): string {
   /** 作用域由 {@link scopePhrase} 单点决定（用户级 = 所有项目 / 项目级 = 本项目 / 会话级 = 本次会话内） */
   const askAgain = (what: string) => `允许，且${scope}不再询问 ${what}`
   const rules = update.rules
@@ -185,8 +207,13 @@ function addRulesLabel(update: PermissionUpdateRulesWire, toolName: string, scop
     return `允许，且${scope}可读取 ${formatPathList(readDirs)}`
   }
 
-  // 配置文件目录（`.claude/` 与本仓自有根 `.nexusai/`）：编辑类规则的特例
-  for (const [marker, label] of CONFIG_DIR_LABELS) {
+  // 配置文件目录（`.claude/` 恒在，自有根随 appName 派生）：编辑类规则的特例
+  const selfMarker = selfConfigDirMarker(selfDirName)
+  const configDirLabels: ReadonlyArray<readonly [string, string]> = [
+    CC_CONFIG_DIR_LABEL,
+    [selfMarker, selfMarker],
+  ]
+  for (const [marker, label] of configDirLabels) {
     if (rules.every((r) => FILE_TOOLS.has(r.toolName) && r.ruleContent?.includes(marker))) {
       return `允许，且${scope}编辑配置目录 ${label}`
     }
@@ -224,11 +251,14 @@ function addRulesLabel(update: PermissionUpdateRulesWire, toolName: string, scop
  * @param toolName 本次请求的工具名（后端 `Tool.name()`）· 用于分工具选措辞
  * @param projectLabel 当前会话绑定项目的展示名（cwd 的等价物）· 项目级档位的项目标识；
  *                     缺省/取不到时退化为「在本项目中」（不猜、不编造项目名）
+ * @param selfDirName 自有根目录名（**不含**前导点，如 `nexusai` / `nexusai-scene`）·
+ *                    缺省/空白时回落 `.nexusai/` ⇒ 与 appName 通道落地前的行为逐字相同
  */
 export function formatSuggestionLabel(
   update: PermissionUpdate,
   toolName: string,
   projectLabel?: string | null,
+  selfDirName?: string | null,
 ): string {
   // ⭐ 作用域短语单点：项目级带项目标识 / 用户级明说「所有项目」/ 会话级「本次会话内」。
   //   判据 = 后端 PermissionUpdatePersister.java:112-114（cliArg / session 都不落盘）。
@@ -236,7 +266,7 @@ export function formatSuggestionLabel(
 
   switch (update.type) {
     case 'addRules':
-      return addRulesLabel(update, toolName, scope)
+      return addRulesLabel(update, toolName, scope, selfDirName)
     case 'addDirectories': {
       const dirs = update.directories ?? []
       if (dirs.length === 0) return fallbackLabel(update)
@@ -262,12 +292,15 @@ export function formatSuggestionLabel(
  * （后端会把多条规则打包进同一条 addRules —— 那种情况仍是一个档位，文案聚合展示）。
  *
  * @param projectLabel 当前会话绑定项目的展示名（见 {@link formatSuggestionLabel}）
+ * @param selfDirName 自有根目录名（**不含**前导点）· 见 {@link selfConfigDirMarker}；
+ *                    缺省/空白时回落 `.nexusai/`（App 未拿到 appName 时零变化）
  */
 export function buildSuggestionOptions(
   suggestions: PermissionUpdate[] | null | undefined,
   toolName: string,
   projectLabel?: string | null,
+  selfDirName?: string | null,
 ): { label: string; update: PermissionUpdate }[] {
   if (!suggestions || suggestions.length === 0) return []
-  return suggestions.map((update) => ({ label: formatSuggestionLabel(update, toolName, projectLabel), update }))
+  return suggestions.map((update) => ({ label: formatSuggestionLabel(update, toolName, projectLabel, selfDirName), update }))
 }

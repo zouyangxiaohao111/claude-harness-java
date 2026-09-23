@@ -279,7 +279,7 @@ public final class InitVerifiersCommand {
     public String source() { return SOURCE; }
     public String getPrompt() {
         // [T3/#21] prompt 文本 .nexusai → 动态 appName（决策 D1/D6）：模型指引目录随 appName 联动
-        return PROMPT.replace(".nexusai", "." + NexusaiPaths.getAppName());
+        return NexusaiPaths.replaceSelfDirLiteral(PROMPT);
     }
 
     public List<java.util.Map<String, Object>> getPromptBlocks() {

@@ -40,12 +40,13 @@ spring:
   # otherwise be swallowed by the parser.
   # ---------------------------------------------------------------
   datasource:
-    # [G3 决策] DB 位置：NEXUSAI_HOME 已废弃用于应用配置（自有根 NexusaiPaths = {user.home}/.nexusai），
-    #   但 DB 位置保留 ${NEXUSAI_HOME:./}（未设 env 默认 ./ → cwd/nexusai.db），避免破坏既有 dev DB 路径；
-    #   如需迁到 {user.home} 可改 ${user.home}/.nexusai/nexusai.db。cron/MCP 已入 DB（datasource 承载），
-    #   无独立文件路径。
-    # 默认无 profile = dev（cwd 库）；prod 由 application-prod.yml 覆盖 url 到 ~/.nexusai。
-    url: "jdbc:sqlite:${user.home}/.nexusai/nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"
+    # [G3 决策 + 批 appname-dyn 2026-09-23] DB 位置随 appName 动态派生：
+    #   ${user.home}/.${spring.application.name}/nexusai.db（= 与 NexusaiPaths.getAppConfigHomeDir()
+    #   同源的自有根下的库文件）。appName=nexusai ⇒ 逐字节 = 原写死值 ${user.home}/.nexusai/nexusai.db
+    #   （主线零变化）；appName=nexusai-scene ⇒ ${user.home}/.nexusai-scene/nexusai.db（独立空库）。
+    #   NEXUSAI_HOME 已废弃用于应用配置；cron/MCP 已入 DB（datasource 承载），无独立文件路径。
+    # 默认无 profile = dev（同样落自有根库）；prod 由 application-prod.yml 覆盖 url（同为动态占位）。
+    url: "jdbc:sqlite:${user.home}/.${spring.application.name}/nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"
     driver-class-name: org.sqlite.JDBC
     hikari:
       pool-name: NexusAiHikariPool
@@ -279,10 +280,13 @@ nexusai:
 
   # [R32-b7a-2 Phase 5] ConfigStorage 路径配置 (Phase 3 FileConfigStorage 读取).
   # [G3 决策] 前缀由 ${NEXUSAI_HOME:.} 改为 ${user.home}（NEXUSAI_HOME 已废弃）。
-  # 默认 global-file = ~/.nexusai.json (对齐 CC ~/.claude.json); settings 无显式配置 → 走 NexusaiPaths 动态根
-  # (= NexusaiPaths.getAppConfigHomeDir()/settings.json，appName 默认 nexusai)。
+  # [批 appname-dyn 2026-09-23] global-file 随 appName 动态派生：
+  #   ${user.home}/.${spring.application.name}.json。appName=nexusai ⇒ 逐字节 = 原写死值
+  #   ${user.home}/.nexusai.json（主线零变化）；appName=nexusai-scene ⇒ ${user.home}/.nexusai-scene.json。
+  #   与 NexusaiPaths.getGlobalConfigFilePath()（同名单点真源）同值；settings 无显式配置 →
+  #   走 NexusaiPaths 动态根（= NexusaiPaths.getAppConfigHomeDir()/settings.json）。
   config:
-    global-file: ${user.home}/.nexusai.json
+    global-file: ${user.home}/.${spring.application.name}.json
 
   # AES/GCM 256-bit key (base64). Dev default only.
   # Generate new: openssl rand -base64 32

@@ -227,7 +227,7 @@ public final class WorkflowRunEngine {
     private String resolveNamedScript(String name, String cwd) throws WorkflowError {
         // 决策 D6/D7：nexusai 目录优先 + .claude/workflows 回落（既有命名 workflow 兼容）
         String[] bases = {
-                Path.of(cwd, WorkflowConstants.WORKFLOW_DIR_NAME).toString(),
+                Path.of(cwd, WorkflowConstants.workflowDirName()).toString(),
                 Path.of(cwd, ".claude/workflows").toString(),
         };
         for (String base : bases) {
@@ -243,7 +243,7 @@ public final class WorkflowRunEngine {
             }
         }
         throw new WorkflowError("Sub-workflow \"" + name + "\" not found (looked in "
-                + WorkflowConstants.WORKFLOW_DIR_NAME + "/ 与 .claude/workflows/)");
+                + WorkflowConstants.workflowDirName() + "/ 与 .claude/workflows/)");
     }
 
     /**

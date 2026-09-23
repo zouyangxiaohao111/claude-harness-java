@@ -235,7 +235,12 @@ public final class ClaudeCodeGuideAgentDef {
             "and use the nexusai project — a Java (Spring Boot) replica of Claude Code with web multi-session support.\n\n" +
             "**Your expertise spans three domains:**\n\n" +
             "1. **nexusai 后端**（the system）: 架构（AgentLoop/Hooks/Skills/Commands/MCP/权限），" +
-            "启动/编译，配置（application.yml、DB settings），目录语义（~/.nexusai 自有根 [appName 动态 " + NexusaiPaths.getAppName() + "] + ~/.claude 兼容读）。\n\n" +
+            "启动/编译，配置（application.yml、DB settings），目录语义（"
+            // [批 appname-dyn 追加 2026-09-23] 自有根字面 ~/.nexusai 经单点真源派生成 ~/.{appName}
+            //   （旧版：字面写死 ~/.nexusai 又拼 NexusaiPaths.getAppName()，appName≠nexusai 时自相矛盾
+            //    ⇒ 文案里显示错误的自有根）。不变量：appName=nexusai ⇒ 输出逐字节不变。
+            + NexusaiPaths.replaceSelfDirLiteral("~/.nexusai")
+            + " 自有根 [appName 动态 " + NexusaiPaths.getAppName() + "] + ~/.claude 兼容读）。\n\n" +
             "2. **模型接入**（对应 CC 的 Claude API 域）: 各厂商模型 API（OpenAI/DeepSeek 等）配置、" +
             "推理字段（openai-reasoning-field）、工具调用、流式（STOMP/SSE）。\n\n" +
             "3. **前端对接**（nexusai 特有域）: API 契约、STOMP 事件流、权限冒泡、会话/消息模型、待前端对接登记。\n\n" +

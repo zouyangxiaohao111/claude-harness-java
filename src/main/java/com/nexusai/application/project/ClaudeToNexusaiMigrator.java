@@ -44,8 +44,12 @@ public class ClaudeToNexusaiMigrator {
 
     /** 项目级 claude 目录名（源）。 */
     private static final String CLAUDE_DIR = ".claude";
-    /** 项目内 nexusai 自有目录名（目标 · 已入 .gitignore，零仓库污染 · 决策 D6 全动态 .{appName}）。 */
-    private static final String NEXUSAI_DIR = NexusaiPaths.getProjectDirName();
+    // [批 appname-dyn 追加 2026-09-23] 原为 `private static final String NEXUSAI_DIR =
+    //   NexusaiPaths.getProjectDirName();` —— ⛔ static final 在**类加载期**冻结，而 appName 由
+    //   NexusaiAppNameInitializer 的 @PostConstruct（另一 bean，时序不保证先于本类加载）写入
+    //   ⇒ appName=nexusai-scene 时该常量会冻成默认 ".nexusai"，迁移目标目录错位（与
+    //   StatuslineCommand#ALLOWED_TOOLS / NexusaiPaths#getAppTempDirName 的时序纪律同族）。
+    //   故删常量，改在**取值点**现读（见 migrateOnce 内 nexusaiDir）。
 
     /**
      * D6 白名单（依据 claude-dir-io-register §3 项目级读写清单）。
@@ -86,7 +90,8 @@ public class ClaudeToNexusaiMigrator {
             return;
         }
         Path claudeDir = root.resolve(CLAUDE_DIR);
-        Path nexusaiDir = root.resolve(NEXUSAI_DIR);
+        // 取值点现读（⛔ 不得缓存为 static final —— 时序纪律见类首注释）
+        Path nexusaiDir = root.resolve(NexusaiPaths.getProjectDirName());
 
         // 幂等：.nexusai/ 已存在 → 跳过（绝不覆盖）
         if (Files.exists(nexusaiDir)) {
@@ -101,7 +106,9 @@ public class ClaudeToNexusaiMigrator {
             return;
         }
 
-        log.info("[ClaudeToNexusaiMigrator] 项目级 .claude → .nexusai 一次性导入开始: projectRoot={}", root);
+        // [批 appname-dyn 追加 2026-09-23] 日志文案里的目标目录名与实际写入目录同源（现读，不写死）
+        log.info("[ClaudeToNexusaiMigrator] 项目级 .claude → {} 一次性导入开始: projectRoot={}",
+            NexusaiPaths.getProjectDirName(), root);
         int copied = 0;
         for (String item : WHITELIST) {
             Path src = claudeDir.resolve(item);
@@ -120,8 +127,8 @@ public class ClaudeToNexusaiMigrator {
                 log.error("[ClaudeToNexusaiMigrator] 导入失败（继续其余白名单项）: source={}", src, e);
             }
         }
-        log.info("[ClaudeToNexusaiMigrator] 项目级 .claude → .nexusai 一次性导入完成: projectRoot={} copied={}",
-            root, copied);
+        log.info("[ClaudeToNexusaiMigrator] 项目级 .claude → {} 一次性导入完成: projectRoot={} copied={}",
+            NexusaiPaths.getProjectDirName(), root, copied);
     }
 
     /**

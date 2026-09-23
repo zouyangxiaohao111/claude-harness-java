@@ -7,6 +7,8 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * NexusAI 配置路径工具 · 自有根 = 动态 {@code ~/.{appName}/}（决策 D1）。
@@ -151,6 +153,106 @@ public final class NexusaiPaths {
      */
     public static Path getAppConfigHomePath() {
         return Paths.get(getAppConfigHomeDir());
+    }
+
+    /**
+     * 全局配置文件<b>名</b> · {@code .{appName}.json}（含前导点，与
+     * {@link #getProjectDirName()} 同族命名）。
+     *
+     * <p><b>不变量（本批唯一硬不变量）</b>：{@code appName=nexusai} ⇒ 返回值逐字节 =
+     * {@code ".nexusai.json"}（= 本批改前的写死值），主线行为零变化；{@code appName=nexusai-scene}
+     * ⇒ {@code ".nexusai-scene.json"}。
+     *
+     * <p>为什么必须动态（决策依据）：用户 2026-09-23 裁定「要改就该 master 变成动态」+
+     * 「我想做的是跟着 appName 走」—— 与 {@link #getProjectDirName()} / {@link #getAppConfigHomeDir()}
+     * 同一条派生链。⛔ 不得在本类之外另起第二套命名（危险文件名判定 / 存储回落 / YAML 占位符
+     * 必须全部经本方法或其下游 {@link #getGlobalConfigFilePath()}）。
+     *
+     * <p>时序纪律同 {@link #getAppTempDirName()}：每次调用现读 {@code appName}，
+     * ⛔ 不得缓存（{@link NexusaiAppNameInitializer} 的 {@code @PostConstruct} 可能晚于首调）。
+     *
+     * @return 全局配置文件名（含前导点，如 {@code .nexusai.json}）
+     */
+    public static String getGlobalConfigFileName() {
+        return "." + appName + ".json";
+    }
+
+    /**
+     * 全局配置文件路径 · {@code {user.home}/.{appName}.json}（NFC 归一化的绝对路径）。
+     *
+     * <p>形态与 {@link #getAppConfigHomeDir()} 同风格（{@code user.home} 系统属性 + NFC 归一）。
+     * <b>⛔ 刻意<u>不</u>消费 {@link #setConfigHomeDirOverride} 覆写</b>：全局文件位于
+     * <b>{@code user.home} 下而非配置自有根内</b>（旧值 {@code {user.home}/.nexusai.json} 同此语义），
+     * 自有根覆写只重定向 {@code ~/.{appName}} 那棵子树 —— 若在此消费覆写，会把全局文件从
+     * {@code user.home} 挪进覆写目录，改变既有路径语义（现有测试锁
+     * 「global 父目录 == user.home」，见 {@code R32B7a2_FileConfigStorageTest}）。
+     *
+     * <p><b>不变量</b>：{@code appName=nexusai} ⇒ 逐字节 = {@code {user.home}/.nexusai.json}（本批改前值）。
+     *
+     * @return 全局配置文件绝对路径（NFC 归一化）
+     */
+    public static String getGlobalConfigFilePath() {
+        Path path = Path.of(System.getProperty("user.home", "."), getGlobalConfigFileName())
+            .toAbsolutePath().normalize();
+        String result = ClaudePaths.normalizeNfc(path.toString());
+        if (log.isDebugEnabled()) {
+            log.debug("NexusAI 全局配置文件: {}（appName={}）", result, appName);
+        }
+        return result;
+    }
+
+    /**
+     * 默认自有根字面 {@code .nexusai} 的<b>带尾锚</b>匹配式 · 幂等性关键。
+     *
+     * <p>形态 = {@code \Q.nexusai\E(?![A-Za-z0-9_-])} —— 匹配 {@code .nexusai} 但要求其
+     * <b>后继字符不得</b>属于 {@code [A-Za-z0-9_-]}（负向前瞻）。
+     *
+     * <p><b>为什么必须加尾锚</b>：替换<b>源</b>是默认字面 {@code .nexusai}，而替换<b>目标</b>
+     * {@link #getProjectDirName()}（{@code .{appName}}）在 {@code appName} 以 {@code nexusai}
+     * 开头时（如 {@code nexusai-scene}）<b>自身前缀即含该字面</b>：
+     * <ul>
+     *   <li>无锚版：对 {@code "~/.nexusai-scene"} 再套一次 ⇒ {@code "~/.nexusai-scene-scene"}
+     *       （<b>非幂等</b>）；文本里的 {@code .nexusai2} 类 token 也会被咬。</li>
+     *   <li>带锚版：{@code .nexusai-scene} 的后继是 {@code -}（落在否定字符类内）⇒ <b>不再匹配</b>
+     *       ⇒ 套用任意次结果相同（<b>幂等</b>）。</li>
+     * </ul>
+     * 同类「前缀碰撞」本仓刚在姊妹提交 {@code 3bf45e37}「锚前缀改含尾分隔符（照 CC）」闭合过一次，
+     * 本方法把该形态固化为单点真源。
+     *
+     * <p>⚠️ 该锚<b>不影响</b>需要替换的正常形态：后继为 {@code /}、{@code .}（如
+     * {@code ~/.nexusai.json}）、空格、中文标点、行尾 等均不在否定类内 ⇒ 照常替换。
+     */
+    private static final Pattern SELF_DIR_LITERAL =
+        Pattern.compile(Pattern.quote("." + DEFAULT_APP_NAME) + "(?![A-Za-z0-9_-])");
+
+    /**
+     * 文案字面量收敛助手 · 把文本里写死的默认自有根字面 {@code .nexusai} 替换成
+     * <b>当前</b>自有根目录名 {@link #getProjectDirName()}（{@code .{appName}}）。
+     *
+     * <p><b>为什么需要它（单一真源）</b>：本仓历史上散落多处
+     * {@code text.replace(".nexusai", "." + NexusaiPaths.getAppName())} 样板（init / skill 文案 /
+     * bundled agent / workflow tool 等）—— 写法等价但各写各的，易漂。收敛到本方法后
+     * 「默认字面 → 动态名」只有一处实现。
+     *
+     * <p><b>零变化保证</b>：{@code appName=nexusai} ⇒ {@link #getProjectDirName()} = {@code ".nexusai"}
+     * ⇒ 替换源与目标同串 ⇒ 输出逐字节等于入参 ⇒ 主线输出零变化。
+     *
+     * <p><b>幂等性</b>：匹配式带尾锚（见 {@link #SELF_DIR_LITERAL}）⇒ 结果文本里的
+     * {@code .{appName}}（{@code appName=nexusai-scene} 时为 {@code .nexusai-scene}）后继为
+     * {@code -} 或行尾/分隔符，<b>不会再被本方法匹配</b> ⇒ 套用 N 次 == 套用 1 次。
+     * 实例：{@code nexusai-scene} 下对 {@code "~/.nexusai-scene"} 再套一次仍是
+     * {@code "~/.nexusai-scene"}（无锚版会变成 {@code .nexusai-scene-scene}）。
+     *
+     * @param text 待替换文本（可为 null）
+     * @return 替换后的文本（null 入参原样返回 null；{@code appName=nexusai} 时逐字节等于入参）
+     */
+    public static String replaceSelfDirLiteral(String text) {
+        if (text == null) {
+            return null;
+        }
+        // quoteReplacement：当前目标串不含 '$' / '\\'，但走 raw replaceAll 易被未来 appName 咬（后向引用语义）
+        return SELF_DIR_LITERAL.matcher(text)
+            .replaceAll(Matcher.quoteReplacement(getProjectDirName()));
     }
 
     // ────────────────────────────────────────────────────────────────────────

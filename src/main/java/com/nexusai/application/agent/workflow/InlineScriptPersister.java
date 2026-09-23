@@ -33,7 +33,7 @@ public final class InlineScriptPersister {
      * @throws IOException 写失败（调用方降级仅 log，不阻塞 run——service.ts:217-221）
      */
     public static Path persist(String script, String runId, String cwd) throws IOException {
-        Path dir = Path.of(cwd, WorkflowConstants.WORKFLOW_RUNS_DIR, runId);
+        Path dir = Path.of(cwd, WorkflowConstants.workflowRunsDir(), runId);
         Files.createDirectories(dir);
         Path file = dir.resolve("script.js");
         Files.writeString(file, script);

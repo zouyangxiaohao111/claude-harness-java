@@ -37,6 +37,16 @@ public class StuckSkillRegistrar {
     /**
      * CC stuck.ts STUCK_PROMPT 完整文案（:6-59）· two-message Slack 结构（thread_ts :49）+ pgrep -lP
      * + sample &lt;pid&gt; 3 + Notes 2 条。
+     *
+     * <p><b>[批 appname-dyn 追加 2026-09-23] 本常量刻意<b>保留源字面量</b></b>（其内
+     * {@code ~/.nexusai/debug/<session-id>.txt} 是<b>模型面向</b>的路径指引）—— 运行时在
+     * {@link #register} 里经 {@link NexusaiPaths#replaceSelfDirLiteral(String)} 派生为当前
+     * {@code ~/.{appName}/debug/...}。⛔ 不在此就地动态化：{@code static final} 冻结早于
+     * {@link NexusaiAppNameInitializer} 的 {@code @PostConstruct} 注入 appName（时序纪律同
+     * {@code StatuslineCommand#ALLOWED_TOOLS} 的 javadoc），就地动态化会让 appName 恒为默认值。
+     *
+     * <p><b>不变量</b>：{@code appName=nexusai} ⇒ 派生结果逐字节 == 本常量（主线文案零变化）；
+     * {@code appName=nexusai-scene} ⇒ {@code ~/.nexusai-scene/debug/<session-id>.txt}。
      */
     public static final String STUCK_PROMPT = """
         # /stuck — diagnose frozen/slow Claude Code sessions
@@ -116,7 +126,9 @@ public class StuckSkillRegistrar {
             null,   // agent
             Map.of(),   // files
             (args, cwd) -> {
-                String prompt = STUCK_PROMPT;
+                // [批 appname-dyn 追加 2026-09-23] 模型面向文案里的自有根字面 ~/.nexusai/debug/...
+                //   随 appName 派生（单点真源助手；appName=nexusai ⇒ 逐字节不变，见 STUCK_PROMPT javadoc）
+                String prompt = NexusaiPaths.replaceSelfDirLiteral(STUCK_PROMPT);
                 if (args != null && !args.isBlank()) {
                     prompt += "\n## User-provided context\n\n" + args + "\n";
                 }

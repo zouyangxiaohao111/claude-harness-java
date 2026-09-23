@@ -753,10 +753,17 @@ public final class PowerShellPathValidator {
     /** 危险目录（auto-edit 禁改）· 对齐 CC filesystem.ts:74-79（WritePermissionChecker 同源）。
      *  '.claude' 保留 CC mirror；'.nexusai' 改动态 NexusaiPaths.getProjectDirName()（决策 D1，appName≠nexusai 时仍判危险）。 */
     private static final Set<String> DANGEROUS_DIRECTORIES = Set.of(".git", ".vscode", ".idea", ".claude");
-    /** 危险文件（auto-edit 禁改）· 对齐 CC filesystem.ts:57-68。 */
+    /** 危险文件（auto-edit 禁改）· 对齐 CC filesystem.ts:57-68（WritePermissionChecker /
+     *  PathValidation 同源，本份是第三份表）。
+     *
+     *  <p>[批 appname-dyn 2026-09-23] 原有的一项 {@code .nexusai.json} 已<b>移出本静态 Set</b>：
+     *  静态常量无法运行时动态，而全局配置文件名自本批起随 appName 派生（{@code .{appName}.json}）
+     *  ⇒ 改由 {@link #pathSafetyForAutoEdit} 文件段经 {@link NexusaiPaths#getGlobalConfigFileName()}
+     *  动态判定（与危险<b>目录</b>侧 line ~813 {@link NexusaiPaths#getProjectDirName()} 同一模式，
+     *  也与另两份表已改后的形态一致）。{@code .claude.json} 静态条目<b>保留不动</b>（CC mirror 只读兼容）。 */
     private static final Set<String> DANGEROUS_FILES = Set.of(
         ".gitconfig", ".gitmodules", ".bashrc", ".bash_profile", ".zshrc",
-        ".zprofile", ".profile", ".ripgreprc", ".mcp.json", ".claude.json", ".nexusai.json");
+        ".zprofile", ".profile", ".ripgreprc", ".mcp.json", ".claude.json");
 
     /**
      * 解析后路径判定 · 对齐 CC pathValidation.ts:863-977 isPathAllowed。
@@ -830,6 +837,14 @@ public final class PowerShellPathValidator {
         }
         if (segments.length > 0) {
             String fileName = segments[segments.length - 1];
+            // [批 appname-dyn 2026-09-23] 危险文件名动态化（第三份表，与 PathValidation /
+            //   WritePermissionChecker 已改后的形态同款）：全局配置文件名 = .{appName}.json。
+            //   文案用 getGlobalConfigFileName() 的规范形（非入参原样）⇒ 不变量：appName=nexusai
+            //   时该串 == ".nexusai.json" == 移出静态条目**前**循环里的 f ⇒ 报错文案逐字节不变。
+            String dynamicConfigFileName = NexusaiPaths.getGlobalConfigFileName();
+            if (fileName.equalsIgnoreCase(dynamicConfigFileName)) {
+                return "路径命中危险文件 " + dynamicConfigFileName + "（auto-edit 禁改）";
+            }
             for (String f : DANGEROUS_FILES) {
                 if (f.equalsIgnoreCase(fileName)) {
                     return "路径命中危险文件 " + f + "（auto-edit 禁改）";
