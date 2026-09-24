@@ -117,13 +117,16 @@ public final class AgentProgressTracker {
      * @param summary    摘要文本（CC summary 字段；发射时同时作为 description）
      * @param sdkEnabled SDK agentProgressSummaries 门（CC getSdkAgentProgressSummariesEnabled）
      * @param queue      SDK 事件队列（可空 · 测试直构无 bean）
+     * @param sessionId  归属会话 id（C2：SDK task_progress 归属源 · 值来自
+     *                   {@code SubagentExecutor.maybeStartSummary} 的 sessionId 形参；
+     *                   task_progress 由 agent-summary 定时线程发射，MDC 已丢 ⇒ 必须显式携带）
      */
-    public void applySummary(String summary, boolean sdkEnabled, SdkEventQueue queue) {
+    public void applySummary(String summary, boolean sdkEnabled, SdkEventQueue queue, String sessionId) {
         this.summary = summary;
         if (sdkEnabled && queue != null && summary != null && !summary.isBlank()) {
             // CC emitTaskProgress({ description: summary, ..., summary }) —— description 与 summary
             // 均为摘要文本（sdkProgress.ts:10-36 + LocalAgentTask.tsx:397-405）。
-            queue.emitTaskProgress(taskId, toolUseId, summary, startTime,
+            queue.emitTaskProgress(sessionId, taskId, toolUseId, summary, startTime,
                     (int) tokenCount, (int) toolUseCount, null, summary);
         }
     }

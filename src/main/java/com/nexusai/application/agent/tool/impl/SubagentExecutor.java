@@ -2615,7 +2615,9 @@ public class SubagentExecutor {
                     int totalTokensInt = loopResult != null ? (int) loopResult.totalTokens() : 0;
                     int toolUsesInt = loopResult != null ? loopResult.totalToolUseCount() : 0;
                     long durationMs = System.currentTimeMillis() - startMs;
-                    sdkEventQueue.emitTaskTerminatedSdk(registeredForeground.id(), bookendStatus,
+                    // C2 · 会话归属 = 前台任务登记时装入的创建会话（registerAgentForeground(createSessionId)）
+                    sdkEventQueue.emitTaskTerminatedSdk(registeredForeground.sessionId(),
+                        registeredForeground.id(), bookendStatus,
                         new com.nexusai.application.agent.tasks.SdkEventQueue.TaskTerminatedOpts(
                             summaryToolUseId, summaryDescription, "",
                             new com.nexusai.application.agent.tasks.SdkEventQueue.TaskUsage(
@@ -4432,7 +4434,10 @@ public class SubagentExecutor {
         AgentSummaryHandle handle = summaryService.start(
             agentId, agentId, summarizer, summary -> {
                 if (progressTracker != null) {
-                    progressTracker.applySummary(summary, sdk, sdkEventQueue);
+                    // C2 · 会话归属显式化：sessionId 为本方法形参（= 子代理继承的父会话，CC
+                    //   agentSummary.ts:46 与 startAgentSummarization 同源），显式捕获进回调，
+                    //   发射 task_progress 时归属该会话。
+                    progressTracker.applySummary(summary, sdk, sdkEventQueue, sessionId);
                 }
             },
             // [S1-T7] 归因上下文以值捕获后随摘要状态下传到 scheduler 池线程（见 maybeStartSummary javadoc）。

@@ -2149,33 +2149,6 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * 从 streamTopic 解析任务归属 id · RK-w5-2（WF5-03c）。
-     *
-     * <p>后台派生 loop（setTaskStreamContext）的 streamTopic 恒为
-     * {@code /topic/tasks/{taskId}/stream}（w5-01 隔离设计 1）；前台主 loop 为
-     * {@code /topic/sessions/{S}/stream}（会话级单 topic，setStreamContext）。SDK 事件 drain 时按此
-     * 归属过滤（drainSdkEvents(sessionId, ownerTaskId)）：后台 loop 只取本任务事件，不吞前台/
-     * 他会话任务事件；前台 loop 返回 null → 全量取（对齐 CC 单会话全量 drain 语义）。
-     *
-     * @param streamTopic 当前 loop 的流式 topic（可为 null）
-     * @return 后台任务 taskId；非任务路径（/topic/sessions/... 或 null）→ null
-     */
-    static String ownerTaskIdFromStreamTopic(String streamTopic) {
-        if (streamTopic == null) {
-            return null;
-        }
-        // setTaskStreamContext 独占生成 /topic/tasks/{taskId}/stream（w5-01 隔离设计 1）
-        String prefix = "/topic/tasks/";
-        if (streamTopic.startsWith(prefix)) {
-            String rest = streamTopic.substring(prefix.length());
-            int slash = rest.indexOf('/');
-            String taskId = (slash >= 0) ? rest.substring(0, slash) : rest;
-            return taskId.isBlank() ? null : taskId;
-        }
-        return null;
-    }
-
-    /**
      * [R32-b7b-2 P1-3 + P2-1 修复] 解析本次 LLM call 使用的 model · 严格对齐
      * CC {@code Open-ClaudeCode/src/utils/model/model.ts:50-98} {@code getMainLoopModel()}.
      *
@@ -6049,13 +6022,20 @@ public class LlmAgentLoop implements AgentLoop {
             // CC 把 drain 产物写入输出流（stdout）；Java 经 STOMP wsTemplate 推共享 topic /topic/tasks
             // （事件自带 session_id 供前端过滤，契约见 探查/task-system/待前端联调.md）。
             // 非流式会话 ctx.wsTemplate()=null → 跳过（对齐 CC 仅 headless/streaming 消费 SDK 事件）。
-            // RK-w5-2（WF5-03c）：前台/后台并发 drain 互吞——后台 loop（setTaskStreamContext 注入
-            //   streamTopic=/topic/tasks/{taskId}/stream）按任务归属过滤，只取本任务事件，不吞前台/
-            //   他会话任务事件；前台 loop streamTopic=/topic/sessions/... → ownerTaskId=null 全量取。
+            // [C2 根修] 旧 RK-w5-2 的「按 ownerTaskId 过滤」已整块删除（ownerTaskIdFromStreamTopic 一并删）：
+            //   队列改为 per-session 桶，drain 只取**本会话桶** ⇒ 前台 loop / 后台派生 loop /
+            //   子代理 loop / fork / hook 无论走哪条路径，都只可能取到归属本会话的事件，
+            //   结构上不再存在「谁先 drain 谁把别人的事件盖成自己的会话键」。
+            // [单通道出站 · 本块已从「主通道」降级为「幂等兜底」] 投递已前移到**入队点**
+            // （SdkEventQueue.enqueueSdkEvent 取走整桶 → TaskConfiguration 装配的投递器推 /topic/tasks）
+            // ⇒ 装在投递器的生产运行下，本块的桶**通常已被取空**，drain 取到空 ⇒ 无操作（幂等）。
+            // ⛔ 本块仍必须保留：它是投递器缺位（非 Spring 测试直构 / wsTemplate=null）与
+            //   投递失败被回灌（SdkEventQueue.deliverNow catch 分支）两种情况下**唯一**的消费点。
+            // ⛔ 也别在此新增第二处 drain（双发）；两处出站的形态必须一致（都是 toFlatJsonNodes 数组）。
+            // 对齐 CC 2.1.281：drain 实现 exe 偏移 220592956（取一次、同一批喂出口）。
             if (ctx.sdkEventQueue() != null && ctx.wsTemplate() != null) {
                 java.util.List<SdkEventQueue.DrainedSdkEvent> sdkEvents = ctx.sdkEventQueue().drainSdkEvents(
-                    state.sessionId(),
-                    ownerTaskIdFromStreamTopic(ctx.streamTopic()));
+                    state.sessionId());
                 if (!sdkEvents.isEmpty()) {
                     try {
                         java.util.List<com.fasterxml.jackson.databind.JsonNode> sdkNodes =

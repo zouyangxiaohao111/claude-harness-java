@@ -240,14 +240,25 @@ public class InProcessTeammateTaskRegistry {
         String prompt = state.prompt() != null ? state.prompt() : "";
         String description = name + ": "
             + (prompt.length() > 50 ? prompt.substring(0, 50) + "..." : prompt);
-        return new BackgroundTask(
+        // [刀 1a · teammate 会话归属] 显式把父会话装进 BackgroundTask.sessionId。
+        //   WHY：13 参兼容构造默认 sessionId=null（BackgroundTask.java:174 javadoc 自陈），而
+        //   TaskController.listTasks 会话级过滤把 sessionId==null 的任务整条剔除（sessionId() == null
+        //   → continue）⇒ teammate 在会话级 REST 清单里不可见，前端只剩 STOMP 实时一条命（事件丢窗即
+        //   永久空白）。对照：普通 local_agent 由 spawn 侧显式带 createSessionId（类型间不一致）。
+        //   parentSessionId 可能为 null（standalone teammate）⇒ withSessionId(null) 保持既有
+        //   sessionId=null 语义，不伪造会话。
+        String parentSessionId = state.identity().parentSessionId();
+        BackgroundTask task = new BackgroundTask(
             state.taskId(), TaskType.IN_PROCESS_TEAMMATE, BackgroundTaskStatus.RUNNING,
             description, toolUseId,
             System.currentTimeMillis(), null, null,
             // [批 3b-D7] 输出根所属会话 = teammate 的父会话（SpawnContext.parentSessionId 显式装入）；
                 //   ⛔ 不再由下游读 MDC（本方法可能在非会话线程构造 BackgroundTask）
                 com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
-                    state.identity().parentSessionId(), state.taskId()), 0L, false,
+                    parentSessionId, state.taskId()), 0L, false,
             null, true);
+        // withSessionId = 返回新对象的不可变副本（BackgroundTask.java:195-200），20 个实参位与 canonical
+        //   record 构造一一对应（仅 sessionId 槽替换）⇒ 语义等价（已读码确证，非采信上游摘要）。
+        return task.withSessionId(parentSessionId);
     }
 }

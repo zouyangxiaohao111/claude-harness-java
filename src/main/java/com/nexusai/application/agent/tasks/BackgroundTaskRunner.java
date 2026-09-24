@@ -83,12 +83,22 @@ public class BackgroundTaskRunner {
      */
     private volatile com.nexusai.application.agent.team.SpawnInProcess spawnInProcess;
     /**
-     * STOMP 模板 · [cron-task-inject-align C8 · 决策8] 终态 task_notification 结构化直推：空闲路径 /
-     * 无 turn 无 SDK drain（LlmAgentLoop :3885-3893 仅 turn 顶部推），经本字段直接推 /topic/tasks。
-     * volatile + setter 注入（仿 dreamTaskRegistry :56-78 模式）；可为 null —— 测试直构无 bean 时
-     * {@link #emitTerminatedSdk} null 守卫跳过不阻断。
+     * 主会话后台化服务（stopTask 第 5 环回退委托）· 对齐 CC stopTask.ts:38-65
+     * {@code getTaskByType('local_agent').kill} —— CC 里主会话任务（LocalMainSessionTask.ts:150）
+     * 与 spawn 的子代理任务注册进**同一个** {@code appState.tasks}（同为 type='local_agent'）
+     * ⇒ 走同一 kill 命中。
+     *
+     * <p><b>WHY 需要这一环</b>：Java 端主会话后台化任务（{@code MainSessionBackgroundService.registerMainSessionTask}
+     * :210 → {@code TaskFrameworkService.registerMainSessionTask}）**不经 {@link #spawn}** ——
+     * 只写 framework 统一 store 的 {@code store} + {@code mainSessionStore}，**不写**本 runner 的
+     * 本地 {@code tasks} 地图 ⇒ {@link #stopTask} 首行 {@code tasks.get(taskId)} miss，
+     * 而 4 条回退（dream/remote/monitor/teammate）按 type 判别全不认领 ⇒ 落 NOT_FOUND（前端 404）。
+     * 本环按「在不在 mainSessionStore 里」认领（⛔ 判别器见 {@link #stopMainSessionTask} 注释）。
+     *
+     * <p><b>可为 null</b>（未装配 ⇒ 该分支返回 null，fail-closed 落回既有 NOT_FOUND，
+     * 与其余 4 环同构 —— 非 Spring 单测直构时即此态）。
      */
-    private volatile org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate;
+    private volatile MainSessionBackgroundService mainSessionBackgroundService;
 
     public BackgroundTaskRunner(NotificationQueue notificationQueue,
                                  TaskFrameworkService frameworkService) {
@@ -128,9 +138,19 @@ public class BackgroundTaskRunner {
         this.spawnInProcess = spawnInProcess;
     }
 
-    /** 注入 STOMP 模板（TaskConfiguration 装配 · C8 结构化 task_notification 直推）。 */
-    public void setWsTemplate(org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate) {
-        this.wsTemplate = wsTemplate;
+    /**
+     * 注入主会话后台化服务（TaskConfiguration 装配 · 第 5 环 TaskStop 分发用）。
+     *
+     * <p>无直接循环依赖 —— {@code MainSessionBackgroundService} 本身不依赖本 runner
+     * （其字段 = TaskFrameworkService / ObjectProvider&lt;LlmAgentLoop&gt; / SdkEventQueue /
+     * NotificationQueue / chatExecutor / ChatService(required=false) / SessionMapper /
+     * SessionAgentStateRegistry，无本类型）。装配侧另用 {@code @Lazy} 形参（见 TaskConfiguration）
+     * 以规避**间接**路径（本服务 → ChatService → ToolRegistry → BashTool 的
+     * {@code @Autowired(required=false) backgroundTaskRunner}）在 @Bean 形参解析期成环 ——
+     * 该间接环路在本仓已有同型先例（ToolRegistrationConfig:718-725 的 @Lazy 注释）。
+     */
+    public void setMainSessionBackgroundService(MainSessionBackgroundService mainSessionBackgroundService) {
+        this.mainSessionBackgroundService = mainSessionBackgroundService;
     }
 
     /**
@@ -1531,6 +1551,31 @@ public class BackgroundTaskRunner {
             if (teammateResult != null) {
                 return teammateResult;
             }
+            // [第 5 环 · 主会话后台化任务] 对齐 CC stopTask.ts:38-65：CC 里主会话任务
+            //   （LocalMainSessionTask.ts:150 registerTask）与 spawn 的子代理任务同 type='local_agent'、
+            //   同进 appState.tasks ⇒ 经同一 kill 命中。Java 端主会话任务只写 framework 统一 store
+            //   （registerMainSessionTask → TaskFrameworkService），不经 spawn ⇒ 本地 tasks 查不到。
+            //
+            // ⭐ 为什么必须排在**这里**（而不是更后面）：主会话任务与 spawn 的子代理任务
+            //   **type 相同**（都是 TaskType.LOCAL_AGENT，TaskType.java:24）⇒ 「按 type 判别」的回退
+            //   （此处下方 stopLocalAgentTask 的 store 回退正是按 type=LOCAL_AGENT 判别的）会把它一起
+            //   截胡，且由于 killAsyncAgent 以 runner 本地地图为权威，截胡后只会得到 NOT_RUNNING
+            //   （任务仍在跑却报「非运行态」）。故「更具体」的按 store 归属判别的主会话环必须排在
+            //   「更泛」的按 type 判别的 store 回退**之前**；而排在 dream/remote/monitor/teammate
+            //   四条按 type 的回退**之后**是安全的 —— 那四者认领的是各自不同的 type，结构上与
+            //   local_agent 天然互斥，不会与主会话任务抢。
+            StopTaskResult mainSessionResult = stopMainSessionTask(taskId);
+            if (mainSessionResult != null) {
+                return mainSessionResult;
+            }
+            // [刀 3] local_agent 任务也可只注册在统一 store（主会话后台化 MainSessionBackgroundService
+            //   → TaskFrameworkService.registerMainSessionTask，不经 spawn）→ 本地 tasks 查不到。
+            //   listAllTasks 是「本地 ∪ store」合并视图 ⇒ 这类任务「列得出来、点停止必 404」。
+            //   回退 store 查 + killAsyncAgent 分发（mirror stopInProcessTeammateTask）。
+            StopTaskResult localAgentResult = stopLocalAgentTask(taskId);
+            if (localAgentResult != null) {
+                return localAgentResult;
+            }
             if (log.isDebugEnabled()) {
                 log.debug("BackgroundTaskRunner.stopTask: task {} 不存在 (not_found)", taskId);
             }
@@ -1755,6 +1800,127 @@ public class BackgroundTaskRunner {
         log.info("BackgroundTaskRunner.stopTask: in_process_teammate task {} killed (killInProcessTeammate taskId={})",
             taskId, taskId);
         return new StopTaskResult(taskId, TaskType.IN_PROCESS_TEAMMATE.getTypeString(), command, null);
+    }
+
+    /**
+     * 主会话后台化任务停止（第 5 环）· 对齐 CC stopTask.ts:38-65（主会话任务与子代理任务同
+     * type='local_agent'、同 registry ⇒ 同一 kill 命中；见 LocalMainSessionTask.ts:150 registerTask）。
+     *
+     * <p>四段式**逐段镜像** {@link #stopInProcessTeammateTask}（依赖守卫 → 归属判别 → 状态守卫 →
+     * 委托 kill）：
+     * <ol>
+     *   <li>依赖 null 守卫 → {@code null}（未装配 ⇒ fail-closed 落回既有 NOT_FOUND，与 4 环同构）</li>
+     *   <li>归属判别 → 非主会话任务 → {@code null}（交回后续分发路径）</li>
+     *   <li>status 非 RUNNING → {@code NOT_RUNNING}</li>
+     *   <li>委托 {@link MainSessionBackgroundService#killMainSessionTask(String)}：
+     *       false → NOT_RUNNING；true → ok 结果</li>
+     * </ol>
+     *
+     * <p><b>⭐ 判别器纪律（不可替换）</b>：主会话任务与 spawn 出来的子代理任务
+     * <b>type 相同</b>（都是 {@link TaskType#LOCAL_AGENT}，TaskType.java:24）——
+     * 判别它们<b>只能靠「在不在 mainSessionStore 里」</b>
+     * （{@link TaskFrameworkService#getMainSessionTask(String)} :145-147，主会话注册时
+     * {@code registerMainSessionTask} 双写的独立 store）。⛔ <b>不许</b>用 taskId 的 's' 前缀做
+     * 字符串匹配 —— 那个前缀是 {@link MainSessionTaskState#generateMainSessionId()} 的**私有**实现
+     * 常量（{@code MAIN_SESSION_ID_PREFIX}，private static final），按前缀判别等于把私有实现细节
+     * 复制成第二个事实源（改常量即静默失配）。
+     *
+     * @param taskId 任务 id（主会话后台化为 's' 前缀 9 字符，但不依赖该形态判别）
+     * @return 非主会话任务 / 服务未装配 → null（交由正常 not_found / 其他分发路径）；
+     *         主会话任务 → 停止结果
+     */
+    private StopTaskResult stopMainSessionTask(String taskId) {
+        if (mainSessionBackgroundService == null || frameworkService == null) {
+            if (log.isDebugEnabled()) {
+                log.debug("BackgroundTaskRunner.stopTask: 主会话后台化服务未装配, 跳过第 5 环分发 task={}", taskId);
+            }
+            return null;
+        }
+        // ② 归属判别 —— 唯一判据：在不在 mainSessionStore（⛔ 不是 type、⛔ 不是 's' 前缀）
+        MainSessionTaskState state = frameworkService.getMainSessionTask(taskId).orElse(null);
+        if (state == null) {
+            if (log.isDebugEnabled()) {
+                log.debug("BackgroundTaskRunner.stopTask: task {} 不在 mainSessionStore（非主会话后台化任务），第 5 环不认领",
+                    taskId);
+            }
+            return null;
+        }
+        String command = state.description();
+        if (state.status() != BackgroundTaskStatus.RUNNING) {
+            if (log.isDebugEnabled()) {
+                log.debug("BackgroundTaskRunner.stopTask: 主会话任务 {} status={} 非 running (not_running)",
+                    taskId, state.status().getStatusString());
+            }
+            return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command,
+                StopTaskErrorCode.NOT_RUNNING);
+        }
+        boolean killed = mainSessionBackgroundService.killMainSessionTask(taskId);
+        if (!killed) {
+            // 真中断 / 终态置位未能完成（任务在守卫复检时已终态，或 kill 内部只改状态失败）——
+            //   与本文件其余回退的 `!killed → NOT_RUNNING` 同构。
+            log.warn("BackgroundTaskRunner.stopTask: 主会话任务 {} 停止未生效（killMainSessionTask 返回 false）"
+                + " → 返回 not_running（任务可能已终态，或未真正中断）", taskId);
+            return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command,
+                StopTaskErrorCode.NOT_RUNNING);
+        }
+        log.info("BackgroundTaskRunner.stopTask: 主会话后台化任务 {} 已停止"
+            + "（第 5 环：abortStream 真中断 + KILLED 终态 + emitTaskTerminatedSdk('stopped')）", taskId);
+        return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command, null);
+    }
+
+    /**
+     * local_agent 任务停止「统一 store 回退」· 与 {@link #stopDreamTask} / {@link #stopRemoteAgentTask} /
+     * {@link #stopMonitorMcpTask} / {@link #stopInProcessTeammateTask} 同构（类型判断 → store 查 →
+     * 状态守卫 → 转发 kill）。
+     *
+     * <p>WHY（刀 3）：{@link #listAllTasks()} 的查表范围 = 本地 tasks ∪ framework store，而
+     * {@link #stopTask} 入口只在本地 tasks 里查 ⇒ 只注册进统一 store 的 local_agent 会
+     * 「列得出来、点停止必 404」（主会话后台化：MainSessionBackgroundService.registerMainSessionTask
+     * → TaskFrameworkService.registerMainSessionTask，不经 {@link #spawn}）。前端 2s 轮询据此反复
+     * 登记 ⇒ 永久幽灵卡片。本回退把这类任务收敛到确定的停止结果。
+     *
+     * <p>kill 转发 = {@link #killAsyncAgent(String, AsyncAgentResult)}，与 stopTask 内本地 tasks 分支的
+     * LOCAL_AGENT 分发同源（CC stopTask.ts:65 LocalAgentTask.kill → killAsyncAgent，
+     * LocalAgentTask.tsx:281-303），不另起范式。
+     *
+     * @param taskId local_agent 任务 id（= agentId.toString()，或主会话后台化 's' 前缀 id）
+     * @return 非 local_agent 任务 / 未装配 → null（交回 not_found 路径）；local_agent 任务 → 停止结果
+     */
+    private StopTaskResult stopLocalAgentTask(String taskId) {
+        if (frameworkService == null) {
+            return null;
+        }
+        BackgroundTask task = frameworkService.getTask(taskId).orElse(null);
+        if (task == null || task.type() != TaskType.LOCAL_AGENT) {
+            return null;
+        }
+        String command = task.description();
+        if (task.status() != BackgroundTaskStatus.RUNNING) {
+            if (log.isDebugEnabled()) {
+                log.debug("BackgroundTaskRunner.stopTask: local_agent task {} status={} 非 running (not_running)",
+                    taskId, task.status().getStatusString());
+            }
+            return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command,
+                StopTaskErrorCode.NOT_RUNNING);
+        }
+        boolean killed = killAsyncAgent(taskId, null);
+        if (!killed) {
+            // fail-loud（不是静默降级）：killAsyncAgent 以 runner 本地 tasks 地图为权威
+            //   （{@link #killAsyncAgent(String, AsyncAgentResult)} 首行 `tasks.get(taskId)`），而能走到本
+            //   回退的 local_agent 按定义**不在**该地图里（在本地地图的早已被 stopTask 上方分支拦下）⇒
+            //   store 报 running 时也会返回 false。此处与其余四个回退的 `!killed → NOT_RUNNING` 同构，
+            //   但打 WARN 暴露之：主会话后台化任务当前**没有可用的中断通道**（R-1 待办：
+            //   MainSessionBackgroundService.taskAbortSignals 无消费点，且 ChatController 调
+            //   startBackgroundSession 时 abortFlag=null）⇒ 本回退只收敛「可停止性」判定，不代表已真正中断。
+            log.warn("BackgroundTaskRunner.stopTask: local_agent task {} store 报 running 但 killAsyncAgent 未命中"
+                + "（该任务仅在统一 store、无本地 tasks 条目 / 无 abortController）→ 返回 not_running；"
+                + "真实中断通道（R-1）未接线，任务可能仍在后台运行", taskId);
+            return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command,
+                StopTaskErrorCode.NOT_RUNNING);
+        }
+        log.info("BackgroundTaskRunner.stopTask: local_agent task {} killed (killAsyncAgent, 统一 store 回退)",
+            taskId);
+        return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command, null);
     }
 
     /**
@@ -2273,6 +2439,12 @@ public class BackgroundTaskRunner {
      * （对齐 CC stopTask.ts:90 summary: task.description）；outputFile 透传 Java 输出文件路径
      * （CC 直接发射路径缺省 ''，因正常 XML 解析路径会填 output_file；Java 无该解析，透传更有用）。
      * sdkEventQueue 为 null（测试直构）时静默跳过。
+     *
+     * <p><b>[单通道出站] 本方法只有一条出站路径 = {@link SdkEventQueue#emitTaskTerminatedSdk}
+     * （入队即投递）</b>：队列桶是唯一出口，投递由装配侧投递器在<b>入队点</b>完成。原先并行的
+     * 「STOMP 直推」已删除（它是双投来源）—— 详见本方法方法体内注释。
+     * <b>空会话键不再由本方法自带守卫</b>：三分判据（null / blank / NO_SESSION 哨兵 ⇒ fail-loud 丢弃）
+     * 单点在 {@link SdkEventQueue#enqueueSdkEvent}，出站 session_id 恒非空。
      */
     private void emitTerminatedSdk(BackgroundTask task) {
         if (sdkEventQueue == null) {
@@ -2293,21 +2465,24 @@ public class BackgroundTaskRunner {
         if (status == null) {
             return;
         }
-        sdkEventQueue.emitTaskTerminatedSdk(task.id(), status,
+        // C2 · 会话归属：task 自带的创建会话（task.sessionId()，注册时显式装入）
+        sdkEventQueue.emitTaskTerminatedSdk(task.sessionId(), task.id(), status,
             new SdkEventQueue.TaskTerminatedOpts(task.toolUseId(), task.description(),
                 task.outputFile(), null));
-        // [C8 · 决策8] 空闲路径 / 无 turn 无 SDK drain → 单点 STOMP 直推 /topic/tasks（结构化
-        //   task_notification，字段对齐既有 SdkEventQueue.TaskNotificationEvent 契约 FR-5；
-        //   sessionId 供前端按会话过滤）。wsTemplate null（测试直构）→ 跳过不阻断。
-        if (wsTemplate != null) {
-            wsTemplate.convertAndSend("/topic/tasks",
-                new com.nexusai.eventbus.ws.TaskNotificationEvent(
-                    task.sessionId(), task.id(), status, task.description()));
-            if (log.isDebugEnabled()) {
-                log.debug("BackgroundTaskRunner.emitTerminatedSdk: task {} 已直推 /topic/tasks task_notification({})",
-                    task.id(), status);
-            }
-        }
+        // [单通道出站] 此处原有的「STOMP 直推 /topic/tasks」整段已删除 —— 投递已**前移到入队点**
+        //   （SdkEventQueue.enqueueSdkEvent 取走整桶 → TaskConfiguration 装配的投递器出站）。
+        //   保留直推 = 双投来源：会话正在跑 turn 时，入队那条会在下一个 turn 顶部 drain 再推一次
+        //   ⇒ 同一终态推两次（前端 toast 不幂等 ⇒ 弹两次）。删除后**一条通道同时覆盖活跃与空闲会话**，
+        //   且正常路径下同一批事件只被取走一次。
+        //   ⚠️ 「不可能重复」是**过头断言**，此处显式收回：SdkEventQueue.deliverNow 自己登记的
+        //   **requeue-after-send 残余窗口**（出站已写出后投递器才抛 ⇒ 回灌 ⇒ 该批被再取一次）
+        //   是结构上真实存在的重复路径，它以「罕见重复」换「投递器一挂不静默丢」。
+        //   ⛔ 后人不要拿这句当保证去做删除或简化。
+        //   对齐 CC 2.1.281「取一次、同一批喂一处」（exe 偏移约 220592956 的 drain 实现
+        //   + 220593897 的 `drain:Bo` 安装点 + 220377666 的 Cf/Tke 入队监听器注册）。
+        //   ⚠️ 空会话键的守卫**没有丢**：它现在唯一落在 SdkEventQueue.enqueueSdkEvent 的三分判据
+        //   （null / blank / NO_SESSION 哨兵 ⇒ fail-loud 丢弃 ⇒ 连投递机会都没有），与出站契约
+        //   「session_id 恒非空」同口径。
     }
 
     // [IMPL-10] DEL-L03-02: hookRegistry 注入 + TaskCompleted/TeammateIdle 发射已删除

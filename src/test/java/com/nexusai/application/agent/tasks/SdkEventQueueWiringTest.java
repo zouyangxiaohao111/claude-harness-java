@@ -30,10 +30,15 @@ class SdkEventQueueWiringTest {
     @TempDir
     Path tempDir;
 
+    /** 归属会话（C2：task_started 需归属会话才能入队；drain 必须用同一键） */
+    private static final String SESSION = "sess";
+
     private BackgroundTask runningBashTask(String id) {
         return new BackgroundTask(id, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             "desc-" + id, "tu-" + id, System.currentTimeMillis(), null, null,
-            tempDir.resolve(id + ".out").toString(), 0L, false, null, false);
+            tempDir.resolve(id + ".out").toString(), 0L, false, null, false)
+            // C2 · 任务归属会话（13 参兼容构造 sessionId=null ⇒ 必须显式带出）
+            .withSessionId(SESSION);
     }
 
     @Test
@@ -75,7 +80,9 @@ class SdkEventQueueWiringTest {
         BackgroundTaskRunner runner = new BackgroundTaskRunner(nq, service, sdk);
 
         String taskId = UUID.randomUUID().toString();
-        runner.registerAsyncAgent(UUID.fromString(taskId), "调研任务", "prompt", "general-purpose", null, null);
+        // createSessionId 为必填（批 3b-D7 签名收紧：taskOutputPath 缺值 fail-loud）；
+        // C2 起同时是 task_started/task_notification 的归属键 ⇒ 必须与下方 drain 同键。
+        runner.registerAsyncAgent(UUID.fromString(taskId), "调研任务", "prompt", "general-purpose", null, SESSION);
         // register 已发 task_started（先 drain 掉）
         assertThat(sdk.drainSdkEvents("sess")).hasSize(1);
 

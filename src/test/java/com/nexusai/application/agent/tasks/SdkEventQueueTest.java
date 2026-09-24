@@ -34,7 +34,7 @@ class SdkEventQueueTest {
     @DisplayName("enqueue→drain 补 uuid + drain 会话 session_id（CC :96-100）")
     void enqueueAndDrain_stampsUuidAndDrainSessionId() {
         // WHY: 前端按 session_id 归属会话、按 uuid 去重；漏 stamp 则跨会话事件无法过滤
-        queue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent("t1", "tu1", "desc", "local_bash", null, null));
+        queue.enqueueSdkEvent("sess-1", new SdkEventQueue.TaskStartedEvent("t1", "tu1", "desc", "local_bash", null, null));
 
         List<SdkEventQueue.DrainedSdkEvent> drained = queue.drainSdkEvents("sess-1");
 
@@ -45,14 +45,15 @@ class SdkEventQueueTest {
     }
 
     @Test
-    @DisplayName("满 MAX_QUEUE_SIZE=1000 shift 最旧（CC :83-85）")
+    @DisplayName("满 MAX_QUEUE_SIZE=1000 shift 最旧（CC :83-85 · C2 起为每会话桶上限）")
     void capShift_dropsOldestWhenOver1000() {
-        // WHY: 无界堆积 = 内存泄漏；shift 保证队列有界
+        // WHY: 无界堆积 = 内存泄漏；shift 保证桶有界。C2 起 MAX_QUEUE_SIZE 是**每会话桶**上限
+        //   （CC 的 1000 是每队列，而 CC 进程=会话 ⇒ 每队列 ≡ 每会话，语义一致）。
         for (int i = 0; i < SdkEventQueue.MAX_QUEUE_SIZE + 1; i++) {
-            queue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent("t" + i, null, "d", null, null, null));
+            queue.enqueueSdkEvent("sess", new SdkEventQueue.TaskStartedEvent("t" + i, null, "d", null, null, null));
         }
 
-        List<SdkEventQueue.DrainedSdkEvent> drained = queue.drainSdkEvents(null);
+        List<SdkEventQueue.DrainedSdkEvent> drained = queue.drainSdkEvents("sess");
 
         assertThat(drained).hasSize(SdkEventQueue.MAX_QUEUE_SIZE);
         // 最旧的 t0 被 shift 掉，队首是 t1
@@ -64,9 +65,9 @@ class SdkEventQueueTest {
     void interactiveGate_blocksEnqueue() {
         // WHY: TUI 等价场景事件永不消费，入队纯浪费；gate 关闭后必须零入队
         queue.setNonInteractiveSession(false);
-        queue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent("t1", null, "d", null, null, null));
+        queue.enqueueSdkEvent("sess", new SdkEventQueue.TaskStartedEvent("t1", null, "d", null, null, null));
 
-        assertThat(queue.drainSdkEvents(null)).isEmpty();
+        assertThat(queue.drainSdkEvents("sess")).isEmpty();
     }
 
     @Test
@@ -78,7 +79,7 @@ class SdkEventQueueTest {
     @Test
     @DisplayName("emitTaskTerminatedSdk 缺省 output_file/summary=''（CC :130-131）")
     void emitTaskTerminatedSdk_defaultsEmptyOutputFileAndSummary() {
-        queue.emitTaskTerminatedSdk("t1", "completed", null);
+        queue.emitTaskTerminatedSdk("sess", "t1", "completed", null);
 
         SdkEventQueue.TaskNotificationEvent evt =
             (SdkEventQueue.TaskNotificationEvent) queue.drainSdkEvents("sess").get(0).event();
@@ -93,7 +94,7 @@ class SdkEventQueueTest {
     @DisplayName("emitTaskProgress 按 startTime 计算 duration_ms（sdkProgress.ts:30）")
     void emitTaskProgress_computesUsageFromStartTime() {
         long start = System.currentTimeMillis() - 1000;
-        queue.emitTaskProgress("t1", "tu1", "desc", start, 500, 3, "Read", null);
+        queue.emitTaskProgress("sess", "t1", "tu1", "desc", start, 500, 3, "Read", null);
 
         SdkEventQueue.TaskProgressEvent evt =
             (SdkEventQueue.TaskProgressEvent) queue.drainSdkEvents("sess").get(0).event();
@@ -103,35 +104,62 @@ class SdkEventQueueTest {
         assertThat(evt.usage().durationMs()).isGreaterThanOrEqualTo(1000);
     }
 
+    /**
+     * ⚠️ <b>契约变更（C2 · 有意推翻旧语义，不得悄悄绿）</b>
+     *
+     * <p><b>旧契约</b>（本用例改写前的 {@code drainByOwnerTaskId_onlyDrainsOwningTaskEvents}）：
+     * 「队列是进程级单 List；入队打 ownerTaskId；drain(sessionId, ownerTaskId) 按**任务**过滤——
+     * 后台 loop 传自身 taskId 只取本任务事件，其余留队，再由前台 loop 的**全量 drain** 取走并
+     * **盖上它的 session_id**」。该契约把「他会话事件留队后被本会话盖键取走」当作<b>正确</b>行为。
+     *
+     * <p><b>新契约</b>（C2）：归属按**会话**而非任务。入队即定死会话键、每会话一个桶、
+     * {@code drainSdkEvents(sessionId)} 只取本会话桶 ⇒ <b>任何会话都取不到别人的事件</b>
+     * （不存在「他会话事件留队等着被谁盖键取走」这一态）。旧语义正是用户症状「子代理错乱跑到
+     * 别的会话」的结构成因，故<b>有意推翻</b>；任务维度（ownerTaskId）整块删除。
+     */
     @Test
-    @DisplayName("按 ownerTaskId 过滤 drain：后台 loop 只取本任务事件，不吞前台/他会话事件（RK-w5-2）")
-    void drainByOwnerTaskId_onlyDrainsOwningTaskEvents() {
-        // WHY: SdkEventQueue 为进程级单例队列，前台 loop（ChatService）与后台 loop
-        //   （startBackgroundSession）并发 drain 时全取会"互吞"——后台 loop 若取走前台/他会话
-        //   任务事件，会盖成后台 session_id（跨会话错标，前端按 session_id 过滤就漏了本会话任务）。
-        //   enqueue 打标 ownerTaskId + drain 按任务过滤，保证后台 loop 只取自身 task 的事件。
-        queue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent("task-bg", "tu1", "bg desc", "local_agent", null, null));
-        queue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent("task-fg", "tu2", "fg desc", "local_bash", null, null));
-        queue.enqueueSdkEvent(new SdkEventQueue.SessionStateChangedEvent("running"));
+    @DisplayName("[契约变更 C2] 按会话隔离 drain：本会话只取本会话桶，绝不吞他会话事件（取代旧 drainByOwnerTaskId）")
+    void drainBySession_isolationReplacesOwnerTaskIdContract() {
+        // WHY: 旧「按 ownerTaskId 过滤 + 前台全量取盖章」在子代理 loop / fork / hook / teammate
+        //   路径上全部退化为全量取（那些路径拿不到 taskId 来源）⇒ 谁先 drain 谁把别人事件盖成
+        //   自己的会话键。按会话分桶后该结构不再存在。
+        queue.enqueueSdkEvent("sess-x",
+            new SdkEventQueue.TaskStartedEvent("task-bg", "tu1", "bg desc", "local_agent", null, null));
+        queue.enqueueSdkEvent("sess-y",
+            new SdkEventQueue.TaskStartedEvent("task-fg", "tu2", "fg desc", "local_bash", null, null));
+        queue.enqueueSdkEvent("sess-y", new SdkEventQueue.SessionStateChangedEvent("running"));
 
-        // 后台 loop 按自身 task 过滤 drain：只取 task-bg 事件，盖后台 session_id
-        List<SdkEventQueue.DrainedSdkEvent> bg = queue.drainSdkEvents("sess-x", "task-bg");
-        assertThat(bg).hasSize(1);
-        assertThat(((SdkEventQueue.TaskStartedEvent) bg.get(0).event()).taskId()).isEqualTo("task-bg");
-        assertThat(bg.get(0).sessionId()).isEqualTo("sess-x");
+        // 本会话（sess-x）只取到自己的 1 条
+        List<SdkEventQueue.DrainedSdkEvent> mine = queue.drainSdkEvents("sess-x");
+        assertThat(mine).hasSize(1);
+        assertThat(((SdkEventQueue.TaskStartedEvent) mine.get(0).event()).taskId()).isEqualTo("task-bg");
+        assertThat(mine.get(0).sessionId()).isEqualTo("sess-x");
 
-        // 其余（task-fg + session_state_changed）必须留队，前台 loop 全量 drain 取回
-        List<SdkEventQueue.DrainedSdkEvent> rest = queue.drainSdkEvents("sess-y");
-        assertThat(rest).hasSize(2);
-        assertThat(rest).anyMatch(e -> e.event() instanceof SdkEventQueue.TaskStartedEvent t
+        // 他会话（sess-y）的事件**未被本会话取走**：sess-y 自己仍能原样取回 2 条（反面对照可达）
+        List<SdkEventQueue.DrainedSdkEvent> theirs = queue.drainSdkEvents("sess-y");
+        assertThat(theirs).hasSize(2);
+        assertThat(theirs).anyMatch(e -> e.event() instanceof SdkEventQueue.TaskStartedEvent t
             && "task-fg".equals(t.taskId()));
-        assertThat(rest).anyMatch(e -> e.event() instanceof SdkEventQueue.SessionStateChangedEvent);
+        assertThat(theirs).anyMatch(e -> e.event() instanceof SdkEventQueue.SessionStateChangedEvent);
+        // 且它们的 session_id 仍是 sess-y（未被盖上 sess-x）
+        assertThat(theirs).allMatch(e -> "sess-y".equals(e.sessionId()));
     }
 
     @Test
-    @DisplayName("出站 JSON：snake_case + uuid/session_id 平级 + null 省略")
+    @DisplayName("空会话键入队 fail-loud 丢弃（C2：出站 session_id 恒非空）")
+    void enqueueWithBlankSession_dropsAndDoesNotStampEmptyKey() {
+        // WHY: 空键入队 → 出站 `session_id: null` → 前端 `evt.session_id ?? 当前会话` 会把事件
+        //   错标到**当前打开的会话**（比丢弃更坏）。故入队处拦下并留痕。
+        queue.enqueueSdkEvent(null, new SdkEventQueue.TaskStartedEvent("t1", null, "d", null, null, null));
+        queue.enqueueSdkEvent("  ", new SdkEventQueue.TaskStartedEvent("t2", null, "d", null, null, null));
+
+        assertThat(queue.size()).as("空会话键事件不得入任何桶").isZero();
+    }
+
+    @Test
+    @DisplayName("出站 JSON：snake_case + uuid/session_id 平级 + session_id 恒在（C2 不再省略）")
     void toFlatJsonNodes_flattensWithSnakeCaseAndOmitsNulls() {
-        queue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent("t1", "tu1", "desc", "local_bash", null, null));
+        queue.enqueueSdkEvent("sess-1", new SdkEventQueue.TaskStartedEvent("t1", "tu1", "desc", "local_bash", null, null));
 
         List<JsonNode> nodes = SdkEventQueue.toFlatJsonNodes(queue.drainSdkEvents("sess-1"), mapper);
         JsonNode n = nodes.get(0);

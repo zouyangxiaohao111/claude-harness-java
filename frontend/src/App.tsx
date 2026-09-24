@@ -607,7 +607,7 @@ function App() {
     if (!activeSessionId) return
     try {
       // 1) 停止当前会话全部异步任务（background bash/agent/workflow 等）
-      await tasksApi.stopAllTasks(activeSessionId)
+      const stopAllRes = await tasksApi.stopAllTasks(activeSessionId)
       // 2) 中止该会话 pending 权限（worker 解除等待）
       const pending = useChatStore.getState().permissionQueue.filter((r) => r.sessionId === activeSessionId)
       for (const req of pending) {
@@ -616,7 +616,15 @@ function App() {
       }
       // 3) 清当前流式
       clearStream(activeSessionId)
-      showToast('已停止所有任务', 'success')
+      // [stop-all 假成功修正] 后端 success = (failed == 0)（TaskController.stopAll）——
+      //   有任务真没停掉时如实告知，⛔ 不再恒报「已停止所有任务」（用户裁定本批一起修）。
+      //   注意：前端 mock/旧后端的响应可能无 failed 字段 ⇒ 用 `?? 0` 兜底，undefined 走成功分支。
+      if (stopAllRes?.success === false) {
+        const failedCount = stopAllRes.failed ?? 0
+        showToast(failedCount > 0 ? `部分任务未能停止（${failedCount} 个）` : '部分任务未能停止', 'info')
+      } else {
+        showToast('已停止所有任务', 'success')
+      }
       // 显示「已停止」后后台刷新会话数据（停止后立即反映真实状态，等同轨迹 tab 刷新）
       await refreshAfterStop()
     } catch (e) {

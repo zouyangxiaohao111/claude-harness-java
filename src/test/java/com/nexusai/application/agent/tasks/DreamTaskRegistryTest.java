@@ -44,7 +44,7 @@ class DreamTaskRegistryTest {
         DreamTaskRegistry registry = newRegistry();
         AbortController abort = new AbortController();
 
-        String taskId = registry.registerDreamTask(3, 123456789L, abort);
+        String taskId = registry.registerDreamTask("sess-dream", 3, 123456789L, abort);
 
         // 前缀 d + 8 base36（CC Task.ts:86 dream:'d' + generateTaskId:98-106）
         assertThat(taskId).startsWith("d").hasSize(9);
@@ -69,7 +69,7 @@ class DreamTaskRegistryTest {
         TaskFrameworkService framework = new TaskFrameworkService(sdk);
         DreamTaskRegistry registry = new DreamTaskRegistry(framework);
 
-        String taskId = registry.registerDreamTask(2, 99L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 2, 99L, new AbortController());
 
         // 统一 store 可见 + DREAM/RUNNING/'dreaming'（前端面板卡）
         BackgroundTask bg = framework.getTask(taskId).orElseThrow();
@@ -80,7 +80,7 @@ class DreamTaskRegistryTest {
 
         // SDK task_started 已发（对齐 framework.ts:104-116）
         SdkEventQueue.TaskStartedEvent evt =
-            (SdkEventQueue.TaskStartedEvent) sdk.drainSdkEvents("sess").get(0).event();
+            (SdkEventQueue.TaskStartedEvent) sdk.drainSdkEvents("sess-dream").get(0).event();
         assertThat(evt.taskId()).isEqualTo(taskId);
         assertThat(evt.taskType()).isEqualTo("dream"); // CC TaskType 枚举小写值
         assertThat(evt.description()).isEqualTo("dreaming");
@@ -90,7 +90,7 @@ class DreamTaskRegistryTest {
     @DisplayName("addDreamTurn 空 turn + 无新 touched → no-op 跳过（framework.ts:59-63 原引用）")
     void addDreamTurn_emptyTurnAndNoTouched_isNoop() {
         DreamTaskRegistry registry = newRegistry();
-        String taskId = registry.registerDreamTask(1, 1L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 1L, new AbortController());
         DreamTaskState before = registry.getDreamTask(taskId).orElseThrow();
 
         registry.addDreamTurn(taskId, new DreamTaskState.DreamTurn("", 0), List.of());
@@ -106,7 +106,7 @@ class DreamTaskRegistryTest {
     @DisplayName("addDreamTurn 去重 touched + 首个 Edit/Write 翻 phase=updating（DreamTask.ts:83-100）")
     void addDreamTurn_deduplicatesTouchedAndFipsPhaseToUpdating() {
         DreamTaskRegistry registry = newRegistry();
-        String taskId = registry.registerDreamTask(1, 1L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 1L, new AbortController());
 
         registry.addDreamTurn(taskId,
             new DreamTaskState.DreamTurn("分析完成", 2), List.of("/a", "/b", "/a"));
@@ -131,7 +131,7 @@ class DreamTaskRegistryTest {
     @DisplayName("addDreamTurn 非空 turn（无 touched）也更新 turns——no-op 严格判据（DreamTask.ts:87-93）")
     void addDreamTurn_nonEmptyTurnWithoutTouched_stillAppendsTurn() {
         DreamTaskRegistry registry = newRegistry();
-        String taskId = registry.registerDreamTask(1, 1L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 1L, new AbortController());
 
         registry.addDreamTurn(taskId, new DreamTaskState.DreamTurn("有文本", 0), List.of());
         registry.addDreamTurn(taskId, new DreamTaskState.DreamTurn("", 0), List.of()); // no-op
@@ -149,7 +149,7 @@ class DreamTaskRegistryTest {
     @DisplayName("addDreamTurn turns 截断至 MAX_TURNS=30（DreamTask.ts:12/:101 slice(-(MAX-1)).concat）")
     void addDreamTurn_truncatesTurnsToMaxTurns() {
         DreamTaskRegistry registry = newRegistry();
-        String taskId = registry.registerDreamTask(1, 1L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 1L, new AbortController());
 
         for (int i = 1; i <= 31; i++) {
             registry.addDreamTurn(taskId,
@@ -173,7 +173,7 @@ class DreamTaskRegistryTest {
         TaskFrameworkService framework = new TaskFrameworkService(sdk);
         DreamTaskRegistry registry = new DreamTaskRegistry(framework);
         AbortController abort = new AbortController();
-        String taskId = registry.registerDreamTask(3, 123L, abort);
+        String taskId = registry.registerDreamTask("sess-dream", 3, 123L, abort);
 
         registry.completeDreamTask(taskId);
 
@@ -194,7 +194,7 @@ class DreamTaskRegistryTest {
     @DisplayName("failDreamTask 置 failed + endTime + notified=true + abortController 清空（DreamTask.ts:122-130）")
     void failDreamTask_setsFailedStateNotifiedAndClearsAbortController() {
         DreamTaskRegistry registry = newRegistry();
-        String taskId = registry.registerDreamTask(2, 456L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 2, 456L, new AbortController());
 
         registry.failDreamTask(taskId);
 
@@ -213,7 +213,7 @@ class DreamTaskRegistryTest {
         DreamTaskRegistry registry = newRegistry();
         AbortController abort = new AbortController();
         long priorMtime = 888L;
-        String taskId = registry.registerDreamTask(1, priorMtime, abort);
+        String taskId = registry.registerDreamTask("sess-dream", 1, priorMtime, abort);
         AtomicReference<Long> rolledBackMtime = new AtomicReference<>(-1L);
         // [TL-W2 P9] seam 带 taskId（kill 线程不再现算 memoryDir）
         registry.setRollbackConsolidationLock((killedTaskId, m) -> rolledBackMtime.set(m));
@@ -238,7 +238,7 @@ class DreamTaskRegistryTest {
         // WHY: complete 后（fork 已成功）TaskStop 再 kill 必须短路——不 abort 已完成 fork、
         //   不覆盖终态、不重复回退锁（CC :139 return task）。
         DreamTaskRegistry registry = newRegistry();
-        String taskId = registry.registerDreamTask(1, 777L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 777L, new AbortController());
         registry.completeDreamTask(taskId);
         AtomicInteger rollbackCalls = new AtomicInteger();
         registry.setRollbackConsolidationLock((killedTaskId, m) -> rollbackCalls.incrementAndGet());
@@ -264,7 +264,7 @@ class DreamTaskRegistryTest {
         SdkEventQueue sdk = new SdkEventQueue();
         TaskFrameworkService framework = new TaskFrameworkService(sdk);
         DreamTaskRegistry registry = new DreamTaskRegistry(framework);
-        String taskId = registry.registerDreamTask(1, 1L, new AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 1L, new AbortController());
 
         registry.completeDreamTask(taskId);
         framework.evictTerminalTask(taskId);

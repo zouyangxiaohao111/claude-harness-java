@@ -263,7 +263,7 @@ class RemoteAgentTaskServiceTest {
     }
 
     private SdkEventQueue.TaskNotificationEvent firstTerminated() {
-        List<SdkEventQueue.DrainedSdkEvent> drained = sdkEvents.drainSdkEvents(null);
+        List<SdkEventQueue.DrainedSdkEvent> drained = sdkEvents.drainSdkEvents(CREATING_SESSION);
         for (SdkEventQueue.DrainedSdkEvent d : drained) {
             if (d.event() instanceof SdkEventQueue.TaskNotificationEvent e) {
                 return e;

@@ -105,6 +105,13 @@ class WebSocketPermissionPrompterSessionStateTest {
         bound.onResponse("req-1", "deny");
         t.join(3_000);
 
+        // [C2 · 发射侧归属] emit 点必须把「发射会话」带下去：他会话 drain 必须为空
+        //   （否则该事件会被他会话 turn 顶部 drain 取走、盖上他会话的 session_id —— 用户症状
+        //   「子代理/事件错乱跑到别的会话」）。只测队列不够，这里证明 **Prompter 这一侧真的传了键**。
+        assertThat(sdkQueue.drainSdkEvents("sess-other"))
+            .as("session_state_changed 只归发射会话；他会话 drain 必须为空（C2 归因前置）")
+            .isEmpty();
+
         List<SdkEventQueue.DrainedSdkEvent> drained = sdkQueue.drainSdkEvents(SESSION_ID.toString());
         assertThat(drained)
             .as("权限弹窗结束后必须发射会话态 running 通知（对齐 CC structuredIO.ts:654）")

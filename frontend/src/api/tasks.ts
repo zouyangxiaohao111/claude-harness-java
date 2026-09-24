@@ -40,6 +40,11 @@ export const tasksApi = {
     api<{ success: boolean; backgrounded: number }>(
       `/tasks/background-all?sessionId=${encodeURIComponent(sessionId)}`,
       { method: 'POST' }),
-  /** 停止当前会话全部任务（会话级） */
-  stopAllTasks: (sessionId: string) => api<{ success: boolean }>(`/tasks/stop-all?sessionId=${sessionId}`, { method: 'POST' }),
+  /** 停止当前会话全部任务（会话级）。
+   *  [stop-all 假成功修正] 后端 `success` 不再是常量 true —— `success = (failed == 0)`
+   *  （TaskController.stopAll：NOT_RUNNING 幂等口径不算失败，只有真错才计入 failed）。
+   *  前端据此分支文案，故响应类型必须带上 `failed`/`stopped`。 */
+  stopAllTasks: (sessionId: string) =>
+    api<{ success: boolean; stopped: number; failed: number }>(
+      `/tasks/stop-all?sessionId=${sessionId}`, { method: 'POST' }),
 }

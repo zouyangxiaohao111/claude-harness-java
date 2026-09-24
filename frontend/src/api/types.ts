@@ -782,6 +782,47 @@ export interface MarketUseExpertResult {
   /** 展示名（toast「已使用 X 驱动会话」） */
   displayName?: string | null
 }
+/** GET /api/market/external 单插件（后端 ExternalPluginDto · 自建 MinIO 市场插件） */
+export interface ExternalMarketPlugin {
+  /** 插件英文标识（marketplace.json entry.name，安装定位用） */
+  name: string
+  /** 中文展示名 */
+  displayName?: string | null
+  /** 描述 */
+  description?: string | null
+  /** 版本号 */
+  version?: string | null
+  /** 分类（expert / skill / connector，前端分流到 Tab） */
+  category?: string | null
+  /** 标签 */
+  tags?: string[] | null
+  /** 创建时间（ISO 8601） */
+  createdAt?: string | null
+}
+/** GET /api/market/external 响应（后端 ExternalMarketDto · 自建 MinIO 市场） */
+export interface ExternalMarket {
+  /** 市场名 */
+  name: string
+  /** 市场所有者 */
+  owner?: string | null
+  /** 市场描述 */
+  description?: string | null
+  /** 插件列表（category 分流） */
+  plugins: ExternalMarketPlugin[]
+}
+/** POST /api/plugins/install 响应（后端 PluginInstallResult） */
+export interface PluginInstallResult {
+  /** 是否安装成功 */
+  success: boolean
+  /** 结果消息（中文；失败含原因） */
+  message: string
+  /** 已安装插件标识（name@marketplace） */
+  pluginId?: string | null
+  /** 插件名 */
+  pluginName?: string | null
+  /** 安装 scope */
+  scope?: string | null
+}
 
 // ---- Todo 清单（TodoWrite 工具 · GET /sessions/{id}/todos + STOMP /topic/sessions/{sessionId}/todos）----
 /** Todo 状态（对齐后端 TodoItem.status） */

@@ -3,6 +3,7 @@ package com.nexusai.application.agent.tasks;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.RunRequest;
+import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.AgentTranscript;
@@ -110,6 +111,22 @@ public class MainSessionBackgroundService {
      */
     @Autowired(required = false)
     private SessionMapper sessionMapper;
+    /**
+     * 会话 AgentState 注册表 · {@link #killMainSessionTask} 的**真中断**通道。
+     *
+     * <p><b>WHY</b>：本服务的后台派生查询（{@code runBackgroundQuery} → {@code LlmAgentLoop.run}）
+     * 按 {@code agentUuid}（= {@code taskAgentId(taskId)}）注册进本注册表的 <b>agents 桶</b>
+     * （{@code SessionAgentStateRegistry.register(UUID, AgentState)}，由其 javadoc :96-117 +
+     * {@code LlmAgentLoop}:2735-2737 确证）⇒ 停止任务时经该桶取回在飞 AgentState 调
+     * {@code abortStream("user-cancel")} = 与 {@code ChatService.cancelSession}（:2097-2114）
+     * <b>同一条</b>硬中断路径（attach 的 runAbortController.abort → provider 流消费循环 chunk 边界
+     * 检查 aborted → loop 立即退出）。缺此通道时 kill 只改状态，卡片显示「已停止」而后台仍在烧 token。
+     *
+     * <p>{@code required=false}（仿该文件 sessionMapper 风格）：非 Spring 单测 / 裁剪环境注入不到
+     * → {@link #killMainSessionTask} 降级为「只改状态」并打 <b>≥WARN</b> 留痕（⛔ 不静默）。
+     */
+    @Autowired(required = false)
+    private SessionAgentStateRegistry sessionAgentStateRegistry;
     /** [IMP2-10 · MISS-2 · OD-13] taskBudget 配置源（tokens；0 = 未配置 → 回落 RunRequest.DEFAULT_TASK_BUDGET_TOTAL） */
     @Value("${nexusai.agent.task-budget.total:0}")
     private int taskBudgetTotalConfigured = 0;
@@ -224,6 +241,126 @@ public class MainSessionBackgroundService {
      */
     public Optional<AtomicBoolean> getAbortSignal(String taskId) {
         return Optional.ofNullable(taskAbortSignals.get(taskId));
+    }
+
+    /**
+     * 停止主会话后台化任务（真中断 + 终态收尾）· 由 {@code BackgroundTaskRunner.stopMainSessionTask}
+     * （TaskStop 第 5 环）委托调用 · 对齐 CC {@code stopTask.ts:38-65}
+     * （{@code getTaskByType('local_agent').kill} → {@code LocalAgentTask.tsx:273-303}
+     * 「同一处 status=killed + abortController?.abort()」—— CC 里「能 kill」与「能中断执行体」是同一件事）。
+     *
+     * <p><b>语义（顺序即语义，不要重排）</b>：
+     * <ol>
+     *   <li><b>only-if-running 守卫</b>（照抄 {@code BackgroundTaskRunner.killAsyncAgent}:1241-1248 的写法）：
+     *       投影不存在 / status 非 RUNNING → false（幂等短路，无副作用）</li>
+     *   <li>⭐ <b>真中断</b>（本方法承重环节）：
+     *       (a) registry 取该任务 agentUuid 的在飞 AgentState → {@code abortStream("user-cancel")}
+     *           （与 {@code ChatService.cancelSession} 同一条硬中断路径）；
+     *       (b) 任务级 abort 信号置 true（{@link #getAbortSignal}）；
+     *       两条均 log.info 留痕；取不到/未装配 → ≥WARN 留痕（⛔ 不静默）。</li>
+     *   <li><b>置终态</b>：KILLED + endTime + notified，且<b>双 store 同步</b>
+     *       （{@code updateTaskState} + {@code updateMainSessionTask}）——
+     *       只改前者会让 mainSessionStore 滞留 RUNNING（{@code getMainSessionTask} 侧永远看到运行时态）。</li>
+     *   <li><b>发终态事件</b>：{@code emitTaskTerminatedSdk(taskId, "stopped", ...)} —— 闭合
+     *       registerMainSessionTask 发的 task_started bookend（前端据此把卡片置「已停止」）。</li>
+     *   <li>⛔ <b>不 evict</b>：对齐既有 kill 路径（{@code killAsyncAgent} / {@code markKilled}）
+     *       —— 面板要能显示「已停止」，evict 掉则前端读不到终态。</li>
+     * </ol>
+     *
+     * <p><b>agentUuid 取法（⛔ 不是照抄别的表达式）</b>：{@code taskAgentId(taskId)} —— 本类私有单点，
+     * 注册侧（{@code registerMainSessionTask}:158 用它构造 {@code BackgroundTask.agentId}；
+     * {@code runBackgroundQuery}:392 用它作 {@code RunRequest} 的 agentId）与本方法<b>同源同参</b>，
+     * 故映射到同一 UUID ⇒ 与 {@code LlmAgentLoop} 注册进 registry 的键一致。
+     * ⛔ <b>不是</b> {@code MainSessionTaskState.agentId()}（那是 taskId 的**字符串**视图，
+     * CC :132 {@code agentId=taskId}，与 registry 的 UUID 键空间不同源）。
+     *
+     * @param taskId 主会话后台化任务 id（'s' 前缀 9 字符）
+     * @return true = 本次调用完成了「中断 + 终态」；false = 任务不存在 / 已非 running（幂等短路）
+     */
+    public boolean killMainSessionTask(String taskId) {
+        // ① only-if-running 守卫（镜像 killAsyncAgent 守卫：先取记录，非 running 直接短路，不产生副作用）
+        BackgroundTask current = taskFrameworkService.getTask(taskId).orElse(null);
+        if (current == null) {
+            log.warn("主会话后台化任务停止: taskId={} 不存在（framework store 无此任务）→ kill 未生效（false）", taskId);
+            return false;
+        }
+        if (current.status() != BackgroundTaskStatus.RUNNING) {
+            log.info("主会话后台化任务停止: taskId={} status={} 非 running → kill 幂等短路（false）",
+                taskId, current.status().getStatusString());
+            return false;
+        }
+
+        // ② 真中断 (a)：registry 在飞 AgentState 硬断流 —— 与 ChatService.cancelSession 同一路径。
+        //    agentUuid 与注册侧同源同参（见 javadoc「agentUuid 取法」）。
+        UUID agentUuid = taskAgentId(taskId);
+        if (sessionAgentStateRegistry == null) {
+            // required=false 注入不到（非 Spring 单测 / 裁剪环境）：只能置终态 —— 必须 ≥WARN，
+            //   否则「卡片已停止、后台仍在烧 token」的假绿无人察觉。
+            log.warn("[降级] 主会话后台化任务停止: taskId={} sessionAgentStateRegistry 未装配 → "
+                + "无法硬断流，仅置终态；后台派生查询可能仍在运行（持续消耗 token）【≥WARN 显式留痕，非静默】",
+                taskId);
+        } else {
+            AgentState inFlight = sessionAgentStateRegistry.getByAgentId(agentUuid);
+            if (inFlight != null) {
+                inFlight.abortStream("user-cancel");
+                log.info("主会话后台化任务停止: taskId={} agentUuid={} → registry 命中在飞 AgentState，"
+                    + "已 abortStream(\"user-cancel\")（provider 硬断流 → 查询循环立即退出；"
+                    + "与 ChatService.cancelSession 同一硬中断路径）", taskId, agentUuid);
+            } else {
+                log.warn("主会话后台化任务停止: taskId={} agentUuid={} 在 registry 未命中在飞 AgentState"
+                    + "（loop 尚未注册 / 已退出 / 未 attach abortController）→ 本次无硬断流可打，仍置终态",
+                    taskId, agentUuid);
+            }
+        }
+        // ② 真中断 (b)：任务级 abort 信号置 true（CC registerMainSessionTask 返回的 abortSignal :160
+        //    在本类的持有物 = taskAbortSignals）。⚠️ 如实说明承重关系：runBackgroundQuery 的 abort 分支
+        //    读的是**形参** abortFlag（:440），生产 ChatController 传 null ⇒ 该形参恒 null ——
+        //    真正生效的中断是上面的 (a)；本 (b) 令「传入了本 map 中同一实例的调用方」在 loop 返回后
+        //    短路为 markNotified + emitTaskTerminatedSdk('stopped')（:440-449），与 CC
+        //    「taskState.abortController 被 stop 置位」同形。
+        Optional<AtomicBoolean> abortSignal = getAbortSignal(taskId);
+        if (abortSignal.isPresent()) {
+            abortSignal.get().set(true);
+            log.info("主会话后台化任务停止: taskId={} 任务级 abort 信号已置 true（taskAbortSignals 命中）", taskId);
+        } else {
+            log.warn("主会话后台化任务停止: taskId={} 任务级 abort 信号不存在"
+                + "（taskAbortSignals 无此条目：未注册 / 已被清理）→ 跳过置位", taskId);
+        }
+
+        // ③ 置终态 KILLED + endTime + notified（写法照抄既有 kill 路径 killAsyncAgent:1249-1252 的
+        //    withStatus(KILLED).withEndTime(now).withNotified()），双 store 同步。
+        BackgroundTask terminal = current
+            .withStatus(BackgroundTaskStatus.KILLED)
+            .withEndTime(System.currentTimeMillis())
+            .withNotified();
+        taskFrameworkService.updateTaskState(taskId, terminal);
+        MainSessionTaskState carrier = taskFrameworkService.getMainSessionTask(taskId).orElse(null);
+        if (carrier != null) {
+            taskFrameworkService.updateMainSessionTask(taskId,
+                carrier.withStatus(BackgroundTaskStatus.KILLED)
+                    .withEndTime(terminal.endTime())
+                    .withNotified());
+            log.info("主会话后台化任务终止态已置: taskId={} status=killed, endTime={}, notified=true（双 store 同步）",
+                taskId, terminal.endTime());
+        } else {
+            // 双 store 不一致（理论上 registerMainSessionTask 必双写；此处 fail-loud 暴露，不静默）
+            log.warn("主会话后台化任务终止态: taskId={} mainSessionStore 无对应载体（双 store 不一致）→ "
+                + "仅投影置终态；getMainSessionTask 侧仍读不到该任务", taskId);
+        }
+
+        // ④ 发终态事件 'stopped'（闭合 task_started bookend，前端据此将卡片置「已停止」）。
+        //    选项构造照抄本文件既有 emit 点（completeMainSessionTask:590-591/:595-596 的形参给法：
+        //    toolUseId + "Background session" + outputFile + usage=null），与 abort 分支 :446-447
+        //    同为 'stopped' 语义点。
+        sdkEventQueue.emitTaskTerminatedSdk(terminal.sessionId(), taskId, "stopped",
+            new SdkEventQueue.TaskTerminatedOpts(terminal.toolUseId(), "Background session",
+                terminal.outputFile(), null));
+        log.info("主会话后台化任务停止完成: taskId={} → emitTaskTerminatedSdk('stopped') 已发", taskId);
+
+        // ⑤ ⛔ 不 evict：对齐既有 kill 路径（BackgroundTaskRunner.killAsyncAgent 只置态不移除 /
+        //    LocalShellTaskGuards 路径的 markKilled 同理）—— 面板要能显示「已停止」；
+        //    移除任务会让前端 2s 轮询直接读不到该条目（卡片消失而非显示「已停止」）。
+        return true;
     }
 
     /**
@@ -443,7 +580,8 @@ public class MainSessionBackgroundService {
                 //   （chat:killAgents 路径已 notified+emitted 则不重发；stopTask 路径必须发 bookend）
                 boolean alreadyNotified = markNotified(taskId);
                 if (!alreadyNotified) {
-                    sdkEventQueue.emitTaskTerminatedSdk(taskId, "stopped",
+                    // C2 · 会话归属 = 本后台派生查询的会话（runBackgroundQuery 形参 sessionId）
+                    sdkEventQueue.emitTaskTerminatedSdk(sessionId, taskId, "stopped",
                         new SdkEventQueue.TaskTerminatedOpts(null, description, null, null));
                 }
                 return;
@@ -587,12 +725,14 @@ public class MainSessionBackgroundService {
             // CC :199-206 后台化 → XML 通知（原子 notified CAS 防重）
             enqueueMainSessionNotification(taskId, "Background session",
                 success ? "completed" : "failed", toolUseId);
-            sdkEventQueue.emitTaskTerminatedSdk(taskId, success ? "completed" : "failed",
+            sdkEventQueue.emitTaskTerminatedSdk(terminal.sessionId(), taskId, success ? "completed" : "failed",
                 new SdkEventQueue.TaskTerminatedOpts(toolUseId, "Background session", terminal.outputFile(), null));
         } else {
             // CC :207-218 已前台化 → 置 notified + SDK task_terminated bookend（无 XML）
             markNotified(taskId);
-            sdkEventQueue.emitTaskTerminatedSdk(taskId, success ? "completed" : "failed",
+            // C2 · 会话归属：terminal = current.withStatus/withEndTime 派生副本，
+            //   sessionId 随 with* 系列保留（BackgroundTask.withStatus 透传 sessionId）。
+            sdkEventQueue.emitTaskTerminatedSdk(terminal.sessionId(), taskId, success ? "completed" : "failed",
                 new SdkEventQueue.TaskTerminatedOpts(toolUseId, "Background session", terminal.outputFile(), null));
         }
         log.info("主会话后台化任务完成: taskId={}, success={}, wasBackgrounded={}, notified={}",

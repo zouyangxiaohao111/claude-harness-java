@@ -17,7 +17,7 @@ export function AgentSelector({ currentAgent, onOpen }: {
 
   return (
     <div
-      className="toolbar-select agent-selector agent-market-trigger"
+      className={`toolbar-select agent-selector agent-market-trigger${currentAgent ? ' active' : ''}`}
       title={currentAgent
         ? `当前主线程 agent：${currentAgent} · 点击打开技能市场`
         : '打开技能市场：选择专家驱动整轮对话'}

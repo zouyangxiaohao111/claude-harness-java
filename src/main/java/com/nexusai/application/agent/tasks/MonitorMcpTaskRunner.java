@@ -281,7 +281,8 @@ public class MonitorMcpTaskRunner {
                 default -> null;
             };
             if (sdkStatus != null) {
-                sdkEventQueue.emitTaskTerminatedSdk(task.id(), sdkStatus,
+                // C2 · 会话归属：task 自带的创建会话（registerTask(sessionId) 显式装入）
+                sdkEventQueue.emitTaskTerminatedSdk(task.sessionId(), task.id(), sdkStatus,
                     new SdkEventQueue.TaskTerminatedOpts(task.toolUseId(), summary, task.outputFile(), null));
             }
         }

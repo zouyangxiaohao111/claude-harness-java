@@ -31,7 +31,7 @@ class AgentProgressTrackerTest {
         AgentProgressTracker tracker = new AgentProgressTracker("task-1", "tu-1", 1000L);
         tracker.setProgress(3L, 150L);
 
-        tracker.applySummary("Reading runAgent.ts", true, queue);
+        tracker.applySummary("Reading runAgent.ts", true, queue, "session-1");
 
         assertThat(tracker.summary()).isEqualTo("Reading runAgent.ts");
         List<SdkEventQueue.DrainedSdkEvent> drained = queue.drainSdkEvents("session-1");
@@ -54,7 +54,7 @@ class AgentProgressTrackerTest {
         SdkEventQueue queue = new SdkEventQueue();
         AgentProgressTracker tracker = new AgentProgressTracker("task-2", null, 2000L);
 
-        tracker.applySummary("Fixing null check", false, queue);
+        tracker.applySummary("Fixing null check", false, queue, "session-1");
 
         assertThat(tracker.summary()).isEqualTo("Fixing null check");
         assertThat(queue.drainSdkEvents("session-1")).isEmpty();
@@ -65,7 +65,7 @@ class AgentProgressTrackerTest {
     void applySummary_withNullQueue_doesNotEmit() {
         AgentProgressTracker tracker = new AgentProgressTracker("task-3", null, 3000L);
 
-        tracker.applySummary("Running auth module tests", true, null);
+        tracker.applySummary("Running auth module tests", true, null, "session-1");
 
         assertThat(tracker.summary()).isEqualTo("Running auth module tests");
     }
@@ -98,7 +98,7 @@ class AgentProgressTrackerTest {
         assertThat(tracker.toolUseCount()).isEqualTo(3L);
         assertThat(tracker.tokenCount()).isEqualTo(270L);
 
-        tracker.applySummary("Reading runAgent.ts", true, queue);
+        tracker.applySummary("Reading runAgent.ts", true, queue, "session-1");
         SdkEventQueue.TaskProgressEvent progress =
             (SdkEventQueue.TaskProgressEvent) queue.drainSdkEvents("session-1").get(0).event();
         assertThat(progress.usage().totalTokens()).isEqualTo(270);

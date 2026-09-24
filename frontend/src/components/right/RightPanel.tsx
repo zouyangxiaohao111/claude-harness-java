@@ -457,15 +457,34 @@ export function RightPanel({
       const res = await tasksApi.killTask(id.taskId)
       if (!res?.success) { showToast('停止失败', 'info'); return }
       // [stop-终态乐观] 立刻置 stopped：即使 killed 终态事件丢失，卡片也不再停"运行中"（事件到达时幂等覆盖）
-      useSubagentStore.getState().addActivity(id.taskId, { type: 'stopped', text: '已停止', ts: Date.now() })
+      //   ⚠️ 显式传第三个实参 activeSessionId（`?? ''` 与本面板读取子代理桶的键 bySession[activeSessionId ?? ''] 同源）：
+      //   addActivity 的 `sessionId ?? get().sessionId ?? ''` 是给存量调用方的全局单槽回落，本批纪律要求
+      //   新调用点一律显式传 sid —— 否则并发会话下单槽可能指向"上一个请求残留的别会话"（比 null 更坏的第三态），
+      //   乐观终态会写进别会话桶：卡片所在桶仍停"运行中"，而别会话被误标。
+      useSubagentStore.getState().addActivity(id.taskId, { type: 'stopped', text: '已停止', ts: Date.now() }, activeSessionId ?? '')
       showToast(`已停止 @${id.name}`, 'success')
     } catch (e) {
       // [stop-404 幂等] 任务已不存在（已结束/已移除）→ 本地清身份，避免卡片永久"运行中"
-      if (e instanceof ApiError && e.status === 404) {
-        useSubagentStore.getState().forget(id.taskId)
+      if (e instanceof ApiError && (e.status === 404 || e.status === 409)) {
+        // [刀 2b-i] 显式传 sessionId（不再落到 forget 的全局单槽 `sessionId ?? get().sessionId`）：
+        //   单槽在并发会话下会把清理打到"上一个请求残留的别会话"桶。`?? ''` 与本面板读取子代理桶的
+        //   键（bySession[activeSessionId ?? '']）同源，保证清的就是卡片所在的那个桶。
+        // [刀 2b-ii · 409 收敛] 409 = 后端 stopTask 说该任务已非运行态（NOT_RUNNING，
+        //   TaskController.java:229-231），本地卡片不该再停在"运行中"。此处选「与 404 同款的本地清理」，
+        //   理由：①与 404 出口（任务已不存在 ⇒ 清本地身份）语义同构，都是"后端已无该运行任务 ⇒
+        //   本地无 running 可维护"；②不伪造终态类型 —— 后端未告知是 completed 还是 killed，凭空写
+        //   'stopped' 会把"已完成"误标成"已停止"（且 addActivity 的终态幂等守卫会挡住轮询随后的精确回写）；
+        //   ③该任务的服务端终态记录仍在后端任务清单里可查（异步任务面板照常展示），本地清掉的只是陈旧身份。
+        useSubagentStore.getState().forget(id.taskId, activeSessionId ?? '')
         showToast('该任务已结束（已清理状态）', 'info')
         return
       }
+      // [本批修正 · 判据收窄] 收敛判据从 `e instanceof ApiError` 收窄为**仅 404/409**（见上分支）。
+      //   WHY：api/rest.ts 把**网络层错误**也包成 ApiError(status = 0)（:97-103 的 fetch catch），
+      //   把一切 `!res.ok` 包成 ApiError（:105-107，含 400/401/403/500…）。这些情况下后端**可能仍在
+      //   正常跑该任务**（网络抖动、鉴权/服务端临时故障），清本地身份 + 弹「该任务已结束（已清理状态）」
+      //   是**误导**：卡片闪一下消失、活动时间线被重置，而任务其实还在跑（2s 后轮询又把它登记回来）。
+      //   ⛔ 非 404/409 的 ApiError 不静默吞 —— 落到下方原样 toast（保留既有行为）。
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }

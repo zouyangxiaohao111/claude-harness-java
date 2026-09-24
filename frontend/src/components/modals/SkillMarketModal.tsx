@@ -2,15 +2,22 @@ import { useEffect, useMemo, useState } from 'react'
 import { ApiError } from '@/api/rest'
 import { agentApi } from '@/api/agent'
 import { marketApi } from '@/api/market'
-import type { AgentListItem, MarketConnector, MarketExpert, MarketSkill } from '@/api/types'
+import type {
+  AgentListItem,
+  ExternalMarketPlugin,
+  MarketConnector,
+  MarketExpert,
+  MarketSkill,
+} from '@/api/types'
 
 /**
  * 技能市场弹窗（骨架版 · v3 mockup 结构确认）。
  * 三种 Tab：专家（本地 + 远端混排大卡）/ 技能（分类胶囊 + 精选横条 + 推荐 3 列小卡）/ 连接器（3 列小卡）。
- * - 专家「使用」：本地 agentType → App 走现有 PATCH mainThreadAgent；远端 marketId → marketApi.useExpert
- *   （后端构造成本地 agent + 设会话 mainThreadAgent）→ App 刷新 currentAgent + toast。
+ * 三种来源（左上角下拉切换）：腾讯 workbuddy（/api/market/* 远端）/ 建科数字插件市场（自建 MinIO，
+ *   /api/market/external 解析 marketplace.json，按 category 分流）/ 本地（仅 /agents/list）。
+ * - 专家「使用」：本地 agentType → App 走现有 PATCH mainThreadAgent；腾讯远端 marketId →
+ *   marketApi.useExpert；建科市场专家需安装插件（当前仅展示，按钮提示开发中）。
  * - 技能/连接器「+」：骨架仅 UI 高亮（不做真实安装）。
- * 数据源：远端走 /api/market/*（固定腾讯 workbuddy 市场源 · 多源结构预留）；本地专家走 /agents/list。
  */
 
 /** Tab 类型 */
@@ -24,8 +31,20 @@ const SEARCH_PLACEHOLDERS: Record<MarketTab, string> = {
   connector: '搜索连接器名 / 说明',
 }
 
-/** 远端来源下拉（多源预留：现仅腾讯 workbuddy 一项，点选为占位） */
-const MARKET_SOURCES = [{ id: 'tencent-workbuddy', label: '腾讯 workbuddy' }]
+/** 市场来源 id · 决定市场弹窗的数据源（腾讯 workbuddy / 自建 MinIO / 本地） */
+export type MarketSourceId = 'tencent-workbuddy' | 'jianke-market' | 'local'
+
+/** 建科数字插件市场（自建 MinIO）· 内置固定地址（用户拍板 2026-09-17）。
+ *  指向 marketplace.json 索引（几 KB）——看列表只拉索引；装插件时后端按 source 只下载
+ *  对应插件包 plugin.zip（按需，上千插件不整包下载）。公网入口 netHost 任意网络可达。 */
+const JIANKE_MARKET_URL = 'http://101.68.93.109:9102/nexusai/marketplace/marketplace.json'
+
+/** 市场来源下拉（多源：建科数字插件市场 / 腾讯 workbuddy / 本地 · 建科默认排首） */
+const MARKET_SOURCES: { id: MarketSourceId; label: string }[] = [
+  { id: 'jianke-market', label: '建科数字插件市场' },
+  { id: 'tencent-workbuddy', label: '腾讯 workbuddy' },
+  { id: 'local', label: '本地' },
+]
 
 /** 头像兜底色板（图标 URL 缺失时用名字首字 + 色块） */
 const AVATAR_COLORS = ['#CC785C', '#5B8DC9', '#5DB872', '#7B61FF', '#C99417', '#4A6CF7', '#C77B5C', '#D9534F']
@@ -40,6 +59,8 @@ interface ExpertCard {
   key: string
   kind: 'local' | 'remote'
   name: string
+  /** 安装/使用标识（本地=agentType · 建科远端=marketId 插件名） */
+  marketId: string
   subtitle: string
   desc: string
   tags: string[]
@@ -69,10 +90,17 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   showToast: (msg: string, type?: 'success' | 'info') => void
 }) {
   const [tab, setTab] = useState<MarketTab>('expert')
+  const [source, setSource] = useState<MarketSourceId>('jianke-market')
   const [q, setQ] = useState('')
   const [srcOpen, setSrcOpen] = useState(false)
 
-  // ---- 数据（单次加载 · Promise.allSettled 容错：单个源失败不影响其余渲染）----
+  // ---- 建科市场安装态（前端记忆已装插件名，安装成功后标记「已安装」）----
+  const [installed, setInstalled] = useState<Set<string>>(new Set())
+  const [marketName, setMarketName] = useState('zjky-market')
+  // 远程下载的插件专家（source='plugin'）· 供建科市场「使用」按钮定位 agentType（不混入本地来源）
+  const [pluginAgents, setPluginAgents] = useState<AgentListItem[]>([])
+
+  // ---- 数据（按来源加载 · Promise.allSettled 容错：单个源失败不影响其余渲染）----
   const [localAgents, setLocalAgents] = useState<AgentListItem[]>([])
   const [experts, setExperts] = useState<MarketExpert[]>([])
   const [skills, setSkills] = useState<MarketSkill[]>([])
@@ -80,10 +108,76 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
 
+  // 建科市场插件（ExternalMarketPlugin）→ 现有 Market* 类型（按 category 分流到三 Tab）
+  const toMarketExpert = (p: ExternalMarketPlugin): MarketExpert => ({
+    marketId: p.name, agentName: p.name, displayName: p.displayName, description: p.description,
+    tags: p.tags ?? [], categories: p.category ? [p.category] : [], remote: true,
+  })
+  const toMarketSkill = (p: ExternalMarketPlugin): MarketSkill => ({
+    marketId: p.name, name: p.name, displayName: p.displayName, description: p.description,
+    categories: p.category ? [p.category] : [], remote: true,
+  })
+  const toMarketConnector = (p: ExternalMarketPlugin): MarketConnector => ({
+    marketId: p.name, name: p.displayName || p.name, authType: p.tags?.[0], remote: true,
+  })
+
   useEffect(() => {
     let cancelled = false
     setLoading(true)
     setLoadError(null)
+    const formatFail = (e: unknown) => (e instanceof ApiError ? e.userMessage() : String(e))
+    const done = () => { if (!cancelled) setLoading(false) }
+
+    // 已安装标记初始化（权威数据源 · 后端 installed_plugins.json · 各来源共用）
+    void marketApi.listInstalled().then((names) => {
+      if (cancelled) return
+      if (names && names.length > 0) setInstalled(new Set(names))
+    }).catch(() => { /* 查询失败静默：标记为空，安装仍可用 */ })
+
+    if (source === 'local') {
+      // 本地来源：仅本地 agents（专家 Tab；技能/连接器无数据）。pluginAgents 一并记录（供「使用」定位）
+      void agentApi.listAgents(sessionId)
+        .then((ag) => {
+          if (cancelled) return
+          setLocalAgents(ag)
+          setPluginAgents(ag.filter((a) => a.source === 'plugin'))
+          setExperts([]); setSkills([]); setConnectors([])
+        })
+        .catch((e) => {
+          if (cancelled) return
+          setLoadError(`本地专家加载失败：${formatFail(e)}`)
+          setLocalAgents([]); setExperts([]); setSkills([]); setConnectors([])
+        })
+        .finally(done)
+      return () => { cancelled = true }
+    }
+
+    if (source === 'jianke-market') {
+      // 建科数字插件市场：/api/market/external 下载解析 marketplace.json → 按 category 分流；
+      // 并行取本地 agents（仅记录 source='plugin' 的插件专家，供「使用」定位 agentType）
+      void Promise.allSettled([
+        agentApi.listAgents(sessionId),
+        marketApi.listExternal(JIANKE_MARKET_URL),
+      ]).then(([agR, mR]) => {
+        if (cancelled) return
+        setLocalAgents([])
+        setPluginAgents(agR.status === 'fulfilled' ? agR.value.filter((a) => a.source === 'plugin') : [])
+        if (mR.status === 'fulfilled') {
+          const m = mR.value
+          if (m?.name) setMarketName(m.name)
+          const pl = m?.plugins ?? []
+          setExperts(pl.filter((p) => p.category === 'expert').map(toMarketExpert))
+          setSkills(pl.filter((p) => p.category === 'skill').map(toMarketSkill))
+          setConnectors(pl.filter((p) => p.category === 'connector').map(toMarketConnector))
+        } else {
+          setLoadError(`建科市场拉取失败：${formatFail((mR as PromiseRejectedResult).reason)}`)
+          setExperts([]); setSkills([]); setConnectors([])
+        }
+      }).finally(done)
+      return () => { cancelled = true }
+    }
+
+    // 腾讯 workbuddy：本地 agents + 远端 expert/skill/connector（现有 4 路）
     void Promise.allSettled([
       agentApi.listAgents(sessionId),
       marketApi.listExperts(sessionId),
@@ -91,18 +185,20 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       marketApi.listConnectors(sessionId),
     ]).then(([localR, exR, skR, coR]) => {
       if (cancelled) return
-      setLocalAgents(localR.status === 'fulfilled' ? localR.value : [])
+      const locals = localR.status === 'fulfilled' ? localR.value : []
+      setLocalAgents(locals)
+      setPluginAgents(locals.filter((a) => a.source === 'plugin'))
       setExperts(exR.status === 'fulfilled' ? exR.value : [])
       setSkills(skR.status === 'fulfilled' ? skR.value : [])
       setConnectors(coR.status === 'fulfilled' ? coR.value : [])
       const failed = [localR, exR, skR, coR].filter((r): r is PromiseRejectedResult => r.status === 'rejected')
       setLoadError(failed.length
-        ? `部分数据加载失败（已尽力展示可用项）：${failed.map((r) => r.reason instanceof ApiError ? r.reason.userMessage() : String(r.reason)).join('；')}`
+        ? `部分数据加载失败（已尽力展示可用项）：${failed.map((r) => formatFail(r.reason)).join('；')}`
         : null)
-      setLoading(false)
+      done()
     })
     return () => { cancelled = true }
-  }, [sessionId])
+  }, [sessionId, source])
 
   // ---- 已安装计数（顶栏 · =preinstalled 或 isConnected 或本地已装专家数）----
   const installedCount = tab === 'expert'
@@ -132,9 +228,11 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const expertCards = useMemo<ExpertCard[]>(() => {
     const cards: ExpertCard[] = []
     for (const a of localAgents) {
+      // 本地来源只显示用户自己放的（非插件）agents；远程下载的插件专家归「远程」来源展示
+      if (source === 'local' && a.source === 'plugin') continue
       const nm = a.agentType
       cards.push({
-        key: `local:${nm}`, kind: 'local', name: nm,
+        key: `local:${nm}`, kind: 'local', name: nm, marketId: nm,
         subtitle: a.source || '本地专家',
         desc: a.whenToUse ?? '',
         tags: [],
@@ -148,7 +246,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     for (const e of experts) {
       const nm = e.displayName || e.agentName || e.marketId
       cards.push({
-        key: `remote:${e.marketId}`, kind: 'remote', name: nm,
+        key: `remote:${e.marketId}`, kind: 'remote', name: nm, marketId: e.marketId,
         subtitle: [e.profession, e.useCountDisplay ?? (e.useCount != null ? `${e.useCount} 次使用` : '')]
           .filter(Boolean).join(' · '),
         desc: e.description ?? '',
@@ -161,15 +259,52 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       })
     }
     return cards.filter((c) => matchAny(c.name, c.subtitle, c.desc))
-  }, [localAgents, experts, currentAgent, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [localAgents, experts, currentAgent, keyword, source]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ---- 使用专家（本地走 PATCH · 远端走 marketApi.useExpert）----
+  // ---- 安装建科市场插件（POST /api/plugins/install · 后端自动 reconcile 市场 + 安装链）----
+  const installMarketPlugin = async (pluginName: string) => {
+    if (busy) {
+      showToast('对话进行中，请稍后再安装', 'info')
+      return
+    }
+    try {
+      const r = await marketApi.installPlugin({
+        pluginId: `${pluginName}@${marketName}`,
+        marketplaceUrl: JIANKE_MARKET_URL,
+        scope: 'user',
+      })
+      if (r.success) {
+        setInstalled((prev) => new Set(prev).add(pluginName))
+        showToast(`已安装 ${r.pluginName || pluginName}`, 'success')
+      } else {
+        showToast(r.message || '安装失败', 'info')
+      }
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }
+
+  // ---- 使用已安装的插件专家（agentType = <插件名>:<agent名> · 从 pluginAgents 匹配）----
+  const useInstalledPlugin = (pluginName: string) => {
+    const agent = pluginAgents.find((a) => a.agentType.startsWith(`${pluginName}:`))
+    if (!agent) {
+      showToast('该插件的专家尚未加载，请稍后重试', 'info')
+      return
+    }
+    onUseLocalAgent?.(agent.agentType)
+  }
+
+  // ---- 使用专家（本地走 PATCH · 腾讯远端走 marketApi.useExpert · 建科市场走 installMarketPlugin）----
   const handleUse = (card: ExpertCard) => {
     if (busy) {
       showToast('对话进行中，请等当前轮完成后切换专家', 'info')
       return
     }
     if (card.inUse) return
+    if (source === 'jianke-market') {
+      void installMarketPlugin(card.marketId)
+      return
+    }
     if (card.kind === 'local') {
       const a = localAgents.find((x) => x.agentType === card.name)
       if (a) onUseLocalAgent?.(a.agentType)
@@ -223,16 +358,16 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
               <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
             </svg>
           </button>
-          {/* 市场源下拉（固定腾讯 · 多源预留结构） */}
+          {/* 市场源下拉（腾讯 workbuddy / 建科数字插件市场 / 本地） */}
           <div className="sm-source">
-            <button className="sm-source-btn" onClick={() => setSrcOpen((v) => !v)} title="市场源（多源预留）">
-              <span className="sm-source-label">{MARKET_SOURCES[0].label}</span>
+            <button className="sm-source-btn" onClick={() => setSrcOpen((v) => !v)} title="切换市场来源">
+              <span className="sm-source-label">{MARKET_SOURCES.find((s) => s.id === source)?.label ?? '来源'}</span>
               <span className="sm-source-caret">▾</span>
             </button>
             {srcOpen && (
               <div className="sm-source-menu">
                 {MARKET_SOURCES.map((s) => (
-                  <div key={s.id} className={`sm-source-item${s.id === MARKET_SOURCES[0].id ? ' active' : ''}`} onClick={() => setSrcOpen(false)}>
+                  <div key={s.id} className={`sm-source-item${source === s.id ? ' active' : ''}`} onClick={() => { setSource(s.id); setSrcOpen(false) }}>
                     {s.label}
                   </div>
                 ))}
@@ -303,14 +438,25 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                             </div>
                             <div className="sm-card-sub">{c.subtitle}</div>
                           </div>
-                          <button
-                            className={`sm-use-btn${c.inUse ? ' used' : ''}${busy && !c.inUse ? ' disabled' : ''}`}
-                            disabled={c.inUse}
-                            onClick={() => handleUse(c)}
-                            title={busy && !c.inUse ? '对话进行中不可切换（仅新会话可切换）' : (c.inUse ? '当前会话正在使用' : `使用 ${c.name} 驱动会话`)}
-                          >
-                            {c.inUse ? '使用中' : '使用'}
-                          </button>
+                          {source === 'jianke-market' ? (
+                            installed.has(c.marketId) ? (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                <span className="sm-installed-mark">已安装</span>
+                                <button className="sm-use-btn" onClick={() => useInstalledPlugin(c.marketId)} title={`使用 ${c.name} 驱动会话`}>使用</button>
+                              </div>
+                            ) : (
+                              <button className="sm-use-btn" onClick={() => void installMarketPlugin(c.marketId)} title={`安装 ${c.name}`}>安装</button>
+                            )
+                          ) : (
+                            <button
+                              className={`sm-use-btn${c.inUse ? ' used' : ''}${busy && !c.inUse ? ' disabled' : ''}`}
+                              disabled={c.inUse}
+                              onClick={() => handleUse(c)}
+                              title={busy && !c.inUse ? '对话进行中不可切换（仅新会话可切换）' : (c.inUse ? '当前会话正在使用' : `使用 ${c.name} 驱动会话`)}
+                            >
+                              {c.inUse ? '使用中' : '使用'}
+                            </button>
+                          )}
                         </div>
                         {c.desc && <div className="sm-desc">{c.desc}</div>}
                         {c.tags.length > 0 && (
@@ -350,6 +496,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                           skill={s}
                           marked={isMarked('skill', s.marketId)}
                           onMark={() => toggleMark('skill', s.marketId)}
+                          onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
                         />
                       ))}
                     </div>
@@ -369,6 +516,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                           skill={s}
                           marked={isMarked('skill', s.marketId)}
                           onMark={() => toggleMark('skill', s.marketId)}
+                          onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
                         />
                       ))}
                     </div>
@@ -390,13 +538,26 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                             <span className="sm-mini-name" title={c.name ?? c.marketId}>{c.name ?? c.marketId}</span>
                             {c.isConnected
                               ? <span className="sm-installed-mark">已连接</span>
-                              : <button
-                                  className={`sm-plus-btn${isMarked('connector', c.marketId) ? ' marked' : ''}`}
-                                  onClick={() => toggleMark('connector', c.marketId)}
-                                  title="连接（骨架：UI 占位）"
-                                >
-                                  {isMarked('connector', c.marketId) ? '✓' : '+'}
-                                </button>}
+                              : source === 'jianke-market'
+                                ? (
+                                    <button
+                                      className={`sm-plus-btn${installed.has(c.marketId) ? ' marked' : ''}`}
+                                      disabled={installed.has(c.marketId)}
+                                      onClick={() => void installMarketPlugin(c.marketId)}
+                                      title={installed.has(c.marketId) ? '已安装' : '安装'}
+                                    >
+                                      {installed.has(c.marketId) ? '✓' : '+'}
+                                    </button>
+                                  )
+                                : (
+                                    <button
+                                      className={`sm-plus-btn${isMarked('connector', c.marketId) ? ' marked' : ''}`}
+                                      onClick={() => toggleMark('connector', c.marketId)}
+                                      title="连接（骨架：UI 占位）"
+                                    >
+                                      {isMarked('connector', c.marketId) ? '✓' : '+'}
+                                    </button>
+                                  )}
                           </div>
                           {desc && <div className="sm-desc one">{desc}</div>}
                         </div>
@@ -413,11 +574,13 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   )
 }
 
-/** 技能小卡（精选横条 + 推荐网格共用）· 3 列小卡：图标 + 名 + 描述 2 行截断 + 右上「+」（UI 高亮） */
-function SkillMiniCard({ skill, marked, onMark }: {
+/** 技能小卡（精选横条 + 推荐网格共用）· 3 列小卡：图标 + 名 + 描述 2 行截断 + 右上「+」。
+ *  onInstall 存在（建科市场来源）→ 「+」调安装；否则维持骨架 UI 高亮（onMark）。 */
+function SkillMiniCard({ skill, marked, onMark, onInstall }: {
   skill: MarketSkill
   marked: boolean
   onMark: () => void
+  onInstall?: (marketId: string) => void
 }) {
   const nm = skill.displayName || skill.name || skill.marketId
   return (
@@ -429,7 +592,13 @@ function SkillMiniCard({ skill, marked, onMark }: {
         <span className="sm-mini-name" title={nm}>{nm}</span>
         {skill.preinstalled
           ? <span className="sm-installed-mark">已安装</span>
-          : <button className={`sm-plus-btn${marked ? ' marked' : ''}`} onClick={onMark} title="安装（骨架：UI 占位）">{marked ? '✓' : '+'}</button>}
+          : onInstall
+            ? (
+                <button className="sm-plus-btn" onClick={() => onInstall(skill.marketId)} title="安装">
+                  +
+                </button>
+              )
+            : <button className={`sm-plus-btn${marked ? ' marked' : ''}`} onClick={onMark} title="安装（骨架：UI 占位）">{marked ? '✓' : '+'}</button>}
       </div>
       {skill.description && <div className="sm-desc two">{skill.description}</div>}
     </div>

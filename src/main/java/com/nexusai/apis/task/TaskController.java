@@ -295,13 +295,20 @@ public class TaskController {
      * 全部。仅 status==RUNNING 才逐个 {@code stopTask}；失败 log.warn 不中断。用户拍板：全部停止
      * 当前会话级，由前端传入 activeSessionId 界定。
      *
+     * <p><b>success 口径（本批修正：原实现恒 {@code success:true} 是假成功）</b>：
+     * {@code success = (failed == 0)} —— 后端如实回报，前端据此选文案（不再把「有任务没停掉」
+     * 也报成功）。<b>NOT_RUNNING 不算失败</b>：任务本就已停（终态 / 被并发停掉），这是
+     * <b>幂等语义</b>下的正常末态，不是错误；只有真正的错误（NOT_FOUND / UNSUPPORTED_TYPE）
+     * 才计入 {@code failed}。
+     *
      * @param sessionId 会话 id（可选）
-     * @return {@code {success: true, stopped: N}}
+     * @return {@code {success: boolean, stopped: N, failed: N}}（failed = 真正停失败的任务数）
      */
     @PostMapping("/stop-all")
     public Map<String, Object> stopAll(@RequestParam(required = false) String sessionId) {
         List<BackgroundTask> all = backgroundTaskRunner.listAllTasks();
         int stopped = 0;
+        int failed = 0;
         for (BackgroundTask task : all) {
             if (sessionId != null && !sessionId.isBlank()) {
                 if (task.sessionId() == null || !sessionId.equals(task.sessionId())) {
@@ -314,13 +321,20 @@ public class TaskController {
             StopTaskResult r = backgroundTaskRunner.stopTask(task.id());
             if (r.ok()) {
                 stopped++;
+            } else if (r.errorCode() == BackgroundTaskRunner.StopTaskErrorCode.NOT_RUNNING) {
+                // ⭐ 口径：NOT_RUNNING 不算失败 —— stopTask 报「非运行态」= 该任务本就已停
+                //   （终态，或被并发停掉）。stop-all 是幂等批量动作，把已停任务重复列入
+                //   不应被读成「停止失败」（否则用户会看到假的「部分任务未能停止」）。
+                log.info("[TaskController] stop-all: task {} 已非运行态（幂等：本就已停，不计入失败）", task.id());
             } else {
+                failed++;
                 log.warn("[TaskController] stop-all: task {} 停止失败 errorCode={}", task.id(), r.errorCode());
             }
         }
-        log.info("[TaskController] POST /api/v1/tasks/stop-all sessionId={} → 已停 {} 个（扫描 {} 个）",
-            sessionId, stopped, all.size());
-        return Map.of("success", true, "stopped", stopped);
+        boolean success = (failed == 0);
+        log.info("[TaskController] POST /api/v1/tasks/stop-all sessionId={} → 已停 {} 个, 失败 {} 个（扫描 {} 个）, success={}",
+            sessionId, stopped, failed, all.size(), success);
+        return Map.of("success", success, "stopped", stopped, "failed", failed);
     }
 
     /**

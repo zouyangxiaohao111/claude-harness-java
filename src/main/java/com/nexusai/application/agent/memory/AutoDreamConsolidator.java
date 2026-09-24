@@ -795,8 +795,10 @@ public class AutoDreamConsolidator {
         //   null-safe：未装配 registry（测试直构）时 taskId=null → 不注册，其余行为不变。
         String dreamTaskId = null;
         if (dreamTaskRegistry != null) {
+            // C2 · 会话归属显式化：本方法的 sessionId 形参即 dream fork 的归属会话
+            //   （buildForkParams 的「真实会话 id（排除自身那个）」同源），显式下传。
             dreamTaskId = dreamTaskRegistry.registerDreamTask(
-                sessionIds.size(), priorMtime, abortController);
+                sessionId, sessionIds.size(), priorMtime, abortController);
             // [TL-W2 P9] memoryDir 随任务显式携带 —— kill 回退 seam 在 REST/TaskStop 线程执行时
             //   按 taskId 取回本会话目录（不再现算 ThreadLocal）。本行在会话线程（或已回放的
             //   hook 线程）执行，memoryDir 为 consolidateIfNeeded 显式透传值。

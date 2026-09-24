@@ -891,7 +891,12 @@ public class AutonomousAgentLoop {
             current.id(), current.type(), status, terminalDescription,
             current.toolUseId(), current.startTime(), now, current.totalPausedMs(),
             current.outputFile(), current.outputOffset(), true,
-            current.agentId(), current.isBackgrounded());
+            current.agentId(), current.isBackgrounded())
+            // C2 · 次生缺口修复：上面是 13 参兼容构造 ⇒ sessionId 默认 null，会把注册侧
+            //   （InProcessTeammateTaskRegistry.toBackgroundTask 的 withSessionId(parentSessionId)）
+            //   补的会话在**终态**擦掉 ⇒ terminal 的 task_notification（emitTaskTerminatedSdk）
+            //   与 REST 会话级过滤同时丢归属。此处显式保留原值。
+            .withSessionId(current.sessionId());
         taskFrameworkService.updateTaskState(taskId, terminal);
         terminalTasks.add(taskId);
         log.info("[AutonomousAgentLoop] {}: task {} → {} (endTime={}, notified=true)",
@@ -899,7 +904,8 @@ public class AutonomousAgentLoop {
 
         if (sdkEventQueue != null) {
             String summary = agentName != null ? agentName : current.description();
-            sdkEventQueue.emitTaskTerminatedSdk(taskId, sdkStatus,
+            // C2 · 会话归属：terminal 已显式保留 current.sessionId()（见上方 withSessionId）
+            sdkEventQueue.emitTaskTerminatedSdk(current.sessionId(), taskId, sdkStatus,
                 new SdkEventQueue.TaskTerminatedOpts(current.toolUseId(), summary,
                     current.outputFile(), null));
         }

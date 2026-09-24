@@ -579,4 +579,45 @@ class MarketplaceReconcilerTest {
         assertThat(result.failed()).extracting(f -> f.name()).containsExactly("claude-plugins-official");
         assertThat(manager().loadKnownMarketplacesConfig()).doesNotContainKey("claude-plugins-official");
     }
+
+    @Test
+    @DisplayName("reconcile：url 源下载物化 → 安装成功并落盘 known_marketplaces.json")
+    void reconcile_urlSource_downloadsAndMaterializes() throws IOException {
+        // 预置"下载结果"：一个含 .claude-plugin/marketplace.json 的目录（模拟 MinIO 市场 zip 解压后的内容）
+        Path downloaded = tempDir.resolve("dl-url-mkt");
+        Files.createDirectories(downloaded.resolve(".claude-plugin"));
+        Files.writeString(downloaded.resolve(".claude-plugin/marketplace.json"),
+            "{\"name\":\"url-market\",\"owner\":\"test\",\"plugins\":[]}", StandardCharsets.UTF_8);
+
+        // mock 下载器：把预置内容复制到目标目录（不触真实 HTTP）
+        MarketplaceHttpDownloader fakeDl = new MarketplaceHttpDownloader() {
+            @Override
+            public String downloadMarketplace(String url, Map<String, String> headers, String targetDir)
+                    throws IOException {
+                Path t = Paths.get(targetDir);
+                Files.createDirectories(t.resolve(".claude-plugin"));
+                Files.copy(downloaded.resolve(".claude-plugin/marketplace.json"),
+                    t.resolve(".claude-plugin/marketplace.json"),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                return t.resolve(".claude-plugin/marketplace.json").toString();
+            }
+        };
+
+        FakeConfigStorage cfg = new FakeConfigStorage();
+        declare(cfg, "url-market", new MarketplaceSource.Url("https://example.com/marketplace.zip", null));
+        MarketplaceReconciler reconciler = new MarketplaceReconciler(store(cfg), null, fakeDl,
+            () -> tempDir.toString(), null);
+
+        ReconcileResult result = reconciler.reconcile(null);
+
+        // WHY：url 源（MinIO/静态 HTTP）是自建远程市场的主接入方式 —— 下载 zip/文件 → 解析
+        //       marketplace.json 取 name → 物化到 cacheDir/{name} → 写 known_marketplaces.json。
+        //       旧实现 Url 分支直接抛错，市场永远添加不上。
+        assertThat(result.installed()).containsExactly("url-market");
+        assertThat(manager().loadKnownMarketplacesConfig()).containsKey("url-market");
+        KnownMarketplace entry = manager().loadKnownMarketplacesConfig().get("url-market");
+        assertThat(entry.source()).isEqualTo(new MarketplaceSource.Url("https://example.com/marketplace.zip", null));
+        assertThat(Files.isRegularFile(Paths.get(entry.installLocation())
+            .resolve(".claude-plugin/marketplace.json"))).isTrue();
+    }
 }

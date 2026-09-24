@@ -64,6 +64,9 @@ public class MarketplaceManager {
     /** git 同步服务（L2）· CC cacheMarketplaceFromGit/gitPull/gitClone；测试可注入 mock。 */
     private MarketplaceSyncService syncService;
 
+    /** HTTP 下载器（{@code {source:'url'}} 源物化）· MinIO/静态 HTTP 托管；测试可注入 mock。 */
+    private MarketplaceHttpDownloader httpDownloader;
+
     /**
      * getMarketplace per-name memoize · CC {@code getMarketplace = memoize(...)}（marketplaceManager.ts:2122）。
      * Java 无 lodash memoize，自实现 Map（会话提示词 §8）；refresh 删 key 失效（CC :2380）；
@@ -103,6 +106,13 @@ public class MarketplaceManager {
             syncService = new MarketplaceSyncService();
         }
         return syncService;
+    }
+
+    private MarketplaceHttpDownloader httpDownloader() {
+        if (httpDownloader == null) {
+            httpDownloader = new MarketplaceHttpDownloader();
+        }
+        return httpDownloader;
     }
 
     // ── 文件路径 ─────────────────────────────────────────────────────────
@@ -671,11 +681,14 @@ public class MarketplaceManager {
                     log.debug("Validating local marketplace '{}'", name);
                 }
                 requireCachedMarketplaceReadable(name, installLocation, source);
+            } else if (source instanceof MarketplaceSource.Url u) {
+                // URL 源：重新下载（zip 或 marketplace.json）覆盖缓存目录（内部保证嵌套布局）
+                httpDownloader().downloadMarketplace(u.url(), u.headers(), installLocation);
+                requireCachedMarketplaceReadable(name, installLocation, source);
             } else {
-                // url/npm：重新下载属 L4 安装层（cacheMarketplaceFromUrl），MPL2 仅 git 源
+                // npm/settings/hostPattern 等：重新下载属 L4 安装层，暂不支持
                 throw new IOException("Unsupported marketplace source type for refresh: "
-                    + source.getClass().getSimpleName()
-                    + "（URL 源重新下载待 L4 安装层实现）");
+                    + source.getClass().getSimpleName());
             }
 
             // 写回 lastUpdated + 持久化（CC :2563-2565）
@@ -776,7 +789,14 @@ public class MarketplaceManager {
             sync().cacheMarketplaceFromGit(git.url(), cachePath, git.ref(), git.sparsePaths(), false);
             return cachePath;
         }
-        log.warn("refreshAllMarketplaces 跳过非 git 源 {}（url/npm/local 属 L4 安装层范围）",
+        if (source instanceof MarketplaceSource.Url u) {
+            String tempName = "temp_" + System.currentTimeMillis();
+            String cachePath = Paths.get(cacheDir, tempName).toString();
+            // HTTP 下载（zip 或 marketplace.json）→ 物化临时目录（内部保证嵌套布局）
+            httpDownloader().downloadMarketplace(u.url(), u.headers(), cachePath);
+            return cachePath;
+        }
+        log.warn("refreshAllMarketplaces 跳过非 git/url 源 {}（npm/local 属 L4 安装层范围）",
             source.getClass().getSimpleName());
         return null;
     }

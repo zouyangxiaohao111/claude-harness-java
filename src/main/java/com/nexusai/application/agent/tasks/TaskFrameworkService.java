@@ -99,7 +99,9 @@ public class TaskFrameworkService {
             return;
         }
         if (sdkEventQueue != null) {
-            sdkEventQueue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent(
+            // C2 · 会话归属 = 任务自身携带的创建会话（BackgroundTask.sessionId，批 3b-D7 起的归属单一事实源）。
+            //   为空的路径由队列侧 fail-loud 丢弃 + WARN（⛔ 不伪造会话）。
+            sdkEventQueue.enqueueSdkEvent(task.sessionId(), new SdkEventQueue.TaskStartedEvent(
                 task.id(), task.toolUseId(), task.description(),
                 task.type().getTypeString(), null, null));
         }
@@ -135,7 +137,9 @@ public class TaskFrameworkService {
             return;
         }
         if (sdkEventQueue != null) {
-            sdkEventQueue.enqueueSdkEvent(new SdkEventQueue.TaskStartedEvent(
+            // C2 · 会话归属取投影 BackgroundTask.sessionId（registerMainSessionTask 的 sessionId 实参，
+            //   见 MainSessionBackgroundService：projection 显式 withSessionId(sessionId)）。
+            sdkEventQueue.enqueueSdkEvent(projection.sessionId(), new SdkEventQueue.TaskStartedEvent(
                 state.id(), state.toolUseId(), state.description(),
                 state.type().getTypeString(), null, state.prompt()));
         }

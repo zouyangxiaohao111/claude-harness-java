@@ -216,7 +216,7 @@ class MonitorMcpTaskRunnerTest {
             assertThat(terminal.notified()).as("终态 notified:true（可 evict，防双发）").isTrue();
 
             // SDK task_notification：status='stopped'（sdkEventQueue.ts:114-134）
-            List<SdkEventQueue.DrainedSdkEvent> drained = sdk.drainSdkEvents(null);
+            List<SdkEventQueue.DrainedSdkEvent> drained = sdk.drainSdkEvents(SESSION);
             assertThat(drained).anySatisfy(e -> {
                 assertThat(e.event()).isInstanceOf(SdkEventQueue.TaskNotificationEvent.class);
                 SdkEventQueue.TaskNotificationEvent ev = (SdkEventQueue.TaskNotificationEvent) e.event();

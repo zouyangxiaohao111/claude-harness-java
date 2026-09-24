@@ -97,6 +97,9 @@ class AutoDreamConsolidatorTest {
     @TempDir
     Path tempDir;
 
+    /** [C2] dream 任务的归属会话 id（不在 writeSessions 造的候选集内 ⇒ 不干扰会话门）。 */
+    private static final String DREAM_SESSION = "sess-dream-current";
+
     Path ws;
     Path mem;
     MemoryStorage storage;
@@ -706,7 +709,7 @@ class AutoDreamConsolidatorTest {
         //   供 live display + Improved 完成消息（filesTouched 非空才发，autoDream.ts:238-248）。
         DreamTaskRegistry registry = new DreamTaskRegistry();
         consolidator.setDreamTaskRegistry(registry);
-        String taskId = registry.registerDreamTask(1, 1L, new com.nexusai.application.agent.tool.AbortController());
+        String taskId = registry.registerDreamTask("sess-dream", 1, 1L, new com.nexusai.application.agent.tool.AbortController());
         List<String> holder = new ArrayList<>();
 
         // 1 条 assistant 消息：文本 + Edit tool_use（file_path）
@@ -1066,10 +1069,13 @@ class AutoDreamConsolidatorTest {
         });
 
         List<SystemMessage> received = new ArrayList<>();
-        consolidator.consolidateIfNeeded(ws, null, received::add);
+        // [C2 · 会话归属] 生产路径（StopHookPipeline:336）恒传真实 sessionId；SDK task_started 需要
+        //   归属会话才能入队（无会话 ⇒ 队列 fail-loud 丢弃）。此处显式传一个**不在候选集内**的会话 id
+        //   ——既满足 C2 归属前置，又不改变会话门（排除自身：不在候选集 ⇒ 不排除，仍 5 个 ≥ minSessions）。
+        consolidator.consolidateIfNeeded(ws, DREAM_SESSION, received::add);
 
         // (1) SDK task_started 已发 → 前端可渲染 dream 任务卡（framework.ts:104-116 + TaskFrameworkService:91）
-        var sdkEvents = sdk.drainSdkEvents("sess");
+        var sdkEvents = sdk.drainSdkEvents(DREAM_SESSION);
         assertThat(sdkEvents).hasSize(1);
         var started = (com.nexusai.application.agent.tasks.SdkEventQueue.TaskStartedEvent) sdkEvents.get(0).event();
         assertThat(started.subtype()).isEqualTo("task_started");

@@ -1,6 +1,6 @@
 import { api } from './rest'
 import { API_BASE } from './base'
-import type { MarketConnector, MarketExpert, MarketSkill, MarketUseExpertResult } from './types'
+import type { ExternalMarket, MarketConnector, MarketExpert, MarketSkill, MarketUseExpertResult, PluginInstallResult } from './types'
 
 /** 技能市场 BASE：契约在 /api/market/* 下（与 agentApi /agents/list 同域，地址单一来源见 ./base） */
 const MARKET_BASE = API_BASE
@@ -28,4 +28,13 @@ export const marketApi = {
   /** 使用远端专家（POST /api/market/expert/{marketId}/use · 后端构造成本地 agent + 设会话 mainThreadAgent） */
   useExpert: (sessionId: string, marketId: string) =>
     api<MarketUseExpertResult>(`/market/expert/${encodeURIComponent(marketId)}/use`, { method: 'POST', body: { sessionId } }, MARKET_BASE),
+  /** 外部插件市场（自建 MinIO / 静态 HTTP）· GET /api/market/external?url= · 后端下载解析 marketplace.json */
+  listExternal: (url: string) =>
+    api<ExternalMarket>(`/market/external${buildQs({ url })}`, {}, MARKET_BASE),
+  /** 安装外部市场插件 · POST /api/plugins/install（后端自动 reconcile 市场 + 安装链） */
+  installPlugin: (body: { pluginId: string; marketplaceUrl: string; scope?: string }) =>
+    api<PluginInstallResult>(`/plugins/install`, { method: 'POST', body }, MARKET_BASE),
+  /** 已安装且启用的插件名列表 · GET /api/plugins/installed（「已安装」标记初始化） */
+  listInstalled: () =>
+    api<string[]>(`/plugins/installed`, {}, MARKET_BASE),
 }

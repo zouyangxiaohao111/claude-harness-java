@@ -795,10 +795,27 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             //   enqueueSdkEvent {subtype:'session_state_changed', state}）。
             //   sdkEventQueue 未注入（测试直构）→ 跳过，不阻断权限流程。
             if (pending.isEmpty() && sdkEventQueue != null) {
-                sdkEventQueue.enqueueSdkEvent(new SdkEventQueue.SessionStateChangedEvent("running"));
-                if (log.isDebugEnabled()) {
-                    log.debug("PERMISSION 无 pending 权限请求 → 会话态 running 通知出站 requestId={}（对齐 CC structuredIO.ts:654）",
-                        requestId);
+                // [C2 · 会话归属规则] 归【发射会话】= 本次弹窗实际投递到的会话（owningSessionId，
+                //   与上面 STOMP 推送端点同源；teammate 请求 → Leader 会话）。
+                //   取不到会话（null / NO_SESSION 哨兵）⇒ 不入队 + log.warn：
+                //   ⛔ 不许塞 SessionKeys.NO_SESSION 冒充会话（那是「确无会话」哨兵，非真会话；
+                //      会被前端 `/topic/sessions/no-session/...` 打成无人订阅的 topic）；
+                //   ⛔ 不许用 null 入队（出站 session_id 恒非空是 C2 契约，前端
+                //      `evt.session_id ?? sessionIdRef.current` 会把它错标到当前打开的会话）。
+                //   丢弃代价 = 零可见损失：该事件前端当前未消费（仅回「会话继续运行」语义）。
+                String emitSessionId = owningSessionId(ctx);
+                if (emitSessionId == null || emitSessionId.isBlank()
+                        || SessionKeys.isNoSession(emitSessionId)) {
+                    log.warn("PERMISSION 无 pending 权限请求，但取不到发射会话（sessionId={}）→ "
+                        + "会话态 running 通知**不入队** requestId={}（C2：空会话键出站会被前端错标到当前会话）",
+                        emitSessionId, requestId);
+                } else {
+                    sdkEventQueue.enqueueSdkEvent(emitSessionId,
+                        new SdkEventQueue.SessionStateChangedEvent("running"));
+                    if (log.isDebugEnabled()) {
+                        log.debug("PERMISSION 无 pending 权限请求 → 会话态 running 通知出站 sessionId={} requestId={}（对齐 CC structuredIO.ts:654）",
+                            emitSessionId, requestId);
+                    }
                 }
             }
         }

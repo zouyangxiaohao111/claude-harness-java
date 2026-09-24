@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.21] - 2026-09-24
+
+### 修复
+- 修复子代理与任务事件归属、收尾相关的多个 bug。
+
 ## [0.1.20] - 2026-09-23
 
 ### 修复

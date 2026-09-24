@@ -370,7 +370,9 @@ public class RemoteAgentTaskService {
         framework.updateTaskState(taskId, s.base());
         // CC :835-838 emitTaskTerminatedSdk(taskId,'stopped',{toolUseId, summary: description})
         if (sdkEventQueue != null) {
-            sdkEventQueue.emitTaskTerminatedSdk(taskId, "stopped",
+            // C2 · 会话归属 = base.sessionId()（= creatingSession 本地创建会话）·
+            //   ⛔ 绝不用 s.sessionId()（那是 CCR remote 会话 id，语义不同，见本类 :218 警示）。
+            sdkEventQueue.emitTaskTerminatedSdk(s.base().sessionId(), taskId, "stopped",
                 new SdkEventQueue.TaskTerminatedOpts(s.toolUseId(), s.description(), s.base().outputFile(), null));
         }
         // CC :840-842 archiveRemoteSession fire-and-forget

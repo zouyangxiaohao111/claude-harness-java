@@ -2,6 +2,7 @@ package com.nexusai.domain.market;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.application.agent.plugin.MarketplaceHttpDownloader;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.subagent.AgentDefinition;
 import com.nexusai.application.agent.subagent.AgentDefinitionRegistry;
@@ -10,6 +11,8 @@ import com.nexusai.domain.session.SessionService;
 import com.nexusai.infra.exception.BadGatewayException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.model.market.dto.ExternalMarketDto;
+import com.nexusai.model.market.dto.ExternalPluginDto;
 import com.nexusai.model.market.dto.MarketConnectorDto;
 import com.nexusai.model.market.dto.MarketExpertDto;
 import com.nexusai.model.market.dto.MarketSkillDto;
@@ -92,6 +95,9 @@ public class WorkbuddyMarketService {
     @Lazy
     private SubagentTool subagentTool;
     @Autowired private SessionService sessionService;
+
+    /** 外部市场（自建 MinIO/静态 HTTP）下载器 · 解析 marketplace.json 供前端市场弹窗展示。 */
+    private final MarketplaceHttpDownloader httpDownloader = new MarketplaceHttpDownloader();
 
     /** 本地缓存：cacheKey → (响应根 JsonNode, 抓取时间戳)。 */
     private final ConcurrentHashMap<String, CacheEntry> cache = new ConcurrentHashMap<>();
@@ -184,6 +190,64 @@ public class WorkbuddyMarketService {
             log.info("[WorkbuddyMarket] 连接器列表 → {} 条（腾讯代调，缓存 5 分钟）", out.size());
         }
         return out;
+    }
+
+    /**
+     * 解析外部插件市场（自建 MinIO / 静态 HTTP 托管）· GET /api/market/external。
+     *
+     * <p>用 {@link MarketplaceHttpDownloader} 下载 url（zip 或 marketplace.json）→ 解析
+     * {@code marketplace.json}（含扩展字段 displayName/description/createdAt）→ 映射为
+     * 扁平插件列表（category 前端分流到专家/技能/连接器 Tab）。下载后清理临时目录。
+     *
+     * @param url marketplace URL（zip 或 marketplace.json）
+     * @return 市场元信息 + 插件列表
+     * @throws BadGatewayException 下载/解析失败（fail-loud，502 中文）
+     */
+    public ExternalMarketDto listExternalMarket(String url) {
+        if (url == null || url.isBlank()) {
+            throw new ValidationException("外部市场 url 不能为空");
+        }
+        Path tmp = null;
+        try {
+            tmp = Files.createTempDirectory("nexusai-ext-market-");
+            String mp = httpDownloader.downloadMarketplace(url, null, tmp.toString());
+            JsonNode root = JSON.readTree(Files.readString(Path.of(mp), StandardCharsets.UTF_8));
+            List<ExternalPluginDto> plugins = new ArrayList<>();
+            for (JsonNode n : nodeList(root, "plugins")) {
+                String name = text(n.get("name"));
+                if (name == null || name.isBlank()) {
+                    continue;
+                }
+                plugins.add(new ExternalPluginDto(
+                    name,
+                    text(n.get("displayName")),
+                    text(n.get("description")),
+                    text(n.get("version")),
+                    text(n.get("category")),
+                    strList(n.get("tags")),
+                    text(n.get("createdAt"))));
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[WorkbuddyMarket] 外部市场解析 name={} plugins={} 个（url={}）",
+                    text(root.get("name")), plugins.size(), truncate(url, 120));
+            }
+            return new ExternalMarketDto(
+                text(root.get("name")),
+                text(root.get("owner")),
+                text(root.get("description")),
+                plugins);
+        } catch (IOException e) {
+            log.error("[WorkbuddyMarket] 外部市场拉取失败 url={}: {}", truncate(url, 120), e.getMessage());
+            throw new BadGatewayException("外部市场拉取失败（" + e.getMessage() + "）", e);
+        } finally {
+            if (tmp != null) {
+                try {
+                    Files.walk(tmp).sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            }
+        }
     }
 
     /**

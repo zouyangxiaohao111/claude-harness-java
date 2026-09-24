@@ -571,8 +571,18 @@ public class InstalledPluginsManager {
             name = pluginId;
         }
         Path installPathPath = installPath != null ? Paths.get(installPath) : null;
+        // [安装可用修复] 默认 agentsPath = installPath/agents（对齐 CC loadPluginAgents.ts:250
+        //   plugin.agentsPath 默认 agents 目录）。旧实现恒 null → PluginLoader.loadAllEnabledAgents
+        //   扫空，插件专家/agents 永不加载（装完不可用）。
+        Path defaultAgentsPath = null;
+        if (installPathPath != null) {
+            Path agentsDir = installPathPath.resolve("agents");
+            if (Files.isDirectory(agentsDir)) {
+                defaultAgentsPath = agentsDir;
+            }
+        }
         InstalledRecord rec = new InstalledRecord(name, version, "marketplace", true, installedAt,
-            installPathPath, null, projectPath, installPath, installedAt, gitCommitSha);
+            installPathPath, defaultAgentsPath, projectPath, installPath, installedAt, gitCommitSha);
         installed.put(name, rec);
         writeThrough(rec);
         if (log.isInfoEnabled()) {

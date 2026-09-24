@@ -1,6 +1,7 @@
 package com.nexusai.apis.market;
 
 import com.nexusai.domain.market.WorkbuddyMarketService;
+import com.nexusai.model.market.dto.ExternalMarketDto;
 import com.nexusai.model.market.dto.MarketConnectorDto;
 import com.nexusai.model.market.dto.MarketExpertDto;
 import com.nexusai.model.market.dto.MarketSkillDto;
@@ -60,6 +61,15 @@ public class WorkbuddyMarketController {
     @GetMapping("/connector")
     public List<MarketConnectorDto> listConnectors() {
         return marketService.listConnectors();
+    }
+
+    /**
+     * 外部插件市场（自建 MinIO / 静态 HTTP）解析代理 · url 指向 marketplace.zip 或 marketplace.json。
+     * 下载并解析 marketplace.json，返回市场元信息 + 插件列表（category 前端分流）。
+     */
+    @GetMapping("/external")
+    public ExternalMarketDto listExternal(@RequestParam String url) {
+        return marketService.listExternalMarket(url);
     }
 
     /**

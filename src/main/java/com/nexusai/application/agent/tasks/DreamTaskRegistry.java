@@ -54,6 +54,17 @@ public class DreamTaskRegistry {
     /** 富 dream 状态存储（Java 侧 DreamTaskState 的 home） */
     private final ConcurrentHashMap<String, DreamTaskState> store = new ConcurrentHashMap<>();
 
+    /**
+     * dream taskId → 归属会话 id（C2 · 会话归属显式化）。
+     *
+     * <p><b>WHY</b>：{@link DreamTaskState} 是纯 UI 状态载体（无会话字段），而统一 store 的
+     * {@link BackgroundTask#sessionId()} 是 SDK task_started / task_notification 的归属源。
+     * 注册时把会话记在这里，终态 {@link #withTerminal} 路径重建 BackgroundTask 时照旧带出
+     * —— 否则终态会把 sessionId 擦回 null（与 AutonomousAgentLoop 13 参重建同类缺口）。
+     * 会话在注册期（会话线程内）取值，此处只做值搬运，⛔ 不在他线程现算。
+     */
+    private final ConcurrentHashMap<String, String> sessionByTaskId = new ConcurrentHashMap<>();
+
     /** 统一任务存储 + SDK 事件通道（可为 null —— 测试直构无 bean 时仅存本类 store，不落统一 store） */
     private final TaskFrameworkService taskFrameworkService;
 
@@ -97,12 +108,15 @@ public class DreamTaskRegistry {
      *   <li>{@code registerTask}（framework.ts:77 含 SDK task_started）</li>
      * </ol>
      *
+     * @param sessionId         归属会话 id（C2：SDK task_started 归属源 · 值来自
+     *                          {@code AutoDreamConsolidator.doConsolidate} 的 sessionId 形参）
      * @param sessionsReviewing 被 consolidation 审阅的 session 数（autoDream.ts:204 sessionIds.length）
      * @param priorMtime        锁 mtime 快照（kill/fail 回退用）
      * @param abortController   fork 的 AbortController（autoDream.ts:203 创建）
      * @return 新任务 id（'d' 前缀）
      */
-    public String registerDreamTask(int sessionsReviewing, long priorMtime, AbortController abortController) {
+    public String registerDreamTask(String sessionId, int sessionsReviewing, long priorMtime,
+                                    AbortController abortController) {
         String id = TaskIdGenerator.generate(TaskType.DREAM);
         long now = System.currentTimeMillis();
         DreamTaskState state = new DreamTaskState(
@@ -111,6 +125,9 @@ public class DreamTaskRegistry {
             DreamTaskState.DreamPhase.STARTING, sessionsReviewing,
             List.of(), List.of(), abortController, priorMtime);
         store.put(id, state);
+        if (sessionId != null && !sessionId.isBlank()) {
+            sessionByTaskId.put(id, sessionId);
+        }
         if (taskFrameworkService != null) {
             taskFrameworkService.registerTask(toBackgroundTask(state));
         }
@@ -320,9 +337,17 @@ public class DreamTaskRegistry {
      * 同步终态，使 evictTerminalTask / 惰性 GC 可回收（framework.ts:124-147）。
      */
     private BackgroundTask toBackgroundTask(DreamTaskState s) {
-        return new BackgroundTask(
+        BackgroundTask task = new BackgroundTask(
             s.id(), TaskType.DREAM, s.status(), s.description(),
             null, s.startTime(), s.endTime(), null, "", 0L, s.notified(), null, true);
+        // C2 · 会话归属显式化：13 参兼容构造 sessionId=null ⇒ 必须显式带出注册期会话，
+        //   否则 SDK task_started（registerTask）与终态重建都会丢归属（前端按 session_id 过滤漏卡）。
+        return task.withSessionId(sessionIdOf(s.id()));
+    }
+
+    /** 取注册期记录的归属会话（未登记 → null，不伪造会话）。 */
+    private String sessionIdOf(String taskId) {
+        return sessionByTaskId.get(taskId);
     }
 
     /** 追加去重（不修改入参列表） */

@@ -204,7 +204,7 @@ class TaskStopDispatchTest {
         BackgroundTaskRunner runner = new BackgroundTaskRunner(nq, service, sdk);
         runner.setDreamTaskRegistry(dream);
         AbortController abort = new AbortController();
-        String taskId = dream.registerDreamTask(2, 999L, abort);
+        String taskId = dream.registerDreamTask("sess-dream", 2, 999L, abort);
 
         BackgroundTaskRunner.StopTaskResult result = runner.stopTask(taskId);
 
@@ -318,7 +318,7 @@ class TaskStopDispatchTest {
             com.nexusai.application.agent.remote.RemoteAgentTaskService.RegisterOptions opts =
                 new com.nexusai.application.agent.remote.RemoteAgentTaskService.RegisterOptions(
                     com.nexusai.application.agent.remote.RemoteTaskType.REMOTE_AGENT,
-                    "sess-1", "部署", "claude -p 'deploy'", "tu-r1", null, null, null, null, null);
+                    "sess-1", "部署", "claude -p 'deploy'", "tu-r1", null, null, null, null, "sess-1");
             com.nexusai.application.agent.remote.RemoteAgentTaskService.RegisteredRemoteTask reg =
                 ctx.remoteService().registerRemoteAgentTask(opts);
 
@@ -330,7 +330,7 @@ class TaskStopDispatchTest {
             // 经 RemoteAgentTask.kill：KILLED + notified + SDK stopped + archive（:811-847）
             assertThat(ctx.remoteService().findTask(reg.taskId()).status()).isEqualTo(BackgroundTaskStatus.KILLED);
             assertThat(ctx.api().archiveCalled).as("kill 必须触发 archiveRemoteSession（释放云资源，:840-842）").isTrue();
-            List<SdkEventQueue.DrainedSdkEvent> drained = ctx.sdk().drainSdkEvents(null);
+            List<SdkEventQueue.DrainedSdkEvent> drained = ctx.sdk().drainSdkEvents("sess-1");
             boolean stopped = drained.stream().anyMatch(d ->
                 d.event() instanceof SdkEventQueue.TaskNotificationEvent e && "stopped".equals(e.status()));
             assertThat(stopped).as("kill 必须发 task_notification stopped SDK 事件（:835-838）").isTrue();
@@ -347,7 +347,7 @@ class TaskStopDispatchTest {
             com.nexusai.application.agent.remote.RemoteAgentTaskService.RegisterOptions opts =
                 new com.nexusai.application.agent.remote.RemoteAgentTaskService.RegisterOptions(
                     com.nexusai.application.agent.remote.RemoteTaskType.REMOTE_AGENT,
-                    "sess-1", "部署", "claude -p 'deploy'", "tu-r1", null, null, null, null, null);
+                    "sess-1", "部署", "claude -p 'deploy'", "tu-r1", null, null, null, null, "sess-1");
             com.nexusai.application.agent.remote.RemoteAgentTaskService.RegisteredRemoteTask reg =
                 ctx.remoteService().registerRemoteAgentTask(opts);
             ctx.remoteService().kill(reg.taskId()); // 先杀掉 → 非 running

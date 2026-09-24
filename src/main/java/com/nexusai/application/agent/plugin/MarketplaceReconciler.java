@@ -64,6 +64,7 @@ public class MarketplaceReconciler implements PluginInstallationManager.Marketpl
 
     private final MarketplaceConfigStore store;
     private final MarketplaceSyncService sync;
+    private final MarketplaceHttpDownloader httpDownloader;
     private final Supplier<String> projectRoot;
     private final Predicate<ReconcileSkipKey> skipFilter;
 
@@ -72,8 +73,15 @@ public class MarketplaceReconciler implements PluginInstallationManager.Marketpl
 
     public MarketplaceReconciler(MarketplaceConfigStore store, MarketplaceSyncService sync,
                                  Supplier<String> projectRoot, Predicate<ReconcileSkipKey> skipFilter) {
+        this(store, sync, null, projectRoot, skipFilter);
+    }
+
+    public MarketplaceReconciler(MarketplaceConfigStore store, MarketplaceSyncService sync,
+                                 MarketplaceHttpDownloader httpDownloader,
+                                 Supplier<String> projectRoot, Predicate<ReconcileSkipKey> skipFilter) {
         this.store = Objects.requireNonNull(store);
         this.sync = sync != null ? sync : new MarketplaceSyncService();
+        this.httpDownloader = httpDownloader != null ? httpDownloader : new MarketplaceHttpDownloader();
         // [批 3c] 默认 projectRoot 取进程级 original cwd（对齐 CC reconciler.ts:131 diffMarketplaces
         //   传 projectRoot: getOriginalCwd() + :257 normalizeSource 的 base = projectRoot ?? getOriginalCwd()）。
         //   **消费链无会话**：normalizeSource ← diff/reconcile ← diffMarketplaces/reconcileMarketplaces
@@ -86,7 +94,7 @@ public class MarketplaceReconciler implements PluginInstallationManager.Marketpl
     }
 
     public MarketplaceReconciler(MarketplaceConfigStore store) {
-        this(store, null, null, null);
+        this(store, null, null, null, null);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -321,8 +329,13 @@ public class MarketplaceReconciler implements PluginInstallationManager.Marketpl
                 temporaryCachePath = abs;
                 cleanupNeeded = false;
             }
-            case MarketplaceSource.Url u ->
-                throw new IOException("URL marketplace 源重新下载属 L4 安装层（MPL4），暂不支持 reconcile: " + u.url());
+            case MarketplaceSource.Url u -> {
+                temporaryCachePath = Paths.get(cacheDir, tempName).toString();
+                cleanupNeeded = true;
+                // HTTP 下载（zip 或 marketplace.json）→ 物化临时目录；downloadMarketplace 内部
+                // 保证 .claude-plugin/marketplace.json 布局（根有则同步），下游按嵌套路径读取。
+                marketplacePath = httpDownloader.downloadMarketplace(u.url(), u.headers(), temporaryCachePath);
+            }
             case MarketplaceSource.Npm n ->
                 throw new IOException("NPM marketplace 源尚未实现（CC loadAndCacheMarketplace :1625-1628 同样 throw）: "
                     + n.npmPackage());

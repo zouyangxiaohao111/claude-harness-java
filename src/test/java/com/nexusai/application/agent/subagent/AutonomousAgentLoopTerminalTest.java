@@ -45,6 +45,9 @@ class AutonomousAgentLoopTerminalTest {
         }
     }
 
+    /** C2 · 注册任务与 drain 必须用同一会话键（旧实现的 null 全量取已被会话桶取代）。 */
+    private static final String SESSION = "sess-term";
+
     private RecordingFramework framework;
     private SdkEventQueue sdkQueue;
     private TaskService taskService;
@@ -68,7 +71,9 @@ class AutonomousAgentLoopTerminalTest {
             "alice teammate", null,
             System.currentTimeMillis(), null, null,
             "/tmp/" + taskId + ".out", 0L, false,
-            null, true);
+            null, true)
+            // C2 · 任务必须带归属会话，否则终态 task_notification 无法归属（会被队列 fail-loud 丢弃）
+            .withSessionId(SESSION);
         framework.registerTask(task);
     }
 
@@ -99,14 +104,14 @@ class AutonomousAgentLoopTerminalTest {
         assertThat(after.endTime()).as("completed 必须设置 endTime").isNotNull();
 
         // SDK bookend 只发一次 completed
-        SdkEventQueue.TaskNotificationEvent evt = onlyNotification("sess-1");
+        SdkEventQueue.TaskNotificationEvent evt = onlyNotification(SESSION);
         assertThat(evt).as("必须发出 task_notification").isNotNull();
         assertThat(evt.status()).isEqualTo("completed");
 
         // 再次调用 → no-op（alreadyTerminal）
         boolean second = loop.complete();
         assertThat(second).as("已 terminal 时 complete 必须 no-op").isFalse();
-        assertThat(onlyNotification("sess-1")).as("不得重复发 SDK").isNull();
+        assertThat(onlyNotification(SESSION)).as("不得重复发 SDK").isNull();
     }
 
     @Test
@@ -124,13 +129,13 @@ class AutonomousAgentLoopTerminalTest {
         assertThat(after.notified()).isTrue();
         assertThat(after.endTime()).isNotNull();
 
-        SdkEventQueue.TaskNotificationEvent evt = onlyNotification("sess-2");
+        SdkEventQueue.TaskNotificationEvent evt = onlyNotification(SESSION);
         assertThat(evt).as("必须发出 task_notification").isNotNull();
         assertThat(evt.status()).isEqualTo("failed");
 
         // alreadyTerminal 守卫
         assertThat(loop.fail("again")).as("已 failed 时 fail 必须 no-op").isFalse();
-        assertThat(onlyNotification("sess-2")).as("不得重复发 SDK").isNull();
+        assertThat(onlyNotification(SESSION)).as("不得重复发 SDK").isNull();
     }
 
     @Test
@@ -152,13 +157,13 @@ class AutonomousAgentLoopTerminalTest {
         assertThat(after.notified()).isTrue();
         assertThat(after.endTime()).isNotNull();
 
-        SdkEventQueue.TaskNotificationEvent evt = onlyNotification("sess-3");
+        SdkEventQueue.TaskNotificationEvent evt = onlyNotification(SESSION);
         assertThat(evt).as("必须发出 task_notification").isNotNull();
         assertThat(evt.status()).isEqualTo("stopped");
 
         // 重复 kill → no-op
         assertThat(loop.kill()).isFalse();
-        assertThat(onlyNotification("sess-3")).as("不得重复发 SDK").isNull();
+        assertThat(onlyNotification(SESSION)).as("不得重复发 SDK").isNull();
     }
 
     @Test

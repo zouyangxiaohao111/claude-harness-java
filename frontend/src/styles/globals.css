@@ -7885,6 +7885,9 @@ html {
 .composer .project-binder.locked span { color: #9CA3AF; }
 
 /* V58 AgentSelector（主线程 agent 专家胶囊 · 复用 toolbar-select/mode-dropdown/mode-item 结构 · 仅差异项） */
+/* 已选主线程专家：常亮高亮（橙色主题 · 区别于 hover 瞬态 · 一眼看出当前驱动专家） */
+.composer .agent-selector.active,
+.composer .agent-selector.active:hover { background: #FFF3EB; border-color: #FFD0B0; color: #E65C00; box-shadow: 0 4px 10px rgba(255,122,61,0.15); }
 .composer .agent-selector .agent-selector-icon { width: 14px; height: 14px; }
 .composer .agent-selector .agent-selector-chevron { font-size: 10px; opacity: 0.7; }
 .composer .agent-selector .agent-dropdown { width: 240px; max-height: 280px; overflow-y: auto; }
