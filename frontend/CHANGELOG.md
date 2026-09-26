@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.22] - 2026-09-26
+
+### 修复
+- 修复部分后台请求（会话记忆/压缩/摘要）漏带自定义请求头、导致 opencode 等强制要求会话头的服务返回 400 的 bug。
+
 ## [0.1.21] - 2026-09-24
 
 ### 修复

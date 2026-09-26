@@ -274,7 +274,11 @@ public class OpenAiSdkProvider implements LlmProvider {
                 null, effortValue, null,
                 // includeUsage=true（流式 usage 采集）+ streamingMainChain=true（探针链标记：
                 // 本路径是唯一会在 :343 打「响应」探针的路径 ⇒ 与响应行同桶，1:1 可对排）。
-                true, true);
+                true, true,
+                // [D 可观测性 2026-09-24] 本次真的会注入的自定义 header 数（与 buildClient 内的注入
+                //   同源：同一 config.extraHeaders() + 同一谓词 ProviderHeaderInjector.isInjectableHeader）
+                //   ⇒ 探针行 hdrs=0 即指认「这条请求零自定义 header 出去」（fork 家族也走本路径 ⇒ 全覆盖）。
+                ProviderHeaderInjector.injectableCount(config.extraHeaders()));
 
             String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
             if (log.isDebugEnabled()) {
@@ -408,7 +412,11 @@ public class OpenAiSdkProvider implements LlmProvider {
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt,
                 userMessage == null ? List.of() : List.of(newUserMessage(userMessage)),
-                null, null, false, null, null, null);
+                null, null, false, null, null, null,
+                // [D 可观测性] 显式走 12-param 主实现，带上注入 header 数（否则探针打 hdrs=-）。
+                //   includeUsage=false / streamingMainChain=false 与原先经 9-param 链式落到 11-param 时的
+                //   取值逐字相同 ⇒ 只多个日志字段，wire 零变化。
+                false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
             ChatCompletion resp = client.chat().completions().create(params);
 
             String content = extractContent(resp);
@@ -496,7 +504,10 @@ public class OpenAiSdkProvider implements LlmProvider {
             OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
-                outputFormatSchema, thinkingDisabled, temperature, null, maxTokens);
+                outputFormatSchema, thinkingDisabled, temperature, null, maxTokens,
+                // [D 可观测性] 同上：显式走 12-param 主实现并带注入 header 数（原为经 9-param 链式落到
+                //   11-param，includeUsage/streamingMainChain 取值不变 ⇒ 仅多日志字段）。
+                false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
             // [WF3-04 explainer] 强制 tool_choice（CC options.tool_choice）→ named function choice
             params = applyToolChoice(params, options);
             ChatCompletion resp = client.chat().completions().create(params);
@@ -563,7 +574,10 @@ public class OpenAiSdkProvider implements LlmProvider {
             OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
-                outputFormatSchema, thinkingDisabled, temperature, null, maxTokens);
+                outputFormatSchema, thinkingDisabled, temperature, null, maxTokens,
+                // [D 可观测性] 同上：显式走 12-param 主实现并带注入 header 数（原为经 9-param 链式落到
+                //   11-param，includeUsage/streamingMainChain 取值不变 ⇒ 仅多日志字段）。
+                false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
             params = applyToolChoice(params, options);
             ChatCompletion resp = client.chat().completions().create(params);
 
@@ -765,18 +779,13 @@ public class OpenAiSdkProvider implements LlmProvider {
     }
 
     /**
-     * [DEC-04] buildRequestParams · 11-param 主实现（含探针链标记）。
+     * [DEC-04] buildRequestParams · 11-param 重载（不含「本次注入的自定义 header 数」载荷）。
      *
-     * <p><b>includeUsage</b>：流式路径传 {@code true} 写入 {@code stream_options.include_usage}
-     * （OpenAI streaming 默认不返回 usage，需显式开启）；非流式路径传 false（stream_options 对
-     * non-streaming 无效）。CC 侧 Anthropic 流式 usage 恒返回，本 flag 为 OpenAI 协议等价。
-     *
-     * <p><b>streamingMainChain</b>（[前缀缓存头部探针 · 可判读化]）：本请求是否走
-     * <b>流式主链</b>（{@link #doStream}，即唯一会打「响应」探针的那条路）。⛔ 它<b>只</b>影响探针
-     * 的记账分桶与日志标记（{@code chain=stream|side}），<b>不改任何一个 wire 字节</b>：
-     * 出站 params 的构造逐字与传入 false 时相同。WHY 必须显式传而不复用 includeUsage 推断：
-     * 二者语义不同（一个管 {@code stream_options}，一个管日志可判读性），复用会在将来任一侧
-     * 变更时静默串味。见 {@link #HEAD_PROBE_SIDE_SUFFIX}。
+     * <p>行为与 {@link #buildRequestParams(String, String, List, ArrayNode, JsonNode, boolean, Double,
+     * String, Integer, boolean, boolean, int)} 完全一致，只差探针行上的 {@code hdrs=} 取值：
+     * 本重载传 {@link #HEAD_PROBE_HDRS_UNKNOWN}（打 {@code hdrs=-} = 未提供，如实标注而非编造 0）。
+     * 生产 4 条发送路径都显式走 12-param 主实现并带上 {@link ProviderHeaderInjector#injectableCount}；
+     * 本重载保留给测试/未知调用方（既有签名零破坏）。
      */
     public static ChatCompletionCreateParams buildRequestParams(String modelName,
                                                          String systemPrompt,
@@ -789,6 +798,46 @@ public class OpenAiSdkProvider implements LlmProvider {
                                                          Integer maxTokens,
                                                          boolean includeUsage,
                                                          boolean streamingMainChain) {
+        return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
+            thinkingDisabled, temperature, effortValue, maxTokens, includeUsage, streamingMainChain,
+            HEAD_PROBE_HDRS_UNKNOWN);
+    }
+
+    /**
+     * [DEC-04] buildRequestParams · 12-param 主实现（含探针链标记 + 本次注入的自定义 header 数）。
+     *
+     * <p><b>includeUsage</b>：流式路径传 {@code true} 写入 {@code stream_options.include_usage}
+     * （OpenAI streaming 默认不返回 usage，需显式开启）；非流式路径传 false（stream_options 对
+     * non-streaming 无效）。CC 侧 Anthropic 流式 usage 恒返回，本 flag 为 OpenAI 协议等价。
+     *
+     * <p><b>streamingMainChain</b>（[前缀缓存头部探针 · 可判读化]）：本请求是否走
+     * <b>流式主链</b>（{@link #doStream}，即唯一会打「响应」探针的那条路）。⛔ 它<b>只</b>影响探针
+     * 的记账分桶与日志标记（{@code chain=stream|side}），<b>不改任何一个 wire 字节</b>：
+     * 出站 params 的构造逐字与传入 false 时相同。WHY 必须显式传而不复用 includeUsage 推断：
+     * 二者语义不同（一个管 {@code stream_options}，一个管日志可判读性），复用会在将来任一侧
+     * 变更时静默串味。见 {@link #HEAD_PROBE_SIDE_SUFFIX}。
+     *
+     * <p><b>injectedCustomHeaderCount</b>（[D 可观测性 · 2026-09-24]）：本次请求
+     * <b>真的会注入</b>的自定义 header 条数，取
+     * {@link ProviderHeaderInjector#injectableCount(java.util.Map)}（与注入侧同一谓词，见该方法的
+     * 同源证明）。⛔ 与本方法一样<b>只影响日志</b>（探针行的 {@code hdrs=} 字段），不改任何 wire 字节。
+     * WHY 必须由调用方传入而不是本方法自行推算：本方法拿不到 {@code ProviderConfig}
+     * （注入发生在 {@link #buildClient(ProviderConfig, String)} 内，两者是相邻的两次调用，
+     * 方法间没有配置载体）；调用点两样都在作用域里，传入即可，避免把 config 灌进 DTO→wire 转换点。
+     * 未知时传 {@link #HEAD_PROBE_HDRS_UNKNOWN}（打 {@code hdrs=-}）。
+     */
+    public static ChatCompletionCreateParams buildRequestParams(String modelName,
+                                                         String systemPrompt,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         JsonNode outputFormatSchema,
+                                                         boolean thinkingDisabled,
+                                                         Double temperature,
+                                                         String effortValue,
+                                                         Integer maxTokens,
+                                                         boolean includeUsage,
+                                                         boolean streamingMainChain,
+                                                         int injectedCustomHeaderCount) {
         ChatCompletionCreateParams.Builder b = ChatCompletionCreateParams.builder()
             .model(modelName == null ? "" : modelName);
         if (systemPrompt != null && !systemPrompt.isBlank()) {
@@ -892,7 +941,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         //   [可判读化] streamingMainChain 由调用方显式声明（doStream=true，其余=false）：
         //   主链行 chain=stream 且与响应行同桶 ⇒ 1:1 可对排；侧查询行 chain=side 走独立桶。
         logHeadProbeOutbound(systemPrompt, outbound, sentMessageCount, tools, strictModelGate,
-            streamingMainChain);
+            streamingMainChain, injectedCustomHeaderCount);
         return b.build();
     }
 
@@ -1572,6 +1621,16 @@ public class OpenAiSdkProvider implements LlmProvider {
     private static final String HEAD_PROBE_NO_SESSION = "<no-session>";
 
     /**
+     * [前缀缓存头部探针 · D 可观测性 2026-09-24] {@code hdrs=} 的「未提供」哨兵（探针行打 {@code -}）。
+     *
+     * <p><b>WHY 用哨兵而不是 0</b>：{@code hdrs=0} 是一个<b>有信息量的结论</b>（本次请求零自定义 header
+     * 出去了 = 400 的可判据成因），必须与「调用方没传这个载荷」（11-param 重载 / 测试直驱）区分开
+     * —— 把未知写成 0 会让排障者把「没测」读成「没发」（同族陷阱：判读某个探针字段前，先问它是
+     * 「按什么口径算出来的」，例如 hash 的是代码内投影还是线上字节）。
+     */
+    private static final int HEAD_PROBE_HDRS_UNKNOWN = -1;
+
+    /**
      * [前缀缓存头部探针] <b>侧查询（非流式主链）的桶后缀</b> · 与主链桶隔离。
      *
      * <p><b>WHY 必须隔离（本后缀的存在理由）</b>：出站探针在<b>四条</b>发送路径都打
@@ -1724,6 +1783,9 @@ public class OpenAiSdkProvider implements LlmProvider {
      * @param strictModelGate    strict 模型层门控（{@code toOpenAiSdkTool} 的同一入参）
      * @param streamingMainChain true = 流式主链请求（{@link #doStream}，其响应行也打）；
      *                           false = 侧查询（标题 / 分类器 / 解释器，无响应行）
+     * @param injectedCustomHeaderCount [D 可观测性] 本次请求真的会注入的自定义 header 条数
+     *                           （{@link ProviderHeaderInjector#injectableCount}）；
+     *                           {@link #HEAD_PROBE_HDRS_UNKNOWN} = 未提供（打 {@code hdrs=-}）
      *
      * <p><b>⭐ 判读方式</b>：日志行上有 {@code chain=stream|side} 标记 + {@code turn} 序号。
      * 同一 sessionId 下：<b>主链</b>行（{@code chain=stream}）的 turn 从 1 起<b>连号</b>，且与
@@ -1732,12 +1794,19 @@ public class OpenAiSdkProvider implements LlmProvider {
      * （这正是本标记 + 分桶要修的可判读性缺陷）。对排方法：按 sessionId 分组 → 只看
      * {@code chain=stream} 的行 → 相邻两行 turn 应连续，且每条都能在响应行里找到同 turn 的那条。
      *
+     * <p><b>⭐ {@code hdrs=} 字段（D 可观测性 · 2026-09-24）</b>：本请求真的注入了几条自定义
+     * header。{@code hdrs=0} ⇒ <b>本次请求一条自定义 header 都没出去</b>（provider 配了
+     * {@code ${session_id}} 却零注入的场景 = 400 的成因）；{@code hdrs=-} ⇒ 调用方未提供该载荷
+     * （测试直驱 / 走 11-param 重载），如实标注而非编造 0。⚠️ 本字段与 {@code sessionId} 的解析
+     * 结果<b>无关</b>：{@code sessionId=} 打的是「占位符展开成什么」，{@code hdrs=} 打的才是
+     * 「header 有没有发」—— 排查 header 丢失时必须看 {@code hdrs}（本字段即为此而加）。
+     *
      * <p>包级可见（原 private）供单测直接驱动：主链/侧查询的<b>分桶与连号</b>是纯记账逻辑，
      * 不经真实网络即可断言（与 {@link #fingerprintHead} 同先例）。
      */
     static void logHeadProbeOutbound(String systemPrompt, List<ChatMessageDto> outbound,
                                      int sentCount, ArrayNode tools, boolean strictModelGate,
-                                     boolean streamingMainChain) {
+                                     boolean streamingMainChain, int injectedCustomHeaderCount) {
         if (!log.isInfoEnabled()) {
             return;
         }
@@ -1752,10 +1821,13 @@ public class OpenAiSdkProvider implements LlmProvider {
             }
             HeadProbeFingerprint fp = fingerprintHead(systemPrompt, outbound, sentCount, tools, strictModelGate);
             log.info("[前缀缓存探针] 出站 sessionId={} turn={} chain={} thread={} sys[{}] tools[{}] "
-                    + "msg0[{}] msg1[{}] msg2[{}] msgCount={}",
+                    + "msg0[{}] msg1[{}] msg2[{}] msgCount={} hdrs={}",
                 sessionId, turn, streamingMainChain ? "stream" : "side",
                 java.lang.Thread.currentThread().getName(),
-                fp.system(), fp.tools(), fp.msg0(), fp.msg1(), fp.msg2(), fp.sentCount());
+                fp.system(), fp.tools(), fp.msg0(), fp.msg1(), fp.msg2(), fp.sentCount(),
+                // [D 可观测性] 与该请求真的会注入的自定义 header 数同源；未提供 → "-"（如实标注不编造）
+                injectedCustomHeaderCount == HEAD_PROBE_HDRS_UNKNOWN
+                    ? "-" : String.valueOf(injectedCustomHeaderCount));
         } catch (Exception e) {
             log.warn("[前缀缓存探针] 出站指纹计算失败: {}", e.toString());
         }

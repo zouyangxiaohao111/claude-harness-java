@@ -133,8 +133,11 @@ class OutboundHeadProbeChainPairingTest {
 
     /** 驱动一次出站探针（与生产同口径：sessionId 由 outbound 里解析）。 */
     private static void outbound(List<ChatMessageDto> msgs, ArrayNode tools, boolean streamingMainChain) {
+        // 末参 = hdrs 载荷：本类测的是「分桶与连号」，与 header 注入数无关 ⇒ 传 -1（= 探针的
+        // 「未提供」哨兵 HEAD_PROBE_HDRS_UNKNOWN，行上打 hdrs=-，不编造 0）。
+        // hdrs 字段本身由 ProviderHeaderObservabilityTest 单独守。
         OpenAiSdkProvider.logHeadProbeOutbound("SYS\n\nPrimary working directory: /w", msgs, msgs.size(),
-            tools, true, streamingMainChain);
+            tools, true, streamingMainChain, -1);
     }
 
     /** 已捕获的出站探针行。 */

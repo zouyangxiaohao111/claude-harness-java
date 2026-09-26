@@ -1990,8 +1990,17 @@ public class ToolRegistrationConfig {
                     return null;
                 }
                 String type = prov.getType() != null ? prov.getType() : "openai_compatible";
+                // [A · provider-hdr 2026-09-24] 必须走 3 参构造带上 extraHeaders —— 2 参便捷构造落
+                //   Map.of() ⇒ ProviderHeaderInjector.apply 的空值早返回（ProviderHeaderInjector.java:102）
+                //   ⇒ 该出口一条自定义 header 都不发（不是发常量）。本处喂 ForkModelRoute，被
+                //   QueryLoopForkedQuery 取用 ⇒ fork 家族（SESSION_MEMORY / EXTRACT_MEMORIES /
+                //   AUTO_DREAM，post-sampling hook 每轮触发、用用户主模型 provider）恒零 header ⇒
+                //   opencode 这类强制要求请求头的 provider 每轮 400。
+                //   写法照抄既有 3 参先例（ModelConfigResolver.java:117 / ChatService.java:2219）：
+                //   DB 列是 JSON 字符串 ⇒ 过 deserializeHeaders 转 Map（未配置 → null，注入侧同样短路）。
                 com.nexusai.infra.llm.ProviderConfig cfg =
-                    new com.nexusai.infra.llm.ProviderConfig(prov.getBaseUrl(), rawKey);
+                    new com.nexusai.infra.llm.ProviderConfig(prov.getBaseUrl(), rawKey,
+                        com.nexusai.domain.provider.ProviderService.deserializeHeaders(prov.getExtraHeaders()));
                 com.nexusai.infra.llm.LlmProvider p = llmProviderFactory.getProvider(cfg, type);
                 return new com.nexusai.application.agent.compact.fork.ProductionForkedQuery.ForkModelRoute(
                     rec.getName(), cfg, p, type);
@@ -2110,7 +2119,14 @@ public class ToolRegistrationConfig {
                 if (rawKey == null || rawKey.isBlank()) {
                     return com.nexusai.infra.llm.ProviderConfig.empty();
                 }
-                return new com.nexusai.infra.llm.ProviderConfig(provider.getBaseUrl(), rawKey);
+                // [A · provider-hdr 2026-09-24] 同上（sessionForkModelRoute）：本 supplier 是 5 个 @Bean 的
+                //   configSupplier（streamCompactSummary / countTokensClient / awaySummaryService /
+                //   productionForkedQuery / queryLoopForkedQuery）⇒ 2 参构造落 Map.of() ⇒
+                //   ProviderHeaderInjector.java:102 早返回 ⇒ 压缩摘要 / away-summary / fork 三族请求
+                //   恒零自定义 header（opencode 强制要 header ⇒ 400）。3 参 + deserializeHeaders，
+                //   与 ModelConfigResolver.java:117 / ChatService.java:2219 同源。
+                return new com.nexusai.infra.llm.ProviderConfig(provider.getBaseUrl(), rawKey,
+                    com.nexusai.domain.provider.ProviderService.deserializeHeaders(provider.getExtraHeaders()));
             } catch (Exception e) {
                 log.warn("configSupplier 解析失败, 回落 mock: {}", e.toString());
                 return com.nexusai.infra.llm.ProviderConfig.empty();
