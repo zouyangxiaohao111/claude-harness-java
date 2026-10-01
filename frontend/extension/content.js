@@ -12,6 +12,11 @@
 //     本页只服务于一个会话，故 window.__NEXUSAI_CC_CONSOLE__ 等缓冲天然按会话隔离（无需按 sessionId 键控）
 //   · chrome.tabs/windows 类工具（resize_window/tabs_*/switch_browser/javascript_tool/screenshot）
 //     不在此处理，由 background 直接执行；此处收到会返回「未实现」占位
+//   · ⛔ 不做剪贴板通道（本批明确放弃，勿再尝试）：manifest.json 权限无 clipboardRead，
+//     本文件与 background.js 也都没有 execCommand('copy') / navigator.clipboard 读取实现
+//     ⇒ 点页面的「复制」按钮 + 读剪贴板，结构性不可能成功（复制按钮点了也没人读）。
+//     要网页正文请走：get_page_text（innerText 拿不到正文时加 mode:"full"）/
+//     read_page(filter:"all") / javascript_tool。
 
 // 防重复注入：manifest 注入 + executeScript 兜底注入都会执行本文件
 if (!window.__NEXUSAI_CC_LOADED__) {
@@ -55,12 +60,14 @@ function buildSelector(el) {
   return parts.join(' > ')
 }
 
-/** 读取元素基础信息（read_page / find 共用） */
-function elementInfo(el) {
+/** 读取元素基础信息（read_page / find 共用）
+ *  @param textCap 单节点文本上限：find / read_page(filter:interactive) 用默认 200（保持旧行为）；
+ *         read_page(filter:all) 用 READ_PAGE_TEXT_CAP（200 连一段正文都装不下 —— 本批的病灶） */
+function elementInfo(el, textCap = 200) {
   const rect = el.getBoundingClientRect()
   return {
     tag: el.tagName.toLowerCase(),
-    text: (el.textContent || '').trim().slice(0, 200),
+    text: (el.textContent || '').trim().slice(0, textCap),
     placeholder: el.getAttribute('placeholder') || undefined,
     ariaLabel: el.getAttribute('aria-label') || undefined,
     role: el.getAttribute('role') || undefined,
@@ -159,17 +166,146 @@ function refreshInteractiveIndex() {
 /*  18 个工具实现（DOM 操作类）                                         */
 /* ------------------------------------------------------------------ */
 
-/** read_page：基于单源可交互索引输出可交互元素清单（每个带 ref=快照下标） */
-async function readPage() {
-  const nodes = refreshInteractiveIndex() // 与 find / computer 共用同一份索引
-  return { ok: true, result: { url: location.href, title: document.title, nodeCount: nodes.length, nodes } }
+/** read_page(filter:all) 的单节点文本上限（find / filter:interactive 仍是 200）。
+ *  依据：200 连一个中文正文段落都装不下（模型拿到的是半截正文）；
+ *  但单节点仍要封顶 —— 一个容器可能带整页文本，无上限会让它独占 max_chars 总预算、并把
+ *  预算耗在重复的子树文本上（父节点 textContent 含全部后代文本）。2000 ≈ 中文长段落/代码块
+ *  片段的量级；总预算由 max_chars（默认 50000）守门，单节点上限只防「一个节点吃光预算」。 */
+const READ_PAGE_TEXT_CAP = 2000
+/** read_page 默认遍历深度（照后端 BrowserToolRegistry schema：default 15）；根节点算 depth 1 */
+const READ_PAGE_DEFAULT_DEPTH = 15
+/** read_page 默认输出字符预算（照后端 schema：default 50000）；超出即显式报错，不静默截断 */
+const READ_PAGE_DEFAULT_MAX_CHARS = 50000
+/** read_page(filter:all) 不进元素树的标签：无正文价值，且 textContent 会把整段内联 JS/CSS 源码
+ *  塞进输出预算（script/style），noscript/template 是不渲染的模板源 */
+const TREE_SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template'])
+
+/** 递归建元素树（read_page(filter:all) 用）：节点 = elementInfo（文本上限 READ_PAGE_TEXT_CAP）+ children */
+function buildElementTree(el, depth, maxDepth) {
+  const node = { ...elementInfo(el, READ_PAGE_TEXT_CAP), children: [] }
+  if (depth >= maxDepth) return node
+  for (const child of el.children) {
+    if (TREE_SKIP_TAGS.has(child.tagName.toLowerCase())) continue
+    node.children.push(buildElementTree(child, depth + 1, maxDepth))
+  }
+  return node
 }
 
-/** get_page_text：整页可见文本（整页全交，不在扩展侧截断——超 CC 单结果内联上限
- *  DEFAULT_MAX_RESULT_SIZE_CHARS=50_000 的部分由后端落盘+文件路径预览承接，聚合 200k 兜底） */
-async function getPageText() {
-  const text = (document.body ? document.body.innerText : '') || ''
-  return { ok: true, result: { url: location.href, text } }
+/** 元素树节点总数（nodeCount 口径：整棵树，不是仅根层） */
+function countTreeNodes(nodes) {
+  let n = 0
+  for (const node of nodes) n += 1 + countTreeNodes(node.children || [])
+  return n
+}
+
+/** read_page 输出超预算 ⇒ 显式报错（filter:"all" 的元素树与 filter:"interactive" 的扁平清单
+ *  共用同一套语义：⛔ 绝不静默截断；advice = 该档下可操作的收窄建议） */
+function overBudget(size, maxChars, advice) {
+  return { ok: false, error: `read_page 输出 ${size} 字符，超过 max_chars=${maxChars}。请收窄范围：${advice}` }
+}
+
+/**
+ * read_page：
+ *   · filter:"interactive" ⇒ 单源可交互索引清单（与旧实现逐字相同：同一份 refreshInteractiveIndex()
+ *     快照、同一 elementInfo 字段集与顺序；回归锚）
+ *   · filter:"all"（默认，照后端 schema）⇒ 元素树：节点含 tag/text/ariaLabel/role/href/可见性 + children，
+ *     支持 depth（默认 15，根算 1）/ ref_id（以该 ref 为根返回其子树）/ max_chars（默认 50000，
+ *     超出返回显式错误而不静默截断）
+ * ref_id 取自最近一次 read_page(filter:"interactive") / find 的快照；失效或越界 ⇒ 显式报错，不回落整页。
+ *
+ * 参数适用档（⛔ 不再有「schema 描述了、某档却静默不认」的分支）：
+ *   · max_chars —— 两档都生效（输出预算是输出侧概念，与档位无关），超出一律显式报错，不静默截断
+ *   · depth / ref_id —— 只是「元素树」概念（树有多深 / 以谁为子树根）。interactive 返回扁平清单，
+ *     既无层级也无子树聚焦 ⇒ 与该档同时给出时**显式报错**：不假装生效，也不静默忽略。
+ *     要聚焦某元素子树请用 filter:"all" + ref_id；要按条件找元素请用 find。
+ */
+async function readPage(args = {}) {
+  const filter = args.filter === 'interactive' ? 'interactive' : 'all'
+  // 参数一律在分档**之前**解析/校验：任何一档都不允许存在「参数被静默吞掉」的分支
+  const depthGiven = args.depth != null
+  const refGiven = args.ref_id != null
+  const depth = Number.isFinite(Number(args.depth)) && Number(args.depth) >= 0
+    ? Math.trunc(Number(args.depth)) : READ_PAGE_DEFAULT_DEPTH
+  const maxChars = Number.isFinite(Number(args.max_chars)) && Number(args.max_chars) > 0
+    ? Math.trunc(Number(args.max_chars)) : READ_PAGE_DEFAULT_MAX_CHARS
+  if (filter === 'interactive') {
+    if (depthGiven) {
+      return {
+        ok: false,
+        error: 'read_page depth 仅对 filter:"all" 的元素树有效：filter:"interactive" 返回扁平可交互清单，'
+          + `没有层级（depth=${String(args.depth)}）。请去掉 depth，或改用 filter:"all"。`,
+      }
+    }
+    if (refGiven) {
+      return {
+        ok: false,
+        error: 'read_page ref_id 仅对 filter:"all" 的元素树有效（以该 ref 为根返回其子树）：'
+          + `filter:"interactive" 返回整页扁平清单，ref_id 无聚焦语义（ref_id=${String(args.ref_id)}）。`
+          + '要聚焦某元素子树请用 filter:"all"+ref_id；要按条件找元素请用 find。',
+      }
+    }
+    const nodes = refreshInteractiveIndex() // 与 find / computer 共用同一份索引
+    const size = JSON.stringify(nodes).length
+    if (size > maxChars) {
+      return overBudget(size, maxChars, 'filter:"interactive" 档不收窄清单（depth/ref_id 在此档不适用）：'
+        + '请改用 find 按文本/selector 缩小匹配范围，或显式调大 max_chars。')
+    }
+    return { ok: true, result: { url: location.href, title: document.title, nodeCount: nodes.length, nodes } }
+  }
+  // 根：ref_id 给定 ⇒ 用最近一次 read_page/find 快照里的那个元素（含其子树）；否则整页正文容器 body
+  let root = document.body
+  if (args.ref_id != null) {
+    const idx = parseRef(args.ref_id)
+    const el = idx >= 0 && idx < interactiveElements.length ? interactiveElements[idx] : null
+    if (!el || !el.isConnected) {
+      return { ok: false, error: `ref 失效，请重新 read_page/find（ref=${String(args.ref_id)}）` }
+    }
+    root = el
+  }
+  if (!root) return { ok: false, error: 'read_page 找不到页面根元素（document.body 为空）' }
+  const nodes = [buildElementTree(root, 1, depth)]
+  const size = JSON.stringify(nodes).length
+  if (size > maxChars) {
+    return overBudget(size, maxChars, `减小 depth（当前 depth=${depth}），`
+      + '或用 ref_id 聚焦某个元素的子树（ref 取自 read_page(filter:"interactive") / find），或显式调大 max_chars。')
+  }
+  return {
+    ok: true,
+    result: { url: location.href, title: document.title, filter, depth, nodeCount: countTreeNodes(nodes), nodes },
+  }
+}
+
+/** 正文文本收集（get_page_text mode:"full"）：克隆 body 后剔除无正文价值的标签再取 textContent，
+ *  用于 innerText 因离屏 / content-visibility 虚拟化而漏掉正文时。
+ *  textContent 含 HTML 源码里的缩进空白 ⇒ 折叠空白串，便于模型阅读（要原样结构请用 javascript_tool）。 */
+function collectFullText() {
+  if (!document.body) return ''
+  const clone = document.body.cloneNode(true)
+  for (const el of clone.querySelectorAll('script, style, noscript, template, svg')) el.remove()
+  const raw = clone.textContent || ''
+  return raw.replace(/\s+/g, ' ').trim()
+}
+
+/** get_page_text：mode:"inner"（默认）⇒ document.body.innerText（与旧行为逐字相同，零回归锚）；
+ *  mode:"full" ⇒ DOM 遍历 textContent（补 innerText 漏掉的离屏/虚拟化正文）。
+ *  两档都附带诊断 innerTextLen / textContentLen，让模型自己判断要不要换 mode。
+ *  整页全交，不在扩展侧截断——超 CC 单结果内联上限 DEFAULT_MAX_RESULT_SIZE_CHARS=50_000 的
+ *  部分由后端落盘+文件路径预览承接，聚合 200k 兜底。 */
+async function getPageText(args = {}) {
+  const mode = args.mode === 'full' ? 'full' : 'inner'
+  const innerText = (document.body ? document.body.innerText : '') || ''
+  const textContent = document.body ? (document.body.textContent || '') : ''
+  const text = mode === 'full' ? collectFullText() : innerText
+  return {
+    ok: true,
+    result: {
+      url: location.href,
+      mode,
+      text,
+      innerTextLen: innerText.length,
+      textContentLen: textContent.length,
+    },
+  }
 }
 
 /** find：在单源可交互索引快照内按文本/描述/selector 匹配，返回带 ref 的结果供 computer 定位 */

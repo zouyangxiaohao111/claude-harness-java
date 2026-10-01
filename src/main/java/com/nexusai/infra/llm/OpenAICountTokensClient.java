@@ -66,6 +66,18 @@ public class OpenAICountTokensClient implements CountTokensClient {
         this.modelSupplier = modelSupplier;
     }
 
+    /**
+     * 来源类别 = {@link TokenSource#ESTIMATE}（本地 tiktoken 估算，不发网络请求）·
+     * 「上下文分析」面板 (a2) 态，数值旁标「估算」。
+     *
+     * <p>显式覆写（虽与接口默认值同）：让「哪个客户端 = 哪种来源」在本类里自证，
+     * 而不是靠读者去翻接口默认值。
+     */
+    @Override
+    public TokenSource sourceKind() {
+        return TokenSource.ESTIMATE;
+    }
+
     @Override
     public Integer countTokens(String content) {
         // 空内容短路 → 0（对齐 tokenEstimation.ts:127-130）

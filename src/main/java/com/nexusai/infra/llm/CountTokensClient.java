@@ -23,9 +23,37 @@ import java.util.List;
  *   <li>空内容/空工具 → {@code 0}（tokenEstimation.ts:127-130 countTokensWithAPI 短路）；</li>
  *   <li>API 成功 → {@code input_tokens}（tokenEstimation.ts:195）；</li>
  *   <li>API 失败 / {@code input_tokens} 非 number / model 或 config 不可得 → {@code null}
- *       （tokenEstimation.ts:189-199；CC Haiku 兜底在 Java 端无 count_tokens 通道，
- *       终极兜底 null → 调用方 {@code tokens||0} 记 0）。</li>
+ *       （tokenEstimation.ts:189-199）。</li>
  * </ul>
+ *
+ * <p><b>[CC 对照 · 已核 2.1.284 发行产物]</b> 对齐目标 = <b>CC 2.1.284</b>（本机
+ * {@code C:/Users/WIN/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe}，
+ * 246,480,032 字节，exe 内嵌 {@code // Version: 2.1.284} 且与同包 package.json 一致）。
+ * 关于「API 计数失败之后会怎样」，核过的事实（本类旧注释称 CC 靠 <b>Haiku</b> 兜底，已失真）：
+ * <ul>
+ *   <li>CC 在 {@code analyzeContext} 侧对主调用包了一层 {@code ebt(主调用, 本地估算器)}：
+ *       主调用返回 {@code null} 或抛错时，记日志
+ *       {@code "analyzeContext: count unavailable, estimating locally"}，然后改走
+ *       <b>本地估算器</b>（{@code eZn} 内联的 {@code h}：逐消息 {@code Xte(content, tokenizer)}
+ *       求和）。⇒ <b>通用兜底是本地估算，不是 Haiku</b>。</li>
+ *   <li>唯一沾模型的是一条<b>很窄的特例</b>：仅当确实在用网关（{@code gatewayAuth()} 非空）
+ *       且 count_tokens 回 <b>HTTP 501</b> 时，才走 {@code pAn}（"gateway sample count"）——
+ *       以 small/fast 模型（{@code ANTHROPIC_SMALL_FAST_MODEL}，缺省回落到
+ *       {@code ANTHROPIC_DEFAULT_HAIKU_MODEL} 即 Haiku；Vertex/Bedrock 分支换 Sonnet）发一次
+ *       {@code messages.create}，读 {@code usage.input_tokens}。它<b>不</b>是通用兜底路径。</li>
+ *   <li><b>[有意偏离 CC]</b> 本仓 Java 端不复制这层兜底，两个理由：① Java 的 anthropic 客户端
+ *       没有 Haiku 兜底通道；② 更要紧的是，CC 那种「API 失败后静默换成估算值」会让调用方
+ *       分不清「精确」与「估算」—— 正是本批次要消灭的。本仓把估算做成<b>另一条显式路径</b>
+ *       （{@link OpenAICountTokensClient} 的 tiktoken，来源标 {@link TokenSource#ESTIMATE}），
+ *       API 路径失败则如实返回 {@code null}（来源标 {@link TokenSource#UNAVAILABLE}），
+ *       由 {@link TokenSource} 四态把两者区分开。</li>
+ * </ul>
+ * ⚠️ minify 名（{@code eZn} / {@code ebt} / {@code pAn}）随 CC 构建漂动，换版本后须按语义重核。
+ *
+ * <p><b>⛔ 调用方不得再把 {@code null} 抹成 0</b>：CC 在消费侧写的是 {@code tokens||0}
+ * （analyzeContext.ts:308），那会把「算不出来」与「真 0」在 wire 上塌成同一个字节，前端无从标注。
+ * Java 端由 {@link TokenSource#of(Integer, TokenSource)} 统一把 {@code null} 记成
+ * {@link TokenSource#UNAVAILABLE} 并<b>保留 null 数值</b>（三处 collapse 点已改）。</p>
  *
  * <p><b>RES-C9 变更</b>：原 @FunctionalInterface 升级为普通接口（新增 countTokensForTools 默认方法），
  * 既有 lambda 消费方（如 SystemPromptTokenCounter 测试的 {@code content -> 5}）不受影响
@@ -38,9 +66,28 @@ public interface CountTokensClient {
      * （analyzeContext.ts:301）。
      *
      * @param content section 内容（非空；空 → 0 短路）
-     * @return token 数或 null（null → 调用方按 0 处理，analyzeContext.ts:308 {@code tokens||0}）
+     * @return token 数或 null（<b>null 必须原样向上带出</b>，语义 = 算不出来 / 不可用；
+     *         调用方不得按 0 处理，见 {@link TokenSource#of(Integer, TokenSource)}）
      */
     Integer countTokens(String content);
+
+    /**
+     * 本客户端产生数值的<b>来源类别</b>（{@link TokenSource#API} 真实端点 /
+     * {@link TokenSource#ESTIMATE} 本地估算）。
+     *
+     * <p>默认 {@link TokenSource#ESTIMATE}：未知实现一律按「估算」标注 —— 保守方向 = 宁可少标
+     * 精度、绝不虚报精度（把估算标成精确是「自信的错标」，把精确标成估算是无害的保守）。
+     * {@link AnthropicCountTokensClient} 覆写为 {@link TokenSource#API}，
+     * {@link OpenAICountTokensClient} 显式覆写为 {@link TokenSource#ESTIMATE}（自证意向）。
+     *
+     * <p>⛔ 不得由前端按 provider 类型推测（bean 构造期求值一次，切 provider 后不重建；
+     * 且 anthropic 兼容第三方恰恰是没有该端点那批）。
+     *
+     * @return 该客户端数值的来源类别
+     */
+    default TokenSource sourceKind() {
+        return TokenSource.ESTIMATE;
+    }
 
     /**
      * 工具定义 token 计数 · CC original: countTokensWithFallback([], toolSchemas)
@@ -55,7 +102,8 @@ public interface CountTokensClient {
      * 按 {@code Math.max(0, raw - 500)} 扣减（analyzeContext.ts:479/:638-641），本方法返回原始值。
      *
      * @param tools 工具 schema 列表（CC toolToAPISchema 产物；空 → 0）
-     * @return token 数（含 overhead；null → 调用方按 0）或 0（默认实现，无 tools 通道）
+     * @return token 数（含 overhead）或 0（默认实现，无 tools 通道）；<b>null = 算不出来</b>，
+     *         调用方必须原样带出为不可用（不得扣成 {@code Math.max(0, 0-500)=0} 的假 0）
      */
     default Integer countTokensForTools(List<ToolSchema> tools) {
         return 0;

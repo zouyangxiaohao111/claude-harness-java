@@ -661,10 +661,15 @@ public class CommandRegistrationConfig28 {
             }
             try {
                 ContextAnalyzeService.ContextAnalyzeResult result = contextAnalyzeService.analyze(null, null);
+                // [四态标注] categories 的 tokens 变为可空（null = 算不出来）→ 求和时跳过不可用段，
+                //   并把「有几段算不出来」一并打出（原先 mapToInt 直接拆箱会在 null 上 NPE）。
                 int total = result.categories().stream()
+                    .filter(c -> c.tokens() != null)
                     .mapToInt(ContextAnalyzeService.ContextCategory::tokens).sum();
-                log.info("[CommandRegistrationConfig28] /context 执行完成: {} 个分类段，合计 {} tokens（对齐 CC context.tsx ContextVisualization）",
-                    result.categories().size(), total);
+                long unavailable = result.categories().stream()
+                    .filter(c -> c.tokens() == null).count();
+                log.info("[CommandRegistrationConfig28] /context 执行完成: {} 个分类段，合计 {} tokens（其中 {} 段不可用）（对齐 CC context.tsx ContextVisualization）",
+                    result.categories().size(), total, unavailable);
             } catch (Exception e) {
                 log.warn("[CommandRegistrationConfig28] /context analyze 失败: {}", e.getMessage());
             }

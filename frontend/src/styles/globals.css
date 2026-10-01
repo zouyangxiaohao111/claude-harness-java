@@ -8157,7 +8157,26 @@ html {
 .ca-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ca-path { font-family: var(--font-mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ca-path em { font-style: normal; color: #999; font-size: 10.5px; margin-left: 6px; }
-.ca-tokens { color: #999; font-family: var(--font-mono); font-size: 11.5px; flex-shrink: 0; }
+.ca-tokens { color: #999; font-family: var(--font-mono); font-size: 11.5px; flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; }
+/* 数值旁的来源角标 · 形态与既有 .snipped-badge 一致（同款圆角小角标，⛔ 不另起视觉范式）。
+   色值取本弹窗的浅色面板口径（.ca-* 全块均为硬编码浅色，不随 data-theme 走）。 */
+.ca-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  line-height: 1.4;
+  border: 1px solid #EEEEEE;
+  background: #F5F0E8;
+  color: #C99417;
+}
+/* 算不出来：数值位的「—」+「不可用」角标（中性灰，弱于「估算」——估算仍有数字，不可用没有） */
+.ca-na { color: #BBB; }
+.ca-badge-na { color: #999; }
+/* 顶部说明（三类图例）· 紧贴合计行下方 */
+.ca-legend { font-size: 11px; color: #999; line-height: 1.6; margin: -6px 0 12px; }
 
 /* ================================================================ */
 /*  F1 用量与花费弹窗（UsageCostModal · .uc-* 对齐 ContextAnalyze .ca-*） */

@@ -75,6 +75,18 @@ public class AnthropicCountTokensClient implements CountTokensClient {
         this.modelSupplier = modelSupplier;
     }
 
+    /**
+     * 来源类别 = {@link TokenSource#API}（服务端真实计数）· 「上下文分析」面板 (a1) 态。
+     *
+     * <p>⚠️ 只声明来源，不改网络实现：失败时仍返回 {@code null}（由调用方带出为
+     * {@link TokenSource#UNAVAILABLE}）。第三方 anthropic 兼容商没有该端点时，
+     * 这里标的是「本该由服务端精确计数」，实际结果 null → 面板显示「— 不可用」。
+     */
+    @Override
+    public TokenSource sourceKind() {
+        return TokenSource.API;
+    }
+
     @Override
     public Integer countTokens(String content) {
         // 空内容短路 → 0（tokenEstimation.ts:127-130）

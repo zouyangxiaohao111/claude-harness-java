@@ -3,6 +3,7 @@ package com.nexusai.application.agent.prompt;
 import com.nexusai.application.agent.prompt.SystemPromptTokenCounter.SystemPromptSectionDetail;
 import com.nexusai.application.agent.prompt.SystemPromptTokenCounter.SystemTokenCounts;
 import com.nexusai.infra.llm.CountTokensClient;
+import com.nexusai.infra.llm.TokenSource;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -28,8 +29,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>逐 section API 计数</b>（analyzeContext.ts:299-303 + tokenEstimation.ts:124-201）——
  *       计数委托真实 countTokens API，不再是本地 rough（round(len/4)）。若退化回 rough 主路径
  *       （忽略计数器 / 用内容长度估算），本测试变红。</li>
- *   <li><b>失败→0 语义</b>（analyzeContext.ts:308 {@code tokens||0}）——某 section API 失败/null
- *       必须记 0，不得让 null 击穿破坏总 token 恒等式。</li>
+ *   <li><b>[四态标注 · 偏离 CC] 失败→不可用</b>（本仓不采用 analyzeContext.ts:308 {@code tokens||0}）——
+ *       某 section 计数失败/null 必须<b>原样保留 null</b> 并标 {@link TokenSource#UNAVAILABLE}，
+ *       ⛔ 不得抹成 0（抹成 0 会让「算不出来」与「真 0」在 wire 上字节相同，前端只能显示一个骗人的 0）；
+ *       任一分节不可用 ⇒ 合计也为 null（部分求和会低估却看似精确）。</li>
  *   <li><b>空数组/全 boundary 短路</b> 必须返回 {@code {0, []}} 而非报错，且不得调用计数器
  *       （analyzeContext.ts:295-297）。</li>
  * </ol>
@@ -100,28 +103,71 @@ class SystemPromptTokenCounterTest {
     }
 
     @Test
-    @DisplayName("逐 section 委托计数器（API 计数），null→0（analyzeContext.ts:299-317 + :308 tokens||0）")
-    void perSection_delegatesToCounter_nullBecomesZero() {
-        // 计数器按顺序返回 [100, null, 50]（第二个 section API 失败 → null → 0）
+    @DisplayName("[四态] null 不抹成 0：失败分节 tokens=null + tokenSource=unavailable，合计亦为 null")
+    void perSection_nullKeptAsUnavailable_notCollapsedToZero() {
+        // 计数器按顺序返回 [100, null, 50]（第二个 section API 失败 → 算不出来）
         AtomicInteger idx = new AtomicInteger();
-        CountTokensClient counter = content -> switch (idx.getAndIncrement()) {
-            case 0 -> 100;
-            case 1 -> null;   // API 失败 → tokens=0（analyzeContext.ts:308）
-            default -> 50;
+        CountTokensClient counter = new CountTokensClient() {
+            @Override
+            public Integer countTokens(String content) {
+                return switch (idx.getAndIncrement()) {
+                    case 0 -> 100;
+                    case 1 -> null;   // API 失败 → 算不出来（不可用）
+                    default -> 50;
+                };
+            }
+
+            @Override
+            public TokenSource sourceKind() {
+                return TokenSource.API;
+            }
         };
         SystemTokenCounts result = SystemPromptTokenCounter.count(
             List.of("# A", "# B", "# C"), Map.of(), counter);
 
         assertThat(result.systemPromptSections()).extracting(SystemPromptSectionDetail::tokens)
-            .as("section token = 计数器返回值 || 0")
-            .containsExactly(100, 0, 50);
+            .as("算不出来的分节必须是 null，⛔ 不是 0（CC analyzeContext.ts:308 tokens||0 会抹成 0 ⇒ 本次要修的根）")
+            .containsExactly(100, null, 50);
+        assertThat(result.systemPromptSections()).extracting(SystemPromptSectionDetail::tokenSource)
+            .as("每一行都要能自证来源：(a1) api / (b) unavailable / (a1) api")
+            .containsExactly(TokenSource.API, TokenSource.UNAVAILABLE, TokenSource.API);
         assertThat(result.systemPromptTokens())
-            .as("总 token = Σ section token（失败 section 计 0）")
-            .isEqualTo(150);
-        // 展示恒等式：总 token = Σ section token
-        assertThat(result.systemPromptSections().stream()
-            .mapToInt(SystemPromptSectionDetail::tokens).sum())
-            .isEqualTo(result.systemPromptTokens());
+            .as("任一分节算不出来 ⇒ 合计也是 null（部分求和会低估却看起来同样精确）")
+            .isNull();
+        assertThat(result.systemPromptTokensSource()).isEqualTo(TokenSource.UNAVAILABLE);
+    }
+
+    @Test
+    @DisplayName("[四态] 全部分节成功 → tokenSource=api（服务端真实计数，(a1) 态面板不加角标）")
+    void allSectionsSucceeded_carryApiSource() {
+        CountTokensClient apiCounter = new CountTokensClient() {
+            @Override
+            public Integer countTokens(String content) {
+                return 5;
+            }
+
+            @Override
+            public TokenSource sourceKind() {
+                return TokenSource.API;
+            }
+        };
+        SystemTokenCounts result = SystemPromptTokenCounter.count(List.of("# A", "# B"), Map.of(), apiCounter);
+
+        assertThat(result.systemPromptTokens()).isEqualTo(10);
+        assertThat(result.systemPromptTokensSource()).isEqualTo(TokenSource.API);
+        assertThat(result.systemPromptSections()).extracting(SystemPromptSectionDetail::tokenSource)
+            .containsOnly(TokenSource.API);
+    }
+
+    @Test
+    @DisplayName("[四态] 本地估算客户端 → tokenSource=estimate（(a2) 态面板标「估算」）")
+    void estimateClient_carriesEstimateSource() {
+        SystemTokenCounts result = SystemPromptTokenCounter.count(List.of("# A"), Map.of(), FIXED_7);
+
+        assertThat(result.systemPromptTokens()).isEqualTo(7);
+        assertThat(result.systemPromptTokensSource())
+            .as("lambda/未覆写 sourceKind 的实现默认按估算标注（保守方向：绝不虚报精度）")
+            .isEqualTo(TokenSource.ESTIMATE);
     }
 
     @Test

@@ -510,20 +510,99 @@ export interface ContextAnalyzeRequest {
   customSystemPrompt?: string
   appendSystemPrompt?: string
 }
-export interface ContextSystemPromptSection { name: string; tokens: number }
-export interface ContextMemoryFile { path: string; type: string; tokens: number }
-export interface ContextAnalyzeCategory { name: string; tokens: number; color?: string | null }
-export interface ContextAnalyzeSkills { totalSkills: number; includedSkills: number; tokens: number }
+
+/**
+ * 一个 token 数值的**来源**（后端 `TokenSource` · wire 上为小写字符串）。
+ *
+ * - `api` —— 服务端真实计数：数值可直接相信，界面**不加角标**；
+ * - `estimate` —— 本地估算（tiktoken / `round(len/4)`）：数值旁标「估算」；
+ * - `unavailable` —— **算不出来**：数值为 `null`，界面显示「—」+「不可用」（⛔ 不显示 0）。
+ *
+ * ⚠️ 「算不出来」（`tokens === null`）与「真的是 0」（`tokens === 0`）是两回事：
+ * 前者是「这项数字没能统计出来」（成因不一定在提供商侧 —— 也可能是本地估算出错或本地读不到技能清单，
+ * 具体成因由 `unavailableCause` 下发），后者是「确实没有内容」——后端保证两者在 wire 上可区分。
+ *
+ * ⚠️ 来源由后端**实际装配的计数客户端**决定，⛔ 不要在前端按 `Provider.type` 猜：
+ * 计数客户端 bean 在构造期求值一次，用户切提供商后不会重建；且 `type: anthropic` 的
+ * 第三方兼容商恰恰就是「没有这个计数接口」的那批。
+ */
+export type ContextTokenSource = 'api' | 'estimate' | 'unavailable'
+
+/**
+ * 分类行「不可用」（`tokens === null`）的**成因**（后端 `UnavailableCause` · wire 为小写字符串）。
+ *
+ * ⚠️ `tokenSource === 'unavailable'` 只说明「算不出来」，**说不清是哪一侧的原因**；面板的悬停提示
+ * 必须按成因选，否则会把用户指向一个结构上不可能的原因。⇒ 成因由后端下发，⛔ 不要在界面上按
+ * `categories[].name` 反推（名字是显示文案，后端本地化过、日后可能再改）。
+ *
+ * - `provider` —— 提供商侧：服务端计数接口缺失 / 调用失败（**只有实际走服务端计数的行**才可能这样，
+ *   即产生该行数值的是 anthropic 计数客户端时）；
+ * - `local` —— 本地：**技能清单读不到**（技能 frontmatter 恒为本地粗估，全程不经提供商）；
+ * - `localEstimate` —— 本地：**本地估算这一步出错**（非 anthropic 提供商的系统提示词 / MCP 工具 /
+ *   记忆文件三行走本地估算，失败时数值为 `null`，与提供商无关）；
+ * - `derived` —— 该行是**扣减/合成**值（内置工具 − 技能），成因不在单侧，故面板不归因。
+ *
+ * ⚠️ `local` 与 `localEstimate` 是**两件事**（前者=技能清单/文件读不到，后者=本地估算器自己出错）——
+ * 面板⛔不得共用同一句文案，也不要拿 `local` 去覆盖 `localEstimate`。
+ */
+export type ContextCategoryUnavailableCause = 'provider' | 'local' | 'localEstimate' | 'derived'
+/** 分节明细 · `tokens === null` = 该分节算不出来（配合 `tokenSource === 'unavailable'`） */
+export interface ContextSystemPromptSection { name: string; tokens: number | null; tokenSource: ContextTokenSource }
+/** 记忆文件明细 · `tokens === null` = 该文件算不出来 */
+export interface ContextMemoryFile { path: string; type: string; tokens: number | null; tokenSource: ContextTokenSource }
+/**
+ * 展示分类 · `tokens === null` = 该分类算不出来（此时该分类仍会返回，界面才有处渲染「—」）。
+ *
+ * ⚠️ `name` 是**显示名**（可供改名/本地化），⛔ 界面逻辑不得按它分支；要区分行的语义请用
+ * `unavailableCause` 这类机器字段。
+ */
+export interface ContextAnalyzeCategory {
+  name: string
+  tokens: number | null
+  color?: string | null
+  tokenSource: ContextTokenSource
+  /** 该行不可用的成因（仅有 `tokens === null` 时有值；数值正常的行为 `null`/省略）· 面板据此选提示文案 */
+  unavailableCause?: ContextCategoryUnavailableCause | null
+}
+/**
+ * 技能统计。
+ * ⚠️ `tokensSource` 是 **token 数值的来源**（正常恒为 `'estimate'`：技能 frontmatter 一律按
+ * `round(len/4)` 本地粗估，与提供商无关；技能清单加载失败时为 `'unavailable'`）；它**不是**
+ * 技能来源 —— 技能来源是 `skillFrontmatter[].source`（userSettings/plugin）。两者不可混为一谈。
+ *
+ * ⚠️ `totalSkills` / `includedSkills` 可为 `null` = **技能数未知**（清单加载失败，连有几个技能都不
+ * 知道）。⛔ 不要把它当 0 渲染「技能数 0 / 0」——那会和同一行的「— 不可用」自相矛盾
+ * （0 说「确实没有」，角标说「不知道」）。
+ */
+export interface ContextAnalyzeSkills {
+  totalSkills: number | null
+  includedSkills: number | null
+  tokens: number | null
+  tokensSource: ContextTokenSource
+}
 export interface ContextAnalyzeResponse {
-  systemPromptTokens: number
+  /** 系统提示词总 token · `null` = 算不出来（界面显示「—」） */
+  systemPromptTokens: number | null
+  systemPromptTokensSource: ContextTokenSource
   systemPromptSections: ContextSystemPromptSection[]
-  claudeMdTokens: number
+  /** CLAUDE.md / 记忆文件段总 token · `null` = 算不出来 */
+  claudeMdTokens: number | null
+  claudeMdTokensSource: ContextTokenSource
   memoryFiles: ContextMemoryFile[]
-  builtInToolTokens: number
-  mcpToolTokens: number
-  /** 技能统计（totalSkills/includedSkills/tokens）· 可选 */
+  /** 内置工具 schema 计数 · `null` = 算不出来 */
+  builtInToolTokens: number | null
+  builtInToolTokensSource: ContextTokenSource
+  /** MCP 工具 schema 计数 · `null` = 算不出来 */
+  mcpToolTokens: number | null
+  mcpToolTokensSource: ContextTokenSource
+  /** 技能统计 · 可选（**确实没有技能**时后端省略该键；算不出来时仍会返回） */
   skills?: ContextAnalyzeSkills | null
-  /** 展示分类（name/tokens/color · builtInToolTokens 扣减值承载）· 可选 */
+  /**
+   * 展示分类（name/tokens/color · builtInToolTokens 扣减值承载）· 可选。
+   * ⚠️ `name` 是**中文**类别名（「系统提示词」「内置工具（不含技能）」「MCP 工具」「记忆文件」「技能」）——
+   * 后端已本地化（有意偏离上游英文名），前端⛔不要再按名字（英文或中文）匹配：名字是显示文案，
+   * 会随改名/本地化变动；要按行分支请用 `unavailableCause` 这类机器字段。
+   */
   categories?: ContextAnalyzeCategory[] | null
 }
 
