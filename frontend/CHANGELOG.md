@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.24] - 2026-10-08
+
+### 修复
+- 修复对话操作弹窗候选消息不完整的bug。
+
 ## [0.1.23] - 2026-10-01
 
 ### 修复

@@ -5,6 +5,7 @@ import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.MessageCreatedResponse;
 import com.nexusai.model.session.dto.PartialCompactRequest;
 import com.nexusai.model.session.dto.PartialCompactResponse;
+import com.nexusai.model.session.dto.PivotCandidateDto;
 import com.nexusai.model.session.dto.QueuePopRequest;
 import com.nexusai.model.session.dto.QueuePopResponse;
 import com.nexusai.model.session.dto.SendMessageRequest;
@@ -91,6 +92,21 @@ public class ChatController {
 
     /** [window-paging] /messages/page 响应体 · total = 会话消息总数（DB sessions.messageCount 非 meta 口径）。 */
     public record PageResp(List<ChatMessageDto> messages, boolean hasMore, int total) {}
+
+    /**
+     * [dialog-ops-pivot] 对话操作弹窗（压缩/裁剪）候选 · GET /sessions/{sessionId}/messages/pivot-candidates。
+     *
+     * <p>候选 =「当前上下文可见的用户消息」（最后一条 compact_boundary 之后 + preservedSegment 重挂
+     * + snip 剔除，判定与模型所见同源）；轻量出站（id/createdAt/previewSource/removedAfter），
+     * 不读全量 46 列行、不查 tool_calls；计数只额外读 (seq,is_meta) 两个小列。打开即快照，不分页。
+     *
+     * <p>⛔ 不过 {@code TeammateMessageFoldingChain}：折叠判据只命中
+     * author=attachment/subtype=task_status/in_process_teammate/completed 的行（非 user），对候选无操作。
+     */
+    @GetMapping("/messages/pivot-candidates")
+    public List<PivotCandidateDto> pivotCandidates(@PathVariable String sessionId) {
+        return messageService.listPivotCandidates(sessionId);
+    }
 
     /**
      * [trace-count] 会话消息总数（轻量轮询）· GET /sessions/{sessionId}/messages/count。

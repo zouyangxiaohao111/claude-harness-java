@@ -1,9 +1,12 @@
 import { useEffect, useState } from 'react'
-import type { ChatMessageDto } from '@/api/types'
+import type { PivotCandidateDto } from '@/api/types'
 import { PREVIEW_SOURCE_CHARACTERS, projectPreview } from '@/markdown/plainPreview'
 
 interface Props {
-  messages: ChatMessageDto[]
+  candidates: PivotCandidateDto[]
+  loading: boolean
+  error: string | null
+  onRetry: () => void
   /** 初始 tab：双击 Esc → compact；用户可切换到 trim */
   initialTab?: 'compact' | 'trim'
   onCompact: (messageId: string, direction: 'from' | 'up_to') => void
@@ -11,25 +14,9 @@ interface Props {
   onClose: () => void
 }
 
-/** 参与 pivot 选择的消息：仅用户消息（对齐回合边界语义，2026-08-24）+ 非元消息（isMeta 续写提示不展示）
+/** 列表项单行预览（markdown→纯文本投影 + 折叠空白 + 截 60 字）。
  *
- *  <p>WHY 排除 compact 摘要与 transcript-only：这两类是压缩产物的展示载体、不是真实回合边界 ——
- *  CC 对同一用途的「可选消息」列表显式排除二者（{@code MessageSelector.tsx:796-801}：
- *  {@code if (message.isCompactSummary || message.isVisibleInTranscriptOnly) return false}，
- *  判据来源 {@code services/compact/compact.ts:648 / 1068} 打标处）。选中它们做 from/up_to 切片
- *  会切出无意义的边界（pivot 落在摘要消息上时，「摘要之前/之后的对话」语义不成立）。 */
-function pivotList(messages: ChatMessageDto[]): ChatMessageDto[] {
-  return messages.filter(
-    (m) =>
-      !m.isMeta &&
-      m.role === 'user' &&
-      m.isCompactSummary !== true &&
-      m.isVisibleInTranscriptOnly !== true,
-  )
-}
-
-/** 列表项单行预览（markdown→纯文本投影 + 折叠空白 + 截 60 字）
- *
+ *  <p>previewSource 是服务端已截到 2048 字符（与 {@link PREVIEW_SOURCE_CHARACTERS} 同值）的正文前缀。
  *  <p>投影走 {@link projectPreview}：**先按字符截断源文、再投影**（顺序不可换，已由
  *  markdown/__tests__/plainPreview.test.ts 钉住 —— 反过来等于对全文 parse）。
  *  窗口大小用 {@link PREVIEW_SOURCE_CHARACTERS}（与 harness 同值的单点约定，见 plainPreview.ts）。
@@ -53,8 +40,8 @@ function pivotList(messages: ChatMessageDto[]): ChatMessageDto[] {
  *  <br>本仓两处都选择偏离：**剥 markdown** + **折空白（保留全部文字）**。理由：用户粘贴代码块 /
  *  标题时，不剥的预览在单行列表里可读性显著变差（{@code **}/{@code #}/围栏占掉本就紧张的 60 字
  *  窗口）；而本仓列表项是单行 HTML（CSS nowrap + ellipsis），折空白比 CC 的「丢后续行」信息更多。 */
-function listPreview(m: ChatMessageDto): string {
-  const text = projectPreview(m.content ?? '', PREVIEW_SOURCE_CHARACTERS).replace(/\s+/g, ' ').trim()
+function listPreview(c: PivotCandidateDto): string {
+  const text = projectPreview(c.previewSource ?? '', PREVIEW_SOURCE_CHARACTERS).replace(/\s+/g, ' ').trim()
   return text.slice(0, 60) || '(空消息)'
 }
 
@@ -65,13 +52,15 @@ function listPreview(m: ChatMessageDto): string {
  * 键盘：Esc 关闭 / Enter 确认当前 tab（capture 阶段拦截，对齐 TrimConfirmModal 的 keydown 处理）。
  */
 export function DialogOpsModal({
-  messages,
+  candidates,
+  loading,
+  error,
+  onRetry,
   initialTab = 'compact',
   onCompact,
   onTrim,
   onClose,
 }: Props) {
-  const list = pivotList(messages)
   const [tab, setTab] = useState<'compact' | 'trim'>(initialTab)
   const [compactSel, setCompactSel] = useState<string | null>(null)
   const [direction, setDirection] = useState<'from' | 'up_to'>('from')
@@ -85,6 +74,8 @@ export function DialogOpsModal({
         e.stopPropagation()
         onClose()
       } else if (e.key === 'Enter') {
+        // 重试按钮的 Enter 激活是浏览器默认动作：capture 拦截会把它一并取消 → 放行
+        if ((e.target as HTMLElement | null)?.closest?.('.dops-retry')) return
         e.preventDefault()
         e.stopPropagation()
         if (tab === 'compact') {
@@ -98,11 +89,9 @@ export function DialogOpsModal({
     return () => window.removeEventListener('keydown', onKey, true)
   }, [onClose, tab, compactSel, direction, trimSel, onCompact, onTrim])
 
-  // 裁剪影响预览：pivot 之后（不含 pivot）的非元消息
-  const trimIdx = trimSel ? list.findIndex((m) => m.id === trimSel) : -1
-  const trimDeleted = trimIdx >= 0 ? list.slice(trimIdx + 1) : []
-  const trimCount = trimDeleted.length
-  const trimFirst = trimDeleted[0] ?? null
+  // 裁剪影响预览：口径 = 该消息及之后将被删除的非 meta 行数（含自身；后端 removedAfter）
+  const trimSelItem = trimSel ? candidates.find((c) => c.id === trimSel) ?? null : null
+  const trimCount = trimSelItem?.removedAfter ?? 0
 
   return (
     <div className="dops-backdrop" onClick={onClose}>
@@ -120,18 +109,42 @@ export function DialogOpsModal({
           </button>
         </div>
         <div className="dops-body">
-          {tab === 'compact' ? (
+          {loading ? (
+            <>
+              <div className="dops-status">正在加载消息列表…</div>
+              <div className="ms-actions">
+                <button className="ms-cancel" onClick={onClose}>取消 <kbd>Esc</kbd></button>
+              </div>
+            </>
+          ) : error ? (
+            <>
+              <div className="dops-status dops-error">
+                <span>加载失败：{error}</span>
+                <button className="dops-retry" onClick={onRetry}>重试</button>
+              </div>
+              <div className="ms-actions">
+                <button className="ms-cancel" onClick={onClose}>取消 <kbd>Esc</kbd></button>
+              </div>
+            </>
+          ) : candidates.length === 0 ? (
+            <>
+              <div className="dops-status">暂无可选消息</div>
+              <div className="ms-actions">
+                <button className="ms-cancel" onClick={onClose}>取消 <kbd>Esc</kbd></button>
+              </div>
+            </>
+          ) : tab === 'compact' ? (
             <>
               <div className="ms-head">选择压缩切点</div>
               <div className="ms-list">
-                {list.map((m) => (
+                {candidates.map((c) => (
                   <div
-                    key={m.id}
-                    className={compactSel === m.id ? 'ms-item active' : 'ms-item'}
-                    onClick={() => setCompactSel(m.id)}
+                    key={c.id}
+                    className={compactSel === c.id ? 'ms-item active' : 'ms-item'}
+                    onClick={() => setCompactSel(c.id)}
                   >
-                    <span className="ms-role">{m.role === 'user' ? '你' : 'nexus'}</span>
-                    <span className="ms-text">{listPreview(m)}</span>
+                    <span className="ms-role">你</span>
+                    <span className="ms-text">{listPreview(c)}</span>
                   </div>
                 ))}
               </div>
@@ -172,43 +185,38 @@ export function DialogOpsModal({
                 <span>恢复到此前的对话与代码状态？</span>
               </div>
               <div className="trim-hint">
-                选择一条消息作为恢复点，其后的全部对话记录将被永久删除，模型上下文将回退到此条消息。
+                选择一条消息作为恢复点，此消息及其之后的全部对话记录将被永久删除，模型上下文将回退到此消息之前。
               </div>
               <div className="trim-list">
-                {list.map((m) => (
+                {candidates.map((c) => (
                   <div
-                    key={m.id}
-                    className={trimSel === m.id ? 'trim-item active' : 'trim-item'}
-                    onClick={() => setTrimSel(m.id)}
+                    key={c.id}
+                    className={trimSel === c.id ? 'trim-item active' : 'trim-item'}
+                    onClick={() => setTrimSel(c.id)}
                   >
-                    <span className="trim-role">{m.role === 'user' ? '你' : 'nexus'}</span>
-                    <span className="trim-text">{listPreview(m)}</span>
+                    <span className="trim-role">你</span>
+                    <span className="trim-text">{listPreview(c)}</span>
                   </div>
                 ))}
               </div>
-              {trimSel && (
-                <>
-                  <div className="trim-effects">
-                    <div className="trim-effect">此消息后的所有对话记录将被永久删除</div>
-                    <div className="trim-effect">模型上下文回退到此点</div>
-                    <div className="trim-effect warn">此操作无法撤销</div>
-                  </div>
-                  <div className="trim-preview">
-                    <div className="trim-preview-title">影响预览 · 将删除此后 {trimCount} 条消息</div>
-                    {trimFirst ? (
-                      <>
-                        <div className="trim-preview-row">
-                          <span className="trim-role">{trimFirst.role === 'user' ? '你' : 'nexus'}</span>
-                          <span className="trim-text">{listPreview(trimFirst)}</span>
-                        </div>
-                        {trimCount > 1 && <div className="trim-preview-more">… 以及其后 {trimCount - 1} 条</div>}
-                      </>
-                    ) : (
-                      <div className="trim-preview-more">此消息后无更多消息，将仅保留到当前为止</div>
-                    )}
-                  </div>
-                </>
-              )}
+              {trimSel &&
+                (trimSelItem ? (
+                  <>
+                    <div className="trim-effects">
+                      <div className="trim-effect">此消息及之后的对话记录将被永久删除</div>
+                      <div className="trim-effect">模型上下文回退到此消息之前</div>
+                      <div className="trim-effect warn">此操作无法撤销</div>
+                    </div>
+                    <div className="trim-preview">
+                      <div className="trim-preview-title">影响预览 · 将删除 {trimCount} 条消息</div>
+                      <div className="trim-preview-row">
+                        <span className="trim-role">你</span>
+                        <span className="trim-text">{listPreview(trimSelItem)}</span>
+                      </div>
+                      {trimCount > 1 && <div className="trim-preview-more">… 及其之后的对话共 {trimCount} 条</div>}
+                    </div>
+                  </>
+                ) : null)}
               <div className="trim-actions">
                 <button className="trim-cancel" onClick={onClose}>取消 <kbd>Esc</kbd></button>
                 <button
@@ -301,6 +309,27 @@ export function DialogOpsModal({
           overflow-y: auto;
           min-height: 0;
         }
+        .dops-status {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 24px 8px;
+          font-size: 13px;
+          color: var(--ink-muted);
+          justify-content: center;
+        }
+        .dops-status.dops-error { color: var(--error); }
+        .dops-retry {
+          border: 1px solid var(--hairline-strong);
+          background: transparent;
+          color: var(--ink-muted);
+          padding: 4px 12px;
+          border-radius: 8px;
+          font-size: 12.5px;
+          font-weight: 600;
+          cursor: pointer;
+        }
+        .dops-retry:hover { border-color: var(--ink-muted); color: var(--ink); }
 
         /* ---- 压缩 tab（ms-*）· 对齐 MessageSelector 交互 ---- */
         .ms-head { font-size: 13px; font-weight: 700; color: var(--ink); margin-bottom: 8px; }

@@ -6,6 +6,7 @@ import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo;
 import com.nexusai.model.session.dto.FinishReason;
+import com.nexusai.model.session.dto.PivotCandidateDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
 import com.nexusai.model.session.dto.MessageCreatedResponse;
@@ -27,6 +28,8 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -757,6 +760,211 @@ public class MessageService {
     /** [window-paging] 分页响应 · {messages(seq ASC), hasMore, total}。total = 会话消息总数
      *  （sessions.messageCount · 非 meta 口径）——前端轨迹 tab 徽标全量用，避免拿「已加载页」条数当全量。 */
     public record PageResult(List<ChatMessageDto> messages, boolean hasMore, int total) {}
+
+    /** [dialog-ops-pivot] 预览源文窗口（字符）：与前端 plainPreview.ts PREVIEW_SOURCE_CHARACTERS 同值单点约定。 */
+    private static final int PREVIEW_SOURCE_CHARACTERS = 2048;
+
+    /**
+     * [dialog-ops-pivot] 对话操作弹窗（压缩/裁剪）候选 = 当前上下文可见的用户消息。
+     *
+     * <p>判定复用 {@link BoundaryReader#getMessagesAfterCompactBoundary(java.util.List)}（模型视角同源：
+     * 最后一条 compact_boundary 之后 + preservedSegment 重挂 + snip 剔除），再过滤
+     * role=user 且非 meta / 非摘要 / 非 transcript-only。
+     *
+     * <p><b>精准轻读</b>（不读全量 46 列行、<b>不查 tool_calls</b>——后者是全量 toDto 的 N+1 慢点；
+     * 计数只额外读 {@code (seq, is_meta)} 两个小列）：主读 = user 行 + compact/snip 边界行（最小列集）；
+     * 补读 = 最后 boundary 的 preservedSegment 头尾 2 行（仅当有 id 不在主读结果时）；
+     * 计数 = 一次读全表 (seq,is_meta) 小列 → 后缀非 meta 计数。共 ≤3 条 SQL、零 N+1。
+     *
+     * @param sessionId 会话 id（为空/不存在 → NotFoundException，对齐 listPageBySession）
+     * @return 候选（会话顺序）
+     */
+    public List<PivotCandidateDto> listPivotCandidates(String sessionId) {
+        // [fail loud] 对齐 listPageBySession：sessionId 空或会话不存在显式失败（拒绝跨会话/静默空列表）
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new NotFoundException("Session " + sessionId + " not found（sessionId 为空：拒绝跨会话候选查询）");
+        }
+        SessionRecord session = sessionMapper.selectOneById(sessionId);
+        if (session == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        long t0 = System.currentTimeMillis();
+
+        // 1) 主读：user 行 + 全部 compact/snip 边界行（最小列集；content 全读、Java 侧截预览窗口）
+        QueryWrapper qw = QueryWrapper.create()
+            .select("id", "seq", "role", "subtype", "compact_metadata", "snip_metadata",
+                    "is_meta", "is_compact_summary", "is_visible_in_transcript_only", "created_at", "content")
+            .where("session_id = ? AND (role = 'user' OR subtype IN ('compact_boundary','snip_boundary'))",
+                sessionId)
+            .orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER);
+        List<MessageRecord> rows = new ArrayList<>(messageMapper.selectListByQuery(qw));
+        warnNullSeqIfAny(sessionId, "listPivotCandidates", rows);
+
+        // 2) 补读：最后 compact_boundary 的 preservedSegment 头尾行（供重挂定位/取段；多数会话不执行）
+        Set<String> present = new HashSet<>();
+        for (MessageRecord r : rows) {
+            present.add(r.getId());
+        }
+        MessageRecord lastBoundary = null;
+        for (int i = rows.size() - 1; i >= 0; i--) {
+            if ("compact_boundary".equals(rows.get(i).getSubtype())) {
+                lastBoundary = rows.get(i);
+                break;
+            }
+        }
+        if (lastBoundary != null) {
+            Map<String, Object> meta = parseMap(lastBoundary.getCompactMetadata());
+            // [F7] 键名与 BoundaryReader.java:110/113/119 同源（preservedSegment / headUuid / tailUuid）；
+            //   写侧改名必须同步，本处取值失败会静默零补读（BoundaryReader 侧有 ERROR 留痕）。
+            Object segObj = meta == null ? null : meta.get("preservedSegment");
+            if (segObj instanceof Map<?, ?> seg) {
+                List<String> need = new ArrayList<>();
+                for (String key : new String[]{"headUuid", "tailUuid"}) {
+                    Object v = seg.get(key);
+                    if (v instanceof String s && !s.isBlank() && !present.contains(s)) {
+                        need.add(s);
+                    }
+                }
+                if (!need.isEmpty()) {
+                    rows.addAll(messageMapper.selectListByQuery(QueryWrapper.create()
+                        .select("id", "seq", "role", "subtype", "compact_metadata", "snip_metadata",
+                                "is_meta", "is_compact_summary", "is_visible_in_transcript_only", "created_at", "content")
+                        .where("session_id = ?", sessionId)
+                        .in("id", need)));
+                }
+            }
+        }
+        // 按 seq 升序（NULLS LAST）——与整表 feed 同序（等价性前提之一）
+        rows.sort(Comparator.comparing(MessageRecord::getSeq, Comparator.nullsLast(Comparator.naturalOrder())));
+
+        // 3) 轻量构造（不查 tool_calls）+ id→seq 映射（计数用）
+        List<ChatMessageDto> dtos = new ArrayList<>(rows.size());
+        Map<String, Long> seqById = new HashMap<>();
+        for (MessageRecord r : rows) {
+            dtos.add(lightDtoForPivot(r));
+            if (r.getId() != null && r.getSeq() != null) {
+                seqById.put(r.getId(), r.getSeq());
+            }
+        }
+
+        // 4) 判定 + 过滤（当前上下文可见用户消息）
+        List<ChatMessageDto> modelView = BoundaryReader.getMessagesAfterCompactBoundary(dtos, false);
+        List<ChatMessageDto> visible = new ArrayList<>();
+        for (ChatMessageDto m : modelView) {
+            if (m == null || m.role() != Role.user) {
+                continue;
+            }
+            if (m.isMeta() || m.isCompactSummary() || m.isVisibleInTranscriptOnly()) {
+                continue;
+            }
+            visible.add(m);
+        }
+
+        // [F6b] 无候选 → 跳过计数查询（少一条 SQL）；日志与正常出口同款字段，避免「静默空列表」
+        if (visible.isEmpty()) {
+            log.info("对话操作候选: session={}, 行数={}, 补读行数={}, 候选数=0, 耗时={}ms（无可见用户消息，跳过计数查询）",
+                sessionId, rows.size(), rows.size() - present.size(), System.currentTimeMillis() - t0);
+            return List.of();
+        }
+
+        // 5) 计数：一次读全表 (seq,is_meta) → 后缀非 meta 计数（含自身），二分定位首个 >= pivotSeq 的位置。
+        //   [F6d] 计数与候选集为同一快照的近似（非事务读）——候选与计数之间若有并发写入，计数可能偏大/偏小。
+        List<MessageRecord> allRows = messageMapper.selectListByQuery(QueryWrapper.create()
+            .select("seq", "is_meta")
+            .where("session_id = ?", sessionId)
+            .orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER));
+        warnNullSeqIfAny(sessionId, "listPivotCandidates", allRows);
+        List<Long> seqs = new ArrayList<>(allRows.size());
+        for (MessageRecord r : allRows) {
+            seqs.add(r.getSeq());
+        }
+        int[] suffixNonMeta = new int[allRows.size() + 1];
+        for (int i = allRows.size() - 1; i >= 0; i--) {
+            // [F6e] !Boolean.TRUE.equals 与 /messages/count 的 SQL `is_meta IS NULL OR != 1` 仅当列值
+            //   ∈ {0,1,NULL} 时等价；当前写入面只产 0/1（V51 存量行 NULL 已按非 meta 计）。
+            boolean isMetaRow = Boolean.TRUE.equals(allRows.get(i).getIsMeta());
+            suffixNonMeta[i] = suffixNonMeta[i + 1] + (isMetaRow ? 0 : 1);
+        }
+
+        // 6) 组装出站（previewSource = 正文前 2048 字符——与前端 PREVIEW_SOURCE_CHARACTERS 同值）
+        List<PivotCandidateDto> out = new ArrayList<>(visible.size());
+        for (ChatMessageDto m : visible) {
+            Long seq = seqById.get(m.id());
+            if (seq == null) {
+                // [fail loud] 对齐 listPageBySession 的游标 seq 守卫：候选自身 seq 为空 = V70 位置键未落
+                //   （数据异常）。静默 0 会让前端误显示「删除 0 条」而实际裁剪杀伤面未知，必须显式失败。
+                throw new IllegalStateException(
+                    "[MessageService] listPivotCandidates: 候选消息 seq 为空（该行位置键未落 = 数据异常），"
+                        + "无法计算裁剪删除计数（静默 0 会让前端误显示「删除 0 条」）"
+                        + " sessionId=" + sessionId + " pivot.id=" + m.id());
+            }
+            int removedAfter = suffixNonMeta[firstIndexAtLeast(seqs, seq)];
+            String content = m.content() == null ? "" : m.content();
+            String preview = content.length() > PREVIEW_SOURCE_CHARACTERS
+                ? content.substring(0, PREVIEW_SOURCE_CHARACTERS) : content;
+            out.add(new PivotCandidateDto(m.id(), m.createdAt(), preview, removedAfter));
+        }
+        log.info("对话操作候选: session={}, 行数={}, 补读行数={}, 候选数={}, 耗时={}ms",
+            sessionId, rows.size(), rows.size() - present.size(), out.size(),
+            System.currentTimeMillis() - t0);
+        return out;
+    }
+
+    /** [dialog-ops-pivot] 在升序 {@code seqs}（null 恒在尾部）中找首个「{@code s == null || s >= pivot}」的下标。
+     *  二分替代线性重扫（O(log n) 每候选）；语义与原线性版完全一致：找不到（全小于 pivot）返回 {@code size()}。 */
+    private static int firstIndexAtLeast(List<Long> seqs, long pivot) {
+        int lo = 0;
+        int hi = seqs.size();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            Long s = seqs.get(mid);
+            if (s == null || s >= pivot) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return lo;
+    }
+
+    /** [dialog-ops-pivot] 轻量构造：只填判定/出站所需字段，不查 tool_calls（N+1 除外路径）。
+     *  package-private 供单测复用（等价性对照的 expected 端与实现同源，消掉构造变量）。
+     *  参数顺序依据 {@code ChatMessageDto.java:646-688} 的 32 参构造。
+     *
+     *  <p><b>硬约束</b>：BoundaryReader 的消费字段集（id / role / subtype / compactMetadata /
+     *  snipMetadata）变更时必须同步本方法，否则 pivot 路径静默偏离模型所见（子集喂 ≠ 整表喂）。 */
+    ChatMessageDto lightDtoForPivot(MessageRecord m) {
+        return new ChatMessageDto(
+            m.getId(),
+            m.getSessionId(),
+            m.getRole() != null ? Role.valueOf(m.getRole()) : null,
+            m.getAuthor(),
+            m.getContent(),
+            null,                 // reasoning
+            List.of(),            // toolCalls（轻量路径不查 tool_calls）
+            null,                 // finishReason
+            null, null,           // inputTokens/outputTokens
+            null,                 // time（相对时间文案，候选不用）
+            parseDateTime(m.getCreatedAt()),
+            null,                 // toolCallId
+            null,                 // assistantMessageId
+            null,                 // acceptFeedback
+            List.of(),            // contentBlocks
+            List.of(),            // imagePasteIds
+            null,                 // structuredOutput
+            Boolean.TRUE.equals(m.getIsMeta()),
+            false,                // isError
+            null,                 // sourceToolUseID
+            m.getSubtype(),
+            false, null, null, null,   // isApiErrorMessage/apiError/error/errorDetails
+            parseMap(m.getCompactMetadata()),
+            null,                 // microcompactMetadata
+            null,                 // logicalParentUuid
+            Boolean.TRUE.equals(m.getIsCompactSummary()),
+            Boolean.TRUE.equals(m.getIsVisibleInTranscriptOnly()),
+            null)                 // usage
+            .withSnipMetadata(parseMap(m.getSnipMetadata()));
+    }
 
     /**
      * 会话消息总数（sessions.messageCount · 非 meta 口径）· GET /sessions/{sessionId}/messages/count。

@@ -1089,6 +1089,15 @@ export interface ChatMessageDto {
    *  乐观追加带 base64（≤5MB 即时预览）/ path（local-read 大文件本地读）；F5 重拉后端出站 url（内容端点）+ contentId */
   userAttachments?: { type: string; filename: string; mediaType?: string | null; contentId?: string | null; url?: string | null; base64?: string | null; path?: string | null }[] | null
 }
+/** [dialog-ops-pivot] 对话操作弹窗候选（轻量出站：无正文全文 / 无 tool_calls）。
+ *  previewSource = 正文前 2048 字符（服务端截断，与 PREVIEW_SOURCE_CHARACTERS 同值）；
+ *  removedAfter = 该消息作为裁剪恢复点时将被删除的非 meta 行数（含自身；口径同 messages/count）。 */
+export interface PivotCandidateDto {
+  id: string
+  createdAt: string
+  previewSource: string
+  removedAfter: number
+}
 /** 附件契约（attachment-multimodal）：结构化附件。图片 base64 直传；大 PDF 先 upload 拿 contentId；
  *  local-read 模式（前后端同机）大文件传本地 path 由后端读盘，与 base64/contentId 三选一 */
 export interface AttachmentRequest {

@@ -4819,7 +4819,8 @@ public record AgentLoopContext(
         //   · sessionId：producer 的 envelope 走 attachments.ts:3201 形态（sessionId=null），而
         //     messages.session_id NOT NULL ⇒ 落库时不补即 insert 失败。
         //   · isMeta：producer 的 envelope 建的是 isMeta=false，而前端**只按 isMeta** 隐藏元消息
-        //     （front/src/App.tsx:1864 / DialogOpsModal.tsx:24）⇒ 不拨正就会多出一条
+        //     （候选侧过滤现落 MessageService.listPivotCandidates 三判据一处；2026-10-08 dialog-ops-pivot 批）
+        //     ⇒ 不拨正就会多出一条
         //     「用户消息」（内容还是给模型看的 system-reminder）。CC 侧该消息由
         //     normalizeAttachmentForAPI 以 {@code createUserMessage({isMeta:true})} 产出（messages.ts:4228-4230）。
         //   · 当前有效性：user 分支不推 STOMP ⇒ 该消息对 UI 不新增可见项（isMeta=true 前端隐藏，

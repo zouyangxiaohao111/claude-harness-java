@@ -1,5 +1,5 @@
 import { api, BASE_URL } from './rest'
-import type { ChatMessageDto, MessageCreatedResponse, PartialCompactRequest, PartialCompactResponse, QueuePopResponse, SendMessageRequest } from './types'
+import type { ChatMessageDto, MessageCreatedResponse, PartialCompactRequest, PartialCompactResponse, PivotCandidateDto, QueuePopResponse, SendMessageRequest } from './types'
 
 export const chatApi = {
   listMessages: (sessionId: string) =>
@@ -14,6 +14,10 @@ export const chatApi = {
   /** [trace-count] 会话消息总数（轻量 GET /messages/count · DB sessions.messageCount 非 meta 口径 · 轨迹徽标轮询用） */
   messageCount: (sessionId: string) =>
     api<{ total: number }>(`/sessions/${encodeURIComponent(sessionId)}/messages/count`),
+  /** [dialog-ops-pivot] 对话操作弹窗候选：当前上下文可见的用户消息（后端 BoundaryReader 模型视角
+   *  同源判定；轻量：无正文全文/tool_calls）。打开弹窗时拉取，不做分页/实时刷新。 */
+  listPivotCandidates: (sessionId: string) =>
+    api<PivotCandidateDto[]>(`/sessions/${encodeURIComponent(sessionId)}/messages/pivot-candidates`),
   send: (sessionId: string, req: SendMessageRequest) =>
     api<MessageCreatedResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: 'POST', body: req }),
   removeMessage: (sessionId: string, messageId: string) =>

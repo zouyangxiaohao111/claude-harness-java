@@ -9,7 +9,7 @@ import {
   brandTagFromName,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag, DiffFile } from '@/types'
-import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert } from '@/api/types'
+import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert, PivotCandidateDto } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
 import { sessionFilesApi } from '@/api/sessionFiles'
 import { marketApi } from '@/api/market'
@@ -228,6 +228,10 @@ function App() {
   // 合并「对话操作」弹窗（双击 Esc → 压缩 tab；消息 hover「↺ 回退到此」→ 裁剪 tab）
   const [showDialogOps, setShowDialogOps] = useState(false)
   const [dialogOpsTab, setDialogOpsTab] = useState<'compact' | 'trim'>('compact')
+  // [dialog-ops-pivot] 弹窗候选（当前上下文可见用户消息 · 轻量端点；打开时拉取）
+  const [dialogOpsCandidates, setDialogOpsCandidates] = useState<PivotCandidateDto[]>([])
+  const [dialogOpsLoading, setDialogOpsLoading] = useState(false)
+  const [dialogOpsError, setDialogOpsError] = useState<string | null>(null)
   // 命令面板（/ 未命中或 ⌘K 触发）
   const [showCommandPalette, setShowCommandPalette] = useState(false)
   // FNT-SUB-02：/agents 命令 → 打开子代理面板（而非 executeBuiltin）
@@ -642,6 +646,28 @@ function App() {
     await handleStopAll()
   }, [activeSessionId, turnRunning, handleStopAll])
 
+  // [dialog-ops-pivot] 候选请求序号：仅最新一轮请求可写 state / 清 loading（覆盖「关了再开」旧响应后到、过期请求提前清 loading 两个方向）
+  const dialogOpsReqSeq = useRef(0)
+  /** [dialog-ops-pivot] 拉取候选（打开弹窗时调用；过期守卫 = 会话未切换且非过期请求：请求序号保证仅最新一轮可落
+   *  state / 清 loading，对齐 loadTraceFull 先例）。注：activeSessionIdRef 是渲染期同步 ref（声明在文件后部），
+   *  此处仅事件期读取，⛔ 不得挪入 useMemo / 渲染期求值（会 ReferenceError）。 */
+  const loadDialogOpsCandidates = useCallback(async (sid: string) => {
+    const seq = ++dialogOpsReqSeq.current
+    setDialogOpsCandidates([])
+    setDialogOpsLoading(true)
+    setDialogOpsError(null)
+    try {
+      const list = await chatApi.listPivotCandidates(sid)
+      if (seq !== dialogOpsReqSeq.current || activeSessionIdRef.current !== sid) return
+      setDialogOpsCandidates(list)
+    } catch (e) {
+      if (seq !== dialogOpsReqSeq.current || activeSessionIdRef.current !== sid) return
+      setDialogOpsError(e instanceof ApiError ? e.userMessage() : String(e))
+    } finally {
+      if (seq === dialogOpsReqSeq.current) setDialogOpsLoading(false)
+    }
+  }, [])
+
   // ---- Ctrl+B：当前会话前台任务全部转后台（对齐 CC task:background · 主线程可继续对话）----
   useEffect(() => {
     const onBg = (e: KeyboardEvent) => {
@@ -690,6 +716,8 @@ function App() {
         if (canOpenDialogOps) {
           setDialogOpsTab('compact')
           setShowDialogOps(true)
+          const sid = activeSessionIdRef.current
+          if (sid) void loadDialogOpsCandidates(sid)
         }
       } else {
         lastIdleEscRef.current = now
@@ -697,7 +725,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [canOpenDialogOps, showCommandPalette, turnRunning, stopStreaming, handleStopAll])
+  }, [canOpenDialogOps, showCommandPalette, turnRunning, stopStreaming, handleStopAll, loadDialogOpsCandidates])
 
   const handleConfirmCompact = useCallback(async (messageId: string, direction: 'from' | 'up_to') => {
     if (!activeSessionId) return
@@ -721,7 +749,7 @@ function App() {
       setMessages(activeSessionId, resp.messages)
       if (resp.conversationId) setConversationId(activeSessionId, resp.conversationId)
       setShowDialogOps(false)
-      showToast('已裁剪，此消息后的对话已删除', 'success')
+      showToast('已裁剪，此消息及其之后的对话已删除', 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
@@ -2152,7 +2180,13 @@ function App() {
       />
       {showDialogOps && (
         <DialogOpsModal
-          messages={storeMessages}
+          candidates={dialogOpsCandidates}
+          loading={dialogOpsLoading}
+          error={dialogOpsError}
+          onRetry={() => {
+            const sid = activeSessionIdRef.current
+            if (sid) void loadDialogOpsCandidates(sid)
+          }}
           initialTab={dialogOpsTab}
           onCompact={handleConfirmCompact}
           onTrim={handleTrimAfter}
