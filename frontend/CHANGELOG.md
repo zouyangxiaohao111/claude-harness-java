@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.26] - 2026-10-09
+
+### 修复
+- 修复对话气泡样式和输入框宽度显示的bug。
+
 ## [0.1.25] - 2026-10-09
 
 ### 修复

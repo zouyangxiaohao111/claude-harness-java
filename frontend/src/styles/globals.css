@@ -1206,18 +1206,9 @@ html {
 .msg.assistant .body { max-width: 85%; background: transparent; font-size: var(--fs-body, 15px); line-height: 1.7; color: #333; }
 .msg .content { font-size: 15px; line-height: 1.7; color: #333; }
 .msg .content p { color: #333; }
-.msg.user .user-bubble {
-  max-width: 70%;
-  background: var(--surface-1);
-  border: 1px solid var(--hairline);
-  padding: 14px 20px;
-  border-radius: 20px 20px 4px 20px;
-  font-size: 15px;
-  line-height: 1.7;
-  color: var(--ink);
-  box-shadow: 0 2px 10px rgba(20, 20, 19, 0.06), 0 1px 3px rgba(20, 20, 19, 0.04), 0 0 0 1px var(--glass-hairline);
-  margin-right: 0;
-}
+/* [2026-10-09] 旧 .user-bubble 视觉块已删除：该块被文末「User Bubble」块（约 :2230）全量覆盖成
+   浅蓝底 / 580px 固定宽的形态，两处定义长期分裂。按用户裁定取「白底 + 柔和立体阴影 + 20px 圆角 +
+   百分比宽度 + 入场动画」（原型 v5 形态），视觉已合并回文末唯一权威块——⚠️ 今后气泡样式只改那一处。 */
 
 .msg .avatar {
   width: 30px;
@@ -2220,25 +2211,42 @@ html {
   word-break: break-all;
 }
 
-/* User Bubble */
+/* User Bubble —— 唯一权威块（2026-10-09 用户裁定：旧 :1209 块的视觉曾长期被本块覆盖，
+   现统一取「白底 + 柔和立体阴影 + 20px 圆角 + 百分比宽度」形态（原型 v5），并加轻量入场动画；
+   ⚠️ 气泡样式今后只改这一处） */
 .msg.user { justify-content: flex-end; }
 .msg.user .user-bubble {
   display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 6px 8px;
-  background: #eef6ff;
-  border: 1px solid #dcecff;
-  padding: 10px 14px;
-  border-radius: 18px 18px 4px 18px;
+  max-width: 70%;   /* 原 580px 固定宽 → 百分比（全屏自适应；「不能写死」口径） */
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  padding: 14px 20px;
+  border-radius: 20px 20px 4px 20px;
   font-size: var(--fs-body, 15px);
-  line-height: 1.55;
-  max-width: 580px;
+  line-height: 1.7;
+  color: var(--ink);
   word-break: break-word;
-  box-shadow: 0 1px 2px rgba(28,28,25,.04);
+  box-shadow: 0 2px 10px rgba(20, 20, 19, 0.06), 0 1px 3px rgba(20, 20, 19, 0.04), 0 0 0 1px var(--glass-hairline);
+  animation: bubbleIn 200ms var(--spring);
 }
-/* 气泡内文字：flex 子项可收缩折行（不强制占满 → 短文字与附件胶囊同行 · 气泡宽度随内容动态增长） */
-.msg.user .user-bubble .user-text { min-width: 0; flex: 0 1 auto; }
+@keyframes bubbleIn {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+/* 气泡内文字：flex 子项可收缩折行（不强制占满 → 短文字与附件胶囊同行 · 气泡宽度随内容动态增长）
+   + overflow-wrap: anywhere —— 长无空格串（URL/路径/堆栈）在气泡内折行，不溢出边界（2026-10-09） */
+.msg.user .user-bubble .user-text { min-width: 0; flex: 0 1 auto; overflow-wrap: anywhere; }
+/* [2026-10-09 用户报] 用户气泡 markdown 排版补偿：全局 reset `*{margin:0;padding:0}`（:104）清零了列表
+   默认缩进，助手侧有 22px 补偿（.msg .content.md ul/ol），用户侧此前缺失 ⇒ 列表 marker（outside 定位）
+   贴气泡左缘、段落无常规间距。取值与助手侧一致（22px）。 */
+.msg.user .user-bubble .user-text ul,
+.msg.user .user-bubble .user-text ol { margin: 4px 0; padding-left: 22px; }
+.msg.user .user-bubble .user-text li { margin: 2px 0; }
+.msg.user .user-bubble .user-text p { margin: 0 0 8px; }
+.msg.user .user-bubble .user-text p:last-child { margin-bottom: 0; }
 
 /* Composer */
 .composer {
@@ -2266,6 +2274,7 @@ html {
 }
 .composer-empty .composer-inner {
   width: 100%;
+  margin: 0;   /* 空态居中布局不受会话内输入框的 margin-left 影响（2026-10-09） */
 }
 .composer-empty .project-binder {
   margin-bottom: 16px;
@@ -2296,9 +2305,13 @@ html {
   margin-bottom: 16px;
 }
 
+/* [2026-10-09 用户裁定] 输入框对齐助手正文列（原 760px 固定居中 → 全屏时与消息列失衡）：
+   左缘 = 正文左缘（.composer 自带 32px 水平 padding + 头像 30 + gap 12 ⇒ 内容坐标系 42px）；
+   宽度 = 正文列宽 = 0.85 × (中心列 - 64px) = 内容坐标系的 85%，纯百分比自适应（无写死宽度）。 */
 .composer-inner {
-  max-width: 760px;
-  margin: 0 auto;
+  max-width: none;
+  margin: 0 0 0 42px;
+  width: 85%;
   display: flex;
   flex-direction: column;
   align-items: stretch;
