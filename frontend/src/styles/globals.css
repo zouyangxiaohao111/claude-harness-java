@@ -2215,6 +2215,17 @@ html {
    现统一取「白底 + 柔和立体阴影 + 20px 圆角 + 百分比宽度」形态（原型 v5），并加轻量入场动画；
    ⚠️ 气泡样式今后只改这一处） */
 .msg.user { justify-content: flex-end; }
+/* [2026-10-09 用户报「气泡没有右对齐」修复] .user-msg 此前全仓无任何样式 ⇒ 其宽度由内容决定
+   （flex item auto）：气泡宽度是绝对 580px 时，user-msg 宽≈气泡宽、气泡天然贴行右缘；
+   改为百分比 70% 后，百分比 max-width 在父级 intrinsic 宽度计算阶段被忽略 ⇒ user-msg 仍按
+   「无约束自然宽」参与定宽，而气泡（inline-flex）在其中左对齐 ⇒ 右对齐失效。
+   补：撑满行宽（给 70% 一个确定基准）+ 纵向堆叠且各子元素（气泡/图片/徽章）右对齐。 */
+.user-msg {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
 .msg.user .user-bubble {
   display: inline-flex;
   flex-wrap: wrap;

@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.27] - 2026-10-09
+
+### 修复
+- 修复消息气泡右对齐失效的bug。
+
 ## [0.1.26] - 2026-10-09
 
 ### 修复
