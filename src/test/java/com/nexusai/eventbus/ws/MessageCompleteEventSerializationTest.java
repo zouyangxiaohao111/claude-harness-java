@@ -100,4 +100,20 @@ class MessageCompleteEventSerializationTest {
         assertThat(root.get("content").asText()).isEqualTo("回复");
         assertThat(root.get("reasoning").asText()).isEqualTo("思考");
     }
+
+    @Test
+    @DisplayName("[sm-boundary-reload] compacted=true 出站：本轮发生过压缩 → 前端收尾重拉对账")
+    void serializesCompactedFlag() throws Exception {
+        // 末参 compacted=true（= AgentState.consumeTurnCompacted() 的结果，压缩落库成功那一轮）
+        MessageCompleteEvent evt = new MessageCompleteEvent("sess-1", "msg-u", "msg-a",
+            "回复", "思考", "stop", null, null, null,
+            null, 0.0, null, 0L, 0, 0L, 0L, null, true);
+        String json = mapper.writeValueAsString(evt);
+        JsonNode root = mapper.readTree(json);
+
+        assertThat(root.has("compacted")).as("compacted 字段必须出站（前端据此触发重拉）").isTrue();
+        assertThat(root.get("compacted").asBoolean())
+            .as("compacted=true = 本轮压缩已落库 → 前端 finalize 后重拉尾页（分割线对账层）")
+            .isTrue();
+    }
 }

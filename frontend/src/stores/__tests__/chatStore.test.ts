@@ -12,12 +12,14 @@ function baseMsg(id: string, sessionId: string = 'sess-1'): ChatMessageDto {
   }
 }
 
-/** 造 n 个「user + assistant」两轮条（assistant 的 userMessageId 指向其 user ⇒ 合计 n 轮）。 */
+/** 造 n 个「user + assistant」两轮条（两行 userMessageId 都指向该 user ⇒ 合计 n 轮）。
+ *  ⚠️ user 行必须带自身锚：wire 契约 = 「user 消息 userMessageId=自身 id」（ChatMessageDto javadoc /
+ *  appendMetaUser）。缺锚的 user 行在新 turnKeyOf 规则下会被归到【上一轮】（无锚 → 最近前置锚）。 */
 const turnSeqs = (n: number, sid = 'sess-1', prefix = 't'): ChatMessageDto[] =>
   Array.from({ length: n }, (_, i) => {
     const uid = `${prefix}${i}`
     return [
-      baseMsg(uid, sid),
+      { ...baseMsg(uid, sid), userMessageId: uid },
       { ...baseMsg(`${uid}-a`, sid), role: 'assistant' as const, userMessageId: uid },
     ]
   }).flat()
@@ -350,7 +352,9 @@ describe('chatStore 有界窗口（窗口 = 最近 N 个对话轮）', () => {
       ...rest,
     ]
     s.getState().setMessages('sess-1', withNoise)
-    s.getState().appendMessages('sess-1', [baseMsg('tail')])   // 60 轮 → 触发裁剪到 50 轮
+    // ⚠️ tail 必须带自身锚：无锚行（新 turnKeyOf 规则）归组到上一轮、不再「多一轮」——
+    //   本用例要的是「追加一条 = 多一轮 → 触发裁剪」，故按 wire 契约给 user 行自身锚。
+    s.getState().appendMessages('sess-1', [{ ...baseMsg('tail'), userMessageId: 'tail' }])   // 60 轮 → 触发裁剪到 50 轮
     const msgs = s.getState().messages['sess-1'] ?? []
     // 结论一：t0 整轮（连同其 tool/meta 噪声行）被挤出 —— 噪声行没被当成独立轮而留下
     expect(msgs.some((m) => m.id === 't0-tool')).toBe(false)
@@ -463,5 +467,63 @@ describe('chatStore appendMessages（本地追加也必须有界）', () => {
     expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS * 2)
     expect(msgs[0].userMessageId ?? msgs[0].id).toBe('t5')                     // 切点在轮首
     expect(msgs[msgs.length - 1].id).toBe(`t${MESSAGE_WINDOW_TURNS + 4}-a`)
+  })
+})
+
+// [sm-boundary-reload] 压缩（SM/auto）落库成功即经 stream 通道推 message.insert（整行载荷 = compact
+//   boundary 行）→ 不等 turn 收尾 / F5，分割线就该出现；同一 id 还有第二条通道（complete.compacted
+//   收尾重拉 = setMessages 整表替换）。本组守住两条不变量：①即时插行 ②两条通道按 id 收敛（不得重复行）。
+describe('[sm-boundary-reload] insertServerMessages（message.insert 即时插行）', () => {
+  /** compact boundary 行（形状对齐后端 MessageInsertEvent.messages 元素：
+   *  role=system + author=system + subtype=compact_boundary + isMeta=false · CompactBoundaryMessage.toChatMessageDto）。 */
+  const boundaryRow = (id = 'b1'): ChatMessageDto => ({
+    ...baseMsg(id), role: 'system', author: 'system', subtype: 'compact_boundary',
+    content: 'Conversation compacted', isMeta: false,
+  })
+
+  it('插入并追加到列表尾（WHY：压缩落库那一刻分割线就要显示，不等 turn 收尾 / F5）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m1'), baseMsg('m2')])
+    s.getState().insertServerMessages('sess-1', [boundaryRow()])
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(3)
+    expect(msgs[msgs.length - 1]?.id).toBe('b1')   // 插到列表尾（当前点）
+  })
+
+  it('同 id 幂等：重复到达不产生重复行（WHY：即时层 + 重放/重拉双通道双达不得出双行）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m1')])
+    s.getState().insertServerMessages('sess-1', [boundaryRow()])
+    s.getState().insertServerMessages('sess-1', [boundaryRow()])   // 同 id 再来
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs.filter((m) => m.id === 'b1')).toHaveLength(1)
+  })
+
+  it('与重拉收敛：重拉尾页已含该行时，同 id 事件到达不再插（WHY：complete.compacted 重拉先到、实时推后到）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m1'), baseMsg('m2'), boundaryRow()])  // 重拉（整表替换）已含 boundary 行
+    s.getState().insertServerMessages('sess-1', [boundaryRow()])
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(3)
+    expect(msgs.filter((m) => m.id === 'b1')).toHaveLength(1)
+  })
+
+  it('插入不额外占轮（boundary 随其所属轮）且仍按轮有界（WHY：本文件不变量「漏一条追加路径即内存无界」；新规则下 boundary 不再挤掉真实轮）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', turnSeqs(MESSAGE_WINDOW_TURNS))   // 满窗 50 轮（t0..t49）
+    s.getState().insertServerMessages('sess-1', [boundaryRow()])
+    let msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs.some((m) => m.id === 't0')).toBe(true)    // boundary 归组到 t49 轮 ⇒ 不占轮、不挤掉最老真实轮
+    expect(msgs[msgs.length - 1]?.id).toBe('b1')
+    // 再来一条真实轮（user+assistant）→ 51 轮超窗 → LRU 从头部挤出最老一轮
+    s.getState().appendMessages('sess-1', turnSeqs(1, 'sess-1', 'z'))
+    msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs.some((m) => m.id === 't0')).toBe(false)   // 最老一轮被挤出
+    expect(msgs.some((m) => m.id === 'b1')).toBe(true)    // boundary 随其所属轮保留（不是被裁掉的孤行）
+    expect(msgs[msgs.length - 1]?.id).toBe('z0-a')
+    // 窗口恒为最近 50 轮（有界）：50 轮 × 2 行 + 1 条 boundary 行（无锚行随其所属轮、不额外占轮）
+    expect(msgs).toHaveLength(MESSAGE_WINDOW_TURNS * 2 + 1)
+    // 轮口径：有锚行构成的轮数恒 = 50（boundary 无锚 ⇒ 不计入轮数）
+    expect(new Set(msgs.filter((m) => m.userMessageId).map((m) => m.userMessageId)).size).toBe(MESSAGE_WINDOW_TURNS)
   })
 })

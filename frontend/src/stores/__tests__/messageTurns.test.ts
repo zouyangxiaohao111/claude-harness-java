@@ -13,11 +13,14 @@ function msg(id: string, patch: Partial<ChatMessageDto> = {}): ChatMessageDto {
   }
 }
 
-/** 造 n 轮（每轮 user + assistant，assistant 的 userMessageId 指向其 user）。 */
+/** 造 n 轮（每轮 user + assistant · 两行都带 userMessageId=uid）。
+ *  ⚠️ user 行必须带自身锚：wire 契约 = 「user 消息 userMessageId=自身 id」（ChatMessageDto javadoc /
+ *  chatStore.appendMetaUser）。缺锚的 user 行在新 turnKeyOf 规则下会被归到【上一轮】（无锚 → 最近前置锚），
+ *  测到的就不是真实轮形态了。 */
 const seq = (n: number, prefix = 't'): ChatMessageDto[] =>
   Array.from({ length: n }, (_, i) => {
     const uid = `${prefix}${i}`
-    return [msg(uid), msg(`${uid}-a`, { role: 'assistant', userMessageId: uid })]
+    return [msg(uid, { userMessageId: uid }), msg(`${uid}-a`, { role: 'assistant', userMessageId: uid })]
   }).flat()
 
 describe('messageTurns 判据（与 MessageList 渲染分组同源）', () => {
@@ -36,9 +39,13 @@ describe('messageTurns 判据（与 MessageList 渲染分组同源）', () => {
     expect(isDialogueRow(msg('a', { author: 'system', subtype: 'tool_use_summary', isMeta: true }))).toBe(false)
   })
 
-  it('turnKeyOf = userMessageId ?? id（WHY：与 MessageList 的 push 键同源，否则两处归轮不同）', () => {
-    expect(turnKeyOf(msg('m1'))).toBe('m1')
-    expect(turnKeyOf(msg('m1', { userMessageId: 'u9' }))).toBe('u9')
+  it('turnKeyOf：有锚行取自身锚 / 无锚行取【最近前置锚】/ 前向无锚回落自身 id（WHY：与 MessageList 的 push 键同源，否则两处归轮不同）', () => {
+    expect(turnKeyOf(msg('m1'))).toBe('m1')                            // 前向无锚 → 自身 id（兜底：自成一键）
+    expect(turnKeyOf(msg('m1', { userMessageId: 'u9' }))).toBe('u9')   // 有锚 → 自身锚（行为不变）
+    // [sm-boundary-reload] 无锚行（compact boundary 等）→ 最近前置锚（不得自成一键：
+    //   否则被插在 messages 尾的 boundary 会渲染到本轮流式块【之后】= 分割线错位）
+    expect(turnKeyOf(msg('b1', { role: 'system', subtype: 'compact_boundary' }), 'u9')).toBe('u9')
+    expect(turnKeyOf(msg('b1', { role: 'system', subtype: 'compact_boundary' }), null)).toBe('b1')
   })
 })
 
@@ -80,8 +87,17 @@ describe('messageTurns capTailTurns（窗口 = 最近 N 轮，整轮保留）', 
     expect(kept.some((m) => m.id === 'x0')).toBe(false)
     // x2 轮内的噪声行在其轮内 ⇒ 随轮保留（它是本轮的行，不是切点之前的孤儿）
     expect(kept.some((m) => m.id === 'orphan-tool')).toBe(true)
-    const keptTurns = new Set(kept.filter((m) => isDialogueRow(m)).map(turnKeyOf))
+    const keptTurns = new Set(kept.filter((m) => isDialogueRow(m)).map((m) => turnKeyOf(m)))
     expect(keptTurns.size).toBe(2)
+  })
+
+  it('[sm-boundary-reload] 无锚 boundary 行随其所属轮保留/丢弃（不自成一键 · 不额外占轮）', () => {
+    const all = [...seq(3), msg('b1', { role: 'system', subtype: 'compact_boundary' })]
+    // 只留最后一轮：boundary 归组到 t2（最近前置锚）→ 随之保留，且不额外占一轮
+    const kept = capTailTurns(all, 1)
+    expect(kept.map((m) => m.id)).toEqual(['t2', 't2-a', 'b1'])
+    // 3 轮（boundary 不占轮）⇒ 未超限 → 原样返回同一引用
+    expect(capTailTurns(all, 3)).toBe(all)
   })
 
   it('全无对话行 / 空数组 / maxTurns<=0 → 原样返回（WHY：不制造无谓的新数组）', () => {

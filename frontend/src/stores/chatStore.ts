@@ -157,6 +157,10 @@ export interface ChatState {
    *  与 setMessages 的区别：setMessages = 服务端整表替换（有界，头部可能是 compact 摘要，不裁剪）；
    *  appendMessages = 本地追加（无界，必须裁剪，头部最老的先走）。 */
   appendMessages: (sessionId: string, msgs: ChatMessageDto[]) => void
+  /** [sm-boundary-reload] 服务端插入行（STOMP message.insert 事件 · 压缩 boundary 行落库即推）：
+   *  **id 幂等**（同 id 已存在 → 跳过）+ 插列表尾 + 有界窗口。与收尾重拉（setMessages 整表替换）
+   *  天然收敛 —— 同 id 覆盖/跳过，不产生重复行（对齐 addStopHookSummary 的幂等插入语义）。 */
+  insertServerMessages: (sessionId: string, rows: ChatMessageDto[]) => void
   /** [snip-persist] 合并被裁剪消息 id（STOMP message.boundary 实时 → 会话 snippedIds） */
   markSnipped: (sessionId: string, ids: string[]) => void
   /** 合并图片缓存（重拉后 batch 拉图结果写入 · 覆盖同 id，保留其余）；超 IMAGE_CACHE_MAX_PER_SESSION
@@ -292,6 +296,18 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     if (!msgs?.length) return st
     const prev = st.messages[sessionId] ?? []
     return { messages: { ...st.messages, [sessionId]: capTailTurns([...prev, ...msgs], MESSAGE_WINDOW_TURNS) } }
+  }),
+  // [sm-boundary-reload] 服务端插入行（message.insert 事件 = 压缩 boundary 行落库即推）：id 幂等 +
+  //   插列表尾 + 有界窗口。⛔ 不走 appendMessages —— 那条路无 id 去重（重拉/重放双通道会出重复行）。
+  //   与重拉（setMessages 整表替换）天然收敛：同 id 跳过，不产生重复行。
+  insertServerMessages: (sessionId, rows) => set((st) => {
+    const msgs = st.messages[sessionId] ?? []
+    // 幂等：同 id 已在列表（重拉已含该行 / 重复推送）→ 跳过不重复插
+    const fresh = rows.filter((r) => r.id && !msgs.some((m) => m.id === r.id))
+    if (!fresh.length) return st
+    // 插列表尾（当前点）：boundary 行落库即最新时序，非 flow 锚定（无 userMessageId 归属）
+    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
+    return { messages: { ...st.messages, [sessionId]: capTailTurns([...msgs, ...fresh], MESSAGE_WINDOW_TURNS) } }
   }),
   /** [snip-persist] STOMP message.boundary 实时合并被裁剪消息 id（会话级 snippedIds） */
   markSnipped: (sessionId, ids) => set((st) => {

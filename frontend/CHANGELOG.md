@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.25] - 2026-10-09
+
+### 修复
+- 修复压缩成功后对话页不显示已压缩分割线的bug。
+
 ## [0.1.24] - 2026-10-08
 
 ### 修复

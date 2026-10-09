@@ -28,9 +28,25 @@ export function isDialogueRow(m: ChatMessageDto): boolean {
   return true
 }
 
-/** 轮键：一条消息归属哪一轮。与 MessageList groups 的 push 键同源（userMessageId ?? id）。 */
-export function turnKeyOf(m: ChatMessageDto): string {
-  return m.userMessageId ?? m.id ?? ''
+/**
+ * 轮键：一条消息归属哪一轮。与 MessageList groups 的 push 键同源（cap 与渲染的【单一真源】）。
+ *
+ * <p>规则（三段）：
+ * <ol>
+ *   <li><b>有锚行</b>（{@code userMessageId} 非空）→ 取自身锚（行为不变）；</li>
+ *   <li><b>无锚行</b>（compact boundary 行 / 本地追加的无锚行等）→ 取<b>最近前置有锚行</b>的键
+ *       （{@code prevAnchorKey}）。⚠️ 不得自成一键：boundary 行被插在 messages 尾，自成一键会在渲染时
+ *       排到本轮流式块<b>之后</b>（分割线错位到回复后面 —— [sm-boundary-reload] 修复的病灶）；</li>
+ *   <li>前向<b>无任何锚</b>（窗口头部被裁 / 首行即无锚）→ 回落自身 {@code id}（自成一键，保窗口裁剪安全）。</li>
+ * </ol>
+ *
+ * <p>⚠️ 调用方必须【按序扫描】，且只把<b>非空 {@code userMessageId}</b> 推进 {@code prevAnchorKey}
+ * （无锚行不得把自己的键当成锚传给后面的行 —— 否则「无锚 → 自身 id」的兜底会级联成伪锚）。
+ *
+ * @param prevAnchorKey 前向扫描中最近一个非空 {@code userMessageId}（无 → null/undefined）
+ */
+export function turnKeyOf(m: ChatMessageDto, prevAnchorKey?: string | null): string {
+  return m.userMessageId ?? prevAnchorKey ?? m.id ?? ''
 }
 
 /**
@@ -48,14 +64,19 @@ export function turnKeyOf(m: ChatMessageDto): string {
  */
 export function capTailTurns<T extends ChatMessageDto>(msgs: T[], maxTurns: number): T[] {
   if (maxTurns <= 0 || msgs.length === 0) return msgs
-  // ① 正向一趟：给每一行算出「它所属的轮键」—— 对话行取自己的键；**非对话行（tool 行 / 纯 meta 行）
-  //   沿用最近一个前置对话行的键**。这样它们既不会自成一「轮」（否则不可见的占位会顶掉真实轮），
-  //   也不会无主残留（否则尾部不断追加的 meta 行永远不被裁，又变成无界增长）。
+  // ① 正向一趟：给每一行算出「它所属的轮键」—— 对话行取自己的键（有锚 = 自身锚；无锚 = 最近前置锚，
+  //   前向无锚则自身 id · 见 turnKeyOf）；**非对话行（tool 行 / 纯 meta 行）沿用最近一个前置对话行的键**。
+  //   这样它们既不会自成一「轮」（否则不可见的占位会顶掉真实轮），也不会无主残留（否则尾部不断追加的
+  //   meta 行永远不被裁，又变成无界增长）。
   const rowKey: (string | null)[] = new Array(msgs.length).fill(null)
-  let cur: string | null = null
+  let cur: string | null = null          // 最近前置【对话行】的键（非对话行沿用）
+  let anchor: string | null = null       // 最近前置【有锚】对话行的 userMessageId（无锚行归组用）
   for (let i = 0; i < msgs.length; i++) {
     const m = msgs[i]!
-    if (isDialogueRow(m)) cur = turnKeyOf(m)
+    if (isDialogueRow(m)) {
+      if (m.userMessageId) anchor = m.userMessageId   // ⚠️ 只被有锚行推进（无锚行不得污染锚）
+      cur = turnKeyOf(m, anchor)
+    }
     rowKey[i] = cur
   }
   // ② 反向一趟：从尾部取最多 maxTurns 个不同的键 = 要保留的轮

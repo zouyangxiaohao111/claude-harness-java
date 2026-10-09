@@ -1181,6 +1181,11 @@ public class LlmAgentLoop implements AgentLoop {
         try {
             List<ChatMessageDto> normalized = state.persistCompactedMessages(postCompactMessages);
             state.replaceMessages(normalized != null ? normalized : postCompactMessages);
+            // [sm-boundary-reload] turn 级「本轮发生过压缩」标记：落库成功才置位 → turn 收尾
+            //   ChatService.publishCompleteEvent consume 一次 → complete.compacted=true → 前端收尾重拉
+            //   （对账层；即时层 = 同点 ChatService.compactPersistListener 推 message.insert boundary 行）。
+            //   ⚠️ 失败/未武装分支不置位：DB 未落时前端重拉看不到新 boundary，报 compacted=true 属假信号。
+            state.markTurnCompacted();
             if (log.isInfoEnabled()) {
                 log.info("[compact-persist] compact 结果已 append-only 落库（不删旧行）: session={} 条数={}",
                     sid, state.rawMessages().size());
@@ -2577,6 +2582,13 @@ public class LlmAgentLoop implements AgentLoop {
         // PR 4: 构造 state 时传入 sessionId/agentId，供 PermissionContextBuilder 使用
         // [RES-SP31] 透传 appendSystemPrompt（RunRequest → AgentState，OPD-SP-31 接线）
         AgentState state = new AgentState(systemPrompt, sessionId, agentId, appendSystemPrompt);
+        // [sm-boundary-reload] turn 级压缩标记复位 = 本 run「首个 state 可用处」：
+        //   run(RunRequest) 方法体入口只有 params（state 在 doRun 此处才构造）⇒ 落点选这里。
+        //   ⚠️ 如实：当前每 run 新建 AgentState（turnCompacted 初始即 false）⇒ 本复位恒为 no-op。
+        //   保留为前瞻防御：将来引入 AgentState 跨 run 复用（会话 registry / cron 复用）时，
+        //   上一轮 abort/error（不发 complete ⇒ 标记无人 consume）的残留才会被此处挡住
+        //   → 防本轮 complete 谎报 compacted=true（未压缩轮假重拉）。
+        state.clearTurnCompacted();
         // [V-TOK 实施] 会话启动 restore 累计（对齐 CC restoreCostStateForSession · state.ts:704-710）：
         //   从 sessions 表 total_cost_yuan + model_usage_json 列（V48）读回 → 写 AgentState 会话累计
         //   字段，使 message.complete 的 total_cost_usd/modelUsage 反映跨 turn 累计

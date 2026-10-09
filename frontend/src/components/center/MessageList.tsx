@@ -937,12 +937,17 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     }
     // [brief-align] 含 SendUserMessage 的轮次里丢掉冗余助手正文 · 对齐 CC components/Messages.tsx:169-206
     //   dropTextInBriefTurns（transcript 模式绕过：本仓轨迹 tab 直读 store，不经本函数 —— 同 CC）。
+    // [sm-boundary-reload] 轮键在序列上前向解析（与 capTailTurns 前向趟同源）：无锚行（compact boundary
+    //   等）归组到【最近前置有锚行】的键 —— 否则 boundary 自成一键、被排到本轮流式块之后（分割线错位）。
+    let anchor: string | null = null
     for (const m of dropTextInBriefTurns(messages)) {
       // 轮归属与过滤判据的【唯一真源】= stores/messageTurns（与 chatStore 的窗口裁剪同源，防两处漂移）。
       //   原实现把三条 continue 与轮键内联在此、store 另写一份 —— 一旦漂移，「渲染出来的轮」与
       //   「被裁剪的轮」就不是同一个东西（裁剪切点会落在一轮中间）。
       if (!isDialogueRow(m)) continue
-      push(turnKeyOf(m), { kind: 'msg', m })
+      // ⚠️ 只被【有锚行】推进（无锚行不得把自己的键当锚传给后面 —— 与 turnKeyOf 的兜底语义配对）
+      if (m.userMessageId) anchor = m.userMessageId
+      push(turnKeyOf(m, anchor), { kind: 'msg', m })
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
     //   的「位置」语义 —— 用户1 任务轮归用户1、排队 append 后的轮归排队）。冻结保证不被排队 append

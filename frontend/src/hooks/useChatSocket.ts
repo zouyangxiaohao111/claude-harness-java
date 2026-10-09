@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Client, type StompSubscription } from '@stomp/stompjs'
 import { useChatStore } from '../stores/chatStore'
-import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
+import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
@@ -196,6 +196,10 @@ export function useChatSocket(
   /** [断连恢复] WS 被服务端强杀（send time limit 超时 → close）后,重连收到的第一个 message.complete
    *   触发回调 → App 按 sid 权威重拉 GET /messages 补偿缺口。根治「complete 推给零订阅者丢失 → 打字机永久卡死」。 */
   onReconnectReload?: (sid: string) => void,
+  /** [sm-boundary-reload] 本轮有压缩落库成功（message.complete.compacted=true）→ finalize 之后回调 App
+   *   重拉尾页补对账层（即时层 = 同点推送的 message.insert boundary 行；同 id 幂等收敛不重复）。
+   *   App 侧注册既有 handleReconnectReload（复用同一重拉实现，不新写一套）。 */
+  onCompactedReload?: (sid: string) => void,
 ) {
   const clientRef = useRef<Client | null>(null)
   const setConnection = useChatStore((s) => s.setConnection)
@@ -216,6 +220,9 @@ export function useChatSocket(
   // [断连恢复] onReconnectReload 经 ref 转发
   const onReconnectReloadRef = useRef(onReconnectReload)
   onReconnectReloadRef.current = onReconnectReload
+  // [sm-boundary-reload] onCompactedReload 经 ref 转发（同 onReconnectReload 模式：effect/闭包不捕获过期回调）
+  const onCompactedReloadRef = useRef(onCompactedReload)
+  onCompactedReloadRef.current = onCompactedReload
   /** [断连恢复] WS 被服务端强杀（Send time exceeded → close 1011）后置 true;重连后第一个 message.complete
    *   触发权威重拉并复位（补偿断连窗口内被零订阅者丢弃的 chunk/complete —— 打字机永久卡死的直接原因）。
    *   不放 onConnect 复位:断连丢事件的 turn 其 complete 在重连之后才到,onConnect 过早复位会漏掉这次补偿。 */
@@ -761,6 +768,10 @@ export function useChatSocket(
       if (evt.removedUuids?.length) {
         st.markSnipped(sid, evt.removedUuids)
       }
+    } else if (isMessageInsert(evt)) {
+      // [sm-boundary-reload] 压缩落库即推的【整行】插入（boundary 行）→ id 幂等插列表尾：分割线即时
+      //   显示。对账层 = complete.compacted 后重拉（同 id 收敛，不产生重复行）。
+      if (evt.messages?.length) st.insertServerMessages(sid, evt.messages)
     } else if (isMessageUsage(evt)) {
       // message.usage（消息级完成、非 turn 终态）：每条 assistant 流式结束推自身 usage + 上下文快照
       //   → 按 assistantMessageId 实时挂到流式块 → Composer 缓存%/上下文条即时更新（不等 turn complete）。
@@ -793,6 +804,10 @@ export function useChatSocket(
         decodeMs: evt.usage?.decode_ms ?? null,
         contextWindow: evt.contextWindow ?? null,
       })
+      // [sm-boundary-reload] 本轮有压缩落库成功（compacted=true）→ finalize 之后触发收尾重拉（对账层）：
+      //   即时层 message.insert 只推 boundary 行；重拉补齐 summary 等其余新行。⛔ 位置必须在 finalizeBlocks
+      //   之后（块先转消息，重拉整表替换才是权威完整态）；失败/未压缩轮后端不置位 → 无假重拉。
+      if (evt.compacted) onCompactedReloadRef.current?.(sid)
       // 重试横幅清除：complete = 本轮 LLM 调用成功（api_retry 重试后成功）→ 隐藏「正在重试」
       //   横幅（对齐 CC：重试成功即消失；此前仅 onClose 手动关闭，残留导致「已完成仍显示重试」）
       st.setRetry(null)

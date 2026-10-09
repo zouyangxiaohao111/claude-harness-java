@@ -358,6 +358,29 @@ public class AgentState {
     private boolean pendingPostCompaction = false;
 
     /**
+     * [sm-boundary-reload] turn 级「本轮发生过压缩」标记 · 无 CC 对应物（净新增 · 前端对账层信号）。
+     *
+     * <p><b>语义</b>：压缩<b>落库成功</b>（{@code LlmAgentLoop.persistCompactedMessages} 命中
+     * {@link #isCompactPersistArmed()} 且 append-only 落库返回后）置位；turn 收尾由
+     * {@code ChatService.publishCompleteEvent} 经 {@link #consumeTurnCompacted()} <b>读+清一次</b>，
+     * 随 {@code message.complete.compacted=true} 出站 → 前端 finalize 后重拉尾页
+     * （「已压缩 · 对话历史已总结」分割线的对账层；即时层是同点推送的 {@code message.insert}）。
+     * run 入口 {@link #clearTurnCompacted()} 复位为<b>前瞻防御</b>：当前每 run 新建 {@code AgentState}
+     * ⇒ 复位恒为 no-op（如实）；将来引入跨 run 复用后，上一轮 abort/error（不发 complete ⇒ 无人消费）
+     * 的残留才会被它挡住（防下一轮假重拉）。
+     *
+     * <p><b>为什么不复用 {@link #pendingPostCompaction}</b>：后者的消费方是「压缩后首个 API success」
+     * （provider 遥测侧 consumePostCompactionAtApiSuccess），到 turn 收口构造 complete 事件时<b>恒已被消费</b>
+     * ⇒ 不能充当「本轮压缩过」的信号源（本处语义 = 落库发生过 + 尚未对前端对账）。
+     *
+     * <p><b>local-only 约束（CLAUDE.md BudgetTracker 架构红线）</b>：{@code @JsonIgnore} —— 纯进程内
+     * turn 状态，绝不序列化到 outbound DTO / STOMP / WebSocket / EventPublisher payload
+     * （出站面只有 {@code message.complete.compacted} 这一个显式投影）。
+     */
+    @JsonIgnore
+    private boolean turnCompacted = false;
+
+    /**
      * s05-P1-3：自上次 TodoWrite 调用以来的 assistant turn 数。
      * 对齐 CC utils/attachments.ts:3212-3264 getTodoReminderTurnCounts 的
      * turnsSinceLastTodoWrite（CC 从消息历史反向扫描计数；Java 用 State 计数器等价实现）。
@@ -766,6 +789,38 @@ public class AgentState {
      */
     public void setPendingPostCompaction(boolean value) {
         this.pendingPostCompaction = value;
+    }
+
+    /**
+     * [sm-boundary-reload] 置位 turn 级压缩标记 · 由 {@code LlmAgentLoop.persistCompactedMessages}
+     * 在压缩结果 append-only 落库成功后调用（落库失败/无落库通道不置位 —— 前端重拉应对齐 DB 事实）。
+     */
+    public void markTurnCompacted() {
+        this.turnCompacted = true;
+    }
+
+    /**
+     * [sm-boundary-reload] 读+清 turn 级压缩标记（consume 恰好一次）· complete 事件唯一消费点。
+     *
+     * <p>WHY 恰好一次：不清 → 同一标记会被后续轮 complete 重复消费 → <b>未压缩的轮</b>也触发前端重拉。
+     *
+     * @return true = 本 turn 压缩已落库、尚未被任何 complete 消费
+     */
+    public boolean consumeTurnCompacted() {
+        boolean v = turnCompacted;
+        turnCompacted = false;
+        return v;
+    }
+
+    /**
+     * [sm-boundary-reload] 复位 turn 级压缩标记 · run 入口调用（本 turn 首个 state 可用处）。
+     *
+     * <p><b>当前恒为 no-op（如实）</b>：每 run 新建 {@code AgentState}（本字段初始即 false）⇒
+     * 此刻没有残留可清。保留为<b>前瞻防御</b>：将来引入 AgentState 跨 run 复用（会话 state registry /
+     * cron 复用）时，上一轮 abort/error（不发 complete ⇒ 标记无人 consume）的残留才会被此处挡住。
+     */
+    public void clearTurnCompacted() {
+        this.turnCompacted = false;
     }
 
     /** s05-P1-3：自上次 TodoWrite 调用以来的 assistant turn 数 */

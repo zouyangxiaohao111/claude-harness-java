@@ -1,7 +1,7 @@
 import { Client, type IMessage, type StompSubscription } from '@stomp/stompjs'
 import SockJS from 'sockjs-client'
 import { WS_BASE, SOCKJS_BASE } from './base'
-import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, MessageUsageEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations, PermissionUpdate } from './types'
+import type { StreamEvent, MessageChunkEvent, PushedUserMessageEvent, MessageCompleteEvent, MessageUsageEvent, PermissionRequestEvent, ApiRetryEvent, MessageErrorEvent, MessageCancelledEvent, MessageToolCallEvent, MessageToolResultEvent, MessageBoundaryEvent, MessageInsertEvent, TokenWarningEvent, AskUserAnswers, AskUserAnnotations, PermissionUpdate } from './types'
 
 export function parseStreamEvent(raw: unknown): StreamEvent {
   const obj = (raw ?? {}) as Record<string, unknown>
@@ -15,6 +15,9 @@ export const isComplete = (e: StreamEvent): e is MessageCompleteEvent => e.type 
 export const isMessageUsage = (e: StreamEvent): e is MessageUsageEvent => e.type === 'message.usage'
 export const isToolCall = (e: StreamEvent): e is MessageToolCallEvent => e.type === 'message.tool_call'
 export const isBoundary = (e: StreamEvent): e is MessageBoundaryEvent => e.type === 'message.boundary'
+/** [sm-boundary-reload] 服务端插入行守卫（message.insert · 压缩 boundary 行落库即推）——
+ *  ⚠️ 与 isBoundary（snip · 只标注既有行）语义相反：本事件携带【新行】行体，前端插列表尾 */
+export const isMessageInsert = (e: StreamEvent): e is MessageInsertEvent => e.type === 'message.insert'
 export const isToolResult = (e: StreamEvent): e is MessageToolResultEvent => e.type === 'message.tool_result'
 export const isPermission = (e: StreamEvent): e is PermissionRequestEvent => e.type === 'permission.request'
 export const isStatus = (e: StreamEvent): boolean => e.type === 'session.status'

@@ -86,6 +86,17 @@ public class MessageCompleteEvent extends StreamEvent {
      * current_usage / contextWindow；null → NON_NULL 省略。
      */
     private final Integer percentLeft;
+    /**
+     * [sm-boundary-reload] 本轮是否发生过<b>落库成功</b>的压缩（turn 级）· 净新增字段，非 CC 对齐
+     * （CC 无此出站字段；CC 的同名状态 {@code STATE.pendingPostCompaction} 是<b>进程内</b>且被
+     * 「压缩后首个 API success」消费，见 AgentState.turnCompacted javadoc 的差异说明）。
+     *
+     * <p><b>语义</b>：true = 本 turn 有压缩结果 append-only 落库成功（值 = 装配点
+     * {@code AgentState.consumeTurnCompacted()}，读+清一次）。前端据此在收尾（finalizeBlocks）后
+     * <b>重拉尾页</b>补上「已压缩 · 对话历史已总结」分割线（对账层兜底；实时层是同点推送的
+     * {@code message.insert}）。恒出站（primitive，NON_NULL 不省略）→ 旧前端忽略未知字段即可。
+     */
+    private final boolean compacted;
 
     public MessageCompleteEvent(String sessionId, String userMessageId,
                                 String assistantMessageId, String content, String reasoning,
@@ -93,7 +104,29 @@ public class MessageCompleteEvent extends StreamEvent {
                                 Long reasoningDurationMs) {
         this(sessionId, userMessageId, assistantMessageId, content, reasoning, finishReason,
             inputTokens, outputTokens, reasoningDurationMs,
-            null, 0.0, null, 0L, 0, 0L, 0L, null);
+            null, 0.0, null, 0L, 0, 0L, 0L, null, false);
+    }
+
+    /**
+     * [sm-boundary-reload] 向后兼容构造器：保留既有 17 参调用方（旧 canonical 形状：…contextWindow,
+     * contextTokensUsed, percentLeft），compacted 默认 {@code false}。
+     *
+     * <p>WHY：{@code compacted} 是本批新增的<b>第 18 参</b>（⛔ 既有参数序不动）。既有调用方
+     * （如 {@code MessageCompleteEventSerializationTest} 的既有用例）按位置传 17 参 —— 不给本重载
+     * 就必须逐个改调用点，且「忘记补参」会静默编译失败/错位。默认 false = 改前无 compacted 时的行为。
+     */
+    public MessageCompleteEvent(String sessionId, String userMessageId,
+                                String assistantMessageId, String content, String reasoning,
+                                String finishReason, Integer inputTokens, Integer outputTokens,
+                                Long reasoningDurationMs,
+                                MessageUsageDto usage, double totalCostUsd,
+                                Map<String, CostTracker.ModelUsage> modelUsage,
+                                long durationMs, int numTurns,
+                                long contextWindow, long contextTokensUsed, Integer percentLeft) {
+        this(sessionId, userMessageId, assistantMessageId, content, reasoning, finishReason,
+            inputTokens, outputTokens, reasoningDurationMs,
+            usage, totalCostUsd, modelUsage, durationMs, numTurns,
+            contextWindow, contextTokensUsed, percentLeft, false);
     }
 
     public MessageCompleteEvent(String sessionId, String userMessageId,
@@ -103,7 +136,8 @@ public class MessageCompleteEvent extends StreamEvent {
                                 MessageUsageDto usage, double totalCostUsd,
                                 Map<String, CostTracker.ModelUsage> modelUsage,
                                 long durationMs, int numTurns,
-                                long contextWindow, long contextTokensUsed, Integer percentLeft) {
+                                long contextWindow, long contextTokensUsed, Integer percentLeft,
+                                boolean compacted) {
         super("message.complete", sessionId, userMessageId);
         this.assistantMessageId = assistantMessageId;
         this.content = content;
@@ -120,6 +154,7 @@ public class MessageCompleteEvent extends StreamEvent {
         this.contextWindow = contextWindow;
         this.contextTokensUsed = contextTokensUsed;
         this.percentLeft = percentLeft;
+        this.compacted = compacted;
     }
 
     public String getAssistantMessageId() { return assistantMessageId; }
@@ -137,4 +172,5 @@ public class MessageCompleteEvent extends StreamEvent {
     public long getContextWindow() { return contextWindow; }
     public long getContextTokensUsed() { return contextTokensUsed; }
     public Integer getPercentLeft() { return percentLeft; }
+    public boolean isCompacted() { return compacted; }
 }

@@ -957,7 +957,9 @@ function App() {
   }, [loadTailWindow])
 
   // 多会话并行订阅（订阅所有 activeStreams；complete/cancel 明确回调移除）
-  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload)
+  // [sm-boundary-reload] onCompactedReload 注册同一 handleReconnectReload（复用既有重拉实现，不新写一套）：
+  //   压缩落库成功（complete.compacted=true）→ finalize 后收尾重拉尾页补对账层（即时层 = message.insert 插行）。
+  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload, handleReconnectReload)
 
   // ---- away-summary：blur 5min 触发，REST 摘要回插为系统消息 ----
   useAwaySummary(activeSessionId, (text) => {

@@ -1137,6 +1137,7 @@ export type StreamEventType =
   | 'message.chunk' | 'message.complete' | 'message.usage' | 'message.error' | 'message.cancelled' | 'message.user'
   | 'message.tool_call' | 'message.tool_result'   // 占位不发，仅类型占位
   | 'message.boundary'                             // [snip-persist] Snip 裁剪边界（removedUuids → 消息「已裁剪」角标）
+  | 'message.insert'                               // [sm-boundary-reload] 服务端插入行（压缩 boundary 行落库即推 → id 幂等插列表尾）
   | 'session.status' | 'session.title'
   | 'permission.request'
   | 'api_retry' | 'files.changed' | 'token_warning'
@@ -1170,6 +1171,16 @@ export interface MessageBoundaryEvent extends StreamEventBase {
   type: 'message.boundary'
   removedUuids?: string[] | null
   summary?: string | null
+}
+/** [sm-boundary-reload] 服务端插入行事件 · 后端压缩（SM/auto）<b>落库成功</b>时经 stream 通道推「整行」载荷
+ *  （本批只含 compact boundary 行，判据 BoundaryReader 单源）→ 前端按 id 幂等插列表尾：分割线**即时**显示，
+ *  不必等 turn 收尾 / F5。⚠️ 与 {@link MessageBoundaryEvent}（snip）语义相反：那个只带 removedUuids 给
+ *  【已有】行打「已裁剪」角标；本事件携带完整行体 —— boundary 是前端手上没有的【新行】，只能整行插。
+ *  userMessageId 恒 null（不承载 turn 归属；前端按行处理，不需要 flow 锚点）。 */
+export interface MessageInsertEvent extends StreamEventBase {
+  type: 'message.insert'
+  /** 要插入的完整消息行（落库返回的归一化 DTO，id 与 DB 同源 = 前端幂等收敛键；时间类字段以重拉为准） */
+  messages?: ChatMessageDto[] | null
 }
 /** 后端推送的 user 消息（cron/Ask 后台落库 prompt · isMeta=true 前端占位不显示，保持 flow 顺序） */
 export interface PushedUserMessageEvent extends StreamEventBase {
@@ -1232,6 +1243,9 @@ export interface MessageCompleteEvent extends StreamEventBase {
   contextTokensUsed?: number | null
   /** 上下文剩余百分比（0-100 · 无 usage 时省略 · 负数 clamp 0） */
   percentLeft?: number | null
+  /** [sm-boundary-reload] 本轮是否有压缩结果落库成功（恒出站 primitive）→ finalize 后重拉尾页补对账层
+   *  （即时层 = 同点推送的 message.insert boundary 行；失败/未武装分支不置位，防假重拉） */
+  compacted?: boolean | null
 }
 /** 消息级 usage 快照事件（后端每条 assistant 流式结束推 · 消息级完成、非 turn 终态）。
  *  携带该条 usage + 上下文快照 → 前端实时更新缓存%/上下文条；不得当 turn 终态退订（退订只在 message.complete）。

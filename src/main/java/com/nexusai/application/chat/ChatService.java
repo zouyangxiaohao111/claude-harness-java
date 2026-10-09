@@ -6,6 +6,7 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.AgentEvent;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.UserInputDispatcher;
+import com.nexusai.application.agent.compact.BoundaryReader;
 import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.application.agent.skill.SkillRegistry;
@@ -1196,6 +1197,10 @@ public class ChatService {
             ChatMessageDto lastAsst = lastAssistantMessage(state);
             if (lastAsst != null && lastAsst.id() != null) resolvedAssistantId = lastAsst.id();
         }
+        // [sm-boundary-reload] turn 级压缩标记：读+清一次（consume 恰好一次，语义见 AgentState.turnCompacted）
+        //   —— true = 本 turn 有压缩结果落库成功 → 前端收尾后重拉尾页补「已压缩」分割线（对账层；
+        //   即时层 = compactPersistListener 同点推的 message.insert boundary 行）。
+        boolean turnCompacted = state.consumeTurnCompacted();
         sendAndLog(wsTemplate, streamTopic,
             // [merge] 保留 effectiveEventUserMessageId（排队 flow userMessageId 双通道一致）+ V-TOK 真实 usage 装配
             new MessageCompleteEvent(sessionId, effectiveEventUserMessageId(state, userMessageId), resolvedAssistantId,
@@ -1207,7 +1212,8 @@ public class ChatService {
                 state.sessionModelUsage(),
                 completeDurationMs,
                 state.turnCount(),
-                completeContextWindow, completeContextUsed, completePercentLeft),
+                completeContextWindow, completeContextUsed, completePercentLeft,
+                turnCompacted),
             "complete finishReason=" + state.finishReason()
                 + " content=" + abbreviate(finalContent, 80)
                 + " reasoningLen=" + (finalReasoning == null ? 0 : finalReasoning.length()));
@@ -1400,9 +1406,32 @@ public class ChatService {
                 List<ChatMessageDto> normalized = SqliteBusyRetry.executeWithBusyRetry(
                     "[compact-persist] append-only 落库",
                     () -> messageService.appendPostCompactMessages(sessionId, msgs));
+                // [sm-boundary-reload] 即时层：落库返回的归一化行集里筛出 compact boundary 行，经 stream
+                //   通道推 message.insert（前端按 id 幂等插行 → 聊天区即时出现「已压缩」分割线）。
+                //   ⚠️ 只推 boundary（本批范围 · 判据 BoundaryReader 单源）：kept 行已在列表（多推 = 重复行）；
+                //   summary 是本次压缩新建行，属对账层（complete.compacted 后重拉）的覆盖范围。
+                //   wsTemplate==null（非 Spring 单测 / armPersistenceListeners 后台通道）→ sendAndLog 既有
+                //   守卫跳过推送仅落库（唯一传 null streamTopic 的武装点 armPersistenceListeners 同时传
+                //   null wsTemplate ⇒ 二者成对，不会走到 convertAndSend(null, …)）。
+                List<ChatMessageDto> boundaryRows = filterCompactBoundaryRows(normalized);
+                // 落库记账先打（⛔ 不受推送影响）：推送失败绝不能伪装成「落库失败」（DB 已提交）。
                 if (log.isInfoEnabled()) {
                     log.info("[compact-persist] compact 结果已 append-only 落库: session={} 条数={}（不删旧行 · 对齐 CC recordTranscript）",
                         sessionId, normalized.size());
+                }
+                if (!boundaryRows.isEmpty()) {
+                    // best-effort（同仓惯例，如 persistAppendedMessage 的 snip_boundary 分支）：
+                    //   try 只包推送 —— 推送抛异常若冒泡进 LlmAgentLoop.persistCompactedMessages 的 catch，
+                    //   会 ① 假报「落库失败」（DB 其实已提交）② 跳过 state.markTurnCompacted()
+                    //   ⇒ 即时层失败时把对账层一起关掉（本方法此处只管推送；mark 在 LlmAgentLoop 侧保持原位）。
+                    try {
+                        sendAndLog(wsTemplate, streamTopic,
+                            new MessageInsertEvent(sessionId, boundaryRows),
+                            "message.insert boundary=" + boundaryRows.size());
+                    } catch (Exception e) {
+                        log.warn("message.insert 推送失败（best-effort，不影响落库；对账层 complete.compacted 兜底）: session={} err={}",
+                            sessionId, e.toString());
+                    }
                 }
                 return normalized;
             });
@@ -1420,6 +1449,32 @@ public class ChatService {
     public void armRealTimePersist(AgentState state, String sessionId, String streamTopic,
                                    SimpMessagingTemplate wsTemplate) {
         armRealTimePersist(state, sessionId, streamTopic, wsTemplate, null);
+    }
+
+    /**
+     * [sm-boundary-reload] 从落库结果中筛出 compact boundary 行（即时层 message.insert 的载荷）。
+     *
+     * <p><b>WHY 单点静态</b>：判据必须与读侧同一来源 —— {@link BoundaryReader#isCompactBoundaryMessage}
+     * （CC {@code isCompactBoundaryMessage}，messages.ts:4608：role=system && subtype=compact_boundary）。
+     * 任何手写 {@code "compact_boundary".equals(subtype)} 都会在 CC 侧的判别演化时静默漂移
+     * （如误纳 microcompact_boundary → 前端把微压缩也画成「已压缩」分割线）。
+     *
+     * <p>容忍 null：{@code normalized} 理论不为 null，但「未武装/异常兜底」路径可能给 null 或含 null 元素，
+     * 本方法只做过滤、绝不 NPE（推送是 best-effort，不得因筛选打断落库返回链）。
+     *
+     * @param rows 落库返回的归一化行集（appendPostCompactMessages 的返回）
+     * @return 其中的 compact boundary 行（保持原相对顺序）；无 → 空列表
+     */
+    static List<ChatMessageDto> filterCompactBoundaryRows(List<ChatMessageDto> rows) {
+        List<ChatMessageDto> out = new ArrayList<>();
+        if (rows != null) {
+            for (ChatMessageDto m : rows) {
+                if (m != null && BoundaryReader.isCompactBoundaryMessage(m)) {
+                    out.add(m);
+                }
+            }
+        }
+        return out;
     }
 
     /**
