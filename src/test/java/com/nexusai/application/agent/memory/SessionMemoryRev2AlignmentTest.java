@@ -453,15 +453,18 @@ class SessionMemoryRev2AlignmentTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("SM-02: SM 压缩执行 SessionStart hooks('compact') → hookResults 进 CompactionResult（GAP-3）")
+    @DisplayName("SM-02: SM 压缩执行 SessionStart hooks('compact') → hookResults 进 CompactionResult（GAP-3；新形态=hook_additional_context 附加行）")
     void compaction_runsSessionStartHooks_intoHookResults() throws Exception {
         Path dir = baseDir.resolve("s1").resolve("session-memory");
         Files.createDirectories(dir);
         Files.writeString(dir.resolve("summary.md"), "# Learnings\nsome real learning content\n");
 
         HookRegistry registry = Mockito.mock(HookRegistry.class);
+        // [压缩回执外显修复] 带非空 additionalContexts → 新行为下 CompactionResult.hookResults
+        //   承载 hook_additional_context 附加行（旧断言锁定的 "String message 变文本消息" 已废除：
+        //   String 无 CC attachment 对应物 → 不产消息，下方 hasSize(1) 同时锁住这点）。
         Mockito.when(registry.executeEventAll(Mockito.any())).thenReturn(List.of(
-            new GenericHook.HookResult(false, null, null, null,
+            new GenericHook.HookResult(false, null, null, List.of("restored CLAUDE.md context"),
                 "restored CLAUDE.md context", null, null, null, null,
                 GenericHook.HookOutcome.SUCCESS, null, null, null, null,
                 null, null, null, null)));
@@ -478,9 +481,13 @@ class SessionMemoryRev2AlignmentTest {
 
         assertThat(r).isNotNull();
         assertThat(r.hookResults())
-            .as("SessionStart hooks 输出必须进 CompactionResult.hookResults（旧实现恒空）")
+            .as("SessionStart hooks 结果必须进 CompactionResult.hookResults（新形态 = hook_additional_context 附加行）")
             .hasSize(1);
+        assertThat(r.hookResults().get(0).subtype())
+            .as("additionalContexts 聚合行（sessionStart.ts:163-172）")
+            .isEqualTo("hook_additional_context");
         assertThat(r.hookResults().get(0).content()).contains("restored CLAUDE.md context");
+        assertThat(r.hookResults().get(0).isMeta()).isTrue();
         assertThat(r.hookResults().get(0).author()).isEqualTo("hook");
         // source='compact' + model 载荷
         Mockito.verify(registry).executeEventAll(Mockito.argThat(event -> {

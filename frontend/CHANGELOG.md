@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.28] - 2026-10-09
+
+### 修复
+- 修复压缩后 hook 输出显示为对话消息的bug。
+
 ## [0.1.27] - 2026-10-09
 
 ### 修复

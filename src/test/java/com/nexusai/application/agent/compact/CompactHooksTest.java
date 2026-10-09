@@ -40,12 +40,14 @@ class CompactHooksTest {
     /**
      * [P1-6] 真实 command hook 形态的 success 结果 —— message 是 hook_success attachment
      * （CommandHookExecutor.toHookResultCore 产出：content=stdout.trim()，stdout 原文）。
+     * hookName/hookEvent 取 SessionStart —— 本 fixture 同时供 processSessionStartHooks
+     * 事件门用例消费（F3：hookEvent 须 ∈ {SessionStart, UserPromptSubmit} 才产出）。
      */
     private static GenericHook.HookResult commandSuccessResult(String stdoutText) {
         return new GenericHook.HookResult(
             false, null, List.of(), List.of(),
             com.nexusai.application.agent.attachment.AttachmentMessageDto.hookSuccess(
-                "PreCompact:s1", null, "PreCompact", stdoutText, stdoutText, "", 0, "my-hook.sh", 12L),
+                "SessionStart:s1", null, "SessionStart", stdoutText, stdoutText, "", 0, "my-hook.sh", 12L),
             null, null, null, null, GenericHook.HookOutcome.SUCCESS, null, null, null, null,
             null, null, null, null);
     }
@@ -115,10 +117,16 @@ class CompactHooksTest {
     }
 
     @Test
-    @DisplayName("P1-6: SessionStart hook 消息 content = hook 输出文本（不再落 attachment.toString）")
-    void sessionStart_hookMessageContentIsHookOutput() {
-        // WHY: 该路径产物进 postCompactMessages → 作为 user 消息进模型上下文 —— 旧实现把
-        //   AttachmentMessageDto 的 toString 整串喂给模型（DB 实证每次 compact 3 条）。
+    @DisplayName("[压缩回执外显修复·补全] SessionStart 非 JSON hook_success → 产 isMeta system-reminder 消息（非裸文本）")
+    void sessionStart_nonJsonHookSuccessWrapsInSystemReminder() {
+        // WHY（规则九 · 验证意图）: 旧行为把 stdout 原文当裸 user 文本消息（DB 实证 39 条 JSON 形态
+        //   {"hookSpecificOutput":…} = JSON 路径 bug；更早 3 条为 AttachmentMessageDto.toString 形态）。
+        //   补全后两条通道对齐 CC：JSON 型 content=''（hooks.ts:729）→ 不产（messages.ts:4106-4108）；
+        //   非 JSON 型 content=stdout.trim()（hooks.ts:2617-2644，commandSuccessResult 即此形态）→
+        //   产 isMeta system-reminder（messages.ts:4109-4116 wrapInSystemReminder(
+        //   "{hookName} hook success: {content}")；模型可见、UI 空渲染 nullRenderingAttachments.ts:14-16）。
+        //   ⇒ 意图改为「hook 输出只允许以 system-reminder 形态出现，⛔ 不得再以裸文本形态出现」。
+        //   期望串中 hookName 取自测试 fixture（commandSuccessResult 的 hookName="SessionStart:s1"）。
         HookRegistry registry = new HookRegistry();
         registry.register("test-session-start", event -> commandSuccessResult("技能已刷新"),
             HookEventType.SESSION_START);
@@ -127,15 +135,16 @@ class CompactHooksTest {
 
         List<ChatMessageDto> hookMessages = CompactHooks.processSessionStartHooks(ctx);
 
-        assertThat(hookMessages)
-            .as("成功 hook 的非空输出产一条 hook 消息")
-            .hasSize(1);
-        assertThat(hookMessages.get(0).content())
-            .as("消息 content 必须是 hook 输出文本（模型读到的内容）")
-            .isEqualTo("技能已刷新");
-        assertThat(hookMessages.get(0).content())
-            .as("不得把结构化 attachment 的 toString 当消息内容（P1-6 根因）")
-            .doesNotContain("AttachmentMessageDto");
+        assertThat(hookMessages).hasSize(1);
+        ChatMessageDto hookMsg = hookMessages.get(0);
+        assertThat(hookMsg.content())
+            .as("不得以裸文本（\"技能已刷新\"）形态出现；必须是 wrapInSystemReminder 形态")
+            .isEqualTo("<system-reminder>\nSessionStart:s1 hook success: 技能已刷新\n</system-reminder>");
+        assertThat(hookMsg.isMeta())
+            .as("恒 isMeta=true（对齐 CC createUserMessage({isMeta:true})，messages.ts:4114）")
+            .isTrue();
+        assertThat(hookMsg.subtype()).isNull();
+        assertThat(hookMsg.author()).isEqualTo("hook");
     }
 
     @Test

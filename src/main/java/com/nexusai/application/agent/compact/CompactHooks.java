@@ -117,11 +117,33 @@ public final class CompactHooks {
      * 执行 SessionStart hooks（source='compact'）· 对齐 CC
      * {@code processSessionStartHooks('compact', {model})}（compact.ts:592-594）。
      *
-     * <p>成功 hook 的非空输出转换为 {@code ChatMessageDto}（author='hook'）加入
-     * {@code hookResults}（CompactionResult.hookResults，compact.ts:742）。
+     * <p><b>[压缩回执外显修复] hook attachment 按 CC attachment→message 分派产出</b>
+     * （CC 在 sessionStart.ts:141-143 推入 attachment 消息对象，由 attachment→message 转换渲染）：
+     * <ul>
+     *   <li><b>hook_success · JSON 型</b>（content=''，hooks.ts:729 硬编码；stdout 仅记录载荷 :730）→
+     *       转换时 content==='' 返回 []（messages.ts:4106-4108）⇒ 不进模型；UI 亦空渲染
+     *       （nullRenderingAttachments.ts:14-16）——两端不可见（真库 39 条
+     *       {@code {"hookSpecificOutput":…}} 脏消息即旧实现此路径外显为裸文本，已消除）。</li>
+     *   <li><b>hook_success · 非 JSON 型</b>（content=stdout.trim()，hooks.ts:2617-2644）→ 产 isMeta
+     *       system-reminder 消息 {@code "{hookName} hook success: {content}"}
+     *       （messages.ts:4099-4116：事件门 {SessionStart, UserPromptSubmit} + content 非空）——模型可见、
+     *       UI 不可见；渲染与本仓 {@code LlmAgentLoop.appendPlainHookMessage} 同构（就地实现，不复用）。</li>
+     *   <li><b>hook_blocking_error</b>（JSON {@code {"decision":"block"}} 路径，HookOutputParser.java:302-311
+     *       → :463-465，outcome 恒 SUCCESS :480-482）→ 产 isMeta system-reminder 消息
+     *       {@code "{hookName} hook blocking error from command: "{command}": {blockingError}"}
+     *       （messages.ts:4090-4097，<b>无事件门</b>；渲染与 AgentLoopContext.renderHookAttachmentForLlm
+     *       :3539-3554 同构）——模型可见、UI 不可见。</li>
+     * </ul>
+     * {@code additionalContexts} 聚合为单条 {@code hook_additional_context} 消息（isMeta=true，
+     * sessionStart.ts:163-172），顺序在逐 hook 消息之后。
+     *
+     * <p><b>isMeta=true 读侧后果</b>（同 §14 先例说理，LlmAgentLoop.java:11583-11590）：
+     * {@code lastUserMessageId}（!isMeta 过滤）/ pivot 候选过滤不再被 hook 行劫持（user_message_id
+     * 不指向 hook 随机 UUID）、{@code countNonMetaMessages} 计数不虚高、前端按 isMeta 不渲染为气泡；
+     * 模型面不受影响（isMeta 绝不用于模型侧过滤）。
      *
      * @param ctx 压缩上下文
-     * @return hook 结果消息列表（无 hook / 无输出 → 空）
+     * @return hook 附加消息列表（逐 hook 的 system-reminder 回执 + hook_additional_context 聚合行）
      */
     public static List<ChatMessageDto> processSessionStartHooks(CompactConversationContext ctx) {
         HookRegistry registry = ctx.getHookRegistry();
@@ -135,21 +157,65 @@ public final class CompactHooks {
         }
         List<ChatMessageDto> hookMessages = new ArrayList<>();
         // △-5 附加通道（对齐 CC sessionStart.ts:141-156）：additionalContext（单值）+
-        // watchPaths 收集；CC 聚合顺序 = 逐 result push message，最后 push
-        // hook_additional_context 附件消息（sessionStart.ts:163-172）。
+        // watchPaths 收集；CC 顺序 = 逐 result 推入 message（hook 回执见下方与方法 JavaDoc），
+        // 最后 push hook_additional_context 附件消息（sessionStart.ts:163-172）。
         List<String> additionalContexts = new ArrayList<>();
         List<String> allWatchPaths = new ArrayList<>();
         for (GenericHook.HookResult result : results) {
             if (result.outcome() != GenericHook.HookOutcome.SUCCESS) {
                 continue;
             }
-            String output = outputOf(result);
-            if (!output.isEmpty()) {
-                hookMessages.add(new ChatMessageDto(
-                    UUID.randomUUID().toString(), ctx.getSessionId(), Role.user, "hook",
-                    output, null, List.of(), FinishReason.stop,
-                    null, null, "刚刚", OffsetDateTime.now(), null, null, null,
-                    List.of(), List.of(), null, false, false));
+            // [压缩回执外显修复] 按 CC attachment→message 分派（messages.ts:4090-4116）：
+            //   ① hook_success：content 非空（!isEmpty，严格对齐 CC content === ''；⛔ 不用 isBlank 等更严判据）
+            //      且 hookEvent ∈ {SessionStart, UserPromptSubmit}（事件门 messages.ts:4100-4105）→ 产
+            //      `{hookName} hook success: {content}`；JSON 型 content=''（hooks.ts:729）→ 门内判空拦截。（事件门依据 att.hookEvent——producer 经 HookRegistry:5059 ccName 填充；plugin 双注册 lambda 副本 hookEvent=null 被门抑制属重复副本，正式副本照产、无消息丢失。）
+            //   ② hook_blocking_error：无事件门（messages.ts:4090-4097）→ 产
+            //      `{hookName} hook blocking error from command: "{command}": {blockingError}`。
+            //      承重：JSON {"decision":"block"}（HookOutputParser.java:302-311 → :463-465）产 blocking
+            //      attachment 且 outcome 恒 SUCCESS（:480-482）——⛔ 不带 type 门时会被错套 "hook success" 前缀。
+            //   ③ 其它 type / String 等其它形态 message：无 CC attachment 对应物 → 不产（debug 日志仅覆盖非 attachment 形态；attachment 其它 type 静默，可达性≈0，outcome 门先拦）。
+            //   等价性承重前提：producer 侧 content 已 trim / 恒空（CommandHookExecutor.java:1699
+            //   stdout.trim()；HookOutputParser.java:467-468 content 恒 ""）⇒ !isEmpty 与 CC content === '' 等价；
+            //   与 LlmAgentLoop.java:11608 的 isBlank 差异为刻意（对齐 CC 判空）。
+            if (result.message() instanceof AttachmentMessageDto att) {
+                // hookName 缺省链同 LlmAgentLoop.resolveHookName（attachment.hookName → 事件名
+                //   → "Hook"）：绝不产出 "null hook success: " 这类伪造前缀（不伪造、不留空）。
+                String hookName = att.hookName() != null && !att.hookName().isBlank()
+                    ? att.hookName()
+                    : (att.hookEvent() != null && !att.hookEvent().isBlank() ? att.hookEvent() : "Hook");
+                if ("hook_success".equals(att.type())
+                        && att.content() != null && !att.content().isEmpty()
+                        && ("SessionStart".equals(att.hookEvent()) || "UserPromptSubmit".equals(att.hookEvent()))) {
+                    hookMessages.add(new ChatMessageDto(
+                        UUID.randomUUID().toString(), ctx.getSessionId(), Role.user, "hook",
+                        "<system-reminder>\n" + hookName + " hook success: " + att.content()
+                            + "\n</system-reminder>",
+                        null, List.of(), FinishReason.stop,
+                        null, null, "刚刚", OffsetDateTime.now(), null, null, null,
+                        List.of(), List.of(), null, true, false));
+                } else if ("hook_blocking_error".equals(att.type())) {
+                    // 取数：CC blockingError.{command,blockingError} 在 Java 落 att.command() 与
+                    //   att.blockingError()（AttachmentMessageDto.hookBlockingError 工厂把 blockingError
+                    //   文本同写 content 与 blockingError() 两字段，:583-587；此处兜底取 content）。
+                    //   command 缺省 ""（同 AgentLoopContext.renderHookAttachmentForLlm :3554 先例）。
+                    String command = att.command() != null ? att.command() : "";
+                    String blockingText = att.blockingError() != null ? att.blockingError()
+                        : (att.content() != null ? att.content() : "");
+                    hookMessages.add(new ChatMessageDto(
+                        UUID.randomUUID().toString(), ctx.getSessionId(), Role.user, "hook",
+                        "<system-reminder>\n" + hookName + " hook blocking error from command: \""
+                            + command + "\": " + blockingText + "\n</system-reminder>",
+                        null, List.of(), FinishReason.stop,
+                        null, null, "刚刚", OffsetDateTime.now(), null, null, null,
+                        List.of(), List.of(), null, true, false));
+                }
+            } else if (result.message() != null) {
+                // [fail-loud 可查] String / 其它形态 message 无 CC hook_success attachment 对应物
+                //   （CC 该路径 result.message 恒为 attachment 消息对象，hooks.ts:710-736 / :2628-2643）→ 不产消息。
+                if (log.isDebugEnabled()) {
+                    log.debug("[CompactHooks] SessionStart hook 结果 message 无 CC attachment 对应物（{}）→ 不产消息",
+                        result.message().getClass().getName());
+                }
             }
             // △-5 · CC original: hookResult.additionalContexts（sessionStart.ts:145-149）·
             //   Java HookResult.additionalContexts 为 List<String>（H-WF5a-02 折叠链项2, 全保留）
@@ -271,9 +337,10 @@ public final class CompactHooks {
      *
      * <p><b>[P1-6 修复] WHY 取 attachment 的 stdout/stderr 而非 {@code message().toString()}</b>：
      * CC 的 {@code output} 是 <b>hook 进程的文本输出</b> —— command hook 成功取 stdout、失败取 stderr
-     * （utils/hooks.ts:3476-3480），HTTP hook 取 body（:3390-3400）。CompactHooks 三个消费点
-     * （PreCompact newCustomInstructions / SessionStart hook 消息 / PostCompact userDisplayMessage）
-     * 在 CC 都派生自该文本。Java 的等价文本落在 {@link AttachmentMessageDto} 的
+     * （utils/hooks.ts:3476-3480），HTTP hook 取 body（:3390-3400）。CompactHooks 消费点
+     * （PreCompact newCustomInstructions / PostCompact userDisplayMessage）在 CC 均派生自该文本；
+     * SessionStart 侧回执不经本函数（直接取 attachment.content，见 {@link #processSessionStartHooks}）。
+     * Java 的等价文本落在 {@link AttachmentMessageDto} 的
      * {@code stdout}/{@code stderr}（CommandHookExecutor 逐字段对齐 CC 3800 行）；
      * 旧实现取 {@code message().toString()} → 结构化 DTO 的 toString 被当成 hook 输出
      * （DB 实证：{@code content=AttachmentMessageDto[id=8f85a058-…, messageType=attachment, type=hook_success,
