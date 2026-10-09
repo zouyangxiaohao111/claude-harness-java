@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyEdits, bulletFix, headingFix, isSepRow, passFence, passMarkers, passTable, relLines, repair, tableSplit, PROD_REPAIR_OPTS } from '../rescue.ts'
+import { applyEdits, bulletFix, headingFix, isSepRow, passFence, passGlue, passMarkers, passTable, relLines, repair, tableSplit, PROD_REPAIR_OPTS } from '../rescue.ts'
 import { parseGfmWithMath } from '../parse.ts'
 
 describe('rescue · 工具层', () => {
@@ -295,30 +295,157 @@ describe('rescue · P1e 闸门：拆完**真能成表**才拆（判据来自真�
   })
 })
 
-describe('rescue · P2 标题规则', () => {
-  it('CJK 开头、短、无黑名单 → 补空格', () => {
+describe('rescue · P1.5 拆行抢救（判据来自全库评估原型；语料行逐字节取自真库）', () => {
+  it('表格：行尾 | 且 body 含 | → 首个 | 前拆（拆出的标题段同时补空格）', () => {
+    // 真库 msg 92df5bf1 原行（其下一行是 3 格分隔行）
+    expect(passGlue('##全部完成 ✅|任务 |状态 |验证 |\n').src)
+      .toBe('## 全部完成 ✅\n|任务 |状态 |验证 |\n')
+  })
+
+  it('表格 + 分隔行：整套 repair 后仍是 heading + table（P1 先接走；两处拆点相同）', () => {
+    const src = '##全部完成 ✅|任务 |状态 |验证 |\n|---|---|---|\n| 打包 | 完成 | ✅ |\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.out).toBe('## 全部完成 ✅\n|任务 |状态 |验证 |\n|---|---|---|\n| 打包 | 完成 | ✅ |\n')
+    expect(parseGfmWithMath(r.out).children.map((c) => c.type)).toEqual(['heading', 'table'])   // 拆完真成表（P1 闸门）
+  })
+
+  it('围栏：``` 前拆（真库 msg 4af6f64e 原行）', () => {
+    expect(passGlue('##路径（请核对）```\n').src).toBe('## 路径（请核对）\n```\n')
+  })
+
+  it('行内第二标题号：# 后不跟字母数字 → 拆，且两段各自补空格（真库 msg 399f9238 原行）', () => {
+    expect(passGlue('##待讨论的6个点###①鉴权（硬阻塞，必须解决）\n').src)
+      .toBe('## 待讨论的6个点\n### ①鉴权（硬阻塞，必须解决）\n')
+  })
+
+  it('数字列表：1. 前拆（真库 msg e386b363 原行）', () => {
+    const src = '##已完成1. ✅ **任务1+2（docx预览修复）**——审查通过（"准备好合并：是"，无严重项）\n'
+    expect(passGlue(src).src)
+      .toBe('## 已完成\n1. ✅ **任务1+2（docx预览修复）**——审查通过（"准备好合并：是"，无严重项）\n')
+  })
+
+  it('连字符列表：- 前拆（真库 msg 728c9d4f 原行）', () => {
+    const src = '##对你场景（本地文件 + Tauri桌面）的过滤结论- ❌ **微软 Office Web Viewer**：强制 `?src=`公网 URL，`file://`和内网路径直接报错 → **本地场景排除**\n'
+    expect(passGlue(src).src)
+      .toBe('## 对你场景（本地文件 + Tauri桌面）的过滤结论\n- ❌ **微软 Office Web Viewer**：强制 `?src=`公网 URL，`file://`和内网路径直接报错 → **本地场景排除**\n')
+  })
+
+  it('单井号 + 围栏拆：补空格必须打在**段**上（整行判据会被行尾 ``` 拒绝）（真库 msg 6e81b188 原行）', () => {
+    expect(repair('#二、生产阶段：6步，谁产生什么```\n', PROD_REPAIR_OPTS).out)
+      .toBe('# 二、生产阶段：6步，谁产生什么\n```\n')
+  })
+})
+
+describe('rescue · P1.5 误拆防护（原型约束：不拆不该拆的）', () => {
+  it('颜色值 `#FF7A45`（# 后跟字母数字）不是第二个标题号 → 不拆', () => {
+    const short = '##这版基准 `#FF7A45`/`#F97316` 亮橙\n'
+    expect(passGlue(short).src).toBe(short)
+    // 真库 msg 36e9e71b 原行（长、含 ** 与多处颜色值）
+    const real = '##这版的基准是你给的文件**视觉100%沿用你的 `场景选择中心-mock.html`**：`#FF7A45`/`#F97316`亮橙、`#FAF7F1`米白侧栏、`#FDFBF7`画布、三列场景卡、圆角14px、hover上浮。我没有自造任何配色。\n'
+    expect(passGlue(real).src).toBe(real)
+  })
+
+  it('编号标题 `##2. MCP：…`（数字在 rest 起始位）不是数字列表 → 不拆，但补空格', () => {
+    const src = '##2. MCP：`nexusai-in-chrome`（浏览器自动化）\n'
+    expect(passGlue(src).src).toBe(src)
+    expect(repair(src, PROD_REPAIR_OPTS).out).toBe('## 2. MCP：`nexusai-in-chrome`（浏览器自动化）\n')
+  })
+
+  it('行内代码里的 `1. ` 不是拆点（inCodeBefore 判据）', () => {
+    const src = '##用法 `a1. b` 说明\n'
+    expect(passGlue(src).src).toBe(src)
+    expect(repair(src, PROD_REPAIR_OPTS).out).toBe('## 用法 `a1. b` 说明\n')
+  })
+
+  it('拆点落在井号正后（`####|a |b |` / `#|a |b |` / `####``` `）→ 不拆（否则拆出 ATX 空标题；与 P1 tableSplit 同款闸）', () => {
+    expect(passGlue('####|a |b |\n').src).toBe('####|a |b |\n')
+    expect(passGlue('#|a |b |\n').src).toBe('#|a |b |\n')
+    expect(passGlue('####```\n').src).toBe('####```\n')
+    expect(repair('####|a |b |\n', PROD_REPAIR_OPTS).out).toBe('####|a |b |\n')
+  })
+
+  it('围栏内的 `#` 行一律不动（顶层段落判据天然排除，不是裸文本扫描）', () => {
+    const src = '```\n# 这是代码注释\n##include <x>\n```\n'
+    expect(repair(src, PROD_REPAIR_OPTS).out).toBe(src)
+  })
+
+  it('已知残差（登记待裁定）：P0 判整篇不闭合而放弃时，拆出的 ``` 仍会吞后文', () => {
+    // ⚠️ 断言的是**当前行为**（原型拆行无平衡闸，P0 的平衡闸只作用于它自己的提行），不是期望行为。
+    // 真库 msg 6e81b188：`#二、生产阶段…``` ` 的下一行就是 `① docx_chunker.py …`
+    const src = '#二、生产阶段：6步，谁产生什么```\n① docx_chunker.py ←把 Word切成一"块块"\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    expect(r.out).toBe('# 二、生产阶段：6步，谁产生什么\n```\n① docx_chunker.py ←把 Word切成一"块块"\n')
+    expect(parseGfmWithMath(r.out).children.map((c) => c.type)).toEqual(['heading', 'code'])
+  })
+})
+
+describe('rescue · P1.5 与下游树的对应（拆行改文本 ⇒ 旧树必须作废）', () => {
+  it('拆行 + 多段：P1.5 有编辑时必须弃用 P1 的树（与逐 pass 各 parse 一次的参照链逐字节相同）', () => {
+    // 真库 msg 399f9238 第 1 行（要拆）+ 段内后续行 + 末行（P3 的 `-CJK` 靶子）：
+    // 拆行把末行的位置整体后移 ⇒ 复用拆行前的树会拿旧 position 切出「`-`」这种半截行。
+    const src = '##待讨论的6个点###①鉴权（硬阻塞，必须解决）\n继续行\n-配置表\n'
+    const p1 = passTable(passFence(src).src, PROD_REPAIR_OPTS.tableHeader)
+    const ps = passGlue(p1.src, p1.root)
+    // 参照链：passMarkers 自己 parse 拆后的文本（不复用任何旧树）
+    const ref = passMarkers(ps.src).src
+    expect(repair(src, PROD_REPAIR_OPTS).out).toBe(ref)
+    expect(ref).toBe('## 待讨论的6个点\n### ①鉴权（硬阻塞，必须解决）\n继续行\n- 配置表\n')
+    // 前提门 1：本条确实走「P1.5 改了文本、P0/P1 没改」这条路径（旧短路条件成立、新条件不成立）
+    expect(passFence(src).src).toBe(src)
+    expect(p1.edits).toHaveLength(0)
+    expect(ps.edits.length).toBeGreaterThan(0)
+    // 前提门 2（反面对照，须可达）：拿拆行前的树配拆行后的文本 → 结果**必须**不同。
+    // 否则本用例对「复用旧树」这件事无判别力（变异验证：把 reuseRoot 的 ps 条件去掉，本条必须转红）。
+    expect(passMarkers(ps.src, p1.root).src).not.toBe(ref)
+  })
+})
+
+describe('rescue · P2 标题规则（判据 = 原型 healHeading，2026-10-09 放宽）', () => {
+  it('CJK 开头、短 → 补空格（编号标题同样补：数字起始只挡拆行，不挡补空格）', () => {
     expect(headingFix('##一句话结论')).toEqual({ fixed: '## 一句话结论' })
-    expect(headingFix('###②审查选项')).toMatchObject({ reject: 'not-cjk-or-ordinal' })
     expect(headingFix('##1.内置工具')).toEqual({ fixed: '## 1.内置工具' })
   })
 
-  it('负例：单 # / 拉丁开头 / 超长 / 含 ** / 含行内 ## / 句末标点', () => {
-    expect(headingFix('#tag 话题')).toMatchObject({ reject: 'hash-count-1' })
-    expect(headingFix('##spec 同步')).toMatchObject({ reject: 'not-cjk-or-ordinal' })
-    expect(headingFix('##标题**粗体**')).toMatchObject({ reject: 'contains-**' })
-    expect(headingFix('##A##B')).toMatchObject({ reject: 'contains-embedded-hash' })
-    expect(headingFix('##回答：不能确认。两篇都没抽全。')).toMatchObject({ reject: 'ends-sentence-punct' })
+  it('放宽：旧四道限制误杀的真标题一律补空格（真库语料逐字节）', () => {
+    // 单井号（旧 `hash-count-1` 拒绝；`#tag 话题` 一并放行 —— 与 `#五、…` 同族，判据不区分拉丁/中文）
+    expect(headingFix('#五、完整的"来源→被谁读→得到什么"')).toEqual({ fixed: '# 五、完整的"来源→被谁读→得到什么"' })
+    expect(headingFix('#tag 话题')).toEqual({ fixed: '# tag 话题' })
+    // 首字符非 CJK、非编号（旧 `not-cjk-or-ordinal` 拒绝）
+    expect(headingFix('##★一个遗留待你拍')).toEqual({ fixed: '## ★一个遗留待你拍' })
+    expect(headingFix('##spec 同步')).toEqual({ fixed: '## spec 同步' })
+    // 含右书名号（旧 `contains-」` 拒绝）
+    expect(headingFix('##A」B')).toEqual({ fixed: '## A」B' })
+    // 含双星号（旧 `contains-**` 拒绝）
+    expect(headingFix('##标题**粗体**')).toEqual({ fixed: '## 标题**粗体**' })
+    // `？` 结尾（旧 `ends-sentence-punct` 拒绝）
+    expect(headingFix('###②审查选项要不要暴露给用户？')).toEqual({ fixed: '### ②审查选项要不要暴露给用户？' })
+    // 超长（旧 `len>30` 拒绝）
+    expect(headingFix('##' + '很'.repeat(31))).toEqual({ fixed: '## ' + '很'.repeat(31) })
+    // 长 + 双星 + 右书名号三者同时命中（真库 msg d83e48d8 原行，旧判据三道限制全挂）
+    expect(headingFix('##你问的「⑧是AI还是机器」——**机器，纯代码，一句AI判断都没有**'))
+      .toEqual({ fixed: '## 你问的「⑧是AI还是机器」——**机器，纯代码，一句AI判断都没有**' })
+    // `：`/`；` 结尾（旧 `ends-sentence-punct` 拒绝；2026-10-09 用户裁定改为治）
+    expect(headingFix('##结果：**还没完**——硬强制那个执行者**仍在跑**，但它**已落盘的部分我看过了、方向全对**：'))
+      .toEqual({ fixed: '## 结果：**还没完**——硬强制那个执行者**仍在跑**，但它**已落盘的部分我看过了、方向全对**：' })
+    expect(headingFix('##待你决策HTML功能在独立分支上，有三种整合方式：'))
+      .toEqual({ fixed: '## 待你决策HTML功能在独立分支上，有三种整合方式：' })
+    // 端到端（repair 链）同样治 —— 这两条走 P2 补空格臂（真库 msg 0ab3b675 原行）
+    expect(repair('##结果：**还没完**——硬强制那个执行者**仍在跑**，但它**已落盘的部分我看过了、方向全对**：\n', PROD_REPAIR_OPTS).out)
+      .toBe('## 结果：**还没完**——硬强制那个执行者**仍在跑**，但它**已落盘的部分我看过了、方向全对**：\n')
   })
 
-  it('负例：含竖线 / 右书名号 / 三反引号串（三条判据在真实语料上均有命中）', () => {
+  it('负例（三类拒绝）：单井号+数字 / 含句号 / 残余粘连', () => {
+    // `#6` 是引用编号，不是标题（真库 msg 47a87117 原行）
+    expect(headingFix('#6确实已改（L862 `tool_check_progress`，L867注释写明"显式列出未覆盖chunk"）。读完整实现确认四项真实状态。'))
+      .toMatchObject({ reject: 'single-hash-digit' })
+    // 含句号 → 像正文（真库 msg 5bb30c40 原行；句号不在结尾也算）
+    expect(headingFix('##环境：已具备`docker29.4.3`（WSL2 backend running）、`python3.14.4`、`uv0.11.7`、`git`都在。可以跑。（风险点：Python3.14很新，terminal-bench可能有兼容问题，必要时用3.12。）'))
+      .toMatchObject({ reject: 'contains-。' })
+    expect(headingFix('##回答：不能确认。两篇都没抽全。')).toMatchObject({ reject: 'contains-。' })
+    // 残余粘连三道（该由 P1/P1.5 先拆开再判）
     expect(headingFix('##A|B')).toMatchObject({ reject: 'contains-|' })
-    expect(headingFix('##A」B')).toMatchObject({ reject: 'contains-」' })
+    expect(headingFix('##A##B')).toMatchObject({ reject: 'contains-embedded-hash' })
     expect(headingFix('##A```B')).toMatchObject({ reject: 'contains-fence-run' })
-  })
-
-  it('长度门边界：30 接受、31 拒绝', () => {
-    expect(headingFix('##' + '很'.repeat(30))).toEqual({ fixed: '## ' + '很'.repeat(30) })
-    expect(headingFix('##' + '很'.repeat(31))).toMatchObject({ reject: 'len>30' })
   })
 
   it('带空格的合法标题不动（无 marker）', () => {

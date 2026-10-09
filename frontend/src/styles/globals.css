@@ -1204,7 +1204,7 @@ html {
 .msg .avatar { width: 32px; height: 32px; border-radius: 8px; background: #E65C00; font-weight: 700; }
 .msg.assistant .avatar { background: #E65C00; }
 .msg.assistant .body { max-width: 85%; background: transparent; font-size: var(--fs-body, 15px); line-height: 1.7; color: #333; }
-.msg .content { font-size: 15px; line-height: 1.7; color: #333; }
+.msg .content { font-size: 16px; line-height: 28px; color: #333; }
 .msg .content p { color: #333; }
 /* [2026-10-09] 旧 .user-bubble 视觉块已删除：该块被文末「User Bubble」块（约 :2230）全量覆盖成
    浅蓝底 / 580px 固定宽的形态，两处定义长期分裂。按用户裁定取「白底 + 柔和立体阴影 + 20px 圆角 +
@@ -1260,15 +1260,20 @@ html {
 
 .msg .content {
   color: var(--ink-strong);
-  font-size: var(--fs-body, 15px); /* 对齐 deepseek-harness 正文舒展（16px）· 桌面紧凑折中 15px */
-  line-height: 1.7;
+  font-size: var(--fs-body, 16px); /* 2026-10-09 用户拍板对齐 dsh：正文 16px / 行高 28px（原 15px 紧凑折中） */
+  line-height: 28px;
 }
 
 .msg .content p {
-  margin-bottom: 8px;
+  margin: 16px 0; /* dsh: .markdown p { margin: 16px 0 } */
 }
 
-.msg .content p:last-child {
+/* dsh：首/尾子元素贴边（原仅 p:last-child 一条） */
+.msg .content > *:first-child {
+  margin-top: 0;
+}
+
+.msg .content > *:last-child {
   margin-bottom: 0;
 }
 
@@ -1287,7 +1292,7 @@ html {
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
   padding: 12px 14px;
-  margin: 8px 0;
+  margin: 16px 0; /* 2026-10-09 对齐 dsh：pre { margin: 16px 0 } */
   overflow-x: auto;
   font-size: 12px;
   line-height: 1.55;
@@ -1307,20 +1312,26 @@ html {
 
 /* md 渲染（marked + DOMPurify）：标题/列表/链接/引用/表格/分割线 */
 .msg .content.md h1, .msg .content.md h2, .msg .content.md h3, .msg .content.md h4 {
-  margin: 14px 0 8px;
+  margin: 32px 0 16px; /* 2026-10-09 对齐 dsh（h1-h3 32px/16px） */
   font-weight: 600;
   color: var(--ink);
   line-height: 1.4;
+}
+/* dsh：h4 单独 16px；:where(h5,h6) 同 16px */
+.msg .content.md h4, .msg .content.md h5, .msg .content.md h6 {
+  margin: 16px 0;
 }
 .msg .content.md h1 { font-size: 1.35em; }
 .msg .content.md h2 { font-size: 1.25em; }
 .msg .content.md h3 { font-size: 1.1em; }
 .msg .content.md h4 { font-size: 1em; }
 .msg .content.md ul, .msg .content.md ol {
-  margin: 8px 0;
+  margin: 16px 0; /* 2026-10-09 对齐 dsh；padding-left 22px 是 marker 缩进补偿（非间距），保持不动 */
   padding-left: 22px;
 }
-.msg .content.md li { margin: 4px 0; }
+.msg .content.md li { margin: 0; }
+.msg .content.md li:not(:first-child) { margin-top: 6px; } /* dsh */
+.msg .content.md li > p { margin: 8px 0; } /* dsh: li > p { margin: 8px 0 } */
 .msg .content.md a {
   color: var(--accent);
   text-decoration: none;
@@ -1329,7 +1340,7 @@ html {
 .msg .content.md blockquote {
   border-left: 3px solid var(--hairline);
   padding: 2px 0 2px 12px;
-  margin: 8px 0;
+  margin: 16px 0 0; /* 2026-10-09 对齐 dsh：blockquote { margin: 16px 0 0 } */
   color: var(--ink-muted);
 }
 .msg .content.md table {
@@ -1352,14 +1363,14 @@ html {
 .msg .content.md hr {
   border: none;
   border-top: 1px solid var(--hairline);
-  margin: 14px 0;
+  margin: 32px 0; /* 2026-10-09 对齐 dsh：hr { margin: 32px 0 } */
 }
 
 /* ===== mdast 增量渲染器（MarkdownText / CodeBlock）样式 · 移植 deepseek-harness ===== */
 /* 代码块容器：banner + 正文 pre（覆盖 .msg .content pre 的通用边框/背景/圆角） */
 .msg .content.md .md-code-block,
 .msg.user .user-bubble .md-code-block {
-  margin: 8px 0;
+  margin: 16px 0; /* 2026-10-09 对齐 dsh：pre { margin: 16px 0 } */
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
   background: var(--surface-1);
@@ -9048,7 +9059,7 @@ html {
          Mac13≈1224 / Mac16≈1469 / 1920 屏≈1632 / 4K@150%≈2176。 */
 :root {
   --fs-base: 13px;   /* body 根字号（继承文本基线） */
-  --fs-body: 15px;   /* 消息正文/用户气泡 */
+  --fs-body: 16px;   /* 消息正文/用户气泡（2026-10-09 用户拍板对齐 dsh：固定 16px，取代窄窗 15px 折中） */
   --fs-input: 16px;  /* 输入框 */
   --fs-list: 14px;   /* 会话列表 */
 }

@@ -18,6 +18,12 @@
  *
  * 出处：本实现移植自已全库验证的原型（1143 条真实消息：79 改善 / 0 回归 /
  * 干净对照 0 误伤），规则与判据逐条对应 prototype `engine.ts`。
+ *
+ * P1.5（拆粘连行 + 放宽补空格判据，2026-10-09）移植自先期验证原型，判据经
+ * 真库全量评估（3393 行裸奔语料：拆行 899 行命中 = table 578 / fence 142 / numlist 70 /
+ * hash2 66 / dash 62，各类样本逐条人工审过；补空格相对旧 headingFix 去掉
+ * 长度 / 含双星 / 含右书名号 / 首字符 四道限制 —— 它们在真库上误杀真标题）。
+ * 逐条对应原型，未加新规则；唯一例外见 `headingFix`（`：/；` 结尾的拒绝按 2026-10-09 用户裁定去掉）。
  */
 
 import { parseGfmWithMath } from './parse.ts'
@@ -308,7 +314,7 @@ export function passTable(src: string, headings = false): TablePassResult {
 export interface Reject {
   /** 产生该记录的 pass。 */
   pass: 'heading' | 'bullet' | 'ordered'
-  /** 拒绝理由（例如 'not-cjk' / 'len>30' / 'out-of-scope'）。 */
+  /** 拒绝理由（例如 'no-marker' / 'contains-|' / 'out-of-scope'）。 */
   reason: string
   /** 原始行文本。 */
   line: string
@@ -322,29 +328,40 @@ export interface MarkerPassResult extends PassResult {
   rejects: Reject[]
 }
 
+/** 裸奔标题行：`#{1,6}` 后**紧跟非空白**（拆行与补空格的共同入口判据）。
+ *  `(?!#)` 强制 #{1,6} 取极大 hash 串：否则贪婪+回溯会把 '## 已合规' 拆成 hashes='#'
+ *  + rest='# 已合规'，误报「单井号」（该行明明有 2 个 #）。 */
+const GLUED_HEADING = /^(#{1,6})(?!#)(\S.*)$/
+
 /**
- * 标题规则（`##` + 无空格形态）。返回补好空格的行，或一个拒绝理由。
+ * 标题规则（`#{1,6}` + 无空格形态）。返回补好空格的行，或一个拒绝理由。
  * 拒绝即保持原样（继续裸露）—— 保守优先，宁可少救不可误伤。
+ *
+ * 判据 = 原型 `healHeading`（2026-10-09 实装，**整段替换**旧判据）：
+ * 旧判据的四道限制（`[...rest].length > 30` / 含 `**` / 含 `」` / 首字符非 CJK 或编号）
+ * 在真库裸奔语料上实测**误杀真标题**（`##你问的「⑧是AI还是机器」——**机器，纯代码…**` 长且含双星、
+ * `##★一个遗留待你拍` 星号开头、`#五、完整的"来源→被谁读→得到什么"` 单井号），一并去除；
+ * `？`/`！` 结尾也不再算句末标点（`###②审查选项要不要暴露给用户？` 是真标题）；
+ * `：`/`；` 结尾同样不再拒绝 —— 2026-10-09 用户裁定（`##结果：**还没完**——…：`、
+ * `##待你决策HTML功能在独立分支上，有三种整合方式：` 都要整行变标题）；
+ * 此处与先期原型有一处**有意分歧**（原型保留 `/[：；]\s*$/` 拒绝）。
+ * 只留三类拒绝（其余形态一律补空格）：
+ * - `#6…`：单井号 + 紧跟数字 —— 引用编号不是标题；
+ * - 含 `。`：像正文（`##环境：已具备…可以跑。（风险点：…`）；
+ * - 残余粘连（含 `|` / 三反引号串 / `#`）：该由 P1 / P1.5 先拆开再判 ——
+ *   整行直接补空格会把表格、围栏或下一个标题一起并进标题文本。
  */
 export function headingFix(line: string): { fixed: string } | { reject: string } {
-  // `(?!#)` 强制 #{1,6} 取极大 hash 串：否则贪婪+回溯会把 '## 已合规' 拆成 hashes='#'
-  // + rest='# 已合规'，误报 hash-count-1（该行明明有 2 个 #）。
-  const m = /^(#{1,6})(?!#)(\S.*)$/.exec(line)
+  const m = GLUED_HEADING.exec(line)
   if (m === null) return { reject: 'no-marker' }
   const hashes = m[1]!
   const rest = m[2]!
-  if (hashes.length < 2) return { reject: 'hash-count-1' }
-  if (rest.includes('**')) return { reject: 'contains-**' }
-  // 中文右书名号结尾的行（真实语料命中 4 行）
-  if (rest.includes('」')) return { reject: 'contains-」' }
-  // 挡住「正文行被整行变成标题」的那道闸（真实语料命中 23 行）
+  if (hashes.length === 1 && /^\d/.test(rest)) return { reject: 'single-hash-digit' }
+  if (rest.includes('。')) return { reject: 'contains-。' }
+  // 残余粘连三道（同一族：行内还有没拆的块级标记）
   if (rest.includes('|')) return { reject: 'contains-|' }
   if (/#/.test(rest)) return { reject: 'contains-embedded-hash' }
-  // 行内含三反引号串（真实语料命中 4 行）
   if (/`{3,}/.test(rest)) return { reject: 'contains-fence-run' }
-  if (/[：。；！？]\s*$/.test(rest)) return { reject: 'ends-sentence-punct' }
-  if ([...rest].length > 30) return { reject: 'len>30' }
-  if (!CJK_START.test(rest[0]!) && !/^\d+[.、)）]/.test(rest)) return { reject: 'not-cjk-or-ordinal' }
   return { fixed: `${hashes} ${rest}` }
 }
 
@@ -355,6 +372,109 @@ export function bulletFix(line: string): { fixed: string } | { reject: string } 
   const rest = m[1]!
   if (!CJK_START.test(rest[0]!)) return { reject: 'not-cjk' }
   return { fixed: `- ${rest}` }
+}
+
+/** 位置 i 是否落在行内代码（反引号段）内 —— 落在其中即不是拆点（那是字面内容）。 */
+function inCodeBefore(s: string, i: number): boolean {
+  let n = 0
+  for (let k = 0; k < i; k++) if (s[k] === '`') n += 1
+  return n % 2 === 1
+}
+
+/** 单行的全部拆点（**相对本行起点**的列号，升序去重）。逐条照抄原型 `splitPoints`
+ * （各类都带「误拆形态」约束，真库样本逐条人工审过）：
+ * 1. 表格 `|`（行尾 `|` 且 body 含 `|` → 首个 `|` 前拆）；2. 围栏 ``` ``` ```；
+ * 3. 行内第二个标题号；4. 数字列表 `1. `；5. 连字符列表 `- `。 */
+function splitPoints(line: string, hashes: number): number[] {
+  const body = line.slice(hashes)
+  const pts: number[] = []
+  // 1) 表格：行尾 | 且 body 含 | → 首个 | 前拆
+  if (/\|\s*$/.test(line) && body.includes('|')) pts.push(hashes + body.indexOf('|'))
+  // 2) 围栏：``` 前拆
+  const f = body.indexOf('```')
+  if (f >= 0) pts.push(hashes + f)
+  // 3) 行内第二标题号：# 后不跟 [A-Za-z0-9]（排除 #FF7A45 / #include 这类）、不在行内代码内
+  const h2 = /#{1,6}(?!#)(?=[^\s\d#])/.exec(body)
+  if (h2 !== null) {
+    const after = body[h2.index + h2[0].length] ?? ''
+    if (!/[A-Za-z0-9]/.test(after) && !inCodeBefore(body, h2.index)) pts.push(hashes + h2.index)
+  }
+  // 4) 数字列表：不在 rest 起始位（排除 ##2. MCP 这类编号标题）、前字符非 *（防拆断加粗）、
+  //    不在行内代码内
+  const reNl = /\d+\.\s/g
+  let m: RegExpExecArray | null
+  while ((m = reNl.exec(body)) !== null) {
+    if (m.index > 0 && body[m.index - 1] !== '*' && !inCodeBefore(body, m.index)) {
+      pts.push(hashes + m.index)
+      break
+    }
+  }
+  // 5) 连字符列表：非空白非 - 后紧跟 `- `（中文直连形态，排除 A-B / 破折号）
+  const reDash = /[^\s-]-(?=\s)/g
+  while ((m = reDash.exec(body)) !== null) {
+    const p = m.index + 1
+    if (!inCodeBefore(body, p)) {
+      pts.push(hashes + p)
+      break
+    }
+  }
+  // 拆点必须落在正文里（> hashes）：拆点 = hashes 会拆出纯井号段（`####|a |b |` → `####` +
+  // `|a |b |`），那是 ATX 空标题（凭空多一个空 h4）—— P1 的 tableSplit 对同一形状有同款闸
+  //（`####|a |b |` / `#|a |b |` → 不拆），P1.5 必须一致，否则会把 P1 的闸绕过去。
+  return [...new Set(pts)].filter((p) => p > hashes).sort((a, b) => a - b)
+}
+
+/**
+ * P1.5 · 拆行抢救：把「标题号与正文整段粘连在同一行」的裸奔行按拆点插 `\n` 断开，
+ * 并给拆出的**每段**补标题空格（`##已完成- ✅ …` → `## 已完成` + `- ✅ …`）。
+ * 两处插入都是纯插入，逐条落进 `edits`（`kind` 区分：`split` / `heading`）。
+ *
+ * 为什么只作用于**顶层段落**内的行（与 passMarkers 同一架构判据，不是裸文本全行扫描）：
+ * 块级归属由真解析器裁定（C1/C3）—— 围栏、缩进代码块、表格里的 `#` 行天然不在 targets 内，
+ * 不必也不该自造块边界状态机（`##include <x>` 这种代码注释就是这么被挡住的）。
+ * 拆点判据本身是**行内**启发式（第一个 `|`、``` ``` ```、第二个标题号、`1. `、`- ` ——
+ * 行内没有「块边界」这回事），其正确性由不变量套件守（`rescue.invariant.test.ts` 的 A 组：
+ * 「repair 只做插入」），符合 C3 的「运行时闸门或测试，取成本较低者」。
+ *
+ * 与 P1 的分工：行尾带 `|` 的粘连行 P1 也拆、且拆点相同（都在首个 `|` 前），P1 先跑 ⇒
+ * 成表形态归 P1（它有「拆完真能成表」闸门）；本 pass 兜 P1 闸门放行的其余形态
+ * （真库实测：带分隔行的 578 行全由 P1 覆盖，另 321 行是 fence/numlist/hash2/dash）。
+ *
+ * ⚠️ 本 pass **改变行数** ⇒ 它之后的任何 pass 都不许再用旧的 mdast 树（见 `repair` 的 `reuseRoot`）。
+ * @param providedRoot 已解析好的树（须与 `src` 逐字节对应）。缺省自己 parse；
+ *   `repair` 在 P1 未改文本时复用 P1 的树，省掉一次全量 parse。
+ */
+export function passGlue(src: string, providedRoot?: DocRoot): PassResult {
+  const root = providedRoot ?? parseGfmWithMath(src)
+  const edits: Edit[] = []
+  for (const p of topParagraphs(root)) {
+    const a = p.position.start.offset
+    const b = p.position.end.offset
+    for (const { off, line } of relLines(src.slice(a, b))) {
+      const m = GLUED_HEADING.exec(line)
+      if (m === null) continue
+      const pts = splitPoints(line, m[1]!.length)
+      if (pts.length === 0) continue
+      const cuts = [0, ...pts]
+      for (let k = 0; k < cuts.length; k++) {
+        const segStart = cuts[k]!
+        if (k > 0) {
+          const at = a + off + segStart
+          edits.push({ start: at, end: at, text: '\n', pass: 'split', kind: 'split', line })
+        }
+        // 拆出的每段**单独**过标题判据：判据必须打在段上 —— 整行判据会被段外的残余形态
+        // （行尾的 ``` 、段里的 `|`）拒绝，而那正是要拆的原因。
+        const segEnd = k + 1 < cuts.length ? cuts[k + 1]! : line.length
+        const h = headingFix(line.slice(segStart, segEnd))
+        if ('fixed' in h) {
+          // 纯插入一个空格：`h.fixed` 是 `${hashes} ${rest}`，空格恒在 hashes.length 处
+          const ins = a + off + segStart + h.fixed.indexOf(' ')
+          edits.push({ start: ins, end: ins, text: ' ', pass: 'split', kind: 'heading', line })
+        }
+      }
+    }
+  }
+  return { src: applyEdits(src, edits), edits }
 }
 
 /**
@@ -428,6 +548,9 @@ export interface RepairResult {
    *  的唯一消费者是 `repair` 自己的 `reuseRoot`（纯优化），不必外传 —— 外传会让
    *  fail-safe 路径被迫编一棵空树，凭空造出"形状正常却零块"的静默谎。 */
   table: PassResult
+  /** P1.5（拆行）的子结果。它**会改行数** —— 它的编辑一旦非空，P1 的树就不能再给下游用
+   *  （见 `repair` 的 `reuseRoot`）。 */
+  glue: PassResult
   markers: MarkerPassResult
 }
 
@@ -441,29 +564,42 @@ export const PROD_REPAIR_OPTS = { tableHeader: true } as const
 /**
  * 抢救链（顺序不可换：P0 先做，才决定后面看到的块结构）。
  *
- * P0 围栏 → P1 表格 → P2/P3 标记。三个 pass 各自读真解析器的 mdast position（符合 C3）；
+ * P0 围栏 → P1 表格 → P1.5 拆行 → P2/P3 标记。四个 pass 各自读真解析器的 mdast position（符合 C3）；
  * 只在 settled 渲染前调用（C2）。各 pass 的诊断字段（`markers.rejects`）不参与决策
  * （注：`headingFix` 的 `(?!#)` 修正后，'## 已合规' 这类已合法标题不再进 rejects，属预期）。
  *
  * @param src 原始 markdown 源码
  * @param opts.tableHeader 是否启用 P1e（容器是活标题的表格），缺省 false
- * @returns 修补结果：`out` + 三个 pass 各自的子结果（偏移各自自洽，`fence.aborted` 不被吞）
+ * @returns 修补结果：`out` + 四个 pass 各自的子结果（偏移各自自洽，`fence.aborted` 不被吞）
  */
 export function repair(src: string, opts: { tableHeader?: boolean } = {}): RepairResult {
   try {
     const p0 = passFence(src)
     const p1 = passTable(p0.src, opts.tableHeader === true)
-    // 纯优化（输出逐字节不变）：P1 无编辑 ⇒ `applyEdits(p0.src, [])` 原样返回字符串，
-    // 故 p1.src 与 p0.src 逐字节相同 ⇒ P1 的树与 passMarkers 的输入对应，可直接复用，
+    // P1.5 的树复用同 P1 的口径：只有 P1 没改文本时，P1 的树才与 `p1.src` 逐字节对应。
+    const ps = passGlue(p1.src, p1.edits.length === 0 ? p1.root : undefined)
+    // 纯优化（输出逐字节不变）：P1 与 P1.5 都无编辑 ⇒ `applyEdits(x, [])` 原样返回字符串，
+    // 故 ps.src 与 p1.src 逐字节相同 ⇒ P1 的树与 passMarkers 的输入对应，可直接复用，
     // 省掉一次全量 parse（本函数因此通常只 parse 1 次）。
     // 注：`p1.edits.length === 0` 单独就已推出 `p1.src === p0.src`，故 `p0.src === src`
     // 是**冗余的额外收紧**（不是安全必要条件，作用只是「原文未被 P0 触碰」的显式复述）。
     // 保留而不简化：本条件只影响 parse 次数、不影响任何输出，少动一行少一分风险。
-    const reuseRoot = p0.src === src && p1.edits.length === 0 ? p1.root : undefined
-    const p2 = passMarkers(p1.src, reuseRoot)
+    //
+    // ⚠️ `ps.edits.length === 0` 是**安全必要条件**（不是优化）：P1.5 拆行改了行数与偏移，
+    // 旧树的位置与新文本不再对应 —— 漏掉这一条会让 passMarkers 拿着错位的 position 乱插空格
+    // （「拆行 + 多段」用例在 rescue.test.ts 里钉住这条）。
+    const reuseRoot =
+      p0.src === src && p1.edits.length === 0 && ps.edits.length === 0 ? p1.root : undefined
+    const p2 = passMarkers(ps.src, reuseRoot)
     // `table` 显式取 `PassResult` 两字段（不透传 `p1`）：`TablePassResult.root` 的偏移基准是
     // `p0.src`、与 `out` 不配套，运行时的形状就不该与声明不一致（同 `RepairResult.table` 的 JSDoc）。
-    return { out: p2.src, fence: p0, table: { src: p1.src, edits: p1.edits }, markers: p2 }
+    return {
+      out: p2.src,
+      fence: p0,
+      table: { src: p1.src, edits: p1.edits },
+      glue: { src: ps.src, edits: ps.edits },
+      markers: p2,
+    }
   } catch (err) {
     // fail-safe：抢救层任何异常都不该让消息渲染不出来 —— 退回原文，并显式告警而非静默
     // （静默回退会让「抢救层对所有消息永久失效」没有任何信号，front/CLAUDE.md 规则十二）。
@@ -473,6 +609,7 @@ export function repair(src: string, opts: { tableHeader?: boolean } = {}): Repai
       out: src,
       fence: { src, edits: [], aborted: false },
       table: fallback,
+      glue: fallback,
       markers: { src, edits: [], rejects: [] },
     }
   }
