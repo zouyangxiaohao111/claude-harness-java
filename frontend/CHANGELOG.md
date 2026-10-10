@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.31] - 2026-10-10
+
+### 修复
+- 修复收起两侧边栏时输入框未随对话区平铺的bug。
+
 ## [0.1.30] - 2026-10-10
 
 ### 修复
