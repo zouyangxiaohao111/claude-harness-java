@@ -424,6 +424,24 @@ public class AnthropicSdkProvider implements LlmProvider {
                 log.info("AnthropicSdkProvider stream aborted: SDK 流消费已中断, 跳过 onComplete");
                 return;
             }
+            // [stream-integrity 2026-10-10] 流完整性校验（断流 fail loud）——
+            //   事故 sess-bf736cb3（2026-10-10，8 条 out=0 + reasoning 半句）：DeepSeek /anthropic
+            //   端点在思考生成中途结束响应——HTTP 层正常完成（SDK 静默 EOF，零异常）但 SSE 缺
+            //   message_delta/message_stop。此前本仓把「流结束」一律当「正常说完」→ 断流被静默
+            //   包装成「正常的空回复」（用户看到「没有工具调用直接结束」）。命中判据即抛 IOException
+            //   → 外层 catch → 既有「非流式回退 + 重试」链接管（不再静默；正常流/合法「想完不说」
+            //   有 usage 佐证、不受影响）。判据与反例矩阵见 streamLooksTruncated + wire 测试。
+            if (streamLooksTruncated(state)) {
+                log.warn("AnthropicSdkProvider 流完整性校验失败（疑似服务端提前结束流·断流）: "
+                        + "finishReason={} contentLen={} reasoningLen={} toolCalls={} outputTokens={} "
+                        + "→ 按失败处理：走非流式回退/重试链",
+                    state.finishReason, state.content.length(), state.reasoning.length(),
+                    state.toolCalls.size(), state.outputTokens);
+                throw new java.io.IOException("AnthropicSdkProvider stream truncated: 流结束但缺有效终止信号"
+                    + "（finishReason=" + state.finishReason + ", contentLen=" + state.content.length()
+                    + ", reasoningLen=" + state.reasoning.length()
+                    + ", outputTokens=" + state.outputTokens + "）");
+            }
             consumePostCompactionAtApiSuccess(history);
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(buildAssistantMessage(state));
@@ -846,6 +864,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                                Consumer<String> onReasoningChunk,
                                java.util.Set<String> completedToolIds) {
         if (event.isMessageStart()) {
+            state.sawMessageStart = true; // [stream-integrity] CC partialMessage 等价物
             RawMessageStartEvent start = event.asMessageStart();
             var usage = start.message() != null ? start.message().usage() : null;
             if (usage != null) {
@@ -922,6 +941,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 }
             }
         } else if (event.isContentBlockStop()) {
+            state.sawCompletedBlock = true; // [stream-integrity] CC newMessages>0 等价信号（有完成块=有可用产出）
             int idx = (int) event.asContentBlockStop().index();
             ToolCallAccumulator acc = state.toolCalls.get(idx);
             if (acc != null && acc.isComplete() && completedToolIds != null
@@ -2953,6 +2973,11 @@ public class AnthropicSdkProvider implements LlmProvider {
         final Map<Integer, ToolCallAccumulator> toolCalls = new LinkedHashMap<>();
         int thinkingBlockIdx = -1;
         String finishReason = null;
+        // [stream-integrity 对齐 CC claude.ts:2337-2364] 流完整性信号：
+        //   sawMessageStart ≈ CC partialMessage；sawCompletedBlock ≈ CC newMessages.length>0
+        //   （有 content block 完成 = 消息可成形 / 有可用产出）。
+        boolean sawMessageStart = false;
+        boolean sawCompletedBlock = false;
         // [D-4] 流式 request_id 头（CC claude.ts:1834 streamRequestId=result.request_id · req_xxx 格式，
         //   非 message id msg_xxx）· 透传到 AssistantMessage.requestId 供 invokingRequestId 归因。
         String requestId = null;
@@ -3042,6 +3067,50 @@ public class AnthropicSdkProvider implements LlmProvider {
             usage,
             state.requestId
         );
+    }
+
+    /**
+     * [stream-integrity 2026-10-10] 流完整性检查 · 逐条对齐 CC claude.ts:2337-2364。
+     *
+     * <p><b>CC original（逐字摘录）</b>：
+     * <pre>
+     * // Detect when the stream completed without producing any assistant messages.
+     * // This covers two proxy failure modes:
+     * // 1. No events at all (!partialMessage): proxy returned 200 with non-SSE body
+     * // 2. Partial events (partialMessage set but no content blocks completed AND
+     * //    no stop_reason received): proxy returned message_start but stream ended
+     * //    before content_block_stop and before message_delta with stop_reason
+     * // Note: We must check stopReason to avoid false positives.
+     * if (!partialMessage || (newMessages.length === 0 && !stopReason)) { … throw … }
+     * </pre>
+     *
+     * <p><b>Java 映射</b>：{@code partialMessage} ≈ {@link StreamState#sawMessageStart}；
+     * {@code newMessages.length > 0} ≈ {@link StreamState#sawCompletedBlock}（本仓单流单消息模型下，
+     * 「有 content block 完成」即「消息可成形 / 有可用产出」）；{@code stopReason} ≈
+     * {@link StreamState#finishReason}。命中 → doStream 抛 IOException → 既有「非流式回退 + 重试」
+     * 链——与 CC {@code throw new Error('Stream ended without receiving any events')} →
+     * non-streaming fallback（claude.ts:2353 comment 'triggering non-streaming fallback'）同构。
+     *
+     * <p><b>信任原则（对齐 CC 'We must check stopReason to avoid false positives'）</b>：
+     * <ul>
+     *   <li>见到 stop_reason 即视为合法完成（含合法空轮——如 structured output 的空响应）；</li>
+     *   <li>有完成块即视为有可用产出（如工具块完成 → 参数可执行；即便随后流断也不判截断——
+     *       与 CC newMessages&gt;0 放行一致）。</li>
+     * </ul>
+     *
+     * <p>事故回放（sess-bf736cb3·8 条）：思考半句（块未闭合 → sawCompletedBlock=false）+
+     * 无 message_delta（finishReason=null）→ 条件②命中 ✓。
+     */
+    static boolean streamLooksTruncated(StreamState state) {
+        if (state == null) {
+            return false;
+        }
+        // ① 无任何事件（连 message_start 都没有，CC !partialMessage）→ proxy 返回 200 非 SSE 类
+        if (!state.sawMessageStart) {
+            return true;
+        }
+        // ② 有 message_start、但无完成块、且未收到 stop_reason（CC 二条件 AND）→ 提前结束
+        return !state.sawCompletedBlock && state.finishReason == null;
     }
 
     private static String normalizeBaseUrl(String baseUrl) {

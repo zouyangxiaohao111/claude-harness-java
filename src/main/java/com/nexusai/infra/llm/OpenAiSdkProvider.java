@@ -10,6 +10,12 @@ import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
+import com.nexusai.application.agent.api.ApiErrors;
+import com.nexusai.application.agent.recovery.ErrorClassifier;
+import com.nexusai.application.agent.recovery.RetryDelayCalculator;
+import com.nexusai.application.agent.recovery.RetryOptions;
+import com.nexusai.application.agent.recovery.TransientErrorHandler;
+import com.nexusai.application.agent.recovery.WithRetryEngine;
 import com.nexusai.infra.properties.NexusProperties;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
@@ -153,7 +159,7 @@ public class OpenAiSdkProvider implements LlmProvider {
             .collect(Collectors.joining("\n\n"));
         doStream(config, modelName, joined, history, tools, effortValue, null,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            aborted, onError, onComplete);
+            onStreamingFallback, aborted, onError, onComplete);
     }
 
     /**
@@ -196,7 +202,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         }
         doStream(config, modelName, systemPrompt, history, tools, effortValue, thinkingConfig,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            aborted, onError, onComplete);
+            onStreamingFallback, aborted, onError, onComplete);
     }
 
     /**
@@ -251,6 +257,7 @@ public class OpenAiSdkProvider implements LlmProvider {
                           Consumer<AssistantMessage> onAssistantMessage,
                           Consumer<ToolUseBlock> onToolCallComplete,
                           Consumer<String> onReasoningChunk,
+                          Runnable onStreamingFallback,
                           AtomicBoolean aborted,
                           Consumer<Throwable> onError,
                           Runnable onComplete) {
@@ -339,6 +346,21 @@ public class OpenAiSdkProvider implements LlmProvider {
                 log.info("OpenAiSdkProvider stream aborted: SDK 流消费已中断, 跳过 onComplete");
                 return;
             }
+            // [stream-integrity 2026-10-10 · 判据对齐 CC claude.ts:2337-2364] 流完整性检查——
+            //   openai 协议的「停止标记」= 末 chunk 的 finish_reason（OpenAI 规范：每个 choice 的
+            //   最终 chunk 必带；DeepSeek 实测每次正常流均有——2026-10-10 直连 19 次对照）。
+            //   流结束仍未见到 finish_reason ⇒ 与 CC 'no stop_reason received'（proxy 提前结束流）
+            //   同形态 → fail loud（log.warn + throw IOException）→ 本方法 catch → onError 上抛。
+            //   本通道无「非流式回退」（按裁定不配）；上层 withRetry 对连接类错误另有重试链
+            //   （ErrorClassifier.isConnectionError——IOException 以其语义进入）。
+            if (state.finishReason == null) {
+                log.warn("OpenAiSdkProvider 流完整性校验失败（疑似服务端提前结束流·断流）: "
+                        + "contentLen={} reasoningLen={} toolCalls={} → 按失败处理（未收到 finish_reason）",
+                    state.content.length(), state.reasoning.length(), state.toolCalls.size());
+                throw new java.io.IOException("OpenAiSdkProvider stream truncated: 流结束但未收到 finish_reason"
+                    + "（contentLen=" + state.content.length() + ", reasoningLen=" + state.reasoning.length()
+                    + ", toolCalls=" + state.toolCalls.size() + "）");
+            }
 
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(buildAssistantMessage(state));
@@ -360,9 +382,157 @@ public class OpenAiSdkProvider implements LlmProvider {
             if (aborted != null && aborted.get()) {
                 return; // abort 已发出 onError, 不重复报错
             }
-            log.error("OpenAiSdkProvider 流式调用失败: {}", e.toString());
-            onError.accept(translateSdkError(e));
+            RuntimeException translated = translateSdkError(e);
+            log.error("OpenAiSdkProvider 流式调用失败: {}", translated.toString());
+            // [stream-integrity 2026-10-10 · 行为同步 CC] 流式失败→非流式回退（CC claude.ts:2505-2562
+            //   'Error streaming, falling back to non-streaming mode'；2.1.296 用户文案
+            //   'Retrying without streaming'）——排除用户中止/SDK 超时/门控禁用后一律回退；
+            //   判据复用 AnthropicSdkProvider 同源静态方法（两 provider 一致，防漂移）。
+            if (onStreamingFallback != null
+                && AnthropicSdkProvider.shouldUseNonStreamingFallback(
+                    translated, aborted, streamingFallbackDisabled())) {
+                if (nonStreamingFallback(config, modelName, systemPrompt, history, tools, effortValue,
+                        thinkingConfig, translated, aborted, onStreamingFallback,
+                        onAssistantMessage, onComplete)) {
+                    return; // 回退成功（已送达 onAssistantMessage/onComplete）
+                }
+            }
+            onError.accept(translated);
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [stream-integrity 2026-10-10 · 行为同步 CC] 流式失败 → 非流式回退
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * [stream-integrity 2026-10-10 · 行为同步 CC] 非流式回退门控 · 与 AnthropicSdkProvider 同源
+     * （CC claude.ts:2469-2475：CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK env +
+     * tengu_disable_streaming_to_non_streaming_fallback feature flag——openai provider 无
+     * featureFlags 注入 → 仅 env 门，缺口登记于本注释）。
+     */
+    private boolean streamingFallbackDisabled() {
+        return ErrorClassifier.isEnvTruthy(System.getenv("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK"));
+    }
+
+    /**
+     * [stream-integrity 2026-10-10 · 行为同步 CC] 非流式回退执行 · 对齐 CC executeNonStreamingRequest
+     * （claude.ts:818-910；注释 claude.ts:2504 'Error streaming, falling back to non-streaming mode'；
+     * 2.1.296 用户文案 'Retrying without streaming'）+ withRetry（withRetry.ts:170-517）。
+     *
+     * <p>流式失败后：触发 onStreamingFallback（loop tombstone 部分消息）→ 非流式
+     * {@code chat.completions.create}（同 history/tools/effort）→ 产出 AssistantMessage 走
+     * onAssistantMessage/onComplete。非流式重试循环自带 withRetry 语义（连续 529 计数初始 =
+     * 流式 529 预置值、退避、耗尽即失败）——循环主体与 {@code AnthropicSdkProvider.nonStreamingFallback}
+     * 同构（两 provider 一致，防漂移）。
+     *
+     * @return true=回退成功并已送达 onAssistantMessage/onComplete；false=回退失败/中止（调用方走 onError 原错误）
+     */
+    private boolean nonStreamingFallback(ProviderConfig config, String modelName,
+                                         String systemPrompt, List<ChatMessageDto> history, ArrayNode tools,
+                                         String effortValue,
+                                         ChatRequestOptions.ThinkingConfig thinkingConfig,
+                                         Throwable streamingError, AtomicBoolean aborted,
+                                         Runnable onStreamingFallback,
+                                         Consumer<AssistantMessage> onAssistantMessage,
+                                         Runnable onComplete) {
+        if (onStreamingFallback != null) {
+            try {
+                onStreamingFallback.run();
+            } catch (Exception ex) {
+                log.warn("[OpenAiSdkProvider] onStreamingFallback 回调异常: {}", ex.toString());
+            }
+        }
+        // CC claude.ts:2559：流式失败若为 529，非流式 529 预算从 1 起算（复用 ant 同源静态判据）
+        RetryOptions retryOptions = new RetryOptions(
+            null, modelName, null, null, null, () -> aborted != null && aborted.get(),
+            null, AnthropicSdkProvider.computeInitialConsecutive529Errors(streamingError));
+        int consecutive529Errors = retryOptions.initialConsecutive529Errors() != null
+            ? retryOptions.initialConsecutive529Errors() : 0;
+        int maxRetries = WithRetryEngine.getDefaultMaxRetries();
+        int attempts = 0;
+        while (attempts++ < maxRetries + 1) {
+            if (aborted != null && aborted.get()) {
+                log.info("[OpenAiSdkProvider] 非流式回退中止，放弃");
+                return false;
+            }
+            try {
+                AssistantMessage msg = nonStreamingSend(config, modelName, systemPrompt, history, tools,
+                    effortValue, thinkingConfig);
+                if (onAssistantMessage != null) {
+                    onAssistantMessage.accept(msg);
+                }
+                if (onComplete != null) {
+                    onComplete.run();
+                }
+                log.info("[OpenAiSdkProvider] 流式失败→非流式回退成功 (attempt={}, model={}, 529预置={}) · CC claude.ts:2505-2562",
+                    attempts, modelName, retryOptions.initialConsecutive529Errors());
+                return true;
+            } catch (Throwable e2) {
+                if (aborted != null && aborted.get()) {
+                    return false;
+                }
+                if (e2 instanceof java.util.concurrent.CancellationException) {
+                    return false;
+                }
+                RuntimeException translated2 = translateSdkError(e2);
+                if (ErrorClassifier.is529Error(translated2)) {
+                    if (TransientErrorHandler.isEligibleFor529Fallback(modelName)) {
+                        consecutive529Errors++;
+                        if (consecutive529Errors >= ApiErrors.MAX_CONSECUTIVE_529) {
+                            log.warn("[OpenAiSdkProvider] 非流式回退连续 {} 次 529（含流式预置 {}），放弃回退"
+                                    + " → 上层 Path3 模型降级 · CC withRetry.ts:334-337",
+                                consecutive529Errors, retryOptions.initialConsecutive529Errors());
+                            return false;
+                        }
+                    } else {
+                        log.warn("[OpenAiSdkProvider] 非流式回退 529 但主模型 {} 非降级资格，仅退避 · CC withRetry.ts:329-333",
+                            modelName);
+                    }
+                }
+                if (!ErrorClassifier.isRetryable(translated2)) {
+                    log.warn("[OpenAiSdkProvider] 非流式回退不可重试错误，放弃: {}", translated2.toString());
+                    return false;
+                }
+                long delayMs = RetryDelayCalculator.calculate(attempts,
+                    translated2 instanceof LlmApiException lae2 ? ErrorClassifier.extractRetryAfterSeconds(lae2) : null,
+                    ApiErrors.MAX_DELAY_MS);
+                log.warn("[OpenAiSdkProvider] 非流式回退重试 attempt={}/{} 退避 {}ms · CC withRetry.ts:429-463",
+                    attempts, maxRetries, delayMs);
+                if (delayMs > 0) {
+                    try {
+                        java.lang.Thread.sleep(delayMs);
+                    } catch (InterruptedException ie) {
+                        java.lang.Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** [stream-integrity 2026-10-10] 非流式单次发送 · 对齐 CC executeNonStreamingRequest 的 create(...)（claude.ts:870-903）。 */
+    private AssistantMessage nonStreamingSend(ProviderConfig config, String modelName,
+                                              String systemPrompt, List<ChatMessageDto> history,
+                                              ArrayNode tools, String effortValue,
+                                              ChatRequestOptions.ThinkingConfig thinkingConfig) {
+        String sessionId = SessionIdResolver.resolve(history, null);
+        OpenAIClient client = buildClient(config, sessionId);
+        boolean thinkingDisabled = thinkingConfig != null && "disabled".equals(thinkingConfig.type());
+        // 与 doStream 同参（同 history/tools/effort；includeUsage/streamingMainChain=false——非流式、非探针链）
+        ChatCompletionCreateParams params = buildRequestParams(
+            sdkModelName(modelName), systemPrompt, history, tools,
+            null, thinkingDisabled, null, effortValue, null,
+            false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
+        ChatCompletion resp = client.chat().completions().create(params);
+        String content = extractContent(resp);
+        List<ToolUseBlock> tools2 = extractToolCalls(resp);
+        String thinking = extractThinking(resp);
+        String finishReason = tools2.isEmpty() ? "stop" : "tool_calls";
+        AgentUsage usage = extractUsage(resp);
+        return new AssistantMessage(content, finishReason, tools2,
+            thinking != null ? thinking : "", null, usage);
     }
 
     // ===================== chat (non-stream) =====================
