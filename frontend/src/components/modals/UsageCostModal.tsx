@@ -11,17 +11,12 @@ import { SUBAGENT_STATUS_LABEL, formatSubagentStat } from '@/utils/subagentStats
 /** 千位以上紧凑显示（按模型明细/上下文条用 · 对齐 ContextAnalyzeModal fmt） */
 const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
 
-/** byModel 行 token 总计 · [ant-deepseek 双计修复 2026-10-10] 数字自证（与后端 Tokens.inputIncludesCacheHit
- *  同构）：anthropic 标志 且 非「总小票」形态（cr+cc ≤ input）→ 4 项和（input 不含 cache hit）；
- *  「总小票」形态（input 已含 cache hit，如 DeepSeek /anthropic 端点）或非 anthropic → input+output。 */
-const modelRowTotal = (r: StatsByModel) => {
-  const cr = r.cacheReadInputTokens
-  const cc = r.cacheCreationInputTokens
-  const totalForm = (cr > 0 || cc > 0) && cr + cc <= r.inputTokens
-  return r.anthropic && !totalForm
-    ? r.inputTokens + r.outputTokens + cr + cc
-    : r.inputTokens + r.outputTokens
-}
+/** byModel 行 token 总计 · 按 provider 分派（后端 byModel 每行 anthropic 标志）：
+ *  anthropic（claude）4 项和（input 不含 cache hit）；deepseek（openai 协议）input 已含 cache hit，
+ *  只能 input+output，4 项和会双计 cache。 */
+const modelRowTotal = (r: StatsByModel) => r.anthropic
+  ? r.inputTokens + r.outputTokens + r.cacheReadInputTokens + r.cacheCreationInputTokens
+  : r.inputTokens + r.outputTokens
 
 /** 稳定空数组（避免 selector `?? []` 每次返回新引用触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []

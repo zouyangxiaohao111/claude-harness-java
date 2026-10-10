@@ -258,10 +258,8 @@ class StreamCompactSummaryTest {
             // [A 命中率口径] 3 参带 providerType='anthropic'：cacheHitRate 保持 CC/Anthropic
             //   三字段分母语义（read/(input+read+create)）；2 参重载 providerType=null →
             //   isAnthropic()=false 走 read/input，本用例会 RED（防公式被误改）。
-            //   [ant-deepseek 双计修复 2026-10-10] 数据用「三小票」形态（cr 2000 + cc 3000 > input 1000）；
-            //   原数据 (1000,500,200,300) 是「总小票」形态 → 自适应会走 read/input（0.2）。
             ForkedAgentResult result = new ForkedAgentResult(
-                List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 2000, 3000), "anthropic");
+                List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 200, 300), "anthropic");
             RunForkedAgent.ForkedQuery query = params -> result;
             ToolUseContext tuc = new ToolUseContext(
                 UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
@@ -286,11 +284,11 @@ class StreamCompactSummaryTest {
                 Mockito.argThat(attrs -> {
                     Object hit = attrs.get("cacheHitRate");
                     return attrs.get("outputTokens").equals(500L)
-                        && attrs.get("cacheReadInputTokens").equals(2000L)
-                        && attrs.get("cacheCreationInputTokens").equals(3000L)
+                        && attrs.get("cacheReadInputTokens").equals(200L)
+                        && attrs.get("cacheCreationInputTokens").equals(300L)
                         && attrs.get("preCompactTokenCount").equals(0)
                         && hit instanceof Double d
-                        && Math.abs(d - 2000.0 / (2000 + 3000 + 1000)) < 1e-9;
+                        && Math.abs(d - 200.0 / (200 + 300 + 1000)) < 1e-9;
                 }));
             Mockito.verify(telemetry).logOTelEvent(
                 Mockito.eq("tengu_compact_cache_sharing_success"), Mockito.anyMap());

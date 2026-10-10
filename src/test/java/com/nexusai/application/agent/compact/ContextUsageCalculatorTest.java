@@ -27,14 +27,11 @@ class ContextUsageCalculatorTest {
     // ─────────────────────────── computeContextTokensUsed 纯函数 ───────────────────────────
 
     @Test
-    @DisplayName("Anthropic：input+cacheRead+cacheCreate 三字段和（三小票形态数据）")
+    @DisplayName("Anthropic：input+cacheRead+cacheCreate 三字段和")
     void compute_anthropicSumsAllThree() {
-        // [ant-deepseek 双计修复] 形态维度显式化：三字段和要求「三小票」数字形态
-        //（cache_read 远大于 input，Claude 原生）。原数据 (2000,500,300) 恰为「总小票」形态
-        //（cr+cc ≤ input）→ 现走自适应只取 input（见 compute_totalFormIgnoresCacheEvenWhenAnthropicFlag）。
-        assertThat(ContextUsageCalculator.computeContextTokensUsed(1000L, 9000L, 2000L, true))
-            .as("Anthropic 三字段独立 → 三字段和 = 12000")
-            .isEqualTo(12000L);
+        assertThat(ContextUsageCalculator.computeContextTokensUsed(2000L, 500L, 300L, true))
+            .as("Anthropic 三字段独立 → 三字段和")
+            .isEqualTo(2800L);
     }
 
     @Test
@@ -43,10 +40,9 @@ class ContextUsageCalculatorTest {
         assertThat(ContextUsageCalculator.computeContextTokensUsed(2000L, null, null, true))
             .as("Anthropic + cache null → input + 0 + 0")
             .isEqualTo(2000L);
-        // [ant-deepseek 双计修复] 用三小票形态数据（cacheRead 大）表达「cacheCreate null → 0 补齐」
-        assertThat(ContextUsageCalculator.computeContextTokensUsed(1000L, 5000L, null, true))
-            .as("Anthropic + cacheCreate null（三小票）→ input + cacheRead + 0 = 6000")
-            .isEqualTo(6000L);
+        assertThat(ContextUsageCalculator.computeContextTokensUsed(2000L, 500L, null, true))
+            .as("Anthropic + cacheCreate null → input + cacheRead + 0")
+            .isEqualTo(2500L);
     }
 
     @Test
@@ -58,31 +54,15 @@ class ContextUsageCalculatorTest {
             .isEqualTo(2000L);
     }
 
-    @Test
-    @DisplayName("[ant-deepseek 双计修复] anthropic 标志但「总小票」形态数字 → 只取 input（防 ×2）")
-    void compute_totalFormIgnoresCacheEvenWhenAnthropicFlag() {
-        // WHY: DeepSeek /anthropic 端点 provider.type=anthropic 但数字是 OpenAI 语义
-        //（2026-10-10 真库实锤 input=397798=cache_read 396800+cache_creation 998）；
-        // 按旧三字段和 = 795596 双计 → 压缩判定 ×2 虚高 → 用户报「瞬间压缩」。
-        assertThat(ContextUsageCalculator.computeContextTokensUsed(397798L, 396800L, 998L, true))
-            .as("input 已含 cache hit → 只取 input")
-            .isEqualTo(397798L);
-        // cc=0 轮（本轮增量未写入 cache，真库 09:41:13 行 345389/341760/0）同样只取 input
-        assertThat(ContextUsageCalculator.computeContextTokensUsed(345389L, 341760L, 0L, true))
-            .as("cc=0 总小票轮 → 同样只取 input（宽松判据覆盖）")
-            .isEqualTo(345389L);
-    }
-
     // ─────────────────────────── computeCacheHitRate 纯函数 ───────────────────────────
 
     @Test
-    @DisplayName("Anthropic：cache 命中率 = read/(input+read+create) 三字段分母（三小票形态数据）")
+    @DisplayName("Anthropic：cache 命中率 = read/(input+read+create) 三字段分母（CC forkedAgent.ts:647-654）")
     void cacheHitRate_anthropic_threeFieldDenominator() {
-        // WHY: Claude usage 三字段独立 → 分母 = input + cache_read + cache_create（CC :651-654）；
-        // [ant-deepseek 双计修复] 数据用三小票形态（cacheRead 9000 远大于 input 1000，Claude 原生）。
-        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 9000L, 2000L, true))
-            .as("read/(input+read+create) = 9000/12000 = 0.75")
-            .isCloseTo(0.75, within(1e-9));
+        // WHY: Claude usage 三字段独立 → 分母 = input + cache_read + cache_create（CC :651-654）。
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 900L, 100L, true))
+            .as("read/(input+read+create) = 900/2000")
+            .isCloseTo(0.45, within(1e-9));
     }
 
     @Test
@@ -92,10 +72,9 @@ class ContextUsageCalculatorTest {
         assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, null, null, true))
             .as("cacheRead null → read=0 → 0")
             .isEqualTo(0d);
-        // [ant-deepseek 双计修复] 三小票形态数据（cacheRead 9000 > input 2000）
-        assertThat(ContextUsageCalculator.computeCacheHitRate(2000L, 9000L, null, true))
-            .as("cacheCreate null（三小票）→ 分母 = input + read + 0 = 9000/11000")
-            .isCloseTo(9000.0 / 11000.0, within(1e-9));
+        assertThat(ContextUsageCalculator.computeCacheHitRate(1000L, 900L, null, true))
+            .as("cacheCreate null → 分母 = input + read + 0 = 900/1900")
+            .isCloseTo(900.0 / 1900.0, within(1e-9));
     }
 
     @Test
@@ -123,16 +102,6 @@ class ContextUsageCalculatorTest {
         assertThat(ContextUsageCalculator.computeCacheHitRate(0L, 900L, 100L, true))
             .as("anthropic 分母 = 0+900+100 > 0 → 900/1000 = 0.9（input=0 但 read/create 存在仍可算）")
             .isCloseTo(0.9, within(1e-9));
-    }
-
-    @Test
-    @DisplayName("[ant-deepseek 双计修复] 总小票形态命中率 = read/input（防三项分母算成一半）")
-    void cacheHitRate_totalFormReadOverInput() {
-        // WHY: ant deepseek 真数字 397798/396800/998：正确命中率 = 396800/397798 ≈ 99.75%；
-        //   按三项分母 = 396800/795596 ≈ 49.87%（用户可见的「命中率显示成一半」假象）。
-        assertThat(ContextUsageCalculator.computeCacheHitRate(397798L, 396800L, 998L, true))
-            .as("read/input ≈ 0.9975（防 0.4987 回归）")
-            .isCloseTo(396800.0 / 397798.0, within(1e-9));
     }
 
     // ─────────────────────────── isAnthropic 判定链 ───────────────────────────
@@ -262,34 +231,5 @@ class ContextUsageCalculatorTest {
         assertThat(snap.contextWindow()).isEqualTo(4000L);
         assertThat(snap.contextTokensUsed()).as("usage null → used 0").isZero();
         assertThat(snap.percentLeft()).as("usage null → percentLeft null（省略）").isNull();
-    }
-
-    @Test
-    @DisplayName("[ant-deepseek 双计修复] snapshot：anthropic 标志 + 总小票数字 → used=input（阈值链不 ×2）")
-    void snapshot_totalFormUsedEqualsInput() {
-        // WHY: 快照 used 是「当前上下文条」与压缩阈值共用的数字；ant deepseek 下旧逻辑
-        // = 2×真实 → 界面显示虚高 + 提前压缩（用户 2026-10-10 报障的全链闭环点）。
-        stubResolvableModel();
-        ProviderRecord p = new ProviderRecord();
-        p.setId("p1");
-        p.setType("anthropic");
-        when(providerMapper.selectOneById(any())).thenReturn(p);
-        ModelRecord m = new ModelRecord();
-        m.setId("m1");
-        m.setProviderId("p1");
-        m.setName("deepseek-flash");
-        m.setEnabled(true);
-        m.setMaxContextTokens(1048576);
-        when(modelMapper.selectOneByQuery(any())).thenReturn(m);
-
-        // AgentUsage 构造序 = (input, output, cacheCreation, cacheRead)；数字取自真库 09:59:51 行
-        ContextUsageCalculator.Snapshot snap = ContextUsageCalculator.snapshot(
-            modelMapper, providerMapper, "ds-zcw/deepseek-flash",
-            new com.nexusai.application.agent.tool.AgentUsage(397798L, 745L, 998L, 396800L, null, null, null));
-
-        assertThat(snap.contextTokensUsed())
-            .as("总小票 → used=397798（非 795596）").isEqualTo(397798L);
-        assertThat(snap.percentLeft())
-            .as("round((1-397798/1048576)*100)=62").isEqualTo(62);
     }
 }

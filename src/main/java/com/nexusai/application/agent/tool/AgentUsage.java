@@ -207,13 +207,11 @@ public record AgentUsage(
      * @return 总 token 数（≥ 0）
      */
     public long totalTokens(boolean anthropic) {
-        long cr = cacheReadInputTokens != null ? cacheReadInputTokens : 0L;
-        long cc = cacheCreationInputTokens != null ? cacheCreationInputTokens : 0L;
-        // [ant-deepseek 双计修复 2026-10-10] 数字自证（判据单点 = compact.Tokens.inputIncludesCacheHit）：
-        // 「总小票」形态（input 已含 cache hit）只取 input+output；「三小票」形态维持 CC 4 项和。
-        if (anthropic && !com.nexusai.application.agent.compact.Tokens
-                .inputIncludesCacheHit(inputTokens, cr, cc)) {
-            return inputTokens + cc + cr + outputTokens;
+        if (anthropic) {
+            return inputTokens
+                + (cacheCreationInputTokens != null ? cacheCreationInputTokens : 0L)
+                + (cacheReadInputTokens != null ? cacheReadInputTokens : 0L)
+                + outputTokens;
         }
         return inputTokens + outputTokens;
     }

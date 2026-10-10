@@ -56,7 +56,7 @@ function backgroundMsg(): ChatMessageDto {
   } as ChatMessageDto
 }
 
-function mountComposer(model = 'ds-openai/deepseek-v4-flash'): { container: HTMLDivElement; root: Root; footer: () => string } {
+function mountComposer(): { container: HTMLDivElement; root: Root; footer: () => string } {
   ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
   const container = document.createElement('div')
   document.body.appendChild(container)
@@ -74,7 +74,7 @@ function mountComposer(model = 'ds-openai/deepseek-v4-flash'): { container: HTML
         popEditable={async () => null}
         boundProjectName={null}
         onSelectProject={() => {}}
-        currentModel={model}
+        currentModel="ds-openai/deepseek-v4-flash"
         permissionMode="default"
         empty={false}
         sessionId={SID}
@@ -164,57 +164,5 @@ describe('D1 · Composer 底部数字来源过滤（缓存% / 当前上下文）
     mounted = h
 
     expect(h.footer()).toContain('当前上下文 9k / 200k')
-  })
-})
-
-/**
- * [ant-deepseek 双计修复 2026-10-10] 缓存% 分母改「数字自证」（与后端 Tokens.inputIncludesCacheHit 同构）：
- * 「总小票」形态（cache_read+cache_creation ≤ input）→ cr/input；「三小票」形态 → cr/(input+cr+cc)。
- *
- * <h2>RED（改回旧「provider 名 == 'anthropic'」判据哪条红）</h2>
- * <ul>
- *   <li>用例 1（名恰为 anthropic + 总小票数字）→ 旧实现三项分母把 99.7% 算成 ~50% → 断 100% 红；</li>
- *   <li>用例 2（名非 anthropic + 三小票数字，如 minimax）→ 旧实现 cr/ci 把 75% 算成 900% → 断 75% 红。</li>
- * </ul>
- */
-describe('[ant-deepseek 双计修复] 缓存% 数字自证（不看 provider 名）', () => {
-  let mounted: { container: HTMLDivElement; root: Root } | undefined
-
-  beforeEach(() => {
-    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
-  })
-
-  afterEach(() => {
-    if (mounted) {
-      const cur = mounted
-      act(() => cur.root.unmount())
-      cur.container.remove()
-      mounted = undefined
-    }
-    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
-  })
-
-  it('总小票形态 + provider 名恰为 anthropic（旧名判据翻车组合）→ cr/input = 100%', () => {
-    // 真库数据（sess-bf736cb3 09:59:51 行）：input=397798 = 缓存读 396800 + 缓存写 998
-    const msg = {
-      ...userMsg(),
-      usage: { input_tokens: 397798, output_tokens: 745, cache_read_input_tokens: 396800, cache_creation_input_tokens: 998 },
-    }
-    useChatStore.setState({ messages: { [SID]: [msg] } })
-    const h = mountComposer('anthropic/some-claude-like')
-    mounted = h
-    expect(h.footer()).toContain('缓存 100%')      // round(396800/397798*100) = 100
-    expect(h.footer()).not.toContain('缓存 50%')   // 旧三项分母 = 396800/795596 ≈ 50%
-  })
-
-  it('三小票形态 + 名非 anthropic（如 minimax）→ 三项分母 = 75%（旧实现会算出 900%）', () => {
-    const msg = {
-      ...userMsg(),
-      usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 9000, cache_creation_input_tokens: 2000 },
-    }
-    useChatStore.setState({ messages: { [SID]: [msg] } })
-    const h = mountComposer('minimax/MiniMax-M3')
-    mounted = h
-    expect(h.footer()).toContain('缓存 75%')       // 9000/(1000+9000+2000) = 0.75
   })
 })

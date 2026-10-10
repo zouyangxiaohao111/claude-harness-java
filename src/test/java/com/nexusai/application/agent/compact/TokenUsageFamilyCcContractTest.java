@@ -110,11 +110,8 @@ class TokenUsageFamilyCcContractTest {
     @Test
     @DisplayName("getTokenCountFromUsage = input + cache_creation + cache_read + output（tokens.ts:46-53）")
     void getTokenCountFromUsage_sumsAllFour() {
-        // [ant-deepseek 双计修复 2026-10-10] 形态维度显式化：4 项和要求「三小票」数据
-        //（cache 两字段 > input，Claude 原生）；原数据 (100,20,5,3) 恰为「总小票」形态
-        //（cr+cc=8 ≤ input=100）→ 现走自适应只取 input+output=120。
-        Tokens.Usage usage = new Tokens.Usage(100, 20, 5000, 3000);
-        assertThat(Tokens.getTokenCountFromUsage(usage)).isEqualTo(8120);
+        Tokens.Usage usage = new Tokens.Usage(100, 20, 5, 3);
+        assertThat(Tokens.getTokenCountFromUsage(usage)).isEqualTo(128);
         assertThat(Tokens.getTokenCountFromUsage(null)).isZero();
     }
 
@@ -123,13 +120,11 @@ class TokenUsageFamilyCcContractTest {
     void getTokenCountFromUsage_nonAnthropic_inputPlusOutput() {
         // WHY (A5-2): deepseek（openai 协议）input_tokens 已含 cache hit（input == H+M），
         //   4 项和把 cacheRead/cacheCreate 重复计入 → 展示/预算/决策阈值口径必须 input+output。
-        // [ant-deepseek 双计修复 2026-10-10] 三小票形态数据（cache 两字段 > input），
-        // 使 anthropic=true 分支真正走 CC 4 项和；总小票形态用例见 TokensTest。
-        Tokens.Usage usage = new Tokens.Usage(100, 20, 5000, 3000);
+        Tokens.Usage usage = new Tokens.Usage(100, 20, 5, 3);
         assertThat(Tokens.getTokenCountFromUsage(usage, false))
-            .as("100+20=120（忽略 cacheRead=5000/cacheCreation=3000）").isEqualTo(120);
-        // anthropic=true + 三小票数据保持 4 项和（CC 原生），与 1 参一致
-        assertThat(Tokens.getTokenCountFromUsage(usage, true)).isEqualTo(8120);
+            .as("100+20=120（忽略 cacheRead=5/cacheCreate=3）").isEqualTo(120);
+        // anthropic=true 保持 4 项和（CC 原生）与 1 参一致
+        assertThat(Tokens.getTokenCountFromUsage(usage, true)).isEqualTo(128);
         assertThat(Tokens.getTokenCountFromUsage(null, false)).isZero();
     }
 
