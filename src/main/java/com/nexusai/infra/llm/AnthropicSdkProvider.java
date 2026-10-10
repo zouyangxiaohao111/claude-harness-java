@@ -2201,6 +2201,9 @@ public class AnthropicSdkProvider implements LlmProvider {
         //   Anthropic 通道唯一 DTO→wire 转换点（buildMessageParams → stream/chat/chatWithRaw/chatWithOptions
         //   及 fork 的 ProductionForkedQuery.streamOnce 全经此）。
         history = ToolResultPairingRepair.ensureToolResultPairing(history);
+        // [CC 对齐 · fork-400 专项 2026-10-10] tool 结果组合并器：连续的 Role.tool 消息
+        //   合并进同一条 user MessageParam 的 content 数组（见 tool 分支注释与循环尾 flush）。
+        List<ContentBlockParam> pendingToolResults = null;
         for (ChatMessageDto m : history) {
             if (m == null || m.role() == null) continue;
             if (m.role() == Role.system) {
@@ -2272,9 +2275,30 @@ public class AnthropicSdkProvider implements LlmProvider {
                 for (JsonNode block : siblingBlocks) {
                     appendSdkContentBlock(blocks, block);
                 }
-                msgs.add(MessageParam.builder().role(MessageParam.Role.USER)
-                    .contentOfBlockParams(blocks).build());
+                // [CC 对齐 · fork-400 专项 2026-10-10] 连续 tool 结果合并进同一条 user 的 content 数组。
+                //   CC original: mergeUserMessagesAndToolResults（messages.ts:2372）；调用点 :2283
+                //   「If the last message is also a user message, merge them」+ hoistToolResults 提升
+                //   tool_result。WHY：一轮 N 个 tool_use 的 N 条结果若各起一条 user（= 连续 user 消息），
+                //   DeepSeek ant 端点按「immediately after」严格校验 → 400：
+                //   「tool_use ids were found without tool_result blocks immediately after: call_0X」
+                //   （fork 的 SM 提取 Edit×N 稳定触发；主链无一轮多工具故未暴露；wire 级测试
+                //   AnthropicMultiToolWireTest 固化）。
+                //   口径 = 只合并「连续 tool 消息组」（CC 还并相邻普通 user；那会改既有合法请求的出站字节、
+                //   伤前缀缓存——本仓不并，仅消除「连续 tool 结果」这一非法形态）。
+                if (pendingToolResults == null) {
+                    pendingToolResults = new ArrayList<>();
+                }
+                pendingToolResults.addAll(blocks);
                 continue;
+            }
+            // 非 tool、非 system（两者上面已 continue）⇒ 先收束 tool 结果组（flush），
+            // 保证合并结果仍是「紧随 assistant 的同一条 user」。
+            if (pendingToolResults != null) {
+                if (!pendingToolResults.isEmpty()) {
+                    msgs.add(MessageParam.builder().role(MessageParam.Role.USER)
+                        .contentOfBlockParams(pendingToolResults).build());
+                }
+                pendingToolResults = null;
             }
             if (m.role() == Role.assistant && m.toolCalls() != null && !m.toolCalls().isEmpty()) {
                 List<ContentBlockParam> blocks = new ArrayList<>();
@@ -2329,6 +2353,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                 msgs.add(MessageParam.builder().role(r)
                     .content(m.content() == null ? "" : m.content()).build());
             }
+        }
+        // [CC 对齐 · fork-400 专项 2026-10-10] 收尾 flush：历史以工具结果结尾时的最后一段 tool 结果组
+        //   （run 内「刚采样完 assistant(tool_use) + 工具结果」是正常中间态——见配对修复头注）。
+        if (pendingToolResults != null && !pendingToolResults.isEmpty()) {
+            msgs.add(MessageParam.builder().role(MessageParam.Role.USER)
+                .contentOfBlockParams(pendingToolResults).build());
         }
         return msgs;
     }

@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.34] - 2026-10-10
+
+### 修复
+- 修复 Anthropic 格式模型多工具调用时后台任务反复报错的bug。
+
 ## [0.1.33] - 2026-10-10
 
 ### 修复
