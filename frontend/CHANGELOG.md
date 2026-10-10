@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.30] - 2026-10-10
+
+### 修复
+- 修复弹窗当前上下文与底部数字不一致的bug。
+
 ## [0.1.29] - 2026-10-10
 
 ### 修复

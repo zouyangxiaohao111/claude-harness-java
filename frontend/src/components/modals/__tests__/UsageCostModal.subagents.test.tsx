@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { UsageCostModal } from '../UsageCostModal'
 import { useChatStore } from '@/stores/chatStore'
 import { useSubagentStore } from '@/stores/subagentStore'
+import type { ChatMessageDto } from '@/api/types'
 
 /**
  * D2 · 用量弹窗「子代理（本会话）」区块（**只新增**，既有区块一字不动）。
@@ -129,5 +130,90 @@ describe('D2 · UsageCostModal 子代理（本会话）区块', () => {
     await mount()
     expect(container.textContent).toContain('@alice')
     expect(container.textContent).not.toContain('@carol')
+  })
+})
+
+/**
+ * [口径拉齐 2026-10-10] 弹窗「当前上下文条」与底部数字同口径（只统计用户自己的请求）。
+ * 用户裁定「拉齐」。RED：把 ctxInfo 换回 resolveCtxInfo([lastMsg])（未过滤）→ 两条用例红（会显示后台轮的 9k）。
+ */
+describe('[口径拉齐] UsageCostModal 当前上下文条 · 与底部同口径', () => {
+  let container: HTMLDivElement
+  let root: Root
+
+  beforeEach(() => {
+    ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    localStorage.clear()
+    useSubagentStore.setState({ sessionId: null, bySession: {} })
+    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+  })
+
+  afterEach(() => {
+    act(() => { root.unmount() })
+    container.remove()
+  })
+
+  async function flush(): Promise<void> {
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+  }
+
+  function asstMsg(over: Partial<ChatMessageDto>): ChatMessageDto {
+    return {
+      id: 'a', sessionId: SID, role: 'assistant', author: 'nexus', content: '',
+      reasoning: null, toolCalls: null, finishReason: 'stop', inputTokens: null, outputTokens: null,
+      reasoningDurationMs: null, time: null, toolCallId: null, assistantMessageId: null,
+      userMessageId: null, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null,
+      error: null, errorDetails: null, matchedRule: null,
+      usage: null, contextTokensUsed: null, contextWindow: null, percentLeft: null,
+      ...over,
+    } as ChatMessageDto
+  }
+
+  async function mount(): Promise<void> {
+    await act(async () => {
+      root.render(<UsageCostModal activeSessionId={SID} onSwitch={() => {}} onClose={() => {}} />)
+    })
+    await flush()
+  }
+
+  it('末条是后台轮（显式 usageSource）→ 显示用户轮的数', async () => {
+    const userAsst = asstMsg({
+      id: 'a-user',
+      usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 500 },
+      contextTokensUsed: 1000, contextWindow: 200000, percentLeft: 99,
+    })
+    const bgAsst = asstMsg({
+      id: 'a-bg', usageSource: 'background',
+      usage: { input_tokens: 9000, output_tokens: 10, cache_read_input_tokens: 900 },
+      contextTokensUsed: 9000, contextWindow: 200000, percentLeft: 95,
+    })
+    useChatStore.setState({ messages: { [SID]: [userAsst, bgAsst] }, streams: {}, sessions: [] })
+    await mount()
+    const text = container.textContent ?? ''
+    expect(text).toContain('当前上下文')
+    expect(text).toContain('1k / 200k')
+    expect(text).not.toContain('9k / 200k')
+  })
+
+  it('重拉态（无 usageSource）：userMessageId 指向 isMeta user 行 → 同样排除', async () => {
+    const userAsst = asstMsg({
+      id: 'a-user',
+      usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 500 },
+      contextTokensUsed: 1000, contextWindow: 200000, percentLeft: 99,
+    })
+    const bgUser = { ...asstMsg({ id: 'u-bg' }), role: 'user', isMeta: true } as ChatMessageDto
+    const bgAsst = asstMsg({
+      id: 'a-bg', userMessageId: 'u-bg',
+      usage: { input_tokens: 9000, output_tokens: 10, cache_read_input_tokens: 900 },
+      contextTokensUsed: 9000, contextWindow: 200000, percentLeft: 95,
+    })
+    useChatStore.setState({ messages: { [SID]: [userAsst, bgUser, bgAsst] }, streams: {}, sessions: [] })
+    await mount()
+    const text = container.textContent ?? ''
+    expect(text).toContain('1k / 200k')
+    expect(text).not.toContain('9k / 200k')
   })
 })
