@@ -253,14 +253,14 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     [msgs, liveBlocks, backgroundFlows],
   )
   const ctxInfo = useMemo(() => resolveCtxInfo(usageScan), [usageScan])
-  // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
-  //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
-  //   deepseek（openai 协议）：input_tokens 已含 cache hit（input==H+M），直接 cache_read / input
-  //   （真实命中率；按 anthropic 公式会算成真实的一半 ~40% 假象）。provider 由 currentModel
-  //   `provider/model` 前缀判定（后端 ContextUsageCalculator.isAnthropic 同口径：provider.type==anthropic）。
+  // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：[ant-deepseek 双计修复 2026-10-10] 分母改
+  //   「数字自证」判据（与后端 Tokens.inputIncludesCacheHit 同构）：
+  //   「总小票」形态（input 已含 cache hit：cr+cc ≤ input，如 DeepSeek /anthropic 端点）→ cr/input；
+  //   「三小票」形态（Claude 原生，input 不含 cache）→ cr/(input+cache_read+cache_creation)。
+  //   原「provider 名 == 'anthropic'」判据已删——名判据对自定义命名的 ant provider（ds-zcw）判 false、
+  //   对真 Anthropic 语义但名非 'anthropic' 的 provider 判 true 反向错，且与后端 type 判据不同源。
   //   取最近一条带 usage 的 assistant 消息（complete 事件 usage 透传 · tokenWarning.tokenUsage 仅 number 无缓存细分）
   const cacheRateInfo = useMemo(() => {
-    const isClaudeProvider = (currentModel ?? '').split('/')[0].trim().toLowerCase() === 'anthropic'
     const scanned = usageScan
     for (let i = scanned.length - 1; i >= 0; i--) {
       const u = scanned[i]?.usage
@@ -268,15 +268,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       const cr = u.cache_read_input_tokens ?? 0
       const ci = u.input_tokens ?? 0
       const cc = u.cache_creation_input_tokens ?? 0
-      if (isClaudeProvider) {
-        const total = ci + cc + cr
-        if (total > 0) return { rate: Math.round((cr / total) * 100), read: cr }
-      } else if (ci > 0) {
-        return { rate: Math.round((cr / ci) * 100), read: cr }
-      }
+      const totalForm = (cr > 0 || cc > 0) && cr + cc <= ci
+      const denom = totalForm ? ci : ci + cc + cr
+      if (denom > 0) return { rate: Math.round((cr / denom) * 100), read: cr }
     }
     return null
-  }, [usageScan, currentModel])
+  }, [usageScan])
   // F4 · 最近一条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示）。
   //   扫描源 = [...msgs, ...liveBlocks]：live 块在 message.usage（assistant 流式结束）即挂 usage/decode_ms，
   //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。

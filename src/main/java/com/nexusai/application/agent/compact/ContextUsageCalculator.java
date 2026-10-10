@@ -73,10 +73,14 @@ public final class ContextUsageCalculator {
      * @return contextTokensUsed（已用 token 数，≥ input）
      */
     public static long computeContextTokensUsed(long input, Long cacheRead, Long cacheCreate, boolean anthropic) {
-        if (anthropic) {
-            return input
-                + (cacheRead != null ? cacheRead : 0L)
-                + (cacheCreate != null ? cacheCreate : 0L);
+        long cr = cacheRead != null ? cacheRead : 0L;
+        long cc = cacheCreate != null ? cacheCreate : 0L;
+        // [ant-deepseek 双计修复 2026-10-10] 数字自证（判据单点 = Tokens.inputIncludesCacheHit，同包）：
+        // 「总小票」形态（input 已含 cache hit，如 DeepSeek /anthropic 端点）只取 input——按 CC 三项和
+        // 会 ×2 虚高（2026-10-10 真库实锤 input=397798=cache_read 396800+cache_creation 998）；
+        // 「三小票」形态（Claude 原生）维持 CC 三项和。
+        if (anthropic && !Tokens.inputIncludesCacheHit(input, cr, cc)) {
+            return input + cr + cc;
         }
         return input;
     }
@@ -105,8 +109,12 @@ public final class ContextUsageCalculator {
         if (read <= 0) {
             return 0d;
         }
-        long denom = anthropic
-            ? input + read + (cacheCreate != null ? cacheCreate : 0L)
+        long cc = cacheCreate != null ? cacheCreate : 0L;
+        // [ant-deepseek 双计修复 2026-10-10] 数字自证（判据单点 = Tokens.inputIncludesCacheHit）：
+        // 「总小票」形态（input 已含 cache hit）分母 = input（命中率 = read/input，与 OpenAI 语义一致——
+        // 按三项分母会把 99%+ 算成 ~50% 假象）；「三小票」形态维持 CC 三项分母。
+        long denom = (anthropic && !Tokens.inputIncludesCacheHit(input, read, cc))
+            ? input + read + cc
             : input;
         return denom > 0 ? (double) read / denom : 0d;
     }

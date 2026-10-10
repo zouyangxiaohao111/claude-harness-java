@@ -98,9 +98,15 @@ public final class AgentProgressTracker {
         if (usage == null) {
             return;
         }
-        long input = usage.inputTokens()
-            + (usage.cacheCreationInputTokens() != null ? usage.cacheCreationInputTokens() : 0L)
-            + (usage.cacheReadInputTokens() != null ? usage.cacheReadInputTokens() : 0L);
+        long cr = usage.cacheReadInputTokens() != null ? usage.cacheReadInputTokens() : 0L;
+        long cc = usage.cacheCreationInputTokens() != null ? usage.cacheCreationInputTokens() : 0L;
+        // [ant-deepseek 双计修复 2026-10-10] 数字自证（判据单点 = compact.Tokens.inputIncludesCacheHit）：
+        // 「总小票」形态（input 已含 cache hit）只取 input；「三小票」形态维持原 3 项和
+        //（原实现恒 3 项和无分派，对所有 OpenAI 语义来源都虚计；本修复一并覆盖）。
+        long input = com.nexusai.application.agent.compact.Tokens
+            .inputIncludesCacheHit(usage.inputTokens(), cr, cc)
+            ? usage.inputTokens()
+            : usage.inputTokens() + cc + cr;
         this.latestInputTokens = input;
         this.cumulativeOutputTokens += usage.outputTokens();
         this.toolUseCount += toolUseInMessage;

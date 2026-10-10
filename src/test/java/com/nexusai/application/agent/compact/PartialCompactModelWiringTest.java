@@ -56,7 +56,7 @@ import static org.mockito.Mockito.when;
  * <ol>
  *   <li>删掉 {@code buildContext} 里的 {@code cc.setModel(resolveCompactModel(sessionId))} →
  *       {@link #anthropicSession_ctxCarriesModel_fourFieldSum} 的 preTokens 断言红
- *       （188374 → 94625，少计）；{@link #deepseekSession_ctxCarriesModel_inputOnly} 仍绿
+ *       （1048405 → 94625，少计）；{@link #deepseekSession_ctxCarriesModel_inputOnly} 仍绿
  *       —— 正是「只有 anthropic 侧少计」的实证。</li>
  *   <li>把 {@code resolveCompactModel} 的 DB 回落链去掉（只读 live state）→
  *       {@link #anthropicSession_ctxCarriesModel_fourFieldSum}（未注册会话 · DB 会话记录取模型）与
@@ -77,7 +77,7 @@ class PartialCompactModelWiringTest {
     private static final String DEEPSEEK = "deepseek/deepseek-v4-flash";
     private static final String SETTINGS_ANTHROPIC = "anthropic/claude-opus-4-6";
 
-    private static final int ANTHROPIC_4_FIELD_SUM = 93749 + 93568 + 181 + 876; // 188374
+    private static final int ANTHROPIC_4_FIELD_SUM = 93749 + 935680 + 18100 + 876; // 1048405
     private static final int DEEPSEEK_INPUT_OUTPUT = 93749 + 876;               // 94625
 
     private Object savedModelMapper;
@@ -101,7 +101,7 @@ class PartialCompactModelWiringTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("anthropic 会话（未注册，sessions.model_name 命中）→ ctx 带模型 → preTokens=188374（4 项和）")
+    @DisplayName("anthropic 会话（未注册，sessions.model_name 命中）→ ctx 带模型 → preTokens=1048405（4 项和）")
     void anthropicSession_ctxCarriesModel_fourFieldSum() {
         ModelMapper mm = mock(ModelMapper.class);
         ProviderMapper pm = mock(ProviderMapper.class);
@@ -118,7 +118,7 @@ class PartialCompactModelWiringTest {
 
         assertThat(preTokens)
             .as("anthropic：Claude usage 三字段独立 → preTokens = input+cacheRead+cacheCreate+output"
-                + " = 188374（旧实现 ctx.model=null → 94625，少计）")
+                + " = 1048405（旧实现 ctx.model=null → 94625，少计）")
             .isEqualTo(ANTHROPIC_4_FIELD_SUM);
     }
 
@@ -135,7 +135,7 @@ class PartialCompactModelWiringTest {
         assertThat(svc.resolveCompactModel(SESSION)).isEqualTo(DEEPSEEK);
         assertThat(compactAndReadPreTokens(svc))
             .as("deepseek：prompt_tokens 已含 cache hit → preTokens = input+output = 94625"
-                + "（4 项和 188374 = 把 cache read/creation 双计）")
+                + "（4 项和 1048405 = 把 cache read/creation 双计）")
             .isEqualTo(DEEPSEEK_INPUT_OUTPUT);
     }
 
@@ -171,7 +171,7 @@ class PartialCompactModelWiringTest {
             .isNull();
         assertThat(ContextUsageCalculator.isAnthropic(null, null, null)).isFalse();
         assertThat(compactAndReadPreTokens(svc))
-            .as("回落非 Anthropic → input+output = 94625（与唯权威同向；不是 4 项和的 188374）")
+            .as("回落非 Anthropic → input+output = 94625（与唯权威同向；不是 4 项和的 1048405）")
             .isEqualTo(DEEPSEEK_INPUT_OUTPUT);
     }
 
@@ -208,7 +208,7 @@ class PartialCompactModelWiringTest {
                 + "否则压缩口径与本轮真实请求的模型不一致（auto 路径 AutoCompactor.model 同源）")
             .isEqualTo(ANTHROPIC);
         assertThat(compactAndReadPreTokens(svc))
-            .as("anthropic live state → preTokens = 4 项和 188374")
+            .as("anthropic live state → preTokens = 4 项和 1048405")
             .isEqualTo(ANTHROPIC_4_FIELD_SUM);
     }
 
@@ -283,7 +283,7 @@ class PartialCompactModelWiringTest {
         return summary;
     }
 
-    /** [u0, a0, u1, a1] —— 末条 a1 携带 DB 实证 usage（input=93749 / output=876 / read=93568 / create=181）。 */
+    /** [u0, a0, u1, a1] —— 末条 a1 携带 usage（三小票形态：input=93749 / output=876 / read=935680 / create=18100，read ≫ input = Claude 原生）。 */
     private static List<ChatMessageDto> history() {
         List<ChatMessageDto> list = new ArrayList<>();
         list.add(msg("u0", Role.user));
@@ -339,8 +339,8 @@ class PartialCompactModelWiringTest {
 
     private static ChatMessageDto usageMsg(String id) {
         return msg(id, Role.assistant)
-            .withUsage(new AgentUsage(93749L, 876L, 181L, 93568L, null, null, null))
-            .withUsageCache(93568, 181);
+            .withUsage(new AgentUsage(93749L, 876L, 18100L, 935680L, null, null, null))
+            .withUsageCache(935680, 18100);
     }
 
     private static Object readStaticMapper(String field) throws Exception {

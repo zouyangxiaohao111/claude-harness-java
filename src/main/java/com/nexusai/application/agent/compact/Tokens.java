@@ -94,6 +94,33 @@ public final class Tokens {
     }
 
     /**
+     * 「input 已含 cache hit」（总小票形态）数字自证 · 判据单点（2026-10-10 ant-deepseek 双计修复）。
+     *
+     * <p><b>WHY</b>：上游 usage 数字存在两种形态——Anthropic 语义（input <b>不含</b> cache，
+     * 三字段独立，CC 原生）与 OpenAI 语义（input <b>已含</b> cache hit，cache_read/cache_creation
+     * 是 input 的<b>子集</b>）。判「哪个来源是哪种形态」不能靠协议名——provider.type=anthropic 的
+     * DeepSeek /anthropic 端点返回的仍是 OpenAI 语义数字（2026-10-10 真库实锤：
+     * {@code input=397798 = cache_read 396800 + cache_creation 998}；另有 cc=0 轮
+     * {@code input-cache_read} 为未命中增量同样 ≤ 总量，宽松判据 10/10 行成立）。
+     * 数字自证判据 = <b>命中+写入 ≤ 总量</b>（子集关系成立 ⇒ input 是总量形态）。
+     *
+     * <p><b>误判方向安全性</b>：Anthropic 侧因 cache_read 通常远大于 input（读缓存 ≫ 新增）而
+     * 极少满足该关系；即使个别轮误判，后果 = 「少算缓存」→ 压缩判定偏保守延后（可接受），
+     * 反向错误（把总小票按 4 项和算）才是 ×2 虚高 → 过早压缩（用户 2026-10-10 报障形态）。
+     *
+     * @param input       input_tokens（≤ 0 → false，无信息量不判）
+     * @param cacheRead   cache_read_input_tokens（null → 0，调用方负责）
+     * @param cacheCreate cache_creation_input_tokens（null → 0，调用方负责）
+     * @return true = input 已含 cache hit（求和只取 input + output）；false = 按 Anthropic 4 项和
+     */
+    public static boolean inputIncludesCacheHit(long input, long cacheRead, long cacheCreate) {
+        if (input <= 0) {
+            return false;
+        }
+        return (cacheRead > 0 || cacheCreate > 0) && (cacheRead + cacheCreate) <= input;
+    }
+
+    /**
      * 上下文总 token · CC original: getTokenCountFromUsage (utils/tokens.ts:46-53)。
      * input + cache_creation + cache_read + output（全量窗口，含 cache）。
      *
@@ -125,11 +152,15 @@ public final class Tokens {
         if (usage == null) {
             return 0;
         }
-        if (anthropic) {
+        // [ant-deepseek 双计修复 2026-10-10] anthropic 分支再加一层数字自证（inputIncludesCacheHit）：
+        // 上游「总小票」形态（DeepSeek /anthropic 端点等 OpenAI 语义来源）input 已含 cache hit，
+        // 按 CC 4 项和会双计（×2 虚高 → 早压缩）。自证命中 → 与下方非 anthropic 同路（只取 input+output）。
+        if (anthropic && !inputIncludesCacheHit(usage.inputTokens(),
+                usage.cacheReadInputTokens(), usage.cacheCreationInputTokens())) {
             return usage.inputTokens() + usage.cacheCreationInputTokens()
                 + usage.cacheReadInputTokens() + usage.outputTokens();
         }
-        // 非 anthropic：input_tokens 已含 cache hit，只计 input+output（A5-2）
+        // 非 anthropic / 总小票形态：input_tokens 已含 cache hit，只计 input+output（A5-2）
         return usage.inputTokens() + usage.outputTokens();
     }
 

@@ -7821,8 +7821,10 @@ html {
 /* 对话/轨迹 nav 下方去掉分割线（原型） */
 .center-tabs { border-bottom: none; }
 
-/* ===== Composer 对齐基础 HTML（950px / 60px / 工具栏 / 快捷键） ===== */
-.composer-inner { max-width: 950px; }
+/* ===== Composer 对齐基础 HTML（60px / 工具栏 / 快捷键） ===== */
+/* [2026-10-10 移除 max-width:950px 残留] 该上限为 08-22 旧设计，文末 last-wins 压掉 2333 行
+   10-09 裁定的「85% 纯百分比自适应」——收起两侧边栏时输入框不随中心列平铺（用户报障）。
+   宽度口径现由 2333 行单点承担（max-width:none + width:85% + margin-left:42px）。 */
 .composer textarea { height: 60px; max-height: 200px; min-height: 60px; font-size: 16px; }
 .composer .input-box { padding: 16px; border-radius: 16px; }
 .composer .toolbar { margin-top: 4px; }
