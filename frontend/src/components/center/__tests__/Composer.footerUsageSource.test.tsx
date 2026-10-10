@@ -7,24 +7,25 @@ import { useChatStore } from '@/stores/chatStore'
 import type { ChatMessageDto, Provider } from '@/api/types'
 
 /**
- * D1 · 底部数字（缓存% / 当前上下文）只统计「用户自己的请求」—— 后台任务 run 的 message.usage 不再污染。
+ * 底部数字（缓存% / 当前上下文）· [口径反转 2026-10-10 用户裁定]。
  *
  * <h2>WHY（规则九 · 意图而非行为）</h2>
- * <p>同会话后台任务（CronIdleExecutor 的 cron 调度 / 任务通知 run）复用会话 stream topic 推
- * {@code message.usage}（实测 63% 事件出自 {@code cron-idle-*} 线程）。Composer 底部 footer 取
- * 「最后一条带 usage 的条目」⇒ 用户刚发一轮，footer 却显示后台任务那轮的缓存%/上下文
- * （数字忽大忽小、还不受用户操作影响）。修法 = 事件带「来源」标记，footer 取数只认 user 来源；
- * 其余展示（弹窗上下文条 / 助手消息自己的 t/s 与 usage）不动。
+ * <p>原 D1 口径（0.1.29）：footer 只统计「用户自己的请求」，cron/任务通知唤醒的轮被过滤。
+ * 用户实测推翻该口径：**cron/通知唤醒的主会话轮就是主会话的对话**（主会话收到消息并回复了），
+ * 用户长时间只看任务跑时数字被钉死（「缓存都不动了」）。裁定：**去掉来源过滤**——所有主会话轮
+ * 都驱动底部数字；真正要排除的「子代理/fork 的 usage」结构性不进本流（不推 message.usage），
+ * 无需过滤。同时按 deepseek-harness 官方口径**双显示**：本回合（最近一条 usage）+ 会话累计
+ * （`modelUsage` 累计快照聚合，Σ命中/Σ输入）。
  *
  * <h2>RED（改回旧实现哪条红）</h2>
  * <ul>
- *   <li>footer 扫描源去掉 {@code isUserUsageSource} 过滤 → 「末条 background 快照不得顶掉用户那条」红；</li>
- *   <li>把缺省来源当 background（而不是 user）→ 「无来源标记的旧消息照常计入」红（静默隐藏既有数据）。</li>
+ *   <li>把 {@code usageScan} 改回「按 isUserUsageSource 过滤」→ ①③④ 红（末条 background 被滤掉）；</li>
+ *   <li>累计改用「最近一轮」的数（不聚合 modelUsage）→ 双显示用例的「（累计）」断言红。</li>
  * </ul>
  *
  * <h2>手法</h2>
- * 沿用本仓 Composer 既有 jsdom 真实渲染模式（{@code Composer.stopVisibleWhenServerRunning.test.tsx}）：
- * createRoot + act，不引入新依赖；断言真实 DOM 文本（footer 由 useMemo 计算，必须走真渲染才覆盖接线）。
+ * 沿用本仓 Composer 既有 jsdom 真实渲染模式：createRoot + act，断言真实 DOM 文本
+ * （footer 由 useMemo 计算，必须走真渲染才覆盖接线）。
  */
 
 vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => false, invoke: vi.fn(async () => undefined) }))
@@ -33,7 +34,15 @@ vi.mock('@tauri-apps/plugin-fs', () => ({ stat: vi.fn(), readFile: vi.fn(), writ
 
 const SID = 'sess-d1-footer'
 
-/** 用户来源的 assistant 消息（无 usageSource = 旧消息/旧帧，展示侧按 user 计）。 */
+/** ModelUsageEntry 全字段（会话按模型累计快照 · 「累计」双显示的取数源）。 */
+function mu(inTok: number, outTok: number, cr: number, cc: number) {
+  return {
+    inputTokens: inTok, outputTokens: outTok, cacheReadInputTokens: cr, cacheCreationInputTokens: cc,
+    webSearchRequests: 0, costUSD: 0, contextWindow: 200000, maxOutputTokens: 0,
+  }
+}
+
+/** 用户轮 assistant（openai 语义数据：cr ≤ input；本回合 500/1000 = 50%）。 */
 function userMsg(): ChatMessageDto {
   return {
     id: 'a-user', sessionId: SID, role: 'assistant', author: 'nexus', content: '用户那轮',
@@ -43,16 +52,18 @@ function userMsg(): ChatMessageDto {
     error: null, errorDetails: null, matchedRule: null,
     usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 500 },
     contextTokensUsed: 1000, contextWindow: 200000, percentLeft: 99,
+    modelUsage: { 'ds-openai/deepseek-v4-flash': mu(1000, 50, 500, 0) },
   } as ChatMessageDto
 }
 
-/** 后台来源（cron 调度 / 任务通知 run）的 assistant 消息 —— 数字与用户那条明显不同，便于断言谁被采用。 */
+/** 后台（cron/任务通知唤醒的主会话）轮 —— 本回合 900/9000 = 10%；modelUsage=会话累计（user+bg：1400/10000 = 14%）。 */
 function backgroundMsg(): ChatMessageDto {
   return {
     ...userMsg(),
     id: 'a-bg', content: '后台通知那轮', userMessageId: 'u-bg', usageSource: 'background',
     usage: { input_tokens: 9000, output_tokens: 10, cache_read_input_tokens: 900 },
     contextTokensUsed: 9000, contextWindow: 200000, percentLeft: 95,
+    modelUsage: { 'ds-openai/deepseek-v4-flash': mu(10000, 60, 1400, 0) },
   } as ChatMessageDto
 }
 
@@ -91,7 +102,7 @@ function mountComposer(model = 'ds-openai/deepseek-v4-flash', providers?: Provid
   }
 }
 
-describe('D1 · Composer 底部数字来源过滤（缓存% / 当前上下文）', () => {
+describe('[口径反转 2026-10-10] 底部数字跟随「所有主会话轮」（含后台唤醒轮）', () => {
   let mounted: { container: HTMLDivElement; root: Root } | undefined
 
   beforeEach(() => {
@@ -108,40 +119,40 @@ describe('D1 · Composer 底部数字来源过滤（缓存% / 当前上下文）
     useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
   })
 
-  it('⭐ 末条是后台来源快照 → footer 仍显示用户自己那条的数（缓存 50% / 1k / 200k），不被后台任务顶掉', () => {
+  it('⭐ 末条是后台唤醒轮 → 显示「它」（缓存 10%（本回合） / 上下文 9k），不再钉在旧用户轮', () => {
     useChatStore.setState({ messages: { [SID]: [userMsg(), backgroundMsg()] } })
     const h = mountComposer()
     mounted = h
 
     const text = h.footer()
-    expect(text).toContain('当前上下文 1k / 200k')
-    expect(text).toContain('缓存 50%')
-    expect(text).not.toContain('9k / 200k')
-    expect(text).not.toContain('缓存 10%')
+    expect(text).toContain('当前上下文 9k / 200k')
+    expect(text).toContain('缓存 10%（本回合）')
+    expect(text).not.toContain('1k / 200k')
   })
 
-  it('无来源标记的旧消息（旧帧 / 旧数据）照常计入 —— 缺省按 user 计，不得静默隐藏', () => {
+  it('无来源标记的旧消息（旧帧 / 旧数据）照常计入——缺省按 user 计不隐藏', () => {
     useChatStore.setState({ messages: { [SID]: [userMsg()] } })
     const h = mountComposer()
     mounted = h
 
     expect(h.footer()).toContain('当前上下文 1k / 200k')
-    expect(h.footer()).toContain('缓存 50%')
+    expect(h.footer()).toContain('缓存 50%（本回合）')
   })
 
-  it('只有后台来源快照（用户本轮尚未有带 usage 的 assistant）→ 不显示用户数（不得拿后台任务的数顶上）', () => {
+  it('只有后台快照（用户本轮尚无 assistant）→ 照常显示它（主会话轮即是当前活动）', () => {
     useChatStore.setState({ messages: { [SID]: [backgroundMsg()] } })
     const h = mountComposer()
     mounted = h
 
-    expect(h.footer()).not.toContain('当前上下文')
+    const text = h.footer()
+    expect(text).toContain('当前上下文 9k / 200k')
+    expect(text).toContain('缓存 10%（本回合）')
   })
 
-  it('⭐ F5/重拉态：后台轮的 assistant 行【无 usageSource】（DB 行）但 userMessageId 指向 is_meta=true 的 user 行 → 仍不得顶掉用户轮的数', () => {
-    // 重拉数据形态（GET /messages 尾页）：实时事件的 source 不存在，判据 = user_message_id → user 行 is_meta
+  it('⭐ F5/重拉态：后台轮 assistant 行【无 usageSource】但 userMessageId 指向 is_meta=true 的 user 行 → 照常计入（不得再被滤掉）', () => {
     const reloadedBgUser = {
       ...userMsg(), id: 'u-bg', role: 'user' as const, content: '<task-notification>…', isMeta: true,
-      usage: null, contextTokensUsed: null, contextWindow: null, percentLeft: null,
+      usage: null, contextTokensUsed: null, contextWindow: null, percentLeft: null, modelUsage: null,
     }
     const reloadedBgAssistant = {
       ...backgroundMsg(), id: 'a-bg', usageSource: undefined, userMessageId: 'u-bg',
@@ -151,11 +162,11 @@ describe('D1 · Composer 底部数字来源过滤（缓存% / 当前上下文）
     mounted = h
 
     const text = h.footer()
-    expect(text).toContain('当前上下文 1k / 200k')
-    expect(text).not.toContain('9k / 200k')
+    expect(text).toContain('当前上下文 9k / 200k')
+    expect(text).toContain('缓存 10%（本回合）')
   })
 
-  it('重拉态对照：user 行 is_meta=false（用户自己那条）→ 最新一条照常计入（不得把用户自己的数也滤掉）', () => {
+  it('重拉态对照：user 行 is_meta=false（用户自己那条）→ 最新一条照常计入', () => {
     const reloadedUserAssistant = {
       ...backgroundMsg(), id: 'a-user2', usageSource: undefined, userMessageId: 'u-1',
       contextTokensUsed: 9000, usage: { input_tokens: 9000, output_tokens: 10, cache_read_input_tokens: 900 },
@@ -165,6 +176,67 @@ describe('D1 · Composer 底部数字来源过滤（缓存% / 当前上下文）
     mounted = h
 
     expect(h.footer()).toContain('当前上下文 9k / 200k')
+  })
+})
+
+/**
+ * [缓存%双显示 2026-10-10 用户裁定] 「本回合」+「累计（会话）」两个数：
+ * 累计 = Σ命中/Σ输入（modelUsage 累计聚合 · deepseek-harness 官方口径），每轮回复都推动本数
+ * （含后台唤醒轮——不依赖用户输入）。
+ */
+describe('[缓存%双显示] 本回合 + 会话累计（Σ命中/Σ输入）', () => {
+  let mounted: { container: HTMLDivElement; root: Root } | undefined
+
+  beforeEach(() => {
+    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
+  })
+
+  afterEach(() => {
+    if (mounted) {
+      const cur = mounted
+      act(() => cur.root.unmount())
+      cur.container.remove()
+      mounted = undefined
+    }
+    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
+  })
+
+  it('openai 语义：本回合 10%（背景轮）· 累计 14%（Σ1400/Σ10000）——两数不同、各自口径对', () => {
+    useChatStore.setState({ messages: { [SID]: [userMsg(), backgroundMsg()] } })
+    const h = mountComposer()
+    mounted = h
+
+    const text = h.footer()
+    expect(text).toContain('缓存 10%（本回合）')
+    expect(text).toContain('14%（累计）')       // round(1400/10000*100)
+  })
+
+  it('ant 语义（type=anthropic）：本回合 = cr/(input+cr+cc) = 97%；累计 = Σ 三桶 = 57%', () => {
+    const msg = {
+      ...userMsg(),
+      usage: { input_tokens: 2560, output_tokens: 100, cache_read_input_tokens: 86600, cache_creation_input_tokens: 0 },
+      modelUsage: { 'ds-zcw/deepseek-flash': mu(5000, 600, 8000, 1000) },
+    }
+    useChatStore.setState({ messages: { [SID]: [msg] } })
+    const h = mountComposer('ds-zcw/deepseek-flash', [{
+      id: 'p-zcw', name: 'ds-zcw', type: 'anthropic', baseUrl: '', apiKeyMasked: '', extraHeaders: null, enabled: true, models: [],
+    }])
+    mounted = h
+
+    const text = h.footer()
+    expect(text).toContain('缓存 97%（本回合）')   // 86600/(2560+86600)
+    expect(text).toContain('57%（累计）')          // 8000/(5000+8000+1000)
+  })
+
+  it('无 modelUsage（老数据）→ 只显示本回合，不显示累计（不得凭空造数）', () => {
+    const msg = { ...userMsg(), modelUsage: null }
+    useChatStore.setState({ messages: { [SID]: [msg] } })
+    const h = mountComposer()
+    mounted = h
+
+    const text = h.footer()
+    expect(text).toContain('缓存 50%（本回合）')
+    expect(text).not.toContain('累计')
   })
 })
 
@@ -202,6 +274,7 @@ describe('[缓存%判据修复] Anthropic 判定查 providers.type（不再按�
     const msg = {
       ...userMsg(),
       usage: { input_tokens: 2560, output_tokens: 100, cache_read_input_tokens: 86600, cache_creation_input_tokens: 0 },
+      modelUsage: null,
     }
     useChatStore.setState({ messages: { [SID]: [msg] } })
     const h = mountComposer('ds-zcw/deepseek-flash', [realProvider('ds-zcw', 'anthropic')])
@@ -215,6 +288,7 @@ describe('[缓存%判据修复] Anthropic 判定查 providers.type（不再按�
     const msg = {
       ...userMsg(),
       usage: { input_tokens: 471359, output_tokens: 100, cache_read_input_tokens: 470784, cache_creation_input_tokens: 0 },
+      modelUsage: null,
     }
     useChatStore.setState({ messages: { [SID]: [msg] } })
     const h = mountComposer('oc/deepseek-v4.1-flash', [realProvider('oc', 'openai_compatible')])

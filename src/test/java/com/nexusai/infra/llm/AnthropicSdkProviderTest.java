@@ -82,6 +82,20 @@ class AnthropicSdkProviderTest {
     }
 
     @Test
+    @DisplayName("[thinking-adaptive 2026-10-10] buildMessageParams: 恒发 thinking:{type:\"adaptive\",display:\"omitted\"}（对齐 CC 2.1.296 实发形态）")
+    void buildMessageParams_thinkingAdaptive() {
+        MessageCreateParams params = AnthropicSdkProvider.buildMessageParams(
+            "deepseek-flash", null, List.of(), null, null, null, null, null, null);
+
+        assertThat(params.thinking()).isPresent();
+        var t = params.thinking().get();
+        assertThat(t.isAdaptive()).as("恒发 adaptive（CC 捕获形态）").isTrue();
+        assertThat(t.asAdaptive().display()).isPresent();
+        assertThat(t.asAdaptive().display().get().asString())
+            .as("display=omitted（CC 同形）").isEqualTo("omitted");
+    }
+
+    @Test
     @DisplayName("[DEC-RV-07] buildMessageParams: messages cache marker exactly-one（CC claude.ts:3078-3091）")
     void buildMessageParams_cacheMarker() {
         // 一条 user 消息 → marker 落最后一条（skipCacheWrite null）

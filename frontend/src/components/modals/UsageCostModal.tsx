@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useChatStore } from '@/stores/chatStore'
-import { backgroundUsageFlowIds, isUserUsageSource, resolveCtxInfo } from '@/utils/contextUsage'
+import { resolveCtxInfo } from '@/utils/contextUsage'
 import { sessionApi } from '@/api/sessions'
 import { statsApi } from '@/api/stats'
 import type { ChatMessageDto, StatsByModel, StatsResponse } from '@/api/types'
@@ -177,16 +177,11 @@ export function UsageCostModal({
   //   [P3-d 口径统一 2026-09-11] 删除「回落 token_warning」：其 tokenUsage 是本地估算、percentLeft 是
   //   阈值相对口径（分母 autoCompactThreshold ≠ 窗口），与服务端真实 usage 不同源 → 混显示会让弹窗与
   //   Composer 上下文条各说一套；无快照即不显示该条（对齐 CC getCurrentUsage undefined）。
-  //   [口径拉齐 2026-10-10] 取数改用「用户来源过滤后的全列表」（与 Composer 底部 usageScan 同一单点）：
-  //   后台任务轮（cron/任务通知 run）的 usage 不再顶掉本条 —— 此前用未过滤的 [lastMsg]，
-  //   末条是后台轮时弹窗与底部数字「各说一套」（用户裁定：拉齐）。
+  //   [口径拉齐 2026-10-10 → 口径反转 2026-10-10] 取数 = 与 Composer 底部同类（全列表单点）；
+  //   口径经用户实测修正：**去掉「只统计用户来源」过滤**——cron/任务通知唤醒的主会话轮属于主会话
+  //   对话，照常驱动本条（用户裁定「前端不能停止」）。
   const msgsOfSession = useChatStore((s) => s.messages[activeSessionId] ?? EMPTY_MESSAGES)
-  const bgFlowIds = useMemo(() => backgroundUsageFlowIds(msgsOfSession), [msgsOfSession])
-  const usageScan = useMemo(
-    () => msgsOfSession.filter((m) => isUserUsageSource(m, bgFlowIds)),
-    [msgsOfSession, bgFlowIds],
-  )
-  const ctxInfo = resolveCtxInfo(usageScan)
+  const ctxInfo = resolveCtxInfo(msgsOfSession)
   const ctxUsed = ctxInfo?.used ?? null
   const ctxWindow = ctxInfo?.window ?? null
   const ctxPct = ctxInfo?.pct ?? null

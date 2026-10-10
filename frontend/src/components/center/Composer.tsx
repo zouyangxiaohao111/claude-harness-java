@@ -17,7 +17,7 @@ import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
 import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
-import { backgroundUsageFlowIds, isUserUsageSource, resolveCtxInfo } from '@/utils/contextUsage'
+import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
@@ -254,11 +254,11 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   //   complete 兜底）按 user 计 —— 向后兼容，不得静默隐藏既有数据。
   //   [R1 · F5/重拉态] DB 行没有 usageSource（实时事件才有）→ 用 DB 判据派生：后台来源 flow = 该轮
   //   user 行 is_meta=true（cron/通知注入行，V51）。集合只依赖 msgs（user 行来自重拉），故 F5 后仍成立。
-  const backgroundFlows = useMemo(() => backgroundUsageFlowIds(msgs), [msgs])
-  const usageScan = useMemo(
-    () => [...msgs, ...liveBlocks].filter((x) => isUserUsageSource(x, backgroundFlows)),
-    [msgs, liveBlocks, backgroundFlows],
-  )
+  // [口径反转 2026-10-10 用户裁定] 删除「只统计用户来源」过滤（原 D1 口径作废）：cron/任务通知
+  //   唤醒的**主会话轮**（主会话收到消息并回复了）属于主会话对话，底部数字应随之刷新——「后台轮
+  //   顶掉」在用户视角下正是当前活动；真正要排除的「子代理/fork 的 usage」结构性不进本流
+  //   （不推 message.usage），无需过滤。
+  const usageScan = useMemo(() => [...msgs, ...liveBlocks], [msgs, liveBlocks])
   const ctxInfo = useMemo(() => resolveCtxInfo(usageScan), [usageScan])
   // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
   //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
@@ -292,6 +292,36 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     }
     return null
   }, [usageScan, isClaudeProvider])
+  // [缓存%双显示 2026-10-10 用户裁定] 第二个数：**会话累计**命中率（deepseek-harness 官方口径）。
+  //   口径 = 「命中之和 ÷ 输入之和」（按轮大小加权，不是挑某一轮）；数据源 = 最近一条 assistant 的
+  //   modelUsage（会话按模型累计快照 · 每轮 complete 更新 + 落库 model_usage_json，F5 后仍在；含
+  //   用户轮与 cron/任务通知唤醒的主会话轮；子代理/fork 结构性不进该累计）→ **每轮回复都会推动本数**
+  //   （含后台触发的自动轮，不依赖用户输入——用户裁定的「不能停止」要求）。
+  //   公式沿用 0.1.32 协议分派：anthropic 语义 = Σcr/(Σinput+Σcr+Σcc)（与官方三桶同构）；
+  //   openai 语义 = Σcr/Σinput（其 input 已含命中，套三桶会双计成 ~50% 假象）。
+  const lastMsg = useMemo(() => {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'assistant') return msgs[i]
+    }
+    return null
+  }, [msgs])
+  const sessionCacheRateInfo = useMemo(() => {
+    const mu = lastMsg?.modelUsage
+    if (!mu) return null
+    let ci = 0
+    let cr = 0
+    let cc = 0
+    for (const u of Object.values(mu)) {
+      ci += u.inputTokens ?? 0
+      cr += u.cacheReadInputTokens ?? 0
+      cc += u.cacheCreationInputTokens ?? 0
+    }
+    if (isClaudeProvider) {
+      const total = ci + cc + cr
+      return total > 0 ? Math.round((cr / total) * 100) : null
+    }
+    return ci > 0 ? Math.round((cr / ci) * 100) : null
+  }, [lastMsg, isClaudeProvider])
   // F4 · 最近一条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示）。
   //   扫描源 = [...msgs, ...liveBlocks]：live 块在 message.usage（assistant 流式结束）即挂 usage/decode_ms，
   //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。
@@ -1246,8 +1276,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 </span>
               )}
               {cacheRateInfo && (
-                <span className={`hu-cache${cacheRateInfo.rate >= 50 ? '' : ' warn'}`} title={`缓存读取 ${compactNumber(cacheRateInfo.read)} tokens`}>
-                  · 缓存 {cacheRateInfo.rate}%
+                <span className={`hu-cache${cacheRateInfo.rate >= 50 ? '' : ' warn'}`} title={`本回合缓存读取 ${compactNumber(cacheRateInfo.read)} tokens`}>
+                  · 缓存 {cacheRateInfo.rate}%（本回合）
+                  {sessionCacheRateInfo != null && ` · ${sessionCacheRateInfo}%（累计）`}
                 </span>
               )}
               {sessionUsage?.totalCostYuan != null && sessionUsage.totalCostYuan > 0 && <span className="hu-cost">· ¥{sessionUsage.totalCostYuan.toFixed(2)}</span>}

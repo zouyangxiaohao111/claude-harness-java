@@ -19,6 +19,7 @@ import com.anthropic.models.messages.RawMessageDeltaEvent;
 import com.anthropic.models.messages.RawMessageStartEvent;
 import com.anthropic.models.messages.RawMessageStreamEvent;
 import com.anthropic.models.messages.TextBlockParam;
+import com.anthropic.models.messages.ThinkingConfigAdaptive;
 import com.anthropic.models.messages.ThinkingConfigEnabled;
 import com.anthropic.models.messages.ThinkingConfigParam;
 import com.anthropic.models.messages.Tool;
@@ -1090,8 +1091,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                 maxTokens, null, null, outputFormat, skipCacheWrite,
                 options != null ? options.enablePromptCaching() : null,
                 StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
-            if (temperature != null) {
+            if (temperature != null && params.thinking().isEmpty()) {
                 // [P2-16] thinking disabled 时写 temperature（CC claude.ts:1693-1694）
+                // [thinking-adaptive 2026-10-10] 判据显式化：请求带 thinking（现恒 adaptive）时不写
+                //   temperature —— 对齐 CC（thinking 活跃时 API 要求 temperature=1，CC 仅在 disabled 时写）。
                 params = params.toBuilder().temperature(temperature).build();
             }
 
@@ -1234,8 +1237,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                 maxTokens, null, null, outputFormat, skipCacheWrite,
                 options != null ? options.enablePromptCaching() : null,
                 StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
-            if (temperature != null) {
+            if (temperature != null && params.thinking().isEmpty()) {
                 // [P2-16] thinking disabled 时写 temperature（CC claude.ts:1693-1694）
+                // [thinking-adaptive 2026-10-10] 判据显式化：请求带 thinking（现恒 adaptive）时不写
+                //   temperature —— 对齐 CC（thinking 活跃时 API 要求 temperature=1，CC 仅在 disabled 时写）。
                 params = params.toBuilder().temperature(temperature).build();
             }
             params = adjustParamsForNonStreaming(params);
@@ -1530,7 +1535,10 @@ public class AnthropicSdkProvider implements LlmProvider {
      * SDK 支持传输（anthropic-java MessageCreateParams 无 typed context_management 字段，但外层
      * Builder {@code putAdditionalProperty(String, JsonValue)} 可序列化进请求 JSON，与
      * output_config.task_budget / cache_edits 同机制），但 Java {@code AnthropicSdkProvider}
-     * 恒不发送 thinking（buildMessageParams 无 .thinking() 调用，hasThinking 恒 false）。
+     * ⚠️ [thinking-adaptive 2026-10-10 更新] 请求侧已**恒发** thinking:{type:"adaptive"}（buildMessageParams
+     * 现含 .thinking 调用）—— 本条「恒不发送 thinking（buildMessageParams 无 .thinking() 调用）」字面
+     * **作废**；下文「未来 Java 启用 thinking 时的对齐接线点」仍未实施（context_management 注入属另一轴：
+     * 判据是「历史含 thinking block」的 hasThinking，与请求参 thinking 不同轴）。
      * <p>① <b>REQUEST BODY 零行为差异（成立）</b>：CC {@code getAPIContextManagement}
      * （apiMicrocompact.ts:64-153）非 ant 路径唯一策略 clear_thinking_20251015 需
      * {@code hasThinking && !isRedactThinkingActive}（apiMicrocompact.ts:82-84）恒不触发，且
@@ -1646,7 +1654,18 @@ public class AnthropicSdkProvider implements LlmProvider {
             .maxTokens(maxOutputTokensOverride != null
                 ? maxOutputTokensOverride
                 // [G-18] 请求体默认与压缩链同源：DB 优先（models.max_tokens）→ CC 家族表回落
-                : resolveMaxOutputTokensForModel(modelName));
+                : resolveMaxOutputTokensForModel(modelName))
+            // [thinking-adaptive 2026-10-10] 统一发 thinking:{type:"adaptive",display:"omitted"}
+            //   ——对齐 CC 2.1.296 实发形态（用户真机 CC 对接 DeepSeek /anthropic 的本地抓包实证：
+            //   CC 对一切模型（含未知模型 deepseek-flash）均带此字段）。本仓此前「恒不发 → 用上游默认」：
+            //   第三方 ant 端点（DeepSeek）对 deepseek-flash 默认 thinking 开，长上下文下「想完不写正文」
+            //   → 空收尾（用户报「直接结束」）。直连实测该参数被 DeepSeek 端点接受、adaptive 令模型
+            //   「适可而止地想」。display=OMITTED 与 CC 同形（DeepSeek 实测仍回 thinking 内容，不影响
+            //   本仓思考展示；真 Claude 侧与 CC 行为一致）。
+            .thinking(ThinkingConfigParam.ofAdaptive(
+                ThinkingConfigAdaptive.builder()
+                    .display(ThinkingConfigAdaptive.Display.OMITTED)
+                    .build()));
 
         // [C-31] output_config: task_budget + effort + format 共享单节点（CC claude.ts:1559-1565）
         OutputConfig.Builder ocb = null;

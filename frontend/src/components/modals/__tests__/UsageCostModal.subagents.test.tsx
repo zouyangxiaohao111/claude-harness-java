@@ -134,8 +134,9 @@ describe('D2 · UsageCostModal 子代理（本会话）区块', () => {
 })
 
 /**
- * [口径拉齐 2026-10-10] 弹窗「当前上下文条」与底部数字同口径（只统计用户自己的请求）。
- * 用户裁定「拉齐」。RED：把 ctxInfo 换回 resolveCtxInfo([lastMsg])（未过滤）→ 两条用例红（会显示后台轮的 9k）。
+ * [口径拉齐 → 口径反转 2026-10-10] 弹窗「当前上下文条」与底部数字**同口径**（这一句不变）；
+ * 口径本身经用户实测修正：**去掉「只统计用户来源」过滤**——cron/通知唤醒的主会话轮属于主会话
+ * 对话，照常计入（原两条用例语义已反转）。RED：把 ctxInfo 换回「按 isUserUsageSource 过滤」→ 两条红。
  */
 describe('[口径拉齐] UsageCostModal 当前上下文条 · 与底部同口径', () => {
   let container: HTMLDivElement
@@ -179,7 +180,7 @@ describe('[口径拉齐] UsageCostModal 当前上下文条 · 与底部同口径
     await flush()
   }
 
-  it('末条是后台轮（显式 usageSource）→ 显示用户轮的数', async () => {
+  it('[口径反转 2026-10-10] 末条是后台唤醒轮（显式 usageSource）→ 显示它（主会话轮即当前活动，不再被滤）', async () => {
     const userAsst = asstMsg({
       id: 'a-user',
       usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 500 },
@@ -194,11 +195,11 @@ describe('[口径拉齐] UsageCostModal 当前上下文条 · 与底部同口径
     await mount()
     const text = container.textContent ?? ''
     expect(text).toContain('当前上下文')
-    expect(text).toContain('1k / 200k')
-    expect(text).not.toContain('9k / 200k')
+    expect(text).toContain('9k / 200k')
+    expect(text).not.toContain('1k / 200k')
   })
 
-  it('重拉态（无 usageSource）：userMessageId 指向 isMeta user 行 → 同样排除', async () => {
+  it('[口径反转 2026-10-10] 重拉态（无 usageSource）：userMessageId 指向 isMeta user 行 → 照常计入（不得被滤）', async () => {
     const userAsst = asstMsg({
       id: 'a-user',
       usage: { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 500 },
@@ -213,7 +214,7 @@ describe('[口径拉齐] UsageCostModal 当前上下文条 · 与底部同口径
     useChatStore.setState({ messages: { [SID]: [userAsst, bgUser, bgAsst] }, streams: {}, sessions: [] })
     await mount()
     const text = container.textContent ?? ''
-    expect(text).toContain('1k / 200k')
-    expect(text).not.toContain('9k / 200k')
+    expect(text).toContain('9k / 200k')
+    expect(text).not.toContain('1k / 200k')
   })
 })
