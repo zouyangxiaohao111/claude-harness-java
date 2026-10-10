@@ -214,7 +214,7 @@ class ProductionForkedQueryUsageCcContractTest {
                            AbortController abortController,
                            Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             int idx = Math.min(callCount.getAndIncrement(), script.size() - 1);
             onAssistantMessage.accept(script.get(idx));
             onComplete.run();

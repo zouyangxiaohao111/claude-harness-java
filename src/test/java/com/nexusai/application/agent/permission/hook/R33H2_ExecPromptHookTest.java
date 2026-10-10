@@ -79,7 +79,7 @@ class R33H2_ExecPromptHookTest {
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
                                Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
 
@@ -120,7 +120,7 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (capturedUser != null) capturedUser.set(u);
                 return response;
@@ -198,7 +198,7 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 try { Thread.sleep(2000); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); throw new RuntimeException(e);
@@ -237,7 +237,7 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) { throw new UnsupportedOperationException(); }
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new RuntimeException("provider exploded");
             }

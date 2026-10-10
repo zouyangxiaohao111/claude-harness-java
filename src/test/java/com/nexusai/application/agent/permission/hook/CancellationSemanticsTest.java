@@ -89,7 +89,7 @@ class CancellationSemanticsTest {
                            AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             int idx = callCount.getAndIncrement();
             AssistantMessage am = responses.get(Math.min(idx, responses.size() - 1));
             onAssistantMessage.accept(am);
@@ -167,7 +167,7 @@ class CancellationSemanticsTest {
             java.util.function.Consumer<String> orc, Runnable osf,
             AbortController ac,
             java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             throw new UnsupportedOperationException();
         }
 
@@ -391,7 +391,7 @@ class CancellationSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) { return ""; }

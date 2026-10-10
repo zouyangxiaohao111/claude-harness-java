@@ -146,6 +146,24 @@ export function SettingsModal({
     setDynamicHeaderValues(appSettings?.allowDynamicHeaderValues ?? true)
   }, [appSettings?.allowDynamicHeaderValues])
 
+  // 流空闲超时（通用 tab · settings.stream_idle_timeout_ms；V78 列）。
+  // 留空 = 未配置（后端回落 env/默认 300000）；有效下限 300000——低于下限会被后端抬到 300s，
+  // 故前端 min 直接拦住并在保存时给出显式提示（避免"设了 60000 却按 300000 生效"的静默偏差）。
+  const [idleTimeoutDraft, setIdleTimeoutDraft] = useState('')
+  useEffect(() => {
+    setIdleTimeoutDraft(appSettings?.streamIdleTimeoutMs != null ? String(appSettings.streamIdleTimeoutMs) : '')
+  }, [appSettings?.streamIdleTimeoutMs])
+
+  const saveIdleTimeout = () => {
+    const raw = idleTimeoutDraft.trim()
+    const parsed = raw === '' || Number.isNaN(Number(raw)) ? null : Number(raw)
+    if (parsed != null && parsed < 300000) {
+      showToast('流空闲超时必须 ≥ 300000 毫秒（5 分钟），低于该值不会生效', 'info')
+      return
+    }
+    void onSaveSettings({ streamIdleTimeoutMs: parsed })
+  }
+
   return (
     <>
     <div className="settings-backdrop" onClick={close}>
@@ -218,6 +236,23 @@ export function SettingsModal({
                     <input type="checkbox" defaultChecked />
                     <span></span>
                   </label>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">流空闲超时（毫秒）</div>
+                    <div className="settings-row-desc">超过该时长没有任何输出时自动中断；留空使用默认 300000（5 分钟）</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <input
+                      className="settings-input"
+                      type="number"
+                      min={300000}
+                      placeholder="300000"
+                      value={idleTimeoutDraft}
+                      onChange={(e) => setIdleTimeoutDraft(e.target.value)}
+                    />
+                    <button className="envc-save" onClick={saveIdleTimeout}>保存</button>
+                  </div>
                 </div>
               </>
             )}

@@ -76,7 +76,7 @@ class AnthropicSdkProviderStreamErrorTranslationTest {
                     done.countDown();
                 },
                 () -> {
-                }, null, null);
+                }, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
             assertThat(done.await(10, TimeUnit.SECONDS))
                 .as("流式 429 应在有限时间内经 onError 送达")

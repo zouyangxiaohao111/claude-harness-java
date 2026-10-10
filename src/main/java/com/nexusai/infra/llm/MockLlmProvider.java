@@ -116,7 +116,9 @@ public class MockLlmProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [流空闲看门狗] 末参接收（mock 无真实流可看门狗；T6 决定是否消费）
+                       StreamIdleControl streamIdleControl) {
         // [C] 记录 skipCacheWrite 供测试观测（mock 无 wire 层；主/子/fork 任一路径透传是否到位
         //   经 {@link #lastSkipCacheWrite()} 断言）。
         this.lastSkipCacheWrite = skipCacheWrite;
@@ -163,7 +165,9 @@ public class MockLlmProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [流空闲看门狗] 末参接收（同 blocks 重载注释）
+                       StreamIdleControl streamIdleControl) {
         // [C] 记录 skipCacheWrite 供测试观测（同上）
         this.lastSkipCacheWrite = skipCacheWrite;
         List<ChatMessageDto> reflected = history;
@@ -197,7 +201,8 @@ public class MockLlmProvider implements LlmProvider {
             reflected, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
             onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
-            agentContext);   // [A#3] 显式归因上下文透传（mock 不发射该边，签名跟随）
+            agentContext,   // [A#3] 显式归因上下文透传（mock 不发射该边，签名跟随）
+            streamIdleControl);   // [看门狗] 末参透传
     }
 
     /**

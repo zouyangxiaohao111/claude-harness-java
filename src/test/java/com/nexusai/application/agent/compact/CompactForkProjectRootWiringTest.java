@@ -279,7 +279,7 @@ class CompactForkProjectRootWiringTest {
                                          java.util.function.Consumer<com.nexusai.application.agent.tool.ToolUseBlock> otc,
                                          Consumer<String> orc, Runnable osf, AbortController ac,
                                          Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
             }

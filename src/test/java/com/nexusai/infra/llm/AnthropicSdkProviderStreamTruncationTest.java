@@ -95,7 +95,7 @@ class AnthropicSdkProviderStreamTruncationTest {
                 () -> {
                     completed.set(true);
                     done.countDown();
-                }, null, null);
+                }, null, null, StreamIdleControl.NONE);
 
             assertThat(done.await(10, TimeUnit.SECONDS))
                 .as("截断流应经「判失败→非流式回退」在有限时间内完成")
@@ -154,7 +154,7 @@ class AnthropicSdkProviderStreamTruncationTest {
                     gotError.set(err);
                     done.countDown();
                 },
-                done::countDown, null, null);
+                done::countDown, null, null, StreamIdleControl.NONE);
 
             assertThat(done.await(10, TimeUnit.SECONDS))
                 .as("截断流（无回退通道）应在有限时间内以 onError 或 onComplete 终结")
@@ -202,7 +202,7 @@ class AnthropicSdkProviderStreamTruncationTest {
                 () -> fallbackFired.set(true),
                 null,
                 gotError::set,
-                done::countDown, null, null);
+                done::countDown, null, null, StreamIdleControl.NONE);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             assertThat(gotMsg.get())

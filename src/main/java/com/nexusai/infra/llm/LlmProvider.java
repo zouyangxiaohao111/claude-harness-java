@@ -107,7 +107,11 @@ public interface LlmProvider {
                 // [参数位置] 追加在参数表末尾 —— 本接口 3 个重载在测试树被 Mockito 以纯 positional
                 //   索引消费（inv.getArgument(9/10/16) 等），中部插入会静默漂移既有索引；
                 //   末尾追加与之逐位兼容（同 skipCacheWrite 的既有取舍）。
-                com.nexusai.application.agent.subagent.AgentContext agentContext);
+                com.nexusai.application.agent.subagent.AgentContext agentContext,
+                // [流空闲看门狗 · 用户裁定 10-10] 末参追加（同上两条"末尾追加保 positional 索引"取舍）：
+                //   单次调用的看门狗控制载体（专用中止 controller + forceNonStreaming）；
+                //   无看门狗路径传 StreamIdleControl.NONE。消费点见 AnthropicSdkProvider.doStream。
+                StreamIdleControl streamIdleControl);
 
     /**
      * [CCJ-EXEC-08] 18-arg 流式 · <b>带 thinkingConfig 透传</b>（含 effortValue）。
@@ -144,7 +148,8 @@ public interface LlmProvider {
                         Consumer<Throwable> onError,
                         Runnable onComplete,
                         Boolean skipCacheWrite,
-                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                        com.nexusai.application.agent.subagent.AgentContext agentContext,
+                        StreamIdleControl streamIdleControl) {
         // [merge-fix] ⊕C-1 blocks 唯一发送契约：String 兼容链已删（16-arg String 委托目标不在
         //   合并接口），默认实现把 systemPrompt 折为单 block（CacheScope.NULL = 不缓存，join 恒等）
         //   路由到 blocks 抽象重载；thinkingConfig 忽略（与原有默认语义一致）。
@@ -153,7 +158,8 @@ public interface LlmProvider {
             history, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
             onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
-            agentContext);   // [A#3] 显式归因上下文透传（virtual-thread 边界不可丢）
+            agentContext,    // [A#3] 显式归因上下文透传（virtual-thread 边界不可丢）
+            streamIdleControl);   // [看门狗] 末参透传
     }
 
     /**
@@ -187,12 +193,14 @@ public interface LlmProvider {
                         Consumer<Throwable> onError,
                         Runnable onComplete,
                         Boolean skipCacheWrite,
-                        com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                        com.nexusai.application.agent.subagent.AgentContext agentContext,
+                        StreamIdleControl streamIdleControl) {
         stream(config, modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
             onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
-            agentContext);   // [A#3] 显式归因上下文透传
+            agentContext,    // [A#3] 显式归因上下文透传
+            streamIdleControl);   // [看门狗] 末参透传
     }
 
     /**

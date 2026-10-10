@@ -175,7 +175,7 @@ class SkillListingAgentSlotRecycleTest {
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             int idx = callCount.getAndIncrement();
             onAssistantMessage.accept(responses.get(Math.min(idx, responses.size() - 1)));
             onComplete.run();

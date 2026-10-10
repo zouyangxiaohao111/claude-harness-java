@@ -72,7 +72,7 @@ class AnthropicSdkProviderApiTelemetryTest {
                 List.of(userMsg("hi")), null,
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown, null, null);
+                null, e -> {}, done::countDown, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).as("onComplete 必须触发（正常流结束）").isTrue();
 
@@ -121,7 +121,7 @@ class AnthropicSdkProviderApiTelemetryTest {
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {},
                 null, // onStreamingFallback = null（不回退）
-                null, e -> errored.countDown(), () -> {}, null, null);
+                null, e -> errored.countDown(), () -> {}, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
             assertThat(errored.await(10, TimeUnit.SECONDS)).as("onError 必须触发（流式 500）").isTrue();
             verify(telemetry).recordEvent(eq("tengu_api_error"), any());
@@ -163,7 +163,7 @@ class AnthropicSdkProviderApiTelemetryTest {
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {},
                 () -> {}, // onStreamingFallback（abort 分支早退，不回退）
-                abort, e -> errored.countDown(), () -> {}, null, null);
+                abort, e -> errored.countDown(), () -> {}, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
             assertThat(errored.await(10, TimeUnit.SECONDS)).as("abort 后 onError(CancellationException) 必须触发").isTrue();
             verify(telemetry).recordEvent(eq("tengu_api_error"), any());
@@ -276,7 +276,7 @@ class AnthropicSdkProviderApiTelemetryTest {
                 List.of(userMsg("hi")), null,
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
-                null, e -> {}, done::countDown, null, null);
+                null, e -> {}, done::countDown, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
             assertThat(done.await(10, TimeUnit.SECONDS)).as("telemetry=null 时正常流仍走 onComplete").isTrue();
         } finally {
             server.stop(0);

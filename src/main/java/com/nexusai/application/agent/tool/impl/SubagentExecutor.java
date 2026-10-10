@@ -144,7 +144,6 @@ public class SubagentExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(SubagentExecutor.class);
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final long STREAM_TIMEOUT_SECONDS = 300;
 
     /**
      * [IMP-SUB-25 D-3] handoff 复核提示词 · CC original:

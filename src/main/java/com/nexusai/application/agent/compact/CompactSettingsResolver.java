@@ -172,6 +172,26 @@ public class CompactSettingsResolver {
     }
 
     /**
+     * 实时读 {@code settings.stream_idle_timeout_ms}（V78）· 流空闲看门狗阈值（对齐 CC
+     * {@code CLAUDE_STREAM_IDLE_TIMEOUT_MS} 的 DB 承载；用户 10-10 追加要求：前端「设置→通用」页可配）。
+     *
+     * <p>本层只做「DB 有值（> 0）原样透出」，<b>不做 300000 下限钳制</b>——钳制在消费点
+     * {@code StreamIdleWatchdogSettings.idleMs()} 统一执行（对齐 CC {@code Math.max(am()??0,300000)}）。
+     *
+     * @return 毫秒数 = DB 有值（&gt; 0）；null = 未配置 / 非正（回落 env/默认 300000）
+     */
+    public Integer streamIdleTimeoutMs() {
+        SettingsRecord row = resolveSettingsRow();
+        if (row != null) {
+            Integer ms = row.getStreamIdleTimeoutMs();
+            if (ms != null && ms > 0) {
+                return ms;
+            }
+        }
+        return null;
+    }
+
+    /**
      * 实时读 {@code settings.time_based_mc_keep_recent} · CC original: keepRecent
      * （timeBasedMCConfig.ts:26-27，默认 5）。
      *

@@ -176,7 +176,7 @@ class StreamCompactSummaryForkUserContextTest {
                                          Consumer<String> orc, Runnable osf,
                                          AbortController ac,
                                          Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 captured[0] = h;
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
@@ -233,7 +233,7 @@ class StreamCompactSummaryForkUserContextTest {
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
                                          com.nexusai.application.agent.tool.AbortController abort,
                                          Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 capturedBlocks[0] = blocks;
                 onChunk.accept("summary text");
                 onAssistant.accept(new AssistantMessage("summary text", "stop", List.of()));
@@ -329,7 +329,7 @@ class StreamCompactSummaryForkUserContextTest {
                                          Consumer<ToolUseBlock> otc, Consumer<String> orc,
                                          Runnable osf, AbortController ac,
                                          Consumer<Throwable> oe, Runnable ocp, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 oa.accept(new AssistantMessage("summary text", "stop", List.of()));
                 ocp.run();
             }

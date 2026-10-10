@@ -135,7 +135,7 @@ class ExecAgentHookSemanticsTest {
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             capturedSystemPrompt.set(systemPromptBlocks == null ? null
                 : systemPromptBlocks.stream()
                     .map(com.nexusai.application.agent.prompt.SystemPromptBlock::text)
@@ -166,12 +166,12 @@ class ExecAgentHookSemanticsTest {
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                           com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                           com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             capturedThinkingType.set(thinkingConfig != null ? thinkingConfig.type() : null);
             stream(config, modelName, systemPromptBlocks, history, tools,
                 maxOutputTokensOverride, taskBudget, effortValue, querySource,
                 onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-                onStreamingFallback, abortController, onError, onComplete, skipCacheWrite, agentContext);
+                onStreamingFallback, abortController, onError, onComplete, skipCacheWrite, agentContext, streamIdleControl);
         }
     }
 
@@ -195,7 +195,7 @@ class ExecAgentHookSemanticsTest {
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
                                Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 onError.accept(new RuntimeException("provider exploded"));
             }
         };
@@ -546,7 +546,7 @@ class ExecAgentHookSemanticsTest {
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
                                Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 capturedModel.set(modelName);
                 onAssistantMessage.accept(new AssistantMessage("", "tool_calls",
                     List.of(structuredCall(true, null))));

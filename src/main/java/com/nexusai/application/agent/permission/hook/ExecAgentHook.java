@@ -423,7 +423,9 @@ public class ExecAgentHook {
                         // [A#3 tuc-invoking-req] agentContext 逐字段拷贝透传 —— hook agent 的
                         //   ModelRequest 由主循环请求派生，归因上下文同样必须原样带过（漏拷贝会让
                         //   hook 触发的 LLM 调用在 provider 侧丢 invokingRequestId）。
-                        request.agentContext());
+                        request.agentContext(),
+                        // [流空闲看门狗] streamIdleControl 逐字段拷贝透传（拷贝式构造函数，漏拷即静默丢参）
+                        request.streamIdleControl());
                     return ModelCaller.call(context(), countingRequest);
                 }
             };

@@ -19,9 +19,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <h2>它守护什么（WHY · 有真实前科）</h2>
  * <p>本接口的桩在测试树里以<b>纯位置索引</b>取回调（{@code inv.getArgument(9/10/16)} 或
- * {@code args.length == N ? big : small} 三元）。而本接口的签名历史上被<b>两次末尾追加</b>
- * （{@code Boolean skipCacheWrite}、{@code AgentContext agentContext}）⇒ 三档 arity 从
- * {@code 18 / 18 / 19} 整体推到 <b>{@code 19 / 19 / 20}</b>。
+ * {@code args.length == N ? big : small} 三元）。而本接口的签名历史上被<b>三次末尾追加</b>
+ * （{@code Boolean skipCacheWrite}、{@code AgentContext agentContext}、
+ * {@code StreamIdleControl streamIdleControl}·流空闲看门狗 2026-10-10）⇒ 三档 arity 从
+ * {@code 18 / 18 / 19} 整体推到 <b>{@code 20 / 20 / 21}</b>。
  * <p>其中一批桩用了 {@code args.length == 19 ? 大值 : 小值} 的<b>条件常量</b>（寓意「19 参 = 带
  * thinkingConfig 的大档」）。arity 整体右移一格后该寓意反转 ⇒ <b>19 参时取到的是大档的索引</b>：
  * <ul>
@@ -34,19 +35,20 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       AssistantMessage cannot be cast to ToolUseBlock} ⇒ 同型超时链（实测该类 2111s /
  *       3 条断言失败）。</li>
  * </ul>
- * <p>⇒ 那 2 个文件里共 <b>7 处位置常量</b>（{@code E1aForkShieldGateTest.java} 的
+ * <p>⇒ 那 <b>3 个文件</b>里共 <b>10 处位置常量</b>（{@code E1aForkShieldGateTest.java} 的
  * {@code chunkIdx/msgIdx/doneIdx} = 3 处；{@code LlmAgentLoopPerRunPromptAssemblyTest.java} 的
- * 两个桩工厂各 2 处 = 4 处）必须以 <b>20</b> 为大档判据。本类把「档位」这个前提<b>机械钉住</b>，
+ * 两个桩工厂各 2 处 = 4 处；{@code SubagentBlockingLimitShieldG4Test.java} 3 处——原 javadoc 漏列，本批补正）
+ * 必须以 <b>21</b> 为大档判据。本类把「档位」这个前提<b>机械钉住</b>，
  * 使下一次 arity 变更时它们在编译/断言期暴露，而不是变成一次静默的 300s 超时。
  *
  * <h2>⛔ 反向实验（falsification · 本守卫是「能红的」）</h2>
  * <p>任选其一即可让本类翻红（本仓判据：护栏有效性靠反向实验，不靠声明）：
  * <ol>
- *   <li>给 {@link LlmProvider#stream} 的任一重载<b>再加一个形参</b>（如 19 → 20）
- *       ⇒ {@link #streamOverloadArities_arePinned()} 的 {@code containsExactly(19, 19, 20)} 红；</li>
+ *   <li>给 {@link LlmProvider#stream} 的任一重载<b>再加一个形参</b>（如 20 → 21）
+ *       ⇒ {@link #streamOverloadArities_arePinned()} 的 {@code containsExactly(20, 20, 21)} 红；</li>
  *   <li>在任一重载的<b>中部插入</b>一个形参（如把 {@code querySource} 插到 {@code onChunk} 之前）
- *       ⇒ {@link #nineteenArgOverload_callbackPositions_arePinned()} /
- *       {@link #twentyArgOverload_callbackPositions_arePinned()} 的位置断言红。</li>
+ *       ⇒ {@link #twentyArgOverload_callbackPositions_arePinned()} /
+ *       {@link #twentyOneArgOverload_callbackPositions_arePinned()} 的位置断言红。</li>
  * </ol>
  * <p>⚠️ 本类<b>只</b>守护「接口签名这个前提」。它<b>不</b>守护各测试文件里那 7 处常量本身与
  * 本类一致（常量是字面量，反射看不到）—— 两者的连接点是：<b>本类红 ⟺ 必须回去改那 7 处</b>。
@@ -101,23 +103,24 @@ class LlmProviderStreamArityInvariantTest {
     }
 
     @Test
-    @DisplayName("stream 重载 arity 集合 == {19, 19, 20}（追加/移除形参 ⇒ 全仓位置索引桩必须同步）")
+    @DisplayName("stream 重载 arity 集合 == {20, 20, 21}（追加/移除形参 ⇒ 全仓位置索引桩必须同步）")
     void streamOverloadArities_arePinned() {
         assertThat(streamOverloads())
-            .as("本接口 stream 必须恰好 3 个重载；arity 变更 ⇒ 本仓 7 处条件常量"
-                + "（E1aForkShieldGateTest 3 处 + LlmAgentLoopPerRunPromptAssemblyTest 4 处）"
+            .as("本接口 stream 必须恰好 3 个重载；arity 变更 ⇒ 本仓 10 处条件常量"
+                + "（E1aForkShieldGateTest 3 处 + LlmAgentLoopPerRunPromptAssemblyTest 4 处 + "
+                + "SubagentBlockingLimitShieldG4Test 3 处）"
                 + "与 ~104 处绝对索引桩全部需要复核")
             .hasSize(3);
         assertThat(streamOverloads().stream().map(Method::getParameterCount).toList())
             .as("arity 集合（升序）—— 实测自 LlmProvider.class.getMethods()")
-            .containsExactly(19, 19, 20);
+            .containsExactly(20, 20, 21);
     }
 
     @Test
-    @DisplayName("19 参 blocks 重载（无 thinkingConfig）：onChunk@9 / onAssistantMessage@10 / "
+    @DisplayName("20 参 blocks 重载（无 thinkingConfig）：onChunk@9 / onAssistantMessage@10 / "
         + "onToolCallComplete@11 / onComplete@16")
-    void nineteenArgOverload_callbackPositions_arePinned() {
-        Method m = overload(19, List.class);
+    void twentyArgOverload_callbackPositions_arePinned() {
+        Method m = overload(20, List.class);
         assertCallbackSlot(m, 9, Consumer.class, String.class);
         assertCallbackSlot(m, 10, Consumer.class, AssistantMessage.class);
         assertCallbackSlot(m, 11, Consumer.class, ToolUseBlock.class);
@@ -125,10 +128,10 @@ class LlmProviderStreamArityInvariantTest {
     }
 
     @Test
-    @DisplayName("20 参 blocks+thinkingConfig 重载：各回调比 19 参者后移一位（onChunk@10 / "
+    @DisplayName("21 参 blocks+thinkingConfig 重载：各回调比 20 参者后移一位（onChunk@10 / "
         + "onAssistantMessage@11 / onComplete@17）")
-    void twentyArgOverload_callbackPositions_arePinned() {
-        Method m = overload(20, List.class);
+    void twentyOneArgOverload_callbackPositions_arePinned() {
+        Method m = overload(21, List.class);
         assertCallbackSlot(m, 10, Consumer.class, String.class);
         assertCallbackSlot(m, 11, Consumer.class, AssistantMessage.class);
         assertCallbackSlot(m, 17, Runnable.class, null);

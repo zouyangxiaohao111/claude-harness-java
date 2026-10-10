@@ -1,0 +1,15 @@
+-- ===================================================================
+-- V78: settings 表新增 stream_idle_timeout_ms 列（流式空闲超时，毫秒）
+--
+-- 背景：流空闲看门狗（对齐 CC 2.1.296 —— 空闲语义替代原固定 300s 总时长；用户 10-10 拍板），
+--   阈值支持前端「设置→通用」页配置（用户 10-10 追加要求）。
+-- 列：stream_idle_timeout_ms（INTEGER 可空）= 空闲超时毫秒；null/<=0 = 未配置，
+--   回落 env(CLAUDE_STREAM_IDLE_TIMEOUT_MS) 或默认 300000；有效值下限 300000（对齐 CC
+--   WJt(){return Math.max(am()??0,300000)} 原语义）。不加 DEFAULT，null = 未配置回落原判定链
+--   （对齐 V54 先例）。
+--   Java 端 camelCase 字段（streamIdleTimeoutMs），MyBatis-Flex 自动 snake_case↔camelCase
+--   精确映射（streamIdleTimeoutMs -> stream_idle_timeout_ms；同 V34 autoMemoryEnabled 先例）。
+-- 读链：SettingsService.get()/update() 读写 DB 列；StreamIdleWatchdogSettings 每次调用
+--   selectOneById(1) 实时读（对齐 CompactSettingsResolver 不缓存范式，前端 PUT 后下一轮即生效）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN stream_idle_timeout_ms INTEGER;

@@ -181,7 +181,7 @@ class ForkAgentContextExplicitCarrierTest {
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
                                          com.nexusai.application.agent.tool.AbortController abort,
                                          Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                                         AgentContext agentContext) {
+                                         AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 sink[0] = agentContext;
                 onAssistant.accept(new AssistantMessage("fork-ok", "stop", List.of()));
                 onComplete.run();

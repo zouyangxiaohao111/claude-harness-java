@@ -274,8 +274,8 @@ class E1aForkShieldGateTest {
         org.mockito.stubbing.Answer<Object> answer = inv -> {
             Object[] args = inv.getArguments();
             // [fix-junit 2026-09-14] 位置常量按**重载 arity** 分派（⛔ 原注释与代码皆错，见下）：
-            //   · 20 参 = blocks+thinkingConfig 重载（onChunk/onAssistantMessage/onComplete 各后移一位）；
-            //   · 19 参 = 两个**无 thinkingConfig** 的重载（抽象 blocks 重载 / default String 版）——
+            //   · 21 参 = blocks+thinkingConfig 重载（onChunk/onAssistantMessage/onComplete 各后移一位）；
+            //   · 20 参 = 两个**无 thinkingConfig** 的重载（抽象 blocks 重载 / default String 版）——
             //     其 onChunk@9 / onAssistantMessage@10 / onComplete@16。
             // ⛔ 原实现写 `== 19 ? 大值 : 小值` + 注释「19 参 = blocks+thinkingConfig 重载」，两者互为
             //   印证因而同错：`agentContext` 被**追加**到 LlmProvider.stream 末尾后，三档 arity 从
@@ -284,9 +284,11 @@ class E1aForkShieldGateTest {
             //   ⇒ ClassCastException(String→AssistantMessage) ⇒ onComplete 永不执行 ⇒ 300s
             //   STREAM_TIMEOUT × 重试（实测单类 1505s，2 条断言失败）。
             // 反向守卫：LlmProviderStreamArityInvariantTest（再给 stream 追加形参 ⇒ 它立刻翻红）。
-            int chunkIdx = args.length == 20 ? 10 : 9;
-            int msgIdx = args.length == 20 ? 11 : 10;
-            int doneIdx = args.length == 20 ? 17 : 16;
+            // [流空闲看门狗 2026-10-10] streamIdleControl 追加 ⇒ 大档（blocks+thinkingConfig）arity 20→21，
+            //   本组常量同步右移一格（21 = 大档；20 = 两个无 thinkingConfig 重载）。
+            int chunkIdx = args.length == 21 ? 10 : 9;
+            int msgIdx = args.length == 21 ? 11 : 10;
+            int doneIdx = args.length == 21 ? 17 : 16;
             java.util.function.Consumer<String> onChunk =
                 (java.util.function.Consumer<String>) args[chunkIdx];
             java.util.function.Consumer<AssistantMessage> onMsg =
@@ -302,9 +304,9 @@ class E1aForkShieldGateTest {
             return null;
         };
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(),any(), any());
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         return provider;
     }
 

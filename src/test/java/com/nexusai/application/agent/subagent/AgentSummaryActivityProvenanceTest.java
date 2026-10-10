@@ -80,7 +80,7 @@ class AgentSummaryActivityProvenanceTest {
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
                                      Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                                     com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                                     com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             if (onChunk != null) onChunk.accept(novel());
             if (onComplete != null) onComplete.run();
         }

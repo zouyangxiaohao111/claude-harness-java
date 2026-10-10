@@ -134,7 +134,7 @@ public final class RecordingLlmProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         requests.add(new OutboundRequest(systemPromptBlocks, history, tools));
         int n = calls.getAndIncrement();
         // [步骤 8 · 数据流日志] 每次出站请求记一行（只记形状与长度，⛔ 不打正文）：判前缀稳定性
@@ -191,10 +191,10 @@ public final class RecordingLlmProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         stream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             taskBudget, effortValue, querySource, onChunk, onAssistantMessage, onToolCallComplete,
             onReasoningChunk, onStreamingFallback, abortController, onError, onComplete,
-            skipCacheWrite, agentContext);
+            skipCacheWrite, agentContext, streamIdleControl);
     }
 }

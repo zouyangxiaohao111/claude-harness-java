@@ -298,7 +298,7 @@ class R32B7b2_PerCallReResolutionTest {
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             // 真实 run() 流: 记录 model + 模拟一次纯文本响应 (无 tool_calls → NORMAL 退出)
             recordedModels.add(modelName);
             streamCallCount++;
@@ -337,7 +337,7 @@ class R32B7b2_PerCallReResolutionTest {
     }
 
     @Test
-    @DisplayName("R7-9: Recording provider · turn 1 stream() 收到 model A, run() 内多 turn 模型动态切换 (P1-2 端到端)")
+    @DisplayName("R7-9: Recording provider · turn 1 stream(, any()) 收到 model A, run() 内多 turn 模型动态切换 (P1-2 端到端)")
     void recordingProviderMultiTurnModelSwitch() {
         // WHY: P1-2 修复核心 (Code Reviewer P1-5): 验证真实 provider call 在 run() 多 turn
         // 间收到不同 model. 旧 R7-8 仅手动串行调 getModelForCall(), 未真实跑 run().

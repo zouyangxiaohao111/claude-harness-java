@@ -256,6 +256,13 @@ public class SettingsRecord {
     //   allow_dynamic_header_values；同 autoDreamEnabled → auto_dream_enabled 先例）。
     private Boolean allowDynamicHeaderValues;
 
+    // [V78 stream-idle-watchdog] 流空闲超时毫秒（V78 建列 stream_idle_timeout_ms INTEGER；对齐 CC
+    //   CLAUDE_STREAM_IDLE_TIMEOUT_MS 的 DB 承载，前端「设置→通用」页可配）。
+    //   语义：null/<=0 = 未配置 → 回落 env/默认 300000；有效下限 300000（对齐 CC 原样）。
+    //   命名：MyBatis-Flex camelCase→snake 精确映射（streamIdleTimeoutMs -> stream_idle_timeout_ms；
+    //   同 autoMemoryEnabled -> auto_memory_enabled 先例）。
+    private Integer streamIdleTimeoutMs;
+
     public Integer getId() { return id; }
     public void setId(Integer id) { this.id = id; }
     public String getTheme() { return theme; }
@@ -405,4 +412,8 @@ public class SettingsRecord {
     // （MyBatis-Flex snake↔camel 映射；null = 未配置 → 调用方按默认开处理）
     public Boolean getAllowDynamicHeaderValues() { return allowDynamicHeaderValues; }
     public void setAllowDynamicHeaderValues(Boolean allowDynamicHeaderValues) { this.allowDynamicHeaderValues = allowDynamicHeaderValues; }
+    // [V78 stream-idle-watchdog] stream_idle_timeout_ms ↔ streamIdleTimeoutMs
+    // （MyBatis-Flex snake↔camel 映射；null/<=0 = 未配置 → 回落 env/默认 300000）
+    public Integer getStreamIdleTimeoutMs() { return streamIdleTimeoutMs; }
+    public void setStreamIdleTimeoutMs(Integer streamIdleTimeoutMs) { this.streamIdleTimeoutMs = streamIdleTimeoutMs; }
 }

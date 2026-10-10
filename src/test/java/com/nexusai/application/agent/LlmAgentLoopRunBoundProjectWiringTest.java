@@ -136,7 +136,8 @@ class LlmAgentLoopRunBoundProjectWiringTest {
      *
      * <p>⚠️ provider 桩必须逐参对齐 {@code LlmProvider.stream} 的<b>当前</b> arity：本仓该接口有
      * 3 个重载 = 19（blocks 抽象）/19（String+thinkingConfig）/20（blocks+thinkingConfig）
-     * ⇒ 位置索引的桩按 {@code args.length == 20 ? big : small} 判档，否则静默不命中。
+     * ⇒ 位置索引的桩按 {@code args.length == 21 ? big : small} 判档（大档 = blocks+thinkingConfig；
+     *   2026-10-10 追加 streamIdleControl 后再右移一格），否则静默不命中。
      * 这里的 19 参桩命中<b>抽象 blocks 重载</b>（位置 3 为 {@code anyList()}），
      * 取 {@code getArgument(9/10/16)} = onChunk / onAssistantMessage / onComplete。
      */
@@ -155,7 +156,7 @@ class LlmAgentLoopRunBoundProjectWiringTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         return new LlmAgentLoop(factory);
     }
 

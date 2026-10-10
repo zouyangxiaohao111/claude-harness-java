@@ -126,7 +126,8 @@ class PrefixCacheRealApiE2eTest {
             List.copyOf(history), null,
             null, null, null, null,
             chunk -> { }, last::set, call -> { }, chunk -> { },
-            () -> { }, AbortController.NOOP, failure::set, () -> { }, null, null);
+            () -> { }, AbortController.NOOP, failure::set, () -> { }, null, null,
+            com.nexusai.infra.llm.StreamIdleControl.NONE);   // [看门狗] 直呼无等待段 → NONE（规格 §3）
         if (failure.get() != null) {
             throw new IllegalStateException("真 API 调用失败（e2e 必须 fail-loud，⛔ 不静默跳过）", failure.get());
         }

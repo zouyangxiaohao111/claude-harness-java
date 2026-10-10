@@ -119,7 +119,7 @@ class R33H7_ExecAgentHookTest {
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             if (delayMs > 0) {
                 try { Thread.sleep(delayMs); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); return;
@@ -159,7 +159,7 @@ class R33H7_ExecAgentHookTest {
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
                                Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 onError.accept(new RuntimeException("provider exploded"));
             }
         };

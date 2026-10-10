@@ -255,7 +255,7 @@ class LlmAgentLoopStopHookTranscriptAnchorWiringTest {
             onComplete.run();
             return null;
         }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
 
         HookRegistry hookRegistry = Mockito.mock(HookRegistry.class);
         when(hookRegistry.executeStopHooksCollecting(any(), any(), any())).thenAnswer(inv -> {

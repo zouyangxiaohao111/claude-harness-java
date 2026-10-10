@@ -281,7 +281,7 @@ class HookRegistryDispatchTest {
                                          AbortController abortController,
                                          java.util.function.Consumer<Throwable> onError,
                                          Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig config, String modelName, String systemPrompt, String userMessage) {

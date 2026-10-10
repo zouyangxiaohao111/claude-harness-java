@@ -963,7 +963,9 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                     //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
                     //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
                     //   等价 CC agentContext.ts:170 无 invokingRequestId。
-                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null));
+                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null),
+                    // [流空闲看门狗] compact 直呼路径无等待段驱动看门狗 → NONE（规格 §3）
+                    com.nexusai.infra.llm.StreamIdleControl.NONE);
             } else {
                 provider.stream(
                     config, model, blocks, history, tools, null, null, null, null,
@@ -980,7 +982,9 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                     //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
                     //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
                     //   等价 CC agentContext.ts:170 无 invokingRequestId。
-                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null));
+                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null),
+                    // [流空闲看门狗] fork/compact 直呼路径无等待段驱动看门狗 → NONE（规格 §3）
+                    com.nexusai.infra.llm.StreamIdleControl.NONE);
             }
             // [IMP2-15 △-15] CC 无 300s 级硬超时（compact.ts 全程：靠 abortController + SDK
             //   状态，流一直持续则等待）→ future.get() 无超时等待；取消路径仍经

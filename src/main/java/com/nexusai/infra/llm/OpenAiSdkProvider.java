@@ -139,7 +139,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [流空闲看门狗] 末参 · T6 消费（OpenAI 通道看门狗接线）；本批（T3）先接签名。
+                       StreamIdleControl streamIdleControl) {
         // [C] skipCacheWrite 签名跟随（wire 无 marker 语义 · openai-compatible 端点无 prompt cache
         //   条目写入移位的对应物 → 忽略，行为零改动）。CC 侧本参数只在 Anthropic 通道
         //   claude.ts:3243 markerIndex 消费。
@@ -159,7 +161,8 @@ public class OpenAiSdkProvider implements LlmProvider {
             .collect(Collectors.joining("\n\n"));
         doStream(config, modelName, joined, history, tools, effortValue, null,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete);
+            onStreamingFallback, aborted, onError, onComplete,
+            streamIdleControl);   // [看门狗] 末参透传
     }
 
     /**
@@ -189,7 +192,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [流空闲看门狗] 末参接收（T6 消费）
+                       StreamIdleControl streamIdleControl) {
         // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
@@ -202,7 +207,8 @@ public class OpenAiSdkProvider implements LlmProvider {
         }
         doStream(config, modelName, systemPrompt, history, tools, effortValue, thinkingConfig,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete);
+            onStreamingFallback, aborted, onError, onComplete,
+            streamIdleControl);   // [看门狗] 末参透传
     }
 
     /**
@@ -232,7 +238,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [流空闲看门狗] 末参接收（T6 消费）
+                       StreamIdleControl streamIdleControl) {
         // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         String joined = systemPromptBlocks == null ? null : systemPromptBlocks.stream()
             .filter(java.util.Objects::nonNull)
@@ -242,7 +250,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         stream(config, modelName, joined, history, tools, maxOutputTokensOverride, taskBudget,
             effortValue, thinkingConfig, onChunk, onAssistantMessage, onToolCallComplete,
             onReasoningChunk, onStreamingFallback, abortController, onError, onComplete,
-            skipCacheWrite, agentContext);   // [A#3] 显式归因上下文透传（OpenAI 侧不发射该边，签名跟随）
+            skipCacheWrite, agentContext, streamIdleControl);   // [A#3] 显式归因上下文透传（OpenAI 侧不发射该边，签名跟随）+ [看门狗] 末参透传
     }
 
     /** 流式核心 · SDK createStreaming + 迭代器消费（[H13-GAP-4 v3] chunk 边界检查 aborted）. */
@@ -260,19 +268,52 @@ public class OpenAiSdkProvider implements LlmProvider {
                           Runnable onStreamingFallback,
                           AtomicBoolean aborted,
                           Consumer<Throwable> onError,
-                          Runnable onComplete) {
+                          Runnable onComplete,
+                          // [流空闲看门狗] 末参（读超时武装 + 触发标记 + stall 映射）
+                          StreamIdleControl streamIdleControl) {
         if (config == null || !config.isUsable()) {
             onError.accept(new IllegalStateException(
                 "OpenAiSdkProvider.stream 调用时 ProviderConfig 不可用"));
             return;
         }
+        // [流空闲看门狗 · 判决矩阵「降级非流式」] 对齐 CC retryWithoutStreaming（exe 223,028,125 Kke）
+        //   · 与 AnthropicSdkProvider 同形：跳过流式直接走非流式发送（复用流式失败回退的重试壳；
+        //   不触发 onStreamingFallback——CC 该路径同样不发 fallback 通知，exe 223,167,514 无 dh 调用）。
+        //   [合并后接线] 原 fail-loud（"openai-java 无非流式助手管线"）的理由已被 master
+        //   fix-stream-truncation 引入的 nonStreamingSend（完整 tools/thinking/usage 助手管线）消除
+        //   ⇒ 按通道无关的 CC 语义接上（fail-loud 形态删除，测试同步改写）。
+        //   失败语义对齐 Anthropic：回退也败 ⇒ 交付 NOTHING stall 交判决矩阵（⛔ 非静默）。
+        if (streamIdleControl != null && streamIdleControl.forceNonStreaming()) {
+            if (log.isInfoEnabled()) {
+                log.info("[OpenAiSdkProvider] streamIdleControl.forceNonStreaming=true → 直接非流式发送"
+                    + "（stall 判决矩阵 retryWithoutStreaming · CC exe 223,028,125）");
+            }
+            boolean ok = nonStreamingFallback(config, modelName, systemPrompt, history, tools,
+                effortValue, thinkingConfig, null, aborted, null,
+                onAssistantMessage, onComplete);
+            if (ok) {
+                return;
+            }
+            onError.accept(new StreamIdleTimeoutError(StreamIdleTimeoutError.Progress.NOTHING, false,
+                "stream idle fallback (non-streaming) failed"));
+            return;
+        }
+        // [流空闲看门狗] 标志（catch 也要读 → 声明在 try 外；state 同理提前声明）
+        AtomicBoolean stalledByWatchdog = new AtomicBoolean(false);
+        AtomicBoolean watchdogAnyEvent = new AtomicBoolean(false);
+        AtomicBoolean watchdogAnyOutputShown = new AtomicBoolean(false);
+        AtomicBoolean watchdogAnyBlockFinished = new AtomicBoolean(false);
+        OpenAiStreamState state = new OpenAiStreamState();
         try {
             // [provider-custom-headers 任务 7] 主链 sessionId 来源 = history（DB 真值，必中）。
             //   ⚠️ 刻意**不**在此处兜底环境态会话槽（裸 MDC，已随批 3c 删除）；该类槽可能残留别会话 id，
             //   详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
             //   （护栏按**字面量**判，故连注释里都不留该调用形态 —— 它正是被照抄的来源。）
             String sessionId = SessionIdResolver.resolve(history, null);
-            OpenAIClient client = buildClient(config, sessionId);
+            // [看门狗] 武装流式读超时（openai-java timeout(Duration) 经实测=读空闲语义）
+            OpenAIClient client = buildClient(config, sessionId,
+                streamIdleControl != null && streamIdleControl.idleTimeoutMs() > 0
+                    ? streamIdleControl.idleTimeoutMs() : null);
             // [DEC-04] 流式请求开启 stream_options.include_usage=true → final chunk 携带 usage
             // （OpenAI streaming 默认不返回 usage；对齐 CC Anthropic 流式 always-on usage）
             ChatCompletionCreateParams params = buildRequestParams(
@@ -299,7 +340,18 @@ public class OpenAiSdkProvider implements LlmProvider {
             StreamResponse<ChatCompletionChunk> response =
                 client.chat().completions().createStreaming(params);
 
-            OpenAiStreamState state = new OpenAiStreamState();
+            // [看门狗] 触发标记监听（⛔ 不调 close()——同 SDK 家族的 close 死锁实证见 Anthropic 侧探针）
+            if (streamIdleControl != null && streamIdleControl.watchdogController() != null) {
+                streamIdleControl.watchdogController().onCancel(ac -> {
+                    if (stalledByWatchdog.compareAndSet(false, true)) {
+                        if (log.isWarnEnabled()) {
+                            log.warn("[OpenAiSdkProvider] 看门狗触发（reason={}）；解阻塞由读超时（{}ms）完成",
+                                ac.reason(), streamIdleControl.idleTimeoutMs());
+                        }
+                    }
+                });
+            }
+            // [看门狗] state 已提前声明（catch 侧映射要读 finishReason）
             // [D-4] requestId 兜底（DEC-RV-14a）· openai-java 0.25.0 无 withRawResponse（R-REQ-1），
             //   响应侧 x-request-id 头不可达 → 与非流式 chatWithRaw 一致走请求侧自建 ID
             //   （旧实现 = 裸 MDC 的 reqId 槽，值源为 ChatService 入口写入的 userMessageId）
@@ -333,12 +385,30 @@ public class OpenAiSdkProvider implements LlmProvider {
                     break; // 硬中断: 不再消费
                 }
                 if (finished.get()) break;
+                if (stalledByWatchdog.get()) break;   // [看门狗] 触发后停止消费（下行走 stall 抛出）
                 try {
-                    parseChunk(it.next(), state, onChunk, onToolCallComplete,
+                    ChatCompletionChunk chunk = it.next();
+                    updateWatchdogProgressFlagsOpenAi(chunk, watchdogAnyEvent, watchdogAnyOutputShown,
+                        watchdogAnyBlockFinished);   // [看门狗]
+                    parseChunk(chunk, state, onChunk, onToolCallComplete,
                         onReasoningChunk, completedToolIds);
                 } catch (Exception e) {
+                    // [看门狗] 读超时（读线程内抛出）或触发竞争 = stall 主通道：交付并退出
+                    if (stalledByWatchdog.get()
+                            || AnthropicSdkProvider.isStreamIdleReadTimeout(e, streamIdleControl)) {
+                        onError.accept(buildOpenAiStreamIdleError(watchdogAnyBlockFinished.get(),
+                            watchdogAnyOutputShown.get(), watchdogAnyEvent.get(), state));
+                        return;
+                    }
                     log.warn("OpenAI SDK chunk 解析失败: {}", e.toString());
                 }
+            }
+
+            // [看门狗] 读循环正常退出也可能是触发所致 → 成功路径之前先判（对齐 Anthropic 侧）
+            if (stalledByWatchdog.get()) {
+                onError.accept(buildOpenAiStreamIdleError(watchdogAnyBlockFinished.get(),
+                    watchdogAnyOutputShown.get(), watchdogAnyEvent.get(), state));
+                return;
             }
 
             // abort 后不触发 onAssistantMessage / onComplete（onError 已由 abort listener 发出）
@@ -382,6 +452,15 @@ public class OpenAiSdkProvider implements LlmProvider {
             if (aborted != null && aborted.get()) {
                 return; // abort 已发出 onError, 不重复报错
             }
+            // [看门狗] stall 优先于一切分类：不走通用错误路径，也不走非流式回退——stall 交循环层
+            //   判决矩阵（降级/重试/终局）；若先落到下方 [stream-integrity] 回退，判决矩阵将永远
+            //   收不到 stall（读超时是 IOException，shouldUseNonStreamingFallback 会判 true）。
+            if (stalledByWatchdog.get()
+                    || AnthropicSdkProvider.isStreamIdleReadTimeout(e, streamIdleControl)) {
+                onError.accept(buildOpenAiStreamIdleError(watchdogAnyBlockFinished.get(),
+                    watchdogAnyOutputShown.get(), watchdogAnyEvent.get(), state));
+                return;
+            }
             RuntimeException translated = translateSdkError(e);
             log.error("OpenAiSdkProvider 流式调用失败: {}", translated.toString());
             // [stream-integrity 2026-10-10 · 行为同步 CC] 流式失败→非流式回退（CC claude.ts:2505-2562
@@ -399,6 +478,48 @@ public class OpenAiSdkProvider implements LlmProvider {
             }
             onError.accept(translated);
         }
+    }
+
+    /**
+     * [看门狗] OpenAI chunk 三标志：任意 chunk=anyEvent；非空 content 增量=anyOutputShown
+     * （reasoning 增量不算输出，对齐 CC Cl 排除 thinking）；finish_reason 出现=anyBlockFinished
+     * （OpenAI 无 block_stop，finish 即末块 ⇒ 与 Anthropic 的 {@code Gan} 五态同构）。
+     */
+    static void updateWatchdogProgressFlagsOpenAi(ChatCompletionChunk chunk,
+                                                  AtomicBoolean anyEvent,
+                                                  AtomicBoolean anyOutputShown,
+                                                  AtomicBoolean anyBlockFinished) {
+        anyEvent.set(true);
+        for (var choice : chunk.choices()) {
+            if (choice == null || choice.delta() == null) {
+                continue;
+            }
+            var c = choice.delta().content();
+            if (c != null && c.isPresent() && c.get() != null && !c.get().isBlank()) {
+                anyOutputShown.set(true);
+            }
+            if (choice.finishReason().isPresent()) {
+                anyBlockFinished.set(true);
+            }
+        }
+    }
+
+    /** [看门狗] 构造 stall 异常（message 对齐 CC 两条变体；progress 由三标志推五态）。 */
+    private static StreamIdleTimeoutError buildOpenAiStreamIdleError(boolean anyBlockFinished,
+                                                                     boolean anyOutputShown,
+                                                                     boolean anyEvent,
+                                                                     OpenAiStreamState state) {
+        StreamIdleTimeoutError.Progress p;
+        if (anyBlockFinished) {
+            p = anyOutputShown ? StreamIdleTimeoutError.Progress.OUTPUT
+                : StreamIdleTimeoutError.Progress.THINKING_ONLY;
+        } else if (anyOutputShown) {
+            p = StreamIdleTimeoutError.Progress.PARTIAL_OUTPUT;
+        } else {
+            p = anyEvent ? StreamIdleTimeoutError.Progress.STARTED : StreamIdleTimeoutError.Progress.NOTHING;
+        }
+        return new StreamIdleTimeoutError(p, state.finishReason != null,
+            "Stream idle timeout - " + (anyBlockFinished ? "partial response received" : "no chunks received"));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -879,12 +1000,27 @@ public class OpenAiSdkProvider implements LlmProvider {
      *                  null → 占位符落 {@link DynamicHeaderExpander#STATIC_FALLBACK}
      */
     static OpenAIClient buildClient(ProviderConfig config, String sessionId) {
+        return buildClient(config, sessionId, null);
+    }
+
+    /**
+     * [流空闲看门狗] 带可选"流式读超时"的客户端构造。openai-java 0.25 的 {@code timeout(Duration)}
+     * 经实测（Scratch 判别，见提交记录）= <b>读空闲语义</b>：活跃流（chunk 间隔 &lt; timeout、总时长 ≫ timeout）
+     * 存活到 [DONE]；静默 ≥ timeout 时在读线程内抛 {@code SocketTimeoutException: timeout}
+     * ⇒ 直接用作看门狗中止原语（与 Anthropic 通道的 {@code Timeout.read} 同语义；无需反射）。
+     *
+     * @param readIdleMs 流式读超时毫秒（null/≤0 = 不武装，保持现状）
+     */
+    static OpenAIClient buildClient(ProviderConfig config, String sessionId, Long readIdleMs) {
         OpenAIOkHttpClient.Builder builder = OpenAIOkHttpClient.builder()
             .apiKey(config.apiKey())
             // [CC claude.ts:1781] Disabled auto-retry in favor of manual implementation
             .maxRetries(0);
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
             builder.baseUrl(normalizeBaseUrl(config.baseUrl()));
+        }
+        if (readIdleMs != null && readIdleMs > 0) {
+            builder.timeout(java.time.Duration.ofMillis(readIdleMs));
         }
         ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();

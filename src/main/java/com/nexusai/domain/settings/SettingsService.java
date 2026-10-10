@@ -260,6 +260,9 @@ public class SettingsService {
         //   ⚠️ 缺这一分支 = PUT 的新值被静默丢弃（Spring Boot 默认 FAIL_ON_UNKNOWN_PROPERTIES=false，
         //   前端传了也不报错）——「点了等于没点」的另一半。
         if (req.allowDynamicHeaderValues() != null) s.setAllowDynamicHeaderValues(req.allowDynamicHeaderValues());
+        // [V78 stream-idle-watchdog] streamIdleTimeoutMs merge（V78 列 stream_idle_timeout_ms；
+        //   null = 不覆盖；消费方 StreamIdleWatchdogSettings 每次实时读；有效下限 300000 在消费点钳制）
+        if (req.streamIdleTimeoutMs() != null) s.setStreamIdleTimeoutMs(req.streamIdleTimeoutMs());
 
         // [IMP-MV2-16 + V56] auto-memory/auto-dream 开关写链：
         //   autoMemoryEnabled → DB 列（V34 auto_memory_enabled）+ settings.json 双写（[C-05] DB 为主，
@@ -475,7 +478,10 @@ public class SettingsService {
             // [V72 provider-custom-headers D6 · 2026-09-13 补] allowDynamicHeaderValues DB 列透出
             //   （V72 列 allow_dynamic_header_values；null = 未配置 → 默认开）。
             //   不透出这一行，前端开关会**恒显示默认开**（GET 拿不到真实值）——「点了等于没点」的一半。
-            s.getAllowDynamicHeaderValues()
+            s.getAllowDynamicHeaderValues(),
+            // [V78 stream-idle-watchdog] streamIdleTimeoutMs DB 列透出（V78 列 stream_idle_timeout_ms；
+            //   null/<=0 = 未配置 → StreamIdleWatchdogSettings 回落 env/默认 300000；有效下限 300000）
+            s.getStreamIdleTimeoutMs()
         );
     }
 

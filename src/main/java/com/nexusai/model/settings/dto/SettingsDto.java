@@ -181,5 +181,9 @@ public record SettingsDto(
     //   .STATIC_FALLBACK（nexusai-static）。
     //   ⚠️ 三处必须同步，缺一处 = 前端开关「点了等于没点」（GET 恒显默认、PUT 被静默丢弃）：
     //     ① 本字段 ② SettingsService.toDto 透出 ③ SettingsService.update 的 null-skip merge 分支。
-    Boolean allowDynamicHeaderValues
+    Boolean allowDynamicHeaderValues,
+    // [V78 stream-idle-watchdog] 流空闲超时毫秒（settings.stream_idle_timeout_ms 列，前端「设置→通用」页可配；
+    //   null/<=0 = 未配置 → env(CLAUDE_STREAM_IDLE_TIMEOUT_MS)/默认 300000；有效下限 300000）。
+    //   ⚠️ 三处必须同步（同上）：① 本字段 ② SettingsService.toDto 透出 ③ SettingsService.update 的 merge 分支。
+    Integer streamIdleTimeoutMs
 ) {}

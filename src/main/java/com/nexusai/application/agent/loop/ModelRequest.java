@@ -110,6 +110,12 @@ public record ModelRequest(
     //
     // 取值规则：主线程 / 无归因上下文 → null（对齐 CC 主线程 undefined，事件无该属性）；
     //   子代理 → SubagentExecutor 装入的 SubagentContext 实例。
-    com.nexusai.application.agent.subagent.AgentContext agentContext
+    com.nexusai.application.agent.subagent.AgentContext agentContext,
+    // ═══════════════════ [流空闲看门狗 · 用户裁定 10-10] streamIdleControl ═══════════════════
+    // 单次模型调用的看门狗控制载体 · CC original: 无入参（CC 的查询层看门狗直接持有流对象；
+    //   本仓 provider 持有流对象 → 经专用 AbortController 通道下传，方案规格 §3）。
+    //   forceNonStreaming = 判决矩阵"降级非流式"（CC retryWithoutStreaming exe 223,028,125）。
+    // 位置 = 参数表末尾（同 skipCacheWrite/agentContext 的既有取舍：测试树 positional 索引不动）。
+    com.nexusai.infra.llm.StreamIdleControl streamIdleControl
 ) {
 }

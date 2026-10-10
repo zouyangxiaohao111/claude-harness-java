@@ -211,9 +211,10 @@ class SubagentBlockingLimitShieldG4Test {
         LlmProvider provider = Mockito.mock(LlmProvider.class);
         org.mockito.stubbing.Answer<Object> answer = inv -> {
             Object[] args = inv.getArguments();
-            int chunkIdx = args.length == 20 ? 10 : 9;
-            int msgIdx = args.length == 20 ? 11 : 10;
-            int doneIdx = args.length == 20 ? 17 : 16;
+            // [流空闲看门狗 2026-10-10] streamIdleControl 追加 ⇒ 大档 arity 20→21，常量同步右移
+            int chunkIdx = args.length == 21 ? 10 : 9;
+            int msgIdx = args.length == 21 ? 11 : 10;
+            int doneIdx = args.length == 21 ? 17 : 16;
             java.util.function.Consumer<String> onChunk = (java.util.function.Consumer<String>) args[chunkIdx];
             java.util.function.Consumer<AssistantMessage> onMsg =
                 (java.util.function.Consumer<AssistantMessage>) args[msgIdx];
@@ -226,9 +227,9 @@ class SubagentBlockingLimitShieldG4Test {
             return null;
         };
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         Mockito.doAnswer(answer).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
-            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         when(factory.getProvider(any(), any())).thenReturn(provider);
         return factory;

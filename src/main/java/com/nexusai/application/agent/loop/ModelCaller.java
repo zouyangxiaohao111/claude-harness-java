@@ -110,8 +110,10 @@ public final class ModelCaller {
                 request.onError(),
                 request.onComplete(),
                 request.skipCacheWrite(),
-                request.agentContext());   // [A#3] 显式归因上下文透传（本方法在 STREAM_EXECUTOR
+                request.agentContext(),   // [A#3] 显式归因上下文透传（本方法在 STREAM_EXECUTOR
                                            //   虚拟线程执行，AgentContext ThreadLocal 不可达）
+                (request.streamIdleControl() != null ? request.streamIdleControl()
+                    : com.nexusai.infra.llm.StreamIdleControl.NONE));   // [看门狗] 末参（null → NONE = 无看门狗）
             return ModelResponse.SUBMITTED;
         }
         // [IMP-SP-08] blocks 发送边界：splitSysPromptPrefix 产物直达 blocks 重载（system 为
@@ -142,7 +144,9 @@ public final class ModelCaller {
             request.onError(),
             request.onComplete(),
             request.skipCacheWrite(),
-            request.agentContext());   // [A#3] 显式归因上下文透传（STREAM_EXECUTOR 虚拟线程边界）
+            request.agentContext(),   // [A#3] 显式归因上下文透传（STREAM_EXECUTOR 虚拟线程边界）
+            (request.streamIdleControl() != null ? request.streamIdleControl()
+                : com.nexusai.infra.llm.StreamIdleControl.NONE));   // [看门狗] 末参（null → NONE）
         return ModelResponse.SUBMITTED;
     }
 }

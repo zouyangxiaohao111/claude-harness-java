@@ -125,7 +125,7 @@ class ProductionForkedQuerySessionModelRouteTest {
                                          Consumer<String> onReasoning, Runnable onStreamingFallback,
                                          com.nexusai.application.agent.tool.AbortController abort,
                                          Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 called.set(true);
                 modelRef.set(m);
                 onAssistant.accept(new AssistantMessage("done", "stop", List.of()));

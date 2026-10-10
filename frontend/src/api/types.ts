@@ -395,6 +395,9 @@ export interface AppSettings {
   subagentModelName: string | null
   /** 压缩窗口上限（auto_compact_window 列）：留空=不限制；设置后 min(模型窗口, 值) 只缩不扩 */
   autoCompactWindow: number | null
+  /** 流空闲超时（毫秒；stream_idle_timeout_ms 列 V78）：超过该时长没有任何输出时自动中断；
+   *  留空=默认 300000（5 分钟）；有效下限 300000（低于下限会被抬到 300s）。「通用」页可配。 */
+  streamIdleTimeoutMs?: number | null
   /** 输出 token 上限（V27 max_output_tokens）：>0 生效、> 模型上限封顶、null 用模型默认 */
   maxOutputTokens: number | null
   /** 回落模型全名（V28 RENAME fallback_model_name） */

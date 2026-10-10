@@ -240,6 +240,25 @@ public class AnthropicSdkProvider implements LlmProvider {
      *                  null → 占位符落 {@link DynamicHeaderExpander#STATIC_FALLBACK}
      */
     static AnthropicClient buildClient(ProviderConfig config, String sessionId) {
+        return buildClient(config, sessionId, null);
+    }
+
+    /**
+     * [流空闲看门狗 · 换挡说明] 带可选"流式读超时"的客户端构造：{@code readIdleMs != null} 时以
+     * {@code Timeout.default().toBuilder().read(...)} <b>只覆盖 okhttp 读超时</b>（其余档保持
+     * 默认——⛔ 不碰 request/callTimeout，那会把长活跃流按总时长误杀）。
+     *
+     * <p><b>WHY 读超时而非 close()</b>（实测证据，见 {@code StreamIdleAbortChannelProbeTest}）：
+     * 消费若干事件后阻塞在 {@code it.next()} 时——① {@code StreamResponse.close()} <b>死锁</b>
+     * （close 线程自身卡死、读者不解）；② {@code Thread.interrupt()} <b>不解阻塞</b>；
+     * ③ SDK 未暴露 cancel/controller 句柄。读超时 = 唯一可控、且天然在<b>读线程内</b>抛
+     * {@code SocketTimeoutException} 的通道 ⇒ 作为空闲看门狗的中止原语。语义 = CC 的字节级
+     * 空闲看门狗家族（{@code CHn} "stream idle: no bytes for Nms"）；可观测结果与事件级看门狗
+     * 一致：静默到阈值 → 流中止 → stall 判决矩阵。
+     *
+     * @param readIdleMs 流式读超时毫秒（null/≤0 = 不武装，保持现状）
+     */
+    static AnthropicClient buildClient(ProviderConfig config, String sessionId, Long readIdleMs) {
         AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder()
             .apiKey(config.apiKey())
             // [CC claude.ts:1781] Disabled auto-retry in favor of manual implementation
@@ -247,8 +266,36 @@ public class AnthropicSdkProvider implements LlmProvider {
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
             builder.baseUrl(normalizeBaseUrl(config.baseUrl()));
         }
+        if (readIdleMs != null && readIdleMs > 0) {
+            // ⚠️ javac 无法直呼 Kotlin 方法名 `default`（Java 关键字）⇒ 经反射桥取默认实例，
+            //   再 toBuilder() 只覆盖 read 档（其余三档保持 SDK 默认——行为零偏移）。
+            builder.timeout(defaultTimeoutInstance().toBuilder()
+                .read(java.time.Duration.ofMillis(readIdleMs))
+                .build());
+        }
         ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();
+    }
+
+    /**
+     * 取 SDK 默认 {@code Timeout} 实例。Kotlin 的 {@code Timeout.default()} 方法名是 Java 关键字，
+     * javac 无法直呼 ⇒ 反射桥（静态优先，Companion 实例兜底）；失败 fail-loud。
+     */
+    private static com.anthropic.core.Timeout defaultTimeoutInstance() {
+        try {
+            return (com.anthropic.core.Timeout) com.anthropic.core.Timeout.class
+                .getMethod("default").invoke(null);
+        } catch (ReflectiveOperationException staticMiss) {
+            try {
+                Object companion = com.anthropic.core.Timeout.class.getField("Companion").get(null);
+                return (com.anthropic.core.Timeout) companion.getClass()
+                    .getMethod("default").invoke(companion);
+            } catch (ReflectiveOperationException companionMiss) {
+                throw new IllegalStateException(
+                    "Anthropic SDK Timeout.default() 反射失败（SDK 版本变更？见 buildClient 换挡说明）",
+                    companionMiss);
+            }
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -278,7 +325,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                        // [A#3 tuc-invoking-req] 显式 agent 归因上下文（null = 主线程 / 无归因）·
                        //   本方法跑在 STREAM_EXECUTOR 虚拟线程（LlmAgentLoop:6604），AgentContext
                        //   ThreadLocal 不可达 ⇒ 必须由调用方（ModelCaller，上下文有效线程）显式下传。
-                       com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [流空闲看门狗] 末参 · T4 在 doStream 内消费（注册关流监听 + stall 映射）；
+                       //   本批（T3）先接签名、零行为。
+                       StreamIdleControl streamIdleControl) {
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
             abortController.onCancel(ac -> {
@@ -288,10 +338,30 @@ public class AnthropicSdkProvider implements LlmProvider {
                 }
             });
         }
+        // [流空闲看门狗 · 判决矩阵「降级非流式」] 对齐 CC retryWithoutStreaming（exe 223,028,125 Kke）：
+        //   跳过流式直接走非流式发送（复用流式失败回退的重试壳；不触发 onStreamingFallback——
+        //   CC 该路径同样不发 fallback 通知，exe 223,167,514 无 dh 调用）。
+        if (streamIdleControl != null && streamIdleControl.forceNonStreaming()) {
+            if (log.isInfoEnabled()) {
+                log.info("[AnthropicSdkProvider] streamIdleControl.forceNonStreaming=true → 直接非流式发送"
+                    + "（stall 判决矩阵 retryWithoutStreaming · CC exe 223,028,125）");
+            }
+            boolean ok = runNonStreamingWithRetries(config, modelName, systemPromptBlocks, history, tools,
+                maxOutputTokensOverride, taskBudget, effortValue, null, aborted, null,
+                onAssistantMessage, onComplete, skipCacheWrite, agentContext,
+                null, false);   // [Wn] 强制入口不启用封顶（非 stall 来源）
+            if (ok) {
+                return;
+            }
+            onError.accept(new StreamIdleTimeoutError(StreamIdleTimeoutError.Progress.NOTHING, false,
+                "stream idle fallback (non-streaming) failed"));
+            return;
+        }
         doStream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite, agentContext);
+            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite, agentContext,
+            streamIdleControl);   // [看门狗] 末参透传
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -336,7 +406,9 @@ public class AnthropicSdkProvider implements LlmProvider {
                           Consumer<Throwable> onError,
                           Runnable onComplete,
                           Boolean skipCacheWrite,
-                          com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                          com.nexusai.application.agent.subagent.AgentContext agentContext,
+                          // [流空闲看门狗] doStream 消费：注册关流监听 + 读循环后 stall 判定 + catch 映射
+                          StreamIdleControl streamIdleControl) {
         if (config == null || !config.isUsable()) {
             onError.accept(new IllegalStateException(
                 "AnthropicSdkProvider.stream called without usable ProviderConfig"));
@@ -345,12 +417,27 @@ public class AnthropicSdkProvider implements LlmProvider {
 
         long streamStartMs = System.currentTimeMillis(); // [A-13] per-LLM-call durationMs 起点 · CC logging.ts start
 
+        // [流空闲看门狗 · 对齐 CC 2.1.296（规格 §2-§3）]
+        //   · stalledByWatchdog：看门狗触发标记（abort 监听置位；实际解阻塞由读超时完成，
+        //     见 buildClient 换挡说明——close()/interrupt 经实测均不可用）
+        //   · 三标志 = CC Gan 的 anyEvent/anyOutputShown/anyBlockFinished（exe 223,030,407）
+        AtomicBoolean stalledByWatchdog = new AtomicBoolean(false);
+        AtomicBoolean anyEvent = new AtomicBoolean(false);
+        AtomicBoolean anyOutputShown = new AtomicBoolean(false);
+        AtomicBoolean anyBlockFinished = new AtomicBoolean(false);
+
+        // [看门狗] state 提前声明（catch 侧的 stall 映射要读 finishReason；try 内局部变量对 catch 不可见）
+        StreamState state = new StreamState();
+
         try {
             // [provider-custom-headers 任务 6] 主链 sessionId 来源 = history（DB 真值，必中）。
             //   ⚠️ 刻意**不**在此处兜底任何环境态会话槽（原为裸 MDC，批 3c 已删该类）；残留槽可能给出
             //   别会话的 id，详见 SessionIdResolver 类 javadoc 与 ProviderSessionIdWiringGuardTest 的接线级护栏。
             String sessionId = SessionIdResolver.resolve(history, null);
-            AnthropicClient client = buildClient(config, sessionId);
+            // [看门狗] 武装流式读超时（唯一可控解阻塞通道；见 buildClient 换挡说明）
+            AnthropicClient client = buildClient(config, sessionId,
+                streamIdleControl != null && streamIdleControl.idleTimeoutMs() > 0
+                    ? streamIdleControl.idleTimeoutMs() : null);
             // [C] skipCacheWrite 透传（原硬编码 null → 流式路径 marker 移位永不触发）·
             //   CC claude.ts:3224/:3243 markerIndex = skipCacheWrite ? len-2 : len-1
             MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
@@ -388,13 +475,24 @@ public class AnthropicSdkProvider implements LlmProvider {
             String requestId = rawResp.requestId().orElse(null);
 
             // 逐事件消费 · [H13-GAP-4 v3] 迭代器 + aborted 事件边界检查
-            StreamState state = new StreamState();
-            state.requestId = requestId;
+            state.requestId = requestId;   // [看门狗] state 已在 try 前声明
             if (log.isDebugEnabled()) {
                 log.debug("AnthropicSdkProvider 流式捕获 request_id={} · CC claude.ts:1834 streamRequestId=result.request_id",
                     requestId);
             }
             StreamResponse<RawMessageStreamEvent> resp = rawResp.parse();
+            // [流空闲看门狗] 注册"触发标记"监听（⛔ 不调 close()——消费后静默场景 close 会死锁，
+            //   见 buildClient 换挡说明；解阻塞交给读超时）
+            if (streamIdleControl != null && streamIdleControl.watchdogController() != null) {
+                streamIdleControl.watchdogController().onCancel(ac -> {
+                    if (stalledByWatchdog.compareAndSet(false, true)) {
+                        if (log.isWarnEnabled()) {
+                            log.warn("[AnthropicSdkProvider] 看门狗触发（reason={}）；解阻塞由读超时（{}ms）完成",
+                                ac.reason(), streamIdleControl.idleTimeoutMs());
+                        }
+                    }
+                });
+            }
             AtomicBoolean finished = new AtomicBoolean(false);
             java.util.Set<String> completedToolIds =
                 onToolCallComplete == null ? null : java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -405,12 +503,30 @@ public class AnthropicSdkProvider implements LlmProvider {
                     break; // 硬中断: 不再消费
                 }
                 if (finished.get()) break;
+                if (stalledByWatchdog.get()) break;   // [看门狗] 关流后停止消费（下行走 stall 抛出）
                 try {
                     RawMessageStreamEvent event = it.next();
+                    updateWatchdogProgressFlags(event, anyEvent, anyOutputShown, anyBlockFinished);   // [看门狗]
                     mapStreamEvent(event, state, onChunk, onToolCallComplete, onReasoningChunk, completedToolIds);
                 } catch (Exception e) {
+                    // [看门狗] 读超时/触发竞争 = stall 主通道（读线程内抛出，天然解开阻塞）：
+                    //   交付 stall 并退出（⛔ 继续循环会在每个空闲窗口重超时 → 空转）。
+                    if (stalledByWatchdog.get() || isStreamIdleReadTimeout(e, streamIdleControl)) {
+                        onError.accept(buildStreamIdleTimeoutError(anyBlockFinished.get(), anyOutputShown.get(),
+                            anyEvent.get(), state));
+                        return;
+                    }
                     log.warn("AnthropicSdkProvider 事件映射失败: {}", e.toString());
                 }
+            }
+            // [流空闲看门狗] 读循环「正常退出」也可能是关流所致（spike：close → hasNext()=false 干净收尾）
+            //   ⇒ 成功路径之前先查 stall 标志（对齐 CC 干净出口自抛 Error，exe 223,151,231）。
+            //   ⚠️ 交付必须走 onError（本方法契约：错误经回调，不向调用线程抛——调用方在
+            //   STREAM_EXECUTOR 虚拟线程，抛出会被吞）。
+            if (stalledByWatchdog.get()) {
+                onError.accept(buildStreamIdleTimeoutError(anyBlockFinished.get(), anyOutputShown.get(),
+                    anyEvent.get(), state));
+                return;
             }
 
             // abort 后不触发 onAssistantMessage / onComplete（onError 已由 abort listener 发出）
@@ -463,6 +579,14 @@ public class AnthropicSdkProvider implements LlmProvider {
                 history == null ? 0 : history.size(), state, querySource, streamStartMs), agentContext);
             onComplete.run();
         } catch (Exception e) {
+            // [流空闲看门狗] stall 优先于一切分类：不走通用流式→非流式回退（那是 5xx/连接类错误的
+            //   通道），由循环层按 progress 五态判决（规格 §2.4 · CC Bhr exe 223,026,053）。
+            //   交付走 onError（同上：不向调用线程抛）。读超时（hasNext() 处抛出等）在此同判。
+            if (stalledByWatchdog.get() || isStreamIdleReadTimeout(e, streamIdleControl)) {
+                onError.accept(buildStreamIdleTimeoutError(anyBlockFinished.get(), anyOutputShown.get(),
+                    anyEvent.get(), state));
+                return;
+            }
             RuntimeException translated = translateSdkError(e);
             // [A-13] per-LLM-call 流式错误事件 · CC claude.ts:2720/:2776 logAPIError
             //   （翻译后 error/status 面可用；abort 也先记录再返回）
@@ -484,15 +608,129 @@ public class AnthropicSdkProvider implements LlmProvider {
             //   DEC-RV-03 回退链迁移自旧 AnthropicProvider.nonStreamingFallback。
             if (onStreamingFallback != null
                 && shouldUseNonStreamingFallback(translated, aborted, streamingFallbackDisabled())) {
-                if (nonStreamingFallback(config, modelName, systemPromptBlocks, history, tools,
+                // [Wn] 传回退请求自身超时值 + pm 判据（CC E1/j6e：529 / 5xx非529 / APIError
+                //   api_error|timeout_error——第三项本仓 N/A：LlmApiException 无 error.type 形字段，
+                //   translateSdkError 已将其归一为状态码/文案）；且流存活 ≥ rln（outlasted）
+                long wnRln = nonStreamingTimeoutRlnMs();
+                boolean wnOutlasted = (System.currentTimeMillis() - streamStartMs) >= wnRln;
+                boolean wnPmClass = ErrorClassifier.is529Error(translated)
+                    || (translated instanceof LlmApiException laePm
+                        && laePm.status() >= 500 && laePm.status() < 600 && laePm.status() != 529);
+                if (runNonStreamingWithRetries(config, modelName, systemPromptBlocks, history, tools,
                     maxOutputTokensOverride, taskBudget, effortValue, translated, aborted,
-                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, agentContext)) {
+                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, agentContext,
+                    wnRln, wnPmClass && wnOutlasted)) {
                     return;
                 }
                 log.warn("[AnthropicSdkProvider] 非流式回退失败，走原始流式错误 · CC claude.ts:2562");
             }
             log.error("AnthropicSdkProvider.stream failed: {}", translated.toString());
             onError.accept(translated);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [流空闲看门狗] helpers · 对齐 CC 2.1.296（progress 五态 / 事件标志）
+    // ════════════════════════════════════════════════════════════════════
+
+    /** [看门狗] CC Gan 的 progress 五态（exe 223,030,407 判定顺序照抄）。 */
+    private static StreamIdleTimeoutError.Progress computeWatchdogProgress(boolean anyBlockFinished,
+                                                                            boolean anyOutputShown,
+                                                                            boolean anyEvent) {
+        if (anyBlockFinished) {
+            return anyOutputShown ? StreamIdleTimeoutError.Progress.OUTPUT
+                : StreamIdleTimeoutError.Progress.THINKING_ONLY;
+        }
+        if (anyOutputShown) {
+            return StreamIdleTimeoutError.Progress.PARTIAL_OUTPUT;
+        }
+        return anyEvent ? StreamIdleTimeoutError.Progress.STARTED : StreamIdleTimeoutError.Progress.NOTHING;
+    }
+
+    /**
+     * [看门狗] 判定异常是否为"流式读超时"（仅当本请求已武装读超时；cause 链 ≤6 层）。
+     * okhttp 阻塞读超时抛 {@code SocketTimeoutException("timeout")}（经 SDK/okio 可能被包多层）。
+     */
+    static boolean isStreamIdleReadTimeout(Throwable e, StreamIdleControl control) {
+        return control != null && control.idleTimeoutMs() > 0 && isTimeoutInCauseChain(e);
+    }
+
+    /** [Wn/看门狗共用] cause 链 ≤6 层是否含超时类异常（SocketTimeoutException / InterruptedIOException:timeout）。 */
+    static boolean isTimeoutInCauseChain(Throwable e) {
+        Throwable t = e;
+        for (int i = 0; i < 6 && t != null; i++, t = t.getCause()) {
+            if (t instanceof java.net.SocketTimeoutException) {
+                return true;
+            }
+            if (t instanceof java.io.InterruptedIOException && t.getMessage() != null
+                    && t.getMessage().toLowerCase(java.util.Locale.ROOT).contains("timeout")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * [Wn · 非流式回退超时预算] 对齐 CC exe 223,010,874：
+     * {@code Wn = env CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES ?? (CLAUDE_CODE_RETRY_WATCHDOG && failedStreamOutlastedTimeout ? 2 : 无)}。
+     * 返回 -1 = 无值（本机制不介入，走通用重试路径）。
+     *
+     * <p>读码语义（"封顶"读法，CC 原文 {@code if(_e>=Wn) throw RetryError; _e++}）：命中
+     * （超时类错误 + elapsed ≥ nonStreamingTimeoutMs×0.9）时——超预算 → 中止（对应 CC
+     * {@code api_request_nonstreaming_timeout_exhausted}）；未超预算 → 计数后照走通用重试。
+     * <b>默认（两 env 均未设）= 不介入</b>（CC 原样 · 用户裁定 10-10）。
+     *
+     * @param envRaw                          env CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES 原值（可 null）
+     * @param retryWatchdogGate               env CLAUDE_CODE_RETRY_WATCHDOG 真值
+     * @param failedStreamOutlastedTimeout    流式失败为 529/5xx且流存活 ≥rln（CC pm，见调用方）
+     */
+    static int resolveNonStreamingTimeoutRetryBudget(String envRaw, boolean retryWatchdogGate,
+                                                     boolean failedStreamOutlastedTimeout) {
+        if (envRaw != null && !envRaw.isBlank()) {
+            try {
+                int v = Integer.parseInt(envRaw.trim());
+                if (v >= 0) {
+                    return v;
+                }
+            } catch (NumberFormatException ignored) {
+                // 非法值按未设处理（继续走门控链）
+            }
+        }
+        return retryWatchdogGate && failedStreamOutlastedTimeout ? 2 : -1;
+    }
+
+    /** [Wn] 非流式回退请求自身超时值 = CC {@code rln()}：API_TIMEOUT_MS 优先，否则 300s（远程 120s 分支本仓 N/A）。 */
+    static long nonStreamingTimeoutRlnMs() {
+        long env = StreamIdleWatchdogSettings.parsePositiveLong(System.getenv("API_TIMEOUT_MS"));
+        return env > 0 ? env : 300_000L;
+    }
+
+    /** [看门狗] 构造 stall 异常（message 对齐 CC 两条变体：partial / no chunks）。 */
+    private static StreamIdleTimeoutError buildStreamIdleTimeoutError(boolean anyBlockFinished,
+                                                                      boolean anyOutputShown,
+                                                                      boolean anyEvent,
+                                                                      StreamState state) {
+        return new StreamIdleTimeoutError(
+            computeWatchdogProgress(anyBlockFinished, anyOutputShown, anyEvent),
+            state.finishReason != null,
+            "Stream idle timeout - " + (anyBlockFinished ? "partial response received" : "no chunks received"));
+    }
+
+    /**
+     * [看门狗] 每事件维护三标志：
+     * anyEvent=任意事件；anyOutputShown=非思考块 start（对齐 CC Cl：非 thinking/redacted_thinking）；
+     * anyBlockFinished=任意 content_block_stop。
+     */
+    static void updateWatchdogProgressFlags(RawMessageStreamEvent event, AtomicBoolean anyEvent,
+                                            AtomicBoolean anyOutputShown, AtomicBoolean anyBlockFinished) {
+        anyEvent.set(true);
+        if (event.isContentBlockStart()) {
+            var block = event.asContentBlockStart().contentBlock();
+            if (!block.isThinking() && !block.isRedactedThinking()) {
+                anyOutputShown.set(true);
+            }
+        } else if (event.isContentBlockStop()) {
+            anyBlockFinished.set(true);
         }
     }
 
@@ -583,6 +821,41 @@ public class AnthropicSdkProvider implements LlmProvider {
                                          Runnable onComplete,
                                          Boolean skipCacheWrite,
                                          com.nexusai.application.agent.subagent.AgentContext agentContext) {
+        return runNonStreamingWithRetries(config, modelName, systemPromptBlocks, history, tools,
+            maxOutputTokensOverride, taskBudget, effortValue, streamingError, aborted,
+            onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, agentContext,
+            null, false);   // [Wn] 兼容包装：不启用封顶（新调用点直接走 runNonStreamingWithRetries）
+    }
+
+    /**
+     * [流空闲看门狗 · 规格 §3] 非流式发送 + 重试壳（由 {@link #nonStreamingFallback} 的既有实现
+     * <b>原样搬出</b>，供两处复用）：
+     * <ul>
+     *   <li>A) 流式 catch 的自动回退（streamingError = 流式错误，带 529 预置计数）；</li>
+     *   <li>B) forceNonStreaming 强制入口（streamingError = null，onStreamingFallback = null——
+     *       CC retryWithoutStreaming 路径同样不发 fallback 通知，exe 223,167,514 无 dh 调用）。</li>
+     * </ul>
+     */
+    private boolean runNonStreamingWithRetries(ProviderConfig config, String modelName,
+                                         List<SystemPromptBlock> systemPromptBlocks,
+                                         List<ChatMessageDto> history, ArrayNode tools,
+                                         Integer maxOutputTokensOverride, TaskBudgetParam taskBudget,
+                                         String effortValue, Throwable streamingError,
+                                         AtomicBoolean aborted, Runnable onStreamingFallback,
+                                         Consumer<AssistantMessage> onAssistantMessage,
+                                         Runnable onComplete,
+                                         Boolean skipCacheWrite,
+                                         com.nexusai.application.agent.subagent.AgentContext agentContext,
+                                         // [Wn] 见 resolveNonStreamingTimeoutRetryBudget；
+                                         //   null/false = 本机制不介入（forceNonStreaming 入口即此）
+                                         Long nonStreamingTimeoutMs, boolean failedStreamOutlastedTimeout) {
+        // [Wn 封顶] 对齐 CC exe 223,010,874（预算 -1=不介入；env 与门控只读一次）
+        int wnBudget = nonStreamingTimeoutMs != null
+            ? resolveNonStreamingTimeoutRetryBudget(System.getenv("CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES"),
+                ErrorClassifier.isEnvTruthy(System.getenv("CLAUDE_CODE_RETRY_WATCHDOG")),
+                failedStreamOutlastedTimeout)
+            : -1;
+        int timeoutRetriesUsed = 0;
         if (onStreamingFallback != null) {
             try {
                 onStreamingFallback.run();
@@ -633,6 +906,20 @@ public class AnthropicSdkProvider implements LlmProvider {
                 // [A-13] per-LLM-call 非流式尝试错误事件（每次尝试 = 一次真实 LLM 调用）· CC logAPIError
                 emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName,
                     history == null ? 0 : history.size(), e2, null, attemptStartMs), agentContext);
+                // [Wn 封顶 · 对齐 CC exe 223,010,874] 命中（超时类 + elapsed≥0.9×超时值）：
+                //   超预算 → 中止；未超预算 → 计数后照走下方通用重试（"封顶"读法）
+                if (wnBudget >= 0 && isTimeoutInCauseChain(e2)
+                        && System.currentTimeMillis() - attemptStartMs
+                            >= (long) (nonStreamingTimeoutMs * 0.9)) {
+                    if (timeoutRetriesUsed >= wnBudget) {
+                        log.error("[AnthropicSdkProvider] 非流式回退超时重试预算尽（Wn={}），放弃"
+                            + " · CC api_request_nonstreaming_timeout_exhausted", wnBudget);
+                        return false;
+                    }
+                    timeoutRetriesUsed++;
+                    log.warn("[AnthropicSdkProvider] 非流式回退超时（elapsed≥90%×{}ms），重试 {}/{}",
+                        nonStreamingTimeoutMs, timeoutRetriesUsed, wnBudget);
+                }
                 if (ErrorClassifier.is529Error(e2)) {
                     if (TransientErrorHandler.isEligibleFor529Fallback(modelName)) {
                         consecutive529Errors++;

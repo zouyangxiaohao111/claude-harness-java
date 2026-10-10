@@ -301,7 +301,6 @@ public class LlmAgentLoop implements AgentLoop {
      */
     private static final java.util.concurrent.ExecutorService STREAM_EXECUTOR =
         java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
-    private static final long STREAM_TIMEOUT_SECONDS = 300;
     /** [OBS1] chunk 推送限流日志的最小间隔（ms）：chunk 极密集，逐条打日志会把日志刷爆。 */
     private static final long PUSH_LOG_INTERVAL_MS = 1000L;
     private static final int DEFAULT_TOKEN_BUDGET = 180_000;
@@ -5684,6 +5683,11 @@ public class LlmAgentLoop implements AgentLoop {
         //   genuine next_turn / fallback 模型切换成功后复位（CC 每次 withRetry 调用重开计数）。
         int[] retryAttemptHolder = { 0 };
         int[] consecutive529ErrorsHolder = { 0 };
+        // [流空闲看门狗] stall 判决矩阵计数（跨迭代存活 · CC 账本 stalls 预算 V6e=1 / Kke 一次性标志）：
+        //   stallRetries：stall"重试新流"已用次数（≤1）；forceNonStreamingNextAttempt：下一请求强制
+        //   非流式（构造 control 时消费并清零）。均随 genuine next_turn 边界复位。
+        int[] stallRetries = { 0 };
+        boolean[] forceNonStreamingNextAttempt = { false };
         // [ER-IMP-06] 持久重试独立计数闭包 · CC withRetry.ts:188 persistentAttempt
         //   独立于 attempt 持续增长（非持久路径为 null/不使用）；退避公式用 persistentAttempt
         //   （5min cap 指数退避），attempt 在持久模式被 clamp（CC:504-506）使 do-while 永不终止。
@@ -6561,6 +6565,13 @@ public class LlmAgentLoop implements AgentLoop {
             //   content/reasoning chunk（先到者）到达时刻；decodeMs = now - firstTokenMs。
             //   lambda 捕获用数组 holder（同 reasoningStartMs 惯例）；-1 = 未打点（无 token）。
             long[] firstTokenMs = {-1L};
+            // [流空闲看门狗 · 规格 §2] 等待段空闲钟（chunk 回调打点；per-iteration 重建）。
+            //   watchdogLastChunkNanos：最近一次 chunk 时刻（nanoTime，计时长用）；watchdogWarned：
+            //   本空闲窗是否已告警（chunk 到达复位）；watchdogFired：本调用是否已触发（只触发一次，
+            //   对齐 CC am 单次置位 exe 223,124,387）。
+            long[] watchdogLastChunkNanos = { System.nanoTime() };
+            boolean[] watchdogWarned = { false };
+            boolean[] watchdogFired = { false };
             CountDownLatch done = new CountDownLatch(1);
             boolean[] errored = {false};
             // s11.x: 捕获原始异常对象（保留 LlmApiException headers 供 Retry-After 提取）
@@ -7175,6 +7186,18 @@ public class LlmAgentLoop implements AgentLoop {
                 com.nexusai.application.agent.prompt.SystemPromptSplitter.splitSysPromptPrefix(
                     fullSystemPrompt, useGlobalCacheScope(params.config()),
                     hasMcpToolInRequest(perTurnTuc));
+            // [流空闲看门狗 · 规格 §2-§3] 配置解析（env>设置>默认，300s 下限）+ 每请求专用 control。
+            //   forceNonStreaming = 判决矩阵"降级非流式"（CC retryWithoutStreaming）一次性标志——消费即清
+            //   （同 streamingFallbackOccured 消费模式）。watchdogController 供等待段到点打"触发标记"。
+            boolean streamIdleWatchdogEnabled = com.nexusai.infra.llm.StreamIdleWatchdogSettings.enabled();
+            long streamIdleWatchdogMs = streamIdleWatchdogEnabled
+                ? com.nexusai.infra.llm.StreamIdleWatchdogSettings.idleMs(settingsResolver) : 0L;
+            com.nexusai.application.agent.tool.AbortController streamWatchdogAbort =
+                new com.nexusai.application.agent.tool.AbortController();
+            com.nexusai.infra.llm.StreamIdleControl streamIdleControl =
+                new com.nexusai.infra.llm.StreamIdleControl(
+                    streamWatchdogAbort, forceNonStreamingNextAttempt[0], streamIdleWatchdogMs);
+            forceNonStreamingNextAttempt[0] = false;
             com.nexusai.application.agent.loop.ModelRequest request = new com.nexusai.application.agent.loop.ModelRequest(
                 params.config(),
                 effectiveModel,
@@ -7205,6 +7228,7 @@ public class LlmAgentLoop implements AgentLoop {
                 //   请求 thinkingConfig=null → 零行为变化（Anthropic 省略参数=disabled 等价）。
                 params.querySource() == QuerySource.HOOK_AGENT ? params.thinkingConfig() : null,
                 chunk -> {
+                    watchdogLastChunkNanos[0] = System.nanoTime(); watchdogWarned[0] = false;   // [看门狗] chunk 打点
                     chunkCount[0]++;
                     // [reasoningDurationMs] 首个 content chunk → 推理阶段结束打点一次（仅一次）
                     if (reasoningStartMs[0] >= 0 && reasoningEndMs[0] < 0) {
@@ -7298,6 +7322,7 @@ public class LlmAgentLoop implements AgentLoop {
                 },
                 // 11-arg 回调: 每个 tool_call 完整时立即 add 到 executor (真流式并行)
                 toolCall -> {
+                    watchdogLastChunkNanos[0] = System.nanoTime(); watchdogWarned[0] = false;   // [看门狗] chunk 打点
                     if (seenToolIds.add(toolCall.id())) {
                         seenToolCalls.add(toolCall);
                         // [R32-b15 Stage 2 C5] streaming 回调路径: 立即把 tool_use_id
@@ -7324,6 +7349,7 @@ public class LlmAgentLoop implements AgentLoop {
                 // 12-arg 回调 (Phase 6·s02.6 真流式 reasoning): 每个 SSE reasoning chunk 立即推 STOMP
                 // (如果构造器 5 注入了 ctx.wsTemplate(), 走真流式; 否则只累积等 ChatService 回放)
                 reasoningChunk -> {
+                    watchdogLastChunkNanos[0] = System.nanoTime(); watchdogWarned[0] = false;   // [看门狗] chunk 打点
                     // [reasoningDurationMs] 首 reasoning chunk 到达 → 推理计时起点（仅一次）
                     if (reasoningStartMs[0] < 0) {
                         reasoningStartMs[0] = System.currentTimeMillis();
@@ -7383,7 +7409,9 @@ public class LlmAgentLoop implements AgentLoop {
                 // 禁止事项：不得在 STREAM_EXECUTOR 任务体里回放/重设 ThreadLocal 再读
                 //   （用户铁律：会话态一律显式传参，回放不算合规）。
                 (params.toolUseContext() != null
-                    ? params.toolUseContext().agentContext() : null)
+                    ? params.toolUseContext().agentContext() : null),
+                // [流空闲看门狗] 每请求专用 control（上方构造：控制器 + forceNonStreaming + idleMs）
+                streamIdleControl
             );
             // [H7-arch Phase 5-2 P3-④] 提交 LLM call（loop 不再直接 provider.stream）。
             // [对抗核验 H13-GAP-4 v3] 后台线程执行 callModel → loop 线程空闲执行 abort 感知轮询
@@ -7408,26 +7436,28 @@ public class LlmAgentLoop implements AgentLoop {
 
             // 等待流完成
             try {
-                // [H7-arch Phase 5 P5 C8] abort 感知等待 · 对齐 CC AbortSignal 透传 provider 的即时响应。
-                // Java 无 provider abort 透传（后续扩展点）→ 短轮询折衷：state.cancelled() 时 ≤500ms 返回，
-                // 替代原 done.await(300s) 软超时（Phase 3 ExecAgentHook 发现 loop 不响应 state.cancel，
-                // abort 后需等 stream 自然结束或 300s 超时）。abort 跳出 → 下方 aborted_streaming 处理。
-                long deadline = System.currentTimeMillis() + STREAM_TIMEOUT_SECONDS * 1000L;
+                // [流空闲看门狗 · 规格 §2 · 用户裁定 10-10] 对齐 CC 2.1.296：**空闲语义**（每 chunk 重置），
+                //   替代原固定 300s 总时长 deadline。触发动作 = 日志 + watchdogController.abort（"触发标记"）；
+                //   实际解阻塞由 provider 侧流式读超时完成（close() 经实测死锁——见 AnthropicSdkProvider
+                //   buildClient 换挡说明），stall 随 onError 抵达下方 errored 路径 → 判决矩阵。
+                //   保留 500ms 轮询：与 state.cancelled() 感知共用同一路（Java 无 abort 透传的既有折衷）。
                 boolean streamCompleted = false;
-                while (!streamCompleted && !state.cancelled()
-                        && System.currentTimeMillis() < deadline) {
+                while (!streamCompleted && !state.cancelled()) {
                     streamCompleted = done.await(500, TimeUnit.MILLISECONDS);
-                }
-                if (!streamCompleted && !state.cancelled()) {
-                    state.setError("stream timeout (" + STREAM_TIMEOUT_SECONDS + "s)");
-                    state.setExitReason(ExitReason.STREAM_TIMEOUT);
-                    log.error("LlmAgentLoop: {}", state.exitReason());
-
-                    // [IMP-SF-02 · DEL-WF7-GC-01] STREAM_TIMEOUT→StopFailure('invalid_request') 发射点已删除：
-                    //   CC 超时 error='unknown'（errors.ts:434-443）非 'invalid_request'，且 CC 仅经
-                    //   lastMessage.isApiErrorMessage 门（query.ts:1262-1264）发 StopFailure——本地 300s
-                    //   轮询 watchdog 未产出 API 错误消息（isApiErrorMessage=false），按 CC 语义不发 StopFailure。
-                    break;
+                    if (streamCompleted || state.cancelled() || streamIdleControl.idleTimeoutMs() <= 0
+                            || watchdogFired[0]) {
+                        continue;
+                    }
+                    long idleMs = (System.nanoTime() - watchdogLastChunkNanos[0]) / 1_000_000L;
+                    if (idleMs >= streamIdleControl.idleTimeoutMs()) {
+                        watchdogFired[0] = true;
+                        log.error("Streaming idle timeout: no chunks received for {}s, aborting stream",
+                            streamIdleControl.idleTimeoutMs() / 1000);
+                        streamIdleControl.watchdogController().abort("stream_idle_timeout");
+                    } else if (!watchdogWarned[0] && idleMs >= streamIdleControl.idleTimeoutMs() / 2) {
+                        watchdogWarned[0] = true;
+                        log.warn("Streaming idle warning: no chunks received for {}s", idleMs / 1000);
+                    }
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -7489,6 +7519,55 @@ public class LlmAgentLoop implements AgentLoop {
                         consecutive529ErrorsHolder[0] = 0;
                         continue;
                     }
+                }
+
+                // ── [流空闲看门狗 · 判决矩阵] 对齐 CC Bhr（exe 223,026,053）/ Gan（exe 223,030,407）· 规格 §2.4 ──
+                if (streamError instanceof com.nexusai.infra.llm.StreamIdleTimeoutError sit) {
+                    com.nexusai.infra.llm.StreamIdleTimeoutError.Progress p = sit.progress();
+                    boolean nothing = p == com.nexusai.infra.llm.StreamIdleTimeoutError.Progress.NOTHING;
+                    boolean thinkingOnly = p == com.nexusai.infra.llm.StreamIdleTimeoutError.Progress.THINKING_ONLY;
+                    // 重试新流：仅 nothing / thinkingOnly(未收 stop_reason)；stalls 预算 ≤1 且总重试预算未耗尽
+                    //   总闸原式 = retries < maxRetries（CC iO exe 214,790,863；env CLAUDE_CODE_MAX_RETRIES ?? 10）
+                    boolean retryNewStream = (nothing || (thinkingOnly && !sit.stopReasonReceived()))
+                        && stallRetries[0] < 1
+                        && retryAttemptHolder[0] < com.nexusai.application.agent.recovery.WithRetryEngine.getDefaultMaxRetries();
+                    if (retryNewStream) {
+                        stallRetries[0]++;
+                        retryAttemptHolder[0]++;
+                        log.warn("Stream idle timeout {} — retrying streaming ({}/1)",
+                            nothing ? "before first event" : "after thinking-only yield", stallRetries[0]);
+                        resetPerAttemptStateForRetry(ctx, state, perTurnTuc, turnAssistantId,
+                            params.querySource(), params.thinkingConfig(), params.canUseTool(),
+                            acc, reasoningBuf, reasoningStartMs, reasoningEndMs, firstTokenMs, chunkCount,
+                            seenToolCalls, seenToolIds, streamingExecRef);
+                        state.clearError();
+                        errored[0] = false;
+                        continue;
+                    }
+                    // 降级非流式：nothing(预算尽) / partialOutput(吐一半被卡) / started(只有事件无输出)
+                    boolean needNonStreaming = nothing
+                        || p == com.nexusai.infra.llm.StreamIdleTimeoutError.Progress.PARTIAL_OUTPUT
+                        || p == com.nexusai.infra.llm.StreamIdleTimeoutError.Progress.STARTED;
+                    if (needNonStreaming) {
+                        log.error("Error streaming, falling back to non-streaming mode: {}",
+                            streamError.getMessage());
+                        forceNonStreamingNextAttempt[0] = true;
+                        retryAttemptHolder[0]++;
+                        state.clearError();
+                        errored[0] = false;
+                        state.markNeedsFollowUp();
+                        continue;
+                    }
+                    // 保留部分（OUTPUT / thinkingOnly 预算尽）→ 终局（文案按"是否有内容"两分，对齐 CC
+                    //   exe 223,160,318 / exe 223,160,817）
+                    boolean hasContent = p == com.nexusai.infra.llm.StreamIdleTimeoutError.Progress.OUTPUT
+                        || p == com.nexusai.infra.llm.StreamIdleTimeoutError.Progress.PARTIAL_OUTPUT;
+                    state.setError(hasContent
+                        ? "API Error: The response stopped arriving. The response above may be incomplete."
+                        : "API Error: The response stalled before a response was produced. Try again.");
+                    state.setExitReason(ExitReason.STREAM_TIMEOUT);
+                    log.info("[LlmAgentLoop] stream idle stall 终局: progress={} hasContent={}", p, hasContent);
+                    break;
                 }
 
                 // [ER-IMP-07 / DC-23] Stream-A4 流式期错误抑制已删除：CC 无 Java 独有静默 continue
@@ -8514,7 +8593,14 @@ public class LlmAgentLoop implements AgentLoop {
                 log.error("[LlmAgentLoop] max_tokens 恢复耗尽: {}", mtResult.message());
                 break;
             }
-            String text = acc.toString();
+            // [流空闲看门狗 · 非流式产出补全 · e2e 实测修复] 非流式成功路径（forceNonStreaming 降级 /
+            //   流式失败回退）**无 onChunk 回调** ⇒ acc/chunkCount 恒空。若直取 acc，下方空响应守卫
+            //   （:8845 text.isEmpty() && chunkCount==0）会把**完整回复**误杀为 NO_ASSISTANT_TEXT
+            //   —— e2e(:3482 stub)实测：PARTIAL_OUTPUT 降级非流式成功，回复全丢、turn 以 empty 收尾。
+            //   CC 里 fallback 消息是作为完整 assistant message 直接入列（无"本地累加"判定）⇒
+            //   此处以 msg 全文补齐等价：仅当 acc 为空时取 msg.content()，流式路径（acc 非空）字节不变。
+            String text = acc.length() > 0 ? acc.toString()
+                : (msg != null && msg.content() != null ? msg.content() : "");
 
             // ── phase 日志: 把"turn N"替换成语义化 phase
             //    LLM 一次响应可能含: reasoning(思考) + preamble(调工具前的话) + tool_calls(1..N)
@@ -8739,6 +8825,9 @@ public class LlmAgentLoop implements AgentLoop {
                 consecutive529ErrorsHolder[0] = 0;
                 persistentAttemptHolder[0] = 0;
                 fastModeTemporarilyDisabled[0] = false;
+                // [流空闲看门狗] next_turn 边界复位 stall 判决计数/一次性标志
+                stallRetries[0] = 0;
+                forceNonStreamingNextAttempt[0] = false;
                 pendingMaxOutputTokensOverride = null;
                 retryContextMaxTokensOverride = null;
                 if (log.isDebugEnabled()) {
@@ -11392,6 +11481,43 @@ public class LlmAgentLoop implements AgentLoop {
         return System.currentTimeMillis() - firstTokenMs[0];
     }
 
+    /**
+     * [流空闲看门狗] 重试前重置 per-attempt 累积 + 重建 executor（原 handleModelFallback 步骤 2/3
+     * 原样搬出共享；handleModelFallback 与 stall"重试新流"判决同款）。清单（漏一项 = 二次尝试把
+     * 上一段残余当本轮内容；CC query.ts:934-940 + assistantMessages/toolResults/toolUseBlocks/
+     * needsFollowUp 重置）。
+     */
+    private static void resetPerAttemptStateForRetry(
+            AgentLoopContext ctx, AgentState state, ToolUseContext perTurnTuc, String turnAssistantId,
+            QuerySource querySource, ThinkingConfig thinkingConfig,
+            com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool canUseTool,
+            StringBuilder acc, StringBuilder reasoningBuf, long[] reasoningStartMs, long[] reasoningEndMs,
+            long[] firstTokenMs, int[] chunkCount, List<ToolUseBlock> seenToolCalls,
+            java.util.Set<String> seenToolIds, StreamingToolExecutor[] streamingExecRef) {
+        acc.setLength(0);
+        reasoningBuf.setLength(0);
+        // [reasoningDurationMs] 复位推理计时（残余计时会污染重建 executor 后新一轮）
+        reasoningStartMs[0] = -1L;
+        reasoningEndMs[0] = -1L;
+        // [B7-R9] 同步复位首 token 计时（残余计时污染重建 executor 后新一轮）
+        firstTokenMs[0] = -1L;
+        chunkCount[0] = 0;
+        seenToolCalls.clear();
+        seenToolIds.clear();
+        // CC 内层 attemptWithFallback 循环在同 turn 内重试；Java 单 do-while 结构需保持
+        // needsFollowUp=true 才能触发下一次 LLM 调用（否则 do-while 直接退出）。
+        state.markNeedsFollowUp();
+        // discard + 重建 executor（CC query.ts:934-940）
+        if (streamingExecRef[0] != null) {
+            streamingExecRef[0].discard();
+            streamingExecRef[0] = AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc,
+                state, turnAssistantId,
+                (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
+                true /* deferredModifier */,
+                buildSubagentAgentOptions(querySource, thinkingConfig), null, canUseTool);
+        }
+    }
+
     private static void handleModelFallback(
             AgentLoopContext ctx,
             AgentState state,
@@ -11435,29 +11561,11 @@ public class LlmAgentLoop implements AgentLoop {
             log.info("[LlmAgentLoop] model fallback: 为 {} 个 pending tool_use 生成 synthetic error tool_results · CC yieldMissingToolResultBlocks",
                 fallbackMsg.toolCalls().size());
         }
-        // 2) 清空 per-turn 累积（CC: assistantMessages/toolResults/toolUseBlocks/needsFollowUp 重置）
-        acc.setLength(0);
-        reasoningBuf.setLength(0);
-        // [reasoningDurationMs] fallback 复位推理计时（残余计时会污染重建 executor 后新一轮）
-        reasoningStartMs[0] = -1L;
-        reasoningEndMs[0] = -1L;
-        // [B7-R9] fallback 同步复位首 token 计时（残余计时污染重建 executor 后新一轮）
-        firstTokenMs[0] = -1L;
-        chunkCount[0] = 0;
-        seenToolCalls.clear();
-        seenToolIds.clear();
-        // CC 内层 attemptWithFallback 循环在同 turn 内重试；Java 单 do-while 结构需保持
-        // needsFollowUp=true 才能触发下一次 LLM 调用（否则 do-while 直接退出）。
-        state.markNeedsFollowUp();
-        // 3) discard + 重建 executor（CC query.ts:934-940）
-        if (streamingExecRef[0] != null) {
-            streamingExecRef[0].discard();
-            streamingExecRef[0] = AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc,
-                state, turnAssistantId,
-                (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
-                true /* deferredModifier */,
-                buildSubagentAgentOptions(querySource, thinkingConfig), null, canUseTool);
-        }
+        // 2)+3) 清空 per-turn 累积 + discard/重建 executor（CC query.ts:934-940）
+        //   [流空闲看门狗] 抽出共享——stall "重试新流"判决（Bhr exe 223,026,053）用同一套重置清单。
+        resetPerAttemptStateForRetry(ctx, state, perTurnTuc, turnAssistantId,
+            querySource, thinkingConfig, canUseTool, acc, reasoningBuf, reasoningStartMs,
+            reasoningEndMs, firstTokenMs, chunkCount, seenToolCalls, seenToolIds, streamingExecRef);
         // 4) tengu_model_fallback_triggered 遥测等价（slf4j+logback 中文）· CC query.ts:932-941
         //    entrypoint='cli'（CC 硬编码，Java 主循环等价）；queryChainId→sessionId；queryDepth→turnCount
         log.warn("LlmAgentLoop: tengu_model_fallback_triggered 等价 "

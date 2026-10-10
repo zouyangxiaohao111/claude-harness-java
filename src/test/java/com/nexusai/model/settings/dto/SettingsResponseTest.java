@@ -71,7 +71,7 @@ class SettingsResponseTest {
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null);
+            null, null, null, null, null, null, null, null);
     }
 
     private JsonNode serialize(Theme theme) throws Exception {
