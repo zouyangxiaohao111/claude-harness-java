@@ -890,6 +890,32 @@ public class CronIdleExecutor {
     }
 
     /**
+     * [D1 usage-source] 队列命令 → 本 run 的 message.usage 来源标记。
+     *
+     * <p><b>值域</b>（与 {@code MessageUsageEvent.SOURCE_*} 同）：
+     * <ul>
+     *   <li>{@code MODE_TASK_NOTIFICATION}（后台任务完成通知）→ {@code background}；</li>
+     *   <li>{@code workload == WORKLOAD_CRON}（TestJob 定时 fire，mode=prompt）→ {@code background}；</li>
+     *   <li>其余（busy-queued 用户排队消息 = mode=prompt + workload=busy-queued）→ {@code user}。</li>
+     * </ul>
+     *
+     * <p>本判据是「cron run 与用户请求在 usage-push 时点上的差异」的<b>唯一可靠来源</b>：run 进
+     * LlmAgentLoop 后 querySource 恒 REPL_MAIN_THREAD、userMessageId 也拿不到（task-notification 的
+     * cmd.uuid()=null → 注入消息落随机 UUID；cron fire 的 uuid 形如 msg-xxxxxxxx 与真实用户消息同形）
+     * ⇒ 队列项的 mode/workload 是唯一还握着「谁发起的」的地方，必须在 run 前显式打标。
+     *
+     * @param cmd 队列命令（非 null；批量模式传首条 —— 纯 task-notification 批同 mode）
+     * @return {@code background} / {@code user}（缺省用户来源，不隐藏既有数据）
+     */
+    static String usageSourceOf(NotificationQueue.QueueItem cmd) {
+        boolean background = NotificationQueue.MODE_TASK_NOTIFICATION.equals(cmd.mode())
+            || NotificationQueue.WORKLOAD_CRON.equals(cmd.workload());
+        return background
+            ? com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_BACKGROUND
+            : com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER;
+    }
+
+    /**
      * 对齐 CC messageQueueManager.ts:538-547 isSlashCommand — value trim 后以 '/' 开头且
      * skipSlashCommands=false。skipSlashCommands=true（bridge/CCR 消息，textInputTypes.ts:320）
      * 时 '/'-开头按纯文本送模型，不走命令链 —— 本执行器判别必须与 NotificationQueue.isSlashCommand
@@ -1571,27 +1597,76 @@ public class CronIdleExecutor {
         //   —— 覆盖 busy-queued / cron / task-notification（子代理/后台任务完成后主 agent 处理回复用户可见，
         //   2026-08-27 联调修复）；headless（task-notification 会话已删 / DURABLE 已关 → sessionUuid=null）
         //   与全局（GLOBAL_SESSION_KEY）不推流（无前端会话可收）。
-        if (sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid) && wsTemplate != null) {
-            loop.setStreamContext(wsTemplate, cmd.sessionId(), cmd.uuid());
-            if (log.isInfoEnabled()) {
-                log.info("CronIdleExecutor: 真实会话注入 streamContext session={} userMsgId={} mode={} workload={}",
-                    cmd.sessionId(), cmd.uuid(), cmd.mode(), cmd.workload());
+        // [R1 · 通知类命令消费前落库 prompt user 行] 原实现只对 mode=prompt（cron / busy-queued）落库，
+        //   task-notification 的 cmd.uuid()=null ⇒ 该轮 prompt **不落库** ⇒ 本轮 assistant 行的
+        //   user_message_id 落成随机 UUID（实测库内 419 条悬挂链接，指向不存在的行）⇒ 重拉态无法判断
+        //   「这轮是后台来源」⇒ F5 后 footer 又被后台那轮 usage 顶掉（用户原始报障同形）。
+        //   现把通知类命令的 prompt 行落库（is_meta=true：后台来源 DB 判据 + UI 隐藏、模型可见），
+        //   并用落库后的真实 id 作本轮 userMessageId（setStreamContext / 实时落库 init 同源）⇒
+        //   本轮 assistant 行归链到该行。落点选本方法（**批量路径也经此处汇聚**，一处覆盖单条+批量）。
+        //   best-effort 不阻断 run（对齐 loop 内 prompt 落库分支的 catch 语义）。
+        //   ⚠️ 承重不变式（三值耦合，[F3] 就地写明）：本条新行的 id ≡ 本轮 streamContext 的
+        //   userMessageId（下方 setStreamContext(promptUserId)）≡ 实时落库 SPI 的 init
+        //   （armRealTimePersist(persistUserId)）。三者必须同源，否则：①本轮 prompt 会被
+        //   listForResumeExcluding(streamUserMessageId) 漏排除 ⇒ 同轮双注入（prompt 走 RunRequest
+        //   一次 + 历史重载一次）；②assistant 行归属链断回悬挂。改动任一值前先对齐三处。
+        String promptUserId = cmd.uuid();
+        if (NotificationQueue.MODE_TASK_NOTIFICATION.equals(cmd.mode())
+                && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)
+                && cmd.sessionId() != null && !cmd.sessionId().isBlank()
+                && messageService != null) {
+            try {
+                MessageCreatedResponse created = messageService.createQueuedUserMessage(
+                    cmd.sessionId(), cmd.uuid(), cmd.value(), OffsetDateTime.now(),
+                    true /* isMeta：后台来源（cron 调度 / 任务通知）→ 落 is_meta 列，重拉态来源判据 */);
+                if (created != null && created.userMessageId() != null) {
+                    promptUserId = created.userMessageId();
+                }
+                if (log.isInfoEnabled()) {
+                    log.info("CronIdleExecutor: [R1] 通知类 prompt 落库 user 行 session={} id={}（is_meta=true · "
+                            + "重拉态「后台来源」判据；本轮 assistant 行 user_message_id 归链到它）",
+                        cmd.sessionId(), promptUserId);
+                }
+            } catch (Exception e) {
+                log.warn("CronIdleExecutor: [R1] 通知类 prompt 落库失败 session={} uuid={}: {}"
+                        + "（best-effort：run 继续，仅该轮重拉态来源判据缺失）",
+                    cmd.sessionId(), cmd.uuid(), e.getMessage());
             }
+        }
+        // [D1 usage-source] 本 run 的 message.usage 来源标记：cron 调度 / 任务通知 = background
+        //   （不是用户自己的请求），busy-queued 用户排队消息 = user。前端底部「缓存% / 当前上下文」只统计
+        //   user 来源（实测 63% 的 message.usage 事件出自 cron-idle-* 线程，会把底部数字刷成后台任务的数）。
+        //   [R3-5] 与 setStreamContext 合并成**同一次调用**（4 参重载）⇒ 顺序契约结构上不存在
+        //   （原「先建流上下文、后打标」的顺序一旦写反会被静默复位）。
+        String usageSource = usageSourceOf(cmd);
+        if (sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid) && wsTemplate != null) {
+            // [R1] userMessageId 用落库后的真实 id（promptUserId；cron/busy 路径 == cmd.uuid()，
+            //   通知类 = 上面落库的 id）→ 本轮 assistant 行的 user_message_id 不再悬挂。
+            loop.setStreamContext(wsTemplate, cmd.sessionId(), promptUserId, usageSource);
+            if (log.isInfoEnabled()) {
+                log.info("CronIdleExecutor: 真实会话注入 streamContext session={} userMsgId={} mode={} workload={} usageSource={}",
+                    cmd.sessionId(), promptUserId, cmd.mode(), cmd.workload(), usageSource);
+            }
+        } else {
+            // headless / 全局：无 STOMP 流上下文（不推送 → 来源仅影响事件标记，仍打标以保语义一致）
+            loop.setStreamUsageSource(usageSource);
         }
         // [实时落库 2026-09-03] cron run 前武装实时落库 SPI（与主会话同一 ChatService.armRealTimePersist）：
         //   doRun 历史注入完成后回调 → setAppendListener，cron 轮 assistant/tool/snip_boundary 逐条实时落库
         //   （对齐 CC onFireTask 结果实时写 transcript）。门控三条件：真实会话（非 GLOBAL）/ chatService
-        //   注入 / loop.run 前。传 cmd.uuid()（=cron user 消息 id）作 DB user_message_id 归属根
-        //   （对齐原 replayAndPersist lastUserMessageId = cmd.uuid()）。cron 无 queued-user → user 分支天然跳过。
+        //   注入 / loop.run 前。[R1] init 传**落库后真实 id**（promptUserId；cron/busy 与 cmd.uuid() 同值，
+        //   通知类为上面落库的 id）作 DB user_message_id 归属根 —— 通知类原为 null ⇒ init 回落
+        //   state.lastUserMessageId()（=历史里用户自己那条）⇒ 本轮 assistant 行归错轮、重拉态被当 user。
         if (chatService != null && sessionUuid != null && !GLOBAL_SESSION_KEY.equals(sessionUuid)) {
             String persistTopic = "/topic/sessions/" + sessionUuid + "/stream";
             org.springframework.messaging.simp.SimpMessagingTemplate persistWs = wsTemplate;
+            final String persistUserId = promptUserId;   // lambda 捕获需 effectively final
             loop.setPostHistoryPersistEnabler(state ->
-                chatService.armRealTimePersist(state, sessionUuid, persistTopic, persistWs, cmd.uuid()));
+                chatService.armRealTimePersist(state, sessionUuid, persistTopic, persistWs, persistUserId));
             if (log.isInfoEnabled()) {
                 log.info("CronIdleExecutor: 实时落库 SPI 已武装 session={} userMsgId={} mode={}"
                         + "（对齐 CC onFireTask 逐条实时写 transcript）",
-                    sessionUuid, cmd.uuid(), cmd.mode());
+                    sessionUuid, persistUserId, cmd.mode());
             }
         }
         // [批 1 · 方向 C] 项目锚（boundProject）已在 req 上显式挂载（见上方 withBoundProject），

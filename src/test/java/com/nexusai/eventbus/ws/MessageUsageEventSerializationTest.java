@@ -67,6 +67,30 @@ class MessageUsageEventSerializationTest {
     }
 
     @Test
+    @DisplayName("[D1 usage-source] source 字段出站：user/background 原样；缺省 null → NON_NULL 省略（向后兼容）")
+    void serializesUsageSource() throws Exception {
+        MessageUsageDto usageDto = MessageUsageDto.from(new AgentUsage(1L, 2L, null, null, null, null, null), null);
+
+        MessageUsageEvent background = MessageUsageEvent.of("sess-1", "msg-u", "msg-a", usageDto,
+            1_048_576L, 10L, 99, MessageUsageEvent.SOURCE_BACKGROUND);
+        JsonNode bgRoot = mapper.readTree(mapper.writeValueAsString(background));
+        assertThat(bgRoot.get("source").asText())
+            .as("source=background（cron 调度 / 任务通知 run）→ 前端底部数字据此不计入")
+            .isEqualTo("background");
+
+        MessageUsageEvent user = MessageUsageEvent.of("sess-1", "msg-u", "msg-a", usageDto,
+            1_048_576L, 10L, 99, MessageUsageEvent.SOURCE_USER);
+        assertThat(mapper.readTree(mapper.writeValueAsString(user)).get("source").asText())
+            .as("source=user（用户自己的请求）").isEqualTo("user");
+
+        // 向后兼容：7 参 of（无来源）→ 字段省略（前端按 user 计，不隐藏既有数据）
+        MessageUsageEvent legacy = MessageUsageEvent.of("sess-1", "msg-u", "msg-a", usageDto,
+            1_048_576L, 10L, 99);
+        assertThat(mapper.readTree(mapper.writeValueAsString(legacy)).has("source"))
+            .as("缺省 source → NON_NULL 省略（旧行为逐位不变）").isFalse();
+    }
+
+    @Test
     @DisplayName("@JsonInclude(NON_NULL)：usage null → 省略；percentLeft null → 省略")
     void omitsNullFields() throws Exception {
         MessageUsageEvent evt = MessageUsageEvent.of("sess-1", "msg-u", "msg-a", null, 0L, 0L, null);

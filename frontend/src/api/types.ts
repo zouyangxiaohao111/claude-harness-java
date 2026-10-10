@@ -1064,6 +1064,9 @@ export interface ChatMessageDto {
   userMessageId?: string | null
   /** complete 事件透传：本轮真实 usage（snake_case · 无上报省略） */
   usage?: MessageUsageDto | null
+  /** [D1 usage-source] 本条 usage 的来源标记（message.usage 事件的 source 经流式块透传 · 只在前端内存，
+   *  不入 DB）：'user' / 'background'；缺省 = 按用户来源计（底部数字过滤用，见 utils/contextUsage）。 */
+  usageSource?: string | null
   /** complete 事件透传：会话累计花费（元） */
   totalCostUsd?: number | null
   /** complete 事件透传：按模型 usage 快照（会话累计） */
@@ -1258,6 +1261,10 @@ export interface MessageUsageEvent extends StreamEventBase {
   type: 'message.usage'
   /** 该条 assistant 消息 id；null = 会话级快照覆盖（见上） */
   assistantMessageId?: string | null
+  /** [D1 usage-source] 本条 usage 的来源标记（后端 MessageUsageEvent.source）：'user' = 用户自己的请求
+   *  （含 busy-queued 排队消息）；'background' = 后台来源（cron 调度 / 任务通知 run，非用户请求）。
+   *  ⚠️ 缺省（旧后端 / 未标记）= 按 'user' 计（展示侧不得静默隐藏既有数据）。 */
+  source?: string | null
   usage?: MessageUsageDto | null
   /** 模型上下文窗口（tokens · 模型原始 max_context_tokens，未命中回落 1_048_576） */
   contextWindow?: number | null

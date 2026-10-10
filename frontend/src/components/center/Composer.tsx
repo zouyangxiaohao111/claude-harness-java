@@ -17,7 +17,7 @@ import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
 import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
-import { resolveCtxInfo } from '@/utils/contextUsage'
+import { backgroundUsageFlowIds, isUserUsageSource, resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
@@ -240,7 +240,19 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   //   getCurrentUsage 找不到 → 指示器归零），否则会拿压缩前的值顶上来（数字不降）。
   const msgs = useChatStore((s) => (sessionId ? (s.messages[sessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES))
   const liveBlocks = useChatStore((s) => (sessionId ? (s.streams[sessionId] ?? EMPTY_BLOCKS) : EMPTY_BLOCKS))
-  const ctxInfo = useMemo(() => resolveCtxInfo([...msgs, ...liveBlocks]), [msgs, liveBlocks])
+  // [D1 usage-source] 底部数字只统计「用户自己的请求」：同会话后台任务（cron 调度 / 任务通知 run）
+  //   复用同一 stream topic 推 message.usage（实测 63% 事件出自 cron-idle-* 线程）→ 不过滤则
+  //   footer 的「缓存% / 当前上下文 / t/s」会被后台任务那轮顶掉（数字与用户操作无关地跳变）。
+  //   来源由后端打标（MessageUsageEvent.source），经块/消息的 usageSource 透传；缺省（旧帧/旧消息/
+  //   complete 兜底）按 user 计 —— 向后兼容，不得静默隐藏既有数据。
+  //   [R1 · F5/重拉态] DB 行没有 usageSource（实时事件才有）→ 用 DB 判据派生：后台来源 flow = 该轮
+  //   user 行 is_meta=true（cron/通知注入行，V51）。集合只依赖 msgs（user 行来自重拉），故 F5 后仍成立。
+  const backgroundFlows = useMemo(() => backgroundUsageFlowIds(msgs), [msgs])
+  const usageScan = useMemo(
+    () => [...msgs, ...liveBlocks].filter((x) => isUserUsageSource(x, backgroundFlows)),
+    [msgs, liveBlocks, backgroundFlows],
+  )
+  const ctxInfo = useMemo(() => resolveCtxInfo(usageScan), [usageScan])
   // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
   //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
   //   deepseek（openai 协议）：input_tokens 已含 cache hit（input==H+M），直接 cache_read / input
@@ -249,7 +261,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   //   取最近一条带 usage 的 assistant 消息（complete 事件 usage 透传 · tokenWarning.tokenUsage 仅 number 无缓存细分）
   const cacheRateInfo = useMemo(() => {
     const isClaudeProvider = (currentModel ?? '').split('/')[0].trim().toLowerCase() === 'anthropic'
-    const scanned = [...msgs, ...liveBlocks]
+    const scanned = usageScan
     for (let i = scanned.length - 1; i >= 0; i--) {
       const u = scanned[i]?.usage
       if (!u) continue
@@ -264,13 +276,14 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       }
     }
     return null
-  }, [msgs, liveBlocks, currentModel])
+  }, [usageScan, currentModel])
   // F4 · 最近一条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示）。
   //   扫描源 = [...msgs, ...liveBlocks]：live 块在 message.usage（assistant 流式结束）即挂 usage/decode_ms，
   //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。
   //   live 块无 role（隐含 assistant）；decode_ms 语义 = 首 token→完成整段计时，故速率是「每段输出收尾即跳」。
+  //   [D1 usage-source] 同源于 message.usage → 与缓存%/上下文条统一只统计 user 来源（底部数字口径一致）。
   const lastSpeedTs = useMemo(() => {
-    const scanned = [...msgs, ...liveBlocks] as Array<ChatMessageDto & StreamBlock>
+    const scanned = usageScan as Array<ChatMessageDto & StreamBlock>
     for (let i = scanned.length - 1; i >= 0; i--) {
       const m = scanned[i]
       if (m.role && m.role !== 'assistant') continue
@@ -279,7 +292,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       if (ot > 0 && dm > 0) return Math.round((ot * 1000) / dm)
     }
     return null
-  }, [msgs, liveBlocks])
+  }, [usageScan])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const highlightRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)

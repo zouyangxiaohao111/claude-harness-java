@@ -359,6 +359,19 @@ public class StreamingToolExecutor {
      * getCompletedResults() 非阻塞返回已 COMPLETED 工具, 已返回的不再重复. Set 用于 O(1) 去重.
      */
     private final Set<String> drainedIds = ConcurrentHashMap.newKeySet();
+
+    /**
+     * [fix-toolcall-fault A/R3] drain 顺序的 toolUseId 台账 —— 与
+     * {@link #getRemainingResultsStream()} / {@link #getCompletedResults()} /
+     * {@link #drainDiscardedRemaining()} 每次产出结果**同序同量**追加，供配对侧按 id
+     * 绑定「结果 ↔ 调用」。
+     *
+     * <p><b>WHY 必须有</b>：结果顺序 = **完成批序**（并行调用快者先出，批次内按 add 序），
+     * 未必等于 tool_calls 的 index 序；且幽灵槽（流式期未入队、派发前补 add）只能追加在尾部
+     * ⇒ 原「按位置配对」（AgentLoopContext:2179 IMP-C2 拍板）会把真调用的结果写到幽灵槽 id 下。
+     * 本台账让配对与顺序解耦（{@link ToolResult} 4 字段契约不存 toolUseId，故 id 只能在此记录）。
+     */
+    private final java.util.Queue<String> drainedIdOrder = new java.util.concurrent.ConcurrentLinkedQueue<>();
     /**
      * [R32-b15 C8] 待消费 progress 事件队列 · 对齐 CC StreamingToolExecutor.ts:407 pendingProgress.
      * LinkedBlockingQueue 保证多线程 enqueueProgress / peekPendingProgress 安全.
@@ -2711,6 +2724,28 @@ public class StreamingToolExecutor {
     }
 
     /**
+     * [fix-toolcall-fault A/R3] 已 drain 结果的 toolUseId 台账（drain 顺序）。
+     *
+     * <p>与 {@link #getRemainingResultsStream()} / {@link #getRemainingResults()} 本次产出
+     * **一一对应同序**（两者在同一 drain 循环里追加）；消费用法：
+     * {@code results.get(i)} 属于 {@code drainedToolUseIds().get(i)}。生产仅一次 drain
+     * （AgentLoopContext:1914/:1954 两条路径二选一），故调用时刻的台账即本次 results 的 id 序列。
+     *
+     * @return 不可变 id 列表（drain 顺序）
+     */
+    public java.util.List<String> drainedToolUseIds() {
+        return java.util.List.copyOf(drainedIdOrder);
+    }
+
+    /**
+     * [fix-toolcall-fault A/R3] 该 toolUseId 的工具是否已入队（流式回调已 add 过）。
+     * 供派发前 catch-up 补齐流式期未入队的调用（幽灵槽等）。
+     */
+    public boolean hasToolCall(String toolUseId) {
+        return toolUseId != null && tools.containsKey(toolUseId);
+    }
+
+    /**
      * [Session F ALI-1] 惰性版 getRemainingResults · 对齐 CC
      * {@code Open-ClaudeCode/src/services/tools/StreamingToolExecutor.ts:453-490}
      * getRemainingResults() AsyncGenerator 逐条 yield 语义.
@@ -2857,7 +2892,9 @@ public class StreamingToolExecutor {
                 // 未知类型 → 防御性 fallback (sealed 已收窄, 理论不可达)
                 drained.add(ToolResult.error(t.call.id(), "unknown result type"));
             }
+            // [fix-toolcall-fault A/R3] id 台账与结果同序同量追加（配对侧按 id 绑定）
             drainedIds.add(t.call.id());
+            drainedIdOrder.add(t.call.id());
         }
         if (log.isDebugEnabled()) {
             log.debug("TOOL drainDiscardedRemaining: 补齐 discarded 残留结果={}",
@@ -2905,7 +2942,9 @@ public class StreamingToolExecutor {
                     // 未知类型 → 防御性 fallback (sealed 已收窄, 理论不可达)
                     drained.add(ToolResult.error(t.call.id(), "unknown result type"));
                 }
+                // [fix-toolcall-fault A/R3] id 台账与结果同序同量追加（配对侧按 id 绑定）
                 drainedIds.add(t.call.id());
+                drainedIdOrder.add(t.call.id());
             } else if (t.status == Status.EXECUTING && !t.isConcurrencySafe) {
                 // [Session F ALI-1] CC 保序 break (StreamingToolExecutor.ts:436-438):
                 //   非并发安全工具执行中 → 其后的工具结果不越过它 yield (保持 add 序,

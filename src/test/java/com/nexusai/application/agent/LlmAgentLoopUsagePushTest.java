@@ -103,6 +103,33 @@ class LlmAgentLoopUsagePushTest {
     }
 
     @Test
+    @DisplayName("[D1 usage-source] state 的来源标记透传到事件：background（cron/通知 run）/ 缺省 user（用户自己的请求）")
+    void carriesUsageSourceFromState() {
+        SimpMessagingTemplate ws = Mockito.mock(SimpMessagingTemplate.class);
+        AgentLoopContext ctx = ctx(ws, modelMapper, providerMapper);
+        AgentState state = newState();
+        AgentUsage usage = new AgentUsage(10L, 5L, null, null, null, null, null);
+        AssistantMessage msg = new AssistantMessage("回复", "stop", List.of(), null, null, usage);
+
+        // 缺省（用户请求路径未标记）→ user
+        assertThat(state.usageSource())
+            .as("缺省来源 = user（旧调用方零改动，不是 background）").isEqualTo("user");
+        LlmAgentLoop.publishMessageUsage(ctx, state, "deepseek-v4-flash", "msg-u", "a-1", msg, null);
+        ArgumentCaptor<Object> payload1 = ArgumentCaptor.forClass(Object.class);
+        verify(ws).convertAndSend(eq("topic"), payload1.capture());
+        assertThat(((MessageUsageEvent) payload1.getValue()).getSource()).isEqualTo("user");
+
+        // 后台来源（CronIdleExecutor 对 cron/任务通知 run 打标）→ background
+        state.setUsageSource("background");
+        LlmAgentLoop.publishMessageUsage(ctx, state, "deepseek-v4-flash", "msg-u", "a-2", msg, null);
+        ArgumentCaptor<Object> payload2 = ArgumentCaptor.forClass(Object.class);
+        verify(ws, Mockito.times(2)).convertAndSend(eq("topic"), payload2.capture());
+        assertThat(((MessageUsageEvent) payload2.getAllValues().get(1)).getSource())
+            .as("后台任务 run 的 usage 必须带 background → 前端底部数字不计入（实测 63% 事件出自 cron-idle 线程）")
+            .isEqualTo("background");
+    }
+
+    @Test
     @DisplayName("无 ws（非流式/单测）→ 跳过推送但 runUsage 仍累计（complete 口径不依赖流式通道）")
     void noWsStillAccumulatesRunUsage() {
         AgentLoopContext ctx = ctx(null, modelMapper, providerMapper);

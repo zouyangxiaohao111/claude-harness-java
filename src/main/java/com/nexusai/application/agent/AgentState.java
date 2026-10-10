@@ -229,6 +229,26 @@ public class AgentState {
     private final List<InjectedQueuedMessage> injectedQueuedMessages = new ArrayList<>();
 
     /**
+     * [D1 usage-source] 本 run 的 message.usage 来源标记（值域见 {@code MessageUsageEvent.SOURCE_*}）：
+     * {@code "user"}（缺省）= 用户自己的请求（含 busy-queued 排队消息）；{@code "background"} = 后台来源
+     * （CronIdleExecutor 起的 cron 调度 / 任务通知 run）。
+     *
+     * <p><b>WHY 放在 per-run 的 AgentState</b>：来源是「本 run 是谁发起的」这一 run 级属性，与
+     * {@code usage-push} 的推送时点一一对应；{@code publishMessageUsage(ctx, state, …)} 已持有 state
+     * ⇒ 无需改事件工厂的 3 个调用点签名（也不引入新的跨层通道）。生产写入链 = {@code LlmAgentLoop.doRun}
+     * 建 state 后按 loop 实例字段盖章；该字段的**主写入面**是
+     * {@code setStreamContext(ws, sessionId, userMessageId, usageSource)} 4 参重载（[R3-5]：来源与流
+     * 上下文同一次调用写入，CronIdleExecutor 的 cron/通知 run 走它打 {@code background}）；仅
+     * headless/全局无流分支走低层 {@code setStreamUsageSource}。此外 {@code doRun} 之后，
+     * mid-turn drain 会按**本轮注入项**再改写本值（逐轮 sticky：cron/通知/coordinator/channel →
+     * background，busy-queued → user，普通 prompt 不改写）。
+     *
+     * <p>默认值恒 {@code "user"}：旧调用方 / 未打标路径（单测、VerifyChatController、fork）零改动，
+     * 语义 = 用户来源（前端据此计入底部数字，不隐藏既有数据）。
+     */
+    private String usageSource = com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER;
+
+    /**
      * [mid-turn-align] 单条 mid-turn 注入的排队 user 消息（uuid = 队列命令 id，content = 原始文本，可空串）。
      *
      * <p>[P0-1 OD-1/OD-3] 3 参扩展 + queuedOrigin（排队来源标记）：queuedOrigin 供 ChatService 落库
@@ -733,6 +753,29 @@ public class AgentState {
     }
     /** OD-11 对齐 CC 无默认: null = 无限轮 (CC query.ts:190 不设默认值) */
     public Integer maxTurns() { return maxTurns; }
+
+    /**
+     * [D1 usage-source] 本 run 的 usage 来源标记（恒非 null，缺省 {@code "user"}）。
+     *
+     * <p>消费点 = {@code LlmAgentLoop.publishMessageUsage} → {@code MessageUsageEvent.source} →
+     * 前端底部数字只统计 {@code "user"}（见 {@code front/src/utils/contextUsage.ts#isUserUsageSource}）。
+     */
+    public String usageSource() { return usageSource; }
+
+    /**
+     * [D1 usage-source] 写本 run 的 usage 来源标记（生产写点 = {@code LlmAgentLoop.doRun} 建 state 后
+     * 按 loop 实例字段盖章；打标入口 = {@code LlmAgentLoop.setStreamUsageSource}，由 CronIdleExecutor
+     * 对 cron 调度 / 任务通知命令置 {@code "background"}）。
+     *
+     * <p>null / blank → 保持缺省 {@code "user"}（防御：不把「没来源」写成 null 语义，
+     * 见 {@link com.nexusai.eventbus.ws.MessageUsageEvent#SOURCE_USER}）。
+     *
+     * @param source 来源标记（null / blank → 回落 "user"）
+     */
+    public void setUsageSource(String source) {
+        this.usageSource = (source == null || source.isBlank())
+            ? com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER : source;
+    }
     public boolean needsFollowUp() { return needsFollowUp; }
     public boolean cancelled() { return cancelled; }
     public String lastError() { return lastError; }

@@ -1853,17 +1853,20 @@ public class LlmAgentLoop implements AgentLoop {
             com.nexusai.eventbus.ws.MessageUsageEvent.of(
                 ctx.streamSessionId(), userMessageId, assistantMessageId,
                 com.nexusai.eventbus.ws.MessageUsageDto.from(usage, decodeMs),
-                snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft());
+                snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft(),
+                // [D1 usage-source] run 级来源标记（state 盖章 · 缺省 "user"）→ 前端底部数字只统计 user 来源
+                state.usageSource());
         ws.convertAndSend(topic, event);
         if (log.isInfoEnabled()) {
             // [OBS2] 补打 topic：usage 与 chunk 走的是同一个 stream topic（ctx.streamTopic()），
             //   这行日志是判断「通道有没有问题」的承重前提 —— 只有带上 topic 才能把「后端推哪去了」
             //   与前端订阅/收帧对齐（配 WebSocketDeliveryDiagnostics 的 [ws-deliver] 汇总段读）。
             log.info("[usage-push] STOMP → topic={} type=message.usage asst={} usage(input={},output={},cacheRead={},cacheCreate={}) "
-                    + "ctx(window={},used={},pct={}) · CC claude.ts:2244-2248",
+                    + "ctx(window={},used={},pct={}) source={}（D1：前端底部数字只统计 user 来源）· CC claude.ts:2244-2248",
                 topic, assistantMessageId, usage.inputTokens(), usage.outputTokens(),
                 usage.cacheReadInputTokens(), usage.cacheCreationInputTokens(),
-                snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft());
+                snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft(),
+                state.usageSource());
         }
     }
 
@@ -1902,6 +1905,17 @@ public class LlmAgentLoop implements AgentLoop {
      *  对齐 CC LocalMainSessionTask bgMessages 进 query({messages})；真子代理（fork 自有上下文，
      *  不调 LlmAgentLoop.run，SubagentExecutor.java:2015）恒 false 不注入。 */
     private boolean backgroundSessionTask;
+    /**
+     * [D1 usage-source] 本 run 的 message.usage 来源标记 · 默认 {@code "user"}（用户自己的请求）。
+     * CronIdleExecutor 对 cron 调度 / 任务通知命令在 run 前经 {@link #setStreamUsageSource} 置
+     * {@code "background"} → doRun 建 state 后盖章到 {@code AgentState.usageSource}
+     * （publishMessageUsage 据此写事件 source；前端底部数字只统计 user 来源）。
+     *
+     * <p>写入面（[R3-5] 合并后无顺序契约）：生产走 {@code setStreamContext(..., usageSource)} 4 参重载
+     * （与流上下文同一次调用写入，顺序不可能写反）；{@link #setStreamUsageSource} 为低层单点入口
+     * （已无生产调用方，保留给测试/后续调用者）。
+     */
+    private String streamUsageSource = com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER;
 
     /**
      * [C1 收口] 本 run 是否为「该会话的交互式用户回合」—— <b>队长 inbox 消费资格的唯一判据</b>。
@@ -2093,12 +2107,34 @@ public class LlmAgentLoop implements AgentLoop {
             org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate,
             String streamSessionId,
             String streamUserMessageId) {
+        setStreamContext(wsTemplate, streamSessionId, streamUserMessageId, null);
+    }
+
+    /**
+     * [R3-5 · usage-source 合并入口] 流上下文 + 本 run 的 {@code message.usage} 来源**同一次调用**写入。
+     *
+     * <p><b>WHY（为什么合并而不是两个 setter）</b>：原实现是「3 参 setStreamContext（内部复位来源为
+     * user）+ 独立 {@link #setStreamUsageSource}」—— 顺序写反（先打标后建流上下文）会让来源被静默复位，
+     * 且失败形态不可见（事件 source 恒 user、前端底部数字照旧被后台任务污染）。合并后顺序<b>结构上
+     * 不可能写错</b>（值随调用直传，同一条语句），顺序契约从"注释纪律"降级为"不存在"。
+     *
+     * @param usageSource {@code MessageUsageEvent.SOURCE_*}；null/blank → 缺省 {@code user}
+     *                    （= 原 3 参重载语义，前台主路径逐位不变）
+     */
+    public void setStreamContext(
+            org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate,
+            String streamSessionId,
+            String streamUserMessageId,
+            String usageSource) {
         this.wsTemplate = wsTemplate;
         this.streamSessionId = streamSessionId;
         this.streamUserMessageId = streamUserMessageId;
         // [fix-loop-resume-history] 前台主线程路径显式复位后台标志（prototype scope 每请求新实例，
         // 防御性：复用实例时防残留上次后台任务标志污染注入门控）。
         this.backgroundSessionTask = false;
+        // [D1 usage-source] 来源随流上下文一并写入（防御性：不传 → 缺省 user，等价原复位语义）。
+        this.streamUsageSource = (usageSource == null || usageSource.isBlank())
+            ? com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER : usageSource;
         // [streamTopic-session-level] 会话级单 topic（对齐 CC 会话单一事件流，query.ts 单会话单流）：
         //   assistant 消息 id（msg_ 串）由 SDK/loop 生成并经事件下发，不在 topic 编码。
         this.streamTopic = (streamSessionId != null)
@@ -2109,6 +2145,31 @@ public class LlmAgentLoop implements AgentLoop {
         if (log.isDebugEnabled()) {
             log.debug("[LlmAgentLoop] stream context 已设置: ws={} session={} userMsg={} topic={}",
                 wsTemplate != null, streamSessionId, streamUserMessageId, streamTopic);
+        }
+    }
+
+    /**
+     * [D1 usage-source] 写本 run 的 message.usage 来源标记（{@code MessageUsageEvent.SOURCE_*} 值域）。
+     *
+     * <p><b>WHY</b>：CronIdleExecutor 的空闲消费 run（cron 调度 / 任务通知）复用会话 stream topic 推
+     * message.usage，但<b>不是用户自己的请求</b>（实测 63% 事件出自 cron-idle-* 线程）→ 前端底部
+     * 「缓存% / 当前上下文」被后台任务那轮顶掉。来源在 run 前显式打标（值随调用直传，不经 ThreadLocal）。
+     *
+     * <p>[R3-5] 有流上下文的路径已改走 {@code setStreamContext(..., usageSource)} 4 参重载（来源与流
+     * 上下文同一次写入 ⇒ 无顺序契约）。本方法现存**一个**生产调用方：CronIdleExecutor 的
+     * headless / 全局会话分支（{@code sessionUuid==null || GLOBAL} —— 无 STOMP 流上下文、不建流环境，
+     * 故无"被复位"顺序风险）；在该分支里它是唯一写入面。若将来有人在本类实例上<b>先</b>调本方法、
+     * <b>后</b>调 3 参 {@code setStreamContext}，来源会被后者复位为缺省 user（见其 javadoc）——
+     * 新调用方请直接用 4 参重载。
+     *
+     * @param source {@code "user"} / {@code "background"}（null / blank → 不接受，回落缺省 user）
+     */
+    public void setStreamUsageSource(String source) {
+        this.streamUsageSource = (source == null || source.isBlank())
+            ? com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER : source;
+        if (log.isDebugEnabled()) {
+            log.debug("[D1 usage-source] 本 run usage 来源标记: source={} session={}（前端底部数字只统计 user 来源）",
+                this.streamUsageSource, this.streamSessionId);
         }
     }
 
@@ -2582,6 +2643,10 @@ public class LlmAgentLoop implements AgentLoop {
         // PR 4: 构造 state 时传入 sessionId/agentId，供 PermissionContextBuilder 使用
         // [RES-SP31] 透传 appendSystemPrompt（RunRequest → AgentState，OPD-SP-31 接线）
         AgentState state = new AgentState(systemPrompt, sessionId, agentId, appendSystemPrompt);
+        // [D1 usage-source] 本 run 的 usage 来源盖章（loop 实例字段 → per-run state；publishMessageUsage
+        //   据此写事件 source，前端底部数字只统计「用户自己的请求」）。前台/单测/fork 路径该字段恒缺省
+        //   "user"（行为零变化）；只有 CronIdleExecutor 对 cron 调度 / 任务通知 run 显式置 "background"。
+        state.setUsageSource(this.streamUsageSource);
         // [sm-boundary-reload] turn 级压缩标记复位 = 本 run「首个 state 可用处」：
         //   run(RunRequest) 方法体入口只有 params（state 在 doRun 此处才构造）⇒ 落点选这里。
         //   ⚠️ 如实：当前每 run 新建 AgentState（turnCompacted 初始即 false）⇒ 本复位恒为 no-op。
@@ -9740,6 +9805,9 @@ public class LlmAgentLoop implements AgentLoop {
             if (foldEnd >= 0) {
                 // 折叠段 [i, foldEnd]（N≥2 连续 completed bash 通知）：单条 user 消息 + 单条 attachment。
                 int foldSize = foldEnd - i + 1;
+                // [D1/R1 usage-source · 逐轮] 折叠段 = 后台命令完成通知（task-notification）→ 本来源标记为
+                //   background（与单条 task-notification 注入同一判据，见下方 queuedOrigin 段的注释）。
+                state.setUsageSource(com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_BACKGROUND);
                 // [P0-1 C6 折叠适配] 折叠合成消息 content 只存 "N background commands completed"
                 //   （去 TASK_NOTIFICATION_PREFIX —— 发送层 task-notification 分支会加一次前缀，此处
                 //   再加会二次前缀）；明细留 background_task_notification attachment（模型仍可见完成明细）。
@@ -9818,6 +9886,19 @@ public class LlmAgentLoop implements AgentLoop {
                 queuedOrigin = "task-notification";
             } else {
                 queuedOrigin = null;   // turn-0 prompt（非排队）
+            }
+            // [D1/R1 usage-source · 逐轮（sticky）] 本轮 message.usage 的来源随**注入项**切换：
+            //   后台注入项（cron 调度 / 任务通知 / coordinator / channel）→ background；
+            //   busy-queued（用户自己排的队）→ user；turn-0 / 普通 prompt **不盖章**（保持 run 级来源 ——
+            //   CronIdleExecutor 起的 cron/通知 run 的"本轮 prompt"必须保持 background）。
+            //   WHY 逐轮而非仅 run 级：一轮 assistant 的 usage 归属的是「触发它的那条注入」，
+            //   与重拉态判据（该轮 user 行 is_meta=true → background）同语义 ⇒ live 与 F5 后一致
+            //   （否则同一状态刷新前后 footer 数字会跳变）。sticky 语义：下一条注入才改变来源，
+            //   注入项触发的后续工具轮沿用同一来源（该轮工作仍属该触发）。
+            if (busyQueued) {
+                state.setUsageSource(com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER);
+            } else if (cron || coordinator || channel || !prompt) {
+                state.setUsageSource(com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_BACKGROUND);
             }
             String content = item.value();   // 原文 RAW（壳留给发送层；turn-0 本就原文）
             // [P0-1 OD-D3/D4] isMeta 新公式：item.isMeta() 现算 ‖ coordinator/channel/cron
@@ -12542,7 +12623,11 @@ public class LlmAgentLoop implements AgentLoop {
         java.util.Map<String, String> assistantIdByToolUseId,
         // [IMP-C2] 每组 toolUseId → isError（ToolResult 4 字段契约删除 isError 字段，
         //   由执行器在错误路径推导后经本通道透传 mapper，组 2-1 拍板）
-        java.util.Map<String, Boolean> resultErrorFlags
+        java.util.Map<String, Boolean> resultErrorFlags,
+        // [fix-toolcall-fault A/R3] results 的 toolUseId 序列（与 results 同序同量 ·
+        //   StreamingToolExecutor.drainedToolUseIds）—— 配对侧据此**按 id** 绑定结果↔调用，
+        //   免受「结果顺序=完成批序」与「幽灵槽补 add 追加在尾部」造成的错配（IMP-C2 位置配对缺陷）。
+        java.util.List<String> resultToolUseIds
     ) {}
 
     /**

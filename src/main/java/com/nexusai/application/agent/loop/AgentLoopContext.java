@@ -1918,12 +1918,13 @@ public record AgentLoopContext(
                 log.error("AgentLoopContext tool await failed", e);
                 streamingExec.applyDeferredContextModifiers(perTurnTuc);
                 return new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(List.of(),
-                    java.util.Map.copyOf(state.assistantIdByToolUseId()), java.util.Map.of());
+                    java.util.Map.copyOf(state.assistantIdByToolUseId()), java.util.Map.of(), List.of());
             }
             streamingExec.applyDeferredContextModifiers(perTurnTuc);
             outcome = new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(results,
                 java.util.Map.copyOf(state.assistantIdByToolUseId()),
-                streamingExec.getResultErrorFlags());
+                streamingExec.getResultErrorFlags(),
+                streamingExec.drainedToolUseIds());
             if (log.isInfoEnabled()) {
                 log.info("AgentLoopContext runTools [streaming]: results={} lineageSize={}",
                     outcome.results().size(), outcome.assistantIdByToolUseId().size());
@@ -1934,7 +1935,7 @@ public record AgentLoopContext(
             StreamingToolExecutor exec = buildStreamingExecutor(ctx, perTurnTuc, state, turnAssistantId,
                 extendedHandler, true /* deferredModifier */, agentOptions, assistantMessage, canUseTool);
             if (exec == null) {
-                return new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(List.of(), java.util.Map.of(), java.util.Map.of());
+                return new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(List.of(), java.util.Map.of(), java.util.Map.of(), List.of());
             }
             for (ToolUseBlock call : toolCalls) {
                 state.bindToolUseIdToAssistantId(call.id(), turnAssistantId);
@@ -1958,18 +1959,48 @@ public record AgentLoopContext(
                 log.error("AgentLoopContext tool execution failed", e);
                 exec.applyDeferredContextModifiers(perTurnTuc);
                 return new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(List.of(),
-                    java.util.Map.copyOf(state.assistantIdByToolUseId()), java.util.Map.of());
+                    java.util.Map.copyOf(state.assistantIdByToolUseId()), java.util.Map.of(), List.of());
             }
             exec.applyDeferredContextModifiers(perTurnTuc);
             outcome = new com.nexusai.application.agent.LlmAgentLoop.ToolRunOutcome(results,
                 java.util.Map.copyOf(state.assistantIdByToolUseId()),
-                exec.getResultErrorFlags());
+                exec.getResultErrorFlags(),
+                exec.drainedToolUseIds());
             if (log.isInfoEnabled()) {
                 log.info("AgentLoopContext runTools [fallback]: results={} lineageSize={}",
                     outcome.results().size(), outcome.assistantIdByToolUseId().size());
             }
         }
         return outcome;
+    }
+
+    /**
+     * [fix-toolcall-fault A/R3] 结果↔调用**按 toolUseId** 配对（静态缝 Pattern #14）。
+     *
+     * <p>{@code results} 与 {@code resultIds} 同序同量（{@code StreamingToolExecutor.drainedToolUseIds}
+     * 契约）。为什么不能按位置：①drain 顺序 = 完成批序（并行调用快者先出），未必等于 tool_calls 的
+     * index 序；②幽灵槽（流式期不入队）经 catch-up 补 add 只能落在尾部。任一情况下位置配对都会把
+     * A 调用的结果写到 B 调用 id 下（内容错配）。
+     *
+     * @param results   执行器结果（drain 顺序）
+     * @param resultIds 与 results 同序的 toolUseId（缺/短 → 该结果无主，交由配对侧补 synthetic error）
+     * @return toolUseId → 结果（LinkedHashMap；重复 id 只留首个）
+     */
+    static java.util.Map<String, com.nexusai.application.agent.tool.ToolResult> pairResultsByToolUseId(
+            java.util.List<com.nexusai.application.agent.tool.ToolResult> results,
+            java.util.List<String> resultIds) {
+        java.util.Map<String, com.nexusai.application.agent.tool.ToolResult> byId =
+            new java.util.LinkedHashMap<>();
+        if (results == null) {
+            return byId;
+        }
+        for (int i = 0; i < results.size(); i++) {
+            String rid = resultIds != null && i < resultIds.size() ? resultIds.get(i) : null;
+            if (rid != null) {
+                byId.putIfAbsent(rid, results.get(i));
+            }
+        }
+        return byId;
     }
 
     /**
@@ -2112,6 +2143,26 @@ public record AgentLoopContext(
         ForkSubagentMessages.Message forkAssistantMessage =
             LlmAgentLoop.toForkAssistantMessage(turnAssistantId, msg);
         if (streamingExec != null && streamingExec.size() > 0) {
+            // [fix-toolcall-fault A/R3] **catch-up add**：流式期未入队的 tool_calls（幽灵槽哨兵名
+            //   等 isComplete() 恒 false 的槽）在派发前补齐 —— 否则 results 少一项 ⇒ 该调用只能拿
+            //   "Tool result missing" 合成错误（而非 CC 同形的 No such tool available），且结果-调用
+            //   错配（见下方按 id 配对）。复用 fallback 分支同款 add 循环语义（:1939-1949）。
+            int catchUp = 0;
+            for (ToolUseBlock call : msg.toolCalls()) {
+                if (streamingExec.hasToolCall(call.id())) {
+                    continue;
+                }
+                state.bindToolUseIdToAssistantId(call.id(), turnAssistantId);
+                com.nexusai.application.agent.tool.ToolParent catchUpParent =
+                    com.nexusai.application.agent.tool.ToolParent.of(turnAssistantId);
+                streamingExec.add(call, catchUpParent, onToolProgress);
+                catchUp++;
+            }
+            if (catchUp > 0) {
+                log.warn("AgentLoopContext handleToolCallsTurn catch-up add: {} 个 tool_call 流式期未入队"
+                        + "（幽灵槽/不完整槽）→ 派发前补齐 (calls={} exec.size={})",
+                    catchUp, msg.toolCalls().size(), streamingExec.size());
+            }
             outcome = runTools(ctx, perTurnTuc, state, msg.toolCalls(), turnAssistantId, streamingExec,
                 (er, id) -> ToolResultApplier.apply(er, state.rawMessages(), state, id),
                 subagentOptions, forkAssistantMessage, onToolProgress, canUseTool);
@@ -2171,34 +2222,39 @@ public record AgentLoopContext(
         for (ToolUseBlock call : msg.toolCalls()) {
             toolNameById.put(call.id(), call.name());
         }
-        // [IMP-C2] 结果-调用配对改按 add 顺序（ToolResult 已删除 toolUseId 字段，组 2-1 拍板）：
-        //   getRemainingResultsStream 按 add 顺序 yield 结果，与 msg.toolCalls() 同序配对。
-        //   aborted_tools 路径在 results 尾部追加 synthetic error（对齐 CC query.ts:1485-1515，
-        //   该路径 results 数量可能 > toolCalls，尾部 synthetic 无对应 call，跳过配对）。
-        int resultIdx = 0;
+        // [fix-toolcall-fault A/R3] 结果-调用配对改**按 toolUseId**（IMP-C2 位置配对缺陷修复）：
+        //   ⛔ 原「按 add 顺序位置配对」在两种情况下会串内容：①results 顺序 = **完成批序**
+        //   （并行调用快者先出；见 StreamingToolExecutor.drainNextBatch → getCompletedResults），
+        //   未必等于 tool_calls 的 index 序；②幽灵槽（流式期不入队）经 catch-up 补 add 只能落在尾部。
+        //   ToolResult 4 字段契约不存 toolUseId ⇒ id 由执行器 drain 时按同序记录
+        //   （StreamingToolExecutor.drainedToolUseIds）经 ToolRunOutcome 透传。
+        //   aborted_tools 路径在 results 尾部追加 synthetic error（对齐 CC query.ts:1485-1515）——
+        //   按 id 配对时尾部多余结果自然无对应 call（不再需要位置豁免）。
+        java.util.List<String> resultIds = outcome.resultToolUseIds();
+        java.util.Map<String, com.nexusai.application.agent.tool.ToolResult> resultById =
+            pairResultsByToolUseId(results, resultIds);
         for (ToolUseBlock call : msg.toolCalls()) {
-            if (resultIdx >= results.size()) {
-                // [fix-toolcalls-400 B] 配对防御：执行器结果数 < tool_calls 数（如混合批里空参工具
-                //   未被流式回调加入，见根因 1.1）时不再静默 break —— 为每个未覆盖 tool_call 生成
-                //   synthetic error tool_result，保证每个 tool_call 都有 tool 响应。否则 state.rawMessages()
-                //   变 [assistant(N calls), tool(S<N results)] → OpenAI 400 "insufficient tool messages
-                //   following tool_calls message"（对齐 CC yieldMissingToolResultBlocks query.ts:123-149，
+            com.nexusai.application.agent.tool.ToolResult r = resultById.remove(call.id());
+            if (r == null) {
+                // [fix-toolcalls-400 B] 配对防御：该 tool_call 无执行器结果（空参工具未入队 /
+                //   catch-up 也补不上等）时为它生成 synthetic error tool_result，保证每个 tool_call
+                //   都有 tool 响应。否则 state.rawMessages() 变 [assistant(N calls), tool(S<N results)]
+                //   → OpenAI 400 "insufficient tool messages following tool_calls message"
+                //   （对齐 CC yieldMissingToolResultBlocks query.ts:123-149，
                 //   handleModelFallback:7368-7380 同款；turnAssistantId = CC sourceToolAssistantUUID 等价位）。
-                log.warn("AgentLoopContext handleToolCallsTurn 配对缺口: toolCalls={} results={} → 对剩余 {} 个 tool_call 生成 synthetic error tool_result",
-                    msg.toolCalls().size(), results.size(), msg.toolCalls().size() - resultIdx);
-                for (int k = resultIdx; k < msg.toolCalls().size(); k++) {
-                    ToolUseBlock orphan = msg.toolCalls().get(k);
-                    state.appendMessage(LlmAgentLoop.toolResultMessage(
-                        com.nexusai.application.agent.tool.ToolResult.error(orphan.id(), "Tool result missing"),
-                        orphan.id(), true, null, turnAssistantId, null, List.of(), List.of(), Map.of()));
-                    traceEmit(ctx, new com.nexusai.application.agent.diff.TraceEvent(
-                        com.nexusai.application.agent.diff.TraceEvent.Kind.TOOL_RESULT,
-                        orphan.name(), System.currentTimeMillis(),
-                        java.util.Map.of("id", orphan.id(), "isError", true)));
-                }
-                break;
+                log.warn("AgentLoopContext handleToolCallsTurn 配对缺口: toolUseId={} 无执行器结果 → "
+                        + "synthetic error tool_result (calls={} results={} ids={})",
+                    call.id(), msg.toolCalls().size(), results.size(),
+                    resultIds != null ? resultIds.size() : -1);
+                state.appendMessage(LlmAgentLoop.toolResultMessage(
+                    com.nexusai.application.agent.tool.ToolResult.error(call.id(), "Tool result missing"),
+                    call.id(), true, null, turnAssistantId, null, List.of(), List.of(), Map.of()));
+                traceEmit(ctx, new com.nexusai.application.agent.diff.TraceEvent(
+                    com.nexusai.application.agent.diff.TraceEvent.Kind.TOOL_RESULT,
+                    call.name(), System.currentTimeMillis(),
+                    java.util.Map.of("id", call.id(), "isError", true)));
+                continue;
             }
-            com.nexusai.application.agent.tool.ToolResult r = results.get(resultIdx++);
             String toolName = call.name();
             // [G2] 按 toolName 解析 Tool 实例（per-turn TUC 可用工具表 + alias 兜底），
             // toolResultMessage 经 per-tool mapToToolResultBlockParam 构造 tool_result 块

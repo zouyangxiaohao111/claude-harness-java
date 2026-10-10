@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { TOKEN_WARNING_TEXT, resolveCtxInfo, tokenWarningBannerText } from '../contextUsage'
+import { TOKEN_WARNING_TEXT, backgroundUsageFlowIds, isUserUsageSource, resolveCtxInfo, tokenWarningBannerText } from '../contextUsage'
 import type { TokenWarningEvent } from '../../api/types'
 
 /**
@@ -58,6 +58,64 @@ describe('resolveCtxInfo · 快照口径（唯一权威）', () => {
       { contextTokensUsed: null, contextWindow: null, percentLeft: null },
       { contextTokensUsed: undefined, contextWindow: undefined },
     ])).toBeNull()
+  })
+})
+
+describe('isUserUsageSource · 底部数字只统计「用户自己的请求」（D1 后台任务污染修复）', () => {
+  it('source=background（cron 调度 / 任务通知 run 的 message.usage）→ 不计入（WHY：实测 63% 事件出自 cron-idle 线程，会把底部缓存%/上下文刷成后台任务的数）', () => {
+    expect(isUserUsageSource({ usageSource: 'background' })).toBe(false)
+  })
+
+  it('source=user → 计入（用户自己的请求，含 busy-queued 排队消息）', () => {
+    expect(isUserUsageSource({ usageSource: 'user' })).toBe(true)
+  })
+
+  it('缺省/未知/null → 计入（向后兼容：旧帧无该字段、旧消息无标记、complete 兜底 —— 不得隐藏既有数据）', () => {
+    expect(isUserUsageSource({})).toBe(true)
+    expect(isUserUsageSource({ usageSource: null })).toBe(true)
+    expect(isUserUsageSource({ usageSource: undefined })).toBe(true)
+    expect(isUserUsageSource(null)).toBe(true)
+    expect(isUserUsageSource(undefined)).toBe(true)
+  })
+
+  it('显式来源优先于派生：usageSource=user 的行即使链接到 is_meta=true 的 user 行也照常计入（live 事件比 DB 派生准）', () => {
+    const bg = backgroundUsageFlowIds([{ id: 'u-bg', role: 'user', isMeta: true }])
+    expect(isUserUsageSource({ usageSource: 'user', userMessageId: 'u-bg' }, bg)).toBe(true)
+    expect(isUserUsageSource({ usageSource: 'background', userMessageId: 'u-user' }, bg)).toBe(false)
+  })
+})
+
+describe('backgroundUsageFlowIds + 派生过滤 · F5/重拉态（DB 行无 usageSource 时的判据）', () => {
+  it('后台 flow = 该轮 user 行 is_meta=true 的 id（cron 调度 / 任务通知的注入行）', () => {
+    const set = backgroundUsageFlowIds([
+      { id: 'u-user', role: 'user', isMeta: false },
+      { id: 'u-cron', role: 'user', isMeta: true },
+      { id: 'a-1', role: 'assistant', isMeta: false },   // assistant 行不参与
+      { id: null, role: 'user', isMeta: true },          // 无 id → 跳过
+    ])
+    expect([...set]).toEqual(['u-cron'])
+  })
+
+  it('重拉态：assistant 行无 usageSource 但 userMessageId 指向 is_meta=true 行 → 不计入（后台轮）', () => {
+    type RowLike = {
+      id?: string | null; role?: string | null; isMeta?: boolean | null
+      userMessageId?: string | null; usageSource?: string | null
+    }
+    const list: RowLike[] = [
+      { id: 'u-user', role: 'user', isMeta: false },
+      { id: 'u-bg', role: 'user', isMeta: true },                 // cron/通知注入行（DB V51 is_meta）
+      { id: 'a-bg', role: 'assistant', userMessageId: 'u-bg' },   // 该后台轮的 assistant 行
+    ]
+    const set = backgroundUsageFlowIds(list)
+    expect(isUserUsageSource(list[2], set)).toBe(false)
+    expect(isUserUsageSource(list[1], set)).toBe(true)            // user 行自身仍算用户来源（无 userMessageId 链接）
+    expect(isUserUsageSource({ userMessageId: 'u-user' }, set)).toBe(true)
+  })
+
+  it('无 set / 空 set（live 块或未传）→ 行为与旧实现逐位一致（缺省计入）', () => {
+    expect(isUserUsageSource({ userMessageId: 'u-bg' })).toBe(true)
+    expect(isUserUsageSource({ userMessageId: 'u-bg' }, new Set())).toBe(true)
+    expect(isUserUsageSource({ userMessageId: 'u-bg' }, backgroundUsageFlowIds([]))).toBe(true)
   })
 })
 

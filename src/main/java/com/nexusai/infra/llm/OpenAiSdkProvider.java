@@ -1468,7 +1468,15 @@ public class OpenAiSdkProvider implements LlmProvider {
                         toolCall.type = tc.type().get().toString();
                     }
                     tc.function().ifPresent(fn -> {
-                        fn.name().ifPresent(n -> toolCall.name = n);
+                        // [fix-toolcall-fault A] 仅非空才覆盖 name：OpenAI 协议 name 只在首块给一次；
+                        //   上游（vLLM 实测）偶发后续块重复发 name:""/空白 → 旧实现 ifPresent 直接覆盖
+                        //   会把已到的真名抹成空 → 造出幽灵槽（整回合死的另一条成因路径）。
+                        //   name 是"写入即定"身份字段（不像 arguments 需跨块拼接），空值无信息量。
+                        fn.name().ifPresent(n -> {
+                            if (n != null && !n.isBlank()) {
+                                toolCall.name = n;
+                            }
+                        });
                         fn.arguments().ifPresent(a -> toolCall.args += a);
                     });
                 }
@@ -1499,8 +1507,11 @@ public class OpenAiSdkProvider implements LlmProvider {
         //   守卫保证不双发（A-1 已发过的进不了）。
         if (state.finishReason != null && onToolCallComplete != null && completedToolIds != null) {
             for (OpenAiToolCallAccumulator acc : state.toolCalls.values()) {
-                boolean hasIdentity = acc.id != null && !acc.id.isEmpty()
-                    && acc.name != null && !acc.name.isEmpty();
+                // [fix-toolcall-fault A · R4] 口径统一：身份判据用 isBlank()（与
+                //   accumulator.isComplete() / ToolUseBlock 构造器三处同源），原 isEmpty()
+                //   会放行纯空白 id/name 进补发回调。
+                boolean hasIdentity = acc.id != null && !acc.id.isBlank()
+                    && acc.name != null && !acc.name.isBlank();
                 if (hasIdentity && !acc.isComplete() && completedToolIds.add(acc.id)) {
                     onToolCallComplete.accept(acc.toBlock());
                     if (log.isDebugEnabled()) {

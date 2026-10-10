@@ -5,7 +5,8 @@ import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete,
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
-import type { StreamEvent, TaskEvent, SessionStatusEvent, SessionTitleEvent, TeamStatusEvent, TeammateMessageEvent, TodoItem } from '../api/types'
+import type { StreamEvent, TaskEvent, TaskEventUsage, SessionStatusEvent, SessionTitleEvent, TeamStatusEvent, TeammateMessageEvent, TodoItem } from '../api/types'
+import type { SubagentUsageStat } from '../utils/subagentStats'
 import type { SessionFile } from '../types'
 import { useTeamStore } from '../stores/teamStore'
 import { useTodoStore } from '../stores/todoStore'
@@ -92,6 +93,21 @@ function extractWorkerName(description: string | null | undefined): string | nul
   const from = /来自\s*([A-Za-z0-9_.-]+)/.exec(description)
   if (from) return from[1]
   return null
+}
+
+/**
+ * [D2/D3] task 事件 usage（wire snake_case）→ store 的 camelCase 统计（缺字段不臆造 0）。
+ *
+ * <p>来源 = {@code SdkEventQueue.TaskUsage}{@code {total_tokens, tool_uses, duration_ms}}
+ * （task_progress 进度累计 / task_notification 终态）。全缺 → null（展示侧显示「统计不可用」）。
+ */
+function taskUsageOf(u: TaskEventUsage | null | undefined): SubagentUsageStat | null {
+  if (!u) return null
+  const totalTokens = u.total_tokens ?? null
+  const toolUses = u.tool_uses ?? null
+  const durationMs = u.duration_ms ?? null
+  if (totalTokens == null && toolUses == null && durationMs == null) return null
+  return { totalTokens, toolUses, durationMs }
 }
 
 /**
@@ -683,7 +699,12 @@ export function useChatSocket(
         // 写入子代理活动历史（任务 tab 点开时间线可见）；不弹 toast（避免刷屏）
         const taskId = evt.task_id ?? evt.uuid ?? null
         if (taskId) {
-          useSubagentStore.getState().addActivity(taskId, { type: 'progress', text: evt.summary ?? '…', toolName: evt.last_tool_name, ts: Date.now() }, evt.session_id ?? sessionIdRef.current ?? undefined)
+          const sid = evt.session_id ?? sessionIdRef.current ?? undefined
+          useSubagentStore.getState().addActivity(taskId, { type: 'progress', text: evt.summary ?? '…', toolName: evt.last_tool_name, ts: Date.now() }, sid)
+          // [D2/D3] 进度 usage（tokens/调用次数/耗时 · 后端 AgentProgressTracker 逐消息累计）→ 卡片统计行实时
+          //   [R3-4] onlyIfRunning：终态后到达的进度（乱序/补投）不得覆盖终态权威值
+          const usage = taskUsageOf(evt.usage)
+          if (usage) useSubagentStore.getState().setUsage(taskId, usage, sid, { onlyIfRunning: true })
         }
         break
       }
@@ -691,11 +712,15 @@ export function useChatSocket(
         const taskId = evt.task_id ?? evt.uuid ?? null
         // 终态写入活动历史（保留卡片供查看，不 forget）
         if (taskId) {
+          const sid = evt.session_id ?? sessionIdRef.current ?? undefined
           useSubagentStore.getState().addActivity(taskId, {
             type: evt.status === 'failed' ? 'failed' : evt.status === 'stopped' ? 'stopped' : 'done',
             text: evt.summary ?? evt.output_file ?? '…',
             ts: Date.now(),
-          }, evt.session_id ?? sessionIdRef.current ?? undefined)
+          }, sid)
+          // [D2/D3] 终态 usage → 卡片/弹窗展示「已消耗」（失败/中止同样显示）
+          const usage = taskUsageOf(evt.usage)
+          if (usage) useSubagentStore.getState().setUsage(taskId, usage, sid)
         }
         // 任务终态 → 居中 toast（对齐「打开会话」提示）
         if (showToast) showToast(`任务${evt.status === 'failed' ? '失败' : evt.status === 'stopped' ? '已停止' : '完成'}：${evt.summary ?? evt.output_file ?? '…'}`, 'info')
@@ -784,6 +809,8 @@ export function useChatSocket(
           contextTokensUsed: evt.contextTokensUsed ?? null,
           contextWindow: evt.contextWindow ?? null,
           percentLeft: evt.percentLeft ?? null,
+          // [D1 usage-source] 来源标记透传到块（底部数字只统计「用户自己的请求」；缺省按 user 计）
+          usageSource: evt.source ?? null,
         })
       }
     } else if (isComplete(evt)) {

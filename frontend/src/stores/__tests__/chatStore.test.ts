@@ -229,6 +229,33 @@ describe('chatStore message.usage 逐块挂载 + finalize 逐块优先', () => {
     expect(m?.contextTokensUsed).toBe(3000)
     expect(m?.contextWindow).toBe(200000)
   })
+
+  it('usageSource 逐块挂载 + finalize 透传到消息（WHY：D1 底部数字只统计「用户自己的请求」—— 来源必须跟着 usage 一路到消息，否则后台任务 run 的快照仍会被当成用户的最新一条）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().appendChunk('sess-1', 'turn-a', 'A')
+    s.getState().applyMessageUsage('sess-1', 'turn-a', {
+      usage: { input_tokens: 100, output_tokens: 10 },
+      contextTokensUsed: 100, contextWindow: 200000, percentLeft: 99,
+      usageSource: 'background',
+    })
+    const b = s.getState().streams['sess-1']?.[0]
+    expect(b?.usageSource).toBe('background')
+
+    s.getState().finalizeBlocks('sess-1')
+    const m = s.getState().messages['sess-1']?.[0]
+    expect(m?.usageSource).toBe('background')
+  })
+
+  it('usageSource 缺省（旧帧 / 旧消息）保持「无值」—— 展示侧按「用户来源」计（不得臆造 background 隐藏数据）', () => {
+    const s = createChatStore()
+    s.getState().ensureStreamBlock('sess-1', 'turn-a')
+    s.getState().applyMessageUsage('sess-1', 'turn-a', { usage: { input_tokens: 1, output_tokens: 1 } })
+    expect(s.getState().streams['sess-1']?.[0]?.usageSource).toBeUndefined()
+    s.getState().finalizeBlocks('sess-1')
+    // 块转消息的字段一律 `?? null`（与相邻 usage/totalCostUsd 同款）→ 无来源 = null（非 'background'）
+    expect(s.getState().messages['sess-1']?.[0]?.usageSource ?? null).toBeNull()
+  })
 })
 
 describe('chatStore streamTicks（[chat-switch-stream-align] 流式活动节拍 · 滚底按会话隔离）', () => {

@@ -584,6 +584,41 @@ class StreamingToolExecutorDispatchTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // [fix-toolcall-fault A] 幽灵槽哨兵名 → CC 同形容错路径
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("[fix-toolcall-fault A] 幽灵槽哨兵名进执行器 → No such tool available error 结果（回合继续，CC StreamingToolExecutor.ts:77-102）")
+    void add_malformedSentinelName_returnsNoSuchToolAvailable_errorResult() throws Exception {
+        // WHY（规则九 · 验证意图）: 幽灵 tool_call 槽（上游 vLLM name 恒 null）经
+        //   OpenAiSdkProvider → OpenAiToolCallAccumulator.toBlock() 映射哨兵名后，必须走到
+        //   CC 同形容错路径：查不到工具 → is_error=true 的 tool_result
+        //   「No such tool available: {name}」→ 回喂模型自纠、<b>回合继续</b>（不得杀死回合）。
+        //   本用例锁定"哨兵名 ⇒ 该 error 结果"两半的接头（上半在
+        //   OpenAiSdkProviderMalformedToolCallTest；此处为下半：执行器真实产出）。
+        ExecutorService pool = Executors.newFixedThreadPool(4);
+        ToolRegistry registry = new ToolRegistry(); // 空注册表 = 任何名字都查不到（等价哨兵名情形）
+        StreamingToolExecutor exec = new StreamingToolExecutor(registry, pool, context());
+        exec.add(call("ghost-1",
+            com.nexusai.infra.llm.OpenAiToolCallAccumulator.MALFORMED_TOOL_CALL_NAME));
+        List<ToolResult> results = exec.getRemainingResults();
+        pool.shutdown();
+
+        assertThat(results).as("哨兵名调用必须产出 1 条结果（error，不是静默丢弃）").hasSize(1);
+        assertThat(LlmAgentLoop.isToolErrorData(results.get(0).data()))
+            .as("对齐 CC StreamingToolExecutor.ts:77-102 的 is_error:true（CC 外层还包 <tool_use_error> 壳，"
+                + "本仓沿用既有文案，语义等价）").isTrue();
+        assertThat(String.valueOf(results.get(0).data()))
+            .as("对齐本仓既有 unknown-tool 文案（与 CC StreamingToolExecutor.ts:91 的 "
+                + "`No such tool available: ${name}` 语义等价，非逐字节含壳）")
+            .isEqualTo("No such tool available: "
+                + com.nexusai.infra.llm.OpenAiToolCallAccumulator.MALFORMED_TOOL_CALL_NAME);
+        assertThat(exec.drainedToolUseIds())
+            .as("[fix-toolcall-fault A/R3] drain id 台账与结果同序同量（配对侧按 id 绑定）")
+            .containsExactly("ghost-1");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // 辅助
     // ════════════════════════════════════════════════════════════════════
 

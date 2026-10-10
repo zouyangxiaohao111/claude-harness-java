@@ -55,6 +55,25 @@ public final class AsyncAgentFinalizer {
     }
 
     /**
+     * [fix-toolcall-fault B] 失败终态路由 · 对齐 CC runAsyncAgentLifecycle catch →
+     * {@code failAsyncAgent(taskId, msg)} + 通知 {@code status:'failed'} / {@code error:msg}
+     * (agentToolUtils.ts:670-681)。
+     *
+     * <p><b>WHY 独立入口（而非复用 {@link #finalize}）</b>：{@code finalize} 对非 null result
+     * 一律走 {@code completeAsyncAgent}（写 COMPLETED）—— 失败的 async agent 会被掩成"完成"
+     * （CC 的失败通道是 {@code failAsyncAgent}，不是 complete）。失败必须落 FAILED 才能让父 Agent
+     * 看到 {@code <status>failed</status>} + error 文案。
+     *
+     * @param taskId task id (= agentId.toString())
+     * @param error  错误描述（写入 task.error + outputFile + 终态通知 failed 段）
+     */
+    public void finalizeFailed(String taskId, String error) {
+        log.info("AsyncAgentFinalizer: 写入失败结果 task={} errLen={}",
+            taskId, error != null ? error.length() : 0);
+        runner.failAsyncAgent(taskId, error);
+    }
+
+    /**
      * killed 三态路由 · 对齐 CC runAsyncAgentLifecycle AbortError 路径 (agentToolUtils.ts:640-668).
      *
      * <p>killAsyncAgent (CC killAsyncAgent) 原子推进 KILLED + enqueue killed 通知; 幂等

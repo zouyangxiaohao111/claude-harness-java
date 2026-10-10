@@ -12,7 +12,10 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 /**
  * [S4] runAsyncAgentLifecycle 三态通知 RED-GREEN 双证测试 (P1 差异项 6).
@@ -189,5 +192,22 @@ class RunAsyncAgentLifecycleTest {
         finalizer.finalize("agent-1", null);
 
         verify(runner).failAsyncAgent("agent-1", "null result");
+    }
+
+    @Test
+    @DisplayName("[fix-toolcall-fault B] AsyncAgentFinalizer.finalizeFailed → failAsyncAgent（真 FAILED 通道 · CC :671）")
+    void asyncAgentFinalizer_finalizeFailed_shouldCallFailAsyncAgent() {
+        // WHY（规则九 · 验证意图）: 失败的 async agent 必须以 FAILED 终态收尾（CC failAsyncAgent
+        //   agentToolUtils.ts:671 + 通知 status:'failed' + error:msg :673-681）。既有 finalize()
+        //   对非 null result 一律走 completeAsyncAgent（写 COMPLETED）—— 失败的 async agent 会被
+        //   掩成"完成"（用户报障"没干成活"的可见形态之一）。本用例锁定真失败通道可达：
+        //   路由到 failAsyncAgent(taskId, error)，error 原文透传。
+        BackgroundTaskRunner runner = mock(BackgroundTaskRunner.class);
+        AsyncAgentFinalizer finalizer = new AsyncAgentFinalizer(runner);
+
+        finalizer.finalizeFailed("agent-1", "OpenAI SDK 流式调用失败: boom");
+
+        verify(runner).failAsyncAgent("agent-1", "OpenAI SDK 流式调用失败: boom");
+        verify(runner, never()).completeAsyncAgent(eq("agent-1"), any());
     }
 }

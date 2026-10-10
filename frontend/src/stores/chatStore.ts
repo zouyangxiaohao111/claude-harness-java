@@ -61,6 +61,10 @@ export interface StreamBlock {
   contextWindow?: number | null
   /** message.usage 事件逐条挂载：上下文剩余百分比（块内优先） */
   percentLeft?: number | null
+  /** [D1 usage-source] 该条 usage/快照的来源（message.usage 事件 source 逐条挂载）：
+   *  'user' = 用户自己的请求 / 'background' = 后台任务 run（cron 调度 / 任务通知）。
+   *  底部数字（缓存% / 当前上下文）只统计 user 来源（见 utils/contextUsage.isUserUsageSource）。 */
+  usageSource?: string | null
 }
 
 /** 会话流式 API 错误（message.error 事件 → 对话流助手位置错误卡渲染 · 对齐 CC assistant API error 语义） */
@@ -190,6 +194,8 @@ export interface ChatState {
     contextTokensUsed?: number | null
     contextWindow?: number | null
     percentLeft?: number | null
+    /** [D1 usage-source] 该条 usage 的来源标记（事件 source · 底部数字按来源过滤用） */
+    usageSource?: string | null
   }) => void
   /** complete 收口：流式块转 assistant 消息（id=turnAssistantId · 与后端同源后即 DB 权威 id），清空流式块 */
   /** 块级流式收口 → 块转消息；meta 可选（complete 事件透传 reasoningDurationMs + token usage/cost/上下文快照，无则 null） */
@@ -466,6 +472,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       contextTokensUsed: meta.contextTokensUsed ?? next[idx].contextTokensUsed,
       contextWindow: meta.contextWindow ?? next[idx].contextWindow,
       percentLeft: meta.percentLeft ?? next[idx].percentLeft,
+      // [D1 usage-source] 来源随 usage 挂载（缺省 undefined = 按用户来源计，见 isUserUsageSource）
+      usageSource: meta.usageSource ?? next[idx].usageSource,
     }
     return { streams: { ...st.streams, [sessionId]: next } }
   }),
@@ -488,7 +496,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       apiError: null, error: null, errorDetails: null, matchedRule: null,
       // 逐块优先：块内 usage/上下文快照（message.usage 实时挂载）→ 回落 complete meta
       //   （turn 累计 usage 只兜底纯工具轮/旧后端无 message.usage 的块）
-      usage: b.usage ?? meta.usage ?? null, totalCostUsd: meta.totalCostUsd ?? null,
+      usage: b.usage ?? meta.usage ?? null,
+      // [D1 usage-source] 来源随块转消息（底部数字按来源过滤；complete meta 无来源字段 → 缺省 undefined = user）
+      usageSource: b.usageSource ?? null, totalCostUsd: meta.totalCostUsd ?? null,
       modelUsage: meta.modelUsage ?? null,
       contextTokensUsed: b.contextTokensUsed ?? meta.contextTokensUsed ?? null,
       percentLeft: b.percentLeft ?? meta.percentLeft ?? null,

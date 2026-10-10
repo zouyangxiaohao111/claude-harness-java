@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.29] - 2026-10-10
+
+### 修复
+- 修复子代理工具调用容错与统计显示的bug。
+
 ## [0.1.28] - 2026-10-09
 
 ### 修复

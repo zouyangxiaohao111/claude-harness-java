@@ -3345,6 +3345,14 @@ public class SubagentTool implements Tool {
                                 res.summaryText(), res.usage(), res.totalTokens(),
                                 res.totalDurationMs(), ag.toString());
                             finalizer.finalizeKilled(ag.toString(), killed);
+                        } else if ("failed".equals(res.status())) {
+                            // [fix-toolcall-fault B] 错误退出（结论=错误文本）→ 走真 FAILED 通道
+                            //   （对齐 CC failAsyncAgent agentToolUtils.ts:671-681：task 落 failed
+                            //   + 通知 status:'failed' + error:msg）。旧实现无此分支 → 失败的
+                            //   async agent 被写成 COMPLETED（父 Agent 看到"完成"的空话）。
+                            log.warn("Async subagent {} 失败: agentId={} err={}",
+                                sel.agentType(), ag, res.summaryText());
+                            finalizer.finalizeFailed(ag.toString(), res.summaryText());
                         } else {
                             log.info("Async subagent {} 完成: agentId={}", sel.agentType(), ag);
                             // [Phase A 任务 6] 成功路径: 走 AsyncAgentFinalizer 写入 COMPLETED
@@ -3360,10 +3368,11 @@ public class SubagentTool implements Tool {
                         log.error("Async subagent {} 失败: {}", sel.agentType(), e.getMessage());
                         // [Phase A 任务 6] 失败路径: 同样走 AsyncAgentFinalizer (失败结果)
                         // summary 字段作为错误描述写入 outputFile
-                        AsyncAgentResult failure = AsyncAgentResult.failure(
-                            "Subagent " + sel.agentType() + " failed: " + e.getMessage(),
-                            ag.toString());
-                        finalizer.finalize(ag.toString(), failure);
+                        // [fix-toolcall-fault B] 改走 finalizeFailed：旧路径 finalize(非 null result)
+                        //   内部是 completeAsyncAgent → 写 COMPLETED（失败被掩成完成）。CC 同场景
+                        //   catch → failAsyncAgent + status:'failed'（agentToolUtils.ts:670-681）。
+                        finalizer.finalizeFailed(ag.toString(),
+                            "Subagent " + sel.agentType() + " failed: " + e.getMessage());
                     } finally {
                         // P0-2 修复: 异步线程结束时清理 tracker key, 阻止 sessionCwd map 无界增长.
                         //   [acc8 复核 · 理由已更正] 原注释写「避免 activeSessionCount 单调递增」——
@@ -3860,6 +3869,11 @@ public class SubagentTool implements Tool {
                         res.summaryText(), res.usage(), res.totalTokens(),
                         res.totalDurationMs(), ag.toString());
                     finalizer.finalizeKilled(ag.toString(), killed);
+                } else if ("failed".equals(res.status())) {
+                    // [fix-toolcall-fault B] resume 路径同三态：错误退出 → 真 FAILED 通道（CC :671）
+                    log.warn("[SubagentTool] Resume async agent {} 失败: agentId={} err={}",
+                        sel.agentType(), ag, res.summaryText());
+                    finalizer.finalizeFailed(ag.toString(), res.summaryText());
                 } else {
                     log.info("[SubagentTool] Resume async agent {} 完成: agentId={}", sel.agentType(), ag);
                     AsyncAgentResult success = AsyncAgentResult.success(
@@ -3870,10 +3884,9 @@ public class SubagentTool implements Tool {
                 }
             } catch (Exception e) {
                 log.error("[SubagentTool] Resume async agent {} 失败: {}", sel.agentType(), e.getMessage(), e);
-                AsyncAgentResult failure = AsyncAgentResult.failure(
-                    "Subagent " + sel.agentType() + " resume failed: " + e.getMessage(),
-                    ag.toString());
-                finalizer.finalize(ag.toString(), failure);
+                // [fix-toolcall-fault B] 同主路径：异常 → finalizeFailed（旧 finalize 会写 COMPLETED）
+                finalizer.finalizeFailed(ag.toString(),
+                    "Subagent " + sel.agentType() + " resume failed: " + e.getMessage());
             }
         }, "resume-subagent-" + ag);
         asyncWorker.setDaemon(true);

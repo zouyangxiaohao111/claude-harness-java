@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { SettingsTab, Project, SessionFile } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
 import { workflowApi } from '@/api/workflows'
@@ -9,6 +9,7 @@ import type { AgentTranscriptMessage, Schedule, ScheduleKind, WorkflowRunDto } f
 import { useSchedules } from '@/hooks/useSchedules'
 import { cronToHuman } from '@/components/modals/SchedulesPanel'
 import { useSubagentStore, type SubagentIdentity } from '@/stores/subagentStore'
+import { formatDurationMs, formatSubagentStat } from '@/utils/subagentStats'
 import { TeamPanel } from '@/components/right/TeamPanel'
 import { TodoPanel } from '@/components/right/TodoPanel'
 import { AsyncTasksPanel } from '@/components/right/AsyncTasksPanel'
@@ -36,6 +37,28 @@ function SubagentCard({ id, onKill, sessionId }: {
   const [open, setOpen] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
   const statusLabel = id.status === 'running' ? '运行中' : id.status === 'done' ? '已完成' : id.status === 'failed' ? '失败' : '已停止'
+  // [D3] 统计行：运行中按【本地已耗时】实时累加（事件的 duration_ms 停在事件到达那一刻，会僵住）；
+  //   终态用事件给的值（失败/中止同样显示已消耗）。无任何统计 → 「统计不可用」。
+  //   [R2] 本地耗时与 usage **解耦**：后端 task_progress（唯一带 usage 的进度事件）默认被
+  //   sdkAgentProgressSummariesEnabled（@Value 默认 false）门掉 ⇒ 运行期通常没有 usage ⇒
+  //   若耗时依赖 usage，则整个运行期显示「统计不可用」而本地计时是死代码。故运行中**无 usage 也**
+  //   显示实时已耗时（「已运行 Xs」），「统计不可用」只留给「非运行中且无 usage」。
+  //   [R3-3] 冷启动恢复的 running（id.restored）不计时：其结束时间未知，计时会显示假时长。
+  const ticking = id.status === 'running' && !id.restored
+  const [nowTs, setNowTs] = useState(() => Date.now())
+  useEffect(() => {
+    if (!ticking) return
+    const timer = setInterval(() => setNowTs(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [ticking])
+  const startedAt = id.activities[0]?.ts ?? null
+  const liveDurationMs = ticking && startedAt != null ? Math.max(0, nowTs - startedAt) : null
+  const statsText = useMemo(() => {
+    if (!id.usage) {
+      return liveDurationMs != null ? `已运行 ${formatDurationMs(liveDurationMs)}` : null
+    }
+    return formatSubagentStat({ ...id.usage, durationMs: liveDurationMs ?? id.usage.durationMs })
+  }, [id.usage, liveDurationMs])
   return (
     <div className={`subagent-card ${id.status}${open ? ' open' : ''}`} onClick={() => setOpen((v) => !v)}>
       <div className="sc-head">
@@ -53,6 +76,8 @@ function SubagentCard({ id, onKill, sessionId }: {
           <path d="M2 4L6 8L10 4" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </div>
+      {/* [D3] 统计行（新增）：33.6k tokens · 5 次调用 · 39.5s */}
+      <div className="sc-stats">{statsText ?? '统计不可用'}</div>
       {open && (
         <div className="sc-timeline">
           {id.activities.map((a, i) => (

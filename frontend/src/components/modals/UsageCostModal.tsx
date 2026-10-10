@@ -1,10 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useChatStore } from '@/stores/chatStore'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { sessionApi } from '@/api/sessions'
 import { statsApi } from '@/api/stats'
 import type { ChatMessageDto, StatsByModel, StatsResponse } from '@/api/types'
 import { compactNumber } from '@/utils/format'
+import { failureReasonOf, subagentListOfSession, useSubagentStore } from '@/stores/subagentStore'
+import { SUBAGENT_STATUS_LABEL, formatSubagentStat } from '@/utils/subagentStats'
 
 /** 千位以上紧凑显示（按模型明细/上下文条用 · 对齐 ContextAnalyzeModal fmt） */
 const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
@@ -185,6 +187,14 @@ export function UsageCostModal({
   // 全部会话合计：sessions 表累计值求和（只读展示 · 对齐「所有会话」行式，金额 accent 色）
   const totalCostSum = sessions.reduce((acc, s) => acc + (s.totalCostYuan ?? 0), 0)
   const totalTokensSum = sessions.reduce((acc, s) => acc + (s.totalTokens ?? 0), 0)
+  // [D2] 子代理（本会话）：身份来自 subagentStore（task_started 登记 / task_progress·task_notification
+  //   补 usage），统计行展示口径 = utils/subagentStats 单点。⚠️ selector 只取 bySession 原引用，
+  //   派生列表走 useMemo —— 直接在选择器里返回新数组会导致 zustand 无限重渲染（仓内既有坑）。
+  const subagentBySession = useSubagentStore((s) => s.bySession)
+  const subagents = useMemo(
+    () => subagentListOfSession(subagentBySession, activeSessionId),
+    [subagentBySession, activeSessionId],
+  )
 
   return (
     <div className="uc-backdrop" onClick={onClose}>
@@ -303,6 +313,28 @@ export function UsageCostModal({
                 </div>
               </div>
             )}
+          </div>
+
+          {/* [D2] 子代理（本会话）· 只新增区块：每行 = 名字 · 状态 · tokens · 调用次数 · 时长；
+              失败行附失败原因小字（无原因文本时不渲染那行）。数据源 = /topic/tasks 的 task 事件 usage。 */}
+          <div className="uc-section">
+            <div className="uc-section-title">子代理（本会话）</div>
+            {subagents.length === 0 && <div className="uc-muted">暂无子代理记录</div>}
+            {subagents.map((sub) => {
+              const stats = formatSubagentStat(sub.usage)
+              const reason = failureReasonOf(sub)
+              return (
+                <div key={sub.taskId ?? sub.name} className="uc-subagent-item">
+                  <div className="uc-row">
+                    <span className="uc-name" title={sub.name}>@{sub.name}</span>
+                    <span className="uc-tokens">
+                      {SUBAGENT_STATUS_LABEL[sub.status]} · {stats ?? '统计不可用'}
+                    </span>
+                  </div>
+                  {reason && <div className="uc-subagent-reason">失败原因：{reason}</div>}
+                </div>
+              )
+            })}
           </div>
           </>
           )}

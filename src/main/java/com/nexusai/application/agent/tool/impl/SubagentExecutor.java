@@ -182,7 +182,8 @@ public class SubagentExecutor {
      * @param totalToolUseCount 工具调用计数 (CC totalToolUseCount)
      * @param totalDurationMs   总耗时 ms (CC totalDurationMs)
      * @param agentId           子 Agent UUID
-     * @param status            completed / aborted (CC status)
+     * @param status            completed / aborted / failed (CC status)；[fix-toolcall-fault B]
+     *                          failed = 错误退出且无 assistant 文本（结论=错误文本，async 走 FAILED 通道）
      * @param totalTokens       总 token 数 (CC totalTokens, agentToolUtils.ts:237/319)
      * @param usage             usage 对象 (CC usage, agentToolUtils.ts:238-256)
      */
@@ -213,6 +214,23 @@ public class SubagentExecutor {
                                              String agentId, long totalTokens, AgentUsage usage) {
             return new SubagentResult(summary, toolUseCount, durationMs, agentId,
                 "aborted", totalTokens, Objects.requireNonNull(usage, "SubagentResult.usage 必填（对齐 CC usage 非空）"));
+        }
+
+        /**
+         * [fix-toolcall-fault B] 失败终态 · status="failed"（对齐 CC async 生命周期
+         * {@code failAsyncAgent} → 通知 {@code status:'failed'}，agentToolUtils.ts:671-681）。
+         *
+         * <p>{@code summary} 承载错误文本（CC 失败通知的 {@code error} 段同源）—— async 路由据此
+         * 走 {@code AsyncAgentFinalizer.finalizeFailed} 落 FAILED（而非被掩成 COMPLETED）。
+         */
+        public static SubagentResult failed(String summary, int toolUseCount, long durationMs, String agentId) {
+            return failed(summary, toolUseCount, durationMs, agentId, 0L, AgentUsage.EMPTY);
+        }
+
+        public static SubagentResult failed(String summary, int toolUseCount, long durationMs,
+                                            String agentId, long totalTokens, AgentUsage usage) {
+            return new SubagentResult(summary, toolUseCount, durationMs, agentId,
+                "failed", totalTokens, Objects.requireNonNull(usage, "SubagentResult.usage 必填（对齐 CC usage 非空）"));
         }
     }
 
@@ -2609,6 +2627,15 @@ public class SubagentExecutor {
                         bookendStatus = "failed";
                     } else if ("aborted".equals(loopResult.status())) {
                         bookendStatus = "stopped";
+                    } else if ("failed".equals(loopResult.status())) {
+                        // [fix-toolcall-fault B · 返工 R2] 真零产出（CC throw 家族）→ SDK bookend 同步 failed。
+                        //   CC 真源 AgentTool.tsx:1167-1183 的判据是 **syncAgentError**：
+                        //   :1174 `status: syncAgentError ? 'failed' : wasAborted ? 'stopped' : 'completed'`
+                        //   ——syncAgentError 由 sync catch 路径（:1223-1252）置位，与本仓
+                        //   "failed 状态 = 零产出 throw 家族" 语义同源（CC query 内的错误 yield 成
+                        //   assistant 消息 ⇒ 不进 syncAgentError ⇒ completed，见 resolveFinalConclusion）。
+                        //   否则面板/前端收到 completed 与真实失败相矛盾。
+                        bookendStatus = "failed";
                     } else {
                         bookendStatus = "completed";
                     }
@@ -2774,12 +2801,18 @@ public class SubagentExecutor {
 
         // ── Step 22: extract conclusion ──
         String conclusion = loopResult != null ? loopResult.summaryText() : null;
-        boolean wasAborted = loopResult != null && "aborted".equals(loopResult.status());
+        // [fix-toolcall-fault B / 返工 R1] **状态保真**：loopResult 的三态逐态传出，
+        //   ⛔ 不得塌缩。原实现 `wasAborted ? aborted(...) : completed(...)` 把
+        //   runSubagentQueryLoop 产出的 "failed" 吞回 completed ⇒ SubagentTool 的 failed 分支
+        //   （finalizeFailed）与 SDK bookend 的 failed 分支**在生产不可达**（修复不生效）。
+        String loopStatus = loopResult != null ? loopResult.status() : null;
+        boolean wasAborted = "aborted".equals(loopStatus);
+        boolean wasFailed = "failed".equals(loopStatus);
         if (conclusion == null || conclusion.isBlank()) {
-            conclusion = "Subagent completed without final answer.";
+            conclusion = SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER;
         }
         log.info("[SubagentExecutor] Step 22: 子 Agent 结束, status={} conclusionLength={}",
-                wasAborted ? "aborted" : "completed", conclusion.length());
+                loopStatus != null ? loopStatus : "completed", conclusion.length());
 
         // s06 P1-2 修补: 返回结构化 SubagentResult (对齐 CC AgentTool.tsx:1253-1260)
         // [Phase A 任务 3] 真实 totalToolUseCount 透传 · 直接复用 loopResult.totalToolUseCount(),
@@ -2848,7 +2881,9 @@ public class SubagentExecutor {
         //   query/error/success，:196/:304/:463，无子代理边界事件）；此处仅保留 Step 22 结果组装。
         return wasAborted
                 ? SubagentResult.aborted(conclusion, toolUseCount, durationMs, agentIdStr, totalTokens, usage)
-                : SubagentResult.completed(conclusion, toolUseCount, durationMs, agentIdStr, totalTokens, usage);
+                : wasFailed
+                    ? SubagentResult.failed(conclusion, toolUseCount, durationMs, agentIdStr, totalTokens, usage)
+                    : SubagentResult.completed(conclusion, toolUseCount, durationMs, agentIdStr, totalTokens, usage);
     }
 
     /**
@@ -5151,9 +5186,30 @@ public class SubagentExecutor {
                             fallbackToolUseCount,
                             subagentCtx, fallbackText);
                 }
-                return subagentCtx.abortController().isCancelled()
-                        ? SubagentResult.aborted(fallbackText, fallbackToolUseCount, 0L, agentIdHex, fallbackTokens, fallbackUsage)
-                        : SubagentResult.completed(fallbackText, fallbackToolUseCount, 0L, agentIdHex, fallbackTokens, fallbackUsage);
+                // [fix-toolcall-fault B · 返工 R2] **throw 家族**（异常穿出 queryLoop）· 对齐 CC
+                //   runAsyncAgentLifecycle catch → failAsyncAgent(taskId, msg)（agentToolUtils.ts:670-681）：
+                //   零 assistant 文本（无任何交付物）→ status=failed + 结论=异常原文。
+                //   ⚠️ 与模型/流错误分流：后者在 query 内被 yield 成 assistant 错误消息（query.ts:990-992）
+                //   ⇒ 由正常收尾判 completed（见 resolveFinalConclusion ③）；本路径是 CC 的 throw 家族
+                //   （agentToolUtils.ts:297-300 throw → catch :671），只有它落 failed。
+                //   有部分产出时保持既有语义（completed + 部分结果 + sync 错误恢复分类，CC :1223-1252）。
+                boolean zeroOutput = lastAssistantTextOrNull(state.rawMessages()) == null;
+                if (subagentCtx.abortController().isCancelled()) {
+                    return SubagentResult.aborted(fallbackText, fallbackToolUseCount, 0L,
+                        agentIdHex, fallbackTokens, fallbackUsage);
+                }
+                if (zeroOutput) {
+                    String errText = e.getMessage() != null && !e.getMessage().isBlank()
+                        ? e.getMessage() : e.toString();
+                    log.warn("[SubagentExecutor] [fix-toolcall-fault B] queryLoop 异常 ∧ 零 assistant 文本 "
+                            + "→ status=failed 结论=异常原文: agentId={} err={} "
+                            + "(CC :297-300 throw → :671 failAsyncAgent 等价位)",
+                        agentId, errText);
+                    return SubagentResult.failed(errText, fallbackToolUseCount, 0L,
+                        agentIdHex, fallbackTokens, fallbackUsage);
+                }
+                return SubagentResult.completed(fallbackText, fallbackToolUseCount, 0L,
+                    agentIdHex, fallbackTokens, fallbackUsage);
             }
     
             // [S4-1 流式化] 后置批量 transcript 录制 + 逐消息 emit 循环已删除 —
@@ -5164,7 +5220,25 @@ public class SubagentExecutor {
     
             boolean aborted = result.aborted() || (finalState != null && finalState.cancelled());
             List<ChatMessageDto> summarySource = finalState != null ? finalState.rawMessages() : state.rawMessages();
-            String summary = extractConclusionFromMessages(summarySource);
+            // [fix-toolcall-fault B] 收尾判定改单一判定点（结论 + 状态）· 对齐 CC 真源结构：
+            //   ① 错误退出 ∧ 零 assistant 文本 ∧ **有错误文本** → completed + 结论=错误文本
+            //      （CC query.ts:990-992 错误被 yield 成 assistant 消息 ⇒ 生命周期照常收下 ⇒
+            //       finalizeAgentTool 取到该文本；旧实现落占位 "Subagent completed without final answer."
+            //       ⇒ 父 Agent 拿到"完成"的空话、真错误被掩盖 = 用户报障"子代理没干成活"）
+            //   ② 错误退出 ∧ 零文本 ∧ **连错误文本都没有（真零产出）** → status=failed
+            //      （CC agentToolUtils.ts:297-300 throw → :671 failAsyncAgent 等价位）
+            //   ③ 有文本 / 非错误退出 → 行为不变（completed + 原文 / 占位兜底）
+            FinalConclusion conclusion = resolveFinalConclusion(aborted, summarySource, finalState);
+            String summary = conclusion.summary();
+            if (finalState != null && isFailureExit(finalState.exitReason())) {
+                // [fix-toolcall-fault B] 错误退出的收尾可观测点（幽灵槽/上游故障的判读入口）：
+                //   有错误文本 ⇒ completed + 错误文本（CC 错误消息恒为最后一条 assistant 消息）
+                //   agentToolUtils.ts:296-318 + query.ts:990-992；零产出 ⇒ failed（:297-300 → :671）。
+                log.warn("[SubagentExecutor] [fix-toolcall-fault B] 子代理错误退出收尾: "
+                        + "agentId={} exitReason={} → status={} hasAssistantText={} errTextLen={}",
+                    agentId, finalState.exitReason(), conclusion.status(),
+                    lastAssistantTextOrNull(summarySource) != null, summary.length());
+            }
             // [IMP-SUB-03] D3 totalToolUseCount 恒 0 修复 · 对齐 CC agentToolUtils.ts:262-274
             //   countToolUses(agentMessages) —— 从消息历史 tool_use 计数填充。原恒 0 的
             //   LoopResult.totalToolUseCount 死字段（queryLoop 硬编码 0，全仓无消费方）已在
@@ -5216,9 +5290,13 @@ public class SubagentExecutor {
                 }
             }
 
-            return aborted
-                    ? SubagentResult.aborted(summary, totalToolUseCount, 0L, agentIdHex, totalTokens, usage)
-                    : SubagentResult.completed(summary, totalToolUseCount, 0L, agentIdHex, totalTokens, usage);
+            // [fix-toolcall-fault B] 三态路由：aborted → killed 通道 / failed → FAILED 通道
+            //   （SubagentTool 按 status 分派 AsyncAgentFinalizer）/ 其余 → completed。
+            return switch (conclusion.status()) {
+                case "aborted" -> SubagentResult.aborted(summary, totalToolUseCount, 0L, agentIdHex, totalTokens, usage);
+                case "failed" -> SubagentResult.failed(summary, totalToolUseCount, 0L, agentIdHex, totalTokens, usage);
+                default -> SubagentResult.completed(summary, totalToolUseCount, 0L, agentIdHex, totalTokens, usage);
+            };
         } finally {
             // [S4-1 流式化] finally 解除 appendListener (防泄漏: 本 state 为子 agent 隔离实例,
             //   不解除则异常/早退路径残留回调引用; 对齐 CC runAgent.ts:816-859 finally 清理).
@@ -5271,18 +5349,229 @@ public class SubagentExecutor {
         return warning != null ? warning + "\n\n" + summary : summary;
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // [fix-toolcall-fault R5 登记 · 可核对载体] 未修项 / 下游影响（本轮不修，供复核与后续立批）
+    //
+    // 1) id-less 幽灵槽变体（与 name 空对称的洞）：OpenAiToolCallAccumulator.toBlock() 只兜 name 空；
+    //    id 空/纯空白仍会被 ToolUseBlock 构造器（ToolUseBlock.java:18-19 id.isBlank()）抛出 ⇒ 同款
+    //    「整个回合死」。上游 vLLM 实测形态**只有 name 空**（id 皆有值），且 id 是「结果↔调用」配对
+    //    主键（合成 id 会动配对契约）⇒ 未修，待上游实证后再立批。
+    //
+    // 2) status=="failed" 的下游消费方（本轮全部未改；修通后该状态首次可现于生产）：
+    //    ① SubagentTool.executeSync（:3096-3104）：把 result.status() 填入 structuredOutput("status")
+    //       ——现在可能是 "failed"。⚠️ 与 CC 的差异一并登记：CC sync 的零产出异常走
+    //       **throw syncAgentError**（AgentTool.tsx:1226-1228，无 assistant 消息 → 重抛）⇒ 工具框架
+    //       产 is_error tool_result；本仓同场景返回 ToolResult.success + 错误文本 + status="failed"
+    //       （父 Agent 收到内容而非工具错误）。另注：CC sync 成功返回 status 恒 'completed'
+    //       （AgentTool.tsx:1255 硬编码），本仓 sync 现可能出现 "failed"。
+    //    ② ClaudeCodeBackendAdapter:306：只判 "aborted"；status=="failed"（非 abort）会继续走
+    //       :328-340 构造 AgentRunResultOk ⇒ workflow 既不死（dead）也不重试（失败按成功交付）。
+    //    ③ AutonomousAgentLoop:1274-1276：判据 "aborted".equals(status) && !isAborted()；
+    //       failed 不触发该分支（teammate 轮次归类不受影响，但也不区分失败）。
+    //    ④ SkillToolImpl:1670-1674（fork skill）：forkData 硬编码 success=true + status="forked"，
+    //       result=summaryText；子代理 failed 时父侧仍读作成功 fork（内容=错误文本）。
+    //    交叉核对：以上 4 处与审查员独立枚举的 4 处一一对应、无缺漏无多出；全仓 grep SubagentResult
+    //    的 status 读点亦仅此 4 处 + 本类 Step 22/bookend + SubagentTool 三态路由（已按本批对齐）。
+    //
+    // 3) 「错误落成一条 assistant 消息」的结构级全同形（可选后续）：CC 的错误文本经 query.ts:990-992
+    //    进入**消息通道**（LLM 可见、进 transcript、usage 归因一致）；本仓现经 lastError/attachment
+    //    通道，由收尾判定"翻译"为结论文本（行为等价、结构不同——R2 取舍：本轮采判据精确化路线）。
+    //    若后续做 LlmAgentLoop 结构改造（错误 yield 成 messages），上面 ①②③④ 可一并收敛。
+    //
+    // 4) [本轮新增未决项] queryLoop 内部 catch（异常穿出 queryLoop）在**有部分产出**时的状态 ——
+    //    **async 等价位未对齐**（本轮只做了零产出→failed，未按 isAsync 分流）：
+    //    ① 现状：该 catch 在「有非空 assistant 文本」时**恒返回 completed**（本文件 :5196-5212 ——
+    //       仅 cancelled→aborted / 零产出→failed 两个前置分支，**无 isAsync 分支**），不区分 sync/async。
+    //    ② CC sync 同场景 = AgentTool.tsx:1223-1252（syncAgentError 且**有** assistant 消息 → 不重抛，
+    //       finalize → status:'completed'，把部分进展交还父 Agent）⇒ **本仓 sync 侧已对齐**。
+    //    ③ CC async 同场景 = 异常穿出 → runAsyncAgentLifecycle catch（非 AbortError）→
+    //       {@code failAsyncAgent} + 通知 {@code status:'failed'} / {@code error:msg}
+    //       （agentToolUtils.ts:670-681）⇒ **本仓 async 报 completed 与 CC 不符（async 等价位未对齐）**
+    //       —— 本项登记的核心价值。
+    //    ④ F1（错误文本优先）仅作用于 finalState 收尾路径（resolveFinalConclusion），**不覆盖本 catch 路径**
+    //       （catch 直接用 lastAssistantTextOrNull + fallbackText，不读 exitReason）。
+    //    修法方向（未做，待立批）：按 isAsync 分流 —— async 且非 abort → failed（错误=异常原文）；
+    //    sync 保持 completed + 部分文本 + 错误恢复分类（CC :1223-1252 对齐）。
+    // ════════════════════════════════════════════════════════════════════════
+
     /**
      * 从消息历史中提取最终结论。
      * 从后往前找最后一条 assistant 消息的文本。
      */
     private String extractConclusionFromMessages(List<ChatMessageDto> messages) {
+        String text = lastAssistantTextOrNull(messages);
+        return text != null ? text : SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER;
+    }
+
+    /** [fix-toolcall-fault B] 子代理无任何非空 assistant 文本时的占位结论（最后兜底）。 */
+    static final String SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER = "Subagent completed without final answer.";
+
+    /**
+     * [fix-toolcall-fault B · F4] failed 终态的**独立**结论文案 —— 不得复用 completed 的占位
+     * （否则 FAILED 通知渲染成 {@code failed: Subagent completed without final answer.}：自相矛盾，
+     * 且正是用户反感的占位语）。
+     */
+    static final String SUBAGENT_NO_OUTPUT_FAILURE_TEXT = "Subagent produced no output.";
+
+    /**
+     * [fix-toolcall-fault B] 收尾三态判定结果 · {@code status ∈ {"completed","aborted","failed"}}
+     * （CC AgentTool.tsx:1253-1260 agentResult.status）。
+     */
+    record FinalConclusion(String summary, String status) { }
+
+    /**
+     * [fix-toolcall-fault B] 逆序取最后一条非空 assistant 文本；无 → null（与
+     * {@link #extractConclusionFromMessages} 同口径，唯一区别是 null vs 占位，供收尾判定区分
+     * "真有产出" 与 "无产出"）。对齐 CC {@code getLastAssistantMessage} + 逆序回退
+     * (agentToolUtils.ts:297-315)。
+     */
+    static String lastAssistantTextOrNull(List<ChatMessageDto> messages) {
+        if (messages == null) {
+            return null;
+        }
         for (int i = messages.size() - 1; i >= 0; i--) {
             ChatMessageDto msg = messages.get(i);
-            if (msg.role() == Role.assistant && msg.content() != null && !msg.content().isBlank()) {
+            if (msg != null && msg.role() == Role.assistant
+                    && msg.content() != null && !msg.content().isBlank()) {
                 return msg.content();
             }
         }
-        return "Subagent completed without final answer.";
+        return null;
+    }
+
+    /**
+     * [fix-toolcall-fault B] 退出原因是否属「错误退出」· 对齐 CC query.ts:955-996 的 model_error 家族
+     * （catch → {@code yield createAssistantAPIErrorMessage({content: errorMessage})} +
+     * {@code return {reason:'model_error'}}）。
+     *
+     * <p><b>语义（R2 精确化）</b>：错误退出**不是**"落 failed"的同义词 —— CC 里模型/流错误被
+     * yield 成一条 assistant 错误消息，子代理生命周期照常收下 ⇒ **completed + 交付错误文本**；
+     * failed 只留给「连一条 assistant 消息都没有」的 throw 家族（{@code agentToolUtils.ts:297-300}
+     * throw → catch {@code :671 failAsyncAgent}）。故本判据只用于「无 assistant 文本时的兜底归类」。
+     *
+     * <p>排除：NORMAL（正常收尾）/ ABORTED 与 INTERRUPTED（用户中断，走 killed 三态 —— 见
+     * {@link #isAbortExit}，对齐 CC AbortError → killAsyncAgent agentToolUtils.ts:640-668）/
+     * MAX_TURNS（步数上限，CC 亦按正常收尾处理）/ STOP_HOOK_PREVENTED 与 HOOK_STOPPED（hook 优雅终止）/
+     * MAX_OUTPUT_TOKENS（死枚举，已不生产）。
+     *
+     * <p>穷尽 switch（无 default）：新增 ExitReason 时编译期强制表态。
+     */
+    static boolean isFailureExit(AgentState.ExitReason reason) {
+        if (reason == null) {
+            return false;
+        }
+        return switch (reason) {
+            case STREAM_ERROR, MODEL_ERROR, STREAM_TIMEOUT, NO_ASSISTANT_TEXT,
+                 PROMPT_TOO_LONG, IMAGE_ERROR, BLOCKING_LIMIT,
+                 STRUCTURED_OUTPUT_RETRIES_EXCEEDED, STOP_HOOK_BLOCKING_LIMIT_EXCEEDED -> true;
+            case NORMAL, ABORTED, INTERRUPTED, MAX_TURNS, MAX_OUTPUT_TOKENS,
+                 STOP_HOOK_PREVENTED, HOOK_STOPPED -> false;
+        };
+    }
+
+    /**
+     * [fix-toolcall-fault B · R2.3] 退出原因是否属「abort 家族」（→ killed/aborted 通道）。
+     *
+     * <p>判读依据：CC 里只有**用户/上层 abort**（{@code AbortError}）走 killed
+     * （{@code agentToolUtils.ts:640-668} catch {@code error instanceof AbortError} → killAsyncAgent）。
+     * Java 侧等价位 = {@link AgentState.ExitReason#INTERRUPTED}（LlmAgentLoop:7314-7318 等待流完成时
+     * 被中断 → {@code setError("interrupted")} + 该退出码）。{@code ABORTED} 由调用方经
+     * {@code result.aborted()/state.cancelled()} 传入，不在此重复判定。
+     */
+    static boolean isAbortExit(AgentState.ExitReason reason) {
+        return reason == AgentState.ExitReason.INTERRUPTED;
+    }
+
+    /**
+     * [fix-toolcall-fault B] 错误文本落点解析（结论 = 错误文本的来源）· 对齐 CC
+     * {@code createAssistantAPIErrorMessage({content: errorMessage})}（query.ts:990-992）：
+     * CC 把模型/流错误原文作为 assistant 消息可见交付；Java 侧对应落点两处 ——
+     *
+     * <ol>
+     *   <li>{@code state.lastError()}（LlmAgentLoop:7239 流错误 / :9121-9126 重试耗尽 /
+     *       :7304 超时 等全部错误退出点均 setError）—— 主来源；</li>
+     *   <li>兜底：{@code assistant_api_error} attachment 的 content（LlmAgentLoop:8133-8136
+     *       yield 的错误载文；lastError 缺失/被清时仍有原文）。</li>
+     * </ol>
+     *
+     * @return 错误文本；两处均无 → null（调用方回落占位）
+     */
+    static String failureExitErrorText(AgentState finalState) {
+        if (finalState == null) {
+            return null;
+        }
+        String lastError = finalState.lastError();
+        if (lastError != null && !lastError.isBlank()) {
+            return lastError;
+        }
+        List<com.nexusai.application.agent.attachment.AttachmentMessageDto> attachments = finalState.attachments();
+        if (attachments != null) {
+            for (int i = attachments.size() - 1; i >= 0; i--) {
+                var att = attachments.get(i);
+                if (att != null && "assistant_api_error".equals(att.type())
+                        && att.content() != null && !att.content().isBlank()) {
+                    return att.content();
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * [fix-toolcall-fault B] 收尾结论 + 状态判定（单一判定点 · 静态缝 Pattern #14）· 返工 R2 精确化 + F1 优先级对齐。
+     *
+     * <p><b>CC 真源结构（决定判据与优先级）</b>：
+     * <ul>
+     *   <li><b>取文本的顺序</b>：{@code finalizeAgentTool}（agentToolUtils.ts:296-318）先取**最后一条**
+     *       assistant 消息的 text，仅当其为空才逆序回退到更早的含文本 assistant 消息。</li>
+     *   <li><b>模型/流错误（yield 家族）→ completed + 错误文本</b>：CC 把错误 yield 成一条 assistant
+     *       消息（query.ts:990-992 {@code createAssistantAPIErrorMessage} + :996 model_error）——该消息
+     *       **总是最后一条且必有 text** ⇒ 按上面的顺序，CC **永远交付错误文本**（更早的部分产出不进
+     *       content）。</li>
+     *   <li><b>failed 只留给真·零产出</b>：{@code finalizeAgentTool} 连一条 assistant 消息都没有时
+     *       {@code throw new Error('No assistant messages found')}（:297-300）→ async 生命周期 catch →
+     *       {@code failAsyncAgent} + 通知 {@code status:'failed'}（:670-681）。</li>
+     *   <li><b>AbortError → killed</b>（:640-668），即 Java 的 abort/INTERRUPTED 家族。</li>
+     * </ul>
+     *
+     * <p>判定顺序（1:1 映射上述结构 · F1 后「错误文本优先」）：
+     * <ol>
+     *   <li><b>abort 家族</b>（调用方 aborted 或 exitReason=INTERRUPTED）→ status=aborted，结论取文本
+     *       （CC extractPartialResult :658），无则占位；</li>
+     *   <li>yield 家族（{@link #isFailureExit}）∧ <b>有错误文本</b> → status=completed +
+     *       <b>结论=错误文本（优先于任何更早 assistant 文本）</b> —— CC 里该错误就是最后一条 assistant
+     *       消息（:296-318 + query.ts:990-992），故错误文本胜出；</li>
+     *   <li>有非空 assistant 文本 → status=completed + 原文（非 yield 家族，或 yield 家族但无错误文本）；</li>
+     *   <li>yield 家族 ∧ 无文本 ∧ <b>无错误文本（真零产出）</b> → status=<b>failed</b> +
+     *       {@link #SUBAGENT_NO_OUTPUT_FAILURE_TEXT}（CC throw 家族等价位 · F4 独立文案）；</li>
+     *   <li>其余（非错误退出且无文本）→ status=completed + {@link #SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER}。</li>
+     * </ol>
+     */
+    static FinalConclusion resolveFinalConclusion(boolean aborted,
+                                                  List<ChatMessageDto> summarySource,
+                                                  AgentState finalState) {
+        String text = lastAssistantTextOrNull(summarySource);
+        boolean abortLike = aborted
+            || (finalState != null && isAbortExit(finalState.exitReason()));
+        if (abortLike) {
+            return new FinalConclusion(
+                text != null ? text : SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER, "aborted");
+        }
+        boolean failureExit = finalState != null && isFailureExit(finalState.exitReason());
+        String errorText = failureExit ? failureExitErrorText(finalState) : null;
+        if (errorText != null) {
+            // [F1] yield 家族：CC 的 API 错误消息恒为最后一条 assistant 消息且必有 text
+            //   ⇒ 交付内容 = 错误文本，**优先于任何更早 assistant 文本**（对齐 agentToolUtils.ts:296-318）。
+            return new FinalConclusion(errorText, "completed");
+        }
+        if (text != null) {
+            return new FinalConclusion(text, "completed");
+        }
+        if (failureExit) {
+            // 真零产出（连错误文本都没有）→ CC finalizeAgentTool throw 家族等价位
+            return new FinalConclusion(SUBAGENT_NO_OUTPUT_FAILURE_TEXT, "failed");
+        }
+        return new FinalConclusion(SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER, "completed");
     }
 
     /**
