@@ -4,7 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Composer } from '../Composer'
 import { useChatStore } from '@/stores/chatStore'
-import type { ChatMessageDto } from '@/api/types'
+import type { ChatMessageDto, Provider } from '@/api/types'
 
 /**
  * D1 · 底部数字（缓存% / 当前上下文）只统计「用户自己的请求」—— 后台任务 run 的 message.usage 不再污染。
@@ -56,7 +56,7 @@ function backgroundMsg(): ChatMessageDto {
   } as ChatMessageDto
 }
 
-function mountComposer(): { container: HTMLDivElement; root: Root; footer: () => string } {
+function mountComposer(model = 'ds-openai/deepseek-v4-flash', providers?: Provider[]): { container: HTMLDivElement; root: Root; footer: () => string } {
   ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
   const container = document.createElement('div')
   document.body.appendChild(container)
@@ -74,7 +74,8 @@ function mountComposer(): { container: HTMLDivElement; root: Root; footer: () =>
         popEditable={async () => null}
         boundProjectName={null}
         onSelectProject={() => {}}
-        currentModel="ds-openai/deepseek-v4-flash"
+        currentModel={model}
+        providers={providers}
         permissionMode="default"
         empty={false}
         sessionId={SID}
@@ -164,5 +165,60 @@ describe('D1 · Composer 底部数字来源过滤（缓存% / 当前上下文）
     mounted = h
 
     expect(h.footer()).toContain('当前上下文 9k / 200k')
+  })
+})
+
+/**
+ * [缓存%判据修复 2026-10-10] 「是否 Anthropic 协议」判据从「provider 名前缀猜」改为查 providers
+ * 列表的权威 type 字段（后端 ProviderDto.type）——自定义命名的 ant provider（如 ds-zcw）不再判错。
+ *
+ * <h2>RED（改回「名判据」哪条红）</h2>
+ * 用例 1（ds-zcw：名不含 'anthropic'、type=anthropic、真三小票数据）——旧名判 → false → cr/input
+ * = 86600/2560 ≈ 3383%（用户实报「缓存 3386%」同形）；新判据查表 → 97% → 断言红。
+ */
+describe('[缓存%判据修复] Anthropic 判定查 providers.type（不再按名字猜）', () => {
+  let mounted: { container: HTMLDivElement; root: Root } | undefined
+
+  beforeEach(() => {
+    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
+  })
+
+  afterEach(() => {
+    if (mounted) {
+      const cur = mounted
+      act(() => cur.root.unmount())
+      cur.container.remove()
+      mounted = undefined
+    }
+    useChatStore.setState({ messages: {}, streams: {}, sessions: [] })
+  })
+
+  const realProvider = (name: string, type: Provider['type']): Provider => ({
+    id: 'p-' + name, name, type, baseUrl: '', apiKeyMasked: '', extraHeaders: null, enabled: true, models: [],
+  })
+
+  it('自定义命名 ant provider（ds-zcw/deepseek-flash，type=anthropic）→ cr/(input+cr+cc) = 97%（旧名判据为 3383%）', () => {
+    // 真机观测形态：input=本轮未命中增量（2.56k）、cache_read=命中的历史（86.6k）→ 总量 89.2k
+    const msg = {
+      ...userMsg(),
+      usage: { input_tokens: 2560, output_tokens: 100, cache_read_input_tokens: 86600, cache_creation_input_tokens: 0 },
+    }
+    useChatStore.setState({ messages: { [SID]: [msg] } })
+    const h = mountComposer('ds-zcw/deepseek-flash', [realProvider('ds-zcw', 'anthropic')])
+    mounted = h
+    expect(h.footer()).toContain('缓存 97%')       // 86600/(2560+86600) = 0.9713
+    expect(h.footer()).not.toContain('3383%')      // 旧名判据会除以 input（未命中增量）→ 3383%
+  })
+
+  it('openai 型 provider（input 已含缓存语义）→ 仍用 cr/input（不得误用三项分母）', () => {
+    // oc 行形态：input=471359（全量含缓存）、cache_read=470784（命中子集）→ cr/input ≈ 100%
+    const msg = {
+      ...userMsg(),
+      usage: { input_tokens: 471359, output_tokens: 100, cache_read_input_tokens: 470784, cache_creation_input_tokens: 0 },
+    }
+    useChatStore.setState({ messages: { [SID]: [msg] } })
+    const h = mountComposer('oc/deepseek-v4.1-flash', [realProvider('oc', 'openai_compatible')])
+    mounted = h
+    expect(h.footer()).toContain('缓存 100%')      // round(470784/471359*100) = 100
   })
 })

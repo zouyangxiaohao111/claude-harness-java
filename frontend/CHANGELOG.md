@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.32] - 2026-10-10
+
+### 修复
+- 修复缓存命中率显示异常的bug。
+
 ## [0.1.31] - 2026-10-10
 
 ### 修复

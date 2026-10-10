@@ -1994,6 +1994,7 @@ function App() {
             boundProjectId={activeSession.mainProjectId}
             onSelectProject={() => void handleSelectProjectFolder()}
             currentModel={activeSession.modelName ?? ''}
+            providers={providersApi.list}
             effortLevel={activeSession.effortLevel ?? 'high'}
             ultracodeEnabled={activeSession.ultracodeEnabled}
             bareMode={activeSession.bareMode}

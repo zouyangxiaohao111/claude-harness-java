@@ -5,7 +5,7 @@ import { SessionToolsPanel } from './SessionToolsPanel'
 import { CatArtBody } from '../startup/CatArt'
 import type { PoppedQueueInput, QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
-import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
+import type { AttachmentRequest, SessionDto, ChatMessageDto, Provider } from '@/api/types'
 import { uploadAttachment } from '@/api/chat'
 import { AgentSelector } from './AgentSelector'
 import { isTauri } from '@tauri-apps/api/core'
@@ -128,6 +128,13 @@ interface ComposerProps {
   onSelectProject: () => void
   /** 当前模型名（发送键旁胶囊展示） */
   currentModel: string
+  /**
+   * Provider 列表（后端权威 `type` 字段）· [缓存%判据修复 2026-10-10] 供判定当前模型是否 Anthropic
+   * 协议（`provider.type === 'anthropic'`）——此前按 `provider/model` 前缀**名字猜**，自定义命名的
+   * ant provider（如 ds-zcw）判 false → 用错公式（真三小票数据算出「缓存 3386%」）。缺省 undefined
+   * → 判据回落 false（不猜，与旧行为兼容）。
+   */
+  providers?: Provider[]
   /** 当前会话权限模式（会话覆盖 ?? 全局默认 ?? 'default' · App 解析后传入） */
   permissionMode: PermissionMode
   /** 切换会话权限模式（App 调 sessionApi.update({permissionMode}) · 会话覆盖全局） */
@@ -224,7 +231,7 @@ function renderHighlighted(text: string, onChipRemove?: (token: string) => void)
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onOpenMarket }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, providers, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onOpenMarket }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -256,11 +263,19 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
   //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
   //   deepseek（openai 协议）：input_tokens 已含 cache hit（input==H+M），直接 cache_read / input
-  //   （真实命中率；按 anthropic 公式会算成真实的一半 ~40% 假象）。provider 由 currentModel
-  //   `provider/model` 前缀判定（后端 ContextUsageCalculator.isAnthropic 同口径：provider.type==anthropic）。
+  //   （真实命中率；按 anthropic 公式会算成真实的一半 ~40% 假象）。
+  //   [缓存%判据修复 2026-10-10] 「是否 Anthropic 协议」从「provider 名前缀猜」改为查 providers 列表的
+  //   权威 type 字段（后端 ProviderDto.type）——自定义命名的 ant provider（如 ds-zcw）此前名判 false →
+  //   走 cr/input → 真三小票数据（input=未命中增量、cr=命中的历史）算出 3386%；查表后走
+  //   cr/(input+cr+cc) 正确。列表缺失 / 查不到 → false（回落旧行为，不猜）。
   //   取最近一条带 usage 的 assistant 消息（complete 事件 usage 透传 · tokenWarning.tokenUsage 仅 number 无缓存细分）
+  const isClaudeProvider = useMemo(() => {
+    const prefix = (currentModel ?? '').split('/')[0]?.trim().toLowerCase()
+    if (!prefix || !providers) return false
+    const p = providers.find((x) => (x.name ?? '').trim().toLowerCase() === prefix)
+    return p?.type === 'anthropic'
+  }, [currentModel, providers])
   const cacheRateInfo = useMemo(() => {
-    const isClaudeProvider = (currentModel ?? '').split('/')[0].trim().toLowerCase() === 'anthropic'
     const scanned = usageScan
     for (let i = scanned.length - 1; i >= 0; i--) {
       const u = scanned[i]?.usage
@@ -276,7 +291,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       }
     }
     return null
-  }, [usageScan, currentModel])
+  }, [usageScan, isClaudeProvider])
   // F4 · 最近一条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示）。
   //   扫描源 = [...msgs, ...liveBlocks]：live 块在 message.usage（assistant 流式结束）即挂 usage/decode_ms，
   //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。
