@@ -8,6 +8,7 @@ import com.nexusai.application.agent.compact.PostCompactCleanup;
 import com.nexusai.application.agent.prompt.PromptCacheGroup;
 import com.nexusai.application.agent.prompt.SessionPromptCacheRegistry;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
+import com.nexusai.application.agent.SessionLedgerRegistry;
 import com.nexusai.application.agent.SessionStartSeenRegistry;
 import com.nexusai.application.agent.skill.BuiltInCommands;
 import com.nexusai.application.agent.skill.SkillRegistry;
@@ -526,6 +527,11 @@ public class CommandController {
             //   净结果仍为「该 subtype 在 DB 恒 1 条」（先插后删不变量：插入失败则不执行删除 → 旧份仍在，
             //   绝不丢份）—— 结论不变，达成机制从「跳过」换成「覆盖式写」。
             SessionStartSeenRegistry.remove(sessionIdParam);
+            // [会话账本柜 · session-ledger 2026-10-10] 账本柜同点清理：/clear 已清空对话，不得把
+            //   「清前的旧历史账本」接力进下一次 run（对齐 SessionStartSeenRegistry 同 /clear 重置语义；
+            //   与 SessionAgentStateRegistry 的「不接 /clear」差异说明见其 javadoc——账本 = 对话历史，
+            //   对话清了账本必须清；STATE 承载 invokedSkills 等，/clear 后仍需存活）。
+            SessionLedgerRegistry.remove(sessionIdParam);
             // [skill-listing-cc-align 2026-09-10] skill_listing sent 注册表 · /clear 重置该会话去重态。
             //   ① CC {@code resetSentSkillNames()} 语义（clear/caches.ts:79）—— clear 后下一次 skill_listing
             //   要重发<b>整份</b>：本表清 SENT + 保留 INITIALIZED（= CC suppressNext=false）→ 下一 run 走

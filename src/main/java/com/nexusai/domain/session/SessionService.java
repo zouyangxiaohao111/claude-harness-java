@@ -428,6 +428,20 @@ public class SessionService {
             log.warn("[SessionService] delete: SessionStartSeenRegistry.remove 失败 session={}: {}",
                 id, e.toString());
         }
+        // [会话账本柜 · session-ledger 2026-10-10] 会话删除 → 释放该会话历史账本（防进程内无界增长）。
+        //   与本节既有各注册表同一口径：CC 一进程一会话、会话结束即进程退出，无对应动作；Java 常驻
+        //   JVM 必须显式回收。账本可含万级消息 DTO（本会话家族中单体体积最大者，与 SessionAgentStateRegistry
+        //   同量级）。best-effort：静态工具表直呼不套 null 守卫；null/未知 key → remove no-op。
+        try {
+            com.nexusai.application.agent.SessionLedgerRegistry.remove(id);
+            if (log.isDebugEnabled()) {
+                log.debug("[SessionService] delete: SessionLedgerRegistry.remove session={}（防进程内账本泄漏）",
+                    id);
+            }
+        } catch (Exception e) {
+            log.warn("[SessionService] delete: SessionLedgerRegistry.remove 失败 session={}: {}",
+                id, e.toString());
+        }
         // [skill-listing-cc-align 2026-09-10] 会话删除 → 移除该会话主 AgentState 映射（sessions + agents 双桶）。
         //   对齐说明：CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无对应动作；
         //   Java 常驻 JVM 必须显式移除，否则每个「跑过又不再跑」的会话都会留一个陈旧 AgentState

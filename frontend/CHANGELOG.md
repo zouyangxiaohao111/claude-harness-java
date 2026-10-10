@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.33] - 2026-10-10
+
+### 修复
+- 修复长会话缓存命中率异常下降与对话中途意外结束的bug。
+
 ## [0.1.32] - 2026-10-10
 
 ### 修复

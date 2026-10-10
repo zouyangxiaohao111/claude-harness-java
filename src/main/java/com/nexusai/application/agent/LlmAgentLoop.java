@@ -2722,13 +2722,53 @@ public class LlmAgentLoop implements AgentLoop {
         if ((agentId == null || backgroundSessionTask) && messageService != null
                 && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
-                // [vision-cc-align 2026-09-03] resume 注入 = filterIncomplete（剔除含未完成 tool_calls 的
+                // [会话账本柜 · session-ledger 2026-10-10] 历史来源冷热分流（单一构造源）：
+                //   热 = take 快照 + 新鲜度校验通过（快照后除在途用户消息外无旁路新行）→ 直接用账本
+                //        （跳过 DB 全量重读与注入过滤）——对齐 CC（REPL 内存 messages 恒持，REPL.tsx:2793）
+                //        与 dsh（live 禁止重载，coordinator.ts:723）。
+                //   冷 = 无快照 / 快照不新鲜 / 不可校验 → 下方现有 DB 路径全量重抄（行为与改造前逐字一致）。
+                //   commit 在 LlmAgentLoop.run 出口（仅 NORMAL 终态）；take/commit 一次性接力语义见注册表 javadoc。
+                // [vision-cc-align 2026-09-03]（冷路径）resume 注入 = filterIncomplete（剔除含未完成 tool_calls 的
                 //   assistant，对齐 CC runAgent.ts:866 filterIncompleteToolCalls：工具执行中被中断/未完成的
                 //   半轮整条作废）→ defend（清随之残留的孤 tool_result，防 OpenAI 400 role tool 无前驱）。
                 //   作用在注入副本，不物理删 DB/UI（对齐 CC append-only transcript）。
-                List<ChatMessageDto> resumeHistory = defendOrphanToolResults(
-                    filterIncompleteAssistantToolCalls(
-                        messageService.listForResumeExcluding(resumeRawTranscript, streamUserMessageId)));
+                List<ChatMessageDto> resumeHistory = null;
+                boolean ledgerHot = false;
+                SessionLedgerRegistry.LedgerSnapshot ledgerSnapshot = SessionLedgerRegistry.take(streamSessionId);
+                if (ledgerSnapshot != null) {
+                    // 新鲜度校验（id 锚）：DB 最近 id（剔除当前在途用户消息后）应 == 快照最后一条 id。
+                    // ⛔ 勿用 createdAt 比较（双源精度 / assistant DTO 值不同源——见 SessionLedgerRegistry
+                    //   类 javadoc「新鲜度锚 = lastMessageId」，初版 createdAt 方案 e2e 实锤永久不新鲜）。
+                    java.util.List<String> latestIds = null;
+                    boolean fresh = false;
+                    try {
+                        latestIds = new java.util.ArrayList<>(messageService.latestMessageIds(streamSessionId, 2));
+                        latestIds.removeIf(id -> id != null && id.equals(streamUserMessageId));
+                        fresh = !latestIds.isEmpty() && latestIds.get(0).equals(ledgerSnapshot.lastMessageId());
+                    } catch (Exception e) {
+                        log.warn("[会话账本柜] 新鲜度校验失败（按不新鲜处理 → 冷启动重抄）: session={} err={}",
+                            streamSessionId, e.getMessage());
+                    }
+                    if (fresh) {
+                        resumeHistory = ledgerSnapshot.messages();
+                        ledgerHot = true;
+                        if (log.isInfoEnabled()) {
+                            log.info("[会话账本柜] 热接力命中: session={} 账本 {} 条（lastMessageId={}）"
+                                + "—— 跳过 DB 全量重读与注入过滤"
+                                + "（对齐 CC REPL 恒持 messages / dsh live 禁止重载）",
+                                streamSessionId, resumeHistory.size(), ledgerSnapshot.lastMessageId());
+                        }
+                    } else if (log.isInfoEnabled()) {
+                        log.info("[会话账本柜] 快照不新鲜 → 弃快照走冷启动全量重抄: session={} "
+                            + "[诊断] expectedLastId={} latestIds(剔用户后)={} streamUserMessageId={}",
+                            streamSessionId, ledgerSnapshot.lastMessageId(), latestIds, streamUserMessageId);
+                    }
+                }
+                if (resumeHistory == null) {
+                    resumeHistory = defendOrphanToolResults(
+                        filterIncompleteAssistantToolCalls(
+                            messageService.listForResumeExcluding(resumeRawTranscript, streamUserMessageId)));
+                }
                 if (resumeHistory != null && !resumeHistory.isEmpty()) {
                     // [C 级 2026-09-07] 恢复注入块只把 DB 既有历史灌入 state.rawMessages()（注册 prePersisted +
                     //   appendMessage 循环，供消息产出钩子跳过历史 id）。§14 SessionStart 是否执行由进程级
@@ -2751,9 +2791,9 @@ public class LlmAgentLoop implements AgentLoop {
                         }
                     }
                     if (log.isInfoEnabled()) {
-                        log.info("[LlmAgentLoop] 主路径 DB 历史注入完成: session={} 历史 {} 条"
+                        log.info("[LlmAgentLoop] 主路径历史注入完成: session={} 历史 {} 条（来源={}）"
                             + "（对齐 CC loadConversationForResume 全量注入，含合成 sentinel 均已登记 prePersistedMessageIds）",
-                            streamSessionId, resumeHistory.size());
+                            streamSessionId, resumeHistory.size(), ledgerHot ? "账本接力(热)" : "DB重抄(冷)");
                     }
                 }
             } catch (Exception e) {
@@ -3875,6 +3915,19 @@ public class LlmAgentLoop implements AgentLoop {
 
         log.info("LlmAgentLoop.run done: turns={} msgs={} exit={} error={}",
             out.turnCount(), out.rawMessages().size(), out.exitReason(), out.lastError());
+
+        // [会话账本柜 · session-ledger 2026-10-10] run 正常完成（NORMAL 终态）→ 账本交棒（commit）。
+        //   非 NORMAL（ABORTED / STREAM_ERROR / MAX_TURNS 等）不交棒 → 柜台无此会话 → 下个 run
+        //   冷启动全量重抄（快照永不半途——「一次性消费 + 完成才交棒」消灭所有错接分支，
+        //   见 SessionLedgerRegistry javadoc）。commit 时剔除合成哨兵（账本 = DB 等价物）。
+        //   调用方全集论证（commit 安全前提）：run() 仅被主路径（ChatService.processUserMessage /
+        //   CronIdleExecutor / MainSessionBackgroundService）+ VerifyChatController 验证直驱调用；
+        //   fork / 子代理（SESSION_MEMORY / EXTRACT_MEMORIES / auto_dream / compact 摘要）全部经
+        //   RunForkedAgent → queryLoop 直入，不经本出口 ⇒ 无需额外身份过滤。
+        if (out.exitReason() == AgentState.ExitReason.NORMAL
+                && params.sessionId() != null && !params.sessionId().isBlank()) {
+            SessionLedgerRegistry.commit(params.sessionId(), out.rawMessages());
+        }
 
         // 事件 4：loop 退出
         publishEvent(new AgentLoopExitedEvent(out, out.exitReason(), out.turnCount()));

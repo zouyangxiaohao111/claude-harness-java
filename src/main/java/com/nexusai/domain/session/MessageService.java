@@ -996,6 +996,35 @@ public class MessageService {
         return (int) n;
     }
 
+    /**
+     * [会话账本柜 · session-ledger 2026-10-10] 取会话最近 N 条消息的 id（created_at DESC 序）。
+     *
+     * <p><b>用途</b>：热接力快照的「新鲜度校验」——比对「快照最后一条 id」与「DB 最近 id（剔除当前
+     * 在途用户消息后）」。⛔ 勿改回 createdAt 比较（初版方案 e2e 实锤双缺陷：state DTO 纳秒精度 vs
+     * DB 毫秒截断；且 assistant 的 DTO.createdAt 与落库值不同源——落库经 {@code nextCreatedAt}
+     * 单调分配器取号 ⇒ 字符串比较不可用）。id 为 DTO/DB 同源稳定键（appendListener 用 DTO 原 id 落库），
+     * 且「id 列表」比对天然绕开时间比较的并列/精度问题。
+     *
+     * @param sessionId 会话 ID（DB 键 "sess-xxx"；null/空白 → 空列表）
+     * @param limit     取多少条（≤0 → 空列表）
+     * @return 最近 N 条消息 id（created_at DESC；无消息 → 空列表）
+     */
+    public List<String> latestMessageIds(String sessionId, int limit) {
+        if (sessionId == null || sessionId.isBlank() || limit <= 0) {
+            return List.of();
+        }
+        List<MessageRecord> rows = messageMapper.selectListByQuery(
+            QueryWrapper.create().eq("session_id", sessionId)
+                .orderBy("created_at", false).limit(0, limit));
+        List<String> ids = new ArrayList<>(rows.size());
+        for (MessageRecord r : rows) {
+            if (r != null && r.getId() != null) {
+                ids.add(r.getId());
+            }
+        }
+        return ids;
+    }
+
     /** 删除本会话指定 subtype 的消息行（如 hook_additional_context：CC 不落 transcript，我们覆盖式永保 1 条）。 */
     public int deleteBySessionAndSubtype(String sessionId, String subtype) {
         return deleteBySessionAndSubtype(sessionId, subtype, null);

@@ -75,6 +75,13 @@ public final class SessionResumeDeserializer {
     /** CC conversationRecovery.ts:216 Continue from where you left off. */
     public static final String CONTINUE_FROM_LEFT_OFF = "Continue from where you left off.";
 
+    /**
+     * [session-ledger 2026-10-10] 合成缺失 tool_result 的占位文本 · CC original:
+     * {@code SYNTHETIC_TOOL_RESULT_PLACEHOLDER}（messages.ts:247-248）。提为 public 常量供
+     * {@code SessionLedgerRegistry.isSyntheticSentinel} 双匹配剔除（真源单点，勿在别处重写字面量）。
+     */
+    public static final String SYNTHETIC_MISSING_TOOL_RESULT = "Tool result missing";
+
     /** 中断状态 · 对齐 CC TurnInterruptionState（conversationRecovery.ts:142-149）。 */
     public enum InterruptionKind {
         /** 无中断（完成 turn / 空列表）。 */
@@ -242,7 +249,7 @@ public final class SessionResumeDeserializer {
     private static ChatMessageDto syntheticMissingToolResult(ChatMessageDto assistant, String toolUseId) {
         return new ChatMessageDto(
             UUID.randomUUID().toString(), assistant.sessionId(), Role.tool, null,
-            "Tool result missing", null, null, null, null, null, "刚刚", null,
+            SYNTHETIC_MISSING_TOOL_RESULT, null, null, null, null, null, "刚刚", null,
             toolUseId, assistant.assistantMessageId(), null,
             List.of(), List.of(), null, false, true);
     }
