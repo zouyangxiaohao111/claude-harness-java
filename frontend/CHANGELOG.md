@@ -2,6 +2,11 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.36] - 2026-10-13
+
+### 修复
+- 修复子代理后台命令回执错投主会话的bug。
+
 ## [0.1.35] - 2026-10-10
 
 ### 修复
